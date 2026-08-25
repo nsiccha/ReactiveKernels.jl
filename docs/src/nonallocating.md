@@ -104,6 +104,25 @@ The initial integration is intentionally narrow:
 These are physical execution constraints only. The logical graph remains pure,
 and the same `Plan` can always be passed to ordinary `prepare` instead.
 
+## Reactive layers use owned state, not borrowed caches
+
+`prepare_nonallocating` is a *direct-execution* optimization: its per-recipe
+caches are borrowed values that may alias inputs and are overwritten on the next
+call. The reactive layers deliberately do **not** run recipes through it.
+[`ReactiveState`](online-stats.md) stores materialized, frozen, and checkpointed
+values by reference and reuses them across demands, so a borrowed cache that a
+later call overwrites would silently corrupt a persisted value; `get!` therefore
+prepares ordinary [`prepare`](api.md)-style kernels whose results are owned.
+
+Mutation-friendly *reactive* authoring is a separate, supported surface —
+`prepare_reactive` → `CompiledReactiveState`, with `mutate!`/`touch!` for
+in-place updates of the declared mutable state and owned typed slots for derived
+values. It keeps ownership, invalidation, and freeze/checkpoint semantics
+intact; see [Mutation-friendly reactive
+authoring](online-stats.md#Mutation-friendly-reactive-authoring). Reach for a
+`prepare_nonallocating` kernel only for direct, single-caller execution, and
+copy any mutable result you need to keep before the next call.
+
 ## Reproducible integration gate
 
 The default package tests remain independent of the unregistered weak
