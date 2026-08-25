@@ -26,8 +26,8 @@ include("graphops.jl")
 include("reactive.jl")
 include("visualization.jl")
 
-export Value, Recipe, Graph, Plan, PreparedKernel, PlanningError
-export value, value!, add!, plan, prepare, lower, transform, compile
+export Value, Recipe, Graph, Plan, PreparedKernel, NonAllocatingKernel, PlanningError
+export value, value!, add!, plan, prepare, prepare_nonallocating, lower, transform, compile
 export explain, code_expr, inputs, outputs, valtype
 export compose, PreparationCache, prepare!, canon_id
 export DAGVisualization, visualize, dot_source, save_visualization

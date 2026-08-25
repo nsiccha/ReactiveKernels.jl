@@ -14,9 +14,10 @@ a prepared kernel.
 > This is a proof-of-concept implementation of the design brief in
 > [this gist](https://gist.github.com/nsiccha/7f8c6802e1522be05f2d3240dba8aa68).
 > It contains no probabilistic-programming or domain-specific semantics — it is a
-> general dataflow abstraction. Scope covers the design's Phases 1–4; the
-> Phase 5 hooks (mutation/bufferization AST passes, e-graphs, Enzyme/Reactant
-> backends) are intentionally left as documented extension points.
+> general dataflow abstraction. Scope covers the design's Phases 1–4 and the
+> first Phase 5 physical-lowering integration: an optional
+> MutatingFunctions-backed non-allocating preparation path. E-graphs and
+> Enzyme/Reactant backends remain extension points.
 
 The runnable [`examples/eight_schools.jl`](examples/eight_schools.jl) shows how
 to build PPL semantics manually from ordinary recipes: unconstrained-to-
@@ -149,6 +150,67 @@ k    = compile(ast2)
 k    = prepare(p; passes = (mypass,))
 ```
 
+## Non-allocating preparation
+
+`prepare_nonallocating` keeps the same graph and plan, but applies one final AST
+pass that routes each selected operation through
+`MutatingFunctions.apply!!`. Every single-output recipe gets a typed persistent
+cache. MutatingFunctions is currently unregistered, so install the reviewed
+revision explicitly and load it to activate ReactiveKernels' optional extension:
+
+```julia
+using Pkg
+Pkg.add(url = "https://github.com/nsiccha/MutatingFunctions.jl",
+        rev = "b353559ef3e391ae2e2d98256b6967903fdfa410")
+
+using ReactiveKernels, MutatingFunctions
+```
+
+The first kernel call seeds its caches; later calls offer them back to the
+registered mutating implementation:
+
+```julia
+g = Graph()
+x = value!(g, :x, Vector{Float64})
+a = value!(g, :a, Vector{Float64})
+b = value!(g, :b, Vector{Float64})
+
+add!(g, x => a, copy)
+add!(g, a => b, reverse)
+
+k = prepare_nonallocating(g; have = (x,), want = (b,))
+k([1.0, 2.0, 3.0])  # warm-up: seeds the `copy` and `reverse` caches
+y = k([4.0, 5.0])    # reuses both caches; y == [5.0, 4.0]
+```
+
+This path deliberately inherits the `apply!!` contract:
+
+- steady-state allocation freedom requires every selected operation to have a
+  genuinely mutating `apply!!` method for the runtime types; its generic
+  fallback is correct but may allocate;
+- selected recipes must each have one output, matching `apply!!`'s one-cache /
+  one-result interface;
+- each cache slot retains whatever its operation first returns: registered
+  allocating operations normally seed fresh kernel-retained storage, but an
+  aliasing operation may retain caller-owned input, and a no-recipe plan returns
+  its `have` value directly; treat mutable results as borrowed values that may
+  alias inputs or be overwritten by the next call;
+- a prepared instance is stateful, non-reentrant, and not safe for concurrent
+  calls — prepare one per independent caller;
+- custom `passes` run on the ordinary lowered AST before the cache rewrite.
+
+See the [non-allocating workflow](docs/src/nonallocating.md) for inspection and
+allocation-testing examples.
+
+The optional surface has a reproducible exact-revision integration gate:
+
+```sh
+julia --startup-file=no test/run_nonallocating_integration.jl
+```
+
+The default `Pkg.test()` target intentionally does not install or load
+MutatingFunctions; CI runs both paths independently.
+
 ## API surface
 
 | Concept | Functions |
@@ -156,7 +218,7 @@ k    = prepare(p; passes = (mypass,))
 | Build | `Graph`, `value`, `value!`, `add!`, `compose` |
 | Plan | `plan`, `explain`, `code_expr`, `inputs`, `outputs` |
 | Visualize | `visualize`, `dot_source`, `save_visualization` |
-| Lower / compile | `lower`, `transform`, `compile`, `prepare` |
+| Lower / compile | `lower`, `transform`, `compile`, `prepare`, `prepare_nonallocating` |
 | Cache | `PreparationCache`, `prepare!` |
 | Reactive | `ReactiveState`, `set!`, `get!`, `freeze!`, `unfreeze!`, `materialize!`, `checkpoint` |
 
