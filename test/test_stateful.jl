@@ -147,11 +147,37 @@ end
     copyto!(destination, partial)
     @test get!(destination, doubled_state) == [6.0, 8.0]
 
+    # Handles carry an identity token in addition to their literal slot, so a
+    # same-graph program and a forged out-of-range handle fail uniformly before
+    # any tuple or validity-mask indexing.
+    other_program = prepare_reactive(
+        graph; have = (source,), want = (doubled, total),
+    )
+    foreign_same_graph = statevalue(other_program, total)
+    forged = ReactiveValue{99,Float64}(program.token, graph, total)
+    @test_throws ArgumentError get!(partial, foreign_same_graph)
+    @test_throws ArgumentError checkpoint(partial, (foreign_same_graph,))
+    @test_throws ArgumentError code_expr(program, foreign_same_graph)
+    @test_throws ArgumentError checkpoint(partial, (forged,))
+    @test_throws ArgumentError code_expr(program, forged)
+
+    foreign_graph = Graph()
+    foreign_source = value!(foreign_graph, :source, Vector{Float64})
+    foreign_total = value!(foreign_graph, :total, Float64)
+    add!(foreign_graph, foreign_source => foreign_total, sum)
+    foreign_program = prepare_reactive(
+        foreign_graph; have = (foreign_source,), want = (foreign_total,),
+    )
+    foreign_handle = statevalue(foreign_program, foreign_total)
+    @test_throws ArgumentError checkpoint(partial, (foreign_handle,))
+    @test_throws ArgumentError code_expr(program, foreign_handle)
+
     stale = program([1.0])
     stale_handle = statevalue(program, total)
     value!(graph, :late_graph_change, Float64)
     @test_throws ArgumentError get!(stale, stale_handle)
     @test_throws ArgumentError copy(stale)
+    @test_throws ArgumentError code_expr(program, stale_handle)
 end
 
 @testset "compiled reactive state preserves planner/lowering contracts" begin

@@ -12,6 +12,7 @@ hot code: their slot index is a type parameter, so `get!`, `set!`, and `touch!`
 use literal tuple indices without dictionary lookup.
 """
 struct ReactiveValue{I,T}
+    token::Base.RefValue{Nothing}
     graph::Graph
     value::Value{T}
 end
@@ -37,6 +38,7 @@ It contains a single selected `Plan`, an initialization kernel, compiled lazy
 getter kernels, and a precomputed dependency graph for invalidation.
 """
 struct ReactiveProgram{H,G,V,IN,OUT}
+    token::Base.RefValue{Nothing}
     graph::Graph
     graph_version::Int
     handles::H
@@ -91,10 +93,10 @@ function _state_values(plan::Plan)
     result
 end
 
-function _state_handles(graph::Graph, values)
+function _state_handles(token, graph::Graph, values)
     Tuple(begin
         T = valtype(value)
-        ReactiveValue{i,T}(graph, value)
+        ReactiveValue{i,T}(token, graph, value)
     end for (i, value) in enumerate(values))
 end
 
@@ -203,7 +205,8 @@ function prepare_reactive(graph::Graph; have = (), want = ())
     selected = plan(graph; have = have, want = want)
     values = _state_values(selected)
     index = Dict(canon_id(graph, value.id) => i for (i, value) in enumerate(values))
-    handles = _state_handles(graph, values)
+    token = Ref{Nothing}(nothing)
+    handles = _state_handles(token, graph, values)
     recipe_index = Dict(recipe.id => i for (i, recipe) in enumerate(selected.recipes))
     getters = Tuple(
         _prepare_getter(selected, index, recipe_index, canon_id(graph, value.id))
@@ -214,6 +217,7 @@ function prepare_reactive(graph::Graph; have = (), want = ())
     source_ids = Set(canon_id(graph, value.id) for value in selected.have)
     sources = BitVector(canon_id(graph, value.id) in source_ids for value in values)
     ReactiveProgram(
+        token,
         graph,
         graph.version,
         handles,
@@ -292,16 +296,29 @@ statevalue(state::CompiledReactiveState, value::Value) =
     nothing
 end
 
-function _check_handle(state::CompiledReactiveState, handle::ReactiveValue{I}) where {I}
-    _check_state_version(state)
-    handle.graph === state.program.graph || throw(ArgumentError(
+function _check_program_handle(program::ReactiveProgram,
+                               handle::ReactiveValue{I}) where {I}
+    program.graph.version == program.graph_version || throw(ArgumentError(
+        "graph changed after prepare_reactive; prepare a new ReactiveProgram",
+    ))
+    handle.token === program.token || throw(ArgumentError(
+        "ReactiveValue belongs to a different program",
+    ))
+    handle.graph === program.graph || throw(ArgumentError(
         "ReactiveValue belongs to a different graph",
     ))
-    expected = _tuple_slot(state.program.handles, Val(I))
+    1 <= I <= length(program.handles) || throw(ArgumentError(
+        "ReactiveValue slot is outside this program",
+    ))
+    expected = _tuple_slot(program.handles, Val(I))
     handle.value.id == expected.value.id || throw(ArgumentError(
         "ReactiveValue belongs to a different program",
     ))
     nothing
+end
+
+function _check_handle(state::CompiledReactiveState, handle::ReactiveValue)
+    _check_program_handle(state.program, handle)
 end
 
 @inline function Base.get!(state::CompiledReactiveState,
@@ -439,6 +456,7 @@ function checkpoint(state::CompiledReactiveState, values)
     result = Dict{Int,Any}()
     for value in _handle_tuple(values)
         handle = value isa ReactiveValue ? value : statevalue(state, value)
+        _check_handle(state, handle)
         state.program.sources[_slot_index(handle)] && throw(ArgumentError(
             "checkpoint stores derived cut points; pass HAVE values to the new program instance",
         ))
@@ -521,8 +539,10 @@ end
 
 inputs(program::ReactiveProgram) = program.inputs
 outputs(program::ReactiveProgram) = program.outputs
-code_expr(program::ReactiveProgram, handle::ReactiveValue{I}) where {I} =
+function code_expr(program::ReactiveProgram, handle::ReactiveValue{I}) where {I}
+    _check_program_handle(program, handle)
     _tuple_slot(program.getters, Val(I)).ast
+end
 code_expr(program::ReactiveProgram, value::Value) =
     code_expr(program, statevalue(program, value))
 
