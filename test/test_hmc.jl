@@ -250,14 +250,22 @@ end
         step_f = partial(leapfrog!; stepsize = 0.03),
         max_depth = 6,
     )
-    chain = sample!(state, 100; discard_initial = 50)
+    warmup = warmup!(state, 150; target_accept = 0.9)
+    chain = sample!(state, 100)
     densities = [logdensity(view(chain.samples, :, draw))
                  for draw in axes(chain.samples, 2)]
 
     @test size(chain.samples) == (10, 100)
     @test all(isfinite, chain.samples)
     @test all(isfinite, densities)
-    @test all(!diagnostic.diverged for diagnostic in chain.diagnostics)
+    divergences = count(diagnostic -> diagnostic.diverged, chain.diagnostics)
+    @test divergences <= 5
+    # The centered funnel is intentionally difficult; require a usable,
+    # non-degenerate post-warmup chain without pretending it reaches the
+    # nominal target acceptance in only 150 warmup transitions.
+    @test mean(diagnostic.acceptance_rate for diagnostic in chain.diagnostics) > 0.7
+    @test warmup.final_stepsize > 0
+    @test all(>(0), diag(warmup.metric))
     @test maximum(vec(std(chain.samples; dims = 2))) > 0.01
     # The selected combined gradient recipe owns potential+gradient; the
     # cheaper potential-only alternative must never be called in NUTS.
@@ -347,6 +355,14 @@ end
     @test diag(warmup.metric)[1] > diag(warmup.metric)[2]
     @test warmup.metric_window_ends == [40, 100]
     @test length(warmup.diagnostics) == 120
+
+    adapted_chain = sample!(adapted_state, 400)
+    adapted_means = vec(mean(adapted_chain.samples; dims = 2))
+    adapted_variances = vec(var(adapted_chain.samples; dims = 2))
+    @test all(isfinite, adapted_chain.samples)
+    @test all(!diagnostic.diverged for diagnostic in adapted_chain.diagnostics)
+    @test all(abs.(adapted_means) .< [0.2, 0.8])
+    @test all(abs.(adapted_variances ./ scales .- 1) .< 0.4)
 
     short_state = nuts_state(
         euclidean_phasepoint(

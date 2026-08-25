@@ -682,8 +682,8 @@ end
 Run a fixed-step NUTS chain, returning a named tuple with a dense `samples`
 matrix (parameters × draws) and one [`NUTSDiagnostics`](@ref) per retained
 draw. `discard_initial` only discards transitions; it does not adapt the step
-size or metric. Use the adaptation utilities explicitly until a warmup policy
-has been selected.
+size or metric. For an adaptive workflow, call [`warmup!`](@ref) first and then
+call `sample!` with `discard_initial=0` (the default).
 """
 function sample!(state::NUTSState, draws::Integer; discard_initial::Integer = 0)
     draws >= 0 || throw(ArgumentError("draws must be non-negative"))
