@@ -271,6 +271,68 @@ function _reactive_alias_target(rhs, fields::Set{Symbol}, shadow::Set{Symbol})
     (r isa Symbol && r in fields && !(r in shadow)) ? r : nothing
 end
 
+_copy_aliases(a::Dict{Symbol,Set{Symbol}}) =
+    Dict{Symbol,Set{Symbol}}(k => copy(v) for (k, v) in a)
+
+# The empty symbol marks a control-flow-CONFLICTED alias (root differs across
+# paths, or the local is an alias on only some reachable paths). It forces the
+# possible-root set to size >= 2 so a later mutation of that local is rejected at
+# macro expansion; it is filtered out of the diagnostic.
+const _REACTIVE_ALIAS_CONFLICT = Symbol("")
+
+# Does this if/elseif chain end in a plain `else` (so there is no fall-through)?
+function _has_final_else(ex)
+    (ex isa Expr && ex.head in (:if, :elseif) && length(ex.args) >= 3) || return false
+    last = ex.args[3]
+    (last isa Expr && last.head === :elseif) ? _has_final_else(last) : true
+end
+
+# STRICT control-flow merge: a local stays a sound alias ONLY if every reachable
+# path binds it to the SAME single field root. If roots differ, or the local is an
+# alias on only some paths (alias-vs-nonalias), it is marked conflicted (a mutation
+# then errors at expansion). `paths` are the per-path alias maps (branch results,
+# plus the incoming snapshot when a fall-through is reachable).
+function _reactive_merge_strict!(dest::Dict{Symbol,Set{Symbol}}, paths)
+    paths = collect(paths)
+    empty!(dest)
+    ks = Set{Symbol}(); for p in paths; union!(ks, keys(p)); end
+    for k in ks
+        roots = Set{Symbol}(); sound = true
+        for p in paths
+            if haskey(p, k)
+                union!(roots, p[k])
+                length(p[k]) == 1 || (sound = false)
+            else
+                sound = false                       # alias on only some paths
+            end
+        end
+        dest[k] = (sound && length(roots) == 1) ? Set([first(roots)]) :
+                  union(roots, Set([_REACTIVE_ALIAS_CONFLICT]))
+    end
+    dest
+end
+
+# Route an alias-local mutation to the field it aliases. A straight-line
+# single-field alias (`tree = trees[d]; tree.x = …`) lowers to one assign!-backed
+# inplace closure that invalidates exactly that field's dependents. A
+# branch/loop-DIVERGENT alias (bound to different fields on different control-flow
+# paths) is REJECTED at macro expansion with an actionable error: a compile-time
+# over-approximation would assign! every candidate — materializing a non-chosen
+# invalid recipe and throwing if a non-chosen candidate is frozen — which is
+# unsound, and there is no in-band runtime field identity to dispatch on without a
+# Symbol/materialization. ca9's aliases are all straight-line single-field.
+function _reactive_alias_dispatch(self, aliasname, roots, body)
+    length(roots) == 1 &&
+        return _reactive_inplace_call(self, first(roots), gensym(:buffer), body)
+    named = sort!(collect(r for r in roots if r != _REACTIVE_ALIAS_CONFLICT))
+    throw(ArgumentError(string(
+        "@reactive: local `", aliasname, "` aliases a reactive field only on some ",
+        "control-flow paths, or different fields on different paths (",
+        isempty(named) ? "no consistent field" : join(named, ", "),
+        "); a control-flow-divergent alias cannot be soundly invalidated. Bind it ",
+        "to one field on every path, or mutate the field directly.")))
+end
+
 # `_reactive_inplace!(self, Val(root)) do buffer; body; end`.
 _reactive_inplace_call(self, root, buffer, body) =
     Expr(:call, _reactive_inplace!, Expr(:(->), buffer, Expr(:block, body)),
@@ -284,7 +346,7 @@ _reactive_inplace_call(self, root, buffer, body) =
 # destructuring mutations use the closure form (root -> buffer) directly, which
 # is correct for pure RHS and avoids materializing a broadcast result.
 function _reactive_inplace(ex, fields, methods, self, shadow, root::Symbol,
-                           aliases::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}())
+                           aliases::Dict{Symbol,Set{Symbol}} = Dict{Symbol,Set{Symbol}}())
     buffer = gensym(:buffer)
     lhs = ex.args[1]; rhs = ex.args[2]
     if ex.head === :(=)
@@ -311,7 +373,7 @@ end
 # forwarded the object. `shadow` holds locally-bound names.
 function _reactive_rewrite(ex, fields::Set{Symbol}, methods::Set{Symbol},
                            self::Symbol, shadow::Set{Symbol},
-                           aliases::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}())
+                           aliases::Dict{Symbol,Set{Symbol}} = Dict{Symbol,Set{Symbol}}())
     if ex isa Symbol
         (ex in fields && !(ex in shadow)) &&
             return Expr(:call, getproperty, self, QuoteNode(ex))
@@ -340,7 +402,7 @@ function _reactive_rewrite(ex, fields::Set{Symbol}, methods::Set{Symbol},
                 subst = _reactive_subst(inner, fields, methods, self, shadow,
                                         gensym(:__noroot__), gensym(:__nobuf__); dot = true)
                 dotted = Expr(:macrocall, ex.args[1], ex.args[2], subst)
-                return _reactive_inplace_call(self, aliases[root], gensym(:buffer), dotted)
+                return _reactive_alias_dispatch(self, root, aliases[root], dotted)
             end
         end
         return Expr(:macrocall, ex.args[1], ex.args[2],
@@ -357,13 +419,13 @@ function _reactive_rewrite(ex, fields::Set{Symbol}, methods::Set{Symbol},
             if lhs !== root && root isa Symbol && haskey(aliases, root)
                 mut = Expr(ex.head, lhs,
                            _reactive_rewrite(rhs, fields, methods, self, shadow, aliases))
-                return _reactive_inplace_call(self, aliases[root], gensym(:buffer), mut)
+                return _reactive_alias_dispatch(self, root, aliases[root], mut)
             end
             # (Re)binding a local: record a field alias if the RHS references into a
             # field, else clear any prior alias for that name.
             if lhs isa Symbol
                 target = _reactive_alias_target(rhs, fields, shadow)
-                target === nothing ? delete!(aliases, lhs) : (aliases[lhs] = target)
+                target === nothing ? delete!(aliases, lhs) : (aliases[lhs] = Set([target]))
             end
             local_names = Set{Symbol}(); _reactive_assign_names!(local_names, lhs)
             inner = union(shadow, local_names)
@@ -384,13 +446,38 @@ function _reactive_rewrite(ex, fields::Set{Symbol}, methods::Set{Symbol},
         return _reactive_sibling_call(ex, self, rw)
     elseif ex.head === :. && length(ex.args) == 2 && ex.args[2] isa QuoteNode
         return Expr(:., rw(ex.args[1]), ex.args[2])
+    elseif ex.head in (:if, :elseif)
+        # Rewrite the condition, then each branch on its OWN copy of the alias map,
+        # and STRICT-merge the reachable paths: a local stays an alias only if every
+        # reachable path binds it to the SAME single field; otherwise a later
+        # mutation of it errors at expansion. The incoming snapshot is a reachable
+        # path only when there is no final `else` (fall-through).
+        cond = rw(ex.args[1])
+        snapshot = _copy_aliases(aliases)
+        out = Any[cond]; branches = Dict{Symbol,Set{Symbol}}[]
+        for br in ex.args[2:end]
+            bd = _copy_aliases(snapshot)
+            push!(out, _reactive_rewrite(br, fields, methods, self, shadow, bd))
+            push!(branches, bd)
+        end
+        paths = _has_final_else(ex) ? branches : push!(copy(branches), snapshot)
+        _reactive_merge_strict!(aliases, paths)
+        return Expr(ex.head, out...)
     elseif ex.head in (:for, :while)
         bind = Set{Symbol}()
         ex.head === :for && _reactive_assign_names!(bind, ex.args[1] isa Expr &&
             ex.args[1].head === :(=) ? ex.args[1].args[1] : ex.args[1])
-        inner = union(shadow, bind); scope = copy(aliases)
-        return Expr(ex.head, (_reactive_rewrite(a, fields, methods, self, inner, scope)
+        inner = union(shadow, bind)
+        # A loop runs 0+ times, so after it a local may hold its incoming alias
+        # (0 iterations) OR a loop-body binding (>=1). Rewrite the body on a copy,
+        # then merge incoming + body-scope (union) back into the outer map.
+        incoming = _copy_aliases(aliases); scope = _copy_aliases(aliases)
+        body = Expr(ex.head, (_reactive_rewrite(a, fields, methods, self, inner, scope)
                               for a in ex.args)...)
+        # Both zero iterations (incoming) and >=1 (body result) are reachable;
+        # strict-merge rejects a local whose alias changed across them.
+        _reactive_merge_strict!(aliases, (incoming, scope))
+        return body
     end
     Expr(ex.head, (rw(arg) for arg in ex.args)...)
 end

@@ -587,19 +587,24 @@ function assign!(state::CompiledReactiveState, handle::ReactiveValue{I,T}, value
     state
 end
 
-"In-place `assign!`: materialize the slot, mutate it via `f`, then mark valid and invalidate dependents (even if `f` throws)."
+"""
+In-place `assign!`: materialize the slot, mutate it via `f`, then mark valid and
+invalidate dependents (even if `f` throws). Returns `f`'s result so a rooted
+in-place assignment lowered onto this preserves Julia's assignment value (the new
+scalar for an indexed compound, the destination for a dotted/broadcast assign);
+`try return f(value) finally …` keeps the finally invalidation on both paths.
+"""
 function assign!(f, state::CompiledReactiveState, handle::ReactiveValue{I,T}) where {I,T}
     _check_handle(state, handle)
     state.frozen[I] && throw(ArgumentError(
         "assign! cannot override frozen slot $I; unfreeze! first"))
     value = get!(state, handle)
     try
-        f(value)
+        return f(value)
     finally
         state.valid[I] = true
         _invalidate_dependents!(state, I)
     end
-    state
 end
 
 "Freeze the current value of a derived slot as an authoritative cut point."

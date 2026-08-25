@@ -197,3 +197,125 @@ end
     _acc(obj, i, x) = (accumulate!(obj, i, x); @allocated accumulate!(obj, i, x))
     @test _acc(z, 1, 1.0) == 0
 end
+
+const _BR_A = Ref(0)
+const _BR_B = Ref(0)
+
+@reactive branchobj(k::Int) = begin
+    a::Vector{Float64} = fill(1.0, k)
+    b::Vector{Float64} = fill(10.0, k)
+    asum::Float64 = (_BR_A[] += 1; sum(a))
+    bsum::Float64 = (_BR_B[] += 1; sum(b))
+    bumpa!(delta) = begin
+        w = a                          # straight-line single-field alias (ca9 shape)
+        w[1] += delta
+    end
+end
+
+# Expand a @reactive definition, returning "" on success or the ArgumentError
+# message on a macro-expansion rejection.
+function _reactive_expansion_error(defexpr)
+    try
+        macroexpand(@__MODULE__, defexpr)
+        ""
+    catch e
+        e isa LoadError && (e = e.error)
+        e isa ArgumentError ? e.msg : sprint(showerror, e)
+    end
+end
+
+@testset "@reactive ca9 — single-field alias is scoped; frozen other field untouched" begin
+    _BR_A[] = 0; _BR_B[] = 0
+    t = branchobj(2)
+    @test t.asum == 2.0 && t.bsum == 20.0                 # materialize both dependents
+    ReactiveKernels.freeze!(t.state, t.handles.b)         # freeze the b field
+    ca = _BR_A[]; cb = _BR_B[]
+    bumpa!(t, 5.0)                                        # w = a; a[1] 1 -> 6 (no throw)
+    @test t.a[1] == 6.0 && t.b[1] == 10.0                 # only a mutated
+    @test t.asum == 7.0 && _BR_A[] == ca + 1              # a's dependent recomputed
+    @test t.bsum == 20.0 && _BR_B[] == cb                 # b frozen: NOT materialized/recomputed
+end
+
+@testset "@reactive ca9 — control-flow-divergent aliases are rejected at expansion" begin
+    # different fields on different branches
+    @test occursin("cannot be soundly invalidated", _reactive_expansion_error(:(
+        @reactive _bad_branch(k::Int) = begin
+            a::Vector{Float64} = fill(1.0, k); b::Vector{Float64} = fill(2.0, k)
+            m!(c) = begin
+                if c; w = a; else; w = b; end
+                w[1] += 1.0
+            end
+        end)))
+    # alias on one path, non-alias on the other (bare if fall-through)
+    @test occursin("cannot be soundly invalidated", _reactive_expansion_error(:(
+        @reactive _bad_mixed(k::Int) = begin
+            a::Vector{Float64} = fill(1.0, k)
+            m!(c) = begin
+                w = a
+                if c; w = zeros(k); end
+                w[1] += 1.0
+            end
+        end)))
+    # loop rebinds the alias to a different field (0 vs >=1 iterations diverge)
+    @test occursin("cannot be soundly invalidated", _reactive_expansion_error(:(
+        @reactive _bad_loop(k::Int) = begin
+            a::Vector{Float64} = fill(1.0, k); b::Vector{Float64} = fill(2.0, k)
+            m!(n) = begin
+                w = a
+                for _ in 1:n; w = b; end
+                w[1] += 1.0
+            end
+        end)))
+    # a straight-line single-field alias must NOT be rejected
+    @test _reactive_expansion_error(:(
+        @reactive _ok_alias(k::Int) = begin
+            a::Vector{Float64} = fill(1.0, k)
+            m!() = begin
+                w = a
+                w[1] += 1.0
+            end
+        end)) == ""
+end
+
+@reactive retobj(k::Int) = begin
+    arr::Vector{Float64} = fill(2.0, k)
+    scal::Float64 = 0.0
+    r_compound!(i) = begin
+        return arr[i] += 1.0           # indexed compound -> new scalar
+    end
+    r_dotted!(v) = begin
+        return arr .= v                # dotted -> destination (arr)
+    end
+    r_scalarcompound!(x) = begin
+        return scal += x               # scalar bare-field compound -> new value
+    end
+    r_wholefield!(v) = begin
+        return arr = v                 # whole-field -> v
+    end
+    r_alias!(i) = begin
+        w = arr
+        return w[i] += 1.0             # local-alias compound -> new scalar
+    end
+    r_dotmacro!(v) = begin
+        return @. arr = v              # @. dotmacro -> destination (arr)
+    end
+    r_aliasdotmacro!() = begin
+        w = arr
+        return @. w = w * 2.0          # alias-@. -> destination (w === arr)
+    end
+end
+
+@testset "@reactive ca9 — rooted in-place assignment return values" begin
+    o = retobj(3)
+    @test r_compound!(o, 1) === 3.0                # arr[1] 2 -> 3
+    @test o.arr[1] == 3.0
+    dest = r_dotted!(o, 5.0)                       # arr .= 5 returns the destination
+    @test dest == [5.0, 5.0, 5.0] && dest === o.arr
+    @test r_scalarcompound!(o, 4.0) === 4.0        # scal 0 -> 4
+    @test r_wholefield!(o, [1.0, 2.0, 3.0]) == [1.0, 2.0, 3.0]
+    @test r_alias!(o, 2) === 3.0                   # arr now [1,2,3]; w[2] 2 + 1 = 3
+    d2 = r_dotmacro!(o, 7.0)                        # @. arr = 7 -> destination
+    @test d2 == [7.0, 7.0, 7.0] && d2 === o.arr
+    d3 = r_aliasdotmacro!(o)                        # w=arr; @. w = w*2 -> destination
+    @test d3 == [14.0, 14.0, 14.0] && d3 === o.arr
+end
