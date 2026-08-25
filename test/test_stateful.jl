@@ -456,3 +456,54 @@ end
     _cg2(st, dh, sh) = (copy_group!(st, dh, sh); @allocated copy_group!(st, dh, sh))
     @test _cg2(state, (hv1, hv2), (hv2, hv2)) == 0
 end
+
+@testset "assign! direct-slot override (internal facade primitive)" begin
+    graph = Graph()
+    a = value!(graph, :a, Float64)
+    b = value!(graph, :b, Float64)
+    c = value!(graph, :c, Float64)
+    bcalls = Ref(0)
+    add!(graph, a => b, x -> (bcalls[] += 1; x + 10))
+    add!(graph, b => c, x -> x * 2)
+    program = prepare_reactive(graph; have = (a,), want = (b, c))
+    st = program(5.0)
+    ha = statevalue(program, a); hb = statevalue(program, b); hc = statevalue(program, c)
+    @test get!(st, hb) == 15.0 && get!(st, hc) == 30.0
+    @test bcalls[] == 1
+
+    # override a DERIVED slot: get! returns it with no recompute; downstream recomputes
+    ReactiveKernels.assign!(st, hb, 100.0)
+    @test get!(st, hb) == 100.0
+    @test bcalls[] == 1                     # recipe NOT re-run for the override
+    @test get!(st, hc) == 200.0             # downstream recomputed from the override
+
+    # a later true-upstream change invalidates the override -> recompute from recipe
+    set!(st, ha, 7.0)
+    @test get!(st, hb) == 17.0
+    @test bcalls[] == 2
+    @test get!(st, hc) == 34.0
+
+    # on a HAVE source assign! == set!
+    ReactiveKernels.assign!(st, ha, 1.0)
+    @test get!(st, hb) == 11.0
+
+    # a frozen slot is rejected; frozen bit is never changed
+    freeze!(st, hb)
+    @test_throws ArgumentError ReactiveKernels.assign!(st, hb, 0.0)
+    @test st.frozen[ReactiveKernels._slot_index(hb)]
+    unfreeze!(st, hb)
+
+    # in-place form on an array derived slot, buffer reused
+    g2 = Graph()
+    s = value!(g2, :s, Vector{Float64}); d = value!(g2, :d, Vector{Float64})
+    add!(g2, s => d, x -> 2 .* x)
+    p2 = prepare_reactive(g2; have = (s,), want = (d,))
+    st2 = p2([1.0, 2.0]); hd = statevalue(p2, d)
+    @test get!(st2, hd) == [2.0, 4.0]
+    buf0 = get!(st2, hd)
+    ReactiveKernels.assign!(st2, hd) do buf
+        buf .= 99.0
+    end
+    @test get!(st2, hd) == [99.0, 99.0]
+    @test get!(st2, hd) === buf0            # reused the same buffer
+end

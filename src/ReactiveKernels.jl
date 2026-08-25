@@ -30,6 +30,7 @@ include("authoring.jl")
 include("reactive.jl")
 include("stateful.jl")
 include("hmc.jl")
+include("reactive_facade.jl")
 include("visualization.jl")
 
 export Value, Recipe, Graph, Plan, PreparedKernel, NonAllocatingKernel, PlanningError
@@ -42,6 +43,7 @@ export DAGVisualization, visualize, dot_source, save_visualization
 export ReactiveState, set!, get!, freeze!, unfreeze!, checkpoint, materialize!
 export ReactiveProgram, CompiledReactiveState, ReactiveValue
 export prepare_reactive, statevalue, touch!, mutate!, copy_group!
+export ReactiveObject, @reactive
 # Reactive HMC/NUTS layer
 export ReactivePhasePoint, euclidean_phasepoint, riemannian_phasepoint
 export leapfrog!, generalized_leapfrog!, implicit_midpoint!, multistep

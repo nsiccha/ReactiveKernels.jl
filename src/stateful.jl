@@ -426,6 +426,42 @@ end
 set!(state::CompiledReactiveState, graph_value::Value, value) =
     set!(state, statevalue(state, graph_value), value)
 
+# `assign!` is the INTERNAL direct-slot writer the @reactive facade lowers every
+# object field write to (both HAVE and derived), so the facade needs no
+# HAVE/derived branching. It writes the slot, marks it valid, and runs the
+# existing dependent-invalidation worklist — it never changes the frozen bit and
+# rejects a frozen slot. On a HAVE source it equals `set!`; on an unfrozen
+# derived slot it is a TEMPORARY OVERRIDE: `get!` short-circuits on the valid bit
+# and returns the assigned value without recomputing, and a later change to a
+# true upstream dependency invalidates this slot again so `get!` recomputes from
+# the recipe. `set!` stays HAVE-only and exported; `assign!` is not exported —
+# arbitrary slot pokes are not part of the public surface (approved by
+# ReactiveKernels:poc against the compiled-state invariants).
+function assign!(state::CompiledReactiveState, handle::ReactiveValue{I,T}, value) where {I,T}
+    _check_handle(state, handle)
+    state.frozen[I] && throw(ArgumentError(
+        "assign! cannot override frozen slot $I; unfreeze! first"))
+    _tuple_slot(state.slots, Val(I))[] = value
+    state.valid[I] = true
+    _invalidate_dependents!(state, I)
+    state
+end
+
+"In-place `assign!`: materialize the slot, mutate it via `f`, then mark valid and invalidate dependents (even if `f` throws)."
+function assign!(f, state::CompiledReactiveState, handle::ReactiveValue{I,T}) where {I,T}
+    _check_handle(state, handle)
+    state.frozen[I] && throw(ArgumentError(
+        "assign! cannot override frozen slot $I; unfreeze! first"))
+    value = get!(state, handle)
+    try
+        f(value)
+    finally
+        state.valid[I] = true
+        _invalidate_dependents!(state, I)
+    end
+    state
+end
+
 "Freeze the current value of a derived slot as an authoritative cut point."
 function freeze!(state::CompiledReactiveState, handle::ReactiveValue{I}) where {I}
     _check_handle(state, handle)
