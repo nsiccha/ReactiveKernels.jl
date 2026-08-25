@@ -1,6 +1,7 @@
 import './kernel-example.css'
 
 let exampleCounter = 0
+let kernelExamplesStarted = false
 
 type PaneName = 'source' | 'kernel' | 'dag'
 
@@ -170,7 +171,8 @@ function processKernelExamples(root: ParentNode) {
 }
 
 export function setupKernelExamples() {
-  if (typeof window === 'undefined') return
+  if (typeof window === 'undefined' || kernelExamplesStarted) return
+  kernelExamplesStarted = true
 
   processKernelExamples(document.body)
   const observer = new MutationObserver((mutations) => {
