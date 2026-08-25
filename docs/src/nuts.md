@@ -8,10 +8,16 @@ invalidates and lazily recomputes only their downstream recipes.
 
 The complete runnable source is
 [`examples/nuts.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/nuts.jl).
-Its model and Hamiltonian are ordinary declarative recipes:
+Its model and Hamiltonian are ordinary declarative recipes. The panel below is
+one build-executed artifact: **Raw input** is the exact public `@kernel` source
+and query, **Generated kernel** is the actual prepared Hamiltonian subkernel,
+and **Compute DAG** is the live colored `visualize(hamiltonian_kernel.plan)`
+component. Choose **Compare all** to inspect the three views side by side while
+preserving the DAG's fit, zoom, pan, and node-inspection state.
 
-```@example nuts
-using LinearAlgebra, Random, ReactiveKernels
+```@eval
+Main.ReactiveKernelsDocs.execute_example(@__MODULE__, raw"""
+using LinearAlgebra
 
 potential(position) = sum(abs2, position) / 2
 potential_gradient(position) = (potential(position), copy(position))
@@ -31,36 +37,35 @@ model = @kernel begin
     dham_dpos::Vector{Float64} = dpot_dpos
     return (pot, dpot_dpos, chol_metric, kin, ham, dham_dpos, dham_dmom)
 end
-nothing # hide
-```
 
-The same public spec exposes the selected plan, generated Hamiltonian getter,
-and colored compute DAG before sampling:
-
-```@example nuts
 dimension = 4
-point = euclidean_phasepoint(model, (
+inputs = (;
     pos = zeros(dimension),
     mom = zeros(dimension),
     metric = Matrix{Float64}(I, dimension, dimension),
-))
-selected_plan = explain(plan(point))
-generated_hamiltonian = code_expr(point, :ham)
-dag = visualize(plan(point))
+)
+hamiltonian_kernel = prepare(model;
+    have = (:pos, :mom, :metric),
+    want = (:ham, :dham_dpos, :dham_dmom),
+)
+output = hamiltonian_kernel(Tuple(inputs)...)
 
-(selected_plan, generated_hamiltonian)
-```
-
-The selected plan's HTML-showable DAG is rendered directly, preserving its
-fit, zoom, pan, and node-inspection controls:
-
-```@example nuts
-Main.ReactiveKernelsDocs.html_result(dag) # hide
+docs_example = (;
+    name = :nuts_hamiltonian,
+    origin = "declarative NUTS Hamiltonian (build executed)",
+    inputs,
+    kernel = hamiltonian_kernel,
+    output,
+)
+""")
 ```
 
 The same compiled reactive program then drives warmup and sampling:
 
 ```@example nuts
+using Random
+
+point = euclidean_phasepoint(model, inputs)
 sampler = nuts_state(point;
     rng = Xoshiro(20260825),
     step_f = partial(leapfrog!; stepsize = 0.35),
