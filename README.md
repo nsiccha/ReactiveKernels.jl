@@ -24,7 +24,8 @@ to build PPL semantics manually from ordinary recipes: unconstrained-to-
 constrained transforms, an optional log Jacobian, decomposed prior and
 likelihood terms, pointwise log likelihoods, total log density, and new-group
 prediction. Different `want` sets prune density or generated-quantity work from
-the same graph, and the numeric boundary accepts forward-mode AD dual numbers.
+the same graph, and the numeric boundary differentiates cleanly through
+reverse-mode AD (`DifferentiationInterface` with the Enzyme backend).
 
 ## Pipeline
 
