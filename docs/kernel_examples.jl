@@ -69,6 +69,7 @@ function setup_online_stats!(mod::Module)
     if !isdefined(mod, :OnlineStatsExample)
         Base.include(mod, joinpath(@__DIR__, "..", "examples", "online_stats.jl"))
     end
+    Core.eval(mod, :(using Statistics))
     Core.eval(mod, :(using .OnlineStatsExample: MomentsAccumulator))
     nothing
 end
