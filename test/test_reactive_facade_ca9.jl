@@ -75,6 +75,11 @@ const _CA9_MSUM = Ref(0)    # recompute counter for `msum`   (depends on mvs)
         c && (w = weights[2])           # short-circuit rebind, SAME root -> accepted
         w[1] += delta
     end
+    orsameroot!(c, delta) = begin
+        w = weights[1]
+        c || (w = weights[2])           # || short-circuit rebind, SAME root -> accepted
+        w[1] += delta
+    end
 end
 
 @testset "@reactive ca9 — indexed/nested/compound/dotted/@./loop" begin
@@ -138,11 +143,24 @@ end
     ternroot!(t, true, 10.0)                       # w = true ? weights[1] : weights[2]
     @test t.weights[1][1] == 15.0                  # 5 + 10
     @test t.wsum == 18.0 && _CA9_WSUM[] == c3 + 1
-    # short-circuit && rebind to the SAME root is also accepted and invalidates
+    # short-circuit && rebind to the SAME root is accepted; prove BOTH paths
     c4 = _CA9_WSUM[]
     andsameroot!(t, false, 2.0)                    # c=false -> no rebind; w=weights[1]; +2
     @test t.weights[1][1] == 17.0
     @test t.wsum == 20.0 && _CA9_WSUM[] == c4 + 1
+    c5 = _CA9_WSUM[]
+    andsameroot!(t, true, 4.0)                     # c=true -> executed RHS; w=weights[2] (=3) +4
+    @test t.weights[2][1] == 7.0
+    @test t.wsum == 24.0 && _CA9_WSUM[] == c5 + 1
+    # same-root `||` control, both paths
+    c6 = _CA9_WSUM[]
+    orsameroot!(t, true, 1.0)                      # c=true -> short-circuit; w=weights[1]; +1
+    @test t.weights[1][1] == 18.0
+    @test t.wsum == 25.0 && _CA9_WSUM[] == c6 + 1
+    c7 = _CA9_WSUM[]
+    orsameroot!(t, false, 6.0)                     # c=false -> executed RHS; w=weights[2] (=7) +6
+    @test t.weights[2][1] == 13.0
+    @test t.wsum == 31.0 && _CA9_WSUM[] == c7 + 1
 end
 
 @testset "@reactive ca9 — local-alias @. nested mutation invalidates dependent" begin
