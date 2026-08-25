@@ -82,9 +82,13 @@ partitioned = reduce(merge, parts)
 ```
 
 Empty means and variances are `NaN`. A singleton has a finite mean, `NaN`
-corrected variance, and zero uncorrected variance. Constant and large-offset
-streams retain nonnegative `m2`; only a negative value within the explicit
-floating-point rounding tolerance is clamped to zero.
+corrected variance, and zero uncorrected variance. Non-finite observations
+propagate `NaN` or positive infinity; a negative `m2`, including negative
+infinity, is rejected. Constant and large-offset streams retain nonnegative
+`m2`; only a finite negative value within the explicit floating-point rounding
+tolerance is clamped to zero. Count ratios use widened arithmetic before the
+result is stored back in `T`, so narrow storage such as `Float16` remains valid
+when a merged count exceeds its largest finite value.
 
 ## Reactive invalidation is explicit
 

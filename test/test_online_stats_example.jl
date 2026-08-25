@@ -10,6 +10,12 @@ const OSE = OnlineStatsExample
     @test_throws MethodError OSE.MomentsAccumulator(Int)
     @test_throws ArgumentError OSE.MomentsAccumulator{Float64}(-1, 0, 0)
     @test_throws ArgumentError OSE.MomentsAccumulator{Float64}(2, 0, -1)
+    @test_throws ArgumentError OSE.MomentsAccumulator{Float64}(2, 0, -Inf)
+    @test_throws DomainError OSE._nonnegative_m2(-Inf, Inf)
+    @test isnan(OSE._nonnegative_m2(NaN, 1.0))
+    @test OSE._nonnegative_m2(Inf, Inf) == Inf
+    @test isnan(OSE.MomentsAccumulator{Float64}(2, 0, NaN).m2)
+    @test OSE.MomentsAccumulator{Float64}(2, 0, Inf).m2 == Inf
 
     @testset "empty, singleton, and non-finite semantics" begin
         empty_state = OSE.MomentsAccumulator()
@@ -81,6 +87,47 @@ const OSE = OnlineStatsExample
                               merge(parts[2], merge(parts[3], parts[4])))
         @test mean(left_grouped) ≈ mean(right_grouped) rtol=1e-14
         @test left_grouped.m2 ≈ right_grouped.m2 rtol=1e-10
+
+        # Float16 cannot represent 80_000 as a finite value. Count ratios and
+        # the Chan cross term must therefore be evaluated in widened arithmetic
+        # before the resulting sufficient statistics are stored back in Float16.
+        zeros16 = OSE.fit(Float16, zeros(Float16, 40_000))
+        ones16 = OSE.fit(Float16, ones(Float16, 40_000))
+        forward16 = @inferred merge(zeros16, ones16)
+        reverse16 = @inferred merge(ones16, zeros16)
+        for combined in (forward16, reverse16)
+            @test combined.n == 80_000
+            @test mean(combined) isa Float16
+            @test isfinite(mean(combined))
+            @test mean(combined) ≈ Float16(0.5)
+            @test isfinite(combined.m2)
+            @test combined.m2 ≈ Float16(20_000)
+            @test @inferred(var(combined)) isa Float16
+            @test isfinite(var(combined))
+            @test var(combined) ≈ Float16(0.25)
+            @test var(combined; corrected=false) ≈ Float16(0.25)
+        end
+        @test isequal(forward16, reverse16)
+        advanced16 = @inferred OSE.update(forward16, one(Float16))
+        @test advanced16.n == 80_001
+        @test isfinite(advanced16.mean)
+        @test isfinite(advanced16.m2)
+        @test isfinite(var(advanced16))
+
+        uneven16 = (
+            OSE.fit(Float16, zeros(Float16, 30_000)),
+            OSE.fit(Float16, ones(Float16, 40_000)),
+            OSE.fit(Float16, fill(Float16(2), 10_000)),
+        )
+        left16 = merge(merge(uneven16[1], uneven16[2]), uneven16[3])
+        right16 = merge(uneven16[1], merge(uneven16[2], uneven16[3]))
+        @test left16.n == right16.n == 80_000
+        @test isfinite(left16.mean) && isfinite(right16.mean)
+        @test left16.mean ≈ Float16(0.75) atol=eps(Float16)
+        @test right16.mean ≈ Float16(0.75) atol=eps(Float16)
+        @test isfinite(left16.m2) && isfinite(right16.m2)
+        @test left16.m2 ≈ right16.m2 rtol=Float16(4) * eps(Float16)
+        @test isfinite(var(left16)) && isfinite(var(right16))
     end
 
     @testset "generated state kernels are inferred and allocation-free" begin

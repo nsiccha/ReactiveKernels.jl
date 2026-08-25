@@ -16,9 +16,11 @@ Immutable sufficient statistics for the mean and variance of a scalar stream.
 `T` must be a floating-point type so the empty and corrected-singleton results
 can be represented as `NaN` without changing the return type.
 
-Finite states maintain `m2 >= 0`. The update and merge algorithms clamp only a
-negative value within a small floating-point roundoff tolerance back to zero;
-a larger negative value is an error.
+States maintain `m2 >= 0`, except that `NaN` and `+Inf` propagate from
+non-finite observations. Negative values, including `-Inf`, are rejected. The
+update and merge algorithms clamp only a finite negative value within a small
+floating-point roundoff tolerance back to zero; a larger negative value is an
+error.
 """
 struct MomentsAccumulator{T<:AbstractFloat}
     n::Int
@@ -31,8 +33,8 @@ struct MomentsAccumulator{T<:AbstractFloat}
         count >= 0 || throw(ArgumentError("observation count must be non-negative"))
         μ = convert(T, mean)
         second = convert(T, m2)
-        isfinite(second) && second < zero(T) &&
-            throw(ArgumentError("finite m2 must be non-negative"))
+        second < zero(T) &&
+            throw(ArgumentError("m2 must not be negative"))
         count == 0 && (!iszero(μ) || !iszero(second)) &&
             throw(ArgumentError("an empty accumulator must have zero mean and m2"))
         count == 1 && !iszero(second) &&
@@ -45,7 +47,9 @@ MomentsAccumulator(::Type{T}=Float64) where {T<:AbstractFloat} =
     MomentsAccumulator{T}(0, zero(T), zero(T))
 
 function _nonnegative_m2(value::T, scale::T) where {T<:AbstractFloat}
-    (!isfinite(value) || value >= zero(T)) && return value
+    (isnan(value) || value >= zero(T)) && return value
+    isinf(value) &&
+        throw(DomainError(value, "m2 became negative infinity"))
     tolerance = T(16) * eps(T) * max(one(T), abs(scale))
     value >= -tolerance && return zero(T)
     throw(DomainError(value, "m2 became negative beyond floating-point roundoff"))
@@ -64,11 +68,15 @@ function update(accumulator::MomentsAccumulator{T},
     accumulator.n == 0 && return MomentsAccumulator{T}(1, x, zero(T))
 
     n = Base.checked_add(accumulator.n, 1)
-    delta = x - accumulator.mean
-    next_mean = accumulator.mean + delta / T(n)
-    increment = delta * (x - next_mean)
-    next_m2 = _nonnegative_m2(accumulator.m2 + increment,
-                              abs(accumulator.m2) + abs(increment))
+    W = promote_type(T, Float64)
+    wide_x = W(x)
+    wide_mean = W(accumulator.mean)
+    delta = wide_x - wide_mean
+    next_mean = wide_mean + delta / W(n)
+    increment = delta * (wide_x - next_mean)
+    wide_m2 = W(accumulator.m2)
+    next_m2 = _nonnegative_m2(wide_m2 + increment,
+                              abs(wide_m2) + abs(increment))
     MomentsAccumulator{T}(n, next_mean, next_m2)
 end
 
@@ -96,7 +104,9 @@ fit(observations) = fit(Float64, observations)
 
 Combine two partitions with Chan's parallel-variance formula. Empty
 accumulators are exact identities. Both arguments must use the same floating
-storage type, keeping the return type statically known.
+storage type, keeping the return type statically known. Count ratios and the
+cross term use at least `Float64` arithmetic so narrow storage types never
+convert a valid large `Int` count to floating-point infinity.
 """
 function Base.merge(a::MomentsAccumulator{T},
                     b::MomentsAccumulator{T}) where {T<:AbstractFloat}
@@ -104,12 +114,17 @@ function Base.merge(a::MomentsAccumulator{T},
     b.n == 0 && return a
 
     n = Base.checked_add(a.n, b.n)
-    delta = b.mean - a.mean
-    b_weight = T(b.n) / T(n)
-    next_mean = a.mean + delta * b_weight
-    cross = delta * delta * (T(a.n) * T(b.n) / T(n))
-    next_m2 = _nonnegative_m2(a.m2 + b.m2 + cross,
-                              abs(a.m2) + abs(b.m2) + abs(cross))
+    W = promote_type(T, Float64)
+    wide_a_mean = W(a.mean)
+    wide_b_mean = W(b.mean)
+    delta = wide_b_mean - wide_a_mean
+    b_weight = W(b.n) / W(n)
+    next_mean = wide_a_mean + delta * b_weight
+    cross = delta * delta * (W(a.n) * W(b.n) / W(n))
+    wide_a_m2 = W(a.m2)
+    wide_b_m2 = W(b.m2)
+    next_m2 = _nonnegative_m2(wide_a_m2 + wide_b_m2 + cross,
+                              abs(wide_a_m2) + abs(wide_b_m2) + abs(cross))
     MomentsAccumulator{T}(n, next_mean, next_m2)
 end
 
@@ -127,7 +142,8 @@ function Statistics.var(accumulator::MomentsAccumulator{T};
                         corrected::Bool=true) where {T}
     denominator = accumulator.n - Int(corrected)
     denominator > 0 || return T(NaN)
-    accumulator.m2 / T(denominator)
+    W = promote_type(T, Float64)
+    T(W(accumulator.m2) / W(denominator))
 end
 
 """
