@@ -30,6 +30,7 @@ include("authoring.jl")
 include("reactive.jl")
 include("stateful.jl")
 include("hmc.jl")
+include("reactive_nuts.jl")
 include("reactive_facade.jl")
 include("visualization.jl")
 
@@ -46,6 +47,7 @@ export prepare_reactive, prepare_reactive_nonallocating, statevalue, touch!, mut
 export ReactiveObject, @reactive
 # Reactive HMC/NUTS layer
 export ReactivePhasePoint, euclidean_phasepoint, riemannian_phasepoint
+export reactive_nuts_group
 export leapfrog!, generalized_leapfrog!, implicit_midpoint!, multistep
 export PartialFunction, partial, NUTSState, NUTSDiagnostics, nuts_state, step!
 export refresh_momentum!, diagnostics, sample!, reactive_program
