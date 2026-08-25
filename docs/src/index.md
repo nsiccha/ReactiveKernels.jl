@@ -20,6 +20,8 @@ features:
     details: Preparation prunes to exactly the computations needed to turn have into want, selects among alternative producers, and does graph-level CSE — then emits ordinary Julia via RuntimeGeneratedFunctions.
   - title: The graph is compile-time, not a scheduler
     details: The prepared kernel is straight-line code. Reactive invalidation and cache bookkeeping live outside the hot kernel, never inside it.
+  - title: Optional cache-filling lowering
+    details: prepare_nonallocating applies a final MutatingFunctions-backed AST rewrite, keeping mutation and allocation behavior independent of graph semantics.
   - title: Deliberately narrow
     details: No dynamic scheduling, no AD, no PPL semantics, no symbolic algebra. It generates excellent plain Julia kernels for any pure dataflow graph.
 ---
@@ -49,6 +51,22 @@ k = prepare(g; have = (x, y), want = (out,))
 k(1.0, 2.0)          # straight-line: no graph, no planner on this path
 ```
 
+## See the selected DAG
+
+```julia
+p = plan(g; have = (x, y), want = (out,))
+visualize(p)                         # interactive HTML; SVG rich-display fallback
+visualize(p; alternatives = true)   # include unselected candidate recipes
+save_visualization("plan.html", p)  # standalone fit/pan/zoom/inspect component
+save_visualization("plan.svg", p)   # self-contained, no renderer dependency
+save_visualization("plan.dot", p)   # portable Graphviz interchange
+```
+
+Values and recipes are separate nodes, so multi-input and multi-output recipes
+remain explicit. The preferred self-contained HTML surface adds fit, pan, zoom,
+and node inspection to the dependency-free SVG fallback; DOT export is
+available when a downstream tool needs Graphviz-quality publication layout.
+
 A second mode is **incremental / demand-driven** execution: previously
 materialized values join the effective `have` set, changed source values
 invalidate only the cached results whose provenance actually depended on them,
@@ -58,4 +76,5 @@ bookkeeping staying outside the generated kernel.
 > **Status:** early development — the public API is still being shaped. The
 > examples above track the design and will follow the implementation as it lands.
 
-See the [API Reference](/api) for the exported surface.
+See the [non-allocating workflow](nonallocating.md) for persistent array-cache
+lowering, or the [API Reference](api.md) for the exported surface.

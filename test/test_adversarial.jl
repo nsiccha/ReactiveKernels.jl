@@ -65,6 +65,35 @@ using Test
         end
     end
 
+    @testset "effectful recipes are never structurally CSE'd" begin
+        for effectful_first in (true, false)
+            g = Graph()
+            x = value!(g, :x, Float64)
+            pure_out = value!(g, :pure_out, Float64)
+            effect_out = value!(g, :effect_out, Float64)
+            effects = Ref(0)
+            add_pure! = () -> add!(g, x => pure_out, v -> v + 1;
+                                   cse_key = :same_structure)
+            add_effect! = () -> add!(g, x => effect_out,
+                                     v -> (effects[] += 1; v + 10);
+                                     cse_key = :same_structure, effectful = true)
+            if effectful_first
+                add_effect!()
+                add_pure!()
+            else
+                add_pure!()
+                add_effect!()
+            end
+
+            @test length(g.recipes) == 2
+            @test canon_id(g, pure_out.id) != canon_id(g, effect_out.id)
+            @test count(r -> r.effectful, g.recipes) == 1
+            @test prepare(g; have = (x,), want = (pure_out,))(1.0) == 2.0
+            @test_throws PlanningError plan(g; have = (x,), want = (effect_out,))
+            @test effects[] == 0
+        end
+    end
+
     @testset "generated bindings are globally hygienic" begin
         g = Graph()
         ops_named = value!(g, :__ops__, Float64)
