@@ -232,6 +232,26 @@ function prepare_reactive(graph::Graph; have = (), want = ())
     )
 end
 
+"""
+    prepare_reactive(spec::KernelSpec; have, want) -> ReactiveProgram
+
+Prepare an authoring [`KernelSpec`] through the same compiled reactive state
+engine as a hand-built graph. Symbol and `Value` boundary overrides are
+resolved against the spec before delegating, so the authoring surface does not
+introduce a second runtime or a sampler-specific refresh path.
+"""
+function prepare_reactive(spec::KernelSpec;
+                          have = _KERNEL_DEFAULT_BOUNDARY,
+                          want = _KERNEL_DEFAULT_BOUNDARY,
+                          kwargs...)
+    resolved_have = _kernel_selection(spec, have, spec.have_names, :have)
+    resolved_want = _kernel_selection(spec, want, spec.want_names, :want)
+    prepare_reactive(spec.graph;
+                     have = resolved_have,
+                     want = resolved_want,
+                     kwargs...)
+end
+
 @generated function _state_slots(handles::H, args::A) where {H<:Tuple,A<:Tuple}
     handle_types = H.parameters
     arg_count = length(A.parameters)

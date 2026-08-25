@@ -127,6 +127,33 @@ function _phasepoint(program, state, values)
 end
 
 """
+    reactive_phasepoint(spec::KernelSpec, initial::NamedTuple)
+
+Construct a phase point directly from an authoring spec. Every declared HAVE
+port is initialized from `initial` by name; selected WANT ports remain lazy
+compiled getters. This is the general public entry point used by sampler
+examples, with no HMC-specific refresh path.
+"""
+function reactive_phasepoint(spec::KernelSpec, initial::NamedTuple)
+    have_names = spec.have_names
+    missing = Tuple(name for name in have_names if !haskey(initial, name))
+    isempty(missing) || throw(ArgumentError(
+        "missing initial values for KernelSpec HAVE ports $(missing)"))
+    program = prepare_reactive(spec)
+    state = program((getproperty(initial, name) for name in have_names)...)
+    names = Tuple(name for name in spec.port_order
+                  if haskey(program.index, canon_id(spec.graph, spec[name].id)))
+    handles = NamedTuple{names}(Tuple(
+        statevalue(program, spec[name]) for name in names))
+    ReactivePhasePoint(state, handles)
+end
+
+euclidean_phasepoint(spec::KernelSpec, initial::NamedTuple) =
+    reactive_phasepoint(spec, initial)
+riemannian_phasepoint(spec::KernelSpec, initial::NamedTuple) =
+    reactive_phasepoint(spec, initial)
+
+"""
     euclidean_phasepoint(potential, potential_gradient, metric, position, momentum)
 
 Prepare a Gaussian-kinetic Euclidean phase point. `potential_gradient(q)` must

@@ -14,6 +14,7 @@ makedocs(
         "Home" => "index.md",
         "Visualization" => "visualization.md",
         "Eight schools" => "eight-schools.md",
+        "NUTS sampling" => "nuts.md",
         "Non-allocating kernels" => "nonallocating.md",
         "API"  => "api.md",
     ],

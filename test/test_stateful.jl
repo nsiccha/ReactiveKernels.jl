@@ -11,6 +11,34 @@ function _compiled_state_allocations(state, source, wanted)
     (; touch_allocations, recompute_allocations, cached_allocations)
 end
 
+@testset "compiled reactive KernelSpec boundary" begin
+    calls = Ref(0)
+    spec = @kernel begin
+        source::Vector{Float64}
+        total::Float64 = begin
+            calls[] += 1
+            sum(source)
+        end
+        return (total,)
+    end
+
+    program = prepare_reactive(spec)
+    state = program([1.0, 2.0])
+    source = statevalue(program, spec.source)
+    total = statevalue(program, spec.total)
+    @test get!(state, total) == 3.0
+    @test calls[] == 1
+    mutate!(state, source) do value
+        value[1] = 4.0
+    end
+    @test get!(state, total) == 6.0
+    @test calls[] == 2
+
+    by_symbol = prepare_reactive(spec; have = :source, want = :total)
+    @test get!(by_symbol([3.0]), statevalue(by_symbol, spec.total)) == 3.0
+    @test_throws KeyError prepare_reactive(spec; have = :missing)
+end
+
 @testset "compiled reactive state" begin
     graph = Graph()
     position = value!(graph, :position, Vector{Float64})

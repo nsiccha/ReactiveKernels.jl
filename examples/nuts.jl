@@ -8,15 +8,29 @@ using ReactiveKernels
 potential(position) = sum(abs2, position) / 2
 potential_gradient(position) = (potential(position), copy(position))
 
+model = @kernel begin
+    pos::Vector{Float64}
+    mom::Vector{Float64}
+    metric::Matrix{Float64}
+    chol_metric::Cholesky{Float64,Matrix{Float64}} = cholesky(metric)
+    pot::Float64 = potential(pos)
+    (pot, dpot_dpos::Vector{Float64}) = potential_gradient(pos)
+    (kin::Float64, dham_dmom::Vector{Float64}) = begin
+        velocity = chol_metric \ mom
+        (0.5 * (logdet(chol_metric) + dot(mom, velocity)), velocity)
+    end
+    ham::Float64 = pot + kin
+    dham_dpos::Vector{Float64} = dpot_dpos
+    return (pot, dpot_dpos, chol_metric, kin, ham, dham_dpos, dham_dmom)
+end
+
 rng = Xoshiro(20260825)
 dimension = 4
-point = euclidean_phasepoint(
-    potential,
-    potential_gradient,
-    Diagonal(ones(dimension)),
-    zeros(dimension),
-    zeros(dimension),
-)
+point = euclidean_phasepoint(model, (
+    pos = zeros(dimension),
+    mom = zeros(dimension),
+    metric = Matrix{Float64}(I, dimension, dimension),
+))
 sampler = nuts_state(
     point;
     rng,
