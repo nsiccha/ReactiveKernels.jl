@@ -3,7 +3,8 @@ include(joinpath(@__DIR__, "..", "examples", "preexisting_reactivehmc.jl"))
 include(joinpath(@__DIR__, "..", "examples", "artifacts.jl"))
 
 using .ReactiveObjectsExamples
-using .ReactiveHMCExamples
+using .ReactiveHMCExamples: euclidean_examples, riemannian_examples,
+    softabs_examples
 using LinearAlgebra
 using ReactiveKernels
 using .CompatibilityArtifacts
@@ -133,13 +134,14 @@ end
     direct_pos, direct_mom = copy(pos), copy(mom)
     direct = nothing
     for _ in 1:3
-        direct = generalized_leapfrog!(
+        direct = ReactiveHMCExamples.generalized_leapfrog!(
             direct_pos, direct_mom, riemannian.gaussian;
             stepsize = 0.02, n_fi_steps = 2,
         )
     end
-    wrapped = multistep!(
-        generalized_leapfrog!, copy(pos), copy(mom), riemannian.gaussian;
+    wrapped = ReactiveHMCExamples.multistep!(
+        ReactiveHMCExamples.generalized_leapfrog!,
+        copy(pos), copy(mom), riemannian.gaussian;
         stepsize = 0.06, n_fi_steps = 2, n_steps = 3,
     )
     @test wrapped.pos == direct.pos
