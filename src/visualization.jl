@@ -29,6 +29,12 @@ struct DAGVisualization{T<:Union{Graph,Plan}}
     end
 end
 
+function _check_orientation(orientation::Symbol)
+    orientation in (:horizontal, :vertical) ||
+        throw(ArgumentError("orientation must be :horizontal or :vertical"))
+    orientation
+end
+
 """
     visualize(graph; orientation=:horizontal) -> DAGVisualization
     visualize(plan; alternatives=false, orientation=:horizontal) -> DAGVisualization
@@ -47,12 +53,6 @@ supported, with self-contained SVG as the static fallback. The underlying
 `Graph` and `Plan` types expose both representations directly, so a notebook
 can display them without calling `visualize` explicitly.
 """
-function _check_orientation(orientation::Symbol)
-    orientation in (:horizontal, :vertical) ||
-        throw(ArgumentError("orientation must be :horizontal or :vertical"))
-    orientation
-end
-
 function visualize(x::Graph; alternatives::Bool = false,
                    orientation::Symbol = :horizontal)
     DAGVisualization(x, alternatives, orientation)
