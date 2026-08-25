@@ -124,7 +124,10 @@ struct PreparedKernel{F,O,IN,OUT}
     ast::Expr
 end
 
-@inline (k::PreparedKernel)(args...) = k.f(k.ops, args...)
+@inline function (k::PreparedKernel)(args...)
+    length(args) == length(k.inputs) || throw(MethodError(k, args))
+    k.f(k.ops, args...)
+end
 
 function _prepare(p::Plan, ast::Expr)
     f = compile(ast)
