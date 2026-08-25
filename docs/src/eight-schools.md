@@ -60,9 +60,26 @@ parameters = constrain_kernel(q)
 
 The log-density query requests the full decomposition. Pointwise terms are a
 first-class node, so returning them together with the scalar density shares the
-likelihood computation rather than repeating it:
+likelihood computation rather than repeating it.
 
-```@example eight_schools
+The panel below is one coherent, build-executed artifact—not three separately
+maintained snippets. **Raw input** is the exact source that builds and runs the
+query, **Generated kernel** is `code_expr(density_kernel)` from that execution,
+and **Compute DAG** is the live colored `visualize(density_plan)` component.
+Choose **Compare all** to inspect the same source, subkernel, and selected plan
+side by side without resetting the interactive DAG.
+
+```@eval
+Main.ReactiveKernelsDocs.execute_example(@__MODULE__, raw"""
+using ReactiveKernels
+include(joinpath(pkgdir(ReactiveKernels), "examples", "eight_schools.jl"))
+using .EightSchoolsExample
+
+model = build_eight_schools_graph()
+q = (1.5, log(2.0), ntuple(i -> 0.25 * i, 8)...)
+observations = EIGHT_SCHOOLS_Y
+observation_scales = EIGHT_SCHOOLS_SIGMA
+
 density_plan = plan(model.graph;
     have = (model.unconstrained, model.observations,
             model.observation_scales),
@@ -70,23 +87,19 @@ density_plan = plan(model.graph;
             model.likelihood, model.density))
 density_kernel = prepare(density_plan)
 
-prior, logjac, pointwise, likelihood, density =
-    density_kernel(q, observations, observation_scales)
-
+output = density_kernel(q, observations, observation_scales)
+prior, logjac, pointwise, likelihood, density = output
 @assert likelihood ≈ sum(pointwise)
 @assert density ≈ prior + logjac + likelihood
 
-(; prior, logjac, likelihood, density)
-```
-
-## Generated density subkernel
-
-`density_kernel` is not an interpreter over the graph. The next block asks the
-prepared kernel for the exact straight-line Julia expression it compiled; the
-output is generated from the live plan above during the docs build.
-
-```@example eight_schools
-code_expr(density_kernel)
+docs_example = (;
+    name = :eight_schools_density,
+    origin = "examples/eight_schools.jl (build executed)",
+    inputs = (; q, observations, observation_scales),
+    kernel = density_kernel,
+    output,
+)
+""")
 ```
 
 The numeric graph ports are typed at a `Real` boundary, while constrained
