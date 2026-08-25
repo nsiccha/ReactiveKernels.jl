@@ -1,6 +1,7 @@
 using Documenter, DocumenterVitepress, ReactiveKernels
 
 include("kernel_examples.jl")
+include(joinpath(@__DIR__, "..", "examples", "distributions.jl"))
 
 makedocs(
     sitename = "ReactiveKernels.jl",
@@ -13,6 +14,7 @@ makedocs(
     pages = [
         "Home" => "index.md",
         "Visualization" => "visualization.md",
+        "Distribution log densities" => "distributions.md",
         "Eight schools" => "eight-schools.md",
         "NUTS sampling" => "nuts.md",
         "Online statistics" => "online-stats.md",
