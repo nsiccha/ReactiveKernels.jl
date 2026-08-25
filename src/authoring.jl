@@ -209,6 +209,17 @@ function _kernel_function_name!(names::Set{Symbol}, signature)
     names
 end
 
+function _kernel_callable_name!(names::Set{Symbol}, signature)
+    while signature isa Expr && signature.head in (:(::), :where)
+        signature = signature.args[1]
+    end
+    if signature isa Expr && signature.head === :call &&
+       signature.args[1] isa Symbol
+        push!(names, signature.args[1])
+    end
+    names
+end
+
 function _kernel_where_names!(names::Set{Symbol}, signature)
     signature isa Expr || return names
     if signature.head === :where
@@ -236,7 +247,7 @@ function _kernel_signature_annotations!(annotations::Vector{Any}, signature)
                 append!(annotations, parameter.args[2:end])
             end
         end
-    elseif signature.head in (:call, :parameters)
+    elseif signature.head in (:call, :parameters, :tuple)
         start = signature.head === :call ? 2 : 1
         for argument in signature.args[start:end]
             _kernel_signature_annotations!(annotations, argument)
@@ -340,7 +351,7 @@ function _kernel_validate_function_signature!(
     # Outer locals/definite writes cannot make a runtime value legal in a local
     # method signature. Only signature-owned lexical names are exempt.
     signature_hidden = Set{Symbol}()
-    _kernel_function_name!(signature_hidden, signature)
+    _kernel_callable_name!(signature_hidden, signature)
     _kernel_where_names!(signature_hidden, signature)
     for annotation in _kernel_signature_annotations(signature)
         reads = Symbol[]
@@ -353,6 +364,86 @@ function _kernel_validate_function_signature!(
             "signature annotation; Julia method signatures cannot capture runtime " *
             "local types. Use a runtime isa/convert check or a module-qualified " *
             "static type instead"))
+    end
+    nothing
+end
+
+function _kernel_generator_iterator_flow!(
+    out::Vector{Symbol}, seen::Set{Symbol}, iterator, known::Set{Symbol},
+    assigned::Set{Symbol}, hidden::Set{Symbol},
+)
+    if iterator isa Expr && iterator.head in (:(=), :in)
+        _kernel_free_ports_flow!(
+            out, seen, iterator.args[2], known, assigned, hidden,
+        )
+        _kernel_assignment_lhs_reads!(
+            out, seen, iterator.args[1], known, assigned, hidden,
+        )
+        iterator_names = Set{Symbol}()
+        _kernel_bound_names!(iterator_names, iterator.args[1])
+        union!(hidden, iterator_names)
+        union!(assigned, iterator_names)
+    elseif iterator isa Expr && iterator.head === :filter
+        # Parser order is predicates first and the iterator source last, while
+        # evaluation binds every listed iterator in source order before the
+        # predicate can read them.
+        for nested_iterator in iterator.args[2:end]
+            _kernel_generator_iterator_flow!(
+                out, seen, nested_iterator, known, assigned, hidden,
+            )
+        end
+        for predicate in iterator.args[1:1]
+            _kernel_free_ports_flow!(
+                out, seen, predicate, known, assigned, hidden,
+            )
+        end
+    elseif iterator isa Expr && iterator.head === :block
+        for nested in iterator.args
+            _kernel_generator_iterator_flow!(
+                out, seen, nested, known, assigned, hidden,
+            )
+        end
+    else
+        _kernel_free_ports_flow!(
+            out, seen, iterator, known, assigned, hidden,
+        )
+    end
+    nothing
+end
+
+function _kernel_generator_flow!(
+    out::Vector{Symbol}, seen::Set{Symbol}, ex::Expr, known::Set{Symbol},
+    assigned::Set{Symbol}, hidden::Set{Symbol},
+)
+    if ex.head === :comprehension || ex.head === :flatten
+        for nested in ex.args
+            nested isa Expr && _kernel_generator_flow!(
+                out, seen, nested, known, copy(assigned), copy(hidden),
+            )
+        end
+        return nothing
+    end
+    ex.head === :generator || return _kernel_free_ports_flow!(
+        out, seen, ex, known, assigned, hidden,
+    )
+
+    generator_hidden = copy(hidden)
+    generator_assigned = copy(assigned)
+    for iterator in ex.args[2:end]
+        _kernel_generator_iterator_flow!(
+            out, seen, iterator, known, generator_assigned, generator_hidden,
+        )
+    end
+    body = ex.args[1]
+    if body isa Expr && body.head in (:generator, :flatten)
+        _kernel_generator_flow!(
+            out, seen, body, known, generator_assigned, generator_hidden,
+        )
+    else
+        _kernel_explicit_locals!(generator_hidden, body)
+        _kernel_free_ports_flow!(
+            out, seen, body, known, generator_assigned, generator_hidden,
+        )
     end
     nothing
 end
@@ -414,21 +505,23 @@ function _kernel_free_ports_flow!(out::Vector{Symbol}, seen::Set{Symbol}, ex,
     elseif ex.head === :(=)
         # Pure binder leaves are not reads. Typed binders evaluate their type,
         # while indexed/property targets evaluate receiver/index components.
+        # Julia evaluates the RHS first, so its definite writes are visible to
+        # the later target evaluation.
+        _kernel_free_ports_flow!(out, seen, ex.args[2], known, assigned, hidden)
         _kernel_assignment_lhs_reads!(
             out, seen, ex.args[1], known, assigned, hidden,
         )
-        _kernel_free_ports_flow!(out, seen, ex.args[2], known, assigned, hidden)
         written = Set{Symbol}()
         _kernel_assignment_names!(written, ex.args[1])
         union!(assigned, written)
     elseif ex.head === :local
         for declaration in ex.args
             if declaration isa Expr && declaration.head === :(=)
-                _kernel_assignment_lhs_reads!(
-                    out, seen, declaration.args[1], known, assigned, hidden,
-                )
                 _kernel_free_ports_flow!(
                     out, seen, declaration.args[2], known, assigned, hidden,
+                )
+                _kernel_assignment_lhs_reads!(
+                    out, seen, declaration.args[1], known, assigned, hidden,
                 )
                 _kernel_assignment_names!(assigned, declaration.args[1])
             else
@@ -474,6 +567,9 @@ function _kernel_free_ports_flow!(out::Vector{Symbol}, seen::Set{Symbol}, ex,
                 _kernel_free_ports_flow!(
                     out, seen, iterator.args[2], known, assigned, loop_hidden,
                 )
+                _kernel_assignment_lhs_reads!(
+                    out, seen, iterator.args[1], known, assigned, loop_hidden,
+                )
                 iterator_names = Set{Symbol}()
                 _kernel_bound_names!(iterator_names, iterator.args[1])
                 union!(loop_hidden, iterator_names)
@@ -496,30 +592,8 @@ function _kernel_free_ports_flow!(out::Vector{Symbol}, seen::Set{Symbol}, ex,
             out, seen, ex.args[2], known, copy(assigned), body_hidden,
         )
     elseif ex.head === :generator || ex.head === :comprehension
-        args = ex.head === :comprehension && length(ex.args) == 1 &&
-               ex.args[1] isa Expr && ex.args[1].head === :generator ?
-               ex.args[1].args : ex.args
-        generator_hidden = copy(hidden)
-        generator_assigned = copy(assigned)
-        for iterator in args[2:end]
-            if iterator isa Expr && iterator.head in (:(=), :in)
-                _kernel_free_ports_flow!(
-                    out, seen, iterator.args[2], known,
-                    generator_assigned, generator_hidden,
-                )
-                iterator_names = Set{Symbol}()
-                _kernel_bound_names!(iterator_names, iterator.args[1])
-                union!(generator_hidden, iterator_names)
-            else
-                _kernel_free_ports_flow!(
-                    out, seen, iterator, known,
-                    generator_assigned, generator_hidden,
-                )
-            end
-        end
-        _kernel_explicit_locals!(generator_hidden, args[1])
-        _kernel_free_ports_flow!(
-            out, seen, args[1], known, generator_assigned, generator_hidden,
+        _kernel_generator_flow!(
+            out, seen, ex, known, assigned, hidden,
         )
     elseif ex.head === :let
         let_hidden = copy(hidden)
@@ -529,11 +603,17 @@ function _kernel_free_ports_flow!(out::Vector{Symbol}, seen::Set{Symbol}, ex,
                 _kernel_free_ports_flow!(
                     out, seen, binding.args[2], known, let_assigned, let_hidden,
                 )
+                _kernel_assignment_lhs_reads!(
+                    out, seen, binding.args[1], known, let_assigned, let_hidden,
+                )
                 binding_names = Set{Symbol}()
                 _kernel_bound_names!(binding_names, binding.args[1])
                 union!(let_hidden, binding_names)
                 union!(let_assigned, binding_names)
             else
+                _kernel_assignment_lhs_reads!(
+                    out, seen, binding, known, let_assigned, let_hidden,
+                )
                 _kernel_bound_names!(let_hidden, binding)
                 _kernel_bound_names!(let_assigned, binding)
             end
@@ -543,6 +623,9 @@ function _kernel_free_ports_flow!(out::Vector{Symbol}, seen::Set{Symbol}, ex,
             out, seen, ex.args[end], known, let_assigned, let_hidden,
         )
     elseif ex.head === :->
+        _kernel_validate_function_signature!(
+            ex.args[1], known, assigned, hidden,
+        )
         function_hidden = copy(hidden)
         _kernel_bound_names!(function_hidden, ex.args[1])
         _kernel_explicit_locals!(function_hidden, ex.args[2])

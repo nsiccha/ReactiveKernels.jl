@@ -365,6 +365,43 @@ end
               (:i,)
         @test prepare(generator_scope)(10) == 13
 
+        filtered_generator = @kernel begin
+            source::Int
+            xs::Vector{Int}
+            @recipe (effectful = true) x::Int = source + 100
+            y::Vector{Int} = [x for x in xs if isodd(x)]
+            return y
+        end
+        @test Tuple(v.name for v in kernel_graph(filtered_generator).recipes[2].inputs) ==
+              (:xs,)
+        @test prepare(filtered_generator)(1, [1, 2, 3]) == [1, 3]
+
+        filtered_noncollision = @kernel begin
+            xs::Vector{Int}
+            threshold::Int
+            y::Vector{Int} = [x for x in xs if x > threshold]
+            return y
+        end
+        @test Set(v.name for v in only(
+            kernel_graph(filtered_noncollision).recipes,
+        ).inputs) == Set((:xs, :threshold))
+        @test prepare(filtered_noncollision)([1, 2, 3], 1) == [2, 3]
+
+        nested_filtered_generator = @kernel begin
+            source::Int
+            xs::Vector{Int}
+            @recipe (effectful = true) x::Int = source + 100
+            @recipe (effectful = true) y::Int = source + 200
+            z::Vector{Int} = [
+                x + y for x in xs if x > 0 for y in 1:x if y < x
+            ]
+            return z
+        end
+        @test Tuple(
+            v.name for v in kernel_graph(nested_filtered_generator).recipes[3].inputs
+        ) == (:xs,)
+        @test prepare(nested_filtered_generator)(1, [2, 3]) == [3, 4, 5]
+
         while_scope = @kernel begin
             a::Int
             y::Int = begin
@@ -448,6 +485,111 @@ end
             kernel_graph(indexed_assignment).recipes,
         ).inputs) == (:a, :i)
         @test prepare(indexed_assignment)([1, 2], 2) == 10
+
+        rhs_before_target = @kernel begin
+            source::Int
+            a::Vector{Int}
+            @recipe (effectful = true) i::Int = source + 100
+            y::Vector{Int} = begin
+                b = copy(a)
+                b[i] = (i = 1; 9)
+                b
+            end
+            return y
+        end
+        @test Tuple(v.name for v in kernel_graph(rhs_before_target).recipes[2].inputs) ==
+              (:a,)
+        @test prepare(rhs_before_target)(1, [2, 3]) == [9, 3]
+
+        rhs_before_typed_target = @kernel begin
+            @recipe (effectful = true) T::DataType = Int
+            y::Int = begin
+                x::T = (T = Int; 2)
+                x
+            end
+            return y
+        end
+        @test isempty(kernel_graph(rhs_before_typed_target).recipes[2].inputs)
+        @test prepare(rhs_before_typed_target; have = ())() == 2
+
+        typed_let = @kernel begin
+            T::DataType
+            y::Int = let x::T = 2
+                x
+            end
+            return y
+        end
+        @test Tuple(v.name for v in only(kernel_graph(typed_let).recipes).inputs) ==
+              (:T,)
+        @test prepare(typed_let)(Int) == 2
+
+        declared_typed_let = @kernel begin
+            T::DataType
+            y::Int = let x::T
+                x = 2
+                x
+            end
+            return y
+        end
+        @test Tuple(
+            v.name for v in only(kernel_graph(declared_typed_let).recipes).inputs
+        ) == (:T,)
+        @test prepare(declared_typed_let)(Int) == 2
+
+        typed_for = @kernel begin
+            T::DataType
+            xs::Vector{Int}
+            y::Int = begin
+                total = 0
+                for x::T in xs
+                    total += x
+                end
+                total
+            end
+            return y
+        end
+        @test Set(v.name for v in only(kernel_graph(typed_for).recipes).inputs) ==
+              Set((:T, :xs))
+        @test prepare(typed_for)(Int, [1, 2]) == 3
+
+        typed_comprehension = @kernel begin
+            T::DataType
+            xs::Vector{Int}
+            y::Vector{Int} = [x for x::T in xs]
+            return y
+        end
+        @test Set(v.name for v in only(
+            kernel_graph(typed_comprehension).recipes,
+        ).inputs) == Set((:T, :xs))
+        @test prepare(typed_comprehension)(Int, [1, 2]) == [1, 2]
+
+        filtered_typed_comprehension = @kernel begin
+            T::DataType
+            xs::Vector{Int}
+            y::Vector{Int} = [x for x::T in xs if isodd(x)]
+            return y
+        end
+        @test Set(v.name for v in only(
+            kernel_graph(filtered_typed_comprehension).recipes,
+        ).inputs) == Set((:T, :xs))
+        @test prepare(filtered_typed_comprehension)(Int, [1, 2, 3]) == [1, 3]
+
+        target_receivers = @kernel begin
+            a::Vector{Int}
+            box::AuthoringComputedCalleeFixture.Box
+            y::Int = begin
+                copy(a)[1] = 9
+                deepcopy(box).value = 8
+                17
+            end
+            return y
+        end
+        @test Tuple(v.name for v in only(
+            kernel_graph(target_receivers).recipes,
+        ).inputs) == (:a, :box)
+        @test prepare(target_receivers)(
+            [1, 2], AuthoringComputedCalleeFixture.Box(1),
+        ) == 17
 
         property_assignment = @kernel begin
             box::AuthoringComputedCalleeFixture.Box
@@ -609,6 +751,23 @@ end
         ).inputs) == Set((:a, :flag))
         @test prepare(read_before_branch_assignment)(2, true) == 6
         @test prepare(read_before_branch_assignment)(2, false) == 7
+
+        static_lambda = @kernel begin
+            f::Function = (x::Base.Int -> x + 1)
+            return f
+        end
+        static_function = prepare(static_lambda; have = ())()
+        @test static_function(2) == 3
+
+        lambda_binder_collision = @kernel begin
+            source::Int
+            @recipe (effectful = true) x::Int = source + 100
+            f::Function = (x::Int -> x + 1)
+            return f
+        end
+        @test isempty(kernel_graph(lambda_binder_collision).recipes[2].inputs)
+        collision_function = prepare(lambda_binder_collision)(1)
+        @test collision_function(2) == 3
     end
 
     @testset "pure named-port composition and explicit boundaries" begin
@@ -939,6 +1098,23 @@ end
                             x + 1
                         end
                         f(2)
+                    end
+                    return y
+                end
+            end,
+            quote
+                @kernel begin
+                    T::DataType
+                    f::Function = (x::T -> x)
+                    return f
+                end
+            end,
+            quote
+                @kernel begin
+                    T::DataType
+                    xs::Vector{Int}
+                    y::Vector{Int} = map(xs) do x::T
+                        x
                     end
                     return y
                 end
