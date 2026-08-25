@@ -9,6 +9,23 @@ struct RawHTML
     content::String
 end
 
+# DocumenterVitepress prefers image/svg+xml over text/html when both are
+# showable. Wrap a rich result when the docs specifically require its
+# interactive HTML surface rather than the static SVG fallback.
+struct HTMLResult{T}
+    content::T
+end
+
+Base.show(io::IO, mime::MIME"text/html", result::HTMLResult) =
+    show(io, mime, result.content)
+
+function html_result(content)
+    showable(MIME"text/html"(), content) || error(
+        "docs HTML result must provide a text/html display",
+    )
+    HTMLResult(content)
+end
+
 # Julia 1.10's stdlib Markdown predates Markdown.HTMLBlock. Teach the
 # Documenter-owned MarkdownAST conversion about this docs-only block so @eval
 # results can contain real HTML instead of a printed Julia value.
