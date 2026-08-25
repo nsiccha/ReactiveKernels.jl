@@ -1,9 +1,8 @@
 using ReactiveKernels
 using Test
 
-# Minimal smoke suite — establishes the test harness (test/Project.toml + this
-# file are wired into `test.yml`). The implementer expands this as the
-# have/want planning API lands.
-@testset "ReactiveKernels.jl" begin
-    @test ReactiveKernels isa Module
+@testset "ReactiveKernels" begin
+    include("test_stateless.jl")
+    include("test_composition_cse.jl")
+    include("test_reactive.jl")
 end

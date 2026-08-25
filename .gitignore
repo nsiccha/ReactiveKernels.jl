@@ -1,19 +1,4 @@
-# Julia
-Manifest.toml
-*.jl.cov
-*.jl.*.cov
-*.jl.mem
-/deps/deps.jl
-/deps/build.log
-.DS_Store
-
-# Editor / tooling
-.vscode
-.luarc.json
-
-# Agent scaffolding (local convenience symlink; never committed)
-CLAUDE.md
-
-# Docs build artifacts (docs/ has its own .gitignore too)
-docs/build/
-docs/site/
+/Manifest.toml
+/scratchpad_gist.md
+*.cov
+/docs/build/
