@@ -1,0 +1,29 @@
+name: Run tests
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    # `synchronize` fires on new commits pushed to a PR (unlike `edited`, which
+    # only fires on title/body edits), so a pushed fix re-runs the suite.
+    types: [opened, synchronize, reopened]
+permissions:
+  actions: write       # let julia-actions/cache evict its own caches
+  contents: read
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        julia-version: ['lts', '1', 'pre']
+        julia-arch: [x64]
+        os: [ubuntu-latest, windows-latest, macOS-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.julia-version }}
+          arch: ${{ matrix.julia-arch }}
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
