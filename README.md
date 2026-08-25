@@ -125,6 +125,33 @@ k    = compile(ast2)
 k    = prepare(p; passes = (mypass,))
 ```
 
+## Preexisting ecosystem examples
+
+[`examples/preexisting.jl`](examples/preexisting.jl) ports the examples that
+predate this package and exercises them against the public API:
+
+- ReactiveObjects.jl's chain, diamond, and shared-intermediate gallery graphs;
+- ReactiveHMC.jl's Euclidean, Riemannian, and SoftAbs phase points, including
+  all three relativistic variants;
+- leapfrog, generalized leapfrog, implicit midpoint, and multistep integration.
+
+The scalar gallery kernels assert zero allocations after preparation. The HMC
+ports prepare their geometry and dynamics kernels once, then count the original
+potential/gradient/metric oracles. For example, four generalized-leapfrog
+fixed-point iterations call the combined metric-gradient oracle exactly five
+times—once for the starting position and once per changed position—and never
+call the three dominated partial oracles.
+
+`test/test_handwritten_benchmarks.jl` uses BenchmarkTools to compare the
+prepared chain and shared-intermediate kernels with equivalent hand-written
+Julia functions. The test prints median timings and their ratio, while its
+portable acceptance checks semantic equality, inferred concrete return types,
+and zero hot-path allocations rather than asserting a machine-dependent timing
+threshold.
+
+The source revisions are pinned in the example files so the compatibility
+corpus is auditable.
+
 ## API surface
 
 | Concept | Functions |
@@ -146,6 +173,8 @@ graph objects on the hot path). See `test/test_stateless.jl` and
 ## Running
 
 ```julia
-julia --project=. -e 'using Pkg; Pkg.test()'   # 84 tests
+julia --project=. -e 'using Pkg; Pkg.test()'   # 136 tests
+julia --project=. -e 'using Pkg; Pkg.test(test_args=["benchmark"])'
 julia --project=. examples/demo.jl             # runnable walkthrough
+julia --project=. examples/preexisting.jl      # ReactiveObjects/ReactiveHMC ports
 ```
