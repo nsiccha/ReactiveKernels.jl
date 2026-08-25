@@ -48,6 +48,12 @@ end
 
 k = prepare(model)
 k(f, h, 1.0, 2.0)    # straight-line: no graph, no planner on this path
+
+@kernel affine(x, factor = 2; offset = factor - 1) = begin
+    out = factor * x + offset
+end
+
+prepare(affine)(3; offset = 4)  # 10
 ```
 
 The definition has ordinary function syntax, as in ReactiveObjects.jl, and its
@@ -62,6 +68,17 @@ intermediates, and alternative producers may be forward-referenced; tuple
 assignment is one multi-output recipe, and
 `@recipe (cost = ..., cse_key = ...)` exposes the existing planner metadata
 without dropping to the low-level builder.
+
+Trailing positional defaults and fixed keyword arguments follow ordinary Julia
+call syntax. Defaults are evaluated only when omitted, may refer to earlier
+arguments, and remain exposed input ports alongside required arguments. A
+keyword without a default is required. The prepared call adapter resolves the
+signature before entering the same generated positional kernel.
+
+The macro authors a graph, not a per-kernel object type. Compiled reactive state
+supports source mutation through `set!`, `mutate!`, and `touch!`; inline method
+definitions and ReactiveObjects-style magic `__self__` rewriting are not part of
+`@kernel`.
 
 ## Extend by named ports
 

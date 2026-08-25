@@ -13,17 +13,115 @@ objects, and `inputs(spec)` / `outputs(spec)` report the default have/want
 boundary declared by [`@kernel`](@ref).
 
 Look up a named port with `spec.name` or `spec[:name]`. Dot names matching a
-`KernelSpec` storage field (`graph`, `ports`, `port_order`, `have_names`, or
-`want_names`) return that field; a colliding port therefore uses bracket lookup.
+`KernelSpec` storage field (`graph`, `ports`, `port_order`, `have_names`,
+`want_names`, or `call_signature`) return that field; a colliding port therefore
+uses bracket lookup.
 Planning and preparation accept either port names or `Value`s in their `have`
 and `want` overrides.
 """
-struct KernelSpec
+struct KernelSpec{S}
     graph::Graph
     ports::Dict{Symbol,Value}
     port_order::Vector{Symbol}
     have_names::Vector{Symbol}
     want_names::Vector{Symbol}
+    call_signature::S
+end
+
+KernelSpec(graph::Graph, ports::Dict{Symbol,Value}, port_order::Vector{Symbol},
+           have_names::Vector{Symbol}, want_names::Vector{Symbol}) =
+    KernelSpec(graph, ports, port_order, have_names, want_names, nothing)
+
+struct _KernelRequiredArgument end
+const _KERNEL_REQUIRED_ARGUMENT = _KernelRequiredArgument()
+
+struct _KernelCallSignature{P,K,M,D}
+    defaults::D
+end
+
+function _kernel_call_signature(::Val{P}, ::Val{K}, ::Val{M}, defaults::D) where {P,K,M,D}
+    _KernelCallSignature{P,K,M,D}(defaults)
+end
+
+struct _KernelSignatureCallable{F,S}
+    target::F
+    signature::S
+end
+
+@inline function (callable::_KernelSignatureCallable)(args...; kwargs...)
+    _kernel_signature_invoke(callable, args, NamedTuple(kwargs))
+end
+
+inputs(callable::_KernelSignatureCallable) = inputs(callable.target)
+outputs(callable::_KernelSignatureCallable) = outputs(callable.target)
+code_expr(callable::_KernelSignatureCallable) = code_expr(callable.target)
+
+function Base.show(io::IO, callable::_KernelSignatureCallable)
+    print(io, "KernelSignatureCallable(")
+    show(io, callable.target)
+    print(io, ")")
+end
+
+@generated function _kernel_signature_invoke(
+    callable::_KernelSignatureCallable{F,S}, args::A,
+    kwargs::NamedTuple{N,KT},
+) where {F,S,A,N,KT}
+    positional_names, keyword_names, default_mask = S.parameters[1:3]
+    positional_count = length(positional_names)
+    supplied_count = length(A.parameters)
+    first_default = findfirst(identity, default_mask[1:positional_count])
+    required_positionals = first_default === nothing ? positional_count : first_default - 1
+
+    if supplied_count < required_positionals || supplied_count > positional_count
+        return :(throw(MethodError(callable, args)))
+    end
+    unknown = Tuple(name for name in N if !(name in keyword_names))
+    if !isempty(unknown)
+        accepted = join(string.(keyword_names), ", ")
+        message = isempty(accepted) ?
+                  "kernel does not accept keyword arguments; got $(unknown)" :
+                  "unknown kernel keyword $(unknown); accepted keywords: $accepted"
+        return :(throw(ArgumentError($message)))
+    end
+
+    body = Expr(:block)
+    resolved = Symbol[]
+    defaults = :(getfield(getfield(callable, :signature), :defaults))
+    for index in 1:positional_count
+        value = gensym(positional_names[index])
+        if index <= supplied_count
+            push!(body.args, :(local $value = args[$index]))
+        else
+            provider = :(getfield($defaults, $index))
+            push!(body.args, :(local $value = $provider($(resolved...))))
+        end
+        push!(resolved, value)
+    end
+    for (keyword_index, name) in enumerate(keyword_names)
+        index = positional_count + keyword_index
+        value = gensym(name)
+        supplied_index = findfirst(==(name), N)
+        if supplied_index !== nothing
+            push!(body.args, :(local $value = getfield(kwargs, $supplied_index)))
+        elseif default_mask[index]
+            provider = :(getfield($defaults, $index))
+            push!(body.args, :(local $value = $provider($(resolved...))))
+        else
+            push!(body.args, :(throw(UndefKeywordError($(QuoteNode(name))))))
+        end
+        push!(resolved, value)
+    end
+    target = :(getfield(callable, :target))
+    push!(body.args, :(return $target($(resolved...))))
+    body
+end
+
+_kernel_signature_callable(target, ::Nothing) = target
+function _kernel_signature_callable(
+    target, signature::_KernelCallSignature{P,K,M},
+) where {P,K,M}
+    isempty(K) && !any(M) && return target
+    _KernelSignatureCallable(target, signature)
 end
 
 function Base.show(io::IO, spec::KernelSpec)
@@ -785,7 +883,8 @@ function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol})
     Expr(:->, Expr(:tuple, deps...), rhs)
 end
 
-function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[])
+function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
+                        call_signature = nothing)
     statements = block isa Expr && block.head === :block ? block.args : Any[block]
     graph_var = gensym(:kernel_graph)
     ports_var = gensym(:kernel_ports)
@@ -942,9 +1041,47 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[])
             $want_var = $symbol_ref[]
             $(prelude...)
             $(body...)
-            $spec_ref($graph_var, $ports_var, $order_var, $have_var, $want_var)
+            $spec_ref($graph_var, $ports_var, $order_var, $have_var, $want_var,
+                      $call_signature)
         end
     end
+end
+
+function _kernel_signature_argument(argument)
+    has_default = argument isa Expr && argument.head === :kw
+    declaration = has_default ? argument.args[1] : argument
+    declaration isa Expr && declaration.head === :(...) && throw(ArgumentError(
+        "@kernel signatures do not support variadic positional or keyword ports"))
+    name, type_expr = _kernel_port_decl(declaration)
+    default_expr = has_default ? argument.args[2] : nothing
+    (; name, type_expr, has_default, default_expr)
+end
+
+function _kernel_call_signature_expr(positional, keywords)
+    positional_names = Tuple(argument.name for argument in positional)
+    keyword_names = Tuple(argument.name for argument in keywords)
+    arguments = (positional..., keywords...)
+    default_mask = Tuple(argument.has_default for argument in arguments)
+    previous = Symbol[]
+    providers = Any[]
+    required_ref = GlobalRef(@__MODULE__, :_KERNEL_REQUIRED_ARGUMENT)
+    for argument in arguments
+        if argument.has_default
+            parameters = Expr(:tuple, previous...)
+            push!(providers, Expr(:->, parameters, argument.default_expr))
+        else
+            push!(providers, required_ref)
+        end
+        push!(previous, argument.name)
+    end
+    signature_ref = GlobalRef(@__MODULE__, :_kernel_call_signature)
+    val_ref = GlobalRef(Base, :Val)
+    :($signature_ref(
+        $val_ref($(QuoteNode(positional_names))),
+        $val_ref($(QuoteNode(keyword_names))),
+        $val_ref($(QuoteNode(default_mask))),
+        $(Expr(:tuple, providers...)),
+    ))
 end
 
 function _kernel_named_signature(signature)
@@ -952,18 +1089,39 @@ function _kernel_named_signature(signature)
     name = first(signature.args)
     name isa Symbol || throw(ArgumentError(
         "@kernel function name must be a symbol, got $(repr(name))"))
-    inputs = Tuple{Symbol,Any}[]
-    seen = Set{Symbol}()
+    positional_raw = Any[]
+    keyword_raw = Any[]
     for argument in signature.args[2:end]
-        argument isa Expr && argument.head === :parameters && throw(ArgumentError(
-            "@kernel signatures currently accept positional ports only"))
-        port_name, type_expr = _kernel_port_decl(argument)
-        port_name in seen && throw(ArgumentError(
-            "@kernel signature repeats port :$port_name"))
-        push!(seen, port_name)
-        push!(inputs, (port_name, type_expr))
+        if argument isa Expr && argument.head === :parameters
+            append!(keyword_raw, argument.args)
+        else
+            push!(positional_raw, argument)
+        end
     end
-    name, inputs
+    positional = [_kernel_signature_argument(argument) for argument in positional_raw]
+    keywords = [_kernel_signature_argument(argument) for argument in keyword_raw]
+
+    optional_seen = false
+    for argument in positional
+        if argument.has_default
+            optional_seen = true
+        elseif optional_seen
+            throw(ArgumentError(
+                "@kernel optional positional arguments must occur at the end"))
+        end
+    end
+
+    seen = Set{Symbol}()
+    for argument in (positional..., keywords...)
+        argument.name in seen && throw(ArgumentError(
+            "@kernel signature repeats port :$(argument.name)"))
+        push!(seen, argument.name)
+    end
+    inputs = Tuple{Symbol,Any}[
+        (argument.name, argument.type_expr)
+        for argument in (positional..., keywords...)
+    ]
+    name, inputs, _kernel_call_signature_expr(positional, keywords)
 end
 
 function _kernel_definition_parts(ex::Expr)
@@ -985,6 +1143,12 @@ end
     kernel = prepare(model)
     kernel(sin, 1.0)
 
+    @kernel affine(x, scale = 2; offset = scale - 1) = begin
+        y = scale * x + offset
+    end
+
+    prepare(affine)(3; offset = 4)
+
     @kernel begin
         x::Float64
         y::Float64 = f(x)
@@ -996,6 +1160,12 @@ form mirrors an ordinary Julia function definition: its signature names the
 default `have` ports, including function-valued inputs. The macro binds the
 function name to the resulting `KernelSpec`; [`prepare`](@ref) turns it into the
 callable straight-line kernel. Both short and long definitions are supported.
+Trailing positional defaults and fixed keyword arguments use ordinary Julia
+call syntax. Defaults are evaluated at call time, from left to right, and may
+refer to earlier positional or keyword arguments. A keyword without a default
+is required. Defaulted and keyword arguments remain exposed `have` ports; the
+signature adapter only fills their values before entering the same generated
+positional kernel. Variadic positional and keyword splats are not supported.
 
 Type annotations are optional metadata. Omitting them does not add dynamic
 dispatch to a prepared kernel: Julia specializes the generated function on the
@@ -1018,12 +1188,17 @@ Recipe metadata uses the compact form
 All recipe bodies resolve and capture names in the caller's scope. The macro
 only constructs closures and graph metadata; recipe bodies run only when a
 prepared kernel is invoked.
+
+`@kernel` authors a graph, not a new object type. Inline method definitions and
+ReactiveObjects-style `__self__` rewriting are not part of this macro. Stateful
+mutation is provided separately by [`prepare_reactive`](@ref), [`set!`](@ref),
+[`mutate!`](@ref), and [`touch!`](@ref).
 """
 macro kernel(ex)
     definition = ex isa Expr ? _kernel_definition_parts(ex) : nothing
     definition === nothing && return esc(_kernel_expand(ex))
-    name, inputs, block = definition
-    esc(Expr(:(=), name, _kernel_expand(block, inputs)))
+    name, inputs, call_signature, block = definition
+    esc(Expr(:(=), name, _kernel_expand(block, inputs, call_signature)))
 end
 
 # --- named boundaries ------------------------------------------------------
@@ -1064,25 +1239,31 @@ end
 
 function prepare(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                  want = _KERNEL_DEFAULT_BOUNDARY, passes = ())
-    prepare(plan(spec; have = have, want = want); passes = passes)
+    prepared = prepare(plan(spec; have = have, want = want); passes = passes)
+    have === _KERNEL_DEFAULT_BOUNDARY || return prepared
+    _kernel_signature_callable(prepared, spec.call_signature)
 end
 
 function prepare!(cache::PreparationCache, spec::KernelSpec;
                   have = _KERNEL_DEFAULT_BOUNDARY,
                   want = _KERNEL_DEFAULT_BOUNDARY, passes = ())
-    prepare!(cache, spec.graph;
-             have = _kernel_selection(spec, have, spec.have_names, :have),
-             want = _kernel_selection(spec, want, spec.want_names, :want),
-             passes = passes)
+    prepared = prepare!(cache, spec.graph;
+                        have = _kernel_selection(spec, have, spec.have_names, :have),
+                        want = _kernel_selection(spec, want, spec.want_names, :want),
+                        passes = passes)
+    have === _KERNEL_DEFAULT_BOUNDARY || return prepared
+    _kernel_signature_callable(prepared, spec.call_signature)
 end
 
 function prepare_nonallocating(spec::KernelSpec;
                                have = _KERNEL_DEFAULT_BOUNDARY,
                                want = _KERNEL_DEFAULT_BOUNDARY, passes = ())
-    prepare_nonallocating(spec.graph;
+    prepared = prepare_nonallocating(spec.graph;
         have = _kernel_selection(spec, have, spec.have_names, :have),
         want = _kernel_selection(spec, want, spec.want_names, :want),
         passes = passes)
+    have === _KERNEL_DEFAULT_BOUNDARY || return prepared
+    _kernel_signature_callable(prepared, spec.call_signature)
 end
 
 inputs(spec::KernelSpec) = _kernel_selection(
@@ -1178,7 +1359,8 @@ function Base.merge(base::KernelSpec, fragment::KernelSpec; boundary::Symbol = :
     _kernel_reindex_producers!(graph)
 
     chosen = boundary === :base ? base : fragment
-    KernelSpec(graph, ports, order, copy(chosen.have_names), copy(chosen.want_names))
+    KernelSpec(graph, ports, order, copy(chosen.have_names), copy(chosen.want_names),
+               chosen.call_signature)
 end
 
 """
@@ -1199,5 +1381,5 @@ function compose(first::KernelSpec, rest::KernelSpec...; boundary::Symbol = :bas
     boundary === :base && return combined
     last = rest[end]
     KernelSpec(combined.graph, combined.ports, combined.port_order,
-               copy(last.have_names), copy(last.want_names))
+               copy(last.have_names), copy(last.want_names), last.call_signature)
 end
