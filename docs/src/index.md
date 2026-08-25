@@ -82,15 +82,17 @@ base while extra requested outputs opt into extra work. The explicit
 p = plan(g)
 visualize(p)                         # interactive HTML; SVG rich-display fallback
 visualize(p; alternatives = true)   # include unselected candidate recipes
-save_visualization("plan.html", p)  # standalone fit/pan/zoom/inspect component
+save_visualization("plan.html", p)  # interactive HTML with offline SVG fallback
 save_visualization("plan.svg", p)   # self-contained, no renderer dependency
 save_visualization("plan.dot", p)   # portable Graphviz interchange
 ```
 
 Values and recipes are separate nodes, so multi-input and multi-output recipes
-remain explicit. The preferred self-contained HTML surface adds fit, pan, zoom,
-and node inspection to the dependency-free SVG fallback; DOT export is
-available when a downstream tool needs Graphviz-quality publication layout.
+remain explicit. The preferred HTML surface uses Cytoscape.js with ELK for
+layered layout, fit, pan, zoom, focus, and node inspection. The public docs
+bundle those libraries locally; standalone HTML retains the dependency-free SVG
+fallback. DOT export is available when a downstream tool needs Graphviz-quality
+publication layout.
 
 A second mode is **incremental / demand-driven** execution: previously
 materialized values join the effective `have` set, changed source values
