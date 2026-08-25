@@ -283,6 +283,61 @@ end
         @test isempty(kernel_graph(long_form_function).recipes[2].inputs)
         @test prepare(long_form_function)(1) == 9
 
+        short_default_capture = @kernel begin
+            a::Int
+            y::Int = begin
+                f(; x = a) = x + 1
+                f()
+            end
+            return y
+        end
+        @test Tuple(v.name for v in only(
+            kernel_graph(short_default_capture).recipes,
+        ).inputs) == (:a,)
+        @test prepare(short_default_capture)(2) == 3
+
+        long_default_capture = @kernel begin
+            a::Int
+            y::Int = begin
+                function f(x = a)
+                    x + 2
+                end
+                f()
+            end
+            return y
+        end
+        @test Tuple(v.name for v in only(
+            kernel_graph(long_default_capture).recipes,
+        ).inputs) == (:a,)
+        @test prepare(long_default_capture)(2) == 4
+
+        shadowed_default = @kernel begin
+            source::Int
+            @recipe (effectful = true) a::Int = source + 100
+            y::Int = begin
+                f(; x = begin
+                    a = 4
+                    a
+                end) = x + 1
+                f()
+            end
+            return y
+        end
+        @test isempty(kernel_graph(shadowed_default).recipes[2].inputs)
+        @test prepare(shadowed_default)(1) == 5
+
+        earlier_parameter_default = @kernel begin
+            source::Int
+            @recipe (effectful = true) x::Int = source + 100
+            y::Int = begin
+                f(x, y = x) = y
+                f(4)
+            end
+            return y
+        end
+        @test isempty(kernel_graph(earlier_parameter_default).recipes[2].inputs)
+        @test prepare(earlier_parameter_default)(1) == 4
+
         for_scope = @kernel begin
             i::Int
             y::Int = begin

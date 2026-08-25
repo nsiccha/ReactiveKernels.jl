@@ -162,6 +162,23 @@ function _kernel_function_name!(names::Set{Symbol}, signature)
     names
 end
 
+function _kernel_function_arguments(signature)
+    while signature isa Expr && signature.head in (:(::), :where)
+        signature = signature.args[1]
+    end
+    signature isa Expr && signature.head === :call || return Any[]
+    positional = Any[]
+    keywords = Any[]
+    for argument in signature.args[2:end]
+        if argument isa Expr && argument.head === :parameters
+            append!(keywords, argument.args)
+        else
+            push!(positional, argument)
+        end
+    end
+    append!(positional, keywords)
+end
+
 _kernel_iterators(ex::Expr) = ex.head === :block ? ex.args : (ex,)
 
 # Precollect only lexical declarations owned by the current hard scope. Plain
@@ -204,6 +221,30 @@ function _kernel_port_read!(out::Vector{Symbol}, seen::Set{Symbol}, name::Symbol
     assigned
 end
 
+function _kernel_function_default_reads!(
+    out::Vector{Symbol}, seen::Set{Symbol}, signature, known::Set{Symbol},
+    assigned::Set{Symbol}, hidden::Set{Symbol},
+)
+    signature_hidden = copy(hidden)
+    _kernel_function_name!(signature_hidden, signature)
+    for argument in _kernel_function_arguments(signature)
+        if argument isa Expr && argument.head === :kw
+            # Earlier positional/keyword parameters are in scope, while the
+            # parameter currently being defaulted is not yet bound.
+            _kernel_free_ports_flow!(
+                out, seen, argument.args[2], known,
+                copy(assigned), signature_hidden,
+            )
+            parameter_names = Set{Symbol}()
+            _kernel_bound_names!(parameter_names, argument.args[1])
+            union!(signature_hidden, parameter_names)
+        else
+            _kernel_bound_names!(signature_hidden, argument)
+        end
+    end
+    nothing
+end
+
 function _kernel_free_ports_flow!(out::Vector{Symbol}, seen::Set{Symbol}, ex,
                                   known::Set{Symbol}, assigned::Set{Symbol},
                                   hidden::Set{Symbol})
@@ -227,6 +268,9 @@ function _kernel_free_ports_flow!(out::Vector{Symbol}, seen::Set{Symbol}, ex,
         end
     elseif ex.head === :(=) && ex.args[1] isa Expr &&
            ex.args[1].head in (:call, :where)
+        _kernel_function_default_reads!(
+            out, seen, ex.args[1], known, assigned, hidden,
+        )
         function_names = Set{Symbol}()
         _kernel_function_parameters!(function_names, ex.args[1])
         body_hidden = union(copy(hidden), function_names)
@@ -357,6 +401,9 @@ function _kernel_free_ports_flow!(out::Vector{Symbol}, seen::Set{Symbol}, ex,
             out, seen, ex.args[2], known, Set{Symbol}(), function_hidden,
         )
     elseif ex.head === :function
+        _kernel_function_default_reads!(
+            out, seen, ex.args[1], known, assigned, hidden,
+        )
         function_hidden = copy(hidden)
         function_names = Set{Symbol}()
         _kernel_function_parameters!(function_names, ex.args[1])
