@@ -23,7 +23,8 @@ sampler = nuts_state(
     step_f = partial(leapfrog!; stepsize = 0.35),
     max_depth = 7,
 )
-chain = sample!(sampler, 1_000; discard_initial = 300)
+warmup = warmup!(sampler, 300)
+chain = sample!(sampler, 1_000)
 means = vec(sum(chain.samples; dims = 2)) ./ size(chain.samples, 2)
 variances = vec(sum(abs2, chain.samples .- means; dims = 2)) ./
     (size(chain.samples, 2) - 1)
@@ -35,3 +36,5 @@ println(code_expr(point, :ham))
 println("sample mean: ", means)
 println("sample variance: ", variances)
 println("divergences: ", count(stat -> stat.diverged, chain.diagnostics))
+println("adapted step size: ", warmup.final_stepsize)
+println("adapted metric: ", warmup.metric)

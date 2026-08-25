@@ -45,7 +45,9 @@ export ReactivePhasePoint, euclidean_phasepoint, riemannian_phasepoint
 export leapfrog!, generalized_leapfrog!, implicit_midpoint!, multistep
 export PartialFunction, partial, NUTSState, NUTSDiagnostics, nuts_state, step!
 export refresh_momentum!, diagnostics, sample!, reactive_program
+export find_initial_stepsize!, warmup!
 export DualAveragingState, dual_averaging_state, fit!
 export WelfordVariance, welford_var
+export TrajectoryStats, SamplingStats, trajectory_stats, sampling_stats, reset!
 
 end # module ReactiveKernels

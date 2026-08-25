@@ -101,9 +101,12 @@ end
 
     @test_throws ArgumentError touch!(state, grad)
     @test_throws ArgumentError set!(state, grad, zeros(2))
+    derived_callback_called = Ref(false)
     @test_throws ArgumentError mutate!(state, grad) do gradient_value
+        derived_callback_called[] = true
         gradient_value .= 0
     end
+    @test !derived_callback_called[]
     @test get!(state, grad) == [2.0, 0.0]
     @test_throws ArgumentError freeze!(state, q)
     @test all(!, state.frozen)

@@ -30,6 +30,12 @@ function _criterion_receipt(left, right, backward_velocity, forward_velocity)
     (; criterion, allocations)
 end
 
+function _trace_product_receipt(left, right)
+    value = ReactiveKernels._tr_prod(left, right)
+    allocations = @allocated ReactiveKernels._tr_prod(left, right)
+    (; value, allocations)
+end
+
 @testset "compiled ReactiveHMC phase points" begin
     gradient_calls = Ref(0)
     counted_gradient(position) = begin
@@ -83,6 +89,12 @@ end
     )
     @test criterion_receipt.criterion
     @test criterion_receipt.allocations == 0
+
+    trace_receipt = _trace_product_receipt(
+        [1.0 2.0; 3.0 4.0], [0.5 1.0; 1.5 2.0],
+    )
+    @test trace_receipt.value == 14.5
+    @test trace_receipt.allocations == 0
 
     metric(position) = begin
         potential, gradient = _gaussian_gradient(position)
@@ -144,9 +156,11 @@ end
     )
     transition = @inferred step!(state)
 
-    # Exact deterministic output from ReactiveHMC.jl
-    # dev@a8a33f958ab0dffb5696ce7da7fcdcdd6983c208 (its nuts.jl is
-    # byte-identical to main@ca9ea4ca41924bb0e1fadc01c717e1333916aba6).
+    # Exact deterministic output from the executable upstream fixture at
+    # `test/fixtures/reactivehmc_ca9_reference.jl`, run in a checkout of
+    # ReactiveHMC.jl main@ca9ea4ca41924bb0e1fadc01c717e1333916aba6.
+    # That revision's `src/nuts.jl` is byte-identical on
+    # dev@a8a33f958ab0dffb5696ce7da7fcdcdd6983c208.
     @test state.init.pos == [0.27957763671875, -0.4214599609375]
     @test state.init.mom == [0.15133209228515626, -0.15659484863281245]
     @test state.init.ham == 0.15160775120020845
@@ -265,4 +279,71 @@ end
     step!(variance, [3.0, 6.0])
     @test variance.mean == [2.0, 4.0]
     @test variance.var ≈ [2 / 3, 8 / 3]
+
+    point = euclidean_phasepoint(
+        _gaussian_potential,
+        _gaussian_gradient,
+        Diagonal(ones(2)),
+        [0.1, -0.2],
+        [0.3, -0.4],
+    )
+    trajectory = trajectory_stats(2)
+    state = nuts_state(
+        point;
+        rng = Xoshiro(42),
+        step_f = partial(leapfrog!; stepsize = 0.25),
+        stats_f = trajectory,
+        max_depth = 3,
+    )
+    transition = sample!(state)
+    @test size(trajectory.positions) == (2, transition.n_steps + 1)
+    @test size(trajectory.gradients) == size(trajectory.positions)
+    @test length(trajectory.dhams) == transition.n_steps + 1
+    @test length(trajectory.pots) == transition.n_steps + 1
+    @test sort(trajectory.idxs) == 0:transition.n_steps
+
+    run_stats = sampling_stats(trajectory)
+    run_stats(state, adaptation)
+    @test run_stats.draws[:, 1] == state.init.pos
+    @test run_stats.n_steps == [transition.n_steps]
+    @test run_stats.stepsizes == [0.25]
+    @test run_stats.acc_rate == [transition.acceptance_rate]
+    @test run_stats.diverged == [transition.diverged]
+    @test run_stats.full_history[1] == trajectory.positions
+    @test run_stats.full_idxs[1] == trajectory.idxs
+
+    scales = [0.25, 4.0]
+    anisotropic_potential(position) =
+        sum(abs2(position[index]) / scales[index] for index in eachindex(position)) / 2
+    anisotropic_gradient(position) =
+        (anisotropic_potential(position), position ./ scales)
+    adapted_point = euclidean_phasepoint(
+        anisotropic_potential,
+        anisotropic_gradient,
+        Diagonal(ones(2)),
+        zeros(2),
+        zeros(2),
+    )
+    adapted_state = nuts_state(
+        adapted_point;
+        rng = Xoshiro(20260825),
+        step_f = partial(leapfrog!; stepsize = 1.0),
+        max_depth = 7,
+    )
+    warmup = warmup!(
+        adapted_state, 120;
+        initial_buffer = 20,
+        terminal_buffer = 20,
+        first_window = 20,
+    )
+    @test isfinite(warmup.initial_stepsize)
+    @test warmup.initial_stepsize > 0
+    @test isfinite(warmup.final_stepsize)
+    @test warmup.final_stepsize > 0
+    @test warmup.metric isa Diagonal
+    @test all(isfinite, diag(warmup.metric))
+    @test all(>(0), diag(warmup.metric))
+    @test diag(warmup.metric) != ones(2)
+    @test warmup.metric_window_ends == [40, 100]
+    @test length(warmup.diagnostics) == 120
 end

@@ -1,10 +1,12 @@
-# Stateful Hamiltonian phase points and the multinomial NUTS transition from
+# Stateful Euclidean/Riemannian Hamiltonian phase points, integrators,
+# adaptation utilities, and the multinomial NUTS transition from
 # ReactiveHMC.jl `src/nuts.jl` at main@ca9ea4ca41924bb0e1fadc01c717e1333916aba6.
 # The file is byte-identical on dev@a8a33f958ab0dffb5696ce7da7fcdcdd6983c208.
 # The sampler algorithm is intentionally kept separate from graph construction:
 # every Hamiltonian field is supplied by a `ReactiveProgram`, while the
 # integrators mutate only declared HAVE slots through the generic invalidation
-# API.
+# API. This file does not port ReactiveHMC's separate fixed-length HMC state or
+# its SoftAbs/relativistic phase-point constructors.
 
 """
     ReactivePhasePoint
@@ -116,7 +118,8 @@ function Base.copyto!(destination::ReactivePhasePoint,
     destination
 end
 
-_tr_prod(a::AbstractMatrix, b::AbstractMatrix) = sum(a' .* b)
+_tr_prod(a::AbstractMatrix, b::AbstractMatrix) =
+    sum(Base.broadcasted(*, a', b))
 
 function _phasepoint(program, state, values)
     handles = map(value -> statevalue(program, value), values)
@@ -332,6 +335,10 @@ function Base.getproperty(f::PartialFunction, name::Symbol)
     getproperty(getfield(f, :kwargs), name)
 end
 
+Base.propertynames(f::PartialFunction, private::Bool = false) =
+    private ? (fieldnames(typeof(f))..., keys(getfield(f, :kwargs))...) :
+              keys(getfield(f, :kwargs))
+
 partial(f, args...; kwargs...) = PartialFunction(f, args, (), (; kwargs...))
 partial(f, ::Colon, args...; kwargs...) =
     PartialFunction(f, (), args, (; kwargs...))
@@ -377,6 +384,11 @@ byte-identical at `dev@a8a33f958ab0dffb5696ce7da7fcdcdd6983c208`.
 The transition uses the generalized endpoint-momentum U-turn criterion from
 that implementation. Hamiltonian values and derivatives are supplied lazily
 by the phase point's compiled ReactiveKernels graph.
+
+The ported scope is this multinomial transition plus the Euclidean/Riemannian
+phase-point, integrator, adaptation, and statistics utilities used with it. It
+does not claim to include ReactiveHMC's separate fixed-length HMC state or its
+SoftAbs/relativistic phase-point constructors.
 """
 mutable struct NUTSState{R,P,F,S,T,TR,PR}
     rng::R
@@ -659,6 +671,7 @@ end
 
 "Refresh momentum and run one NUTS transition."
 function sample!(state::NUTSState)
+    state.stats_f isa TrajectoryStats && reset!(state.stats_f, state.init)
     refresh_momentum!(state)
     step!(state)
 end
@@ -666,8 +679,11 @@ end
 """
     sample!(state, draws; discard_initial=0)
 
-Run a usable NUTS chain, returning a named tuple with a dense `samples` matrix
-(parameters × draws) and one [`NUTSDiagnostics`](@ref) per retained draw.
+Run a fixed-step NUTS chain, returning a named tuple with a dense `samples`
+matrix (parameters × draws) and one [`NUTSDiagnostics`](@ref) per retained
+draw. `discard_initial` only discards transitions; it does not adapt the step
+size or metric. Use the adaptation utilities explicitly until a warmup policy
+has been selected.
 """
 function sample!(state::NUTSState, draws::Integer; discard_initial::Integer = 0)
     draws >= 0 || throw(ArgumentError("draws must be non-negative"))
@@ -762,4 +778,377 @@ function step!(state::WelfordVariance, values::AbstractMatrix; kwargs...)
         step!(state, value; kwargs...)
     end
     state
+end
+
+function _with_stepsize(f::PartialFunction, stepsize)
+    current = getproperty(f, :stepsize)
+    converted = convert(typeof(current), stepsize)
+    PartialFunction(
+        f.func,
+        f.largs,
+        f.rargs,
+        merge(f.kwargs, (; stepsize = converted)),
+    )
+end
+
+function _set_stepsize!(state::NUTSState, stepsize)
+    state.step_f isa PartialFunction || throw(ArgumentError(
+        "automatic step-size adaptation requires step_f = partial(integrator!; stepsize=...)",
+    ))
+    hasproperty(state.step_f, :stepsize) || throw(ArgumentError(
+        "automatic step-size adaptation requires a stepsize keyword",
+    ))
+    state.step_f = _with_stepsize(state.step_f, stepsize)
+    state
+end
+
+function _probe_acceptance(state::NUTSState, stepsize)
+    refresh_momentum!(state)
+    initial_energy = state.init.ham
+    proposal = copy(state.init)
+    _with_stepsize(state.step_f, stepsize)(proposal)
+    energy_error = _finite_or_neginf(initial_energy - proposal.ham)
+    _min1exp(energy_error)
+end
+
+"""
+    find_initial_stepsize!(state; initial=1, target=0.5,
+                           min_stepsize=eps(Float64), max_stepsize=1e3)
+
+Find a reasonable leapfrog step size by doubling or halving until a one-step
+proposal crosses `target` acceptance. This is the standard NUTS initialization
+heuristic; it consumes random momentum draws but does not move the chain's
+position. `state.step_f` must have been built with
+`partial(integrator!; stepsize=...)`.
+"""
+function find_initial_stepsize!(state::NUTSState;
+                                initial = one(state.energy_error),
+                                target = 0.5,
+                                min_stepsize = eps(typeof(state.energy_error)),
+                                max_stepsize = oftype(state.energy_error, 1e3),
+                                max_iterations::Integer = 32)
+    zero(target) < target < one(target) || throw(ArgumentError(
+        "target must be strictly between zero and one",
+    ))
+    zero(initial) < initial || throw(ArgumentError(
+        "initial step size must be positive",
+    ))
+    stepsize = clamp(
+        convert(typeof(state.energy_error), initial),
+        convert(typeof(state.energy_error), min_stepsize),
+        convert(typeof(state.energy_error), max_stepsize),
+    )
+    acceptance = _probe_acceptance(state, stepsize)
+    increase = acceptance > target
+    for _ in 1:max_iterations
+        crossed = increase ? acceptance <= target : acceptance >= target
+        crossed && break
+        next_stepsize = increase ? 2stepsize : stepsize / 2
+        next_stepsize = clamp(
+            next_stepsize,
+            convert(typeof(stepsize), min_stepsize),
+            convert(typeof(stepsize), max_stepsize),
+        )
+        next_stepsize == stepsize && break
+        stepsize = next_stepsize
+        acceptance = _probe_acceptance(state, stepsize)
+    end
+    _set_stepsize!(state, stepsize)
+    stepsize
+end
+
+function _warmup_window_ends(iterations::Int, initial_buffer::Int,
+                             terminal_buffer::Int, first_window::Int)
+    slow_start = initial_buffer + 1
+    slow_stop = iterations - terminal_buffer
+    slow_start > slow_stop && return Int[]
+    ends = Int[]
+    start = slow_start
+    window = first_window
+    while start <= slow_stop
+        remaining = slow_stop - start + 1
+        if 2window > remaining
+            push!(ends, slow_stop)
+            break
+        end
+        push!(ends, start + window - 1)
+        start += window
+        window *= 2
+    end
+    ends
+end
+
+function _adapted_diagonal_metric(point::ReactivePhasePoint,
+                                  estimate::WelfordVariance;
+                                  minimum_variance,
+                                  regularization = 5)
+    weight = estimate.n / (estimate.n + regularization)
+    variance = @. max(
+        minimum_variance,
+        weight * estimate.var + (1 - weight) * minimum_variance,
+    )
+    current = point.metric
+    if current isa Diagonal
+        return Diagonal(convert(typeof(current.diag), variance))
+    end
+    convert(typeof(current), Matrix(Diagonal(variance)))
+end
+
+"""
+    warmup!(state, iterations; target_accept=0.8, adapt_metric=true, ...)
+
+Warm up a Euclidean NUTS state with an automatic initial step-size search,
+dual averaging, and Stan-style expanding windows for a regularized diagonal
+metric estimate. Metric updates use the phase point's public reactive `metric`
+HAVE slot, so the compiled program performs ordinary dependency invalidation;
+there is no sampler-specific refresh path.
+
+The return value records the initial/final step sizes, final metric, per-warmup
+diagnostics, and metric-window boundaries. For a fixed metric set
+`adapt_metric=false`. The current implementation intentionally supports
+Euclidean phase points whose `metric` is a declared source.
+"""
+function warmup!(state::NUTSState, iterations::Integer;
+                 target_accept = 0.8,
+                 adapt_metric::Bool = true,
+                 initial_buffer::Union{Nothing,Integer} = nothing,
+                 terminal_buffer::Union{Nothing,Integer} = nothing,
+                 first_window::Union{Nothing,Integer} = nothing,
+                 minimum_variance = 1e-3)
+    iterations >= 1 || throw(ArgumentError(
+        "warmup iterations must be positive",
+    ))
+    point = state.init
+    if adapt_metric
+        hasproperty(point.handles, :metric) || throw(ArgumentError(
+            "metric adaptation requires a phase point with a metric property",
+        ))
+        metric_handle = point.handles.metric
+        point.state.program.sources[_slot_index(metric_handle)] ||
+            throw(ArgumentError(
+                "metric adaptation requires metric to be a ReactiveProgram HAVE source",
+            ))
+    end
+
+    n = Int(iterations)
+    initial_count = initial_buffer === nothing ? min(75, max(1, n ÷ 5)) :
+                    Int(initial_buffer)
+    terminal_count = terminal_buffer === nothing ? min(50, max(1, n ÷ 10)) :
+                     Int(terminal_buffer)
+    initial_count >= 0 && terminal_count >= 0 || throw(ArgumentError(
+        "warmup buffer lengths must be non-negative",
+    ))
+    initial_count + terminal_count < n || begin
+        initial_count = max(1, n ÷ 3)
+        terminal_count = max(1, n ÷ 6)
+    end
+    slow_length = max(0, n - initial_count - terminal_count)
+    window_size = first_window === nothing ? min(25, max(1, slow_length)) :
+                  Int(first_window)
+    window_size >= 1 || throw(ArgumentError(
+        "first metric window must be positive",
+    ))
+    window_ends = adapt_metric ? _warmup_window_ends(
+        n, initial_count, terminal_count, window_size,
+    ) : Int[]
+
+    initial_stepsize = find_initial_stepsize!(state)
+    adaptation = dual_averaging_state(
+        initial_stepsize; target = target_accept,
+    )
+    variance = welford_var(length(point.pos), eltype(point.pos))
+    warmup_diagnostics = Vector{NUTSDiagnostics{typeof(state.energy_error)}}(
+        undef, n,
+    )
+    next_window = 1
+    for iteration in 1:n
+        transition = sample!(state)
+        warmup_diagnostics[iteration] = transition
+        fit!(adaptation, transition.acceptance_rate)
+        _set_stepsize!(state, adaptation.current)
+
+        inside_slow_window = initial_count < iteration <= n - terminal_count
+        adapt_metric && inside_slow_window && step!(variance, point.pos)
+        if next_window <= length(window_ends) &&
+           iteration == window_ends[next_window]
+            metric = _adapted_diagonal_metric(
+                point, variance; minimum_variance,
+            )
+            point.metric = metric
+            restart_stepsize = find_initial_stepsize!(
+                state; initial = state.step_f.stepsize,
+            )
+            adaptation = dual_averaging_state(
+                restart_stepsize; target = target_accept,
+            )
+            variance = welford_var(length(point.pos), eltype(point.pos))
+            next_window += 1
+        end
+    end
+    _set_stepsize!(state, adaptation.final)
+    (;
+        initial_stepsize,
+        final_stepsize = state.step_f.stepsize,
+        metric = copy(point.metric),
+        diagnostics = warmup_diagnostics,
+        metric_window_ends = window_ends,
+    )
+end
+
+"""
+    TrajectoryStats
+    trajectory_stats(dimension, T=Float64)
+
+Optional recorder matching ReactiveHMC's `trajectory_stats` public surface.
+It records ordered positions, gradients, energy errors, potentials, and the
+tree-building reveal order for one NUTS transition. Pass it as `stats_f` to
+[`nuts_state`](@ref); [`sample!`](@ref) resets it automatically, while callers
+of the low-level [`step!`](@ref) should first call `reset!(stats, point)`.
+"""
+mutable struct TrajectoryStats{T}
+    dim::Int
+    position_storage::Matrix{T}
+    gradient_storage::Matrix{T}
+    dhams::Vector{T}
+    pots::Vector{T}
+    idxs::Vector{Int}
+    first::Int
+    count::Int
+end
+
+function trajectory_stats(dimension::Integer, ::Type{T} = Float64) where {T}
+    dimension >= 1 || throw(ArgumentError("dimension must be positive"))
+    capacity = 16
+    TrajectoryStats(
+        Int(dimension),
+        Matrix{T}(undef, dimension, capacity),
+        Matrix{T}(undef, dimension, capacity),
+        T[], T[], Int[], div(capacity, 2), 0,
+    )
+end
+
+function Base.getproperty(stats::TrajectoryStats, name::Symbol)
+    if name === :positions
+        first = getfield(stats, :first)
+        count = getfield(stats, :count)
+        return @view getfield(stats, :position_storage)[:, first:(first + count - 1)]
+    elseif name === :gradients
+        first = getfield(stats, :first)
+        count = getfield(stats, :count)
+        return @view getfield(stats, :gradient_storage)[:, first:(first + count - 1)]
+    end
+    getfield(stats, name)
+end
+
+Base.propertynames(::TrajectoryStats, private::Bool = false) =
+    private ? (
+        :dim, :positions, :gradients, :dhams, :pots, :idxs,
+        :position_storage, :gradient_storage, :first, :count,
+    ) : (:dim, :positions, :gradients, :dhams, :pots, :idxs)
+
+function _reserve_trajectory_column!(stats::TrajectoryStats, prepend::Bool)
+    capacity = size(stats.position_storage, 2)
+    needs_room = prepend ? stats.first == 1 :
+                 stats.first + stats.count > capacity
+    if needs_room
+        new_capacity = 2capacity
+        new_first = div(new_capacity - stats.count, 2) + 1
+        position_storage = similar(stats.position_storage, stats.dim, new_capacity)
+        gradient_storage = similar(stats.gradient_storage, stats.dim, new_capacity)
+        if stats.count > 0
+            source = stats.first:(stats.first + stats.count - 1)
+            destination = new_first:(new_first + stats.count - 1)
+            copyto!(@view(position_storage[:, destination]),
+                    @view(stats.position_storage[:, source]))
+            copyto!(@view(gradient_storage[:, destination]),
+                    @view(stats.gradient_storage[:, source]))
+        end
+        stats.position_storage = position_storage
+        stats.gradient_storage = gradient_storage
+        stats.first = new_first
+    end
+    if prepend
+        stats.first -= 1
+        stats.count += 1
+        stats.first
+    else
+        column = stats.first + stats.count
+        stats.count += 1
+        column
+    end
+end
+
+function reset!(stats::TrajectoryStats, point::ReactivePhasePoint)
+    length(point.pos) == stats.dim || throw(DimensionMismatch(
+        "trajectory recorder dimension $(stats.dim) does not match phase point dimension $(length(point.pos))",
+    ))
+    stats.count = 0
+    stats.first = div(size(stats.position_storage, 2), 2)
+    column = _reserve_trajectory_column!(stats, false)
+    stats.position_storage[:, column] .= point.pos
+    stats.gradient_storage[:, column] .= -point.dham_dpos
+    empty!(stats.dhams)
+    empty!(stats.pots)
+    empty!(stats.idxs)
+    push!(stats.dhams, zero(eltype(stats.dhams)))
+    push!(stats.pots, point.pot)
+    push!(stats.idxs, 0)
+    stats
+end
+
+function (stats::TrajectoryStats)(state::NUTSState)
+    prepend = !state.go_forward
+    column = _reserve_trajectory_column!(stats, prepend)
+    stats.position_storage[:, column] .= state.fwd.pos
+    stats.gradient_storage[:, column] .= -state.fwd.dham_dpos
+    if prepend
+        pushfirst!(stats.dhams, state.energy_error)
+        pushfirst!(stats.pots, state.fwd.pot)
+        pushfirst!(stats.idxs, length(stats.idxs))
+    else
+        push!(stats.dhams, state.energy_error)
+        push!(stats.pots, state.fwd.pot)
+        push!(stats.idxs, length(stats.idxs))
+    end
+    stats
+end
+
+"""
+    SamplingStats
+    sampling_stats(trajectory_stats)
+
+Accumulate ReactiveHMC-compatible per-transition draws, leapfrog counts,
+stepsizes, acceptance rates, divergence flags, and optional trajectory history.
+Call the returned object as `stats(state, adaptation_state)` after a transition.
+"""
+mutable struct SamplingStats{T,S}
+    trajectory::S
+    draws::Matrix{T}
+    n_steps::Vector{Int}
+    stepsizes::Vector{T}
+    acc_rate::Vector{T}
+    diverged::Vector{Bool}
+    full_history::Vector{Matrix{T}}
+    full_idxs::Vector{Vector{Int}}
+end
+
+function sampling_stats(trajectory::TrajectoryStats{T}) where {T}
+    SamplingStats(
+        trajectory,
+        Matrix{T}(undef, trajectory.dim, 0),
+        Int[], T[], T[], Bool[], Matrix{T}[], Vector{Int}[],
+    )
+end
+
+function (stats::SamplingStats)(state::NUTSState, adaptation_state = nothing)
+    stats.draws = hcat(stats.draws, state.init.pos)
+    push!(stats.n_steps, max(0, length(stats.trajectory.dhams) - 1))
+    stepsize = hasproperty(state.step_f, :stepsize) ?
+               state.step_f.stepsize : oftype(state.energy_error, NaN)
+    push!(stats.stepsizes, stepsize)
+    push!(stats.acc_rate, diagnostics(state).acceptance_rate)
+    push!(stats.diverged, state.diverged)
+    push!(stats.full_history, Matrix(stats.trajectory.positions))
+    push!(stats.full_idxs, copy(stats.trajectory.idxs))
+    stats
 end
