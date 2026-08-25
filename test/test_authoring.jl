@@ -97,6 +97,7 @@ end
               (:h, :a)
 
         kernel = prepare(model)
+        @test kernel isa PreparedKernel
         @test @inferred(kernel(f, h, 1.0, 2.0)) == 6.0
         allocated(k, f, h, x, y) = (k(f, h, x, y); @allocated k(f, h, x, y))
 
@@ -130,6 +131,88 @@ end
         @test_throws ArgumentError macroexpand(@__MODULE__, quote
             @kernel repeated(x, x) = begin
                 y = x + 1
+            end
+        end)
+
+        default_calls = Ref(0)
+        @kernel configurable(x, scale = begin
+                                 default_calls[] += 1
+                                 2
+                             end;
+                             offset = scale + 1,
+                             transform = identity,
+                             required) = begin
+            out = transform(x * scale + offset + required)
+        end
+
+        @test default_calls[] == 0
+        @test keys(configurable) ==
+              (:x, :scale, :offset, :transform, :required, :out)
+        @test Tuple(value.name for value in inputs(configurable)) ==
+              (:x, :scale, :offset, :transform, :required)
+        configurable_kernel = prepare(configurable)
+        @test inputs(configurable_kernel) == inputs(configurable)
+        @test outputs(configurable_kernel) == outputs(configurable)
+        @test code_expr(configurable_kernel) == code_expr(plan(configurable))
+        @test @inferred(configurable_kernel(3; required = 4)) == 13
+        @test default_calls[] == 1
+        @test @inferred(configurable_kernel(3, 5; required = 4)) == 25
+        @test default_calls[] == 1
+        @test @inferred(configurable_kernel(
+            3; offset = 10, transform = x -> 2x, required = 4,
+        )) == 40
+        @test default_calls[] == 2
+        configurable_allocations(kernel) = begin
+            kernel(3; required = 4)
+            @allocated kernel(3; required = 4)
+        end
+        @test configurable_allocations(configurable_kernel) == 0
+        @test_throws UndefKeywordError configurable_kernel(3)
+        @test_throws ArgumentError configurable_kernel(3; required = 4, extra = 1)
+        @test_throws MethodError configurable_kernel()
+        @test_throws MethodError configurable_kernel(1, 2, 3)
+
+        @kernel function long_defaults(x = 2; offset = x + 1)
+            out = x + offset
+        end
+        @test @inferred(prepare(long_defaults)()) == 5
+        @test @inferred(prepare(long_defaults)(4; offset = 10)) == 14
+
+        @kernel keyword_chain(x; first = x + 1, second = first + 1) = begin
+            out = x + first + second
+        end
+        @test @inferred(prepare(keyword_chain)(1)) == 6
+        @test @inferred(prepare(keyword_chain)(1; first = 10)) == 22
+
+        @kernel keyword_only(; x = 1, y = x + 1) = begin
+            out = x + y
+        end
+        @test @inferred(prepare(keyword_only)()) == 3
+        @test @inferred(prepare(keyword_only)(y = 10)) == 11
+
+        @kernel configurable_diagnostic(out) = begin
+            doubled = 2out
+        end
+        configurable_extended = merge(configurable, configurable_diagnostic)
+        @test @inferred(prepare(configurable_extended)(3; required = 4)) == 13
+
+        cache = PreparationCache()
+        cached_configurable = prepare!(cache, configurable)
+        @test @inferred(cached_configurable(3; required = 4)) == 13
+
+        @test_throws ArgumentError macroexpand(@__MODULE__, quote
+            @kernel invalid_optional(x = 1, y) = begin
+                out = x + y
+            end
+        end)
+        @test_throws ArgumentError macroexpand(@__MODULE__, quote
+            @kernel invalid_vararg(x, rest...) = begin
+                out = x
+            end
+        end)
+        @test_throws ArgumentError macroexpand(@__MODULE__, quote
+            @kernel invalid_keyword_splat(x; kwargs...) = begin
+                out = x
             end
         end)
     end
@@ -254,19 +337,21 @@ end
             port_order::Int
             have_names::Int
             want_names::Int
-            out::Int = ports + port_order + have_names + want_names
+            call_signature::Int
+            out::Int = ports + port_order + have_names + want_names + call_signature
             return out
         end
         @test storage_collision.ports isa Dict
         @test storage_collision.port_order isa Vector{Symbol}
         @test storage_collision.have_names isa Vector{Symbol}
         @test storage_collision.want_names isa Vector{Symbol}
-        for name in (:ports, :port_order, :have_names, :want_names)
+        @test storage_collision.call_signature === nothing
+        for name in (:ports, :port_order, :have_names, :want_names, :call_signature)
             @test storage_collision[name] isa Value{Int}
             @test name in propertynames(storage_collision)
             @test count(==(name), propertynames(storage_collision)) == 1
         end
-        @test prepare(storage_collision)(1, 2, 3, 4) == 10
+        @test prepare(storage_collision)(1, 2, 3, 4, 5) == 15
 
         @test prepare(AuthoringNameCollisionFixture.make_module_spec())(2) == 3
         @test prepare(AuthoringNameCollisionFixture.make_local_spec(1, 2))(2) == 4

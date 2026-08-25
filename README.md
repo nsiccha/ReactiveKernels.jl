@@ -54,6 +54,14 @@ end
 
 k = prepare(chain)
 k(step, scale, 1.2)  # 4.4 — a straight-line kernel: b = 2*(x+1)
+
+@kernel affine(x, factor = 2; offset = factor - 1) = begin
+    y = factor * x + offset
+end
+
+affine_kernel = prepare(affine)
+affine_kernel(3)                  # 7
+affine_kernel(3; offset = 4)      # 10
 ```
 
 Like ReactiveObjects.jl's `@reactive` definitions, the primary `@kernel` form
@@ -64,7 +72,16 @@ concrete values passed at runtime. Every signature argument and assignment is
 exposed (`chain.x`, `chain.a`, `chain.b`); without an explicit `return`, the
 derived sink `b` is the default output. A `return` can choose another default
 output boundary without hiding any named port. Anonymous `@kernel begin ... end`
-specifications remain useful for fragments and low-level tooling.
+specifications remain useful for fragments and low-level tooling. Trailing
+positional defaults and fixed keyword arguments follow Julia call syntax;
+defaults run when omitted and may refer to earlier arguments. They remain
+ordinary exposed input ports (`affine.factor`, `affine.offset`).
+
+`@kernel` declares a graph rather than a new object type. Reactive state inputs
+can be changed with `set!`, `mutate!`, and `touch!`, but inline method definitions
+such as `Base.show(io, __self__) = ...` and magic `__self__` rewriting are not
+currently supported. Define external methods on an ordinary wrapper type when
+that object-level interface is needed.
 
 ### Low-level `Graph` escape hatch (equivalent)
 
