@@ -66,6 +66,10 @@ const _CA9_MSUM = Ref(0)    # recompute counter for `msum`   (depends on mvs)
         end
         w[1] += delta                   # sound single-root alias -> accepted, invalidates weights
     end
+    ternroot!(c, delta) = begin
+        w = c ? weights[1] : weights[2] # ternary RHS, same root `weights` -> accepted
+        w[1] += delta
+    end
 end
 
 @testset "@reactive ca9 — indexed/nested/compound/dotted/@./loop" begin
@@ -124,6 +128,11 @@ end
     sameroot!(t, false, 3.0)                       # c=false -> w=weights[2]; weights[2][1]+=3
     @test t.weights[2][1] == 3.0
     @test t.wsum == 8.0 && _CA9_WSUM[] == c2 + 1
+    # ternary RHS with the SAME root is also accepted and invalidates the dependent
+    c3 = _CA9_WSUM[]
+    ternroot!(t, true, 10.0)                       # w = true ? weights[1] : weights[2]
+    @test t.weights[1][1] == 15.0                  # 5 + 10
+    @test t.wsum == 18.0 && _CA9_WSUM[] == c3 + 1
 end
 
 @testset "@reactive ca9 — local-alias @. nested mutation invalidates dependent" begin
@@ -285,6 +294,24 @@ end
             m!(n) = begin
                 w = a
                 for _ in 1:n; w = b; end
+                w[1] += 1.0
+            end
+        end)))
+    # ternary RHS aliasing DIFFERENT fields
+    @test occursin("cannot be soundly invalidated", _reactive_expansion_error(:(
+        @reactive _bad_tern(k::Int) = begin
+            a::Vector{Float64} = fill(1.0, k); b::Vector{Float64} = fill(2.0, k)
+            m!(c) = begin
+                w = c ? a : b
+                w[1] += 1.0
+            end
+        end)))
+    # ternary RHS aliasing a field on one side, a non-alias on the other
+    @test occursin("cannot be soundly invalidated", _reactive_expansion_error(:(
+        @reactive _bad_tern_mixed(k::Int) = begin
+            a::Vector{Float64} = fill(1.0, k)
+            m!(c) = begin
+                w = c ? a : zeros(k)
                 w[1] += 1.0
             end
         end)))

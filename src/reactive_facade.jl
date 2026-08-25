@@ -271,6 +271,23 @@ function _reactive_alias_target(rhs, fields::Set{Symbol}, shadow::Set{Symbol})
     (r isa Symbol && r in fields && !(r in shadow)) ? r : nothing
 end
 
+# The set of field roots a binding RHS can alias. A plain reference into a field
+# gives its single root; a ternary `c ? A : B` (Expr(:if) with 3 args) is sound
+# ONLY if every branch aliases the SAME single field — otherwise (distinct roots,
+# or alias-vs-nonalias) it yields a conflicted set (>= 2, with the sentinel) so a
+# later mutation of the local is rejected at expansion. Empty = not an alias.
+function _reactive_alias_roots(rhs, fields::Set{Symbol}, shadow::Set{Symbol})
+    if rhs isa Expr && rhs.head === :if && length(rhs.args) == 3
+        ra = _reactive_alias_roots(rhs.args[2], fields, shadow)
+        rb = _reactive_alias_roots(rhs.args[3], fields, shadow)
+        (isempty(ra) && isempty(rb)) && return Set{Symbol}()
+        (length(ra) == 1 && ra == rb) && return ra
+        return union(ra, rb, Set([_REACTIVE_ALIAS_CONFLICT]))
+    end
+    t = _reactive_alias_target(rhs, fields, shadow)
+    t === nothing ? Set{Symbol}() : Set([t])
+end
+
 _copy_aliases(a::Dict{Symbol,Set{Symbol}}) =
     Dict{Symbol,Set{Symbol}}(k => copy(v) for (k, v) in a)
 
@@ -424,8 +441,8 @@ function _reactive_rewrite(ex, fields::Set{Symbol}, methods::Set{Symbol},
             # (Re)binding a local: record a field alias if the RHS references into a
             # field, else clear any prior alias for that name.
             if lhs isa Symbol
-                target = _reactive_alias_target(rhs, fields, shadow)
-                target === nothing ? delete!(aliases, lhs) : (aliases[lhs] = Set([target]))
+                roots = _reactive_alias_roots(rhs, fields, shadow)
+                isempty(roots) ? delete!(aliases, lhs) : (aliases[lhs] = roots)
             end
             local_names = Set{Symbol}(); _reactive_assign_names!(local_names, lhs)
             inner = union(shadow, local_names)
