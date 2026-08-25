@@ -54,6 +54,17 @@ function _evaluate_source(mod::Module, displayed::AbstractString)
     nothing
 end
 
+function setup_eight_schools!(mod::Module)
+    if !isdefined(mod, :EightSchoolsExample)
+        Base.include(mod, joinpath(@__DIR__, "..", "examples", "eight_schools.jl"))
+    end
+    Core.eval(mod, :(using .EightSchoolsExample:
+        EightSchoolsParameters, NewGroupPrediction,
+        SchoolVector, UnconstrainedParameters, PredictionInnovations,
+        EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA))
+    nothing
+end
+
 """
     render_examples(artifacts) -> Markdown.MD
 
@@ -112,9 +123,11 @@ Evaluate the exact displayed Julia source and render the resulting prepared
 kernel through the standard three-view UI. The source must bind `result` to a
 named tuple with `name`, `origin`, `inputs`, `kernel`, and `output` fields.
 """
-function execute_example(mod::Module, code::AbstractString; result::Symbol = :docs_example)
+function execute_example(mod::Module, code::AbstractString;
+                         result::Symbol = :docs_example, setup = nothing)
     displayed = strip(code, '\n')
     Core.eval(mod, :(using ReactiveKernels))
+    setup === nothing || setup(mod)
     _evaluate_source(mod, displayed)
     executed = Core.eval(mod, result)
     executed.kernel isa PreparedKernel || error(

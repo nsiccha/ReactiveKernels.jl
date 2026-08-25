@@ -49,6 +49,11 @@ function ReactiveState(g::Graph; materialize = (), frozen = nothing)
     st
 end
 
+function ReactiveState(spec::KernelSpec; materialize = (), frozen = nothing)
+    values = _kernel_selection(spec, materialize, Symbol[], :materialize)
+    ReactiveState(spec.graph; materialize = values, frozen = frozen)
+end
+
 _cid(st::ReactiveState, v::Value) = canon_id(st.graph, v.id)
 
 function _install!(st::ReactiveState, id::Int, val, policy::Symbol)

@@ -7,7 +7,13 @@ prepared kernel's hot path.
 ## Quick use
 
 ```julia
-p = plan(g; have = (x, y), want = (out,))
+g = @kernel begin
+    x::Float64
+    y::Float64
+    out::Float64 = hypot(x, y)
+    return out
+end
+p = plan(g)
 
 p                                      # interactive HTML in a rich display
 visualize(p)                           # the configurable display object

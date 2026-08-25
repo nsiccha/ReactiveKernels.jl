@@ -63,6 +63,8 @@ function visualize(x::Plan; alternatives::Bool = false,
     DAGVisualization(x, alternatives, orientation)
 end
 
+visualize(spec::KernelSpec; kwargs...) = visualize(spec.graph; kwargs...)
+
 struct _VizNode
     id::String
     label::String
@@ -229,6 +231,7 @@ and can be stored, diffed, or rendered by any compatible external tool.
 """
 dot_source(v::DAGVisualization) = sprint(_write_dot, v)
 dot_source(x::Union{Graph,Plan}; kwargs...) = dot_source(visualize(x; kwargs...))
+dot_source(spec::KernelSpec; kwargs...) = dot_source(visualize(spec; kwargs...))
 
 Base.show(io::IO, ::MIME"text/vnd.graphviz", v::DAGVisualization) = _write_dot(io, v)
 Base.show(io::IO, mime::MIME"text/vnd.graphviz", x::Union{Graph,Plan}) =
@@ -645,3 +648,5 @@ end
 
 save_visualization(path::AbstractString, x::Union{Graph,Plan}; kwargs...) =
     save_visualization(path, visualize(x; kwargs...))
+save_visualization(path::AbstractString, spec::KernelSpec; kwargs...) =
+    save_visualization(path, visualize(spec; kwargs...))

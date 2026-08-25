@@ -25,6 +25,65 @@ const REACTIVEOBJECTS_ORIGIN =
 const REACTIVEHMC_ORIGIN =
     "ReactiveHMC.jl main@ca9ea4ca41924bb0e1fadc01c717e1333916aba6"
 
+const CHAIN_SOURCE = """@kernel begin
+    x::Float64
+    z::Float64 = 2x
+    w::Float64 = z + 1
+    return w
+end"""
+
+const DIAMOND_SOURCE = """@kernel begin
+    a::Float64
+    b::Float64 = a + 1
+    c::Float64 = a + 2
+    d::Float64 = b + c
+    return d
+end"""
+
+const SHARED_SOURCE = """@kernel begin
+    x::Float64
+    a::Float64 = x + 1
+    b::Float64 = 2a
+    c::Float64 = 3a
+    return (b, c)
+end"""
+
+const EUCLIDEAN_SOURCE = """@kernel begin
+    pos::typeof(pos0)
+    mom::typeof(mom0)
+    metric::typeof(metric0)
+    pot::typeof(pot0) = pot_f(pos)
+    (pot, dpot::typeof(dpot0)) = grad_f(pos)
+    chol::typeof(chol0) = cholesky(metric)
+    dham_dmom::typeof(dmom0) = metric_dmom(chol, mom)
+    ham::typeof(ham0) = hamiltonian(pot, chol, mom)
+    return ham
+end"""
+
+const RIEMANNIAN_SOURCE = """@kernel begin
+    pos::typeof(pos0)
+    mom::typeof(mom0)
+    (pot::typeof(pot0), dpot::typeof(dpot0),
+     metric::typeof(metric0), metric_grad::typeof(metric_grad0)) =
+        metric_gradient(pos)
+    chol::typeof(chol0) = cholesky(metric)
+    inv_metric::typeof(inv_metric0) = Symmetric(inv(chol))
+    dham_dpos::typeof(dpos0) = metric_dpos(mom, chol, inv_metric, metric_grad, dpot)
+    return (pot, dpot, metric, metric_grad, chol, inv_metric, dham_dpos)
+end"""
+
+const SOFTABS_SOURCE = """@kernel begin
+    pos::typeof(pos0)
+    (pot::typeof(pot0), dpot::typeof(dpot0),
+     premetric::typeof(premetric0), premetric_grad::typeof(premetric_grad0)) =
+        premetric_gradient(pos)
+    (eigenvalues::typeof(eigenvalues0), eigenvectors::typeof(eigenvectors0),
+     metric_eigenvalues::typeof(metric_eigenvalues0), q_inv::typeof(q_inv0),
+     jacobian::typeof(jacobian0)) = softabs_geometry(premetric)
+    return (pot, dpot, premetric, premetric_grad, eigenvalues, eigenvectors,
+            metric_eigenvalues, q_inv, jacobian)
+end"""
+
 """
     ExampleArtifact
 
@@ -61,32 +120,21 @@ function reactiveobjects_artifacts()
         _artifact(
             :reactiveobjects_chain,
             REACTIVEOBJECTS_ORIGIN,
-            """@reactive _demo_chain(x) = begin
-    z = 2x
-    w = z + 1
-end""",
+            CHAIN_SOURCE,
             (; x = 10.0),
             chain.kernel,
         ),
         _artifact(
             :reactiveobjects_diamond,
             REACTIVEOBJECTS_ORIGIN,
-            """@reactive _demo_diamond(a) = begin
-    b = a + 1
-    c = a + 2
-    d = b + c
-end""",
+            DIAMOND_SOURCE,
             (; a = 10.0),
             diamond.kernel,
         ),
         _artifact(
             :reactiveobjects_shared,
             REACTIVEOBJECTS_ORIGIN,
-            """@reactive _demo_shared(x) = begin
-    a = x + 1
-    b = 2a
-    c = 3a
-end""",
+            SHARED_SOURCE,
             (; x = 5.0),
             shared.kernel,
         ),
@@ -106,28 +154,28 @@ function reactivehmc_artifacts()
         _artifact(
             :euclidean_phasepoint,
             REACTIVEHMC_ORIGIN,
-            "euclidean_phasepoint(pot_f, grad_f, metric, pos, mom)",
+            EUCLIDEAN_SOURCE,
             (; pos, metric, mom),
             euclidean.gaussian.prepared.ham,
         ),
         _artifact(
             :relativistic_euclidean_phasepoint,
             REACTIVEHMC_ORIGIN,
-            "relativistic_euclidean_phasepoint(pot_f, grad_f, metric, pos, mom; c, m)",
+            EUCLIDEAN_SOURCE,
             (; pos, metric, mom),
             euclidean.relativistic.prepared.ham,
         ),
         _artifact(
             :riemannian_phasepoint,
             REACTIVEHMC_ORIGIN,
-            "riemannian_phasepoint(pot_f, grad_f, metric_f, metric_grad_f, pos, mom)",
+            RIEMANNIAN_SOURCE,
             (; pos),
             riemannian.gaussian.prepared.geometry,
         ),
         _artifact(
             :relativistic_riemannian_phasepoint,
             REACTIVEHMC_ORIGIN,
-            "relativistic_riemannian_phasepoint(pot_f, grad_f, metric_f, metric_grad_f, pos, mom; c, m)",
+            RIEMANNIAN_SOURCE,
             (;
                 mom,
                 chol = relativistic_geometry.chol,
@@ -140,42 +188,42 @@ function reactivehmc_artifacts()
         _artifact(
             :riemannian_softabs_phasepoint,
             REACTIVEHMC_ORIGIN,
-            "riemannian_softabs_phasepoint(pot_f, grad_f, premetric_f, premetric_grad_f, pos, mom; alpha)",
+            SOFTABS_SOURCE,
             (; pos),
             softabs.gaussian.prepared.geometry,
         ),
         _artifact(
             :relativistic_riemannian_softabs_phasepoint,
             REACTIVEHMC_ORIGIN,
-            "relativistic_riemannian_softabs_phasepoint(pot_f, grad_f, premetric_f, premetric_grad_f, pos, mom; alpha, c, m)",
+            SOFTABS_SOURCE,
             (; pos),
             softabs.relativistic.prepared.geometry,
         ),
         _artifact(
             :leapfrog,
             REACTIVEHMC_ORIGIN,
-            "leapfrog!(phasepoint; stepsize = 0.1)",
+            EUCLIDEAN_SOURCE,
             (; pos),
             euclidean.gaussian.prepared.dpos,
         ),
         _artifact(
             :generalized_leapfrog,
             REACTIVEHMC_ORIGIN,
-            "generalized_leapfrog!(phasepoint; stepsize = 0.1, n_fi_steps = 4)",
+            RIEMANNIAN_SOURCE,
             (; pos),
             riemannian.gaussian.prepared.geometry,
         ),
         _artifact(
             :implicit_midpoint,
             REACTIVEHMC_ORIGIN,
-            "implicit_midpoint!(phasepoint; stepsize = 0.1, n_fi_steps = 4)",
+            RIEMANNIAN_SOURCE,
             (; pos),
             riemannian.gaussian.prepared.geometry,
         ),
         _artifact(
             :multistep,
             REACTIVEHMC_ORIGIN,
-            "multistep(generalized_leapfrog!; n_steps = 3)(phasepoint; stepsize = 0.06, n_fi_steps = 2)",
+            SOFTABS_SOURCE,
             (; pos),
             softabs.gaussian.prepared.geometry,
         ),
