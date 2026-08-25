@@ -161,6 +161,19 @@ end
     orsameroot!(t, false, 6.0)                     # c=false -> executed RHS; w=weights[2] (=7) +6
     @test t.weights[2][1] == 13.0
     @test t.wsum == 31.0 && _CA9_WSUM[] == c7 + 1
+    # accepted short-circuit aliases must stay type-stable + 0-alloc on BOTH paths
+    # (the conditionally-rebound alias local is captured via a fresh single binding,
+    # not boxed) — matching the ternary's Float64 / 0 B.
+    _and_ret(o, c, x) = andsameroot!(o, c, x)
+    _or_ret(o, c, x) = orsameroot!(o, c, x)
+    @test @inferred(_and_ret(t, false, 0.0)) isa Float64
+    @test @inferred(_and_ret(t, true, 0.0)) isa Float64
+    @test @inferred(_or_ret(t, false, 0.0)) isa Float64
+    @test @inferred(_or_ret(t, true, 0.0)) isa Float64
+    _aalloc(o, c, x) = (andsameroot!(o, c, x); @allocated andsameroot!(o, c, x))
+    _oalloc(o, c, x) = (orsameroot!(o, c, x); @allocated orsameroot!(o, c, x))
+    @test _aalloc(t, false, 0.0) == 0 && _aalloc(t, true, 0.0) == 0
+    @test _oalloc(t, false, 0.0) == 0 && _oalloc(t, true, 0.0) == 0
 end
 
 @testset "@reactive ca9 — local-alias @. nested mutation invalidates dependent" begin

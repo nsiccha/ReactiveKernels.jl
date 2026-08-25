@@ -338,6 +338,16 @@ function _reactive_merge_strict!(dest::Dict{Symbol,Set{Symbol}}, paths)
     dest
 end
 
+# Replace every free occurrence of symbol `old` with `new` (used to redirect an
+# alias mutation onto a fresh single-assignment local); quoted subtrees are left
+# untouched.
+function _reactive_replace_symbol(ex, old::Symbol, new)
+    ex === old && return new
+    ex isa Expr || return ex
+    ex.head === :quote && return ex
+    Expr(ex.head, (_reactive_replace_symbol(a, old, new) for a in ex.args)...)
+end
+
 # Route an alias-local mutation to the field it aliases. A straight-line
 # single-field alias (`tree = trees[d]; tree.x = …`) lowers to one assign!-backed
 # inplace closure that invalidates exactly that field's dependents. A
@@ -348,8 +358,17 @@ end
 # unsound, and there is no in-band runtime field identity to dispatch on without a
 # Symbol/materialization. ca9's aliases are all straight-line single-field.
 function _reactive_alias_dispatch(self, aliasname, roots, body)
-    length(roots) == 1 &&
-        return _reactive_inplace_call(self, first(roots), gensym(:buffer), body)
+    if length(roots) == 1
+        # Bind a FRESH single-assignment local to the alias's current value and
+        # capture THAT in the assign! closure. The user's alias local may be
+        # conditionally rebound (`c && (w = weights[2])`), which — captured in a
+        # closure — Julia boxes (Core.Box: Any-typed, allocating). The fresh local
+        # is assigned exactly once, so the closure stays concrete/type-stable/0 B.
+        fresh = gensym(:alias)
+        body2 = _reactive_replace_symbol(body, aliasname, fresh)
+        return Expr(:let, Expr(:(=), fresh, aliasname),
+                    _reactive_inplace_call(self, first(roots), gensym(:buffer), body2))
+    end
     named = sort!(collect(r for r in roots if r != _REACTIVE_ALIAS_CONFLICT))
     throw(ArgumentError(string(
         "@reactive: local `", aliasname, "` aliases a reactive field only on some ",
