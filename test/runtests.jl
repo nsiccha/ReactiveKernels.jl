@@ -3,7 +3,10 @@ using Test
 
 @testset "ReactiveKernels" begin
     benchmark_only = ARGS == ["benchmark"]
-    if !benchmark_only
+    distributions_only = ARGS == ["distributions"]
+    if distributions_only
+        include("test_distributions_example.jl")
+    elseif !benchmark_only
         include("test_stateless.jl")
         include("test_authoring.jl")
         include("test_nonallocating_core.jl")
@@ -15,8 +18,9 @@ using Test
         include("test_eight_schools_example.jl")
         include("test_hmc.jl")
         include("test_online_stats_example.jl")
+        include("test_distributions_example.jl")
         include("test_preexisting_examples.jl")
         include("test_corrected_core_examples.jl")
     end
-    include("test_handwritten_benchmarks.jl")
+    distributions_only || include("test_handwritten_benchmarks.jl")
 end

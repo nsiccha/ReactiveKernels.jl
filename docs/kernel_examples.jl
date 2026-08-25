@@ -21,10 +21,6 @@ function _example_title(name::Symbol)
     join(uppercasefirst.(split(string(name), '_')), " ")
 end
 
-function _plain_repr(value)
-    sprint(show, MIME"text/plain"(), value; context = :limit => false)
-end
-
 function _generated_source(expr::Expr)
     sprint(Base.show_unquoted, expr; context = :limit => false)
 end
@@ -94,12 +90,7 @@ function render_examples(artifacts)
             "$(artifact.name) generated view is not its PreparedKernel code_expr",
         )
 
-        source = string(
-            "# Origin: ", artifact.origin, "\n",
-            artifact.source, "\n\n",
-            "# Executed input\n", _plain_repr(artifact.inputs), "\n\n",
-            "# Actual output\n", _plain_repr(artifact.output),
-        )
+        source = artifact.source
         generated = _generated_source(artifact.generated)
 
         title = _example_title(artifact.name)
