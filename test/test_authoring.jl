@@ -72,6 +72,68 @@ end
 end
 
 @testset "Declarative kernel authoring" begin
+    @testset "function-shaped definitions, optional types, and exposed ports" begin
+        f_calls = Ref(0)
+        h_calls = Ref(0)
+        f(x, y) = (f_calls[] += 1; x + y)
+        h(a) = (h_calls[] += 1; 2a)
+
+        @kernel model(f, h, x, y) = begin
+            a = f(x, y)
+            out = h(a)
+        end
+
+        @test model isa KernelSpec
+        @test f_calls[] == 0
+        @test h_calls[] == 0
+        @test keys(model) == (:f, :h, :x, :y, :a, :out)
+        @test inputs(model) == (model.f, model.h, model.x, model.y)
+        @test outputs(model) == (model.out,)
+        @test all(v -> ReactiveKernels.valtype(v) === Any,
+                  (model.f, model.h, model.x, model.y, model.a, model.out))
+        @test Tuple(v.name for v in kernel_graph(model).recipes[1].inputs) ==
+              (:f, :x, :y)
+        @test Tuple(v.name for v in kernel_graph(model).recipes[2].inputs) ==
+              (:h, :a)
+
+        kernel = prepare(model)
+        @test @inferred(kernel(f, h, 1.0, 2.0)) == 6.0
+        allocated(k, f, h, x, y) = (k(f, h, x, y); @allocated k(f, h, x, y))
+
+        @kernel typed_model(f::typeof(f), h::typeof(h),
+                            x::Float64, y::Float64) = begin
+            a::Float64 = f(x, y)
+            out::Float64 = h(a)
+        end
+        typed_kernel = prepare(typed_model)
+        @test @inferred(typed_kernel(f, h, 1.0, 2.0)) == 6.0
+        untyped_allocations = allocated(kernel, f, h, 1.0, 2.0)
+        typed_allocations = allocated(typed_kernel, f, h, 1.0, 2.0)
+        @test untyped_allocations == typed_allocations
+
+        @kernel function mapped(f, x)
+            y = f(x)
+        end
+        @test mapped isa KernelSpec
+        @test prepare(mapped)(x -> x + one(x), 2) == 3
+
+        @kernel selected(f, x) = begin
+            a = f(x)
+            out = 2a
+            return a
+        end
+        @test keys(selected) == (:f, :x, :a, :out)
+        @test outputs(selected) == (selected.a,)
+        @test prepare(selected)(identity, 3) == 3
+        @test prepare(selected; want = :out)(identity, 3) == 6
+
+        @test_throws ArgumentError macroexpand(@__MODULE__, quote
+            @kernel repeated(x, x) = begin
+                y = x + 1
+            end
+        end)
+    end
+
     @testset "typed ports, zero-execution construction, and metadata" begin
         calls = Ref(0)
         pair(x) = (calls[] += 1; (x + 1, x + 2))
@@ -1038,21 +1100,13 @@ end
             x::Int
             x::Float64
         end
-        untyped = quote
-            @kernel begin
-                x::Float64
-                y = x + 1
-            end
+        untyped = @kernel begin
+            x::Float64
+            y = x + 1
         end
-        error = try
-            macroexpand(@__MODULE__, untyped)
-            nothing
-        catch err
-            err
-        end
-        @test error isa ArgumentError
-        @test occursin("port :y", sprint(showerror, error))
-        @test occursin("type annotation", sprint(showerror, error))
+        @test ReactiveKernels.valtype(untyped.x) === Float64
+        @test ReactiveKernels.valtype(untyped.y) === Any
+        @test outputs(untyped) == (untyped.y,)
 
         typed_cse_error = try
             @kernel begin

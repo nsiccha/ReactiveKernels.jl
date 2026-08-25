@@ -155,18 +155,15 @@ accumulator states, then compose them by named ports. The returned
 every port available for explicit `have`/`want` queries.
 """
 function build_online_stats_graph(::Type{T}=Float64) where {T<:AbstractFloat}
-    updates = @kernel begin
-        state::MomentsAccumulator{T}
-        observation::T
+    @kernel updates(state::MomentsAccumulator{T}, observation::T) = begin
         updated::MomentsAccumulator{T} = update(state, observation)
         average::T = mean(updated)
         sample_variance::T = var(updated)
         return updated, average, sample_variance
     end
 
-    partitions = @kernel begin
-        left_partition::MomentsAccumulator{T}
-        right_partition::MomentsAccumulator{T}
+    @kernel partitions(left_partition::MomentsAccumulator{T},
+                       right_partition::MomentsAccumulator{T}) = begin
         merged::MomentsAccumulator{T} = merge(left_partition, right_partition)
         merged_average::T = mean(merged)
         merged_variance::T = var(merged)

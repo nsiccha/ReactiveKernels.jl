@@ -23,22 +23,17 @@ therefore absent from both generated views.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(@__MODULE__, raw"""
-updates = @kernel begin
-    state::MomentsAccumulator{Float64}
-    observation::Float64
+@kernel updates(state::MomentsAccumulator{Float64}, observation::Float64) = begin
     updated::MomentsAccumulator{Float64} =
         OnlineStatsExample.update(state, observation)
     average::Float64 = Statistics.mean(updated)
     sample_variance::Float64 = Statistics.var(updated)
-    return updated, average, sample_variance
 end
 
-partitions = @kernel begin
-    left_partition::MomentsAccumulator{Float64}
-    right_partition::MomentsAccumulator{Float64}
+@kernel partitions(left_partition::MomentsAccumulator{Float64},
+                   right_partition::MomentsAccumulator{Float64}) = begin
     merged::MomentsAccumulator{Float64} =
         Base.merge(left_partition, right_partition)
-    return merged
 end
 
 model = merge(updates, partitions)
