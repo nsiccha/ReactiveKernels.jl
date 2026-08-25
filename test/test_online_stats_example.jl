@@ -85,14 +85,17 @@ const OSE = OnlineStatsExample
 
     @testset "generated state kernels are inferred and allocation-free" begin
         model = OSE.build_online_stats_graph()
-        update_kernel = prepare(model.graph;
-            have=(model.state, model.observation), want=(model.updated,))
-        merge_kernel = prepare(model.graph;
-            have=(model.left_partition, model.right_partition),
-            want=(model.merged,))
-        summary_kernel = prepare(model.graph;
-            have=(model.state, model.observation),
-            want=(model.average, model.sample_variance))
+        @test model isa KernelSpec
+        @test inputs(model) == (model.state, model.observation)
+        @test outputs(model) ==
+              (model.updated, model.average, model.sample_variance)
+
+        update_kernel = prepare(model;
+            have=(:state, :observation), want=:updated)
+        merge_kernel = prepare(model;
+            have=(:left_partition, :right_partition), want=:merged)
+        summary_kernel = prepare(model;
+            have=(:state, :observation), want=(:average, :sample_variance))
 
         empty_state = OSE.MomentsAccumulator()
         one_state = @inferred update_kernel(empty_state, 1.0)
@@ -115,7 +118,7 @@ const OSE = OnlineStatsExample
 
     @testset "ReactiveState replacement, invalidation, and frozen cut points" begin
         model = OSE.build_online_stats_graph()
-        state = ReactiveState(model.graph; materialize=(model.updated,))
+        state = ReactiveState(model; materialize=(model.updated,))
         empty_state = OSE.MomentsAccumulator()
 
         set!(state, model.state, empty_state)
@@ -148,9 +151,9 @@ const OSE = OnlineStatsExample
 
     @testset "canonical colored DAG exposes update structure" begin
         model = OSE.build_online_stats_graph()
-        update_plan = plan(model.graph;
-            have=(model.state, model.observation),
-            want=(model.updated, model.average, model.sample_variance))
+        update_plan = plan(model;
+            have=(:state, :observation),
+            want=(:updated, :average, :sample_variance))
         view = visualize(update_plan)
         html = sprint(show, MIME"text/html"(), view)
         dot = dot_source(view)
@@ -162,5 +165,18 @@ const OSE = OnlineStatsExample
         @test occursin("#ffedd5", dot)
         @test occursin("#dbeafe", dot)
         @test occursin("update", dot)
+    end
+
+    @testset "public docs keep a literal declarative source block" begin
+        page = read(joinpath(@__DIR__, "..", "docs", "src", "online-stats.md"),
+                    String)
+        @test occursin("updates = @kernel begin", page)
+        @test occursin("partitions = @kernel begin", page)
+        @test occursin("model = merge(updates, partitions)", page)
+        @test occursin("Main.ReactiveKernelsDocs.execute_example", page)
+        @test !occursin("include(", page)
+        @test !occursin("Graph()", page)
+        @test !occursin("value!(", page)
+        @test !occursin("add!(", page)
     end
 end

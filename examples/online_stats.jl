@@ -133,36 +133,31 @@ end
 """
     build_online_stats_graph(T=Float64)
 
-Build update, partition-merge, and summary recipes over immutable accumulator
-states. The returned named tuple exposes the graph and every port so consumers
-can prepare only the subkernel they need.
+Build declarative update/summary and partition-merge kernels over immutable
+accumulator states, then compose them by named ports. The returned
+[`KernelSpec`](@ref) keeps the update path as its default boundary while making
+every port available for explicit `have`/`want` queries.
 """
 function build_online_stats_graph(::Type{T}=Float64) where {T<:AbstractFloat}
-    graph = Graph()
+    updates = @kernel begin
+        state::MomentsAccumulator{T}
+        observation::T
+        updated::MomentsAccumulator{T} = update(state, observation)
+        average::T = mean(updated)
+        sample_variance::T = var(updated)
+        return updated, average, sample_variance
+    end
 
-    state = value!(graph, :state, MomentsAccumulator{T})
-    observation = value!(graph, :observation, T)
-    updated = value!(graph, :updated, MomentsAccumulator{T})
-    average = value!(graph, :mean, T)
-    sample_variance = value!(graph, :sample_variance, T)
+    partitions = @kernel begin
+        left_partition::MomentsAccumulator{T}
+        right_partition::MomentsAccumulator{T}
+        merged::MomentsAccumulator{T} = merge(left_partition, right_partition)
+        merged_average::T = mean(merged)
+        merged_variance::T = var(merged)
+        return merged, merged_average, merged_variance
+    end
 
-    left_partition = value!(graph, :left_partition, MomentsAccumulator{T})
-    right_partition = value!(graph, :right_partition, MomentsAccumulator{T})
-    merged = value!(graph, :merged, MomentsAccumulator{T})
-    merged_average = value!(graph, :merged_mean, T)
-    merged_variance = value!(graph, :merged_variance, T)
-
-    add!(graph, (state, observation) => updated, update)
-    add!(graph, updated => average, mean)
-    add!(graph, updated => sample_variance, var)
-
-    add!(graph, (left_partition, right_partition) => merged, merge)
-    add!(graph, merged => merged_average, mean)
-    add!(graph, merged => merged_variance, var)
-
-    (; graph, state, observation, updated, average, sample_variance,
-       left_partition, right_partition, merged, merged_average,
-       merged_variance)
+    merge(updates, partitions)
 end
 
 @noinline function _run_kernel_updates(kernel, accumulator, iterations::Int)
@@ -216,7 +211,7 @@ materialization.
 function reactive_performance_report(model; iterations::Int=1_000)
     iterations > 0 || throw(ArgumentError("iterations must be positive"))
     seed = MomentsAccumulator(ReactiveKernels.valtype(model.observation))
-    state = ReactiveState(model.graph; materialize=(model.updated,))
+    state = ReactiveState(model; materialize=(model.updated,))
     _run_reactive_updates!(state, model, seed, 1)
     allocated_bytes = @allocated _run_reactive_updates!(
         state, model, seed, iterations)
@@ -229,9 +224,9 @@ end
 
 function demo()
     model = build_online_stats_graph()
-    update_plan = plan(model.graph;
-        have=(model.state, model.observation),
-        want=(model.updated, model.average, model.sample_variance))
+    update_plan = plan(model;
+        have=(:state, :observation),
+        want=(:updated, :average, :sample_variance))
     update_kernel = prepare(update_plan)
 
     data = [1.0, 2.0, 4.0, 8.0]
@@ -246,8 +241,7 @@ function demo()
     println("generated source:\n", code_expr(update_kernel))
     println("colored DAG (DOT interchange):\n", dot_source(update_plan))
     println("kernel performance = ", kernel_performance_report(
-        prepare(model.graph; have=(model.state, model.observation),
-                want=(model.updated,))))
+        prepare(model; have=(:state, :observation), want=:updated)))
     println("reactive performance = ", reactive_performance_report(model))
     nothing
 end
