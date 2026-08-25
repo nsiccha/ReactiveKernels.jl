@@ -35,35 +35,58 @@ unconstrained
 log prior + log Jacobian + log likelihood ──► unconstrained log density
 ```
 
-The important part is that these remain separate graph values. Asking only for
-the constrained parameters omits the Jacobian and every density recipe:
+The important part is that these remain separate graph values. The block below
+is executed while the documentation is built; it loads the linked example
+source and runs the constrain-only kernel on the raw unconstrained input.
+Asking only for the constrained parameters omits the Jacobian and every density
+recipe:
 
-```julia
+```@example eight_schools
+using ReactiveKernels
+include(joinpath(pkgdir(ReactiveKernels), "examples", "eight_schools.jl"))
+using .EightSchoolsExample
+
 model = build_eight_schools_graph()
+q = (1.5, log(2.0), ntuple(i -> 0.25 * i, 8)...)
+observations = EIGHT_SCHOOLS_Y
+observation_scales = EIGHT_SCHOOLS_SIGMA
 
-k = prepare(model.graph;
+constrain_kernel = prepare(model.graph;
     have = (model.unconstrained,),
     want = (model.parameters,))
 
-parameters = k(q)
+parameters = constrain_kernel(q)
 ```
 
 The log-density query requests the full decomposition. Pointwise terms are a
 first-class node, so returning them together with the scalar density shares the
 likelihood computation rather than repeating it:
 
-```julia
-k = prepare(model.graph;
+```@example eight_schools
+density_plan = plan(model.graph;
     have = (model.unconstrained, model.observations,
             model.observation_scales),
     want = (model.prior, model.log_jacobian, model.pointwise,
             model.likelihood, model.density))
+density_kernel = prepare(density_plan)
 
 prior, logjac, pointwise, likelihood, density =
-    k(q, observations, observation_scales)
+    density_kernel(q, observations, observation_scales)
 
 @assert likelihood ≈ sum(pointwise)
 @assert density ≈ prior + logjac + likelihood
+
+(; prior, logjac, likelihood, density)
+```
+
+## Generated density subkernel
+
+`density_kernel` is not an interpreter over the graph. The next block asks the
+prepared kernel for the exact straight-line Julia expression it compiled; the
+output is generated from the live plan above during the docs build.
+
+```@example eight_schools
+code_expr(density_kernel)
 ```
 
 The numeric graph ports are typed at a `Real` boundary, while constrained
@@ -74,7 +97,11 @@ dual-number tuples created by forward-mode AD:
 ```julia
 using ForwardDiff
 
-logdensity(qv) = k(Tuple(qv), observations, observation_scales)
+density_only = prepare(model.graph;
+    have = (model.unconstrained, model.observations,
+            model.observation_scales),
+    want = (model.density,))
+logdensity(qv) = density_only(Tuple(qv), observations, observation_scales)
 gradient = ForwardDiff.gradient(logdensity, collect(q))
 ```
 
@@ -82,14 +109,16 @@ Generated quantities can start at an already-constrained boundary. In this
 query, planning removes the unconstrained transform, Jacobian, prior, likelihood
 reduction, and total-density recipes:
 
-```julia
-k = prepare(model.graph;
+```@example eight_schools
+generated_kernel = prepare(model.graph;
     have = (model.parameters, model.observations, model.observation_scales,
             model.new_group_scale, model.prediction_innovations),
     want = (model.pointwise, model.new_group))
 
-pointwise, prediction = k(parameters, observations, observation_scales,
-                          σ_new, (ϵ_θ, ϵ_y))
+pointwise, prediction = generated_kernel(
+    parameters, observations, observation_scales, 12.0, (0.25, -1.0))
+
+prediction
 ```
 
 Prediction takes standard-normal innovations as inputs rather than drawing
