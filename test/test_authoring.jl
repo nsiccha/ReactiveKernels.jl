@@ -122,6 +122,8 @@ end
         end
         @test field_collision.graph === kernel_graph(field_collision)
         @test field_collision[:graph] isa Value{Int}
+        @test :graph in propertynames(field_collision)
+        @test count(===(:graph), propertynames(field_collision)) == 1
         @test prepare(field_collision)(2) == 3
 
         @test prepare(AuthoringNameCollisionFixture.make_module_spec())(2) == 3
@@ -276,6 +278,30 @@ end
         @test prepare(cse_combined; want = :b)(3) == 3
         @test prepare(cse_combined; want = :doubled)(3) == 6
 
+        single_alias = @kernel begin
+            x::Int
+            @recipe (cost = 0) y::Int = x + 1
+            @recipe (cost = 10, cse_key = :single_alias) a::Int = x + 10
+            @recipe (cost = 10, cse_key = :single_alias) y = x + 10
+            return y
+        end
+        single_alias_graph = kernel_graph(single_alias)
+        @test sort(ReactiveKernels.producers_of(
+            single_alias_graph, single_alias.y.id,
+        )) == [1, 2]
+        @test plan(single_alias).cost == 0
+        @test prepare(single_alias)(2) == 3
+
+        repeated_output = @kernel begin
+            x::Int
+            @recipe (cse_key = :repeated_output) y::Int = identity(x)
+            @recipe (cse_key = :repeated_output) y = identity(x)
+            return y
+        end
+        @test length(kernel_graph(repeated_output).recipes) == 1
+        @test !haskey(kernel_graph(repeated_output).aliases, repeated_output.y.id)
+        @test prepare(repeated_output)(3) == 3
+
         cheap_base = @kernel begin
             x::Int
             @recipe (cost = 0) y::Int = x + 1
@@ -302,6 +328,53 @@ end
         )) == [1, 2]
         @test plan(alias_reversed; have = :x, want = :y).cost == 0
         @test prepare(alias_reversed; have = :x, want = :y)(2) == 3
+
+        typed_base = @kernel begin
+            x::Int
+            @recipe (cse_key = :typed_cross_spec) a::Int = identity(x)
+            return a
+        end
+        typed_fragment = @kernel begin
+            x::Int
+            @recipe (cse_key = :typed_cross_spec) b::String = string(x)
+            return b
+        end
+        base_snapshot = (
+            kernel_graph(typed_base).version,
+            length(kernel_graph(typed_base).recipes),
+            copy(kernel_graph(typed_base).producers),
+            copy(kernel_graph(typed_base).aliases),
+        )
+        fragment_snapshot = (
+            kernel_graph(typed_fragment).version,
+            length(kernel_graph(typed_fragment).recipes),
+            copy(kernel_graph(typed_fragment).producers),
+            copy(kernel_graph(typed_fragment).aliases),
+        )
+        typed_messages = map(1:2) do _
+            try
+                merge(typed_base, typed_fragment)
+                ""
+            catch err
+                @test err isa ArgumentError
+                sprint(showerror, err)
+            end
+        end
+        @test typed_messages[1] == typed_messages[2]
+        @test occursin("structural CSE output type mismatch", typed_messages[1])
+        @test occursin("position 1", typed_messages[1])
+        @test base_snapshot == (
+            kernel_graph(typed_base).version,
+            length(kernel_graph(typed_base).recipes),
+            kernel_graph(typed_base).producers,
+            kernel_graph(typed_base).aliases,
+        )
+        @test fragment_snapshot == (
+            kernel_graph(typed_fragment).version,
+            length(kernel_graph(typed_fragment).recipes),
+            kernel_graph(typed_fragment).producers,
+            kernel_graph(typed_fragment).aliases,
+        )
     end
 
     @testset "low-level equivalence and unchanged hot path" begin
@@ -364,6 +437,37 @@ end
         @test error isa ArgumentError
         @test occursin("port :y", sprint(showerror, error))
         @test occursin("type annotation", sprint(showerror, error))
+
+        typed_cse_error = try
+            @kernel begin
+                x::Int
+                @recipe (cse_key = :claimed_same) a::Int = identity(x)
+                @recipe (cse_key = :claimed_same) b::String = string(x)
+                return b
+            end
+            nothing
+        catch err
+            err
+        end
+        @test typed_cse_error isa ArgumentError
+        @test occursin(
+            "structural CSE output type mismatch",
+            sprint(showerror, typed_cse_error),
+        )
+
+        multi_output_type_error = try
+            @kernel begin
+                x::Int
+                @recipe (cse_key = :typed_pair) (a::Int, b::String) = (x, string(x))
+                @recipe (cse_key = :typed_pair) (c::Int, d::Int) = (x, x)
+                return c
+            end
+            nothing
+        catch err
+            err
+        end
+        @test multi_output_type_error isa ArgumentError
+        @test occursin("position 2", sprint(showerror, multi_output_type_error))
         @test_throws KeyError (@kernel begin x::Int end)[:missing]
     end
 end
