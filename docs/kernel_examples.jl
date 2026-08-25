@@ -16,8 +16,13 @@ struct HTMLResult{T}
     content::T
 end
 
-Base.show(io::IO, mime::MIME"text/html", result::HTMLResult) =
-    show(io, mime, result.content)
+function Base.show(io::IO, mime::MIME"text/html", result::HTMLResult)
+    html = sprint(show, mime, result.content; context = io)
+    # DocumenterVitepress places HTML results inside a JavaScript template
+    # literal. Preserve backslashes across that boundary so expressions such
+    # as the DAG script's /\s+/ regular expression reach the browser intact.
+    print(io, replace(html, "\\" => "\\\\"))
+end
 
 function html_result(content)
     showable(MIME"text/html"(), content) || error(
