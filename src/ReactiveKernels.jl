@@ -24,6 +24,7 @@ include("planner.jl")
 include("codegen.jl")
 include("graphops.jl")
 include("reactive.jl")
+include("stateful.jl")
 include("visualization.jl")
 
 export Value, Recipe, Graph, Plan, PreparedKernel, NonAllocatingKernel, PlanningError
@@ -33,5 +34,7 @@ export compose, PreparationCache, prepare!, canon_id
 export DAGVisualization, visualize, dot_source, save_visualization
 # Reactive layer
 export ReactiveState, set!, get!, freeze!, unfreeze!, checkpoint, materialize!
+export ReactiveProgram, CompiledReactiveState, ReactiveValue
+export prepare_reactive, statevalue, touch!, mutate!
 
 end # module ReactiveKernels
