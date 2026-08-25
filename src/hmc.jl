@@ -883,15 +883,19 @@ function _adapted_diagonal_metric(point::ReactivePhasePoint,
                                   minimum_variance,
                                   regularization = 5)
     weight = estimate.n / (estimate.n + regularization)
-    variance = @. max(
+    position_variance = @. max(
         minimum_variance,
         weight * estimate.var + (1 - weight) * minimum_variance,
     )
+    # `metric` is the momentum covariance (mass matrix) in these phase points.
+    # Welford estimates position covariance, so the frequency-equalizing
+    # diagonal mass is its reciprocal.
+    mass_diagonal = @. inv(position_variance)
     current = point.metric
     if current isa Diagonal
-        return Diagonal(convert(typeof(current.diag), variance))
+        return Diagonal(convert(typeof(current.diag), mass_diagonal))
     end
-    convert(typeof(current), Matrix(Diagonal(variance)))
+    convert(typeof(current), Matrix(Diagonal(mass_diagonal)))
 end
 
 """
@@ -899,7 +903,8 @@ end
 
 Warm up a Euclidean NUTS state with an automatic initial step-size search,
 dual averaging, and Stan-style expanding windows for a regularized diagonal
-metric estimate. Metric updates use the phase point's public reactive `metric`
+mass estimate (the reciprocal of estimated position variance). Metric updates
+use the phase point's public reactive `metric`
 HAVE slot, so the compiled program performs ordinary dependency invalidation;
 there is no sampler-specific refresh path.
 

@@ -344,6 +344,7 @@ end
     @test all(isfinite, diag(warmup.metric))
     @test all(>(0), diag(warmup.metric))
     @test diag(warmup.metric) != ones(2)
+    @test diag(warmup.metric)[1] > diag(warmup.metric)[2]
     @test warmup.metric_window_ends == [40, 100]
     @test length(warmup.diagnostics) == 120
 end
