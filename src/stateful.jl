@@ -30,6 +30,22 @@ end
 @inline (getter::_ReactiveGetter)(slots, valid) =
     getter.f(getter.ops, slots, valid)
 
+# In-place variant produced by `prepare_reactive_nonallocating`. It carries an
+# extra injected `cache_apply` callable, passed positionally to the generated
+# getter alongside the pure `ops` tuple. The generated body routes selected
+# single-output recipes through `cache_apply` so a stale slot buffer is reused
+# in place instead of allocating a fresh recipe return. `get!` calls both getter
+# variants through the same `(slots, valid)` interface.
+struct _ReactiveGetterInPlace{F,O,A}
+    f::F
+    ops::O
+    cache_apply::A
+    ast::Expr
+end
+
+@inline (getter::_ReactiveGetterInPlace)(slots, valid) =
+    getter.f(getter.ops, getter.cache_apply, slots, valid)
+
 """
     ReactiveProgram
 
@@ -116,7 +132,13 @@ function _state_dependencies(plan::Plan, index)
     dependents
 end
 
-function _ensure_expr(plan::Plan, index, recipe_index, id::Int)
+# `mutating_slots` holds the slot indices whose (single-output, owned) producer
+# recipe was selected for in-place evaluation. It is always empty for the pure
+# `prepare_reactive` program, so that program's AST is byte-identical to before
+# this hook existed. For a slot in the set, the store site is routed through the
+# injected `__cache_apply__` helper (see `_ReactiveGetterInPlace`).
+function _ensure_expr(plan::Plan, index, recipe_index, id::Int,
+                      mutating_slots::Set{Int} = Set{Int}())
     graph = plan.graph
     slot_index = index[id]
     recipe = get(plan.producer, id, nothing)
@@ -131,32 +153,56 @@ function _ensure_expr(plan::Plan, index, recipe_index, id::Int)
     body = Expr(:block)
     for input in recipe.inputs
         input_id = canon_id(graph, input.id)
-        push!(body.args, _ensure_expr(plan, index, recipe_index, input_id))
+        push!(body.args, _ensure_expr(plan, index, recipe_index, input_id, mutating_slots))
     end
     args = [:(__slots__[$(index[canon_id(graph, input.id)])][]) for input in recipe.inputs]
-    call = :(__ops__[$(recipe_index[recipe.id])]($(args...)))
+    k = recipe_index[recipe.id]
 
-    multiple = length(recipe.outputs) != 1
-    results = if multiple
-        names = [gensym(:recipe_result) for _ in recipe.outputs]
-        push!(body.args, Expr(:(=), Expr(:tuple, names...), call))
-        names
-    else
-        name = gensym(:recipe_result)
-        push!(body.args, :($name = $call))
-        (name,)
-    end
-    for (position, output) in enumerate(recipe.outputs)
-        output_id = canon_id(graph, output.id)
-        _owned_output(plan, recipe, output_id) || continue
-        output_index = index[output_id]
-        value_expr = results[position]
+    if length(recipe.outputs) == 1 && slot_index in mutating_slots
+        # In-place single-output store (`slot_index == output_index` here). The
+        # slot IS the per-instance cache: on the first touch the slot Ref is
+        # undefined (`_state_slots` seeds derived slots with `Ref{T}()`), so seed
+        # it with the ordinary allocating op; on every later (post-invalidation)
+        # evaluation reuse the surviving buffer through `__cache_apply__`.
+        # `_invalidate_dependents!` only flips validity and never clears a slot,
+        # so an assigned slot stays assigned across invalidate→recompute cycles.
+        # The helper's RETURN is stored unconditionally: `apply!!`-style helpers
+        # mutate-and-return the cache, or return a fresh object on resize / an
+        # immutable / a shape change, and either must land back in the slot.
         push!(body.args, quote
-            if !__valid__[$output_index]
-                __slots__[$output_index][] = $value_expr
-                __valid__[$output_index] = true
+            if !__valid__[$slot_index]
+                __slots__[$slot_index][] = isassigned(__slots__[$slot_index]) ?
+                    __cache_apply__(__slots__[$slot_index][], __ops__[$k], $(args...)) :
+                    __ops__[$k]($(args...))
+                __valid__[$slot_index] = true
             end
         end)
+    else
+        # Pure path: today's straight-line allocate-and-store, byte-identical.
+        # Multi-output recipes always take this branch (single-output-only hook).
+        call = :(__ops__[$k]($(args...)))
+        multiple = length(recipe.outputs) != 1
+        results = if multiple
+            names = [gensym(:recipe_result) for _ in recipe.outputs]
+            push!(body.args, Expr(:(=), Expr(:tuple, names...), call))
+            names
+        else
+            name = gensym(:recipe_result)
+            push!(body.args, :($name = $call))
+            (name,)
+        end
+        for (position, output) in enumerate(recipe.outputs)
+            output_id = canon_id(graph, output.id)
+            _owned_output(plan, recipe, output_id) || continue
+            output_index = index[output_id]
+            value_expr = results[position]
+            push!(body.args, quote
+                if !__valid__[$output_index]
+                    __slots__[$output_index][] = $value_expr
+                    __valid__[$output_index] = true
+                end
+            end)
+        end
     end
 
     quote
@@ -166,22 +212,29 @@ function _ensure_expr(plan::Plan, index, recipe_index, id::Int)
     end
 end
 
-function _getter_ast(plan::Plan, index, recipe_index, id::Int)
+function _getter_ast(plan::Plan, index, recipe_index, id::Int;
+                     in_place::Bool = false,
+                     mutating_slots::Set{Int} = Set{Int}())
     slot_index = index[id]
     body = Expr(:block)
-    push!(body.args, _ensure_expr(plan, index, recipe_index, id))
+    push!(body.args, _ensure_expr(plan, index, recipe_index, id, mutating_slots))
     push!(body.args, :(return __slots__[$slot_index][]))
-    Expr(
-        :function,
-        Expr(:tuple, :__ops__, :__slots__, :__valid__),
-        body,
-    )
+    signature = in_place ?
+        Expr(:tuple, :__ops__, :__cache_apply__, :__slots__, :__valid__) :
+        Expr(:tuple, :__ops__, :__slots__, :__valid__)
+    Expr(:function, signature, body)
 end
 
-function _prepare_getter(plan::Plan, index, recipe_index, id::Int)
-    ast = _getter_ast(plan, index, recipe_index, id)
+function _prepare_getter(plan::Plan, index, recipe_index, id::Int;
+                         cache_apply = nothing,
+                         mutating_slots::Set{Int} = Set{Int}())
+    in_place = cache_apply !== nothing
+    ast = _getter_ast(plan, index, recipe_index, id;
+                      in_place = in_place, mutating_slots = mutating_slots)
     ops = Tuple(recipe.op for recipe in plan.recipes)
-    _ReactiveGetter(compile(ast), ops, ast)
+    in_place ?
+        _ReactiveGetterInPlace(compile(ast), ops, cache_apply, ast) :
+        _ReactiveGetter(compile(ast), ops, ast)
 end
 
 """
@@ -201,15 +254,86 @@ The selected graph and runtime slot types are fixed. This is the efficient
 state-machine counterpart to the open-ended, dictionary-backed
 [`ReactiveState`](@ref).
 """
+# A type is a candidate for in-place reuse when it is a mutable, non-isbits
+# object (arrays, `MutableDiffResult`-style containers, any mutable struct):
+# those own heap storage a mutating op can fill in place. Scalars/isbits and
+# immutable types can only be replaced, so they take the pure branch and never
+# rely on the garbage contents of an `isassigned`-but-uninitialized `Ref`.
+_mutable_like(::Type{T}) where {T} = ismutabletype(T) && !isbitstype(T)
+
+"""
+    _default_is_mutating(recipe) -> Bool
+
+Default per-recipe in-place selector used by [`prepare_reactive_nonallocating`](@ref):
+route a single-output recipe through the in-place hook when its output type is
+mutable/array-like. A consumer may pass a narrower `is_mutating` to opt only
+specific recipes in-place while sharing the same getter codegen.
+"""
+_default_is_mutating(recipe::Recipe) = _mutable_like(valtype(only(recipe.outputs)))
+
+# The slot indices whose single-output, owned producer recipe is selected for
+# in-place evaluation. Empty (so the AST is byte-identical to the pure program)
+# whenever no `cache_apply` was injected.
+function _mutating_slots(plan::Plan, graph::Graph, index, cache_apply, is_mutating)
+    slots = Set{Int}()
+    cache_apply === nothing && return slots
+    for recipe in plan.recipes
+        length(recipe.outputs) == 1 || continue
+        output_id = canon_id(graph, only(recipe.outputs).id)
+        _owned_output(plan, recipe, output_id) || continue
+        is_mutating(recipe) || continue
+        push!(slots, index[output_id])
+    end
+    slots
+end
+
 function prepare_reactive(graph::Graph; have = (), want = ())
+    _prepare_reactive(graph; have = have, want = want)
+end
+
+"""
+    prepare_reactive_nonallocating(graph; have, want, is_mutating=_default_is_mutating)
+    prepare_reactive_nonallocating(spec::KernelSpec; ...)
+
+Optional MutatingFunctions-backed reactive preparation. Install and load
+`MutatingFunctions` alongside `ReactiveKernels` to activate the package
+extension that supplies these methods. It prepares the same closed-world state
+program as [`prepare_reactive`](@ref), but selected single-output recipes reuse
+their per-instance slot buffer in place through `MutatingFunctions.apply!!`
+instead of allocating a fresh recipe return on every recomputation.
+
+Selection is per recipe via `is_mutating(recipe)::Bool` (default: mutable/
+array-like outputs). The injected core hook is a single MF-agnostic callable
+`cache_apply(cache, op, args...) -> newcache`; `MutatingFunctions.apply!!`
+supplies it, and any conforming hand-written mutating op (including a
+non-MutatingFunctions one) fits the same codegen. **Contract on `cache_apply`:**
+it must return the (possibly new) result object, and it must treat an
+immutable/isbits `cache` as passthrough-recompute (ignore the cache bits and
+return `op(args...)` fresh) — `apply!!` already does both.
+
+Slots are per [`CompiledReactiveState`](@ref) instance, so caches are owned
+per instance; `copy`/`copyto!` deep-copy buffers, so distinct instances never
+alias mutable storage. Reused results are borrowed values that may be
+overwritten by the next recomputation; a state is mutable and not thread-safe.
+"""
+function prepare_reactive_nonallocating(args...; kwargs...)
+    throw(ArgumentError(
+        "prepare_reactive_nonallocating requires the optional MutatingFunctions extension; install MutatingFunctions and load it with `using MutatingFunctions`"))
+end
+
+function _prepare_reactive(graph::Graph; have = (), want = (),
+                           cache_apply = nothing,
+                           is_mutating = _default_is_mutating)
     selected = plan(graph; have = have, want = want)
     values = _state_values(selected)
     index = Dict(canon_id(graph, value.id) => i for (i, value) in enumerate(values))
     token = Ref{Nothing}(nothing)
     handles = _state_handles(token, graph, values)
     recipe_index = Dict(recipe.id => i for (i, recipe) in enumerate(selected.recipes))
+    mutating_slots = _mutating_slots(selected, graph, index, cache_apply, is_mutating)
     getters = Tuple(
-        _prepare_getter(selected, index, recipe_index, canon_id(graph, value.id))
+        _prepare_getter(selected, index, recipe_index, canon_id(graph, value.id);
+                        cache_apply = cache_apply, mutating_slots = mutating_slots)
         for value in values
     )
 
@@ -250,6 +374,22 @@ function prepare_reactive(spec::KernelSpec;
                      have = resolved_have,
                      want = resolved_want,
                      kwargs...)
+end
+
+# Resolve a KernelSpec's boundary the same way `prepare_reactive` does, then
+# delegate to the in-place-capable builder. The MutatingFunctions extension
+# calls this for `prepare_reactive_nonallocating(spec::KernelSpec; ...)`, so the
+# authoring surface shares one runtime with the hand-built-graph path.
+function _prepare_reactive(spec::KernelSpec;
+                           have = _KERNEL_DEFAULT_BOUNDARY,
+                           want = _KERNEL_DEFAULT_BOUNDARY,
+                           kwargs...)
+    resolved_have = _kernel_selection(spec, have, spec.have_names, :have)
+    resolved_want = _kernel_selection(spec, want, spec.want_names, :want)
+    _prepare_reactive(spec.graph;
+                      have = resolved_have,
+                      want = resolved_want,
+                      kwargs...)
 end
 
 @generated function _state_slots(handles::H, args::A) where {H<:Tuple,A<:Tuple}
