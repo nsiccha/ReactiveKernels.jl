@@ -7,7 +7,13 @@ prepared kernel's hot path.
 ## Quick use
 
 ```julia
-p = plan(g; have = (x, y), want = (out,))
+g = @kernel begin
+    x::Float64
+    y::Float64
+    out::Float64 = hypot(x, y)
+    return out
+end
+p = plan(g)
 
 p                                      # interactive HTML in a rich display
 visualize(p)                           # the configurable display object
@@ -42,6 +48,25 @@ html = sprint(show, MIME"text/html"(), view)
 
 `showable(MIME"text/html"(), view)` is true. If a frontend does not support
 HTML, `image/svg+xml` remains the static rich-display fallback.
+
+## HTMXObjects fragments
+
+`DAGVisualization` also follows the ordinary HTML-showable child contract used
+by HTMXObjects. Inside an `@htmx` route, compose the visualization as a
+structural child:
+
+```julia
+using HTMXObjects
+
+@get dag() = h.div(visualize(plan))
+```
+
+The returned fragment keeps the same self-contained fit, pan, zoom, and inspect
+behavior. Do not stringify the view or wrap it in `HTMX.Raw`: `h.*` preserves
+HTML-showable children structurally, while `Raw` is reserved for complete,
+trusted JavaScript or CSS payloads. Use an ordinary layout container rather
+than a presentational `SemanticCard`, because the DAG contains interactive
+buttons.
 
 ## Reading a diagram
 

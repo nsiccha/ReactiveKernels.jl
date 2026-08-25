@@ -1,5 +1,5 @@
 // .vitepress/theme/index.ts
-import { h } from 'vue'
+import { h, type DirectiveBinding } from 'vue'
 import DefaultTheme from 'vitepress/theme'
 import type { Theme as ThemeConfig } from 'vitepress'
 import 'virtual:mathjax-styles.css';
@@ -22,6 +22,7 @@ import './style.css' // You could setup your own, or else a default will be copi
 import './docstrings.css' // You could setup your own, or else a default will be copied.
 import Banner from '@/Banner.vue'
 import './overrides.css' // You could setup your own, or else a default will be copied.
+import { setupKernelExamples } from './kernel-example'
 
 // `v-exec-scripts` runs the <script> tags inside a `v-html`'d block: innerHTML never executes
 // scripts, so we re-create each one. `src` scripts are awaited so order holds (bundle before
@@ -63,13 +64,30 @@ export const Theme: ThemeConfig = {
     app.component('VersionPicker', VersionPicker);
     app.component('AuthorBadge', AuthorBadge)
     app.component('Authors', Authors)
+    // `enhanceApp` runs before Vue has hydrated the server-rendered page. Start
+    // only from the root component's mounted hook: child hooks and animation
+    // frames can still run while hydration is reconciling the page and discard
+    // appended dialog nodes. The enhancer's observer handles later navigation.
+    app.mixin({
+      mounted() {
+        if (this === this.$root) setupKernelExamples()
+      },
+    })
 
     // Execute the scripts inside interactive `text/html` outputs (WGLMakie/Bonito, Plotly, …)
     // once their `<ClientOnly>` wrapper has mounted on the client. `mounted` fires on the
     // initial client render and again whenever the page component is remounted by a
     // client-side navigation, so figures initialise instead of staying blank.
     app.directive('exec-scripts', {
-      mounted(el: HTMLElement) {
+      mounted(el: HTMLElement, binding: DirectiveBinding) {
+        if (typeof binding.value === 'string') {
+          const binary = window.atob(binding.value)
+          const bytes = new Uint8Array(binary.length)
+          for (let index = 0; index < binary.length; index += 1) {
+            bytes[index] = binary.charCodeAt(index)
+          }
+          el.innerHTML = new TextDecoder().decode(bytes)
+        }
         activateScripts(el)
       },
     })

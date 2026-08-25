@@ -38,23 +38,48 @@ latter from the former.
 ```julia
 using ReactiveKernels
 
-x   = value(:x, Float64)
-y   = value(:y, Float64)
-a   = value(:a, Float64)
-out = value(:out, Float64)
+g = @kernel begin
+    x::Float64
+    y::Float64
+    a::Float64 = f(x, y)
+    out::Float64 = h(a)
+    return out
+end
 
-g = Graph()
-add!(g, (x, y) => a,  f)
-add!(g,  a     => out, h)
-
-k = prepare(g; have = (x, y), want = (out,))
+k = prepare(g)
 k(1.0, 2.0)          # straight-line: no graph, no planner on this path
 ```
+
+The block is declarative and zero-execution: recipe right-hand sides become
+stored operations and do not run until a prepared kernel is called. Every port
+needs one type annotation somewhere in the block. Declarations, intermediates,
+and alternative producers may be forward-referenced; tuple assignment is one
+multi-output recipe, and `@recipe (cost = ..., cse_key = ...)` exposes the
+existing planner metadata without dropping to the low-level builder.
+
+## Extend by named ports
+
+```julia
+diagnostics = @kernel begin
+    out::Float64
+    squared::Float64 = abs2(out)
+    return squared
+end
+
+extended = merge(g, diagnostics)
+prepare(extended)(1.0, 2.0)                  # same inputs/output as `g`
+prepare(extended; want = (:out, :squared))(1.0, 2.0)
+```
+
+`merge` builds a fresh graph, unifies same-name/same-type ports, and preserves
+the base boundary by default. That makes an extended kernel a drop-in for the
+base while extra requested outputs opt into extra work. The explicit
+`boundary = :fragment` option replaces both defaults when that is intentional.
 
 ## See the selected DAG
 
 ```julia
-p = plan(g; have = (x, y), want = (out,))
+p = plan(g)
 visualize(p)                         # interactive HTML; SVG rich-display fallback
 visualize(p; alternatives = true)   # include unselected candidate recipes
 save_visualization("plan.html", p)  # standalone fit/pan/zoom/inspect component
@@ -73,8 +98,7 @@ invalidate only the cached results whose provenance actually depended on them,
 and the same planner prepares and runs just the missing computation — all cache
 bookkeeping staying outside the generated kernel.
 
-> **Status:** early development — the public API is still being shaped. The
-> examples above track the design and will follow the implementation as it lands.
+> **Status:** early development — the public API is still being shaped.
 
 See the [non-allocating workflow](nonallocating.md) for persistent array-cache
 lowering, or the [API Reference](api.md) for the exported surface.

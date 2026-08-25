@@ -35,6 +35,7 @@ end
     @test length(artifacts) == 13
     @test length(unique(artifact.name for artifact in artifacts)) == 13
     @test all(artifact -> !isempty(artifact.source), artifacts)
+    @test all(artifact -> occursin("@kernel begin", artifact.source), artifacts)
     @test all(artifact -> artifact.generated == code_expr(artifact.kernel), artifacts)
     @test all(artifact -> artifact.dag === artifact.kernel.plan, artifacts)
     @test all(artifact -> isequal(

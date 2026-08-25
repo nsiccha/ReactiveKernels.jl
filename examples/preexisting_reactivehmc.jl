@@ -97,37 +97,32 @@ end
 
 function euclidean_phasepoint_kernels(kinetic::Val, pot_f, grad_f, metric0,
                                       pos0, mom0; speed = 1.0, mass = 1.0)
-    graph = Graph()
-    pos = value!(graph, :pos, typeof(pos0))
-    mom = value!(graph, :mom, typeof(mom0))
-    metric = value!(graph, :metric, typeof(metric0))
-
     pot0 = pot_f(pos0)
     _, dpot0 = grad_f(pos0)
     chol0 = cholesky(metric0)
     dmom0 = _metric_dmom(kinetic, chol0, mom0, speed, mass)
     ham0 = _metric_hamiltonian(kinetic, pot0, chol0, mom0, speed, mass)
 
-    pot = value!(graph, :pot, typeof(pot0))
-    dpot = value!(graph, :dpot_dpos, typeof(dpot0))
-    chol = value!(graph, :chol_metric, typeof(chol0))
-    dham_dmom = value!(graph, :dham_dmom, typeof(dmom0))
-    ham = value!(graph, :ham, typeof(ham0))
+    spec = @kernel begin
+        pos::typeof(pos0)
+        mom::typeof(mom0)
+        metric::typeof(metric0)
+        pot::typeof(pot0) = pot_f(pos)
+        (pot, dpot::typeof(dpot0)) = grad_f(pos)
+        chol::typeof(chol0) = cholesky(metric)
+        dham_dmom::typeof(dmom0) =
+            _metric_dmom(kinetic, chol, mom, speed, mass)
+        ham::typeof(ham0) =
+            _metric_hamiltonian(kinetic, pot, chol, mom, speed, mass)
+        return ham
+    end
 
-    add!(graph, pos => pot, pot_f)
-    add!(graph, pos => (pot, dpot), grad_f)
-    add!(graph, metric => chol, cholesky)
-    add!(graph, (chol, mom) => dham_dmom,
-         (ch, p) -> _metric_dmom(kinetic, ch, p, speed, mass))
-    add!(graph, (pot, chol, mom) => ham,
-         (u, ch, p) -> _metric_hamiltonian(kinetic, u, ch, p, speed, mass))
-
-    dpos_kernel = prepare(graph; have = (pos,), want = (dpot,))
-    dmom_kernel = prepare(graph; have = (metric, mom), want = (dham_dmom,))
-    ham_kernel = prepare(graph; have = (pos, metric, mom), want = (ham,))
+    dpos_kernel = prepare(spec; have = :pos, want = :dpot)
+    dmom_kernel = prepare(spec; have = (:metric, :mom), want = :dham_dmom)
+    ham_kernel = prepare(spec; have = (:pos, :metric, :mom), want = :ham)
 
     (;
-        graph,
+        graph = spec.graph,
         prepared = (; dpos = dpos_kernel, dmom = dmom_kernel, ham = ham_kernel),
         geometry = (p -> (; pos = p, metric = metric0)),
         dham_dpos = ((geo, p) -> dpos_kernel(geo.pos)),
@@ -139,10 +134,6 @@ end
 function riemannian_phasepoint_kernels(kinetic::Val, pot_f, grad_f, metric_f,
                                        metric_grad_f, pos0, mom0;
                                        speed = 1.0, mass = 1.0)
-    graph = Graph()
-    pos = value!(graph, :pos, typeof(pos0))
-    mom = value!(graph, :mom, typeof(mom0))
-
     pot0 = pot_f(pos0)
     _, dpot0 = grad_f(pos0)
     _, _, metric0 = metric_f(pos0)
@@ -155,53 +146,51 @@ function riemannian_phasepoint_kernels(kinetic::Val, pot_f, grad_f, metric_f,
     )
     ham0 = _metric_hamiltonian(kinetic, pot0, chol0, mom0, speed, mass)
 
-    pot = value!(graph, :pot, typeof(pot0))
-    dpot = value!(graph, :dpot_dpos, typeof(dpot0))
-    metric = value!(graph, :metric, typeof(metric0))
-    metric_grad = value!(graph, :metric_grad, typeof(metric_grad0))
-    chol = value!(graph, :chol_metric, typeof(chol0))
-    inv_metric = value!(graph, :inv_metric, typeof(inv_metric0))
-    dham_dmom = value!(graph, :dham_dmom, typeof(dmom0))
-    dham_dpos = value!(graph, :dham_dpos, typeof(dpos0))
-    ham = value!(graph, :ham, typeof(ham0))
-
-    add!(graph, pos => pot, pot_f)
-    add!(graph, pos => (pot, dpot), grad_f)
-    add!(graph, pos => (pot, dpot, metric), metric_f)
-    add!(graph, pos => (pot, dpot, metric, metric_grad), metric_grad_f)
-    add!(graph, metric => chol, cholesky)
-    add!(graph, chol => inv_metric, ch -> Symmetric(inv(ch)))
-    add!(graph, (chol, mom) => dham_dmom,
-         (ch, p) -> _metric_dmom(kinetic, ch, p, speed, mass))
-    add!(graph, (mom, chol, inv_metric, metric_grad, dpot) => dham_dpos,
-         (p, ch, inv_m, dm, du) -> _riemannian_dpos(
-             kinetic, p, ch, inv_m, dm, du, speed, mass,
-         ))
-    add!(graph, (pot, chol, mom) => ham,
-         (u, ch, p) -> _metric_hamiltonian(kinetic, u, ch, p, speed, mass))
+    spec = @kernel begin
+        pos::typeof(pos0)
+        mom::typeof(mom0)
+        pot::typeof(pot0) = pot_f(pos)
+        (pot, dpot::typeof(dpot0)) = grad_f(pos)
+        (pot, dpot, metric::typeof(metric0)) = metric_f(pos)
+        (pot, dpot, metric, metric_grad::typeof(metric_grad0)) =
+            metric_grad_f(pos)
+        chol::typeof(chol0) = cholesky(metric)
+        inv_metric::typeof(inv_metric0) = Symmetric(inv(chol))
+        dham_dmom::typeof(dmom0) =
+            _metric_dmom(kinetic, chol, mom, speed, mass)
+        dham_dpos::typeof(dpos0) = _riemannian_dpos(
+            kinetic, mom, chol, inv_metric, metric_grad, dpot, speed, mass,
+        )
+        ham::typeof(ham0) =
+            _metric_hamiltonian(kinetic, pot, chol, mom, speed, mass)
+        return ham
+    end
 
     geometry_kernel = prepare(
-        graph;
-        have = (pos,),
-        want = (pot, dpot, metric, metric_grad, chol, inv_metric),
+        spec;
+        have = :pos,
+        want = (:pot, :dpot, :metric, :metric_grad, :chol, :inv_metric),
     )
     dpos_kernel = prepare(
-        graph;
-        have = (mom, chol, inv_metric, metric_grad, dpot),
-        want = (dham_dpos,),
+        spec;
+        have = (:mom, :chol, :inv_metric, :metric_grad, :dpot),
+        want = :dham_dpos,
     )
-    dmom_kernel = prepare(graph; have = (chol, mom), want = (dham_dmom,))
-    ham_kernel = prepare(graph; have = (pot, chol, mom), want = (ham,))
+    dmom_kernel = prepare(spec; have = (:chol, :mom), want = :dham_dmom)
+    ham_kernel = prepare(spec; have = (:pot, :chol, :mom), want = :ham)
 
     geometry(p) = NamedTuple{
         (:pot, :dpot, :metric, :metric_grad, :chol, :inv_metric),
     }(geometry_kernel(p))
 
     (;
-        graph,
+        graph = spec.graph,
         values = (;
-            pos, mom, pot, dpot, metric, metric_grad, chol, inv_metric,
-            dham_dpos, dham_dmom, ham,
+            pos = spec.pos, mom = spec.mom, pot = spec.pot, dpot = spec.dpot,
+            metric = spec.metric, metric_grad = spec.metric_grad,
+            chol = spec.chol, inv_metric = spec.inv_metric,
+            dham_dpos = spec.dham_dpos, dham_dmom = spec.dham_dmom,
+            ham = spec.ham,
         ),
         prepared = (;
             geometry = geometry_kernel,
@@ -287,48 +276,38 @@ end
 function softabs_phasepoint_kernels(kinetic::Val, pot_f, grad_f, premetric_f,
                                     premetric_grad_f, pos0, mom0;
                                     alpha = 20.0, speed = 1.0, mass = 1.0)
-    graph = Graph()
-    pos = value!(graph, :pos, typeof(pos0))
-
     pot0 = pot_f(pos0)
     _, dpot0 = grad_f(pos0)
     _, _, premetric0 = premetric_f(pos0)
     _, _, _, premetric_grad0 = premetric_grad_f(pos0)
     softabs0 = _softabs_geometry(premetric0, alpha)
 
-    pot = value!(graph, :pot, typeof(pot0))
-    dpot = value!(graph, :dpot_dpos, typeof(dpot0))
-    premetric = value!(graph, :premetric, typeof(premetric0))
-    premetric_grad = value!(graph, :premetric_grad, typeof(premetric_grad0))
-    eigenvalues = value!(graph, :premetric_eigenvalues, typeof(softabs0.eigenvalues))
-    eigenvectors = value!(graph, :eigenvectors, typeof(softabs0.eigenvectors))
-    metric_eigenvalues = value!(
-        graph, :metric_eigenvalues, typeof(softabs0.metric_eigenvalues),
-    )
-    q_inv = value!(graph, :q_inv, typeof(softabs0.q_inv))
-    jacobian = value!(graph, :softabs_jacobian, typeof(softabs0.jacobian))
-
-    add!(graph, pos => pot, pot_f)
-    add!(graph, pos => (pot, dpot), grad_f)
-    add!(graph, pos => (pot, dpot, premetric), premetric_f)
-    add!(graph, pos => (pot, dpot, premetric, premetric_grad), premetric_grad_f)
-    add!(
-        graph,
-        premetric => (eigenvalues, eigenvectors, metric_eigenvalues, q_inv, jacobian),
-        matrix -> begin
-            geo = _softabs_geometry(matrix, alpha)
+    spec = @kernel begin
+        pos::typeof(pos0)
+        pot::typeof(pot0) = pot_f(pos)
+        (pot, dpot::typeof(dpot0)) = grad_f(pos)
+        (pot, dpot, premetric::typeof(premetric0)) = premetric_f(pos)
+        (pot, dpot, premetric, premetric_grad::typeof(premetric_grad0)) =
+            premetric_grad_f(pos)
+        (
+            eigenvalues::typeof(softabs0.eigenvalues),
+            eigenvectors::typeof(softabs0.eigenvectors),
+            metric_eigenvalues::typeof(softabs0.metric_eigenvalues),
+            q_inv::typeof(softabs0.q_inv),
+            jacobian::typeof(softabs0.jacobian),
+        ) = begin
+            geo = _softabs_geometry(premetric, alpha)
             (geo.eigenvalues, geo.eigenvectors, geo.metric_eigenvalues,
              geo.q_inv, geo.jacobian)
-        end,
-    )
-
-    geometry_kernel = prepare(
-        graph;
-        have = (pos,),
-        want = (
+        end
+        return (
             pot, dpot, premetric, premetric_grad, eigenvalues, eigenvectors,
             metric_eigenvalues, q_inv, jacobian,
-        ),
+        )
+    end
+
+    geometry_kernel = prepare(
+        spec; have = :pos,
     )
 
     geometry(p) = begin
@@ -347,7 +326,7 @@ function softabs_phasepoint_kernels(kinetic::Val, pot_f, grad_f, premetric_f,
     end
 
     (;
-        graph,
+        graph = spec.graph,
         prepared = (; geometry = geometry_kernel),
         geometry,
         dham_dpos = ((geo, p) -> _softabs_dpos(kinetic, geo, p, speed, mass)),

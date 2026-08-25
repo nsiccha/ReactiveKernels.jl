@@ -1,5 +1,7 @@
 using Documenter, DocumenterVitepress, ReactiveKernels
 
+include("kernel_examples.jl")
+
 makedocs(
     sitename = "ReactiveKernels.jl",
     modules  = [ReactiveKernels],
