@@ -48,6 +48,19 @@ selected_plan = explain(plan(point))
 generated_hamiltonian = code_expr(point, :ham)
 dag = visualize(plan(point))
 
+(selected_plan, generated_hamiltonian)
+```
+
+The selected plan's HTML-showable DAG is rendered directly, preserving its
+fit, zoom, pan, and node-inspection controls:
+
+```@example nuts
+Main.ReactiveKernelsDocs.html_result(dag) # hide
+```
+
+The same compiled reactive program then drives warmup and sampling:
+
+```@example nuts
 sampler = nuts_state(point;
     rng = Xoshiro(20260825),
     step_f = partial(leapfrog!; stepsize = 0.35),
@@ -55,8 +68,7 @@ sampler = nuts_state(point;
 warmup = warmup!(sampler, 50)
 chain = sample!(sampler, 100)
 
-(selected_plan, generated_hamiltonian, dag,
- count(diagnostic -> diagnostic.diverged, chain.diagnostics))
+count(diagnostic -> diagnostic.diverged, chain.diagnostics)
 ```
 
 `warmup!` performs initial step-size search, dual averaging, and windowed
