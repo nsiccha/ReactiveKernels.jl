@@ -28,6 +28,13 @@ function _llvm_arithmetic(text)
     [m.match for m in eachmatch(r"\b(?:fadd|fsub|fmul|fdiv)\b", text)]
 end
 
+function _llvm_has_data_load(text)
+    any(eachline(IOBuffer(text))) do line
+        occursin(r"\bload\b", line) &&
+            !occursin(r"\bload volatile\b.*\binttoptr\b", line)
+    end
+end
+
 function _typed_arithmetic(code)
     [m.match for m in eachmatch(
         r"Base\.(?:add_float|sub_float|mul_float|div_float)",
@@ -80,7 +87,12 @@ function _benchmark_comparison(name, prepared, handwritten, input)
     handwritten_arithmetic = _llvm_arithmetic(handwritten_llvm)
     @test prepared_arithmetic == handwritten_arithmetic
     @test !occursin(r"\b(?:call|invoke)\b", prepared_llvm)
-    @test !occursin(r"\bload\b", prepared_llvm)
+    # `julia-actions/julia-runtest` enables source coverage by default. Its
+    # counters are volatile loads from fixed `inttoptr` addresses; those are
+    # instrumentation, not loads from the PreparedKernel wrapper. Keep the
+    # zero-wrapper-load assertion while ignoring only that recognizable form.
+    prepared_has_data_load = _llvm_has_data_load(prepared_llvm)
+    @test !prepared_has_data_load
 
     # Nanosecond kernels are sensitive to timer quantization and CPU state.
     # Alternate measurement order and report the median of nine independent
@@ -145,13 +157,21 @@ function _benchmark_comparison(name, prepared, handwritten, input)
         handwritten_typed_arithmetic,
         llvm_arithmetic = prepared_arithmetic,
         llvm_has_calls = occursin(r"\b(?:call|invoke)\b", prepared_llvm),
-        llvm_loads_kernel = occursin(r"\bload\b", prepared_llvm),
+        llvm_loads_kernel = prepared_has_data_load,
     )
     println("BenchmarkTools comparison: ", measurement)
     measurement
 end
 
 @testset "BenchmarkTools: prepared versus handwritten kernels" begin
+    @test !_llvm_has_data_load(
+        "%lcnt = load volatile i64, i64* inttoptr (i64 123 to i64*), align 8",
+    )
+    @test _llvm_has_data_load("%value = load double, double* %kernel, align 8")
+    @test _llvm_has_data_load(
+        "%value = load volatile i64, i64* %kernel, align 8",
+    )
+
     chain_graph = Graph()
     chain_x = value!(chain_graph, :x, Float64)
     chain_z = value!(chain_graph, :z, Float64)
