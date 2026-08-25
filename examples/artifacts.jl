@@ -25,33 +25,25 @@ const REACTIVEOBJECTS_ORIGIN =
 const REACTIVEHMC_ORIGIN =
     "ReactiveHMC.jl main@ca9ea4ca41924bb0e1fadc01c717e1333916aba6"
 
-const CHAIN_SOURCE = """@kernel begin
-    x::Float64
+const CHAIN_SOURCE = """@kernel graph(x::Float64) = begin
     z::Float64 = 2x
     w::Float64 = z + 1
-    return w
 end"""
 
-const DIAMOND_SOURCE = """@kernel begin
-    a::Float64
+const DIAMOND_SOURCE = """@kernel graph(a::Float64) = begin
     b::Float64 = a + 1
     c::Float64 = a + 2
     d::Float64 = b + c
-    return d
 end"""
 
-const SHARED_SOURCE = """@kernel begin
-    x::Float64
+const SHARED_SOURCE = """@kernel graph(x::Float64) = begin
     a::Float64 = x + 1
     b::Float64 = 2a
     c::Float64 = 3a
-    return (b, c)
 end"""
 
-const EUCLIDEAN_SOURCE = """@kernel begin
-    pos::typeof(pos0)
-    mom::typeof(mom0)
-    metric::typeof(metric0)
+const EUCLIDEAN_SOURCE = """@kernel spec(pos::typeof(pos0), mom::typeof(mom0),
+             metric::typeof(metric0)) = begin
     pot::typeof(pot0) = pot_f(pos)
     (pot, dpot::typeof(dpot0)) = grad_f(pos)
     chol::typeof(chol0) = cholesky(metric)
@@ -60,9 +52,7 @@ const EUCLIDEAN_SOURCE = """@kernel begin
     return ham
 end"""
 
-const RIEMANNIAN_SOURCE = """@kernel begin
-    pos::typeof(pos0)
-    mom::typeof(mom0)
+const RIEMANNIAN_SOURCE = """@kernel spec(pos::typeof(pos0), mom::typeof(mom0)) = begin
     (pot::typeof(pot0), dpot::typeof(dpot0),
      metric::typeof(metric0), metric_grad::typeof(metric_grad0)) =
         metric_gradient(pos)
@@ -72,8 +62,7 @@ const RIEMANNIAN_SOURCE = """@kernel begin
     return (pot, dpot, metric, metric_grad, chol, inv_metric, dham_dpos)
 end"""
 
-const SOFTABS_SOURCE = """@kernel begin
-    pos::typeof(pos0)
+const SOFTABS_SOURCE = """@kernel spec(pos::typeof(pos0)) = begin
     (pot::typeof(pot0), dpot::typeof(dpot0),
      premetric::typeof(premetric0), premetric_grad::typeof(premetric_grad0)) =
         premetric_gradient(pos)

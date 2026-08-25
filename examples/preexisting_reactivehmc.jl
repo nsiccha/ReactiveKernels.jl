@@ -103,10 +103,8 @@ function euclidean_phasepoint_kernels(kinetic::Val, pot_f, grad_f, metric0,
     dmom0 = _metric_dmom(kinetic, chol0, mom0, speed, mass)
     ham0 = _metric_hamiltonian(kinetic, pot0, chol0, mom0, speed, mass)
 
-    spec = @kernel begin
-        pos::typeof(pos0)
-        mom::typeof(mom0)
-        metric::typeof(metric0)
+    @kernel spec(pos::typeof(pos0), mom::typeof(mom0),
+                 metric::typeof(metric0)) = begin
         pot::typeof(pot0) = pot_f(pos)
         (pot, dpot::typeof(dpot0)) = grad_f(pos)
         chol::typeof(chol0) = cholesky(metric)
@@ -146,9 +144,7 @@ function riemannian_phasepoint_kernels(kinetic::Val, pot_f, grad_f, metric_f,
     )
     ham0 = _metric_hamiltonian(kinetic, pot0, chol0, mom0, speed, mass)
 
-    spec = @kernel begin
-        pos::typeof(pos0)
-        mom::typeof(mom0)
+    @kernel spec(pos::typeof(pos0), mom::typeof(mom0)) = begin
         pot::typeof(pot0) = pot_f(pos)
         (pot, dpot::typeof(dpot0)) = grad_f(pos)
         (pot, dpot, metric::typeof(metric0)) = metric_f(pos)
@@ -282,8 +278,7 @@ function softabs_phasepoint_kernels(kinetic::Val, pot_f, grad_f, premetric_f,
     _, _, _, premetric_grad0 = premetric_grad_f(pos0)
     softabs0 = _softabs_geometry(premetric0, alpha)
 
-    spec = @kernel begin
-        pos::typeof(pos0)
+    @kernel spec(pos::typeof(pos0)) = begin
         pot::typeof(pot0) = pot_f(pos)
         (pot, dpot::typeof(dpot0)) = grad_f(pos)
         (pot, dpot, premetric::typeof(premetric0)) = premetric_f(pos)

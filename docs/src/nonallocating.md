@@ -25,11 +25,9 @@ typed cache owned by the prepared kernel.
 ```julia
 using ReactiveKernels, MutatingFunctions
 
-g = @kernel begin
-    x::Vector{Float64}
+@kernel g(x::Vector{Float64}) = begin
     copied::Vector{Float64} = copy(x)
     reversed::Vector{Float64} = reverse(copied)
-    return reversed
 end
 
 p = plan(g)

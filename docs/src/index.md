@@ -30,7 +30,7 @@ features:
 ## Overview
 
 `ReactiveKernels.jl` is a **have → want** computational-graph kernel layer. You
-describe a computation once as a transparent graph of named, typed values and the
+describe a computation once as a transparent graph of named values and the
 operations connecting them; you declare what you already **have** and what you
 **want**; and the planner prepares a specialized Julia function that produces the
 latter from the former.
@@ -38,37 +38,41 @@ latter from the former.
 ```julia
 using ReactiveKernels
 
-g = @kernel begin
-    x::Float64
-    y::Float64
-    a::Float64 = f(x, y)
-    out::Float64 = h(a)
-    return out
+f(x, y) = x + y
+h(a) = abs2(a)
+
+@kernel model(f, h, x, y) = begin
+    a = f(x, y)
+    out = h(a)
 end
 
-k = prepare(g)
-k(1.0, 2.0)          # straight-line: no graph, no planner on this path
+k = prepare(model)
+k(f, h, 1.0, 2.0)    # straight-line: no graph, no planner on this path
 ```
 
-The block is declarative and zero-execution: recipe right-hand sides become
-stored operations and do not run until a prepared kernel is called. Every port
-needs one type annotation somewhere in the block. Declarations, intermediates,
-and alternative producers may be forward-referenced; tuple assignment is one
-multi-output recipe, and `@recipe (cost = ..., cse_key = ...)` exposes the
-existing planner metadata without dropping to the low-level builder.
+The definition has ordinary function syntax, as in ReactiveObjects.jl, and its
+signature is the default input boundary. Functions are ordinary input ports:
+`f` and `h` execute only when the prepared kernel is called. Type annotations
+are optional metadata; omitting them does not prevent the generated function
+from specializing on concrete runtime values. Every named value is exposed as
+a port (`model.f`, `model.x`, `model.a`, `model.out`). With no explicit
+`return`, derived sinks such as `out` are the default output boundary; a
+`return` may select a different default without hiding anything. Declarations,
+intermediates, and alternative producers may be forward-referenced; tuple
+assignment is one multi-output recipe, and
+`@recipe (cost = ..., cse_key = ...)` exposes the existing planner metadata
+without dropping to the low-level builder.
 
 ## Extend by named ports
 
 ```julia
-diagnostics = @kernel begin
-    out::Float64
-    squared::Float64 = abs2(out)
-    return squared
+@kernel diagnostics(out) = begin
+    squared = abs2(out)
 end
 
-extended = merge(g, diagnostics)
-prepare(extended)(1.0, 2.0)                  # same inputs/output as `g`
-prepare(extended; want = (:out, :squared))(1.0, 2.0)
+extended = merge(model, diagnostics)
+prepare(extended)(f, h, 1.0, 2.0)  # same inputs/output as `model`
+prepare(extended; want = (:out, :squared))(f, h, 1.0, 2.0)
 ```
 
 `merge` builds a fresh graph, unifies same-name/same-type ports, and preserves
@@ -79,7 +83,7 @@ base while extra requested outputs opt into extra work. The explicit
 ## See the selected DAG
 
 ```julia
-p = plan(g)
+p = plan(model)
 visualize(p)                         # interactive HTML; SVG rich-display fallback
 visualize(p; alternatives = true)   # include unselected candidate recipes
 save_visualization("plan.html", p)  # interactive HTML with offline SVG fallback

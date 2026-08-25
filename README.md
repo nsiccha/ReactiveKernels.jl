@@ -44,16 +44,27 @@ straight-line Julia Expr  ──►  (optional AST passes)  ──►  RuntimeGe
 ```julia
 using ReactiveKernels
 
-g = @kernel begin
-    x::Float64
-    @recipe (cost = 1.0) a::Float64 = x + 1.0
-    @recipe (cost = 1.0) b::Float64 = 2a
-    return b
+step(x) = x + 1.0
+scale(a) = 2a
+
+@kernel chain(step, scale, x) = begin
+    @recipe (cost = 1.0) a = step(x)
+    @recipe (cost = 1.0) b = scale(a)
 end
 
-k = prepare(g)
-k(1.2)            # 4.4  — a straight-line kernel: b = 2*(x+1)
+k = prepare(chain)
+k(step, scale, 1.2)  # 4.4 — a straight-line kernel: b = 2*(x+1)
 ```
+
+Like ReactiveObjects.jl's `@reactive` definitions, the primary `@kernel` form
+is a normal-looking function definition. Its arguments are the kernel's input
+ports, including function-valued inputs such as `step` and `scale`. Type
+annotations are optional metadata: generated kernels still specialize on the
+concrete values passed at runtime. Every signature argument and assignment is
+exposed (`chain.x`, `chain.a`, `chain.b`); without an explicit `return`, the
+derived sink `b` is the default output. A `return` can choose another default
+output boundary without hiding any named port. Anonymous `@kernel begin ... end`
+specifications remain useful for fragments and low-level tooling.
 
 ### Low-level `Graph` escape hatch (equivalent)
 
@@ -83,7 +94,7 @@ add!(low, low_a => low_b, a -> 2a)
 Inspection is first-class:
 
 ```julia
-p = plan(g)
+p = plan(chain)
 println(explain(p))     # have/want, selected recipes + costs, alternatives, total cost
 code_expr(p)            # the generated Julia Expr, before RGF compilation
 inputs(k), outputs(k)   # graph values in call / return order
@@ -116,14 +127,12 @@ The planner selects the globally cheapest *set* of recipes — not a per-value
 shortest path — accounting for shared work.
 
 ```julia
-g = @kernel begin
-    u::Float64
-    @recipe (cost = 1.0) a::Float64 = cheap_a(u)
-    @recipe (cost = 1.2) (a, b::Float64) = combined_ab(u)
+@kernel g(u) = begin
+    @recipe (cost = 1.0) a = cheap_a(u)
+    @recipe (cost = 1.2) (a, b) = combined_ab(u)
     @recipe (cost = 1.0) b = make_b(a)
-    @recipe (cost = 1.0) c::Float64 = make_c(a)
-    @recipe (cost = 1.0) r::Float64 = finish(b, c)
-    return r
+    @recipe (cost = 1.0) c = make_c(a)
+    @recipe (cost = 1.0) r = finish(b, c)
 end
 
 prepare(g; want = :a)                    # chooses cheap_a  (cost 1.0)
@@ -136,21 +145,17 @@ them.
 
 ## Composition and extension
 
-Fragments compose through typed named ports. `merge` is pure: it builds a fresh
-spec, unifies same-name/same-type ports, copies both recipe sets, and rejects a
-type mismatch before constructing a partial result.
+Fragments compose through named ports. `merge` is pure: it builds a fresh spec,
+unifies same-name/same-type ports, copies both recipe sets, and rejects a type
+mismatch before constructing a partial result.
 
 ```julia
-base = @kernel begin
-    position::Float64
-    energy::Float64 = abs2(position) / 2
-    return energy
+@kernel base(position) = begin
+    energy = abs2(position) / 2
 end
 
-diagnostics = @kernel begin
-    energy::Float64
-    energy_squared::Float64 = abs2(energy)
-    return energy_squared
+@kernel diagnostics(energy) = begin
+    energy_squared = abs2(energy)
 end
 
 extended = merge(base, diagnostics)
@@ -273,11 +278,9 @@ The first kernel call seeds its caches; later calls offer them back to the
 registered mutating implementation:
 
 ```julia
-g = @kernel begin
-    x::Vector{Float64}
+@kernel g(x::Vector{Float64}) = begin
     a::Vector{Float64} = copy(x)
     b::Vector{Float64} = reverse(a)
-    return b
 end
 
 k = prepare_nonallocating(g)

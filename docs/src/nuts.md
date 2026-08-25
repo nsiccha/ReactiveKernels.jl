@@ -22,10 +22,8 @@ using LinearAlgebra
 potential(position) = sum(abs2, position) / 2
 potential_gradient(position) = (potential(position), copy(position))
 
-model = @kernel begin
-    pos::Vector{Float64}
-    mom::Vector{Float64}
-    metric::Matrix{Float64}
+@kernel model(pos::Vector{Float64}, mom::Vector{Float64},
+              metric::Matrix{Float64}) = begin
     chol_metric::Cholesky{Float64,Matrix{Float64}} = cholesky(metric)
     pot::Float64 = potential(pos)
     (pot, dpot_dpos::Vector{Float64}) = potential_gradient(pos)
@@ -35,7 +33,6 @@ model = @kernel begin
     end
     ham::Float64 = pot + kin
     dham_dpos::Vector{Float64} = dpot_dpos
-    return (pot, dpot_dpos, chol_metric, kin, ham, dham_dpos, dham_dmom)
 end
 
 dimension = 4
@@ -64,6 +61,7 @@ The same compiled reactive program then drives warmup and sampling:
 
 ```@example nuts
 using Random
+using ReactiveKernels
 
 point = euclidean_phasepoint(model, inputs)
 sampler = nuts_state(point;

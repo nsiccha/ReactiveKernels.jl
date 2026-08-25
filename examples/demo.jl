@@ -13,14 +13,12 @@ make_b(a)      = a + 100.0
 make_c(a)      = a + 1000.0
 finish(b, c)   = b + c
 
-g = @kernel begin
-    u::Float64
-    @recipe (cost = 1.0) a::Float64 = cheap_a(u)
-    @recipe (cost = 1.2) (a, b::Float64) = combined_ab(u)
+@kernel g(u) = begin
+    @recipe (cost = 1.0) a = cheap_a(u)
+    @recipe (cost = 1.2) (a, b) = combined_ab(u)
     @recipe (cost = 1.0) b = make_b(a)
-    @recipe (cost = 1.0) c::Float64 = make_c(a)
-    @recipe (cost = 1.0) r::Float64 = finish(b, c)
-    return r
+    @recipe (cost = 1.0) c = make_c(a)
+    @recipe (cost = 1.0) r = finish(b, c)
 end
 
 println("Query A — want `a` only:")
@@ -51,12 +49,10 @@ println()
 hr("3. Reactive replay with a frozen cut point (standardization)")
 
 runs = Ref(0)
-g2 = @kernel begin
-    X::Float64
+@kernel g2(X::Float64) = begin
     location::Float64 = (runs[] += 1; X)            # "mean"
     scale::Float64 = (runs[] += 1; abs(X) + 1.0)    # "std"
     standardized::Float64 = (X - location) / scale
-    return standardized
 end
 
 # Phase 1: derive stats from training data.
