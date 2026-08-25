@@ -150,6 +150,50 @@ k    = compile(ast2)
 k    = prepare(p; passes = (mypass,))
 ```
 
+## Preexisting ecosystem examples
+
+[`examples/preexisting.jl`](examples/preexisting.jl) ports the examples that
+predate this package and exercises them against the public API:
+
+- ReactiveObjects.jl's chain, diamond, and shared-intermediate gallery graphs;
+- ReactiveHMC.jl's Euclidean, Riemannian, and SoftAbs phase points, including
+  all three relativistic variants;
+- leapfrog, generalized leapfrog, implicit midpoint, and multistep integration.
+
+The scalar gallery kernels assert zero allocations after preparation. The HMC
+ports prepare their geometry and dynamics kernels once, then count the original
+potential/gradient/metric oracles. For example, four generalized-leapfrog
+fixed-point iterations call the combined metric-gradient oracle exactly five
+times—once for the starting position and once per changed position—and never
+call the three dominated partial oracles.
+
+`test/test_handwritten_benchmarks.jl` uses BenchmarkTools to compare the
+prepared chain and shared-intermediate kernels with equivalent hand-written
+Julia functions. The test prints median timings and their ratio, while its
+portable acceptance checks semantic equality, inferred concrete return types,
+and zero hot-path allocations rather than asserting a machine-dependent timing
+threshold.
+
+The source revisions are pinned in the example files so the compatibility
+corpus is auditable.
+
+For documentation, `examples/artifacts.jl` exposes all 13 compatibility cases
+as executable `ExampleArtifact` records. Each record carries the pinned raw
+source/call and runtime inputs, the real `PreparedKernel` and its executed
+output, the exact `code_expr` generated from that kernel, and its selected
+`Plan`. The visualization layer consumes the plan directly, so docs can render
+the colored compute DAG without reconstructing graph semantics:
+
+```julia
+include("examples/artifacts.jl")
+using .CompatibilityArtifacts
+
+artifact = only(filter(x -> x.name == :reactiveobjects_chain, all_artifacts()))
+artifact.source       # original input/source
+artifact.generated    # actual lowered kernel Expr
+visualize(artifact.dag) # structured HAVE/WANT/recipe DAG
+```
+
 ## Non-allocating preparation
 
 `prepare_nonallocating` keeps the same graph and plan, but applies one final AST
@@ -234,6 +278,8 @@ graph objects on the hot path). See `test/test_stateless.jl` and
 
 ```julia
 julia --project=. -e 'using Pkg; Pkg.test()'   # full package suite
+julia --project=. -e 'using Pkg; Pkg.test(test_args=["benchmark"])'
 julia --project=. examples/demo.jl             # runnable walkthrough
 julia --project=. examples/eight_schools.jl    # manual PPL graph
+julia --project=. examples/preexisting.jl      # ReactiveObjects/ReactiveHMC ports
 ```
