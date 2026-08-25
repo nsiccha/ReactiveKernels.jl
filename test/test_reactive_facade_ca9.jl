@@ -58,6 +58,14 @@ const _CA9_MSUM = Ref(0)    # recompute counter for `msum`   (depends on mvs)
             weights[k][2] = scalar
         end
     end
+    sameroot!(c, delta) = begin
+        if c                            # both branches alias the SAME field `weights`
+            w = weights[1]
+        else
+            w = weights[2]
+        end
+        w[1] += delta                   # sound single-root alias -> accepted, invalidates weights
+    end
 end
 
 @testset "@reactive ca9 — indexed/nested/compound/dotted/@./loop" begin
@@ -102,6 +110,20 @@ end
     @test t.weights[1][1] == 104.0
     @test t.wsum == before + 100.0          # dependent recomputed via the alias path
     @test _CA9_WSUM[] == c + 1              # recomputation actually happened
+end
+
+@testset "@reactive ca9 — same-root if/else alias accepted (not over-rejected)" begin
+    _CA9_WSUM[] = 0
+    t = treestore(2, 3)
+    @test t.wsum == 0.0 && _CA9_WSUM[] == 1        # materialize (all weights zero)
+    c = _CA9_WSUM[]
+    sameroot!(t, true, 5.0)                        # c=true -> w=weights[1]; weights[1][1]+=5
+    @test t.weights[1][1] == 5.0
+    @test t.wsum == 5.0 && _CA9_WSUM[] == c + 1    # weights invalidated -> wsum recomputed
+    c2 = _CA9_WSUM[]
+    sameroot!(t, false, 3.0)                       # c=false -> w=weights[2]; weights[2][1]+=3
+    @test t.weights[2][1] == 3.0
+    @test t.wsum == 8.0 && _CA9_WSUM[] == c2 + 1
 end
 
 @testset "@reactive ca9 — local-alias @. nested mutation invalidates dependent" begin
