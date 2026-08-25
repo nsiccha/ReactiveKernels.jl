@@ -99,6 +99,62 @@ _astuple(v::Value) = (v,)
 _astuple(t::Tuple) = t
 _astuple(v::AbstractVector) = Tuple(v)
 
+function _cse_alias_plan(g::Graph, new_outputs::Tuple, old_outputs::Tuple, cse_key)
+    targets = Dict{Int,Int}()
+    edges = Pair{Int,Int}[]
+
+    for (position, (new_output, old_output)) in enumerate(zip(new_outputs, old_outputs))
+        new_type = valtype(new_output)
+        old_type = valtype(old_output)
+        new_type === old_type || throw(ArgumentError(
+            "structural CSE output type mismatch for key $(repr(cse_key)) at position " *
+            "$position: existing output $(old_output.name) has type $old_type, " *
+            "new output $(new_output.name) has type $new_type"))
+
+        source = canon_id(g, new_output.id)
+        target = canon_id(g, old_output.id)
+        source == target && continue
+        if haskey(targets, source)
+            targets[source] == target || throw(ArgumentError(
+                "conflicting structural CSE output mapping for key $(repr(cse_key)) " *
+                "at position $position: canonical value $source would map to both " *
+                "$(targets[source]) and $target"))
+            continue
+        end
+        targets[source] = target
+        push!(edges, source => target)
+    end
+
+    # Validate the complete mapping before mutating the graph. In particular,
+    # crossed multi-output mappings such as (a, b) => (b, a) must not create a
+    # recursive alias chain.
+    for start in sort!(collect(keys(targets)))
+        seen = Set{Int}()
+        current = start
+        while haskey(targets, current)
+            current in seen && throw(ArgumentError(
+                "cyclic structural CSE output mapping for key $(repr(cse_key))"))
+            push!(seen, current)
+            current = targets[current]
+        end
+    end
+    edges
+end
+
+function _reindex_producers!(g::Graph)
+    empty!(g.producers)
+    for recipe in g.recipes
+        indexed = Set{Int}()
+        for output in recipe.outputs
+            canonical = canon_id(g, output.id)
+            canonical in indexed && continue
+            push!(get!(g.producers, canonical, Int[]), recipe.id)
+            push!(indexed, canonical)
+        end
+    end
+    g
+end
+
 """
     add!(g, inputs => outputs, op; cost=1.0, cse_key=nothing, effectful=false)
     add!(g; inputs, outputs, op, cost=1.0, cse_key=nothing, effectful=false)
@@ -115,9 +171,6 @@ function add!(g::Graph; inputs, outputs, op,
     if !isfinite(recipe_cost) || recipe_cost < 0
         throw(ArgumentError("recipe cost must be finite and non-negative, got $cost"))
     end
-    for v in ins; _register!(g, v); end
-    for v in outs; _register!(g, v); end
-
     # Opt-in structural CSE (gist §8): if a prior recipe carries the same
     # non-`nothing` cse_key, the same canonical inputs, and the same output
     # arity, it computes the same thing. Alias the new outputs onto the existing
@@ -130,14 +183,20 @@ function add!(g::Graph; inputs, outputs, op,
             isequal(r.cse_key, cse_key) || continue
             length(r.outputs) == length(outs) || continue
             Tuple(canon_id(g, v.id) for v in r.inputs) == canon_ins || continue
-            for (new_o, old_o) in zip(outs, r.outputs)
-                g.aliases[new_o.id] = canon_id(g, old_o.id)
+            alias_plan = _cse_alias_plan(g, outs, r.outputs, cse_key)
+            for v in ins; _register!(g, v); end
+            for v in outs; _register!(g, v); end
+            for (source, target) in alias_plan
+                g.aliases[source] = target
             end
+            isempty(alias_plan) || _reindex_producers!(g)
             g.version += 1
             return r
         end
     end
 
+    for v in ins; _register!(g, v); end
+    for v in outs; _register!(g, v); end
     r = Recipe(length(g.recipes) + 1, ins, outs, op, recipe_cost, cse_key, effectful)
     push!(g.recipes, r)
     for v in outs

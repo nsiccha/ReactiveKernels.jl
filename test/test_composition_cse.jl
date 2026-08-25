@@ -37,6 +37,128 @@ using Test
         p = plan(g; have = (x, y), want = (s,))
         @test count(r -> r.op === f, p.recipes) == 2
     end
+
+    @testset "typed aliases are atomic and keep producer alternatives" begin
+        snapshot(g) = (
+            values = copy(g.values),
+            recipes = copy(g.recipes),
+            producers = Dict(id => copy(rs) for (id, rs) in g.producers),
+            aliases = copy(g.aliases),
+            version = g.version,
+        )
+
+        for (existing_type, new_type) in ((Int, String), (String, Int))
+            g = Graph()
+            x = value!(g, :x, existing_type)
+            existing = value!(g, :existing, existing_type)
+            add!(g, x => existing, identity; cse_key = :typed)
+            candidate = value(:candidate, new_type)
+            before = snapshot(g)
+            error = try
+                add!(g, x => candidate, identity; cse_key = :typed)
+                nothing
+            catch err
+                err
+            end
+            @test error isa ArgumentError
+            @test occursin("position 1", sprint(showerror, error))
+            @test occursin(string(existing_type), sprint(showerror, error))
+            @test occursin(string(new_type), sprint(showerror, error))
+            @test snapshot(g) == before
+            @test !haskey(g.values, candidate.id)
+        end
+
+        g = Graph()
+        x = value!(g, :x, Int)
+        first = value!(g, :first, Int)
+        second = value!(g, :second, Float64)
+        add!(g; inputs = (x,), outputs = (first, second),
+             op = x -> (x, Float64(x)), cse_key = :pair)
+        new_first = value(:new_first, Int)
+        new_second = value(:new_second, String)
+        before = snapshot(g)
+        error = try
+            add!(g; inputs = (x,), outputs = (new_first, new_second),
+                 op = x -> (x, string(x)), cse_key = :pair)
+            nothing
+        catch err
+            err
+        end
+        @test error isa ArgumentError
+        @test occursin("position 2", sprint(showerror, error))
+        @test snapshot(g) == before
+        @test !haskey(g.values, new_first.id)
+        @test !haskey(g.values, new_second.id)
+
+        # A valid alias may merge a value that already has a cheaper producer.
+        # Reindex all recipes under the final canonical id so planning retains
+        # both alternatives instead of silently selecting only the CSE target.
+        g = Graph()
+        x = value!(g, :x, Int)
+        cheap = value!(g, :cheap, Int)
+        target = value!(g, :target, Int)
+        add!(g, x => cheap, x -> x + 1; cost = 0, cse_key = :cheap)
+        add!(g, x => target, x -> x + 10; cost = 10, cse_key = :target)
+        add!(g, x => cheap, x -> x + 10; cost = 10, cse_key = :target)
+        @test ReactiveKernels.producers_of(g, cheap.id) == [1, 2]
+        selected = plan(g; have = (x,), want = (cheap,))
+        @test only(selected.recipes).id == 1
+        @test selected.cost == 0
+        @test prepare(selected)(2) == 3
+
+        # Repeating the exact same structural output collapses without writing
+        # a self-alias, which would make canon_id recurse forever.
+        g = Graph()
+        x = value!(g, :x, Int)
+        y = value!(g, :y, Int)
+        add!(g, x => y, identity; cse_key = :same)
+        add!(g, x => y, identity; cse_key = :same)
+        @test !haskey(g.aliases, y.id)
+        @test canon_id(g, y.id) == y.id
+        @test length(g.recipes) == 1
+    end
+
+    @testset "multi-output alias conflicts reject without mutation" begin
+        snapshot(g) = (
+            values = copy(g.values),
+            recipes = copy(g.recipes),
+            producers = Dict(id => copy(rs) for (id, rs) in g.producers),
+            aliases = copy(g.aliases),
+            version = g.version,
+        )
+
+        g = Graph()
+        x = value!(g, :x, Int)
+        a = value!(g, :a, Int)
+        b = value!(g, :b, Int)
+        add!(g; inputs = (x,), outputs = (a, b),
+             op = x -> (x, x), cse_key = :crossed)
+        before = snapshot(g)
+        error = try
+            add!(g; inputs = (x,), outputs = (b, a),
+                 op = x -> (x, x), cse_key = :crossed)
+            nothing
+        catch err
+            err
+        end
+        @test error isa ArgumentError
+        @test occursin("cyclic", sprint(showerror, error))
+        @test snapshot(g) == before
+
+        shared = value(:shared, Int)
+        before = snapshot(g)
+        error = try
+            add!(g; inputs = (x,), outputs = (shared, shared),
+                 op = x -> (x, x), cse_key = :crossed)
+            nothing
+        catch err
+            err
+        end
+        @test error isa ArgumentError
+        @test occursin("conflicting", sprint(showerror, error))
+        @test snapshot(g) == before
+        @test !haskey(g.values, shared.id)
+    end
 end
 
 @testset "Phase 3 — composition (global value identity)" begin
