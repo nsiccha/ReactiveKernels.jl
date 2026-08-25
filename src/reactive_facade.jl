@@ -283,6 +283,15 @@ function _reactive_alias_roots(rhs, fields::Set{Symbol}, shadow::Set{Symbol})
         (isempty(ra) && isempty(rb)) && return Set{Symbol}()
         (length(ra) == 1 && ra == rb) && return ra
         return union(ra, rb, Set([_REACTIVE_ALIAS_CONFLICT]))
+    elseif rhs isa Expr && rhs.head in (:&&, :||)
+        # A short-circuit `c && a` / `c || a` yields the alias on one path and a
+        # non-alias (the bool / other operand) on the short-circuit path, so if any
+        # operand aliases a field it is an alias-vs-nonalias conflict -> reject.
+        rs = Set{Symbol}()
+        for op in rhs.args
+            union!(rs, _reactive_alias_roots(op, fields, shadow))
+        end
+        return isempty(rs) ? rs : union(rs, Set([_REACTIVE_ALIAS_CONFLICT]))
     end
     t = _reactive_alias_target(rhs, fields, shadow)
     t === nothing ? Set{Symbol}() : Set([t])
@@ -480,6 +489,16 @@ function _reactive_rewrite(ex, fields::Set{Symbol}, methods::Set{Symbol},
         paths = _has_final_else(ex) ? branches : push!(copy(branches), snapshot)
         _reactive_merge_strict!(aliases, paths)
         return Expr(ex.head, out...)
+    elseif ex.head in (:&&, :||)
+        # Short-circuit `cond && rhs` / `cond || rhs`: the condition always runs,
+        # the RHS runs only conditionally. Strict-merge the short-circuit path (RHS
+        # not evaluated -> incoming snapshot) with the executed path (RHS result),
+        # so an alias (re)bound only inside a short-circuit RHS becomes conflicted.
+        cond = rw(ex.args[1])
+        snapshot = _copy_aliases(aliases); rhs_scope = _copy_aliases(aliases)
+        rhs_out = _reactive_rewrite(ex.args[2], fields, methods, self, shadow, rhs_scope)
+        _reactive_merge_strict!(aliases, (snapshot, rhs_scope))
+        return Expr(ex.head, cond, rhs_out)
     elseif ex.head in (:for, :while)
         bind = Set{Symbol}()
         ex.head === :for && _reactive_assign_names!(bind, ex.args[1] isa Expr &&

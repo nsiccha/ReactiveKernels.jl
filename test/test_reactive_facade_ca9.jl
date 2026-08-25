@@ -70,6 +70,11 @@ const _CA9_MSUM = Ref(0)    # recompute counter for `msum`   (depends on mvs)
         w = c ? weights[1] : weights[2] # ternary RHS, same root `weights` -> accepted
         w[1] += delta
     end
+    andsameroot!(c, delta) = begin
+        w = weights[1]
+        c && (w = weights[2])           # short-circuit rebind, SAME root -> accepted
+        w[1] += delta
+    end
 end
 
 @testset "@reactive ca9 — indexed/nested/compound/dotted/@./loop" begin
@@ -133,6 +138,11 @@ end
     ternroot!(t, true, 10.0)                       # w = true ? weights[1] : weights[2]
     @test t.weights[1][1] == 15.0                  # 5 + 10
     @test t.wsum == 18.0 && _CA9_WSUM[] == c3 + 1
+    # short-circuit && rebind to the SAME root is also accepted and invalidates
+    c4 = _CA9_WSUM[]
+    andsameroot!(t, false, 2.0)                    # c=false -> no rebind; w=weights[1]; +2
+    @test t.weights[1][1] == 17.0
+    @test t.wsum == 20.0 && _CA9_WSUM[] == c4 + 1
 end
 
 @testset "@reactive ca9 — local-alias @. nested mutation invalidates dependent" begin
@@ -312,6 +322,44 @@ end
             a::Vector{Float64} = fill(1.0, k)
             m!(c) = begin
                 w = c ? a : zeros(k)
+                w[1] += 1.0
+            end
+        end)))
+    # short-circuit && rebinding the alias to a DIFFERENT field
+    @test occursin("cannot be soundly invalidated", _reactive_expansion_error(:(
+        @reactive _bad_and(k::Int) = begin
+            a::Vector{Float64} = fill(1.0, k); b::Vector{Float64} = fill(2.0, k)
+            m!(c) = begin
+                w = b
+                c && (w = a)
+                w[1] += 1.0
+            end
+        end)))
+    # short-circuit || rebinding the alias to a DIFFERENT field
+    @test occursin("cannot be soundly invalidated", _reactive_expansion_error(:(
+        @reactive _bad_or(k::Int) = begin
+            a::Vector{Float64} = fill(1.0, k); b::Vector{Float64} = fill(2.0, k)
+            m!(c) = begin
+                w = b
+                c || (w = a)
+                w[1] += 1.0
+            end
+        end)))
+    # short-circuit RHS `w = c && a` (alias-vs-nonalias)
+    @test occursin("cannot be soundly invalidated", _reactive_expansion_error(:(
+        @reactive _bad_andrhs(k::Int) = begin
+            a::Vector{Float64} = fill(1.0, k)
+            m!(c) = begin
+                w = c && a
+                w[1] += 1.0
+            end
+        end)))
+    # short-circuit RHS `w = c || a`
+    @test occursin("cannot be soundly invalidated", _reactive_expansion_error(:(
+        @reactive _bad_orrhs(k::Int) = begin
+            a::Vector{Float64} = fill(1.0, k)
+            m!(c) = begin
+                w = c || a
                 w[1] += 1.0
             end
         end)))
