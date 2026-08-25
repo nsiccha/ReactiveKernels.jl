@@ -7,6 +7,27 @@ import MutatingFunctions
     slot[] = MutatingFunctions.apply!!(slot[], op, args...)
 end
 
+# The reactive getter injects a `cache_apply(cache, op, args...) -> newcache`
+# helper that takes the slot VALUE (not the Ref) and returns the value the
+# getter stores back. `MutatingFunctions.apply!!` already has that exact
+# contract — including immutable/isbits passthrough — so it IS the reactive hook.
+@inline reactive_cache_apply(cache, op, args...) =
+    MutatingFunctions.apply!!(cache, op, args...)
+
+function ReactiveKernels.prepare_reactive_nonallocating(graph::ReactiveKernels.Graph;
+        have = (), want = (),
+        is_mutating = ReactiveKernels._default_is_mutating)
+    ReactiveKernels._prepare_reactive(graph;
+        have = have, want = want,
+        cache_apply = reactive_cache_apply, is_mutating = is_mutating)
+end
+
+function ReactiveKernels.prepare_reactive_nonallocating(spec::ReactiveKernels.KernelSpec;
+        is_mutating = ReactiveKernels._default_is_mutating, kwargs...)
+    ReactiveKernels._prepare_reactive(spec;
+        cache_apply = reactive_cache_apply, is_mutating = is_mutating, kwargs...)
+end
+
 function ReactiveKernels.prepare_nonallocating(p::ReactiveKernels.Plan; passes = ())
     ast = isempty(passes) ? ReactiveKernels.lower(p) :
           ReactiveKernels.transform(ReactiveKernels.lower(p), passes...)

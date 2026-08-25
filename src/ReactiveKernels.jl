@@ -42,7 +42,7 @@ export DAGVisualization, visualize, dot_source, save_visualization
 # Reactive layer
 export ReactiveState, set!, get!, freeze!, unfreeze!, checkpoint, materialize!
 export ReactiveProgram, CompiledReactiveState, ReactiveValue
-export prepare_reactive, statevalue, touch!, mutate!, copy_group!
+export prepare_reactive, prepare_reactive_nonallocating, statevalue, touch!, mutate!, copy_group!
 export ReactiveObject, @reactive
 # Reactive HMC/NUTS layer
 export ReactivePhasePoint, euclidean_phasepoint, riemannian_phasepoint
