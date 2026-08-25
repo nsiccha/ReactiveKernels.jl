@@ -330,3 +330,73 @@ end
     @test get!(replay, location_state) == 5.0
     @test get!(replay, centered_state) == 35.0
 end
+
+@testset "copy_group! grouped HAVE-boundary copy" begin
+    # Two-particle graph: sources a_pos, b_pos, r_pos, t_pos (Vector) and a
+    # scalar source s_flag; derived a_cost, b_cost, r_cost, delta = a_cost-b_cost.
+    calls = (a = Ref(0), b = Ref(0), r = Ref(0), delta = Ref(0))
+    graph = Graph()
+    a_pos = value!(graph, :a_pos, Vector{Float64})
+    b_pos = value!(graph, :b_pos, Vector{Float64})
+    r_pos = value!(graph, :r_pos, Vector{Float64})
+    t_pos = value!(graph, :t_pos, Vector{Float64})
+    a_cost = value!(graph, :a_cost, Float64)
+    b_cost = value!(graph, :b_cost, Float64)
+    r_cost = value!(graph, :r_cost, Float64)
+    delta = value!(graph, :delta, Float64)
+    add!(graph, a_pos => a_cost, x -> (calls.a[] += 1; sum(abs2, x)))
+    add!(graph, b_pos => b_cost, x -> (calls.b[] += 1; sum(abs2, x)))
+    add!(graph, r_pos => r_cost, x -> (calls.r[] += 1; sum(abs2, x)))
+    add!(graph, (a_cost, b_cost) => delta,
+         (a, b) -> (calls.delta[] += 1; a - b))
+
+    program = prepare_reactive(graph;
+        have = (a_pos, b_pos, r_pos, t_pos),
+        want = (a_cost, b_cost, r_cost, delta))
+    A = [1.0, 0.0]; B = [0.0, 2.0]; R = [3.0, 4.0]
+    state = program(copy(A), copy(B), copy(R), zeros(2))
+    ha = statevalue(program, a_pos); hb = statevalue(program, b_pos)
+    hr = statevalue(program, r_pos); ht = statevalue(program, t_pos)
+    hac = statevalue(program, a_cost); hbc = statevalue(program, b_cost)
+    hd = statevalue(program, delta)
+
+    @test get!(state, hd) == 1.0 - 4.0
+    @test (calls.a[], calls.b[], calls.delta[]) == (1, 1, 1)
+
+    # multi-subscriber / two-particle: touching b invalidates only {b_cost, delta}
+    set!(state, hb, [1.0, 1.0])
+    @test get!(state, hd) == 1.0 - 2.0
+    @test calls.a[] == 1              # a_cost NOT recomputed
+    @test (calls.b[], calls.delta[]) == (2, 2)
+
+    # copy_group! array group a_pos <- r_pos: in-place, invalidates a_cost + delta
+    copy_group!(state, (ha,), (hr,))
+    @test get!(state, hac) == sum(abs2, R)
+    @test get!(state, hd) == sum(abs2, R) - 2.0
+    @test calls.a[] == 2
+
+    # 0-alloc for a homogeneous array group, measured behind a function barrier
+    # so global-scope boxing does not contaminate the allocation count.
+    _cg_alloc(st, dh, sh) = (copy_group!(st, dh, sh); @allocated copy_group!(st, dh, sh))
+    @test _cg_alloc(state, (ha,), (hr,)) == 0
+
+    # swap via temp: a <-> b (multi-slot group in one call also exercised)
+    a_before = get!(state, hac); b_before = get!(state, hbc)
+    copy_group!(state, (ht,), (ha,))
+    copy_group!(state, (ha,), (hb,))
+    copy_group!(state, (hb,), (ht,))
+    @test get!(state, hac) == b_before
+    @test get!(state, hbc) == a_before
+
+    # copy / detached copy: mutating the original must not touch the copy
+    snapshot = copy(state)
+    hd_val = get!(snapshot, hd)
+    set!(state, ha, [9.0, 9.0])
+    @test get!(state, hac) == sum(abs2, [9.0, 9.0])
+    @test get!(snapshot, hd) == hd_val          # copy independent
+    @test snapshot.program === state.program     # program shared (no cloned deps)
+
+    # destinations must be HAVE sources
+    @test_throws ArgumentError copy_group!(state, (hac,), (hr,))
+    @test_throws DimensionMismatch copy_group!(state, (ha, hb), (hr,))
+end

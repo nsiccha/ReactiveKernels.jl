@@ -561,6 +561,63 @@ function Base.copyto!(destination::CompiledReactiveState,
     destination
 end
 
+# --- grouped HAVE-boundary copy ---------------------------------------------
+#
+# `copy_group!` copies a *selected group* of source (HAVE) slots — e.g. a phase
+# point's `(pos, mom)` — from one set of handles into another within the SAME
+# compiled state, reusing array buffers so an array group is 0-alloc, then
+# invalidating each destination's downstream through the ordinary HAVE-boundary
+# API. It is the one additive primitive the sampler needs for proposal-accept,
+# endpoint copy, and swap-via-temp: unlike whole-state `copyto!` it touches only
+# the named slots, and unlike a nested-subscription scheme it adds no
+# per-instance state — it is pure composition over `get!`/`set!`/`mutate!`, so
+# it cannot clone stale subscriptions and preserves every slot-index/validity
+# invariant of the engine.
+
+# Array destinations reuse their existing buffer (in-place copyto!); scalar
+# destinations are set. Dispatch is on the handle value-type parameter, so the
+# branch is resolved at compile time and stays type-stable.
+@inline _group_assign!(state::CompiledReactiveState,
+                       dest::ReactiveValue{I,T}, value) where {I,T<:AbstractArray} =
+    mutate!(buffer -> copyto!(buffer, value), state, dest)
+@inline _group_assign!(state::CompiledReactiveState,
+                       dest::ReactiveValue{I,T}, value) where {I,T} =
+    set!(state, dest, value)
+
+@inline function _copy_group!(state::CompiledReactiveState,
+                              dest::Tuple, src::Tuple)
+    d = first(dest)
+    _check_handle(state, d)
+    state.program.sources[_slot_index(d)] || throw(ArgumentError(
+        "copy_group! destinations must be ReactiveProgram HAVE sources",
+    ))
+    _group_assign!(state, d, get!(state, first(src)))
+    _copy_group!(state, Base.tail(dest), Base.tail(src))
+end
+@inline _copy_group!(::CompiledReactiveState, ::Tuple{}, ::Tuple{}) = nothing
+
+"""
+    copy_group!(state, dest_handles, src_handles)
+
+Copy each source slot in `src_handles` into the paired destination slot in
+`dest_handles`, in place where the value is an array (buffer reused, 0-alloc),
+then invalidate each destination's downstream. Every destination handle must be
+a declared HAVE source; sources may be any readable slot. This is an additive
+composition over the HAVE-boundary API — it changes no invalidation or copy
+internals — and is the group-copy building block for phase-point
+proposal/endpoint bookkeeping. `dest_handles` and `src_handles` are equal-length
+tuples of [`ReactiveValue`](@ref) handles; the pairing is walked by type-stable
+tuple recursion so a homogeneous array group copies with zero allocation.
+"""
+function copy_group!(state::CompiledReactiveState,
+                     dest_handles::Tuple, src_handles::Tuple)
+    length(dest_handles) == length(src_handles) || throw(DimensionMismatch(
+        "copy_group! needs equal-length destination and source handle tuples",
+    ))
+    _copy_group!(state, dest_handles, src_handles)
+    state
+end
+
 inputs(program::ReactiveProgram) = program.inputs
 outputs(program::ReactiveProgram) = program.outputs
 function code_expr(program::ReactiveProgram, handle::ReactiveValue{I}) where {I}
