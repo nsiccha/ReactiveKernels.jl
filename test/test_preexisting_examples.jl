@@ -41,6 +41,26 @@ end
     ), artifacts)
 end
 
+@testset "all compatibility artifacts use the public DAG renderer" begin
+    for artifact in all_artifacts()
+        @testset "$(artifact.name)" begin
+            view = visualize(artifact.dag)
+            html = sprint(show, MIME"text/html"(), view)
+            svg = sprint(show, MIME"image/svg+xml"(), view)
+            dot = dot_source(view)
+
+            @test view isa DAGVisualization
+            @test view.subject === artifact.dag
+            @test showable(MIME"text/html"(), view)
+            @test startswith(html, "<div class=\"rk-dag\"")
+            @test startswith(svg, "<svg")
+            @test startswith(dot, "digraph ReactiveKernels")
+            @test occursin("HAVE", html)
+            @test occursin("WANT", html)
+        end
+    end
+end
+
 @testset "preexisting ReactiveHMC.jl examples" begin
     euclidean = euclidean_examples()
     @test euclidean.gaussian_calls ==
