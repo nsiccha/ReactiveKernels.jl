@@ -9,8 +9,9 @@ itself. `Distributions.jl` supplies distributions and `logpdf`; public
 `Distributions.jl` and `ForwardDiff.jl` are example, test, and documentation
 dependencies only. They are not dependencies of the package runtime.
 
-Each panel is produced from one build-executed artifact. **Raw input** is
-byte-for-byte the compact source evaluated during this documentation build,
+Each panel is produced from one build-executed artifact. **Raw input** retains
+the literal compact source evaluated during this documentation build, alongside
+the established origin, executed-input, and actual-output annotations.
 **Generated kernel** is `code_expr` from that execution, and **Compute DAG** is
 the live `visualize(plan)` component. **Compare all** moves those same three
 views into a side-by-side dialog.
@@ -56,10 +57,12 @@ Main.ReactiveKernelsDocs.execute_example(
 )
 ```
 
-The sources record warmed `@allocated` measurements and `Base.return_types`
-inference results. They do not make blanket non-allocation or type-stability
-claims: distribution construction and multivariate linear algebra are ordinary
-Julia operations selected into the generated kernels, and inference depends on
-the composed operations. The package's separate non-allocating path remains
-documented under
+The sources record warmed `@allocated` measurements for both each prepared
+kernel and its equivalent direct `Distributions.jl` call, then report their
+difference as prepared-composition overhead. This separates the distribution
+construction and `MvNormal` linear-algebra baseline from overhead introduced by
+the composed execution path. The scalar `Base.return_types` results are checked
+as exactly `Float64`, so those allocation figures are not presented as evidence
+of an `Any` return box. They are measured evidence, not a blanket zero-allocation
+claim. The package's separate non-allocating path remains documented under
 [Non-allocating kernels](nonallocating.md).

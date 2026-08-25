@@ -18,13 +18,27 @@ using .DistributionExamples
         end
         @test all(artifact -> artifact.gradient ≈ artifact.reference_gradient, artifacts)
         @test all(artifact -> artifact.allocated_bytes isa Int, artifacts)
+        @test all(artifact -> artifact.reference_allocated_bytes isa Int, artifacts)
+        @test all(artifact -> artifact.composition_overhead_bytes isa Int, artifacts)
         @test all(artifact -> artifact.allocated_bytes >= 0, artifacts)
+        @test all(artifact -> artifact.reference_allocated_bytes >= 0, artifacts)
+        @test all(artifacts) do artifact
+            artifact.composition_overhead_bytes ==
+                artifact.allocated_bytes - artifact.reference_allocated_bytes
+        end
     end
 
-    @testset "inference evidence matches the runtime result" begin
-        for artifact in artifacts
+    @testset "concrete inference evidence matches exact result types" begin
+        expected_returns = (
+            Float64,
+            Float64,
+            Tuple{Float64, Float64, Float64},
+        )
+        for (artifact, expected_return) in zip(artifacts, expected_returns)
             observed = artifact.kernel(Tuple(artifact.inputs)...)
-            @test typeof(observed) <: artifact.inferred_return
+            @test isconcretetype(artifact.inferred_return)
+            @test artifact.inferred_return === expected_return
+            @test typeof(observed) === expected_return
         end
     end
 
