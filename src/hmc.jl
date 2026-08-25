@@ -385,6 +385,10 @@ The transition uses the generalized endpoint-momentum U-turn criterion from
 that implementation. Hamiltonian values and derivatives are supplied lazily
 by the phase point's compiled ReactiveKernels graph.
 
+The progressive tree-building transition follows Algorithm 3 of Hoffman and
+Gelman, ["The No-U-Turn Sampler: Adaptively Setting Path Lengths in Hamiltonian
+Monte Carlo"](https://jmlr.org/papers/v15/hoffman14a.html), JMLR 15 (2014).
+
 The ported scope is this multinomial transition plus the Euclidean/Riemannian
 phase-point, integrator, adaptation, and statistics utilities used with it. It
 does not claim to include ReactiveHMC's separate fixed-length HMC state or its
