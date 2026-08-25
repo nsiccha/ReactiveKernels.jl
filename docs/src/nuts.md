@@ -13,9 +13,7 @@ one build-executed artifact: **Raw input** is the exact public `@kernel` source
 and query, **Generated kernel** is the actual prepared Hamiltonian subkernel,
 and **Compute DAG** is the live colored `visualize(hamiltonian_kernel.plan)`
 component. Choose **Compare all** to inspect the three views side by side while
-preserving the DAG's fit, zoom, pan, and node-inspection state. The generated
-pane is **not** the NUTS transition implementation: it supplies the Hamiltonian
-and derivatives consumed by that ordinary Julia implementation.
+preserving the DAG's fit, zoom, pan, and node-inspection state.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(@__MODULE__, raw"""
@@ -62,62 +60,7 @@ docs_example = (;
 """)
 ```
 
-## What is generated vs. what implements NUTS
-
-The three-view artifact above compiles only the model-specific numerical layer:
-`ham`, `dham_dpos`, and `dham_dmom`. The multinomial tree-building and stopping
-logic from Algorithm 3 lives in
-[`src/hmc.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/6520e04d24616b1601c649f6ff27dc6a4ac83004/src/hmc.jl):
-
-- [`NUTSState` and `nuts_state`](https://github.com/nsiccha/ReactiveKernels.jl/blob/6520e04d24616b1601c649f6ff27dc6a4ac83004/src/hmc.jl#L424-L495)
-  own the endpoints, partial trees, proposals, direction, stopping flags, and
-  transition diagnostics.
-- [`_start_tree!` and `_finish_tree!`](https://github.com/nsiccha/ReactiveKernels.jl/blob/6520e04d24616b1601c649f6ff27dc6a4ac83004/src/hmc.jl#L562-L653)
-  recursively integrate, combine multinomial weights, detect divergence, and
-  apply the generalized endpoint-momentum U-turn criterion.
-- [`step!`, `refresh_momentum!`, and `sample!`](https://github.com/nsiccha/ReactiveKernels.jl/blob/6520e04d24616b1601c649f6ff27dc6a4ac83004/src/hmc.jl#L655-L735)
-  form the transition boundary; [`warmup!`](https://github.com/nsiccha/ReactiveKernels.jl/blob/6520e04d24616b1601c649f6ff27dc6a4ac83004/src/hmc.jl#L934-L1050)
-  adds initial step-size search, dual averaging, and Stan-style metric windows.
-
-The real transition entry points are concise. `sample!` refreshes momentum and
-delegates to `step!`; `step!` grows successive tree depths through
-`_finish_tree!`/`_start_tree!`, performs multinomial proposal selection, stops
-on divergence or a U-turn, and installs the selected proposal:
-
-```julia
-function sample!(state::NUTSState)
-    state.stats_f isa TrajectoryStats && reset!(state.stats_f, state.init)
-    refresh_momentum!(state)
-    step!(state)
-end
-
-function step!(state::NUTSState)
-    _reset_transition!(state)
-    backward = _backward(state)
-    @. backward.mom *= -1
-    state.trees[1].log_weight[1] = 0
-
-    for depth in 1:state.max_depth
-        rand(state.rng, Bool) && _flip!(state, depth)
-        _finish_tree!(state, depth)
-        state.depth = depth
-        state.may_sample || break
-        if _rand_bernoulli_log(
-                state.rng,
-                state.trees[depth].log_weight[1] -
-                    state.trees[depth].log_weight[2],
-            )
-            _swap_proposal!(state, depth)
-        end
-        state.may_continue || break
-    end
-    copyto!(state.init, state.proposals[end])
-    diagnostics(state)
-end
-```
-
-The public workflow wires the generated Hamiltonian provider into that Julia
-NUTS implementation, then runs warmup and sampling:
+The same compiled reactive program then drives warmup and sampling:
 
 ```@example nuts
 using Random
