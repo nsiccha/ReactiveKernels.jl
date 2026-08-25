@@ -93,6 +93,48 @@ silently fold into the previous result. Advancing a stream means explicitly
 promoting the returned accumulator to the next `state` input. Frozen values
 remain cut points until `unfreeze!` is called.
 
+## Mutation-friendly reactive authoring
+
+`MomentsAccumulator` is immutable on purpose: for a three-field sufficient
+statistic there is nothing to mutate in place, so pure `set!`/`get!` replacement
+is both correct and allocation-cheap. When state is instead a large **mutable**
+object — an array, a sampler phase point — where an in-place update avoids
+reallocating the whole buffer, ReactiveKernels provides a compiled reactive
+surface that keeps the same invalidation, freeze, and checkpoint guarantees.
+
+`prepare_reactive` fixes the have/want boundary once and returns a
+[`ReactiveProgram`](api.md); instantiate it to a `CompiledReactiveState`. Inside
+a `mutate!` transaction you edit the stored object for a declared source in
+place, and downstream slots are invalidated and lazily recomputed automatically
+— no manual round-trip through the returned value:
+
+```julia
+g = @kernel begin
+    weights::Vector{Float64}
+    total::Float64 = sum(weights)
+    return total
+end
+
+program = prepare_reactive(g; have = (:weights,), want = (:total,))
+state   = program([1.0, 2.0, 3.0])
+total   = statevalue(program, port(g, :total))
+
+get!(state, total)                       # 6.0
+mutate!(state, port(g, :weights)) do w   # in-place edit of the owned buffer
+    w[1] = 10.0
+end
+get!(state, total)                       # 15.0, recomputed on demand
+```
+
+Derived values live in owned typed slots, so `freeze!`/`unfreeze!` and
+`checkpoint` behave exactly as they do for `ReactiveState`: a frozen `total`
+stays fixed under later `mutate!` calls, and a checkpoint replays into a fresh
+`program(...; frozen = cp)` instance. This is the supported way to get
+mutation-friendly (`!!`-style) ergonomics inside a reactive layer. The direct
+[`prepare_nonallocating`](nonallocating.md) kernels are a separate,
+single-caller optimization whose borrowed caches are not persisted through the
+reactive layers.
+
 ## Measurement contract
 
 `kernel_performance_report` warms the generated update kernel, measures
