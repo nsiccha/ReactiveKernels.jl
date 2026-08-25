@@ -377,6 +377,10 @@ it changed and invalidate its downstream slots. Invalidation also runs if the
 mutation throws, because the object may already have been modified.
 """
 function mutate!(f, state::CompiledReactiveState, handle::ReactiveValue)
+    _check_handle(state, handle)
+    state.program.sources[_slot_index(handle)] || throw(ArgumentError(
+        "mutate! is restricted to the ReactiveProgram HAVE boundary; use freeze! for a derived cut point",
+    ))
     value = get!(state, handle)
     try
         f(value)

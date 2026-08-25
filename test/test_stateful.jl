@@ -101,6 +101,10 @@ end
 
     @test_throws ArgumentError touch!(state, grad)
     @test_throws ArgumentError set!(state, grad, zeros(2))
+    @test_throws ArgumentError mutate!(state, grad) do gradient_value
+        gradient_value .= 0
+    end
+    @test get!(state, grad) == [2.0, 0.0]
     @test_throws ArgumentError freeze!(state, q)
     @test all(!, state.frozen)
     @test_throws ArgumentError checkpoint(state, (q,))

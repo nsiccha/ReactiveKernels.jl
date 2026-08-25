@@ -2,7 +2,7 @@ if !isdefined(@__MODULE__, :ReactiveHMCExamples)
     include(joinpath(@__DIR__, "..", "examples", "preexisting_reactivehmc.jl"))
 end
 
-using .ReactiveHMCExamples
+using .ReactiveHMCExamples: riemannian_examples
 using LinearAlgebra
 using ReactiveKernels
 

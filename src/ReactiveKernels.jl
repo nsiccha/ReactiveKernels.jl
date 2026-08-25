@@ -17,6 +17,9 @@ See the design brief this package implements for the full rationale.
 module ReactiveKernels
 
 using RuntimeGeneratedFunctions
+using LinearAlgebra
+using LogExpFunctions
+using Random
 RuntimeGeneratedFunctions.init(@__MODULE__)
 
 include("core.jl")
@@ -25,6 +28,7 @@ include("codegen.jl")
 include("graphops.jl")
 include("reactive.jl")
 include("stateful.jl")
+include("hmc.jl")
 include("visualization.jl")
 
 export Value, Recipe, Graph, Plan, PreparedKernel, NonAllocatingKernel, PlanningError
@@ -36,5 +40,12 @@ export DAGVisualization, visualize, dot_source, save_visualization
 export ReactiveState, set!, get!, freeze!, unfreeze!, checkpoint, materialize!
 export ReactiveProgram, CompiledReactiveState, ReactiveValue
 export prepare_reactive, statevalue, touch!, mutate!
+# Reactive HMC/NUTS layer
+export ReactivePhasePoint, euclidean_phasepoint, riemannian_phasepoint
+export leapfrog!, generalized_leapfrog!, implicit_midpoint!, multistep
+export PartialFunction, partial, NUTSState, NUTSDiagnostics, nuts_state, step!
+export refresh_momentum!, diagnostics, sample!, reactive_program
+export DualAveragingState, dual_averaging_state, fit!
+export WelfordVariance, welford_var
 
 end # module ReactiveKernels
