@@ -347,4 +347,17 @@ end
     @test diag(warmup.metric)[1] > diag(warmup.metric)[2]
     @test warmup.metric_window_ends == [40, 100]
     @test length(warmup.diagnostics) == 120
+
+    short_state = nuts_state(
+        euclidean_phasepoint(
+            _gaussian_potential, _gaussian_gradient, Diagonal(ones(2)),
+            zeros(2), zeros(2),
+        );
+        rng = Xoshiro(7),
+        step_f = partial(leapfrog!; stepsize = 0.5),
+        max_depth = 4,
+    )
+    short_warmup = warmup!(short_state, 19)
+    @test isempty(short_warmup.metric_window_ends)
+    @test short_warmup.metric == Diagonal(ones(2))
 end

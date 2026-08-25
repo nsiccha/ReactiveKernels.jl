@@ -884,9 +884,12 @@ function _adapted_diagonal_metric(point::ReactivePhasePoint,
                                   minimum_variance,
                                   regularization = 5)
     weight = estimate.n / (estimate.n + regularization)
+    sample_variance = estimate.n > 1 ?
+        estimate.var .* (estimate.n / (estimate.n - 1)) :
+        fill(one(eltype(estimate.var)), length(estimate.var))
     position_variance = @. max(
         minimum_variance,
-        weight * estimate.var + (1 - weight) * minimum_variance,
+        weight * sample_variance + (1 - weight) * minimum_variance,
     )
     # `metric` is the momentum covariance (mass matrix) in these phase points.
     # Welford estimates position covariance, so the frequency-equalizing
@@ -944,24 +947,21 @@ function warmup!(state::NUTSState, iterations::Integer;
     end
 
     n = Int(iterations)
-    initial_count = initial_buffer === nothing ? min(75, max(1, n ÷ 5)) :
-                    Int(initial_buffer)
-    terminal_count = terminal_buffer === nothing ? min(50, max(1, n ÷ 10)) :
-                     Int(terminal_buffer)
+    initial_count = initial_buffer === nothing ? 75 : Int(initial_buffer)
+    terminal_count = terminal_buffer === nothing ? 50 : Int(terminal_buffer)
+    window_size = first_window === nothing ? 25 : Int(first_window)
     initial_count >= 0 && terminal_count >= 0 || throw(ArgumentError(
         "warmup buffer lengths must be non-negative",
     ))
-    initial_count + terminal_count < n || begin
-        initial_count = max(1, n ÷ 3)
-        terminal_count = max(1, n ÷ 6)
-    end
-    slow_length = max(0, n - initial_count - terminal_count)
-    window_size = first_window === nothing ? min(25, max(1, slow_length)) :
-                  Int(first_window)
     window_size >= 1 || throw(ArgumentError(
         "first metric window must be positive",
     ))
-    window_ends = adapt_metric ? _warmup_window_ends(
+    if initial_count + window_size + terminal_count > n
+        initial_count = floor(Int, 0.15n)
+        terminal_count = floor(Int, 0.10n)
+        window_size = n - initial_count - terminal_count
+    end
+    window_ends = adapt_metric && n >= 20 ? _warmup_window_ends(
         n, initial_count, terminal_count, window_size,
     ) : Int[]
 
