@@ -122,9 +122,10 @@ function add!(g::Graph; inputs, outputs, op,
     # non-`nothing` cse_key, the same canonical inputs, and the same output
     # arity, it computes the same thing. Alias the new outputs onto the existing
     # producer's outputs instead of adding a duplicate recipe.
-    if cse_key !== nothing
+    if cse_key !== nothing && !effectful
         canon_ins = Tuple(canon_id(g, v.id) for v in ins)
         for r in g.recipes
+            r.effectful && continue
             r.cse_key === nothing && continue
             isequal(r.cse_key, cse_key) || continue
             length(r.outputs) == length(outs) || continue
