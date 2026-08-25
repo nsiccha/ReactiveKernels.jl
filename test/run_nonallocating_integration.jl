@@ -6,7 +6,8 @@ const MUTATING_FUNCTIONS_REV = "b353559ef3e391ae2e2d98256b6967903fdfa410"
 const MUTATING_FUNCTIONS_UUID = UUID("8a4c2d94-4b3b-4f9e-be63-a3c0cd816e3a")
 
 root = normpath(joinpath(@__DIR__, ".."))
-testfile = joinpath(@__DIR__, "test_nonallocating.jl")
+testfiles = [joinpath(@__DIR__, "test_nonallocating.jl"),
+             joinpath(@__DIR__, "test_reactive_nonallocating.jl")]
 
 mktempdir() do env
     Pkg.activate(env)
@@ -20,5 +21,7 @@ mktempdir() do env
 
     println("NONALLOCATING_DEP\tMutatingFunctions\t", dep.git_revision)
     julia = Base.julia_cmd()
-    run(`$julia --startup-file=no --check-bounds=yes --project=$env $testfile`)
+    for testfile in testfiles
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $testfile`)
+    end
 end
