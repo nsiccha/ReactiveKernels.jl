@@ -9,8 +9,10 @@
 
 const _OPS_ARG = :__ops__
 
-# Assign a source-variable Symbol to every value appearing in the plan, reusing
-# the readable value name and disambiguating only genuine name collisions.
+# Assign a globally unique source-variable Symbol to every canonical value in
+# the plan. User names are diagnostic hints, not binding authority: they may
+# collide with one another, with a generated disambiguation such as `a_12`, or
+# with the hidden `__ops__` argument.
 function _varnames(p::Plan)
     g = p.graph
     ids = Int[]
@@ -18,15 +20,19 @@ function _varnames(p::Plan)
     for r in p.recipes, o in r.outputs; push!(ids, canon_id(g, o.id)); end
     for w in p.want; push!(ids, canon_id(g, w.id)); end
     unique!(ids)
-    namecount = Dict{Symbol,Int}()
-    for id in ids
-        n = p.graph.values[id].name
-        namecount[n] = get(namecount, n, 0) + 1
-    end
+    used = Set{Symbol}((_OPS_ARG,))
     out = Dict{Int,Symbol}()
     for id in ids
-        n = p.graph.values[id].name
-        out[id] = namecount[n] > 1 ? Symbol(n, :_, id) : n
+        base = p.graph.values[id].name
+        candidate = base
+        suffix = 0
+        while candidate in used
+            candidate = suffix == 0 ? Symbol(base, :_, id) :
+                        Symbol(base, :_, id, :_, suffix)
+            suffix += 1
+        end
+        out[id] = candidate
+        push!(used, candidate)
     end
     out
 end
@@ -54,13 +60,28 @@ function lower(p::Plan)
         push!(argexprs, :($(nm(v))::$(valtype(v))))
     end
     body = Expr(:block)
+    # HAVE is authoritative, and the first selected producer of any other
+    # logical value owns its binding. Later recipes may emit that value as a
+    # collateral multi-output; execute the recipe but discard the duplicate so
+    # neither authoritative inputs nor earlier logical values are overwritten.
+    assigned = Set(canon_id(g, v.id) for v in p.have)
     for (k, r) in enumerate(p.recipes)
         callargs = Any[nm(inp) for inp in r.inputs]
         call = Expr(:call, Expr(:ref, _OPS_ARG, k), callargs...)
-        if length(r.outputs) == 1
-            push!(body.args, Expr(:(=), nm(r.outputs[1]), call))
+        lhsnames = Any[]
+        for output in r.outputs
+            cid = canon_id(g, output.id)
+            if cid in assigned
+                push!(lhsnames, gensym(Symbol(nm(output), :_discard)))
+            else
+                push!(assigned, cid)
+                push!(lhsnames, nm(output))
+            end
+        end
+        if length(lhsnames) == 1
+            push!(body.args, Expr(:(=), only(lhsnames), call))
         else
-            lhs = Expr(:tuple, (nm(o) for o in r.outputs)...)
+            lhs = Expr(:tuple, lhsnames...)
             push!(body.args, Expr(:(=), lhs, call))
         end
     end
