@@ -15,6 +15,15 @@ function makeButton(label: string, className: string) {
   return button
 }
 
+function refreshDags(root: ParentNode) {
+  requestAnimationFrame(() => {
+    for (const dag of root.querySelectorAll<HTMLElement>('.rk-dag')) {
+      const api = (dag as HTMLElement & { rkDag?: { resize?: () => void } }).rkDag
+      api?.resize?.()
+    }
+  })
+}
+
 function enhanceKernelExample(root: HTMLElement) {
   if (root.dataset.rkExampleReady === '1') return
 
@@ -52,6 +61,7 @@ function enhanceKernelExample(root: HTMLElement) {
       tabs[paneName].setAttribute('aria-selected', String(selected))
       tabs[paneName].tabIndex = selected ? 0 : -1
     }
+    refreshDags(panes[name])
     if (focus) tabs[name].focus()
   }
 
@@ -140,6 +150,7 @@ function enhanceKernelExample(root: HTMLElement) {
       pane.removeAttribute('aria-labelledby')
       pane.setAttribute('aria-label', labels[name])
       columnBodies[name].appendChild(pane)
+      refreshDags(pane)
     }
     dialog.showModal()
     close.focus()
@@ -154,6 +165,7 @@ function enhanceKernelExample(root: HTMLElement) {
       pane.role = 'tabpanel'
       pane.setAttribute('aria-labelledby', tabs[name].id)
       root.insertBefore(pane, dialog)
+      refreshDags(pane)
     }
     selectPane(active)
     expand.focus()

@@ -98,10 +98,13 @@ The diagram uses explicit value and recipe nodes (`value → recipe → value`),
 so multi-input and multi-output operations stay unambiguous. A plan shows only
 the selected computation by default; `visualize(p; alternatives=true)` adds
 backward-reachable alternatives as muted dashed nodes. Both `Graph` and `Plan`
-also expose interactive HTML and SVG rich displays directly. The HTML component
-adds fit, pan, zoom, keyboard controls, and a structural node inspector without
-external assets; `.dot` / `.gv` exports can be fed to Graphviz for
-publication-oriented layout without making Graphviz a package dependency.
+also expose interactive HTML and SVG rich displays directly. Cytoscape.js with
+ELK supplies the HTML view's layered layout, routing, fit, pan, and zoom; a
+structural side inspector keeps complete node details available without packing
+them into the canvas. The docs bundle those libraries locally, while notebook
+and standalone displays retain an offline SVG fallback. `.dot` / `.gv` exports
+can be fed to Graphviz for publication-oriented layout without making Graphviz
+a Julia package dependency.
 
 See the [visualization guide](docs/src/visualization.md) for the visual
 semantics, format tradeoffs, and deliberate non-goals.
