@@ -1,12 +1,11 @@
-# Dependency-free DAG visualization.
+# DAG visualization with a library-backed interactive surface.
 #
-# DOT is the portable interchange format: callers can feed it to Graphviz,
-# editors, documentation systems, or their own renderer.  A compact layered
-# SVG renderer supplies zero-setup rich display in Julia notebooks and IDEs.
-# A self-contained HTML wrapper progressively adds fit/pan/zoom and structural
-# node inspection without changing the graph model or requiring a JS package.
-# Recipes remain explicit nodes so multi-input and multi-output computations
-# are represented without inventing ambiguous hyper-edge notation.
+# DOT is the portable interchange format, and a compact SVG renderer remains a
+# zero-setup static fallback. Interactive HTML is rendered by Cytoscape.js with
+# the ELK layered layout: established libraries own graph geometry, routing,
+# zooming, and panning while ReactiveKernels supplies only its graph model,
+# semantic styling, and inspector. Recipes remain explicit nodes so multi-input
+# and multi-output computations are represented without ambiguous hyper-edges.
 
 """
     DAGVisualization
@@ -39,7 +38,7 @@ end
     visualize(graph; orientation=:horizontal) -> DAGVisualization
     visualize(plan; alternatives=false, orientation=:horizontal) -> DAGVisualization
 
-Create a dependency-free DAG visualization. Values and recipes are separate
+Create a DAG visualization. Values and recipes are separate
 nodes, with edges `value → recipe → value`, so multi-input and multi-output
 recipes remain unambiguous.
 
@@ -48,10 +47,12 @@ to add backward-reachable but unselected candidates as muted dashed nodes.
 `orientation` may be `:horizontal` (left to right) or `:vertical` (top to
 bottom).
 
-Rich Julia displays render the result as interactive, self-contained HTML when
-supported, with self-contained SVG as the static fallback. The underlying
-`Graph` and `Plan` types expose both representations directly, so a notebook
-can display them without calling `visualize` explicitly.
+Rich Julia displays render the result as Cytoscape.js + ELK interactive HTML
+when supported, with self-contained SVG as the static and offline fallback.
+Documentation bundles the libraries locally; standalone rich displays load
+the same pinned libraries on demand. The underlying `Graph` and `Plan` types
+expose both representations directly, so a notebook can display them without
+calling `visualize` explicitly.
 """
 function visualize(x::Graph; alternatives::Bool = false,
                    orientation::Symbol = :horizontal)
@@ -246,7 +247,7 @@ end
 
 function Base.show(io::IO, ::MIME"text/plain", v::DAGVisualization)
     show(io, v)
-    print(io, "\n  rich display: interactive self-contained HTML",
+    print(io, "\n  rich display: Cytoscape.js + ELK interactive HTML",
           "\n  fallback: self-contained SVG",
           "\n  interchange: dot_source(view)",
           "\n  files: save_visualization(\"plan.html\", view), \"plan.svg\", or \"plan.dot\"")
@@ -254,6 +255,72 @@ end
 
 _xml_escape(s) = replace(string(s), '&' => "&amp;", '<' => "&lt;", '>' => "&gt;",
                          '"' => "&quot;", '\'' => "&apos;")
+
+function _write_json_string(io::IO, value)
+    print(io, '"')
+    for char in string(value)
+        if char == '"'
+            print(io, "\\\"")
+        elseif char == '\\'
+            print(io, "\\\\")
+        elseif char == '\b'
+            print(io, "\\b")
+        elseif char == '\f'
+            print(io, "\\f")
+        elseif char == '\n'
+            print(io, "\\n")
+        elseif char == '\r'
+            print(io, "\\r")
+        elseif char == '\t'
+            print(io, "\\t")
+        elseif char == '<'
+            # An application/json script must never contain a literal
+            # `</script`, even when a user-controlled node name does.
+            print(io, "\\u003c")
+        elseif Int(char) < 0x20
+            print(io, "\\u", lpad(string(Int(char); base = 16), 4, '0'))
+        else
+            print(io, char)
+        end
+    end
+    print(io, '"')
+end
+
+function _write_html_model(io::IO, model::_VizModel, orientation::Symbol)
+    print(io, "{\"title\":")
+    _write_json_string(io, model.title)
+    print(io, ",\"orientation\":")
+    _write_json_string(io, orientation)
+    print(io, ",\"nodes\":[")
+    for (index, node) in enumerate(model.nodes)
+        index == 1 || print(io, ',')
+        print(io, "{\"data\":{\"id\":")
+        _write_json_string(io, node.id)
+        print(io, ",\"label\":")
+        _write_json_string(io, node.label)
+        print(io, ",\"detail\":")
+        _write_json_string(io, node.detail)
+        print(io, ",\"kind\":")
+        _write_json_string(io, node.kind)
+        print(io, ",\"state\":")
+        _write_json_string(io, node.state)
+        print(io, "}}")
+    end
+    print(io, "],\"edges\":[")
+    for (index, edge) in enumerate(model.edges)
+        index == 1 || print(io, ',')
+        print(io, "{\"data\":{\"id\":")
+        _write_json_string(io, string(edge.src, "__", edge.dst))
+        print(io, ",\"source\":")
+        _write_json_string(io, edge.src)
+        print(io, ",\"target\":")
+        _write_json_string(io, edge.dst)
+        print(io, ",\"state\":")
+        _write_json_string(io, edge.state)
+        print(io, "}}")
+    end
+    print(io, "]}")
+end
 
 # Losslessly wrap long labels into SVG tspans. This deliberately never clips or
 # ellipsizes user-readable names or types.
@@ -469,13 +536,14 @@ Base.show(io::IO, mime::MIME"image/svg+xml", x::Union{Graph,Plan}) =
 
 const _DAG_HTML_STYLE = raw"""
 <style>
-.rk-dag{container-type:inline-size;color:#0f172a;background:#fff;border:1px solid #cbd5e1;border-radius:12px;overflow:hidden;font:13px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;box-shadow:0 1px 2px rgba(15,23,42,.06)}
-.rk-dag *{box-sizing:border-box}.rk-dag-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:9px 12px;border-bottom:1px solid #e2e8f0;background:#f8fafc}.rk-dag-toolbar button{appearance:none;border:1px solid #94a3b8;border-radius:6px;background:#fff;color:#0f172a;padding:5px 10px;font:600 12px/1.2 inherit;cursor:pointer}.rk-dag-toolbar button:hover{background:#eff6ff;border-color:#2563eb}.rk-dag-toolbar button:focus-visible{outline:3px solid rgba(37,99,235,.3);outline-offset:1px}.rk-dag-hint{margin-left:auto;color:#475569;font-size:12px}
-.rk-dag-workspace{display:grid;grid-template-columns:minmax(0,1fr) minmax(190px,24%);min-height:360px;max-height:min(720px,72vh)}.rk-dag-canvas{min-width:0;min-height:360px;overflow:hidden;touch-action:none;cursor:grab;background:#fff}.rk-dag-canvas:active{cursor:grabbing}.rk-dag-canvas:focus-visible{outline:3px solid rgba(37,99,235,.3);outline-offset:-3px}.rk-dag-canvas svg{display:block;width:100%;height:100%;max-height:none}.rk-dag-canvas .rk-node{cursor:pointer}
-.rk-dag-inspector{min-width:0;overflow:auto;border-left:1px solid #e2e8f0;background:#f8fafc;padding:16px}.rk-dag-inspector h3{font-size:14px;line-height:1.3;margin:0 0 12px;overflow-wrap:anywhere}.rk-dag-inspector dl{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:7px 10px;margin:0}.rk-dag-inspector dt{font-weight:650;color:#475569}.rk-dag-inspector dd{margin:0;overflow-wrap:anywhere;white-space:normal}.rk-dag-inspector .rk-muted{color:#64748b}
-@media(max-width:700px){.rk-dag-hint{width:100%;margin-left:0}.rk-dag-workspace{grid-template-columns:1fr;max-height:none}.rk-dag-inspector{border-left:0;border-top:1px solid #e2e8f0}.rk-dag-canvas{min-height:320px}}
-@container(max-width:700px){.rk-dag-hint{width:100%;margin-left:0}.rk-dag-workspace{grid-template-columns:1fr;max-height:none}.rk-dag-inspector{border-left:0;border-top:1px solid #e2e8f0}.rk-dag-canvas{min-height:320px}}
-@media(prefers-color-scheme:dark){.rk-dag{color:#e2e8f0;background:#0f172a;border-color:#475569}.rk-dag-toolbar,.rk-dag-inspector{background:#1e293b;border-color:#475569}.rk-dag-toolbar button{background:#0f172a;color:#e2e8f0;border-color:#64748b}.rk-dag-toolbar button:hover{background:#1e3a5f}.rk-dag-hint,.rk-dag-inspector dt,.rk-dag-inspector .rk-muted{color:#cbd5e1}}
+.rk-dag{--rk-bg:#fff;--rk-surface:#f8fafc;--rk-border:#dbe4f0;--rk-text:#132238;--rk-muted:#64748b;--rk-accent:#4f46e5;--rk-accent-soft:#eef2ff;container-type:inline-size;color:var(--rk-text);background:var(--rk-bg);border:1px solid var(--rk-border);border-radius:18px;overflow:hidden;font:13px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;box-shadow:0 18px 48px rgba(30,41,59,.10),0 2px 8px rgba(30,41,59,.06)}
+.rk-dag *{box-sizing:border-box}.rk-dag-toolbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 14px;border-bottom:1px solid var(--rk-border);background:linear-gradient(135deg,#fff 0%,#f8faff 72%,#f1f5ff 100%)}.rk-dag-heading{display:flex;min-width:0;flex:1;align-items:center;gap:10px}.rk-dag-mark{width:10px;height:10px;flex:0 0 auto;border-radius:999px;background:linear-gradient(135deg,#4f46e5,#8b5cf6);box-shadow:0 0 0 5px rgba(99,102,241,.11)}.rk-dag-title{overflow:hidden;font-size:13px;font-weight:750;letter-spacing:-.01em;text-overflow:ellipsis;white-space:nowrap}.rk-dag-engine{border:1px solid #c7d2fe;border-radius:999px;background:#eef2ff;color:#4338ca;padding:3px 8px;font-size:10px;font-weight:750;letter-spacing:.04em;text-transform:uppercase}.rk-dag-controls{display:flex;align-items:center;gap:5px}.rk-dag-toolbar button{display:inline-grid;min-width:32px;height:30px;place-items:center;appearance:none;border:1px solid var(--rk-border);border-radius:9px;background:rgba(255,255,255,.86);color:var(--rk-text);padding:0 9px;font:700 12px/1 inherit;cursor:pointer;box-shadow:0 1px 2px rgba(15,23,42,.04)}.rk-dag-toolbar button:hover{border-color:#a5b4fc;background:#eef2ff;color:#4338ca}.rk-dag-toolbar button:focus-visible,.rk-dag-picker select:focus-visible{outline:3px solid rgba(79,70,229,.22);outline-offset:2px}.rk-dag-status{width:100%;color:var(--rk-muted);font-size:11px}.rk-dag[data-rk-renderer="cytoscape-elk"] .rk-dag-status{display:none}
+.rk-dag-workspace{display:grid;grid-template-columns:minmax(0,1fr) minmax(220px,26%);min-height:430px;max-height:min(760px,76vh)}.rk-dag-canvas{position:relative;min-width:0;min-height:430px;overflow:hidden;background-color:#fbfdff;background-image:radial-gradient(circle at 1px 1px,rgba(100,116,139,.17) 1px,transparent 0);background-size:22px 22px}.rk-dag-canvas:focus-visible{outline:3px solid rgba(79,70,229,.24);outline-offset:-3px}.rk-dag-stage,.rk-dag-fallback{position:absolute;inset:0}.rk-dag-stage[hidden],.rk-dag-fallback[hidden]{display:none}.rk-dag-fallback{overflow:hidden}.rk-dag-fallback svg{display:block;width:100%;height:100%;max-height:none}.rk-dag-empty{display:grid;height:100%;min-height:300px;place-items:center;color:var(--rk-muted);font-weight:600}
+.rk-dag[data-rk-orientation="vertical"] .rk-dag-workspace,.rk-dag[data-rk-orientation="vertical"] .rk-dag-canvas{min-height:680px}
+.rk-dag-inspector{min-width:0;overflow:auto;border-left:1px solid var(--rk-border);background:linear-gradient(180deg,#f8fafc 0%,#fff 100%);padding:18px}.rk-dag-picker{display:grid;gap:6px;margin:0 0 18px;color:var(--rk-muted);font-size:11px;font-weight:750;letter-spacing:.045em;text-transform:uppercase}.rk-dag-picker select{width:100%;min-width:0;border:1px solid var(--rk-border);border-radius:10px;background:var(--rk-bg);color:var(--rk-text);padding:8px 30px 8px 10px;font:600 12px/1.35 inherit;text-transform:none}.rk-dag-inspector h3{margin:0 0 14px;font-size:15px;line-height:1.35;letter-spacing:-.01em;overflow-wrap:anywhere}.rk-dag-inspector dl{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:8px 11px;margin:0}.rk-dag-inspector dt{font-size:11px;font-weight:750;color:var(--rk-muted);letter-spacing:.035em;text-transform:uppercase}.rk-dag-inspector dd{margin:0;overflow-wrap:anywhere;white-space:normal}.rk-dag-inspector .rk-muted{color:var(--rk-muted)}
+@media(max-width:700px){.rk-dag-engine{display:none}.rk-dag-workspace{grid-template-columns:1fr;max-height:none}.rk-dag-inspector{border-top:1px solid var(--rk-border);border-left:0}.rk-dag-canvas{min-height:350px}}
+@container(max-width:700px){.rk-dag-engine{display:none}.rk-dag-workspace{grid-template-columns:1fr;max-height:none}.rk-dag-inspector{border-top:1px solid var(--rk-border);border-left:0}.rk-dag-canvas{min-height:350px}}
+.dark .rk-dag{--rk-bg:#111827;--rk-surface:#172033;--rk-border:#334155;--rk-text:#e5e7eb;--rk-muted:#a8b3c5;background:#111827;box-shadow:0 18px 52px rgba(0,0,0,.34)}.dark .rk-dag-toolbar{background:linear-gradient(135deg,#172033 0%,#161c32 100%)}.dark .rk-dag-engine{border-color:#4338ca;background:#252354;color:#c7d2fe}.dark .rk-dag-toolbar button{background:#1f2937}.dark .rk-dag-toolbar button:hover{background:#272b55}.dark .rk-dag-canvas{background-color:#101725;background-image:radial-gradient(circle at 1px 1px,rgba(148,163,184,.14) 1px,transparent 0)}.dark .rk-dag-inspector{background:linear-gradient(180deg,#172033 0%,#111827 100%)}
 </style>
 """
 
@@ -484,109 +552,203 @@ const _DAG_HTML_SCRIPT = raw"""
 (() => {
   const script = document.currentScript;
   const root = script && script.closest('.rk-dag');
-  if (!root || root.dataset.rkReady === 'true') return;
-  root.dataset.rkReady = 'true';
+  if (!root || root.dataset.rkReady === 'true' || root.dataset.rkReady === 'loading') return;
+  root.dataset.rkReady = 'loading';
   const canvas = root.querySelector('[data-rk-canvas]');
-  const svg = root.querySelector('[data-rk-svg]');
-  if (!canvas || !svg) return;
+  const stage = root.querySelector('[data-rk-stage]');
+  const fallback = root.querySelector('[data-rk-fallback]');
+  const modelNode = root.querySelector('[data-rk-model]');
+  const status = root.querySelector('[data-rk-status]');
+  if (!canvas || !stage || !fallback || !modelNode) return;
 
-  const rawBox = svg.getAttribute('viewBox').trim().split(/\s+/).map(Number);
-  const original = {x: rawBox[0], y: rawBox[1], w: rawBox[2], h: rawBox[3]};
-  let box = {...original};
-  const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
-  const applyBox = () => svg.setAttribute('viewBox', `${box.x} ${box.y} ${box.w} ${box.h}`);
-  const fit = () => { box = {...original}; applyBox(); };
-  const zoom = (scale, clientX, clientY) => {
-    const rect = canvas.getBoundingClientRect();
-    const px = clientX == null ? .5 : clamp((clientX - rect.left) / rect.width, 0, 1);
-    const py = clientY == null ? .5 : clamp((clientY - rect.top) / rect.height, 0, 1);
-    const nextW = clamp(box.w * scale, original.w * .12, original.w * 8);
-    const nextH = clamp(box.h * scale, original.h * .12, original.h * 8);
-    box.x += (box.w - nextW) * px;
-    box.y += (box.h - nextH) * py;
-    box.w = nextW;
-    box.h = nextH;
-    applyBox();
+  let model;
+  try {
+    model = JSON.parse(modelNode.textContent || '{}');
+  } catch (error) {
+    root.dataset.rkReady = 'fallback';
+    if (status) status.textContent = 'Static fallback · graph data could not be read';
+    return;
+  }
+  if (!model.nodes || model.nodes.length === 0) {
+    root.dataset.rkReady = 'true';
+    root.dataset.rkRenderer = 'static-empty';
+    if (status) status.textContent = 'Empty graph';
+    return;
+  }
+
+  const hasElk = () => {
+    try { return Boolean(window.cytoscape && window.cytoscape('layout', 'elk')); }
+    catch (_) { return false; }
   };
-
-  root.querySelector('[data-rk-fit]').addEventListener('click', fit);
-  root.querySelector('[data-rk-zoom-in]').addEventListener('click', () => zoom(.8));
-  root.querySelector('[data-rk-zoom-out]').addEventListener('click', () => zoom(1.25));
-  canvas.addEventListener('wheel', event => {
-    event.preventDefault();
-    zoom(event.deltaY < 0 ? .82 : 1.22, event.clientX, event.clientY);
-  }, {passive: false});
-
-  let drag = null;
-  canvas.addEventListener('pointerdown', event => {
-    if (event.button !== 0) return;
-    drag = {x: event.clientX, y: event.clientY, box: {...box}, moved: false};
-    canvas.setPointerCapture(event.pointerId);
+  const loadScript = (src, integrity, ready) => new Promise((resolve, reject) => {
+    if (ready()) { resolve(); return; }
+    const existing = document.querySelector(`script[data-rk-vendor="${src}"]`);
+    if (existing) {
+      existing.addEventListener('load', () => ready() ? resolve() : reject(new Error(src)), {once:true});
+      existing.addEventListener('error', reject, {once:true});
+      return;
+    }
+    const tag = document.createElement('script');
+    tag.src = src;
+    tag.integrity = integrity;
+    tag.crossOrigin = 'anonymous';
+    tag.dataset.rkVendor = src;
+    tag.addEventListener('load', () => ready() ? resolve() : reject(new Error(src)), {once:true});
+    tag.addEventListener('error', reject, {once:true});
+    document.head.appendChild(tag);
   });
-  canvas.addEventListener('pointermove', event => {
-    if (!drag) return;
-    const rect = canvas.getBoundingClientRect();
-    const dx = (event.clientX - drag.x) * drag.box.w / rect.width;
-    const dy = (event.clientY - drag.y) * drag.box.h / rect.height;
-    drag.moved = drag.moved || Math.abs(event.clientX - drag.x) + Math.abs(event.clientY - drag.y) > 3;
-    box.x = drag.box.x - dx;
-    box.y = drag.box.y - dy;
-    applyBox();
-  });
-  const stopDrag = event => {
-    if (!drag) return;
-    root.dataset.rkDragged = drag.moved ? 'true' : 'false';
-    drag = null;
-    if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
-  };
-  canvas.addEventListener('pointerup', stopDrag);
-  canvas.addEventListener('pointercancel', stopDrag);
 
-  const nodes = Array.from(root.querySelectorAll('[data-rk-id]'));
-  const byId = new Map(nodes.map(node => [node.dataset.rkId, node]));
-  const edges = Array.from(root.querySelectorAll('[data-rk-src][data-rk-dst]'));
-  const field = name => root.querySelector(`[data-rk-inspect-${name}]`);
-  const nodeName = id => {
-    const node = byId.get(id);
-    return node ? node.dataset.rkLabel : id;
-  };
-  const inspect = node => {
-    nodes.forEach(candidate => candidate.classList.toggle('is-inspected', candidate === node));
-    field('title').textContent = node.dataset.rkLabel;
-    field('kind').textContent = node.dataset.rkKind;
-    field('state').textContent = node.dataset.rkState;
-    field('detail').textContent = node.dataset.rkDetail;
-    const incoming = edges.filter(edge => edge.dataset.rkDst === node.dataset.rkId)
-                          .map(edge => nodeName(edge.dataset.rkSrc));
-    const outgoing = edges.filter(edge => edge.dataset.rkSrc === node.dataset.rkId)
-                          .map(edge => nodeName(edge.dataset.rkDst));
-    field('incoming').textContent = incoming.length ? incoming.join(' · ') : 'None';
-    field('outgoing').textContent = outgoing.length ? outgoing.join(' · ') : 'None';
-  };
-  nodes.forEach(node => {
-    node.addEventListener('click', () => {
-      if (root.dataset.rkDragged === 'true') {
-        root.dataset.rkDragged = 'false';
-        return;
-      }
-      inspect(node);
+  const libraries = window.__rkDagLibraries ||
+    (window.__rkDagLoadBundledLibraries && window.__rkDagLoadBundledLibraries()) ||
+    (window.__rkDagLibraries = (async () => {
+    await loadScript(
+      'https://unpkg.com/cytoscape@3.33.4/dist/cytoscape.min.js',
+      'sha256-vNg/DjHrF1AmqBHbbcHyS0MmAA7f+kAqENB0jFvlV7Q=',
+      () => Boolean(window.cytoscape),
+    );
+    await loadScript(
+      'https://unpkg.com/elkjs@0.9.3/lib/elk.bundled.js',
+      'sha256-sHRavX8jzZFpChWH43ftvhn9cjPHgzACkJNnIFRiFtQ=',
+      () => Boolean(window.ELK),
+    );
+    await loadScript(
+      'https://unpkg.com/cytoscape-elk@2.3.0/dist/cytoscape-elk.js',
+      'sha256-Jay7neqbDcb+8OebaXVH7lblefDhwirkNTEx5yx+FAo=',
+      hasElk,
+    );
+  })());
+
+  libraries.then(() => {
+    if (!hasElk()) throw new Error('ELK layout was not registered');
+    const horizontal = model.orientation === 'horizontal';
+    const isDark = () => document.documentElement.classList.contains('dark') ||
+      (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    const styleFor = dark => {
+      const palette = dark ? {
+        text:'#e5e7eb', muted:'#9ca3af', edge:'#718096', value:'#182235', recipe:'#1e293b',
+        selected:'#252b56', have:'#113b2d', want:'#492919', havewant:'#463a16', alternative:'#18202e'
+      } : {
+        text:'#172033', muted:'#64748b', edge:'#94a3b8', value:'#ffffff', recipe:'#f8fafc',
+        selected:'#eef2ff', have:'#ecfdf5', want:'#fff7ed', havewant:'#fffbeb', alternative:'#f8fafc'
+      };
+      return [
+        {selector:'node',style:{
+          'shape':'ellipse','width':156,'height':62,'padding':'4px',
+          'background-color':palette.value,'border-color':'#94a3b8','border-width':1.5,
+          'label':'data(label)','color':palette.text,'font-size':'12px','font-weight':600,
+          'font-family':'Inter, ui-sans-serif, system-ui, sans-serif','text-wrap':'wrap',
+          'text-max-width':'160px','text-valign':'center','text-halign':'center',
+          'min-zoomed-font-size':8,'transition-property':'opacity, border-width, border-color, background-color',
+          'transition-duration':'140ms'
+        }},
+        {selector:'node[kind = "recipe"]',style:{'shape':'round-rectangle','background-color':palette.recipe,'border-color':'#64748b'}},
+        {selector:'node[state = "selected"]',style:{'background-color':palette.selected,'border-color':'#4f46e5','border-width':2.2}},
+        {selector:'node[state = "have"]',style:{'background-color':palette.have,'border-color':'#10b981','border-width':2.2}},
+        {selector:'node[state = "want"]',style:{'background-color':palette.want,'border-color':'#f97316','border-width':2.2}},
+        {selector:'node[state = "havewant"]',style:{'background-color':palette.havewant,'border-color':'#eab308','border-width':2.2}},
+        {selector:'node[state = "alternative"]',style:{'background-color':palette.alternative,'border-color':'#94a3b8','border-style':'dashed'}},
+        {selector:'node[state = "effectful"]',style:{'background-color':dark ? '#471d25' : '#fff1f2','border-color':'#e11d48','border-style':'dashed'}},
+        {selector:'edge',style:{
+          'width':1.6,'line-color':palette.edge,'target-arrow-color':palette.edge,
+          'target-arrow-shape':'triangle','arrow-scale':.85,'curve-style':'taxi',
+          'taxi-direction':horizontal ? 'rightward' : 'downward','taxi-turn':24,
+          'taxi-turn-min-distance':10,'transition-property':'opacity, width, line-color, target-arrow-color',
+          'transition-duration':'140ms'
+        }},
+        {selector:'edge[state = "alternative"]',style:{'line-style':'dashed','line-color':'#94a3b8','target-arrow-color':'#94a3b8'}},
+        {selector:'.rk-focus',style:{'border-color':'#7c3aed','border-width':4,'z-index':20}},
+        {selector:'edge.rk-focus',style:{'line-color':'#7c3aed','target-arrow-color':'#7c3aed','width':3,'z-index':20}},
+        {selector:'.rk-neighbor',style:{'opacity':1}},
+        {selector:'.rk-dimmed',style:{'opacity':.16}}
+      ];
+    };
+    stage.hidden = false;
+    const cy = window.cytoscape({
+      container: stage,
+      elements: [...model.nodes, ...model.edges],
+      minZoom: .18,
+      maxZoom: 3.5,
+      boxSelectionEnabled: false,
+      style: styleFor(isDark())
     });
-    node.addEventListener('keydown', event => {
-      if (event.key === 'Enter' || event.key === ' ') {
-        event.preventDefault();
-        inspect(node);
+    const layout = cy.layout({
+      name:'elk', fit:true, padding:44, animate:false, nodeDimensionsIncludeLabels:true,
+      elk:{
+        'elk.algorithm':'layered','elk.direction':horizontal ? 'RIGHT' : 'DOWN',
+        'elk.edgeRouting':'ORTHOGONAL','elk.spacing.nodeNode':'38',
+        'elk.layered.spacing.nodeNodeBetweenLayers':'72',
+        'elk.layered.nodePlacement.strategy':'NETWORK_SIMPLEX',
+        'elk.layered.crossingMinimization.strategy':'LAYER_SWEEP'
       }
     });
+    const field = name => root.querySelector(`[data-rk-inspect-${name}]`);
+    const picker = root.querySelector('[data-rk-picker]');
+    const labelFor = collection => collection.map(item => item.data('label')).join(' · ');
+    const inspect = node => {
+      if (!node || node.empty()) return;
+      cy.elements().removeClass('rk-focus rk-neighbor rk-dimmed');
+      const neighborhood = node.closedNeighborhood();
+      cy.elements().difference(neighborhood).addClass('rk-dimmed');
+      neighborhood.addClass('rk-neighbor');
+      node.addClass('rk-focus');
+      node.connectedEdges().addClass('rk-focus');
+      field('title').textContent = node.data('label');
+      field('kind').textContent = node.data('kind');
+      field('state').textContent = node.data('state');
+      field('detail').textContent = node.data('detail');
+      const incoming = node.incomers('node');
+      const outgoing = node.outgoers('node');
+      field('incoming').textContent = incoming.length ? labelFor(incoming) : 'None';
+      field('outgoing').textContent = outgoing.length ? labelFor(outgoing) : 'None';
+      if (picker) picker.value = node.id();
+    };
+    const fit = () => { cy.resize(); cy.fit(undefined, 44); };
+    const home = () => {
+      fit();
+      if (cy.zoom() < .68) {
+        cy.zoom(.68);
+        cy.center();
+      }
+    };
+    const zoom = factor => {
+      const level = Math.max(cy.minZoom(), Math.min(cy.maxZoom(), cy.zoom() * factor));
+      cy.zoom({level, renderedPosition:{x:cy.width()/2,y:cy.height()/2}});
+    };
+    root.querySelector('[data-rk-fit]').addEventListener('click', fit);
+    root.querySelector('[data-rk-zoom-in]').addEventListener('click', () => zoom(1.22));
+    root.querySelector('[data-rk-zoom-out]').addEventListener('click', () => zoom(1/1.22));
+    if (picker) picker.addEventListener('change', () => inspect(cy.$id(picker.value)));
+    canvas.addEventListener('keydown', event => {
+      if (event.key === '+' || event.key === '=') { event.preventDefault(); zoom(1.22); }
+      else if (event.key === '-') { event.preventDefault(); zoom(1/1.22); }
+      else if (event.key === '0') { event.preventDefault(); fit(); }
+    });
+    cy.on('tap', 'node', event => inspect(event.target));
+    cy.on('tap', event => {
+      if (event.target !== cy) return;
+      cy.elements().removeClass('rk-focus rk-neighbor rk-dimmed');
+      if (picker) picker.value = '';
+    });
+    cy.one('layoutstop', () => {
+      stage.hidden = false;
+      fallback.hidden = true;
+      root.dataset.rkReady = 'true';
+      root.dataset.rkRenderer = 'cytoscape-elk';
+      requestAnimationFrame(home);
+      root.dispatchEvent(new CustomEvent('rk-dag:ready', {bubbles:true}));
+    });
+    layout.run();
+    root.rkDag = Object.freeze({
+      fit, zoomIn:() => zoom(1.22), zoomOut:() => zoom(1/1.22),
+      resize:() => requestAnimationFrame(home),
+      inspect:id => inspect(cy.$id(id)), renderer:'cytoscape-elk', cy
+    });
+  }).catch(error => {
+    root.dataset.rkReady = 'fallback';
+    root.dataset.rkRenderer = 'svg-fallback';
+    if (status) status.textContent = 'Static SVG fallback · interactive libraries unavailable';
+    console.warn('ReactiveKernels DAG enhancement failed', error);
   });
-  canvas.addEventListener('keydown', event => {
-    if (event.target !== canvas) return;
-    if (event.key === '+' || event.key === '=') { event.preventDefault(); zoom(.8); }
-    else if (event.key === '-') { event.preventDefault(); zoom(1.25); }
-    else if (event.key === '0') { event.preventDefault(); fit(); }
-  });
-
-  root.rkDag = Object.freeze({fit, zoomIn: () => zoom(.8), zoomOut: () => zoom(1.25),
-    inspect: id => { const node = byId.get(id); if (node) inspect(node); }});
 })();
 </script>
 """
@@ -597,22 +759,33 @@ function _write_html(io::IO, v::DAGVisualization; document::Bool = false)
     if document
         println(io, "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>$title</title></head><body style=\"margin:16px;background:#f8fafc\">")
     end
-    print(io, "<div class=\"rk-dag\" aria-label=\"Interactive $title\">", _DAG_HTML_STYLE)
+    print(io, "<div class=\"rk-dag\" data-rk-orientation=\"$(_xml_escape(v.orientation))\" aria-label=\"Interactive $title\">", _DAG_HTML_STYLE)
     print(io, "<div class=\"rk-dag-toolbar\" role=\"toolbar\" aria-label=\"DAG navigation\">",
+          "<div class=\"rk-dag-heading\"><span class=\"rk-dag-mark\" aria-hidden=\"true\"></span>",
+          "<strong class=\"rk-dag-title\">$title</strong>",
+          "<span class=\"rk-dag-engine\">Cytoscape · ELK</span></div>",
+          "<div class=\"rk-dag-controls\"><button type=\"button\" data-rk-zoom-out aria-label=\"Zoom out\">−</button>",
           "<button type=\"button\" data-rk-fit>Fit</button>",
-          "<button type=\"button\" data-rk-zoom-in>Zoom in</button>",
-          "<button type=\"button\" data-rk-zoom-out>Zoom out</button>",
-          "<span class=\"rk-dag-hint\">Drag to pan · scroll to zoom · select a node to inspect</span></div>")
-    print(io, "<div class=\"rk-dag-workspace\"><div class=\"rk-dag-canvas\" data-rk-canvas tabindex=\"0\" aria-label=\"DAG canvas; use plus, minus, and zero keys to zoom and fit\">")
+          "<button type=\"button\" data-rk-zoom-in aria-label=\"Zoom in\">+</button></div>",
+          "<span class=\"rk-dag-status\" data-rk-status>Loading interactive graph…</span></div>")
+    print(io, "<div class=\"rk-dag-workspace\"><div class=\"rk-dag-canvas\" data-rk-canvas tabindex=\"0\" role=\"application\" aria-label=\"Interactive DAG; drag to pan, scroll to zoom, and select a node to inspect\">",
+          "<div class=\"rk-dag-stage\" data-rk-stage hidden></div><div class=\"rk-dag-fallback\" data-rk-fallback>")
     _write_svg(io, v)
-    print(io, "</div><aside class=\"rk-dag-inspector\" aria-live=\"polite\" aria-label=\"Node inspector\">",
+    print(io, "</div></div><aside class=\"rk-dag-inspector\" aria-live=\"polite\" aria-label=\"Node inspector\">",
+          "<label class=\"rk-dag-picker\">Inspect node<select data-rk-picker><option value=\"\">Choose a value or recipe</option>")
+    for node in model.nodes
+        print(io, "<option value=\"$(_xml_escape(node.id))\">$(_xml_escape(node.label))</option>")
+    end
+    print(io, "</select></label>",
           "<h3 data-rk-inspect-title>Select a value or recipe</h3>",
           "<dl><dt>Kind</dt><dd data-rk-inspect-kind class=\"rk-muted\">—</dd>",
           "<dt>State</dt><dd data-rk-inspect-state class=\"rk-muted\">—</dd>",
           "<dt>Details</dt><dd data-rk-inspect-detail class=\"rk-muted\">—</dd>",
           "<dt>Incoming</dt><dd data-rk-inspect-incoming class=\"rk-muted\">—</dd>",
           "<dt>Outgoing</dt><dd data-rk-inspect-outgoing class=\"rk-muted\">—</dd></dl></aside></div>",
-          _DAG_HTML_SCRIPT, "</div>")
+          "<script type=\"application/json\" data-rk-model>")
+    _write_html_model(io, model, v.orientation)
+    print(io, "</script>", _DAG_HTML_SCRIPT, "</div>")
     document && print(io, "</body></html>")
 end
 
@@ -624,10 +797,10 @@ Base.show(io::IO, mime::MIME"text/html", x::Union{Graph,Plan}) =
     save_visualization(path, graph_or_plan; alternatives=false, orientation=:horizontal)
     save_visualization(path, visualization)
 
-Write a visualization to `.html`, `.svg`, `.dot`, or `.gv`. HTML is a
-self-contained interactive document, SVG is its dependency-free static base,
-and DOT preserves the graph for Graphviz and other compatible tools. Returns
-`path`.
+Write a visualization to `.html`, `.svg`, `.dot`, or `.gv`. HTML loads pinned
+Cytoscape.js + ELK assets when its host has not bundled them and always carries
+a self-contained SVG fallback. SVG is the dependency-free static surface, and
+DOT preserves the graph for Graphviz and other compatible tools. Returns `path`.
 """
 function save_visualization(path::AbstractString, v::DAGVisualization)
     ext = lowercase(splitext(path)[2])

@@ -19,8 +19,8 @@ end
 function Base.show(io::IO, mime::MIME"text/html", result::HTMLResult)
     html = sprint(show, mime, result.content; context = io)
     # DocumenterVitepress places HTML results inside a JavaScript template
-    # literal. Preserve backslashes across that boundary so expressions such
-    # as the DAG script's /\s+/ regular expression reach the browser intact.
+    # literal. Preserve backslashes across that boundary so embedded scripts,
+    # JSON escapes, and regular expressions reach the browser intact.
     print(io, replace(html, "\\" => "\\\\"))
 end
 
@@ -52,7 +52,10 @@ function _generated_source(expr::Expr)
 end
 
 function _dag_html(plan::Plan)
-    view = visualize(plan)
+    # The docs content column is deliberately narrow. A top-to-bottom layout
+    # keeps labels readable there without changing the public API's horizontal
+    # default for wider notebook and standalone surfaces.
+    view = visualize(plan; orientation = :vertical)
     mime = MIME"text/html"()
     showable(mime, view) || error(
         "visualize(plan) must provide the interactive text/html docs surface",
