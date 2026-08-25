@@ -22,6 +22,7 @@ import './style.css' // You could setup your own, or else a default will be copi
 import './docstrings.css' // You could setup your own, or else a default will be copied.
 import Banner from '@/Banner.vue'
 import './overrides.css' // You could setup your own, or else a default will be copied.
+import { setupKernelExamples } from './kernel-example'
 
 // `v-exec-scripts` runs the <script> tags inside a `v-html`'d block: innerHTML never executes
 // scripts, so we re-create each one. `src` scripts are awaited so order holds (bundle before
@@ -63,6 +64,7 @@ export const Theme: ThemeConfig = {
     app.component('VersionPicker', VersionPicker);
     app.component('AuthorBadge', AuthorBadge)
     app.component('Authors', Authors)
+    setupKernelExamples()
 
     // Execute the scripts inside interactive `text/html` outputs (WGLMakie/Bonito, Plotly, …)
     // once their `<ClientOnly>` wrapper has mounted on the client. `mounted` fires on the
