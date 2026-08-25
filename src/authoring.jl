@@ -12,8 +12,9 @@ consumed by the planner, `ports` maps author-facing names to graph [`Value`](@re
 objects, and `inputs(spec)` / `outputs(spec)` report the default have/want
 boundary declared by [`@kernel`](@ref).
 
-Look up a named port with `spec.name` or `spec[:name]`. `spec.graph` is the
-underlying graph; a port literally named `graph` therefore uses bracket lookup.
+Look up a named port with `spec.name` or `spec[:name]`. Dot names matching a
+`KernelSpec` storage field (`graph`, `ports`, `port_order`, `have_names`, or
+`want_names`) return that field; a colliding port therefore uses bracket lookup.
 Planning and preparation accept either port names or `Value`s in their `have`
 and `want` overrides.
 """
@@ -43,8 +44,7 @@ function Base.getproperty(spec::KernelSpec, name::Symbol)
 end
 
 function Base.propertynames(spec::KernelSpec, private::Bool = false)
-    names = private ? (fieldnames(KernelSpec)..., spec.port_order...) :
-                      (:graph, spec.port_order...)
+    names = (fieldnames(KernelSpec)..., spec.port_order...)
     Tuple(unique(names))
 end
 
@@ -151,134 +151,276 @@ function _kernel_function_parameters!(names::Set{Symbol}, signature)
     names
 end
 
-# Julia function bodies are hard scopes: a plain local assignment anywhere in
-# the body makes that name local throughout the body, including sibling begin
-# blocks and branches. Find those binders before inferring graph dependencies.
-# Nested hard scopes own their bindings and are intentionally not descended.
-function _kernel_scope_locals!(names::Set{Symbol}, ex)
-    ex isa Expr || return names
-    ex.head in (:quote, :->, :function, :let, :generator, :comprehension) &&
-        return names
-    if ex.head === :(=)
-        _kernel_assignment_names!(names, ex.args[1])
-        _kernel_scope_locals!(names, ex.args[2])
-        return names
-    elseif ex.head in (:local, :global)
-        for declaration in ex.args
-            if declaration isa Expr && declaration.head === :(=)
-                _kernel_assignment_names!(names, declaration.args[1])
-                _kernel_scope_locals!(names, declaration.args[2])
-            else
-                _kernel_assignment_names!(names, declaration)
-            end
-        end
-        return names
-    end
-    for arg in ex.args
-        _kernel_scope_locals!(names, arg)
+function _kernel_function_name!(names::Set{Symbol}, signature)
+    if signature isa Expr && signature.head in (:(::), :where)
+        _kernel_function_name!(names, signature.args[1])
+    elseif signature isa Expr && signature.head === :call
+        signature.args[1] isa Symbol && push!(names, signature.args[1])
+    elseif signature isa Symbol
+        push!(names, signature)
     end
     names
 end
 
-function _kernel_free_ports!(out::Vector{Symbol}, seen::Set{Symbol}, ex,
-                             known::Set{Symbol}, bound::Set{Symbol})
-    if ex isa Symbol
-        if ex in known && !(ex in bound) && !(ex in seen)
-            push!(out, ex)
-            push!(seen, ex)
-        end
-        return out
-    end
-    (ex isa Expr) || return out
-    ex.head === :quote && return out
+_kernel_iterators(ex::Expr) = ex.head === :block ? ex.args : (ex,)
 
-    if ex.head === :->
-        local_bound = copy(bound)
-        _kernel_bound_names!(local_bound, ex.args[1])
-        _kernel_scope_locals!(local_bound, ex.args[2])
-        _kernel_free_ports!(out, seen, ex.args[2], known, local_bound)
-        return out
+# Precollect only lexical declarations owned by the current hard scope. Plain
+# assignments are handled in statement order below; nested loop/catch/function
+# scopes must not turn a conditional write into an unconditional shadow.
+function _kernel_explicit_locals!(names::Set{Symbol}, ex)
+    ex isa Expr || return names
+    ex.head === :quote && return names
+    if ex.head === :function
+        _kernel_function_name!(names, ex.args[1])
+        return names
+    elseif ex.head === :(=) && ex.args[1] isa Expr &&
+           ex.args[1].head in (:call, :where)
+        _kernel_function_name!(names, ex.args[1])
+        return names
+    elseif ex.head in (:local, :global)
+        for declaration in ex.args
+            target = declaration isa Expr && declaration.head === :(=) ?
+                     declaration.args[1] : declaration
+            _kernel_assignment_names!(names, target)
+        end
+        return names
+    elseif ex.head in (:->, :let, :generator, :comprehension,
+                       :for, :while, :try)
+        return names
+    end
+    for arg in ex.args
+        _kernel_explicit_locals!(names, arg)
+    end
+    names
+end
+
+function _kernel_port_read!(out::Vector{Symbol}, seen::Set{Symbol}, name::Symbol,
+                            known::Set{Symbol}, assigned::Set{Symbol},
+                            hidden::Set{Symbol})
+    if name in known && !(name in assigned) && !(name in hidden) && !(name in seen)
+        push!(out, name)
+        push!(seen, name)
+    end
+    assigned
+end
+
+function _kernel_free_ports_flow!(out::Vector{Symbol}, seen::Set{Symbol}, ex,
+                                  known::Set{Symbol}, assigned::Set{Symbol},
+                                  hidden::Set{Symbol})
+    ex isa Symbol && return _kernel_port_read!(
+        out, seen, ex, known, assigned, hidden,
+    )
+    ex isa Expr || return assigned
+    ex.head === :quote && return assigned
+
+    if ex.head === :block
+        for statement in ex.args
+            _kernel_free_ports_flow!(out, seen, statement, known, assigned, hidden)
+        end
     elseif ex.head === :kw
-        # The first argument is a keyword or named-tuple label, not a value
-        # reference. Only its value expression can depend on graph ports.
-        _kernel_free_ports!(out, seen, ex.args[2], known, bound)
-        return out
+        _kernel_free_ports_flow!(out, seen, ex.args[2], known, assigned, hidden)
     elseif ex.head === :.
-        # Property names are normally QuoteNodes, but treating this form
-        # explicitly also keeps a future parser representation from turning a
-        # field label into a graph edge.
-        _kernel_free_ports!(out, seen, ex.args[1], known, bound)
+        _kernel_free_ports_flow!(out, seen, ex.args[1], known, assigned, hidden)
         if length(ex.args) > 1 && !(ex.args[2] isa QuoteNode) &&
            !(ex.args[2] isa Symbol)
-            _kernel_free_ports!(out, seen, ex.args[2], known, bound)
+            _kernel_free_ports_flow!(out, seen, ex.args[2], known, assigned, hidden)
         end
-        return out
-    elseif ex.head === :let
-        local_bound = copy(bound)
-        for binding in ex.args[1:end-1]
-            if binding isa Expr && (binding.head === :(=) || binding.head === :kw)
-                _kernel_free_ports!(out, seen, binding.args[2], known, local_bound)
-                _kernel_bound_names!(local_bound, binding.args[1])
+    elseif ex.head === :(=) && ex.args[1] isa Expr &&
+           ex.args[1].head in (:call, :where)
+        function_names = Set{Symbol}()
+        _kernel_function_parameters!(function_names, ex.args[1])
+        body_hidden = union(copy(hidden), function_names)
+        _kernel_explicit_locals!(body_hidden, ex.args[2])
+        _kernel_free_ports_flow!(
+            out, seen, ex.args[2], known, Set{Symbol}(), body_hidden,
+        )
+        union!(assigned, function_names)
+    elseif ex.head === :(=)
+        # Targets are binding syntax, not reads; the RHS is evaluated before
+        # the target becomes definitely assigned, so `a = a + 1` retains `a`.
+        _kernel_free_ports_flow!(out, seen, ex.args[2], known, assigned, hidden)
+        written = Set{Symbol}()
+        _kernel_assignment_names!(written, ex.args[1])
+        union!(assigned, written)
+    elseif ex.head in (:local, :global)
+        for declaration in ex.args
+            if declaration isa Expr && declaration.head === :(=)
+                _kernel_free_ports_flow!(
+                    out, seen, declaration.args[2], known, assigned, hidden,
+                )
+                _kernel_assignment_names!(assigned, declaration.args[1])
             else
-                _kernel_bound_names!(local_bound, binding)
+                _kernel_assignment_names!(assigned, declaration)
             end
         end
-        _kernel_scope_locals!(local_bound, ex.args[end])
-        _kernel_free_ports!(out, seen, ex.args[end], known, local_bound)
-        return out
+    elseif ex.head === :if
+        _kernel_free_ports_flow!(out, seen, ex.args[1], known, assigned, hidden)
+        incoming = copy(assigned)
+        then_assigned = copy(incoming)
+        _kernel_free_ports_flow!(
+            out, seen, ex.args[2], known, then_assigned, hidden,
+        )
+        else_assigned = copy(incoming)
+        if length(ex.args) >= 3 && ex.args[3] !== nothing
+            _kernel_free_ports_flow!(
+                out, seen, ex.args[3], known, else_assigned, hidden,
+            )
+        end
+        empty!(assigned)
+        union!(assigned, intersect(then_assigned, else_assigned))
+    elseif ex.head in (:&&, :||)
+        _kernel_free_ports_flow!(out, seen, ex.args[1], known, assigned, hidden)
+        branch_assigned = copy(assigned)
+        _kernel_free_ports_flow!(
+            out, seen, ex.args[2], known, branch_assigned, hidden,
+        )
+    elseif ex.head === :for
+        loop_hidden = copy(hidden)
+        for iterator in _kernel_iterators(ex.args[1])
+            if iterator isa Expr && iterator.head in (:(=), :in)
+                _kernel_free_ports_flow!(
+                    out, seen, iterator.args[2], known, assigned, loop_hidden,
+                )
+                iterator_names = Set{Symbol}()
+                _kernel_bound_names!(iterator_names, iterator.args[1])
+                union!(loop_hidden, iterator_names)
+            else
+                _kernel_free_ports_flow!(
+                    out, seen, iterator, known, assigned, loop_hidden,
+                )
+            end
+        end
+        body_hidden = copy(loop_hidden)
+        _kernel_explicit_locals!(body_hidden, ex.args[2])
+        _kernel_free_ports_flow!(
+            out, seen, ex.args[2], known, copy(assigned), body_hidden,
+        )
+    elseif ex.head === :while
+        _kernel_free_ports_flow!(out, seen, ex.args[1], known, assigned, hidden)
+        body_hidden = copy(hidden)
+        _kernel_explicit_locals!(body_hidden, ex.args[2])
+        _kernel_free_ports_flow!(
+            out, seen, ex.args[2], known, copy(assigned), body_hidden,
+        )
     elseif ex.head === :generator || ex.head === :comprehension
-        # Generators store their body first and iterator bindings afterwards.
-        # Walk iterator domains before extending the local binding set, then
-        # visit the body with all generator-local names hidden.
         args = ex.head === :comprehension && length(ex.args) == 1 &&
                ex.args[1] isa Expr && ex.args[1].head === :generator ?
                ex.args[1].args : ex.args
-        local_bound = copy(bound)
+        generator_hidden = copy(hidden)
+        generator_assigned = copy(assigned)
         for iterator in args[2:end]
             if iterator isa Expr && iterator.head in (:(=), :in)
-                _kernel_free_ports!(out, seen, iterator.args[2], known, local_bound)
-                _kernel_bound_names!(local_bound, iterator.args[1])
+                _kernel_free_ports_flow!(
+                    out, seen, iterator.args[2], known,
+                    generator_assigned, generator_hidden,
+                )
+                iterator_names = Set{Symbol}()
+                _kernel_bound_names!(iterator_names, iterator.args[1])
+                union!(generator_hidden, iterator_names)
             else
-                _kernel_free_ports!(out, seen, iterator, known, local_bound)
+                _kernel_free_ports_flow!(
+                    out, seen, iterator, known,
+                    generator_assigned, generator_hidden,
+                )
             end
         end
-        _kernel_free_ports!(out, seen, args[1], known, local_bound)
-        return out
-    elseif ex.head === :for
-        local_bound = copy(bound)
-        iterator = ex.args[1]
-        if iterator isa Expr && iterator.head in (:(=), :in)
-            _kernel_free_ports!(out, seen, iterator.args[2], known, local_bound)
-            _kernel_bound_names!(local_bound, iterator.args[1])
+        _kernel_explicit_locals!(generator_hidden, args[1])
+        _kernel_free_ports_flow!(
+            out, seen, args[1], known, generator_assigned, generator_hidden,
+        )
+    elseif ex.head === :let
+        let_hidden = copy(hidden)
+        let_assigned = copy(assigned)
+        for binding in ex.args[1:end-1]
+            if binding isa Expr && binding.head in (:(=), :kw)
+                _kernel_free_ports_flow!(
+                    out, seen, binding.args[2], known, let_assigned, let_hidden,
+                )
+                binding_names = Set{Symbol}()
+                _kernel_bound_names!(binding_names, binding.args[1])
+                union!(let_hidden, binding_names)
+                union!(let_assigned, binding_names)
+            else
+                _kernel_bound_names!(let_hidden, binding)
+                _kernel_bound_names!(let_assigned, binding)
+            end
         end
-        _kernel_free_ports!(out, seen, ex.args[2], known, local_bound)
-        return out
+        _kernel_explicit_locals!(let_hidden, ex.args[end])
+        _kernel_free_ports_flow!(
+            out, seen, ex.args[end], known, let_assigned, let_hidden,
+        )
+    elseif ex.head === :->
+        function_hidden = copy(hidden)
+        _kernel_bound_names!(function_hidden, ex.args[1])
+        _kernel_explicit_locals!(function_hidden, ex.args[2])
+        _kernel_free_ports_flow!(
+            out, seen, ex.args[2], known, Set{Symbol}(), function_hidden,
+        )
     elseif ex.head === :function
-        local_bound = copy(bound)
-        _kernel_function_parameters!(local_bound, ex.args[1])
-        _kernel_scope_locals!(local_bound, ex.args[2])
-        _kernel_free_ports!(out, seen, ex.args[2], known, local_bound)
-        return out
-    elseif ex.head === :(=) && ex.args[1] isa Expr &&
-           ex.args[1].head in (:call, :where)
-        local_bound = copy(bound)
-        _kernel_function_parameters!(local_bound, ex.args[1])
-        _kernel_scope_locals!(local_bound, ex.args[2])
-        _kernel_free_ports!(out, seen, ex.args[2], known, local_bound)
-        return out
+        function_hidden = copy(hidden)
+        function_names = Set{Symbol}()
+        _kernel_function_parameters!(function_names, ex.args[1])
+        union!(function_hidden, function_names)
+        _kernel_explicit_locals!(function_hidden, ex.args[2])
+        _kernel_free_ports_flow!(
+            out, seen, ex.args[2], known, Set{Symbol}(), function_hidden,
+        )
+        union!(assigned, function_names)
+    elseif ex.head === :try
+        incoming = copy(assigned)
+        try_hidden = copy(hidden)
+        _kernel_explicit_locals!(try_hidden, ex.args[1])
+        _kernel_free_ports_flow!(
+            out, seen, ex.args[1], known, copy(incoming), try_hidden,
+        )
+        if length(ex.args) >= 3 && ex.args[3] !== false
+            catch_hidden = copy(hidden)
+            ex.args[2] !== false && _kernel_bound_names!(catch_hidden, ex.args[2])
+            _kernel_explicit_locals!(catch_hidden, ex.args[3])
+            _kernel_free_ports_flow!(
+                out, seen, ex.args[3], known, copy(incoming), catch_hidden,
+            )
+        end
+        if length(ex.args) >= 4 && ex.args[4] !== false
+            finally_hidden = copy(hidden)
+            _kernel_explicit_locals!(finally_hidden, ex.args[4])
+            _kernel_free_ports_flow!(
+                out, seen, ex.args[4], known, copy(incoming), finally_hidden,
+            )
+        end
+    else
+        for arg in ex.args
+            _kernel_free_ports_flow!(out, seen, arg, known, assigned, hidden)
+        end
     end
-
-    for arg in ex.args
-        _kernel_free_ports!(out, seen, arg, known, bound)
-    end
-    out
+    assigned
 end
 
 function _kernel_free_ports(ex, known::Set{Symbol})
     out = Symbol[]
-    bound = Set{Symbol}()
-    _kernel_scope_locals!(bound, ex)
-    _kernel_free_ports!(out, Set{Symbol}(), ex, known, bound)
+    hidden = Set{Symbol}()
+    _kernel_explicit_locals!(hidden, ex)
+    _kernel_free_ports_flow!(
+        out, Set{Symbol}(), ex, known, Set{Symbol}(), hidden,
+    )
+    out
+end
+
+function _kernel_hygienic_catches(ex, known::Set{Symbol})
+    ex isa Expr || return ex
+    ex.head === :quote && return ex
+    if ex.head === :try
+        args = Any[_kernel_hygienic_catches(arg, known) for arg in ex.args]
+        if length(args) >= 3 && args[2] isa Symbol && args[2] in known &&
+           args[3] !== false
+            original = args[2]
+            fresh = gensym(original)
+            args[2] = fresh
+            args[3] = Expr(:let, Expr(:(=), original, fresh), args[3])
+        end
+        return Expr(:try, args...)
+    end
+    Expr(ex.head, (_kernel_hygienic_catches(arg, known) for arg in ex.args)...)
 end
 
 function _kernel_recipe(ex)
@@ -321,7 +463,7 @@ function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol})
         callee = rhs.args[1]
         args = rhs.args[2:end]
         callee_is_port = callee isa Symbol && callee in known
-        if !callee_is_port && length(args) == length(deps) &&
+        if callee isa Symbol && !callee_is_port && length(args) == length(deps) &&
            all(i -> args[i] === deps[i], eachindex(args))
             return callee
         end
@@ -435,7 +577,8 @@ function _kernel_expand(block)
     body = Any[]
     for entry in entries
         entry[1] === :recipe || continue
-        _, outputs, rhs, metadata = entry
+        _, outputs, authored_rhs, metadata = entry
+        rhs = _kernel_hygienic_catches(authored_rhs, known)
         deps = _kernel_free_ports(rhs, known)
         dep_values = Expr(:tuple, (port_vars[name] for name in deps)...)
         out_values = Expr(:tuple, (port_vars[name] for (name, _) in outputs)...)
@@ -506,9 +649,13 @@ function _kernel_selection(spec::KernelSpec, selection, defaults::Vector{Symbol}
         if item isa Symbol
             push!(values, spec[item])
         elseif item isa Value
-            haskey(spec.graph.values, item.id) || throw(ArgumentError(
+            owned = get(spec.graph.values, item.id, nothing)
+            if owned === nothing || typeof(owned) !== typeof(item) ||
+               owned.id != item.id || owned.name !== item.name
+                throw(ArgumentError(
                 "$label value $(item) does not belong to this KernelSpec"))
-            push!(values, item)
+            end
+            push!(values, owned)
         else
             throw(ArgumentError(
                 "$label entries must be port names or Value objects, got $(repr(item))"))

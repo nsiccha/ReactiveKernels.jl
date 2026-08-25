@@ -55,6 +55,18 @@ qualified_global() = @kernel begin
 end
 end
 
+module AuthoringComputedCalleeFixture
+struct CallableSource
+    calls::Base.RefValue{Int}
+end
+
+function Base.getproperty(source::CallableSource, name::Symbol)
+    name === :op || return getfield(source, name)
+    getfield(source, :calls)[] += 1
+    identity
+end
+end
+
 @testset "Declarative kernel authoring" begin
     @testset "typed ports, zero-execution construction, and metadata" begin
         calls = Ref(0)
@@ -96,6 +108,51 @@ end
         @test only_a(9.0) == 9.0
         @test inputs(only_a) == (spec[:x],)
         @test outputs(only_a) == (spec[:a],)
+
+        explicit_values = prepare(spec; have = spec.x, want = spec.out)
+        @test explicit_values(2.0) == 7.0
+        forged_have_name = Value{Float64}(spec.x.id, :forged)
+        forged_have_type = Value{Int}(spec.x.id, spec.x.name)
+        forged_want_name = Value{Float64}(spec.out.id, :forged)
+        forged_want_type = Value{Int}(spec.out.id, spec.out.name)
+        @test_throws ArgumentError prepare(
+            spec; have = forged_have_name, want = spec.out,
+        )
+        @test_throws ArgumentError prepare(
+            spec; have = forged_have_type, want = spec.out,
+        )
+        @test_throws ArgumentError prepare(
+            spec; have = spec.x, want = forged_want_name,
+        )
+        @test_throws ArgumentError prepare(
+            spec; have = spec.x, want = forged_want_type,
+        )
+
+        computed_calls = Ref(0)
+        makeop() = (computed_calls[] += 1; identity)
+        computed_callee = @kernel begin
+            x::Int
+            y::Int = makeop()(x)
+            return y
+        end
+        @test computed_calls[] == 0
+        computed_kernel = prepare(computed_callee)
+        @test computed_calls[] == 0
+        @test computed_kernel(3) == 3
+        @test computed_calls[] == 1
+
+        property_calls = Ref(0)
+        callable_source = AuthoringComputedCalleeFixture.CallableSource(property_calls)
+        property_callee = @kernel begin
+            x::Int
+            y::Int = callable_source.op(x)
+            return y
+        end
+        @test property_calls[] == 0
+        property_kernel = prepare(property_callee)
+        @test property_calls[] == 0
+        @test property_kernel(4) == 4
+        @test property_calls[] == 1
     end
 
     @testset "caller scope and dependency hygiene" begin
@@ -123,8 +180,27 @@ end
         @test field_collision.graph === kernel_graph(field_collision)
         @test field_collision[:graph] isa Value{Int}
         @test :graph in propertynames(field_collision)
-        @test count(===(:graph), propertynames(field_collision)) == 1
+        @test count(name -> name === :graph, propertynames(field_collision)) == 1
         @test prepare(field_collision)(2) == 3
+
+        storage_collision = @kernel begin
+            ports::Int
+            port_order::Int
+            have_names::Int
+            want_names::Int
+            out::Int = ports + port_order + have_names + want_names
+            return out
+        end
+        @test storage_collision.ports isa Dict
+        @test storage_collision.port_order isa Vector{Symbol}
+        @test storage_collision.have_names isa Vector{Symbol}
+        @test storage_collision.want_names isa Vector{Symbol}
+        for name in (:ports, :port_order, :have_names, :want_names)
+            @test storage_collision[name] isa Value{Int}
+            @test name in propertynames(storage_collision)
+            @test count(==(name), propertynames(storage_collision)) == 1
+        end
+        @test prepare(storage_collision)(1, 2, 3, 4) == 10
 
         @test prepare(AuthoringNameCollisionFixture.make_module_spec())(2) == 3
         @test prepare(AuthoringNameCollisionFixture.make_local_spec(1, 2))(2) == 4
@@ -192,6 +268,168 @@ end
         @test isempty(shadow_recipes[3].inputs)
         @test isempty(shadow_recipes[4].inputs)
         @test prepare(shadowed)(1) == (5, 6, 9, 11)
+
+        long_form_function = @kernel begin
+            source::Int
+            @recipe (effectful = true) a::Int = source + 100
+            result::Int = begin
+                function a(x)
+                    x + 8
+                end
+                a(1)
+            end
+            return result
+        end
+        @test isempty(kernel_graph(long_form_function).recipes[2].inputs)
+        @test prepare(long_form_function)(1) == 9
+
+        for_scope = @kernel begin
+            i::Int
+            y::Int = begin
+                before = i
+                for i in 1:2
+                    nothing
+                end
+                before + i
+            end
+            return y
+        end
+        @test Tuple(v.name for v in only(kernel_graph(for_scope).recipes).inputs) == (:i,)
+        @test prepare(for_scope)(10) == 20
+
+        generator_scope = @kernel begin
+            i::Int
+            y::Int = sum(i for i in 1:2) + i
+            return y
+        end
+        @test Tuple(v.name for v in only(kernel_graph(generator_scope).recipes).inputs) ==
+              (:i,)
+        @test prepare(generator_scope)(10) == 13
+
+        while_scope = @kernel begin
+            a::Int
+            y::Int = begin
+                before = a
+                while false
+                    a = 1
+                end
+                before + a
+            end
+            return y
+        end
+        @test Tuple(v.name for v in only(kernel_graph(while_scope).recipes).inputs) ==
+              (:a,)
+        @test prepare(while_scope)(10) == 20
+
+        catch_only = @kernel begin
+            source::Int
+            @recipe (effectful = true) a::Int = source + 100
+            caught::Int = try
+                error("expected")
+            catch a
+                5
+            end
+            return caught
+        end
+        @test isempty(kernel_graph(catch_only).recipes[2].inputs)
+        @test prepare(catch_only)(1) == 5
+
+        catch_outer = @kernel begin
+            a::Int
+            y::Int = begin
+                caught = try
+                    error("expected")
+                catch a
+                    5
+                end
+                caught + a
+            end
+            return y
+        end
+        @test Tuple(v.name for v in only(kernel_graph(catch_outer).recipes).inputs) ==
+              (:a,)
+        @test prepare(catch_outer)(10) == 15
+
+        no_read_assignment = @kernel begin
+            source::Int
+            @recipe (effectful = true) a::Int = source + 100
+            y::Int = begin
+                a = 4
+                5
+            end
+            return y
+        end
+        @test isempty(kernel_graph(no_read_assignment).recipes[2].inputs)
+        @test prepare(no_read_assignment)(1) == 5
+
+        read_modify_assignment = @kernel begin
+            a::Int
+            y::Int = begin
+                a = a + 1
+                a
+            end
+            return y
+        end
+        @test Tuple(
+            v.name for v in only(kernel_graph(read_modify_assignment).recipes).inputs
+        ) == (:a,)
+        @test prepare(read_modify_assignment)(10) == 11
+
+        one_branch_assignment = @kernel begin
+            a::Int
+            flag::Bool
+            y::Int = begin
+                if flag
+                    a = 4
+                end
+                a + 1
+            end
+            return y
+        end
+        @test Set(v.name for v in only(
+            kernel_graph(one_branch_assignment).recipes,
+        ).inputs) == Set((:a, :flag))
+        @test prepare(one_branch_assignment)(2, false) == 3
+        @test prepare(one_branch_assignment)(2, true) == 5
+
+        both_branch_assignment = @kernel begin
+            a::Int
+            flag::Bool
+            y::Int = begin
+                if flag
+                    a = 4
+                else
+                    a = 5
+                end
+                a + 1
+            end
+            return y
+        end
+        @test Tuple(v.name for v in only(
+            kernel_graph(both_branch_assignment).recipes,
+        ).inputs) == (:flag,)
+        @test prepare(both_branch_assignment; have = :flag)(true) == 5
+        @test prepare(both_branch_assignment; have = :flag)(false) == 6
+
+        read_before_branch_assignment = @kernel begin
+            a::Int
+            flag::Bool
+            y::Int = begin
+                before = a
+                if flag
+                    a = 4
+                else
+                    a = 5
+                end
+                before + a
+            end
+            return y
+        end
+        @test Set(v.name for v in only(
+            kernel_graph(read_before_branch_assignment).recipes,
+        ).inputs) == Set((:a, :flag))
+        @test prepare(read_before_branch_assignment)(2, true) == 6
+        @test prepare(read_before_branch_assignment)(2, false) == 7
     end
 
     @testset "pure named-port composition and explicit boundaries" begin
