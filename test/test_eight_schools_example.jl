@@ -72,4 +72,16 @@ using .EightSchoolsExample
         @test prediction.θ == 2.0
         @test prediction.y == -10.0
     end
+
+    @testset "invalid constrained inputs fail explicitly" begin
+        parameters = EightSchoolsParameters(1.0, 4.0, ntuple(_ -> 2.0, 8))
+        bad_scales = (0.0, EIGHT_SCHOOLS_SIGMA[2:end]...)
+
+        @test_throws DomainError EightSchoolsExample.pointwise_log_likelihood(
+            parameters, EIGHT_SCHOOLS_Y, bad_scales)
+        @test_throws DomainError EightSchoolsExample.predict_new_group(
+            parameters, 0.0, (0.25, -1.0))
+        @test_throws DomainError EightSchoolsExample.log_prior(
+            EightSchoolsParameters(1.0, 0.0, ntuple(_ -> 2.0, 8)))
+    end
 end
