@@ -49,6 +49,42 @@ using ReactiveKernels
         @test length(kernel.plan.recipes) == 3
     end
 
+    @testset "effectful HMC diagnostics never alias pure oracle results" begin
+        # ReactiveHMC-style oracle wrappers often share a stable cache key even
+        # when one wrapper exists only to log a diagnostic.  The effect marker
+        # is part of recipe identity: the pure result must remain plannable and
+        # the diagnostic result must remain rejected, in either insertion order.
+        for effectful_first in (false, true)
+            graph = Graph()
+            pos = value!(graph, :pos, Float64)
+            potential = value!(graph, :potential, Float64)
+            logged_potential = value!(graph, :logged_potential, Float64)
+            pure = () -> add!(
+                graph, pos => potential, abs2; cse_key = :potential_oracle,
+            )
+            diagnostic = () -> add!(
+                graph, pos => logged_potential, abs2;
+                cse_key = :potential_oracle, effectful = true,
+            )
+
+            if effectful_first
+                diagnostic()
+                pure()
+            else
+                pure()
+                diagnostic()
+            end
+
+            @test length(graph.recipes) == 2
+            @test prepare(
+                graph; have = (pos,), want = (potential,),
+            )(3.0) == 9.0
+            @test_throws PlanningError plan(
+                graph; have = (pos,), want = (logged_potential,),
+            )
+        end
+    end
+
     @testset "nested reactive provenance remains valid" begin
         graph = Graph()
         x = value!(graph, :x, Float64)
