@@ -2,8 +2,25 @@
 using ReactiveKernels
 using Test
 
-# Helper: does the generated Expr mention a call to op index `k`?
-calls_opindex(ast, k) = occursin("__ops__[$k]", string(ast))
+# Positional operations deliberately have no global names in lowered code.
+# Inspect the Expr structurally so generated-code assertions prove exactly
+# which operation slots are called instead of searching for absent op names.
+function op_call_indices(ast)
+    indices = Int[]
+    function visit(node)
+        node isa Expr || return
+        if node.head === :call && node.args[1] isa Expr
+            callee = node.args[1]
+            if callee.head === :ref && length(callee.args) == 2 &&
+               callee.args[1] === :__ops__ && callee.args[2] isa Int
+                push!(indices, callee.args[2])
+            end
+        end
+        foreach(visit, node.args)
+    end
+    visit(ast)
+    indices
+end
 
 @testset "Phase 1 — single-producer DAG" begin
     @testset "1. want already in have -> identity kernel" begin
@@ -27,16 +44,18 @@ calls_opindex(ast, k) = occursin("__ops__[$k]", string(ast))
         g = Graph()
         x = value!(g, :x, Float64); a = value!(g, :a, Float64)
         b = value!(g, :b, Float64); c = value!(g, :c, Float64)
-        add!(g, x => a, x -> x)
-        add!(g, a => b, a -> a + 1.0)   # wanted branch
-        add!(g, a => c, a -> error("c must not run"))  # unrelated branch
+        to_a = add!(g, x => a, x -> x)
+        to_b = add!(g, a => b, a -> a + 1.0)   # wanted branch
+        to_c = add!(g, a => c, a -> error("c must not run"))  # unrelated branch
         p = plan(g; have=(x,), want=(b,))
         ast = code_expr(p)
-        # only 2 recipes selected (x->a, a->b); the c branch must be absent
-        @test length(p.recipes) == 2
-        s = string(ast)
-        @test !occursin("c", s) || !occursin(":c", s)  # c not assigned
+        @test [r.id for r in p.recipes] == [to_a.id, to_b.id]
+        @test op_call_indices(ast) == [1, 2]
         k = prepare(p)
+        @test length(k.ops) == 2
+        @test k.ops[1] === to_a.op
+        @test k.ops[2] === to_b.op
+        @test !any(op -> op === to_c.op, k.ops)
         @test k(5.0) == 6.0
     end
 
@@ -139,9 +158,13 @@ end
     @testset "10/Query C. have boundary is never recomputed" begin
         kc = plan(g; have=(a, b), want=(r,))
         @test length(kc.recipes) == 2   # make_c, finish only
-        s = string(code_expr(kc))
-        @test !occursin("cheap_a", s) && !occursin("combined_ab", s) && !occursin("make_b", s)
+        @test kc.recipes[1].op === make_c
+        @test kc.recipes[2].op === finish
+        @test op_call_indices(code_expr(kc)) == [1, 2]
         k = prepare(kc)
+        @test k.ops[1] === make_c
+        @test k.ops[2] === finish
+        @test !any(op -> op === cheap_a || op === combined_ab || op === make_b, k.ops)
         # a=2, b=3: c=make_c(2)=1002, r=finish(3,1002)=1005
         @test k(2.0, 3.0) == 1005.0
     end
