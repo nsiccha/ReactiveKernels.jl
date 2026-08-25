@@ -382,10 +382,11 @@ function implicit_midpoint!(pos, mom, kernels; stepsize, n_fi_steps)
 end
 
 
-function multistep!(integrator!, pos, mom, kernels; n_steps, kwargs...)
+function multistep!(integrator!, pos, mom, kernels; n_steps, stepsize, kwargs...)
     result = nothing
+    substepsize = stepsize / n_steps
     for _ in 1:n_steps
-        result = integrator!(pos, mom, kernels; kwargs...)
+        result = integrator!(pos, mom, kernels; stepsize = substepsize, kwargs...)
     end
     result
 end
