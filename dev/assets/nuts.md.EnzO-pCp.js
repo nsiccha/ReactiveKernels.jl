@@ -150,7 +150,7 @@ import{_ as t,C as n,ap as l,o as r,c as p,ao as a,E as d,w as k,a2 as h,j as o}
   const svg = root.querySelector('[data-rk-svg]');
   if (!canvas || !svg) return;
 
-  const rawBox = svg.getAttribute('viewBox').trim().split(/s+/).map(Number);
+  const rawBox = svg.getAttribute('viewBox').trim().split(/\\s+/).map(Number);
   const original = {x: rawBox[0], y: rawBox[1], w: rawBox[2], h: rawBox[3]};
   let box = {...original};
   const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
