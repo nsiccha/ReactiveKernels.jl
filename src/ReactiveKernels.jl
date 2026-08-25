@@ -23,10 +23,13 @@ include("core.jl")
 include("planner.jl")
 include("codegen.jl")
 include("graphops.jl")
+include("reactive.jl")
 
 export Value, Recipe, Graph, Plan, PreparedKernel, PlanningError
 export value, value!, add!, plan, prepare, lower, transform, compile
 export explain, code_expr, inputs, outputs, valtype
 export compose, PreparationCache, prepare!, canon_id
+# Reactive layer
+export ReactiveState, set!, get!, freeze!, unfreeze!, checkpoint, materialize!
 
 end # module ReactiveKernels

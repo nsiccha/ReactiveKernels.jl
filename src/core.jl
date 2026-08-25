@@ -97,6 +97,7 @@ end
 
 _astuple(v::Value) = (v,)
 _astuple(t::Tuple) = t
+_astuple(v::AbstractVector) = Tuple(v)
 
 """
     add!(g, inputs => outputs, op; cost=1.0, cse_key=nothing, effectful=false)

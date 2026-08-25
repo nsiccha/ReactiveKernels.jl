@@ -165,6 +165,32 @@ end
     @test k(1.0, 2.0) == 1003.0
 end
 
+@testset "19. AST pass boundary — transform before RGF, semantics unchanged" begin
+    g = Graph()
+    x = value!(g, :x, Float64); a = value!(g, :a, Float64); b = value!(g, :b, Float64)
+    add!(g, x => a, x -> x + 1.0)
+    add!(g, a => b, a -> 2a)
+    p = plan(g; have=(x,), want=(b,))
+    ast0 = lower(p)
+
+    # A semantics-preserving pass: prepend a harmless unused binding.
+    ran = Ref(false)
+    noop_pass(ex::Expr) = (ran[] = true;
+        Expr(:function, ex.args[1],
+             Expr(:block, :(__scratch__ = 0.0), ex.args[2].args...)))
+
+    ast1 = transform(ast0, noop_pass)
+    @test ran[]
+    @test ast1 != ast0
+    @test occursin("__scratch__", string(ast1))
+
+    k0 = prepare(p)
+    k1 = prepare(p; passes=(noop_pass,))
+    @test k0(3.0) == k1(3.0) == 8.0     # (3+1)*2, unchanged by the pass
+    # planning is untouched: same recipes, same order
+    @test [r.id for r in k0.plan.recipes] == [r.id for r in k1.plan.recipes]
+end
+
 @testset "explain / inspection" begin
     g = Graph()
     u = value!(g, :u, Float64); a = value!(g, :a, Float64)
