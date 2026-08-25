@@ -608,6 +608,15 @@ internals — and is the group-copy building block for phase-point
 proposal/endpoint bookkeeping. `dest_handles` and `src_handles` are equal-length
 tuples of [`ReactiveValue`](@ref) handles; the pairing is walked by type-stable
 tuple recursion so a homogeneous array group copies with zero allocation.
+
+Pairs are applied **sequentially, left to right**, and an array destination is
+mutated in place. Overlapping destination/source groups are therefore
+order-dependent and generally NOT a swap: `copy_group!(state, (a, b), (b, a))`
+copies `b` into `a` first, so both end holding the original `b`. To exchange two
+groups, route through a temporary group (`t ← a`, `a ← b`, `b ← t`) — the
+allocation-free idiom the sampler uses for endpoint/proposal swaps. Sources are
+read (`get!`) before their paired destination is written, but later pairs see
+earlier destinations' new values.
 """
 function copy_group!(state::CompiledReactiveState,
                      dest_handles::Tuple, src_handles::Tuple)
