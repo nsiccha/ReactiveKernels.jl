@@ -50,12 +50,12 @@ import{_ as i,o as a,c as n,ao as e}from"./chunks/framework.DF1ZdG05.js";const o
 <span class="line"><span style="--shiki-light:#959da5;--shiki-dark:#959da5;">                                  #= /home/runner/work/ReactiveKernels.jl/ReactiveKernels.jl/src/stateful.jl:125 =#</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                  __valid__[1] || error(&quot;compiled reactive source slot $(slot_index) is invalid&quot;)</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                              end</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                              (var&quot;##recipe_result#346&quot;, var&quot;##recipe_result#347&quot;) = (__ops__[2])((__slots__[1])[])</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                              (var&quot;##recipe_result#447&quot;, var&quot;##recipe_result#448&quot;) = (__ops__[2])((__slots__[1])[])</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                              begin</span></span>
 <span class="line"><span style="--shiki-light:#959da5;--shiki-dark:#959da5;">                                  #= /home/runner/work/ReactiveKernels.jl/ReactiveKernels.jl/src/stateful.jl:155 =#</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                  if !(__valid__[5])</span></span>
 <span class="line"><span style="--shiki-light:#959da5;--shiki-dark:#959da5;">                                      #= /home/runner/work/ReactiveKernels.jl/ReactiveKernels.jl/src/stateful.jl:156 =#</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                      (__slots__[5])[] = var&quot;##recipe_result#346&quot;</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                      (__slots__[5])[] = var&quot;##recipe_result#447&quot;</span></span>
 <span class="line"><span style="--shiki-light:#959da5;--shiki-dark:#959da5;">                                      #= /home/runner/work/ReactiveKernels.jl/ReactiveKernels.jl/src/stateful.jl:157 =#</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                      __valid__[5] = true</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                  end</span></span>
@@ -64,7 +64,7 @@ import{_ as i,o as a,c as n,ao as e}from"./chunks/framework.DF1ZdG05.js";const o
 <span class="line"><span style="--shiki-light:#959da5;--shiki-dark:#959da5;">                                  #= /home/runner/work/ReactiveKernels.jl/ReactiveKernels.jl/src/stateful.jl:155 =#</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                  if !(__valid__[6])</span></span>
 <span class="line"><span style="--shiki-light:#959da5;--shiki-dark:#959da5;">                                      #= /home/runner/work/ReactiveKernels.jl/ReactiveKernels.jl/src/stateful.jl:156 =#</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                      (__slots__[6])[] = var&quot;##recipe_result#347&quot;</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                      (__slots__[6])[] = var&quot;##recipe_result#448&quot;</span></span>
 <span class="line"><span style="--shiki-light:#959da5;--shiki-dark:#959da5;">                                      #= /home/runner/work/ReactiveKernels.jl/ReactiveKernels.jl/src/stateful.jl:157 =#</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                      __valid__[6] = true</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                  end</span></span>
@@ -86,12 +86,12 @@ import{_ as i,o as a,c as n,ao as e}from"./chunks/framework.DF1ZdG05.js";const o
 <span class="line"><span style="--shiki-light:#959da5;--shiki-dark:#959da5;">                                              #= /home/runner/work/ReactiveKernels.jl/ReactiveKernels.jl/src/stateful.jl:125 =#</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                              __valid__[3] || error(&quot;compiled reactive source slot $(slot_index) is invalid&quot;)</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                          end</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                          var&quot;##recipe_result#348&quot; = (__ops__[1])((__slots__[3])[])</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                          var&quot;##recipe_result#449&quot; = (__ops__[1])((__slots__[3])[])</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                          begin</span></span>
 <span class="line"><span style="--shiki-light:#959da5;--shiki-dark:#959da5;">                                              #= /home/runner/work/ReactiveKernels.jl/ReactiveKernels.jl/src/stateful.jl:155 =#</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                              if !(__valid__[4])</span></span>
 <span class="line"><span style="--shiki-light:#959da5;--shiki-dark:#959da5;">                                                  #= /home/runner/work/ReactiveKernels.jl/ReactiveKernels.jl/src/stateful.jl:156 =#</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                                  (__slots__[4])[] = var&quot;##recipe_result#348&quot;</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                                  (__slots__[4])[] = var&quot;##recipe_result#449&quot;</span></span>
 <span class="line"><span style="--shiki-light:#959da5;--shiki-dark:#959da5;">                                                  #= /home/runner/work/ReactiveKernels.jl/ReactiveKernels.jl/src/stateful.jl:157 =#</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                                  __valid__[4] = true</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                              end</span></span>
@@ -103,12 +103,12 @@ import{_ as i,o as a,c as n,ao as e}from"./chunks/framework.DF1ZdG05.js";const o
 <span class="line"><span style="--shiki-light:#959da5;--shiki-dark:#959da5;">                                  #= /home/runner/work/ReactiveKernels.jl/ReactiveKernels.jl/src/stateful.jl:125 =#</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                  __valid__[2] || error(&quot;compiled reactive source slot $(slot_index) is invalid&quot;)</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                              end</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                              (var&quot;##recipe_result#349&quot;, var&quot;##recipe_result#350&quot;) = (__ops__[3])((__slots__[4])[], (__slots__[2])[])</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                              (var&quot;##recipe_result#450&quot;, var&quot;##recipe_result#451&quot;) = (__ops__[3])((__slots__[4])[], (__slots__[2])[])</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                              begin</span></span>
 <span class="line"><span style="--shiki-light:#959da5;--shiki-dark:#959da5;">                                  #= /home/runner/work/ReactiveKernels.jl/ReactiveKernels.jl/src/stateful.jl:155 =#</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                  if !(__valid__[7])</span></span>
 <span class="line"><span style="--shiki-light:#959da5;--shiki-dark:#959da5;">                                      #= /home/runner/work/ReactiveKernels.jl/ReactiveKernels.jl/src/stateful.jl:156 =#</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                      (__slots__[7])[] = var&quot;##recipe_result#349&quot;</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                      (__slots__[7])[] = var&quot;##recipe_result#450&quot;</span></span>
 <span class="line"><span style="--shiki-light:#959da5;--shiki-dark:#959da5;">                                      #= /home/runner/work/ReactiveKernels.jl/ReactiveKernels.jl/src/stateful.jl:157 =#</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                      __valid__[7] = true</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                  end</span></span>
@@ -117,7 +117,7 @@ import{_ as i,o as a,c as n,ao as e}from"./chunks/framework.DF1ZdG05.js";const o
 <span class="line"><span style="--shiki-light:#959da5;--shiki-dark:#959da5;">                                  #= /home/runner/work/ReactiveKernels.jl/ReactiveKernels.jl/src/stateful.jl:155 =#</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                  if !(__valid__[8])</span></span>
 <span class="line"><span style="--shiki-light:#959da5;--shiki-dark:#959da5;">                                      #= /home/runner/work/ReactiveKernels.jl/ReactiveKernels.jl/src/stateful.jl:156 =#</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                      (__slots__[8])[] = var&quot;##recipe_result#350&quot;</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                      (__slots__[8])[] = var&quot;##recipe_result#451&quot;</span></span>
 <span class="line"><span style="--shiki-light:#959da5;--shiki-dark:#959da5;">                                      #= /home/runner/work/ReactiveKernels.jl/ReactiveKernels.jl/src/stateful.jl:157 =#</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                      __valid__[8] = true</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                  end</span></span>
@@ -125,12 +125,12 @@ import{_ as i,o as a,c as n,ao as e}from"./chunks/framework.DF1ZdG05.js";const o
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                          end</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                      end</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                  end</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                  var&quot;##recipe_result#351&quot; = (__ops__[4])((__slots__[5])[], (__slots__[7])[])</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                  var&quot;##recipe_result#452&quot; = (__ops__[4])((__slots__[5])[], (__slots__[7])[])</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                  begin</span></span>
 <span class="line"><span style="--shiki-light:#959da5;--shiki-dark:#959da5;">                      #= /home/runner/work/ReactiveKernels.jl/ReactiveKernels.jl/src/stateful.jl:155 =#</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                      if !(__valid__[9])</span></span>
 <span class="line"><span style="--shiki-light:#959da5;--shiki-dark:#959da5;">                          #= /home/runner/work/ReactiveKernels.jl/ReactiveKernels.jl/src/stateful.jl:156 =#</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                          (__slots__[9])[] = var&quot;##recipe_result#351&quot;</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                          (__slots__[9])[] = var&quot;##recipe_result#452&quot;</span></span>
 <span class="line"><span style="--shiki-light:#959da5;--shiki-dark:#959da5;">                          #= /home/runner/work/ReactiveKernels.jl/ReactiveKernels.jl/src/stateful.jl:157 =#</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                          __valid__[9] = true</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                      end</span></span>
