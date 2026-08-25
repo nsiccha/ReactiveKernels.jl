@@ -1,0 +1,4 @@
+name = "ReactiveKernels"
+uuid = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
+authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
+version = "0.1.0"
