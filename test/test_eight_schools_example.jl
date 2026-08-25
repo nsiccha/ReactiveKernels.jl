@@ -70,6 +70,124 @@ using .EightSchoolsExample
         @test gradient[2] ≈ finite_difference rtol = 1e-6
     end
 
+    @testset "corrected core contracts hold on PPL paths" begin
+        @testset "authoritative constrained HAVE is a hard cut" begin
+            p = plan(model.graph;
+                     have = (model.unconstrained, model.μ),
+                     want = (model.parameters,))
+            @test inputs(p) == (model.unconstrained, model.μ)
+
+            parameters = prepare(p)(q, 99.0)
+            @test parameters.μ == 99.0
+            @test parameters.τ ≈ 2.0
+            @test parameters.θ == ntuple(i -> 0.25 * i, 8)
+
+            state = ReactiveState(model.graph)
+            set!(state, model.unconstrained, q)
+            set!(state, model.μ, 99.0)
+            @test get!(state, model.parameters) == parameters
+        end
+
+        @testset "overlapping transform producers admit a valid order" begin
+            graph = Graph()
+            raw = value!(graph, :ppl_unconstrained, NTuple{2,Real})
+            location = value!(graph, :location, Real)
+            log_scale = value!(graph, :log_scale, Real)
+            bridge = value!(graph, :location_bridge, Real)
+            auxiliary = value!(graph, :auxiliary, Real)
+
+            overlapping = add!(graph, bridge => (location, auxiliary),
+                               x -> (x - 10, 2x))
+            source = add!(graph, raw => (location, log_scale),
+                          x -> (x[1], x[2]))
+            bridged = add!(graph, location => bridge, x -> x + 10)
+
+            p = plan(graph; have = (raw,), want = (auxiliary, log_scale))
+            @test [r.id for r in p.recipes] ==
+                  [source.id, bridged.id, overlapping.id]
+            auxiliary_value, log_scale_value =
+                prepare(p)((3.0, log(2.0)))
+            @test auxiliary_value == 26.0
+            @test log_scale_value ≈ log(2.0)
+        end
+
+        @testset "nested density provenance remains reusable" begin
+            nested = build_eight_schools_graph()
+            checked_density = value!(nested.graph, :checked_log_density, Real)
+            density_calls = Ref(0)
+            add!(nested.graph,
+                 (nested.prior, nested.log_jacobian, nested.likelihood) =>
+                     checked_density,
+                 (prior, jacobian, likelihood) -> begin
+                     density_calls[] += 1
+                     prior + jacobian + likelihood
+                 end)
+
+            state = ReactiveState(
+                nested.graph;
+                materialize = (nested.parameters, nested.prior,
+                               nested.pointwise, nested.likelihood,
+                               checked_density),
+            )
+            set!(state, nested.unconstrained, q)
+            set!(state, nested.observations, EIGHT_SCHOOLS_Y)
+            set!(state, nested.observation_scales, EIGHT_SCHOOLS_SIGMA)
+
+            get!(state, nested.parameters)
+            get!(state, nested.prior)
+            get!(state, nested.pointwise)
+            get!(state, nested.likelihood)
+            first_density = get!(state, checked_density)
+            @test get!(state, checked_density) == first_density
+            @test density_calls[] == 1
+        end
+
+        @testset "checkpoint rejects stale transformed parameters" begin
+            checkpointed = build_eight_schools_graph()
+            state = ReactiveState(checkpointed.graph;
+                                  materialize = (checkpointed.parameters,))
+            set!(state, checkpointed.unconstrained, q)
+            get!(state, checkpointed.parameters)
+
+            q2 = (7.0, q[2:end]...)
+            set!(state, checkpointed.unconstrained, q2)
+            @test_throws ErrorException checkpoint(
+                state, (checkpointed.parameters,))
+
+            refreshed = get!(state, checkpointed.parameters)
+            saved = checkpoint(state, (checkpointed.parameters,))
+            @test refreshed.μ == 7.0
+            @test saved[canon_id(checkpointed.graph,
+                                 checkpointed.parameters.id)] == refreshed
+        end
+
+        @testset "generated bindings are hygienic for PPL names" begin
+            graph = Graph()
+            reserved = value!(graph, :__ops__,
+                              EightSchoolsExample.UnconstrainedParameters)
+            location = value!(graph, :location, Real)
+            log_scale = value!(graph, :log_scale, Real)
+            effects = value!(graph, :effects, EightSchoolsExample.SchoolVector)
+            add!(graph, reserved => (location, log_scale, effects),
+                 EightSchoolsExample.split_unconstrained)
+
+            k = prepare(graph; have = (reserved,),
+                        want = (location, log_scale, effects))
+            @test k(q) == (q[1], q[2], q[3:end])
+        end
+
+        @testset "recipe costs preserve planner assumptions" begin
+            diagnostic = value!(model.graph, :density_diagnostic, Real)
+            recipe_count = length(model.graph.recipes)
+            for invalid_cost in (-1.0, Inf, NaN)
+                @test_throws ArgumentError add!(
+                    model.graph, model.density => diagnostic, identity;
+                    cost = invalid_cost)
+            end
+            @test length(model.graph.recipes) == recipe_count
+        end
+    end
+
     @testset "generated quantities prune density work" begin
         parameters = EightSchoolsParameters(1.0, 4.0, ntuple(_ -> 2.0, 8))
         p = plan(model.graph;
