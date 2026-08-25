@@ -13,11 +13,9 @@ end
 
 "Port of ReactiveObjects.jl's `chain` gallery example."
 function chain_example()
-    graph = @kernel begin
-        x::Float64
+    @kernel graph(x::Float64) = begin
         z::Float64 = 2x
         w::Float64 = z + 1
-        return w
     end
 
     state = ReactiveState(graph; materialize = :z)
@@ -34,12 +32,10 @@ end
 "Port of ReactiveObjects.jl's `diamond` gallery example."
 function diamond_example()
     calls = Dict(:b => Ref(0), :c => Ref(0), :d => Ref(0))
-    graph = @kernel begin
-        a::Float64
+    @kernel graph(a::Float64) = begin
         b::Float64 = (calls[:b][] += 1; a + 1)
         c::Float64 = (calls[:c][] += 1; a + 2)
         d::Float64 = (calls[:d][] += 1; b + c)
-        return d
     end
 
     state = ReactiveState(graph; materialize = (:b, :c))
@@ -60,12 +56,10 @@ end
 "Port of ReactiveObjects.jl's `shared` gallery example."
 function shared_example()
     a_calls = Ref(0)
-    graph = @kernel begin
-        x::Float64
+    @kernel graph(x::Float64) = begin
         a::Float64 = (a_calls[] += 1; x + 1)
         b::Float64 = 2a
         c::Float64 = 3a
-        return (b, c)
     end
 
     state = ReactiveState(graph; materialize = :a)

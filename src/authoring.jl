@@ -785,7 +785,7 @@ function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol})
     Expr(:->, Expr(:tuple, deps...), rhs)
 end
 
-function _kernel_expand(block)
+function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[])
     statements = block isa Expr && block.head === :block ? block.args : Any[block]
     graph_var = gensym(:kernel_graph)
     ports_var = gensym(:kernel_ports)
@@ -816,6 +816,16 @@ function _kernel_expand(block)
         end
         type_expr === nothing || push!(annotations[name], type_expr)
         name
+    end
+
+    # Function-shaped definitions put the default HAVE boundary in the
+    # signature, matching ordinary Julia and ReactiveObjects authoring. An
+    # omitted annotation is metadata-only `Any`; Julia still specializes the
+    # prepared straight-line function on the concrete runtime argument types.
+    for (name, type_expr) in signature_inputs
+        register!(name, type_expr)
+        _kernel_push_unique!(have_names, name)
+        push!(entries, (:input, name))
     end
 
     # Pass 1: collect the complete named-port namespace, all type annotations,
@@ -852,7 +862,12 @@ function _kernel_expand(block)
         end
 
         isempty(metadata) || throw(ArgumentError("@recipe must wrap a recipe assignment"))
-        if raw isa Expr && raw.head === :(::) && raw.args[1] isa Symbol
+        if raw isa Symbol
+            name = register!(raw, nothing)
+            _kernel_push_unique!(have_names, name)
+            push!(entries, (:input, name))
+            continue
+        elseif raw isa Expr && raw.head === :(::) && raw.args[1] isa Symbol
             name, type_expr = _kernel_port_decl(raw)
             register!(name, type_expr)
             _kernel_push_unique!(have_names, name)
@@ -860,7 +875,7 @@ function _kernel_expand(block)
             continue
         end
         throw(ArgumentError(
-            "unsupported @kernel statement $(repr(raw)); expected a typed input, recipe assignment, or return"))
+            "unsupported @kernel statement $(repr(raw)); expected an input name, recipe assignment, or return"))
     end
 
     known = Set(port_order)
@@ -868,8 +883,6 @@ function _kernel_expand(block)
         name in known || throw(ArgumentError("@kernel returns undeclared port :$name"))
     end
     for name in port_order
-        isempty(annotations[name]) && throw(ArgumentError(
-            "kernel port :$name needs an explicit type annotation somewhere in the block"))
         port_vars[name] = gensym(name)
     end
 
@@ -879,7 +892,9 @@ function _kernel_expand(block)
     prelude = Any[]
     for name in port_order
         value_var = port_vars[name]
-        for type_expr in annotations[name]
+        type_exprs = isempty(annotations[name]) ? Any[GlobalRef(Core, :Any)] :
+                     annotations[name]
+        for type_expr in type_exprs
             push!(prelude, :($value_var = $declare_ref(
                 $graph_var, $ports_var, $order_var, $(QuoteNode(name)), $type_expr)))
         end
@@ -889,11 +904,17 @@ function _kernel_expand(block)
     end
 
     body = Any[]
+    consumed_names = Set{Symbol}()
+    produced_names = Symbol[]
     for entry in entries
         entry[1] === :recipe || continue
         _, outputs, authored_rhs, metadata = entry
         rhs = _kernel_hygienic_catches(authored_rhs, known)
         deps = _kernel_free_ports(rhs, known)
+        union!(consumed_names, deps)
+        for (name, _) in outputs
+            _kernel_push_unique!(produced_names, name)
+        end
         dep_values = Expr(:tuple, (port_vars[name] for name in deps)...)
         out_values = Expr(:tuple, (port_vars[name] for (name, _) in outputs)...)
         op = _kernel_operation(rhs, deps, known)
@@ -902,6 +923,11 @@ function _kernel_expand(block)
         effectful = get(metadata, :effectful, false)
         push!(body, :($add_ref($graph_var, $dep_values, $out_values,
                                $op, $cost, $cse_key, $effectful)))
+    end
+    if !saw_return
+        for name in produced_names
+            name in consumed_names || _kernel_push_unique!(want_names, name)
+        end
     end
     for name in want_names
         push!(body, :($push_unique_ref($want_var, $(QuoteNode(name)))))
@@ -921,21 +947,69 @@ function _kernel_expand(block)
     end
 end
 
+function _kernel_named_signature(signature)
+    signature isa Expr && signature.head === :call || return nothing
+    name = first(signature.args)
+    name isa Symbol || throw(ArgumentError(
+        "@kernel function name must be a symbol, got $(repr(name))"))
+    inputs = Tuple{Symbol,Any}[]
+    seen = Set{Symbol}()
+    for argument in signature.args[2:end]
+        argument isa Expr && argument.head === :parameters && throw(ArgumentError(
+            "@kernel signatures currently accept positional ports only"))
+        port_name, type_expr = _kernel_port_decl(argument)
+        port_name in seen && throw(ArgumentError(
+            "@kernel signature repeats port :$port_name"))
+        push!(seen, port_name)
+        push!(inputs, (port_name, type_expr))
+    end
+    name, inputs
+end
+
+function _kernel_definition_parts(ex::Expr)
+    if ex.head === :(=) && length(ex.args) == 2
+        named = _kernel_named_signature(ex.args[1])
+        named === nothing || return (named..., ex.args[2])
+    elseif ex.head === :function && length(ex.args) == 2
+        named = _kernel_named_signature(ex.args[1])
+        named === nothing || return (named..., ex.args[2])
+    end
+    nothing
+end
+
 """
+    @kernel model(f, x) = begin
+        y = f(x)
+    end
+
+    kernel = prepare(model)
+    kernel(sin, 1.0)
+
     @kernel begin
         x::Float64
         y::Float64 = f(x)
         return y
     end
 
-Build a named, typed [`KernelSpec`](@ref) without executing any recipe RHS.
-Bare typed declarations are default `have` ports. An assignment creates one
-recipe; every named port needs a type annotation somewhere in the block, tuple
-assignment creates a multi-output recipe, and assigning an output again creates
-an alternative producer. Declarations and producers may be forward-referenced:
-the complete named-port namespace is collected before dependencies are inferred.
-When a caller global has the same name as a port, qualify the global with its
-module name. `return` declares the default `want` boundary.
+Build a named [`KernelSpec`](@ref) without executing any recipe RHS. The primary
+form mirrors an ordinary Julia function definition: its signature names the
+default `have` ports, including function-valued inputs. The macro binds the
+function name to the resulting `KernelSpec`; [`prepare`](@ref) turns it into the
+callable straight-line kernel. Both short and long definitions are supported.
+
+Type annotations are optional metadata. Omitting them does not add dynamic
+dispatch to a prepared kernel: Julia specializes the generated function on the
+concrete operation and input types at the call site. An assignment creates one
+recipe; tuple assignment creates a multi-output recipe, and assigning an output
+again creates an alternative producer. Declarations and producers may be
+forward-referenced: the complete named-port namespace is collected before
+dependencies are inferred. When a caller global has the same name as a port,
+qualify the global with its module name.
+
+Every signature argument and assignment is exposed by name. `return` is
+optional: without one, derived sink ports form the default `want` boundary;
+with one, the returned port names replace that default. Either way, every port
+remains selectable through `spec[:name]` or `want = :name`.
 
 Recipe metadata uses the compact form
 
@@ -945,8 +1019,11 @@ All recipe bodies resolve and capture names in the caller's scope. The macro
 only constructs closures and graph metadata; recipe bodies run only when a
 prepared kernel is invoked.
 """
-macro kernel(block)
-    esc(_kernel_expand(block))
+macro kernel(ex)
+    definition = ex isa Expr ? _kernel_definition_parts(ex) : nothing
+    definition === nothing && return esc(_kernel_expand(ex))
+    name, inputs, block = definition
+    esc(Expr(:(=), name, _kernel_expand(block, inputs)))
 end
 
 # --- named boundaries ------------------------------------------------------

@@ -10,19 +10,13 @@ using ForwardDiff
 using BenchmarkTools
 
 function normal_model(::Type{T}) where {T<:AbstractFloat}
-    normal_family = @kernel begin
-        μ::T
-        logσ::T
+    @kernel normal_family(μ::T, logσ::T) = begin
         σ::T = exp(logσ)
         normal::Normal{T} = Distributions.Normal(μ, σ)
-        return normal
     end
 
-    normal_observation = @kernel begin
-        normal::Normal{T}
-        x::T
+    @kernel normal_observation(normal::Normal{T}, x::T) = begin
         logdensity::T = logpdf(normal, x)
-        return logdensity
     end
 
     compose(normal_family, normal_observation)
@@ -78,18 +72,14 @@ using ForwardDiff
 using BenchmarkTools
 
 function bernoulli_model(::Type{T}) where {T<:AbstractFloat}
-    bernoulli_family = @kernel begin
-        logit::T
+    @kernel bernoulli_family(logit::T) = begin
         probability::T = inv(1 + exp(-logit))
         bernoulli::Bernoulli{T} = Distributions.Bernoulli(probability)
-        return bernoulli
     end
 
-    bernoulli_observation = @kernel begin
-        bernoulli::Bernoulli{T}
-        observed::Bool
+    @kernel bernoulli_observation(bernoulli::Bernoulli{T},
+                                  observed::Bool) = begin
         logdensity::T = logpdf(bernoulli, observed)
-        return logdensity
     end
 
     compose(bernoulli_family, bernoulli_observation)
@@ -151,9 +141,7 @@ using BenchmarkTools
 function regression_model(::Type{T}) where {T<:AbstractFloat}
     distribution_type = typeof(Distributions.MvNormal(zeros(T, 1), one(T) * I))
 
-    coefficient_prior = @kernel begin
-        coefficients::Vector{T}
-        prior_scale::T
+    @kernel coefficient_prior(coefficients::Vector{T}, prior_scale::T) = begin
         prior_mean::Vector{T} = zeros(
             eltype(coefficients), length(coefficients),
         )
@@ -161,14 +149,10 @@ function regression_model(::Type{T}) where {T<:AbstractFloat}
             prior_mean, abs2(prior_scale) * I,
         )
         prior_logdensity::T = logpdf(prior_distribution, coefficients)
-        return prior_logdensity
     end
 
-    regression_likelihood = @kernel begin
-        coefficients::Vector{T}
-        design::Matrix{T}
-        observations::Vector{T}
-        noise_scale::T
+    @kernel regression_likelihood(coefficients::Vector{T}, design::Matrix{T},
+                                  observations::Vector{T}, noise_scale::T) = begin
         mean::Vector{T} = design * coefficients
         likelihood_distribution::distribution_type = Distributions.MvNormal(
             mean, abs2(noise_scale) * I,
@@ -176,14 +160,11 @@ function regression_model(::Type{T}) where {T<:AbstractFloat}
         likelihood_logdensity::T = logpdf(
             likelihood_distribution, observations,
         )
-        return likelihood_logdensity
     end
 
-    joint_density = @kernel begin
-        prior_logdensity::T
-        likelihood_logdensity::T
+    @kernel joint_density(prior_logdensity::T,
+                          likelihood_logdensity::T) = begin
         logdensity::T = prior_logdensity + likelihood_logdensity
-        return logdensity
     end
 
     compose(coefficient_prior, regression_likelihood, joint_density)

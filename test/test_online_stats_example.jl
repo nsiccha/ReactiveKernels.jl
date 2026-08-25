@@ -217,8 +217,8 @@ const OSE = OnlineStatsExample
     @testset "public docs keep a literal declarative source block" begin
         page = read(joinpath(@__DIR__, "..", "docs", "src", "online-stats.md"),
                     String)
-        @test occursin("updates = @kernel begin", page)
-        @test occursin("partitions = @kernel begin", page)
+        @test occursin("@kernel updates(", page)
+        @test occursin("@kernel partitions(", page)
         @test occursin("model = merge(updates, partitions)", page)
         @test occursin("Main.ReactiveKernelsDocs.execute_example", page)
         @test !occursin("include(", page)
