@@ -22,6 +22,39 @@ function make_spec(local_offset)
 end
 end
 
+module AuthoringNameCollisionFixture
+using ..ReactiveKernels
+
+const Dict = :shadowed
+const Symbol = :shadowed
+
+make_module_spec() = @kernel begin
+    x::Int
+    y::Int = x + 1
+    return y
+end
+
+function make_local_spec(Dict, Symbol)
+    @kernel begin
+        x::Int
+        y::Int = x + 2
+        return y
+    end
+end
+end
+
+module AuthoringForwardFixture
+using ..ReactiveKernels
+
+const x = 40
+
+qualified_global() = @kernel begin
+    x::Int
+    y::Int = AuthoringForwardFixture.x + 2
+    return y
+end
+end
+
 @testset "Declarative kernel authoring" begin
     @testset "typed ports, zero-execution construction, and metadata" begin
         calls = Ref(0)
@@ -40,11 +73,14 @@ end
         @test calls[] == 0
         @test spec isa KernelSpec
         @test keys(spec) == (:x, :a, :b, :out)
+        @test hasproperty(spec, :graph)
+        @test hasproperty(spec, :x)
         @test inputs(spec) == (spec[:x],)
         @test outputs(spec) == (spec[:out],)
         @test ReactiveKernels.valtype(spec[:x]) === Float64
         @test kernel_graph(spec).recipes[1].cost == 1.2
         @test kernel_graph(spec).recipes[1].cse_key === :pair
+        @test kernel_graph(spec).recipes[1].op === pair
         @test length(kernel_graph(spec).recipes[1].outputs) == 2
         @test length(kernel_graph(spec).producers[spec[:a].id]) == 2
 
@@ -78,6 +114,82 @@ end
             return __caches__
         end
         @test prepare(reserved)(2, 3) == 5
+
+        field_collision = @kernel begin
+            graph::Int
+            out::Int = graph + 1
+            return out
+        end
+        @test field_collision.graph === kernel_graph(field_collision)
+        @test field_collision[:graph] isa Value{Int}
+        @test prepare(field_collision)(2) == 3
+
+        @test prepare(AuthoringNameCollisionFixture.make_module_spec())(2) == 3
+        @test prepare(AuthoringNameCollisionFixture.make_local_spec(1, 2))(2) == 4
+
+        forward_input = @kernel begin
+            y::Int = x + 1
+            x::Int
+            return y
+        end
+        @test prepare(forward_input)(2) == 3
+
+        forward_intermediate = @kernel begin
+            z::Int = y + 1
+            y::Int = x + 1
+            x::Int
+            return z
+        end
+        @test Tuple(v.name for v in kernel_graph(forward_intermediate).recipes[1].inputs) ==
+              (:y,)
+        @test prepare(forward_intermediate)(2) == 4
+
+        forward_alternative = @kernel begin
+            @recipe (cost = 0) y = x + 1
+            @recipe (cost = 2) y::Int = x + 2
+            x::Int
+            return y
+        end
+        @test length(ReactiveKernels.producers_of(
+            kernel_graph(forward_alternative), forward_alternative.y.id,
+        )) == 2
+        @test prepare(forward_alternative)(2) == 3
+
+        qualified = AuthoringForwardFixture.qualified_global()
+        @test isempty(only(kernel_graph(qualified).recipes).inputs)
+        @test prepare(qualified)(2) == 42
+
+        shadowed = @kernel begin
+            source::Int
+            @recipe (effectful = true) a::Int = source + 100
+            sequential::Int = begin
+                a = 4
+                a + 1
+            end
+            branched::Int = begin
+                if source > 0
+                    a = 6
+                else
+                    a = 7
+                end
+                a
+            end
+            local_function::Int = begin
+                a(x) = x + 8
+                a(1)
+            end
+            declared::Int = begin
+                local a = 10
+                a + 1
+            end
+            return (sequential, branched, local_function, declared)
+        end
+        shadow_recipes = kernel_graph(shadowed).recipes[2:end]
+        @test isempty(shadow_recipes[1].inputs)
+        @test Tuple(v.name for v in shadow_recipes[2].inputs) == (:source,)
+        @test isempty(shadow_recipes[3].inputs)
+        @test isempty(shadow_recipes[4].inputs)
+        @test prepare(shadowed)(1) == (5, 6, 9, 11)
     end
 
     @testset "pure named-port composition and explicit boundaries" begin
@@ -163,6 +275,33 @@ end
         @test prepare(cse_combined; want = :a)(3) == 3
         @test prepare(cse_combined; want = :b)(3) == 3
         @test prepare(cse_combined; want = :doubled)(3) == 6
+
+        cheap_base = @kernel begin
+            x::Int
+            @recipe (cost = 0) y::Int = x + 1
+            return y
+        end
+        alias_fragment = @kernel begin
+            x::Int
+            @recipe (cost = 10, cse_key = :expensive) a::Int = x + 10
+            @recipe (cost = 10, cse_key = :expensive) y::Int = x + 10
+            return y
+        end
+        alias_merged = merge(cheap_base, alias_fragment)
+        alias_graph = kernel_graph(alias_merged)
+        @test sort(ReactiveKernels.producers_of(
+            alias_graph, alias_merged.y.id,
+        )) == [1, 2]
+        @test plan(alias_merged).cost == 0
+        @test prepare(alias_merged)(2) == 3
+
+        alias_reversed = merge(alias_fragment, cheap_base)
+        reversed_graph = kernel_graph(alias_reversed)
+        @test sort(ReactiveKernels.producers_of(
+            reversed_graph, alias_reversed.y.id,
+        )) == [1, 2]
+        @test plan(alias_reversed; have = :x, want = :y).cost == 0
+        @test prepare(alias_reversed; have = :x, want = :y)(2) == 3
     end
 
     @testset "low-level equivalence and unchanged hot path" begin
@@ -223,7 +362,8 @@ end
             err
         end
         @test error isa ArgumentError
-        @test occursin("output :y", sprint(showerror, error))
+        @test occursin("port :y", sprint(showerror, error))
+        @test occursin("type annotation", sprint(showerror, error))
         @test_throws KeyError (@kernel begin x::Int end)[:missing]
     end
 end

@@ -25,15 +25,14 @@ typed cache owned by the prepared kernel.
 ```julia
 using ReactiveKernels, MutatingFunctions
 
-g = Graph()
-x = value!(g, :x, Vector{Float64})
-copied = value!(g, :copied, Vector{Float64})
-reversed = value!(g, :reversed, Vector{Float64})
+g = @kernel begin
+    x::Vector{Float64}
+    copied::Vector{Float64} = copy(x)
+    reversed::Vector{Float64} = reverse(copied)
+    return reversed
+end
 
-add!(g, x => copied, copy)
-add!(g, copied => reversed, reverse)
-
-p = plan(g; have = (x,), want = (reversed,))
+p = plan(g)
 k = prepare_nonallocating(p)
 
 k([1.0, 2.0, 3.0]) # first call allocates and seeds both caches

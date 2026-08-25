@@ -12,8 +12,10 @@ consumed by the planner, `ports` maps author-facing names to graph [`Value`](@re
 objects, and `inputs(spec)` / `outputs(spec)` report the default have/want
 boundary declared by [`@kernel`](@ref).
 
-Look up a named port with `spec[:name]`. Planning and preparation accept either
-port names or `Value`s in their `have` and `want` overrides.
+Look up a named port with `spec.name` or `spec[:name]`. `spec.graph` is the
+underlying graph; a port literally named `graph` therefore uses bracket lookup.
+Planning and preparation accept either port names or `Value`s in their `have`
+and `want` overrides.
 """
 struct KernelSpec
     graph::Graph
@@ -32,6 +34,19 @@ end
 
 Base.keys(spec::KernelSpec) = Tuple(spec.port_order)
 Base.haskey(spec::KernelSpec, name::Symbol) = haskey(spec.ports, name)
+
+function Base.getproperty(spec::KernelSpec, name::Symbol)
+    name in fieldnames(KernelSpec) && return getfield(spec, name)
+    ports = getfield(spec, :ports)
+    haskey(ports, name) && return ports[name]
+    getfield(spec, name)
+end
+
+function Base.propertynames(spec::KernelSpec, private::Bool = false)
+    names = private ? (fieldnames(KernelSpec)..., spec.port_order...) :
+                      (:graph, spec.port_order...)
+    Tuple(unique(names))
+end
 
 function Base.getindex(spec::KernelSpec, name::Symbol)
     haskey(spec.ports, name) && return spec.ports[name]
@@ -104,6 +119,67 @@ function _kernel_bound_names!(names::Set{Symbol}, ex)
     names
 end
 
+function _kernel_assignment_names!(names::Set{Symbol}, lhs)
+    if lhs isa Symbol
+        push!(names, lhs)
+    elseif lhs isa Expr && lhs.head in (:(::), :kw, :(...))
+        _kernel_assignment_names!(names, lhs.args[1])
+    elseif lhs isa Expr && lhs.head in (:tuple, :parameters)
+        for arg in lhs.args
+            _kernel_assignment_names!(names, arg)
+        end
+    elseif lhs isa Expr && lhs.head === :call && lhs.args[1] isa Symbol
+        # Short-form local function definition: f(args...) = body.
+        push!(names, lhs.args[1])
+    elseif lhs isa Expr && lhs.head === :where
+        _kernel_assignment_names!(names, lhs.args[1])
+    end
+    names
+end
+
+function _kernel_function_parameters!(names::Set{Symbol}, signature)
+    if signature isa Expr && signature.head in (:(::), :where)
+        _kernel_function_parameters!(names, signature.args[1])
+    elseif signature isa Expr && signature.head === :call
+        signature.args[1] isa Symbol && push!(names, signature.args[1])
+        for arg in signature.args[2:end]
+            _kernel_bound_names!(names, arg)
+        end
+    else
+        _kernel_bound_names!(names, signature)
+    end
+    names
+end
+
+# Julia function bodies are hard scopes: a plain local assignment anywhere in
+# the body makes that name local throughout the body, including sibling begin
+# blocks and branches. Find those binders before inferring graph dependencies.
+# Nested hard scopes own their bindings and are intentionally not descended.
+function _kernel_scope_locals!(names::Set{Symbol}, ex)
+    ex isa Expr || return names
+    ex.head in (:quote, :->, :function, :let, :generator, :comprehension) &&
+        return names
+    if ex.head === :(=)
+        _kernel_assignment_names!(names, ex.args[1])
+        _kernel_scope_locals!(names, ex.args[2])
+        return names
+    elseif ex.head in (:local, :global)
+        for declaration in ex.args
+            if declaration isa Expr && declaration.head === :(=)
+                _kernel_assignment_names!(names, declaration.args[1])
+                _kernel_scope_locals!(names, declaration.args[2])
+            else
+                _kernel_assignment_names!(names, declaration)
+            end
+        end
+        return names
+    end
+    for arg in ex.args
+        _kernel_scope_locals!(names, arg)
+    end
+    names
+end
+
 function _kernel_free_ports!(out::Vector{Symbol}, seen::Set{Symbol}, ex,
                              known::Set{Symbol}, bound::Set{Symbol})
     if ex isa Symbol
@@ -119,6 +195,7 @@ function _kernel_free_ports!(out::Vector{Symbol}, seen::Set{Symbol}, ex,
     if ex.head === :->
         local_bound = copy(bound)
         _kernel_bound_names!(local_bound, ex.args[1])
+        _kernel_scope_locals!(local_bound, ex.args[2])
         _kernel_free_ports!(out, seen, ex.args[2], known, local_bound)
         return out
     elseif ex.head === :kw
@@ -146,6 +223,7 @@ function _kernel_free_ports!(out::Vector{Symbol}, seen::Set{Symbol}, ex,
                 _kernel_bound_names!(local_bound, binding)
             end
         end
+        _kernel_scope_locals!(local_bound, ex.args[end])
         _kernel_free_ports!(out, seen, ex.args[end], known, local_bound)
         return out
     elseif ex.head === :generator || ex.head === :comprehension
@@ -177,7 +255,15 @@ function _kernel_free_ports!(out::Vector{Symbol}, seen::Set{Symbol}, ex,
         return out
     elseif ex.head === :function
         local_bound = copy(bound)
-        _kernel_bound_names!(local_bound, ex.args[1])
+        _kernel_function_parameters!(local_bound, ex.args[1])
+        _kernel_scope_locals!(local_bound, ex.args[2])
+        _kernel_free_ports!(out, seen, ex.args[2], known, local_bound)
+        return out
+    elseif ex.head === :(=) && ex.args[1] isa Expr &&
+           ex.args[1].head in (:call, :where)
+        local_bound = copy(bound)
+        _kernel_function_parameters!(local_bound, ex.args[1])
+        _kernel_scope_locals!(local_bound, ex.args[2])
         _kernel_free_ports!(out, seen, ex.args[2], known, local_bound)
         return out
     end
@@ -190,7 +276,9 @@ end
 
 function _kernel_free_ports(ex, known::Set{Symbol})
     out = Symbol[]
-    _kernel_free_ports!(out, Set{Symbol}(), ex, known, Set{Symbol}())
+    bound = Set{Symbol}()
+    _kernel_scope_locals!(bound, ex)
+    _kernel_free_ports!(out, Set{Symbol}(), ex, known, bound)
 end
 
 function _kernel_recipe(ex)
@@ -228,6 +316,19 @@ function _kernel_return_names(ex)
     names
 end
 
+function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol})
+    if rhs isa Expr && rhs.head === :call && !isempty(rhs.args)
+        callee = rhs.args[1]
+        args = rhs.args[2:end]
+        callee_is_port = callee isa Symbol && callee in known
+        if !callee_is_port && length(args) == length(deps) &&
+           all(i -> args[i] === deps[i], eachindex(args))
+            return callee
+        end
+    end
+    Expr(:->, Expr(:tuple, deps...), rhs)
+end
+
 function _kernel_expand(block)
     statements = block isa Expr && block.head === :block ? block.args : Any[block]
     graph_var = gensym(:kernel_graph)
@@ -236,8 +337,11 @@ function _kernel_expand(block)
     have_var = gensym(:kernel_have)
     want_var = gensym(:kernel_want)
     port_vars = Dict{Symbol,Symbol}()
-    known = Set{Symbol}()
-    body = Any[]
+    port_order = Symbol[]
+    annotations = Dict{Symbol,Vector{Any}}()
+    have_names = Symbol[]
+    want_names = Symbol[]
+    entries = Any[]
     saw_return = false
 
     declare_ref = GlobalRef(@__MODULE__, :_kernel_declare!)
@@ -246,26 +350,21 @@ function _kernel_expand(block)
     spec_ref = GlobalRef(@__MODULE__, :KernelSpec)
     graph_ref = GlobalRef(@__MODULE__, :Graph)
     value_ref = GlobalRef(@__MODULE__, :Value)
+    dict_ref = GlobalRef(Base, :Dict)
+    symbol_ref = GlobalRef(Core, :Symbol)
 
-    function declare!(name::Symbol, type_expr; input::Bool)
-        if !haskey(port_vars, name)
-            type_expr === nothing && throw(ArgumentError(
-                "new kernel port :$name needs an explicit type annotation, for example $name::Float64"))
-            port_vars[name] = gensym(name)
-            push!(known, name)
-        elseif type_expr === nothing
-            input && push!(body, :($push_unique_ref($have_var, $(QuoteNode(name)))))
-            return port_vars[name]
+    function register!(name::Symbol, type_expr)
+        if !(name in port_order)
+            push!(port_order, name)
+            annotations[name] = Any[]
         end
-        if type_expr !== nothing
-            value_var = port_vars[name]
-            push!(body, :($value_var = $declare_ref(
-                $graph_var, $ports_var, $order_var, $(QuoteNode(name)), $type_expr)))
-        end
-        input && push!(body, :($push_unique_ref($have_var, $(QuoteNode(name)))))
-        port_vars[name]
+        type_expr === nothing || push!(annotations[name], type_expr)
+        name
     end
 
+    # Pass 1: collect the complete named-port namespace, all type annotations,
+    # and the boundary. Recipe dependency inference must not depend on statement
+    # order: forward inputs and forward intermediates are ordinary graph edges.
     for raw in statements
         _kernel_is_line(raw) && continue
         saw_return && throw(ArgumentError("@kernel statements cannot follow return"))
@@ -274,10 +373,9 @@ function _kernel_expand(block)
             saw_return = true
             returned = _kernel_return_names(only(raw.args))
             for name in returned
-                name in known || throw(ArgumentError(
-                    "@kernel returns undeclared port :$name"))
-                push!(body, :($push_unique_ref($want_var, $(QuoteNode(name)))))
+                _kernel_push_unique!(want_names, name)
             end
+            push!(entries, (:return, returned))
             continue
         end
 
@@ -290,45 +388,76 @@ function _kernel_expand(block)
             outputs = Tuple{Symbol,Any}[]
             for item in lhs_items
                 name, type_expr = _kernel_port_decl(item)
-                if !(name in known) && type_expr === nothing
-                    throw(ArgumentError(
-                        "new kernel output :$name needs an explicit type annotation"))
-                end
+                register!(name, type_expr)
                 push!(outputs, (name, type_expr))
             end
-
-            deps = _kernel_free_ports(rhs, known)
-            for (name, type_expr) in outputs
-                declare!(name, type_expr; input = false)
-            end
-            dep_values = Expr(:tuple, (port_vars[name] for name in deps)...)
-            out_values = Expr(:tuple, (port_vars[name] for (name, _) in outputs)...)
-            op = Expr(:->, Expr(:tuple, deps...), rhs)
-            cost = get(metadata, :cost, 1.0)
-            cse_key = get(metadata, :cse_key, nothing)
-            effectful = get(metadata, :effectful, false)
-            push!(body, :($add_ref($graph_var, $dep_values, $out_values,
-                                   $op, $cost, $cse_key, $effectful)))
+            push!(entries, (:recipe, outputs, rhs, metadata))
             continue
         end
 
         isempty(metadata) || throw(ArgumentError("@recipe must wrap a recipe assignment"))
         if raw isa Expr && raw.head === :(::) && raw.args[1] isa Symbol
             name, type_expr = _kernel_port_decl(raw)
-            declare!(name, type_expr; input = true)
+            register!(name, type_expr)
+            _kernel_push_unique!(have_names, name)
+            push!(entries, (:input, name))
             continue
         end
         throw(ArgumentError(
             "unsupported @kernel statement $(repr(raw)); expected a typed input, recipe assignment, or return"))
     end
 
+    known = Set(port_order)
+    for name in want_names
+        name in known || throw(ArgumentError("@kernel returns undeclared port :$name"))
+    end
+    for name in port_order
+        isempty(annotations[name]) && throw(ArgumentError(
+            "kernel port :$name needs an explicit type annotation somewhere in the block"))
+        port_vars[name] = gensym(name)
+    end
+
+    # Pass 2: declare every port before adding any recipe, then emit recipes in
+    # authored order. Repeated annotations are checked by `_kernel_declare!` so
+    # incompatible declarations fail during construction with their real types.
+    prelude = Any[]
+    for name in port_order
+        value_var = port_vars[name]
+        for type_expr in annotations[name]
+            push!(prelude, :($value_var = $declare_ref(
+                $graph_var, $ports_var, $order_var, $(QuoteNode(name)), $type_expr)))
+        end
+    end
+    for name in have_names
+        push!(prelude, :($push_unique_ref($have_var, $(QuoteNode(name)))))
+    end
+
+    body = Any[]
+    for entry in entries
+        entry[1] === :recipe || continue
+        _, outputs, rhs, metadata = entry
+        deps = _kernel_free_ports(rhs, known)
+        dep_values = Expr(:tuple, (port_vars[name] for name in deps)...)
+        out_values = Expr(:tuple, (port_vars[name] for (name, _) in outputs)...)
+        op = _kernel_operation(rhs, deps, known)
+        cost = get(metadata, :cost, 1.0)
+        cse_key = get(metadata, :cse_key, nothing)
+        effectful = get(metadata, :effectful, false)
+        push!(body, :($add_ref($graph_var, $dep_values, $out_values,
+                               $op, $cost, $cse_key, $effectful)))
+    end
+    for name in want_names
+        push!(body, :($push_unique_ref($want_var, $(QuoteNode(name)))))
+    end
+
     quote
         let
             $graph_var = $graph_ref()
-            $ports_var = Dict{Symbol,$value_ref}()
-            $order_var = Symbol[]
-            $have_var = Symbol[]
-            $want_var = Symbol[]
+            $ports_var = $dict_ref{$symbol_ref,$value_ref}()
+            $order_var = $symbol_ref[]
+            $have_var = $symbol_ref[]
+            $want_var = $symbol_ref[]
+            $(prelude...)
             $(body...)
             $spec_ref($graph_var, $ports_var, $order_var, $have_var, $want_var)
         end
@@ -344,9 +473,12 @@ end
 
 Build a named, typed [`KernelSpec`](@ref) without executing any recipe RHS.
 Bare typed declarations are default `have` ports. An assignment creates one
-recipe; newly introduced outputs need a type annotation, tuple assignment
-creates a multi-output recipe, and assigning an existing output again creates
-an alternative producer. `return` declares the default `want` boundary.
+recipe; every named port needs a type annotation somewhere in the block, tuple
+assignment creates a multi-output recipe, and assigning an output again creates
+an alternative producer. Declarations and producers may be forward-referenced:
+the complete named-port namespace is collected before dependencies are inferred.
+When a caller global has the same name as a port, qualify the global with its
+module name. `return` declares the default `want` boundary.
 
 Recipe metadata uses the compact form
 
@@ -462,6 +594,16 @@ function _kernel_clone_aliases!(graph::Graph, ports::Dict{Symbol,Value},
     graph
 end
 
+function _kernel_reindex_producers!(graph::Graph)
+    empty!(graph.producers)
+    for recipe in graph.recipes, output in recipe.outputs
+        producers = get!(graph.producers, canon_id(graph, output.id), Int[])
+        recipe.id in producers || push!(producers, recipe.id)
+    end
+    graph.version += 1
+    graph
+end
+
 """
     merge(base::KernelSpec, fragment::KernelSpec; boundary=:base) -> KernelSpec
 
@@ -495,6 +637,7 @@ function Base.merge(base::KernelSpec, fragment::KernelSpec; boundary::Symbol = :
     _kernel_clone_aliases!(graph, ports, base)
     _kernel_clone_recipes!(graph, ports, fragment)
     _kernel_clone_aliases!(graph, ports, fragment)
+    _kernel_reindex_producers!(graph)
 
     chosen = boundary === :base ? base : fragment
     KernelSpec(graph, ports, order, copy(chosen.have_names), copy(chosen.want_names))

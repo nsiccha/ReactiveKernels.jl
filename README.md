@@ -29,7 +29,7 @@ the same graph, and the numeric boundary accepts forward-mode AD dual numbers.
 ## Pipeline
 
 ```
-user graph + have/want query
+declarative kernel + have/want query
         │  dependency pruning
         │  alternative-producer cost selection
         │  CSE / topological scheduling
@@ -44,22 +44,46 @@ straight-line Julia Expr  ──►  (optional AST passes)  ──►  RuntimeGe
 ```julia
 using ReactiveKernels
 
-g = Graph()
-x = value!(g, :x, Float64)
-a = value!(g, :a, Float64)
-b = value!(g, :b, Float64)
+g = @kernel begin
+    x::Float64
+    @recipe (cost = 1.0) a::Float64 = x + 1.0
+    @recipe (cost = 1.0) b::Float64 = 2a
+    return b
+end
 
-add!(g, x => a, x -> x + 1.0; cost = 1.0)
-add!(g, a => b, a -> 2a;      cost = 1.0)
-
-k = prepare(g; have = (x,), want = (b,))
+k = prepare(g)
 k(1.2)            # 4.4  — a straight-line kernel: b = 2*(x+1)
+```
+
+### Low-level `Graph` escape hatch (equivalent)
+
+`@kernel` is only hygienic construction of the low-level objects. For tooling
+that already owns `Value`s, the imperative API remains available and produces
+the same plan and generated code:
+
+```julia
+authored = @kernel begin
+    x::Float64
+    a::Float64 = x + 1.0
+    b::Float64 = 2a
+    return b
+end
+
+low = Graph()
+low_x = value!(low, :x, Float64)
+low_a = value!(low, :a, Float64)
+low_b = value!(low, :b, Float64)
+add!(low, low_x => low_a, x -> x + 1.0)
+add!(low, low_a => low_b, a -> 2a)
+
+@assert code_expr(plan(authored)) ==
+        code_expr(plan(low; have = low_x, want = low_b))
 ```
 
 Inspection is first-class:
 
 ```julia
-p = plan(g; have = (x,), want = (b,))
+p = plan(g)
 println(explain(p))     # have/want, selected recipes + costs, alternatives, total cost
 code_expr(p)            # the generated Julia Expr, before RGF compilation
 inputs(k), outputs(k)   # graph values in call / return order
@@ -89,22 +113,54 @@ The planner selects the globally cheapest *set* of recipes — not a per-value
 shortest path — accounting for shared work.
 
 ```julia
-g = Graph()
-u, a, b, c, r = (value!(g, s, Float64) for s in (:u, :a, :b, :c, :r))
+g = @kernel begin
+    u::Float64
+    @recipe (cost = 1.0) a::Float64 = cheap_a(u)
+    @recipe (cost = 1.2) (a, b::Float64) = combined_ab(u)
+    @recipe (cost = 1.0) b = make_b(a)
+    @recipe (cost = 1.0) c::Float64 = make_c(a)
+    @recipe (cost = 1.0) r::Float64 = finish(b, c)
+    return r
+end
 
-add!(g, u => a,       cheap_a;     cost = 1.0)   # cheap route to `a` only
-add!(g, u => (a, b),  combined_ab; cost = 1.2)   # produces a AND b together
-add!(g, a => b,       make_b;      cost = 1.0)
-add!(g, a => c,       make_c;      cost = 1.0)
-add!(g, (b, c) => r,  finish;      cost = 1.0)
-
-prepare(g; have = (u,), want = (a,))   # chooses cheap_a  (cost 1.0)
-prepare(g; have = (u,), want = (r,))   # chooses combined_ab, since b is needed too (cost 3.2 < 4.0)
-prepare(g; have = (a, b), want = (r,)) # starts at the boundary: only make_c + finish
+prepare(g; want = :a)                    # chooses cheap_a  (cost 1.0)
+prepare(g)                               # chooses combined_ab (cost 3.2 < 4.0)
+prepare(g; have = (:a, :b), want = :r)  # only make_c + finish
 ```
 
 Values in `have` are authoritative — the planner never emits code to recompute
 them.
+
+## Composition and extension
+
+Fragments compose through typed named ports. `merge` is pure: it builds a fresh
+spec, unifies same-name/same-type ports, copies both recipe sets, and rejects a
+type mismatch before constructing a partial result.
+
+```julia
+base = @kernel begin
+    position::Float64
+    energy::Float64 = abs2(position) / 2
+    return energy
+end
+
+diagnostics = @kernel begin
+    energy::Float64
+    energy_squared::Float64 = abs2(energy)
+    return energy_squared
+end
+
+extended = merge(base, diagnostics)
+prepare(extended)(2.0)                         # 2.0, same boundary as `base`
+prepare(extended; want = (:energy, :energy_squared))(2.0) # (2.0, 4.0)
+```
+
+The base boundary is preserved by default, so adding diagnostics does not alter
+the ordinary call or return shape and unused observables generate no work. Use
+`merge(base, fragment; boundary = :fragment)` only when replacing both default
+inputs and outputs is intentional. This is the extension path for augmenting a
+NUTS graph with downstream-specific observables while retaining a drop-in
+regular-NUTS kernel.
 
 ## Reactive / incremental use
 
@@ -114,12 +170,12 @@ input that fed an *unused* alternative path does **not** invalidate a cached
 value.
 
 ```julia
-state = ReactiveState(g; materialize = (a,))
-set!(state, x, 1.0)
-out1 = get!(state, b)        # computes a, caches it
+state = ReactiveState(g; materialize = :a)
+set!(state, g.x, 1.0)
+out1 = get!(state, g.b)        # computes a, caches it
 
-set!(state, x, 1.5)          # only x changes → a's provenance is stale
-out2 = get!(state, b)        # a recomputed on demand; unrelated caches survive
+set!(state, g.x, 1.5)          # only x changes → a's provenance is stale
+out2 = get!(state, g.b)        # a recomputed on demand; unrelated caches survive
 ```
 
 **Frozen cut points** support cross-phase replay without any `train`/`test`
@@ -178,11 +234,11 @@ The source revisions are pinned in the example files so the compatibility
 corpus is auditable.
 
 For documentation, `examples/artifacts.jl` exposes all 13 compatibility cases
-as executable `ExampleArtifact` records. Each record carries the pinned raw
-source/call and runtime inputs, the real `PreparedKernel` and its executed
-output, the exact `code_expr` generated from that kernel, and its selected
-`Plan`. The visualization layer consumes the plan directly, so docs can render
-the colored compute DAG without reconstructing graph semantics:
+as executable `ExampleArtifact` records. Each record carries the corresponding
+compact `@kernel` source and runtime inputs, the real `PreparedKernel` and its
+executed output, the exact `code_expr` generated from that kernel, and its
+selected `Plan`. The visualization layer consumes the plan directly, so docs
+can render the colored compute DAG without reconstructing graph semantics:
 
 ```julia
 include("examples/artifacts.jl")
@@ -214,15 +270,14 @@ The first kernel call seeds its caches; later calls offer them back to the
 registered mutating implementation:
 
 ```julia
-g = Graph()
-x = value!(g, :x, Vector{Float64})
-a = value!(g, :a, Vector{Float64})
-b = value!(g, :b, Vector{Float64})
+g = @kernel begin
+    x::Vector{Float64}
+    a::Vector{Float64} = copy(x)
+    b::Vector{Float64} = reverse(a)
+    return b
+end
 
-add!(g, x => a, copy)
-add!(g, a => b, reverse)
-
-k = prepare_nonallocating(g; have = (x,), want = (b,))
+k = prepare_nonallocating(g)
 k([1.0, 2.0, 3.0])  # warm-up: seeds the `copy` and `reverse` caches
 y = k([4.0, 5.0])    # reuses both caches; y == [5.0, 4.0]
 ```
@@ -259,7 +314,8 @@ MutatingFunctions; CI runs both paths independently.
 
 | Concept | Functions |
 |---|---|
-| Build | `Graph`, `value`, `value!`, `add!`, `compose` |
+| Author / compose | `@kernel`, `KernelSpec`, `merge`, `compose`, `port`, `kernel_graph` |
+| Low-level build | `Graph`, `value`, `value!`, `add!` |
 | Plan | `plan`, `explain`, `code_expr`, `inputs`, `outputs` |
 | Visualize | `visualize`, `dot_source`, `save_visualization` |
 | Lower / compile | `lower`, `transform`, `compile`, `prepare`, `prepare_nonallocating` |
