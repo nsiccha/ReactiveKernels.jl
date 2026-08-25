@@ -104,6 +104,9 @@ function checkpoint(st::ReactiveState, values)
     for v in _astuple(values)
         id = _cid(st, v)
         haskey(st.values, id) || error("checkpoint: value $(v.name) is not materialized yet")
+        _valid(st, id) || error(
+            "checkpoint: value $(v.name) is stale; recompute it with get! before checkpointing",
+        )
         cp[id] = st.values[id]
     end
     cp
@@ -120,13 +123,19 @@ function _valid(st::ReactiveState, id::Int, visiting = Set{Int}())
     pol === :reactive || return false
     (id in visiting) && return false
     push!(visiting, id)
-    prov = get(st.provenance, id, nothing)
-    prov === nothing && return false
-    for (dep, ver) in prov
-        (get(st.versions, dep, -1) == ver) || return false
-        _valid(st, dep, visiting) || return false
+    try
+        prov = get(st.provenance, id, nothing)
+        prov === nothing && return false
+        for (dep, ver) in prov
+            (get(st.versions, dep, -1) == ver) || return false
+            _valid(st, dep, visiting) || return false
+        end
+        true
+    finally
+        # `visiting` is the current recursion stack, not a global seen set.
+        # Sibling provenance branches may legitimately share a dependency.
+        delete!(visiting, id)
     end
-    true
 end
 
 # Effective HAVE (gist §18): authoritative source/frozen values, plus reactive
@@ -150,15 +159,14 @@ end
 # The have values a plan actually consumes (kernel inputs), sorted by id for a
 # stable reuse signature.
 function _needed_have(g::Graph, p::Plan, have_set::Set{Int})
-    produced = Set(canon_id(g, o.id) for r in p.recipes for o in r.outputs)
     needed = Set{Int}()
     for r in p.recipes, inp in r.inputs
         cid = canon_id(g, inp.id)
-        (cid in have_set) && !(cid in produced) && push!(needed, cid)
+        (cid in have_set) && push!(needed, cid)
     end
     for w in p.want
         cid = canon_id(g, w.id)
-        (cid in have_set) && !(cid in produced) && push!(needed, cid)
+        (cid in have_set) && push!(needed, cid)
     end
     [g.values[id] for id in sort!(collect(needed))]
 end
