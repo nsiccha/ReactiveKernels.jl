@@ -24,6 +24,29 @@ import Banner from '@/Banner.vue'
 import './overrides.css' // You could setup your own, or else a default will be copied.
 import { setupKernelExamples } from './kernel-example'
 
+function exposeDagLibraries() {
+  if (typeof window === 'undefined') return
+  const dagWindow = window as Window & {
+    __rkDagLibraries?: Promise<void>
+    __rkDagLoadBundledLibraries?: () => Promise<void>
+  }
+  dagWindow.__rkDagLoadBundledLibraries = () => {
+    if (dagWindow.__rkDagLibraries) return dagWindow.__rkDagLibraries
+    dagWindow.__rkDagLibraries = Promise.all([
+      import('cytoscape'),
+      // cytoscape-elk does not publish TypeScript declarations.
+      // @ts-expect-error missing upstream declaration
+      import('cytoscape-elk'),
+    ]).then(([cytoscapeModule, elkExtensionModule]) => {
+      const cytoscape = cytoscapeModule.default
+      const cytoscapeElk = elkExtensionModule.default
+      cytoscape.use(cytoscapeElk)
+      Object.assign(window, { cytoscape, cytoscapeElk })
+    })
+    return dagWindow.__rkDagLibraries
+  }
+}
+
 // `v-exec-scripts` runs the <script> tags inside a `v-html`'d block: innerHTML never executes
 // scripts, so we re-create each one. `src` scripts are awaited so order holds (bundle before
 // its callers). Used on interactive text/html output (WGLMakie/Bonito, Plotly) which the writer
@@ -60,6 +83,10 @@ export const Theme: ThemeConfig = {
     })
   },
   enhanceApp({ app, router, siteData }) {
+    // Public docs lazy-load the Vite-bundled renderer only on pages that mount
+    // a DAG. The HTML component's pinned CDN fallback remains for notebooks
+    // and saved standalone documents outside this host.
+    exposeDagLibraries()
     enhanceAppWithTabs(app);
     app.component('VersionPicker', VersionPicker);
     app.component('AuthorBadge', AuthorBadge)
