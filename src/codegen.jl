@@ -1,0 +1,198 @@
+# Lowering a Plan to ordinary straight-line Julia, the optional AST-transform
+# boundary, and final RGF compilation into a PreparedKernel.
+#
+# Operations are *not* referenced as globals in the generated code (that would
+# be fragile under world age; gist §9). Instead every selected recipe's `op` is
+# passed positionally in an `__ops__` tuple and called by literal index, so the
+# generated body is closed over nothing and specializes on the concrete op
+# types. The hot path therefore touches no graph object.
+
+const _OPS_ARG = :__ops__
+
+# Assign a source-variable Symbol to every value appearing in the plan, reusing
+# the readable value name and disambiguating only genuine name collisions.
+function _varnames(p::Plan)
+    ids = Int[]
+    for v in p.have; push!(ids, v.id); end
+    for r in p.recipes, o in r.outputs; push!(ids, o.id); end
+    for w in p.want; push!(ids, w.id); end
+    unique!(ids)
+    namecount = Dict{Symbol,Int}()
+    for id in ids
+        n = p.graph.values[id].name
+        namecount[n] = get(namecount, n, 0) + 1
+    end
+    out = Dict{Int,Symbol}()
+    for id in ids
+        n = p.graph.values[id].name
+        out[id] = namecount[n] > 1 ? Symbol(n, :_, id) : n
+    end
+    out
+end
+
+"""
+    lower(p::Plan) -> Expr
+
+Lower a plan to an ordinary anonymous-function `Expr` of the form
+
+    function (__ops__, x::T1, y::T2)
+        a = __ops__[1](x, y)
+        ...
+        return out
+    end
+
+This `Expr` is a first-class artifact: it may be inspected (`code_expr`) and
+rewritten (`transform`) before compilation (gist §9).
+"""
+function lower(p::Plan)
+    names = _varnames(p)
+    argexprs = Any[_OPS_ARG]
+    for v in p.have
+        push!(argexprs, :($(names[v.id])::$(valtype(v))))
+    end
+    body = Expr(:block)
+    for (k, r) in enumerate(p.recipes)
+        callargs = Any[names[inp.id] for inp in r.inputs]
+        call = Expr(:call, Expr(:ref, _OPS_ARG, k), callargs...)
+        if length(r.outputs) == 1
+            push!(body.args, Expr(:(=), names[r.outputs[1].id], call))
+        else
+            lhs = Expr(:tuple, (names[o.id] for o in r.outputs)...)
+            push!(body.args, Expr(:(=), lhs, call))
+        end
+    end
+    retval = length(p.want) == 1 ? names[p.want[1].id] :
+             Expr(:tuple, (names[w.id] for w in p.want)...)
+    push!(body.args, Expr(:return, retval))
+    Expr(:function, Expr(:tuple, argexprs...), body)
+end
+
+"""
+    transform(ast, passes...) -> Expr
+
+Apply zero or more AST passes (each an `Expr -> Expr` function) in order. This
+is the extension point for simplification, mutation/bufferization, or
+backend-specific rewrites; it must not change planning semantics (gist §9).
+"""
+transform(ast::Expr, passes...) = foldl((a, pass) -> pass(a), passes; init = ast)
+
+"""
+    compile(ast::Expr) -> callable
+
+Compile a lowered `Expr` into a native Julia function via
+`RuntimeGeneratedFunctions`. The returned callable takes `(__ops__, args...)`.
+"""
+compile(ast::Expr) = @RuntimeGeneratedFunction(ast)
+
+"""
+    PreparedKernel
+
+A small callable object holding the RGF-generated function, the positional
+`ops` tuple, and metadata (graph values in call/return order, the plan, and the
+lowered AST). Runtime invocation does not consult any planning logic.
+"""
+struct PreparedKernel{F,O,IN,OUT}
+    f::F
+    ops::O
+    inputs::IN
+    outputs::OUT
+    plan::Plan
+    ast::Expr
+end
+
+@inline (k::PreparedKernel)(args...) = k.f(k.ops, args...)
+
+function _prepare(p::Plan, ast::Expr)
+    f = compile(ast)
+    ops = ntuple(i -> p.recipes[i].op, length(p.recipes))
+    PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, ast)
+end
+
+"""
+    prepare(p::Plan; passes=()) -> PreparedKernel
+    prepare(g::Graph; have, want, passes=()) -> PreparedKernel
+
+Ergonomic composition of `plan -> lower -> transform -> compile`. `passes` is a
+tuple of AST passes applied before compilation.
+"""
+prepare(p::Plan; passes = ()) =
+    _prepare(p, isempty(passes) ? lower(p) : transform(lower(p), passes...))
+
+function prepare(g::Graph; have = (), want = (), passes = ())
+    p = plan(g; have = have, want = want)
+    prepare(p; passes = passes)
+end
+
+"Graph values in positional call order."
+inputs(k::PreparedKernel) = k.inputs
+inputs(p::Plan) = Tuple(p.have)
+"Graph values in return order."
+outputs(k::PreparedKernel) = k.outputs
+outputs(p::Plan) = Tuple(p.want)
+
+"""
+    code_expr(p) -> Expr
+
+The generated Julia `Expr` before RGF compilation. Accepts a `Plan` or a
+`PreparedKernel`. Useful for asserting that unused operations are literally
+absent from the kernel (gist §20).
+"""
+code_expr(p::Plan) = lower(p)
+code_expr(k::PreparedKernel) = k.ast
+
+# --- explanation -----------------------------------------------------------
+
+_opname(op) = try
+    n = nameof(op)
+    startswith(string(n), "#") ? string(op) : string(n)
+catch
+    string(op)
+end
+
+function _recipe_line(r::Recipe)
+    ins = join([string(v.name) for v in r.inputs], ", ")
+    outs = length(r.outputs) == 1 ? string(r.outputs[1].name) :
+           "(" * join([string(v.name) for v in r.outputs], ", ") * ")"
+    "$outs = $(_opname(r.op))($ins)"
+end
+
+"""
+    explain(p::Plan) -> String
+
+Human-readable account of the plan: the have/want boundary, the selected
+recipes with costs, the total cost, and the backward-reachable alternatives
+that were not selected (gist §16).
+"""
+function explain(p::Plan)
+    io = IOBuffer()
+    println(io, "Have:")
+    println(io, "  ", isempty(p.have) ? "(none)" : join([string(v.name) for v in p.have], ", "))
+    println(io, "Want:")
+    println(io, "  ", join([string(v.name) for v in p.want], ", "))
+    println(io, "Selected recipes:")
+    if isempty(p.recipes)
+        println(io, "  (none — all wanted values are already in HAVE)")
+    else
+        lines = [_recipe_line(r) for r in p.recipes]
+        w = maximum(length, lines)
+        for (r, l) in zip(p.recipes, lines)
+            println(io, "  ", rpad(l, w + 2), "cost ", r.cost)
+        end
+    end
+    selected = Set(r.id for r in p.recipes)
+    unused = [r for r in p.candidates if !(r.id in selected)]
+    if !isempty(unused)
+        println(io, "Alternatives not selected:")
+        for r in unused
+            println(io, "  ", rpad(_recipe_line(r), 0), "  (cost ", r.cost, ")")
+        end
+    end
+    print(io, "Total graph cost: ", p.cost)
+    String(take!(io))
+end
+
+Base.show(io::IO, p::Plan) = print(io, explain(p))
+function Base.show(io::IO, k::PreparedKernel)
+    print(io, "PreparedKernel(", join([string(v.name) for v in k.inputs], ", "),
+          " -> ", join([string(v.name) for v in k.outputs], ", "), ")")
+end
