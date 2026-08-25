@@ -3,7 +3,7 @@
 These executable examples sketch the boundary a future probabilistic-programming
 layer can build on without adding probability semantics to `ReactiveKernels`
 itself. `Distributions.jl` supplies distributions and `logpdf`; public
-`@kernel` fragments expose named, typed ports; `compose` joins fragments; and a
+`@kernel` fragments expose named ports (with optional type metadata); `compose` joins fragments; and a
 `prepare` query selects the requested log-density computation.
 
 `Distributions.jl` and `ForwardDiff.jl` are example, test, and documentation

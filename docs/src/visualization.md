@@ -7,11 +7,8 @@ prepared kernel's hot path.
 ## Quick use
 
 ```julia
-g = @kernel begin
-    x::Float64
-    y::Float64
-    out::Float64 = hypot(x, y)
-    return out
+@kernel g(x, y) = begin
+    out = hypot(x, y)
 end
 p = plan(g)
 
