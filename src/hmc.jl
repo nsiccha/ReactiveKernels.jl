@@ -812,18 +812,19 @@ function _probe_acceptance(state::NUTSState, stepsize)
 end
 
 """
-    find_initial_stepsize!(state; initial=1, target=0.5,
+    find_initial_stepsize!(state; initial=1, target=0.8,
                            min_stepsize=eps(Float64), max_stepsize=1e3)
 
 Find a reasonable leapfrog step size by doubling or halving until a one-step
-proposal crosses `target` acceptance. This is the standard NUTS initialization
-heuristic; it consumes random momentum draws but does not move the chain's
-position. `state.step_f` must have been built with
+proposal crosses `target` acceptance. This follows Stan's `init_stepsize`
+policy: each candidate receives a fresh momentum draw, and metric-window
+updates rerun the search before restarting dual averaging. It does not move the
+chain's position. `state.step_f` must have been built with
 `partial(integrator!; stepsize=...)`.
 """
 function find_initial_stepsize!(state::NUTSState;
                                 initial = one(state.energy_error),
-                                target = 0.5,
+                                target = 0.8,
                                 min_stepsize = eps(typeof(state.energy_error)),
                                 max_stepsize = oftype(state.energy_error, 1e3),
                                 max_iterations::Integer = 32)
@@ -923,6 +924,13 @@ function warmup!(state::NUTSState, iterations::Integer;
     iterations >= 1 || throw(ArgumentError(
         "warmup iterations must be positive",
     ))
+    zero(target_accept) < target_accept < one(target_accept) ||
+        throw(ArgumentError(
+            "target_accept must be strictly between zero and one",
+        ))
+    minimum_variance > zero(minimum_variance) || throw(ArgumentError(
+        "minimum_variance must be positive",
+    ))
     point = state.init
     if adapt_metric
         hasproperty(point.handles, :metric) || throw(ArgumentError(
@@ -966,10 +974,12 @@ function warmup!(state::NUTSState, iterations::Integer;
         undef, n,
     )
     next_window = 1
+    adaptation_updates = 0
     for iteration in 1:n
         transition = sample!(state)
         warmup_diagnostics[iteration] = transition
         fit!(adaptation, transition.acceptance_rate)
+        adaptation_updates += 1
         _set_stepsize!(state, adaptation.current)
 
         inside_slow_window = initial_count < iteration <= n - terminal_count
@@ -986,11 +996,12 @@ function warmup!(state::NUTSState, iterations::Integer;
             adaptation = dual_averaging_state(
                 restart_stepsize; target = target_accept,
             )
+            adaptation_updates = 0
             variance = welford_var(length(point.pos), eltype(point.pos))
             next_window += 1
         end
     end
-    _set_stepsize!(state, adaptation.final)
+    adaptation_updates == 0 || _set_stepsize!(state, adaptation.final)
     (;
         initial_stepsize,
         final_stepsize = state.step_f.stepsize,
