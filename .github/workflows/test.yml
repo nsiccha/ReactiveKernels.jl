@@ -25,8 +25,20 @@ jobs:
           version: ${{ matrix.julia-version }}
           arch: ${{ matrix.julia-arch }}
       - uses: julia-actions/cache@v2
+        with:
+          # Compiled caches are sensitive to Julia's coverage/bounds flags and
+          # RuntimeGeneratedFunctions' generated method worlds. Rebuild them
+          # for each job while retaining package, artifact, and registry caches.
+          cache-compiled: false
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
+        with:
+          # Coverage instrumentation is exercised on LTS. On Julia 1.12/pre it
+          # adds counter allocations to the zero-allocation probe, so use those
+          # lanes for the ordinary compiled, zero-allocation contract instead.
+          coverage: ${{ matrix.julia-version == 'lts' }}
+          check_bounds: yes
+          compiled_modules: yes
 
   nonallocating-integration:
     runs-on: ubuntu-latest
