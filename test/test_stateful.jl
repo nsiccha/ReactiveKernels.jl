@@ -405,34 +405,42 @@ end
     graph = Graph()
     v1 = value!(graph, :v1, Vector{Float64})
     v2 = value!(graph, :v2, Vector{Float64})
+    vt = value!(graph, :vt, Vector{Float64})   # spare temp group for swap-via-temp
     s1 = value!(graph, :s1, Float64)
     s2 = value!(graph, :s2, Float64)
     total = value!(graph, :total, Float64)
-    add!(graph, (v1, v2, s1, s2) => total,
-         (a, b, c, d) -> sum(a) + sum(b) + c + d)
-    program = prepare_reactive(graph; have = (v1, v2, s1, s2), want = (total,))
-    state = program([1.0], [2.0], 10.0, 20.0)
+    # vt is a consumed dependency (so it owns a slot) but does not affect total.
+    add!(graph, (v1, v2, vt, s1, s2) => total,
+         (a, b, _t, c, d) -> sum(a) + sum(b) + c + d)
+    program = prepare_reactive(graph; have = (v1, v2, vt, s1, s2), want = (total,))
+    state = program([1.0], [2.0], [0.0], 10.0, 20.0)
     hv1 = statevalue(program, v1); hv2 = statevalue(program, v2)
+    hvt = statevalue(program, vt)
     hs1 = statevalue(program, s1); hs2 = statevalue(program, s2)
     htot = statevalue(program, total)
     @test get!(state, htot) == 1.0 + 2.0 + 10.0 + 20.0
 
     # genuine TWO-slot array group in a single call
-    program(zeros(1), zeros(1), 0.0, 0.0)  # (compile the group path)
     set!(state, hv1, [7.0]); set!(state, hv2, [9.0])
     copy_group!(state, (hv1, hv2), (hv2, hv1))  # aliasing: NOT a swap (order-dependent)
     @test get!(state, hv1) == [9.0]             # v2 copied into v1 first
     @test get!(state, hv2) == [9.0]             # then v1 (already 9) into v2
 
-    # correct swap via a temporary group
+    # correct swap via a temporary group, entirely through copy_group! (t<-a, a<-b,
+    # b<-t) — the allocation-free idiom the sampler uses for endpoint/proposal swaps.
     set!(state, hv1, [7.0]); set!(state, hv2, [9.0])
-    tmp = program([0.0], [0.0], 0.0, 0.0)       # scratch source of same shape? use s-slots instead
-    # swap through v-nothing: use scalar-free temp by adding a third vector source
-    # (reuse s1/s2 for scalars below); here swap v1<->v2 via a plain Julia temp copy
-    a0 = copy(get!(state, hv1)); b0 = copy(get!(state, hv2))
-    # temp-group swap idiom requires a spare HAVE slot; emulate with set!
-    set!(state, hv1, b0); set!(state, hv2, a0)
-    @test get!(state, hv1) == b0 && get!(state, hv2) == a0
+    function _swap_via_temp!(st, a, b, t)
+        copy_group!(st, (t,), (a,))
+        copy_group!(st, (a,), (b,))
+        copy_group!(st, (b,), (t,))
+    end
+    _swap_via_temp!(state, hv1, hv2, hvt)          # warmup for the alloc measure
+    set!(state, hv1, [7.0]); set!(state, hv2, [9.0])
+    _swap_via_temp!(state, hv1, hv2, hvt)
+    @test get!(state, hv1) == [9.0]                # a now holds original b
+    @test get!(state, hv2) == [7.0]                # b now holds original a
+    _swap_alloc(st, a, b, t) = @allocated _swap_via_temp!(st, a, b, t)
+    @test _swap_alloc(state, hv1, hv2, hvt) == 0    # three-call swap is 0 B
 
     # MIXED scalar + array group in one call: array in-place, scalar set!
     set!(state, hv1, [1.0]); set!(state, hs1, 100.0)
