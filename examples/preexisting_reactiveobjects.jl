@@ -29,7 +29,7 @@ function chain_example()
 
     kernel = prepare(graph; have = (x,), want = (w,))
     (; initial, updated, recipe_count = length(kernel.plan.recipes),
-       allocations = _allocated(kernel, 10.0))
+       allocations = _allocated(kernel, 10.0), kernel)
 end
 
 "Port of ReactiveObjects.jl's `diamond` gallery example."
@@ -57,7 +57,7 @@ function diamond_example()
     kernel = prepare(graph; have = (a,), want = (d,))
     (; initial, b_only, updated,
        calls = (; b = calls[:b][], c = calls[:c][], d = calls[:d][]),
-       allocations = _allocated(kernel, 10.0))
+       allocations = _allocated(kernel, 10.0), kernel)
 end
 
 "Port of ReactiveObjects.jl's `shared` gallery example."
@@ -80,14 +80,24 @@ function shared_example()
 
     kernel = prepare(graph; have = (x,), want = (b, c))
     (; b = b_value, c = c_value, a_calls = a_calls[],
-       allocations = _allocated(kernel, 5.0))
+       allocations = _allocated(kernel, 5.0), kernel)
 end
 
 function run(io::IO = stdout)
+    chain = chain_example()
+    diamond = diamond_example()
+    shared = shared_example()
     println(io, "ReactiveObjects.jl compatibility examples")
-    println(io, "  chain:   ", chain_example())
-    println(io, "  diamond: ", diamond_example())
-    println(io, "  shared:  ", shared_example())
+    println(io, "  chain:   ", (;
+        chain.initial, chain.updated, chain.recipe_count, chain.allocations,
+    ))
+    println(io, "  diamond: ", (;
+        diamond.initial, diamond.b_only, diamond.updated, diamond.calls,
+        diamond.allocations,
+    ))
+    println(io, "  shared:  ", (;
+        shared.b, shared.c, shared.a_calls, shared.allocations,
+    ))
     nothing
 end
 

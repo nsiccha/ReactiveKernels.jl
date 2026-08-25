@@ -1,9 +1,12 @@
 include(joinpath(@__DIR__, "..", "examples", "preexisting_reactiveobjects.jl"))
 include(joinpath(@__DIR__, "..", "examples", "preexisting_reactivehmc.jl"))
+include(joinpath(@__DIR__, "..", "examples", "artifacts.jl"))
 
 using .ReactiveObjectsExamples
 using .ReactiveHMCExamples
 using LinearAlgebra
+using ReactiveKernels
+using .CompatibilityArtifacts
 
 @testset "preexisting ReactiveObjects.jl examples" begin
     chain = chain_example()
@@ -24,6 +27,18 @@ using LinearAlgebra
     @test shared.c == 18.0
     @test shared.a_calls == 1
     @test shared.allocations == 0
+end
+
+@testset "docs-ready compatibility artifacts" begin
+    artifacts = all_artifacts()
+    @test length(artifacts) == 13
+    @test length(unique(artifact.name for artifact in artifacts)) == 13
+    @test all(artifact -> !isempty(artifact.source), artifacts)
+    @test all(artifact -> artifact.generated == code_expr(artifact.kernel), artifacts)
+    @test all(artifact -> artifact.dag === artifact.kernel.plan, artifacts)
+    @test all(artifact -> isequal(
+        artifact.output, artifact.kernel(Tuple(artifact.inputs)...),
+    ), artifacts)
 end
 
 @testset "preexisting ReactiveHMC.jl examples" begin

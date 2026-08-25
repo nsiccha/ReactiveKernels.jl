@@ -152,6 +152,23 @@ threshold.
 The source revisions are pinned in the example files so the compatibility
 corpus is auditable.
 
+For documentation, `examples/artifacts.jl` exposes all 13 compatibility cases
+as executable `ExampleArtifact` records. Each record carries the pinned raw
+source/call and runtime inputs, the real `PreparedKernel` and its executed
+output, the exact `code_expr` generated from that kernel, and its selected
+`Plan`. The visualization layer consumes the plan directly, so docs can render
+the colored compute DAG without reconstructing graph semantics:
+
+```julia
+include("examples/artifacts.jl")
+using .CompatibilityArtifacts
+
+artifact = only(filter(x -> x.name == :reactiveobjects_chain, all_artifacts()))
+artifact.source       # original input/source
+artifact.generated    # actual lowered kernel Expr
+visualize(artifact.dag) # structured HAVE/WANT/recipe DAG
+```
+
 ## API surface
 
 | Concept | Functions |
