@@ -1,9 +1,21 @@
 using ReactiveKernels
-using ForwardDiff
+using DifferentiationInterface
+import Enzyme
 using Test
 
 include(joinpath(@__DIR__, "..", "examples", "eight_schools.jl"))
 using .EightSchoolsExample
+
+# Reverse-mode Enzyme through DifferentiationInterface. Runtime activity is
+# enabled because the prepared density kernel closes over constant model data
+# (the observations and their scales), which Enzyme's static activity analysis
+# cannot prove non-differentiable; the closure (which captures the prepared
+# kernel) is annotated `Const` because only the numeric input is differentiated,
+# never the kernel itself.
+const ENZYME_BACKEND = AutoEnzyme(;
+    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
+    function_annotation = Enzyme.Const,
+)
 
 @testset "manual PPL graph — eight schools" begin
     model = build_eight_schools_graph()
@@ -57,17 +69,33 @@ using .EightSchoolsExample
                     want = (model.density,))
         logdensity(qv) = k(Tuple(qv), EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA)
 
-        gradient = ForwardDiff.gradient(logdensity, collect(q))
+        qvec = collect(q)
+        gradient = DifferentiationInterface.gradient(
+            logdensity, ENZYME_BACKEND, qvec)
         @test length(gradient) == length(q)
         @test all(isfinite, gradient)
 
-        h = 1e-6
-        qplus = collect(q)
-        qminus = collect(q)
-        qplus[2] += h
-        qminus[2] -= h
-        finite_difference = (logdensity(qplus) - logdensity(qminus)) / (2h)
-        @test gradient[2] ≈ finite_difference rtol = 1e-6
+        # Enzyme derivative-aliasing caveat: DifferentiationInterface's
+        # out-of-place gradient must return freshly allocated memory that does
+        # not alias the mutable primal input.
+        @test gradient !== qvec
+        @test pointer(gradient) != pointer(qvec)
+
+        # Correctness is validated with no second differentiation backend. The
+        # μ-component has a closed form for this fixed q: the Normal(0, 5) prior
+        # contributes -μ/25 = -0.06, and the eight Normal(μ, τ) group terms
+        # contribute Σⱼ(θⱼ - μ)/τ² = (9 - 12)/4 = -0.75 (τ = exp(log 2) = 2), so
+        # ∂density/∂μ = -0.81 exactly.
+        @test gradient[1] ≈ -0.81
+        # The full gradient is pinned to independently established constants;
+        # these anchor a pure DI+Enzyme regression that needs no second
+        # differentiation backend as a dependency.
+        expected_gradient = [
+            -0.81, -6.338362068965517, 0.4358333333333333, 0.325,
+            0.1728515625, 0.17458677685950413, 0.034722222222222224,
+            -0.004132231404958678, 0.1, -0.0941358024691358,
+        ]
+        @test gradient ≈ expected_gradient
     end
 
     @testset "corrected core contracts hold on PPL paths" begin

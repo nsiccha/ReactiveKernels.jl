@@ -48,6 +48,10 @@ function _run_pinned_comparison()
             Pkg.PackageSpec(name = "DynamicHMC", version = v"3.6.1"),
             Pkg.PackageSpec(name = "LogDensityProblems", version = v"2.2.0"),
             Pkg.PackageSpec(name = "MCMCDiagnosticTools", version = v"0.3.19"),
+            # Every sampler's runtime gradient is DI+Enzyme reverse mode, pinned
+            # to the exact versions the DI+Enzyme test suite validated against.
+            Pkg.PackageSpec(name = "DifferentiationInterface", version = v"0.7.21"),
+            Pkg.PackageSpec(name = "Enzyme", version = v"0.13.199"),
         ])
         Pkg.precompile()
 

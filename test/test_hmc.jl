@@ -1,9 +1,21 @@
-using ForwardDiff
+using DifferentiationInterface
+import Enzyme
 using LinearAlgebra
 using Random
 using ReactiveKernels
 using Statistics
 using Test
+
+# Reverse-mode Enzyme through DifferentiationInterface for the eight-schools NUTS
+# gradient. Runtime activity is enabled because the prepared density kernel closes
+# over constant model data (observations and scales) that Enzyme's static activity
+# analysis cannot prove non-differentiable; the closure (which captures the
+# prepared kernel) is annotated `Const` because only the numeric position is
+# differentiated, never the kernel itself.
+const _HMC_ENZYME_BACKEND = AutoEnzyme(;
+    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
+    function_annotation = Enzyme.Const,
+)
 
 _gaussian_potential(position) = sum(abs2, position) / 2
 _gaussian_gradient(position) =
@@ -204,7 +216,7 @@ end
         length(first_chain.diagnostics)
 end
 
-@testset "eight-schools graph and ForwardDiff inside NUTS" begin
+@testset "eight-schools graph and DI+Enzyme inside NUTS" begin
     if !isdefined(Main, :EightSchoolsExample)
         include(joinpath(@__DIR__, "..", "examples", "eight_schools.jl"))
     end
@@ -232,7 +244,8 @@ end
     potential_gradient(position) = begin
         gradient_calls[] += 1
         value = logdensity(position)
-        (-value, -ForwardDiff.gradient(logdensity, position))
+        (-value, -DifferentiationInterface.gradient(
+            logdensity, _HMC_ENZYME_BACKEND, position))
     end
 
     initial = zeros(10)
