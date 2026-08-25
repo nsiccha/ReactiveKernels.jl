@@ -9,11 +9,12 @@ prepared kernel's hot path.
 ```julia
 p = plan(g; have = (x, y), want = (out,))
 
-p                                      # SVG in a rich Julia display
+p                                      # interactive HTML in a rich display
 visualize(p)                           # the configurable display object
 visualize(p; alternatives = true)     # add unselected candidates
 visualize(p; orientation = :vertical) # top-to-bottom instead of left-to-right
 
+save_visualization("plan.html", p)
 save_visualization("plan.svg", p)
 save_visualization("plan.dot", p)
 dot_source(p)
@@ -23,6 +24,24 @@ dot_source(p)
 shows only selected recipes by default, because that is usually the answer to
 “what will run?”. With `alternatives=true`, backward-reachable candidates that
 lost the cost selection remain visible as muted dashed nodes.
+
+The HTML view is a complete, dependency-free component: use **Fit**, **Zoom
+in**, and **Zoom out**, drag the canvas to pan, scroll to zoom at the pointer,
+or use `+`, `-`, and `0` from the focused canvas. Selecting a value or recipe
+opens its full state, detail, and incoming/outgoing connections in the side
+inspector. The component keeps its navigation and inspection state when a docs
+page moves the original DOM node between layouts.
+
+Documentation code can embed the public object directly—there is no second
+graph model or rendering implementation to copy:
+
+```julia
+view = visualize(artifact.dag) # artifact.dag::Plan
+html = sprint(show, MIME"text/html"(), view)
+```
+
+`showable(MIME"text/html"(), view)` is true. If a frontend does not support
+HTML, `image/svg+xml` remains the static rich-display fallback.
 
 ## Reading a diagram
 
@@ -43,23 +62,24 @@ Labels always retain the full value name, type, identity, operation name, cost,
 and recipe identity. Long text wraps across lines rather than being clipped.
 Structural-CSE aliases share one value node and list all alias names.
 
-## Why SVG plus DOT?
+## Why HTML plus SVG plus DOT?
 
-The two formats serve different portability layers:
+The three formats serve different portability layers:
 
 | Need | Surface | Tradeoff |
 |---|---|---|
-| Immediate notebook/IDE inspection | Built-in self-contained SVG | Zero setup and no package dependency; intentionally a compact layered layout for modest graphs |
+| Interactive notebook/docs inspection | Built-in self-contained HTML | Fit, pan, zoom, keyboard navigation, and structural inspection; no CDN or runtime package |
 | Files that render anywhere | `save_visualization("graph.svg", x)` | Static rather than interactive |
+| Standalone interactive artifact | `save_visualization("graph.html", x)` | Opens directly in a browser and contains its own SVG, CSS, and JavaScript |
 | Large or publication-oriented layout | `dot_source` or `.dot` / `.gv` export | A downstream Graphviz renderer is needed, but ReactiveKernels does not impose its binary/artifact footprint on every user |
 
 Mermaid was not chosen as the core renderer because rendering it requires a
-JavaScript integration in the host page, and syntax/version behavior becomes a
-frontend concern. Makie/D3-style interactive views can be useful for filtering,
-pan/zoom, or runtime overlays, but their dependency and application surface are
-better added later as optional consumers of the stable DOT export. The initial
-scope is deliberately inspect/export/save; it does not add graph editing,
-runtime profiling, or an interactive frontend.
+versioned Mermaid integration in the host page, and syntax/version behavior
+becomes a frontend concern. Makie/D3 would add a substantial dependency or
+application surface. The small built-in JavaScript progressively enhances the
+same accessible SVG that static frontends render; it does not fetch code or
+introduce another layout. Graph editing and runtime profiling remain out of
+scope.
 
 Successful `Plan`s are acyclic. A raw `Graph` may still contain a cycle; the
 built-in SVG keeps the involved nodes visible at a stable final rank so the

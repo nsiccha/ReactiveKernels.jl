@@ -49,6 +49,20 @@ viz_finish(b, c) = b + c
     @test !occursin('…', svg)
     @test svg == sprint(show, MIME"image/svg+xml"(), p)
 
+    html = sprint(show, MIME"text/html"(), view)
+    @test showable(MIME"text/html"(), view)
+    @test startswith(html, "<div class=\"rk-dag\"")
+    @test occursin("data-rk-fit", html)
+    @test occursin("data-rk-zoom-in", html)
+    @test occursin("data-rk-canvas", html)
+    @test occursin("data-rk-inspect-title", html)
+    @test occursin("data-rk-id=\"r_", html)
+    @test occursin("data-rk-src=", html)
+    @test occursin("root.rkDag", html)
+    @test occursin("u&lt;&amp;&quot;", html)
+    @test !occursin("<script src=", html)
+    @test html == sprint(show, MIME"text/html"(), p)
+
     graph_source = dot_source(g)
     @test occursin("viz_cheap", graph_source)
     @test occursin("viz_b", graph_source)
@@ -56,8 +70,11 @@ viz_finish(b, c) = b + c
 
     mktempdir() do dir
         svg_path = save_visualization(joinpath(dir, "plan.svg"), p)
+        html_path = save_visualization(joinpath(dir, "plan.html"), p)
         dot_path = save_visualization(joinpath(dir, "plan.dot"), view)
         @test startswith(read(svg_path, String), "<svg")
+        @test startswith(read(html_path, String), "<!doctype html>")
+        @test occursin("root.rkDag", read(html_path, String))
         @test startswith(read(dot_path, String), "digraph")
         @test_throws ArgumentError save_visualization(joinpath(dir, "plan.png"), p)
     end
@@ -69,6 +86,8 @@ viz_finish(b, c) = b + c
     @test occursin("digraph ReactiveKernels", dot_source(empty_graph))
     @test occursin("ReactiveKernels graph",
                    sprint(show, MIME"image/svg+xml"(), empty_graph))
+    @test occursin("Select a value or recipe",
+                   sprint(show, MIME"text/html"(), empty_graph))
 
     alias_graph = Graph()
     alias_input = value!(alias_graph, :alias_input, Int)
@@ -118,4 +137,15 @@ end
     p2 = plan(g2; have = (x2,), want = (b2, c2))
     @test length(p2.recipes) == 3
     @test occursin("total cost 3.0", sprint(show, MIME"image/svg+xml"(), p2))
+
+    # Reserved-looking value names remain ordinary data in all renderers and
+    # cannot collide with the generated kernel's internal argument names.
+    g3 = Graph()
+    reserved = value!(g3, :__ops__, Int)
+    reserved_out = value!(g3, :__rk_values__, Int)
+    add!(g3, reserved => reserved_out, identity)
+    p3 = plan(g3; have = (reserved,), want = (reserved_out,))
+    @test prepare(p3)(7) == 7
+    @test occursin("__ops__", dot_source(p3))
+    @test occursin("__rk_values__", sprint(show, MIME"text/html"(), p3))
 end
