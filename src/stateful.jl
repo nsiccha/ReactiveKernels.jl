@@ -285,7 +285,15 @@ statevalue(state::CompiledReactiveState, value::Value) =
 
 @inline _tuple_slot(tuple, ::Val{I}) where {I} = getfield(tuple, I)
 
+@inline function _check_state_version(state::CompiledReactiveState)
+    state.program.graph.version == state.program.graph_version || throw(ArgumentError(
+        "graph changed after prepare_reactive; prepare a new ReactiveProgram",
+    ))
+    nothing
+end
+
 function _check_handle(state::CompiledReactiveState, handle::ReactiveValue{I}) where {I}
+    _check_state_version(state)
     handle.graph === state.program.graph || throw(ArgumentError(
         "ReactiveValue belongs to a different graph",
     ))
@@ -380,6 +388,9 @@ set!(state::CompiledReactiveState, graph_value::Value, value) =
 "Freeze the current value of a derived slot as an authoritative cut point."
 function freeze!(state::CompiledReactiveState, handle::ReactiveValue{I}) where {I}
     _check_handle(state, handle)
+    state.program.sources[I] && throw(ArgumentError(
+        "ReactiveProgram HAVE values are already authoritative; use set!",
+    ))
     get!(state, handle)
     state.frozen[I] = true
     state
@@ -436,19 +447,46 @@ function checkpoint(state::CompiledReactiveState, values)
     result
 end
 
-_copy_slot_value!(destination::AbstractArray, source::AbstractArray) =
-    (copyto!(destination, source); destination)
+_copy_slot_value(value::AbstractArray) = copy(value)
+_copy_slot_value(value) = value
+
+function _copy_slot_value!(destination::AbstractArray, source::AbstractArray)
+    axes(destination) == axes(source) || return copy(source)
+    copyto!(destination, source)
+    destination
+end
 _copy_slot_value!(destination, source) = source
 
-@generated function _copy_slots!(destination::D, source::S) where {D<:Tuple,S<:Tuple}
+@generated function _copy_slots(slots::S, valid::BitVector) where {S<:Tuple}
+    body = Expr(:tuple)
+    for (index, slot_type) in enumerate(S.parameters)
+        value_type = slot_type.parameters[1]
+        push!(body.args, quote
+            if valid[$index]
+                Ref{$value_type}(_copy_slot_value(slots[$index][]))
+            else
+                Ref{$value_type}()
+            end
+        end)
+    end
+    body
+end
+
+@generated function _copy_slots!(destination::D, source::S,
+                                 destination_valid::BitVector,
+                                 source_valid::BitVector) where {D<:Tuple,S<:Tuple}
     length(D.parameters) == length(S.parameters) ||
         return :(throw(DimensionMismatch("compiled state slot counts differ")))
     body = Expr(:block)
     for index in 1:length(D.parameters)
         push!(body.args, quote
-            destination[$index][] = _copy_slot_value!(
-                destination[$index][], source[$index][],
-            )
+            if source_valid[$index]
+                destination[$index][] = if destination_valid[$index]
+                    _copy_slot_value!(destination[$index][], source[$index][])
+                else
+                    _copy_slot_value(source[$index][])
+                end
+            end
         end)
     end
     push!(body.args, :(destination))
@@ -456,10 +494,8 @@ _copy_slot_value!(destination, source) = source
 end
 
 function Base.copy(state::CompiledReactiveState)
-    slots = map(slot -> Ref(begin
-        value = slot[]
-        value isa AbstractArray ? copy(value) : value
-    end), state.slots)
+    _check_state_version(state)
+    slots = _copy_slots(state.slots, state.valid)
     CompiledReactiveState(
         state.program,
         slots,
@@ -471,10 +507,13 @@ end
 
 function Base.copyto!(destination::CompiledReactiveState,
                       source::CompiledReactiveState)
+    _check_state_version(destination)
+    _check_state_version(source)
     destination.program === source.program || throw(ArgumentError(
         "compiled states belong to different ReactivePrograms",
     ))
-    _copy_slots!(destination.slots, source.slots)
+    _copy_slots!(destination.slots, source.slots,
+                 destination.valid, source.valid)
     copyto!(destination.valid, source.valid)
     copyto!(destination.frozen, source.frozen)
     destination

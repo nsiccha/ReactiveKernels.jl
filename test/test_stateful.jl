@@ -101,7 +101,57 @@ end
 
     @test_throws ArgumentError touch!(state, grad)
     @test_throws ArgumentError set!(state, grad, zeros(2))
+    @test_throws ArgumentError freeze!(state, q)
+    @test all(!, state.frozen)
     @test_throws ArgumentError checkpoint(state, (q,))
+end
+
+@testset "compiled reactive fresh and partial state copies" begin
+    graph = Graph()
+    source = value!(graph, :source, Vector{Float64})
+    doubled = value!(graph, :doubled, Vector{Float64})
+    total = value!(graph, :total, Float64)
+    add!(graph, source => doubled, x -> 2 .* x)
+    add!(graph, source => total, sum)
+    program = prepare_reactive(
+        graph; have = (source,), want = (doubled, total),
+    )
+    source_state = statevalue(program, source)
+    doubled_state = statevalue(program, doubled)
+    total_state = statevalue(program, total)
+
+    fresh = program([1.0, 2.0])
+    fresh_copy = copy(fresh)
+    @test get!(fresh_copy, doubled_state) == [2.0, 4.0]
+    mutate!(fresh_copy, source_state) do x
+        x[1] = 10.0
+    end
+    @test get!(fresh_copy, source_state) == [10.0, 2.0]
+    @test get!(fresh, source_state) == [1.0, 2.0]
+
+    partial = program([3.0, 4.0])
+    @test get!(partial, doubled_state) == [6.0, 8.0]
+    partial_copy = copy(partial)
+    @test get!(partial_copy, doubled_state) == [6.0, 8.0]
+    @test get!(partial_copy, total_state) == 7.0
+
+    destination = program([0.0])
+    copyto!(destination, partial)
+    @test get!(destination, doubled_state) == [6.0, 8.0]
+    @test get!(destination, total_state) == 7.0
+    mutate!(destination, source_state) do x
+        resize!(x, 3)
+        x .= (1.0, 2.0, 3.0)
+    end
+    get!(destination, doubled_state)
+    copyto!(destination, partial)
+    @test get!(destination, doubled_state) == [6.0, 8.0]
+
+    stale = program([1.0])
+    stale_handle = statevalue(program, total)
+    value!(graph, :late_graph_change, Float64)
+    @test_throws ArgumentError get!(stale, stale_handle)
+    @test_throws ArgumentError copy(stale)
 end
 
 @testset "compiled reactive state preserves planner/lowering contracts" begin
