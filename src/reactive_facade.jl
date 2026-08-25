@@ -57,9 +57,9 @@ end
     name in fieldnames(H) || return :(throw(ArgumentError(
         "ReactiveObject $($(QuoteNode(Name))) has no field $($(QuoteNode(name)))")))
     quote
-        handles = getfield(object, :handles)
         assign!(getfield(object, :state),
-                getfield(handles, $(QuoteNode(name))), value)
+                getfield(getfield(object, :handles), $(QuoteNode(name))), value)
+        value                       # a Julia assignment returns the assigned value
     end
 end
 
@@ -104,6 +104,25 @@ end
 end
 
 reactive_program(object::ReactiveObject) = getfield(object, :state).program
+
+# In-place root-field mutation boundary. Every indexed/property-chain/compound/
+# dotted/destructuring/@. field write the facade generates goes through this,
+# which delegates to the poc-approved `assign!` in-place form: it materializes the
+# root slot buffer, runs `f` (the substituted store), and marks valid + invalidates
+# the root's dependents in a `finally` (exception-safe, even on a partial write).
+# The facade therefore reaches NONE of the guarded core internals directly — only
+# `assign!` — and the field is a `Val` type parameter, so there is no runtime
+# Symbol lookup. RHS evaluation order is preserved by the caller staging the RHS
+# before this call for the plain `=`/compound cases.
+@generated function _reactive_inplace!(f, object::ReactiveObject{Name,S,H},
+                                       ::Val{name}) where {Name,S,H,name}
+    name in fieldnames(H) || return :(throw(ArgumentError(
+        "ReactiveObject $($(QuoteNode(Name))) has no field $($(QuoteNode(name)))")))
+    quote
+        assign!(f, getfield(object, :state),
+                getfield(getfield(object, :handles), $(QuoteNode(name))))
+    end
+end
 
 Base.copy(object::ReactiveObject{Name}) where {Name} =
     ReactiveObject{Name}(copy(getfield(object, :state)), getfield(object, :handles))
@@ -159,12 +178,140 @@ function _reactive_signature_bindings(signature)
     bound
 end
 
-# Rewrite a method body so field/port reads become getproperty, field writes
-# become setproperty!, and sibling-method calls receive the object. `shadow`
-# holds names locally bound (method params, loop/let/local vars) that keep their
-# ordinary meaning. Ordinary Julia control flow is preserved verbatim.
+# The root symbol at the base of an assignment target chain (or nothing).
+_assign_root(x::Symbol) = x
+function _assign_root(x)
+    x isa Expr || return nothing
+    x.head in (:ref, :., :(::)) && return _assign_root(x.args[1])
+    if x.head === :tuple                      # destructuring: all roots must agree
+        roots = collect(Iterators.filter(!isnothing, (_assign_root(a) for a in x.args)))
+        (!isempty(roots) && all(==(first(roots)), roots)) ? first(roots) : nothing
+    else
+        nothing
+    end
+end
+
+# The binary operator of a compound-assignment head (:+=, :.*=, …); nothing for
+# a plain `=`, a broadcast `.=`, or a non-assignment head.
+function _reactive_compound_op(head::Symbol)
+    (head === :(=) || head === :(.=)) && return nothing
+    s = String(head)
+    (endswith(s, "=") && length(s) > 1 && s[end-1] != '=' &&
+        !(s in ("!=", "<=", ">=", ".!=", ".<=", ".>="))) || return nothing
+    Symbol(s[1:end-1])
+end
+
+_reactive_is_dotassign(head::Symbol) =
+    head === :(.=) || (startswith(String(head), ".") && endswith(String(head), "=") &&
+                       _reactive_compound_op(head) !== nothing)
+
+_reactive_is_assign(head::Symbol) =
+    head === :(=) || head === :(.=) || _reactive_compound_op(head) !== nothing
+
+_reactive_is_dotmacro(ex) = ex isa Expr && ex.head === :macrocall &&
+    !isempty(ex.args) && ex.args[1] === Symbol("@__dot__")
+
+# Sibling-method call forwarding, shared by rewrite and subst: inject the object
+# as the first POSITIONAL arg, keeping any :parameters block in its AST position.
+function _reactive_sibling_call(ex, self, rec)
+    kwc = nothing; posc = Any[]
+    for a in ex.args[2:end]
+        if a isa Expr && a.head === :parameters
+            kwc = Expr(:parameters, (k isa Expr && k.head === :kw ?
+                Expr(:kw, k.args[1], rec(k.args[2])) : rec(k) for k in a.args)...)
+        else
+            push!(posc, rec(a))
+        end
+    end
+    out = Any[ex.args[1]]; kwc === nothing || push!(out, kwc)
+    # Near-verbatim ca9 often passes __self__ explicitly (flip!(__self__, depth));
+    # don't inject a second self when the first positional arg is already it.
+    (!isempty(posc) && posc[1] === self) || push!(out, self)
+    append!(out, posc)
+    Expr(:call, out...)
+end
+
+# Substitute inside an in-place mutation body: the root field becomes `buffer`,
+# other field reads become getproperty, sibling calls forward the object, and the
+# assignment STRUCTURE is preserved (we are mutating buffer in place).
+function _reactive_subst(ex, fields::Set{Symbol}, methods::Set{Symbol},
+                         self::Symbol, shadow::Set{Symbol}, root::Symbol, buffer::Symbol;
+                         dot::Bool = false)
+    if ex isa Symbol
+        ex === root && return buffer
+        if ex in fields && !(ex in shadow)
+            read = Expr(:call, getproperty, self, QuoteNode(ex))
+            # Inside a `@.`, protect the inserted getproperty CALL from being
+            # broadcast (`getproperty.(self,:f)`) by escaping it with `$(...)`; the
+            # destination `.field` property access is left for @. to handle.
+            return dot ? Expr(:$, read) : read
+        end
+        return ex
+    end
+    ex isa Expr || return ex
+    ex.head === :quote && return ex
+    s(n) = _reactive_subst(n, fields, methods, self, shadow, root, buffer; dot = dot)
+    if ex.head === :. && length(ex.args) == 2 && ex.args[2] isa QuoteNode
+        return Expr(:., s(ex.args[1]), ex.args[2])
+    elseif ex.head === :call && ex.args[1] isa Symbol && ex.args[1] in methods
+        return _reactive_sibling_call(ex, self, s)
+    end
+    Expr(ex.head, (s(a) for a in ex.args)...)
+end
+
+# If `rhs` is a simple reference INTO a currently-visible field (`field`,
+# `field[...]`, `field.x`, or a nested chain of those), return that field root;
+# else nothing. Binding a local to such an expression aliases the field's live
+# array, so mutating the local must invalidate the field's dependents.
+function _reactive_alias_target(rhs, fields::Set{Symbol}, shadow::Set{Symbol})
+    r = rhs
+    while r isa Expr && r.head in (:ref, :.)
+        r = r.args[1]
+    end
+    (r isa Symbol && r in fields && !(r in shadow)) ? r : nothing
+end
+
+# `_reactive_inplace!(self, Val(root)) do buffer; body; end`.
+_reactive_inplace_call(self, root, buffer, body) =
+    Expr(:call, _reactive_inplace!, Expr(:(->), buffer, Expr(:block, body)),
+         self, Expr(:call, Val, QuoteNode(root)))
+
+# Lower an in-place root-field mutation through the assign!-backed
+# `_reactive_inplace!`. For a plain `=` or a (non-dotted) compound assignment the
+# RHS is STAGED into a temp before the call, so a side-effecting RHS (e.g. one
+# that mutates an upstream field of the root) is evaluated before the buffer is
+# materialized — Julia's exact RHS-before-receiver order. Dotted/broadcast and
+# destructuring mutations use the closure form (root -> buffer) directly, which
+# is correct for pure RHS and avoids materializing a broadcast result.
+function _reactive_inplace(ex, fields, methods, self, shadow, root::Symbol,
+                           aliases::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}())
+    buffer = gensym(:buffer)
+    lhs = ex.args[1]; rhs = ex.args[2]
+    if ex.head === :(=)
+        # Plain `=`: Julia evaluates RHS before the receiver/index
+        # (`v[idx()] = rhs()` traces rhs, idx, set), so stage the RHS first.
+        tmp = gensym(:rhs)
+        rhs_staged = _reactive_rewrite(rhs, fields, methods, self, shadow, aliases)
+        lhs_b = _reactive_subst(lhs, fields, methods, self, shadow, root, buffer)
+        return Expr(:block,
+            Expr(:(=), tmp, rhs_staged),
+            _reactive_inplace_call(self, root, buffer, Expr(:(=), lhs_b, tmp)),
+            tmp)   # a Julia assignment returns the assigned value
+    end
+    # Compound (`v[idx()] += rhs()` traces idx, get, rhs, set) and dotted/
+    # broadcast (`.=` / `.op=`): the assign!-buffer closure naturally preserves
+    # Julia's evaluation order, so substitute root -> buffer and run in place.
+    body = _reactive_subst(ex, fields, methods, self, shadow, root, buffer)
+    _reactive_inplace_call(self, root, buffer, body)
+end
+
+# Rewrite a method body: field reads -> getproperty, whole-field writes ->
+# setproperty!, scalar compound writes -> setproperty!(read op rhs), rooted /
+# dotted / destructuring / @. mutations -> in-place assign!, and sibling calls
+# forwarded the object. `shadow` holds locally-bound names.
 function _reactive_rewrite(ex, fields::Set{Symbol}, methods::Set{Symbol},
-                           self::Symbol, shadow::Set{Symbol})
+                           self::Symbol, shadow::Set{Symbol},
+                           aliases::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}())
     if ex isa Symbol
         (ex in fields && !(ex in shadow)) &&
             return Expr(:call, getproperty, self, QuoteNode(ex))
@@ -172,45 +319,77 @@ function _reactive_rewrite(ex, fields::Set{Symbol}, methods::Set{Symbol},
     end
     ex isa Expr || return ex
     ex.head === :quote && return ex
-    rw(node) = _reactive_rewrite(node, fields, methods, self, shadow)
+    rw(node) = _reactive_rewrite(node, fields, methods, self, shadow, aliases)
 
-    if ex.head === :(=)
-        lhs = ex.args[1]
-        if lhs isa Symbol && lhs in fields && !(lhs in shadow)
-            return Expr(:call, setproperty!, self, QuoteNode(lhs), rw(ex.args[2]))
-        end
-        # a local binding shadows any same-named field within the rest of scope
-        local_names = Set{Symbol}()
-        _reactive_assign_names!(local_names, lhs)
-        inner = union(shadow, local_names)
-        return Expr(:(=), lhs, _reactive_rewrite(ex.args[2], fields, methods, self, inner))
-    elseif ex.head === :call && ex.args[1] isa Symbol && ex.args[1] in methods
-        # sibling-method call: inject the object as the first POSITIONAL arg,
-        # keeping any :parameters (keyword) block in its AST position.
-        kwc = nothing; posc = Any[]
-        for a in ex.args[2:end]
-            if a isa Expr && a.head === :parameters
-                kwc = Expr(:parameters,
-                           (k isa Expr && k.head === :kw ?
-                            Expr(:kw, k.args[1], rw(k.args[2])) : rw(k) for k in a.args)...)
-            else
-                push!(posc, rw(a))
+    if _reactive_is_dotmacro(ex)
+        inner = ex.args[end]
+        if inner isa Expr && _reactive_is_assign(inner.head)
+            root = _assign_root(inner.args[1])
+            if root !== nothing && root in fields && !(root in shadow)
+                # dot forms read the destination first, so the buffer closure
+                # (root -> buffer) preserves order; run @. over the buffer.
+                buffer = gensym(:buffer)
+                subst = _reactive_subst(inner, fields, methods, self, shadow, root, buffer; dot = true)
+                dotted = Expr(:macrocall, ex.args[1], ex.args[2], subst)
+                return _reactive_inplace_call(self, root, buffer, dotted)
+            elseif root isa Symbol && haskey(aliases, root)
+                # local alias root inside @. (`tr = trees[d]; @. tr.mom = -bwd.mom`):
+                # keep the alias, rewrite other fields to getproperty, and wrap the
+                # WHOLE dotted mutation in the assign!-backed closure (ignoring the
+                # buffer) so assign!'s finally invalidates the aliased field.
+                subst = _reactive_subst(inner, fields, methods, self, shadow,
+                                        gensym(:__noroot__), gensym(:__nobuf__); dot = true)
+                dotted = Expr(:macrocall, ex.args[1], ex.args[2], subst)
+                return _reactive_inplace_call(self, aliases[root], gensym(:buffer), dotted)
             end
         end
-        out = Any[ex.args[1]]
-        kwc === nothing || push!(out, kwc)
-        push!(out, self)
-        append!(out, posc)
-        return Expr(:call, out...)
+        return Expr(:macrocall, ex.args[1], ex.args[2],
+                    (rw(a) for a in ex.args[3:end])...)
+    elseif _reactive_is_assign(ex.head)
+        lhs = ex.args[1]; rhs = ex.args[2]
+        root = _assign_root(lhs)
+        if root === nothing || !(root in fields) || root in shadow
+            # Mutation THROUGH a local alias of a field (`w = trees[d]; w[..] = …`):
+            # run the mutation inside the assign!-backed inplace closure — the
+            # closure ignores the buffer and uses the alias, so assign!'s finally
+            # invalidates the aliased field's dependents on success AND on a
+            # throwing partial write, without reaching any guarded internals.
+            if lhs !== root && root isa Symbol && haskey(aliases, root)
+                mut = Expr(ex.head, lhs,
+                           _reactive_rewrite(rhs, fields, methods, self, shadow, aliases))
+                return _reactive_inplace_call(self, aliases[root], gensym(:buffer), mut)
+            end
+            # (Re)binding a local: record a field alias if the RHS references into a
+            # field, else clear any prior alias for that name.
+            if lhs isa Symbol
+                target = _reactive_alias_target(rhs, fields, shadow)
+                target === nothing ? delete!(aliases, lhs) : (aliases[lhs] = target)
+            end
+            local_names = Set{Symbol}(); _reactive_assign_names!(local_names, lhs)
+            inner = union(shadow, local_names)
+            return Expr(ex.head, lhs,
+                        _reactive_rewrite(rhs, fields, methods, self, inner, aliases))
+        end
+        op = _reactive_compound_op(ex.head)
+        if lhs === root && ex.head === :(=)
+            return Expr(:call, setproperty!, self, QuoteNode(root), rw(rhs))
+        elseif lhs === root && op !== nothing && !_reactive_is_dotassign(ex.head)
+            return Expr(:call, setproperty!, self, QuoteNode(root),
+                        Expr(:call, op, Expr(:call, getproperty, self, QuoteNode(root)),
+                             rw(rhs)))
+        else
+            return _reactive_inplace(ex, fields, methods, self, shadow, root, aliases)
+        end
+    elseif ex.head === :call && ex.args[1] isa Symbol && ex.args[1] in methods
+        return _reactive_sibling_call(ex, self, rw)
     elseif ex.head === :. && length(ex.args) == 2 && ex.args[2] isa QuoteNode
-        # obj.field property access: rewrite the object, keep the field literal
         return Expr(:., rw(ex.args[1]), ex.args[2])
     elseif ex.head in (:for, :while)
         bind = Set{Symbol}()
         ex.head === :for && _reactive_assign_names!(bind, ex.args[1] isa Expr &&
             ex.args[1].head === :(=) ? ex.args[1].args[1] : ex.args[1])
-        inner = union(shadow, bind)
-        return Expr(ex.head, (_reactive_rewrite(a, fields, methods, self, inner)
+        inner = union(shadow, bind); scope = copy(aliases)
+        return Expr(ex.head, (_reactive_rewrite(a, fields, methods, self, inner, scope)
                               for a in ex.args)...)
     end
     Expr(ex.head, (rw(arg) for arg in ex.args)...)
@@ -300,19 +479,35 @@ function _reactive_expand(def)
     # generated `__self__`, user param names, and user calls share one hygiene
     # context; runtime helpers are interpolated as VALUES (immune to esc).
     spec_sym = gensym(:spec); prog_sym = gensym(:program); handles_sym = gensym(:handles)
-    pos_names = Symbol[p for (p, _) in positional]
+    # Preserve the original positional/keyword TYPE annotations so the generated
+    # constructor keeps its dispatch (an untyped port stays untyped).
+    typed(p, t) = t === nothing ? p : Expr(:(::), p, t)
     # Julia AST: the :parameters (keyword) block comes right after the callee.
     ctor_sig_args = Any[name]
     if !isempty(keywords)
-        kw_params = Any[hasdefault ? Expr(:kw, p, default) : p
-                        for (p, _, hasdefault, default) in keywords]
+        kw_params = Any[]
+        for (p, t, hasdefault, default) in keywords
+            tp = typed(p, t)
+            push!(kw_params, hasdefault ? Expr(:kw, tp, default) : tp)
+        end
         push!(ctor_sig_args, Expr(:parameters, kw_params...))
     end
-    append!(ctor_sig_args, pos_names)
+    for (p, t) in positional; push!(ctor_sig_args, typed(p, t)); end
+    # Cache (program, handles) once per definition in a UNIQUE per-expansion const
+    # so independent instances share the compiled program (copyto!-compatible),
+    # setup runs once, and the constructor stays type-stable (the const is a typed
+    # tuple, not a Symbol=>Any dict). The gensym'd name cannot collide across
+    # definitions or modules.
+    cache_name = gensym(Symbol(name, :__program))
+    cache_def = Expr(:const, Expr(:(=), cache_name, quote
+        let
+            $spec_sym = $spec_build
+            built = $prepare_reactive($spec_sym; want = $want_tuple)
+            (built, $_reactive_handles(built, $spec_sym, $expose_tuple))
+        end
+    end))
     ctor_body = quote
-        $spec_sym = $spec_build
-        $prog_sym = $prepare_reactive($spec_sym; want = $want_tuple)
-        $handles_sym = $_reactive_handles($prog_sym, $spec_sym, $expose_tuple)
+        ($prog_sym, $handles_sym) = $cache_name
         $(ReactiveObject){$(QuoteNode(name))}(
             $prog_sym($(port_names...)), $handles_sym)
     end
@@ -341,7 +536,7 @@ function _reactive_expand(def)
         push!(method_code, Expr(:function, Expr(:call, sig_args...), new_body))
     end
 
-    esc(Expr(:block, constructor, method_code..., name))
+    esc(Expr(:block, cache_def, constructor, method_code..., name))
 end
 
 """

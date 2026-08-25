@@ -19,6 +19,7 @@ using Test
         include("test_hmc.jl")
         include("test_reactive_sampler_baseline.jl")
         include("test_reactive_facade.jl")
+        include("test_reactive_facade_ca9.jl")
         include("test_online_stats_example.jl")
         include("test_distributions_example.jl")
         include("test_preexisting_examples.jl")
