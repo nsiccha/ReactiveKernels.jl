@@ -49,6 +49,20 @@ k = prepare(g; have = (x, y), want = (out,))
 k(1.0, 2.0)          # straight-line: no graph, no planner on this path
 ```
 
+## See the selected DAG
+
+```julia
+p = plan(g; have = (x, y), want = (out,))
+visualize(p)                         # SVG in notebooks and rich Julia displays
+visualize(p; alternatives = true)   # include unselected candidate recipes
+save_visualization("plan.svg", p)   # self-contained, no renderer dependency
+save_visualization("plan.dot", p)   # portable Graphviz interchange
+```
+
+Values and recipes are separate nodes, so multi-input and multi-output recipes
+remain explicit. The built-in SVG renderer is dependency-free; DOT export is
+available when a downstream tool needs Graphviz-quality publication layout.
+
 A second mode is **incremental / demand-driven** execution: previously
 materialized values join the effective `have` set, changed source values
 invalidate only the cached results whose provenance actually depended on them,

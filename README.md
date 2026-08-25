@@ -55,7 +55,22 @@ p = plan(g; have = (x,), want = (b,))
 println(explain(p))     # have/want, selected recipes + costs, alternatives, total cost
 code_expr(p)            # the generated Julia Expr, before RGF compilation
 inputs(k), outputs(k)   # graph values in call / return order
+
+visualize(p)            # self-contained SVG in notebooks and other rich displays
+save_visualization("plan.svg", p)
+dot_source(p)           # portable Graphviz DOT source
 ```
+
+The diagram uses explicit value and recipe nodes (`value → recipe → value`),
+so multi-input and multi-output operations stay unambiguous. A plan shows only
+the selected computation by default; `visualize(p; alternatives=true)` adds
+backward-reachable alternatives as muted dashed nodes. Both `Graph` and `Plan`
+also expose SVG rich display directly, while `.dot` / `.gv` exports can be fed
+to Graphviz for publication-oriented layout without making Graphviz a package
+dependency.
+
+See the [visualization guide](docs/src/visualization.md) for the visual
+semantics, format tradeoffs, and deliberate non-goals.
 
 ## Alternative producers (the interesting bit)
 
@@ -131,6 +146,7 @@ k    = prepare(p; passes = (mypass,))
 |---|---|
 | Build | `Graph`, `value`, `value!`, `add!`, `compose` |
 | Plan | `plan`, `explain`, `code_expr`, `inputs`, `outputs` |
+| Visualize | `visualize`, `dot_source`, `save_visualization` |
 | Lower / compile | `lower`, `transform`, `compile`, `prepare` |
 | Cache | `PreparationCache`, `prepare!` |
 | Reactive | `ReactiveState`, `set!`, `get!`, `freeze!`, `unfreeze!`, `materialize!`, `checkpoint` |
@@ -146,6 +162,6 @@ graph objects on the hot path). See `test/test_stateless.jl` and
 ## Running
 
 ```julia
-julia --project=. -e 'using Pkg; Pkg.test()'   # 84 tests
+julia --project=. -e 'using Pkg; Pkg.test()'   # package test suite
 julia --project=. examples/demo.jl             # runnable walkthrough
 ```

@@ -10,6 +10,7 @@ makedocs(
     ),
     pages = [
         "Home" => "index.md",
+        "Visualization" => "visualization.md",
         "API"  => "api.md",
     ],
     checkdocs = :none,
