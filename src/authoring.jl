@@ -385,13 +385,12 @@ function _kernel_generator_iterator_flow!(
         union!(assigned, iterator_names)
     elseif iterator isa Expr && iterator.head === :filter
         # Parser order is predicates first and the iterator source last, while
-        # evaluation binds every listed iterator in source order before the
-        # predicate can read them.
-        for nested_iterator in iterator.args[2:end]
-            _kernel_generator_iterator_flow!(
-                out, seen, nested_iterator, known, assigned, hidden,
-            )
-        end
+        # comma-form iterator sources all resolve in the incoming outer scope.
+        # Only after every source/type has been evaluated do their binders hide
+        # graph ports for the predicate and body.
+        _kernel_generator_binding_group_flow!(
+            out, seen, iterator.args[2:end], known, assigned, hidden,
+        )
         for predicate in iterator.args[1:1]
             _kernel_free_ports_flow!(
                 out, seen, predicate, known, assigned, hidden,
@@ -408,6 +407,32 @@ function _kernel_generator_iterator_flow!(
             out, seen, iterator, known, assigned, hidden,
         )
     end
+    nothing
+end
+
+function _kernel_generator_binding_group_flow!(
+    out::Vector{Symbol}, seen::Set{Symbol}, iterators, known::Set{Symbol},
+    assigned::Set{Symbol}, hidden::Set{Symbol},
+)
+    incoming_hidden = copy(hidden)
+    iterator_names = Set{Symbol}()
+    for iterator in iterators
+        if iterator isa Expr && iterator.head in (:(=), :in)
+            _kernel_free_ports_flow!(
+                out, seen, iterator.args[2], known, assigned, incoming_hidden,
+            )
+            _kernel_assignment_lhs_reads!(
+                out, seen, iterator.args[1], known, assigned, incoming_hidden,
+            )
+            _kernel_bound_names!(iterator_names, iterator.args[1])
+        else
+            _kernel_free_ports_flow!(
+                out, seen, iterator, known, assigned, incoming_hidden,
+            )
+        end
+    end
+    union!(hidden, iterator_names)
+    union!(assigned, iterator_names)
     nothing
 end
 
@@ -429,10 +454,17 @@ function _kernel_generator_flow!(
 
     generator_hidden = copy(hidden)
     generator_assigned = copy(assigned)
-    for iterator in ex.args[2:end]
-        _kernel_generator_iterator_flow!(
-            out, seen, iterator, known, generator_assigned, generator_hidden,
+    iterators = ex.args[2:end]
+    if length(iterators) > 1
+        _kernel_generator_binding_group_flow!(
+            out, seen, iterators, known, generator_assigned, generator_hidden,
         )
+    else
+        for iterator in iterators
+            _kernel_generator_iterator_flow!(
+                out, seen, iterator, known, generator_assigned, generator_hidden,
+            )
+        end
     end
     body = ex.args[1]
     if body isa Expr && body.head in (:generator, :flatten)

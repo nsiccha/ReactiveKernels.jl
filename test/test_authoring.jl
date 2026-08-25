@@ -387,6 +387,46 @@ end
         ).inputs) == Set((:xs, :threshold))
         @test prepare(filtered_noncollision)([1, 2, 3], 1) == [2, 3]
 
+        comma_outer_scope = @kernel begin
+            x::Int
+            xs::Vector{Int}
+            y::Matrix{Int} = [x + y for x in xs, y in 1:x]
+            return y
+        end
+        @test Set(v.name for v in only(
+            kernel_graph(comma_outer_scope).recipes,
+        ).inputs) == Set((:x, :xs))
+        @test prepare(comma_outer_scope)(3, [2, 3]) == [3 4 5; 4 5 6]
+
+        comma_filtered_noncollision = @kernel begin
+            xs::Vector{Int}
+            ys::Vector{Int}
+            threshold::Int
+            z::Vector{Int} = [
+                x + y for x in xs, y in ys if x + y > threshold
+            ]
+            return z
+        end
+        @test Set(v.name for v in only(
+            kernel_graph(comma_filtered_noncollision).recipes,
+        ).inputs) == Set((:xs, :ys, :threshold))
+        @test prepare(comma_filtered_noncollision)([1, 2], [2, 3], 3) == [4, 4, 5]
+
+        comma_three_iterators = @kernel begin
+            x::Int
+            y::Int
+            xs::Vector{Int}
+            z::Vector{Int} = [
+                x + y + z for x in xs, y in 1:x, z in 1:y if z < x
+            ]
+            return z
+        end
+        @test Set(v.name for v in only(
+            kernel_graph(comma_three_iterators).recipes,
+        ).inputs) == Set((:x, :y, :xs))
+        @test prepare(comma_three_iterators)(3, 2, [2, 3]) ==
+              [4, 5, 5, 6, 6, 7, 6, 7, 8]
+
         nested_filtered_generator = @kernel begin
             source::Int
             xs::Vector{Int}
