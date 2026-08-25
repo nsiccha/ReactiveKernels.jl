@@ -4,8 +4,12 @@ using ReactiveKernels
 using Statistics
 
 export MomentsAccumulator, update, fit
+export HMCDiagnosticsAccumulator, record_transition, fit_diagnostics
+export sample_count, divergence_rate, divergence_percent
+export mean_acceptance_rate, mean_leapfrog_steps, mean_stepsize
 export build_online_stats_graph
-export kernel_performance_report, reactive_performance_report
+export kernel_performance_report, diagnostics_performance_report
+export reactive_performance_report
 export demo
 
 """
@@ -147,10 +151,156 @@ function Statistics.var(accumulator::MomentsAccumulator{T};
 end
 
 """
+    HMCDiagnosticsAccumulator(T=Float64)
+
+Fixed-size, mergeable summaries of the scalar transition telemetry recorded by
+ReactiveHMC's sampling statistics: acceptance rate, leapfrog-step count, step
+size, and divergence. The three continuous summaries use
+[`MomentsAccumulator`](@ref), while divergences are counted exactly.
+
+This state deliberately does not claim to represent rank-normalized R-hat or
+ESS. Those diagnostics require retained, ordered draws from multiple chains and
+cannot be recovered exactly from a constant-size mergeable accumulator.
+"""
+struct HMCDiagnosticsAccumulator{T<:AbstractFloat}
+    n_divergent::Int
+    acceptance_rate::MomentsAccumulator{T}
+    leapfrog_steps::MomentsAccumulator{T}
+    stepsize::MomentsAccumulator{T}
+
+    function HMCDiagnosticsAccumulator{T}(
+        n_divergent::Integer,
+        acceptance_rate::MomentsAccumulator{T},
+        leapfrog_steps::MomentsAccumulator{T},
+        stepsize::MomentsAccumulator{T},
+    ) where {T<:AbstractFloat}
+        divergences = Int(n_divergent)
+        divergences >= 0 ||
+            throw(ArgumentError("divergence count must be non-negative"))
+        n = acceptance_rate.n
+        leapfrog_steps.n == n && stepsize.n == n ||
+            throw(ArgumentError("diagnostic moment counts must agree"))
+        divergences <= n ||
+            throw(ArgumentError("divergence count cannot exceed sample count"))
+        new{T}(divergences, acceptance_rate, leapfrog_steps, stepsize)
+    end
+end
+
+function HMCDiagnosticsAccumulator(::Type{T}=Float64) where {T<:AbstractFloat}
+    empty = MomentsAccumulator(T)
+    HMCDiagnosticsAccumulator{T}(0, empty, empty, empty)
+end
+
+"Number of transitions summarized by an HMC diagnostics accumulator."
+sample_count(accumulator::HMCDiagnosticsAccumulator) =
+    accumulator.acceptance_rate.n
+
+"Fraction of divergent transitions, or `NaN` when no transitions were seen."
+function divergence_rate(accumulator::HMCDiagnosticsAccumulator{T}) where {T}
+    n = sample_count(accumulator)
+    n == 0 && return T(NaN)
+    W = promote_type(T, Float64)
+    T(W(accumulator.n_divergent) / W(n))
+end
+
+"Divergent transitions as a percentage, or `NaN` for an empty state."
+function divergence_percent(accumulator::HMCDiagnosticsAccumulator{T}) where {T}
+    rate = divergence_rate(accumulator)
+    T(T(100) * rate)
+end
+
+"Mean transition acceptance rate, or `NaN` for an empty state."
+mean_acceptance_rate(accumulator::HMCDiagnosticsAccumulator) =
+    mean(accumulator.acceptance_rate)
+
+"Mean leapfrog-step count, or `NaN` for an empty state."
+mean_leapfrog_steps(accumulator::HMCDiagnosticsAccumulator) =
+    mean(accumulator.leapfrog_steps)
+
+"Mean sampler step size, or `NaN` for an empty state."
+mean_stepsize(accumulator::HMCDiagnosticsAccumulator) =
+    mean(accumulator.stepsize)
+
+"""
+    record_transition(accumulator, acc_rate, n_steps, stepsize, diverged)
+
+Return a new HMC diagnostics state containing one transition. The argument
+names mirror the scalar streams stored by ReactiveHMC's `sampling_stats`.
+"""
+function record_transition(
+    accumulator::HMCDiagnosticsAccumulator{T},
+    acc_rate::Real,
+    n_steps::Integer,
+    stepsize::Real,
+    diverged::Bool,
+) where {T<:AbstractFloat}
+    acceptance = convert(T, acc_rate)
+    isfinite(acceptance) && zero(T) <= acceptance <= one(T) ||
+        throw(DomainError(acc_rate, "acceptance rate must be finite and in [0, 1]"))
+
+    n_steps >= 0 ||
+        throw(DomainError(n_steps, "leapfrog-step count must be non-negative"))
+    steps = convert(T, n_steps)
+    isfinite(steps) ||
+        throw(DomainError(n_steps, "leapfrog-step count must fit the storage type"))
+
+    epsilon = convert(T, stepsize)
+    isfinite(epsilon) && epsilon > zero(T) ||
+        throw(DomainError(stepsize, "step size must be finite and positive"))
+
+    divergences = diverged ? Base.checked_add(accumulator.n_divergent, 1) :
+                  accumulator.n_divergent
+    HMCDiagnosticsAccumulator{T}(
+        divergences,
+        update(accumulator.acceptance_rate, acceptance),
+        update(accumulator.leapfrog_steps, steps),
+        update(accumulator.stepsize, epsilon),
+    )
+end
+
+"""
+    fit_diagnostics(accumulator, records)
+    fit_diagnostics(T, records)
+    fit_diagnostics(records)
+
+Fold transition records with fields `acc_rate`, `n_steps`, `stepsize`, and
+`diverged` into a mergeable diagnostics state.
+"""
+function fit_diagnostics(accumulator::HMCDiagnosticsAccumulator, records)
+    for record in records
+        accumulator = record_transition(
+            accumulator,
+            record.acc_rate,
+            record.n_steps,
+            record.stepsize,
+            record.diverged,
+        )
+    end
+    accumulator
+end
+
+fit_diagnostics(::Type{T}, records) where {T<:AbstractFloat} =
+    fit_diagnostics(HMCDiagnosticsAccumulator(T), records)
+fit_diagnostics(records) = fit_diagnostics(Float64, records)
+
+"Combine independently summarized HMC transition partitions."
+function Base.merge(a::HMCDiagnosticsAccumulator{T},
+                    b::HMCDiagnosticsAccumulator{T}) where {T<:AbstractFloat}
+    sample_count(a) == 0 && return b
+    sample_count(b) == 0 && return a
+    HMCDiagnosticsAccumulator{T}(
+        Base.checked_add(a.n_divergent, b.n_divergent),
+        merge(a.acceptance_rate, b.acceptance_rate),
+        merge(a.leapfrog_steps, b.leapfrog_steps),
+        merge(a.stepsize, b.stepsize),
+    )
+end
+
+"""
     build_online_stats_graph(T=Float64)
 
-Build declarative update/summary and partition-merge kernels over immutable
-accumulator states, then compose them by named ports. The returned
+Build declarative scalar-moment, partition-merge, and HMC-diagnostics kernels
+over immutable accumulator states, then compose them by named ports. The returned
 [`KernelSpec`](@ref) keeps the update path as its default boundary while making
 every port available for explicit `have`/`want` queries.
 """
@@ -170,7 +320,30 @@ function build_online_stats_graph(::Type{T}=Float64) where {T<:AbstractFloat}
         return merged, merged_average, merged_variance
     end
 
-    merge(updates, partitions)
+    diagnostics = @kernel begin
+        diagnostics_state::HMCDiagnosticsAccumulator{T}
+        acceptance_rate_observation::T
+        leapfrog_steps_observation::Int
+        stepsize_observation::T
+        diverged_observation::Bool
+        updated_diagnostics::HMCDiagnosticsAccumulator{T} = record_transition(
+            diagnostics_state,
+            acceptance_rate_observation,
+            leapfrog_steps_observation,
+            stepsize_observation,
+            diverged_observation,
+        )
+        diagnostic_sample_count::Int = sample_count(updated_diagnostics)
+        diagnostic_divergence_percent::T = divergence_percent(updated_diagnostics)
+        diagnostic_mean_acceptance_rate::T = mean_acceptance_rate(updated_diagnostics)
+        diagnostic_mean_leapfrog_steps::T = mean_leapfrog_steps(updated_diagnostics)
+        diagnostic_mean_stepsize::T = mean_stepsize(updated_diagnostics)
+        return updated_diagnostics, diagnostic_sample_count,
+               diagnostic_divergence_percent, diagnostic_mean_acceptance_rate,
+               diagnostic_mean_leapfrog_steps, diagnostic_mean_stepsize
+    end
+
+    merge(merge(updates, partitions), diagnostics)
 end
 
 @noinline function _run_kernel_updates(kernel, accumulator, iterations::Int)
@@ -196,6 +369,41 @@ function kernel_performance_report(kernel,
     allocated_bytes = @allocated _run_kernel_updates(kernel, seed, iterations)
     started = time_ns()
     result = _run_kernel_updates(kernel, seed, iterations)
+    elapsed_ns = Int(time_ns() - started)
+    (; iterations, allocated_bytes, elapsed_ns,
+       nanoseconds_per_update=elapsed_ns / iterations, result)
+end
+
+@noinline function _run_diagnostics_updates(kernel, accumulator,
+                                            iterations::Int)
+    T = typeof(accumulator.stepsize.mean)
+    acceptance = T(0.9)
+    epsilon = T(0.2)
+    for i in 1:iterations
+        accumulator = kernel(accumulator, acceptance, 7, epsilon,
+                             iszero(i % 31))
+    end
+    accumulator
+end
+
+"""
+    diagnostics_performance_report(kernel,
+        seed=HMCDiagnosticsAccumulator(); iterations=100_000)
+
+Warm the generated HMC diagnostics kernel, then measure steady-state allocated
+bytes and elapsed time in separate runs.
+"""
+function diagnostics_performance_report(
+    kernel,
+    seed::HMCDiagnosticsAccumulator=HMCDiagnosticsAccumulator();
+    iterations::Int=100_000,
+)
+    iterations > 0 || throw(ArgumentError("iterations must be positive"))
+    _run_diagnostics_updates(kernel, seed, 1)
+    allocated_bytes = @allocated _run_diagnostics_updates(
+        kernel, seed, iterations)
+    started = time_ns()
+    result = _run_diagnostics_updates(kernel, seed, iterations)
     elapsed_ns = Int(time_ns() - started)
     (; iterations, allocated_bytes, elapsed_ns,
        nanoseconds_per_update=elapsed_ns / iterations, result)
@@ -246,6 +454,12 @@ function demo()
     streaming = fit(data)
     partitions = (fit(data[1:1]), fit(data[2:3]), fit(data[4:4]))
     merged = reduce(merge, partitions)
+    transitions = [
+        (acc_rate=0.92, n_steps=7, stepsize=0.25, diverged=false),
+        (acc_rate=0.81, n_steps=15, stepsize=0.20, diverged=true),
+        (acc_rate=0.96, n_steps=5, stepsize=0.30, diverged=false),
+    ]
+    diagnostics = fit_diagnostics(transitions)
 
     println("streaming state = ", streaming)
     println("merged state    = ", merged)
@@ -253,6 +467,9 @@ function demo()
     println("generated update = ", update_kernel(MomentsAccumulator(), 3.0))
     println("generated source:\n", code_expr(update_kernel))
     println("colored DAG (DOT interchange):\n", dot_source(update_plan))
+    println("HMC diagnostics = ", diagnostics)
+    println("divergences = ", diagnostics.n_divergent, "/",
+            sample_count(diagnostics), " (", divergence_percent(diagnostics), "%)")
     println("kernel performance = ", kernel_performance_report(
         prepare(model; have=(:state, :observation), want=:updated)))
     println("reactive performance = ", reactive_performance_report(model))
