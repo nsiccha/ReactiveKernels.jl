@@ -199,6 +199,10 @@ function riemannian_phasepoint_kernels(kinetic::Val, pot_f, grad_f, metric_f,
 
     (;
         graph,
+        values = (;
+            pos, mom, pot, dpot, metric, metric_grad, chol, inv_metric,
+            dham_dpos, dham_dmom, ham,
+        ),
         prepared = (;
             geometry = geometry_kernel,
             dpos = dpos_kernel,

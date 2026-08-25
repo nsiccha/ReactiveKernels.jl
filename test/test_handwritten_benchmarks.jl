@@ -1,4 +1,5 @@
 using BenchmarkTools
+using InteractiveUtils
 
 _handwritten_chain(x::Float64) = 2x + 1
 _handwritten_shared(x::Float64) = (2(x + 1), 3(x + 1))
@@ -20,6 +21,13 @@ function _benchmark_comparison(name, prepared, handwritten, input)
     handwritten_types = Base.return_types(handwritten, (typeof(input),))
     @test prepared_types == [typeof(prepared_result)]
     @test handwritten_types == [typeof(handwritten_result)]
+
+    typed = only(code_typed(prepared, Tuple{typeof(input)}; optimize = true))
+    @test typed.second === typeof(prepared_result)
+    warntype = sprint(io -> code_warntype(
+        io, prepared, Tuple{typeof(input)}; debuginfo = :none,
+    ))
+    @test !occursin("::Any", warntype)
 
     prepared_trial = @benchmark $prepared($input) samples = 10_000 seconds = 0.25
     handwritten_trial = @benchmark $handwritten($input) samples = 10_000 seconds = 0.25

@@ -173,7 +173,7 @@ graph objects on the hot path). See `test/test_stateless.jl` and
 ## Running
 
 ```julia
-julia --project=. -e 'using Pkg; Pkg.test()'   # 139 tests
+julia --project=. -e 'using Pkg; Pkg.test()'   # 143 tests
 julia --project=. -e 'using Pkg; Pkg.test(test_args=["benchmark"])'
 julia --project=. examples/demo.jl             # runnable walkthrough
 julia --project=. examples/preexisting.jl      # ReactiveObjects/ReactiveHMC ports
