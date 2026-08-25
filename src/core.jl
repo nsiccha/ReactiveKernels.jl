@@ -111,6 +111,10 @@ function add!(g::Graph; inputs, outputs, op,
               cost::Real = 1.0, cse_key = nothing, effectful::Bool = false)
     ins = _astuple(inputs)
     outs = _astuple(outputs)
+    recipe_cost = Float64(cost)
+    if !isfinite(recipe_cost) || recipe_cost < 0
+        throw(ArgumentError("recipe cost must be finite and non-negative, got $cost"))
+    end
     for v in ins; _register!(g, v); end
     for v in outs; _register!(g, v); end
 
@@ -133,7 +137,7 @@ function add!(g::Graph; inputs, outputs, op,
         end
     end
 
-    r = Recipe(length(g.recipes) + 1, ins, outs, op, Float64(cost), cse_key, effectful)
+    r = Recipe(length(g.recipes) + 1, ins, outs, op, recipe_cost, cse_key, effectful)
     push!(g.recipes, r)
     for v in outs
         push!(get!(g.producers, canon_id(g, v.id), Int[]), r.id)

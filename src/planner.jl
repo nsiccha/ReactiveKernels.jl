@@ -79,6 +79,7 @@ mutable struct _Search
     best_sel::Union{Nothing,Vector{Int}}
     best_cost::Float64
     best_len::Int
+    saw_cyclic_complete::Bool
 end
 
 # The set of value ids available given `have` plus the outputs of `selected`.
@@ -118,6 +119,8 @@ function _search!(s::_Search, selected::Vector{Int}, cost::Float64)
                 s.best_len = length(selected)
                 s.best_sel = copy(selected)
             end
+        else
+            s.saw_cyclic_complete = true
         end
         return
     end
@@ -134,53 +137,34 @@ end
 
 # --- topological ordering / cycle detection --------------------------------
 
-# Predecessor recipes of `rid` within the selected set: the recipes producing
-# its inputs (inputs already in `have` need no producer).
-function _preds(g::Graph, rid::Int, selected::Vector{Int}, have::Set{Int})
-    ps = Int[]
-    for inp in g.recipes[rid].inputs
-        cin = canon_id(g, inp.id)
-        (cin in have) && continue
-        for other in selected
-            other == rid && continue
-            if any(o -> canon_id(g, o.id) == cin, g.recipes[other].outputs)
-                push!(ps, other)
-                break
-            end
-        end
-    end
-    ps
-end
-
 function _is_acyclic(g::Graph, selected::Vector{Int}, have::Set{Int})
     _topo(g, selected, have) !== nothing
 end
 
-# Kahn's algorithm. Returns the ordered recipe ids, or `nothing` on a cycle.
+# Availability-based Kahn ordering. A logical value may be emitted by more than
+# one selected multi-output recipe, so binding each input to an arbitrary
+# "first producer" can manufacture a cycle even when another producer makes a
+# valid order possible. Instead, execute any recipe whose inputs are currently
+# available, adding all of its outputs to the availability frontier.
+# Returns ordered recipe ids, or `nothing` when no valid order exists.
 function _topo(g::Graph, selected::Vector{Int}, have::Set{Int})
-    indeg = Dict(rid => 0 for rid in selected)
-    succ = Dict(rid => Int[] for rid in selected)
-    for rid in selected
-        for p in _preds(g, rid, selected, have)
-            push!(succ[p], rid)
-            indeg[rid] += 1
-        end
-    end
-    ready = sort!([rid for rid in selected if indeg[rid] == 0])
+    available = copy(have)
+    remaining = Set(selected)
     order = Int[]
-    while !isempty(ready)
-        rid = popfirst!(ready)
+    while !isempty(remaining)
+        ready = sort!([
+            rid for rid in remaining
+            if all(inp -> canon_id(g, inp.id) in available, g.recipes[rid].inputs)
+        ])
+        isempty(ready) && return nothing
+        rid = first(ready)
+        delete!(remaining, rid)
         push!(order, rid)
-        for t in succ[rid]
-            indeg[t] -= 1
-            if indeg[t] == 0
-                # keep deterministic order
-                idx = searchsortedfirst(ready, t)
-                insert!(ready, idx, t)
-            end
+        for output in g.recipes[rid].outputs
+            push!(available, canon_id(g, output.id))
         end
     end
-    length(order) == length(selected) ? order : nothing
+    order
 end
 
 # --- public entry point ----------------------------------------------------
@@ -193,16 +177,29 @@ from the boundary `have`. Values in `have` are authoritative and are never
 recomputed (gist §7). Throws `PlanningError` for impossible or cyclic queries.
 """
 function plan(g::Graph; have = (), want = ())
-    haves = collect(Value, _astuple(have))
+    # HAVE is set-like. Preserve first-seen order for the positional API while
+    # collapsing repeated and structural-CSE-aliased identities to one input.
+    haves = Value[]
+    seen_have = Set{Int}()
+    for v in _astuple(have)
+        cid = canon_id(g, v.id)
+        cid in seen_have && continue
+        push!(seen_have, cid)
+        push!(haves, g.values[cid])
+    end
     wants = collect(Value, _astuple(want))
     have_ids = Set(canon_id(g, v.id) for v in haves)
     want_ids = [canon_id(g, v.id) for v in wants]
 
     cand_ids = _candidate_recipes(g, have_ids, want_ids)
-    s = _Search(g, have_ids, want_ids, cand_ids, nothing, Inf, typemax(Int))
+    s = _Search(g, have_ids, want_ids, cand_ids, nothing, Inf, typemax(Int), false)
     _search!(s, Int[], 0.0)
 
     if s.best_sel === nothing
+        if s.saw_cyclic_complete
+            names = join((string(g.values[w].name) for w in want_ids), ", ")
+            throw(PlanningError("Cannot produce $names: every complete recipe selection contains a cycle"))
+        end
         throw(PlanningError(_impossible_message(g, have_ids, want_ids, cand_ids)))
     end
 
@@ -213,6 +210,7 @@ function plan(g::Graph; have = (), want = ())
     producer = Dict{Int,Recipe}()
     for r in recipes, o in r.outputs
         cid = canon_id(g, o.id)
+        cid in have_ids && continue
         haskey(producer, cid) || (producer[cid] = r)
     end
     Plan(g, haves, wants, recipes, producer, s.best_cost,
@@ -242,7 +240,7 @@ function _impossible_message(g::Graph, have::Set{Int}, want::Vector{Int}, cand::
     end
     missing_wants = [w for w in want if !(w in reachable)]
     io = IOBuffer()
-    havestr = isempty(have) ? "{}" : join(sort([string(g.values[i].name) for i in have]), ", ")
+    havestr = join(sort([string(g.values[i].name) for i in have]), ", ")
     println(io, "Cannot produce ",
             join([string(g.values[w].name) for w in missing_wants], ", "),
             " from available values {", havestr, "}.")
