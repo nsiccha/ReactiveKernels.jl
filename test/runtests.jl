@@ -6,4 +6,5 @@ using Test
     include("test_composition_cse.jl")
     include("test_reactive.jl")
     include("test_adversarial.jl")
+    include("test_eight_schools_example.jl")
 end
