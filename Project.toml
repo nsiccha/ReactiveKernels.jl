@@ -6,8 +6,15 @@ version = "0.1.0"
 [deps]
 RuntimeGeneratedFunctions = "7e49a35a-f44a-4d26-94aa-eba1b4ca6b47"
 
+[weakdeps]
+MutatingFunctions = "8a4c2d94-4b3b-4f9e-be63-a3c0cd816e3a"
+
+[extensions]
+ReactiveKernelsMutatingFunctionsExt = "MutatingFunctions"
+
 [compat]
 ForwardDiff = "0.10, 1"
+MutatingFunctions = "0.1"
 RuntimeGeneratedFunctions = "0.5"
 julia = "1.10"
 
