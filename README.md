@@ -18,6 +18,13 @@ a prepared kernel.
 > Phase 5 hooks (mutation/bufferization AST passes, e-graphs, Enzyme/Reactant
 > backends) are intentionally left as documented extension points.
 
+The runnable [`examples/eight_schools.jl`](examples/eight_schools.jl) shows how
+to build PPL semantics manually from ordinary recipes: unconstrained-to-
+constrained transforms, an optional log Jacobian, decomposed prior and
+likelihood terms, pointwise log likelihoods, total log density, and new-group
+prediction. Different `want` sets prune density or generated-quantity work from
+the same graph, and the numeric boundary accepts forward-mode AD dual numbers.
+
 ## Pipeline
 
 ```
@@ -146,6 +153,7 @@ graph objects on the hot path). See `test/test_stateless.jl` and
 ## Running
 
 ```julia
-julia --project=. -e 'using Pkg; Pkg.test()'   # 84 tests
+julia --project=. -e 'using Pkg; Pkg.test()'   # full package suite
 julia --project=. examples/demo.jl             # runnable walkthrough
+julia --project=. examples/eight_schools.jl    # manual PPL graph
 ```

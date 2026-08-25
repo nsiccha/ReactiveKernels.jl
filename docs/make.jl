@@ -10,6 +10,7 @@ makedocs(
     ),
     pages = [
         "Home" => "index.md",
+        "Eight schools" => "eight-schools.md",
         "API"  => "api.md",
     ],
     checkdocs = :none,
