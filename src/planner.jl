@@ -60,7 +60,8 @@ function _candidate_recipes(g::Graph, have::Set{Int}, want::Vector{Int})
                 push!(cand, rid)
             end
             for inp in r.inputs
-                (inp.id in have) || push!(stack, inp.id)
+                cid = canon_id(g, inp.id)
+                (cid in have) || push!(stack, cid)
             end
         end
     end
@@ -84,7 +85,7 @@ end
 function _produced(s::_Search, selected::Vector{Int})
     p = copy(s.have)
     for rid in selected, o in s.g.recipes[rid].outputs
-        push!(p, o.id)
+        push!(p, canon_id(s.g, o.id))
     end
     p
 end
@@ -95,7 +96,8 @@ function _frontier(s::_Search, selected::Vector{Int}, produced::Set{Int})
         (w in produced) || (w in f) || push!(f, w)
     end
     for rid in selected, inp in s.g.recipes[rid].inputs
-        (inp.id in produced) || (inp.id in f) || push!(f, inp.id)
+        cid = canon_id(s.g, inp.id)
+        (cid in produced) || (cid in f) || push!(f, cid)
     end
     f
 end
@@ -122,7 +124,7 @@ function _search!(s::_Search, selected::Vector{Int}, cost::Float64)
     v = frontier[1]
     for rid in s.candidates
         (rid in selected) && continue
-        any(o -> o.id == v, s.g.recipes[rid].outputs) || continue
+        any(o -> canon_id(s.g, o.id) == v, s.g.recipes[rid].outputs) || continue
         push!(selected, rid)
         _search!(s, selected, cost + s.g.recipes[rid].cost)
         pop!(selected)
@@ -137,10 +139,11 @@ end
 function _preds(g::Graph, rid::Int, selected::Vector{Int}, have::Set{Int})
     ps = Int[]
     for inp in g.recipes[rid].inputs
-        (inp.id in have) && continue
+        cin = canon_id(g, inp.id)
+        (cin in have) && continue
         for other in selected
             other == rid && continue
-            if any(o -> o.id == inp.id, g.recipes[other].outputs)
+            if any(o -> canon_id(g, o.id) == cin, g.recipes[other].outputs)
                 push!(ps, other)
                 break
             end
@@ -192,8 +195,8 @@ recomputed (gist §7). Throws `PlanningError` for impossible or cyclic queries.
 function plan(g::Graph; have = (), want = ())
     haves = collect(Value, _astuple(have))
     wants = collect(Value, _astuple(want))
-    have_ids = Set(v.id for v in haves)
-    want_ids = [v.id for v in wants]
+    have_ids = Set(canon_id(g, v.id) for v in haves)
+    want_ids = [canon_id(g, v.id) for v in wants]
 
     cand_ids = _candidate_recipes(g, have_ids, want_ids)
     s = _Search(g, have_ids, want_ids, cand_ids, nothing, Inf, typemax(Int))
@@ -209,7 +212,8 @@ function plan(g::Graph; have = (), want = ())
     recipes = [g.recipes[rid] for rid in order]
     producer = Dict{Int,Recipe}()
     for r in recipes, o in r.outputs
-        haskey(producer, o.id) || (producer[o.id] = r)
+        cid = canon_id(g, o.id)
+        haskey(producer, cid) || (producer[cid] = r)
     end
     Plan(g, haves, wants, recipes, producer, s.best_cost,
          [g.recipes[rid] for rid in cand_ids])

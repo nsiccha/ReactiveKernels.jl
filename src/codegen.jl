@@ -12,10 +12,11 @@ const _OPS_ARG = :__ops__
 # Assign a source-variable Symbol to every value appearing in the plan, reusing
 # the readable value name and disambiguating only genuine name collisions.
 function _varnames(p::Plan)
+    g = p.graph
     ids = Int[]
-    for v in p.have; push!(ids, v.id); end
-    for r in p.recipes, o in r.outputs; push!(ids, o.id); end
-    for w in p.want; push!(ids, w.id); end
+    for v in p.have; push!(ids, canon_id(g, v.id)); end
+    for r in p.recipes, o in r.outputs; push!(ids, canon_id(g, o.id)); end
+    for w in p.want; push!(ids, canon_id(g, w.id)); end
     unique!(ids)
     namecount = Dict{Symbol,Int}()
     for id in ids
@@ -45,24 +46,26 @@ This `Expr` is a first-class artifact: it may be inspected (`code_expr`) and
 rewritten (`transform`) before compilation (gist §9).
 """
 function lower(p::Plan)
+    g = p.graph
     names = _varnames(p)
+    nm(v) = names[canon_id(g, v.id)]
     argexprs = Any[_OPS_ARG]
     for v in p.have
-        push!(argexprs, :($(names[v.id])::$(valtype(v))))
+        push!(argexprs, :($(nm(v))::$(valtype(v))))
     end
     body = Expr(:block)
     for (k, r) in enumerate(p.recipes)
-        callargs = Any[names[inp.id] for inp in r.inputs]
+        callargs = Any[nm(inp) for inp in r.inputs]
         call = Expr(:call, Expr(:ref, _OPS_ARG, k), callargs...)
         if length(r.outputs) == 1
-            push!(body.args, Expr(:(=), names[r.outputs[1].id], call))
+            push!(body.args, Expr(:(=), nm(r.outputs[1]), call))
         else
-            lhs = Expr(:tuple, (names[o.id] for o in r.outputs)...)
+            lhs = Expr(:tuple, (nm(o) for o in r.outputs)...)
             push!(body.args, Expr(:(=), lhs, call))
         end
     end
-    retval = length(p.want) == 1 ? names[p.want[1].id] :
-             Expr(:tuple, (names[w.id] for w in p.want)...)
+    retval = length(p.want) == 1 ? nm(p.want[1]) :
+             Expr(:tuple, (nm(w) for w in p.want)...)
     push!(body.args, Expr(:return, retval))
     Expr(:function, Expr(:tuple, argexprs...), body)
 end

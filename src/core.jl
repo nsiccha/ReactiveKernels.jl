@@ -66,12 +66,22 @@ planner needs. Building executes nothing.
 mutable struct Graph
     values::Dict{Int,Value}          # id => Value
     recipes::Vector{Recipe}
-    producers::Dict{Int,Vector{Int}} # value id => indices into `recipes`
+    producers::Dict{Int,Vector{Int}} # canonical value id => indices into `recipes`
+    aliases::Dict{Int,Int}           # value id => structurally-equal canonical id
     version::Int
 end
-Graph() = Graph(Dict{Int,Value}(), Recipe[], Dict{Int,Vector{Int}}(), 0)
+Graph() = Graph(Dict{Int,Value}(), Recipe[], Dict{Int,Vector{Int}}(),
+                Dict{Int,Int}(), 0)
 
 _register!(g::Graph, v::Value) = (g.values[v.id] = v; v)
+
+"""
+    canon_id(g, id) -> Int
+
+Resolve a value id to its structural-CSE canonical representative (gist §8).
+Absent any structural CSE this is the identity.
+"""
+canon_id(g::Graph, id::Int) = haskey(g.aliases, id) ? canon_id(g, g.aliases[id]) : id
 
 """
     value!(g, name, T) -> Value{T}
@@ -102,10 +112,30 @@ function add!(g::Graph; inputs, outputs, op,
     outs = _astuple(outputs)
     for v in ins; _register!(g, v); end
     for v in outs; _register!(g, v); end
+
+    # Opt-in structural CSE (gist §8): if a prior recipe carries the same
+    # non-`nothing` cse_key, the same canonical inputs, and the same output
+    # arity, it computes the same thing. Alias the new outputs onto the existing
+    # producer's outputs instead of adding a duplicate recipe.
+    if cse_key !== nothing
+        canon_ins = Tuple(canon_id(g, v.id) for v in ins)
+        for r in g.recipes
+            r.cse_key === nothing && continue
+            isequal(r.cse_key, cse_key) || continue
+            length(r.outputs) == length(outs) || continue
+            Tuple(canon_id(g, v.id) for v in r.inputs) == canon_ins || continue
+            for (new_o, old_o) in zip(outs, r.outputs)
+                g.aliases[new_o.id] = canon_id(g, old_o.id)
+            end
+            g.version += 1
+            return r
+        end
+    end
+
     r = Recipe(length(g.recipes) + 1, ins, outs, op, Float64(cost), cse_key, effectful)
     push!(g.recipes, r)
     for v in outs
-        push!(get!(g.producers, v.id, Int[]), r.id)
+        push!(get!(g.producers, canon_id(g, v.id), Int[]), r.id)
     end
     g.version += 1
     r
@@ -114,5 +144,5 @@ end
 add!(g::Graph, pair::Pair, op; kwargs...) =
     add!(g; inputs = pair.first, outputs = pair.second, op = op, kwargs...)
 
-"All recipes that can produce value id `vid`."
-producers_of(g::Graph, vid::Int) = get(g.producers, vid, Int[])
+"All recipes that can produce value id `vid` (resolved through structural CSE)."
+producers_of(g::Graph, vid::Int) = get(g.producers, canon_id(g, vid), Int[])

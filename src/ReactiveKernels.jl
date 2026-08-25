@@ -22,9 +22,11 @@ RuntimeGeneratedFunctions.init(@__MODULE__)
 include("core.jl")
 include("planner.jl")
 include("codegen.jl")
+include("graphops.jl")
 
 export Value, Recipe, Graph, Plan, PreparedKernel, PlanningError
 export value, value!, add!, plan, prepare, lower, transform, compile
 export explain, code_expr, inputs, outputs, valtype
+export compose, PreparationCache, prepare!, canon_id
 
 end # module ReactiveKernels
