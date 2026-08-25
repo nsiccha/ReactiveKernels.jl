@@ -26,6 +26,15 @@ using .DistributionExamples
             artifact.composition_overhead_bytes ==
                 artifact.allocated_bytes - artifact.reference_allocated_bytes
         end
+        @test all(artifact -> artifact.allocated_bytes == 0, artifacts[1:2])
+        @test all(
+            artifact -> artifact.reference_allocated_bytes == 0,
+            artifacts[1:2],
+        )
+        @test artifacts[3].allocated_bytes > 0
+        @test artifacts[3].allocated_bytes ==
+            artifacts[3].reference_allocated_bytes
+        @test all(artifact -> artifact.composition_overhead_bytes == 0, artifacts)
     end
 
     @testset "concrete inference evidence matches exact result types" begin

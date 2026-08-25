@@ -57,12 +57,13 @@ Main.ReactiveKernelsDocs.execute_example(
 )
 ```
 
-The sources record warmed `@allocated` measurements for both each prepared
-kernel and its equivalent direct `Distributions.jl` call, then report their
-difference as prepared-composition overhead. This separates the distribution
-construction and `MvNormal` linear-algebra baseline from overhead introduced by
-the composed execution path. The scalar `Base.return_types` results are checked
-as exactly `Float64`, so those allocation figures are not presented as evidence
-of an `Any` return box. They are measured evidence, not a blanket zero-allocation
-claim. The package's separate non-allocating path remains documented under
-[Non-allocating kernels](nonallocating.md).
+The sources record `BenchmarkTools.@ballocated` measurements behind a function
+barrier for both each prepared kernel and its equivalent direct
+`Distributions.jl` call, then report their difference as prepared-composition
+overhead. The scalar paths measure zero bytes on both sides. The multivariate
+path reports equal, nonzero measurements because `MvNormal` construction and
+linear algebra allocate in both the prepared and direct calls. The scalar
+`Base.return_types` results are checked as exactly `Float64`, so allocation and
+inference are separate claims rather than an `Any` result being mistaken for a
+distribution cost. The package's separate non-allocating path remains
+documented under [Non-allocating kernels](nonallocating.md).

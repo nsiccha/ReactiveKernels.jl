@@ -7,15 +7,14 @@ export all_sources, evaluate_source, run
 const CONTINUOUS_SOURCE = raw"""
 using Distributions
 using ForwardDiff
-
-normal_distribution(μ::T, σ::T) where {T<:Real} = Normal(μ, σ)
+using BenchmarkTools
 
 function normal_model(::Type{T}) where {T<:AbstractFloat}
     normal_family = @kernel begin
         μ::T
         logσ::T
         σ::T = exp(logσ)
-        normal::Normal{T} = normal_distribution(μ, σ)
+        normal::Normal{T} = Distributions.Normal(μ, σ)
         return normal
     end
 
@@ -46,9 +45,9 @@ reference_gradient = ForwardDiff.gradient(
     v -> normal_reference(v[1], v[2], v[3]),
     [inputs.x, inputs.μ, inputs.logσ],
 )
-warmed_allocated(f, args...) = (f(args...); @allocated f(args...))
-allocated_bytes = warmed_allocated(normal_kernel, Tuple(inputs)...)
-reference_allocated_bytes = warmed_allocated(normal_reference, Tuple(inputs)...)
+allocation_bytes(f, a, b, c) = @ballocated $f($a, $b, $c)
+allocated_bytes = allocation_bytes(normal_kernel, Tuple(inputs)...)
+reference_allocated_bytes = allocation_bytes(normal_reference, Tuple(inputs)...)
 composition_overhead_bytes = allocated_bytes - reference_allocated_bytes
 inferred_return = only(Base.return_types(
     normal_kernel, Tuple{map(typeof, Tuple(inputs))...},
@@ -76,14 +75,13 @@ docs_example = (;
 const DISCRETE_SOURCE = raw"""
 using Distributions
 using ForwardDiff
-
-bernoulli_distribution(probability::T) where {T<:Real} = Bernoulli(probability)
+using BenchmarkTools
 
 function bernoulli_model(::Type{T}) where {T<:AbstractFloat}
     bernoulli_family = @kernel begin
         logit::T
         probability::T = inv(1 + exp(-logit))
-        bernoulli::Bernoulli{T} = bernoulli_distribution(probability)
+        bernoulli::Bernoulli{T} = Distributions.Bernoulli(probability)
         return bernoulli
     end
 
@@ -115,9 +113,9 @@ reference_gradient = ForwardDiff.gradient(
     v -> bernoulli_reference(inputs.observed, v[1]),
     [inputs.logit],
 )
-warmed_allocated(f, args...) = (f(args...); @allocated f(args...))
-allocated_bytes = warmed_allocated(bernoulli_kernel, Tuple(inputs)...)
-reference_allocated_bytes = warmed_allocated(
+allocation_bytes(f, a, b) = @ballocated $f($a, $b)
+allocated_bytes = allocation_bytes(bernoulli_kernel, Tuple(inputs)...)
+reference_allocated_bytes = allocation_bytes(
     bernoulli_reference, Tuple(inputs)...,
 )
 composition_overhead_bytes = allocated_bytes - reference_allocated_bytes
@@ -148,9 +146,10 @@ const MULTIVARIATE_SOURCE = raw"""
 using Distributions
 using ForwardDiff
 using LinearAlgebra
+using BenchmarkTools
 
 function regression_model(::Type{T}) where {T<:AbstractFloat}
-    distribution_type = typeof(MvNormal(zeros(T, 1), one(T) * I))
+    distribution_type = typeof(Distributions.MvNormal(zeros(T, 1), one(T) * I))
 
     coefficient_prior = @kernel begin
         coefficients::Vector{T}
@@ -158,7 +157,7 @@ function regression_model(::Type{T}) where {T<:AbstractFloat}
         prior_mean::Vector{T} = zeros(
             eltype(coefficients), length(coefficients),
         )
-        prior_distribution::distribution_type = MvNormal(
+        prior_distribution::distribution_type = Distributions.MvNormal(
             prior_mean, abs2(prior_scale) * I,
         )
         prior_logdensity::T = logpdf(prior_distribution, coefficients)
@@ -171,7 +170,7 @@ function regression_model(::Type{T}) where {T<:AbstractFloat}
         observations::Vector{T}
         noise_scale::T
         mean::Vector{T} = design * coefficients
-        likelihood_distribution::distribution_type = MvNormal(
+        likelihood_distribution::distribution_type = Distributions.MvNormal(
             mean, abs2(noise_scale) * I,
         )
         likelihood_logdensity::T = logpdf(
@@ -208,14 +207,14 @@ function reference_density(
     coefficients, prior_scale, design, observations, noise_scale,
 )
     prior = logpdf(
-        MvNormal(
+        Distributions.MvNormal(
             zeros(eltype(coefficients), length(coefficients)),
             abs2(prior_scale) * I,
         ),
         coefficients,
     )
     likelihood = logpdf(
-        MvNormal(
+        Distributions.MvNormal(
             design * coefficients,
             abs2(noise_scale) * I,
         ),
@@ -239,9 +238,9 @@ reference_gradient = ForwardDiff.gradient(
     )),
     inputs.coefficients,
 )
-warmed_allocated(f, args...) = (f(args...); @allocated f(args...))
-allocated_bytes = warmed_allocated(regression_kernel, Tuple(inputs)...)
-reference_allocated_bytes = warmed_allocated(reference_density, Tuple(inputs)...)
+allocation_bytes(f, a, b, c, d, e) = @ballocated $f($a, $b, $c, $d, $e)
+allocated_bytes = allocation_bytes(regression_kernel, Tuple(inputs)...)
+reference_allocated_bytes = allocation_bytes(reference_density, Tuple(inputs)...)
 composition_overhead_bytes = allocated_bytes - reference_allocated_bytes
 inferred_return = only(Base.return_types(
     regression_kernel, Tuple{map(typeof, Tuple(inputs))...},
