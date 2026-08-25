@@ -66,6 +66,18 @@ prior, logjac, pointwise, likelihood, density =
 @assert density ≈ prior + logjac + likelihood
 ```
 
+The numeric graph ports are typed at a `Real` boundary, while constrained
+parameters and predictions retain their concrete scalar type. The prepared
+kernel therefore specializes on ordinary `Float64` inputs and also accepts the
+dual-number tuples created by forward-mode AD:
+
+```julia
+using ForwardDiff
+
+logdensity(qv) = k(Tuple(qv), observations, observation_scales)
+gradient = ForwardDiff.gradient(logdensity, collect(q))
+```
+
 Generated quantities can start at an already-constrained boundary. In this
 query, planning removes the unconstrained transform, Jacobian, prior, likelihood
 reduction, and total-density recipes:

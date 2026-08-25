@@ -1,4 +1,5 @@
 using ReactiveKernels
+using ForwardDiff
 using Test
 
 include(joinpath(@__DIR__, "..", "examples", "eight_schools.jl"))
@@ -47,6 +48,26 @@ using .EightSchoolsExample
         @test all(isfinite, pointwise)
         @test likelihood ≈ sum(pointwise)
         @test density ≈ prior + log_jacobian + likelihood
+    end
+
+    @testset "the log-density boundary accepts AD numbers" begin
+        k = prepare(model.graph;
+                    have = (model.unconstrained, model.observations,
+                            model.observation_scales),
+                    want = (model.density,))
+        logdensity(qv) = k(Tuple(qv), EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA)
+
+        gradient = ForwardDiff.gradient(logdensity, collect(q))
+        @test length(gradient) == length(q)
+        @test all(isfinite, gradient)
+
+        h = 1e-6
+        qplus = collect(q)
+        qminus = collect(q)
+        qplus[2] += h
+        qminus[2] -= h
+        finite_difference = (logdensity(qplus) - logdensity(qminus)) / (2h)
+        @test gradient[2] ≈ finite_difference rtol = 1e-6
     end
 
     @testset "generated quantities prune density work" begin

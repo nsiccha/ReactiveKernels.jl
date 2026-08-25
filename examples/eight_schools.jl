@@ -7,25 +7,25 @@ export EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA
 export build_eight_schools_graph, demo
 
 const NSCHOOLS = 8
-const SchoolVector = NTuple{NSCHOOLS,Float64}
-const UnconstrainedParameters = NTuple{NSCHOOLS + 2,Float64}
-const PredictionInnovations = NTuple{2,Float64}
+const SchoolVector = NTuple{NSCHOOLS,Real}
+const UnconstrainedParameters = NTuple{NSCHOOLS + 2,Real}
+const PredictionInnovations = NTuple{2,Real}
 const _LOG2PI = log(2π)
 
 const EIGHT_SCHOOLS_Y = (28.0, 8.0, -3.0, 7.0, -1.0, 1.0, 18.0, 12.0)
 const EIGHT_SCHOOLS_SIGMA = (15.0, 10.0, 16.0, 11.0, 9.0, 11.0, 10.0, 18.0)
 
 "Constrained parameters for the centered eight-schools model."
-struct EightSchoolsParameters
-    μ::Float64
-    τ::Float64
-    θ::SchoolVector
+struct EightSchoolsParameters{T<:Real}
+    μ::T
+    τ::T
+    θ::NTuple{NSCHOOLS,T}
 end
 
 "A deterministic new-group prediction for supplied standard-normal innovations."
-struct NewGroupPrediction
-    θ::Float64
-    y::Float64
+struct NewGroupPrediction{T<:Real}
+    θ::T
+    y::T
 end
 
 # --- Pure operations used as graph recipes ---------------------------------
@@ -34,21 +34,21 @@ function split_unconstrained(q::UnconstrainedParameters)
     q[1], q[2], ntuple(i -> q[i + 2], NSCHOOLS)
 end
 
-positive_scale(log_τ::Float64) = exp(log_τ)
+positive_scale(log_τ::Real) = exp(log_τ)
 
-assemble_parameters(μ::Float64, τ::Float64, θ::SchoolVector) =
+assemble_parameters(μ::Real, τ::Real, θ::SchoolVector) =
     EightSchoolsParameters(μ, τ, θ)
 
 # Only τ is transformed: τ = exp(log_τ), hence log |dτ / dlog_τ| = log_τ.
-log_abs_det_jacobian(log_τ::Float64) = log_τ
+log_abs_det_jacobian(log_τ::Real) = log_τ
 
-function normal_logpdf(x::Float64, location::Float64, scale::Float64)
+function normal_logpdf(x::Real, location::Real, scale::Real)
     scale > 0 || throw(DomainError(scale, "normal scale must be positive"))
     z = (x - location) / scale
     -0.5 * _LOG2PI - log(scale) - 0.5 * z^2
 end
 
-function half_cauchy_logpdf(x::Float64, scale::Float64)
+function half_cauchy_logpdf(x::Real, scale::Real)
     x > 0 || throw(DomainError(x, "half-Cauchy variate must be positive"))
     scale > 0 || throw(DomainError(scale, "half-Cauchy scale must be positive"))
     log(2) - log(π) - log(scale) - log1p((x / scale)^2)
@@ -73,12 +73,12 @@ end
 
 sum_log_likelihood(log_likelihoods::SchoolVector) = sum(log_likelihoods)
 
-total_log_density(log_prior::Float64, log_jacobian::Float64,
-                  log_likelihood::Float64) =
+total_log_density(log_prior::Real, log_jacobian::Real,
+                  log_likelihood::Real) =
     log_prior + log_jacobian + log_likelihood
 
 function predict_new_group(parameters::EightSchoolsParameters,
-                           σ_new::Float64,
+                           σ_new::Real,
                            innovations::PredictionInnovations)
     σ_new > 0 ||
         throw(DomainError(σ_new, "new-group observation scale must be positive"))
@@ -106,23 +106,23 @@ function build_eight_schools_graph()
     unconstrained = value!(graph, :unconstrained, UnconstrainedParameters)
     observations = value!(graph, :observations, SchoolVector)
     observation_scales = value!(graph, :observation_scales, SchoolVector)
-    new_group_scale = value!(graph, :new_group_scale, Float64)
+    new_group_scale = value!(graph, :new_group_scale, Real)
     prediction_innovations = value!(graph, :prediction_innovations,
                                     PredictionInnovations)
 
     # Unconstrained -> constrained transform.
-    μ = value!(graph, :μ, Float64)
-    log_τ = value!(graph, :log_τ, Float64)
+    μ = value!(graph, :μ, Real)
+    log_τ = value!(graph, :log_τ, Real)
     θ = value!(graph, :θ, SchoolVector)
-    τ = value!(graph, :τ, Float64)
+    τ = value!(graph, :τ, Real)
     parameters = value!(graph, :parameters, EightSchoolsParameters)
-    log_jacobian = value!(graph, :log_jacobian, Float64)
+    log_jacobian = value!(graph, :log_jacobian, Real)
 
     # Density and generated quantities.
-    prior = value!(graph, :log_prior, Float64)
+    prior = value!(graph, :log_prior, Real)
     pointwise = value!(graph, :pointwise_log_likelihood, SchoolVector)
-    likelihood = value!(graph, :log_likelihood, Float64)
-    density = value!(graph, :log_density, Float64)
+    likelihood = value!(graph, :log_likelihood, Real)
+    density = value!(graph, :log_density, Real)
     new_group = value!(graph, :new_group_prediction, NewGroupPrediction)
 
     add!(graph, unconstrained => (μ, log_τ, θ), split_unconstrained)
