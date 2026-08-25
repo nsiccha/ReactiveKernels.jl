@@ -137,9 +137,56 @@ function _kernel_assignment_names!(names::Set{Symbol}, lhs)
     names
 end
 
+function _kernel_assignment_lhs_reads!(out::Vector{Symbol}, seen::Set{Symbol}, lhs,
+                                       known::Set{Symbol}, assigned::Set{Symbol},
+                                       hidden::Set{Symbol})
+    lhs isa Symbol && return assigned
+    lhs isa Expr || return assigned
+    if lhs.head === :(::)
+        _kernel_assignment_lhs_reads!(
+            out, seen, lhs.args[1], known, assigned, hidden,
+        )
+        for annotation in lhs.args[2:end]
+            _kernel_free_ports_flow!(
+                out, seen, annotation, known, assigned, hidden,
+            )
+        end
+    elseif lhs.head in (:tuple, :parameters)
+        for target in lhs.args
+            _kernel_assignment_lhs_reads!(
+                out, seen, target, known, assigned, hidden,
+            )
+        end
+    elseif lhs.head === :kw
+        _kernel_assignment_lhs_reads!(
+            out, seen, lhs.args[1], known, assigned, hidden,
+        )
+        _kernel_free_ports_flow!(
+            out, seen, lhs.args[2], known, assigned, hidden,
+        )
+    elseif lhs.head === :(...)
+        _kernel_assignment_lhs_reads!(
+            out, seen, lhs.args[1], known, assigned, hidden,
+        )
+    else
+        # Mutation targets such as `a[i]` and `obj.field` evaluate only their
+        # receiver/index components; the ordinary expression walker already
+        # treats property labels as inert.
+        _kernel_free_ports_flow!(out, seen, lhs, known, assigned, hidden)
+    end
+    assigned
+end
+
 function _kernel_function_parameters!(names::Set{Symbol}, signature)
-    if signature isa Expr && signature.head in (:(::), :where)
+    if signature isa Expr && signature.head === :(::)
         _kernel_function_parameters!(names, signature.args[1])
+    elseif signature isa Expr && signature.head === :where
+        _kernel_function_parameters!(names, signature.args[1])
+        for parameter in signature.args[2:end]
+            target = parameter isa Expr && parameter.head in (:<:, :>:) ?
+                     parameter.args[1] : parameter
+            _kernel_bound_names!(names, target)
+        end
     elseif signature isa Expr && signature.head === :call
         signature.args[1] isa Symbol && push!(names, signature.args[1])
         for arg in signature.args[2:end]
@@ -161,6 +208,47 @@ function _kernel_function_name!(names::Set{Symbol}, signature)
     end
     names
 end
+
+function _kernel_where_names!(names::Set{Symbol}, signature)
+    signature isa Expr || return names
+    if signature.head === :where
+        for parameter in signature.args[2:end]
+            target = parameter isa Expr && parameter.head in (:<:, :>:) ?
+                     parameter.args[1] : parameter
+            _kernel_bound_names!(names, target)
+        end
+        _kernel_where_names!(names, signature.args[1])
+    elseif signature.head === :(::)
+        _kernel_where_names!(names, signature.args[1])
+    end
+    names
+end
+
+function _kernel_signature_annotations!(annotations::Vector{Any}, signature)
+    signature isa Expr || return annotations
+    if signature.head === :(::)
+        _kernel_signature_annotations!(annotations, signature.args[1])
+        append!(annotations, signature.args[2:end])
+    elseif signature.head === :where
+        _kernel_signature_annotations!(annotations, signature.args[1])
+        for parameter in signature.args[2:end]
+            if parameter isa Expr && parameter.head in (:<:, :>:)
+                append!(annotations, parameter.args[2:end])
+            end
+        end
+    elseif signature.head in (:call, :parameters)
+        start = signature.head === :call ? 2 : 1
+        for argument in signature.args[start:end]
+            _kernel_signature_annotations!(annotations, argument)
+        end
+    elseif signature.head === :kw || signature.head === :(...)
+        _kernel_signature_annotations!(annotations, signature.args[1])
+    end
+    annotations
+end
+
+_kernel_signature_annotations(signature) =
+    _kernel_signature_annotations!(Any[], signature)
 
 function _kernel_function_arguments(signature)
     while signature isa Expr && signature.head in (:(::), :where)
@@ -227,6 +315,7 @@ function _kernel_function_default_reads!(
 )
     signature_hidden = copy(hidden)
     _kernel_function_name!(signature_hidden, signature)
+    _kernel_where_names!(signature_hidden, signature)
     for argument in _kernel_function_arguments(signature)
         if argument isa Expr && argument.head === :kw
             # Earlier positional/keyword parameters are in scope, while the
@@ -245,6 +334,29 @@ function _kernel_function_default_reads!(
     nothing
 end
 
+function _kernel_validate_function_signature!(
+    signature, known::Set{Symbol}, assigned::Set{Symbol}, hidden::Set{Symbol},
+)
+    # Outer locals/definite writes cannot make a runtime value legal in a local
+    # method signature. Only signature-owned lexical names are exempt.
+    signature_hidden = Set{Symbol}()
+    _kernel_function_name!(signature_hidden, signature)
+    _kernel_where_names!(signature_hidden, signature)
+    for annotation in _kernel_signature_annotations(signature)
+        reads = Symbol[]
+        _kernel_free_ports_flow!(
+            reads, Set{Symbol}(), annotation, known,
+            Set{Symbol}(), signature_hidden,
+        )
+        isempty(reads) || throw(ArgumentError(
+            "graph port :$(first(reads)) cannot appear in a nested local function " *
+            "signature annotation; Julia method signatures cannot capture runtime " *
+            "local types. Use a runtime isa/convert check or a module-qualified " *
+            "static type instead"))
+    end
+    nothing
+end
+
 function _kernel_free_ports_flow!(out::Vector{Symbol}, seen::Set{Symbol}, ex,
                                   known::Set{Symbol}, assigned::Set{Symbol},
                                   hidden::Set{Symbol})
@@ -258,6 +370,23 @@ function _kernel_free_ports_flow!(out::Vector{Symbol}, seen::Set{Symbol}, ex,
         for statement in ex.args
             _kernel_free_ports_flow!(out, seen, statement, known, assigned, hidden)
         end
+    elseif ex.head === :tuple
+        # In tuple expression context `name = value` / `name = value` under a
+        # `:parameters` node is a named-tuple field, not a local assignment.
+        for item in ex.args
+            fields = item isa Expr && item.head === :parameters ? item.args : (item,)
+            for field in fields
+                if field isa Expr && field.head in (:(=), :kw)
+                    _kernel_free_ports_flow!(
+                        out, seen, field.args[2], known, assigned, hidden,
+                    )
+                else
+                    _kernel_free_ports_flow!(
+                        out, seen, field, known, assigned, hidden,
+                    )
+                end
+            end
+        end
     elseif ex.head === :kw
         _kernel_free_ports_flow!(out, seen, ex.args[2], known, assigned, hidden)
     elseif ex.head === :.
@@ -268,6 +397,9 @@ function _kernel_free_ports_flow!(out::Vector{Symbol}, seen::Set{Symbol}, ex,
         end
     elseif ex.head === :(=) && ex.args[1] isa Expr &&
            ex.args[1].head in (:call, :where)
+        _kernel_validate_function_signature!(
+            ex.args[1], known, assigned, hidden,
+        )
         _kernel_function_default_reads!(
             out, seen, ex.args[1], known, assigned, hidden,
         )
@@ -280,21 +412,38 @@ function _kernel_free_ports_flow!(out::Vector{Symbol}, seen::Set{Symbol}, ex,
         )
         union!(assigned, function_names)
     elseif ex.head === :(=)
-        # Targets are binding syntax, not reads; the RHS is evaluated before
-        # the target becomes definitely assigned, so `a = a + 1` retains `a`.
+        # Pure binder leaves are not reads. Typed binders evaluate their type,
+        # while indexed/property targets evaluate receiver/index components.
+        _kernel_assignment_lhs_reads!(
+            out, seen, ex.args[1], known, assigned, hidden,
+        )
         _kernel_free_ports_flow!(out, seen, ex.args[2], known, assigned, hidden)
         written = Set{Symbol}()
         _kernel_assignment_names!(written, ex.args[1])
         union!(assigned, written)
-    elseif ex.head in (:local, :global)
+    elseif ex.head === :local
         for declaration in ex.args
             if declaration isa Expr && declaration.head === :(=)
+                _kernel_assignment_lhs_reads!(
+                    out, seen, declaration.args[1], known, assigned, hidden,
+                )
                 _kernel_free_ports_flow!(
                     out, seen, declaration.args[2], known, assigned, hidden,
                 )
                 _kernel_assignment_names!(assigned, declaration.args[1])
             else
+                _kernel_assignment_lhs_reads!(
+                    out, seen, declaration, known, assigned, hidden,
+                )
                 _kernel_assignment_names!(assigned, declaration)
+            end
+        end
+    elseif ex.head === :global
+        for declaration in ex.args
+            if declaration isa Expr && declaration.head === :(=)
+                _kernel_free_ports_flow!(
+                    out, seen, declaration.args[2], known, assigned, hidden,
+                )
             end
         end
     elseif ex.head === :if
@@ -401,6 +550,9 @@ function _kernel_free_ports_flow!(out::Vector{Symbol}, seen::Set{Symbol}, ex,
             out, seen, ex.args[2], known, Set{Symbol}(), function_hidden,
         )
     elseif ex.head === :function
+        _kernel_validate_function_signature!(
+            ex.args[1], known, assigned, hidden,
+        )
         _kernel_function_default_reads!(
             out, seen, ex.args[1], known, assigned, hidden,
         )

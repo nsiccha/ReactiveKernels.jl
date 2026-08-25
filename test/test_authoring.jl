@@ -60,6 +60,10 @@ struct CallableSource
     calls::Base.RefValue{Int}
 end
 
+mutable struct Box
+    value::Int
+end
+
 function Base.getproperty(source::CallableSource, name::Symbol)
     name === :op || return getfield(source, name)
     getfield(source, :calls)[] += 1
@@ -430,6 +434,126 @@ end
         ) == (:a,)
         @test prepare(read_modify_assignment)(10) == 11
 
+        indexed_assignment = @kernel begin
+            a::Vector{Int}
+            i::Int
+            y::Int = begin
+                b = copy(a)
+                b[i] = 9
+                sum(b)
+            end
+            return y
+        end
+        @test Tuple(v.name for v in only(
+            kernel_graph(indexed_assignment).recipes,
+        ).inputs) == (:a, :i)
+        @test prepare(indexed_assignment)([1, 2], 2) == 10
+
+        property_assignment = @kernel begin
+            box::AuthoringComputedCalleeFixture.Box
+            field_value::Int
+            value::Int
+            y::Int = begin
+                local_box = deepcopy(box)
+                local_box.value = field_value
+                local_box.value
+            end
+            return y
+        end
+        @test Tuple(v.name for v in only(
+            kernel_graph(property_assignment).recipes,
+        ).inputs) == (:box, :field_value)
+        @test prepare(
+            property_assignment; have = (:box, :field_value),
+        )(AuthoringComputedCalleeFixture.Box(1), 9) == 9
+
+        named_tuple_assignment = @kernel begin
+            a::Int
+            x::Int
+            y::NamedTuple{(:a,:b),Tuple{Int,Int}} = (a = x, b = a)
+            return y
+        end
+        @test Set(v.name for v in only(
+            kernel_graph(named_tuple_assignment).recipes,
+        ).inputs) == Set((:a, :x))
+        @test prepare(named_tuple_assignment)(3, 4) == (a = 4, b = 3)
+
+        semicolon_named_tuple = @kernel begin
+            a::Int
+            x::Int
+            y::NamedTuple{(:a,:b),Tuple{Int,Int}} = (; a = x, b = a)
+            return y
+        end
+        @test Set(v.name for v in only(
+            kernel_graph(semicolon_named_tuple).recipes,
+        ).inputs) == Set((:a, :x))
+        @test prepare(semicolon_named_tuple)(3, 4) == (a = 4, b = 3)
+
+        destructuring_assignment = @kernel begin
+            a::Int
+            b::Int
+            y::Int = begin
+                (a, b) = (2, 3)
+                a + b
+            end
+            return y
+        end
+        @test isempty(only(kernel_graph(destructuring_assignment).recipes).inputs)
+        @test prepare(destructuring_assignment; have = ())() == 5
+
+        mixed_assignment = @kernel begin
+            source::Int
+            @recipe (effectful = true) x::Int = source + 100
+            y::Int = begin
+                b = [0]
+                (x, b[1]) = (2, 3)
+                x + b[1]
+            end
+            return y
+        end
+        @test isempty(kernel_graph(mixed_assignment).recipes[2].inputs)
+        @test prepare(mixed_assignment)(1) == 5
+
+        typed_assignment = @kernel begin
+            T::DataType
+            y::Int = begin
+                x::T = 2
+                x
+            end
+            return y
+        end
+        @test Tuple(v.name for v in only(
+            kernel_graph(typed_assignment).recipes,
+        ).inputs) == (:T,)
+        @test prepare(typed_assignment)(Int) == 2
+
+        initialized_typed_local = @kernel begin
+            T::DataType
+            y::Int = begin
+                local x::T = 2
+                x
+            end
+            return y
+        end
+        @test Tuple(v.name for v in only(
+            kernel_graph(initialized_typed_local).recipes,
+        ).inputs) == (:T,)
+        @test prepare(initialized_typed_local)(Int) == 2
+
+        declared_typed_local = @kernel begin
+            T::DataType
+            y::Int = begin
+                local x::T
+                x = 2
+                x
+            end
+            return y
+        end
+        @test Tuple(v.name for v in only(
+            kernel_graph(declared_typed_local).recipes,
+        ).inputs) == (:T,)
+        @test prepare(declared_typed_local)(Int) == 2
+
         one_branch_assignment = @kernel begin
             a::Int
             flag::Bool
@@ -761,6 +885,90 @@ end
         end
         @test multi_output_type_error isa ArgumentError
         @test occursin("position 2", sprint(showerror, multi_output_type_error))
+
+        invalid_signatures = (
+            quote
+                @kernel begin
+                    T::DataType
+                    y::Int = begin
+                        f(x::T) = x + 1
+                        f(2)
+                    end
+                    return y
+                end
+            end,
+            quote
+                @kernel begin
+                    T::DataType
+                    y::Int = begin
+                        function f(x::T)
+                            x + 1
+                        end
+                        f(2)
+                    end
+                    return y
+                end
+            end,
+            quote
+                @kernel begin
+                    T::DataType
+                    y::DataType = begin
+                        f(x::Q) where {Q<:T} = Q
+                        f(2)
+                    end
+                    return y
+                end
+            end,
+            quote
+                @kernel begin
+                    T::DataType
+                    y::Int = begin
+                        T = Int
+                        f(x::T) = x + 1
+                        f(2)
+                    end
+                    return y
+                end
+            end,
+            quote
+                @kernel begin
+                    T::DataType
+                    y::Int = begin
+                        local T = Int
+                        function f(x::T)
+                            x + 1
+                        end
+                        f(2)
+                    end
+                    return y
+                end
+            end,
+        )
+        for invalid in invalid_signatures
+            signature_error = try
+                macroexpand(@__MODULE__, invalid)
+                nothing
+            catch err
+                err
+            end
+            @test signature_error isa ArgumentError
+            @test occursin(
+                "cannot appear in a nested local function signature annotation",
+                sprint(showerror, signature_error),
+            )
+            @test occursin("runtime isa/convert", sprint(showerror, signature_error))
+        end
+
+        where_collision = @kernel begin
+            S::DataType
+            y::DataType = begin
+                f(x::S) where S = S
+                f(2)
+            end
+            return y
+        end
+        @test isempty(only(kernel_graph(where_collision).recipes).inputs)
+        @test prepare(where_collision; have = ())() === Int
         @test_throws KeyError (@kernel begin x::Int end)[:missing]
     end
 end
