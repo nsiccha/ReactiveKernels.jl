@@ -46,6 +46,7 @@ using .DistributionExamples
         for (artifact, expected_return) in zip(artifacts, expected_returns)
             observed = artifact.kernel(Tuple(artifact.inputs)...)
             @test isconcretetype(artifact.inferred_return)
+            @test artifact.inferred_return === typeof(observed)
             @test artifact.inferred_return === expected_return
             @test typeof(observed) === expected_return
         end
