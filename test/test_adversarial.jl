@@ -88,6 +88,8 @@ using Test
         k = prepare(g; have = (x, x), want = (x,))
         @test inputs(k) == (x,)
         @test k(4.0) == 4.0
+        @test_throws MethodError k()
+        @test_throws MethodError k(4.0, 5.0)
 
         source = value!(g, :source, Float64)
         x_alias = value!(g, :x_alias, Float64)
