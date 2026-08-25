@@ -6,7 +6,7 @@ makedocs(
     format   = DocumenterVitepress.MarkdownVitepress(
         repo = "github.com/nsiccha/ReactiveKernels.jl",
         devurl = "dev",
-        devbranch = "dev",
+        devbranch = "main",
     ),
     pages = [
         "Home" => "index.md",
@@ -28,6 +28,6 @@ end
 
 DocumenterVitepress.deploydocs(
     repo = "github.com/nsiccha/ReactiveKernels.jl",
-    devbranch = "dev",
+    devbranch = "main",
     push_preview = true,
 )
