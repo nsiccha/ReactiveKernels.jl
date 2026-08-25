@@ -8,6 +8,8 @@
 # types. The hot path therefore touches no graph object.
 
 const _OPS_ARG = :__ops__
+const _CACHES_ARG = :__caches__
+const _CACHE_APPLY_ARG = :__cache_apply__
 
 # Assign a globally unique source-variable Symbol to every canonical value in
 # the plan. User names are diagnostic hints, not binding authority: they may
@@ -20,7 +22,7 @@ function _varnames(p::Plan)
     for r in p.recipes, o in r.outputs; push!(ids, canon_id(g, o.id)); end
     for w in p.want; push!(ids, canon_id(g, w.id)); end
     unique!(ids)
-    used = Set{Symbol}((_OPS_ARG,))
+    used = Set{Symbol}((_OPS_ARG, _CACHES_ARG, _CACHE_APPLY_ARG))
     out = Dict{Int,Symbol}()
     for id in ids
         base = p.graph.values[id].name
@@ -135,6 +137,82 @@ function _prepare(p::Plan, ast::Expr)
     PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, ast)
 end
 
+# The optional MutatingFunctions extension uses one typed cache cell per
+# selected recipe. Its `nothing` value requests the allocating implementation
+# on first use; later calls feed the stored value back to the extension helper.
+_cache_slot(::Value{T}) where {T} = Ref{Union{Nothing,T}}(nothing)
+
+function _rewrite_nonallocating_calls(node)
+    node isa Expr || return node
+    args = map(_rewrite_nonallocating_calls, node.args)
+    rewritten = Expr(node.head, args...)
+    if rewritten.head === :call && rewritten.args[1] isa Expr
+        callee = rewritten.args[1]
+        if callee.head === :ref && length(callee.args) == 2 &&
+           callee.args[1] === _OPS_ARG && callee.args[2] isa Int
+            cache = Expr(:ref, _CACHES_ARG, callee.args[2])
+            return Expr(:call, _CACHE_APPLY_ARG, cache, callee,
+                        rewritten.args[2:end]...)
+        end
+    end
+    rewritten
+end
+
+function _nonallocating_ast(ast::Expr)
+    ast.head === :function ||
+        throw(ArgumentError("non-allocating preparation requires a function Expr"))
+    signature = ast.args[1]
+    signature isa Expr && signature.head === :tuple &&
+        !isempty(signature.args) && first(signature.args) === _OPS_ARG ||
+        throw(ArgumentError("non-allocating preparation requires the lowered __ops__ signature"))
+    args = Expr(:tuple, _OPS_ARG, _CACHES_ARG, _CACHE_APPLY_ARG,
+                signature.args[2:end]...)
+    Expr(:function, args, _rewrite_nonallocating_calls(ast.args[2]))
+end
+
+"""
+    NonAllocatingKernel
+
+A stateful prepared kernel whose selected single-output recipes are invoked
+through `MutatingFunctions.apply!!`. Each recipe owns a persistent typed cache:
+the first call seeds it and later calls offer it back for in-place reuse.
+
+Each cache slot retains whatever its operation returned on the first call.
+Registered allocating operations such as `copy` normally seed fresh
+kernel-retained storage, but aliasing operations may retain caller-owned
+inputs, and a no-recipe plan returns its `have` value directly. Treat mutable
+results as borrowed values that may alias inputs or be overwritten by later
+calls. A kernel instance is therefore neither reentrant nor safe for concurrent
+calls; prepare one instance per independent caller.
+"""
+struct NonAllocatingKernel{F,O,C,A,IN,OUT}
+    f::F
+    ops::O
+    caches::C
+    cache_apply::A
+    inputs::IN
+    outputs::OUT
+    plan::Plan
+    ast::Expr
+end
+
+@inline function (k::NonAllocatingKernel)(args...)
+    length(args) == length(k.inputs) || throw(MethodError(k, args))
+    k.f(k.ops, k.caches, k.cache_apply, args...)
+end
+
+function _prepare_nonallocating(p::Plan, ast::Expr, cache_apply)
+    for r in p.recipes
+        length(r.outputs) == 1 || throw(ArgumentError(
+            "prepare_nonallocating requires single-output recipes; recipe $(r.id) has $(length(r.outputs)) outputs"))
+    end
+    f = compile(ast)
+    ops = ntuple(i -> p.recipes[i].op, length(p.recipes))
+    caches = ntuple(i -> _cache_slot(only(p.recipes[i].outputs)), length(p.recipes))
+    NonAllocatingKernel(f, ops, caches, cache_apply, Tuple(p.have),
+                        Tuple(p.want), p, ast)
+end
+
 """
     prepare(p::Plan; passes=()) -> PreparedKernel
     prepare(g::Graph; have, want, passes=()) -> PreparedKernel
@@ -150,11 +228,43 @@ function prepare(g::Graph; have = (), want = (), passes = ())
     prepare(p; passes = passes)
 end
 
+"""
+    prepare_nonallocating(p::Plan; passes=()) -> NonAllocatingKernel
+    prepare_nonallocating(g::Graph; have, want, passes=()) -> NonAllocatingKernel
+
+Optional MutatingFunctions-backed preparation interface. Install and load
+`MutatingFunctions` alongside `ReactiveKernels` to activate the package
+extension that supplies these methods. The extension prepares the same
+straight-line plan as [`prepare`](@ref), then applies a final AST transform
+that routes every selected operation through `MutatingFunctions.apply!!` and a
+persistent per-recipe cache. User `passes` run before this final transform.
+
+The first invocation populates the caches and may allocate. Later invocations
+reuse them when the selected operations provide allocation-free `apply!!`
+methods for the runtime argument and cache types. MutatingFunctions' generic
+fallback preserves semantics but may still allocate, so allocation freedom is
+a property of the complete lowered operation set rather than a planner
+guarantee.
+
+Every selected recipe must have exactly one output. Each slot retains the first
+object returned by its operation: that is fresh kernel-retained storage for
+ordinary allocating/registered operations, but it may be a caller-owned input
+for aliasing operations. A no-recipe plan returns its input directly. Treat
+mutable results as borrowed values that may alias inputs or be overwritten by
+the next call; a prepared instance is not reentrant or thread-safe.
+"""
+function prepare_nonallocating(args...; kwargs...)
+    throw(ArgumentError(
+        "prepare_nonallocating requires the optional MutatingFunctions extension; install MutatingFunctions and load it with `using MutatingFunctions`"))
+end
+
 "Graph values in positional call order."
 inputs(k::PreparedKernel) = k.inputs
+inputs(k::NonAllocatingKernel) = k.inputs
 inputs(p::Plan) = Tuple(p.have)
 "Graph values in return order."
 outputs(k::PreparedKernel) = k.outputs
+outputs(k::NonAllocatingKernel) = k.outputs
 outputs(p::Plan) = Tuple(p.want)
 
 """
@@ -166,6 +276,7 @@ absent from the kernel (gist §20).
 """
 code_expr(p::Plan) = lower(p)
 code_expr(k::PreparedKernel) = k.ast
+code_expr(k::NonAllocatingKernel) = k.ast
 
 # --- explanation -----------------------------------------------------------
 
@@ -221,5 +332,10 @@ end
 Base.show(io::IO, p::Plan) = print(io, explain(p))
 function Base.show(io::IO, k::PreparedKernel)
     print(io, "PreparedKernel(", join([string(v.name) for v in k.inputs], ", "),
+          " -> ", join([string(v.name) for v in k.outputs], ", "), ")")
+end
+
+function Base.show(io::IO, k::NonAllocatingKernel)
+    print(io, "NonAllocatingKernel(", join([string(v.name) for v in k.inputs], ", "),
           " -> ", join([string(v.name) for v in k.outputs], ", "), ")")
 end
