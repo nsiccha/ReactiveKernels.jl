@@ -50,13 +50,11 @@ side by side without resetting the interactive DAG.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(@__MODULE__, raw"""
-model = @kernel begin
-    unconstrained::UnconstrainedParameters
-    observations::SchoolVector
-    observation_scales::SchoolVector
-    new_group_scale::Real
-    prediction_innovations::PredictionInnovations
-
+@kernel model(unconstrained::UnconstrainedParameters,
+              observations::SchoolVector,
+              observation_scales::SchoolVector,
+              new_group_scale::Real,
+              prediction_innovations::PredictionInnovations) = begin
     (μ::Real, log_τ::Real, θ::SchoolVector) =
         EightSchoolsExample.split_unconstrained(unconstrained)
     τ::Real = EightSchoolsExample.positive_scale(log_τ)

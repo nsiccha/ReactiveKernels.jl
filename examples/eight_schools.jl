@@ -100,13 +100,11 @@ nodes. Prediction is deterministic for caller-supplied standard-normal
 innovations; sampling those innovations remains outside the pure graph.
 """
 function build_eight_schools_graph()
-    @kernel begin
-        unconstrained::UnconstrainedParameters
-        observations::SchoolVector
-        observation_scales::SchoolVector
-        new_group_scale::Real
-        prediction_innovations::PredictionInnovations
-
+    @kernel model(unconstrained::UnconstrainedParameters,
+                  observations::SchoolVector,
+                  observation_scales::SchoolVector,
+                  new_group_scale::Real,
+                  prediction_innovations::PredictionInnovations) = begin
         (μ::Real, log_τ::Real, θ::SchoolVector) =
             split_unconstrained(unconstrained)
         τ::Real = positive_scale(log_τ)

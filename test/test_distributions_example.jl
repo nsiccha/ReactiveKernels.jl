@@ -9,7 +9,7 @@ using .DistributionExamples
     @testset "executed source is the documentation source" begin
         @test length(artifacts) == 3
         @test all(source -> startswith(source, "using Distributions\n"), all_sources())
-        @test all(source -> occursin("@kernel begin", source), all_sources())
+        @test all(source -> occursin(r"@kernel \w+\(", source), all_sources())
         @test all(source -> occursin("compose(", source), all_sources())
         @test all(artifacts) do artifact
             artifact.output isa Tuple ?
