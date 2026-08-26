@@ -352,6 +352,58 @@ end
         @test r.reads == (:g, :mom)   # `p.mom` on the RHS of `p.pos = p.mom` is a read
     end
 
+    @testset "registered-kernel resolver + hygiene/rebind + core intrinsic" begin
+        # Mode-2 free method → registered with Token + subject + effect roots + !! flag
+        reg = RKS.kernel_registration(leapfrog!)
+        @test reg isa RKS._KernelRegistration
+        @test reg.kind === :free_method
+        @test reg.subject === :phasepoint
+        @test reg.token === RKS.kernel_token(leapfrog!)
+        @test reg.write_roots == (:mom, :pos)
+        @test reg.read_roots == (:dham_dpos, :dham_dmom)
+        @test !reg.is_bang_bang
+        @test RKS.kernel_registration(nuts!!).is_bang_bang            # `!!` metadata carried
+
+        # Mode-1 object kernel → registered by Token
+        obj = RKS.kernel_registration(StatefulObjFixture)
+        @test obj.kind === :object_kernel
+        @test obj.token === RKS.kernel_token(StatefulObjFixture)
+
+        # a stateless kernel → recognized by value (no Token in Increment 1)
+        @kernel plainreg(f, x) = begin
+            y = f(x)
+        end
+        sreg = RKS.kernel_registration(plainreg)
+        @test sreg.kind === :stateless
+        @test sreg.token === nothing
+
+        # an ordinary Julia callable / value is NOT registered ⇒ opaque
+        @test RKS.kernel_registration(sin) === nothing
+        @test RKS.kernel_registration(42) === nothing
+
+        # RK-core intrinsic: the SAME resolver accommodates an intrinsic Token + `!!`
+        ireg = RKS.kernel_registration(RKS.copy!!)
+        @test ireg.kind === :intrinsic
+        @test ireg.is_bang_bang
+        @test ireg.subject === :dest
+        @test ireg.token === RKS.kernel_token(RKS.copy!!)
+        @test ireg.write_roots == () && ireg.read_roots == ()        # structural, no field list
+        # intrinsic token and @kernel-def tokens are distinct identities
+        @test ireg.token !== reg.token
+        @test ireg.token !== obj.token
+        @test reg.token !== obj.token
+
+        # hygienic name→registration hop (by module binding identity, no eval)
+        @test RKS.kernel_registration(@__MODULE__, :leapfrog!).token === RKS.kernel_token(leapfrog!)
+        @test RKS.kernel_registration(@__MODULE__, :a_name_that_is_undefined_xyz) === nothing
+
+        # rebind discriminator
+        cap = RKS.kernel_registration(leapfrog!)
+        @test !RKS.kernel_rebound(cap, leapfrog!)                     # same binding
+        @test RKS.kernel_rebound(cap, nuts!!)                         # different Token
+        @test RKS.kernel_rebound(cap, sin)                            # no longer a kernel
+    end
+
     @testset "recipe-source provenance: frozen capture + kernel_recipe_ast" begin
         skel = StatefulRecipeSrcFixture
         ast = RKS.kernel_recipe_ast(skel)

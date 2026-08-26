@@ -668,3 +668,97 @@ function _kernel_mode2_expand(name, signature_inputs, call_signature, block,
              QuoteNode(subject), esc(spec_expr),
              roots.writes, roots.reads, method_meta, body_source, is_bb)))
 end
+
+# --- registered-kernel resolver + hygiene/rebind discriminator ---------------
+#
+# The single load-bearing new substrate accessor (RK 2026-08-26; poc gate 4):
+# maps a captured callable NAME/VALUE identity to its registration — def-unique
+# Token + declared subject/effect-root metadata — so a cross-kernel call
+# (`leapfrog!(fwd)`, and the inner callee of `partial(leapfrog!; …)` /
+# `deepcopy(child)`) resolves to a REGISTERED call instead of an opaque Julia
+# call. Source/registration PROVENANCE only — no effect closure/lowering. An
+# ordinary Julia callable resolves to `nothing` (opaque, per the compiler
+# boundary: ordinary Julia is opaque unless explicitly registered).
+
+struct _KernelRegistration
+    token::Any               # def-unique/intrinsic Token, or `nothing` for a stateless spec
+    kind::Symbol             # :free_method | :object_kernel | :stateless | :intrinsic
+    subject::Union{Symbol,Nothing}    # Mode-2/intrinsic subject (first positional), else nothing
+    write_roots::Tuple{Vararg{Symbol}}
+    read_roots::Tuple{Vararg{Symbol}}
+    is_bang_bang::Bool       # `!!` strong same-object update registration
+end
+
+# A tiny RK-CORE registered intrinsic (NOT authored via `@kernel`): a strong
+# structural update carrying a stable, def-unique intrinsic Token so the general
+# resolver recognizes it exactly like an `@kernel` definition token (RK 2026-08-26
+# source-contract refinement). Provenance only in Increment 1 — the alias-aware
+# minimal owned-closure copy is lowered later; no manual field list is stored.
+struct _KernelIntrinsic
+    name::Symbol
+    token::Symbol            # stable, def-unique intrinsic Token (never a gensym)
+    subject::Union{Symbol,Nothing}
+    is_bang_bang::Bool
+end
+kernel_token(i::_KernelIntrinsic) = getfield(i, :token)
+kernel_subject(i::_KernelIntrinsic) = getfield(i, :subject)
+kernel_is_bangbang(i::_KernelIntrinsic) = getfield(i, :is_bang_bang)
+
+"""
+    copy!!(dest, src)
+
+RK-core registered structural strong-update intrinsic (RK 2026-08-26). Contract
+(realized by later lowering): returns `dest` identically; fixed shape/type; copies
+the compiler-inferred OWNED authoritative closure into existing buffers; leaves
+SHARED authority identity/closure untouched; alias-aware minimal physical copies;
+incompatible shape / shared authority rejects. Increment 1 registers its
+PROVENANCE ONLY — it is recognized through the general registered-kernel/intrinsic
+resolver + `!!` metadata, with NO manual field list and NO external dependency.
+"""
+const copy!! = _KernelIntrinsic(Symbol("copy!!"), Symbol("__rk_intrinsic_copy!!__"),
+                                :dest, true)
+
+"""
+    kernel_registration(value) -> _KernelRegistration | nothing
+    kernel_registration(mod::Module, name::Symbol) -> _KernelRegistration | nothing
+
+Registration provenance of a registered `@kernel` (Mode-1/Mode-2, Token-registered),
+a stateless `KernelSpec` (recognized by value, no Token in Increment 1), or an
+RK-core `_KernelIntrinsic` (intrinsic Token) — else `nothing` (an ordinary Julia
+callable ⇒ opaque, per the compiler boundary). The `(mod, name)` form is the
+hygienic name→registration hop poc uses at composition — it reads the module
+binding BY IDENTITY, never eval'ing the call.
+"""
+kernel_registration(::Any) = nothing
+kernel_registration(skel::_Mode2KernelSkeleton) =
+    _KernelRegistration(kernel_token(skel), :free_method, kernel_subject(skel),
+                        kernel_write_roots(skel), kernel_read_roots(skel),
+                        kernel_is_bangbang(skel))
+kernel_registration(skel::_StatefulKernelSkeleton) =
+    _KernelRegistration(kernel_token(skel), :object_kernel, nothing, (), (), false)
+kernel_registration(spec::KernelSpec) =
+    _KernelRegistration(nothing, :stateless, nothing,
+                        Tuple(spec.have_names), Tuple(spec.want_names), false)
+kernel_registration(i::_KernelIntrinsic) =
+    _KernelRegistration(kernel_token(i), :intrinsic, kernel_subject(i), (), (),
+                        kernel_is_bangbang(i))
+function kernel_registration(mod::Module, name::Symbol)
+    isdefined(mod, name) || return nothing
+    kernel_registration(getglobal(mod, name))
+end
+
+"""
+    kernel_rebound(captured::_KernelRegistration, current) -> Bool
+
+Hygiene/rebind discriminator: `true` iff `current` (a value or its registration)
+is NOT the same definition the `captured` registration recorded — the name was
+rebound to a different `@kernel`, or is no longer a registered kernel. The Token
+is the stable hygienic identity; a stateless capture (no Token) is treated as
+un-reboundable here (identity is by value at the call site).
+"""
+function kernel_rebound(captured::_KernelRegistration, current)
+    cur = current isa _KernelRegistration ? current : kernel_registration(current)
+    cur === nothing && return true                 # binding gone / no longer a kernel
+    captured.token === nothing && return false     # stateless: no Token identity
+    cur.token !== captured.token
+end
