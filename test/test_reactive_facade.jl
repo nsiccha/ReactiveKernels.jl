@@ -416,19 +416,20 @@ end
     @test _sp_ref(o, :held) === Base.RefValue{Float64}
 end
 
-# Hygiene regression 2: a `typeof` binding local to the call site must not affect
-# the auto-generated HAVE typing (uses Core.typeof). `_sp_plain` relies solely on
-# the automatic HAVE typing (no user typeof annotation), so this isolates it.
-@reactive specialize=true _sp_plain(pos, weight) = begin
-    scaled::Base.eltype(pos) = weight * sum(pos)
-end
-
-@testset "@reactive specialize — local typeof shadow does not defeat HAVE typing" begin
-    obj = let typeof = identity          # shadow `typeof` locally at the call site
-        _sp_plain([1.0, 2.0, 3.0], 2.0)
+# Hygiene regression 2 (non-vacuous): the @reactive DEFINITION itself is inside a
+# `let` that shadows `typeof`, so the generated auto HAVE annotation is expanded
+# where `typeof` is bound to `identity`. Only the hygienic `Core.typeof` keeps the
+# HAVE slots concrete; a caller-scope shadow alone would NOT capture the generated
+# annotation (that expands in the definition scope), hence the definition-site let.
+@testset "@reactive specialize — definition-site typeof shadow (hygiene)" begin
+    obj = let typeof = identity
+        @reactive specialize=true _local_shadow_obj(pos, weight) = begin
+            scaled::Base.eltype(pos) = weight * sum(pos)
+        end
+        _local_shadow_obj([1.0, 2.0, 3.0], 2.0)
     end
     @test obj isa ReactiveObject
-    # Auto-generated HAVE refs stay concrete (not Ref{Any}) despite the local shadow.
+    # Auto-generated HAVE refs stay concrete (not Ref{Any}) despite the shadow.
     @test _sp_ref(obj, :pos) === Base.RefValue{Vector{Float64}}
     @test _sp_ref(obj, :weight) === Base.RefValue{Float64}
     @test obj.scaled == 12.0
