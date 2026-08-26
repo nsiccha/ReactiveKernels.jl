@@ -9,6 +9,12 @@
 # A method-bearing `@kernel` binds a `const` (a stable owner binding), so it MUST be
 # defined at module top level — the fixtures below live outside the `@testset`
 # (which is a local scope); the local-scope rejection is asserted separately.
+#
+# Isolated in a MODULE so the top-level fixtures (`leapfrog!`, `nuts!!`, `step_f`, `gf`,
+# `M`, `mycallee`, …) cannot shadow package exports in the shared `Pkg.test` Main
+# (RK 2026-08-27); it still nests under runtests.jl's outer `@testset` (same task).
+module TestKernelStateful
+using ReactiveKernels, Test
 
 const RKS = ReactiveKernels
 
@@ -966,3 +972,5 @@ end
         @test RKS.kernel_callee_rebound(owner_calls_qualified, qref)      # M.copy!! no longer resolves
     end
 end
+
+end # module TestKernelStateful
