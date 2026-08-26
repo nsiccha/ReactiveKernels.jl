@@ -61,6 +61,21 @@ end
     @test m.current != before                       # derived recomputed reactively
     @test (m.target = 0.7) == 0.7                    # Julia assignment return semantics
     @test :target in propertynames(m, true)
+
+    # Public copy(::DualAveragingState) + bidirectional clone/source isolation.
+    base = dual_averaging_state(0.5); fit!(base, 0.9)
+    cl = copy(base)
+    @test cl isa DualAveragingState
+    @test getfield(cl, :object) !== getfield(base, :object)   # distinct wrapped objects
+    @test cl.current == base.current
+    # Snapshot base, advance clone, assert base unchanged (and vice-versa below).
+    base_before = base.current
+    fit!(cl, 0.1)
+    @test base.current == base_before                # base untouched by the clone's fit!
+    @test cl.current != base.current                 # clone advanced; base untouched
+    c_after = cl.current
+    fit!(base, 0.2); fit!(base, 0.3)                 # advancing base must not touch clone
+    @test cl.current == c_after
 end
 
 @testset "reactive Welford — nominal wrapper, parity, matrix, F32/F64, ownership" begin
@@ -83,11 +98,22 @@ end
     # Concrete inference of the exposed accumulator arrays.
     @test (@inferred((e -> e.var)(w)))::Vector{Float64} == w.var
 
-    # Clone ownership: copying the underlying reactive object detaches state.
-    clone = WelfordVariance(copy(w.object))
+    # Clone ownership: public copy(::WelfordVariance) detaches state (bidirectional).
+    clone = copy(w)
+    @test clone isa WelfordVariance
+    @test getfield(clone, :object) !== getfield(w, :object)   # distinct wrapped objects
+    @test clone.object.state !== w.object.state               # distinct reactive states
     step!(clone, [10.0, 10.0])
-    @test w.var ≈ [2 / 3, 8 / 3]     # source estimate unaffected
+    @test w.var ≈ [2 / 3, 8 / 3]     # source estimate unaffected by clone
     @test w.n == 3
+    # Snapshot the clone state, THEN advance the source; the clone must be unchanged.
+    clone_n = clone.n
+    clone_mean = copy(clone.mean)
+    clone_var = copy(clone.var)
+    step!(w, [0.0, 0.0]); step!(w, [5.0, 5.0])
+    @test clone.n == clone_n
+    @test clone.mean == clone_mean
+    @test clone.var == clone_var
 
     # Warmed step! mutates mean/var in place — allocation-free.
     ww = welford_var(2); v = [1.0, 2.0]

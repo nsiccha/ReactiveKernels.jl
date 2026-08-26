@@ -759,6 +759,10 @@ end
     setproperty!(getfield(state, :object), name, value)
 Base.propertynames(state::DualAveragingState, private::Bool = false) =
     propertynames(getfield(state, :object), private)
+# Ownership: copying the wrapper deep-copies the underlying reactive object's state,
+# so the clone is detached from the source (bidirectional isolation).
+Base.copy(state::DualAveragingState) =
+    DualAveragingState(copy(getfield(state, :object)))
 
 "Advance the reactive dual-averaging accumulators by one acceptance observation."
 function fit!(state::DualAveragingState, acceptance_rate)
@@ -825,6 +829,8 @@ end
     setproperty!(getfield(estimate, :object), name, value)
 Base.propertynames(estimate::WelfordVariance, private::Bool = false) =
     propertynames(getfield(estimate, :object), private)
+Base.copy(estimate::WelfordVariance) =
+    WelfordVariance(copy(getfield(estimate, :object)))
 
 """
     welford_var(dimension, T=Float64)
