@@ -967,12 +967,13 @@ function warmup!(state::AbstractNUTSState, iterations::Integer;
             restart_stepsize = find_initial_stepsize!(
                 state; initial = state.step_f.stepsize,
             )
-            adaptation = dual_averaging_state(
-                restart_stepsize; target = target_accept,
-            )
+            # Reset the SAME adaptation/variance reactive objects in place (bit-
+            # identical to a fresh dual_averaging_state/welford_var) so each metric
+            # window reuses their compiled programs instead of rebuilding/recompiling
+            # them — the dominant fixed per-window warmup cost.
+            reset!(adaptation, restart_stepsize; target = target_accept)
             adaptation_updates = 0
-            variance = welford_var(length(_nuts_position(state)),
-                                   eltype(_nuts_position(state)))
+            reset!(variance)
             next_window += 1
         end
     end

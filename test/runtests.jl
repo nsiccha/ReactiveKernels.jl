@@ -11,6 +11,7 @@ using Test
         include("test_authoring.jl")
         include("test_nonallocating_core.jl")
         include("test_composition_cse.jl")
+        include("test_deterministic_ast.jl")
         include("test_reactive.jl")
         include("test_stateful.jl")
         include("test_visualization.jl")

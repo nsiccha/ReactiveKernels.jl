@@ -885,6 +885,32 @@ function dual_averaging_state(initial; target = 0.8,
         T(relaxation_exponent), T(offset)))
 end
 
+"""
+    reset!(state::DualAveragingState, initial; target=0.8, regularization_scale=0.05,
+           relaxation_exponent=0.75, offset=10)
+
+Reinitialize the dual-averaging accumulators IN PLACE to exactly the state a fresh
+[`dual_averaging_state`](@ref)`(initial; …)` would hold, REUSING the same compiled
+reactive program (so a warmup metric-window restart never rebuilds/recompiles the
+adaptation object). Bit-identical to reconstruction; the precision `T` is taken from
+the existing object's sources. Writes are 0-B scalar HAVE-source sets.
+"""
+function reset!(state::DualAveragingState, initial; target = 0.8,
+                regularization_scale = 0.05,
+                relaxation_exponent = 0.75, offset = 10)
+    object = getfield(state, :object)
+    T = typeof(getproperty(object, :center))
+    setproperty!(object, :iteration, one(T))
+    setproperty!(object, :error, zero(T))
+    setproperty!(object, :log_final, zero(T))
+    setproperty!(object, :center, log(T(10)) + log(T(initial)))
+    setproperty!(object, :target, T(target))
+    setproperty!(object, :regularization_scale, T(regularization_scale))
+    setproperty!(object, :relaxation_exponent, T(relaxation_exponent))
+    setproperty!(object, :offset, T(offset))
+    state
+end
+
 # ---------------------------------------------------------------------------
 # GAP-1b — reactive online Welford variance authored through @reactive
 # specialize=true. n/mean/var live ONLY in the reactive object's mutable HAVE
@@ -944,6 +970,23 @@ over `dimension` components with scalar element type `T`.
 welford_var(dimension::Integer, ::Type{T} = Float64) where {T} =
     WelfordVariance(_welford_object(
         zero(T), zeros(T, dimension), zeros(T, dimension)))
+
+"""
+    reset!(estimate::WelfordVariance)
+
+Zero the online Welford `n`/`mean`/`var` sources IN PLACE (reusing the same compiled
+reactive program and the owned mean/var buffers), so a warmup metric-window restart
+reuses the estimator instead of rebuilding/recompiling it. Bit-identical to a fresh
+[`welford_var`](@ref); the count reset is a 0-B scalar set and the buffer clears are
+0-B in-place `mutate!`s that preserve ownership.
+"""
+function reset!(estimate::WelfordVariance)
+    object = getfield(estimate, :object)
+    setproperty!(object, :n, zero(typeof(getproperty(object, :n))))
+    mutate!(object, :mean) do mean; fill!(mean, zero(eltype(mean))); mean; end
+    mutate!(object, :var) do var; fill!(var, zero(eltype(var))); var; end
+    estimate
+end
 
 "Fold one observation vector into the reactive Welford estimate (in place)."
 step!(estimate::WelfordVariance, value::AbstractVector; weight = 1) =

@@ -241,3 +241,114 @@ end
     @test size(run.draws, 2) == n0 + 1                      # source unaffected (clone->source)
     @test size(clone.draws, 2) == c0 + 1
 end
+
+
+# --- reset! reuse regressions (deterministic-AST warmup-window fix) ------------
+@testset "reset! — matches fresh, reuses program, isolated, inferred, 0-B" begin
+    for T in (Float64, Float32)
+        # DualAveragingState: mutate, then reset -> equals a fresh object.
+        da = dual_averaging_state(T(0.5); target = 0.8)
+        prog0 = reactive_program(da)
+        fit!(da, T(0.9)); fit!(da, T(0.7))
+        reset!(da, T(0.33); target = 0.8)
+        fresh = dual_averaging_state(T(0.33); target = 0.8)
+        @test da.iteration == fresh.iteration
+        @test da.error == fresh.error
+        @test da.current == fresh.current
+        @test da.final == fresh.final
+        @test da.current isa T
+        @test reactive_program(da) === prog0            # SAME program, no reconstruction
+        @test (@inferred reset!(da, T(0.4); target = 0.8)) === da
+
+        # WelfordVariance: mutate, then reset -> equals fresh; owned buffers retained.
+        wv = welford_var(3, T)
+        prog_w = reactive_program(wv)
+        mean0 = wv.mean; var0 = wv.var
+        step!(wv, T[1, 2, 3]); step!(wv, T[3, 2, 1])
+        reset!(wv)
+        wf = welford_var(3, T)
+        @test wv.n == wf.n
+        @test wv.mean == wf.mean
+        @test wv.var == wf.var
+        @test reactive_program(wv) === prog_w           # SAME program
+        @test wv.mean === mean0 && wv.var === var0      # owned array identities retained
+        @test (@inferred reset!(wv)) === wv
+    end
+
+    # Dual reset covers EVERY source field == a fresh construction (Float32/64).
+    for T in (Float64, Float32)
+        da = dual_averaging_state(T(0.5); target = T(0.82), regularization_scale = T(0.06),
+                                  relaxation_exponent = T(0.7), offset = T(12))
+        fit!(da, T(0.9)); fit!(da, T(0.6))
+        reset!(da, T(0.3); target = T(0.77), regularization_scale = T(0.04),
+               relaxation_exponent = T(0.8), offset = T(9))
+        fresh = dual_averaging_state(T(0.3); target = T(0.77), regularization_scale = T(0.04),
+                                     relaxation_exponent = T(0.8), offset = T(9))
+        for name in (:iteration, :error, :log_final, :center, :target,
+                     :regularization_scale, :relaxation_exponent, :offset, :current, :final)
+            @test getproperty(da, name) == getproperty(fresh, name)
+        end
+    end
+
+    # Bidirectional detached-copy / reset isolation.
+    da = dual_averaging_state(0.5); fit!(da, 0.9); fit!(da, 0.85)
+    clone = copy(da)
+    src_current = da.current; src_iter = da.iteration
+    reset!(clone, 0.2)                                    # reset clone
+    @test da.current == src_current && da.iteration == src_iter   # source untouched
+    @test clone.iteration == 1
+    clone_current = clone.current
+    reset!(da, 0.7)                                       # reset source
+    @test clone.current == clone_current                 # clone untouched (other direction)
+
+    # 0-B over 1000 resets through warmed named barriers that return `nothing`
+    # (reset! is the side effect, so the loop is not eliminated; a scalar return
+    # would be boxed by @allocated and read as a spurious 16 B).
+    da2 = dual_averaging_state(0.5)
+    function _reset_da(d, n)
+        for _ in 1:n; reset!(d, 0.3; target = 0.8); end
+        nothing
+    end
+    _reset_da(da2, 1)
+    @test @allocated(_reset_da(da2, 1000)) == 0
+    wv2 = welford_var(4)
+    function _reset_wv(w, n)
+        for _ in 1:n; reset!(w); end
+        nothing
+    end
+    _reset_wv(wv2, 1)
+    @test @allocated(_reset_wv(wv2, 1000)) == 0
+end
+
+@testset "warmup! metric-window restart: exact oracle parity through restarts" begin
+    _wr_grad!(g, q) = (copyto!(g, q); sum(abs2, q) / 2)
+    _wr_valgrad(q) = (sum(abs2, q) / 2, copy(q))
+    _wr_pot(q) = sum(abs2, q) / 2
+    D = 4; q0 = [sin(1.0i) for i in 1:D]
+    metric = Matrix{Float64}(I, D, D)
+    oracle = ReactiveKernels._oracle_nuts_state(
+        euclidean_phasepoint(_wr_pot, _wr_valgrad, metric, copy(q0), zeros(D));
+        rng = Xoshiro(321), step_f = partial(leapfrog!; stepsize = 0.5), max_depth = 6)
+    compiled = nuts_state(reactive_nuts_group(_wr_grad!, metric, copy(q0), zeros(D));
+        rng = Xoshiro(321), step_f = partial(leapfrog!; stepsize = 0.5), max_depth = 6)
+    # 400 iterations guarantees several metric-window restarts; the reset/reuse path
+    # must stay BIT-FOR-BIT identical to the ordinary-Julia oracle through them.
+    cw = warmup!(compiled, 400; target_accept = 0.8)
+    ow = warmup!(oracle, 400; target_accept = 0.8)
+    @test cw.initial_stepsize == ow.initial_stepsize
+    @test cw.final_stepsize == ow.final_stepsize
+    @test cw.metric == ow.metric
+end
+
+@testset "warmup! window branch resets in place (static: no reconstruction)" begin
+    # Durable static regression: the metric-window boundary must RESET the existing
+    # adaptation/variance objects, never reconstruct them (the per-window recompile).
+    src = read(joinpath(pkgdir(ReactiveKernels), "src", "hmc.jl"), String)
+    lo = findfirst("iteration == window_ends[next_window]", src)
+    hi = findnext("next_window += 1", src, last(lo))
+    window_branch = src[first(lo):last(hi)]
+    @test occursin("reset!(adaptation", window_branch)
+    @test occursin("reset!(variance", window_branch)
+    @test !occursin("dual_averaging_state(", window_branch)
+    @test !occursin("welford_var(", window_branch)
+end

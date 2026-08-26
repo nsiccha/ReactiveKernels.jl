@@ -178,16 +178,29 @@ function _ensure_expr(plan::Plan, index, recipe_index, id::Int,
             end
         end)
     else
-        # Pure path: today's straight-line allocate-and-store, byte-identical.
+        # Pure path: straight-line allocate-and-store with identical operation order
+        # and behavior (the emitted AST is no longer byte-identical to the pre-fix
+        # one — the result-local NAMES change deterministically, see below).
         # Multi-output recipes always take this branch (single-output-only hook).
+        # Result locals are named DETERMINISTICALLY from the stable recipe index `k`
+        # (and the output position), NOT a fresh gensym: a gensym differs on every
+        # getter build, so two structurally identical programs (e.g. two
+        # `specialize=true` constructions of the same signature) produced distinct
+        # RuntimeGeneratedFunction ASTs -> distinct getter/program TYPES -> a full
+        # recompile per construction. A stable name makes the ASTs identical, so the
+        # RGF/type is reused. `k` is unique per recipe (recipe_index is a bijection),
+        # and each recipe is emitted under its own `if !__valid__[slot]` guard, so
+        # reusing the name across a diamond re-emission is a guarded reassignment of
+        # the same value — semantically identical to the old distinct gensyms.
         call = :(__ops__[$k]($(args...)))
         multiple = length(recipe.outputs) != 1
         results = if multiple
-            names = [gensym(:recipe_result) for _ in recipe.outputs]
+            names = [Symbol("__recipe_result_", k, "_", position)
+                     for position in 1:length(recipe.outputs)]
             push!(body.args, Expr(:(=), Expr(:tuple, names...), call))
             names
         else
-            name = gensym(:recipe_result)
+            name = Symbol("__recipe_result_", k)
             push!(body.args, :($name = $call))
             (name,)
         end
