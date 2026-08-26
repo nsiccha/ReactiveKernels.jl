@@ -144,6 +144,29 @@ function _reactive_handles(program::ReactiveProgram, spec::KernelSpec, names)
     NamedTuple{exposed}(Tuple(statevalue(program, spec[name]) for name in exposed))
 end
 
+# Validate a program returned by an injected `prepare=` callable (or built in the
+# specialized constructor) against the authored spec: it must be built from the
+# SAME graph, its HAVE inputs must equal the signature ports in exact order, and
+# every exposed/requested port must be present (so `_reactive_handles` never
+# silently drops a field). Returns the validated program.
+function _reactive_validate_program(program::ReactiveProgram, spec::KernelSpec,
+                                    expose_names)
+    program.graph === spec.graph || throw(ArgumentError(
+        "@reactive prepare callable returned a program built from a different " *
+        "graph/KernelSpec than the authored object"))
+    expected = Tuple(canon_id(spec.graph, spec[name].id) for name in spec.have_names)
+    actual = Tuple(canon_id(spec.graph, value.id) for value in program.inputs)
+    expected == actual || throw(ArgumentError(
+        "@reactive prepare callable returned a program whose HAVE inputs do not " *
+        "match the signature ports $(spec.have_names) in order"))
+    for name in expose_names
+        haskey(program.index, canon_id(spec.graph, spec[name].id)) || throw(ArgumentError(
+            "@reactive prepare callable returned a program missing the exposed " *
+            "port :$(name)"))
+    end
+    program
+end
+
 # --- @reactive macro ---------------------------------------------------------
 
 _reactive_is_method(stmt) =
@@ -575,7 +598,7 @@ function _reactive_definition_parts(def)
     (parts..., def.args[2])
 end
 
-function _reactive_expand(def; prepare = nothing)
+function _reactive_expand(def; prepare = nothing, specialize = false)
     parts = _reactive_definition_parts(def)
     parts === nothing && throw(ArgumentError(
         "@reactive expects `name(args...; kw...) = begin ... end`, got $(repr(def))"))
@@ -613,7 +636,14 @@ function _reactive_expand(def; prepare = nothing)
     # the signature args as HAVE ports. Every field is materialized (want) so the
     # object can expose it.
     kernel_body = Expr(:block, kernel_stmts...)
-    spec_build = _kernel_expand(kernel_body, inputs)
+    # Per-construction specialization (poc-approved opt-in): the HAVE ports are
+    # typed from the RUNTIME arguments (`typeof(arg)`) so the same authored object
+    # yields a distinct concrete program per concrete signature (Float32/Float64,
+    # Matrix/Diagonal, distinct closure types) with no Value{Any}. The default mode
+    # types ports from the declared annotations and caches one program in a const.
+    spec_inputs = specialize === true ?
+        Tuple{Symbol,Any}[(p, :(typeof($p))) for (p, _) in inputs] : inputs
+    spec_build = _kernel_expand(kernel_body, spec_inputs)
     want_tuple = Expr(:tuple, (QuoteNode(f) for f in field_names)...)
     expose_tuple = Expr(:tuple, (QuoteNode(n) for n in vcat(port_names, field_names))...)
 
@@ -641,29 +671,50 @@ function _reactive_expand(def; prepare = nothing)
     # tuple, not a Symbol=>Any dict). The gensym'd name cannot collide across
     # definitions or modules.
     cache_name = gensym(Symbol(name, :__program))
-    # Default (no `prepare=`): byte-for-byte the original expansion. With a custom
-    # prepare callable: validate at build time that it returned a ReactiveProgram.
-    built_expr = prepare === nothing ?
+    # Plain default (no prepare=, no specialize): byte-for-byte the original
+    # expansion. Otherwise (custom prepare OR specialized construction) validate the
+    # built program isa ReactiveProgram AND matches the authored graph/inputs/
+    # exposure — so a misbehaving callable fails with an actionable error rather
+    # than silently dropping fields.
+    built_expr = (prepare === nothing && specialize !== true) ?
         :($prepare_reactive($spec_sym; want = $want_tuple)) :
         quote
-            let program = $prepare($spec_sym; want = $want_tuple)
+            let program = $(prepare === nothing ? prepare_reactive : prepare)(
+                    $spec_sym; want = $want_tuple)
                 program isa $ReactiveProgram || throw(ArgumentError(
                     "@reactive prepare callable must return a ReactiveProgram; got " *
                     string(typeof(program))))
-                program
+                $_reactive_validate_program(program, $spec_sym, $expose_tuple)
             end
         end
-    cache_def = Expr(:const, Expr(:(=), cache_name, quote
-        let
+    if specialize === true
+        # Move spec-build + prepare into the constructor: each call builds a
+        # runtime-typed program and its handles. The constructor's inference may be
+        # unstable, but the returned ReactiveObject is concrete-at-runtime, so a
+        # function barrier / state-parametric caller gets an inferred, 0-B hot loop.
+        cache_def = nothing
+        ctor_body = quote
             $spec_sym = $spec_build
-            built = $built_expr
-            (built, $_reactive_handles(built, $spec_sym, $expose_tuple))
+            $prog_sym = $built_expr
+            $handles_sym = $_reactive_handles($prog_sym, $spec_sym, $expose_tuple)
+            $(ReactiveObject){$(QuoteNode(name))}(
+                $prog_sym($(port_names...)), $handles_sym)
         end
-    end))
-    ctor_body = quote
-        ($prog_sym, $handles_sym) = $cache_name
-        $(ReactiveObject){$(QuoteNode(name))}(
-            $prog_sym($(port_names...)), $handles_sym)
+    else
+        # Default: cache (program, handles) once per definition in a UNIQUE
+        # per-expansion const — byte-for-byte the original expansion.
+        cache_def = Expr(:const, Expr(:(=), cache_name, quote
+            let
+                $spec_sym = $spec_build
+                built = $built_expr
+                (built, $_reactive_handles(built, $spec_sym, $expose_tuple))
+            end
+        end))
+        ctor_body = quote
+            ($prog_sym, $handles_sym) = $cache_name
+            $(ReactiveObject){$(QuoteNode(name))}(
+                $prog_sym($(port_names...)), $handles_sym)
+        end
     end
     constructor = Expr(:function, Expr(:call, ctor_sig_args...), ctor_body)
 
@@ -690,7 +741,12 @@ function _reactive_expand(def; prepare = nothing)
         push!(method_code, Expr(:function, Expr(:call, sig_args...), new_body))
     end
 
-    esc(Expr(:block, cache_def, constructor, method_code..., name))
+    top = Any[]
+    cache_def === nothing || push!(top, cache_def)
+    push!(top, constructor)
+    append!(top, method_code)
+    push!(top, name)
+    esc(Expr(:block, top...))
 end
 
 """
@@ -705,6 +761,18 @@ sources; body `lhs = rhs` assignments become compiled reactive derived nodes
 definitions become ordinary type-stable methods that take the object as their
 first argument, with field references routed through the object. Returns a
 constructor bound to `name` producing a [`ReactiveObject`](@ref).
+
+Options (before the definition):
+- `@reactive prepare=<callable> name(...) = ...` — the injected `<callable>`
+  receives the `KernelSpec` and a `want` keyword and must return a
+  [`ReactiveProgram`](@ref) built from that spec (e.g. one selecting the
+  non-allocating in-place preparation). The macro still owns spec/want/handles and
+  validates the returned program's graph/inputs/exposure.
+- `@reactive specialize=true name(...) = ...` — build a fresh runtime-typed program
+  in the CONSTRUCTOR (not a per-definition const), typing every otherwise-untyped
+  HAVE port from `typeof(runtime_value)` so the object is concrete-at-runtime and
+  generic over argument precision/storage. The default (`specialize=false`) caches
+  one program per definition in a const and is unchanged.
 """
 macro reactive(args...)
     isempty(args) && throw(ArgumentError("@reactive requires a definition"))
@@ -715,15 +783,25 @@ macro reactive(args...)
     # one selecting the non-allocating cache_apply/is_mutating preparation). With
     # no option the expansion is byte-for-byte identical to before.
     prepare = nothing
-    seen_prepare = false
+    specialize = false
+    seen = Set{Symbol}()
     for option in args[1:(end - 1)]
-        (option isa Expr && option.head === :(=) && option.args[1] === :prepare) ||
-            throw(ArgumentError(
-                "@reactive options must be `prepare=<callable>`; got $(repr(option))"))
-        seen_prepare && throw(ArgumentError(
-            "@reactive got a duplicate `prepare=` option"))
-        seen_prepare = true
-        prepare = option.args[2]
+        (option isa Expr && option.head === :(=) &&
+         option.args[1] isa Symbol) || throw(ArgumentError(
+            "@reactive options must be `key=value`; got $(repr(option))"))
+        key = option.args[1]
+        key in (:prepare, :specialize) || throw(ArgumentError(
+            "@reactive supports options `prepare=<callable>` and " *
+            "`specialize=<bool>`; got `$(key)=`"))
+        key in seen && throw(ArgumentError("@reactive got a duplicate `$(key)=` option"))
+        push!(seen, key)
+        key === :prepare && (prepare = option.args[2])
+        if key === :specialize
+            (option.args[2] isa Bool) || throw(ArgumentError(
+                "@reactive `specialize=` requires a literal Bool (true/false); got " *
+                repr(option.args[2])))
+            specialize = option.args[2]
+        end
     end
-    _reactive_expand(def; prepare = prepare)
+    _reactive_expand(def; prepare = prepare, specialize = specialize)
 end

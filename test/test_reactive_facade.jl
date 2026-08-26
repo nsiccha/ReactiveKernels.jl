@@ -1,5 +1,6 @@
 using ReactiveKernels
 using Test
+using LinearAlgebra
 
 # Non-HMC exercise of the public @reactive object/method facade: signature args
 # are mutable HAVE sources, body assignments are compiled reactive derived
@@ -260,4 +261,140 @@ _unwrap_err(err) = err isa LoadError ? err.error : err
     @test occursin("prepare_reactive", ast_default)
     @test !occursin("__cache_apply__", ast_default)
     @test !occursin("must return a ReactiveProgram", ast_default)   # no validation wrap
+end
+
+
+# --- Per-construction specialization (specialize=true) FOUNDATION tests. ---
+# Named scaling helpers (two distinct concrete callable types). We avoid a bare
+# `pos .* scale` RHS: `_kernel_operation` currently preserves a dotted operator as
+# a direct callee, and `.*` is not a bound function — tracked as a separate
+# authoring follow-up, not needed by these tests or the sampler's recipes.
+struct _SpScale{S}; s::S; end
+(op::_SpScale)(x) = broadcast(*, op.s, x)      # Float32-preserving when s::Float32
+struct _SpShift{S}; s::S; end
+(op::_SpShift)(x) = broadcast(+, x, op.s)
+
+# Runtime-derived annotations (`typeof(pos)`, `eltype(pos)`) evaluated in the
+# constructor against the concrete args make the DERIVED slots concrete too — no
+# `where` grammar. HAVE ports are typed from `typeof(arg)`.
+@reactive specialize=true _sp_obj(op, pos, metric) = begin
+    applied::typeof(pos) = op(pos)
+    total::eltype(pos) = sum(applied)
+    kept_metric::typeof(metric) = metric
+end
+
+@reactive specialize=true _sp_kw(pos; scale = 2.0) = begin
+    scaled::typeof(pos) = op_scale(pos, scale)
+end
+op_scale(pos, scale) = broadcast(*, scale, pos)
+
+# Misbehaving prepare callables (same object, different failure modes).
+_sp_wrong_graph(spec; want) = begin
+    g = ReactiveKernels.Graph(); x = ReactiveKernels.value!(g, :x, Float64)
+    ReactiveKernels.prepare_reactive(g; have = (x,), want = (x,))
+end
+_sp_wrong_want(spec; want) = ReactiveKernels.prepare_reactive(spec; want = ())
+_sp_wrong_order(spec; want) =
+    ReactiveKernels.prepare_reactive(spec;
+        have = Tuple(reverse(spec.have_names)), want = want)
+@reactive prepare=_sp_wrong_graph specialize=true _sp_bad_graph(pos, mom) = begin
+    y::typeof(pos) = pos
+end
+@reactive prepare=_sp_wrong_want specialize=true _sp_bad_want(pos, mom) = begin
+    y::typeof(pos) = pos
+end
+@reactive prepare=_sp_wrong_order specialize=true _sp_bad_order(pos, mom) = begin
+    y::typeof(pos) = pos
+end
+
+_sp_ref(object, name) = typeof(getfield(object, :state).slots[
+    ReactiveKernels._slot_index(getfield(object, :handles)[name])])
+
+@testset "@reactive specialize — concrete HAVE+derived slots, distinct programs" begin
+    op_a = _SpScale(2.0); op_b = _SpShift(1.0)     # two distinct callable types
+    m_dense = [2.0 0.0; 0.0 3.0]; m_diag = Diagonal([2.0, 3.0])
+
+    a64 = _sp_obj(op_a, [1.0, 2.0], m_dense)
+    b64 = _sp_obj(op_b, [1.0, 2.0], m_dense)
+    a32 = _sp_obj(_SpScale(2.0f0), Float32[1, 2], Matrix{Float32}([2 0; 0 3]))
+    adiag = _sp_obj(op_a, [1.0, 2.0], m_diag)
+
+    # Distinct concrete object types across callable, precision, and storage.
+    @test typeof(a64) !== typeof(b64)
+    @test typeof(a64) !== typeof(a32)
+    @test typeof(a64) !== typeof(adiag)
+
+    # Exact HAVE slot Ref types (via handle indices) — concrete, no Ref{Any}.
+    @test _sp_ref(a64, :op) === Base.RefValue{_SpScale{Float64}}
+    @test _sp_ref(a64, :pos) === Base.RefValue{Vector{Float64}}
+    @test _sp_ref(a64, :metric) === Base.RefValue{Matrix{Float64}}
+    @test _sp_ref(a32, :pos) === Base.RefValue{Vector{Float32}}
+    @test _sp_ref(adiag, :metric) === Base.RefValue{Diagonal{Float64,Vector{Float64}}}
+    # Exact DERIVED slot Ref types — concrete via runtime annotations.
+    @test _sp_ref(a64, :applied) === Base.RefValue{Vector{Float64}}
+    @test _sp_ref(a64, :total) === Base.RefValue{Float64}
+    @test _sp_ref(a32, :applied) === Base.RefValue{Vector{Float32}}
+    @test _sp_ref(a32, :total) === Base.RefValue{Float32}
+    # No hot slot is Ref{Any}.
+    @test !any(t -> t === Base.RefValue{Any}, typeof(a64.state.slots).parameters)
+    @test !any(t -> t === Base.RefValue{Any}, typeof(a32.state.slots).parameters)
+
+    # Values compute correctly, precision preserved.
+    @test a64.applied == [2.0, 4.0] && a64.total == 6.0
+    @test b64.applied == [2.0, 3.0]
+    @test a32.applied == Float32[2, 4] && a32.applied isa Vector{Float32}
+    @test a32.total isa Float32
+
+    # Function-barrier inference of derived reads is concrete.
+    @test (@inferred((o -> o.applied)(a64)))::Vector{Float64} == [2.0, 4.0]
+    @test (@inferred((o -> o.total)(a64)))::Float64 == 6.0
+    @test (@inferred((o -> o.applied)(a32)))::Vector{Float32} == Float32[2, 4]
+
+    # Per-instance isolation + copy detachment.
+    setproperty!(a64, :pos, [5.0, 6.0])
+    @test a64.applied == [10.0, 12.0]
+    @test b64.applied == [2.0, 3.0]
+    clone = copy(a64)
+    setproperty!(clone, :pos, [0.0, 0.0])
+    @test a64.applied == [10.0, 12.0]
+    @test clone.program === a64.program
+
+    # Real function-barrier 0-B source mutation/read cycle (derived-recompute 0-B
+    # is a tracked follow-up once in-place derived preparation composes with this).
+    function _src_cycle!(o, v, n)
+        for _ in 1:n
+            setproperty!(o, :pos, v)
+            o.pos
+        end
+        nothing
+    end
+    v = [7.0, 8.0]
+    _src_cycle!(a64, v, 2)
+    @test @allocated(_src_cycle!(a64, v, 1000)) == 0
+end
+
+@testset "@reactive specialize — defaults/kwargs, validation, option robustness" begin
+    k = _sp_kw([1.0, 2.0])                         # default scale=2
+    @test k.scaled == [2.0, 4.0]
+    @test (@inferred((o -> o.scaled)(k)))::Vector{Float64} == [2.0, 4.0]
+    @test _sp_ref(k, :pos) === Base.RefValue{Vector{Float64}}
+    @test _sp_ref(k, :scaled) === Base.RefValue{Vector{Float64}}
+    k2 = _sp_kw([1.0, 2.0]; scale = 10.0)
+    @test k2.scaled == [10.0, 20.0]
+
+    # Validation at construction: wrong graph, missing want, wrong input order.
+    eg = try; _sp_bad_graph([1.0], [1.0]); nothing; catch e; e; end
+    @test eg isa ArgumentError && occursin("different", sprint(showerror, eg))
+    ew = try; _sp_bad_want([1.0], [1.0]); nothing; catch e; e; end
+    @test ew isa ArgumentError && occursin("missing the exposed", sprint(showerror, ew))
+    eo = try; _sp_bad_order([1.0], [1.0]); nothing; catch e; e; end
+    @test eo isa ArgumentError && occursin("in order", sprint(showerror, eo))
+
+    # specialize must be a literal Bool; a runtime symbol is rejected at expansion.
+    lit = try
+        @eval @reactive specialize=some_runtime_flag _sp_lit(x) = begin y::typeof(x) = x end
+        nothing
+    catch e; e; end
+    @test _unwrap_err(lit) isa ArgumentError
+    @test occursin("literal Bool", sprint(showerror, _unwrap_err(lit)))
 end
