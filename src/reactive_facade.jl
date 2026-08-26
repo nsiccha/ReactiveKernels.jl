@@ -636,13 +636,16 @@ function _reactive_expand(def; prepare = nothing, specialize = false)
     # the signature args as HAVE ports. Every field is materialized (want) so the
     # object can expose it.
     kernel_body = Expr(:block, kernel_stmts...)
-    # Per-construction specialization (poc-approved opt-in): the HAVE ports are
-    # typed from the RUNTIME arguments (`typeof(arg)`) so the same authored object
+    # Per-construction specialization (poc-approved opt-in): every HAVE port is
+    # typed from the RUNTIME argument (`typeof(arg)`) so the same authored object
     # yields a distinct concrete program per concrete signature (Float32/Float64,
     # Matrix/Diagonal, distinct closure types) with no Value{Any}. The default mode
     # types ports from the declared annotations and caches one program in a const.
+    # Use the hygienic `Core.typeof` binding (not a caller-resolved `typeof`) so a
+    # port literally named `typeof` cannot shadow it.
     spec_inputs = specialize === true ?
-        Tuple{Symbol,Any}[(p, :(typeof($p))) for (p, _) in inputs] : inputs
+        Tuple{Symbol,Any}[(p, Expr(:call, GlobalRef(Core, :typeof), p))
+                          for (p, _) in inputs] : inputs
     spec_build = _kernel_expand(kernel_body, spec_inputs)
     want_tuple = Expr(:tuple, (QuoteNode(f) for f in field_names)...)
     expose_tuple = Expr(:tuple, (QuoteNode(n) for n in vcat(port_names, field_names))...)
@@ -769,10 +772,11 @@ Options (before the definition):
   non-allocating in-place preparation). The macro still owns spec/want/handles and
   validates the returned program's graph/inputs/exposure.
 - `@reactive specialize=true name(...) = ...` — build a fresh runtime-typed program
-  in the CONSTRUCTOR (not a per-definition const), typing every otherwise-untyped
-  HAVE port from `typeof(runtime_value)` so the object is concrete-at-runtime and
-  generic over argument precision/storage. The default (`specialize=false`) caches
-  one program per definition in a const and is unchanged.
+  in the CONSTRUCTOR (not a per-definition const), typing every HAVE port from
+  `typeof(runtime_value)` (via the hygienic `Core.typeof`) so the object is
+  concrete-at-runtime and generic over argument precision/storage. The default
+  (`specialize=false`) caches one program per definition in a const and is
+  unchanged.
 """
 macro reactive(args...)
     isempty(args) && throw(ArgumentError("@reactive requires a definition"))
