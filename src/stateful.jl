@@ -178,16 +178,29 @@ function _ensure_expr(plan::Plan, index, recipe_index, id::Int,
             end
         end)
     else
-        # Pure path: today's straight-line allocate-and-store, byte-identical.
+        # Pure path: straight-line allocate-and-store with identical operation order
+        # and behavior (the emitted AST is no longer byte-identical to the pre-fix
+        # one — the result-local NAMES change deterministically, see below).
         # Multi-output recipes always take this branch (single-output-only hook).
+        # Result locals are named DETERMINISTICALLY from the stable recipe index `k`
+        # (and the output position), NOT a fresh gensym: a gensym differs on every
+        # getter build, so two structurally identical programs (e.g. two
+        # `specialize=true` constructions of the same signature) produced distinct
+        # RuntimeGeneratedFunction ASTs -> distinct getter/program TYPES -> a full
+        # recompile per construction. A stable name makes the ASTs identical, so the
+        # RGF/type is reused. `k` is unique per recipe (recipe_index is a bijection),
+        # and each recipe is emitted under its own `if !__valid__[slot]` guard, so
+        # reusing the name across a diamond re-emission is a guarded reassignment of
+        # the same value — semantically identical to the old distinct gensyms.
         call = :(__ops__[$k]($(args...)))
         multiple = length(recipe.outputs) != 1
         results = if multiple
-            names = [gensym(:recipe_result) for _ in recipe.outputs]
+            names = [Symbol("__recipe_result_", k, "_", position)
+                     for position in 1:length(recipe.outputs)]
             push!(body.args, Expr(:(=), Expr(:tuple, names...), call))
             names
         else
-            name = gensym(:recipe_result)
+            name = Symbol("__recipe_result_", k)
             push!(body.args, :($name = $call))
             (name,)
         end
@@ -566,6 +579,47 @@ end
 set!(state::CompiledReactiveState, graph_value::Value, value) =
     set!(state, statevalue(state, graph_value), value)
 
+# `assign!` is the INTERNAL direct-slot writer the @reactive facade lowers every
+# object field write to (both HAVE and derived), so the facade needs no
+# HAVE/derived branching. It writes the slot, marks it valid, and runs the
+# existing dependent-invalidation worklist — it never changes the frozen bit and
+# rejects a frozen slot. On a HAVE source it equals `set!`; on an unfrozen
+# derived slot it is a TEMPORARY OVERRIDE: `get!` short-circuits on the valid bit
+# and returns the assigned value without recomputing, and a later change to a
+# true upstream dependency invalidates this slot again so `get!` recomputes from
+# the recipe. `set!` stays HAVE-only and exported; `assign!` is not exported —
+# arbitrary slot pokes are not part of the public surface (approved by
+# ReactiveKernels:poc against the compiled-state invariants).
+function assign!(state::CompiledReactiveState, handle::ReactiveValue{I,T}, value) where {I,T}
+    _check_handle(state, handle)
+    state.frozen[I] && throw(ArgumentError(
+        "assign! cannot override frozen slot $I; unfreeze! first"))
+    _tuple_slot(state.slots, Val(I))[] = value
+    state.valid[I] = true
+    _invalidate_dependents!(state, I)
+    state
+end
+
+"""
+In-place `assign!`: materialize the slot, mutate it via `f`, then mark valid and
+invalidate dependents (even if `f` throws). Returns `f`'s result so a rooted
+in-place assignment lowered onto this preserves Julia's assignment value (the new
+scalar for an indexed compound, the destination for a dotted/broadcast assign);
+`try return f(value) finally …` keeps the finally invalidation on both paths.
+"""
+function assign!(f, state::CompiledReactiveState, handle::ReactiveValue{I,T}) where {I,T}
+    _check_handle(state, handle)
+    state.frozen[I] && throw(ArgumentError(
+        "assign! cannot override frozen slot $I; unfreeze! first"))
+    value = get!(state, handle)
+    try
+        return f(value)
+    finally
+        state.valid[I] = true
+        _invalidate_dependents!(state, I)
+    end
+end
+
 "Freeze the current value of a derived slot as an authoritative cut point."
 function freeze!(state::CompiledReactiveState, handle::ReactiveValue{I}) where {I}
     _check_handle(state, handle)
@@ -699,6 +753,72 @@ function Base.copyto!(destination::CompiledReactiveState,
     copyto!(destination.valid, source.valid)
     copyto!(destination.frozen, source.frozen)
     destination
+end
+
+# --- grouped HAVE-boundary copy ---------------------------------------------
+#
+# `copy_group!` copies a *selected group* of source (HAVE) slots — e.g. a phase
+# point's `(pos, mom)` — from one set of handles into another within the SAME
+# compiled state, reusing array buffers so an array group is 0-alloc, then
+# invalidating each destination's downstream through the ordinary HAVE-boundary
+# API. It is the one additive primitive the sampler needs for proposal-accept,
+# endpoint copy, and swap-via-temp: unlike whole-state `copyto!` it touches only
+# the named slots, and unlike a nested-subscription scheme it adds no
+# per-instance state — it is pure composition over `get!`/`set!`/`mutate!`, so
+# it cannot clone stale subscriptions and preserves every slot-index/validity
+# invariant of the engine.
+
+# Array destinations reuse their existing buffer (in-place copyto!); scalar
+# destinations are set. Dispatch is on the handle value-type parameter, so the
+# branch is resolved at compile time and stays type-stable.
+@inline _group_assign!(state::CompiledReactiveState,
+                       dest::ReactiveValue{I,T}, value) where {I,T<:AbstractArray} =
+    mutate!(buffer -> copyto!(buffer, value), state, dest)
+@inline _group_assign!(state::CompiledReactiveState,
+                       dest::ReactiveValue{I,T}, value) where {I,T} =
+    set!(state, dest, value)
+
+@inline function _copy_group!(state::CompiledReactiveState,
+                              dest::Tuple, src::Tuple)
+    d = first(dest)
+    _check_handle(state, d)
+    state.program.sources[_slot_index(d)] || throw(ArgumentError(
+        "copy_group! destinations must be ReactiveProgram HAVE sources",
+    ))
+    _group_assign!(state, d, get!(state, first(src)))
+    _copy_group!(state, Base.tail(dest), Base.tail(src))
+end
+@inline _copy_group!(::CompiledReactiveState, ::Tuple{}, ::Tuple{}) = nothing
+
+"""
+    copy_group!(state, dest_handles, src_handles)
+
+Copy each source slot in `src_handles` into the paired destination slot in
+`dest_handles`, in place where the value is an array (buffer reused, 0-alloc),
+then invalidate each destination's downstream. Every destination handle must be
+a declared HAVE source; sources may be any readable slot. This is an additive
+composition over the HAVE-boundary API — it changes no invalidation or copy
+internals — and is the group-copy building block for phase-point
+proposal/endpoint bookkeeping. `dest_handles` and `src_handles` are equal-length
+tuples of [`ReactiveValue`](@ref) handles; the pairing is walked by type-stable
+tuple recursion so a homogeneous array group copies with zero allocation.
+
+Pairs are applied **sequentially, left to right**, and an array destination is
+mutated in place. Overlapping destination/source groups are therefore
+order-dependent and generally NOT a swap: `copy_group!(state, (a, b), (b, a))`
+copies `b` into `a` first, so both end holding the original `b`. To exchange two
+groups, route through a temporary group (`t ← a`, `a ← b`, `b ← t`) — the
+allocation-free idiom the sampler uses for endpoint/proposal swaps. Sources are
+read (`get!`) before their paired destination is written, but later pairs see
+earlier destinations' new values.
+"""
+function copy_group!(state::CompiledReactiveState,
+                     dest_handles::Tuple, src_handles::Tuple)
+    length(dest_handles) == length(src_handles) || throw(DimensionMismatch(
+        "copy_group! needs equal-length destination and source handle tuples",
+    ))
+    _copy_group!(state, dest_handles, src_handles)
+    state
 end
 
 inputs(program::ReactiveProgram) = program.inputs

@@ -1,4 +1,6 @@
 using AdvancedHMC
+using DifferentiationInterface
+import Enzyme
 using DynamicHMC
 using DynamicHMC.Diagnostics: REACHED_MAX_DEPTH, is_divergent
 using LinearAlgebra
@@ -9,23 +11,50 @@ using Random
 using ReactiveKernels
 using Statistics
 
+# Every sampler's runtime gradient goes through this shared reverse-mode Enzyme
+# backend via DifferentiationInterface, so RK/AdvancedHMC/DynamicHMC differentiate
+# the SAME scalar log density and the comparison is fair. Runtime activity is on
+# and the differentiated function is annotated Const because only the numeric
+# position is differentiated, never any captured constant model data. The
+# handwritten analytic gradients below are correctness oracles only, never the
+# sampled path.
+const BENCHMARK_BACKEND = AutoEnzyme(;
+    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
+    function_annotation = Enzyme.Const,
+)
+
 abstract type CountedTarget end
 
-mutable struct GaussianTarget <: CountedTarget
+# Targets carry a CONCRETELY-TYPED DI+Enzyme gradient preparation built once (at
+# construction, i.e. the setup phase, timed separately from sampling) from the
+# actual initial primal, so the sampled gradient path is type-stable.
+mutable struct GaussianTarget{P} <: CountedTarget
     dimension::Int
     logdensity_calls::Int
     gradient_calls::Int
+    preparation::P
 end
+GaussianTarget(dimension::Int) = GaussianTarget(
+    dimension, 0, 0,
+    prepare_gradient(_gaussian_logp, BENCHMARK_BACKEND, zeros(dimension)))
 
-mutable struct CenteredEightSchoolsTarget <: CountedTarget
+mutable struct CenteredEightSchoolsTarget{P} <: CountedTarget
     logdensity_calls::Int
     gradient_calls::Int
+    preparation::P
 end
+CenteredEightSchoolsTarget() = CenteredEightSchoolsTarget(
+    0, 0,
+    prepare_gradient(_centered_logp, BENCHMARK_BACKEND, [0.0, log(5.0), zeros(8)...]))
 
-mutable struct NoncenteredEightSchoolsTarget <: CountedTarget
+mutable struct NoncenteredEightSchoolsTarget{P} <: CountedTarget
     logdensity_calls::Int
     gradient_calls::Int
+    preparation::P
 end
+NoncenteredEightSchoolsTarget() = NoncenteredEightSchoolsTarget(
+    0, 0,
+    prepare_gradient(_noncentered_logp, BENCHMARK_BACKEND, [0.0, log(5.0), zeros(8)...]))
 
 const EIGHT_Y = [28.0, 8.0, -3.0, 7.0, -1.0, 1.0, 18.0, 12.0]
 const EIGHT_SIGMA = [15.0, 10.0, 16.0, 11.0, 9.0, 11.0, 10.0, 18.0]
@@ -36,6 +65,8 @@ const COMPARISON_PACKAGES = (
     "DynamicHMC",
     "LogDensityProblems",
     "MCMCDiagnosticTools",
+    "DifferentiationInterface",
+    "Enzyme",
 )
 
 LogDensityProblems.dimension(target::GaussianTarget) = target.dimension
@@ -109,51 +140,97 @@ function _noncentered_eight_schools(q)
     (logdensity, gradient)
 end
 
+# Scalar log densities — the public model boundary DI+Enzyme differentiates.
+_gaussian_logp(q) = -sum(abs2, q) / 2
+
+function _centered_logp(q)
+    mu = q[1]
+    log_tau = q[2]
+    tau = exp(log_tau)
+    theta = @view q[3:10]
+    inverse_tau_squared = inv(tau * tau)
+    logdensity = -0.5 * log(2pi) - log(5.0) - 0.5 * (mu / 5.0)^2
+    ratio_squared = (tau / 5.0)^2
+    logdensity += log(2.0) - log(pi) - log(5.0) - log1p(ratio_squared) + log_tau
+    for index in eachindex(theta)
+        delta = theta[index] - mu
+        residual = EIGHT_Y[index] - theta[index]
+        logdensity += -0.5 * log(2pi) - log_tau -
+            0.5 * delta^2 * inverse_tau_squared
+        logdensity += -0.5 * log(2pi) - log(EIGHT_SIGMA[index]) -
+            0.5 * (residual / EIGHT_SIGMA[index])^2
+    end
+    logdensity
+end
+
+function _noncentered_logp(q)
+    mu = q[1]
+    log_tau = q[2]
+    tau = exp(log_tau)
+    eta = @view q[3:10]
+    logdensity = -0.5 * log(2pi) - log(5.0) - 0.5 * (mu / 5.0)^2
+    ratio_squared = (tau / 5.0)^2
+    logdensity += log(2.0) - log(pi) - log(5.0) - log1p(ratio_squared) + log_tau
+    for index in eachindex(eta)
+        theta = mu + tau * eta[index]
+        residual = EIGHT_Y[index] - theta
+        inverse_sigma_squared = inv(EIGHT_SIGMA[index]^2)
+        logdensity += -0.5 * log(2pi) - 0.5 * eta[index]^2
+        logdensity += -0.5 * log(2pi) - log(EIGHT_SIGMA[index]) -
+            0.5 * residual^2 * inverse_sigma_squared
+    end
+    logdensity
+end
+
+# The scalar log density DI+Enzyme differentiates for each target.
+_logp(::GaussianTarget) = _gaussian_logp
+_logp(::CenteredEightSchoolsTarget) = _centered_logp
+_logp(::NoncenteredEightSchoolsTarget) = _noncentered_logp
+
 _evaluate(target::GaussianTarget, q) = _gaussian(q)
 _evaluate(::CenteredEightSchoolsTarget, q) = _centered_eight_schools(q)
 _evaluate(::NoncenteredEightSchoolsTarget, q) = _noncentered_eight_schools(q)
 
 function LogDensityProblems.logdensity(target::CountedTarget, q)
     target.logdensity_calls += 1
-    first(_evaluate(target, q))
+    _logp(target)(q)
 end
 
+# External LDP consumers (AdvancedHMC / DynamicHMC) may retain the gradient of a
+# phasepoint, so the gradient returned here must be a FRESH array per call. Use
+# DI's out-of-place value_and_gradient with the concrete preparation. Owned
+# in-place gradient buffers are reserved for RK's phasepoint slots, where the
+# reactive program explicitly owns the memory.
 function LogDensityProblems.logdensity_and_gradient(target::CountedTarget, q)
     target.gradient_calls += 1
-    _evaluate(target, q)
+    value_and_gradient(_logp(target), target.preparation, BENCHMARK_BACKEND, q)
 end
 
 initial(::GaussianTarget) = zeros(4)
 initial(::CenteredEightSchoolsTarget) = [0.0, log(5.0), zeros(8)...]
 initial(::NoncenteredEightSchoolsTarget) = [0.0, log(5.0), zeros(8)...]
 
-function validate_target_gradient(evaluate, q)
-    _, analytic = evaluate(q)
-    increment = 1.0e-6
-    finite_difference = similar(q)
-    for index in eachindex(q)
-        forward = copy(q)
-        backward = copy(q)
-        forward[index] += increment
-        backward[index] -= increment
-        finite_difference[index] =
-            (first(evaluate(forward)) - first(evaluate(backward))) /
-            (2increment)
-    end
-    @assert isapprox(
-        analytic, finite_difference; rtol = 2.0e-6, atol = 2.0e-7,
-    )
-    maximum(abs, analytic - finite_difference)
+# Validate the DI+Enzyme gradient of the scalar log density against the
+# closed-form analytic gradient at a fixed point. The analytic form is a
+# correctness ORACLE only — never the sampled gradient path — and no numerical
+# differencing is used.
+function validate_target_gradient(logp, analytic_evaluate, q)
+    _, analytic = analytic_evaluate(q)
+    preparation = prepare_gradient(logp, BENCHMARK_BACKEND, copy(q))
+    di_gradient =
+        DifferentiationInterface.gradient(logp, preparation, BENCHMARK_BACKEND, q)
+    @assert isapprox(analytic, di_gradient; rtol = 2.0e-6, atol = 2.0e-7)
+    maximum(abs, analytic - di_gradient)
 end
 
 function validate_target_gradients()
     q = [0.3, log(1.7), -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8]
     println((;
         centered_gradient_max_error = validate_target_gradient(
-            _centered_eight_schools, q,
+            _centered_logp, _centered_eight_schools, q,
         ),
         noncentered_gradient_max_error = validate_target_gradient(
-            _noncentered_eight_schools, q,
+            _noncentered_logp, _noncentered_eight_schools, q,
         ),
     ))
 end
@@ -167,34 +244,24 @@ end
 function prepare_reactive_target(target)
     initial_position = initial(target)
     timed = @timed begin
-        potential(position) = -LogDensityProblems.logdensity(target, position)
-        function potential_gradient(position)
-            logdensity, gradient =
-                LogDensityProblems.logdensity_and_gradient(target, position)
-            (-logdensity, -gradient)
-        end
-        model = ReactiveKernels.@kernel begin
-            pos::Vector{Float64}
-            mom::Vector{Float64}
-            metric::Matrix{Float64}
-            chol_metric::Cholesky{Float64,Matrix{Float64}} = cholesky(metric)
-            pot::Float64 = potential(pos)
-            (pot, dpot_dpos::Vector{Float64}) = potential_gradient(pos)
-            (kin::Float64, dham_dmom::Vector{Float64}) = begin
-                velocity = chol_metric \ mom
-                (0.5 * (logdet(chol_metric) + dot(mom, velocity)), velocity)
-            end
-            ham::Float64 = pot + kin
-            dham_dpos::Vector{Float64} = dpot_dpos
-            return (pot, dpot_dpos, chol_metric, kin, ham,
-                    dham_dpos, dham_dmom)
+        # Public compiled-reactive boundary: the scalar potential (= -logdensity)
+        # is differentiated by DI+Enzyme (prepared once on the target) into the
+        # sampler's OWNED gradient buffer in place, then negated in place. No
+        # handwritten sampled gradient; RK's own gradient counter is incremented.
+        function potential_gradient!(gradient, position)
+            target.gradient_calls += 1
+            value = first(value_and_gradient!(
+                _logp(target), gradient, target.preparation,
+                BENCHMARK_BACKEND, position))
+            gradient .*= -1
+            -value
         end
         dimension = length(initial_position)
-        ReactiveKernels.euclidean_phasepoint(model, (
-            pos = copy(initial_position),
-            mom = zeros(dimension),
-            metric = Matrix{Float64}(I, dimension, dimension),
-        ))
+        ReactiveKernels.reactive_nuts_group(
+            potential_gradient!,
+            Matrix{Float64}(I, dimension, dimension),
+            copy(initial_position),
+            zeros(dimension))
     end
     (;
         target,
@@ -208,6 +275,7 @@ function run_reactive(context; seed, n_warmup, n_draws, max_depth,
                       target_accept)
     reset_counts!(context.target)
     timed = @timed begin
+        # nuts_state on the flat reactive_nuts_group returns a CompiledNUTSState.
         sampler = ReactiveKernels.nuts_state(
             copy(context.point);
             rng = Xoshiro(seed),
@@ -372,17 +440,17 @@ function aggregate(chains; setup_seconds = 0.0, setup_bytes = 0)
 end
 
 function target_constructor(target)
-    target isa GaussianTarget && return () -> GaussianTarget(4, 0, 0)
+    target isa GaussianTarget && return () -> GaussianTarget(4)
     target isa CenteredEightSchoolsTarget &&
-        return () -> CenteredEightSchoolsTarget(0, 0)
-    () -> NoncenteredEightSchoolsTarget(0, 0)
+        return () -> CenteredEightSchoolsTarget()
+    () -> NoncenteredEightSchoolsTarget()
 end
 
 function compile_paths()
     for target in (
-        GaussianTarget(4, 0, 0),
-        CenteredEightSchoolsTarget(0, 0),
-        NoncenteredEightSchoolsTarget(0, 0),
+        GaussianTarget(4),
+        CenteredEightSchoolsTarget(),
+        NoncenteredEightSchoolsTarget(),
     )
         context = prepare_reactive_target(target)
         run_reactive(
@@ -427,7 +495,10 @@ function compare(name, constructor; target_accept)
     for runner in (run_reactive, run_advancedhmc, run_dynamichmc)
         GC.gc()
         if runner === run_reactive
-            context = prepare_reactive_target(constructor())
+            # Setup = target DI+Enzyme preparation (timed) + reactive graph
+            # preparation (timed inside prepare_reactive_target), both once.
+            built = @timed constructor()
+            context = prepare_reactive_target(built.value)
             chains = [
                 runner(
                     context;
@@ -440,21 +511,30 @@ function compare(name, constructor; target_accept)
             ]
             println(aggregate(
                 chains;
-                setup_seconds = context.setup_seconds,
-                setup_bytes = context.setup_bytes,
+                setup_seconds = built.time + context.setup_seconds,
+                setup_bytes = built.bytes + context.setup_bytes,
             ))
         else
+            # Per-chain target instances (clean call counters); the DI+Enzyme
+            # preparation cost of each construction is timed and summed into
+            # setup. Collect the timed builds first, then sum their fields, so no
+            # mutable accumulator is captured into the sampling closure.
+            builds = [@timed(constructor()) for _ in seeds]
             chains = [
                 runner(
-                    constructor();
+                    build.value;
                     seed,
                     n_warmup = settings.warmup,
                     n_draws = settings.draws,
                     max_depth = settings.max_depth,
                     target_accept,
-                ) for seed in seeds
+                ) for (seed, build) in zip(seeds, builds)
             ]
-            println(aggregate(chains))
+            println(aggregate(
+                chains;
+                setup_seconds = sum(build -> build.time, builds),
+                setup_bytes = sum(build -> build.bytes, builds),
+            ))
         end
     end
 end
@@ -482,19 +562,19 @@ end
 package_receipts()
 validate_target_gradients()
 compile_paths()
-compare(:gaussian, () -> GaussianTarget(4, 0, 0); target_accept = 0.8)
+compare(:gaussian, () -> GaussianTarget(4); target_accept = 0.8)
 compare(
     :centered_eight_schools,
-    () -> CenteredEightSchoolsTarget(0, 0);
+    () -> CenteredEightSchoolsTarget();
     target_accept = 0.8,
 )
 compare(
     :centered_eight_schools,
-    () -> CenteredEightSchoolsTarget(0, 0);
+    () -> CenteredEightSchoolsTarget();
     target_accept = 0.9,
 )
 compare(
     :noncentered_eight_schools,
-    () -> NoncenteredEightSchoolsTarget(0, 0);
+    () -> NoncenteredEightSchoolsTarget();
     target_accept = 0.8,
 )

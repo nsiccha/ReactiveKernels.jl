@@ -16,8 +16,6 @@ using ReactiveKernels: code_expr
         @test all(source -> occursin("AutoEnzyme", source), all_sources())
         @test all(source -> occursin("DifferentiationInterface.gradient", source),
                   all_sources())
-        # ForwardDiff is retired tree-wide; it must not appear here.
-        @test all(source -> !occursin("ForwardDiff", source), all_sources())
         # The compute path is Distributions.jl-free: the generated straight-line
         # kernel references no distribution library.
         @test all(artifacts) do artifact

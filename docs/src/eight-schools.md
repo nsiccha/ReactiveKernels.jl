@@ -112,17 +112,28 @@ parameters = constrain_kernel(q)
 
 The numeric graph ports are typed at a `Real` boundary, while constrained
 parameters and predictions retain their concrete scalar type. The prepared
-kernel therefore specializes on ordinary `Float64` inputs and also accepts the
-dual-number tuples created by forward-mode AD:
+kernel therefore specializes on ordinary `Float64` inputs and also differentiates
+cleanly through reverse-mode AD (`DifferentiationInterface` with the Enzyme
+backend):
 
 ```julia
-using ForwardDiff
+using DifferentiationInterface
+import Enzyme
+
+# Reverse-mode Enzyme with runtime activity enabled: the prepared kernel closes
+# over constant model data (the observations and their scales) that Enzyme's
+# static activity analysis cannot prove non-differentiable. The closure is
+# annotated `Const` because only the numeric input is differentiated.
+enzyme_backend = AutoEnzyme(;
+    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
+    function_annotation = Enzyme.Const,
+)
 
 density_only = prepare(model;
     have = (:unconstrained, :observations, :observation_scales),
     want = :density)
 logdensity(qv) = density_only(Tuple(qv), observations, observation_scales)
-gradient = ForwardDiff.gradient(logdensity, collect(q))
+gradient = DifferentiationInterface.gradient(logdensity, enzyme_backend, collect(q))
 ```
 
 Generated quantities can start at an already-constrained boundary. In this
