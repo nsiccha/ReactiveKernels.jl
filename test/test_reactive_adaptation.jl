@@ -173,3 +173,71 @@ end
     run(st)                                                            # advance source
     @test size(rc.draws, 2) == 1                                       # clone unaffected
 end
+
+@testset "reactive stats — dynamic capacity growth + prepend/append order survives resize" begin
+    # Drive >16 reserved columns on BOTH sides (initial capacity is 16) so the
+    # backing storage resizes, and assert positions/gradients/dhams/pots/idxs keep
+    # their ordered prepend/append semantics across the resize.
+    t = trajectory_stats(1)
+    # Seed one column; gradient storage records -dham_dpos, so set dham_dpos=pos for
+    # a self-consistent gradients == -positions check, and reset! seeds dhams with 0.
+    reset!(t, (pos = [100.0], dham_dpos = [100.0], pot = 100.0))
+    exp_pos = [100.0]; exp_dh = [0.0]
+    function _drive!(stats, prepend, val)
+        obj = getfield(stats, :object); gs = obj.state; h = obj.handles
+        col = ReactiveKernels._reserve_trajectory_column!(stats, prepend)
+        ReactiveKernels.mutate!(gs, h.position_storage) do s; s[:, col] .= val; s; end
+        ReactiveKernels.mutate!(gs, h.gradient_storage) do s; s[:, col] .= -val; s; end
+        if prepend
+            ReactiveKernels.mutate!(gs, h.dhams) do d; pushfirst!(d, val); d; end
+            ReactiveKernels.mutate!(gs, h.pots) do p; pushfirst!(p, val); p; end
+            ReactiveKernels.mutate!(gs, h.idxs) do i; pushfirst!(i, length(i)); i; end
+        else
+            ReactiveKernels.mutate!(gs, h.dhams) do d; push!(d, val); d; end
+            ReactiveKernels.mutate!(gs, h.pots) do p; push!(p, val); p; end
+            ReactiveKernels.mutate!(gs, h.idxs) do i; push!(i, length(i)); i; end
+        end
+    end
+    for k in 1:24
+        prepend = isodd(k)
+        _drive!(t, prepend, Float64(k))
+        prepend ? (pushfirst!(exp_pos, Float64(k)); pushfirst!(exp_dh, Float64(k))) :
+                  (push!(exp_pos, Float64(k)); push!(exp_dh, Float64(k)))
+    end
+    @test size(getfield(t, :object).position_storage, 2) > 16    # actually resized
+    @test length(exp_pos) == 25
+    @test vec(t.positions) == exp_pos                            # order survived resize
+    @test vec(t.gradients) == -exp_pos
+    @test t.dhams == exp_dh
+    @test t.pots == exp_pos
+    @test sort(t.idxs) == 0:24
+end
+
+@testset "reactive stats — Float32 construction/callback typing + SamplingStats isolation" begin
+    # Float32 stats over a Float32 compiled sampler.
+    D = 2
+    f32g!(g, q) = (copyto!(g, q); sum(abs2, q) / 2)
+    t32 = trajectory_stats(D, Float32)
+    @test t32 isa TrajectoryStats
+    @test eltype(getfield(t32, :object).position_storage) === Float32
+    grp = reactive_nuts_group(f32g!, Matrix{Float32}(I, D, D),
+                              Float32[0.1, -0.2], Float32[0.3, -0.4])
+    st = nuts_state(grp; rng = Xoshiro(7),
+                    step_f = partial(leapfrog!; stepsize = 0.25f0),
+                    stats_f = t32, max_depth = 3)
+    sample!(st)
+    @test eltype(t32.positions) === Float32
+    @test eltype(t32.dhams) === Float32
+
+    # SamplingStats bidirectional clone/source isolation + setproperty! return.
+    run = sampling_stats(t32); run(st)
+    @test (run.n_steps = run.n_steps) == run.n_steps        # setproperty! forwards+returns
+    clone = copy(run)
+    n0 = size(run.draws, 2)
+    run(st)                                                 # advance SOURCE
+    @test size(clone.draws, 2) == n0                        # clone unaffected (source->clone)
+    c0 = size(clone.draws, 2)
+    clone(st)                                               # advance CLONE
+    @test size(run.draws, 2) == n0 + 1                      # source unaffected (clone->source)
+    @test size(clone.draws, 2) == c0 + 1
+end
