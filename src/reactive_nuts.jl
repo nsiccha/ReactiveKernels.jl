@@ -249,6 +249,18 @@ _nuts_proposal(pos, mom) = _NUTSProposal(copy(pos), copy(mom))
 # ordinary orchestration scratch the ca9 design permits — RNG, the integrator, the
 # optional recorder, max_depth, and the bounded trees/proposals. `step_f` is the one
 # mutable ordinary field (adaptation replaces it); everything else is immutable here.
+"""
+    CompiledNUTSState
+
+The compiled-reactive multinomial NUTS sampler state built by
+[`nuts_state`](@ref)/[`compiled_nuts_state`](@ref) from a flat phase-point group
+([`reactive_nuts_group`](@ref)). The per-transition Hamiltonian work and the
+control/diagnostic fields are reactive HAVE/derived nodes on the group's
+[`ReactiveProgram`](@ref) ([`reactive_program`](@ref)); the struct itself keeps only
+the ordinary orchestration scratch (RNG, integrator, optional recorder, max depth,
+bounded trees/proposals). Drives the public sampler interface — [`step!`](@ref),
+[`sample!`](@ref), [`refresh_momentum!`](@ref), [`diagnostics`](@ref).
+"""
 mutable struct CompiledNUTSState{R,G,F,S,TR,PR} <: AbstractNUTSState
     rng::R
     group::G                 # the flat compiled-reactive phase-point group
@@ -389,6 +401,16 @@ function _nuts_metric_is_source(state::CompiledNUTSState)
         state.group.state.program.sources[_slot_index(handles.metric)]
 end
 
+const _REACTIVE_NUTS_REQUIRED_HANDLES = (
+    :gofwd, :chol_metric, :dham, :diverged, :active_ham, :min_dham,
+    # GAP-1d control + completed-transition diagnostic-snapshot sources.
+    :may_sample, :may_continue, :depth, :n_steps, :acceptance_sum,
+    :last_energy_error, :last_diverged,
+    :init_pos, :init_mom, :init_ham, :init_dpot_dpos, :init_dham_dmom,
+    :fwd_pos, :fwd_mom, :fwd_ham, :fwd_dpot_dpos, :fwd_dham_dmom,
+    :bwd_pos, :bwd_mom, :bwd_ham, :bwd_dpot_dpos, :bwd_dham_dmom,
+)
+
 """
     compiled_nuts_state(group; rng, step_f, stats_f=nothing,
                         max_depth=10, min_dham=-1000.0)
@@ -414,16 +436,6 @@ handles; the struct carries no ordinary duplicate/shadow copy of them. Only the 
 the tree-growth recursion, U-turn criteria, RNG draws, and the bounded
 trees/proposals scratch are ordinary Julia (as in ca9).
 """
-const _REACTIVE_NUTS_REQUIRED_HANDLES = (
-    :gofwd, :chol_metric, :dham, :diverged, :active_ham, :min_dham,
-    # GAP-1d control + completed-transition diagnostic-snapshot sources.
-    :may_sample, :may_continue, :depth, :n_steps, :acceptance_sum,
-    :last_energy_error, :last_diverged,
-    :init_pos, :init_mom, :init_ham, :init_dpot_dpos, :init_dham_dmom,
-    :fwd_pos, :fwd_mom, :fwd_ham, :fwd_dpot_dpos, :fwd_dham_dmom,
-    :bwd_pos, :bwd_mom, :bwd_ham, :bwd_dpot_dpos, :bwd_dham_dmom,
-)
-
 function compiled_nuts_state(group::_NUTSGroup; rng, step_f,
                              stats_f = nothing, max_depth::Integer = 10,
                              min_dham = -1000.0)
@@ -725,6 +737,13 @@ function step!(state::CompiledNUTSState)
     diagnostics(state)
 end
 
+"""
+    diagnostics(state) -> NUTSDiagnostics
+
+Per-transition diagnostics for a NUTS `state` (a [`CompiledNUTSState`](@ref)): tree
+depth, leapfrog count, mean acceptance, divergence status, and the completed-
+transition energy-error snapshot. Returned by [`step!`](@ref)/[`sample!`](@ref).
+"""
 function diagnostics(state::CompiledNUTSState)
     n_steps = _cn_getproperty(state, Val(:n_steps))
     acceptance_sum = _cn_getproperty(state, Val(:acceptance_sum))

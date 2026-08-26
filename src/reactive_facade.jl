@@ -103,6 +103,15 @@ end
     end
 end
 
+"""
+    reactive_program(object) -> ReactiveProgram
+
+The compiled [`ReactiveProgram`](@ref) backing a reactive object (a
+[`ReactiveObject`](@ref) or a thin wrapper over one, such as the NUTS sampler and
+its adaptation/statistics states). `reactive_program(object).plan` is the Compute
+DAG and `code_expr(reactive_program(object), handle)` is the generated getter for a
+reachable derived node.
+"""
 reactive_program(object::ReactiveObject) = getfield(object, :state).program
 
 # In-place root-field mutation boundary. Every indexed/property-chain/compound/

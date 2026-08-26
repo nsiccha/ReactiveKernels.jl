@@ -99,6 +99,31 @@ function setup_online_stats!(mod::Module)
     nothing
 end
 
+# The ONE shared three-view UI (Raw input / Generated kernel / Compute DAG). Both
+# the stateless PreparedKernel path and the ReactiveProgram path emit through this;
+# there is no second renderer. `dag` is the exact `Plan` consumed by `visualize`.
+function _three_pane_blocks!(blocks, title, source, generated, dag::Plan)
+    push!(blocks, RawHTML("""
+<h2>$(title)</h2>
+<div class="rk-example" data-rk-example>
+<div data-rk-pane="source">
+"""))
+    push!(blocks, Markdown.Code("julia", source))
+    push!(blocks, RawHTML("""
+</div>
+<div data-rk-pane="kernel">
+"""))
+    push!(blocks, Markdown.Code("julia", generated))
+    push!(blocks, RawHTML("""
+</div>
+<div data-rk-pane="dag">
+$(_dag_html(dag))
+</div>
+</div>
+"""))
+    blocks
+end
+
 """
     render_examples(artifacts) -> Markdown.MD
 
@@ -126,28 +151,150 @@ function render_examples(artifacts)
             "# Actual output\n", _plain_repr(artifact.output),
         )
         generated = _generated_source(artifact.generated)
-
-        title = _example_title(artifact.name)
-        push!(blocks, RawHTML("""
-<h2>$(title)</h2>
-<div class="rk-example" data-rk-example>
-<div data-rk-pane="source">
-"""))
-        push!(blocks, Markdown.Code("julia", source))
-        push!(blocks, RawHTML("""
-</div>
-<div data-rk-pane="kernel">
-"""))
-        push!(blocks, Markdown.Code("julia", generated))
-        push!(blocks, RawHTML("""
-</div>
-<div data-rk-pane="dag">
-$(_dag_html(artifact.dag))
-</div>
-</div>
-"""))
+        _three_pane_blocks!(blocks, _example_title(artifact.name), source, generated, artifact.dag)
     end
     Markdown.MD(blocks)
+end
+
+# --- ReactiveProgram artifacts (the actual compiled reactive programs) ----------
+
+# The underlying reactive object (unwrapping a nominal wrapper) and its handles.
+_artifact_object(object) =
+    object isa ReactiveKernels.ReactiveObject ? object : getfield(object, :object)
+_artifact_handles(object) = getfield(_artifact_object(object), :handles)
+
+# The live value read through a getter (source or derived) of the executed object.
+# `invokelatest` because the displayed source may have defined fresh recipe methods
+# (e.g. the DI+Enzyme potential_gradient!) into the page sandbox in a newer world.
+_getter_value(object, getter::Symbol) =
+    Base.invokelatest(getproperty, _artifact_object(object), getter)
+
+_is_source(program::ReactiveProgram, handle) =
+    program.sources[ReactiveKernels._slot_index(handle)]
+
+# The full recipe/value inventory of a program's exposed handles: which names are
+# HAVE sources and which are DERIVED getter nodes. The one-to-one coverage gate
+# compares this against a declared expectation, so a missing/extra recipe in any of
+# the five programs fails the docs build.
+function _program_inventory(program::ReactiveProgram, handles)
+    derived = Symbol[]; sources = Symbol[]
+    for name in keys(handles)
+        push!(_is_source(program, getproperty(handles, name)) ? sources : derived, name)
+    end
+    (; derived = sort(derived), sources = sort(sources),
+       recipe_count = length(program.plan.recipes))
+end
+
+"""
+    program_artifact(name, origin, source, object, getter; note="") -> NamedTuple
+
+One-to-one docs artifact for the ACTUAL compiled `ReactiveProgram` behind a public
+reactive object/wrapper. `program = reactive_program(object)` (tied to the
+build-executed object), `generated` is the real `code_expr(program, handle)` of the
+selected load-bearing `getter`, `dag` is that same `program.plan`, and `inventory`
+is the full source/derived recipe census used by the coverage gate. `note` labels
+the ordinary non-reactive orchestration (recursion, RNG, U-turn, leapfrog,
+adaptation/statistics update methods) so no fake DAG is invented for it.
+"""
+function program_artifact(name::Symbol, origin::AbstractString,
+                          source::AbstractString, object, getter::Symbol;
+                          note::AbstractString = "")
+    program = reactive_program(object)
+    handles = _artifact_handles(object)
+    handle = getproperty(handles, getter)
+    (; name, origin, source, object, program, getter,
+       getter_is_source = _is_source(program, handle),
+       generated = code_expr(program, handle),
+       output = _getter_value(object, getter),   # executed value read via the live getter
+       dag = program.plan,
+       inventory = _program_inventory(program, handles), note)
+end
+
+"""
+    render_program_examples(artifacts) -> Markdown.MD
+
+Render ReactiveProgram artifacts through the SAME three-view UI as
+[`render_examples`](@ref). Raw input is the build-executed public constructor
+source; Generated kernel is the REAL `code_expr` of the selected load-bearing getter
+of the actual `reactive_program` (a derived fused getter where the program has
+derived nodes; a source-slot getter for a state-only program); Compute DAG is that
+same `program.plan`, which visually carries the full recipe graph. Fails if any
+artifact's program/generated/DAG identity diverges from the live program.
+"""
+function render_program_examples(artifacts)
+    blocks = Any[]
+    for artifact in artifacts
+        artifact.program isa ReactiveProgram || error(
+            "$(artifact.name) did not provide a ReactiveProgram",
+        )
+        artifact.dag === artifact.program.plan || error(
+            "$(artifact.name) DAG is not its reactive_program plan",
+        )
+        handle = getproperty(_artifact_handles(artifact.object), artifact.getter)
+        artifact.generated == code_expr(artifact.program, handle) || error(
+            "$(artifact.name) generated view diverges from the live code_expr($(artifact.getter))",
+        )
+
+        # Executed evidence: the live value read through the selected getter after the
+        # displayed source ran must match the artifact (real build-executed example).
+        _getter_value(artifact.object, artifact.getter) == artifact.output || error(
+            "$(artifact.name) recorded output diverges from the live getter value",
+        )
+
+        kind = artifact.getter_is_source ?
+            "state-only reactive program — the pane shows the generated source-slot " *
+            "getter for `$(artifact.getter)`; its updates ($(artifact.note)) are " *
+            "ordinary Julia methods over these HAVE sources" :
+            "the pane shows the generated FUSED getter for the derived node " *
+            "`$(artifact.getter)` — one straight-line function, no graph traversal " *
+            "($(artifact.note))"
+        source = string("# Origin: ", artifact.origin, "\n", artifact.source, "\n\n",
+                        "# Actual output — ", artifact.getter, " (read through the ",
+                        "live getter after executing the above)\n",
+                        _plain_repr(artifact.output))
+        generated = string("# ", kind, "\n\n", _generated_source(artifact.generated))
+        _three_pane_blocks!(blocks, _example_title(artifact.name), source, generated, artifact.dag)
+    end
+    Markdown.MD(blocks)
+end
+
+"""
+    assert_program_coverage(artifacts, expected) -> artifacts
+
+Mechanical one-to-one coverage gate. `expected` maps each program name to its
+declared `(derived, sources)` handle inventory. Errors — failing the docs build — if
+the rendered set is not EXACTLY the expected program names, if any artifact's
+`program`/`dag` is not the live `reactive_program(object)`/`program.plan`, if the
+selected getter's `code_expr` diverges from the live program, or if any program's
+actual source/derived recipe inventory diverges from its declared expectation
+(so a missing or extra recipe in any of the five programs is caught).
+"""
+function assert_program_coverage(artifacts, expected)
+    names = [a.name for a in artifacts]
+    Set(names) == Set(keys(expected)) && length(names) == length(expected) || error(
+        "program coverage mismatch: rendered $(sort(names)) vs expected $(sort(collect(keys(expected))))",
+    )
+    for a in artifacts
+        a.program === reactive_program(a.object) || error(
+            "$(a.name) program is not the live reactive_program(object)",
+        )
+        a.dag === a.program.plan || error("$(a.name) DAG is not program.plan")
+        handle = getproperty(_artifact_handles(a.object), a.getter)
+        a.generated == code_expr(a.program, handle) || error(
+            "$(a.name) generated getter diverges from the live program",
+        )
+        _getter_value(a.object, a.getter) == a.output || error(
+            "$(a.name) recorded output diverges from the live getter value",
+        )
+        want = expected[a.name]
+        (sort(collect(want.derived)) == a.inventory.derived &&
+         sort(collect(want.sources)) == a.inventory.sources) || error(
+            "$(a.name) recipe inventory diverged from the declared coverage:\n" *
+            "  derived: got $(a.inventory.derived)\n           want $(sort(collect(want.derived)))\n" *
+            "  sources: got $(a.inventory.sources)\n           want $(sort(collect(want.sources)))",
+        )
+    end
+    artifacts
 end
 
 """
@@ -183,6 +330,121 @@ function execute_example(mod::Module, code::AbstractString;
         ),
     )
     render_examples((artifact,))
+end
+
+# The five compiled reactive programs of the public NUTS workflow, each defined by
+# its exact build-executed public constructor source. The gradient boundary is the
+# ACTUAL sampled path: a scalar potential differentiated once by DI + reverse-mode
+# Enzyme into an owned buffer (as in examples/nuts.jl). `note` labels the ordinary
+# non-reactive orchestration around each program.
+const _FIVE_PROGRAM_SNIPPETS = (
+    (name = :nuts_group,
+     origin = "reactive_nuts_group (build executed)",
+     getter = :dham,
+     note = "the transition recursion, RNG draws, U-turn criteria, leapfrog, and " *
+            "tree/proposal scratch are ordinary inferred Julia over these handles",
+     source = raw"""
+# The public model boundary is a SCALAR potential; its gradient goes through
+# DifferentiationInterface + reverse-mode Enzyme, prepared once and written into
+# the sampler's owned buffer in place (the actual sampled path — no handwritten
+# gradient callback). See examples/nuts.jl for the full runnable workflow.
+backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
+                     function_annotation = Enzyme.Const)
+potential(q) = sum(abs2, q) / 2
+dimension = 4
+preparation = prepare_gradient(potential, backend, zeros(dimension))
+potential_gradient!(gradient, position) = first(value_and_gradient!(
+    potential, gradient, preparation, backend, position))
+
+object = reactive_nuts_group(potential_gradient!,
+    Matrix{Float64}(I, dimension, dimension), zeros(dimension), zeros(dimension))"""),
+    (name = :dual_averaging,
+     origin = "dual_averaging_state (build executed)",
+     getter = :current,
+     note = "fit! is an ordinary method advancing the accumulator sources",
+     source = raw"""
+object = dual_averaging_state(0.35; target = 0.8)
+fit!(object, 0.9)          # ordinary method: advance the accumulator sources
+fit!(object, 0.72)"""),
+    (name = :welford_variance,
+     origin = "welford_var (build executed)",
+     getter = :var,
+     note = "step! folds observations into the n/mean/var sources in place",
+     source = raw"""
+dimension = 4
+object = welford_var(dimension)
+step!(object, [0.5, -1.0, 2.0, 0.25])   # ordinary in-place source update
+step!(object, [1.5, -0.5, 1.0, 0.75])"""),
+    (name = :trajectory_stats,
+     origin = "trajectory_stats (build executed)",
+     getter = :pots,
+     note = "the recorder callback and positions/gradients VIEWS are ordinary " *
+            "methods; the history/index buffers are its HAVE sources",
+     source = raw"""
+dimension = 4
+object = trajectory_stats(dimension)"""),
+    (name = :sampling_stats,
+     origin = "sampling_stats (build executed)",
+     getter = :draws,
+     note = "the per-transition callback appends to its HAVE sources; the reduced " *
+            "views are ordinary methods",
+     source = raw"""
+dimension = 4
+object = sampling_stats(trajectory_stats(dimension))"""),
+)
+
+# Declared one-to-one recipe/value inventory for each of the five programs. The
+# coverage gate fails the docs build if any program's ACTUAL source/derived recipe
+# census diverges from this — so a missing or extra recipe is caught mechanically.
+const _FIVE_PROGRAM_INVENTORY = Dict(
+    :nuts_group => (
+        derived = (:active_ham, :bwd_dham_dmom, :bwd_dpot_dpos, :bwd_ham, :bwd_kin,
+                   :bwd_kinetic, :bwd_pot, :bwd_valgrad, :chol_metric, :dham, :diverged,
+                   :fwd_dham_dmom, :fwd_dpot_dpos, :fwd_ham, :fwd_kin, :fwd_kinetic,
+                   :fwd_pot, :fwd_valgrad, :init_dham_dmom, :init_dpot_dpos, :init_ham,
+                   :init_kin, :init_kinetic, :init_pot, :init_valgrad),
+        sources = (:acceptance_sum, :bwd_mom, :bwd_pos, :depth, :fwd_mom, :fwd_pos,
+                   :gofwd, :init_mom, :init_pos, :last_diverged, :last_energy_error,
+                   :may_continue, :may_sample, :metric, :min_dham, :n_steps,
+                   :potential_gradient!)),
+    :dual_averaging => (
+        derived = (:current, :final, :log_current),
+        sources = (:center, :error, :iteration, :log_final, :offset,
+                   :regularization_scale, :relaxation_exponent, :target)),
+    :welford_variance => (derived = (), sources = (:mean, :n, :var)),
+    :trajectory_stats => (
+        derived = (),
+        sources = (:count, :dhams, :dim, :first, :gradient_storage, :idxs,
+                   :position_storage, :pots)),
+    :sampling_stats => (
+        derived = (),
+        sources = (:acc_rate, :diverged, :draws, :full_history, :full_idxs,
+                   :n_steps, :stepsizes, :trajectory)),
+)
+
+"""
+    render_five_programs(mod) -> Markdown.MD
+
+Build-execute the five public constructors of the compiled-reactive NUTS workflow
+(NUTS group, DualAveragingState, WelfordVariance, TrajectoryStats, SamplingStats),
+assert one-to-one program/getter/DAG coverage, and render each actual
+`reactive_program` through the shared three-view UI. Fails the docs build if any of
+the five programs lacks an artifact or diverges from its live program.
+"""
+function render_five_programs(mod::Module)
+    Core.eval(mod, :(using ReactiveKernels, LinearAlgebra, Random,
+                           DifferentiationInterface))
+    Core.eval(mod, :(import Enzyme))
+    artifacts = Any[]
+    for snippet in _FIVE_PROGRAM_SNIPPETS
+        _evaluate_source(mod, snippet.source)          # build-execute the public source
+        object = Core.eval(mod, :object)               # the live object from that source
+        push!(artifacts, program_artifact(snippet.name, snippet.origin,
+                                          snippet.source, object, snippet.getter;
+                                          note = snippet.note))
+    end
+    assert_program_coverage(artifacts, _FIVE_PROGRAM_INVENTORY)
+    render_program_examples(artifacts)
 end
 
 end # module ReactiveKernelsDocs
