@@ -14,9 +14,11 @@ makedocs(
     ),
     pages = [
         "Home" => "index.md",
-        "Visualization" => "visualization.md",
-        "Distribution log densities" => "distributions.md",
-        "Batched log densities" => "batched.md",
+        "Building blocks" => [
+            "Distribution log densities" => "distributions.md",
+            "Batched log densities" => "batched.md",
+            "Non-allocating kernels" => "nonallocating.md",
+        ],
         "Probabilistic programming" => [
             "Eight schools" => "eight-schools.md",
             "Linear regression" => "linear-regression.md",
@@ -26,10 +28,12 @@ makedocs(
             "ARMA(1,1) time series" => "arma11.md",
             "Gaussian mixture" => "gaussian-mixture.md",
         ],
-        "NUTS sampling" => "nuts.md",
-        "Fused NUTS authoring" => "nuts-architecture.md",
-        "Online statistics" => "online-stats.md",
-        "Non-allocating kernels" => "nonallocating.md",
+        "Sampling" => [
+            "NUTS sampling" => "nuts.md",
+            "Fused NUTS authoring" => "nuts-architecture.md",
+            "Online statistics" => "online-stats.md",
+        ],
+        "Visualization" => "visualization.md",
         "API"  => "api.md",
     ],
     checkdocs = :none,
