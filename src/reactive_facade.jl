@@ -254,6 +254,43 @@ function _reactive_sibling_call(ex, self, rec)
     Expr(:call, out...)
 end
 
+# Control-flow / scoping forms whose local bindings and deferred/exceptional
+# execution the @reactive method-body rewriter does NOT soundly track: a local
+# that shadows a field, or a field mutation captured inside a closure / comprehension
+# / try, would be silently mis-rewritten (a wrong reactive graph). They are REJECTED
+# at macro expansion with an actionable error rather than expanded unsoundly.
+# Straight-line code, `if`/`elseif`, `&&`/`||`, `for`/`while`, indexing, `.field`,
+# `@.`, compound assignment, and sibling-method calls ARE supported.
+function _reactive_unsupported_form(ex)
+    ex isa Expr || return nothing
+    ex.head === :let && return "a `let` block"
+    ex.head in (:try, :trycatch, :trycatchelse) && return "a `try`/`catch` block"
+    ex.head === :comprehension && return "a comprehension"
+    ex.head === :typed_comprehension && return "a typed comprehension"
+    ex.head === :generator && return "a generator expression"
+    ex.head === :flatten && return "a nested/filtered generator"
+    ex.head === :do && return "a `do` block"
+    ex.head === :(->) && return "an anonymous function / closure"
+    ex.head === :function && return "a nested function definition"
+    # short-form nested function def `f(x) = ...` (a `=` whose LHS is a call).
+    (ex.head === :(=) && ex.args[1] isa Expr && ex.args[1].head === :call) &&
+        return "a nested function definition"
+    nothing
+end
+
+# Throw the actionable expansion-time rejection for an unsupported control-flow form.
+function _reactive_reject_form(what::AbstractString)
+    throw(ArgumentError(string(
+        "@reactive does not support ", what, " inside a method body: its local ",
+        "bindings and deferred/exceptional execution are not soundly tracked by the ",
+        "reactive-field rewriter, so a local shadowing a field — or a field mutation ",
+        "captured inside it — would be silently mis-rewritten. Bind and mutate the ",
+        "reactive field directly in supported straight-line/`if`/`for`/`while` code, ",
+        "move the logic into a sibling method declared in the same @reactive ",
+        "definition, or precompute the value in the ordinary wrapper and pass it in ",
+        "as a port.")))
+end
+
 # Substitute inside an in-place mutation body: the root field becomes `buffer`,
 # other field reads become getproperty, sibling calls forward the object, and the
 # assignment STRUCTURE is preserved (we are mutating buffer in place).
@@ -273,6 +310,7 @@ function _reactive_subst(ex, fields::Set{Symbol}, methods::Set{Symbol},
     end
     ex isa Expr || return ex
     ex.head === :quote && return ex
+    let what = _reactive_unsupported_form(ex); what === nothing || _reactive_reject_form(what); end
     s(n) = _reactive_subst(n, fields, methods, self, shadow, root, buffer; dot = dot)
     if ex.head === :. && length(ex.args) == 2 && ex.args[2] isa QuoteNode
         return Expr(:., s(ex.args[1]), ex.args[2])
@@ -449,6 +487,9 @@ function _reactive_rewrite(ex, fields::Set{Symbol}, methods::Set{Symbol},
     end
     ex isa Expr || return ex
     ex.head === :quote && return ex
+    # Unconditional expansion-time rejection of control-flow / scoping forms the
+    # rewriter cannot soundly track (declared @reactive grammar boundary).
+    let what = _reactive_unsupported_form(ex); what === nothing || _reactive_reject_form(what); end
     rw(node) = _reactive_rewrite(node, fields, methods, self, shadow, aliases)
 
     if _reactive_is_dotmacro(ex)
@@ -764,6 +805,19 @@ sources; body `lhs = rhs` assignments become compiled reactive derived nodes
 definitions become ordinary type-stable methods that take the object as their
 first argument, with field references routed through the object. Returns a
 constructor bound to `name` producing a [`ReactiveObject`](@ref).
+
+Method-body grammar (declared boundary): field reads/writes are routed soundly
+through straight-line code, `if`/`elseif`, `&&`/`||`, `for`/`while`, indexing,
+`.field` access, `@.` broadcast, compound assignment, and sibling-method calls.
+Control-flow / scoping forms that introduce their own bindings or defer/except
+execution — `let`, `try`/`catch`, comprehensions and generators, `do` blocks,
+anonymous functions/closures, and nested function definitions — are REJECTED at
+macro expansion (the rewriter cannot soundly tell a local that shadows a field
+from the field itself, nor track a field mutation captured inside such a form).
+Bind and mutate the reactive field directly in the supported straight-line/`if`/
+loop grammar, move the logic into a sibling method declared in the same `@reactive`
+definition, or precompute the value in the ordinary wrapper and pass it in as a
+port.
 
 Options (before the definition):
 - `@reactive prepare=<callable> name(...) = ...` — the injected `<callable>`

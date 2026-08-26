@@ -434,3 +434,112 @@ end
     @test _sp_ref(obj, :weight) === Base.RefValue{Float64}
     @test obj.scaled == 12.0
 end
+
+
+# --- Control-flow / scoping grammar boundary (alias-soundness) ----------------
+# Each rejected form is exercised NON-VACUOUSLY: the construct binds or mutates the
+# reactive field `pos`, exactly the shadow/capture case the rewriter cannot track,
+# so silent expansion would produce a wrong graph. Expansion must reject instead.
+_facade_eval(defexpr) =
+    try; Core.eval(@__MODULE__, defexpr); nothing; catch e; e; end
+
+@testset "@reactive facade — control-flow grammar boundary (rejection)" begin
+    # (name, quoted @reactive def whose METHOD BODY holds the offending form,
+    #  substring of the construct the error must name)
+    cases = [
+        (:let, quote
+            @reactive _rej_let(pos::Vector{Float64}, scale::Float64) = begin
+                c::Float64 = scale
+                bad() = (let pos = 0.0; pos + 1.0; end)   # let-binding shadows field pos
+            end
+        end, "`let` block"),
+        (:try, quote
+            @reactive _rej_try(pos::Vector{Float64}, scale::Float64) = begin
+                c::Float64 = scale
+                bad!() = (try; pos = pos .+ 1.0; catch; end)  # field mutation in try
+            end
+        end, "`try`/`catch` block"),
+        (:comprehension, quote
+            @reactive _rej_comp(pos::Vector{Float64}, scale::Float64) = begin
+                c::Float64 = scale
+                bad() = [pos for pos in 1:3]              # comprehension var shadows field
+            end
+        end, "comprehension"),
+        (:generator, quote
+            @reactive _rej_gen(pos::Vector{Float64}, scale::Float64) = begin
+                c::Float64 = scale
+                bad() = sum(pos for pos in 1:3)           # generator var shadows field
+            end
+        end, "generator expression"),
+        (:do, quote
+            @reactive _rej_do(pos::Vector{Float64}, scale::Float64) = begin
+                c::Float64 = scale
+                bad() = foreach(1:2) do pos; pos; end      # do-param shadows field
+            end
+        end, "`do` block"),
+        (:closure, quote
+            @reactive _rej_cls(pos::Vector{Float64}, scale::Float64) = begin
+                c::Float64 = scale
+                bad() = (f = pos -> pos + 1.0; f(scale))   # closure param shadows field
+            end
+        end, "anonymous function / closure"),
+        (:nested_long, quote
+            @reactive _rej_fnl(pos::Vector{Float64}, scale::Float64) = begin
+                c::Float64 = scale
+                bad() = (function inner(pos); pos + 1.0; end; inner(scale))
+            end
+        end, "nested function definition"),
+        (:nested_short, quote
+            @reactive _rej_fns(pos::Vector{Float64}, scale::Float64) = begin
+                c::Float64 = scale
+                bad() = (inner(pos) = pos + 1.0; inner(scale))
+            end
+        end, "nested function definition"),
+    ]
+    for (label, defexpr, needle) in cases
+        err = _facade_eval(defexpr)
+        @test _unwrap_err(err) isa ArgumentError    # deterministic expansion rejection
+        msg = sprint(showerror, _unwrap_err(err))
+        @test occursin(needle, msg)                 # error NAMES the construct
+        @test occursin("does not support", msg)
+    end
+    # The actionable guidance wording is present (declared grammar boundary).
+    guide = sprint(showerror, _unwrap_err(_facade_eval(cases[1][2])))
+    @test occursin("sibling method declared in the same @reactive definition", guide)
+    # Long- and short-form nested defs are distinct ASTs both rejected as such.
+    @test _facade_eval(cases[7][2]) isa Union{Exception,LoadError}
+    @test _facade_eval(cases[8][2]) isa Union{Exception,LoadError}
+end
+
+# Supported straight-line/if/for/@./compound grammar keeps working, inferred, 0-B.
+@reactive _grammar_ok(vec::Vector{Float64}, k::Float64) = begin
+    total::Float64 = k * sum(vec)
+    readsum() = begin
+        s = 0.0
+        for x in vec                 # for-loop (supported)
+            s += x                   # compound assignment on a LOCAL (supported)
+        end
+        s > 0.0 ? s + total : total  # ternary (supported)
+    end
+    scale!(f) = begin
+        k = k * f                    # compound field write (supported)
+        @. vec = vec * f             # @. in-place field mutation (supported)
+    end
+end
+
+# Measure inside a named function (warm then measure the SAME call) so the barrier
+# is compiled code, not a top-level @allocated over globals with boxing artifacts.
+_grammar_alloc(o, f) = (scale!(o, f); @allocated scale!(o, f))
+
+@testset "@reactive facade — supported control flow stays inferred + 0-B" begin
+    o = _grammar_ok([1.0, 2.0, 3.0], 2.0)
+    @test o isa ReactiveObject
+    @test o.total == 12.0
+    @test readsum(o) == 6.0 + 12.0             # for + compound + ternary path
+    @test (@inferred readsum(o)) isa Float64   # supported grammar stays inferred
+
+    scale!(o, 2.0)                             # one call: vec *= 2, k *= 2
+    @test o.vec == [2.0, 4.0, 6.0]
+    @test o.k == 4.0
+    @test _grammar_alloc(o, 1.0) == 0          # field @./compound writes are 0 B
+end
