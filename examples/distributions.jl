@@ -3,9 +3,10 @@
 # These examples build log densities as ordinary `ReactiveKernels` recipes:
 # closed-form arithmetic composed into a prepared straight-line kernel. The
 # compute path contains no `Distributions.jl` call — that package appears only
-# as an independent correctness/allocation oracle. Differentiation goes through
-# `DifferentiationInterface` with the `Enzyme` reverse-mode backend; `Enzyme`
-# never differentiates through `Distributions.jl`.
+# as an independent correctness/allocation oracle. ReactiveKernels plans and
+# computes the density; it does not differentiate. Gradients, if a downstream
+# sampler needs them, are the consumer's concern and are deliberately out of
+# scope here.
 module DistributionExamples
 
 export CONTINUOUS_SOURCE, DISCRETE_SOURCE, MULTIVARIATE_SOURCE
@@ -13,23 +14,20 @@ export all_sources, evaluate_source, run
 
 const CONTINUOUS_SOURCE = raw"""
 using Distributions
-using DifferentiationInterface
-import Enzyme
 using BenchmarkTools
 
-# Native, Distributions.jl-free Gaussian log density as two composable recipes.
-# The family fragment maps an unconstrained log scale to a positive scale; the
-# observation fragment evaluates the log density in closed form.
-@kernel normal_family(logσ::Float64) = begin
+# Native, Distributions.jl-free Gaussian log density as one have→want recipe.
+# We HAVE the log scale logσ, so the density uses it directly for the -logσ
+# term and derives σ = exp(logσ) only where the scale is genuinely needed (the
+# standardized residual). There is no exp-then-log round trip: log(σ) is never
+# recomputed from a σ we built out of the logσ we already hold.
+@kernel normal_logpdf(x::Float64, μ::Float64, logσ::Float64) = begin
     σ::Float64 = exp(logσ)
-end
-
-@kernel normal_observation(x::Float64, μ::Float64, σ::Float64) = begin
     z::Float64 = (x - μ) / σ
-    logdensity::Float64 = -0.5 * log(2π) - log(σ) - 0.5 * z^2
+    logdensity::Float64 = -0.5 * log(2π) - logσ - 0.5 * z^2
 end
 
-normal_kernel = prepare(compose(normal_family, normal_observation);
+normal_kernel = prepare(normal_logpdf;
     have = (:x, :μ, :logσ),
     want = :logdensity,
 )
@@ -41,24 +39,6 @@ output = normal_kernel(Tuple(inputs)...)
 normal_reference(x, μ, logσ) = logpdf(Normal(μ, exp(logσ)), x)
 reference = normal_reference(Tuple(inputs)...)
 
-# The same closed-form density as a plain function, to check that preparation
-# preserves reverse-mode AD.
-normal_logpdf(x, μ, logσ) = begin
-    σ = exp(logσ)
-    z = (x - μ) / σ
-    -0.5 * log(2π) - log(σ) - 0.5 * z^2
-end
-
-backend = AutoEnzyme(; mode = Enzyme.Reverse)
-gradient = DifferentiationInterface.gradient(
-    v -> normal_kernel(v[1], v[2], v[3]),
-    backend, [inputs.x, inputs.μ, inputs.logσ],
-)
-reference_gradient = DifferentiationInterface.gradient(
-    v -> normal_logpdf(v[1], v[2], v[3]),
-    backend, [inputs.x, inputs.μ, inputs.logσ],
-)
-
 allocation_bytes(f, a, b, c) = @ballocated $f($a, $b, $c)
 allocated_bytes = allocation_bytes(normal_kernel, Tuple(inputs)...)
 reference_allocated_bytes = allocation_bytes(normal_reference, Tuple(inputs)...)
@@ -67,7 +47,6 @@ inferred_return = only(Base.return_types(
 ))
 
 @assert output ≈ reference
-@assert gradient ≈ reference_gradient
 @assert !occursin("Distributions", string(code_expr(normal_kernel)))
 
 docs_example = (;
@@ -77,8 +56,6 @@ docs_example = (;
     kernel = normal_kernel,
     output,
     reference,
-    gradient,
-    reference_gradient,
     allocated_bytes,
     reference_allocated_bytes,
     inferred_return,
@@ -87,26 +64,18 @@ docs_example = (;
 
 const DISCRETE_SOURCE = raw"""
 using Distributions
-using DifferentiationInterface
-import Enzyme
 using LogExpFunctions
 using BenchmarkTools
 
-# Native Bernoulli-logit log density. The family fragment computes the two
-# outcome log-probabilities in a numerically stable closed form; the
-# observation fragment selects the observed one. Differentiation is only with
-# respect to the continuous logit.
-@kernel bernoulli_family(logit::Float64) = begin
-    log_p1::Float64 = -log1pexp(-logit)
-    log_p0::Float64 = -log1pexp(logit)
+# Native Bernoulli-logit log density as one have→want recipe. The observed
+# outcome selects between the two numerically stable log-probabilities
+# -log1pexp(∓logit) in closed form; no separate family/observation fragments
+# and nothing to compose.
+@kernel bernoulli_logit_logpdf(observed::Bool, logit::Float64) = begin
+    logdensity::Float64 = observed ? -log1pexp(-logit) : -log1pexp(logit)
 end
 
-@kernel bernoulli_observation(observed::Bool, log_p1::Float64,
-                              log_p0::Float64) = begin
-    logdensity::Float64 = observed ? log_p1 : log_p0
-end
-
-bernoulli_kernel = prepare(compose(bernoulli_family, bernoulli_observation);
+bernoulli_kernel = prepare(bernoulli_logit_logpdf;
     have = (:observed, :logit),
     want = :logdensity,
 )
@@ -119,20 +88,6 @@ bernoulli_reference(observed, logit) =
     logpdf(Bernoulli(logistic(logit)), observed)
 reference = bernoulli_reference(Tuple(inputs)...)
 
-# Plain native form for the AD-preservation check.
-bernoulli_logit_logpdf(observed, logit) =
-    observed ? -log1pexp(-logit) : -log1pexp(logit)
-
-backend = AutoEnzyme(; mode = Enzyme.Reverse)
-gradient = DifferentiationInterface.gradient(
-    v -> bernoulli_kernel(inputs.observed, v[1]),
-    backend, [inputs.logit],
-)
-reference_gradient = DifferentiationInterface.gradient(
-    v -> bernoulli_logit_logpdf(inputs.observed, v[1]),
-    backend, [inputs.logit],
-)
-
 allocation_bytes(f, a, b) = @ballocated $f($a, $b)
 allocated_bytes = allocation_bytes(bernoulli_kernel, Tuple(inputs)...)
 reference_allocated_bytes = allocation_bytes(
@@ -143,7 +98,6 @@ inferred_return = only(Base.return_types(
 ))
 
 @assert output ≈ reference
-@assert gradient ≈ reference_gradient
 @assert !occursin("Distributions", string(code_expr(bernoulli_kernel)))
 
 docs_example = (;
@@ -153,8 +107,6 @@ docs_example = (;
     kernel = bernoulli_kernel,
     output,
     reference,
-    gradient,
-    reference_gradient,
     allocated_bytes,
     reference_allocated_bytes,
     inferred_return,
@@ -163,8 +115,6 @@ docs_example = (;
 
 const MULTIVARIATE_SOURCE = raw"""
 using Distributions
-using DifferentiationInterface
-import Enzyme
 using LinearAlgebra
 using BenchmarkTools
 
@@ -200,6 +150,10 @@ end
     logdensity::Float64 = prior_logdensity + likelihood_logdensity
 end
 
+# This is where `compose` earns its place: three separately-authored recipes
+# share the same `coefficients` port, and `compose` unifies that port so the
+# planner sees one parameter feeding both the prior and the likelihood. (The
+# scalar examples above need no `compose` — each is a single recipe.)
 regression_kernel = prepare(
     compose(coefficient_prior, regression_likelihood, joint_density);
     have = (:coefficients, :prior_scale, :design, :observations, :noise_scale),
@@ -231,28 +185,6 @@ function reference_density(
 end
 reference = reference_density(Tuple(inputs)...)
 
-# Plain native total log density for the AD-preservation check.
-native_total(coefficients, prior_scale, design, observations, noise_scale) =
-    isotropic_normal_logpdf(coefficients, zero(coefficients), prior_scale) +
-    isotropic_normal_logpdf(observations, design * coefficients, noise_scale)
-
-# Differentiate only with respect to the shared coefficients; the design,
-# observations, and scales are held constant with `Constant`, which is the
-# idiomatic DifferentiationInterface way to keep them out of the active set.
-backend = AutoEnzyme(; mode = Enzyme.Reverse)
-gradient = DifferentiationInterface.gradient(
-    (c, ps, d, o, ns) -> last(regression_kernel(c, ps, d, o, ns)),
-    backend, inputs.coefficients,
-    Constant(inputs.prior_scale), Constant(inputs.design),
-    Constant(inputs.observations), Constant(inputs.noise_scale),
-)
-reference_gradient = DifferentiationInterface.gradient(
-    (c, ps, d, o, ns) -> native_total(c, ps, d, o, ns),
-    backend, inputs.coefficients,
-    Constant(inputs.prior_scale), Constant(inputs.design),
-    Constant(inputs.observations), Constant(inputs.noise_scale),
-)
-
 allocation_bytes(f, a, b, c, d, e) = @ballocated $f($a, $b, $c, $d, $e)
 allocated_bytes = allocation_bytes(regression_kernel, Tuple(inputs)...)
 reference_allocated_bytes = allocation_bytes(reference_density, Tuple(inputs)...)
@@ -261,7 +193,6 @@ inferred_return = only(Base.return_types(
 ))
 
 @assert all(output .≈ reference)
-@assert gradient ≈ reference_gradient
 @assert allocated_bytes < reference_allocated_bytes
 @assert !occursin("Distributions", string(code_expr(regression_kernel)))
 
@@ -272,8 +203,6 @@ docs_example = (;
     kernel = regression_kernel,
     output,
     reference,
-    gradient,
-    reference_gradient,
     allocated_bytes,
     reference_allocated_bytes,
     inferred_return,
@@ -300,8 +229,6 @@ function run(io::IO = stdout)
         println(io, artifact.name)
         println(io, "  output: ", artifact.output)
         println(io, "  reference: ", artifact.reference)
-        println(io, "  gradient: ", artifact.gradient)
-        println(io, "  reference gradient: ", artifact.reference_gradient)
         println(io, "  allocated bytes: ", artifact.allocated_bytes)
         println(io, "  oracle allocated bytes: ",
                 artifact.reference_allocated_bytes)

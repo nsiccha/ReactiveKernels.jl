@@ -9,13 +9,31 @@ using ReactiveKernels: code_expr
 
     @testset "sources build native recipes checked against a Distributions oracle" begin
         @test length(artifacts) == 3
-        # Every source composes @kernel recipes and differentiates through
-        # DifferentiationInterface with the Enzyme backend.
+        # Every source declares @kernel recipes. ReactiveKernels plans and
+        # computes the density; it does not differentiate, so these examples
+        # carry no AD/gradient machinery.
         @test all(source -> occursin(r"@kernel \w+\(", source), all_sources())
-        @test all(source -> occursin("compose(", source), all_sources())
-        @test all(source -> occursin("AutoEnzyme", source), all_sources())
-        @test all(source -> occursin("DifferentiationInterface.gradient", source),
+        @test all(source -> !occursin("AutoEnzyme", source), all_sources())
+        @test all(source -> !occursin("DifferentiationInterface", source),
                   all_sources())
+        # `compose` earns its place ONLY where a shared port must be unified:
+        # the multivariate source. The scalar densities are single recipes, so
+        # they must NOT shoehorn a compose call in for decoration.
+        continuous, discrete, multivariate = all_sources()
+        @test occursin("compose(", multivariate)
+        @test !occursin("compose(", continuous)
+        @test !occursin("compose(", discrete)
+        # Regression guard against the exp-then-log round trip: with logσ in
+        # HAND the density uses it directly (the -logσ term), never rebuilds σ
+        # via exp only to take log(σ) again. Scan code only — drop `#` comments
+        # so prose mentioning the anti-pattern doesn't trip the guard.
+        code_only(src) = join(
+            (first(split(line, "#")) for line in eachsplit(src, "\n")), "\n",
+        )
+        continuous_code = code_only(continuous)
+        @test occursin("- logσ", continuous_code)
+        @test !occursin("log(σ)", continuous_code)
+        @test !occursin("log(exp", continuous_code)
         # The compute path is Distributions.jl-free: the generated straight-line
         # kernel references no distribution library.
         @test all(artifacts) do artifact
@@ -27,9 +45,6 @@ using ReactiveKernels: code_expr
                 all(isapprox.(artifact.output, artifact.reference)) :
                 isapprox(artifact.output, artifact.reference)
         end
-        # Preparation preserves reverse-mode AD (kernel vs plain native fn).
-        @test all(artifact -> artifact.gradient ≈ artifact.reference_gradient,
-                  artifacts)
     end
 
     @testset "native path allocates no more than the Distributions oracle" begin
