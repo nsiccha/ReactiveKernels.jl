@@ -84,15 +84,24 @@ struct _KernelMethod
     name::Symbol
     form::Symbol             # :short | :long
     self::Symbol             # the explicit first formal (no __self__ magic)
-    argnames::Tuple{Vararg{Symbol}}   # immutable
+    argnames::Tuple{Vararg{Symbol}}   # immutable — SCALAR (non-splat) formal names
+    vararg::Union{Symbol,Nothing}       # positional slurp `xs...` name, or nothing
+    kwargs_splat::Union{Symbol,Nothing} # keyword slurp `; kwargs...` name, or nothing
     signature::Any           # the FULL AUTHORED signature AST (where binders +
-                             #   constraints + return `::` annotation preserved)
-    call::Any                # the peeled `:call` (name + formals) used for extraction
+                             #   constraints + return `::` annotation + splats preserved)
+    call::Any                # the peeled `:call` (name + formals, splats retained
+                             #   verbatim for forwarding) used for extraction
     body::Any                # the raw method-body AST (handed to poc's emission)
 end
 
+# A vararg/kwargs SLURP formal (`xs...` positionally, `; kwargs...` in a keyword
+# `:parameters` block) is `Expr(:..., inner)`. It is a bound name but NOT a scalar
+# value, so callers record it separately from ordinary argnames.
+_kernel_is_splat(a) = a isa Expr && a.head === :...
+
 _kernel_arg_name(a) =
     a isa Symbol ? a :
+    (a isa Expr && a.head === :...) ? _kernel_arg_name(a.args[1]) :
     (a isa Expr && a.head === :(::) && a.args[1] isa Symbol) ? a.args[1] :
     (a isa Expr && a.head === :kw && a.args[1] isa Symbol) ? a.args[1] :
     (a isa Expr && a.head === :kw && a.args[1] isa Expr &&
@@ -119,23 +128,55 @@ function _kernel_extract_method(stmt, form)
     isempty(positionals) && throw(ArgumentError(
         "stateful @kernel method :$name needs an explicit `self` first positional " *
         "formal (explicit self is required — no hidden __self__)"))
+    # Self is the first POSITIONAL and must be an ordinary formal — never a slurp
+    # (`self...` is nonsensical, and its inner name would otherwise be mis-read as
+    # self by the recursive `_kernel_arg_name`).
+    _kernel_is_splat(positionals[1]) && throw(ArgumentError(
+        "stateful @kernel method :$name self formal cannot be a vararg splat " *
+        "$(repr(positionals[1]))"))
     self = _kernel_arg_name(positionals[1])
     self isa Symbol || throw(ArgumentError(
         "stateful @kernel method :$name has an unsupported self formal $(repr(positionals[1]))"))
+    # Ordinary (scalar) formal names go into `argnames`. A positional `xs...` slurp
+    # and a keyword `; kwargs...` slurp are each recorded SEPARATELY: their names are
+    # bindings, not scalar values, so a consumer that iterates `argnames` never
+    # mistakes a slurp for a single argument — while the raw `signature`/`call`
+    # retain the splat AST verbatim for forwarding.
     argnames = Symbol[]
+    vararg = nothing
     for a in positionals[2:end]
-        n = _kernel_arg_name(a)
-        n === nothing && throw(ArgumentError(
-            "stateful @kernel method :$name has an unsupported argument $(repr(a))"))
-        push!(argnames, n)
+        if _kernel_is_splat(a)
+            vararg === nothing || throw(ArgumentError(
+                "stateful @kernel method :$name has more than one positional vararg"))
+            n = _kernel_arg_name(a)
+            n isa Symbol || throw(ArgumentError(
+                "stateful @kernel method :$name has an unsupported positional vararg $(repr(a))"))
+            vararg = n
+        else
+            n = _kernel_arg_name(a)
+            n === nothing && throw(ArgumentError(
+                "stateful @kernel method :$name has an unsupported argument $(repr(a))"))
+            push!(argnames, n)
+        end
     end
+    kwargs_splat = nothing
     for a in kwparams
-        n = _kernel_arg_name(a)
-        n === nothing && throw(ArgumentError(
-            "stateful @kernel method :$name has an unsupported keyword $(repr(a))"))
-        push!(argnames, n)
+        if _kernel_is_splat(a)
+            kwargs_splat === nothing || throw(ArgumentError(
+                "stateful @kernel method :$name has more than one keyword splat"))
+            n = _kernel_arg_name(a)
+            n isa Symbol || throw(ArgumentError(
+                "stateful @kernel method :$name has an unsupported keyword splat $(repr(a))"))
+            kwargs_splat = n
+        else
+            n = _kernel_arg_name(a)
+            n === nothing && throw(ArgumentError(
+                "stateful @kernel method :$name has an unsupported keyword $(repr(a))"))
+            push!(argnames, n)
+        end
     end
-    _KernelMethod(name, form, self, Tuple(argnames), raw_sig, call, body)
+    _KernelMethod(name, form, self, Tuple(argnames), vararg, kwargs_splat,
+                  raw_sig, call, body)
 end
 
 # --- (3) FROZEN, detached child-capture snapshot ----------------------------
@@ -225,7 +266,8 @@ end
 
 # Route a method-bearing `@kernel` here. Increment-1 SKELETON: split the body into
 # recipe statements vs method definitions, extract the methods (short/long,
-# explicit self, kwargs-before-self), and expand the recipe portion through the
+# explicit self, keyword params before self, positional `xs...` + keyword
+# `; kwargs...` splats), and expand the recipe portion through the
 # EXISTING stateless machinery (`_kernel_expand`, the shared parser/adapter — RK
 # gate 2). It does NOT yet build a factory/schedule; it returns the substrate so
 # later increments (and poc's MethodIR) can attach by Token.
@@ -258,6 +300,7 @@ function _kernel_stateful_expand(name, signature_inputs, call_signature, block,
     # The AST fields are embedded as values (immutable, inspectable).
     method_meta = Tuple(
         (; name = m.name, form = m.form, self = m.self, argnames = m.argnames,
+           vararg = m.vararg, kwargs_splat = m.kwargs_splat,
            signature = m.signature, call = m.call, body = m.body)
         for m in methods)
 

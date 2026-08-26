@@ -36,6 +36,22 @@ end
     end
 end
 
+# Keyword `; kwargs...` splat (the ReactiveHMC fidelity signature), a positional
+# `xs...` vararg, and a mixed named-kwarg + keyword-splat block. Bodies are raw AST
+# (Increment 1 does not lower them), so the annotations/names need not resolve.
+@kernel StatefulSplatFixture(a) = begin
+    r = a
+    step!(self, x::AbstractMatrix; kwargs...) = begin
+        self.r = x
+    end
+    scan!(self, xs...) = begin
+        self.r = xs
+    end
+    tune!(self, y; target = 0.8, opts...) = begin
+        self.r = y + target
+    end
+end
+
 @kernel StatefulOneFixture(a) = begin
     r = a
     m!(self) = begin
@@ -119,6 +135,62 @@ end
         @test n.call.head === :call
         @test string(n.call) == string(:(n!(self)))        # peeled call drops ::Nothing
         @test (n.name, n.self, n.argnames) == (:n!, :self, ())
+    end
+
+    @testset "kwargs-splat + positional-vararg extraction (forwarding-ready)" begin
+        ms = RKS.kernel_methods(StatefulSplatFixture)
+        @test length(ms) == 3
+
+        # step!(self, x::AbstractMatrix; kwargs...) — the ReactiveHMC fidelity sig:
+        # explicit self found through the `:parameters` block; x is the one scalar
+        # arg; `kwargs` is stored as the keyword splat, NOT as an argname.
+        s = ms[1]
+        @test (s.name, s.form, s.self, s.argnames) == (:step!, :short, :self, (:x,))
+        @test s.vararg === nothing
+        @test s.kwargs_splat === :kwargs
+        # forwarding AST preserved verbatim — the raw signature + peeled call both
+        # still carry `; kwargs...` (and the typed positional), so lowering can
+        # forward the splat to the reference source.
+        @test occursin("kwargs...", string(s.signature))
+        @test occursin("kwargs...", string(s.call))
+        @test occursin("AbstractMatrix", string(s.signature))
+
+        # scan!(self, xs...) — positional vararg recorded in `vararg`, not argnames.
+        v = ms[2]
+        @test (v.name, v.self, v.argnames) == (:scan!, :self, ())
+        @test v.vararg === :xs
+        @test v.kwargs_splat === nothing
+        @test occursin("xs...", string(v.call))
+
+        # tune!(self, y; target = 0.8, opts...) — named kwarg stays in argnames,
+        # the trailing `opts...` is the keyword splat.
+        t = ms[3]
+        @test (t.name, t.self, t.argnames) == (:tune!, :self, (:y, :target))
+        @test t.vararg === nothing
+        @test t.kwargs_splat === :opts
+        @test occursin("opts...", string(t.signature))
+
+        # the exposed metadata carries the new immutable splat slots
+        @test all(m -> hasproperty(m, :vararg) && hasproperty(m, :kwargs_splat), ms)
+    end
+
+    @testset "splat storage + self-splat rejection (direct extraction)" begin
+        m = RKS._kernel_extract_method(
+            :(step!(self, x::AbstractMatrix; kwargs...) = self.r = x), :short)
+        @test (m.name, m.self, m.argnames, m.vararg, m.kwargs_splat) ==
+              (:step!, :self, (:x,), nothing, :kwargs)
+        # both slots are Union{Symbol,Nothing} — immutable metadata
+        @test m.kwargs_splat isa Symbol && m.vararg === nothing
+
+        # a plain method (no splats) reports `nothing` for BOTH new slots — the
+        # additive fields don't perturb the existing extraction contract.
+        n = RKS._kernel_extract_method(:(m!(self, x; k = 1) = self.r), :short)
+        @test n.vararg === nothing && n.kwargs_splat === nothing
+        @test n.argnames == (:x, :k)
+
+        # self itself may not be a vararg splat
+        @test_throws ArgumentError RKS._kernel_extract_method(
+            :(bad!(self...) = 1), :short)
     end
 
     @testset "(4) short/long detection on the plain fixture" begin
