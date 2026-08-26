@@ -90,6 +90,65 @@ function setup_eight_schools!(mod::Module)
     nothing
 end
 
+function setup_linear_regression!(mod::Module)
+    if !isdefined(mod, :LinearRegressionExample)
+        Base.include(mod, joinpath(@__DIR__, "..", "examples", "linear_regression.jl"))
+    end
+    Core.eval(mod, :(using .LinearRegressionExample:
+        LinearRegressionParameters, LinearPrediction,
+        DataVector, UnconstrainedParameters,
+        LINREG_X, LINREG_Y))
+    nothing
+end
+
+function setup_beta_binomial!(mod::Module)
+    if !isdefined(mod, :BetaBinomialExample)
+        Base.include(mod, joinpath(@__DIR__, "..", "examples", "beta_binomial.jl"))
+    end
+    Core.eval(mod, :(using .BetaBinomialExample:
+        BetaBinomialParameters, CountVector,
+        BETA_BINOMIAL_TRIALS, BETA_BINOMIAL_SUCCESSES))
+    nothing
+end
+
+function setup_poisson_gamma!(mod::Module)
+    if !isdefined(mod, :PoissonGammaExample)
+        Base.include(mod, joinpath(@__DIR__, "..", "examples", "poisson_gamma.jl"))
+    end
+    Core.eval(mod, :(using .PoissonGammaExample:
+        PoissonGammaParameters, CountVector, POISSON_COUNTS))
+    nothing
+end
+
+function setup_dugongs!(mod::Module)
+    if !isdefined(mod, :DugongsGrowthExample)
+        Base.include(mod, joinpath(@__DIR__, "..", "examples", "dugongs_growth.jl"))
+    end
+    Core.eval(mod, :(using .DugongsGrowthExample:
+        DugongsParameters, UnconstrainedParameters, RealVector,
+        DUGONGS_AGE, DUGONGS_LENGTH))
+    nothing
+end
+
+function setup_arma11!(mod::Module)
+    if !isdefined(mod, :ARMA11Example)
+        Base.include(mod, joinpath(@__DIR__, "..", "examples", "arma11.jl"))
+    end
+    Core.eval(mod, :(using .ARMA11Example:
+        ARMAParameters, UnconstrainedParameters, RealVector, ARMA_SERIES))
+    nothing
+end
+
+function setup_gaussian_mixture!(mod::Module)
+    if !isdefined(mod, :GaussianMixtureExample)
+        Base.include(mod, joinpath(@__DIR__, "..", "examples", "gaussian_mixture.jl"))
+    end
+    Core.eval(mod, :(using .GaussianMixtureExample:
+        MixtureParameters, UnconstrainedParameters, RealVector,
+        MIXTURE_OBSERVATIONS))
+    nothing
+end
+
 function setup_online_stats!(mod::Module)
     if !isdefined(mod, :OnlineStatsExample)
         Base.include(mod, joinpath(@__DIR__, "..", "examples", "online_stats.jl"))

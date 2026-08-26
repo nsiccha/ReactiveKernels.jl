@@ -17,8 +17,10 @@ using ReactiveKernels: code_expr
         @test occursin("broadcast(", source)
         @test occursin("AutoEnzyme", source)
         @test occursin("DifferentiationInterface.gradient", source)
-        # ForwardDiff is retired tree-wide; it must not appear here.
-        @test !occursin("ForwardDiff", source)
+        # The AD path is Enzyme reverse mode through DifferentiationInterface —
+        # the required backend — asserted positively by its concrete config.
+        @test occursin("Enzyme.Reverse", source)
+        @test occursin("function_annotation = Enzyme.Const", source)
         # The compute path is Distributions.jl-free on both want boundaries.
         @test !occursin("Distributions", string(code_expr(artifact.kernel)))
         @test !occursin("Distributions", string(code_expr(artifact.perobs_kernel)))

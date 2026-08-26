@@ -1,0 +1,153 @@
+# Declarative PPL kernel: linear regression
+
+`ReactiveKernels` has no built-in probabilistic-programming semantics. Like the
+[eight-schools example](eight-schools.md), this one assembles those semantics
+manually from ordinary pure Julia recipes, while leaving the graph planner
+responsible only for selecting the computation required by a particular
+`have`/`want` query.
+
+The complete runnable source is
+[`examples/linear_regression.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/linear_regression.jl).
+It implements a simple Gaussian regression
+
+```math
+\begin{aligned}
+\alpha &\sim \operatorname{Normal}(0, 10), \\
+\beta &\sim \operatorname{Normal}(0, 10), \\
+\sigma &\sim \operatorname{HalfNormal}(5), \\
+y_i &\sim \operatorname{Normal}(\alpha + \beta x_i, \sigma).
+\end{aligned}
+```
+
+The unconstrained vector is `(α, β, log_σ)`. Only `σ` needs a support transform,
+so `σ = exp(log_σ)` and the optional log absolute Jacobian determinant is
+`log_σ`.
+
+```text
+unconstrained
+  ├─ split ──► α, β, log_σ ──► σ = exp(log_σ) ──► constrained parameters
+  │                                   │
+  │                                   ├─► log prior
+  │                                   ├─► pointwise log likelihood ─► log likelihood
+  │                                   └─► new-observation prediction
+  └─ log_σ ──► log Jacobian
+
+log prior + log Jacobian + log likelihood ──► unconstrained log density
+```
+
+The important part is that these remain separate named ports. The compact block
+below is the authored model, executed verbatim while the documentation is built.
+Pointwise terms are a first-class port, so returning them together with the
+scalar density shares the likelihood computation rather than repeating it.
+
+The panel below is one coherent, build-executed artifact. **Raw input** is the
+exact source that builds and runs the query, **Generated kernel** is
+`code_expr(density_kernel)` from that execution, and **Compute DAG** is the live
+colored `visualize(density_plan)` component.
+
+```@eval
+Main.ReactiveKernelsDocs.execute_example(@__MODULE__, raw"""
+@kernel model(unconstrained::UnconstrainedParameters,
+              predictors::DataVector,
+              responses::DataVector,
+              new_predictor::Real,
+              prediction_innovation::Real) = begin
+    (α::Real, β::Real, log_σ::Real) =
+        LinearRegressionExample.split_unconstrained(unconstrained)
+    σ::Real = LinearRegressionExample.positive_scale(log_σ)
+    parameters::LinearRegressionParameters =
+        LinearRegressionExample.assemble_parameters(α, β, σ)
+    log_jacobian::Real =
+        LinearRegressionExample.log_abs_det_jacobian(log_σ)
+
+    prior::Real = LinearRegressionExample.log_prior(parameters)
+    pointwise::DataVector = LinearRegressionExample.pointwise_log_likelihood(
+        parameters, predictors, responses,
+    )
+    likelihood::Real = LinearRegressionExample.sum_log_likelihood(pointwise)
+    density::Real = LinearRegressionExample.total_log_density(
+        prior, log_jacobian, likelihood,
+    )
+    prediction::LinearPrediction = LinearRegressionExample.predict_new(
+        parameters, new_predictor, prediction_innovation,
+    )
+    return density
+end
+
+q = (1.0, 2.0, log(0.5))
+predictors = LINREG_X
+responses = LINREG_Y
+
+density_kernel = prepare(model;
+    have = (:unconstrained, :predictors, :responses),
+    want = (:prior, :log_jacobian, :pointwise, :likelihood, :density))
+
+output = density_kernel(q, predictors, responses)
+prior, logjac, pointwise, likelihood, density = output
+@assert likelihood ≈ sum(pointwise)
+@assert density ≈ prior + logjac + likelihood
+
+docs_example = (;
+    name = :linear_regression_density,
+    origin = "compact @kernel model (build executed)",
+    inputs = (; q, predictors, responses),
+    kernel = density_kernel,
+    output,
+)
+"""; setup = Main.ReactiveKernelsDocs.setup_linear_regression!)
+```
+
+Asking only for constrained parameters selects just the split, positive-scale,
+and assembly recipes; the Jacobian and every density recipe disappear:
+
+```julia
+constrain_kernel = prepare(model;
+    have = :unconstrained,
+    want = :parameters)
+parameters = constrain_kernel(q)
+```
+
+The numeric graph ports are typed at a `Real` boundary, while constrained
+parameters and predictions retain their concrete scalar type. The prepared
+kernel therefore specializes on ordinary `Float64` inputs and also
+differentiates cleanly through reverse-mode AD (`DifferentiationInterface` with
+the Enzyme backend):
+
+```julia
+using DifferentiationInterface
+import Enzyme
+
+enzyme_backend = AutoEnzyme(;
+    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
+    function_annotation = Enzyme.Const,
+)
+
+density_only = prepare(model;
+    have = (:unconstrained, :predictors, :responses),
+    want = :density)
+logdensity(qv) = density_only(Tuple(qv), predictors, responses)
+gradient = DifferentiationInterface.gradient(logdensity, enzyme_backend, collect(q))
+```
+
+Generated quantities can start at an already-constrained boundary. In this
+query, planning removes the unconstrained transform, Jacobian, prior,
+likelihood reduction, and total-density recipes:
+
+```julia
+generated_kernel = prepare(model;
+    have = (:parameters, :new_predictor, :prediction_innovation),
+    want = :prediction)
+
+prediction = generated_kernel(parameters, 3.0, -1.0)
+```
+
+Prediction takes a standard-normal innovation as an input rather than drawing a
+random number inside a recipe. That preserves the graph's purity: a caller can
+draw a fresh innovation, replay a fixed one, or batch them using the same
+prepared kernel without hiding an effect from the planner.
+
+Run the walkthrough from the repository root:
+
+```sh
+julia --project=. examples/linear_regression.jl
+```
