@@ -75,11 +75,17 @@ module _ArtifactSandbox end
     @testset "coverage gate is NON-VACUOUS (fails on tampering)" begin
         # A missing program is rejected.
         @test_throws ErrorException RKD.assert_program_coverage(arts[1:4], RKD._FIVE_PROGRAM_INVENTORY)
-        # A diverged inventory (drop one required derived getter) is rejected.
-        tampered = Dict(RKD._FIVE_PROGRAM_INVENTORY)
+        # A diverged handle census (drop one required derived getter) is rejected.
         base = RKD._FIVE_PROGRAM_INVENTORY[:nuts_group]
-        tampered[:nuts_group] = (derived = Base.setdiff(base.derived, (:dham,)),
-                                 sources = base.sources)
-        @test_throws ErrorException RKD.assert_program_coverage(arts, tampered)
+        dropped = Dict(RKD._FIVE_PROGRAM_INVENTORY)
+        dropped[:nuts_group] = (derived = Base.setdiff(base.derived, (:dham,)),
+                                sources = base.sources, recipe_count = base.recipe_count)
+        @test_throws ErrorException RKD.assert_program_coverage(arts, dropped)
+        # A diverged recipe_count (an added/removed INTERMEDIATE recipe) is rejected
+        # even though the exposed handle census is unchanged.
+        miscounted = Dict(RKD._FIVE_PROGRAM_INVENTORY)
+        miscounted[:nuts_group] = (derived = base.derived, sources = base.sources,
+                                   recipe_count = base.recipe_count + 1)
+        @test_throws ErrorException RKD.assert_program_coverage(arts, miscounted)
     end
 end

@@ -287,11 +287,16 @@ function assert_program_coverage(artifacts, expected)
             "$(a.name) recorded output diverges from the live getter value",
         )
         want = expected[a.name]
+        # Compare the exposed source/derived handle census AND the total plan recipe
+        # count, so an added/removed INTERMEDIATE recipe (one not exposed as a handle)
+        # is also caught — otherwise "missing OR extra recipes fail" would overclaim.
         (sort(collect(want.derived)) == a.inventory.derived &&
-         sort(collect(want.sources)) == a.inventory.sources) || error(
+         sort(collect(want.sources)) == a.inventory.sources &&
+         want.recipe_count == a.inventory.recipe_count) || error(
             "$(a.name) recipe inventory diverged from the declared coverage:\n" *
             "  derived: got $(a.inventory.derived)\n           want $(sort(collect(want.derived)))\n" *
-            "  sources: got $(a.inventory.sources)\n           want $(sort(collect(want.sources)))",
+            "  sources: got $(a.inventory.sources)\n           want $(sort(collect(want.sources)))\n" *
+            "  recipe_count: got $(a.inventory.recipe_count) want $(want.recipe_count)",
         )
     end
     artifacts
@@ -406,20 +411,24 @@ const _FIVE_PROGRAM_INVENTORY = Dict(
         sources = (:acceptance_sum, :bwd_mom, :bwd_pos, :depth, :fwd_mom, :fwd_pos,
                    :gofwd, :init_mom, :init_pos, :last_diverged, :last_energy_error,
                    :may_continue, :may_sample, :metric, :min_dham, :n_steps,
-                   :potential_gradient!)),
+                   :potential_gradient!),
+        recipe_count = 25),
     :dual_averaging => (
         derived = (:current, :final, :log_current),
         sources = (:center, :error, :iteration, :log_final, :offset,
-                   :regularization_scale, :relaxation_exponent, :target)),
-    :welford_variance => (derived = (), sources = (:mean, :n, :var)),
+                   :regularization_scale, :relaxation_exponent, :target),
+        recipe_count = 3),
+    :welford_variance => (derived = (), sources = (:mean, :n, :var), recipe_count = 0),
     :trajectory_stats => (
         derived = (),
         sources = (:count, :dhams, :dim, :first, :gradient_storage, :idxs,
-                   :position_storage, :pots)),
+                   :position_storage, :pots),
+        recipe_count = 0),
     :sampling_stats => (
         derived = (),
         sources = (:acc_rate, :diverged, :draws, :full_history, :full_idxs,
-                   :n_steps, :stepsizes, :trajectory)),
+                   :n_steps, :stepsizes, :trajectory),
+        recipe_count = 0),
 )
 
 """
