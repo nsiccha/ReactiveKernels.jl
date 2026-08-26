@@ -161,6 +161,11 @@ end
                        sprint(showerror, err))
     end
 
+    @testset "definition module is exposed for hygienic op GlobalRefs" begin
+        @test RKS.kernel_module(StatefulOneFixture) === @__MODULE__
+        @test RKS.kernel_module(StatefulObjFixture) isa Module
+    end
+
     @testset "(2) unique per-definition Token + object/view skeletons" begin
         @test RKS.kernel_token(StatefulOneFixture) !== RKS.kernel_token(StatefulTwoFixture)
         tok = RKS.kernel_token(StatefulOneFixture)

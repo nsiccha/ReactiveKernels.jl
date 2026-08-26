@@ -203,16 +203,18 @@ _kernel_snapshot_port_names(snap::_ChildSnapshot) = snap.port_order
 # an inspectable skeleton so tests can assert the discrimination/detection/Token.
 struct _StatefulKernelSkeleton{Token,S,M}
     name::Symbol
+    mod::Module              # the DEFINITION module (for hygienic op GlobalRefs)
     spec::S
     methods::M
 end
 # `Token` is a phantom type parameter — the unique definition token, a per-expansion
 # gensym Symbol carried as `Val{Token}` (unique, typed overload identity, no minted
 # struct / no world-age hazard / no mutable registry). Supplied explicitly.
-_StatefulKernelSkeleton(name::Symbol, ::Val{Token}, spec::S, methods::M) where {Token,S,M} =
-    _StatefulKernelSkeleton{Token,S,M}(name, spec, methods)
+_StatefulKernelSkeleton(name::Symbol, ::Val{Token}, mod::Module, spec::S, methods::M) where {Token,S,M} =
+    _StatefulKernelSkeleton{Token,S,M}(name, mod, spec, methods)
 
 kernel_token(skel::_StatefulKernelSkeleton{Token}) where {Token} = Token
+kernel_module(skel::_StatefulKernelSkeleton) = getfield(skel, :mod)
 kernel_spec(skel::_StatefulKernelSkeleton) = getfield(skel, :spec)
 kernel_methods(skel::_StatefulKernelSkeleton) = getfield(skel, :methods)
 
@@ -266,6 +268,6 @@ function _kernel_stateful_expand(name, signature_inputs, call_signature, block,
     # token is a per-expansion gensym Symbol carried as `Val(token_sym)`.
     Expr(:const, Expr(:(=), esc(name),
         Expr(:call, _StatefulKernelSkeleton, QuoteNode(name),
-             Expr(:call, Val, QuoteNode(token_sym)),
+             Expr(:call, Val, QuoteNode(token_sym)), __module__,
              esc(spec_expr), method_meta)))
 end
