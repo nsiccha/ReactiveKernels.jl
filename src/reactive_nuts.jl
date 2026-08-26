@@ -339,8 +339,18 @@ end
 Build the compiled-reactive multinomial NUTS transition from a flat phase-point
 group produced by [`reactive_nuts_group`](@ref). Same public surface as the
 [`NUTSState`](@ref) oracle — [`step!`](@ref), [`sample!`](@ref),
-[`refresh_momentum!`](@ref), [`diagnostics`](@ref) — with the sampler state living
-in one compiled `ReactiveProgram`.
+[`refresh_momentum!`](@ref), [`diagnostics`](@ref).
+
+Boundary (honest): the per-transition Hamiltonian work — each endpoint's
+potential/gradient/kinetic/velocity, the active-endpoint selection, the energy
+error `dham`, and the `diverged` flag — is compiled reactive state in the group's
+`ReactiveProgram` ([`reactive_program`](@ref)). The tree-growth recursion, U-turn
+criteria, RNG draws, and proposal swaps are ordinary Julia (as in ca9). This
+struct's own control/diagnostic fields (`go_forward`, `energy_error`, `depth`, …)
+and the trees/proposals are ordinary mutable state, NOT reactive nodes — the
+sampler is not yet a single compiled `ReactiveProgram`. Compiling the remaining
+adaptation/statistics fields and authoring the group through the public
+`@reactive` surface are tracked as follow-up work.
 """
 const _REACTIVE_NUTS_REQUIRED_HANDLES = (
     :gofwd, :chol_metric, :dham, :diverged, :active_ham,
