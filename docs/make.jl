@@ -30,7 +30,6 @@ makedocs(
         ],
         "Sampling" => [
             "NUTS sampling" => "nuts.md",
-            "Fused NUTS authoring" => "nuts-architecture.md",
             "Online statistics" => "online-stats.md",
         ],
         "Visualization" => "visualization.md",
