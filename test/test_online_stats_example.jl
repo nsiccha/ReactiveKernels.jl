@@ -130,6 +130,95 @@ const OSE = OnlineStatsExample
         @test isfinite(var(left16)) && isfinite(var(right16))
     end
 
+    @testset "HMC transition diagnostics are fixed-size and mergeable" begin
+        empty = OSE.HMCDiagnosticsAccumulator()
+        @test isbitstype(typeof(empty))
+        @test OSE.sample_count(empty) == 0
+        @test empty.n_divergent == 0
+        @test isnan(OSE.divergence_rate(empty))
+        @test isnan(OSE.divergence_percent(empty))
+        @test isnan(OSE.mean_acceptance_rate(empty))
+        @test isnan(OSE.mean_leapfrog_steps(empty))
+        @test isnan(OSE.mean_stepsize(empty))
+
+        @test_throws DomainError OSE.record_transition(empty, -0.1, 3, 0.1, false)
+        @test_throws DomainError OSE.record_transition(empty, 1.1, 3, 0.1, false)
+        @test_throws DomainError OSE.record_transition(empty, NaN, 3, 0.1, false)
+        @test_throws DomainError OSE.record_transition(empty, 0.8, -1, 0.1, false)
+        @test_throws DomainError OSE.record_transition(empty, 0.8, 3, 0.0, false)
+        @test_throws DomainError OSE.record_transition(empty, 0.8, 3, Inf, false)
+        @test_throws ArgumentError OSE.HMCDiagnosticsAccumulator{Float64}(
+            1, OSE.MomentsAccumulator(), OSE.MomentsAccumulator(),
+            OSE.MomentsAccumulator())
+        @test_throws ArgumentError OSE.HMCDiagnosticsAccumulator{Float64}(
+            0, OSE.update(OSE.MomentsAccumulator(), 0.8),
+            OSE.MomentsAccumulator(), OSE.MomentsAccumulator())
+
+        records = [
+            (acc_rate=0.91, n_steps=7,  stepsize=0.25, diverged=false),
+            (acc_rate=0.83, n_steps=15, stepsize=0.20, diverged=true),
+            (acc_rate=0.97, n_steps=5,  stepsize=0.30, diverged=false),
+            (acc_rate=0.76, n_steps=31, stepsize=0.15, diverged=true),
+            (acc_rate=0.88, n_steps=9,  stepsize=0.22, diverged=false),
+            (acc_rate=0.94, n_steps=6,  stepsize=0.28, diverged=false),
+            (acc_rate=0.69, n_steps=63, stepsize=0.10, diverged=true),
+        ]
+        fitted = @inferred OSE.fit_diagnostics(records)
+        @test OSE.sample_count(fitted) == length(records)
+        @test fitted.n_divergent == count(record -> record.diverged, records)
+        @test OSE.divergence_rate(fitted) ≈ mean(record.diverged for record in records)
+        @test OSE.divergence_percent(fitted) ≈
+              100 * mean(record.diverged for record in records)
+        @test OSE.mean_acceptance_rate(fitted) ≈
+              mean(record.acc_rate for record in records)
+        @test OSE.mean_leapfrog_steps(fitted) ≈
+              mean(record.n_steps for record in records)
+        @test OSE.mean_stepsize(fitted) ≈
+              mean(record.stepsize for record in records)
+        @test var(fitted.acceptance_rate) ≈
+              var([record.acc_rate for record in records])
+        @test var(fitted.leapfrog_steps) ≈
+              var([record.n_steps for record in records])
+        @test var(fitted.stepsize) ≈
+              var([record.stepsize for record in records])
+
+        parts = (
+            OSE.fit_diagnostics(@view records[1:1]),
+            OSE.fit_diagnostics(@view records[2:3]),
+            OSE.fit_diagnostics(@view records[4:7]),
+        )
+        @test isequal(merge(empty, parts[1]), parts[1])
+        @test isequal(merge(parts[1], empty), parts[1])
+        merged = reduce(merge, parts)
+        @test merged.n_divergent == fitted.n_divergent
+        @test OSE.sample_count(merged) == OSE.sample_count(fitted)
+        @test OSE.mean_acceptance_rate(merged) ≈ OSE.mean_acceptance_rate(fitted)
+        @test OSE.mean_leapfrog_steps(merged) ≈ OSE.mean_leapfrog_steps(fitted)
+        @test OSE.mean_stepsize(merged) ≈ OSE.mean_stepsize(fitted)
+
+        left_grouped = merge(merge(parts[1], parts[2]), parts[3])
+        right_grouped = merge(parts[1], merge(parts[2], parts[3]))
+        @test left_grouped.n_divergent == right_grouped.n_divergent
+        @test OSE.mean_acceptance_rate(left_grouped) ≈
+              OSE.mean_acceptance_rate(right_grouped)
+        @test OSE.mean_leapfrog_steps(left_grouped) ≈
+              OSE.mean_leapfrog_steps(right_grouped)
+        @test OSE.mean_stepsize(left_grouped) ≈ OSE.mean_stepsize(right_grouped)
+
+        # Count-derived rates must also avoid converting large valid counts
+        # through narrow storage before division.
+        moments16 = OSE.MomentsAccumulator{Float16}(40_000, 0.5, 1.0)
+        narrow_a = OSE.HMCDiagnosticsAccumulator{Float16}(
+            10_000, moments16, moments16, moments16)
+        narrow_b = OSE.HMCDiagnosticsAccumulator{Float16}(
+            20_000, moments16, moments16, moments16)
+        narrow = @inferred merge(narrow_a, narrow_b)
+        @test OSE.sample_count(narrow) == 80_000
+        @test narrow.n_divergent == 30_000
+        @test OSE.divergence_rate(narrow) === Float16(0.375)
+        @test OSE.divergence_percent(narrow) === Float16(37.5)
+    end
+
     @testset "generated state kernels are inferred and allocation-free" begin
         model = OSE.build_online_stats_graph()
         @test model isa KernelSpec
@@ -143,6 +232,13 @@ const OSE = OnlineStatsExample
             have=(:left_partition, :right_partition), want=:merged)
         summary_kernel = prepare(model;
             have=(:state, :observation), want=(:average, :sample_variance))
+        diagnostics_kernel = prepare(model;
+            have=(:diagnostics_state, :acceptance_rate_observation,
+                  :leapfrog_steps_observation, :stepsize_observation,
+                  :diverged_observation),
+            want=(:updated_diagnostics, :diagnostic_divergence_percent,
+                  :diagnostic_mean_acceptance_rate,
+                  :diagnostic_mean_leapfrog_steps, :diagnostic_mean_stepsize))
 
         empty_state = OSE.MomentsAccumulator()
         one_state = @inferred update_kernel(empty_state, 1.0)
@@ -150,6 +246,25 @@ const OSE = OnlineStatsExample
         @test @inferred(merge_kernel(one_state, two_state)) isa
               OSE.MomentsAccumulator{Float64}
         @test @inferred(summary_kernel(one_state, 3.0)) == (2.0, 2.0)
+
+        empty_diagnostics = OSE.HMCDiagnosticsAccumulator()
+        diagnostic_result = @inferred diagnostics_kernel(
+            empty_diagnostics, 0.9, 7, 0.2, false)
+        @test diagnostic_result[1] isa OSE.HMCDiagnosticsAccumulator{Float64}
+        @test diagnostic_result[2:end] == (0.0, 0.9, 7.0, 0.2)
+
+        diagnostics_update_kernel = prepare(model;
+            have=(:diagnostics_state, :acceptance_rate_observation,
+                  :leapfrog_steps_observation, :stepsize_observation,
+                  :diverged_observation),
+            want=:updated_diagnostics)
+        diagnostics_report = OSE.diagnostics_performance_report(
+            diagnostics_update_kernel; iterations=10_000)
+        @test diagnostics_report.allocated_bytes == 0
+        @test diagnostics_report.elapsed_ns > 0
+        @test diagnostics_report.nanoseconds_per_update > 0
+        @test OSE.sample_count(diagnostics_report.result) == 10_000
+        @test diagnostics_report.result.n_divergent == fld(10_000, 31)
 
         report = OSE.kernel_performance_report(update_kernel; iterations=10_000)
         @test report.allocated_bytes == 0
@@ -219,6 +334,9 @@ const OSE = OnlineStatsExample
                     String)
         @test occursin("@kernel updates(", page)
         @test occursin("@kernel partitions(", page)
+        @test occursin("diagnostics = @kernel begin", page)
+        @test occursin("OnlineStatsExample.record_transition", page)
+        @test occursin("name = :hmc_transition_diagnostics", page)
         @test occursin("model = merge(updates, partitions)", page)
         @test occursin("Main.ReactiveKernelsDocs.execute_example", page)
         @test !occursin("include(", page)

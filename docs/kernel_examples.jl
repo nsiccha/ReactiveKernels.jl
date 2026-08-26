@@ -95,7 +95,8 @@ function setup_online_stats!(mod::Module)
         Base.include(mod, joinpath(@__DIR__, "..", "examples", "online_stats.jl"))
     end
     Core.eval(mod, :(using Statistics))
-    Core.eval(mod, :(using .OnlineStatsExample: MomentsAccumulator))
+    Core.eval(mod, :(using .OnlineStatsExample:
+        MomentsAccumulator, HMCDiagnosticsAccumulator))
     nothing
 end
 

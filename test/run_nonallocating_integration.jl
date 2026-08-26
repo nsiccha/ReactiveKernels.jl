@@ -7,7 +7,8 @@ const MUTATING_FUNCTIONS_UUID = UUID("8a4c2d94-4b3b-4f9e-be63-a3c0cd816e3a")
 
 root = normpath(joinpath(@__DIR__, ".."))
 testfiles = [joinpath(@__DIR__, "test_nonallocating.jl"),
-             joinpath(@__DIR__, "test_reactive_nonallocating.jl")]
+             joinpath(@__DIR__, "test_reactive_nonallocating.jl"),
+             joinpath(@__DIR__, "test_batched_nonallocating.jl")]
 
 mktempdir() do env
     Pkg.activate(env)
@@ -16,6 +17,9 @@ mktempdir() do env
     dep = Pkg.dependencies()[MUTATING_FUNCTIONS_UUID]
     dep.git_revision == MUTATING_FUNCTIONS_REV || error(
         "expected MutatingFunctions revision $(MUTATING_FUNCTIONS_REV), got $(dep.git_revision)")
+    # test_batched_nonallocating.jl exercises the reverse-mode gradient path, so
+    # the integration environment also needs the AD and benchmarking stack.
+    Pkg.add(["DifferentiationInterface", "Enzyme", "BenchmarkTools"])
     Pkg.develop(path = root)
     Pkg.instantiate()
 
