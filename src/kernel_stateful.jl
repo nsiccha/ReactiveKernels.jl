@@ -286,8 +286,11 @@ function _kernel_reconstruct(snap::_ChildSnapshot)
     aliases = Dict{Int,Int}(p.first => p.second for p in snap.aliases)
     graph = Graph(values, recipes, producers, aliases, snap.version)
     ports = Dict{Symbol,Value}(p.first => values[p.second] for p in snap.ports)
-    KernelSpec(graph, ports, collect(snap.port_order), collect(snap.have_names),
-               collect(snap.want_names), snap.call_signature)
+    # `collect(Symbol, …)` (not bare `collect`) so an EMPTY boundary rebuilds as a
+    # `Vector{Symbol}`, not a `Vector{Union{}}` — a ports-only Mode-2 spec has no wants.
+    KernelSpec(graph, ports, collect(Symbol, snap.port_order),
+               collect(Symbol, snap.have_names), collect(Symbol, snap.want_names),
+               snap.call_signature)
 end
 
 _kernel_snapshot_recipe_count(snap::_ChildSnapshot) = length(snap.recipes)
@@ -408,24 +411,43 @@ _kernel_thaw_ast(x) = x
 # `KernelSpec`, and the extracted method metadata. Later increments replace this
 # with the specializing factory + typed views + compiled schedules; for now it is
 # an inspectable skeleton so tests can assert the discrimination/detection/Token.
-struct _StatefulKernelSkeleton{Token,S,M,R}
+# Thaw the FRESH/FROZEN method metadata: each stored method meta carries its
+# `signature`/`call`/`body` deeply FROZEN (see `_FrozenExpr`); every `kernel_methods`
+# call rebuilds fresh thawed `Expr`s so a caller can never reach the store or a
+# previous read (mutation isolation), and the AST type/structure round-trips faithfully.
+function _kernel_thaw_method(m::NamedTuple)
+    vals = map(keys(m), Tuple(m)) do k, v
+        (k === :signature || k === :call || k === :body) ? _kernel_thaw_ast(v) : v
+    end
+    NamedTuple{keys(m)}(vals)
+end
+_kernel_thaw_methods(methods) = Tuple(_kernel_thaw_method(m) for m in methods)
+
+struct _StatefulKernelSkeleton{Token,SN,M,R}
     name::Symbol
     mod::Module              # the DEFINITION module (for hygienic op GlobalRefs)
-    spec::S
-    methods::M
+    spec_snapshot::SN        # DETACHED IMMUTABLE owner-spec provenance (a `_ChildSnapshot`);
+                             #   the field/port metadata is captured, never a live mutable spec
+    methods::M               # per-method meta with DEEPLY FROZEN signature/call/body
     recipe_source::R         # frozen, detached recipe-statement source (see _FrozenExpr)
 end
 # `Token` is a phantom type parameter — the unique definition token, a per-expansion
 # gensym Symbol carried as `Val{Token}` (unique, typed overload identity, no minted
 # struct / no world-age hazard / no mutable registry). Supplied explicitly.
-_StatefulKernelSkeleton(name::Symbol, ::Val{Token}, mod::Module, spec::S, methods::M,
-                        recipe_source::R) where {Token,S,M,R} =
-    _StatefulKernelSkeleton{Token,S,M,R}(name, mod, spec, methods, recipe_source)
+_StatefulKernelSkeleton(name::Symbol, ::Val{Token}, mod::Module, spec_snapshot::SN,
+                        methods::M, recipe_source::R) where {Token,SN,M,R} =
+    _StatefulKernelSkeleton{Token,SN,M,R}(name, mod, spec_snapshot, methods, recipe_source)
 
 kernel_token(skel::_StatefulKernelSkeleton{Token}) where {Token} = Token
 kernel_module(skel::_StatefulKernelSkeleton) = getfield(skel, :mod)
-kernel_spec(skel::_StatefulKernelSkeleton) = getfield(skel, :spec)
-kernel_methods(skel::_StatefulKernelSkeleton) = getfield(skel, :methods)
+# FRESH reconstructed planning `KernelSpec` per call from the detached snapshot — never
+# a shared live authority, so mutating a returned spec/graph cannot change a later read.
+kernel_spec(skel::_StatefulKernelSkeleton) = _kernel_reconstruct(getfield(skel, :spec_snapshot))
+# Immutable port metadata surface (the authored field/port names, a Tuple).
+kernel_port_names(skel::_StatefulKernelSkeleton) =
+    _kernel_snapshot_port_names(getfield(skel, :spec_snapshot))
+# FRESH thawed method ASTs each call (mutation isolation).
+kernel_methods(skel::_StatefulKernelSkeleton) = _kernel_thaw_methods(getfield(skel, :methods))
 
 # Thaw a FRESH copy of the captured recipe-statement source (`Expr(:block, …)`), in
 # authored order, with full conditional/index/call structure preserved and definition
@@ -474,13 +496,15 @@ function _kernel_stateful_expand(name, signature_inputs, call_signature, block,
     # The exposed per-method metadata carries the FULL authored signature (where
     # binders + return annotation), the peeled call, and the raw body — enough for
     # Increment 2's MethodIR emission (typed MethodId, return-annotation semantics).
-    # These are inspectable literal AST values; the `signature`/`call`/`body` `Expr`
-    # leaves are MUTABLE (not frozen) — only the separately-captured `recipe_source`
-    # below is deeply frozen/immutable.
+    # `signature`/`call`/`body` are DEEPLY FROZEN (line-stripped) exactly like
+    # `recipe_source`, so no shared mutable `Expr` survives in the stored form;
+    # `kernel_methods` thaws a fresh copy per call (mutation isolation, type fidelity).
     method_meta = Tuple(
         (; name = m.name, form = m.form, argnames = m.argnames,
            vararg = m.vararg, kwargs_splat = m.kwargs_splat,
-           signature = m.signature, call = m.call, body = m.body,
+           signature = _kernel_freeze_ast(Base.remove_linenums!(deepcopy(m.signature))),
+           call = _kernel_freeze_ast(Base.remove_linenums!(deepcopy(m.call))),
+           body = _kernel_freeze_ast(Base.remove_linenums!(deepcopy(m.body))),
            sibling_calls = m.sibling_calls)
         for m in methods)
 
@@ -502,7 +526,10 @@ function _kernel_stateful_expand(name, signature_inputs, call_signature, block,
     Expr(:const, Expr(:(=), esc(name),
         Expr(:call, _StatefulKernelSkeleton, QuoteNode(name),
              Expr(:call, Val, QuoteNode(token_sym)), __module__,
-             esc(spec_expr), method_meta, recipe_source)))
+             # E: capture a DETACHED IMMUTABLE snapshot of the owner spec at definition
+             # time instead of storing the live mutable authority.
+             Expr(:call, _kernel_capture_child, QuoteNode(name), esc(spec_expr)),
+             method_meta, recipe_source)))
 end
 
 # --- Mode-2 free-method recognition (V7 implicit-field pivot) ----------------
@@ -613,30 +640,33 @@ _kernel_is_bangbang_name(name::Symbol) = endswith(String(name), "!!")
 # write/read effect roots, the ports-only recipe `spec` (the signature ports; the
 # body holds mutations, not owner recipes), the frozen body source (poc lowers it),
 # and the `!!` registration flag. Later increments add the specializing factory.
-struct _Mode2KernelSkeleton{Token,S,M,B}
+struct _Mode2KernelSkeleton{Token,SN,M,B}
     name::Symbol
     mod::Module
     subject::Symbol
-    spec::S
+    spec_snapshot::SN        # DETACHED IMMUTABLE owner-spec provenance (a `_ChildSnapshot`)
     write_roots::Tuple{Vararg{Symbol}}
     read_roots::Tuple{Vararg{Symbol}}
-    method::M                # (; name, subject, write_roots, read_roots)
+    method::M                # (; name, subject, write_roots, read_roots, signature[frozen], call[frozen])
     body_source::B           # frozen, detached body-statement source (see _FrozenExpr)
     is_bang_bang::Bool
 end
-_Mode2KernelSkeleton(name::Symbol, ::Val{Token}, mod::Module, subject::Symbol, spec::S,
-                     write_roots, read_roots, method::M, body_source::B,
-                     is_bb::Bool) where {Token,S,M,B} =
-    _Mode2KernelSkeleton{Token,S,M,B}(name, mod, subject, spec, Tuple(write_roots),
-                                      Tuple(read_roots), method, body_source, is_bb)
+_Mode2KernelSkeleton(name::Symbol, ::Val{Token}, mod::Module, subject::Symbol,
+                     spec_snapshot::SN, write_roots, read_roots, method::M,
+                     body_source::B, is_bb::Bool) where {Token,SN,M,B} =
+    _Mode2KernelSkeleton{Token,SN,M,B}(name, mod, subject, spec_snapshot, Tuple(write_roots),
+                                       Tuple(read_roots), method, body_source, is_bb)
 
 kernel_token(skel::_Mode2KernelSkeleton{Token}) where {Token} = Token
 kernel_module(skel::_Mode2KernelSkeleton) = getfield(skel, :mod)
-kernel_spec(skel::_Mode2KernelSkeleton) = getfield(skel, :spec)
+kernel_spec(skel::_Mode2KernelSkeleton) = _kernel_reconstruct(getfield(skel, :spec_snapshot))
+kernel_port_names(skel::_Mode2KernelSkeleton) =
+    _kernel_snapshot_port_names(getfield(skel, :spec_snapshot))
 kernel_subject(skel::_Mode2KernelSkeleton) = getfield(skel, :subject)
 kernel_write_roots(skel::_Mode2KernelSkeleton) = getfield(skel, :write_roots)
 kernel_read_roots(skel::_Mode2KernelSkeleton) = getfield(skel, :read_roots)
-kernel_methods(skel::_Mode2KernelSkeleton) = (getfield(skel, :method),)
+# FRESH thawed method AST (the frozen signature/call) each call — mutation isolation.
+kernel_methods(skel::_Mode2KernelSkeleton) = (_kernel_thaw_method(getfield(skel, :method)),)
 kernel_is_bangbang(skel::_Mode2KernelSkeleton) = getfield(skel, :is_bang_bang)
 
 # Thaw a FRESH copy of the captured Mode-2 body source (`Expr(:block, …)`), in
@@ -656,10 +686,17 @@ end
 # freeze the body source, and bind the substrate by Token. It does NOT lower a
 # schedule or generate a callable dispatch; later increments add those.
 function _kernel_mode2_expand(name, signature_inputs, call_signature, block,
-                              subject::Symbol, __module__)
+                              subject::Symbol, raw_signature, __module__)
     roots = _kernel_subject_effect_roots(block, subject)
+    # A: retain the FULL authored raw signature + peeled call (positional/keyword order,
+    # required/default status, annotations, where/return where supported), DEEPLY FROZEN
+    # so poc reads them verbatim rather than reconstructing from spec port keys.
+    frozen_sig = _kernel_freeze_ast(Base.remove_linenums!(deepcopy(raw_signature)))
+    frozen_call = _kernel_freeze_ast(
+        Base.remove_linenums!(deepcopy(_kernel_peel_signature(raw_signature))))
     method_meta = (; name = name, subject = subject,
-                     write_roots = roots.writes, read_roots = roots.reads)
+                     write_roots = roots.writes, read_roots = roots.reads,
+                     signature = frozen_sig, call = frozen_call)
     # Ports-only spec: the signature ports (the body carries mutations, not recipes).
     spec_expr = _kernel_expand(Expr(:block), signature_inputs, call_signature, __module__)
     body_source = Tuple(
@@ -669,8 +706,9 @@ function _kernel_mode2_expand(name, signature_inputs, call_signature, block,
     is_bb = _kernel_is_bangbang_name(name)
     Expr(:const, Expr(:(=), esc(name),
         Expr(:call, _Mode2KernelSkeleton, QuoteNode(name),
-             Expr(:call, Val, QuoteNode(token_sym)), __module__,
-             QuoteNode(subject), esc(spec_expr),
+             Expr(:call, Val, QuoteNode(token_sym)), __module__, QuoteNode(subject),
+             # E: detached immutable owner-spec snapshot, not the live authority.
+             Expr(:call, _kernel_capture_child, QuoteNode(name), esc(spec_expr)),
              roots.writes, roots.reads, method_meta, body_source, is_bb)))
 end
 

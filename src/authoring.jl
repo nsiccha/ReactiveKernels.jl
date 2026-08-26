@@ -1230,12 +1230,14 @@ function _kernel_named_signature(signature)
 end
 
 function _kernel_definition_parts(ex::Expr)
+    # Returns (name, inputs, call_signature, positional_names, raw_signature, block).
+    # `raw_signature` = `ex.args[1]` — the FULL authored signature AST (Mode-2 retains it).
     if ex.head === :(=) && length(ex.args) == 2
         named = _kernel_named_signature(ex.args[1])
-        named === nothing || return (named..., ex.args[2])
+        named === nothing || return (named..., ex.args[1], ex.args[2])
     elseif ex.head === :function && length(ex.args) == 2
         named = _kernel_named_signature(ex.args[1])
-        named === nothing || return (named..., ex.args[2])
+        named === nothing || return (named..., ex.args[1], ex.args[2])
     end
     nothing
 end
@@ -1310,7 +1312,7 @@ macro kernel(ex)
     definition = ex isa Expr ? _kernel_definition_parts(ex) : nothing
     definition === nothing &&
         return esc(_kernel_expand(ex, Tuple{Symbol,Any}[], nothing, __module__))
-    name, inputs, call_signature, positional_names, block = definition
+    name, inputs, call_signature, positional_names, raw_signature, block = definition
     # Discriminator (V7): nested methods ⇒ Mode-1 object kernel; else a methodless
     # body that MUTATES a field of the FIRST positional subject ⇒ Mode-2 free method
     # (independent of `!` spelling); else the byte-identical stateless expansion.
@@ -1324,12 +1326,12 @@ macro kernel(ex)
             "stateful @kernel `$name` (`!!` strong same-object update) needs a first " *
             "positional subject to update in place"))
         return _kernel_mode2_expand(name, inputs, call_signature, block,
-                                    positional_names[1], __module__)
+                                    positional_names[1], raw_signature, __module__)
     end
     if !isempty(positional_names) &&
        _kernel_body_mutates_subject(block, positional_names[1])
         return _kernel_mode2_expand(name, inputs, call_signature, block,
-                                    positional_names[1], __module__)
+                                    positional_names[1], raw_signature, __module__)
     end
     esc(Expr(:(=), name, _kernel_expand(block, inputs, call_signature, __module__)))
 end

@@ -179,6 +179,12 @@ partial(x) = x                     # NOT ReactiveKernels.partial
 macro node(ex); esc(ex); end       # NOT ReactiveKernels.@node
 end
 
+# Mode-2 with a RICH authored signature (positional + typed positional-default +
+# keyword-default) to probe full signature retention (order/default/annotation).
+@kernel richmode!(p, s::Float64 = 2.0; tol = 0.001) = begin
+    @. p.pos += s * tol
+end
+
 @testset "stateful @kernel substrate (Increment 1)" begin
     @testset "(3) methodless @kernel unchanged — routes to the stateless path" begin
         @kernel plain(f, x) = begin
@@ -795,11 +801,71 @@ end
         actual = @macroexpand1 @kernel plain(f, x) = begin
             y = f(x)
         end
-        nm, inp, sig, posn, blk = RKS._kernel_definition_parts(def)
+        nm, inp, sig, posn, rawsig, blk = RKS._kernel_definition_parts(def)
         ref = Expr(:(=), nm, RKS._kernel_expand(blk, inp, sig))
         @test norm(actual) == norm(ref)
         # and no stateful codegen leaked into the methodless expansion
         @test !occursin("_StatefulKernelSkeleton", string(actual))
         @test !occursin("KernelObject", string(actual))
+    end
+
+    @testset "Mode-2 retains full authored signature + peeled call (A)" begin
+        m = only(RKS.kernel_methods(richmode!))
+        @test m.name === :richmode!
+        sig = m.signature
+        @test sig isa Expr && sig.head === :call
+        @test sig.args[1] === :richmode!
+        @test sig.args[3] === :p                              # first positional, IN ORDER
+        @test sig.args[4] isa Expr && sig.args[4].head === :kw  # `s` carries a default
+        s = string(sig)
+        @test occursin("Float64", s) && occursin("2.0", s)    # annotation + positional default
+        @test occursin("tol", s) && occursin("0.001", s)      # keyword name + default
+        @test m.call isa Expr && m.call.head === :call        # peeled call present
+        # leapfrog!'s positional + keyword retained verbatim — poc reads the signature,
+        # it does NOT reconstruct one from spec port keys.
+        lm = only(RKS.kernel_methods(leapfrog!))
+        @test occursin("phasepoint", string(lm.signature)) &&
+              occursin("stepsize", string(lm.signature))
+        @test :phasepoint in RKS.kernel_port_names(leapfrog!)
+    end
+
+    @testset "method AST fresh/frozen isolation + type fidelity (B)" begin
+        # Mode-1: fresh thawed ASTs each call — distinct objects, equal content
+        a = RKS.kernel_methods(StatefulSigFixture)
+        b = RKS.kernel_methods(StatefulSigFixture)
+        @test a[1].signature == b[1].signature && a[1].signature !== b[1].signature
+        @test a[1].call == b[1].call && a[1].call !== b[1].call
+        @test a[1].body == b[1].body && a[1].body !== b[1].body
+        # corrupting a thawed copy cannot reach the store or a later read
+        orig = deepcopy(a[2].signature)
+        empty!(a[2].signature.args)
+        push!(a[2].signature.args, :corrupted)
+        @test RKS.kernel_methods(StatefulSigFixture)[2].signature == orig
+        # type fidelity: the `where`-clause signature round-trips as an Expr with `where`
+        @test occursin("where", string(RKS.kernel_methods(StatefulSigFixture)[2].signature))
+        # Mode-2 signature/call are frozen/thawed too
+        m1 = only(RKS.kernel_methods(leapfrog!))
+        m2 = only(RKS.kernel_methods(leapfrog!))
+        @test m1.signature == m2.signature && m1.signature !== m2.signature
+        @test m1.call !== m2.call
+    end
+
+    @testset "owner-spec detached snapshot: mutation isolation + freshness (E)" begin
+        # kernel_spec returns a FRESH reconstructed planning spec each call
+        s1 = RKS.kernel_spec(StatefulObjFixture)
+        s2 = RKS.kernel_spec(StatefulObjFixture)
+        @test s1 isa KernelSpec && s2 isa KernelSpec
+        @test s1 !== s2                                       # distinct objects
+        @test keys(s1) == keys(s2)                            # equal field/port sets
+        # mutating a returned spec's graph cannot change a later read's field set
+        before = collect(keys(RKS.kernel_spec(StatefulObjFixture)))
+        empty!(kernel_graph(s1).recipes)                      # corrupt the returned graph
+        @test collect(keys(RKS.kernel_spec(StatefulObjFixture))) == before
+        # immutable port-name surface (a detached Tuple)
+        @test RKS.kernel_port_names(StatefulObjFixture) isa Tuple
+        @test :ham in RKS.kernel_port_names(StatefulObjFixture)
+        # Mode-2 too: fresh reconstruct each call
+        @test RKS.kernel_spec(leapfrog!) isa KernelSpec
+        @test RKS.kernel_spec(leapfrog!) !== RKS.kernel_spec(leapfrog!)
     end
 end
