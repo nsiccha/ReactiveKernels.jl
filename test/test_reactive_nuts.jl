@@ -571,3 +571,70 @@ end
         g2; rng = Xoshiro(1),
         step_f = partial(leapfrog!; stepsize = 0.2, bogus = true))
 end
+
+@testset "reactive_nuts_group authored via @reactive — actual-group regressions" begin
+    D = 4
+    metric = Matrix{Float64}(I, D, D)
+    grp = reactive_nuts_group(_std_pot_grad!, metric, _det_pos(D), _det_mom(D))
+
+    # The group is the public @reactive object; reactive_program is its authored program.
+    @test grp isa ReactiveKernels.ReactiveObject
+    @test reactive_program(grp) === grp.state.program
+    @test reactive_program(grp) isa ReactiveKernels.ReactiveProgram
+    # No hot slot is Ref{Any} (concrete state/getter/slots).
+    @test !any(t -> t === Base.RefValue{Any}, typeof(grp.state.slots).parameters)
+
+    # Two distinct potential-gradient callable types + Matrix/Diagonal + Float32/Float64
+    # coexist in ONE process as distinct concrete group/state types, all concrete slots.
+    _other_grad!(g, q) = (g .= q; sum(abs2, q) / 2)          # different callable type
+    g1 = reactive_nuts_group(_std_pot_grad!, metric, _det_pos(D), _det_mom(D))
+    g2 = reactive_nuts_group(_other_grad!, metric, _det_pos(D), _det_mom(D))
+    gdiag = reactive_nuts_group(_std_pot_grad!, Diagonal(ones(D)), _det_pos(D), _det_mom(D))
+    f32g!(g, q) = (copyto!(g, q); sum(abs2, q) / 2)
+    g32 = reactive_nuts_group(f32g!, Matrix{Float32}(I, D, D),
+                              Float32.(_det_pos(D)), Float32.(_det_mom(D)))
+    @test typeof(g1) !== typeof(g2)        # distinct callable => distinct concrete type
+    @test typeof(g1) !== typeof(gdiag)     # Matrix vs Diagonal
+    @test typeof(g1) !== typeof(g32)       # Float64 vs Float32
+    @test eltype(g32.init_pos) === Float32
+    @test g32.init_dpot_dpos isa Vector{Float32}
+    @test !any(t -> t === Base.RefValue{Any}, typeof(g32.state.slots).parameters)
+
+    # Owned bundle caches are independent across instances (per-slot ownership) —
+    # the HIDDEN bundle OBJECTS and their inner buffers, not just exposed arrays.
+    @test g1.init_dpot_dpos !== g2.init_dpot_dpos
+    @test g1.init_dham_dmom !== gdiag.init_dham_dmom
+    @test g1.init_valgrad !== g2.init_valgrad
+    @test g1.init_kinetic !== gdiag.init_kinetic
+    @test g1.init_valgrad.gradient !== g2.init_valgrad.gradient
+    @test g1.init_kinetic.velocity !== gdiag.init_kinetic.velocity
+
+    # The actual compiled getters storage is concrete — no `Any` anywhere in the
+    # program.getters tuple type (slots alone do not prove concrete getter storage).
+    @test !occursin("Any", string(typeof(grp.state.program.getters)))
+    @test !occursin("Any", string(typeof(g32.state.program.getters)))
+
+    # Hot authored-group leapfrog stays inferred and 0 B.
+    @inferred ReactiveKernels._group_leapfrog!(g1, Val(:fwd), 0.1)
+    _lf!(g, n) = (for _ in 1:n
+                      ReactiveKernels._group_leapfrog!(g, Val(:fwd), 0.1)
+                  end)
+    _lf!(g1, 2)
+    @test @allocated(_lf!(g1, 1000)) == 0
+end
+
+@testset "reactive_nuts_group no longer constructs a Graph (source check)" begin
+    src = read(joinpath(@__DIR__, "..", "src", "reactive_nuts.jl"), String)
+    # The construction path is the @reactive-authored object + a delegating wrapper.
+    @test occursin("@reactive specialize=true prepare=_nuts_prepare\n" *
+                   "        _reactive_nuts_group_object", src) ||
+          occursin("@reactive specialize=true prepare=_nuts_prepare _reactive_nuts_group_object", src)
+    # The reactive_nuts_group WRAPPER delegates and never builds a Graph directly.
+    wrapper = match(r"function reactive_nuts_group\(.*?\n(.*?)\nend"s, src)
+    @test wrapper !== nothing
+    body = wrapper.captures[1]
+    @test occursin("_reactive_nuts_group_object", body)
+    @test !occursin("Graph()", body)
+    @test !occursin("value!(", body)
+    @test !occursin("add!(", body)
+end

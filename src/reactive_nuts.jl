@@ -54,16 +54,15 @@ mutable struct _Kinetic{T,V<:AbstractVector{T}}
     velocity::V
 end
 
-# Recipe op wrapping the caller's in-place scalar-potential boundary
-# `f(gradient, position) -> potential`. A plain (pure) call — used on the first
-# evaluation and in the pure program — allocates a fresh bundle; the in-place
-# `cache_apply` method below reuses the slot bundle's buffer.
-struct _GradientBundleOp{F}
-    f::F
-end
-@inline function (op::_GradientBundleOp)(position)
+# Bundle RECIPE FUNCTIONS (named, so the in-place cache_apply can dispatch on their
+# type). Each is a single-output recipe over its HAVE inputs; a plain (pure) call —
+# used on the first evaluation and in the pure program — allocates a fresh bundle,
+# while the in-place `cache_apply` methods below reuse the slot bundle's buffer.
+# `potential_gradient!(gradient, position) -> potential` is a HAVE source read by the
+# gradient bundle recipe (so the authored @reactive group can take it as a port).
+@inline function _grad_bundle(potential_gradient!, position)
     gradient = similar(position)
-    value = op.f(gradient, position)
+    value = potential_gradient!(gradient, position)
     _ValueGradient(value, gradient)
 end
 
@@ -71,21 +70,20 @@ _kinetic_energy(chol, momentum, velocity) =
     convert(eltype(velocity),
             (logdet(chol) + dot(momentum, velocity)) / 2)
 
-struct _KineticBundleOp end
-@inline function (::_KineticBundleOp)(chol, momentum)
+@inline function _kin_bundle(chol, momentum)
     velocity = chol \ momentum
     _Kinetic(_kinetic_energy(chol, momentum, velocity), velocity)
 end
 
 # Hand-written, MutatingFunctions-agnostic in-place hook. Contract: reuse and
 # return the (possibly new) cache; treat an immutable/isbits or unregistered cache
-# as a passthrough recompute. Only the two owned bundle types reuse in place.
-@inline function _nuts_cache_apply(cache::_ValueGradient, op::_GradientBundleOp,
-                                   position)
-    cache.value = op.f(cache.gradient, position)
+# as a passthrough recompute. Only the two owned bundle recipes reuse in place.
+@inline function _nuts_cache_apply(cache::_ValueGradient, ::typeof(_grad_bundle),
+                                   potential_gradient!, position)
+    cache.value = potential_gradient!(cache.gradient, position)
     cache
 end
-@inline function _nuts_cache_apply(cache::_Kinetic, ::_KineticBundleOp,
+@inline function _nuts_cache_apply(cache::_Kinetic, ::typeof(_kin_bundle),
                                    chol, momentum)
     copyto!(cache.velocity, momentum)
     ldiv!(chol, cache.velocity)
@@ -93,6 +91,13 @@ end
     cache
 end
 @inline _nuts_cache_apply(cache, op, args...) = op(args...)
+
+# The injected `prepare=` callable for the authored @reactive NUTS group: the owned
+# bundle recipes reuse their per-slot buffer in place through the MutatingFunctions-
+# agnostic cache hook; all other recipes stay on the pure branch.
+_nuts_prepare(spec; want) = _prepare_reactive(
+    spec; want = want, cache_apply = _nuts_cache_apply,
+    is_mutating = _nuts_is_mutating)
 
 # Route ONLY the two owned bundle recipes through the in-place hook; the scalar and
 # borrowed-vector projections stay on the pure (allocation-free) branch.
@@ -120,130 +125,88 @@ function _copy_slot_value!(destination::_Kinetic, source::_Kinetic)
     destination
 end
 
+# Pure 0-B projections (named so they never trip the dotted-operator-as-callee
+# authoring path and stay off the in-place hook).
+@inline _vg_value(bundle) = bundle.value
+@inline _vg_gradient(bundle) = bundle.gradient
+@inline _kn_kinetic(bundle) = bundle.kinetic
+@inline _kn_velocity(bundle) = bundle.velocity
+@inline _active_select(forward, forward_ham, backward_ham) =
+    forward ? forward_ham : backward_ham
+@inline _energy_error(init_ham, active_ham) = _finite_or_neginf(init_ham - active_ham)
+@inline _is_divergent(energy_error, threshold) = !(energy_error >= threshold)
+
+# The flat compiled-reactive NUTS phase-point group, authored through the PUBLIC
+# `@reactive` surface (per-construction specialize=true so it is generic over the
+# closure/precision/metric-storage; prepare=_nuts_prepare so each endpoint's owned
+# value/gradient + kinetic bundles reuse their per-slot buffer in place). Runtime-
+# derived annotations (`typeof`/`eltype`) keep every hot slot concrete. The three
+# endpoints are written out (the facade has no loop form); they differ only by
+# their HAVE sources. Exposed field names match the previous hand-built group
+# exactly, so `CompiledNUTSState` consumes it unchanged.
+@reactive specialize=true prepare=_nuts_prepare _reactive_nuts_group_object(
+        potential_gradient!, metric, gofwd, min_dham,
+        init_pos, init_mom, fwd_pos, fwd_mom, bwd_pos, bwd_mom) = begin
+    chol_metric::typeof(cholesky(metric)) = cholesky(metric)
+
+    init_valgrad::_ValueGradient{eltype(init_pos),typeof(init_pos)} =
+        _grad_bundle(potential_gradient!, init_pos)
+    init_pot::eltype(init_pos) = _vg_value(init_valgrad)
+    init_dpot_dpos::typeof(init_pos) = _vg_gradient(init_valgrad)
+    init_kinetic::_Kinetic{eltype(init_pos),typeof(init_pos)} =
+        _kin_bundle(chol_metric, init_mom)
+    init_kin::eltype(init_pos) = _kn_kinetic(init_kinetic)
+    init_dham_dmom::typeof(init_pos) = _kn_velocity(init_kinetic)
+    init_ham::eltype(init_pos) = init_pot + init_kin
+
+    fwd_valgrad::_ValueGradient{eltype(fwd_pos),typeof(fwd_pos)} =
+        _grad_bundle(potential_gradient!, fwd_pos)
+    fwd_pot::eltype(fwd_pos) = _vg_value(fwd_valgrad)
+    fwd_dpot_dpos::typeof(fwd_pos) = _vg_gradient(fwd_valgrad)
+    fwd_kinetic::_Kinetic{eltype(fwd_pos),typeof(fwd_pos)} =
+        _kin_bundle(chol_metric, fwd_mom)
+    fwd_kin::eltype(fwd_pos) = _kn_kinetic(fwd_kinetic)
+    fwd_dham_dmom::typeof(fwd_pos) = _kn_velocity(fwd_kinetic)
+    fwd_ham::eltype(fwd_pos) = fwd_pot + fwd_kin
+
+    bwd_valgrad::_ValueGradient{eltype(bwd_pos),typeof(bwd_pos)} =
+        _grad_bundle(potential_gradient!, bwd_pos)
+    bwd_pot::eltype(bwd_pos) = _vg_value(bwd_valgrad)
+    bwd_dpot_dpos::typeof(bwd_pos) = _vg_gradient(bwd_valgrad)
+    bwd_kinetic::_Kinetic{eltype(bwd_pos),typeof(bwd_pos)} =
+        _kin_bundle(chol_metric, bwd_mom)
+    bwd_kin::eltype(bwd_pos) = _kn_kinetic(bwd_kinetic)
+    bwd_dham_dmom::typeof(bwd_pos) = _kn_velocity(bwd_kinetic)
+    bwd_ham::eltype(bwd_pos) = bwd_pot + bwd_kin
+
+    active_ham::eltype(init_pos) = _active_select(gofwd, fwd_ham, bwd_ham)
+    dham::eltype(init_pos) = _energy_error(init_ham, active_ham)
+    diverged::Bool = _is_divergent(dham, min_dham)
+end
+
 """
     reactive_nuts_group(potential_gradient!, metric, position, momentum;
                         gofwd = true, min_dham = -1000.0)
 
-Build the flat compiled-reactive NUTS phase-point group. All three endpoints
-(`init`, `fwd`, `bwd`) are initialized from `(position, momentum)` and share the
-Cholesky factor of the fixed Euclidean `metric`. `potential_gradient!(gradient, q)`
-must fill `gradient` in place and return the scalar potential `U(q)`.
-
-The returned [`ReactivePhasePoint`](@ref) exposes, per endpoint `e` in
-`(:init, :fwd, :bwd)`, the HAVE sources `e_pos`, `e_mom` and the reactive nodes
-`e_pot`, `e_dpot_dpos`, `e_kin`, `e_dham_dmom`, `e_ham`; plus the shared HAVE
-sources `metric`, `gofwd`, and the reactive selection/diagnostic nodes
-`active_ham` (`gofwd ? fwd_ham : bwd_ham`), `dham` (`init_ham - active_ham`), and
-`diverged` (`!(dham >= min_dham)`).
-
-Each endpoint's potential+gradient and kinetic work is an owned single-output
-bundle reused in place through the per-slot in-place getter hook, so a warmed
-invalidate→recompute is allocation-free apart from the caller boundary's own work.
+Build the flat compiled-reactive NUTS phase-point group (a
+[`ReactiveObject`](@ref) authored through the public `@reactive` surface). All
+three endpoints (`init`, `fwd`, `bwd`) are initialized from `(position, momentum)`;
+each is given its OWN copy so the endpoints never alias.
 """
 function reactive_nuts_group(potential_gradient!, metric, position, momentum;
                              gofwd::Bool = true,
                              min_dham::Real = _REACTIVE_NUTS_DEFAULT_MIN_DHAM)
-    gradient_op = _GradientBundleOp(potential_gradient!)
-    kinetic_op = _KineticBundleOp()
-    gradient_bundle0 = gradient_op(position)
-    chol0 = cholesky(metric)
-    kinetic_bundle0 = kinetic_op(chol0, momentum)
-    potential0 = gradient_bundle0.value
-    ham0 = potential0 + kinetic_bundle0.kinetic
-
-    graph = Graph()
-    metric_value = value!(graph, :metric, typeof(metric))
-    gofwd_value = value!(graph, :gofwd, Bool)
-    chol = value!(graph, :chol_metric, typeof(chol0))
-    add!(graph, metric_value => chol, cholesky)
-
-    # Per-endpoint Hamiltonian sub-graph: an owned value/gradient bundle and an
-    # owned kinetic bundle (both reused in place), then pure projections into the
-    # exposed scalar/vector nodes, joined into ham. Endpoints differ only by their
-    # HAVE sources.
-    ports = Dict{Symbol,Any}()
-    for endpoint in _REACTIVE_NUTS_ENDPOINTS
-        pos = ports[Symbol(endpoint, :_pos)] =
-            value!(graph, Symbol(endpoint, :_pos), typeof(position))
-        mom = ports[Symbol(endpoint, :_mom)] =
-            value!(graph, Symbol(endpoint, :_mom), typeof(momentum))
-        gradient_bundle =
-            value!(graph, Symbol(endpoint, :_valgrad), typeof(gradient_bundle0))
-        pot = ports[Symbol(endpoint, :_pot)] =
-            value!(graph, Symbol(endpoint, :_pot), typeof(potential0))
-        dpot = ports[Symbol(endpoint, :_dpot_dpos)] =
-            value!(graph, Symbol(endpoint, :_dpot_dpos),
-                   typeof(gradient_bundle0.gradient))
-        kinetic_bundle =
-            value!(graph, Symbol(endpoint, :_kinetic), typeof(kinetic_bundle0))
-        kinetic = ports[Symbol(endpoint, :_kin)] =
-            value!(graph, Symbol(endpoint, :_kin), typeof(kinetic_bundle0.kinetic))
-        dham_dmom = ports[Symbol(endpoint, :_dham_dmom)] =
-            value!(graph, Symbol(endpoint, :_dham_dmom),
-                   typeof(kinetic_bundle0.velocity))
-        ham = ports[Symbol(endpoint, :_ham)] =
-            value!(graph, Symbol(endpoint, :_ham), typeof(ham0))
-        add!(graph, pos => gradient_bundle, gradient_op)
-        add!(graph, gradient_bundle => pot, bundle -> bundle.value)
-        add!(graph, gradient_bundle => dpot, bundle -> bundle.gradient)
-        add!(graph, (chol, mom) => kinetic_bundle, kinetic_op)
-        add!(graph, kinetic_bundle => kinetic, bundle -> bundle.kinetic)
-        add!(graph, kinetic_bundle => dham_dmom, bundle -> bundle.velocity)
-        add!(graph, (pot, kinetic) => ham, +)
-    end
-
-    # Active-endpoint selection + energy error + divergence — reactive recipes over
-    # the wider HAVE. `gofwd` is a HAVE source; `active_ham` branches over the
-    # static edges to both endpoint hamiltonians at compute time.
-    active_ham = value!(graph, :active_ham, typeof(ham0))
-    add!(graph, (gofwd_value, ports[:fwd_ham], ports[:bwd_ham]) => active_ham,
-         (forward, forward_ham, backward_ham) ->
-             forward ? forward_ham : backward_ham)
-    # `dham` is the finite-guarded energy error init_ham - active_ham (matching the
-    # oracle's _finite_or_neginf(init.ham - forward.ham) exactly), and `min_dham` is
-    # a reactive HAVE source so the divergence threshold can be changed and
-    # `diverged` recomputes reactively.
-    dham = value!(graph, :dham, typeof(ham0))
-    add!(graph, (ports[:init_ham], active_ham) => dham,
-         (init_ham, selected_ham) -> _finite_or_neginf(init_ham - selected_ham))
-    min_dham_value = value!(graph, :min_dham, typeof(ham0))
-    diverged = value!(graph, :diverged, Bool)
-    add!(graph, (dham, min_dham_value) => diverged,
-         (energy_error, threshold) -> !(energy_error >= threshold))
-
-    haves = (metric_value, gofwd_value, min_dham_value,
-             ports[:init_pos], ports[:init_mom],
-             ports[:fwd_pos], ports[:fwd_mom],
-             ports[:bwd_pos], ports[:bwd_mom])
-    endpoint_wants = Tuple(Iterators.flatten(
-        (ports[Symbol(endpoint, suffix)]
-         for suffix in (:_pot, :_dpot_dpos, :_kin, :_dham_dmom, :_ham))
-        for endpoint in _REACTIVE_NUTS_ENDPOINTS))
-    wants = (chol, active_ham, dham, diverged, endpoint_wants...)
-
-    program = _prepare_reactive(graph; have = haves, want = wants,
-                                cache_apply = _nuts_cache_apply,
-                                is_mutating = _nuts_is_mutating)
-    state = program(metric, gofwd, convert(typeof(ham0), min_dham),
-                    copy(position), copy(momentum),
-                    copy(position), copy(momentum),
-                    copy(position), copy(momentum))
-
-    handle_names = (:metric, :gofwd, :min_dham, :chol_metric,
-                    :active_ham, :dham, :diverged,
-                    (Symbol(endpoint, suffix)
-                     for endpoint in _REACTIVE_NUTS_ENDPOINTS
-                     for suffix in (:_pos, :_mom, :_pot, :_dpot_dpos,
-                                    :_kin, :_dham_dmom, :_ham))...)
-    handle_ports = (metric_value, gofwd_value, min_dham_value, chol,
-                    active_ham, dham, diverged,
-                    (ports[Symbol(endpoint, suffix)]
-                     for endpoint in _REACTIVE_NUTS_ENDPOINTS
-                     for suffix in (:_pos, :_mom, :_pot, :_dpot_dpos,
-                                    :_kin, :_dham_dmom, :_ham))...)
-    values = NamedTuple{handle_names}(handle_ports)
-    _phasepoint(program, state, values)
+    threshold = convert(eltype(position), min_dham)
+    _reactive_nuts_group_object(
+        potential_gradient!, metric, gofwd, threshold,
+        copy(position), copy(momentum),
+        copy(position), copy(momentum),
+        copy(position), copy(momentum))
 end
+
+# The authored group is a ReactiveObject; the sampler accepts either it or a bare
+# ReactivePhasePoint (both are the identical `state`/`handles` runtime surface).
+const _NUTSGroup = Union{ReactivePhasePoint,ReactiveObject}
 
 # ---------------------------------------------------------------------------
 # CompiledNUTSState — the ca9 multinomial NUTS transition running on the flat
@@ -335,7 +298,7 @@ function _nuts_metric_is_source(state::CompiledNUTSState)
 end
 
 """
-    compiled_nuts_state(init::ReactivePhasePoint; rng, step_f, stats_f=nothing,
+    compiled_nuts_state(group; rng, step_f, stats_f=nothing,
                         max_depth=10, min_dham=-1000.0)
 
 Build the compiled-reactive multinomial NUTS transition from a flat phase-point
@@ -361,7 +324,7 @@ const _REACTIVE_NUTS_REQUIRED_HANDLES = (
     :bwd_pos, :bwd_mom, :bwd_ham, :bwd_dpot_dpos, :bwd_dham_dmom,
 )
 
-function compiled_nuts_state(group::ReactivePhasePoint; rng, step_f,
+function compiled_nuts_state(group::_NUTSGroup; rng, step_f,
                              stats_f = nothing, max_depth::Integer = 10,
                              min_dham = -1000.0)
     max_depth >= 1 || throw(ArgumentError("max_depth must be positive"))
@@ -410,7 +373,7 @@ end
 # integrator: mom half-kick (reads gradient), pos drift (reads velocity), mom
 # half-kick (reads recomputed gradient). Uses the group's per-slot in-place
 # bundles, so the reactive recompute is allocation-free.
-@inline function _group_leapfrog!(group::ReactivePhasePoint, ::Val{P},
+@inline function _group_leapfrog!(group::_NUTSGroup, ::Val{P},
                                   stepsize) where {P}
     gs = group.state
     handles = group.handles
@@ -719,7 +682,7 @@ function (stats::TrajectoryStats)(state::CompiledNUTSState)
 end
 
 """
-    nuts_state(point::ReactivePhasePoint; rng, step_f, ...)
+    nuts_state(group; rng, step_f, ...)
 
 Construct the compiled-reactive NUTS sampler. `point` MUST be a flat phase-point
 group from [`reactive_nuts_group`](@ref); it builds a [`CompiledNUTSState`](@ref).
@@ -727,7 +690,7 @@ A plain single-endpoint phase point is REJECTED with actionable guidance — the
 ordinary-Julia reference oracle is the unexported `_oracle_nuts_state`, used only
 for parity tests.
 """
-function nuts_state(point::ReactivePhasePoint; kwargs...)
+function nuts_state(point::_NUTSGroup; kwargs...)
     _is_reactive_nuts_group(point) || throw(ArgumentError(
         "nuts_state builds the compiled-reactive sampler and requires a flat " *
         "phase-point group from reactive_nuts_group(potential_gradient!, metric, " *
@@ -736,6 +699,6 @@ function nuts_state(point::ReactivePhasePoint; kwargs...)
     compiled_nuts_state(point; kwargs...)
 end
 
-_is_reactive_nuts_group(point::ReactivePhasePoint) =
+_is_reactive_nuts_group(point::_NUTSGroup) =
     all(name -> name in keys(getfield(point, :handles)),
         (:gofwd, :min_dham, :init_pos, :fwd_pos, :bwd_pos, :dham))

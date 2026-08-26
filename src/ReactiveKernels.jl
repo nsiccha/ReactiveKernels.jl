@@ -30,8 +30,8 @@ include("authoring.jl")
 include("reactive.jl")
 include("stateful.jl")
 include("hmc.jl")
-include("reactive_nuts.jl")
 include("reactive_facade.jl")
+include("reactive_nuts.jl")
 include("visualization.jl")
 
 export Value, Recipe, Graph, Plan, PreparedKernel, NonAllocatingKernel, PlanningError
