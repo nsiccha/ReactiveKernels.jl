@@ -9,6 +9,7 @@ using Test
     elseif !benchmark_only
         include("test_stateless.jl")
         include("test_authoring.jl")
+        include("test_kernel_stateful.jl")
         include("test_nonallocating_core.jl")
         include("test_composition_cse.jl")
         include("test_deterministic_ast.jl")

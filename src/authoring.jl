@@ -1208,6 +1208,10 @@ macro kernel(ex)
     definition = ex isa Expr ? _kernel_definition_parts(ex) : nothing
     definition === nothing && return esc(_kernel_expand(ex))
     name, inputs, call_signature, block = definition
+    # A method-bearing body routes to the stateful authoring substrate; a
+    # methodless body keeps the byte-identical stateless expansion below.
+    _kernel_body_has_methods(block) &&
+        return _kernel_stateful_expand(name, inputs, call_signature, block, __module__)
     esc(Expr(:(=), name, _kernel_expand(block, inputs, call_signature)))
 end
 
