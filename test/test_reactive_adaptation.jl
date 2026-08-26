@@ -1,5 +1,10 @@
 using ReactiveKernels
 using Test
+using Random
+using LinearAlgebra
+
+_ta_grad!(g, q) = (copyto!(g, q); sum(abs2, q) / 2)
+_ta_pos(D) = [sin(1.0i) for i in 1:D]
 
 # GAP-1a — reactive dual-averaging authored through @reactive specialize=true.
 # DualAveragingState stays a public NOMINAL wrapper type over the reactive object.
@@ -124,4 +129,47 @@ end
     bytes = @allocated _wcyc!(ww, v, 1000)
     println("REACTIVE_WELFORD_STEP_ALLOC_BYTES\t", bytes)
     @test bytes == 0
+end
+
+@testset "reactive TrajectoryStats/SamplingStats — wrappers, program-share, copy isolation" begin
+    t = trajectory_stats(2)
+    @test t isa TrajectoryStats
+    @test reactive_program(t) isa ReactiveKernels.ReactiveProgram
+
+    # Drive it through one real compiled-sampler transition.
+    grp = reactive_nuts_group(_ta_grad!, Matrix{Float64}(I, 2, 2), [0.1, -0.2], [0.3, -0.4])
+    st = nuts_state(grp; rng = Xoshiro(42),
+                    step_f = partial(leapfrog!; stepsize = 0.25),
+                    stats_f = t, max_depth = 3)
+    tr = sample!(st)
+    @test size(t.positions) == (2, tr.n_steps + 1)     # view over the reactive storage
+    @test size(t.gradients) == size(t.positions)
+    @test length(t.dhams) == tr.n_steps + 1
+    @test sort(t.idxs) == 0:tr.n_steps
+
+    # copy: shared immutable program, detached state, view isolation.
+    tc = copy(t)
+    @test tc isa TrajectoryStats
+    @test reactive_program(tc) === reactive_program(t)                  # shared program
+    @test getfield(tc, :object).state !== getfield(t, :object).state    # detached state
+    t_pos_snapshot = copy(Matrix(t.positions))
+    reset!(tc, st.init)                                                 # mutate the clone
+    @test Matrix(t.positions) == t_pos_snapshot                        # source unchanged
+
+    # setproperty! forwarding + read-only view rejection.
+    @test (t.count = t.count) == t.count                               # source assignment
+    @test_throws ArgumentError (t.positions = zeros(2, 1))
+
+    # SamplingStats: program-share + trajectory source NOT aliased on copy.
+    run = sampling_stats(t)
+    @test run isa SamplingStats
+    @test reactive_program(run) isa ReactiveKernels.ReactiveProgram
+    run(st)
+    @test size(run.draws, 2) == 1
+    @test length(run.n_steps) == 1
+    rc = copy(run)
+    @test reactive_program(rc) === reactive_program(run)               # shared program
+    @test getfield(rc, :object).trajectory !== getfield(run, :object).trajectory
+    run(st)                                                            # advance source
+    @test size(rc.draws, 2) == 1                                       # clone unaffected
 end

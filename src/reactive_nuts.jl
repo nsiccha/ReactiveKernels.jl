@@ -660,28 +660,12 @@ function _probe_acceptance(state::CompiledNUTSState, stepsize)
     _min1exp(probe.dham)
 end
 
-# --- Forward-endpoint readers for the optional TrajectoryStats recorder. ---
+# --- Forward-endpoint readers for the optional TrajectoryStats recorder (the
+# TrajectoryStats callback for a CompiledNUTSState lives in the GAP-1c section). ---
 @inline _cn_fwd_dpos(state) =
     state.go_forward ? state.group.fwd_dpot_dpos : state.group.bwd_dpot_dpos
 @inline _cn_fwd_pot(state) =
     state.go_forward ? state.group.fwd_pot : state.group.bwd_pot
-
-function (stats::TrajectoryStats)(state::CompiledNUTSState)
-    prepend = !state.go_forward
-    column = _reserve_trajectory_column!(stats, prepend)
-    stats.position_storage[:, column] .= _cn_fwd_pos(state)
-    stats.gradient_storage[:, column] .= -_cn_fwd_dpos(state)
-    if prepend
-        pushfirst!(stats.dhams, state.energy_error)
-        pushfirst!(stats.pots, _cn_fwd_pot(state))
-        pushfirst!(stats.idxs, length(stats.idxs))
-    else
-        push!(stats.dhams, state.energy_error)
-        push!(stats.pots, _cn_fwd_pot(state))
-        push!(stats.idxs, length(stats.idxs))
-    end
-    stats
-end
 
 """
     nuts_state(group; rng, step_f, ...)
@@ -859,4 +843,225 @@ function step!(estimate::WelfordVariance, values::AbstractMatrix; kwargs...)
         step!(estimate, value; kwargs...)
     end
     estimate
+end
+
+# ---------------------------------------------------------------------------
+# GAP-1c — reactive trajectory / sampling recorders. The authoritative
+# buffers/counters/history live ONLY in a specialize=true @reactive object (its
+# HAVE sources); the derived `positions`/`gradients` VIEWS are computed in the
+# wrapper (not reactive SubArray slots, which would break generic copy). Every
+# resize/copy/push!/empty!/hcat mutation routes through the reactive boundary
+# (set!/mutate!) so invalidation/ownership stay sound. TrajectoryStats /
+# SamplingStats stay public nominal wrapper types.
+# ---------------------------------------------------------------------------
+
+@reactive specialize=true _trajectory_object(
+        dim, position_storage, gradient_storage, dhams, pots, idxs, first, count) =
+    begin end
+
+"""
+    TrajectoryStats
+    trajectory_stats(dimension, T=Float64)
+
+Optional recorder (public nominal wrapper over a `@reactive` object) for one NUTS
+transition's ordered positions, gradients, energy errors, potentials, and reveal
+order. Pass as `stats_f` to [`nuts_state`](@ref); [`sample!`](@ref) resets it.
+"""
+struct TrajectoryStats{O}
+    object::O
+end
+
+function Base.getproperty(stats::TrajectoryStats, name::Symbol)
+    name === :object && return getfield(stats, :object)
+    object = getfield(stats, :object)
+    if name === :positions
+        first = object.first; count = object.count
+        return @view object.position_storage[:, first:(first + count - 1)]
+    elseif name === :gradients
+        first = object.first; count = object.count
+        return @view object.gradient_storage[:, first:(first + count - 1)]
+    end
+    getproperty(object, name)
+end
+Base.propertynames(::TrajectoryStats, private::Bool = false) =
+    private ?
+    (:object, :dim, :position_storage, :gradient_storage, :dhams, :pots, :idxs,
+     :first, :count, :positions, :gradients) :
+    (:dim, :positions, :gradients, :dhams, :pots, :idxs)
+reactive_program(stats::TrajectoryStats) =
+    reactive_program(getfield(stats, :object))
+
+function trajectory_stats(dimension::Integer, ::Type{T} = Float64) where {T}
+    dimension >= 1 || throw(ArgumentError("dimension must be positive"))
+    capacity = 16
+    TrajectoryStats(_trajectory_object(
+        Int(dimension),
+        Matrix{T}(undef, dimension, capacity),
+        Matrix{T}(undef, dimension, capacity),
+        T[], T[], Int[], div(capacity, 2), 0))
+end
+
+# `positions`/`gradients` are wrapper-computed views, NOT reactive slots, so the
+# object holds only array/scalar HAVE sources — generic copy(object) deep-copies
+# the array sources while sharing the immutable program/handles, and the clone's
+# wrapper views recompute against the copied storage.
+Base.copy(stats::TrajectoryStats) =
+    TrajectoryStats(copy(getfield(stats, :object)))
+
+# Public source-field assignment forwards to the reactive object (the old struct was
+# mutable); the computed views are read-only.
+@inline function Base.setproperty!(stats::TrajectoryStats, name::Symbol, value)
+    (name === :positions || name === :gradients) && throw(ArgumentError(
+        "TrajectoryStats.$(name) is a computed read-only view"))
+    setproperty!(getfield(stats, :object), name, value)
+end
+
+function _reserve_trajectory_column!(stats::TrajectoryStats, prepend::Bool)
+    object = getfield(stats, :object); gs = object.state; handles = object.handles
+    capacity = size(object.position_storage, 2)
+    needs_room = prepend ? object.first == 1 :
+                 object.first + object.count > capacity
+    if needs_room
+        new_capacity = 2capacity
+        new_first = div(new_capacity - object.count, 2) + 1
+        new_ps = similar(object.position_storage, object.dim, new_capacity)
+        new_gs = similar(object.gradient_storage, object.dim, new_capacity)
+        if object.count > 0
+            source = object.first:(object.first + object.count - 1)
+            destination = new_first:(new_first + object.count - 1)
+            copyto!(@view(new_ps[:, destination]),
+                    @view(object.position_storage[:, source]))
+            copyto!(@view(new_gs[:, destination]),
+                    @view(object.gradient_storage[:, source]))
+        end
+        set!(gs, handles.position_storage, new_ps)
+        set!(gs, handles.gradient_storage, new_gs)
+        set!(gs, handles.first, new_first)
+    end
+    if prepend
+        set!(gs, handles.first, object.first - 1)
+        set!(gs, handles.count, object.count + 1)
+        object.first
+    else
+        column = object.first + object.count
+        set!(gs, handles.count, object.count + 1)
+        column
+    end
+end
+
+function reset!(stats::TrajectoryStats, point)
+    object = getfield(stats, :object); gs = object.state; handles = object.handles
+    length(point.pos) == object.dim || throw(DimensionMismatch(
+        "trajectory recorder dimension $(object.dim) does not match phase point " *
+        "dimension $(length(point.pos))"))
+    set!(gs, handles.count, 0)
+    set!(gs, handles.first, div(size(object.position_storage, 2), 2))
+    column = _reserve_trajectory_column!(stats, false)
+    mutate!(gs, handles.position_storage) do storage
+        storage[:, column] .= point.pos; storage
+    end
+    mutate!(gs, handles.gradient_storage) do storage
+        storage[:, column] .= -point.dham_dpos; storage
+    end
+    mutate!(gs, handles.dhams) do d; empty!(d); push!(d, zero(eltype(d))); d; end
+    mutate!(gs, handles.pots) do p; empty!(p); push!(p, point.pot); p; end
+    mutate!(gs, handles.idxs) do i; empty!(i); push!(i, 0); i; end
+    stats
+end
+
+# Forward-endpoint readers per sampler kind (NUTSState oracle vs CompiledNUTSState).
+_traj_fwd_pos(state::NUTSState) = state.fwd.pos
+_traj_fwd_pos(state::CompiledNUTSState) = _cn_fwd_pos(state)
+_traj_fwd_dpos(state::NUTSState) = state.fwd.dham_dpos
+_traj_fwd_dpos(state::CompiledNUTSState) = _cn_fwd_dpos(state)
+_traj_fwd_pot(state::NUTSState) = state.fwd.pot
+_traj_fwd_pot(state::CompiledNUTSState) = _cn_fwd_pot(state)
+
+function (stats::TrajectoryStats)(state::AbstractNUTSState)
+    object = getfield(stats, :object); gs = object.state; handles = object.handles
+    prepend = !state.go_forward
+    column = _reserve_trajectory_column!(stats, prepend)
+    pos = _traj_fwd_pos(state); dpos = _traj_fwd_dpos(state); pot = _traj_fwd_pot(state)
+    mutate!(gs, handles.position_storage) do storage
+        storage[:, column] .= pos; storage
+    end
+    mutate!(gs, handles.gradient_storage) do storage
+        storage[:, column] .= -dpos; storage
+    end
+    if prepend
+        mutate!(gs, handles.dhams) do d; pushfirst!(d, state.energy_error); d; end
+        mutate!(gs, handles.pots) do p; pushfirst!(p, pot); p; end
+        mutate!(gs, handles.idxs) do i; pushfirst!(i, length(i)); i; end
+    else
+        mutate!(gs, handles.dhams) do d; push!(d, state.energy_error); d; end
+        mutate!(gs, handles.pots) do p; push!(p, pot); p; end
+        mutate!(gs, handles.idxs) do i; push!(i, length(i)); i; end
+    end
+    stats
+end
+
+@reactive specialize=true _sampling_object(
+        trajectory, draws, n_steps, stepsizes, acc_rate, diverged,
+        full_history, full_idxs) = begin end
+
+"""
+    SamplingStats
+    sampling_stats(trajectory_stats)
+
+Public nominal wrapper accumulating per-transition draws, leapfrog counts,
+stepsizes, acceptance rates, divergence flags, and optional trajectory history in a
+`@reactive` object. Call as `stats(state, adaptation_state)` after a transition.
+"""
+struct SamplingStats{O}
+    object::O
+end
+
+@inline Base.getproperty(stats::SamplingStats, name::Symbol) =
+    name === :object ? getfield(stats, :object) :
+    getproperty(getfield(stats, :object), name)
+@inline Base.setproperty!(stats::SamplingStats, name::Symbol, value) =
+    setproperty!(getfield(stats, :object), name, value)
+Base.propertynames(stats::SamplingStats, private::Bool = false) =
+    propertynames(getfield(stats, :object), private)
+reactive_program(stats::SamplingStats) =
+    reactive_program(getfield(stats, :object))
+# Generic copy(object) would passthrough (alias) the non-array `trajectory` source,
+# so re-run the EXISTING program on deep-copied HAVE args (trajectory deep-copied
+# first) and reuse the shared immutable handles.
+function Base.copy(stats::SamplingStats)
+    o = getfield(stats, :object)
+    newstate = o.state.program(
+        copy(o.trajectory), copy(o.draws), copy(o.n_steps), copy(o.stepsizes),
+        copy(o.acc_rate), copy(o.diverged),
+        [copy(h) for h in o.full_history], [copy(i) for i in o.full_idxs])
+    SamplingStats(ReactiveObject{:_sampling_object}(newstate, o.handles))
+end
+
+function sampling_stats(trajectory::TrajectoryStats)
+    T = eltype(getfield(trajectory, :object).dhams)
+    dimension = trajectory.dim
+    SamplingStats(_sampling_object(
+        trajectory, Matrix{T}(undef, dimension, 0),
+        Int[], T[], T[], Bool[], Matrix{T}[], Vector{Int}[]))
+end
+
+function (stats::SamplingStats)(state::AbstractNUTSState, adaptation_state = nothing)
+    object = getfield(stats, :object); gs = object.state; handles = object.handles
+    trajectory = object.trajectory
+    set!(gs, handles.draws, hcat(object.draws, state.init.pos))
+    mutate!(gs, handles.n_steps) do n
+        push!(n, max(0, length(trajectory.dhams) - 1)); n
+    end
+    stepsize = hasproperty(state.step_f, :stepsize) ?
+               state.step_f.stepsize : oftype(state.energy_error, NaN)
+    mutate!(gs, handles.stepsizes) do s; push!(s, stepsize); s; end
+    mutate!(gs, handles.acc_rate) do a
+        push!(a, diagnostics(state).acceptance_rate); a
+    end
+    mutate!(gs, handles.diverged) do d; push!(d, state.diverged); d; end
+    mutate!(gs, handles.full_history) do h
+        push!(h, Matrix(trajectory.positions)); h
+    end
+    mutate!(gs, handles.full_idxs) do fi; push!(fi, copy(trajectory.idxs)); fi; end
+    stats
 end
