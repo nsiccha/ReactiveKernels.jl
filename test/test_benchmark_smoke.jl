@@ -18,10 +18,35 @@ end
 @testset "benchmark scripts parse (anti-rot)" begin
     for name in ("nuts_comparison.jl", "nuts_comparison_body.jl",
                  "nuts_microbench.jl", "nuts_microbench_ca9.jl",
-                 "_ca9_microbench_body.jl")
+                 "_ca9_microbench_body.jl", "_repro_guard.jl")
         path = joinpath(_BENCH_DIR, name)
         @test isfile(path)
         @test _parses(path)
+    end
+end
+
+@testset "reproducibility guard: attached rejected, detached accepted, dirty rejected" begin
+    include(joinpath(_BENCH_DIR, "_repro_guard.jl"))
+    mktempdir() do dir
+        repo = joinpath(dir, "repo")
+        run(`git init -q $repo`)
+        run(`git -C $repo config user.email t@example.com`)
+        run(`git -C $repo config user.name tester`)
+        write(joinpath(repo, "f.txt"), "x")
+        run(`git -C $repo add -A`)
+        run(`git -C $repo commit -q -m init`)
+        sha = readchomp(`git -C $repo rev-parse HEAD`)
+        # Attached-branch worktree is REJECTED even though it is tracked-clean.
+        att = joinpath(dir, "att")
+        run(`git -C $repo worktree add -q -b br $att $sha`)
+        @test_throws ErrorException _require_clean_detached_candidate(att)
+        # Clean detached worktree is ACCEPTED and returns the pinned SHA.
+        det = joinpath(dir, "det")
+        run(`git -C $repo worktree add -q --detach $det $sha`)
+        @test _require_clean_detached_candidate(det) == sha
+        # A dirty detached worktree is REJECTED.
+        write(joinpath(det, "f.txt"), "y")
+        @test_throws ErrorException _require_clean_detached_candidate(det)
     end
 end
 

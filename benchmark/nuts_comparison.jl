@@ -17,21 +17,11 @@ const _COMPARISON_INNER = "RK_NUTS_COMPARISON_INNER"
 const _MUTATING_FUNCTIONS_REVISION =
     "b353559ef3e391ae2e2d98256b6967903fdfa410"
 
-function _checked_candidate(root)
-    sha = readchomp(`git -C $root rev-parse HEAD`)
-    dirty = readchomp(
-        `git -C $root status --porcelain --untracked-files=no`,
-    )
-    isempty(dirty) || error(
-        "comparison requires a tracked-clean ReactiveKernels candidate; " *
-        "commit or revert these changes first:\n$dirty",
-    )
-    sha
-end
+include(joinpath(@__DIR__, "_repro_guard.jl"))
 
 function _run_pinned_comparison()
     root = normpath(joinpath(@__DIR__, ".."))
-    candidate_sha = _checked_candidate(root)
+    candidate_sha = _require_clean_detached_candidate(root)
     mktempdir(prefix = "reactivekernels-nuts-comparison-") do environment
         Pkg.activate(environment)
 

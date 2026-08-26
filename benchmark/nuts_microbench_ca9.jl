@@ -22,18 +22,11 @@ const _CA9_INNER = "RK_CA9_MICROBENCH_INNER"
 const _REACTIVE_OBJECTS_REV = "419881dcfe93fbf0c679837c5421322fbd2c6888"
 const _REACTIVE_HMC_REV = "ca9ea4ca41924bb0e1fadc01c717e1333916aba6"
 
-function _checked_candidate(root)
-    sha = readchomp(`git -C $root rev-parse HEAD`)
-    dirty = readchomp(`git -C $root status --porcelain --untracked-files=no`)
-    isempty(dirty) || error(
-        "the ca9 microbench requires a tracked-clean ReactiveKernels candidate; " *
-        "commit or run from a clean detached worktree first:\n$dirty")
-    sha
-end
+include(joinpath(@__DIR__, "_repro_guard.jl"))
 
 function _run_pinned()
     root = normpath(joinpath(@__DIR__, ".."))
-    candidate_sha = _checked_candidate(root)
+    candidate_sha = _require_clean_detached_candidate(root)
     mktempdir(prefix = "reactivekernels-ca9-microbench-") do environment
         Pkg.activate(environment)
         Pkg.add(Pkg.PackageSpec(
