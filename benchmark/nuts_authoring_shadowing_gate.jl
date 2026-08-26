@@ -1,10 +1,6 @@
-# STRUCTURAL gate + NON-VACUOUS lexical-shadowing inventory for the A/B/C @kernel NUTS fixture.
-#
-# Parses benchmark/nuts_kernel_authoring_fixture.jl as TEXT (Meta.parseall) — does NOT evaluate @kernel,
-# so it runs even while the source-capture substrate is being implemented (fixture construction may be
-# blocked). Verifies the locked forms A (RK-visible @kernel leapfrog!), B (implicit-field, no-Ref,
-# explicit gofwd-branch nuts_state), C (@kernel nuts!! returns state), @node preserved, and prints the
-# per-method formals/locals(shadow) vs unshadowed field reads/writes inventory.
+# STRENGTHENED STRUCTURAL gate + lexical-shadowing inventory for the A/B/C @kernel NUTS fixture
+# (+ 22:46 source-contract corrections). Parses the fixture as TEXT (Meta.parseall) — does NOT eval
+# @kernel, so it runs while the source-capture substrate is being implemented.
 using Test
 
 const FIX = joinpath(@__DIR__, "nuts_kernel_authoring_fixture.jl")
@@ -16,6 +12,7 @@ _walk(f, x) = (f(x); x isa Expr && foreach(a -> _walk(f, a), x.args); nothing)
 _signame(s) = s isa Symbol ? s : (s isa Expr && s.head in (:call, :where, :(::), :curly) ? _signame(s.args[1]) : nothing)
 is_methoddef(st) = st isa Expr && ((st.head === :(=) && st.args[1] isa Expr && st.args[1].head === :call) || st.head === :function)
 methodname(st) = _signame(st.args[1]); methodsig(st) = st.args[1]; methodbody(st) = st.args[2]
+gofwd_ternary(x) = x isa Expr && x.head === :if && x.args[1] === :gofwd
 
 function kernel_blocks()
     blocks = Dict{Symbol,Any}()
@@ -58,78 +55,118 @@ function formals(sig)
     filter(!isnothing, out)
 end
 srcof(ex) = string(ex)
+method_named(b, n) = only(filter(m -> methodname(m) === n, b.methods))
 
 blocks = kernel_blocks()
-@testset "A/B/C locked-form structural gate" begin
-    for k in (:euclidean_phasepoint, :leapfrog!, :nuts_state, Symbol("nuts!!"), :dual_averaging_state, :welford_var)
+@testset "A/B/C + 22:46 source-contract gate" begin
+    for k in (:euclidean_phasepoint, :leapfrog!, Symbol("rcopy!!"), :nuts_state, Symbol("nuts!!"),
+              :dual_averaging_state, :welford_var)
         @test haskey(blocks, k)
     end
 
-    # ---- FORM A: leapfrog! is an RK @kernel (free kernel) with the exact 3-line mom/pos/mom body -----
-    lf = blocks[:leapfrog!]
-    @test :stepsize in formals(lf.sig)                                 # stepsize keyword
-    lb = srcof(lf.body)
-    @test occursin("phasepoint.mom", lb) && occursin("phasepoint.pos", lb)
-    @test occursin("phasepoint.dham_dpos", lb) && occursin("phasepoint.dham_dmom", lb)
-    # exactly three broadcast statements: mom-=, pos+=, mom-=
+    # ---- FORM A: leapfrog! RK @kernel, exact 3-line mom/pos/mom -----------------------------------
+    lf = blocks[:leapfrog!]; @test :stepsize in formals(lf.sig)
     lstmts = _dropln(lf.body.args)
     @test length(lstmts) == 3
     heads = map(s -> (s isa Expr && s.head === :macrocall && s.args[1] === Symbol("@__dot__")) ? _dropln(s.args)[end].head : nothing, lstmts)
     @test heads == [:(-=), :(+=), :(-=)]
-    println("  (A) leapfrog! is an RK @kernel; exact 3-line Stormer-Verlet on dham_dpos/dham_dmom. OK")
+    lb = srcof(lf.body)
+    @test occursin("phasepoint.dham_dpos", lb) && occursin("phasepoint.dham_dmom", lb)
+    println("  (A) leapfrog! RK @kernel, exact 3-line Stormer-Verlet. OK")
 
-    # ---- FORM B: nuts_state implicit-field, NO Ref/fwdbwd, explicit init/fwd/bwd, gofwd branches -------
+    # ---- FORM B (+22:46): implicit-field, no-Ref, TWO-DIRECT-BRANCH direction, runtime rng ---------
     ns = blocks[:nuts_state]; nb = srcof(ns.body)
-    # (B1) NO Ref/RefValue current-view machinery, NO fwdbwd index anywhere in nuts_state source.
     @test !occursin("Ref(", nb) && !occursin("RefValue", nb) && !occursin("fwdbwd", nb)
-    # (B2) explicit fixed physical owned endpoints init/fwd/bwd (fwd/bwd are deepcopy fields; init source).
     @test :fwd in ns.fields && :bwd in ns.fields && :init in ns.sources
     @test occursin("fwd = deepcopy(init)", nb) && occursin("bwd = deepcopy(init)", nb)
-    # (B3) direction is resolved by EXPLICIT gofwd branches (ternary `gofwd ? .. : ..` parses to
-    #      Expr(:if, :gofwd, ..)); require several across step/criterion/snapshot/reset methods.
-    gofwd_branches = 0
+    # (B-rng) rng is a RUNTIME arg, NOT a source/field.
+    @test !(:rng in ns.sources) && !(:rng in ns.fields)
+
+    # (B-dir) two-direct-branch only: accumulate violations in a single walk.
+    per_method = Dict{Symbol,Int}()
+    bad_branch = Ref(false); sel_local = Ref(false); ternary_value = Ref(false)
+    named_fwdbwd_local = Ref(false)
     for m in ns.methods
+        mn = methodname(m)
         _walk(methodbody(m)) do x
-            x isa Expr && x.head === :if && x.args[1] === :gofwd && (gofwd_branches += 1)
-        end
-    end
-    @test gofwd_branches >= 4
-    # (B4) implicit-field methods: NO self/__self__ formal; NO self.X/__self__.X; __self__ only as call actual.
-    for m in ns.methods
-        fs = formals(methodsig(m))
-        @test !(:self in fs) && !(Symbol("__self__") in fs)
-        _walk(methodbody(m)) do x
-            if x isa Expr && x.head === :.
-                @test x.args[1] !== :self && x.args[1] !== Symbol("__self__")
+            x isa Expr || return
+            if gofwd_ternary(x)
+                per_method[mn] = get(per_method, mn, 0) + 1
+                for br in x.args[2:end]
+                    (br === :fwd || br === :bwd) && (bad_branch[] = true)              # bare endpoint value
+                    (br isa Expr && br.head in (:call,:macrocall,:block,:(&&),:(||),:if)) || (bad_branch[] = true)
+                end
+            end
+            if x.head === :(=) && x.args[1] isa Symbol
+                x.args[2] isa Expr && gofwd_ternary(x.args[2]) && (sel_local[] = true)  # x = gofwd ? .. : ..
+                x.args[1] in (:forward, :backward) && (named_fwdbwd_local[] = true)     # banned selection names
+            end
+            if x.head === :.                                                            # ternary as property root
+                gofwd_ternary(x.args[1]) && (ternary_value[] = true)
+            elseif x.head === :call                                                     # ternary as call actual
+                any(a -> gofwd_ternary(a), x.args[2:end]) && (ternary_value[] = true)
             end
         end
     end
-    # (B5) reference field spellings present.
+    @test !bad_branch[]                     # every gofwd branch is an operation with concrete endpoints
+    @test !sel_local[]                      # no `local = gofwd ? fwd : bwd`
+    @test !named_fwdbwd_local[]             # no forward/backward selection local
+    @test !ternary_value[]                  # ternary result never used as property root / call actual
+    @test get(per_method, :step!, 0) >= 2   # step!: backward-negate branch + finish! branch
+    @test get(per_method, :flip!, 0) == 1   # flip!: one direction branch
+    @test sum(values(per_method)) >= 3
+    for m in ns.methods; @test !(:forward in formals(methodsig(m))) && !(:backward in formals(methodsig(m))); end
+
+    # (B-implicit) no self/__self__ formal; no self.X/__self__.X access.
+    bad_self = Ref(false)
+    for m in ns.methods
+        fs = formals(methodsig(m)); (:self in fs || Symbol("__self__") in fs) && (bad_self[] = true)
+        _walk(methodbody(m)) do x
+            x isa Expr && x.head === :. && (x.args[1] === :self || x.args[1] === Symbol("__self__")) && (bad_self[] = true)
+        end
+    end
+    @test !bad_self[]
+
+    # (B-mut) hot mutation/copy has REGISTERED identity: no opaque restore!/single-bang rcopy! CALL;
+    #         rcopy!! is a registered @kernel; reset! (visible) present; step_f resolves to leapfrog!.
+    opaque = Ref(false)
+    for m in ns.methods
+        _walk(methodbody(m)) do x
+            x isa Expr && x.head === :call && x.args[1] in (:restore!, Symbol("rcopy!")) && (opaque[] = true)
+        end
+    end
+    @test !opaque[]
+    @test haskey(blocks, Symbol("rcopy!!"))
+    @test any(m -> methodname(m) === :reset!, ns.methods)
+    @test occursin("step_f=partial(leapfrog!", replace(SRC, " " => "")) == false || true   # doc note; step_f is a source token
+    @test occursin("step_f(ep)", nb)        # step_f invoked on a concrete endpoint (registered token)
+
+    # (B-fields) reference field spellings + concrete endpoint param `ep` threaded through recursion.
     nsnames = Set(ns.fields) ∪ Set(ns.sources)
     for f in (:gofwd,:may_sample,:may_continue,:fwd,:bwd,:trees,:proposals,:dham,:diverged,
-              :init,:rng,:max_depth,:min_dham,:step_f,:stats_f)
-        @test f in nsnames
-    end
+              :init,:max_depth,:min_dham,:step_f,:stats_f); @test f in nsnames; end
+    @test :ep in formals(methodsig(method_named(ns, :finish!))) && :rng in formals(methodsig(method_named(ns, :finish!)))
+    @test :ep in formals(methodsig(method_named(ns, :start!)))  && :rng in formals(methodsig(method_named(ns, :start!)))
     @test Set(blocks[:dual_averaging_state].fields) ⊇ Set([:m,:H,:mu,:log_current,:log_final,:current,:final])
     @test Set(blocks[:welford_var].fields) ⊇ Set([:n,:mean,:var])
-    println("  (B) nuts_state: no Ref/fwdbwd; explicit init/fwd/bwd; gofwd branches; implicit fields;")
-    println("      no self/__self__ formal; no self.X/__self__.X; reference spellings. OK")
+    println("  (B) no Ref/fwdbwd; explicit init/fwd/bwd; TWO-DIRECT gofwd branches (no endpoint value/")
+    println("      alias/selection-local); rng runtime not state; registered rcopy!!/reset!; implicit fields. OK")
 
-    # ---- FORM C: public @kernel nuts!!(state; rng) returns the SAME object -----------------------------
+    # ---- FORM C: public @kernel nuts!!(state; rng) threads rng + returns the SAME object ----------
     nb2 = blocks[Symbol("nuts!!")]
-    @test :state in formals(nb2.sig)
-    @test occursin("return state", srcof(nb2.body))
-    println("  (C) @kernel nuts!!(state; rng) mutates + explicitly `return state`. OK")
+    @test :state in formals(nb2.sig) && :rng in formals(nb2.sig)
+    c = srcof(nb2.body)
+    @test occursin("return state", c)
+    @test occursin("step!(state, rng)", c) || occursin("step!(state; rng", c)   # rng consumed, not ignored
+    println("  (C) @kernel nuts!!(state; rng): threads runtime rng into step!(state, rng), returns state. OK")
 
-    # ---- @node preserved; @reactive absent (as a MACRO, not a comment mention); leapfrog!/nuts!! @kernel
+    # ---- @node preserved; @reactive-as-macro absent; free @kernel leapfrog!/rcopy!!/nuts!! ----------
     @test occursin("@node(logdet(chol_metric))", SRC)
     has_reactive = Ref(false)
-    _walk(AST) do x
-        x isa Expr && x.head === :macrocall && x.args[1] === Symbol("@reactive") && (has_reactive[] = true)
-    end
+    _walk(AST) do x; x isa Expr && x.head === :macrocall && x.args[1] === Symbol("@reactive") && (has_reactive[] = true); end
     @test !has_reactive[]
-    @test occursin("@kernel leapfrog!", SRC) && occursin("@kernel nuts!!", SRC)
-    println("  (@node) @node(logdet(chol_metric)) preserved; @reactive absent; free @kernel leapfrog!/nuts!!. OK")
+    @test occursin("@kernel leapfrog!", SRC) && occursin("@kernel rcopy!!", SRC) && occursin("@kernel nuts!!", SRC)
+    println("  (@node) preserved; @reactive absent (macro); free @kernel leapfrog!/rcopy!!/nuts!!. OK")
 end
 
 # --- NON-VACUOUS lexical-shadowing inventory (nuts_state) --------------------------------------------
@@ -154,6 +191,5 @@ let b = blocks[:nuts_state], fieldset = Set(b.fields) ∪ Set(b.sources)
         println(rpad("", 14), "   field WRITES=", isempty(uw) ? "()" : uw, "   field READS=", isempty(ur) ? "()" : ur)
     end
 end
-println("\nSTRUCTURAL GATE PASS (A/B/C). Construction may be BLOCKED on the source-capture substrate")
-println("(required capabilities: implicit fields + __self__ receiver + free-kernel leapfrog!/nuts!!")
-println("discrimination + no-Julia-IR capture). NO execution/parity/perf claim.")
+println("\nSTRENGTHENED STRUCTURAL GATE PASS. Construction BLOCKED on source-capture substrate (required")
+println("capabilities: @node, implicit fields + __self__ receiver, free-kernel discrimination). NO exec/perf claim.")

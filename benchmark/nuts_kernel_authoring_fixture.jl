@@ -1,32 +1,34 @@
-# ReactiveHMC-STRUCTURE `@kernel` NUTS AUTHORING FIXTURE — implicit-field, no-Ref, RK-visible leapfrog,
-# `!!` public entry. Durable CONSUMER contract against the canonical LOCKED forms A/B/C (lead 22:35).
+# ReactiveHMC-STRUCTURE `@kernel` NUTS AUTHORING FIXTURE — implicit-field, no-Ref (two-direct-branch
+# direction), runtime rng, RK-visible leapfrog!/rcopy!!, `!!` public entry. Durable CONSUMER contract
+# against the canonical LOCKED forms A/B/C + the 22:46 source-contract corrections.
 #
-# Algorithm-STRUCTURE reference (NOT a bitwise target): ReactiveHMC.jl v0.1.0
-# (~/.julia/packages/ReactiveHMC/781sB/src, pinned main@ca9ea4ca) — phasepoints.jl / integrators.jl /
-# nuts.jl / adaptation.jl. Semantic fidelity, not token fidelity: improvements may change arithmetic/order
-# and must not preserve mistakes. Correctness is independent/mathematical, never bitwise/RNG agreement.
+# Algorithm-STRUCTURE reference (NOT a bitwise target): ReactiveHMC.jl v0.1.0 (781sB @ ca9ea4ca) —
+# phasepoints.jl / integrators.jl / nuts.jl / adaptation.jl. Semantic fidelity, not token/bitwise.
 #
-# DEVIATIONS from the reference source (semantic, user-ruled — named):
-#   (1) sole macro: @reactive -> @kernel.
-#   (2) NO Ref current-views (Ref was a source+backend mistake): explicit FIXED physical owned init/fwd/bwd
-#       structural copies; every direction-dependent op branches EXPLICITLY on `gofwd` so the compiler emits
-#       typed per-direction variants — never a current-view alias / Ref / fwdbwd index.
-#   (3) leapfrog! is an RK-authored FREE @kernel (visible ordered effects), passed ordinarily as
-#       step_f=partial(leapfrog!;stepsize=ε); it is NOT an opaque Julia call in the hot path.
-#   (4) public compiled entry is `@kernel nuts!!(state; rng)` — mutates compiler-owned concrete state and
-#       returns the SAME object (result === state), fixed shape/type, 0-B, no RefValue.
-#   @node(logdet(chol_metric)) is PRESERVED verbatim (named assignments are nodes automatically; anonymous
-#   inline subexpressions become nodes ONLY via @node — no heuristic AST extraction).
+# LOCKED FORMS + 22:46 CORRECTIONS honored:
+#  A) leapfrog! is an RK-authored FREE @kernel with visible ordered effects; step_f=partial(leapfrog!;ε).
+#  B) implicit-field methods; NO Ref/fwdbwd/current-view; explicit FIXED physical owned init/fwd/bwd.
+#     Direction is expressed as TWO DIRECT PHYSICAL-ENDPOINT BRANCH CALLS with a CONCRETE endpoint actual
+#     (`gofwd ? op!(__self__, fwd, …) : op!(__self__, bwd, …)`) — the conditional NEVER yields an endpoint
+#     value/alias/local; the concrete endpoint threads through the recursion as a plain method formal `ep`.
+#  C) public `@kernel nuts!!(state; rng)` mutates compiler-owned concrete state + `return state`
+#     (result===state, fixed shape/type, 0-B, no RefValue).
+#  RNG is a TYPED RUNTIME arg, NOT sampler state: `rng` is removed from nuts_state sources; `step!(rng;…)`
+#  threads it through every RNG-using sibling/recursive call; `nuts!!` calls `step!(state, rng)`.
+#  RESET/COPY are NAMED RK-VISIBLE strong-updates (NOT opaque restore!/rcopy!): `rcopy!!` is a registered
+#  @kernel owned-copy with visible effect roots; reset! establishes authoritative owned endpoint state via
+#  visible owned copies + control writes. step_f resolves to the registered leapfrog! token; a non-nothing
+#  stats_f must likewise be a registered kernel. @node(logdet(chol_metric)) preserved. (Exact owned-copy
+#  field-set / reset intrinsic contract follows the syntax/core strong-update contract.)
 #
-# STAGE: durable source-capture CONSUMER surface. Syntax is implementing the narrow source-capture
-# substrate; until it lands this may be CONSTRUCTION-BLOCKED (required-capability signal, NOT a defect —
-# implicit fields + __self__ receiver + free-kernel leapfrog!/nuts!! discrimination + no-Julia-IR capture).
-# NO execution/parity/0-B/perf claim here. Structural verification + the non-vacuous lexical-shadowing
-# inventory run via benchmark/nuts_authoring_shadowing_gate.jl (parses this file; does not eval @kernel).
+# STAGE: durable source-capture CONSUMER surface. CONSTRUCTION-BLOCKED on the current substrate (@node,
+# implicit fields + __self__ receiver, free-kernel discrimination pending syntax's source-capture
+# substrate) — required-capability signal, NOT a defect. NO execution/parity/0-B/perf claim; docs not
+# sourced. Structural verification + lexical-shadowing inventory via nuts_authoring_shadowing_gate.jl.
 using ReactiveKernels
 using LinearAlgebra, LogExpFunctions, Random
 
-# ---- nuts.jl / adaptation.jl module helpers (algorithm-structure reference) --------------------------
+# ---- module helpers (algorithm-structure reference) -------------------------------------------------
 fillf(f::Function, value, n::Int) = [f(value) for _ in 1:n]
 finiteorneginf(x) = isfinite(x) ? x : typeof(x)(-Inf)
 min1exp(x) = x >= 0 ? one(x) : exp(x)
@@ -41,121 +43,145 @@ trajectory(d::Int) = trajectory(zeros(d), zeros(d))
 trajectory(bwd, fwd) = (; bwd, fwd)
 mv(mom, dham_dmom) = (; mom, dham_dmom)
 mv(d::Int) = mv(zeros(d), zeros(d))
-tree(d::Int) = (;
-    log_weight = fill(-Inf, 2),
-    bwd = mv(d),
-    bwd_fwd = mv(d),
-    summed_mom = trajectory(d),
-)
+tree(d::Int) = (; log_weight = fill(-Inf, 2), bwd = mv(d), bwd_fwd = mv(d), summed_mom = trajectory(d))
 tree(phasepoint) = tree(length(phasepoint.pos))
+reset_one_tree!(t) = begin                      # visible buffer clears (owned scratch)
+    fill!(t.log_weight, -Inf)
+    @. t.bwd.mom = 0; @. t.bwd.dham_dmom = 0
+    @. t.bwd_fwd.mom = 0; @. t.bwd_fwd.dham_dmom = 0
+    @. t.summed_mom.bwd = 0; @. t.summed_mom.fwd = 0
+    t
+end
 
-# ---- phasepoints.jl: euclidean_phasepoint (methodless => stateless) — @node(logdet) PRESERVED ---------
+# ---- euclidean_phasepoint (methodless => stateless) — @node(logdet) PRESERVED ------------------------
 @kernel euclidean_phasepoint(pot_f, grad_f, metric, pos, mom) = begin
     pot = pot_f(pos)
     pot, dpot_dpos = grad_f(pos)
-
     chol_metric = cholesky(metric)
     dkin_dmom = chol_metric \ mom
     kin = .5 * (@node(logdet(chol_metric)) + dot(mom, dkin_dmom))
-
     ham = pot + kin
     dham_dpos = dpot_dpos
     dham_dmom = dkin_dmom
 end
 
-# ---- integrators.jl: leapfrog! — FORM A: RK-authored FREE @kernel with visible ordered effects --------
-# Passed ordinarily as step_f=partial(leapfrog!;stepsize=ε); factory binding static/inlined; no author
-# type ceremony; no hidden self-prepare. RK sees the ordered pos/mom writes + dham_dpos/dham_dmom reads.
+# ---- FORM A: leapfrog! — RK-authored FREE @kernel with visible ordered effects -----------------------
 @kernel leapfrog!(phasepoint; stepsize) = begin
     @. phasepoint.mom -= 0.5 * stepsize * phasepoint.dham_dpos
     @. phasepoint.pos +=       stepsize * phasepoint.dham_dmom
     @. phasepoint.mom -= 0.5 * stepsize * phasepoint.dham_dpos
 end
 
-# ---- nuts.jl: nuts_state — FORM B: implicit-field methods; NO Ref; explicit physical init/fwd/bwd; -----
-# direction resolved by EXPLICIT gofwd branches (typed per-direction variants); __self__ only as a call
-# actual. Bare owner fields + explicit child traversal (fwd.pos). `current forward` = gofwd ? fwd : bwd;
-# `current backward` = gofwd ? bwd : fwd.
-@kernel nuts_state(init; rng, max_depth = 10, min_dham = -1000.,
-                   step_f = nothing, stats_f = nothing) = begin
+# ---- rcopy!!: registered RK owned-copy strong-update with VISIBLE effect roots (replaces opaque rcopy!)
+# dest's owned buffers <- src. Representative visible field-set; exact owned-copy contract follows core.
+@kernel rcopy!!(dest, src) = begin
+    @. dest.pos = src.pos
+    @. dest.mom = src.mom
+    @. dest.dpot_dpos = src.dpot_dpos
+    @. dest.dham_dmom = src.dham_dmom
+    dest.pot = src.pot
+    dest.kin = src.kin
+    dest.ham = src.ham
+    return dest
+end
+
+# ---- nuts.jl: nuts_state — FORM B: implicit-field; NO Ref; explicit init/fwd/bwd; two-direct-branch ---
+# direction (concrete endpoint `ep` threaded); runtime rng; visible reset!/rcopy!! strong-updates.
+@kernel nuts_state(init; max_depth = 10, min_dham = -1000., step_f = nothing, stats_f = nothing) = begin
     gofwd = true
     may_sample = true
     may_continue = true
     fwd = deepcopy(init)                 # explicit FIXED physical owned endpoints (structural copies)
-    bwd = deepcopy(init)                 # NO Ref, NO fwdbwd index, NO current-view alias
+    bwd = deepcopy(init)
     trees = fillf(tree, init, max_depth + 1)
     proposals = fillf(deepcopy, init, max_depth + 2)
     dham = 0.
     diverged = !(dham >= min_dham)
-    stepfwd!() = step_f(gofwd ? fwd : bwd)                       # step the current forward (gofwd branch)
+
+    # reset establishes authoritative owned endpoint state — visible owned copies + control writes.
+    reset!() = begin
+        gofwd = true
+        may_sample = true
+        may_continue = true
+        dham = 0.
+        diverged = !(dham >= min_dham)
+        rcopy!!(fwd, init)               # registered owned-copy (visible)
+        rcopy!!(bwd, init)
+        for p in proposals; rcopy!!(p, init); end
+        for t in trees; reset_one_tree!(t); end
+    end
     collectstats!() = isnothing(stats_f) || stats_f(__self__)
     logadvanceprob(depth) = trees[depth-1].log_weight[1] - trees[depth].log_weight[1]
     swapproposal!(i, j = length(proposals)) = begin
         proposals[i], proposals[j] = proposals[j], proposals[i]
     end
-    step!(; force = true) = begin
-        restore!(__self__; force)
-        (gofwd ? bwd : fwd).mom .*= -1                           # negate current backward momentum
+
+    step!(rng; force = true) = begin
+        reset!(__self__)
+        gofwd ? (@. bwd.mom *= -1) : (@. fwd.mom *= -1)        # two direct branches; concrete backward
         trees[1].log_weight[1] = 0.
         for depth in 1:max_depth
             rand(rng, Bool) && flip!(__self__, depth)
-            finish_tree!(__self__, depth)
+            gofwd ? finish!(__self__, fwd, depth, rng) : finish!(__self__, bwd, depth, rng)
             may_sample || break
             randbernoullilog(rng, logswapprob(trees[depth])) && swapproposal!(__self__, depth)
             may_continue || break
         end
-        rcopy!(init, proposals[end])
+        rcopy!!(init, proposals[end])                          # registered owned-copy (visible)
     end
     flip!(depth) = if depth > 1
         gofwd = !gofwd
+        gofwd ? flip_neg!(__self__, bwd, depth) : flip_neg!(__self__, fwd, depth)   # concrete backward
+    end
+    flip_neg!(ep, depth) = begin
         tree = trees[depth]
-        backward = gofwd ? bwd : fwd                            # current backward AFTER toggle (gofwd branch)
-        @. tree.bwd.mom = -backward.mom
-        @. tree.bwd.dham_dmom = -backward.dham_dmom
+        @. tree.bwd.mom = -ep.mom
+        @. tree.bwd.dham_dmom = -ep.dham_dmom
         @. tree.summed_mom.fwd *= -1
     end
-    finish_tree!(depth) = begin
+    finish!(ep, depth, rng) = begin
         tree = trees[depth]
         suptree = trees[depth+1]
-        forward = gofwd ? fwd : bwd                             # current forward (gofwd branch)
         tree.log_weight[2] = tree.log_weight[1]
         if depth == 1
-            rcopy!(suptree.bwd, (; forward.mom, forward.dham_dmom))
+            @. suptree.bwd.mom = ep.mom                        # tree-data copies as visible broadcasts
+            @. suptree.bwd.dham_dmom = ep.dham_dmom
         else
-            rcopy!(suptree.bwd, tree.bwd)
-            rcopy!(tree.bwd_fwd, (; forward.mom, forward.dham_dmom))
-            tree.summed_mom.bwd .= tree.summed_mom.fwd
+            @. suptree.bwd.mom = tree.bwd.mom
+            @. suptree.bwd.dham_dmom = tree.bwd.dham_dmom
+            @. tree.bwd_fwd.mom = ep.mom
+            @. tree.bwd_fwd.dham_dmom = ep.dham_dmom
+            @. tree.summed_mom.bwd = tree.summed_mom.fwd
         end
-        start_tree!(__self__, depth)
+        start!(__self__, ep, depth, rng)
         may_continue || return may_sample = false
         suptree.log_weight[1] = logaddexp(tree.log_weight[1], tree.log_weight[2])
         may_continue = if depth == 1
-            suptree.summed_mom.fwd .= suptree.bwd.mom .+ forward.mom
-            compute_criterion(suptree.summed_mom.fwd, suptree.bwd.dham_dmom, forward.dham_dmom)
+            @. suptree.summed_mom.fwd = suptree.bwd.mom + ep.mom
+            compute_criterion(suptree.summed_mom.fwd, suptree.bwd.dham_dmom, ep.dham_dmom)
         else
-            suptree.summed_mom.fwd .= tree.summed_mom.bwd .+ tree.summed_mom.fwd
+            @. suptree.summed_mom.fwd = tree.summed_mom.bwd + tree.summed_mom.fwd
             (
-                compute_criterion(suptree.summed_mom.fwd, suptree.bwd.dham_dmom, forward.dham_dmom) &&
+                compute_criterion(suptree.summed_mom.fwd, suptree.bwd.dham_dmom, ep.dham_dmom) &&
                 compute_criterion(badd(tree.summed_mom.bwd, tree.bwd.mom),
                                   suptree.bwd.dham_dmom, tree.bwd.dham_dmom) &&
                 compute_criterion(badd(tree.bwd_fwd.mom, tree.summed_mom.fwd),
-                                  tree.bwd_fwd.dham_dmom, forward.dham_dmom)
+                                  tree.bwd_fwd.dham_dmom, ep.dham_dmom)
             )
         end
     end
-    start_tree!(depth) = if depth == 1
-        stepfwd!(__self__)
-        forward = gofwd ? fwd : bwd                             # current forward (gofwd branch)
-        dham = finiteorneginf(init.ham - forward.ham)
+    start!(ep, depth, rng) = if depth == 1
+        step_f(ep)                                             # registered leapfrog! token, concrete ep
+        dham = finiteorneginf(init.ham - ep.ham)
         collectstats!(__self__)
         diverged && return may_continue = false
         trees[1].log_weight[1] = dham
-        rcopy!(proposals[1], forward)
+        rcopy!!(proposals[1], ep)
     else
-        start_tree!(__self__, depth - 1)
+        start!(__self__, ep, depth - 1, rng)
         may_continue || return may_sample = false
         swapproposal!(__self__, depth - 1, depth)
-        finish_tree!(__self__, depth - 1)
+        finish!(__self__, ep, depth - 1, rng)
         if may_sample && randbernoullilog(rng, logadvanceprob(__self__, depth))
             swapproposal!(__self__, depth - 1, depth)
         end
@@ -163,10 +189,8 @@ end
 end
 
 # ---- FORM C: public compiled entry — mutate compiler-owned concrete state + return the SAME object -----
-# result === state; fixed shape; same identity/type; 0-B; no RefValue. Shape changes use a separate
-# non-hot reconstruction API (not this hot entry). `!!` alias/effect registration drives invalidation.
 @kernel nuts!!(state; rng) = begin
-    step!(state)          # one multinomial NUTS transition on compiler-owned concrete state
+    step!(state, rng)             # threads runtime rng; mutates compiler-owned concrete state
     return state
 end
 
