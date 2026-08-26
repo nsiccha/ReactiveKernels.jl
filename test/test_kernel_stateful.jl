@@ -185,6 +185,43 @@ end
     @. p.pos += s * tol
 end
 
+# D: owners whose method bodies CALL registered kernels — for callee-registration
+# snapshotting. A genuine bare call, a qualified call, and a call through a NON-const
+# name that we rebind after definition (rebind-before-access).
+@kernel owner_calls_leapfrog(pp) = begin
+    driver!(x) = leapfrog!(pp; stepsize = x)
+end
+M = ReactiveKernels                         # module-alias binding, rebound in the D probe
+@kernel owner_calls_qualified(d) = begin
+    refresh!(s) = M.copy!!(d, s)
+end
+mycallee = leapfrog!                        # NON-const binding, rebound in the D probe
+@kernel owner_calls_rebindable(pp) = begin
+    m!(x) = mycallee(pp; stepsize = x)
+end
+# a plain stateless @kernel — a DIRECT call to it is the rejected provenance category.
+@kernel plain_stateless(x) = begin
+    y = x + 1
+end
+# Owner-field exclusion: a registered GLOBAL `step_f` vs a nuts_state KWARG `step_f` — the
+# `step_f(fwd)` call is factory-time FIELD resolution, NOT a global capture.
+@kernel step_f(pp; stepsize) = begin
+    @. pp.pos += stepsize
+end
+@kernel nuts_state_fielded(ham; step_f) = begin
+    fwd = ham
+    drive!(x) = step_f(fwd)
+end
+# Two-method collision: a formal `gf` in method A must not suppress a genuine global `gf`
+# call in method B (per-body exclusion).
+@kernel gf(pp; stepsize) = begin
+    @. pp.pos += stepsize
+end
+@kernel owner_two_methods(pp) = begin
+    a!(gf) = gf
+    b!(x) = gf(pp; stepsize = x)
+end
+
 @testset "stateful @kernel substrate (Increment 1)" begin
     @testset "(3) methodless @kernel unchanged — routes to the stateless path" begin
         @kernel plain(f, x) = begin
@@ -867,5 +904,65 @@ end
         # Mode-2 too: fresh reconstruct each call
         @test RKS.kernel_spec(leapfrog!) isa KernelSpec
         @test RKS.kernel_spec(leapfrog!) !== RKS.kernel_spec(leapfrog!)
+    end
+
+    @testset "registered-callee identity snapshot at definition time (D)" begin
+        CR = RKS._CapturedCalleeRef
+        # genuine BARE call → captured registration, keyed by the AUTHORED SLOT. A key
+        # reconstructed FRESH from the authored GlobalRef/field (not reused from the
+        # stored tuple) finds the capture — value-semantic ==/hash.
+        bref = CR(GlobalRef(@__MODULE__, :leapfrog!), nothing)
+        reg = RKS.kernel_callee_registration(owner_calls_leapfrog, bref)
+        @test reg !== nothing
+        @test reg.token === RKS.kernel_token(leapfrog!) && reg.kind === :free_method
+        @test bref == CR(GlobalRef(@__MODULE__, :leapfrog!), nothing)   # value-semantic key
+        @test hash(bref) == hash(CR(GlobalRef(@__MODULE__, :leapfrog!), nothing))
+        # keys carry the authored SLOT (GlobalRef + field), never a raw Expr
+        @test all(cc -> cc.ref isa CR && cc.ref.slot isa GlobalRef,
+                  RKS.kernel_callee_registrations(owner_calls_leapfrog))
+        # retained target/source are deeply-immutable registered classes, NOT a live spec
+        for cc in RKS.kernel_callee_registrations(owner_calls_leapfrog)
+            @test !(cc.target isa KernelSpec) && !(cc.registration.source isa KernelSpec)
+        end
+
+        # QUALIFIED `M.f` → key is (module-slot, field). Bare `copy!!` and `M.copy!!` do
+        # NOT collapse to the same key.
+        qref = CR(GlobalRef(@__MODULE__, :M), Symbol("copy!!"))
+        qreg = RKS.kernel_callee_registration(owner_calls_qualified, qref)
+        @test qreg !== nothing && qreg.kind === :intrinsic && qreg.token === RKS.kernel_token(copy!!)
+        @test qref != CR(GlobalRef(@__MODULE__, Symbol("copy!!")), nothing)
+
+        # tokenless STATELESS direct call REJECTED; `:quote`/deferred + sibling not scanned
+        @test_throws ArgumentError RKS._kernel_capture_callees(@__MODULE__, (:plain_stateless,))
+        @test isempty(RKS._kernel_body_callee_refs(:(y = :(leapfrog!(z))), Set{Symbol}()))
+        @test isempty(RKS._kernel_body_callee_refs(:(sib!(x)), Set((:sib!,))))
+
+        # OWNER FIELD/KWARG exclusion: a registered global `step_f` does NOT get captured
+        # from `step_f(fwd)` where `step_f` is the owner kwarg (factory-time field).
+        @test RKS.kernel_callee_registration(nuts_state_fielded,
+                  CR(GlobalRef(@__MODULE__, :step_f), nothing)) === nothing
+        @test isempty(RKS.kernel_callee_registrations(nuts_state_fielded))
+
+        # TWO-METHOD collision (PER-BODY): a formal `gf` in method A must NOT suppress the
+        # genuine global `gf` call in method B.
+        greg = RKS.kernel_callee_registration(owner_two_methods, CR(GlobalRef(@__MODULE__, :gf), nothing))
+        @test greg !== nothing && greg.token === RKS.kernel_token(gf)
+
+        # REBIND-BEFORE-ACCESS via a NON-const alias: the captured identity is DETACHED.
+        aref = CR(GlobalRef(@__MODULE__, :mycallee), nothing)
+        @test RKS.kernel_callee_registration(owner_calls_rebindable, aref).token ===
+              RKS.kernel_token(leapfrog!)
+        @test !RKS.kernel_callee_rebound(owner_calls_rebindable, aref)   # not yet rebound
+        global mycallee = nuts!!                                          # rebind the alias
+        @test RKS.kernel_callee_registration(owner_calls_rebindable, aref).token ===
+              RKS.kernel_token(leapfrog!)                                 # STILL leapfrog! (detached)
+        @test RKS.kernel_callee_rebound(owner_calls_rebindable, aref)     # drift detected
+
+        # REBIND the QUALIFIER MODULE M: the accessor still finds the authored key and
+        # reports rebound — never downgrades to opaque.
+        @test !RKS.kernel_callee_rebound(owner_calls_qualified, qref)     # M still ReactiveKernels
+        global M = Base                                                   # rebind the module
+        @test RKS.kernel_callee_registration(owner_calls_qualified, qref).kind === :intrinsic
+        @test RKS.kernel_callee_rebound(owner_calls_qualified, qref)      # M.copy!! no longer resolves
     end
 end

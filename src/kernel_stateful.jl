@@ -423,23 +423,28 @@ function _kernel_thaw_method(m::NamedTuple)
 end
 _kernel_thaw_methods(methods) = Tuple(_kernel_thaw_method(m) for m in methods)
 
-struct _StatefulKernelSkeleton{Token,SN,M,R}
+struct _StatefulKernelSkeleton{Token,SN,M,R,C}
     name::Symbol
     mod::Module              # the DEFINITION module (for hygienic op GlobalRefs)
     spec_snapshot::SN        # DETACHED IMMUTABLE owner-spec provenance (a `_ChildSnapshot`);
                              #   the field/port metadata is captured, never a live mutable spec
     methods::M               # per-method meta with DEEPLY FROZEN signature/call/body
     recipe_source::R         # frozen, detached recipe-statement source (see _FrozenExpr)
+    callee_regs::C           # immutable def-time snapshot: authored callee ref => registration
 end
 # `Token` is a phantom type parameter — the unique definition token, a per-expansion
 # gensym Symbol carried as `Val{Token}` (unique, typed overload identity, no minted
 # struct / no world-age hazard / no mutable registry). Supplied explicitly.
 _StatefulKernelSkeleton(name::Symbol, ::Val{Token}, mod::Module, spec_snapshot::SN,
-                        methods::M, recipe_source::R) where {Token,SN,M,R} =
-    _StatefulKernelSkeleton{Token,SN,M,R}(name, mod, spec_snapshot, methods, recipe_source)
+                        methods::M, recipe_source::R,
+                        callee_regs::C) where {Token,SN,M,R,C} =
+    _StatefulKernelSkeleton{Token,SN,M,R,C}(name, mod, spec_snapshot, methods,
+                                            recipe_source, callee_regs)
 
 kernel_token(skel::_StatefulKernelSkeleton{Token}) where {Token} = Token
 kernel_module(skel::_StatefulKernelSkeleton) = getfield(skel, :mod)
+# D: immutable def-time snapshot of direct registered callees (detached identities).
+kernel_callee_registrations(skel::_StatefulKernelSkeleton) = getfield(skel, :callee_regs)
 # FRESH reconstructed planning `KernelSpec` per call from the detached snapshot — never
 # a shared live authority, so mutating a returned spec/graph cannot change a later read.
 kernel_spec(skel::_StatefulKernelSkeleton) = _kernel_reconstruct(getfield(skel, :spec_snapshot))
@@ -529,7 +534,12 @@ function _kernel_stateful_expand(name, signature_inputs, call_signature, block,
              # E: capture a DETACHED IMMUTABLE snapshot of the owner spec at definition
              # time instead of storing the live mutable authority.
              Expr(:call, _kernel_capture_child, QuoteNode(name), esc(spec_expr)),
-             method_meta, recipe_source)))
+             method_meta, recipe_source,
+             # D: snapshot each direct registered callee's identity, PER METHOD BODY —
+             # sibling/owner-field/formal/local names excluded (pending/factory-time).
+             _kernel_callee_capture_expr(
+                 _kernel_mode1_callee_pairs(signature_inputs, recipe_stmts, methods),
+                 __module__))))
 end
 
 # --- Mode-2 free-method recognition (V7 implicit-field pivot) ----------------
@@ -640,7 +650,7 @@ _kernel_is_bangbang_name(name::Symbol) = endswith(String(name), "!!")
 # write/read effect roots, the ports-only recipe `spec` (the signature ports; the
 # body holds mutations, not owner recipes), the frozen body source (poc lowers it),
 # and the `!!` registration flag. Later increments add the specializing factory.
-struct _Mode2KernelSkeleton{Token,SN,M,B}
+struct _Mode2KernelSkeleton{Token,SN,M,B,C}
     name::Symbol
     mod::Module
     subject::Symbol
@@ -650,15 +660,17 @@ struct _Mode2KernelSkeleton{Token,SN,M,B}
     method::M                # (; name, subject, write_roots, read_roots, signature[frozen], call[frozen])
     body_source::B           # frozen, detached body-statement source (see _FrozenExpr)
     is_bang_bang::Bool
+    callee_regs::C           # immutable def-time snapshot: authored callee ref => registration
 end
 _Mode2KernelSkeleton(name::Symbol, ::Val{Token}, mod::Module, subject::Symbol,
                      spec_snapshot::SN, write_roots, read_roots, method::M,
-                     body_source::B, is_bb::Bool) where {Token,SN,M,B} =
-    _Mode2KernelSkeleton{Token,SN,M,B}(name, mod, subject, spec_snapshot, Tuple(write_roots),
-                                       Tuple(read_roots), method, body_source, is_bb)
+                     body_source::B, is_bb::Bool, callee_regs::C) where {Token,SN,M,B,C} =
+    _Mode2KernelSkeleton{Token,SN,M,B,C}(name, mod, subject, spec_snapshot, Tuple(write_roots),
+                                         Tuple(read_roots), method, body_source, is_bb, callee_regs)
 
 kernel_token(skel::_Mode2KernelSkeleton{Token}) where {Token} = Token
 kernel_module(skel::_Mode2KernelSkeleton) = getfield(skel, :mod)
+kernel_callee_registrations(skel::_Mode2KernelSkeleton) = getfield(skel, :callee_regs)
 kernel_spec(skel::_Mode2KernelSkeleton) = _kernel_reconstruct(getfield(skel, :spec_snapshot))
 kernel_port_names(skel::_Mode2KernelSkeleton) =
     _kernel_snapshot_port_names(getfield(skel, :spec_snapshot))
@@ -709,7 +721,11 @@ function _kernel_mode2_expand(name, signature_inputs, call_signature, block,
              Expr(:call, Val, QuoteNode(token_sym)), __module__, QuoteNode(subject),
              # E: detached immutable owner-spec snapshot, not the live authority.
              Expr(:call, _kernel_capture_child, QuoteNode(name), esc(spec_expr)),
-             roots.writes, roots.reads, method_meta, body_source, is_bb)))
+             roots.writes, roots.reads, method_meta, body_source, is_bb,
+             # D: snapshot each direct registered callee's identity — the free method's
+             # own name + subject/formals + body locals excluded (pending/factory-time).
+             _kernel_callee_capture_expr(
+                 _kernel_mode2_callee_pairs(name, signature_inputs, block), __module__))))
 end
 
 # --- registered-kernel resolver + hygiene/rebind discriminator ---------------
@@ -821,6 +837,221 @@ function kernel_rebound(captured::_KernelRegistration, current)
     # Token-less (stateless): value identity is the only sound handle — two DISTINCT
     # specs are a rebind. NEVER report unchanged just because there is no Token.
     cur.source !== captured.source
+end
+
+# --- D: registered-callee identity SNAPSHOT (definition-time provenance) ------
+#
+# Direct registered callees appearing in captured method bodies get their
+# registration identity SNAPSHOTTED at owner/free-kernel definition time — not
+# re-resolved from the module global when method_irs later runs. So a callee name
+# rebound BEFORE analysis never silently substitutes the rebound definition: the
+# detached captured `_KernelRegistration` is authoritative, and `kernel_rebound`
+# detects the drift. Callable FIELDS (e.g. a `step_f` kwarg) are factory-time
+# registered values, NOT global snapshots, and are out of scope here.
+
+# The binding name(s) on an assignment LHS: `x`, `x::T`, or a `(a, b)` tuple.
+function _kernel_binding_names(lhs)
+    if lhs isa Symbol
+        Symbol[lhs]
+    elseif lhs isa Expr && lhs.head === :(::) && lhs.args[1] isa Symbol
+        Symbol[lhs.args[1]]
+    elseif lhs isa Expr && lhs.head === :tuple
+        reduce(vcat, (_kernel_binding_names(a) for a in lhs.args); init = Symbol[])
+    else
+        Symbol[]
+    end
+end
+
+# The owner FIELD/PORT names — signature inputs plus recipe-output LHS names — which are
+# callable-field/factory-time values, NOT global callees.
+function _kernel_owner_field_names(signature_inputs, recipe_stmts)
+    names = Set{Symbol}(first(i) for i in signature_inputs)
+    for s in recipe_stmts
+        s isa LineNumberNode && continue
+        stmt = (s isa Expr && s.head === :macrocall) ? s.args[end] : s   # peel @recipe meta
+        (stmt isa Expr && stmt.head === :(=)) || continue
+        union!(names, _kernel_binding_names(stmt.args[1]))
+    end
+    names
+end
+
+# Names bound by a plain `=` assignment anywhere in `body` — method LOCALS (a callee
+# spelled like a local is a local, not a global).
+function _kernel_body_local_names(body)
+    locals = Symbol[]
+    local walk
+    walk = function (x)
+        x isa Expr || return
+        x.head === :(=) && length(x.args) >= 1 && append!(locals, _kernel_binding_names(x.args[1]))
+        for a in x.args
+            walk(a)
+        end
+        return
+    end
+    walk(body)
+    locals
+end
+
+# PER-METHOD `(body, exclusions)` pairs for a Mode-1 owner. SHARED across methods:
+# sibling method names + owner field/port names. PER-METHOD: that method's formals +
+# that body's locals — so a formal/local `f` in method A never suppresses a genuine
+# registered global `f` call in method B.
+function _kernel_mode1_callee_pairs(signature_inputs, recipe_stmts, methods)
+    shared = Set{Symbol}(m.name for m in methods)
+    union!(shared, _kernel_owner_field_names(signature_inputs, recipe_stmts))
+    map(methods) do m
+        excl = copy(shared)
+        union!(excl, m.argnames)
+        m.vararg === nothing || push!(excl, m.vararg)
+        m.kwargs_splat === nothing || push!(excl, m.kwargs_splat)
+        union!(excl, _kernel_body_local_names(m.body))
+        (m.body, excl)
+    end
+end
+
+# The single `(body, exclusions)` pair for a Mode-2 free method: its own name + the
+# subject/formals (signature inputs) + body locals.
+function _kernel_mode2_callee_pairs(name, signature_inputs, block)
+    excl = Set{Symbol}((name,))
+    union!(excl, (first(i) for i in signature_inputs))
+    union!(excl, _kernel_body_local_names(block))
+    [(block, excl)]
+end
+
+# Distinct DIRECT callee references at `:call` heads in ONE `body`, EXCLUDING every name
+# in `exclusions` — sibling/subject-method names, owner field/port names, and THIS body's
+# formals/locals — which are pending/factory-time values that take PRECEDENCE over any
+# same-spelled global. `:quote`/deferred syntax is not descended into. Bare `f` → `:f`;
+# `Mod.f` → `(:Mod, :f)`; both immutable, never a QuoteNode wrapping a mutable Expr.
+function _kernel_body_callee_refs(body, exclusions)
+    refs = Any[]
+    seen = Set{Any}()
+    local walk
+    walk = function (x)
+        x isa Expr || return
+        x.head === :quote && return                       # skip quoted/deferred syntax
+        if x.head === :call && !isempty(x.args)
+            c = x.args[1]
+            ref = c isa Symbol ? (c in exclusions ? nothing : c) :
+                  (c isa Expr && c.head === :(.) && length(c.args) == 2 &&
+                   c.args[1] isa Symbol && c.args[2] isa QuoteNode) ?
+                      (c.args[1], c.args[2].value) : nothing
+            ref !== nothing && !(ref in seen) && (push!(seen, ref); push!(refs, ref))
+        end
+        for a in x.args
+            walk(a)
+        end
+        return
+    end
+    walk(body)
+    refs
+end
+
+# The IMMUTABLE AUTHORED-REFERENCE key — the binding SLOT the author actually wrote,
+# NOT the resolved target (a target-only key collapses `f` with `M.f` and two module
+# aliases, and cannot be re-validated after the qualifier is rebound). `slot` is the
+# authored binding in the owner module (`GlobalRef(owner_mod, :f)` bare, or the module
+# slot `GlobalRef(owner_mod, :M)` qualified); `field` is `nothing` (bare) or the field
+# name (`:f` for `M.f`).
+struct _CapturedCalleeRef
+    slot::GlobalRef
+    field::Union{Symbol,Nothing}
+end
+# One captured direct callee: the authored slot key + the DETACHED registration payload
+# (Token/source/effect metadata) + the resolved target identity (for rebind validation).
+struct _CapturedCallee
+    ref::_CapturedCalleeRef
+    registration::_KernelRegistration
+    target::Any
+end
+
+# VALUE-SEMANTIC key equality: an independently reconstructed key (same authored module
+# IDENTITY + slot name + field) matches the stored one — lookup never depends on reusing
+# the captured `cc.ref` object. Module compared by identity; name/field by value.
+Base.:(==)(a::_CapturedCalleeRef, b::_CapturedCalleeRef) =
+    a.slot.mod === b.slot.mod && a.slot.name === b.slot.name && a.field === b.field
+Base.isequal(a::_CapturedCalleeRef, b::_CapturedCalleeRef) = a == b
+Base.hash(r::_CapturedCalleeRef, h::UInt) =
+    hash(r.field, hash(r.slot.name, hash(objectid(r.slot.mod), h)))
+
+# Re-resolve an authored slot ref through the CURRENT module state (for rebind checks):
+# the resolved value, or `nothing` if the slot/qualifier no longer resolves.
+function _kernel_resolve_captured_ref(ref::_CapturedCalleeRef)
+    slot = ref.slot
+    isdefined(slot.mod, slot.name) || return nothing
+    base = getglobal(slot.mod, slot.name)
+    ref.field === nothing && return base
+    (base isa Module && isdefined(base, ref.field)) || return nothing
+    getglobal(base, ref.field)
+end
+
+# At DEFINITION time: for each authored callee ref build its authored-slot key, resolve
+# the target + registration, and keep the REGISTERED ones. An ordinary Julia callee is
+# omitted. A tokenless STATELESS direct-call category is REJECTED deterministically (its
+# live `KernelSpec` must not be retained as semantic source) until the factory consumes it.
+function _kernel_capture_callees(mod::Module, refs)
+    caps = _CapturedCallee[]
+    for ref in refs
+        if ref isa Symbol
+            cref = _CapturedCalleeRef(GlobalRef(mod, ref), nothing)
+            isdefined(mod, ref) || continue
+            target = getglobal(mod, ref)
+        else                                       # (M, f) authored qualified
+            outer, nm = ref
+            cref = _CapturedCalleeRef(GlobalRef(mod, outer), nm)
+            isdefined(mod, outer) || continue
+            om = getglobal(mod, outer)
+            (om isa Module && isdefined(om, nm)) || continue
+            target = getglobal(om, nm)
+        end
+        reg = kernel_registration(target)
+        reg === nothing && continue
+        reg.kind === :stateless && throw(ArgumentError(
+            "direct call to a stateless @kernel `$(cref.field === nothing ? cref.slot.name : cref.field)` " *
+            "is not a captured provenance category in Increment 1 (its live KernelSpec must " *
+            "not be retained as semantic source); compose/prepare it through the factory instead."))
+        push!(caps, _CapturedCallee(cref, reg, target))
+    end
+    Tuple(caps)
+end
+
+function _kernel_find_captured_callee(skel, ref::_CapturedCalleeRef)
+    for cc in kernel_callee_registrations(skel)
+        cc.ref == ref && return cc
+    end
+    nothing
+end
+
+# Look up the captured registration by AUTHORED-SLOT key — no current-global resolution
+# (the payload is detached), so a rebind never downgrades this to opaque.
+function kernel_callee_registration(skel, ref::_CapturedCalleeRef)
+    cc = _kernel_find_captured_callee(skel, ref)
+    cc === nothing ? nothing : cc.registration
+end
+
+# `true` iff the authored slot/qualifier no longer resolves to the captured target — a
+# rebind of the name (or, for `M.f`, of the module `M`). Throws on an unknown ref.
+function kernel_callee_rebound(skel, ref::_CapturedCalleeRef)
+    cc = _kernel_find_captured_callee(skel, ref)
+    cc === nothing && throw(ArgumentError("no captured callee for $(ref)"))
+    _kernel_resolve_captured_ref(ref) !== cc.target
+end
+
+# The macro-time capture expression: `_kernel_capture_callees(__module__, (refs…))`,
+# each ref an IMMUTABLE quoted value (Symbol or `(Symbol,Symbol)`), never a QuoteNode
+# wrapping a mutable Expr.
+function _kernel_callee_capture_expr(body_excl_pairs, __module__)
+    refs = Any[]
+    seen = Set{Any}()
+    for (body, excl) in body_excl_pairs                # PER-BODY exclusions, unioned refs
+        for r in _kernel_body_callee_refs(body, excl)
+            !(r in seen) && (push!(seen, r); push!(refs, r))
+        end
+    end
+    ref_exprs = map(refs) do r
+        r isa Symbol ? QuoteNode(r) : Expr(:tuple, QuoteNode(r[1]), QuoteNode(r[2]))
+    end
+    Expr(:call, _kernel_capture_callees, __module__, Expr(:tuple, ref_exprs...))
 end
 
 # --- source-marker recognition: @node / deepcopy / partial -------------------
