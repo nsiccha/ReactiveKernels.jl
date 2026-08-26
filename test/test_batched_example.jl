@@ -1,12 +1,14 @@
 using Test
 
 include(joinpath(@__DIR__, "..", "examples", "batched.jl"))
-using .BatchedExamples
 using ReactiveKernels: code_expr
 
+# Reference the module qualified rather than `using .BatchedExamples`: the
+# distributions example module exports the same `all_sources`/`evaluate_source`
+# names, and both are loaded in the same test session.
 @testset "Batched (vectorized) log-density example" begin
-    artifact = only(map(evaluate_source, all_sources()))
-    source = only(all_sources())
+    artifact = only(map(BatchedExamples.evaluate_source, BatchedExamples.all_sources()))
+    source = only(BatchedExamples.all_sources())
 
     @testset "one native graph, checked against a Distributions oracle" begin
         # The source composes a @kernel recipe and differentiates through
