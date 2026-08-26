@@ -67,10 +67,14 @@ end
     _ValueGradient(value, gradient)
 end
 
+_kinetic_energy(chol, momentum, velocity) =
+    convert(eltype(velocity),
+            (logdet(chol) + dot(momentum, velocity)) / 2)
+
 struct _KineticBundleOp end
 @inline function (::_KineticBundleOp)(chol, momentum)
     velocity = chol \ momentum
-    _Kinetic(0.5 * (logdet(chol) + dot(momentum, velocity)), velocity)
+    _Kinetic(_kinetic_energy(chol, momentum, velocity), velocity)
 end
 
 # Hand-written, MutatingFunctions-agnostic in-place hook. Contract: reuse and
@@ -85,7 +89,7 @@ end
                                    chol, momentum)
     copyto!(cache.velocity, momentum)
     ldiv!(chol, cache.velocity)
-    cache.kinetic = 0.5 * (logdet(chol) + dot(momentum, cache.velocity))
+    cache.kinetic = _kinetic_energy(chol, momentum, cache.velocity)
     cache
 end
 @inline _nuts_cache_apply(cache, op, args...) = op(args...)
@@ -195,15 +199,19 @@ function reactive_nuts_group(potential_gradient!, metric, position, momentum;
     add!(graph, (gofwd_value, ports[:fwd_ham], ports[:bwd_ham]) => active_ham,
          (forward, forward_ham, backward_ham) ->
              forward ? forward_ham : backward_ham)
+    # `dham` is the finite-guarded energy error init_ham - active_ham (matching the
+    # oracle's _finite_or_neginf(init.ham - forward.ham) exactly), and `min_dham` is
+    # a reactive HAVE source so the divergence threshold can be changed and
+    # `diverged` recomputes reactively.
     dham = value!(graph, :dham, typeof(ham0))
     add!(graph, (ports[:init_ham], active_ham) => dham,
-         (init_ham, selected_ham) -> init_ham - selected_ham)
+         (init_ham, selected_ham) -> _finite_or_neginf(init_ham - selected_ham))
+    min_dham_value = value!(graph, :min_dham, typeof(ham0))
     diverged = value!(graph, :diverged, Bool)
-    minimum_dham = Float64(min_dham)
-    add!(graph, dham => diverged,
-         energy_error -> !(energy_error >= minimum_dham))
+    add!(graph, (dham, min_dham_value) => diverged,
+         (energy_error, threshold) -> !(energy_error >= threshold))
 
-    haves = (metric_value, gofwd_value,
+    haves = (metric_value, gofwd_value, min_dham_value,
              ports[:init_pos], ports[:init_mom],
              ports[:fwd_pos], ports[:fwd_mom],
              ports[:bwd_pos], ports[:bwd_mom])
@@ -216,18 +224,18 @@ function reactive_nuts_group(potential_gradient!, metric, position, momentum;
     program = _prepare_reactive(graph; have = haves, want = wants,
                                 cache_apply = _nuts_cache_apply,
                                 is_mutating = _nuts_is_mutating)
-    state = program(metric, gofwd,
+    state = program(metric, gofwd, convert(typeof(ham0), min_dham),
                     copy(position), copy(momentum),
                     copy(position), copy(momentum),
                     copy(position), copy(momentum))
 
-    handle_names = (:metric, :gofwd, :chol_metric,
+    handle_names = (:metric, :gofwd, :min_dham, :chol_metric,
                     :active_ham, :dham, :diverged,
                     (Symbol(endpoint, suffix)
                      for endpoint in _REACTIVE_NUTS_ENDPOINTS
                      for suffix in (:_pos, :_mom, :_pot, :_dpot_dpos,
                                     :_kin, :_dham_dmom, :_ham))...)
-    handle_ports = (metric_value, gofwd_value, chol,
+    handle_ports = (metric_value, gofwd_value, min_dham_value, chol,
                     active_ham, dham, diverged,
                     (ports[Symbol(endpoint, suffix)]
                      for endpoint in _REACTIVE_NUTS_ENDPOINTS
@@ -258,7 +266,7 @@ mutable struct _NUTSProposal{V<:AbstractVector}
 end
 _nuts_proposal(pos, mom) = _NUTSProposal(copy(pos), copy(mom))
 
-mutable struct CompiledNUTSState{R,G,F,S,T,TR,PR}
+mutable struct CompiledNUTSState{R,G,F,S,T,TR,PR} <: AbstractNUTSState
     rng::R
     group::G                 # the flat compiled-reactive phase-point group
     step_f::F
@@ -277,16 +285,52 @@ mutable struct CompiledNUTSState{R,G,F,S,T,TR,PR}
     acceptance_sum::T
 end
 
+# A concrete, typed read-only view of the group's `init` endpoint that mirrors the
+# ordinary phase-point interface (`.pos/.mom/.ham/.metric/.dham_dpos/.dham_dmom/
+# .pot/.chol_metric`) used by adaptation, statistics, and user callbacks. It maps
+# each name to the corresponding `init_*` (or shared) reactive node, so consumers
+# see the init endpoint — never the whole group.
+struct _CompiledInitView{G}
+    group::G
+end
+@inline function Base.getproperty(view::_CompiledInitView, name::Symbol)
+    group = getfield(view, :group)
+    name === :pos && return group.init_pos
+    name === :mom && return group.init_mom
+    name === :ham && return group.init_ham
+    name === :pot && return group.init_pot
+    name === :dham_dpos && return group.init_dpot_dpos
+    name === :dham_dmom && return group.init_dham_dmom
+    name === :metric && return group.metric
+    name === :chol_metric && return group.chol_metric
+    name === :group && return group
+    return getproperty(group, name)
+end
+
 # Expose ca9-style property names over the group so the compiled state reads like
-# the reference object (`state.dham`, `state.gofwd`, `state.init.pos`, ...).
+# the reference object (`state.dham`, `state.gofwd`, `state.init.pos`, ...). `init`
+# is a typed init-endpoint view, NOT the whole group.
 function Base.getproperty(state::CompiledNUTSState, name::Symbol)
     name === :dham && return getfield(state, :energy_error)
     name === :gofwd && return getfield(state, :go_forward)
-    name === :init && return getfield(state, :group)
+    name === :init && return _CompiledInitView(getfield(state, :group))
     getfield(state, name)
 end
 
 reactive_program(state::CompiledNUTSState) = state.group.state.program
+
+# --- State-access interface for the shared adaptation/statistics helpers. ---
+_nuts_position(state::CompiledNUTSState) = state.group.init_pos
+_nuts_metric(state::CompiledNUTSState) = state.group.metric
+function _set_nuts_metric!(state::CompiledNUTSState, metric)
+    set!(state.group.state, state.group.handles.metric, metric)
+    metric
+end
+function _nuts_metric_is_source(state::CompiledNUTSState)
+    handles = state.group.handles
+    hasproperty(handles, :metric) &&
+        state.group.state.program.sources[_slot_index(handles.metric)]
+end
 
 """
     compiled_nuts_state(init::ReactivePhasePoint; rng, step_f, stats_f=nothing,
@@ -310,13 +354,27 @@ function compiled_nuts_state(group::ReactivePhasePoint; rng, step_f,
                              min_dham = -1000.0)
     max_depth >= 1 || throw(ArgumentError("max_depth must be positive"))
     handle_names = keys(getfield(group, :handles))
-    all(name -> name in handle_names, _REACTIVE_NUTS_REQUIRED_HANDLES) ||
+    all(name -> name in handle_names, (_REACTIVE_NUTS_REQUIRED_HANDLES...,
+                                       :min_dham)) ||
         throw(ArgumentError(
             "compiled_nuts_state requires a flat phase-point group from " *
             "reactive_nuts_group; got a ReactivePhasePoint without the " *
-            "init/fwd/bwd + gofwd/dham handles"))
+            "init/fwd/bwd + gofwd/dham/min_dham handles"))
+    # The compiled transition drives one in-place leapfrog on the active endpoint.
+    # Only `partial(leapfrog!; stepsize=...)` is supported; reject any other
+    # integrator rather than silently ignoring its func/args.
+    (step_f isa PartialFunction && step_f.func === leapfrog! &&
+     isempty(step_f.largs) && isempty(step_f.rargs) &&
+     hasproperty(step_f, :stepsize)) || throw(ArgumentError(
+        "compiled_nuts_state supports step_f = partial(leapfrog!; stepsize=...); " *
+        "other integrators are not yet supported on the compiled group"))
     prototype = group.init_mom
     scalar = typeof(float(group.init_ham - group.init_ham))
+    # Sync the reactive divergence threshold so group.diverged uses this min_dham.
+    # Convert to the group's potential scalar type (which may differ from the
+    # coordinate eltype), read off the existing min_dham source value.
+    set!(group.state, group.handles.min_dham,
+         convert(typeof(group.min_dham), min_dham))
     trees = [_nuts_tree((; mom = prototype)) for _ in 1:(max_depth + 1)]
     proposals = [_nuts_proposal(group.init_pos, group.init_mom)
                  for _ in 1:(max_depth + 2)]
@@ -340,10 +398,10 @@ end
 # integrator: mom half-kick (reads gradient), pos drift (reads velocity), mom
 # half-kick (reads recomputed gradient). Uses the group's per-slot in-place
 # bundles, so the reactive recompute is allocation-free.
-@inline function _cn_endpoint_leapfrog!(state::CompiledNUTSState, ::Val{P},
-                                        stepsize) where {P}
-    gs = state.group.state
-    handles = state.group.handles
+@inline function _group_leapfrog!(group::ReactivePhasePoint, ::Val{P},
+                                  stepsize) where {P}
+    gs = group.state
+    handles = group.handles
     mom_h = getfield(handles, Symbol(P, :_mom))
     pos_h = getfield(handles, Symbol(P, :_pos))
     grad_h = getfield(handles, Symbol(P, :_dpot_dpos))
@@ -363,13 +421,13 @@ end
         @. momentum -= 0.5 * stepsize * gradient2
         momentum
     end
-    state
+    group
 end
 
 @inline function _cn_step_forward!(state::CompiledNUTSState)
     stepsize = state.step_f.stepsize
-    state.go_forward ? _cn_endpoint_leapfrog!(state, Val(:fwd), stepsize) :
-                       _cn_endpoint_leapfrog!(state, Val(:bwd), stepsize)
+    state.go_forward ? _group_leapfrog!(state.group, Val(:fwd), stepsize) :
+                       _group_leapfrog!(state.group, Val(:bwd), stepsize)
 end
 
 # Keep the reactive selection source in sync with go_forward, so the group's
@@ -452,10 +510,12 @@ function _cn_start_tree!(state::CompiledNUTSState, depth::Int)
     if depth == 1
         _cn_step_forward!(state)
         state.n_steps += 1
-        # Reactive energy error: init_ham - active_ham, selected by gofwd.
-        state.energy_error = _finite_or_neginf(state.group.dham)
+        # Reactive energy error + divergence read straight from the group's compiled
+        # nodes: dham = _finite_or_neginf(init_ham - active_ham), selected by gofwd;
+        # diverged = !(dham >= min_dham) over the reactive min_dham threshold source.
+        state.energy_error = state.group.dham
         state.acceptance_sum += _min1exp(state.energy_error)
-        state.diverged = !(state.energy_error >= state.min_energy_error)
+        state.diverged = state.group.diverged
         _cn_collect_stats!(state)
         if state.diverged
             state.may_continue = false
@@ -601,24 +661,69 @@ function refresh_momentum!(state::CompiledNUTSState)
 end
 
 function sample!(state::CompiledNUTSState)
+    state.stats_f isa TrajectoryStats && reset!(state.stats_f, state.init)
     refresh_momentum!(state)
     step!(state)
 end
+# sample!(state, draws) is the shared AbstractNUTSState method in hmc.jl.
 
-function sample!(state::CompiledNUTSState, draws::Integer;
-                 discard_initial::Integer = 0)
-    draws >= 0 || throw(ArgumentError("draws must be non-negative"))
-    discard_initial >= 0 || throw(ArgumentError(
-        "discard_initial must be non-negative"))
-    for _ in 1:discard_initial
-        sample!(state)
-    end
-    position = state.group.init_pos
-    samples = Matrix{eltype(position)}(undef, length(position), draws)
-    stats = Vector{NUTSDiagnostics{typeof(state.energy_error)}}(undef, draws)
-    for draw in 1:draws
-        stats[draw] = sample!(state)
-        samples[:, draw] .= state.group.init_pos
-    end
-    (; samples, diagnostics = stats)
+# --- Adaptation probe: one-step acceptance at a candidate stepsize. Mirrors the
+# oracle's _probe_acceptance (same RNG draw order) so find_initial_stepsize! is
+# transition-for-transition identical to the oracle. ---
+function _probe_acceptance(state::CompiledNUTSState, stepsize)
+    refresh_momentum!(state)
+    probe = copy(state.group)
+    handles = probe.handles
+    gs = probe.state
+    copy_group!(gs, (handles.fwd_pos, handles.fwd_mom),
+                (handles.init_pos, handles.init_mom))
+    set!(gs, handles.gofwd, true)
+    _group_leapfrog!(probe, Val(:fwd), stepsize)
+    # probe.dham = _finite_or_neginf(init_ham - fwd_ham) — the one-step energy error.
+    _min1exp(probe.dham)
 end
+
+# --- Forward-endpoint readers for the optional TrajectoryStats recorder. ---
+@inline _cn_fwd_dpos(state) =
+    state.go_forward ? state.group.fwd_dpot_dpos : state.group.bwd_dpot_dpos
+@inline _cn_fwd_pot(state) =
+    state.go_forward ? state.group.fwd_pot : state.group.bwd_pot
+
+function (stats::TrajectoryStats)(state::CompiledNUTSState)
+    prepend = !state.go_forward
+    column = _reserve_trajectory_column!(stats, prepend)
+    stats.position_storage[:, column] .= _cn_fwd_pos(state)
+    stats.gradient_storage[:, column] .= -_cn_fwd_dpos(state)
+    if prepend
+        pushfirst!(stats.dhams, state.energy_error)
+        pushfirst!(stats.pots, _cn_fwd_pot(state))
+        pushfirst!(stats.idxs, length(stats.idxs))
+    else
+        push!(stats.dhams, state.energy_error)
+        push!(stats.pots, _cn_fwd_pot(state))
+        push!(stats.idxs, length(stats.idxs))
+    end
+    stats
+end
+
+"""
+    nuts_state(point::ReactivePhasePoint; rng, step_f, ...)
+
+Construct a NUTS sampler. When `point` is a flat phase-point group from
+[`reactive_nuts_group`](@ref) it builds the compiled-reactive
+[`CompiledNUTSState`](@ref) (the default public path); a plain single-endpoint
+phase point builds the ordinary-Julia reference oracle (`_oracle_nuts_state`,
+retained for parity tests).
+"""
+function nuts_state(point::ReactivePhasePoint; kwargs...)
+    _is_reactive_nuts_group(point) || throw(ArgumentError(
+        "nuts_state builds the compiled-reactive sampler and requires a flat " *
+        "phase-point group from reactive_nuts_group(potential_gradient!, metric, " *
+        "position, momentum); got a plain phase point. Build a group first, or " *
+        "use the internal reference oracle _oracle_nuts_state for parity checks."))
+    compiled_nuts_state(point; kwargs...)
+end
+
+_is_reactive_nuts_group(point::ReactivePhasePoint) =
+    all(name -> name in keys(getfield(point, :handles)),
+        (:gofwd, :min_dham, :init_pos, :fwd_pos, :bwd_pos, :dham))

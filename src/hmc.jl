@@ -421,7 +421,14 @@ phase-point, integrator, adaptation, and statistics utilities used with it. It
 does not claim to include ReactiveHMC's separate fixed-length HMC state or its
 SoftAbs/relativistic phase-point constructors.
 """
-mutable struct NUTSState{R,P,F,S,T,TR,PR}
+# Shared supertype for the ordinary-Julia oracle and the compiled-reactive
+# sampler. The adaptation (step-size search, dual averaging, metric windows) and
+# statistics helpers dispatch on this type through a small state-access interface
+# (`_nuts_position`, `_nuts_metric`, `_set_nuts_metric!`, `_nuts_metric_is_source`,
+# `_probe_acceptance`, `_set_stepsize!`) so the sampler math is written once.
+abstract type AbstractNUTSState end
+
+mutable struct NUTSState{R,P,F,S,T,TR,PR} <: AbstractNUTSState
     rng::R
     init::P
     step_f::F
@@ -454,6 +461,16 @@ _forward(state::NUTSState) =
 _backward(state::NUTSState) =
     state.endpoints[state.go_forward ? 2 : 1]
 
+# --- State-access interface for the shared adaptation/statistics helpers. ---
+_nuts_position(state::NUTSState) = state.init.pos
+_nuts_metric(state::NUTSState) = state.init.metric
+_set_nuts_metric!(state::NUTSState, metric) = (state.init.metric = metric)
+function _nuts_metric_is_source(state::NUTSState)
+    point = state.init
+    hasproperty(point.handles, :metric) &&
+        point.state.program.sources[_slot_index(point.handles.metric)]
+end
+
 """
     nuts_state(init; rng, step_f, stats_f=nothing,
                max_depth=10, min_dham=-1000)
@@ -463,7 +480,7 @@ integrator callable such as `partial(leapfrog!; stepsize=0.25)`. A low-level
 [`step!`](@ref) uses the momentum currently stored in `init`; [`sample!`](@ref)
 refreshes momentum before each transition and is the convenient sampling API.
 """
-function nuts_state(init::ReactivePhasePoint; rng,
+function _oracle_nuts_state(init::ReactivePhasePoint; rng,
                     step_f,
                     stats_f = nothing,
                     max_depth::Integer = 10,
@@ -716,7 +733,8 @@ draw. `discard_initial` only discards transitions; it does not adapt the step
 size or metric. For an adaptive workflow, call [`warmup!`](@ref) first and then
 call `sample!` with `discard_initial=0` (the default).
 """
-function sample!(state::NUTSState, draws::Integer; discard_initial::Integer = 0)
+function sample!(state::AbstractNUTSState, draws::Integer;
+                discard_initial::Integer = 0)
     draws >= 0 || throw(ArgumentError("draws must be non-negative"))
     discard_initial >= 0 || throw(ArgumentError(
         "discard_initial must be non-negative",
@@ -724,12 +742,12 @@ function sample!(state::NUTSState, draws::Integer; discard_initial::Integer = 0)
     for _ in 1:discard_initial
         sample!(state)
     end
-    position = state.init.pos
+    position = _nuts_position(state)
     samples = Matrix{eltype(position)}(undef, length(position), draws)
     stats = Vector{NUTSDiagnostics{typeof(state.energy_error)}}(undef, draws)
     for draw in 1:draws
         stats[draw] = sample!(state)
-        samples[:, draw] .= state.init.pos
+        samples[:, draw] .= _nuts_position(state)
     end
     (; samples, diagnostics = stats)
 end
@@ -822,7 +840,7 @@ function _with_stepsize(f::PartialFunction, stepsize)
     )
 end
 
-function _set_stepsize!(state::NUTSState, stepsize)
+function _set_stepsize!(state::AbstractNUTSState, stepsize)
     state.step_f isa PartialFunction || throw(ArgumentError(
         "automatic step-size adaptation requires step_f = partial(integrator!; stepsize=...)",
     ))
@@ -853,7 +871,7 @@ updates rerun the search before restarting dual averaging. It does not move the
 chain's position. `state.step_f` must have been built with
 `partial(integrator!; stepsize=...)`.
 """
-function find_initial_stepsize!(state::NUTSState;
+function find_initial_stepsize!(state::AbstractNUTSState;
                                 initial = one(state.energy_error),
                                 target = 0.8,
                                 min_stepsize = eps(typeof(state.energy_error)),
@@ -910,7 +928,7 @@ function _warmup_window_ends(iterations::Int, initial_buffer::Int,
     ends
 end
 
-function _adapted_diagonal_metric(point::ReactivePhasePoint,
+function _adapted_diagonal_metric(current_metric,
                                   estimate::WelfordVariance;
                                   minimum_variance,
                                   regularization = 5)
@@ -926,7 +944,7 @@ function _adapted_diagonal_metric(point::ReactivePhasePoint,
     # Welford estimates position covariance, so the frequency-equalizing
     # diagonal mass is its reciprocal.
     mass_diagonal = @. inv(position_variance)
-    current = point.metric
+    current = current_metric
     if current isa Diagonal
         return Diagonal(convert(typeof(current.diag), mass_diagonal))
     end
@@ -948,7 +966,7 @@ diagnostics, and metric-window boundaries. For a fixed metric set
 `adapt_metric=false`. The current implementation intentionally supports
 Euclidean phase points whose `metric` is a declared source.
 """
-function warmup!(state::NUTSState, iterations::Integer;
+function warmup!(state::AbstractNUTSState, iterations::Integer;
                  target_accept = 0.8,
                  adapt_metric::Bool = true,
                  initial_buffer::Union{Nothing,Integer} = nothing,
@@ -965,16 +983,10 @@ function warmup!(state::NUTSState, iterations::Integer;
     minimum_variance > zero(minimum_variance) || throw(ArgumentError(
         "minimum_variance must be positive",
     ))
-    point = state.init
     if adapt_metric
-        hasproperty(point.handles, :metric) || throw(ArgumentError(
-            "metric adaptation requires a phase point with a metric property",
+        _nuts_metric_is_source(state) || throw(ArgumentError(
+            "metric adaptation requires metric to be a ReactiveProgram HAVE source",
         ))
-        metric_handle = point.handles.metric
-        point.state.program.sources[_slot_index(metric_handle)] ||
-            throw(ArgumentError(
-                "metric adaptation requires metric to be a ReactiveProgram HAVE source",
-            ))
     end
 
     n = Int(iterations)
@@ -996,11 +1008,12 @@ function warmup!(state::NUTSState, iterations::Integer;
         n, initial_count, terminal_count, window_size,
     ) : Int[]
 
+    position = _nuts_position(state)
     initial_stepsize = find_initial_stepsize!(state)
     adaptation = dual_averaging_state(
         initial_stepsize; target = target_accept,
     )
-    variance = welford_var(length(point.pos), eltype(point.pos))
+    variance = welford_var(length(position), eltype(position))
     warmup_diagnostics = Vector{NUTSDiagnostics{typeof(state.energy_error)}}(
         undef, n,
     )
@@ -1014,13 +1027,14 @@ function warmup!(state::NUTSState, iterations::Integer;
         _set_stepsize!(state, adaptation.current)
 
         inside_slow_window = initial_count < iteration <= n - terminal_count
-        adapt_metric && inside_slow_window && step!(variance, point.pos)
+        adapt_metric && inside_slow_window &&
+            step!(variance, _nuts_position(state))
         if next_window <= length(window_ends) &&
            iteration == window_ends[next_window]
             metric = _adapted_diagonal_metric(
-                point, variance; minimum_variance,
+                _nuts_metric(state), variance; minimum_variance,
             )
-            point.metric = metric
+            _set_nuts_metric!(state, metric)
             restart_stepsize = find_initial_stepsize!(
                 state; initial = state.step_f.stepsize,
             )
@@ -1028,7 +1042,8 @@ function warmup!(state::NUTSState, iterations::Integer;
                 restart_stepsize; target = target_accept,
             )
             adaptation_updates = 0
-            variance = welford_var(length(point.pos), eltype(point.pos))
+            variance = welford_var(length(_nuts_position(state)),
+                                   eltype(_nuts_position(state)))
             next_window += 1
         end
     end
@@ -1036,7 +1051,7 @@ function warmup!(state::NUTSState, iterations::Integer;
     (;
         initial_stepsize,
         final_stepsize = state.step_f.stepsize,
-        metric = copy(point.metric),
+        metric = copy(_nuts_metric(state)),
         diagnostics = warmup_diagnostics,
         metric_window_ends = window_ends,
     )
@@ -1125,7 +1140,7 @@ function _reserve_trajectory_column!(stats::TrajectoryStats, prepend::Bool)
     end
 end
 
-function reset!(stats::TrajectoryStats, point::ReactivePhasePoint)
+function reset!(stats::TrajectoryStats, point)
     length(point.pos) == stats.dim || throw(DimensionMismatch(
         "trajectory recorder dimension $(stats.dim) does not match phase point dimension $(length(point.pos))",
     ))
@@ -1187,7 +1202,7 @@ function sampling_stats(trajectory::TrajectoryStats{T}) where {T}
     )
 end
 
-function (stats::SamplingStats)(state::NUTSState, adaptation_state = nothing)
+function (stats::SamplingStats)(state::AbstractNUTSState, adaptation_state = nothing)
     stats.draws = hcat(stats.draws, state.init.pos)
     push!(stats.n_steps, max(0, length(stats.trajectory.dhams) - 1))
     stepsize = hasproperty(state.step_f, :stepsize) ?

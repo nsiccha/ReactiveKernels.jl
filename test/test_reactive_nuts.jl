@@ -305,7 +305,7 @@ end
         )
         q0 = _det_pos(D)
 
-        oracle = nuts_state(
+        oracle = ReactiveKernels._oracle_nuts_state(
             euclidean_phasepoint(_std_pot,
                                  q -> (_std_pot(q), copy(q)), metric, copy(q0),
                                  zeros(D));
@@ -341,7 +341,7 @@ end
     D = 4
     metric = Matrix{Float64}(I, D, D)
     q0 = _det_pos(D)
-    oracle = nuts_state(
+    oracle = ReactiveKernels._oracle_nuts_state(
         euclidean_phasepoint(_std_pot, q -> (_std_pot(q), copy(q)), metric,
                              copy(q0), zeros(D));
         rng = Xoshiro(77), step_f = partial(leapfrog!; stepsize = 0.3), max_depth = 6)
@@ -390,7 +390,7 @@ end
                              A'A + 6 * I)))
         q0 = _det_pos(D)
         m0 = _det_mom(D)
-        oracle = nuts_state(
+        oracle = ReactiveKernels._oracle_nuts_state(
             euclidean_phasepoint(_std_pot, q -> (_std_pot(q), copy(q)), metric,
                                  copy(q0), copy(m0));
             rng = Xoshiro(9), step_f = partial(leapfrog!; stepsize = 0.2),
@@ -423,4 +423,130 @@ end
                                  Matrix{Float64}(I, 3, 3), zeros(3), zeros(3))
     @test_throws ArgumentError compiled_nuts_state(
         plain; rng = Xoshiro(1), step_f = partial(leapfrog!; stepsize = 0.1))
+end
+
+@testset "CompiledNUTSState — public nuts_state default + integrator/threshold" begin
+    D = 4
+    metric = Matrix{Float64}(I, D, D)
+    q0 = _det_pos(D)
+    group = reactive_nuts_group(_std_pot_grad!, metric, copy(q0), zeros(D))
+
+    # Public nuts_state builds the COMPILED state for a group.
+    state = nuts_state(group; rng = Xoshiro(1),
+                       step_f = partial(leapfrog!; stepsize = 0.2))
+    @test state isa CompiledNUTSState
+    @test reactive_program(state) === group.state.program
+
+    # A plain (non-group) phase point is rejected with actionable guidance.
+    plain = euclidean_phasepoint(_std_pot, q -> (_std_pot(q), copy(q)),
+                                 metric, zeros(D), zeros(D))
+    @test_throws ArgumentError nuts_state(plain; rng = Xoshiro(1),
+                                          step_f = partial(leapfrog!; stepsize = 0.2))
+
+    # Non-leapfrog integrators are rejected.
+    g2 = reactive_nuts_group(_std_pot_grad!, metric, copy(q0), zeros(D))
+    @test_throws ArgumentError compiled_nuts_state(
+        g2; rng = Xoshiro(1),
+        step_f = partial(generalized_leapfrog!; stepsize = 0.2, n_fi_steps = 1))
+    @test_throws ArgumentError compiled_nuts_state(
+        g2; rng = Xoshiro(1), step_f = leapfrog!)
+
+    # The min_dham threshold is a reactive HAVE source: compiled_nuts_state syncs it
+    # and changing it invalidates/recomputes the group's diverged node.
+    g3 = reactive_nuts_group(_std_pot_grad!, metric, copy(q0), zeros(D))
+    st = compiled_nuts_state(g3; rng = Xoshiro(1),
+                             step_f = partial(leapfrog!; stepsize = 0.2),
+                             min_dham = -1000.0)
+    @test g3.min_dham == -1000.0
+    g3.fwd_mom = 50.0 .* _det_mom(D)          # large energy error, dham very negative
+    @test g3.dham < -1000.0
+    @test g3.diverged == true
+    g3.min_dham = -1.0e9                        # loosen threshold reactively
+    @test g3.diverged == false                  # diverged recomputed reactively
+end
+
+@testset "CompiledNUTSState — reactive group.diverged is CONSUMED (validity)" begin
+    # Non-vacuous regression: the compiled transition must READ the reactive
+    # group.diverged node, so its slot is VALID (computed) at every stats callback —
+    # never hand-computed with the diverged node left stale/invalid.
+    D = 4
+    metric = Matrix{Float64}(I, D, D)
+    group = reactive_nuts_group(_std_pot_grad!, metric, _det_pos(D), zeros(D))
+    diverged_handle = group.handles.diverged
+    dham_handle = group.handles.dham
+    diverged_slot = ReactiveKernels._slot_index(diverged_handle)
+    dham_slot = ReactiveKernels._slot_index(dham_handle)
+
+    validities = Tuple{Bool,Bool}[]
+    recorder = function (state)
+        gstate = state.group.state
+        push!(validities, (gstate.valid[dham_slot], gstate.valid[diverged_slot]))
+    end
+    state = compiled_nuts_state(group; rng = Xoshiro(3),
+                                step_f = partial(leapfrog!; stepsize = 0.2),
+                                stats_f = recorder, max_depth = 4)
+    for _ in 1:5
+        sample!(state)
+    end
+    @test !isempty(validities)
+    @test all(v -> v == (true, true), validities)   # diverged CONSUMED, not stale
+end
+
+@testset "CompiledNUTSState — warmup! adaptation parity with the oracle" begin
+    D = 4
+    q0 = _det_pos(D)
+    oracle = ReactiveKernels._oracle_nuts_state(
+        euclidean_phasepoint(_std_pot, q -> (_std_pot(q), copy(q)),
+                             Matrix{Float64}(I, D, D), copy(q0), zeros(D));
+        rng = Xoshiro(123), step_f = partial(leapfrog!; stepsize = 0.5),
+        max_depth = 6)
+    compiled = nuts_state(
+        reactive_nuts_group(_std_pot_grad!, Matrix{Float64}(I, D, D),
+                            copy(q0), zeros(D));
+        rng = Xoshiro(123), step_f = partial(leapfrog!; stepsize = 0.5),
+        max_depth = 6)
+
+    ow = warmup!(oracle, 200; target_accept = 0.8)
+    cw = warmup!(compiled, 200; target_accept = 0.8)
+    @test cw.initial_stepsize == ow.initial_stepsize
+    @test cw.final_stepsize == ow.final_stepsize
+    @test cw.metric == ow.metric
+    @test cw.metric_window_ends == ow.metric_window_ends
+
+    # Post-warmup sampling stays in exact lockstep.
+    oc = sample!(oracle, 100)
+    cc = sample!(compiled, 100)
+    @test cc.samples == oc.samples
+end
+
+@testset "CompiledNUTSState — Float32 group divergence control" begin
+    D = 3
+    metric = Matrix{Float32}(I, D, D)
+    q0 = Float32[sin(1.0f0 * i) for i in 1:D]
+    m0 = Float32[cos(0.7f0 * i) for i in 1:D]
+    f32_grad!(g, q) = (copyto!(g, q); 0.5f0 * sum(abs2, q))
+    group = reactive_nuts_group(f32_grad!, metric, copy(q0), copy(m0))
+    @test eltype(group.init_pos) === Float32
+    @test group.min_dham isa Float32
+    st = compiled_nuts_state(group; rng = Xoshiro(5),
+                             step_f = partial(leapfrog!; stepsize = 0.2f0),
+                             min_dham = -1000.0)
+    @test group.min_dham == -1000.0f0
+    group.fwd_mom = 100.0f0 .* m0
+    @test group.diverged == true
+end
+
+@testset "CompiledNUTSState — @inferred public step! + init view inference" begin
+    D = 4
+    group = reactive_nuts_group(_std_pot_grad!, Matrix{Float64}(I, D, D),
+                                _det_pos(D), zeros(D))
+    state = nuts_state(group; rng = Xoshiro(2),
+                       step_f = partial(leapfrog!; stepsize = 0.2), max_depth = 5)
+    refresh_momentum!(state)
+    @test (@inferred step!(state)) isa NUTSDiagnostics
+    # Init endpoint view exposes phase-point fields with concrete inferred types.
+    initview = state.init
+    @test (@inferred((v -> v.pos)(initview)))::Vector{Float64} == group.init_pos
+    @test (@inferred((v -> v.ham)(initview)))::Float64 == group.init_ham
+    @test (@inferred((v -> v.metric)(initview))) == group.metric
 end
