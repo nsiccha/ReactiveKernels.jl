@@ -1,38 +1,32 @@
-# ReactiveHMC.jl-FAITHFUL `@kernel` NUTS AUTHORING FIXTURE.
+# ReactiveHMC-STRUCTURE `@kernel` NUTS AUTHORING FIXTURE — implicit-field, no-Ref, RK-visible leapfrog,
+# `!!` public entry. Durable CONSUMER contract against the canonical LOCKED forms A/B/C (lead 22:35).
 #
-# Re-authored (correct-then-rebase) directly against the ACTUAL ReactiveHMC.jl source — NOT the
-# in-repo oracle. Reference provenance:
-#   ReactiveHMC v0.1.0, installed at ~/.julia/packages/ReactiveHMC/781sB/src, pinned in
-#   ReactiveKernels' src/hmc.jl to main@ca9ea4ca41924bb0e1fadc01c717e1333916aba6
-#   (github.com/nsiccha/ReactiveHMC.jl/blob/ca9ea4ca.../src/nuts.jl). Files transcribed:
-#   phasepoints.jl (euclidean_phasepoint), integrators.jl (leapfrog!), nuts.jl (nuts_state +
-#   tree helpers), adaptation.jl (dual_averaging_state, welford_var).
+# Algorithm-STRUCTURE reference (NOT a bitwise target): ReactiveHMC.jl v0.1.0
+# (~/.julia/packages/ReactiveHMC/781sB/src, pinned main@ca9ea4ca) — phasepoints.jl / integrators.jl /
+# nuts.jl / adaptation.jl. Semantic fidelity, not token fidelity: improvements may change arithmetic/order
+# and must not preserve mistakes. Correctness is independent/mathematical, never bitwise/RNG agreement.
 #
-#   DEVIATIONS from the reference source (named explicitly — this is NOT a verbatim copy):
-#     (i)   @reactive  ->  the unified sole @kernel.
-#     (ii)  implicit-field capture + __self__  ->  an explicit `self` first method parameter (so
-#           method bodies read/write self.<field>); a namespace/self adaptation required by @kernel.
-#     (iii) @node(logdet(chol_metric))  ->  plain logdet(chol_metric): the @node caching hint is
-#           dropped because caching/hoisting must be INFERRED by @kernel's analysis, not annotated.
-#   Everything else — field NAMES, object COMPOSITION, the pot_f/grad_f phase-point shape, the Ref
-#   current-view for fwd/bwd, the direct in-object state mutation, the DA (m/H/mu + fit!) and Welford
-#   (n/mean/var + step!(x;kwargs...)) recurrences, and the restore!/rcopy! reset — is the reference's.
+# DEVIATIONS from the reference source (semantic, user-ruled — named):
+#   (1) sole macro: @reactive -> @kernel.
+#   (2) NO Ref current-views (Ref was a source+backend mistake): explicit FIXED physical owned init/fwd/bwd
+#       structural copies; every direction-dependent op branches EXPLICITLY on `gofwd` so the compiler emits
+#       typed per-direction variants — never a current-view alias / Ref / fwdbwd index.
+#   (3) leapfrog! is an RK-authored FREE @kernel (visible ordered effects), passed ordinarily as
+#       step_f=partial(leapfrog!;stepsize=ε); it is NOT an opaque Julia call in the hot path.
+#   (4) public compiled entry is `@kernel nuts!!(state; rng)` — mutates compiler-owned concrete state and
+#       returns the SAME object (result === state), fixed shape/type, 0-B, no RefValue.
+#   @node(logdet(chol_metric)) is PRESERVED verbatim (named assignments are nodes automatically; anonymous
+#   inline subexpressions become nodes ONLY via @node — no heuristic AST extraction).
 #
-# This REPLACES the earlier fixture, which diverged from the reference (invented value_gradient
-# bundle, velocity/kinetic/hamiltonian names, an external _NUTSScratch argument + a no-self-mutation
-# "segment/orchestration" contract, and warmup!/adapt_metric! that live OUTSIDE nuts_state in the
-# reference). 5e8773b is retained only as algorithm/oracle history; it is NOT the production target.
-#
-# STAGE: SOURCE-SHAPE + MACRO-CONSTRUCTION only (construction-only substrate). If the graph
-# analysis / MethodIR rejects any faithful shape here (in-object tree state mutation, fwd/bwd
-# derived from gofwd, callable pot_f/grad_f, restore!/rcopy!), that is a COMPILER REQUIREMENT to
-# lower the reference shape — NOT a fixture defect to be worked around. NO execution/parity/0-B/perf
-# claim. One `@kernel` macro; no Graph/add!/applier/binding plumbing; no compiler-limitation
-# compromises.
+# STAGE: durable source-capture CONSUMER surface. Syntax is implementing the narrow source-capture
+# substrate; until it lands this may be CONSTRUCTION-BLOCKED (required-capability signal, NOT a defect —
+# implicit fields + __self__ receiver + free-kernel leapfrog!/nuts!! discrimination + no-Julia-IR capture).
+# NO execution/parity/0-B/perf claim here. Structural verification + the non-vacuous lexical-shadowing
+# inventory run via benchmark/nuts_authoring_shadowing_gate.jl (parses this file; does not eval @kernel).
 using ReactiveKernels
 using LinearAlgebra, LogExpFunctions, Random
 
-# ---- nuts.jl / adaptation.jl module helpers (verbatim from the reference) ---------------------------
+# ---- nuts.jl / adaptation.jl module helpers (algorithm-structure reference) --------------------------
 fillf(f::Function, value, n::Int) = [f(value) for _ in 1:n]
 finiteorneginf(x) = isfinite(x) ? x : typeof(x)(-Inf)
 min1exp(x) = x >= 0 ? one(x) : exp(x)
@@ -55,124 +49,128 @@ tree(d::Int) = (;
 )
 tree(phasepoint) = tree(length(phasepoint.pos))
 
-# ---- phasepoints.jl: euclidean_phasepoint (methodless => stateless; derived-only) ------------------
-# grad_f(pos) returns (pot, dpot_dpos); pot_f(pos) the potential alone — the reference's TWO-function
-# gradient shape (NOT a value_gradient bundle). Reactive fields: pot, dpot_dpos, chol_metric,
-# dkin_dmom, kin, ham, dham_dpos, dham_dmom.
+# ---- phasepoints.jl: euclidean_phasepoint (methodless => stateless) — @node(logdet) PRESERVED ---------
 @kernel euclidean_phasepoint(pot_f, grad_f, metric, pos, mom) = begin
     pot = pot_f(pos)
     pot, dpot_dpos = grad_f(pos)
 
     chol_metric = cholesky(metric)
     dkin_dmom = chol_metric \ mom
-    # (reference wraps the logdet term in @node as a caching hint; @kernel's analysis owns caching.)
-    kin = .5 * (logdet(chol_metric) + dot(mom, dkin_dmom))
+    kin = .5 * (@node(logdet(chol_metric)) + dot(mom, dkin_dmom))
 
     ham = pot + kin
     dham_dpos = dpot_dpos
     dham_dmom = dkin_dmom
 end
 
-# ---- integrators.jl: leapfrog! is a FREE function taking the phase point; stepsize is a keyword ----
-leapfrog!(phasepoint; stepsize) = begin
-    @. phasepoint.mom -= .5 * stepsize * phasepoint.dham_dpos
-    @. phasepoint.pos +=      stepsize * phasepoint.dham_dmom
-    @. phasepoint.mom -= .5 * stepsize * phasepoint.dham_dpos
+# ---- integrators.jl: leapfrog! — FORM A: RK-authored FREE @kernel with visible ordered effects --------
+# Passed ordinarily as step_f=partial(leapfrog!;stepsize=ε); factory binding static/inlined; no author
+# type ceremony; no hidden self-prepare. RK sees the ordered pos/mom writes + dham_dpos/dham_dmom reads.
+@kernel leapfrog!(phasepoint; stepsize) = begin
+    @. phasepoint.mom -= 0.5 * stepsize * phasepoint.dham_dpos
+    @. phasepoint.pos +=       stepsize * phasepoint.dham_dmom
+    @. phasepoint.mom -= 0.5 * stepsize * phasepoint.dham_dpos
 end
 
-# ---- nuts.jl: nuts_state — ONE in-object multinomial NUTS sampler --------------------------------
-# Tree scratch (gofwd/may_sample/may_continue/fwdbwd/fwd/bwd/trees/proposals/dham/diverged) are the
-# object's OWN composed fields; fwd/bwd are DERIVED from gofwd; step!/flip!/finish_tree!/start_tree!
-# are methods that mutate those fields DIRECTLY (self.gofwd = !self.gofwd; self.may_sample = false;
-# self.dham = …). This is the reference's composition and mutation model — no external scratch, no
-# segment/orchestration split. reset is restore!(self;force) + bwd.mom.*=-1 + rcopy!(init, proposals[end]).
+# ---- nuts.jl: nuts_state — FORM B: implicit-field methods; NO Ref; explicit physical init/fwd/bwd; -----
+# direction resolved by EXPLICIT gofwd branches (typed per-direction variants); __self__ only as a call
+# actual. Bare owner fields + explicit child traversal (fwd.pos). `current forward` = gofwd ? fwd : bwd;
+# `current backward` = gofwd ? bwd : fwd.
 @kernel nuts_state(init; rng, max_depth = 10, min_dham = -1000.,
                    step_f = nothing, stats_f = nothing) = begin
     gofwd = true
     may_sample = true
     may_continue = true
-    fwdbwd = fillf(deepcopy, init, 2)
-    fwd = Ref(fwdbwd[gofwd ? 1 : 2])            # reference current-view: Ref selected by gofwd
-    bwd = Ref(fwdbwd[gofwd ? 2 : 1])
+    fwd = deepcopy(init)                 # explicit FIXED physical owned endpoints (structural copies)
+    bwd = deepcopy(init)                 # NO Ref, NO fwdbwd index, NO current-view alias
     trees = fillf(tree, init, max_depth + 1)
     proposals = fillf(deepcopy, init, max_depth + 2)
     dham = 0.
     diverged = !(dham >= min_dham)
-
-    stepfwd!(self) = self.step_f(self.fwd)
-    collectstats!(self) = isnothing(self.stats_f) || self.stats_f(self)
-    logadvanceprob(self, depth) =
-        self.trees[depth - 1].log_weight[1] - self.trees[depth].log_weight[1]
-    swapproposal!(self, i, j = length(self.proposals)) = begin
-        self.proposals[i], self.proposals[j] = self.proposals[j], self.proposals[i]
+    stepfwd!() = step_f(gofwd ? fwd : bwd)                       # step the current forward (gofwd branch)
+    collectstats!() = isnothing(stats_f) || stats_f(__self__)
+    logadvanceprob(depth) = trees[depth-1].log_weight[1] - trees[depth].log_weight[1]
+    swapproposal!(i, j = length(proposals)) = begin
+        proposals[i], proposals[j] = proposals[j], proposals[i]
     end
-    step!(self; force = true) = begin
-        restore!(self; force)
-        self.bwd.mom .*= -1
-        self.trees[1].log_weight[1] = 0.
-        for depth in 1:self.max_depth
-            rand(self.rng, Bool) && flip!(self, depth)
-            finish_tree!(self, depth)
-            self.may_sample || break
-            randbernoullilog(self.rng, logswapprob(self.trees[depth])) && swapproposal!(self, depth)
-            self.may_continue || break
+    step!(; force = true) = begin
+        restore!(__self__; force)
+        (gofwd ? bwd : fwd).mom .*= -1                           # negate current backward momentum
+        trees[1].log_weight[1] = 0.
+        for depth in 1:max_depth
+            rand(rng, Bool) && flip!(__self__, depth)
+            finish_tree!(__self__, depth)
+            may_sample || break
+            randbernoullilog(rng, logswapprob(trees[depth])) && swapproposal!(__self__, depth)
+            may_continue || break
         end
-        rcopy!(self.init, self.proposals[end])
+        rcopy!(init, proposals[end])
     end
-    flip!(self, depth) = if depth > 1
-        self.gofwd = !self.gofwd
-        tree = self.trees[depth]
-        @. tree.bwd.mom = -self.bwd.mom
-        @. tree.bwd.dham_dmom = -self.bwd.dham_dmom
+    flip!(depth) = if depth > 1
+        gofwd = !gofwd
+        tree = trees[depth]
+        backward = gofwd ? bwd : fwd                            # current backward AFTER toggle (gofwd branch)
+        @. tree.bwd.mom = -backward.mom
+        @. tree.bwd.dham_dmom = -backward.dham_dmom
         @. tree.summed_mom.fwd *= -1
     end
-    finish_tree!(self, depth) = begin
-        tree = self.trees[depth]
-        suptree = self.trees[depth + 1]
+    finish_tree!(depth) = begin
+        tree = trees[depth]
+        suptree = trees[depth+1]
+        forward = gofwd ? fwd : bwd                             # current forward (gofwd branch)
         tree.log_weight[2] = tree.log_weight[1]
         if depth == 1
-            rcopy!(suptree.bwd, (; self.fwd.mom, self.fwd.dham_dmom))
+            rcopy!(suptree.bwd, (; forward.mom, forward.dham_dmom))
         else
             rcopy!(suptree.bwd, tree.bwd)
-            rcopy!(tree.bwd_fwd, (; self.fwd.mom, self.fwd.dham_dmom))
+            rcopy!(tree.bwd_fwd, (; forward.mom, forward.dham_dmom))
             tree.summed_mom.bwd .= tree.summed_mom.fwd
         end
-        start_tree!(self, depth)
-        self.may_continue || return self.may_sample = false
+        start_tree!(__self__, depth)
+        may_continue || return may_sample = false
         suptree.log_weight[1] = logaddexp(tree.log_weight[1], tree.log_weight[2])
-        self.may_continue = if depth == 1
-            suptree.summed_mom.fwd .= suptree.bwd.mom .+ self.fwd.mom
-            compute_criterion(suptree.summed_mom.fwd, suptree.bwd.dham_dmom, self.fwd.dham_dmom)
+        may_continue = if depth == 1
+            suptree.summed_mom.fwd .= suptree.bwd.mom .+ forward.mom
+            compute_criterion(suptree.summed_mom.fwd, suptree.bwd.dham_dmom, forward.dham_dmom)
         else
             suptree.summed_mom.fwd .= tree.summed_mom.bwd .+ tree.summed_mom.fwd
             (
-                compute_criterion(suptree.summed_mom.fwd, suptree.bwd.dham_dmom, self.fwd.dham_dmom) &&
+                compute_criterion(suptree.summed_mom.fwd, suptree.bwd.dham_dmom, forward.dham_dmom) &&
                 compute_criterion(badd(tree.summed_mom.bwd, tree.bwd.mom),
                                   suptree.bwd.dham_dmom, tree.bwd.dham_dmom) &&
                 compute_criterion(badd(tree.bwd_fwd.mom, tree.summed_mom.fwd),
-                                  tree.bwd_fwd.dham_dmom, self.fwd.dham_dmom)
+                                  tree.bwd_fwd.dham_dmom, forward.dham_dmom)
             )
         end
     end
-    start_tree!(self, depth) = if depth == 1
-        stepfwd!(self)
-        self.dham = finiteorneginf(self.init.ham - self.fwd.ham)
-        collectstats!(self)
-        self.diverged && return self.may_continue = false
-        self.trees[1].log_weight[1] = self.dham
-        rcopy!(self.proposals[1], self.fwd)
+    start_tree!(depth) = if depth == 1
+        stepfwd!(__self__)
+        forward = gofwd ? fwd : bwd                             # current forward (gofwd branch)
+        dham = finiteorneginf(init.ham - forward.ham)
+        collectstats!(__self__)
+        diverged && return may_continue = false
+        trees[1].log_weight[1] = dham
+        rcopy!(proposals[1], forward)
     else
-        start_tree!(self, depth - 1)
-        self.may_continue || return self.may_sample = false
-        swapproposal!(self, depth - 1, depth)
-        finish_tree!(self, depth - 1)
-        if self.may_sample && randbernoullilog(self.rng, logadvanceprob(self, depth))
-            swapproposal!(self, depth - 1, depth)
+        start_tree!(__self__, depth - 1)
+        may_continue || return may_sample = false
+        swapproposal!(__self__, depth - 1, depth)
+        finish_tree!(__self__, depth - 1)
+        if may_sample && randbernoullilog(rng, logadvanceprob(__self__, depth))
+            swapproposal!(__self__, depth - 1, depth)
         end
     end
 end
 
-# ---- adaptation.jl: dual_averaging_state (m/H/mu + fit!(x)) ----------------------------------------
+# ---- FORM C: public compiled entry — mutate compiler-owned concrete state + return the SAME object -----
+# result === state; fixed shape; same identity/type; 0-B; no RefValue. Shape changes use a separate
+# non-hot reconstruction API (not this hot entry). `!!` alias/effect registration drives invalidation.
+@kernel nuts!!(state; rng) = begin
+    step!(state)          # one multinomial NUTS transition on compiler-owned concrete state
+    return state
+end
+
+# ---- adaptation.jl: dual_averaging_state (m/H/mu + fit!(x)) — implicit-field -------------------------
 @kernel dual_averaging_state(init; target = .8, regularization_scale = .05,
                              relaxation_exponent = .75, offset = 10) = begin
     m = one(init)
@@ -182,225 +180,25 @@ end
     log_final = zero(init)
     current = exp(log_current)
     final = exp(log_final)
-    fit!(self, x) = begin
-        self.m += 1
-        self.H += (self.target - x - self.H) / (self.m + self.offset)
-        self.log_final += self.m^(-self.relaxation_exponent) * (self.log_current - self.log_final)
+    fit!(x) = begin
+        m += 1
+        H += (target - x - H) / (m + offset)
+        log_final += m^(-relaxation_exponent) * (log_current - log_final)
     end
 end
 
-# ---- adaptation.jl: welford_var (n/mean/var + step!(x; dn)) ----------------------------------------
+# ---- adaptation.jl: welford_var (n/mean/var + step!(x; dn)) — implicit-field --------------------------
 @kernel welford_var(dim) = begin
     n = 0.
     mean = zeros(dim)
     var = zeros(dim)
-    step!(self, x::AbstractVector; dn = 1.) = begin
-        self.n += dn
-        w = dn / self.n
-        @. self.var = smooth(self.var, (x - smooth(self.mean, x, w)) * (x - self.mean), w)
-        @. self.mean = smooth(self.mean, x, w)
+    step!(x::AbstractVector; dn = 1.) = begin
+        n += dn
+        w = dn / n
+        @. var = smooth(var, (x - smooth(mean, x, w)) * (x - mean), w)
+        @. mean = smooth(mean, x, w)
     end
-    # reference matrix overload forwards `; kwargs...` verbatim. @kernel construction currently
-    # REJECTS a kwargs-splat in a method signature ("unsupported keyword :(kwargs...)"), so this line
-    # blocks the whole fixture from loading until syntax/poc add kwargs-splat support — that BLOCKED
-    # state is the correct sequencing (a required-capability signal), NOT a fixture defect to work around.
-    step!(self, x::AbstractMatrix; kwargs...) = for xi in eachcol(x)
-        step!(self, xi; kwargs...)
+    step!(x::AbstractMatrix; kwargs...) = for xi in eachcol(x)
+        step!(__self__, xi; kwargs...)
     end
-end
-
-# NOTE: trajectory_stats / sampling_stats (statistics.jl) are faithful recorders built on
-# ElasticArrays, which is not a current ReactiveKernels dependency; they are deferred to a follow-up
-# (adding the dep is a cross-cutting change) and are NOT part of the reference nuts_state surface —
-# metric/step-size adaptation and stats live OUTSIDE nuts_state in ReactiveHMC (user composes
-# welford_var + dual_averaging_state + Diagonal(max.(1e-6, wv.var))), so nuts_state stays the pure
-# transition, exactly as the reference.
-
-# ==== reference-surface source-shape gate (construction only; NO execution/parity/perf) =============
-if abspath(PROGRAM_FILE) == @__FILE__
-    RKS = ReactiveKernels
-    spec_of(k) = k isa RKS.KernelSpec ? k : getfield(k, :spec)
-    fields_of(k) = Set(spec_of(k).port_order)
-    methods_of(k) = Set(m.name for m in RKS.kernel_methods(k))
-    body_str(k) = join([string(m.body) for m in RKS.kernel_methods(k)], "\n")
-
-    # ---- AST util: does a method body directly mutate a `self.<field>` (assignment or .= broadcast)?
-    _walk(f, x) = (f(x); x isa Expr && foreach(a -> _walk(f, a), x.args); nothing)
-    _is_self_lhs(x, self) =
-        x isa Expr && ((x.head === :. && (x.args[1] === self || _is_self_lhs(x.args[1], self))) ||
-                       (x.head === :ref && _is_self_lhs(x.args[1], self)))
-    const _CMP = Set([:(==), :(!=), :(<=), :(>=), :(===), :(!==), :(.==), :(.!=), :(.<=), :(.>=)])
-    _is_assign(h) = h isa Symbol && (s = String(h); endswith(s, "=") && !(h in _CMP))
-    function self_mutates(method)
-        found = Ref(false)
-        _walk(method.body) do x
-            x isa Expr && _is_assign(x.head) && length(x.args) >= 1 &&
-                _is_self_lhs(x.args[1], method.self) && (found[] = true)
-        end
-        found[]
-    end
-    method_named(k, name) = (ms = filter(m -> m.name === name, RKS.kernel_methods(k)); ms)
-
-    # ---- file-AST inspection (parse THIS file directly; independent of @kernel macro construction, so
-    #      these pin the exact SOURCE FORMS — Ref constructors, kwargs-splat, the leapfrog method span). --
-    _fileast = Meta.parseall(read(@__FILE__, String); filename = @__FILE__)
-    _dropln(args) = filter(a -> !(a isa LineNumberNode), args)
-    _signame(sig) = sig isa Expr ? (sig.head === :call ? sig.args[1] :
-                                    sig.head in (:where, :(::), :curly) ? _signame(sig.args[1]) : nothing) : nothing
-    function kernel_body_ast(name)
-        for st in _fileast.args
-            st isa Expr && st.head === :macrocall && st.args[1] === Symbol("@kernel") || continue
-            eq = st.args[end]
-            eq isa Expr && eq.head === :(=) && _signame(eq.args[1]) === name && return eq.args[2]
-        end
-        error("no @kernel $name found in file AST")
-    end
-    function func_def_ast(name)
-        for st in _fileast.args
-            st isa Expr && st.head in (:(=), :function) && st.args[1] isa Expr &&
-                st.args[1].head === :call && st.args[1].args[1] === name && return st
-        end
-        error("no function $name found in file AST")
-    end
-    _has_params(callsig) = (i = findfirst(a -> a isa Expr && a.head === :parameters, callsig.args);
-                            i === nothing ? nothing : callsig.args[i])
-    _kwname(p) = p isa Symbol ? p : (p isa Expr && p.head in (:kw, :(::), :(...)) ? _kwname(p.args[1]) : nothing)
-
-    # (a) euclidean_phasepoint: methodless (stateless), REFERENCE derived-field names, pot_f/grad_f ---
-    @assert euclidean_phasepoint isa RKS.KernelSpec "euclidean_phasepoint must be methodless (stateless)"
-    pp = fields_of(euclidean_phasepoint)
-    for f in (:pot_f, :grad_f, :metric, :pos, :mom,           # sources (pot_f AND grad_f — two funcs)
-              :pot, :dpot_dpos, :chol_metric, :dkin_dmom, :kin, :ham, :dham_dpos, :dham_dmom)  # derived
-        @assert f in pp "euclidean_phasepoint missing reference field $f"
-    end
-    @assert Set(spec_of(euclidean_phasepoint).want_names) == Set([:ham, :dham_dpos, :dham_dmom]) "phasepoint exposes reference outputs"
-    # invented (non-reference) names must be ABSENT from the phase-point surface
-    for bad in (:value_gradient, :velocity, :kinetic, :potential, :hamiltonian, :gradient, :chol)
-        @assert !(bad in pp) "non-reference name $bad present in phase point — surface diverged"
-    end
-
-    # (b) leapfrog!: inspect the ACTUAL method-def AST (source span), not whole-file tokens. It must be
-    #     the exact 3-line Stormer-Verlet body `@. mom -=; @. pos +=; @. mom -=` on dham_dpos/dham_dmom,
-    #     with a `stepsize` keyword.
-    lfdef = func_def_ast(:leapfrog!)
-    lfparams = _has_params(lfdef.args[1])
-    @assert lfparams !== nothing && any(p -> _kwname(p) === :stepsize, lfparams.args) "leapfrog! must take a stepsize keyword"
-    lfbody = lfdef.args[2]
-    @assert lfbody isa Expr && lfbody.head === :block "leapfrog! body must be a block"
-    lfstmts = _dropln(lfbody.args)
-    # each statement is `@. phasepoint.<field> <op>= …`; extract (op, field)
-    function dot_assign(stmt)
-        stmt isa Expr && stmt.head === :macrocall && stmt.args[1] === Symbol("@__dot__") || return nothing
-        inner = _dropln(stmt.args)[end]
-        inner isa Expr && length(inner.args) >= 1 || return nothing
-        lhs = inner.args[1]
-        lhs isa Expr && lhs.head === :. && lhs.args[1] === :phasepoint &&
-            lhs.args[2] isa QuoteNode || return nothing
-        (inner.head, lhs.args[2].value)
-    end
-    lftargets = map(dot_assign, lfstmts)
-    @assert lftargets == [(:(-=), :mom), (:(+=), :pos), (:(-=), :mom)] "leapfrog! must be the 3-line Stormer-Verlet (mom-=; pos+=; mom-=), got $lftargets"
-    lfsrc = string(lfbody)
-    @assert occursin("dham_dpos", lfsrc) && occursin("dham_dmom", lfsrc) && occursin("stepsize", lfsrc) "leapfrog! must act on dham_dpos/dham_dmom scaled by stepsize"
-
-    # (c) nuts_state: in-object composed tree fields + reference method inventory --------------------
-    ns = fields_of(nuts_state)
-    for f in (:init, :rng, :max_depth, :min_dham, :step_f, :stats_f,          # sources
-              :gofwd, :may_sample, :may_continue, :fwdbwd, :fwd, :bwd,        # composed control/endpoints
-              :trees, :proposals, :dham, :diverged)                          # composed scratch + diagnostics
-        @assert f in ns "nuts_state missing reference field $f — tree state must be composed IN the object"
-    end
-    @assert methods_of(nuts_state) == Set([:stepfwd!, :collectstats!, :logadvanceprob, :swapproposal!,
-                                           :step!, :flip!, :finish_tree!, :start_tree!]) "nuts_state method inventory: $(methods_of(nuts_state))"
-    # (c') Ref current-view source form: fwd/bwd MUST be `Ref(...)` (reference shape; the analysis must
-    #      learn the Ref/current-view semantics — NOT the bare-indexing rewrite).
-    nsbody = kernel_body_ast(:nuts_state)
-    function ref_assign(body, lhs)
-        for st in _dropln(body.args)
-            st isa Expr && st.head === :(=) && st.args[1] === lhs || continue
-            rhs = st.args[2]
-            return rhs isa Expr && rhs.head === :call && rhs.args[1] === :Ref
-        end
-        false
-    end
-    @assert ref_assign(nsbody, :fwd) "nuts_state must define `fwd = Ref(...)` (reference current-view, not bare indexing)"
-    @assert ref_assign(nsbody, :bwd) "nuts_state must define `bwd = Ref(...)`"
-
-    # (d) DIRECT in-object mutation (the reference model) — these methods MUST mutate self fields ----
-    @assert self_mutates(only(method_named(nuts_state, :flip!))) "flip! must mutate self (gofwd/tree) directly"
-    @assert self_mutates(only(method_named(nuts_state, :finish_tree!))) "finish_tree! must mutate self.may_sample/may_continue directly"
-    @assert self_mutates(only(method_named(nuts_state, :start_tree!))) "start_tree! must mutate self.dham/may_* directly"
-    @assert self_mutates(only(method_named(nuts_state, :step!))) "step! must mutate self.trees directly"
-    nb = body_str(nuts_state)
-    @assert occursin("self.gofwd = !", nb) "flip! must toggle self.gofwd"
-    @assert occursin("self.may_sample = false", nb) "must set self.may_sample=false on stop"
-    @assert occursin("self.dham = finiteorneginf", nb) "start_tree! must set self.dham = finiteorneginf(init.ham - fwd.ham)"
-
-    # (e) reference multinomial machinery present (log weights, tournament, RNG, criterion, reset) ---
-    for tok in ("log_weight", "swapproposal!", "randbernoullilog", "logswapprob", "logadvanceprob",
-                "compute_criterion", "logaddexp", "summed_mom", "bwd_fwd",
-                "restore!", "rcopy!", "proposals[end]")
-        @assert occursin(tok, nb) "nuts_state must use reference construct `$tok`"
-    end
-
-    # (f) dual_averaging_state: reference m/H/mu accumulators + fit! -------------------------------
-    da = fields_of(dual_averaging_state)
-    for f in (:m, :H, :mu, :log_current, :log_final, :current, :final)
-        @assert f in da "dual_averaging_state missing reference field $f"
-    end
-    @assert methods_of(dual_averaging_state) == Set([:fit!]) "DA inventory"
-    db = body_str(dual_averaging_state)
-    @assert occursin("self.m += 1", db) && occursin("self.H +=", db) && occursin("self.log_final +=", db) "DA fit! reference recurrence (m/H/log_final)"
-    for bad in (:iteration, :error, :center, :regularization)   # earlier-invented DA names must be gone
-        @assert !(bad in da) "non-reference DA name $bad present"
-    end
-
-    # (g) welford_var: reference n/mean/var + step!(x;dn) (two dispatch methods) --------------------
-    wf = fields_of(welford_var)
-    for f in (:n, :mean, :var)
-        @assert f in wf "welford_var missing reference field $f"
-    end
-    @assert methods_of(welford_var) == Set([:step!]) "welford inventory (step!)"
-    @assert length(method_named(welford_var, :step!)) == 2 "welford must have vector + matrix step! methods"
-    wb = body_str(welford_var)
-    @assert occursin("self.n += dn", wb) && occursin("smooth(", wb) "welford step! reference recurrence"
-    # (g') kwargs-splat source form: the matrix step! MUST carry `; kwargs...` and FORWARD it verbatim
-    #      (reference signature) — not an explicit-dn rewrite. Inspected from the method-def AST.
-    function kwargs_splat_forwarding(body, mname)
-        for st in _dropln(body.args)
-            st isa Expr && st.head === :(=) && st.args[1] isa Expr && st.args[1].head === :call &&
-                st.args[1].args[1] === mname || continue
-            sigparams = _has_params(st.args[1])
-            sigparams === nothing && continue
-            any(p -> p isa Expr && p.head === :(...), sigparams.args) || continue   # `; kwargs...` in sig
-            fwd = Ref(false)
-            _walk(st.args[2]) do x                                                    # forwards `; kwargs...`
-                x isa Expr && x.head === :call && x.args[1] === mname &&
-                    (pp = _has_params(x); pp !== nothing &&
-                     any(p -> p isa Expr && p.head === :(...), pp.args)) && (fwd[] = true)
-            end
-            fwd[] && return true
-        end
-        false
-    end
-    @assert kwargs_splat_forwarding(kernel_body_ast(:welford_var), :step!) "welford matrix step! must use `; kwargs...` and forward it (reference splat, not explicit-dn)"
-
-    # (h) sole @kernel; no @reactive / no Graph/add!/applier/binding plumbing in any authored body --
-    allbodies = join([body_str(k) for k in (nuts_state, dual_averaging_state, welford_var)], "\n") *
-                "\n" * string(spec_of(euclidean_phasepoint).port_order)
-    for bad in ("@reactive", "Graph(", "add!(", "output_binding", "_RecipeApplier", "compile_update",
-                "bind_schedule", "_NUTSScratch", "reset_scratch!", "mirror!", "recompute_init!",
-                "value_gradient", "adapt_metric!", "warmup!")
-        @assert !occursin(bad, allbodies) "plumbing/non-reference/invented token present: $bad"
-    end
-
-    println("Reference-surface source-shape gate PASS: transcribed from ACTUAL ReactiveHMC.jl v0.1.0")
-    println("(781sB @ ca9ea4ca). euclidean_phasepoint (methodless, pot_f/grad_f, reference derived")
-    println("names) + free leapfrog!(phasepoint;stepsize) inspected from its method AST + nuts_state")
-    println("(in-object composed tree state, fwd/bwd = Ref current-view, DIRECT self mutation in")
-    println("step!/flip!/finish_tree!/start_tree!, restore!/rcopy! reset, multinomial tournament) + DA")
-    println("(m/H/mu + fit!) + welford (n/mean/var + step!(x;kwargs...), 2 methods, splat pinned). Sole")
-    println("@kernel; no plumbing; invented names ABSENT. Deviations from reference NAMED: @reactive->")
-    println("@kernel, implicit-field/__self__->explicit self, @node(logdet)->plain logdet (inferred")
-    println("caching). Construction-only — NO execution/parity/0-B/perf claim.")
 end
