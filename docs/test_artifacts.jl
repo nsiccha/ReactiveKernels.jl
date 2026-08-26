@@ -72,6 +72,30 @@ module _ArtifactSandbox end
         end
     end
 
+    @testset "fused leaf (Unit A) build-executes and gates its inventory" begin
+        md = RKD.render_fused_leaf(_ArtifactSandbox)     # build-executes + asserts coverage
+        @test md isa Markdown.MD
+
+        built = RKD._prepare_fused_leaf(
+            Core.eval(_ArtifactSandbox, :metric),
+            Core.eval(_ArtifactSandbox, :position),
+            Core.eval(_ArtifactSandbox, :potential_gradient!))
+        @test RKD.assert_fused_leaf_coverage(built) === built
+        @test length(built.plan.recipes) == RKD._FUSED_LEAF_RECIPES
+        @test Set(v.name for v in built.plan.have) == Set(RKD._FUSED_LEAF_HAVE)
+        @test Set(v.name for v in built.plan.want) == Set(RKD._FUSED_LEAF_WANT)
+        @test code_expr(built.kernel) isa Expr           # REAL generated fused schedule
+        @test built.kernel.plan === built.plan           # DAG identity
+
+        # NON-VACUOUS: a tampered expectation is rejected (wrong count, dropped
+        # HAVE port, extra WANT output all fail).
+        @test_throws ErrorException RKD.assert_fused_leaf_coverage(built; recipes = 12)
+        @test_throws ErrorException RKD.assert_fused_leaf_coverage(built;
+            have = Base.setdiff(RKD._FUSED_LEAF_HAVE, (:logdet_chol,)))
+        @test_throws ErrorException RKD.assert_fused_leaf_coverage(built;
+            want = (RKD._FUSED_LEAF_WANT..., :extra))
+    end
+
     @testset "coverage gate is NON-VACUOUS (fails on tampering)" begin
         # A missing program is rejected.
         @test_throws ErrorException RKD.assert_program_coverage(arts[1:4], RKD._FIVE_PROGRAM_INVENTORY)

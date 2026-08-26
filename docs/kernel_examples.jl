@@ -2,6 +2,7 @@ module ReactiveKernelsDocs
 
 using Base64
 using Documenter
+using LinearAlgebra
 using Markdown
 using ReactiveKernels
 
@@ -514,6 +515,314 @@ function render_five_programs(mod::Module)
     end
     assert_program_coverage(artifacts, _FIVE_PROGRAM_INVENTORY)
     render_program_examples(artifacts)
+end
+
+# ===========================================================================
+# Unit A — the fused stateless-composed NUTS leaf (BENCHMARK feasibility tip).
+#
+# This is the docs' build-executed copy of the fused leaf independently accepted
+# at benchmark tip 71f37a2 (`benchmark/nuts_fused_leaf_proto.jl`, `build_leaf` /
+# `prepare_leaf`). It composes the EXISTING public stateless core
+#   Graph -> plan(have, want) -> lower -> _nonallocating_ast -> _prepare_nonallocating
+# over the EXISTING NUTS ops (`_grad_bundle`/`_vg_*`/`_energy_error`/`_is_divergent`),
+# so the numeric work is bit-identical to the reactive group's per-endpoint
+# Hamiltonian — but the hot leaf is ONE straight-line schedule with no
+# get!/validity/invalidation bookkeeping. It is BENCHMARK-only and BORROWED-output
+# (returned arrays alias the kernel's owned caches); the production owned-slot form
+# is PLANNED (see the architecture page). Keep in lockstep with the benchmark leaf;
+# the coverage gate below asserts the 13-recipe / 9-have / 9-want inventory.
+# ===========================================================================
+const _RK = ReactiveKernels
+
+# Leaf-only arithmetic ops — token-for-token matches to `_group_leapfrog!` so the
+# fused schedule is bit-identical to the reactive leapfrog + energy error.
+_lf_half(mom, stepsize, grad) = mom .- 0.5 .* stepsize .* grad   # @. mom -= 0.5*stepsize*grad
+_lf_drift(pos, stepsize, vel) = pos .+ stepsize .* vel           # @. pos += stepsize*velocity
+_lf_solve(chol, mom) = chol \ mom                                # velocity = M^-1 * mom
+_lf_add(a, b) = a + b
+_lf_dot(a, b) = dot(a, b)
+# kinetic = (logdet(chol) + dot(mom, vel)) / 2, with logdet HOISTED to a persistent
+# per-trajectory scalar (constant while the metric is fixed) — bit-identical to
+# `_kinetic_energy`, but the straight-line leaf never recomputes logdet.
+_lf_kin(logdet_chol, dotmv) = (logdet_chol + dotmv) / 2
+
+# Leaf cache_apply: each recipe reuses its owned slot in place. Mirrors the reactive
+# group's `_nuts_cache_apply`; scalars/projections stay pure.
+@inline function _leaf_apply!(cache, ::typeof(_lf_half), mom, stepsize, grad)
+    @. cache = mom - 0.5 * stepsize * grad
+    cache
+end
+@inline function _leaf_apply!(cache, ::typeof(_lf_drift), pos, stepsize, vel)
+    @. cache = pos + stepsize * vel
+    cache
+end
+@inline function _leaf_apply!(cache, ::typeof(_lf_solve), chol, mom)
+    copyto!(cache, mom)
+    ldiv!(chol, cache)
+    cache
+end
+@inline function _leaf_apply!(cache::_RK._ValueGradient, ::typeof(_RK._grad_bundle), pgrad, pos)
+    cache.value = pgrad(cache.gradient, pos)   # THE single gradient call of the leaf
+    cache
+end
+@inline _leaf_apply!(cache, op, args...) = op(args...)   # pure / scalar / projection
+
+# Force a CONCRETE return type (T, not Union{Nothing,T}) so the lowered kernel's
+# recipe outputs stay concretely typed — no Union propagation / boxing in warm IR.
+@inline function _leaf_cache_apply(slot::Base.RefValue{Union{Nothing,T}}, op, args...) where {T}
+    cached = slot[]
+    val::T = cached === nothing ? op(args...) : _leaf_apply!(cached, op, args...)
+    slot[] = val
+    val
+end
+
+# The exact 13-recipe leaf graph. HAVE (9): {pos,mom,old_grad} change each call;
+# {chol,stepsize,init_ham,threshold,pgrad,logdet_chol} are the persistent partition.
+# WANT (9): the complete new endpoint state + dham + diverged.
+function _build_fused_leaf(V, S, CH, PG, VG)
+    g = _RK.Graph()
+    pos   = _RK.value(:pos, V);         mom  = _RK.value(:mom, V)
+    ograd = _RK.value(:old_grad, V);    chol = _RK.value(:chol, CH)
+    ss    = _RK.value(:stepsize, S);    ih   = _RK.value(:init_ham, S)
+    thr   = _RK.value(:threshold, S);   pg   = _RK.value(:pgrad, PG)
+    ldc   = _RK.value(:logdet_chol, S)                     # persistent per-trajectory scalar
+
+    half  = _RK.value(:half_mom, V);    vel1  = _RK.value(:vel1, V)
+    npos  = _RK.value(:new_pos, V);     nvg   = _RK.value(:new_vg, VG)
+    ngrad = _RK.value(:new_grad, V);    nval  = _RK.value(:new_value, S)
+    nmom  = _RK.value(:new_mom, V);     dotmv = _RK.value(:dotmv, S)
+    kin   = _RK.value(:kinetic, S);     nvel  = _RK.value(:new_vel, V)
+    nham  = _RK.value(:new_ham, S);     dh    = _RK.value(:dham, S)
+    dvg   = _RK.value(:diverged, Bool)
+
+    _RK.add!(g; inputs = (mom, ss, ograd),  outputs = half,  op = _lf_half)
+    _RK.add!(g; inputs = (chol, half),      outputs = vel1,  op = _lf_solve)
+    _RK.add!(g; inputs = (pos, ss, vel1),   outputs = npos,  op = _lf_drift)
+    _RK.add!(g; inputs = (pg, npos),        outputs = nvg,   op = _RK._grad_bundle)
+    _RK.add!(g; inputs = nvg,               outputs = ngrad, op = _RK._vg_gradient)
+    _RK.add!(g; inputs = nvg,               outputs = nval,  op = _RK._vg_value)
+    _RK.add!(g; inputs = (half, ss, ngrad), outputs = nmom,  op = _lf_half)
+    _RK.add!(g; inputs = (chol, nmom),      outputs = nvel,  op = _lf_solve)
+    _RK.add!(g; inputs = (nmom, nvel),      outputs = dotmv, op = _lf_dot)
+    _RK.add!(g; inputs = (ldc, dotmv),      outputs = kin,   op = _lf_kin)
+    _RK.add!(g; inputs = (nval, kin),       outputs = nham,  op = _lf_add)
+    _RK.add!(g; inputs = (ih, nham),        outputs = dh,    op = _RK._energy_error)
+    _RK.add!(g; inputs = (dh, thr),         outputs = dvg,   op = _RK._is_divergent)
+
+    have = (pos, mom, ograd, chol, ss, ih, thr, pg, ldc)
+    want = (npos, nmom, ngrad, nvel, nham, dh, dvg, nval, kin)
+    g, have, want
+end
+
+function _prepare_fused_leaf(metric, pos0, pgrad)
+    V = typeof(pos0); S = eltype(pos0)
+    CH = typeof(cholesky(metric)); PG = typeof(pgrad); VG = _RK._ValueGradient{S,V}
+    g, have, want = _build_fused_leaf(V, S, CH, PG, VG)
+    p = _RK.plan(g; have = have, want = want)
+    ast = _RK._nonallocating_ast(_RK.lower(p))
+    kernel = _RK._prepare_nonallocating(p, ast, _leaf_cache_apply)
+    (; g, have, want, plan = p, kernel)
+end
+
+# --- non-vacuous coverage gate for Unit A ----------------------------------
+const _FUSED_LEAF_HAVE = (:pos, :mom, :old_grad, :chol, :stepsize, :init_ham,
+                          :threshold, :pgrad, :logdet_chol)
+const _FUSED_LEAF_WANT = (:new_pos, :new_mom, :new_grad, :new_vel, :new_ham,
+                          :dham, :diverged, :new_value, :kinetic)
+const _FUSED_LEAF_RECIPES = 13
+
+"""
+    assert_fused_leaf_coverage(built; have, want, recipes) -> built
+
+Mechanical inventory gate for the fused leaf. Errors — failing the docs build — if
+the planned program's HAVE/WANT boundary or its total recipe count diverges from the
+expected benchmark inventory (a missing or extra recipe is caught). The expectation
+is passed explicitly (defaulting to the declared benchmark inventory) so the gate is
+demonstrably NON-VACUOUS: a tampered expectation is rejected.
+"""
+function assert_fused_leaf_coverage(built; have = _FUSED_LEAF_HAVE,
+                                    want = _FUSED_LEAF_WANT, recipes = _FUSED_LEAF_RECIPES)
+    got_have = Tuple(v.name for v in built.plan.have)
+    got_want = Tuple(v.name for v in built.plan.want)
+    Set(got_have) == Set(have) && length(got_have) == length(have) || error(
+        "fused leaf HAVE diverged: got $(got_have) vs $(have)")
+    Set(got_want) == Set(want) && length(got_want) == length(want) || error(
+        "fused leaf WANT diverged: got $(got_want) vs $(want)")
+    length(built.plan.recipes) == recipes || error(
+        "fused leaf recipe count diverged: got $(length(built.plan.recipes)) want $(recipes)")
+    built.kernel.plan === built.plan || error("fused leaf kernel plan is not the built plan")
+    built
+end
+
+# The DI + reverse-mode Enzyme scalar-potential boundary + the persistent-partition
+# seed, evaluated in the page sandbox exactly as the benchmark sets it up.
+const _FUSED_LEAF_SETUP = raw"""
+using LinearAlgebra, Random, DifferentiationInterface
+import Enzyme
+
+# The model boundary is a SCALAR potential; its gradient goes through
+# DifferentiationInterface + reverse-mode Enzyme, prepared once and written into the
+# leaf's owned gradient buffer in place (no handwritten gradient callback).
+backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
+                     function_annotation = Enzyme.Const)
+potential(q) = sum(abs2, q) / 2
+dimension = 4
+preparation = prepare_gradient(potential, backend, zeros(dimension))
+potential_gradient!(gradient, position) = first(value_and_gradient!(
+    potential, gradient, preparation, backend, position))
+
+# Persistent per-trajectory partition: metric factor, its log-determinant, and the
+# fixed reference energy `init_ham` — all constant while the metric/stepsize is fixed.
+metric = Matrix{Float64}(I, dimension, dimension)
+chol = cholesky(metric)
+logdet_chol = logdet(chol)
+stepsize = 0.35
+threshold = -1000.0
+Random.seed!(20260826)
+position = randn(dimension)
+momentum = randn(dimension)
+old_gradient = similar(position)
+init_potential = potential_gradient!(old_gradient, position)   # ∇U(pos), returns U(pos)
+velocity0 = chol \ momentum
+init_ham = init_potential + (logdet_chol + dot(momentum, velocity0)) / 2
+"""
+
+# The readable Raw-input pane: the exact fused-leaf construction shown to the reader
+# (mirrors `_build_fused_leaf`/`_prepare_fused_leaf` above, which is what executes).
+const _FUSED_LEAF_SOURCE = raw"""
+# Reuse the EXISTING NUTS ops so the numeric work is identical to the reactive group.
+using ReactiveKernels, LinearAlgebra
+const RK = ReactiveKernels
+
+# Leaf-only arithmetic — token-for-token matches to `_group_leapfrog!`.
+_lf_half(mom, stepsize, grad) = mom .- 0.5 .* stepsize .* grad   # @. mom -= 0.5*stepsize*grad
+_lf_drift(pos, stepsize, vel) = pos .+ stepsize .* vel           # @. pos += stepsize*velocity
+_lf_solve(chol, mom) = chol \ mom                                # velocity = M^-1 * mom
+_lf_dot(a, b) = dot(a, b)
+_lf_kin(logdet_chol, dotmv) = (logdet_chol + dotmv) / 2          # logdet HOISTED out of the leaf
+_lf_add(a, b) = a + b
+
+# HAVE ports (9): {pos,mom,old_grad} change each call; the rest are the persistent
+# per-trajectory partition. `pgrad` is the DI+Enzyme potential_gradient! closure.
+g = RK.Graph()
+pos = RK.value(:pos, V);   mom = RK.value(:mom, V);   old_grad = RK.value(:old_grad, V)
+chol = RK.value(:chol, CH); stepsize = RK.value(:stepsize, S); init_ham = RK.value(:init_ham, S)
+threshold = RK.value(:threshold, S); pgrad = RK.value(:pgrad, PG); logdet_chol = RK.value(:logdet_chol, S)
+
+# Intermediate + WANT values, then 13 single-output recipes. RK._grad_bundle is the
+# ONE gradient call of the leaf; RK._vg_gradient/_vg_value are borrowed projections.
+half = RK.value(:half_mom, V); vel1 = RK.value(:vel1, V); new_pos = RK.value(:new_pos, V)
+new_vg = RK.value(:new_vg, VG); new_grad = RK.value(:new_grad, V); new_val = RK.value(:new_value, S)
+new_mom = RK.value(:new_mom, V); new_vel = RK.value(:new_vel, V); dotmv = RK.value(:dotmv, S)
+kinetic = RK.value(:kinetic, S); new_ham = RK.value(:new_ham, S); dham = RK.value(:dham, S)
+diverged = RK.value(:diverged, Bool)
+
+RK.add!(g; inputs = (mom, stepsize, old_grad),  outputs = half,     op = _lf_half)
+RK.add!(g; inputs = (chol, half),               outputs = vel1,     op = _lf_solve)
+RK.add!(g; inputs = (pos, stepsize, vel1),      outputs = new_pos,  op = _lf_drift)
+RK.add!(g; inputs = (pgrad, new_pos),           outputs = new_vg,   op = RK._grad_bundle)
+RK.add!(g; inputs = new_vg,                     outputs = new_grad, op = RK._vg_gradient)
+RK.add!(g; inputs = new_vg,                     outputs = new_val,  op = RK._vg_value)
+RK.add!(g; inputs = (half, stepsize, new_grad), outputs = new_mom,  op = _lf_half)
+RK.add!(g; inputs = (chol, new_mom),            outputs = new_vel,  op = _lf_solve)
+RK.add!(g; inputs = (new_mom, new_vel),         outputs = dotmv,    op = _lf_dot)
+RK.add!(g; inputs = (logdet_chol, dotmv),       outputs = kinetic,  op = _lf_kin)
+RK.add!(g; inputs = (new_val, kinetic),         outputs = new_ham,  op = _lf_add)
+RK.add!(g; inputs = (init_ham, new_ham),        outputs = dham,     op = RK._energy_error)
+RK.add!(g; inputs = (dham, threshold),          outputs = diverged, op = RK._is_divergent)
+
+# Plan the have -> want query, then lower to a straight-line NON-ALLOCATING kernel
+# whose recipes reuse owned caches in place (a hand-written cache policy; the
+# production form consumes poc's compile_update owned-slot primitive instead).
+have = (pos, mom, old_grad, chol, stepsize, init_ham, threshold, pgrad, logdet_chol)
+want = (new_pos, new_mom, new_grad, new_vel, new_ham, dham, diverged, new_val, kinetic)
+plan   = RK.plan(g; have = have, want = want)
+kernel = RK._prepare_nonallocating(plan, RK._nonallocating_ast(RK.lower(plan)), _leaf_cache_apply)
+"""
+
+"""
+    render_fused_leaf(mod) -> Markdown.MD
+
+Build-execute the fused NUTS leaf (Unit A) at the DI + reverse-mode Enzyme
+scalar-potential boundary, assert its 13-recipe coverage, run one leaf, and render
+the actual program through the shared three-view UI. **Generated kernel** is the real
+`code_expr` of the fused non-allocating schedule; **Compute DAG** is `plan`. Fails the
+docs build if the inventory diverges or the generated view is not the live kernel's.
+"""
+function render_fused_leaf(mod::Module)
+    _evaluate_source(mod, _FUSED_LEAF_SETUP)     # build-execute the DI + Enzyme boundary
+    metric = Core.eval(mod, :metric)
+    pos0   = Core.eval(mod, :position)
+    mom0   = Core.eval(mod, :momentum)
+    ograd0 = Core.eval(mod, :old_gradient)
+    pgrad! = Core.eval(mod, :potential_gradient!)
+    chol   = Core.eval(mod, :chol)
+    ss     = Core.eval(mod, :stepsize)
+    ih     = Core.eval(mod, :init_ham)
+    thr    = Core.eval(mod, :threshold)
+    ldc    = Core.eval(mod, :logdet_chol)
+
+    built = _prepare_fused_leaf(metric, pos0, pgrad!)
+    assert_fused_leaf_coverage(built)
+
+    named_inputs = (; pos = pos0, mom = mom0, old_grad = ograd0, chol = chol,
+                    stepsize = ss, init_ham = ih, threshold = thr,
+                    pgrad = pgrad!, logdet_chol = ldc)
+    # Positional call in the kernel's actual input order.
+    input_tuple = Tuple(getproperty(named_inputs, v.name) for v in built.plan.have)
+    raw = Base.invokelatest(built.kernel, input_tuple...)
+    # Borrowed arrays alias the kernel's owned caches; snapshot before display.
+    output = map(x -> x isa AbstractArray ? copy(x) : x, raw)
+    named_output = NamedTuple{Tuple(v.name for v in built.plan.want)}(output)
+    # Sanity on the executed evidence (real build-executed leaf).
+    (named_output.diverged isa Bool && isfinite(named_output.dham) &&
+     all(isfinite, named_output.new_pos)) || error(
+        "fused leaf produced a non-finite / malformed result")
+
+    generated = code_expr(built.kernel)
+    generated == built.kernel.ast || error("fused leaf generated view is not the live kernel code_expr")
+
+    source = string(
+        "# Origin: fused NUTS leaf — benchmark feasibility tip 71f37a2 (build executed)\n",
+        strip(_FUSED_LEAF_SOURCE, '\n'), "\n\n",
+        "# Executed input (D=4, identity metric, seed 20260826)\n",
+        _plain_repr(named_inputs), "\n\n",
+        "# Actual output — one fused leaf (arrays are BORROWED: they alias the\n",
+        "# kernel's owned caches and are valid until the next call)\n",
+        _plain_repr(named_output),
+    )
+    kernel_view = string(
+        "# The fused NON-ALLOCATING schedule: one straight-line function over the\n",
+        "# recipe caches (`__caches__`) through the injected cache policy\n",
+        "# (`__cache_apply__`) — NO get!/validity/invalidation in the hot leaf.\n\n",
+        _generated_source(generated),
+    )
+    _three_pane_blocks!(Any[], "Unit A — the fused leaf", source, kernel_view, built.plan) |>
+        Markdown.MD
+end
+
+# Build provenance — the exact commit the docs were build-executed from, so a reader
+# can tie every generated pane and inventory to a source SHA (drift-proofing).
+function build_commit()
+    try
+        strip(read(`git -C $(dirname(@__DIR__)) rev-parse --short=12 HEAD`, String))
+    catch
+        "unavailable"
+    end
+end
+
+"""
+    render_build_commit() -> Markdown.MD
+
+A one-line build-provenance stamp naming the exact commit the page was
+build-executed from.
+"""
+function render_build_commit()
+    sha = build_commit()
+    Markdown.MD(Markdown.Paragraph(Any[
+        "Every generated pane, DAG, and inventory below was build-executed from commit ",
+        Markdown.Code(sha), ".",
+    ]))
 end
 
 end # module ReactiveKernelsDocs
