@@ -17,9 +17,21 @@
 #  threads it through every RNG-using sibling/recursive call; `nuts!!` calls `step!(state, rng)`.
 #  RESET/COPY are NAMED RK-VISIBLE strong-updates (NOT opaque restore!/rcopy!): `rcopy!!` is a registered
 #  @kernel owned-copy with visible effect roots; reset! establishes authoritative owned endpoint state via
-#  visible owned copies + control writes. step_f resolves to the registered leapfrog! token; a non-nothing
-#  stats_f must likewise be a registered kernel. @node(logdet(chol_metric)) preserved. (Exact owned-copy
-#  field-set / reset intrinsic contract follows the syntax/core strong-update contract.)
+#  visible owned copies + INLINE buffer clears + control writes (no unregistered helper). step_f resolves
+#  to the registered leapfrog! token; a non-nothing stats_f must likewise be a registered kernel.
+#  @node(logdet(chol_metric)) preserved.
+#
+#  PINNED STRUCTURAL-COPY OWNERSHIP POLICY (load-bearing for the one-logdet-cut-point + no-extra-gradient
+#  guarantees; `deepcopy(init)` is the STRUCTURAL MARKER for it, not ordinary all-fields deepcopy):
+#   - SHARED BY IDENTITY across init/fwd/bwd: read-only authority inputs pot_f, grad_f, metric, plus the
+#     metric-only closure chol_metric and the @node(logdet(chol_metric)) value (compiler shares read-only
+#     authority closures — exactly one slot).
+#   - OWNED/DISTINCT per endpoint: the registered-integrator-written sources pos, mom, plus their
+#     endpoint-dependent closures/caches pot, dpot_dpos, dkin_dmom, kin, ham, dham_dpos, dham_dmom
+#     (compiler clones writable-source closures — pairwise-distinct owned buffers).
+#   rcopy!! copies EXACTLY the owned set into existing destination buffers; it never touches the shared
+#   metric authority. (Runtime slot-identity/counter gates — shared=one slot, owned pairwise-distinct,
+#   metric mutation recomputes chol/logdet once, pos/mom leaf schedule contains neither — land with lowering.)
 #
 # STAGE: durable source-capture CONSUMER surface. CONSTRUCTION-BLOCKED on the current substrate (@node,
 # implicit fields + __self__ receiver, free-kernel discrimination pending syntax's source-capture
@@ -45,13 +57,12 @@ mv(mom, dham_dmom) = (; mom, dham_dmom)
 mv(d::Int) = mv(zeros(d), zeros(d))
 tree(d::Int) = (; log_weight = fill(-Inf, 2), bwd = mv(d), bwd_fwd = mv(d), summed_mom = trajectory(d))
 tree(phasepoint) = tree(length(phasepoint.pos))
-reset_one_tree!(t) = begin                      # visible buffer clears (owned scratch)
-    fill!(t.log_weight, -Inf)
-    @. t.bwd.mom = 0; @. t.bwd.dham_dmom = 0
-    @. t.bwd_fwd.mom = 0; @. t.bwd_fwd.dham_dmom = 0
-    @. t.summed_mom.bwd = 0; @. t.summed_mom.fwd = 0
-    t
-end
+
+# The exact registered-token binding nuts_state's step_f expects: step_f resolves to the RK-registered
+# leapfrog! kernel with a bound stepsize SOURCE (form A; factory binding static/inlined, hygienic
+# identity). Parsed by the structural gate; actual construction happens once the source-capture
+# substrate lands.
+example_step_binding(stepsize) = partial(leapfrog!; stepsize = stepsize)
 
 # ---- euclidean_phasepoint (methodless => stateless) — @node(logdet) PRESERVED ------------------------
 @kernel euclidean_phasepoint(pot_f, grad_f, metric, pos, mom) = begin
@@ -72,12 +83,18 @@ end
     @. phasepoint.mom -= 0.5 * stepsize * phasepoint.dham_dpos
 end
 
-# ---- rcopy!!: registered RK owned-copy strong-update with VISIBLE effect roots (replaces opaque rcopy!)
-# dest's owned buffers <- src. Representative visible field-set; exact owned-copy contract follows core.
+# ---- rcopy!!: registered RK owned-copy strong-update (replaces opaque rcopy!). COPIES THE COMPLETE OWNED
+# authoritative endpoint snapshot into EXISTING destination buffers (identity preserved, currentness
+# maintained). NEVER copies/rebinds the SHARED metric authority (metric/chol_metric/@node(logdet)/pot_f/
+# grad_f). Owned set = the registered-integrator-written sources (pos, mom) + their endpoint-dependent
+# closures/caches (pot, dpot_dpos, dkin_dmom, kin, ham, dham_dpos, dham_dmom). dham_dpos/dham_dmom are
+# copied explicitly (do not assume they alias dpot_dpos/dkin_dmom unless the compiler proves the slot).
 @kernel rcopy!!(dest, src) = begin
-    @. dest.pos = src.pos
-    @. dest.mom = src.mom
+    @. dest.pos       = src.pos
+    @. dest.mom       = src.mom
     @. dest.dpot_dpos = src.dpot_dpos
+    @. dest.dkin_dmom = src.dkin_dmom
+    @. dest.dham_dpos = src.dham_dpos
     @. dest.dham_dmom = src.dham_dmom
     dest.pot = src.pot
     dest.kin = src.kin
@@ -87,6 +104,9 @@ end
 
 # ---- nuts.jl: nuts_state — FORM B: implicit-field; NO Ref; explicit init/fwd/bwd; two-direct-branch ---
 # direction (concrete endpoint `ep` threaded); runtime rng; visible reset!/rcopy!! strong-updates.
+# step_f resolves to the registered leapfrog! token (see example_step_binding). stats_f is
+# registered-or-nothing: a non-nothing stats_f MUST be a registered RK kernel (not an opaque runtime
+# Function) so collectstats!(__self__) has a visible registered callback identity.
 @kernel nuts_state(init; max_depth = 10, min_dham = -1000., step_f = nothing, stats_f = nothing) = begin
     gofwd = true
     may_sample = true
@@ -98,7 +118,8 @@ end
     dham = 0.
     diverged = !(dham >= min_dham)
 
-    # reset establishes authoritative owned endpoint state — visible owned copies + control writes.
+    # reset establishes authoritative owned endpoint state — registered owned copies + INLINE visible
+    # buffer clears (no opaque unregistered helper) + control writes.
     reset!() = begin
         gofwd = true
         may_sample = true
@@ -108,7 +129,15 @@ end
         rcopy!!(fwd, init)               # registered owned-copy (visible)
         rcopy!!(bwd, init)
         for p in proposals; rcopy!!(p, init); end
-        for t in trees; reset_one_tree!(t); end
+        for t in trees
+            fill!(t.log_weight, -Inf)
+            @. t.bwd.mom = 0
+            @. t.bwd.dham_dmom = 0
+            @. t.bwd_fwd.mom = 0
+            @. t.bwd_fwd.dham_dmom = 0
+            @. t.summed_mom.bwd = 0
+            @. t.summed_mom.fwd = 0
+        end
     end
     collectstats!() = isnothing(stats_f) || stats_f(__self__)
     logadvanceprob(depth) = trees[depth-1].log_weight[1] - trees[depth].log_weight[1]
@@ -116,7 +145,7 @@ end
         proposals[i], proposals[j] = proposals[j], proposals[i]
     end
 
-    step!(rng; force = true) = begin
+    step!(rng) = begin
         reset!(__self__)
         gofwd ? (@. bwd.mom *= -1) : (@. fwd.mom *= -1)        # two direct branches; concrete backward
         trees[1].log_weight[1] = 0.

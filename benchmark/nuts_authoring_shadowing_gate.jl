@@ -127,19 +127,46 @@ blocks = kernel_blocks()
     end
     @test !bad_self[]
 
-    # (B-mut) hot mutation/copy has REGISTERED identity: no opaque restore!/single-bang rcopy! CALL;
-    #         rcopy!! is a registered @kernel; reset! (visible) present; step_f resolves to leapfrog!.
-    opaque = Ref(false)
+    # (B-mut) EVERY hot mutating (!-suffixed) callee must have a REGISTERED identity: a registered @kernel
+    #         (rcopy!! / step_f->leapfrog!), a captured nuts_state sibling method, or an allowed visible
+    #         primitive (fill!). Any other !-callee (unregistered ordinary-Julia helper, restore!, rcopy!,
+    #         reset_one_tree!, ...) is REJECTED.
+    registered_kernels = Set(string(k) for k in keys(blocks))
+    sibling_methods = Set(string(methodname(m)) for m in ns.methods)
+    allowed_prims = Set(["fill!"])
+    bad_mut = String[]
     for m in ns.methods
         _walk(methodbody(m)) do x
-            x isa Expr && x.head === :call && x.args[1] in (:restore!, Symbol("rcopy!")) && (opaque[] = true)
+            x isa Expr && x.head === :call && x.args[1] isa Symbol || return
+            f = string(x.args[1]); endswith(f, "!") && f != "!" && f != "!=" || return   # skip the ! / != operators
+            (f in registered_kernels || f in sibling_methods || f in allowed_prims) || push!(bad_mut, f)
         end
     end
-    @test !opaque[]
-    @test haskey(blocks, Symbol("rcopy!!"))
-    @test any(m -> methodname(m) === :reset!, ns.methods)
-    @test occursin("step_f=partial(leapfrog!", replace(SRC, " " => "")) == false || true   # doc note; step_f is a source token
-    @test occursin("step_f(ep)", nb)        # step_f invoked on a concrete endpoint (registered token)
+    @test isempty(bad_mut)
+    @test haskey(blocks, Symbol("rcopy!!")) && any(m -> methodname(m) === :reset!, ns.methods)
+    @test occursin("step_f(ep)", nb)          # step_f invoked on a concrete endpoint (registered token)
+    @test !occursin("reset_one_tree!", SRC)   # opaque helper inlined away
+
+    # (B-own) rcopy!! copies the COMPLETE OWNED set into dest; NEVER the shared metric authority.
+    rc = blocks[Symbol("rcopy!!")]; rc_writes = Set{Symbol}()
+    _walk(rc.body) do x
+        x isa Expr && is_assign(x.head) && x.args[1] isa Expr && x.args[1].head === :. &&
+            x.args[1].args[1] === :dest && x.args[1].args[2] isa QuoteNode && push!(rc_writes, x.args[1].args[2].value)
+    end
+    @test Set([:pos,:mom,:pot,:dpot_dpos,:dkin_dmom,:kin,:ham,:dham_dpos,:dham_dmom]) ⊆ rc_writes
+    @test isempty(rc_writes ∩ Set([:metric,:chol_metric,:pot_f,:grad_f]))
+
+    # (B-bind) a REAL parsed step_f binding: partial(leapfrog!; stepsize=<source>) — registered identity.
+    bind_ok = Ref(false)
+    _walk(AST) do x
+        x isa Expr && x.head === :call && x.args[1] === :partial && any(a -> a === :leapfrog!, x.args) &&
+            any(a -> a isa Expr && a.head === :parameters &&
+                     any(p -> p isa Expr && p.head === :kw && p.args[1] === :stepsize, a.args), x.args) && (bind_ok[] = true)
+    end
+    @test bind_ok[]
+
+    # (B-noforce) `force` removed from step! (dead after registered reset).
+    @test !(:force in formals(methodsig(method_named(ns, :step!))))
 
     # (B-fields) reference field spellings + concrete endpoint param `ep` threaded through recursion.
     nsnames = Set(ns.fields) ∪ Set(ns.sources)
