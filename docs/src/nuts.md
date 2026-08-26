@@ -8,9 +8,10 @@
 > **method-bearing `@kernel`** surface — a phase-point *endpoint* object with in-place
 > `leapfrog!` / `refresh_momentum!` methods, a composed `sampler`, and ordinary tree
 > recursion (ReactiveHMC-faithful, `@reactive` **removed**). That surface is **staged,
-> not yet canonical**: it is mid-implementation (syntax → poc → HMC), and its real
-> definitions + interaction will appear here — build-executed and drift-proof from the
-> landed fixture — once it lands. Nothing below is the final authoring surface.
+> not yet canonical**: it is mid-implementation (syntax → poc → HMC). Its **reviewed,
+> source-faithful authoring fixture is shown below as a source-only, non-executable
+> target** (compiler lowering in progress); the legacy `@reactive` substrate that
+> follows it is being replaced.
 
 `ReactiveKernels` includes a multinomial No-U-Turn sampler. Its per-transition
 Hamiltonian work is *currently* a compiled reactive kernel — the **legacy substrate**
@@ -30,6 +31,33 @@ an **analytic** callable — so the *kernel*, not any differentiation machinery,
 visible content, and the timings isolate sampler overhead rather than the gradient. The
 complete runnable workflow, including the optional DI + Enzyme boundary, is
 [`examples/nuts.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/nuts.jl).
+
+## The reviewed `@kernel` authoring surface
+
+> [!IMPORTANT]
+> **Compiler lowering in progress / not executable sampler.** The definitions below are
+> the **reviewed, ReactiveHMC.jl-faithful** `@kernel` NUTS authoring surface, sourced
+> **drift-proof** from `benchmark/nuts_kernel_authoring_fixture.jl` at reviewed commit
+> `725ac9b` and read from the file at build time. This is a **source-only** target:
+> it is **not executed**, there is **no generated-kernel or Compute-DAG pane**, and
+> **no parity, allocation, performance, or production claim** is made (the stateful
+> `@kernel` lowering is mid-implementation — the definitions construct but do not
+> compile to a runnable sampler). It is the authoring *shape* to review, not code you
+> can run.
+
+Re-authored directly against the ReactiveHMC.jl reference source
+([`ca9ea4ca`](https://github.com/nsiccha/ReactiveHMC.jl), `phasepoints.jl` /
+`integrators.jl` / `nuts.jl` / `adaptation.jl`), with exactly three named deviations —
+`@reactive` → the unified `@kernel`; implicit-field capture / `__self__` → an explicit
+`self` first method parameter; and the `@node` caching hint dropped so caching/hoisting
+is *inferred* by `@kernel`, not annotated. Everything else (field names, object
+composition, the `pot_f`/`grad_f` phase-point shape, the direct in-object state mutation,
+the dual-averaging / Welford recurrences, `restore!`/`rcopy!`) is the reference's. One
+`@kernel` macro; no `Graph`/`add!`/applier/binding plumbing; `@reactive` removed.
+
+```@eval
+Main.ReactiveKernelsDocs.render_authoring_fixture()
+```
 
 ## Current substrate (legacy `@reactive` group — being replaced)
 
