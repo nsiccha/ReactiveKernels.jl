@@ -22,6 +22,7 @@ using Test
         include("test_reactive_adaptation.jl")
         include("test_reactive_facade.jl")
         include("test_reactive_facade_ca9.jl")
+        include("test_benchmark_smoke.jl")
         include("test_online_stats_example.jl")
         include("test_distributions_example.jl")
         include("test_preexisting_examples.jl")
