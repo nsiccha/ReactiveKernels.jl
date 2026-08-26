@@ -1,800 +1,323 @@
-# ReactiveHMC-shaped `@kernel` NUTS AUTHORING FIXTURE (V7, rooted at Inc1 substrate 118ad97).
+# ReactiveHMC.jl-FAITHFUL `@kernel` NUTS AUTHORING FIXTURE.
 #
-# The author-facing surface the user asked for: ONE `@kernel` macro, concise composable method
-# bodies faithful to ReactiveHMC.jl, no Graph/add!/applier/output_binding plumbing, no `@reactive`,
-# no production transition wiring. Once poc's Increment-2 MethodIR clears, these EXACT definitions
-# become the MethodIR consumer fixture and then the production sampler.
+# Re-authored (correct-then-rebase) directly against the ACTUAL ReactiveHMC.jl source — NOT the
+# in-repo oracle. Reference provenance:
+#   ReactiveHMC v0.1.0, installed at ~/.julia/packages/ReactiveHMC/781sB/src, pinned in
+#   ReactiveKernels' src/hmc.jl to main@ca9ea4ca41924bb0e1fadc01c717e1333916aba6
+#   (github.com/nsiccha/ReactiveHMC.jl/blob/ca9ea4ca.../src/nuts.jl). Files transcribed:
+#   phasepoints.jl (euclidean_phasepoint), integrators.jl (leapfrog!), nuts.jl (nuts_state +
+#   tree helpers), adaptation.jl (dual_averaging_state, welford_var). The ONLY change from the
+#   reference is @reactive -> the unified sole @kernel with an explicit `self` first method
+#   parameter; field NAMES, object COMPOSITION, the pot_f/grad_f phase-point shape, the direct
+#   in-object state mutation, the DA (m/H/mu + fit!) and Welford (n/mean/var + step!(x;dn))
+#   recurrences, and the restore!/rcopy! reset semantics are the reference's, verbatim.
 #
-# STAGE (Inc1 / 118ad97): SOURCE-SHAPE + MACRO-CONSTRUCTION only. MethodIR/effect-lowering is
-# intentionally ABSENT, so these CONSTRUCT (stateful skeletons with retained raw bodies) but do NOT
-# execute/compile — NO execution/perf claim. The multinomial NUTS transition (mirror / start_tree! /
-# finish_tree! / flip! / step!) is a FAITHFUL 1:1 transcription of the ordinary-Julia oracle in
-# src/hmc.jl (`_reset_transition!`/`_start_tree!`/`_finish_tree!`/`_flip!`/`step!`, which is itself
-# ported byte-for-byte from ReactiveHMC.jl @ca9ea4ca) — same log-weights, proposal tournament + swap,
-# `_rand_bernoulli_log` multinomial selection, accumulated summed-momenta, backward/forward velocities,
-# divergence stop, depth>1 three-part U-turn criterion, and EXACT RNG call order (direction coin ->
-# subtree proposal draws -> top-level proposal draw). Warmup boundaries (find_initial_stepsize! ->
-# expanding metric windows -> window-end mass update -> DA+Welford reset per window -> final da.final)
-# are transcribed from src/hmc.jl `warmup!`/`_warmup_window_ends`/`_adapted_diagonal_metric`. DA/Welford
-# recurrences are byte-faithful to src/reactive_nuts.jl (`_dual_averaging_object`/`_welford_object`).
+# This REPLACES the earlier fixture, which diverged from the reference (invented value_gradient
+# bundle, velocity/kinetic/hamiltonian names, an external _NUTSScratch argument + a no-self-mutation
+# "segment/orchestration" contract, and warmup!/adapt_metric! that live OUTSIDE nuts_state in the
+# reference). 5e8773b is retained only as algorithm/oracle history; it is NOT the production target.
 #
-# SCRATCH OWNERSHIP (parent binding choice, 18:21): the hot transition takes an EXPLICIT PREALLOCATED
-# orchestration-scratch argument built ONCE outside the transition (`_nuts_scratch`) and passed to
-# step!/warmup!/sample!. Automatic scratch hoisting is not implemented/specified, so honest ownership
-# is shown now; the later specializing factory may own/inject the same scratch without changing the
-# transition math. NO tree/proposal/control buffer is constructed inside hot orchestration; scratch is
-# mutated by ordinary orchestration (fill!/copyto!/index writes), NEVER as reactive self-path state.
-#
-# SEGMENT vs ORCHESTRATION contract (authored in the source, enforced by the gate below):
-#  - SEGMENTS mutate authoritative reactive state (endpoints / adaptation / statistics): leapfrog!,
-#    refresh_momentum!, mirror!, recompute_init!, restore_accept!, set_stepsize!, adapt_metric!, fit!,
-#    reset! (DA+Welford), observe!, record!  — plus read-only reducers energy_error/divergent/
-#    uturn_ok/uturn_ok_sum.
-#  - ORCHESTRATION methods (reset_scratch!/start_tree!/finish_tree!/flip!/probe_acceptance!/
-#    find_initial_stepsize!/step!/warmup!/sample!) are ordinary Julia: dynamic recursion + RNG +
-#    tree/proposal/control SCRATCH; they mutate authoritative state ONLY through segment calls —
-#    never a direct `self.<path> = …` (in any assignment/broadcast/mutating-call form).
+# STAGE: SOURCE-SHAPE + MACRO-CONSTRUCTION only (construction-only substrate). If the graph
+# analysis / MethodIR rejects any faithful shape here (in-object tree state mutation, fwd/bwd
+# derived from gofwd, callable pot_f/grad_f, restore!/rcopy!), that is a COMPILER REQUIREMENT to
+# lower the reference shape — NOT a fixture defect to be worked around. NO execution/parity/0-B/perf
+# claim. One `@kernel` macro; no Graph/add!/applier/binding plumbing; no compiler-limitation
+# compromises.
 using ReactiveKernels
-using LinearAlgebra, Random
+using LinearAlgebra, LogExpFunctions, Random
 
-# --- module-level plain helpers (src/hmc.jl-faithful; allowed non-self primitives) ------------------
-_smooth(previous, new, weight) = (1 - weight) * previous + weight * new         # src/hmc.jl:753
-_min1exp(x) = x >= 0 ? one(x) : exp(x)                                          # src/hmc.jl:376
-_finite_or_neginf(x) = isfinite(x) ? x : oftype(x, -Inf)                        # src/hmc.jl:375
-_rand_bernoulli_log(rng, lp) = lp > 0 ? true : -randexp(rng) < lp              # src/hmc.jl:377-378
-function _logaddexp(a, b)                                                       # LogExpFunctions-faithful
-    a == b == -Inf && return oftype(a, -Inf)
-    m = max(a, b)
-    m + log1p(exp(min(a, b) - m))
-end
-# src/hmc.jl:839-858 verbatim (pure; expanding Stan-style slow windows).
-function _warmup_window_ends(iterations::Int, initial_buffer::Int,
-                             terminal_buffer::Int, first_window::Int)
-    slow_start = initial_buffer + 1
-    slow_stop = iterations - terminal_buffer
-    slow_start > slow_stop && return Int[]
-    ends = Int[]
-    start = slow_start
-    window = first_window
-    while start <= slow_stop
-        remaining = slow_stop - start + 1
-        if 2window > remaining
-            push!(ends, slow_stop)
-            break
-        end
-        push!(ends, start + window - 1)
-        start += window
-        window *= 2
-    end
-    ends
-end
+# ---- nuts.jl / adaptation.jl module helpers (verbatim from the reference) ---------------------------
+fillf(f::Function, value, n::Int) = [f(value) for _ in 1:n]
+finiteorneginf(x) = isfinite(x) ? x : typeof(x)(-Inf)
+min1exp(x) = x >= 0 ? one(x) : exp(x)
+badd(args...) = Base.broadcasted(+, args...)
+randbernoullilog(rng, logprob) = logprob > 0 ? true : -randexp(rng) < logprob
+logswapprob(tree) = tree.log_weight[1] - tree.log_weight[2]
+compute_criterion(mom, bwd_dham_dmom, fwd_dham_dmom) =
+    (dot(mom, bwd_dham_dmom) > 0 && dot(mom, fwd_dham_dmom) > 0)
+smooth(prev, new, new_weight) = (1 - new_weight) * prev + new_weight * new
 
-# --- Object A: shared Hamiltonian / metric authority (methodless => stateless, composed by identity) -
-@kernel hamiltonian(potential_gradient!, metric, stepsize) = begin
-    chol        = cholesky(metric)
-    logdet_chol = logdet(chol)
-end
+trajectory(d::Int) = trajectory(zeros(d), zeros(d))
+trajectory(bwd, fwd) = (; bwd, fwd)
+mv(mom, dham_dmom) = (; mom, dham_dmom)
+mv(d::Int) = mv(zeros(d), zeros(d))
+tree(d::Int) = (;
+    log_weight = fill(-Inf, 2),
+    bwd = mv(d),
+    bwd_fwd = mv(d),
+    summed_mom = trajectory(d),
+)
+tree(phasepoint) = tree(length(phasepoint.pos))
 
-# --- Object B: a phase-point endpoint (owns pos/mom + derived; reads shared `ham`) ------------------
-@kernel endpoint(ham, pos, mom) = begin
-    value_gradient = ham.potential_gradient!(pos)                 # owned (value, gradient) bundle
-    potential      = value_gradient.value
-    gradient       = value_gradient.gradient
-    velocity       = ham.chol \ mom                              # owned; reads shared chol
-    kinetic        = (ham.logdet_chol + dot(mom, velocity)) / 2  # reads shared logdet_chol cut point
-    hamiltonian    = potential + kinetic
+# ---- phasepoints.jl: euclidean_phasepoint (methodless => stateless; derived-only) ------------------
+# grad_f(pos) returns (pot, dpot_dpos); pot_f(pos) the potential alone — the reference's TWO-function
+# gradient shape (NOT a value_gradient bundle). Reactive fields: pot, dpot_dpos, chol_metric,
+# dkin_dmom, kin, ham, dham_dpos, dham_dmom.
+@kernel euclidean_phasepoint(pot_f, grad_f, metric, pos, mom) = begin
+    pot = pot_f(pos)
+    pot, dpot_dpos = grad_f(pos)
 
-    # segment: resample momentum ~ N(0,M); velocity/kinetic/hamiltonian recompute (0 pgrad).
-    function refresh_momentum!(self, rng)
-        randn!(rng, self.mom)
-        lmul!(self.ham.chol.L, self.mom)
-    end
-    # segment: faithful 3-line Stormer-Verlet; self.ham.stepsize is the shared slot (visible sharing).
-    leapfrog!(self) = begin
-        @. self.mom -= 0.5 * self.ham.stepsize * self.gradient
-        @. self.pos +=       self.ham.stepsize * self.velocity
-        @. self.mom -= 0.5 * self.ham.stepsize * self.gradient
-    end
+    chol_metric = cholesky(metric)
+    dkin_dmom = chol_metric \ mom
+    # (reference wraps the logdet term in @node as a caching hint; @kernel's analysis owns caching.)
+    kin = .5 * (logdet(chol_metric) + dot(mom, dkin_dmom))
+
+    ham = pot + kin
+    dham_dpos = dpot_dpos
+    dham_dmom = dkin_dmom
 end
 
-# --- Object D1: Nesterov dual averaging (byte-faithful to src _dual_averaging_object + reset!) ------
-@kernel dual_averaging(iteration, error, log_final, center,
-                       target, regularization_scale, relaxation_exponent, offset) = begin
-    log_current = center - sqrt(iteration) / regularization_scale * error
-    current     = exp(log_current)
-    final       = exp(log_final)
-    fit!(self, acceptance_rate) = begin
-        new_iteration  = self.iteration + 1
-        new_error      = self.error +
-            (self.target - acceptance_rate - self.error) / (new_iteration + self.offset)
-        self.iteration = new_iteration
-        self.error     = new_error
-        weight         = new_iteration^(-self.relaxation_exponent)
-        self.log_final = self.log_final + weight * (self.log_current - self.log_final)
-    end
-    # segment: reinitialize accumulators in place to a fresh dual_averaging_state(initial) — src
-    # reset!(::DualAveragingState, initial) (reactive_nuts.jl:917-931). Reused at each metric window.
-    reset!(self, initial; target = 0.8, regularization_scale = 0.05,
-           relaxation_exponent = 0.75, offset = 10) = begin
-        self.iteration            = one(self.center)
-        self.error                = zero(self.center)
-        self.log_final            = zero(self.center)
-        self.center               = log(oftype(self.center, 10)) + log(oftype(self.center, initial))
-        self.target               = oftype(self.center, target)
-        self.regularization_scale = oftype(self.center, regularization_scale)
-        self.relaxation_exponent  = oftype(self.center, relaxation_exponent)
-        self.offset               = oftype(self.center, offset)
-    end
+# ---- integrators.jl: leapfrog! is a FREE function taking the phase point; stepsize is a keyword ----
+leapfrog!(phasepoint; stepsize) = begin
+    @. phasepoint.mom -= .5 * stepsize * phasepoint.dham_dpos
+    @. phasepoint.pos +=      stepsize * phasepoint.dham_dmom
+    @. phasepoint.mom -= .5 * stepsize * phasepoint.dham_dpos
 end
 
-# --- Object D2: online componentwise Welford (byte-faithful to src _welford_object + reset!) --------
-@kernel welford(n, mean, var) = begin
-    function observe!(self, value; weight = 1)
-        self.n   = self.n + weight
-        fraction = weight / self.n
-        @. self.var  = _smooth(self.var,
-                               (value - _smooth(self.mean, value, fraction)) * (value - self.mean),
-                               fraction)
-        @. self.mean = _smooth(self.mean, value, fraction)
-    end
-    # segment: zero n/mean/var in place — src reset!(::WelfordVariance) (reactive_nuts.jl:1002-1007).
-    reset!(self) = begin
-        self.n = zero(self.n)
-        @. self.mean = zero(self.mean)
-        @. self.var  = zero(self.var)
-    end
-end
+# ---- nuts.jl: nuts_state — ONE in-object multinomial NUTS sampler --------------------------------
+# Tree scratch (gofwd/may_sample/may_continue/fwdbwd/fwd/bwd/trees/proposals/dham/diverged) are the
+# object's OWN composed fields; fwd/bwd are DERIVED from gofwd; step!/flip!/finish_tree!/start_tree!
+# are methods that mutate those fields DIRECTLY (self.gofwd = !self.gofwd; self.may_sample = false;
+# self.dham = …). This is the reference's composition and mutation model — no external scratch, no
+# segment/orchestration split. reset is restore!(self;force) + bwd.mom.*=-1 + rcopy!(init, proposals[end]).
+@kernel nuts_state(init; rng, max_depth = 10, min_dham = -1000.,
+                   step_f = nothing, stats_f = nothing) = begin
+    gofwd = true
+    may_sample = true
+    may_continue = true
+    fwdbwd = fillf(deepcopy, init, 2)
+    fwd = fwdbwd[gofwd ? 1 : 2]                 # derived from gofwd (reference wraps in Ref)
+    bwd = fwdbwd[gofwd ? 2 : 1]
+    trees = fillf(tree, init, max_depth + 1)
+    proposals = fillf(deepcopy, init, max_depth + 2)
+    dham = 0.
+    diverged = !(dham >= min_dham)
 
-# --- Object E: statistics (real diagnostic accumulators incl. energy error) -------------------------
-@kernel sampling_stats(sum_depth, sum_n_steps, sum_accept, sum_energy_error, n_divergent, n_draws) = begin
-    function record!(self, depth, n_steps, acceptance, energy_error, divergent)
-        self.sum_depth        = self.sum_depth + depth
-        self.sum_n_steps      = self.sum_n_steps + n_steps
-        self.sum_accept       = self.sum_accept + acceptance
-        self.sum_energy_error = self.sum_energy_error + energy_error
-        self.n_divergent      = self.n_divergent + (divergent ? 1 : 0)
-        self.n_draws          = self.n_draws + 1
+    stepfwd!(self) = self.step_f(self.fwd)
+    collectstats!(self) = isnothing(self.stats_f) || self.stats_f(self)
+    logadvanceprob(self, depth) =
+        self.trees[depth - 1].log_weight[1] - self.trees[depth].log_weight[1]
+    swapproposal!(self, i, j = length(self.proposals)) = begin
+        self.proposals[i], self.proposals[j] = self.proposals[j], self.proposals[i]
     end
-end
-
-# --- The sampler (driver): one shared ham + three composed endpoints + adaptation/stats -------------
-@kernel sampler(potential_gradient!, metric, stepsize, position, momentum, max_depth, min_dham) = begin
-    ham   = hamiltonian(potential_gradient!, metric, stepsize)    # shared authority (one instance)
-    init  = endpoint(ham, position, momentum)                     # three composed phase points
-    fwd   = endpoint(ham, position, momentum)
-    bwd   = endpoint(ham, position, momentum)
-    da    = dual_averaging(one(stepsize), zero(stepsize), zero(stepsize),
-                           log(oftype(stepsize, 10)) + log(stepsize),
-                           oftype(stepsize, 0.8), oftype(stepsize, 0.05),
-                           oftype(stepsize, 0.75), oftype(stepsize, 10))
-    w     = welford(zero(eltype(position)), zero(position), zero(position))   # float n (F32/F64-faithful)
-    stats = sampling_stats(0, 0, zero(stepsize), zero(stepsize), 0, 0)
-
-    # --- read-only reducer segments (no state write) -------------------------------------------------
-    # dham = finite(init_ham - moving_ham); divergence threshold; U-turn criteria (endpoint-momentum).
-    energy_error(self, moving_ham) = _finite_or_neginf(self.init.hamiltonian - moving_ham)
-    divergent(self, dham) = !(dham >= self.min_dham)
-    uturn_ok(self, summed_mom, back_vel, fwd_vel) =                          # src _compute_criterion
-        (dot(summed_mom, back_vel) > 0) && (dot(summed_mom, fwd_vel) > 0)
-    uturn_ok_sum(self, left_mom, right_mom, back_vel, fwd_vel) =            # src _compute_criterion_sum
-        uturn_ok(self, left_mom .+ right_mom, back_vel, fwd_vel)
-
-    # --- state-mutating segments (endpoints / adaptation / metric) -----------------------------------
-    # AUTHORITATIVE reset MIRROR (src _reset_transition! + step!'s backward-momentum negation, fused):
-    # fwd = FULL identity copy of init; bwd = init with SIGNED momentum+velocity and copied pot/grad/
-    # kin/ham (kinetic quadratic => sign-invariant). Distinct owned fwd/bwd buffers => the first leaf
-    # reads the mirrored init gradient WITHOUT a pgrad recompute (fused == n_steps + 1).
-    mirror!(self) = begin
-        self.fwd.value_gradient = self.init.value_gradient       # owned bundle (distinct inner buffers)
-        @. self.fwd.pos      = self.init.pos
-        @. self.fwd.mom      = self.init.mom
-        @. self.fwd.velocity = self.init.velocity
-        @. self.fwd.gradient = self.init.gradient                # projection of the bundle
-        self.fwd.potential   = self.init.potential               # projection/scalar
-        self.fwd.kinetic     = self.init.kinetic
-        self.fwd.hamiltonian = self.init.hamiltonian
-        self.bwd.value_gradient = self.init.value_gradient       # bwd shares the position => same bundle
-        @. self.bwd.pos      = self.init.pos
-        @. self.bwd.mom      = -self.init.mom
-        @. self.bwd.velocity = -self.init.velocity
-        @. self.bwd.gradient = self.init.gradient
-        self.bwd.potential   = self.init.potential
-        self.bwd.kinetic     = self.init.kinetic
-        self.bwd.hamiltonian = self.init.hamiltonian
-    end
-    # Unit-C: make init's FULL phase point current after accepted pos/mom with EXACTLY one pgrad — the
-    # boundary gradient that also seeds the next transition's mirror (amortized fused == n_steps + 1).
-    recompute_init!(self) = begin
-        self.init.value_gradient = self.init.ham.potential_gradient!(self.init.pos)   # the one pgrad
-        self.init.potential      = self.init.value_gradient.value
-        self.init.gradient       = self.init.value_gradient.gradient
-        self.init.velocity       = self.init.ham.chol \ self.init.mom
-        self.init.kinetic        = (self.init.ham.logdet_chol +
-                                    dot(self.init.mom, self.init.velocity)) / 2
-        self.init.hamiltonian    = self.init.potential + self.init.kinetic
-    end
-    # accepted restore: write the multinomially-selected proposal pos/mom into init (state write).
-    restore_accept!(self, accepted_pos, accepted_mom) = begin
-        @. self.init.pos = accepted_pos
-        @. self.init.mom = accepted_mom
-    end
-    # cross-view adaptation writes: DA -> shared stepsize slot; Welford variance -> shared mass diagonal.
-    set_stepsize!(self, stepsize) = begin
-        self.ham.stepsize = stepsize
-    end
-    # src _adapted_diagonal_metric (hmc.jl:860-881): n>1 guard/fallback + metric TYPE preservation.
-    adapt_metric!(self; minimum_variance = 1e-3, regularization = 5) = begin
-        weight = self.w.n / (self.w.n + regularization)
-        sample_variance = self.w.n > 1 ?
-            self.w.var .* (self.w.n / (self.w.n - 1)) :
-            fill(one(eltype(self.w.var)), length(self.w.var))
-        position_variance = @. max(minimum_variance,
-                                   weight * sample_variance + (1 - weight) * minimum_variance)
-        mass_diagonal = @. inv(position_variance)
-        current = self.ham.metric
-        self.ham.metric = current isa Diagonal ?
-            Diagonal(convert(typeof(current.diag), mass_diagonal)) :
-            convert(typeof(current), Matrix(Diagonal(mass_diagonal)))
-    end
-
-    # --- ORCHESTRATION (ordinary Julia; tree/proposal/control come from the PASSED scratch) ----------
-    # per-transition scratch reset (src _reset_transition!'s proposal/tree/flag clears): fill!/copyto!
-    # into the PREALLOCATED scratch; reads self.init but writes ONLY scratch (never self-path state).
-    function reset_scratch!(self, scratch)
-        c = scratch.control
-        c.go_forward = true
-        c.may_sample = true
-        c.may_continue = true
-        c.energy_error = zero(c.energy_error)
-        c.diverged = false
-        c.depth = 0
-        c.n_steps = 0
-        c.acceptance_sum = zero(c.acceptance_sum)
-        for p in scratch.proposals
-            copyto!(p.pos, self.init.pos)
-            copyto!(p.mom, self.init.mom)
-        end
-        for t in scratch.trees
-            fill!(t.log_weight, -Inf)
-            fill!(t.backward.momentum, 0)
-            fill!(t.backward.velocity, 0)
-            fill!(t.backward_forward.momentum, 0)
-            fill!(t.backward_forward.velocity, 0)
-            fill!(t.summed_momentum.backward, 0)
-            fill!(t.summed_momentum.forward, 0)
-        end
-        scratch
-    end
-    # src _flip! (hmc.jl:553-562): toggle direction, negate the (now) backward endpoint's momentum/
-    # velocity into the tree, and flip the accumulated forward momentum. depth==1 is a no-op.
-    function flip!(self, depth, scratch)
-        depth > 1 || return scratch
-        scratch.control.go_forward = !scratch.control.go_forward
-        tree = scratch.trees[depth]
-        back = scratch.control.go_forward ? self.bwd : self.fwd
-        @. tree.backward.momentum = -back.mom
-        @. tree.backward.velocity = -back.velocity
-        @. tree.summed_momentum.forward *= -1
-        scratch
-    end
-    # src _start_tree! (hmc.jl:569-601): base leaf = one leapfrog + energy/divergence + log-weight +
-    # proposal copy; recursive step swaps proposals then draws the SUBTREE Bernoulli-log selection.
-    function start_tree!(self, depth, scratch, rng)
-        if depth == 1
-            active = scratch.control.go_forward ? self.fwd : self.bwd
-            leapfrog!(active)                                        # segment (the fused-gradient leaf)
-            scratch.control.n_steps += 1
-            e = energy_error(self, active.hamiltonian)              # reducer (finite(init_ham - ham))
-            scratch.control.energy_error = e
-            scratch.control.acceptance_sum += _min1exp(e)
-            scratch.control.diverged = divergent(self, e)          # reducer
-            if scratch.control.diverged
-                scratch.control.may_continue = false               # divergence stop
-                return scratch
-            end
-            scratch.trees[1].log_weight[1] = e
-            copyto!(scratch.proposals[1].pos, active.pos)
-            copyto!(scratch.proposals[1].mom, active.mom)
-            return scratch
-        end
-        start_tree!(self, depth - 1, scratch, rng)
-        if !scratch.control.may_continue
-            scratch.control.may_sample = false
-            return scratch
-        end
-        scratch.proposals[depth - 1], scratch.proposals[depth] =
-            scratch.proposals[depth], scratch.proposals[depth - 1]           # _swap_proposal!(d-1,d)
-        finish_tree!(self, depth - 1, scratch, rng)
-        if scratch.control.may_sample && _rand_bernoulli_log(rng,            # SUBTREE proposal draw
-                scratch.trees[depth - 1].log_weight[1] - scratch.trees[depth].log_weight[1])
-            scratch.proposals[depth - 1], scratch.proposals[depth] =
-                scratch.proposals[depth], scratch.proposals[depth - 1]
-        end
-        scratch
-    end
-    # src _finish_tree! (hmc.jl:603-660): combine sub-trees under logaddexp weights + accumulated
-    # summed-momenta + the depth>1 three-part endpoint-momentum U-turn criterion.
-    function finish_tree!(self, depth, scratch, rng)
-        tree = scratch.trees[depth]
-        supertree = scratch.trees[depth + 1]
-        tree.log_weight[2] = tree.log_weight[1]
-        active = scratch.control.go_forward ? self.fwd : self.bwd
-        if depth == 1
-            copyto!(supertree.backward.momentum, active.mom)
-            copyto!(supertree.backward.velocity, active.velocity)
-        else
-            copyto!(supertree.backward.momentum, tree.backward.momentum)
-            copyto!(supertree.backward.velocity, tree.backward.velocity)
-            copyto!(tree.backward_forward.momentum, active.mom)
-            copyto!(tree.backward_forward.velocity, active.velocity)
-            copyto!(tree.summed_momentum.backward, tree.summed_momentum.forward)
-        end
-        start_tree!(self, depth, scratch, rng)
-        if !scratch.control.may_continue
-            scratch.control.may_sample = false
-            return scratch
-        end
-        supertree.log_weight[1] = _logaddexp(tree.log_weight[1], tree.log_weight[2])
-        if depth == 1
-            @. supertree.summed_momentum.forward = supertree.backward.momentum + active.mom
-            scratch.control.may_continue = uturn_ok(self,
-                supertree.summed_momentum.forward, supertree.backward.velocity, active.velocity)
-        else
-            @. supertree.summed_momentum.forward =
-                tree.summed_momentum.backward + tree.summed_momentum.forward
-            scratch.control.may_continue =
-                uturn_ok(self, supertree.summed_momentum.forward,
-                         supertree.backward.velocity, active.velocity) &&
-                uturn_ok_sum(self, tree.summed_momentum.backward, tree.backward.momentum,
-                             supertree.backward.velocity, tree.backward.velocity) &&
-                uturn_ok_sum(self, tree.backward_forward.momentum, tree.summed_momentum.forward,
-                             tree.backward_forward.velocity, active.velocity)
-        end
-        scratch
-    end
-    # src step! (hmc.jl:663-685): reset mirror -> per-depth doubling with EXACT RNG order (direction
-    # coin -> [subtree draws inside finish_tree!] -> top-level proposal draw) -> accepted restore.
-    function step!(self, scratch, rng)
-        mirror!(self)                                              # segment (init -> fwd/bwd, bwd signed)
-        reset_scratch!(self, scratch)                             # orchestration (scratch clears)
-        scratch.trees[1].log_weight[1] = 0
+    step!(self; force = true) = begin
+        restore!(self; force)
+        self.bwd.mom .*= -1
+        self.trees[1].log_weight[1] = 0.
         for depth in 1:self.max_depth
-            rand(rng, Bool) && flip!(self, depth, scratch)        # RNG #1: direction coin
-            finish_tree!(self, depth, scratch, rng)               # RNG #2..k: subtree proposal draws
-            scratch.control.depth = depth
-            scratch.control.may_sample || break
-            if _rand_bernoulli_log(rng,                            # RNG last-of-depth: top-level draw
-                    scratch.trees[depth].log_weight[1] - scratch.trees[depth].log_weight[2])
-                scratch.proposals[depth], scratch.proposals[end] =
-                    scratch.proposals[end], scratch.proposals[depth]         # _swap_proposal!(depth)
-            end
-            scratch.control.may_continue || break
+            rand(self.rng, Bool) && flip!(self, depth)
+            finish_tree!(self, depth)
+            self.may_sample || break
+            randbernoullilog(self.rng, logswapprob(self.trees[depth])) && swapproposal!(self, depth)
+            self.may_continue || break
         end
-        restore_accept!(self, scratch.proposals[end].pos, scratch.proposals[end].mom)   # segment
-        recompute_init!(self)                                     # segment (Unit-C: one boundary pgrad)
-        scratch
+        rcopy!(self.init, self.proposals[end])
     end
-    # src _probe_acceptance (hmc.jl:783-790): fresh momentum, one leapfrog on a mirrored endpoint,
-    # min1exp(energy error). Uses fwd as probe scratch (overwritten by the next transition's mirror).
-    function probe_acceptance!(self, rng, stepsize)
-        refresh_momentum!(self.init, rng)                         # segment
-        set_stepsize!(self, stepsize)                             # segment (write shared stepsize)
-        mirror!(self)                                             # segment (init -> fwd/bwd)
-        leapfrog!(self.fwd)                                       # segment (one step on fwd)
-        _min1exp(energy_error(self, self.fwd.hamiltonian))        # reducer
+    flip!(self, depth) = if depth > 1
+        self.gofwd = !self.gofwd
+        tree = self.trees[depth]
+        @. tree.bwd.mom = -self.bwd.mom
+        @. tree.bwd.dham_dmom = -self.bwd.dham_dmom
+        @. tree.summed_mom.fwd *= -1
     end
-    # src find_initial_stepsize! (hmc.jl:803-837): double/halve until a one-step proposal crosses target.
-    function find_initial_stepsize!(self, rng; initial = one(self.ham.stepsize), target = 0.8,
-                                    min_stepsize = eps(typeof(self.ham.stepsize)),
-                                    max_stepsize = oftype(self.ham.stepsize, 1e3),
-                                    max_iterations = 32)
-        stepsize = clamp(oftype(self.ham.stepsize, initial),
-                         oftype(self.ham.stepsize, min_stepsize),
-                         oftype(self.ham.stepsize, max_stepsize))
-        acceptance = probe_acceptance!(self, rng, stepsize)
-        increase = acceptance > target
-        for _ in 1:max_iterations
-            crossed = increase ? acceptance <= target : acceptance >= target
-            crossed && break
-            next_stepsize = increase ? 2stepsize : stepsize / 2
-            next_stepsize = clamp(next_stepsize,
-                                  oftype(stepsize, min_stepsize), oftype(stepsize, max_stepsize))
-            next_stepsize == stepsize && break
-            stepsize = next_stepsize
-            acceptance = probe_acceptance!(self, rng, stepsize)
+    finish_tree!(self, depth) = begin
+        tree = self.trees[depth]
+        suptree = self.trees[depth + 1]
+        tree.log_weight[2] = tree.log_weight[1]
+        if depth == 1
+            rcopy!(suptree.bwd, (; self.fwd.mom, self.fwd.dham_dmom))
+        else
+            rcopy!(suptree.bwd, tree.bwd)
+            rcopy!(tree.bwd_fwd, (; self.fwd.mom, self.fwd.dham_dmom))
+            tree.summed_mom.bwd .= tree.summed_mom.fwd
         end
-        set_stepsize!(self, stepsize)                             # segment
-        stepsize
-    end
-    # src warmup! (hmc.jl:898-988): initial step-size search, dual averaging every iteration, Stan-style
-    # expanding metric windows with window-end mass update + DA/Welford reset, final da.final.
-    function warmup!(self, iterations, scratch, rng; target_accept = 0.8, minimum_variance = 1e-3)
-        n = Int(iterations)                                       # _warmup_window_ends wants ::Int
-        initial_stepsize = find_initial_stepsize!(self, rng; target = target_accept)   # orchestration
-        reset!(self.da, initial_stepsize; target = target_accept)  # segment (start DA at initial)
-        reset!(self.w)                                             # segment (start Welford clean)
-        initial_count = 75
-        terminal_count = 50
-        window_size = 25
-        if initial_count + window_size + terminal_count > n
-            initial_count = floor(Int, 0.15n)
-            terminal_count = floor(Int, 0.10n)
-            window_size = n - initial_count - terminal_count
+        start_tree!(self, depth)
+        self.may_continue || return self.may_sample = false
+        suptree.log_weight[1] = logaddexp(tree.log_weight[1], tree.log_weight[2])
+        self.may_continue = if depth == 1
+            suptree.summed_mom.fwd .= suptree.bwd.mom .+ self.fwd.mom
+            compute_criterion(suptree.summed_mom.fwd, suptree.bwd.dham_dmom, self.fwd.dham_dmom)
+        else
+            suptree.summed_mom.fwd .= tree.summed_mom.bwd .+ tree.summed_mom.fwd
+            (
+                compute_criterion(suptree.summed_mom.fwd, suptree.bwd.dham_dmom, self.fwd.dham_dmom) &&
+                compute_criterion(badd(tree.summed_mom.bwd, tree.bwd.mom),
+                                  suptree.bwd.dham_dmom, tree.bwd.dham_dmom) &&
+                compute_criterion(badd(tree.bwd_fwd.mom, tree.summed_mom.fwd),
+                                  tree.bwd_fwd.dham_dmom, self.fwd.dham_dmom)
+            )
         end
-        window_ends = n >= 20 ?
-            _warmup_window_ends(n, initial_count, terminal_count, window_size) : Int[]
-        next_window = 1
-        adaptation_updates = 0
-        for iteration in 1:n
-            refresh_momentum!(self.init, rng)                     # segment
-            step!(self, scratch, rng)                             # orchestration (one transition)
-            acceptance = scratch.control.n_steps == 0 ? zero(self.ham.stepsize) :
-                         scratch.control.acceptance_sum / scratch.control.n_steps
-            fit!(self.da, acceptance)                             # segment (dual averaging)
-            adaptation_updates += 1
-            set_stepsize!(self, self.da.current)                  # segment (DA current -> stepsize)
-            inside_slow_window = initial_count < iteration <= n - terminal_count
-            inside_slow_window && observe!(self.w, self.init.pos) # segment (Welford, slow window only)
-            if next_window <= length(window_ends) && iteration == window_ends[next_window]
-                adapt_metric!(self; minimum_variance = minimum_variance)   # segment (window-end mass)
-                restart = find_initial_stepsize!(self, rng; initial = self.ham.stepsize,
-                                                 target = target_accept)   # orchestration
-                reset!(self.da, restart; target = target_accept) # segment (restart DA per window)
-                adaptation_updates = 0
-                reset!(self.w)                                    # segment (restart Welford per window)
-                next_window += 1
-            end
-            record!(self.stats, scratch.control.depth, scratch.control.n_steps, acceptance,
-                    scratch.control.energy_error, scratch.control.diverged)   # segment (statistics)
-        end
-        adaptation_updates == 0 || set_stepsize!(self, self.da.final)   # segment (final da.final)
-        self
     end
-    # src sample! (hmc.jl:711-715): refresh momentum, one transition, record diagnostics (no adaptation).
-    function sample!(self, scratch, rng)
-        refresh_momentum!(self.init, rng)                         # segment
-        step!(self, scratch, rng)                                 # orchestration
-        acceptance = scratch.control.n_steps == 0 ? zero(self.ham.stepsize) :
-                     scratch.control.acceptance_sum / scratch.control.n_steps
-        record!(self.stats, scratch.control.depth, scratch.control.n_steps, acceptance,
-                scratch.control.energy_error, scratch.control.diverged)   # segment
-        scratch
+    start_tree!(self, depth) = if depth == 1
+        stepfwd!(self)
+        self.dham = finiteorneginf(self.init.ham - self.fwd.ham)
+        collectstats!(self)
+        self.diverged && return self.may_continue = false
+        self.trees[1].log_weight[1] = self.dham
+        rcopy!(self.proposals[1], self.fwd)
+    else
+        start_tree!(self, depth - 1)
+        self.may_continue || return self.may_sample = false
+        swapproposal!(self, depth - 1, depth)
+        finish_tree!(self, depth - 1)
+        if self.may_sample && randbernoullilog(self.rng, logadvanceprob(self, depth))
+            swapproposal!(self, depth - 1, depth)
+        end
     end
 end
 
-# --- PREALLOCATED orchestration scratch (built ONCE outside the transition; parent binding choice) --
-# src _OracleNUTSState's trees (max_depth+1) / proposals (max_depth+2) / control flags, as ordinary
-# non-authoritative buffers. NOT sampler state; two instances are conceptually independent.
-mutable struct _NUTSControl{T}
-    go_forward::Bool; may_sample::Bool; may_continue::Bool
-    energy_error::T; diverged::Bool; depth::Int; n_steps::Int; acceptance_sum::T
-end
-struct _NUTSTree{L,V}
-    log_weight::L
-    backward::@NamedTuple{momentum::V, velocity::V}
-    backward_forward::@NamedTuple{momentum::V, velocity::V}
-    summed_momentum::@NamedTuple{backward::V, forward::V}
-end
-struct _NUTSProposal{V}
-    pos::V; mom::V
-end
-struct _NUTSScratch{T,L,V}
-    control::_NUTSControl{T}
-    trees::Vector{_NUTSTree{L,V}}
-    proposals::Vector{_NUTSProposal{V}}
-end
-function _nuts_scratch(position, momentum, max_depth::Integer)
-    T = eltype(momentum)
-    mv() = (momentum = zero(momentum), velocity = zero(momentum))
-    tree() = _NUTSTree(fill(T(-Inf), 2), mv(), mv(),
-                       (backward = zero(momentum), forward = zero(momentum)))
-    control = _NUTSControl{T}(true, true, true, zero(T), false, 0, 0, zero(T))
-    trees = _NUTSTree[tree() for _ in 1:(max_depth + 1)]
-    proposals = _NUTSProposal[_NUTSProposal(copy(position), copy(momentum))
-                              for _ in 1:(max_depth + 2)]
-    _NUTSScratch(control, [t for t in trees], [p for p in proposals])
+# ---- adaptation.jl: dual_averaging_state (m/H/mu + fit!(x)) ----------------------------------------
+@kernel dual_averaging_state(init; target = .8, regularization_scale = .05,
+                             relaxation_exponent = .75, offset = 10) = begin
+    m = one(init)
+    H = zero(init)
+    mu = log(10) + log(init)
+    log_current = mu - sqrt(m) / regularization_scale * H
+    log_final = zero(init)
+    current = exp(log_current)
+    final = exp(log_final)
+    fit!(self, x) = begin
+        self.m += 1
+        self.H += (self.target - x - self.H) / (self.m + self.offset)
+        self.log_final += self.m^(-self.relaxation_exponent) * (self.log_current - self.log_final)
+    end
 end
 
-# --- Inc1 source-shape gate (construction only; NO execution/perf) — NON-VACUOUS structural checks --
+# ---- adaptation.jl: welford_var (n/mean/var + step!(x; dn)) ----------------------------------------
+@kernel welford_var(dim) = begin
+    n = 0.
+    mean = zeros(dim)
+    var = zeros(dim)
+    step!(self, x::AbstractVector; dn = 1.) = begin
+        self.n += dn
+        w = dn / self.n
+        @. self.var = smooth(self.var, (x - smooth(self.mean, x, w)) * (x - self.mean), w)
+        @. self.mean = smooth(self.mean, x, w)
+    end
+    # reference forwards `; kwargs...`; @kernel construction currently rejects a kwargs-splat in a
+    # method signature (FLAGGED to poc as a required capability). `dn` is the ONLY keyword the vector
+    # method accepts, so forwarding it explicitly is behaviorally identical to the reference splat.
+    step!(self, x::AbstractMatrix; dn = 1.) = for xi in eachcol(x)
+        step!(self, xi; dn = dn)
+    end
+end
+
+# NOTE: trajectory_stats / sampling_stats (statistics.jl) are faithful recorders built on
+# ElasticArrays, which is not a current ReactiveKernels dependency; they are deferred to a follow-up
+# (adding the dep is a cross-cutting change) and are NOT part of the reference nuts_state surface —
+# metric/step-size adaptation and stats live OUTSIDE nuts_state in ReactiveHMC (user composes
+# welford_var + dual_averaging_state + Diagonal(max.(1e-6, wv.var))), so nuts_state stays the pure
+# transition, exactly as the reference.
+
+# ==== reference-surface source-shape gate (construction only; NO execution/parity/perf) =============
 if abspath(PROGRAM_FILE) == @__FILE__
     RKS = ReactiveKernels
-    method_of(k, name) = (ms = filter(m -> m.name === name, RKS.kernel_methods(k));
-                          @assert length(ms) == 1 "expected exactly one $(name) method"; ms[1])
+    spec_of(k) = k isa RKS.KernelSpec ? k : getfield(k, :spec)
+    fields_of(k) = Set(spec_of(k).port_order)
+    methods_of(k) = Set(m.name for m in RKS.kernel_methods(k))
+    body_str(k) = join([string(m.body) for m in RKS.kernel_methods(k)], "\n")
 
-    # ---- AST utilities over the RETAINED raw method bodies (Inc1 gives .name/.self/.body) -----------
+    # ---- AST util: does a method body directly mutate a `self.<field>` (assignment or .= broadcast)?
     _walk(f, x) = (f(x); x isa Expr && foreach(a -> _walk(f, a), x.args); nothing)
-    # unqualified call heads (for the call-graph closure)
-    function body_calls(body)
-        acc = String[]
-        _walk(body) do x
-            x isa Expr && x.head === :call && x.args[1] isa Symbol && push!(acc, string(x.args[1]))
-        end
-        acc
-    end
-    # ordered call heads in source/traversal order (qualified `a.b(...)` head => "b"); for RNG order.
-    function ordered_call_heads(body)
-        acc = String[]
-        _walk(body) do x
-            if x isa Expr && x.head === :call
-                h = x.args[1]
-                h isa Symbol && push!(acc, string(h))
-                h isa Expr && h.head === :. && h.args[2] isa QuoteNode && push!(acc, string(h.args[2].value))
-            end
-        end
-        acc
-    end
-    count_call(body, name) = count(==(name), body_calls(body))
-    # dotted self-path of an lvalue (self.a.b / self.a.b[i]) => "a.b" (or nothing)
-    function self_path(x, self)
-        x isa Expr || return nothing
-        if x.head === :ref
-            return self_path(x.args[1], self)
-        elseif x.head === :.
-            base = x.args[1]
-            field = x.args[2] isa QuoteNode ? string(x.args[2].value) : nothing
-            field === nothing && return nothing
-            base === self && return field
-            inner = self_path(base, self)
-            return inner === nothing ? nothing : string(inner, ".", field)
-        end
-        nothing
-    end
-    # FULL assignment grammar: any head ending in `=` that is not a comparison. Recurses through @.
-    # macrocalls (their inner assignment is a normal Expr under :macrocall args).
+    _is_self_lhs(x, self) =
+        x isa Expr && ((x.head === :. && (x.args[1] === self || _is_self_lhs(x.args[1], self))) ||
+                       (x.head === :ref && _is_self_lhs(x.args[1], self)))
     const _CMP = Set([:(==), :(!=), :(<=), :(>=), :(===), :(!==), :(.==), :(.!=), :(.<=), :(.>=)])
-    is_assign_head(h::Symbol) = (s = String(h); endswith(s, "=") && !(h in _CMP))
-    is_assign_head(::Any) = false
-    # (i) self-ASSIGNMENT targets: only assignment-head LHS self-paths (field-set extraction).
-    function self_assign_targets(body, self)
-        acc = String[]
-        _walk(body) do x
-            x isa Expr && is_assign_head(x.head) && length(x.args) >= 1 || return
-            p = self_path(x.args[1], self); p === nothing || push!(acc, p)
+    _is_assign(h) = h isa Symbol && (s = String(h); endswith(s, "=") && !(h in _CMP))
+    function self_mutates(method)
+        found = Ref(false)
+        _walk(method.body) do x
+            x isa Expr && _is_assign(x.head) && length(x.args) >= 1 &&
+                _is_self_lhs(x.args[1], method.self) && (found[] = true)
         end
-        acc
+        found[]
     end
-    # (ii) FULL self-MUTATION scanner (the orchestration contract): assignment-head LHS self-paths PLUS
-    # ANY `!`-suffixed callee that touches a self path, NOT relying on a fixed mutator list. copyto!/
-    # fill! legitimately READ self as a non-destination source, so for those two the destination is
-    # arg1 ONLY; every OTHER unrecognized `!` callee (push!/setindex!/broadcast!/user mutator) is
-    # flagged if ANY actual argument is a self path. Authored segment/orchestration calls (the
-    # sanctioned mutation channel) are exempt by name.
-    const _DEST_FIRST = Set(["copyto!", "fill!"])
-    function self_mutations(body, self, authored)
-        acc = String[]
-        _walk(body) do x
-            x isa Expr || return
-            if is_assign_head(x.head) && length(x.args) >= 1
-                p = self_path(x.args[1], self); p === nothing || push!(acc, "assign:$(p)")
-            elseif x.head === :call && x.args[1] isa Symbol
-                fname = string(x.args[1])
-                fname in authored && return                       # sanctioned segment/orchestration call
-                endswith(fname, "!") || return
-                if fname in _DEST_FIRST
-                    length(x.args) >= 2 &&
-                        (p = self_path(x.args[2], self); p === nothing || push!(acc, "dest:$(p)"))
-                else
-                    for a in x.args[2:end]
-                        p = self_path(a, self)
-                        p === nothing || (push!(acc, "mutate($(fname)):$(p)"); break)
-                    end
-                end
-            end
-        end
-        acc
+    method_named(k, name) = (ms = filter(m -> m.name === name, RKS.kernel_methods(k)); ms)
+
+    # (a) euclidean_phasepoint: methodless (stateless), REFERENCE derived-field names, pot_f/grad_f ---
+    @assert euclidean_phasepoint isa RKS.KernelSpec "euclidean_phasepoint must be methodless (stateless)"
+    pp = fields_of(euclidean_phasepoint)
+    for f in (:pot_f, :grad_f, :metric, :pos, :mom,           # sources (pot_f AND grad_f — two funcs)
+              :pot, :dpot_dpos, :chol_metric, :dkin_dmom, :kin, :ham, :dham_dpos, :dham_dmom)  # derived
+        @assert f in pp "euclidean_phasepoint missing reference field $f"
     end
-    subseq(hay, needles) = begin      # are `needles` a subsequence of `hay` (order preserved)?
-        i = 1
-        for h in hay
-            i > length(needles) && break
-            h == needles[i] && (i += 1)
-        end
-        i > length(needles)
+    @assert Set(spec_of(euclidean_phasepoint).want_names) == Set([:ham, :dham_dpos, :dham_dmom]) "phasepoint exposes reference outputs"
+    # invented (non-reference) names must be ABSENT from the phase-point surface
+    for bad in (:value_gradient, :velocity, :kinetic, :potential, :hamiltonian, :gradient, :chol)
+        @assert !(bad in pp) "non-reference name $bad present in phase point — surface diverged"
     end
 
-    # (a) skeleton types: stateful vs stateless ------------------------------------------------------
-    for k in (endpoint, sampler, dual_averaging, welford, sampling_stats)
-        @assert k isa RKS._StatefulKernelSkeleton "$(k) must be a method-bearing (stateful) @kernel"
+    # (b) leapfrog! is a free function on dham_dpos/dham_dmom with a `stepsize` keyword --------------
+    lf = first(methods(leapfrog!))
+    @assert :stepsize in Base.kwarg_decl(lf) "leapfrog! must take a stepsize keyword"
+    lfsrc = read(@__FILE__, String)
+    @assert occursin("phasepoint.dham_dpos", lfsrc) && occursin("phasepoint.dham_dmom", lfsrc) "leapfrog! must act on dham_dpos/dham_dmom"
+
+    # (c) nuts_state: in-object composed tree fields + reference method inventory --------------------
+    ns = fields_of(nuts_state)
+    for f in (:init, :rng, :max_depth, :min_dham, :step_f, :stats_f,          # sources
+              :gofwd, :may_sample, :may_continue, :fwdbwd, :fwd, :bwd,        # composed control/endpoints
+              :trees, :proposals, :dham, :diverged)                          # composed scratch + diagnostics
+        @assert f in ns "nuts_state missing reference field $f — tree state must be composed IN the object"
     end
-    @assert !(hamiltonian isa RKS._StatefulKernelSkeleton) "hamiltonian is methodless -> stateless"
+    @assert methods_of(nuts_state) == Set([:stepfwd!, :collectstats!, :logadvanceprob, :swapproposal!,
+                                           :step!, :flip!, :finish_tree!, :start_tree!]) "nuts_state method inventory: $(methods_of(nuts_state))"
 
-    # (b) exact method inventory (incl. reset!, probe/stepsize search, full recursion/adaptation) -----
-    mnames(k) = Set(m.name for m in RKS.kernel_methods(k))
-    @assert mnames(endpoint) == Set([:refresh_momentum!, :leapfrog!]) "endpoint inventory"
-    @assert mnames(dual_averaging) == Set([:fit!, :reset!]) "dual_averaging inventory"
-    @assert mnames(welford) == Set([:observe!, :reset!]) "welford inventory"
-    @assert mnames(sampling_stats) == Set([:record!]) "stats inventory"
-    want_sampler = Set([:energy_error, :divergent, :uturn_ok, :uturn_ok_sum, :mirror!,
-                        :recompute_init!, :restore_accept!, :set_stepsize!, :adapt_metric!,
-                        :reset_scratch!, :flip!, :start_tree!, :finish_tree!, :step!,
-                        :probe_acceptance!, :find_initial_stepsize!, :warmup!, :sample!])
-    @assert mnames(sampler) == want_sampler "sampler inventory: $(mnames(sampler))"
+    # (d) DIRECT in-object mutation (the reference model) — these methods MUST mutate self fields ----
+    @assert self_mutates(only(method_named(nuts_state, :flip!))) "flip! must mutate self (gofwd/tree) directly"
+    @assert self_mutates(only(method_named(nuts_state, :finish_tree!))) "finish_tree! must mutate self.may_sample/may_continue directly"
+    @assert self_mutates(only(method_named(nuts_state, :start_tree!))) "start_tree! must mutate self.dham/may_* directly"
+    @assert self_mutates(only(method_named(nuts_state, :step!))) "step! must mutate self.trees directly"
+    nb = body_str(nuts_state)
+    @assert occursin("self.gofwd = !", nb) "flip! must toggle self.gofwd"
+    @assert occursin("self.may_sample = false", nb) "must set self.may_sample=false on stop"
+    @assert occursin("self.dham = finiteorneginf", nb) "start_tree! must set self.dham = finiteorneginf(init.ham - fwd.ham)"
 
-    # (c) call-graph closure: every method-shaped call (`!`-suffixed or a named reducer) in the sampler
-    #     method bodies resolves to an authored sibling/child method or an allowed external primitive.
-    reducers = Set(["energy_error", "divergent", "uturn_ok", "uturn_ok_sum"])
-    authored = Set(string(n) for n in want_sampler) ∪
-               Set(["refresh_momentum!", "leapfrog!", "fit!", "reset!", "observe!", "record!"])
-    allowed_ext = Set(["copy", "zero", "one", "exp", "log", "log1p", "sqrt", "dot", "isfinite",
-                       "oftype", "cholesky", "logdet", "randn!", "lmul!", "ldiv!", "inv", "max",
-                       "min", "clamp", "convert", "Matrix", "Diagonal", "fill", "fill!", "copyto!",
-                       "floor", "length", "eltype", "float", "typeof", "rand", "eps",
-                       "_min1exp", "_finite_or_neginf", "_logaddexp", "_rand_bernoulli_log",
-                       "_smooth", "_warmup_window_ends", "_nuts_scratch", "!", "!="])
-    for m in RKS.kernel_methods(sampler), call in body_calls(m.body)
-        (endswith(call, "!") || call in reducers) || continue
-        (call in authored || call in allowed_ext) ||
-            error("unresolved method call `$(call)` in sampler.$(m.name) — not authored/allowed")
+    # (e) reference multinomial machinery present (log weights, tournament, RNG, criterion, reset) ---
+    for tok in ("log_weight", "swapproposal!", "randbernoullilog", "logswapprob", "logadvanceprob",
+                "compute_criterion", "logaddexp", "summed_mom", "bwd_fwd",
+                "restore!", "rcopy!", "proposals[end]")
+        @assert occursin(tok, nb) "nuts_state must use reference construct `$tok`"
     end
 
-    # (d) segment/orchestration contract: ORCHESTRATION bodies have ZERO self MUTATIONS — no assignment
-    #     to any self-path (full grammar) AND no unrecognized `!` mutator touching a self-path — so they
-    #     mutate authoritative state ONLY through authored segment calls.
-    orchestration = Set([:reset_scratch!, :flip!, :start_tree!, :finish_tree!, :step!,
-                         :probe_acceptance!, :find_initial_stepsize!, :warmup!, :sample!])
-    for m in RKS.kernel_methods(sampler)
-        m.name in orchestration || continue
-        w = self_mutations(m.body, m.self, authored)
-        isempty(w) || error("orchestration sampler.$(m.name) mutates self-path(s) $(w) — use segments")
+    # (f) dual_averaging_state: reference m/H/mu accumulators + fit! -------------------------------
+    da = fields_of(dual_averaging_state)
+    for f in (:m, :H, :mu, :log_current, :log_final, :current, :final)
+        @assert f in da "dual_averaging_state missing reference field $f"
     end
-    # (d') NEGATIVE PROBES: the scanner must catch mutators OUTSIDE any fixed list (push!/setindex!/
-    #      broadcast!/user mutator) and the full augmented-assignment grammar, while NOT flagging a
-    #      copyto!/fill! that merely READS self as a source, nor an authored segment call.
-    let s = :self
-        flags(ex) = self_mutations(ex, s, authored)
-        @assert !isempty(flags(:(push!(self.x, 1))))           "must catch push!(self.x,...)"
-        @assert !isempty(flags(:(setindex!(self.x, 1, 2))))    "must catch setindex!(self.x,...)"
-        @assert !isempty(flags(:(broadcast!(+, self.x, y))))   "must catch broadcast!(...,self.x)"
-        @assert !isempty(flags(:(usermutate!(self.q.r, 3))))   "must catch an arbitrary ! mutator on self"
-        @assert !isempty(flags(:(self.x .+= 1)))               "must catch .+="
-        @assert !isempty(flags(:(self.x ./= 2)))               "must catch ./="
-        @assert !isempty(flags(:(self.a.b[i] = 3)))            "must catch indexed self assignment"
-        @assert isempty(flags(:(copyto!(local_dest, self.x)))) "must NOT flag copyto! reading self as source"
-        @assert isempty(flags(:(fill!(local_dest, self.x)))) "must NOT flag fill! reading self as source"
-        @assert isempty(flags(:(leapfrog!(self))))             "must NOT flag an authored segment call"
-        @assert isempty(flags(:(refresh_momentum!(self.init, rng)))) "must NOT flag an authored segment call"
+    @assert methods_of(dual_averaging_state) == Set([:fit!]) "DA inventory"
+    db = body_str(dual_averaging_state)
+    @assert occursin("self.m += 1", db) && occursin("self.H +=", db) && occursin("self.log_final +=", db) "DA fit! reference recurrence (m/H/log_final)"
+    for bad in (:iteration, :error, :center, :regularization)   # earlier-invented DA names must be gone
+        @assert !(bad in da) "non-reference DA name $bad present"
     end
 
-    # (e) FULL authoritative mirror: exact fwd+bwd fields INCL. the owned value_gradient bundle; bwd
-    #     momentum/velocity SIGNED (unary minus) so no forward-only staleness survives in bwd.
-    mirror = method_of(sampler, :mirror!)
-    mw = Set(self_assign_targets(mirror.body, mirror.self))
-    for f in ("value_gradient", "pos", "mom", "velocity", "gradient", "potential", "kinetic", "hamiltonian")
-        @assert "fwd.$f" in mw "mirror! must copy init.$f -> fwd.$f"
-        @assert "bwd.$f" in mw "mirror! must set bwd.$f"
+    # (g) welford_var: reference n/mean/var + step!(x;dn) (two dispatch methods) --------------------
+    wf = fields_of(welford_var)
+    for f in (:n, :mean, :var)
+        @assert f in wf "welford_var missing reference field $f"
     end
-    # bwd.mom and bwd.velocity RHS must be a NEGATION of the init source (signed backward half).
-    function mirror_bwd_signed(body, self, field)
-        signed = Ref(false)
-        _walk(body) do x
-            x isa Expr && x.head === :(=) || return
-            self_path(x.args[1], self) == "bwd.$field" || return
-            rhs = x.args[2]
-            rhs isa Expr && rhs.head === :call && rhs.args[1] === :- && length(rhs.args) == 2 &&
-                (signed[] = true)
-        end
-        signed[]
-    end
-    # the `@. bwd.mom = -init.mom` lowers the RHS negation inside a macrocall; scan the stringified body.
-    mbody = string(mirror.body)
-    @assert occursin("bwd.mom = -", mbody) || mirror_bwd_signed(mirror.body, mirror.self, "mom") "bwd momentum must be signed"
-    @assert occursin("bwd.velocity = -", mbody) || mirror_bwd_signed(mirror.body, mirror.self, "velocity") "bwd velocity must be signed"
+    @assert methods_of(welford_var) == Set([:step!]) "welford inventory (step!)"
+    @assert length(method_named(welford_var, :step!)) == 2 "welford must have vector + matrix step! methods"
+    wb = body_str(welford_var)
+    @assert occursin("self.n += dn", wb) && occursin("smooth(", wb) "welford step! reference recurrence"
 
-    # (f) Unit-C: recompute_init! makes the FULL phase point current with EXACTLY one pgrad ------------
-    rec = method_of(sampler, :recompute_init!)
-    rw = Set(self_assign_targets(rec.body, rec.self))
-    for f in ("value_gradient", "potential", "gradient", "velocity", "kinetic", "hamiltonian")
-        @assert "init.$f" in rw "recompute_init! must make init.$f current"
-    end
-    @assert length(collect(eachmatch(r"potential_gradient!", string(rec.body)))) == 1 "recompute_init! must do EXACTLY one pgrad"
-
-    # (g) metric adaptation: n>1 guard + type preservation (src _adapted_diagonal_metric) -------------
-    am = string(method_of(sampler, :adapt_metric!).body)
-    @assert occursin("> 1", am) "adapt_metric! must guard n>1 (no n==1 NaN)"
-    @assert occursin("isa Diagonal", am) && occursin("convert", am) "adapt_metric! must preserve metric type"
-    @assert occursin("inv", am) && occursin("position_variance", am) "adapt_metric! mass diagonal retained"
-
-    # (h) warmup boundaries: initial search + expanding windows + per-window DA/Welford reset + final --
-    wu = method_of(sampler, :warmup!)
-    wuc = body_calls(wu.body)
-    @assert "find_initial_stepsize!" in wuc "warmup! must run initial step-size search"
-    @assert occursin("_warmup_window_ends", string(wu.body)) "warmup! must compute expanding windows"
-    @assert count_call(wu.body, "reset!") >= 3 "warmup! must reset DA+Welford (start + per window)"
-    @assert count_call(wu.body, "adapt_metric!") >= 1 "warmup! must update mass at window ends"
-    @assert occursin("final", string(wu.body)) "warmup! must apply final da.final"
-    @assert occursin("observe!", string(wu.body)) "warmup! must accumulate Welford in slow windows"
-
-    # (i) multinomial tree: log weights + proposal swap + Bernoulli selection + accumulation + criterion
-    stb = start_tree = method_of(sampler, :start_tree!).body
-    @assert occursin("log_weight", string(stb)) "start_tree! must set per-depth log weights"
-    @assert count_call(stb, "_rand_bernoulli_log") == 1 "start_tree! must draw exactly one subtree selection"
-    ftb = method_of(sampler, :finish_tree!).body
-    @assert occursin("_logaddexp", string(ftb)) "finish_tree! must combine weights via logaddexp"
-    @assert occursin("summed_momentum", string(ftb)) "finish_tree! must accumulate summed momenta"
-    @assert count_call(ftb, "uturn_ok") + count_call(ftb, "uturn_ok_sum") >= 4 "finish_tree! must apply the depth>1 three-part criterion"
-    @assert occursin("backward.velocity", string(ftb)) && occursin("backward_forward", string(ftb)) "finish_tree! must use backward/forward velocities"
-
-    # (j) EXACT RNG call order in step!: direction coin -> subtree draws (in finish_tree!) -> top draw --
-    stepb = method_of(sampler, :step!).body
-    heads = ordered_call_heads(stepb)
-    @assert subseq(heads, ["rand", "flip!", "finish_tree!", "_rand_bernoulli_log"]) "step! RNG/site order: coin -> flip! -> finish_tree! -> top-level proposal draw"
-    @assert count_call(stepb, "rand") == 1 "step! must draw exactly one direction coin per depth site"
-    @assert count_call(stepb, "_rand_bernoulli_log") == 1 "step! must have exactly one top-level proposal draw site"
-    @assert occursin("may_continue", string(stepb)) "step! must honor the U-turn/divergence stop"
-    @assert occursin("proposals[end]", string(stepb)) "step! must restore the tournament-selected proposal"
-
-    # (k) divergence stop is wired: start_tree! sets may_continue=false on divergence -------------------
-    @assert occursin("may_continue = false", string(stb)) "start_tree! must stop on divergence"
-
-    # (l) stats records energy error (real diagnostic) ------------------------------------------------
-    rc = method_of(sampling_stats, :record!)
-    @assert "sum_energy_error" in Set(self_assign_targets(rc.body, rc.self)) "record! must accumulate energy error"
-
-    # (m) scratch: NO tree/proposal/control construction inside hot orchestration; buffers from scratch -
-    hot = Set([:reset_scratch!, :flip!, :start_tree!, :finish_tree!, :step!,
-               :probe_acceptance!, :find_initial_stepsize!, :warmup!, :sample!])
-    for m in RKS.kernel_methods(sampler)
-        m.name in hot || continue
-        s = string(m.body)
-        # forbid per-transition BUFFER allocation (arrays) + scratch construction; scalar control
-        # resets like `zero(c.energy_error)` are legitimate in-place scratch mutation and allowed.
-        for bad in ("_nuts_scratch", "_NUTSTree", "_NUTSProposal", "_NUTSControl",
-                    "zeros(", "similar(", "copy(",
-                    "zero(self.init.pos", "zero(self.init.mom", "zero(pos", "zero(position", "zero(momentum")
-            @assert !occursin(bad, s) "hot orchestration sampler.$(m.name) constructs scratch/buffers ($bad) — must come from the passed scratch"
-        end
-    end
-    # scratch is genuinely preallocated; buffers are pairwise distinct WITHIN one instance AND across
-    # instances (no aliasing that would corrupt the tournament / tree accumulation).
-    all_buffers(s) = begin
-        bufs = Any[]
-        for p in s.proposals; push!(bufs, p.pos); push!(bufs, p.mom); end
-        for t in s.trees
-            push!(bufs, t.log_weight, t.backward.momentum, t.backward.velocity,
-                  t.backward_forward.momentum, t.backward_forward.velocity,
-                  t.summed_momentum.backward, t.summed_momentum.forward)
-        end
-        bufs
-    end
-    let s1 = _nuts_scratch(zeros(3), zeros(3), 4), s2 = _nuts_scratch(zeros(3), zeros(3), 4)
-        @assert length(s1.trees) == 5 && length(s1.proposals) == 6 "scratch sizing (max_depth+1 / +2)"
-        b1 = all_buffers(s1)
-        @assert length(b1) == length(unique(objectid, b1)) "ALL scratch buffers must be pairwise distinct within one instance"
-        b2 = all_buffers(s2)
-        @assert isempty(intersect(Set(objectid.(b1)), Set(objectid.(b2)))) "two scratch instances must share no buffer"
-    end
-    # Float32 vs Float64: the unified factory promises DISTINCT concrete precision paths (no Float64
-    # fallback for a Float32 model) — control/tree/proposal buffers carry the position's scalar type.
-    let s32 = _nuts_scratch(zeros(Float32, 3), zeros(Float32, 3), 3),
-        s64 = _nuts_scratch(zeros(Float64, 3), zeros(Float64, 3), 3)
-        @assert eltype(s32.proposals[1].pos) === Float32 && eltype(s32.trees[1].log_weight) === Float32 &&
-                typeof(s32.control.energy_error) === Float32 "Float32 model => Float32 scratch path"
-        @assert eltype(s64.proposals[1].pos) === Float64 && eltype(s64.trees[1].log_weight) === Float64 &&
-                typeof(s64.control.energy_error) === Float64 "Float64 model => Float64 scratch path"
+    # (h) sole @kernel; no @reactive / no Graph/add!/applier/binding plumbing in any authored body --
+    allbodies = join([body_str(k) for k in (nuts_state, dual_averaging_state, welford_var)], "\n") *
+                "\n" * string(spec_of(euclidean_phasepoint).port_order)
+    for bad in ("@reactive", "Graph(", "add!(", "output_binding", "_RecipeApplier", "compile_update",
+                "bind_schedule", "_NUTSScratch", "reset_scratch!", "mirror!", "recompute_init!",
+                "value_gradient", "adapt_metric!", "warmup!")
+        @assert !occursin(bad, allbodies) "plumbing/non-reference/invented token present: $bad"
     end
 
-    # (n) no manual plumbing / no @reactive in any authored method body ------------------------------
-    allobjs = (endpoint, dual_averaging, welford, sampling_stats, sampler)
-    bodies = join([string(m.body) for k in allobjs for m in RKS.kernel_methods(k)], "\n")
-    for bad in ("@reactive", "Graph(", "add!", "output_binding", "_RecipeApplier",
-                "compile_update", "bind_schedule", "cache_apply")
-        @assert !occursin(bad, bodies) "manual-plumbing/@reactive token in a method body: $bad"
-    end
-
-    # (o) faithful recurrence bodies retained (DA/Welford/leapfrog) -----------------------------------
-    @assert occursin("relaxation_exponent", bodies) && occursin("log_final", bodies) &&
-            occursin("log_current", bodies) "DA fit! recurrence retained"
-    @assert occursin("_smooth", bodies) "Welford _smooth recurrence retained"
-    @assert occursin("stepsize", bodies) && occursin("gradient", bodies) &&
-            occursin("velocity", bodies) "leapfrog Stormer-Verlet retained"
-
-    println("Inc1 source-shape gate PASS (NON-VACUOUS): stateful/stateless skeletons + exact method")
-    println("inventory + call-graph closure + segment/orchestration contract (full assignment grammar +")
-    println("any-! -mutator-on-self, authored-exempt, w/ push!/setindex!/broadcast! negative probes) +")
-    println("FULL authoritative mirror (16 fields incl. value_gradient bundle, bwd mom+vel signed) +")
-    println("Unit-C full phase point w/ exactly-one pgrad + n>1 metric guard + type")
-    println("preservation + warmup windows/DA+Welford reset/final + multinomial tree (log weights,")
-    println("proposal swap, subtree+top-level Bernoulli draws, accumulated momenta, 3-part criterion,")
-    println("divergence stop) + EXACT RNG order + energy-error stats + preallocated independent scratch.")
-    println("MethodIR/execution ABSENT (118ad97) — NO execution/perf claim.")
+    println("Reference-surface source-shape gate PASS: transcribed from ACTUAL ReactiveHMC.jl v0.1.0")
+    println("(781sB @ ca9ea4ca). euclidean_phasepoint (methodless, pot_f/grad_f, reference derived")
+    println("names) + free leapfrog!(phasepoint;stepsize) + nuts_state (in-object composed tree state,")
+    println("fwd/bwd derived from gofwd, DIRECT self mutation in step!/flip!/finish_tree!/start_tree!,")
+    println("restore!/rcopy! reset, multinomial tournament/log-weights/RNG/criterion) + DA (m/H/mu +")
+    println("fit!) + welford (n/mean/var + step!(x;dn), 2 methods). Sole @kernel; no plumbing; invented")
+    println("names (value_gradient/velocity/kinetic/hamiltonian/external-scratch/mirror!/warmup!) ABSENT.")
+    println("Construction-only substrate — NO execution/parity/0-B/perf claim; MethodIR lowering of the")
+    println("faithful shape is a compiler requirement, not a fixture defect.")
 end
