@@ -11,6 +11,27 @@ const ENZYME_BACKEND = AutoEnzyme(;
     function_annotation = Enzyme.Const,
 )
 
+function dugongs_reference_logdensity(qv)
+    α, β, u_λ, log_τ = qv
+    parameters = DugongsParameters(
+        α,
+        β,
+        DugongsGrowthExample.bounded_lambda(u_λ),
+        DugongsGrowthExample.sd_from_log_precision(log_τ),
+    )
+    prior = DugongsGrowthExample.log_prior(parameters)
+    likelihood = DugongsGrowthExample.sum_log_likelihood(
+        DugongsGrowthExample.pointwise_log_likelihood(
+            parameters, DUGONGS_AGE, DUGONGS_LENGTH,
+        ),
+    )
+    DugongsGrowthExample.total_log_density(
+        prior,
+        DugongsGrowthExample.log_abs_det_jacobian(u_λ, log_τ),
+        likelihood,
+    )
+end
+
 @testset "manual PPL graph — dugongs (nonlinear growth)" begin
     model = build_dugongs_graph()
     q = (2.7, 1.0, 1.7, log(300.0))
@@ -69,6 +90,10 @@ const ENZYME_BACKEND = AutoEnzyme(;
         @test gradient !== qvec
         @test pointer(gradient) != pointer(qvec)
 
+        @test logdensity(qvec) ≈ dugongs_reference_logdensity(qvec)
+        reference_gradient = DifferentiationInterface.gradient(
+            dugongs_reference_logdensity, ENZYME_BACKEND, qvec)
+        @test gradient ≈ reference_gradient
     end
 
     @testset "generated quantity prunes density work" begin

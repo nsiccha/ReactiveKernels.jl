@@ -15,6 +15,18 @@ const ENZYME_BACKEND = AutoEnzyme(;
     function_annotation = Enzyme.Const,
 )
 
+function linear_regression_reference_logdensity(qv)
+    α, β, log_σ = qv
+    parameters = LinearRegressionParameters(α, β, exp(log_σ))
+    prior = LinearRegressionExample.log_prior(parameters)
+    likelihood = LinearRegressionExample.sum_log_likelihood(
+        LinearRegressionExample.pointwise_log_likelihood(
+            parameters, LINREG_X, LINREG_Y,
+        ),
+    )
+    LinearRegressionExample.total_log_density(prior, log_σ, likelihood)
+end
+
 @testset "manual PPL graph — linear regression" begin
     model = build_linear_regression_graph()
     q = (1.0, 2.0, log(0.5))
@@ -76,6 +88,10 @@ const ENZYME_BACKEND = AutoEnzyme(;
         @test gradient !== qvec
         @test pointer(gradient) != pointer(qvec)
 
+        @test logdensity(qvec) ≈ linear_regression_reference_logdensity(qvec)
+        reference_gradient = DifferentiationInterface.gradient(
+            linear_regression_reference_logdensity, ENZYME_BACKEND, qvec)
+        @test gradient ≈ reference_gradient
     end
 
     @testset "generated quantities prune density work" begin
