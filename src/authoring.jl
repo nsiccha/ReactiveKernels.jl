@@ -929,10 +929,14 @@ function _kernel_resolve_binding(mod::Module, callee)
     end
 end
 
-# Heads under which work is CONTROL-DEPENDENT (branch/loop-local): lifting an `@node`
-# out of them would make it unconditional in the static graph.
-_kernel_is_control_head(h) =
-    h in (:if, :(&&), :(||), :for, :while, :comprehension, :generator, :try)
+# Heads under which lifting an `@node` OUT would change semantics: either CONTROL-
+# DEPENDENT (branch/loop — the node would become unconditional in the static graph) or
+# a DEFERRED/LEXICAL scope (lambda/function/do/let/quote — the node would escape a local
+# binding it references, an accidental capture). A genuine `@node` beneath any of these
+# is rejected, never silently hoisted. (Syntactic only — no Julia IR inference.)
+_kernel_is_nonstraight_head(h) =
+    h in (:if, :(&&), :(||), :for, :while, :comprehension, :generator, :try,
+          :(->), :function, :do, :let, :quote)
 
 # Promote every GENUINE RK `@node(expr)` in a recipe block into a distinct hygienic
 # recipe node (a `gensym`ed name, collision-free with any authored port), prepended in
@@ -955,9 +959,10 @@ function _kernel_lift_nodes(block, mod)
         if x.head === :macrocall && !isempty(x.args) && _kernel_is_node_macro(x.args[1])
             if is_rk_node(x.args[1])
                 straight || throw(ArgumentError(
-                    "@node is only valid in a straight-line recipe context — not beneath " *
-                    "?:/if/&&/||/loop. Increment 1 rejects branch-local @node rather than " *
-                    "silently making it unconditional in the static graph."))
+                    "@node is only valid in a straight-line recipe context — not beneath a " *
+                    "branch/loop (?:/if/&&/||/for/while/try) or a deferred/lexical scope " *
+                    "(->/function/do/let/quote), whose local bindings a hoisted node would " *
+                    "escape. Increment 1 rejects it rather than silently changing semantics."))
                 inner = rewrite(x.args[end], straight)      # nested @node promoted first
                 nm = gensym(:node)
                 push!(lifted, Expr(:(=), nm, inner))
@@ -968,7 +973,7 @@ function _kernel_lift_nodes(block, mod)
                 return Expr(x.head, Any[rewrite(a, straight) for a in x.args]...)
             end
         end
-        sub = _kernel_is_control_head(x.head) ? false : straight
+        sub = _kernel_is_nonstraight_head(x.head) ? false : straight
         Expr(x.head, Any[rewrite(a, sub) for a in x.args]...)
     end
     new_stmts = Any[rewrite(s, true) for s in block.args]

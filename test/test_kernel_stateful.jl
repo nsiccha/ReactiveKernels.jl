@@ -483,19 +483,26 @@ end
         @test Set(keys(spoofednode)) == Set((:m, :kin))
 
         # FIX (B): COLLISION-FREE — the generated node name is a gensym, so it cannot
-        # alias an authored port even one spelled like the old `#node#1`.
+        # alias an authored port even one spelled like the old `#node#1`. NON-VACUOUS
+        # gate: EXACTLY four ports (x, authored #node#1, a DISTINCT generated node, y),
+        # and the authored vs lifted graph Values carry DIFFERENT ids (the old shared-port
+        # bug had only 3 ports — the generated node collided onto authored `#node#1`).
         @kernel collidenode(x) = begin
             var"#node#1" = x + 1
             y = @node(x + 2)
         end
         @test collidenode isa KernelSpec
         kc = collect(keys(collidenode))
-        @test length(kc) == length(unique(kc))                       # NO port collision
-        @test Symbol("#node#1") in kc                                # the authored port survives
-        @test length(kernel_graph(collidenode).recipes) == 3         # #node#1, <gensym>, y
+        @test length(kc) == 4                                        # x, #node#1, generated, y
+        @test :x in kc && Symbol("#node#1") in kc && :y in kc
+        gen = filter(p -> !(p in (:x, :y, Symbol("#node#1"))), kc)
+        @test length(gen) == 1                                       # one DISTINCT generated node
+        @test gen[1] !== Symbol("#node#1")                           # NOT aliasing the authored port
+        @test collidenode.ports[Symbol("#node#1")].id != collidenode.ports[gen[1]].id
+        @test length(kernel_graph(collidenode).recipes) == 3         # #node#1, generated, y
 
-        # FIX (C): a genuine `@node` in a NON-straight-line (branch/loop) context is
-        # REJECTED, not silently made unconditional in the static graph.
+        # FIX (C): a genuine `@node` in a NON-straight-line CONTROL context (branch/loop)
+        # is REJECTED, not silently made unconditional in the static graph.
         @test_throws Exception @macroexpand @kernel condnode(c, x) = begin
             y = c ? @node(abs(x)) : x
         end
@@ -504,6 +511,21 @@ end
         end
         @test_throws Exception @macroexpand @kernel loopnode(x) = begin
             y = [@node(abs(x)) for _ in 1:2]
+        end
+        # ...and in a DEFERRED/LEXICAL scope (lambda/let/do), where a hoisted node would
+        # escape the local binding it references — also REJECTED.
+        @test_throws Exception @macroexpand @kernel lamnode(g) = begin
+            f = x -> @node(g(x))
+        end
+        @test_throws Exception @macroexpand @kernel letnode(x) = begin
+            y = let z = x
+                @node(abs(z))
+            end
+        end
+        @test_throws Exception @macroexpand @kernel donode(g, x) = begin
+            y = map(g) do e
+                @node(abs(x))
+            end
         end
     end
 
