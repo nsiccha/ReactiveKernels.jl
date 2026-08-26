@@ -5,8 +5,10 @@ using Statistics
 
 export MomentsAccumulator, update, fit
 export HMCDiagnosticsAccumulator, record_transition, fit_diagnostics
-export sample_count, divergence_rate, divergence_percent
-export mean_acceptance_rate, mean_leapfrog_steps, mean_stepsize
+export sample_count, max_tree_depth, divergence_rate, divergence_percent
+export mean_tree_depth, mean_leapfrog_steps, mean_acceptance_rate
+export mean_energy_error, mean_stepsize
+export metric_adaptation_report
 export build_online_stats_graph
 export kernel_performance_report, diagnostics_performance_report
 export reactive_performance_report
@@ -153,47 +155,76 @@ end
 """
     HMCDiagnosticsAccumulator(T=Float64)
 
-Fixed-size, mergeable summaries of the scalar transition telemetry recorded by
-ReactiveHMC's sampling statistics: acceptance rate, leapfrog-step count, step
-size, and divergence. The three continuous summaries use
-[`MomentsAccumulator`](@ref), while divergences are counted exactly.
+Fixed-size, mergeable summaries of the per-transition diagnostics the
+compiled-reactive NUTS sampler reports as a [`NUTSDiagnostics`](@ref): tree
+depth, leapfrog-step count, mean acceptance rate, and completed-transition
+energy error, together with an exact divergence count and the exact maximum
+observed tree depth. The four continuous summaries use
+[`MomentsAccumulator`](@ref); divergences and the maximum depth are exact.
+
+Step size is **not** part of `NUTSDiagnostics` — it is an adaptation quantity
+owned by the sampler's dual-averaging state — so it is ingested separately when
+a value is available and represented as unavailable (`NaN`/`missing`) summary
+otherwise. The energy-error and step-size summaries therefore fold only their
+finite (and, for step size, positive) observations, so their counts may be
+below the transition count while depth, leapfrog, and acceptance are recorded
+for every transition.
 
 This state deliberately does not claim to represent rank-normalized R-hat or
 ESS. Those diagnostics require retained, ordered draws from multiple chains and
-cannot be recovered exactly from a constant-size mergeable accumulator.
+cannot be recovered exactly from a constant-size mergeable accumulator. For the
+reactive, in-place diagonal-metric variance the sampler adapts, reuse the
+canonical [`WelfordVariance`](@ref)/[`welford_var`](@ref) (see
+[`metric_adaptation_report`](@ref)) rather than this mergeable scalar surface.
 """
 struct HMCDiagnosticsAccumulator{T<:AbstractFloat}
     n_divergent::Int
-    acceptance_rate::MomentsAccumulator{T}
+    max_depth::Int
+    depth::MomentsAccumulator{T}
     leapfrog_steps::MomentsAccumulator{T}
+    acceptance_rate::MomentsAccumulator{T}
+    energy_error::MomentsAccumulator{T}
     stepsize::MomentsAccumulator{T}
 
     function HMCDiagnosticsAccumulator{T}(
         n_divergent::Integer,
-        acceptance_rate::MomentsAccumulator{T},
+        max_depth::Integer,
+        depth::MomentsAccumulator{T},
         leapfrog_steps::MomentsAccumulator{T},
+        acceptance_rate::MomentsAccumulator{T},
+        energy_error::MomentsAccumulator{T},
         stepsize::MomentsAccumulator{T},
     ) where {T<:AbstractFloat}
         divergences = Int(n_divergent)
         divergences >= 0 ||
             throw(ArgumentError("divergence count must be non-negative"))
-        n = acceptance_rate.n
-        leapfrog_steps.n == n && stepsize.n == n ||
-            throw(ArgumentError("diagnostic moment counts must agree"))
+        deepest = Int(max_depth)
+        deepest >= 0 ||
+            throw(ArgumentError("maximum tree depth must be non-negative"))
+        n = depth.n
+        leapfrog_steps.n == n && acceptance_rate.n == n ||
+            throw(ArgumentError("per-transition diagnostic counts must agree"))
+        energy_error.n <= n && stepsize.n <= n ||
+            throw(ArgumentError("optional diagnostic counts cannot exceed the transition count"))
         divergences <= n ||
-            throw(ArgumentError("divergence count cannot exceed sample count"))
-        new{T}(divergences, acceptance_rate, leapfrog_steps, stepsize)
+            throw(ArgumentError("divergence count cannot exceed the transition count"))
+        n == 0 && deepest != 0 &&
+            throw(ArgumentError("an empty accumulator must have zero maximum tree depth"))
+        new{T}(divergences, deepest, depth, leapfrog_steps, acceptance_rate,
+               energy_error, stepsize)
     end
 end
 
 function HMCDiagnosticsAccumulator(::Type{T}=Float64) where {T<:AbstractFloat}
     empty = MomentsAccumulator(T)
-    HMCDiagnosticsAccumulator{T}(0, empty, empty, empty)
+    HMCDiagnosticsAccumulator{T}(0, 0, empty, empty, empty, empty, empty)
 end
 
 "Number of transitions summarized by an HMC diagnostics accumulator."
-sample_count(accumulator::HMCDiagnosticsAccumulator) =
-    accumulator.acceptance_rate.n
+sample_count(accumulator::HMCDiagnosticsAccumulator) = accumulator.depth.n
+
+"Exact maximum tree depth observed, or `0` for an empty state."
+max_tree_depth(accumulator::HMCDiagnosticsAccumulator) = accumulator.max_depth
 
 "Fraction of divergent transitions, or `NaN` when no transitions were seen."
 function divergence_rate(accumulator::HMCDiagnosticsAccumulator{T}) where {T}
@@ -209,79 +240,144 @@ function divergence_percent(accumulator::HMCDiagnosticsAccumulator{T}) where {T}
     T(T(100) * rate)
 end
 
-"Mean transition acceptance rate, or `NaN` for an empty state."
-mean_acceptance_rate(accumulator::HMCDiagnosticsAccumulator) =
-    mean(accumulator.acceptance_rate)
+"Mean tree depth, or `NaN` for an empty state."
+mean_tree_depth(accumulator::HMCDiagnosticsAccumulator) = mean(accumulator.depth)
 
 "Mean leapfrog-step count, or `NaN` for an empty state."
 mean_leapfrog_steps(accumulator::HMCDiagnosticsAccumulator) =
     mean(accumulator.leapfrog_steps)
 
-"Mean sampler step size, or `NaN` for an empty state."
-mean_stepsize(accumulator::HMCDiagnosticsAccumulator) =
-    mean(accumulator.stepsize)
+"Mean transition acceptance rate, or `NaN` for an empty state."
+mean_acceptance_rate(accumulator::HMCDiagnosticsAccumulator) =
+    mean(accumulator.acceptance_rate)
+
+"Mean completed-transition energy error over finite observations, or `NaN`."
+mean_energy_error(accumulator::HMCDiagnosticsAccumulator) =
+    mean(accumulator.energy_error)
 
 """
-    record_transition(accumulator, acc_rate, n_steps, stepsize, diverged)
+Mean sampler step size over the transitions that reported an available (finite,
+positive) step size, or `NaN` when no step size was available.
+"""
+mean_stepsize(accumulator::HMCDiagnosticsAccumulator) = mean(accumulator.stepsize)
 
-Return a new HMC diagnostics state containing one transition. The argument
-names mirror the scalar streams stored by ReactiveHMC's `sampling_stats`.
+"""
+    record_transition(accumulator, diagnostics::NUTSDiagnostics, stepsize=NaN)
+
+Fold one canonical [`NUTSDiagnostics`](@ref) transition record into the
+mergeable summary. Tree depth, leapfrog count, and acceptance rate are recorded
+for every transition, and the maximum tree depth is tracked exactly.
+
+The completed-transition `energy_error` is folded only when finite. Because the
+canonical sampler normalizes any non-finite energy error to `-Inf` and marks
+that transition divergent, a non-finite error is accepted only when `diverged`
+is true (captured by the divergence count, not folded); a non-finite error with
+`diverged == false` is invalid telemetry and is rejected.
+
+Step size is not part of `NUTSDiagnostics`; pass the sampler's active step size
+to summarize it, or leave it `NaN` (the default) or `missing` to record the
+transition with an unavailable step size (never folded). A finite non-positive
+or infinite step size is rejected as invalid telemetry rather than treated as
+unavailable.
 """
 function record_transition(
     accumulator::HMCDiagnosticsAccumulator{T},
-    acc_rate::Real,
-    n_steps::Integer,
-    stepsize::Real,
-    diverged::Bool,
+    diagnostics::NUTSDiagnostics,
+    stepsize::Union{Real,Missing} = T(NaN),
 ) where {T<:AbstractFloat}
-    acceptance = convert(T, acc_rate)
+    diagnostics.depth >= 0 ||
+        throw(DomainError(diagnostics.depth, "tree depth must be non-negative"))
+    diagnostics.n_steps >= 0 ||
+        throw(DomainError(diagnostics.n_steps,
+                          "leapfrog-step count must be non-negative"))
+
+    acceptance = convert(T, diagnostics.acceptance_rate)
     isfinite(acceptance) && zero(T) <= acceptance <= one(T) ||
-        throw(DomainError(acc_rate, "acceptance rate must be finite and in [0, 1]"))
+        throw(DomainError(diagnostics.acceptance_rate,
+                          "acceptance rate must be finite and in [0, 1]"))
 
-    n_steps >= 0 ||
-        throw(DomainError(n_steps, "leapfrog-step count must be non-negative"))
-    steps = convert(T, n_steps)
-    isfinite(steps) ||
-        throw(DomainError(n_steps, "leapfrog-step count must fit the storage type"))
+    # Energy error: the canonical sampler normalizes any non-finite error to
+    # `-Inf` AND marks that transition divergent. A divergent transition's
+    # non-finite error is therefore captured by the divergence count and not
+    # folded; a non-finite error on a NON-divergent transition is invalid
+    # telemetry and is rejected.
+    energy = convert(T, diagnostics.energy_error)
+    next_energy_error = if isfinite(energy)
+        update(accumulator.energy_error, energy)
+    else
+        diagnostics.diverged ||
+            throw(DomainError(diagnostics.energy_error,
+                "a non-finite energy error must be marked divergent"))
+        accumulator.energy_error
+    end
 
-    epsilon = convert(T, stepsize)
-    isfinite(epsilon) && epsilon > zero(T) ||
-        throw(DomainError(stepsize, "step size must be finite and positive"))
+    # Step size is optional and lives outside `NUTSDiagnostics`. `NaN` or
+    # `missing` records the transition with an UNAVAILABLE step size (never
+    # folded); any other invalid value (finite non-positive, or infinite) is
+    # rejected rather than silently treated as unavailable.
+    next_stepsize = if ismissing(stepsize)
+        accumulator.stepsize
+    else
+        epsilon = convert(T, stepsize)
+        if isnan(epsilon)
+            accumulator.stepsize
+        elseif isfinite(epsilon) && epsilon > zero(T)
+            update(accumulator.stepsize, epsilon)
+        else
+            throw(DomainError(stepsize,
+                "step size must be NaN/missing (unavailable) or finite and positive"))
+        end
+    end
 
-    divergences = diverged ? Base.checked_add(accumulator.n_divergent, 1) :
-                  accumulator.n_divergent
+    divergences = diagnostics.diverged ?
+        Base.checked_add(accumulator.n_divergent, 1) : accumulator.n_divergent
+
     HMCDiagnosticsAccumulator{T}(
         divergences,
-        update(accumulator.acceptance_rate, acceptance),
-        update(accumulator.leapfrog_steps, steps),
-        update(accumulator.stepsize, epsilon),
+        max(accumulator.max_depth, Int(diagnostics.depth)),
+        update(accumulator.depth, convert(T, diagnostics.depth)),
+        update(accumulator.leapfrog_steps, convert(T, diagnostics.n_steps)),
+        update(accumulator.acceptance_rate, convert(T, diagnostics.acceptance_rate)),
+        next_energy_error,
+        next_stepsize,
     )
 end
 
-"""
-    fit_diagnostics(accumulator, records)
-    fit_diagnostics(T, records)
-    fit_diagnostics(records)
+_transition_diagnostics(diagnostics::NUTSDiagnostics) = diagnostics
+_transition_diagnostics(transition) = transition.diagnostics
+_transition_stepsize(::NUTSDiagnostics, ::Type{T}) where {T} = T(NaN)
+function _transition_stepsize(transition, ::Type{T}) where {T}
+    hasproperty(transition, :stepsize) || return T(NaN)
+    stepsize = transition.stepsize
+    # `missing` is a first-class unavailable form; only a present value converts.
+    stepsize === missing ? missing : convert(T, stepsize)
+end
 
-Fold transition records with fields `acc_rate`, `n_steps`, `stepsize`, and
-`diverged` into a mergeable diagnostics state.
 """
-function fit_diagnostics(accumulator::HMCDiagnosticsAccumulator, records)
-    for record in records
+    fit_diagnostics(accumulator, transitions)
+    fit_diagnostics(T, transitions)
+    fit_diagnostics(transitions)
+
+Fold an iterable of transitions into a mergeable diagnostics state. Each element
+is either a [`NUTSDiagnostics`](@ref) (recorded with an unavailable step size) or
+a named tuple carrying a `diagnostics` field and an optional `stepsize` (a
+value, `missing`, or omitted — the latter two record an unavailable step size).
+"""
+function fit_diagnostics(accumulator::HMCDiagnosticsAccumulator{T},
+                         transitions) where {T}
+    for transition in transitions
         accumulator = record_transition(
             accumulator,
-            record.acc_rate,
-            record.n_steps,
-            record.stepsize,
-            record.diverged,
+            _transition_diagnostics(transition),
+            _transition_stepsize(transition, T),
         )
     end
     accumulator
 end
 
-fit_diagnostics(::Type{T}, records) where {T<:AbstractFloat} =
-    fit_diagnostics(HMCDiagnosticsAccumulator(T), records)
-fit_diagnostics(records) = fit_diagnostics(Float64, records)
+fit_diagnostics(::Type{T}, transitions) where {T<:AbstractFloat} =
+    fit_diagnostics(HMCDiagnosticsAccumulator(T), transitions)
+fit_diagnostics(transitions) = fit_diagnostics(Float64, transitions)
 
 "Combine independently summarized HMC transition partitions."
 function Base.merge(a::HMCDiagnosticsAccumulator{T},
@@ -290,8 +386,11 @@ function Base.merge(a::HMCDiagnosticsAccumulator{T},
     sample_count(b) == 0 && return a
     HMCDiagnosticsAccumulator{T}(
         Base.checked_add(a.n_divergent, b.n_divergent),
-        merge(a.acceptance_rate, b.acceptance_rate),
+        max(a.max_depth, b.max_depth),
+        merge(a.depth, b.depth),
         merge(a.leapfrog_steps, b.leapfrog_steps),
+        merge(a.acceptance_rate, b.acceptance_rate),
+        merge(a.energy_error, b.energy_error),
         merge(a.stepsize, b.stepsize),
     )
 end
@@ -322,25 +421,26 @@ function build_online_stats_graph(::Type{T}=Float64) where {T<:AbstractFloat}
 
     diagnostics = @kernel begin
         diagnostics_state::HMCDiagnosticsAccumulator{T}
-        acceptance_rate_observation::T
-        leapfrog_steps_observation::Int
+        transition::NUTSDiagnostics{T}
         stepsize_observation::T
-        diverged_observation::Bool
         updated_diagnostics::HMCDiagnosticsAccumulator{T} = record_transition(
             diagnostics_state,
-            acceptance_rate_observation,
-            leapfrog_steps_observation,
+            transition,
             stepsize_observation,
-            diverged_observation,
         )
         diagnostic_sample_count::Int = sample_count(updated_diagnostics)
+        diagnostic_max_tree_depth::Int = max_tree_depth(updated_diagnostics)
         diagnostic_divergence_percent::T = divergence_percent(updated_diagnostics)
         diagnostic_mean_acceptance_rate::T = mean_acceptance_rate(updated_diagnostics)
+        diagnostic_mean_tree_depth::T = mean_tree_depth(updated_diagnostics)
         diagnostic_mean_leapfrog_steps::T = mean_leapfrog_steps(updated_diagnostics)
+        diagnostic_mean_energy_error::T = mean_energy_error(updated_diagnostics)
         diagnostic_mean_stepsize::T = mean_stepsize(updated_diagnostics)
         return updated_diagnostics, diagnostic_sample_count,
-               diagnostic_divergence_percent, diagnostic_mean_acceptance_rate,
-               diagnostic_mean_leapfrog_steps, diagnostic_mean_stepsize
+               diagnostic_max_tree_depth, diagnostic_divergence_percent,
+               diagnostic_mean_acceptance_rate, diagnostic_mean_tree_depth,
+               diagnostic_mean_leapfrog_steps, diagnostic_mean_energy_error,
+               diagnostic_mean_stepsize
     end
 
     merge(merge(updates, partitions), diagnostics)
@@ -376,12 +476,11 @@ end
 
 @noinline function _run_diagnostics_updates(kernel, accumulator,
                                             iterations::Int)
-    T = typeof(accumulator.stepsize.mean)
-    acceptance = T(0.9)
+    T = typeof(accumulator.acceptance_rate.mean)
     epsilon = T(0.2)
     for i in 1:iterations
-        accumulator = kernel(accumulator, acceptance, 7, epsilon,
-                             iszero(i % 31))
+        transition = NUTSDiagnostics(3, 7, T(0.9), iszero(i % 31), T(-0.05))
+        accumulator = kernel(accumulator, transition, epsilon)
     end
     accumulator
 end
@@ -443,6 +542,44 @@ function reactive_performance_report(model; iterations::Int=1_000)
        nanoseconds_per_update=elapsed_ns / iterations, result)
 end
 
+# Deterministic parameter-vector draws for the metric-adaptation showcase, so the
+# reactive Welford estimate is reproducible in the docs build and tests.
+const METRIC_ADAPTATION_DRAWS = [
+    [1.0, -2.0, 0.5],
+    [1.5, -1.0, 0.0],
+    [0.5, -3.0, 1.0],
+    [2.0, -2.5, -0.5],
+]
+
+"""
+    metric_adaptation_report(observations=METRIC_ADAPTATION_DRAWS)
+
+Showcase the canonical reactive [`welford_var`](@ref)/[`WelfordVariance`](@ref)
+estimator — the sampler's own in-place diagonal-metric adaptation statistic —
+by folding parameter-vector `observations` and reading back its online
+componentwise mean and variance. This deliberately reuses the exported canonical
+estimator rather than re-implementing a vector Welford: it is the reactive,
+in-place, history-dependent counterpart to the immutable, mergeable
+[`MomentsAccumulator`](@ref) used for the scalar summaries above, and is *not*
+itself mergeable across partitions.
+"""
+function metric_adaptation_report(observations=METRIC_ADAPTATION_DRAWS)
+    isempty(observations) &&
+        throw(ArgumentError("need at least one observation vector"))
+    dimension = length(first(observations))
+    dimension > 0 ||
+        throw(ArgumentError("observation vectors must have at least one component"))
+    all(observation -> length(observation) == dimension, observations) ||
+        throw(DimensionMismatch(
+            "all observation vectors must share the same dimension"))
+    estimate = welford_var(dimension)
+    for value in observations
+        step!(estimate, value)
+    end
+    (; dimension, count=estimate.n,
+       mean=copy(estimate.mean), variance=copy(estimate.var))
+end
+
 function demo()
     model = build_online_stats_graph()
     update_plan = plan(model;
@@ -454,12 +591,16 @@ function demo()
     streaming = fit(data)
     partitions = (fit(data[1:1]), fit(data[2:3]), fit(data[4:4]))
     merged = reduce(merge, partitions)
+    # Canonical per-transition diagnostics: NUTSDiagnostics(depth, n_steps,
+    # acceptance_rate, diverged, energy_error). Step size is adapted separately,
+    # so it is paired in explicitly and left NaN when unavailable.
     transitions = [
-        (acc_rate=0.92, n_steps=7, stepsize=0.25, diverged=false),
-        (acc_rate=0.81, n_steps=15, stepsize=0.20, diverged=true),
-        (acc_rate=0.96, n_steps=5, stepsize=0.30, diverged=false),
+        (diagnostics=NUTSDiagnostics(3, 7, 0.92, false, -0.05), stepsize=0.25),
+        (diagnostics=NUTSDiagnostics(5, 15, 0.81, true, -6.0), stepsize=0.20),
+        (diagnostics=NUTSDiagnostics(2, 5, 0.96, false, -0.01),),  # step size unavailable
     ]
     diagnostics = fit_diagnostics(transitions)
+    adaptation = metric_adaptation_report()
 
     println("streaming state = ", streaming)
     println("merged state    = ", merged)
@@ -470,6 +611,11 @@ function demo()
     println("HMC diagnostics = ", diagnostics)
     println("divergences = ", diagnostics.n_divergent, "/",
             sample_count(diagnostics), " (", divergence_percent(diagnostics), "%)")
+    println("max tree depth = ", max_tree_depth(diagnostics),
+            ", mean energy error = ", mean_energy_error(diagnostics),
+            ", mean step size = ", mean_stepsize(diagnostics))
+    println("metric adaptation (canonical welford_var) variance = ",
+            adaptation.variance)
     println("kernel performance = ", kernel_performance_report(
         prepare(model; have=(:state, :observation), want=:updated)))
     println("reactive performance = ", reactive_performance_report(model))
