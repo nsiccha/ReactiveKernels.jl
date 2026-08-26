@@ -224,9 +224,23 @@ _artifact_object(object) =
     object isa ReactiveKernels.ReactiveObject ? object : getfield(object, :object)
 _artifact_handles(object) = getfield(_artifact_object(object), :handles)
 
+# Drift-proof: read the ACTUAL `@reactive ... needle(...) = begin … end` authoring
+# block out of a source file, so the docs show the real kernel definition (the
+# recipe math + update methods) rather than an opaque constructor call. Captures
+# from the `@reactive` line carrying `needle` through the first column-0 `end`.
+const _REACTIVE_NUTS_SRC = joinpath(dirname(@__DIR__), "src", "reactive_nuts.jl")
+function read_reactive_block(file::AbstractString, needle::AbstractString)
+    lines = readlines(file)
+    start = findfirst(l -> occursin("@reactive", l) && occursin(needle, l), lines)
+    start === nothing && error("no @reactive block for $(needle) in $(file)")
+    stop = findnext(l -> rstrip(l) == "end", lines, start + 1)
+    stop === nothing && error("unterminated @reactive block for $(needle)")
+    join(lines[start:stop], "\n")
+end
+
 # The live value read through a getter (source or derived) of the executed object.
 # `invokelatest` because the displayed source may have defined fresh recipe methods
-# (e.g. the DI+Enzyme potential_gradient!) into the page sandbox in a newer world.
+# (e.g. the analytic potential_gradient!) into the page sandbox in a newer world.
 _getter_value(object, getter::Symbol) =
     Base.invokelatest(getproperty, _artifact_object(object), getter)
 
@@ -259,11 +273,11 @@ adaptation/statistics update methods) so no fake DAG is invented for it.
 """
 function program_artifact(name::Symbol, origin::AbstractString,
                           source::AbstractString, object, getter::Symbol;
-                          note::AbstractString = "")
+                          note::AbstractString = "", definition::AbstractString = "")
     program = reactive_program(object)
     handles = _artifact_handles(object)
     handle = getproperty(handles, getter)
-    (; name, origin, source, object, program, getter,
+    (; name, origin, source, object, program, getter, definition,
        getter_is_source = _is_source(program, handle),
        generated = code_expr(program, handle),
        output = _getter_value(object, getter),   # executed value read via the live getter
@@ -309,7 +323,13 @@ function render_program_examples(artifacts)
             "the pane shows the generated FUSED getter for the derived node " *
             "`$(artifact.getter)` — one straight-line function, no graph traversal " *
             "($(artifact.note))"
-        source = string("# Origin: ", artifact.origin, "\n", artifact.source, "\n\n",
+        defblock = isempty(artifact.definition) ? "" : string(
+            "# ─── The kernel definition — the ACTUAL @reactive authoring in\n",
+            "#     src/reactive_nuts.jl (the recipe math + any update method) ───\n",
+            artifact.definition, "\n\n",
+            "# ─── How you construct it and interact with it ───\n")
+        source = string(defblock,
+                        "# Origin: ", artifact.origin, "\n", artifact.source, "\n\n",
                         "# Actual output — ", artifact.getter, " (read through the ",
                         "live getter after executing the above)\n",
                         _plain_repr(artifact.output))
@@ -399,33 +419,30 @@ function execute_example(mod::Module, code::AbstractString;
 end
 
 # The five compiled reactive programs of the public NUTS workflow, each defined by
-# its exact build-executed public constructor source. The gradient boundary is the
-# ACTUAL sampled path: a scalar potential differentiated once by DI + reverse-mode
-# Enzyme into an owned buffer (as in examples/nuts.jl). `note` labels the ordinary
-# non-reactive orchestration around each program.
+# its exact build-executed public constructor source. The gradient boundary is a
+# CONSUMER-SUPPLIED ANALYTIC gradient (no DI/Enzyme) so the compiled kernel, not the
+# differentiation, is the visible content. `note` labels the ordinary non-reactive
+# orchestration around each program.
 const _FIVE_PROGRAM_SNIPPETS = (
     (name = :nuts_group,
      origin = "reactive_nuts_group (build executed)",
+     def_needle = "_reactive_nuts_group_object",
      getter = :dham,
      note = "the transition recursion, RNG draws, U-turn criteria, leapfrog, and " *
             "tree/proposal scratch are ordinary inferred Julia over these handles",
      source = raw"""
-# The public model boundary is a SCALAR potential; its gradient goes through
-# DifferentiationInterface + reverse-mode Enzyme, prepared once and written into
-# the sampler's owned buffer in place (the actual sampled path — no handwritten
-# gradient callback). See examples/nuts.jl for the full runnable workflow.
-backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-                     function_annotation = Enzyme.Const)
-potential(q) = sum(abs2, q) / 2
+# The public model boundary is a SCALAR potential with a CONSUMER-SUPPLIED ANALYTIC
+# gradient — no DifferentiationInterface/Enzyme machinery — so the compiled kernel,
+# not the differentiation, is the visible content. Here U(x) = ‖x‖²/2, so ∇U(x) = x.
+potential_gradient!(gradient, position) =
+    (copyto!(gradient, position); sum(abs2, position) / 2)
 dimension = 4
-preparation = prepare_gradient(potential, backend, zeros(dimension))
-potential_gradient!(gradient, position) = first(value_and_gradient!(
-    potential, gradient, preparation, backend, position))
 
 object = reactive_nuts_group(potential_gradient!,
     Matrix{Float64}(I, dimension, dimension), zeros(dimension), zeros(dimension))"""),
     (name = :dual_averaging,
      origin = "dual_averaging_state (build executed)",
+     def_needle = "_dual_averaging_object",
      getter = :current,
      note = "fit! is an ordinary method advancing the accumulator sources",
      source = raw"""
@@ -434,6 +451,7 @@ fit!(object, 0.9)          # ordinary method: advance the accumulator sources
 fit!(object, 0.72)"""),
     (name = :welford_variance,
      origin = "welford_var (build executed)",
+     def_needle = "_welford_object",
      getter = :var,
      note = "step! folds observations into the n/mean/var sources in place",
      source = raw"""
@@ -443,6 +461,7 @@ step!(object, [0.5, -1.0, 2.0, 0.25])   # ordinary in-place source update
 step!(object, [1.5, -0.5, 1.0, 0.75])"""),
     (name = :trajectory_stats,
      origin = "trajectory_stats (build executed)",
+     def_needle = "_trajectory_object",
      getter = :pots,
      note = "the recorder callback and positions/gradients VIEWS are ordinary " *
             "methods; the history/index buffers are its HAVE sources",
@@ -451,6 +470,7 @@ dimension = 4
 object = trajectory_stats(dimension)"""),
     (name = :sampling_stats,
      origin = "sampling_stats (build executed)",
+     def_needle = "_sampling_object",
      getter = :draws,
      note = "the per-transition callback appends to its HAVE sources; the reduced " *
             "views are ordinary methods",
@@ -502,16 +522,16 @@ assert one-to-one program/getter/DAG coverage, and render each actual
 the five programs lacks an artifact or diverges from its live program.
 """
 function render_five_programs(mod::Module)
-    Core.eval(mod, :(using ReactiveKernels, LinearAlgebra, Random,
-                           DifferentiationInterface))
-    Core.eval(mod, :(import Enzyme))
+    Core.eval(mod, :(using ReactiveKernels, LinearAlgebra, Random))
     artifacts = Any[]
     for snippet in _FIVE_PROGRAM_SNIPPETS
         _evaluate_source(mod, snippet.source)          # build-execute the public source
         object = Core.eval(mod, :object)               # the live object from that source
         push!(artifacts, program_artifact(snippet.name, snippet.origin,
                                           snippet.source, object, snippet.getter;
-                                          note = snippet.note))
+                                          note = snippet.note,
+                                          definition = read_reactive_block(
+                                              _REACTIVE_NUTS_SRC, snippet.def_needle)))
     end
     assert_program_coverage(artifacts, _FIVE_PROGRAM_INVENTORY)
     render_program_examples(artifacts)
@@ -654,22 +674,18 @@ function assert_fused_leaf_coverage(built; have = _FUSED_LEAF_HAVE,
     built
 end
 
-# The DI + reverse-mode Enzyme scalar-potential boundary + the persistent-partition
-# seed, evaluated in the page sandbox exactly as the benchmark sets it up.
+# The consumer analytic scalar-potential boundary + the persistent-partition seed,
+# evaluated in the page sandbox exactly as the benchmark sets it up.
 const _FUSED_LEAF_SETUP = raw"""
-using LinearAlgebra, Random, DifferentiationInterface
-import Enzyme
+using LinearAlgebra, Random
 
-# The model boundary is a SCALAR potential; its gradient goes through
-# DifferentiationInterface + reverse-mode Enzyme, prepared once and written into the
-# leaf's owned gradient buffer in place (no handwritten gradient callback).
-backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-                     function_annotation = Enzyme.Const)
-potential(q) = sum(abs2, q) / 2
+# The model boundary is a SCALAR potential with a CONSUMER-SUPPLIED ANALYTIC gradient
+# — no DifferentiationInterface/Enzyme machinery — so the KERNEL, not the
+# differentiation, is the visible content. Here U(x) = ‖x‖²/2, so ∇U(x) = x;
+# potential_gradient! fills the gradient buffer in place and returns the potential.
+potential_gradient!(gradient, position) =
+    (copyto!(gradient, position); sum(abs2, position) / 2)
 dimension = 4
-preparation = prepare_gradient(potential, backend, zeros(dimension))
-potential_gradient!(gradient, position) = first(value_and_gradient!(
-    potential, gradient, preparation, backend, position))
 
 # Persistent per-trajectory partition: metric factor, its log-determinant, and the
 # fixed reference energy `init_ham` — all constant while the metric/stepsize is fixed.
@@ -703,7 +719,7 @@ _lf_kin(logdet_chol, dotmv) = (logdet_chol + dotmv) / 2          # logdet HOISTE
 _lf_add(a, b) = a + b
 
 # HAVE ports (9): {pos,mom,old_grad} change each call; the rest are the persistent
-# per-trajectory partition. `pgrad` is the DI+Enzyme potential_gradient! closure.
+# per-trajectory partition. `pgrad` is the consumer's analytic potential_gradient!.
 g = RK.Graph()
 pos = RK.value(:pos, V);   mom = RK.value(:mom, V);   old_grad = RK.value(:old_grad, V)
 chol = RK.value(:chol, CH); stepsize = RK.value(:stepsize, S); init_ham = RK.value(:init_ham, S)
@@ -743,14 +759,14 @@ kernel = RK._prepare_nonallocating(plan, RK._nonallocating_ast(RK.lower(plan)), 
 """
     render_fused_leaf(mod) -> Markdown.MD
 
-Build-execute the fused NUTS leaf (Unit A) at the DI + reverse-mode Enzyme
+Build-execute the fused NUTS leaf (Unit A) at the consumer analytic
 scalar-potential boundary, assert its 13-recipe coverage, run one leaf, and render
 the actual program through the shared three-view UI. **Generated kernel** is the real
 `code_expr` of the fused non-allocating schedule; **Compute DAG** is `plan`. Fails the
 docs build if the inventory diverges or the generated view is not the live kernel's.
 """
 function render_fused_leaf(mod::Module)
-    _evaluate_source(mod, _FUSED_LEAF_SETUP)     # build-execute the DI + Enzyme boundary
+    _evaluate_source(mod, _FUSED_LEAF_SETUP)     # build-execute the analytic gradient boundary
     metric = Core.eval(mod, :metric)
     pos0   = Core.eval(mod, :position)
     mom0   = Core.eval(mod, :momentum)

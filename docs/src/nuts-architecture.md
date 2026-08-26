@@ -169,11 +169,15 @@ Main.ReactiveKernelsDocs.render_fused_leaf(@__MODULE__)
 ```
 
 The leaf's `pos`, `mom`, `old_grad` change every call; `chol`, `stepsize`,
-`init_ham`, `threshold`, the DI+Enzyme `pgrad` closure, and `logdet_chol` are the
-**persistent partition**, constant while the metric and step size are fixed. Exactly
-one recipe (`_grad_bundle`) calls the gradient, writing potential *and* gradient into
-one owned `_ValueGradient` bundle; `_vg_gradient`/`_vg_value` are borrowed
-projections. **One leaf ⇒ one gradient.**
+`init_ham`, `threshold`, the `pgrad` closure, and `logdet_chol` are the
+**persistent partition**, constant while the metric and step size are fixed. The
+panel above uses an **analytic** `pgrad` (∇U(x)=x) so the kernel — not the
+differentiation — is the visible content; ReactiveKernels computes no pullbacks
+itself and accepts any consumer gradient, including an optional
+DifferentiationInterface + reverse-mode Enzyme integration. Exactly one recipe
+(`_grad_bundle`) calls the gradient, writing potential *and* gradient into one owned
+`_ValueGradient` bundle; `_vg_gradient`/`_vg_value` are borrowed projections.
+**One leaf ⇒ one gradient.**
 
 ## The four compiled units — honest status
 
