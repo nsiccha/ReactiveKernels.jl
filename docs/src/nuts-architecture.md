@@ -88,6 +88,14 @@ this level** — the real graph construction plus its generated fused schedule a
 
 > **Illustrative TARGET — not currently executable.** No generated/DAG pane is shown
 > for it; the substrate it needs is reviewed but not yet canonical (see below).
+>
+> **Superseded direction note:** the approved authoring surface now **removes
+> `@reactive`** in favour of a single method-bearing **`@kernel`** macro (a phase-point
+> *endpoint* object with in-place `leapfrog!`/`refresh_momentum!` methods and a composed
+> `sampler`, ReactiveHMC-faithful — approved as V7, mid-implementation). The
+> `@reactive endpoint` form below is the earlier shape of that same design; the real
+> unified `@kernel` definitions will be shown here build-executed and drift-proof from
+> HMC's reviewed authoring fixture once it lands.
 
 ```julia
 @reactive endpoint(potential_gradient!, metric, pos, mom) = begin
