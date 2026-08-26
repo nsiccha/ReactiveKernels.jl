@@ -113,7 +113,7 @@ end
 # step_f resolves to the registered leapfrog! token (see example_step_binding). stats_f is
 # registered-or-nothing: a non-nothing stats_f MUST be a registered RK kernel (not an opaque runtime
 # Function) so collectstats!(__self__) has a visible registered callback identity.
-@kernel nuts_state(init; max_depth = 10, min_dham = -1000., step_f = nothing, stats_f = nothing) = begin
+@kernel nuts_state(init; step_f, max_depth = 10, min_dham = oftype(init.ham, -1000), stats_f = nothing) = begin
     gofwd = true
     may_sample = true
     may_continue = true
@@ -121,8 +121,8 @@ end
     bwd = deepcopy(init)
     trees = fillf(tree, init, max_depth + 1)
     proposals = fillf(deepcopy, init, max_depth + 2)
-    dham = 0.
-    diverged = !(dham >= min_dham)
+    dham = zero(init.ham)
+    diverged = !(dham >= min_dham)        # authored ONCE as the derived recipe (never written imperatively)
 
     # reset establishes authoritative owned endpoint state — registered owned copies + INLINE visible
     # buffer clears (no opaque unregistered helper) + control writes.
@@ -130,8 +130,7 @@ end
         gofwd = true
         may_sample = true
         may_continue = true
-        dham = 0.
-        diverged = !(dham >= min_dham)
+        dham = zero(init.ham)           # write dham ONLY; `diverged` is the derived recipe (recomputed)
         copy!!(fwd, init)               # registered owned-copy (visible)
         copy!!(bwd, init)
         for p in proposals; copy!!(p, init); end

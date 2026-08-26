@@ -178,6 +178,33 @@ blocks = kernel_blocks()
     # (B-noforce) `force` removed from step! (dead after registered reset).
     @test !(:force in formals(methodsig(method_named(ns, :step!))))
 
+    # (B-derived) NO nested method writes the DERIVED field `diverged` (authored once as the recipe);
+    #             reset! writes `dham` ONLY among the two.
+    wrote_diverged = Ref(false)
+    for m in ns.methods
+        _walk(methodbody(m)) do x
+            x isa Expr && is_assign(x.head) && x.args[1] === :diverged && (wrote_diverged[] = true)
+        end
+    end
+    @test !wrote_diverged[]
+    reset_writes = Set{Symbol}()
+    _walk(methodbody(method_named(ns, :reset!))) do x
+        x isa Expr && is_assign(x.head) && x.args[1] isa Symbol && push!(reset_writes, x.args[1])
+    end
+    @test :dham in reset_writes && !(:diverged in reset_writes)
+
+    # (B-reqkw) step_f is a REQUIRED keyword (bare symbol in :parameters, no :kw default); stats_f optional.
+    params = ns.sig.args[findfirst(a -> a isa Expr && a.head === :parameters, ns.sig.args)]
+    @test any(p -> p === :step_f, params.args)                                           # required (no default)
+    @test any(p -> p isa Expr && p.head === :kw && p.args[1] === :stats_f, params.args)   # optional
+    @test !(:step_f in ns.fields)                                                         # a source, not a field
+
+    # (B-f32f64) type-preserving scalar source forms: min_dham=oftype(init.ham,-1000); dham=zero(init.ham);
+    #            no hardcoded Float64 literal for either (F32/F64 source-form discriminator).
+    @test occursin("oftype(init.ham", SRC)
+    @test occursin("zero(init.ham)", nb)
+    @test !occursin("min_dham = -1000", SRC) && !occursin("dham = 0.", nb)
+
     # (B-fields) reference field spellings + concrete endpoint param `ep` threaded through recursion.
     nsnames = Set(ns.fields) ∪ Set(ns.sources)
     for f in (:gofwd,:may_sample,:may_continue,:fwd,:bwd,:trees,:proposals,:dham,:diverged,
