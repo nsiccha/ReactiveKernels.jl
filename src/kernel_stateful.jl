@@ -310,13 +310,17 @@ function _kernel_freeze_ast(x)
         "deeply-immutable literals, and `Vector`/`Dict`/`Tuple`/`NamedTuple`/`Pair` of them."))
 end
 
-# True iff `x` has NO reachable mutable state: an `isbits` value, an interned `Symbol` /
-# immutable `AbstractString`, or an immutable struct whose every field is deeply
-# immutable. A mutable object (`Array`/`Dict`), or an immutable struct WRAPPING one
-# (`Set`, whose backing `Dict` is mutable), is NOT. Immutable structs cannot form
-# cycles, so the recursion terminates.
+# True iff `x` has NO reachable mutable state: an `isbits` value, the two builtin
+# interned/immutable atoms `Symbol` and `String` (both report `ismutable`-true despite
+# immutable user semantics), or an immutable struct whose every field is deeply immutable.
+# NOT safe: a mutable object (`Array`/`Dict`); an immutable struct WRAPPING one (`Set`,
+# whose backing `Dict` is mutable); a mutable or custom `AbstractString` that reaches
+# mutable storage (e.g. one backed by a `Vector{UInt8}`) — the exceptional atom is `String`
+# ONLY, never `AbstractString` broadly. A genuinely-immutable string wrapper (`SubString`,
+# whose fields are a `String` + `Int`s) still passes via the generic recursive field proof
+# below. Immutable structs cannot form cycles, so the recursion terminates.
 _kernel_leaf_deeply_immutable(::Symbol) = true
-_kernel_leaf_deeply_immutable(::AbstractString) = true
+_kernel_leaf_deeply_immutable(::String) = true
 function _kernel_leaf_deeply_immutable(x)
     isbits(x) && return true
     ismutable(x) && return false

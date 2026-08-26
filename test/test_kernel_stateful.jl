@@ -25,10 +25,10 @@ _frozen_all_immutable(x::NamedTuple) = all(_frozen_all_immutable, values(x))
 _frozen_all_immutable(x::Pair) =
     _frozen_all_immutable(x.first) && _frozen_all_immutable(x.second)
 _frozen_all_immutable(::Symbol) = true   # interned atom: ismutable-true but un-mutatable
-_frozen_all_immutable(::AbstractString) = true
+_frozen_all_immutable(::String) = true   # builtin immutable string (NOT AbstractString broadly)
 # generic reachable-mutability check, independent of the freezer: recurse into an
-# immutable struct's fields too, so a hidden Set/Dict (immutable wrapper of mutable
-# state) is still caught, not only a bare Expr/Vector/Dict.
+# immutable struct's fields too, so a hidden Set/Dict/mutable-AbstractString (an immutable
+# wrapper of mutable state) is still caught, not only a bare Expr/Vector/Dict.
 function _frozen_all_immutable(x)
     isbits(x) && return true
     ismutable(x) && return false
@@ -38,6 +38,12 @@ end
 # A mutable leaf the freezer must REJECT (never silently retain).
 mutable struct _AdvMutableLeaf
     v::Int
+end
+
+# A MUTABLE custom `AbstractString` (backed by a mutable buffer) — the freezer must
+# reject it, never retain it by identity (RK repro on bb3cbcd).
+mutable struct _EvilString <: AbstractString
+    buf::Vector{UInt8}
 end
 
 # Recursively assert `typeof` matches at every corresponding node — a `Vector{Int}` that
@@ -357,6 +363,21 @@ end
               Dict{Symbol,Int}
         @test typeof(RKS._kernel_thaw_ast(RKS._kernel_freeze_ast((1, [2, 3])))) ===
               Tuple{Int,Vector{Int}}
+
+        # a MUTABLE custom AbstractString reaches mutable storage → REJECT (bare,
+        # QuoteNode-nested, Expr-nested); it is NEVER retained by identity.
+        @test_throws ArgumentError RKS._kernel_freeze_ast(_EvilString(UInt8[0x61]))
+        @test_throws ArgumentError RKS._kernel_freeze_ast(QuoteNode(_EvilString(UInt8[0x61])))
+        @test_throws ArgumentError RKS._kernel_freeze_ast(Expr(:call, :f, _EvilString(UInt8[0x61])))
+
+        # a plain String is the exceptional safe atom; a genuinely-immutable string wrapper
+        # (SubString: a String + Ints) passes the GENERIC recursive field proof and is
+        # retained (safe — immutable) and round-trips.
+        @test RKS._kernel_thaw_ast(RKS._kernel_freeze_ast("s")) === "s"
+        let ss = SubString("hello", 1, 3)
+            @test _frozen_all_immutable(RKS._kernel_freeze_ast(ss))
+            @test RKS._kernel_thaw_ast(RKS._kernel_freeze_ast(ss)) === ss
+        end
 
         # generic assertion on the REAL captured fixture: no mutable object in the store.
         @test _frozen_all_immutable(getfield(StatefulRecipeSrcFixture, :recipe_source))
