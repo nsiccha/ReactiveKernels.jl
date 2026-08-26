@@ -246,10 +246,13 @@ _kernel_snapshot_port_names(snap::_ChildSnapshot) = snap.port_order
 # Frozen wrappers, so NO mutable object survives in the stored form:
 #   `Expr`      → `_FrozenExpr(head, Tuple of frozen args)`
 #   `QuoteNode` → `_FrozenQuoteNode(frozen value)`  (its value may wrap an `Expr`)
-#   `Vector`    → `_FrozenVector(Tuple of frozen elems)`
-#   `Dict`      → `_FrozenDict(Tuple of frozen `key => value` pairs)`
-# Each is an immutable `struct` whose children are `Tuple`s (never a `Vector`) of
-# frozen nodes / immutable leaves.
+#   `Vector{T}` → `_FrozenVector{T}(Tuple of frozen elems)`  (exact `eltype` stored)
+#   `Dict{K,V}` → `_FrozenDict{K,V}(Tuple of frozen `key => value` pairs)`  (exact types)
+# Each is an immutable `struct` whose children are `Tuple`s (never a `Vector`) of frozen
+# nodes / immutable leaves. The `Vector`/`Dict` wrappers carry the EXACT concrete element/
+# key/value types so thaw rebuilds `typeof(src)` faithfully (not a `Vector{Any}`/base
+# `Dict`), which matters because a programmatically-supplied AST literal dispatches on its
+# concrete type.
 struct _FrozenExpr
     head::Symbol
     args::Tuple
@@ -257,11 +260,11 @@ end
 struct _FrozenQuoteNode
     value::Any
 end
-struct _FrozenVector
-    elems::Tuple
+struct _FrozenVector{T}
+    elems::Tuple             # frozen elements; `T` = exact `eltype`, rebuilt on thaw
 end
-struct _FrozenDict
-    pairs::Tuple             # Tuple of `Pair{frozen-key, frozen-value}`
+struct _FrozenDict{K,V}
+    pairs::Tuple             # frozen `key => value` pairs; `K`/`V` rebuilt on thaw
 end
 
 # Freeze source AST → frozen form. `Expr`/`QuoteNode` and the mutable containers
@@ -276,9 +279,19 @@ end
 _kernel_freeze_ast(x::Expr) =
     _FrozenExpr(x.head, Tuple(_kernel_freeze_ast(a) for a in x.args))
 _kernel_freeze_ast(x::QuoteNode) = _FrozenQuoteNode(_kernel_freeze_ast(x.value))
-_kernel_freeze_ast(x::Vector) = _FrozenVector(Tuple(_kernel_freeze_ast(e) for e in x))
-_kernel_freeze_ast(x::AbstractDict) =
-    _FrozenDict(Tuple(_kernel_freeze_ast(k) => _kernel_freeze_ast(v) for (k, v) in x))
+_kernel_freeze_ast(x::Vector) =
+    _FrozenVector{Base.eltype(x)}(Tuple(_kernel_freeze_ast(e) for e in x))
+# NB: qualify `Base.keytype`/`Base.valtype` — ReactiveKernels defines its own `valtype`
+# (for `Value`/`ReactiveValue`), which shadows `Base.valtype` inside this module.
+_kernel_freeze_ast(x::Dict) =
+    _FrozenDict{Base.keytype(x),Base.valtype(x)}(
+        Tuple(_kernel_freeze_ast(k) => _kernel_freeze_ast(v) for (k, v) in x))
+# A non-`Dict` `AbstractDict` (`IdDict`, an ordered/custom dict, …) cannot be rebuilt to
+# its exact `typeof` generically, so REJECT it rather than silently thawing a base `Dict`
+# of a different type.
+_kernel_freeze_ast(x::AbstractDict) = throw(ArgumentError(
+    "cannot freeze recipe-source AST: unsupported `AbstractDict` subtype $(typeof(x)) — " *
+    "only the concrete `Dict` is faithfully reconstructable."))
 _kernel_freeze_ast(x::Tuple) = map(_kernel_freeze_ast, x)
 _kernel_freeze_ast(x::NamedTuple) = NamedTuple{keys(x)}(map(_kernel_freeze_ast, values(x)))
 _kernel_freeze_ast(x::Pair) = _kernel_freeze_ast(x.first) => _kernel_freeze_ast(x.second)
@@ -317,9 +330,10 @@ end
 _kernel_thaw_ast(x::_FrozenExpr) =
     Expr(x.head, Any[_kernel_thaw_ast(a) for a in x.args]...)
 _kernel_thaw_ast(x::_FrozenQuoteNode) = QuoteNode(_kernel_thaw_ast(x.value))
-_kernel_thaw_ast(x::_FrozenVector) = Any[_kernel_thaw_ast(e) for e in x.elems]
-_kernel_thaw_ast(x::_FrozenDict) =
-    Dict(_kernel_thaw_ast(p.first) => _kernel_thaw_ast(p.second) for p in x.pairs)
+_kernel_thaw_ast(x::_FrozenVector{T}) where {T} =
+    T[_kernel_thaw_ast(e) for e in x.elems]
+_kernel_thaw_ast(x::_FrozenDict{K,V}) where {K,V} =
+    Dict{K,V}(_kernel_thaw_ast(p.first) => _kernel_thaw_ast(p.second) for p in x.pairs)
 _kernel_thaw_ast(x::Tuple) = map(_kernel_thaw_ast, x)
 _kernel_thaw_ast(x::NamedTuple) = NamedTuple{keys(x)}(map(_kernel_thaw_ast, values(x)))
 _kernel_thaw_ast(x::Pair) = _kernel_thaw_ast(x.first) => _kernel_thaw_ast(x.second)

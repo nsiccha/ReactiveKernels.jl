@@ -40,6 +40,31 @@ mutable struct _AdvMutableLeaf
     v::Int
 end
 
+# Recursively assert `typeof` matches at every corresponding node — a `Vector{Int}` that
+# thawed as `Vector{Any}`, or a `Dict{Symbol,Int}` as a base `Dict{Any,Any}`, must FAIL
+# even though `==` would pass.
+function _types_match(a, b)
+    typeof(a) === typeof(b) || return false
+    if a isa Expr
+        length(a.args) == length(b.args) || return false
+        return all(i -> _types_match(a.args[i], b.args[i]), eachindex(a.args))
+    elseif a isa QuoteNode
+        return _types_match(a.value, b.value)
+    elseif a isa Vector
+        length(a) == length(b) || return false
+        return all(i -> _types_match(a[i], b[i]), eachindex(a))
+    elseif a isa AbstractDict
+        keys(a) == keys(b) || return false
+        return all(k -> _types_match(a[k], b[k]), keys(a))
+    elseif a isa Tuple || a isa NamedTuple
+        return all(i -> _types_match(a[i], b[i]), 1:length(a))
+    elseif a isa Pair
+        return _types_match(a.first, b.first) && _types_match(a.second, b.second)
+    else
+        return true                       # leaf: top-level typeof already matched
+    end
+end
+
 # --- top-level stateful fixtures (method-bearing ⇒ const ⇒ top-level only) ---
 @kernel StatefulObjFixture(ham, pos, mom) = begin
     derived = ham
@@ -307,6 +332,7 @@ end
             @test _frozen_all_immutable(fr)                        # no mutable object survives
             thawed = RKS._kernel_thaw_ast(fr)
             @test thawed == src && thawed !== src                  # exact fresh round-trip
+            @test _types_match(thawed, src)                        # …incl. EXACT concrete typeof
         end
 
         # a thawed container is fully detached — mutating it can't reach the frozen store.
@@ -321,6 +347,16 @@ end
         @test_throws ArgumentError RKS._kernel_freeze_ast(Expr(:call, :f, _AdvMutableLeaf(1)))
         @test_throws ArgumentError RKS._kernel_freeze_ast(QuoteNode(Set([1])))
         @test_throws ArgumentError RKS._kernel_freeze_ast(Expr(:call, :f, (1, Set([2]))))
+        # a non-`Dict` AbstractDict is not generically reconstructable → REJECT (do NOT
+        # silently thaw it as a base `Dict`).
+        @test_throws ArgumentError RKS._kernel_freeze_ast(Expr(:call, :f, IdDict(1 => 2)))
+
+        # concrete container types are reconstructed EXACTLY, not widened to Any.
+        @test typeof(RKS._kernel_thaw_ast(RKS._kernel_freeze_ast([1, 2, 3]))) === Vector{Int}
+        @test typeof(RKS._kernel_thaw_ast(RKS._kernel_freeze_ast(Dict(:a => 1)))) ===
+              Dict{Symbol,Int}
+        @test typeof(RKS._kernel_thaw_ast(RKS._kernel_freeze_ast((1, [2, 3])))) ===
+              Tuple{Int,Vector{Int}}
 
         # generic assertion on the REAL captured fixture: no mutable object in the store.
         @test _frozen_all_immutable(getfield(StatefulRecipeSrcFixture, :recipe_source))
