@@ -897,51 +897,91 @@ end
 # `_kernel_expand`, not in kernel_stateful.jl) because authoring.jl loads first and a
 # `@doc`-embedded `@kernel` expands at load time — a forward ref would be undefined.
 
-# Is a macrocall head the `@node` promoter by NAME (bare or module-qualified)? A
-# SYNTACTIC candidate only; identity is confirmed by `_kernel_marker_kind(mod, ex)`.
+# Is a macrocall head NAMED `@node` (bare or module-qualified)? A SYNTACTIC CANDIDATE
+# only — identity (the genuine RK `@node` binding vs a foreign `Evil.@node`) is
+# confirmed via `_kernel_resolve_binding`.
 _kernel_is_node_macro(m) =
     m === Symbol("@node") ||
     (m isa Expr && m.head === :(.) && length(m.args) >= 2 &&
         m.args[2] == QuoteNode(Symbol("@node")))
 
-# Any `@node(...)` marker anywhere in `x`?
+# Any `@node(...)` CANDIDATE (by name) anywhere in `x`?
 _kernel_has_node_marker(x) =
     x isa Expr && (
         (x.head === :macrocall && !isempty(x.args) && _kernel_is_node_macro(x.args[1])) ||
         any(_kernel_has_node_marker, x.args))
 
-# Promote every `@node(expr)` in a recipe block into a distinct named recipe node
-# (`#node#k = expr`), prepended in authored order, replacing each occurrence with its
-# node name. Returns the SAME block object (byte-identical) when no `@node` is present,
-# so ordinary recipes are unchanged. `#`-prefixed names are hygienic (non-authorable)
-# and deterministic (stable within one expansion). Nested `@node` is promoted inner-first.
-function _kernel_lift_nodes(block)
+# Resolve a callee/macro-head AST (bare `name` or `Mod.name`) to its BINDING VALUE in
+# `mod`, or `nothing`. Reads bindings only (no call eval) — inside the compiler boundary.
+function _kernel_resolve_binding(mod::Module, callee)
+    if callee isa Symbol
+        isdefined(mod, callee) ? getglobal(mod, callee) : nothing
+    elseif callee isa Expr && callee.head === :(.) && length(callee.args) == 2 &&
+           callee.args[1] isa Symbol && callee.args[2] isa QuoteNode
+        outer = callee.args[1]
+        isdefined(mod, outer) || return nothing
+        outerval = getglobal(mod, outer)
+        outerval isa Module || return nothing
+        inner = callee.args[2].value
+        isdefined(outerval, inner) ? getglobal(outerval, inner) : nothing
+    else
+        nothing
+    end
+end
+
+# Heads under which work is CONTROL-DEPENDENT (branch/loop-local): lifting an `@node`
+# out of them would make it unconditional in the static graph.
+_kernel_is_control_head(h) =
+    h in (:if, :(&&), :(||), :for, :while, :comprehension, :generator, :try)
+
+# Promote every GENUINE RK `@node(expr)` in a recipe block into a distinct hygienic
+# recipe node (a `gensym`ed name, collision-free with any authored port), prepended in
+# authored order, replacing each occurrence with its node name. Three soundness rules
+# (RK 2026-08-26): (a) IDENTITY-AWARE — a foreign `@node` (e.g. `Evil.@node`) sharing
+# only the name is NOT promoted, it is left to expand as its own macro; (b) COLLISION-
+# FREE — the generated name is a `gensym`, so it cannot alias an authored port; (c) a
+# genuine `@node` in a NON-straight-line (branch/loop) context is REJECTED rather than
+# silently made unconditional. Returns the SAME block object (byte-identical) when
+# nothing is promoted. `mod === nothing` (no definition module) never promotes.
+function _kernel_lift_nodes(block, mod)
     (block isa Expr && block.head === :block) || return block
-    _kernel_has_node_marker(block) || return block          # no @node ⇒ byte-identical
+    _kernel_has_node_marker(block) || return block
     lifted = Any[]
-    counter = Ref(0)
+    promoted = Ref(0)
+    is_rk_node = head -> mod isa Module && _kernel_resolve_binding(mod, head) === var"@node"
     local rewrite
-    rewrite = function (x)
+    rewrite = function (x, straight::Bool)
         x isa Expr || return x
         if x.head === :macrocall && !isempty(x.args) && _kernel_is_node_macro(x.args[1])
-            inner = rewrite(x.args[end])                    # nested @node promoted first
-            counter[] += 1
-            nm = Symbol("#node#", counter[])
-            push!(lifted, Expr(:(=), nm, inner))
-            return nm
+            if is_rk_node(x.args[1])
+                straight || throw(ArgumentError(
+                    "@node is only valid in a straight-line recipe context — not beneath " *
+                    "?:/if/&&/||/loop. Increment 1 rejects branch-local @node rather than " *
+                    "silently making it unconditional in the static graph."))
+                inner = rewrite(x.args[end], straight)      # nested @node promoted first
+                nm = gensym(:node)
+                push!(lifted, Expr(:(=), nm, inner))
+                promoted[] += 1
+                return nm
+            else
+                # a foreign `@node` by name only — leave it for its own macro to expand.
+                return Expr(x.head, Any[rewrite(a, straight) for a in x.args]...)
+            end
         end
-        Expr(x.head, Any[rewrite(a) for a in x.args]...)
+        sub = _kernel_is_control_head(x.head) ? false : straight
+        Expr(x.head, Any[rewrite(a, sub) for a in x.args]...)
     end
-    new_stmts = Any[rewrite(s) for s in block.args]
+    new_stmts = Any[rewrite(s, true) for s in block.args]
+    promoted[] == 0 && return block            # nothing genuine promoted ⇒ unchanged
     Expr(:block, vcat(lifted, new_stmts)...)
 end
 
 function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
-                        call_signature = nothing)
-    # Promote `@node(expr)` markers into distinct named recipe nodes so a marked
-    # anonymous subexpression becomes a real schedulable graph node/port (RK 2026-08-26).
-    # A no-op returning the SAME block — byte-identical — when no `@node` is present.
-    block = _kernel_lift_nodes(block)
+                        call_signature = nothing, mod::Union{Module,Nothing} = nothing)
+    # Promote genuine RK `@node(expr)` markers into distinct schedulable recipe nodes
+    # (identity-aware, collision-free, straight-line-only). A no-op — byte-identical —
+    # for bodies with no `@node` (or only foreign `@node`).
+    block = _kernel_lift_nodes(block, mod)
     statements = block isa Expr && block.head === :block ? block.args : Any[block]
     graph_var = gensym(:kernel_graph)
     ports_var = gensym(:kernel_ports)
@@ -1263,7 +1303,8 @@ compiled stateless kernel remains available through [`prepare_reactive`](@ref),
 """
 macro kernel(ex)
     definition = ex isa Expr ? _kernel_definition_parts(ex) : nothing
-    definition === nothing && return esc(_kernel_expand(ex))
+    definition === nothing &&
+        return esc(_kernel_expand(ex, Tuple{Symbol,Any}[], nothing, __module__))
     name, inputs, call_signature, positional_names, block = definition
     # Discriminator (V7): nested methods ⇒ Mode-1 object kernel; else a methodless
     # body that MUTATES a field of the FIRST positional subject ⇒ Mode-2 free method
@@ -1285,7 +1326,7 @@ macro kernel(ex)
         return _kernel_mode2_expand(name, inputs, call_signature, block,
                                     positional_names[1], __module__)
     end
-    esc(Expr(:(=), name, _kernel_expand(block, inputs, call_signature)))
+    esc(Expr(:(=), name, _kernel_expand(block, inputs, call_signature, __module__)))
 end
 
 # --- named boundaries ------------------------------------------------------

@@ -454,28 +454,62 @@ end
         @test copy!! === ReactiveKernels.copy!!
     end
 
-    @testset "@node port-lifting + marker recognition (identity-confirmed)" begin
-        # FIX (1): `@node` is PORT-LIFTED into a distinct schedulable graph node — NOT
-        # expanded away. Non-vacuous graph gate: exactly one `#node#` node port exists,
-        # the graph has 2 recipes, and `m`/`kin` are ports with the node internal.
+    @testset "@node transformer soundness (identity / collision / control-flow)" begin
+        # HAPPY PATH: a genuine straight-line `@node` is PORT-LIFTED into a distinct
+        # schedulable graph node. Non-vacuous graph gate: 2 recipes, 3 ports (:m, the
+        # lifted node, :kin), the node being the port that is neither :m nor :kin.
         @kernel withnode(m) = begin
             kin = 0.5 * (@node(abs(m)) + 2.0)
         end
         @test withnode isa KernelSpec
-        g = kernel_graph(withnode)
-        @test length(g.recipes) == 2
-        nodeports = filter(p -> startswith(String(p), "#node#"), collect(keys(withnode)))
-        @test length(nodeports) == 1
-        @test :m in keys(withnode) && :kin in keys(withnode)
+        @test length(kernel_graph(withnode).recipes) == 2
+        ks = collect(keys(withnode))
+        @test length(ks) == 3 && :m in ks && :kin in ks
+        @test length(filter(p -> p !== :m && p !== :kin, ks)) == 1   # exactly one lifted node
         # a @node-FREE recipe block is returned byte-identical (the SAME object)
         blk = :(begin
             y = f(x)
         end)
-        @test RKS._kernel_lift_nodes(blk) === blk
+        @test RKS._kernel_lift_nodes(blk, @__MODULE__) === blk
         @test (@node 41 + 1) == 42                 # harmless identity outside a kernel
 
-        # FIX (3): the syntactic classifier is a NON-AUTHORITATIVE candidate — it
-        # matches a foreign binding by name...
+        # FIX (A): IDENTITY-AWARE — a foreign `@node` (name only) is NOT promoted as RK
+        # semantics; it expands as its own macro, leaving NO hidden node.
+        @kernel spoofednode(m) = begin
+            kin = 0.5 * (MarkerSpoof.@node(abs(m)) + 2.0)
+        end
+        @test spoofednode isa KernelSpec
+        @test length(kernel_graph(spoofednode).recipes) == 1         # only `kin`; no lifted node
+        @test Set(keys(spoofednode)) == Set((:m, :kin))
+
+        # FIX (B): COLLISION-FREE — the generated node name is a gensym, so it cannot
+        # alias an authored port even one spelled like the old `#node#1`.
+        @kernel collidenode(x) = begin
+            var"#node#1" = x + 1
+            y = @node(x + 2)
+        end
+        @test collidenode isa KernelSpec
+        kc = collect(keys(collidenode))
+        @test length(kc) == length(unique(kc))                       # NO port collision
+        @test Symbol("#node#1") in kc                                # the authored port survives
+        @test length(kernel_graph(collidenode).recipes) == 3         # #node#1, <gensym>, y
+
+        # FIX (C): a genuine `@node` in a NON-straight-line (branch/loop) context is
+        # REJECTED, not silently made unconditional in the static graph.
+        @test_throws Exception @macroexpand @kernel condnode(c, x) = begin
+            y = c ? @node(abs(x)) : x
+        end
+        @test_throws Exception @macroexpand @kernel andnode(c, x) = begin
+            y = c && @node(abs(x))
+        end
+        @test_throws Exception @macroexpand @kernel loopnode(x) = begin
+            y = [@node(abs(x)) for _ in 1:2]
+        end
+    end
+
+    @testset "marker recognition: candidate (syntactic) vs kind (identity-confirmed)" begin
+        # the syntactic classifier is a NON-AUTHORITATIVE candidate — matches by name,
+        # including a foreign binding...
         @test RKS._kernel_marker_candidate(:(@node(logdet(m)))) === :node
         @test RKS._kernel_marker_candidate(:(deepcopy(init))) === :deepcopy
         @test RKS._kernel_marker_candidate(:(MarkerSpoof.deepcopy(init))) === :deepcopy

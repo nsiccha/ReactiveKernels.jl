@@ -468,7 +468,7 @@ function _kernel_stateful_expand(name, signature_inputs, call_signature, block,
     end
 
     recipe_block = Expr(:block, recipe_stmts...)
-    spec_expr = _kernel_expand(recipe_block, signature_inputs, call_signature)
+    spec_expr = _kernel_expand(recipe_block, signature_inputs, call_signature, __module__)
 
     token_sym = gensym(Symbol(name, :_token))
     # The exposed per-method metadata carries the FULL authored signature (where
@@ -661,7 +661,7 @@ function _kernel_mode2_expand(name, signature_inputs, call_signature, block,
     method_meta = (; name = name, subject = subject,
                      write_roots = roots.writes, read_roots = roots.reads)
     # Ports-only spec: the signature ports (the body carries mutations, not recipes).
-    spec_expr = _kernel_expand(Expr(:block), signature_inputs, call_signature)
+    spec_expr = _kernel_expand(Expr(:block), signature_inputs, call_signature, __module__)
     body_source = Tuple(
         _kernel_freeze_ast(s isa Expr ? Base.remove_linenums!(deepcopy(s)) : s)
         for s in _kernel_body_statements(block) if !(s isa LineNumberNode))
@@ -818,24 +818,8 @@ _kernel_callee_name(c) =
     (c isa Expr && c.head === :(.) && length(c.args) >= 2 && c.args[2] isa QuoteNode) ?
         c.args[2].value : nothing
 
-# Resolve a callee AST (bare `name` or `Mod.name`) to its BINDING VALUE in `mod`, or
-# `nothing`. Reads bindings only (no call eval), so it stays inside the compiler
-# boundary.
-function _kernel_resolve_binding(mod::Module, callee)
-    if callee isa Symbol
-        isdefined(mod, callee) ? getglobal(mod, callee) : nothing
-    elseif callee isa Expr && callee.head === :(.) && length(callee.args) == 2 &&
-           callee.args[1] isa Symbol && callee.args[2] isa QuoteNode
-        outer = callee.args[1]
-        isdefined(mod, outer) || return nothing
-        outerval = getglobal(mod, outer)
-        outerval isa Module || return nothing
-        inner = callee.args[2].value
-        isdefined(outerval, inner) ? getglobal(outerval, inner) : nothing
-    else
-        nothing
-    end
-end
+# (`_kernel_resolve_binding` — the identity-resolving binding lookup — lives in
+# authoring.jl alongside the `@node` lift, which also needs it at load time.)
 
 """
     _kernel_marker_candidate(ex) -> Symbol | nothing
