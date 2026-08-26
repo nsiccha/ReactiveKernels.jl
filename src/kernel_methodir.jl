@@ -261,9 +261,10 @@ FACTS (primary; none gates legality of a direct in-object write):
 - `effects` — a SET (Tuple) ⊆ (`:place_write`, `:opaque_call`); the empty tuple is a body with no LOCAL
   effect. Transitive sibling/registered/opaque/RNG effects are NOT baked in (a later
   call-graph fixed point produces closed summaries).
-- `resolution_deps` — what must be resolved later: sibling-overload sets, opaque-callee traits, rng
-  ordering, registered/intrinsic/field callable identities, unresolved aliases; never a falsely-final
-  "resolved purity" claim.
+- `resolution_deps` — what must be resolved later: sibling-overload sets, opaque-callee traits,
+  registered/intrinsic-callee (captured Token) identities, callable-field identities, subject-method
+  calls, unresolved aliases; never a falsely-final "resolved purity" claim. RNG is NOT a dep here — it
+  is never name-classified; RNG effect/ordering is deferred to a later trait / typed-RuntimeArg fact.
 `kind` is a SECONDARY derived convenience (`:segment`/`:orchestration`/`:unresolved`), never the
 authority. `ok` is `false` only for a genuine grammar violation (a faithful in-object write is NEVER a
 violation). `signature` retains the FULL authored signature AST; `self` is the receiver symbol (`__self__`
@@ -502,8 +503,10 @@ _kmir_is_assign(head::Symbol) =
     head === :(=) || head === :(.=) || _kmir_compound_op(head) !== nothing
 _kmir_is_dotmacro(ex) = ex isa Expr && ex.head === :macrocall &&
     !isempty(ex.args) && ex.args[1] === Symbol("@__dot__")
-_kmir_is_node(ex) = ex isa Expr && ex.head === :macrocall &&
-    !isempty(ex.args) && ex.args[1] === Symbol("@node")
+# A `@node`-SPELLED macrocall (a candidate) — spelling only; genuine RK-@node IDENTITY is decided by
+# `_kernel_marker_kind` (resolves the `@node` binding to RK's `var"@node"`, defeating a foreign/local
+# spoof). Spelling alone NEVER authorizes promotion (RK marker-hygiene).
+_kmir_node_candidate(ex) = _kernel_marker_candidate(ex) === :node
 
 # ---- expression normalization -> _MExpr VALUE -------------------------------
 
@@ -622,8 +625,18 @@ function _kmexpr(ex, ctx::_KMIRCtx, shadow::Set{Symbol}; bcast::Bool=false)
     end
     (ex isa Expr) || return _Lit(ex)
     ex.head === :quote && return _Lit(ex)
-    # @node: already a lifted recipe — normalize the inner expr for dependency reads, NO double-promote.
-    _kmir_is_node(ex) && return _NodeExpr(_kmexpr(ex.args[end], ctx, shadow; bcast=bcast), ex.args[end], ctx.mod)
+    # @node promotion is IDENTITY-aware (RK marker-hygiene): a `@node`-spelled macrocall promotes to a
+    # `_NodeExpr` (a lifted recipe; inner normalized for dep reads, NO double-promote) ONLY when its
+    # `@node` binding resolves to RK's genuine `@node` (`_kernel_marker_kind === :node`). A foreign/local
+    # `@node` macro (a spoof) is ordinary Julia macro semantics — OPAQUE under the compiler boundary —
+    # and is REJECTED actionably, never silently promoted on spelling.
+    if _kmir_node_candidate(ex)
+        _kernel_marker_kind(ctx.mod, ex) === :node && return _NodeExpr(
+            _kmexpr(ex.args[end], ctx, shadow; bcast=bcast), ex.args[end], ctx.mod)
+        _kmir_reject("a `@node`-spelled macro whose `@node` does NOT resolve to RK's `@node` (a foreign/" *
+                     "local macro binding) is not RK node provenance — ordinary Julia macro semantics are " *
+                     "opaque under the compiler boundary")
+    end
     m(node) = _kmexpr(node, ctx, shadow; bcast=bcast)
     if ex.head === :. && length(ex.args) == 2 && ex.args[2] isa QuoteNode
         return _Getfield(m(ex.args[1]), ex.args[2].value)
@@ -1200,8 +1213,9 @@ abstract type _Access end
 struct _ARead   <: _Access; path::Tuple{Vararg{Symbol}}; end
 "A WRITE to a place root `(root, owner)`."
 struct _AWrite  <: _Access; root::Symbol; owner::Any; end
-"A CALL effect (`kind` ∈ :sibling/:field/:registered/:intrinsic/:opaque/:operator/:rng) with its
-ordered argument-read events (`reads`). Every call IS a read of its actuals."
+"A CALL effect (`kind` ∈ :sibling/:field/:registered/:intrinsic/:subject_method/:opaque/:operator) with
+its ordered argument-read events (`reads`). Every call IS a read of its actuals. RNG is never a call
+kind — it is not name-classified (finding 10)."
 struct _ACall   <: _Access; kind::Symbol; id::Any; reads::Vector{_Access}; end
 "Two MUTUALLY-EXCLUSIVE ordered event groups (`thn`/`els`) — an `if`/ternary branch. A read in one arm
 is NOT sequenced before a write in the other."

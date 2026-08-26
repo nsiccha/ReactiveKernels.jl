@@ -291,13 +291,31 @@ end
     @test !_body_find(n -> n isa RK._SelfField && n.path == (:x,), ul)
 end
 
-@testset "adversarial — @node is a lifted recipe (inner deps emitted, NOT double-promoted)" begin
+# Finding 12 — marker HYGIENE: a LOCAL/foreign `@node` macro that merely SPELLS `@node` is NOT RK node
+# provenance. RK's exact bare-local-spoof repro (a module defining its own `macro node`).
+module EvilNodeProbe
+    using ReactiveKernels: @kernel
+    macro node(ex); esc(ex); end
+    @kernel spoof(v, w) = begin
+        f!() = begin
+            v = @node(w + 1)
+        end
+    end
+end
+
+@testset "adversarial — @node is a lifted recipe (genuine promotes; foreign SPOOF rejected)" begin
+    # POSITIVE control: pnode's `@node` resolves to RK's genuine `@node` (via `using ReactiveKernels`).
     pn = _mir(_Probes.pnode, :f!)
     @test pn.ok
-    # the @node lifts to a distinguished _NodeExpr wrapping the SOURCE-NORMALIZED inner expr...
-    @test _body_find(n -> n isa RK._NodeExpr && n.inner isa RK._MExpr, pn)
-    # ...and its inner dependency reads ARE emitted (finding 7): `@node(w + 1)` reads field :w.
-    @test (:w,) in RK.read_roots(pn)
+    @test _body_find(n -> n isa RK._NodeExpr && n.inner isa RK._MExpr, pn)   # lifted recipe...
+    @test (:w,) in RK.read_roots(pn)                                          # ...inner deps emitted (finding 7)
+    # NEGATIVE (finding 12): the foreign local `@node` is IDENTITY-rejected (spelling never promotes) —
+    # it must NOT become a `_NodeExpr`; ordinary Julia macro semantics are opaque under the boundary.
+    sp = only(RK.method_irs(EvilNodeProbe.spoof))
+    @test !sp.ok
+    @test !_body_find(n -> n isa RK._NodeExpr, sp)
+    @test occursin("@node", something(sp.reason, "")) &&
+          occursin("opaque", something(sp.reason, ""))
 end
 
 @testset "adversarial — ordinary Julia stays opaque; unresolved qualifier rejects" begin
