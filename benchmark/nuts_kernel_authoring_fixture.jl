@@ -1,5 +1,5 @@
 # ReactiveHMC-STRUCTURE `@kernel` NUTS AUTHORING FIXTURE — implicit-field, no-Ref (two-direct-branch
-# direction), runtime rng, RK-visible leapfrog!/rcopy!!, `!!` public entry. Durable CONSUMER contract
+# direction), runtime rng, RK-visible leapfrog!/copy!!, `!!` public entry. Durable CONSUMER contract
 # against the canonical LOCKED forms A/B/C + the 22:46 source-contract corrections.
 #
 # Algorithm-STRUCTURE reference (NOT a bitwise target): ReactiveHMC.jl v0.1.0 (781sB @ ca9ea4ca) —
@@ -15,11 +15,11 @@
 #     (result===state, fixed shape/type, 0-B, no RefValue).
 #  RNG is a TYPED RUNTIME arg, NOT sampler state: `rng` is removed from nuts_state sources; `step!(rng;…)`
 #  threads it through every RNG-using sibling/recursive call; `nuts!!` calls `step!(state, rng)`.
-#  RESET/COPY are NAMED RK-VISIBLE strong-updates (NOT opaque restore!/rcopy!): `rcopy!!` is a registered
-#  @kernel owned-copy with visible effect roots; reset! establishes authoritative owned endpoint state via
-#  visible owned copies + INLINE buffer clears + control writes (no unregistered helper). step_f resolves
-#  to the registered leapfrog! token; a non-nothing stats_f must likewise be a registered kernel.
-#  @node(logdet(chol_metric)) preserved.
+#  RESET/COPY use the RK-CORE registered structural strong-update `copy!!(dest, src)` (result===dest) —
+#  NOT opaque restore!/rcopy! and NOT a hand-authored field list. reset! establishes authoritative owned
+#  endpoint state via copy!! + INLINE visible buffer clears + control writes (no unregistered helper).
+#  step_f resolves to the registered leapfrog! token; a non-nothing stats_f must likewise be a registered
+#  kernel (resolver-registered-or-reject at construction). @node(logdet(chol_metric)) preserved.
 #
 #  PINNED STRUCTURAL-COPY OWNERSHIP POLICY (load-bearing for the one-logdet-cut-point + no-extra-gradient
 #  guarantees; `deepcopy(init)` is the STRUCTURAL MARKER for it, not ordinary all-fields deepcopy):
@@ -29,7 +29,7 @@
 #   - OWNED/DISTINCT per endpoint: the registered-integrator-written sources pos, mom, plus their
 #     endpoint-dependent closures/caches pot, dpot_dpos, dkin_dmom, kin, ham, dham_dpos, dham_dmom
 #     (compiler clones writable-source closures — pairwise-distinct owned buffers).
-#   rcopy!! copies EXACTLY the owned set into existing destination buffers; it never touches the shared
+#   copy!! copies EXACTLY the owned set into existing destination buffers; it never touches the shared
 #   metric authority. (Runtime slot-identity/counter gates — shared=one slot, owned pairwise-distinct,
 #   metric mutation recomputes chol/logdet once, pos/mom leaf schedule contains neither — land with lowering.)
 #
@@ -64,6 +64,13 @@ tree(phasepoint) = tree(length(phasepoint.pos))
 # substrate lands.
 example_step_binding(stepsize) = partial(leapfrog!; stepsize = stepsize)
 
+# A REAL parsed construction/binding of the sampler (form A step_f token + registered-or-nothing stats_f):
+# step_f resolves to the registered leapfrog! kernel with a bound stepsize source; a non-nothing stats_f
+# is resolver-registered-or-reject at construction (this TEXT expression is spelling only — hygienic
+# registered identity is proven later by the resolver/MethodIR gate, not by the source-call census).
+example_nuts_binding(init, stepsize; stats_f = nothing) =
+    nuts_state(init; step_f = partial(leapfrog!; stepsize), stats_f)
+
 # ---- euclidean_phasepoint (methodless => stateless) — @node(logdet) PRESERVED ------------------------
 @kernel euclidean_phasepoint(pot_f, grad_f, metric, pos, mom) = begin
     pot = pot_f(pos)
@@ -83,27 +90,26 @@ end
     @. phasepoint.mom -= 0.5 * stepsize * phasepoint.dham_dpos
 end
 
-# ---- rcopy!!: registered RK owned-copy strong-update (replaces opaque rcopy!). COPIES THE COMPLETE OWNED
-# authoritative endpoint snapshot into EXISTING destination buffers (identity preserved, currentness
-# maintained). NEVER copies/rebinds the SHARED metric authority (metric/chol_metric/@node(logdet)/pot_f/
-# grad_f). Owned set = the registered-integrator-written sources (pos, mom) + their endpoint-dependent
-# closures/caches (pot, dpot_dpos, dkin_dmom, kin, ham, dham_dpos, dham_dmom). dham_dpos/dham_dmom are
-# copied explicitly (do not assume they alias dpot_dpos/dkin_dmom unless the compiler proves the slot).
-@kernel rcopy!!(dest, src) = begin
-    @. dest.pos       = src.pos
-    @. dest.mom       = src.mom
-    @. dest.dpot_dpos = src.dpot_dpos
-    @. dest.dkin_dmom = src.dkin_dmom
-    @. dest.dham_dpos = src.dham_dpos
-    @. dest.dham_dmom = src.dham_dmom
-    dest.pot = src.pot
-    dest.kin = src.kin
-    dest.ham = src.ham
-    return dest
-end
+# ---- reset/proposal restore uses the RK-CORE registered structural strong-update `copy!!(dest, src)`
+# (result === dest) — NOT a hand-authored field list (author never enumerates phase-point fields; a
+# field list would drift when the phase-point graph changes). Its EXPLICIT CORE REGISTRATION: copy the
+# COMPLETE OWNED authoritative closure from src into dest's EXISTING buffers, preserve destination
+# identity/currentness, leave SHARED authority slots UNTOUCHED, collapse aliased projections to ONE
+# physical copy, and reject incompatible shape/type/shared-authority identity. The compiler generates the
+# minimal alias-aware copy schedule.
+#
+# EXPECTED OWNERSHIP METADATA (the contract copy!!'s core registration enforces — documented, NOT
+# hand-implemented here; "read-only" is relative to endpoint methods):
+#   SHARED-BY-IDENTITY authority (one slot, untouched by copy!!): pot_f, grad_f, metric, plus the
+#     metric-only closure chol_metric + the @node(logdet(chol_metric)) value. These remain SHARED even
+#     when an OWNER-level adaptation method mutates metric — such a mutation updates the ONE shared
+#     authority and its chol/@node closure EXACTLY ONCE.
+#   OWNED/DISTINCT per endpoint (what copy!! moves): the integrator-written sources pos, mom + their
+#     endpoint-dependent closures/caches pot, dpot_dpos, dkin_dmom, kin, ham, dham_dpos, dham_dmom
+#     (aliased projections collapse to one physical copy). deepcopy(init) is the STRUCTURAL MARKER.
 
 # ---- nuts.jl: nuts_state — FORM B: implicit-field; NO Ref; explicit init/fwd/bwd; two-direct-branch ---
-# direction (concrete endpoint `ep` threaded); runtime rng; visible reset!/rcopy!! strong-updates.
+# direction (concrete endpoint `ep` threaded); runtime rng; visible reset!/copy!! strong-updates.
 # step_f resolves to the registered leapfrog! token (see example_step_binding). stats_f is
 # registered-or-nothing: a non-nothing stats_f MUST be a registered RK kernel (not an opaque runtime
 # Function) so collectstats!(__self__) has a visible registered callback identity.
@@ -126,11 +132,11 @@ end
         may_continue = true
         dham = 0.
         diverged = !(dham >= min_dham)
-        rcopy!!(fwd, init)               # registered owned-copy (visible)
-        rcopy!!(bwd, init)
-        for p in proposals; rcopy!!(p, init); end
+        copy!!(fwd, init)               # registered owned-copy (visible)
+        copy!!(bwd, init)
+        for p in proposals; copy!!(p, init); end
         for t in trees
-            fill!(t.log_weight, -Inf)
+            Base.fill!(t.log_weight, -Inf)
             @. t.bwd.mom = 0
             @. t.bwd.dham_dmom = 0
             @. t.bwd_fwd.mom = 0
@@ -156,7 +162,7 @@ end
             randbernoullilog(rng, logswapprob(trees[depth])) && swapproposal!(__self__, depth)
             may_continue || break
         end
-        rcopy!!(init, proposals[end])                          # registered owned-copy (visible)
+        copy!!(init, proposals[end])                          # registered owned-copy (visible)
     end
     flip!(depth) = if depth > 1
         gofwd = !gofwd
@@ -205,7 +211,7 @@ end
         collectstats!(__self__)
         diverged && return may_continue = false
         trees[1].log_weight[1] = dham
-        rcopy!!(proposals[1], ep)
+        copy!!(proposals[1], ep)
     else
         start!(__self__, ep, depth - 1, rng)
         may_continue || return may_sample = false

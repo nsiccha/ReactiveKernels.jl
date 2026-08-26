@@ -59,10 +59,11 @@ method_named(b, n) = only(filter(m -> methodname(m) === n, b.methods))
 
 blocks = kernel_blocks()
 @testset "A/B/C + 22:46 source-contract gate" begin
-    for k in (:euclidean_phasepoint, :leapfrog!, Symbol("rcopy!!"), :nuts_state, Symbol("nuts!!"),
+    for k in (:euclidean_phasepoint, :leapfrog!, :nuts_state, Symbol("nuts!!"),
               :dual_averaging_state, :welford_var)
         @test haskey(blocks, k)
     end
+    @test !haskey(blocks, Symbol("copy!!"))   # copy!! is the RK-CORE intrinsic — NOT authored in the fixture
 
     # ---- FORM A: leapfrog! RK @kernel, exact 3-line mom/pos/mom -----------------------------------
     lf = blocks[:leapfrog!]; @test :stepsize in formals(lf.sig)
@@ -127,43 +128,52 @@ blocks = kernel_blocks()
     end
     @test !bad_self[]
 
-    # (B-mut) EVERY hot mutating (!-suffixed) callee must have a REGISTERED identity: a registered @kernel
-    #         (rcopy!! / step_f->leapfrog!), a captured nuts_state sibling method, or an allowed visible
-    #         primitive (fill!). Any other !-callee (unregistered ordinary-Julia helper, restore!, rcopy!,
-    #         reset_one_tree!, ...) is REJECTED.
-    registered_kernels = Set(string(k) for k in keys(blocks))
+    # (B-mut) SOURCE-CALL CENSUS (spelling ONLY — NOT a hygienic-registration proof; the resolver/MethodIR
+    #         gate proves captured GlobalRef/Token identity + rejects rebinds). Every hot mutating
+    #         (!-suffixed, non-operator, unqualified) callee must be spelled as an authored @kernel, a
+    #         captured nuts_state sibling, or the RK-CORE strong-update intrinsic copy!!. A QUALIFIED
+    #         primitive (Base.fill!) is a `.`-call, not a bare Symbol, so it is skipped. Any bare
+    #         unqualified !-callee outside those sets (restore!/rcopy!/reset_one_tree!/helper) is rejected.
+    authored_kernels = Set(string(k) for k in keys(blocks))
     sibling_methods = Set(string(methodname(m)) for m in ns.methods)
-    allowed_prims = Set(["fill!"])
+    core_intrinsics = Set(["copy!!"])
     bad_mut = String[]
     for m in ns.methods
         _walk(methodbody(m)) do x
             x isa Expr && x.head === :call && x.args[1] isa Symbol || return
-            f = string(x.args[1]); endswith(f, "!") && f != "!" && f != "!=" || return   # skip the ! / != operators
-            (f in registered_kernels || f in sibling_methods || f in allowed_prims) || push!(bad_mut, f)
+            f = string(x.args[1]); endswith(f, "!") && f != "!" && f != "!=" || return
+            (f in authored_kernels || f in sibling_methods || f in core_intrinsics) || push!(bad_mut, f)
         end
     end
     @test isempty(bad_mut)
-    @test haskey(blocks, Symbol("rcopy!!")) && any(m -> methodname(m) === :reset!, ns.methods)
-    @test occursin("step_f(ep)", nb)          # step_f invoked on a concrete endpoint (registered token)
-    @test !occursin("reset_one_tree!", SRC)   # opaque helper inlined away
+    @test any(m -> methodname(m) === :reset!, ns.methods)
+    @test occursin("step_f(ep)", nb)                         # step_f invoked on a concrete endpoint
+    @test !occursin("reset_one_tree!", SRC)                  # opaque helper inlined away
+    # copy!! is the ONLY reset/proposal-restore path: no authored fieldwise copy, no @kernel copy!!/rcopy!!.
+    @test occursin("copy!!(", nb) && !occursin("@kernel copy!!", SRC) && !occursin("rcopy!!", SRC)
+    @test occursin("Base.fill!", nb)                         # qualified visible primitive for buffer clears
 
-    # (B-own) rcopy!! copies the COMPLETE OWNED set into dest; NEVER the shared metric authority.
-    rc = blocks[Symbol("rcopy!!")]; rc_writes = Set{Symbol}()
-    _walk(rc.body) do x
-        x isa Expr && is_assign(x.head) && x.args[1] isa Expr && x.args[1].head === :. &&
-            x.args[1].args[1] === :dest && x.args[1].args[2] isa QuoteNode && push!(rc_writes, x.args[1].args[2].value)
+    # (B-own) the pinned ownership policy is EXPECTED METADATA (documented, NOT hand-implemented): the
+    #         shared authority + the complete owned set are named in the source.
+    for f in ("pot_f", "grad_f", "metric", "chol_metric"); @test occursin(f, SRC); end       # shared
+    for f in ("pos", "mom", "dpot_dpos", "dkin_dmom", "dham_dpos", "dham_dmom", "pot", "kin", "ham")
+        @test occursin(f, SRC)                                                                # owned
     end
-    @test Set([:pos,:mom,:pot,:dpot_dpos,:dkin_dmom,:kin,:ham,:dham_dpos,:dham_dmom]) ⊆ rc_writes
-    @test isempty(rc_writes ∩ Set([:metric,:chol_metric,:pot_f,:grad_f]))
 
-    # (B-bind) a REAL parsed step_f binding: partial(leapfrog!; stepsize=<source>) — registered identity.
-    bind_ok = Ref(false)
+    # (B-bind) REAL parsed constructor/binding expressions (SPELLING; identity proven later by resolver):
+    #          partial(leapfrog!; stepsize) + nuts_state(init; step_f=..., stats_f).
+    has_step_partial = Ref(false); has_nuts_binding = Ref(false)
     _walk(AST) do x
-        x isa Expr && x.head === :call && x.args[1] === :partial && any(a -> a === :leapfrog!, x.args) &&
-            any(a -> a isa Expr && a.head === :parameters &&
-                     any(p -> p isa Expr && p.head === :kw && p.args[1] === :stepsize, a.args), x.args) && (bind_ok[] = true)
+        x isa Expr && x.head === :call || return
+        if x.args[1] === :partial && any(a -> a === :leapfrog!, x.args) &&
+           any(a -> a isa Expr && a.head === :parameters &&
+                    any(p -> p === :stepsize || (p isa Expr && p.head === :kw && p.args[1] === :stepsize), a.args), x.args)
+            has_step_partial[] = true
+        end
+        x.args[1] === :nuts_state && any(a -> a isa Expr && a.head === :parameters, x.args) && (has_nuts_binding[] = true)
     end
-    @test bind_ok[]
+    @test has_step_partial[]
+    @test has_nuts_binding[]
 
     # (B-noforce) `force` removed from step! (dead after registered reset).
     @test !(:force in formals(methodsig(method_named(ns, :step!))))
@@ -177,7 +187,7 @@ blocks = kernel_blocks()
     @test Set(blocks[:dual_averaging_state].fields) ⊇ Set([:m,:H,:mu,:log_current,:log_final,:current,:final])
     @test Set(blocks[:welford_var].fields) ⊇ Set([:n,:mean,:var])
     println("  (B) no Ref/fwdbwd; explicit init/fwd/bwd; TWO-DIRECT gofwd branches (no endpoint value/")
-    println("      alias/selection-local); rng runtime not state; registered rcopy!!/reset!; implicit fields. OK")
+    println("      alias/selection-local); rng runtime not state; core copy!! / visible reset!; implicit fields. OK")
 
     # ---- FORM C: public @kernel nuts!!(state; rng) threads rng + returns the SAME object ----------
     nb2 = blocks[Symbol("nuts!!")]
@@ -192,8 +202,8 @@ blocks = kernel_blocks()
     has_reactive = Ref(false)
     _walk(AST) do x; x isa Expr && x.head === :macrocall && x.args[1] === Symbol("@reactive") && (has_reactive[] = true); end
     @test !has_reactive[]
-    @test occursin("@kernel leapfrog!", SRC) && occursin("@kernel rcopy!!", SRC) && occursin("@kernel nuts!!", SRC)
-    println("  (@node) preserved; @reactive absent (macro); free @kernel leapfrog!/rcopy!!/nuts!!. OK")
+    @test occursin("@kernel leapfrog!", SRC) && occursin("@kernel nuts!!", SRC)
+    println("  (@node) preserved; @reactive absent (macro); free @kernel leapfrog!/nuts!!; copy!! is core. OK")
 end
 
 # --- NON-VACUOUS lexical-shadowing inventory (nuts_state) --------------------------------------------
