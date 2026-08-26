@@ -244,34 +244,24 @@ end
 function prepare_reactive_target(target)
     initial_position = initial(target)
     timed = @timed begin
-        potential(position) = -LogDensityProblems.logdensity(target, position)
-        function potential_gradient(position)
-            logdensity, gradient =
-                LogDensityProblems.logdensity_and_gradient(target, position)
-            (-logdensity, -gradient)
-        end
-        model = ReactiveKernels.@kernel begin
-            pos::Vector{Float64}
-            mom::Vector{Float64}
-            metric::Matrix{Float64}
-            chol_metric::Cholesky{Float64,Matrix{Float64}} = cholesky(metric)
-            pot::Float64 = potential(pos)
-            (pot, dpot_dpos::Vector{Float64}) = potential_gradient(pos)
-            (kin::Float64, dham_dmom::Vector{Float64}) = begin
-                velocity = chol_metric \ mom
-                (0.5 * (logdet(chol_metric) + dot(mom, velocity)), velocity)
-            end
-            ham::Float64 = pot + kin
-            dham_dpos::Vector{Float64} = dpot_dpos
-            return (pot, dpot_dpos, chol_metric, kin, ham,
-                    dham_dpos, dham_dmom)
+        # Public compiled-reactive boundary: the scalar potential (= -logdensity)
+        # is differentiated by DI+Enzyme (prepared once on the target) into the
+        # sampler's OWNED gradient buffer in place, then negated in place. No
+        # handwritten sampled gradient; RK's own gradient counter is incremented.
+        function potential_gradient!(gradient, position)
+            target.gradient_calls += 1
+            value = first(value_and_gradient!(
+                _logp(target), gradient, target.preparation,
+                BENCHMARK_BACKEND, position))
+            gradient .*= -1
+            -value
         end
         dimension = length(initial_position)
-        ReactiveKernels.euclidean_phasepoint(model, (
-            pos = copy(initial_position),
-            mom = zeros(dimension),
-            metric = Matrix{Float64}(I, dimension, dimension),
-        ))
+        ReactiveKernels.reactive_nuts_group(
+            potential_gradient!,
+            Matrix{Float64}(I, dimension, dimension),
+            copy(initial_position),
+            zeros(dimension))
     end
     (;
         target,
@@ -285,6 +275,7 @@ function run_reactive(context; seed, n_warmup, n_draws, max_depth,
                       target_accept)
     reset_counts!(context.target)
     timed = @timed begin
+        # nuts_state on the flat reactive_nuts_group returns a CompiledNUTSState.
         sampler = ReactiveKernels.nuts_state(
             copy(context.point);
             rng = Xoshiro(seed),
