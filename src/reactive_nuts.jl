@@ -21,11 +21,13 @@
 # `copyto!` deep-copy the buffers and distinct proposals never alias — the property
 # a caller-shared or program-level buffer would violate.
 #
-# The group reuses the tested `ReactivePhasePoint{S,H}` runtime wrapper, so every
-# node is reachable as a property. It is AD-agnostic: `potential_gradient!(gradient,
-# position) -> potential` is the caller-supplied scalar-potential boundary that
-# fills the passed (slot-owned) gradient buffer in place — the DI+Enzyme
-# `value_and_gradient!` is wired in at the call site with no shared caller buffer.
+# The group is authored through the PUBLIC `@reactive` facade (per-construction
+# `specialize=true` + `prepare=_nuts_prepare`), so it is a `ReactiveObject` whose
+# every node is reachable as a property; there is no hand-built Graph. It is
+# AD-agnostic: `potential_gradient!(gradient, position) -> potential` is the
+# caller-supplied scalar-potential boundary that fills the passed (slot-owned)
+# gradient buffer in place — the DI+Enzyme `value_and_gradient!` is wired in at the
+# call site with no shared caller buffer.
 
 const _REACTIVE_NUTS_ENDPOINTS = (:init, :fwd, :bwd)
 const _REACTIVE_NUTS_DEFAULT_MIN_DHAM = -1000.0
@@ -309,13 +311,13 @@ group produced by [`reactive_nuts_group`](@ref). Same public surface as the
 Boundary (honest): the per-transition Hamiltonian work — each endpoint's
 potential/gradient/kinetic/velocity, the active-endpoint selection, the energy
 error `dham`, and the `diverged` flag — is compiled reactive state in the group's
-`ReactiveProgram` ([`reactive_program`](@ref)). The tree-growth recursion, U-turn
-criteria, RNG draws, and proposal swaps are ordinary Julia (as in ca9). This
-struct's own control/diagnostic fields (`go_forward`, `energy_error`, `depth`, …)
-and the trees/proposals are ordinary mutable state, NOT reactive nodes — the
-sampler is not yet a single compiled `ReactiveProgram`. Compiling the remaining
-adaptation/statistics fields and authoring the group through the public
-`@reactive` surface are tracked as follow-up work.
+`ReactiveProgram` ([`reactive_program`](@ref)), which is now authored through the
+public `@reactive` facade ([`reactive_nuts_group`](@ref)). The tree-growth
+recursion, U-turn criteria, RNG draws, and proposal swaps are ordinary Julia (as in
+ca9). This struct's own control/diagnostic fields (`go_forward`, `energy_error`,
+`depth`, …) and the trees/proposals are still ordinary mutable state; moving the
+dependency-bearing control/diagnostic + adaptation/statistics fields onto public
+reactive handles is tracked as GAP-1 follow-up work.
 """
 const _REACTIVE_NUTS_REQUIRED_HANDLES = (
     :gofwd, :chol_metric, :dham, :diverged, :active_ham,
@@ -702,3 +704,84 @@ end
 _is_reactive_nuts_group(point::_NUTSGroup) =
     all(name -> name in keys(getfield(point, :handles)),
         (:gofwd, :min_dham, :init_pos, :fwd_pos, :bwd_pos, :dham))
+
+# ---------------------------------------------------------------------------
+# GAP-1 — reactive step-size adaptation authored through the public @reactive
+# facade (no ordinary mutable shadow struct). ca9's design: the dual-averaging
+# accumulators are the object's mutable HAVE sources, the current / final step
+# sizes are compiled reactive DERIVED nodes, and `fit!` is an ordinary method that
+# mutates the accumulator sources while READING the reactive `log_current`.
+# `specialize=true` makes it generic over the step-size precision (Float32/Float64)
+# with concrete slots; the numeric recurrence is byte-identical to ReactiveHMC's.
+# ---------------------------------------------------------------------------
+
+@reactive specialize=true _dual_averaging_object(
+        iteration, error, log_final, center,
+        target, regularization_scale, relaxation_exponent, offset) = begin
+    log_current::typeof(center) =
+        center - sqrt(iteration) / regularization_scale * error
+    current::typeof(center) = exp(log_current)
+    final::typeof(center) = exp(log_final)
+    fit!(acceptance_rate) = begin
+        new_iteration = iteration + 1
+        new_error = error +
+            (target - acceptance_rate - error) / (new_iteration + offset)
+        iteration = new_iteration
+        error = new_error
+        weight = new_iteration^(-relaxation_exponent)
+        # Reads the reactive `log_current` (recomputed from the just-mutated
+        # iteration/error sources), then advances the running-average source.
+        log_final = log_final + weight * (log_current - log_final)
+        __self__
+    end
+end
+
+"""
+    DualAveragingState
+
+Public nominal type for the reactive Nesterov dual-averaging step-size adaptation.
+A THIN wrapper around the compiled-reactive `@reactive` object that holds ALL
+dependency-bearing state; it adds no authoritative fields of its own and forwards
+property reads (`state.current`, `state.final`, `state.iteration`, …) and
+[`fit!`](@ref) to the wrapped reactive object.
+"""
+struct DualAveragingState{O}
+    object::O
+end
+
+@inline Base.getproperty(state::DualAveragingState, name::Symbol) =
+    name === :object ? getfield(state, :object) :
+    getproperty(getfield(state, :object), name)
+# The old DualAveragingState was mutable: forward public field assignment to the
+# wrapped reactive object (mutating a HAVE source invalidates the derived
+# current/final), returning the assigned value for Julia assignment semantics.
+@inline Base.setproperty!(state::DualAveragingState, name::Symbol, value) =
+    setproperty!(getfield(state, :object), name, value)
+Base.propertynames(state::DualAveragingState, private::Bool = false) =
+    propertynames(getfield(state, :object), private)
+
+"Advance the reactive dual-averaging accumulators by one acceptance observation."
+function fit!(state::DualAveragingState, acceptance_rate)
+    fit!(getfield(state, :object), acceptance_rate)
+    state
+end
+
+"""
+    dual_averaging_state(initial; target=0.8, regularization_scale=0.05,
+                         relaxation_exponent=0.75, offset=10)
+
+Build the reactive Nesterov dual-averaging step-size adaptation
+([`DualAveragingState`](@ref)). `state.current` and `state.final` are compiled
+reactive derived step sizes; [`fit!`](@ref)`(state, acceptance_rate)` advances the
+accumulators. Generic over the step-size precision; byte-identical to the
+ReactiveHMC recurrence.
+"""
+function dual_averaging_state(initial; target = 0.8,
+                              regularization_scale = 0.05,
+                              relaxation_exponent = 0.75, offset = 10)
+    T = typeof(float(initial))
+    DualAveragingState(_dual_averaging_object(
+        one(T), zero(T), zero(T), log(T(10)) + log(T(initial)),
+        T(target), T(regularization_scale),
+        T(relaxation_exponent), T(offset)))
+end

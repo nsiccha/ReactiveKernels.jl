@@ -753,50 +753,11 @@ function sample!(state::AbstractNUTSState, draws::Integer;
 end
 
 "Mutable Nesterov dual-averaging state matching ReactiveHMC's adaptation rule."
-mutable struct DualAveragingState{T}
-    target::T
-    regularization_scale::T
-    relaxation_exponent::T
-    offset::T
-    iteration::T
-    error::T
-    center::T
-    log_current::T
-    log_final::T
-    current::T
-    final::T
-end
-
-function dual_averaging_state(initial;
-                              target = 0.8,
-                              regularization_scale = 0.05,
-                              relaxation_exponent = 0.75,
-                              offset = 10)
-    T = typeof(float(initial))
-    iteration = one(T)
-    error = zero(T)
-    center = log(T(10)) + log(T(initial))
-    log_current = center
-    log_final = zero(T)
-    DualAveragingState(
-        T(target), T(regularization_scale), T(relaxation_exponent), T(offset),
-        iteration, error, center, log_current, log_final,
-        exp(log_current), exp(log_final),
-    )
-end
-
-function fit!(state::DualAveragingState, acceptance_rate)
-    state.iteration += 1
-    state.error += (state.target - acceptance_rate - state.error) /
-                   (state.iteration + state.offset)
-    state.log_current = state.center -
-        sqrt(state.iteration) / state.regularization_scale * state.error
-    weight = state.iteration^(-state.relaxation_exponent)
-    state.log_final += weight * (state.log_current - state.log_final)
-    state.current = exp(state.log_current)
-    state.final = exp(state.log_final)
-    state
-end
+# The Nesterov dual-averaging step-size adaptation is a public compiled-reactive
+# object authored through `@reactive specialize=true` — see
+# `src/reactive_nuts.jl` (`dual_averaging_state`, `fit!`). Its accumulators are
+# mutable HAVE sources and the current/final step sizes are reactive derived nodes,
+# generic over the step-size precision; there is no ordinary mutable shadow struct.
 
 "Online componentwise variance estimate using ReactiveHMC's Welford update."
 mutable struct WelfordVariance{T,V}
