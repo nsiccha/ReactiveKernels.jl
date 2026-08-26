@@ -128,6 +128,20 @@ end
         @test prepare(selected)(identity, 3) == 3
         @test prepare(selected; want = :out)(identity, 3) == 6
 
+        # A recipe whose whole RHS is a bare dotted-operator broadcast between
+        # two ports (`a .* b`) must lower to a closure, not the bare `.*`
+        # symbol as a callee: `.*` is broadcast syntax, not a bound function,
+        # so a bare-callee lowering fails at construction with
+        # `UndefVarError: .* not defined`.
+        @kernel broadcast_mul(a, b) = begin scaled = a .* b end
+        @test prepare(broadcast_mul)([1.0, 2.0], 2.0) == [2.0, 4.0]
+        @kernel broadcast_add(a, b) = begin summed = a .+ b end
+        @test prepare(broadcast_add)([1.0, 2.0], [10.0, 20.0]) == [11.0, 22.0]
+        # A genuine bound infix operator between two ports (`+`) still takes the
+        # bare-callee hot path unchanged.
+        @kernel bound_add(a, b) = begin summed = a + b end
+        @test prepare(bound_add)(1.0, 2.0) == 3.0
+
         @test_throws ArgumentError macroexpand(@__MODULE__, quote
             @kernel repeated(x, x) = begin
                 y = x + 1
