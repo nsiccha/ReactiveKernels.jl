@@ -120,6 +120,35 @@ function setup_poisson_gamma!(mod::Module)
     nothing
 end
 
+function setup_dugongs!(mod::Module)
+    if !isdefined(mod, :DugongsGrowthExample)
+        Base.include(mod, joinpath(@__DIR__, "..", "examples", "dugongs_growth.jl"))
+    end
+    Core.eval(mod, :(using .DugongsGrowthExample:
+        DugongsParameters, UnconstrainedParameters, RealVector,
+        DUGONGS_AGE, DUGONGS_LENGTH))
+    nothing
+end
+
+function setup_arma11!(mod::Module)
+    if !isdefined(mod, :ARMA11Example)
+        Base.include(mod, joinpath(@__DIR__, "..", "examples", "arma11.jl"))
+    end
+    Core.eval(mod, :(using .ARMA11Example:
+        ARMAParameters, UnconstrainedParameters, RealVector, ARMA_SERIES))
+    nothing
+end
+
+function setup_gaussian_mixture!(mod::Module)
+    if !isdefined(mod, :GaussianMixtureExample)
+        Base.include(mod, joinpath(@__DIR__, "..", "examples", "gaussian_mixture.jl"))
+    end
+    Core.eval(mod, :(using .GaussianMixtureExample:
+        MixtureParameters, UnconstrainedParameters, RealVector,
+        MIXTURE_OBSERVATIONS))
+    nothing
+end
+
 function setup_online_stats!(mod::Module)
     if !isdefined(mod, :OnlineStatsExample)
         Base.include(mod, joinpath(@__DIR__, "..", "examples", "online_stats.jl"))
