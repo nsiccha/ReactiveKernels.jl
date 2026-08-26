@@ -243,33 +243,86 @@ _kernel_snapshot_port_names(snap::_ChildSnapshot) = snap.port_order
 # it back only by THAWING a FRESH mutable `Expr` copy per call, so a caller that
 # mutates the returned AST can never reach the stored source (nor a second reader).
 
-# A frozen `Expr`: an immutable struct whose children are a Tuple (never a Vector)
-# of frozen nodes / immutable leaves.
+# Frozen wrappers, so NO mutable object survives in the stored form:
+#   `Expr`      → `_FrozenExpr(head, Tuple of frozen args)`
+#   `QuoteNode` → `_FrozenQuoteNode(frozen value)`  (its value may wrap an `Expr`)
+#   `Vector`    → `_FrozenVector(Tuple of frozen elems)`
+#   `Dict`      → `_FrozenDict(Tuple of frozen `key => value` pairs)`
+# Each is an immutable `struct` whose children are `Tuple`s (never a `Vector`) of
+# frozen nodes / immutable leaves.
 struct _FrozenExpr
     head::Symbol
     args::Tuple
 end
-# A frozen `QuoteNode` (its `value` may itself wrap an `Expr`, so freeze that too).
 struct _FrozenQuoteNode
     value::Any
 end
+struct _FrozenVector
+    elems::Tuple
+end
+struct _FrozenDict
+    pairs::Tuple             # Tuple of `Pair{frozen-key, frozen-value}`
+end
 
-# Freeze source AST → frozen form. `Expr`/`QuoteNode` recurse; every other node is an
-# immutable leaf (`Symbol`, numeric/string/char/bool literal, `LineNumberNode`, …) and
-# is kept as-is. Source ASTs never contain a bare `Vector`/`Dict` (those appear only
-# post-evaluation), so no lossy container coercion is needed.
+# Freeze source AST → frozen form. `Expr`/`QuoteNode` and the mutable containers
+# `Vector`/`Dict` are wrapped; the immutable COMPOSITES `Tuple`/`NamedTuple`/`Pair`
+# keep their own type but with every element frozen (an immutable `Tuple` can still
+# hide a mutable `Vector`, so it MUST recurse). An immutable SCALAR leaf (`Symbol`,
+# numeric/string/char/bool literal, `LineNumberNode`, an immutable struct, …) is
+# retained as-is — it cannot be mutated. Any OTHER mutable leaf (a `Set`, a
+# `mutable struct`, a `Matrix`, …) is REJECTED with an actionable error rather than
+# silently retained, so the guarantee "no mutable object survives" holds for ANY
+# input, not only for authored recipe source (which never contains a bare container).
 _kernel_freeze_ast(x::Expr) =
     _FrozenExpr(x.head, Tuple(_kernel_freeze_ast(a) for a in x.args))
 _kernel_freeze_ast(x::QuoteNode) = _FrozenQuoteNode(_kernel_freeze_ast(x.value))
-_kernel_freeze_ast(x) = x
+_kernel_freeze_ast(x::Vector) = _FrozenVector(Tuple(_kernel_freeze_ast(e) for e in x))
+_kernel_freeze_ast(x::AbstractDict) =
+    _FrozenDict(Tuple(_kernel_freeze_ast(k) => _kernel_freeze_ast(v) for (k, v) in x))
+_kernel_freeze_ast(x::Tuple) = map(_kernel_freeze_ast, x)
+_kernel_freeze_ast(x::NamedTuple) = NamedTuple{keys(x)}(map(_kernel_freeze_ast, values(x)))
+_kernel_freeze_ast(x::Pair) = _kernel_freeze_ast(x.first) => _kernel_freeze_ast(x.second)
+# `Symbol` is `ismutable`-true in Julia's type system but is an interned, un-mutatable
+# atom (0 fields, no `setfield!`), so it is a safe immutable leaf — retain it, ahead of
+# the catch-all below.
+_kernel_freeze_ast(x::Symbol) = x
+# Any other leaf is retained ONLY if it has NO reachable mutable state; otherwise it is
+# REJECTED, never silently retained. `ismutable` alone is insufficient: a `Set` is an
+# IMMUTABLE struct wrapping a mutable `Dict`, so the check must recurse into fields.
+function _kernel_freeze_ast(x)
+    _kernel_leaf_deeply_immutable(x) && return x
+    throw(ArgumentError(
+        "cannot freeze recipe-source AST: unsupported leaf of type $(typeof(x)) with " *
+        "reachable mutable state. Recipe source may contain only ASTs (`Expr`/`QuoteNode`), " *
+        "deeply-immutable literals, and `Vector`/`Dict`/`Tuple`/`NamedTuple`/`Pair` of them."))
+end
 
-# Thaw frozen form → a FRESH mutable AST. Each call rebuilds new `Expr` (fresh `args`
-# `Vector`) nodes, so the result shares no mutable structure with the stored frozen
-# value or with any previously thawed copy. Immutable leaves are returned as-is (a
-# `Symbol`/literal cannot be mutated, so sharing it is safe).
+# True iff `x` has NO reachable mutable state: an `isbits` value, an interned `Symbol` /
+# immutable `AbstractString`, or an immutable struct whose every field is deeply
+# immutable. A mutable object (`Array`/`Dict`), or an immutable struct WRAPPING one
+# (`Set`, whose backing `Dict` is mutable), is NOT. Immutable structs cannot form
+# cycles, so the recursion terminates.
+_kernel_leaf_deeply_immutable(::Symbol) = true
+_kernel_leaf_deeply_immutable(::AbstractString) = true
+function _kernel_leaf_deeply_immutable(x)
+    isbits(x) && return true
+    ismutable(x) && return false
+    return all(i -> _kernel_leaf_deeply_immutable(getfield(x, i)), 1:nfields(x))
+end
+
+# Thaw frozen form → a FRESH mutable AST. Each call rebuilds new `Expr`/`Vector`/`Dict`
+# nodes, so the result shares no mutable structure with the stored frozen value or with
+# any previously thawed copy. Immutable leaves are returned as-is (a `Symbol`/literal
+# cannot be mutated, so sharing it is safe).
 _kernel_thaw_ast(x::_FrozenExpr) =
     Expr(x.head, Any[_kernel_thaw_ast(a) for a in x.args]...)
 _kernel_thaw_ast(x::_FrozenQuoteNode) = QuoteNode(_kernel_thaw_ast(x.value))
+_kernel_thaw_ast(x::_FrozenVector) = Any[_kernel_thaw_ast(e) for e in x.elems]
+_kernel_thaw_ast(x::_FrozenDict) =
+    Dict(_kernel_thaw_ast(p.first) => _kernel_thaw_ast(p.second) for p in x.pairs)
+_kernel_thaw_ast(x::Tuple) = map(_kernel_thaw_ast, x)
+_kernel_thaw_ast(x::NamedTuple) = NamedTuple{keys(x)}(map(_kernel_thaw_ast, values(x)))
+_kernel_thaw_ast(x::Pair) = _kernel_thaw_ast(x.first) => _kernel_thaw_ast(x.second)
 _kernel_thaw_ast(x) = x
 
 # --- (3)+(2) stateful expansion (skeleton) ----------------------------------

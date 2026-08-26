@@ -10,15 +10,35 @@
 
 const RKS = ReactiveKernels
 
-# True iff `x` (a frozen recipe-source value) contains NO mutable AST container —
-# no `Expr`, `Vector`, or `Dict` anywhere in its structure.
-_no_mutable_ast(::Expr) = false
-_no_mutable_ast(::AbstractVector) = false
-_no_mutable_ast(::AbstractDict) = false
-_no_mutable_ast(x::RKS._FrozenExpr) = all(_no_mutable_ast, x.args)
-_no_mutable_ast(x::RKS._FrozenQuoteNode) = _no_mutable_ast(x.value)
-_no_mutable_ast(x::Tuple) = all(_no_mutable_ast, x)
-_no_mutable_ast(::Any) = true
+# GENERIC soundness assertion: every reachable node in a frozen recipe-source value
+# is either a frozen wrapper / immutable composite (recursed) or an immutable leaf —
+# i.e. NO mutable object of ANY kind (`Expr`, `Vector`, `Dict`, `Set`, a mutable
+# struct, …) survives. The terminal check is `!ismutable`, so it is not tied to the
+# specific container types this fixture happens to use.
+_frozen_all_immutable(x::RKS._FrozenExpr) = all(_frozen_all_immutable, x.args)
+_frozen_all_immutable(x::RKS._FrozenQuoteNode) = _frozen_all_immutable(x.value)
+_frozen_all_immutable(x::RKS._FrozenVector) = all(_frozen_all_immutable, x.elems)
+_frozen_all_immutable(x::RKS._FrozenDict) =
+    all(p -> _frozen_all_immutable(p.first) && _frozen_all_immutable(p.second), x.pairs)
+_frozen_all_immutable(x::Tuple) = all(_frozen_all_immutable, x)
+_frozen_all_immutable(x::NamedTuple) = all(_frozen_all_immutable, values(x))
+_frozen_all_immutable(x::Pair) =
+    _frozen_all_immutable(x.first) && _frozen_all_immutable(x.second)
+_frozen_all_immutable(::Symbol) = true   # interned atom: ismutable-true but un-mutatable
+_frozen_all_immutable(::AbstractString) = true
+# generic reachable-mutability check, independent of the freezer: recurse into an
+# immutable struct's fields too, so a hidden Set/Dict (immutable wrapper of mutable
+# state) is still caught, not only a bare Expr/Vector/Dict.
+function _frozen_all_immutable(x)
+    isbits(x) && return true
+    ismutable(x) && return false
+    return all(i -> _frozen_all_immutable(getfield(x, i)), 1:nfields(x))
+end
+
+# A mutable leaf the freezer must REJECT (never silently retain).
+mutable struct _AdvMutableLeaf
+    v::Int
+end
 
 # --- top-level stateful fixtures (method-bearing ⇒ const ⇒ top-level only) ---
 @kernel StatefulObjFixture(ham, pos, mom) = begin
@@ -242,7 +262,7 @@ end
         # (gate 5) NO Expr / Vector / Dict lives in the stored frozen form.
         stored = getfield(skel, :recipe_source)
         @test stored isa Tuple
-        @test _no_mutable_ast(stored)
+        @test _frozen_all_immutable(stored)
         @test all(n -> n isa RKS._FrozenExpr, stored)
 
         # definition module retained for hygienic resolution of the captured names.
@@ -255,7 +275,7 @@ end
                     :(y = f(:sym, x[i], a ? b : c)))
             fr = RKS._kernel_freeze_ast(src)
             @test fr isa RKS._FrozenExpr
-            @test _no_mutable_ast(fr)                      # (gate 5) exact structure
+            @test _frozen_all_immutable(fr)                      # (gate 5) exact structure
             thawed = RKS._kernel_thaw_ast(fr)
             @test thawed == src && thawed !== src          # (gate 2) round-trip, fresh
         end
@@ -269,8 +289,41 @@ end
         # a QuoteNode wrapping an Expr is frozen too — no raw Expr survives (gate 5).
         qn = Expr(:(=), :x, QuoteNode(Expr(:call, :+, :a, :b)))
         frq = RKS._kernel_freeze_ast(qn)
-        @test _no_mutable_ast(frq)
+        @test _frozen_all_immutable(frq)
         @test RKS._kernel_thaw_ast(frq) == qn
+    end
+
+    @testset "freeze soundness: mutable containers round-trip, others reject" begin
+        # (gate 5, generic) raw / QuoteNode-nested Vector+Dict and a Tuple-containing-
+        # mutable all freeze so NO mutable object survives, and thaw a FRESH exact copy.
+        for src in (Expr(:call, :f, [1, 2, 3]),                    # raw Vector leaf
+                    Expr(:call, :g, Dict(:a => 1, :b => 2)),       # raw Dict leaf
+                    Expr(:(=), :x, QuoteNode([1, 2])),             # QuoteNode-nested Vector
+                    Expr(:(=), :y, QuoteNode(Dict(1 => 2))),       # QuoteNode-nested Dict
+                    Expr(:call, :h, (1, [2, 3], Dict(:k => 4))),   # Tuple hiding mutables
+                    Expr(:call, :k, (a = 1, b = [2, 3])),          # NamedTuple hiding a Vector
+                    Expr(:call, :m, :p => Dict(1 => 2)))           # Pair hiding a Dict
+            fr = RKS._kernel_freeze_ast(src)
+            @test _frozen_all_immutable(fr)                        # no mutable object survives
+            thawed = RKS._kernel_thaw_ast(fr)
+            @test thawed == src && thawed !== src                  # exact fresh round-trip
+        end
+
+        # a thawed container is fully detached — mutating it can't reach the frozen store.
+        fr = RKS._kernel_freeze_ast(Expr(:call, :f, [1, 2, 3]))
+        t = RKS._kernel_thaw_ast(fr)
+        push!(t.args[2], 99)                                       # mutate the thawed Vector
+        @test RKS._kernel_thaw_ast(fr) == Expr(:call, :f, [1, 2, 3])
+
+        # an UNSUPPORTED mutable leaf is REJECTED, not silently retained — bare, and
+        # nested inside a QuoteNode or a Tuple.
+        @test_throws ArgumentError RKS._kernel_freeze_ast(Expr(:call, :f, Set([1, 2])))
+        @test_throws ArgumentError RKS._kernel_freeze_ast(Expr(:call, :f, _AdvMutableLeaf(1)))
+        @test_throws ArgumentError RKS._kernel_freeze_ast(QuoteNode(Set([1])))
+        @test_throws ArgumentError RKS._kernel_freeze_ast(Expr(:call, :f, (1, Set([2]))))
+
+        # generic assertion on the REAL captured fixture: no mutable object in the store.
+        @test _frozen_all_immutable(getfield(StatefulRecipeSrcFixture, :recipe_source))
     end
 
     @testset "(4) short/long detection on the plain fixture" begin
