@@ -62,3 +62,38 @@ end
     @test (m.target = 0.7) == 0.7                    # Julia assignment return semantics
     @test :target in propertynames(m, true)
 end
+
+@testset "reactive Welford — nominal wrapper, parity, matrix, F32/F64, ownership" begin
+    w = welford_var(2)
+    @test w isa WelfordVariance
+    step!(w, [1.0, 2.0]); step!(w, [2.0, 4.0]); step!(w, [3.0, 6.0])
+    @test w.mean == [2.0, 4.0]
+    @test w.var ≈ [2 / 3, 8 / 3]
+    @test w.n == 3
+
+    # matrix step! == column-wise folding.
+    wm = welford_var(2); step!(wm, [1.0 2.0 3.0; 2.0 4.0 6.0])
+    @test wm.mean == w.mean && wm.var ≈ w.var
+
+    # Generic over precision.
+    w32 = welford_var(2, Float32); step!(w32, Float32[1, 2]); step!(w32, Float32[3, 4])
+    @test eltype(w32.var) === Float32 && eltype(w32.mean) === Float32
+    @test w32.n isa Float32
+
+    # Concrete inference of the exposed accumulator arrays.
+    @test (@inferred((e -> e.var)(w)))::Vector{Float64} == w.var
+
+    # Clone ownership: copying the underlying reactive object detaches state.
+    clone = WelfordVariance(copy(w.object))
+    step!(clone, [10.0, 10.0])
+    @test w.var ≈ [2 / 3, 8 / 3]     # source estimate unaffected
+    @test w.n == 3
+
+    # Warmed step! mutates mean/var in place — allocation-free.
+    ww = welford_var(2); v = [1.0, 2.0]
+    _wcyc!(e, x, n) = (for _ in 1:n; step!(e, x); end)
+    _wcyc!(ww, v, 2)
+    bytes = @allocated _wcyc!(ww, v, 1000)
+    println("REACTIVE_WELFORD_STEP_ALLOC_BYTES\t", bytes)
+    @test bytes == 0
+end

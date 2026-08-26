@@ -785,3 +785,64 @@ function dual_averaging_state(initial; target = 0.8,
         T(target), T(regularization_scale),
         T(relaxation_exponent), T(offset)))
 end
+
+# ---------------------------------------------------------------------------
+# GAP-1b — reactive online Welford variance authored through @reactive
+# specialize=true. n/mean/var live ONLY in the reactive object's mutable HAVE
+# sources; the `step!` method mutates the mean/var arrays IN PLACE (through the
+# facade's dotted-assignment => mutate! path) so invalidation/ownership stay sound.
+# `WelfordVariance` stays a public nominal wrapper type, generic over precision.
+# ---------------------------------------------------------------------------
+
+@reactive specialize=true _welford_object(n, mean, var) = begin
+    step!(value; weight = 1) = begin
+        n = n + weight
+        fraction = weight / n
+        @. var = _smooth(var,
+                         (value - _smooth(mean, value, fraction)) * (value - mean),
+                         fraction)
+        @. mean = _smooth(mean, value, fraction)
+        __self__
+    end
+end
+
+"""
+    WelfordVariance
+
+Public nominal type for the reactive online componentwise variance estimate — a
+THIN wrapper over the compiled-reactive `@reactive` object that holds ALL
+dependency-bearing `n`/`mean`/`var` state; it adds no authoritative fields and
+forwards property reads/writes and [`step!`](@ref) to the wrapped object.
+"""
+struct WelfordVariance{O}
+    object::O
+end
+
+@inline Base.getproperty(estimate::WelfordVariance, name::Symbol) =
+    name === :object ? getfield(estimate, :object) :
+    getproperty(getfield(estimate, :object), name)
+@inline Base.setproperty!(estimate::WelfordVariance, name::Symbol, value) =
+    setproperty!(getfield(estimate, :object), name, value)
+Base.propertynames(estimate::WelfordVariance, private::Bool = false) =
+    propertynames(getfield(estimate, :object), private)
+
+"""
+    welford_var(dimension, T=Float64)
+
+Build the reactive online Welford variance estimator ([`WelfordVariance`](@ref))
+over `dimension` components with scalar element type `T`.
+"""
+welford_var(dimension::Integer, ::Type{T} = Float64) where {T} =
+    WelfordVariance(_welford_object(
+        zero(T), zeros(T, dimension), zeros(T, dimension)))
+
+"Fold one observation vector into the reactive Welford estimate (in place)."
+step!(estimate::WelfordVariance, value::AbstractVector; weight = 1) =
+    (step!(getfield(estimate, :object), value; weight = weight); estimate)
+"Fold each column of a matrix into the reactive Welford estimate."
+function step!(estimate::WelfordVariance, values::AbstractMatrix; kwargs...)
+    for value in eachcol(values)
+        step!(estimate, value; kwargs...)
+    end
+    estimate
+end

@@ -760,35 +760,13 @@ end
 # generic over the step-size precision; there is no ordinary mutable shadow struct.
 
 "Online componentwise variance estimate using ReactiveHMC's Welford update."
-mutable struct WelfordVariance{T,V}
-    n::T
-    mean::V
-    var::V
-end
-
-welford_var(dimension::Integer, ::Type{T} = Float64) where {T} =
-    WelfordVariance(zero(T), zeros(T, dimension), zeros(T, dimension))
-
 _smooth(previous, new, weight) = (1 - weight) * previous + weight * new
 
-function step!(state::WelfordVariance, value::AbstractVector; weight = 1)
-    state.n += weight
-    fraction = weight / state.n
-    @. state.var = _smooth(
-        state.var,
-        (value - _smooth(state.mean, value, fraction)) * (value - state.mean),
-        fraction,
-    )
-    @. state.mean = _smooth(state.mean, value, fraction)
-    state
-end
-
-function step!(state::WelfordVariance, values::AbstractMatrix; kwargs...)
-    for value in eachcol(values)
-        step!(state, value; kwargs...)
-    end
-    state
-end
+# The online Welford variance estimate is a public compiled-reactive object
+# authored through `@reactive specialize=true` — see `src/reactive_nuts.jl`
+# (`WelfordVariance`, `welford_var`). Its n/mean/var accumulators are the reactive
+# object's mutable HAVE sources; `step!` mutates them in place. There is no ordinary
+# mutable shadow struct.
 
 function _with_stepsize(f::PartialFunction, stepsize)
     current = getproperty(f, :stepsize)
@@ -890,7 +868,7 @@ function _warmup_window_ends(iterations::Int, initial_buffer::Int,
 end
 
 function _adapted_diagonal_metric(current_metric,
-                                  estimate::WelfordVariance;
+                                  estimate;
                                   minimum_variance,
                                   regularization = 5)
     weight = estimate.n / (estimate.n + regularization)
