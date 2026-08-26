@@ -47,7 +47,7 @@ export prepare_reactive, prepare_reactive_nonallocating, statevalue, touch!, mut
 export ReactiveObject, @reactive
 # Reactive HMC/NUTS layer
 export ReactivePhasePoint, euclidean_phasepoint, riemannian_phasepoint
-export reactive_nuts_group
+export reactive_nuts_group, compiled_nuts_state, CompiledNUTSState
 export leapfrog!, generalized_leapfrog!, implicit_midpoint!, multistep
 export PartialFunction, partial, NUTSState, NUTSDiagnostics, nuts_state, step!
 export refresh_momentum!, diagnostics, sample!, reactive_program

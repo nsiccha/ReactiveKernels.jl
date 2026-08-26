@@ -236,3 +236,389 @@ function reactive_nuts_group(potential_gradient!, metric, position, momentum;
     values = NamedTuple{handle_names}(handle_ports)
     _phasepoint(program, state, values)
 end
+
+# ---------------------------------------------------------------------------
+# CompiledNUTSState — the ca9 multinomial NUTS transition running on the flat
+# compiled-reactive group. The tree-growth / U-turn / proposal / statistics
+# orchestration mirrors the ordinary-Julia `NUTSState` oracle
+# (src/hmc.jl:424-735) line-for-line, but every phase-point read/write is routed
+# through the ONE flat group's handles: `init`, and the two moving endpoints
+# `fwd`/`bwd` selected by the reactive `gofwd` source. The energy error `dham` and
+# `diverged` are read from the group's reactive nodes (init_ham - active_ham),
+# never hand-computed. Recursion, loops, RNG draws and proposal swaps stay
+# ordinary inferred Julia, exactly as in ca9. `NUTSState` is retained unchanged as
+# the parity oracle.
+# ---------------------------------------------------------------------------
+
+# One proposal is an ordinary owned (pos, mom) snapshot; swaps are plain vector
+# element swaps and the accepted sample is `proposals[end].pos`.
+mutable struct _NUTSProposal{V<:AbstractVector}
+    pos::V
+    mom::V
+end
+_nuts_proposal(pos, mom) = _NUTSProposal(copy(pos), copy(mom))
+
+mutable struct CompiledNUTSState{R,G,F,S,T,TR,PR}
+    rng::R
+    group::G                 # the flat compiled-reactive phase-point group
+    step_f::F
+    stats_f::S
+    max_depth::Int
+    min_energy_error::T
+    trees::TR
+    proposals::PR
+    go_forward::Bool
+    may_sample::Bool
+    may_continue::Bool
+    energy_error::T
+    diverged::Bool
+    depth::Int
+    n_steps::Int
+    acceptance_sum::T
+end
+
+# Expose ca9-style property names over the group so the compiled state reads like
+# the reference object (`state.dham`, `state.gofwd`, `state.init.pos`, ...).
+function Base.getproperty(state::CompiledNUTSState, name::Symbol)
+    name === :dham && return getfield(state, :energy_error)
+    name === :gofwd && return getfield(state, :go_forward)
+    name === :init && return getfield(state, :group)
+    getfield(state, name)
+end
+
+reactive_program(state::CompiledNUTSState) = state.group.state.program
+
+"""
+    compiled_nuts_state(init::ReactivePhasePoint; rng, step_f, stats_f=nothing,
+                        max_depth=10, min_dham=-1000.0)
+
+Build the compiled-reactive multinomial NUTS transition from a flat phase-point
+group produced by [`reactive_nuts_group`](@ref). Same public surface as the
+[`NUTSState`](@ref) oracle — [`step!`](@ref), [`sample!`](@ref),
+[`refresh_momentum!`](@ref), [`diagnostics`](@ref) — with the sampler state living
+in one compiled `ReactiveProgram`.
+"""
+const _REACTIVE_NUTS_REQUIRED_HANDLES = (
+    :gofwd, :chol_metric, :dham, :diverged, :active_ham,
+    :init_pos, :init_mom, :init_ham, :init_dpot_dpos, :init_dham_dmom,
+    :fwd_pos, :fwd_mom, :fwd_ham, :fwd_dpot_dpos, :fwd_dham_dmom,
+    :bwd_pos, :bwd_mom, :bwd_ham, :bwd_dpot_dpos, :bwd_dham_dmom,
+)
+
+function compiled_nuts_state(group::ReactivePhasePoint; rng, step_f,
+                             stats_f = nothing, max_depth::Integer = 10,
+                             min_dham = -1000.0)
+    max_depth >= 1 || throw(ArgumentError("max_depth must be positive"))
+    handle_names = keys(getfield(group, :handles))
+    all(name -> name in handle_names, _REACTIVE_NUTS_REQUIRED_HANDLES) ||
+        throw(ArgumentError(
+            "compiled_nuts_state requires a flat phase-point group from " *
+            "reactive_nuts_group; got a ReactivePhasePoint without the " *
+            "init/fwd/bwd + gofwd/dham handles"))
+    prototype = group.init_mom
+    scalar = typeof(float(group.init_ham - group.init_ham))
+    trees = [_nuts_tree((; mom = prototype)) for _ in 1:(max_depth + 1)]
+    proposals = [_nuts_proposal(group.init_pos, group.init_mom)
+                 for _ in 1:(max_depth + 2)]
+    CompiledNUTSState(
+        rng, group, step_f, stats_f, Int(max_depth),
+        convert(scalar, min_dham), trees, proposals,
+        true, true, true, zero(scalar), false, 0, 0, zero(scalar),
+    )
+end
+
+# --- Type-stable endpoint access over the flat group (branch on go_forward). ---
+# fwd/bwd are the two moving endpoints; `go_forward` selects which is "forward".
+@inline _cn_fwd_mom(state) = state.go_forward ? state.group.fwd_mom : state.group.bwd_mom
+@inline _cn_fwd_vel(state) = state.go_forward ? state.group.fwd_dham_dmom : state.group.bwd_dham_dmom
+@inline _cn_fwd_ham(state) = state.go_forward ? state.group.fwd_ham : state.group.bwd_ham
+@inline _cn_fwd_pos(state) = state.go_forward ? state.group.fwd_pos : state.group.bwd_pos
+@inline _cn_bwd_mom(state) = state.go_forward ? state.group.bwd_mom : state.group.fwd_mom
+@inline _cn_bwd_vel(state) = state.go_forward ? state.group.bwd_dham_dmom : state.group.fwd_dham_dmom
+
+# One in-place leapfrog on the ACTIVE (forward) endpoint, matching ca9's
+# integrator: mom half-kick (reads gradient), pos drift (reads velocity), mom
+# half-kick (reads recomputed gradient). Uses the group's per-slot in-place
+# bundles, so the reactive recompute is allocation-free.
+@inline function _cn_endpoint_leapfrog!(state::CompiledNUTSState, ::Val{P},
+                                        stepsize) where {P}
+    gs = state.group.state
+    handles = state.group.handles
+    mom_h = getfield(handles, Symbol(P, :_mom))
+    pos_h = getfield(handles, Symbol(P, :_pos))
+    grad_h = getfield(handles, Symbol(P, :_dpot_dpos))
+    vel_h = getfield(handles, Symbol(P, :_dham_dmom))
+    gradient = get!(gs, grad_h)
+    mutate!(gs, mom_h) do momentum
+        @. momentum -= 0.5 * stepsize * gradient
+        momentum
+    end
+    velocity = get!(gs, vel_h)
+    mutate!(gs, pos_h) do position
+        @. position += stepsize * velocity
+        position
+    end
+    gradient2 = get!(gs, grad_h)
+    mutate!(gs, mom_h) do momentum
+        @. momentum -= 0.5 * stepsize * gradient2
+        momentum
+    end
+    state
+end
+
+@inline function _cn_step_forward!(state::CompiledNUTSState)
+    stepsize = state.step_f.stepsize
+    state.go_forward ? _cn_endpoint_leapfrog!(state, Val(:fwd), stepsize) :
+                       _cn_endpoint_leapfrog!(state, Val(:bwd), stepsize)
+end
+
+# Keep the reactive selection source in sync with go_forward, so the group's
+# `active_ham`/`dham`/`diverged` nodes track the current forward endpoint.
+@inline function _cn_sync_gofwd!(state::CompiledNUTSState)
+    set!(state.group.state, state.group.handles.gofwd, state.go_forward)
+    state
+end
+
+@inline function _cn_negate_backward_mom!(state::CompiledNUTSState)
+    handles = state.group.handles
+    gs = state.group.state
+    if state.go_forward
+        mutate!(gs, handles.bwd_mom) do m; @. m *= -1; m; end
+    else
+        mutate!(gs, handles.fwd_mom) do m; @. m *= -1; m; end
+    end
+    state
+end
+
+# Reset both moving endpoints to `init` in one 0-alloc HAVE-boundary group copy,
+# then reset proposals/trees/flags — the ca9 per-transition restore.
+function _cn_reset_transition!(state::CompiledNUTSState)
+    handles = state.group.handles
+    gs = state.group.state
+    copy_group!(gs,
+        (handles.fwd_pos, handles.fwd_mom, handles.bwd_pos, handles.bwd_mom),
+        (handles.init_pos, handles.init_mom, handles.init_pos, handles.init_mom))
+    init_pos = state.group.init_pos
+    init_mom = state.group.init_mom
+    for proposal in state.proposals
+        copyto!(proposal.pos, init_pos)
+        copyto!(proposal.mom, init_mom)
+    end
+    foreach(_reset_tree!, state.trees)
+    state.go_forward = true
+    _cn_sync_gofwd!(state)
+    state.may_sample = true
+    state.may_continue = true
+    state.energy_error = zero(state.energy_error)
+    state.diverged = false
+    state.depth = 0
+    state.n_steps = 0
+    state.acceptance_sum = zero(state.acceptance_sum)
+    state
+end
+
+function _cn_swap_proposal!(state::CompiledNUTSState, first_index::Int,
+                            second_index::Int = length(state.proposals))
+    state.proposals[first_index], state.proposals[second_index] =
+        state.proposals[second_index], state.proposals[first_index]
+    state
+end
+
+function _cn_snapshot_forward!(proposal::_NUTSProposal, state::CompiledNUTSState)
+    copyto!(proposal.pos, _cn_fwd_pos(state))
+    copyto!(proposal.mom, _cn_fwd_mom(state))
+    proposal
+end
+
+function _cn_flip!(state::CompiledNUTSState, depth::Int)
+    depth > 1 || return state
+    state.go_forward = !state.go_forward
+    _cn_sync_gofwd!(state)
+    tree = state.trees[depth]
+    backward_mom = _cn_bwd_mom(state)
+    backward_vel = _cn_bwd_vel(state)
+    @. tree.backward.momentum = -backward_mom
+    @. tree.backward.velocity = -backward_vel
+    @. tree.summed_momentum.forward *= -1
+    state
+end
+
+@inline function _cn_collect_stats!(state::CompiledNUTSState)
+    state.stats_f === nothing || state.stats_f(state)
+    state
+end
+
+function _cn_start_tree!(state::CompiledNUTSState, depth::Int)
+    if depth == 1
+        _cn_step_forward!(state)
+        state.n_steps += 1
+        # Reactive energy error: init_ham - active_ham, selected by gofwd.
+        state.energy_error = _finite_or_neginf(state.group.dham)
+        state.acceptance_sum += _min1exp(state.energy_error)
+        state.diverged = !(state.energy_error >= state.min_energy_error)
+        _cn_collect_stats!(state)
+        if state.diverged
+            state.may_continue = false
+            return state
+        end
+        state.trees[1].log_weight[1] = state.energy_error
+        _cn_snapshot_forward!(state.proposals[1], state)
+        return state
+    end
+
+    _cn_start_tree!(state, depth - 1)
+    if !state.may_continue
+        state.may_sample = false
+        return state
+    end
+    _cn_swap_proposal!(state, depth - 1, depth)
+    _cn_finish_tree!(state, depth - 1)
+    if state.may_sample && _rand_bernoulli_log(
+            state.rng,
+            state.trees[depth - 1].log_weight[1] -
+                state.trees[depth].log_weight[1],
+        )
+        _cn_swap_proposal!(state, depth - 1, depth)
+    end
+    state
+end
+
+function _cn_finish_tree!(state::CompiledNUTSState, depth::Int)
+    tree = state.trees[depth]
+    supertree = state.trees[depth + 1]
+    tree.log_weight[2] = tree.log_weight[1]
+    forward_mom = _cn_fwd_mom(state)
+    forward_vel = _cn_fwd_vel(state)
+
+    if depth == 1
+        copyto!(supertree.backward.momentum, forward_mom)
+        copyto!(supertree.backward.velocity, forward_vel)
+    else
+        copyto!(supertree.backward.momentum, tree.backward.momentum)
+        copyto!(supertree.backward.velocity, tree.backward.velocity)
+        copyto!(tree.backward_forward.momentum, forward_mom)
+        copyto!(tree.backward_forward.velocity, forward_vel)
+        copyto!(tree.summed_momentum.backward, tree.summed_momentum.forward)
+    end
+
+    _cn_start_tree!(state, depth)
+    if !state.may_continue
+        state.may_sample = false
+        return state
+    end
+
+    # forward endpoint may have moved during the recursive start_tree!; re-read.
+    forward_mom = _cn_fwd_mom(state)
+    forward_vel = _cn_fwd_vel(state)
+    supertree.log_weight[1] = logaddexp(tree.log_weight[1], tree.log_weight[2])
+    if depth == 1
+        @. supertree.summed_momentum.forward =
+            supertree.backward.momentum + forward_mom
+        state.may_continue = _compute_criterion(
+            supertree.summed_momentum.forward,
+            supertree.backward.velocity,
+            forward_vel,
+        )
+    else
+        @. supertree.summed_momentum.forward =
+            tree.summed_momentum.backward + tree.summed_momentum.forward
+        state.may_continue =
+            _compute_criterion(
+                supertree.summed_momentum.forward,
+                supertree.backward.velocity,
+                forward_vel,
+            ) &&
+            _compute_criterion_sum(
+                tree.summed_momentum.backward,
+                tree.backward.momentum,
+                supertree.backward.velocity,
+                tree.backward.velocity,
+            ) &&
+            _compute_criterion_sum(
+                tree.backward_forward.momentum,
+                tree.summed_momentum.forward,
+                tree.backward_forward.velocity,
+                forward_vel,
+            )
+    end
+    state
+end
+
+function _cn_restore_init!(state::CompiledNUTSState)
+    proposal = state.proposals[end]
+    handles = state.group.handles
+    gs = state.group.state
+    mutate!(gs, handles.init_pos) do position
+        copyto!(position, proposal.pos)
+        position
+    end
+    mutate!(gs, handles.init_mom) do momentum
+        copyto!(momentum, proposal.mom)
+        momentum
+    end
+    state
+end
+
+"Advance one multinomial NUTS transition on the compiled-reactive group."
+function step!(state::CompiledNUTSState)
+    _cn_reset_transition!(state)
+    _cn_negate_backward_mom!(state)
+    state.trees[1].log_weight[1] = 0
+
+    for depth in 1:state.max_depth
+        rand(state.rng, Bool) && _cn_flip!(state, depth)
+        _cn_finish_tree!(state, depth)
+        state.depth = depth
+        state.may_sample || break
+        if _rand_bernoulli_log(
+                state.rng,
+                state.trees[depth].log_weight[1] -
+                    state.trees[depth].log_weight[2],
+            )
+            _cn_swap_proposal!(state, depth)
+        end
+        state.may_continue || break
+    end
+    _cn_restore_init!(state)
+    diagnostics(state)
+end
+
+function diagnostics(state::CompiledNUTSState)
+    acceptance = state.n_steps == 0 ? zero(state.acceptance_sum) :
+                 state.acceptance_sum / state.n_steps
+    NUTSDiagnostics(state.depth, state.n_steps, acceptance,
+                    state.diverged, state.energy_error)
+end
+
+function refresh_momentum!(state::CompiledNUTSState)
+    factor = state.group.chol_metric
+    mutate!(state.group.state, state.group.handles.init_mom) do momentum
+        randn!(state.rng, momentum)
+        lmul!(factor.L, momentum)
+        momentum
+    end
+    state.group
+end
+
+function sample!(state::CompiledNUTSState)
+    refresh_momentum!(state)
+    step!(state)
+end
+
+function sample!(state::CompiledNUTSState, draws::Integer;
+                 discard_initial::Integer = 0)
+    draws >= 0 || throw(ArgumentError("draws must be non-negative"))
+    discard_initial >= 0 || throw(ArgumentError(
+        "discard_initial must be non-negative"))
+    for _ in 1:discard_initial
+        sample!(state)
+    end
+    position = state.group.init_pos
+    samples = Matrix{eltype(position)}(undef, length(position), draws)
+    stats = Vector{NUTSDiagnostics{typeof(state.energy_error)}}(undef, draws)
+    for draw in 1:draws
+        stats[draw] = sample!(state)
+        samples[:, draw] .= state.group.init_pos
+    end
+    (; samples, diagnostics = stats)
+end

@@ -1,5 +1,6 @@
 using ReactiveKernels
 using LinearAlgebra
+using Random
 using DifferentiationInterface
 import Enzyme
 using Test
@@ -289,4 +290,137 @@ end
     @test di_group2.dham ≈ analytic_group.dham
     @test di_group2.fwd_ham ≈ analytic_group.fwd_ham
     @test di_group2.fwd_dpot_dpos ≈ analytic_group.fwd_dpot_dpos
+end
+
+@testset "CompiledNUTSState — transition-by-transition parity with the oracle" begin
+    # The compiled-reactive transition must be BYTE-for-byte deterministically
+    # identical to the ordinary-Julia NUTSState oracle under a shared RNG stream:
+    # same draws in the same order, so every accepted sample and every diagnostic
+    # field matches. Both are driven by the SAME analytic potential (the oracle via
+    # its (value, gradient) boundary, the compiled group via the in-place boundary).
+    for (label, D, metric) in (
+            ("gaussian-identity", 4, Matrix{Float64}(I, 4, 4)),
+            ("gaussian-dense", 6,
+             (A = [1.0 / (i + j) for i in 1:6, j in 1:6]; A'A + 6 * I)),
+        )
+        q0 = _det_pos(D)
+
+        oracle = nuts_state(
+            euclidean_phasepoint(_std_pot,
+                                 q -> (_std_pot(q), copy(q)), metric, copy(q0),
+                                 zeros(D));
+            rng = Xoshiro(2024),
+            step_f = partial(leapfrog!; stepsize = 0.25),
+            max_depth = 5,
+        )
+        compiled = compiled_nuts_state(
+            reactive_nuts_group(_std_pot_grad!, metric, copy(q0), zeros(D));
+            rng = Xoshiro(2024),
+            step_f = partial(leapfrog!; stepsize = 0.25),
+            max_depth = 5,
+        )
+
+        # The public compiled state carries the flat compiled ReactiveProgram.
+        @test reactive_program(compiled) isa ReactiveKernels.ReactiveProgram
+        @test reactive_program(compiled) === compiled.group.state.program
+
+        for transition in 1:40
+            oracle_diag = sample!(oracle)
+            compiled_diag = sample!(compiled)
+            @test compiled.group.init_pos ≈ oracle.init.pos
+            @test compiled_diag.depth == oracle_diag.depth
+            @test compiled_diag.n_steps == oracle_diag.n_steps
+            @test compiled_diag.diverged == oracle_diag.diverged
+            @test compiled_diag.acceptance_rate ≈ oracle_diag.acceptance_rate
+            @test compiled_diag.energy_error ≈ oracle_diag.energy_error
+        end
+    end
+end
+
+@testset "CompiledNUTSState — sample!(draws) parity" begin
+    D = 4
+    metric = Matrix{Float64}(I, D, D)
+    q0 = _det_pos(D)
+    oracle = nuts_state(
+        euclidean_phasepoint(_std_pot, q -> (_std_pot(q), copy(q)), metric,
+                             copy(q0), zeros(D));
+        rng = Xoshiro(77), step_f = partial(leapfrog!; stepsize = 0.3), max_depth = 6)
+    compiled = compiled_nuts_state(
+        reactive_nuts_group(_std_pot_grad!, metric, copy(q0), zeros(D));
+        rng = Xoshiro(77), step_f = partial(leapfrog!; stepsize = 0.3), max_depth = 6)
+
+    oracle_chain = sample!(oracle, 200)
+    compiled_chain = sample!(compiled, 200)
+    @test compiled_chain.samples ≈ oracle_chain.samples
+    @test all(getfield.(compiled_chain.diagnostics, :depth) .==
+              getfield.(oracle_chain.diagnostics, :depth))
+    @test [d.energy_error for d in compiled_chain.diagnostics] ≈
+          [d.energy_error for d in oracle_chain.diagnostics]
+end
+
+@testset "CompiledNUTSState — ca9 fixture bit-for-bit reproduction" begin
+    # Direct fixed-momentum step! (no momentum refresh) on the compiled-reactive
+    # group must reproduce the executable upstream ReactiveHMC ca9 fixture
+    # (test/fixtures/reactivehmc_ca9_reference.jl @ ca9ea4ca) BIT-FOR-BIT: identical
+    # init pos/mom/ham and every diagnostic field.
+    compiled = compiled_nuts_state(
+        reactive_nuts_group(_std_pot_grad!, Diagonal(ones(2)),
+                            [0.1, -0.2], [0.3, -0.4]);
+        rng = Xoshiro(42),
+        step_f = partial(leapfrog!; stepsize = 0.25),
+        max_depth = 3,
+    )
+    transition = step!(compiled)   # fixed momentum [0.3, -0.4], no refresh
+    @test compiled.group.init_pos == [0.27957763671875, -0.4214599609375]
+    @test compiled.group.init_mom == [0.15133209228515626, -0.15659484863281245]
+    @test compiled.group.init_ham == 0.15160775120020845
+    @test transition.depth == 3
+    @test transition.n_steps == 7
+    @test transition.energy_error == -0.0012290068185673575
+    @test transition.acceptance_rate == 0.9985695900582436
+    @test !transition.diverged
+end
+
+@testset "CompiledNUTSState — direct step! is bit-for-bit equal to the oracle" begin
+    # Fixed-momentum direct step! (no refresh): the compiled state and the oracle
+    # execute the same float ops in the same order, so every field is EXACTLY (==)
+    # equal, including init momentum and Hamiltonian.
+    for (D, metric) in ((4, Matrix{Float64}(I, 4, 4)),
+                        (6, (A = [1.0 / (i + j) for i in 1:6, j in 1:6];
+                             A'A + 6 * I)))
+        q0 = _det_pos(D)
+        m0 = _det_mom(D)
+        oracle = nuts_state(
+            euclidean_phasepoint(_std_pot, q -> (_std_pot(q), copy(q)), metric,
+                                 copy(q0), copy(m0));
+            rng = Xoshiro(9), step_f = partial(leapfrog!; stepsize = 0.2),
+            max_depth = 5)
+        compiled = compiled_nuts_state(
+            reactive_nuts_group(_std_pot_grad!, metric, copy(q0), copy(m0));
+            rng = Xoshiro(9), step_f = partial(leapfrog!; stepsize = 0.2),
+            max_depth = 5)
+        for _ in 1:25
+            od = step!(oracle)          # direct step!, fixed momentum
+            cd = step!(compiled)
+            @test compiled.group.init_pos == oracle.init.pos
+            @test compiled.group.init_mom == oracle.init.mom
+            @test compiled.group.init_ham == oracle.init.ham
+            @test cd.depth == od.depth
+            @test cd.n_steps == od.n_steps
+            @test cd.diverged == od.diverged
+            @test cd.energy_error == od.energy_error
+            @test cd.acceptance_rate == od.acceptance_rate
+            # Manually re-inject the same fixed momentum for the next direct step!
+            # on both, keeping the fixed-momentum comparison deterministic.
+            oracle.init.mom = copy(m0)
+            compiled.group.init_mom = copy(m0)
+        end
+    end
+end
+
+@testset "CompiledNUTSState — constructor rejects a non-group phase point" begin
+    plain = euclidean_phasepoint(_std_pot, q -> (_std_pot(q), copy(q)),
+                                 Matrix{Float64}(I, 3, 3), zeros(3), zeros(3))
+    @test_throws ArgumentError compiled_nuts_state(
+        plain; rng = Xoshiro(1), step_f = partial(leapfrog!; stepsize = 0.1))
 end
