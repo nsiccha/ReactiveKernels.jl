@@ -9,10 +9,17 @@ integration, and the adaptation/statistics update methods all run *over* these
 compiled reactive handles; they are **not** themselves reactive graphs, and no DAG
 is manufactured for them.
 
-The public model boundary is a **scalar potential**; its gradient goes through
+The public model boundary is a **scalar potential** plus its gradient callable
+`potential_gradient!(gradient, position)`, which fills the gradient buffer in place and
+returns the potential. **ReactiveKernels computes no pullbacks itself** — it accepts
+*any* consumer gradient: a hand-written analytic one, or an optional automatic-
+differentiation integration (e.g.
 [DifferentiationInterface](https://github.com/JuliaDiff/DifferentiationInterface.jl)
-with reverse-mode [Enzyme](https://github.com/EnzymeAD/Enzyme.jl), prepared once and
-written into the sampler's owned buffer in place. The complete runnable workflow is
+with reverse-mode [Enzyme](https://github.com/EnzymeAD/Enzyme.jl)). The examples on
+this page use the standard Gaussian `U(x) = ‖x‖²/2`, whose gradient is simply `x`, with
+an **analytic** callable — so the *kernel*, not any differentiation machinery, is the
+visible content, and the timings isolate sampler overhead rather than the gradient. The
+complete runnable workflow, including the optional DI + Enzyme boundary, is
 [`examples/nuts.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/nuts.jl).
 
 ## The five compiled reactive programs
@@ -60,25 +67,68 @@ matching its declared inventory — so a missing or extra recipe fails the build
 Main.ReactiveKernelsDocs.render_five_programs(@__MODULE__)
 ```
 
+## The reactive state, and how you drive it
+
+The compiled group above *is* the reactive **state**. Its fields are exactly the
+sources and derived nodes of the `@reactive` definition: `init_pos`/`init_mom` and
+the control/diagnostic fields are HAVE **sources** you write; the Hamiltonian
+quantities (`init_ham`, `dham`, `diverged`, the per-endpoint bundles/projections) are
+**derived** reactive nodes you read. All of it is visible — no hidden state:
+
+```@example nutsdrive
+using LinearAlgebra, Random, ReactiveKernels
+
+# A consumer gradient callable — here the analytic gradient of U(x) = ‖x‖²/2 (∇U = x).
+# (RK computes no pullbacks; an optional DI + Enzyme integration would supply the same
+# callable — see the intro.)
+potential_gradient!(gradient, position) =
+    (copyto!(gradient, position); sum(abs2, position) / 2)
+
+# The group is the reactive state — every field is a reactive source or derived node:
+group = reactive_nuts_group(potential_gradient!,
+    Matrix{Float64}(I, 4, 4), zeros(4), ones(4))
+propertynames(group)
+```
+
+You **read** a derived getter directly; each recomputes only its invalidated inputs
+(a source-slot read is allocation-free):
+
+```@example nutsdrive
+(group.init_ham, group.dham, group.diverged)   # derived reactive nodes, read on demand
+```
+
+The sampler holds only orchestration scratch — **all** phase-point state lives on the
+reactive group, so there is no shadow copy to keep in sync:
+
+```@example nutsdrive
+sampler = nuts_state(group;
+    rng = Xoshiro(1), step_f = partial(leapfrog!; stepsize = 0.3), max_depth = 5)
+fieldnames(typeof(sampler))
+```
+
+You **drive** it by running a transition; afterwards the diagnostics are read straight
+off the reactive group (the transition wrote its sources, the getters recompute):
+
+```@example nutsdrive
+chain = sample!(sampler, 1)                     # one NUTS transition
+(chain.diagnostics[1].depth, chain.diagnostics[1].diverged, group.dham)
+```
+
 ## The sampled path
 
-The same compiled `reactive_nuts_group` program drives warmup and sampling through
-the DI + Enzyme scalar-potential boundary:
+The same compiled `reactive_nuts_group` program drives warmup and sampling through the
+consumer gradient callable (analytic here; an optional DI + Enzyme integration would
+supply the same callable):
 
 ```@example nuts
 using LinearAlgebra
 using Random
 using ReactiveKernels
-using DifferentiationInterface
-import Enzyme
 
-backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-                     function_annotation = Enzyme.Const)
-potential(q) = sum(abs2, q) / 2
+# Analytic gradient of U(x) = ‖x‖²/2 (∇U = x); RK computes no pullbacks itself.
+potential_gradient!(gradient, position) =
+    (copyto!(gradient, position); sum(abs2, position) / 2)
 dimension = 4
-preparation = prepare_gradient(potential, backend, zeros(dimension))
-potential_gradient!(gradient, position) = first(value_and_gradient!(
-    potential, gradient, preparation, backend, position))
 
 group = reactive_nuts_group(potential_gradient!,
     Matrix{Float64}(I, dimension, dimension), zeros(dimension), zeros(dimension))

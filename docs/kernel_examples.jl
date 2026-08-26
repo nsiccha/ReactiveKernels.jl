@@ -240,7 +240,7 @@ end
 
 # The live value read through a getter (source or derived) of the executed object.
 # `invokelatest` because the displayed source may have defined fresh recipe methods
-# (e.g. the DI+Enzyme potential_gradient!) into the page sandbox in a newer world.
+# (e.g. the analytic potential_gradient!) into the page sandbox in a newer world.
 _getter_value(object, getter::Symbol) =
     Base.invokelatest(getproperty, _artifact_object(object), getter)
 
@@ -419,10 +419,10 @@ function execute_example(mod::Module, code::AbstractString;
 end
 
 # The five compiled reactive programs of the public NUTS workflow, each defined by
-# its exact build-executed public constructor source. The gradient boundary is the
-# ACTUAL sampled path: a scalar potential differentiated once by DI + reverse-mode
-# Enzyme into an owned buffer (as in examples/nuts.jl). `note` labels the ordinary
-# non-reactive orchestration around each program.
+# its exact build-executed public constructor source. The gradient boundary is a
+# CONSUMER-SUPPLIED ANALYTIC gradient (no DI/Enzyme) so the compiled kernel, not the
+# differentiation, is the visible content. `note` labels the ordinary non-reactive
+# orchestration around each program.
 const _FIVE_PROGRAM_SNIPPETS = (
     (name = :nuts_group,
      origin = "reactive_nuts_group (build executed)",
@@ -431,17 +431,12 @@ const _FIVE_PROGRAM_SNIPPETS = (
      note = "the transition recursion, RNG draws, U-turn criteria, leapfrog, and " *
             "tree/proposal scratch are ordinary inferred Julia over these handles",
      source = raw"""
-# The public model boundary is a SCALAR potential; its gradient goes through
-# DifferentiationInterface + reverse-mode Enzyme, prepared once and written into
-# the sampler's owned buffer in place (the actual sampled path — no handwritten
-# gradient callback). See examples/nuts.jl for the full runnable workflow.
-backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-                     function_annotation = Enzyme.Const)
-potential(q) = sum(abs2, q) / 2
+# The public model boundary is a SCALAR potential with a CONSUMER-SUPPLIED ANALYTIC
+# gradient — no DifferentiationInterface/Enzyme machinery — so the compiled kernel,
+# not the differentiation, is the visible content. Here U(x) = ‖x‖²/2, so ∇U(x) = x.
+potential_gradient!(gradient, position) =
+    (copyto!(gradient, position); sum(abs2, position) / 2)
 dimension = 4
-preparation = prepare_gradient(potential, backend, zeros(dimension))
-potential_gradient!(gradient, position) = first(value_and_gradient!(
-    potential, gradient, preparation, backend, position))
 
 object = reactive_nuts_group(potential_gradient!,
     Matrix{Float64}(I, dimension, dimension), zeros(dimension), zeros(dimension))"""),
@@ -527,9 +522,7 @@ assert one-to-one program/getter/DAG coverage, and render each actual
 the five programs lacks an artifact or diverges from its live program.
 """
 function render_five_programs(mod::Module)
-    Core.eval(mod, :(using ReactiveKernels, LinearAlgebra, Random,
-                           DifferentiationInterface))
-    Core.eval(mod, :(import Enzyme))
+    Core.eval(mod, :(using ReactiveKernels, LinearAlgebra, Random))
     artifacts = Any[]
     for snippet in _FIVE_PROGRAM_SNIPPETS
         _evaluate_source(mod, snippet.source)          # build-execute the public source
@@ -681,22 +674,18 @@ function assert_fused_leaf_coverage(built; have = _FUSED_LEAF_HAVE,
     built
 end
 
-# The DI + reverse-mode Enzyme scalar-potential boundary + the persistent-partition
-# seed, evaluated in the page sandbox exactly as the benchmark sets it up.
+# The consumer analytic scalar-potential boundary + the persistent-partition seed,
+# evaluated in the page sandbox exactly as the benchmark sets it up.
 const _FUSED_LEAF_SETUP = raw"""
-using LinearAlgebra, Random, DifferentiationInterface
-import Enzyme
+using LinearAlgebra, Random
 
-# The model boundary is a SCALAR potential; its gradient goes through
-# DifferentiationInterface + reverse-mode Enzyme, prepared once and written into the
-# leaf's owned gradient buffer in place (no handwritten gradient callback).
-backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-                     function_annotation = Enzyme.Const)
-potential(q) = sum(abs2, q) / 2
+# The model boundary is a SCALAR potential with a CONSUMER-SUPPLIED ANALYTIC gradient
+# — no DifferentiationInterface/Enzyme machinery — so the KERNEL, not the
+# differentiation, is the visible content. Here U(x) = ‖x‖²/2, so ∇U(x) = x;
+# potential_gradient! fills the gradient buffer in place and returns the potential.
+potential_gradient!(gradient, position) =
+    (copyto!(gradient, position); sum(abs2, position) / 2)
 dimension = 4
-preparation = prepare_gradient(potential, backend, zeros(dimension))
-potential_gradient!(gradient, position) = first(value_and_gradient!(
-    potential, gradient, preparation, backend, position))
 
 # Persistent per-trajectory partition: metric factor, its log-determinant, and the
 # fixed reference energy `init_ham` — all constant while the metric/stepsize is fixed.
@@ -730,7 +719,7 @@ _lf_kin(logdet_chol, dotmv) = (logdet_chol + dotmv) / 2          # logdet HOISTE
 _lf_add(a, b) = a + b
 
 # HAVE ports (9): {pos,mom,old_grad} change each call; the rest are the persistent
-# per-trajectory partition. `pgrad` is the DI+Enzyme potential_gradient! closure.
+# per-trajectory partition. `pgrad` is the consumer's analytic potential_gradient!.
 g = RK.Graph()
 pos = RK.value(:pos, V);   mom = RK.value(:mom, V);   old_grad = RK.value(:old_grad, V)
 chol = RK.value(:chol, CH); stepsize = RK.value(:stepsize, S); init_ham = RK.value(:init_ham, S)
@@ -770,14 +759,14 @@ kernel = RK._prepare_nonallocating(plan, RK._nonallocating_ast(RK.lower(plan)), 
 """
     render_fused_leaf(mod) -> Markdown.MD
 
-Build-execute the fused NUTS leaf (Unit A) at the DI + reverse-mode Enzyme
+Build-execute the fused NUTS leaf (Unit A) at the consumer analytic
 scalar-potential boundary, assert its 13-recipe coverage, run one leaf, and render
 the actual program through the shared three-view UI. **Generated kernel** is the real
 `code_expr` of the fused non-allocating schedule; **Compute DAG** is `plan`. Fails the
 docs build if the inventory diverges or the generated view is not the live kernel's.
 """
 function render_fused_leaf(mod::Module)
-    _evaluate_source(mod, _FUSED_LEAF_SETUP)     # build-execute the DI + Enzyme boundary
+    _evaluate_source(mod, _FUSED_LEAF_SETUP)     # build-execute the analytic gradient boundary
     metric = Core.eval(mod, :metric)
     pos0   = Core.eval(mod, :position)
     mom0   = Core.eval(mod, :momentum)
