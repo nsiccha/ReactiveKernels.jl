@@ -17,19 +17,18 @@ using DifferentiationInterface
 import Enzyme
 using BenchmarkTools
 
-# Native, Distributions.jl-free Gaussian log density as two composable recipes.
-# The family fragment maps an unconstrained log scale to a positive scale; the
-# observation fragment evaluates the log density in closed form.
-@kernel normal_family(logσ::Float64) = begin
+# Native, Distributions.jl-free Gaussian log density as one have→want recipe.
+# We HAVE the log scale logσ, so the density uses it directly for the -logσ
+# term and derives σ = exp(logσ) only where the scale is genuinely needed (the
+# standardized residual). There is no exp-then-log round trip: log(σ) is never
+# recomputed from a σ we built out of the logσ we already hold.
+@kernel normal_logpdf(x::Float64, μ::Float64, logσ::Float64) = begin
     σ::Float64 = exp(logσ)
-end
-
-@kernel normal_observation(x::Float64, μ::Float64, σ::Float64) = begin
     z::Float64 = (x - μ) / σ
-    logdensity::Float64 = -0.5 * log(2π) - log(σ) - 0.5 * z^2
+    logdensity::Float64 = -0.5 * log(2π) - logσ - 0.5 * z^2
 end
 
-normal_kernel = prepare(compose(normal_family, normal_observation);
+normal_kernel = prepare(normal_logpdf;
     have = (:x, :μ, :logσ),
     want = :logdensity,
 )
@@ -42,11 +41,11 @@ normal_reference(x, μ, logσ) = logpdf(Normal(μ, exp(logσ)), x)
 reference = normal_reference(Tuple(inputs)...)
 
 # The same closed-form density as a plain function, to check that preparation
-# preserves reverse-mode AD.
-normal_logpdf(x, μ, logσ) = begin
+# preserves reverse-mode AD. Same arithmetic as the recipe — logσ used directly.
+normal_logpdf_plain(x, μ, logσ) = begin
     σ = exp(logσ)
     z = (x - μ) / σ
-    -0.5 * log(2π) - log(σ) - 0.5 * z^2
+    -0.5 * log(2π) - logσ - 0.5 * z^2
 end
 
 backend = AutoEnzyme(; mode = Enzyme.Reverse)
@@ -55,7 +54,7 @@ gradient = DifferentiationInterface.gradient(
     backend, [inputs.x, inputs.μ, inputs.logσ],
 )
 reference_gradient = DifferentiationInterface.gradient(
-    v -> normal_logpdf(v[1], v[2], v[3]),
+    v -> normal_logpdf_plain(v[1], v[2], v[3]),
     backend, [inputs.x, inputs.μ, inputs.logσ],
 )
 
@@ -92,21 +91,16 @@ import Enzyme
 using LogExpFunctions
 using BenchmarkTools
 
-# Native Bernoulli-logit log density. The family fragment computes the two
-# outcome log-probabilities in a numerically stable closed form; the
-# observation fragment selects the observed one. Differentiation is only with
-# respect to the continuous logit.
-@kernel bernoulli_family(logit::Float64) = begin
-    log_p1::Float64 = -log1pexp(-logit)
-    log_p0::Float64 = -log1pexp(logit)
+# Native Bernoulli-logit log density as one have→want recipe. The observed
+# outcome selects between the two numerically stable log-probabilities
+# -log1pexp(∓logit) in closed form; no separate family/observation fragments
+# and nothing to compose. Differentiation is only with respect to the
+# continuous logit.
+@kernel bernoulli_logit_logpdf(observed::Bool, logit::Float64) = begin
+    logdensity::Float64 = observed ? -log1pexp(-logit) : -log1pexp(logit)
 end
 
-@kernel bernoulli_observation(observed::Bool, log_p1::Float64,
-                              log_p0::Float64) = begin
-    logdensity::Float64 = observed ? log_p1 : log_p0
-end
-
-bernoulli_kernel = prepare(compose(bernoulli_family, bernoulli_observation);
+bernoulli_kernel = prepare(bernoulli_logit_logpdf;
     have = (:observed, :logit),
     want = :logdensity,
 )
@@ -120,7 +114,7 @@ bernoulli_reference(observed, logit) =
 reference = bernoulli_reference(Tuple(inputs)...)
 
 # Plain native form for the AD-preservation check.
-bernoulli_logit_logpdf(observed, logit) =
+bernoulli_logit_logpdf_plain(observed, logit) =
     observed ? -log1pexp(-logit) : -log1pexp(logit)
 
 backend = AutoEnzyme(; mode = Enzyme.Reverse)
@@ -129,7 +123,7 @@ gradient = DifferentiationInterface.gradient(
     backend, [inputs.logit],
 )
 reference_gradient = DifferentiationInterface.gradient(
-    v -> bernoulli_logit_logpdf(inputs.observed, v[1]),
+    v -> bernoulli_logit_logpdf_plain(inputs.observed, v[1]),
     backend, [inputs.logit],
 )
 
@@ -200,6 +194,10 @@ end
     logdensity::Float64 = prior_logdensity + likelihood_logdensity
 end
 
+# This is where `compose` earns its place: three separately-authored recipes
+# share the same `coefficients` port, and `compose` unifies that port so the
+# planner sees one parameter feeding both the prior and the likelihood. (The
+# scalar examples above need no `compose` — each is a single recipe.)
 regression_kernel = prepare(
     compose(coefficient_prior, regression_likelihood, joint_density);
     have = (:coefficients, :prior_scale, :design, :observations, :noise_scale),

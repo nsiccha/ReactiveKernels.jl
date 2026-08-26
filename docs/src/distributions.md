@@ -3,11 +3,20 @@
 These executable examples build log densities the way a probabilistic-programming
 layer on top of `ReactiveKernels` would want them: as ordinary `@kernel` recipes
 of closed-form arithmetic. The **compute path contains no `Distributions.jl`
-call** — each density is written out directly, `compose` joins the fragments,
-and a `prepare` query lowers exactly the requested computation to a straight-line
-kernel. That keeps the hot path free of distribution-object construction and
+call** — each density is written out directly, a `have`/`want` `prepare` query
+lowers exactly the requested computation to a straight-line kernel, and `compose`
+enters only where several recipes share a parameter (the multivariate case
+below). That keeps the hot path free of distribution-object construction and
 friendly to batching, lazy evaluation, and the non-allocating lowering under
 [Non-allocating kernels](nonallocating.md).
+
+Each density is written in terms of what you already **have**. When the log scale
+`logσ` is a given, the density names it directly for the `-logσ` term and derives
+`σ = exp(logσ)` only where the scale itself is needed — there is no `exp`-then-`log`
+round trip. The planner does `have`/`want` min-cost planning and structural common
+subexpression elimination, not algebraic identities like `log∘exp = id`, so the
+minimal work comes from stating the recipe naturally, not from a post-hoc
+simplification pass.
 
 `Distributions.jl` appears **only as an independent oracle**: it supplies a
 reference value (and a reference allocation figure) that the native kernel is
@@ -27,12 +36,14 @@ into a side-by-side dialog.
 
 ## Continuous: Normal location and log scale
 
-The family fragment maps an unconstrained log scale to a positive scale; the
-observation fragment evaluates the Gaussian log density `-½log2π - logσ - ½z²`
-in closed form. The example checks both the scalar value and a real reverse-mode
-`Enzyme` gradient over `(x, μ, logσ)`: the value against `Distributions.logpdf`,
-and the gradient against the same closed-form density written as a plain
-function, so that preparation is shown to preserve AD.
+A single recipe evaluates the Gaussian log density `-½log2π - logσ - ½z²` in
+closed form from `have = (x, μ, logσ)`. Because `logσ` is a given, the `-logσ`
+term uses it directly and `σ = exp(logσ)` is derived once, only for the
+standardized residual `z = (x - μ)/σ` — no `log(exp(logσ))` round trip. The
+example checks both the scalar value and a real reverse-mode `Enzyme` gradient
+over `(x, μ, logσ)`: the value against `Distributions.logpdf`, and the gradient
+against the same closed-form density written as a plain function, so that
+preparation is shown to preserve AD.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
@@ -42,12 +53,11 @@ Main.ReactiveKernelsDocs.execute_example(
 
 ## Discrete: Bernoulli observation with a differentiable logit
 
-The family fragment computes the two outcome log-probabilities with the stable
-`-log1pexp(∓logit)` form; the observation fragment selects the observed one.
-The observation is deliberately discrete, so differentiation is only with
-respect to the continuous logit. The kernel value is checked against a
-`Bernoulli` reference and the one-dimensional `Enzyme` gradient against the
-native closed-form density.
+A single recipe selects between the two numerically stable outcome
+log-probabilities `-log1pexp(∓logit)` on the observed bit. The observation is
+deliberately discrete, so differentiation is only with respect to the continuous
+logit. The kernel value is checked against a `Bernoulli` reference and the
+one-dimensional `Enzyme` gradient against the native closed-form density.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
@@ -57,14 +67,16 @@ Main.ReactiveKernelsDocs.execute_example(
 
 ## Multivariate: shared regression coefficients
 
-One coefficient vector feeds both an isotropic-Gaussian prior and an
-isotropic-Gaussian regression likelihood, each written as a native quadratic
-form (no `MvNormal` object). A third fragment sums the two selected terms. This
-makes the shared parameter visible to the planner and demonstrates a
-multivariate composition without proposing a model DSL or sampler API. The joint
-value is checked against direct `MvNormal` calls, and the gradient with respect
-to the shared coefficients — held constant against the design, observations, and
-scales via `DifferentiationInterface`'s `Constant` — against the native total.
+This is the case that actually needs `compose`. One coefficient vector feeds
+both an isotropic-Gaussian prior and an isotropic-Gaussian regression
+likelihood, each written as a native quadratic form (no `MvNormal` object), and
+a third recipe sums the two terms. `compose` unifies the shared `coefficients`
+port across those separately-authored recipes so the planner sees one parameter
+feeding both densities — which is what `compose` is *for*, and why the scalar
+examples above, being single recipes, use none. The joint value is checked
+against direct `MvNormal` calls, and the gradient with respect to the shared
+coefficients — held constant against the design, observations, and scales via
+`DifferentiationInterface`'s `Constant` — against the native total.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
