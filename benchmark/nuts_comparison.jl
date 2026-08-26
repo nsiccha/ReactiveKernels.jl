@@ -17,21 +17,11 @@ const _COMPARISON_INNER = "RK_NUTS_COMPARISON_INNER"
 const _MUTATING_FUNCTIONS_REVISION =
     "b353559ef3e391ae2e2d98256b6967903fdfa410"
 
-function _checked_candidate(root)
-    sha = readchomp(`git -C $root rev-parse HEAD`)
-    dirty = readchomp(
-        `git -C $root status --porcelain --untracked-files=no`,
-    )
-    isempty(dirty) || error(
-        "comparison requires a tracked-clean ReactiveKernels candidate; " *
-        "commit or revert these changes first:\n$dirty",
-    )
-    sha
-end
+include(joinpath(@__DIR__, "_repro_guard.jl"))
 
 function _run_pinned_comparison()
     root = normpath(joinpath(@__DIR__, ".."))
-    candidate_sha = _checked_candidate(root)
+    candidate_sha = _require_clean_detached_candidate(root)
     mktempdir(prefix = "reactivekernels-nuts-comparison-") do environment
         Pkg.activate(environment)
 
@@ -48,6 +38,10 @@ function _run_pinned_comparison()
             Pkg.PackageSpec(name = "DynamicHMC", version = v"3.6.1"),
             Pkg.PackageSpec(name = "LogDensityProblems", version = v"2.2.0"),
             Pkg.PackageSpec(name = "MCMCDiagnosticTools", version = v"0.3.19"),
+            # Every sampler's runtime gradient is DI+Enzyme reverse mode, pinned
+            # to the exact versions the DI+Enzyme test suite validated against.
+            Pkg.PackageSpec(name = "DifferentiationInterface", version = v"0.7.21"),
+            Pkg.PackageSpec(name = "Enzyme", version = v"0.13.199"),
         ])
         Pkg.precompile()
 
