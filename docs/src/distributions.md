@@ -21,10 +21,13 @@ simplification pass.
 `Distributions.jl` appears **only as an independent oracle**: it supplies a
 reference value (and a reference allocation figure) that the native kernel is
 checked against. It is an example/test/documentation dependency, never a
-dependency of the package runtime and never part of the compute or gradient
-path. Differentiation goes through `DifferentiationInterface` with the `Enzyme`
-reverse-mode backend, and `Enzyme` differentiates the native recipes only —
-never `Distributions.jl`.
+dependency of the package runtime and never part of the compute path.
+
+`ReactiveKernels` **plans and computes** the density; it does **not**
+differentiate. Automatic differentiation is not the package's job — if a
+downstream sampler needs gradients, that is the consumer's concern, applied to
+the ordinary Julia function `prepare` hands back. These examples therefore carry
+no AD, and demonstrate the forward `have`/`want` story alone.
 
 Each panel is produced from one build-executed artifact. **Raw input** retains
 the literal compact source evaluated during this documentation build, alongside
@@ -40,10 +43,7 @@ A single recipe evaluates the Gaussian log density `-½log2π - logσ - ½z²` i
 closed form from `have = (x, μ, logσ)`. Because `logσ` is a given, the `-logσ`
 term uses it directly and `σ = exp(logσ)` is derived once, only for the
 standardized residual `z = (x - μ)/σ` — no `log(exp(logσ))` round trip. The
-example checks both the scalar value and a real reverse-mode `Enzyme` gradient
-over `(x, μ, logσ)`: the value against `Distributions.logpdf`, and the gradient
-against the same closed-form density written as a plain function, so that
-preparation is shown to preserve AD.
+scalar value is checked against `Distributions.logpdf`.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
@@ -51,13 +51,11 @@ Main.ReactiveKernelsDocs.execute_example(
 )
 ```
 
-## Discrete: Bernoulli observation with a differentiable logit
+## Discrete: Bernoulli observation with a logit
 
 A single recipe selects between the two numerically stable outcome
-log-probabilities `-log1pexp(∓logit)` on the observed bit. The observation is
-deliberately discrete, so differentiation is only with respect to the continuous
-logit. The kernel value is checked against a `Bernoulli` reference and the
-one-dimensional `Enzyme` gradient against the native closed-form density.
+log-probabilities `-log1pexp(∓logit)` on the observed bit. The kernel value is
+checked against a `Bernoulli` reference.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
@@ -74,9 +72,7 @@ a third recipe sums the two terms. `compose` unifies the shared `coefficients`
 port across those separately-authored recipes so the planner sees one parameter
 feeding both densities — which is what `compose` is *for*, and why the scalar
 examples above, being single recipes, use none. The joint value is checked
-against direct `MvNormal` calls, and the gradient with respect to the shared
-coefficients — held constant against the design, observations, and scales via
-`DifferentiationInterface`'s `Constant` — against the native total.
+against direct `MvNormal` calls.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
