@@ -225,13 +225,13 @@ const _NUTSGroup = Union{ReactivePhasePoint,ReactiveObject}
 # ---------------------------------------------------------------------------
 # CompiledNUTSState — the ca9 multinomial NUTS transition running on the flat
 # compiled-reactive group. The tree-growth / U-turn / proposal / statistics
-# orchestration mirrors the ordinary-Julia `NUTSState` oracle
+# orchestration mirrors the ordinary-Julia `_OracleNUTSState` oracle
 # (src/hmc.jl:424-735) line-for-line, but every phase-point read/write is routed
 # through the ONE flat group's handles: `init`, and the two moving endpoints
 # `fwd`/`bwd` selected by the reactive `gofwd` source. The energy error `dham` and
 # `diverged` are read from the group's reactive nodes (init_ham - active_ham),
 # never hand-computed. Recursion, loops, RNG draws and proposal swaps stay
-# ordinary inferred Julia, exactly as in ca9. `NUTSState` is retained unchanged as
+# ordinary inferred Julia, exactly as in ca9. `_OracleNUTSState` is retained unchanged as
 # the parity oracle.
 # ---------------------------------------------------------------------------
 
@@ -385,9 +385,9 @@ end
                         max_depth=10, min_dham=-1000.0)
 
 Build the compiled-reactive multinomial NUTS transition from a flat phase-point
-group produced by [`reactive_nuts_group`](@ref). Same public surface as the
-[`NUTSState`](@ref) oracle — [`step!`](@ref), [`sample!`](@ref),
-[`refresh_momentum!`](@ref), [`diagnostics`](@ref).
+group produced by [`reactive_nuts_group`](@ref). Offers the public sampler
+interface — [`step!`](@ref), [`sample!`](@ref), [`refresh_momentum!`](@ref),
+[`diagnostics`](@ref).
 
 Boundary (honest): the per-transition Hamiltonian work — each endpoint's
 potential/gradient/kinetic/velocity, the active-endpoint selection, the energy
@@ -1052,12 +1052,12 @@ function reset!(stats::TrajectoryStats, point)
     stats
 end
 
-# Forward-endpoint readers per sampler kind (NUTSState oracle vs CompiledNUTSState).
-_traj_fwd_pos(state::NUTSState) = state.fwd.pos
+# Forward-endpoint readers per sampler kind (_OracleNUTSState oracle vs CompiledNUTSState).
+_traj_fwd_pos(state::_OracleNUTSState) = state.fwd.pos
 _traj_fwd_pos(state::CompiledNUTSState) = _cn_fwd_pos(state)
-_traj_fwd_dpos(state::NUTSState) = state.fwd.dham_dpos
+_traj_fwd_dpos(state::_OracleNUTSState) = state.fwd.dham_dpos
 _traj_fwd_dpos(state::CompiledNUTSState) = _cn_fwd_dpos(state)
-_traj_fwd_pot(state::NUTSState) = state.fwd.pot
+_traj_fwd_pot(state::_OracleNUTSState) = state.fwd.pot
 _traj_fwd_pot(state::CompiledNUTSState) = _cn_fwd_pot(state)
 
 function (stats::TrajectoryStats)(state::AbstractNUTSState)

@@ -392,7 +392,7 @@ function _nuts_tree(point)
     )
 end
 
-"Diagnostics for one completed [`NUTSState`](@ref) transition."
+"Diagnostics for one completed multinomial NUTS transition."
 struct NUTSDiagnostics{T}
     depth::Int
     n_steps::Int
@@ -401,26 +401,19 @@ struct NUTSDiagnostics{T}
     energy_error::T
 end
 
-"""
-    NUTSState
-
-Mutable multinomial No-U-Turn sampler state faithfully ported from
-[`ReactiveHMC.jl/src/nuts.jl`](https://github.com/nsiccha/ReactiveHMC.jl/blob/ca9ea4ca41924bb0e1fadc01c717e1333916aba6/src/nuts.jl)
-at `main@ca9ea4ca41924bb0e1fadc01c717e1333916aba6`; that source is
-byte-identical at `dev@a8a33f958ab0dffb5696ce7da7fcdcdd6983c208`.
-The transition uses the generalized endpoint-momentum U-turn criterion from
-that implementation. Hamiltonian values and derivatives are supplied lazily
-by the phase point's compiled ReactiveKernels graph.
-
-The progressive tree-building transition follows Algorithm 3 of Hoffman and
-Gelman, ["The No-U-Turn Sampler: Adaptively Setting Path Lengths in Hamiltonian
-Monte Carlo"](https://jmlr.org/papers/v15/hoffman14a.html), JMLR 15 (2014).
-
-The ported scope is this multinomial transition plus the Euclidean/Riemannian
-phase-point, integrator, adaptation, and statistics utilities used with it. It
-does not claim to include ReactiveHMC's separate fixed-length HMC state or its
-SoftAbs/relativistic phase-point constructors.
-"""
+# _OracleNUTSState — INTERNAL, unexported ordinary-Julia reference oracle (not part
+# of the public surface; the public compiled sampler is CompiledNUTSState via
+# nuts_state/compiled_nuts_state). Mutable multinomial No-U-Turn sampler state
+# faithfully ported from ReactiveHMC.jl/src/nuts.jl
+# (https://github.com/nsiccha/ReactiveHMC.jl/blob/ca9ea4ca41924bb0e1fadc01c717e1333916aba6/src/nuts.jl)
+# at main@ca9ea4ca41924bb0e1fadc01c717e1333916aba6; that source is byte-identical
+# at dev@a8a33f958ab0dffb5696ce7da7fcdcdd6983c208. The transition uses the
+# generalized endpoint-momentum U-turn criterion from that implementation;
+# Hamiltonian values/derivatives are supplied lazily by the phase point's compiled
+# ReactiveKernels graph. The progressive tree-building transition follows Algorithm
+# 3 of Hoffman and Gelman, "The No-U-Turn Sampler" (https://jmlr.org/papers/v15/hoffman14a.html),
+# JMLR 15 (2014). Retained ONLY as the parity oracle for CompiledNUTSState tests.
+#
 # Shared supertype for the ordinary-Julia oracle and the compiled-reactive
 # sampler. The adaptation (step-size search, dual averaging, metric windows) and
 # statistics helpers dispatch on this type through a small state-access interface
@@ -428,7 +421,7 @@ SoftAbs/relativistic phase-point constructors.
 # `_probe_acceptance`, `_set_stepsize!`) so the sampler math is written once.
 abstract type AbstractNUTSState end
 
-mutable struct NUTSState{R,P,F,S,T,TR,PR} <: AbstractNUTSState
+mutable struct _OracleNUTSState{R,P,F,S,T,TR,PR} <: AbstractNUTSState
     rng::R
     init::P
     step_f::F
@@ -448,7 +441,7 @@ mutable struct NUTSState{R,P,F,S,T,TR,PR} <: AbstractNUTSState
     acceptance_sum::T
 end
 
-function Base.getproperty(state::NUTSState, name::Symbol)
+function Base.getproperty(state::_OracleNUTSState, name::Symbol)
     name === :fwd && return _forward(state)
     name === :bwd && return _backward(state)
     name === :dham && return getfield(state, :energy_error)
@@ -456,30 +449,27 @@ function Base.getproperty(state::NUTSState, name::Symbol)
     getfield(state, name)
 end
 
-_forward(state::NUTSState) =
+_forward(state::_OracleNUTSState) =
     state.endpoints[state.go_forward ? 1 : 2]
-_backward(state::NUTSState) =
+_backward(state::_OracleNUTSState) =
     state.endpoints[state.go_forward ? 2 : 1]
 
 # --- State-access interface for the shared adaptation/statistics helpers. ---
-_nuts_position(state::NUTSState) = state.init.pos
-_nuts_metric(state::NUTSState) = state.init.metric
-_set_nuts_metric!(state::NUTSState, metric) = (state.init.metric = metric)
-function _nuts_metric_is_source(state::NUTSState)
+_nuts_position(state::_OracleNUTSState) = state.init.pos
+_nuts_metric(state::_OracleNUTSState) = state.init.metric
+_set_nuts_metric!(state::_OracleNUTSState, metric) = (state.init.metric = metric)
+function _nuts_metric_is_source(state::_OracleNUTSState)
     point = state.init
     hasproperty(point.handles, :metric) &&
         point.state.program.sources[_slot_index(point.handles.metric)]
 end
 
-"""
-    nuts_state(init; rng, step_f, stats_f=nothing,
-               max_depth=10, min_dham=-1000)
-
-Create the ReactiveHMC-compatible multinomial NUTS transition. `step_f` is an
-integrator callable such as `partial(leapfrog!; stepsize=0.25)`. A low-level
-[`step!`](@ref) uses the momentum currently stored in `init`; [`sample!`](@ref)
-refreshes momentum before each transition and is the convenient sampling API.
-"""
+# _oracle_nuts_state(init; rng, step_f, stats_f=nothing, max_depth=10, min_dham=-1000)
+# INTERNAL: builds the ordinary-Julia reference oracle from a single-endpoint
+# ReactivePhasePoint. Not exported and not the public constructor — the public
+# sampler is nuts_state(group)/compiled_nuts_state(group) → CompiledNUTSState. Used
+# only for bit-for-bit parity tests. `step_f` is an integrator callable such as
+# `partial(leapfrog!; stepsize=0.25)`.
 function _oracle_nuts_state(init::ReactivePhasePoint; rng,
                     step_f,
                     stats_f = nothing,
@@ -490,7 +480,7 @@ function _oracle_nuts_state(init::ReactivePhasePoint; rng,
     trees = [_nuts_tree(init) for _ in 1:(max_depth + 1)]
     proposals = [copy(init) for _ in 1:(max_depth + 2)]
     scalar = typeof(float(init.ham - init.ham))
-    NUTSState(
+    _OracleNUTSState(
         rng,
         init,
         step_f,
@@ -522,7 +512,7 @@ function _reset_tree!(tree)
     tree
 end
 
-function _reset_transition!(state::NUTSState)
+function _reset_transition!(state::_OracleNUTSState)
     copyto!(state.endpoints[1], state.init)
     copyto!(state.endpoints[2], state.init)
     for proposal in state.proposals
@@ -553,14 +543,14 @@ _compute_criterion_sum(left_momentum, right_momentum,
         forward_velocity,
     )
 
-function _swap_proposal!(state::NUTSState, first_index::Int,
+function _swap_proposal!(state::_OracleNUTSState, first_index::Int,
                          second_index::Int = length(state.proposals))
     state.proposals[first_index], state.proposals[second_index] =
         state.proposals[second_index], state.proposals[first_index]
     state
 end
 
-function _flip!(state::NUTSState, depth::Int)
+function _flip!(state::_OracleNUTSState, depth::Int)
     depth > 1 || return state
     state.go_forward = !state.go_forward
     tree = state.trees[depth]
@@ -571,12 +561,12 @@ function _flip!(state::NUTSState, depth::Int)
     state
 end
 
-function _collect_stats!(state::NUTSState)
+function _collect_stats!(state::_OracleNUTSState)
     state.stats_f === nothing || state.stats_f(state)
     state
 end
 
-function _start_tree!(state::NUTSState, depth::Int)
+function _start_tree!(state::_OracleNUTSState, depth::Int)
     if depth == 1
         state.step_f(_forward(state))
         state.n_steps += 1
@@ -610,7 +600,7 @@ function _start_tree!(state::NUTSState, depth::Int)
     state
 end
 
-function _finish_tree!(state::NUTSState, depth::Int)
+function _finish_tree!(state::_OracleNUTSState, depth::Int)
     tree = state.trees[depth]
     supertree = state.trees[depth + 1]
     tree.log_weight[2] = tree.log_weight[1]
@@ -670,7 +660,7 @@ function _finish_tree!(state::NUTSState, depth::Int)
 end
 
 "Advance one multinomial NUTS transition using the momentum already in `state.init`."
-function step!(state::NUTSState)
+function step!(state::_OracleNUTSState)
     _reset_transition!(state)
     backward = _backward(state)
     @. backward.mom *= -1
@@ -694,7 +684,7 @@ function step!(state::NUTSState)
     diagnostics(state)
 end
 
-function diagnostics(state::NUTSState)
+function diagnostics(state::_OracleNUTSState)
     acceptance = state.n_steps == 0 ? zero(state.acceptance_sum) :
                  state.acceptance_sum / state.n_steps
     NUTSDiagnostics(
@@ -707,7 +697,7 @@ function diagnostics(state::NUTSState)
 end
 
 "Draw a fresh Gaussian momentum appropriate for the phase point metric."
-function refresh_momentum!(state::NUTSState)
+function refresh_momentum!(state::_OracleNUTSState)
     point = state.init
     factor = point.chol_metric
     mutate!(point, :mom) do momentum
@@ -718,7 +708,7 @@ function refresh_momentum!(state::NUTSState)
 end
 
 "Refresh momentum and run one NUTS transition."
-function sample!(state::NUTSState)
+function sample!(state::_OracleNUTSState)
     state.stats_f isa TrajectoryStats && reset!(state.stats_f, state.init)
     refresh_momentum!(state)
     step!(state)
@@ -790,7 +780,7 @@ function _set_stepsize!(state::AbstractNUTSState, stepsize)
     state
 end
 
-function _probe_acceptance(state::NUTSState, stepsize)
+function _probe_acceptance(state::_OracleNUTSState, stepsize)
     refresh_momentum!(state)
     initial_energy = state.init.ham
     proposal = copy(state.init)

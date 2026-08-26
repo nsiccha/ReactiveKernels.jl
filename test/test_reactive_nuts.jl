@@ -294,7 +294,7 @@ end
 
 @testset "CompiledNUTSState — transition-by-transition parity with the oracle" begin
     # The compiled-reactive transition must be BYTE-for-byte deterministically
-    # identical to the ordinary-Julia NUTSState oracle under a shared RNG stream:
+    # identical to the ordinary-Julia _OracleNUTSState oracle under a shared RNG stream:
     # same draws in the same order, so every accepted sample and every diagnostic
     # field matches. Both are driven by the SAME analytic potential (the oracle via
     # its (value, gradient) boundary, the compiled group via the in-place boundary).
@@ -423,6 +423,37 @@ end
                                  Matrix{Float64}(I, 3, 3), zeros(3), zeros(3))
     @test_throws ArgumentError compiled_nuts_state(
         plain; rng = Xoshiro(1), step_f = partial(leapfrog!; stepsize = 0.1))
+end
+
+@testset "GAP-1e — public surface is compiled-only (no NUTSState type)" begin
+    # The internal ordinary-Julia oracle was renamed NUTSState -> _OracleNUTSState:
+    # there is NO `NUTSState` binding at all, and it is absent from the public names.
+    @test !isdefined(ReactiveKernels, :NUTSState)
+    @test !(:NUTSState in names(ReactiveKernels; all = false))
+    # The oracle type/constructor stay genuinely internal (unexported).
+    @test !(:_OracleNUTSState in names(ReactiveKernels; all = false))
+    @test !(:_oracle_nuts_state in names(ReactiveKernels; all = false))
+    @test isdefined(ReactiveKernels, :_OracleNUTSState)   # exists, just not public
+
+    # The public constructor returns the compiled-reactive state...
+    D = 3
+    metric = Matrix{Float64}(I, D, D)
+    group = reactive_nuts_group(_std_pot_grad!, metric, _det_pos(D), zeros(D))
+    state = nuts_state(group; rng = Xoshiro(1),
+                       step_f = partial(leapfrog!; stepsize = 0.2))
+    @test state isa CompiledNUTSState
+    # ...and a plain single-endpoint phase point still throws actionable guidance
+    # pointing at the compiled group.
+    plain = euclidean_phasepoint(_std_pot, q -> (_std_pot(q), copy(q)),
+                                 metric, zeros(D), zeros(D))
+    err = try
+        nuts_state(plain; rng = Xoshiro(1), step_f = partial(leapfrog!; stepsize = 0.2))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("reactive_nuts_group", sprint(showerror, err))
 end
 
 @testset "CompiledNUTSState — public nuts_state default + integrator/threshold" begin
