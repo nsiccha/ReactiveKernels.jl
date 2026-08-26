@@ -971,6 +971,70 @@ end
         @test collision_function(2) == 3
     end
 
+    @testset "control-flow and scoping forms in recipe bodies" begin
+        # A recipe RHS is compiled into an opaque ordinary-Julia operation over
+        # its free ports, so arbitrary control-flow and scoping forms run as
+        # ordinary Julia. Free-port detection flows through them and a `catch`
+        # variable colliding with a port is renamed hygienically.
+
+        # try/catch: a port referenced only inside the try body is still a dep,
+        # and the fallback path executes ordinary Julia.
+        trycatch = @kernel tc(a, b) = begin
+            r = try
+                a + b
+            catch
+                zero(a)
+            end
+        end
+        @test Tuple(v.name for v in kernel_graph(trycatch).recipes[1].inputs) == (:a, :b)
+        @test prepare(trycatch)(1.0, 2.0) == 3.0
+
+        # catch-variable hygiene: a port named `e` is not shadowed by `catch e`.
+        catch_hygiene = @kernel ch(a, e) = begin
+            r = try
+                a + e
+            catch e
+                e
+            end
+        end
+        @test Tuple(v.name for v in kernel_graph(catch_hygiene).recipes[1].inputs) == (:a, :e)
+        @test prepare(catch_hygiene)(1.0, 2.0) == 3.0
+
+        # try/finally.
+        tryfinally = @kernel tf(a) = begin
+            r = try
+                a * 2
+            finally
+            end
+        end
+        @test prepare(tryfinally)(3.0) == 6.0
+
+        # let binding referencing a port.
+        letform = @kernel lf(a, b) = begin
+            r = let t = a + b
+                t * 2
+            end
+        end
+        @test Tuple(v.name for v in kernel_graph(letform).recipes[1].inputs) == (:a, :b)
+        @test prepare(letform)(1.0, 2.0) == 6.0
+
+        # comprehension over a port.
+        comprehension = @kernel cp(v) = begin
+            r = [x^2 for x in v]
+        end
+        @test Tuple(v.name for v in kernel_graph(comprehension).recipes[1].inputs) == (:v,)
+        @test prepare(comprehension)([1.0, 2.0, 3.0]) == [1.0, 4.0, 9.0]
+
+        # do-block referencing a port.
+        doblock = @kernel db(v) = begin
+            r = map(v) do x
+                x + 1
+            end
+        end
+        @test Tuple(v.name for v in kernel_graph(doblock).recipes[1].inputs) == (:v,)
+        @test prepare(doblock)([1.0, 2.0]) == [2.0, 3.0]
+    end
+
     @testset "pure named-port composition and explicit boundaries" begin
         base = @kernel begin
             x::Float64
