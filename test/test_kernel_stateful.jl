@@ -72,27 +72,30 @@ function _types_match(a, b)
 end
 
 # --- top-level stateful fixtures (method-bearing ⇒ const ⇒ top-level only) ---
+# V7 implicit-field pivot: nested methods declare NO `self` formal; bare unshadowed
+# names are the owner's fields; `__self__` appears ONLY as the first actual of a
+# sibling object-pass call.
 @kernel StatefulObjFixture(ham, pos, mom) = begin
     derived = ham
-    leapfrog!(self) = begin
-        @. self.pos += self.mom
+    leapfrog!() = begin
+        @. pos += mom
     end
-    function refresh!(self, rng)
-        self.mom = rng
+    function refresh!(rng)
+        mom = rng
     end
 end
 
 # kwargs/defaults, typed args + `where`, and a return `::` annotation.
 @kernel StatefulSigFixture(a) = begin
     r = a
-    fit!(self, x; target = 0.8) = begin
-        self.r = x + target
+    fit!(x; target = 0.8) = begin
+        r = x + target
     end
-    m!(self::S, x::S) where {S} = begin
-        self.r = x
+    m!(x::S) where {S} = begin
+        r = x
     end
-    function n!(self)::Nothing
-        self.r = 0
+    function n!()::Nothing
+        r = 0
         nothing
     end
 end
@@ -102,37 +105,51 @@ end
 # (Increment 1 does not lower them), so the annotations/names need not resolve.
 @kernel StatefulSplatFixture(a) = begin
     r = a
-    step!(self, x::AbstractMatrix; kwargs...) = begin
-        self.r = x
+    step!(x::AbstractMatrix; kwargs...) = begin
+        r = x
     end
-    scan!(self, xs...) = begin
-        self.r = xs
+    scan!(xs...) = begin
+        r = xs
     end
-    tune!(self, y; target = 0.8, opts...) = begin
-        self.r = y + target
+    tune!(y; target = 0.8, opts...) = begin
+        r = y + target
     end
 end
 
 # Recipe-source provenance: conditional (`? :`), index (`[]`), and `Ref(...)` call
 # structure in the recipe portion — the exact shapes poc's MethodIR must recover.
+# (The `Ref` here exercises arbitrary-AST capture fidelity; it is NOT production
+# NUTS storage, which is the no-Ref concrete backend.)
 @kernel StatefulRecipeSrcFixture(fwdbwd, gofwd) = begin
     fwd = Ref(fwdbwd[gofwd ? 1 : 2])
     bwd = Ref(fwdbwd[gofwd ? 2 : 1])
-    swap!(self) = begin
-        self.fwd = bwd
+    swap!() = begin
+        fwd = bwd
     end
 end
 
 @kernel StatefulOneFixture(a) = begin
     r = a
-    m!(self) = begin
-        self.r = 1
+    m!() = begin
+        r = 1
     end
 end
 @kernel StatefulTwoFixture(a) = begin
     r = a
-    m!(self) = begin
-        self.r = 1
+    m!() = begin
+        r = 1
+    end
+end
+
+# Implicit-receiver sibling object-pass: `drive!` invokes sibling `refresh!` with
+# `__self__` as the synthetic receiver actual → a recorded receiver edge.
+@kernel StatefulSiblingFixture(a) = begin
+    r = a
+    refresh!(x) = begin
+        r = x
+    end
+    drive!(x) = begin
+        refresh!(__self__, x)
     end
 end
 
@@ -171,15 +188,15 @@ end
     @testset "(1)+(2) short/long extraction with kwargs/typed/where/return-ann" begin
         ms = RKS.kernel_methods(StatefulSigFixture)
         @test length(ms) == 3
-        # fit!(self, x; target = 0.8): self, positional x, keyword target
-        @test (ms[1].name, ms[1].form, ms[1].self, ms[1].argnames) ==
-              (:fit!, :short, :self, (:x, :target))
-        # m!(self::S, x::S) where {S}: typed args, self peeled through `where`
-        @test (ms[2].name, ms[2].form, ms[2].self, ms[2].argnames) ==
-              (:m!, :short, :self, (:x,))
-        # function n!(self)::Nothing: return annotation peeled
-        @test (ms[3].name, ms[3].form, ms[3].self, ms[3].argnames) ==
-              (:n!, :long, :self, ())
+        # fit!(x; target = 0.8): positional x, keyword target (implicit receiver)
+        @test (ms[1].name, ms[1].form, ms[1].argnames) ==
+              (:fit!, :short, (:x, :target))
+        # m!(x::S) where {S}: typed arg through `where`
+        @test (ms[2].name, ms[2].form, ms[2].argnames) ==
+              (:m!, :short, (:x,))
+        # function n!()::Nothing: return annotation peeled, no formals
+        @test (ms[3].name, ms[3].form, ms[3].argnames) ==
+              (:n!, :long, ())
         # (5) argnames is an immutable Tuple, not a Vector
         @test all(m -> m.argnames isa Tuple, ms)
         # the exposed metadata hands poc the FULL authored signature + peeled call
@@ -192,31 +209,31 @@ end
 
     @testset "extraction retains BOTH the full authored signature and peeled call" begin
         # constrained `where` binder is preserved in the signature, absent from the call
-        m = RKS._kernel_extract_method(:(m!(self::S, x::S) where {S<:Real} = x), :short)
+        m = RKS._kernel_extract_method(:(m!(x::S) where {S<:Real} = x), :short)
         @test occursin("where", string(m.signature))
         @test occursin("S", string(m.signature)) && occursin("Real", string(m.signature))
         @test !occursin("where", string(m.call))          # peeled call has no where
         @test m.call.head === :call
-        @test (m.name, m.self, m.argnames) == (:m!, :self, (:x,))
+        @test (m.name, m.argnames) == (:m!, (:x,))
 
         # return `::` annotation preserved in the signature, absent from the call
         n = RKS._kernel_extract_method(
-            :(function n!(self)::Nothing; nothing; end), :long)
+            :(function n!()::Nothing; nothing; end), :long)
         @test occursin("Nothing", string(n.signature))    # ::Nothing retained
         @test n.call.head === :call
-        @test string(n.call) == string(:(n!(self)))        # peeled call drops ::Nothing
-        @test (n.name, n.self, n.argnames) == (:n!, :self, ())
+        @test string(n.call) == string(:(n!()))            # peeled call drops ::Nothing
+        @test (n.name, n.argnames) == (:n!, ())
     end
 
     @testset "kwargs-splat + positional-vararg extraction (forwarding-ready)" begin
         ms = RKS.kernel_methods(StatefulSplatFixture)
         @test length(ms) == 3
 
-        # step!(self, x::AbstractMatrix; kwargs...) — the ReactiveHMC fidelity sig:
-        # explicit self found through the `:parameters` block; x is the one scalar
-        # arg; `kwargs` is stored as the keyword splat, NOT as an argname.
+        # step!(x::AbstractMatrix; kwargs...) — the ReactiveHMC fidelity sig (implicit
+        # receiver): x is the one scalar positional; `kwargs` is stored as the keyword
+        # splat, NOT as an argname.
         s = ms[1]
-        @test (s.name, s.form, s.self, s.argnames) == (:step!, :short, :self, (:x,))
+        @test (s.name, s.form, s.argnames) == (:step!, :short, (:x,))
         @test s.vararg === nothing
         @test s.kwargs_splat === :kwargs
         # forwarding AST preserved verbatim — the raw signature + peeled call both
@@ -226,17 +243,17 @@ end
         @test occursin("kwargs...", string(s.call))
         @test occursin("AbstractMatrix", string(s.signature))
 
-        # scan!(self, xs...) — positional vararg recorded in `vararg`, not argnames.
+        # scan!(xs...) — positional vararg recorded in `vararg`, not argnames.
         v = ms[2]
-        @test (v.name, v.self, v.argnames) == (:scan!, :self, ())
+        @test (v.name, v.argnames) == (:scan!, ())
         @test v.vararg === :xs
         @test v.kwargs_splat === nothing
         @test occursin("xs...", string(v.call))
 
-        # tune!(self, y; target = 0.8, opts...) — named kwarg stays in argnames,
+        # tune!(y; target = 0.8, opts...) — named kwarg stays in argnames,
         # the trailing `opts...` is the keyword splat.
         t = ms[3]
-        @test (t.name, t.self, t.argnames) == (:tune!, :self, (:y, :target))
+        @test (t.name, t.argnames) == (:tune!, (:y, :target))
         @test t.vararg === nothing
         @test t.kwargs_splat === :opts
         @test occursin("opts...", string(t.signature))
@@ -245,23 +262,42 @@ end
         @test all(m -> hasproperty(m, :vararg) && hasproperty(m, :kwargs_splat), ms)
     end
 
-    @testset "splat storage + self-splat rejection (direct extraction)" begin
+    @testset "splat storage + self/__self__-formal rejection (direct extraction)" begin
         m = RKS._kernel_extract_method(
-            :(step!(self, x::AbstractMatrix; kwargs...) = self.r = x), :short)
-        @test (m.name, m.self, m.argnames, m.vararg, m.kwargs_splat) ==
-              (:step!, :self, (:x,), nothing, :kwargs)
+            :(step!(x::AbstractMatrix; kwargs...) = (r = x)), :short)
+        @test (m.name, m.argnames, m.vararg, m.kwargs_splat) ==
+              (:step!, (:x,), nothing, :kwargs)
         # both slots are Union{Symbol,Nothing} — immutable metadata
         @test m.kwargs_splat isa Symbol && m.vararg === nothing
 
-        # a plain method (no splats) reports `nothing` for BOTH new slots — the
-        # additive fields don't perturb the existing extraction contract.
-        n = RKS._kernel_extract_method(:(m!(self, x; k = 1) = self.r), :short)
+        # a plain method (no splats) reports `nothing` for BOTH slots — the additive
+        # fields don't perturb the extraction contract.
+        n = RKS._kernel_extract_method(:(m!(x; k = 1) = r), :short)
         @test n.vararg === nothing && n.kwargs_splat === nothing
         @test n.argnames == (:x, :k)
 
-        # self itself may not be a vararg splat
+        # a `self`/`__self__` formal is rejected (implicit receiver) — scalar or splat.
+        @test_throws ArgumentError RKS._kernel_extract_method(:(bad!(self) = 1), :short)
+        @test_throws ArgumentError RKS._kernel_extract_method(:(bad!(__self__) = 1), :short)
+        @test_throws ArgumentError RKS._kernel_extract_method(:(bad!(self...) = 1), :short)
+    end
+
+    @testset "implicit-receiver `__self__` object-pass recognition + rejection" begin
+        # a sibling call `refresh!(__self__, x)` records the receiver edge.
+        d = RKS._kernel_extract_method(:(drive!(x) = refresh!(__self__, x)), :short)
+        @test d.sibling_calls == (:refresh!,)
+        # no `__self__` ⇒ no edges.
+        @test RKS._kernel_extract_method(:(plain!(x) = (r = x)), :short).sibling_calls == ()
+        # the fixture exposes the edge on its `drive!` method.
+        sib = RKS.kernel_methods(StatefulSiblingFixture)
+        drive = sib[findfirst(m -> m.name === :drive!, sib)]
+        @test drive.sibling_calls == (:refresh!,)
+        # `__self__.field` (field qualifier) is rejected.
         @test_throws ArgumentError RKS._kernel_extract_method(
-            :(bad!(self...) = 1), :short)
+            :(m!(x) = (__self__.r = x)), :short)
+        # a bare `__self__` outside an object-pass actual is rejected.
+        @test_throws ArgumentError RKS._kernel_extract_method(:(m!() = (y = __self__)), :short)
+        @test_throws ArgumentError RKS._kernel_extract_method(:(m!() = sib!(x, __self__)), :short)
     end
 
     @testset "recipe-source provenance: frozen capture + kernel_recipe_ast" begin
@@ -389,16 +425,30 @@ end
         @test RKS.kernel_spec(obj) isa KernelSpec
         ms = RKS.kernel_methods(obj)
         @test length(ms) == 2
-        @test (ms[1].name, ms[1].form, ms[1].self, ms[1].argnames) ==
-              (:leapfrog!, :short, :self, ())
-        @test (ms[2].name, ms[2].form, ms[2].self, ms[2].argnames) ==
-              (:refresh!, :long, :self, (:rng,))
+        @test (ms[1].name, ms[1].form, ms[1].argnames) ==
+              (:leapfrog!, :short, ())
+        @test (ms[2].name, ms[2].form, ms[2].argnames) ==
+              (:refresh!, :long, (:rng,))
     end
 
-    @testset "(4) a method with no explicit self rejects at expansion" begin
-        @test_throws Exception @macroexpand @kernel bad(a) = begin
+    @testset "(4) implicit receiver: no-self ACCEPTED; self/__self__ formal REJECTS" begin
+        # a method with no receiver formal is the NORMAL form now — expands cleanly.
+        @test (@macroexpand @kernel ok(a) = begin
             r = a
             noself!() = begin
+                r = 1
+            end
+        end) isa Expr
+        # a formal literally named `self` or `__self__` is rejected at expansion.
+        @test_throws Exception @macroexpand @kernel bad1(a) = begin
+            r = a
+            m!(self) = begin
+                r = 1
+            end
+        end
+        @test_throws Exception @macroexpand @kernel bad2(a) = begin
+            r = a
+            m!(__self__) = begin
                 r = 1
             end
         end
@@ -409,8 +459,8 @@ end
             @eval function _stateful_in_local_scope()
                 @kernel inner(a) = begin
                     r = a
-                    m!(self) = begin
-                        self.r = 1
+                    m!(x) = begin
+                        r = 1
                     end
                 end
             end

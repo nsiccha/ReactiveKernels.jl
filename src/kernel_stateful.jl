@@ -78,20 +78,29 @@ end
 kernel_view_path(::KernelView{Parent,Path}) where {Parent,Path} = Path
 kernel_view_parent(view::KernelView) = getfield(view, :parent)
 
-# --- (4)+(5) short/long method extraction, explicit-self contract -----------
+# --- (4)+(5) short/long method extraction, IMPLICIT-RECEIVER contract --------
+#
+# V7 implicit-field pivot (RK 2026-08-26): a nested method declares NO receiver
+# formal. Bare unshadowed names are the owner's fields (poc's IR resolves
+# field-vs-local by lexical scope from the stored AST + the recipe-portion
+# `kernel_spec` ports); a lexical local/formal shadows a field. The ONLY
+# object-pass spelling is `__self__` as the FIRST positional actual of a sibling
+# call (`flip!(__self__, depth)`), recorded here as a receiver edge. A
+# `self`/`__self__` FORMAL, or `__self__` used as a field qualifier / anywhere
+# but an object-pass actual, is REJECTED.
 
 struct _KernelMethod
     name::Symbol
     form::Symbol             # :short | :long
-    self::Symbol             # the explicit first formal (no __self__ magic)
-    argnames::Tuple{Vararg{Symbol}}   # immutable — SCALAR (non-splat) formal names
+    argnames::Tuple{Vararg{Symbol}}   # SCALAR positional formal names (implicit receiver — NO self)
     vararg::Union{Symbol,Nothing}       # positional slurp `xs...` name, or nothing
     kwargs_splat::Union{Symbol,Nothing} # keyword slurp `; kwargs...` name, or nothing
     signature::Any           # the FULL AUTHORED signature AST (where binders +
                              #   constraints + return `::` annotation + splats preserved)
     call::Any                # the peeled `:call` (name + formals, splats retained
                              #   verbatim for forwarding) used for extraction
-    body::Any                # the raw method-body AST (handed to poc's emission)
+    body::Any                # the raw method-body AST (bare fields; handed to poc's emission)
+    sibling_calls::Tuple{Vararg{Symbol}}  # callee names invoked with `__self__` (receiver edges)
 end
 
 # A vararg/kwargs SLURP formal (`xs...` positionally, `; kwargs...` in a keyword
@@ -109,6 +118,53 @@ _kernel_arg_name(a) =
     (a isa Expr && a.head === :(::) && a.args[1] isa Expr &&
         a.args[1].head === :kw) ? a.args[1].args[1] : nothing
 
+# Validate/recognize `__self__` usage in a method body and collect the sibling
+# receiver edges. `__self__` is legal ONLY as the FIRST positional actual of a
+# call (`sibling!(__self__, …)`); `__self__.field` (field qualifier) and any other
+# bare `__self__` are rejected. Returns the tuple of callee names so invoked.
+function _kernel_self_usage(mname::Symbol, body)
+    callees = Symbol[]
+    local walk
+    walk = function (x, self_ok::Bool)
+        if x === :__self__
+            self_ok || throw(ArgumentError(
+                "stateful @kernel method :$mname uses `__self__` outside an object-pass call " *
+                "actual — it is only the synthetic receiver in `sibling!(__self__, …)`"))
+            return
+        end
+        x isa Expr || return
+        if x.head === :(.) && !isempty(x.args) && x.args[1] === :__self__
+            throw(ArgumentError(
+                "stateful @kernel method :$mname uses `__self__.` as a field qualifier; " *
+                "fields are BARE (no `self.`/`__self__.`) and `__self__` is only an object-pass actual"))
+        elseif x.head === :call
+            callee = x.args[1]
+            pos = Any[]
+            kws = Any[]
+            for a in x.args[2:end]
+                (a isa Expr && a.head === :parameters) ? append!(kws, a.args) : push!(pos, a)
+            end
+            if !isempty(pos) && pos[1] === :__self__ && callee isa Symbol
+                push!(callees, callee)
+            end
+            walk(callee, false)
+            for (i, a) in enumerate(pos)
+                walk(a, i == 1)          # only the first positional slot admits a bare `__self__`
+            end
+            for a in kws
+                walk(a, false)
+            end
+        else
+            for a in x.args
+                walk(a, false)
+            end
+        end
+        return
+    end
+    walk(body, false)
+    Tuple(callees)
+end
+
 function _kernel_extract_method(stmt, form)
     raw_sig = stmt.args[1]                       # full authored signature (unpeeled)
     call = _kernel_peel_signature(raw_sig)       # the underlying :call
@@ -117,34 +173,21 @@ function _kernel_extract_method(stmt, form)
     name isa Symbol || throw(ArgumentError(
         "stateful @kernel method must have a plain name; got $(repr(name))"))
     formals = call.args[2:end]
-    # Julia places a keyword `:parameters` block BEFORE the positional formals, so
-    # separate kwargs before locating the explicit `self` (the first POSITIONAL).
+    # Julia places a keyword `:parameters` block BEFORE the positional formals.
     kwparams = Any[]
     positionals = formals
     if !isempty(formals) && formals[1] isa Expr && formals[1].head === :parameters
         kwparams = formals[1].args
         positionals = formals[2:end]
     end
-    isempty(positionals) && throw(ArgumentError(
-        "stateful @kernel method :$name needs an explicit `self` first positional " *
-        "formal (explicit self is required — no hidden __self__)"))
-    # Self is the first POSITIONAL and must be an ordinary formal — never a slurp
-    # (`self...` is nonsensical, and its inner name would otherwise be mis-read as
-    # self by the recursive `_kernel_arg_name`).
-    _kernel_is_splat(positionals[1]) && throw(ArgumentError(
-        "stateful @kernel method :$name self formal cannot be a vararg splat " *
-        "$(repr(positionals[1]))"))
-    self = _kernel_arg_name(positionals[1])
-    self isa Symbol || throw(ArgumentError(
-        "stateful @kernel method :$name has an unsupported self formal $(repr(positionals[1]))"))
-    # Ordinary (scalar) formal names go into `argnames`. A positional `xs...` slurp
-    # and a keyword `; kwargs...` slurp are each recorded SEPARATELY: their names are
-    # bindings, not scalar values, so a consumer that iterates `argnames` never
-    # mistakes a slurp for a single argument — while the raw `signature`/`call`
-    # retain the splat AST verbatim for forwarding.
+    # IMPLICIT RECEIVER: methods declare NO `self` formal (zero positionals is fine).
+    # ALL positionals are ordinary formals. A positional `xs...` slurp and a keyword
+    # `; kwargs...` slurp are recorded SEPARATELY: their names are bindings, not
+    # scalar values, so a consumer iterating `argnames` never mistakes a slurp for a
+    # single argument — while the raw `signature`/`call` retain the splat AST verbatim.
     argnames = Symbol[]
     vararg = nothing
-    for a in positionals[2:end]
+    for a in positionals
         if _kernel_is_splat(a)
             vararg === nothing || throw(ArgumentError(
                 "stateful @kernel method :$name has more than one positional vararg"))
@@ -175,8 +218,20 @@ function _kernel_extract_method(stmt, form)
             push!(argnames, n)
         end
     end
-    _KernelMethod(name, form, self, Tuple(argnames), vararg, kwargs_splat,
-                  raw_sig, call, body)
+    # Zero self/__self__ formals: a formal literally named `self` or `__self__` is
+    # REJECTED — the receiver is synthesized, never author-written.
+    for n in argnames
+        (n === :self || n === :__self__) && throw(ArgumentError(
+            "stateful @kernel method :$name declares a `$n` formal; the receiver is implicit " *
+            "(zero self/__self__ formals) — bare unshadowed names are the owner's fields"))
+    end
+    (vararg === :self || vararg === :__self__ || kwargs_splat === :self ||
+        kwargs_splat === :__self__) && throw(ArgumentError(
+        "stateful @kernel method :$name declares a `self`/`__self__` splat formal; the receiver is implicit"))
+    # Recognize/validate `__self__` object-pass usage and record the receiver edges.
+    sibling_calls = _kernel_self_usage(name, body)
+    _KernelMethod(name, form, Tuple(argnames), vararg, kwargs_splat,
+                  raw_sig, call, body, sibling_calls)
 end
 
 # --- (3) FROZEN, detached child-capture snapshot ----------------------------
@@ -418,9 +473,10 @@ function _kernel_stateful_expand(name, signature_inputs, call_signature, block,
     # Increment 2's MethodIR emission (typed MethodId, return-annotation semantics).
     # The AST fields are embedded as values (immutable, inspectable).
     method_meta = Tuple(
-        (; name = m.name, form = m.form, self = m.self, argnames = m.argnames,
+        (; name = m.name, form = m.form, argnames = m.argnames,
            vararg = m.vararg, kwargs_splat = m.kwargs_splat,
-           signature = m.signature, call = m.call, body = m.body)
+           signature = m.signature, call = m.call, body = m.body,
+           sibling_calls = m.sibling_calls)
         for m in methods)
 
     # Capture the recipe-portion SOURCE as a detached, recursively-frozen AST (poc's
