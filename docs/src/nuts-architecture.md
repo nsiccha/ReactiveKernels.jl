@@ -2,12 +2,11 @@
 
 This page is an **ergonomic acceptance test**. It asks the real question behind the
 fused No-U-Turn sampler: *how easy is it to author an efficient, allocation-free,
-reusable mathematical kernel in `ReactiveKernels`?* It shows the **concise author
-syntax we intend** beside the **compiler expansion that actually runs**, measures
-the author-effort gap, and labels every remaining author-facing workaround as an
-**open package defect** — tracked in
-[`ReactiveKernels:syntax` todo `152a6td`](https://claude.ai/code). The fused NUTS
-leaf is the canonical usability gate.
+reusable mathematical kernel in `ReactiveKernels`?* It shows the **approved target
+author syntax** (fixture v2) beside the **kernel that actually runs today**, and states
+exactly what the compiler already infers versus what this task still has to build —
+tracked in [`ReactiveKernels:syntax` todo `152a6td`](https://claude.ai/code). The fused
+NUTS endpoint is the canonical usability gate.
 
 Where an *actual* compiled program exists it is shown through the build-executed
 **Raw input / Generated kernel / Compute DAG** renderer; where a piece is not yet
@@ -42,95 +41,134 @@ reactive engine — it needs one straight-line schedule compiled once, performin
 **no** `get!`, validity, or invalidation work in the hot path. That is the fused
 leaf below.
 
-## The usability gate: authoring the fused leaf three ways
+## The usability gate: authoring an endpoint three ways
 
-Here is the same leaf authored three ways. The middle column — the **current
-low-level reality** — is the one that runs today and is build-executed further down.
-The goal of `152a6td` is to make the third column produce the middle column's kernel.
+The same Hamiltonian endpoint, authored three ways. Column 2 is what runs **today**
+(and is build-executed in the Unit A panel below); Column 3 is the **approved target
+syntax** this task delivers (`ReactiveKernels:syntax` `152a6td`, fixture v2). Column 3
+is illustrative — it is **not** executable yet, so no generated/DAG pane is shown for
+it; the honest "what exists vs what this task builds" split is spelled out beneath it.
 
-### 1. Handwritten mutable Julia — fast, but inline and non-reusable
-
-```julia
-# Allocation-free by hand: every buffer, the schedule, and the mutation order are
-# hand-managed and hard-wired to this one leaf. Not reusable, not composable.
-function leapfrog_leaf!(new_pos, new_mom, new_vel, gradient, half,
-                        pos, mom, old_grad, chol, stepsize, init_ham,
-                        threshold, potential_gradient!, logdet_chol)
-    @. half = mom - 0.5 * stepsize * old_grad
-    copyto!(new_vel, half); ldiv!(chol, new_vel)
-    @. new_pos = pos + stepsize * new_vel
-    value = potential_gradient!(gradient, new_pos)          # the one gradient
-    @. new_mom = half - 0.5 * stepsize * gradient
-    copyto!(new_vel, new_mom); ldiv!(chol, new_vel)
-    kinetic = (logdet_chol + dot(new_mom, new_vel)) / 2
-    new_ham = value + kinetic
-    dham = init_ham - new_ham
-    (; new_pos, new_mom, new_vel, gradient, new_ham,
-       dham, diverged = !(dham >= threshold))
-end
-```
-
-### 2. Current low-level ReactiveKernels — reusable and allocation-free, but heavy to author
-
-This is what an author must write **today** to get a reusable, allocation-free
-kernel: build the graph explicitly, split changed from persistent inputs by hand,
-hand-write a per-recipe cache policy, and drop to the internal
-`_prepare_nonallocating` because the public `prepare_nonallocating` reallocates. It
-is build-executed in the panel below. **Every hand-managed concept in it is an open
-defect** (see the table that follows).
-
-### 3. Intended public syntax — the acceptance target (design owned by `152a6td`)
+### 1. Handwritten mutable Julia — fast, but hand-everything
 
 ```julia
-# TARGET (illustrative — design owned by ReactiveKernels:syntax 152a6td):
-# mathematics + explicit mutation intent; the compiler derives the changed/persistent
-# split, owned/borrowed storage, per-recipe cache policy, and alias/effect metadata.
-@kernel leapfrog_leaf(pos, mom, old_grad;                    # per-call inputs
-                      chol, stepsize, init_ham, threshold,
-                      potential_gradient!, logdet_chol) = begin   # persistent inputs
-    half     = mom - 0.5 * stepsize * old_grad
-    new_pos  = pos + stepsize * (chol \ half)
-    bundle   = potential_gradient!(new_pos)                  # owned value+gradient bundle
-    new_mom  = half - 0.5 * stepsize * gradient(bundle)
-    kinetic  = (logdet_chol + dot(new_mom, chol \ new_mom)) / 2
-    new_ham  = value(bundle) + kinetic
-    dham     = init_ham - new_ham
-    diverged = !(dham >= threshold)
+mutable struct HamEndpoint{T,M}
+    pos::Vector{T}; mom::Vector{T}; metric::M
+    chol; logdetM::T                       # hoisted by hand: recomputed only on metric change
+    grad::Vector{T}; vel::Vector{T}        # hand-owned reused buffers
+    pot::T; kin::T; ham::T
 end
+function refresh!(s)                        # author hand-writes ordering + what to recompute
+    s.pot = s.potential_gradient!(s.grad, s.pos)
+    ldiv!(s.vel, s.chol, s.mom); s.kin = 0.5*(s.logdetM + dot(s.mom, s.vel))
+    s.ham = s.pot + s.kin
+end
+function leapfrog!(s, h)
+    @. s.mom -= 0.5h*s.grad; refresh!(s)    # must remember to refresh after each write
+    @. s.pos += h*s.vel;     refresh!(s)
+    @. s.mom -= 0.5h*s.grad
+end
+adapt_metric!(s, M) = (s.metric = M; s.chol = cholesky(M); s.logdetM = logdet(s.chol); refresh!(s))
 ```
 
-The function-shaped `@kernel` surface (mathematics-as-recipes, have→want planning)
-is real today; what is **not** yet automatic is deriving the *allocation-free
-owned-slot schedule* from it without the column-2 plumbing. Closing that gap is
-`152a6td`.
+0-B once the buffers exist, but there is no incrementality (every `refresh!` reruns the
+gradient even when only `mom` moved), the buffers and recompute triggers are hand-managed,
+there is no reuse/compose, and accepted-state isolation is a manual copy.
 
-### Author-effort comparison
+### 2. Current ReactiveKernels — reactive and 0-B, but heavy to author
 
-| Approach | Author writes | Reusable / composable | Allocation-free | Author must manage |
-|---|---|---|---|---|
-| 1. Handwritten mutable Julia | ~14 lines | ❌ inline, one-off | ✅ by hand | every buffer, schedule, mutation order |
-| 2. Current low-level RK *(build-executed below)* | ~40 lines + a hand-written cache policy | ✅ as a kernel | ✅ behind a hand-written concrete barrier | have/want, changed vs persistent, cache policy, `Union` barrier, borrowed outputs, alias-write order |
-| 3. Intended `@kernel` *(target `152a6td`)* | ~12 lines | ✅ | ✅ compiler-derived | mathematics + mutation intent only |
+Reactive and allocation-free, but the author writes, per program: owned-bundle
+`mutable struct`s (`_ValueGradient`/`_Kinetic`), named recipe functions + projections,
+**three** `_nuts_cache_apply` methods, `_nuts_is_mutating`, `_nuts_prepare`,
+`_copy_slot_value(!)` hooks, every `typeof(...)` annotation, and the endpoint block
+**hand-unrolled ×3** (no loop grammar). The **Unit A panel below build-executes exactly
+this level** — the real graph construction plus its generated fused schedule and DAG.
 
-## Open author-facing defects (tracked in `152a6td`)
+### 3. Intended public syntax — the approved target (fixture v2, `152a6td`)
 
-Each row is a workaround the author is currently forced into by column 2. None of
-these is *intended* authoring — each is an open product defect, not normal usage.
+> **Illustrative TARGET — not currently executable.** No generated/DAG pane is shown
+> for it; the substrate it needs is reviewed but not yet canonical (see below).
 
-| Author-facing workaround (today) | Should be | Owner |
-|---|---|---|
-| Manual `have`/`want`; hand-split changed vs persistent inputs | inferred from usage | `152a6td` |
-| Hand-written `cache_apply`; internal `_prepare_nonallocating` because public `prepare_nonallocating` **reallocates** the owned bundles | compiler-derived per-recipe cache policy | `152a6td` |
-| `Ref{Union{Nothing,T}}` + a `val::T` boxing barrier | typed seed-once `Ref{T}` at construction | `152a6td` |
-| Borrowed outputs copied by hand; owned-slot aliasing wired manually | compiler owned/borrowed inference + safe aliasing | `152a6td` / `poc` |
-| Alias-write ordering guaranteed by hand (owned bundle mutates before its projection reads) | compiler alias/effect metadata + freshness validator | `152a6td` / `poc` |
-| `logdet(chol)` hoisted out of the leaf by hand | persistent-partition inference | `152a6td` |
-| Shape change (dimension, `Matrix` vs `Diagonal`) ⇒ rebuild the kernel by hand | covered shape-change rules | `152a6td` |
-| Composing units re-declares shared bindings/cache policy | composition reuses bindings without duplication | `152a6td` |
+```julia
+@reactive endpoint(potential_gradient!, metric, pos, mom) = begin
+    chol             = cholesky(metric)
+    logdetM          = logdet(chol)
+    (pot, dpot_dpos) = value_gradient(potential_gradient!, pos)
+    dham_dmom        = mass_solve(chol, mom)
+    kin              = 0.5 * (logdetM + dot(mom, dham_dmom))
+    ham              = pot + kin
+    leapfrog!(h) = begin
+        @. mom -= 0.5h * dpot_dpos
+        @. pos += h * dham_dmom
+        @. mom -= 0.5h * dpot_dpos
+    end
+    adapt_metric!(M) = begin
+        metric = M
+    end
+end
+init = endpoint(pgrad!, metric, pos0, mom0)
+fwd  = copy(init)
+bwd  = copy(init)
+@reactive nuts_step(init, fwd, bwd, gofwd, min_dham) = begin
+    active_ham = gofwd ? fwd.ham : bwd.ham
+    dham       = init.ham - active_ham
+    diverged   = dham < min_dham
+end
+s = nuts_step(init, fwd, bwd, true, -1000.0)
+leapfrog!(s.fwd, 0.25)
+s.dham
+copyto!(s.init, s.fwd)
+adapt_metric!(s.fwd, new_metric)
+```
 
-The low-level `compile_update(...; changed, persistent, want, input_binding,
-output_binding, cache_policy)` interface is **planned** as an expert/compiler escape
-hatch — not yet built, and explicitly *not* the default author experience.
+- The `(pos, mom)` field writes **infer** the leapfrog changed set; a graph proof
+  **hoists** `chol`/`logdetM` because `metric` is unchanged. Assigning `metric` selects
+  the other update mode and recomputes them exactly once on the next dependent read.
+- RK registers the `value_gradient` / `mass_solve` in-place policies **once**; kernel
+  authors write no cache applier, bundle, or ownership metadata.
+- The same source specializes over `Float32`/`Float64`, `Matrix`/`Diagonal`, and any
+  callable gradient type. The consumer `potential_gradient!(grad, pos) -> value` may be
+  analytic **or** an optional DI + Enzyme-prepared callable (permitted).
+- `copy` owns distinct buffers; a flattened composition makes cross-endpoint
+  invalidation and schedules sound — the endpoint is authored once and replicated by
+  `copy`, not unrolled ×3.
+- A library author's *custom* in-place op is the only irreducible registration surface.
+  V1 (recommended): `@inplace myop!(out, a, b)` generates a logical
+  `myop(a, b) -> (value, out)`; kernel authors never call the 3-arg impl. The variant is
+  the user's pick — decision `0dvxevh`.
+
+### What the target infers (nothing hand-written) — and eliminates
+
+**Inferred:** want/bindings/graph/schedule/freshness; owned in-place outputs (via the
+registered combinator effects); the changed set (field-LHS writes + registered effects);
+the persistent partition (graph-hoist proof); copy-isolation (facade); loop-free reuse
+(`copy` + compose). **Eliminated vs Column 2:** the bundle structs, named recipes +
+projections, all cache appliers, `is_mutating`, the `prepare` hook, the copy hooks, the
+`typeof` annotations, and the ×3 unroll.
+
+### Current vs compiler-work-still-required (honesty)
+
+**Exists today** (`61ec0c8` + array `compile_update` `849683`, verified): the `@reactive`
+facade (signature sources, derived recipes, invalidation-tracked mutation methods,
+`get`/`set!`/`mutate!`/`touch!`/`assign!`, in-place `@. field -= …` writes, facade
+`copy`/`copyto!`), `specialize=true`, the `prepare=` hook; the `compile_update` array core
+with `_RecipeApplier`/`cache_policy`/`alias_writes`/`bind`; `prepare_reactive_nonallocating`;
+KernelSpec `compose`/`merge`. The current 0-B NUTS path works — but only via the
+hand-written bundle/cache-applier boilerplate of Column 2.
+
+**This task adds** (not yet built): the `in_place_effect` trait + `@inplace` registration +
+the construction-time resolver (roles→Values, `cache_policy` synthesis, auto-hoist proof,
+bundle+projection generation); the RK-provided `value_gradient`/`mass_solve` combinators +
+their once-registered policies; poc's core hook consuming the resolved policy in
+`compile_update` cache-selection + the facade ordered-per-occurrence effect-metadata trace
+(enabling changed-inference and nonlocal bundle→projection resolution); and auto-flattening
+`compose` across `@reactive` objects (today `reactive_nuts.jl` flattens by hand). So Column
+3 is the target; the combinators, inference, auto-hoist, and auto-flatten-compose are the
+deliverable, not current API.
+
+The expert escape hatch `compile_update(...; changed, persistent, want, input_binding,
+output_binding, cache_policy)` stays public and inspectable (Raw input / Generated kernel /
+Compute DAG) — but is never the default author experience.
 
 ## What is genuinely easy — and correct — today
 
@@ -169,11 +207,15 @@ Main.ReactiveKernelsDocs.render_fused_leaf(@__MODULE__)
 ```
 
 The leaf's `pos`, `mom`, `old_grad` change every call; `chol`, `stepsize`,
-`init_ham`, `threshold`, the DI+Enzyme `pgrad` closure, and `logdet_chol` are the
-**persistent partition**, constant while the metric and step size are fixed. Exactly
-one recipe (`_grad_bundle`) calls the gradient, writing potential *and* gradient into
-one owned `_ValueGradient` bundle; `_vg_gradient`/`_vg_value` are borrowed
-projections. **One leaf ⇒ one gradient.**
+`init_ham`, `threshold`, the `pgrad` closure, and `logdet_chol` are the
+**persistent partition**, constant while the metric and step size are fixed. The
+panel above uses an **analytic** `pgrad` (∇U(x)=x) so the kernel — not the
+differentiation — is the visible content; ReactiveKernels computes no pullbacks
+itself and accepts any consumer gradient, including an optional
+DifferentiationInterface + reverse-mode Enzyme integration. Exactly one recipe
+(`_grad_bundle`) calls the gradient, writing potential *and* gradient into one owned
+`_ValueGradient` bundle; `_vg_gradient`/`_vg_value` are borrowed projections.
+**One leaf ⇒ one gradient.**
 
 ## The four compiled units — honest status
 
@@ -274,15 +316,25 @@ The prototype is gated three independent ways at `71f37a2`:
   means matching the *true distribution*, not the reactive path.
 - **Type/LLVM and allocation gates** on the actual timed windows.
 
-## The production path — PLANNED
+## The production path — reviewed substrate, not yet canonical
 
-Turning the benchmark prototype into the public sampler requires the owned-slot
-**`compile_update`** primitive and array/alias-effect contract from the core
-(`ReactiveKernels:poc`'s domain): a typed seed-once `Ref{T}` cache, aliasing owned
-outputs (side-effect the endpoint arrays into aliased owned slots, return only isbits
-scalars), and array/alias-effect metadata so alias-writes participate in the freshness
-validator. The production sampler must then compile and compose Units B and D through
-the same path and **repeat every gate above** before it replaces the reactive hot leaf.
+> **Reviewed compiler substrate, not canonical production integration.** Scalar
+> `compile_update` checkpoint `5817984` and the array/alias-effect overlay `849683`
+> have passed core review. They establish the expert
+> `compile_update → bind_schedule → begin_updates!/bound()/finish_updates!` machinery,
+> authoritative owned-array outputs, cut-point reuse, isolation, typed/LLVM gates, and
+> stable-shape 0-B execution. They are approved overlays **awaiting canonical
+> landing/consumption**; the public HMC sampler has not yet migrated Units A/C onto
+> them, and Units B/D effect-metadata compilation remains open. Therefore the substrate
+> is real/reviewed, while the concise target syntax and the complete fused sampler
+> remain planned.
+
+Turning the benchmark prototype into the public sampler consumes that reviewed
+substrate: the owned-slot `compile_update` path (typed seed-once cache, aliasing owned
+outputs, array/alias-effect metadata so alias-writes participate in the freshness
+validator), plus the construction-time resolver and combinators of fixture v2 above. The
+production sampler must then compile and compose Units B and D through the same path and
+**repeat every gate above** before it replaces the reactive hot leaf.
 
 This page stays current under a build-executed drift gate: every generated pane, DAG,
 and inventory is regenerated from source at build time and fails the build on drift
