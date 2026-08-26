@@ -6,11 +6,17 @@
 #   ReactiveKernels' src/hmc.jl to main@ca9ea4ca41924bb0e1fadc01c717e1333916aba6
 #   (github.com/nsiccha/ReactiveHMC.jl/blob/ca9ea4ca.../src/nuts.jl). Files transcribed:
 #   phasepoints.jl (euclidean_phasepoint), integrators.jl (leapfrog!), nuts.jl (nuts_state +
-#   tree helpers), adaptation.jl (dual_averaging_state, welford_var). The ONLY change from the
-#   reference is @reactive -> the unified sole @kernel with an explicit `self` first method
-#   parameter; field NAMES, object COMPOSITION, the pot_f/grad_f phase-point shape, the direct
-#   in-object state mutation, the DA (m/H/mu + fit!) and Welford (n/mean/var + step!(x;dn))
-#   recurrences, and the restore!/rcopy! reset semantics are the reference's, verbatim.
+#   tree helpers), adaptation.jl (dual_averaging_state, welford_var).
+#
+#   DEVIATIONS from the reference source (named explicitly — this is NOT a verbatim copy):
+#     (i)   @reactive  ->  the unified sole @kernel.
+#     (ii)  implicit-field capture + __self__  ->  an explicit `self` first method parameter (so
+#           method bodies read/write self.<field>); a namespace/self adaptation required by @kernel.
+#     (iii) @node(logdet(chol_metric))  ->  plain logdet(chol_metric): the @node caching hint is
+#           dropped because caching/hoisting must be INFERRED by @kernel's analysis, not annotated.
+#   Everything else — field NAMES, object COMPOSITION, the pot_f/grad_f phase-point shape, the Ref
+#   current-view for fwd/bwd, the direct in-object state mutation, the DA (m/H/mu + fit!) and Welford
+#   (n/mean/var + step!(x;kwargs...)) recurrences, and the restore!/rcopy! reset — is the reference's.
 #
 # This REPLACES the earlier fixture, which diverged from the reference (invented value_gradient
 # bundle, velocity/kinetic/hamiltonian names, an external _NUTSScratch argument + a no-self-mutation
@@ -86,8 +92,8 @@ end
     may_sample = true
     may_continue = true
     fwdbwd = fillf(deepcopy, init, 2)
-    fwd = fwdbwd[gofwd ? 1 : 2]                 # derived from gofwd (reference wraps in Ref)
-    bwd = fwdbwd[gofwd ? 2 : 1]
+    fwd = Ref(fwdbwd[gofwd ? 1 : 2])            # reference current-view: Ref selected by gofwd
+    bwd = Ref(fwdbwd[gofwd ? 2 : 1])
     trees = fillf(tree, init, max_depth + 1)
     proposals = fillf(deepcopy, init, max_depth + 2)
     dham = 0.
@@ -194,11 +200,12 @@ end
         @. self.var = smooth(self.var, (x - smooth(self.mean, x, w)) * (x - self.mean), w)
         @. self.mean = smooth(self.mean, x, w)
     end
-    # reference forwards `; kwargs...`; @kernel construction currently rejects a kwargs-splat in a
-    # method signature (FLAGGED to poc as a required capability). `dn` is the ONLY keyword the vector
-    # method accepts, so forwarding it explicitly is behaviorally identical to the reference splat.
-    step!(self, x::AbstractMatrix; dn = 1.) = for xi in eachcol(x)
-        step!(self, xi; dn = dn)
+    # reference matrix overload forwards `; kwargs...` verbatim. @kernel construction currently
+    # REJECTS a kwargs-splat in a method signature ("unsupported keyword :(kwargs...)"), so this line
+    # blocks the whole fixture from loading until syntax/poc add kwargs-splat support — that BLOCKED
+    # state is the correct sequencing (a required-capability signal), NOT a fixture defect to work around.
+    step!(self, x::AbstractMatrix; kwargs...) = for xi in eachcol(x)
+        step!(self, xi; kwargs...)
     end
 end
 
@@ -234,6 +241,31 @@ if abspath(PROGRAM_FILE) == @__FILE__
     end
     method_named(k, name) = (ms = filter(m -> m.name === name, RKS.kernel_methods(k)); ms)
 
+    # ---- file-AST inspection (parse THIS file directly; independent of @kernel macro construction, so
+    #      these pin the exact SOURCE FORMS — Ref constructors, kwargs-splat, the leapfrog method span). --
+    _fileast = Meta.parseall(read(@__FILE__, String); filename = @__FILE__)
+    _dropln(args) = filter(a -> !(a isa LineNumberNode), args)
+    _signame(sig) = sig isa Expr ? (sig.head === :call ? sig.args[1] :
+                                    sig.head in (:where, :(::), :curly) ? _signame(sig.args[1]) : nothing) : nothing
+    function kernel_body_ast(name)
+        for st in _fileast.args
+            st isa Expr && st.head === :macrocall && st.args[1] === Symbol("@kernel") || continue
+            eq = st.args[end]
+            eq isa Expr && eq.head === :(=) && _signame(eq.args[1]) === name && return eq.args[2]
+        end
+        error("no @kernel $name found in file AST")
+    end
+    function func_def_ast(name)
+        for st in _fileast.args
+            st isa Expr && st.head in (:(=), :function) && st.args[1] isa Expr &&
+                st.args[1].head === :call && st.args[1].args[1] === name && return st
+        end
+        error("no function $name found in file AST")
+    end
+    _has_params(callsig) = (i = findfirst(a -> a isa Expr && a.head === :parameters, callsig.args);
+                            i === nothing ? nothing : callsig.args[i])
+    _kwname(p) = p isa Symbol ? p : (p isa Expr && p.head in (:kw, :(::), :(...)) ? _kwname(p.args[1]) : nothing)
+
     # (a) euclidean_phasepoint: methodless (stateless), REFERENCE derived-field names, pot_f/grad_f ---
     @assert euclidean_phasepoint isa RKS.KernelSpec "euclidean_phasepoint must be methodless (stateless)"
     pp = fields_of(euclidean_phasepoint)
@@ -247,11 +279,29 @@ if abspath(PROGRAM_FILE) == @__FILE__
         @assert !(bad in pp) "non-reference name $bad present in phase point — surface diverged"
     end
 
-    # (b) leapfrog! is a free function on dham_dpos/dham_dmom with a `stepsize` keyword --------------
-    lf = first(methods(leapfrog!))
-    @assert :stepsize in Base.kwarg_decl(lf) "leapfrog! must take a stepsize keyword"
-    lfsrc = read(@__FILE__, String)
-    @assert occursin("phasepoint.dham_dpos", lfsrc) && occursin("phasepoint.dham_dmom", lfsrc) "leapfrog! must act on dham_dpos/dham_dmom"
+    # (b) leapfrog!: inspect the ACTUAL method-def AST (source span), not whole-file tokens. It must be
+    #     the exact 3-line Stormer-Verlet body `@. mom -=; @. pos +=; @. mom -=` on dham_dpos/dham_dmom,
+    #     with a `stepsize` keyword.
+    lfdef = func_def_ast(:leapfrog!)
+    lfparams = _has_params(lfdef.args[1])
+    @assert lfparams !== nothing && any(p -> _kwname(p) === :stepsize, lfparams.args) "leapfrog! must take a stepsize keyword"
+    lfbody = lfdef.args[2]
+    @assert lfbody isa Expr && lfbody.head === :block "leapfrog! body must be a block"
+    lfstmts = _dropln(lfbody.args)
+    # each statement is `@. phasepoint.<field> <op>= …`; extract (op, field)
+    function dot_assign(stmt)
+        stmt isa Expr && stmt.head === :macrocall && stmt.args[1] === Symbol("@__dot__") || return nothing
+        inner = _dropln(stmt.args)[end]
+        inner isa Expr && length(inner.args) >= 1 || return nothing
+        lhs = inner.args[1]
+        lhs isa Expr && lhs.head === :. && lhs.args[1] === :phasepoint &&
+            lhs.args[2] isa QuoteNode || return nothing
+        (inner.head, lhs.args[2].value)
+    end
+    lftargets = map(dot_assign, lfstmts)
+    @assert lftargets == [(:(-=), :mom), (:(+=), :pos), (:(-=), :mom)] "leapfrog! must be the 3-line Stormer-Verlet (mom-=; pos+=; mom-=), got $lftargets"
+    lfsrc = string(lfbody)
+    @assert occursin("dham_dpos", lfsrc) && occursin("dham_dmom", lfsrc) && occursin("stepsize", lfsrc) "leapfrog! must act on dham_dpos/dham_dmom scaled by stepsize"
 
     # (c) nuts_state: in-object composed tree fields + reference method inventory --------------------
     ns = fields_of(nuts_state)
@@ -262,6 +312,19 @@ if abspath(PROGRAM_FILE) == @__FILE__
     end
     @assert methods_of(nuts_state) == Set([:stepfwd!, :collectstats!, :logadvanceprob, :swapproposal!,
                                            :step!, :flip!, :finish_tree!, :start_tree!]) "nuts_state method inventory: $(methods_of(nuts_state))"
+    # (c') Ref current-view source form: fwd/bwd MUST be `Ref(...)` (reference shape; the analysis must
+    #      learn the Ref/current-view semantics — NOT the bare-indexing rewrite).
+    nsbody = kernel_body_ast(:nuts_state)
+    function ref_assign(body, lhs)
+        for st in _dropln(body.args)
+            st isa Expr && st.head === :(=) && st.args[1] === lhs || continue
+            rhs = st.args[2]
+            return rhs isa Expr && rhs.head === :call && rhs.args[1] === :Ref
+        end
+        false
+    end
+    @assert ref_assign(nsbody, :fwd) "nuts_state must define `fwd = Ref(...)` (reference current-view, not bare indexing)"
+    @assert ref_assign(nsbody, :bwd) "nuts_state must define `bwd = Ref(...)`"
 
     # (d) DIRECT in-object mutation (the reference model) — these methods MUST mutate self fields ----
     @assert self_mutates(only(method_named(nuts_state, :flip!))) "flip! must mutate self (gofwd/tree) directly"
@@ -301,6 +364,26 @@ if abspath(PROGRAM_FILE) == @__FILE__
     @assert length(method_named(welford_var, :step!)) == 2 "welford must have vector + matrix step! methods"
     wb = body_str(welford_var)
     @assert occursin("self.n += dn", wb) && occursin("smooth(", wb) "welford step! reference recurrence"
+    # (g') kwargs-splat source form: the matrix step! MUST carry `; kwargs...` and FORWARD it verbatim
+    #      (reference signature) — not an explicit-dn rewrite. Inspected from the method-def AST.
+    function kwargs_splat_forwarding(body, mname)
+        for st in _dropln(body.args)
+            st isa Expr && st.head === :(=) && st.args[1] isa Expr && st.args[1].head === :call &&
+                st.args[1].args[1] === mname || continue
+            sigparams = _has_params(st.args[1])
+            sigparams === nothing && continue
+            any(p -> p isa Expr && p.head === :(...), sigparams.args) || continue   # `; kwargs...` in sig
+            fwd = Ref(false)
+            _walk(st.args[2]) do x                                                    # forwards `; kwargs...`
+                x isa Expr && x.head === :call && x.args[1] === mname &&
+                    (pp = _has_params(x); pp !== nothing &&
+                     any(p -> p isa Expr && p.head === :(...), pp.args)) && (fwd[] = true)
+            end
+            fwd[] && return true
+        end
+        false
+    end
+    @assert kwargs_splat_forwarding(kernel_body_ast(:welford_var), :step!) "welford matrix step! must use `; kwargs...` and forward it (reference splat, not explicit-dn)"
 
     # (h) sole @kernel; no @reactive / no Graph/add!/applier/binding plumbing in any authored body --
     allbodies = join([body_str(k) for k in (nuts_state, dual_averaging_state, welford_var)], "\n") *
@@ -313,11 +396,11 @@ if abspath(PROGRAM_FILE) == @__FILE__
 
     println("Reference-surface source-shape gate PASS: transcribed from ACTUAL ReactiveHMC.jl v0.1.0")
     println("(781sB @ ca9ea4ca). euclidean_phasepoint (methodless, pot_f/grad_f, reference derived")
-    println("names) + free leapfrog!(phasepoint;stepsize) + nuts_state (in-object composed tree state,")
-    println("fwd/bwd derived from gofwd, DIRECT self mutation in step!/flip!/finish_tree!/start_tree!,")
-    println("restore!/rcopy! reset, multinomial tournament/log-weights/RNG/criterion) + DA (m/H/mu +")
-    println("fit!) + welford (n/mean/var + step!(x;dn), 2 methods). Sole @kernel; no plumbing; invented")
-    println("names (value_gradient/velocity/kinetic/hamiltonian/external-scratch/mirror!/warmup!) ABSENT.")
-    println("Construction-only substrate — NO execution/parity/0-B/perf claim; MethodIR lowering of the")
-    println("faithful shape is a compiler requirement, not a fixture defect.")
+    println("names) + free leapfrog!(phasepoint;stepsize) inspected from its method AST + nuts_state")
+    println("(in-object composed tree state, fwd/bwd = Ref current-view, DIRECT self mutation in")
+    println("step!/flip!/finish_tree!/start_tree!, restore!/rcopy! reset, multinomial tournament) + DA")
+    println("(m/H/mu + fit!) + welford (n/mean/var + step!(x;kwargs...), 2 methods, splat pinned). Sole")
+    println("@kernel; no plumbing; invented names ABSENT. Deviations from reference NAMED: @reactive->")
+    println("@kernel, implicit-field/__self__->explicit self, @node(logdet)->plain logdet (inferred")
+    println("caching). Construction-only — NO execution/parity/0-B/perf claim.")
 end
