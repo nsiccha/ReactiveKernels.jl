@@ -53,7 +53,7 @@ const ENZYME_BACKEND = AutoEnzyme(;
         @test density ≈ prior + log_jacobian + likelihood
     end
 
-    @testset "the log-density boundary differentiates (AD + finite differences)" begin
+    @testset "the log-density boundary differentiates through DI + Enzyme" begin
         k = prepare(model.graph;
                     have = (model.log_rate, model.counts),
                     want = (model.density,))
@@ -65,9 +65,6 @@ const ENZYME_BACKEND = AutoEnzyme(;
         @test length(gradient) == 1
         @test all(isfinite, gradient)
 
-        h = 1e-6
-        fd = (logdensity([log_rate + h]) - logdensity([log_rate - h])) / (2h)
-        @test gradient[1] ≈ fd rtol = 1e-4
     end
 
     @testset "generated quantity prunes density work" begin

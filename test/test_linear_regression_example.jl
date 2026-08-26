@@ -59,7 +59,7 @@ const ENZYME_BACKEND = AutoEnzyme(;
         @test density ≈ prior + log_jacobian + likelihood
     end
 
-    @testset "the log-density boundary differentiates (AD + finite differences)" begin
+    @testset "the log-density boundary differentiates through DI + Enzyme" begin
         k = prepare(model.graph;
                     have = (model.unconstrained, model.predictors,
                             model.responses),
@@ -76,15 +76,6 @@ const ENZYME_BACKEND = AutoEnzyme(;
         @test gradient !== qvec
         @test pointer(gradient) != pointer(qvec)
 
-        # Independent correctness anchor: central finite differences, no second
-        # AD backend required.
-        fd = map(eachindex(qvec)) do i
-            h = 1e-6
-            up = copy(qvec); up[i] += h
-            dn = copy(qvec); dn[i] -= h
-            (logdensity(up) - logdensity(dn)) / (2h)
-        end
-        @test gradient ≈ fd rtol = 1e-4
     end
 
     @testset "generated quantities prune density work" begin

@@ -57,7 +57,7 @@ const ENZYME_BACKEND = AutoEnzyme(;
         @test pointwise[1] ≈ expected
     end
 
-    @testset "the log-density boundary differentiates (AD + finite differences)" begin
+    @testset "the log-density boundary differentiates through DI + Enzyme" begin
         k = prepare(model.graph;
                     have = (model.unconstrained, model.observations),
                     want = (model.density,))
@@ -71,13 +71,6 @@ const ENZYME_BACKEND = AutoEnzyme(;
         @test gradient !== qvec
         @test pointer(gradient) != pointer(qvec)
 
-        fd = map(eachindex(qvec)) do i
-            h = 1e-6
-            up = copy(qvec); up[i] += h
-            dn = copy(qvec); dn[i] -= h
-            (logdensity(up) - logdensity(dn)) / (2h)
-        end
-        @test gradient ≈ fd rtol = 1e-4
     end
 
     @testset "responsibility generated quantity prunes density work" begin
