@@ -290,43 +290,52 @@ end
 # Val-dispatch so a literal-name access (`state.go_forward`, `state.n_steps`) stays
 # type-stable (the returned group source is concrete), unlike a runtime `name in
 # (...)` branch which would infer a Union in the hot transition loop.
+# Internal fast accessors that bypass the Symbol -> Val getproperty layer: the group
+# is a real struct field (getfield), and each group port/derived is read through the
+# ReactiveObject's GENERATED `Val` getter directly (still a plain reactive get!, same
+# one-authority handle) rather than `group.name` (which re-enters Symbol dispatch and
+# dominated the transition wall time). Hot-recursion code must use these, not
+# `state.foo`/`group.foo`; the public Symbol path (below) is unchanged.
+@inline _cn_grp(state::CompiledNUTSState) = getfield(state, :group)
+@inline _cn_gval(state::CompiledNUTSState, v::Val) = getproperty(_cn_grp(state), v)
+
 @inline Base.getproperty(state::CompiledNUTSState, name::Symbol) =
     _cn_getproperty(state, Val(name))
 @inline _cn_getproperty(state::CompiledNUTSState, ::Val{:init}) =
-    _CompiledInitView(getfield(state, :group))
+    _CompiledInitView(_cn_grp(state))
 @inline _cn_getproperty(state::CompiledNUTSState, ::Val{:min_energy_error}) =
-    getfield(state, :group).min_dham
+    _cn_gval(state, Val(:min_dham))
 @inline _cn_getproperty(state::CompiledNUTSState, ::Val{:go_forward}) =
-    getfield(state, :group).gofwd
+    _cn_gval(state, Val(:gofwd))
 @inline _cn_getproperty(state::CompiledNUTSState, ::Val{:gofwd}) =
-    getfield(state, :group).gofwd
+    _cn_gval(state, Val(:gofwd))
 @inline _cn_getproperty(state::CompiledNUTSState, ::Val{:may_sample}) =
-    getfield(state, :group).may_sample
+    _cn_gval(state, Val(:may_sample))
 @inline _cn_getproperty(state::CompiledNUTSState, ::Val{:may_continue}) =
-    getfield(state, :group).may_continue
+    _cn_gval(state, Val(:may_continue))
 @inline _cn_getproperty(state::CompiledNUTSState, ::Val{:depth}) =
-    getfield(state, :group).depth
+    _cn_gval(state, Val(:depth))
 @inline _cn_getproperty(state::CompiledNUTSState, ::Val{:n_steps}) =
-    getfield(state, :group).n_steps
+    _cn_gval(state, Val(:n_steps))
 @inline _cn_getproperty(state::CompiledNUTSState, ::Val{:acceptance_sum}) =
-    getfield(state, :group).acceptance_sum
+    _cn_gval(state, Val(:acceptance_sum))
 # Diagnostic SNAPSHOTS (not the live dham/diverged, which restore may change).
 @inline _cn_getproperty(state::CompiledNUTSState, ::Val{:energy_error}) =
-    getfield(state, :group).last_energy_error
+    _cn_gval(state, Val(:last_energy_error))
 @inline _cn_getproperty(state::CompiledNUTSState, ::Val{:dham}) =
-    getfield(state, :group).last_energy_error
+    _cn_gval(state, Val(:last_energy_error))
 @inline _cn_getproperty(state::CompiledNUTSState, ::Val{:diverged}) =
-    getfield(state, :group).last_diverged
+    _cn_gval(state, Val(:last_diverged))
 @inline _cn_getproperty(state::CompiledNUTSState, ::Val{name}) where {name} =
     getfield(state, name)
 
 @inline Base.setproperty!(state::CompiledNUTSState, name::Symbol, value) =
     _cn_setproperty!(state, Val(name), value)
-# `source` is a Val type-parameter, so the handle field access constant-folds —
-# type-stable without relying on constant propagation through a Symbol argument.
+# `source` is a Val type-parameter, so the handle field access constant-folds; the
+# group's `state`/`handles` are read via getfield (not the Symbol getproperty layer).
 @inline function _cn_set_source!(state::CompiledNUTSState, ::Val{source}, value) where {source}
     group = getfield(state, :group)
-    set!(group.state, getproperty(group.handles, source), value)
+    set!(getfield(group, :state), getproperty(getfield(group, :handles), source), value)
     value
 end
 @inline _cn_setproperty!(state::CompiledNUTSState, ::Val{:go_forward}, v) =
@@ -448,12 +457,14 @@ end
 
 # --- Type-stable endpoint access over the flat group (branch on go_forward). ---
 # fwd/bwd are the two moving endpoints; `go_forward` selects which is "forward".
-@inline _cn_fwd_mom(state) = state.go_forward ? state.group.fwd_mom : state.group.bwd_mom
-@inline _cn_fwd_vel(state) = state.go_forward ? state.group.fwd_dham_dmom : state.group.bwd_dham_dmom
-@inline _cn_fwd_ham(state) = state.go_forward ? state.group.fwd_ham : state.group.bwd_ham
-@inline _cn_fwd_pos(state) = state.go_forward ? state.group.fwd_pos : state.group.bwd_pos
-@inline _cn_bwd_mom(state) = state.go_forward ? state.group.bwd_mom : state.group.fwd_mom
-@inline _cn_bwd_vel(state) = state.go_forward ? state.group.bwd_dham_dmom : state.group.fwd_dham_dmom
+# Active-endpoint readers on the internal Val fast path (no Symbol getproperty).
+@inline _cn_gofwd(state::CompiledNUTSState) = _cn_gval(state, Val(:gofwd))
+@inline _cn_fwd_mom(state) = _cn_gofwd(state) ? _cn_gval(state, Val(:fwd_mom)) : _cn_gval(state, Val(:bwd_mom))
+@inline _cn_fwd_vel(state) = _cn_gofwd(state) ? _cn_gval(state, Val(:fwd_dham_dmom)) : _cn_gval(state, Val(:bwd_dham_dmom))
+@inline _cn_fwd_ham(state) = _cn_gofwd(state) ? _cn_gval(state, Val(:fwd_ham)) : _cn_gval(state, Val(:bwd_ham))
+@inline _cn_fwd_pos(state) = _cn_gofwd(state) ? _cn_gval(state, Val(:fwd_pos)) : _cn_gval(state, Val(:bwd_pos))
+@inline _cn_bwd_mom(state) = _cn_gofwd(state) ? _cn_gval(state, Val(:bwd_mom)) : _cn_gval(state, Val(:fwd_mom))
+@inline _cn_bwd_vel(state) = _cn_gofwd(state) ? _cn_gval(state, Val(:bwd_dham_dmom)) : _cn_gval(state, Val(:fwd_dham_dmom))
 
 # One in-place leapfrog on the ACTIVE (forward) endpoint, matching ca9's
 # integrator: mom half-kick (reads gradient), pos drift (reads velocity), mom
@@ -486,15 +497,16 @@ end
 end
 
 @inline function _cn_step_forward!(state::CompiledNUTSState)
-    stepsize = state.step_f.stepsize
-    state.go_forward ? _group_leapfrog!(state.group, Val(:fwd), stepsize) :
-                       _group_leapfrog!(state.group, Val(:bwd), stepsize)
+    stepsize = getfield(state, :step_f).stepsize
+    _cn_gofwd(state) ? _group_leapfrog!(_cn_grp(state), Val(:fwd), stepsize) :
+                       _group_leapfrog!(_cn_grp(state), Val(:bwd), stepsize)
 end
 
 @inline function _cn_negate_backward_mom!(state::CompiledNUTSState)
-    handles = state.group.handles
-    gs = state.group.state
-    if state.go_forward
+    group = _cn_grp(state)
+    handles = getfield(group, :handles)
+    gs = getfield(group, :state)
+    if _cn_gofwd(state)
         mutate!(gs, handles.bwd_mom) do m; @. m *= -1; m; end
     else
         mutate!(gs, handles.fwd_mom) do m; @. m *= -1; m; end
@@ -505,41 +517,43 @@ end
 # Reset both moving endpoints to `init` in one 0-alloc HAVE-boundary group copy,
 # then reset proposals/trees/flags — the ca9 per-transition restore.
 function _cn_reset_transition!(state::CompiledNUTSState)
-    handles = state.group.handles
-    gs = state.group.state
+    group = _cn_grp(state)
+    handles = getfield(group, :handles)
+    gs = getfield(group, :state)
     copy_group!(gs,
         (handles.fwd_pos, handles.fwd_mom, handles.bwd_pos, handles.bwd_mom),
         (handles.init_pos, handles.init_mom, handles.init_pos, handles.init_mom))
-    init_pos = state.group.init_pos
-    init_mom = state.group.init_mom
-    for proposal in state.proposals
+    init_pos = getproperty(group, Val(:init_pos))
+    init_mom = getproperty(group, Val(:init_mom))
+    for proposal in getfield(state, :proposals)
         copyto!(proposal.pos, init_pos)
         copyto!(proposal.mom, init_mom)
     end
-    foreach(_reset_tree!, state.trees)
-    # `state.go_forward = true` writes the group's `gofwd` source directly (its
-    # public alias), so the reactive active_ham/dham/diverged nodes already track
-    # the forward endpoint — no separate sync needed.
-    state.go_forward = true
-    state.may_sample = true
-    state.may_continue = true
+    foreach(_reset_tree!, getfield(state, :trees))
+    # Writing `go_forward` writes the group's `gofwd` source directly (its public
+    # alias), so the reactive active_ham/dham/diverged nodes already track the
+    # forward endpoint. All control writes take the internal Val fast path.
+    _cn_setproperty!(state, Val(:go_forward), true)
+    _cn_setproperty!(state, Val(:may_sample), true)
+    _cn_setproperty!(state, Val(:may_continue), true)
     # Reset the transition diagnostic snapshots (last_energy_error/last_diverged);
     # they are assigned only from the consumed live group.dham/group.diverged in
     # _cn_start_tree!, never aliased to the live values which restore may change.
     # Take the zero from the snapshot source itself (a stored HAVE value) rather
-    # than from state.group.dham, which would force the live derived node.
-    state.energy_error = zero(state.energy_error)
-    state.diverged = false
-    state.depth = 0
-    state.n_steps = 0
-    state.acceptance_sum = zero(state.acceptance_sum)
+    # than from the live derived dham node.
+    _cn_setproperty!(state, Val(:energy_error), zero(_cn_getproperty(state, Val(:energy_error))))
+    _cn_setproperty!(state, Val(:diverged), false)
+    _cn_setproperty!(state, Val(:depth), 0)
+    _cn_setproperty!(state, Val(:n_steps), 0)
+    _cn_setproperty!(state, Val(:acceptance_sum), zero(_cn_getproperty(state, Val(:acceptance_sum))))
     state
 end
 
 function _cn_swap_proposal!(state::CompiledNUTSState, first_index::Int,
-                            second_index::Int = length(state.proposals))
-    state.proposals[first_index], state.proposals[second_index] =
-        state.proposals[second_index], state.proposals[first_index]
+                            second_index::Int = length(getfield(state, :proposals)))
+    proposals = getfield(state, :proposals)
+    proposals[first_index], proposals[second_index] =
+        proposals[second_index], proposals[first_index]
     state
 end
 
@@ -551,8 +565,9 @@ end
 
 function _cn_flip!(state::CompiledNUTSState, depth::Int)
     depth > 1 || return state
-    state.go_forward = !state.go_forward   # writes group.gofwd (its public alias)
-    tree = state.trees[depth]
+    # writes group.gofwd (go_forward's alias) on the internal Val fast path
+    _cn_setproperty!(state, Val(:go_forward), !_cn_gofwd(state))
+    tree = getfield(state, :trees)[depth]
     backward_mom = _cn_bwd_mom(state)
     backward_vel = _cn_bwd_vel(state)
     @. tree.backward.momentum = -backward_mom
@@ -562,41 +577,45 @@ function _cn_flip!(state::CompiledNUTSState, depth::Int)
 end
 
 @inline function _cn_collect_stats!(state::CompiledNUTSState)
-    state.stats_f === nothing || state.stats_f(state)
+    stats_f = getfield(state, :stats_f)
+    stats_f === nothing || stats_f(state)
     state
 end
 
 function _cn_start_tree!(state::CompiledNUTSState, depth::Int)
     if depth == 1
         _cn_step_forward!(state)
-        state.n_steps += 1
+        _cn_setproperty!(state, Val(:n_steps), _cn_getproperty(state, Val(:n_steps)) + 1)
         # Reactive energy error + divergence read straight from the group's compiled
-        # nodes: dham = _finite_or_neginf(init_ham - active_ham), selected by gofwd;
-        # diverged = !(dham >= min_dham) over the reactive min_dham threshold source.
-        state.energy_error = state.group.dham
-        state.acceptance_sum += _min1exp(state.energy_error)
-        state.diverged = state.group.diverged
+        # nodes (via the internal Val getter): dham = finite(init_ham - active_ham),
+        # selected by gofwd; diverged = !(dham >= min_dham) over the reactive threshold.
+        energy_error = _cn_gval(state, Val(:dham))
+        _cn_setproperty!(state, Val(:energy_error), energy_error)
+        _cn_setproperty!(state, Val(:acceptance_sum),
+                         _cn_getproperty(state, Val(:acceptance_sum)) + _min1exp(energy_error))
+        diverged = _cn_gval(state, Val(:diverged))
+        _cn_setproperty!(state, Val(:diverged), diverged)
         _cn_collect_stats!(state)
-        if state.diverged
-            state.may_continue = false
+        if diverged
+            _cn_setproperty!(state, Val(:may_continue), false)
             return state
         end
-        state.trees[1].log_weight[1] = state.energy_error
-        _cn_snapshot_forward!(state.proposals[1], state)
+        getfield(state, :trees)[1].log_weight[1] = energy_error
+        _cn_snapshot_forward!(getfield(state, :proposals)[1], state)
         return state
     end
 
     _cn_start_tree!(state, depth - 1)
-    if !state.may_continue
-        state.may_sample = false
+    if !_cn_getproperty(state, Val(:may_continue))
+        _cn_setproperty!(state, Val(:may_sample), false)
         return state
     end
     _cn_swap_proposal!(state, depth - 1, depth)
     _cn_finish_tree!(state, depth - 1)
-    if state.may_sample && _rand_bernoulli_log(
-            state.rng,
-            state.trees[depth - 1].log_weight[1] -
-                state.trees[depth].log_weight[1],
+    trees = getfield(state, :trees)
+    if _cn_getproperty(state, Val(:may_sample)) && _rand_bernoulli_log(
+            getfield(state, :rng),
+            trees[depth - 1].log_weight[1] - trees[depth].log_weight[1],
         )
         _cn_swap_proposal!(state, depth - 1, depth)
     end
@@ -604,8 +623,9 @@ function _cn_start_tree!(state::CompiledNUTSState, depth::Int)
 end
 
 function _cn_finish_tree!(state::CompiledNUTSState, depth::Int)
-    tree = state.trees[depth]
-    supertree = state.trees[depth + 1]
+    trees = getfield(state, :trees)
+    tree = trees[depth]
+    supertree = trees[depth + 1]
     tree.log_weight[2] = tree.log_weight[1]
     forward_mom = _cn_fwd_mom(state)
     forward_vel = _cn_fwd_vel(state)
@@ -622,8 +642,8 @@ function _cn_finish_tree!(state::CompiledNUTSState, depth::Int)
     end
 
     _cn_start_tree!(state, depth)
-    if !state.may_continue
-        state.may_sample = false
+    if !_cn_getproperty(state, Val(:may_continue))
+        _cn_setproperty!(state, Val(:may_sample), false)
         return state
     end
 
@@ -634,15 +654,15 @@ function _cn_finish_tree!(state::CompiledNUTSState, depth::Int)
     if depth == 1
         @. supertree.summed_momentum.forward =
             supertree.backward.momentum + forward_mom
-        state.may_continue = _compute_criterion(
+        _cn_setproperty!(state, Val(:may_continue), _compute_criterion(
             supertree.summed_momentum.forward,
             supertree.backward.velocity,
             forward_vel,
-        )
+        ))
     else
         @. supertree.summed_momentum.forward =
             tree.summed_momentum.backward + tree.summed_momentum.forward
-        state.may_continue =
+        _cn_setproperty!(state, Val(:may_continue),
             _compute_criterion(
                 supertree.summed_momentum.forward,
                 supertree.backward.velocity,
@@ -659,15 +679,16 @@ function _cn_finish_tree!(state::CompiledNUTSState, depth::Int)
                 tree.summed_momentum.forward,
                 tree.backward_forward.velocity,
                 forward_vel,
-            )
+            ))
     end
     state
 end
 
 function _cn_restore_init!(state::CompiledNUTSState)
-    proposal = state.proposals[end]
-    handles = state.group.handles
-    gs = state.group.state
+    proposal = getfield(state, :proposals)[end]
+    group = _cn_grp(state)
+    handles = getfield(group, :handles)
+    gs = getfield(group, :state)
     mutate!(gs, handles.init_pos) do position
         copyto!(position, proposal.pos)
         position
@@ -683,45 +704,52 @@ end
 function step!(state::CompiledNUTSState)
     _cn_reset_transition!(state)
     _cn_negate_backward_mom!(state)
-    state.trees[1].log_weight[1] = 0
+    trees = getfield(state, :trees)
+    rng = getfield(state, :rng)
+    trees[1].log_weight[1] = 0
 
-    for depth in 1:state.max_depth
-        rand(state.rng, Bool) && _cn_flip!(state, depth)
+    for depth in 1:getfield(state, :max_depth)
+        rand(rng, Bool) && _cn_flip!(state, depth)
         _cn_finish_tree!(state, depth)
-        state.depth = depth
-        state.may_sample || break
+        _cn_setproperty!(state, Val(:depth), depth)
+        _cn_getproperty(state, Val(:may_sample)) || break
         if _rand_bernoulli_log(
-                state.rng,
-                state.trees[depth].log_weight[1] -
-                    state.trees[depth].log_weight[2],
+                rng,
+                trees[depth].log_weight[1] - trees[depth].log_weight[2],
             )
             _cn_swap_proposal!(state, depth)
         end
-        state.may_continue || break
+        _cn_getproperty(state, Val(:may_continue)) || break
     end
     _cn_restore_init!(state)
     diagnostics(state)
 end
 
 function diagnostics(state::CompiledNUTSState)
-    acceptance = state.n_steps == 0 ? zero(state.acceptance_sum) :
-                 state.acceptance_sum / state.n_steps
-    NUTSDiagnostics(state.depth, state.n_steps, acceptance,
-                    state.diverged, state.energy_error)
+    n_steps = _cn_getproperty(state, Val(:n_steps))
+    acceptance_sum = _cn_getproperty(state, Val(:acceptance_sum))
+    acceptance = n_steps == 0 ? zero(acceptance_sum) : acceptance_sum / n_steps
+    NUTSDiagnostics(_cn_getproperty(state, Val(:depth)), n_steps, acceptance,
+                    _cn_getproperty(state, Val(:diverged)),
+                    _cn_getproperty(state, Val(:energy_error)))
 end
 
 function refresh_momentum!(state::CompiledNUTSState)
-    factor = state.group.chol_metric
-    mutate!(state.group.state, state.group.handles.init_mom) do momentum
-        randn!(state.rng, momentum)
+    group = _cn_grp(state)
+    factor = getproperty(group, Val(:chol_metric))
+    gs = getfield(group, :state)
+    rng = getfield(state, :rng)
+    mutate!(gs, getfield(group, :handles).init_mom) do momentum
+        randn!(rng, momentum)
         lmul!(factor.L, momentum)
         momentum
     end
-    state.group
+    group
 end
 
 function sample!(state::CompiledNUTSState)
-    state.stats_f isa TrajectoryStats && reset!(state.stats_f, state.init)
+    stats_f = getfield(state, :stats_f)
+    stats_f isa TrajectoryStats && reset!(stats_f, state.init)
     refresh_momentum!(state)
     step!(state)
 end
@@ -732,7 +760,7 @@ end
 # transition-for-transition identical to the oracle. ---
 function _probe_acceptance(state::CompiledNUTSState, stepsize)
     refresh_momentum!(state)
-    probe = copy(state.group)
+    probe = copy(_cn_grp(state))
     handles = probe.handles
     gs = probe.state
     copy_group!(gs, (handles.fwd_pos, handles.fwd_mom),
@@ -746,9 +774,9 @@ end
 # --- Forward-endpoint readers for the optional TrajectoryStats recorder (the
 # TrajectoryStats callback for a CompiledNUTSState lives in the GAP-1c section). ---
 @inline _cn_fwd_dpos(state) =
-    state.go_forward ? state.group.fwd_dpot_dpos : state.group.bwd_dpot_dpos
+    _cn_gofwd(state) ? _cn_gval(state, Val(:fwd_dpot_dpos)) : _cn_gval(state, Val(:bwd_dpot_dpos))
 @inline _cn_fwd_pot(state) =
-    state.go_forward ? state.group.fwd_pot : state.group.bwd_pot
+    _cn_gofwd(state) ? _cn_gval(state, Val(:fwd_pot)) : _cn_gval(state, Val(:bwd_pot))
 
 """
     nuts_state(group; rng, step_f, ...)
