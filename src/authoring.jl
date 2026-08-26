@@ -870,12 +870,22 @@ function _kernel_return_names(ex)
     names
 end
 
+# A dotted operator such as `.*` is broadcast *syntax*, not a bound function:
+# `a .* b` lowers to `broadcast(*, a, b)` and there is no callable named `.*`.
+# Splicing the bare symbol as a recipe callee errors at construction with
+# `UndefVarError: .* not defined`, so such recipes must take the closure path.
+function _is_broadcast_operator(sym::Symbol)
+    s = String(sym)
+    length(s) >= 2 && s[1] === '.' && Base.isoperator(Symbol(s[2:end]))
+end
+
 function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol})
     if rhs isa Expr && rhs.head === :call && !isempty(rhs.args)
         callee = rhs.args[1]
         args = rhs.args[2:end]
         callee_is_port = callee isa Symbol && callee in known
-        if callee isa Symbol && !callee_is_port && length(args) == length(deps) &&
+        if callee isa Symbol && !callee_is_port && !_is_broadcast_operator(callee) &&
+           length(args) == length(deps) &&
            all(i -> args[i] === deps[i], eachindex(args))
             return callee
         end
