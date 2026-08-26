@@ -235,6 +235,43 @@ end
 _kernel_snapshot_recipe_count(snap::_ChildSnapshot) = length(snap.recipes)
 _kernel_snapshot_port_names(snap::_ChildSnapshot) = snap.port_order
 
+# --- recipe-SOURCE provenance: detached, recursively-frozen AST -------------
+
+# `Recipe.op` is an opaque lowered closure, so poc's stateful MethodIR needs the
+# ORIGINAL recipe-statement source. We store it as an IMMUTABLE, recursively-frozen
+# node form — NO `Expr` / `Vector` / `Dict` survives in the stored value — and hand
+# it back only by THAWING a FRESH mutable `Expr` copy per call, so a caller that
+# mutates the returned AST can never reach the stored source (nor a second reader).
+
+# A frozen `Expr`: an immutable struct whose children are a Tuple (never a Vector)
+# of frozen nodes / immutable leaves.
+struct _FrozenExpr
+    head::Symbol
+    args::Tuple
+end
+# A frozen `QuoteNode` (its `value` may itself wrap an `Expr`, so freeze that too).
+struct _FrozenQuoteNode
+    value::Any
+end
+
+# Freeze source AST → frozen form. `Expr`/`QuoteNode` recurse; every other node is an
+# immutable leaf (`Symbol`, numeric/string/char/bool literal, `LineNumberNode`, …) and
+# is kept as-is. Source ASTs never contain a bare `Vector`/`Dict` (those appear only
+# post-evaluation), so no lossy container coercion is needed.
+_kernel_freeze_ast(x::Expr) =
+    _FrozenExpr(x.head, Tuple(_kernel_freeze_ast(a) for a in x.args))
+_kernel_freeze_ast(x::QuoteNode) = _FrozenQuoteNode(_kernel_freeze_ast(x.value))
+_kernel_freeze_ast(x) = x
+
+# Thaw frozen form → a FRESH mutable AST. Each call rebuilds new `Expr` (fresh `args`
+# `Vector`) nodes, so the result shares no mutable structure with the stored frozen
+# value or with any previously thawed copy. Immutable leaves are returned as-is (a
+# `Symbol`/literal cannot be mutated, so sharing it is safe).
+_kernel_thaw_ast(x::_FrozenExpr) =
+    Expr(x.head, Any[_kernel_thaw_ast(a) for a in x.args]...)
+_kernel_thaw_ast(x::_FrozenQuoteNode) = QuoteNode(_kernel_thaw_ast(x.value))
+_kernel_thaw_ast(x) = x
+
 # --- (3)+(2) stateful expansion (skeleton) ----------------------------------
 
 # The substrate object bound by a method-bearing `@kernel` in Increment 1. It
@@ -242,22 +279,33 @@ _kernel_snapshot_port_names(snap::_ChildSnapshot) = snap.port_order
 # `KernelSpec`, and the extracted method metadata. Later increments replace this
 # with the specializing factory + typed views + compiled schedules; for now it is
 # an inspectable skeleton so tests can assert the discrimination/detection/Token.
-struct _StatefulKernelSkeleton{Token,S,M}
+struct _StatefulKernelSkeleton{Token,S,M,R}
     name::Symbol
     mod::Module              # the DEFINITION module (for hygienic op GlobalRefs)
     spec::S
     methods::M
+    recipe_source::R         # frozen, detached recipe-statement source (see _FrozenExpr)
 end
 # `Token` is a phantom type parameter — the unique definition token, a per-expansion
 # gensym Symbol carried as `Val{Token}` (unique, typed overload identity, no minted
 # struct / no world-age hazard / no mutable registry). Supplied explicitly.
-_StatefulKernelSkeleton(name::Symbol, ::Val{Token}, mod::Module, spec::S, methods::M) where {Token,S,M} =
-    _StatefulKernelSkeleton{Token,S,M}(name, mod, spec, methods)
+_StatefulKernelSkeleton(name::Symbol, ::Val{Token}, mod::Module, spec::S, methods::M,
+                        recipe_source::R) where {Token,S,M,R} =
+    _StatefulKernelSkeleton{Token,S,M,R}(name, mod, spec, methods, recipe_source)
 
 kernel_token(skel::_StatefulKernelSkeleton{Token}) where {Token} = Token
 kernel_module(skel::_StatefulKernelSkeleton) = getfield(skel, :mod)
 kernel_spec(skel::_StatefulKernelSkeleton) = getfield(skel, :spec)
 kernel_methods(skel::_StatefulKernelSkeleton) = getfield(skel, :methods)
+
+# Thaw a FRESH copy of the captured recipe-statement source (`Expr(:block, …)`), in
+# authored order, with full conditional/index/call structure preserved and definition
+# line numbers stripped. Each call rebuilds new mutable nodes, so mutating the result
+# never affects the stored frozen source or a subsequent read. poc's stateful MethodIR
+# consumes this because `Recipe.op` is opaque; pair it with `kernel_module` for
+# hygienic resolution of the names inside.
+kernel_recipe_ast(skel::_StatefulKernelSkeleton) =
+    Expr(:block, (_kernel_thaw_ast(s) for s in getfield(skel, :recipe_source))...)
 
 function Base.show(io::IO, skel::_StatefulKernelSkeleton)
     print(io, "stateful @kernel :", skel.name, " (", length(skel.methods),
@@ -304,6 +352,16 @@ function _kernel_stateful_expand(name, signature_inputs, call_signature, block,
            signature = m.signature, call = m.call, body = m.body)
         for m in methods)
 
+    # Capture the recipe-portion SOURCE as a detached, recursively-frozen AST (poc's
+    # stateful MethodIR needs it — `Recipe.op` is opaque). Deep-copy each recipe
+    # statement before stripping line numbers so the originals feeding `spec_expr`
+    # stay untouched; drop bare line-number statements; keep source order + the full
+    # conditional/index/call structure. The frozen value is embedded as an immutable
+    # literal (exactly like `method_meta`), so it self-quotes into the expansion.
+    recipe_source = Tuple(
+        _kernel_freeze_ast(s isa Expr ? Base.remove_linenums!(deepcopy(s)) : s)
+        for s in recipe_stmts if !(s isa LineNumberNode))
+
     # A method-bearing `@kernel` binds its OWNER name via a `const` so the bound
     # skeleton value is a stable, immutable binding (safe to capture by identity in
     # a composing owner). A `const` in an unsupported local scope is a Julia error,
@@ -312,5 +370,5 @@ function _kernel_stateful_expand(name, signature_inputs, call_signature, block,
     Expr(:const, Expr(:(=), esc(name),
         Expr(:call, _StatefulKernelSkeleton, QuoteNode(name),
              Expr(:call, Val, QuoteNode(token_sym)), __module__,
-             esc(spec_expr), method_meta)))
+             esc(spec_expr), method_meta, recipe_source)))
 end

@@ -10,6 +10,16 @@
 
 const RKS = ReactiveKernels
 
+# True iff `x` (a frozen recipe-source value) contains NO mutable AST container —
+# no `Expr`, `Vector`, or `Dict` anywhere in its structure.
+_no_mutable_ast(::Expr) = false
+_no_mutable_ast(::AbstractVector) = false
+_no_mutable_ast(::AbstractDict) = false
+_no_mutable_ast(x::RKS._FrozenExpr) = all(_no_mutable_ast, x.args)
+_no_mutable_ast(x::RKS._FrozenQuoteNode) = _no_mutable_ast(x.value)
+_no_mutable_ast(x::Tuple) = all(_no_mutable_ast, x)
+_no_mutable_ast(::Any) = true
+
 # --- top-level stateful fixtures (method-bearing ⇒ const ⇒ top-level only) ---
 @kernel StatefulObjFixture(ham, pos, mom) = begin
     derived = ham
@@ -49,6 +59,16 @@ end
     end
     tune!(self, y; target = 0.8, opts...) = begin
         self.r = y + target
+    end
+end
+
+# Recipe-source provenance: conditional (`? :`), index (`[]`), and `Ref(...)` call
+# structure in the recipe portion — the exact shapes poc's MethodIR must recover.
+@kernel StatefulRecipeSrcFixture(fwdbwd, gofwd) = begin
+    fwd = Ref(fwdbwd[gofwd ? 1 : 2])
+    bwd = Ref(fwdbwd[gofwd ? 2 : 1])
+    swap!(self) = begin
+        self.fwd = bwd
     end
 end
 
@@ -191,6 +211,66 @@ end
         # self itself may not be a vararg splat
         @test_throws ArgumentError RKS._kernel_extract_method(
             :(bad!(self...) = 1), :short)
+    end
+
+    @testset "recipe-source provenance: frozen capture + kernel_recipe_ast" begin
+        skel = StatefulRecipeSrcFixture
+        ast = RKS.kernel_recipe_ast(skel)
+        @test ast isa Expr && ast.head === :block
+
+        # (gate 2) recipe SOURCE round-trips the conditional/index/Ref statements in
+        # authored order, structure intact.
+        stmts = filter(s -> !(s isa LineNumberNode), ast.args)
+        @test length(stmts) == 2
+        @test stmts[1] == :(fwd = Ref(fwdbwd[gofwd ? 1 : 2]))
+        @test stmts[2] == :(bwd = Ref(fwdbwd[gofwd ? 2 : 1]))
+
+        # (gate 3) each call thaws a FRESH copy; mutating one does not change a later
+        # read.
+        ast2 = RKS.kernel_recipe_ast(skel)
+        @test ast2 == ast && ast2 !== ast
+        empty!(ast.args); push!(ast.args, :corrupted)     # corrupt the first copy
+        ast3 = RKS.kernel_recipe_ast(skel)
+        @test ast3 != ast                                  # stored source untouched
+        @test filter(s -> !(s isa LineNumberNode), ast3.args)[1] ==
+              :(fwd = Ref(fwdbwd[gofwd ? 1 : 2]))
+
+        # (gate 4) capture is a value fixed at expansion — no runtime-state input, so
+        # repeated reads are stable regardless of prior mutation.
+        @test RKS.kernel_recipe_ast(skel) == ast2
+
+        # (gate 5) NO Expr / Vector / Dict lives in the stored frozen form.
+        stored = getfield(skel, :recipe_source)
+        @test stored isa Tuple
+        @test _no_mutable_ast(stored)
+        @test all(n -> n isa RKS._FrozenExpr, stored)
+
+        # definition module retained for hygienic resolution of the captured names.
+        @test RKS.kernel_module(skel) isa Module
+    end
+
+    @testset "freeze/thaw AST round-trips; no mutable node survives freezing" begin
+        for src in (:(fwd = Ref(fwdbwd[gofwd ? 1 : 2])),
+                    :(bwd = Ref(fwdbwd[gofwd ? 2 : 1])),
+                    :(y = f(:sym, x[i], a ? b : c)))
+            fr = RKS._kernel_freeze_ast(src)
+            @test fr isa RKS._FrozenExpr
+            @test _no_mutable_ast(fr)                      # (gate 5) exact structure
+            thawed = RKS._kernel_thaw_ast(fr)
+            @test thawed == src && thawed !== src          # (gate 2) round-trip, fresh
+        end
+
+        # a thawed copy is fully detached — mutating it can't reach the frozen node.
+        fr = RKS._kernel_freeze_ast(:(fwd = Ref(fwdbwd[gofwd ? 1 : 2])))
+        t1 = RKS._kernel_thaw_ast(fr)
+        t1.args[1] = :zzz
+        @test RKS._kernel_thaw_ast(fr) == :(fwd = Ref(fwdbwd[gofwd ? 1 : 2]))
+
+        # a QuoteNode wrapping an Expr is frozen too — no raw Expr survives (gate 5).
+        qn = Expr(:(=), :x, QuoteNode(Expr(:call, :+, :a, :b)))
+        frq = RKS._kernel_freeze_ast(qn)
+        @test _no_mutable_ast(frq)
+        @test RKS._kernel_thaw_ast(frq) == qn
     end
 
     @testset "(4) short/long detection on the plain fixture" begin
