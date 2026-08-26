@@ -1199,6 +1199,19 @@ All recipe bodies resolve and capture names in the caller's scope. The macro
 only constructs closures and graph metadata; recipe bodies run only when a
 prepared kernel is invoked.
 
+A recipe RHS may contain arbitrary Julia, including control-flow and scoping
+forms — `try`/`catch`/`finally`, `let`, comprehensions, and `do` blocks. Each
+recipe is compiled into an opaque ordinary-Julia operation closed over its free
+ports, so these forms simply run as ordinary Julia inside that operation; there
+is no reactive invalidation to track through them, which is why they are safe
+here. Free-port detection flows through them, so a port referenced only inside a
+`try`, `let`, or comprehension is still discovered as a recipe dependency. A
+`catch` variable that collides with a port name is renamed hygienically, so the
+exception binding never shadows a port. This differs from an invalidation-tracked
+reactive method body, where deferred or exception-conditional execution would
+defeat field-level invalidation and such forms are therefore rejected — the
+opaque-operation model is exactly what lets `@kernel` admit them.
+
 `@kernel` authors a graph, not a new object type. Inline method definitions and
 ReactiveObjects-style `__self__` rewriting are not part of this macro. Stateful
 mutation is provided separately by [`prepare_reactive`](@ref), [`set!`](@ref),

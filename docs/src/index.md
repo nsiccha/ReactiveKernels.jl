@@ -75,6 +75,18 @@ arguments, and remain exposed input ports alongside required arguments. A
 keyword without a default is required. The prepared call adapter resolves the
 signature before entering the same generated positional kernel.
 
+A recipe right-hand side is ordinary Julia. Each recipe compiles into an opaque
+operation closed over its free ports, so control-flow and scoping forms —
+`try`/`catch`/`finally`, `let`, comprehensions, and `do` blocks — run as plain
+Julia inside that operation. Free-port detection flows through them, so a port
+used only inside a `try`, `let`, or comprehension is still discovered as a
+dependency, and a `catch` variable that happens to share a port's name is
+renamed so it never shadows the port. This is safe precisely because the recipe
+is opaque: there is no reactive invalidation to track through the branch. It is
+the deliberate contrast with an invalidation-tracked reactive method body, where
+deferred or exception-conditional execution would defeat field-level
+invalidation and these forms are therefore rejected.
+
 The macro authors a graph, not a per-kernel object type. Compiled reactive state
 supports source mutation through `set!`, `mutate!`, and `touch!`; inline method
 definitions and ReactiveObjects-style magic `__self__` rewriting are not part of
