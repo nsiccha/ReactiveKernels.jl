@@ -167,7 +167,7 @@ end
                            log(oftype(stepsize, 10)) + log(stepsize),
                            oftype(stepsize, 0.8), oftype(stepsize, 0.05),
                            oftype(stepsize, 0.75), oftype(stepsize, 10))
-    w     = welford(0, zero(position), zero(position))
+    w     = welford(zero(eltype(position)), zero(position), zero(position))   # float n (F32/F64-faithful)
     stats = sampling_stats(0, 0, zero(stepsize), zero(stepsize), 0, 0)
 
     # --- read-only reducer segments (no state write) -------------------------------------------------
@@ -185,13 +185,15 @@ end
     # kin/ham (kinetic quadratic => sign-invariant). Distinct owned fwd/bwd buffers => the first leaf
     # reads the mirrored init gradient WITHOUT a pgrad recompute (fused == n_steps + 1).
     mirror!(self) = begin
+        self.fwd.value_gradient = self.init.value_gradient       # owned bundle (distinct inner buffers)
         @. self.fwd.pos      = self.init.pos
         @. self.fwd.mom      = self.init.mom
         @. self.fwd.velocity = self.init.velocity
-        @. self.fwd.gradient = self.init.gradient
-        self.fwd.potential   = self.init.potential
+        @. self.fwd.gradient = self.init.gradient                # projection of the bundle
+        self.fwd.potential   = self.init.potential               # projection/scalar
         self.fwd.kinetic     = self.init.kinetic
         self.fwd.hamiltonian = self.init.hamiltonian
+        self.bwd.value_gradient = self.init.value_gradient       # bwd shares the position => same bundle
         @. self.bwd.pos      = self.init.pos
         @. self.bwd.mom      = -self.init.mom
         @. self.bwd.velocity = -self.init.velocity
@@ -382,8 +384,9 @@ end
         _min1exp(energy_error(self, self.fwd.hamiltonian))        # reducer
     end
     # src find_initial_stepsize! (hmc.jl:803-837): double/halve until a one-step proposal crosses target.
-    function find_initial_stepsize!(self, rng; initial = 1, target = 0.8,
-                                    min_stepsize = eps(Float64), max_stepsize = 1e3,
+    function find_initial_stepsize!(self, rng; initial = one(self.ham.stepsize), target = 0.8,
+                                    min_stepsize = eps(typeof(self.ham.stepsize)),
+                                    max_stepsize = oftype(self.ham.stepsize, 1e3),
                                     max_iterations = 32)
         stepsize = clamp(oftype(self.ham.stepsize, initial),
                          oftype(self.ham.stepsize, min_stepsize),
@@ -406,7 +409,7 @@ end
     # src warmup! (hmc.jl:898-988): initial step-size search, dual averaging every iteration, Stan-style
     # expanding metric windows with window-end mass update + DA/Welford reset, final da.final.
     function warmup!(self, iterations, scratch, rng; target_accept = 0.8, minimum_variance = 1e-3)
-        n = iterations
+        n = Int(iterations)                                       # _warmup_window_ends wants ::Int
         initial_stepsize = find_initial_stepsize!(self, rng; target = target_accept)   # orchestration
         reset!(self.da, initial_stepsize; target = target_accept)  # segment (start DA at initial)
         reset!(self.w)                                             # segment (start Welford clean)
@@ -536,23 +539,46 @@ if abspath(PROGRAM_FILE) == @__FILE__
         end
         nothing
     end
-    # FULL assignment grammar: any head ending in `=` that is not a comparison, plus mutating calls
-    # (copyto!/fill!/lmul!/ldiv!/mul!/randn!) whose DESTINATION (first arg) is a self-path.
+    # FULL assignment grammar: any head ending in `=` that is not a comparison. Recurses through @.
+    # macrocalls (their inner assignment is a normal Expr under :macrocall args).
     const _CMP = Set([:(==), :(!=), :(<=), :(>=), :(===), :(!==), :(.==), :(.!=), :(.<=), :(.>=)])
     is_assign_head(h::Symbol) = (s = String(h); endswith(s, "=") && !(h in _CMP))
     is_assign_head(::Any) = false
-    const _MUT = Set(["copyto!", "fill!", "lmul!", "ldiv!", "mul!", "randn!", "rmul!"])
-    # collect every self-path WRITE target (assignment LHS + mutating-call destination), recursing
-    # through @. macrocalls (their inner assignment is a normal Expr under :macrocall args).
-    function self_writes(body, self)
+    # (i) self-ASSIGNMENT targets: only assignment-head LHS self-paths (field-set extraction).
+    function self_assign_targets(body, self)
+        acc = String[]
+        _walk(body) do x
+            x isa Expr && is_assign_head(x.head) && length(x.args) >= 1 || return
+            p = self_path(x.args[1], self); p === nothing || push!(acc, p)
+        end
+        acc
+    end
+    # (ii) FULL self-MUTATION scanner (the orchestration contract): assignment-head LHS self-paths PLUS
+    # ANY `!`-suffixed callee that touches a self path, NOT relying on a fixed mutator list. copyto!/
+    # fill! legitimately READ self as a non-destination source, so for those two the destination is
+    # arg1 ONLY; every OTHER unrecognized `!` callee (push!/setindex!/broadcast!/user mutator) is
+    # flagged if ANY actual argument is a self path. Authored segment/orchestration calls (the
+    # sanctioned mutation channel) are exempt by name.
+    const _DEST_FIRST = Set(["copyto!", "fill!"])
+    function self_mutations(body, self, authored)
         acc = String[]
         _walk(body) do x
             x isa Expr || return
             if is_assign_head(x.head) && length(x.args) >= 1
-                p = self_path(x.args[1], self); p === nothing || push!(acc, p)
-            elseif x.head === :call && x.args[1] isa Symbol && string(x.args[1]) in _MUT &&
-                   length(x.args) >= 2
-                p = self_path(x.args[2], self); p === nothing || push!(acc, p)
+                p = self_path(x.args[1], self); p === nothing || push!(acc, "assign:$(p)")
+            elseif x.head === :call && x.args[1] isa Symbol
+                fname = string(x.args[1])
+                fname in authored && return                       # sanctioned segment/orchestration call
+                endswith(fname, "!") || return
+                if fname in _DEST_FIRST
+                    length(x.args) >= 2 &&
+                        (p = self_path(x.args[2], self); p === nothing || push!(acc, "dest:$(p)"))
+                else
+                    for a in x.args[2:end]
+                        p = self_path(a, self)
+                        p === nothing || (push!(acc, "mutate($(fname)):$(p)"); break)
+                    end
+                end
             end
         end
         acc
@@ -592,7 +618,7 @@ if abspath(PROGRAM_FILE) == @__FILE__
     allowed_ext = Set(["copy", "zero", "one", "exp", "log", "log1p", "sqrt", "dot", "isfinite",
                        "oftype", "cholesky", "logdet", "randn!", "lmul!", "ldiv!", "inv", "max",
                        "min", "clamp", "convert", "Matrix", "Diagonal", "fill", "fill!", "copyto!",
-                       "floor", "length", "eltype", "float", "typeof", "rand", "push!",
+                       "floor", "length", "eltype", "float", "typeof", "rand", "eps",
                        "_min1exp", "_finite_or_neginf", "_logaddexp", "_rand_bernoulli_log",
                        "_smooth", "_warmup_window_ends", "_nuts_scratch", "!", "!="])
     for m in RKS.kernel_methods(sampler), call in body_calls(m.body)
@@ -601,20 +627,39 @@ if abspath(PROGRAM_FILE) == @__FILE__
             error("unresolved method call `$(call)` in sampler.$(m.name) — not authored/allowed")
     end
 
-    # (d) segment/orchestration contract: ORCHESTRATION bodies have ZERO self-path WRITES (full
-    #     assignment grammar + mutating-call destinations), so they mutate state only via segments.
+    # (d) segment/orchestration contract: ORCHESTRATION bodies have ZERO self MUTATIONS — no assignment
+    #     to any self-path (full grammar) AND no unrecognized `!` mutator touching a self-path — so they
+    #     mutate authoritative state ONLY through authored segment calls.
     orchestration = Set([:reset_scratch!, :flip!, :start_tree!, :finish_tree!, :step!,
                          :probe_acceptance!, :find_initial_stepsize!, :warmup!, :sample!])
     for m in RKS.kernel_methods(sampler)
         m.name in orchestration || continue
-        w = self_writes(m.body, m.self)
-        isempty(w) || error("orchestration sampler.$(m.name) writes self-path(s) $(w) — use segments")
+        w = self_mutations(m.body, m.self, authored)
+        isempty(w) || error("orchestration sampler.$(m.name) mutates self-path(s) $(w) — use segments")
+    end
+    # (d') NEGATIVE PROBES: the scanner must catch mutators OUTSIDE any fixed list (push!/setindex!/
+    #      broadcast!/user mutator) and the full augmented-assignment grammar, while NOT flagging a
+    #      copyto!/fill! that merely READS self as a source, nor an authored segment call.
+    let s = :self
+        flags(ex) = self_mutations(ex, s, authored)
+        @assert !isempty(flags(:(push!(self.x, 1))))           "must catch push!(self.x,...)"
+        @assert !isempty(flags(:(setindex!(self.x, 1, 2))))    "must catch setindex!(self.x,...)"
+        @assert !isempty(flags(:(broadcast!(+, self.x, y))))   "must catch broadcast!(...,self.x)"
+        @assert !isempty(flags(:(usermutate!(self.q.r, 3))))   "must catch an arbitrary ! mutator on self"
+        @assert !isempty(flags(:(self.x .+= 1)))               "must catch .+="
+        @assert !isempty(flags(:(self.x ./= 2)))               "must catch ./="
+        @assert !isempty(flags(:(self.a.b[i] = 3)))            "must catch indexed self assignment"
+        @assert isempty(flags(:(copyto!(local_dest, self.x)))) "must NOT flag copyto! reading self as source"
+        @assert isempty(flags(:(fill!(local_dest, self.x)))) "must NOT flag fill! reading self as source"
+        @assert isempty(flags(:(leapfrog!(self))))             "must NOT flag an authored segment call"
+        @assert isempty(flags(:(refresh_momentum!(self.init, rng)))) "must NOT flag an authored segment call"
     end
 
-    # (e) FULL authoritative mirror: exact fwd+bwd fields; bwd momentum/velocity SIGNED (unary minus) --
+    # (e) FULL authoritative mirror: exact fwd+bwd fields INCL. the owned value_gradient bundle; bwd
+    #     momentum/velocity SIGNED (unary minus) so no forward-only staleness survives in bwd.
     mirror = method_of(sampler, :mirror!)
-    mw = Set(self_writes(mirror.body, mirror.self))
-    for f in ("pos", "mom", "velocity", "gradient", "potential", "kinetic", "hamiltonian")
+    mw = Set(self_assign_targets(mirror.body, mirror.self))
+    for f in ("value_gradient", "pos", "mom", "velocity", "gradient", "potential", "kinetic", "hamiltonian")
         @assert "fwd.$f" in mw "mirror! must copy init.$f -> fwd.$f"
         @assert "bwd.$f" in mw "mirror! must set bwd.$f"
     end
@@ -637,12 +682,10 @@ if abspath(PROGRAM_FILE) == @__FILE__
 
     # (f) Unit-C: recompute_init! makes the FULL phase point current with EXACTLY one pgrad ------------
     rec = method_of(sampler, :recompute_init!)
-    rw = Set(self_writes(rec.body, rec.self))
+    rw = Set(self_assign_targets(rec.body, rec.self))
     for f in ("value_gradient", "potential", "gradient", "velocity", "kinetic", "hamiltonian")
         @assert "init.$f" in rw "recompute_init! must make init.$f current"
     end
-    @assert count(occursin("potential_gradient!", string(s)) for s in
-                  [a for a in rec.body.args]) >= 0   # (presence; count-of-one asserted via string)
     @assert length(collect(eachmatch(r"potential_gradient!", string(rec.body)))) == 1 "recompute_init! must do EXACTLY one pgrad"
 
     # (g) metric adaptation: n>1 guard + type preservation (src _adapted_diagonal_metric) -------------
@@ -685,7 +728,7 @@ if abspath(PROGRAM_FILE) == @__FILE__
 
     # (l) stats records energy error (real diagnostic) ------------------------------------------------
     rc = method_of(sampling_stats, :record!)
-    @assert "sum_energy_error" in Set(self_writes(rc.body, rc.self)) "record! must accumulate energy error"
+    @assert "sum_energy_error" in Set(self_assign_targets(rc.body, rc.self)) "record! must accumulate energy error"
 
     # (m) scratch: NO tree/proposal/control construction inside hot orchestration; buffers from scratch -
     hot = Set([:reset_scratch!, :flip!, :start_tree!, :finish_tree!, :step!,
@@ -701,11 +744,33 @@ if abspath(PROGRAM_FILE) == @__FILE__
             @assert !occursin(bad, s) "hot orchestration sampler.$(m.name) constructs scratch/buffers ($bad) — must come from the passed scratch"
         end
     end
-    # scratch is genuinely preallocated + two instances independent (distinct buffers).
+    # scratch is genuinely preallocated; buffers are pairwise distinct WITHIN one instance AND across
+    # instances (no aliasing that would corrupt the tournament / tree accumulation).
+    all_buffers(s) = begin
+        bufs = Any[]
+        for p in s.proposals; push!(bufs, p.pos); push!(bufs, p.mom); end
+        for t in s.trees
+            push!(bufs, t.log_weight, t.backward.momentum, t.backward.velocity,
+                  t.backward_forward.momentum, t.backward_forward.velocity,
+                  t.summed_momentum.backward, t.summed_momentum.forward)
+        end
+        bufs
+    end
     let s1 = _nuts_scratch(zeros(3), zeros(3), 4), s2 = _nuts_scratch(zeros(3), zeros(3), 4)
         @assert length(s1.trees) == 5 && length(s1.proposals) == 6 "scratch sizing (max_depth+1 / +2)"
-        @assert s1.proposals[1].pos !== s2.proposals[1].pos "two scratch instances must be independent"
-        @assert s1.trees[1].log_weight !== s2.trees[1].log_weight "two scratch instances must be independent"
+        b1 = all_buffers(s1)
+        @assert length(b1) == length(unique(objectid, b1)) "ALL scratch buffers must be pairwise distinct within one instance"
+        b2 = all_buffers(s2)
+        @assert isempty(intersect(Set(objectid.(b1)), Set(objectid.(b2)))) "two scratch instances must share no buffer"
+    end
+    # Float32 vs Float64: the unified factory promises DISTINCT concrete precision paths (no Float64
+    # fallback for a Float32 model) — control/tree/proposal buffers carry the position's scalar type.
+    let s32 = _nuts_scratch(zeros(Float32, 3), zeros(Float32, 3), 3),
+        s64 = _nuts_scratch(zeros(Float64, 3), zeros(Float64, 3), 3)
+        @assert eltype(s32.proposals[1].pos) === Float32 && eltype(s32.trees[1].log_weight) === Float32 &&
+                typeof(s32.control.energy_error) === Float32 "Float32 model => Float32 scratch path"
+        @assert eltype(s64.proposals[1].pos) === Float64 && eltype(s64.trees[1].log_weight) === Float64 &&
+                typeof(s64.control.energy_error) === Float64 "Float64 model => Float64 scratch path"
     end
 
     # (n) no manual plumbing / no @reactive in any authored method body ------------------------------
@@ -724,9 +789,10 @@ if abspath(PROGRAM_FILE) == @__FILE__
             occursin("velocity", bodies) "leapfrog Stormer-Verlet retained"
 
     println("Inc1 source-shape gate PASS (NON-VACUOUS): stateful/stateless skeletons + exact method")
-    println("inventory + call-graph closure + segment/orchestration contract (full assignment grammar,")
-    println("zero self-writes in orchestration) + FULL authoritative mirror (14 fields, bwd mom+vel")
-    println("signed) + Unit-C full phase point w/ exactly-one pgrad + n>1 metric guard + type")
+    println("inventory + call-graph closure + segment/orchestration contract (full assignment grammar +")
+    println("any-! -mutator-on-self, authored-exempt, w/ push!/setindex!/broadcast! negative probes) +")
+    println("FULL authoritative mirror (16 fields incl. value_gradient bundle, bwd mom+vel signed) +")
+    println("Unit-C full phase point w/ exactly-one pgrad + n>1 metric guard + type")
     println("preservation + warmup windows/DA+Welford reset/final + multinomial tree (log weights,")
     println("proposal swap, subtree+top-level Bernoulli draws, accumulated momenta, 3-part criterion,")
     println("divergence stop) + EXACT RNG order + energy-error stats + preallocated independent scratch.")
