@@ -32,6 +32,7 @@ using Test
         include("test_benchmark_smoke.jl")
         include("test_online_stats_example.jl")
         include("test_distributions_example.jl")
+        include("test_vectorized_lpdf.jl")
         include("test_batched_example.jl")
         include("test_preexisting_examples.jl")
         include("test_corrected_core_examples.jl")

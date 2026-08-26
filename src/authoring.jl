@@ -184,6 +184,80 @@ function _kernel_add!(graph::Graph, ins, outs, op, cost, cse_key, effectful)
          cost = cost, cse_key = cse_key, effectful = effectful)
 end
 
+# --- generated batched log densities: the `plate` marker --------------------
+#
+# Ergonomic authoring for the PPL log-density-accumulation idiom (Stan's
+# vectorized lpdf / `reduce_sum`): the author writes a *scalar* pointwise term
+# over batched data and marks it with `plate`, and the batched graph — broadcast
+# the pointwise op over the batch, then `sum`-reduce to the scalar log density —
+# is generated at authoring time:
+#
+#     logdensity::Float64      = plate(normal_lpdf, x, μ, σ)   # broadcast + sum
+#     per_obs::Vector{Float64} = plate(normal_lpdf, x, μ, σ)   # broadcast only
+#
+# This generates exactly the graph `examples/batched.jl` writes by hand
+# (`broadcast(f, x, …)` + `sum`), so the planner and lowering are unchanged; only
+# the authoring layer is new. Whether the reduction is generated is decided by
+# the DECLARED output type (scalar ⇒ sum to the total log density; array ⇒ the
+# per-observation vector, for LOO/WAIC).
+#
+# `plate` is an explicit MARKER, not automatic type inference. Automatic firing
+# on a bare scalar call was tried and empirically miscompiled genuine functions
+# that take a vector (e.g. arma11's `one_step_forecast(::ARMAParameters, …)`):
+# op opacity means no type-only rule can distinguish a pointwise lpdf from a
+# real vector-consuming function, and a wrong guess silently computes the wrong
+# thing. The marker fires only where the author asks for it, so it can never
+# change the meaning of an existing kernel; explicit `broadcast`/`sum` remain
+# available and untouched.
+
+"""
+    _PointwiseOp(f)
+
+Recipe operation that broadcasts a scalar function `f` over its arguments:
+`_PointwiseOp(f)(args...) == broadcast(f, args...)`. Concrete and closed over
+only `f`, so it specializes cleanly and carries no world-age hazard when passed
+positionally in the lowered `__ops__` tuple (see codegen.jl).
+"""
+struct _PointwiseOp{F}
+    f::F
+end
+(p::_PointwiseOp)(args...) = broadcast(p.f, args...)
+
+# Recognize a `plate(f, batch_ports...)` recipe RHS and return the pointwise
+# function expression `f` (spliced verbatim into the generated builder), or
+# `nothing` for any other RHS. `f` must be a baked pointwise function, not one of
+# the batched ports: a port-valued `f` is the existing explicit-`broadcast`
+# pattern, and treating it as the marker's function would misbind the inputs.
+function _kernel_plate_function(rhs, known::Set{Symbol})
+    (rhs isa Expr && rhs.head === :call && length(rhs.args) >= 3 &&
+     rhs.args[1] === :plate) || return nothing
+    f = rhs.args[2]
+    f isa Symbol && f in known && throw(ArgumentError(
+        "plate's first argument must be a pointwise function, not the port :$f"))
+    f
+end
+
+# Build the batched recipes for a `plate(f, batch_ports...)` marker: broadcast
+# `f` over the batch, and — when the declared output is scalar — reduce it with
+# `sum`. The reduction decision uses the resolved output type (`valtype`), so it
+# is robust regardless of how the output was annotated. The intermediate per-item
+# value is an internal graph value (not a named port); its declared element type
+# is the scalar output's type, which is metadata only — lowering does not
+# annotate produced intermediates (codegen.jl) — so a non-`Vector` batch
+# container still lowers and runs correctly.
+function _kernel_add_plate!(graph::Graph, ins::Tuple, outs::Tuple, f, cost,
+                            cse_key, effectful)
+    length(outs) == 1 || throw(ArgumentError("plate(...) requires a single output"))
+    out = only(outs)
+    if valtype(out) <: AbstractArray
+        _kernel_add!(graph, ins, (out,), _PointwiseOp(f), cost, cse_key, effectful)
+    else
+        per = value!(graph, gensym(:plate), Vector{valtype(out)})
+        _kernel_add!(graph, ins, (per,), _PointwiseOp(f), cost, cse_key, effectful)
+        _kernel_add!(graph, (per,), (out,), sum, cost, nothing, false)
+    end
+end
+
 # --- macro parsing ---------------------------------------------------------
 
 _kernel_is_line(ex) = ex isa LineNumberNode
@@ -912,6 +986,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     declare_ref = GlobalRef(@__MODULE__, :_kernel_declare!)
     push_unique_ref = GlobalRef(@__MODULE__, :_kernel_push_unique!)
     add_ref = GlobalRef(@__MODULE__, :_kernel_add!)
+    add_plate_ref = GlobalRef(@__MODULE__, :_kernel_add_plate!)
     spec_ref = GlobalRef(@__MODULE__, :KernelSpec)
     graph_ref = GlobalRef(@__MODULE__, :Graph)
     value_ref = GlobalRef(@__MODULE__, :Value)
@@ -1026,12 +1101,20 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         end
         dep_values = Expr(:tuple, (port_vars[name] for name in deps)...)
         out_values = Expr(:tuple, (port_vars[name] for (name, _) in outputs)...)
-        op = _kernel_operation(rhs, deps, known)
         cost = get(metadata, :cost, 1.0)
         cse_key = get(metadata, :cse_key, nothing)
         effectful = get(metadata, :effectful, false)
-        push!(body, :($add_ref($graph_var, $dep_values, $out_values,
-                               $op, $cost, $cse_key, $effectful)))
+        plate_fn = _kernel_plate_function(rhs, known)
+        if plate_fn === nothing
+            op = _kernel_operation(rhs, deps, known)
+            push!(body, :($add_ref($graph_var, $dep_values, $out_values,
+                                   $op, $cost, $cse_key, $effectful)))
+        else
+            # `deps` are the batched ports (the marker's function is baked, not a
+            # port), so they are exactly the broadcast inputs.
+            push!(body, :($add_plate_ref($graph_var, $dep_values, $out_values,
+                                         $plate_fn, $cost, $cse_key, $effectful)))
+        end
     end
     if !saw_return
         for name in produced_names
