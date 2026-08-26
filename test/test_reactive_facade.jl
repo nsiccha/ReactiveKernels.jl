@@ -144,3 +144,120 @@ end
     combo!(c, 0)                          # n defaults to 2
     @test c.base == 15                    # 13 + 2
 end
+
+# Additive @reactive `prepare=` hook: the macro owns spec/want/handles; an injected
+# callable returns the ReactiveProgram, so a definition can opt into the proven
+# non-allocating cache_apply/is_mutating preparation without any HMC- or
+# MutatingFunctions-specific coupling. Default (no option) stays byte-for-byte.
+@reactive _prep_default(pos::Vector{Float64}) = begin
+    copied::Vector{Float64} = copy(pos)
+end
+
+# Hand-written, MutatingFunctions-agnostic in-place hook.
+_prep_hca(cache::AbstractVector, ::typeof(copy), a) =
+    (length(cache) == length(a) || resize!(cache, length(a)); copyto!(cache, a); cache)
+_prep_hca(cache, op, args...) = op(args...)
+_prep_inplace(spec; want) = ReactiveKernels._prepare_reactive(
+    spec; want = want, cache_apply = _prep_hca,
+    is_mutating = ReactiveKernels._default_is_mutating)
+
+@reactive prepare=_prep_inplace _prep_owned(pos::Vector{Float64}) = begin
+    copied::Vector{Float64} = copy(pos)
+end
+
+@testset "@reactive facade — additive prepare hook (default unchanged)" begin
+    # Default expansion is byte-for-byte identical (option resolves to the same
+    # prepare_reactive value at macro-expansion time).
+    default_ast = @macroexpand @reactive _md(x::Vector{Float64}) = begin
+        y::Vector{Float64} = copy(x)
+    end
+    @test !occursin("cache_apply", string(default_ast))
+    @test occursin("prepare_reactive", string(default_ast))
+
+    d = _prep_default([1.0, 2.0])
+    @test d isa ReactiveObject
+    @test d.copied == [1.0, 2.0]
+    # Default is the allocating path: each recompute returns a fresh array.
+    first_copy = d.copied
+    setproperty!(d, :pos, [3.0, 4.0])
+    @test d.copied == [3.0, 4.0]
+    @test d.copied !== first_copy
+end
+
+@testset "@reactive facade — custom in-place preparation (0 B, isolation)" begin
+    owned = _prep_owned([1.0, 2.0, 3.0])
+    @test owned isa ReactiveObject
+    buffer = owned.copied
+    @test buffer == [1.0, 2.0, 3.0]
+
+    # The owned slot is reused in place across invalidate→recompute (stable id).
+    setproperty!(owned, :pos, [4.0, 5.0, 6.0])
+    @test owned.copied === buffer
+    @test owned.copied == [4.0, 5.0, 6.0]
+
+    # Steady-state 0 bytes behind a function barrier.
+    function _cycle!(object, value, n)
+        for _ in 1:n
+            setproperty!(object, :pos, value)
+            object.copied
+        end
+    end
+    probe_value = [4.0, 5.0, 6.0]
+    _cycle!(owned, probe_value, 1)
+    @test @allocated(_cycle!(owned, probe_value, 1000)) == 0
+
+    # Per-instance cache isolation.
+    other = _prep_owned([7.0, 8.0, 9.0])
+    @test other.copied !== owned.copied
+    setproperty!(other, :pos, [0.0, 0.0, 0.0])
+    @test owned.copied == [4.0, 5.0, 6.0]
+
+    # copy deep-copies the owned buffer (no aliasing across copies).
+    clone = copy(owned)
+    @test clone.copied !== owned.copied
+    setproperty!(clone, :pos, [1.0, 1.0, 1.0])
+    @test owned.copied == [4.0, 5.0, 6.0]
+
+    # Inference: the reactive read is concretely typed.
+    @test (@inferred((o -> o.copied)(owned)))::Vector{Float64} == [4.0, 5.0, 6.0]
+end
+
+# A prepare callable that does not return a ReactiveProgram; the validation runs in
+# the const program-cache initializer at definition-eval time.
+_bad_prep(spec; want) = 42
+_unwrap_err(err) = err isa LoadError ? err.error : err
+
+@testset "@reactive facade — prepare hook robustness (duplicate/validation/AST)" begin
+    # Duplicate prepare= options are rejected deterministically (macro-expansion).
+    dup = try
+        @eval @reactive prepare=identity prepare=identity _dup(x::Vector{Float64}) = begin
+            y::Vector{Float64} = copy(x)
+        end
+        nothing
+    catch err
+        err
+    end
+    @test _unwrap_err(dup) isa ArgumentError
+
+    # The injected callable must return a ReactiveProgram — actionable build error.
+    thrown = try
+        @eval @reactive prepare=_bad_prep _bad(x::Vector{Float64}) = begin
+            y::Vector{Float64} = copy(x)
+        end
+        nothing
+    catch err
+        err
+    end
+    @test _unwrap_err(thrown) isa ArgumentError
+    @test occursin("must return a ReactiveProgram", sprint(showerror, _unwrap_err(thrown)))
+
+    # Default expansion AST is unchanged by the additive option (no cache_apply,
+    # still prepare_reactive; option-free and prepare=default produce the same
+    # program-build call shape).
+    ast_default = string(@macroexpand @reactive _a1(x::Vector{Float64}) = begin
+        y::Vector{Float64} = copy(x)
+    end)
+    @test occursin("prepare_reactive", ast_default)
+    @test !occursin("__cache_apply__", ast_default)
+    @test !occursin("must return a ReactiveProgram", ast_default)   # no validation wrap
+end

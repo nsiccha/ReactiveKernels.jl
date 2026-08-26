@@ -272,7 +272,6 @@ mutable struct CompiledNUTSState{R,G,F,S,T,TR,PR} <: AbstractNUTSState
     step_f::F
     stats_f::S
     max_depth::Int
-    min_energy_error::T
     trees::TR
     proposals::PR
     go_forward::Bool
@@ -314,6 +313,9 @@ function Base.getproperty(state::CompiledNUTSState, name::Symbol)
     name === :dham && return getfield(state, :energy_error)
     name === :gofwd && return getfield(state, :go_forward)
     name === :init && return _CompiledInitView(getfield(state, :group))
+    # The reactive group's min_dham HAVE source is the single divergence-threshold
+    # authority; expose it (never a duplicate mutable copy that could drift).
+    name === :min_energy_error && return getfield(state, :group).min_dham
     getfield(state, name)
 end
 
@@ -375,9 +377,10 @@ function compiled_nuts_state(group::ReactivePhasePoint; rng, step_f,
     # integrator rather than silently ignoring its func/args.
     (step_f isa PartialFunction && step_f.func === leapfrog! &&
      isempty(step_f.largs) && isempty(step_f.rargs) &&
-     hasproperty(step_f, :stepsize)) || throw(ArgumentError(
-        "compiled_nuts_state supports step_f = partial(leapfrog!; stepsize=...); " *
-        "other integrators are not yet supported on the compiled group"))
+     keys(getfield(step_f, :kwargs)) === (:stepsize,)) || throw(ArgumentError(
+        "compiled_nuts_state supports step_f = partial(leapfrog!; stepsize=...) " *
+        "with exactly the stepsize keyword; other integrators or extra/unknown " *
+        "keywords are not supported on the compiled group"))
     prototype = group.init_mom
     scalar = typeof(float(group.init_ham - group.init_ham))
     # Sync the reactive divergence threshold so group.diverged uses this min_dham.
@@ -389,8 +392,7 @@ function compiled_nuts_state(group::ReactivePhasePoint; rng, step_f,
     proposals = [_nuts_proposal(group.init_pos, group.init_mom)
                  for _ in 1:(max_depth + 2)]
     CompiledNUTSState(
-        rng, group, step_f, stats_f, Int(max_depth),
-        convert(scalar, min_dham), trees, proposals,
+        rng, group, step_f, stats_f, Int(max_depth), trees, proposals,
         true, true, true, zero(scalar), false, 0, 0, zero(scalar),
     )
 end
@@ -719,11 +721,11 @@ end
 """
     nuts_state(point::ReactivePhasePoint; rng, step_f, ...)
 
-Construct a NUTS sampler. When `point` is a flat phase-point group from
-[`reactive_nuts_group`](@ref) it builds the compiled-reactive
-[`CompiledNUTSState`](@ref) (the default public path); a plain single-endpoint
-phase point builds the ordinary-Julia reference oracle (`_oracle_nuts_state`,
-retained for parity tests).
+Construct the compiled-reactive NUTS sampler. `point` MUST be a flat phase-point
+group from [`reactive_nuts_group`](@ref); it builds a [`CompiledNUTSState`](@ref).
+A plain single-endpoint phase point is REJECTED with actionable guidance — the
+ordinary-Julia reference oracle is the unexported `_oracle_nuts_state`, used only
+for parity tests.
 """
 function nuts_state(point::ReactivePhasePoint; kwargs...)
     _is_reactive_nuts_group(point) || throw(ArgumentError(

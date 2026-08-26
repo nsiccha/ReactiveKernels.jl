@@ -550,3 +550,24 @@ end
     @test (@inferred((v -> v.ham)(initview)))::Float64 == group.init_ham
     @test (@inferred((v -> v.metric)(initview))) == group.metric
 end
+
+@testset "CompiledNUTSState — single divergence-threshold authority + strict kwargs" begin
+    D = 3
+    metric = Matrix{Float64}(I, D, D)
+    group = reactive_nuts_group(_std_pot_grad!, metric, _det_pos(D), zeros(D))
+    state = compiled_nuts_state(group; rng = Xoshiro(1),
+                                step_f = partial(leapfrog!; stepsize = 0.2),
+                                min_dham = -500.0)
+    # min_energy_error is NOT a duplicate field — it reads the group's min_dham
+    # HAVE source, so there is a single authority that cannot drift.
+    @test state.min_energy_error === group.min_dham
+    @test state.min_energy_error == -500.0
+    group.min_dham = -12.0
+    @test state.min_energy_error == -12.0        # follows the source, no stale copy
+
+    # Unknown/extra integrator keywords are rejected, not silently ignored.
+    g2 = reactive_nuts_group(_std_pot_grad!, metric, _det_pos(D), zeros(D))
+    @test_throws ArgumentError compiled_nuts_state(
+        g2; rng = Xoshiro(1),
+        step_f = partial(leapfrog!; stepsize = 0.2, bogus = true))
+end

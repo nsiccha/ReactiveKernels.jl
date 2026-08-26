@@ -575,7 +575,7 @@ function _reactive_definition_parts(def)
     (parts..., def.args[2])
 end
 
-function _reactive_expand(def)
+function _reactive_expand(def; prepare = nothing)
     parts = _reactive_definition_parts(def)
     parts === nothing && throw(ArgumentError(
         "@reactive expects `name(args...; kw...) = begin ... end`, got $(repr(def))"))
@@ -641,10 +641,22 @@ function _reactive_expand(def)
     # tuple, not a Symbol=>Any dict). The gensym'd name cannot collide across
     # definitions or modules.
     cache_name = gensym(Symbol(name, :__program))
+    # Default (no `prepare=`): byte-for-byte the original expansion. With a custom
+    # prepare callable: validate at build time that it returned a ReactiveProgram.
+    built_expr = prepare === nothing ?
+        :($prepare_reactive($spec_sym; want = $want_tuple)) :
+        quote
+            let program = $prepare($spec_sym; want = $want_tuple)
+                program isa $ReactiveProgram || throw(ArgumentError(
+                    "@reactive prepare callable must return a ReactiveProgram; got " *
+                    string(typeof(program))))
+                program
+            end
+        end
     cache_def = Expr(:const, Expr(:(=), cache_name, quote
         let
             $spec_sym = $spec_build
-            built = $prepare_reactive($spec_sym; want = $want_tuple)
+            built = $built_expr
             (built, $_reactive_handles(built, $spec_sym, $expose_tuple))
         end
     end))
@@ -694,6 +706,24 @@ definitions become ordinary type-stable methods that take the object as their
 first argument, with field references routed through the object. Returns a
 constructor bound to `name` producing a [`ReactiveObject`](@ref).
 """
-macro reactive(def)
-    _reactive_expand(def)
+macro reactive(args...)
+    isempty(args) && throw(ArgumentError("@reactive requires a definition"))
+    def = last(args)
+    # Additive, non-HMC option: `@reactive prepare=<callable> name(...) = ...`.
+    # The macro still owns the spec/want/handles; the injected callable receives
+    # the KernelSpec and a `want` keyword and must return a ReactiveProgram (e.g.
+    # one selecting the non-allocating cache_apply/is_mutating preparation). With
+    # no option the expansion is byte-for-byte identical to before.
+    prepare = nothing
+    seen_prepare = false
+    for option in args[1:(end - 1)]
+        (option isa Expr && option.head === :(=) && option.args[1] === :prepare) ||
+            throw(ArgumentError(
+                "@reactive options must be `prepare=<callable>`; got $(repr(option))"))
+        seen_prepare && throw(ArgumentError(
+            "@reactive got a duplicate `prepare=` option"))
+        seen_prepare = true
+        prepare = option.args[2]
+    end
+    _reactive_expand(def; prepare = prepare)
 end

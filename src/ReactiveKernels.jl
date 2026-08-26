@@ -49,7 +49,7 @@ export ReactiveObject, @reactive
 export ReactivePhasePoint, euclidean_phasepoint, riemannian_phasepoint
 export reactive_nuts_group, compiled_nuts_state, CompiledNUTSState
 export leapfrog!, generalized_leapfrog!, implicit_midpoint!, multistep
-export PartialFunction, partial, NUTSState, NUTSDiagnostics, nuts_state, step!
+export PartialFunction, partial, NUTSDiagnostics, nuts_state, step!
 export refresh_momentum!, diagnostics, sample!, reactive_program
 export find_initial_stepsize!, warmup!
 export DualAveragingState, dual_averaging_state, fit!
