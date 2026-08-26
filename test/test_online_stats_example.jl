@@ -134,89 +134,193 @@ const OSE = OnlineStatsExample
         empty = OSE.HMCDiagnosticsAccumulator()
         @test isbitstype(typeof(empty))
         @test OSE.sample_count(empty) == 0
+        @test OSE.max_tree_depth(empty) == 0
         @test empty.n_divergent == 0
         @test isnan(OSE.divergence_rate(empty))
         @test isnan(OSE.divergence_percent(empty))
-        @test isnan(OSE.mean_acceptance_rate(empty))
+        @test isnan(OSE.mean_tree_depth(empty))
         @test isnan(OSE.mean_leapfrog_steps(empty))
+        @test isnan(OSE.mean_acceptance_rate(empty))
+        @test isnan(OSE.mean_energy_error(empty))
         @test isnan(OSE.mean_stepsize(empty))
 
-        @test_throws DomainError OSE.record_transition(empty, -0.1, 3, 0.1, false)
-        @test_throws DomainError OSE.record_transition(empty, 1.1, 3, 0.1, false)
-        @test_throws DomainError OSE.record_transition(empty, NaN, 3, 0.1, false)
-        @test_throws DomainError OSE.record_transition(empty, 0.8, -1, 0.1, false)
-        @test_throws DomainError OSE.record_transition(empty, 0.8, 3, 0.0, false)
-        @test_throws DomainError OSE.record_transition(empty, 0.8, 3, Inf, false)
+        # Acceptance rate is still validated even though it now arrives inside
+        # a canonical NUTSDiagnostics record.
+        @test_throws DomainError OSE.record_transition(
+            empty, NUTSDiagnostics(3, 7, -0.1, false, 0.0), 0.1)
+        @test_throws DomainError OSE.record_transition(
+            empty, NUTSDiagnostics(3, 7, 1.1, false, 0.0), 0.1)
+        @test_throws DomainError OSE.record_transition(
+            empty, NUTSDiagnostics(3, 7, NaN, false, 0.0), 0.1)
+        # Non-negative tree depth and leapfrog count.
+        @test_throws DomainError OSE.record_transition(
+            empty, NUTSDiagnostics(-1, 7, 0.8, false, 0.0), 0.1)
+        @test_throws DomainError OSE.record_transition(
+            empty, NUTSDiagnostics(3, -1, 0.8, false, 0.0), 0.1)
+
+        # Step size: NaN (the default) is an explicit UNAVAILABLE — recorded
+        # without error and never folded — while a finite non-positive or
+        # infinite value is invalid telemetry and is rejected.
+        valid = NUTSDiagnostics(3, 7, 0.8, false, -0.05)
+        unavailable = OSE.record_transition(empty, valid)
+        @test OSE.sample_count(unavailable) == 1
+        @test unavailable.stepsize.n == 0
+        @test isnan(OSE.mean_stepsize(unavailable))
+        @test OSE.record_transition(empty, valid, NaN).stepsize.n == 0
+        available = OSE.record_transition(empty, valid, 0.2)
+        @test available.stepsize.n == 1
+        @test OSE.mean_stepsize(available) == 0.2
+        @test_throws DomainError OSE.record_transition(empty, valid, 0.0)
+        @test_throws DomainError OSE.record_transition(empty, valid, -0.5)
+        @test_throws DomainError OSE.record_transition(empty, valid, Inf)
+
+        # `missing` is a first-class unavailable step size in BOTH the direct
+        # call and the named-tuple fit path: retain the transition, never fold,
+        # and leave mean_stepsize NaN.
+        missing_direct = OSE.record_transition(empty, valid, missing)
+        @test OSE.sample_count(missing_direct) == 1
+        @test missing_direct.stepsize.n == 0
+        @test isnan(OSE.mean_stepsize(missing_direct))
+        missing_fit = OSE.fit_diagnostics([
+            (diagnostics=valid, stepsize=missing),
+            (diagnostics=NUTSDiagnostics(2, 3, 0.7, false, -0.01), stepsize=0.2),
+        ])
+        @test OSE.sample_count(missing_fit) == 2
+        @test missing_fit.stepsize.n == 1              # only the available one
+        @test OSE.mean_stepsize(missing_fit) == 0.2
+
+        # A divergent transition's non-finite energy error is captured by the
+        # divergence count, not folded into the energy-error moments.
+        diverged = OSE.record_transition(
+            empty, NUTSDiagnostics(4, 9, 0.6, true, -Inf), 0.15)
+        @test diverged.n_divergent == 1
+        @test OSE.sample_count(diverged) == 1
+        @test diverged.energy_error.n == 0
+        @test isnan(OSE.mean_energy_error(diverged))
+        @test OSE.max_tree_depth(diverged) == 4
+
+        # A non-finite energy error on a NON-divergent transition is invalid
+        # telemetry and is rejected; a divergent non-finite (incl. NaN) error is
+        # accepted count-only.
+        @test_throws DomainError OSE.record_transition(
+            empty, NUTSDiagnostics(3, 7, 0.8, false, -Inf), 0.15)
+        @test_throws DomainError OSE.record_transition(
+            empty, NUTSDiagnostics(3, 7, 0.8, false, NaN), 0.15)
+        divergent_nan = OSE.record_transition(
+            empty, NUTSDiagnostics(4, 9, 0.6, true, NaN), 0.15)
+        @test divergent_nan.n_divergent == 1
+        @test divergent_nan.energy_error.n == 0
+        @test isnan(OSE.mean_energy_error(divergent_nan))
+
+        # Constructor invariants over the retargeted field layout.
+        m1 = OSE.update(OSE.MomentsAccumulator(), 0.8)
+        e = OSE.MomentsAccumulator()
         @test_throws ArgumentError OSE.HMCDiagnosticsAccumulator{Float64}(
-            1, OSE.MomentsAccumulator(), OSE.MomentsAccumulator(),
-            OSE.MomentsAccumulator())
+            1, 0, e, e, e, e, e)               # divergences exceed count
         @test_throws ArgumentError OSE.HMCDiagnosticsAccumulator{Float64}(
-            0, OSE.update(OSE.MomentsAccumulator(), 0.8),
-            OSE.MomentsAccumulator(), OSE.MomentsAccumulator())
+            0, 0, m1, e, e, e, e)              # per-transition counts disagree
+        @test_throws ArgumentError OSE.HMCDiagnosticsAccumulator{Float64}(
+            0, -1, e, e, e, e, e)             # negative maximum tree depth
+        @test_throws ArgumentError OSE.HMCDiagnosticsAccumulator{Float64}(
+            0, 3, e, e, e, e, e)              # empty state, nonzero max depth
+        @test_throws ArgumentError OSE.HMCDiagnosticsAccumulator{Float64}(
+            0, 0, m1, m1, m1, e, OSE.update(m1, 0.1))  # stepsize count exceeds n
 
         records = [
-            (acc_rate=0.91, n_steps=7,  stepsize=0.25, diverged=false),
-            (acc_rate=0.83, n_steps=15, stepsize=0.20, diverged=true),
-            (acc_rate=0.97, n_steps=5,  stepsize=0.30, diverged=false),
-            (acc_rate=0.76, n_steps=31, stepsize=0.15, diverged=true),
-            (acc_rate=0.88, n_steps=9,  stepsize=0.22, diverged=false),
-            (acc_rate=0.94, n_steps=6,  stepsize=0.28, diverged=false),
-            (acc_rate=0.69, n_steps=63, stepsize=0.10, diverged=true),
+            (diagnostics=NUTSDiagnostics(3,  7, 0.91, false, -0.05), stepsize=0.25),
+            (diagnostics=NUTSDiagnostics(5, 15, 0.83, true,  -6.0),  stepsize=0.20),
+            (diagnostics=NUTSDiagnostics(4,  5, 0.97, false, -0.01), stepsize=0.30),
+            (diagnostics=NUTSDiagnostics(6, 31, 0.76, true,  -8.0),  stepsize=0.15),
+            (diagnostics=NUTSDiagnostics(3,  9, 0.88, false, -0.02), stepsize=0.22),
+            (diagnostics=NUTSDiagnostics(4,  6, 0.94, false, -0.03), stepsize=0.28),
+            (diagnostics=NUTSDiagnostics(7, 63, 0.69, true,  -9.0),  stepsize=0.10),
         ]
+        diags = [record.diagnostics for record in records]
         fitted = @inferred OSE.fit_diagnostics(records)
         @test OSE.sample_count(fitted) == length(records)
-        @test fitted.n_divergent == count(record -> record.diverged, records)
-        @test OSE.divergence_rate(fitted) ≈ mean(record.diverged for record in records)
-        @test OSE.divergence_percent(fitted) ≈
-              100 * mean(record.diverged for record in records)
-        @test OSE.mean_acceptance_rate(fitted) ≈
-              mean(record.acc_rate for record in records)
-        @test OSE.mean_leapfrog_steps(fitted) ≈
-              mean(record.n_steps for record in records)
-        @test OSE.mean_stepsize(fitted) ≈
-              mean(record.stepsize for record in records)
-        @test var(fitted.acceptance_rate) ≈
-              var([record.acc_rate for record in records])
-        @test var(fitted.leapfrog_steps) ≈
-              var([record.n_steps for record in records])
-        @test var(fitted.stepsize) ≈
-              var([record.stepsize for record in records])
+        @test fitted.n_divergent == count(d -> d.diverged, diags)
+        @test OSE.max_tree_depth(fitted) == maximum(d -> d.depth, diags)
+        @test OSE.divergence_rate(fitted) ≈ mean(d.diverged for d in diags)
+        @test OSE.divergence_percent(fitted) ≈ 100 * mean(d.diverged for d in diags)
+        @test OSE.mean_acceptance_rate(fitted) ≈ mean(d.acceptance_rate for d in diags)
+        @test OSE.mean_tree_depth(fitted) ≈ mean(d.depth for d in diags)
+        @test OSE.mean_leapfrog_steps(fitted) ≈ mean(d.n_steps for d in diags)
+        @test OSE.mean_energy_error(fitted) ≈ mean(d.energy_error for d in diags)
+        @test OSE.mean_stepsize(fitted) ≈ mean(record.stepsize for record in records)
+        @test var(fitted.depth) ≈ var([Float64(d.depth) for d in diags])
+        @test var(fitted.energy_error) ≈ var([d.energy_error for d in diags])
+        @test var(fitted.stepsize) ≈ var([record.stepsize for record in records])
+
+        # Bare NUTSDiagnostics (no paired step size) records an unavailable one.
+        bare = OSE.fit_diagnostics(diags)
+        @test OSE.sample_count(bare) == length(diags)
+        @test bare.stepsize.n == 0
+        @test isnan(OSE.mean_stepsize(bare))
+        @test OSE.mean_acceptance_rate(bare) ≈ OSE.mean_acceptance_rate(fitted)
+        @test OSE.max_tree_depth(bare) == OSE.max_tree_depth(fitted)
 
         parts = (
-            OSE.fit_diagnostics(@view records[1:1]),
-            OSE.fit_diagnostics(@view records[2:3]),
-            OSE.fit_diagnostics(@view records[4:7]),
+            OSE.fit_diagnostics(records[1:1]),
+            OSE.fit_diagnostics(records[2:3]),
+            OSE.fit_diagnostics(records[4:7]),
         )
         @test isequal(merge(empty, parts[1]), parts[1])
         @test isequal(merge(parts[1], empty), parts[1])
         merged = reduce(merge, parts)
         @test merged.n_divergent == fitted.n_divergent
         @test OSE.sample_count(merged) == OSE.sample_count(fitted)
+        @test OSE.max_tree_depth(merged) == OSE.max_tree_depth(fitted)
         @test OSE.mean_acceptance_rate(merged) ≈ OSE.mean_acceptance_rate(fitted)
+        @test OSE.mean_tree_depth(merged) ≈ OSE.mean_tree_depth(fitted)
         @test OSE.mean_leapfrog_steps(merged) ≈ OSE.mean_leapfrog_steps(fitted)
+        @test OSE.mean_energy_error(merged) ≈ OSE.mean_energy_error(fitted)
         @test OSE.mean_stepsize(merged) ≈ OSE.mean_stepsize(fitted)
 
         left_grouped = merge(merge(parts[1], parts[2]), parts[3])
         right_grouped = merge(parts[1], merge(parts[2], parts[3]))
         @test left_grouped.n_divergent == right_grouped.n_divergent
+        @test OSE.max_tree_depth(left_grouped) == OSE.max_tree_depth(right_grouped)
         @test OSE.mean_acceptance_rate(left_grouped) ≈
               OSE.mean_acceptance_rate(right_grouped)
-        @test OSE.mean_leapfrog_steps(left_grouped) ≈
-              OSE.mean_leapfrog_steps(right_grouped)
+        @test OSE.mean_energy_error(left_grouped) ≈
+              OSE.mean_energy_error(right_grouped)
         @test OSE.mean_stepsize(left_grouped) ≈ OSE.mean_stepsize(right_grouped)
 
         # Count-derived rates must also avoid converting large valid counts
         # through narrow storage before division.
         moments16 = OSE.MomentsAccumulator{Float16}(40_000, 0.5, 1.0)
         narrow_a = OSE.HMCDiagnosticsAccumulator{Float16}(
-            10_000, moments16, moments16, moments16)
+            10_000, 5, moments16, moments16, moments16, moments16, moments16)
         narrow_b = OSE.HMCDiagnosticsAccumulator{Float16}(
-            20_000, moments16, moments16, moments16)
+            20_000, 6, moments16, moments16, moments16, moments16, moments16)
         narrow = @inferred merge(narrow_a, narrow_b)
         @test OSE.sample_count(narrow) == 80_000
         @test narrow.n_divergent == 30_000
+        @test OSE.max_tree_depth(narrow) == 6
         @test OSE.divergence_rate(narrow) === Float16(0.375)
         @test OSE.divergence_percent(narrow) === Float16(37.5)
+    end
+
+    @testset "metric adaptation reuses the canonical welford_var estimator" begin
+        report = OSE.metric_adaptation_report()
+        @test report.dimension == 3
+        @test report.count == length(OSE.METRIC_ADAPTATION_DRAWS)
+        @test length(report.mean) == 3
+        @test length(report.variance) == 3
+        @test all(report.variance .>= 0)
+
+        # The estimate matches the canonical welford_var it reuses, folded the
+        # same way (this is the sampler's own metric-adaptation statistic).
+        reference = welford_var(3)
+        for value in OSE.METRIC_ADAPTATION_DRAWS
+            step!(reference, value)
+        end
+        @test report.mean ≈ reference.mean
+        @test report.variance ≈ reference.var
+
+        @test_throws ArgumentError OSE.metric_adaptation_report(Vector{Float64}[])
+        @test_throws DimensionMismatch OSE.metric_adaptation_report(
+            [[1.0, 2.0, 3.0], [1.0, 2.0]])
     end
 
     @testset "generated state kernels are inferred and allocation-free" begin
@@ -233,12 +337,11 @@ const OSE = OnlineStatsExample
         summary_kernel = prepare(model;
             have=(:state, :observation), want=(:average, :sample_variance))
         diagnostics_kernel = prepare(model;
-            have=(:diagnostics_state, :acceptance_rate_observation,
-                  :leapfrog_steps_observation, :stepsize_observation,
-                  :diverged_observation),
-            want=(:updated_diagnostics, :diagnostic_divergence_percent,
+            have=(:diagnostics_state, :transition, :stepsize_observation),
+            want=(:updated_diagnostics, :diagnostic_max_tree_depth,
+                  :diagnostic_divergence_percent,
                   :diagnostic_mean_acceptance_rate,
-                  :diagnostic_mean_leapfrog_steps, :diagnostic_mean_stepsize))
+                  :diagnostic_mean_energy_error, :diagnostic_mean_stepsize))
 
         empty_state = OSE.MomentsAccumulator()
         one_state = @inferred update_kernel(empty_state, 1.0)
@@ -249,14 +352,12 @@ const OSE = OnlineStatsExample
 
         empty_diagnostics = OSE.HMCDiagnosticsAccumulator()
         diagnostic_result = @inferred diagnostics_kernel(
-            empty_diagnostics, 0.9, 7, 0.2, false)
+            empty_diagnostics, NUTSDiagnostics(3, 7, 0.9, false, -0.05), 0.2)
         @test diagnostic_result[1] isa OSE.HMCDiagnosticsAccumulator{Float64}
-        @test diagnostic_result[2:end] == (0.0, 0.9, 7.0, 0.2)
+        @test diagnostic_result[2:end] == (3, 0.0, 0.9, -0.05, 0.2)
 
         diagnostics_update_kernel = prepare(model;
-            have=(:diagnostics_state, :acceptance_rate_observation,
-                  :leapfrog_steps_observation, :stepsize_observation,
-                  :diverged_observation),
+            have=(:diagnostics_state, :transition, :stepsize_observation),
             want=:updated_diagnostics)
         diagnostics_report = OSE.diagnostics_performance_report(
             diagnostics_update_kernel; iterations=10_000)
@@ -336,7 +437,11 @@ const OSE = OnlineStatsExample
         @test occursin("@kernel partitions(", page)
         @test occursin("diagnostics = @kernel begin", page)
         @test occursin("OnlineStatsExample.record_transition", page)
+        @test occursin("transition::NUTSDiagnostics{Float64}", page)
+        @test occursin("NUTSDiagnostics(3, 7, 0.91, false, -0.05)", page)
         @test occursin("name = :hmc_transition_diagnostics", page)
+        @test occursin("metric_adaptation_report", page)
+        @test occursin("welford_var", page)
         @test occursin("model = merge(updates, partitions)", page)
         @test occursin("Main.ReactiveKernelsDocs.execute_example", page)
         @test !occursin("include(", page)
