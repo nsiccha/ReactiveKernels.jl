@@ -256,6 +256,6 @@ let b = blocks[:nuts_state], fieldset = Set(b.fields) ∪ Set(b.sources)
     end
 end
 println("\nSTRENGTHENED STRUCTURAL GATE PASS (source-form / Meta.parseall — does not eval @kernel).")
-println("Construction verified SEPARATELY on the c998ec3 Inc1 substrate (all six @kernel blocks define:")
+println("Construction verified SEPARATELY on the 612ceee Inc1 substrate (all six @kernel blocks define:")
 println("@node, implicit fields + __self__ receiver, free-kernel leapfrog!/nuts!!, stateful nuts_state).")
 println("Source-form + construction only — NO MethodIR/lowering/execution/parity/alloc/perf claim.")
