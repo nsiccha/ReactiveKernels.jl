@@ -832,6 +832,14 @@ Base.propertynames(estimate::WelfordVariance, private::Bool = false) =
 Base.copy(estimate::WelfordVariance) =
     WelfordVariance(copy(getfield(estimate, :object)))
 
+# reactive_program forwarding so the generic artifact-inventory API resolves for a
+# @reactive object and its nominal wrappers (state.program also reads directly).
+reactive_program(object::ReactiveObject) = getfield(object, :state).program
+reactive_program(state::DualAveragingState) =
+    reactive_program(getfield(state, :object))
+reactive_program(estimate::WelfordVariance) =
+    reactive_program(getfield(estimate, :object))
+
 """
     welford_var(dimension, T=Float64)
 

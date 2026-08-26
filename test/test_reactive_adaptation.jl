@@ -27,6 +27,7 @@ end
         oracle = _old_da(initial)
         state = dual_averaging_state(initial)
         @test state isa DualAveragingState                 # public nominal type
+        @test reactive_program(state) isa ReactiveKernels.ReactiveProgram
         @test state.current ≈ oracle.cur
         for a in (0.9, 0.6, 0.85, 0.3, 0.95, 0.7, 0.8, 0.5, 0.99, 0.75, 0.1)
             _old_fit!(oracle, a)
@@ -81,6 +82,7 @@ end
 @testset "reactive Welford — nominal wrapper, parity, matrix, F32/F64, ownership" begin
     w = welford_var(2)
     @test w isa WelfordVariance
+    @test reactive_program(w) isa ReactiveKernels.ReactiveProgram
     step!(w, [1.0, 2.0]); step!(w, [2.0, 4.0]); step!(w, [3.0, 6.0])
     @test w.mean == [2.0, 4.0]
     @test w.var ≈ [2 / 3, 8 / 3]
