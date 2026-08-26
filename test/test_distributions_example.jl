@@ -9,12 +9,11 @@ using ReactiveKernels: code_expr
 
     @testset "sources build native recipes checked against a Distributions oracle" begin
         @test length(artifacts) == 3
-        # Every source declares @kernel recipes. ReactiveKernels plans and
-        # computes the density; it does not differentiate, so these examples
-        # carry no AD/gradient machinery.
+        # Every source declares @kernel recipes and differentiates through
+        # DifferentiationInterface with the Enzyme backend.
         @test all(source -> occursin(r"@kernel \w+\(", source), all_sources())
-        @test all(source -> !occursin("AutoEnzyme", source), all_sources())
-        @test all(source -> !occursin("DifferentiationInterface", source),
+        @test all(source -> occursin("AutoEnzyme", source), all_sources())
+        @test all(source -> occursin("DifferentiationInterface.gradient", source),
                   all_sources())
         # `compose` earns its place ONLY where a shared port must be unified:
         # the multivariate source. The scalar densities are single recipes, so
@@ -45,6 +44,9 @@ using ReactiveKernels: code_expr
                 all(isapprox.(artifact.output, artifact.reference)) :
                 isapprox(artifact.output, artifact.reference)
         end
+        # Preparation preserves reverse-mode AD (kernel vs plain native fn).
+        @test all(artifact -> artifact.gradient ≈ artifact.reference_gradient,
+                  artifacts)
     end
 
     @testset "native path allocates no more than the Distributions oracle" begin
