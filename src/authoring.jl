@@ -893,8 +893,55 @@ function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol})
     Expr(:->, Expr(:tuple, deps...), rhs)
 end
 
+# `@node(expr)` recipe-node promotion, used by `_kernel_expand`. Kept HERE (ahead of
+# `_kernel_expand`, not in kernel_stateful.jl) because authoring.jl loads first and a
+# `@doc`-embedded `@kernel` expands at load time — a forward ref would be undefined.
+
+# Is a macrocall head the `@node` promoter by NAME (bare or module-qualified)? A
+# SYNTACTIC candidate only; identity is confirmed by `_kernel_marker_kind(mod, ex)`.
+_kernel_is_node_macro(m) =
+    m === Symbol("@node") ||
+    (m isa Expr && m.head === :(.) && length(m.args) >= 2 &&
+        m.args[2] == QuoteNode(Symbol("@node")))
+
+# Any `@node(...)` marker anywhere in `x`?
+_kernel_has_node_marker(x) =
+    x isa Expr && (
+        (x.head === :macrocall && !isempty(x.args) && _kernel_is_node_macro(x.args[1])) ||
+        any(_kernel_has_node_marker, x.args))
+
+# Promote every `@node(expr)` in a recipe block into a distinct named recipe node
+# (`#node#k = expr`), prepended in authored order, replacing each occurrence with its
+# node name. Returns the SAME block object (byte-identical) when no `@node` is present,
+# so ordinary recipes are unchanged. `#`-prefixed names are hygienic (non-authorable)
+# and deterministic (stable within one expansion). Nested `@node` is promoted inner-first.
+function _kernel_lift_nodes(block)
+    (block isa Expr && block.head === :block) || return block
+    _kernel_has_node_marker(block) || return block          # no @node ⇒ byte-identical
+    lifted = Any[]
+    counter = Ref(0)
+    local rewrite
+    rewrite = function (x)
+        x isa Expr || return x
+        if x.head === :macrocall && !isempty(x.args) && _kernel_is_node_macro(x.args[1])
+            inner = rewrite(x.args[end])                    # nested @node promoted first
+            counter[] += 1
+            nm = Symbol("#node#", counter[])
+            push!(lifted, Expr(:(=), nm, inner))
+            return nm
+        end
+        Expr(x.head, Any[rewrite(a) for a in x.args]...)
+    end
+    new_stmts = Any[rewrite(s) for s in block.args]
+    Expr(:block, vcat(lifted, new_stmts)...)
+end
+
 function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                         call_signature = nothing)
+    # Promote `@node(expr)` markers into distinct named recipe nodes so a marked
+    # anonymous subexpression becomes a real schedulable graph node/port (RK 2026-08-26).
+    # A no-op returning the SAME block — byte-identical — when no `@node` is present.
+    block = _kernel_lift_nodes(block)
     statements = block isa Expr && block.head === :block ? block.args : Any[block]
     graph_var = gensym(:kernel_graph)
     ports_var = gensym(:kernel_ports)
@@ -1202,10 +1249,17 @@ All recipe bodies resolve and capture names in the caller's scope. The macro
 only constructs closures and graph metadata; recipe bodies run only when a
 prepared kernel is invoked.
 
-`@kernel` authors a graph, not a new object type. Inline method definitions and
-ReactiveObjects-style `__self__` rewriting are not part of this macro. Stateful
-mutation is provided separately by [`prepare_reactive`](@ref), [`set!`](@ref),
-[`mutate!`](@ref), and [`touch!`](@ref).
+`@kernel` supports three authoring modes, discriminated by the body. A methodless
+recipe body authors a stateless graph `KernelSpec` — this docstring's primary form,
+byte-identical to earlier releases. A body with nested method definitions authors a
+stateful OBJECT kernel with an IMPLICIT synthesized receiver: nested methods declare
+no `self`/`__self__` formal, bare unshadowed names are the owner's fields, and
+`__self__` appears only as a sibling object-pass actual (`flip!(__self__, depth)`). A
+methodless body that mutates a field of its first positional subject — or ANY `!!`
+name (a strong same-object update) — authors a free METHOD (e.g.
+`leapfrog!(phasepoint; stepsize)`, `nuts!!(state; rng)`). Reactive mutation of a
+compiled stateless kernel remains available through [`prepare_reactive`](@ref),
+[`set!`](@ref), [`mutate!`](@ref), and [`touch!`](@ref).
 """
 macro kernel(ex)
     definition = ex isa Expr ? _kernel_definition_parts(ex) : nothing
@@ -1216,6 +1270,16 @@ macro kernel(ex)
     # (independent of `!` spelling); else the byte-identical stateless expansion.
     _kernel_body_has_methods(block) &&
         return _kernel_stateful_expand(name, inputs, call_signature, block, __module__)
+    # `!!` is an EXPLICIT strong same-object update registration (locked Form C): it
+    # routes Mode-2 regardless of whether the mutation is direct or through a
+    # registered/delegated call (`nuts!!(state; rng) = begin step!(state, rng); state end`).
+    if _kernel_is_bangbang_name(name)
+        isempty(positional_names) && throw(ArgumentError(
+            "stateful @kernel `$name` (`!!` strong same-object update) needs a first " *
+            "positional subject to update in place"))
+        return _kernel_mode2_expand(name, inputs, call_signature, block,
+                                    positional_names[1], __module__)
+    end
     if !isempty(positional_names) &&
        _kernel_body_mutates_subject(block, positional_names[1])
         return _kernel_mode2_expand(name, inputs, call_signature, block,

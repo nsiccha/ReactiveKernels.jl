@@ -1,17 +1,20 @@
-# Stateful `@kernel` authoring — Increment 1 SUBSTRATE SKELETON (V7 architecture GO).
+# Stateful `@kernel` authoring — Increment 1 SUBSTRATE (V7 implicit-field pivot).
 #
-# A method-bearing `@kernel` body (one that defines inner mutation/orchestration
-# methods) is routed here; a methodless body keeps the current byte-identical
-# stateless expansion in `authoring.jl` untouched. This increment establishes ONLY
-# the substrate: the method-presence discriminator, the unique per-definition Token,
-# the explicit-self `KernelObject` / `KernelView` type skeletons, short/long method
-# detection with local-scope rejection, and the frozen detached child-capture
-# snapshot.
+# `@kernel` has THREE modes (discriminated in `authoring.jl`): a methodless recipe
+# body ⇒ byte-identical stateless `KernelSpec`; a body with nested methods ⇒ a
+# stateful OBJECT kernel with an IMPLICIT synthesized receiver (no `self` formal,
+# bare fields, `__self__` only as a sibling object-pass actual); a methodless body
+# mutating its first positional subject's fields — or any `!!` name — ⇒ a free
+# METHOD. This increment establishes ONLY the substrate: the discriminators, the
+# unique per-definition Token, the `KernelObject`/`KernelView` skeletons, implicit-
+# receiver + Mode-2 method extraction, the frozen detached child/recipe/body source,
+# the registered-kernel/intrinsic resolver + hygiene/rebind, and the
+# `@node`/`deepcopy`/`partial`/`!!` source-marker recognition.
 #
 # It deliberately contains NO effect-lowering: no MethodIR/SSA, no `compile_update`
-# consumption, no epoch codegen, no `@reactive` deletion, no port migration. Those
-# are later increments (poc's effect-lowering lane retargets MethodIR onto this
-# substrate only after this SHA clears review).
+# consumption, no epoch codegen, no `@reactive` deletion, no port migration, no
+# factory/execution. Those are later increments (poc's effect-lowering lane retargets
+# MethodIR onto this substrate only after this SHA clears review).
 
 # --- (1)+(2) method-presence discriminator ----------------------------------
 
@@ -471,7 +474,9 @@ function _kernel_stateful_expand(name, signature_inputs, call_signature, block,
     # The exposed per-method metadata carries the FULL authored signature (where
     # binders + return annotation), the peeled call, and the raw body — enough for
     # Increment 2's MethodIR emission (typed MethodId, return-annotation semantics).
-    # The AST fields are embedded as values (immutable, inspectable).
+    # These are inspectable literal AST values; the `signature`/`call`/`body` `Expr`
+    # leaves are MUTABLE (not frozen) — only the separately-captured `recipe_source`
+    # below is deeply frozen/immutable.
     method_meta = Tuple(
         (; name = m.name, form = m.form, argnames = m.argnames,
            vararg = m.vararg, kwargs_splat = m.kwargs_splat,
@@ -687,6 +692,8 @@ struct _KernelRegistration
     write_roots::Tuple{Vararg{Symbol}}
     read_roots::Tuple{Vararg{Symbol}}
     is_bang_bang::Bool       # `!!` strong same-object update registration
+    source::Any              # the originating value — the ONLY stable identity handle for a
+                             #   token-less stateless spec (so rebind stays sound; see kernel_rebound)
 end
 
 # A tiny RK-CORE registered intrinsic (NOT authored via `@kernel`): a strong
@@ -743,15 +750,15 @@ kernel_registration(::Any) = nothing
 kernel_registration(skel::_Mode2KernelSkeleton) =
     _KernelRegistration(kernel_token(skel), :free_method, kernel_subject(skel),
                         kernel_write_roots(skel), kernel_read_roots(skel),
-                        kernel_is_bangbang(skel))
+                        kernel_is_bangbang(skel), skel)
 kernel_registration(skel::_StatefulKernelSkeleton) =
-    _KernelRegistration(kernel_token(skel), :object_kernel, nothing, (), (), false)
+    _KernelRegistration(kernel_token(skel), :object_kernel, nothing, (), (), false, skel)
 kernel_registration(spec::KernelSpec) =
     _KernelRegistration(nothing, :stateless, nothing,
-                        Tuple(spec.have_names), Tuple(spec.want_names), false)
+                        Tuple(spec.have_names), Tuple(spec.want_names), false, spec)
 kernel_registration(i::_KernelIntrinsic) =
     _KernelRegistration(kernel_token(i), :intrinsic, kernel_subject(i), (), (),
-                        kernel_is_bangbang(i))
+                        kernel_is_bangbang(i), i)
 function kernel_registration(mod::Module, name::Symbol)
     isdefined(mod, name) || return nothing
     kernel_registration(getglobal(mod, name))
@@ -762,46 +769,48 @@ end
 
 Hygiene/rebind discriminator: `true` iff `current` (a value or its registration)
 is NOT the same definition the `captured` registration recorded — the name was
-rebound to a different `@kernel`, or is no longer a registered kernel. The Token
-is the stable hygienic identity; a stateless capture (no Token) is treated as
-un-reboundable here (identity is by value at the call site).
+rebound to a different `@kernel`/intrinsic, or is no longer a registered kernel. A
+Token-registered capture compares by Token; a token-less stateless capture compares
+by captured VALUE identity, so two distinct stateless specs read as a rebind — it
+NEVER reports unchanged merely because there is no Token.
 """
 function kernel_rebound(captured::_KernelRegistration, current)
     cur = current isa _KernelRegistration ? current : kernel_registration(current)
     cur === nothing && return true                 # binding gone / no longer a kernel
-    captured.token === nothing && return false     # stateless: no Token identity
-    cur.token !== captured.token
+    if captured.token !== nothing
+        return cur.token !== captured.token         # Token-registered: identity by Token
+    end
+    # Token-less (stateless): value identity is the only sound handle — two DISTINCT
+    # specs are a rebind. NEVER report unchanged just because there is no Token.
+    cur.source !== captured.source
 end
 
 # --- source-marker recognition: @node / deepcopy / partial -------------------
 #
-# The remaining recognized authoring markers (RK 2026-08-26 GO #5). Increment 1
-# CAPTURES them as recognized markers in the frozen recipe/body source + resolves
-# their inner callee identity through the resolver above — generic registered-call
-# capture (RK 2026-08-26: no need to expand Inc1 beyond that). Recognition is
-# syntactic; promotion/lowering (the anonymous-node cache, the owned-copy reset,
-# the static-bind) comes later. `!!` (marker #4) is already recognized off the name.
+# The remaining recognized authoring markers (RK 2026-08-26 GO #5). `@node` is
+# PORT-LIFTED into a real recipe node (below), so a marked anonymous subexpression
+# becomes a schedulable graph node/port — NOT expanded away. `deepcopy`/`partial`
+# are captured in the frozen source; their callee identity is resolved through the
+# IDENTITY-CONFIRMED classifier + `kernel_registration`. `!!` (marker #4) is
+# recognized off the name. Recognition/promotion only — no effect closure/lowering.
 
 """
     @node(expr)
 
-Anonymous-node promoter. Inside a `@kernel` recipe it MARKS an anonymous inline
-subexpression for promotion to a hygienic stable recipe node (the ONLY way an
-anonymous subexpression becomes a cached node — named recipe assignments auto-node;
-no arbitrary AST extraction). Increment 1 captures it as a recognized marker in the
-frozen recipe source (poc promotes the marked node) and expands to its argument so
-the recipe still builds; it adds NO second object-definition surface. Outside a
-`@kernel` it is a harmless identity.
+Anonymous-node promoter. Inside a `@kernel` recipe, `@node(expr)` is PORT-LIFTED
+into a distinct named recipe node (a schedulable graph node/port) — the ONLY way an
+anonymous subexpression becomes an independent node (named recipe assignments
+auto-node; no arbitrary AST extraction, no cost heuristics). It adds NO second
+object-definition surface. Outside a `@kernel` (or if it survives to runtime) it is
+a harmless identity.
 """
 macro node(ex)
     esc(ex)
 end
 
-# Is a macrocall head the `@node` promoter (bare or module-qualified)?
-_kernel_is_node_macro(m) =
-    m === Symbol("@node") ||
-    (m isa Expr && m.head === :(.) && length(m.args) >= 2 &&
-        m.args[2] == QuoteNode(Symbol("@node")))
+# (`_kernel_is_node_macro` / `_kernel_has_node_marker` / `_kernel_lift_nodes` — the
+# `@node` port-lift — live in authoring.jl ahead of `_kernel_expand`, since that file
+# loads first and expands a `@doc`-embedded `@kernel` at load time.)
 
 # The base callee name of a `:call` head (`deepcopy` / `Base.deepcopy` → :deepcopy).
 _kernel_callee_name(c) =
@@ -809,16 +818,34 @@ _kernel_callee_name(c) =
     (c isa Expr && c.head === :(.) && length(c.args) >= 2 && c.args[2] isa QuoteNode) ?
         c.args[2].value : nothing
 
-"""
-    _kernel_marker_kind(ex) -> Symbol | nothing
+# Resolve a callee AST (bare `name` or `Mod.name`) to its BINDING VALUE in `mod`, or
+# `nothing`. Reads bindings only (no call eval), so it stays inside the compiler
+# boundary.
+function _kernel_resolve_binding(mod::Module, callee)
+    if callee isa Symbol
+        isdefined(mod, callee) ? getglobal(mod, callee) : nothing
+    elseif callee isa Expr && callee.head === :(.) && length(callee.args) == 2 &&
+           callee.args[1] isa Symbol && callee.args[2] isa QuoteNode
+        outer = callee.args[1]
+        isdefined(mod, outer) || return nothing
+        outerval = getglobal(mod, outer)
+        outerval isa Module || return nothing
+        inner = callee.args[2].value
+        isdefined(outerval, inner) ? getglobal(outerval, inner) : nothing
+    else
+        nothing
+    end
+end
 
-Classify a call/macrocall AST as a recognized authoring MARKER (provenance for
-poc): `:node` (`@node` promoter), `:deepcopy` (structural owned-copy declaration),
-`:partial` (static token-preserving binder), else `nothing`. Recognition is purely
-syntactic; the inner callee's registration is resolved separately via
-[`kernel_registration`](@ref).
 """
-function _kernel_marker_kind(ex)
+    _kernel_marker_candidate(ex) -> Symbol | nothing
+
+SYNTACTIC, NON-AUTHORITATIVE candidate classification of a call/macrocall AST:
+`:node` / `:deepcopy` / `:partial` / `nothing`, matched by NAME only. A foreign
+`Evil.deepcopy` or `Evil.@node` matches too — callers MUST confirm identity via
+`_kernel_marker_kind(mod, ex)` before treating a candidate as authoritative.
+"""
+function _kernel_marker_candidate(ex)
     ex isa Expr || return nothing
     if ex.head === :macrocall && !isempty(ex.args) && _kernel_is_node_macro(ex.args[1])
         return :node
@@ -828,4 +855,27 @@ function _kernel_marker_kind(ex)
         name === :partial && return :partial
     end
     nothing
+end
+
+"""
+    _kernel_marker_kind(mod::Module, ex) -> Symbol | nothing
+
+AUTHORITATIVE marker classification: the syntactic candidate CONFIRMED by resolving
+the callee's actual binding in `mod` to the genuine primitive — RK's `@node` macro,
+`Base.deepcopy`, or RK's `partial`. A spoof (`Evil.deepcopy`, `Evil.@node`, or a
+rebound name) resolves to `nothing`.
+"""
+function _kernel_marker_kind(mod::Module, ex)
+    cand = _kernel_marker_candidate(ex)
+    cand === nothing && return nothing
+    bound = _kernel_resolve_binding(mod, ex.args[1])
+    if cand === :node
+        bound === var"@node" ? :node : nothing
+    elseif cand === :deepcopy
+        bound === Base.deepcopy ? :deepcopy : nothing
+    elseif cand === :partial
+        bound === partial ? :partial : nothing
+    else
+        nothing
+    end
 end

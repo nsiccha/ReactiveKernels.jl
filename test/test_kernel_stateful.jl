@@ -1,8 +1,10 @@
-# Increment 1 (V7 architecture GO): the stateful `@kernel` authoring SUBSTRATE
-# SKELETON. Asserts the substrate — the discriminator, unique Token, explicit-self
-# object/view type skeletons, short/long (incl. kwargs/typed/where/return-annotated)
-# method detection, deterministic unsupported-local-scope rejection, and the FROZEN
-# detached child-capture snapshot with reconstruction. NO effect-lowering yet.
+# Increment 1 (V7 implicit-field pivot): the stateful `@kernel` authoring SUBSTRATE.
+# Asserts the substrate — the 3-mode discriminator, unique Token, IMPLICIT-receiver
+# object/view skeletons + method extraction (no self formal; `__self__` only as a
+# sibling object-pass actual), Mode-2 free-method recognition, the registered-kernel/
+# intrinsic resolver + hygiene/rebind, `@node` port-lifting + `deepcopy`/`partial`
+# marker recognition, deterministic unsupported-local-scope rejection, and the FROZEN
+# detached child-capture snapshot. NO effect-lowering yet.
 #
 # A method-bearing `@kernel` binds a `const` (a stable owner binding), so it MUST be
 # defined at module top level — the fixtures below live outside the `@testset`
@@ -161,9 +163,20 @@ end
     @. phasepoint.pos +=       stepsize * phasepoint.dham_dmom
     @. phasepoint.mom -= 0.5 * stepsize * phasepoint.dham_dpos
 end
+# `nuts!!` — the strong same-object update ENTRY in its exact delegation form: it
+# mutates `state` through a registered/delegated call (`step!`), NOT a direct field
+# write, so it is the `!!` REGISTRATION (not a `state.field =` mutation) that routes
+# it Mode-2 (locked Form C).
 @kernel nuts!!(state; rng) = begin
-    state.pos = rng
+    step!(state, rng)
     return state
+end
+
+# Spoof module for marker identity-confirmation: same NAMES, different bindings.
+module MarkerSpoof
+deepcopy(x) = x                    # NOT Base.deepcopy
+partial(x) = x                     # NOT ReactiveKernels.partial
+macro node(ex); esc(ex); end       # NOT ReactiveKernels.@node
 end
 
 @testset "stateful @kernel substrate (Increment 1)" begin
@@ -329,12 +342,20 @@ end
         @test RKS.kernel_recipe_ast(leapfrog!) isa Expr    # frozen body thaws fresh
         @test RKS.kernel_spec(leapfrog!) isa KernelSpec     # ports-only recipe spec
 
-        # `!!` strong same-object update registration recognized off the name
+        # `!!` routes Mode-2 via the strong-update REGISTRATION even though the body
+        # mutates through a delegated call (`step!(state, rng)`), not a direct field
+        # write — so the declared direct roots are empty (the delegated effects resolve
+        # through the registered-call resolver, poc's lane).
         @test nuts!! isa RKS._Mode2KernelSkeleton
         @test RKS.kernel_subject(nuts!!) === :state
-        @test RKS.kernel_write_roots(nuts!!) == (:pos,)
+        @test RKS.kernel_write_roots(nuts!!) == ()
+        @test RKS.kernel_read_roots(nuts!!) == ()
         @test RKS.kernel_is_bangbang(nuts!!)
         @test RKS.kernel_token(leapfrog!) !== RKS.kernel_token(nuts!!)  # def-unique Tokens
+        # a `!!` free method with no subject at all is rejected
+        @test_throws Exception @macroexpand @kernel bad!!() = begin
+            noop()
+        end
 
         # the discriminator: mutation of the first positional vs a bare READ / recipe
         @test !RKS._kernel_body_mutates_subject(:(begin y = f(x) end), :x)
@@ -397,11 +418,25 @@ end
         @test RKS.kernel_registration(@__MODULE__, :leapfrog!).token === RKS.kernel_token(leapfrog!)
         @test RKS.kernel_registration(@__MODULE__, :a_name_that_is_undefined_xyz) === nothing
 
-        # rebind discriminator
+        # rebind discriminator (Token-registered)
         cap = RKS.kernel_registration(leapfrog!)
         @test !RKS.kernel_rebound(cap, leapfrog!)                     # same binding
         @test RKS.kernel_rebound(cap, nuts!!)                         # different Token
         @test RKS.kernel_rebound(cap, sin)                            # no longer a kernel
+
+        # FIX (4): token-less STATELESS rebind is SOUND (value identity) — two distinct
+        # stateless specs read as a rebind; it never reports unchanged for lack of Token.
+        @kernel sa_spec(x) = begin
+            y = x + 1
+        end
+        @kernel sb_spec(x) = begin
+            y = x + 2
+        end
+        capA = RKS.kernel_registration(sa_spec)
+        @test capA.token === nothing                                 # stateless: no Token
+        @test !RKS.kernel_rebound(capA, sa_spec)                     # same spec ⇒ unchanged
+        @test RKS.kernel_rebound(capA, sb_spec)                      # DISTINCT stateless ⇒ rebind
+        @test RKS.kernel_rebound(capA, leapfrog!)                    # rebound to a Token kind
     end
 
     @testset "copy!! RK-core intrinsic — registration contract boundary" begin
@@ -419,22 +454,43 @@ end
         @test copy!! === ReactiveKernels.copy!!
     end
 
-    @testset "source-marker recognition: @node / deepcopy / partial" begin
-        # `@node` is a defined, exported macro (passthrough) so a recipe using it builds
+    @testset "@node port-lifting + marker recognition (identity-confirmed)" begin
+        # FIX (1): `@node` is PORT-LIFTED into a distinct schedulable graph node — NOT
+        # expanded away. Non-vacuous graph gate: exactly one `#node#` node port exists,
+        # the graph has 2 recipes, and `m`/`kin` are ports with the node internal.
         @kernel withnode(m) = begin
-            kin = 0.5 * (@node(logdet(m)) + 2.0)
+            kin = 0.5 * (@node(abs(m)) + 2.0)
         end
         @test withnode isa KernelSpec
-        @test :m in keys(withnode)
-        # `@node` outside a kernel is a harmless identity
-        @test (@node 41 + 1) == 42
-        # the syntactic classifier recognizes each recognized marker shape
-        @test RKS._kernel_marker_kind(:(@node(logdet(m)))) === :node
-        @test RKS._kernel_marker_kind(:(deepcopy(init))) === :deepcopy
-        @test RKS._kernel_marker_kind(:(Base.deepcopy(init))) === :deepcopy
-        @test RKS._kernel_marker_kind(:(partial(leapfrog!; stepsize = 0.1))) === :partial
-        @test RKS._kernel_marker_kind(:(f(x))) === nothing
-        @test RKS._kernel_marker_kind(:(y + 1)) === nothing
+        g = kernel_graph(withnode)
+        @test length(g.recipes) == 2
+        nodeports = filter(p -> startswith(String(p), "#node#"), collect(keys(withnode)))
+        @test length(nodeports) == 1
+        @test :m in keys(withnode) && :kin in keys(withnode)
+        # a @node-FREE recipe block is returned byte-identical (the SAME object)
+        blk = :(begin
+            y = f(x)
+        end)
+        @test RKS._kernel_lift_nodes(blk) === blk
+        @test (@node 41 + 1) == 42                 # harmless identity outside a kernel
+
+        # FIX (3): the syntactic classifier is a NON-AUTHORITATIVE candidate — it
+        # matches a foreign binding by name...
+        @test RKS._kernel_marker_candidate(:(@node(logdet(m)))) === :node
+        @test RKS._kernel_marker_candidate(:(deepcopy(init))) === :deepcopy
+        @test RKS._kernel_marker_candidate(:(MarkerSpoof.deepcopy(init))) === :deepcopy
+        @test RKS._kernel_marker_candidate(:(partial(f; k = 1))) === :partial
+        @test RKS._kernel_marker_candidate(:(f(x))) === nothing
+        # ...the AUTHORITATIVE (mod, ex) form CONFIRMS the actual binding identity
+        @test RKS._kernel_marker_kind(@__MODULE__, :(@node(x))) === :node
+        @test RKS._kernel_marker_kind(@__MODULE__, :(deepcopy(x))) === :deepcopy
+        @test RKS._kernel_marker_kind(@__MODULE__, :(Base.deepcopy(x))) === :deepcopy
+        @test RKS._kernel_marker_kind(@__MODULE__, :(partial(leapfrog!; stepsize = 0.1))) === :partial
+        # spoofs (same name, foreign binding) are REJECTED by identity confirmation
+        @test RKS._kernel_marker_kind(@__MODULE__, :(MarkerSpoof.deepcopy(x))) === nothing
+        @test RKS._kernel_marker_kind(@__MODULE__, :(MarkerSpoof.partial(x))) === nothing
+        @test RKS._kernel_marker_kind(@__MODULE__, :(MarkerSpoof.@node(x))) === nothing
+        @test RKS._kernel_marker_kind(@__MODULE__, :(f(x))) === nothing
     end
 
     @testset "recipe-source provenance: frozen capture + kernel_recipe_ast" begin
