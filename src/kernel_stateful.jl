@@ -704,6 +704,16 @@ kernel_token(i::_KernelIntrinsic) = getfield(i, :token)
 kernel_subject(i::_KernelIntrinsic) = getfield(i, :subject)
 kernel_is_bangbang(i::_KernelIntrinsic) = getfield(i, :is_bang_bang)
 
+# Direct/unprepared execution REJECTS ACTIONABLY (RK 2026-08-26): in Increment 1 an
+# intrinsic is captured for PROVENANCE only — there is NO hidden plan, generic
+# `deepcopy`, or fallback. The alias-aware minimal owned-closure copy is realized by
+# later lowering; until then a bare call must fail loudly, not silently copy.
+(i::_KernelIntrinsic)(args...; kwargs...) = throw(ArgumentError(
+    "$(getfield(i, :name)) is a registered RK-core intrinsic captured for PROVENANCE " *
+    "only in Increment 1 (kind :intrinsic, Token $(getfield(i, :token)), subject " *
+    ":$(getfield(i, :subject))); it is NOT executable until lowering lands — no hidden " *
+    "plan, generic deepcopy, or fallback. Compose/prepare it through the owning kernel."))
+
 """
     copy!!(dest, src)
 
@@ -761,4 +771,61 @@ function kernel_rebound(captured::_KernelRegistration, current)
     cur === nothing && return true                 # binding gone / no longer a kernel
     captured.token === nothing && return false     # stateless: no Token identity
     cur.token !== captured.token
+end
+
+# --- source-marker recognition: @node / deepcopy / partial -------------------
+#
+# The remaining recognized authoring markers (RK 2026-08-26 GO #5). Increment 1
+# CAPTURES them as recognized markers in the frozen recipe/body source + resolves
+# their inner callee identity through the resolver above — generic registered-call
+# capture (RK 2026-08-26: no need to expand Inc1 beyond that). Recognition is
+# syntactic; promotion/lowering (the anonymous-node cache, the owned-copy reset,
+# the static-bind) comes later. `!!` (marker #4) is already recognized off the name.
+
+"""
+    @node(expr)
+
+Anonymous-node promoter. Inside a `@kernel` recipe it MARKS an anonymous inline
+subexpression for promotion to a hygienic stable recipe node (the ONLY way an
+anonymous subexpression becomes a cached node — named recipe assignments auto-node;
+no arbitrary AST extraction). Increment 1 captures it as a recognized marker in the
+frozen recipe source (poc promotes the marked node) and expands to its argument so
+the recipe still builds; it adds NO second object-definition surface. Outside a
+`@kernel` it is a harmless identity.
+"""
+macro node(ex)
+    esc(ex)
+end
+
+# Is a macrocall head the `@node` promoter (bare or module-qualified)?
+_kernel_is_node_macro(m) =
+    m === Symbol("@node") ||
+    (m isa Expr && m.head === :(.) && length(m.args) >= 2 &&
+        m.args[2] == QuoteNode(Symbol("@node")))
+
+# The base callee name of a `:call` head (`deepcopy` / `Base.deepcopy` → :deepcopy).
+_kernel_callee_name(c) =
+    c isa Symbol ? c :
+    (c isa Expr && c.head === :(.) && length(c.args) >= 2 && c.args[2] isa QuoteNode) ?
+        c.args[2].value : nothing
+
+"""
+    _kernel_marker_kind(ex) -> Symbol | nothing
+
+Classify a call/macrocall AST as a recognized authoring MARKER (provenance for
+poc): `:node` (`@node` promoter), `:deepcopy` (structural owned-copy declaration),
+`:partial` (static token-preserving binder), else `nothing`. Recognition is purely
+syntactic; the inner callee's registration is resolved separately via
+[`kernel_registration`](@ref).
+"""
+function _kernel_marker_kind(ex)
+    ex isa Expr || return nothing
+    if ex.head === :macrocall && !isempty(ex.args) && _kernel_is_node_macro(ex.args[1])
+        return :node
+    elseif ex.head === :call && !isempty(ex.args)
+        name = _kernel_callee_name(ex.args[1])
+        name === :deepcopy && return :deepcopy
+        name === :partial && return :partial
+    end
+    nothing
 end

@@ -404,6 +404,39 @@ end
         @test RKS.kernel_rebound(cap, sin)                            # no longer a kernel
     end
 
+    @testset "copy!! RK-core intrinsic — registration contract boundary" begin
+        reg = RKS.kernel_registration(copy!!)
+        @test reg.kind === :intrinsic
+        @test reg.subject === :dest
+        @test reg.is_bang_bang
+        @test reg.token === RKS.kernel_token(copy!!)
+        @test reg.token isa Symbol                       # stable intrinsic Token (not a gensym)
+        @test reg.write_roots == () && reg.read_roots == ()   # NO manual roots / effect closure
+        # direct/unprepared execution REJECTS actionably — no hidden plan/deepcopy/fallback
+        @test_throws ArgumentError copy!!(zeros(2), ones(2))
+        @test_throws ArgumentError copy!!(1, 2)
+        # exported for unqualified HMC author use
+        @test copy!! === ReactiveKernels.copy!!
+    end
+
+    @testset "source-marker recognition: @node / deepcopy / partial" begin
+        # `@node` is a defined, exported macro (passthrough) so a recipe using it builds
+        @kernel withnode(m) = begin
+            kin = 0.5 * (@node(logdet(m)) + 2.0)
+        end
+        @test withnode isa KernelSpec
+        @test :m in keys(withnode)
+        # `@node` outside a kernel is a harmless identity
+        @test (@node 41 + 1) == 42
+        # the syntactic classifier recognizes each recognized marker shape
+        @test RKS._kernel_marker_kind(:(@node(logdet(m)))) === :node
+        @test RKS._kernel_marker_kind(:(deepcopy(init))) === :deepcopy
+        @test RKS._kernel_marker_kind(:(Base.deepcopy(init))) === :deepcopy
+        @test RKS._kernel_marker_kind(:(partial(leapfrog!; stepsize = 0.1))) === :partial
+        @test RKS._kernel_marker_kind(:(f(x))) === nothing
+        @test RKS._kernel_marker_kind(:(y + 1)) === nothing
+    end
+
     @testset "recipe-source provenance: frozen capture + kernel_recipe_ast" begin
         skel = StatefulRecipeSrcFixture
         ast = RKS.kernel_recipe_ast(skel)

@@ -39,7 +39,7 @@ export Value, Recipe, Graph, Plan, PreparedKernel, NonAllocatingKernel, Planning
 export value, value!, add!, plan, prepare, prepare_nonallocating, lower, transform, compile
 export explain, code_expr, inputs, outputs, valtype
 export compose, PreparationCache, prepare!, canon_id
-export KernelSpec, @kernel, kernel_graph, port
+export KernelSpec, @kernel, @node, kernel_graph, port, copy!!
 export DAGVisualization, visualize, dot_source, save_visualization
 # Reactive layer
 export ReactiveState, set!, get!, freeze!, unfreeze!, checkpoint, materialize!
