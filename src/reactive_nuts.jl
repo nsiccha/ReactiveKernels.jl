@@ -148,7 +148,16 @@ end
 # exactly, so `CompiledNUTSState` consumes it unchanged.
 @reactive specialize=true prepare=_nuts_prepare _reactive_nuts_group_object(
         potential_gradient!, metric, gofwd, min_dham,
+        may_sample, may_continue, depth, n_steps, acceptance_sum,
+        last_energy_error, last_diverged,
         init_pos, init_mom, fwd_pos, fwd_mom, bwd_pos, bwd_mom) = begin
+    # gofwd + the sampler control/diagnostic fields are public reactive HAVE sources
+    # on this group — the CompiledNUTSState transition reads/writes them here rather
+    # than in ordinary mutable struct fields (GAP-1d). `last_energy_error`/
+    # `last_diverged` are per-transition DIAGNOSTIC SNAPSHOTS assigned from the
+    # consumed live `dham`/`diverged`; the live derived `dham`/`diverged` stay the
+    # reactive computation used for acceptance/divergence (restore may legitimately
+    # change live dham, which must NOT retroactively rewrite the snapshot).
     chol_metric::typeof(cholesky(metric)) = cholesky(metric)
 
     init_valgrad::_ValueGradient{eltype(init_pos),typeof(init_pos)} =
@@ -198,9 +207,12 @@ each is given its OWN copy so the endpoints never alias.
 function reactive_nuts_group(potential_gradient!, metric, position, momentum;
                              gofwd::Bool = true,
                              min_dham::Real = _REACTIVE_NUTS_DEFAULT_MIN_DHAM)
-    threshold = convert(eltype(position), min_dham)
+    scalar = eltype(position)
+    threshold = convert(scalar, min_dham)
     _reactive_nuts_group_object(
         potential_gradient!, metric, gofwd, threshold,
+        # sampler control + diagnostic-snapshot sources, at their reset values:
+        true, true, 0, 0, zero(scalar), zero(scalar), false,
         copy(position), copy(momentum),
         copy(position), copy(momentum),
         copy(position), copy(momentum))
@@ -231,7 +243,13 @@ mutable struct _NUTSProposal{V<:AbstractVector}
 end
 _nuts_proposal(pos, mom) = _NUTSProposal(copy(pos), copy(mom))
 
-mutable struct CompiledNUTSState{R,G,F,S,T,TR,PR} <: AbstractNUTSState
+# GAP-1d: the sampler's dependency-bearing control/diagnostic state lives on the
+# group's reactive HAVE handles (gofwd, may_sample, may_continue, depth, n_steps,
+# acceptance_sum, last_energy_error, last_diverged); this struct keeps ONLY the
+# ordinary orchestration scratch the ca9 design permits — RNG, the integrator, the
+# optional recorder, max_depth, and the bounded trees/proposals. `step_f` is the one
+# mutable ordinary field (adaptation replaces it); everything else is immutable here.
+mutable struct CompiledNUTSState{R,G,F,S,TR,PR} <: AbstractNUTSState
     rng::R
     group::G                 # the flat compiled-reactive phase-point group
     step_f::F
@@ -239,14 +257,6 @@ mutable struct CompiledNUTSState{R,G,F,S,T,TR,PR} <: AbstractNUTSState
     max_depth::Int
     trees::TR
     proposals::PR
-    go_forward::Bool
-    may_sample::Bool
-    may_continue::Bool
-    energy_error::T
-    diverged::Bool
-    depth::Int
-    n_steps::Int
-    acceptance_sum::T
 end
 
 # A concrete, typed read-only view of the group's `init` endpoint that mirrors the
@@ -271,18 +281,89 @@ end
     return getproperty(group, name)
 end
 
-# Expose ca9-style property names over the group so the compiled state reads like
-# the reference object (`state.dham`, `state.gofwd`, `state.init.pos`, ...). `init`
-# is a typed init-endpoint view, NOT the whole group.
-function Base.getproperty(state::CompiledNUTSState, name::Symbol)
-    name === :dham && return getfield(state, :energy_error)
-    name === :gofwd && return getfield(state, :go_forward)
-    name === :init && return _CompiledInitView(getfield(state, :group))
-    # The reactive group's min_dham HAVE source is the single divergence-threshold
-    # authority; expose it (never a duplicate mutable copy that could drift).
-    name === :min_energy_error && return getfield(state, :group).min_dham
+# The sampler control/diagnostic fields are the group's reactive HAVE sources
+# (GAP-1d) — there is no ordinary mutable shadow. getproperty/setproperty! forward
+# the ca9-style names to those handles: go_forward/gofwd => group.gofwd; the control
+# fields => group.<name>; the diagnostic snapshots state.energy_error/state.dham =>
+# group.last_energy_error and state.diverged => group.last_diverged (NOT the live
+# dham/diverged, which restore may legitimately change). `init` is a typed init view.
+# Val-dispatch so a literal-name access (`state.go_forward`, `state.n_steps`) stays
+# type-stable (the returned group source is concrete), unlike a runtime `name in
+# (...)` branch which would infer a Union in the hot transition loop.
+@inline Base.getproperty(state::CompiledNUTSState, name::Symbol) =
+    _cn_getproperty(state, Val(name))
+@inline _cn_getproperty(state::CompiledNUTSState, ::Val{:init}) =
+    _CompiledInitView(getfield(state, :group))
+@inline _cn_getproperty(state::CompiledNUTSState, ::Val{:min_energy_error}) =
+    getfield(state, :group).min_dham
+@inline _cn_getproperty(state::CompiledNUTSState, ::Val{:go_forward}) =
+    getfield(state, :group).gofwd
+@inline _cn_getproperty(state::CompiledNUTSState, ::Val{:gofwd}) =
+    getfield(state, :group).gofwd
+@inline _cn_getproperty(state::CompiledNUTSState, ::Val{:may_sample}) =
+    getfield(state, :group).may_sample
+@inline _cn_getproperty(state::CompiledNUTSState, ::Val{:may_continue}) =
+    getfield(state, :group).may_continue
+@inline _cn_getproperty(state::CompiledNUTSState, ::Val{:depth}) =
+    getfield(state, :group).depth
+@inline _cn_getproperty(state::CompiledNUTSState, ::Val{:n_steps}) =
+    getfield(state, :group).n_steps
+@inline _cn_getproperty(state::CompiledNUTSState, ::Val{:acceptance_sum}) =
+    getfield(state, :group).acceptance_sum
+# Diagnostic SNAPSHOTS (not the live dham/diverged, which restore may change).
+@inline _cn_getproperty(state::CompiledNUTSState, ::Val{:energy_error}) =
+    getfield(state, :group).last_energy_error
+@inline _cn_getproperty(state::CompiledNUTSState, ::Val{:dham}) =
+    getfield(state, :group).last_energy_error
+@inline _cn_getproperty(state::CompiledNUTSState, ::Val{:diverged}) =
+    getfield(state, :group).last_diverged
+@inline _cn_getproperty(state::CompiledNUTSState, ::Val{name}) where {name} =
     getfield(state, name)
+
+@inline Base.setproperty!(state::CompiledNUTSState, name::Symbol, value) =
+    _cn_setproperty!(state, Val(name), value)
+# `source` is a Val type-parameter, so the handle field access constant-folds —
+# type-stable without relying on constant propagation through a Symbol argument.
+@inline function _cn_set_source!(state::CompiledNUTSState, ::Val{source}, value) where {source}
+    group = getfield(state, :group)
+    set!(group.state, getproperty(group.handles, source), value)
+    value
 end
+@inline _cn_setproperty!(state::CompiledNUTSState, ::Val{:go_forward}, v) =
+    _cn_set_source!(state, Val(:gofwd), v)
+# `gofwd` is a pure alias of the public `go_forward` control source (read+write).
+@inline _cn_setproperty!(state::CompiledNUTSState, ::Val{:gofwd}, v) =
+    _cn_set_source!(state, Val(:gofwd), v)
+@inline _cn_setproperty!(state::CompiledNUTSState, ::Val{:may_sample}, v) =
+    _cn_set_source!(state, Val(:may_sample), v)
+@inline _cn_setproperty!(state::CompiledNUTSState, ::Val{:may_continue}, v) =
+    _cn_set_source!(state, Val(:may_continue), v)
+@inline _cn_setproperty!(state::CompiledNUTSState, ::Val{:depth}, v) =
+    _cn_set_source!(state, Val(:depth), v)
+@inline _cn_setproperty!(state::CompiledNUTSState, ::Val{:n_steps}, v) =
+    _cn_set_source!(state, Val(:n_steps), v)
+@inline _cn_setproperty!(state::CompiledNUTSState, ::Val{:acceptance_sum}, v) =
+    _cn_set_source!(state, Val(:acceptance_sum), v)
+# `min_energy_error` forwards to the single divergence-threshold authority.
+@inline _cn_setproperty!(state::CompiledNUTSState, ::Val{:min_energy_error}, v) =
+    _cn_set_source!(state, Val(:min_dham), v)
+# Diagnostic SNAPSHOTS: `dham` is a pure read/write alias of `energy_error`
+# (both the completed-transition snapshot, NOT the live derived dham node).
+@inline _cn_setproperty!(state::CompiledNUTSState, ::Val{:energy_error}, v) =
+    _cn_set_source!(state, Val(:last_energy_error), v)
+@inline _cn_setproperty!(state::CompiledNUTSState, ::Val{:dham}, v) =
+    _cn_set_source!(state, Val(:last_energy_error), v)
+@inline _cn_setproperty!(state::CompiledNUTSState, ::Val{:diverged}, v) =
+    _cn_set_source!(state, Val(:last_diverged), v)
+@inline _cn_setproperty!(state::CompiledNUTSState, ::Val{name}, v) where {name} =
+    setfield!(state, name, v)
+
+# Public property inventory: the ordinary struct fields plus the group-backed
+# control/diagnostic names getproperty exposes (the ca9 CompiledNUTSState surface).
+Base.propertynames(::CompiledNUTSState, private::Bool = false) =
+    (:rng, :group, :step_f, :stats_f, :max_depth, :trees, :proposals,
+     :init, :go_forward, :gofwd, :may_sample, :may_continue, :depth, :n_steps,
+     :acceptance_sum, :energy_error, :dham, :diverged, :min_energy_error)
 
 reactive_program(state::CompiledNUTSState) = state.group.state.program
 
@@ -311,16 +392,24 @@ group produced by [`reactive_nuts_group`](@ref). Same public surface as the
 Boundary (honest): the per-transition Hamiltonian work — each endpoint's
 potential/gradient/kinetic/velocity, the active-endpoint selection, the energy
 error `dham`, and the `diverged` flag — is compiled reactive state in the group's
-`ReactiveProgram` ([`reactive_program`](@ref)), which is now authored through the
-public `@reactive` facade ([`reactive_nuts_group`](@ref)). The tree-growth
-recursion, U-turn criteria, RNG draws, and proposal swaps are ordinary Julia (as in
-ca9). This struct's own control/diagnostic fields (`go_forward`, `energy_error`,
-`depth`, …) and the trees/proposals are still ordinary mutable state; moving the
-dependency-bearing control/diagnostic + adaptation/statistics fields onto public
-reactive handles is tracked as GAP-1 follow-up work.
+`ReactiveProgram` ([`reactive_program`](@ref)), which is authored through the
+public `@reactive` facade ([`reactive_nuts_group`](@ref)). The dependency-bearing
+control and diagnostic fields are reactive HAVE sources on that same group too:
+`go_forward` (the `gofwd` selection), `may_sample`, `may_continue`, `depth`,
+`n_steps`, `acceptance_sum`, and the completed-transition diagnostic snapshots
+`energy_error`/`diverged` (the distinct `last_energy_error`/`last_diverged` sources,
+assigned only from the consumed live `group.dham`/`group.diverged` in
+`_cn_start_tree!` — never aliased to the live derived nodes, which restore may
+legitimately change). `getproperty`/`setproperty!` forward those names to the
+handles; the struct carries no ordinary duplicate/shadow copy of them. Only the RNG,
+the tree-growth recursion, U-turn criteria, RNG draws, and the bounded
+trees/proposals scratch are ordinary Julia (as in ca9).
 """
 const _REACTIVE_NUTS_REQUIRED_HANDLES = (
-    :gofwd, :chol_metric, :dham, :diverged, :active_ham,
+    :gofwd, :chol_metric, :dham, :diverged, :active_ham, :min_dham,
+    # GAP-1d control + completed-transition diagnostic-snapshot sources.
+    :may_sample, :may_continue, :depth, :n_steps, :acceptance_sum,
+    :last_energy_error, :last_diverged,
     :init_pos, :init_mom, :init_ham, :init_dpot_dpos, :init_dham_dmom,
     :fwd_pos, :fwd_mom, :fwd_ham, :fwd_dpot_dpos, :fwd_dham_dmom,
     :bwd_pos, :bwd_mom, :bwd_ham, :bwd_dpot_dpos, :bwd_dham_dmom,
@@ -331,12 +420,11 @@ function compiled_nuts_state(group::_NUTSGroup; rng, step_f,
                              min_dham = -1000.0)
     max_depth >= 1 || throw(ArgumentError("max_depth must be positive"))
     handle_names = keys(getfield(group, :handles))
-    all(name -> name in handle_names, (_REACTIVE_NUTS_REQUIRED_HANDLES...,
-                                       :min_dham)) ||
+    all(name -> name in handle_names, _REACTIVE_NUTS_REQUIRED_HANDLES) ||
         throw(ArgumentError(
             "compiled_nuts_state requires a flat phase-point group from " *
-            "reactive_nuts_group; got a ReactivePhasePoint without the " *
-            "init/fwd/bwd + gofwd/dham/min_dham handles"))
+            "reactive_nuts_group; got a group without the init/fwd/bwd + " *
+            "gofwd/dham/min_dham + control/diagnostic-snapshot handles"))
     # The compiled transition drives one in-place leapfrog on the active endpoint.
     # Only `partial(leapfrog!; stepsize=...)` is supported; reject any other
     # integrator rather than silently ignoring its func/args.
@@ -347,7 +435,6 @@ function compiled_nuts_state(group::_NUTSGroup; rng, step_f,
         "with exactly the stepsize keyword; other integrators or extra/unknown " *
         "keywords are not supported on the compiled group"))
     prototype = group.init_mom
-    scalar = typeof(float(group.init_ham - group.init_ham))
     # Sync the reactive divergence threshold so group.diverged uses this min_dham.
     # Convert to the group's potential scalar type (which may differ from the
     # coordinate eltype), read off the existing min_dham source value.
@@ -356,10 +443,7 @@ function compiled_nuts_state(group::_NUTSGroup; rng, step_f,
     trees = [_nuts_tree((; mom = prototype)) for _ in 1:(max_depth + 1)]
     proposals = [_nuts_proposal(group.init_pos, group.init_mom)
                  for _ in 1:(max_depth + 2)]
-    CompiledNUTSState(
-        rng, group, step_f, stats_f, Int(max_depth), trees, proposals,
-        true, true, true, zero(scalar), false, 0, 0, zero(scalar),
-    )
+    CompiledNUTSState(rng, group, step_f, stats_f, Int(max_depth), trees, proposals)
 end
 
 # --- Type-stable endpoint access over the flat group (branch on go_forward). ---
@@ -407,13 +491,6 @@ end
                        _group_leapfrog!(state.group, Val(:bwd), stepsize)
 end
 
-# Keep the reactive selection source in sync with go_forward, so the group's
-# `active_ham`/`dham`/`diverged` nodes track the current forward endpoint.
-@inline function _cn_sync_gofwd!(state::CompiledNUTSState)
-    set!(state.group.state, state.group.handles.gofwd, state.go_forward)
-    state
-end
-
 @inline function _cn_negate_backward_mom!(state::CompiledNUTSState)
     handles = state.group.handles
     gs = state.group.state
@@ -440,10 +517,17 @@ function _cn_reset_transition!(state::CompiledNUTSState)
         copyto!(proposal.mom, init_mom)
     end
     foreach(_reset_tree!, state.trees)
+    # `state.go_forward = true` writes the group's `gofwd` source directly (its
+    # public alias), so the reactive active_ham/dham/diverged nodes already track
+    # the forward endpoint — no separate sync needed.
     state.go_forward = true
-    _cn_sync_gofwd!(state)
     state.may_sample = true
     state.may_continue = true
+    # Reset the transition diagnostic snapshots (last_energy_error/last_diverged);
+    # they are assigned only from the consumed live group.dham/group.diverged in
+    # _cn_start_tree!, never aliased to the live values which restore may change.
+    # Take the zero from the snapshot source itself (a stored HAVE value) rather
+    # than from state.group.dham, which would force the live derived node.
     state.energy_error = zero(state.energy_error)
     state.diverged = false
     state.depth = 0
@@ -467,8 +551,7 @@ end
 
 function _cn_flip!(state::CompiledNUTSState, depth::Int)
     depth > 1 || return state
-    state.go_forward = !state.go_forward
-    _cn_sync_gofwd!(state)
+    state.go_forward = !state.go_forward   # writes group.gofwd (its public alias)
     tree = state.trees[depth]
     backward_mom = _cn_bwd_mom(state)
     backward_vel = _cn_bwd_vel(state)

@@ -492,6 +492,180 @@ end
     @test all(v -> v == (true, true), validities)   # diverged CONSUMED, not stale
 end
 
+@testset "CompiledNUTSState — GAP-1d control/diagnostic fields ARE group sources" begin
+    # No ordinary mutable shadow: the struct itself carries only rng/group/step_f/
+    # stats_f/max_depth/trees/proposals — every control/diagnostic field is a
+    # reactive HAVE source on the group, reached via getproperty/setproperty!.
+    @test fieldnames(CompiledNUTSState) ===
+          (:rng, :group, :step_f, :stats_f, :max_depth, :trees, :proposals)
+    for shadow in (:go_forward, :may_sample, :may_continue, :depth, :n_steps,
+                   :acceptance_sum, :energy_error, :diverged, :gofwd, :dham)
+        @test !(shadow in fieldnames(CompiledNUTSState))
+    end
+
+    D = 4
+    metric = Matrix{Float64}(I, D, D)
+    group = reactive_nuts_group(_std_pot_grad!, metric, _det_pos(D), zeros(D))
+    state = compiled_nuts_state(group; rng = Xoshiro(9),
+                                step_f = partial(leapfrog!; stepsize = 0.2),
+                                max_depth = 4)
+
+    # propertynames exposes the ca9 surface INCLUDING the read/write aliases, so
+    # hasproperty agrees with getproperty (no getproperty-works-but-hasproperty-false).
+    for name in (:go_forward, :gofwd, :may_sample, :may_continue, :depth, :n_steps,
+                 :acceptance_sum, :energy_error, :dham, :diverged, :min_energy_error,
+                 :init, :group, :rng)
+        @test hasproperty(state, name)
+        @test name in propertynames(state)
+    end
+
+    # setproperty! forwards each control name to its group HAVE source; getproperty
+    # reads it straight back (single authority — no duplicate copy to drift).
+    state.go_forward = false
+    @test state.go_forward === false
+    @test group.gofwd === false
+    state.gofwd = true                 # the gofwd alias round-trips symmetrically
+    @test state.go_forward === true
+    @test group.gofwd === true
+    state.depth = 3;            @test state.depth == 3 == group.depth
+    state.n_steps = 7;          @test state.n_steps == 7 == group.n_steps
+    state.may_sample = false;   @test state.may_sample === false === group.may_sample
+    state.may_continue = false; @test state.may_continue === false === group.may_continue
+    state.acceptance_sum = 1.5; @test state.acceptance_sum == 1.5 == group.acceptance_sum
+    # energy_error / dham are the SAME diagnostic snapshot (last_energy_error), not
+    # the live derived dham node; both names read/write it.
+    state.energy_error = -0.75
+    @test state.energy_error == -0.75 == state.dham == group.last_energy_error
+    state.dham = -0.5
+    @test state.energy_error == -0.5 == state.dham == group.last_energy_error
+    state.diverged = true
+    @test state.diverged === true === group.last_diverged
+    # min_energy_error forwards to the single divergence-threshold authority.
+    state.min_energy_error = -12.5
+    @test state.min_energy_error == -12.5 == group.min_dham
+
+    # Setter return values are the assigned value (not the state).
+    @test (state.n_steps = 4) == 4
+    @test (state.energy_error = -0.1) == -0.1
+end
+
+@testset "CompiledNUTSState — control reads/writes are inferred and 0-B" begin
+    D = 4
+    metric = Matrix{Float64}(I, D, D)
+    group = reactive_nuts_group(_std_pot_grad!, metric, _det_pos(D), zeros(D))
+    state = compiled_nuts_state(group; rng = Xoshiro(11),
+                                step_f = partial(leapfrog!; stepsize = 0.2),
+                                max_depth = 4)
+
+    # Literal-name accesses infer concrete types (no Union from a runtime branch).
+    _probe_gofwd(s)   = s.go_forward
+    _probe_depth(s)   = s.depth
+    _probe_nsteps(s)  = s.n_steps
+    _probe_ee(s)      = s.energy_error
+    _probe_div(s)     = s.diverged
+    @test (@inferred _probe_gofwd(state))  isa Bool
+    @test (@inferred _probe_depth(state))  isa Int
+    @test (@inferred _probe_nsteps(state)) isa Int
+    @test (@inferred _probe_ee(state))     isa Float64
+    @test (@inferred _probe_div(state))    isa Bool
+
+    # A control read/write cycle over the group sources allocates nothing.
+    function _control_cycle!(s)
+        s.n_steps += 1
+        s.go_forward = !s.go_forward
+        s.acceptance_sum += 1.0
+        s.energy_error = zero(s.energy_error)
+        s.n_steps
+    end
+    _control_cycle!(state)                       # warm
+    @test @allocated(_control_cycle!(state)) == 0
+end
+
+@testset "CompiledNUTSState — diagnostic snapshot decoupled from live dham/diverged" begin
+    # The completed-transition diagnostics (state.energy_error/state.diverged) are
+    # SAME-PROGRAM reactive HAVE snapshots (last_energy_error/last_diverged), assigned
+    # only from the consumed live group.dham/group.diverged in _cn_start_tree! after
+    # the actual leapfrog — never aliased to those live derived nodes, which restore
+    # and threshold changes may legitimately move.
+    D = 4
+    metric = Matrix{Float64}(I, D, D)
+    q0 = _det_pos(D)
+
+    oracle = ReactiveKernels._oracle_nuts_state(
+        euclidean_phasepoint(_std_pot, q -> (_std_pot(q), copy(q)), metric,
+                             copy(q0), zeros(D));
+        rng = Xoshiro(4321), step_f = partial(leapfrog!; stepsize = 0.25),
+        max_depth = 5)
+    group = reactive_nuts_group(_std_pot_grad!, metric, copy(q0), zeros(D))
+    state = compiled_nuts_state(group; rng = Xoshiro(4321),
+                                step_f = partial(leapfrog!; stepsize = 0.25),
+                                max_depth = 5, min_dham = -1000.0)
+
+    local oracle_diag, compiled_diag
+    for _ in 1:12
+        oracle_diag = sample!(oracle)
+        compiled_diag = sample!(state)
+    end
+
+    # After the transition, the snapshot exactly matches the oracle diagnostic.
+    snap_ee  = state.energy_error
+    snap_div = state.diverged
+    @test snap_ee ≈ oracle_diag.energy_error
+    @test snap_div == oracle_diag.diverged
+    @test compiled_diag.energy_error == snap_ee
+    @test compiled_diag.diverged == snap_div
+
+    # Perturb an input the LIVE dham depends on: the live derived node recomputes to
+    # a different value, but the completed-transition snapshot is NOT rewritten.
+    state.go_forward = true
+    group.fwd_mom = 80.0 .* _det_mom(D)          # huge energy error → very negative dham
+    @test group.dham != snap_ee                  # live diagnostic moved
+    @test group.dham < -1000.0
+    @test state.energy_error == snap_ee          # snapshot unchanged (not aliased)
+
+    # Threshold change recomputes the LIVE diverged node but must not retroactively
+    # rewrite the completed-transition diverged snapshot.
+    @test group.diverged == true                 # live: dham < min_dham
+    state.min_energy_error = -1.0e9              # loosen reactively
+    @test group.diverged == false                # live recomputed
+    @test state.diverged == snap_div             # snapshot still the completed value
+
+    # And the reverse: tightening does not rewrite the snapshot either.
+    state.min_energy_error = 0.0
+    @test group.diverged == true
+    @test state.diverged == snap_div
+end
+
+@testset "CompiledNUTSState — live dham/diverged CONSUMED after the leapfrog" begin
+    # The snapshot must be sourced from the live group nodes AFTER the actual
+    # in-place leapfrog on the active endpoint: at every stats callback the dham and
+    # diverged slots are valid AND the recorded snapshot equals the live value at
+    # that instant (proving assignment from the consumed live node, not a constant).
+    D = 3
+    metric = Matrix{Float64}(I, D, D)
+    group = reactive_nuts_group(_std_pot_grad!, metric, _det_pos(D), zeros(D))
+    dham_slot = ReactiveKernels._slot_index(group.handles.dham)
+    div_slot = ReactiveKernels._slot_index(group.handles.diverged)
+
+    matched = Bool[]
+    recorder = function (s)
+        gstate = s.group.state
+        # Both live nodes are computed (valid) at the callback...
+        @assert gstate.valid[dham_slot] && gstate.valid[div_slot]
+        # ...and the just-taken snapshot equals the live value consumed here.
+        push!(matched, s.energy_error == s.group.dham &&
+                       s.diverged == s.group.diverged)
+    end
+    state = compiled_nuts_state(group; rng = Xoshiro(5),
+                                step_f = partial(leapfrog!; stepsize = 0.2),
+                                stats_f = recorder, max_depth = 4)
+    for _ in 1:6
+        sample!(state)
+    end
+    @test !isempty(matched)
+    @test all(matched)
+end
+
 @testset "CompiledNUTSState — warmup! adaptation parity with the oracle" begin
     D = 4
     q0 = _det_pos(D)
