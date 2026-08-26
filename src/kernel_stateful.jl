@@ -499,3 +499,172 @@ function _kernel_stateful_expand(name, signature_inputs, call_signature, block,
              Expr(:call, Val, QuoteNode(token_sym)), __module__,
              esc(spec_expr), method_meta, recipe_source)))
 end
+
+# --- Mode-2 free-method recognition (V7 implicit-field pivot) ----------------
+#
+# A METHODLESS `@kernel name(sig) = body` whose body MUTATES a field of the FIRST
+# positional subject (`subject.field = …` / `subject.field op= …`, incl. `@.`
+# broadcast) is a Mode-2 FREE METHOD (e.g. `leapfrog!(phasepoint; stepsize)`),
+# authored by the sole `@kernel` so RK owns its visible effects — independent of
+# `!` spelling (bang is a naming convention, not the discriminator). This is
+# provenance/recognition ONLY: the shallow-declared write/read roots on the
+# subject, the frozen body source, and a def-unique Token — NO MethodIR / effect
+# closure / lowering / execution.
+
+# An assignment-like head: `=` or an augmented `op=` (`+=`, `-=`, `.=`, …), but
+# NOT a comparison that merely ends in `=` (`==`, `<=`, `===`, `.==`, …).
+function _kernel_is_assign_head(h)
+    h isa Symbol || return false
+    s = String(h)
+    endswith(s, "=") || return false
+    h in (:(==), :(!=), :(<=), :(>=), :(===), :(!==),
+          :(.==), :(.!=), :(.<=), :(.>=)) && return false
+    true
+end
+
+# Root of a (possibly nested) `a.b.c` property chain: `a`.
+_kernel_dot_root(x) = (x isa Expr && x.head === :(.)) ? _kernel_dot_root(x.args[1]) : x
+
+# Is `place` a property access rooted at `subject` (`subject.f`, `subject.a.b`)?
+_kernel_is_subject_place(place, subject::Symbol) =
+    place isa Expr && place.head === :(.) && _kernel_dot_root(place) === subject
+
+# The field DIRECTLY under `subject` in a `subject.a.b` chain (the top owned field
+# = the write/read ROOT): `subject.mom` → `:mom`, `subject.a.b` → `:a`.
+function _kernel_top_field(place, subject::Symbol)
+    node = place
+    while node isa Expr && node.head === :(.)
+        if node.args[1] === subject
+            f = length(node.args) >= 2 ? node.args[2] : nothing
+            return f isa QuoteNode ? f.value : (f isa Symbol ? f : nothing)
+        end
+        node = node.args[1]
+    end
+    nothing
+end
+
+# Does the body mutate a field of `subject` anywhere (through `@.` too)? — the
+# Mode-2 discriminator. Disjoint from stateless recipes (bare-Symbol LHS) and from
+# Mode-1 (nested methods, tested first).
+function _kernel_body_mutates_subject(block, subject::Symbol)
+    found = false
+    walk(x) = begin
+        (found || !(x isa Expr)) && return
+        if _kernel_is_assign_head(x.head) && length(x.args) >= 1 &&
+           _kernel_is_subject_place(x.args[1], subject)
+            found = true
+            return
+        end
+        for a in x.args
+            walk(a)
+        end
+    end
+    walk(block)
+    found
+end
+
+# Shallow-DECLARED effect roots on the subject: top-fields written (assignment LHS
+# `subject.f …`) vs read (`subject.f` elsewhere). Provenance for the resolver — NOT
+# an effect closure (poc derives precise per-owner effects itself).
+function _kernel_subject_effect_roots(block, subject::Symbol)
+    writes = Symbol[]
+    reads = Symbol[]
+    pushuniq!(v, x) = (x isa Symbol && !(x in v) && push!(v, x); nothing)
+    local walk
+    walk = function (x)
+        x isa Expr || return
+        if _kernel_is_assign_head(x.head) && length(x.args) >= 2
+            lhs = x.args[1]
+            if _kernel_is_subject_place(lhs, subject)
+                pushuniq!(writes, _kernel_top_field(lhs, subject))
+                # a direct field place has no reachable sub-reads; do NOT re-count it
+                # as a read.
+            else
+                walk(lhs)
+            end
+            for a in x.args[2:end]
+                walk(a)
+            end
+        elseif x.head === :(.) && _kernel_dot_root(x) === subject
+            pushuniq!(reads, _kernel_top_field(x, subject))
+            walk(x.args[1])          # the object chain (the field is a QuoteNode leaf)
+        else
+            for a in x.args
+                walk(a)
+            end
+        end
+        return
+    end
+    walk(block)
+    (writes = Tuple(writes), reads = Tuple(reads))
+end
+
+# `@kernel name!!` — the strong same-object update registration (marker #4). The
+# `!!` suffix is recognized off the stored name; no extra storage is needed.
+_kernel_is_bangbang_name(name::Symbol) = endswith(String(name), "!!")
+
+# The substrate object bound by a Mode-2 free `@kernel` in Increment 1. It carries
+# the def name + unique Token, the subject (first positional), the shallow-declared
+# write/read effect roots, the ports-only recipe `spec` (the signature ports; the
+# body holds mutations, not owner recipes), the frozen body source (poc lowers it),
+# and the `!!` registration flag. Later increments add the specializing factory.
+struct _Mode2KernelSkeleton{Token,S,M,B}
+    name::Symbol
+    mod::Module
+    subject::Symbol
+    spec::S
+    write_roots::Tuple{Vararg{Symbol}}
+    read_roots::Tuple{Vararg{Symbol}}
+    method::M                # (; name, subject, write_roots, read_roots)
+    body_source::B           # frozen, detached body-statement source (see _FrozenExpr)
+    is_bang_bang::Bool
+end
+_Mode2KernelSkeleton(name::Symbol, ::Val{Token}, mod::Module, subject::Symbol, spec::S,
+                     write_roots, read_roots, method::M, body_source::B,
+                     is_bb::Bool) where {Token,S,M,B} =
+    _Mode2KernelSkeleton{Token,S,M,B}(name, mod, subject, spec, Tuple(write_roots),
+                                      Tuple(read_roots), method, body_source, is_bb)
+
+kernel_token(skel::_Mode2KernelSkeleton{Token}) where {Token} = Token
+kernel_module(skel::_Mode2KernelSkeleton) = getfield(skel, :mod)
+kernel_spec(skel::_Mode2KernelSkeleton) = getfield(skel, :spec)
+kernel_subject(skel::_Mode2KernelSkeleton) = getfield(skel, :subject)
+kernel_write_roots(skel::_Mode2KernelSkeleton) = getfield(skel, :write_roots)
+kernel_read_roots(skel::_Mode2KernelSkeleton) = getfield(skel, :read_roots)
+kernel_methods(skel::_Mode2KernelSkeleton) = (getfield(skel, :method),)
+kernel_is_bangbang(skel::_Mode2KernelSkeleton) = getfield(skel, :is_bang_bang)
+
+# Thaw a FRESH copy of the captured Mode-2 body source (`Expr(:block, …)`), in
+# authored order, structure intact, line numbers stripped — the mutation body poc
+# lowers into the free-method schedule.
+kernel_recipe_ast(skel::_Mode2KernelSkeleton) =
+    Expr(:block, (_kernel_thaw_ast(s) for s in getfield(skel, :body_source))...)
+
+function Base.show(io::IO, skel::_Mode2KernelSkeleton)
+    print(io, "Mode-2 @kernel :", skel.name, " (subject :", skel.subject,
+          skel.is_bang_bang ? "; !! strong-update" : "",
+          "; Increment-1 skeleton)")
+end
+
+# Route a Mode-2 free `@kernel` here. Increment-1 SKELETON: scan the subject's
+# declared write/read roots, build a ports-only recipe spec from the signature,
+# freeze the body source, and bind the substrate by Token. It does NOT lower a
+# schedule or generate a callable dispatch; later increments add those.
+function _kernel_mode2_expand(name, signature_inputs, call_signature, block,
+                              subject::Symbol, __module__)
+    roots = _kernel_subject_effect_roots(block, subject)
+    method_meta = (; name = name, subject = subject,
+                     write_roots = roots.writes, read_roots = roots.reads)
+    # Ports-only spec: the signature ports (the body carries mutations, not recipes).
+    spec_expr = _kernel_expand(Expr(:block), signature_inputs, call_signature)
+    body_source = Tuple(
+        _kernel_freeze_ast(s isa Expr ? Base.remove_linenums!(deepcopy(s)) : s)
+        for s in _kernel_body_statements(block) if !(s isa LineNumberNode))
+    token_sym = gensym(Symbol(name, :_token))
+    is_bb = _kernel_is_bangbang_name(name)
+    Expr(:const, Expr(:(=), esc(name),
+        Expr(:call, _Mode2KernelSkeleton, QuoteNode(name),
+             Expr(:call, Val, QuoteNode(token_sym)), __module__,
+             QuoteNode(subject), esc(spec_expr),
+             roots.writes, roots.reads, method_meta, body_source, is_bb)))
+end

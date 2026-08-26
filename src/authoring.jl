@@ -1131,7 +1131,10 @@ function _kernel_named_signature(signature)
         (argument.name, argument.type_expr)
         for argument in (positional..., keywords...)
     ]
-    name, inputs, _kernel_call_signature_expr(positional, keywords)
+    # The first positional name is the Mode-2 subject candidate (a body mutating its
+    # fields selects the free-method path); keywords are never the subject.
+    positional_names = Tuple(argument.name for argument in positional)
+    name, inputs, _kernel_call_signature_expr(positional, keywords), positional_names
 end
 
 function _kernel_definition_parts(ex::Expr)
@@ -1207,11 +1210,17 @@ mutation is provided separately by [`prepare_reactive`](@ref), [`set!`](@ref),
 macro kernel(ex)
     definition = ex isa Expr ? _kernel_definition_parts(ex) : nothing
     definition === nothing && return esc(_kernel_expand(ex))
-    name, inputs, call_signature, block = definition
-    # A method-bearing body routes to the stateful authoring substrate; a
-    # methodless body keeps the byte-identical stateless expansion below.
+    name, inputs, call_signature, positional_names, block = definition
+    # Discriminator (V7): nested methods ⇒ Mode-1 object kernel; else a methodless
+    # body that MUTATES a field of the FIRST positional subject ⇒ Mode-2 free method
+    # (independent of `!` spelling); else the byte-identical stateless expansion.
     _kernel_body_has_methods(block) &&
         return _kernel_stateful_expand(name, inputs, call_signature, block, __module__)
+    if !isempty(positional_names) &&
+       _kernel_body_mutates_subject(block, positional_names[1])
+        return _kernel_mode2_expand(name, inputs, call_signature, block,
+                                    positional_names[1], __module__)
+    end
     esc(Expr(:(=), name, _kernel_expand(block, inputs, call_signature)))
 end
 

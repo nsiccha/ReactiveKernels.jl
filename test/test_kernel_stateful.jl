@@ -153,6 +153,19 @@ end
     end
 end
 
+# Mode-2 free methods: a METHODLESS body mutating the FIRST positional subject's
+# fields (`@.` broadcast + augmented assign). `leapfrog!` (bang, not `!!`) with the
+# canonical sign-corrected integrator; `nuts!!` (strong same-object update).
+@kernel leapfrog!(phasepoint; stepsize) = begin
+    @. phasepoint.mom -= 0.5 * stepsize * phasepoint.dham_dpos
+    @. phasepoint.pos +=       stepsize * phasepoint.dham_dmom
+    @. phasepoint.mom -= 0.5 * stepsize * phasepoint.dham_dpos
+end
+@kernel nuts!!(state; rng) = begin
+    state.pos = rng
+    return state
+end
+
 @testset "stateful @kernel substrate (Increment 1)" begin
     @testset "(3) methodless @kernel unchanged — routes to the stateless path" begin
         @kernel plain(f, x) = begin
@@ -298,6 +311,45 @@ end
         # a bare `__self__` outside an object-pass actual is rejected.
         @test_throws ArgumentError RKS._kernel_extract_method(:(m!() = (y = __self__)), :short)
         @test_throws ArgumentError RKS._kernel_extract_method(:(m!() = sib!(x, __self__)), :short)
+    end
+
+    @testset "Mode-2 free-method recognition (subject field mutation)" begin
+        # discriminator: a body mutating the first positional's field ⇒ Mode-2,
+        # NOT stateless and NOT Mode-1 (object kernel).
+        @test leapfrog! isa RKS._Mode2KernelSkeleton
+        @test !(leapfrog! isa KernelSpec)
+        @test !(leapfrog! isa RKS._StatefulKernelSkeleton)
+        @test RKS.kernel_subject(leapfrog!) === :phasepoint
+        # shallow-declared effect roots on the subject (top owned fields)
+        @test RKS.kernel_write_roots(leapfrog!) == (:mom, :pos)
+        @test RKS.kernel_read_roots(leapfrog!) == (:dham_dpos, :dham_dmom)
+        @test !RKS.kernel_is_bangbang(leapfrog!)          # `!` is not `!!`
+        @test RKS.kernel_token(leapfrog!) isa Symbol
+        @test RKS.kernel_module(leapfrog!) === @__MODULE__
+        @test RKS.kernel_recipe_ast(leapfrog!) isa Expr    # frozen body thaws fresh
+        @test RKS.kernel_spec(leapfrog!) isa KernelSpec     # ports-only recipe spec
+
+        # `!!` strong same-object update registration recognized off the name
+        @test nuts!! isa RKS._Mode2KernelSkeleton
+        @test RKS.kernel_subject(nuts!!) === :state
+        @test RKS.kernel_write_roots(nuts!!) == (:pos,)
+        @test RKS.kernel_is_bangbang(nuts!!)
+        @test RKS.kernel_token(leapfrog!) !== RKS.kernel_token(nuts!!)  # def-unique Tokens
+
+        # the discriminator: mutation of the first positional vs a bare READ / recipe
+        @test !RKS._kernel_body_mutates_subject(:(begin y = f(x) end), :x)
+        @test !RKS._kernel_body_mutates_subject(:(begin y = x.field end), :x)  # read ≠ mutation
+        @test RKS._kernel_body_mutates_subject(:(begin x.a = 1 end), :x)
+        @test RKS._kernel_body_mutates_subject(:(begin @. x.a -= 1 end), :x)
+        @test RKS._kernel_body_mutates_subject(:(begin x.a.b = 1 end), :x)     # nested owner path
+
+        # direct effect-root scan: read/write classification incl. a field both ways
+        r = RKS._kernel_subject_effect_roots(:(begin
+            @. p.mom -= p.g
+            p.pos = p.mom
+        end), :p)
+        @test r.writes == (:mom, :pos)
+        @test r.reads == (:g, :mom)   # `p.mom` on the RHS of `p.pos = p.mom` is a read
     end
 
     @testset "recipe-source provenance: frozen capture + kernel_recipe_ast" begin
@@ -546,7 +598,7 @@ end
         actual = @macroexpand1 @kernel plain(f, x) = begin
             y = f(x)
         end
-        nm, inp, sig, blk = RKS._kernel_definition_parts(def)
+        nm, inp, sig, posn, blk = RKS._kernel_definition_parts(def)
         ref = Expr(:(=), nm, RKS._kernel_expand(blk, inp, sig))
         @test norm(actual) == norm(ref)
         # and no stateful codegen leaked into the methodless expansion
