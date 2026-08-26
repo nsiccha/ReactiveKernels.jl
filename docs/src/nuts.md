@@ -1,13 +1,22 @@
-# Compiled-reactive NUTS sampling
+# NUTS sampling
 
-`ReactiveKernels` includes a multinomial No-U-Turn sampler whose per-transition
-Hamiltonian work is a genuinely *compiled reactive* kernel. The public workflow —
-[`reactive_nuts_group`](@ref) + [`nuts_state`](@ref), with warmup and statistics —
-compiles **five** distinct [`ReactiveProgram`](@ref)s. Everything else is ordinary
-inferred Julia: the tree-growth recursion, RNG draws, U-turn criteria, leapfrog
-integration, and the adaptation/statistics update methods all run *over* these
-compiled reactive handles; they are **not** themselves reactive graphs, and no DAG
-is manufactured for them.
+> [!WARNING]
+> **This page documents the current `@reactive` substrate, which is being replaced —
+> it is not the final authoring API.** The compiled group shown below (a flat
+> `reactive_nuts_group` with three hand-unrolled endpoints authored via `@reactive`) is
+> the **legacy implementation / parity oracle**. The approved direction is a unified,
+> **method-bearing `@kernel`** surface — a phase-point *endpoint* object with in-place
+> `leapfrog!` / `refresh_momentum!` methods, a composed `sampler`, and ordinary tree
+> recursion (ReactiveHMC-faithful, `@reactive` **removed**). That surface is **staged,
+> not yet canonical**: it is mid-implementation (syntax → poc → HMC), and its real
+> definitions + interaction will appear here — build-executed and drift-proof from the
+> landed fixture — once it lands. Nothing below is the final authoring surface.
+
+`ReactiveKernels` includes a multinomial No-U-Turn sampler. Its per-transition
+Hamiltonian work is *currently* a compiled reactive kernel — the **legacy substrate**
+documented below. The tree-growth recursion, RNG draws, U-turn criteria, leapfrog
+integration, and the adaptation/statistics update methods all run *over* the compiled
+handles as ordinary inferred Julia; they are not themselves reactive graphs.
 
 The public model boundary is a **scalar potential** plus its gradient callable
 `potential_gradient!(gradient, position)`, which fills the gradient buffer in place and
@@ -22,58 +31,34 @@ visible content, and the timings isolate sampler overhead rather than the gradie
 complete runnable workflow, including the optional DI + Enzyme boundary, is
 [`examples/nuts.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/nuts.jl).
 
-## The five compiled reactive programs
+## Current substrate (legacy `@reactive` group — being replaced)
 
-Each panel below shows the **actual kernel**, not an opaque constructor call.
-**Raw input** leads with the *real `@reactive` authoring* of the kernel — the exact
-recipe math (and, for the adaptation kernels, the inner `fit!`/`step!` update method)
-read straight out of `src/reactive_nuts.jl` — followed by how you **construct and
-interact** with it (build it, then read a getter or run its update method) and the
-value that read returns. **Generated kernel** is the real `code_expr` of a selected
-load-bearing getter of the actual `reactive_program` (a fused derived getter where
-the program has derived nodes, a source-slot getter for a state-only program);
-**Compute DAG** is that same `program.plan`, whose interactive graph carries the
-*complete* recipe inventory. Choose **Compare all** to inspect the three views side
-by side while preserving the DAG's fit, zoom, pan, and node-inspection state.
+The sampler is currently implemented as a flat `reactive_nuts_group`: a single
+`@reactive` object with the three phase-point endpoints (`init`/`fwd`/`bwd`)
+**hand-unrolled ×3**, per-endpoint `_grad_bundle`/`_kin_bundle` recipes and their
+projections, a reactive active-endpoint selection (`active_ham`), energy error
+(`dham`), and `diverged`; leapfrog and tree recursion run as ordinary Julia over those
+handles. Step-size adaptation, Welford metric adaptation, and the trajectory/sampling
+statistics are four further `@reactive` programs.
 
-So you can read the authoring syntax and the interaction directly — the definitions
-are the actual source, the getters/update methods are exactly how you drive them —
-and give feedback on the API without opening any implementation file.
+This is the **parity oracle / current substrate**, not the authoring surface to
+review — it is exactly what the staged unified `@kernel` surface (see the banner above,
+and the [Fused NUTS authoring](nuts-architecture.md) page) replaces. The raw
+`@reactive` authoring panels have been **removed from this primary path deliberately**:
+the real, method-bearing `@kernel` definitions + interaction will appear here
+build-executed and drift-proof — sourced from HMC's reviewed authoring fixture — once
+it lands. Nothing on this page is the desired final architecture.
 
-The docs build asserts a mechanical one-to-one coverage gate: exactly these five
-programs, each artifact's program/DAG/getter tied to the live
-`reactive_program(object)`, and each program's full source/derived recipe census
-matching its declared inventory — so a missing or extra recipe fails the build.
+## The legacy substrate's state and interaction
 
-- The **NUTS group** program fuses the whole per-endpoint Hamiltonian: for each of
-  `init`/`fwd`/`bwd` an owned value–gradient bundle and kinetic bundle with their
-  velocity/kinetic/gradient/potential projections, the Cholesky metric factor and
-  per-endpoint hamiltonian, and then the reactive active-endpoint selection
-  (`active_ham`), energy error (`dham`), and `diverged` flag. Its control and
-  diagnostic surface (`gofwd`, `may_sample`, `may_continue`, `depth`, `n_steps`,
-  `acceptance_sum`, and the completed-transition snapshots
-  `last_energy_error`/`last_diverged`, plus the `min_dham` threshold) are HAVE
-  sources on the same program. The selected `dham` getter shows how all of that
-  work fuses into one straight-line function with no graph traversal.
-- **DualAveragingState** compiles the Nesterov step-size recurrence
-  (`log_current`/`current`/`final`) over its accumulator sources; `fit!` is an
-  ordinary method advancing those sources.
-- **WelfordVariance**, **TrajectoryStats**, and **SamplingStats** are *state-only*
-  reactive programs: their authoritative buffers/counters/history are HAVE sources
-  with no derived nodes, and their `step!`/recorder/reduction methods are ordinary
-  Julia over those handles.
+*(This section introspects the current `@reactive` substrate described above — kept for
+reference until the unified `@kernel` surface lands; it is not the target API.)*
 
-```@eval
-Main.ReactiveKernelsDocs.render_five_programs(@__MODULE__)
-```
-
-## The reactive state, and how you drive it
-
-The compiled group above *is* the reactive **state**. Its fields are exactly the
-sources and derived nodes of the `@reactive` definition: `init_pos`/`init_mom` and
-the control/diagnostic fields are HAVE **sources** you write; the Hamiltonian
-quantities (`init_ham`, `dham`, `diverged`, the per-endpoint bundles/projections) are
-**derived** reactive nodes you read. All of it is visible — no hidden state:
+The compiled group *is* the reactive **state**. Its fields are the sources and derived
+nodes of the `@reactive` definition: `init_pos`/`init_mom` and the control/diagnostic
+fields are HAVE **sources** you write; the Hamiltonian quantities (`init_ham`, `dham`,
+`diverged`, the per-endpoint bundles/projections) are **derived** reactive nodes you
+read:
 
 ```@example nutsdrive
 using LinearAlgebra, Random, ReactiveKernels
