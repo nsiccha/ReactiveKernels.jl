@@ -11,6 +11,18 @@ const ENZYME_BACKEND = AutoEnzyme(;
     function_annotation = Enzyme.Const,
 )
 
+function poisson_gamma_reference_logdensity(qv)
+    log_rate = only(qv)
+    parameters = PoissonGammaParameters(exp(log_rate))
+    prior = PoissonGammaExample.log_prior(parameters)
+    likelihood = PoissonGammaExample.sum_log_likelihood(
+        PoissonGammaExample.pointwise_log_likelihood(
+            parameters, POISSON_COUNTS,
+        ),
+    )
+    PoissonGammaExample.total_log_density(prior, log_rate, likelihood)
+end
+
 @testset "manual PPL graph — Poisson-Gamma" begin
     model = build_poisson_gamma_graph()
     log_rate = log(3.5)
@@ -53,7 +65,7 @@ const ENZYME_BACKEND = AutoEnzyme(;
         @test density ≈ prior + log_jacobian + likelihood
     end
 
-    @testset "the log-density boundary differentiates (AD + finite differences)" begin
+    @testset "the log-density boundary differentiates through DI + Enzyme" begin
         k = prepare(model.graph;
                     have = (model.log_rate, model.counts),
                     want = (model.density,))
@@ -65,9 +77,10 @@ const ENZYME_BACKEND = AutoEnzyme(;
         @test length(gradient) == 1
         @test all(isfinite, gradient)
 
-        h = 1e-6
-        fd = (logdensity([log_rate + h]) - logdensity([log_rate - h])) / (2h)
-        @test gradient[1] ≈ fd rtol = 1e-4
+        @test logdensity(qvec) ≈ poisson_gamma_reference_logdensity(qvec)
+        reference_gradient = DifferentiationInterface.gradient(
+            poisson_gamma_reference_logdensity, ENZYME_BACKEND, qvec)
+        @test gradient ≈ reference_gradient
     end
 
     @testset "generated quantity prunes density work" begin

@@ -11,6 +11,17 @@ const ENZYME_BACKEND = AutoEnzyme(;
     function_annotation = Enzyme.Const,
 )
 
+function arma11_reference_logdensity(qv)
+    μ, φ, θ, log_σ = qv
+    parameters = ARMAParameters(μ, φ, θ, exp(log_σ))
+    errors = ARMA11Example.arma_errors(parameters, ARMA_SERIES)
+    prior = ARMA11Example.log_prior(parameters)
+    likelihood = ARMA11Example.sum_log_likelihood(
+        ARMA11Example.pointwise_log_likelihood(errors, parameters),
+    )
+    ARMA11Example.total_log_density(prior, log_σ, likelihood)
+end
+
 @testset "manual PPL graph — ARMA(1,1)" begin
     model = build_arma11_graph()
     q = (0.0, 0.9, -0.2, log(0.15))
@@ -46,7 +57,7 @@ const ENZYME_BACKEND = AutoEnzyme(;
         @test density ≈ prior + log_jacobian + likelihood
     end
 
-    @testset "the log-density boundary differentiates (AD + finite differences)" begin
+    @testset "the log-density boundary differentiates through DI + Enzyme" begin
         k = prepare(model.graph;
                     have = (model.unconstrained, model.series),
                     want = (model.density,))
@@ -60,13 +71,10 @@ const ENZYME_BACKEND = AutoEnzyme(;
         @test gradient !== qvec
         @test pointer(gradient) != pointer(qvec)
 
-        fd = map(eachindex(qvec)) do i
-            h = 1e-6
-            up = copy(qvec); up[i] += h
-            dn = copy(qvec); dn[i] -= h
-            (logdensity(up) - logdensity(dn)) / (2h)
-        end
-        @test gradient ≈ fd rtol = 1e-4
+        @test logdensity(qvec) ≈ arma11_reference_logdensity(qvec)
+        reference_gradient = DifferentiationInterface.gradient(
+            arma11_reference_logdensity, ENZYME_BACKEND, qvec)
+        @test gradient ≈ reference_gradient
     end
 
     @testset "one-step forecast from a constrained boundary" begin

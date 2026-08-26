@@ -11,6 +11,26 @@ const ENZYME_BACKEND = AutoEnzyme(;
     function_annotation = Enzyme.Const,
 )
 
+function gaussian_mixture_reference_logdensity(qv)
+    μ₁, δ, log_σ₁, log_σ₂, logit_θ = qv
+    _, μ₂ = GaussianMixtureExample.ordered_means(μ₁, δ)
+    θ = GaussianMixtureExample.logistic(logit_θ)
+    parameters = MixtureParameters(μ₁, μ₂, exp(log_σ₁), exp(log_σ₂), θ)
+    prior = GaussianMixtureExample.log_prior(parameters)
+    likelihood = GaussianMixtureExample.sum_log_likelihood(
+        GaussianMixtureExample.pointwise_log_likelihood(
+            parameters, MIXTURE_OBSERVATIONS,
+        ),
+    )
+    GaussianMixtureExample.total_log_density(
+        prior,
+        GaussianMixtureExample.log_abs_det_jacobian(
+            δ, log_σ₁, log_σ₂, θ,
+        ),
+        likelihood,
+    )
+end
+
 @testset "manual PPL graph — Gaussian mixture (marginalization)" begin
     model = build_gaussian_mixture_graph()
     q = (-3.0, log(6.0), log(0.7), log(0.7), 0.0)
@@ -57,7 +77,7 @@ const ENZYME_BACKEND = AutoEnzyme(;
         @test pointwise[1] ≈ expected
     end
 
-    @testset "the log-density boundary differentiates (AD + finite differences)" begin
+    @testset "the log-density boundary differentiates through DI + Enzyme" begin
         k = prepare(model.graph;
                     have = (model.unconstrained, model.observations),
                     want = (model.density,))
@@ -71,13 +91,10 @@ const ENZYME_BACKEND = AutoEnzyme(;
         @test gradient !== qvec
         @test pointer(gradient) != pointer(qvec)
 
-        fd = map(eachindex(qvec)) do i
-            h = 1e-6
-            up = copy(qvec); up[i] += h
-            dn = copy(qvec); dn[i] -= h
-            (logdensity(up) - logdensity(dn)) / (2h)
-        end
-        @test gradient ≈ fd rtol = 1e-4
+        @test logdensity(qvec) ≈ gaussian_mixture_reference_logdensity(qvec)
+        reference_gradient = DifferentiationInterface.gradient(
+            gaussian_mixture_reference_logdensity, ENZYME_BACKEND, qvec)
+        @test gradient ≈ reference_gradient
     end
 
     @testset "responsibility generated quantity prunes density work" begin

@@ -15,6 +15,18 @@ const ENZYME_BACKEND = AutoEnzyme(;
     function_annotation = Enzyme.Const,
 )
 
+function linear_regression_reference_logdensity(qv)
+    α, β, log_σ = qv
+    parameters = LinearRegressionParameters(α, β, exp(log_σ))
+    prior = LinearRegressionExample.log_prior(parameters)
+    likelihood = LinearRegressionExample.sum_log_likelihood(
+        LinearRegressionExample.pointwise_log_likelihood(
+            parameters, LINREG_X, LINREG_Y,
+        ),
+    )
+    LinearRegressionExample.total_log_density(prior, log_σ, likelihood)
+end
+
 @testset "manual PPL graph — linear regression" begin
     model = build_linear_regression_graph()
     q = (1.0, 2.0, log(0.5))
@@ -59,7 +71,7 @@ const ENZYME_BACKEND = AutoEnzyme(;
         @test density ≈ prior + log_jacobian + likelihood
     end
 
-    @testset "the log-density boundary differentiates (AD + finite differences)" begin
+    @testset "the log-density boundary differentiates through DI + Enzyme" begin
         k = prepare(model.graph;
                     have = (model.unconstrained, model.predictors,
                             model.responses),
@@ -76,15 +88,10 @@ const ENZYME_BACKEND = AutoEnzyme(;
         @test gradient !== qvec
         @test pointer(gradient) != pointer(qvec)
 
-        # Independent correctness anchor: central finite differences, no second
-        # AD backend required.
-        fd = map(eachindex(qvec)) do i
-            h = 1e-6
-            up = copy(qvec); up[i] += h
-            dn = copy(qvec); dn[i] -= h
-            (logdensity(up) - logdensity(dn)) / (2h)
-        end
-        @test gradient ≈ fd rtol = 1e-4
+        @test logdensity(qvec) ≈ linear_regression_reference_logdensity(qvec)
+        reference_gradient = DifferentiationInterface.gradient(
+            linear_regression_reference_logdensity, ENZYME_BACKEND, qvec)
+        @test gradient ≈ reference_gradient
     end
 
     @testset "generated quantities prune density work" begin
