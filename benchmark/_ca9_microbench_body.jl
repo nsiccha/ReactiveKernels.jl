@@ -61,7 +61,8 @@ function _ca9_leapfrog(p)
     ReactiveHMC.leapfrog!(p; stepsize = 0.1)
     p.ham
 end
-_ca9_full(state) = (ReactiveHMC.step!(state); state.init.ham)   # step!-only, no reset
+# step!-only (no reset); returns the SAME accepted-position scalar as the RK arms.
+_ca9_full(state) = (ReactiveHMC.step!(state); state.init.pos[1])
 
 # --- RK compiled / oracle stage ops -------------------------------------------
 _c_ham(a) = a.group.fwd_ham
