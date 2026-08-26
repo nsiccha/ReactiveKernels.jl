@@ -8,9 +8,9 @@
 > **method-bearing `@kernel`** surface — a phase-point *endpoint* object with in-place
 > `leapfrog!` / `refresh_momentum!` methods, a composed `sampler`, and ordinary tree
 > recursion (ReactiveHMC-faithful, `@reactive` **removed**). That surface is **staged,
-> not yet canonical**: it is mid-implementation (syntax → poc → HMC). Its **reviewed
-> authoring fixture is shown below as a non-executable target** (compiler lowering in
-> progress); the legacy `@reactive` substrate that follows it is being replaced.
+> not yet canonical**: it is mid-implementation (syntax → poc → HMC), and its real
+> definitions + interaction will appear here — build-executed and drift-proof from the
+> landed fixture — once it lands. Nothing below is the final authoring surface.
 
 `ReactiveKernels` includes a multinomial No-U-Turn sampler. Its per-transition
 Hamiltonian work is *currently* a compiled reactive kernel — the **legacy substrate**
@@ -30,30 +30,6 @@ an **analytic** callable — so the *kernel*, not any differentiation machinery,
 visible content, and the timings isolate sampler overhead rather than the gradient. The
 complete runnable workflow, including the optional DI + Enzyme boundary, is
 [`examples/nuts.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/nuts.jl).
-
-## The reviewed `@kernel` authoring surface
-
-> [!IMPORTANT]
-> **Compiler lowering in progress / not executable production yet.** The definitions
-> below are the **reviewed** ReactiveHMC-shaped `@kernel` authoring surface (V7), sourced
-> **drift-proof** from `benchmark/nuts_kernel_authoring_fixture.jl` at reviewed commit
-> `5e8773b` and read from the file at build time. They **construct** (stateful skeletons
-> with retained raw bodies) but the effect-metadata / MethodIR lowering is
-> *intentionally absent*, so they do **not** execute or compile yet: there is
-> deliberately **no generated-kernel or Compute-DAG pane** and **no parity/performance
-> claim**. This is the authoring *shape* to review — not production code.
-
-This is the surface the sampler is being migrated onto: one `@kernel` macro, a shared
-`hamiltonian`, a phase-point `endpoint` object with in-place `leapfrog!` /
-`refresh_momentum!` segment methods, `dual_averaging` / `welford` / `sampling_stats`
-adaptation objects, and a composed `sampler` whose multinomial-NUTS `step!` is a faithful
-1:1 transcription of the ordinary-Julia oracle — **no `@reactive`**, and no
-`Graph`/`add!`/applier/`output_binding` plumbing. The consumer supplies
-`potential_gradient!(pos) -> value_gradient` (analytic or optional DI + Enzyme).
-
-```@eval
-Main.ReactiveKernelsDocs.render_authoring_fixture()
-```
 
 ## Current substrate (legacy `@reactive` group — being replaced)
 
