@@ -17,14 +17,21 @@ written into the sampler's owned buffer in place. The complete runnable workflow
 
 ## The five compiled reactive programs
 
-Each panel below is a **build-executed** public constructor. **Raw input** is its
-exact source plus the value read through a live getter after executing it;
-**Generated kernel** is the real `code_expr` of a selected load-bearing getter of
-the actual `reactive_program` (a fused derived getter where the program has derived
-nodes, a source-slot getter for a state-only program); **Compute DAG** is that same
-`program.plan`, whose interactive graph carries the *complete* recipe inventory.
-Choose **Compare all** to inspect the three views side by side while preserving the
-DAG's fit, zoom, pan, and node-inspection state.
+Each panel below shows the **actual kernel**, not an opaque constructor call.
+**Raw input** leads with the *real `@reactive` authoring* of the kernel — the exact
+recipe math (and, for the adaptation kernels, the inner `fit!`/`step!` update method)
+read straight out of `src/reactive_nuts.jl` — followed by how you **construct and
+interact** with it (build it, then read a getter or run its update method) and the
+value that read returns. **Generated kernel** is the real `code_expr` of a selected
+load-bearing getter of the actual `reactive_program` (a fused derived getter where
+the program has derived nodes, a source-slot getter for a state-only program);
+**Compute DAG** is that same `program.plan`, whose interactive graph carries the
+*complete* recipe inventory. Choose **Compare all** to inspect the three views side
+by side while preserving the DAG's fit, zoom, pan, and node-inspection state.
+
+So you can read the authoring syntax and the interaction directly — the definitions
+are the actual source, the getters/update methods are exactly how you drive them —
+and give feedback on the API without opening any implementation file.
 
 The docs build asserts a mechanical one-to-one coverage gate: exactly these five
 programs, each artifact's program/DAG/getter tied to the live

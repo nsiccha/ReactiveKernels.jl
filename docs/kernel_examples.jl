@@ -224,6 +224,20 @@ _artifact_object(object) =
     object isa ReactiveKernels.ReactiveObject ? object : getfield(object, :object)
 _artifact_handles(object) = getfield(_artifact_object(object), :handles)
 
+# Drift-proof: read the ACTUAL `@reactive ... needle(...) = begin … end` authoring
+# block out of a source file, so the docs show the real kernel definition (the
+# recipe math + update methods) rather than an opaque constructor call. Captures
+# from the `@reactive` line carrying `needle` through the first column-0 `end`.
+const _REACTIVE_NUTS_SRC = joinpath(dirname(@__DIR__), "src", "reactive_nuts.jl")
+function read_reactive_block(file::AbstractString, needle::AbstractString)
+    lines = readlines(file)
+    start = findfirst(l -> occursin("@reactive", l) && occursin(needle, l), lines)
+    start === nothing && error("no @reactive block for $(needle) in $(file)")
+    stop = findnext(l -> rstrip(l) == "end", lines, start + 1)
+    stop === nothing && error("unterminated @reactive block for $(needle)")
+    join(lines[start:stop], "\n")
+end
+
 # The live value read through a getter (source or derived) of the executed object.
 # `invokelatest` because the displayed source may have defined fresh recipe methods
 # (e.g. the DI+Enzyme potential_gradient!) into the page sandbox in a newer world.
@@ -259,11 +273,11 @@ adaptation/statistics update methods) so no fake DAG is invented for it.
 """
 function program_artifact(name::Symbol, origin::AbstractString,
                           source::AbstractString, object, getter::Symbol;
-                          note::AbstractString = "")
+                          note::AbstractString = "", definition::AbstractString = "")
     program = reactive_program(object)
     handles = _artifact_handles(object)
     handle = getproperty(handles, getter)
-    (; name, origin, source, object, program, getter,
+    (; name, origin, source, object, program, getter, definition,
        getter_is_source = _is_source(program, handle),
        generated = code_expr(program, handle),
        output = _getter_value(object, getter),   # executed value read via the live getter
@@ -309,7 +323,13 @@ function render_program_examples(artifacts)
             "the pane shows the generated FUSED getter for the derived node " *
             "`$(artifact.getter)` — one straight-line function, no graph traversal " *
             "($(artifact.note))"
-        source = string("# Origin: ", artifact.origin, "\n", artifact.source, "\n\n",
+        defblock = isempty(artifact.definition) ? "" : string(
+            "# ─── The kernel definition — the ACTUAL @reactive authoring in\n",
+            "#     src/reactive_nuts.jl (the recipe math + any update method) ───\n",
+            artifact.definition, "\n\n",
+            "# ─── How you construct it and interact with it ───\n")
+        source = string(defblock,
+                        "# Origin: ", artifact.origin, "\n", artifact.source, "\n\n",
                         "# Actual output — ", artifact.getter, " (read through the ",
                         "live getter after executing the above)\n",
                         _plain_repr(artifact.output))
@@ -406,6 +426,7 @@ end
 const _FIVE_PROGRAM_SNIPPETS = (
     (name = :nuts_group,
      origin = "reactive_nuts_group (build executed)",
+     def_needle = "_reactive_nuts_group_object",
      getter = :dham,
      note = "the transition recursion, RNG draws, U-turn criteria, leapfrog, and " *
             "tree/proposal scratch are ordinary inferred Julia over these handles",
@@ -426,6 +447,7 @@ object = reactive_nuts_group(potential_gradient!,
     Matrix{Float64}(I, dimension, dimension), zeros(dimension), zeros(dimension))"""),
     (name = :dual_averaging,
      origin = "dual_averaging_state (build executed)",
+     def_needle = "_dual_averaging_object",
      getter = :current,
      note = "fit! is an ordinary method advancing the accumulator sources",
      source = raw"""
@@ -434,6 +456,7 @@ fit!(object, 0.9)          # ordinary method: advance the accumulator sources
 fit!(object, 0.72)"""),
     (name = :welford_variance,
      origin = "welford_var (build executed)",
+     def_needle = "_welford_object",
      getter = :var,
      note = "step! folds observations into the n/mean/var sources in place",
      source = raw"""
@@ -443,6 +466,7 @@ step!(object, [0.5, -1.0, 2.0, 0.25])   # ordinary in-place source update
 step!(object, [1.5, -0.5, 1.0, 0.75])"""),
     (name = :trajectory_stats,
      origin = "trajectory_stats (build executed)",
+     def_needle = "_trajectory_object",
      getter = :pots,
      note = "the recorder callback and positions/gradients VIEWS are ordinary " *
             "methods; the history/index buffers are its HAVE sources",
@@ -451,6 +475,7 @@ dimension = 4
 object = trajectory_stats(dimension)"""),
     (name = :sampling_stats,
      origin = "sampling_stats (build executed)",
+     def_needle = "_sampling_object",
      getter = :draws,
      note = "the per-transition callback appends to its HAVE sources; the reduced " *
             "views are ordinary methods",
@@ -511,7 +536,9 @@ function render_five_programs(mod::Module)
         object = Core.eval(mod, :object)               # the live object from that source
         push!(artifacts, program_artifact(snippet.name, snippet.origin,
                                           snippet.source, object, snippet.getter;
-                                          note = snippet.note))
+                                          note = snippet.note,
+                                          definition = read_reactive_block(
+                                              _REACTIVE_NUTS_SRC, snippet.def_needle)))
     end
     assert_program_coverage(artifacts, _FIVE_PROGRAM_INVENTORY)
     render_program_examples(artifacts)
