@@ -841,4 +841,24 @@ function render_build_commit()
     ]))
 end
 
+# The reviewed `@kernel` NUTS authoring fixture (V7), shown as a NON-EXECUTABLE target.
+# Read DRIFT-PROOF from the repo file at build time — NOT executed, NO generated/DAG
+# pane, no parity/perf claim (the stateful `@kernel` lowering is mid-implementation, so
+# it constructs but does not compile). Sourced from the reviewed fixture at 5e8773b.
+const _AUTHORING_FIXTURE_PATH =
+    joinpath(dirname(@__DIR__), "benchmark", "nuts_kernel_authoring_fixture.jl")
+
+"""
+    render_authoring_fixture() -> Markdown.MD
+
+Render the reviewed `@kernel` NUTS authoring fixture as a plain code block, read
+drift-proof from `benchmark/nuts_kernel_authoring_fixture.jl` at build time. It is
+NOT executed and no generated-kernel/DAG pane is produced — this is the illustrative
+reviewed target surface (compiler lowering in progress), not build-executed code.
+"""
+function render_authoring_fixture()
+    src = read(_AUTHORING_FIXTURE_PATH, String)
+    Markdown.MD(Any[Markdown.Code("julia", rstrip(src))])
+end
+
 end # module ReactiveKernelsDocs
