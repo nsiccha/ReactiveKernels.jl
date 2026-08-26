@@ -1,10 +1,12 @@
 [deps]
 BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
+DifferentiationInterface = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
 DocumenterVitepress = "4710194d-e776-4893-9690-8d956a29c365"
 Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
-ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
+Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+LogExpFunctions = "2ab3a3ac-af41-5b50-aa03-7779005ae688"
 ReactiveKernels = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
 
 [sources.ReactiveKernels]

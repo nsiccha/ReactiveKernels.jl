@@ -1,0 +1,140 @@
+# Declarative PPL kernel: Poisson-Gamma
+
+`ReactiveKernels` has no built-in probabilistic-programming semantics. Like the
+[eight-schools example](eight-schools.md), this one assembles those semantics
+manually from ordinary pure Julia recipes, while leaving the graph planner
+responsible only for selecting the computation required by a particular
+`have`/`want` query.
+
+The complete runnable source is
+[`examples/poisson_gamma.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/poisson_gamma.jl).
+It implements a shared-rate count model
+
+```math
+\begin{aligned}
+\lambda &\sim \operatorname{Gamma}(2, 1), \\
+y_i &\sim \operatorname{Poisson}(\lambda),
+\end{aligned}
+```
+
+where several event counts share one Poisson rate `λ` (with the Gamma prior
+parameterized by shape `2` and rate `1`).
+
+The single unconstrained coordinate is `log_rate`. The support transform is
+`λ = exp(log_rate)`, so the optional log absolute Jacobian determinant is
+`log_rate`.
+
+```text
+log_rate ──► λ = exp(log_rate) ──► constrained parameters
+   │               │
+   │               ├─► log prior
+   │               ├─► pointwise log likelihood ─► log likelihood
+   │               └─► expected count (generated quantity)
+   └─ log_rate ──► log Jacobian
+
+log prior + log Jacobian + log likelihood ──► unconstrained log density
+```
+
+The important part is that these remain separate named ports. The compact block
+below is the authored model, executed verbatim while the documentation is built.
+Pointwise terms are a first-class port, so returning them together with the
+scalar density shares the likelihood computation rather than repeating it.
+
+The panel below is one coherent, build-executed artifact. **Raw input** is the
+exact source that builds and runs the query, **Generated kernel** is
+`code_expr(density_kernel)` from that execution, and **Compute DAG** is the live
+colored `visualize(density_plan)` component.
+
+```@eval
+Main.ReactiveKernelsDocs.execute_example(@__MODULE__, raw"""
+@kernel model(log_rate::Real,
+              counts::CountVector,
+              exposure::Real) = begin
+    rate::Real = PoissonGammaExample.positive_rate(log_rate)
+    parameters::PoissonGammaParameters =
+        PoissonGammaExample.assemble_parameters(rate)
+    log_jacobian::Real = PoissonGammaExample.log_abs_det_jacobian(log_rate)
+
+    prior::Real = PoissonGammaExample.log_prior(parameters)
+    pointwise::NTuple{6,Real} = PoissonGammaExample.pointwise_log_likelihood(
+        parameters, counts,
+    )
+    likelihood::Real = PoissonGammaExample.sum_log_likelihood(pointwise)
+    density::Real = PoissonGammaExample.total_log_density(
+        prior, log_jacobian, likelihood,
+    )
+    expected::Real = PoissonGammaExample.expected_count(parameters, exposure)
+    return density
+end
+
+log_rate = log(3.5)
+counts = POISSON_COUNTS
+
+density_kernel = prepare(model;
+    have = (:log_rate, :counts),
+    want = (:prior, :log_jacobian, :pointwise, :likelihood, :density))
+
+output = density_kernel(log_rate, counts)
+prior, logjac, pointwise, likelihood, density = output
+@assert likelihood ≈ sum(pointwise)
+@assert density ≈ prior + logjac + likelihood
+
+docs_example = (;
+    name = :poisson_gamma_density,
+    origin = "compact @kernel model (build executed)",
+    inputs = (; log_rate, counts),
+    kernel = density_kernel,
+    output,
+)
+"""; setup = Main.ReactiveKernelsDocs.setup_poisson_gamma!)
+```
+
+Asking only for constrained parameters selects just the exponential transform
+and assembly recipes; the Jacobian and every density recipe disappear:
+
+```julia
+constrain_kernel = prepare(model;
+    have = :log_rate,
+    want = :parameters)
+parameters = constrain_kernel(log_rate)
+```
+
+The numeric graph ports are typed at a `Real` boundary, while the constrained
+rate retains its concrete scalar type. The prepared density kernel therefore
+specializes on ordinary `Float64` inputs and also differentiates cleanly through
+reverse-mode AD (`DifferentiationInterface` with the Enzyme backend):
+
+```julia
+using DifferentiationInterface
+import Enzyme
+
+enzyme_backend = AutoEnzyme(;
+    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
+    function_annotation = Enzyme.Const,
+)
+
+density_only = prepare(model;
+    have = (:log_rate, :counts),
+    want = :density)
+logdensity(qv) = density_only(only(qv), counts)
+gradient = DifferentiationInterface.gradient(logdensity, enzyme_backend, [log_rate])
+```
+
+Generated quantities can start at an already-constrained boundary. Here the
+expected number of events over a future window is a deterministic function of
+the rate, so planning removes the transform, Jacobian, prior, likelihood, and
+total-density recipes:
+
+```julia
+generated_kernel = prepare(model;
+    have = (:parameters, :exposure),
+    want = :expected)
+
+expected = generated_kernel(parameters, 4.0)
+```
+
+Run the walkthrough from the repository root:
+
+```sh
+julia --project=. examples/poisson_gamma.jl
+```

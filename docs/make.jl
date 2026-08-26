@@ -2,6 +2,7 @@ using Documenter, DocumenterVitepress, ReactiveKernels
 
 include("kernel_examples.jl")
 include(joinpath(@__DIR__, "..", "examples", "distributions.jl"))
+include(joinpath(@__DIR__, "..", "examples", "batched.jl"))
 
 makedocs(
     sitename = "ReactiveKernels.jl",
@@ -13,12 +14,26 @@ makedocs(
     ),
     pages = [
         "Home" => "index.md",
+        "Building blocks" => [
+            "Distribution log densities" => "distributions.md",
+            "Batched log densities" => "batched.md",
+            "Non-allocating kernels" => "nonallocating.md",
+        ],
+        "Probabilistic programming" => [
+            "Eight schools" => "eight-schools.md",
+            "Linear regression" => "linear-regression.md",
+            "Beta-binomial" => "beta-binomial.md",
+            "Poisson-Gamma" => "poisson-gamma.md",
+            "Dugongs (nonlinear growth)" => "dugongs-growth.md",
+            "ARMA(1,1) time series" => "arma11.md",
+            "Gaussian mixture" => "gaussian-mixture.md",
+        ],
+        "Sampling" => [
+            "NUTS sampling" => "nuts.md",
+            "Fused NUTS authoring" => "nuts-architecture.md",
+            "Online statistics" => "online-stats.md",
+        ],
         "Visualization" => "visualization.md",
-        "Distribution log densities" => "distributions.md",
-        "Eight schools" => "eight-schools.md",
-        "NUTS sampling" => "nuts.md",
-        "Online statistics" => "online-stats.md",
-        "Non-allocating kernels" => "nonallocating.md",
         "API"  => "api.md",
     ],
     checkdocs = :none,

@@ -1,36 +1,42 @@
+# Runnable NUTS workflow. DifferentiationInterface and Enzyme are OPTIONAL extras —
+# ReactiveKernels does not hard-depend on any AD backend — so run this under an
+# environment that provides them (e.g. `julia --project=docs examples/nuts.jl`, or a
+# project with DifferentiationInterface + Enzyme added), NOT the bare package env.
 using LinearAlgebra
 using Random
 using ReactiveKernels
+using DifferentiationInterface
+import Enzyme
 
-# A complete graph-backed NUTS workflow. The Hamiltonian phase point owns an
-# inspectable ReactiveProgram: integrator mutations of `pos` and `mom`
-# invalidate the dependent fields, and generated getters recompute them lazily.
+# A complete graph-backed NUTS workflow on the flat compiled-reactive sampler.
+# `reactive_nuts_group` compiles the init/fwd/bwd Hamiltonian plus the reactive
+# active-endpoint selection, energy error `dham`, and `diverged` flag into ONE
+# `ReactiveProgram`; `nuts_state` returns a `CompiledNUTSState` whose transition
+# runs on that program. The public model boundary is a SCALAR potential; its
+# gradient is DifferentiationInterface + reverse-mode Enzyme, prepared once and
+# written into the sampler's owned gradient buffer in place — no handwritten
+# gradient callback on the sampled path.
+const ENZYME_BACKEND = AutoEnzyme(;
+    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
+    function_annotation = Enzyme.Const,
+)
+
 potential(position) = sum(abs2, position) / 2
-potential_gradient(position) = (potential(position), copy(position))
 
-@kernel model(pos::Vector{Float64}, mom::Vector{Float64},
-              metric::Matrix{Float64}) = begin
-    chol_metric::Cholesky{Float64,Matrix{Float64}} = cholesky(metric)
-    pot::Float64 = potential(pos)
-    (pot, dpot_dpos::Vector{Float64}) = potential_gradient(pos)
-    (kin::Float64, dham_dmom::Vector{Float64}) = begin
-        velocity = chol_metric \ mom
-        (0.5 * (logdet(chol_metric) + dot(mom, velocity)), velocity)
-    end
-    ham::Float64 = pot + kin
-    dham_dpos::Vector{Float64} = dpot_dpos
-end
-
-rng = Xoshiro(20260825)
 dimension = 4
-point = euclidean_phasepoint(model, (
-    pos = zeros(dimension),
-    mom = zeros(dimension),
-    metric = Matrix{Float64}(I, dimension, dimension),
-))
+gradient_preparation = prepare_gradient(potential, ENZYME_BACKEND, zeros(dimension))
+potential_gradient!(gradient, position) = first(value_and_gradient!(
+    potential, gradient, gradient_preparation, ENZYME_BACKEND, position))
+
+group = reactive_nuts_group(
+    potential_gradient!,
+    Matrix{Float64}(I, dimension, dimension),
+    zeros(dimension),
+    zeros(dimension),
+)
 sampler = nuts_state(
-    point;
-    rng,
+    group;
+    rng = Xoshiro(20260825),
     step_f = partial(leapfrog!; stepsize = 0.35),
     max_depth = 7,
 )
@@ -40,10 +46,15 @@ means = vec(sum(chain.samples; dims = 2)) ./ size(chain.samples, 2)
 variances = vec(sum(abs2, chain.samples .- means; dims = 2)) ./
     (size(chain.samples, 2) - 1)
 
+println("compiled sampler type: ", typeof(sampler).name.name)
+# Introspect the ACTUAL compiled ReactiveProgram behind the group: its plan is the
+# Compute DAG, and code_expr(program, handle) is the generated getter for any
+# reachable derived node (here the reactive energy error `dham`).
+program = reactive_program(group)
 println("selected plan:")
-println(explain(plan(point)))
-println("generated Hamiltonian getter:")
-println(code_expr(point, :ham))
+println(explain(program.plan))
+println("generated reactive energy-error (dham) getter:")
+println(code_expr(program, getproperty(group.handles, :dham)))
 println("sample mean: ", means)
 println("sample variance: ", variances)
 println("divergences: ", count(stat -> stat.diverged, chain.diagnostics))

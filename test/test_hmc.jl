@@ -1,13 +1,33 @@
-using ForwardDiff
+using DifferentiationInterface
+import Enzyme
 using LinearAlgebra
 using Random
 using ReactiveKernels
 using Statistics
 using Test
 
+# Reverse-mode Enzyme through DifferentiationInterface for the eight-schools NUTS
+# gradient. Runtime activity is enabled because the prepared density kernel closes
+# over constant model data (observations and scales) that Enzyme's static activity
+# analysis cannot prove non-differentiable; the closure (which captures the
+# prepared kernel) is annotated `Const` because only the numeric position is
+# differentiated, never the kernel itself.
+const _HMC_ENZYME_BACKEND = AutoEnzyme(;
+    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
+    function_annotation = Enzyme.Const,
+)
+
 _gaussian_potential(position) = sum(abs2, position) / 2
+# Analytic (value, gradient) callback — oracle/parity fixtures only.
 _gaussian_gradient(position) =
     (_gaussian_potential(position), copy(position))
+# Public compiled-group boundary: DI+Enzyme gradient prepared ONCE, filled into
+# the passed owned buffer in place. This is the sampler's runtime gradient path.
+const _HMC_GAUSSIAN_PREP =
+    prepare_gradient(_gaussian_potential, _HMC_ENZYME_BACKEND, zeros(2))
+_gaussian_gradient!(gradient, position) = first(value_and_gradient!(
+    _gaussian_potential, gradient, _HMC_GAUSSIAN_PREP,
+    _HMC_ENZYME_BACKEND, position))
 _phase_hamiltonian(point) = point.ham
 
 function _phasepoint_receipt(point)
@@ -148,7 +168,7 @@ end
     )
     stepper = partial(leapfrog!; stepsize = 0.25)
     @test stepper.stepsize == 0.25
-    state = nuts_state(
+    state = ReactiveKernels._oracle_nuts_state(
         point;
         rng = Xoshiro(42),
         step_f = stepper,
@@ -172,15 +192,10 @@ end
 end
 
 function _gaussian_chain(seed; draws = 600, warmup = 200)
-    point = euclidean_phasepoint(
-        _gaussian_potential,
-        _gaussian_gradient,
-        Diagonal(ones(2)),
-        zeros(2),
-        zeros(2),
-    )
+    group = reactive_nuts_group(
+        _gaussian_gradient!, Diagonal(ones(2)), zeros(2), zeros(2))
     state = nuts_state(
-        point;
+        group;
         rng = Xoshiro(seed),
         step_f = partial(leapfrog!; stepsize = 0.35),
         max_depth = 7,
@@ -204,7 +219,7 @@ end
         length(first_chain.diagnostics)
 end
 
-@testset "eight-schools graph and ForwardDiff inside NUTS" begin
+@testset "eight-schools graph and DI+Enzyme inside NUTS" begin
     if !isdefined(Main, :EightSchoolsExample)
         include(joinpath(@__DIR__, "..", "examples", "eight_schools.jl"))
     end
@@ -229,23 +244,26 @@ end
         potential_calls[] += 1
         -logdensity(position)
     end
-    potential_gradient(position) = begin
-        gradient_calls[] += 1
-        value = logdensity(position)
-        (-value, -ForwardDiff.gradient(logdensity, position))
-    end
-
+    # Public compiled-group boundary: differentiate the scalar potential
+    # (= -logdensity) with DI+Enzyme prepared ONCE, filling the passed owned
+    # gradient buffer in place. No handwritten or allocating sampled gradient.
+    # `potential_scalar` intentionally does NOT touch potential_calls — the
+    # separate potential-only closure above must stay uncalled in NUTS (== 0).
+    potential_scalar(position) = -logdensity(position)
     initial = zeros(10)
     initial[2] = log(5.0)
-    point = euclidean_phasepoint(
-        potential,
-        potential_gradient,
-        Diagonal(ones(10)),
-        initial,
-        zeros(10),
-    )
+    gradient_preparation =
+        prepare_gradient(potential_scalar, _HMC_ENZYME_BACKEND, copy(initial))
+    potential_gradient!(gradient, position) = begin
+        gradient_calls[] += 1
+        first(value_and_gradient!(potential_scalar, gradient,
+                                  gradient_preparation, _HMC_ENZYME_BACKEND,
+                                  position))
+    end
+    group = reactive_nuts_group(
+        potential_gradient!, Diagonal(ones(10)), initial, zeros(10))
     state = nuts_state(
-        point;
+        group;
         rng = Xoshiro(8008),
         step_f = partial(leapfrog!; stepsize = 0.03),
         max_depth = 6,
@@ -288,16 +306,11 @@ end
     @test variance.mean == [2.0, 4.0]
     @test variance.var ≈ [2 / 3, 8 / 3]
 
-    point = euclidean_phasepoint(
-        _gaussian_potential,
-        _gaussian_gradient,
-        Diagonal(ones(2)),
-        [0.1, -0.2],
-        [0.3, -0.4],
-    )
+    group = reactive_nuts_group(
+        _gaussian_gradient!, Diagonal(ones(2)), [0.1, -0.2], [0.3, -0.4])
     trajectory = trajectory_stats(2)
     state = nuts_state(
-        point;
+        group;
         rng = Xoshiro(42),
         step_f = partial(leapfrog!; stepsize = 0.25),
         stats_f = trajectory,
@@ -323,17 +336,15 @@ end
     scales = [0.25, 4.0]
     anisotropic_potential(position) =
         sum(abs2(position[index]) / scales[index] for index in eachindex(position)) / 2
-    anisotropic_gradient(position) =
-        (anisotropic_potential(position), position ./ scales)
-    adapted_point = euclidean_phasepoint(
-        anisotropic_potential,
-        anisotropic_gradient,
-        Diagonal(ones(2)),
-        zeros(2),
-        zeros(2),
-    )
+    anisotropic_preparation =
+        prepare_gradient(anisotropic_potential, _HMC_ENZYME_BACKEND, zeros(2))
+    anisotropic_gradient!(gradient, position) = first(value_and_gradient!(
+        anisotropic_potential, gradient, anisotropic_preparation,
+        _HMC_ENZYME_BACKEND, position))
+    adapted_group = reactive_nuts_group(
+        anisotropic_gradient!, Diagonal(ones(2)), zeros(2), zeros(2))
     adapted_state = nuts_state(
-        adapted_point;
+        adapted_group;
         rng = Xoshiro(20260825),
         step_f = partial(leapfrog!; stepsize = 1.0),
         max_depth = 7,
@@ -365,10 +376,8 @@ end
     @test all(abs.(adapted_variances ./ scales .- 1) .< 0.4)
 
     short_state = nuts_state(
-        euclidean_phasepoint(
-            _gaussian_potential, _gaussian_gradient, Diagonal(ones(2)),
-            zeros(2), zeros(2),
-        );
+        reactive_nuts_group(
+            _gaussian_gradient!, Diagonal(ones(2)), zeros(2), zeros(2));
         rng = Xoshiro(7),
         step_f = partial(leapfrog!; stepsize = 0.5),
         max_depth = 4,

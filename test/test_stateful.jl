@@ -330,3 +330,180 @@ end
     @test get!(replay, location_state) == 5.0
     @test get!(replay, centered_state) == 35.0
 end
+
+@testset "copy_group! grouped HAVE-boundary copy" begin
+    # Two-particle graph: sources a_pos, b_pos, r_pos, t_pos (Vector) and a
+    # scalar source s_flag; derived a_cost, b_cost, r_cost, delta = a_cost-b_cost.
+    calls = (a = Ref(0), b = Ref(0), r = Ref(0), delta = Ref(0))
+    graph = Graph()
+    a_pos = value!(graph, :a_pos, Vector{Float64})
+    b_pos = value!(graph, :b_pos, Vector{Float64})
+    r_pos = value!(graph, :r_pos, Vector{Float64})
+    t_pos = value!(graph, :t_pos, Vector{Float64})
+    a_cost = value!(graph, :a_cost, Float64)
+    b_cost = value!(graph, :b_cost, Float64)
+    r_cost = value!(graph, :r_cost, Float64)
+    delta = value!(graph, :delta, Float64)
+    add!(graph, a_pos => a_cost, x -> (calls.a[] += 1; sum(abs2, x)))
+    add!(graph, b_pos => b_cost, x -> (calls.b[] += 1; sum(abs2, x)))
+    add!(graph, r_pos => r_cost, x -> (calls.r[] += 1; sum(abs2, x)))
+    add!(graph, (a_cost, b_cost) => delta,
+         (a, b) -> (calls.delta[] += 1; a - b))
+
+    program = prepare_reactive(graph;
+        have = (a_pos, b_pos, r_pos, t_pos),
+        want = (a_cost, b_cost, r_cost, delta))
+    A = [1.0, 0.0]; B = [0.0, 2.0]; R = [3.0, 4.0]
+    state = program(copy(A), copy(B), copy(R), zeros(2))
+    ha = statevalue(program, a_pos); hb = statevalue(program, b_pos)
+    hr = statevalue(program, r_pos); ht = statevalue(program, t_pos)
+    hac = statevalue(program, a_cost); hbc = statevalue(program, b_cost)
+    hd = statevalue(program, delta)
+
+    @test get!(state, hd) == 1.0 - 4.0
+    @test (calls.a[], calls.b[], calls.delta[]) == (1, 1, 1)
+
+    # multi-subscriber / two-particle: touching b invalidates only {b_cost, delta}
+    set!(state, hb, [1.0, 1.0])
+    @test get!(state, hd) == 1.0 - 2.0
+    @test calls.a[] == 1              # a_cost NOT recomputed
+    @test (calls.b[], calls.delta[]) == (2, 2)
+
+    # copy_group! array group a_pos <- r_pos: in-place, invalidates a_cost + delta
+    copy_group!(state, (ha,), (hr,))
+    @test get!(state, hac) == sum(abs2, R)
+    @test get!(state, hd) == sum(abs2, R) - 2.0
+    @test calls.a[] == 2
+
+    # 0-alloc for a homogeneous array group, measured behind a function barrier
+    # so global-scope boxing does not contaminate the allocation count.
+    _cg_alloc(st, dh, sh) = (copy_group!(st, dh, sh); @allocated copy_group!(st, dh, sh))
+    @test _cg_alloc(state, (ha,), (hr,)) == 0
+
+    # swap via temp: a <-> b (multi-slot group in one call also exercised)
+    a_before = get!(state, hac); b_before = get!(state, hbc)
+    copy_group!(state, (ht,), (ha,))
+    copy_group!(state, (ha,), (hb,))
+    copy_group!(state, (hb,), (ht,))
+    @test get!(state, hac) == b_before
+    @test get!(state, hbc) == a_before
+
+    # copy / detached copy: mutating the original must not touch the copy
+    snapshot = copy(state)
+    hd_val = get!(snapshot, hd)
+    set!(state, ha, [9.0, 9.0])
+    @test get!(state, hac) == sum(abs2, [9.0, 9.0])
+    @test get!(snapshot, hd) == hd_val          # copy independent
+    @test snapshot.program === state.program     # program shared (no cloned deps)
+
+    # destinations must be HAVE sources
+    @test_throws ArgumentError copy_group!(state, (hac,), (hr,))
+    @test_throws DimensionMismatch copy_group!(state, (ha, hb), (hr,))
+end
+
+@testset "copy_group! multi-slot, mixed scalar/array, aliasing" begin
+    graph = Graph()
+    v1 = value!(graph, :v1, Vector{Float64})
+    v2 = value!(graph, :v2, Vector{Float64})
+    vt = value!(graph, :vt, Vector{Float64})   # spare temp group for swap-via-temp
+    s1 = value!(graph, :s1, Float64)
+    s2 = value!(graph, :s2, Float64)
+    total = value!(graph, :total, Float64)
+    # vt is a consumed dependency (so it owns a slot) but does not affect total.
+    add!(graph, (v1, v2, vt, s1, s2) => total,
+         (a, b, _t, c, d) -> sum(a) + sum(b) + c + d)
+    program = prepare_reactive(graph; have = (v1, v2, vt, s1, s2), want = (total,))
+    state = program([1.0], [2.0], [0.0], 10.0, 20.0)
+    hv1 = statevalue(program, v1); hv2 = statevalue(program, v2)
+    hvt = statevalue(program, vt)
+    hs1 = statevalue(program, s1); hs2 = statevalue(program, s2)
+    htot = statevalue(program, total)
+    @test get!(state, htot) == 1.0 + 2.0 + 10.0 + 20.0
+
+    # genuine TWO-slot array group in a single call
+    set!(state, hv1, [7.0]); set!(state, hv2, [9.0])
+    copy_group!(state, (hv1, hv2), (hv2, hv1))  # aliasing: NOT a swap (order-dependent)
+    @test get!(state, hv1) == [9.0]             # v2 copied into v1 first
+    @test get!(state, hv2) == [9.0]             # then v1 (already 9) into v2
+
+    # correct swap via a temporary group, entirely through copy_group! (t<-a, a<-b,
+    # b<-t) — the allocation-free idiom the sampler uses for endpoint/proposal swaps.
+    set!(state, hv1, [7.0]); set!(state, hv2, [9.0])
+    function _swap_via_temp!(st, a, b, t)
+        copy_group!(st, (t,), (a,))
+        copy_group!(st, (a,), (b,))
+        copy_group!(st, (b,), (t,))
+    end
+    _swap_via_temp!(state, hv1, hv2, hvt)          # warmup for the alloc measure
+    set!(state, hv1, [7.0]); set!(state, hv2, [9.0])
+    _swap_via_temp!(state, hv1, hv2, hvt)
+    @test get!(state, hv1) == [9.0]                # a now holds original b
+    @test get!(state, hv2) == [7.0]                # b now holds original a
+    _swap_alloc(st, a, b, t) = @allocated _swap_via_temp!(st, a, b, t)
+    @test _swap_alloc(state, hv1, hv2, hvt) == 0    # three-call swap is 0 B
+
+    # MIXED scalar + array group in one call: array in-place, scalar set!
+    set!(state, hv1, [1.0]); set!(state, hs1, 100.0)
+    copy_group!(state, (hv1, hs1), (hv2, hs2))  # (array, scalar) <- (array, scalar)
+    @test get!(state, hv1) == get!(state, hv2)
+    @test get!(state, hs1) == get!(state, hs2)
+    @test get!(state, htot) == 2*sum(get!(state,hv2)) + 2*get!(state,hs2)
+
+    # type stability of the grouped copy
+    @test (@inferred copy_group!(state, (hv1, hs1), (hv2, hs2))) === state
+
+    # 0-alloc for a genuine two-slot homogeneous array group (function barrier)
+    _cg2(st, dh, sh) = (copy_group!(st, dh, sh); @allocated copy_group!(st, dh, sh))
+    @test _cg2(state, (hv1, hv2), (hv2, hv2)) == 0
+end
+
+@testset "assign! direct-slot override (internal facade primitive)" begin
+    graph = Graph()
+    a = value!(graph, :a, Float64)
+    b = value!(graph, :b, Float64)
+    c = value!(graph, :c, Float64)
+    bcalls = Ref(0)
+    add!(graph, a => b, x -> (bcalls[] += 1; x + 10))
+    add!(graph, b => c, x -> x * 2)
+    program = prepare_reactive(graph; have = (a,), want = (b, c))
+    st = program(5.0)
+    ha = statevalue(program, a); hb = statevalue(program, b); hc = statevalue(program, c)
+    @test get!(st, hb) == 15.0 && get!(st, hc) == 30.0
+    @test bcalls[] == 1
+
+    # override a DERIVED slot: get! returns it with no recompute; downstream recomputes
+    ReactiveKernels.assign!(st, hb, 100.0)
+    @test get!(st, hb) == 100.0
+    @test bcalls[] == 1                     # recipe NOT re-run for the override
+    @test get!(st, hc) == 200.0             # downstream recomputed from the override
+
+    # a later true-upstream change invalidates the override -> recompute from recipe
+    set!(st, ha, 7.0)
+    @test get!(st, hb) == 17.0
+    @test bcalls[] == 2
+    @test get!(st, hc) == 34.0
+
+    # on a HAVE source assign! == set!
+    ReactiveKernels.assign!(st, ha, 1.0)
+    @test get!(st, hb) == 11.0
+
+    # a frozen slot is rejected; frozen bit is never changed
+    freeze!(st, hb)
+    @test_throws ArgumentError ReactiveKernels.assign!(st, hb, 0.0)
+    @test st.frozen[ReactiveKernels._slot_index(hb)]
+    unfreeze!(st, hb)
+
+    # in-place form on an array derived slot, buffer reused
+    g2 = Graph()
+    s = value!(g2, :s, Vector{Float64}); d = value!(g2, :d, Vector{Float64})
+    add!(g2, s => d, x -> 2 .* x)
+    p2 = prepare_reactive(g2; have = (s,), want = (d,))
+    st2 = p2([1.0, 2.0]); hd = statevalue(p2, d)
+    @test get!(st2, hd) == [2.0, 4.0]
+    buf0 = get!(st2, hd)
+    ReactiveKernels.assign!(st2, hd) do buf
+        buf .= 99.0
+    end
+    @test get!(st2, hd) == [99.0, 99.0]
+    @test get!(st2, hd) === buf0            # reused the same buffer
+end

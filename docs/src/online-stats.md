@@ -3,9 +3,15 @@
 Online mean and variance are a compact example of the boundary between pure
 state transitions and reactive orchestration. A `MomentsAccumulator{T}` stores
 only `(n, mean, m2)`. Welford's update consumes one observation, while Chan's
-parallel formula combines independently processed partitions. Both operations
-return new immutable values, so they are ordinary pure recipes rather than
-hidden mutation inside the graph.
+parallel formula combines independently processed partitions. The same
+building block also summarizes the per-transition diagnostics the
+compiled-reactive NUTS sampler reports as a `NUTSDiagnostics` — tree depth,
+leapfrog-step count, acceptance rate, and energy error — alongside an exact
+divergence count and maximum tree depth. All operations return new immutable
+values, so they are ordinary pure recipes rather than hidden mutation inside
+the graph. For the reactive, in-place diagonal-metric variance the sampler
+itself adapts, the example reuses the canonical `welford_var` estimator rather
+than re-implementing it.
 
 The complete runnable implementation is
 [`examples/online_stats.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/online_stats.jl).
@@ -76,6 +82,114 @@ partitioned = reduce(merge, parts)
 @assert Statistics.var(partitioned) ≈ Statistics.var(streaming)
 ```
 
+## HMC sampling diagnostics
+
+`HMCDiagnosticsAccumulator{T}` ingests the canonical `NUTSDiagnostics` record
+the compiled-reactive sampler returns per transition — `depth`, `n_steps`,
+`acceptance_rate`, `diverged`, and `energy_error` — storing online moments for
+depth, leapfrog count, acceptance rate, and energy error, plus an exact
+divergence count and maximum tree depth. Step size is **not** part of
+`NUTSDiagnostics` (it is adapted by the sampler's dual-averaging state), so it
+is supplied separately and summarized only when a finite, positive value is
+given; `NaN` (the default) or `missing` records the transition with an
+unavailable step size, while a non-positive or infinite value is rejected as
+invalid telemetry. The completed-transition `energy_error` is likewise folded
+only when finite: because the canonical sampler normalizes a non-finite error
+to `-Inf` and marks it divergent, a non-finite error is accepted only on a
+divergent transition (counted, not folded) and rejected otherwise.
+Independently summarized chain segments are mergeable, and the empty state is an
+exact identity.
+
+The compact block below is again the literal source executed by the docs build.
+Its Generated and Compute DAG panes therefore show the actual HMC diagnostics
+subkernel, not setup or include plumbing.
+
+```@eval
+Main.ReactiveKernelsDocs.execute_example(@__MODULE__, raw"""
+diagnostics = @kernel begin
+    diagnostics_state::HMCDiagnosticsAccumulator{Float64}
+    transition::NUTSDiagnostics{Float64}
+    stepsize_observation::Float64
+    updated_diagnostics::HMCDiagnosticsAccumulator{Float64} =
+        OnlineStatsExample.record_transition(
+            diagnostics_state,
+            transition,
+            stepsize_observation,
+        )
+    max_tree_depth::Int =
+        OnlineStatsExample.max_tree_depth(updated_diagnostics)
+    divergence_percent::Float64 =
+        OnlineStatsExample.divergence_percent(updated_diagnostics)
+    mean_acceptance_rate::Float64 =
+        OnlineStatsExample.mean_acceptance_rate(updated_diagnostics)
+    mean_energy_error::Float64 =
+        OnlineStatsExample.mean_energy_error(updated_diagnostics)
+    mean_stepsize::Float64 =
+        OnlineStatsExample.mean_stepsize(updated_diagnostics)
+    return updated_diagnostics, max_tree_depth, divergence_percent,
+           mean_acceptance_rate, mean_energy_error, mean_stepsize
+end
+
+diagnostics_kernel = prepare(diagnostics;
+    have = (:diagnostics_state, :transition, :stepsize_observation),
+    want = (:updated_diagnostics, :max_tree_depth, :divergence_percent,
+            :mean_acceptance_rate, :mean_energy_error, :mean_stepsize))
+
+seed = HMCDiagnosticsAccumulator()
+inputs = (seed, NUTSDiagnostics(3, 7, 0.91, false, -0.05), 0.25)
+output = diagnostics_kernel(inputs...)
+
+docs_example = (;
+    name = :hmc_transition_diagnostics,
+    origin = "compact @kernel HMC diagnostics reducer (build executed)",
+    inputs,
+    kernel = diagnostics_kernel,
+    output,
+)
+"""; setup = Main.ReactiveKernelsDocs.setup_online_stats!)
+```
+
+Each transition is a canonical `NUTSDiagnostics`; step size is paired in
+explicitly and omitted (recorded as unavailable) when the sampler has not
+adapted one yet:
+
+```julia
+records = [
+    (diagnostics=NUTSDiagnostics(3, 7,  0.91, false, -0.05), stepsize=0.25),
+    (diagnostics=NUTSDiagnostics(5, 15, 0.83, true,  -6.0),  stepsize=0.20),
+    (diagnostics=NUTSDiagnostics(2, 5,  0.96, false, -0.01),),  # step size unavailable
+]
+diagnostics = OnlineStatsExample.fit_diagnostics(records)
+
+@assert OnlineStatsExample.sample_count(diagnostics) == 3
+@assert diagnostics.n_divergent == 1
+@assert OnlineStatsExample.max_tree_depth(diagnostics) == 5
+@assert isnan(OnlineStatsExample.mean_stepsize(
+    OnlineStatsExample.fit_diagnostics(
+        [NUTSDiagnostics(1, 1, 0.9, false, 0.0)])))
+```
+
+This fixed-size reducer intentionally does not approximate rank-normalized
+R-hat or bulk/tail ESS: exact versions require retained, ordered draws from
+multiple chains. WarmupHMC reports those from its retained sampling history,
+while divergence count and maximum tree depth are represented exactly here.
+
+### Reactive metric adaptation reuses the canonical estimator
+
+The mergeable scalar summaries above are distinct from the sampler's diagonal
+*metric* adaptation, which is a reactive, in-place, componentwise variance over
+parameter vectors. The example does not re-implement it: it reuses the exported
+canonical `welford_var`/`WelfordVariance`, the same estimator the sampler adapts
+its metric with.
+
+```julia
+report = OnlineStatsExample.metric_adaptation_report()
+
+@assert report.count == length(OnlineStatsExample.METRIC_ADAPTATION_DRAWS)
+@assert report.dimension == 3
+@assert all(report.variance .>= 0)
+```
+
 Empty means and variances are `NaN`. A singleton has a finite mean, `NaN`
 corrected variance, and zero uncorrected variance. Non-finite observations
 propagate `NaN` or positive infinity; a negative `m2`, including negative
@@ -139,6 +253,8 @@ reactive layers.
 
 `kernel_performance_report` warms the generated update kernel, measures
 steady-state allocations in one run, and elapsed time in a separate run.
+`diagnostics_performance_report` applies the same measurement contract to the
+HMC diagnostics update kernel.
 `reactive_performance_report` does the same for the orchestration path, whose
 allocation count deliberately includes source versioning, invalidation,
 planning-cache lookup, and materialization. Timings are reported observations,
@@ -149,6 +265,11 @@ model = OnlineStatsExample.build_online_stats_graph()
 kernel = prepare(model; have = (:state, :observation), want = :updated)
 
 direct = OnlineStatsExample.kernel_performance_report(kernel)
+diagnostics_kernel = prepare(model;
+    have = (:diagnostics_state, :transition, :stepsize_observation),
+    want = :updated_diagnostics)
+diagnostics = OnlineStatsExample.diagnostics_performance_report(
+    diagnostics_kernel)
 reactive = OnlineStatsExample.reactive_performance_report(model)
 ```
 
