@@ -192,31 +192,9 @@ function _kernel_resolve_callable_or_reject(name::Symbol, v)
     reg
 end
 
-# --- identity-bound RK-core primitive effect registry (RK 2026-08-27) ---------
+# --- identity-bound RK-core primitive effect registry -------------------------
 #
-# A call touching a reactive/self/subject place is admissible ONLY when its CAPTURED
-# CALLABLE IDENTITY has a detached effect descriptor — a registered @kernel / sibling
-# method / core intrinsic, OR an RK-core PRIMITIVE registered here by EXACT identity.
-# Qualification and `!`-spelling are NOT effect evidence (locked compiler boundary:
-# ordinary Julia is opaque unless explicitly registered). `Base.fill!` is sanctioned for
-# the RIGHT reason — its exact identity is registered with a declared destination write —
-# NOT because it is `.`-qualified or bang-suffixed.
-
-# Declared effect of a VALUE-POSITION primitive: the positional actual indices that are
-# WRITES; every other positional is a READ (source order retained). This is for
-# positional-effect primitives only (e.g. `Base.fill!`). `copy!!` is NOT one of these —
-# it is the RK-core `:intrinsic` with STRONGER STRUCTURAL semantics (destination
-# owned-CLOSURE copy, shared authority untouched, `result === dest`, shape/type checks),
-# carried by its own registration, never flattened to a positional write here.
-struct _PrimitiveEffect
-    writes::Tuple{Vararg{Int}}
-    # NOTE: `Base.fill!` is currently admitted in DISCARDED-effect position only; a
-    # declared result-alias policy is needed before any value-position use.
-end
-
-# The registry is a pure DISPATCH on the resolved VALUE identity — used AT OWNER DEFINITION
-# (capture time), so its result can be SNAPSHOTTED detached (never reread at analysis, and
-# no mutable registry). `nothing` = not an RK-core value-position primitive.
-_kernel_primitive_effect(@nospecialize(v)) =
-    v === Base.fill! ? _PrimitiveEffect((1,)) :    # fill!(dest, x): dest = write, x = read
-    nothing
+# `_PrimitiveEffect` + `_kernel_primitive_effect` live in `kernel_stateful.jl` (before
+# `_KernelRegistration`, whose `:primitive` kind carries the descriptor). They are
+# consumed HERE by the interprocedural closure below, and captured DETACHED at owner
+# definition by `_kernel_capture_callees` (rebind-checked), never reread at analysis.

@@ -34,6 +34,30 @@ end
     drive!() = copy!!(s, y)
 end
 
+# identity-bound primitive: `Base.fill!(buf, 0.0)` writes `buf` (an owner field) through
+# the registered RK-core primitive — captured DETACHED at definition with its positional
+# write descriptor, keyed by the authored slot, rebind-checked (fix 1).
+@kernel filler(buf) = begin
+    zero!() = Base.fill!(buf, 0.0)
+end
+
+# local-spoof adversary: a method-local `fill!` shadows the primitive → it is a body LOCAL,
+# excluded at ref collection, NEVER captured as the registered `Base.fill!` identity.
+@kernel spooffill(buf) = begin
+    zero!() = begin
+        fill! = (a, b) -> a
+        fill!(buf, 0.0)
+    end
+end
+
+# alias-module rebind adversary: `AliasMod.fill!` is captured through a NON-const module
+# slot; rebinding `AliasMod` to a module without `fill!` must read as rebound.
+AliasMod = Base
+@kernel aliasfill(buf) = begin
+    zero!() = AliasMod.fill!(buf, 0.0)
+end
+baremodule NoFill end
+
 @testset "Inc3 factory substrate" begin
     @testset "LOCAL owned seed (not authoritative)" begin
         # the direct-write seed is exactly the mutated field
@@ -113,6 +137,36 @@ end
         # foreign callables (qualified or not) are not registered → reject
         @test RKS._kernel_primitive_effect(sin) === nothing
         @test RKS._kernel_primitive_effect(println) === nothing
+    end
+
+    @testset "detached Base.fill! capture + rebind (fix 1)" begin
+        caps = RKS.kernel_callee_registrations(filler)
+        prims = [c for c in caps if c.registration.kind === :primitive]
+        @test length(prims) == 1
+        prim = only(prims)
+        # captured by EXACT identity, with the detached positional descriptor
+        @test prim.target === Base.fill!
+        @test prim.registration.primitive_effect isa RKS._PrimitiveEffect
+        @test prim.registration.primitive_effect.writes == (1,)
+        # keyed by the AUTHORED SLOT — an independently reconstructed ref matches (value key)
+        ref2 = RKS._CapturedCalleeRef(GlobalRef(@__MODULE__, :Base), :fill!)
+        @test RKS.kernel_callee_registration(filler, ref2).primitive_effect.writes == (1,)
+        # the slot re-resolves to Base.fill! → NOT rebound
+        @test !RKS.kernel_callee_rebound(filler, prim.ref)
+
+        # local-spoof: a method-local `fill!` is excluded → NO primitive capture at all
+        @test isempty([c for c in RKS.kernel_callee_registrations(spooffill)
+                       if c.registration.kind === :primitive])
+
+        # alias-module rebind: captured through non-const `AliasMod`; rebinding it to a
+        # module without `fill!` reads as rebound (detached slot re-resolution).
+        aprim = only(c for c in RKS.kernel_callee_registrations(aliasfill)
+                     if c.registration.kind === :primitive)
+        @test aprim.target === Base.fill!
+        @test !RKS.kernel_callee_rebound(aliasfill, aprim.ref)   # AliasMod === Base still
+        @eval AliasMod = NoFill                                  # rebind the module slot
+        @test RKS.kernel_callee_rebound(aliasfill, aprim.ref)    # NoFill has no `fill!`
+        @eval AliasMod = Base                                    # restore
     end
 end
 

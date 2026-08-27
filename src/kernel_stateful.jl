@@ -739,16 +739,52 @@ end
 # ordinary Julia callable resolves to `nothing` (opaque, per the compiler
 # boundary: ordinary Julia is opaque unless explicitly registered).
 
+# --- identity-bound RK-core primitive effect registry ------------------------
+#
+# A call touching a reactive/self/subject place is admissible ONLY when its CAPTURED
+# CALLABLE IDENTITY has a detached effect descriptor — a registered @kernel / sibling
+# method / core intrinsic, OR an RK-core PRIMITIVE registered here by EXACT identity.
+# Qualification and `!`-spelling are NOT effect evidence (locked compiler boundary:
+# ordinary Julia is opaque unless explicitly registered). `Base.fill!` is sanctioned for
+# the RIGHT reason — its exact identity is registered with a declared destination write —
+# NOT because it is `.`-qualified or bang-suffixed. Captured DETACHED at owner definition
+# (`_kernel_capture_callees`, kind `:primitive`), rebind-checked; never reread at analysis.
+
+# Declared effect of a VALUE-POSITION primitive: the positional actual indices that are
+# WRITES; every other positional is a READ (source order retained). For positional-effect
+# primitives only (e.g. `Base.fill!`). `copy!!` is NOT one of these — it is the RK-core
+# `:intrinsic` with STRONGER STRUCTURAL semantics (destination owned-CLOSURE copy, shared
+# authority untouched, `result === dest`, shape/type checks), carried by its own
+# registration, never flattened to a positional write here.
+struct _PrimitiveEffect
+    writes::Tuple{Vararg{Int}}
+    # NOTE: `Base.fill!` is currently admitted in DISCARDED-effect position only; a
+    # declared result-alias policy is needed before any value-position use.
+end
+
+# Pure DISPATCH on the resolved VALUE identity — used AT OWNER DEFINITION (capture time),
+# so its result is SNAPSHOTTED detached (no mutable registry, no analysis-time reread).
+# `nothing` = not an RK-core value-position primitive.
+_kernel_primitive_effect(@nospecialize(v)) =
+    v === Base.fill! ? _PrimitiveEffect((1,)) :    # fill!(dest, x): dest = write, x = read
+    nothing
+
 struct _KernelRegistration
     token::Any               # def-unique/intrinsic Token, or `nothing` for a stateless spec
-    kind::Symbol             # :free_method | :object_kernel | :stateless | :intrinsic
+    kind::Symbol             # :free_method | :object_kernel | :stateless | :intrinsic | :primitive
     subject::Union{Symbol,Nothing}    # Mode-2/intrinsic subject (first positional), else nothing
     write_roots::Tuple{Vararg{Symbol}}
     read_roots::Tuple{Vararg{Symbol}}
     is_bang_bang::Bool       # `!!` strong same-object update registration
     source::Any              # the originating value — the ONLY stable identity handle for a
                              #   token-less stateless spec (so rebind stays sound; see kernel_rebound)
+    # `:primitive` only: the detached positional-write descriptor (`Base.fill!`). `nothing`
+    # for every other kind — its effect is carried by write_roots/the intrinsic Token.
+    primitive_effect::Union{Nothing,_PrimitiveEffect}
 end
+# 7-arg convenience: every non-primitive registration defaults `primitive_effect=nothing`.
+_KernelRegistration(token, kind, subject, wr, rr, bb, source) =
+    _KernelRegistration(token, kind, subject, wr, rr, bb, source, nothing)
 
 # A tiny RK-CORE registered intrinsic (NOT authored via `@kernel`): a strong
 # structural update carrying a stable, def-unique intrinsic Token so the general
@@ -1005,7 +1041,20 @@ function _kernel_capture_callees(mod::Module, refs)
             target = getglobal(om, nm)
         end
         reg = kernel_registration(target)
-        reg === nothing && continue
+        if reg === nothing
+            # Not a registered @kernel/intrinsic. Is it an identity-bound RK-core PRIMITIVE
+            # (exact `Base.fill!`)? Capture it DETACHED with kind :primitive + its positional
+            # descriptor, keyed by the SAME authored-slot ref + rebind-checked by target
+            # identity. An ordinary Julia callee (`evil!`, a foreign function) has no
+            # descriptor → omitted → opaque → REJECTED by the interprocedural closure. A
+            # LOCAL/formal `fill!` never reaches here (excluded at ref collection).
+            peff = _kernel_primitive_effect(target)
+            peff === nothing && continue
+            reg = _KernelRegistration(Symbol("__rk_primitive__"), :primitive, nothing,
+                                      (), (), false, target, peff)
+            push!(caps, _CapturedCallee(cref, reg, target))
+            continue
+        end
         reg.kind === :stateless && throw(ArgumentError(
             "direct call to a stateless @kernel `$(cref.field === nothing ? cref.slot.name : cref.field)` " *
             "is not a captured provenance category in Increment 1 (its live KernelSpec must " *
