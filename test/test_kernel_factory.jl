@@ -683,6 +683,36 @@ end
             @test (@allocated RKS._owner_kill!(a, Val(1))) == 0
             @test (@allocated RKS._owner_current(a, Val(2))) == 0
         end
+
+        # >WORD_BITS DISCRIMINATOR (RK pt1/04:50): a layout wider than one machine word uses W>1
+        # words and NEVER shift-wraps — a slot in word 2 is independent of a slot in word 1.
+        WB = RKS._WORD_BITS
+        nbig = WB + 6
+        big = RKS._kernel_construct_owned(Val(:big), ntuple(i -> Float64(i), nbig))
+        @test length(RKS.owner_current_mask(big)) == 2            # W = cld(WB+6, WB) = 2
+        @test RKS._owner_current(big, Val(WB + 1)) && RKS._owner_current(big, Val(1))
+        RKS._owner_kill!(big, Val(WB + 1))                        # kill a word-2 slot
+        @test !RKS._owner_current(big, Val(WB + 1)) && RKS._owner_current(big, Val(1))
+        RKS._owner_bless!(big, Val(WB + 1))
+        @test RKS._owner_current(big, Val(WB + 1))
+        # cross-word kill/bless are ALLOCATION-FREE (0-B) — warm the exact Val specialization first
+        RKS._owner_kill!(big, Val(WB + 2)); RKS._owner_bless!(big, Val(WB + 2))
+        @test (@allocated RKS._owner_kill!(big, Val(WB + 2))) == 0
+        RKS._owner_bless!(big, Val(WB + 3)); RKS._owner_kill!(big, Val(WB + 3))
+        @test (@allocated RKS._owner_bless!(big, Val(WB + 3))) == 0
+
+        # NONCONTIGUOUS entry-current mask: EXACTLY slots {1, WB+1} set (arbitrary subset across
+        # words), nothing between — proves the mask is built from exact indices, not a low-prefix.
+        m = RKS._owner_mask(nbig, [1, WB + 1])
+        nc = RKS._OwnerState{:nc}(ntuple(i -> Float64(i), nbig), m)
+        @test RKS._owner_current(nc, Val(1)) && RKS._owner_current(nc, Val(WB + 1))
+        @test !RKS._owner_current(nc, Val(2)) && !RKS._owner_current(nc, Val(WB)) &&
+              !RKS._owner_current(nc, Val(WB + 2))
+        # copy!! currentness transfer requires IDENTICAL layout type; a different Token/slots/width
+        # rejects (nc and big share a width but differ in Token; a small state differs in all).
+        @test_throws MethodError RKS._owner_copy_current!(big, nc)    # different Token
+        small = RKS._kernel_construct_owned(Val(:sm), (1.0, [2.0]))
+        @test_throws MethodError RKS._owner_copy_current!(small, big) # different slots/width
     end
 
     @testset "poc binder/plan seam accessors (RK 04:41)" begin

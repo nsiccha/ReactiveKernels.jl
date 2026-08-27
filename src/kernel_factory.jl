@@ -143,15 +143,35 @@ end
 # `getfield`; scalar updates are accumulated and committed by ONE typed tuple replacement
 # at the schedule boundary. `Token` phantom-types the owner definition; layout (the slot
 # order in `T`) is fixed by the plan AFTER the transitive effect closure.
-mutable struct _OwnerState{Token,T<:Tuple}
+mutable struct _OwnerState{Token,T<:Tuple,W}
     slots::T
-    current::UInt      # allocation-free currentness BITMASK over the physical owned slots (RK
-                       #   04:39): bit (I-1) set ⇔ slot I is current. copy!! transfers it, a write
-                       #   KILLS selected dependents, a root commit BLESSES the produced trace.
-                       #   Per-instance (init/fwd/bwd carry INDEPENDENT masks). NOT a Dict/Set/Ref.
+    current::NTuple{W,UInt}   # allocation-free currentness BITSET over the physical owned slots
+                              #   (RK 04:45/04:46): W = cld(nslots, 64) machine words, so a layout
+                              #   WIDER than one word never shift-wraps into a single UInt. Bit
+                              #   (I-1) set ⇔ slot I current; copy!! transfers it, a write KILLS a
+                              #   dependent, a producer BLESSES it. Per-instance INDEPENDENT masks.
+                              #   isbits (0-B word replacement). NOT a Dict/Set/Ref.
 end
-_OwnerState{Token}(slots::T, current::UInt = ~UInt(0)) where {Token,T<:Tuple} =
-    _OwnerState{Token,T}(slots, current)
+const _WORD_BITS = 8 * sizeof(UInt)                    # machine word width (RK 04:50 — not literal 64)
+@inline _owner_word(i::Int) = (i - 1) ÷ _WORD_BITS + 1  # 1-based machine-word index of slot i
+@inline _owner_bit(i::Int) = (i - 1) % _WORD_BITS       # bit offset within that word
+
+# Exact-width mask (W = cld(nslots, WORD_BITS) words) with EXACTLY the physical slot indices in
+# `set_indices` set (RK 04:45 pt3 / 04:50 — an ARBITRARY subset, e.g. the physical slots mapped
+# from `plan.entry_current`, never an all-current/low-prefix guess). Construction-time only.
+function _owner_mask(nslots::Int, set_indices = 1:nslots)
+    W = max(cld(nslots, _WORD_BITS), 1)
+    words = fill(UInt(0), W)
+    for i in set_indices
+        1 <= i <= nslots || continue
+        words[_owner_word(i)] |= UInt(1) << _owner_bit(i)
+    end
+    ntuple(w -> @inbounds(words[w]), W)
+end
+_OwnerState{Token}(slots::T) where {Token,T<:Tuple} =
+    (m = _owner_mask(length(slots)); _OwnerState{Token,T,length(m)}(slots, m))
+_OwnerState{Token}(slots::T, current::NTuple{W,UInt}) where {Token,T<:Tuple,W} =
+    _OwnerState{Token,T,W}(slots, current)
 
 owner_token(::_OwnerState{Token}) where {Token} = Token
 owner_slots(s::_OwnerState) = getfield(s, :slots)
@@ -161,18 +181,26 @@ owner_slots(s::_OwnerState) = getfield(s, :slots)
 
 # Commit a whole new concrete slot tuple in ONE TYPED replacement (same `T`). The typed
 # signature enforces layout/type stability — a different-typed tuple does not match.
-@inline _owner_commit!(s::_OwnerState{Token,T}, slots::T) where {Token,T} =
+@inline _owner_commit!(s::_OwnerState{Token,T,W}, slots::T) where {Token,T,W} =
     (setfield!(s, :slots, slots); s)
 
-# Currentness mask accessors — constant bit ops, allocation-free (Val-indexed physical slot).
-@inline _owner_current(s::_OwnerState, ::Val{I}) where {I} = (s.current >> (I - 1)) & UInt(1) == UInt(1)
-@inline _owner_kill!(s::_OwnerState, ::Val{I}) where {I} =                   # a write kills a slot
-    (setfield!(s, :current, s.current & ~(UInt(1) << (I - 1))); s)
-@inline _owner_bless!(s::_OwnerState, ::Val{I}) where {I} =                  # a producer blesses it
-    (setfield!(s, :current, s.current | (UInt(1) << (I - 1))); s)
+# Currentness accessors — constant word/bit ops from WORD_BITS; the WORD index is resolved from the
+# Val-indexed physical slot, so a >WORD_BITS layout addresses the correct machine word (no wrap).
+@inline _owner_current(s::_OwnerState, ::Val{I}) where {I} =
+    (getfield(s, :current)[_owner_word(I)] >> _owner_bit(I)) & UInt(1) == UInt(1)
+@inline function _owner_kill!(s::_OwnerState, ::Val{I}) where {I}            # a write kills a slot
+    c = getfield(s, :current); w = _owner_word(I)
+    setfield!(s, :current, Base.setindex(c, c[w] & ~(UInt(1) << _owner_bit(I)), w)); s
+end
+@inline function _owner_bless!(s::_OwnerState, ::Val{I}) where {I}           # a producer blesses it
+    c = getfield(s, :current); w = _owner_word(I)
+    setfield!(s, :current, Base.setindex(c, c[w] | (UInt(1) << _owner_bit(I)), w)); s
+end
 owner_current_mask(s::_OwnerState) = getfield(s, :current)
-# copy!! transfers currentness: the destination inherits the source's mask (RK 03:44/04:39).
-@inline _owner_copy_current!(dest::_OwnerState, src::_OwnerState) =
+# copy!! transfers currentness: dest inherits src's mask — restricted to an IDENTICAL layout type
+# (same Token/slots/width), as the copy!! contract requires (RK 04:45 pt2); an incompatible owner
+# does not match (shared-authority identity is validated by the construction seam).
+@inline _owner_copy_current!(dest::_OwnerState{Tok,T,W}, src::_OwnerState{Tok,T,W}) where {Tok,T,W} =
     (setfield!(dest, :current, getfield(src, :current)); dest)
 
 # --- callable field / partial resolution (RK callable-Token redirect) --------
