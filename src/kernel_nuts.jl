@@ -104,7 +104,11 @@ end
     _nuts_invalidate_diverged!(fr)                        # clear derived-diverged committed + pending
     try
         r.refresh(getfield(fr, :init), getfield(fr, :shared), r.handles, rng)   # refresh (mom-deps killed)
-        r.fn(fr, sc, rng, r.cfg)                          # the compiled step! machine
+        # call the RGF's generated body DIRECTLY (RK): the outer RuntimeGeneratedFunction callable WRAPPER
+        # materializes its 4-arg tuple when not loop-inlined (~352 B/transition in an HMC loop) — bypassing the
+        # wrapper via generated_callfunc keeps the compiled step! machine exact 0-B inside a repeated loop.
+        RuntimeGeneratedFunctions.generated_callfunc(r.fn, fr, sc, rng, r.cfg)  # the compiled step! machine
+
         _diagnostics_root_commit!(getfield(fr, :diag))    # single deferred commit — only on success
         _nuts_derived_root_commit!(fr)
     catch

@@ -24,7 +24,7 @@ function _nuts_mkvals(pf, T)
 end
 function _nuts_frame(pf, T, md)
     frame = RK._construct_nuts_frame(pf, _nuts_mkvals(pf, T), md;
-                                     step_f = RK.partial(_NutsFix.leapfrog!; stepsize = 0.1), stats_f = nothing, min_dham = -1000)
+                                     step_f = RK.partial(_NutsFix.leapfrog!; stepsize = T(0.1)), stats_f = nothing, min_dham = -1000)
     RK.compile_prepared_initialization(pf, typeof(frame.init), typeof(frame.shared))(frame.init, frame.shared, RK.kernel_prepared_handles(pf))
     RK._seed_nuts_children!(frame)
     frame
@@ -44,19 +44,29 @@ _slot(pf, ep, f) = RK._canon_slot(ep, RK.kernel_plan_named_slot_val(RK.kernel_pr
     @test RK._diag_slot(frame.diag, Val(4)) != 0.0            # dham is a real (fresh-momentum) energy error, not stale 0
 end
 
-@testset "kernel_nuts — public root @inferred + EXACT 0-B for two rng types (Xoshiro + MersenneTwister)" begin
-    pf = _nuts_pf(); frame = _nuts_frame(pf, Float64, 3)
-    C = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame)
-    rt = Base.return_types(C.root!, (typeof(frame), typeof(C.scratch), typeof(Random.Xoshiro(1))))
-    @test length(rt) == 1 && isconcretetype(rt[1])            # concrete _NutsFrame return
-    @inferred C.root!(frame, C.scratch, Random.Xoshiro(1))
-    # the WHOLE public root (refresh + step + epoch) is exact 0-B behind a clean in-fn barrier, both rng types
-    function root0b(root, fr, sc, rg)
-        RK._nuts_frame_reset_control!(fr); root(fr, sc, rg); GC.gc()
-        RK._nuts_frame_reset_control!(fr); @allocated root(fr, sc, rg)
+# typed-batch allocation gate (RK): a fully-typed Val{N} while loop, warmed, so the LOOP path (not just a
+# single call) is measured — this is what an HMC sampler drives. The public root must be EXACTLY 0-B here.
+@inline function _nuts_batch(root, fr, sc, rng, ::Val{N}) where {N}
+    i = 0; @inbounds while i < N; root(fr, sc, rng); i += 1; end; nothing
+end
+# measured with a LITERAL Val{N} (a runtime Val(N) would itself be type-unstable and allocate)
+_nuts_batch0b(root, fr, sc, rng, ::Val{N}) where {N} =
+    (_nuts_batch(root, fr, sc, rng, Val(N)); GC.gc(); @allocated _nuts_batch(root, fr, sc, rng, Val(N)))
+
+@testset "kernel_nuts — public root @inferred + EXACT 0-B IN A LOOP (typed batch n=64/128/256, both rng, F32+F64)" begin
+    for T in (Float64, Float32)
+        pf = _nuts_pf(); frame = _nuts_frame(pf, T, 5)
+        C = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame)
+        rt = Base.return_types(C.root!, (typeof(frame), typeof(C.scratch), typeof(Random.Xoshiro(1))))
+        @test length(rt) == 1 && isconcretetype(rt[1])       # concrete _NutsFrame return
+        @test RK.diagnostics_ham_type(frame.diag) === T       # diagnostics carry the frame's ham type (F32/F64)
+        @inferred C.root!(frame, C.scratch, Random.Xoshiro(1))
+        for rg in (Random.Xoshiro(91), Random.MersenneTwister(2))
+            @test _nuts_batch0b(C.root!, frame, C.scratch, rg, Val(64)) == 0
+            @test _nuts_batch0b(C.root!, frame, C.scratch, rg, Val(128)) == 0
+            @test _nuts_batch0b(C.root!, frame, C.scratch, rg, Val(256)) == 0
+        end
     end
-    @test root0b(C.root!, frame, C.scratch, Random.Xoshiro(1)) == 0
-    @test root0b(C.root!, frame, C.scratch, Random.MersenneTwister(2)) == 0
 end
 
 @testset "kernel_nuts — RNG-INDEPENDENT: one sampler accepts two rng types, scratch/root types unchanged" begin
