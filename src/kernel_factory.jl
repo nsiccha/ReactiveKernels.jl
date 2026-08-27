@@ -291,25 +291,10 @@ _kernel_reg_writes_subject(reg::_KernelRegistration) =
 # evidence. A call is admissible over a reactive actual iff its EXACT identity is (a) a
 # registered @kernel / intrinsic / RK-core effect primitive (handled as a write), or (b) an
 # identity-bound PURE primitive registered here (reads only). Everything else REJECTS.
-const _KERNEL_PURE_PRIMS = Base.IdSet{Any}()
-for f in (Base.:+, Base.:-, Base.:*, Base.:/, Base.:\, Base.:^, Base.:%,
-          Base.:(==), Base.:(!=), Base.:<, Base.:>, Base.:<=, Base.:>=, Base.:!,
-          Base.:&, Base.:|, Base.xor, Base.abs, Base.abs2, Base.sqrt, Base.cbrt,
-          Base.exp, Base.log, Base.log1p, Base.expm1, Base.sin, Base.cos, Base.tan,
-          Base.min, Base.max, Base.minmax, Base.identity, Base.muladd, Base.fma,
-          Base.sum, Base.prod, Base.zero, Base.one, Base.oftype, Base.convert,
-          Base.float, Base.inv, Base.sign, Base.clamp, Base.hypot, Base.mod, Base.rem,
-          Base.length, Base.size, Base.eltype, Base.getindex, Base.first, Base.last,
-          Base.isnothing, Base.isfinite, Base.isinf, Base.isnan, Base.iszero, Base.isequal,
-          Base.ifelse, Base.signbit, Base.floor, Base.ceil, Base.round, Base.log2, Base.log10,
-          Base.:(:), Base.OneTo, Base.eachindex, Base.eachcol, Base.eachrow, Base.axes,
-          Base.broadcasted, Base.materialize, Base.mapreduce, Base.reduce, Base.map, Base.filter,
-          LinearAlgebra.dot, LinearAlgebra.norm, LinearAlgebra.cholesky, LinearAlgebra.logdet,
-          LogExpFunctions.logaddexp, LogExpFunctions.logsumexp)
-    push!(_KERNEL_PURE_PRIMS, f)
-end
-_kernel_pure_primitive(ref::GlobalRef) =
-    isdefined(ref.mod, ref.name) && (getglobal(ref.mod, ref.name) in _KERNEL_PURE_PRIMS)
+# The exact-identity PURE primitive set + capture now live in `kernel_stateful.jl` as the
+# definition-time `:pure_primitive` provenance category (`_KERNEL_PURE_PRIMS` /
+# `_kernel_pure_primitive_value`, RK 06:01) — the factory NEVER does a live analysis-time spelling
+# lookup: it consults the captured `_RegisteredCall` registration only.
 
 # --- abstract place lattice + structured environment (RK block pt 1) ----------
 #
@@ -381,9 +366,11 @@ function _own_field_reg(st::_OwnState, field::Symbol)
     fr[field]
 end
 
-# Reject an opaque/non-pure call over a reactive actual in ANY position (RK block pt 6).
+# Reject an opaque/non-pure call over a reactive actual in ANY position (RK block pt 6). An exact
+# pure primitive / operator is NO LONGER a live spelling exception here (RK 06:01) — it is captured
+# at definition as `:pure_primitive` and emitted as a `_RegisteredCall`, so any residual `_OpCall`
+# reaching this point is a genuinely opaque external and REJECTS over a reactive place.
 function _own_reject_opaque!(n::_OpCall, env::Dict{Symbol,_Places})
-    _kernel_pure_primitive(n.op) && return
     for a in n.args
         pl = _kernel_place_of(a, env)
         any(p -> p[1] === :self || p[1] === :formal, pl) && throw(_KernelFactoryReject(
@@ -457,6 +444,10 @@ function _own_expr_effects!(st::_OwnState, cur::MethodId, x, env::Dict{Symbol,_P
             for w in de.writes
                 w <= length(x.args) && _own_record!(st, cur, _kernel_place_of(x.args[w], env))
             end
+        elseif reg.kind === :pure_primitive
+            # An exact-identity RK-core PURE primitive (RK 06:01) — an ordinary/dotted/compound
+            # operator or named Base/stdlib pure callable. Reads EVERY actual, writes NOTHING, any
+            # arity: admissible over reactive places (NOT opaque), contributes no ownership.
         else                                       # :free_method / :object_kernel / :stateless
             # RK block pt 4: a registered call owns its subject ONLY if it writes it; a pure
             # registered reducer (empty roots) must NOT own its first actual. Its subject WRITE goes

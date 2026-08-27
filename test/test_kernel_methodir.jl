@@ -201,7 +201,13 @@ end
     all_ev = _ae_all(ev)
     @test any(e -> e isa RK._ACall && e.kind === :sibling, all_ev)
     @test any(e -> e isa RK._ACall && e.kind === :intrinsic, all_ev)   # copy!!
-    @test any(e -> e isa RK._ACall && e.kind === :opaque, all_ev)      # rand(rng,…) is opaque (no name-RNG)
+    # RK 06:01/06:08: operators + named Base primitives are now EXACT captured pure identities — there is
+    # NO opaque/external call event anywhere in step!; `*`/`zero` carry their `typeof`-token :registered
+    # pure edges (each reading its actuals), and `rand(rng,…)` is the registered RK-core rng primitive.
+    @test !any(e -> e isa RK._ACall && e.kind === :opaque, all_ev)
+    @test any(e -> e isa RK._ACall && e.kind === :registered && e.id === typeof(*), all_ev)
+    @test any(e -> e isa RK._ACall && e.kind === :registered && e.id === typeof(zero), all_ev)
+    @test any(e -> e isa RK._ACall && e.kind === :registered && e.id === Symbol("__rk_rng_Random_rand__"), all_ev)
     # a write-only scalar (`gofwd = !gofwd`) contributes a WRITE with no read of its own terminal place
     fl = RK.access_events(_mir(_NS, :flip!))
     @test any(e -> e isa RK._AWrite && e.owner == (:gofwd,), _ae_all(fl))
@@ -444,4 +450,162 @@ end
     # the detached port names are non-empty and carry the composed fields
     @test :gofwd in RK.kernel_port_names(_NS)
     @test :fwd in RK.kernel_port_names(_NS) && :trees in RK.kernel_port_names(_NS)
+end
+
+# ==== RK 06:01–06:37 pure/operator/comparison/default provenance + specialization-domain probes =======
+
+module _ProvAdv
+    using ReactiveKernels
+    # ordinary `*`/`+`, dotted `.+`, compound `+=` over reactive fields — all captured :pure_primitive.
+    @kernel pops(a, b) = begin
+        f!() = begin; a = b * b + b; end
+        d!() = begin; a .+= b; end
+    end
+    # chained comparison `b < a < b` (2 ops) — short-circuit guard, captured pure.
+    @kernel pcmp(a, b, o) = begin; c!() = begin; o = (b < a < b) ? a : b; end; end
+    # a LOCAL formal `oftype` shadows Base.oftype -> NOT the captured Base pure primitive.
+    @kernel plocal(v, w) = begin; h!(oftype) = begin; v = oftype(w); end; end
+    # a higher-order helper (`map`, excluded from the pure set) stays OPAQUE over a reactive place.
+    @kernel phigher(v, w) = begin; m!() = begin; v = map(w, w); end; end
+    # DEFAULT left-to-right: a later kw formal `zero` must NOT suppress capture of the pure `zero` in the
+    # earlier `x` default (RK 06:28).
+    @kernel pdefformal(v, w) = begin; m!(; x = zero(w), zero = 1) = begin; v = x; end; end
+    # a BODY local `zero` must NOT suppress the default's global `zero` capture.
+    @kernel pdeflocal(v, w) = begin; m!(; x = zero(w)) = begin; zero = w; v = x; end; end
+    # rebind drift: `myzero` captured pure at def, then rebound to a non-pure λ -> emission REJECT.
+    myzero = zero
+    @kernel pdrift(v, w) = begin; e!() = begin; v = myzero(w); end; end
+    myzero = (z) -> z
+end
+
+_default_of(ir, nm) = (i = findfirst(f -> f.name === nm, ir.formals); i === nothing ? nothing : ir.formals[i].default)
+
+module _DomEvil
+    struct Imm <: Number; x::Int; end                  # a USER isbits <: Number (module not Base/Core)
+    mutable struct Mut; y::Int; end
+    Base.:+(a::Mut, b::Mut) = (a.y += b.y; a)          # mutating `+` under the Base identity
+    Base.length(a::Mut) = (a.y += 1; a.y)              # mutating `length` under the Base identity
+end
+
+@testset "provenance — no mutable registry; deeply-immutable pure identity tuple (RK 06:08)" begin
+    @test RK._KERNEL_PURE_PRIMS isa Tuple
+    @test !(RK._KERNEL_PURE_PRIMS isa Union{Base.IdSet,AbstractDict,AbstractSet})
+    @test all(f -> RK._kernel_pure_primitive_value(f), RK._KERNEL_PURE_PRIMS)   # === scan, no membership struct
+    @test RK._kernel_pure_primitive_value(Base.oftype) && !RK._kernel_pure_primitive_value(map)
+end
+
+@testset "provenance — Julia AST reality for operator forms (RK 06:07)" begin
+    @test Meta.parse("a + b").args[1]   === :+
+    @test Meta.parse("a .+ b").args[1]  === Symbol(".+")
+    @test Meta.parse("a .* b").args[1]  === Symbol(".*")
+    @test Meta.parse("a += b").head     === :+=
+    @test Meta.parse("a .+= b").head    === Symbol(".+=")
+    @test Meta.parse("a < b < c").head  === :comparison
+    # the de-dot / compound-base normalizers recover the base identity
+    @test RK._kernel_dedot_op(Symbol(".+")) === :+ && RK._kernel_dedot_op(:+) === :+
+    @test RK._kernel_compound_base_op(:+=) === :+ && RK._kernel_compound_base_op(Symbol(".+=")) === :+
+    @test RK._kernel_compound_base_op(:(=)) === nothing && RK._kernel_compound_base_op(:(==)) === nothing
+end
+
+@testset "provenance — ZERO opaque across ALL 8 final-fixture kernels (bodies+defaults+edges) (RK 06:07/06:21b)" begin
+    kernels = Any[_PP, _LF, getproperty(_FixImpl, Symbol("refresh_momentum!!")),
+                  getproperty(_FixImpl, Symbol("nuts_stats!")), _NS, _NB, _DA, _WV]
+    for k in kernels, ir in RK.method_irs(k)
+        @test ir.ok
+        @test !any(e -> e isa Tuple && e[1] === :external, RK.call_edges(ir))       # no opaque/external edge
+        @test !any(e -> e isa RK._ACall && e.kind === :opaque, _ae_all(RK.access_events(ir)))
+        for f in ir.formals                                                          # RK 06:21b: no opaque default
+            f.default === nothing && continue
+            @test !_find(n -> n isa RK._OpCall && n.hint === :opaque, f.default)
+        end
+    end
+    # non-vacuous: a captured pure-primitive edge (typeof token) is present somewhere
+    st = _mir(_NS, :step!)
+    @test any(e -> e isa Tuple && e[1] === :registered && e[3] === typeof(*), RK.call_edges(st))
+end
+
+@testset "provenance — operators + chained comparison are captured pure, short-circuit guard (RK 06:01/06:17)" begin
+    f = _mir(_ProvAdv.pops, :f!)
+    @test _body_find(n -> n isa RK._RegisteredCall && n.registration.kind === :pure_primitive &&
+                          n.registration.source === Base.:*, f)
+    d = _mir(_ProvAdv.pops, :d!)   # dotted compound `.+=` -> broadcast _RegisteredCall
+    @test _body_find(n -> n isa RK._RegisteredCall && n.registration.source === Base.:+ && n.broadcast, d)
+    c = _mir(_ProvAdv.pcmp, :c!)
+    @test _body_find(n -> n isa RK._Comparison && length(n.regs) == 2 &&
+                          all(r -> r.kind === :pure_primitive, n.regs), c)
+    # access events: op1 GUARANTEED, op2 under an _AGuard (short-circuit); reads are NOT unconditional
+    ev = RK.access_events(c)
+    reg_calls_top = count(e -> e isa RK._ACall && e.kind === :registered, ev)   # only op1 at top level
+    @test reg_calls_top == 1
+    @test any(e -> e isa RK._AGuard && any(g -> g isa RK._ACall, e.body), ev)   # op2 guarded
+end
+
+@testset "provenance — eachcol borrows(1) descriptor; higher-order + local shadow stay non-pure (RK 06:09/06:10)" begin
+    wm = _mirs(_WV, :step!)[2]                                   # matrix Welford step! iterates eachcol(x)
+    @test any(e -> e isa Tuple && e[1] === :registered && e[3] === Symbol("__rk_borrows_Base_eachcol__"),
+              RK.call_edges(wm))
+    # higher-order `map` is OPAQUE (excluded from the pure set)
+    m = _mir(_ProvAdv.phigher, :m!)
+    @test _body_find(n -> n isa RK._OpCall && n.hint === :opaque, m)
+    @test !_body_find(n -> n isa RK._RegisteredCall && n.registration.kind === :pure_primitive, m)
+    # a LOCAL formal `oftype` never resolves to the Base pure primitive
+    h = _mir(_ProvAdv.plocal, :h!)
+    @test !_body_find(n -> n isa RK._RegisteredCall && n.registration.source === Base.oftype, h)
+end
+
+@testset "provenance — rebind drift of a captured pure primitive REJECTS at emission (RK 06:07)" begin
+    e = _mir(_ProvAdv.pdrift, :e!)
+    @test !e.ok
+    @test occursin("REBOUND", something(e.reason, ""))
+end
+
+@testset "provenance — DEFAULT capture is left-to-right (later formal / body local do not suppress) (RK 06:28)" begin
+    # later kw formal `zero` does NOT suppress the pure `zero` captured in the earlier `x` default
+    mf = _mir(_ProvAdv.pdefformal, :m!)
+    xd = _default_of(mf, :x)
+    @test xd !== nothing
+    @test _find(n -> n isa RK._RegisteredCall && n.registration.kind === :pure_primitive &&
+                     n.registration.source === Base.zero, xd)
+    @test !_find(n -> n isa RK._OpCall && n.hint === :opaque, xd)
+    # a body local `zero` likewise does not suppress the default's global `zero`
+    ml = _mir(_ProvAdv.pdeflocal, :m!)
+    xl = _default_of(ml, :x)
+    @test _find(n -> n isa RK._RegisteredCall && n.registration.source === Base.zero, xl)
+    # defaults ARE folded into the census (resolution_deps carries the registered default call)
+    @test any(d -> d isa Tuple && d[1] === :registered_call && d[2] === typeof(zero), mf.resolution_deps)
+end
+
+@testset "specialization-domain — PER-callee pure contract: final-safe accepts + custom overload rejects (RK 06:33)" begin
+    mkpure(f) = RK._KernelRegistration(typeof(f), :pure_primitive, nothing, (), (), false, f, nothing)
+    dok = RK.kernel_pure_primitive_domain_ok
+    # length: any-eltype Base container (proposals::Vector{<endpoint>}); NOT numeric-gated
+    @test dok(mkpure(Base.length), (Vector{Any},)) && dok(mkpure(Base.length), (Tuple{Int,String},))
+    # isnothing: Nothing OR a registered kernel object (stats_f = nuts_stats! / nothing)
+    @test dok(mkpure(Base.isnothing), (Nothing,))
+    @test dok(mkpure(Base.isnothing), (typeof(getproperty(_FixImpl, Symbol("nuts_stats!"))),))
+    # arithmetic/oftype/zero/one over numeric scalars + arrays; Colon over integers
+    @test dok(mkpure(Base.:+), (Float64, Float64)) && dok(mkpure(Base.:+), (Vector{Float32}, Vector{Float32}))
+    @test dok(mkpure(Base.oftype), (Float64, Float64)) && dok(mkpure(Base.:(:)), (Int, Int))
+    # NEGATIVES: a custom container / number under the SAME generic identity REJECTS
+    @test !dok(mkpure(Base.length), (_DomEvil.Mut,))
+    @test !dok(mkpure(Base.:+), (_DomEvil.Mut, _DomEvil.Mut))
+    @test !dok(mkpure(Base.:+), (_DomEvil.Imm, _DomEvil.Imm))        # user isbits<:Number still rejects
+    @test !dok(mkpure(Base.:(:)), (Float64, Float64))                # Colon needs integers
+end
+
+@testset "specialization-domain — PER-primitive effect contract: final accepts + custom rejects (RK 06:37)" begin
+    using LinearAlgebra, Random
+    mkeff(f) = (pe = RK._kernel_primitive_effect(f); RK._KernelRegistration(pe.token, :primitive, nothing, (), (), false, f, pe))
+    eok = RK.kernel_builtin_primitive_domain_ok
+    rng = typeof(Random.default_rng())
+    L = typeof(cholesky([2.0 0.0; 0.0 2.0]).L)
+    @test eok(mkeff(Random.randn!), (rng, Vector{Float64}))         # refresh: randn!(rng, mom)
+    @test eok(mkeff(LinearAlgebra.lmul!), (L, Vector{Float64}))     # refresh: lmul!(chol, mom)
+    @test eok(mkeff(Random.rand), (rng, Type{Bool}))               # step!: rand(rng, Bool)
+    @test eok(mkeff(Base.eachcol), (Matrix{Float64},))             # Welford: eachcol(x)
+    @test eok(mkeff(Base.fill!), (Vector{Float64}, Float64))
+    # NEGATIVES: custom rng/matrix/dest under the SAME generic REJECT
+    @test !eok(mkeff(LinearAlgebra.lmul!), (Matrix{String}, Vector{Float64}))  # non-numeric matrix
+    @test !eok(mkeff(Random.randn!), (Int, Vector{Float64}))                    # custom "rng"
+    @test !eok(mkeff(Base.fill!), (_DomEvil.Mut, Float64))                      # custom dest
 end

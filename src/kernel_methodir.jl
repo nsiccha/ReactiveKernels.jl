@@ -106,9 +106,17 @@ struct _Index     <: _MExpr; base::_MExpr; idxs::Tuple{Vararg{_MExpr}}; end
 struct _Getfield  <: _MExpr; base::_MExpr; field::Symbol; end
 "Short-circuit `lhs && rhs` / `lhs || rhs` in expression position (op ∈ (:&&, :||))."
 struct _Short     <: _MExpr; op::Symbol; lhs::_MExpr; rhs::_MExpr; end
-"A CHAINED comparison `a < b <= c` — ordered `operands` (N+1 values) + `ops` (N operators). A faithful
-value node; the `&&`-lowering with the shared middle temp is left to the later lowering."
-struct _Comparison <: _MExpr; operands::Tuple{Vararg{_MExpr}}; ops::Tuple{Vararg{Symbol}}; end
+"A CHAINED comparison `a < b <= c` — ordered `operands` (N+1 values) + `ops` (N operators) + the captured
+EXACT PURE-PRIMITIVE provenance of each operator (`refs`/`regs`, parallel to `ops`; RK 06:08 — a chained
+comparison operator is NOT spelling-authorized, it resolves through the SAME definition-time pure identity
+as a call and is rebind-checked at emission or rejected). A faithful value node; the `&&`-lowering with the
+shared middle temp is left to the later lowering."
+struct _Comparison <: _MExpr
+    operands::Tuple{Vararg{_MExpr}}
+    ops::Tuple{Vararg{Symbol}}
+    refs::Tuple{Vararg{_CapturedCalleeRef}}
+    regs::Tuple{Vararg{_KernelRegistration}}
+end
 "Ternary `cond ? then : else` in expression position."
 struct _IfExpr    <: _MExpr; cond::_MExpr; thenv::_MExpr; elsev::_MExpr; end
 "A value-position BLOCK — an if-EXPRESSION branch (`may_continue = if c; <effects…>; <value> end`):
@@ -539,6 +547,24 @@ function _kmir_lookup_captured(callee, ctx::_KMIRCtx)
     cc
 end
 
+# Resolve a BASE operator identity (`op` a bare Symbol, already de-dotted) to a captured EXACT
+# PURE-PRIMITIVE `_CapturedCallee`, or `nothing` (RK 06:01). This closes the operator loophole:
+# ordinary/dotted/compound operators resolve through the SAME definition-time pure provenance as
+# named calls (rebind-validated by `_kmir_lookup_captured`), NOT `Base.isoperator` spelling.
+function _kmir_pure_op_captured(op::Symbol, ctx::_KMIRCtx)
+    cc = _kmir_lookup_captured(op, ctx)
+    (cc !== nothing && cc.registration.kind === :pure_primitive) ? cc : nothing
+end
+
+# The synthesized binary-operator application of a COMPOUND assignment (`a += b` → `a + b`): a captured
+# EXACT pure-primitive base op -> a `_RegisteredCall` (definition-time identity, rebind-checked); else a
+# hinted `_OpCall`. So compound operators are NOT a spelling loophole either (RK 06:01).
+function _kmir_binop_expr(base::Symbol, args::Tuple, broadcast::Bool, ctx::_KMIRCtx)
+    cc = _kmir_pure_op_captured(base, ctx)
+    cc !== nothing && return _RegisteredCall(cc.ref, cc.registration, false, args, (), broadcast)
+    _OpCall(GlobalRef(ctx.mod, base), args, (), broadcast)
+end
+
 # Classify a bare/qualified callee -> a hygienic GlobalRef, else reject.
 function _kmir_callee_ref(callee, ctx::_KMIRCtx, shadow::Set{Symbol})
     if callee isa Symbol
@@ -658,11 +684,13 @@ function _kmexpr(ex, ctx::_KMIRCtx, shadow::Set{Symbol}; bcast::Bool=false)
         # remaining callees (global/qualified/operator): parse the actuals once.
         bc = _kmir_dotted_op(callee)
         pos, kwp = _kmir_pos_kw(ex, ctx, shadow; bcast=bcast)
-        # (c) a DIRECT REGISTERED @kernel / intrinsic callee -> `_RegisteredCall` from the captured
-        #     def-time snapshot (finding 2), carrying the immutable registration identity.
-        cc = bc ? nothing : _kmir_lookup_captured(callee, ctx)
+        # (c) a DIRECT REGISTERED @kernel / intrinsic / exact pure-primitive callee -> `_RegisteredCall`
+        #     from the captured def-time snapshot (finding 2), carrying the immutable registration
+        #     identity. Ordinary spelling resolves directly; a DOTTED pure operator (`.+`, bc) resolves
+        #     through its captured BASE identity with broadcast set (RK 06:01 — no spelling loophole).
+        cc = bc ? _kmir_pure_op_captured(_kmir_base_op(callee), ctx) : _kmir_lookup_captured(callee, ctx)
         cc !== nothing && return _RegisteredCall(cc.ref, cc.registration,
-            cc.registration.kind === :intrinsic, pos, kwp, bcast)
+            cc.registration.kind === :intrinsic, pos, kwp, bcast || bc)
         # (d) a call passing the RECEIVER/subject as its FIRST actual to a plain (non-op) name that is
         #     neither sibling, field, nor a captured global -> a PENDING subject-method call (finding 1;
         #     `nuts!!`'s `step!(state, rng)`), resolved at construction via the object's Token/MethodId.
@@ -679,7 +707,19 @@ function _kmexpr(ex, ctx::_KMIRCtx, shadow::Set{Symbol}; bcast::Bool=false)
     elseif ex.head === :comparison
         operands = _MExpr[m(ex.args[i]) for i in 1:2:length(ex.args)]
         ops = Symbol[ex.args[i] for i in 2:2:length(ex.args)]
-        return _Comparison(Tuple(operands), Tuple(ops))
+        # RK 06:08: each chained-comparison operator must resolve to a captured EXACT pure primitive by
+        # its base identity (rebind-checked) — a rebound / locally-shadowed / unregistered `<` REJECTS,
+        # never spelling-authorized. Store the captured provenance parallel to `ops`.
+        refs = _CapturedCalleeRef[]; regs = _KernelRegistration[]
+        for op in ops
+            base = _kmir_dotted_op(op) ? _kmir_base_op(op) : op
+            cc = _kmir_pure_op_captured(base, ctx)
+            cc === nothing && _kmir_reject(
+                "chained-comparison operator `$op` does not resolve to a captured exact pure primitive " *
+                "(rebound / locally shadowed / unregistered) — it cannot be spelling-authorized")
+            push!(refs, cc.ref); push!(regs, cc.registration)
+        end
+        return _Comparison(Tuple(operands), Tuple(ops), Tuple(refs), Tuple(regs))
     elseif ex.head === :if && length(ex.args) == 3
         return _IfExpr(m(ex.args[1]), m(ex.args[2]), m(ex.args[3]))
     elseif ex.head === :block
@@ -787,7 +827,7 @@ function _kmir_placewrite(lhs, rhs, op, dot, ctx::_KMIRCtx, shadow::Set{Symbol})
     rexpr  = _kmexpr(rhs, ctx, shadow)
     if op !== nothing
         base = _kmir_dotted_op(op) ? _kmir_base_op(op) : op
-        rexpr = _OpCall(GlobalRef(ctx.mod, base), (_kmexpr(lhs, ctx, shadow), rexpr), (), dot || _kmir_dotted_op(op))
+        rexpr = _kmir_binop_expr(base, (_kmexpr(lhs, ctx, shadow), rexpr), dot || _kmir_dotted_op(op), ctx)
     end
     _PlaceWrite(target, root, owner, alias, rexpr, dot)
 end
@@ -822,7 +862,7 @@ function _kmstmt_assign(ex, ctx::_KMIRCtx, shadow::Set{Symbol})
         rexpr = _kmexpr(rhs, ctx, shadow)
         if op !== nothing
             base = _kmir_dotted_op(op) ? _kmir_base_op(op) : op
-            rexpr = _OpCall(GlobalRef(ctx.mod, base), (_kmexpr(lhs, ctx, shadow), rexpr), (), _kmir_dotted_op(op))
+            rexpr = _kmir_binop_expr(base, (_kmexpr(lhs, ctx, shadow), rexpr), _kmir_dotted_op(op), ctx)
         end
         p = (op === nothing) ? _kmir_recv_path(_kmir_nav_root(rhs), ctx, shadow) : nothing
         # an alias binds to the RHS field root ONLY when the RHS is a field-rooted place (index/getfield
@@ -1100,33 +1140,41 @@ end
 #   (:operator_trait, GlobalRef) | (:opaque_call, GlobalRef) |
 #   (:intrinsic_call, GlobalRef) | (:registered_call, GlobalRef) | (:registered_field, path) |
 #   (:registered_or_nothing_field, path) | (:sibling_overload, name) | (:deferred_alias, alias-or-target).
-function _kmir_facts_from_body(body, control::Symbol)
-    effects = Set{Symbol}(); deps = Any[]
-    for s in body
-        _kmir_walk(s) do n
-            if n isa _PlaceWrite
-                push!(effects, :place_write)
-                (n.root === :deferred) && push!(deps, (:deferred_alias, n.alias === nothing ? n.target : n.alias))
-            elseif n isa _OpCall
-                if n.hint === :opaque
-                    push!(effects, :opaque_call); push!(deps, (:opaque_call, n.op))
-                else                                          # :operator_candidate — a HINT, not proof
-                    push!(deps, (:operator_trait, n.op))
-                end
-            elseif n isa _RegisteredCall
-                # the CAPTURED Token is the identity (finding 2); its effect footprint is resolved later
-                # from the registration's roots — no falsely-final local effect.
-                push!(deps, (n.intrinsic ? :intrinsic_call : :registered_call, n.registration.token))
-            elseif n isa _SubjectMethodCall
-                push!(deps, (:subject_method, n.name))         # resolved at construction (Token/MethodId)
-            elseif n isa _FieldCall
-                push!(deps, (n.hint === :registered_or_nothing ? :registered_or_nothing_field :
-                             :registered_field, n.path))
-            elseif (n isa _Call || n isa _CallExpr) && length(n.candidates) > 1
-                push!(deps, (:sibling_overload, n.name))
-            end
+# One node's contribution to the (effects, deps) census — shared by body statements AND formal-default
+# expression trees (RK 06:21b), so a default's callees are never a hidden opaque edge.
+function _kmir_node_fact!(effects, deps, n)
+    if n isa _PlaceWrite
+        push!(effects, :place_write)
+        (n.root === :deferred) && push!(deps, (:deferred_alias, n.alias === nothing ? n.target : n.alias))
+    elseif n isa _OpCall
+        if n.hint === :opaque
+            push!(effects, :opaque_call); push!(deps, (:opaque_call, n.op))
+        else                                          # :operator_candidate — a HINT, not proof
+            push!(deps, (:operator_trait, n.op))
         end
+    elseif n isa _RegisteredCall
+        # the CAPTURED Token is the identity (finding 2); its effect footprint is resolved later
+        # from the registration's roots — no falsely-final local effect.
+        push!(deps, (n.intrinsic ? :intrinsic_call : :registered_call, n.registration.token))
+    elseif n isa _Comparison
+        # RK 06:08: a chained comparison's operators carry captured EXACT pure-primitive identities
+        # (no opaque edge, no spelling authority) — record each as a registered-call dep.
+        for r in n.regs; push!(deps, (:registered_call, r.token)); end
+    elseif n isa _SubjectMethodCall
+        push!(deps, (:subject_method, n.name))         # resolved at construction (Token/MethodId)
+    elseif n isa _FieldCall
+        push!(deps, (n.hint === :registered_or_nothing ? :registered_or_nothing_field :
+                     :registered_field, n.path))
+    elseif (n isa _Call || n isa _CallExpr) && length(n.candidates) > 1
+        push!(deps, (:sibling_overload, n.name))
     end
+    nothing
+end
+
+function _kmir_facts_from_body(body, control::Symbol, defaults = ())
+    effects = Set{Symbol}(); deps = Any[]
+    for s in body;      _kmir_walk((n) -> _kmir_node_fact!(effects, deps, n), s); end
+    for d in defaults;  _kmir_walk((n) -> _kmir_node_fact!(effects, deps, n), d); end   # RK 06:21b
     deps = unique(deps)
     undecided = any(d -> d isa Tuple && d[1] in (:opaque_call, :sibling_overload, :deferred_alias), deps)
     kind = control in (:loop, :recursive) ? :orchestration : undecided ? :unresolved : :segment
@@ -1189,7 +1237,8 @@ function _kmir_emit_method(m::_KMIRMethodDesc, decl::Int, control::Symbol, preli
             c = body[end]
             body[end] = _Return(_CallExpr(c.name, c.candidates, c.target, c.pos, c.kw))
         end
-        effects, deps, kind = _kmir_facts_from_body(body, control)
+        defexprs = Any[f.default for f in formals if f.default !== nothing]
+        effects, deps, kind = _kmir_facts_from_body(body, control, defexprs)   # RK 06:21b: fold defaults
         return _mir(id, Tuple(formals), Tuple(body), true, nothing; effects, deps, kind)
     catch err
         err isa _KMIRReject || rethrow()
@@ -1264,6 +1313,24 @@ function _kmir_val_reads!(ev, x)
         _kmir_val_reads!(ev, x.lhs)
         rb = _Access[]; _kmir_val_reads!(rb, x.rhs)
         push!(ev, _AGuard(_Access[], rb))                # RHS may not run (short-circuit)
+    elseif x isa _Comparison
+        # RK 06:08/06:17: `a < b <= c` is `(a<b) && (b<=c)` — a SHORT-CIRCUIT chain, the shared middle
+        # operand evaluated ONCE. op1 is a REGISTERED pure call reading operands 1,2 GUARANTEED; each
+        # later op reads only its NEW operand (the middle reused) under a progressively nested `_AGuard`
+        # (may not run). Faithful conditional reads, no opaque/external edge, no spelling authority.
+        n = length(x.regs)
+        rd1 = _Access[]
+        _kmir_val_reads!(rd1, x.operands[1]); _kmir_val_reads!(rd1, x.operands[2])
+        push!(ev, _ACall(:registered, x.regs[1].token, rd1))
+        inner = _Access[]                                # build the guard chain innermost-first
+        for i in n:-1:2
+            body = _Access[]
+            rdi = _Access[]; _kmir_val_reads!(rdi, x.operands[i + 1])
+            push!(body, _ACall(:registered, x.regs[i].token, rdi))
+            isempty(inner) || push!(body, _AGuard(_Access[], inner))
+            inner = body
+        end
+        n >= 2 && push!(ev, _AGuard(_Access[], inner))
     elseif x isa _MExpr
         for fn in fieldnames(typeof(x)); _kmir_vr_field!(ev, getfield(x, fn)); end
     end
@@ -1342,7 +1409,16 @@ carried + may-run-zero, guard bodies may not run, and every call carries its arg
 SOUND input (never a flat two-branch concatenation) to the later read-before-first-write / loop-carried
 / write-only schedule derivation."
 function access_events(ir::MethodIR)
-    ev = _Access[]; for s in ir.body; _kmir_access_stmt!(ev, s); end; ev
+    ev = _Access[]
+    # DEFAULT expressions (RK 06:21b) evaluate at entry, left-to-right, and MAY NOT RUN (the caller may
+    # supply the arg) — each is a guarded read/call prelude, never an unconditional read.
+    for f in ir.formals
+        f.default === nothing && continue
+        db = _Access[]; _kmir_val_reads!(db, f.default)
+        isempty(db) || push!(ev, _AGuard(_Access[], db))
+    end
+    for s in ir.body; _kmir_access_stmt!(ev, s); end
+    ev
 end
 # Recursively flatten the structured events into a flat leaf stream (reads/writes/calls).
 function _kmir_flatten!(out, ev)
@@ -1373,7 +1449,9 @@ read_roots(ir::MethodIR) = unique(Any[e.path for e in _kmir_leaves(ir) if e isa 
 `(:subject_method, name)` / `(:external, op::GlobalRef, hint)`. NOT transitively closed."
 function call_edges(ir::MethodIR)
     out = Any[]
-    for s in ir.body
+    nodes = Any[ir.body...]
+    for f in ir.formals; f.default === nothing || push!(nodes, f.default); end   # RK 06:21b: default callees
+    for s in nodes
         _kmir_walk(s) do n
             n isa _Call            && push!(out, (:sibling, n.name, length(n.candidates)))
             n isa _CallExpr        && push!(out, (:sibling, n.name, length(n.candidates)))
@@ -1381,6 +1459,7 @@ function call_edges(ir::MethodIR)
             n isa _RegisteredCall  && push!(out, (n.intrinsic ? :intrinsic : :registered, n.ref, n.registration.token))
             n isa _SubjectMethodCall && push!(out, (:subject_method, n.name))
             n isa _OpCall          && push!(out, (:external, n.op, n.hint))
+            n isa _Comparison      && foreach((r, g) -> push!(out, (:registered, r, g.token)), n.refs, n.regs)
         end
     end
     unique(out)

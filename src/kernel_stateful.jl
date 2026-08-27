@@ -725,7 +725,7 @@ function _kernel_mode2_expand(name, signature_inputs, call_signature, block,
              # D: snapshot each direct registered callee's identity — the free method's
              # own name + subject/formals + body locals excluded (pending/factory-time).
              _kernel_callee_capture_expr(
-                 _kernel_mode2_callee_pairs(name, signature_inputs, block), __module__))))
+                 _kernel_mode2_callee_pairs(name, signature_inputs, block, raw_signature), __module__))))
 end
 
 # --- registered-kernel resolver + hygiene/rebind discriminator ---------------
@@ -824,7 +824,170 @@ _kernel_primitive_effect(@nospecialize(v)) =
     #   no reactive WRITE (returns a fresh value); reads both actuals.
     v === Random.rand ?
         _EffectDescriptor(Symbol("__rk_rng_Random_rand__"), 2, (), (1, 2), nothing, :rng, :ordered, (), 1) :
+    #   eachcol(A): NOT pure — reads A (arg 1) and returns a lazy VIEW iterator BORROWING arg 1 (RK
+    #   06:10), so a yielded column aliases A and must NOT be treated as an independent value. No write.
+    v === Base.eachcol ?
+        _EffectDescriptor(Symbol("__rk_borrows_Base_eachcol__"), 1, (), (1,), nothing, :pure, :none, (1,), nothing) :
     nothing
+
+# --- exact-identity PURE Base/stdlib primitive SET (RK 2026-08-27 provenance fix) -------------
+#
+# The locked compiler boundary: an ordinary call receiving a reactive place has UNKNOWN mutation
+# unless a DETACHED descriptor exists; `!`-spelling / qualification / `Base.isoperator` are NOT
+# evidence. These exact CALLABLE IDENTITIES are RK-core PURE primitives — arbitrary arity, reads
+# EVERY actual, writes nothing. They are captured at owner definition as kind `:pure_primitive`
+# (token `typeof(target)`, source the exact value), so admission is DEFINITION-TIME + rebind-checked
+# and poc emits the captured authored slot — NEVER a live analysis-time spelling lookup. Operators
+# (ordinary/dotted/compound) resolve through THIS SAME set by their base identity (RK 06:01), so a
+# same-spelled rebound operator cannot bypass the provenance boundary.
+# A DEEPLY-IMMUTABLE Tuple of exact callable identities — NOT a mutable IdSet/Dict registry (RK
+# 06:08: the locked contract forbids a mutable registry in this provenance path; relocating one would
+# not change that). Cold capture, so an identity `===` scan is fine.
+#
+# NARROWED (RK 06:09): only sound reads-all/no-writes identities — operators, scalar math, predicates,
+# type/zero constructors, and non-borrowing navigation. HIGHER-ORDER Base generics (`map`/`filter`/
+# `reduce`/`mapreduce`/`sum`/`prod`/`broadcasted`/`materialize`) are EXCLUDED: they take a callable arg
+# whose effects are arbitrary, so an arity-blind reads-all descriptor is unsound. `eachcol`/`eachrow`
+# are EXCLUDED too — they BORROW arg 1 (return views), carried instead by an exact built-in `borrows`
+# descriptor in `_kernel_primitive_effect` (RK 06:10). An unlisted helper stays OPAQUE (negative test).
+#
+# TRULY MINIMAL (RK 06:21): only the exact identities INDEPENDENTLY OBSERVED as method-body calls in the
+# final fixture MethodIR — arithmetic/comparison OPERATORS plus `zero`, `one`, `oftype`, `isnothing`, and
+# the range `Colon`, plus `logaddexp`. This category's contract is reads-all AND a FRESH result aliasing
+# NO actual, so possibly-aliasing helpers are OUT: `identity`/`getindex`/`first`/`last` (return an actual),
+# `min`/`max`/`clamp`/`ifelse` (return an actual), `convert`/`axes`/`eachindex` (can return/borrow arg),
+# and the whole higher-order family (`map`/`reduce`/`sum`/…, arbitrary callable-arg effects). `eachcol`
+# BORROWS arg 1 → the explicit built-in descriptor in `_kernel_primitive_effect` instead. `dot`/`cholesky`/
+# `logdet`/`log`/`exp`/`sqrt` appear only as TOP-LEVEL GRAPH RECIPES in the fixture (not stateful method
+# calls), so they need no entry here. `oftype` delegates to `convert` and CAN return a mutable arg2 — the
+# final uses are numeric SCALARS (value semantics), so it is retained on the understanding that
+# SPECIALIZATION (poc lowering, where concrete types are known) gates it to scalar/deeply-immutable
+# actuals and rejects a mutable actual (coordinate with poc). Expansion is an explicit later step, never a
+# broad possibly-aliasing whitelist.
+const _KERNEL_PURE_PRIMS = (Base.:+, Base.:-, Base.:*, Base.:/, Base.:\, Base.:^, Base.:%,
+          Base.:(==), Base.:(!=), Base.:<, Base.:>, Base.:<=, Base.:>=, Base.:!, Base.:&, Base.:|, Base.xor,
+          Base.zero, Base.one, Base.oftype, Base.isnothing, Base.length, Base.:(:),
+          LogExpFunctions.logaddexp)
+# EXACT-IDENTITY VALUE test (`===` scan over the immutable tuple) — used at capture (definition-time
+# snapshot) AND in `kernel_rebound` to confirm the current binding is STILL an exact registered pure
+# primitive (spoof/rebind rejection). No mutable membership structure.
+_kernel_pure_primitive_value(@nospecialize(v)) = any(x -> x === v, _KERNEL_PURE_PRIMS)
+
+# ---- PER-CALLEE SPECIALIZATION domain contracts (RK 06:29/06:30/06:33) -----------------------------
+#
+# Exact generic identity is NECESSARY but NOT SUFFICIENT: Base generics are EXTENSIBLE, so a custom type
+# could define a mutating/opaque method under the SAME `Base.:+`/`length`/`isnothing`/… identity. The
+# captured category is therefore a definition-time identity capture PLUS a detached SPECIALIZATION-TIME
+# domain contract validated against the CONCRETE argument types (never IR-inspecting the dispatched
+# method). The contract is PER CALLEE/TOKEN (and arity) — a single all-args-numeric predicate is wrong:
+# `length(proposals)` sees an `Array{<endpoint-state>}` (non-numeric eltype) and `isnothing(stats_f)` sees
+# `Nothing` or a registered kernel object (RK 06:33). LOAD-BEARING: `kernel_pure_primitive_domain_ok` is
+# the exact predicate poc/the factory call at specialization; a same-generic overload on a custom
+# container/number REJECTS unless it carries an explicit `@rk_*` / registered-kernel declaration.
+#
+# Type-domain leaves (all require a BUILT-IN Base/Core concrete type — a user type/overload is out):
+_kernel_dom_builtin(::Type{T}) where {T} = parentmodule(T) in (Base, Core)
+_kernel_dom_num_scalar(::Type{T}) where {T} = isbitstype(T) && T <: Number && _kernel_dom_builtin(T)
+_kernel_dom_int_scalar(::Type{T}) where {T} = isbitstype(T) && T <: Integer && _kernel_dom_builtin(T)
+# a numeric VALUE: a scalar leaf OR a concrete Base numeric array/range (broadcast/array arithmetic).
+function _kernel_dom_num_value(::Type{T}) where {T}
+    _kernel_dom_num_scalar(T) && return true
+    _kernel_dom_builtin(T) || return false
+    (T <: Array || T <: AbstractRange) && return _kernel_dom_num_scalar(eltype(T))
+    false
+end
+# a concrete Base CONTAINER (Array/Tuple/range) of ANY element type — the `length` domain.
+_kernel_dom_container(::Type{T}) where {T} =
+    _kernel_dom_builtin(T) && (T <: Array || T <: Tuple || T <: AbstractRange)
+# a builtin RNG — the rng-arg domain of effect primitives.
+_kernel_dom_rng(::Type{T}) where {T} =
+    T <: Random.AbstractRNG && parentmodule(T) in (Base, Core, Random)
+
+# `isnothing`'s domain: `Nothing`, or a COMPILER-OWNED registered callable/state category with a trusted
+# direct lowering (its `=== nothing` cannot be user-subverted) — e.g. a `stats_f=nuts_stats!` kernel
+# object. Types resolved at CALL time (forward-declared skeletons/intrinsic are defined below).
+_kernel_dom_isnothing(::Type{T}) where {T} =
+    T === Nothing || T <: _Mode2KernelSkeleton || T <: _StatefulKernelSkeleton || T <: _KernelIntrinsic
+
+# PER-CALLEE dispatch on the captured exact identity (`reg.source`).
+function _kernel_pure_callee_domain_ok(@nospecialize(f), argtypes)
+    isempty(argtypes) && return false
+    f === Base.length   && return length(argtypes) == 1 && _kernel_dom_container(argtypes[1])
+    f === Base.isnothing && return length(argtypes) == 1 && _kernel_dom_isnothing(argtypes[1])
+    f === Base.:(:)     && return all(_kernel_dom_int_scalar, argtypes)            # Colon: integer numeric
+    f === Base.oftype   && return length(argtypes) == 2 && all(_kernel_dom_num_scalar, argtypes)
+    (f === Base.zero || f === Base.one) && return length(argtypes) == 1 && _kernel_dom_num_value(argtypes[1])
+    # arithmetic / comparison / logical / logaddexp: numeric leaves OR numeric arrays (broadcast eltype).
+    all(_kernel_dom_num_value, argtypes)
+end
+
+"""
+    kernel_pure_primitive_domain_ok(reg::_KernelRegistration, argtypes) -> Bool
+
+Per-callee SPECIALIZATION admission for a captured `:pure_primitive` call (RK 06:33): `true` iff `reg` is
+a pure-primitive registration AND the CONCRETE `argtypes` are in THIS callee's supported domain (numeric
+leaf for arithmetic/zero/one/oftype/logaddexp, integer for `Colon`, any-eltype Base container for
+`length`, `Nothing`/compiler-owned callable for `isnothing`). A mutating/opaque overload of the same
+generic over an unsupported domain is REJECTED.
+"""
+kernel_pure_primitive_domain_ok(reg, argtypes) =
+    reg.kind === :pure_primitive && _kernel_pure_callee_domain_ok(reg.source, argtypes)
+
+# The SAME principle for RK-core BUILT-IN EFFECT primitives (RK 06:30/06:37): each descriptor is an
+# authoritative contract ONLY over its supported builtin concrete domain — validated PER exact primitive +
+# arity/position (a single coarse all-args predicate is wrong: `lmul!` arg1 is a LinearAlgebra structured
+# matrix, `rand`'s arg2 is a `Type{Bool}`). A user method extending the SAME generic over an unsupported
+# domain REJECTS. A PUBLIC `@rk_*` declaration (`:declared_effect`) is the AUTHOR's trusted contract and is
+# NOT gated; only the silent core built-ins (`:primitive`) refuse to bless arbitrary overloads.
+_kernel_dom_num_array(::Type{T}) where {T} =
+    T <: Array && _kernel_dom_builtin(T) && _kernel_dom_num_scalar(eltype(T))
+_kernel_dom_num_matrix(::Type{T}) where {T} =
+    T <: Matrix && _kernel_dom_builtin(T) && _kernel_dom_num_scalar(eltype(T))
+# sanctioned builtin LinearAlgebra structured matrices (or a dense Base matrix) over builtin numeric.
+function _kernel_dom_lmul_lhs(::Type{T}) where {T}
+    _kernel_dom_num_matrix(T) && return true
+    parentmodule(T) === LinearAlgebra || return false
+    (T <: LinearAlgebra.LowerTriangular || T <: LinearAlgebra.UpperTriangular ||
+     T <: LinearAlgebra.UnitLowerTriangular || T <: LinearAlgebra.UnitUpperTriangular ||
+     T <: LinearAlgebra.Diagonal || T <: LinearAlgebra.Symmetric || T <: LinearAlgebra.Hermitian) &&
+        _kernel_dom_num_scalar(eltype(T))
+end
+# a supported `rand` sample spec at pos2: a `Type{S}` of a builtin sampleable numeric/Bool scalar, or a
+# numeric value spec.
+function _kernel_dom_sample_spec(::Type{T}) where {T}
+    T <: Type || return _kernel_dom_num_value(T)
+    (T isa DataType && length(T.parameters) == 1) || return false
+    S = T.parameters[1]
+    S isa Type && _kernel_dom_num_scalar(S)
+end
+
+# PER-PRIMITIVE dispatch on the captured exact identity (`reg.source`) + arity/position (RK 06:37).
+function _kernel_effect_callee_domain_ok(@nospecialize(f), argtypes)
+    f === Base.fill!     && return length(argtypes) == 2 && _kernel_dom_num_array(argtypes[1]) &&
+                                   _kernel_dom_num_scalar(argtypes[2])
+    f === Base.copyto!   && return length(argtypes) == 2 && _kernel_dom_num_array(argtypes[1]) &&
+                                   _kernel_dom_num_array(argtypes[2])
+    f === Random.randn!  && return length(argtypes) == 2 && _kernel_dom_rng(argtypes[1]) &&
+                                   _kernel_dom_num_array(argtypes[2])
+    f === LinearAlgebra.lmul! && return length(argtypes) == 2 && _kernel_dom_lmul_lhs(argtypes[1]) &&
+                                   _kernel_dom_num_array(argtypes[2])
+    f === Random.rand    && return length(argtypes) == 2 && _kernel_dom_rng(argtypes[1]) &&
+                                   _kernel_dom_sample_spec(argtypes[2])
+    f === Base.eachcol   && return length(argtypes) == 1 && _kernel_dom_num_matrix(argtypes[1])
+    false
+end
+
+"""
+    kernel_builtin_primitive_domain_ok(reg, argtypes) -> Bool
+
+Per-callee/arity SPECIALIZATION admission for a captured RK-core built-in EFFECT primitive (`reg.kind ===
+:primitive`, RK 06:37): dispatches on the exact identity — `fill!`(Base Array dest + numeric scalar),
+`copyto!`(Base Array dest+src), `randn!`(builtin RNG + numeric Array), `lmul!`(sanctioned LinearAlgebra/
+dense matrix + numeric Array), `rand`(builtin RNG + sample `Type`), `eachcol`(Base numeric Matrix). A
+custom overload over an unsupported domain REJECTS. Author `@rk_*` declarations are trusted, not gated.
+"""
+kernel_builtin_primitive_domain_ok(reg, argtypes) =
+    reg.kind === :primitive && _kernel_effect_callee_domain_ok(reg.source, argtypes)
 
 # --- explicit exact-identity DECLARED effects for author helpers (RK ruling A/B) ----
 #
@@ -971,6 +1134,16 @@ by captured VALUE identity, so two distinct stateless specs read as a rebind —
 NEVER reports unchanged merely because there is no Token.
 """
 function kernel_rebound(captured::_KernelRegistration, current)
+    if captured.kind === :pure_primitive
+        # An exact-identity RK-core PURE primitive (RK 06:01): validated by IDENTITY — `current` must
+        # still BE the captured source value AND remain an exact registered pure primitive. A rebind
+        # of the authored slot to a different callable (or to a non-pure one) reads as REBOUND, so a
+        # same-spelled operator/helper cannot bypass the provenance boundary.
+        if current isa _KernelRegistration
+            return current.kind !== :pure_primitive || current.source !== captured.source
+        end
+        return current !== captured.source || !_kernel_pure_primitive_value(current)
+    end
     if captured.kind === :primitive || captured.kind === :declared_effect
         # An RK-core primitive / author-declared-effect helper's target is NOT a registered kernel,
         # so it is validated by RE-DERIVING its detached descriptor from the current value and
@@ -1050,51 +1223,125 @@ function _kernel_body_local_names(body)
     locals
 end
 
+# The base name of ONE authored formal declaration (peel `::T`, `= default`/`:kw`, and `xs...`).
+function _kernel_formal_base_name(a)
+    a isa Symbol && return a
+    if a isa Expr
+        a.head === :(::) && return _kernel_formal_base_name(a.args[1])
+        (a.head === :kw || a.head === :(=)) && return _kernel_formal_base_name(a.args[1])
+        a.head === :... && return _kernel_formal_base_name(a.args[1])
+    end
+    nothing
+end
+
+# The authored DEFAULT value expressions of a peeled `:call` signature, each paired with the formal
+# names IN SCOPE for it (RK 06:21b/06:28). Defaults evaluate LEFT-TO-RIGHT: the i-th formal's default
+# sees ONLY the formals declared BEFORE it (positionals precede keywords) — NOT the current or any LATER
+# formal. So `f(; x = g(), g = 1)` resolves `g` in `x`'s default to the GLOBAL `g` (Julia:
+# `g()=99; f(;x=g(),g=1)=x; f()==99`), and a later formal name matching a global callable must NOT
+# suppress capture in an earlier default. Returns `(default_expr, prior_formal_names)` in authored order.
+function _kernel_call_default_pairs(call)
+    out = Any[]
+    (call isa Expr && call.head === :call) || return out
+    posargs = Any[]; kwargs = Any[]
+    for a in call.args[2:end]
+        (a isa Expr && a.head === :parameters) ? append!(kwargs, a.args) : push!(posargs, a)
+    end
+    prior = Symbol[]
+    for a in Iterators.flatten((posargs, kwargs))     # positionals precede keywords in scope order
+        (a isa Expr && a.head === :kw) && push!(out, (a.args[2], copy(prior)))
+        nm = _kernel_formal_base_name(a); nm === nothing || push!(prior, nm)
+    end
+    out
+end
+
 # PER-METHOD `(body, exclusions)` pairs for a Mode-1 owner. SHARED across methods:
 # sibling method names + owner field/port names. PER-METHOD: that method's formals +
 # that body's locals — so a formal/local `f` in method A never suppresses a genuine
-# registered global `f` call in method B.
+# registered global `f` call in method B. Each method also contributes a DEFAULTS pair
+# (RK 06:21b): defaults evaluate at entry in left-to-right formal scope BEFORE the body — exclude
+# siblings/fields + the formals (a later formal cannot appear in an earlier default), NOT body locals.
 function _kernel_mode1_callee_pairs(signature_inputs, recipe_stmts, methods)
     shared = Set{Symbol}(m.name for m in methods)
     union!(shared, _kernel_owner_field_names(signature_inputs, recipe_stmts))
-    map(methods) do m
+    pairs = Any[]
+    for m in methods
         excl = copy(shared)
         union!(excl, m.argnames)
         m.vararg === nothing || push!(excl, m.vararg)
         m.kwargs_splat === nothing || push!(excl, m.kwargs_splat)
         union!(excl, _kernel_body_local_names(m.body))
-        (m.body, excl)
+        push!(pairs, (m.body, excl))
+        for (dexpr, prior) in _kernel_call_default_pairs(m.call)   # one pair PER default, left-to-right
+            dexcl = copy(shared); union!(dexcl, prior)             # only PRIOR formals in scope (RK 06:28)
+            push!(pairs, (dexpr, dexcl))
+        end
     end
+    pairs
 end
 
-# The single `(body, exclusions)` pair for a Mode-2 free method: its own name + the
-# subject/formals (signature inputs) + body locals.
-function _kernel_mode2_callee_pairs(name, signature_inputs, block)
-    excl = Set{Symbol}((name,))
-    union!(excl, (first(i) for i in signature_inputs))
-    union!(excl, _kernel_body_local_names(block))
-    [(block, excl)]
+# The `(body, exclusions)` pair(s) for a Mode-2 free method: its own name + the subject/formals
+# (signature inputs) + body locals; plus a DEFAULTS pair (RK 06:21b) in formal scope (siblings has only
+# the method's own name; a default sees the subject/formals + globals).
+function _kernel_mode2_callee_pairs(name, signature_inputs, block, raw_signature)
+    formals = Set{Symbol}(first(i) for i in signature_inputs)
+    excl = Set{Symbol}((name,)); union!(excl, formals); union!(excl, _kernel_body_local_names(block))
+    pairs = Any[(block, excl)]
+    for (dexpr, prior) in _kernel_call_default_pairs(_kernel_peel_signature(raw_signature))
+        dexcl = Set{Symbol}((name,)); union!(dexcl, prior)         # own name + only PRIOR formals (RK 06:28)
+        push!(pairs, (dexpr, dexcl))
+    end
+    pairs
 end
 
-# Distinct DIRECT callee references at `:call` heads in ONE `body`, EXCLUDING every name
-# in `exclusions` — sibling/subject-method names, owner field/port names, and THIS body's
-# formals/locals — which are pending/factory-time values that take PRECEDENCE over any
-# same-spelled global. `:quote`/deferred syntax is not descended into. Bare `f` → `:f`;
-# `Mod.f` → `(:Mod, :f)`; both immutable, never a QuoteNode wrapping a mutable Expr.
+# De-dot an operator-callee spelling to its BASE identity (RK 06:01: `a .+ b` is `Expr(:call, :.+, …)`,
+# and `.+` is not a binding — its base `+` is). A field access / `..` is NOT a dotted operator.
+_kernel_dedot_op(s::Symbol) =
+    (str = String(s); length(str) >= 2 && str[1] == '.' && str[2] != '.') ? Symbol(str[2:end]) : s
+# The base operator of a COMPOUND-assignment head so its identity is captured too (`+=`→`+`, `.+=`→`+`).
+# `nothing` for plain `=`/`.=` and for comparisons (`==`/`!=`/`<=`/`>=` and their dotted forms).
+function _kernel_compound_base_op(head::Symbol)
+    s = String(head)
+    startswith(s, ".") && (s = s[2:end])
+    (endswith(s, "=") && length(s) > 1 && s[end-1] != '=' && !(s in ("!=", "<=", ">="))) || return nothing
+    Symbol(s[1:end-1])
+end
+
+# Distinct DIRECT callee references at `:call` heads (and the base operator of COMPOUND-assignment
+# heads — RK 06:01, so a `+=`/`.+` operator resolves through the SAME captured pure identity, not a
+# spelling loophole) in ONE `body`, EXCLUDING every name in `exclusions` — sibling/subject-method
+# names, owner field/port names, and THIS body's formals/locals — which are pending/factory-time
+# values that take PRECEDENCE over any same-spelled global. `:quote`/deferred syntax is not descended
+# into. Bare `f` → `:f`; dotted `.+` → its base `:+`; `Mod.f` → `(:Mod, :f)`; all immutable.
 function _kernel_body_callee_refs(body, exclusions)
     refs = Any[]
     seen = Set{Any}()
+    add! = function (ref)
+        ref !== nothing && !(ref in seen) && (push!(seen, ref); push!(refs, ref))
+    end
     local walk
     walk = function (x)
         x isa Expr || return
         x.head === :quote && return                       # skip quoted/deferred syntax
         if x.head === :call && !isempty(x.args)
             c = x.args[1]
-            ref = c isa Symbol ? (c in exclusions ? nothing : c) :
-                  (c isa Expr && c.head === :(.) && length(c.args) == 2 &&
-                   c.args[1] isa Symbol && c.args[2] isa QuoteNode) ?
-                      (c.args[1], c.args[2].value) : nothing
-            ref !== nothing && !(ref in seen) && (push!(seen, ref); push!(refs, ref))
+            if c isa Symbol
+                b = _kernel_dedot_op(c)                    # `.+` → `+`; bare name unchanged
+                add!(b in exclusions ? nothing : b)
+            elseif c isa Expr && c.head === :(.) && length(c.args) == 2 &&
+                   c.args[1] isa Symbol && c.args[2] isa QuoteNode
+                add!((c.args[1], c.args[2].value))
+            end
+        elseif x.head === :comparison                      # CHAINED `a < b <= c` (RK 06:08): the operators
+            for i in 2:2:length(x.args)                    #   are bare Symbols at even positions — capture
+                o = x.args[i]                              #   each base identity so it is not spelling-only
+                o isa Symbol || continue
+                b = _kernel_dedot_op(o)
+                add!(b in exclusions ? nothing : b)
+            end
+        else
+            b = _kernel_compound_base_op(x.head)           # `a += b` / `a .+= b` → base op `+`
+            b !== nothing && add!(b in exclusions ? nothing : b)
         end
         for a in x.args
             walk(a)
@@ -1174,9 +1421,18 @@ function _kernel_capture_callees(mod::Module, refs)
             if peff === nothing
                 # not an RK-core primitive — does the exact identity carry an author-DECLARED
                 # effect descriptor (@rk_pure/@rk_borrows/@rk_rng)? Capture it detached (kind
-                # :declared_effect); else omit (opaque → the ownership closure rejects by name).
+                # :declared_effect); else is it an exact-identity RK-core PURE primitive (RK 06:01,
+                # incl. an operator's base identity)? Capture kind :pure_primitive (token
+                # typeof(target), source the exact value, no descriptor — reads-all/no-writes, any
+                # arity); else omit (opaque → the ownership closure rejects by name).
                 deff = _kernel_declared_effect(target)
-                deff === nothing && continue
+                if deff === nothing
+                    _kernel_pure_primitive_value(target) || continue
+                    reg = _KernelRegistration(typeof(target), :pure_primitive, nothing,
+                                              (), (), false, target, nothing)
+                    push!(caps, _CapturedCallee(cref, reg, target))
+                    continue
+                end
                 reg = _KernelRegistration(deff.token, :declared_effect, nothing,
                                           (), (), false, target, deff)
                 push!(caps, _CapturedCallee(cref, reg, target))
