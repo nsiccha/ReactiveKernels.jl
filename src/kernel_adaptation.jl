@@ -85,6 +85,7 @@ struct _DLit{T} <: _SMDomainNode end
 struct _DCall{Source,Dot,Args} <: _SMDomainNode end
 struct _DWrite{Target,Dot,Rhs} <: _SMDomainNode end
 struct _DValue{Rhs} <: _SMDomainNode end
+struct _DDefault{Name,Rhs} <: _SMDomainNode end
 struct _DOrchestration{Borrow,SegmentForest} <: _SMDomainNode end
 
 # A column yielded by `eachcol(::Matrix{T})` is a builtin, non-owning view, not a fabricated `Vector{T}`.
@@ -207,6 +208,10 @@ function _sm_validate_node(::Type{_DWrite{T,D,R}}, argtypes, ::Type{KWT}) where 
 end
 _sm_validate_node(::Type{_DValue{R}}, argtypes, ::Type{KWT}) where {R,KWT} =
     (_sm_dtype(R, argtypes, KWT, false); nothing)
+function _sm_validate_node(::Type{_DDefault{N,R}}, argtypes, ::Type{KWT}) where {N,R,KWT}
+    N in KWT.parameters[1] || _sm_dtype(R, argtypes, KWT, false)
+    nothing
+end
 
 function _sm_validate_forest(::Type{F}, argtypes, ::Type{KWT}) where {F,KWT}
     for N in F.parameters
@@ -292,7 +297,7 @@ function _sm_domain_forest(ir::MethodIR, plan::_KernelPlan, fields, ::Type{OW}, 
         elseif f.kind === :kw
             dt = f.default === nothing ? Nothing : _sm_dtree(f.default, plan, fields, OW, SH, finfo, ltrees, false)
             finfo[f.name] = _DKw{f.name,dt}
-            dt === Nothing || push!(nodes, _DValue{dt})
+            dt === Nothing || push!(nodes, _DDefault{f.name,dt})
         end
     end
     for st in ir.body

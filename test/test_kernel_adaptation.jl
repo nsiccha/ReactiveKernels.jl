@@ -2,7 +2,7 @@
 # object — the AUTHORED recurrence, NOT the package @reactive type (HMC acceptance G3/G4).  Construction and
 # method execution share the authoritative plan/ownership/bootstrap substrate; the hot method ABI is concrete,
 # inferred, and allocation-free.
-using Test, LinearAlgebra
+using Test, LinearAlgebra, InteractiveUtils
 using ReactiveKernels
 const RK = ReactiveKernels
 
@@ -137,7 +137,10 @@ end
 @testset "kernel_adaptation — DA/Welford authoring has no @rk helper/result/arity contract" begin
     src = read(joinpath(@__DIR__, "..", "benchmark", "nuts_kernel_authoring_fixture.jl"), String)
     wstart = findfirst("@kernel welford_var", src)
+    dstart = findfirst("@kernel dual_averaging_state", src)
+    dsrc = src[first(dstart):(first(wstart) - 1)]
     wsrc = src[first(wstart):end]
+    @test !occursin("@rk_", dsrc)
     @test !occursin("@rk_", wsrc)
     @test !occursin("smooth(", wsrc)
     for skel in (_AdaptFix.dual_averaging_state, _AdaptFix.welford_var), ir in RK.method_irs(skel)
@@ -165,6 +168,11 @@ using ReactiveKernels
 @kernel required_kw_state(init) = begin
     value = zero(init)
     step!(x; dn) = value += x * dn
+end
+
+@kernel default_order_state(init) = begin
+    value = zero(init)
+    step!(x; a = x, b = a + one(a)) = value += b
 end
 
 @kernel bad_length_state(init) = begin
@@ -231,6 +239,14 @@ end
     RK.stateful_call!(req, Val(:step!), 2.0; dn = 3.0)
     @test RK.stateful_get(req, Val(:value)) == 6.0
     @test_throws ArgumentError RK.stateful_call!(req, Val(:step!), 2.0; bogus = 3.0)
+
+    ord = _cstate(_AdaptBad.default_order_state, 0.0)
+    RK.stateful_call!(ord, Val(:step!), 2.0)
+    @test RK.stateful_get(ord, Val(:value)) == 3.0
+    RK.stateful_call!(ord, Val(:step!), 2.0; a = 4.0)
+    @test RK.stateful_get(ord, Val(:value)) == 8.0
+    RK.stateful_call!(ord, Val(:step!), 2.0; a = "unused", b = 5.0)
+    @test RK.stateful_get(ord, Val(:value)) == 13.0
 
     w = _cstate(_AdaptFix.welford_var, zeros(3))
     @test_throws ArgumentError RK.stateful_call!(w, Val(:step!), [1.0,2,3]; bogus = 1.0)
@@ -301,6 +317,16 @@ end
     @test !_scur(pfd, getfield(d,:owned), getfield(d,:shared), :log_current)
     @test !_scur(pfd, getfield(d,:owned), getfield(d,:shared), :current)
     @test _scur(pfd, getfield(d,:owned), getfield(d,:shared), :log_final) # ensure threw before target kill
+
+    # A forged MethodIR write to a genuinely shared plan slot must be rejected by the emitter itself; it may
+    # not infer ownership from the method-local write set.
+    baseir = only(RK.method_irs(_AdaptFix.dual_averaging_state))
+    forged = RK._PlaceWrite(RK._SelfField((:mu,)), :self, (:mu,), nothing, RK._Lit(1.0), false)
+    badir = RK.MethodIR(baseir.id, baseir.self, baseir.formals, (forged,), baseir.control,
+        baseir.effects, baseir.resolution_deps, baseir.kind, baseir.ok, baseir.reason, baseir.signature)
+    mu = RK.kernel_plan_slot(pfd.plan, :mu).canon
+    @test_throws RK._LLowerReject RK.compile_stateful_method(pfd, typeof(getfield(d,:owned)),
+        typeof(getfield(d,:shared)), badir, Set((mu,)))
 end
 
 function _hot_type_clean(T, seen = Set{Any}())
@@ -313,6 +339,27 @@ function _hot_type_clean(T, seen = Set{Any}())
     isconcretetype(T) || return false
     T isa DataType || return true
     all(ft -> _hot_type_clean(ft, seen), fieldtypes(T))
+end
+
+
+function _llvm_text(f, tt)
+    io = IOBuffer()
+    InteractiveUtils.code_llvm(io, f, tt; raw = true, dump_module = false, optimize = true)
+    String(take!(io))
+end
+
+@testset "kernel_adaptation — typed hot batches contain no generic apply or boxing" begin
+    kd = RK.compile_stateful(_AdaptFix.dual_averaging_state, 0.65)
+    sd = kd(0.65)
+    kw = RK.compile_stateful(_AdaptFix.welford_var, zeros(3))
+    sw = kw(zeros(3))
+    for (f, tt) in ((_da_batch!, Tuple{typeof(sd),Float64,Val{64}}),
+                    (_wv_batch!, Tuple{typeof(sw),Vector{Float64},Val{64}}),
+                    (_wv_batch!, Tuple{typeof(sw),Matrix{Float64},Val{64}}))
+        llvm = _llvm_text(f, tt)
+        @test !occursin("apply_generic", llvm)
+        @test !occursin("jl_box", llvm)
+    end
 end
 
 @testset "kernel_adaptation — compiled hot state is concrete and retains no Dict/Any/Function/Core.Box" begin
