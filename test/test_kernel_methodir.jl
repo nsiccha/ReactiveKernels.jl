@@ -481,7 +481,10 @@ end
 _default_of(ir, nm) = (i = findfirst(f -> f.name === nm, ir.formals); i === nothing ? nothing : ir.formals[i].default)
 
 module _DomEvil
+    using LinearAlgebra
     struct Imm <: Number; x::Int; end                  # a USER isbits <: Number (module not Base/Core)
+    struct UInt2 <: Integer; v::Int; end               # a USER integer parameter
+    struct EvilArr <: AbstractMatrix{Float64} end      # a custom backing storage for a LA wrapper
     mutable struct Mut; y::Int; end
     Base.:+(a::Mut, b::Mut) = (a.y += b.y; a)          # mutating `+` under the Base identity
     Base.length(a::Mut) = (a.y += 1; a.y)              # mutating `length` under the Base identity
@@ -591,6 +594,11 @@ end
     @test !dok(mkpure(Base.:+), (_DomEvil.Mut, _DomEvil.Mut))
     @test !dok(mkpure(Base.:+), (_DomEvil.Imm, _DomEvil.Imm))        # user isbits<:Number still rejects
     @test !dok(mkpure(Base.:(:)), (Float64, Float64))                # Colon needs integers
+    # RK 06:43b/06:44: recursively-safe concrete representation — a Base-owned numeric wrapper
+    # parameterized by a USER type dispatches user code and REJECTS; a builtin-param wrapper is admitted.
+    @test dok(mkpure(Base.:+), (Complex{Float64}, Complex{Float64}))
+    @test !dok(mkpure(Base.:+), (Rational{_DomEvil.UInt2}, Rational{_DomEvil.UInt2}))
+    @test !dok(mkpure(Base.:+), (Rational{BigInt}, Rational{BigInt}))   # BigInt is not a primitive leaf
 end
 
 @testset "specialization-domain — PER-primitive effect contract: final accepts + custom rejects (RK 06:37)" begin
@@ -600,7 +608,9 @@ end
     rng = typeof(Random.default_rng())
     L = typeof(cholesky([2.0 0.0; 0.0 2.0]).L)
     @test eok(mkeff(Random.randn!), (rng, Vector{Float64}))         # refresh: randn!(rng, mom)
-    @test eok(mkeff(LinearAlgebra.lmul!), (L, Vector{Float64}))     # refresh: lmul!(chol, mom)
+    @test eok(mkeff(LinearAlgebra.lmul!), (L, Vector{Float64}))     # refresh: lmul!(chol, mom); L=LowerTriangular{T,Matrix{T}}
+    @test L <: LinearAlgebra.LowerTriangular && L.parameters[2] <: Matrix   # Cholesky.L backing is a Base Matrix
+    @test eok(mkeff(LinearAlgebra.lmul!), (Diagonal{Float64,Vector{Float64}}, Vector{Float64}))
     @test eok(mkeff(Random.rand), (rng, Type{Bool}))               # step!: rand(rng, Bool)
     @test eok(mkeff(Base.eachcol), (Matrix{Float64},))             # Welford: eachcol(x)
     @test eok(mkeff(Base.fill!), (Vector{Float64}, Float64))
@@ -608,4 +618,7 @@ end
     @test !eok(mkeff(LinearAlgebra.lmul!), (Matrix{String}, Vector{Float64}))  # non-numeric matrix
     @test !eok(mkeff(Random.randn!), (Int, Vector{Float64}))                    # custom "rng"
     @test !eok(mkeff(Base.fill!), (_DomEvil.Mut, Float64))                      # custom dest
+    # RK 06:43/06:44: a custom AbstractMatrix BACKING a LinearAlgebra wrapper must REJECT (the wrapper
+    # parentmodule is not enough — its getindex/lmul! can carry arbitrary effects)
+    @test !eok(mkeff(LinearAlgebra.lmul!), (LowerTriangular{Float64,_DomEvil.EvilArr}, Vector{Float64}))
 end

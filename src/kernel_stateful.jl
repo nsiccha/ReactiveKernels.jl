@@ -885,10 +885,23 @@ _kernel_pure_primitive_value(@nospecialize(v)) = any(x -> x === v, _KERNEL_PURE_
 # the exact predicate poc/the factory call at specialization; a same-generic overload on a custom
 # container/number REJECTS unless it carries an explicit `@rk_*` / registered-kernel declaration.
 #
-# Type-domain leaves (all require a BUILT-IN Base/Core concrete type — a user type/overload is out):
+# Type-domain leaves. A numeric SCALAR must be RECURSIVELY-SAFE CONCRETE REPRESENTATION, not merely
+# `parentmodule ∈ Base/Core + isbits Number` (RK 06:43b): a Base-owned wrapper parameterized by a user
+# type — `Rational{UserInt}`, `Complex{UserReal}` — still dispatches user code. Whitelist the primitive
+# builtin bit integers/Bool and IEEE floats; admit `Complex`/`Rational` ONLY when every parameter is
+# itself admitted (recursive). Final NUTS uses Float32/Float64/Int and passes.
+const _KERNEL_SAFE_LEAF_NUMS = (Bool, Int8, Int16, Int32, Int64, Int128,
+                                UInt8, UInt16, UInt32, UInt64, UInt128, Float16, Float32, Float64)
+const _KERNEL_SAFE_LEAF_INTS = (Bool, Int8, Int16, Int32, Int64, Int128,
+                                UInt8, UInt16, UInt32, UInt64, UInt128)
 _kernel_dom_builtin(::Type{T}) where {T} = parentmodule(T) in (Base, Core)
-_kernel_dom_num_scalar(::Type{T}) where {T} = isbitstype(T) && T <: Number && _kernel_dom_builtin(T)
-_kernel_dom_int_scalar(::Type{T}) where {T} = isbitstype(T) && T <: Integer && _kernel_dom_builtin(T)
+function _kernel_dom_num_scalar(::Type{T}) where {T}
+    any(x -> x === T, _KERNEL_SAFE_LEAF_NUMS) && return true
+    (T <: Complex || T <: Rational) && T isa DataType && length(T.parameters) == 1 &&
+        return _kernel_dom_num_scalar(T.parameters[1])       # recursively safe wrapper
+    false
+end
+_kernel_dom_int_scalar(::Type{T}) where {T} = any(x -> x === T, _KERNEL_SAFE_LEAF_INTS)
 # a numeric VALUE: a scalar leaf OR a concrete Base numeric array/range (broadcast/array arithmetic).
 function _kernel_dom_num_value(::Type{T}) where {T}
     _kernel_dom_num_scalar(T) && return true
@@ -944,13 +957,24 @@ _kernel_dom_num_array(::Type{T}) where {T} =
 _kernel_dom_num_matrix(::Type{T}) where {T} =
     T <: Matrix && _kernel_dom_builtin(T) && _kernel_dom_num_scalar(eltype(T))
 # sanctioned builtin LinearAlgebra structured matrices (or a dense Base matrix) over builtin numeric.
+# HARDENING (RK 06:43): the wrapper parentmodule/eltype is NOT enough — a structured wrapper can BACK a
+# custom AbstractMatrix/Vector whose getindex/lmul! has arbitrary effects while the outer type still
+# belongs to LinearAlgebra. Require the BACKING STORAGE type parameter to itself be a concrete Base numeric
+# Matrix (Vector for `Diagonal`). Final `cholesky(m).L :: LowerTriangular{T,Matrix{T}}` passes.
 function _kernel_dom_lmul_lhs(::Type{T}) where {T}
-    _kernel_dom_num_matrix(T) && return true
+    _kernel_dom_num_matrix(T) && return true                   # a dense concrete Base numeric Matrix
     parentmodule(T) === LinearAlgebra || return false
-    (T <: LinearAlgebra.LowerTriangular || T <: LinearAlgebra.UpperTriangular ||
-     T <: LinearAlgebra.UnitLowerTriangular || T <: LinearAlgebra.UnitUpperTriangular ||
-     T <: LinearAlgebra.Diagonal || T <: LinearAlgebra.Symmetric || T <: LinearAlgebra.Hermitian) &&
-        _kernel_dom_num_scalar(eltype(T))
+    (T isa DataType && length(T.parameters) >= 2) || return false
+    S = T.parameters[2]                                        # the backing storage type
+    S isa Type || return false
+    if T <: LinearAlgebra.Diagonal
+        return S <: Vector && _kernel_dom_num_array(S)         # Diagonal backs a concrete Base Vector
+    elseif T <: LinearAlgebra.LowerTriangular || T <: LinearAlgebra.UpperTriangular ||
+           T <: LinearAlgebra.UnitLowerTriangular || T <: LinearAlgebra.UnitUpperTriangular ||
+           T <: LinearAlgebra.Symmetric || T <: LinearAlgebra.Hermitian
+        return _kernel_dom_num_matrix(S)                       # backs a concrete Base numeric Matrix
+    end
+    false
 end
 # a supported `rand` sample spec at pos2: a `Type{S}` of a builtin sampleable numeric/Bool scalar, or a
 # numeric value spec.
