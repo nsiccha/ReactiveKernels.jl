@@ -30,6 +30,48 @@ module _NativeFakeStructural
     const Bool = Core.Bool
 end
 
+struct _NativeCountedGrad
+    count::Vector{Int}
+end
+@inline function (g::_NativeCountedGrad)(dst,p)
+    @inbounds g.count[1]+=1
+    @. dst=2*p
+    sum(abs2,p)
+end
+struct _NativeThrowGrad
+    count::Vector{Int}
+    fail::Vector{Bool}
+end
+@inline function (g::_NativeThrowGrad)(dst,p)
+    @inbounds g.count[1]+=1
+    @inbounds g.fail[1] && error("NATIVE_GRAD_SENTINEL")
+    @. dst=2*p
+    sum(abs2,p)
+end
+struct _NativeThrowRNG <: Random.AbstractRNG end
+Random.randn!(::_NativeThrowRNG, x::AbstractArray) = error("NATIVE_RNG_SENTINEL")
+
+function _native_vals_with_grad(pf,T,grad;metric=T[2 0;0 2])
+    d=_native_vals(pf,T); P=RK.kernel_prepared_plan(pf)
+    for s in RK.kernel_plan_slots(P)
+        n=String(s.path[1])
+        n=="grad_f" && (d[s.canon]=grad)
+        n=="metric" && (d[s.canon]=metric)
+        n=="chol_metric" && (d[s.canon]=cholesky(metric))
+    end
+    d
+end
+
+function _native_build_instrumented(pf,T;grad=_NativeCountedGrad([0]),metric=T[2 0;0 2],
+        md=5,min_dham=T(-1000),stats=_NativeNutsFix.nuts_stats!)
+    vals=_native_vals_with_grad(pf,T,grad;metric=metric)
+    k=RK._build_nuts_instrumented_sampler(pf,vals,_NativeNutsFix.nuts_state,
+        _NativeNutsFix.refresh_momentum!!,_NativeNutsFix.nuts!!;
+        step_f=RK.partial(_NativeNutsFix.leapfrog!;stepsize=T(.1)),max_depth=md,
+        min_dham=min_dham,stats_f=stats)
+    k,grad
+end
+
 
 @testset "native NUTS — generated root executes the real fixture" begin
     pf=_native_pf(); fr=_native_frame(pf,Float64,3)
@@ -413,11 +455,198 @@ end
                             RK.kernel_registration(_NativeNutsFix2.leapfrog!))
     plan2=RK.kernel_prepared_plan(pf2); q=typeof(cert).parameters
     BadCert=Core.apply_type(RK._NutsCertificate,q[1],q[2],q[3],typeof(plan2),
-        RK.kernel_plan_key(plan2),q[6],q[7],q[8],q[9],q[10],q[11],q[12],q[13])
+        RK.kernel_plan_key(plan2),q[6],q[7],q[8],q[9],q[10],q[11],q[12],q[13],q[14],
+        q[15],q[16],q[17])
     hc=RK._NutsHandles(Val(RT),getfield(h,:root),getfield(h,:scratch),frame,BadCert())
     kc=RK.KernelObject{OT,typeof(frame),typeof(hc)}(frame,hc)
     @test_throws ArgumentError RK.nuts_sealed_certificate(kc)
 
     @test_throws ArgumentError RK._native_nuts_certificate(Val(:instrumented),pf,
         _NativeNutsFix.nuts_state,Val(RT),getfield(h,:root),getfield(h,:scratch),frame)
+end
+
+
+@testset "instrumented native NUTS — compiler-owned seal and exact emitted tape" begin
+    pf=_native_pf()
+    kp=RK._build_nuts_sampler(pf,_native_vals(pf,Float64),_NativeNutsFix.nuts_state,
+        _NativeNutsFix.refresh_momentum!!,_NativeNutsFix.nuts!!;
+        step_f=RK.partial(_NativeNutsFix.leapfrog!;stepsize=.1),max_depth=5,
+        min_dham=-1000,stats_f=_NativeNutsFix.nuts_stats!)
+    ki,_=_native_build_instrumented(pf,Float64)
+    cp=RK._nuts_certificate_parts(RK.nuts_sealed_certificate(kp))
+    ci=RK._nuts_certificate_parts(RK.nuts_sealed_certificate(ki))
+    @test fieldcount(typeof(RK.nuts_sealed_certificate(ki))) == 0
+    @test cp.mode === :production && ci.mode === :instrumented
+    @test cp.owner === ci.owner && cp.root_token === ci.root_token
+    @test cp.plan === ci.plan && cp.plan_key === ci.plan_key
+    @test cp.program === ci.program && cp.control === ci.control
+    @test cp.recipe_manifest === ci.recipe_manifest
+    @test cp.recipes === ci.recipes && cp.roles === ci.roles && cp.integrator === ci.integrator
+    @test RK.nuts_sealed_root(kp) !== RK.nuts_sealed_root(ki)
+    @test RK.nuts_sealed_frame(kp) !== RK.nuts_sealed_frame(ki)
+    @test RK.nuts_sealed_scratch(kp) === ()
+    @test RK.nuts_sealed_scratch(ki) === getfield(RK.nuts_sealed_root(ki),:scratch)
+    prod_lowered=join(string.(Base.code_lowered(RK.nuts_sealed_root(kp),
+        Tuple{typeof(RK.nuts_sealed_frame(kp)),Tuple{},Random.Xoshiro})))
+    @test !occursin("_nuts_instrument",prod_lowered)
+    @test RK.nuts_instrumentation_equivalent(kp,ki)
+    @test RK._nuts_real_op_signature(cp.emitted_ops) === RK._nuts_real_op_signature(ci.emitted_ops)
+    @test RK._nuts_validate_emitted_ops(:production,cp.emitted_ops)
+    @test RK._nuts_validate_emitted_ops(:instrumented,ci.emitted_ops)
+    @test !any(T->T<:RK._NutsInstrumentWrite,cp.emitted_ops.parameters)
+    its=ci.emitted_ops.parameters
+    @test any(T->T<:RK._NutsInstrumentWrite,its)
+    @test all(i->begin
+        T=its[i]
+        !(T<:RK._NutsInstrumentWrite) ||
+          (i>1 && its[i-1]<:RK._NutsRealOp && T.parameters[2]==its[i-1].parameters[1])
+    end,eachindex(its))
+    realids=[T.parameters[1] for T in its if T<:RK._NutsRealOp]
+    instrids=[T.parameters[1] for T in its if T<:RK._NutsInstrumentWrite]
+    @test length(realids)==length(unique(realids))
+    @test length(instrids)==length(unique(instrids))
+    @test isempty(intersect(Set(realids),Set(instrids)))
+    @test count(T->T<:RK._NutsRealOp && T.parameters[2]===:leaf_write,its) == 3
+    R1=RK._NutsRealOp{1,:probe,:a}; R2=RK._NutsRealOp{2,:probe,:b}
+    I1=RK._NutsInstrumentWrite{100001,1,:probe}; Ibad=RK._NutsInstrumentWrite{100002,1,:probe}
+    @test !RK._nuts_validate_emitted_ops(:instrumented,Tuple{I1,R1})       # write before real
+    @test !RK._nuts_validate_emitted_ops(:instrumented,Tuple{R1,R2,Ibad}) # declared adjacency is elsewhere
+    @test !RK._nuts_validate_emitted_ops(:production,Tuple{R1,I1})
+    @test !RK._nuts_validate_emitted_ops(:instrumented,Tuple{R1,I1,R1})   # duplicate real lexical id
+
+    # No adapter-shaped object can enter the seal.  The exact scratch VALUE is retained in the root, so even
+    # a same-concrete-type deep copy is detached and rejected rather than accepted by shape alone.
+    coordinated=(root=RK.nuts_sealed_root(ki),scratch=RK.nuts_sealed_scratch(ki),
+                 certificate=RK.nuts_sealed_certificate(ki))
+    @test_throws MethodError RK.nuts_instrumented_counts(coordinated)
+    h=getfield(ki,:handles); sc2=deepcopy(getfield(h,:scratch)); OT=RK.kernel_token(ki)
+    h2=RK._NutsHandles(Val(RK.nuts_handles_root_token(h)),getfield(h,:root),sc2,
+                       getfield(h,:frame),getfield(h,:certificate))
+    k2=RK.KernelObject{OT,typeof(getfield(ki,:state)),typeof(h2)}(getfield(ki,:state),h2)
+    @test_throws ArgumentError RK.nuts_instrumented_counts(k2)
+    @test_throws ArgumentError getfield(h,:root)(getfield(h,:frame),sc2,Random.Xoshiro(1))
+    @test !RK.nuts_instrumentation_equivalent(kp,kp)
+    @test !RK.nuts_instrumentation_equivalent(ki,ki)
+    # A different frame carries equal metric values but is not the sampler's actual metric authority.
+    frame2=_native_frame(pf,Float64,5;stats=_NativeNutsFix.nuts_stats!)
+    hf=RK._NutsHandles(Val(RK.nuts_handles_root_token(h)),getfield(h,:root),getfield(h,:scratch),
+                       frame2,getfield(h,:certificate))
+    kf=RK.KernelObject{OT,typeof(frame2),typeof(hf)}(frame2,hf)
+    @test_throws ArgumentError RK.nuts_sealed_metric(kf)
+end
+
+
+@testset "instrumented native NUTS — ordinary/divergence/throw parity" begin
+    for T in (Float64,Float32)
+        pf=_native_pf()
+        fp=_native_frame(pf,T,5;stats=_NativeNutsFix.nuts_stats!)
+        fi=_native_frame(pf,T,5;stats=_NativeNutsFix.nuts_stats!)
+        Cp=RK.compile_nuts_native(pf,_NativeNutsFix.nuts_state,_NativeNutsFix.refresh_momentum!!,
+                                  _NativeNutsFix.nuts!!,fp)
+        Ci=RK.compile_nuts_native_instrumented(pf,_NativeNutsFix.nuts_state,
+            _NativeNutsFix.refresh_momentum!!,_NativeNutsFix.nuts!!,fi)
+        for seed in 1:8
+            Cp.root!(fp,Cp.scratch,Random.Xoshiro(seed))
+            Ci.root!(fi,Ci.scratch,Random.Xoshiro(seed))
+            @test _native_obs(pf,fi)==_native_obs(pf,fp)
+        end
+        fpd=_native_frame(pf,T,5;stats=_NativeNutsFix.nuts_stats!,min_dham=T(1e6))
+        fid=_native_frame(pf,T,5;stats=_NativeNutsFix.nuts_stats!,min_dham=T(1e6))
+        Dp=RK.compile_nuts_native(pf,_NativeNutsFix.nuts_state,_NativeNutsFix.refresh_momentum!!,
+                                  _NativeNutsFix.nuts!!,fpd)
+        Di=RK.compile_nuts_native_instrumented(pf,_NativeNutsFix.nuts_state,
+            _NativeNutsFix.refresh_momentum!!,_NativeNutsFix.nuts!!,fid)
+        Dp.root!(fpd,(),Random.Xoshiro(7)); Di.root!(fid,Di.scratch,Random.Xoshiro(7))
+        @test _native_obs(pf,fid)==_native_obs(pf,fpd)
+        @test fid.diverged && !fid.may_sample && !fid.may_continue
+        @test RK._diag_slot(fid.diag,Val(2))==1
+
+        bp=RK._nuts_instrumentation_counts(Ci.scratch)
+        @test_throws ArgumentError Ci.root!(fi,Ci.scratch,_NativeThrowRNG())
+        ap=RK._nuts_instrumentation_counts(Ci.scratch)
+        @test ap.transitions==bp.transitions && ap.leaf_bodies==bp.leaf_bodies &&
+              ap.gradients==bp.gradients
+        @test RK.diagnostics_pending_mask(fi.diag)==0 && RK.diagnostics_committed_mask(fi.diag)==0
+    end
+
+    # A destination gradient that throws after entering the callable is not a completed recipe, leaf, or
+    # transition.  The completion hook is physically after assignment+bless and therefore cannot false-count.
+    pf=_native_pf(); g=_NativeThrowGrad([0],[false]); k,_=_native_build_instrumented(pf,Float64;grad=g)
+    _NativeNutsFix.nuts!!(k;rng=Random.Xoshiro(1)); before=RK.nuts_instrumented_counts(k)
+    g.fail[1]=true
+    @test_throws ErrorException _NativeNutsFix.nuts!!(k;rng=Random.Xoshiro(2))
+    after=RK.nuts_instrumented_counts(k)
+    @test after.gradients==before.gradients
+    @test after.leaf_bodies==before.leaf_bodies
+    @test after.transitions==before.transitions
+end
+
+
+@testset "instrumented native NUTS — G10 identity chain and fixed exact-0B scratch" begin
+    for T in (Float64,Float32)
+        pf=_native_pf(); g=_NativeCountedGrad([0]); k,_=_native_build_instrumented(pf,T;grad=g)
+        @test RK.nuts_sealed_gradient(k) === g
+        _NativeNutsFix.nuts!!(k;rng=Random.Xoshiro(1))
+        for seed in (2,3)
+            c0=RK.nuts_instrumented_counts(k); e0=g.count[1]
+            @inferred _NativeNutsFix.nuts!!(k;rng=Random.Xoshiro(seed))
+            c1=RK.nuts_instrumented_counts(k); e1=g.count[1]
+            n=RK._diag_slot(RK.nuts_sealed_frame(k).diag,Val(1))
+            @test e1-e0 == c1.gradients-c0.gradients == c1.leaf_bodies-c0.leaf_bodies ==
+                  c1.diagnostics-c0.diagnostics == n
+            @test n>0
+        end
+        for rng in (Random.Xoshiro(91),Random.MersenneTwister(92))
+            @test _sealed_public_alloc(_NativeNutsFix.nuts!!,k,rng,Val(64))==0
+            @test _sealed_public_alloc(_NativeNutsFix.nuts!!,k,rng,Val(256))==0
+        end
+        # The fixed ring has overflowed many times, but neither it nor the complete recipe counter bank grows.
+        c=RK.nuts_instrumented_counts(k)
+        @test c.trace_overflows>0
+        @test c.trace_length==length(RK.nuts_sealed_scratch(k).trace)
+        tr=RK.nuts_instrumented_trace(k)
+        static=RK.nuts_sealed_op_stream(k).parameters
+        adj=Dict(T.parameters[1]=>T.parameters[2] for T in static if T<:RK._NutsInstrumentWrite)
+        @test all(i->get(adj,tr[i+1],nothing)==tr[i],1:2:length(tr))
+    end
+end
+
+
+@testset "instrumented native NUTS — G13 complete recipe census and real probes" begin
+    pf=_native_pf(); metric=Diagonal(ones(Float64,2)); k,_=_native_build_instrumented(
+        pf,Float64;metric=metric)
+    _NativeNutsFix.nuts!!(k;rng=Random.Xoshiro(1))
+    s0=RK.nuts_instrumented_schedule(k); selected=Set(s0.plan.selected_recipe_keys)
+    keys(s)=Set((x.owner,x.recipe) for x in s.recompute)
+    @test keys(s0)==selected
+    @test length(s0.recompute)==length(unique((x.owner,x.recipe) for x in s0.recompute))
+    @test length(unique((s0.plan.chol_role,s0.plan.logdet_role,s0.plan.grad_role)))==3
+    @test all(in(selected),(s0.plan.chol_role,s0.plan.logdet_role,s0.plan.grad_role))
+    @test any(x->x.kind===:inlined && x.id===s0.integrator.body_marker,s0.leaf_ops)
+    @test any(x->x.kind===:recipe && (x.owner,x.id)==s0.plan.grad_role,s0.leaf_ops)
+    @test count(x->x.kind===:inlined && x.id===s0.integrator.refresh_body_marker,s0.root_ops)==1
+    @test !any(x->x.id in (s0.integrator.refresh_token,s0.integrator.refresh_body_marker),s0.leaf_ops)
+    @test any(x->(x.owner,x.id)==s0.plan.logdet_role,s0.nodes)
+    @test !any(x->x.kind===:recipe && (x.owner,x.id)==s0.plan.logdet_role,s0.leaf_ops)
+    @test !any(x->x.kind in (:opaque,:dynamic,:registered),(s0.root_ops...,s0.leaf_ops...))
+
+    m(s)=Dict((x.owner,x.recipe)=>x.count for x in s.recompute)
+    M2=Diagonal(fill(2.0,2)); b=m(s0)
+    @test RK.nuts_instrumented_mutate_metric!(k,M2) === RK.nuts_sealed_metric(k)
+    s1=RK.nuts_instrumented_schedule(k); a=m(s1)
+    @test keys(s1)==selected
+    @test a[s0.plan.chol_role]-b[s0.plan.chol_role]==1
+    @test a[s0.plan.logdet_role]-b[s0.plan.logdet_role]==1
+    @test a[s0.plan.grad_role]-b[s0.plan.grad_role]==0
+    pp=RK.nuts_instrumented_phasepoint(k); L=cholesky(M2)
+    @test pp.dham_dmom ≈ L\pp.mom
+    @test pp.kin ≈ (logdet(L)+dot(pp.mom,L\pp.mom))/2
+    spre=RK.nuts_instrumented_schedule(k); pre=m(spre)
+    RK.nuts_instrumented_leaf_probe!(k,pp.pos,pp.mom)
+    s2=RK.nuts_instrumented_schedule(k); post=m(s2)
+    @test keys(s2)==selected
+    @test post[s0.plan.grad_role]-pre[s0.plan.grad_role]==1
+    @test post[s0.plan.chol_role]-pre[s0.plan.chol_role]==0
+    @test post[s0.plan.logdet_role]-pre[s0.plan.logdet_role]==0
+    @test all(key->post[key]>=pre[key],selected)
 end

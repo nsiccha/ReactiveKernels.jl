@@ -109,7 +109,8 @@ end
 
 # Emit ONE handle (literal-indexed `handles[i]`) into `stmts` — shared by initialization + schedule so the
 # two paths cannot drift. MODE drives the invocation; producer-owned outputs are blessed after success.
-function _pp_emit_handle!(stmts, plan::_KernelPlan, h, i::Int, ::Type{OW}, ::Type{SH}) where {OW,SH}
+function _pp_emit_handle!(stmts, plan::_KernelPlan, h, i::Int, ::Type{OW}, ::Type{SH};
+                          recipe_hook=nothing) where {OW,SH}
     mode = recipe_handle_mode(h)
     ins = collect(h.inputs); outs = collect(h.outputs); op = recipe_handle_op(h)
     hi = :(recipe_handle_op(handles[$i]))                      # literal-indexed captured op (type-stable)
@@ -153,6 +154,14 @@ function _pp_emit_handle!(stmts, plan::_KernelPlan, h, i::Int, ::Type{OW}, ::Typ
         _l_reject("prepared-endpoint handle $i has unsupported mode $mode")
     end
     _pp_bless!(stmts, plan, collect(h.owned))                  # bless ONLY the producer-owned subset
+    # A recipe is complete only after its real call, destination assignment, and every producer-owned bless.
+    # The instrumentation compiler supplies a site hook here; production supplies `nothing`.  Keeping this
+    # seam after `_pp_bless!` is load-bearing for exception semantics: a throwing or half-written recipe is
+    # never counted as completed.
+    if recipe_hook !== nothing
+        hook = recipe_hook(i, h)
+        hook === nothing || push!(stmts, hook)
+    end
 end
 
 # Compile-time domain admission for a BARE recipe op against concrete argument types (RK 07:53) — reject
@@ -382,7 +391,8 @@ end
 # Returns (unconditional_grads, conditional_grads) — the destination-grad count on the always-taken vs the
 # recovery-only path.
 function _lf_ensure!(stmts, c::Int, current::Set{Int}, stale::Set{Int}, plan::_KernelPlan,
-                     producer::Dict{Int,Int}, hidx, ::Type{OW}, ::Type{SH}) where {OW,SH}
+                     producer::Dict{Int,Int}, hidx, ::Type{OW}, ::Type{SH};
+                     recipe_hook=nothing) where {OW,SH}
     c in current && return (0, 0)
     role, slot = kernel_plan_field(plan, c); obj = role === :owned ? :owned : :shared
     if !haskey(producer, c)                                       # non-producible source
@@ -390,10 +400,12 @@ function _lf_ensure!(stmts, c::Int, current::Set{Int}, stale::Set{Int}, plan::_K
             "leapfrog read of a DIRTY non-producible source (canon $($c)) — requires reset, never read stale")))
         push!(current, c); return (0, 0)
     elseif c in stale                                             # known-stale → unconditional recompute
-        return (_lf_recompute!(stmts, c, current, stale, plan, producer, hidx, OW, SH), 0)
+        return (_lf_recompute!(stmts, c, current, stale, plan, producer, hidx, OW, SH;
+                               recipe_hook=recipe_hook), 0)
     else                                                          # produced, entry-unknown → conditional ensure
         guard = Any[]
-        n = _lf_recompute!(guard, c, current, stale, plan, producer, hidx, OW, SH)
+        n = _lf_recompute!(guard, c, current, stale, plan, producer, hidx, OW, SH;
+                           recipe_hook=recipe_hook)
         push!(stmts, Expr(:if, :(!_canon_current($obj, Val($slot))), Expr(:block, guard...)))
         push!(current, c)                                         # current after the ensure regardless of branch
         return (0, n)
@@ -404,12 +416,14 @@ end
 # selected producer handle (blesses producer-owned outputs after success). Returns the grad count on this
 # always-taken path.
 function _lf_recompute!(stmts, c::Int, current::Set{Int}, stale::Set{Int}, plan::_KernelPlan,
-                        producer::Dict{Int,Int}, hidx, ::Type{OW}, ::Type{SH}) where {OW,SH}
+                        producer::Dict{Int,Int}, hidx, ::Type{OW}, ::Type{SH};
+                        recipe_hook=nothing) where {OW,SH}
     rid = producer[c]; (h, i) = hidx[rid]; n = 0
     for inp in h.inputs
-        (uc, _) = _lf_ensure!(stmts, inp, current, stale, plan, producer, hidx, OW, SH); n += uc
+        (uc, _) = _lf_ensure!(stmts, inp, current, stale, plan, producer, hidx, OW, SH;
+                              recipe_hook=recipe_hook); n += uc
     end
-    _pp_emit_handle!(stmts, plan, h, i, OW, SH)
+    _pp_emit_handle!(stmts, plan, h, i, OW, SH; recipe_hook=recipe_hook)
     for o in h.owned; delete!(stale, o); push!(current, o); end
     n + (recipe_handle_mode(h) === :destination ? 1 : 0)
 end
@@ -424,7 +438,8 @@ kick-2), with REAL runtime mask kills/blesses so kinetic/ham are physically dirt
 the partial binder's kwargs NamedTuple (runtime stepsize). Returns the owned object; F32/F64 warmed exact
 0-B / @inferred; exactly one pgrad per leaf; a mid-write throw leaves executed-prefix outputs dirty.
 """
-function compile_leapfrog(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, leaf_ir::MethodIR) where {OW,SH}
+function _compile_leapfrog_native(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, leaf_ir::MethodIR,
+                                  instrumented::Bool; recipe_hook=nothing,write_hook=nothing) where {OW,SH}
     plan = kernel_prepared_plan(pf); hs = kernel_prepared_handles(pf)
     fc = _lf_canon_map(plan)
     producer = Dict{Int,Int}(c => r for (c, r) in kernel_plan_producer(plan))
@@ -436,9 +451,10 @@ function compile_leapfrog(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, leaf_ir:
     # invocation. `current` = canons made current HERE (by a produce/write); `stale` = canons killed HERE.
     current = Set{Int}(); stale = Set{Int}()
     ngrad_uncond = 0
-    for pw in _exec_place_writes(leaf_ir)
+    for (write_ordinal,pw) in enumerate(_exec_place_writes(leaf_ir))
         for c in _lf_reads(pw.rhs, fc)                             # ensure READ canons, authored order
-            (uc, _) = _lf_ensure!(stmts, c, current, stale, plan, producer, hidx, OW, SH)
+            (uc, _) = _lf_ensure!(stmts, c, current, stale, plan, producer, hidx, OW, SH;
+                                  recipe_hook=recipe_hook)
             ngrad_uncond += uc
         end
         tgt = fc[pw.target.path[end]]
@@ -447,6 +463,10 @@ function compile_leapfrog(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, leaf_ir:
         for d in deps; _lf_mask!(stmts, plan, d, :kill); end
         _lf_write!(stmts, pw, plan, fc, stepkw, OW, SH)
         _lf_mask!(stmts, plan, tgt, :bless)                       # BLESS the written canon only AFTER success
+        if write_hook !== nothing
+            hook=write_hook(write_ordinal,pw,tgt)
+            hook===nothing || push!(stmts,hook)
+        end
         for d in deps; delete!(current, d); push!(stale, d); end
         delete!(stale, tgt); push!(current, tgt)                  # freshly written → current
     end
@@ -454,8 +474,18 @@ function compile_leapfrog(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, leaf_ir:
     # dpot ensure adds a SECOND grad only on the recovery (dirty-entry) branch.
     ngrad_uncond == 1 || _l_reject(
         "executable leapfrog emitted $ngrad_uncond unconditional destination-grad recomputes; expected exactly one")
-    compile(:((owned, shared, handles, $stepkw) -> $(Expr(:block, stmts..., :(return owned)))))
+    instrumented ?
+        compile(:((owned, shared, handles, $stepkw, __lf_instrumentation) ->
+                  $(Expr(:block, stmts..., :(return owned))))) :
+        compile(:((owned, shared, handles, $stepkw) -> $(Expr(:block, stmts..., :(return owned)))))
 end
+
+compile_leapfrog(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, leaf_ir::MethodIR) where {OW,SH} =
+    _compile_leapfrog_native(pf, OW, SH, leaf_ir, false)
+compile_leapfrog_instrumented(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, leaf_ir::MethodIR;
+        recipe_hook=nothing,write_hook=nothing) where {OW,SH} =
+    _compile_leapfrog_native(pf, OW, SH, leaf_ir, true;
+                             recipe_hook=recipe_hook,write_hook=write_hook)
 
 # Emit ONE authored leapfrog write: a DOTTED broadcast materialize! into the target's canon slot.
 function _lf_write!(stmts, pw::_PlaceWrite, plan::_KernelPlan, fc::Dict{Symbol,Int}, stepkw::Symbol,

@@ -1807,17 +1807,29 @@ Every parameter is derived while compiling the real native root.  In particular,
 actual immutable `_NativeProgram` consumed by that root; neither an adapter nor a benchmark supplies
 any of these facts.  `RootT`/`ScratchT`/`FrameT` make detached evidence fail before it can be observed.
 """
+abstract type _NutsEmittedOp end
+struct _NutsRealOp{Id,Kind,Authority} <: _NutsEmittedOp end
+struct _NutsInstrumentWrite{Id,AdjacentTo,Counter} <: _NutsEmittedOp end
+struct _NutsRecipeDescriptor{Owner,Recipe,OpT,Mode,Inputs,Outputs,Owned} end
+struct _NutsLeafWriteDescriptor{Integrator,Ordinal,Canon,Dot} end
+struct _NutsRootManifest{RefreshToken,RefreshBodyMarker,Ops} end
+struct _NutsLeafManifest{Integrator,StepSlot,BodyMarker,Ops,Nodes} end
+
 struct _NutsCertificate{Mode,OwnerToken,RootToken,PlanT,PlanKey,ProgramT,ControlFingerprint,
-                        SelectedRecipes,Roles,Integrator,RootT,ScratchT,FrameT} end
+                        RecipeManifest,RootManifest,LeafManifest,EmittedOps,SelectedRecipes,Roles,
+                        Integrator,RootT,ScratchT,FrameT} end
 struct _NutsControlFingerprint{ProgramT,RootMid,NodeCount} end
 struct _UnsealedNutsCertificate end
 
 function _nuts_certificate_parts(::Type{<:_NutsCertificate{Mode,OwnerToken,RootToken,PlanT,
-        PlanKey,ProgramT,ControlFingerprint,SelectedRecipes,Roles,Integrator,RootT,ScratchT,
-        FrameT}}) where {Mode,OwnerToken,RootToken,PlanT,PlanKey,ProgramT,ControlFingerprint,
-                        SelectedRecipes,Roles,Integrator,RootT,ScratchT,FrameT}
+        PlanKey,ProgramT,ControlFingerprint,RecipeManifest,RootManifest,LeafManifest,EmittedOps,
+        SelectedRecipes,Roles,Integrator,RootT,ScratchT,FrameT}}) where {Mode,OwnerToken,RootToken,
+        PlanT,PlanKey,ProgramT,ControlFingerprint,RecipeManifest,RootManifest,LeafManifest,EmittedOps,
+        SelectedRecipes,Roles,Integrator,RootT,ScratchT,FrameT}
     (mode=Mode, owner=OwnerToken, root_token=RootToken, plan=PlanT, plan_key=PlanKey,
-     program=ProgramT, control=ControlFingerprint, recipes=SelectedRecipes, roles=Roles,
+     program=ProgramT, control=ControlFingerprint, recipe_manifest=RecipeManifest,
+     root_manifest=RootManifest, leaf_manifest=LeafManifest, emitted_ops=EmittedOps,
+     recipes=SelectedRecipes, roles=Roles,
      integrator=Integrator, root_type=RootT, scratch_type=ScratchT, frame_type=FrameT)
 end
 _nuts_certificate_parts(c::_NutsCertificate) = _nuts_certificate_parts(typeof(c))
@@ -1847,8 +1859,8 @@ function _nuts_sealed_handles(k::K) where {K<:KernelObject}
     c isa _NutsCertificate || throw(ArgumentError(
         "legacy/control NUTS sampler is explicitly unsealed; compile native production evidence first"))
     p = _nuts_certificate_parts(c)
-    p.mode === :production || throw(ArgumentError(
-        "unsupported sealed NUTS mode $(p.mode); instrumented emission has not been implemented"))
+    p.mode in (:production,:instrumented) || throw(ArgumentError(
+        "unsupported sealed NUTS mode $(p.mode)"))
     p.owner === kernel_token(k) || throw(ArgumentError("sealed NUTS owner-token mismatch"))
     p.root_token === nuts_handles_root_token(h) || throw(ArgumentError("sealed NUTS root-token mismatch"))
     getfield(h, :frame) === getfield(k, :state) || throw(ArgumentError(
@@ -1865,8 +1877,31 @@ function _nuts_sealed_handles(k::K) where {K<:KernelObject}
     np.plan === p.plan || throw(ArgumentError("sealed NUTS Program/Plan mismatch"))
     _native_root_program(typeof(getfield(h, :root))) === p.program || throw(ArgumentError(
         "sealed NUTS root does not execute the certified Program"))
+    rm,rootm,leafm,ops=_native_root_manifests(typeof(getfield(h,:root)))
+    (p.recipe_manifest===rm && p.root_manifest===rootm && p.leaf_manifest===leafm &&
+     p.emitted_ops===ops) || throw(ArgumentError(
+        "sealed NUTS certificate is detached from the root's compiler manifests"))
+    if p.mode === :production
+        getfield(h, :root) isa _CompiledNutsRootNative || throw(ArgumentError(
+            "production certificate is detached from the production native root family"))
+        getfield(h, :scratch) === () || throw(ArgumentError(
+            "production certificate is detached from the production no-instrumentation scratch"))
+    else
+        getfield(h, :root) isa _CompiledNutsRootInstrumented || throw(ArgumentError(
+            "instrumented certificate is detached from the instrumented native root family"))
+        getfield(h, :scratch) isa _NutsInstrumentationScratch || throw(ArgumentError(
+            "instrumented certificate is detached from compiler-owned instrumentation scratch"))
+        getfield(getfield(h, :root), :scratch) === getfield(h, :scratch) || throw(ArgumentError(
+            "instrumented root/scratch value provenance mismatch"))
+        q=typeof(getfield(h,:scratch)).parameters
+        (q[1]===p.owner && q[2]===p.root_token && q[3]===p.plan && q[4]===p.program &&
+         q[5]===p.emitted_ops && q[6]===p.recipe_manifest) || throw(ArgumentError(
+            "instrumented scratch token/plan/program/manifest provenance mismatch"))
+    end
     p.control === _NutsControlFingerprint{p.program,np.root,_native_program_node_count(p.program)} ||
         throw(ArgumentError("sealed NUTS control fingerprint mismatch"))
+    _nuts_validate_emitted_ops(p.mode, p.emitted_ops) || throw(ArgumentError(
+        "sealed NUTS emitted-op stream is not physically adjacent/unique"))
     p.recipes === p.plan_key[5] || throw(ArgumentError("sealed NUTS selected-recipe mismatch"))
     expected_roles = Tuple((t[1], t[2], t[3], t[4]) for t in p.plan_key[2])
     p.roles === expected_roles || throw(ArgumentError("sealed NUTS physical-role mismatch"))
@@ -1902,6 +1937,8 @@ end
     _nuts_sealed_shared_slot_expr(K, :metric)
 @generated nuts_sealed_chol_metric(k::K) where {K<:KernelObject} =
     _nuts_sealed_shared_slot_expr(K, :chol_metric)
+@generated nuts_sealed_gradient(k::K) where {K<:KernelObject} =
+    _nuts_sealed_shared_slot_expr(K, :grad_f)
 
 # Prepare the sampler FRAME from source inputs (RK 12:26): build the frame, run POC's full six-handle
 # INITIALIZATION on `frame.init` exactly once, and SEED the children — returning the ready `_NutsFrame`
@@ -1926,7 +1963,8 @@ nuts_sampler(::Val{OwnerToken}, ::Val{RootToken}, frame::_NutsFrame, root, scrat
         frame, _NutsHandles(Val(RootToken), root, scratch, frame, _UnsealedNutsCertificate()))
 
 function _sealed_nuts_sampler(::Val{OwnerToken}, ::Val{RootToken}, frame::_NutsFrame, root, scratch,
-        certificate::_NutsCertificate{:production,OwnerToken,RootToken}) where {OwnerToken,RootToken}
+        certificate::_NutsCertificate{Mode,OwnerToken,RootToken}) where {Mode,OwnerToken,RootToken}
+    Mode in (:production,:instrumented) || throw(ArgumentError("unsupported sealed sampler mode `$Mode`"))
     p = _nuts_certificate_parts(certificate)
     typeof(frame) === p.frame_type || throw(ArgumentError("certificate/frame type mismatch"))
     typeof(root) === p.root_type || throw(ArgumentError("certificate/root type mismatch"))

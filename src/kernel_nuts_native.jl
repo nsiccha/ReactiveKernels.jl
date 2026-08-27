@@ -412,6 +412,8 @@ mutable struct _NativeEmitCtx
     methods::Dict{Int,Type}
     derived::Tuple
     value_method::Bool
+    instrumented::Bool
+    scratch::Symbol
 end
 
 function _native_call_expr_mids(T::Type,out=Set{Int}())
@@ -479,7 +481,9 @@ end
 function _nn_ensure(C::_NativeEmitCtx, ep, field::Symbol)
     ensure = Expr(:call, GlobalRef(Core, :getfield), _nn_cfg(C, :ensures), QuoteNode(field))
     shared = Expr(:call, GlobalRef(Core, :getfield), C.frame, QuoteNode(:shared))
-    Expr(:call, ensure, ep, shared, _nn_cfg(C, :handles))
+    args=Any[ep,shared,_nn_cfg(C,:handles)]
+    C.instrumented && push!(args,C.scratch)
+    Expr(:call, ensure, args...)
 end
 
 function _nn_self_read(T::Type{<:_NNSelfField}, C::_NativeEmitCtx)
@@ -532,8 +536,10 @@ function _nn_sibling_call(mid::Int, As::Type{<:Tuple}, Kws::Type{<:Tuple}, C::_N
     isempty(Kws.parameters) || _native_reject("native sibling keyword calls are not admitted")
     args = Any[_nn_val(a,C) for a in As.parameters]
     length(args) <= 3 || _native_reject("native sibling call arity $(length(args)) exceeds fixed ABI 3")
-    Expr(:call, GlobalRef(@__MODULE__, Symbol("_nn_method",length(args))), C.program, :(Val($mid)),
-         C.cfg, C.frame, args...)
+    family = C.instrumented ? Symbol("_nni_method",length(args)) : Symbol("_nn_method",length(args))
+    prefix = C.instrumented ? Any[C.program,:(Val($mid)),C.cfg,C.frame,C.scratch] :
+                              Any[C.program,:(Val($mid)),C.cfg,C.frame]
+    Expr(:call, GlobalRef(@__MODULE__, family), prefix..., args...)
 end
 
 function _nn_stats(C::_NativeEmitCtx)
@@ -544,7 +550,10 @@ function _nn_stats(C::_NativeEmitCtx)
     # `_validate_stats_body` has already proven the final statement is `return __self__`; a field call
     # inlines only the preceding diagnostic writes, exactly like the control emitter.
     pop!(xs)
-    Expr(:block, xs..., :nothing)
+    C.instrumented ? Expr(:block, xs...,
+        Expr(:call,GlobalRef(@__MODULE__,:_nuts_instrument_marker!),C.scratch,
+             _nn_cfg(C,:stats_site),:(Val(:diagnostics))), :nothing) :
+        Expr(:block, xs..., :nothing)
 end
 
 function _nn_val(T::Type, C::_NativeEmitCtx)
@@ -594,9 +603,16 @@ function _nn_val(T::Type, C::_NativeEmitCtx)
         fld === :step_f ? begin
             length(A.parameters)==1 || _native_reject("step_f requires one endpoint")
             ep=_nn_val(A.parameters[1],C)
-            Expr(:call,_nn_cfg(C,:leaf),ep,
-                 Expr(:call,GlobalRef(Core,:getfield),C.frame,QuoteNode(:shared)),
-                 _nn_cfg(C,:handles),_nn_cfg(C,:stepkw))
+            leafargs=Any[ep,Expr(:call,GlobalRef(Core,:getfield),C.frame,QuoteNode(:shared)),
+                         _nn_cfg(C,:handles),_nn_cfg(C,:stepkw)]
+            if C.instrumented
+                push!(leafargs,C.scratch)
+                Expr(:block,Expr(:call,_nn_cfg(C,:leaf),leafargs...),
+                     Expr(:call,GlobalRef(@__MODULE__,:_nuts_instrument_marker!),C.scratch,
+                          _nn_cfg(C,:leaf_site),:(Val(:leaf_body))))
+            else
+                Expr(:call,_nn_cfg(C,:leaf),leafargs...)
+            end
         end : fld === :stats_f ? _nn_stats(C) : _native_reject("unsupported field callable $fld ($Hint)")
     elseif T <: _NNCallExpr
         Name,Mid,Target,A,Kw=T.parameters
@@ -703,14 +719,14 @@ function _nn_stmt(T::Type,C::_NativeEmitCtx)
     end
 end
 
-function _nn_generated_body(ProgramT,Mid,argsyms::Tuple)
+function _nn_generated_body(ProgramT,Mid,argsyms::Tuple; instrumented::Bool=false)
     parts=_native_program_parts(ProgramT); methods=_native_method_map(ProgramT)
     haskey(methods,Mid) || return :(throw(ArgumentError("native NUTS call to unencoded MethodId $Mid")))
     M=methods[Mid]; formals=M.parameters[3]; body=M.parameters[4]
     length(argsyms)<=length(formals.parameters) || return :(throw(MethodError($(Symbol("_nn_method",length(argsyms))), (Val($Mid),))))
     value_method=Mid in _native_value_mids(ProgramT)
     C=_NativeEmitCtx(ProgramT,parts.plan,:frame,:cfg,Dict{Symbol,Symbol}(),Dict{Symbol,Symbol}(),methods,
-                     parts.derived,value_method)
+                     parts.derived,value_method,instrumented,:scratch)
     pro=Any[]
     for (i,F) in enumerate(formals.parameters)
         Name,Kind,Required,Default=F.parameters
@@ -737,20 +753,219 @@ end
 @generated _nn_method3(::Type{P},::Val{Mid},cfg,frame,a1,a2,a3) where {P<:_NativeProgram,Mid} =
     _nn_generated_body(P,Mid,(:a1,:a2,:a3))
 
-struct _CompiledNutsRootNative{ProgramT,Refresh,Cfg,H}
+@generated _nni_method0(::Type{P},::Val{Mid},cfg,frame,scratch) where {P<:_NativeProgram,Mid} =
+    _nn_generated_body(P,Mid,();instrumented=true)
+@generated _nni_method1(::Type{P},::Val{Mid},cfg,frame,scratch,a1) where {P<:_NativeProgram,Mid} =
+    _nn_generated_body(P,Mid,(:a1,);instrumented=true)
+@generated _nni_method2(::Type{P},::Val{Mid},cfg,frame,scratch,a1,a2) where {P<:_NativeProgram,Mid} =
+    _nn_generated_body(P,Mid,(:a1,:a2);instrumented=true)
+@generated _nni_method3(::Type{P},::Val{Mid},cfg,frame,scratch,a1,a2,a3) where {P<:_NativeProgram,Mid} =
+    _nn_generated_body(P,Mid,(:a1,:a2,:a3);instrumented=true)
+
+struct _NutsNoInstrument end
+struct _NutsEmissionSite{Real,Instrument} end
+
+mutable struct _NutsEmissionBuilder
+    instrumented::Bool
+    next_real::Int
+    ops::Vector{Any}
+end
+_NutsEmissionBuilder(instrumented::Bool) = _NutsEmissionBuilder(instrumented, 1, Any[])
+
+function _nuts_emission_site!(b::_NutsEmissionBuilder, kind::Symbol, authority, counter)
+    id=b.next_real; b.next_real+=1
+    real=_NutsRealOp{id,kind,authority}
+    push!(b.ops,real)
+    instr=_NutsNoInstrument
+    if b.instrumented
+        iid=100000+id
+        instr=_NutsInstrumentWrite{iid,id,counter}
+        # The TYPE tape is appended by the same call that hands the corresponding site to the executable
+        # emitter.  Thus the certificate never reconstructs a parallel list after code emission.
+        push!(b.ops,instr)
+    end
+    _NutsEmissionSite{real,instr}()
+end
+_nuts_emission_ops(b::_NutsEmissionBuilder) = _native_tuple_type(b.ops)
+
+function _native_recipe_manifest(pf::_PreparedFactory)
+    owner=kernel_prepared_token(pf); plan=kernel_prepared_plan(pf)
+    desc=Any[]
+    for (rid,seam,h) in zip(kernel_plan_recipes(plan),kernel_plan_recipe_seam(plan),
+                            kernel_prepared_handles(pf))
+        rid==seam[1] || _native_reject("recipe manifest order drift")
+        push!(desc,_NutsRecipeDescriptor{owner,rid,typeof(recipe_handle_op(h)),recipe_handle_mode(h),
+                                         seam[2],seam[3],seam[4]})
+    end
+    _native_tuple_type(desc)
+end
+
+function _native_recipe_hook(builder::_NutsEmissionBuilder, pf::_PreparedFactory, scratch::Symbol)
+    recs=kernel_plan_recipes(kernel_prepared_plan(pf)); manifest=_native_recipe_manifest(pf)
+    (i,h)->begin
+        rid=recs[i]; D=manifest.parameters[i]
+        (D.parameters[2] == rid && D.parameters[3] === typeof(recipe_handle_op(h)) &&
+         D.parameters[4] === recipe_handle_mode(h)) || _native_reject("recipe emission/manifest drift")
+        site=_nuts_emission_site!(builder,:recipe,D,(:recipe,i))
+        builder.instrumented ? Expr(:call,GlobalRef(@__MODULE__,:_nuts_recipe_complete!),scratch,
+                                    :(Val($i)),QuoteNode(site)) : nothing
+    end
+end
+
+function _native_leaf_write_hook(builder::_NutsEmissionBuilder,integrator,scratch::Symbol)
+    (ordinal,pw,canon)->begin
+        D=_NutsLeafWriteDescriptor{integrator,ordinal,canon,pw.dot}
+        site=_nuts_emission_site!(builder,:leaf_write,D,(:leaf_write,ordinal))
+        builder.instrumented ? Expr(:call,GlobalRef(@__MODULE__,:_nuts_instrument_site!),scratch,
+                                    QuoteNode(site)) : nothing
+    end
+end
+
+struct _CompiledNutsRootNative{ProgramT,RecipeManifest,RootManifest,LeafManifest,EmissionManifest,
+                               Refresh,Cfg,H}
     refresh::Refresh
     cfg::Cfg
     handles::H
 end
 
+struct _CompiledNutsRootInstrumented{ProgramT,RecipeManifest,RootManifest,LeafManifest,EmissionManifest,
+                                     Refresh,Cfg,H,S}
+    refresh::Refresh
+    cfg::Cfg
+    handles::H
+    scratch::S
+end
+
+mutable struct _NutsInstrumentationScratch{OwnerToken,RootToken,PlanT,ProgramT,EmittedOps,
+                                           RecipeManifest,GradIndex,TraceCapacity}
+    transitions::Int
+    refreshes::Int
+    leaf_bodies::Int
+    diagnostics::Int
+    metric_mutations::Int
+    recipe_counts::Vector{Int}
+    trace::Vector{Int}
+    trace_pairs::Int
+    trace_overflows::Int
+end
+function _nuts_instrumentation_scratch(::Val{OwnerToken},::Val{RootToken},::Type{PlanT},
+        ::Type{ProgramT},::Type{EmittedOps},::Type{RecipeManifest},::Val{GradIndex},
+        ::Val{TraceCapacity}=Val(256)) where {OwnerToken,RootToken,PlanT,ProgramT,EmittedOps,
+                                            RecipeManifest,GradIndex,TraceCapacity}
+    iseven(TraceCapacity) && TraceCapacity > 0 || throw(ArgumentError("trace capacity must be positive/even"))
+    trace=zeros(Int,TraceCapacity)
+    _NutsInstrumentationScratch{OwnerToken,RootToken,PlanT,ProgramT,EmittedOps,RecipeManifest,
+                                GradIndex,TraceCapacity}(0,0,0,0,0,zeros(Int,length(RecipeManifest.parameters)),
+                                                        trace,0,0)
+end
+
+struct _NutsInstrumentationCounts
+    transitions::Int
+    refreshes::Int
+    leaf_bodies::Int
+    gradients::Int
+    diagnostics::Int
+    metric_mutations::Int
+    trace_length::Int
+    trace_overflows::Int
+end
+
+@inline function _nuts_trace_site!(s::_NutsInstrumentationScratch,
+        ::_NutsEmissionSite{R,I}) where {RealId,Kind,Authority,InstrumentId,Counter,
+        R<:_NutsRealOp{RealId,Kind,Authority},
+        I<:_NutsInstrumentWrite{InstrumentId,RealId,Counter}}
+    cap=length(getfield(s,:trace)); pair=getfield(s,:trace_pairs)
+    off=2*(pair % (cap>>>1))
+    @inbounds begin
+        getfield(s,:trace)[off+1]=RealId
+        getfield(s,:trace)[off+2]=InstrumentId
+    end
+    setfield!(s,:trace_pairs,pair+1)
+    pair >= (cap>>>1) && setfield!(s,:trace_overflows,getfield(s,:trace_overflows)+1)
+    nothing
+end
+
+@inline function _nuts_instrument_marker!(s::_NutsInstrumentationScratch,site::_NutsEmissionSite,
+        ::Val{Kind}) where {Kind}
+    Kind === :transition ? setfield!(s,:transitions,getfield(s,:transitions)+1) :
+    Kind === :refresh ? setfield!(s,:refreshes,getfield(s,:refreshes)+1) :
+    Kind === :leaf_body ? setfield!(s,:leaf_bodies,getfield(s,:leaf_bodies)+1) :
+    Kind === :diagnostics ? setfield!(s,:diagnostics,getfield(s,:diagnostics)+1) :
+    throw(ArgumentError("unsupported NUTS instrumentation marker `$Kind`"))
+    _nuts_trace_site!(s,site)
+end
+
+@inline function _nuts_instrument_site!(s::_NutsInstrumentationScratch,site::_NutsEmissionSite)
+    _nuts_trace_site!(s,site)
+end
+
+@inline function _nuts_recipe_complete!(s::_NutsInstrumentationScratch,::Val{I},
+        site::_NutsEmissionSite) where {I}
+    @inbounds getfield(s,:recipe_counts)[I]+=1
+    _nuts_trace_site!(s,site)
+end
+
+# Compiler-owned probes use the identical prepared-handle emitter as the public leaf/root, but are not
+# members of the public transition's lexical op tape.  They therefore update the complete recipe counter
+# bank without appending a fictitious public-root site to the trace.
+@inline function _nuts_recipe_probe_complete!(s::_NutsInstrumentationScratch,::Val{I}) where {I}
+    @inbounds getfield(s,:recipe_counts)[I]+=1
+    nothing
+end
+
+function _nuts_instrumentation_counts(s::_NutsInstrumentationScratch{OT,RT,PT,PG,Ops,RM,GI}) where {
+        OT,RT,PT,PG,Ops,RM,GI}
+    grad=@inbounds getfield(s,:recipe_counts)[GI]
+    _NutsInstrumentationCounts(s.transitions,s.refreshes,s.leaf_bodies,grad,s.diagnostics,
+                               s.metric_mutations,min(2*s.trace_pairs,length(s.trace)),s.trace_overflows)
+end
+
+function _nuts_validate_emitted_ops(mode::Symbol,Ops::Type{<:Tuple})
+    ts=Ops.parameters
+    all(t->t isa DataType && t<:_NutsEmittedOp,ts) || return false
+    ids=Int[t.parameters[1] for t in ts]
+    length(ids)==length(unique(ids)) || return false
+    realids=Set{Int}(t.parameters[1] for t in ts if t<:_NutsRealOp)
+    instrids=Set{Int}(t.parameters[1] for t in ts if t<:_NutsInstrumentWrite)
+    isempty(intersect(realids,instrids)) || return false
+    mode === :production && return isempty(instrids)
+    mode === :instrumented || return false
+    for (i,t) in enumerate(ts)
+        t<:_NutsInstrumentWrite || continue
+        i>1 || return false
+        prev=ts[i-1]
+        prev<:_NutsRealOp || return false
+        t.parameters[2] == prev.parameters[1] || return false
+        counter=t.parameters[3]
+        ((counter === prev.parameters[2]) ||
+         (counter === :leaf_body && prev.parameters[2] === :inlined) ||
+         (counter isa Tuple && !isempty(counter) && counter[1] === prev.parameters[2])) || return false
+    end
+    true
+end
+
+_nuts_real_op_signature(Ops::Type{<:Tuple}) = Tuple((t.parameters[1],t.parameters[2],t.parameters[3])
+    for t in Ops.parameters if t<:_NutsRealOp)
+
 _native_root_program(::Type{<:_CompiledNutsRootNative{ProgramT}}) where {ProgramT} = ProgramT
+_native_root_program(::Type{<:_CompiledNutsRootInstrumented{ProgramT}}) where {ProgramT} = ProgramT
+function _native_root_manifests(::Type{<:_CompiledNutsRootNative{P,RM,RootM,LeafM,Ops}}) where {
+        P,RM,RootM,LeafM,Ops}; (RM,RootM,LeafM,Ops); end
+function _native_root_manifests(::Type{<:_CompiledNutsRootInstrumented{P,RM,RootM,LeafM,Ops}}) where {
+        P,RM,RootM,LeafM,Ops}; (RM,RootM,LeafM,Ops); end
 
 # Construct the zero-field seal only after the REAL native root, scratch, and frame exist.  All structural
-# facts come from the compiler-owned Plan/Program types; the caller supplies no evidence tuple.  There is no
-# instrumented arm yet, so asking for one is an explicit error rather than a production-shaped fabrication.
-function _native_nuts_certificate(::Val{:production}, pf::_PreparedFactory, skel,
-        ::Val{RootToken}, root::_CompiledNutsRootNative{ProgramT}, scratch, frame::_NutsFrame) where {
-        RootToken,ProgramT}
+# facts come from the compiler-owned Plan/Program types; the caller supplies no evidence tuple. Production and
+# instrumented modes accept only their corresponding concrete root families.
+function _native_nuts_certificate(::Val{Mode}, pf::_PreparedFactory, skel,
+        ::Val{RootToken}, root, scratch, frame::_NutsFrame) where {Mode,RootToken}
+    Mode in (:production,:instrumented) || throw(ArgumentError(
+        "unsupported native NUTS certificate mode `$Mode`"))
+    ProgramT=_native_root_program(typeof(root))
+    Mode === :production && !(root isa _CompiledNutsRootNative) && throw(ArgumentError(
+        "production certificate requires the production native root"))
+    Mode === :instrumented && !(root isa _CompiledNutsRootInstrumented) && throw(ArgumentError(
+        "instrumented certificate requires the instrumented native root"))
     parts = _native_program_parts(ProgramT)
     OwnerToken = kernel_token(skel)
     parts.owner === OwnerToken || throw(ArgumentError("native certificate owner/program mismatch"))
@@ -768,14 +983,16 @@ function _native_nuts_certificate(::Val{:production}, pf::_PreparedFactory, skel
     Roles = Tuple((t[1], t[2], t[3], t[4]) for t in PlanKey[2])
     ControlFingerprint = _NutsControlFingerprint{ProgramT,parts.root,
                                                  _native_program_node_count(ProgramT)}
-    Cert = _NutsCertificate{:production,OwnerToken,RootToken,PlanT,PlanKey,ProgramT,
-        ControlFingerprint,SelectedRecipes,Roles,Integrator,typeof(root),typeof(scratch),typeof(frame)}
+    RecipeManifest,RootManifest,LeafManifest,EmittedOps=_native_root_manifests(typeof(root))
+    RecipeManifest === _native_recipe_manifest(pf) || throw(ArgumentError(
+        "native root recipe manifest is detached from the prepared handles"))
+    _nuts_validate_emitted_ops(Mode,EmittedOps) || throw(ArgumentError(
+        "compiler produced an invalid native emitted-op stream"))
+    Cert = _NutsCertificate{Mode,OwnerToken,RootToken,PlanT,PlanKey,ProgramT,
+        ControlFingerprint,RecipeManifest,RootManifest,LeafManifest,EmittedOps,SelectedRecipes,Roles,
+        Integrator,typeof(root),typeof(scratch),typeof(frame)}
     Cert()
 end
-_native_nuts_certificate(::Val{:instrumented}, args...) = throw(ArgumentError(
-    "instrumented native NUTS emission is not implemented; refusing to fabricate a certificate"))
-_native_nuts_certificate(::Val{Mode}, args...) where {Mode} = throw(ArgumentError(
-    "unsupported native NUTS certificate mode `$Mode`"))
 @inline function (r::_CompiledNutsRootNative{P})(fr,::Tuple{},rng) where {P}
     _diagnostics_reset!(getfield(fr,:diag)); _nuts_invalidate_diverged!(fr)
     try
@@ -788,9 +1005,182 @@ _native_nuts_certificate(::Val{Mode}, args...) where {Mode} = throw(ArgumentErro
     fr
 end
 
-# Cold prototype entry using the existing validated compiler solely for leaf/ensure/refresh/public-root setup.
-# The hot root and recursive program are wholly native and registry-free.  This factoring is temporary: it keeps
-# the correctness slice narrow while the final immutable state-threading compiler reuses the same ProgramT.
+@inline function (r::_CompiledNutsRootInstrumented{P})(fr,
+        sc::_NutsInstrumentationScratch,rng) where {P}
+    sc === getfield(r,:scratch) || throw(ArgumentError(
+        "instrumented root requires its compiler-owned scratch authority"))
+    _diagnostics_reset!(getfield(fr,:diag))
+    _nuts_instrument_site!(sc,getfield(r.cfg,:diag_reset_site))
+    _nuts_invalidate_diverged!(fr)
+    _nuts_instrument_site!(sc,getfield(r.cfg,:invalidate_entry_site))
+    try
+        r.refresh(getfield(fr,:init),getfield(fr,:shared),r.handles,rng)
+        _nuts_instrument_marker!(sc,getfield(r.cfg,:refresh_site),Val(:refresh))
+        _nni_method1(P,Val(_native_program_parts(P).root),r.cfg,fr,sc,rng)
+        _diagnostics_root_commit!(getfield(fr,:diag))
+        _nuts_instrument_site!(sc,getfield(r.cfg,:diag_commit_site))
+        _nuts_derived_root_commit!(fr)
+        _nuts_instrument_site!(sc,getfield(r.cfg,:derived_commit_site))
+        _nuts_instrument_marker!(sc,getfield(r.cfg,:transition_site),Val(:transition))
+    catch
+        setfield!(getfield(fr,:diag),:pending,UInt(0))
+        _nuts_instrument_site!(sc,getfield(r.cfg,:catch_pending_site))
+        _nuts_invalidate_diverged!(fr)
+        _nuts_instrument_site!(sc,getfield(r.cfg,:catch_invalidate_site))
+        rethrow()
+    end
+    fr
+end
+
+# Compile one demanded ensure through the same recipe-completion seam as the leaf.  `builder` is cold,
+# per-compilation scratch; its type tape is frozen into the root/certificate before the sampler escapes.
+function _compile_native_ensure(pf::_PreparedFactory,::Type{OW},::Type{SH},field::Symbol,
+        builder::_NutsEmissionBuilder) where {OW,SH}
+    plan=kernel_prepared_plan(pf); hs=kernel_prepared_handles(pf); fc=_lf_canon_map(plan)
+    producer=Dict{Int,Int}(c=>r for (c,r) in kernel_plan_producer(plan))
+    recs=kernel_plan_recipes(plan)
+    hidx=Dict{Int,Tuple{Any,Int}}(recs[i]=>(hs[i],i) for i in eachindex(hs))
+    haskey(fc,field) || _native_reject("demanded ensure has no canon for `$field`")
+    c=fc[field]; stmts=Any[]; current=Set{Int}(); stale=Set{Int}()
+    hook=_native_recipe_hook(builder,pf,:scratch)
+    _lf_ensure!(stmts,c,current,stale,plan,producer,hidx,OW,SH;recipe_hook=hook)
+    ret=_pp_read(plan,c)
+    builder.instrumented ?
+        compile(:((owned,shared,handles,scratch)->$(Expr(:block,stmts...,:(return $ret))))) :
+        compile(:((owned,shared,handles)->$(Expr(:block,stmts...,:(return $ret)))))
+end
+
+function _native_demanded_fields(pf,skel)
+    deriv=derived_fields(pf); demanded=Set{Symbol}()
+    scan(x)=begin
+        if x isa _Getfield && x.field in deriv
+            push!(demanded,x.field)
+        elseif x isa _SelfField && length(x.path)==2 && x.path[1] in _EP_SELF && x.path[2] in deriv
+            push!(demanded,x.path[2])
+        end
+        if x isa Tuple || x isa AbstractVector
+            foreach(scan,x)
+        elseif x isa Pair
+            scan(x.second)
+        elseif x isa _MExpr || x isa _MStmt
+            foreach(f->scan(getfield(x,f)),fieldnames(typeof(x)))
+        end
+    end
+    foreach(ir->scan(ir.body),method_irs(skel))
+    sort!(collect(demanded))
+end
+
+function _compile_native_metric_update(pf::_PreparedFactory,::Type{OW},::Type{SH},
+        ::Val{Mode}) where {OW,SH,Mode}
+    Mode in (:production,:instrumented) || _native_reject("unsupported metric-probe mode $Mode")
+    plan=kernel_prepared_plan(pf); hs=kernel_prepared_handles(pf); fc=_lf_canon_map(plan)
+    metric=get(fc,:metric,nothing); metric===nothing && _native_reject("plan has no metric canon")
+    affected=Set{Int}((metric,_lf_kill_closure(plan,metric)...))
+    stmts=Any[]
+    for c in sort!(collect(affected)); _lf_mask!(stmts,plan,c,:kill); end
+    push!(stmts,:(copyto!($(_pp_read(plan,metric)),new_metric)))
+    _lf_mask!(stmts,plan,metric,:bless)
+    hook=Mode===:instrumented ?
+        ((i,h)->Expr(:call,GlobalRef(@__MODULE__,:_nuts_recipe_probe_complete!),:scratch,:(Val($i)))) :
+        nothing
+    # Only shared-authority producers execute during the metric mutation itself.  Owned kinetic closure is
+    # intentionally left dirty and is repaired by the real phasepoint read, matching the Plan invalidation.
+    for (i,h) in enumerate(hs)
+        outs=collect(h.owned)
+        isempty(outs) && continue
+        all(c->kernel_plan_field(plan,c)[1]===:shared,outs) || continue
+        any(in(affected),outs) || continue
+        _pp_emit_handle!(stmts,plan,h,i,OW,SH;recipe_hook=hook)
+    end
+    args=Mode===:instrumented ? :((owned,shared,handles,scratch,new_metric)) :
+                                :((owned,shared,handles,new_metric))
+    compile(:($args -> $(Expr(:block,stmts...,:(return owned)))))
+end
+
+struct _NutsRefreshBodyMarker{RefreshT} end
+struct _NutsLeafBodyMarker{ProgramT} end
+
+function _native_node_manifest(pf::_PreparedFactory,RM::Type{<:Tuple})
+    plan=kernel_prepared_plan(pf)
+    nodes=Any[]
+    for (i,D) in enumerate(RM.parameters)
+        # A compiler node is a selected recipe whose producer-owned result is shared and whose inputs are
+        # shared.  This identifies the fixture's declared logdet node structurally, without operator names.
+        ins,owned=D.parameters[5],D.parameters[7]
+        !isempty(owned) || continue
+        all(c->kernel_plan_field(plan,c)[1]===:shared,ins) || continue
+        all(c->kernel_plan_field(plan,c)[1]===:shared,owned) || continue
+        push!(nodes,D)
+    end
+    _native_tuple_type(nodes)
+end
+
+function _native_manifest_slice(ops::Vector{Any},lo::Int,hi::Int)
+    hi < lo ? Tuple{} : _native_tuple_type(ops[lo:hi])
+end
+
+function _compile_native_components(pf::_PreparedFactory,skel,refresh_skel,frame::_NutsFrame,
+        base,::Type{ProgramT},::Val{Mode}) where {ProgramT<:_NativeProgram,Mode}
+    instrumented=Mode===:instrumented
+    Mode in (:production,:instrumented) || _native_reject("unsupported native component mode $Mode")
+    b=_NutsEmissionBuilder(instrumented)
+    RM=_native_recipe_manifest(pf)
+    diag_reset_site=_nuts_emission_site!(b,:root_write,(base.RootToken,:diagnostics_reset),
+                                         (:root_write,:diagnostics_reset))
+    invalidate_entry_site=_nuts_emission_site!(b,:root_write,(base.RootToken,:derived_invalidate),
+                                                (:root_write,:derived_invalidate))
+    refresh_site=_nuts_emission_site!(b,:refresh,typeof(base.refresh),:refresh)
+    EPT=typeof(getfield(frame,:fwd)); SH=typeof(getfield(frame,:shared))
+    fields=_native_demanded_fields(pf,skel)
+    ensures=NamedTuple{Tuple(fields)}(Tuple(_compile_native_ensure(pf,EPT,SH,f,b) for f in fields))
+    leaf_start=length(b.ops)+1
+    leaf_ir,stepkw=prepared_callable_leaf(nuts_frame_step(frame))
+    hook=_native_recipe_hook(b,pf,:__lf_instrumentation)
+    write_hook=_native_leaf_write_hook(b,prepared_callable_token(nuts_frame_step(frame)),
+                                       :__lf_instrumentation)
+    leaf=instrumented ? compile_leapfrog_instrumented(pf,EPT,SH,leaf_ir;
+                                                       recipe_hook=hook,write_hook=write_hook) :
+                        _compile_leapfrog_native(pf,EPT,SH,leaf_ir,false;
+                                                 recipe_hook=hook,write_hook=write_hook)
+    metric_update=_compile_native_metric_update(pf,EPT,SH,Val(Mode))
+    LeafMarker=_NutsLeafBodyMarker{ProgramT}
+    leaf_site=_nuts_emission_site!(b,:inlined,LeafMarker,:leaf_body)
+    stats=stats_binding_token(nuts_frame_stats(frame))
+    stats_site=stats===nothing ? _NutsEmissionSite{_NutsRealOp{0,:none,Nothing},_NutsNoInstrument}() :
+        _nuts_emission_site!(b,:diagnostics,stats,:diagnostics)
+    leaf_end=length(b.ops)
+    diag_commit_site=_nuts_emission_site!(b,:root_write,(base.RootToken,:diagnostics_commit),
+                                          (:root_write,:diagnostics_commit))
+    derived_commit_site=_nuts_emission_site!(b,:root_write,(base.RootToken,:derived_commit),
+                                             (:root_write,:derived_commit))
+    transition_site=_nuts_emission_site!(b,:transition,base.RootToken,:transition)
+    catch_pending_site=_nuts_emission_site!(b,:root_write,(base.RootToken,:catch_pending_clear),
+                                            (:root_write,:catch_pending_clear))
+    catch_invalidate_site=_nuts_emission_site!(b,:root_write,(base.RootToken,:catch_derived_invalidate),
+                                               (:root_write,:catch_derived_invalidate))
+    Ops=_nuts_emission_ops(b)
+    root_types=Any[b.ops[i] for i in eachindex(b.ops) if i<leaf_start || i>leaf_end]
+    root_ops=_native_tuple_type(root_types)
+    leaf_ops=_native_manifest_slice(b.ops,leaf_start,leaf_end)
+    nodes=_native_node_manifest(pf,RM)
+    RootM=_NutsRootManifest{kernel_token(refresh_skel),_NutsRefreshBodyMarker{typeof(base.refresh)},root_ops}
+    LeafM=_NutsLeafManifest{prepared_callable_token(nuts_frame_step(frame)),:step_f,
+                            LeafMarker,leaf_ops,nodes}
+    cfg=(leaf=leaf,handles=base.cfg.handles,stepkw=stepkw,ensures=ensures,
+         callees=base.cfg.callees,callee_refs=base.cfg.callee_refs,
+         callee_registrations=base.cfg.callee_registrations,
+         metric_update=metric_update,
+         diag_reset_site=diag_reset_site,invalidate_entry_site=invalidate_entry_site,
+         refresh_site=refresh_site,leaf_site=leaf_site,stats_site=stats_site,
+         diag_commit_site=diag_commit_site,derived_commit_site=derived_commit_site,
+         transition_site=transition_site,catch_pending_site=catch_pending_site,
+         catch_invalidate_site=catch_invalidate_site)
+    (;cfg,RM,RootM,LeafM,Ops)
+end
+
+# Cold native entry using the existing validated compiler solely to construct the captured
+# leaf/ensure/refresh authorities.  The hot root and recursive program are wholly native and registry-free;
+# the later immutable state-threading ABI can reuse the same ProgramT and compiler-owned manifests.
 function compile_nuts_native(pf::_PreparedFactory,skel,refresh_skel,nuts_root_skel,frame::_NutsFrame;
                              root_name::Symbol=:step!)
     base=compile_nuts(pf,skel,refresh_skel,nuts_root_skel,frame;root_name=root_name)
@@ -803,12 +1193,181 @@ function compile_nuts_native(pf::_PreparedFactory,skel,refresh_skel,nuts_root_sk
     E=_native_encode_program(irs,typeof(kernel_prepared_plan(pf)),kernel_token(skel),kernel_module(skel);
                              root_name=root_name,derived=derived_fields(pf),stats_ir=stats_ir,
                              stats_produced=produced)
-    cfg=(leaf=base.cfg.leaf,handles=base.cfg.handles,stepkw=base.cfg.stepkw,
-         ensures=base.cfg.ensures,callees=E.callees,callee_refs=E.refs,
-         callee_registrations=E.registrations)
+    authority=(refresh=base.refresh,RootToken=base.RootToken,
+        cfg=(handles=base.cfg.handles,callees=E.callees,callee_refs=E.refs,
+             callee_registrations=E.registrations))
+    C=_compile_native_components(pf,skel,refresh_skel,frame,authority,E.program,Val(:production))
+    cfg=C.cfg
     H=kernel_prepared_handles(pf)
-    root=_CompiledNutsRootNative{E.program,typeof(base.refresh),typeof(cfg),typeof(H)}(base.refresh,cfg,H)
+    root=_CompiledNutsRootNative{E.program,C.RM,C.RootM,C.LeafM,C.Ops,
+                                 typeof(base.refresh),typeof(cfg),typeof(H)}(base.refresh,cfg,H)
     certificate=_native_nuts_certificate(Val(:production),pf,skel,Val(base.RootToken),root,(),frame)
     (root! = root,scratch=(),RootToken=base.RootToken,cfg=cfg,refresh=base.refresh,program=E.program,
      refs=E.refs,registrations=E.registrations,control=base,certificate=certificate)
+end
+
+
+"""Compile the genuine instrumented sibling of the production native root.
+
+The ProgramT and all real operations are shared structurally with `compile_nuts_native`, while the leaf,
+native method family, root, certificate, and scratch are independently constructed.  Instrument writes
+touch only `_NutsInstrumentationScratch`; none are present in the production root or cfg.
+"""
+function compile_nuts_native_instrumented(pf::_PreparedFactory,skel,refresh_skel,nuts_root_skel,
+        frame::_NutsFrame;root_name::Symbol=:step!)
+    prod=compile_nuts_native(pf,skel,refresh_skel,nuts_root_skel,frame;root_name=root_name)
+    authority=(refresh=prod.refresh,RootToken=prod.RootToken,cfg=prod.cfg)
+    C=_compile_native_components(pf,skel,refresh_skel,frame,authority,prod.program,Val(:instrumented))
+    cfg=C.cfg
+    H=kernel_prepared_handles(pf); P=prod.program
+    recs=kernel_plan_recipes(kernel_prepared_plan(pf))
+    gradidx=findfirst(==(kernel_prepared_grad_recipe(pf)),recs)
+    gradidx===nothing && _native_reject("prepared gradient recipe is absent from selected recipe order")
+    scratch=_nuts_instrumentation_scratch(Val(kernel_token(skel)),Val(prod.RootToken),
+                                          typeof(kernel_prepared_plan(pf)),P,C.Ops,C.RM,Val(gradidx))
+    root=_CompiledNutsRootInstrumented{P,C.RM,C.RootM,C.LeafM,C.Ops,
+                                       typeof(prod.refresh),typeof(cfg),typeof(H),typeof(scratch)}(
+                                       prod.refresh,cfg,H,scratch)
+    certificate=_native_nuts_certificate(Val(:instrumented),pf,skel,Val(prod.RootToken),
+                                         root,scratch,frame)
+    _nuts_certificate_parts(certificate).emitted_ops === C.Ops || throw(ArgumentError(
+        "instrumented scratch/certificate emitted-op mismatch"))
+    (root! = root,scratch=scratch,RootToken=prod.RootToken,cfg=cfg,refresh=prod.refresh,
+     program=P,refs=prod.refs,registrations=prod.registrations,control=prod.control,
+     certificate=certificate,production=prod)
+end
+
+function _nuts_instrumented_scratch(k::KernelObject)
+    h=_nuts_sealed_handles(k); p=_nuts_certificate_parts(getfield(h,:certificate))
+    p.mode === :instrumented || throw(ArgumentError("sampler is not the sealed instrumented sibling"))
+    sc=getfield(h,:scratch)
+    sc isa _NutsInstrumentationScratch || throw(ArgumentError(
+        "instrumented certificate is detached from compiler-owned instrumentation scratch"))
+    q=typeof(sc).parameters
+    (q[1]===p.owner && q[2]===p.root_token && q[3]===p.plan && q[4]===p.program &&
+     q[5]===p.emitted_ops && q[6]===p.recipe_manifest) || throw(ArgumentError(
+        "instrumented scratch token/plan/program/op-stream provenance mismatch"))
+    sc
+end
+
+nuts_sealed_op_stream(k::KernelObject) =
+    _nuts_certificate_parts(nuts_sealed_certificate(k)).emitted_ops
+nuts_instrumented_counts(k::KernelObject) =
+    _nuts_instrumentation_counts(_nuts_instrumented_scratch(k))
+function nuts_instrumented_recompute(k::KernelObject)
+    sc=_nuts_instrumented_scratch(k)
+    RM=_nuts_certificate_parts(nuts_sealed_certificate(k)).recipe_manifest
+    Tuple((owner=D.parameters[1],recipe=D.parameters[2],count=sc.recipe_counts[i])
+          for (i,D) in enumerate(RM.parameters))
+end
+function nuts_instrumented_trace(k::KernelObject)
+    sc=_nuts_instrumented_scratch(k); cap=length(sc.trace); np=min(sc.trace_pairs,cap>>>1)
+    np==0 && return ()
+    firstpair=sc.trace_pairs<=cap>>>1 ? 0 : sc.trace_pairs % (cap>>>1)
+    Tuple(sc.trace[2*((firstpair+j)%(cap>>>1))+d] for j in 0:np-1 for d in 1:2)
+end
+function _nuts_schedule_op(T::Type{<:_NutsRealOp},refresh_marker=Nothing)
+    _,kind,authority=T.parameters
+    if kind === :recipe
+        D=authority
+        return (kind=:recipe,id=D.parameters[2],owner=D.parameters[1],residual=false)
+    elseif kind === :refresh && refresh_marker !== Nothing
+        return (kind=:inlined,id=refresh_marker,owner=nothing,residual=false)
+    elseif kind === :inlined
+        return (kind=:inlined,id=authority,owner=nothing,residual=false)
+    end
+    (kind=kind,id=authority,owner=nothing,residual=false)
+end
+_nuts_schedule_ops(T::Type{<:Tuple},refresh_marker=Nothing) =
+    Tuple(_nuts_schedule_op(x,refresh_marker) for x in T.parameters if x<:_NutsRealOp)
+
+function _nuts_recipe_roles(p)
+    RM=p.recipe_manifest
+    gradidx=findfirst(D->D.parameters[4]===:destination,RM.parameters)
+    cholidx=findfirst(D->D.parameters[3]===typeof(cholesky),RM.parameters)
+    logidx=findfirst(D->D.parameters[3]===typeof(logdet),RM.parameters)
+    any(isnothing,(gradidx,cholidx,logidx)) && throw(ArgumentError(
+        "instrumented recipe manifest lacks grad/cholesky/logdet roles"))
+    role(i)=(RM.parameters[i].parameters[1],RM.parameters[i].parameters[2])
+    (chol_role=role(cholidx),logdet_role=role(logidx),grad_role=role(gradidx))
+end
+
+function nuts_instrumented_schedule(k::KernelObject)
+    p=_nuts_certificate_parts(nuts_sealed_certificate(k)); _nuts_instrumented_scratch(k)
+    rootp=p.root_manifest.parameters; leafp=p.leaf_manifest.parameters; rr=_nuts_recipe_roles(p)
+    plan=(selected_recipe_keys=Tuple((D.parameters[1],D.parameters[2])
+                                    for D in p.recipe_manifest.parameters),rr...)
+    integrator=(leapfrog_token=p.integrator,stepf_slot=leafp[2],refresh_token=rootp[1],
+                body_marker=leafp[3],refresh_body_marker=rootp[2])
+    (plan=plan,integrator=integrator,root_ops=_nuts_schedule_ops(rootp[3],rootp[2]),
+     leaf_ops=_nuts_schedule_ops(leafp[4]),
+     nodes=Tuple((owner=D.parameters[1],id=D.parameters[2]) for D in leafp[5].parameters),
+     recompute=nuts_instrumented_recompute(k))
+end
+
+function nuts_instrumented_mutate_metric!(k::KernelObject,new_metric)
+    sc=_nuts_instrumented_scratch(k); h=_nuts_sealed_handles(k); root=getfield(h,:root)
+    frame=getfield(h,:frame); cfg=getfield(root,:cfg)
+    typeof(new_metric) === typeof(nuts_sealed_metric(k)) || throw(ArgumentError(
+        "metric probe must preserve the sealed metric representation"))
+    getfield(cfg,:metric_update)(getfield(frame,:init),getfield(frame,:shared),
+        getfield(root,:handles),sc,new_metric)
+    setfield!(sc,:metric_mutations,getfield(sc,:metric_mutations)+1)
+    nuts_sealed_metric(k)
+end
+
+function _nuts_native_slot(p,ep,name::Symbol)
+    _canon_slot(ep,Val(_native_plan_slot(p.plan,name)))
+end
+function _nuts_instrumented_phasepoint(k::KernelObject,ep)
+    p=_nuts_certificate_parts(nuts_sealed_certificate(k)); sc=_nuts_instrumented_scratch(k)
+    root=nuts_sealed_root(k); cfg=getfield(root,:cfg); frame=nuts_sealed_frame(k)
+    ens=getfield(cfg,:ensures)
+    getfield(ens,:dham_dmom)(ep,getfield(frame,:shared),getfield(root,:handles),sc)
+    getfield(ens,:ham)(ep,getfield(frame,:shared),getfield(root,:handles),sc)
+    (pos=_nuts_native_slot(p,ep,:pos),mom=_nuts_native_slot(p,ep,:mom),
+     pot=_nuts_native_slot(p,ep,:pot),dpot_dpos=_nuts_native_slot(p,ep,:dpot_dpos),
+     dkin_dmom=_nuts_native_slot(p,ep,:dkin_dmom),kin=_nuts_native_slot(p,ep,:kin),
+     ham=_nuts_native_slot(p,ep,:ham),dham_dmom=_nuts_native_slot(p,ep,:dham_dmom))
+end
+nuts_instrumented_phasepoint(k::KernelObject) =
+    _nuts_instrumented_phasepoint(k,getfield(nuts_sealed_frame(k),:init))
+
+function nuts_instrumented_leaf_probe!(k::KernelObject,pos,mom)
+    sc=_nuts_instrumented_scratch(k); root=nuts_sealed_root(k); frame=nuts_sealed_frame(k)
+    src=getfield(frame,:init); ep=getfield(frame,:fwd)
+    isequal(pos,_nuts_native_slot(_nuts_certificate_parts(nuts_sealed_certificate(k)),src,:pos)) ||
+        throw(ArgumentError("leaf probe position must come from the sealed phasepoint"))
+    isequal(mom,_nuts_native_slot(_nuts_certificate_parts(nuts_sealed_certificate(k)),src,:mom)) ||
+        throw(ArgumentError("leaf probe momentum must come from the sealed phasepoint"))
+    _canon_copy_endpoint!(ep,src)
+    cfg=getfield(root,:cfg)
+    getfield(cfg,:leaf)(ep,getfield(frame,:shared),getfield(root,:handles),getfield(cfg,:stepkw),sc)
+    _nuts_instrument_marker!(sc,getfield(cfg,:leaf_site),Val(:leaf_body))
+    _nuts_instrumented_phasepoint(k,ep)
+end
+
+function nuts_instrumentation_equivalent(production::KernelObject,instrumented::KernelObject)
+    hp=_nuts_sealed_handles(production); hi=_nuts_sealed_handles(instrumented)
+    cp=_nuts_certificate_parts(getfield(hp,:certificate)); ci=_nuts_certificate_parts(getfield(hi,:certificate))
+    cp.mode === :production && ci.mode === :instrumented || return false
+    getfield(hp,:root) !== getfield(hi,:root) || return false
+    getfield(hp,:frame) !== getfield(hi,:frame) || return false
+    _nuts_instrumented_scratch(instrumented)
+    for f in (:owner,:root_token,:plan,:plan_key,:program,:control,:recipe_manifest,:recipes,:roles,:integrator)
+        getfield(cp,f) === getfield(ci,f) || return false
+    end
+    _nuts_real_op_signature(cp.emitted_ops) === _nuts_real_op_signature(ci.emitted_ops) || return false
+    _nuts_validate_emitted_ops(:production,cp.emitted_ops) || return false
+    _nuts_validate_emitted_ops(:instrumented,ci.emitted_ops) || return false
+    true
+end
+
+function _build_nuts_instrumented_sampler(pf::_PreparedFactory,endpoint_values,nuts_state_skel,
+        refresh_skel::_Mode2KernelSkeleton,nuts_skel::_Mode2KernelSkeleton;
+        step_f,max_depth::Int,min_dham,stats_f)
+    frame=_prepare_nuts_frame(pf,endpoint_values,max_depth;step_f,stats_f,min_dham)
+    C=compile_nuts_native_instrumented(pf,nuts_state_skel,refresh_skel,nuts_skel,frame)
+    _sealed_nuts_sampler(Val(kernel_token(nuts_state_skel)),Val(C.RootToken),frame,
+                         C.root!,C.scratch,C.certificate)
 end
