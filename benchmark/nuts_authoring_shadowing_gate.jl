@@ -175,7 +175,29 @@ blocks = kernel_blocks()
     @test !occursin("reset_one_tree!", SRC)                  # opaque helper inlined away
     # copy!! is the ONLY reset/proposal-restore path: no authored fieldwise copy, no @kernel copy!!/rcopy!!.
     @test occursin("copy!!(", nb) && !occursin("@kernel copy!!", SRC) && !occursin("rcopy!!", SRC)
-    @test occursin("Base.fill!", nb)                         # qualified visible primitive for buffer clears
+    # (B-reset-minimal) reset! seeds EXACTLY the four LIVE-on-entry endpoints (fwd, bwd, proposals[1],
+    #                   proposals[length(proposals)]) via the visible copy!! strong-update, and performs NONE of the
+    #                   dead eager clears — no all-proposal copy loop, no all-tree Base.fill!/zeroing (the faithful
+    #                   minimal reset: the trajectory overwrites every reached tree/proposal before any read). A
+    #                   regression to the eager all-buffer clear (Base.fill! over trees, `for p in proposals`) fails.
+    reset_copy_targets = String[]
+    reset_props_loop = Ref(false); reset_trees_loop = Ref(false); reset_fill = Ref(false)
+    _walk(methodbody(method_named(ns, :reset!))) do x
+        if x isa Expr && x.head === :call && x.args[1] === :copy!! && length(x.args) >= 2
+            push!(reset_copy_targets, srcof(x.args[2]))                     # first arg = strong-update destination
+        elseif x isa Expr && x.head === :for && x.args[1] isa Expr && x.args[1].head === :(=)
+            x.args[1].args[2] === :proposals && (reset_props_loop[] = true)  # dead all-proposal clear
+            x.args[1].args[2] === :trees && (reset_trees_loop[] = true)      # dead all-tree clear
+        elseif x isa Expr && x.head === :. && x.args[1] === :Base &&
+               x.args[2] isa QuoteNode && x.args[2].value === :fill!
+            reset_fill[] = true                                             # eager buffer clear primitive
+        end
+    end
+    @test Set(reset_copy_targets) == Set(["fwd", "bwd", "proposals[1]", "proposals[length(proposals)]"])  # EXACTLY the 4 live seeds
+    @test length(reset_copy_targets) == 4                                   # no duplicate/extra copy!! destinations
+    @test !reset_props_loop[]                                               # dead `for p in proposals` clear removed
+    @test !reset_trees_loop[]                                               # dead `for t in trees` clear removed
+    @test !reset_fill[] && !occursin("Base.fill!", nb)                      # no eager Base.fill! anywhere in nuts_state
 
     # (B-own) the pinned ownership policy is EXPECTED METADATA (documented, NOT hand-implemented): the
     #         shared authority + the complete owned set are named in the source.
