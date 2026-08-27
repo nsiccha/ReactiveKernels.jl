@@ -87,6 +87,10 @@ end
 @kernel orderk(a, b) = begin
     z = b - a
 end
+# a STATEFUL external gradient functor (DI/counting): construction must retain it by IDENTITY
+# (identity + counter), never deep-copy it.
+mutable struct CountingGrad; n::Int; end
+(c::CountingGrad)(x) = (c.n += 1; x)
 # a SECOND, byte-identical endpoint DEFINITION — same slot/recipe SHAPE, DIFFERENT canonical
 # Value identities — to prove the plan key distinguishes definitions (RK 04:17c).
 @kernel phasepoint_ep2(pot_f, grad_f, metric, pos, mom) = begin
@@ -750,25 +754,30 @@ end
         @test_throws MethodError RKS._owner_copy_current!(small, big) # different slots/width
     end
 
-    @testset "shared authority: one identity across endpoints + owned isolation (RK pt4/5)" begin
-        metric = [1.0, 2.0]
-        shared = RKS._kernel_construct_shared(Val(:auth), (metric, 3.0))
-        endpoints, sh = RKS._kernel_construct_group(Val(:ep), 3, (0.0, [1.0, 2.0, 3.0]), shared)
-        # 3 DISTINCT owned endpoint states (init/fwd/bwd), pairwise non-alias buffers
+    @testset "shared authority: identity/mutable split + one-across-endpoints (RK pt4/5, 05:06)" begin
+        gradf = CountingGrad(0)                 # EXTERNAL identity authority (stateful functor)
+        metric = [1.0, 2.0]                      # PER-SAMPLER mutable authority
+        # two independent SAMPLER instances
+        s1 = RKS._kernel_construct_shared(Val(:auth), (gradf,), (metric, 3.0))
+        s2 = RKS._kernel_construct_shared(Val(:auth), (gradf,), (metric, 3.0))
+        # external grad_f is the SAME identity across samplers — never deep-copied (RK 05:06)
+        @test RKS._shared_slot(s1, Val(1)) === gradf && RKS._shared_slot(s2, Val(1)) === gradf
+        gradf(0)                                 # its counter is shared (identity, not a copy)
+        @test RKS._shared_slot(s2, Val(1)).n == 1
+        # per-sampler mutable metric/chol/@node are DISTINCT across samplers, and NOT the source
+        @test RKS._shared_slot(s1, Val(2)) !== RKS._shared_slot(s2, Val(2))
+        @test RKS._shared_slot(s1, Val(2)) !== metric
+
+        # within ONE sampler, init/fwd/bwd owned endpoints share the SAME s1 by identity, isolate owned
+        endpoints, sh = RKS._kernel_construct_group(Val(:ep), 3, (0.0, [1.0, 2.0, 3.0]), s1)
         @test endpoints[1] !== endpoints[2] && endpoints[2] !== endpoints[3]
         @test RKS._owner_slot(endpoints[1], Val(2)) !== RKS._owner_slot(endpoints[2], Val(2))
-        @test RKS._owner_slot(endpoints[1], Val(2)) !== RKS._owner_slot(endpoints[3], Val(2))
-        # ALL endpoints reference the SAME shared authority object BY IDENTITY — not copied per endpoint
-        @test sh === shared
-        # a mutation of the shared authority is seen through the one shared object (recompute-once)
-        RKS.shared_slots(sh)[1][1] = 99.0
-        @test RKS._shared_slot(sh, Val(1))[1] == 99.0
-        # shared carries its OWN validity mask; killing metric's closure is ONE op across endpoints
-        @test RKS._shared_current(sh, Val(1))
-        RKS._shared_kill!(sh, Val(1))
-        @test !RKS._shared_current(sh, Val(1))
-        # the caller's shared buffer is deep-copied into the authority (isolated from the source)
-        @test RKS._shared_slot(sh, Val(1)) !== metric
+        @test sh === s1
+        # a metric mutation is seen through the one shared object; its closure kills once
+        RKS.shared_slots(sh)[2][1] = 99.0
+        @test RKS._shared_slot(sh, Val(2))[1] == 99.0
+        @test RKS._shared_current(sh, Val(2)); RKS._shared_kill!(sh, Val(2))
+        @test !RKS._shared_current(sh, Val(2))
     end
 
     @testset "poc binder/plan seam accessors (RK 04:41)" begin

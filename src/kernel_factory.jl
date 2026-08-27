@@ -940,9 +940,16 @@ shared_current_mask(s::_SharedState) = getfield(s, :current)
     setfield!(s, :current, Base.setindex(c, c[w] & ~(UInt(1) << _owner_bit(I)), w)); s
 end
 
-# Construct one shared-authority instance (deep-copied once; then referenced by identity).
-@inline _kernel_construct_shared(::Val{Token}, shared_values::Tuple) where {Token} =
-    _SharedState{Token}(map(deepcopy, shared_values))
+# Construct one shared-authority instance, SPLITTING the shared complement into two classes
+# (RK 05:06 — never conflate them):
+#   `external`  — EXTERNAL IDENTITY authorities (the callable inputs grad_f / pot_f / stats_f, even a
+#                 stateful DI/counting functor) retained BY IDENTITY: shared within AND across
+#                 independent sampler instances, NEVER deep-copied (its identity + counter persist).
+#   `per_sampler` — the MUTABLE shared authority (metric + derived chol_metric / @node(logdet)):
+#                 deep-copied ONCE per sampler, shared by init/fwd/bwd, DISTINCT across samplers.
+# Slots are `external...` (identity) then the per-sampler copies.
+@inline _kernel_construct_shared(::Val{Token}, external::Tuple, per_sampler::Tuple) where {Token} =
+    _SharedState{Token}((external..., map(deepcopy, per_sampler)...))
 
 # A multi-endpoint GROUP: `n` DISTINCT owned endpoint states (each isolated / deep-copied), all
 # referencing the ONE shared authority object by identity. This is the concrete no-Ref shape a
