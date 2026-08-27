@@ -11,16 +11,18 @@
 # derivation. The concrete no-Ref storage + one-time `@generated` planning + callable
 # resolution + `deepcopy` owned-copy land on RK confirmation of the reported design forks.
 
-# --- owned-vs-shared field derivation ----------------------------------------
+# --- ownership derivation (LOCAL SEED only; NOT authoritative) ----------------
 #
-# OWNED fields = the mutable per-instance state: every field DIRECTLY written by one of
-# the object's own methods (the write-root top-fields from poc's `write_roots`), plus
-# every recipe output transitively DERIVED from an owned field (recomputed when the
-# owned state changes). SHARED authority = the complement — read-only, unified by value
-# identity at construction. (Cross-object owned-copy of `deepcopy(child)` endpoints is a
-# later increment; this derives a single object's own owned/shared split.)
+# ⚠ These two helpers compute only the LOCAL owned seed and are NOT the authoritative
+# ownership/layout. Final ownership must additionally close TRANSITIVELY over sibling +
+# subject-method + registered callable-field (`step_f`) / `partial` / intrinsic (`copy!!`)
+# effects BEFORE final layout — e.g. `copy!!(init, proposals[end])` and resolved
+# `step_f(ep)` induce owned writes ABSENT from local `write_roots` (RK 2026-08-27). Shared
+# is the complement ONLY after that closed resolution; opaque unresolved effects REJECT
+# rather than being guessed shared. The authoritative closure lands in a later increment;
+# no downstream consumer may treat the local seed as final layout.
 
-# The directly-written owner top-fields (the owned SEED) across all of `skel`'s methods.
+# The directly-written owner top-fields (the LOCAL owned SEED) across `skel`'s own methods.
 function _kernel_factory_direct_writes(skel)
     writes = Set{Symbol}()
     for ir in method_irs(skel)
@@ -34,9 +36,11 @@ function _kernel_factory_direct_writes(skel)
     writes
 end
 
-# Fixpoint closure: owned = direct writes ∪ every recipe output whose ANY input is owned.
-# Returns `(owned::Set{Symbol}, shared::Set{Symbol})` over the object's fields/ports.
-function _kernel_factory_owned_shared(skel)
+# LOCAL owned SEED: direct writes ∪ recipe outputs transitively derived from them, over
+# the object's OWN recipe graph. A SEED for the authoritative transitive closure only —
+# it deliberately does NOT compute a shared complement (that is unsound before closed call
+# effects). Returns `Set{Symbol}` of locally-owned fields.
+function _kernel_factory_local_owned_seed(skel)
     owned = _kernel_factory_direct_writes(skel)
     graph = kernel_graph(kernel_spec(skel))
     changed = true
@@ -45,14 +49,33 @@ function _kernel_factory_owned_shared(skel)
         for r in graph.recipes
             any(inp -> inp.name in owned, r.inputs) || continue
             for out in r.outputs
-                if !(out.name in owned)
-                    push!(owned, out.name)
-                    changed = true
-                end
+                out.name in owned || (push!(owned, out.name); changed = true)
             end
         end
     end
-    fields = Set{Symbol}(kernel_port_names(skel))
-    intersect!(owned, fields)                 # keep only real fields/ports
-    (owned = owned, shared = setdiff(fields, owned))
+    intersect!(owned, Set{Symbol}(kernel_port_names(skel)))
 end
+
+# --- concrete no-Ref owner storage (RK 2026-08-27 storage redirect) ----------
+#
+# ONE generic mutable wrapper around a fully concrete VALUE Tuple of the flattened owned
+# slots — NOT a tuple of Ref/cell/box objects, and NOT a per-definition emitted struct
+# (no runtime type emission / world-age). Val-indexed access lowers to a constant
+# `getfield`; scalar updates are accumulated and committed by ONE typed tuple replacement
+# at the schedule boundary. `Token` phantom-types the owner definition; layout (the slot
+# order in `T`) is fixed by the plan AFTER the transitive effect closure.
+mutable struct _OwnerState{Token,T<:Tuple}
+    slots::T
+end
+_OwnerState{Token}(slots::T) where {Token,T<:Tuple} = _OwnerState{Token,T}(slots)
+
+owner_token(::_OwnerState{Token}) where {Token} = Token
+owner_slots(s::_OwnerState) = getfield(s, :slots)
+
+# Val-indexed slot READ → a constant `getfield` on the value tuple (no dynamic getindex).
+@inline _owner_slot(s::_OwnerState, ::Val{I}) where {I} = getfield(getfield(s, :slots), I)
+
+# Commit a whole new concrete slot tuple in ONE TYPED replacement (same `T`). The typed
+# signature enforces layout/type stability — a different-typed tuple does not match.
+@inline _owner_commit!(s::_OwnerState{Token,T}, slots::T) where {Token,T} =
+    (setfield!(s, :slots, slots); s)

@@ -16,19 +16,31 @@ const RKS = ReactiveKernels
 end
 
 @testset "Inc3 factory substrate" begin
-    @testset "owned-vs-shared field derivation" begin
-        os = RKS._kernel_factory_owned_shared(accum)
-        # `total` is directly written; `combined` derives from it → both OWNED
-        @test :total in os.owned
-        @test :combined in os.owned
-        # `scale` (constant recipe) and `seed` (unwritten source) are SHARED authority
-        @test :scale in os.shared
-        @test :seed in os.shared
-        # exact partition of the field set
-        @test isempty(intersect(os.owned, os.shared))
-        @test union(os.owned, os.shared) == Set(RKS.kernel_port_names(accum))
+    @testset "LOCAL owned seed (not authoritative)" begin
         # the direct-write seed is exactly the mutated field
         @test RKS._kernel_factory_direct_writes(accum) == Set((:total,))
+        # local seed = direct writes ∪ recipe outputs derived from them (owned-ONLY; the
+        # authoritative closure over call effects + the shared complement come later).
+        seed = RKS._kernel_factory_local_owned_seed(accum)
+        @test :total in seed && :combined in seed          # combined derives from total
+        @test !(:scale in seed) && !(:seed in seed)        # constant / unwritten source
+    end
+
+    @testset "concrete no-Ref owner storage (redirect 1)" begin
+        s = RKS._OwnerState{:tok}((1, 2.0, [3.0]))
+        @test RKS.owner_token(s) === :tok
+        # Val-indexed reads → constant getfield on the value tuple
+        @test RKS._owner_slot(s, Val(1)) === 1
+        @test RKS._owner_slot(s, Val(2)) === 2.0
+        # slots are a concrete VALUE tuple — NO Ref/RefValue/cell wrapper on any slot
+        @test fieldtype(typeof(s), :slots) <: Tuple
+        @test !any(t -> t <: Ref, fieldtypes(typeof(RKS.owner_slots(s))))
+        @test fieldtypes(typeof(RKS.owner_slots(s))) == (Int, Float64, Vector{Float64})
+        # scalar updates commit by ONE typed tuple replacement (same T)
+        RKS._owner_commit!(s, (10, 20.0, [30.0]))
+        @test RKS._owner_slot(s, Val(1)) === 10
+        # a different-typed tuple does not match the typed commit (layout stability)
+        @test_throws MethodError RKS._owner_commit!(s, ("x", 1, 2))
     end
 end
 
