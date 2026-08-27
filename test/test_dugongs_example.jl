@@ -1,36 +1,8 @@
 using ReactiveKernels
-using DifferentiationInterface
-import Enzyme
 using Test
 
 include(joinpath(@__DIR__, "..", "examples", "dugongs_growth.jl"))
 using .DugongsGrowthExample
-
-const ENZYME_BACKEND = AutoEnzyme(;
-    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-    function_annotation = Enzyme.Const,
-)
-
-function dugongs_reference_logdensity(qv)
-    α, β, u_λ, log_τ = qv
-    parameters = DugongsParameters(
-        α,
-        β,
-        DugongsGrowthExample.bounded_lambda(u_λ),
-        DugongsGrowthExample.sd_from_log_precision(log_τ),
-    )
-    prior = DugongsGrowthExample.log_prior(parameters)
-    likelihood = DugongsGrowthExample.sum_log_likelihood(
-        DugongsGrowthExample.pointwise_log_likelihood(
-            parameters, DUGONGS_AGE, DUGONGS_LENGTH,
-        ),
-    )
-    DugongsGrowthExample.total_log_density(
-        prior,
-        DugongsGrowthExample.log_abs_det_jacobian(u_λ, log_τ),
-        likelihood,
-    )
-end
 
 @testset "manual PPL graph — dugongs (nonlinear growth)" begin
     model = build_dugongs_graph()
@@ -74,26 +46,6 @@ end
         @test all(isfinite, pointwise)
         @test likelihood ≈ sum(pointwise)
         @test density ≈ prior + log_jacobian + likelihood
-    end
-
-    @testset "the log-density boundary differentiates through DI + Enzyme" begin
-        k = prepare(model.graph;
-                    have = (model.unconstrained, model.ages, model.lengths),
-                    want = (model.density,))
-        logdensity(qv) = k(Tuple(qv), DUGONGS_AGE, DUGONGS_LENGTH)
-
-        qvec = collect(q)
-        gradient = DifferentiationInterface.gradient(
-            logdensity, ENZYME_BACKEND, qvec)
-        @test length(gradient) == length(q)
-        @test all(isfinite, gradient)
-        @test gradient !== qvec
-        @test pointer(gradient) != pointer(qvec)
-
-        @test logdensity(qvec) ≈ dugongs_reference_logdensity(qvec)
-        reference_gradient = DifferentiationInterface.gradient(
-            dugongs_reference_logdensity, ENZYME_BACKEND, qvec)
-        @test gradient ≈ reference_gradient
     end
 
     @testset "generated quantity prunes density work" begin

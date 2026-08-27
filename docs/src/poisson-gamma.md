@@ -99,27 +99,6 @@ constrain_kernel = prepare(model;
 parameters = constrain_kernel(log_rate)
 ```
 
-The numeric graph ports are typed at a `Real` boundary, while the constrained
-rate retains its concrete scalar type. The prepared density kernel therefore
-specializes on ordinary `Float64` inputs and also differentiates cleanly through
-reverse-mode AD (`DifferentiationInterface` with the Enzyme backend):
-
-```julia
-using DifferentiationInterface
-import Enzyme
-
-enzyme_backend = AutoEnzyme(;
-    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-    function_annotation = Enzyme.Const,
-)
-
-density_only = prepare(model;
-    have = (:log_rate, :counts),
-    want = :density)
-logdensity(qv) = density_only(only(qv), counts)
-gradient = DifferentiationInterface.gradient(logdensity, enzyme_backend, [log_rate])
-```
-
 Generated quantities can start at an already-constrained boundary. Here the
 expected number of events over a future window is a deterministic function of
 the rate, so planning removes the transform, Jacobian, prior, likelihood, and

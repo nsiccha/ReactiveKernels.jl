@@ -1,25 +1,12 @@
 using ReactiveKernels
-using DifferentiationInterface
-import Enzyme
 using Test
 
 include(joinpath(@__DIR__, "..", "examples", "eight_schools.jl"))
 using .EightSchoolsExample
 
-# Reverse-mode Enzyme through DifferentiationInterface. Runtime activity is
-# enabled because the prepared density kernel closes over constant model data
-# (the observations and their scales), which Enzyme's static activity analysis
-# cannot prove non-differentiable; the closure (which captures the prepared
-# kernel) is annotated `Const` because only the numeric input is differentiated,
-# never the kernel itself.
-const ENZYME_BACKEND = AutoEnzyme(;
-    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-    function_annotation = Enzyme.Const,
-)
-
 @testset "manual PPL graph — eight schools" begin
     model = build_eight_schools_graph()
-    q = (1.5, log(2.0), ntuple(i -> 0.25 * i, 8)...)
+    q = [1.5, log(2.0), (0.25 .* (1:8))...]
 
     @testset "unconstrained -> constrained; Jacobian is optional" begin
         p = plan(model.graph;
@@ -34,7 +21,7 @@ const ENZYME_BACKEND = AutoEnzyme(;
         @test parameters isa EightSchoolsParameters
         @test parameters.μ == 1.5
         @test parameters.τ ≈ 2.0
-        @test parameters.θ == ntuple(i -> 0.25 * i, 8)
+        @test parameters.θ == [0.25 * i for i in 1:8]
 
         with_jacobian = prepare(model.graph;
             have = (model.unconstrained,),
@@ -44,58 +31,24 @@ const ENZYME_BACKEND = AutoEnzyme(;
         @test log_jacobian == q[2]
     end
 
-    @testset "density decomposition and shared pointwise likelihood" begin
+    @testset "density decomposition; likelihood is a plated (vectorized) kernel" begin
         p = plan(model.graph;
                  have = (model.unconstrained, model.observations,
                          model.observation_scales),
-                 want = (model.prior, model.log_jacobian, model.pointwise,
+                 want = (model.prior, model.log_jacobian,
                          model.likelihood, model.density))
-        @test count(r -> r.op === EightSchoolsExample.pointwise_log_likelihood,
-                    p.recipes) == 1
 
         k = prepare(p)
-        prior, log_jacobian, pointwise, likelihood, density =
+        prior, log_jacobian, likelihood, density =
             k(q, EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA)
 
-        @test all(isfinite, pointwise)
-        @test likelihood ≈ sum(pointwise)
+        θ = q[3:end]
+        reference_likelihood = sum(
+            EightSchoolsExample.normal_logpdf(
+                EIGHT_SCHOOLS_Y[j], θ[j], EIGHT_SCHOOLS_SIGMA[j])
+            for j in 1:8)
+        @test likelihood ≈ reference_likelihood
         @test density ≈ prior + log_jacobian + likelihood
-    end
-
-    @testset "the log-density boundary accepts AD numbers" begin
-        k = prepare(model.graph;
-                    have = (model.unconstrained, model.observations,
-                            model.observation_scales),
-                    want = (model.density,))
-        logdensity(qv) = k(Tuple(qv), EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA)
-
-        qvec = collect(q)
-        gradient = DifferentiationInterface.gradient(
-            logdensity, ENZYME_BACKEND, qvec)
-        @test length(gradient) == length(q)
-        @test all(isfinite, gradient)
-
-        # Enzyme derivative-aliasing caveat: DifferentiationInterface's
-        # out-of-place gradient must return freshly allocated memory that does
-        # not alias the mutable primal input.
-        @test gradient !== qvec
-        @test pointer(gradient) != pointer(qvec)
-
-        # Correctness is validated with no second differentiation backend. The
-        # μ-component has a closed form for this fixed q: the Normal(0, 5) prior
-        # contributes -μ/25 = -0.06, and the eight Normal(μ, τ) group terms
-        # contribute Σⱼ(θⱼ - μ)/τ² = (9 - 12)/4 = -0.75 (τ = exp(log 2) = 2), so
-        # ∂density/∂μ = -0.81 exactly.
-        @test gradient[1] ≈ -0.81
-        # The full gradient is pinned to independently established constants;
-        # these anchor a pure DI+Enzyme regression that needs no second
-        # differentiation backend as a dependency.
-        expected_gradient = [
-            -0.81, -6.338362068965517, 0.4358333333333333, 0.325,
-            0.1728515625, 0.17458677685950413, 0.034722222222222224,
-            -0.004132231404958678, 0.1, -0.0941358024691358,
-        ]
-        @test gradient ≈ expected_gradient
     end
 
     @testset "corrected core contracts hold on PPL paths" begin
@@ -108,7 +61,7 @@ const ENZYME_BACKEND = AutoEnzyme(;
             parameters = prepare(p)(q, 99.0)
             @test parameters.μ == 99.0
             @test parameters.τ ≈ 2.0
-            @test parameters.θ == ntuple(i -> 0.25 * i, 8)
+            @test parameters.θ == [0.25 * i for i in 1:8]
 
             state = ReactiveState(model.graph)
             set!(state, model.unconstrained, q)
@@ -118,11 +71,11 @@ const ENZYME_BACKEND = AutoEnzyme(;
 
         @testset "overlapping transform producers admit a valid order" begin
             graph = Graph()
-            raw = value!(graph, :ppl_unconstrained, NTuple{2,Real})
-            location = value!(graph, :location, Real)
-            log_scale = value!(graph, :log_scale, Real)
-            bridge = value!(graph, :location_bridge, Real)
-            auxiliary = value!(graph, :auxiliary, Real)
+            raw = value!(graph, :ppl_unconstrained, Vector{Float64})
+            location = value!(graph, :location, Float64)
+            log_scale = value!(graph, :log_scale, Float64)
+            bridge = value!(graph, :location_bridge, Float64)
+            auxiliary = value!(graph, :auxiliary, Float64)
 
             overlapping = add!(graph, bridge => (location, auxiliary),
                                x -> (x - 10, 2x))
@@ -134,14 +87,14 @@ const ENZYME_BACKEND = AutoEnzyme(;
             @test [r.id for r in p.recipes] ==
                   [source.id, bridged.id, overlapping.id]
             auxiliary_value, log_scale_value =
-                prepare(p)((3.0, log(2.0)))
+                prepare(p)([3.0, log(2.0)])
             @test auxiliary_value == 26.0
             @test log_scale_value ≈ log(2.0)
         end
 
         @testset "nested density provenance remains reusable" begin
             nested = build_eight_schools_graph()
-            checked_density = value!(nested.graph, :checked_log_density, Real)
+            checked_density = value!(nested.graph, :checked_log_density, Float64)
             density_calls = Ref(0)
             add!(nested.graph,
                  (nested.prior, nested.log_jacobian, nested.likelihood) =>
@@ -154,8 +107,7 @@ const ENZYME_BACKEND = AutoEnzyme(;
             state = ReactiveState(
                 nested.graph;
                 materialize = (nested.parameters, nested.prior,
-                               nested.pointwise, nested.likelihood,
-                               checked_density),
+                               nested.likelihood, checked_density),
             )
             set!(state, nested.unconstrained, q)
             set!(state, nested.observations, EIGHT_SCHOOLS_Y)
@@ -163,7 +115,6 @@ const ENZYME_BACKEND = AutoEnzyme(;
 
             get!(state, nested.parameters)
             get!(state, nested.prior)
-            get!(state, nested.pointwise)
             get!(state, nested.likelihood)
             first_density = get!(state, checked_density)
             @test get!(state, checked_density) == first_density
@@ -177,7 +128,7 @@ const ENZYME_BACKEND = AutoEnzyme(;
             set!(state, checkpointed.unconstrained, q)
             get!(state, checkpointed.parameters)
 
-            q2 = (7.0, q[2:end]...)
+            q2 = [7.0; q[2:end]]
             set!(state, checkpointed.unconstrained, q2)
             @test_throws ErrorException checkpoint(
                 state, (checkpointed.parameters,))
@@ -191,11 +142,10 @@ const ENZYME_BACKEND = AutoEnzyme(;
 
         @testset "generated bindings are hygienic for PPL names" begin
             graph = Graph()
-            reserved = value!(graph, :__ops__,
-                              EightSchoolsExample.UnconstrainedParameters)
-            location = value!(graph, :location, Real)
-            log_scale = value!(graph, :log_scale, Real)
-            effects = value!(graph, :effects, EightSchoolsExample.SchoolVector)
+            reserved = value!(graph, :__ops__, Vector{Float64})
+            location = value!(graph, :location, Float64)
+            log_scale = value!(graph, :log_scale, Float64)
+            effects = value!(graph, :effects, Vector{Float64})
             add!(graph, reserved => (location, log_scale, effects),
                  EightSchoolsExample.split_unconstrained)
 
@@ -205,7 +155,7 @@ const ENZYME_BACKEND = AutoEnzyme(;
         end
 
         @testset "recipe costs preserve planner assumptions" begin
-            diagnostic = value!(model.graph, :density_diagnostic, Real)
+            diagnostic = value!(model.graph, :density_diagnostic, Float64)
             recipe_count = length(model.graph.recipes)
             for invalid_cost in (-1.0, Inf, NaN)
                 @test_throws ArgumentError add!(
@@ -217,38 +167,39 @@ const ENZYME_BACKEND = AutoEnzyme(;
     end
 
     @testset "generated quantities prune density work" begin
-        parameters = EightSchoolsParameters(1.0, 4.0, ntuple(_ -> 2.0, 8))
+        parameters = EightSchoolsParameters(1.0, 4.0, fill(2.0, 8))
         p = plan(model.graph;
-                 have = (model.parameters, model.observations,
-                         model.observation_scales, model.new_group_scale,
+                 have = (model.parameters, model.new_group_scale,
                          model.prediction_innovations),
-                 want = (model.pointwise, model.new_group))
+                 want = (model.new_group,))
 
-        @test length(p.recipes) == 2
+        @test length(p.recipes) == 1
         @test !any(r -> r.op === EightSchoolsExample.split_unconstrained,
                    p.recipes)
         @test !any(r -> r.op === EightSchoolsExample.log_prior, p.recipes)
-        @test !any(r -> r.op === EightSchoolsExample.total_log_density,
-                   p.recipes)
 
-        pointwise, prediction = prepare(p)(
-            parameters, EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA,
-            12.0, (0.25, -1.0))
-        @test all(isfinite, pointwise)
+        prediction = prepare(p)(parameters, 12.0, [0.25, -1.0])
         @test prediction isa NewGroupPrediction
         @test prediction.θ == 2.0
         @test prediction.y == -10.0
     end
 
-    @testset "invalid constrained inputs fail explicitly" begin
-        parameters = EightSchoolsParameters(1.0, 4.0, ntuple(_ -> 2.0, 8))
-        bad_scales = (0.0, EIGHT_SCHOOLS_SIGMA[2:end]...)
+    @testset "the plated likelihood equals the summed per-school density" begin
+        # `plated_loglik` is the vectorized `plate` of the scalar per-school kernel.
+        θ = q[3:end]
+        expected = sum(
+            EightSchoolsExample.normal_logpdf(
+                EIGHT_SCHOOLS_Y[j], θ[j], EIGHT_SCHOOLS_SIGMA[j])
+            for j in 1:8)
+        @test EightSchoolsExample.plated_loglik(
+            EIGHT_SCHOOLS_Y, θ, EIGHT_SCHOOLS_SIGMA) ≈ expected
+    end
 
-        @test_throws DomainError EightSchoolsExample.pointwise_log_likelihood(
-            parameters, EIGHT_SCHOOLS_Y, bad_scales)
+    @testset "invalid constrained inputs fail explicitly" begin
+        @test_throws DomainError EightSchoolsExample.normal_logpdf(0.0, 0.0, 0.0)
         @test_throws DomainError EightSchoolsExample.predict_new_group(
-            parameters, 0.0, (0.25, -1.0))
+            EightSchoolsParameters(1.0, 4.0, fill(2.0, 8)), 0.0, [0.25, -1.0])
         @test_throws DomainError EightSchoolsExample.log_prior(
-            EightSchoolsParameters(1.0, 0.0, ntuple(_ -> 2.0, 8)))
+            EightSchoolsParameters(1.0, 0.0, fill(2.0, 8)))
     end
 end

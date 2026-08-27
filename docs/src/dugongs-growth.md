@@ -101,27 +101,6 @@ constrain_kernel = prepare(model;
 parameters = constrain_kernel(q)
 ```
 
-The numeric graph ports are typed at a `Real` boundary, so the prepared density
-kernel differentiates cleanly through reverse-mode AD
-(`DifferentiationInterface` with the Enzyme backend) — the nonlinear `λ^age` mean
-included:
-
-```julia
-using DifferentiationInterface
-import Enzyme
-
-enzyme_backend = AutoEnzyme(;
-    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-    function_annotation = Enzyme.Const,
-)
-
-density_only = prepare(model;
-    have = (:unconstrained, :ages, :lengths),
-    want = :density)
-logdensity(qv) = density_only(Tuple(qv), ages, lengths)
-gradient = DifferentiationInterface.gradient(logdensity, enzyme_backend, collect(q))
-```
-
 Generated quantities can start at an already-constrained boundary. Here the
 expected length at a new age is a deterministic function of the parameters, so
 planning removes the transforms, Jacobian, prior, likelihood, and total-density
