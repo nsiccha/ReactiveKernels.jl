@@ -175,29 +175,39 @@ blocks = kernel_blocks()
     @test !occursin("reset_one_tree!", SRC)                  # opaque helper inlined away
     # copy!! is the ONLY reset/proposal-restore path: no authored fieldwise copy, no @kernel copy!!/rcopy!!.
     @test occursin("copy!!(", nb) && !occursin("@kernel copy!!", SRC) && !occursin("rcopy!!", SRC)
-    # (B-reset-minimal) reset! seeds EXACTLY the four LIVE-on-entry endpoints (fwd, bwd, proposals[1],
-    #                   proposals[length(proposals)]) via the visible copy!! strong-update, and performs NONE of the
-    #                   dead eager clears — no all-proposal copy loop, no all-tree Base.fill!/zeroing (the faithful
-    #                   minimal reset: the trajectory overwrites every reached tree/proposal before any read). A
-    #                   regression to the eager all-buffer clear (Base.fill! over trees, `for p in proposals`) fails.
-    reset_copy_targets = String[]
-    reset_props_loop = Ref(false); reset_trees_loop = Ref(false); reset_fill = Ref(false)
-    _walk(methodbody(method_named(ns, :reset!))) do x
-        if x isa Expr && x.head === :call && x.args[1] === :copy!! && length(x.args) >= 2
-            push!(reset_copy_targets, srcof(x.args[2]))                     # first arg = strong-update destination
-        elseif x isa Expr && x.head === :for && x.args[1] isa Expr && x.args[1].head === :(=)
-            x.args[1].args[2] === :proposals && (reset_props_loop[] = true)  # dead all-proposal clear
-            x.args[1].args[2] === :trees && (reset_trees_loop[] = true)      # dead all-tree clear
-        elseif x isa Expr && x.head === :. && x.args[1] === :Base &&
-               x.args[2] isa QuoteNode && x.args[2].value === :fill!
-            reset_fill[] = true                                             # eager buffer clear primitive
-        end
+    # (B-reset-minimal) Bind the COMPLETE parsed reset! effect body, not a census of a few spellings. This
+    #                   admits only the seven authored scalar resets followed by the four LIVE endpoint seeds.
+    #                   Any helper call, loop, eachindex/foreach/broadcast form, alternate fill, extra write, or
+    #                   reordering changes this AST and rejects — including an eager clear hidden in a sibling.
+    expected_reset = Any[
+        :(gofwd = true), :(may_sample = true), :(may_continue = true),
+        :(dham = zero(init.ham)), :(n_steps = 0), :(reached_depth = 0),
+        :(acceptance_rate = zero(init.ham)),
+        :(copy!!(fwd, init)), :(copy!!(bwd, init)),
+        :(copy!!(proposals[1], init)), :(copy!!(proposals[length(proposals)], init)),
+    ]
+    reset_effects(body) = body isa Expr && body.head === :block ? _dropln(body.args) : Any[body]
+    reset_exact(body) = reset_effects(body) == expected_reset
+    @test reset_exact(methodbody(method_named(ns, :reset!)))
+
+    # Load-bearing negative controls: mutually different eager-clear spellings all fail the SAME complete-body
+    # contract. These are parser-level controls only; the actual fixture assertion above is the production gate.
+    for extra in (:(reset_all!()),
+                  :(for i in eachindex(proposals); copy!!(proposals[i], init); end),
+                  :(foreach(p -> copy!!(p, init), proposals)),
+                  :(trees .= zero.(trees)),
+                  :(fill!(trees, init)),
+                  :(LinearAlgebra.fill!(trees, init)))
+        @test !reset_exact(Expr(:block, expected_reset..., extra))
     end
-    @test Set(reset_copy_targets) == Set(["fwd", "bwd", "proposals[1]", "proposals[length(proposals)]"])  # EXACTLY the 4 live seeds
-    @test length(reset_copy_targets) == 4                                   # no duplicate/extra copy!! destinations
-    @test !reset_props_loop[]                                               # dead `for p in proposals` clear removed
-    @test !reset_trees_loop[]                                               # dead `for t in trees` clear removed
-    @test !reset_fill[] && !occursin("Base.fill!", nb)                      # no eager Base.fill! anywhere in nuts_state
+    @test !reset_exact(Expr(:block, expected_reset[2:end]...))                # missing scalar reset
+    reordered_reset = copy(expected_reset)
+    reordered_reset[1], reordered_reset[2] = reordered_reset[2], reordered_reset[1]
+    @test !reset_exact(Expr(:block, reordered_reset...))                      # reordered scalar reset
+    @test !reset_exact(Expr(:block, expected_reset..., :(copy!!(fwd, init)))) # duplicate/extra live copy
+    smuggled_reset = copy(expected_reset)
+    smuggled_reset[4] = :(dham = (foreach(p -> copy!!(p, init), proposals); zero(init.ham)))
+    @test !reset_exact(Expr(:block, smuggled_reset...))                       # work hidden in an allowed RHS
 
     # (B-own) the pinned ownership policy is EXPECTED METADATA (documented, NOT hand-implemented): the
     #         shared authority + the complete owned set are named in the source.

@@ -150,9 +150,10 @@ end
         acceptance_rate = zero(init.ham)
         copy!!(fwd, init)                 # registered owned-copy (visible)
         copy!!(bwd, init)
-        # FAITHFUL RESET: the trajectory OVERWRITES every reached tree buffer and every reached proposal before
-        # any read (proven by the committed stale-poison D1–D5 battery in test_kernel_nuts.jl; the eager-vs-
-        # minimal perf A/B is measured EXTERNALLY, not asserted here), so clearing
+        # FAITHFUL RESET: source liveness establishes that the trajectory OVERWRITES every reached tree buffer
+        # and every reached proposal before any read; the committed stale-poison D1–D5 battery verifies the
+        # censused paths in test_kernel_nuts.jl (the eager-vs-minimal perf A/B is measured EXTERNALLY, not
+        # asserted here). Therefore clearing
         # all trees + copying all proposals each transition is dead, O(max_depth) work. Seed ONLY the live-on-
         # entry slots: fwd/bwd (start endpoints) and proposals[1]/proposals[end] (the sample fallbacks read when
         # the sampler takes few/zero steps). trees[1].log_weight is seeded by step! before its first read.

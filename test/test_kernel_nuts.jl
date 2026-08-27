@@ -444,9 +444,10 @@ end
 end
 # Load-bearing tests for the faithful reset cleanup (reset! seeds only fwd/bwd/proposals[1]/proposals[end]).
 # Adversarial stale-poison of every dropped write class (D1–D5) over a CENSUSED set of witnessed paths (depths,
-# both directions, swap AND no-swap all observed, plus a forced-divergence early-return control), full
-# seven-field selected-sample parity, exact 0-B (both RNG), and a spoof-proof source-drift gate (reset! MethodIR
-# structure + comment-stripped body — not a whole-file scan).
+# both directions, net proposals[end] identity change AND no-net-change observed, plus a forced-divergence
+# genuine no-swap control), full seven-field selected-sample parity, and exact 0-B (both RNG). The local
+# MethodIR/comment-stripped checks bind this executable fixture; the complete exact-AST reset contract lives in
+# benchmark/nuts_authoring_shadowing_gate.jl.
 
 @testset "kernel_nuts — faithful reset: stale-poison D1–D5 (censused paths) + parity + 0-B + IR drift gate" begin
     _mkframe(pf, T, md, metric; min_dham = -1000) = begin
@@ -523,7 +524,7 @@ end
         CD = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, _mkframe(pf, T, 10, LinearAlgebra.Diagonal(T[1, 1])))
         CM = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, _mkframe(pf, T, 10, T[1 0; 0 1]))
         # stale-poison D1–D5 across the censused seeds — reference vs each poisoned class byte-identical over the
-        # FULL per-txn record (payload + selected + gofwd). Also collect the observed path CENSUS from the SAME
+        # FULL per-txn record (payload + net end-identity change + gofwd). Also collect the observed path CENSUS from the SAME
         # reference trajectories, so the "dead" claim is scoped to exactly the paths witnessed here.
         depths = Set{Int}(); dirs = Set{Bool}(); sels = Set{Bool}(); allstop = Ref(true)
         for seed in seeds
