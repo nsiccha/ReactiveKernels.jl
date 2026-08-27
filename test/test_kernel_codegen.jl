@@ -87,7 +87,7 @@ function _pp_diag_values(plan, ::Type{T}, diag, pos, mom, pgrad) where {T}
             nm === :chol_metric ? Cholesky(Diagonal(Vector{T}(undef, d)), 'U', 0) :
             startswith(ns, "##node") ? zero(T) :
             (nm in (:pot, :kin, :ham)) ? zero(T) :
-            zeros(T, length(nm in (:dkin_dmom, :dham_dmom) ? mom : pos))
+            zeros(T, size(nm in (:dkin_dmom, :dham_dmom) ? mom : pos))
     end
     v
 end
@@ -125,12 +125,21 @@ end
 
     # The discriminator is solely the concrete prepared factor-slot TYPE. Float16, dense, and a Diagonal over
     # non-builtin backing storage remain on the original generic lowering.
-    @test RK._pp_diag_cholesky_ldiv_type(Cholesky{Float64,Diagonal{Float64,Vector{Float64}}})
-    @test RK._pp_diag_cholesky_ldiv_type(Cholesky{Float32,Diagonal{Float32,Vector{Float32}}})
-    @test !RK._pp_diag_cholesky_ldiv_type(Cholesky{Float16,Diagonal{Float16,Vector{Float16}}})
-    @test !RK._pp_diag_cholesky_ldiv_type(Cholesky{Float64,Matrix{Float64}})
+    @test RK._pp_diag_cholesky_ldiv_type(Cholesky{Float64,Diagonal{Float64,Vector{Float64}}},
+                                         Vector{Float64},Vector{Float64})
+    @test RK._pp_diag_cholesky_ldiv_type(Cholesky{Float32,Diagonal{Float32,Vector{Float32}}},
+                                         Vector{Float32},Vector{Float32})
+    @test !RK._pp_diag_cholesky_ldiv_type(Cholesky{Float16,Diagonal{Float16,Vector{Float16}}},
+                                          Vector{Float16},Vector{Float16})
+    @test !RK._pp_diag_cholesky_ldiv_type(Cholesky{Float64,Matrix{Float64}},
+                                          Vector{Float64},Vector{Float64})
     @test !RK._pp_diag_cholesky_ldiv_type(
-        Cholesky{Float64,Diagonal{Float64,SubArray{Float64,1,Vector{Float64},Tuple{UnitRange{Int}},true}}})
+        Cholesky{Float64,Diagonal{Float64,SubArray{Float64,1,Vector{Float64},Tuple{UnitRange{Int}},true}}},
+        Vector{Float64},Vector{Float64})
+    @test !RK._pp_diag_cholesky_ldiv_type(Cholesky{Float64,Diagonal{Float64,Vector{Float64}}},
+                                          Array{Float64,3},Array{Float64,3})
+    @test !RK._pp_diag_cholesky_ldiv_type(Cholesky{Float64,Diagonal{Float64,Vector{Float64}}},
+                                          Vector{Float64},Matrix{Float64})
 
     # Source/lowering pin: dense remains byte-structurally the old ONE `ldiv!(dest,factor,rhs)` statement.
     od, sd = _pp_construct(pf, plan, _pp_values(plan, Float64, 3, _PPFix.CountPgrad(0)))
@@ -140,14 +149,16 @@ end
     @test length(dense[1].args) == 4                         # callee + dest + factor + rhs
     @test !any(x -> x isa Expr && x.head === :call && x.args[1] === :copyto!, dense)
 
-    # The admitted Diagonal type emits copy + BOTH factor divisions, then the existing bless. This catches the
-    # tempting but mathematically wrong one-factor lowering for scaled masses.
+    # The admitted Diagonal type emits the guarded two-factor helper, then the existing bless. The helper catches
+    # the tempting but mathematically wrong one-factor lowering and owns every IEEE/alias generic fallback.
     dg = ones(Float64, 3); pos = ones(Float64, 3); mom = ones(Float64, 3)
     og, sg = _pp_construct(pf, plan, _pp_diag_values(plan, Float64, dg, pos, mom, _PPFix.CountPgrad(0)))
     diagonal = Any[]; RK._pp_emit_handle!(diagonal, plan, lh, li, typeof(og), typeof(sg))
-    @test diagonal[1] == :(copyto!($(RK._pp_read(plan, outs[1])), $(RK._pp_read(plan, ins[2]))))
-    @test count(x -> x isa Expr && x.head === :call && x.args[1] === :ldiv! && length(x.args) == 3,
-                diagonal) == 2                               # exactly two in-place factor divisions
+    @test diagonal[1] == :(_pp_diag_cholesky_ldiv!($(RK._pp_read(plan, outs[1])),
+                                                    $(RK._pp_read(plan, ins[1])),
+                                                    $(RK._pp_read(plan, ins[2]))))
+    @test count(x -> x isa Expr && x.head === :call && x.args[1] === :_pp_diag_cholesky_ldiv!,
+                diagonal) == 1
 
     # Executable exactness against the generic `F \\ rhs`: F32/F64, dimensions 1/5/17, unit + scaled, 20 seeds.
     for T in (Float64, Float32), d in (1, 5, 17), scaled in (false, true), seed in 1:20
@@ -181,6 +192,81 @@ end
     @test typeof(candidate_error) === typeof(generic_error)
     @test _pp_rd(plan, ow, sh, _pp_c(plan, :dkin_dmom)) == generic_dest == mom
     @test !_pp_cur(plan, ow, sh, _pp_c(plan, :dkin_dmom))
+end
+
+function _pp_ldiv_outcome(make, solve)
+    dest, factor, rhs = make(); err = try
+        solve(dest, factor, rhs); nothing
+    catch e
+        e
+    end
+    bytes(x) = copy(reinterpret(UInt8, vec(x)))
+    (error_type=err === nothing ? nothing : typeof(err),
+     error_text=err === nothing ? nothing : sprint(showerror,err),
+     dest=bytes(dest),factor=bytes(factor.factors.diag),rhs=bytes(rhs))
+end
+
+@testset "prepared-endpoint — Diagonal fast helper IEEE/alias adversaries match generic value + throw prefix" begin
+    for T in (Float64,Float32)
+        tiny=nextfloat(zero(T)); big=floatmax(T)
+        scenarios = (
+            # finite/nonzero inputs whose first division overflows; post-check must replay generic from intact rhs
+            () -> (zeros(T,1),Cholesky(Diagonal(T[tiny]),'U',0),T[one(T)]),
+            () -> (zeros(T,1),Cholesky(Diagonal(T[big]),'U',0),T[tiny]), # underflow/zero result
+            () -> (zeros(T,2),Cholesky(Diagonal(T[1,2]),'U',0),T[-zero(T),one(T)]),
+            () -> (zeros(T,2),Cholesky(Diagonal(T[1,2]),'U',0),T[Inf,one(T)]),
+            () -> (zeros(T,2),Cholesky(Diagonal(T[1,2]),'U',0),T[NaN,one(T)]),
+            () -> (zeros(T,2),Cholesky(Diagonal(T[0,2]),'U',0),T[one(T),one(T)]),
+            () -> (zeros(T,2),Cholesky(Diagonal(T[Inf,2]),'U',0),T[one(T),one(T)]),
+            () -> (zeros(T,2),Cholesky(Diagonal(T[NaN,2]),'U',0),T[one(T),one(T)]),
+            () -> (zeros(T,3),Cholesky(Diagonal(T[1,2]),'U',0),T[1,2,3]), # length mismatch
+            () -> begin x=T[3,4]; (x,Cholesky(Diagonal(T[1,2]),'U',0),x) end, # dest === rhs
+            () -> begin d=T[1,2]; (d,Cholesky(Diagonal(d),'U',0),T[3,4]) end, # dest === factor backing
+            () -> begin r=T[1,2]; (zeros(T,2),Cholesky(Diagonal(r),'U',0),r) end, # rhs === factor backing
+            # Object identity is insufficient: distinct builtin Vectors can share the same storage.
+            () -> begin
+                r=T[3,4]; d=unsafe_wrap(Vector{T},pointer(r),length(r);own=false)
+                @assert d !== r && Base.mightalias(d,r)
+                (d,Cholesky(Diagonal(T[1,2]),'U',0),r)
+            end,
+            () -> begin
+                b=T[1,2]; d=unsafe_wrap(Vector{T},pointer(b),length(b);own=false)
+                @assert d !== b && Base.mightalias(d,b)
+                (d,Cholesky(Diagonal(b),'U',0),T[3,4])
+            end,
+            () -> begin
+                b=T[1,2]; r=unsafe_wrap(Vector{T},pointer(b),length(b);own=false)
+                @assert r !== b && Base.mightalias(r,b)
+                (zeros(T,2),Cholesky(Diagonal(b),'U',0),r)
+            end
+        )
+        for make in scenarios
+            fast=_pp_ldiv_outcome(make,RK._pp_diag_cholesky_ldiv!)
+            generic=_pp_ldiv_outcome(make,(d,f,r)->ldiv!(d,f,r))
+            @test fast == generic
+        end
+
+        # Array{T,3} is outside the fast helper ABI, and the emitter stays byte-structurally on generic ldiv!.
+        pf=_pp_pf(); plan=RK.kernel_prepared_plan(pf); hs=RK.kernel_prepared_handles(pf)
+        li=only(i for i in eachindex(hs) if RK.recipe_handle_mode(hs[i]) === :ldiv); lh=hs[li]
+        diag=T[1,2]; pos=T[1,2]; mom=reshape(T[3,4],2,1,1)
+        ow,sh=_pp_construct(pf,plan,_pp_diag_values(plan,T,diag,pos,mom,_PPFix.CountPgrad(0)))
+        emitted=Any[];RK._pp_emit_handle!(emitted,plan,lh,li,typeof(ow),typeof(sh))
+        @test emitted[1].args[1] === :ldiv! && length(emitted[1].args) == 4
+        candidate_error=try
+            RK.compile_prepared_initialization(pf,typeof(ow),typeof(sh))(ow,sh,hs);nothing
+        catch e
+            e
+        end
+        dest=zeros(T,size(mom));generic_error=try
+            ldiv!(dest,cholesky(Diagonal(diag)),mom);nothing
+        catch e
+            e
+        end
+        @test typeof(candidate_error) === typeof(generic_error) === MethodError
+        @test vec(_pp_rd(plan,ow,sh,_pp_c(plan,:dkin_dmom))) == vec(dest)
+        @test !_pp_cur(plan,ow,sh,_pp_c(plan,:dkin_dmom))
+    end
 end
 
 @testset "prepared-endpoint — transition trace from MethodIR writes: grad/velocity/kin/ham, chol+@node EXCLUDED (RK 08:06/08:10/08:13)" begin

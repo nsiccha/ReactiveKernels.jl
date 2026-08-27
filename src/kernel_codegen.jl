@@ -59,12 +59,36 @@ end
 # triangular solves. For this self-adjoint diagonal backing those are exactly two in-place divisions by the
 # stored factor. Keep the predicate entirely on the concrete prepared-slot TYPE — never the field name/value —
 # and leave dense/custom/other-eltype Cholesky lowering on the generic `ldiv!(dest, factor, rhs)` path.
-function _pp_diag_cholesky_ldiv_type(::Type{FT}) where {FT}
+function _pp_diag_cholesky_ldiv_type(::Type{FT}, ::Type{RT}, ::Type{DT}) where {FT,RT,DT}
     FT <: LinearAlgebra.Cholesky || return false
     (FT isa DataType && length(FT.parameters) >= 2) || return false
     ET, BT = FT.parameters[1], FT.parameters[2]
     (ET === Float32 || ET === Float64) || return false
-    BT isa Type && _kernel_dom_diag(BT) && eltype(BT) === ET
+    BT isa Type && _kernel_dom_diag(BT) && eltype(BT) === ET && RT === Vector{ET} && DT === Vector{ET}
+end
+
+# The two-factor shortcut is byte-equivalent to generic Cholesky ldiv only in the ordinary finite/nonzero,
+# non-aliasing Vector domain. Keep the original rhs untouched until the result has also been checked: any IEEE
+# edge (signed/ordinary zero, Inf/NaN, intermediate overflow/underflow), shape issue, or alias delegates to the
+# generic three-argument method, reproducing its value, exception, and mutation-prefix semantics exactly.
+@inline function _pp_diag_cholesky_ldiv!(dest::Vector{ET},
+        factor::LinearAlgebra.Cholesky{ET,BT}, rhs::Vector{ET}) where {
+        ET<:Union{Float32,Float64},BT<:LinearAlgebra.Diagonal{ET,Vector{ET}}}
+    factors = getfield(factor, :factors); diag = getfield(factors, :diag)
+    (length(dest) == length(rhs) == length(diag) &&
+     !Base.mightalias(dest, rhs) && !Base.mightalias(dest, diag) && !Base.mightalias(rhs, diag)) ||
+        return ldiv!(dest, factor, rhs)
+    @inbounds for i in eachindex(diag, rhs)
+        d = diag[i]; x = rhs[i]
+        (isfinite(d) && !iszero(d) && isfinite(x) && !iszero(x)) || return ldiv!(dest, factor, rhs)
+    end
+    copyto!(dest, rhs)                       # rhs remains intact for a possible result-domain fallback
+    ldiv!(factors, dest)                     # BOTH Cholesky factors; one division is wrong for scaled mass
+    ldiv!(factors, dest)
+    @inbounds for x in dest
+        (isfinite(x) && !iszero(x)) || return ldiv!(dest, factor, rhs)
+    end
+    dest
 end
 # Atomically bless a handle's PRODUCER-OWNED output subset (only — never a shared authority not produced,
 # never a collateral) after its invocation succeeds. 1 or 2 → the atomic Val ops; >2 → a bless per slot.
@@ -105,15 +129,14 @@ function _pp_emit_handle!(stmts, plan::_KernelPlan, h, i::Int, ::Type{OW}, ::Typ
     elseif mode === :ldiv
         # destination-reusing solve into the owned buffer slot (RK 07:20): ldiv!(dest, factor, rhs).
         length(ins) == 2 && length(outs) == 1 || _l_reject("ldiv handle $i must be 2-in/1-out (got $ins/$outs)")
-        factorT = _pp_fieldtype(plan, ins[1], OW, SH)
-        _pp_domain_ok(op, (factorT, _pp_fieldtype(plan, ins[2], OW, SH)), i)
-        if _pp_diag_cholesky_ldiv_type(factorT)
-            # EXACT generic-Cholesky semantics for a real Diagonal backing: copy the rhs, then apply BOTH
-            # Cholesky factors. One division is wrong for a scaled diagonal; no inverse is formed.
+        factorT = _pp_fieldtype(plan, ins[1], OW, SH); rhsT = _pp_fieldtype(plan, ins[2], OW, SH)
+        destT = _pp_fieldtype(plan, outs[1], OW, SH)
+        _pp_domain_ok(op, (factorT, rhsT), i)
+        if _pp_diag_cholesky_ldiv_type(factorT, rhsT, destT)
+            # The inline helper owns the conservative IEEE/alias guards and generic fallback. The emitted call
+            # is selected solely from concrete prepared types; there is no name/value guess or dynamic dispatch.
             dest = _pp_read(plan, outs[1]); factor = _pp_read(plan, ins[1]); rhs = _pp_read(plan, ins[2])
-            push!(stmts, :(copyto!($dest, $rhs)))
-            push!(stmts, :(ldiv!(getfield($factor, :factors), $dest)))
-            push!(stmts, :(ldiv!(getfield($factor, :factors), $dest)))
+            push!(stmts, :(_pp_diag_cholesky_ldiv!($dest, $factor, $rhs)))
         else
             push!(stmts, :(ldiv!($(_pp_read(plan, outs[1])), $(_pp_read(plan, ins[1])), $(_pp_read(plan, ins[2])))))
         end

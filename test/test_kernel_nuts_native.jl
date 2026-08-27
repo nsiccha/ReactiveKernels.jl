@@ -247,29 +247,17 @@ function _sealed_public_alloc(skel, sampler, rng, ::Val{N}) where {N}
     @allocated _sealed_public_batch(skel,sampler,rng,Val(N))
 end
 
-# Test-only reconstruction of the PRE-FAST-PATH emitter: replace each exact emitted
-# `copyto!(dest,rhs); ldiv!(factor.factors,dest); ldiv!(factor.factors,dest)` triple by the old generic
-# `ldiv!(dest,factor,rhs)`. This operates on the compiler-emitted RGF body, not on an independently authored
+# Test-only reconstruction of the PRE-FAST-PATH emitter: replace each exact emitted guarded-helper call by the
+# old generic `ldiv!(dest,factor,rhs)`. This operates on the compiler-emitted RGF body, not on an independently authored
 # sampler, and returns the replacement count so a disconnected/no-op oracle cannot false-green the parity gate.
 function _force_generic_diag_ldiv(x)
     x isa Expr || return (x, 0)
+    if x.head === :call && x.args[1] === :_pp_diag_cholesky_ldiv! && length(x.args) == 4
+        return (Expr(:call,:ldiv!,x.args[2],x.args[3],x.args[4]),1)
+    end
     if x.head === :block
         ys = Any[]; n = 0; i = 1
         while i <= length(x.args)
-            if i + 2 <= length(x.args)
-                a, b, c = x.args[i], x.args[i+1], x.args[i+2]
-                iscopy = a isa Expr && a.head === :call && a.args[1] === :copyto! && length(a.args) == 3
-                isldiv(e) = e isa Expr && e.head === :call && e.args[1] === :ldiv! && length(e.args) == 3
-                if iscopy && isldiv(b) && b == c && b.args[3] == a.args[2]
-                    gf = b.args[2]
-                    isfactors = gf isa Expr && gf.head === :call && gf.args[1] === :getfield &&
-                                length(gf.args) == 3 && gf.args[3] == QuoteNode(:factors)
-                    if isfactors
-                        push!(ys, Expr(:call, :ldiv!, a.args[2], gf.args[2], a.args[3]))
-                        n += 1; i += 3; continue
-                    end
-                end
-            end
             y, m = _force_generic_diag_ldiv(x.args[i]); push!(ys, y); n += m; i += 1
         end
         return (Expr(:block, ys...), n)
