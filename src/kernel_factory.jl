@@ -794,16 +794,21 @@ end
 # TYPES, so an `@generated` factory dispatches to the right specialization; two graphs of the same
 # slot/recipe SHAPE but different canonical Value identities (different definitions) get different
 # keys, while two fresh reads of one definition get the same key. No objectid/hash/Recipe.op.
-struct _KernelPlan{Key,S<:Tuple,A<:Tuple,P<:Tuple,R<:Tuple,E<:Tuple}
+struct _KernelPlan{Key,S<:Tuple,A<:Tuple,P<:Tuple,R<:Tuple,E<:Tuple,RI<:Tuple}
     slots::S          # Tuple{_PlanSlot...}
     alias_groups::A   # Tuple{Tuple{Vararg{Symbol}}...} — deterministic (first-occurrence order)
     producer::P       # Tuple{Tuple{Int,Int}...} — (canonical Value id, selected Recipe id), sorted
     recipes::R        # Tuple{Int...} — selected Plan Recipe ids in execution order
     entry_current::E  # Tuple{Int...} — canonical ids CURRENT after the Plan runs = HAVE ∪ the
                       #   producer-map KEYS (recipe-owned rule; collateral is NOT blessed)
+    recipe_inputs::RI # Tuple{Tuple{Int,Tuple{Vararg{Int}}}...} — (selected Recipe id, its CANONICAL
+                      #   input Value ids), a DETACHED snapshot so a later mutation of the live
+                      #   (mutable) KernelSpec graph cannot change dependency/kill scheduling under
+                      #   the same immutable plan key (RK 04:43). poc reads inputs from HERE.
 end
-_KernelPlan(key, slots::S, groups::A, producer::P, recipes::R, ec::E) where {S,A,P,R,E} =
-    _KernelPlan{key,S,A,P,R,E}(slots, groups, producer, recipes, ec)
+_KernelPlan(key, slots::S, groups::A, producer::P, recipes::R, ec::E, ri::RI) where {S,A,P,R,E,RI} =
+    _KernelPlan{key,S,A,P,R,E,RI}(slots, groups, producer, recipes, ec, ri)
+kernel_plan_recipe_inputs(p::_KernelPlan) = p.recipe_inputs
 kernel_plan_key(::_KernelPlan{Key}) where {Key} = Key
 # The integrator/owner definition Token (RK 04:41): poc proves `binder target Token == plan
 # integrator Token` through THIS accessor, never by destructuring the key tuple internals.
@@ -865,9 +870,13 @@ function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol}; key
         pl = plan(graph; have = have, want = want)
         producer = Tuple(sort!([(cid, r.id) for (cid, r) in pl.producer]))
         recipes = Tuple(r.id for r in pl.recipes)
+        # DETACHED recipe-input snapshot (RK 04:43): each selected recipe's CANONICAL input Value
+        # ids, captured now so a later mutation of the live graph cannot alter it.
+        recipe_inputs = Tuple((r.id, Tuple(sort!([canon_id(graph, v.id) for v in r.inputs])))
+                              for r in pl.recipes)
         producer_keys = Int[cid for (cid, _) in producer]
     else
-        producer = (); recipes = ()
+        producer = (); recipes = (); recipe_inputs = ()
     end
     pkset = Set(producer_keys)
     # entry_current: the proven POST-construction current set = canonical HAVE ∪ the producer-map
@@ -888,8 +897,8 @@ function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol}; key
     # `kernel_spec` reads of one const definition, distinct across definitions) make two same-SHAPE
     # graphs under the same integrator produce DIFFERENT keys. NO objectid/hash/Recipe.op.
     slot_sig = Tuple((s.path, s.canon, s.role, s.slot) for s in slots)
-    key = (key_token, slot_sig, groups, producer, recipes)
-    _KernelPlan(key, Tuple(slots), groups, producer, recipes, Tuple(ec))
+    key = (key_token, slot_sig, groups, producer, recipes, recipe_inputs)
+    _KernelPlan(key, Tuple(slots), groups, producer, recipes, Tuple(ec), recipe_inputs)
 end
 
 # The endpoint plan under an integrator (the immutable canonical map poc wires codegen against).

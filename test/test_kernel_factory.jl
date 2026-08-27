@@ -78,6 +78,11 @@ end
     @. phasepoint.mom -= stepsize * phasepoint.dham_dpos
     @. phasepoint.pos +=       stepsize * phasepoint.dham_dmom
 end
+# a small kernel whose LIVE mutable graph we mutate after capturing a plan (recipe-input snapshot).
+@kernel mutkernel(x) = begin
+    y = x + 1
+    z = y * 2
+end
 # a SECOND, byte-identical endpoint DEFINITION — same slot/recipe SHAPE, DIFFERENT canonical
 # Value identities — to prove the plan key distinguishes definitions (RK 04:17c).
 @kernel phasepoint_ep2(pot_f, grad_f, metric, pos, mom) = begin
@@ -492,6 +497,22 @@ end
         # aliased target's PRODUCER stays canonical: dham_dpos resolves to dpot_dpos's producer
         gph = RKS.kernel_graph(phasepoint_ep)
         @test !isempty(RKS.producers_of(gph, RKS.canon_id(gph, phasepoint_ep.ports[:dham_dpos].id)))
+
+        # DETACHED recipe-input seam (RK 04:43): each selected recipe's canonical input Value ids,
+        # captured as immutable Tuples so poc never rereads the live mutable graph.
+        ri = RKS.kernel_plan_recipe_inputs(plan)
+        @test ri isa Tuple && !isempty(ri) && all(e -> e isa Tuple{Int,<:Tuple}, ri)
+        @test all(e -> e[2] isa Tuple, ri)                       # inputs immutable (not live Vectors)
+        @test any(e -> canonof(:pos) in e[2], ri)                # some recipe reads pos's canon
+
+        # a plan over a LIVE MUTABLE graph is a SNAPSHOT: mutating the graph after capture does not
+        # change the captured recipe-input seam (a fresh plan would differ; the captured one is unchanged).
+        gm = RKS.kernel_graph(mutkernel)
+        planm = RKS._kernel_factory_plan(mutkernel, Set((:y, :z)), Set((:x,)))
+        snap = RKS.kernel_plan_recipe_inputs(planm)
+        RKS.add!(gm; inputs = (mutkernel.ports[:x],), outputs = (mutkernel.ports[:z],),
+                 op = identity, cost = 1.0, cse_key = nothing, effectful = false)  # alt producer of z
+        @test RKS.kernel_plan_recipe_inputs(planm) === snap      # captured snapshot UNCHANGED
     end
 
     @testset "bare-identity canonical alias at expansion (RK 03:57 hardening)" begin
