@@ -50,15 +50,10 @@ end
     end
     nothing
 end
-@inline function _empty_batch!(s, x, ::Val{N}) where {N}
-    i = 0
-    @inbounds while i < N; i += 1; end
-    nothing
-end
-function _net_alloc(batch, empty, s, x, n)
-    batch(s, x, n); empty(s, x, n)
+function _hot_alloc(batch, s, x, n)
+    batch(s, x, n)
     GC.gc()
-    (@allocated batch(s, x, n)) - (@allocated empty(s, x, n))
+    @allocated batch(s, x, n)
 end
 
 @testset "kernel_adaptation — G3 DA: every authored field matches the independent recurrence per step" begin
@@ -89,7 +84,7 @@ end
         @test isconcretetype(only(Base.return_types(RK.stateful_call!, Tuple{typeof(s),Val{:fit!},T})))
         for n in (Val(64), Val(128), Val(256))
             z = _cstate(_AdaptFix.dual_averaging_state, init)
-            @test _net_alloc(_da_batch!, _empty_batch!, z, T(0.5), n) == 0
+            @test _hot_alloc(_da_batch!, z, T(0.5), n) == 0
         end
     end
 end
@@ -117,17 +112,25 @@ end
         end
 
         mat = T[1 3 5; 2 4 6; 4 2 0]
-        sm = _cstate(_AdaptFix.welford_var, zeros(T, 3))
-        sv = _cstate(_AdaptFix.welford_var, zeros(T, 3))
-        @inferred RK.stateful_call!(sm, Val(:step!), mat; dn = T(2))
-        for col in eachcol(mat); RK.stateful_call!(sv, Val(:step!), collect(col); dn = T(2)); end
-        for fld in (:n, :mean, :var)
-            @test RK.stateful_get(sm, Val(fld)) ≈ RK.stateful_get(sv, Val(fld))
+        for dn in (nothing, T(2))
+            sm = _cstate(_AdaptFix.welford_var, zeros(T, 3))
+            sv = _cstate(_AdaptFix.welford_var, zeros(T, 3))
+            if dn === nothing
+                @inferred RK.stateful_call!(sm, Val(:step!), mat)
+                for col in eachcol(mat); RK.stateful_call!(sv, Val(:step!), collect(col)); end
+            else
+                @inferred RK.stateful_call!(sm, Val(:step!), mat; dn = dn)
+                for col in eachcol(mat); RK.stateful_call!(sv, Val(:step!), collect(col); dn = dn); end
+            end
+            for fld in (:n, :mean, :var)
+                @test RK.stateful_get(sm, Val(fld)) ≈ RK.stateful_get(sv, Val(fld))
+            end
+            @test isconcretetype(only(Base.return_types(RK.stateful_call!,
+                Tuple{typeof(sm),Val{:step!},Matrix{T}})))
         end
-        @test isconcretetype(only(Base.return_types(RK.stateful_call!, Tuple{typeof(sm),Val{:step!},Matrix{T}})))
         for (x, batch) in ((T[1,2,3], _wv_batch!), (mat, _wv_batch!)), nrep in (Val(64), Val(128))
             z = _cstate(_AdaptFix.welford_var, zeros(T, 3))
-            @test _net_alloc(batch, _empty_batch!, z, x, nrep) == 0
+            @test _hot_alloc(batch, z, x, nrep) == 0
         end
     end
 end
