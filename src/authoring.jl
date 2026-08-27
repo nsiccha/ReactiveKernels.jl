@@ -905,6 +905,7 @@ function _is_broadcast_operator(sym::Symbol)
 end
 
 function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol})
+    form = :fused
     if rhs isa Expr && rhs.head === :call && !isempty(rhs.args)
         callee = rhs.args[1]
         args = rhs.args[2:end]
@@ -912,10 +913,21 @@ function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol})
         if callee isa Symbol && !callee_is_port && !_is_broadcast_operator(callee) &&
            length(args) == length(deps) &&
            all(i -> args[i] === deps[i], eachindex(args))
-            return callee
+            return callee                                   # BARE exact identity — stays raw (validated)
         end
+        # a call THROUGH A PORT — `callable(args…)` where the callee itself is a port (RK 07:24): the
+        # first dep is the callable source, the rest are ordered args. Tagged `:portcall` so a prepared
+        # handle self-derives the destination contract from source shape + typed slots.
+        callee_is_port && !isempty(deps) && deps[1] === callee && (form = :portcall)
     end
-    Expr(:->, Expr(:tuple, deps...), rhs)
+    # A recipe operation synthesized from captured @kernel source, wrapped as COMPILER-OWNED provenance
+    # with a definition-unique gensym token (RK 07:21) + its Form, so a prepared handle distinguishes it
+    # from a manually-inserted raw (opaque) closure without IR inspection. Call forwards inline.
+    deftoken = gensym(:rk_srcop)
+    Expr(:call, GlobalRef(@__MODULE__, :_KernelSourceOp),
+         Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
+         Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)),
+         Expr(:->, Expr(:tuple, deps...), rhs))
 end
 
 # `@node(expr)` recipe-node promotion, used by `_kernel_expand`. Kept HERE (ahead of

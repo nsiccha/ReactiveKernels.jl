@@ -927,7 +927,8 @@ function _kernel_construct_owned_child(::Val{Token}, plan::_KernelPlan, values) 
     _canon_construct(Val(:owned), owned_vals, owned_mask)
 end
 
-function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol}; key_token = nothing)
+function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol}; key_token = nothing,
+                              with_ops::Bool = false)
     graph = _kernel_the_graph(skel)
     pmap = _kernel_ports_map(skel)
     names = _kernel_all_ports(skel)
@@ -978,9 +979,12 @@ function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol}; key
         # collateral outputs). The producer-OWNED subset (blessing) stays `producer`.
         recipe_outputs = Tuple((r.id, Tuple(canon_id(graph, v.id) for v in r.outputs))
                                for r in pl.recipes)
+        # The selected recipe OP VALUES in exact plan order (RK 07:20) — captured from the source-built
+        # Recipe objects during THIS single planning pass, for the prepared executable handle tuple.
+        selected_ops = Tuple((r.id, r.op) for r in pl.recipes)
         producer_keys = Int[cid for (cid, _) in producer]
     else
-        producer = (); recipes = (); recipe_inputs = (); recipe_outputs = ()
+        producer = (); recipes = (); recipe_inputs = (); recipe_outputs = (); selected_ops = ()
     end
     pkset = Set(producer_keys)
     # entry_current: the proven POST-construction current set = canonical HAVE ∪ the producer-map
@@ -1002,15 +1006,16 @@ function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol}; key
     # graphs under the same integrator produce DIFFERENT keys. NO objectid/hash/Recipe.op.
     slot_sig = Tuple((s.path, s.canon, s.role, s.slot) for s in slots)
     key = (key_token, slot_sig, groups, producer, recipes, recipe_inputs, recipe_outputs)
-    _KernelPlan(key, Tuple(slots), groups, producer, recipes, Tuple(ec), recipe_inputs, recipe_outputs)
+    plan_obj = _KernelPlan(key, Tuple(slots), groups, producer, recipes, Tuple(ec), recipe_inputs, recipe_outputs)
+    with_ops ? (plan_obj, selected_ops) : plan_obj
 end
 
 # The endpoint plan under an integrator (the immutable canonical map poc wires codegen against).
 # The def-unique key is rooted in the INTEGRATOR's definition token (endpoint slice).
-_kernel_factory_endpoint_plan(skel, integrator::_KernelRegistration) =
+_kernel_factory_endpoint_plan(skel, integrator::_KernelRegistration; with_ops::Bool = false) =
     _kernel_factory_plan(skel, _kernel_factory_endpoint_owned(skel, integrator),
                          _kernel_factory_endpoint_shared(skel, integrator);
-                         key_token = integrator.token)
+                         key_token = integrator.token, with_ops = with_ops)
 
 # --- concrete per-instance CONSTRUCTION (isolation + shared identity, no-Ref) ---------------
 #
@@ -1244,21 +1249,128 @@ end
 #
 # The callable constructor must consume a DEFINITION/PREPARATION-captured immutable plan with ZERO
 # planner / live-graph access per instance. `_prepare_factory` performs the SINGLE `plan(graph)`
-# invocation (inside `_kernel_factory_endpoint_plan`); the per-instance `_construct_prepared` reads only
-# the captured plan — it takes NO graph and never calls `plan()`, so poisoning the live graph after
-# preparation cannot change any constructed instance. The selected grad Recipe id and the endpoint Token
-# are TYPE parameters (type-level selected identity), so the grad binding stays @inferred.
-struct _PreparedFactory{Token,GR,P<:_KernelPlan,E<:Tuple}
+# invocation; the per-instance `_construct_prepared` reads only the captured plan + handles — it takes NO
+# graph and never calls `plan()`, so poisoning the live graph after preparation cannot change any
+# constructed instance. It self-discovers the destination recipe + external identity from source shape.
+
+# --- sanctioned graph-recipe BARE identities (RK 07:20) ---------------------------------------------
+# The EXACT LinearAlgebra graph-recipe primitives that appear as RAW recipe ops in the real phasepoint —
+# MINIMAL (RK 07:30): only `cholesky` and `logdet` (`\` is :ldiv, `+`/operators are in the pure set, and
+# `dot` lives INSIDE the trusted fused source op, never a raw recipe). Do not widen without a consumer.
+const _KERNEL_RECIPE_PRIMS = (LinearAlgebra.cholesky, LinearAlgebra.logdet)
+_recipe_bare_op_ok(@nospecialize(op)) =
+    _kernel_pure_primitive_value(op) || any(x -> x === op, _KERNEL_RECIPE_PRIMS)
+
+# Per-callee SAFE-DOMAIN admission for a RAW recipe identity at CONCRETE binding (RK 07:30) — exact
+# identity is necessary but NOT sufficient (`cholesky`/`logdet`/`\`/`+` are extensible; a custom overload
+# type could carry arbitrary effects). Validate the concrete argument types from the prepared slots; a
+# custom-overload domain REJECTS. No IR inference — a load-bearing predicate poc calls at binding.
+_recipe_dom_chol(::Type{T}) where {T} =
+    T <: LinearAlgebra.Cholesky && T isa DataType && length(T.parameters) >= 2 &&
+        _kernel_dom_num_matrix(T.parameters[2])
+"""
+    kernel_recipe_op_domain_ok(op, argtypes) -> Bool
+
+`true` iff the RAW recipe identity `op` is safe over the CONCRETE `argtypes` (RK 07:30): `cholesky`
+(builtin numeric Matrix), `logdet` (a Cholesky over a builtin Matrix, or a builtin Matrix), `\` (a
+Cholesky/structured/dense builtin matrix + builtin numeric Array), and the pure primitives via their
+per-callee domain. A custom-overload type over the same identity REJECTS.
+"""
+function kernel_recipe_op_domain_ok(@nospecialize(op), argtypes)
+    isempty(argtypes) && return false
+    op === LinearAlgebra.cholesky && return length(argtypes) == 1 && _kernel_dom_num_matrix(argtypes[1])
+    op === LinearAlgebra.logdet && return length(argtypes) == 1 &&
+        (_recipe_dom_chol(argtypes[1]) || _kernel_dom_num_matrix(argtypes[1]))
+    op === Base.:\ && return length(argtypes) == 2 &&
+        (_recipe_dom_chol(argtypes[1]) || _kernel_dom_lmul_lhs(argtypes[1])) && _kernel_dom_num_array(argtypes[2])
+    _kernel_pure_primitive_value(op) && return _kernel_pure_callee_domain_ok(op, argtypes)
+    false
+end
+
+# The compile-time execution MODE of a selected recipe op, from exact identity/registration + source Form
+# + BOTH the all-output and producer-owned output counts (RK 07:20/07:24/07:30): `:destination` (a
+# `:portcall` source op with EXACTLY TWO all-outputs, BOTH producer-owned → `f(dest, args…)::scalar`;
+# their buffer/scalar roles are resolved later from typed slots), `:assign` (a single-output `:portcall`,
+# any `:fused` source op, or a sanctioned bare identity — call the op, assign its return), `:ldiv` (the
+# exact `\` built-in — in-place velocity reuse). A two-output port-call with a COLLATERAL output (not both
+# owned), any other port-call arity, a raw unwrapped closure, or an unregistered named op REJECTS.
+function _recipe_op_mode(@nospecialize(op), n_owned_out::Int, n_all_out::Int)
+    if op isa _KernelSourceOp
+        if kernel_sourceop_form(op) === :portcall
+            n_all_out == 1 && return :assign                          # single-output port-call: generic
+            (n_all_out == 2 && n_owned_out == 2) && return :destination
+            throw(_KernelFactoryReject("port-call recipe with $n_all_out all-outputs / $n_owned_out owned " *
+                "is not a valid destination (need exactly two, both producer-owned) or single-output call"))
+        end
+        return :assign                                               # :fused source op — generic assign
+    end
+    op === Base.:\ && return :ldiv
+    _recipe_bare_op_ok(op) && return :assign
+    throw(_KernelFactoryReject("recipe op $(op) is opaque/unregistered — only compiler-source ops " *
+        "(`_KernelSourceOp`) and sanctioned exact identities are admissible as prepared handles"))
+end
+
+# One captured EXECUTABLE recipe handle (RK 07:20): the concrete op value + its `MODE` (a type parameter,
+# so poc dispatches on it at compile time with no runtime lookup) + ordered canonical input/all-output ids
+# + the producer-owned output subset. Immutable — a live-graph mutation after preparation cannot change it.
+struct _RecipeHandle{OP,MODE,IN,OUT,OWN}
+    op::OP
+    inputs::IN
+    outputs::OUT
+    owned::OWN
+end
+recipe_handle_mode(::_RecipeHandle{OP,MODE}) where {OP,MODE} = MODE
+recipe_handle_op(h::_RecipeHandle) = h.op
+function _recipe_handle(op, ins, outs, owned)
+    mode = _recipe_op_mode(op, length(owned), length(outs))
+    _RecipeHandle{typeof(op),mode,typeof(ins),typeof(outs),typeof(owned)}(op, ins, outs, owned)
+end
+
+struct _PreparedFactory{Token,GR,P<:_KernelPlan,H<:Tuple,E<:Tuple}
     plan::P
-    external::E     # the identity-kept (never deep-copied) shared canonical ids (grad_f/pot_f/stats_f)
+    handles::H      # concrete Tuple of `_RecipeHandle` in EXACT plan.recipes order (NOT a Dict/Any)
+    external::E     # the identity-kept (never deep-copied) shared canonical ids (callable authorities)
 end
 kernel_prepared_plan(pf::_PreparedFactory) = pf.plan
 kernel_prepared_grad_recipe(::_PreparedFactory{Token,GR}) where {Token,GR} = GR
 kernel_prepared_token(::_PreparedFactory{Token}) where {Token} = Token
+kernel_prepared_handles(pf::_PreparedFactory) = pf.handles
+kernel_prepared_external(pf::_PreparedFactory) = pf.external
 
-function _prepare_factory(skel, integrator::_KernelRegistration, external::Tuple, grad_recipe::Int)
-    plan = _kernel_factory_endpoint_plan(skel, integrator)   # THE one planner call — at preparation only
-    _PreparedFactory{integrator.token, grad_recipe, typeof(plan), typeof(external)}(plan, external)
+# SELF-DISCOVERING preparation (RK 07:24): the single plan pass captures the plan + selected ops; the
+# handle for each recipe carries its provenance-validated op + mode + ids. The DESTINATION recipe is the
+# UNIQUE `:destination`-mode handle; the EXTERNAL identities are the callable (first) inputs of every
+# `:portcall` recipe. NO caller-supplied grad_recipe/external — those remain only test scaffolding.
+function _prepare_factory(skel, integrator::_KernelRegistration)
+    plan, ops = _kernel_factory_endpoint_plan(skel, integrator; with_ops = true)
+    seam = kernel_plan_recipe_seam(plan)
+    # `ops` and `seam` are BOTH in exact plan.recipes order (RK 07:30): ZIP them positionally — assert
+    # rid equality — so the handle tuple stays CONCRETE/inferred (no Dict{Int,Any} erasing types).
+    handles = map(ops, seam) do o, s
+        o[1] == s[1] || throw(_KernelFactoryReject("prepared op/seam order mismatch: $(o[1]) vs $(s[1])"))
+        _recipe_handle(o[2], s[2], s[3], s[4])
+    end
+    dests = Int[s[1] for (h, s) in zip(handles, seam) if recipe_handle_mode(h) === :destination]
+    length(dests) <= 1 || throw(_KernelFactoryReject("ambiguous: $(length(dests)) destination recipes"))
+    grad_recipe = isempty(dests) ? 0 : dests[1]
+    # external = the callable (FIRST) input canonical of every port-call recipe (the retained authorities)
+    ext = Int[]
+    for (o, s) in zip(ops, seam)
+        op = o[2]
+        (op isa _KernelSourceOp && kernel_sourceop_form(op) === :portcall && !isempty(s[2])) &&
+            (s[2][1] in ext || push!(ext, s[2][1]))
+    end
+    external = Tuple(ext)
+    _PreparedFactory{integrator.token, grad_recipe, typeof(plan), typeof(handles), typeof(external)}(
+        plan, handles, external)
+end
+
+# Private TEST SCAFFOLDING only (RK 07:24) — never the public author-facing constructor: a prepared
+# factory with EXPLICIT external ids + grad recipe, bypassing self-discovery.
+function _prepare_factory_scaffold(skel, integrator::_KernelRegistration, external::Tuple, grad_recipe::Int)
+    plan = _kernel_factory_endpoint_plan(skel, integrator)
+    _PreparedFactory{integrator.token, grad_recipe, typeof(plan), Tuple{}, typeof(external)}(
+        plan, (), external)
 end
 
 # Per-instance construction from the captured plan — NO graph, NO plan(). Builds the HAVE-only owned +

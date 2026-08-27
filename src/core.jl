@@ -58,6 +58,33 @@ struct Recipe
 end
 
 """
+    _KernelSourceOp{DefToken,Form,F}
+
+An immutable wrapper marking a recipe operation SYNTHESIZED from captured `@kernel` source as
+COMPILER-OWNED provenance (RK 07:21). Authoring wraps ONLY the anonymous-closure path of
+`_kernel_operation` in this; a bare exact identity (`cholesky`/`+`/…) stays raw and is identity/domain
+validated. `DefToken` is a definition-unique gensym baked in at graph build — NOT a security boundary (an internal
+constructor/type parameter cannot prevent deliberate internal misuse); it is trusted only because the
+supported authoring path is the ONLY thing that wraps a closure, so an arbitrary public Graph closure is
+never auto-wrapped. It makes each fused op a distinct concrete type (survives the prepared ops-tuple,
+carries no mutable registry). `Form` (RK 07:24)
+distinguishes a `:portcall` — a call THROUGH A PORT, `callable(args…)`, whose first input is the callable
+source and the rest are ordered args — from a general `:fused` expression, so a prepared handle can
+self-derive the DESTINATION contract (a port-call with one owned buffer + one owned scalar output →
+`f(dest, args…)::scalar`) from source SHAPE + typed slot roles, never from a name/Recipe id/inspection.
+The call forwards INLINE. A RAW anonymous closure inserted into a Graph carries no wrapper and is
+rejected as opaque when captured into a prepared handle.
+"""
+struct _KernelSourceOp{DefToken,Form,F}
+    f::F
+end
+_KernelSourceOp(::Val{DefToken}, ::Val{Form}, f::F) where {DefToken,Form,F} =
+    _KernelSourceOp{DefToken,Form,F}(f)
+@inline (op::_KernelSourceOp)(args...) = op.f(args...)
+kernel_sourceop_token(::_KernelSourceOp{DefToken}) where {DefToken} = DefToken
+kernel_sourceop_form(::_KernelSourceOp{DefToken,Form}) where {DefToken,Form} = Form
+
+"""
     Graph()
 
 A mutable builder collecting `Value`s and `Recipe`s plus the producer index the

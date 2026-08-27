@@ -114,6 +114,17 @@ end
 @kernel gradonly_step!(phasepoint; stepsize) = begin
     @. phasepoint.pos += stepsize * phasepoint.dham_dpos
 end
+# an ISOLATED pot_f-FREE full endpoint BYTE-MATCHING the ccb euclidean_phasepoint (RK 07:35): single grad
+# recipe (both pot+dpot owned, no collateral), typed `oftype(pot,0.5)` half, @node(logdet), aliases.
+@kernel euclidean_ep(grad_f, metric, pos, mom) = begin
+    pot, dpot_dpos = grad_f(pos)
+    chol_metric = cholesky(metric)
+    dkin_dmom = chol_metric \ mom
+    kin = oftype(pot, 0.5) * (@node(logdet(chol_metric)) + dot(mom, dkin_dmom))
+    ham = pot + kin
+    dham_dpos = dpot_dpos
+    dham_dmom = dkin_dmom
+end
 # an ISOLATED duplicate whose live graph the prepared-factory poison test may mutate WITHOUT leaking
 # into the clean gradonly_ep used by the copy test (RK 06:59).
 @kernel gradonly_poison_ep(grad_f, pos) = begin
@@ -1036,8 +1047,11 @@ end
         prod = Dict(RKS.kernel_plan_producer(plan0))
         @test haskey(prod, cpot) && haskey(prod, cdpot) && prod[cpot] == prod[cdpot]  # ONE grad recipe
         gr = prod[cpot]
-        # PREPARE ONCE — the single plan(graph) call is here; the captured factory holds an immutable plan
-        pf = RKS._prepare_factory(gradonly_poison_ep, integ, (cgf,), gr)
+        # PREPARE ONCE (SELF-DISCOVERING — no manual grad_recipe/external): the single plan(graph) call is
+        # here; the captured factory discovers the destination recipe + external identity from source shape.
+        pf = RKS._prepare_factory(gradonly_poison_ep, integ)
+        @test RKS.kernel_prepared_grad_recipe(pf) == gr                          # discovered the grad recipe
+        @test cgf in RKS.kernel_prepared_external(pf)                            # discovered grad_f as external
         key_before = RKS.kernel_plan_key(RKS.kernel_prepared_plan(pf))
         canons, _ = RKS.kernel_plan_superset(RKS.kernel_prepared_plan(pf)); N = length(canons)
         pos_slot = RKS.kernel_plan_field(plan0, cpos)[2]
@@ -1076,7 +1090,8 @@ end
         canonof(n) = RKS.canon_id(g, gradonly_ep.ports[n].id)
         cpos, cpot, cdpot, cgf = canonof(:pos), canonof(:pot), canonof(:dpot_dpos), canonof(:grad_f)
         gr = Dict(RKS.kernel_plan_producer(RKS._kernel_factory_endpoint_plan(gradonly_ep, integ)))[cpot]
-        pf = RKS._prepare_factory(gradonly_ep, integ, (cgf,), gr)
+        pf = RKS._prepare_factory(gradonly_ep, integ)                            # SELF-DISCOVERING
+        @test RKS.kernel_prepared_grad_recipe(pf) == gr && cgf in RKS.kernel_prepared_external(pf)
         plan = RKS.kernel_prepared_plan(pf)
         dpot_slot = RKS.kernel_plan_field(plan, cdpot)[2]
         pot_slot = RKS.kernel_plan_field(plan, cpot)[2]
@@ -1128,6 +1143,70 @@ end
         @test RKS._canon_slot(bad, Val(dpot_slot)) == badbuf
         # the copier is CanonOwned-only — shared authority is uncopyable BY TYPE
         @test !hasmethod(RKS._canon_copy_endpoint!, Tuple{RKS._CanonShared, RKS._CanonShared})
+    end
+
+    @testset "construction seam — captured executable recipe HANDLES (concrete tuple, modes, provenance) (RK 07:12–07:35)" begin
+        pf = RKS._prepare_factory(euclidean_ep, RKS.kernel_registration(leapfrog_ep!))  # isolated pot_f-free
+        hs = @inferred RKS.kernel_prepared_handles(pf)                          # field access is inferable
+        # a CONCRETE tuple in plan.recipes order — isconcretetype guarantees NO field type is Any anywhere
+        @test hs isa Tuple && isconcretetype(typeof(hs)) && length(hs) == 6
+        @test all(h -> isconcretetype(typeof(h)) && !any(==(Any), fieldtypes(typeof(h))), hs)
+        # (_prepare_factory itself is COLD-ONLY — the discovery loop is not type-stable; the STORED handle
+        # tuple it produces is fully concrete, which is what poc indexes literally.)
+        modes = [RKS.recipe_handle_mode(h) for h in hs]
+        @test count(==(:destination), modes) == 1                              # the unique grad recipe
+        @test count(==(:ldiv), modes) == 1                                     # the `\` velocity recipe
+        @test count(==(:assign), modes) == 4                                   # cholesky/logdet/kin/+
+        # the source ops (grad port-call + fused kin) carry DISTINCT stable definition tokens (RK 07:25)
+        srcops = [RKS.recipe_handle_op(h) for h in hs if RKS.recipe_handle_op(h) isa RKS._KernelSourceOp]
+        @test length(srcops) == 2
+        @test RKS.kernel_sourceop_token(srcops[1]) !== RKS.kernel_sourceop_token(srcops[2])
+        @test count(o -> RKS.kernel_sourceop_form(o) === :portcall, srcops) == 1  # exactly the grad recipe
+        # the FUSED kin op executes numerically over its ACTUAL ordered inputs (pot, node, mom, dkin) — the
+        # authored `oftype(pot,0.5)*(node + dot(mom,dkin))` (RK 07:35)
+        kinh = only(h for h in hs if RKS.recipe_handle_op(h) isa RKS._KernelSourceOp &&
+                    RKS.kernel_sourceop_form(RKS.recipe_handle_op(h)) === :fused)
+        @test length(kinh.inputs) == 4                                         # (pot, node, mom, dkin) ids
+        kinres = RKS.recipe_handle_op(kinh)(0.3, 2.0, [1.0, 2.0], [0.5, 0.5])
+        @test kinres == oftype(0.3, 0.5) * (2.0 + dot([1.0, 2.0], [0.5, 0.5]))
+
+        # RAW/opaque ops REJECT as prepared handles — a manually-inserted closure or an unregistered name
+        weird(x) = x
+        @test_throws RKS._KernelFactoryReject RKS._recipe_handle((x) -> x, (1,), (2,), (2,))     # raw closure
+        @test_throws RKS._KernelFactoryReject RKS._recipe_handle(weird, (1,), (2,), (2,))        # unregistered name
+        # HANDLE-LEVEL collateral: a :portcall source op with two ALL-outputs but ONE owned REJECTS (RK 07:30)
+        pcall = RKS._KernelSourceOp(Val(:tok), Val(:portcall), (gf, p) -> gf(p))
+        @test_throws RKS._KernelFactoryReject RKS._recipe_handle(pcall, (10, 11), (20, 21), (21,))
+        @test RKS.recipe_handle_mode(RKS._recipe_handle(pcall, (10, 11), (20, 21), (20, 21))) === :destination
+        @test RKS.recipe_handle_mode(RKS._recipe_handle(pcall, (10,), (20,), (20,))) === :assign  # single-output
+
+        # POISON: on the isolated graph, REPLACE the selected Recipe values (same ids/edges, THROWING op)
+        # after preparation, and prove the captured handle op tuple is === unchanged AND executes unchanged
+        # (RK 07:35). Compare elementwise with === (no objectid on singletons). Restore in finally.
+        gp = RKS.kernel_graph(euclidean_ep)
+        capd_ops = Tuple(RKS.recipe_handle_op(h) for h in hs)
+        kin_before = RKS.recipe_handle_op(kinh)(0.3, 2.0, [1.0, 2.0], [0.5, 0.5])
+        saved = copy(gp.recipes)
+        try
+            for (i, r) in enumerate(gp.recipes)
+                gp.recipes[i] = RKS.Recipe(r.id, r.inputs, r.outputs,
+                    (a...) -> error("poisoned Recipe.op"), r.cost, r.cse_key, r.effectful)
+            end
+            hs2 = RKS.kernel_prepared_handles(pf)
+            @test all(RKS.recipe_handle_op(hs2[i]) === capd_ops[i] for i in eachindex(capd_ops))  # === unchanged
+            @test RKS.recipe_handle_op(kinh)(0.3, 2.0, [1.0, 2.0], [0.5, 0.5]) == kin_before        # exec unchanged
+        finally
+            empty!(gp.recipes); append!(gp.recipes, saved)
+        end
+
+        # PER-CALLEE recipe-op safe domain at concrete binding (RK 07:30): identity + safe types accept,
+        # custom-overload types reject
+        dok = RKS.kernel_recipe_op_domain_ok
+        L = typeof(cholesky([2.0 0.0; 0.0 2.0]))
+        @test dok(cholesky, (Matrix{Float64},)) && !dok(cholesky, (Matrix{String},))
+        @test dok(logdet, (L,)) && dok(logdet, (Matrix{Float64},))
+        @test dok(\, (L, Vector{Float64})) && !dok(\, (Matrix{String}, Vector{Float64}))
+        @test dok(+, (Float64, Float64)) && !dok(+, (String, String))
     end
 
     @testset "construction seam — ACTUAL mid-copy throw leaves NO stale blessed bit (epoch contract, not rollback) (RK 07:08)" begin
