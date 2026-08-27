@@ -481,16 +481,23 @@ end
     _D3!(fr) = for t in getfield(fr, :trees); _NAN(t.bwd_fwd.mom); _NAN(t.bwd_fwd.dham_dmom); end
     _D4!(fr) = for t in getfield(fr, :trees); _NAN(t.summed_mom.bwd); _NAN(t.summed_mom.fwd); end
     _D5!(fr) = begin ps = getfield(fr, :proposals); for i in 2:length(ps)-1; _poison_ep!(ps[i]); end end
-    _DALL!(fr) = (_D1!(fr); _D2!(fr); _D3!(fr); _D4!(fr); _D5!(fr))
+    # interior-proposal CURRENTNESS-mask poison (in addition to the 7 values): set the whole mask to all-ZERO
+    # (every field reads dirty) and to all-ONE (every stale/garbage field reads CURRENT). A read-before-write of
+    # an interior proposal's mask leaks either way, so the trajectory must stay byte-identical.
+    _setmask!(ep, v) = setfield!(ep, :current, map(_ -> v, RK._canon_current_mask(ep)))
+    _D5m0!(fr) = begin _D5!(fr); ps = getfield(fr, :proposals); for i in 2:length(ps)-1; _setmask!(ps[i], UInt(0)); end end
+    _D5m1!(fr) = begin _D5!(fr); ps = getfield(fr, :proposals); for i in 2:length(ps)-1; _setmask!(ps[i], ~UInt(0)); end end
+    _DALL!(fr) = (_D1!(fr); _D2!(fr); _D3!(fr); _D4!(fr); _D5m1!(fr))   # combined uses the strongest D5 (values + garbage-current mask)
     _noop!(fr) = nothing
-    # each per-txn record folds the full observable set PLUS the witnessed control category: `selected` =
-    # proposals[end] changed identity this txn (a swap-to-end), and `gofwd` = final direction.
+    # each per-txn record folds the full observable set PLUS the witnessed control category:
+    # `end_identity_changed` = proposals[end] changed OBJECT identity across this txn — a NET change (swaps that
+    # restore identity read as no change, so this is NOT a raw swap count), and `gofwd` = final direction.
     _traj(C, fr, seed, K, poison!) = begin
         rng = Random.Xoshiro(seed); out = Vector{Any}(undef, K)
         for i in 1:K
             poison!(fr); pe0 = objectid(getfield(fr, :proposals)[end])
             C.root!(fr, C.scratch, rng)
-            out[i] = (obs = _obs(fr), selected = objectid(getfield(fr, :proposals)[end]) != pe0,
+            out[i] = (obs = _obs(fr), end_identity_changed = objectid(getfield(fr, :proposals)[end]) != pe0,
                       gofwd = getfield(fr, :gofwd), may_continue = getfield(fr, :may_continue), may_sample = getfield(fr, :may_sample))
         end
         out
@@ -522,23 +529,24 @@ end
         for seed in seeds
             ref = _traj(CD, _mkframe(pf, T, 10, LinearAlgebra.Diagonal(T[1, 1])), seed, 60, _noop!)
             for r in ref
-                push!(depths, Int(r.obs.reached_depth)); push!(dirs, r.gofwd); push!(sels, r.selected)
+                push!(depths, Int(r.obs.reached_depth)); push!(dirs, r.gofwd); push!(sels, r.end_identity_changed)
                 (!r.may_continue && !r.obs.diverged) || (allstop[] = false)
             end
-            for pz in (_D1!, _D2!, _D3!, _D4!, _D5!, _DALL!)
+            for pz in (_D1!, _D2!, _D3!, _D4!, _D5!, _D5m0!, _D5m1!, _DALL!)
                 @test _traj(CD, _mkframe(pf, T, 10, LinearAlgebra.Diagonal(T[1, 1])), seed, 60, pz) == ref
             end
             @test _traj(CD, _mkframe(pf, T, 10, LinearAlgebra.Diagonal(T[1, 1])), seed, 60, _noop!) ==
                   _traj(CM, _mkframe(pf, T, 10, T[1 0; 0 1]), seed, 60, _noop!)   # Diagonal ≡ dense full-observable parity
         end
         # WITNESSED categories, matching the independent Codex census for these EXACT seeds (no overclaim):
-        # reached_depth is exactly {1,2,3,4}, both gofwd directions, both swap-to-end and no-swap, and every
+        # reached_depth is exactly {1,2,3,4}, both gofwd directions, both a net proposals[end] identity change and
+        # no-net-change, and every
         # normal transition ended !may_continue && !diverged (U-turn-like stop). We do NOT claim max-depth
         # (reached_depth never hits max_depth=10) or per-depth flip coverage; divergence is the forced control.
         @test depths == Set([1, 2, 3, 4])
         @test maximum(depths) < 10
         @test dirs == Set([false, true])
-        @test sels == Set([false, true])
+        @test sels == Set([false, true])        # both a NET proposals[end] identity change and no-net-change witnessed
         @test allstop[]                          # all 240 normal transitions stopped via U-turn (!may_continue, !diverged)
         # FORCED-DIVERGENCE control: min_dham above any dham forces diverged=true on leaf 1, exercising the
         # early-return path (start! returns before writing proposals[1] / trees[1].log_weight).
@@ -546,8 +554,8 @@ end
         refX = _traj(CX, _mkframe(pf, T, 10, LinearAlgebra.Diagonal(T[1, 1]); min_dham = T(1e6)), 1, 40, _noop!)
         @test all(r -> r.obs.diverged, refX)                   # control genuinely takes the divergence path (non-vacuous)
         @test all(r -> !r.may_sample && !r.may_continue, refX) # forced divergence pins BOTH control bits off
-        @test all(r -> Int(r.obs.reached_depth) == 1 && !r.selected && r.gofwd, refX)   # observed forced category: depth 1, no swap, gofwd
-        for pz in (_D1!, _D2!, _D3!, _D4!, _D5!, _DALL!)
+        @test all(r -> Int(r.obs.reached_depth) == 1 && !r.end_identity_changed && r.gofwd, refX)   # forced category: depth 1, no NET identity change (genuinely no swap — divergence terminates before any swap), gofwd
+        for pz in (_D1!, _D2!, _D3!, _D4!, _D5!, _D5m0!, _D5m1!, _DALL!)
             @test _traj(CX, _mkframe(pf, T, 10, LinearAlgebra.Diagonal(T[1, 1]); min_dham = T(1e6)), 1, 40, pz) == refX
         end
         # exact 0-B on the faithful-reset path (scaled Diagonal, same type ⇒ reuse CD), F32/F64 × both RNG
