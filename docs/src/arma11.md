@@ -96,27 +96,6 @@ errors_kernel = prepare(model;
 errors = errors_kernel(q, series)
 ```
 
-The numeric graph ports are typed at a `Real` boundary, so the prepared density
-kernel differentiates cleanly through reverse-mode AD
-(`DifferentiationInterface` with the Enzyme backend) — the error recursion
-included:
-
-```julia
-using DifferentiationInterface
-import Enzyme
-
-enzyme_backend = AutoEnzyme(;
-    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-    function_annotation = Enzyme.Const,
-)
-
-density_only = prepare(model;
-    have = (:unconstrained, :series),
-    want = :density)
-logdensity(qv) = density_only(Tuple(qv), series)
-gradient = DifferentiationInterface.gradient(logdensity, enzyme_backend, collect(q))
-```
-
 The one-step-ahead forecast is a deterministic generated quantity; planning it
 from a constrained boundary keeps the recursion (the forecast needs the last
 error) but drops the prior, likelihood, and total-density recipes:

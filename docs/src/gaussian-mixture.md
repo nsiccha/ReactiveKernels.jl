@@ -107,27 +107,6 @@ constrain_kernel = prepare(model;
 parameters = constrain_kernel(q)
 ```
 
-The numeric graph ports are typed at a `Real` boundary, so the prepared density
-kernel differentiates cleanly through reverse-mode AD
-(`DifferentiationInterface` with the Enzyme backend) — the `log_mix`
-marginalization included:
-
-```julia
-using DifferentiationInterface
-import Enzyme
-
-enzyme_backend = AutoEnzyme(;
-    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-    function_annotation = Enzyme.Const,
-)
-
-density_only = prepare(model;
-    have = (:unconstrained, :observations),
-    want = :density)
-logdensity(qv) = density_only(Tuple(qv), observations)
-gradient = DifferentiationInterface.gradient(logdensity, enzyme_backend, collect(q))
-```
-
 Generated quantities can start at an already-constrained boundary. Here the
 posterior responsibility of component 1 for a new observation — the soft
 assignment the marginalization sums over — is a deterministic function of the
