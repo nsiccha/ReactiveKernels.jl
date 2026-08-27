@@ -263,9 +263,9 @@ end
 
     C=RK.compile_nuts_native(pf,_NativeNutsFix.nuts_state,_NativeNutsFix.refresh_momentum!!,_NativeNutsFix.nuts!!,f)
     last=length(f.proposals); a=f.proposals[1]; z=f.proposals[last]
-    @test RK._nn_method1(C.program,Val(4),C.cfg,f,1) === f # omitted j evaluates length(proposals)
+    @test RK._nn_method1(C.program,Val(5),C.cfg,f,1) === f # omitted j evaluates length(proposals)
     @test f.proposals[1] === z && f.proposals[last] === a
-    @test_throws MethodError RK._nn_method0(C.program,Val(4),C.cfg,f) # required i is not guessed
+    @test_throws MethodError RK._nn_method0(C.program,Val(5),C.cfg,f) # required i is not guessed
 end
 
 @testset "native NUTS — two owner tokens interleave without metadata collision" begin
@@ -294,12 +294,18 @@ end
     E = RK._native_encode_program(irs, Nothing, RK.kernel_token(_NativeNutsFix.nuts_state),
                                   RK.kernel_module(_NativeNutsFix.nuts_state))
     @test E.program <: RK._NativeProgram
-    @test RK._native_program_node_count(E.program) == 444
-    @test Tuple(ir.id.decl for ir in irs) == (1,2,3,4,5,6,7,8,9)
+    @test RK._native_program_node_count(E.program) == 715
+    @test Tuple(ir.id.decl for ir in irs) == (1,2,3,4,5,6,7,8,9,10)
     @test Tuple(ir.id.name for ir in irs) ==
-          (:reset!, :collectstats!, :logadvanceprob, :swapproposal!, :step!, :flip!, :flip_neg!, :finish!, :start!)
+          (:finiteorneginf, :reset!, :collectstats!, :logadvanceprob, :swapproposal!,
+           :step!, :flip!, :flip_neg!, :finish!, :start!)
+    mm=Dict(m.parameters[1]=>m for m in RK._native_program_parts(E.program).methods.parameters)
+    @test Tuple(mm[mid].parameters[3].parameters[1].parameters[5] for mid in (8,9,10)) ==
+          (:endpoint_place,:endpoint_place,:endpoint_place)
+    @test all(m -> all(f -> f.parameters[5] === :value, m.parameters[3].parameters),
+              (mm[i] for i in (1,2,3,4,5,6,7)))
     @test length(E.refs) == length(E.callees) == length(E.registrations)
-    @test length(E.refs) > 10
+    @test length(E.refs) == 17
     @test all(r -> r isa RK._CapturedCalleeRef, E.refs)
     @test !any(v -> v isa Dict || v isa Set || v isa Base.RefValue, E.callees)
     # Re-encoding one definition is deterministic and yields the identical program/callee tuple types.

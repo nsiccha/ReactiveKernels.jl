@@ -792,7 +792,7 @@ struct _PrimitiveEffect
     result_alias::Union{Nothing,Int}  # positional the RESULT aliases (fill!/copyto!/lmul!: dest)
     kind::Symbol                      # :effect (positional writer) | :pure | :rng
     order::Symbol                     # :none | :ordered (rng/effect sequencing, no-CSE)
-    borrows::Tuple{Vararg{Int}}       # actual positions the RESULT BORROWS (lazy view, e.g. badd:
+    borrows::Tuple{Vararg{Int}}       # actual positions the RESULT BORROWS (a lazy view may borrow
                                       #   all) — must NOT be cached/materialized as authoritative
     rng_arg::Union{Nothing,Int}       # the runtime RNG arg position (:rng only) — explicit, not by kind
 end
@@ -847,6 +847,11 @@ _kernel_primitive_effect(@nospecialize(v)) =
     #   no reactive WRITE (returns a fresh value); reads both actuals.
     v === Random.rand ?
         _EffectDescriptor(Symbol("__rk_rng_Random_rand__"), 2, (), (1, 2), nothing, :rng, :ordered, (), 1) :
+    #   randexp(rng): the exact 1-positional scalar exponential draw used by the authored NUTS
+    #   accept/reject helper.  It reads only the RNG, writes no reactive place, returns a fresh scalar,
+    #   and is ordered with every other RNG effect.  This is a built-in authority, not an author macro.
+    v === Random.randexp ?
+        _EffectDescriptor(Symbol("__rk_rng_Random_randexp__"), 1, (), (1,), nothing, :rng, :ordered, (), 1) :
     #   eachcol(A): NOT pure — reads A (arg 1) and returns a lazy VIEW iterator BORROWING arg 1 (RK
     #   06:10), so a yielded column aliases A and must NOT be treated as an independent value. No write.
     v === Base.eachcol ?
@@ -1053,6 +1058,7 @@ function _kernel_effect_callee_domain_ok(@nospecialize(f), argtypes)
                                    _kernel_dom_num_array(argtypes[2])
     f === Random.rand    && return length(argtypes) == 2 && _kernel_dom_rng(argtypes[1]) &&
                                    _kernel_dom_sample_spec(argtypes[2])
+    f === Random.randexp && return length(argtypes) == 1 && _kernel_dom_rng(argtypes[1])
     f === Base.eachcol   && return length(argtypes) == 1 && _kernel_dom_num_matrix(argtypes[1])
     false
 end
@@ -1063,7 +1069,8 @@ end
 Per-callee/arity SPECIALIZATION admission for a captured RK-core built-in EFFECT primitive (`reg.kind ===
 :primitive`, RK 06:37): dispatches on the exact identity — `fill!`(Base Array dest + numeric scalar),
 `copyto!`(Base Array dest+src), `randn!`(builtin RNG + numeric Array), `lmul!`(sanctioned LinearAlgebra/
-dense matrix + numeric Array), `rand`(builtin RNG + sample `Type`), `eachcol`(Base numeric Matrix). A
+dense matrix + numeric Array), `rand`(builtin RNG + sample `Type`), `randexp`(builtin RNG),
+`eachcol`(Base numeric Matrix). A
 custom overload over an unsupported domain REJECTS. Author `@rk_*` declarations are trusted, not gated.
 """
 kernel_builtin_primitive_domain_ok(reg, argtypes) =
@@ -1102,7 +1109,7 @@ end
 Declare the ordinary helper `f` (a singleton function) as a PURE reader of its `arity` positional
 args — admissible over reactive places, never a writer. Hygienic/exact/rebind-checked; place it
 next to the helper. `@rk_borrows f arity` additionally marks the result as BORROWING all actuals
-(a lazy view, e.g. `badd` — must not be materialized). `@rk_rng f arity rngpos` declares an ORDERED
+(a lazy view must not be materialized). `@rk_rng f arity rngpos` declares an ORDERED
 RNG helper whose positional `rngpos` is the runtime RNG. Any unregistered helper stays opaque.
 """
 macro rk_pure(f, arity)

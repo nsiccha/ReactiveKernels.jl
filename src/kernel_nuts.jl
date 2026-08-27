@@ -245,7 +245,7 @@ _ensure_read(C::NCtx, epexpr, field::Symbol) =
 
 # inline a value-position acyclic sibling call: substitute formals with actuals, emit its body as a block
 # whose final statement is the returned value. (The CFG inlines only TOP-LEVEL value calls; a call nested in
-# another call's args — `randbernoullilog(rng, logadvanceprob(self, depth))` — is inlined here.)
+# another call's args — `pure_helper(self, other_helper(self, depth))` — is inlined here.)
 function ninline_value(x, lm, C::NCtx)
     length(x.candidates) == 1 || _l_ctrl_reject(   # exact single-candidate (RK #6): no ambiguous-overload guess
         "value-position call `$(x.name)` has $(length(x.candidates)) candidates — overload not narrowed to one")
@@ -680,12 +680,30 @@ function compile_nuts(pf::_PreparedFactory, skel, refresh_skel, nuts_root_skel, 
     runtimearg = rootpos[1]
     PL = kernel_prepared_plan(pf)
     EPT = typeof(getfield(frame, :fwd)); TREE = eltype(getfield(frame, :trees)); SH = typeof(getfield(frame, :shared))
-    # spilled-local column type by role (LocalAssign rhs: trees[..]->TREE, proposals[..]->EPT, else Int)
+    SCALART = typeof(nuts_frame_min_dham(frame))
+    # Spilled-local column type by role.  Tree/proposal references retain their concrete aggregate type;
+    # loop indices/default control scalars remain Int.  A scalar reduction explicitly seeded by
+    # `zero(dham)` retains the endpoint Hamiltonian scalar type across native-loop PC boundaries.
+    # This is source-structural and narrow: no inference or arbitrary-result guessing.
     function _spilled_type(ir, name)
         t = Int
+        hamread(x) = (x isa _SelfField && x.path == (:init, :ham)) ||
+                     (x isa _Getfield && x.field === :ham)
         w(x) = begin
-            if x isa _LocalAssign && _lasym(x.lhs) === name && x.rhs isa _Index && x.rhs.base isa _SelfField
-                b = x.rhs.base.path[1]; t = b === :trees ? TREE : (b === :proposals ? EPT : Int)
+            if x isa _LocalAssign && _lasym(x.lhs) === name
+                if x.rhs isa _Index && x.rhs.base isa _SelfField
+                    b = x.rhs.base.path[1]; t = b === :trees ? TREE : (b === :proposals ? EPT : t)
+                elseif x.rhs isa _RegisteredCall &&
+                       getfield(x.rhs.registration, :source) === zero && length(x.rhs.args) == 1 &&
+                       x.rhs.args[1] isa _SelfField && x.rhs.args[1].path == (:dham,)
+                    t = SCALART
+                elseif x.rhs isa _RegisteredCall &&
+                       getfield(x.rhs.registration, :source) === (-) && length(x.rhs.args) == 2 &&
+                       all(hamread, x.rhs.args)
+                    # `raw_dham = init.ham - ep.ham` is evaluated once before the pure finite sentinel
+                    # sibling consumes it; retain its concrete Hamiltonian scalar type across that call.
+                    t = SCALART
+                end
             end
             if x isa Tuple || x isa AbstractVector; for e in x; w(e); end
             elseif x isa Pair; w(x.second)

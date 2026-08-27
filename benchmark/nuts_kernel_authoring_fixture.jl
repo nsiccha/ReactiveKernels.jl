@@ -1,6 +1,6 @@
 # ReactiveHMC-STRUCTURE `@kernel` NUTS AUTHORING FIXTURE — FINAL executable-integration surface.
 # implicit-field, no-Ref (two-direct-branch direction), runtime rng, RK-visible leapfrog!/refresh_momentum!!/
-# copy!!, `!!` public entry, pot_f + grad_f as alternative pot producers (pot_f RESTORED), public @rk_* helper effect
+# copy!!, `!!` public entry, pot_f + grad_f as alternative pot producers (pot_f RESTORED), no author effect
 # declarations, and a concrete registered zero-allocation stats callback over compiler-owned diagnostics state.
 #
 # Algorithm-STRUCTURE reference (NOT a bitwise target): ReactiveHMC.jl v0.1.0 (781sB @ ca9ea4ca) —
@@ -25,8 +25,8 @@
 #     them per transition; the registered stats_f (nuts_stats!) increments n_steps ONCE per collectstats!/leaf
 #     and records acceptance data — n_steps is produced by the callback, independent of pgrad + body marker.
 #  T-PRESERVING: all construction literals derive from the endpoint/template (zero/one/oftype/similar).
-#  @node(logdet(chol_metric)) preserved. Public @rk_* declarations register the pure/borrowing/rng helpers so
-#  the compiler schedules them with visible effects (never body inference).
+#  @node(logdet(chol_metric)) preserved. Every hot helper is an expression or captured sibling method whose
+#  primitive reads/RNG effects are visible in MethodIR; the production NUTS source needs no `@rk_*` declaration.
 #
 #  PINNED STRUCTURAL-COPY OWNERSHIP POLICY (`deepcopy(init)` is the STRUCTURAL MARKER):
 #   - SHARED BY IDENTITY across init/fwd/bwd: read-only authority inputs pot_f, grad_f, metric, plus the
@@ -36,32 +36,17 @@
 #     dkin_dmom, kin, ham, dham_dpos, dham_dmom (aliased projections collapse to one physical slot).
 #
 # STAGE: FINAL integration-input source surface for syntax cherry-pick + POC compile. CONSTRUCTION happens on
-# the factory/effects substrate (@kernel source-capture + @rk_* declarations + nuts!! execution seam). NO
+# the factory/effects substrate (@kernel source-capture + built-in primitive authority + nuts!! execution seam). NO
 # execution/parity/0-B/perf claim here; docs not sourced. Structural verification + lexical-shadowing inventory
 # via nuts_authoring_shadowing_gate.jl; executable certification via nuts_acceptance_harness.jl (c83, held).
 using ReactiveKernels
 using LinearAlgebra, LogExpFunctions, Random
 
-# ---- module helpers (algorithm-structure reference) — T-derived, no Int→Float64 -----------------------
+# ---- cold module helpers (construction only) — T-derived, no Int→Float64 ------------------------------
 fillf(f::Function, value, n::Int) = [f(value) for _ in 1:n]
-finiteorneginf(x) = isfinite(x) ? x : typeof(x)(-Inf)
-min1exp(x) = x >= 0 ? one(x) : exp(x)
-badd(args...) = Base.broadcasted(+, args...)
-randbernoullilog(rng, logprob) = logprob > 0 ? true : -randexp(rng) < logprob
-logswapprob(tree) = tree.log_weight[1] - tree.log_weight[2]
-compute_criterion(mom, bwd_dham_dmom, fwd_dham_dmom) =
-    (dot(mom, bwd_dham_dmom) > 0 && dot(mom, fwd_dham_dmom) > 0)
-
-# PUBLIC exact-identity effect declarations (973f7f4/bf7d2ed) — the compiler schedules these with visible
-# effects (registered primitives), never by body inference. Authors touch no internals.
-@rk_pure finiteorneginf 1
-@rk_pure min1exp 1
-@rk_borrows badd 2
-@rk_rng randbernoullilog 2 1
-@rk_pure logswapprob 1
-@rk_pure compute_criterion 3
 # Built-in RNG/effect primitives used by refresh_momentum!!: Random.randn! (ordered RNG, rng arg 1, writes/
-# result-aliases dest arg 2), LinearAlgebra.lmul! (reads matrix+dest, writes/aliases dest arg 2).
+# result-aliases dest arg 2), LinearAlgebra.lmul! (reads matrix+dest, writes/aliases dest arg 2). Each
+# accept/reject branch below directly exposes the exact built-in ordered Random.randexp(rng) authority.
 
 # T-derived tree/proposal buffers from the phasepoint/template arrays (zero/similar), sentinel via oftype(ham).
 trajectory(bwd, fwd) = (; bwd, fwd)
@@ -127,7 +112,8 @@ end
 @kernel nuts_stats!(state) = begin
     state.n_steps += 1
     state.acceptance_rate = (one(state.dham) - one(state.dham) / state.n_steps) * state.acceptance_rate +
-                            (one(state.dham) / state.n_steps) * min1exp(state.dham)
+                            (one(state.dham) / state.n_steps) *
+                            (state.dham >= zero(state.dham) ? one(state.dham) : exp(state.dham))
     return state
 end
 
@@ -148,6 +134,15 @@ end
     reached_depth = 0
     acceptance_rate = zero(init.ham)
 
+    # The remaining hot helper is a captured sibling method whose complete primitive body is part of
+    # MethodIR/native ProgramT.  RNG draws stay directly at their consuming branches, and the explicit
+    # reductions in finish! replace the former opaque `dot` + lazy `broadcasted(+)` helpers.  They preserve
+    # the real-valued NUTS criterion, while—as the fixture header states—the scalar reduction is not a
+    # bitwise BLAS-dot target.
+    finiteorneginf(x) = begin
+        result = (x - x == zero(x)) ? x : -(one(x) / zero(x))
+        result
+    end
     reset!() = begin
         gofwd = true
         may_sample = true
@@ -183,7 +178,10 @@ end
             rand(rng, Bool) && flip!(__self__, depth)
             gofwd ? finish!(__self__, fwd, depth, rng) : finish!(__self__, bwd, depth, rng)
             may_sample || break
-            randbernoullilog(rng, logswapprob(trees[depth])) && swapproposal!(__self__, depth)
+            ((trees[depth].log_weight[1] - trees[depth].log_weight[2]) >
+                zero(trees[depth].log_weight[1] - trees[depth].log_weight[2]) ? true :
+                -Random.randexp(rng) < (trees[depth].log_weight[1] - trees[depth].log_weight[2])) &&
+                swapproposal!(__self__, depth)
             may_continue || break
         end
         copy!!(init, proposals[end])                          # registered owned-copy (visible)
@@ -215,23 +213,48 @@ end
         start!(__self__, ep, depth, rng)
         may_continue || return may_sample = false
         suptree.log_weight[1] = logaddexp(tree.log_weight[1], tree.log_weight[2])
-        may_continue = if depth == 1
+        if depth == 1
             @. suptree.summed_mom.fwd = suptree.bwd.mom + ep.mom
-            compute_criterion(suptree.summed_mom.fwd, suptree.bwd.dham_dmom, ep.dham_dmom)
+
+            # Seed from the already-typed scalar diagnostic, not an array element: zero-length vector
+            # inputs retain Julia's ordinary empty-reduction value and never acquire an implicit [1] read.
+            backward_dot = zero(dham)
+            forward_dot = zero(dham)
+            for i in 1:length(suptree.summed_mom.fwd)
+                backward_dot += suptree.summed_mom.fwd[i] * suptree.bwd.dham_dmom[i]
+                forward_dot += suptree.summed_mom.fwd[i] * ep.dham_dmom[i]
+            end
+            may_continue = backward_dot > zero(backward_dot) && forward_dot > zero(forward_dot)
         else
             @. suptree.summed_mom.fwd = tree.summed_mom.bwd + tree.summed_mom.fwd
-            (
-                compute_criterion(suptree.summed_mom.fwd, suptree.bwd.dham_dmom, ep.dham_dmom) &&
-                compute_criterion(badd(tree.summed_mom.bwd, tree.bwd.mom),
-                                  suptree.bwd.dham_dmom, tree.bwd.dham_dmom) &&
-                compute_criterion(badd(tree.bwd_fwd.mom, tree.summed_mom.fwd),
-                                  tree.bwd_fwd.dham_dmom, ep.dham_dmom)
+            base_backward_dot = zero(dham)
+            base_forward_dot = zero(dham)
+            sum1_backward_dot = zero(dham)
+            sum1_forward_dot = zero(dham)
+            sum2_backward_dot = zero(dham)
+            sum2_forward_dot = zero(dham)
+            for i in 1:length(suptree.summed_mom.fwd)
+                base_backward_dot += suptree.summed_mom.fwd[i] * suptree.bwd.dham_dmom[i]
+                base_forward_dot += suptree.summed_mom.fwd[i] * ep.dham_dmom[i]
+                sum1_backward_dot += (tree.summed_mom.bwd[i] + tree.bwd.mom[i]) * suptree.bwd.dham_dmom[i]
+                sum1_forward_dot += (tree.summed_mom.bwd[i] + tree.bwd.mom[i]) * tree.bwd.dham_dmom[i]
+                sum2_backward_dot += (tree.bwd_fwd.mom[i] + tree.summed_mom.fwd[i]) * tree.bwd_fwd.dham_dmom[i]
+                sum2_forward_dot += (tree.bwd_fwd.mom[i] + tree.summed_mom.fwd[i]) * ep.dham_dmom[i]
+            end
+            may_continue = (
+                base_backward_dot > zero(base_backward_dot) &&
+                base_forward_dot > zero(base_forward_dot) &&
+                sum1_backward_dot > zero(sum1_backward_dot) &&
+                sum1_forward_dot > zero(sum1_forward_dot) &&
+                sum2_backward_dot > zero(sum2_backward_dot) &&
+                sum2_forward_dot > zero(sum2_forward_dot)
             )
         end
     end
     start!(ep, depth, rng) = if depth == 1
         step_f(ep)                                             # registered leapfrog! token, concrete ep
-        dham = finiteorneginf(init.ham - ep.ham)
+        raw_dham = init.ham - ep.ham
+        dham = finiteorneginf(__self__, raw_dham)
         collectstats!(__self__)                                # registered stats_f increments n_steps (per leaf)
         diverged && return may_continue = false
         trees[1].log_weight[1] = dham
@@ -241,8 +264,12 @@ end
         may_continue || return may_sample = false
         swapproposal!(__self__, depth - 1, depth)
         finish!(__self__, ep, depth - 1, rng)
-        if may_sample && randbernoullilog(rng, logadvanceprob(__self__, depth))
-            swapproposal!(__self__, depth - 1, depth)
+        if may_sample
+            if (trees[depth - 1].log_weight[1] - trees[depth].log_weight[1]) >
+                    zero(trees[depth - 1].log_weight[1] - trees[depth].log_weight[1]) ? true :
+                    -Random.randexp(rng) < (trees[depth - 1].log_weight[1] - trees[depth].log_weight[1])
+                swapproposal!(__self__, depth - 1, depth)
+            end
         end
     end
 end

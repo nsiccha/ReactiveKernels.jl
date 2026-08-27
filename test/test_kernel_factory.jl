@@ -688,7 +688,7 @@ end
         @test g.version == ver1
     end
 
-    @testset "public exact-identity effect descriptors (@rk_* + built-in randn!/lmul!)" begin
+    @testset "public exact-identity effect descriptors (@rk_* + built-in RNG/linear-algebra effects)" begin
         # RK-core built-in RNG/effect primitives for refresh_momentum!!
         rn = RKS._kernel_primitive_effect(Random.randn!)
         @test rn.kind === :rng && rn.order === :ordered && rn.rng_arg == 1
@@ -752,15 +752,18 @@ end
         # Random.rand 2-positional ordered-RNG built-in (rand(rng, Bool) in step!)
         rd = RKS._kernel_primitive_effect(Random.rand)
         @test rd.kind === :rng && rd.rng_arg == 1 && rd.writes == () && rd.reads == (1, 2)
+        # Random.randexp is an exact arity-1 built-in authority, not an authored @rk_rng declaration.
+        re = RKS._kernel_primitive_effect(Random.randexp)
+        @test re.kind === :rng && re.order === :ordered && re.rng_arg == 1
+        @test re.arity == 1 && re.writes == () && re.reads == (1,) && re.result_alias === nothing
     end
 
     @testset "REAL nuts_state authoritative ownership (corrected ccb35d3 fixture, RK pt5/7, 05:18/26)" begin
-        # Eval the CORRECTED benchmark/nuts_kernel_authoring_fixture.jl EXACTLY as authored — its OWN
-        # six NUTS @rk_* declarations run (no manual overlay, no method-overwrite), so the gate exercises
-        # the authored source. Selective import dodges the exported-name collision.
+        # Eval benchmark/nuts_kernel_authoring_fixture.jl EXACTLY as authored. Production NUTS carries no
+        # @rk_* declaration: every hot helper is visible captured MethodIR over exact built-in primitives.
+        # Selective import dodges the exported-name collision.
         RN = Module(:RealNuts)
-        Core.eval(RN, :(using ReactiveKernels: @kernel, @node, partial, copy!!,
-                                               @rk_pure, @rk_borrows, @rk_rng))
+        Core.eval(RN, :(using ReactiveKernels: @kernel, @node, partial, copy!!))
         Core.eval(RN, :(using LinearAlgebra, LogExpFunctions, Random))
         fixpath = normpath(joinpath(@__DIR__, "..", "benchmark", "nuts_kernel_authoring_fixture.jl"))
         stmts = filter(s -> !(s isa LineNumberNode), Meta.parseall(read(fixpath, String)).args)
@@ -769,13 +772,16 @@ end
             Core.eval(RN, st)
         end
         ns = RN.nuts_state
-        # all SIX authored NUTS declared-helper identities are captured (incl. min1exp); DA/Welford declare none
-        for (h, k) in ((:finiteorneginf, :pure), (:min1exp, :pure), (:badd, :pure),
-                       (:randbernoullilog, :rng), (:logswapprob, :pure),
-                       (:compute_criterion, :pure))
-            d = RKS._kernel_declared_effect(getfield(RN, h))
-            @test d !== nothing && d.kind === k
+        # None of the six former ordinary helpers remains a module binding or a declared-effect capture.
+        for h in (:finiteorneginf, :min1exp, :badd, :randbernoullilog,
+                  :logswapprob, :compute_criterion)
+            @test !isdefined(RN, h)
         end
+        @test !any(c -> c.registration.kind === :declared_effect,
+                   RKS.kernel_callee_registrations(ns))
+        @test any(c -> c.registration.source === Random.randexp &&
+                       c.registration.kind === :primitive,
+                  RKS.kernel_callee_registrations(ns))
         # step_f → leapfrog!, stats_f → the registered nuts_stats! diagnostics callback
         fr = Dict(:step_f => RKS.kernel_registration(RN.leapfrog!),
                   :stats_f => RKS.kernel_registration(RN.nuts_stats!))

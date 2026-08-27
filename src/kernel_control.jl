@@ -276,6 +276,11 @@ function _block_writes(effects, spilled)
     w = Symbol[]
     for e in effects
         if e isa _RawStmt && e.expr isa Tuple && e.expr[1] in (:init,:incr) && e.expr[2] in spilled; push!(w, e.expr[2])
+        elseif e isa _RawStmt && e.expr isa Tuple && e.expr[1] in (:for_native,:while_native)
+            # A straight-line native loop runs inside one PC block, but an authored accumulator can be
+            # live in the following block.  Spill every loop-body LocalAssign exactly as for a top-level
+            # block effect; otherwise the PC machine silently reloads the pre-loop value on resume.
+            append!(w, _block_writes(collect(e.expr[2].body), spilled))
         elseif e isa _LocalAssign && _lasym(e.lhs) in spilled; push!(w, _lasym(e.lhs)) end
     end
     unique(w)
@@ -554,4 +559,3 @@ function _argmap(callee, call)
     end
     fmap
 end
-
