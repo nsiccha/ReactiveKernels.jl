@@ -626,8 +626,8 @@ end
         Core.eval(RN, :(using ReactiveKernels: @kernel, @node, partial, copy!!,
                                                @rk_pure, @rk_borrows, @rk_rng))
         Core.eval(RN, :(using LinearAlgebra, LogExpFunctions, Random))
-        fixsrc = read("/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-syntax/" *
-                      "benchmark/nuts_kernel_authoring_fixture.jl", String)
+        fixpath = normpath(joinpath(@__DIR__, "..", "benchmark", "nuts_kernel_authoring_fixture.jl"))
+        fixsrc = read(fixpath, String)
         stmts = filter(s -> !(s isa LineNumberNode), Meta.parseall(fixsrc).args)
         isnuts(st) = st isa Expr && st.head === :macrocall && st.args[1] === Symbol("@kernel") &&
             (eq = st.args[end]; eq isa Expr && eq.head === :(=) && eq.args[1] isa Expr &&
