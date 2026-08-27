@@ -756,7 +756,7 @@ end
 
     @testset "REAL nuts_state authoritative ownership (corrected ccb35d3 fixture, RK pt5/7, 05:18/26)" begin
         # Eval the CORRECTED benchmark/nuts_kernel_authoring_fixture.jl EXACTLY as authored — its OWN
-        # seven @rk_* declarations run (no manual overlay, no method-overwrite), so the gate exercises
+        # six NUTS @rk_* declarations run (no manual overlay, no method-overwrite), so the gate exercises
         # the authored source. Selective import dodges the exported-name collision.
         RN = Module(:RealNuts)
         Core.eval(RN, :(using ReactiveKernels: @kernel, @node, partial, copy!!,
@@ -769,7 +769,7 @@ end
             Core.eval(RN, st)
         end
         ns = RN.nuts_state
-        # all SEVEN authored declared-helper identities are captured (incl. min1exp)
+        # all SIX authored NUTS declared-helper identities are captured (incl. min1exp); DA/Welford declare none
         for (h, k) in ((:finiteorneginf, :pure), (:min1exp, :pure), (:badd, :pure),
                        (:randbernoullilog, :rng), (:logswapprob, :pure),
                        (:compute_criterion, :pure))

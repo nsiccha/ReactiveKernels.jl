@@ -357,8 +357,5 @@ let b = blocks[:nuts_state], fieldset = Set(b.fields) ∪ Set(b.sources)
     end
 end
 println("\nSTRENGTHENED STRUCTURAL GATE PASS (source-form / Meta.parseall — does not eval @kernel).")
-println("SOURCE-FORM VERIFIED ONLY. This updated eight-@kernel/effect-declaration source (euclidean_phasepoint,")
-println("leapfrog!, refresh_momentum!!, nuts_stats!, nuts_state, nuts!!, dual_averaging_state, welford_var) is")
-println("NOT YET constructed: construction is PENDING cherry-pick onto the current effects/factory substrate")
-println("(@rk_* declarations + @kernel source-capture + nuts!! execution seam). Does NOT inherit the prior")
-println("612ceee construction claim. NO MethodIR/lowering/execution/parity/alloc/perf claim.")
+println("SOURCE-FORM VERIFIED ONLY. This parser gate makes no MethodIR, lowering, execution, parity,")
+println("allocation, or performance claim; those claims require their executable test/benchmark receipts.")
