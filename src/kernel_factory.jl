@@ -713,46 +713,59 @@ _kernel_factory_endpoint_shared(skel, integrator::_KernelRegistration) =
 # cannot mutate layout authority; every accessor returns a detached immutable value. Keyed by the
 # authored PATH + CANONICAL Value id, with ALIAS projections collapsed to ONE physical slot.
 
-# One immutable slot entry: authored owner Path (top-level: `(name,)`), the canonical Value id,
-# its role, and the 1-based physical slot index within that role's tuple. Aliased paths share the
-# same (canon, role, slot). All fields immutable (Tuple/Int/Symbol) — no mutable container.
+# One immutable slot entry: authored owner Path — a Tuple of steps that admits INDEXED children
+# (`Symbol` field steps, `Int` index steps for `trees[i]`/`proposals[i]`; top-level is `(name,)`)
+# — the canonical Value id, its role, and the 1-based physical slot within that role's tuple.
+# Aliased paths share the same (canon, role, slot). All fields immutable — no mutable container.
 struct _PlanSlot
-    path::Tuple{Vararg{Symbol}}
+    path::Tuple{Vararg{Union{Symbol,Int}}}
     canon::Int
     role::Symbol            # :owned | :shared
     slot::Int
 end
 
-# The plan: per-path slots + alias groups (authored names sharing a canonical Value) + the EXACT
-# selected-Plan identity (its Recipe ids, in execution order) + the entry-current canonical set.
-struct _KernelPlan{S<:Tuple,A<:Tuple,R<:Tuple,E<:Tuple}
+# The deeply-immutable plan: a def-unique selected-plan `key`; per-path `slots`; deterministic
+# `alias_groups`; the exact selected `producer` map (canonical Value id → selected Recipe id);
+# the selected Plan `recipes` order; and the proven post-construction `entry_current` set.
+# `Key` is an actual VALUE type parameter (RK 04:17): the immutable structural selected-plan
+# identity — a Tuple of the owner/integrator Token + a per-slot (path, CANONICAL Value id, role,
+# slot) signature + alias groups + the (canonical Value id, Recipe id) producer signature + the
+# recipe order. Because it is a TYPE parameter, two plans with distinct key VALUES have distinct
+# TYPES, so an `@generated` factory dispatches to the right specialization; two graphs of the same
+# slot/recipe SHAPE but different canonical Value identities (different definitions) get different
+# keys, while two fresh reads of one definition get the same key. No objectid/hash/Recipe.op.
+struct _KernelPlan{Key,S<:Tuple,A<:Tuple,P<:Tuple,R<:Tuple,E<:Tuple}
     slots::S          # Tuple{_PlanSlot...}
-    alias_groups::A   # Tuple{Tuple{Vararg{Symbol}}...}
-    plan_recipes::R   # Tuple{Int...} — selected Plan's Recipe ids (identity, not re-derived)
-    entry_current::E  # Tuple{Int...} — canonical ids current at construction entry (the HAVE set)
+    alias_groups::A   # Tuple{Tuple{Vararg{Symbol}}...} — deterministic (first-occurrence order)
+    producer::P       # Tuple{Tuple{Int,Int}...} — (canonical Value id, selected Recipe id), sorted
+    recipes::R        # Tuple{Int...} — selected Plan Recipe ids in execution order
+    entry_current::E  # Tuple{Int...} — canonical ids CURRENT after the Plan runs = HAVE ∪ the
+                      #   producer-map KEYS (recipe-owned rule; collateral is NOT blessed)
 end
+_KernelPlan(key, slots::S, groups::A, producer::P, recipes::R, ec::E) where {S,A,P,R,E} =
+    _KernelPlan{key,S,A,P,R,E}(slots, groups, producer, recipes, ec)
+kernel_plan_key(::_KernelPlan{Key}) where {Key} = Key
 kernel_plan_slots(p::_KernelPlan) = p.slots
 kernel_plan_alias_groups(p::_KernelPlan) = p.alias_groups
-kernel_plan_recipes(p::_KernelPlan) = p.plan_recipes
+kernel_plan_producer(p::_KernelPlan) = p.producer
+kernel_plan_recipes(p::_KernelPlan) = p.recipes
 kernel_plan_entry_current(p::_KernelPlan) = p.entry_current
-# Detached lookup of the slot entry for an authored top-field name (returns the immutable entry).
 function kernel_plan_slot(p::_KernelPlan, field::Symbol)
     for s in p.slots
         s.path === (field,) && return s
     end
     throw(KeyError(field))
 end
-# Distinct physical slot counts per role.
 kernel_plan_nowned(p::_KernelPlan) = length(unique(s.canon for s in p.slots if s.role === :owned))
 kernel_plan_nshared(p::_KernelPlan) = length(unique(s.canon for s in p.slots if s.role === :shared))
 
-function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol})
+function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol}; key_token = nothing)
     graph = _kernel_the_graph(skel)
     pmap = _kernel_ports_map(skel)
     names = _kernel_all_ports(skel)
     canonof(n) = canon_id(graph, pmap[n].id)
-    # distinct canonical Values per role, in authored port order → physical slot indices (aliases
-    # collapse to ONE slot).
+    havek = Set(_kernel_have_names(skel))
+    # distinct canonical Values per role, in authored port order → physical slot indices.
     owned_canons = Int[]; shared_canons = Int[]
     for n in names
         c = canonof(n)
@@ -771,20 +784,54 @@ function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol})
             push!(slots, _PlanSlot((n,), c, :shared, findfirst(==(c), shared_canons)))
         end
     end
-    # alias groups: authored names sharing a canonical Value (>1 name)
-    bycanon = Dict{Int,Vector{Symbol}}()
-    for n in names; push!(get!(bycanon, canonof(n), Symbol[]), n); end
-    groups = Tuple(Tuple(sort(v)) for v in values(bycanon) if length(v) > 1)
-    # EXACT selected-Plan identity: run the planner for all produced ports, keep its Recipe ids.
-    havek = Set(_kernel_have_names(skel))
+    # alias groups: authored names sharing a canonical Value (>1 name), DETERMINISTIC by canonical
+    # first-occurrence in authored port order (RK: reproducible plan key).
+    canon_order = Int[]; bycanon = Dict{Int,Vector{Symbol}}()
+    for n in names
+        c = canonof(n)
+        haskey(bycanon, c) || push!(canon_order, c)
+        push!(get!(bycanon, c, Symbol[]), n)
+    end
+    groups = Tuple(Tuple(bycanon[c]) for c in canon_order if length(bycanon[c]) > 1)
+    # EXACT selected Plan: producer map (canonical Value id → selected Recipe id) + recipe order.
     have = Value[pmap[n] for n in _kernel_have_names(skel)]
     want = Value[pmap[n] for n in names if !(n in havek)]
-    prec = isempty(want) ? () : Tuple(r.id for r in plan(graph; have = have, want = want).recipes)
-    entry_current = Tuple(canonof(n) for n in _kernel_have_names(skel))
-    _KernelPlan(Tuple(slots), groups, prec, entry_current)
+    haveplan = !isempty(want)
+    producer_keys = Int[]      # canonical ids that HAVE a selected producer (recipe-owned)
+    if haveplan
+        pl = plan(graph; have = have, want = want)
+        producer = Tuple(sort!([(cid, r.id) for (cid, r) in pl.producer]))
+        recipes = Tuple(r.id for r in pl.recipes)
+        producer_keys = Int[cid for (cid, _) in producer]
+    else
+        producer = (); recipes = ()
+    end
+    pkset = Set(producer_keys)
+    # entry_current: the proven POST-construction current set = canonical HAVE ∪ the producer-map
+    # KEYS (recipe-owned rule — RK 04:12). Executing a recipe does NOT bless its COLLATERAL outputs
+    # owned by another producer, so this follows `keys(pl.producer)`, NOT every recipe output.
+    # Stable order: authored HAVE first, then producer-owned canons in authored port order; deduped.
+    ec = Int[]
+    for n in _kernel_have_names(skel)
+        c = canonof(n); c in ec || push!(ec, c)
+    end
+    for n in names
+        c = canonof(n)
+        (c in pkset && !(c in ec)) && push!(ec, c)
+    end
+    # DEF-UNIQUE STRUCTURAL key (RK 04:12/04:17): the owner/integrator Token + a per-slot
+    # (path, CANONICAL Value id, role, slot) signature + alias groups + the (canonical Value id,
+    # Recipe id) producer signature + recipe order. The canonical Value IDENTITIES (stable across
+    # `kernel_spec` reads of one const definition, distinct across definitions) make two same-SHAPE
+    # graphs under the same integrator produce DIFFERENT keys. NO objectid/hash/Recipe.op.
+    slot_sig = Tuple((s.path, s.canon, s.role, s.slot) for s in slots)
+    key = (key_token, slot_sig, groups, producer, recipes)
+    _KernelPlan(key, Tuple(slots), groups, producer, recipes, Tuple(ec))
 end
 
 # The endpoint plan under an integrator (the immutable canonical map poc wires codegen against).
+# The def-unique key is rooted in the INTEGRATOR's definition token (endpoint slice).
 _kernel_factory_endpoint_plan(skel, integrator::_KernelRegistration) =
     _kernel_factory_plan(skel, _kernel_factory_endpoint_owned(skel, integrator),
-                         _kernel_factory_endpoint_shared(skel, integrator))
+                         _kernel_factory_endpoint_shared(skel, integrator);
+                         key_token = integrator.token)

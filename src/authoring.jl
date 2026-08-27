@@ -201,6 +201,7 @@ function _kernel_alias!(graph::Graph, from::Value, to::Value, op, cost)
     src == dst && return graph                       # already one class (reverse/transitive)
     if valtype(from) == valtype(to)                  # proven same-type identity → collapse
         graph.aliases[src] = dst
+        graph.version += 1                           # a real canonical mutation (like CSE/merge)
     else                                             # typed conversion → keep the ordinary recipe
         add!(graph; inputs = (to,), outputs = (from,), op = op,
              cost = cost, cse_key = nothing, effectful = false)

@@ -21,6 +21,18 @@ end
     @. phasepoint.mom -= stepsize * phasepoint.dham_dpos
     @. phasepoint.pos +=       stepsize * phasepoint.dham_dmom
 end
+# a SECOND, byte-identical endpoint DEFINITION — same slot/recipe SHAPE, DIFFERENT canonical
+# Value identities — to prove the plan key distinguishes definitions (RK 04:17c).
+@kernel phasepoint_ep2(pot_f, grad_f, metric, pos, mom) = begin
+    pot = pot_f(pos)
+    pot, dpot_dpos = grad_f(pos)
+    chol_metric = cholesky(metric)
+    dkin_dmom = chol_metric \ mom
+    kin = 0.5 * (@node(logdet(chol_metric)) + dot(mom, dkin_dmom))
+    ham = pot + kin
+    dham_dpos = dpot_dpos
+    dham_dmom = dkin_dmom
+end
 
 # Single-object owned/shared fixture: method `add!` writes `total`; `combined` derives
 # from `total`; `scale` is a constant recipe; `seed` is an unwritten source.
@@ -372,11 +384,52 @@ end
         @test any(g -> Set(g) == Set((:dham_dmom, :dkin_dmom)), RKS.kernel_plan_alias_groups(plan))
         # EXACT selected-Plan identity carried (Recipe ids), not a re-derived imitation
         @test !isempty(RKS.kernel_plan_recipes(plan))
+        # SELECTED PRODUCER map (canonical Value id → selected Recipe id), immutable + sorted
+        prod = RKS.kernel_plan_producer(plan)
+        @test prod isa Tuple && !isempty(prod) && all(e -> e isa Tuple{Int,Int}, prod)
+        cdp = RKS.kernel_plan_slot(plan, :dham_dpos).canon
+        @test any(e -> e[1] == cdp, prod)                 # aliased target has a selected producer
+        # POST-CONSTRUCTION entry_current = HAVE ∪ producer-map KEYS (recipe-owned; no collateral)
+        ec = RKS.kernel_plan_entry_current(plan)
+        gphc = RKS.kernel_graph(phasepoint_ep)
+        canonof(n) = RKS.canon_id(gphc, phasepoint_ep.ports[n].id)
+        @test cdp in ec && canonof(:pos) in ec
+        @test length(ec) == length(unique(ec))            # deduped, stable
+        # every canonical HAVE is present directly
+        for n in phasepoint_ep.have_names
+            @test canonof(n) in ec
+        end
+        # ec carries ONLY HAVE ∪ producer-map keys — nothing else is blessed
+        havecanon = Set(canonof(n) for n in phasepoint_ep.have_names)
+        prodkeys = Set(e[1] for e in prod)
+        @test all(c -> c in havecanon || c in prodkeys, ec)
+        # DEF-UNIQUE key as a VALUE type parameter: fresh reads of ONE definition → SAME key;
+        # a same-SHAPE DIFFERENT definition → DIFFERENT key (canonical Value identities differ).
+        @test RKS.kernel_plan_key(plan) ===
+              RKS.kernel_plan_key(RKS._kernel_factory_endpoint_plan(phasepoint_ep, integ))
+        @test RKS.kernel_plan_key(plan) isa Tuple && RKS.kernel_plan_key(plan)[1] === integ.token
+        plan2 = RKS._kernel_factory_endpoint_plan(phasepoint_ep2, integ)
+        @test RKS.kernel_plan_key(plan) != RKS.kernel_plan_key(plan2)
+        # the key is a VALUE type parameter → distinct keys give distinct plan TYPES (for @generated)
+        @test typeof(plan) !== typeof(plan2)
+        # producer tuple EXACTLY matches the actual selected Plan mapping
+        havev = Value[phasepoint_ep.ports[n] for n in phasepoint_ep.have_names]
+        wantv = Value[phasepoint_ep.ports[n] for n in RKS._kernel_all_ports(phasepoint_ep)
+                      if !(n in phasepoint_ep.have_names)]
+        plactual = RKS.plan(RKS.kernel_graph(phasepoint_ep); have = havev, want = wantv)
+        @test RKS.kernel_plan_producer(plan) ==
+              Tuple(sort!([(cid, r.id) for (cid, r) in plactual.producer]))
+        # multi-output producer: `pot` is produced by BOTH pot_f(pos) and grad_f(pos); the producer
+        # map selects EXACTLY ONE (recipe-owned), so entry_current follows it, not collateral.
+        cpot = RKS.canon_id(RKS.kernel_graph(phasepoint_ep), phasepoint_ep.ports[:pot].id)
+        @test count(e -> e[1] == cpot, RKS.kernel_plan_producer(plan)) == 1
         # DEEPLY IMMUTABLE: only Tuples reachable — no Vector/Dict anywhere in the seam
         @test RKS.kernel_plan_slots(plan) isa Tuple
         @test RKS.kernel_plan_alias_groups(plan) isa Tuple
-        @test RKS.kernel_plan_recipes(plan) isa Tuple
+        @test RKS.kernel_plan_recipes(plan) isa Tuple && RKS.kernel_plan_producer(plan) isa Tuple
         @test all(s -> s.path isa Tuple && s.canon isa Int, RKS.kernel_plan_slots(plan))
+        # PATH type admits INDEXED owner children (Symbol|Int steps for trees[i])
+        @test RKS._PlanSlot((:trees, 1, :mom), 1, :owned, 1).path == (:trees, 1, :mom)
         # every owner field classified exactly once
         @test length(owned) + length(shared) == length(RKS._kernel_all_ports(phasepoint_ep))
         # aliased target's PRODUCER stays canonical: dham_dpos resolves to dpot_dpos's producer
@@ -419,6 +472,26 @@ end
         ca = RKS.canon_id(gr, al_rev.ports[:a].id)
         @test RKS.canon_id(gr, al_rev.ports[:b].id) == ca
         @test RKS.canon_id(gr, al_rev.ports[:d].id) == ca
+
+        # `_kernel_alias!` bumps Graph.version on a real alias mutation (like CSE/merge), and the
+        # canonical target's PRODUCER index stays correct before/after the alias.
+        g = ReactiveKernels.Graph()
+        va = ReactiveKernels.value!(g, :a, Float64)
+        vb = ReactiveKernels.value!(g, :b, Float64)
+        ReactiveKernels.add!(g; inputs = (), outputs = (va,), op = () -> 0.0,
+                             cost = 1.0, cse_key = nothing, effectful = false)
+        prod_before = length(RKS.producers_of(g, RKS.canon_id(g, va.id)))
+        ver0 = g.version
+        RKS._kernel_alias!(g, vb, va, identity, 1.0)     # b ≡ a
+        @test g.version == ver0 + 1                       # real canonical mutation bumped version
+        @test RKS.canon_id(g, vb.id) == RKS.canon_id(g, va.id)
+        # a's producer index is unchanged; b now resolves to a's producer via canon
+        @test length(RKS.producers_of(g, RKS.canon_id(g, va.id))) == prod_before
+        @test length(RKS.producers_of(g, RKS.canon_id(g, vb.id))) == prod_before
+        # a NO-OP alias (already same class) does NOT bump the version
+        ver1 = g.version
+        RKS._kernel_alias!(g, vb, va, identity, 1.0)
+        @test g.version == ver1
     end
 end
 
