@@ -12,6 +12,7 @@ using Test
         include("test_kernel_stateful.jl")
         include("test_kernel_methodir.jl")
         include("test_kernel_factory.jl")
+        include("test_kernel_lowering.jl")
         include("test_nonallocating_core.jl")
         include("test_composition_cse.jl")
         include("test_deterministic_ast.jl")
