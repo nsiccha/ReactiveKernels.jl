@@ -1631,6 +1631,17 @@ prepared_callable_subject(c::_PreparedCallable) = c.registration.subject
 prepared_callable_write_roots(c::_PreparedCallable) = c.registration.write_roots
 prepared_callable_read_roots(c::_PreparedCallable) = c.registration.read_roots
 prepared_callable_source(c::_PreparedCallable) = c.registration.source
+# One-call splice helper (poc seam, RK 10:40): resolve the prepared callable's LEAF `MethodIR` from its
+# CAPTURED registration source (`method_irs` on the detached source — NO registry/global reread) plus its
+# bound kwargs, so `start!(depth==1)` splices the leapfrog leaf as a single typed call. The step integrator
+# must be a single-method free kernel (one leaf IR).
+function prepared_callable_leaf(c::_PreparedCallable)
+    irs = method_irs(c.registration.source)
+    length(irs) == 1 || throw(_KernelFactoryReject(
+        "prepared callable leaf expects exactly ONE method IR, got $(length(irs)) — the step integrator " *
+        "must be a single-method free kernel"))
+    (only(irs), c.kwargs === nothing ? NamedTuple() : c.kwargs)
+end
 # The accepted keyword contract of a registered callable's captured signature: `(required names, ALL
 # accepted names, has-kwsplat)`. Typed (`stepsize::T`) and optional (`= default`) formals are recognized
 # via the formal-name parser — NOT only bare `Symbol` (RK 09:36). Only a Mode-2 free method carries one.

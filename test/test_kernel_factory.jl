@@ -1425,6 +1425,9 @@ end
         ok = pc(RKS.partial(leapfrog_ep!; stepsize = 0.1))
         @test RKS.prepared_callable_registration(ok) === RKS.kernel_registration(leapfrog_ep!)
         @test RKS.prepared_callable_kwargs(ok) == (; stepsize = 0.1)
+        # one-call splice helper (poc seam): (leaf MethodIR, bound kwargs) from the CAPTURED source, no reread
+        lf, kw = RKS.prepared_callable_leaf(ok)
+        @test lf isa RKS.MethodIR && lf.id.name === :leapfrog_ep! && lf.ok && kw == (; stepsize = 0.1)
         # a TYPED required keyword (stepsize::Float64) is RECOGNIZED via the formal parser (not only Symbol)
         @test RKS.prepared_callable_kwargs(pc(RKS.partial(typedstep!; stepsize = 0.1))) == (; stepsize = 0.1)
         @test_throws RKS._KernelFactoryReject pc(typedstep!)                    # bare: missing typed stepsize
