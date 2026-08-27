@@ -491,7 +491,7 @@ end
             poison!(fr); pe0 = objectid(getfield(fr, :proposals)[end])
             C.root!(fr, C.scratch, rng)
             out[i] = (obs = _obs(fr), selected = objectid(getfield(fr, :proposals)[end]) != pe0,
-                      gofwd = getfield(fr, :gofwd), may_continue = getfield(fr, :may_continue))
+                      gofwd = getfield(fr, :gofwd), may_continue = getfield(fr, :may_continue), may_sample = getfield(fr, :may_sample))
         end
         out
     end
@@ -545,6 +545,7 @@ end
         CX = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, _mkframe(pf, T, 10, LinearAlgebra.Diagonal(T[1, 1]); min_dham = T(1e6)))
         refX = _traj(CX, _mkframe(pf, T, 10, LinearAlgebra.Diagonal(T[1, 1]); min_dham = T(1e6)), 1, 40, _noop!)
         @test all(r -> r.obs.diverged, refX)                   # control genuinely takes the divergence path (non-vacuous)
+        @test all(r -> !r.may_sample && !r.may_continue, refX) # forced divergence pins BOTH control bits off
         @test all(r -> Int(r.obs.reached_depth) == 1 && !r.selected && r.gofwd, refX)   # observed forced category: depth 1, no swap, gofwd
         for pz in (_D1!, _D2!, _D3!, _D4!, _D5!, _DALL!)
             @test _traj(CX, _mkframe(pf, T, 10, LinearAlgebra.Diagonal(T[1, 1]); min_dham = T(1e6)), 1, 40, pz) == refX
@@ -575,17 +576,28 @@ end
         (pf, RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, fr), fr)
     end
     for T in (Float64, Float32)
-        pf, C, fr = _mkD(T)
-        momslot = RK.kernel_plan_named_slot_val(RK.kernel_prepared_plan(pf), Val(:mom))
+        pf, C, fr = _mkD(T); PL = RK.kernel_prepared_plan(pf)
         C.root!(fr, C.scratch, Random.Xoshiro(1))                       # a SUCCESSFUL transition first (real diag values)
         @test RK._diag_slot(fr.diag, Val(1)) > 0                        # n_steps advanced — the reset below is non-vacuous
         @test RK.diagnostics_committed_mask(fr.diag) == UInt(0x0f)      # previous epoch committed all 4
-        @test_throws Exception C.root!(fr, C.scratch, _CustomRNG2())    # bad RNG rejected inside refresh
+        # comprehensive snapshot (mirrors the direct-refresh before-any-kill gate): EVERY owned+shared canon
+        # value (contents) + currentness bit + whole masks + shared object identity.
+        slots = unique([(RK.kernel_plan_field(PL, sl.canon)[1], RK.kernel_plan_field(PL, sl.canon)[2]) for sl in RK.kernel_plan_slots(PL)])
+        obj(role) = role === :owned ? fr.init : fr.shared
+        vals = Dict((r, s) => _rsnap(RK._canon_slot(obj(r), Val(s))) for (r, s) in slots)
+        curs = Dict((r, s) => RK._canon_current(obj(r), Val(s)) for (r, s) in slots)
+        imask0 = RK._canon_current_mask(fr.init); smask0 = RK._canon_current_mask(fr.shared)
+        shared_ids = Dict(s => RK._canon_slot(fr.shared, Val(s)) for (r, s) in slots if r === :shared)
+        @test_throws ArgumentError C.root!(fr, C.scratch, _CustomRNG2())   # bad RNG rejected inside refresh (SPECIFIC error type)
+        # owned+shared endpoint state EXACTLY unchanged: the RNG is rejected before any kill/write, so nothing ran.
+        @test all(_rsame(RK._canon_slot(obj(r), Val(s)), vals[(r, s)]) for (r, s) in slots)   # every value (contents) unchanged
+        @test all(RK._canon_current(obj(r), Val(s)) === curs[(r, s)] for (r, s) in slots)     # every currentness bit unchanged
+        @test RK._canon_current_mask(fr.init) == imask0 && RK._canon_current_mask(fr.shared) == smask0   # whole masks unchanged
+        @test all(RK._canon_slot(fr.shared, Val(s)) === shared_ids[s] for s in keys(shared_ids))         # shared object identity unchanged
+        # BUT the epoch-entry reset/uncommit DID clear diagnostics + derived (executed-prefix, explicitly NOT rollback):
         @test all(RK._diag_slot(fr.diag, Val(i)) == 0 for i in 1:4)     # diag values reset at epoch entry, never re-committed
-        @test RK.diagnostics_committed_mask(fr.diag) == 0              # committed cleared (NOT the prior 0x0f — not a rollback)
-        @test RK.diagnostics_pending_mask(fr.diag) == 0               # pending cleared by the epoch catch
-        @test !RK.nuts_frame_diverged_committed(fr)                    # derived committed cleared
-        @test !RK.nuts_frame_diverged_pending(fr)                      # derived pending cleared
-        @test RK._canon_current(fr.init, momslot)                      # mom UNCHANGED-current: bad RNG rejected before any kill
+        @test RK.diagnostics_committed_mask(fr.diag) == 0               # committed cleared (NOT the prior 0x0f)
+        @test RK.diagnostics_pending_mask(fr.diag) == 0                # pending cleared by the epoch catch
+        @test !RK.nuts_frame_diverged_committed(fr) && !RK.nuts_frame_diverged_pending(fr)   # derived committed+pending cleared
     end
 end
