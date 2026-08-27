@@ -760,13 +760,23 @@ end
 # semantics (destination owned-CLOSURE copy, shared authority untouched, `result === dest`,
 # shape/type checks), carried by its own registration, never flattened to a positional here.
 struct _PrimitiveEffect
-    token::Symbol
-    arity::Int                        # EXACT accepted positional arity — the descriptor is
-                                      # valid ONLY for a call of this many positionals
-    writes::Tuple{Vararg{Int}}
-    reads::Tuple{Vararg{Int}}
-    result_alias::Union{Nothing,Int}
+    token::Any                        # IDENTITY-derived exact definition identity — `typeof(target)`
+                                      #   for a declared helper, or a stable built-in Symbol. NEVER
+                                      #   name/spelling-derived (that collides cross-module).
+    arity::Int                        # EXACT accepted positional arity — valid ONLY for that arity
+    writes::Tuple{Vararg{Int}}        # positional actuals WRITTEN
+    reads::Tuple{Vararg{Int}}         # positional actuals READ
+    result_alias::Union{Nothing,Int}  # positional the RESULT aliases (fill!/copyto!/lmul!: dest)
+    kind::Symbol                      # :effect (positional writer) | :pure | :rng
+    order::Symbol                     # :none | :ordered (rng/effect sequencing, no-CSE)
+    borrows::Tuple{Vararg{Int}}       # actual positions the RESULT BORROWS (lazy view, e.g. badd:
+                                      #   all) — must NOT be cached/materialized as authoritative
+    rng_arg::Union{Nothing,Int}       # the runtime RNG arg position (:rng only) — explicit, not by kind
 end
+# 5-arg back-compat: an RK-core positional-writer primitive (`Base.fill!`/`copyto!`).
+_PrimitiveEffect(token, arity, writes, reads, result_alias) =
+    _PrimitiveEffect(token, arity, writes, reads, result_alias, :effect, :none, (), nothing)
+const _EffectDescriptor = _PrimitiveEffect
 
 # Pure DISPATCH on the resolved VALUE identity — used AT OWNER DEFINITION (capture time),
 # so its result is SNAPSHOTTED detached (no mutable registry, no analysis-time reread).
@@ -781,7 +791,55 @@ end
 _kernel_primitive_effect(@nospecialize(v)) =
     v === Base.fill!   ? _PrimitiveEffect(Symbol("__rk_primitive_Base_fill!__"),   2, (1,), (2,), 1) :
     v === Base.copyto! ? _PrimitiveEffect(Symbol("__rk_primitive_Base_copyto!__"), 2, (1,), (2,), 1) :
+    # RK-core built-in RNG/effect primitives for `refresh_momentum!!` (RK 2026-08-27):
+    #   randn!(rng, dest): ordered RNG (arg 1 is the RNG), writes dest (arg 2), result aliases dest.
+    v === Random.randn! ?
+        _EffectDescriptor(Symbol("__rk_rng_Random_randn!__"), 2, (2,), (1,), 2, :rng, :ordered, (), 1) :
+    #   lmul!(A, dest): reads matrix A (arg 1) + dest (arg 2), writes dest (arg 2), result aliases dest.
+    v === LinearAlgebra.lmul! ?
+        _EffectDescriptor(Symbol("__rk_effect_LinearAlgebra_lmul!__"), 2, (2,), (1, 2), 2, :effect, :none, (), nothing) :
     nothing
+
+# --- explicit exact-identity DECLARED effects for author helpers (RK ruling A/B) ----
+#
+# An ordinary helper called in a kernel body is OPAQUE unless its EXACT identity carries a detached
+# effect descriptor DECLARED next to the helper — never inferred from its body (the compiler
+# boundary forbids reflection). Authors use the PUBLIC one-line macros `@rk_pure` / `@rk_borrows` /
+# `@rk_rng` (below); they never touch `_kernel_declared_effect` or `_EffectDescriptor` directly.
+# The token is IDENTITY-derived (`typeof(target)`), so the same helper name in two modules does not
+# collide. `nothing` = undeclared → the ownership closure REJECTS it by exact name.
+_kernel_declared_effect(@nospecialize(v)) = nothing
+
+# Internal descriptor builders (token = identity `typeof(f)`), used by the public macros only.
+_effect_pure(@nospecialize(f), arity::Int) =
+    _EffectDescriptor(typeof(f), arity, (), ntuple(identity, arity), nothing, :pure, :none, (), nothing)
+_effect_borrows(@nospecialize(f), arity::Int) =
+    _EffectDescriptor(typeof(f), arity, (), ntuple(identity, arity), nothing, :pure, :none,
+                      ntuple(identity, arity), nothing)
+_effect_rng(@nospecialize(f), arity::Int, rngpos::Int) =
+    _EffectDescriptor(typeof(f), arity, (), ntuple(identity, arity), nothing, :rng, :ordered, (), rngpos)
+
+"""
+    @rk_pure f arity
+
+Declare the ordinary helper `f` (a singleton function) as a PURE reader of its `arity` positional
+args — admissible over reactive places, never a writer. Hygienic/exact/rebind-checked; place it
+next to the helper. `@rk_borrows f arity` additionally marks the result as BORROWING all actuals
+(a lazy view, e.g. `badd` — must not be materialized). `@rk_rng f arity rngpos` declares an ORDERED
+RNG helper whose positional `rngpos` is the runtime RNG. Any unregistered helper stays opaque.
+"""
+macro rk_pure(f, arity)
+    :($(GlobalRef(@__MODULE__, :_kernel_declared_effect))(::typeof($(esc(f)))) =
+          $(GlobalRef(@__MODULE__, :_effect_pure))($(esc(f)), $(esc(arity))))
+end
+macro rk_borrows(f, arity)
+    :($(GlobalRef(@__MODULE__, :_kernel_declared_effect))(::typeof($(esc(f)))) =
+          $(GlobalRef(@__MODULE__, :_effect_borrows))($(esc(f)), $(esc(arity))))
+end
+macro rk_rng(f, arity, rngpos)
+    :($(GlobalRef(@__MODULE__, :_kernel_declared_effect))(::typeof($(esc(f)))) =
+          $(GlobalRef(@__MODULE__, :_effect_rng))($(esc(f)), $(esc(arity)), $(esc(rngpos))))
+end
 
 struct _KernelRegistration
     token::Any               # def-unique/intrinsic Token, or `nothing` for a stateless spec
@@ -879,15 +937,17 @@ by captured VALUE identity, so two distinct stateless specs read as a rebind —
 NEVER reports unchanged merely because there is no Token.
 """
 function kernel_rebound(captured::_KernelRegistration, current)
-    if captured.kind === :primitive
-        # An RK-core primitive's target is NOT a registered kernel (`kernel_registration` is
-        # nothing), so it is validated by RE-DERIVING its detached descriptor from the current
-        # value and comparing the DISTINCT token: rebound iff the slot no longer resolves to
-        # that exact primitive identity.
+    if captured.kind === :primitive || captured.kind === :declared_effect
+        # An RK-core primitive / author-declared-effect helper's target is NOT a registered kernel
+        # (`kernel_registration` is nothing), so it is validated by RE-DERIVING its detached
+        # descriptor from the current value and comparing the DISTINCT identity token: rebound iff
+        # the slot no longer resolves to that exact identity/descriptor.
         if current isa _KernelRegistration
-            return current.kind !== :primitive || current.token !== captured.token
+            return current.kind !== captured.kind || current.token !== captured.token
         end
-        pe = current === nothing ? nothing : _kernel_primitive_effect(current)
+        pe = current === nothing ? nothing :
+             (captured.kind === :primitive ? _kernel_primitive_effect(current) :
+              _kernel_declared_effect(current))
         return pe === nothing || pe.token !== captured.token
     end
     cur = current isa _KernelRegistration ? current : kernel_registration(current)
@@ -1074,7 +1134,17 @@ function _kernel_capture_callees(mod::Module, refs)
             # descriptor → omitted → opaque → REJECTED by the interprocedural closure. A
             # LOCAL/formal `fill!` never reaches here (excluded at ref collection).
             peff = _kernel_primitive_effect(target)
-            peff === nothing && continue
+            if peff === nothing
+                # not an RK-core primitive — does the exact identity carry an author-DECLARED
+                # effect descriptor (@rk_pure/@rk_borrows/@rk_rng)? Capture it detached (kind
+                # :declared_effect); else omit (opaque → the ownership closure rejects by name).
+                deff = _kernel_declared_effect(target)
+                deff === nothing && continue
+                reg = _KernelRegistration(deff.token, :declared_effect, nothing,
+                                          (), (), false, target, deff)
+                push!(caps, _CapturedCallee(cref, reg, target))
+                continue
+            end
             # keyed by the primitive's OWN distinct token (no cross-primitive collision)
             reg = _KernelRegistration(peff.token, :primitive, nothing,
                                       (), (), false, target, peff)

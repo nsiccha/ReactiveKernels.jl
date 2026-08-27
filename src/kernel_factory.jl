@@ -382,6 +382,17 @@ function _own_expr_effects!(st::_OwnState, cur::MethodId, x, env::Dict{Symbol,_P
             end
         elseif reg.kind === :intrinsic
             isempty(x.args) || _own_record!(st, cur, _kernel_place_of(x.args[1], env))  # copy!! dest
+        elseif reg.kind === :declared_effect
+            # an author-DECLARED helper (@rk_pure/@rk_borrows/@rk_rng): admissible over reactive
+            # places (NOT rejected as opaque). It owns only its DECLARED write positions (pure/rng
+            # readers have none → no spurious ownership); rng_arg/borrows/order are lowering metadata.
+            de = reg.primitive_effect
+            length(x.args) == de.arity || throw(_KernelFactoryReject(
+                "declared-effect $(de.token) captured for arity $(de.arity) but called with " *
+                "$(length(x.args)) positionals — unsupported arity"))
+            for w in de.writes
+                w <= length(x.args) && _own_record!(st, cur, _kernel_place_of(x.args[w], env))
+            end
         else                                       # :free_method / :object_kernel / :stateless
             # RK block pt 4: a registered call owns its subject ONLY if it writes it; a pure
             # registered reducer (empty roots) must NOT own its first actual.

@@ -2,8 +2,37 @@
 # shadow package exports in the shared Pkg.test Main.
 module TestKernelFactory
 using ReactiveKernels, Test
-using LinearAlgebra
+using LinearAlgebra, Random
 const RKS = ReactiveKernels
+
+# a PURE helper reading reactive places by reference — admissible ONLY via an explicit exact
+# declaration (the public `@rk_pure`), never by body inference.
+crit(a, b) = a + b
+@rk_pure crit 2
+@kernel critowner(x, y) = begin
+    go!() = begin
+        z = crit(x, y)          # reads self places x,y — admissible via @rk_pure
+        Base.fill!(x, z)        # a real owned write so the closure runs
+    end
+end
+# an UNDECLARED helper on a self place stays opaque → the closure rejects by name.
+uncrit(a, b) = a + b
+@kernel undeclowner(x, y) = begin
+    go!() = begin
+        z = uncrit(x, y)
+        Base.fill!(x, z)
+    end
+end
+# same-NAME cross-module helpers get DISTINCT identity-derived tokens (no collision).
+module CritA; f(a, b) = a + b; end
+module CritB; f(a, b) = a; end
+@rk_pure CritA.f 2
+@rk_pure CritB.f 2
+# borrow / rng declarations (top-level: method defs cannot live in a testset's local scope)
+borrowfn(a) = a
+@rk_borrows borrowfn 1
+rngfn(r, x) = x
+@rk_rng rngfn 2 1
 
 # Faithful euclidean_phasepoint ENDPOINT (mirrors benchmark/nuts_kernel_authoring_fixture.jl):
 # methodless — owned set is the recipe closure seeded by the integrator's subject write-roots.
@@ -492,6 +521,36 @@ end
         ver1 = g.version
         RKS._kernel_alias!(g, vb, va, identity, 1.0)
         @test g.version == ver1
+    end
+
+    @testset "public exact-identity effect descriptors (@rk_* + built-in randn!/lmul!)" begin
+        # RK-core built-in RNG/effect primitives for refresh_momentum!!
+        rn = RKS._kernel_primitive_effect(Random.randn!)
+        @test rn.kind === :rng && rn.order === :ordered && rn.rng_arg == 1
+        @test rn.writes == (2,) && rn.reads == (1,) && rn.result_alias == 2
+        lm = RKS._kernel_primitive_effect(LinearAlgebra.lmul!)
+        @test lm.kind === :effect && lm.writes == (2,) && lm.reads == (1, 2) && lm.result_alias == 2
+
+        # a DECLARED pure helper is captured detached as :declared_effect, IDENTITY-derived token
+        caps = RKS.kernel_callee_registrations(critowner)
+        dec = only(c for c in caps if c.registration.kind === :declared_effect)
+        @test dec.target === crit
+        @test dec.registration.primitive_effect.kind === :pure
+        @test dec.registration.primitive_effect.token === typeof(crit)
+        @test !RKS.kernel_callee_rebound(critowner, dec.ref)          # slot resolves → not rebound
+        # the closure ADMITS the declared helper over self places (no opaque reject); x owned via fill!
+        @test :x in RKS._kernel_factory_owned_authoritative(critowner)
+        # an UNDECLARED helper on a self place REJECTS by exact name
+        @test_throws RKS._KernelFactoryReject RKS._kernel_factory_owned_authoritative(undeclowner)
+
+        # same-NAME cross-module helpers → DISTINCT identity-derived tokens (no collision)
+        @test RKS._kernel_declared_effect(CritA.f).token !== RKS._kernel_declared_effect(CritB.f).token
+        @test RKS._kernel_declared_effect(CritA.f).token === typeof(CritA.f)
+        # @rk_borrows marks the result as borrowing ALL actuals; @rk_rng names the RNG position
+        @test RKS._kernel_declared_effect(borrowfn).borrows == (1,) &&
+              RKS._kernel_declared_effect(borrowfn).kind === :pure
+        @test RKS._kernel_declared_effect(rngfn).kind === :rng &&
+              RKS._kernel_declared_effect(rngfn).rng_arg == 1
     end
 end
 
