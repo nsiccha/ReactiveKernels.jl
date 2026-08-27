@@ -852,6 +852,45 @@ function kernel_plan_field(p::_KernelPlan, canon::Int)
     end
     nothing
 end
+# The canonical-port SUPERSET the storage spans: the DISTINCT canonical Value ids in authored port
+# order, each with its role. Position i is the Val index in BOTH the owned and shared objects.
+function kernel_plan_superset(p::_KernelPlan)
+    canons = Int[]; roles = Symbol[]
+    for s in p.slots
+        s.canon in canons || (push!(canons, s.canon); push!(roles, s.role))
+    end
+    (Tuple(canons), Tuple(roles))
+end
+
+# Construct the owned + shared canonical objects for ONE endpoint from the plan + a canonical
+# value map. Owned canonical fields are DEEP-COPIED (per-endpoint isolation); the opposite role's
+# positions are `Nothing`. SHARED is SPLIT (RK 05:06): a canonical whose id is in `external` (a
+# callable authority — grad_f/pot_f/stats_f) is kept BY IDENTITY (never copied), the rest of the
+# shared authority (metric/chol/@node) is deep-copied once per sampler. `values` maps canonical id
+# → value. Returns `(owned::_CanonOwned, shared::_CanonShared)`.
+function _kernel_construct_endpoint(::Val{Token}, plan::_KernelPlan, values,
+                                    external = ()) where {Token}
+    canons, roles = kernel_plan_superset(plan)
+    N = length(canons)
+    ext = Set{Int}(external)
+    owned_vals = ntuple(N) do i
+        roles[i] === :owned ? deepcopy(values[canons[i]]) : nothing
+    end
+    shared_vals = ntuple(N) do i
+        roles[i] === :shared ?
+            (canons[i] in ext ? values[canons[i]] : deepcopy(values[canons[i]])) : nothing
+    end
+    # current masks start with ONLY the supplied HAVE canonical slots current (RK 05:53 pt1) — NOT
+    # the producer-key/derived bits. Selected recipes (incl. the pgrad applier) execute into the
+    # concrete destination and atomically BLESS their outputs after success; the finalized mask then
+    # equals `kernel_plan_entry_current`. HAVE = entry_current minus the producer-map keys.
+    prodk = Set{Int}(c for (c, _) in kernel_plan_producer(plan))
+    have = Set{Int}(c for c in kernel_plan_entry_current(plan) if !(c in prodk))
+    owned_mask = _owner_mask(N, Int[i for i in 1:N if roles[i] === :owned && canons[i] in have])
+    shared_mask = _owner_mask(N, Int[i for i in 1:N if roles[i] === :shared && canons[i] in have])
+    (_canon_construct(Val(:owned), owned_vals, owned_mask),
+     _canon_construct(Val(:shared), shared_vals, shared_mask))
+end
 
 function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol}; key_token = nothing)
     graph = _kernel_the_graph(skel)
@@ -859,24 +898,21 @@ function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol}; key
     names = _kernel_all_ports(skel)
     canonof(n) = canon_id(graph, pmap[n].id)
     havek = Set(_kernel_have_names(skel))
-    # distinct canonical Values per role, in authored port order → physical slot indices.
-    owned_canons = Int[]; shared_canons = Int[]
+    # ONE ABSOLUTE superset field index per canonical Value (RK 05:48): distinct canonical Values in
+    # authored port order → positions 1..N shared by BOTH role structs; the role only selects which
+    # struct carries the real value (the other holds Nothing). A per-role index would let a shared
+    # slot and an owned slot collide on the same integer and mis-address poc's Val{I}.
+    superset = Int[]
     for n in names
+        (n in owned || n in shared) || continue
         c = canonof(n)
-        if n in owned
-            c in owned_canons || push!(owned_canons, c)
-        elseif n in shared
-            c in shared_canons || push!(shared_canons, c)
-        end
+        c in superset || push!(superset, c)
     end
     slots = _PlanSlot[]
     for n in names
+        (n in owned || n in shared) || continue
         c = canonof(n)
-        if n in owned
-            push!(slots, _PlanSlot((n,), c, :owned, findfirst(==(c), owned_canons)))
-        elseif n in shared
-            push!(slots, _PlanSlot((n,), c, :shared, findfirst(==(c), shared_canons)))
-        end
+        push!(slots, _PlanSlot((n,), c, n in owned ? :owned : :shared, findfirst(==(c), superset)))
     end
     # alias groups: authored names sharing a canonical Value (>1 name), DETERMINISTIC by canonical
     # first-occurrence in authored port order (RK: reproducible plan key).
@@ -1032,6 +1068,29 @@ end
     end
 end
 _canon_current_mask(s::_Canon) = getfield(s, :current)
+# Currentness of a canonical field (the field index IS the mask bit) — a producer BLESSES it.
+@inline _canon_current(s::_Canon, ::Val{I}) where {I} =
+    (getfield(s, :current)[_owner_word(I)] >> _owner_bit(I)) & UInt(1) == UInt(1)
+@inline function _canon_bless!(s::_Canon, ::Val{I}) where {I}
+    c = getfield(s, :current); w = _owner_word(I)
+    setfield!(s, :current, Base.setindex(c, c[w] | (UInt(1) << _owner_bit(I)), w)); s
+end
+@inline function _canon_kill!(s::_Canon, ::Val{I}) where {I}
+    c = getfield(s, :current); w = _owner_word(I)
+    setfield!(s, :current, Base.setindex(c, c[w] & ~(UInt(1) << _owner_bit(I)), w)); s
+end
+# ATOMIC multi-bless (RK 05:53): set BOTH bits with ONE `setfield!` on the `current` field (the whole
+# NTuple is replaced once), handling the distinct-word case. So `pot`+`dpot` become current together;
+# a throw/type-mismatch BEFORE this single commit leaves both dirty. Exact 0-B.
+@inline function _canon_bless2!(s::_Canon, ::Val{I}, ::Val{J}) where {I,J}
+    c = getfield(s, :current); wi = _owner_word(I); wj = _owner_word(J)
+    c = wi == wj ?
+        Base.setindex(c, c[wi] | (UInt(1) << _owner_bit(I)) | (UInt(1) << _owner_bit(J)), wi) :
+        Base.setindex(Base.setindex(c, c[wi] | (UInt(1) << _owner_bit(I)), wi),
+                      c[wj] | (UInt(1) << _owner_bit(J)), wj)
+    setfield!(s, :current, c)   # ONE commit
+    s
+end
 
 # Per-canonical-slot KIND / TYPE for poc's expression emission (RK 05:30) — derived from the CONCRETE
 # field type by Val index (literal `fieldtype`), NEVER a Symbol-name heuristic or live Dict, so
@@ -1060,8 +1119,11 @@ grad_binding_callable(b::_GradBinding) = b.pgrad!
 # One invocation seeds construction: pgrad!(grad_dest, pos) writes the owned grad buffer in place
 # (identity preserved) and returns pot, which is set into the pot slot — atomic, allocation-free.
 @inline function _kernel_apply_grad!(b::_GradBinding, s::_CanonOwned, pos)
-    pot = b.pgrad!(_canon_slot(s, b.dest), pos)   # writes grad dest in place, returns pot
+    pot = b.pgrad!(_canon_slot(s, b.dest), pos)   # writes grad dest in place, returns pot (may THROW)
     _canon_set!(s, b.pot, pot)                    # seed pot atomically from the SAME call
+    # set BOTH current bits in ONE commit ONLY AFTER the call returns (RK 05:47/05:53): a throwing/
+    # partially-writing/type-mismatched pgrad! leaves NEITHER output current → a retry re-runs cleanly.
+    _canon_bless2!(s, b.dest, b.pot)
     s
 end
 

@@ -908,6 +908,50 @@ end
         end
     end
 
+    @testset "ABSOLUTE superset slot indexing + endpoint construction (RK 05:48/05:49)" begin
+        integ = RKS.kernel_registration(leapfrog_ep!)
+        plan = RKS._kernel_factory_endpoint_plan(phasepoint_ep, integ)
+        gp = RKS.kernel_graph(phasepoint_ep)
+        canonf(n) = RKS.canon_id(gp, phasepoint_ep.ports[n].id)
+        canons, roles = RKS.kernel_plan_superset(plan)
+        # shared pot_f/grad_f/metric precede owned pos/mom → pos/mom get ABSOLUTE positions ≥ 4,
+        # NOT per-role slot 1/2 (the bug RK 05:49 reproduced).
+        ps = RKS.kernel_plan_slot(plan, :pos).slot
+        ms = RKS.kernel_plan_slot(plan, :mom).slot
+        @test canons[ps] == canonf(:pos) && roles[ps] === :owned
+        @test canons[ms] == canonf(:mom) && roles[ms] === :owned
+        @test RKS.kernel_plan_field(plan, canonf(:pos)) == (:owned, ps)
+        @test ps >= 4 && ms >= 4
+        @test length(unique(canons)) == length(canons)   # ONE absolute index per canonical Value
+        # CONSTRUCT owned + shared objects from a distinct-per-canon value map; exercise _canon_slot.
+        vals = Dict{Int,Any}(c => Float64(c) for c in canons)
+        ow, sh = RKS._kernel_construct_endpoint(Val(:ep), plan, vals)
+        for s in RKS.kernel_plan_slots(plan)
+            if s.role === :owned
+                @test RKS._canon_slot(ow, Val(s.slot)) == Float64(s.canon)
+                @test RKS._canon_slot(sh, Val(s.slot)) === nothing
+            else
+                @test RKS._canon_slot(sh, Val(s.slot)) == Float64(s.canon)
+                @test RKS._canon_slot(ow, Val(s.slot)) === nothing
+            end
+        end
+    end
+
+    @testset "pgrad! throwing/partial → neither output current, retry reruns (RK 05:47)" begin
+        badpg!(dest, pos) = (dest[1] = 99.0; error("boom"))    # partial write then throw
+        b = RKS._grad_binding(badpg!, Val(1), Val(2))
+        o = RKS._CanonOwned2([0.0, 0.0], 0.0, RKS._owner_mask(2, Int[]))   # dest/pot NOT current
+        @test !RKS._canon_current(o, Val(1)) && !RKS._canon_current(o, Val(2))
+        @test_throws ErrorException RKS._kernel_apply_grad!(b, o, [1.0, 2.0])
+        # bless is AFTER the call, which threw → neither output became current
+        @test !RKS._canon_current(o, Val(1)) && !RKS._canon_current(o, Val(2))
+        # a RETRY with a good pgrad! reruns cleanly and blesses BOTH
+        goodpg!(dest, pos) = (dest .= 2 .* pos; sum(pos))
+        RKS._kernel_apply_grad!(RKS._grad_binding(goodpg!, Val(1), Val(2)), o, [1.0, 2.0])
+        @test RKS._canon_current(o, Val(1)) && RKS._canon_current(o, Val(2))
+        @test RKS._canon_slot(o, Val(1)) == [2.0, 4.0]
+    end
+
     @testset "poc binder/plan seam accessors (RK 04:41)" begin
         integ = RKS.kernel_registration(leapfrog_ep!)
         plan = RKS._kernel_factory_endpoint_plan(phasepoint_ep, integ)
