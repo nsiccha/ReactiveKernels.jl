@@ -98,6 +98,33 @@ end
     go!() = Base.copyto!(a, 1, b, 1, 3)
 end
 
+# FULL real-nuts discriminator (RK block pt 7): every owned endpoint reached by a DISTINCT
+# mechanism, shared identities untouched, plus the overload + branch-phi + direct-formal-write
+# adversaries. Owned: init (intrinsic dest) · fwd/bwd (ep chain + branch-phi + direct formal
+# write) · tree/proposals (primitive dest) · control (direct scalar write). Shared: metric,
+# chol (read-only reads only) · pot_f (read-only callback arg).
+@kernel nutsowner(init, fwd, bwd, tree, proposals, control, metric, chol; step_f, pot_f) = begin
+    start!(ep) = step_f(ep)                        # integrator hole writes its subject
+    start!(ep, half) = step_f(ep)                   # OVERLOAD (arity 2) — distinct MethodId
+    finish!(ep) = start!(__self__, ep)              # sibling → writes formal 1
+    extend!(dir) = begin
+        t = dir ? fwd : bwd                          # branch-phi alias → SET {fwd, bwd}
+        finish!(__self__, t)                         # → BOTH fwd and bwd owned
+    end
+    flip_neg!(ep) = begin
+        @. ep.mom = -ep.mom                          # DIRECT write THROUGH a formal (pt 3)
+    end
+    step!() = begin
+        copy!!(init, proposals)                      # intrinsic dest → init owned
+        Base.fill!(tree, 0.0)                        # primitive dest → tree owned
+        Base.fill!(proposals, 0.0)                   # primitive dest → proposals owned
+        flip_neg!(__self__, fwd)                     # direct-formal-write sibling → fwd owned
+        extend!(__self__, true)                      # phi+chain → fwd, bwd owned
+        control = control + 1                        # direct scalar self-write → control owned
+    end
+    energy!() = pot_f(init) * metric[1] * chol[1]    # read-only callback + pure reads of metric/chol
+end
+
 @testset "Inc3 factory substrate" begin
     @testset "LOCAL owned seed (not authoritative)" begin
         # the direct-write seed is exactly the mutated field
@@ -249,8 +276,11 @@ end
         owned_ro = RKS._kernel_factory_owned_authoritative(epowner; field_regs = fr_ro)
         @test !(:fwd in owned_ro) && !(:bwd in owned_ro)
 
-        # unresolved hole (no field_regs): step_f undecided → chain writes nothing yet
-        @test isempty(RKS._kernel_factory_owned_authoritative(epowner))
+        # RK block pt 5: the AUTHORITATIVE API REJECTS an unresolved required callable field —
+        # it must never let an undecided step_f be blessed shared. The TEMPLATE API defers.
+        @test_throws RKS._KernelFactoryReject RKS._kernel_factory_owned_authoritative(epowner)
+        @test_throws RKS._KernelFactoryReject RKS._kernel_factory_shared(epowner)
+        @test isempty(RKS._kernel_factory_owned_template(epowner))     # holes → no decided write
 
         # req 4 REJECTS: opaque unregistered mutator on a self place (bare + qualified), and a
         # method-local `fill!` spoof (opaque at the call site) — qualification/`!` not evidence.
@@ -261,6 +291,35 @@ end
         @test :buf in RKS._kernel_factory_owned_authoritative(filler)
         # higher-arity copyto! (5 positionals) mismatches the arity-2 descriptor → REJECT
         @test_throws RKS._KernelFactoryReject RKS._kernel_factory_owned_authoritative(bigcopy)
+    end
+
+    @testset "FULL real-nuts ownership discriminator (step 2/3, pt 7)" begin
+        stepreg = RKS.kernel_registration(leapfrog!)
+        potreg = RKS._KernelRegistration(:pot_tok, :free_method, :phasepoint,
+                                         (), (:pot,), false, nothing)
+        fr = Dict(:step_f => stepreg, :pot_f => potreg)
+        owned = RKS._kernel_factory_owned_authoritative(nutsowner; field_regs = fr)
+        shared = RKS._kernel_factory_shared(nutsowner; field_regs = fr)
+
+        # every writable endpoint owned, each via its distinct mechanism
+        for f in (:init, :fwd, :bwd, :tree, :proposals, :control)
+            @test f in owned
+        end
+        # branch-phi: BOTH arms owned (not just the last) — fwd via `dir ? fwd : bwd`
+        @test :fwd in owned && :bwd in owned
+        # read-only / identity fields are SHARED, never spuriously owned
+        for f in (:metric, :chol)
+            @test f in shared && !(f in owned)
+        end
+        # owned and shared partition the ports with no overlap
+        @test isempty(intersect(owned, shared))
+        @test union(owned, shared) == Set{Symbol}(RKS.kernel_port_names(nutsowner))
+
+        # OVERLOAD keying: start! has two declaration MethodIds (arity 1 and 2); the arity-1
+        # call site resolves to the arity-1 candidate — both are subject-writers so fwd/bwd
+        # still close, but the summary is keyed by MethodId, not the collapsed name.
+        ids = [ir.id for ir in RKS.method_irs(nutsowner) if ir.id.name === Symbol("start!")]
+        @test length(ids) == 2
     end
 end
 
