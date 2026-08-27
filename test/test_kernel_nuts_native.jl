@@ -72,6 +72,17 @@ function _native_build_instrumented(pf,T;grad=_NativeCountedGrad([0]),metric=T[2
     k,grad
 end
 
+mutable struct _NativeCountEnsure{F}
+    f::F
+    count::Vector{Int}
+end
+function (c::_NativeCountEnsure)(owned, shared, handles)
+    c.count[1] += 1
+    c.f(owned, shared, handles)
+end
+struct _NativeThrowEnsure end
+(::_NativeThrowEnsure)(owned, shared, handles) = throw(ErrorException("ensure boundary sentinel"))
+
 
 @testset "native NUTS — generated root executes the real fixture" begin
     pf=_native_pf(); fr=_native_frame(pf,Float64,3)
@@ -128,6 +139,39 @@ end
     GP=RK._NativeProgram{:guard_owner,PT,307,Tuple{GM},(),RK._NNNoStats}
     RK._diag_set_value!(f.diag,Val(2),23); @test RK._nn_method0(GP,Val(307),(;),f) === f
     @test RK._diag_slot(f.diag,Val(2)) == 23
+end
+
+@testset "native NUTS — current derived reads bypass the ensure callable; dirty reads repair once" begin
+    pf = _native_pf(); f = _native_frame(pf, Float64, 3)
+    C = RK.compile_nuts_native(pf, _NativeNutsFix.nuts_state, _NativeNutsFix.refresh_momentum!!,
+                               _NativeNutsFix.nuts!!, f)
+    readham = RK._NNSelfField{(:init, :ham)}
+    M = RK._NNMethod{111, :ensure_boundary, Tuple{}, Tuple{RK._NNExprStmt{readham}}}
+    P = RK._NativeProgram{:ensure_boundary, typeof(RK.kernel_prepared_plan(pf)), 111,
+                          Tuple{M}, (:ham,), RK._NNNoStats}
+    calls = [0]
+    counted = _NativeCountEnsure(getfield(C.cfg.ensures, :ham), calls)
+    cfg = (ensures = (ham = counted,), handles = C.cfg.handles)
+
+    # Warm/current is the dominant recursive path: the generated caller reads the physical slot directly.
+    @test RK._nn_method0(P, Val(111), cfg, f) === f
+    @test calls[1] == 0
+
+    # Dirty still delegates to the exact prepared ensure once, then subsequent reads bypass it again.
+    plan = RK.kernel_prepared_plan(pf)
+    hslot = RK.kernel_plan_named_slot_val(plan, Val(:ham))
+    RK._canon_kill!(f.init, hslot)
+    @test RK._nn_method0(P, Val(111), cfg, f) === f
+    @test calls[1] == 1
+    @test RK._canon_current(f.init, hslot)
+    @test RK._nn_method0(P, Val(111), cfg, f) === f
+    @test calls[1] == 1
+
+    # A failing dirty repair is neither bypassed nor followed by a raw stale read/bless.
+    RK._canon_kill!(f.init, hslot)
+    badcfg = (ensures = (ham = _NativeThrowEnsure(),), handles = C.cfg.handles)
+    @test_throws ErrorException RK._nn_method0(P, Val(111), badcfg, f)
+    @test !RK._canon_current(f.init, hslot)
 end
 
 @testset "native NUTS — full parity, concrete return, exact loop 0-B, two RNG, public Mode-2" begin

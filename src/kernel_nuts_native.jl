@@ -481,9 +481,18 @@ end
 function _nn_ensure(C::_NativeEmitCtx, ep, field::Symbol)
     ensure = Expr(:call, GlobalRef(Core, :getfield), _nn_cfg(C, :ensures), QuoteNode(field))
     shared = Expr(:call, GlobalRef(Core, :getfield), C.frame, QuoteNode(:shared))
+    slot = _native_plan_slot(C.plan, field)
+    current = Expr(:call, GlobalRef(@__MODULE__, :_canon_current), ep, :(Val($slot)))
     args=Any[ep,shared,_nn_cfg(C,:handles)]
     C.instrumented && push!(args,C.scratch)
-    Expr(:call, ensure, args...)
+    repair = Expr(:call, ensure, args...)
+    value = Expr(:call, GlobalRef(@__MODULE__, :_canon_slot), ep, :(Val($slot)))
+    # Most recursive NUTS reads are repeats of a value already repaired in this transaction.  Keep the
+    # currentness test in the generated caller so the hot/current path does not cross the separately compiled
+    # ensure-function boundary.  The cold/dirty path still invokes the exact existing ensure, preserving its
+    # recursive producer ordering, kill/bless protocol, and exception prefix; reread the physical slot only
+    # after that call succeeds.
+    Expr(:block, Expr(:if, :(!$current), repair), value)
 end
 
 function _nn_self_read(T::Type{<:_NNSelfField}, C::_NativeEmitCtx)
