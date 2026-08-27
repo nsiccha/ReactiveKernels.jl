@@ -88,9 +88,8 @@ plated_loglik = plate(school_loglik;
     # them together with the log Jacobian log|dτ/dlog_τ| = log_τ, sharing the
     # transform. The planner picks the first for a constrain-only query and the
     # second whenever the Jacobian — hence the unconstrained density — is wanted.
-    parameters::EightSchoolsParameters = EightSchoolsParameters(μ, τ, θ)
-    (parameters::EightSchoolsParameters, log_jacobian::Float64) =
-        (EightSchoolsParameters(μ, τ, θ), log_τ)
+    parameters = (; μ, τ, θ)
+    (parameters, log_jacobian::Float64) = ((; μ, τ, θ), log_τ)
 
     # log prior:  μ ~ Normal(0, 5),  τ ~ HalfCauchy(0, 5),  θⱼ ~ Normal(μ, τ).
     prior::Float64 =
@@ -107,7 +106,7 @@ plated_loglik = plate(school_loglik;
     # Deterministic new-group prediction from standard-normal innovations.
     θ_new::Float64 = μ + τ * prediction_innovations[1]
     y_new::Float64 = θ_new + new_group_scale * prediction_innovations[2]
-    new_group::NewGroupPrediction = NewGroupPrediction(θ_new, y_new)
+    new_group = (; θ = θ_new, y = y_new)
 
     return density
 end
