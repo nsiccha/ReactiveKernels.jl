@@ -21,17 +21,22 @@ module _PPFix
         dham_dpos = dpot_dpos
         dham_dmom = dkin_dmom
     end
-    @kernel leapfrog_ep!(phasepoint; stepsize) = begin
-        @. phasepoint.mom -= stepsize * phasepoint.dham_dpos
-        @. phasepoint.pos +=       stepsize * phasepoint.dham_dmom
+    # the FINAL ccb35d3 leapfrog!: typed half-kick / drift / half-kick (RK 08:49 acceptance discriminator)
+    @kernel leapfrog!(phasepoint; stepsize) = begin
+        @. phasepoint.mom -= oftype(stepsize, 0.5) * stepsize * phasepoint.dham_dpos
+        @. phasepoint.pos +=                       stepsize * phasepoint.dham_dmom
+        @. phasepoint.mom -= oftype(stepsize, 0.5) * stepsize * phasepoint.dham_dpos
     end
     mutable struct CountPgrad; n::Int; end
     (c::CountPgrad)(dest, pos) = (c.n += 1; dest .= 2 .* pos; sum(abs2, pos))
+    # a grad that throws on its Nth call — for executed-prefix exception soundness
+    mutable struct ThrowOnGrad; n::Int; throw_at::Int; end
+    (g::ThrowOnGrad)(dest, pos) = (g.n += 1; g.n >= g.throw_at && error("grad boom"); dest .= 2 .* pos; sum(abs2, pos))
 end
 
 using LinearAlgebra: cholesky, ldiv!, dot, logdet, Cholesky, I, PosDefException
 
-_pp_pf() = RK._prepare_factory(_PPFix.euclidean_ep, RK.kernel_registration(_PPFix.leapfrog_ep!))
+_pp_pf() = RK._prepare_factory(_PPFix.euclidean_ep, RK.kernel_registration(_PPFix.leapfrog!))
 # canonical id of a plan field by NAME; @node resolved by its gensym prefix.
 _pp_c(plan, name::Symbol) = only(s.canon for s in RK.kernel_plan_slots(plan) if s.path[end] === name)
 _pp_node(plan) = only(unique(s.canon for s in RK.kernel_plan_slots(plan) if startswith(String(s.path[end]), "##node")))
@@ -92,7 +97,7 @@ end
 
 @testset "prepared-endpoint — transition trace from MethodIR writes: grad/velocity/kin/ham, chol+@node EXCLUDED (RK 08:06/08:10/08:13)" begin
     pf = _pp_pf(); plan = RK.kernel_prepared_plan(pf)
-    tr = RK.prepared_transition_trace(plan, RK.method_irs(_PPFix.leapfrog_ep!)[1])   # PRODUCTION from leaf writes
+    tr = RK.prepared_transition_trace(plan, RK.method_irs(_PPFix.leapfrog!)[1])   # PRODUCTION from leaf writes
     Rids = RK.selected_trace_recipes(tr)                       # read-only accessor (RK 08:13; no type introspection)
     @test RK.selected_trace_key(tr) === RK.kernel_plan_key(plan)
     prod = Dict(c => r for (c, r) in RK.kernel_plan_producer(plan))
@@ -122,7 +127,7 @@ end
         ow, sh = _pp_construct(pf, plan, _pp_values(plan, T, d, cp))
         RK.compile_prepared_initialization(pf, typeof(ow), typeof(sh))(ow, sh, hs)
         @test cp.n == 1
-        warm = RK.compile_prepared_schedule(pf, typeof(ow), typeof(sh), RK.method_irs(_PPFix.leapfrog_ep!)[1])
+        warm = RK.compile_prepared_schedule(pf, typeof(ow), typeof(sh), RK.method_irs(_PPFix.leapfrog!)[1])
         @test warm(ow, sh, hs) === ow                          # returns the owned object (no tuple alloc)
         chol0 = _pp_rd(plan, ow, sh, _pp_c(plan, :chol_metric)); node0 = _pp_rd(plan, ow, sh, _pp_node(plan))
         n0 = cp.n
@@ -142,7 +147,7 @@ end
     cp = _PPFix.CountPgrad(0)
     ow, sh = _pp_construct(pf, plan, _pp_values(plan, Float64, d, cp))
     init = RK.compile_prepared_initialization(pf, typeof(ow), typeof(sh))
-    leaf = RK.method_irs(_PPFix.leapfrog_ep!)[1]
+    leaf = RK.method_irs(_PPFix.leapfrog!)[1]
     warm = RK.compile_prepared_schedule(pf, typeof(ow), typeof(sh), leaf)
     init(ow, sh, hs); ham_clean = _pp_rd(plan, ow, sh, _pp_c(plan, :ham))
     trace_clean = RK.selected_trace_recipes(RK.prepared_transition_trace(plan, leaf))
@@ -153,7 +158,7 @@ end
         ow2, sh2 = _pp_construct(pf, plan, _pp_values(plan, Float64, d, _PPFix.CountPgrad(0)))
         init(ow2, sh2, hs)                                     # already-captured executor — no live-graph read
         @test _pp_rd(plan, ow2, sh2, _pp_c(plan, :ham)) ≈ ham_clean            # identical math
-        tr2 = RK.prepared_transition_trace(plan, RK.method_irs(_PPFix.leapfrog_ep!)[1])
+        tr2 = RK.prepared_transition_trace(plan, RK.method_irs(_PPFix.leapfrog!)[1])
         @test RK.selected_trace_recipes(tr2) == trace_clean   # identical trace (plan-derived, not graph)
     finally
         append!(g.recipes, saved_recipes); merge!(g.producers, saved_producers)
@@ -196,10 +201,107 @@ end
         @test RK._canon_slot(fwd, Val(RK.kernel_plan_field(plan, cham)[2])) ≈
               RK._canon_slot(ow,  Val(RK.kernel_plan_field(plan, cham)[2]))   # ham transferred
         # EXECUTE the child against the SAME shared authority `sh` (fixed metric) — proves shared wiring:
-        warm = RK.compile_prepared_schedule(pf, typeof(fwd), typeof(sh), RK.method_irs(_PPFix.leapfrog_ep!)[1])
+        warm = RK.compile_prepared_schedule(pf, typeof(fwd), typeof(sh), RK.method_irs(_PPFix.leapfrog!)[1])
         @test warm(fwd, sh, hs) === fwd                       # child recompute returns the child owned obj
         warm(fwd, sh, hs)
         @test (@allocated warm(fwd, sh, hs)) == 0             # child post-write recompute 0-B over the shared chol
         @test _pp_rd(plan, fwd, sh, cham) ≈ _pp_ref(T, d).ham # child recomputes correct ham via shared chol
     end
+end
+
+# ---- consume the REAL ccb35d3 benchmark fixture (RK 08:59: the positive receipt must be non-vacuous) ----
+module _FixLF
+    include(joinpath(@__DIR__, "..", "benchmark", "nuts_kernel_authoring_fixture.jl"))
+end
+const _FIXLF = _FixLF.leapfrog!
+
+@testset "executable leapfrog — REAL ccb35d3 fixture leapfrog! composed with prepared recompute (RK 08:42/08:45/08:51/08:59)" begin
+    pf = RK._prepare_factory(_PPFix.euclidean_ep, RK.kernel_registration(_FIXLF)); plan = RK.kernel_prepared_plan(pf)
+    hs = RK.kernel_prepared_handles(pf)
+    leaf = RK.method_irs(_FIXLF)[1]
+    @test length(RK._exec_place_writes(leaf)) == 3               # half-kick / drift / half-kick
+    # TIE (non-vacuous): the phasepoint-receipt _PPFix.leapfrog! is byte-identical in WRITE STRUCTURE to the
+    # real fixture leapfrog! — same targets/order, so the whole receipt is anchored to ccb35d3.
+    ppw = RK._exec_place_writes(RK.method_irs(_PPFix.leapfrog!)[1])
+    @test length(ppw) == length(RK._exec_place_writes(leaf))
+    @test [w.target for w in ppw] == [w.target for w in RK._exec_place_writes(leaf)]
+    for T in (Float64, Float32)
+        d = 3; cp = _PPFix.CountPgrad(0)
+        ow, sh = _pp_construct(pf, plan, _pp_values(plan, T, d, cp))
+        RK.compile_prepared_initialization(pf, typeof(ow), typeof(sh))(ow, sh, hs)   # cold init (one pgrad)
+        @test cp.n == 1
+        lf = RK.compile_leapfrog(pf, typeof(ow), typeof(sh), leaf)
+        pos0 = copy(_pp_rd(plan, ow, sh, _pp_c(plan, :pos))); mom0 = copy(_pp_rd(plan, ow, sh, _pp_c(plan, :mom)))
+        h = T(0.1); n0 = cp.n
+        @test lf(ow, sh, hs, (stepsize = h,)) === ow             # !!-style: returns owned
+        @test cp.n == n0 + 1                                     # EXACTLY one pgrad per actual leaf
+        # ANALYTIC values (Gaussian pot=|pos|^2, grad=2pos, metric M): one leapfrog step in closed form
+        M = Matrix{T}(I(d)) .+ T(0.5)
+        mom_h = mom0 .- h .* pos0
+        pos_a = pos0 .+ h .* (M \ mom_h)
+        mom_a = mom_h .- h .* pos_a
+        @test _pp_rd(plan, ow, sh, _pp_c(plan, :pos)) ≈ pos_a
+        @test _pp_rd(plan, ow, sh, _pp_c(plan, :mom)) ≈ mom_a
+        # runtime masks: gradient (mom/pos/dpot/pot) current; kinetic/ham PHYSICALLY DIRTY (RK 08:51)
+        @test _pp_cur(plan, ow, sh, _pp_c(plan, :mom)) && _pp_cur(plan, ow, sh, _pp_c(plan, :pos))
+        @test _pp_cur(plan, ow, sh, _pp_c(plan, :dpot_dpos)) && _pp_cur(plan, ow, sh, _pp_c(plan, :pot))
+        @test !_pp_cur(plan, ow, sh, _pp_c(plan, :dkin_dmom))
+        @test !_pp_cur(plan, ow, sh, _pp_c(plan, :kin)) && !_pp_cur(plan, ow, sh, _pp_c(plan, :ham))
+        # NUMERICAL reversibility: leapfrog(h) then leapfrog(-h) returns to start
+        lf(ow, sh, hs, (stepsize = -h,))
+        @test _pp_rd(plan, ow, sh, _pp_c(plan, :pos)) ≈ pos0
+        @test _pp_rd(plan, ow, sh, _pp_c(plan, :mom)) ≈ mom0
+        # function-barrier warmed exact 0-B + @inferred
+        cp2 = _PPFix.CountPgrad(0); o2, s2 = _pp_construct(pf, plan, _pp_values(plan, T, d, cp2))
+        RK.compile_prepared_initialization(pf, typeof(o2), typeof(s2))(o2, s2, hs)
+        lf2 = RK.compile_leapfrog(pf, typeof(o2), typeof(s2), leaf)
+        kw = (stepsize = h,); lf2(o2, s2, hs, kw); lf2(o2, s2, hs, kw)
+        @test (@allocated lf2(o2, s2, hs, kw)) == 0
+        Test.@inferred lf2(o2, s2, hs, kw)
+    end
+    # CONTROLLED energy-error behavior: |Δham| stays small over a short trajectory (the HMC gate owns the
+    # stronger epsilon-scaling law). Recompute ham via the full pass each step.
+    d = 3; cp = _PPFix.CountPgrad(0); ow, sh = _pp_construct(pf, plan, _pp_values(plan, Float64, d, cp))
+    init = RK.compile_prepared_initialization(pf, typeof(ow), typeof(sh)); init(ow, sh, hs)
+    lf = RK.compile_leapfrog(pf, typeof(ow), typeof(sh), leaf)
+    ham0 = _pp_rd(plan, ow, sh, _pp_c(plan, :ham))
+    for _ in 1:20; lf(ow, sh, hs, (stepsize = 0.05,)); init(ow, sh, hs); end
+    @test abs(_pp_rd(plan, ow, sh, _pp_c(plan, :ham)) - ham0) < 0.01
+end
+
+@testset "executable leapfrog — grad throw leaves prefix committed + dpot dirty; RETRY re-runs grad correctly (RK 08:59)" begin
+    pf = _pp_pf(); plan = RK.kernel_prepared_plan(pf); hs = RK.kernel_prepared_handles(pf)
+    leaf = RK.method_irs(_PPFix.leapfrog!)[1]; d = 3
+    tg = _PPFix.ThrowOnGrad(0, 2)                                # ok at init (call 1), THROWS on kick-2 (call 2)
+    ow, sh = _pp_construct(pf, plan, _pp_values(plan, Float64, d, tg))
+    RK.compile_prepared_initialization(pf, typeof(ow), typeof(sh))(ow, sh, hs)     # grad call #1
+    lf = RK.compile_leapfrog(pf, typeof(ow), typeof(sh), leaf)
+    @test_throws ErrorException lf(ow, sh, hs, (stepsize = 0.1,))                  # grad call #2 THROWS mid-leaf
+    @test _pp_cur(plan, ow, sh, _pp_c(plan, :mom)) && _pp_cur(plan, ow, sh, _pp_c(plan, :pos))  # prefix committed
+    @test !_pp_cur(plan, ow, sh, _pp_c(plan, :dpot_dpos))        # grad output DIRTY — retry cannot see it blessed
+    tg.throw_at = 999                                           # stop throwing → RETRY
+    lf(ow, sh, hs, (stepsize = 0.1,))                           # re-executes the grad (call #3)
+    @test _pp_cur(plan, ow, sh, _pp_c(plan, :dpot_dpos))        # grad output now CURRENT
+    @test _pp_rd(plan, ow, sh, _pp_c(plan, :dpot_dpos)) ≈ 2 .* _pp_rd(plan, ow, sh, _pp_c(plan, :pos))  # correct
+end
+
+@testset "executable leapfrog — authored qualified-slot alias rebind is REJECTED (RK 08:55/08:59)" begin
+    # a synthetic QUALIFIED mutable alias `Ops.oftype` (Ops initially Base, then a module with a different
+    # oftype). No Base mutation — only the module-local alias binding moves. The def-time snapshot check must
+    # reject the emission once the authored qualifier resolves away from the captured registration.
+    modx = Module(:LFQ)
+    Core.eval(modx, :(using ReactiveKernels, LinearAlgebra))
+    Core.eval(modx, :(Ops = Base))
+    Core.eval(modx, :(@kernel leapfrog!(phasepoint; stepsize) = begin
+        @. phasepoint.mom -= Ops.oftype(stepsize, 0.5) * stepsize * phasepoint.dham_dpos
+        @. phasepoint.pos +=                            stepsize * phasepoint.dham_dmom
+        @. phasepoint.mom -= Ops.oftype(stepsize, 0.5) * stepsize * phasepoint.dham_dpos
+    end))
+    leafq = RK.method_irs(modx.leapfrog!)[1]
+    pf = _pp_pf(); plan = RK.kernel_prepared_plan(pf); d = 3
+    ow, sh = _pp_construct(pf, plan, _pp_values(plan, Float64, d, _PPFix.CountPgrad(0)))
+    @test RK.compile_leapfrog(pf, typeof(ow), typeof(sh), leafq) isa Function      # BEFORE rebind: fine
+    Core.eval(modx, :(module Evil; oftype(a, b) = error("evil"); end))
+    Core.eval(modx, :(Ops = Evil))                                                 # move the authored qualifier
+    @test_throws RK._LLowerReject RK.compile_leapfrog(pf, typeof(ow), typeof(sh), leafq)
 end
