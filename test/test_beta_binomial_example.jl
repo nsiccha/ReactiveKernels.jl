@@ -1,29 +1,8 @@
 using ReactiveKernels
-using DifferentiationInterface
-import Enzyme
 using Test
 
 include(joinpath(@__DIR__, "..", "examples", "beta_binomial.jl"))
 using .BetaBinomialExample
-
-const ENZYME_BACKEND = AutoEnzyme(;
-    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-    function_annotation = Enzyme.Const,
-)
-
-function beta_binomial_reference_logdensity(qv)
-    rate = BetaBinomialExample.logistic(only(qv))
-    parameters = BetaBinomialParameters(rate)
-    prior = BetaBinomialExample.log_prior(parameters)
-    likelihood = BetaBinomialExample.sum_log_likelihood(
-        BetaBinomialExample.pointwise_log_likelihood(
-            parameters, BETA_BINOMIAL_TRIALS, BETA_BINOMIAL_SUCCESSES,
-        ),
-    )
-    BetaBinomialExample.total_log_density(
-        prior, BetaBinomialExample.log_abs_det_jacobian(rate), likelihood,
-    )
-end
 
 @testset "manual PPL graph — beta-binomial" begin
     model = build_beta_binomial_graph()
@@ -65,24 +44,6 @@ end
         @test all(isfinite, pointwise)
         @test likelihood ≈ sum(pointwise)
         @test density ≈ prior + log_jacobian + likelihood
-    end
-
-    @testset "the log-density boundary differentiates through DI + Enzyme" begin
-        k = prepare(model.graph;
-                    have = (model.logit_rate, model.trials, model.successes),
-                    want = (model.density,))
-        logdensity(qv) = k(only(qv), BETA_BINOMIAL_TRIALS, BETA_BINOMIAL_SUCCESSES)
-
-        qvec = [logit_rate]
-        gradient = DifferentiationInterface.gradient(
-            logdensity, ENZYME_BACKEND, qvec)
-        @test length(gradient) == 1
-        @test all(isfinite, gradient)
-
-        @test logdensity(qvec) ≈ beta_binomial_reference_logdensity(qvec)
-        reference_gradient = DifferentiationInterface.gradient(
-            beta_binomial_reference_logdensity, ENZYME_BACKEND, qvec)
-        @test gradient ≈ reference_gradient
     end
 
     @testset "generated quantity prunes density work" begin

@@ -107,28 +107,6 @@ constrain_kernel = prepare(model;
 parameters = constrain_kernel(q)
 ```
 
-The numeric graph ports are typed at a `Real` boundary, while constrained
-parameters and predictions retain their concrete scalar type. The prepared
-kernel therefore specializes on ordinary `Float64` inputs and also
-differentiates cleanly through reverse-mode AD (`DifferentiationInterface` with
-the Enzyme backend):
-
-```julia
-using DifferentiationInterface
-import Enzyme
-
-enzyme_backend = AutoEnzyme(;
-    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-    function_annotation = Enzyme.Const,
-)
-
-density_only = prepare(model;
-    have = (:unconstrained, :predictors, :responses),
-    want = :density)
-logdensity(qv) = density_only(Tuple(qv), predictors, responses)
-gradient = DifferentiationInterface.gradient(logdensity, enzyme_backend, collect(q))
-```
-
 Generated quantities can start at an already-constrained boundary. In this
 query, planning removes the unconstrained transform, Jacobian, prior,
 likelihood reduction, and total-density recipes:

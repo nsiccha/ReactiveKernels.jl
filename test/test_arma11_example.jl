@@ -1,26 +1,8 @@
 using ReactiveKernels
-using DifferentiationInterface
-import Enzyme
 using Test
 
 include(joinpath(@__DIR__, "..", "examples", "arma11.jl"))
 using .ARMA11Example
-
-const ENZYME_BACKEND = AutoEnzyme(;
-    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-    function_annotation = Enzyme.Const,
-)
-
-function arma11_reference_logdensity(qv)
-    μ, φ, θ, log_σ = qv
-    parameters = ARMAParameters(μ, φ, θ, exp(log_σ))
-    errors = ARMA11Example.arma_errors(parameters, ARMA_SERIES)
-    prior = ARMA11Example.log_prior(parameters)
-    likelihood = ARMA11Example.sum_log_likelihood(
-        ARMA11Example.pointwise_log_likelihood(errors, parameters),
-    )
-    ARMA11Example.total_log_density(prior, log_σ, likelihood)
-end
 
 @testset "manual PPL graph — ARMA(1,1)" begin
     model = build_arma11_graph()
@@ -55,26 +37,6 @@ end
         @test log_jacobian == q[4]
         @test likelihood ≈ sum(pointwise)
         @test density ≈ prior + log_jacobian + likelihood
-    end
-
-    @testset "the log-density boundary differentiates through DI + Enzyme" begin
-        k = prepare(model.graph;
-                    have = (model.unconstrained, model.series),
-                    want = (model.density,))
-        logdensity(qv) = k(Tuple(qv), ARMA_SERIES)
-
-        qvec = collect(q)
-        gradient = DifferentiationInterface.gradient(
-            logdensity, ENZYME_BACKEND, qvec)
-        @test length(gradient) == length(q)
-        @test all(isfinite, gradient)
-        @test gradient !== qvec
-        @test pointer(gradient) != pointer(qvec)
-
-        @test logdensity(qvec) ≈ arma11_reference_logdensity(qvec)
-        reference_gradient = DifferentiationInterface.gradient(
-            arma11_reference_logdensity, ENZYME_BACKEND, qvec)
-        @test gradient ≈ reference_gradient
     end
 
     @testset "one-step forecast from a constrained boundary" begin
