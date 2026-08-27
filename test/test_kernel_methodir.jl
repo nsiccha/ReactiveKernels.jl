@@ -599,6 +599,16 @@ end
     @test dok(mkpure(Base.:+), (Complex{Float64}, Complex{Float64}))
     @test !dok(mkpure(Base.:+), (Rational{_DomEvil.UInt2}, Rational{_DomEvil.UInt2}))
     @test !dok(mkpure(Base.:+), (Rational{BigInt}, Rational{BigInt}))   # BigInt is not a primitive leaf
+    # unary transcendentals (RK 14:35 / POC G3): exp/log/sqrt admitted SCALAR-only (Real domain), so a
+    # single-application `current = exp(log_current)` initializer becomes an admitted BARE :assign recipe.
+    for f in (Base.exp, Base.log, Base.sqrt)
+        @test dok(mkpure(f), (Float64,)) && dok(mkpure(f), (Float32,)) && dok(mkpure(f), (Int,))
+        @test RK._recipe_bare_op_ok(f)                                  # admissible as a bare recipe op
+        @test RK.kernel_recipe_op_domain_ok(f, (Float64,))             # recipe domain admission
+        @test !dok(mkpure(f), (Vector{Float64},))                      # NOT over arrays (matrix-exp is different)
+        @test !dok(mkpure(f), (_DomEvil.Imm,))                          # user numeric still rejects
+        @test !dok(mkpure(f), (Float64, Float64))                       # unary only
+    end
 end
 
 @testset "specialization-domain — PER-primitive effect contract: final accepts + custom rejects (RK 06:37)" begin

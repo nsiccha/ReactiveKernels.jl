@@ -867,6 +867,7 @@ _kernel_primitive_effect(@nospecialize(v)) =
 const _KERNEL_PURE_PRIMS = (Base.:+, Base.:-, Base.:*, Base.:/, Base.:\, Base.:^, Base.:%,
           Base.:(==), Base.:(!=), Base.:<, Base.:>, Base.:<=, Base.:>=, Base.:!, Base.:&, Base.:|, Base.xor,
           Base.zero, Base.one, Base.oftype, Base.isnothing, Base.length, Base.:(:),
+          Base.exp, Base.log, Base.sqrt,          # unary Real-domain transcendentals (pure, effect-free)
           LogExpFunctions.logaddexp)
 # EXACT-IDENTITY VALUE test (`===` scan over the immutable tuple) — used at capture (definition-time
 # snapshot) AND in `kernel_rebound` to confirm the current binding is STILL an exact registered pure
@@ -930,6 +931,10 @@ function _kernel_pure_callee_domain_ok(@nospecialize(f), argtypes)
     f === Base.:(:)     && return all(_kernel_dom_int_scalar, argtypes)            # Colon: integer numeric
     f === Base.oftype   && return length(argtypes) == 2 && all(_kernel_dom_num_scalar, argtypes)
     (f === Base.zero || f === Base.one) && return length(argtypes) == 1 && _kernel_dom_num_value(argtypes[1])
+    # unary transcendentals (RK 14:35 / POC G3): SCALAR-only Real domain — a single-application `exp/log/sqrt`
+    # of a numeric scalar leaf is pure and 0-B; NOT admitted over arrays (matrix `exp` is different semantics).
+    (f === Base.exp || f === Base.log || f === Base.sqrt) &&
+        return length(argtypes) == 1 && _kernel_dom_num_scalar(argtypes[1])
     # arithmetic / comparison / logical / logaddexp: numeric leaves OR numeric arrays (broadcast eltype).
     all(_kernel_dom_num_value, argtypes)
 end
