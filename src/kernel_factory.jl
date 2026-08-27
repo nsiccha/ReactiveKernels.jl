@@ -1794,20 +1794,113 @@ end
 # IDENTITY GATE (RK 12:37/12:39): the KernelObject keeps the OWNER `nuts_state` Token (needed for subject-
 # method MethodIds), and the Handles separately carry the exact compiled public Mode-2 `nuts!!` `RootToken`
 # as their FIRST type parameter (POC compiles/validates the real `nuts!!` MethodIR against it and hands it
-# back to construction). So a sampler is `KernelObject{OwnerToken, Frame, _NutsHandles{RootToken,R,S}}` and
+# back to construction). A legacy sampler is `KernelObject{OwnerToken,Frame,_NutsHandles{...,
+# _UnsealedNutsCertificate}}`; the production builder instead retains the compiler-derived zero-field
+# `_NutsCertificate` plus the exact frame provenance in those handles.
 # OwnerToken need NOT equal RootToken. Dispatch is the Mode-2 SKELETON CALL below, admitted ONLY when the
 # skeleton's own Token === the handle `RootToken` — a pure-type gate, no name special-case. An unrelated
 # Mode-2 skeleton has NO method and is rejected.
-struct _NutsHandles{RootToken,Root,Scratch}
+"""Zero-field compiler certificate retained by a sealed production NUTS sampler.
+
+Every parameter is derived while compiling the real native root.  In particular, `ProgramT` is the
+actual immutable `_NativeProgram` consumed by that root; neither an adapter nor a benchmark supplies
+any of these facts.  `RootT`/`ScratchT`/`FrameT` make detached evidence fail before it can be observed.
+"""
+struct _NutsCertificate{Mode,OwnerToken,RootToken,PlanT,PlanKey,ProgramT,ControlFingerprint,
+                        SelectedRecipes,Roles,Integrator,RootT,ScratchT,FrameT} end
+struct _NutsControlFingerprint{ProgramT,RootMid,NodeCount} end
+struct _UnsealedNutsCertificate end
+
+function _nuts_certificate_parts(::Type{<:_NutsCertificate{Mode,OwnerToken,RootToken,PlanT,
+        PlanKey,ProgramT,ControlFingerprint,SelectedRecipes,Roles,Integrator,RootT,ScratchT,
+        FrameT}}) where {Mode,OwnerToken,RootToken,PlanT,PlanKey,ProgramT,ControlFingerprint,
+                        SelectedRecipes,Roles,Integrator,RootT,ScratchT,FrameT}
+    (mode=Mode, owner=OwnerToken, root_token=RootToken, plan=PlanT, plan_key=PlanKey,
+     program=ProgramT, control=ControlFingerprint, recipes=SelectedRecipes, roles=Roles,
+     integrator=Integrator, root_type=RootT, scratch_type=ScratchT, frame_type=FrameT)
+end
+_nuts_certificate_parts(c::_NutsCertificate) = _nuts_certificate_parts(typeof(c))
+
+struct _NutsHandles{RootToken,Root,Scratch,Frame,Certificate}
     root::Root
     scratch::Scratch
+    frame::Frame
+    certificate::Certificate
 end
-_NutsHandles(::Val{RootToken}, root::Root, scratch::Scratch) where {RootToken,Root,Scratch} =
-    _NutsHandles{RootToken,Root,Scratch}(root, scratch)
+_NutsHandles(::Val{RootToken}, root::Root, scratch::Scratch, frame::Frame,
+             certificate::Certificate) where {RootToken,Root,Scratch,Frame,Certificate} =
+    _NutsHandles{RootToken,Root,Scratch,Frame,Certificate}(root, scratch, frame, certificate)
 nuts_handles_root(h::_NutsHandles) = getfield(h, :root)
 nuts_handles_scratch(h::_NutsHandles) = getfield(h, :scratch)
 nuts_handles_root_token(::_NutsHandles{RootToken}) where {RootToken} = RootToken
 nuts_sampler_frame(k::KernelObject) = getfield(k, :state)
+
+# The one seal traversal.  All public evidence accessors below start from the concrete KernelObject and
+# traverse its own handles; no root/frame/metric/counter argument can be coordinated alongside it.  The
+# frame identity check is deliberately a VALUE identity check, not merely a same-type check.
+function _nuts_sealed_handles(k::K) where {K<:KernelObject}
+    isconcretetype(K) || throw(ArgumentError("sealed NUTS evidence requires a concrete KernelObject"))
+    h = getfield(k, :handles)
+    h isa _NutsHandles || throw(ArgumentError("KernelObject does not carry NUTS handles"))
+    c = getfield(h, :certificate)
+    c isa _NutsCertificate || throw(ArgumentError(
+        "legacy/control NUTS sampler is explicitly unsealed; compile native production evidence first"))
+    p = _nuts_certificate_parts(c)
+    p.mode === :production || throw(ArgumentError(
+        "unsupported sealed NUTS mode $(p.mode); instrumented emission has not been implemented"))
+    p.owner === kernel_token(k) || throw(ArgumentError("sealed NUTS owner-token mismatch"))
+    p.root_token === nuts_handles_root_token(h) || throw(ArgumentError("sealed NUTS root-token mismatch"))
+    getfield(h, :frame) === getfield(k, :state) || throw(ArgumentError(
+        "sealed NUTS frame provenance is detached from the KernelObject state"))
+    typeof(getfield(h, :frame)) === p.frame_type || throw(ArgumentError("sealed NUTS frame-type mismatch"))
+    typeof(getfield(h, :root)) === p.root_type || throw(ArgumentError("sealed NUTS root-type mismatch"))
+    typeof(getfield(h, :scratch)) === p.scratch_type || throw(ArgumentError("sealed NUTS scratch-type mismatch"))
+    p.plan <: _KernelPlan || throw(ArgumentError("sealed NUTS certificate carries no concrete Plan type"))
+    p.plan.parameters[1] === p.plan_key || throw(ArgumentError("sealed NUTS Plan type/key mismatch"))
+    p.program <: _NativeProgram || throw(ArgumentError(
+        "sealed NUTS certificate must carry the actual native Program type"))
+    np = _native_program_parts(p.program)
+    np.owner === p.owner || throw(ArgumentError("sealed NUTS Program/owner mismatch"))
+    np.plan === p.plan || throw(ArgumentError("sealed NUTS Program/Plan mismatch"))
+    _native_root_program(typeof(getfield(h, :root))) === p.program || throw(ArgumentError(
+        "sealed NUTS root does not execute the certified Program"))
+    p.control === _NutsControlFingerprint{p.program,np.root,_native_program_node_count(p.program)} ||
+        throw(ArgumentError("sealed NUTS control fingerprint mismatch"))
+    p.recipes === p.plan_key[5] || throw(ArgumentError("sealed NUTS selected-recipe mismatch"))
+    expected_roles = Tuple((t[1], t[2], t[3], t[4]) for t in p.plan_key[2])
+    p.roles === expected_roles || throw(ArgumentError("sealed NUTS physical-role mismatch"))
+    prepared_callable_token(nuts_frame_step(getfield(h, :frame))) === p.integrator ||
+        throw(ArgumentError("sealed NUTS integrator/frame-binding mismatch"))
+    h
+end
+
+nuts_sealed_certificate(k::KernelObject) = getfield(_nuts_sealed_handles(k), :certificate)
+nuts_sealed_root(k::KernelObject) = getfield(_nuts_sealed_handles(k), :root)
+nuts_sealed_scratch(k::KernelObject) = getfield(_nuts_sealed_handles(k), :scratch)
+nuts_sealed_frame(k::KernelObject) = getfield(_nuts_sealed_handles(k), :frame)
+nuts_sealed_shared(k::KernelObject) = getfield(nuts_sealed_frame(k), :shared)
+
+function _nuts_sealed_shared_slot_expr(K, name::Symbol)
+    H = K.parameters[3]
+    (H isa DataType && H <: _NutsHandles) || return :(_nuts_sealed_handles(k); nothing)
+    Cert = H.parameters[5]
+    (Cert isa DataType && Cert <: _NutsCertificate) || return :(_nuts_sealed_handles(k); nothing)
+    PlanKey = Cert.parameters[5]
+    sig = PlanKey[2]
+    i = findfirst(t -> t[1] == (name,), sig)
+    i === nothing && return :(throw(ArgumentError($("sealed NUTS plan has no `$name` slot"))))
+    sig[i][3] === :shared || return :(throw(ArgumentError(
+        $("sealed NUTS `$name` slot is not shared authority"))))
+    slot = sig[i][4]
+    :(begin
+        h = _nuts_sealed_handles(k)
+        _canon_slot(getfield(getfield(h, :frame), :shared), Val($slot))
+    end)
+end
+@generated nuts_sealed_metric(k::K) where {K<:KernelObject} =
+    _nuts_sealed_shared_slot_expr(K, :metric)
+@generated nuts_sealed_chol_metric(k::K) where {K<:KernelObject} =
+    _nuts_sealed_shared_slot_expr(K, :chol_metric)
 
 # Prepare the sampler FRAME from source inputs (RK 12:26): build the frame, run POC's full six-handle
 # INITIALIZATION on `frame.init` exactly once, and SEED the children — returning the ready `_NutsFrame`
@@ -1820,21 +1913,35 @@ function _prepare_nuts_frame(pf::_PreparedFactory, endpoint_values, max_depth::I
     frame
 end
 
-# Build the FINAL public sampler in one shot (RK 12:32/12:39): a concrete `KernelObject{OwnerToken, Frame,
-# _NutsHandles{RootToken,Root,Scratch}}` over the prepared frame + POC's compiled root!+scratch. `OwnerToken`
+# Build an explicitly UNSEALED legacy sampler in one shot: a concrete `KernelObject` over the prepared frame
+# plus compiled root!+scratch. It remains for control-path regression tests. The production builder below uses
+# `_sealed_nuts_sampler` with the native compiler certificate. `OwnerToken`
 # is the authoring `nuts_state` owner Token (kept for subject-method MethodIds); `RootToken` is the exact
 # Mode-2 `nuts!!` skeleton Token POC compiled the root against — carried in the Handles so the skeleton-call
 # gate below admits ONLY that skeleton. Handle types are concrete from the start; nothing untyped escapes.
 nuts_sampler(::Val{OwnerToken}, ::Val{RootToken}, frame::_NutsFrame, root, scratch) where {OwnerToken,RootToken} =
-    KernelObject{OwnerToken,typeof(frame),_NutsHandles{RootToken,typeof(root),typeof(scratch)}}(
-        frame, _NutsHandles(Val(RootToken), root, scratch))
+    KernelObject{OwnerToken,typeof(frame),
+                 _NutsHandles{RootToken,typeof(root),typeof(scratch),typeof(frame),_UnsealedNutsCertificate}}(
+        frame, _NutsHandles(Val(RootToken), root, scratch, frame, _UnsealedNutsCertificate()))
+
+function _sealed_nuts_sampler(::Val{OwnerToken}, ::Val{RootToken}, frame::_NutsFrame, root, scratch,
+        certificate::_NutsCertificate{:production,OwnerToken,RootToken}) where {OwnerToken,RootToken}
+    p = _nuts_certificate_parts(certificate)
+    typeof(frame) === p.frame_type || throw(ArgumentError("certificate/frame type mismatch"))
+    typeof(root) === p.root_type || throw(ArgumentError("certificate/root type mismatch"))
+    typeof(scratch) === p.scratch_type || throw(ArgumentError("certificate/scratch type mismatch"))
+    H = _NutsHandles{RootToken,typeof(root),typeof(scratch),typeof(frame),typeof(certificate)}
+    KernelObject{OwnerToken,typeof(frame),H}(
+        frame, _NutsHandles(Val(RootToken), root, scratch, frame, certificate))
+end
 
 # --- runnable prepare→compile→attach CORE (RK 13:18 ergonomic gate, fork-free half) ------------------------
 #
 # Given a prepared endpoint factory `pf`, the endpoint slot values, the three authored skeletons (the
 # `nuts_state` construction owner, the `refresh_momentum!!` source, and the public `nuts!!` transition), and
 # the frozen config, this does the WHOLE internal chain — prepare frame (build + POC six-handle init +
-# seed) → POC `compile_nuts` → `nuts_sampler` — and returns the FINAL concrete callable `KernelObject`, on
+# seed) → registry-free `compile_nuts_native` → sealed sampler — and returns the FINAL concrete callable
+# `KernelObject`, on
 # which `nuts!!(sampler; rng)` runs end-to-end. NO manual attach; OwnerToken = the `nuts_state` owner Token,
 # RootToken = the compiled public `nuts!!` Token (`C.RootToken`), distinct and both preserved (RK 12:39).
 #
@@ -1848,8 +1955,9 @@ function _build_nuts_sampler(pf::_PreparedFactory, endpoint_values, nuts_state_s
                              refresh_skel::_Mode2KernelSkeleton, nuts_skel::_Mode2KernelSkeleton;
                              step_f, max_depth::Int, min_dham, stats_f)
     frame = _prepare_nuts_frame(pf, endpoint_values, max_depth; step_f, stats_f, min_dham)
-    C = compile_nuts(pf, nuts_state_skel, refresh_skel, nuts_skel, frame)
-    nuts_sampler(Val(kernel_token(nuts_state_skel)), Val(C.RootToken), frame, C.root!, C.scratch)
+    C = compile_nuts_native(pf, nuts_state_skel, refresh_skel, nuts_skel, frame)
+    _sealed_nuts_sampler(Val(kernel_token(nuts_state_skel)), Val(C.RootToken), frame,
+                         C.root!, C.scratch, C.certificate)
 end
 
 # The authored `nuts!!(state; rng)` dispatch (RK 12:37/12:39 / poc contract): the Mode-2 `nuts!!` SKELETON

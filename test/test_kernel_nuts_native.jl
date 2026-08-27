@@ -231,3 +231,103 @@ end
     @test_throws RK._NativeEncodeReject RK._native_encode_program(irs2,Nothing,
         RK.kernel_token(_NativeNutsFix.nuts_state),RK.kernel_module(_NativeNutsFix.nuts_state))
 end
+
+
+@inline function _sealed_public_batch(skel, sampler, rng, ::Val{N}) where {N}
+    i=0
+    @inbounds while i<N
+        skel(sampler; rng=rng)
+        i+=1
+    end
+    nothing
+end
+function _sealed_public_alloc(skel, sampler, rng, ::Val{N}) where {N}
+    _sealed_public_batch(skel,sampler,rng,Val(N)); GC.gc()
+    @allocated _sealed_public_batch(skel,sampler,rng,Val(N))
+end
+
+@testset "native NUTS — production sampler carries one compiler-derived sealed evidence chain" begin
+    pf=_native_pf()
+    k=RK._build_nuts_sampler(pf,_native_vals(pf,Float64),_NativeNutsFix.nuts_state,
+        _NativeNutsFix.refresh_momentum!!,_NativeNutsFix.nuts!!;
+        step_f=RK.partial(_NativeNutsFix.leapfrog!;stepsize=.1),max_depth=5,
+        min_dham=-1000,stats_f=nothing)
+    cert=RK.nuts_sealed_certificate(k); cp=RK._nuts_certificate_parts(cert)
+    h=getfield(k,:handles); frame=getfield(k,:state)
+    @test fieldcount(typeof(cert)) == 0
+    @test cp.mode === :production
+    @test cp.owner === RK.kernel_token(_NativeNutsFix.nuts_state) === RK.kernel_token(k)
+    @test cp.root_token === RK.kernel_token(_NativeNutsFix.nuts!!)
+    @test cp.plan === typeof(RK.kernel_prepared_plan(pf))
+    @test cp.plan_key === RK.kernel_plan_key(RK.kernel_prepared_plan(pf))
+    @test cp.program <: RK._NativeProgram
+    @test cp.control === RK._NutsControlFingerprint{cp.program,
+        RK._native_program_parts(cp.program).root,RK._native_program_node_count(cp.program)}
+    @test cp.recipes === RK.kernel_plan_recipes(RK.kernel_prepared_plan(pf))
+    @test cp.integrator === RK.prepared_callable_token(RK.nuts_frame_step(frame))
+    @test (@inferred RK.nuts_sealed_certificate(k)) === cert
+    @test (@inferred RK.nuts_sealed_root(k)) === getfield(h,:root)
+    @test RK.nuts_sealed_scratch(k) === getfield(h,:scratch)
+    @test RK.nuts_sealed_frame(k) === frame
+    @test RK.nuts_sealed_shared(k) === getfield(frame,:shared)
+    plan=RK.kernel_prepared_plan(pf)
+    @test (@inferred RK.nuts_sealed_metric(k)) === RK._canon_slot(frame.shared,
+        RK.kernel_plan_named_slot_val(plan,Val(:metric)))
+    @test RK.nuts_sealed_chol_metric(k) === RK._canon_slot(frame.shared,
+        RK.kernel_plan_named_slot_val(plan,Val(:chol_metric)))
+
+    @test (@inferred _NativeNutsFix.nuts!!(k;rng=Random.Xoshiro(3))) === k
+    for rg in (Random.Xoshiro(8),Random.MersenneTwister(9))
+        @test _sealed_public_alloc(_NativeNutsFix.nuts!!,k,rg,Val(64)) == 0
+        @test _sealed_public_alloc(_NativeNutsFix.nuts!!,k,rg,Val(256)) == 0
+    end
+
+    # Legacy control construction is intentionally callable but cannot enter the sealed evidence path.
+    legacy_frame=_native_frame(pf,Float64,5)
+    control=RK.compile_nuts(pf,_NativeNutsFix.nuts_state,_NativeNutsFix.refresh_momentum!!,
+                            _NativeNutsFix.nuts!!,legacy_frame)
+    legacy=RK.nuts_sampler(Val(RK.kernel_token(_NativeNutsFix.nuts_state)),Val(control.RootToken),
+                           legacy_frame,control.root!,control.scratch)
+    @test _NativeNutsFix.nuts!!(legacy;rng=Random.Xoshiro(2)) === legacy
+    @test_throws ArgumentError RK.nuts_sealed_certificate(legacy)
+
+    # A coordinated adapter-shaped report is not an evidence input: only the concrete KernelObject dispatches.
+    coordinated=(sampler=k,root=RK.nuts_sealed_root(k),frame=frame,
+                 metric=RK.nuts_sealed_metric(k),certificate=cert)
+    @test_throws MethodError RK.nuts_sealed_certificate(coordinated)
+
+    # Detached root, root token, owner token, and frame/shared-metric authority each fail the one traversal.
+    RT=RK.nuts_handles_root_token(h); OT=RK.kernel_token(k)
+    badroot=Returns(nothing)
+    hr=RK._NutsHandles(Val(RT),badroot,getfield(h,:scratch),frame,cert)
+    kr=RK.KernelObject{OT,typeof(frame),typeof(hr)}(frame,hr)
+    @test_throws ArgumentError RK.nuts_sealed_root(kr)
+    ht=RK._NutsHandles(Val(:detached_root_token),getfield(h,:root),getfield(h,:scratch),frame,cert)
+    kt=RK.KernelObject{OT,typeof(frame),typeof(ht)}(frame,ht)
+    @test_throws ArgumentError RK.nuts_sealed_certificate(kt)
+    ko=RK.KernelObject{:detached_owner_token,typeof(frame),typeof(h)}(frame,h)
+    @test_throws ArgumentError RK.nuts_sealed_certificate(ko)
+    frame2=_native_frame(pf,Float64,5)
+    kf=RK.KernelObject{OT,typeof(frame2),typeof(h)}(frame2,h)
+    @test_throws ArgumentError RK.nuts_sealed_metric(kf)
+    good_step=getfield(frame,:step_f)
+    wrong_step=RK._prepare_callable(:step_f,
+        RK.partial(_NativeNutsFix2.leapfrog!;stepsize=.1))
+    setfield!(frame,:step_f,wrong_step)
+    @test_throws ArgumentError RK.nuts_sealed_certificate(k)
+    setfield!(frame,:step_f,good_step)
+    @test RK.nuts_sealed_certificate(k) === cert
+
+    # Same owner/root strings cannot hide a different Plan type inside the zero-field certificate.
+    pf2=RK._prepare_factory(_NativeNutsFix2.euclidean_phasepoint,
+                            RK.kernel_registration(_NativeNutsFix2.leapfrog!))
+    plan2=RK.kernel_prepared_plan(pf2); q=typeof(cert).parameters
+    BadCert=Core.apply_type(RK._NutsCertificate,q[1],q[2],q[3],typeof(plan2),
+        RK.kernel_plan_key(plan2),q[6],q[7],q[8],q[9],q[10],q[11],q[12],q[13])
+    hc=RK._NutsHandles(Val(RT),getfield(h,:root),getfield(h,:scratch),frame,BadCert())
+    kc=RK.KernelObject{OT,typeof(frame),typeof(hc)}(frame,hc)
+    @test_throws ArgumentError RK.nuts_sealed_certificate(kc)
+
+    @test_throws ArgumentError RK._native_nuts_certificate(Val(:instrumented),pf,
+        _NativeNutsFix.nuts_state,Val(RT),getfield(h,:root),getfield(h,:scratch),frame)
+end

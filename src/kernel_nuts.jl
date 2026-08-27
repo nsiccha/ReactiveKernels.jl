@@ -140,7 +140,7 @@ end
 # A CONCRETE callable public root (RK): a local closure re-materializes its captured cfg NamedTuple + handle
 # tuple on each call (allocating under the try/catch); a concrete struct stores them in concretely-typed
 # fields so the @inline call method reads them directly and is exact 0-B, and Julia specializes it per runtime
-# rng type (root/scratch stay RNG-independent — the syntax `_NutsHandles{RootToken,Root,Scratch}` is unchanged,
+# rng type (root/scratch stay RNG-independent; handle provenance is attached later by the sampler builder,
 # `Root == typeof(this)`). Wraps the derived-and-validated refresh+step body in ONE OUTER EPOCH.
 struct _CompiledNutsRoot{Fn, Refresh, Cfg, H}
     fn::Fn

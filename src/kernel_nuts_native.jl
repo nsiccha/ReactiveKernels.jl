@@ -742,6 +742,40 @@ struct _CompiledNutsRootNative{ProgramT,Refresh,Cfg,H}
     cfg::Cfg
     handles::H
 end
+
+_native_root_program(::Type{<:_CompiledNutsRootNative{ProgramT}}) where {ProgramT} = ProgramT
+
+# Construct the zero-field seal only after the REAL native root, scratch, and frame exist.  All structural
+# facts come from the compiler-owned Plan/Program types; the caller supplies no evidence tuple.  There is no
+# instrumented arm yet, so asking for one is an explicit error rather than a production-shaped fabrication.
+function _native_nuts_certificate(::Val{:production}, pf::_PreparedFactory, skel,
+        ::Val{RootToken}, root::_CompiledNutsRootNative{ProgramT}, scratch, frame::_NutsFrame) where {
+        RootToken,ProgramT}
+    parts = _native_program_parts(ProgramT)
+    OwnerToken = kernel_token(skel)
+    parts.owner === OwnerToken || throw(ArgumentError("native certificate owner/program mismatch"))
+    plan = kernel_prepared_plan(pf)
+    PlanT = typeof(plan)
+    parts.plan === PlanT || throw(ArgumentError("native certificate plan/program mismatch"))
+    PlanKey = kernel_plan_key(plan)
+    # The integrator authority is the frame's validated prepared callable/binder, not a PlanKey tuple
+    # convention.  PlanT/PlanKey separately retain the endpoint-plan definition authority.
+    Integrator = prepared_callable_token(nuts_frame_step(frame))
+    SelectedRecipes = PlanKey[5]
+    # Full selected physical role signature, including paths and aliases.  This is intentionally redundant
+    # with PlanKey: a gate can census roles without interpreting private Key tuple positions, while exact Key
+    # identity remains separately present.
+    Roles = Tuple((t[1], t[2], t[3], t[4]) for t in PlanKey[2])
+    ControlFingerprint = _NutsControlFingerprint{ProgramT,parts.root,
+                                                 _native_program_node_count(ProgramT)}
+    Cert = _NutsCertificate{:production,OwnerToken,RootToken,PlanT,PlanKey,ProgramT,
+        ControlFingerprint,SelectedRecipes,Roles,Integrator,typeof(root),typeof(scratch),typeof(frame)}
+    Cert()
+end
+_native_nuts_certificate(::Val{:instrumented}, args...) = throw(ArgumentError(
+    "instrumented native NUTS emission is not implemented; refusing to fabricate a certificate"))
+_native_nuts_certificate(::Val{Mode}, args...) where {Mode} = throw(ArgumentError(
+    "unsupported native NUTS certificate mode `$Mode`"))
 @inline function (r::_CompiledNutsRootNative{P})(fr,::Tuple{},rng) where {P}
     _diagnostics_reset!(getfield(fr,:diag)); _nuts_invalidate_diverged!(fr)
     try
@@ -774,6 +808,7 @@ function compile_nuts_native(pf::_PreparedFactory,skel,refresh_skel,nuts_root_sk
          callee_registrations=E.registrations)
     H=kernel_prepared_handles(pf)
     root=_CompiledNutsRootNative{E.program,typeof(base.refresh),typeof(cfg),typeof(H)}(base.refresh,cfg,H)
+    certificate=_native_nuts_certificate(Val(:production),pf,skel,Val(base.RootToken),root,(),frame)
     (root! = root,scratch=(),RootToken=base.RootToken,cfg=cfg,refresh=base.refresh,program=E.program,
-     refs=E.refs,registrations=E.registrations,control=base)
+     refs=E.refs,registrations=E.registrations,control=base,certificate=certificate)
 end
