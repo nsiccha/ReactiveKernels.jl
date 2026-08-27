@@ -918,3 +918,35 @@ _kernel_factory_endpoint_plan(skel, integrator::_KernelRegistration) =
 # and mask width come from the immutable plan (`Token` phantom-types the owner definition).
 @inline _kernel_construct_owned(::Val{Token}, owned_values::Tuple) where {Token} =
     _OwnerState{Token}(map(deepcopy, owned_values))
+
+# SHARED AUTHORITY (RK 04:45 pt4): read-only-across-endpoints closure (metric / chol_metric /
+# @node(logdet)) as its OWN typed slots + validity object, held ONCE and referenced BY IDENTITY by
+# every owned endpoint (init/fwd/bwd). A metric mutation therefore invalidates chol/@node EXACTLY
+# ONCE, shared across endpoints — owned-only masks cannot express that. Same isbits mask machinery.
+mutable struct _SharedState{Token,T<:Tuple,W}
+    slots::T
+    current::NTuple{W,UInt}
+end
+_SharedState{Token}(slots::T) where {Token,T<:Tuple} =
+    (m = _owner_mask(length(slots)); _SharedState{Token,T,length(m)}(slots, m))
+shared_slots(s::_SharedState) = getfield(s, :slots)
+@inline _shared_slot(s::_SharedState, ::Val{I}) where {I} = getfield(getfield(s, :slots), I)
+shared_current_mask(s::_SharedState) = getfield(s, :current)
+@inline _shared_current(s::_SharedState, ::Val{I}) where {I} =
+    (getfield(s, :current)[_owner_word(I)] >> _owner_bit(I)) & UInt(1) == UInt(1)
+@inline function _shared_kill!(s::_SharedState, ::Val{I}) where {I}   # metric write kills its closure
+    c = getfield(s, :current); w = _owner_word(I)
+    setfield!(s, :current, Base.setindex(c, c[w] & ~(UInt(1) << _owner_bit(I)), w)); s
+end
+
+# Construct one shared-authority instance (deep-copied once; then referenced by identity).
+@inline _kernel_construct_shared(::Val{Token}, shared_values::Tuple) where {Token} =
+    _SharedState{Token}(map(deepcopy, shared_values))
+
+# A multi-endpoint GROUP: `n` DISTINCT owned endpoint states (each isolated / deep-copied), all
+# referencing the ONE shared authority object by identity. This is the concrete no-Ref shape a
+# compiled `KernelObject` holds — init/fwd/bwd owned states + one shared closure.
+function _kernel_construct_group(::Val{Token}, n::Int, owned_values::Tuple,
+                                 shared::_SharedState) where {Token}
+    (ntuple(_ -> _kernel_construct_owned(Val(Token), owned_values), n), shared)
+end

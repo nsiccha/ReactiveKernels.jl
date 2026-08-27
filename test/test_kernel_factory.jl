@@ -736,6 +736,27 @@ end
         @test_throws MethodError RKS._owner_copy_current!(small, big) # different slots/width
     end
 
+    @testset "shared authority: one identity across endpoints + owned isolation (RK pt4/5)" begin
+        metric = [1.0, 2.0]
+        shared = RKS._kernel_construct_shared(Val(:auth), (metric, 3.0))
+        endpoints, sh = RKS._kernel_construct_group(Val(:ep), 3, (0.0, [1.0, 2.0, 3.0]), shared)
+        # 3 DISTINCT owned endpoint states (init/fwd/bwd), pairwise non-alias buffers
+        @test endpoints[1] !== endpoints[2] && endpoints[2] !== endpoints[3]
+        @test RKS._owner_slot(endpoints[1], Val(2)) !== RKS._owner_slot(endpoints[2], Val(2))
+        @test RKS._owner_slot(endpoints[1], Val(2)) !== RKS._owner_slot(endpoints[3], Val(2))
+        # ALL endpoints reference the SAME shared authority object BY IDENTITY — not copied per endpoint
+        @test sh === shared
+        # a mutation of the shared authority is seen through the one shared object (recompute-once)
+        RKS.shared_slots(sh)[1][1] = 99.0
+        @test RKS._shared_slot(sh, Val(1))[1] == 99.0
+        # shared carries its OWN validity mask; killing metric's closure is ONE op across endpoints
+        @test RKS._shared_current(sh, Val(1))
+        RKS._shared_kill!(sh, Val(1))
+        @test !RKS._shared_current(sh, Val(1))
+        # the caller's shared buffer is deep-copied into the authority (isolated from the source)
+        @test RKS._shared_slot(sh, Val(1)) !== metric
+    end
+
     @testset "poc binder/plan seam accessors (RK 04:41)" begin
         integ = RKS.kernel_registration(leapfrog_ep!)
         plan = RKS._kernel_factory_endpoint_plan(phasepoint_ep, integ)
