@@ -63,4 +63,27 @@ _plate_call(k, xs, μ, logσ) = k(xs, μ, logσ)
         @test_throws ArgumentError plate(
             plate_nlogpdf; have = (:x, :μ, :logσ), want = :σ, batched = (:x,))
     end
+
+    @testset "MULTIPLE batched ports — normal_lpdf(vec, vec, scalar)" begin
+        # The canonical Stan-parity case: both the observations `x` and the
+        # per-observation means `μ` are batched (e.g. a regression mean), while
+        # the scale is shared. `exp(logσ)`/`log(σ)` must still be computed ONCE.
+        km = plate(plate_nlogpdf; have = (:x, :μ, :logσ), want = :ld,
+                   batched = (:x, :μ))
+        xs = randn(150)
+        μs = randn(150)
+        logσ = log(0.9)
+
+        @test km(xs, μs, logσ) ≈
+            sum(-0.5 * log(2π) - logσ - 0.5 * ((xs[i] - μs[i]) / exp(logσ))^2
+                for i in eachindex(xs))
+
+        body = code_expr(km).args[2].args
+        fori = findfirst(s -> s isa Expr && s.head === :for, body)
+        pre = body[1:(fori - 1)]
+        loopbody = body[fori].args[2].args
+        # The shared-scale recipe is hoisted once; both batched ports are indexed.
+        @test any(s -> occursin("__ops__[1]", string(s)), pre)
+        @test !any(s -> occursin("__ops__[1]", string(s)), loopbody)
+    end
 end
