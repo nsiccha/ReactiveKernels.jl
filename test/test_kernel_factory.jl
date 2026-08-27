@@ -1614,15 +1614,13 @@ end
                                     step_f = RKS.partial(_ErgFix.leapfrog!; stepsize = 0.1),
                                     max_depth = 3, min_dham = -1000, stats_f = _ErgFix.nuts_stats!)
         @test_throws MethodError _ErgFix.leapfrog!(k; rng = Random.Xoshiro(1))
-        # repeated same-signature constructions → identical concrete sampler type (RK 12:32/13:44 gate).
-        # BLOCKED on POC: `compile_nuts`'s `_CompiledNutsRoot` wraps a `RuntimeGeneratedFunction` whose TYPE
-        # tag is a fresh gensym per call (`##frame#879` vs `##frame#898`, distinct content hashes), so two
-        # compiles of the SAME signature yield DIFFERENT root types → different KernelObject types. Reported
-        # to POC; flip to @test once compile_nuts returns a signature-stable (memoized/non-RGF) root.
+        # repeated same-signature constructions → IDENTICAL concrete sampler type (RK 12:32/13:44 gate).
+        # POC closed the stable-type blocker at 6ec4147 (deterministic hot-emitter locals): `compile_nuts`
+        # now returns a signature-stable root, so two compiles of the SAME signature share ONE concrete type.
         k2 = RKS._build_nuts_sampler(pf, ergvals(Float64), _ErgFix.nuts_state, _ErgFix.refresh_momentum!!, _ErgFix.nuts!!;
                                      step_f = RKS.partial(_ErgFix.leapfrog!; stepsize = 0.1),
                                      max_depth = 3, min_dham = -1000, stats_f = _ErgFix.nuts_stats!)
-        @test_broken typeof(k) === typeof(k2)
+        @test typeof(k) === typeof(k2)
     end
 end
 
