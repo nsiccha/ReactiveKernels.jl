@@ -1260,6 +1260,83 @@ end
         @test RKS.diagnostics_committed_mask(dth) == UInt(0)              # committed reset-zeroed, not blessed
     end
 
+    @testset "nuts_state — concrete owned tree + full sampler FRAME (one shared authority, isolated endpoints/trees/proposals, F32/F64) (RK 08:55)" begin
+        # concrete owned TREE byte-matching the fixture: log_weight (2-vec ham sentinel) + bwd/bwd_fwd (mv) +
+        # summed_mom (trajectory), all zeroed buffers; F32/F64 preserved; DISTINCT buffers per tree
+        for (T, ham) in ((Float32, -0.5f0), (Float64, -0.5))
+            tr = RKS._nuts_tree(T[1, 2, 3], ham)
+            @test tr.log_weight == fill(oftype(ham, -Inf), 2) && eltype(tr.log_weight) === T
+            @test eltype(tr.bwd.mom) === T && tr.bwd.mom == zeros(T, 3) && tr.summed_mom.fwd == zeros(T, 3)
+            trs = RKS._nuts_trees(T[1, 2, 3], ham, 4)
+            @test length(trs) == 4 && trs[1].bwd.mom !== trs[2].bwd.mom   # per-tree isolation (distinct)
+        end
+        # TWO-PHASE full FRAME over the REAL pot_f-free SIX-recipe euclidean_ep (RK 09:00/09:02): phase 1
+        # builds init (UNEXECUTED) + one shared + UNSEEDED children; POC runs the full six-handle init on
+        # init exactly once (pgrad×1); phase 2 seeds the complete state to fwd/bwd/proposals (no recompute).
+        integ = RKS.kernel_registration(leapfrog_ep!)
+        pf = RKS._prepare_factory(euclidean_ep, integ)
+        plan = RKS.kernel_prepared_plan(pf)
+        gE = RKS.kernel_graph(euclidean_ep); cf(n) = RKS.canon_id(gE, euclidean_ep.ports[n].id)
+        ownedbufs = [RKS.kernel_plan_field(plan, cf(n))[2] for n in (:pos, :mom, :dpot_dpos, :dkin_dmom)]
+        ecmask = RKS._canon_current_mask                                       # alias
+        entry_owned = sort([RKS.kernel_plan_field(plan, c)[2] for c in RKS.kernel_plan_entry_current(plan)
+                            if RKS.kernel_plan_field(plan, c)[1] === :owned])
+        Ncanon = length(first(RKS.kernel_plan_superset(plan)))
+        function mkvals(T, pg)
+            m = T[2 0; 0 2]; d = Dict{Int,Any}()
+            for s in RKS.kernel_plan_slots(plan)
+                nm = String(s.path[1])
+                d[s.canon] =
+                    nm == "grad_f" ? pg : nm == "metric" ? m : nm == "chol_metric" ? cholesky(m) :
+                    startswith(nm, "##node") ? zero(T) :
+                    nm == "pos" ? T[1, 2] : nm == "mom" ? T[3, 4] :
+                    nm in ("dpot_dpos", "dham_dpos", "dkin_dmom", "dham_dmom") ? T[0, 0] :
+                    zero(T)                                            # pot/kin/ham scalars
+            end
+            d
+        end
+        for T in (Float32, Float64)
+            pg = CountingPgrad(0)
+            frame = RKS._construct_nuts_frame(pf, mkvals(T, pg), T[1, 2], zero(T), 10)
+            @test RKS.nuts_frame_shared(frame) isa RKS._CanonShared              # ONE shared authority
+            @test RKS.nuts_frame_ham_type(frame) === T && RKS.diagnostics_ham_type(frame.diag) === T
+            @test eltype(frame.trees[1].log_weight) === T
+            @test length(frame.trees) == 11 && length(frame.proposals) == 12     # max_depth+1 / +2
+            # phase-1: children are UNSEEDED (dirty) — NOT yet at entry_current, no pgrad ran
+            @test ecmask(frame.fwd) != RKS._owner_mask(Ncanon, entry_owned) && pg.n == 0
+            # POC executes the FULL six-handle init on init exactly once (the one destination pgrad)
+            initfn = RKS.compile_prepared_initialization(pf, typeof(frame.init), typeof(frame.shared))
+            initfn(frame.init, frame.shared, RKS.kernel_prepared_handles(pf))
+            @test pg.n == 1                                                      # pgrad total == 1
+            @test ecmask(frame.init) == RKS._owner_mask(Ncanon, entry_owned)     # init mask == entry_current
+            # phase-2: seed children — complete values+mask copied, ZERO extra pgrad/chol
+            RKS._seed_nuts_children!(frame)
+            @test pg.n == 1                                                      # no child recompute
+            for ch in (frame.fwd, frame.bwd, frame.proposals[1], frame.proposals[end])
+                @test ecmask(ch) == RKS._owner_mask(Ncanon, entry_owned)         # fwd/bwd/proposals mask==entry_current
+                for s in ownedbufs                                              # census ALL owned buffer slots
+                    @test RKS._canon_slot(ch, Val(s)) !== RKS._canon_slot(frame.init, Val(s))  # isolated
+                    @test RKS._canon_slot(ch, Val(s)) == RKS._canon_slot(frame.init, Val(s))   # complete/seeded
+                end
+            end
+            @test frame.proposals[1] !== frame.proposals[2]
+            # control true; 0-B control+diagnostics reset
+            _rc(fr) = RKS._nuts_frame_reset_control!(fr)
+            @test frame.gofwd && frame.may_sample && frame.may_continue
+            _rc(frame); @test (@allocated _rc(frame)) == 0
+        end
+        # EXCEPTION before seeding leaves NO child falsely blessed (children stay dirty)
+        frx = RKS._construct_nuts_frame(pf, mkvals(Float64, CountingPgrad(0)), [1.0, 2.0], 0.0, 3)
+        @test all(RKS._canon_current_mask(ch) != RKS._owner_mask(Ncanon, entry_owned)
+                  for ch in (frx.fwd, frx.bwd, frx.proposals[1]))              # unseeded → not falsely current
+        # TWO independent frames: DISTINCT per-sampler mutable shared authority; external grad kept by identity
+        shared_pg = CountingPgrad(0)
+        f1 = RKS._construct_nuts_frame(pf, mkvals(Float64, shared_pg), [1.0, 2.0], 0.0, 3)
+        f2 = RKS._construct_nuts_frame(pf, mkvals(Float64, shared_pg), [1.0, 2.0], 0.0, 3)
+        @test RKS.nuts_frame_shared(f1) !== RKS.nuts_frame_shared(f2)          # separate mutable authorities
+        @test f1.init !== f2.init && f1.trees[1].bwd.mom !== f2.trees[1].bwd.mom  # fully isolated
+    end
+
     @testset "nuts_state — MIXED endpoints+vectors+scalars frame: scalar 0-B, buffers direct, F32/F64 (RK 08:47/08:51)" begin
         # a representative concrete top-frame slot group (the _CanonOwnedN field ABI, NOT _OwnerState): a
         # buffer (endpoint mom), a buffer (tree), a scalar Int (n_steps), a scalar float (acceptance_rate).

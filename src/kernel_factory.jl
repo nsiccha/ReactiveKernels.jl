@@ -257,6 +257,49 @@ end
 @inline _diagnostics_root_commit!(s::_DiagnosticsStore) =
     (setfield!(s, :committed, getfield(s, :pending)); s)
 
+# --- concrete nuts_state owned TREE / FRAME construction (RK 08:55) ----------------------------------
+#
+# One owned TREE's data buffers, byte-matching the fixture `tree(phasepoint)`: `log_weight` (a 2-vector in
+# the ham type — the `oftype(ham,-Inf)` sentinel), and `bwd`/`bwd_fwd` (each `mv` = mom+dham_dmom) +
+# `summed_mom` (a `trajectory` = bwd+fwd), all zeroed buffers in `pos`'s eltype. A concrete typed NamedTuple
+# (typed fields, no Any/boxing); F32/F64 PRESERVED from pos's eltype + the ham type. Each call allocates
+# DISTINCT buffers (cold construction — per-tree isolation).
+_nuts_mv(v::AbstractVector) = (; mom = zero(v), dham_dmom = zero(v))
+_nuts_trajectory(v::AbstractVector) = (; bwd = zero(v), fwd = zero(v))
+_nuts_tree(pos::AbstractVector, ham) =
+    (; log_weight = fill(oftype(ham, -Inf), 2),
+       bwd = _nuts_mv(pos), bwd_fwd = _nuts_mv(pos), summed_mom = _nuts_trajectory(pos))
+_nuts_trees(pos::AbstractVector, ham, n::Int) = [_nuts_tree(pos, ham) for _ in 1:n]
+
+# The concrete owned SAMPLER FRAME: fixed owned endpoints (init/fwd/bwd), the tree + proposal Vectors, the
+# control scalars, the compiler-owned diagnostics store, and the ONE per-sampler shared authority every
+# endpoint references BY IDENTITY (metric/chol/@node — built once, never per-endpoint). No Ref, no Any:
+# every field is concrete/typed (F32/F64 preserved through EP/TREE/Tham); control + diagnostics scalar
+# updates and the per-transition reset are exact 0-B on the concrete mutable field ABI.
+mutable struct _NutsFrame{EP,TREE,SH,Tham}
+    init::EP              # owned endpoint (isolated buffers), refers to `shared` by identity
+    fwd::EP
+    bwd::EP
+    trees::Vector{TREE}   # max_depth+1 owned trees
+    proposals::Vector{EP} # max_depth+2 owned endpoints (isolated)
+    gofwd::Bool
+    may_sample::Bool
+    may_continue::Bool
+    diag::_DiagnosticsStore{Tham}
+    shared::SH            # the ONE per-sampler shared authority (identity across all endpoints)
+end
+nuts_frame_shared(f::_NutsFrame) = getfield(f, :shared)
+nuts_frame_ham_type(::_NutsFrame{EP,TREE,SH,Tham}) where {EP,TREE,SH,Tham} = Tham
+# Per-transition control+diagnostics RESET (fixture `reset!`) — control back to `true`, diagnostics through
+# `_diagnostics_reset!` (authoritative source write; committed zeroed, all four pending-produced). The tree/
+# endpoint buffer resets (copy!!/fill!) are separate visible producer writes poc lowers. Exact 0-B here.
+@inline function _nuts_frame_reset_control!(f::_NutsFrame)
+    setfield!(f, :gofwd, true); setfield!(f, :may_sample, true); setfield!(f, :may_continue, true)
+    _diagnostics_reset!(getfield(f, :diag)); f
+end
+
+# (`_construct_nuts_frame` is defined after `_PreparedFactory` / `_construct_prepared`, below.)
+
 # --- callable field / partial resolution (RK callable-Token redirect) --------
 #
 # A callable FIELD (`step_f`, `stats_f`) must resolve to a REGISTERED kernel/intrinsic
@@ -1427,8 +1470,10 @@ function _prepare_factory_scaffold(skel, integrator::_KernelRegistration, extern
         plan, (), external)
 end
 
-# Per-instance construction from the captured plan — NO graph, NO plan(). Builds the HAVE-only owned +
-# shared endpoint, then seeds the gradient via the type-stable binding (ONE pgrad, atomic pot+dpot).
+# TEST-ONLY factory-side construction that ALSO seeds the destination gradient (ONE pgrad) via the
+# type-stable binding — NOT the production path (production init is executed entirely by POC's full
+# six-handle initialization, RK 09:02). Kept for the standalone grad-binding/copy gates; never used by
+# `_construct_nuts_frame`, so no second path double-evaluates the destination pgrad.
 function _construct_prepared(pf::_PreparedFactory{Token,GR}, values, pgrad!, pos) where {Token,GR}
     ow, sh = _kernel_construct_endpoint(Val(Token), pf.plan, values, pf.external)
     _kernel_apply_grad!(_grad_binding_from_plan(pf.plan, Val(GR), pgrad!, ow), ow, pos)
@@ -1440,6 +1485,35 @@ end
 # the SAME layout; copy transfers init's producer-blessed state exactly.
 _seed_children!(init::_CanonOwned, children::Vararg{_CanonOwned}) =
     (for c in children; _canon_copy_endpoint!(c, init); end; children)
+
+# PHASE 1 of the two-phase sampler construction (RK 09:00/09:02): build the HAVE-only-current init endpoint
+# + the ONE per-sampler shared authority via `_kernel_construct_endpoint` — NO recipe execution here (no
+# pgrad, no chol) — and the fwd/bwd/proposals owned children UNSEEDED (freshly built, each an isolated
+# owned-only endpoint referencing the single `shared` by identity, NOT yet copied from init). POC runs the
+# FULL captured six-handle initialization on `frame.init` EXACTLY ONCE (the one destination pgrad ×1 +
+# chol/logdet ×1); only then `_seed_nuts_children!` copies the COMPLETE values+mask. Seeding children now
+# would propagate an incomplete init. `pos`/`ham` are init's source position + hamiltonian value; F32/F64
+# PRESERVED via trees/diag. (The single-path construction means no other code path double-evaluates init.)
+function _construct_nuts_frame(pf::_PreparedFactory{Token}, endpoint_values, pos::AbstractVector,
+                               ham, max_depth::Int) where {Token}
+    init_ow, shared = _kernel_construct_endpoint(Val(Token), pf.plan, endpoint_values, pf.external)
+    mkchild() = _kernel_construct_owned_child(Val(Token), pf.plan, endpoint_values)   # UNSEEDED, dirty
+    fwd = mkchild(); bwd = mkchild()
+    proposals = typeof(init_ow)[mkchild() for _ in 1:(max_depth + 2)]
+    trees = _nuts_trees(pos, ham, max_depth + 1)
+    _NutsFrame(init_ow, fwd, bwd, trees, proposals, true, true, true, _diagnostics_store(typeof(ham)), shared)
+end
+
+# PHASE 2 (RK 09:00): AFTER POC has executed the full six-handle init on `frame.init`, seed the children —
+# copy the COMPLETE init values + validity mask to fwd/bwd/proposals with ZERO extra pgrad/chol (a plain
+# owned-endpoint copy). Exception-safe per `_canon_copy_endpoint!`; an exception before this leaves every
+# child DIRTY (never falsely blessed). Returns the frame.
+function _seed_nuts_children!(frame::_NutsFrame)
+    _canon_copy_endpoint!(getfield(frame, :fwd), getfield(frame, :init))
+    _canon_copy_endpoint!(getfield(frame, :bwd), getfield(frame, :init))
+    for p in getfield(frame, :proposals); _canon_copy_endpoint!(p, getfield(frame, :init)); end
+    frame
+end
 
 # The concrete family member for a given arity — a COMPILE-TIME type lookup (no runtime Symbol
 # dispatch, no runtime emission). A layout wider than the predeclared family throws a deterministic
