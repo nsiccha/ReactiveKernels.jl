@@ -18,7 +18,7 @@ using .EightSchoolsExample
         @test !any(r -> r.op === EightSchoolsExample.log_prior, p.recipes)
 
         parameters = prepare(p)(q)
-        @test parameters isa EightSchoolsParameters
+        @test parameters isa NamedTuple
         @test parameters.μ == 1.5
         @test parameters.τ ≈ 2.0
         @test parameters.θ == [0.25 * i for i in 1:8]
@@ -167,7 +167,7 @@ using .EightSchoolsExample
     end
 
     @testset "generated quantities prune density work" begin
-        parameters = EightSchoolsParameters(1.0, 4.0, fill(2.0, 8))
+        parameters = (; μ = 1.0, τ = 4.0, θ = fill(2.0, 8))
         p = plan(model.graph;
                  have = (model.parameters, model.new_group_scale,
                          model.prediction_innovations),
@@ -179,7 +179,7 @@ using .EightSchoolsExample
         @test !any(r -> r.op === EightSchoolsExample.log_prior, p.recipes)
 
         prediction = prepare(p)(parameters, 12.0, [0.25, -1.0])
-        @test prediction isa NewGroupPrediction
+        @test prediction isa NamedTuple
         @test prediction.θ == 2.0
         @test prediction.y == -10.0
     end
@@ -198,8 +198,8 @@ using .EightSchoolsExample
     @testset "invalid constrained inputs fail explicitly" begin
         @test_throws DomainError EightSchoolsExample.normal_logpdf(0.0, 0.0, 0.0)
         @test_throws DomainError EightSchoolsExample.predict_new_group(
-            EightSchoolsParameters(1.0, 4.0, fill(2.0, 8)), 0.0, [0.25, -1.0])
+            (; μ = 1.0, τ = 4.0, θ = fill(2.0, 8)), 0.0, [0.25, -1.0])
         @test_throws DomainError EightSchoolsExample.log_prior(
-            EightSchoolsParameters(1.0, 0.0, fill(2.0, 8)))
+            (; μ = 1.0, τ = 0.0, θ = fill(2.0, 8)))
     end
 end

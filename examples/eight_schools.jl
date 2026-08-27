@@ -2,7 +2,6 @@ module EightSchoolsExample
 
 using ReactiveKernels
 
-export EightSchoolsParameters, NewGroupPrediction
 export EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA
 export build_eight_schools_graph, demo
 
@@ -12,33 +11,14 @@ const _LOG2PI = log(2π)
 const EIGHT_SCHOOLS_Y = [28.0, 8.0, -3.0, 7.0, -1.0, 1.0, 18.0, 12.0]
 const EIGHT_SCHOOLS_SIGMA = [15.0, 10.0, 16.0, 11.0, 9.0, 11.0, 10.0, 18.0]
 
-"Constrained parameters for the centered eight-schools model."
-struct EightSchoolsParameters
-    μ::Float64
-    τ::Float64
-    θ::Vector{Float64}
-end
-
-"A deterministic new-group prediction for supplied standard-normal innovations."
-struct NewGroupPrediction
-    θ::Float64
-    y::Float64
-end
-
-# Structural value equality: the `θ` field is a `Vector`, so the default `==`
-# (which falls back to `===` identity on the array) would call two equal-content
-# parameter sets unequal.
-Base.:(==)(a::EightSchoolsParameters, b::EightSchoolsParameters) =
-    a.μ == b.μ && a.τ == b.τ && a.θ == b.θ
-
 # --- Pure operations used as graph recipes ---------------------------------
 
 split_unconstrained(q::Vector{Float64}) = (q[1], q[2], q[3:end])
 
 positive_scale(log_τ::Float64) = exp(log_τ)
 
-assemble_parameters(μ::Float64, τ::Float64, θ::Vector{Float64}) =
-    EightSchoolsParameters(μ, τ, θ)
+# The constrained parameters are a plain NamedTuple — no opaque struct to look up.
+assemble_parameters(μ::Float64, τ::Float64, θ::Vector{Float64}) = (; μ, τ, θ)
 
 # Only τ is transformed: τ = exp(log_τ), hence log |dτ / dlog_τ| = log_τ.
 log_abs_det_jacobian(log_τ::Float64) = log_τ
@@ -55,7 +35,7 @@ function half_cauchy_logpdf(x::Float64, scale::Float64)
     log(2) - log(π) - log(scale) - log1p((x / scale)^2)
 end
 
-function log_prior(parameters::EightSchoolsParameters)
+function log_prior(parameters)
     lp = normal_logpdf(parameters.μ, 0.0, 5.0)
     lp += half_cauchy_logpdf(parameters.τ, 5.0)
     for θⱼ in parameters.θ
@@ -81,14 +61,13 @@ total_log_density(log_prior::Float64, log_jacobian::Float64,
                   log_likelihood::Float64) =
     log_prior + log_jacobian + log_likelihood
 
-function predict_new_group(parameters::EightSchoolsParameters,
-                           σ_new::Float64,
-                           innovations::Vector{Float64})
+# A deterministic new-group prediction, returned as a plain NamedTuple.
+function predict_new_group(parameters, σ_new::Float64, innovations::Vector{Float64})
     σ_new > 0 ||
         throw(DomainError(σ_new, "new-group observation scale must be positive"))
     θ_new = parameters.μ + parameters.τ * innovations[1]
     y_new = θ_new + σ_new * innovations[2]
-    NewGroupPrediction(θ_new, y_new)
+    (; θ = θ_new, y = y_new)
 end
 
 """
@@ -96,7 +75,8 @@ end
 
 Build the centered eight-schools model as a declarative
 `ReactiveKernels.KernelSpec`. Named ports remain available as properties, making
-different PPL queries explicit `have`/`want` boundaries.
+different PPL queries explicit `have`/`want` boundaries. Constrained parameters
+and predictions are plain NamedTuples, not custom types.
 
 The likelihood is the vectorized `plated_loglik` (a `plate` of the scalar
 per-school `@kernel`); the transform Jacobian, prior, total density, and
@@ -113,13 +93,13 @@ function build_eight_schools_graph()
         (μ::Float64, log_τ::Float64, θ::Vector{Float64}) =
             split_unconstrained(unconstrained)
         τ::Float64 = positive_scale(log_τ)
-        parameters::EightSchoolsParameters = assemble_parameters(μ, τ, θ)
+        parameters = assemble_parameters(μ, τ, θ)
         log_jacobian::Float64 = log_abs_det_jacobian(log_τ)
 
         prior::Float64 = log_prior(parameters)
         likelihood::Float64 = plated_loglik(observations, θ, observation_scales)
         density::Float64 = total_log_density(prior, log_jacobian, likelihood)
-        new_group::NewGroupPrediction = predict_new_group(
+        new_group = predict_new_group(
             parameters, new_group_scale, prediction_innovations,
         )
         return density
@@ -134,6 +114,7 @@ function demo()
     constrained_plan = plan(model; have = :unconstrained, want = :parameters)
     println(explain(constrained_plan))
     parameters = prepare(constrained_plan)(q)
+    println("constrained parameters = ", parameters)
 
     println("\nFull unconstrained-space log density (likelihood via plate):")
     density_plan = plan(model;
@@ -154,7 +135,7 @@ function demo()
                           want = :new_group)
     println(explain(generated_plan))
     prediction = prepare(generated_plan)(parameters, 12.0, [0.25, -1.0])
-    println("new group θ = ", prediction.θ, ", y = ", prediction.y)
+    println("new group prediction = ", prediction)
 
     nothing
 end

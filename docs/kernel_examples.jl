@@ -84,8 +84,9 @@ function setup_eight_schools!(mod::Module)
     if !isdefined(mod, :EightSchoolsExample)
         Base.include(mod, joinpath(@__DIR__, "..", "examples", "eight_schools.jl"))
     end
+    # Constrained parameters and predictions are plain NamedTuples, so there are
+    # no custom types to import — only the model's data.
     Core.eval(mod, :(using .EightSchoolsExample:
-        EightSchoolsParameters, NewGroupPrediction,
         EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA))
     nothing
 end
