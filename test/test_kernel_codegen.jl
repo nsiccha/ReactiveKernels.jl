@@ -101,9 +101,18 @@ end
     chol_r, node_r = prod[_pp_c(plan, :chol_metric)], prod[_pp_node(plan)]
     @test Set(Rids) == Set([grad_r, vel_r, kin_r, ham_r])      # grad/velocity/kin/ham by RECIPE IDENTITY
     @test !(chol_r in Rids) && !(node_r in Rids)               # exact chol + @node recipe ids EXCLUDED
-    # a trace under a DIFFERENT plan key cannot bind (forgery rejected)
-    @test_throws RK._LLowerReject RK.compile_prepared_schedule(pf, RK._CanonOwned1, RK._CanonShared1,
-        RK._SelectedTrace{:forged_key, (2, 4)}())
+    # PROVENANCE (RK 08:37): the PUBLIC production API takes the leaf MethodIR and derives the trace itself,
+    # so a caller CANNOT inject a recipe list — a _SelectedTrace is not an accepted public argument.
+    @test_throws MethodError RK.compile_prepared_schedule(pf, RK._CanonOwned1, RK._CanonShared1,
+        RK._SelectedTrace{RK.kernel_plan_key(plan), (grad_r, vel_r)}())
+    # A same-Key / ARBITRARY-Rids trace IS internally constructible (compiler-internal provenance, NOT a
+    # security boundary) — but reachable only through the PRIVATE overload, which is test-only. It compiles
+    # whatever Rids it is handed; the public path above never exposes that lever.
+    forged = RK._SelectedTrace{RK.kernel_plan_key(plan), (chol_r,)}()   # wrong recipe, right Key
+    @test RK.selected_trace_recipes(forged) == (chol_r,)               # constructible; no boundary
+    # the private overload still rejects a WRONG-plan Key (the one real provenance check it enforces)
+    @test_throws RK._LLowerReject RK._compile_prepared_schedule(pf, RK._CanonOwned1,
+        RK._CanonShared1, RK._SelectedTrace{:forged_key, (2, 4)}())
 end
 
 @testset "prepared-endpoint — POST-WRITE RECOMPUTE 0-B/@inferred, chol+@node Δ0, pgrad Δ1, F32 & F64 (RK 08:04c/08:15)" begin
@@ -113,8 +122,7 @@ end
         ow, sh = _pp_construct(pf, plan, _pp_values(plan, T, d, cp))
         RK.compile_prepared_initialization(pf, typeof(ow), typeof(sh))(ow, sh, hs)
         @test cp.n == 1
-        tr = RK.prepared_transition_trace(plan, RK.method_irs(_PPFix.leapfrog_ep!)[1])
-        warm = RK.compile_prepared_schedule(pf, typeof(ow), typeof(sh), tr)
+        warm = RK.compile_prepared_schedule(pf, typeof(ow), typeof(sh), RK.method_irs(_PPFix.leapfrog_ep!)[1])
         @test warm(ow, sh, hs) === ow                          # returns the owned object (no tuple alloc)
         chol0 = _pp_rd(plan, ow, sh, _pp_c(plan, :chol_metric)); node0 = _pp_rd(plan, ow, sh, _pp_node(plan))
         n0 = cp.n
@@ -134,10 +142,10 @@ end
     cp = _PPFix.CountPgrad(0)
     ow, sh = _pp_construct(pf, plan, _pp_values(plan, Float64, d, cp))
     init = RK.compile_prepared_initialization(pf, typeof(ow), typeof(sh))
-    tr = RK.prepared_transition_trace(plan, RK.method_irs(_PPFix.leapfrog_ep!)[1])
-    warm = RK.compile_prepared_schedule(pf, typeof(ow), typeof(sh), tr)
+    leaf = RK.method_irs(_PPFix.leapfrog_ep!)[1]
+    warm = RK.compile_prepared_schedule(pf, typeof(ow), typeof(sh), leaf)
     init(ow, sh, hs); ham_clean = _pp_rd(plan, ow, sh, _pp_c(plan, :ham))
-    trace_clean = RK.selected_trace_recipes(tr)
+    trace_clean = RK.selected_trace_recipes(RK.prepared_transition_trace(plan, leaf))
     g = RK.kernel_graph(_PPFix.euclidean_ep)
     saved_recipes = copy(g.recipes); saved_producers = copy(g.producers)
     try
@@ -188,8 +196,7 @@ end
         @test RK._canon_slot(fwd, Val(RK.kernel_plan_field(plan, cham)[2])) ≈
               RK._canon_slot(ow,  Val(RK.kernel_plan_field(plan, cham)[2]))   # ham transferred
         # EXECUTE the child against the SAME shared authority `sh` (fixed metric) — proves shared wiring:
-        tr = RK.prepared_transition_trace(plan, RK.method_irs(_PPFix.leapfrog_ep!)[1])
-        warm = RK.compile_prepared_schedule(pf, typeof(fwd), typeof(sh), tr)
+        warm = RK.compile_prepared_schedule(pf, typeof(fwd), typeof(sh), RK.method_irs(_PPFix.leapfrog_ep!)[1])
         @test warm(fwd, sh, hs) === fwd                       # child recompute returns the child owned obj
         warm(fwd, sh, hs)
         @test (@allocated warm(fwd, sh, hs)) == 0             # child post-write recompute 0-B over the shared chol

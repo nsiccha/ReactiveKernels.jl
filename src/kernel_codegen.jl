@@ -110,10 +110,11 @@ function _pp_domain_ok(op, argtypes::Tuple, i::Int)
     nothing
 end
 
-# The IMMUTABLE, PlanKey-tagged recipe-id trace — the ONLY currentness authority `compile_prepared_schedule`
-# accepts (RK 08:05/08:10). BOTH the plan `Key` AND the selected recipe-id tuple `Rids` are TYPE parameters
-# with NO runtime/mutable field, so a value under the right `Key` cannot smuggle a forged recipe list: the
-# schedule dispatches on the literal `Rids`. A trace can therefore only come from the derivation below.
+# The immutable, PlanKey-tagged recipe-id trace — COMPILER-INTERNAL provenance (NOT a security boundary:
+# same-`Key`/arbitrary-`Rids` is internally constructible, RK 08:37). BOTH the plan `Key` and the selected
+# recipe-id tuple `Rids` are TYPE parameters with NO runtime field, so the private schedule dispatches on
+# the literal `Rids` (a value cannot carry a mutable recipe list). The PUBLIC production API takes the leaf
+# MethodIR and DERIVES this trace itself, so no ordinary compiler caller supplies arbitrary `Rids`.
 struct _SelectedTrace{Key,Rids} end
 
 # Read-only accessors (RK 08:13) — acceptance censuses the exact emitted recipe identities + plan binding
@@ -184,16 +185,22 @@ function compile_prepared_initialization(pf::_PreparedFactory, ::Type{OW}, ::Typ
 end
 
 """
-    compile_prepared_schedule(pf, OW, SH, trace::_SelectedTrace) -> fn
+    compile_prepared_schedule(pf, OW, SH, leaf_ir::MethodIR) -> fn
 
-The WARMED transition/leaf executor (RK 08:04 (c) / 08:06): STATICALLY emits ONLY the handles whose recipe
-id is in the lowering-selected `trace` — provenance-verified by matching the trace's `Key` type parameter
-to `kernel_plan_key(pf.plan)` (a forged/foreign trace is rejected). Under a fixed metric the trace omits
-chol/@node, so the warmed call re-runs only grad/velocity/kin/ham and is exact 0-B / @inferred. The
-emitted handle sequence IS the acceptance schedule census.
+The PUBLIC production POST-WRITE RECOMPUTE executor (RK 08:04 (c) / 08:37): takes the real transition/leaf
+MethodIR and DERIVES the selected trace itself (`prepared_transition_trace`), so a compiler caller can NOT
+supply an arbitrary same-plan recipe list. Under a fixed metric the derived trace omits chol/@node, so the
+warmed call re-runs only grad/velocity/kin/ham and is exact 0-B / @inferred.
 """
-function compile_prepared_schedule(pf::_PreparedFactory, ::Type{OW}, ::Type{SH},
-                                   ::_SelectedTrace{Key,Rids}) where {OW,SH,Key,Rids}
+compile_prepared_schedule(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, leaf_ir::MethodIR) where {OW,SH} =
+    _compile_prepared_schedule(pf, OW, SH, prepared_transition_trace(kernel_prepared_plan(pf), leaf_ir))
+
+# PRIVATE trace-taking core (test-only): compile from an already-derived type-level trace. Not the public
+# compiler entry — the `_SelectedTrace` Key/Rids are compiler-internal provenance, not a security boundary
+# (RK 08:37), so this overload is reachable only by the derivation above and by provenance tests. The
+# handles it emits are the acceptance schedule census; a trace whose `Key` is not this plan's is rejected.
+function _compile_prepared_schedule(pf::_PreparedFactory, ::Type{OW}, ::Type{SH},
+                                    ::_SelectedTrace{Key,Rids}) where {OW,SH,Key,Rids}
     plan = kernel_prepared_plan(pf)
     Key === kernel_plan_key(plan) || _l_reject(
         "selected trace PlanKey does not match this prepared plan — schedule not provably tied to it")
