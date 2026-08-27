@@ -510,6 +510,8 @@ end
     R1=RK._NutsRealOp{1,:probe,:a}; R2=RK._NutsRealOp{2,:probe,:b}
     I1=RK._NutsInstrumentWrite{100001,1,:probe}; Ibad=RK._NutsInstrumentWrite{100002,1,:probe}
     I2=RK._NutsInstrumentWrite{100002,2,:probe}; Iextra=RK._NutsInstrumentWrite{100003,2,:probe}
+    @test !RK._nuts_validate_emitted_ops(:production,Tuple{})
+    @test !RK._nuts_validate_emitted_ops(:instrumented,Tuple{})
     @test !RK._nuts_validate_emitted_ops(:instrumented,Tuple{I1,R1})       # write before real
     @test !RK._nuts_validate_emitted_ops(:instrumented,Tuple{R1,R2,Ibad}) # declared adjacency is elsewhere
     @test !RK._nuts_validate_emitted_ops(:production,Tuple{R1,I1})

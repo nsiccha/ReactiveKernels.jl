@@ -922,6 +922,9 @@ end
 
 function _nuts_validate_emitted_ops(mode::Symbol,Ops::Type{<:Tuple})
     ts=Ops.parameters
+    # Every compiled NUTS root necessarily has root-entry, refresh, and transition sites.  Empty is not a
+    # degenerate valid program; accepting it would let a fabricated certificate vacuously satisfy G15.
+    isempty(ts) && return false
     all(t->t isa DataType && t<:_NutsEmittedOp,ts) || return false
     ids=Int[t.parameters[1] for t in ts]
     length(ids)==length(unique(ids)) || return false
