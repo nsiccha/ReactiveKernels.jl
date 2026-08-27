@@ -1261,6 +1261,30 @@ end
         @test dok(logdet, (L,)) && dok(logdet, (Matrix{Float64},))
         @test dok(\, (L, Vector{Float64})) && !dok(\, (Matrix{String}, Vector{Float64}))
         @test dok(+, (Float64, Float64)) && !dok(+, (String, String))
+        # DIAGONAL mass (RK 18:34): a concrete builtin Diagonal{numeric,Vector} is admitted for cholesky input
+        # AND as the Cholesky backing, so logdet/ldiv follow; F32/F64; the dense-Matrix path above is unchanged.
+        for T in (Float64, Float32)
+            D = typeof(Diagonal(T[2, 3]))                                    # Diagonal{T,Vector{T}}
+            CD = typeof(cholesky(Diagonal(T[2, 3])))                         # Cholesky{T,Diagonal{T,Vector{T}}}
+            @test RKS._kernel_dom_diag(D)                                    # the shared concrete-Diagonal predicate
+            @test dok(cholesky, (D,))                                        # cholesky(Diagonal) admitted
+            @test dok(logdet, (CD,))                                         # logdet(Diagonal-backed Cholesky)
+            @test dok(\, (CD, Vector{T}))                                   # (Diagonal-backed Cholesky) \ mom
+            @test RKS._recipe_dom_chol(CD)                                   # Diagonal backing sanctioned
+        end
+        # NEGATIVES — UniformScaling, custom AbstractVector backing, generic structured all REJECT (no widening)
+        @test !dok(cholesky, (typeof(1.0 * I),))                            # UniformScaling{Float64} — not a concrete matrix
+        @test !dok(cholesky, (typeof(I),))                                  # UniformScaling{Bool}
+        @test !RKS._kernel_dom_diag(typeof(1.0 * I))
+        @test !dok(cholesky, (Diagonal{Float64,ThrowingBuf},))             # custom AbstractVector backing (not <: Vector)
+        @test !RKS._kernel_dom_diag(Diagonal{Float64,ThrowingBuf})
+        @test !dok(cholesky, (Tridiagonal{Float64,Vector{Float64}},))      # generic structured — not Diagonal/Matrix
+        @test !dok(cholesky, (Diagonal{String,Vector{String}},))           # non-numeric Diagonal
+        # a Cholesky over a Diagonal backed by a CUSTOM AbstractVector (not <: Vector) still REJECTS
+        @test !RKS._recipe_dom_chol(Cholesky{Float64,Diagonal{Float64,ThrowingBuf}})
+        @test !dok(\, (Cholesky{Float64,Diagonal{Float64,ThrowingBuf}}, Vector{Float64}))
+        # a Cholesky over a non-Matrix / non-Diagonal structured backing REJECTS
+        @test !RKS._recipe_dom_chol(Cholesky{Float64,LowerTriangular{Float64,Matrix{Float64}}})
     end
 
     @testset "construction seam — ACTUAL mid-copy throw leaves NO stale blessed bit (epoch contract, not rollback) (RK 07:08)" begin

@@ -966,6 +966,17 @@ _kernel_dom_num_matrix(::Type{T}) where {T} =
 # custom AbstractMatrix/Vector whose getindex/lmul! has arbitrary effects while the outer type still
 # belongs to LinearAlgebra. Require the BACKING STORAGE type parameter to itself be a concrete Base numeric
 # Matrix (Vector for `Diagonal`). Final `cholesky(m).L :: LowerTriangular{T,Matrix{T}}` passes.
+# A concrete builtin numeric `Diagonal{numeric, Vector{numeric}}` (RK 18:34) — the SINGLE shared predicate for
+# a sanctioned diagonal mass: the backing storage parameter must be a CONCRETE Base numeric `Vector` (via
+# `_kernel_dom_num_array`). A `Diagonal` over a custom `AbstractVector`, a non-`Diagonal` structured wrapper,
+# or `UniformScaling` all REJECT. Shared by the `lmul!` lhs domain and the cholesky/logdet/ldiv recipe domain.
+function _kernel_dom_diag(::Type{T}) where {T}
+    T <: LinearAlgebra.Diagonal || return false
+    (T isa DataType && length(T.parameters) >= 2) || return false
+    S = T.parameters[2]
+    S isa Type && S <: Vector && _kernel_dom_num_array(S)
+end
+
 function _kernel_dom_lmul_lhs(::Type{T}) where {T}
     _kernel_dom_num_matrix(T) && return true                   # a dense concrete Base numeric Matrix
     parentmodule(T) === LinearAlgebra || return false
@@ -973,7 +984,7 @@ function _kernel_dom_lmul_lhs(::Type{T}) where {T}
     S = T.parameters[2]                                        # the backing storage type
     S isa Type || return false
     if T <: LinearAlgebra.Diagonal
-        return S <: Vector && _kernel_dom_num_array(S)         # Diagonal backs a concrete Base Vector
+        return _kernel_dom_diag(T)                             # Diagonal backs a concrete Base numeric Vector
     elseif T <: LinearAlgebra.LowerTriangular
         return _kernel_dom_lower_backing(S)                   # concrete Base Matrix OR the canonicalized Adjoint view
     elseif T <: LinearAlgebra.UpperTriangular ||

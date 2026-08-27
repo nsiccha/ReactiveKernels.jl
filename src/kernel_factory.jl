@@ -1563,9 +1563,12 @@ _recipe_bare_op_ok(@nospecialize(op)) =
 # identity is necessary but NOT sufficient (`cholesky`/`logdet`/`\`/`+` are extensible; a custom overload
 # type could carry arbitrary effects). Validate the concrete argument types from the prepared slots; a
 # custom-overload domain REJECTS. No IR inference — a load-bearing predicate poc calls at binding.
+# A Cholesky whose backing (`T.parameters[2]`) is a concrete Base numeric `Matrix` OR a concrete Base numeric
+# `Diagonal{numeric,Vector}` (RK 18:34, for a diagonal mass — `cholesky(Diagonal)::Cholesky{T,Diagonal{T,Vector{T}}}`).
+# A custom/generic backing still rejects.
 _recipe_dom_chol(::Type{T}) where {T} =
     T <: LinearAlgebra.Cholesky && T isa DataType && length(T.parameters) >= 2 &&
-        _kernel_dom_num_matrix(T.parameters[2])
+        (_kernel_dom_num_matrix(T.parameters[2]) || _kernel_dom_diag(T.parameters[2]))
 """
     kernel_recipe_op_domain_ok(op, argtypes) -> Bool
 
@@ -1576,7 +1579,8 @@ per-callee domain. A custom-overload type over the same identity REJECTS.
 """
 function kernel_recipe_op_domain_ok(@nospecialize(op), argtypes)
     isempty(argtypes) && return false
-    op === LinearAlgebra.cholesky && return length(argtypes) == 1 && _kernel_dom_num_matrix(argtypes[1])
+    op === LinearAlgebra.cholesky && return length(argtypes) == 1 &&
+        (_kernel_dom_num_matrix(argtypes[1]) || _kernel_dom_diag(argtypes[1]))
     op === LinearAlgebra.logdet && return length(argtypes) == 1 &&
         (_recipe_dom_chol(argtypes[1]) || _kernel_dom_num_matrix(argtypes[1]))
     op === Base.:\ && return length(argtypes) == 2 &&
