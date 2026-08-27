@@ -1761,7 +1761,8 @@ end
 # from the start — no separate POC six-handle init, no two-phase seed. The init RETAINS the bootstrap buffers
 # by identity; fwd/bwd/proposals are COMPLETE isolated deep-copies of it sharing the ONE shared authority.
 # Same config/validation as `_construct_nuts_frame` (checked max_depth, step_f Token identity, stats binding,
-# F32/F64 via ham type). Returns a runnable frame ready for `compile_nuts` — no further init/seed step.
+# F32/F64 via ham type). Returns a runnable frame ready for either control `compile_nuts` or production
+# `compile_nuts_native` — no further init/seed step.
 function _construct_nuts_frame_bootstrapped(pf::_PreparedFactory{Token}, cvals::Tuple, max_depth::Int;
                                             step_f, stats_f, min_dham) where {Token}
     (max_depth >= 0 && max_depth <= typemax(Int) - 2) || throw(_KernelFactoryReject(

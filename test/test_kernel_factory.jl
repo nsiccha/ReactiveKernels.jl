@@ -1610,7 +1610,8 @@ end
     end
 
     @testset "nuts_state — runnable prepare→compile→attach CORE: end-to-end nuts!! from _build_nuts_sampler (RK 13:18 fork-free half)" begin
-        # the WHOLE internal chain in ONE call: pf → _prepare_nuts_frame → POC compile_nuts → nuts_sampler →
+        # the WHOLE internal chain in ONE call: pf → _prepare_nuts_frame → registry-free compile_nuts_native
+        # → sealed sampler →
         # FINAL callable KernelObject, on which the authored `nuts!!(sampler; rng)` runs end-to-end.
         pf = RKS._prepare_factory(_ErgFix.euclidean_phasepoint, RKS.kernel_registration(_ErgFix.leapfrog!))
         plan = RKS.kernel_prepared_plan(pf)
@@ -1656,8 +1657,8 @@ end
                                     max_depth = 3, min_dham = -1000, stats_f = _ErgFix.nuts_stats!)
         @test_throws MethodError _ErgFix.leapfrog!(k; rng = Random.Xoshiro(1))
         # repeated same-signature constructions → IDENTICAL concrete sampler type (RK 12:32/13:44 gate).
-        # POC closed the stable-type blocker at 6ec4147 (deterministic hot-emitter locals): `compile_nuts`
-        # now returns a signature-stable root, so two compiles of the SAME signature share ONE concrete type.
+        # The immutable NativeProgram encoder is deterministic, so `compile_nuts_native` returns a
+        # signature-stable sealed root and two compiles of the SAME signature share ONE concrete type.
         k2 = RKS._build_nuts_sampler(pf, ergvals(Float64), _ErgFix.nuts_state, _ErgFix.refresh_momentum!!, _ErgFix.nuts!!;
                                      step_f = RKS.partial(_ErgFix.leapfrog!; stepsize = 0.1),
                                      max_depth = 3, min_dham = -1000, stats_f = _ErgFix.nuts_stats!)
