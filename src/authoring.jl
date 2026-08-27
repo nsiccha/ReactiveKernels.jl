@@ -184,6 +184,30 @@ function _kernel_add!(graph::Graph, ins, outs, op, cost, cse_key, effectful)
          cost = cost, cse_key = cse_key, effectful = effectful)
 end
 
+# A SINGLE-DEFINITION bare-identity recipe `b = a` (RHS a bare port, not a call) makes `b` a
+# CANONICAL ALIAS of `a` (RK 2026-08-27): both authored names resolve to ONE canonical Value —
+# one physical slot, one shared validity/currentness — instead of a distinct Value joined by an
+# opaque identity Recipe. Both authored names stay in `ports`/`port_order` for reporting.
+#
+# SOUNDNESS: it merges canonical CLASSES (`src=canon_id(from)`, `dst=canon_id(to)`) and is a
+# NO-OP when they already coincide, so a reverse/transitive `a=b; b=a` cannot build a cycle or
+# reparent incorrectly. It collapses ONLY a PROVEN same-declared-type identity; a typed
+# conversion (`b::T = a::U`, T≠U) is uncertain, so the ordinary identity Recipe is kept instead.
+# The caller hard-aliases only outputs with EXACTLY ONE authored definition (`b=a; b=c` are
+# alternative producers, not a proof `a===c`).
+function _kernel_alias!(graph::Graph, from::Value, to::Value, op, cost)
+    src = canon_id(graph, from.id)
+    dst = canon_id(graph, to.id)
+    src == dst && return graph                       # already one class (reverse/transitive)
+    if valtype(from) == valtype(to)                  # proven same-type identity → collapse
+        graph.aliases[src] = dst
+    else                                             # typed conversion → keep the ordinary recipe
+        add!(graph; inputs = (to,), outputs = (from,), op = op,
+             cost = cost, cse_key = nothing, effectful = false)
+    end
+    graph
+end
+
 # --- macro parsing ---------------------------------------------------------
 
 _kernel_is_line(ex) = ex isa LineNumberNode
@@ -1004,6 +1028,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     declare_ref = GlobalRef(@__MODULE__, :_kernel_declare!)
     push_unique_ref = GlobalRef(@__MODULE__, :_kernel_push_unique!)
     add_ref = GlobalRef(@__MODULE__, :_kernel_add!)
+    alias_ref = GlobalRef(@__MODULE__, :_kernel_alias!)
     spec_ref = GlobalRef(@__MODULE__, :KernelSpec)
     graph_ref = GlobalRef(@__MODULE__, :Graph)
     value_ref = GlobalRef(@__MODULE__, :Value)
@@ -1104,12 +1129,38 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         push!(prelude, :($push_unique_ref($have_var, $(QuoteNode(name)))))
     end
 
+    # Count authored recipe DEFINITIONS per output name — only a SINGLE-definition output may be
+    # hard-aliased (`b=a; b=c` are alternative producers of `b`, never a proof `a===c`).
+    def_count = Dict{Symbol,Int}()
+    for entry in entries
+        entry[1] === :recipe || continue
+        for (name, _) in entry[2]
+            def_count[name] = get(def_count, name, 0) + 1
+        end
+    end
+
     body = Any[]
     consumed_names = Set{Symbol}()
     produced_names = Symbol[]
     for entry in entries
         entry[1] === :recipe || continue
         _, outputs, authored_rhs, metadata = entry
+        # ALIAS-AT-EXPANSION (RK 2026-08-27): a bare-identity `b = a` — single output, RHS a bare
+        # DECLARED port (`known` is the full predeclared port namespace, forward refs included),
+        # not `b` itself, no `@recipe` metadata, and `b` has exactly ONE authored definition — is
+        # emitted as a canonical alias (proven same-type; typed conversions keep their recipe).
+        # No identity recipe is emitted for the collapsed pair; both labels stay for reporting.
+        if length(outputs) == 1 && authored_rhs isa Symbol && authored_rhs in known &&
+           authored_rhs != outputs[1][1] && isempty(metadata) &&
+           def_count[outputs[1][1]] == 1
+            op = _kernel_operation(authored_rhs, Symbol[authored_rhs], known)
+            cost = 1.0
+            push!(body, :($alias_ref($graph_var, $(port_vars[outputs[1][1]]),
+                                     $(port_vars[authored_rhs]), $op, $cost)))
+            _kernel_push_unique!(produced_names, outputs[1][1])
+            push!(consumed_names, authored_rhs)
+            continue
+        end
         rhs = _kernel_hygienic_catches(authored_rhs, known)
         deps = _kernel_free_ports(rhs, known)
         union!(consumed_names, deps)

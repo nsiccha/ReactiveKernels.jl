@@ -656,22 +656,35 @@ _kernel_all_ports(skel) = kernel_port_names(skel)
 _kernel_the_graph(spec::KernelSpec) = kernel_graph(spec)
 _kernel_the_graph(skel) = kernel_graph(kernel_spec(skel))
 
-# Recipe-graph closure from an explicit owned SEED.
+# name → graph Value, and the HAVE names, for both a stateless `KernelSpec` and a skeleton.
+_kernel_ports_map(spec::KernelSpec) = spec.ports
+_kernel_ports_map(skel) = kernel_spec(skel).ports
+_kernel_have_names(spec::KernelSpec) = spec.have_names
+_kernel_have_names(skel) = kernel_spec(skel).have_names
+
+# CANONICAL-ID recipe-graph closure (RK block pt 4): seed port names → their canonical Value ids,
+# close the recipe graph BY CANONICAL id (so a bare-identity ALIAS collapses — `dham_dpos` shares
+# `dpot_dpos`'s canonical Value, hence its ownership), and report the owned NAMES (a port is owned
+# iff its canonical Value is owned). Never propagates by Symbol name (which would miss aliases and
+# conflate collisions).
 function _kernel_factory_recipe_closure(skel, seed::Set{Symbol})
-    owned = copy(seed)
     graph = _kernel_the_graph(skel)
+    pmap = _kernel_ports_map(skel)
+    names = _kernel_all_ports(skel)
+    canonof(n) = canon_id(graph, pmap[n].id)
+    owned_canon = Set{Int}(canonof(n) for n in seed if haskey(pmap, n))
     changed = true
     while changed
         changed = false
         for r in graph.recipes
-            any(inp -> inp.name in owned, r.inputs) || continue
-            for out in r.outputs
-                out.name in owned || (push!(owned, out.name); changed = true)
+            any(v -> canon_id(graph, v.id) in owned_canon, r.inputs) || continue
+            for o in r.outputs
+                c = canon_id(graph, o.id)
+                c in owned_canon || (push!(owned_canon, c); changed = true)
             end
         end
     end
-    intersect!(owned, Set{Symbol}(_kernel_all_ports(skel)))
-    owned
+    Set{Symbol}(n for n in names if canonof(n) in owned_canon)
 end
 
 """
@@ -680,7 +693,8 @@ end
 
 The owned / shared top-fields of a phase-point endpoint under `integrator` (a resolved
 `_KernelRegistration`, e.g. `leapfrog!`): owned = the integrator's subject write-roots closed
-over the endpoint recipe graph; shared = complement (read-only authority + metric-only closures).
+over the endpoint recipe graph BY CANONICAL id; shared = complement (read-only authority +
+metric-only closures). Alias projections (`dham_dpos`≡`dpot_dpos`) share a canonical Value.
 """
 function _kernel_factory_endpoint_owned(skel, integrator::_KernelRegistration)
     _kernel_reg_writes_subject(integrator) || throw(_KernelFactoryReject(
@@ -692,33 +706,85 @@ _kernel_factory_endpoint_shared(skel, integrator::_KernelRegistration) =
     setdiff(Set{Symbol}(_kernel_all_ports(skel)),
             _kernel_factory_endpoint_owned(skel, integrator))
 
-# --- the immutable per-object PLAN (path→typed-slot map for poc's codegen seam) ------------
+# --- the DEEPLY-IMMUTABLE canonical per-object PLAN (poc's codegen seam) --------------------
 #
-# poc CONSUMES this, never recomputes ownership. `owned`/`shared` are the slot orders within
-# the `_OwnerState` owned tuple and the shared-identity tuple; `slot` maps each owner top-field
-# to `(:owned|:shared, 1-based index)` — so `phasepoint.dham_dpos` resolves to `Val{I}` on the
-# owned tuple. Concrete slot VALTYPES are filled at construction (per-specialization).
-struct _KernelPlan
-    owned::Vector{Symbol}
-    shared::Vector{Symbol}
-    slot::Dict{Symbol,Tuple{Symbol,Int}}
-end
-kernel_plan_owned(p::_KernelPlan) = p.owned
-kernel_plan_shared(p::_KernelPlan) = p.shared
-kernel_plan_slot(p::_KernelPlan, field::Symbol) = p.slot[field]
+# poc CONSUMES this, never recomputes ownership (RK 3f20181 block + 03:54/03:57). It is deeply
+# immutable — only Tuples / Symbols / Ints reachable, no `Vector`/`Dict` anywhere — so a consumer
+# cannot mutate layout authority; every accessor returns a detached immutable value. Keyed by the
+# authored PATH + CANONICAL Value id, with ALIAS projections collapsed to ONE physical slot.
 
-# Build the plan from a computed owned/shared classification (deterministic port order).
+# One immutable slot entry: authored owner Path (top-level: `(name,)`), the canonical Value id,
+# its role, and the 1-based physical slot index within that role's tuple. Aliased paths share the
+# same (canon, role, slot). All fields immutable (Tuple/Int/Symbol) — no mutable container.
+struct _PlanSlot
+    path::Tuple{Vararg{Symbol}}
+    canon::Int
+    role::Symbol            # :owned | :shared
+    slot::Int
+end
+
+# The plan: per-path slots + alias groups (authored names sharing a canonical Value) + the EXACT
+# selected-Plan identity (its Recipe ids, in execution order) + the entry-current canonical set.
+struct _KernelPlan{S<:Tuple,A<:Tuple,R<:Tuple,E<:Tuple}
+    slots::S          # Tuple{_PlanSlot...}
+    alias_groups::A   # Tuple{Tuple{Vararg{Symbol}}...}
+    plan_recipes::R   # Tuple{Int...} — selected Plan's Recipe ids (identity, not re-derived)
+    entry_current::E  # Tuple{Int...} — canonical ids current at construction entry (the HAVE set)
+end
+kernel_plan_slots(p::_KernelPlan) = p.slots
+kernel_plan_alias_groups(p::_KernelPlan) = p.alias_groups
+kernel_plan_recipes(p::_KernelPlan) = p.plan_recipes
+kernel_plan_entry_current(p::_KernelPlan) = p.entry_current
+# Detached lookup of the slot entry for an authored top-field name (returns the immutable entry).
+function kernel_plan_slot(p::_KernelPlan, field::Symbol)
+    for s in p.slots
+        s.path === (field,) && return s
+    end
+    throw(KeyError(field))
+end
+# Distinct physical slot counts per role.
+kernel_plan_nowned(p::_KernelPlan) = length(unique(s.canon for s in p.slots if s.role === :owned))
+kernel_plan_nshared(p::_KernelPlan) = length(unique(s.canon for s in p.slots if s.role === :shared))
+
 function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol})
-    ports = _kernel_all_ports(skel)
-    ownedv = Symbol[p for p in ports if p in owned]
-    sharedv = Symbol[p for p in ports if p in shared]
-    slot = Dict{Symbol,Tuple{Symbol,Int}}()
-    for (i, f) in enumerate(ownedv); slot[f] = (:owned, i); end
-    for (i, f) in enumerate(sharedv); slot[f] = (:shared, i); end
-    _KernelPlan(ownedv, sharedv, slot)
+    graph = _kernel_the_graph(skel)
+    pmap = _kernel_ports_map(skel)
+    names = _kernel_all_ports(skel)
+    canonof(n) = canon_id(graph, pmap[n].id)
+    # distinct canonical Values per role, in authored port order → physical slot indices (aliases
+    # collapse to ONE slot).
+    owned_canons = Int[]; shared_canons = Int[]
+    for n in names
+        c = canonof(n)
+        if n in owned
+            c in owned_canons || push!(owned_canons, c)
+        elseif n in shared
+            c in shared_canons || push!(shared_canons, c)
+        end
+    end
+    slots = _PlanSlot[]
+    for n in names
+        c = canonof(n)
+        if n in owned
+            push!(slots, _PlanSlot((n,), c, :owned, findfirst(==(c), owned_canons)))
+        elseif n in shared
+            push!(slots, _PlanSlot((n,), c, :shared, findfirst(==(c), shared_canons)))
+        end
+    end
+    # alias groups: authored names sharing a canonical Value (>1 name)
+    bycanon = Dict{Int,Vector{Symbol}}()
+    for n in names; push!(get!(bycanon, canonof(n), Symbol[]), n); end
+    groups = Tuple(Tuple(sort(v)) for v in values(bycanon) if length(v) > 1)
+    # EXACT selected-Plan identity: run the planner for all produced ports, keep its Recipe ids.
+    havek = Set(_kernel_have_names(skel))
+    have = Value[pmap[n] for n in _kernel_have_names(skel)]
+    want = Value[pmap[n] for n in names if !(n in havek)]
+    prec = isempty(want) ? () : Tuple(r.id for r in plan(graph; have = have, want = want).recipes)
+    entry_current = Tuple(canonof(n) for n in _kernel_have_names(skel))
+    _KernelPlan(Tuple(slots), groups, prec, entry_current)
 end
 
-# The endpoint plan under an integrator (the map poc wires codegen against).
+# The endpoint plan under an integrator (the immutable canonical map poc wires codegen against).
 _kernel_factory_endpoint_plan(skel, integrator::_KernelRegistration) =
     _kernel_factory_plan(skel, _kernel_factory_endpoint_owned(skel, integrator),
                          _kernel_factory_endpoint_shared(skel, integrator))

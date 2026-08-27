@@ -356,16 +356,69 @@ end
         @test any(occursin("node", String(f)) for f in shared)   # @node(logdet) shared
         @test isempty(intersect(owned, shared))
 
-        # the immutable path→typed-slot PLAN poc consumes (never recomputes ownership)
+        # the DEEPLY-IMMUTABLE canonical PLAN poc consumes (never recomputes ownership)
         plan = RKS._kernel_factory_endpoint_plan(phasepoint_ep, integ)
-        @test RKS.kernel_plan_slot(plan, :pos)[1] === :owned
-        @test RKS.kernel_plan_slot(plan, :dham_dpos)[1] === :owned
-        @test RKS.kernel_plan_slot(plan, :metric)[1] === :shared
-        # slot indices are 1-based and contiguous within each tuple
-        @test Set(RKS.kernel_plan_slot(plan, f)[2] for f in RKS.kernel_plan_owned(plan)) ==
-              Set(1:length(RKS.kernel_plan_owned(plan)))
-        # every owner field is classified exactly once (owned XOR shared)
+        @test RKS.kernel_plan_slot(plan, :pos).role === :owned
+        @test RKS.kernel_plan_slot(plan, :dham_dpos).role === :owned
+        @test RKS.kernel_plan_slot(plan, :metric).role === :shared
+        # ALIAS COLLAPSE: dham_dpos≡dpot_dpos, dham_dmom≡dkin_dmom → SAME canonical slot
+        @test RKS.kernel_plan_slot(plan, :dham_dpos).canon == RKS.kernel_plan_slot(plan, :dpot_dpos).canon
+        @test RKS.kernel_plan_slot(plan, :dham_dpos).slot  == RKS.kernel_plan_slot(plan, :dpot_dpos).slot
+        @test RKS.kernel_plan_slot(plan, :dham_dmom).slot  == RKS.kernel_plan_slot(plan, :dkin_dmom).slot
+        # 9 owned authored names, 2 alias pairs collapse → 7 distinct physical owned slots
+        @test RKS.kernel_plan_nowned(plan) == 7
+        # alias groups exposed (both labels retained), sorted names
+        @test any(g -> Set(g) == Set((:dham_dpos, :dpot_dpos)), RKS.kernel_plan_alias_groups(plan))
+        @test any(g -> Set(g) == Set((:dham_dmom, :dkin_dmom)), RKS.kernel_plan_alias_groups(plan))
+        # EXACT selected-Plan identity carried (Recipe ids), not a re-derived imitation
+        @test !isempty(RKS.kernel_plan_recipes(plan))
+        # DEEPLY IMMUTABLE: only Tuples reachable — no Vector/Dict anywhere in the seam
+        @test RKS.kernel_plan_slots(plan) isa Tuple
+        @test RKS.kernel_plan_alias_groups(plan) isa Tuple
+        @test RKS.kernel_plan_recipes(plan) isa Tuple
+        @test all(s -> s.path isa Tuple && s.canon isa Int, RKS.kernel_plan_slots(plan))
+        # every owner field classified exactly once
         @test length(owned) + length(shared) == length(RKS._kernel_all_ports(phasepoint_ep))
+        # aliased target's PRODUCER stays canonical: dham_dpos resolves to dpot_dpos's producer
+        gph = RKS.kernel_graph(phasepoint_ep)
+        @test !isempty(RKS.producers_of(gph, RKS.canon_id(gph, phasepoint_ep.ports[:dham_dpos].id)))
+    end
+
+    @testset "bare-identity canonical alias at expansion (RK 03:57 hardening)" begin
+        # SINGLE-DEF identity → alias: both names one canonical Value; both labels retained
+        @kernel al_single(a) = begin
+            b = a
+            c = b + 1
+        end
+        g = RKS.kernel_graph(al_single)
+        @test RKS.canon_id(g, al_single.ports[:b].id) == RKS.canon_id(g, al_single.ports[:a].id)
+        @test haskey(al_single.ports, :b) && haskey(al_single.ports, :a)
+
+        # MULTI-DEF output → NOT aliased (`b=a; b=c` are alternative producers, not `a===c`)
+        @kernel al_multi(a, c) = begin
+            b = a
+            b = c
+        end
+        gm = RKS.kernel_graph(al_multi)
+        @test RKS.canon_id(gm, al_multi.ports[:b].id) != RKS.canon_id(gm, al_multi.ports[:a].id)
+        @test RKS.canon_id(gm, al_multi.ports[:b].id) != RKS.canon_id(gm, al_multi.ports[:c].id)
+
+        # TYPED MISMATCH → uncertain, keep the ordinary identity recipe (no collapse)
+        @kernel al_typed(a::Float64) = begin
+            b::Float32 = a
+        end
+        gt = RKS.kernel_graph(al_typed)
+        @test RKS.canon_id(gt, al_typed.ports[:b].id) != RKS.canon_id(gt, al_typed.ports[:a].id)
+
+        # REVERSE/TRANSITIVE → no cycle; canon stable (`d=b=a` all collapse to a's class)
+        @kernel al_rev(a) = begin
+            b = a
+            d = b
+        end
+        gr = RKS.kernel_graph(al_rev)
+        ca = RKS.canon_id(gr, al_rev.ports[:a].id)
+        @test RKS.canon_id(gr, al_rev.ports[:b].id) == ca
+        @test RKS.canon_id(gr, al_rev.ports[:d].id) == ca
     end
 end
 

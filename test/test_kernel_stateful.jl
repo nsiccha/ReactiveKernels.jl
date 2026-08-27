@@ -548,7 +548,12 @@ end
         @test length(gen) == 1                                       # one DISTINCT generated node
         @test gen[1] !== Symbol("#node#1")                           # NOT aliasing the authored port
         @test collidenode.ports[Symbol("#node#1")].id != collidenode.ports[gen[1]].id
-        @test length(kernel_graph(collidenode).recipes) == 3         # #node#1, generated, y
+        # `y = @node(x+2)` lifts to a generated-node recipe + a bare-identity `y = <node>`; the
+        # bare identity is now a CANONICAL ALIAS (RK 2026-08-27), not an identity recipe — so two
+        # recipes (#node#1, generated node), and `y` shares the generated node's canonical Value.
+        @test length(kernel_graph(collidenode).recipes) == 2
+        @test canon_id(kernel_graph(collidenode), collidenode.ports[:y].id) ==
+              canon_id(kernel_graph(collidenode), collidenode.ports[gen[1]].id)
 
         # FIX (C): a genuine `@node` in a NON-straight-line CONTROL context (branch/loop)
         # is REJECTED, not silently made unconditional in the static graph.
