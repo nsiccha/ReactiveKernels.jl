@@ -417,6 +417,21 @@ function _own_sibling!(st::_OwnState, cur::MethodId, x, env::Dict{Symbol,_Places
 end
 
 # Effects of ONE expression node given the current env (writes recorded; opaque calls checked).
+# Record a registered/field call's SUBJECT WRITE via the callee's DECLARED subject write-ROOTS
+# (RK 3rd-block pt3). When the subject actual is `__self__` (`_SelfRef`), those roots are OWNER
+# top-fields → owned (e.g. `stats_f(__self__)` = the diagnostics callback writing n_steps /
+# reached_depth / acceptance_rate). Otherwise the subject PLACE itself (an owner field or a formal
+# endpoint) is written at top-field granularity.
+function _own_subject_write!(st::_OwnState, cur::MethodId, subject, write_roots, env)
+    if subject isa _SelfRef
+        for r in write_roots
+            _own_record!(st, cur, _Places([(:self, r)]))
+        end
+    else
+        _own_record!(st, cur, _kernel_place_of(subject, env))
+    end
+end
+
 function _own_expr_effects!(st::_OwnState, cur::MethodId, x, env::Dict{Symbol,_Places})
     if x isa _RegisteredCall
         reg = x.registration
@@ -444,9 +459,10 @@ function _own_expr_effects!(st::_OwnState, cur::MethodId, x, env::Dict{Symbol,_P
             end
         else                                       # :free_method / :object_kernel / :stateless
             # RK block pt 4: a registered call owns its subject ONLY if it writes it; a pure
-            # registered reducer (empty roots) must NOT own its first actual.
+            # registered reducer (empty roots) must NOT own its first actual. Its subject WRITE goes
+            # to the callee's DECLARED write-roots (owner fields when the subject is __self__).
             _kernel_reg_writes_subject(reg) && !isempty(x.args) &&
-                _own_record!(st, cur, _kernel_place_of(x.args[1], env))
+                _own_subject_write!(st, cur, x.args[1], reg.write_roots, env)
         end
     elseif x isa _FieldCall
         field = isempty(x.path) ? :_ : x.path[1]
@@ -457,7 +473,9 @@ function _own_expr_effects!(st::_OwnState, cur::MethodId, x, env::Dict{Symbol,_P
                 "cannot decide its effect; supply its resolved registration (or an explicit " *
                 "no-effect `nothing`) before ownership/shared, or use the template API"))
         elseif reg isa _KernelRegistration && _kernel_reg_writes_subject(reg) && !isempty(x.pos)
-            _own_record!(st, cur, _kernel_place_of(x.pos[1], env))   # resolved subject-writer
+            # resolved subject-writer: its DECLARED write-roots on the subject actual (owner fields
+            # when the subject is __self__, e.g. `stats_f(__self__)` writing the diagnostics).
+            _own_subject_write!(st, cur, x.pos[1], reg.write_roots, env)
         end
         # reg === nothing (resolved no-effect) → no write
     elseif x isa _SubjectMethodCall

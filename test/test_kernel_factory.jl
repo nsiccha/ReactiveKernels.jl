@@ -87,6 +87,13 @@ end
 @kernel orderk(a, b) = begin
     z = b - a
 end
+# _SelfRef subject-write discriminator: a registered callback that writes ONLY its subject's `x`.
+@kernel cbwrites!(o) = begin
+    @. o.x = 1.0
+end
+@kernel cbowner(x, y; cb) = begin
+    run!() = cb(__self__)
+end
 # a STATEFUL external gradient functor (DI/counting): construction must retain it by IDENTITY
 # (identity + counter), never deep-copy it.
 mutable struct CountingGrad; n::Int; end
@@ -666,43 +673,77 @@ end
         @test rd.kind === :rng && rd.rng_arg == 1 && rd.writes == () && rd.reads == (1, 2)
     end
 
-    @testset "REAL nuts_state authoritative ownership (benchmark fixture, RK pt 5/7)" begin
-        # Eval the APPROVED benchmark/nuts_kernel_authoring_fixture.jl into an isolated module
-        # (selective import dodges the exported-name collision), declaring its HOT HELPERS via the
-        # PUBLIC effect macros BEFORE nuts_state is captured — no fixture source change, no body
-        # inference. This is the real end-to-end authoritative-ownership gate.
+    @testset "REAL nuts_state authoritative ownership (corrected ccb35d3 fixture, RK pt5/7, 05:18/26)" begin
+        # Eval the CORRECTED benchmark/nuts_kernel_authoring_fixture.jl EXACTLY as authored — its OWN
+        # seven @rk_* declarations run (no manual overlay, no method-overwrite), so the gate exercises
+        # the authored source. Selective import dodges the exported-name collision.
         RN = Module(:RealNuts)
         Core.eval(RN, :(using ReactiveKernels: @kernel, @node, partial, copy!!,
                                                @rk_pure, @rk_borrows, @rk_rng))
         Core.eval(RN, :(using LinearAlgebra, LogExpFunctions, Random))
         fixpath = normpath(joinpath(@__DIR__, "..", "benchmark", "nuts_kernel_authoring_fixture.jl"))
-        fixsrc = read(fixpath, String)
-        stmts = filter(s -> !(s isa LineNumberNode), Meta.parseall(fixsrc).args)
-        isnuts(st) = st isa Expr && st.head === :macrocall && st.args[1] === Symbol("@kernel") &&
-            (eq = st.args[end]; eq isa Expr && eq.head === :(=) && eq.args[1] isa Expr &&
-             eq.args[1].head === :call && eq.args[1].args[1] === :nuts_state)
-        decls = [:(@rk_pure finiteorneginf 1), :(@rk_borrows badd 2), :(@rk_rng randbernoullilog 2 1),
-                 :(@rk_pure logswapprob 1), :(@rk_pure compute_criterion 3), :(@rk_pure smooth 3)]
-        done = Ref(false)
+        stmts = filter(s -> !(s isa LineNumberNode), Meta.parseall(read(fixpath, String)).args)
         for st in stmts
             (st isa Expr && st.head === :using) && continue
-            if !done[] && isnuts(st)
-                for d in decls; Core.eval(RN, d); end
-                done[] = true
-            end
             Core.eval(RN, st)
         end
         ns = RN.nuts_state
-        fr = Dict(:step_f => RKS.kernel_registration(RN.leapfrog!), :stats_f => nothing)
+        # all SEVEN authored declared-helper identities are captured (incl. min1exp)
+        for (h, k) in ((:finiteorneginf, :pure), (:min1exp, :pure), (:badd, :pure),
+                       (:randbernoullilog, :rng), (:logswapprob, :pure),
+                       (:compute_criterion, :pure), (:smooth, :pure))
+            d = RKS._kernel_declared_effect(getfield(RN, h))
+            @test d !== nothing && d.kind === k
+        end
+        # step_f → leapfrog!, stats_f → the registered nuts_stats! diagnostics callback
+        fr = Dict(:step_f => RKS.kernel_registration(RN.leapfrog!),
+                  :stats_f => RKS.kernel_registration(RN.nuts_stats!))
         owned = RKS._kernel_factory_owned_authoritative(ns; field_regs = fr)
         shared = RKS._kernel_factory_shared(ns; field_regs = fr)
-        # EXACT top-level owned set: init/fwd/bwd endpoints + trees/proposals + control flags
+        # EXACT owned: init/fwd/bwd + trees/proposals + control flags + DIAGNOSTICS. nuts_stats! writes
+        # n_steps + acceptance_rate (via stats_f(__self__)); reached_depth is a direct step! write;
+        # reset! also writes the diagnostics — so the real fixture confounds the callback path (a
+        # dedicated synthetic discriminator below isolates the _SelfRef subject-write mapping).
         @test owned == Set((:init, :fwd, :bwd, :trees, :proposals,
-                            :gofwd, :may_sample, :may_continue, :dham, :diverged))
-        # SHARED: the callable field + scalar params (no unresolved field)
+                            :gofwd, :may_sample, :may_continue, :dham, :diverged,
+                            :n_steps, :reached_depth, :acceptance_rate))
         @test shared == Set((:step_f, :max_depth, :min_dham, :stats_f))
         @test isempty(intersect(owned, shared))
         @test union(owned, shared) == Set{Symbol}(RKS.kernel_port_names(ns))
+        # DIRECT (RK 05:38): the three diagnostics are OWNED (via reset/step + the stats callback
+        # closure), while step_f/max_depth/min_dham/stats_f remain SHARED.
+        for d in (:n_steps, :reached_depth, :acceptance_rate)
+            @test d in owned && !(d in shared)
+        end
+        for s in (:step_f, :max_depth, :min_dham, :stats_f)
+            @test s in shared && !(s in owned)
+        end
+        # LOAD-BEARING (RK 05:39): nuts_stats! writes EXACTLY {n_steps, acceptance_rate}
+        # (order-insensitive), and stats_f(__self__) maps those subject roots onto OWNER fields.
+        @test Set(RKS.kernel_registration(RN.nuts_stats!).write_roots) == Set((:n_steps, :acceptance_rate))
+        @test :n_steps in owned && :acceptance_rate in owned
+        # reached_depth is a DIRECT step! write (NOT the stats callback) — still owned with stats_f
+        # a resolved no-effect, whereas the callback-only roots are owned via reset/step diagnostics.
+        owned_ns = RKS._kernel_factory_owned_authoritative(ns;
+            field_regs = Dict(:step_f => RKS.kernel_registration(RN.leapfrog!), :stats_f => nothing))
+        @test :reached_depth in owned_ns
+        # euclidean_phasepoint is pot_f-free (grad_f, metric, pos, mom)
+        @test :pot_f ∉ RKS._kernel_all_ports(RN.euclidean_phasepoint)
+        @test :grad_f in RKS._kernel_all_ports(RN.euclidean_phasepoint)
+    end
+
+    @testset "_SelfRef subject-write: callback root → owner field (RK 05:40 discriminator)" begin
+        # NON-VACUOUS (the real fixture's reset! confounds the callback path): `x`/`y` are otherwise
+        # unwritten ports; a registered callback `cb(__self__)` writes ONLY the subject root `x`.
+        cbreg = RKS.kernel_registration(cbwrites!)
+        @test Set(cbreg.write_roots) == Set((:x,))                     # callback writes subject.x only
+        # with the callback RESOLVED: `cb(__self__)` maps the subject write-root onto owner field x →
+        # x OWNED, y stays SHARED.
+        owned_cb = RKS._kernel_factory_owned_authoritative(cbowner; field_regs = Dict(:cb => cbreg))
+        @test :x in owned_cb && !(:y in owned_cb)
+        # with the callback a resolved NO-EFFECT (nothing): nothing writes x/y → BOTH shared.
+        owned_none = RKS._kernel_factory_owned_authoritative(cbowner; field_regs = Dict(:cb => nothing))
+        @test !(:x in owned_none) && !(:y in owned_none)
     end
 
     @testset "concrete no-Ref construction: isolation, independent masks, F32/F64 (step 5)" begin
