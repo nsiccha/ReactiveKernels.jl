@@ -276,7 +276,7 @@ _nuts_trees(pos::AbstractVector, ham, n::Int) = [_nuts_tree(pos, ham) for _ in 1
 # endpoint references BY IDENTITY (metric/chol/@node — built once, never per-endpoint). No Ref, no Any:
 # every field is concrete/typed (F32/F64 preserved through EP/TREE/Tham); control + diagnostics scalar
 # updates and the per-transition reset are exact 0-B on the concrete mutable field ABI.
-mutable struct _NutsFrame{EP,TREE,SH,Tham}
+mutable struct _NutsFrame{EP,TREE,SH,Tham,M,STEP,STATS}
     init::EP              # owned endpoint (isolated buffers), refers to `shared` by identity
     fwd::EP
     bwd::EP
@@ -285,17 +285,42 @@ mutable struct _NutsFrame{EP,TREE,SH,Tham}
     gofwd::Bool
     may_sample::Bool
     may_continue::Bool
+    diverged::Bool        # the authored DERIVED recipe `!(dham >= min_dham)` — a CONCRETE owned Bool, not
+                          #   recomputed by name; its currentness is `derived_current` bit 0
+    derived_current::UInt # currentness of the derived recipes (bit 0 = diverged) — a dham write invalidates
     diag::_DiagnosticsStore{Tham}
     shared::SH            # the ONE per-sampler shared authority (identity across all endpoints)
+    entry_mask::M        # the proven post-init owned currentness mask (entry_current) — init MUST match
+                         #   this before children may be seeded (RK 09:10)
+    step_f::STEP         # the detached prepared step binding (registered leapfrog! token + bound kwargs)
+    stats::STATS         # the registered stats_f scalar-effect binding (or the no-effect `nothing` variant)
+    max_depth::Int       # frozen config
+    min_dham::Tham       # frozen config (in the preserved ham type)
 end
 nuts_frame_shared(f::_NutsFrame) = getfield(f, :shared)
 nuts_frame_ham_type(::_NutsFrame{EP,TREE,SH,Tham}) where {EP,TREE,SH,Tham} = Tham
+nuts_frame_entry_mask(f::_NutsFrame) = getfield(f, :entry_mask)
+nuts_frame_step(f::_NutsFrame) = getfield(f, :step_f)
+nuts_frame_stats(f::_NutsFrame) = getfield(f, :stats)
+nuts_frame_max_depth(f::_NutsFrame) = getfield(f, :max_depth)
+nuts_frame_min_dham(f::_NutsFrame) = getfield(f, :min_dham)
+@inline nuts_frame_diverged_current(f::_NutsFrame) = getfield(f, :derived_current) & UInt(1) == UInt(1)
+# `diverged` is PRODUCED from dham + min_dham (RK 09:11) — a real derived write, marked current; a `dham`
+# write INVALIDATES it (poc recomputes). 0-B.
+@inline function _nuts_produce_diverged!(f::_NutsFrame)
+    setfield!(f, :diverged, !(_diag_slot(getfield(f, :diag), Val(4)) >= getfield(f, :min_dham)))
+    setfield!(f, :derived_current, getfield(f, :derived_current) | UInt(1)); f
+end
+@inline _nuts_invalidate_diverged!(f::_NutsFrame) =
+    (setfield!(f, :derived_current, getfield(f, :derived_current) & ~UInt(1)); f)
 # Per-transition control+diagnostics RESET (fixture `reset!`) — control back to `true`, diagnostics through
 # `_diagnostics_reset!` (authoritative source write; committed zeroed, all four pending-produced). The tree/
 # endpoint buffer resets (copy!!/fill!) are separate visible producer writes poc lowers. Exact 0-B here.
 @inline function _nuts_frame_reset_control!(f::_NutsFrame)
     setfield!(f, :gofwd, true); setfield!(f, :may_sample, true); setfield!(f, :may_continue, true)
-    _diagnostics_reset!(getfield(f, :diag)); f
+    _diagnostics_reset!(getfield(f, :diag))
+    _nuts_invalidate_diverged!(f)      # reset writes dham=0 → the derived `diverged` is stale (poc recomputes)
+    f
 end
 
 # (`_construct_nuts_frame` is defined after `_PreparedFactory` / `_construct_prepared`, below.)
@@ -1495,24 +1520,79 @@ _seed_children!(init::_CanonOwned, children::Vararg{_CanonOwned}) =
 # would propagate an incomplete init. `pos`/`ham` are init's source position + hamiltonian value; F32/F64
 # PRESERVED via trees/diag. (The single-path construction means no other code path double-evaluates init.)
 function _construct_nuts_frame(pf::_PreparedFactory{Token}, endpoint_values, pos::AbstractVector,
-                               ham, max_depth::Int) where {Token}
+                               ham, max_depth::Int; step_f, stats, min_dham) where {Token}
+    # REJECT an out-of-range max_depth BEFORE any construction/mutation (RK 09:10) — the tree/proposal
+    # counts are `max_depth+1`/`max_depth+2`, so a negative depth is a shape error, not a silent empty.
+    max_depth >= 0 || throw(_KernelFactoryReject(
+        "nuts_state max_depth must be ≥ 0 (got $max_depth) — a negative depth is an incompatible shape"))
+    Tham = typeof(ham)
     init_ow, shared = _kernel_construct_endpoint(Val(Token), pf.plan, endpoint_values, pf.external)
+    # the proven post-init owned mask = every OWNED entry_current slot current (init MUST reach this before
+    # children are seeded); computed from the detached plan, NOT the (still-incomplete) init.
+    canons, roles = kernel_plan_superset(pf.plan); N = length(canons)
+    entry_owned = Int[i for i in 1:N if roles[i] === :owned &&
+                      canons[i] in Set{Int}(kernel_plan_entry_current(pf.plan))]
+    entry_mask = _owner_mask(N, entry_owned)
     mkchild() = _kernel_construct_owned_child(Val(Token), pf.plan, endpoint_values)   # UNSEEDED, dirty
     fwd = mkchild(); bwd = mkchild()
     proposals = typeof(init_ow)[mkchild() for _ in 1:(max_depth + 2)]
     trees = _nuts_trees(pos, ham, max_depth + 1)
-    _NutsFrame(init_ow, fwd, bwd, trees, proposals, true, true, true, _diagnostics_store(typeof(ham)), shared)
+    # diverged starts DIRTY (derived_current bit 0 = 0) — POC produces it from dham+min_dham during init.
+    _NutsFrame(init_ow, fwd, bwd, trees, proposals, true, true, true, false, UInt(0),
+               _diagnostics_store(Tham), shared, entry_mask, step_f, stats, max_depth, oftype(ham, min_dham))
 end
 
-# PHASE 2 (RK 09:00): AFTER POC has executed the full six-handle init on `frame.init`, seed the children —
-# copy the COMPLETE init values + validity mask to fwd/bwd/proposals with ZERO extra pgrad/chol (a plain
-# owned-endpoint copy). Exception-safe per `_canon_copy_endpoint!`; an exception before this leaves every
-# child DIRTY (never falsely blessed). Returns the frame.
+# PHASE 2 (RK 09:00/09:10): AFTER POC has executed the full six-handle init on `frame.init`, seed the
+# children — copy the COMPLETE init values + validity mask to fwd/bwd/proposals with ZERO extra pgrad/chol
+# (a plain owned-endpoint copy). REJECTS unless init EXACTLY matches entry_current: a caller must never
+# seed an INCOMPLETE init (an init exception — forced destination-grad or a later handle — leaves init's
+# mask below entry_current, so every child stays DIRTY, never falsely blessed). Exception-safe per
+# `_canon_copy_endpoint!`. Returns the frame.
 function _seed_nuts_children!(frame::_NutsFrame)
+    _canon_current_mask(getfield(frame, :init)) == getfield(frame, :entry_mask) || throw(_KernelFactoryReject(
+        "cannot seed children from an INCOMPLETE init — its currentness mask does not match entry_current " *
+        "(POC must run the full six-handle initialization to completion before seeding)"))
     _canon_copy_endpoint!(getfield(frame, :fwd), getfield(frame, :init))
     _canon_copy_endpoint!(getfield(frame, :bwd), getfield(frame, :init))
     for p in getfield(frame, :proposals); _canon_copy_endpoint!(p, getfield(frame, :init)); end
     frame
+end
+
+# --- registered stats_f scalar-effect binding (RK 08:42/08:55) ---------------------------------------
+#
+# The diagnostic slot index of each fixture diagnostic field (1=n_steps, 2=reached_depth, 3=acceptance_
+# rate, 4=dham) — the stable map the stats binding + poc use, never a name heuristic on the store.
+_diagnostic_slot_of(name::Symbol) =
+    name === :n_steps ? 1 : name === :reached_depth ? 2 : name === :acceptance_rate ? 3 :
+    name === :dham ? 4 : 0
+
+# The registered `stats_f` scalar-effect binding: the registered callback (by identity) + the diagnostic
+# slot indices its DETACHED write-roots produce (nuts_stats! writes n_steps + acceptance_rate → slots
+# {1,3}). `stats_f=nothing` → the NO-EFFECT binding (the fixture `collectstats!` is `isnothing(stats_f) ||
+# stats_f(__self__)`). An OPAQUE/unregistered stats_f REJECTS — a diagnostics callback must be a registered
+# @kernel, never an opaque runtime callable. POC executes stats_f (writing the values via `_diag_set!`,
+# which marks them pending); the binding is the detached which-slots contract poc consumes.
+struct _StatsBinding{F,Slots<:Tuple}
+    stats_f::F
+    produced::Slots
+end
+stats_binding_produced(b::_StatsBinding) = b.produced
+stats_binding_callable(b::_StatsBinding) = b.stats_f
+function _stats_binding(stats_f, reg)
+    stats_f === nothing && return _StatsBinding{Nothing,Tuple{}}(nothing, ())
+    reg === nothing && throw(_KernelFactoryReject(
+        "stats_f is opaque/unregistered — the diagnostics callback must be a registered @kernel, not an " *
+        "opaque runtime callable"))
+    slots = Tuple(sort!(unique(Int[_diagnostic_slot_of(r) for r in reg.write_roots
+                                   if _diagnostic_slot_of(r) != 0])))
+    _StatsBinding(stats_f, slots)
+end
+# Mark the diagnostic slots stats_f produced as PENDING on the store (RK 08:48) — poc calls this after
+# executing stats_f. The no-effect (`nothing`) binding produces nothing.
+_stats_produced!(diag::_DiagnosticsStore, ::_StatsBinding{Nothing}) = diag
+function _stats_produced!(diag::_DiagnosticsStore, b::_StatsBinding)
+    for s in b.produced; _diag_bless!(diag, Val(s)); end
+    diag
 end
 
 # The concrete family member for a given arity — a COMPILE-TIME type lookup (no runtime Symbol

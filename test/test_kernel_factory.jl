@@ -134,6 +134,12 @@ end
 @kernel gradonly_poison_step!(phasepoint; stepsize) = begin
     @. phasepoint.pos += stepsize * phasepoint.dham_dpos
 end
+# a registered diagnostics callback writing n_steps + acceptance_rate (mirrors nuts_stats!'s write-roots)
+@kernel synstats!(state) = begin
+    state.n_steps += 1
+    state.acceptance_rate = state.acceptance_rate + one(state.acceptance_rate)
+    return state
+end
 # a COUNTING in-place gradient — proves 'zero extra pgrad' non-vacuously (count stays 1 across child seeds)
 mutable struct CountingPgrad; n::Int; end
 (c::CountingPgrad)(dest, pos) = (c.n += 1; dest .= 2 .* pos; sum(abs2, pos))
@@ -1295,20 +1301,35 @@ end
             end
             d
         end
+        # frozen config carried into the frame: a prepared step binding + the no-effect stats variant
+        stepb = RKS.partial(leapfrog_ep!; stepsize = 0.1)
+        nostats = RKS._stats_binding(nothing, nothing)
+        mkframe(T, pg, md) = RKS._construct_nuts_frame(pf, mkvals(T, pg), T[1, 2], zero(T), md;
+                                                       step_f = stepb, stats = nostats, min_dham = -1000)
         for T in (Float32, Float64)
             pg = CountingPgrad(0)
-            frame = RKS._construct_nuts_frame(pf, mkvals(T, pg), T[1, 2], zero(T), 10)
+            frame = mkframe(T, pg, 10)
             @test RKS.nuts_frame_shared(frame) isa RKS._CanonShared              # ONE shared authority
             @test RKS.nuts_frame_ham_type(frame) === T && RKS.diagnostics_ham_type(frame.diag) === T
             @test eltype(frame.trees[1].log_weight) === T
             @test length(frame.trees) == 11 && length(frame.proposals) == 12     # max_depth+1 / +2
+            # frozen config + the derived `diverged` recipe are carried in the concrete frame (RK 09:11)
+            @test RKS.nuts_frame_step(frame) === stepb && RKS.nuts_frame_stats(frame) === nostats
+            @test RKS.nuts_frame_max_depth(frame) == 10 && RKS.nuts_frame_min_dham(frame) === oftype(zero(T), -1000)
+            @test !RKS.nuts_frame_diverged_current(frame)                        # diverged starts DIRTY (poc produces)
             # phase-1: children are UNSEEDED (dirty) — NOT yet at entry_current, no pgrad ran
             @test ecmask(frame.fwd) != RKS._owner_mask(Ncanon, entry_owned) && pg.n == 0
+            # SEEDING an INCOMPLETE init REJECTS (RK 09:10) — init not yet at entry_current before poc runs
+            @test_throws RKS._KernelFactoryReject RKS._seed_nuts_children!(frame)
             # POC executes the FULL six-handle init on init exactly once (the one destination pgrad)
             initfn = RKS.compile_prepared_initialization(pf, typeof(frame.init), typeof(frame.shared))
             initfn(frame.init, frame.shared, RKS.kernel_prepared_handles(pf))
             @test pg.n == 1                                                      # pgrad total == 1
             @test ecmask(frame.init) == RKS._owner_mask(Ncanon, entry_owned)     # init mask == entry_current
+            # the derived `diverged` produced from dham+min_dham; reset invalidates it (poc recomputes)
+            RKS._nuts_produce_diverged!(frame); @test RKS.nuts_frame_diverged_current(frame)
+            RKS._nuts_frame_reset_control!(frame); @test !RKS.nuts_frame_diverged_current(frame)
+            RKS._nuts_produce_diverged!(frame)   # re-produce so seeding still sees a complete init below
             # phase-2: seed children — complete values+mask copied, ZERO extra pgrad/chol
             RKS._seed_nuts_children!(frame)
             @test pg.n == 1                                                      # no child recompute
@@ -1325,16 +1346,52 @@ end
             @test frame.gofwd && frame.may_sample && frame.may_continue
             _rc(frame); @test (@allocated _rc(frame)) == 0
         end
-        # EXCEPTION before seeding leaves NO child falsely blessed (children stay dirty)
-        frx = RKS._construct_nuts_frame(pf, mkvals(Float64, CountingPgrad(0)), [1.0, 2.0], 0.0, 3)
+        # An ACTUAL init exception (a THROWING destination-grad) leaves init INCOMPLETE + every child DIRTY,
+        # and _seed_nuts_children! REJECTS (never seeds an incomplete init) (RK 09:10)
+        badpg(dest, p) = (dest[1] = 99.0; error("grad boom"))
+        frx = mkframe(Float64, CountingPgrad(0), 3)   # a valid frame we then poison at execution
+        frx.init === frx.init                                                   # (touch to keep types stable)
+        badfn = RKS.compile_prepared_initialization(pf, typeof(frx.init), typeof(frx.shared))
+        # replace grad_f in the shared with the throwing pgrad, then run init -> it throws mid-init
+        # (simplest: build a fresh frame whose shared holds the throwing grad)
+        frx2 = RKS._construct_nuts_frame(pf, mkvals(Float64, badpg), [1.0, 2.0], 0.0, 3;
+                                         step_f = stepb, stats = nostats, min_dham = -1000)
+        @test_throws Any badfn(frx2.init, frx2.shared, RKS.kernel_prepared_handles(pf))   # init throws
+        @test RKS._canon_current_mask(frx2.init) != RKS._owner_mask(Ncanon, entry_owned)  # init INCOMPLETE
+        @test_throws RKS._KernelFactoryReject RKS._seed_nuts_children!(frx2)               # seeding rejects
+        @test all(RKS._canon_current_mask(ch) != RKS._owner_mask(Ncanon, entry_owned)
+                  for ch in (frx2.fwd, frx2.bwd, frx2.proposals[1]))                       # children stay DIRTY
+        # negative / incompatible max_depth REJECTS before any partial mutation (RK 09:10)
+        @test_throws RKS._KernelFactoryReject RKS._construct_nuts_frame(pf, mkvals(Float64, CountingPgrad(0)),
+            [1.0, 2.0], 0.0, -1; step_f = stepb, stats = nostats, min_dham = -1000)
+        # phase-1 children unseeded/dirty (baseline)
         @test all(RKS._canon_current_mask(ch) != RKS._owner_mask(Ncanon, entry_owned)
                   for ch in (frx.fwd, frx.bwd, frx.proposals[1]))              # unseeded → not falsely current
         # TWO independent frames: DISTINCT per-sampler mutable shared authority; external grad kept by identity
         shared_pg = CountingPgrad(0)
-        f1 = RKS._construct_nuts_frame(pf, mkvals(Float64, shared_pg), [1.0, 2.0], 0.0, 3)
-        f2 = RKS._construct_nuts_frame(pf, mkvals(Float64, shared_pg), [1.0, 2.0], 0.0, 3)
+        f1 = mkframe(Float64, shared_pg, 3)
+        f2 = mkframe(Float64, shared_pg, 3)
         @test RKS.nuts_frame_shared(f1) !== RKS.nuts_frame_shared(f2)          # separate mutable authorities
         @test f1.init !== f2.init && f1.trees[1].bwd.mom !== f2.trees[1].bwd.mom  # fully isolated
+    end
+
+    @testset "nuts_state — registered stats_f scalar-effect binding (write-roots→diag slots; nothing/opaque) (RK 08:42/09:11)" begin
+        # a registered stats_f maps its DETACHED write-roots {n_steps, acceptance_rate} to diagnostic slots
+        reg = RKS.kernel_registration(synstats!)
+        @test Set(reg.write_roots) == Set((:n_steps, :acceptance_rate))
+        b = RKS._stats_binding(synstats!, reg)
+        @test RKS.stats_binding_callable(b) === synstats!
+        @test RKS.stats_binding_produced(b) == (1, 3)                          # n_steps→1, acceptance_rate→3
+        # applying the produced-marking blesses exactly those diagnostic slots pending (0-B path is _diag_set!)
+        d = RKS._diagnostics_store(Float64); RKS._stats_produced!(d, b)
+        @test RKS._diag_produced(d, Val(1)) && RKS._diag_produced(d, Val(3))
+        @test !RKS._diag_produced(d, Val(2)) && !RKS._diag_produced(d, Val(4))
+        # stats_f = nothing is the EXPLICIT no-effect specialization (collectstats! is a no-op)
+        nb = RKS._stats_binding(nothing, nothing)
+        @test RKS.stats_binding_callable(nb) === nothing && RKS.stats_binding_produced(nb) == ()
+        @test RKS._stats_produced!(RKS._diagnostics_store(Float64), nb) isa RKS._DiagnosticsStore  # no-op
+        # an OPAQUE / unregistered stats_f REJECTS (a diagnostics callback must be a registered @kernel)
+        @test_throws RKS._KernelFactoryReject RKS._stats_binding(sin, nothing)
     end
 
     @testset "nuts_state — MIXED endpoints+vectors+scalars frame: scalar 0-B, buffers direct, F32/F64 (RK 08:47/08:51)" begin
