@@ -305,7 +305,9 @@ mutable struct _OwnState
 end
 
 # Record a place-set as WRITES effected by method `cur`: self → owned; formal → this method's
-# formalw; escape → ignored.
+# formalw. RK block pt 5: an (:escape,) WRITE place is an UNRESOLVED/deferred write target (a
+# phi/block-alias arm that lost its place, or a `:deferred` _PlaceWrite) — in AUTHORITATIVE mode
+# it must REJECT, never silently disappear from ownership; the template may defer it.
 function _own_record!(st::_OwnState, cur::MethodId, places::_Places)
     for p in places
         if p[1] === :self
@@ -313,6 +315,11 @@ function _own_record!(st::_OwnState, cur::MethodId, places::_Places)
         elseif p[1] === :formal
             s = get!(st.formalw, cur, Set{Int}())
             p[2] in s || (push!(s, p[2]); st.changed = true)
+        elseif p[1] === :escape && st.require_fields
+            throw(_KernelFactoryReject(
+                "a write resolves to an UNRESOLVED/deferred place (a phi/block-alias arm that " *
+                "did not resolve to an owner field or formal, or a `:deferred` target) — the " *
+                "authoritative closure cannot finalize ownership over it; resolve or rewrite"))
         end
     end
 end
@@ -422,10 +429,12 @@ end
 # Walk one statement in SOURCE ORDER, threading + returning the env (branch/loop/guard merged).
 function _own_stmt!(st::_OwnState, cur::MethodId, s, env::Dict{Symbol,_Places})::Dict{Symbol,_Places}
     if s isa _LocalAssign
-        # evaluate rhs effects, then (re)bind — a later rebind affects only LATER reads.
-        _own_walk_expr!(st, cur, s.rhs, env)
+        # evaluate rhs (effects + block-threaded env + RESULT places), then (re)bind — a later
+        # rebind affects only LATER reads. The rhs's abstract places become the local's alias set,
+        # so `active = begin t=fwd; t end` binds `active` to {fwd} (RK block pt 1).
+        env, pl = _own_eval!(st, cur, s.rhs, env)
         if length(s.lhs) == 1
-            env = copy(env); env[s.lhs[1]] = _kernel_place_of(s.rhs, env)
+            env = copy(env); env[s.lhs[1]] = pl
         else
             env = copy(env); for nm in s.lhs; delete!(env, nm); end   # destructure → escape
         end
@@ -433,22 +442,22 @@ function _own_stmt!(st::_OwnState, cur::MethodId, s, env::Dict{Symbol,_Places}):
         # RK block pt 3: a write THROUGH a formal (`@. ep.mom = …`) or self place is recorded by
         # traversing the TARGET root — write_roots alone omits formal-rooted writes.
         _own_record!(st, cur, _kernel_place_of(s.target, env))
-        _own_walk_expr!(st, cur, s.rhs, env)
+        env, _ = _own_eval!(st, cur, s.rhs, env)
     elseif s isa _PlaceSwap
         for w in s.targets; env = _own_stmt!(st, cur, w, env); end
     elseif s isa _SetReturn
         env = _own_stmt!(st, cur, s.write, env)
     elseif s isa _Call || s isa _CallExpr
-        for a in s.pos; _own_walk_expr!(st, cur, a, env); end
-        for kv in s.kw; _own_walk_expr!(st, cur, kv.second, env); end
+        for a in s.pos; env, _ = _own_eval!(st, cur, a, env); end
+        for kv in s.kw; env, _ = _own_eval!(st, cur, kv.second, env); end
         _own_sibling!(st, cur, s, env)           # RK block pt 2+4 (statement-position siblings)
     elseif s isa _If
-        _own_walk_expr!(st, cur, s.cond, env)
+        env, _ = _own_eval!(st, cur, s.cond, env)
         te = env; for t in s.thenb; te = _own_stmt!(st, cur, t, te); end
         ee = env; for e in s.elseb; ee = _own_stmt!(st, cur, e, ee); end
         env = _env_merge(te, ee)                     # phi merge (RK block pt 1)
     elseif s isa _For || s isa _While
-        _own_walk_expr!(st, cur, s isa _While ? s.cond : s.iter, env)
+        env, _ = _own_eval!(st, cur, s isa _While ? s.cond : s.iter, env)
         be = copy(env)
         if s isa _For
             # the loop VARIABLE aliases the iterated collection's elements — `for t in trees`
@@ -467,50 +476,70 @@ function _own_stmt!(st::_OwnState, cur::MethodId, s, env::Dict{Symbol,_Places}):
         end
         env = _env_merge(env, be)                    # may-run-zero + loop-carry: union
     elseif s isa _Guard
-        _own_walk_expr!(st, cur, s.cond, env)
+        env, _ = _own_eval!(st, cur, s.cond, env)
         be = env; for b in s.body; be = _own_stmt!(st, cur, b, be); end
         env = _env_merge(env, be)                    # guard may not run
     elseif s isa _Return
-        s.value === nothing || _own_walk_expr!(st, cur, s.value, env)
+        s.value === nothing || ((env, _) = _own_eval!(st, cur, s.value, env))
     elseif s isa _ExprStmt
-        _own_walk_expr!(st, cur, s.expr, env)
+        env, _ = _own_eval!(st, cur, s.expr, env)
     end
     env
 end
 
-# Recurse an EXPRESSION for nested call effects. Value-position blocks/ifs carry STATEMENT
-# effects (RK block pt 2): a `_BlockExpr` threads its stmts in source order (env-updated) then
-# its value; an `_IfExpr` transfers each arm and its value — the structured (mutually-exclusive)
-# fact is retained by walking arms separately, not flattened (RK block pt 6).
-function _own_walk_expr!(st::_OwnState, cur::MethodId, x, env::Dict{Symbol,_Places})
-    if x isa _BlockExpr
-        benv = env
-        for s in x.stmts; benv = _own_stmt!(st, cur, s, benv); end
-        _own_walk_expr!(st, cur, x.value, benv)
-        return nothing
+# Evaluate an EXPRESSION: record its effects, thread env through value-position blocks, and
+# RETURN both the updated env and the abstract RESULT-place set (RK block pt 1). This is a real
+# expression transfer — `active = begin t = fwd; t end` returns {fwd}, and an `_IfExpr` arm
+# containing such a block keeps its phi place, instead of collapsing to :escape.
+function _own_eval!(st::_OwnState, cur::MethodId, x, env::Dict{Symbol,_Places})
+    if x isa _SelfField
+        return env, (isempty(x.path) ? _Places([(:escape,)]) : _Places([(:self, x.path[1])]))
+    elseif x isa _FormalRef
+        return env, _Places([(:formal, x.pos)])
+    elseif x isa _LocalRef
+        return env, get(env, x.name, _Places([(:escape,)]))
+    elseif x isa _Index
+        env, _ = _own_eval!(st, cur, x.base, env)
+        pb = _kernel_place_of(x.base, env)
+        for i in x.idxs; env, _ = _own_eval!(st, cur, i, env); end
+        return env, pb                                   # index of an owned place is that place
+    elseif x isa _Getfield
+        return _own_eval!(st, cur, x.base, env)          # field of an owned place is that place
+    elseif x isa _NodeExpr
+        return _own_eval!(st, cur, x.inner, env)
+    elseif x isa _BlockExpr
+        for s in x.stmts; env = _own_stmt!(st, cur, s, env); end   # stmts thread env + record
+        return _own_eval!(st, cur, x.value, env)                    # value under the threaded env
     elseif x isa _IfExpr
-        _own_walk_expr!(st, cur, x.cond, env)
-        _own_walk_expr!(st, cur, x.thenv, env)      # arms walked separately (structured, not merged)
-        _own_walk_expr!(st, cur, x.elsev, env)
-        return nothing
-    end
-    _own_expr_effects!(st, cur, x, env)
-    if x isa _MExpr
-        for i in 1:nfields(x)
-            _own_walk_expr_field!(st, cur, getfield(x, i), env)
+        env, _ = _own_eval!(st, cur, x.cond, env)
+        et, pt = _own_eval!(st, cur, x.thenv, env)
+        ee, pe = _own_eval!(st, cur, x.elsev, env)
+        return _env_merge(et, ee), union(pt, pe)          # phi: env merge + place union
+    elseif x isa _Short
+        env, _ = _own_eval!(st, cur, x.lhs, env)
+        env, pr = _own_eval!(st, cur, x.rhs, env)
+        return env, union(_kernel_place_of(x.lhs, env), pr)
+    else
+        # a call / opcall / tuple / literal / etc.: record its effects, recurse its subexpressions
+        # (threading env), and yield an ESCAPE result place (a call result is not an owned place).
+        _own_expr_effects!(st, cur, x, env)
+        if x isa _MExpr
+            for i in 1:nfields(x)
+                env = _own_eval_field!(st, cur, getfield(x, i), env)
+            end
         end
+        return env, _Places([(:escape,)])
     end
-    nothing
 end
-function _own_walk_expr_field!(st, cur, f, env)
+function _own_eval_field!(st, cur, f, env)
     if f isa _MExpr
-        _own_walk_expr!(st, cur, f, env)
+        env, _ = _own_eval!(st, cur, f, env)
     elseif f isa Tuple
-        for e in f; _own_walk_expr_field!(st, cur, e, env); end
+        for e in f; env = _own_eval_field!(st, cur, e, env); end
     elseif f isa Pair
-        _own_walk_expr_field!(st, cur, f.second, env)
+        env = _own_eval_field!(st, cur, f.second, env)
     end
-    nothing
+    env
 end
 
 # Generic recursion over a MethodIR stmt/expr tree, calling `f` on every node.
