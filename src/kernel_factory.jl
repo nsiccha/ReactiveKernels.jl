@@ -1632,19 +1632,25 @@ kernel_prepared_external(pf::_PreparedFactory) = pf.external
 # handle for each recipe carries its provenance-validated op + mode + ids. The DESTINATION recipe is the
 # UNIQUE `:destination`-mode handle; the EXTERNAL identities are the callable (first) inputs of every
 # `:portcall` recipe. NO caller-supplied grad_recipe/external — those remain only test scaffolding.
-function _prepare_factory(skel, integrator::_KernelRegistration)
-    plan, ops = _kernel_factory_endpoint_plan(skel, integrator; with_ops = true)
+# SHARED prepared-factory core (RK-directed de-drift; POC 14:55): the SINGLE implementation both the endpoint
+# `_prepare_factory` (external-grad `:destination` allowed) and POC's free-stateful `_prepare_stateful`
+# (`allow_destination=false`) call, so the handle-zip + destination + external-authority derivation cannot
+# drift into two hand-copies. `ops`/`seam` are BOTH in exact plan.recipes order (RK 07:30): ZIP positionally,
+# assert rid equality, so the handle tuple stays CONCRETE/inferred (no Dict{Int,Any} erasing types).
+function _prepared_factory_from_plan(token, plan::_KernelPlan, ops; allow_destination::Bool)
     seam = kernel_plan_recipe_seam(plan)
-    # `ops` and `seam` are BOTH in exact plan.recipes order (RK 07:30): ZIP them positionally — assert
-    # rid equality — so the handle tuple stays CONCRETE/inferred (no Dict{Int,Any} erasing types).
     handles = map(ops, seam) do o, s
         o[1] == s[1] || throw(_KernelFactoryReject("prepared op/seam order mismatch: $(o[1]) vs $(s[1])"))
         _recipe_handle(o[2], s[2], s[3], s[4])
     end
     dests = Int[s[1] for (h, s) in zip(handles, seam) if recipe_handle_mode(h) === :destination]
+    allow_destination || isempty(dests) || throw(_KernelFactoryReject(
+        "a free stateful kernel must not carry a :destination (external-grad) recipe"))
     length(dests) <= 1 || throw(_KernelFactoryReject("ambiguous: $(length(dests)) destination recipes"))
     grad_recipe = isempty(dests) ? 0 : dests[1]
-    # external = the callable (FIRST) input canonical of every port-call recipe (the retained authorities)
+    # LIMITATION (RK, explicit): external = the FIRST input of every SELECTED :portcall recipe. Sufficient for
+    # the current pot_f-FREE fixture, but the later pot_f restoration needs ALL HAVE callable authorities
+    # retained even when their alternative recipe is UNSELECTED — not solved here.
     ext = Int[]
     for (o, s) in zip(ops, seam)
         op = o[2]
@@ -1652,8 +1658,12 @@ function _prepare_factory(skel, integrator::_KernelRegistration)
             (s[2][1] in ext || push!(ext, s[2][1]))
     end
     external = Tuple(ext)
-    _PreparedFactory{integrator.token, grad_recipe, typeof(plan), typeof(handles), typeof(external)}(
-        plan, handles, external)
+    _PreparedFactory{token, grad_recipe, typeof(plan), typeof(handles), typeof(external)}(plan, handles, external)
+end
+
+function _prepare_factory(skel, integrator::_KernelRegistration)
+    plan, ops = _kernel_factory_endpoint_plan(skel, integrator; with_ops = true)
+    _prepared_factory_from_plan(integrator.token, plan, ops; allow_destination = true)
 end
 
 # Private TEST SCAFFOLDING only (RK 07:24) — never the public author-facing constructor: a prepared

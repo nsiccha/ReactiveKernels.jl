@@ -1075,6 +1075,23 @@ end
         @test_throws RKS._KernelFactoryReject RKS._grad_binding_from_plan(synp, Val(2), pgrad_ex!, syno)  # rejects collateral
     end
 
+    @testset "construction seam — SHARED prepared-factory core (de-drift: _prepare_factory ≡ helper; allow_destination gate) (POC 14:55)" begin
+        integ = RKS.kernel_registration(leapfrog_ep!)
+        plan, ops = RKS._kernel_factory_endpoint_plan(euclidean_ep, integ; with_ops = true)
+        pf1 = RKS._prepare_factory(euclidean_ep, integ)                          # public entry (calls the helper)
+        pf2 = RKS._prepared_factory_from_plan(integ.token, plan, ops; allow_destination = true)  # helper directly
+        # BYTE-IDENTICAL: same concrete type + token + grad recipe + external authorities + handle tuple
+        @test typeof(pf1) === typeof(pf2)
+        @test RKS.kernel_prepared_token(pf1) === RKS.kernel_prepared_token(pf2) === integ.token
+        @test RKS.kernel_prepared_grad_recipe(pf1) === RKS.kernel_prepared_grad_recipe(pf2)
+        @test RKS.kernel_prepared_external(pf1) == RKS.kernel_prepared_external(pf2)
+        @test length(pf1.handles) == length(pf2.handles) &&
+              all(typeof(a) === typeof(b) for (a, b) in zip(pf1.handles, pf2.handles))
+        # allow_destination=false REJECTS an endpoint carrying a :destination (external-grad) recipe — the gate
+        # POC's free-stateful `_prepare_stateful` relies on (a free kernel must not carry an external grad).
+        @test_throws RKS._KernelFactoryReject RKS._prepared_factory_from_plan(integ.token, plan, ops; allow_destination = false)
+    end
+
     @testset "construction seam — PREPARED plan (zero planner/graph per instance), HAVE-only, type-stable grad, mask==entry_current (RK 05:47/06:49/06:55)" begin
         integ = RKS.kernel_registration(gradonly_poison_step!)   # ISOLATED endpoint — poison never leaks
         g = RKS.kernel_graph(gradonly_poison_ep)
