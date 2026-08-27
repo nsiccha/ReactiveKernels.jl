@@ -803,7 +803,7 @@ end
 # TYPES, so an `@generated` factory dispatches to the right specialization; two graphs of the same
 # slot/recipe SHAPE but different canonical Value identities (different definitions) get different
 # keys, while two fresh reads of one definition get the same key. No objectid/hash/Recipe.op.
-struct _KernelPlan{Key,S<:Tuple,A<:Tuple,P<:Tuple,R<:Tuple,E<:Tuple,RI<:Tuple}
+struct _KernelPlan{Key,S<:Tuple,A<:Tuple,P<:Tuple,R<:Tuple,E<:Tuple,RI<:Tuple,RO<:Tuple}
     slots::S          # Tuple{_PlanSlot...}
     alias_groups::A   # Tuple{Tuple{Vararg{Symbol}}...} — deterministic (first-occurrence order)
     producer::P       # Tuple{Tuple{Int,Int}...} — (canonical Value id, selected Recipe id), sorted
@@ -811,13 +811,42 @@ struct _KernelPlan{Key,S<:Tuple,A<:Tuple,P<:Tuple,R<:Tuple,E<:Tuple,RI<:Tuple}
     entry_current::E  # Tuple{Int...} — canonical ids CURRENT after the Plan runs = HAVE ∪ the
                       #   producer-map KEYS (recipe-owned rule; collateral is NOT blessed)
     recipe_inputs::RI # Tuple{Tuple{Int,Tuple{Vararg{Int}}}...} — (selected Recipe id, its CANONICAL
-                      #   input Value ids), a DETACHED snapshot so a later mutation of the live
-                      #   (mutable) KernelSpec graph cannot change dependency/kill scheduling under
-                      #   the same immutable plan key (RK 04:43). poc reads inputs from HERE.
+                      #   input Value ids in AUTHORED positional order), a DETACHED snapshot so a later
+                      #   mutation of the live KernelSpec graph cannot change dependency/kill scheduling
+                      #   under the same immutable plan key (RK 04:43). poc reads inputs from HERE.
+    recipe_outputs::RO # Tuple{Tuple{Int,Tuple{Vararg{Int}}}...} — (selected Recipe id, its CANONICAL
+                      #   output Value ids in EXACT AUTHORED POSITIONAL ORDER, captured from `r.outputs`
+                      #   during the single planning pass; RK 07:09). A returned tuple/scalar binds to
+                      #   these destinations POSITIONALLY — NEVER reconstructed by sorted ids. The
+                      #   producer-OWNED subset (what may be blessed) is `producer`, not this.
 end
-_KernelPlan(key, slots::S, groups::A, producer::P, recipes::R, ec::E, ri::RI) where {S,A,P,R,E,RI} =
-    _KernelPlan{key,S,A,P,R,E,RI}(slots, groups, producer, recipes, ec, ri)
+_KernelPlan(key, slots::S, groups::A, producer::P, recipes::R, ec::E, ri::RI, ro::RO) where {S,A,P,R,E,RI,RO} =
+    _KernelPlan{key,S,A,P,R,E,RI,RO}(slots, groups, producer, recipes, ec, ri, ro)
 kernel_plan_recipe_inputs(p::_KernelPlan) = p.recipe_inputs
+# The immutable ALL-OUTPUT identities of each selected recipe in EXACT AUTHORED POSITIONAL ORDER (RK
+# 07:09) — captured from `r.outputs`, so a returned tuple/scalar binds to `output[i]`'s canonical
+# destination POSITIONALLY. This is the ASSIGNMENT seam; it is NOT the blessing set (a recipe may emit a
+# COLLATERAL output owned by another producer — that value is assigned but must NEVER be blessed here).
+kernel_plan_recipe_outputs(p::_KernelPlan) = p.recipe_outputs
+# The producer-OWNED canonical output subset of each selected recipe (RK 07:09) — from `Plan.producer`,
+# so BLESSING follows producer ownership only (collateral outputs excluded). In `p.recipes` order; the
+# owned subset preserves the recipe's authored output order (a filtered view of `recipe_outputs`).
+function kernel_plan_producer_owned(p::_KernelPlan)
+    ownedof = Dict{Int,Set{Int}}()
+    for (canon, rid) in p.producer; push!(get!(ownedof, rid, Set{Int}()), canon); end
+    outby = Dict{Int,Any}(p.recipe_outputs)
+    Tuple((rid, Tuple(c for c in get(outby, rid, ()) if c in get(ownedof, rid, Set{Int}())))
+          for rid in p.recipes)
+end
+# The full detached EXECUTION SEAM poc consumes (RK 07:09): each selected recipe in EXECUTION order as
+# `(recipe id, ordered INPUT ids, ordered ALL-OUTPUT ids, producer-OWNED output subset)`. Inputs +
+# outputs bind POSITIONALLY (assignment); only the owned subset is blessed. No Recipe.op / live-graph reread.
+function kernel_plan_recipe_seam(p::_KernelPlan)
+    inby = Dict{Int,Any}(p.recipe_inputs)
+    outby = Dict{Int,Any}(p.recipe_outputs)
+    ownby = Dict{Int,Any}(kernel_plan_producer_owned(p))
+    Tuple((rid, get(inby, rid, ()), get(outby, rid, ()), get(ownby, rid, ())) for rid in p.recipes)
+end
 kernel_plan_key(::_KernelPlan{Key}) where {Key} = Key
 # The integrator/owner definition Token (RK 04:41): poc proves `binder target Token == plan
 # integrator Token` through THIS accessor, never by destructuring the key tuple internals.
@@ -943,9 +972,15 @@ function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol}; key
         # arguments positionally), captured now so a live-graph mutation cannot alter it.
         recipe_inputs = Tuple((r.id, Tuple(canon_id(graph, v.id) for v in r.inputs))
                               for r in pl.recipes)
+        # DETACHED ordered OUTPUT snapshot (RK 07:09): each selected recipe's CANONICAL output Value ids
+        # in EXACT AUTHORED POSITIONAL ORDER from `r.outputs` — a returned tuple/scalar binds positionally,
+        # so this is NEVER reconstructed by inverting/sorting the producer map (which drops order AND
+        # collateral outputs). The producer-OWNED subset (blessing) stays `producer`.
+        recipe_outputs = Tuple((r.id, Tuple(canon_id(graph, v.id) for v in r.outputs))
+                               for r in pl.recipes)
         producer_keys = Int[cid for (cid, _) in producer]
     else
-        producer = (); recipes = (); recipe_inputs = ()
+        producer = (); recipes = (); recipe_inputs = (); recipe_outputs = ()
     end
     pkset = Set(producer_keys)
     # entry_current: the proven POST-construction current set = canonical HAVE ∪ the producer-map
@@ -966,8 +1001,8 @@ function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol}; key
     # `kernel_spec` reads of one const definition, distinct across definitions) make two same-SHAPE
     # graphs under the same integrator produce DIFFERENT keys. NO objectid/hash/Recipe.op.
     slot_sig = Tuple((s.path, s.canon, s.role, s.slot) for s in slots)
-    key = (key_token, slot_sig, groups, producer, recipes, recipe_inputs)
-    _KernelPlan(key, Tuple(slots), groups, producer, recipes, Tuple(ec), recipe_inputs)
+    key = (key_token, slot_sig, groups, producer, recipes, recipe_inputs, recipe_outputs)
+    _KernelPlan(key, Tuple(slots), groups, producer, recipes, Tuple(ec), recipe_inputs, recipe_outputs)
 end
 
 # The endpoint plan under an integrator (the immutable canonical map poc wires codegen against).
@@ -1075,10 +1110,13 @@ end
 end
 # Seed an owned CHILD endpoint from `src` (init→fwd/bwd/proposals): value + VALIDITY transfer with ZERO
 # additional pgrad (RK 06:53/06:56). Restricted to `_CanonOwned` — SHARED authority is uncopyable BY TYPE
-# (referenced by identity, never seeded). EXCEPTION-SAFE: validate every buffer shape BEFORE any mutation,
-# DIRTIFY dest first, copy each slot, and install `src`'s saved mask ONLY after every slot succeeds — a
-# mid-copy `copyto!` throw leaves NO stale current bit. `dest === src` is a mask-preserving no-op. The
-# scalar-vs-buffer branch is generated from the CONCRETE fieldtype (no runtime `isa`); exact 0-B.
+# (referenced by identity, never seeded). The EPOCH contract is NO STALE BLESSED VALUE, NOT transactional
+# rollback (RK 07:08): validate every buffer shape BEFORE any mutation (a shape mismatch rejects with dest
+# untouched), DIRTIFY dest, copy each slot, then install `src`'s saved mask ONLY after every slot succeeds.
+# So a shape mismatch leaves values unchanged, while a POST-VALIDATION `copyto!` throw leaves dest DIRTY
+# (mask zero — no stale current bit) with its VALUES unspecified/partially touched (no rollback allocated).
+# `dest === src` is a mask+value-preserving no-op. Scalar-vs-buffer branch is generated from the CONCRETE
+# fieldtype (no runtime `isa`); exact 0-B.
 @generated function _canon_copy_endpoint!(dest::S, src::S) where {S<:_CanonOwned}
     N = fieldcount(S) - 1
     W = fieldcount(fieldtype(S, N + 1))                  # `current::NTuple{W,UInt}`
@@ -1166,17 +1204,24 @@ grad_binding_callable(b::_GradBinding) = b.pgrad!
 # Recipe.op — only the detached plan Key + the owned struct's field types.
 @generated function _grad_binding_from_plan(::_KernelPlan{Key}, ::Val{GR}, pgrad!,
                                             owned::_CanonOwned) where {Key, GR}
-    producer = Key[4]                                   # Tuple of (canonical id, selected Recipe id)
-    slot_sig = Key[2]                                   # Tuple of (path, canon, role, absolute slot)
-    outs = Int[c for (c, rid) in producer if rid == GR]
+    slot_sig = Key[2]                                   # (path, canon, role, absolute slot)
+    producer = Key[4]                                   # (canonical id, selected Recipe id) — OWNED map
+    recipe_outputs = Key[7]                             # (recipe id, ORDERED output canons) — authored order
+    outs = Int[]                                        # this recipe's outputs in EXACT authored order
+    for (rid, os) in recipe_outputs; rid == GR && (outs = collect(os); break); end
     length(outs) == 2 || return :(throw(_KernelFactoryReject(
-        "grad recipe $($GR) is the selected producer for $($(length(outs))) canonical output(s); a " *
-        "destination-aware gradient binding requires EXACTLY two (the gradient buffer + the potential)")))
+        "grad recipe $($GR) has $($(length(outs))) authored output(s); a destination-aware gradient " *
+        "binding requires EXACTLY two (the potential + the gradient buffer)")))
+    owned_by_gr = Set{Int}(c for (c, rid) in producer if rid == GR)   # blessing follows OWNERSHIP
+    all(c -> c in owned_by_gr, outs) || return :(throw(_KernelFactoryReject(
+        "both grad-recipe outputs must be PRODUCER-OWNED by recipe $($GR) (no collateral)")))
     slotof = Dict{Int,Tuple{Symbol,Int}}()
     for (_, canon, role, slot) in slot_sig; slotof[canon] = (role, slot); end
     fields = Union{Nothing,Tuple{Symbol,Int}}[get(slotof, c, nothing) for c in outs]
     all(f -> f !== nothing && f[1] === :owned, fields) || return :(throw(_KernelFactoryReject(
         "both grad-recipe outputs must be OWNED canonical slots")))
+    # roles from TYPED prepared metadata at EXACT authored output positions (RK 07:09), never sorted ids:
+    # the BUFFER-typed output is the in-place gradient `dest`, the SCALAR-typed output is `pot`.
     slots = Int[f[2] for f in fields]
     kinds = Symbol[fieldtype(owned, s) <: AbstractArray ? :buffer : :scalar for s in slots]
     (count(==(:buffer), kinds) == 1 && count(==(:scalar), kinds) == 1) || return :(throw(_KernelFactoryReject(

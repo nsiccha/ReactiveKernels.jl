@@ -128,6 +128,13 @@ mutable struct CountingPgrad; n::Int; end
 (c::CountingPgrad)(dest, pos) = (c.n += 1; dest .= 2 .* pos; sum(abs2, pos))
 # function barrier for the whole-endpoint mixed scalar+buffer copy 0-B / @inferred gate (RK 07:02)
 _copyep0b(d, s) = RKS._canon_copy_endpoint!(d, s)
+# a buffer that THROWS during copyto! (post-validation mid-copy failure) — proves the epoch contract
+# (mask stays zero/dirty; no stale blessed bit) after an ACTUAL mid-copy throw (RK 07:08).
+mutable struct ThrowingBuf <: AbstractVector{Float64}; data::Vector{Float64}; end
+Base.size(t::ThrowingBuf) = size(t.data)
+Base.getindex(t::ThrowingBuf, i::Int) = t.data[i]
+Base.setindex!(t::ThrowingBuf, v, i::Int) = (t.data[i] = v)
+Base.copyto!(::ThrowingBuf, ::AbstractArray) = error("mid-copy throw")   # unambiguous, wins on arg1
 # a SECOND, byte-identical endpoint DEFINITION — same slot/recipe SHAPE, DIFFERENT canonical
 # Value identities — to prove the plan key distinguishes definitions (RK 04:17c).
 @kernel phasepoint_ep2(pot_f, grad_f, metric, pos, mom) = begin
@@ -975,6 +982,51 @@ end
         @test RKS._canon_slot(o, Val(1)) == [2.0, 4.0]
     end
 
+    @testset "construction seam — ORDERED all-outputs (authored order) + producer-owned subset seam (RK 07:09)" begin
+        integ = RKS.kernel_registration(gradonly_step!)
+        plan = RKS._kernel_factory_endpoint_plan(gradonly_ep, integ)
+        g = RKS.kernel_graph(gradonly_ep)
+        canonof(n) = RKS.canon_id(g, gradonly_ep.ports[n].id)
+        cpot, cdpot = canonof(:pot), canonof(:dpot_dpos)
+        ro = RKS.kernel_plan_recipe_outputs(plan)
+        po = RKS.kernel_plan_producer_owned(plan)
+        seam = RKS.kernel_plan_recipe_seam(plan)
+        @test ro isa Tuple && all(e -> e isa Tuple{Int,<:Tuple}, ro)
+        @test [e[1] for e in seam] == collect(RKS.kernel_plan_recipes(plan))    # execution order
+        @test all(e -> length(e) == 4, seam)                                    # (rid, in, allout, owned)
+        gr = Dict(RKS.kernel_plan_producer(plan))[cpot]
+        grout = only(os for (rid, os) in ro if rid == gr)
+        grown = only(os for (rid, os) in po if rid == gr)
+        # EXACT AUTHORED POSITIONAL ORDER from r.outputs — NOT reconstructed by sorted ids
+        grrecipe = only(r for r in g.recipes if r.id == gr)
+        @test grout == Tuple(RKS.canon_id(g, v.id) for v in grrecipe.outputs)   # authored positional order
+        @test Set(grown) ⊆ Set(grout) && Set(grown) == Set((cpot, cdpot))       # pot_f-free -> both owned
+        @test grown == Tuple(c for c in grout if c in Set(grown))               # owned subset keeps order
+        # the type-stable binding derives pot/dest from these ORDERED outputs (not sorted ids)
+        mkvals() = Dict{Int,Any}(canonof(:pos) => [1.0, 2.0], cpot => 0.0, cdpot => [0.0, 0.0], canonof(:grad_f) => pgrad_ex!)
+        owp, _ = RKS._kernel_construct_endpoint(Val(:g), plan, mkvals(), (canonof(:grad_f),))
+        b = RKS._grad_binding_from_plan(plan, Val(gr), pgrad_ex!, owp)
+        @test b.dest === Val(RKS.kernel_plan_field(plan, cdpot)[2])             # buffer output -> dest
+        @test b.pot === Val(RKS.kernel_plan_field(plan, cpot)[2])              # scalar output -> pot
+        # DETERMINISTIC synthetic COLLATERAL (RK 07:15, non-vacuous): R1 (id 1) produces x,y; R2 (id 2)
+        # EMITS y (collateral, owned by R1) then z (owned). Collateral y is ASSIGNED (recipe_outputs) but
+        # NEVER blessed (excluded from producer_owned), and the grad binding on R2 REJECTS it.
+        sl = [RKS._PlanSlot((:y,), 102, :owned, 1), RKS._PlanSlot((:z,), 103, :owned, 2)]
+        slot_sig = Tuple((s.path, s.canon, s.role, s.slot) for s in sl)
+        producer = ((102, 1), (103, 2))                                        # y owned by R1, z by R2
+        recipes = (1, 2); recipe_inputs = ((1, ()), (2, (102,)))
+        recipe_outputs = ((1, (101, 102)), (2, (102, 103)))                    # R2 emits collateral y then z
+        key = (:syn, slot_sig, (), producer, recipes, recipe_inputs, recipe_outputs)
+        synp = RKS._KernelPlan(key, Tuple(sl), (), producer, recipes, (102, 103), recipe_inputs, recipe_outputs)
+        @test RKS.kernel_plan_recipe_outputs(synp) == recipe_outputs           # ordered ALL outputs
+        r2out = only(o for (r, o) in RKS.kernel_plan_recipe_outputs(synp) if r == 2)
+        r2own = only(o for (r, o) in RKS.kernel_plan_producer_owned(synp) if r == 2)
+        @test r2out == (102, 103) && r2own == (103,)                           # y assigned, only z owned
+        @test setdiff(Set(r2out), Set(r2own)) == Set((102,))                   # NON-VACUOUS collateral = y
+        syno = RKS._CanonOwned2(Float64[0, 0], 0.0, RKS._owner_mask(2, Int[]))
+        @test_throws RKS._KernelFactoryReject RKS._grad_binding_from_plan(synp, Val(2), pgrad_ex!, syno)  # rejects collateral
+    end
+
     @testset "construction seam — PREPARED plan (zero planner/graph per instance), HAVE-only, type-stable grad, mask==entry_current (RK 05:47/06:49/06:55)" begin
         integ = RKS.kernel_registration(gradonly_poison_step!)   # ISOLATED endpoint — poison never leaks
         g = RKS.kernel_graph(gradonly_poison_ep)
@@ -1064,7 +1116,8 @@ end
             @test (@inferred _copyep0b(ch, it)) === ch                          # result identity, inferred
             @test (@allocated _copyep0b(ch, it)) == 0                           # exact 0-B
         end
-        # EXCEPTION-SAFE: a buffer-shape mismatch throws BEFORE any mutation → dest keeps OLD mask AND values
+        # PRE-VALIDATION reject: a buffer-shape mismatch throws BEFORE any mutation → dest keeps OLD mask
+        # AND values (this is the ONLY case values are guaranteed unchanged — RK 07:08)
         bad = RKS._kernel_construct_owned_child(Val(tok), plan,
             Dict{Int,Any}(cpos => [9.0], cpot => 7.0, cdpot => [8.0], cgf => pg))
         premask = RKS._canon_current_mask(bad); badpot = RKS._canon_slot(bad, Val(pot_slot))
@@ -1075,6 +1128,17 @@ end
         @test RKS._canon_slot(bad, Val(dpot_slot)) == badbuf
         # the copier is CanonOwned-only — shared authority is uncopyable BY TYPE
         @test !hasmethod(RKS._canon_copy_endpoint!, Tuple{RKS._CanonShared, RKS._CanonShared})
+    end
+
+    @testset "construction seam — ACTUAL mid-copy throw leaves NO stale blessed bit (epoch contract, not rollback) (RK 07:08)" begin
+        # sizes MATCH (validation passes) but the dest buffer THROWS during copyto! — a post-validation
+        # mid-copy failure. The epoch contract requires the dest mask to end DIRTY (zero) — no stale
+        # current bit — even though values are unspecified/partially touched (no rollback).
+        src = RKS._CanonOwned2(ThrowingBuf([1.0, 2.0]), 5.0, RKS._owner_mask(2, [1, 2]))   # both current
+        dest = RKS._CanonOwned2(ThrowingBuf([0.0, 0.0]), 0.0, RKS._owner_mask(2, [1, 2]))  # starts current
+        @test RKS._canon_current_mask(dest) == RKS._owner_mask(2, [1, 2])
+        @test_throws ErrorException RKS._canon_copy_endpoint!(dest, src)         # copyto! throws mid-copy
+        @test RKS._canon_current_mask(dest) == RKS._owner_mask(2, Int[])         # DIRTY — no stale blessed bit
     end
 
     @testset "poc binder/plan seam accessors (RK 04:41)" begin
