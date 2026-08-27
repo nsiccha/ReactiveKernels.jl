@@ -59,11 +59,29 @@ method_named(b, n) = only(filter(m -> methodname(m) === n, b.methods))
 
 blocks = kernel_blocks()
 @testset "A/B/C + 22:46 source-contract gate" begin
-    for k in (:euclidean_phasepoint, :leapfrog!, :nuts_state, Symbol("nuts!!"),
-              :dual_averaging_state, :welford_var)
+    for k in (:euclidean_phasepoint, :leapfrog!, Symbol("refresh_momentum!!"), Symbol("nuts_stats!"),
+              :nuts_state, Symbol("nuts!!"), :dual_averaging_state, :welford_var)
         @test haskey(blocks, k)
     end
     @test !haskey(blocks, Symbol("copy!!"))   # copy!! is the RK-CORE intrinsic — NOT authored in the fixture
+
+    # ---- GRAD: euclidean_phasepoint takes ONLY grad_f (pot_f DROPPED — no required-but-unused authority) ----
+    ep0 = blocks[:euclidean_phasepoint]; epf = formals(ep0.sig)
+    @test :grad_f in epf && :metric in epf && :pos in epf && :mom in epf
+    @test !(:pot_f in epf)                                             # pot_f absent from the signature
+    # AST-based (formatting-robust): find the assignment (pot, dpot_dpos) = grad_f(pos).
+    grad_recipe = Ref(false); pot_f_producer = Ref(false)
+    _walk(ep0.body) do x
+        x isa Expr || return
+        if x.head === :(=) && x.args[1] isa Expr && x.args[1].head === :tuple && x.args[1].args == [:pot, :dpot_dpos] &&
+           x.args[2] isa Expr && x.args[2].head === :call && x.args[2].args == [:grad_f, :pos]
+            grad_recipe[] = true
+        end
+        x.head === :call && x.args[1] === :pot_f && (pot_f_producer[] = true)
+    end
+    @test grad_recipe[]                                              # ONE destination-bound grad recipe (pot+dpot)
+    @test !pot_f_producer[]                                          # no redundant pot-only producer call
+    println("  (grad) euclidean_phasepoint(grad_f, metric, pos, mom): one grad recipe, pot_f absent. OK")
 
     # ---- FORM A: leapfrog! RK @kernel, exact 3-line mom/pos/mom -----------------------------------
     lf = blocks[:leapfrog!]; @test :stepsize in formals(lf.sig)
@@ -155,7 +173,10 @@ blocks = kernel_blocks()
 
     # (B-own) the pinned ownership policy is EXPECTED METADATA (documented, NOT hand-implemented): the
     #         shared authority + the complete owned set are named in the source.
-    for f in ("pot_f", "grad_f", "metric", "chol_metric"); @test occursin(f, SRC); end       # shared
+    for f in ("grad_f", "metric", "chol_metric"); @test occursin(f, SRC); end                # shared (NO pot_f)
+    # pot_f absence is proven on the euclidean_phasepoint signature/body above (not a text scan — comments
+    # legitimately mention "no pot_f"); assert it is not a formal of ANY authored @kernel block.
+    @test all(b -> !(:pot_f in formals(b.sig)), values(blocks))
     for f in ("pos", "mom", "dpot_dpos", "dkin_dmom", "dham_dpos", "dham_dmom", "pot", "kin", "ham")
         @test occursin(f, SRC)                                                                # owned
     end
@@ -204,6 +225,19 @@ blocks = kernel_blocks()
     @test occursin("oftype(init.ham", SRC)
     @test occursin("zero(init.ham)", nb)
     @test !occursin("min_dham = -1000", SRC) && !occursin("dham = 0.", nb)
+    # (B-Tforms) tree/DA/Welford construction is T-derived — sentinel oftype(ham,-Inf); DA defaults oftype(init,…);
+    #            Welford over a template vector (zero(template)); no hardcoded Float64 constructors.
+    @test occursin("oftype(phasepoint.ham, -Inf)", SRC) && !occursin("fill(-Inf", SRC)      # tree sentinel typed
+    @test occursin("oftype(init, .8)", SRC) && occursin("oftype(init, .05)", SRC)           # DA defaults typed
+    @test occursin("welford_var(template::AbstractVector)", SRC) && occursin("zero(template)", SRC)  # Welford T-template
+    @test !occursin("welford_var(dim::Int)", SRC) && !occursin("n = 0.", SRC)               # no Int/Float64 Welford
+    @test occursin("trajectory(v::AbstractVector)", SRC) && occursin("mv(v::AbstractVector)", SRC)   # buffers from template
+
+    # (B-diag) owned diagnostics on nuts_state (compiler-owned storage), reset per transition; n_steps produced
+    #          by the registered stats callback, independent of pgrad + leapfrog body marker.
+    for f in (:n_steps, :reached_depth, :acceptance_rate); @test f in ns.fields; end
+    @test :n_steps in reset_writes && :acceptance_rate in reset_writes                       # diagnostics reset per transition
+    @test occursin("collectstats!(__self__)", nb) && occursin("stats_f(__self__)", nb)       # per-leaf stats callback
 
     # (B-fields) reference field spellings + concrete endpoint param `ep` threaded through recursion.
     nsnames = Set(ns.fields) ∪ Set(ns.sources)
@@ -222,7 +256,25 @@ blocks = kernel_blocks()
     c = srcof(nb2.body)
     @test occursin("return state", c)
     @test occursin("step!(state, rng)", c) || occursin("step!(state; rng", c)   # rng consumed, not ignored
-    println("  (C) @kernel nuts!!(state; rng): threads runtime rng into step!(state, rng), returns state. OK")
+    # (C-refresh) public nuts!! refreshes momentum on the owned init phasepoint BEFORE step! (no hidden refresh).
+    @test occursin("refresh_momentum!!(state.init; rng)", c)
+    ci_refresh = findfirst("refresh_momentum!!", c); ci_step = findfirst("step!(state", c)
+    @test ci_refresh !== nothing && ci_step !== nothing && first(ci_refresh) < first(ci_step)   # refresh precedes step!
+    println("  (C) @kernel nuts!!(state; rng): refresh_momentum!! on state.init THEN step!(state, rng), returns state. OK")
+
+    # ---- FORM A2: refresh_momentum!! RK @kernel — SOURCE MUTATION ONLY (randn! + lmul!), no cache writes ----
+    rf = blocks[Symbol("refresh_momentum!!")]; @test :phasepoint in formals(rf.sig) && :rng in formals(rf.sig)
+    rfb = srcof(rf.body)
+    @test occursin("Random.randn!(rng, phasepoint.mom)", rfb) && occursin("LinearAlgebra.lmul!(phasepoint.chol_metric.L, phasepoint.mom)", rfb)
+    @test !occursin("@node", rfb)                                            # no @node reference (shared logdet reused)
+    for w in ("phasepoint.kin =", "phasepoint.ham =", "phasepoint.dkin_dmom =", "phasepoint.dham_dmom ="); @test !occursin(w, rfb); end  # NO author cache writes
+    println("  (A2) refresh_momentum!!: source mutation only (randn!/lmul!), no cache/@node writes. OK")
+
+    # ---- STATS IDENTITY: registered nuts_stats! increments owned n_steps; production binding uses it ----
+    st = blocks[Symbol("nuts_stats!")]; @test :state in formals(st.sig)
+    stb = srcof(st.body)
+    @test occursin("state.n_steps += 1", stb)                                # one increment per collectstats!/leaf
+    @test occursin("stats_f = nuts_stats!", SRC)                             # production binding is the registered callback (not nothing)
 
     # ---- @node preserved; @reactive-as-macro absent; free @kernel leapfrog!/rcopy!!/nuts!! ----------
     @test occursin("@node(logdet(chol_metric))", SRC)
@@ -230,7 +282,17 @@ blocks = kernel_blocks()
     _walk(AST) do x; x isa Expr && x.head === :macrocall && x.args[1] === Symbol("@reactive") && (has_reactive[] = true); end
     @test !has_reactive[]
     @test occursin("@kernel leapfrog!", SRC) && occursin("@kernel nuts!!", SRC)
-    println("  (@node) preserved; @reactive absent (macro); free @kernel leapfrog!/nuts!!; copy!! is core. OK")
+    @test occursin("@kernel refresh_momentum!!", SRC) && occursin("@kernel nuts_stats!", SRC)   # free refresh + stats kernels
+    # public @rk_* exact-identity effect declarations (973f7f4/bf7d2ed) — SEVEN module helpers (incl. min1exp,
+    # which nuts_stats! calls; the compiler is forbidden to inspect its body, so it MUST be declared).
+    for d in ("@rk_pure finiteorneginf 1", "@rk_pure min1exp 1", "@rk_borrows badd 2", "@rk_rng randbernoullilog 2 1",
+              "@rk_pure logswapprob 1", "@rk_pure compute_criterion 3", "@rk_pure smooth 3")
+        @test occursin(d, SRC)
+    end
+    # every ordinary module helper the authored kernels CALL must carry an @rk_* declaration (no body inference).
+    @test occursin("min1exp(state.dham)", srcof(blocks[Symbol("nuts_stats!")].body)) && occursin("@rk_pure min1exp 1", SRC)
+    println("  (@node) preserved; @reactive absent; free @kernel leapfrog!/refresh_momentum!!/nuts_stats!/nuts!!;")
+    println("      SEVEN public @rk_* helper effect declarations (incl. @rk_pure min1exp 1); copy!! is core. OK")
 end
 
 # --- NON-VACUOUS lexical-shadowing inventory (nuts_state) --------------------------------------------
