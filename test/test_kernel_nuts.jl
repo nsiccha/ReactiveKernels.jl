@@ -44,16 +44,19 @@ _slot(pf, ep, f) = RK._canon_slot(ep, RK.kernel_plan_named_slot_val(RK.kernel_pr
     @test RK._diag_slot(frame.diag, Val(4)) != 0.0            # dham is a real (fresh-momentum) energy error, not stale 0
 end
 
-@testset "kernel_nuts — public root is @inferred + step-fn 0-B behind a typed barrier" begin
+@testset "kernel_nuts — public root @inferred + EXACT 0-B for two rng types (Xoshiro + MersenneTwister)" begin
     pf = _nuts_pf(); frame = _nuts_frame(pf, Float64, 3)
     C = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame)
     rt = Base.return_types(C.root!, (typeof(frame), typeof(C.scratch), typeof(Random.Xoshiro(1))))
     @test length(rt) == 1 && isconcretetype(rt[1])            # concrete _NutsFrame return
     @inferred C.root!(frame, C.scratch, Random.Xoshiro(1))
-    # the compiled step dispatcher is exact 0-B behind a clean in-fn barrier (refresh's chol.L wrapper is separate)
-    zerob(fn, fr, sc, rg, cc) = (fn(fr, sc, rg, cc); GC.gc(); @allocated fn(fr, sc, rg, cc))
-    RK._nuts_frame_reset_control!(frame)
-    @test zerob(C.fn, frame, C.scratch, Random.Xoshiro(1), C.cfg) == 0
+    # the WHOLE public root (refresh + step + epoch) is exact 0-B behind a clean in-fn barrier, both rng types
+    function root0b(root, fr, sc, rg)
+        RK._nuts_frame_reset_control!(fr); root(fr, sc, rg); GC.gc()
+        RK._nuts_frame_reset_control!(fr); @allocated root(fr, sc, rg)
+    end
+    @test root0b(C.root!, frame, C.scratch, Random.Xoshiro(1)) == 0
+    @test root0b(C.root!, frame, C.scratch, Random.MersenneTwister(2)) == 0
 end
 
 @testset "kernel_nuts — RNG-INDEPENDENT: one sampler accepts two rng types, scratch/root types unchanged" begin

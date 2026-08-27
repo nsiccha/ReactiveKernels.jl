@@ -88,6 +88,33 @@ function compile_refresh(pf, ::Type{OW}, ::Type{SH}, refresh_ir::MethodIR) where
     _CompiledRefresh{typeof(randfn), typeof(lmulfn), mom_slot, chol_slot, kills}(randfn, lmulfn)
 end
 
+# A CONCRETE callable public root (RK): a local closure re-materializes its captured cfg NamedTuple + handle
+# tuple on each call (allocating under the try/catch); a concrete struct stores them in concretely-typed
+# fields so the @inline call method reads them directly and is exact 0-B, and Julia specializes it per runtime
+# rng type (root/scratch stay RNG-independent — the syntax `_NutsHandles{RootToken,Root,Scratch}` is unchanged,
+# `Root == typeof(this)`). Wraps the derived-and-validated refresh+step body in ONE OUTER EPOCH.
+struct _CompiledNutsRoot{Fn, Refresh, Cfg, H}
+    fn::Fn
+    refresh::Refresh
+    cfg::Cfg
+    handles::H
+end
+@inline function (r::_CompiledNutsRoot)(fr, sc, rng)
+    _diagnostics_reset!(getfield(fr, :diag))              # root-begin: clear diag committed + set pending
+    _nuts_invalidate_diverged!(fr)                        # clear derived-diverged committed + pending
+    try
+        r.refresh(getfield(fr, :init), getfield(fr, :shared), r.handles, rng)   # refresh (mom-deps killed)
+        r.fn(fr, sc, rng, r.cfg)                          # the compiled step! machine
+        _diagnostics_root_commit!(getfield(fr, :diag))    # single deferred commit — only on success
+        _nuts_derived_root_commit!(fr)
+    catch
+        setfield!(getfield(fr, :diag), :pending, UInt(0)) # ABORT: clear pending so nothing is falsely current
+        _nuts_invalidate_diverged!(fr)                    # (committed already zeroed; executed-prefix kills stand)
+        rethrow()
+    end
+    fr
+end
+
 # Consume + VALIDATE the authored public root MethodIR (nuts!!) and DERIVE its operation order (RK): the root
 # is lowered FROM the captured IR, never hardcoded. The supported shape is exactly a refresh_momentum!! source
 # call on the subject's init, then a subject `step!` call, then `return __self__` (result===state). Any drift —
@@ -637,29 +664,8 @@ function compile_nuts(pf::_PreparedFactory, skel, refresh_skel, nuts_root_skel, 
     _derive_public_root_ops(nuts_ir, root_name, runtimearg, kernel_token(refresh_skel))
     RootToken = kernel_token(nuts_root_skel)
     step!(fr, sc, rng) = (fn(fr, sc, rng, cfg); fr)
-    # PUBLIC ROOT — one outer epoch over refresh_momentum!! + step! (RK): root-BEGIN clears the diagnostics and
-    # derived-`diverged` committed/pending masks (so an in-epoch throw leaves nothing falsely current), then
-    # refresh (source mom write, mom-dependents killed) and step! run; the SINGLE deferred commit blesses the
-    # diagnostics + derived only after the whole body succeeds. A throw before the commit skips it — committed
-    # stays cleared and the executed-prefix kills leave partial writes dirty. Returns the same frame.
-    root!(fr, sc, rng) = begin
-        _diagnostics_reset!(getfield(fr, :diag))          # clear diag committed + set pending, before authored resets
-        _nuts_invalidate_diverged!(fr)                    # clear derived-diverged committed + pending
-        try
-            refresh(getfield(fr, :init), getfield(fr, :shared), H, rng)
-            fn(fr, sc, rng, cfg)
-            _diagnostics_root_commit!(getfield(fr, :diag))    # single deferred commit — only on success
-            _nuts_derived_root_commit!(fr)
-        catch
-            # ABORT (RK): a throw AFTER a stats/diverged producer set pending would otherwise leave those
-            # pending bits readable as within-epoch current past the epoch end. Clear BOTH masks (committed is
-            # already zeroed) so nothing is falsely current; the endpoint executed-prefix kills already reflect
-            # the partial work (refresh/leapfrog kill-before-write), and a retry repairs. Then rethrow.
-            setfield!(getfield(fr, :diag), :pending, UInt(0))
-            _nuts_invalidate_diverged!(fr)
-            rethrow()
-        end
-        fr
-    end
+    # PUBLIC ROOT — a CONCRETE callable (not a closure) so its cfg/handles are typed fields, not re-materialized
+    # captures: the derived-and-validated refresh + step! body under ONE OUTER EPOCH. Exact 0-B, RNG-specialized.
+    root! = _CompiledNutsRoot(fn, refresh, cfg, H)
     (root! = root!, scratch = scratch, RootToken = RootToken, step! = step!, cfg = cfg, refresh = refresh, fn = fn)
 end
