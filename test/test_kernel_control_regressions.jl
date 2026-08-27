@@ -44,9 +44,38 @@ _mid(name) = RKC.MethodId(name, 1, 0, 0, (), (), (), ())
 _callee(name, fs) = (id = _mid(name), formals = fs)
 _call(name, pos, kw=()) = RKC._Call(name, (), RKC._SelfRef(), Tuple(pos), Tuple(kw))  # target::_MExpr
 
+# EXECUTABLE discarded-return discriminator (RK): a real recursive @kernel whose base case tail is a
+# DISCARDED `return Base.fill!(buf, 7)`. Compiled through the control machine and RUN, it must mutate the
+# real buffer — the old build_region! dropped the return expression, leaving the buffer untouched.
+@kernel _fillrec(s) = begin
+    f(n) = if n <= 0
+        return Base.fill!(s.buf, 7)          # (:s,:buf): the emit's receiver-prefix drop yields S.buf
+    else
+        f(__self__, n - 1)
+    end
+end
+mutable struct _FillSt; buf::Vector{Int}; end
+
+# extract the first node of a type matching `pred` from the captured _fillrec IR (real pure/effectful calls)
+function _find_node(pred)
+    found = Ref{Any}(nothing)
+    w(x) = begin
+        found[] === nothing || return
+        pred(x) && (found[] = x; return)
+        if x isa Tuple || x isa AbstractVector; for e in x; w(e); end
+        elseif x isa Pair; w(x.second)
+        elseif x isa RKC._MExpr || x isa RKC._MStmt; for f in fieldnames(typeof(x)); w(getfield(x, f)); end end
+    end
+    for ir in RKC.method_irs(_fillrec); w(ir.body); end
+    found[]
+end
+
+
 @testset "control regression — source-order _argmap: left-to-right defaults + reject missing/extra/dup (6215c6d)" begin
     # b's default references the earlier formal a — must resolve left-to-right through the bound actual
-    callee = _callee(:f, [_formal(:a, :pos, true), _formal(:b, :pos, false, RKC._OpCall(GlobalRef(Base, :+), (_fr(:a), _lit(1)), (), false))])
+    purebase = _find_node(x -> x isa RKC._RegisteredCall && getfield(x.registration, :kind) === :pure_primitive)
+    bdefault = RKC._subst(purebase, Dict{Symbol,Any}(:n => _fr(:a)))   # captured pure call referencing earlier formal a
+    callee = _callee(:f, [_formal(:a, :pos, true), _formal(:b, :pos, false, bdefault)])
     fmap = RKC._argmap(callee, _call(:f, [_lit(10)]))
     @test isempty(_residual_formals(fmap[:b]))             # a-in-default replaced by the actual (10)
     @test haskey(fmap, :a) && haskey(fmap, :b)
@@ -82,18 +111,6 @@ end
     @test !any(e -> e isa RKC._ExprStmt && e.expr === effect, emitted2)
 end
 
-# EXECUTABLE discarded-return discriminator (RK): a real recursive @kernel whose base case tail is a
-# DISCARDED `return Base.fill!(buf, 7)`. Compiled through the control machine and RUN, it must mutate the
-# real buffer — the old build_region! dropped the return expression, leaving the buffer untouched.
-@kernel _fillrec(s) = begin
-    f(n) = if n <= 0
-        return Base.fill!(s.buf, 7)          # (:s,:buf): the emit's receiver-prefix drop yields S.buf
-    else
-        f(__self__, n - 1)
-    end
-end
-mutable struct _FillSt; buf::Vector{Int}; end
-
 @testset "control regression — EXECUTABLE discarded return Base.fill!(buf,7) mutates the buffer (e0393fc)" begin
     irs = RKC.method_irs(_fillrec)
     fdecl = first(ir.id.decl for ir in irs if ir.id.name === :f)
@@ -104,4 +121,27 @@ mutable struct _FillSt; buf::Vector{Int}; end
     st = _FillSt(zeros(Int, 4))
     fn(st, scratch, 3)                       # 3 recursions then the discarded base-case fill!
     @test st.buf == fill(7, 4)               # OLD code left it [0,0,0,0] (return expr dropped)
+end
+
+@testset "control regression — _argmap purity discriminator rejects effectful/opaque actuals (RK effect-order)" begin
+    callee = _callee(:h, [_formal(:x, :pos, true)])
+    # POSITIVE: a real pure-primitive registered actual (n-1 / n<=0 shape) is accepted
+    purereg = _find_node(x -> x isa RKC._RegisteredCall && getfield(x.registration, :kind) === :pure_primitive)
+    @test purereg !== nothing
+    @test RKC._argmap(callee, _call(:h, [purereg])) isa Dict
+    # POSITIVE default shape: a pure-primitive registered DEFAULT (like length(proposals)) resolves
+    dcallee = _callee(:h2, [_formal(:y, :pos, false, purereg)])
+    @test RKC._argmap(dcallee, _call(:h2, RKC._Lit[])) isa Dict
+    # NEGATIVE: an _OpCall is rejected regardless of hint — `:operator_candidate` is a syntactic HINT, not
+    # proof of purity (spelling-spoof), and `:opaque` may carry effects. Approved operators lower to
+    # captured pure_primitive _RegisteredCall, so a bare _OpCall is never inlinable here.
+    @test_throws ErrorException RKC._argmap(callee, _call(:h, [RKC._OpCall(GlobalRef(Base, :+), (_lit(1), _lit(2)), (), false, :opaque)]))
+    @test_throws ErrorException RKC._argmap(callee, _call(:h, [RKC._OpCall(GlobalRef(Base, :+), (_lit(1), _lit(2)), (), false, :operator_candidate)]))
+    # NEGATIVE: raw _Getfield / _Index can invoke an overloaded getproperty/getindex — not pure here
+    @test_throws ErrorException RKC._argmap(callee, _call(:h, [RKC._Getfield(RKC._SelfRef(), :field)]))
+    @test_throws ErrorException RKC._argmap(callee, _call(:h, [_idx(_sf(:proposals), _lit(1))]))
+    # NEGATIVE: a real EFFECTFUL registered actual (fill! primitive-effect) rejects
+    effreg = _find_node(x -> x isa RKC._RegisteredCall && getfield(x.registration, :kind) === :primitive)
+    @test effreg !== nothing
+    @test_throws ErrorException RKC._argmap(callee, _call(:h, [effreg]))
 end

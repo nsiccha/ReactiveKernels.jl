@@ -501,6 +501,28 @@ end
 # (`f(a, b=a+1)`) resolves. Actuals stay in the CALLER's scope (never substituted through the callee fmap);
 # only defaults are callee-scope and get `_subst`ed through the partial fmap. Rejects missing-required, extra
 # positional, and duplicate/unknown keyword — so no inlined formal silently leaks unbound.
+# PURE-READ actual/default subset (RK effect-order soundness): _argmap maps an actual/default EXPRESSION and
+# `_subst` splices it into the inlined callee body — which can drop it (unused formal), duplicate it (used
+# twice), or reorder it against sibling effects. That is only sound when the expression is a PROVABLY-pure
+# read. The admitted subset (defined by `_is_pure_read` below) is deliberately minimal: structural reads
+# (formal/local/self/self-field) and captured `:pure_primitive` registered calls — NOT raw operators or raw
+# field/index access (see the predicate's rationale). Anything else is rejected rather than silently
+# mis-ordered. NUTS actuals are all in that subset (`__self__`, `depth`, `depth±1`, captured `length(proposals)`),
+# so this never fires on the root; it guards a future effectful actual from corrupting evaluation order.
+_pure_kw(kw) = all(kv -> _is_pure_read(kv.second), kw)                     # recurse through keyword Pair values
+# The PROVABLY-pure inlinable subset — deliberately minimal, and NEVER inferred from spelling (RK):
+#   * structural reads: a formal/local/self reference and a self-field path (no accessor dispatch);
+#   * a CAPTURED `:pure_primitive` `_RegisteredCall` with pure args/kwargs (the resolved, registration-proven
+#     form that approved operators — `depth±1`, `length(proposals)` — already lower to).
+# Everything else is rejected: an `_OpCall`'s `:operator_candidate` is a syntactic HINT, not proof (and an
+# `:opaque` call may carry effects); a raw `_Getfield`/`_Index` can invoke an OVERLOADED getproperty/getindex,
+# so it is not pure without the later concrete-domain proof. NUTS actuals never need those raw accessor forms.
+function _is_pure_read(x)
+    if x isa _FormalRef || x isa _LocalRef || x isa _Lit || x isa _SelfRef || x isa _SelfField; true
+    elseif x isa _RegisteredCall; getfield(x.registration, :kind) === :pure_primitive && all(_is_pure_read, x.args) && _pure_kw(x.kw)
+    else false end
+end
+
 function _argmap(callee, call)
     fmap = Dict{Symbol,Any}()
     kwvals = Dict{Symbol,Any}()                              # supplied keyword actuals, by name
@@ -525,6 +547,11 @@ function _argmap(callee, call)
         end
     end
     isempty(kwvals) || _l_ctrl_reject("call to `$(callee.id.name)` passes unknown keyword(s) $(collect(keys(kwvals)))")
+    for (nm, v) in fmap
+        _is_pure_read(v) || _l_ctrl_reject(
+            "inlined call to `$(callee.id.name)` binds `$nm` to a NON-pure-read actual/default ($(typeof(v))) — " *
+            "substitution cannot preserve effect ordering/multiplicity; only pure reads are inlinable")
+    end
     fmap
 end
 
