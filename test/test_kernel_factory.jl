@@ -140,6 +140,12 @@ end
     state.acceptance_rate = state.acceptance_rate + one(state.acceptance_rate)
     return state
 end
+# a registered callback writing an UNMAPPABLE (non-diagnostic) root — the binding must REJECT it
+@kernel badstats!(state) = begin
+    state.n_steps += 1
+    state.foo = state.foo + 1
+    return state
+end
 # a COUNTING in-place gradient — proves 'zero extra pgrad' non-vacuously (count stays 1 across child seeds)
 mutable struct CountingPgrad; n::Int; end
 (c::CountingPgrad)(dest, pos) = (c.n += 1; dest .= 2 .* pos; sum(abs2, pos))
@@ -1301,11 +1307,10 @@ end
             end
             d
         end
-        # frozen config carried into the frame: a prepared step binding + the no-effect stats variant
+        # frozen config carried into the frame: a raw step binder (validated internally) + no-effect stats
         stepb = RKS.partial(leapfrog_ep!; stepsize = 0.1)
-        nostats = RKS._stats_binding(nothing, nothing)
-        mkframe(T, pg, md) = RKS._construct_nuts_frame(pf, mkvals(T, pg), T[1, 2], zero(T), md;
-                                                       step_f = stepb, stats = nostats, min_dham = -1000)
+        mkframe(T, pg, md) = RKS._construct_nuts_frame(pf, mkvals(T, pg), md;
+                                                       step_f = stepb, stats_f = nothing, min_dham = -1000)
         for T in (Float32, Float64)
             pg = CountingPgrad(0)
             frame = mkframe(T, pg, 10)
@@ -1313,10 +1318,15 @@ end
             @test RKS.nuts_frame_ham_type(frame) === T && RKS.diagnostics_ham_type(frame.diag) === T
             @test eltype(frame.trees[1].log_weight) === T
             @test length(frame.trees) == 11 && length(frame.proposals) == 12     # max_depth+1 / +2
-            # frozen config + the derived `diverged` recipe are carried in the concrete frame (RK 09:11)
-            @test RKS.nuts_frame_step(frame) === stepb && RKS.nuts_frame_stats(frame) === nostats
+            # frozen config = a VALIDATED prepared callable record (leapfrog! registration + bound stepsize)
+            # + the no-effect stats binding; the derived `diverged` recipe starts DIRTY (RK 09:11/09:25)
+            sc = RKS.nuts_frame_step(frame)
+            @test RKS.prepared_callable_registration(sc) === RKS.kernel_registration(leapfrog_ep!)
+            @test RKS.prepared_callable_token(sc) === RKS.kernel_registration(leapfrog_ep!).token
+            @test RKS.prepared_callable_kwargs(sc) == (; stepsize = 0.1)
+            @test RKS.stats_binding_registration(RKS.nuts_frame_stats(frame)) === nothing  # no-effect variant
             @test RKS.nuts_frame_max_depth(frame) == 10 && RKS.nuts_frame_min_dham(frame) === oftype(zero(T), -1000)
-            @test !RKS.nuts_frame_diverged_current(frame)                        # diverged starts DIRTY (poc produces)
+            @test !RKS.nuts_frame_diverged_pending(frame) && !RKS.nuts_frame_diverged_committed(frame)
             # phase-1: children are UNSEEDED (dirty) — NOT yet at entry_current, no pgrad ran
             @test ecmask(frame.fwd) != RKS._owner_mask(Ncanon, entry_owned) && pg.n == 0
             # SEEDING an INCOMPLETE init REJECTS (RK 09:10) — init not yet at entry_current before poc runs
@@ -1326,10 +1336,15 @@ end
             initfn(frame.init, frame.shared, RKS.kernel_prepared_handles(pf))
             @test pg.n == 1                                                      # pgrad total == 1
             @test ecmask(frame.init) == RKS._owner_mask(Ncanon, entry_owned)     # init mask == entry_current
-            # the derived `diverged` produced from dham+min_dham; reset invalidates it (poc recomputes)
-            RKS._nuts_produce_diverged!(frame); @test RKS.nuts_frame_diverged_current(frame)
-            RKS._nuts_frame_reset_control!(frame); @test !RKS.nuts_frame_diverged_current(frame)
-            RKS._nuts_produce_diverged!(frame)   # re-produce so seeding still sees a complete init below
+            # derived `diverged` epoch validity (RK 09:25): produce→pending; a SUCCESS root commits it;
+            # the NEXT root's reset clears BOTH pending AND committed; a produce-without-commit (a later
+            # throw) leaves committed=false so the old value is never falsely current
+            RKS._nuts_produce_diverged!(frame); @test RKS.nuts_frame_diverged_pending(frame)
+            RKS._nuts_derived_root_commit!(frame); @test RKS.nuts_frame_diverged_committed(frame)   # success
+            RKS._nuts_frame_reset_control!(frame)                                # next root: reset clears BOTH
+            @test !RKS.nuts_frame_diverged_pending(frame) && !RKS.nuts_frame_diverged_committed(frame)
+            RKS._nuts_produce_diverged!(frame)                                   # produced but NOT committed (throw)
+            @test RKS.nuts_frame_diverged_pending(frame) && !RKS.nuts_frame_diverged_committed(frame)
             # phase-2: seed children — complete values+mask copied, ZERO extra pgrad/chol
             RKS._seed_nuts_children!(frame)
             @test pg.n == 1                                                      # no child recompute
@@ -1349,24 +1364,24 @@ end
         # An ACTUAL init exception (a THROWING destination-grad) leaves init INCOMPLETE + every child DIRTY,
         # and _seed_nuts_children! REJECTS (never seeds an incomplete init) (RK 09:10)
         badpg(dest, p) = (dest[1] = 99.0; error("grad boom"))
-        frx = mkframe(Float64, CountingPgrad(0), 3)   # a valid frame we then poison at execution
-        frx.init === frx.init                                                   # (touch to keep types stable)
-        badfn = RKS.compile_prepared_initialization(pf, typeof(frx.init), typeof(frx.shared))
-        # replace grad_f in the shared with the throwing pgrad, then run init -> it throws mid-init
-        # (simplest: build a fresh frame whose shared holds the throwing grad)
-        frx2 = RKS._construct_nuts_frame(pf, mkvals(Float64, badpg), [1.0, 2.0], 0.0, 3;
-                                         step_f = stepb, stats = nostats, min_dham = -1000)
-        @test_throws Any badfn(frx2.init, frx2.shared, RKS.kernel_prepared_handles(pf))   # init throws
+        badfn = RKS.compile_prepared_initialization(pf, typeof(mkframe(Float64, badpg, 3).init),
+                                                    typeof(mkframe(Float64, badpg, 3).shared))
+        frx2 = RKS._construct_nuts_frame(pf, mkvals(Float64, badpg), 3;
+                                         step_f = stepb, stats_f = nothing, min_dham = -1000)
+        @test_throws ErrorException badfn(frx2.init, frx2.shared, RKS.kernel_prepared_handles(pf))  # init throws
         @test RKS._canon_current_mask(frx2.init) != RKS._owner_mask(Ncanon, entry_owned)  # init INCOMPLETE
         @test_throws RKS._KernelFactoryReject RKS._seed_nuts_children!(frx2)               # seeding rejects
         @test all(RKS._canon_current_mask(ch) != RKS._owner_mask(Ncanon, entry_owned)
                   for ch in (frx2.fwd, frx2.bwd, frx2.proposals[1]))                       # children stay DIRTY
         # negative / incompatible max_depth REJECTS before any partial mutation (RK 09:10)
         @test_throws RKS._KernelFactoryReject RKS._construct_nuts_frame(pf, mkvals(Float64, CountingPgrad(0)),
-            [1.0, 2.0], 0.0, -1; step_f = stepb, stats = nostats, min_dham = -1000)
-        # phase-1 children unseeded/dirty (baseline)
-        @test all(RKS._canon_current_mask(ch) != RKS._owner_mask(Ncanon, entry_owned)
-                  for ch in (frx.fwd, frx.bwd, frx.proposals[1]))              # unseeded → not falsely current
+            -1; step_f = stepb, stats_f = nothing, min_dham = -1000)
+        # step_f Token IDENTITY: a DIFFERENT registered integrator than the endpoint Plan's REJECTS (RK 09:27)
+        @test_throws RKS._KernelFactoryReject RKS._construct_nuts_frame(pf, mkvals(Float64, CountingPgrad(0)),
+            3; step_f = RKS.partial(gradonly_step!; stepsize = 0.1), stats_f = nothing, min_dham = -1000)
+        # a bare leapfrog_ep! (matching Token) MISSING the required `stepsize` kwarg REJECTS at construction
+        @test_throws RKS._KernelFactoryReject RKS._construct_nuts_frame(pf, mkvals(Float64, CountingPgrad(0)),
+            3; step_f = leapfrog_ep!, stats_f = nothing, min_dham = -1000)
         # TWO independent frames: DISTINCT per-sampler mutable shared authority; external grad kept by identity
         shared_pg = CountingPgrad(0)
         f1 = mkframe(Float64, shared_pg, 3)
@@ -1376,22 +1391,25 @@ end
     end
 
     @testset "nuts_state — registered stats_f scalar-effect binding (write-roots→diag slots; nothing/opaque) (RK 08:42/09:11)" begin
-        # a registered stats_f maps its DETACHED write-roots {n_steps, acceptance_rate} to diagnostic slots
+        # the registration is DERIVED INTERNALLY (not a caller-supplied pair) and CARRIED in the binding
         reg = RKS.kernel_registration(synstats!)
         @test Set(reg.write_roots) == Set((:n_steps, :acceptance_rate))
-        b = RKS._stats_binding(synstats!, reg)
-        @test RKS.stats_binding_callable(b) === synstats!
+        b = RKS._stats_binding(synstats!)
+        @test RKS.stats_binding_registration(b) === reg                       # the captured registration
+        @test RKS.stats_binding_source(b) === synstats! && RKS.stats_binding_token(b) === reg.token
         @test RKS.stats_binding_produced(b) == (1, 3)                          # n_steps→1, acceptance_rate→3
-        # applying the produced-marking blesses exactly those diagnostic slots pending (0-B path is _diag_set!)
+        # applying the produced-marking blesses exactly those diagnostic slots pending
         d = RKS._diagnostics_store(Float64); RKS._stats_produced!(d, b)
         @test RKS._diag_produced(d, Val(1)) && RKS._diag_produced(d, Val(3))
         @test !RKS._diag_produced(d, Val(2)) && !RKS._diag_produced(d, Val(4))
         # stats_f = nothing is the EXPLICIT no-effect specialization (collectstats! is a no-op)
-        nb = RKS._stats_binding(nothing, nothing)
-        @test RKS.stats_binding_callable(nb) === nothing && RKS.stats_binding_produced(nb) == ()
+        nb = RKS._stats_binding(nothing)
+        @test RKS.stats_binding_registration(nb) === nothing && RKS.stats_binding_produced(nb) == ()
         @test RKS._stats_produced!(RKS._diagnostics_store(Float64), nb) isa RKS._DiagnosticsStore  # no-op
         # an OPAQUE / unregistered stats_f REJECTS (a diagnostics callback must be a registered @kernel)
-        @test_throws RKS._KernelFactoryReject RKS._stats_binding(sin, nothing)
+        @test_throws RKS._KernelFactoryReject RKS._stats_binding(sin)
+        # an UNMAPPABLE write-root REJECTS (no silent filter — never understate effects)
+        @test_throws RKS._KernelFactoryReject RKS._stats_binding(badstats!)
     end
 
     @testset "nuts_state — MIXED endpoints+vectors+scalars frame: scalar 0-B, buffers direct, F32/F64 (RK 08:47/08:51)" begin

@@ -286,8 +286,10 @@ mutable struct _NutsFrame{EP,TREE,SH,Tham,M,STEP,STATS}
     may_sample::Bool
     may_continue::Bool
     diverged::Bool        # the authored DERIVED recipe `!(dham >= min_dham)` — a CONCRETE owned Bool, not
-                          #   recomputed by name; its currentness is `derived_current` bit 0
-    derived_current::UInt # currentness of the derived recipes (bit 0 = diverged) — a dham write invalidates
+                          #   recomputed by name (bit 0 of the derived masks)
+    derived_pending::UInt # PRODUCED within the current epoch (a dham write invalidates it) — RK 09:19
+    derived_committed::UInt # blessed at the SINGLE root commit — a post-produce root THROW leaves this
+                          #   uncommitted, so the derived value never survives an exception falsely current
     diag::_DiagnosticsStore{Tham}
     shared::SH            # the ONE per-sampler shared authority (identity across all endpoints)
     entry_mask::M        # the proven post-init owned currentness mask (entry_current) — init MUST match
@@ -304,15 +306,24 @@ nuts_frame_step(f::_NutsFrame) = getfield(f, :step_f)
 nuts_frame_stats(f::_NutsFrame) = getfield(f, :stats)
 nuts_frame_max_depth(f::_NutsFrame) = getfield(f, :max_depth)
 nuts_frame_min_dham(f::_NutsFrame) = getfield(f, :min_dham)
-@inline nuts_frame_diverged_current(f::_NutsFrame) = getfield(f, :derived_current) & UInt(1) == UInt(1)
-# `diverged` is PRODUCED from dham + min_dham (RK 09:11) — a real derived write, marked current; a `dham`
-# write INVALIDATES it (poc recomputes). 0-B.
+@inline nuts_frame_diverged_pending(f::_NutsFrame) = getfield(f, :derived_pending) & UInt(1) == UInt(1)
+@inline nuts_frame_diverged_committed(f::_NutsFrame) = getfield(f, :derived_committed) & UInt(1) == UInt(1)
+# `diverged` is PRODUCED from dham + min_dham (RK 09:11) — a real derived write, marked PENDING (produced
+# within the epoch); a `dham`/reset write INVALIDATES it (poc recomputes). 0-B.
 @inline function _nuts_produce_diverged!(f::_NutsFrame)
     setfield!(f, :diverged, !(_diag_slot(getfield(f, :diag), Val(4)) >= getfield(f, :min_dham)))
-    setfield!(f, :derived_current, getfield(f, :derived_current) | UInt(1)); f
+    setfield!(f, :derived_pending, getfield(f, :derived_pending) | UInt(1)); f
 end
+# Root-begin / dham invalidation clears BOTH pending AND committed (RK 09:25): after a prior successful
+# root committed diverged, a new epoch's reset must not leave the OLD committed bit live — otherwise
+# reset+produce+later-throw could expose it as current. Both cleared → the derived value is fully stale.
 @inline _nuts_invalidate_diverged!(f::_NutsFrame) =
-    (setfield!(f, :derived_current, getfield(f, :derived_current) & ~UInt(1)); f)
+    (setfield!(f, :derived_pending, getfield(f, :derived_pending) & ~UInt(1));
+     setfield!(f, :derived_committed, getfield(f, :derived_committed) & ~UInt(1)); f)
+# The SINGLE root commit blesses the produced derived value (RK 09:19); a post-produce root THROW before
+# this leaves `derived_committed` at its prior value — the derived value is never falsely current.
+@inline _nuts_derived_root_commit!(f::_NutsFrame) =
+    (setfield!(f, :derived_committed, getfield(f, :derived_pending)); f)
 # Per-transition control+diagnostics RESET (fixture `reset!`) — control back to `true`, diagnostics through
 # `_diagnostics_reset!` (authoritative source write; committed zeroed, all four pending-produced). The tree/
 # endpoint buffer resets (copy!!/fill!) are separate visible producer writes poc lowers. Exact 0-B here.
@@ -970,6 +981,25 @@ function kernel_plan_recipe_seam(p::_KernelPlan)
     Tuple((rid, get(inby, rid, ()), get(outby, rid, ()), get(ownby, rid, ())) for rid in p.recipes)
 end
 kernel_plan_key(::_KernelPlan{Key}) where {Key} = Key
+# The immutable OWNED entry-current currentness mask, emitted at COMPILE TIME from the plan's structural
+# Key (slot signature + Key[8] entry_current) — plan-once, NO per-instance Set/traversal (RK 09:19). A
+# constructed init MUST reach this mask before its owned children may be seeded.
+@generated function kernel_plan_entry_owned_mask(::_KernelPlan{Key}) where {Key}
+    slot_sig = Key[2]; ec = Set{Int}(Key[8])
+    N = length(unique(t[2] for t in slot_sig))
+    owned_slots = sort!(Int[t[4] for t in slot_sig if t[3] === :owned && t[2] in ec])
+    :($(_owner_mask(N, owned_slots)))
+end
+# The absolute slot index of a NAMED port, as a compile-time `Val{slot}` emitted from the plan Key's slot
+# signature (RK 09:27) — Val-name keyed, type-stable, NO per-instance Symbol lookup. A compile-time reject
+# names the missing port.
+@generated function kernel_plan_named_slot_val(::_KernelPlan{Key}, ::Val{Name}) where {Key,Name}
+    slot_sig = Key[2]
+    i = findfirst(t -> t[1] == (Name,), slot_sig)
+    i === nothing && return :(throw(_KernelFactoryReject(
+        "the endpoint plan has no port named `$($(QuoteNode(Name)))` — a nuts_state init must be a phasepoint")))
+    :(Val($(slot_sig[i][4])))
+end
 # The integrator/owner definition Token (RK 04:41): poc proves `binder target Token == plan
 # integrator Token` through THIS accessor, never by destructuring the key tuple internals.
 kernel_plan_token(::_KernelPlan{Key}) where {Key} = Key[1]
@@ -1127,7 +1157,9 @@ function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol}; key
     # `kernel_spec` reads of one const definition, distinct across definitions) make two same-SHAPE
     # graphs under the same integrator produce DIFFERENT keys. NO objectid/hash/Recipe.op.
     slot_sig = Tuple((s.path, s.canon, s.role, s.slot) for s in slots)
-    key = (key_token, slot_sig, groups, producer, recipes, recipe_inputs, recipe_outputs)
+    # entry_current is appended as Key[8] (RK 09:19) so a type-level `kernel_plan_entry_owned_mask`
+    # accessor can emit the immutable owned entry mask at compile time — plan-once, no per-instance Set.
+    key = (key_token, slot_sig, groups, producer, recipes, recipe_inputs, recipe_outputs, Tuple(ec))
     plan_obj = _KernelPlan(key, Tuple(slots), groups, producer, recipes, Tuple(ec), recipe_inputs, recipe_outputs)
     with_ops ? (plan_obj, selected_ops) : plan_obj
 end
@@ -1519,27 +1551,35 @@ _seed_children!(init::_CanonOwned, children::Vararg{_CanonOwned}) =
 # chol/logdet ×1); only then `_seed_nuts_children!` copies the COMPLETE values+mask. Seeding children now
 # would propagate an incomplete init. `pos`/`ham` are init's source position + hamiltonian value; F32/F64
 # PRESERVED via trees/diag. (The single-path construction means no other code path double-evaluates init.)
-function _construct_nuts_frame(pf::_PreparedFactory{Token}, endpoint_values, pos::AbstractVector,
-                               ham, max_depth::Int; step_f, stats, min_dham) where {Token}
+function _construct_nuts_frame(pf::_PreparedFactory{Token}, endpoint_values, max_depth::Int;
+                               step_f, stats_f, min_dham) where {Token}
     # REJECT an out-of-range max_depth BEFORE any construction/mutation (RK 09:10) — the tree/proposal
     # counts are `max_depth+1`/`max_depth+2`, so a negative depth is a shape error, not a silent empty.
-    max_depth >= 0 || throw(_KernelFactoryReject(
-        "nuts_state max_depth must be ≥ 0 (got $max_depth) — a negative depth is an incompatible shape"))
-    Tham = typeof(ham)
+    # REJECT an out-of-range / overflowing max_depth BEFORE any allocation (RK 09:10/09:27): the tree/
+    # proposal counts are `max_depth+1`/`max_depth+2`, so guard against a negative depth AND Int overflow.
+    (max_depth >= 0 && max_depth <= typemax(Int) - 2) || throw(_KernelFactoryReject(
+        "nuts_state max_depth must be in 0:$(typemax(Int)-2) (got $max_depth) — incompatible/overflowing shape"))
+    # the step binding MUST be the SAME registered integrator the endpoint Plan was prepared under — by
+    # Token IDENTITY, not name/== (RK 09:27); else the frame carries a different writer than its layout.
+    stepc = _prepare_callable(:step_f, step_f)              # validated record (registration + bound kwargs)
+    prepared_callable_token(stepc) === kernel_plan_token(pf.plan) || throw(_KernelFactoryReject(
+        "step_f resolves to a DIFFERENT registered writer than the endpoint Plan's integrator Token — the " *
+        "frame layout was prepared for a different kernel"))
+    statsb = _stats_binding(stats_f)                        # registration DERIVED internally
     init_ow, shared = _kernel_construct_endpoint(Val(Token), pf.plan, endpoint_values, pf.external)
-    # the proven post-init owned mask = every OWNED entry_current slot current (init MUST reach this before
-    # children are seeded); computed from the detached plan, NOT the (still-incomplete) init.
-    canons, roles = kernel_plan_superset(pf.plan); N = length(canons)
-    entry_owned = Int[i for i in 1:N if roles[i] === :owned &&
-                      canons[i] in Set{Int}(kernel_plan_entry_current(pf.plan))]
-    entry_mask = _owner_mask(N, entry_owned)
+    # DERIVE the pos template + ham type from init's phasepoint slots via COMPILE-TIME Val-name accessors
+    # (RK 09:19/09:27) — no per-instance Symbol lookup, no runtime-Val; `pos` is read as a TEMPLATE (the
+    # trees allocate fresh `zero(pos)` buffers), so no deepcopy.
+    pos = _canon_slot(init_ow, kernel_plan_named_slot_val(pf.plan, Val(:pos)))
+    Tham = typeof(_canon_slot(init_ow, kernel_plan_named_slot_val(pf.plan, Val(:ham))))
+    entry_mask = kernel_plan_entry_owned_mask(pf.plan)      # COMPILE-TIME literal owned mask (plan-once)
     mkchild() = _kernel_construct_owned_child(Val(Token), pf.plan, endpoint_values)   # UNSEEDED, dirty
     fwd = mkchild(); bwd = mkchild()
     proposals = typeof(init_ow)[mkchild() for _ in 1:(max_depth + 2)]
-    trees = _nuts_trees(pos, ham, max_depth + 1)
-    # diverged starts DIRTY (derived_current bit 0 = 0) — POC produces it from dham+min_dham during init.
-    _NutsFrame(init_ow, fwd, bwd, trees, proposals, true, true, true, false, UInt(0),
-               _diagnostics_store(Tham), shared, entry_mask, step_f, stats, max_depth, oftype(ham, min_dham))
+    trees = _nuts_trees(pos, zero(Tham), max_depth + 1)
+    # diverged starts DIRTY (neither pending nor committed) — POC produces it from dham+min_dham during init.
+    _NutsFrame(init_ow, fwd, bwd, trees, proposals, true, true, true, false, UInt(0), UInt(0),
+               _diagnostics_store(Tham), shared, entry_mask, stepc, statsb, max_depth, oftype(zero(Tham), min_dham))
 end
 
 # PHASE 2 (RK 09:00/09:10): AFTER POC has executed the full six-handle init on `frame.init`, seed the
@@ -1572,20 +1612,79 @@ _diagnostic_slot_of(name::Symbol) =
 # stats_f(__self__)`). An OPAQUE/unregistered stats_f REJECTS — a diagnostics callback must be a registered
 # @kernel, never an opaque runtime callable. POC executes stats_f (writing the values via `_diag_set!`,
 # which marks them pending); the binding is the detached which-slots contract poc consumes.
-struct _StatsBinding{F,Slots<:Tuple}
-    stats_f::F
+# A VALIDATED prepared callable record (RK 09:19/09:25) — stores the callable field's IMMUTABLE captured
+# `_KernelRegistration` ITSELF (Token / subject / write-roots / read-roots / kind / `!!` / source) plus its
+# bound kwargs (e.g. `stepsize`), resolved INTERNALLY at construction. POC resolves the exact MethodIR from
+# the captured registration/source — NO registry or global reread — and NEVER calls the runtime callable
+# dynamically. `step_f = partial(leapfrog!; stepsize)` → leapfrog!'s registration + (; stepsize).
+struct _PreparedCallable{R,KW}
+    registration::R
+    kwargs::KW
+end
+prepared_callable_registration(c::_PreparedCallable) = c.registration
+prepared_callable_kwargs(c::_PreparedCallable) = c.kwargs
+prepared_callable_token(c::_PreparedCallable) = c.registration.token
+prepared_callable_subject(c::_PreparedCallable) = c.registration.subject
+prepared_callable_write_roots(c::_PreparedCallable) = c.registration.write_roots
+prepared_callable_read_roots(c::_PreparedCallable) = c.registration.read_roots
+prepared_callable_source(c::_PreparedCallable) = c.registration.source
+# The REQUIRED (no-default) keyword names of a registered callable's captured signature — so a construction
+# can reject a missing required kwarg (RK 09:27) rather than defer it to codegen. Only a Mode-2 free method
+# carries a kwarg signature here; anything else has none.
+function _kernel_required_kwargs(source)
+    source isa _Mode2KernelSkeleton || return ()
+    sig = _kernel_thaw_ast(getfield(source, :method).signature)
+    call = _kernel_peel_signature(sig)
+    (call isa Expr && call.head === :call) || return ()
+    req = Symbol[]
+    for a in call.args
+        (a isa Expr && a.head === :parameters) || continue
+        for p in a.args
+            p isa Symbol && push!(req, p)                # a BARE kwarg = required (no default)
+        end
+    end
+    Tuple(req)
+end
+function _prepare_callable(name::Symbol, v)
+    reg = _kernel_resolve_callable_or_reject(name, v)   # rejects opaque; the resolved registration is the
+    kw = _kernel_binder_kwargs(v)                        #   detached identity poc consumes (no reread)
+    bound = kw === nothing ? () : keys(kw)
+    for r in _kernel_required_kwargs(reg.source)        # validate bound kwargs vs the captured signature
+        r in bound || throw(_KernelFactoryReject(
+            "callable `$name` is missing the REQUIRED keyword `$r` — bind it with `partial(...; $r = …)` " *
+            "at construction; a missing required kwarg must not be deferred to codegen"))
+    end
+    _PreparedCallable(reg, kw)
+end
+
+# The stats binding holds the captured `_KernelRegistration` (RK 09:25), not the raw stats_f, plus the
+# diagnostic slots its write-roots produce.
+struct _StatsBinding{R,Slots<:Tuple}
+    registration::R    # the captured _KernelRegistration, or `nothing` for the no-effect variant
     produced::Slots
 end
 stats_binding_produced(b::_StatsBinding) = b.produced
-stats_binding_callable(b::_StatsBinding) = b.stats_f
-function _stats_binding(stats_f, reg)
+stats_binding_registration(b::_StatsBinding) = b.registration
+stats_binding_token(b::_StatsBinding) = b.registration === nothing ? nothing : b.registration.token
+stats_binding_source(b::_StatsBinding) = b.registration === nothing ? nothing : b.registration.source
+# Derive the registration INTERNALLY (RK 09:19) — NEVER trust a caller-supplied value+reg pair. `stats_f=
+# nothing` is the no-effect variant. An opaque/unregistered stats_f REJECTS. Every declared write-root MUST
+# map to a diagnostic slot — an UNMAPPABLE root REJECTS (no silent filter; never understate effects).
+function _stats_binding(stats_f)
     stats_f === nothing && return _StatsBinding{Nothing,Tuple{}}(nothing, ())
+    reg = _kernel_resolve_callable(stats_f)
     reg === nothing && throw(_KernelFactoryReject(
-        "stats_f is opaque/unregistered — the diagnostics callback must be a registered @kernel, not an " *
-        "opaque runtime callable"))
-    slots = Tuple(sort!(unique(Int[_diagnostic_slot_of(r) for r in reg.write_roots
-                                   if _diagnostic_slot_of(r) != 0])))
-    _StatsBinding(stats_f, slots)
+        "stats_f = $(typeof(stats_f)) is opaque/unregistered — the diagnostics callback must be a " *
+        "registered @kernel, not an opaque runtime callable"))
+    slots = Int[]
+    for r in reg.write_roots
+        s = _diagnostic_slot_of(r)
+        s == 0 && throw(_KernelFactoryReject(
+            "stats_f writes an UNMAPPABLE root `$r` — refusing to understate its effects; a diagnostics " *
+            "callback may write only n_steps / reached_depth / acceptance_rate / dham"))
+        push!(slots, s)
+    end
+    _StatsBinding(reg, Tuple(sort!(unique(slots))))
 end
 # Mark the diagnostic slots stats_f produced as PENDING on the store (RK 08:48) — poc calls this after
 # executing stats_f. The no-effect (`nothing`) binding produces nothing.
