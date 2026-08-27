@@ -159,9 +159,21 @@ function _exec_rhs(x::_SelfField, ctx::_EmitCtx)
     (id === nothing || !haskey(ctx.slotof, id)) && _l_reject("subject field `$(x.path[1])` has no owned slot")
     I = ctx.slotof[id]; push!(ctx.slots_used, I); _slot_local(I)
 end
-_exec_rhs(x::_OpCall, ctx::_EmitCtx) =
-    Expr(:call, GlobalRef(Base, :broadcasted), _exec_callee(x.op),
-         (_exec_rhs(a, ctx) for a in x.args)...)               # fused broadcast, EXACT callee identity
+# Is a MethodIR value node VECTOR-valued (reads an owned slot buffer) or a pure SCALAR (literals/bound
+# formals and scalar ops over them)? Only VECTOR ops broadcast; a scalar-only sub-expression
+# (`oftype(stepsize, 0.5)`, `0.5 * stepsize`) is emitted as a PLAIN call computed once — wrapping it in
+# `broadcasted` builds a nested scalar Broadcasted that does not fuse (→ a per-leaf allocation).
+_exec_is_vec(::_SelfField) = true          # every subject-field read in a leaf method is a slot buffer
+_exec_is_vec(::_Lit) = false
+_exec_is_vec(::_FormalRef) = false
+_exec_is_vec(x::_OpCall) = any(_exec_is_vec, x.args)
+
+function _exec_rhs(x::_OpCall, ctx::_EmitCtx)
+    args = Any[_exec_rhs(a, ctx) for a in x.args]
+    _exec_is_vec(x) ?
+        Expr(:call, GlobalRef(Base, :broadcasted), _exec_callee(x.op), args...) :  # fused vector op
+        Expr(:call, _exec_callee(x.op), args...)                                   # scalar op, computed once
+end
 
 # ---- consume the partial binder SOUNDLY (approved-only + token identity) -----------------------------
 

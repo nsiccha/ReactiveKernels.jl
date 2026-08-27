@@ -194,6 +194,43 @@ end
     @test occursin("materialize!", src) && occursin("broadcasted", src)
 end
 
+module _CgTypedFix
+    include(joinpath(@__DIR__, "..", "benchmark", "nuts_kernel_authoring_fixture.jl"))
+    using ReactiveKernels
+    # the ccb35d3 typed-half leapfrog form: `oftype(stepsize, 0.5)` (F32-safe, no Float64 promotion)
+    @kernel leapfrog_typed!(phasepoint; stepsize) = begin
+        @. phasepoint.mom -= oftype(stepsize, 0.5) * stepsize * phasepoint.dham_dpos
+        @. phasepoint.pos +=                        stepsize * phasepoint.dham_dmom
+        @. phasepoint.mom -= oftype(stepsize, 0.5) * stepsize * phasepoint.dham_dpos
+    end
+end
+
+@testset "codegen — typed-half (oftype) leapfrog: scalar op is a PLAIN call, 0 B, F32-safe" begin
+    LFT = _CgTypedFix.leapfrog_typed!
+    seam = RK._kernel_factory_endpoint_plan(_CgPP, RK.kernel_registration(LFT))
+    ir = RK.method_irs(LFT)[1]
+    prod = Dict(kv[1] => kv[2] for kv in RK.kernel_plan_producer(seam))
+    ap = Dict(prod[RK._seam_canon(seam, :dpot_dpos)] => :pgrad, prod[RK._seam_canon(seam, :dkin_dmom)] => :velocity)
+    ri = RK._seam_recipe_inputs_snapshot(_CgPP, seam)
+    _, meta = RK.compile_leaf(ir, seam, _CgTypedFix.partial(LFT; stepsize = 0.1); recipe_inputs = ri, appliers = ap)
+    src = string(meta.body)
+    # the scalar `oftype(stepsize, 0.5)` is a PLAIN call, NOT wrapped in broadcasted (which would allocate)
+    @test occursin("oftype(", src)
+    @test !occursin("broadcasted(Main._CgTypedFix.oftype", src) && !occursin("broadcasted(Base.oftype", src)
+    barrier(fn, st, pg, cholf, kw) = @allocated fn(st, pg, cholf, kw)   # fn typed → true 0-B measurement
+    for T in (Float64, Float32)
+        fn, m = RK.compile_leaf(ir, seam, _CgTypedFix.partial(LFT; stepsize = T(0.1)); recipe_inputs = ri, appliers = ap)
+        d = 4; metric = Matrix{T}(2 * I, d, d); cholf = cholesky(metric); st = RK.make_leaf_owner_state(_CgPP, seam, T, d)
+        RK._owner_commit!(st, ntuple(i -> begin s = RK._owner_slot(st, Val(i))
+            s isa AbstractVector ? (s .= T.(1:d) ./ (i + 1)) : s end, m.nslots))
+        _quad!(RK._owner_slot(st, Val(m.dpotslot)), RK._owner_slot(st, Val(m.posslot)))
+        pg = _CountGrad(_quad!, 0); kw = (; stepsize = T(0.1))
+        barrier(fn, st, pg, cholf, kw); barrier(fn, st, pg, cholf, kw)
+        @test eltype(RK._owner_slot(st, Val(m.posslot))) === T           # no Float64 promotion (F32-safe)
+        @test barrier(fn, st, pg, cholf, kw) == 0                        # typed half is 0 alloc
+    end
+end
+
 @testset "codegen — an exec whose selected Recipe has no bound applier is REJECTED" begin
     seam = _cg_seam()
     @test_throws RK._LLowerReject RK.compile_leaf(_cg_ir(), seam,
