@@ -1082,6 +1082,140 @@ function _kernel_construct_owned_child(::Val{Token}, plan::_KernelPlan, values) 
     _canon_construct(Val(:owned), owned_vals, owned_mask)
 end
 
+# --- COLD BOOTSTRAP: source inputs → fully-populated canon values, executing each handle EXACTLY once -------
+#
+# The generated cold typed function (RK 13:44 / user 14:xx): from the immutable prepared handle tuple + the
+# HAVE source values, produce a CANON-ORDERED immutable value tuple with EVERY canonical slot populated — so
+# the author supplies only `(grad_f, metric, pos, mom)`, never a canon-id Dict, and no pre-allocated storage.
+# It seeds the HAVE sources, ALLOCATES ONLY the retained destination/ldiv output buffers (`similar` of an
+# array source — these become the init endpoint's real buffers, never discarded), and executes the SELECTED
+# destination/assign/ldiv handles ONCE each in plan order (so exactly one gradient + one cholesky at
+# construction). Emission MIRRORS the schedule emitter's per-mode invocation (kernel_codegen `_pp_emit_handle!`):
+#   * destination — the FIRST input is the destination-aware callable AUTHORITY (a HAVE source, e.g. grad_f),
+#     read as a VALUE and applied `pot = grad_f(dest, args…)`; outputs are (scalar, buffer) in authored order.
+#   * ldiv       — `ldiv!(out, factor, rhs)` into a freshly-allocated `similar(rhs)` output buffer.
+#   * assign     — `out = recipe_handle_op(handles[i])(args…)` (a bare sanctioned op or a fused source op).
+# `sources` is the HAVE values in `entry_current`-minus-producer order. Returns `(v_canon…)` in superset order.
+# Extract the canonical SUPERSET (first-occurrence canons + roles) from a plan `Key` type param — used by the
+# GENERATED plan-keyed constructors so per-slot disposition is a compile-time literal, not a runtime scan.
+function _plan_superset_from_key(Key)
+    canons = Int[]; roles = Symbol[]; seen = Set{Int}()
+    for t in Key[2]                                                              # slot_sig: (path, canon, role, slot)
+        c = t[2]; c in seen || (push!(canons, c); push!(roles, t[3]); push!(seen, c))
+    end
+    (canons, roles)
+end
+# The HAVE canons (caller-supplied sources) = entry_current minus the producer-map keys, in entry_current order.
+_plan_have_from_key(Key) = (prodk = Set{Int}(c for (c, _) in Key[4]); Int[c for c in Key[8] if !(c in prodk)])
+# The Form param of a `_KernelSourceOp{DefToken,Form,F}` op type (`:portcall` / `:fused`).
+_sourceop_form_type(::Type{<:_KernelSourceOp{DefToken,Form}}) where {DefToken,Form} = Form
+# The identity-kept EXTERNAL canonical ids, derived at generation exactly as `_prepare_factory` does: the
+# callable FIRST input of every `:portcall` recipe (grad_f). No runtime field, no value type param needed.
+function _plan_external_from(Key, H)
+    rin = Dict{Int,Vector{Int}}(rid => collect(ins) for (rid, ins) in Key[6])
+    ext = Int[]
+    for (idx, rid) in enumerate(Key[5])
+        OP = H.parameters[idx].parameters[1]
+        (OP <: _KernelSourceOp && _sourceop_form_type(OP) === :portcall) || continue
+        ins = get(rin, rid, Int[])
+        isempty(ins) || (ins[1] in ext || push!(ext, ins[1]))
+    end
+    ext
+end
+
+@generated function _bootstrap_canon_values(::_KernelPlan{Key}, handles::H, sources::Tuple) where {Key,H}
+    recipes = Key[5]
+    rin = Dict{Int,Vector{Int}}(rid => collect(ins) for (rid, ins) in Key[6])   # recipe_inputs
+    rout = Dict{Int,Vector{Int}}(rid => collect(os) for (rid, os) in Key[7])     # recipe_outputs (authored order)
+    canons, _ = _plan_superset_from_key(Key)
+    have = _plan_have_from_key(Key)                                              # source canons (HAVE), ec order
+    vv(c) = Symbol("__v_", c)
+    ridpos = Dict{Int,Int}(rid => i for (i, rid) in enumerate(recipes))
+    stmts = Any[]
+    for (i, c) in enumerate(have)                                               # seed HAVE sources positionally
+        push!(stmts, :($(vv(c)) = sources[$i]))
+    end
+    for rid in recipes                                                          # execute in plan order, once each
+        idx = ridpos[rid]
+        mode = H.parameters[idx].parameters[2]                                  # MODE type param of handle idx
+        ins = rin[rid]; outs = rout[rid]
+        if mode === :destination
+            length(outs) == 2 || return :(throw(_KernelFactoryReject("bootstrap: destination recipe needs 2 outputs")))
+            length(ins) >= 2 || return :(throw(_KernelFactoryReject("bootstrap: destination recipe needs callee + ≥1 arg")))
+            sc, buf = outs[1], outs[2]                                          # authored order: (scalar, buffer)
+            callee = ins[1]; args = ins[2:end]
+            push!(stmts, :($(vv(buf)) = similar($(vv(args[1])))))              # retained destination buffer
+            push!(stmts, :($(vv(sc)) = $(vv(callee))($(vv(buf)), $((vv(a) for a in args)...))))
+        elseif mode === :ldiv
+            (length(ins) == 2 && length(outs) == 1) || return :(throw(_KernelFactoryReject("bootstrap: ldiv recipe must be 2-in/1-out")))
+            factor, rhs = ins[1], ins[2]; o = outs[1]
+            # the SAME concrete domain admission the schedule emitter applies (kernel_codegen `_pp_domain_ok`):
+            # a selected BARE op executes only over its sanctioned argument domain — rejected BEFORE it runs.
+            push!(stmts, :(kernel_recipe_op_domain_ok(recipe_handle_op(handles[$idx]),
+                                                      (typeof($(vv(factor))), typeof($(vv(rhs))))) ||
+                throw(_KernelFactoryReject($("bootstrap: ldiv op rejected for argument domain (recipe $rid)")))))
+            push!(stmts, :($(vv(o)) = similar($(vv(rhs)))))                     # retained ldiv output buffer
+            push!(stmts, :(ldiv!($(vv(o)), $(vv(factor)), $(vv(rhs)))))
+        elseif mode === :assign
+            length(outs) == 1 || return :(throw(_KernelFactoryReject("bootstrap: assign recipe needs 1 output")))
+            o = outs[1]
+            OPi = H.parameters[idx].parameters[1]                               # the handle's op TYPE
+            # a fused `_KernelSourceOp` is a definition-unique sanctioned closure (body never inspected); a
+            # BARE sanctioned op is domain-admitted over its concrete arg types before it runs (kernel_codegen).
+            if !(OPi <: _KernelSourceOp)
+                push!(stmts, :(kernel_recipe_op_domain_ok(recipe_handle_op(handles[$idx]),
+                                                          ($((:(typeof($(vv(a)))) for a in ins)...),)) ||
+                    throw(_KernelFactoryReject($("bootstrap: assign op rejected for argument domain (recipe $rid)")))))
+            end
+            push!(stmts, :($(vv(o)) = recipe_handle_op(handles[$idx])($((vv(a) for a in ins)...))))
+        else
+            return :(throw(_KernelFactoryReject($("bootstrap: unsupported handle mode $mode"))))
+        end
+    end
+    Expr(:block, stmts..., Expr(:tuple, (vv(c) for c in canons)...))
+end
+
+# Instantiate the init endpoint stores DIRECTLY from a superset-ordered cold-bootstrap value tuple, via a
+# GENERATED plan-keyed LITERAL constructor (no runtime role/ntuple branching) — the per-slot disposition is a
+# COMPILE-TIME literal from the plan `Key` + `Val{Ext}` (the identity-kept external ids). All slots are
+# populated (bootstrap executed every handle), so FULL currentness. Per-slot disposition (RK 14:xx isolation
+# contract):
+#   * external callable authority (grad_f): kept BY IDENTITY (`cvals[i]`) — one shared authority, never copied.
+#   * a HAVE SOURCE that is NOT external (the caller's metric / pos / mom): DEEP-COPIED, so the caller's own
+#     arrays are never aliased into the sampler and stay byte-unchanged across transitions and across samplers.
+#   * a bootstrap-PRODUCED value (chol/node/pot/dpot/dkin/kin/ham — the retained destination buffers +
+#     factorization + scalars): kept BY IDENTITY — fresh per bootstrap, no discarded duplicate.
+# Returns `(owned::_CanonOwned, shared::_CanonShared)`.
+@generated function _construct_endpoint_from_values(::_KernelPlan{Key}, handles::H, cvals::Tuple) where {Key,H}
+    canons, roles = _plan_superset_from_key(Key)
+    N = length(canons)
+    have = Set{Int}(_plan_have_from_key(Key)); ext = Set{Int}(_plan_external_from(Key, H))
+    disp(i) = (c = canons[i];                                    # the per-slot value expression
+        c in ext ? :(cvals[$i]) : (c in have ? :(deepcopy(cvals[$i])) : :(cvals[$i])))
+    owned_f = Any[roles[i] === :owned ? disp(i) : :nothing for i in 1:N]
+    shared_f = Any[roles[i] === :shared ? disp(i) : :nothing for i in 1:N]
+    om = _owner_mask(N, Int[i for i in 1:N if roles[i] === :owned])   # FULL owned mask (all populated)
+    sm = _owner_mask(N, Int[i for i in 1:N if roles[i] === :shared])
+    OT = Symbol(:_CanonOwned, N); ST = Symbol(:_CanonShared, N)
+    quote
+        length(cvals) == $N || throw(_KernelFactoryReject("bootstrap value arity mismatch (superset $($N))"))
+        ($OT($(owned_f...), $om), $ST($(shared_f...), $sm))
+    end
+end
+
+# An owned CHILD (fwd/bwd/proposal) built COMPLETE + ISOLATED from the bootstrap value tuple, via the same
+# GENERATED plan-keyed LITERAL constructor: every owned slot is a DEEP COPY (per-endpoint buffer isolation,
+# caller sources included), FULL currentness (a structural copy of the complete init — no separate seed pass).
+# Shared slots are `nothing`: the child references the ONE shared authority by identity (RK 06:59).
+@generated function _construct_owned_child_from_values(::_KernelPlan{Key}, cvals::Tuple) where {Key}
+    canons, roles = _plan_superset_from_key(Key)
+    N = length(canons)
+    owned_f = Any[roles[i] === :owned ? :(deepcopy(cvals[$i])) : :nothing for i in 1:N]
+    om = _owner_mask(N, Int[i for i in 1:N if roles[i] === :owned])
+    OT = Symbol(:_CanonOwned, N)
+    :($OT($(owned_f...), $om))
+end
+
 function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol}; key_token = nothing,
                               with_ops::Bool = false)
     graph = _kernel_the_graph(skel)
@@ -1599,6 +1733,33 @@ function _seed_nuts_children!(frame::_NutsFrame)
     _canon_copy_endpoint!(getfield(frame, :bwd), getfield(frame, :init))
     for p in getfield(frame, :proposals); _canon_copy_endpoint!(p, getfield(frame, :init)); end
     frame
+end
+
+# SINGLE-PASS sampler frame from a COLD-BOOTSTRAP value tuple (RK 13:44 ergonomic path): the bootstrap has
+# already executed the six handles ONCE (one gradient + one cholesky), so the init endpoint is FULLY current
+# from the start — no separate POC six-handle init, no two-phase seed. The init RETAINS the bootstrap buffers
+# by identity; fwd/bwd/proposals are COMPLETE isolated deep-copies of it sharing the ONE shared authority.
+# Same config/validation as `_construct_nuts_frame` (checked max_depth, step_f Token identity, stats binding,
+# F32/F64 via ham type). Returns a runnable frame ready for `compile_nuts` — no further init/seed step.
+function _construct_nuts_frame_bootstrapped(pf::_PreparedFactory{Token}, cvals::Tuple, max_depth::Int;
+                                            step_f, stats_f, min_dham) where {Token}
+    (max_depth >= 0 && max_depth <= typemax(Int) - 2) || throw(_KernelFactoryReject(
+        "nuts_state max_depth must be in 0:$(typemax(Int)-2) (got $max_depth) — incompatible/overflowing shape"))
+    stepc = _prepare_callable(:step_f, step_f)
+    prepared_callable_token(stepc) === kernel_plan_token(pf.plan) || throw(_KernelFactoryReject(
+        "step_f resolves to a DIFFERENT registered writer than the endpoint Plan's integrator Token — the " *
+        "frame layout was prepared for a different kernel"))
+    statsb = _stats_binding(stats_f)
+    init_ow, shared = _construct_endpoint_from_values(pf.plan, pf.handles, cvals)   # COMPLETE init (isolation-correct)
+    pos = _canon_slot(init_ow, kernel_plan_named_slot_val(pf.plan, Val(:pos)))
+    Tham = typeof(_canon_slot(init_ow, kernel_plan_named_slot_val(pf.plan, Val(:ham))))
+    entry_mask = kernel_plan_entry_owned_mask(pf.plan)
+    mkchild() = _construct_owned_child_from_values(pf.plan, cvals)                  # COMPLETE + isolated
+    fwd = mkchild(); bwd = mkchild()
+    proposals = typeof(init_ow)[mkchild() for _ in 1:(max_depth + 2)]
+    trees = _nuts_trees(pos, zero(Tham), max_depth + 1)
+    _NutsFrame(init_ow, fwd, bwd, trees, proposals, true, true, true, false, UInt(0), UInt(0),
+               _diagnostics_store(Tham), shared, entry_mask, stepc, statsb, max_depth, oftype(zero(Tham), min_dham))
 end
 
 # --- author-facing prepared SAMPLER: a callable KernelObject over the frame (RK 12:26/12:32/12:37 / poc) --
