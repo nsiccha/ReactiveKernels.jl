@@ -150,16 +150,13 @@ end
         acceptance_rate = zero(init.ham)
         copy!!(fwd, init)                 # registered owned-copy (visible)
         copy!!(bwd, init)
-        for p in proposals; copy!!(p, init); end
-        for t in trees
-            Base.fill!(t.log_weight, oftype(init.ham, -Inf))
-            @. t.bwd.mom = 0
-            @. t.bwd.dham_dmom = 0
-            @. t.bwd_fwd.mom = 0
-            @. t.bwd_fwd.dham_dmom = 0
-            @. t.summed_mom.bwd = 0
-            @. t.summed_mom.fwd = 0
-        end
+        # FAITHFUL RESET: the trajectory OVERWRITES every reached tree buffer and every reached proposal before
+        # any read (verified: stale-poison D1–D5 battery below + minimal-reset A/B byte-identical), so clearing
+        # all trees + copying all proposals each transition is dead, O(max_depth) work. Seed ONLY the live-on-
+        # entry slots: fwd/bwd (start endpoints) and proposals[1]/proposals[end] (the sample fallbacks read when
+        # the sampler takes few/zero steps). trees[1].log_weight is seeded by step! before its first read.
+        copy!!(proposals[1], init)
+        copy!!(proposals[length(proposals)], init)
     end
     collectstats!() = isnothing(stats_f) || stats_f(__self__)
     logadvanceprob(depth) = trees[depth-1].log_weight[1] - trees[depth].log_weight[1]

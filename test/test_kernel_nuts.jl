@@ -442,3 +442,150 @@ end
     @test occursin("RECEIPT dense_F64=threw_potrs dense_F32=threw_potrs diag_F64=completed diag_F32=completed", receipt)
     @test proc.exitcode == 0
 end
+# Load-bearing tests for the faithful reset cleanup (reset! seeds only fwd/bwd/proposals[1]/proposals[end]).
+# Adversarial stale-poison of every dropped write class (D1–D5) over a CENSUSED set of witnessed paths (depths,
+# both directions, swap AND no-swap all observed, plus a forced-divergence early-return control), full
+# seven-field selected-sample parity, exact 0-B (both RNG), and a spoof-proof source-drift gate (reset! MethodIR
+# structure + comment-stripped body — not a whole-file scan).
+
+@testset "kernel_nuts — faithful reset: stale-poison D1–D5 (censused paths) + parity + 0-B + IR drift gate" begin
+    _mkframe(pf, T, md, metric; min_dham = -1000) = begin
+        PL = RK.kernel_prepared_plan(pf); d = _nuts_mkvals(pf, T)
+        for sl in RK.kernel_plan_slots(PL)
+            nm = String(sl.path[1]); nm == "metric" && (d[sl.canon] = metric); nm == "chol_metric" && (d[sl.canon] = cholesky(metric))
+        end
+        fr = RK._construct_nuts_frame(pf, d, md; step_f = RK.partial(_NutsFix.leapfrog!; stepsize = T(0.3)), stats_f = _NutsFix.nuts_stats!, min_dham = min_dham)
+        RK.compile_prepared_initialization(pf, typeof(fr.init), typeof(fr.shared))(fr.init, fr.shared, RK.kernel_prepared_handles(pf))
+        RK._seed_nuts_children!(fr); fr
+    end
+    # FULL selected-sample payload: all SEVEN physical owned init fields (the sample copied from proposals[end])
+    # + init currentness mask + proposals[end] payload/mask, plus every diagnostic/mask and the physical diverged
+    # field & its currentness bits. Owned slots: pos3 mom4 pot6 dpot7 dkin9 kin10 ham11.
+    _slots(ep) = (copy(RK._canon_slot(ep, Val(3))), copy(RK._canon_slot(ep, Val(4))), RK._canon_slot(ep, Val(6)),
+                  copy(RK._canon_slot(ep, Val(7))), copy(RK._canon_slot(ep, Val(9))), RK._canon_slot(ep, Val(10)),
+                  RK._canon_slot(ep, Val(11)), RK._canon_current_mask(ep))
+    _obs(fr) = (init = _slots(fr.init), prop_end = _slots(getfield(fr, :proposals)[end]),
+                n_steps = RK._diag_slot(fr.diag, Val(1)), reached_depth = RK._diag_slot(fr.diag, Val(2)),
+                acceptance_rate = RK._diag_slot(fr.diag, Val(3)), dham = RK._diag_slot(fr.diag, Val(4)),
+                committed = RK.diagnostics_committed_mask(fr.diag), pending = RK.diagnostics_pending_mask(fr.diag),
+                diverged = getfield(fr, :diverged),
+                diverged_pending = RK.nuts_frame_diverged_pending(fr),
+                diverged_committed = RK.nuts_frame_diverged_committed(fr))
+    _NAN(v::AbstractArray) = fill!(v, convert(eltype(v), NaN))
+    _poison_ep!(ep) = begin                                   # ALL 7 physical owned fields (vectors + scalars)
+        for s in (3, 4, 7, 9); v = RK._canon_slot(ep, Val(s)); v isa AbstractArray && _NAN(v); end
+        for s in (6, 10, 11); RK._canon_set!(ep, Val(s), convert(eltype(RK._canon_slot(ep, Val(3))), NaN)); end
+    end
+    _D1!(fr) = for t in getfield(fr, :trees); _NAN(t.log_weight); end
+    _D2!(fr) = for t in getfield(fr, :trees); _NAN(t.bwd.mom); _NAN(t.bwd.dham_dmom); end
+    _D3!(fr) = for t in getfield(fr, :trees); _NAN(t.bwd_fwd.mom); _NAN(t.bwd_fwd.dham_dmom); end
+    _D4!(fr) = for t in getfield(fr, :trees); _NAN(t.summed_mom.bwd); _NAN(t.summed_mom.fwd); end
+    _D5!(fr) = begin ps = getfield(fr, :proposals); for i in 2:length(ps)-1; _poison_ep!(ps[i]); end end
+    _DALL!(fr) = (_D1!(fr); _D2!(fr); _D3!(fr); _D4!(fr); _D5!(fr))
+    _noop!(fr) = nothing
+    # each per-txn record folds the full observable set PLUS the witnessed control category: `selected` =
+    # proposals[end] changed identity this txn (a swap-to-end), and `gofwd` = final direction.
+    _traj(C, fr, seed, K, poison!) = begin
+        rng = Random.Xoshiro(seed); out = Vector{Any}(undef, K)
+        for i in 1:K
+            poison!(fr); pe0 = objectid(getfield(fr, :proposals)[end])
+            C.root!(fr, C.scratch, rng)
+            out[i] = (obs = _obs(fr), selected = objectid(getfield(fr, :proposals)[end]) != pe0,
+                      gofwd = getfield(fr, :gofwd), may_continue = getfield(fr, :may_continue))
+        end
+        out
+    end
+
+    # === source drift: SPOOF-PROOF ===
+    resetir = only(i for i in RK.method_irs(_NutsFix.nuts_state) if i.id.name === :reset!)
+    _count_for(x) = (x isa RK._For ? 1 : 0) + ((x isa Tuple || x isa AbstractVector) ? sum(_count_for, x; init = 0) :
+        (x isa RK._MExpr || x isa RK._MStmt) ? sum(f -> _count_for(getfield(x, f)), fieldnames(typeof(x)); init = 0) : 0)
+    @test _count_for(resetir.body) == 0                       # reset! contains ZERO loops (dead-write loops gone)
+    srclines = split(read(joinpath(@__DIR__, "..", "benchmark", "nuts_kernel_authoring_fixture.jl"), String), '\n')
+    i0 = findfirst(l -> occursin("reset!() = begin", l), srclines)
+    i1 = i0 + findfirst(l -> strip(l) == "end", srclines[i0+1:end])
+    body_code = replace(join(srclines[i0:i1], "\n"), r"#[^\n]*" => "")     # comment-stripped reset! CODE
+    @test occursin("copy!!(proposals[1], init)", body_code)
+    @test occursin("copy!!(proposals[length(proposals)], init)", body_code)
+    @test occursin("copy!!(fwd, init)", body_code) && occursin("copy!!(bwd, init)", body_code)
+    @test !occursin("for ", body_code) && !occursin("fill!", body_code)
+
+    seeds = (1, 7, 42, 123)
+    for T in (Float64, Float32)
+        pf = _nuts_pf()
+        CD = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, _mkframe(pf, T, 10, LinearAlgebra.Diagonal(T[1, 1])))
+        CM = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, _mkframe(pf, T, 10, T[1 0; 0 1]))
+        # stale-poison D1–D5 across the censused seeds — reference vs each poisoned class byte-identical over the
+        # FULL per-txn record (payload + selected + gofwd). Also collect the observed path CENSUS from the SAME
+        # reference trajectories, so the "dead" claim is scoped to exactly the paths witnessed here.
+        depths = Set{Int}(); dirs = Set{Bool}(); sels = Set{Bool}(); allstop = Ref(true)
+        for seed in seeds
+            ref = _traj(CD, _mkframe(pf, T, 10, LinearAlgebra.Diagonal(T[1, 1])), seed, 60, _noop!)
+            for r in ref
+                push!(depths, Int(r.obs.reached_depth)); push!(dirs, r.gofwd); push!(sels, r.selected)
+                (!r.may_continue && !r.obs.diverged) || (allstop[] = false)
+            end
+            for pz in (_D1!, _D2!, _D3!, _D4!, _D5!, _DALL!)
+                @test _traj(CD, _mkframe(pf, T, 10, LinearAlgebra.Diagonal(T[1, 1])), seed, 60, pz) == ref
+            end
+            @test _traj(CD, _mkframe(pf, T, 10, LinearAlgebra.Diagonal(T[1, 1])), seed, 60, _noop!) ==
+                  _traj(CM, _mkframe(pf, T, 10, T[1 0; 0 1]), seed, 60, _noop!)   # Diagonal ≡ dense full-observable parity
+        end
+        # WITNESSED categories, matching the independent Codex census for these EXACT seeds (no overclaim):
+        # reached_depth is exactly {1,2,3,4}, both gofwd directions, both swap-to-end and no-swap, and every
+        # normal transition ended !may_continue && !diverged (U-turn-like stop). We do NOT claim max-depth
+        # (reached_depth never hits max_depth=10) or per-depth flip coverage; divergence is the forced control.
+        @test depths == Set([1, 2, 3, 4])
+        @test maximum(depths) < 10
+        @test dirs == Set([false, true])
+        @test sels == Set([false, true])
+        @test allstop[]                          # all 240 normal transitions stopped via U-turn (!may_continue, !diverged)
+        # FORCED-DIVERGENCE control: min_dham above any dham forces diverged=true on leaf 1, exercising the
+        # early-return path (start! returns before writing proposals[1] / trees[1].log_weight).
+        CX = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, _mkframe(pf, T, 10, LinearAlgebra.Diagonal(T[1, 1]); min_dham = T(1e6)))
+        refX = _traj(CX, _mkframe(pf, T, 10, LinearAlgebra.Diagonal(T[1, 1]); min_dham = T(1e6)), 1, 40, _noop!)
+        @test all(r -> r.obs.diverged, refX)                   # control genuinely takes the divergence path (non-vacuous)
+        @test all(r -> Int(r.obs.reached_depth) == 1 && !r.selected && r.gofwd, refX)   # observed forced category: depth 1, no swap, gofwd
+        for pz in (_D1!, _D2!, _D3!, _D4!, _D5!, _DALL!)
+            @test _traj(CX, _mkframe(pf, T, 10, LinearAlgebra.Diagonal(T[1, 1]); min_dham = T(1e6)), 1, 40, pz) == refX
+        end
+        # exact 0-B on the faithful-reset path (scaled Diagonal, same type ⇒ reuse CD), F32/F64 × both RNG
+        frS = _mkframe(pf, T, 10, LinearAlgebra.Diagonal(T[2, 2]))
+        for rg in (Random.Xoshiro(91), Random.MersenneTwister(2))
+            @test _nuts_batch0b(CD.root!, frS, CD.scratch, rg, Val(64)) == 0
+            @test _nuts_batch0b(CD.root!, frS, CD.scratch, rg, Val(256)) == 0
+        end
+    end
+end
+
+@testset "kernel_nuts — public ROOT bad-RNG contract: throws + diagnostics/derived cleared, no false commit (F32/F64)" begin
+    # Codex-audit pin (RK): the PUBLIC ROOT (not only C.refresh) begins each epoch by resetting/uncommitting
+    # diagnostics + derived, THEN refreshes. An unsupported RNG is rejected inside refresh BEFORE any kill, so
+    # C.root! THROWS and leaves: all diag values 0, committed=pending=0, derived committed=pending=0 (nothing
+    # falsely current), and mom currentness UNCHANGED (no kill occurred). This is executed-prefix semantics —
+    # explicitly NOT a rollback (the prior transition's committed diagnostics are gone, reset at epoch entry).
+    _mkD(T) = begin
+        pf = _nuts_pf(); PL = RK.kernel_prepared_plan(pf); d = _nuts_mkvals(pf, T)
+        for sl in RK.kernel_plan_slots(PL)
+            nm = String(sl.path[1]); nm == "metric" && (d[sl.canon] = LinearAlgebra.Diagonal(T[1, 1])); nm == "chol_metric" && (d[sl.canon] = cholesky(LinearAlgebra.Diagonal(T[1, 1])))
+        end
+        fr = RK._construct_nuts_frame(pf, d, 10; step_f = RK.partial(_NutsFix.leapfrog!; stepsize = T(0.3)), stats_f = _NutsFix.nuts_stats!, min_dham = -1000)
+        RK.compile_prepared_initialization(pf, typeof(fr.init), typeof(fr.shared))(fr.init, fr.shared, RK.kernel_prepared_handles(pf))
+        RK._seed_nuts_children!(fr)
+        (pf, RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, fr), fr)
+    end
+    for T in (Float64, Float32)
+        pf, C, fr = _mkD(T)
+        momslot = RK.kernel_plan_named_slot_val(RK.kernel_prepared_plan(pf), Val(:mom))
+        C.root!(fr, C.scratch, Random.Xoshiro(1))                       # a SUCCESSFUL transition first (real diag values)
+        @test RK._diag_slot(fr.diag, Val(1)) > 0                        # n_steps advanced — the reset below is non-vacuous
+        @test RK.diagnostics_committed_mask(fr.diag) == UInt(0x0f)      # previous epoch committed all 4
+        @test_throws Exception C.root!(fr, C.scratch, _CustomRNG2())    # bad RNG rejected inside refresh
+        @test all(RK._diag_slot(fr.diag, Val(i)) == 0 for i in 1:4)     # diag values reset at epoch entry, never re-committed
+        @test RK.diagnostics_committed_mask(fr.diag) == 0              # committed cleared (NOT the prior 0x0f — not a rollback)
+        @test RK.diagnostics_pending_mask(fr.diag) == 0               # pending cleared by the epoch catch
+        @test !RK.nuts_frame_diverged_committed(fr)                    # derived committed cleared
+        @test !RK.nuts_frame_diverged_pending(fr)                      # derived pending cleared
+        @test RK._canon_current(fr.init, momslot)                      # mom UNCHANGED-current: bad RNG rejected before any kill
+    end
+end
