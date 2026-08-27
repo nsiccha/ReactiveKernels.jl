@@ -36,18 +36,19 @@ unconstrained ─ split ─ τ ────┤
                               └─ (parameters, log_jacobian)     (chosen: density)
 
 parameters ──► log prior
-          ──► pointwise log likelihood ──► log likelihood
+          ──► log likelihood  (plated: vectorized over the schools)
           ──► new-group prediction
 
 log prior + log Jacobian + log likelihood ──► unconstrained log density
 ```
 
 The block below is the authored model, executed verbatim while the documentation
-is built. Every recipe body is written out inline — the transform, the prior, the
-pointwise likelihood — so nothing is hidden behind a helper call; what you read is
-exactly what the planner lowers. Pointwise terms are a first-class port too, so
-returning them with the scalar density shares the likelihood computation rather
-than repeating it.
+is built. Every recipe body is written out inline — the transform and the prior —
+so nothing is hidden behind a helper call; what you read is exactly what the
+planner lowers. The likelihood is authored ONCE as a scalar per-school `@kernel`
+and `plate`d into a vectorized log density: it iterates the batched ports and sums
+the scalar result in one fused pass, materializing no per-observation vector (and
+hoisting any shared work above the loop).
 
 The panel below is one coherent, build-executed artifact—not three separately
 maintained snippets. **Raw input** is the exact source that builds and runs the
@@ -58,6 +59,17 @@ side by side without resetting the interactive DAG.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(@__MODULE__, raw"""
+# The per-school log likelihood, authored ONCE as a scalar kernel. `plate` turns
+# it into the vectorized log density: the batched ports are iterated element-wise
+# and the scalar `ll` is summed in one fused pass — no per-observation vector is
+# materialized, and any work depending only on shared ports would be hoisted above
+# the loop (here all three inputs vary per school, so there is nothing to hoist).
+@kernel school_loglik(y::Float64, θ::Float64, σ::Float64) = begin
+    ll::Float64 = -0.5 * log(2π) - log(σ) - 0.5 * ((y - θ) / σ)^2
+end
+plated_loglik = plate(school_loglik;
+    have = (:y, :θ, :σ), want = :ll, batched = (:y, :θ, :σ))
+
 @kernel model(unconstrained::Vector{Float64},
               observations::Vector{Float64},
               observation_scales::Vector{Float64},
@@ -86,13 +98,8 @@ Main.ReactiveKernelsDocs.execute_example(@__MODULE__, raw"""
         (log(2) - log(π) - log(5.0) - log1p((τ / 5.0)^2)) +
         sum(-0.5 * log(2π) - log(τ) - 0.5 * ((θ[j] - μ) / τ)^2 for j in 1:8)
 
-    # Pointwise log likelihood:  yⱼ ~ Normal(θⱼ, σⱼ).
-    pointwise::Vector{Float64} = [
-        -0.5 * log(2π) - log(observation_scales[j]) -
-            0.5 * ((observations[j] - θ[j]) / observation_scales[j])^2
-        for j in 1:8
-    ]
-    likelihood::Float64 = sum(pointwise)
+    # Log likelihood:  yⱼ ~ Normal(θⱼ, σⱼ), summed by the vectorized `plated_loglik`.
+    likelihood::Float64 = plated_loglik(observations, θ, observation_scales)
 
     # Unconstrained-space log density.
     density::Float64 = prior + log_jacobian + likelihood
@@ -111,11 +118,10 @@ observation_scales = EIGHT_SCHOOLS_SIGMA
 
 density_kernel = prepare(model;
     have = (:unconstrained, :observations, :observation_scales),
-    want = (:prior, :log_jacobian, :pointwise, :likelihood, :density))
+    want = (:prior, :log_jacobian, :likelihood, :density))
 
 output = density_kernel(q, observations, observation_scales)
-prior, logjac, pointwise, likelihood, density = output
-@assert likelihood ≈ sum(pointwise)
+prior, logjac, likelihood, density = output
 @assert density ≈ prior + logjac + likelihood
 
 docs_example = (;
@@ -140,19 +146,15 @@ parameters = constrain_kernel(q)
 ```
 
 Generated quantities can start at an already-constrained boundary. In this
-query, planning removes the unconstrained transform, Jacobian, prior, likelihood
-reduction, and total-density recipes:
+query, planning removes the unconstrained transform, Jacobian, prior, likelihood,
+and total-density recipes, leaving only the prediction:
 
 ```julia
 generated_kernel = prepare(model;
-    have = (:parameters, :observations, :observation_scales,
-            :new_group_scale, :prediction_innovations),
-    want = (:pointwise, :new_group))
+    have = (:parameters, :new_group_scale, :prediction_innovations),
+    want = :new_group)
 
-pointwise, prediction = generated_kernel(
-    parameters, observations, observation_scales, 12.0, [0.25, -1.0])
-
-prediction
+prediction = generated_kernel(parameters, 12.0, [0.25, -1.0])
 ```
 
 Prediction takes standard-normal innovations as inputs rather than drawing

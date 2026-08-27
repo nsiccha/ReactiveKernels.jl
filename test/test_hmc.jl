@@ -238,7 +238,7 @@ end
     gradient_calls = Ref(0)
     logdensity(position) = begin
         density_calls[] += 1
-        density_kernel(Tuple(position), observations, scales)
+        density_kernel(collect(position), observations, scales)
     end
     potential(position) = begin
         potential_calls[] += 1
