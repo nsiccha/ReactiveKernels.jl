@@ -930,16 +930,20 @@ function _nuts_validate_emitted_ops(mode::Symbol,Ops::Type{<:Tuple})
     isempty(intersect(realids,instrids)) || return false
     mode === :production && return isempty(instrids)
     mode === :instrumented || return false
-    for (i,t) in enumerate(ts)
-        t<:_NutsInstrumentWrite || continue
-        i>1 || return false
-        prev=ts[i-1]
-        prev<:_NutsRealOp || return false
-        t.parameters[2] == prev.parameters[1] || return false
-        counter=t.parameters[3]
-        ((counter === prev.parameters[2]) ||
-         (counter === :leaf_body && prev.parameters[2] === :inlined) ||
-         (counter isa Tuple && !isempty(counter) && counter[1] === prev.parameters[2])) || return false
+    # Instrumented emission is TOTAL, not merely locally well-formed: every real site has exactly one
+    # immediately-following write, and every write belongs to exactly that predecessor.  Without the
+    # cardinality/alternation rule `Real,Write,Real` falsely validated while silently omitting one counter.
+    iseven(length(ts)) || return false
+    length(realids)==length(instrids)==(length(ts)>>>1) || return false
+    for i in 1:2:length(ts)
+        real=ts[i]; write=ts[i+1]
+        real<:_NutsRealOp || return false
+        write<:_NutsInstrumentWrite || return false
+        write.parameters[2] == real.parameters[1] || return false
+        counter=write.parameters[3]
+        ((counter === real.parameters[2]) ||
+         (counter === :leaf_body && real.parameters[2] === :inlined) ||
+         (counter isa Tuple && !isempty(counter) && counter[1] === real.parameters[2])) || return false
     end
     true
 end
