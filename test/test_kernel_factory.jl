@@ -153,6 +153,21 @@ end
 # a COUNTING in-place gradient — proves 'zero extra pgrad' non-vacuously (count stays 1 across child seeds)
 mutable struct CountingPgrad; n::Int; end
 (c::CountingPgrad)(dest, pos) = (c.n += 1; dest .= 2 .* pos; sum(abs2, pos))
+# Two DISTINCT Mode-2 `!!` skeletons for the sampler identity gate (RK 12:37): each mints a def-unique
+# Token. `nuts_root!!` is the sampler's compiled-root owner; `other_root!!` is an UNRELATED skeleton whose
+# Token must NOT admit the same sampler's transition (pure-type gate, no name special-case).
+@kernel nuts_root!!(state; rng) = begin
+    step!(state, rng)
+    return state
+end
+@kernel other_root!!(state; rng) = begin
+    step!(state, rng)
+    return state
+end
+# A synthetic compiled `root!(frame, scratch, rng) -> frame` standing in for POC's compiled Mode-2 root
+# (POC's real root isn't on the syntax branch): it bumps a diagnostic in place and returns the SAME frame,
+# so `result === state`. Concretely-typed scratch (a Tuple), rng THREADED (never stored in scratch).
+synroot!(frame, scratch, rng) = (RKS._diag_set!(frame.diag, Val(1), RKS._diag_slot(frame.diag, Val(1)) + 1); frame)
 # function barrier for the whole-endpoint mixed scalar+buffer copy 0-B / @inferred gate (RK 07:02)
 _copyep0b(d, s) = RKS._canon_copy_endpoint!(d, s)
 # a buffer that THROWS during copyto! (post-validation mid-copy failure) — proves the epoch contract
@@ -1392,6 +1407,71 @@ end
         f2 = mkframe(Float64, shared_pg, 3)
         @test RKS.nuts_frame_shared(f1) !== RKS.nuts_frame_shared(f2)          # separate mutable authorities
         @test f1.init !== f2.init && f1.trees[1].bwd.mom !== f2.trees[1].bwd.mom  # fully isolated
+    end
+
+    @testset "nuts_state — FINAL callable sampler: concrete typed Handles + token-gated Mode-2 dispatch (RK 12:32/12:37/12:39)" begin
+        # A fully-prepared frame (phase-1 build + POC init + phase-2 seed, no manual step) via the ONE-shot
+        # author-facing entry `_prepare_nuts_frame` — the runnable substrate POC compiles its root against.
+        integ = RKS.kernel_registration(leapfrog_ep!)
+        pf = RKS._prepare_factory(euclidean_ep, integ)
+        plan = RKS.kernel_prepared_plan(pf)
+        stepb = RKS.partial(leapfrog_ep!; stepsize = 0.1)
+        function mkvals(T, pg)
+            m = T[2 0; 0 2]; d = Dict{Int,Any}()
+            for s in RKS.kernel_plan_slots(plan)
+                nm = String(s.path[1])
+                d[s.canon] =
+                    nm == "grad_f" ? pg : nm == "metric" ? m : nm == "chol_metric" ? cholesky(m) :
+                    startswith(nm, "##node") ? zero(T) :
+                    nm == "pos" ? T[1, 2] : nm == "mom" ? T[3, 4] :
+                    nm in ("dpot_dpos", "dham_dpos", "dkin_dmom", "dham_dmom") ? T[0, 0] : zero(T)
+            end
+            d
+        end
+        prep(T, pg, md) = RKS._prepare_nuts_frame(pf, mkvals(T, pg), md;
+                                                  step_f = stepb, stats_f = nothing, min_dham = -1000)
+        _fire(skel, k, rng) = skel(k; rng = rng)                               # function barrier for the kw call
+        # OWNER token = the `nuts_state` authoring owner (here, the endpoint plan token stands in); ROOT token
+        # = the compiled public `nuts_root!!` Mode-2 skeleton. They are DISTINCT — the positive control that
+        # the KernelObject keeps the OWNER token while Handles carry the ROOT token (RK 12:39).
+        owner_tok = RKS.kernel_prepared_token(pf)
+        root_tok = RKS.kernel_token(nuts_root!!)
+        @test owner_tok !== root_tok                                            # owner-token != root-token
+        for T in (Float32, Float64)
+            frame = prep(T, CountingPgrad(0), 4)
+            scratch = (zero(T), 0)                                              # concretely-typed Tuple scratch
+            k = RKS.nuts_sampler(Val(owner_tok), Val(root_tok), frame, synroot!, scratch)
+            @test RKS.kernel_token(k) === owner_tok                             # KernelObject keeps OWNER token
+            @test RKS.nuts_handles_root_token(getfield(k, :handles)) === root_tok  # Handles carry ROOT token
+            @test isconcretetype(typeof(k)) && isconcretetype(typeof(getfield(k, :handles)))  # nothing untyped
+            @test RKS.nuts_sampler_frame(k) === frame                          # wraps the SAME frame
+            # DISPATCH is the Mode-2 skeleton call, gated on RootToken. The transition mutates the frame in
+            # place (bumps n_steps) and returns the SAME sampler (result === state).
+            rng = Random.MersenneTwister(1)                                    # hoisted: not part of the call cost
+            n0 = RKS._diag_slot(frame.diag, Val(1))
+            r = nuts_root!!(k; rng = rng)
+            @test r === k && RKS.nuts_sampler_frame(r) === frame               # result === state
+            @test RKS._diag_slot(frame.diag, Val(1)) == n0 + 1                 # root! actually ran in place
+            # type-stable dispatch + 0-B (the frame mutation is the only work; the call itself allocates none)
+            @test (@inferred _fire(nuts_root!!, k, rng)) === k
+            _fire(nuts_root!!, k, rng)                                          # warm the barrier
+            @test (@allocated _fire(nuts_root!!, k, rng)) == 0
+        end
+        # WRONG root-token REJECTS: an UNRELATED Mode-2 skeleton (`other_root!!`) has NO matching method for a
+        # sampler whose Handles carry `nuts_root!!`'s RootToken — pure-type gate, no name special-case.
+        frame = prep(Float64, CountingPgrad(0), 3)
+        k = RKS.nuts_sampler(Val(owner_tok), Val(root_tok), frame, synroot!, (0.0, 0))
+        @test_throws MethodError other_root!!(k; rng = Random.MersenneTwister(1))
+        # RAW-SIGNATURE keyword gates (RK 12:39): `rng` is a REQUIRED KEYWORD — a MISSING, POSITIONAL, or
+        # EXTRA `rng` finds NO method and is rejected (the captured `(state; rng)` contract reused verbatim).
+        @test_throws UndefKeywordError nuts_root!!(k)                            # missing required kw rng
+        @test_throws MethodError nuts_root!!(k, Random.MersenneTwister(1))       # positional rng
+        @test_throws MethodError nuts_root!!(k; rng = Random.MersenneTwister(1), foo = 1)  # extra kw
+        # REPEATED same-signature constructions → IDENTICAL concrete object/root/scratch types (typed/0-B)
+        ka = RKS.nuts_sampler(Val(owner_tok), Val(root_tok), prep(Float64, CountingPgrad(0), 3), synroot!, (0.0, 0))
+        kb = RKS.nuts_sampler(Val(owner_tok), Val(root_tok), prep(Float64, CountingPgrad(0), 3), synroot!, (0.0, 0))
+        @test typeof(ka) === typeof(kb)                                         # identical concrete sampler type
+        @test typeof(getfield(ka, :handles)) === typeof(getfield(kb, :handles))
     end
 
     @testset "nuts_state — registered stats_f scalar-effect binding (write-roots→diag slots; nothing/opaque) (RK 08:42/09:11)" begin

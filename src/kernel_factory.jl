@@ -1601,6 +1601,67 @@ function _seed_nuts_children!(frame::_NutsFrame)
     frame
 end
 
+# --- author-facing prepared SAMPLER: a callable KernelObject over the frame (RK 12:26/12:32/12:37 / poc) --
+#
+# HARD GATE (RK 12:32): the compiled `root!` + `scratch` are CONCRETE TYPE PARAMETERS of the Handles before
+# the public KernelObject ever escapes — NO mutable empty slot, Ref, Any, `Function`-typed field, or Union.
+# So there is NO unattached-placeholder object: construction returns the prepared FRAME, POC compiles its
+# root!+scratch from that concrete frame, and `nuts_sampler` builds the FINAL concrete KernelObject in one
+# shot. Repeated same-signature constructions yield identical concrete object/root/scratch types (0-B).
+#
+# IDENTITY GATE (RK 12:37/12:39): the KernelObject keeps the OWNER `nuts_state` Token (needed for subject-
+# method MethodIds), and the Handles separately carry the exact compiled public Mode-2 `nuts!!` `RootToken`
+# as their FIRST type parameter (POC compiles/validates the real `nuts!!` MethodIR against it and hands it
+# back to construction). So a sampler is `KernelObject{OwnerToken, Frame, _NutsHandles{RootToken,R,S}}` and
+# OwnerToken need NOT equal RootToken. Dispatch is the Mode-2 SKELETON CALL below, admitted ONLY when the
+# skeleton's own Token === the handle `RootToken` — a pure-type gate, no name special-case. An unrelated
+# Mode-2 skeleton has NO method and is rejected.
+struct _NutsHandles{RootToken,Root,Scratch}
+    root::Root
+    scratch::Scratch
+end
+_NutsHandles(::Val{RootToken}, root::Root, scratch::Scratch) where {RootToken,Root,Scratch} =
+    _NutsHandles{RootToken,Root,Scratch}(root, scratch)
+nuts_handles_root(h::_NutsHandles) = getfield(h, :root)
+nuts_handles_scratch(h::_NutsHandles) = getfield(h, :scratch)
+nuts_handles_root_token(::_NutsHandles{RootToken}) where {RootToken} = RootToken
+nuts_sampler_frame(k::KernelObject) = getfield(k, :state)
+
+# Prepare the sampler FRAME from source inputs (RK 12:26): build the frame, run POC's full six-handle
+# INITIALIZATION on `frame.init` exactly once, and SEED the children — returning the ready `_NutsFrame`
+# (concrete). POC compiles its root!+scratch from this frame; then `nuts_sampler` wraps it with the tokens.
+function _prepare_nuts_frame(pf::_PreparedFactory, endpoint_values, max_depth::Int; step_f, stats_f, min_dham)
+    frame = _construct_nuts_frame(pf, endpoint_values, max_depth; step_f, stats_f, min_dham)
+    init = getfield(frame, :init); shared = getfield(frame, :shared)
+    compile_prepared_initialization(pf, typeof(init), typeof(shared))(init, shared, kernel_prepared_handles(pf))
+    _seed_nuts_children!(frame)
+    frame
+end
+
+# Build the FINAL public sampler in one shot (RK 12:32/12:39): a concrete `KernelObject{OwnerToken, Frame,
+# _NutsHandles{RootToken,Root,Scratch}}` over the prepared frame + POC's compiled root!+scratch. `OwnerToken`
+# is the authoring `nuts_state` owner Token (kept for subject-method MethodIds); `RootToken` is the exact
+# Mode-2 `nuts!!` skeleton Token POC compiled the root against — carried in the Handles so the skeleton-call
+# gate below admits ONLY that skeleton. Handle types are concrete from the start; nothing untyped escapes.
+nuts_sampler(::Val{OwnerToken}, ::Val{RootToken}, frame::_NutsFrame, root, scratch) where {OwnerToken,RootToken} =
+    KernelObject{OwnerToken,typeof(frame),_NutsHandles{RootToken,typeof(root),typeof(scratch)}}(
+        frame, _NutsHandles(Val(RootToken), root, scratch))
+
+# The authored `nuts!!(state; rng)` dispatch (RK 12:37/12:39 / poc contract): the Mode-2 `nuts!!` SKELETON
+# is itself the callable, and its captured signature contract — subject positional + REQUIRED KEYWORD `rng`
+# — is reused verbatim as this method's own signature (`(k; rng)`), so a missing / extra / positional `rng`
+# finds NO method and is rejected. Admitted ONLY when the skeleton's own `RootToken` === the sampler handle's
+# `RootToken` (a single shared type parameter); OwnerToken is free — so an unrelated Mode-2 skeleton finds NO
+# method, with no token-free path to bypass the gate. It calls the compiled `root!(frame, scratch, rng)`
+# DIRECTLY on the concrete handle fields — which mutates the frame in place and returns the SAME frame — and
+# returns the SAME sampler, so `result === state`. @inferred / 0-B.
+@inline function (::_Mode2KernelSkeleton{RootToken})(
+        k::KernelObject{OwnerToken,State,<:_NutsHandles{RootToken}}; rng) where {RootToken,OwnerToken,State}
+    h = getfield(k, :handles)
+    getfield(h, :root)(getfield(k, :state), getfield(h, :scratch), rng)
+    k
+end
+
 # --- registered stats_f scalar-effect binding (RK 08:42/08:55) ---------------------------------------
 #
 # The diagnostic slot index of each fixture diagnostic field (1=n_steps, 2=reached_depth, 3=acceptance_
