@@ -131,3 +131,38 @@ end
     # POST-RETURN statement (return no longer last)
     @test_throws Exception RK._derive_public_root_ops(mkroot([b[1], b[3], b[2]]), :step!, :rng, tok)
 end
+
+@testset "kernel_nuts — END-TO-END callable nuts!!(sampler; rng): Mode-2 dispatch, loop 0-B, token/rng rejects" begin
+    OwnerToken = RK.kernel_token(_NutsFix.nuts_state)
+    for T in (Float64, Float32)
+        pf = _nuts_pf()
+        frame = RK._prepare_nuts_frame(pf, _nuts_mkvals(pf, T), 5;
+                                       step_f = RK.partial(_NutsFix.leapfrog!; stepsize = T(0.1)), stats_f = nothing, min_dham = -1000)
+        C = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame)
+        # OwnerToken (nuts_state subject-methods) and RootToken (the nuts!! Mode-2 skeleton) are DISTINCT tokens,
+        # both preserved into the concrete sampler type — the dispatch gate keys on RootToken, OwnerToken is free.
+        @test OwnerToken !== C.RootToken
+        sampler = RK.nuts_sampler(Val(OwnerToken), Val(C.RootToken), frame, C.root!, C.scratch)
+        @test RK.kernel_token(sampler) === OwnerToken                 # owner token preserved on the KernelObject
+        # THE authored public call — the Mode-2 nuts!! skeleton IS the callable
+        r = _NutsFix.nuts!!(sampler; rng = Random.Xoshiro(1))
+        @test RK.nuts_sampler_frame(r) === frame                      # result === state
+        @test RK._canon_slot(frame.init, RK.kernel_plan_named_slot_val(RK.kernel_prepared_plan(pf), Val(:mom))) isa Vector{T}
+        # EXACT 0-B in a loop THROUGH THE PUBLIC PATH (hoisted rng), both rng types
+        @inline function pub(skel, samp, rg, ::Val{N}) where {N}
+            i = 0; @inbounds while i < N; skel(samp; rng = rg); i += 1; end; nothing
+        end
+        pub0b(skel, samp, rg, ::Val{N}) where {N} = (pub(skel, samp, rg, Val(N)); GC.gc(); @allocated pub(skel, samp, rg, Val(N)))
+        for rg in (Random.Xoshiro(91), Random.MersenneTwister(2))
+            @test pub0b(_NutsFix.nuts!!, sampler, rg, Val(64)) == 0
+            @test pub0b(_NutsFix.nuts!!, sampler, rg, Val(128)) == 0
+        end
+        @inferred _NutsFix.nuts!!(sampler; rng = Random.Xoshiro(1))
+        # rng is a REQUIRED KEYWORD — missing / positional rng is rejected
+        @test_throws Exception _NutsFix.nuts!!(sampler)
+        @test_throws Exception _NutsFix.nuts!!(sampler, Random.Xoshiro(1))
+        # a sampler whose handle RootToken differs from the nuts!! skeleton token finds NO Mode-2 method
+        wrong = RK.nuts_sampler(Val(OwnerToken), Val(:not_the_root_token), frame, C.root!, C.scratch)
+        @test_throws MethodError _NutsFix.nuts!!(wrong; rng = Random.Xoshiro(1))
+    end
+end
