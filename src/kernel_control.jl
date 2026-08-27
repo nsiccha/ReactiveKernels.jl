@@ -91,7 +91,7 @@ function build_region!(bb::BB, stmts, cont_pc::Int, ret_pc::Int, ret_val, by_mid
             # effect statement. Dropping it silently lost the terminal init<-proposals[end] copy.
             eff = Any[]
             if v !== nothing
-                push!(eff, ret_val !== nothing ? _LocalAssign(_retvalsym(ret_val), v) : _ExprStmt(v))
+                push!(eff, ret_val !== nothing ? _LocalAssign((_retvalsym(ret_val),), v) : _ExprStmt(v))
             end
             pc = _newpc!(bb); push!(bb.blks, Blk(pc, eff, TGoto(ret_pc))); return pc
         end

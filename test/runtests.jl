@@ -15,6 +15,7 @@ using Test
         include("test_kernel_lowering.jl")
         include("test_kernel_codegen.jl")
         include("test_kernel_control.jl")
+        include("test_kernel_control_regressions.jl")
         include("test_nonallocating_core.jl")
         include("test_composition_cse.jl")
         include("test_deterministic_ast.jl")
