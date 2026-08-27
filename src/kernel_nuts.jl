@@ -169,6 +169,7 @@ struct NCtx
     rec                      # the defunctionalized (recursive) mid set
     runtimearg::Symbol       # the authored runtime-arg formal (rng) — threaded, NOT spilled to RNG-typed SoA
     argsym::Symbol           # the root parameter carrying the runtime rng (read directly everywhere)
+    stats_ir                 # effectful nuts_stats! MethodIR (its writes are inlined) or nothing (no-effect)
 end
 _cfg(C::NCtx, name::Symbol) = Expr(:call, GlobalRef(Core, :getfield), C.cfg, QuoteNode(name))
 # demand-ensure read of derived endpoint `field` on runtime endpoint expr `epexpr`
@@ -215,7 +216,13 @@ function nfieldcall(x, lm, C::NCtx)
         Expr(:call, _cfg(C, :leaf), ep, Expr(:call, GlobalRef(Core, :getfield), C.S, QuoteNode(:shared)),
              _cfg(C, :handles), _cfg(C, :stepkw))
     elseif fld === :stats_f
-        C.stats_noeffect ? :nothing : error("nfieldcall: effectful stats_f not yet wired")
+        # stats_f(__self__): the no-effect variant folds to `nothing`; the effectful variant INLINES the captured
+        # nuts_stats! writes on the SAME frame (n_steps/acceptance_rate resolve to diag slots via nwrite) — the
+        # stats callable is NEVER dynamically invoked — then marks its produced diag slots via _stats_produced!.
+        C.stats_noeffect && return :nothing
+        writes = Any[nwrite(pw, lm, C) for pw in C.stats_ir.body if pw isa _PlaceWrite]
+        Expr(:block, writes...,
+             :(_stats_produced!(Core.getfield($(C.S), :diag), Core.getfield($(C.S), :stats))), :nothing)
     else
         error("nfieldcall: unsupported field callable `$fld`")
     end
@@ -453,7 +460,7 @@ function _reads_walk(x, out::Set{Symbol})
 end
 
 # ---- dispatcher assembly (adapted from compile_dispatcher, frame emit) ----
-function compile_nuts_dispatcher(irs0, PL; typemap, cap::Int, root_mid::Int, stats_noeffect::Bool, derived::Set{Symbol}, runtimearg::Symbol)
+function compile_nuts_dispatcher(irs0, PL; typemap, cap::Int, root_mid::Int, stats_noeffect::Bool, derived::Set{Symbol}, runtimearg::Symbol, stats_ir)
     CFG = gensym(:cfg)  # runtime config NamedTuple: (leaf, handles, stepkw, ensures)
     rec = defunctionalized_mids(irs0)
     by_mid = Dict{Int,Any}(ir.id.decl => ir for ir in irs0)
@@ -475,7 +482,7 @@ function compile_nuts_dispatcher(irs0, PL; typemap, cap::Int, root_mid::Int, sta
     S = gensym(:frame); SC = gensym(:scratch); A0 = gensym(:arg0)
     fspv = Dict(m => Symbol("fsp_$m") for m in mids); nstores = length(mids); ctrl_idx = nstores + 1
     method_arm(m) = begin
-        C = NCtx(S, PL, Dict{Symbol,Symbol}(), _DIAG, CFG, derived, stats_noeffect, by_mid, rec, runtimearg, A0)
+        C = NCtx(S, PL, Dict{Symbol,Symbol}(), _DIAG, CFG, derived, stats_noeffect, by_mid, rec, runtimearg, A0, stats_ir)
         # seed formal kinds: `ep` formals are endpoints
         for f in by_mid[m].formals; f.name === :ep && (C.kinds[:ep] = :endpoint); end
         localmap = Dict{Symbol,Symbol}(nm => gensym(String(nm)) for nm in stored[m])
@@ -639,13 +646,29 @@ function compile_nuts(pf::_PreparedFactory, skel, refresh_skel, nuts_root_skel, 
     ensures = NamedTuple{Tuple(ensuresyms)}(Tuple(compile_prepared_ensure(pf, EPT, SH, f) for f in ensuresyms))
     leaf_ir, stepkw = prepared_callable_leaf(nuts_frame_step(frame))
     leaf = compile_leapfrog(pf, EPT, SH, leaf_ir)
-    stats_noeffect = stats_binding_registration(nuts_frame_stats(frame)) === nothing
+    binding = nuts_frame_stats(frame)
+    stats_noeffect = stats_binding_registration(binding) === nothing
+    # EFFECTFUL stats (RK): resolve exactly one ok nuts_stats! MethodIR from the CAPTURED binding source; its
+    # writes are the ones inlined (never a dynamic stats_f call). Validate the write targets are diag scalars
+    # whose slots EXACTLY match the binding's declared `produced` set — so the compiled writes and the produced
+    # mask can never drift. n_steps/acceptance_rate resolve to diag slots through the same nwrite path.
+    stats_ir = nothing
+    if !stats_noeffect
+        sirs = method_irs(stats_binding_source(binding))
+        (length(sirs) == 1 && sirs[1].ok) || _l_reject("stats_f must resolve to exactly one ok method")
+        stats_ir = sirs[1]
+        pws = [pw for pw in stats_ir.body if pw isa _PlaceWrite]
+        (all(pw -> pw.target isa _SelfField && length(pw.target.path) == 1 && haskey(_DIAG, pw.target.path[1]) && !pw.dot, pws)) ||
+            _l_reject("effectful stats writes must be non-broadcast diagnostic-scalar place-writes; got $(pws)")
+        Tuple(sort!(Int[_DIAG[pw.target.path[1]] for pw in pws])) == Tuple(sort!(collect(Int, stats_binding_produced(binding)))) ||
+            _l_reject("effectful stats write targets $(Tuple(_DIAG[pw.target.path[1]] for pw in pws)) do not match binding produced $(stats_binding_produced(binding))")
+    end
     # capacity: the mutual start!/finish! recursion + the depth loop bound the frame/control stacks by the
     # frame's frozen max_depth. Size generously from it (a `frame overflow`/`ctrl overflow` guard still trips
     # on any miscount rather than corrupting) — no hidden fixed limit.
     cap = 4 * (nuts_frame_max_depth(frame) + 2)
     (fn, storeinfo, capout) = compile_nuts_dispatcher(irs, PL; typemap=tm, cap=cap, root_mid=root_mid,
-                                                      stats_noeffect=stats_noeffect, derived=DERIV, runtimearg=runtimearg)
+                                                      stats_noeffect=stats_noeffect, derived=DERIV, runtimearg=runtimearg, stats_ir=stats_ir)
     cfg = (leaf=leaf, handles=kernel_prepared_handles(pf), stepkw=stepkw, ensures=ensures)
     scratch = make_nuts_scratch(storeinfo, capout)
     refresh = compile_refresh(pf, EPT, SH, method_irs(refresh_skel)[1])

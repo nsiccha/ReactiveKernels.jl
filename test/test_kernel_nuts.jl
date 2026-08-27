@@ -166,3 +166,21 @@ end
         @test_throws MethodError _NutsFix.nuts!!(wrong; rng = Random.Xoshiro(1))
     end
 end
+
+@testset "kernel_nuts — EFFECTFUL stats_f: nuts_stats! writes inlined on the frame (n_steps advances), 0-B" begin
+    pf = _nuts_pf()
+    # effectful stats: stats_f = nuts_stats! (writes n_steps + acceptance_rate per leaf)
+    frame = RK._construct_nuts_frame(pf, _nuts_mkvals(pf, Float64), 4;
+                                     step_f = RK.partial(_NutsFix.leapfrog!; stepsize = 0.1), stats_f = _NutsFix.nuts_stats!, min_dham = -1000)
+    RK.compile_prepared_initialization(pf, typeof(frame.init), typeof(frame.shared))(frame.init, frame.shared, RK.kernel_prepared_handles(pf))
+    RK._seed_nuts_children!(frame)
+    @test RK.stats_binding_registration(RK.nuts_frame_stats(frame)) !== nothing   # effectful binding
+    C = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame)
+    C.root!(frame, C.scratch, Random.Xoshiro(1))
+    @test RK._diag_slot(frame.diag, Val(1)) > 0                # n_steps advanced (stats_f ran per leaf)
+    @test isfinite(RK._diag_slot(frame.diag, Val(3)))         # acceptance_rate written
+    # effectful stats stays exact 0-B in a loop
+    for rg in (Random.Xoshiro(91), Random.MersenneTwister(2))
+        @test _nuts_batch0b(C.root!, frame, C.scratch, rg, Val(64)) == 0
+    end
+end
