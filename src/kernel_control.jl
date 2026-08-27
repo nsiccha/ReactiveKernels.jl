@@ -54,11 +54,11 @@ function build_region!(bb::BB, stmts, cont_pc::Int, ret_pc::Int, ret_val, by_mid
         vloc = Symbol("__lf_", st.lhs)                       # native local holding the helper result
         # NOTE: subsequent reads of `st.lhs` are emitted as this native local via emit machinery.
         return build_region!(bb, [_subst(x, fmap) for x in callee.body], resume, resume, vloc, by_mid, rec, brk, lcont)
-    elseif st isa _PlaceWrite || (st isa _ExprStmt && !_is_call(st.expr)) || (st isa _LocalAssign && !_is_call(st.rhs))
+    elseif st isa _PlaceWrite || st isa _PlaceSwap || (st isa _ExprStmt && !_is_call(st.expr)) || (st isa _LocalAssign && !_is_call(st.rhs))
         eff = Any[st]; i = 1
         while i < length(stmts)
             nx = stmts[i+1]
-            (nx isa _PlaceWrite || (nx isa _ExprStmt && !_is_call(nx.expr)) || (nx isa _LocalAssign && !_is_call(nx.rhs))) || break
+            (nx isa _PlaceWrite || nx isa _PlaceSwap || (nx isa _ExprStmt && !_is_call(nx.expr)) || (nx isa _LocalAssign && !_is_call(nx.rhs))) || break
             push!(eff, nx); i += 1
         end
         tailpc = build_region!(bb, stmts[i+1:end], cont_pc, ret_pc, ret_val, by_mid, rec, brk, lcont)
@@ -89,6 +89,9 @@ function build_region!(bb::BB, stmts, cont_pc::Int, ret_pc::Int, ret_val, by_mid
             ret_val !== nothing && v !== nothing && push!(eff, _LocalAssign(_retvalsym(ret_val), v))
             pc = _newpc!(bb); push!(bb.blks, Blk(pc, eff, TGoto(ret_pc))); return pc
         end
+    elseif st isa _SetReturn
+        # set-then-return: perform the place-write, then return (the written place is the result if bound)
+        pc = _newpc!(bb); push!(bb.blks, Blk(pc, Any[st.write], TGoto(ret_pc))); return pc
     elseif st isa _Guard
         after = build_region!(bb, rest, cont_pc, ret_pc, ret_val, by_mid, rec, brk, lcont)
         thenpc = build_region!(bb, collect(st.body), after, ret_pc, ret_val, by_mid, rec, brk, lcont)
@@ -101,13 +104,15 @@ function build_region!(bb::BB, stmts, cont_pc::Int, ret_pc::Int, ret_val, by_mid
         elsepc = build_region!(bb, collect(st.elseb), after, ret_pc, ret_val, by_mid, rec, brk, lcont)
         pc = _newpc!(bb); push!(bb.blks, Blk(pc, Any[], TBranch(st.cond, thenpc, elsepc))); return pc
     elseif st isa _For
-        var = st.var[1]; lo, hi = _range_bounds(st.iter)
+        var = st.var[1]
         after = build_region!(bb, rest, cont_pc, ret_pc, ret_val, by_mid, rec, brk, lcont)
         if !_loop_suspends(collect(st.body), rec)
-            # NON-suspending loop -> ONE native Julia for-block (RK: preserve native inlining)
+            # NON-suspending loop -> ONE native Julia for-block over ANY iterable (RK: preserve native
+            # inlining; collection loops like `for p in proposals` need no lo:hi range).
             pc = _newpc!(bb); push!(bb.blks, Blk(pc, Any[_RawStmt((:for_native, st))], TGoto(after))); return pc
         end
-        # SUSPENDING loop -> PC machine; `var` is a cross-suspension spilled local
+        # SUSPENDING loop -> PC machine; `var` is a cross-suspension spilled local (needs a lo:hi range).
+        lo, hi = _range_bounds(st.iter)
         header = _newpc!(bb); incr = _newpc!(bb)
         body = build_region!(bb, collect(st.body), incr, ret_pc, ret_val, by_mid, rec, after, incr)  # brk=after, continue=incr
         push!(bb.blks, Blk(header, Any[], TBranch(_RawCond((var, hi)), body, after)))                # if var <= hi
