@@ -778,6 +778,26 @@ _PrimitiveEffect(token, arity, writes, reads, result_alias) =
     _PrimitiveEffect(token, arity, writes, reads, result_alias, :effect, :none, (), nothing)
 const _EffectDescriptor = _PrimitiveEffect
 
+# VALUE equality over the WHOLE descriptor (RK 04:29): a rebind check must detect a DECLARATION
+# DRIFT (arity/kind/order/writes/reads/result_alias/borrows/rng_arg changing) even when the
+# identity token `typeof(f)` is unchanged — comparing the token alone would falsely read unchanged.
+Base.:(==)(a::_PrimitiveEffect, b::_PrimitiveEffect) =
+    a.token === b.token && a.arity == b.arity && a.writes == b.writes && a.reads == b.reads &&
+    a.result_alias == b.result_alias && a.kind === b.kind && a.order === b.order &&
+    a.borrows == b.borrows && a.rng_arg == b.rng_arg
+
+# Validate declared positional metadata is IN RANGE (1:arity) and NON-DUPLICATE (RK 04:29).
+function _effect_check(arity::Int, positions, what::String)
+    arity >= 0 || throw(ArgumentError("effect arity must be ≥ 0, got $arity"))
+    for p in positions
+        1 <= p <= arity || throw(ArgumentError(
+            "declared effect $what position $p out of range 1:$arity"))
+    end
+    length(unique(positions)) == length(positions) ||
+        throw(ArgumentError("declared effect $what positions $positions contain duplicates"))
+    positions
+end
+
 # Pure DISPATCH on the resolved VALUE identity — used AT OWNER DEFINITION (capture time),
 # so its result is SNAPSHOTTED detached (no mutable registry, no analysis-time reread).
 # `nothing` = not an RK-core positional primitive. Each entry carries a DISTINCT token.
@@ -811,13 +831,21 @@ _kernel_primitive_effect(@nospecialize(v)) =
 _kernel_declared_effect(@nospecialize(v)) = nothing
 
 # Internal descriptor builders (token = identity `typeof(f)`), used by the public macros only.
-_effect_pure(@nospecialize(f), arity::Int) =
-    _EffectDescriptor(typeof(f), arity, (), ntuple(identity, arity), nothing, :pure, :none, (), nothing)
-_effect_borrows(@nospecialize(f), arity::Int) =
-    _EffectDescriptor(typeof(f), arity, (), ntuple(identity, arity), nothing, :pure, :none,
-                      ntuple(identity, arity), nothing)
-_effect_rng(@nospecialize(f), arity::Int, rngpos::Int) =
-    _EffectDescriptor(typeof(f), arity, (), ntuple(identity, arity), nothing, :rng, :ordered, (), rngpos)
+# Each VALIDATES its positional metadata (RK 04:29/04:30): positive arity, positions in range,
+# no duplicates.
+function _effect_pure(@nospecialize(f), arity::Int)
+    reads = _effect_check(arity, ntuple(identity, arity), "reads")
+    _EffectDescriptor(typeof(f), arity, (), reads, nothing, :pure, :none, (), nothing)
+end
+function _effect_borrows(@nospecialize(f), arity::Int)
+    reads = _effect_check(arity, ntuple(identity, arity), "reads")
+    _EffectDescriptor(typeof(f), arity, (), reads, nothing, :pure, :none, reads, nothing)
+end
+function _effect_rng(@nospecialize(f), arity::Int, rngpos::Int)
+    reads = _effect_check(arity, ntuple(identity, arity), "reads")
+    _effect_check(arity, (rngpos,), "rng_arg")
+    _EffectDescriptor(typeof(f), arity, (), reads, nothing, :rng, :ordered, (), rngpos)
+end
 
 """
     @rk_pure f arity
@@ -938,17 +966,20 @@ NEVER reports unchanged merely because there is no Token.
 """
 function kernel_rebound(captured::_KernelRegistration, current)
     if captured.kind === :primitive || captured.kind === :declared_effect
-        # An RK-core primitive / author-declared-effect helper's target is NOT a registered kernel
-        # (`kernel_registration` is nothing), so it is validated by RE-DERIVING its detached
-        # descriptor from the current value and comparing the DISTINCT identity token: rebound iff
-        # the slot no longer resolves to that exact identity/descriptor.
+        # An RK-core primitive / author-declared-effect helper's target is NOT a registered kernel,
+        # so it is validated by RE-DERIVING its detached descriptor from the current value and
+        # comparing the ENTIRE descriptor (RK 04:29/04:30) — NOT only the identity token: a
+        # re-declaration of the SAME callable identity (typeof unchanged) that drifts arity / kind /
+        # order / writes / reads / result_alias / borrows / rng_arg must read as REBOUND.
+        capdesc = captured.primitive_effect
         if current isa _KernelRegistration
-            return current.kind !== captured.kind || current.token !== captured.token
+            return current.kind !== captured.kind || current.primitive_effect === nothing ||
+                   current.primitive_effect != capdesc
         end
         pe = current === nothing ? nothing :
              (captured.kind === :primitive ? _kernel_primitive_effect(current) :
               _kernel_declared_effect(current))
-        return pe === nothing || pe.token !== captured.token
+        return pe === nothing || pe != capdesc
     end
     cur = current isa _KernelRegistration ? current : kernel_registration(current)
     cur === nothing && return true                 # binding gone / no longer a kernel

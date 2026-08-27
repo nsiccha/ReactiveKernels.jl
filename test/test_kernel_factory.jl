@@ -52,6 +52,15 @@ HelperMod = Helpers
     end
 end
 baremodule NoHot end
+# DESCRIPTOR-DRIFT adversary: same callable identity, re-declared with different SEMANTICS.
+driftfn(a, b) = a
+@rk_pure driftfn 2
+@kernel driftowner(x, y) = begin
+    go!() = begin
+        z = driftfn(x, y)
+        Base.fill!(x, z)
+    end
+end
 
 # Faithful euclidean_phasepoint ENDPOINT (mirrors benchmark/nuts_kernel_authoring_fixture.jl):
 # methodless — owned set is the recipe closure seeded by the integrator's subject write-roots.
@@ -583,6 +592,24 @@ end
         @eval HelperMod = NoHot
         @test RKS.kernel_callee_rebound(hotowner, hc.ref)
         @eval HelperMod = Helpers
+
+        # DESCRIPTOR DRIFT (RK 04:29/04:30): re-declaring the SAME identity with different semantics
+        # (pure/arity-2 → rng) must read REBOUND via the WHOLE-descriptor comparison, even though
+        # `typeof(driftfn)` is unchanged — and WITHOUT mutating the captured snapshot.
+        dcap = only(c for c in RKS.kernel_callee_registrations(driftowner)
+                    if c.registration.kind === :declared_effect)
+        @test !RKS.kernel_rebound(dcap.registration, driftfn)     # descriptor matches
+        capsnap = dcap.registration.primitive_effect
+        @eval @rk_rng driftfn 2 1                                 # same identity, drifted semantics
+        @test RKS.kernel_rebound(dcap.registration, driftfn)      # whole-descriptor drift → rebound
+        @test dcap.registration.primitive_effect === capsnap      # captured snapshot UNMUTATED
+        @test dcap.registration.primitive_effect.kind === :pure
+        @eval @rk_pure driftfn 2                                  # restore
+
+        # constructor/macro VALIDATION: rngpos out of range and duplicate/out-of-range positions reject
+        @test_throws ArgumentError RKS._effect_rng(rngfn, 2, 3)   # rngpos 3 ∉ 1:2
+        @test_throws ArgumentError RKS._effect_check(2, (0,), "x")   # position 0 out of range
+        @test_throws ArgumentError RKS._effect_check(3, (1, 1), "x") # duplicate positions
     end
 end
 
