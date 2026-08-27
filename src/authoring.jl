@@ -1296,7 +1296,9 @@ Prepare a batched, loop-invariant-hoisting kernel from a scalar `@kernel` spec.
 The `batched` HAVE ports (a name or a collection of names) are passed as arrays
 and iterated element-wise; every recipe that depends only on the shared (scalar)
 ports is computed ONCE, hoisted above the loop; and the single scalar `want` is
-reduced over the batch (default a sum). This is how ReactiveKernels generates a
+reduced over the batch (default a sum). Pass `reduce=nothing` to instead return
+the per-observation VECTOR of the want (for LOO/WAIC), still hoisting the shared
+work and materializing only that vector. This is how ReactiveKernels generates a
 Stan-parity vectorized log density that does no repeated work — e.g. `σ =
 exp(logσ)` / `log(σ)` is computed once, not per observation — in one fused pass
 that materializes no per-element vector. See [`lower_batched`](@ref).

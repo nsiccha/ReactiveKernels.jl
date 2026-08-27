@@ -86,4 +86,28 @@ _plate_call(k, xs, μ, logσ) = k(xs, μ, logσ)
         @test any(s -> occursin("__ops__[1]", string(s)), pre)
         @test !any(s -> occursin("__ops__[1]", string(s)), loopbody)
     end
+
+    @testset "collect mode (reduce=nothing) — per-observation vector, hoisted" begin
+        # For LOO/WAIC: the per-observation densities as a vector, sharing the
+        # hoisted invariants; only the output vector is materialized.
+        kv = plate(plate_nlogpdf; have = (:x, :μ, :logσ), want = :ld,
+                   batched = (:x,), reduce = nothing)
+        xs = randn(64)
+        μ = 0.3
+        logσ = log(1.1)
+
+        got = kv(xs, μ, logσ)
+        ref = [-0.5 * log(2π) - logσ - 0.5 * ((xi - μ) / exp(logσ))^2 for xi in xs]
+        @test got ≈ ref
+        @test length(got) == length(xs)
+
+        # Its sum equals the reducing-mode total (both hoist `exp(logσ)` once).
+        ks = plate(plate_nlogpdf; have = (:x, :μ, :logσ), want = :ld, batched = (:x,))
+        @test sum(got) ≈ ks(xs, μ, logσ)
+
+        body = code_expr(kv).args[2].args
+        fori = findfirst(s -> s isa Expr && s.head === :for, body)
+        @test any(s -> occursin("__ops__[1]", string(s)), body[1:(fori - 1)])
+        @test !any(s -> occursin("__ops__[1]", string(s)), body[fori].args[2].args)
+    end
 end
