@@ -91,13 +91,3 @@ oracle call. The scalar paths measure **zero bytes** on both sides, and each
 inference are separate claims rather than an `Any` result being mistaken for a
 distribution cost. The non-allocating lowering that drives even the batched case
 to zero bytes is documented under [Non-allocating kernels](nonallocating.md).
-
-## The planner is domain-agnostic
-
-None of this adds probability semantics to `ReactiveKernels`; the densities are
-just ordinary recipes. The planner is equally happy to carry an *opaque* library
-object across ports — a `Distributions.Normal` value passed from one fragment to
-another and consumed by `logpdf` — if a future layer prefers to reuse an existing
-distribution library rather than write densities natively. That interop works,
-but it makes the library the compute engine and inherits its allocation profile,
-which is why the examples above keep the arithmetic native.
