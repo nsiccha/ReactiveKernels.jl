@@ -272,8 +272,12 @@ end
     step!(x::AbstractVector; dn = one(n)) = begin
         n += dn
         w = dn / n
-        @. var = smooth(var, (x - smooth(mean, x, w)) * (x - mean), w)
-        @. mean = smooth(mean, x, w)
+        # Keep the adaptation recurrence self-contained in the sanctioned Base arithmetic surface.  In
+        # particular this method must not depend on an author-declared effect helper merely to tell the
+        # compiler the helper's arity/result domain: both smoothing operations are the ordinary affine
+        # formula, visible in the captured MethodIR.
+        @. var = (one(w) - w) * var + w * (x - ((one(w) - w) * mean + w * x)) * (x - mean)
+        @. mean = (one(w) - w) * mean + w * x
     end
     step!(x::AbstractMatrix; kwargs...) = for xi in eachcol(x)
         step!(__self__, xi; kwargs...)
