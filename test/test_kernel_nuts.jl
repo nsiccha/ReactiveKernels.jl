@@ -235,3 +235,47 @@ end
     @test RK._canon_slot(frame.init, momslot) == mom_before        # mom value untouched
     @test RK._canon_current(frame.init, momslot) == cur_before     # mom currentness mask untouched (rejected before kill)
 end
+
+mutable struct _CntGrad; n::Int; end
+(g::_CntGrad)(dst, p) = (g.n += 1; dst .= 2 .* p; sum(abs2, p))
+struct _CustomRNG2 <: Random.AbstractRNG end
+
+# top-level typed batch (an inner closure boxes and would itself allocate — HMC review)
+@inline function _refresh_batch(rf, ep, sh, h, r, ::Val{N}) where {N}
+    i = 0; @inbounds while i < N; rf(ep, sh, h, r); i += 1; end; nothing
+end
+_refresh_batch0b(rf, ep, sh, h, r, ::Val{N}) where {N} =
+    (_refresh_batch(rf, ep, sh, h, r, Val(N)); GC.gc(); @allocated _refresh_batch(rf, ep, sh, h, r, Val(N)))
+# type-aware content snapshot: arrays/Cholesky by copied CONTENTS, scalars by value (egal, NaN-safe),
+# everything else (functor, nothing) by object identity — a `deepcopy;==` snapshot is unsound for the
+# external mutable grad functor and Cholesky (HMC review).
+_rsnap(v) = v isa LinearAlgebra.Cholesky ? copy(v.factors) : v isa AbstractArray ? copy(v) : v isa Number ? v : Base.objectid(v)
+_rsame(v, s) = v isa LinearAlgebra.Cholesky ? v.factors == s : v isa AbstractArray ? v == s : v isa Number ? isequal(v, s) : Base.objectid(v) === s
+
+@testset "kernel_nuts — refresh rng-domain reject leaves ALL owned/shared values+masks + grad counter UNCHANGED" begin
+    pf = _nuts_pf(); PL = RK.kernel_prepared_plan(pf); pg = _CntGrad(0); m = Float64[2 0.5; 0.5 3]
+    d = Dict{Int,Any}()
+    for sl in RK.kernel_plan_slots(PL); nm = String(sl.path[1])
+        d[sl.canon] = nm=="grad_f" ? pg : nm=="metric" ? m : nm=="chol_metric" ? cholesky(m) : startswith(nm,"##node") ? 0.0 :
+            nm=="pos" ? [1.0,2.0] : nm=="mom" ? [3.0,4.0] : (nm in ("dpot_dpos","dham_dpos","dkin_dmom","dham_dmom")) ? [0.0,0.0] : 0.0
+    end
+    frame = RK._construct_nuts_frame(pf, d, 3; step_f=RK.partial(_NutsFix.leapfrog!;stepsize=0.1), stats_f=nothing, min_dham=-1000)
+    RK.compile_prepared_initialization(pf, typeof(frame.init), typeof(frame.shared))(frame.init, frame.shared, RK.kernel_prepared_handles(pf))
+    RK._seed_nuts_children!(frame)
+    C = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame); H = RK.kernel_prepared_handles(pf)
+    # admitted RNGs pass + stay EXACT 0-B in a typed loop (the generated guard folds away)
+    for rg in (Random.Xoshiro(91), Random.MersenneTwister(2))
+        @test _refresh_batch0b(C.refresh, frame.init, frame.shared, H, rg, Val(64)) == 0
+        @test _refresh_batch0b(C.refresh, frame.init, frame.shared, H, rg, Val(128)) == 0
+        @test _refresh_batch0b(C.refresh, frame.init, frame.shared, H, rg, Val(256)) == 0
+    end
+    # snapshot EVERY canon slot's value (contents) + currentness, owned (init) AND shared, plus the grad counter
+    slots = unique([(RK.kernel_plan_field(PL, sl.canon)[1], RK.kernel_plan_field(PL, sl.canon)[2]) for sl in RK.kernel_plan_slots(PL)])
+    obj(role) = role === :owned ? frame.init : frame.shared
+    vals = Dict((r,s) => _rsnap(RK._canon_slot(obj(r), Val(s))) for (r,s) in slots)
+    curs = Dict((r,s) => RK._canon_current(obj(r), Val(s)) for (r,s) in slots); grad0 = pg.n
+    @test_throws ArgumentError C.refresh(frame.init, frame.shared, H, _CustomRNG2())   # rejected BEFORE any kill
+    @test all(_rsame(RK._canon_slot(obj(r), Val(s)), vals[(r,s)]) for (r,s) in slots)  # every owned+shared VALUE unchanged
+    @test all(RK._canon_current(obj(r), Val(s)) === curs[(r,s)] for (r,s) in slots)    # every owned+shared currentness MASK unchanged
+    @test pg.n == grad0                                                                # grad counter unchanged (no producer ran)
+end
