@@ -1,9 +1,11 @@
 # Increment-3 EXECUTABLE codegen gate — the REAL vertical slice. The compiled leapfrog leaf mutates the
-# ACTUAL factory `_OwnerState` slots (no parallel struct), consuming the immutable plan seam
-# (producer/recipes/entry-current/slots) + the `partial(leapfrog!;stepsize)` binder. Proves: exactly ONE
-# in-place `pgrad!` per leaf (destination-aware, writing the canonical grad slot + committing pot); the
-# authored 3-line leapfrog over real F32/F64 buffers; no residual `leapfrog!`/`step_f` call; @inferred +
-# warmed exact 0 B; and that the graph/currentness/layout/binder come from the seam, never a re-plan.
+# ACTUAL factory `_OwnerState` slots (no parallel struct), consuming ONLY the immutable plan seam
+# (producer/recipes/entry-current/slots/key) + a DETACHED recipe-inputs map + the validated
+# `partial(leapfrog!;stepsize)` binder — NEVER the live graph. Proves: exactly ONE in-place `pgrad!` per
+# leaf (destination-aware, writing the canonical grad slot + committing pot); the authored 3-line leapfrog
+# over real F32/F64 buffers; a TYPED RUNTIME stepsize (one specialization runs .1/.25 correctly, no baked
+# constant); scheduling stable under post-seam graph mutation; binder Token == seam integrator Token; no
+# residual `leapfrog!`/`step_f`; @inferred + warmed exact 0 B.
 
 using ReactiveKernels
 using LinearAlgebra
@@ -16,14 +18,18 @@ end
 const _CgLF = _CgFix.leapfrog!
 const _CgPP = _CgFix.euclidean_phasepoint         # the phase-point endpoint (a stateless KernelSpec)
 
-# The endpoint seam under leapfrog!, the method IR, and the interim recipe-id → applier binding.
 _cg_seam() = RK._kernel_factory_endpoint_plan(_CgPP, RK.kernel_registration(_CgLF))
 _cg_ir() = RK.method_irs(_CgLF)[1]
+# DETACHED recipe-inputs (interim snapshot; production consumes `kernel_plan_recipe_inputs(seam)`).
+_cg_ri(seam) = RK._seam_recipe_inputs_snapshot(_CgPP, seam)
 function _cg_appliers(seam)
     prod = Dict(kv[1] => kv[2] for kv in RK.kernel_plan_producer(seam))
-    Dict(prod[RK._l_field_id(_CgPP, :dpot_dpos)] => :pgrad,
-         prod[RK._l_field_id(_CgPP, :dkin_dmom)] => :velocity)
+    Dict(prod[RK._seam_canon(seam, :dpot_dpos)] => :pgrad,
+         prod[RK._seam_canon(seam, :dkin_dmom)] => :velocity)
 end
+_cg_compile(seam, ir; step = 0.1) =
+    RK.compile_leaf(ir, seam, _CgFix.partial(_CgLF; stepsize = step);
+                    recipe_inputs = _cg_ri(seam), appliers = _cg_appliers(seam))
 
 # a real in-place gradient that COUNTS its invocations (0-alloc functor, not a boxed closure): writes the
 # caller-owned gradient buffer and returns the potential — the exact `(g, x)->pot` harness shape.
@@ -31,7 +37,6 @@ mutable struct _CountGrad{P}; f::P; n::Int; end
 (c::_CountGrad)(g, x) = (c.n += 1; c.f(g, x))
 _quad!(g, x) = (@. g = x; sum(abs2, x) / 2)       # quadratic potential U = ½‖x‖², ∇U = x
 
-# Build + seed a real endpoint state over T (dim d); make dpot_dpos current at entry (the seam contract).
 function _cg_state(seam, ::Type{T}, d, meta) where {T}
     st = RK.make_leaf_owner_state(_CgPP, seam, T, d)
     RK._owner_commit!(st, ntuple(i -> begin
@@ -42,87 +47,143 @@ function _cg_state(seam, ::Type{T}, d, meta) where {T}
     st
 end
 
-@testset "codegen — recompute graph built from the SEAM producer/recipes, never plan()" begin
-    seam = _cg_seam()
-    pg = RK._l_seam_plan_graph(_CgPP, seam)
-    @test pg.plan === nothing                                    # NOT a core Plan — seam-derived
-    # producer map EXACTLY equals kernel_plan_producer (canonical Value id → selected Recipe id)
+@testset "codegen — recompute graph is PURE(seam, detached recipe-inputs) — never the live graph" begin
+    seam = _cg_seam(); ri = _cg_ri(seam)
+    pg = RK._l_seam_plan_graph(seam, ri)
+    @test pg.plan === nothing                                    # seam-derived, not a core Plan
     mine = Tuple(sort!([(cid, rid) for (cid, rid) in pg.producer]))
     seam_prod = Tuple((cid, rid) for (cid, rid) in RK.kernel_plan_producer(seam) if !(cid in pg.sources))
     @test mine == seam_prod
-    # the multi-output gradient Recipe owns BOTH pot and dpot_dpos (atomic), from the seam
-    gradrid = pg.producer[RK._l_field_id(_CgPP, :dpot_dpos)]
-    @test RK._l_field_id(_CgPP, :pot) in pg.recipe_owned[gradrid]
+    gradrid = pg.producer[RK._seam_canon(seam, :dpot_dpos)]
+    # ONE destination-bound grad Recipe identity produces pot+dpot ATOMICALLY (RK 04:53): pot's selected
+    # producer IS the grad recipe — the slice assumes NO alternative pot producer / no unused pot_f slot.
+    @test pg.producer[RK._seam_canon(seam, :pot)] == gradrid
+    @test RK._seam_canon(seam, :pot) in pg.recipe_owned[gradrid]     # multi-output grad owns pot too
     @test length(pg.recipe_owned[gradrid]) >= 2
+    # a missing detached edge for a selected recipe is REJECTED (never silently read from the graph)
+    @test_throws RK._LLowerReject RK._l_seam_plan_graph(seam, Dict{Int,Vector{Int}}())
+end
+
+@testset "codegen — ADVERSARY: POISON the selected pos field mapping; body stays seam-derived" begin
+    # LOAD-BEARING adversary (RK 04:54): after capturing seam+IR, POISON the authoritative field mapping
+    # itself — rebind `_CgPP.ports[:pos]` to a FRESH Value so the LIVE `_l_field_id(:pos)` resolves
+    # DIFFERENTLY. The seam-derived compile must be immune (the detached field→canon is the authority),
+    # while the SPEC-resolver schedule provably DRIFTS — proving the poison is real, not inert.
+    seam = _cg_seam(); ir = _cg_ir(); ri = _cg_ri(seam)
+    _, m1 = _cg_compile(seam, ir)
+    live_pos_before = RK._l_field_id(_CgPP, :pos)
+    seam_pos_before = RK._seam_field_canon(seam)[:pos]
+    entry = RK._l_seam_entry_current(seam)
+    pg = RK._l_seam_plan_graph(seam, ri)
+    writes_detached() = [s.key.id for s in
+        RK.lower_leaf_schedule(ir, RK._seam_field_canon(seam), pg; entry_current = entry) if s.kind === :write]
+    writes_spec() = [s.key.id for s in
+        RK.lower_leaf_schedule(ir, _CgPP, pg; entry_current = entry) if s.kind === :write]
+    base_detached = writes_detached()
+    @test base_detached == writes_spec()                        # agree BEFORE the poison
+
+    g = RK.kernel_graph(_CgPP)
+    orig = _CgPP.ports[:pos]
+    try
+        _CgPP.ports[:pos] = RK.value!(g, :__pos_poison, Float64) # POISON the selected :pos field mapping
+        @test RK._l_field_id(_CgPP, :pos) != live_pos_before    # the LIVE spec path DID drift (real poison)
+        @test RK._seam_field_canon(seam)[:pos] == seam_pos_before # the DETACHED seam map did NOT
+        @test writes_detached() == base_detached                # detached schedule UNCHANGED under poison
+        @test writes_spec() != base_detached                    # the SPEC path drifts → detached is load-bearing
+        _, m2 = _cg_compile(seam, ir)                           # full compile off the poisoned spec
+        @test string(m2.body) == string(m1.body)               # emitted body identical — seam-derived, not spec
+    finally
+        _CgPP.ports[:pos] = orig                                # restore the fixture
+    end
+    @test RK._l_field_id(_CgPP, :pos) == live_pos_before        # fixture restored
 end
 
 @testset "codegen — entry-currentness is the seam's proven kernel_plan_entry_current" begin
     seam = _cg_seam()
     ec = RK._l_seam_entry_current(seam)
     @test ec == Set(RK.kernel_plan_entry_current(seam))
-    # dpot_dpos and pos are current at entry (so the first half-kick recomputes NO gradient)
-    @test RK._l_field_id(_CgPP, :dpot_dpos) in ec
-    @test RK._l_field_id(_CgPP, :pos) in ec
+    @test RK._seam_canon(seam, :dpot_dpos) in ec && RK._seam_canon(seam, :pos) in ec
 end
 
 @testset "codegen — the emitted leaf is the 3-line leapfrog with NO residual call, ONE pgrad" begin
-    seam = _cg_seam(); ir = _cg_ir()
-    fn, meta = RK.compile_leaf(ir, _CgPP, seam, _CgFix.partial(_CgLF; stepsize = 0.1);
-                               appliers = _cg_appliers(seam))
+    seam = _cg_seam()
+    _, meta = _cg_compile(seam, _cg_ir())
     src = string(meta.body)
-    @test !occursin("leapfrog", src)                            # no residual integrator call
-    @test !occursin("step_f", src)
+    @test !occursin("leapfrog", src) && !occursin("step_f", src)   # no residual integrator call
     @test meta.pgrad_execs == 1                                 # exactly one gradient RECIPE exec per leaf
     @test count(a -> occursin("pgrad!", string(a)), meta.body.args) == 1
-    # storage is the factory _OwnerState (Val-slot access + a scalar commit), not a parallel struct
-    @test occursin("_owner_slot(state", src)
-    @test occursin("_owner_commit!(state", src)
+    @test occursin("_owner_slot(state", src) && occursin("_owner_commit!(state", src)  # factory _OwnerState
 end
 
-@testset "codegen — stepsize is CONSUMED from the partial binder, not a raw argument" begin
+@testset "codegen — stepsize is a TYPED RUNTIME parameter (NOT baked); binder Token is validated" begin
     seam = _cg_seam(); ir = _cg_ir()
-    # two different bound stepsizes -> two different emitted constants (proves the binder is the source)
-    _, m1 = RK.compile_leaf(ir, _CgPP, seam, _CgFix.partial(_CgLF; stepsize = 0.1); appliers = _cg_appliers(seam))
-    _, m2 = RK.compile_leaf(ir, _CgPP, seam, _CgFix.partial(_CgLF; stepsize = 0.25); appliers = _cg_appliers(seam))
-    @test occursin("0.1", string(m1.body)) && !occursin("0.25", string(m1.body))
-    @test occursin("0.25", string(m2.body))
-    # a binder that resolves to no registered token is rejected
-    @test_throws RK._LLowerReject RK.compile_leaf(ir, _CgPP, seam, (x -> x); appliers = _cg_appliers(seam))
+    _, meta = _cg_compile(seam, ir; step = 0.1)
+    src = string(meta.body)
+    @test occursin("getfield(stepkw, :stepsize)", src)          # loaded at runtime from the binder NamedTuple
+    @test !occursin("0.1", src)                                 # the numeric value is NOT baked into the code
+    @test meta.bound_formals == (:stepsize,)
+    # binder soundness: a wrong-integrator Token is rejected; an unapproved wrapper is rejected
+    other = RK.kernel_registration(_CgFix.euclidean_phasepoint)  # a DIFFERENT registered token (not leapfrog!)
+    if other !== nothing
+        @test_throws RK._LLowerReject RK.resolve_step_binding(_CgFix.partial(_CgFix.euclidean_phasepoint), seam)
+    end
+    @test_throws RK._LLowerReject RK.resolve_step_binding((x -> x), seam)        # arbitrary callable refused
+    @test_throws RK._LLowerReject RK.resolve_step_binding(_CgLF, seam)           # bare kernel (not a binder)
 end
 
-@testset "codegen — executes over real F32/F64 slots: parity, ONE pgrad! call, @inferred, warm 0 B" begin
+@testset "codegen — ONE specialization runs same-typed .1/.25 stepsizes CORRECTLY (adaptation-safe)" begin
+    T = Float64; d = 5; seam = _cg_seam()
+    fn, meta = _cg_compile(seam, _cg_ir(); step = 0.1)          # compiled ONCE
+    metric = Matrix{T}(2 * I, d, d); cholf = cholesky(metric)
+    # analytic leapfrog reference for U=½‖x‖² (∇U=x), M=2I
+    ref(pos0, mom0, g0, ε) = begin
+        mh = mom0 .- (ε/2) .* g0; vel = cholf \ mh; pr = pos0 .+ ε .* vel; mr = mh .- (ε/2) .* pr; (pr, mr)
+    end
+    for ε in (0.1, 0.25)                                        # SAME NamedTuple type, different Float64 value
+        st = _cg_state(seam, T, d, meta)
+        pos0 = copy(RK._owner_slot(st, Val(meta.posslot))); mom0 = copy(RK._owner_slot(st, Val(meta.momslot)))
+        g0 = copy(RK._owner_slot(st, Val(meta.dpotslot)))
+        pg = _CountGrad(_quad!, 0)
+        fn(st, pg, cholf, (; stepsize = ε))                    # runtime stepsize threaded — no recompile
+        @test pg.n == 1
+        pr, mr = ref(pos0, mom0, g0, ε)
+        @test RK._owner_slot(st, Val(meta.posslot)) ≈ pr       # the CORRECT ε executed (not a baked 0.1)
+        @test RK._owner_slot(st, Val(meta.momslot)) ≈ mr
+    end
+end
+
+@testset "codegen — executes over real F32/F64 slots: parity, ONE pgrad!, @inferred, warm 0 B" begin
     for T in (Float64, Float32)
-        seam = _cg_seam(); ir = _cg_ir(); ε = T(0.1); d = 5
-        fn, meta = RK.compile_leaf(ir, _CgPP, seam, _CgFix.partial(_CgLF; stepsize = ε);
-                                   appliers = _cg_appliers(seam))
+        seam = _cg_seam(); ε = T(0.1); d = 5
+        fn, meta = _cg_compile(seam, _cg_ir(); step = ε)
         metric = Matrix{T}(2 * I, d, d); cholf = cholesky(metric)
         st = _cg_state(seam, T, d, meta)
         pos0 = copy(RK._owner_slot(st, Val(meta.posslot)))
         mom0 = copy(RK._owner_slot(st, Val(meta.momslot)))
         g0   = copy(RK._owner_slot(st, Val(meta.dpotslot)))     # ∇U(pos0) = pos0 (quadratic)
+        kw = (; stepsize = ε)
 
         pg = _CountGrad(_quad!, 0)
-        fn(st, pg, cholf)
+        fn(st, pg, cholf, kw)
         @test pg.n == 1                                         # EXACTLY one pgrad! per leaf
 
-        # analytic parity for U=½‖x‖² (∇U=x), M=2I: reference leapfrog by hand
-        mom_h = mom0 .- (ε / 2) .* g0                           # half kick with entry gradient
-        vel   = cholf \ mom_h                                   # velocity = M⁻¹ mom
-        pos_r = pos0 .+ ε .* vel                                # drift
+        mom_h = mom0 .- (ε / 2) .* g0
+        vel   = cholf \ mom_h
+        pos_r = pos0 .+ ε .* vel
         mom_r = mom_h .- (ε / 2) .* pos_r                       # half kick with NEW gradient (∇U(pos_r)=pos_r)
         @test RK._owner_slot(st, Val(meta.posslot)) ≈ pos_r
         @test RK._owner_slot(st, Val(meta.momslot)) ≈ mom_r
         @test RK._owner_slot(st, Val(meta.dpotslot)) ≈ pos_r    # canonical grad slot = ∇U(new pos)
         @test RK._owner_slot(st, Val(meta.potslot)) ≈ sum(abs2, pos_r) / 2   # committed pot
 
-        fn(st, pg, cholf)                                       # warm
-        @inferred fn(st, pg, cholf)
-        @test (@allocated fn(st, pg, cholf)) == 0              # typed exact 0 B
+        fn(st, pg, cholf, kw)                                   # warm
+        @inferred fn(st, pg, cholf, kw)
+        @test (@allocated fn(st, pg, cholf, kw)) == 0          # typed exact 0 B
     end
 end
 
 @testset "codegen — an exec whose selected Recipe has no bound applier is REJECTED" begin
-    seam = _cg_seam(); ir = _cg_ir()
-    @test_throws RK._LLowerReject RK.compile_leaf(ir, _CgPP, seam, _CgFix.partial(_CgLF; stepsize = 0.1);
-                                                  appliers = Dict{Int,Symbol}())
+    seam = _cg_seam()
+    @test_throws RK._LLowerReject RK.compile_leaf(_cg_ir(), seam,
+        _CgFix.partial(_CgLF; stepsize = 0.1); recipe_inputs = _cg_ri(seam), appliers = Dict{Int,Symbol}())
 end

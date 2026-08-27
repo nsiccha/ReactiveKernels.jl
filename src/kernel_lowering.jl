@@ -138,34 +138,41 @@ end
 _l_field_id(spec::KernelSpec, field::Symbol) =
     haskey(spec.ports, field) ? _l_cid(spec.graph, spec.ports[field]) : nothing
 
+# Authored field -> canonical Value id RESOLVER. Two authorities:
+#  - a DETACHED `Dict{Symbol,Int}` (from the immutable seam's slots) — the AUTHORITATIVE production
+#    resolver; independent of the live graph, so a post-seam alias/port mutation cannot move an id.
+#  - a `KernelSpec` — resolves through the (mutable) graph; SCAFFOLDING/tests ONLY, never a production
+#    scheduling authority (RK 04:50: `spec` may remain only for non-authoritative labels/AST association).
+_l_canon_of(m::AbstractDict{Symbol,<:Integer}, field::Symbol) = get(m, field, nothing)
+_l_canon_of(spec::KernelSpec, field::Symbol) = _l_field_id(spec, field)
+
 # Collect the DERIVED subject-field Value ids read anywhere in an `_MExpr` (top field of each
-# `_SelfField`), against the endpoint `spec` + its plan graph `pg` (a read of a HAVE source is omitted).
-function _l_derived_read_ids!(acc::Vector{Int}, x, spec::KernelSpec, pg::_LPlanGraph)
+# `_SelfField`), resolving field->canon through `res` + the plan graph `pg` (a HAVE-source read is omitted).
+function _l_derived_read_ids!(acc::Vector{Int}, x, res, pg::_LPlanGraph)
     if x isa _SelfField && !isempty(x.path)
-        id = _l_field_id(spec, x.path[1])
+        id = _l_canon_of(res, x.path[1])
         (id !== nothing && haskey(pg.producer, id)) && push!(acc, id)   # produced (derived), not a source
     end
     if x isa _MExpr || x isa _MStmt
-        for i in 1:nfields(x); _l_derived_read_ids!(acc, getfield(x, i), spec, pg); end
+        for i in 1:nfields(x); _l_derived_read_ids!(acc, getfield(x, i), res, pg); end
     elseif x isa Tuple
-        for e in x; _l_derived_read_ids!(acc, e, spec, pg); end
+        for e in x; _l_derived_read_ids!(acc, e, res, pg); end
     elseif x isa Pair
-        _l_derived_read_ids!(acc, x.second, spec, pg)
+        _l_derived_read_ids!(acc, x.second, res, pg)
     end
     acc
 end
 
-# The ordered straight-line owned place-writes of a method IR body over endpoint `spec` (leapfrog! is 3
-# place-writes). Straight-line `_PlaceWrite`s over an owned subject field only; branch/loop/sibling
-# composition is a later phase.
-function _l_write_steps(ir::MethodIR, spec::KernelSpec, pg::_LPlanGraph)
+# The ordered straight-line owned place-writes of a method IR body (leapfrog! is 3 place-writes),
+# resolving field->canon through `res` (detached seam map in production; KernelSpec in scaffolding).
+function _l_write_steps(ir::MethodIR, res, pg::_LPlanGraph)
     steps = _LWriteStep[]
     for s in ir.body
         s isa _PlaceWrite || continue
         (s.root === :self && s.owner !== nothing && !isempty(s.owner)) || continue
-        wid = _l_field_id(spec, s.owner[1])
+        wid = _l_canon_of(res, s.owner[1])
         wid === nothing && continue
-        reads = unique(_l_derived_read_ids!(Int[], s.rhs, spec, pg))
+        reads = unique(_l_derived_read_ids!(Int[], s.rhs, res, pg))
         push!(steps, _LWriteStep(wid, s.dot, reads))
     end
     steps
@@ -219,9 +226,9 @@ staled it (the minimal produce set: one gradient Recipe per leaf); every owned w
 dependents. `entry_current` is the PROVEN current-at-entry Value-id set (the factory/plan contract); a
 read not current-at-entry-and-not-produced-since is rejected.
 """
-function lower_leaf_schedule(ir::MethodIR, spec::KernelSpec, pg::_LPlanGraph;
+function lower_leaf_schedule(ir::MethodIR, res, pg::_LPlanGraph;
                              entry_current::Set{Int})
-    steps = _l_write_steps(ir, spec, pg)
+    steps = _l_write_steps(ir, res, pg)
     sched = _LSchedStep[]
     current = copy(entry_current)                     # PROVEN contract, not assumed
     for st in steps
