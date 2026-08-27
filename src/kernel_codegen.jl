@@ -54,6 +54,18 @@ function _pp_fieldtype(plan::_KernelPlan, c::Int, ::Type{OW}, ::Type{SH}) where 
     role, slot = kernel_plan_field(plan, c)
     fieldtype(role === :owned ? OW : SH, slot)
 end
+# The one representation-specific solve lowering admitted here: a Cholesky over a concrete builtin
+# `Diagonal{Float32/Float64,Vector}`. Julia's generic Cholesky solve wraps the same diagonal factors as two
+# triangular solves. For this self-adjoint diagonal backing those are exactly two in-place divisions by the
+# stored factor. Keep the predicate entirely on the concrete prepared-slot TYPE — never the field name/value —
+# and leave dense/custom/other-eltype Cholesky lowering on the generic `ldiv!(dest, factor, rhs)` path.
+function _pp_diag_cholesky_ldiv_type(::Type{FT}) where {FT}
+    FT <: LinearAlgebra.Cholesky || return false
+    (FT isa DataType && length(FT.parameters) >= 2) || return false
+    ET, BT = FT.parameters[1], FT.parameters[2]
+    (ET === Float32 || ET === Float64) || return false
+    BT isa Type && _kernel_dom_diag(BT) && eltype(BT) === ET
+end
 # Atomically bless a handle's PRODUCER-OWNED output subset (only — never a shared authority not produced,
 # never a collateral) after its invocation succeeds. 1 or 2 → the atomic Val ops; >2 → a bless per slot.
 function _pp_bless!(stmts, plan::_KernelPlan, owned_canons)
@@ -93,8 +105,18 @@ function _pp_emit_handle!(stmts, plan::_KernelPlan, h, i::Int, ::Type{OW}, ::Typ
     elseif mode === :ldiv
         # destination-reusing solve into the owned buffer slot (RK 07:20): ldiv!(dest, factor, rhs).
         length(ins) == 2 && length(outs) == 1 || _l_reject("ldiv handle $i must be 2-in/1-out (got $ins/$outs)")
-        _pp_domain_ok(op, (_pp_fieldtype(plan, ins[1], OW, SH), _pp_fieldtype(plan, ins[2], OW, SH)), i)
-        push!(stmts, :(ldiv!($(_pp_read(plan, outs[1])), $(_pp_read(plan, ins[1])), $(_pp_read(plan, ins[2])))))
+        factorT = _pp_fieldtype(plan, ins[1], OW, SH)
+        _pp_domain_ok(op, (factorT, _pp_fieldtype(plan, ins[2], OW, SH)), i)
+        if _pp_diag_cholesky_ldiv_type(factorT)
+            # EXACT generic-Cholesky semantics for a real Diagonal backing: copy the rhs, then apply BOTH
+            # Cholesky factors. One division is wrong for a scaled diagonal; no inverse is formed.
+            dest = _pp_read(plan, outs[1]); factor = _pp_read(plan, ins[1]); rhs = _pp_read(plan, ins[2])
+            push!(stmts, :(copyto!($dest, $rhs)))
+            push!(stmts, :(ldiv!(getfield($factor, :factors), $dest)))
+            push!(stmts, :(ldiv!(getfield($factor, :factors), $dest)))
+        else
+            push!(stmts, :(ldiv!($(_pp_read(plan, outs[1])), $(_pp_read(plan, ins[1])), $(_pp_read(plan, ins[2])))))
+        end
     elseif mode === :assign
         length(outs) == 1 || _l_reject("assign handle $i must be single-output (got $outs)")
         # domain-validate a BARE op (a sanctioned recipe primitive); a fused `_KernelSourceOp` is a

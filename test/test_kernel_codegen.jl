@@ -2,7 +2,7 @@
 # effect-root / copy / transition scaffold tests (which consumed fake `_OwnerState`/`_Synth` storage) were
 # retired with that scaffold on the 4c6ed92 seam; the generic schedule-MODEL tests live in
 # test_kernel_lowering.jl (no fake storage). This suite executes the REAL captured six-handle phasepoint.
-using ReactiveKernels, Test, LinearAlgebra
+using ReactiveKernels, Test, LinearAlgebra, Random
 const RK = ReactiveKernels
 
 # ============================================================================================
@@ -72,6 +72,29 @@ function _pp_ref(::Type{T}, d) where {T}
      kin = T(0.5)*(logdet(ch)+dot(mom,dk)), ham = sum(abs2,pos)+T(0.5)*(logdet(ch)+dot(mom,dk)))
 end
 
+# A Diagonal-typed construction with arbitrary dimension/data. The Cholesky value is a typed, uncomputed
+# placeholder; the executable prepared initialization must replace it before the emitted ldiv handle runs.
+function _pp_diag_values(plan, ::Type{T}, diag, pos, mom, pgrad) where {T}
+    v = Dict{Int,Any}(); d = length(diag)
+    for s in RK.kernel_plan_slots(plan)
+        haskey(v, s.canon) && continue
+        nm = s.path[end]; ns = String(nm)
+        v[s.canon] =
+            nm === :grad_f      ? pgrad :
+            nm === :metric      ? Diagonal(copy(diag)) :
+            nm === :pos         ? copy(pos) :
+            nm === :mom         ? copy(mom) :
+            nm === :chol_metric ? Cholesky(Diagonal(Vector{T}(undef, d)), 'U', 0) :
+            startswith(ns, "##node") ? zero(T) :
+            (nm in (:pot, :kin, :ham)) ? zero(T) :
+            zeros(T, length(nm in (:dkin_dmom, :dham_dmom) ? mom : pos))
+    end
+    v
+end
+
+_pp_bytes_equal(a::Vector{T}, b::Vector{T}) where {T<:Union{Float32,Float64}} =
+    reinterpret(UInt8, a) == reinterpret(UInt8, b)
+
 @testset "prepared-endpoint — FULL six-handle cold init: math + exact masks + counts, F32 & F64 (RK 08:04b)" begin
     pf = _pp_pf(); plan = RK.kernel_prepared_plan(pf); hs = RK.kernel_prepared_handles(pf)
     @test length(hs) == 6
@@ -93,6 +116,71 @@ end
         cur = Set{Int}(s.canon for s in RK.kernel_plan_slots(plan) if _pp_cur(plan, ow, sh, s.canon))
         @test cur == Set(RK.kernel_plan_entry_current(plan))   # final currentness == entry_current EXACTLY
     end
+end
+
+@testset "prepared-endpoint — Diagonal Cholesky ldiv is two-factor exact; dense lowering unchanged" begin
+    pf = _pp_pf(); plan = RK.kernel_prepared_plan(pf); hs = RK.kernel_prepared_handles(pf)
+    li = only(i for i in eachindex(hs) if RK.recipe_handle_mode(hs[i]) === :ldiv)
+    lh = hs[li]; ins = collect(lh.inputs); outs = collect(lh.outputs)
+
+    # The discriminator is solely the concrete prepared factor-slot TYPE. Float16, dense, and a Diagonal over
+    # non-builtin backing storage remain on the original generic lowering.
+    @test RK._pp_diag_cholesky_ldiv_type(Cholesky{Float64,Diagonal{Float64,Vector{Float64}}})
+    @test RK._pp_diag_cholesky_ldiv_type(Cholesky{Float32,Diagonal{Float32,Vector{Float32}}})
+    @test !RK._pp_diag_cholesky_ldiv_type(Cholesky{Float16,Diagonal{Float16,Vector{Float16}}})
+    @test !RK._pp_diag_cholesky_ldiv_type(Cholesky{Float64,Matrix{Float64}})
+    @test !RK._pp_diag_cholesky_ldiv_type(
+        Cholesky{Float64,Diagonal{Float64,SubArray{Float64,1,Vector{Float64},Tuple{UnitRange{Int}},true}}})
+
+    # Source/lowering pin: dense remains byte-structurally the old ONE `ldiv!(dest,factor,rhs)` statement.
+    od, sd = _pp_construct(pf, plan, _pp_values(plan, Float64, 3, _PPFix.CountPgrad(0)))
+    dense = Any[]; RK._pp_emit_handle!(dense, plan, lh, li, typeof(od), typeof(sd))
+    expected_dense = :(ldiv!($(RK._pp_read(plan, outs[1])), $(RK._pp_read(plan, ins[1])), $(RK._pp_read(plan, ins[2]))))
+    @test dense[1] == expected_dense
+    @test length(dense[1].args) == 4                         # callee + dest + factor + rhs
+    @test !any(x -> x isa Expr && x.head === :call && x.args[1] === :copyto!, dense)
+
+    # The admitted Diagonal type emits copy + BOTH factor divisions, then the existing bless. This catches the
+    # tempting but mathematically wrong one-factor lowering for scaled masses.
+    dg = ones(Float64, 3); pos = ones(Float64, 3); mom = ones(Float64, 3)
+    og, sg = _pp_construct(pf, plan, _pp_diag_values(plan, Float64, dg, pos, mom, _PPFix.CountPgrad(0)))
+    diagonal = Any[]; RK._pp_emit_handle!(diagonal, plan, lh, li, typeof(og), typeof(sg))
+    @test diagonal[1] == :(copyto!($(RK._pp_read(plan, outs[1])), $(RK._pp_read(plan, ins[2]))))
+    @test count(x -> x isa Expr && x.head === :call && x.args[1] === :ldiv! && length(x.args) == 3,
+                diagonal) == 2                               # exactly two in-place factor divisions
+
+    # Executable exactness against the generic `F \\ rhs`: F32/F64, dimensions 1/5/17, unit + scaled, 20 seeds.
+    for T in (Float64, Float32), d in (1, 5, 17), scaled in (false, true), seed in 1:20
+        rng = Random.Xoshiro(seed + 100d + (scaled ? 1000 : 0))
+        diag = scaled ? T.(0.25 .+ 4 .* rand(rng, T, d)) : ones(T, d)
+        pos = randn(rng, T, d); mom = randn(rng, T, d); cp = _PPFix.CountPgrad(0)
+        ow, sh = _pp_construct(pf, plan, _pp_diag_values(plan, T, diag, pos, mom, cp))
+        init = RK.compile_prepared_initialization(pf, typeof(ow), typeof(sh))
+        @test init(ow, sh, hs) === ow
+        F = cholesky(Diagonal(diag)); reference = F \ mom
+        got = _pp_rd(plan, ow, sh, _pp_c(plan, :dkin_dmom))
+        @test _pp_bytes_equal(got, reference)
+        @test cp.n == 1
+    end
+
+    # Failure prefix: the rhs is copied, the first factor solve rejects the dimension, and the ldiv output is
+    # never blessed. This is the same executed-prefix/currentness contract as generic Factorization ldiv!.
+    T = Float64; diag = T[1, 4, 9]; pos = T[1, 2, 3]; mom = T[4, 5, 6, 7]
+    ow, sh = _pp_construct(pf, plan, _pp_diag_values(plan, T, diag, pos, mom, _PPFix.CountPgrad(0)))
+    candidate_error = try
+        RK.compile_prepared_initialization(pf, typeof(ow), typeof(sh))(ow, sh, hs); nothing
+    catch e
+        e
+    end
+    generic_dest = zeros(T, length(mom)); generic_error = try
+        ldiv!(generic_dest, cholesky(Diagonal(diag)), mom); nothing
+    catch e
+        e
+    end
+    @test candidate_error isa DimensionMismatch
+    @test typeof(candidate_error) === typeof(generic_error)
+    @test _pp_rd(plan, ow, sh, _pp_c(plan, :dkin_dmom)) == generic_dest == mom
+    @test !_pp_cur(plan, ow, sh, _pp_c(plan, :dkin_dmom))
 end
 
 @testset "prepared-endpoint — transition trace from MethodIR writes: grad/velocity/kin/ham, chol+@node EXCLUDED (RK 08:06/08:10/08:13)" begin

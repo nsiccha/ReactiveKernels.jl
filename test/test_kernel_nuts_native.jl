@@ -10,8 +10,8 @@ end
 
 _native_pf() = RK._prepare_factory(_NativeNutsFix.euclidean_phasepoint,
                                     RK.kernel_registration(_NativeNutsFix.leapfrog!))
-function _native_vals(pf,T)
-    P=RK.kernel_prepared_plan(pf); m=T[2 0;0 2]; d=Dict{Int,Any}()
+function _native_vals(pf,T;metric=T[2 0;0 2])
+    P=RK.kernel_prepared_plan(pf); m=metric; d=Dict{Int,Any}()
     for s in RK.kernel_plan_slots(P)
         n=String(s.path[1]); d[s.canon] = n=="grad_f" ? ((dst,p)->(dst .= 2 .* p;sum(abs2,p))) :
           n=="metric" ? m : n=="chol_metric" ? cholesky(m) : startswith(n,"##node") ? zero(T) :
@@ -19,12 +19,13 @@ function _native_vals(pf,T)
           n in ("dpot_dpos","dham_dpos","dkin_dmom","dham_dmom") ? T[0,0] : zero(T)
     end; d
 end
-function _native_frame(pf,T,md;stats=nothing,min_dham=-1000)
-    f=RK._construct_nuts_frame(pf,_native_vals(pf,T),md;step_f=RK.partial(_NativeNutsFix.leapfrog!;stepsize=T(.1)),
+function _native_frame(pf,T,md;stats=nothing,min_dham=-1000,metric=T[2 0;0 2])
+    f=RK._construct_nuts_frame(pf,_native_vals(pf,T;metric),md;step_f=RK.partial(_NativeNutsFix.leapfrog!;stepsize=T(.1)),
                                stats_f=stats,min_dham=min_dham)
     RK.compile_prepared_initialization(pf,typeof(f.init),typeof(f.shared))(f.init,f.shared,RK.kernel_prepared_handles(pf))
     RK._seed_nuts_children!(f); f
 end
+
 module _NativeFakeStructural
     const Bool = Core.Bool
 end
@@ -244,6 +245,107 @@ end
 function _sealed_public_alloc(skel, sampler, rng, ::Val{N}) where {N}
     _sealed_public_batch(skel,sampler,rng,Val(N)); GC.gc()
     @allocated _sealed_public_batch(skel,sampler,rng,Val(N))
+end
+
+# Test-only reconstruction of the PRE-FAST-PATH emitter: replace each exact emitted
+# `copyto!(dest,rhs); ldiv!(factor.factors,dest); ldiv!(factor.factors,dest)` triple by the old generic
+# `ldiv!(dest,factor,rhs)`. This operates on the compiler-emitted RGF body, not on an independently authored
+# sampler, and returns the replacement count so a disconnected/no-op oracle cannot false-green the parity gate.
+function _force_generic_diag_ldiv(x)
+    x isa Expr || return (x, 0)
+    if x.head === :block
+        ys = Any[]; n = 0; i = 1
+        while i <= length(x.args)
+            if i + 2 <= length(x.args)
+                a, b, c = x.args[i], x.args[i+1], x.args[i+2]
+                iscopy = a isa Expr && a.head === :call && a.args[1] === :copyto! && length(a.args) == 3
+                isldiv(e) = e isa Expr && e.head === :call && e.args[1] === :ldiv! && length(e.args) == 3
+                if iscopy && isldiv(b) && b == c && b.args[3] == a.args[2]
+                    gf = b.args[2]
+                    isfactors = gf isa Expr && gf.head === :call && gf.args[1] === :getfield &&
+                                length(gf.args) == 3 && gf.args[3] == QuoteNode(:factors)
+                    if isfactors
+                        push!(ys, Expr(:call, :ldiv!, a.args[2], gf.args[2], a.args[3]))
+                        n += 1; i += 3; continue
+                    end
+                end
+            end
+            y, m = _force_generic_diag_ldiv(x.args[i]); push!(ys, y); n += m; i += 1
+        end
+        return (Expr(:block, ys...), n)
+    end
+    ys = Any[]; n = 0
+    for a in x.args
+        y, m = _force_generic_diag_ldiv(a); push!(ys, y); n += m
+    end
+    Expr(x.head, ys...), n
+end
+
+function _generic_diag_native_root(C)
+    leafbody, nl = _force_generic_diag_ldiv(getfield(C.cfg.leaf, :body))
+    leaf = RK.compile(:((owned,shared,handles,__lf_stepkw) -> $leafbody))
+    names = keys(C.cfg.ensures); ens = Any[]; ne = 0
+    for name in names
+        body, n = _force_generic_diag_ldiv(getfield(getfield(C.cfg.ensures, name), :body))
+        push!(ens, RK.compile(:((owned,shared,handles) -> $body))); ne += n
+    end
+    nl == 1 || error("generic oracle expected exactly one leaf ldiv replacement, got $nl")
+    ne == 2 || error("generic oracle expected exactly two ensure ldiv replacements, got $ne")
+    ensures = NamedTuple{names}(Tuple(ens))
+    cfg = merge(C.cfg, (leaf=leaf, ensures=ensures))
+    R = Core.apply_type(RK._CompiledNutsRootNative, C.program, typeof(C.refresh), typeof(cfg), typeof(C.cfg.handles))
+    (root=R(C.refresh,cfg,C.cfg.handles), replacements=nl+ne)
+end
+
+function _native_full_obs(pf, f)
+    base = _native_obs(pf,f)
+    masks = (init=RK._canon_current_mask(f.init),fwd=RK._canon_current_mask(f.fwd),
+             bwd=RK._canon_current_mask(f.bwd),
+             proposals=Tuple(RK._canon_current_mask(p) for p in f.proposals),
+             shared=RK._canon_current_mask(f.shared),
+             diverged_pending=RK.nuts_frame_diverged_pending(f),
+             diverged_committed=RK.nuts_frame_diverged_committed(f))
+    (base=base,masks=masks)
+end
+
+@testset "native NUTS — fast Diagonal public trajectory is byte-identical to forced-generic emitted root" begin
+    for T in (Float64,Float32), scaled in (false,true)
+        pf=_native_pf(); metric=Diagonal(scaled ? T[2,3] : T[1,1])
+        fast=RK._build_nuts_sampler(pf,_native_vals(pf,T;metric),_NativeNutsFix.nuts_state,
+            _NativeNutsFix.refresh_momentum!!,_NativeNutsFix.nuts!!;
+            step_f=RK.partial(_NativeNutsFix.leapfrog!;stepsize=T(.1)),max_depth=5,
+            min_dham=T(-1000),stats_f=_NativeNutsFix.nuts_stats!)
+        fg=_native_frame(pf,T,5;metric,stats=_NativeNutsFix.nuts_stats!)
+        Cg=RK.compile_nuts_native(pf,_NativeNutsFix.nuts_state,_NativeNutsFix.refresh_momentum!!,
+                                  _NativeNutsFix.nuts!!,fg)
+        oracle=_generic_diag_native_root(Cg)
+        @test oracle.replacements == 3
+        generic=RK.nuts_sampler(Val(RK.kernel_token(_NativeNutsFix.nuts_state)),Val(Cg.RootToken),
+                                fg,oracle.root,())
+        rf=Random.Xoshiro(71); rg=Random.Xoshiro(71); ff=RK.nuts_sealed_frame(fast)
+        for _ in 1:80
+            @test _NativeNutsFix.nuts!!(fast;rng=rf) === fast
+            @test _NativeNutsFix.nuts!!(generic;rng=rg) === generic
+            @test _native_full_obs(pf,ff) == _native_full_obs(pf,fg)
+        end
+    end
+end
+
+@testset "native NUTS — sealed public Diagonal solve is inferred + exact loop 0-B, two RNG" begin
+    for T in (Float64,Float32)
+        pf=_native_pf(); metric=Diagonal(T[2,3])
+        k=RK._build_nuts_sampler(pf,_native_vals(pf,T;metric),_NativeNutsFix.nuts_state,
+            _NativeNutsFix.refresh_momentum!!,_NativeNutsFix.nuts!!;
+            step_f=RK.partial(_NativeNutsFix.leapfrog!;stepsize=T(.1)),max_depth=5,
+            min_dham=T(-1000),stats_f=nothing)
+        @test RK.nuts_sealed_metric(k) isa Diagonal{T,Vector{T}}
+        @test RK.nuts_sealed_chol_metric(k) isa Cholesky{T,<:Diagonal{T,Vector{T}}}
+        @test (@inferred _NativeNutsFix.nuts!!(k;rng=Random.Xoshiro(3))) === k
+        for rg in (Random.Xoshiro(8),Random.MersenneTwister(9))
+            @test _sealed_public_alloc(_NativeNutsFix.nuts!!,k,rg,Val(64)) == 0
+            @test _sealed_public_alloc(_NativeNutsFix.nuts!!,k,rg,Val(256)) == 0
+        end
+    end
 end
 
 @testset "native NUTS — production sampler carries one compiler-derived sealed evidence chain" begin
