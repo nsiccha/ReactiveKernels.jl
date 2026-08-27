@@ -311,6 +311,12 @@ end
     energy!() = pot_f(init) * metric[1] * chol[1]    # read-only callback + pure reads of metric/chol
 end
 
+# The FULL authored NUTS chain (euclidean_phasepoint / leapfrog! / refresh_momentum!! / nuts_state / nuts!! /
+# nuts_stats!) for the end-to-end ergonomic-core gate — same faithful fixture POC compiles against.
+module _ErgFix
+    include(joinpath(@__DIR__, "..", "benchmark", "nuts_kernel_authoring_fixture.jl"))
+end
+
 @testset "Inc3 factory substrate" begin
     @testset "LOCAL owned seed (not authoritative)" begin
         # the direct-write seed is exactly the mutated field
@@ -1560,6 +1566,63 @@ end
         @test RKS._kernel_binder_kwargs(EvilWrap(leapfrog!)) === nothing   # no duck-typing
         # bound numeric stepsize stays runtime-typed: .1 vs .2 are the same PartialFunction TYPE
         @test typeof(partial(leapfrog!; stepsize = 0.1)) === typeof(partial(leapfrog!; stepsize = 0.2))
+    end
+
+    @testset "nuts_state — runnable prepare→compile→attach CORE: end-to-end nuts!! from _build_nuts_sampler (RK 13:18 fork-free half)" begin
+        # the WHOLE internal chain in ONE call: pf → _prepare_nuts_frame → POC compile_nuts → nuts_sampler →
+        # FINAL callable KernelObject, on which the authored `nuts!!(sampler; rng)` runs end-to-end.
+        pf = RKS._prepare_factory(_ErgFix.euclidean_phasepoint, RKS.kernel_registration(_ErgFix.leapfrog!))
+        plan = RKS.kernel_prepared_plan(pf)
+        function ergvals(T)
+            m = T[2 0; 0 2]; d = Dict{Int,Any}()
+            for s in RKS.kernel_plan_slots(plan)
+                nm = String(s.path[1])
+                d[s.canon] = nm == "grad_f" ? ((dst, p) -> (dst .= 2 .* p; sum(abs2, p))) :
+                    nm == "metric" ? m : nm == "chol_metric" ? cholesky(m) : startswith(nm, "##node") ? zero(T) :
+                    nm == "pos" ? T[1, 2] : nm == "mom" ? T[3, 4] :
+                    (nm in ("dpot_dpos", "dham_dpos", "dkin_dmom", "dham_dmom")) ? T[0, 0] : zero(T)
+            end
+            d
+        end
+        _run(skel, k, rng) = skel(k; rng = rng)                     # function barrier for the kw dispatch
+        for T in (Float64, Float32)
+            k = RKS._build_nuts_sampler(pf, ergvals(T), _ErgFix.nuts_state, _ErgFix.refresh_momentum!!, _ErgFix.nuts!!;
+                                        step_f = RKS.partial(_ErgFix.leapfrog!; stepsize = T(0.1)),
+                                        max_depth = 4, min_dham = -1000, stats_f = _ErgFix.nuts_stats!)
+            # FINAL concrete callable KernelObject: OwnerToken = nuts_state, RootToken = nuts!! — distinct, both kept
+            @test k isa RKS.KernelObject && isconcretetype(typeof(k)) && isconcretetype(typeof(getfield(k, :handles)))
+            @test RKS.kernel_token(k) === RKS.kernel_token(_ErgFix.nuts_state)            # OwnerToken = nuts_state
+            @test RKS.nuts_handles_root_token(getfield(k, :handles)) === RKS.kernel_token(_ErgFix.nuts!!)  # RootToken = nuts!!
+            @test RKS.kernel_token(_ErgFix.nuts_state) !== RKS.kernel_token(_ErgFix.nuts!!)  # distinct
+            frame = RKS.nuts_sampler_frame(k)
+            @test RKS.diagnostics_ham_type(frame.diag) === T                              # F32/F64 preserved
+            # the authored public transition RUNS end-to-end and mutates in place; result === state
+            p0 = copy(RKS._canon_slot(frame.init, RKS.kernel_plan_named_slot_val(plan, Val(:pos))))
+            rng = Random.Xoshiro(1)
+            r = _ErgFix.nuts!!(k; rng = rng)
+            @test r === k                                                                # result === state
+            @test RKS._canon_slot(frame.init, RKS.kernel_plan_named_slot_val(plan, Val(:pos))) != p0  # real transition
+            @test RKS.diagnostics_committed_mask(frame.diag) == UInt(0x0f)               # one deferred epoch commit
+            # type-stable + 0-B public transition (warmed barrier, hoisted rng)
+            @test (@inferred _run(_ErgFix.nuts!!, k, rng)) === k
+            _run(_ErgFix.nuts!!, k, rng)
+            @test (@allocated _run(_ErgFix.nuts!!, k, rng)) == 0
+        end
+        # WRONG-skeleton token gate still holds through the ergonomic core: leapfrog! (a different Mode-2 token)
+        # cannot drive a sampler whose Handles carry nuts!!'s RootToken.
+        k = RKS._build_nuts_sampler(pf, ergvals(Float64), _ErgFix.nuts_state, _ErgFix.refresh_momentum!!, _ErgFix.nuts!!;
+                                    step_f = RKS.partial(_ErgFix.leapfrog!; stepsize = 0.1),
+                                    max_depth = 3, min_dham = -1000, stats_f = _ErgFix.nuts_stats!)
+        @test_throws MethodError _ErgFix.leapfrog!(k; rng = Random.Xoshiro(1))
+        # repeated same-signature constructions → identical concrete sampler type (RK 12:32/13:44 gate).
+        # BLOCKED on POC: `compile_nuts`'s `_CompiledNutsRoot` wraps a `RuntimeGeneratedFunction` whose TYPE
+        # tag is a fresh gensym per call (`##frame#879` vs `##frame#898`, distinct content hashes), so two
+        # compiles of the SAME signature yield DIFFERENT root types → different KernelObject types. Reported
+        # to POC; flip to @test once compile_nuts returns a signature-stable (memoized/non-RGF) root.
+        k2 = RKS._build_nuts_sampler(pf, ergvals(Float64), _ErgFix.nuts_state, _ErgFix.refresh_momentum!!, _ErgFix.nuts!!;
+                                     step_f = RKS.partial(_ErgFix.leapfrog!; stepsize = 0.1),
+                                     max_depth = 3, min_dham = -1000, stats_f = _ErgFix.nuts_stats!)
+        @test_broken typeof(k) === typeof(k2)
     end
 end
 

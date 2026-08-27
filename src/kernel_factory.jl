@@ -1647,6 +1647,29 @@ nuts_sampler(::Val{OwnerToken}, ::Val{RootToken}, frame::_NutsFrame, root, scrat
     KernelObject{OwnerToken,typeof(frame),_NutsHandles{RootToken,typeof(root),typeof(scratch)}}(
         frame, _NutsHandles(Val(RootToken), root, scratch))
 
+# --- runnable prepare→compile→attach CORE (RK 13:18 ergonomic gate, fork-free half) ------------------------
+#
+# Given a prepared endpoint factory `pf`, the endpoint slot values, the three authored skeletons (the
+# `nuts_state` construction owner, the `refresh_momentum!!` source, and the public `nuts!!` transition), and
+# the frozen config, this does the WHOLE internal chain — prepare frame (build + POC six-handle init +
+# seed) → POC `compile_nuts` → `nuts_sampler` — and returns the FINAL concrete callable `KernelObject`, on
+# which `nuts!!(sampler; rng)` runs end-to-end. NO manual attach; OwnerToken = the `nuts_state` owner Token,
+# RootToken = the compiled public `nuts!!` Token (`C.RootToken`), distinct and both preserved (RK 12:39).
+#
+# This is the fork-free portion of the ergonomic gate: it still takes `endpoint_values` keyed by canonical
+# slot. Eliminating that last Dict — synthesizing the endpoint storage from the AUTHORED NAMED source inputs
+# (`euclidean_phasepoint(grad_f, metric, pos, mom)` → init) — is the remaining architecture crux (POC owns
+# init EXECUTION, so the derived-slot storage must be typed-allocated, not executed) surfaced to RK.
+# `nuts_state_skel` is the authoring OWNER (a multi-method `_StatefulKernelSkeleton`); `refresh_skel`/
+# `nuts_skel` are the free `_Mode2KernelSkeleton`s POC's compiler consumes + validates.
+function _build_nuts_sampler(pf::_PreparedFactory, endpoint_values, nuts_state_skel,
+                             refresh_skel::_Mode2KernelSkeleton, nuts_skel::_Mode2KernelSkeleton;
+                             step_f, max_depth::Int, min_dham, stats_f)
+    frame = _prepare_nuts_frame(pf, endpoint_values, max_depth; step_f, stats_f, min_dham)
+    C = compile_nuts(pf, nuts_state_skel, refresh_skel, nuts_skel, frame)
+    nuts_sampler(Val(kernel_token(nuts_state_skel)), Val(C.RootToken), frame, C.root!, C.scratch)
+end
+
 # The authored `nuts!!(state; rng)` dispatch (RK 12:37/12:39 / poc contract): the Mode-2 `nuts!!` SKELETON
 # is itself the callable, and its captured signature contract — subject positional + REQUIRED KEYWORD `rng`
 # — is reused verbatim as this method's own signature (`(k; rng)`), so a missing / extra / positional `rng`
