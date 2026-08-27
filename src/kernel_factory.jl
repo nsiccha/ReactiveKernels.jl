@@ -870,9 +870,10 @@ function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol}; key
         pl = plan(graph; have = have, want = want)
         producer = Tuple(sort!([(cid, r.id) for (cid, r) in pl.producer]))
         recipes = Tuple(r.id for r in pl.recipes)
-        # DETACHED recipe-input snapshot (RK 04:43): each selected recipe's CANONICAL input Value
-        # ids, captured now so a later mutation of the live graph cannot alter it.
-        recipe_inputs = Tuple((r.id, Tuple(sort!([canon_id(graph, v.id) for v in r.inputs])))
+        # DETACHED recipe-input snapshot (RK 04:43/05:00): each selected recipe's CANONICAL input
+        # Value ids in EXACT authored input ORDER (never sorted — the execution applier binds
+        # arguments positionally), captured now so a live-graph mutation cannot alter it.
+        recipe_inputs = Tuple((r.id, Tuple(canon_id(graph, v.id) for v in r.inputs))
                               for r in pl.recipes)
         producer_keys = Int[cid for (cid, _) in producer]
     else

@@ -83,6 +83,10 @@ end
     y = x + 1
     z = y * 2
 end
+# authored input ORDER matters for execution binding: `b - a` has inputs (b, a), NOT sorted.
+@kernel orderk(a, b) = begin
+    z = b - a
+end
 # a SECOND, byte-identical endpoint DEFINITION — same slot/recipe SHAPE, DIFFERENT canonical
 # Value identities — to prove the plan key distinguishes definitions (RK 04:17c).
 @kernel phasepoint_ep2(pot_f, grad_f, metric, pos, mom) = begin
@@ -513,6 +517,16 @@ end
         RKS.add!(gm; inputs = (mutkernel.ports[:x],), outputs = (mutkernel.ports[:z],),
                  op = identity, cost = 1.0, cse_key = nothing, effectful = false)  # alt producer of z
         @test RKS.kernel_plan_recipe_inputs(planm) === snap      # captured snapshot UNCHANGED
+
+        # AUTHORED INPUT ORDER preserved (RK 05:00 pt1/5): `z = b - a` records inputs (b, a), the
+        # exact order the execution applier binds — NOT sorted; a position swap is distinguishable.
+        go = RKS.kernel_graph(orderk)
+        ca = RKS.canon_id(go, orderk.ports[:a].id); cb = RKS.canon_id(go, orderk.ports[:b].id)
+        plano = RKS._kernel_factory_plan(orderk, Set((:z,)), Set((:a, :b)))
+        rio = RKS.kernel_plan_recipe_inputs(plano)
+        @test length(rio) == 1 && rio[1][2] == (cb, ca)         # authored order (b, a)
+        @test rio[1][2] != Tuple(sort([ca, cb]))                # NOT sorted → a swap is distinct
+        @test cb in RKS.kernel_plan_key(plano)[6][1][2]         # ordered inputs are in the Key
     end
 
     @testset "bare-identity canonical alias at expansion (RK 03:57 hardening)" begin
