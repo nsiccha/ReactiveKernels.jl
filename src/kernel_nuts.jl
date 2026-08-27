@@ -62,6 +62,8 @@ function _derive_public_root_ops(nuts_ir::MethodIR, root_name::Symbol, runtimear
     rc = b[1].expr
     getfield(rc.registration, :token) === refresh_token ||
         _l_reject("public root: statement 1 is not the captured refresh_momentum!! (registration token mismatch)")
+    kernel_rebound(rc.registration, _kernel_resolve_captured_ref(rc.ref)) &&
+        _l_reject("public root: the authored refresh_momentum!! slot was REBOUND after definition — stale capture")
     (length(rc.args) == 1 && rc.args[1] isa _SelfField && rc.args[1].path == (:init,)) ||
         _l_reject("public root: refresh subject must be exactly `self.init`; got $(rc.args)")
     (length(rc.kw) == 1 && rc.kw[1].first === :rng && rc.kw[1].second isa _FormalRef && rc.kw[1].second.arg === runtimearg) ||
@@ -582,10 +584,17 @@ function compile_nuts(pf::_PreparedFactory, skel, refresh_skel, nuts_root_skel, 
     # public nuts!! root's rng is a KEYWORD RuntimeArg (distinct from the internal step! POSITIONAL rng); it must
     # match the threaded `runtimearg`. The root is lowered FROM this validated IR, and RootToken is handed to the
     # factory so its Mode-2 dispatch admits only a sampler whose skeleton token === this token.
-    nuts_ir = method_irs(nuts_root_skel)[1]
-    rootkw = [f.name for f in nuts_ir.formals if f.kind === :kw]
-    (length(rootkw) == 1 && rootkw[1] === runtimearg) ||
-        _l_reject("public root: nuts!! must have exactly one keyword RuntimeArg matching the threaded `$runtimearg`; got kw=$rootkw")
+    rirs = method_irs(refresh_skel)
+    (length(rirs) == 1 && rirs[1].ok) || _l_reject("public root: refresh_momentum!! must resolve to exactly one ok method")
+    nirs = method_irs(nuts_root_skel)
+    (length(nirs) == 1 && nirs[1].ok) || _l_reject("public root: nuts!! must resolve to exactly one ok method")
+    nuts_ir = nirs[1]
+    # EXACT signature (keeps syntax's raw-signature promise load-bearing in the compiler): the authored public
+    # root takes exactly ONE required keyword RuntimeArg named `runtimearg` (no positional/splat/defaulted/extra).
+    fs = nuts_ir.formals
+    (length(fs) == 1 && fs[1].name === runtimearg && fs[1].kind === :kw && fs[1].required === true && getfield(fs[1], :default) === nothing) ||
+        _l_reject("public root: nuts!! must take exactly one REQUIRED keyword RuntimeArg `$runtimearg` " *
+                  "(no positional/splat/defaulted/extra formal); got $([(f.name, f.kind, f.required) for f in fs])")
     _derive_public_root_ops(nuts_ir, root_name, runtimearg, kernel_token(refresh_skel))
     RootToken = kernel_token(nuts_root_skel)
     step!(fr, sc, rng) = (fn(fr, sc, rng, cfg); fr)
