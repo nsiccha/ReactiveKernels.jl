@@ -189,10 +189,10 @@ function _validate_stats_body(stats_ir::MethodIR, produced)
     (!isempty(sb) && sb[end] isa _Return && getfield(sb[end], :value) isa _SelfRef) ||
         _l_reject("stats callback must end with `return __self__`")
     pws = sb[1:end-1]
-    all(pw -> pw isa _PlaceWrite && pw.target isa _SelfField && length(pw.target.path) == 1 && haskey(_DIAG, pw.target.path[1]) && !pw.dot, pws) ||
+    all(pw -> pw isa _PlaceWrite && pw.target isa _SelfField && length(pw.target.path) == 1 && _is_diag(pw.target.path[1]) && !pw.dot, pws) ||
         _l_reject("stats callback body must be ONLY non-dot diagnostic-scalar place-writes then `return __self__` (no extra statement); got $([nameof(typeof(s)) for s in sb])")
-    Tuple(sort!(Int[_DIAG[pw.target.path[1]] for pw in pws])) == Tuple(sort!(collect(Int, produced))) ||
-        _l_reject("stats write targets $(Tuple(_DIAG[pw.target.path[1]] for pw in pws)) do not match binding produced $produced")
+    Tuple(sort!(Int[_diag_index(pw.target.path[1]) for pw in pws])) == Tuple(sort!(collect(Int, produced))) ||
+        _l_reject("stats write targets $(Tuple(_diag_index(pw.target.path[1]) for pw in pws)) do not match binding produced $produced")
     nothing
 end
 
@@ -207,7 +207,6 @@ struct NCtx
     S::Symbol
     PL                       # the _KernelPlan value (for compile-time named-slot Vals)
     kinds::Dict{Symbol,Symbol}
-    diagslot::Dict{Symbol,Int}   # diag field -> Val index
     cfg::Symbol              # runtime config NamedTuple arg: (leaf, handles, stepkw, ensures::NamedTuple)
     derived::Set{Symbol}     # endpoint fields that must demand-ensure before a value read
     stats_noeffect::Bool     # true when stats_f is the no-effect variant (skip stats_f calls)
@@ -277,9 +276,12 @@ function nfieldcall(x, lm, C::NCtx)
     end
 end
 
-const _DIAG = Dict(:n_steps=>1, :reached_depth=>2, :acceptance_rate=>3, :dham=>4)
-const _EP_SELF = Set([:init,:fwd,:bwd])
-const _SCALAR_SELF = Set([:gofwd,:may_sample,:may_continue,:diverged])
+# diagnostic scalar field -> Val index. Pure literal dispatch (NOT a module-level mutable Dict); 0 = not a diag
+# field. Definition-time constant-folded — no global lookup object, no runtime hashing.
+@inline _diag_index(s::Symbol) = s === :n_steps ? 1 : s === :reached_depth ? 2 : s === :acceptance_rate ? 3 : s === :dham ? 4 : 0
+@inline _is_diag(s::Symbol) = _diag_index(s) != 0
+# endpoint-bearing __self__ bases. Deeply immutable tuple (NOT a Set); membership is a compile-time constant `in`.
+const _EP_SELF = (:init, :fwd, :bwd)
 
 # classify a place node -> kind symbol
 function nkind(x, C::NCtx)
@@ -323,7 +325,7 @@ function nself_read(path, C::NCtx)
         # `isnothing(stats_f)` is compile-time true and the guarded field call is unreachable.
         f1 === :stats_f && return (C.stats_noeffect ? :(nothing) : :(nuts_frame_stats($(C.S))), :scalar)
         f1 === :step_f && return (:(nuts_frame_step($(C.S))), :scalar)
-        haskey(_DIAG, f1) && return (:(_diag_slot($(C.S).diag, Val($(_DIAG[f1])))), :scalar)
+        _is_diag(f1) && return (:(_diag_slot($(C.S).diag, Val($(_diag_index(f1))))), :scalar)
         k = f1 in _EP_SELF ? :endpoint : (f1 === :trees ? :treevec : (f1 === :proposals ? :epvec : :scalar))
         return (frameget, k)
     end
@@ -451,9 +453,9 @@ function nwrite(pw::_PlaceWrite, lm, C)
     t = pw.target
     if t isa _SelfField && length(t.path) == 1
         f = t.path[1]                                    # frame-direct scalar / diag scalar
-        if haskey(_DIAG, f)
+        if _is_diag(f)
             # G7: RAW value write (no per-leaf pending OR) — reset's pending=0x0f dominates the epoch.
-            set = :(_diag_set_value!($(C.S).diag, Val($(_DIAG[f])), $(nev(pw.rhs, lm, C))))
+            set = :(_diag_set_value!($(C.S).diag, Val($(_diag_index(f))), $(nev(pw.rhs, lm, C))))
             # a `dham` write invalidates + PRODUCES the derived `diverged` (RK) via the dedicated frame seam, so
             # the authored `diverged && return ...` guard downstream reads the fresh derived value, not a stale bit.
             return f === :dham ? Expr(:block, set, :(_nuts_produce_diverged!($(C.S)))) : set
@@ -532,7 +534,7 @@ function compile_nuts_dispatcher(irs0, PL; typemap, cap::Int, root_mid::Int, sta
     S = :__nuts_frame; SC = :__nuts_scratch; A0 = :__nuts_rng
     fspv = Dict(m => Symbol("fsp_$m") for m in mids); nstores = length(mids); ctrl_idx = nstores + 1
     method_arm(m) = begin
-        C = NCtx(S, PL, Dict{Symbol,Symbol}(), _DIAG, CFG, derived, stats_noeffect, by_mid, rec, runtimearg, A0, stats_ir, ctr)
+        C = NCtx(S, PL, Dict{Symbol,Symbol}(), CFG, derived, stats_noeffect, by_mid, rec, runtimearg, A0, stats_ir, ctr)
         # seed formal kinds: `ep` formals are endpoints
         for f in by_mid[m].formals; f.name === :ep && (C.kinds[:ep] = :endpoint); end
         localmap = Dict{Symbol,Symbol}(nm => _dsym(ctr, nm) for nm in stored[m])

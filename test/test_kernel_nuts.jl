@@ -284,3 +284,38 @@ _rsame(v, s) = v isa LinearAlgebra.Cholesky ? v.factors == s : v isa AbstractArr
     @test all(RK._canon_slot(frame.shared, Val(s)) === shared_ids[s] for s in keys(shared_ids))  # shared slots same OBJECT (identity)
     @test pg.n == grad0                                                                # grad counter unchanged (no producer ran)
 end
+
+@testset "NUTS source hygiene: no module-level mutable global lookup objects" begin
+    # User directive (no global dictionaries): the retained production NUTS compiler files must carry NO
+    # module-level CONSTRUCTED mutable lookup object (Dict/Set/IdDict/WeakKeyDict/Ref/registry). Two things are
+    # explicitly NOT banned and this gate must not flag them:
+    #   (1) type ALIASES — `const _LTaken = Dict{Symbol,Int}` / `_Places = Set{Symbol}` (container name → `{`);
+    #   (2) per-compilation LOCAL scratch — indented `ctr = Ref(0)` / `fspv = Dict(...)` inside a function.
+    # Only a TOP-LEVEL construction (`^[const] Name = Container(` / `[`) is an offender. `_DIAG` (Dict) →
+    # `_diag_index` pure dispatch; `_EP_SELF`/`_SCALAR_SELF` (Set) → immutable tuple / removed, this pins it.
+    nuts_files = ["kernel_nuts.jl", "kernel_control.jl", "kernel_codegen.jl"]   # production NUTS/control/codegen
+    #  ^-anchored (multiline): a leading-whitespace line can't match, so indented locals are excluded.
+    #  A CONSTRUCTION is `Name = [Base./Core.]Container[{...}]( / [` — the container (optionally qualified and
+    #  optionally with type params) is IMMEDIATELY followed by a `(`/`[` constructor call. A bare type ALIAS
+    #  `Name = Container{...}` has NO trailing call, so it does not match. This flags `Dict(...)`, `Dict{K,V}()`,
+    #  `Set{T}()`, `Base.RefValue(0)`; it allows `Dict{K,V}` / `Set{T}` aliases and indented function-local scratch.
+    banned = r"^(const[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]*=[ \t]*(Base\.|Core\.)?(Dict|Set|IdDict|WeakKeyDict|Ref|RefValue|ObjectIdDict)(\{[^\n]*\})?[ \t]*[\(\[]"m
+    for f in nuts_files
+        src = read(joinpath(@__DIR__, "..", "src", f), String)
+        offenders = String[strip(m.match) for m in eachmatch(banned, src)]
+        isempty(offenders) || @error "module-level mutable-container construction in src/$f" offenders
+        @test isempty(offenders)
+    end
+    # positive controls — the gate MUST fire on every construction shape:
+    @test occursin(banned, "const _X = Dict(:a=>1)")             # bare constructor
+    @test occursin(banned, "_Y = Set([:a,:b])")                  # bracket constructor
+    @test occursin(banned, "const _Z = Dict{Symbol,Int}()")      # parameterized constructor
+    @test occursin(banned, "_W = Set{Int}()")                    # parameterized constructor
+    @test occursin(banned, "const _R = Base.RefValue(0)")        # qualified constructor
+    @test occursin(banned, "const _N = Dict{Symbol,Vector{Int}}()")  # nested type params
+    # negative controls — the gate MUST NOT fire on aliases or function-local scratch:
+    @test !occursin(banned, "const _LTaken = Dict{Symbol,Int}")  # type alias — allowed
+    @test !occursin(banned, "_Places = Set{Symbol}")             # type alias — allowed
+    @test !occursin(banned, "    ctr = Ref(0)")                  # indented local scratch — allowed
+    @test !occursin(banned, "    fspv = Dict(m => 1 for m in x)")# indented local scratch — allowed
+end
