@@ -84,9 +84,15 @@ function build_region!(bb::BB, stmts, cont_pc::Int, ret_pc::Int, ret_val, by_mid
                 callee = by_mid[m]; fmap = _argmap(callee, v)
                 return build_region!(bb, [_subst(x, fmap) for x in callee.body], ret_pc, ret_pc, ret_val, by_mid, rec, brk, lcont)
             end
-        else                                                 # plain return: bind value (value-position) then goto ret_pc
+        else                                                 # plain return: evaluate the value, then goto ret_pc
+            # PRESERVE the return expression's evaluation (RK real-fixture fix): a discarded non-call return
+            # value (a registered/intrinsic effect or throw — e.g. step!'s tail `return copy!!(init,
+            # proposals[end])`) must still RUN. When value-bound, assign it; when discarded, emit it as an
+            # effect statement. Dropping it silently lost the terminal init<-proposals[end] copy.
             eff = Any[]
-            ret_val !== nothing && v !== nothing && push!(eff, _LocalAssign(_retvalsym(ret_val), v))
+            if v !== nothing
+                push!(eff, ret_val !== nothing ? _LocalAssign(_retvalsym(ret_val), v) : _ExprStmt(v))
+            end
             pc = _newpc!(bb); push!(bb.blks, Blk(pc, eff, TGoto(ret_pc))); return pc
         end
     elseif st isa _SetReturn
