@@ -274,8 +274,13 @@ _rsame(v, s) = v isa LinearAlgebra.Cholesky ? v.factors == s : v isa AbstractArr
     obj(role) = role === :owned ? frame.init : frame.shared
     vals = Dict((r,s) => _rsnap(RK._canon_slot(obj(r), Val(s))) for (r,s) in slots)
     curs = Dict((r,s) => RK._canon_current(obj(r), Val(s)) for (r,s) in slots); grad0 = pg.n
+    imask0 = RK._canon_current_mask(frame.init); smask0 = RK._canon_current_mask(frame.shared)   # raw current tuples
+    shared_ids = Dict(s => RK._canon_slot(frame.shared, Val(s)) for (r,s) in slots if r === :shared)  # by identity
     @test_throws ArgumentError C.refresh(frame.init, frame.shared, H, _CustomRNG2())   # rejected BEFORE any kill
     @test all(_rsame(RK._canon_slot(obj(r), Val(s)), vals[(r,s)]) for (r,s) in slots)  # every owned+shared VALUE unchanged
-    @test all(RK._canon_current(obj(r), Val(s)) === curs[(r,s)] for (r,s) in slots)    # every owned+shared currentness MASK unchanged
+    @test all(RK._canon_current(obj(r), Val(s)) === curs[(r,s)] for (r,s) in slots)    # every owned+shared currentness bit unchanged
+    @test RK._canon_current_mask(frame.init) == imask0                                 # whole owned mask tuple (unused bits too)
+    @test RK._canon_current_mask(frame.shared) == smask0                              # whole shared mask tuple (unused bits too)
+    @test all(RK._canon_slot(frame.shared, Val(s)) === shared_ids[s] for s in keys(shared_ids))  # shared slots same OBJECT (identity)
     @test pg.n == grad0                                                                # grad counter unchanged (no producer ran)
 end
