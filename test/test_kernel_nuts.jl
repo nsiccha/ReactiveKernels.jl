@@ -352,7 +352,7 @@ end
 # √-divisions), so the two are byte-identical ONLY for unit mass (trivial solve); a scaled Diagonal differs at
 # the ULP (F64 ~3e-16, F32 ~6e-8). Hence the byte-identical gate uses UNIT mass.
 
-@testset "kernel_nuts — Diagonal mass: unit-mass full-observable dense-equivalence + exact 0-B (F32/F64, both RNG)" begin
+@testset "kernel_nuts — Diagonal mass: unit-mass full-TRAJECTORY dense-equivalence + exact 0-B (F32/F64, both RNG)" begin
     _mkframe(pf, T, md, metric) = begin
         PL = RK.kernel_prepared_plan(pf); d = _nuts_mkvals(pf, T)
         for sl in RK.kernel_plan_slots(PL)
@@ -362,11 +362,16 @@ end
         RK.compile_prepared_initialization(pf, typeof(fr.init), typeof(fr.shared))(fr.init, fr.shared, RK.kernel_prepared_handles(pf))
         RK._seed_nuts_children!(fr); fr
     end
-    # full HMC-observable snapshot (not pos only): position + every committed diagnostic + mask.
+    # full HMC-observable snapshot (not pos only): position + every committed diagnostic + mask + the PHYSICAL
+    # derived-`diverged` field and its currentness bits (read directly, NOT inferred from dham — a stale/wrong
+    # frame.diverged or derived-currentness bit must be caught).
     _obs(fr) = (pos = copy(RK._canon_slot(fr.init, Val(3))),
                 n_steps = RK._diag_slot(fr.diag, Val(1)), reached_depth = RK._diag_slot(fr.diag, Val(2)),
                 acceptance_rate = RK._diag_slot(fr.diag, Val(3)), dham = RK._diag_slot(fr.diag, Val(4)),
-                committed = RK.diagnostics_committed_mask(fr.diag))
+                committed = RK.diagnostics_committed_mask(fr.diag),
+                diverged = getfield(fr, :diverged),
+                diverged_pending = RK.nuts_frame_diverged_pending(fr),
+                diverged_committed = RK.nuts_frame_diverged_committed(fr))
     for T in (Float64, Float32)
         pf = _nuts_pf()
         # UNIT mass: element-wise solve and dense potrs coincide exactly ⇒ byte-identical full observable set.
@@ -374,15 +379,12 @@ end
         CD = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frD)
         frM = _mkframe(pf, T, 5, T[1 0; 0 1])                        # SAME operator, dense representation
         CM = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frM)
-        rng = Random.Xoshiro(1); for _ in 1:200; CD.root!(frD, CD.scratch, rng); end
-        rng = Random.Xoshiro(1); for _ in 1:200; CM.root!(frM, CM.scratch, rng); end
-        oD = _obs(frD); oM = _obs(frM)
-        @test oD.pos == oM.pos                                       # position BYTE-identical (unit mass)
-        @test oD.n_steps == oM.n_steps
-        @test oD.reached_depth == oM.reached_depth
-        @test oD.acceptance_rate == oM.acceptance_rate
-        @test oD.dham == oM.dham                                     # diverged = !(dham>=min_dham) follows from this
-        @test oD.committed == oM.committed                          # committed diagnostics mask
+        # FULL-TRAJECTORY equivalence: snapshot the complete observable set after EVERY one of the 200 seeded
+        # transitions (not just the terminal frame), so a transient mismatch that later reconverges, or a
+        # stale/wrong diverged / derived-currentness bit at any step, is caught.
+        rngD = Random.Xoshiro(1); trajD = [(CD.root!(frD, CD.scratch, rngD); _obs(frD)) for _ in 1:200]
+        rngM = Random.Xoshiro(1); trajM = [(CM.root!(frM, CM.scratch, rngM); _obs(frM)) for _ in 1:200]
+        @test trajD == trajM                                        # every observable at every step, byte-identical (unit mass)
         # EXACT 0-B on the Diagonal path (a SCALED Diagonal, the real perf case): F32/F64 × both RNG, typed Val{N}.
         frS = _mkframe(pf, T, 5, LinearAlgebra.Diagonal(T[2, 2])); CS = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frS)
         for rg in (Random.Xoshiro(91), Random.MersenneTwister(2))
