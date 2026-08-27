@@ -100,9 +100,12 @@ Lower a plan to a batched, **loop-invariant-hoisting** kernel. The `batched` HAV
 ports are arrays iterated element-wise; every recipe that does NOT (transitively)
 depend on a batched value is emitted ONCE above the loop (the hoist), and only
 the batch-dependent recipes run per element, their single scalar `want`
-accumulated by `reduce` (default `:+`, i.e. a sum). This is how a vectorized log
-density avoids recomputing shared work: e.g. `σ = exp(logσ)` / `log(σ)` is
-computed once, not per observation. The generated function has the same
+accumulated by `reduce` (default `:+`, i.e. a sum). Pass `reduce=nothing` to
+instead COLLECT the per-element want into a vector (the per-observation density,
+for LOO/WAIC) — invariants are still hoisted, only the output vector is
+materialized. This is how a vectorized log density avoids recomputing shared
+work: e.g. `σ = exp(logσ)` / `log(σ)` is computed once, not per observation. The
+generated function (in the reducing mode) has the same
 `(__ops__, have...)` signature as [`lower`](@ref) — batched ports passed as
 arrays, shared ports as scalars — and the whole batch is one straight-line pass
 that materializes no per-element vector.
@@ -181,10 +184,8 @@ function lower_batched(p::Plan; batched, reduce = :+)
         push!(body.args, Expr(:(=), nm(out), callexpr(k, r)))
     end
 
-    acc = gensym(:acc)
-    push!(body.args, :($acc = zero($(valtype(want)))))
-
-    # The fused per-element loop: batched recipes only, the want accumulated.
+    # The fused per-element loop: the batched recipes only (invariants are
+    # already hoisted above). Their assignments are common to both modes.
     loopbody = Expr(:block)
     loop_assigned = copy(assigned)
     for (k, r) in enumerate(p.recipes)
@@ -195,9 +196,26 @@ function lower_batched(p::Plan; batched, reduce = :+)
         push!(loop_assigned, cid)
         push!(loopbody.args, Expr(:(=), nm(out), callexpr(k, r)))
     end
-    push!(loopbody.args, :($acc = $reduce($acc, $(nm(want)))))
-    push!(body.args, Expr(:for, :($idx = eachindex($(nm(iter_port)))), loopbody))
-    push!(body.args, Expr(:return, acc))
+
+    if reduce === nothing
+        # COLLECT mode: materialize the per-element want as a vector (the
+        # per-observation density, for LOO/WAIC). Invariants are still hoisted;
+        # only the output vector is allocated, per element.
+        result = gensym(:collected)
+        push!(body.args,
+              :($result = similar($(nm(iter_port)), $(valtype(want)))))
+        push!(loopbody.args, :($result[$idx] = $(nm(want))))
+        push!(body.args, Expr(:for, :($idx = eachindex($(nm(iter_port)))), loopbody))
+        push!(body.args, Expr(:return, result))
+    else
+        # REDUCE mode: accumulate the per-element want (default a sum), no
+        # per-element vector materialized.
+        acc = gensym(:acc)
+        push!(body.args, :($acc = zero($(valtype(want)))))
+        push!(loopbody.args, :($acc = $reduce($acc, $(nm(want)))))
+        push!(body.args, Expr(:for, :($idx = eachindex($(nm(iter_port)))), loopbody))
+        push!(body.args, Expr(:return, acc))
+    end
     Expr(:function, Expr(:tuple, argexprs...), body)
 end
 
