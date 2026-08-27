@@ -39,11 +39,23 @@ function compile_refresh(pf, ::Type{OW}, ::Type{SH}, refresh_ir::MethodIR) where
     argexpr(a) = a isa _FormalRef ? rng :
         a isa _SelfField ? (let e = _pp_read(plan, fc[a.path[1]]); for seg in a.path[2:end]; e = Expr(:., e, QuoteNode(seg)); end; e end) :
         _l_reject("refresh arg unsupported: $(typeof(a))")
-    for st in refresh_ir.body
-        st isa _ExprStmt && st.expr isa _RegisteredCall || continue  # the two writes; skip the _Return
-        rc = st.expr
-        getfield(rc.registration, :kind) === :intrinsic && _l_reject("refresh calls a provenance-only intrinsic")
-        push!(stmts, Expr(:call, _lf_callee(rc), (argexpr(a) for a in rc.args)...))
+    # EXACT statement validation (no silent skip): the refresh body is exactly two captured registered
+    # primitive writes then a final `return __self__`.
+    b = refresh_ir.body
+    (length(b) == 3 && b[3] isa _Return) || _l_reject("refresh_momentum!! must be exactly [randn!, lmul!, return]; got $(length(b)) statements")
+    for i in 1:2
+        (b[i] isa _ExprStmt && b[i].expr isa _RegisteredCall) || _l_reject("refresh statement $i must be a registered primitive write")
+        rc = b[i].expr
+        getfield(rc.registration, :kind) === :primitive || _l_reject("refresh statement $i is not a registered primitive ($(getfield(rc.registration,:kind)))")
+        # DETACHED authored-slot provenance (RK): emit the authored GlobalRef(module, field) — NOT the
+        # registration's source FUNCTION OBJECT (which the RGF would embed + call via a dynamic
+        # generated_callfunc, allocating). Rebind-check first; resolve the authored module slot with getglobal.
+        kernel_rebound(rc.registration, _kernel_resolve_captured_ref(rc.ref)) &&
+            _l_reject("refresh statement $i authored slot was REBOUND after definition")
+        ref = rc.ref
+        (ref.slot isa GlobalRef) || _l_reject("refresh callee slot is not an authored GlobalRef")
+        mod = getglobal(ref.slot.mod, ref.slot.name)          # e.g. getglobal(owner, :Random) -> Random
+        push!(stmts, Expr(:call, GlobalRef(mod, ref.field), (argexpr(a) for a in rc.args)...))
     end
     _lf_mask!(stmts, plan, mom_c, :bless)                            # bless mom only after both writes succeed
     compile(:((owned, shared, handles, $rng) -> $(Expr(:block, stmts..., :(return owned)))))
