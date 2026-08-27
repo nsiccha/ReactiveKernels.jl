@@ -31,21 +31,23 @@ using .EightSchoolsExample
         @test log_jacobian == q[2]
     end
 
-    @testset "density decomposition and shared pointwise likelihood" begin
+    @testset "density decomposition; likelihood is a plated (vectorized) kernel" begin
         p = plan(model.graph;
                  have = (model.unconstrained, model.observations,
                          model.observation_scales),
-                 want = (model.prior, model.log_jacobian, model.pointwise,
+                 want = (model.prior, model.log_jacobian,
                          model.likelihood, model.density))
-        @test count(r -> r.op === EightSchoolsExample.pointwise_log_likelihood,
-                    p.recipes) == 1
 
         k = prepare(p)
-        prior, log_jacobian, pointwise, likelihood, density =
+        prior, log_jacobian, likelihood, density =
             k(q, EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA)
 
-        @test all(isfinite, pointwise)
-        @test likelihood ≈ sum(pointwise)
+        θ = q[3:end]
+        reference_likelihood = sum(
+            EightSchoolsExample.normal_logpdf(
+                EIGHT_SCHOOLS_Y[j], θ[j], EIGHT_SCHOOLS_SIGMA[j])
+            for j in 1:8)
+        @test likelihood ≈ reference_likelihood
         @test density ≈ prior + log_jacobian + likelihood
     end
 
@@ -105,8 +107,7 @@ using .EightSchoolsExample
             state = ReactiveState(
                 nested.graph;
                 materialize = (nested.parameters, nested.prior,
-                               nested.pointwise, nested.likelihood,
-                               checked_density),
+                               nested.likelihood, checked_density),
             )
             set!(state, nested.unconstrained, q)
             set!(state, nested.observations, EIGHT_SCHOOLS_Y)
@@ -114,7 +115,6 @@ using .EightSchoolsExample
 
             get!(state, nested.parameters)
             get!(state, nested.prior)
-            get!(state, nested.pointwise)
             get!(state, nested.likelihood)
             first_density = get!(state, checked_density)
             @test get!(state, checked_density) == first_density
@@ -169,35 +169,36 @@ using .EightSchoolsExample
     @testset "generated quantities prune density work" begin
         parameters = EightSchoolsParameters(1.0, 4.0, fill(2.0, 8))
         p = plan(model.graph;
-                 have = (model.parameters, model.observations,
-                         model.observation_scales, model.new_group_scale,
+                 have = (model.parameters, model.new_group_scale,
                          model.prediction_innovations),
-                 want = (model.pointwise, model.new_group))
+                 want = (model.new_group,))
 
-        @test length(p.recipes) == 2
+        @test length(p.recipes) == 1
         @test !any(r -> r.op === EightSchoolsExample.split_unconstrained,
                    p.recipes)
         @test !any(r -> r.op === EightSchoolsExample.log_prior, p.recipes)
-        @test !any(r -> r.op === EightSchoolsExample.total_log_density,
-                   p.recipes)
 
-        pointwise, prediction = prepare(p)(
-            parameters, EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA,
-            12.0, [0.25, -1.0])
-        @test all(isfinite, pointwise)
+        prediction = prepare(p)(parameters, 12.0, [0.25, -1.0])
         @test prediction isa NewGroupPrediction
         @test prediction.θ == 2.0
         @test prediction.y == -10.0
     end
 
-    @testset "invalid constrained inputs fail explicitly" begin
-        parameters = EightSchoolsParameters(1.0, 4.0, fill(2.0, 8))
-        bad_scales = [0.0; EIGHT_SCHOOLS_SIGMA[2:end]]
+    @testset "the plated likelihood equals the summed per-school density" begin
+        # `plated_loglik` is the vectorized `plate` of the scalar per-school kernel.
+        θ = q[3:end]
+        expected = sum(
+            EightSchoolsExample.normal_logpdf(
+                EIGHT_SCHOOLS_Y[j], θ[j], EIGHT_SCHOOLS_SIGMA[j])
+            for j in 1:8)
+        @test EightSchoolsExample.plated_loglik(
+            EIGHT_SCHOOLS_Y, θ, EIGHT_SCHOOLS_SIGMA) ≈ expected
+    end
 
-        @test_throws DomainError EightSchoolsExample.pointwise_log_likelihood(
-            parameters, EIGHT_SCHOOLS_Y, bad_scales)
+    @testset "invalid constrained inputs fail explicitly" begin
+        @test_throws DomainError EightSchoolsExample.normal_logpdf(0.0, 0.0, 0.0)
         @test_throws DomainError EightSchoolsExample.predict_new_group(
-            parameters, 0.0, [0.25, -1.0])
+            EightSchoolsParameters(1.0, 4.0, fill(2.0, 8)), 0.0, [0.25, -1.0])
         @test_throws DomainError EightSchoolsExample.log_prior(
             EightSchoolsParameters(1.0, 0.0, fill(2.0, 8)))
     end

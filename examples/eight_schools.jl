@@ -64,13 +64,18 @@ function log_prior(parameters::EightSchoolsParameters)
     lp
 end
 
-function pointwise_log_likelihood(parameters::EightSchoolsParameters,
-                                  y::Vector{Float64},
-                                  σ::Vector{Float64})
-    [normal_logpdf(y[j], parameters.θ[j], σ[j]) for j in 1:NSCHOOLS]
+# The per-school log likelihood, authored ONCE as a scalar `@kernel`. `plate`
+# turns it into the vectorized log density: the batched ports are iterated
+# element-wise and the scalar `ll` is summed, in one fused pass that materializes
+# no per-observation vector. (Here all three inputs vary per school, so there is
+# nothing loop-invariant to hoist; a shared scale — as in linear regression —
+# would be computed once above the loop.)
+@kernel school_loglik(y::Float64, θ::Float64, σ::Float64) = begin
+    ll::Float64 = -0.5 * _LOG2PI - log(σ) - 0.5 * ((y - θ) / σ)^2
 end
 
-sum_log_likelihood(log_likelihoods::Vector{Float64}) = sum(log_likelihoods)
+const plated_loglik = plate(school_loglik;
+    have = (:y, :θ, :σ), want = :ll, batched = (:y, :θ, :σ))
 
 total_log_density(log_prior::Float64, log_jacobian::Float64,
                   log_likelihood::Float64) =
@@ -93,10 +98,11 @@ Build the centered eight-schools model as a declarative
 `ReactiveKernels.KernelSpec`. Named ports remain available as properties, making
 different PPL queries explicit `have`/`want` boundaries.
 
-The graph deliberately keeps the transform Jacobian, prior, pointwise
-log-likelihood, likelihood reduction, total density, and prediction as separate
-nodes. Prediction is deterministic for caller-supplied standard-normal
-innovations; sampling those innovations remains outside the pure graph.
+The likelihood is the vectorized `plated_loglik` (a `plate` of the scalar
+per-school `@kernel`); the transform Jacobian, prior, total density, and
+prediction are separate nodes. Prediction is deterministic for caller-supplied
+standard-normal innovations; sampling those innovations remains outside the pure
+graph.
 """
 function build_eight_schools_graph()
     @kernel model(unconstrained::Vector{Float64},
@@ -111,10 +117,7 @@ function build_eight_schools_graph()
         log_jacobian::Float64 = log_abs_det_jacobian(log_τ)
 
         prior::Float64 = log_prior(parameters)
-        pointwise::Vector{Float64} = pointwise_log_likelihood(
-            parameters, observations, observation_scales,
-        )
-        likelihood::Float64 = sum_log_likelihood(pointwise)
+        likelihood::Float64 = plated_loglik(observations, θ, observation_scales)
         density::Float64 = total_log_density(prior, log_jacobian, likelihood)
         new_group::NewGroupPrediction = predict_new_group(
             parameters, new_group_scale, prediction_innovations,
@@ -132,30 +135,25 @@ function demo()
     println(explain(constrained_plan))
     parameters = prepare(constrained_plan)(q)
 
-    println("\nFull unconstrained-space log density and pointwise terms:")
+    println("\nFull unconstrained-space log density (likelihood via plate):")
     density_plan = plan(model;
                         have = (:unconstrained, :observations,
                                 :observation_scales),
-                        want = (:prior, :log_jacobian, :likelihood, :density,
-                                :pointwise))
+                        want = (:prior, :log_jacobian, :likelihood, :density))
     println(explain(density_plan))
-    prior, log_jacobian, likelihood, density, pointwise =
+    prior, log_jacobian, likelihood, density =
         prepare(density_plan)(q, EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA)
     println("log prior + log Jacobian + log likelihood")
     println("= ", prior, " + ", log_jacobian, " + ", likelihood)
     println("= log density = ", density)
-    println("pointwise log likelihood = ", pointwise)
 
-    println("\nGenerated quantities from an already-constrained HAVE boundary:")
+    println("\nGenerated quantity from an already-constrained HAVE boundary:")
     generated_plan = plan(model;
-                          have = (:parameters, :observations,
-                                  :observation_scales, :new_group_scale,
+                          have = (:parameters, :new_group_scale,
                                   :prediction_innovations),
-                          want = (:pointwise, :new_group))
+                          want = :new_group)
     println(explain(generated_plan))
-    pointwise2, prediction = prepare(generated_plan)(
-        parameters, EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA, 12.0, [0.25, -1.0])
-    @assert pointwise2 == pointwise
+    prediction = prepare(generated_plan)(parameters, 12.0, [0.25, -1.0])
     println("new group θ = ", prediction.θ, ", y = ", prediction.y)
 
     nothing
