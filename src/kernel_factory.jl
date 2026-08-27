@@ -1015,6 +1015,15 @@ end
 end
 _canon_current_mask(s::_Canon) = getfield(s, :current)
 
+# Per-canonical-slot KIND / TYPE for poc's expression emission (RK 05:30) — derived from the CONCRETE
+# field type by Val index (literal `fieldtype`), NEVER a Symbol-name heuristic or live Dict, so
+# renamed storage fields (`f1`,`f2`,…) are irrelevant. `:buffer` for an AbstractArray field, `:scalar`
+# otherwise (Int/Bool/Float scalars). `_canon_slot_type` returns the exact concrete field type.
+@generated function _canon_slot_kind(s::_Canon, ::Val{I}) where {I}
+    QuoteNode(fieldtype(s, I) <: AbstractArray ? :buffer : :scalar)
+end
+@generated _canon_slot_type(s::_Canon, ::Val{I}) where {I} = fieldtype(s, I)
+
 # The concrete family member for a given arity — a COMPILE-TIME type lookup (no runtime Symbol
 # dispatch, no runtime emission). A layout wider than the predeclared family throws a deterministic
 # reject at the @generated boundary (per-N specialization → type-stable / @inferred, RK 05:24).

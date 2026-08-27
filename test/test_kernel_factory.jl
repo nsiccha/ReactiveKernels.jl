@@ -832,6 +832,15 @@ end
         # a layout wider than the predeclared family arity rejects deterministically
         wide = ntuple(i -> Float64(i), RKS._CANON_MAXN + 1)
         @test_throws RKS._KernelFactoryReject RKS._canon_construct(Val(:owned), wide, RKS._owner_mask(length(wide)))
+
+        # SCALAR-vs-BUFFER classification for poc expression emission (RK 05:30): from the concrete
+        # field TYPE by Val index (literal fieldtype), NOT names — Int/Bool/Float scalars vs vectors.
+        mix = RKS._canon_construct(Val(:owned), (1.0, [2.0, 3.0], 4, true), RKS._owner_mask(4))
+        @test RKS._canon_slot_kind(mix, Val(1)) === :scalar && RKS._canon_slot_type(mix, Val(1)) === Float64
+        @test RKS._canon_slot_kind(mix, Val(2)) === :buffer && RKS._canon_slot_type(mix, Val(2)) === Vector{Float64}
+        @test RKS._canon_slot_kind(mix, Val(3)) === :scalar && RKS._canon_slot_type(mix, Val(3)) === Int
+        @test RKS._canon_slot_kind(mix, Val(4)) === :scalar && RKS._canon_slot_type(mix, Val(4)) === Bool
+        @test (@inferred RKS._canon_slot_kind(mix, Val(2))) === :buffer   # type-stable classification
     end
 
     @testset "poc binder/plan seam accessors (RK 04:41)" begin
