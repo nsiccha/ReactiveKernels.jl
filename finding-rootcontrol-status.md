@@ -148,3 +148,25 @@ run the compiled control machine over the frame under ONE outer epoch -> return 
 ### The control compiler's EMIT is the piece to rebind: emit_effect/emit_val currently target a synthetic
 ### S.field. Rebuild them to target the frame accessors above (endpoints canon ABI + trees getproperty +
 ### control-scalar getfield + diag Val). The CFG/liveness/dispatcher/SCC-inlining logic is DONE + proven.
+
+## REBASED onto e4868e5 (HEAD 51f739d) — all binding dependencies in place
+Rebased --onto e4868e5 (7 commits, clean). Available now: prepared_callable_leaf(sf)->(leaf_ir,stepkw) +
+kernel_plan_named_slot_val(plan,Val(:name)). The nuts_state place-write targets are mapped (place_probe):
+- CONTROL SCALARS: owner=(:may_continue,)/(:may_sample,) SelfField root=self -> setfield!(frame, :field, v).
+- DIAG: owner=(:dham,)/(:reached_depth,) -> _diag_set!(diag, Val(4/2), v).
+- ENDPOINT bufs: SelfField(:bwd,:mom)/(:fwd,:mom) root=self owner=(:bwd/:fwd,) dot=true -> endpoint canon
+  slot (materialize! into _canon_slot(getfield(frame,:bwd), kernel_plan_named_slot_val(plan,Val(:mom)))).
+- TREES: owner=(:trees,) Index(base=_Getfield trees, idxs=1)=trees[depth]; Getfield(mom)/(dham_dmom)/(bwd)/
+  (fwd) root=alias dot=true -> getproperty chains on getfield(frame,:trees)[depth] NamedTuple + broadcast.
+- PROPOSALS swap: swapproposal! -> plain Vector element swap on getfield(frame,:proposals).
+
+## FINAL emit-binding (the last large piece, fully scoped) — remaining to runnable nuts!!
+Rebuild the control compiler's emit_effect/emit_val (currently synthetic S.field) to dispatch on the
+place `owner`/`root`/path -> the frame accessor above. Endpoint reads/writes REUSE the phasepoint canon
+machinery; trees via getproperty+broadcast; control scalars via getfield/setfield!; diag via _diag_set!.
+Splice compile_leapfrog(pf, typeof(ep), typeof(shared), leaf_ir) [leaf_ir,stepkw = prepared_callable_leaf(
+nuts_frame_step(frame))] at start!(depth==1) step_f(ep). nuts!! entry = _construct_nuts_frame -> init
+(compile_prepared_initialization + initfn) -> _seed_nuts_children! -> run the compiled control machine over
+the frame under ONE outer epoch (_diagnostics_reset! ... _diagnostics_root_commit!/_nuts_derived_root_commit!)
+-> return the frame (authored return state; result===state; private leaf carrier NOT public). Prove 0-B/
+@inferred + correctness vs a reference NUTS trajectory. The CFG/liveness/dispatcher/SCC-inlining is DONE.
