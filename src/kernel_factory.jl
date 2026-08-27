@@ -56,6 +56,49 @@ function _kernel_factory_local_owned_seed(skel)
     intersect!(owned, Set{Symbol}(kernel_port_names(skel)))
 end
 
+# --- transitive ownership: call-induced writes -------------------------------
+#
+# Local `write_roots` MISS owner fields mutated THROUGH a call (RK 2026-08-27):
+# `copy!!(init, …)` writes `init`; a resolved callable field `step_f(fwd)` writes `fwd`
+# (leapfrog! writes its subject). An owner field that is the FIRST-ARG subject of a
+# registered-call / intrinsic / callable-field call is therefore OWNED. This walks poc's
+# MethodIR bodies generically and collects those subjects.
+
+# Generic recursion over a poc MethodIR node tree, calling `f` on every `_RegisteredCall`
+# / `_FieldCall` node (before recursing into it).
+function _kmir_walk_calls(f, x)
+    (x isa _RegisteredCall || x isa _FieldCall) && f(x)
+    if x isa _MExpr || x isa _MStmt
+        for i in 1:nfields(x)
+            _kmir_walk_calls(f, getfield(x, i))
+        end
+    elseif x isa Tuple
+        for e in x
+            _kmir_walk_calls(f, e)
+        end
+    elseif x isa Pair
+        _kmir_walk_calls(f, x.second)
+    end
+    nothing
+end
+
+_kmir_call_pos(c::_RegisteredCall) = c.args
+_kmir_call_pos(c::_FieldCall) = c.pos
+
+# Owner top-fields written via a call whose first-arg subject is an owner field.
+function _kernel_factory_call_writes(skel)
+    fields = Set{Symbol}()
+    for ir in method_irs(skel)
+        _kmir_walk_calls(ir.body) do c
+            pos = _kmir_call_pos(c)
+            isempty(pos) && return
+            subj = pos[1]
+            subj isa _SelfField && !isempty(subj.path) && push!(fields, subj.path[1])
+        end
+    end
+    fields
+end
+
 # --- concrete no-Ref owner storage (RK 2026-08-27 storage redirect) ----------
 #
 # ONE generic mutable wrapper around a fully concrete VALUE Tuple of the flattened owned
@@ -83,16 +126,24 @@ owner_slots(s::_OwnerState) = getfield(s, :slots)
 # --- callable field / partial resolution (RK callable-Token redirect) --------
 #
 # A callable FIELD (`step_f`, `stats_f`) must resolve to a REGISTERED kernel/intrinsic
-# TOKEN identity, or be REJECTED — never an opaque runtime callable. A `partial(kernel;…)`
-# is a static TOKEN-PRESERVING binder that wraps its target in a `func` slot; unwrap it
-# generically (independent of the binder's concrete type / include order) and resolve the
-# target's registration. Returns the `_KernelRegistration` (Token/effects) or `nothing`.
+# TOKEN identity, or be REJECTED — never an opaque runtime callable.
+#
+# TOKEN-PRESERVING BINDER TRAIT (RK 2026-08-27): a binder is recognized ONLY by an explicit
+# opt-in — `_kernel_binder_target(binder)` returns the wrapped target, `nothing` otherwise.
+# It is EXTENDED only for approved binders (RK's `PartialFunction`, in hmc.jl after that
+# type is declared — include order is not a reason to duck-type). Never trust an arbitrary
+# `Function` with a `.func` field: an `EvilWrap{F}<:Function` would otherwise smuggle a
+# genuine Token through different call semantics, violating the explicit-registration
+# compiler boundary.
+_kernel_binder_target(::Any) = nothing
+
+# Resolve a callable to its registered `_KernelRegistration`, recursing ONLY through the
+# binder trait. `nothing` if it is not a registered kernel/intrinsic (or approved binder).
 function _kernel_resolve_callable(v)
     reg = kernel_registration(v)
     reg === nothing || return reg
-    (v isa Function && hasfield(typeof(v), :func)) &&
-        return _kernel_resolve_callable(getfield(v, :func))
-    nothing
+    target = _kernel_binder_target(v)
+    target === nothing ? nothing : _kernel_resolve_callable(target)
 end
 
 # Resolve a callable field to its registered Token, or REJECT actionably.

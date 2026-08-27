@@ -372,6 +372,11 @@ partial(f, ::Colon, args...; kwargs...) =
 partial(f, left, ::Colon, args...; kwargs...) =
     PartialFunction(f, (left,), args, (; kwargs...))
 
+# `PartialFunction` is RK's approved token-preserving binder: opt IN to the factory's
+# binder trait (declared default-nothing in kernel_factory.jl) by exposing its wrapped
+# target. This is the ONLY sanctioned extension — the factory never duck-types `.func`.
+_kernel_binder_target(f::PartialFunction) = getfield(f, :func)
+
 _finite_or_neginf(x) = isfinite(x) ? x : typeof(x)(-Inf)
 _min1exp(x) = x >= 0 ? one(x) : exp(x)
 _rand_bernoulli_log(rng, log_probability) =

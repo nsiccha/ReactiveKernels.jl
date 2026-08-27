@@ -20,6 +20,20 @@ end
     @. phasepoint.mom -= stepsize * phasepoint.grad
 end
 
+# adversary: a Function with a `func` field but DIFFERENT call semantics — must NOT be
+# accepted as a token-preserving binder (it never opts into the binder trait).
+struct EvilWrap{F} <: Function
+    func::F
+end
+(e::EvilWrap)(args...; kwargs...) = error("evil call semantics")
+
+# call-induced ownership: `s` is written ONLY through the intrinsic `copy!!(s, y)`, not by
+# a direct place-write — local write_roots miss it; the call-writes pass catches it.
+@kernel callowner(x, y) = begin
+    s = x
+    drive!() = copy!!(s, y)
+end
+
 @testset "Inc3 factory substrate" begin
     @testset "LOCAL owned seed (not authoritative)" begin
         # the direct-write seed is exactly the mutated field
@@ -60,6 +74,20 @@ end
         @test_throws ArgumentError RKS._kernel_resolve_callable_or_reject(:step_f, sin)
         # a partial binding a NON-kernel rejects too
         @test_throws ArgumentError RKS._kernel_resolve_callable_or_reject(:step_f, partial(sin; a = 1))
+        # ADVERSARY: a Function with a `func` field but no binder-trait opt-in is REJECTED,
+        # even though its `func` IS a genuine kernel (explicit-registration boundary).
+        @test RKS._kernel_binder_target(EvilWrap(leapfrog!)) === nothing
+        @test RKS._kernel_resolve_callable(EvilWrap(leapfrog!)) === nothing
+        @test_throws ArgumentError RKS._kernel_resolve_callable_or_reject(:step_f, EvilWrap(leapfrog!))
+        # the approved binder DOES opt in
+        @test RKS._kernel_binder_target(partial(leapfrog!; stepsize = 0.1)) === leapfrog!
+    end
+
+    @testset "call-induced writes (transitive ownership seed)" begin
+        # `s` is mutated ONLY through the intrinsic `copy!!(s, y)` — NO local place-write,
+        # so `write_roots` misses it, but the call-writes pass catches it as owned.
+        @test isempty(RKS._kernel_factory_direct_writes(callowner))
+        @test :s in RKS._kernel_factory_call_writes(callowner)
     end
 end
 
