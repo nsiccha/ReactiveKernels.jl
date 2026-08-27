@@ -86,7 +86,6 @@ function setup_eight_schools!(mod::Module)
     end
     Core.eval(mod, :(using .EightSchoolsExample:
         EightSchoolsParameters, NewGroupPrediction,
-        SchoolVector, UnconstrainedParameters, PredictionInnovations,
         EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA))
     nothing
 end

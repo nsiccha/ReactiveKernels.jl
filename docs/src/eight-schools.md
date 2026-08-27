@@ -58,18 +58,18 @@ side by side without resetting the interactive DAG.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(@__MODULE__, raw"""
-@kernel model(unconstrained::UnconstrainedParameters,
-              observations::SchoolVector,
-              observation_scales::SchoolVector,
-              new_group_scale::Real,
-              prediction_innovations::PredictionInnovations) = begin
+@kernel model(unconstrained::Vector{Float64},
+              observations::Vector{Float64},
+              observation_scales::Vector{Float64},
+              new_group_scale::Float64,
+              prediction_innovations::Vector{Float64}) = begin
     # Split the unconstrained vector into (μ, log_τ, θ).
-    μ::Real = unconstrained[1]
-    log_τ::Real = unconstrained[2]
-    θ::SchoolVector = ntuple(i -> unconstrained[i + 2], 8)
+    μ::Float64 = unconstrained[1]
+    log_τ::Float64 = unconstrained[2]
+    θ::Vector{Float64} = unconstrained[3:end]
 
     # Support transform for the scale: τ = exp(log_τ).
-    τ::Real = exp(log_τ)
+    τ::Float64 = exp(log_τ)
 
     # Two producers for the SAME `parameters` port — RK's "multiple paths to one
     # port". The first yields the constrained parameters alone; the second yields
@@ -77,34 +77,35 @@ Main.ReactiveKernelsDocs.execute_example(@__MODULE__, raw"""
     # transform. The planner picks the first for a constrain-only query and the
     # second whenever the Jacobian — hence the unconstrained density — is wanted.
     parameters::EightSchoolsParameters = EightSchoolsParameters(μ, τ, θ)
-    (parameters::EightSchoolsParameters, log_jacobian::Real) =
+    (parameters::EightSchoolsParameters, log_jacobian::Float64) =
         (EightSchoolsParameters(μ, τ, θ), log_τ)
 
     # log prior:  μ ~ Normal(0, 5),  τ ~ HalfCauchy(0, 5),  θⱼ ~ Normal(μ, τ).
-    prior::Real =
+    prior::Float64 =
         (-0.5 * log(2π) - log(5.0) - 0.5 * (μ / 5.0)^2) +
         (log(2) - log(π) - log(5.0) - log1p((τ / 5.0)^2)) +
         sum(-0.5 * log(2π) - log(τ) - 0.5 * ((θ[j] - μ) / τ)^2 for j in 1:8)
 
     # Pointwise log likelihood:  yⱼ ~ Normal(θⱼ, σⱼ).
-    pointwise::SchoolVector = ntuple(8) do j
+    pointwise::Vector{Float64} = [
         -0.5 * log(2π) - log(observation_scales[j]) -
             0.5 * ((observations[j] - θ[j]) / observation_scales[j])^2
-    end
-    likelihood::Real = sum(pointwise)
+        for j in 1:8
+    ]
+    likelihood::Float64 = sum(pointwise)
 
     # Unconstrained-space log density.
-    density::Real = prior + log_jacobian + likelihood
+    density::Float64 = prior + log_jacobian + likelihood
 
     # Deterministic new-group prediction from standard-normal innovations.
-    θ_new::Real = μ + τ * prediction_innovations[1]
-    y_new::Real = θ_new + new_group_scale * prediction_innovations[2]
+    θ_new::Float64 = μ + τ * prediction_innovations[1]
+    y_new::Float64 = θ_new + new_group_scale * prediction_innovations[2]
     new_group::NewGroupPrediction = NewGroupPrediction(θ_new, y_new)
 
     return density
 end
 
-q = (1.5, log(2.0), ntuple(i -> 0.25 * i, 8)...)
+q = [1.5, log(2.0), (0.25 .* (1:8))...]
 observations = EIGHT_SCHOOLS_Y
 observation_scales = EIGHT_SCHOOLS_SIGMA
 
@@ -138,32 +139,6 @@ constrain_kernel = prepare(model;
 parameters = constrain_kernel(q)
 ```
 
-The numeric graph ports are typed at a `Real` boundary, while constrained
-parameters and predictions retain their concrete scalar type. The prepared
-kernel therefore specializes on ordinary `Float64` inputs and also differentiates
-cleanly through reverse-mode AD (`DifferentiationInterface` with the Enzyme
-backend):
-
-```julia
-using DifferentiationInterface
-import Enzyme
-
-# Reverse-mode Enzyme with runtime activity enabled: the prepared kernel closes
-# over constant model data (the observations and their scales) that Enzyme's
-# static activity analysis cannot prove non-differentiable. The closure is
-# annotated `Const` because only the numeric input is differentiated.
-enzyme_backend = AutoEnzyme(;
-    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-    function_annotation = Enzyme.Const,
-)
-
-density_only = prepare(model;
-    have = (:unconstrained, :observations, :observation_scales),
-    want = :density)
-logdensity(qv) = density_only(Tuple(qv), observations, observation_scales)
-gradient = DifferentiationInterface.gradient(logdensity, enzyme_backend, collect(q))
-```
-
 Generated quantities can start at an already-constrained boundary. In this
 query, planning removes the unconstrained transform, Jacobian, prior, likelihood
 reduction, and total-density recipes:
@@ -175,7 +150,7 @@ generated_kernel = prepare(model;
     want = (:pointwise, :new_group))
 
 pointwise, prediction = generated_kernel(
-    parameters, observations, observation_scales, 12.0, (0.25, -1.0))
+    parameters, observations, observation_scales, 12.0, [0.25, -1.0])
 
 prediction
 ```
