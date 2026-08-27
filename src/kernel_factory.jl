@@ -967,35 +967,37 @@ end
 # value per canonical id — never a duplicated chol_metric / @node / metric / grad_f. Val indices
 # are plan-resolved WITHIN the selected role; `current` marks only selected canonical fields.
 #
-# WORLD-AGE CLEAN: the field superset / type FAMILY is fixed (predeclared / @kernel-macro-emitted),
-# NOT emitted from @generated/runtime planning. The SAME definition under a writer vs read-only
-# integrator gets a different Plan role/mask/layout SPECIALIZATION while the struct TYPES are
-# unchanged. (This N=3 pair proves the mechanism; the @kernel macro auto-emits the per-definition
-# pair — the next increment.)
-mutable struct _CanonOwned3{F1,F2,F3,W}
-    f1::F1
-    f2::F2
-    f3::F3
-    current::NTuple{W,UInt}
+# WORLD-AGE CLEAN via a PACKAGE-LOAD PREDECLARED ARITY FAMILY (RK 05:23): `_CanonOwnedN` /
+# `_CanonSharedN` for N in 1:`_CANON_MAXN` are emitted once at package load (NOT from
+# @generated/runtime, NO @eval-per-definition, NO mutable registry, NO KernelSpec identity change).
+# The immutable Plan chooses N = the canonical field count; a layout beyond the supported arity
+# REJECTS deterministically. Same definition writer-vs-read-only → different selected layout/mask,
+# same struct family.
+abstract type _CanonOwned end
+abstract type _CanonShared end
+const _Canon = Union{_CanonOwned,_CanonShared}
+const _CANON_MAXN = 32
+for N in 1:_CANON_MAXN
+    tp = [Symbol(:F, i) for i in 1:N]
+    flds = [:($(Symbol(:f, i))::$(Symbol(:F, i))) for i in 1:N]
+    for (nm, sup) in ((Symbol(:_CanonOwned, N), :_CanonOwned), (Symbol(:_CanonShared, N), :_CanonShared))
+        @eval mutable struct $nm{$(tp...),W} <: $sup
+            $(flds...)
+            current::NTuple{W,UInt}
+        end
+    end
 end
-mutable struct _CanonShared3{F1,F2,F3,W}
-    f1::F1
-    f2::F2
-    f3::F3
-    current::NTuple{W,UInt}
-end
-const _Canon3 = Union{_CanonOwned3,_CanonShared3}
 # Val-indexed READ / WRITE — @generated to emit a LITERAL field-SYMBOL getfield/setfield! for the
 # concrete layout (RK 05:08/05:12), so per-slot mutation is exactly 0-B for mixed scalars + arrays
 # (a runtime-Int `setfield!` would box). `_canon_set!` replaces a scalar/isbits field; array buffers
 # are mutated in place by `_canon_copy_slot!`.
-@generated _canon_slot(s::_Canon3, ::Val{I}) where {I} = :(getfield(s, $(QuoteNode(fieldname(s, I)))))
-@generated function _canon_set!(s::_Canon3, ::Val{I}, v) where {I}
+@generated _canon_slot(s::_Canon, ::Val{I}) where {I} = :(getfield(s, $(QuoteNode(fieldname(s, I)))))
+@generated function _canon_set!(s::_Canon, ::Val{I}, v) where {I}
     :(setfield!(s, $(QuoteNode(fieldname(s, I))), v); s)
 end
 # Structural copy of ONE selected slot preserving array identity: `copyto!` for a mutable array
 # buffer, `setfield!` for a scalar/isbits slot. Only ever called on a SELECTED (real) field.
-@generated function _canon_copy_slot!(dest::S, src::S, ::Val{I}) where {S<:_Canon3,I}
+@generated function _canon_copy_slot!(dest::S, src::S, ::Val{I}) where {S<:_Canon,I}
     fn = QuoteNode(fieldname(S, I))
     quote
         d = getfield(dest, $fn)
@@ -1003,4 +1005,23 @@ end
         dest
     end
 end
-_canon_current_mask(s::_Canon3) = getfield(s, :current)
+_canon_current_mask(s::_Canon) = getfield(s, :current)
+
+# The concrete family member for a given arity — a COMPILE-TIME type lookup (no runtime Symbol
+# dispatch, no runtime emission). A layout wider than the predeclared family throws a deterministic
+# reject at the @generated boundary (per-N specialization → type-stable / @inferred, RK 05:24).
+@generated function _canon_owned_type(::Val{N}) where {N}
+    N <= _CANON_MAXN ? Symbol(:_CanonOwned, N) :
+        :(throw(_KernelFactoryReject("canonical layout arity $($N) exceeds family max $_CANON_MAXN")))
+end
+@generated function _canon_shared_type(::Val{N}) where {N}
+    N <= _CANON_MAXN ? Symbol(:_CanonShared, N) :
+        :(throw(_KernelFactoryReject("canonical layout arity $($N) exceeds family max $_CANON_MAXN")))
+end
+# Construct an owned / shared canonical object from its selected field values + mask. `role` is a
+# `Val{:owned}`/`Val{:shared}` (NOT a runtime Symbol), and the arity is compile-time from the Tuple
+# TYPE — so construction is fully type-stable / @inferred.
+@inline _canon_construct(::Val{:owned}, values::Tuple, mask::NTuple) =
+    _canon_owned_type(Val(length(values)))(values..., mask)
+@inline _canon_construct(::Val{:shared}, values::Tuple, mask::NTuple) =
+    _canon_shared_type(Val(length(values)))(values..., mask)

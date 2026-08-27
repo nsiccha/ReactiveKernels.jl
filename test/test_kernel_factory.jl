@@ -813,6 +813,19 @@ end
             @test RKS._canon_slot(o, Val(2)) === buf                                   # array identity kept
             @test RKS._canon_slot(o, Val(2)) == T[7, 8]                                # values transferred
         end
+
+        # PACKAGE-LOAD ARITY FAMILY (RK 05:23/05:24): construction picks N from the plan at COMPILE
+        # time (Val-role dispatch, arity from the Tuple TYPE) — fully type-stable / @inferred; the
+        # family is predeclared at load (no runtime emission), a layout beyond max REJECTS.
+        o2 = @inferred RKS._canon_construct(Val(:owned), (1.0, [2.0]), RKS._owner_mask(2, [1, 2]))
+        @test o2 isa RKS._CanonOwned2 && RKS._canon_slot(o2, Val(1)) == 1.0
+        s2 = @inferred RKS._canon_construct(Val(:shared), (nothing, [3.0]), RKS._owner_mask(2, [2]))
+        @test s2 isa RKS._CanonShared2 && RKS._canon_slot(s2, Val(1)) === nothing
+        @test RKS._canon_owned_type(Val(5)) === RKS._CanonOwned5   # world-age-clean compile-time lookup
+        @test RKS._canon_shared_type(Val(1)) === RKS._CanonShared1
+        # a layout wider than the predeclared family arity rejects deterministically
+        wide = ntuple(i -> Float64(i), RKS._CANON_MAXN + 1)
+        @test_throws RKS._KernelFactoryReject RKS._canon_construct(Val(:owned), wide, RKS._owner_mask(length(wide)))
     end
 
     @testset "poc binder/plan seam accessors (RK 04:41)" begin
