@@ -251,7 +251,12 @@ for f in (Base.:+, Base.:-, Base.:*, Base.:/, Base.:\, Base.:^, Base.:%,
           Base.sum, Base.prod, Base.zero, Base.one, Base.oftype, Base.convert,
           Base.float, Base.inv, Base.sign, Base.clamp, Base.hypot, Base.mod, Base.rem,
           Base.length, Base.size, Base.eltype, Base.getindex, Base.first, Base.last,
-          LinearAlgebra.dot, LinearAlgebra.norm)
+          Base.isnothing, Base.isfinite, Base.isinf, Base.isnan, Base.iszero, Base.isequal,
+          Base.ifelse, Base.signbit, Base.floor, Base.ceil, Base.round, Base.log2, Base.log10,
+          Base.:(:), Base.OneTo, Base.eachindex, Base.eachcol, Base.eachrow, Base.axes,
+          Base.broadcasted, Base.materialize, Base.mapreduce, Base.reduce, Base.map, Base.filter,
+          LinearAlgebra.dot, LinearAlgebra.norm, LinearAlgebra.cholesky, LinearAlgebra.logdet,
+          LogExpFunctions.logaddexp, LogExpFunctions.logsumexp)
     push!(_KERNEL_PURE_PRIMS, f)
 end
 _kernel_pure_primitive(ref::GlobalRef) =
@@ -284,6 +289,9 @@ end
 _env_merge(a::Dict{Symbol,_Places}, b::Dict{Symbol,_Places}) =
     Dict{Symbol,_Places}(k => union(get(a, k, _Places()), get(b, k, _Places()))
                          for k in union(keys(a), keys(b)))
+
+_env_equal(a::Dict{Symbol,_Places}, b::Dict{Symbol,_Places}) =
+    keys(a) == keys(b) && all(a[k] == get(b, k, _Places()) for k in keys(a))
 
 # Mutable closure state: the growing owned top-field set + per-MethodId formal-write summary
 # (RK block pt 2 — keyed by declaration MethodId, NOT name, so overloads don't collapse).
@@ -330,6 +338,28 @@ function _own_reject_opaque!(n::_OpCall, env::Dict{Symbol,_Places})
     end
 end
 
+# Does a MethodId accept `npos` positional actuals? (`npos_opt == _KMIR_POSSPLAT` ⇒ vararg.)
+_own_arity_matches(mid::MethodId, npos::Int) =
+    mid.npos_req <= npos <= mid.npos_req + mid.npos_opt
+
+# SIBLING call formal-write mapping (RK block pt 2+4). Candidates come arity/kw-matched from the
+# IR but NOT type-narrowed. TEMPLATE unions all candidates (over-approx). AUTHORITATIVE requires
+# the candidates to AGREE on the mapped write-set — if same-arity overloads DISAGREE (a read-only
+# vs a writer), it is not finalizable without concrete arg-type narrowing → REJECT.
+function _own_sibling!(st::_OwnState, cur::MethodId, x, env::Dict{Symbol,_Places})
+    isempty(x.candidates) && return
+    perpos = [get(st.formalw, c.id, Set{Int}()) for c in x.candidates]
+    if st.require_fields && length(perpos) > 1 && !all(==(perpos[1]), perpos)
+        throw(_KernelFactoryReject(
+            "sibling call `$(x.name)` has same-arity overloads with DIFFERENT write effects " *
+            "$(perpos); the authoritative closure cannot finalize it without concrete arg-type " *
+            "narrowing (template over-approximates; add typed specialization)"))
+    end
+    for s in perpos, p in s
+        1 <= p <= length(x.pos) && _own_record!(st, cur, _kernel_place_of(x.pos[p], env))
+    end
+end
+
 # Effects of ONE expression node given the current env (writes recorded; opaque calls checked).
 function _own_expr_effects!(st::_OwnState, cur::MethodId, x, env::Dict{Symbol,_Places})
     if x isa _RegisteredCall
@@ -364,24 +394,25 @@ function _own_expr_effects!(st::_OwnState, cur::MethodId, x, env::Dict{Symbol,_P
         end
         # reg === nothing (resolved no-effect) → no write
     elseif x isa _SubjectMethodCall
-        # RK block pt 4: resolve the subject method against THIS owner's methods; a subject
-        # method owns its receiver ONLY if a matching method writes its receiver/formals.
-        cands = get(st.byid, x, nothing)   # placeholder — resolved below via name lookup
-        writes = false
+        # RK block pt 3: EXACT resolution — match owner methods by name AND arity (self-subject).
+        # A matched method writes the RECEIVER iff it self-writes; its formal-writes map to the
+        # actuals. A pure overload contributes nothing. An external/unresolved subject method on
+        # a reactive receiver is conservatively treated as writing it (sound over-approx; the
+        # receiver is a formal for a thin entry like `nuts!!`, so this propagates, never spurious).
+        npos = length(x.pos)
+        matched = false
         for (mid, mir) in st.byid
-            mid.name === x.name || continue
-            (!isempty(get(st.formalw, mid, Set{Int}())) ||
-             any(w -> w[2] isa Tuple && !isempty(w[2]), write_roots(mir))) && (writes = true)
-        end
-        writes && _own_record!(st, cur, _kernel_place_of(x.subject, env))
-    elseif x isa _Call || x isa _CallExpr
-        # RK block pt 2: a sibling call in EXPRESSION position (e.g. `finish!(ep) =
-        # start!(__self__, ep)`) maps candidate formal-writes back onto the actuals too.
-        for c in x.candidates
-            for p in get(st.formalw, c.id, Set{Int}())
-                1 <= p <= length(x.pos) && _own_record!(st, cur, _kernel_place_of(x.pos[p], env))
+            (mid.name === x.name && _own_arity_matches(mid, npos)) || continue
+            matched = true
+            any(w -> w[2] isa Tuple && !isempty(w[2]), write_roots(mir)) &&
+                _own_record!(st, cur, _kernel_place_of(x.subject, env))
+            for p in get(st.formalw, mid, Set{Int}())
+                1 <= p <= npos && _own_record!(st, cur, _kernel_place_of(x.pos[p], env))
             end
         end
+        matched || _own_record!(st, cur, _kernel_place_of(x.subject, env))
+    elseif x isa _Call || x isa _CallExpr
+        _own_sibling!(st, cur, x, env)          # RK block pt 2 (expression-position siblings)
     elseif x isa _OpCall
         _own_reject_opaque!(x, env)
     end
@@ -410,22 +441,30 @@ function _own_stmt!(st::_OwnState, cur::MethodId, s, env::Dict{Symbol,_Places}):
     elseif s isa _Call || s isa _CallExpr
         for a in s.pos; _own_walk_expr!(st, cur, a, env); end
         for kv in s.kw; _own_walk_expr!(st, cur, kv.second, env); end
-        # RK block pt 2: consume the candidate MethodId set; UNION formal-writes over all
-        # candidates still possible (no factory type-narrowing here → all candidates).
-        for c in s.candidates
-            for p in get(st.formalw, c.id, Set{Int}())
-                1 <= p <= length(s.pos) && _own_record!(st, cur, _kernel_place_of(s.pos[p], env))
-            end
-        end
+        _own_sibling!(st, cur, s, env)           # RK block pt 2+4 (statement-position siblings)
     elseif s isa _If
         _own_walk_expr!(st, cur, s.cond, env)
         te = env; for t in s.thenb; te = _own_stmt!(st, cur, t, te); end
         ee = env; for e in s.elseb; ee = _own_stmt!(st, cur, e, ee); end
         env = _env_merge(te, ee)                     # phi merge (RK block pt 1)
     elseif s isa _For || s isa _While
-        cond_iter = s isa _While ? s.cond : s.iter
-        _own_walk_expr!(st, cur, cond_iter, env)
-        be = env; for b in s.body; be = _own_stmt!(st, cur, b, be); end
+        _own_walk_expr!(st, cur, s isa _While ? s.cond : s.iter, env)
+        be = copy(env)
+        if s isa _For
+            # the loop VARIABLE aliases the iterated collection's elements — `for t in trees`
+            # makes a write `t.log_weight` an owned write of `trees` (RK block pt 1).
+            itpl = _kernel_place_of(s.iter, env)
+            for v in s.var; be[v] = itpl; end
+        end
+        # RK block pt 1: iterate the body abstract-env TRANSFER to a FIXED POINT (a carried
+        # alias `t=fwd; …; t=bwd` must be visible on later iterations), recording under it.
+        while true
+            prev = be
+            cb = be
+            for b in s.body; cb = _own_stmt!(st, cur, b, cb); end
+            be = _env_merge(be, cb)
+            _env_equal(be, prev) && break
+        end
         env = _env_merge(env, be)                    # may-run-zero + loop-carry: union
     elseif s isa _Guard
         _own_walk_expr!(st, cur, s.cond, env)
@@ -439,13 +478,26 @@ function _own_stmt!(st::_OwnState, cur::MethodId, s, env::Dict{Symbol,_Places}):
     env
 end
 
-# Recurse an EXPRESSION for nested call effects (env is read-only within an expression).
+# Recurse an EXPRESSION for nested call effects. Value-position blocks/ifs carry STATEMENT
+# effects (RK block pt 2): a `_BlockExpr` threads its stmts in source order (env-updated) then
+# its value; an `_IfExpr` transfers each arm and its value — the structured (mutually-exclusive)
+# fact is retained by walking arms separately, not flattened (RK block pt 6).
 function _own_walk_expr!(st::_OwnState, cur::MethodId, x, env::Dict{Symbol,_Places})
+    if x isa _BlockExpr
+        benv = env
+        for s in x.stmts; benv = _own_stmt!(st, cur, s, benv); end
+        _own_walk_expr!(st, cur, x.value, benv)
+        return nothing
+    elseif x isa _IfExpr
+        _own_walk_expr!(st, cur, x.cond, env)
+        _own_walk_expr!(st, cur, x.thenv, env)      # arms walked separately (structured, not merged)
+        _own_walk_expr!(st, cur, x.elsev, env)
+        return nothing
+    end
     _own_expr_effects!(st, cur, x, env)
     if x isa _MExpr
         for i in 1:nfields(x)
-            f = getfield(x, i)
-            _own_walk_expr_field!(st, cur, f, env)
+            _own_walk_expr_field!(st, cur, getfield(x, i), env)
         end
     end
     nothing
