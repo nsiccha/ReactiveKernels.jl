@@ -610,3 +610,86 @@ field can never be blessed shared). A port is shared iff it is not owned.
 _kernel_factory_shared(skel; field_regs = Dict{Symbol,Any}()) =
     setdiff(Set{Symbol}(kernel_port_names(skel)),
             _kernel_factory_owned_authoritative(skel; field_regs = field_regs))
+
+# --- phase-point ENDPOINT ownership (RK PINNED structural-copy policy) ---------
+#
+# A phase-point endpoint (`euclidean_phasepoint`) is METHODLESS — its owned set is not a
+# method-body effect closure but a RECIPE-graph closure SEEDED by the integrator's declared
+# subject write-roots (`leapfrog!` writes `pos`,`mom`): a field DERIVED from an owned input is
+# owned (endpoint-dependent closure); a field derived only from read-only authority
+# (`metric`→`chol_metric`→`@node(logdet)`) stays SHARED. This is exactly copy!!'s owned set —
+# the integrator-written sources + their endpoint-dependent closures, shared authority untouched.
+
+# Port/graph accessors that work for both a stateful skeleton and a stateless `KernelSpec`
+# (a phase-point endpoint like `euclidean_phasepoint` is a methodless `KernelSpec`).
+_kernel_all_ports(spec::KernelSpec) = Tuple(spec.port_order)
+_kernel_all_ports(skel) = kernel_port_names(skel)
+_kernel_the_graph(spec::KernelSpec) = kernel_graph(spec)
+_kernel_the_graph(skel) = kernel_graph(kernel_spec(skel))
+
+# Recipe-graph closure from an explicit owned SEED.
+function _kernel_factory_recipe_closure(skel, seed::Set{Symbol})
+    owned = copy(seed)
+    graph = _kernel_the_graph(skel)
+    changed = true
+    while changed
+        changed = false
+        for r in graph.recipes
+            any(inp -> inp.name in owned, r.inputs) || continue
+            for out in r.outputs
+                out.name in owned || (push!(owned, out.name); changed = true)
+            end
+        end
+    end
+    intersect!(owned, Set{Symbol}(_kernel_all_ports(skel)))
+    owned
+end
+
+"""
+    _kernel_factory_endpoint_owned(skel, integrator) -> Set{Symbol}
+    _kernel_factory_endpoint_shared(skel, integrator) -> Set{Symbol}
+
+The owned / shared top-fields of a phase-point endpoint under `integrator` (a resolved
+`_KernelRegistration`, e.g. `leapfrog!`): owned = the integrator's subject write-roots closed
+over the endpoint recipe graph; shared = complement (read-only authority + metric-only closures).
+"""
+function _kernel_factory_endpoint_owned(skel, integrator::_KernelRegistration)
+    _kernel_reg_writes_subject(integrator) || throw(_KernelFactoryReject(
+        "endpoint integrator $(integrator.token) declares no subject write-roots — cannot seed " *
+        "endpoint ownership"))
+    _kernel_factory_recipe_closure(skel, Set{Symbol}(integrator.write_roots))
+end
+_kernel_factory_endpoint_shared(skel, integrator::_KernelRegistration) =
+    setdiff(Set{Symbol}(_kernel_all_ports(skel)),
+            _kernel_factory_endpoint_owned(skel, integrator))
+
+# --- the immutable per-object PLAN (path→typed-slot map for poc's codegen seam) ------------
+#
+# poc CONSUMES this, never recomputes ownership. `owned`/`shared` are the slot orders within
+# the `_OwnerState` owned tuple and the shared-identity tuple; `slot` maps each owner top-field
+# to `(:owned|:shared, 1-based index)` — so `phasepoint.dham_dpos` resolves to `Val{I}` on the
+# owned tuple. Concrete slot VALTYPES are filled at construction (per-specialization).
+struct _KernelPlan
+    owned::Vector{Symbol}
+    shared::Vector{Symbol}
+    slot::Dict{Symbol,Tuple{Symbol,Int}}
+end
+kernel_plan_owned(p::_KernelPlan) = p.owned
+kernel_plan_shared(p::_KernelPlan) = p.shared
+kernel_plan_slot(p::_KernelPlan, field::Symbol) = p.slot[field]
+
+# Build the plan from a computed owned/shared classification (deterministic port order).
+function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol})
+    ports = _kernel_all_ports(skel)
+    ownedv = Symbol[p for p in ports if p in owned]
+    sharedv = Symbol[p for p in ports if p in shared]
+    slot = Dict{Symbol,Tuple{Symbol,Int}}()
+    for (i, f) in enumerate(ownedv); slot[f] = (:owned, i); end
+    for (i, f) in enumerate(sharedv); slot[f] = (:shared, i); end
+    _KernelPlan(ownedv, sharedv, slot)
+end
+
+# The endpoint plan under an integrator (the map poc wires codegen against).
+_kernel_factory_endpoint_plan(skel, integrator::_KernelRegistration) =
+    _kernel_factory_plan(skel, _kernel_factory_endpoint_owned(skel, integrator),
+                         _kernel_factory_endpoint_shared(skel, integrator))

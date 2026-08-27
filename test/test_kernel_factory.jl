@@ -2,7 +2,25 @@
 # shadow package exports in the shared Pkg.test Main.
 module TestKernelFactory
 using ReactiveKernels, Test
+using LinearAlgebra
 const RKS = ReactiveKernels
+
+# Faithful euclidean_phasepoint ENDPOINT (mirrors benchmark/nuts_kernel_authoring_fixture.jl):
+# methodless — owned set is the recipe closure seeded by the integrator's subject write-roots.
+@kernel phasepoint_ep(pot_f, grad_f, metric, pos, mom) = begin
+    pot = pot_f(pos)
+    pot, dpot_dpos = grad_f(pos)
+    chol_metric = cholesky(metric)
+    dkin_dmom = chol_metric \ mom
+    kin = 0.5 * (@node(logdet(chol_metric)) + dot(mom, dkin_dmom))
+    ham = pot + kin
+    dham_dpos = dpot_dpos
+    dham_dmom = dkin_dmom
+end
+@kernel leapfrog_ep!(phasepoint; stepsize) = begin
+    @. phasepoint.mom -= stepsize * phasepoint.dham_dpos
+    @. phasepoint.pos +=       stepsize * phasepoint.dham_dmom
+end
 
 # Single-object owned/shared fixture: method `add!` writes `total`; `combined` derives
 # from `total`; `scale` is a constant recipe; `seed` is an unwritten source.
@@ -320,6 +338,34 @@ end
         # still close, but the summary is keyed by MethodId, not the collapsed name.
         ids = [ir.id for ir in RKS.method_irs(nutsowner) if ir.id.name === Symbol("start!")]
         @test length(ids) == 2
+    end
+
+    @testset "phase-point ENDPOINT ownership + path→slot plan (RK copy!! policy, step 4)" begin
+        integ = RKS.kernel_registration(leapfrog_ep!)
+        @test integ.write_roots == (:mom, :pos) || integ.write_roots == (:pos, :mom)
+        owned = RKS._kernel_factory_endpoint_owned(phasepoint_ep, integ)
+        shared = RKS._kernel_factory_endpoint_shared(phasepoint_ep, integ)
+        # OWNED: integrator-written sources + endpoint-dependent closures
+        for f in (:pos, :mom, :pot, :dpot_dpos, :dkin_dmom, :kin, :ham, :dham_dpos, :dham_dmom)
+            @test f in owned
+        end
+        # SHARED: read-only authority + metric-only closures (chol_metric, @node(logdet))
+        for f in (:pot_f, :grad_f, :metric, :chol_metric)
+            @test f in shared && !(f in owned)
+        end
+        @test any(occursin("node", String(f)) for f in shared)   # @node(logdet) shared
+        @test isempty(intersect(owned, shared))
+
+        # the immutable path→typed-slot PLAN poc consumes (never recomputes ownership)
+        plan = RKS._kernel_factory_endpoint_plan(phasepoint_ep, integ)
+        @test RKS.kernel_plan_slot(plan, :pos)[1] === :owned
+        @test RKS.kernel_plan_slot(plan, :dham_dpos)[1] === :owned
+        @test RKS.kernel_plan_slot(plan, :metric)[1] === :shared
+        # slot indices are 1-based and contiguous within each tuple
+        @test Set(RKS.kernel_plan_slot(plan, f)[2] for f in RKS.kernel_plan_owned(plan)) ==
+              Set(1:length(RKS.kernel_plan_owned(plan)))
+        # every owner field is classified exactly once (owned XOR shared)
+        @test length(owned) + length(shared) == length(RKS._kernel_all_ports(phasepoint_ep))
     end
 end
 
