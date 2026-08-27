@@ -101,9 +101,12 @@ end
     end
 
     @testset "identity-bound primitive effect registry" begin
-        # exact Base.fill! / copy!! resolve to their declared destination write (positional 1)
+        # exact Base.fill! resolves to its declared destination write (positional 1)
         @test RKS._kernel_primitive_effect(Base.fill!).writes == (1,)
-        @test RKS._kernel_primitive_effect(copy!!).writes == (1,)
+        # copy!! is NOT a generic positional primitive — it is the structural :intrinsic
+        # (owned-closure copy, result===dest), carried by its own registration.
+        @test RKS._kernel_primitive_effect(copy!!) === nothing
+        @test RKS.kernel_registration(copy!!).kind === :intrinsic
         # a LOCAL function named `fill!` is NOT the registered identity → reject
         local myfill! = (a, b) -> a
         @test RKS._kernel_primitive_effect(myfill!) === nothing

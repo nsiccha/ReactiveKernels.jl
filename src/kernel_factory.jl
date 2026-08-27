@@ -202,15 +202,21 @@ end
 # the RIGHT reason — its exact identity is registered with a declared destination write —
 # NOT because it is `.`-qualified or bang-suffixed.
 
-# Declared effect of a primitive: the positional actual indices that are WRITES; every
-# other positional is a READ (source order retained).
+# Declared effect of a VALUE-POSITION primitive: the positional actual indices that are
+# WRITES; every other positional is a READ (source order retained). This is for
+# positional-effect primitives only (e.g. `Base.fill!`). `copy!!` is NOT one of these —
+# it is the RK-core `:intrinsic` with STRONGER STRUCTURAL semantics (destination
+# owned-CLOSURE copy, shared authority untouched, `result === dest`, shape/type checks),
+# carried by its own registration, never flattened to a positional write here.
 struct _PrimitiveEffect
     writes::Tuple{Vararg{Int}}
+    # NOTE: `Base.fill!` is currently admitted in DISCARDED-effect position only; a
+    # declared result-alias policy is needed before any value-position use.
 end
 
-# The registry is a pure DISPATCH function on the resolved VALUE identity (no mutable
-# registry, no global reread). `nothing` = not an RK-core primitive.
+# The registry is a pure DISPATCH on the resolved VALUE identity — used AT OWNER DEFINITION
+# (capture time), so its result can be SNAPSHOTTED detached (never reread at analysis, and
+# no mutable registry). `nothing` = not an RK-core value-position primitive.
 _kernel_primitive_effect(@nospecialize(v)) =
     v === Base.fill! ? _PrimitiveEffect((1,)) :    # fill!(dest, x): dest = write, x = read
-    v === copy!!     ? _PrimitiveEffect((1,)) :    # copy!!(dest, src): dest = write, src = read
     nothing
