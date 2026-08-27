@@ -56,6 +56,39 @@ function _kernel_factory_local_owned_seed(skel)
     intersect!(owned, Set{Symbol}(kernel_port_names(skel)))
 end
 
+# --- authoritative ownership closure -----------------------------------------
+#
+# The AUTHORITATIVE owned set = local seed ∪ call-induced writes, then closed over the
+# recipe dep graph (an output derived from an owned field is owned). SHARED authority is
+# the complement — valid ONLY after this closed resolution — unified by captured value
+# identity at construction. `_kernel_factory_local_owned_seed` alone is NOT authoritative
+# (it misses `copy!!(init,…)` / `step_f(fwd)` call effects). Downstream layout consumes
+# THIS, never the local seed.
+#
+# NOTE (opaque-reject, RK 2026-08-27): opaque UNRESOLVED self-mutations must reject rather
+# than be guessed shared. That rule needs one clarification before it can be enforced
+# soundly here — the shadowing gate ALLOWS `Base.fill!`, a qualified opaque self-mutation
+# on an owned buffer, so "reject any opaque self-write" is not blanket. Flagged to RK; the
+# reject predicate lands once the sanctioned-opaque category is pinned. For now the closure
+# is derived; construction (later) is where an unresolvable effect becomes unconstructable.
+function _kernel_factory_owned_closure(skel)
+    owned = union(_kernel_factory_direct_writes(skel), _kernel_factory_call_writes(skel))
+    graph = kernel_graph(kernel_spec(skel))
+    changed = true
+    while changed
+        changed = false
+        for r in graph.recipes
+            any(inp -> inp.name in owned, r.inputs) || continue
+            for out in r.outputs
+                out.name in owned || (push!(owned, out.name); changed = true)
+            end
+        end
+    end
+    fields = Set{Symbol}(kernel_port_names(skel))
+    intersect!(owned, fields)
+    (owned = owned, shared = setdiff(fields, owned))
+end
+
 # --- transitive ownership: call-induced writes -------------------------------
 #
 # Local `write_roots` MISS owner fields mutated THROUGH a call (RK 2026-08-27):

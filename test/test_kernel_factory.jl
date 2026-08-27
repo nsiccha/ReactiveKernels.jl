@@ -89,6 +89,17 @@ end
         @test isempty(RKS._kernel_factory_direct_writes(callowner))
         @test :s in RKS._kernel_factory_call_writes(callowner)
     end
+
+    @testset "authoritative ownership closure (supersedes local seed)" begin
+        oc = RKS._kernel_factory_owned_closure(callowner)
+        # `s` is owned via the copy!! call — the LOCAL seed MISSES it, the closure catches it
+        @test :s in oc.owned
+        @test !(:s in RKS._kernel_factory_local_owned_seed(callowner))
+        # sources `x`/`y` (unwritten) are SHARED authority, valid only after closure
+        @test :x in oc.shared && :y in oc.shared
+        @test isempty(intersect(oc.owned, oc.shared))
+        @test union(oc.owned, oc.shared) == Set(RKS.kernel_port_names(callowner))
+    end
 end
 
 end # module TestKernelFactory
