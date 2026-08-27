@@ -610,6 +610,11 @@ end
         @test_throws ArgumentError RKS._effect_rng(rngfn, 2, 3)   # rngpos 3 ∉ 1:2
         @test_throws ArgumentError RKS._effect_check(2, (0,), "x")   # position 0 out of range
         @test_throws ArgumentError RKS._effect_check(3, (1, 1), "x") # duplicate positions
+        @test_throws ArgumentError RKS._effect_check(0, (), "x")     # zero arity rejected (positive only)
+        @test_throws ArgumentError RKS._effect_check(-1, (), "x")    # negative arity rejected
+        # Random.rand 2-positional ordered-RNG built-in (rand(rng, Bool) in step!)
+        rd = RKS._kernel_primitive_effect(Random.rand)
+        @test rd.kind === :rng && rd.rng_arg == 1 && rd.writes == () && rd.reads == (1, 2)
     end
 end
 

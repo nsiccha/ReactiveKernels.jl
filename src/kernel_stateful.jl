@@ -788,7 +788,9 @@ Base.:(==)(a::_PrimitiveEffect, b::_PrimitiveEffect) =
 
 # Validate declared positional metadata is IN RANGE (1:arity) and NON-DUPLICATE (RK 04:29).
 function _effect_check(arity::Int, positions, what::String)
-    arity >= 0 || throw(ArgumentError("effect arity must be ≥ 0, got $arity"))
+    # A declared effect describes a positional subject/read contract, so arity must be POSITIVE
+    # (RK 04:33); a zero-arg effect would need a separate explicit contract, not a silent admit.
+    arity > 0 || throw(ArgumentError("declared effect arity must be > 0, got $arity"))
     for p in positions
         1 <= p <= arity || throw(ArgumentError(
             "declared effect $what position $p out of range 1:$arity"))
@@ -818,6 +820,10 @@ _kernel_primitive_effect(@nospecialize(v)) =
     #   lmul!(A, dest): reads matrix A (arg 1) + dest (arg 2), writes dest (arg 2), result aliases dest.
     v === LinearAlgebra.lmul! ?
         _EffectDescriptor(Symbol("__rk_effect_LinearAlgebra_lmul!__"), 2, (2,), (1, 2), 2, :effect, :none, (), nothing) :
+    #   rand(rng, T): the 2-positional ordered-RNG form (`rand(rng, Bool)` in step!) — RNG is arg 1,
+    #   no reactive WRITE (returns a fresh value); reads both actuals.
+    v === Random.rand ?
+        _EffectDescriptor(Symbol("__rk_rng_Random_rand__"), 2, (), (1, 2), nothing, :rng, :ordered, (), 1) :
     nothing
 
 # --- explicit exact-identity DECLARED effects for author helpers (RK ruling A/B) ----
