@@ -90,17 +90,26 @@ end
         @test :s in RKS._kernel_factory_call_writes(callowner)
     end
 
-    @testset "owned SEED heuristic (PROVISIONAL — not authoritative/layout)" begin
+    @testset "owned SEED heuristic (PROVISIONAL, owned-candidate ONLY)" begin
         # direct-subject case only: `copy!!(s, y)` has `s` as a direct first-actual, so the
-        # seed catches it. This is a heuristic — the AUTHORITATIVE inter-procedural closure
-        # (call-graph/formal-to-actual fixed point) supersedes it and is required for the
-        # real fixture (fwd/bwd reach the integrator only through the sibling ep chain).
-        oc = RKS._kernel_factory_owned_seed(callowner)
-        @test :s in oc.owned
+        # seed catches it. NO shared complement from a seed — `shared` is created only by
+        # the authoritative API (call-graph/formal-to-actual fixed point + unresolved reject).
+        owned = RKS._kernel_factory_owned_seed(callowner)
+        @test owned isa Set{Symbol}
+        @test :s in owned
         @test !(:s in RKS._kernel_factory_local_owned_seed(callowner))
-        @test :x in oc.shared && :y in oc.shared
-        @test isempty(intersect(oc.owned, oc.shared))
-        @test union(oc.owned, oc.shared) == Set(RKS.kernel_port_names(callowner))
+    end
+
+    @testset "identity-bound primitive effect registry" begin
+        # exact Base.fill! / copy!! resolve to their declared destination write (positional 1)
+        @test RKS._kernel_primitive_effect(Base.fill!).writes == (1,)
+        @test RKS._kernel_primitive_effect(copy!!).writes == (1,)
+        # a LOCAL function named `fill!` is NOT the registered identity → reject
+        local myfill! = (a, b) -> a
+        @test RKS._kernel_primitive_effect(myfill!) === nothing
+        # foreign callables (qualified or not) are not registered → reject
+        @test RKS._kernel_primitive_effect(sin) === nothing
+        @test RKS._kernel_primitive_effect(println) === nothing
     end
 end
 

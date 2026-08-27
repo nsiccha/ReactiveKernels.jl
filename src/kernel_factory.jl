@@ -72,6 +72,9 @@ end
 # ONLY when its captured identity has a detached primitive effect descriptor (else REJECT);
 # (5) iterate to a FIXED POINT before shared=complement/layout. This `*_seed` is a
 # heuristic ONLY — never a layout source.
+# Returns ONLY the owned CANDIDATE `Set{Symbol}` — NO shared complement. `shared` is
+# created by exactly ONE API, after the authoritative closure + unresolved-effect
+# rejection (RK 2026-08-27), never from a seed.
 function _kernel_factory_owned_seed(skel)
     owned = union(_kernel_factory_direct_writes(skel), _kernel_factory_call_writes(skel))
     graph = kernel_graph(kernel_spec(skel))
@@ -85,9 +88,8 @@ function _kernel_factory_owned_seed(skel)
             end
         end
     end
-    fields = Set{Symbol}(kernel_port_names(skel))
-    intersect!(owned, fields)
-    (owned = owned, shared = setdiff(fields, owned))
+    intersect!(owned, Set{Symbol}(kernel_port_names(skel)))
+    owned
 end
 
 # --- transitive ownership: call-induced writes -------------------------------
@@ -189,3 +191,26 @@ function _kernel_resolve_callable_or_reject(name::Symbol, v)
         "(or a `partial(...)` binder of one), never an opaque Julia callable."))
     reg
 end
+
+# --- identity-bound RK-core primitive effect registry (RK 2026-08-27) ---------
+#
+# A call touching a reactive/self/subject place is admissible ONLY when its CAPTURED
+# CALLABLE IDENTITY has a detached effect descriptor — a registered @kernel / sibling
+# method / core intrinsic, OR an RK-core PRIMITIVE registered here by EXACT identity.
+# Qualification and `!`-spelling are NOT effect evidence (locked compiler boundary:
+# ordinary Julia is opaque unless explicitly registered). `Base.fill!` is sanctioned for
+# the RIGHT reason — its exact identity is registered with a declared destination write —
+# NOT because it is `.`-qualified or bang-suffixed.
+
+# Declared effect of a primitive: the positional actual indices that are WRITES; every
+# other positional is a READ (source order retained).
+struct _PrimitiveEffect
+    writes::Tuple{Vararg{Int}}
+end
+
+# The registry is a pure DISPATCH function on the resolved VALUE identity (no mutable
+# registry, no global reread). `nothing` = not an RK-core primitive.
+_kernel_primitive_effect(@nospecialize(v)) =
+    v === Base.fill! ? _PrimitiveEffect((1,)) :    # fill!(dest, x): dest = write, x = read
+    v === copy!!     ? _PrimitiveEffect((1,)) :    # copy!!(dest, src): dest = write, src = read
+    nothing
