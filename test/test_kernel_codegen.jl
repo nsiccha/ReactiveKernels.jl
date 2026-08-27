@@ -497,6 +497,28 @@ Base.getproperty(::_CgEvilProp, ::Symbol) = error("side-effecting getproperty mu
     @test_throws RK._LLowerReject RK._kernel_property(_CgEvilProp(), Val(:x))                # rejected, not run
 end
 
+@testset "codegen — representation census (WIP): refresh_momentum!! + nuts_stats! exact identities, non-opaque" begin
+    # RK 05:36/05:47: the final ccb source adds refresh_momentum!! + nuts_stats!; assert their exact Mode-2
+    # identities are non-opaque (fold into test_kernel_methodir's 8-kernel loop on the rebase).
+    # refresh: registered Random.randn!/LinearAlgebra.lmul! ORDERED primitive effects; mom write + chol read.
+    rir = RK.method_irs(_CgRefreshFix.refresh!!)[1]
+    @test rir.ok && :opaque_call ∉ rir.effects                     # non-opaque
+    reffs = [st.expr for st in rir.body if st isa RK._ExprStmt]
+    @test length(reffs) == 2 && all(c -> c isa RK._RegisteredCall && c.registration.kind === :primitive, reffs)
+    @test getfield(reffs[1].registration, :source) === Random.randn!         # ordered: randn! first
+    @test getfield(reffs[2].registration, :source) === LinearAlgebra.lmul!   # then lmul!
+    @test getfield(reffs[1].registration, :primitive_effect).rng_arg === 1   # runtime rng ordering
+    @test getfield(reffs[1].registration, :primitive_effect).writes == (2,)  # mom-only write closure
+    # nuts_stats: scalar subject writes n_steps/acceptance_rate; declared smooth/min1exp (NOT opaque).
+    sir = RK.method_irs(_CgStatsFix.probe_stats!)[1]
+    @test sir.ok && :opaque_call ∉ sir.effects
+    owners = [w.owner[1] for w in RK._exec_place_writes(sir)]
+    @test :n_steps in owners && :acceptance_rate in owners
+    accw = only(w for w in RK._exec_place_writes(sir) if w.owner == (:acceptance_rate,))
+    @test accw.rhs isa RK._RegisteredCall && accw.rhs.registration.kind === :declared_effect  # smooth declared
+    @test getfield(accw.rhs.args[2].registration, :source) === _CgStatsFix.min1exp             # nested min1exp declared
+end
+
 @testset "codegen — an exec whose selected Recipe has no bound applier is REJECTED" begin
     seam = _cg_seam()
     @test_throws RK._LLowerReject RK.compile_leaf(_cg_ir(), seam,
