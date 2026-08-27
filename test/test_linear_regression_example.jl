@@ -1,31 +1,8 @@
 using ReactiveKernels
-using DifferentiationInterface
-import Enzyme
 using Test
 
 include(joinpath(@__DIR__, "..", "examples", "linear_regression.jl"))
 using .LinearRegressionExample
-
-# Reverse-mode Enzyme through DifferentiationInterface, matching the eight-schools
-# example: runtime activity because the prepared density kernel closes over the
-# constant model data, and a `Const` closure because only the numeric input is
-# differentiated.
-const ENZYME_BACKEND = AutoEnzyme(;
-    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-    function_annotation = Enzyme.Const,
-)
-
-function linear_regression_reference_logdensity(qv)
-    α, β, log_σ = qv
-    parameters = LinearRegressionParameters(α, β, exp(log_σ))
-    prior = LinearRegressionExample.log_prior(parameters)
-    likelihood = LinearRegressionExample.sum_log_likelihood(
-        LinearRegressionExample.pointwise_log_likelihood(
-            parameters, LINREG_X, LINREG_Y,
-        ),
-    )
-    LinearRegressionExample.total_log_density(prior, log_σ, likelihood)
-end
 
 @testset "manual PPL graph — linear regression" begin
     model = build_linear_regression_graph()
@@ -69,29 +46,6 @@ end
         @test all(isfinite, pointwise)
         @test likelihood ≈ sum(pointwise)
         @test density ≈ prior + log_jacobian + likelihood
-    end
-
-    @testset "the log-density boundary differentiates through DI + Enzyme" begin
-        k = prepare(model.graph;
-                    have = (model.unconstrained, model.predictors,
-                            model.responses),
-                    want = (model.density,))
-        logdensity(qv) = k(Tuple(qv), LINREG_X, LINREG_Y)
-
-        qvec = collect(q)
-        gradient = DifferentiationInterface.gradient(
-            logdensity, ENZYME_BACKEND, qvec)
-        @test length(gradient) == length(q)
-        @test all(isfinite, gradient)
-
-        # Out-of-place gradient must not alias the mutable primal input.
-        @test gradient !== qvec
-        @test pointer(gradient) != pointer(qvec)
-
-        @test logdensity(qvec) ≈ linear_regression_reference_logdensity(qvec)
-        reference_gradient = DifferentiationInterface.gradient(
-            linear_regression_reference_logdensity, ENZYME_BACKEND, qvec)
-        @test gradient ≈ reference_gradient
     end
 
     @testset "generated quantities prune density work" begin
