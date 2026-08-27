@@ -150,6 +150,23 @@ function _derive_public_root_ops(nuts_ir::MethodIR, root_name::Symbol, runtimear
     [:refresh, :step]
 end
 
+# TOTAL validation of a captured stats callback MethodIR (RK): zero authored formals; the body is EXACTLY a
+# run of admitted non-dot diagnostic-scalar place-writes then `return __self__` — any extra ExprStmt/call/
+# local/control/post-return statement is REJECTED (never silently dropped, so an added effect cannot vanish);
+# and the written diag slots EXACTLY match the binding's declared `produced` set. Callback-generic (no name).
+function _validate_stats_body(stats_ir::MethodIR, produced)
+    isempty(stats_ir.formals) || _l_reject("stats callback must take no authored formals; got $(stats_ir.formals)")
+    sb = stats_ir.body
+    (!isempty(sb) && sb[end] isa _Return && getfield(sb[end], :value) isa _SelfRef) ||
+        _l_reject("stats callback must end with `return __self__`")
+    pws = sb[1:end-1]
+    all(pw -> pw isa _PlaceWrite && pw.target isa _SelfField && length(pw.target.path) == 1 && haskey(_DIAG, pw.target.path[1]) && !pw.dot, pws) ||
+        _l_reject("stats callback body must be ONLY non-dot diagnostic-scalar place-writes then `return __self__` (no extra statement); got $([nameof(typeof(s)) for s in sb])")
+    Tuple(sort!(Int[_DIAG[pw.target.path[1]] for pw in pws])) == Tuple(sort!(collect(Int, produced))) ||
+        _l_reject("stats write targets $(Tuple(_DIAG[pw.target.path[1]] for pw in pws)) do not match binding produced $produced")
+    nothing
+end
+
 # derived endpoint fields (have a producer) — read of one must demand-ensure; source fields read raw.
 function derived_fields(pf)
     plan = kernel_prepared_plan(pf); fc = _lf_canon_map(plan)
@@ -220,7 +237,7 @@ function nfieldcall(x, lm, C::NCtx)
         # nuts_stats! writes on the SAME frame (n_steps/acceptance_rate resolve to diag slots via nwrite) — the
         # stats callable is NEVER dynamically invoked — then marks its produced diag slots via _stats_produced!.
         C.stats_noeffect && return :nothing
-        writes = Any[nwrite(pw, lm, C) for pw in C.stats_ir.body if pw isa _PlaceWrite]
+        writes = Any[nwrite(pw, lm, C) for pw in C.stats_ir.body[1:end-1]]   # validated: all diag-scalar writes
         Expr(:block, writes...,
              :(_stats_produced!(Core.getfield($(C.S), :diag), Core.getfield($(C.S), :stats))), :nothing)
     else
@@ -657,11 +674,7 @@ function compile_nuts(pf::_PreparedFactory, skel, refresh_skel, nuts_root_skel, 
         sirs = method_irs(stats_binding_source(binding))
         (length(sirs) == 1 && sirs[1].ok) || _l_reject("stats_f must resolve to exactly one ok method")
         stats_ir = sirs[1]
-        pws = [pw for pw in stats_ir.body if pw isa _PlaceWrite]
-        (all(pw -> pw.target isa _SelfField && length(pw.target.path) == 1 && haskey(_DIAG, pw.target.path[1]) && !pw.dot, pws)) ||
-            _l_reject("effectful stats writes must be non-broadcast diagnostic-scalar place-writes; got $(pws)")
-        Tuple(sort!(Int[_DIAG[pw.target.path[1]] for pw in pws])) == Tuple(sort!(collect(Int, stats_binding_produced(binding)))) ||
-            _l_reject("effectful stats write targets $(Tuple(_DIAG[pw.target.path[1]] for pw in pws)) do not match binding produced $(stats_binding_produced(binding))")
+        _validate_stats_body(stats_ir, stats_binding_produced(binding))
     end
     # capacity: the mutual start!/finish! recursion + the depth loop bound the frame/control stacks by the
     # frame's frozen max_depth. Size generously from it (a `frame overflow`/`ctrl overflow` guard still trips

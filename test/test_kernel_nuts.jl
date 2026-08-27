@@ -184,3 +184,17 @@ end
         @test _nuts_batch0b(C.root!, frame, C.scratch, rg, Val(64)) == 0
     end
 end
+
+@testset "kernel_nuts — effectful stats validator is TOTAL: an extra effect cannot disappear" begin
+    good = RK.method_irs(_NutsFix.nuts_stats!)[1]; b = collect(good.body)
+    mk(body) = RK.MethodIR(good.id, good.self, good.formals, Tuple(body), good.control, good.effects,
+                           good.deps, good.kind, good.ok, good.reason, good.signature)
+    @test RK._validate_stats_body(good, (1, 3)) === nothing              # POSITIVE: real nuts_stats! validates
+    # an EXTRA non-PlaceWrite statement (a stand-in effect) before the return: a filtered census would DROP it;
+    # the total validator REJECTS it
+    @test_throws Exception RK._validate_stats_body(mk([b[1], b[2], RK._ExprStmt(RK._SelfRef()), b[3]]), (1, 3))
+    # a POST-RETURN statement rejects
+    @test_throws Exception RK._validate_stats_body(mk([b[1], b[3], b[2]]), (1, 3))
+    # produced-slot mismatch (declared vs written) rejects
+    @test_throws Exception RK._validate_stats_body(good, (1,))
+end
