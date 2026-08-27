@@ -10,12 +10,6 @@
 # stores here are the RK-sanctioned pre-rebase scaffold: the real callable concrete-frame binding lands on
 # the rebase onto syntax's approved seam (58e3903); no synthetic storage survives that.
 # ============================================================================================
-# GENERAL multi-method control-flow compiler (design B) — scratch prototype.
-# Keyed by MethodId.decl (ordinal) + resolved _CallExpr/_Call candidates. No hardcoded names.
-# Tuple of MethodIRs -> per-MethodId basic blocks + liveness -> heterogeneous typed
-# per-MethodId SoA stores + one isbits control stack -> 0-B/@inferred dispatcher.
-# Adversary: four-method mutual recursion (ping!/pong!) with DIFFERENT formal types (Int/Float64).
-
 # ============================ CFG model ============================
 struct Blk; pc::Int; effects::Vector{Any}; term::Any; end
 struct TBranch; cond; then_pc::Int; else_pc::Int; end
@@ -60,11 +54,11 @@ function build_region!(bb::BB, stmts, cont_pc::Int, ret_pc::Int, ret_val, by_mid
         vloc = Symbol("__lf_", st.lhs)                       # native local holding the helper result
         # NOTE: subsequent reads of `st.lhs` are emitted as this native local via emit machinery.
         return build_region!(bb, [_subst(x, fmap) for x in callee.body], resume, resume, vloc, by_mid, rec, brk, lcont)
-    elseif st isa _PlaceWrite || (st isa _ExprStmt && !_is_call(st.expr))
+    elseif st isa _PlaceWrite || (st isa _ExprStmt && !_is_call(st.expr)) || (st isa _LocalAssign && !_is_call(st.rhs))
         eff = Any[st]; i = 1
         while i < length(stmts)
             nx = stmts[i+1]
-            (nx isa _PlaceWrite || (nx isa _ExprStmt && !_is_call(nx.expr))) || break
+            (nx isa _PlaceWrite || (nx isa _ExprStmt && !_is_call(nx.expr)) || (nx isa _LocalAssign && !_is_call(nx.rhs))) || break
             push!(eff, nx); i += 1
         end
         tailpc = build_region!(bb, stmts[i+1:end], cont_pc, ret_pc, ret_val, by_mid, rec, brk, lcont)
@@ -120,6 +114,16 @@ function build_region!(bb::BB, stmts, cont_pc::Int, ret_pc::Int, ret_val, by_mid
         push!(bb.blks, Blk(incr, Any[_RawStmt((:incr, var))], TGoto(header)))                        # var += 1
         init = _newpc!(bb); push!(bb.blks, Blk(init, Any[_RawStmt((:init, var, lo))], TGoto(header)))  # var = lo
         return init
+    elseif st isa _While
+        after = build_region!(bb, rest, cont_pc, ret_pc, ret_val, by_mid, rec, brk, lcont)
+        if !_loop_suspends(collect(st.body), rec)
+            pc = _newpc!(bb); push!(bb.blks, Blk(pc, Any[_RawStmt((:while_native, st))], TGoto(after))); return pc
+        end
+        # SUSPENDING while -> PC machine; continue re-tests the header cond (no increment block)
+        header = _newpc!(bb)
+        body = build_region!(bb, collect(st.body), header, ret_pc, ret_val, by_mid, rec, after, header)  # brk=after, continue=header
+        push!(bb.blks, Blk(header, Any[], TBranch(st.cond, body, after)))
+        return header
     elseif st isa _Break
         brk >= 0 || error("design-B: `break` outside a loop")
         pc = _newpc!(bb); push!(bb.blks, Blk(pc, Any[], TGoto(brk))); return pc
@@ -131,6 +135,7 @@ function build_region!(bb::BB, stmts, cont_pc::Int, ret_pc::Int, ret_val, by_mid
     end
 end
 _retvalsym(v) = v  # ret_val is already the native local Symbol
+_lasym(lhs) = lhs isa Tuple ? Symbol(lhs[end]) : Symbol(lhs)   # _LocalAssign.lhs path -> local Symbol
 
 function build_method(ir, by_mid, rec)
     bb = BB(Blk[], 1)
@@ -214,7 +219,7 @@ function emit_effect(st, locals, S)
     elseif st isa _ExprStmt
         emit_val(st.expr, locals, S)
     elseif st isa _LocalAssign
-        Expr(:(=), (haskey(locals, Symbol(st.lhs)) ? locals[Symbol(st.lhs)] : Symbol(st.lhs)), emit_val(st.rhs, locals, S))
+        Expr(:(=), (haskey(locals, _lasym(st.lhs)) ? locals[_lasym(st.lhs)] : _lasym(st.lhs)), emit_val(st.rhs, locals, S))
     elseif st isa _RawStmt
         e = st.expr
         lv(v) = haskey(locals, v) ? locals[v] : error("loop local $v not stored")
@@ -225,6 +230,13 @@ function emit_effect(st, locals, S)
                 emit_effect(b, locals2, S)
             end
             Expr(:for, Expr(:(=), lvar, emit_val(fr.iter, locals, S)), Expr(:block, bodyx...))
+        elseif e isa Tuple && e[1] === :while_native
+            wr = e[2]
+            bodyx = map(wr.body) do b
+                (b isa _PlaceWrite || b isa _ExprStmt || b isa _LocalAssign) || error("native (non-suspending) while body supports only straight-line effects; got $(typeof(b))")
+                emit_effect(b, locals, S)
+            end
+            Expr(:while, emit_val(wr.cond, locals, S), Expr(:block, bodyx...))
         elseif e isa Tuple && e[1] === :init;  Expr(:(=), lv(e[2]), emit_val(e[3], locals, S))    # var = lo
         elseif e isa Tuple && e[1] === :incr; Expr(:(=), lv(e[2]), Expr(:call, +, lv(e[2]), 1))   # var += 1
         else error("emit_effect: unsupported _RawStmt $(e)") end
@@ -240,7 +252,7 @@ function spilled_locals(ir, rec)
     out = Symbol[]
     walk(x) = begin
         if x isa _For && _loop_suspends(collect(x.body), rec); push!(out, x.var[1]); end
-        if x isa _LocalAssign; push!(out, Symbol(x.lhs)); end   # authored cross-suspension local (RK 10:15 #3)
+        if x isa _LocalAssign; push!(out, _lasym(x.lhs)); end   # authored cross-suspension local (RK 10:15 #3)
         if x isa Tuple || x isa AbstractVector; for e in x; walk(e); end
         elseif x isa Pair; walk(x.second)
         elseif x isa _MExpr || x isa _MStmt; for f in fieldnames(typeof(x)); walk(getfield(x,f)); end end
@@ -253,7 +265,7 @@ function _block_writes(effects, spilled)
     w = Symbol[]
     for e in effects
         if e isa _RawStmt && e.expr isa Tuple && e.expr[1] in (:init,:incr) && e.expr[2] in spilled; push!(w, e.expr[2])
-        elseif e isa _LocalAssign && Symbol(e.lhs) in spilled; push!(w, Symbol(e.lhs)) end
+        elseif e isa _LocalAssign && _lasym(e.lhs) in spilled; push!(w, _lasym(e.lhs)) end
     end
     unique(w)
 end

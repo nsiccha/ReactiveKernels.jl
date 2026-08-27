@@ -58,6 +58,23 @@ module _CtlLoopB  # SUSPENDING for-loop with BREAK
     driverB!(m) = begin for i in 1:m; i > 3 && break; ping!(__self__, i); s.sum = s.sum + i end end
   end
 end
+module _CtlWhile  # SUSPENDING while-loop + continue; local counter i is a cross-suspension local
+  using ReactiveKernels
+  @kernel adv(s;) = begin
+    ping!(k) = begin k <= 0 && return done!(__self__); pong!(__self__, k-1) end
+    pong!(x) = begin x <= 0 && return done!(__self__); ping!(__self__, x-1) end
+    done!() = begin s.count = s.count + 1 end
+    driver!(m) = begin
+      i = 0
+      while i < m
+        i = i + 1
+        i == 2 && continue
+        ping!(__self__, i)
+        s.sum = s.sum + i
+      end
+    end
+  end
+end
 module _CtlNative  # ACYCLIC helper with a NON-suspending native for-loop (inlined natively)
   using ReactiveKernels
   @kernel adv(s;) = begin
@@ -133,4 +150,18 @@ end
     for n in 1:3; st=_CtlAcc(0); fn(st,mk(),n); @test st.acc == 6; end   # reset! native loop 1+2+3
     st=_CtlAcc(0); sc=mk(); fn(st,sc,3); fn(st,sc,3); @test (@allocated fn(st,sc,3)) == 0
     Test.@inferred fn(_CtlAcc(0), mk(), 3)
+end
+
+@testset "control — SUSPENDING while-loop + continue (skip i==2), cross-suspension local, 0-B" begin
+    irs = RKC.method_irs(_CtlWhile.adv); cap=512
+    drv = irs[findfirst(ir->ir.id.name===:driver!, irs)]
+    tm = Dict(1=>Dict(:k=>Int),2=>Dict(:x=>Int),drv.id.decl=>Dict(:m=>Int,:i=>Int))
+    fn = RKC.compile_dispatcher(irs; typemap=tm, cap=cap, root_mid=drv.id.decl)
+    SD()=RKC._FrameStore{drv.id.decl,Tuple{Vector{Int},Vector{Int}}}((Vector{Int}(undef,cap),Vector{Int}(undef,cap)))
+    mk()=(_ctl_st1(cap),_ctl_st2(cap),SD(),Vector{RKC._CtrlFrame}(undef,cap))
+    # m=4: i=1(ping,+1) i=2(continue) i=3(ping,+3) i=4(ping,+4) -> count=3, sum=8
+    st=_CtlSum(0,0); fn(st,mk(),4); @test st.count==3 && st.sum==8
+    st=_CtlSum(0,0); fn(st,mk(),5); @test st.count==4 && st.sum==1+3+4+5   # skip i==2
+    st=_CtlSum(0,0); sc=mk(); fn(st,sc,5); fn(st,sc,5); @test (@allocated fn(st,sc,5)) == 0
+    Test.@inferred fn(_CtlSum(0,0), mk(), 5)
 end
