@@ -108,12 +108,20 @@ end
 
 # ---- MethodIR RHS -> Val-slot expression (the authored ops) -----------------------------------------
 
-_exec_opsym(op::Symbol) = op
-_exec_opsym(op::GlobalRef) = op.name
-function _exec_opsym(op::Expr)
-    op.head === :. && return op.args[end] isa QuoteNode ? op.args[end].value : op.args[end]
-    _l_reject("unsupported operator expression $(op) in an authored op")
+# The emitted call head for an authored op — the EXACT captured callee identity as a canonical `GlobalRef`,
+# never collapsed to a bare spelling (RK 05:00 #3: `op.name` loses module identity and can silently bind a
+# different function). A qualified `Module.:op` `Expr` is RESOLVED to the function's defining-module
+# `GlobalRef` — preserving identity AND inlining (a raw qualified `Expr` head defeats broadcast inlining →
+# allocations). An already-`GlobalRef` op passes through; a bare `Symbol` is rejected (ambiguous identity).
+_exec_callee(op::GlobalRef) = op
+function _exec_callee(op::Expr)
+    op.head === :. || _l_reject("unsupported operator expression $(op) in an authored op")
+    f = Core.eval(Main, op)                                     # resolve the captured qualified ref -> the fn
+    GlobalRef(parentmodule(f), nameof(f))                       # canonical defining-module binding (identity)
 end
+_exec_callee(op::Symbol) = _l_reject(
+    "authored op `$op` is an UNQUALIFIED symbol — identity is ambiguous; the MethodIR must carry a " *
+    "qualified callee (GlobalRef / Module.:op) so the emitted code binds the exact function")
 
 # The local binding name for physical slot `I` inside an emitted broadcast (a plain, UNDOTTED getfield —
 # `@.` would otherwise dot the `_owner_slot`/`Val` accessor itself).
@@ -132,9 +140,12 @@ mutable struct _EmitCtx
     formals_used::Vector{Symbol}
 end
 
-# Translate a MethodIR value node to a broadcast-safe expression: `_SelfField` → the slot's UNDOTTED local
-# (bound before the broadcast); a bound method formal → its runtime LOCAL (loaded from the binder
-# NamedTuple, NEVER baked as a constant — adaptation/reconstruction-safe); ops → call trees.
+# Translate a MethodIR value node into a FUSED broadcast tree leaf/node: `_SelfField` → the slot's local
+# (a Vector leaf, bound before the broadcast); a bound method formal → its runtime LOCAL (loaded from the
+# binder NamedTuple, NEVER a baked constant — adaptation/reconstruction-safe); a literal → a scalar leaf;
+# an `_OpCall` → `Base.broadcasted(<exact-GlobalRef callee>, args...)`. The tree is FUSED (materialize!
+# writes it in place at 0 alloc) AND preserves exact callee identity — built directly rather than via
+# `@__dot__`, which only dots bare SYMBOL operators and would leave a GlobalRef head as an allocating op.
 _exec_rhs(x::_Lit, ctx::_EmitCtx) = x.value
 function _exec_rhs(x::_FormalRef, ctx::_EmitCtx)
     (x.arg in ctx.bound_names) || _l_reject(
@@ -149,7 +160,8 @@ function _exec_rhs(x::_SelfField, ctx::_EmitCtx)
     I = ctx.slotof[id]; push!(ctx.slots_used, I); _slot_local(I)
 end
 _exec_rhs(x::_OpCall, ctx::_EmitCtx) =
-    Expr(:call, _exec_opsym(x.op), (_exec_rhs(a, ctx) for a in x.args)...)
+    Expr(:call, GlobalRef(Base, :broadcasted), _exec_callee(x.op),
+         (_exec_rhs(a, ctx) for a in x.args)...)               # fused broadcast, EXACT callee identity
 
 # ---- consume the partial binder SOUNDLY (approved-only + token identity) -----------------------------
 
@@ -251,15 +263,13 @@ function compile_leaf(ir::MethodIR, seam::_KernelPlan, binder;
         if s.kind === :write
             wi += 1; pw = writes[wi]
             ctx = _EmitCtx(fieldcanon, slotof, Tuple(bound_names), Int[], Symbol[])
-            lhs = _exec_rhs(pw.target, ctx)                # slot local (an aliased buffer)
-            rhs = _exec_rhs(pw.rhs, ctx)
-            for I in unique(ctx.slots_used)                # bind each slot buffer UNDOTTED first
+            lhs = _exec_rhs(pw.target, ctx)                # slot local (the aliased buffer written in place)
+            rhs = _exec_rhs(pw.rhs, ctx)                   # fused broadcast tree (exact-identity callees)
+            for I in unique(ctx.slots_used)                # bind each slot buffer to a local first
                 push!(stmts, :($(_slot_local(I)) = _owner_slot(state, Val($I))))
             end
             for f in ctx.formals_used; f in all_formals || push!(all_formals, f); end
-            dotted = macroexpand(Base, Expr(:macrocall, GlobalRef(Base, Symbol("@__dot__")),
-                                            LineNumberNode(0, :kernel_codegen), Expr(:(=), lhs, rhs)))
-            push!(stmts, dotted)                            # in-place broadcast into the slot buffer
+            push!(stmts, Expr(:call, GlobalRef(Base, :materialize!), lhs, rhs))  # in-place fused broadcast
         elseif s.kind === :exec
             role = get(appliers, s.recipe, nothing)
             role === nothing && _l_reject("selected Recipe $(s.recipe) has no bound in-place applier")

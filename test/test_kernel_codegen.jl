@@ -182,6 +182,18 @@ end
     end
 end
 
+@testset "codegen — authored op identity is PRESERVED as a canonical GlobalRef (never bare spelling)" begin
+    # RK 05:00 #3: a bare-symbol callee could bind a different (shadowed) function. The emitted ops must be
+    # exact-identity GlobalRefs, and an unqualified authored op is rejected.
+    @test RK._exec_callee(GlobalRef(Base, :-)) === GlobalRef(Base, :-)
+    @test RK._exec_callee(:(Base.:-)) === GlobalRef(Base, :-)            # qualified Expr → canonical GlobalRef
+    @test_throws RK._LLowerReject RK._exec_callee(:-)                    # bare symbol: ambiguous identity
+    # the fused broadcast is materialize!/broadcasted (identity-preserving AND 0-alloc), not @__dot__ spelling
+    seam = _cg_seam(); _, meta = _cg_compile(seam, _cg_ir())
+    src = string(meta.body)
+    @test occursin("materialize!", src) && occursin("broadcasted", src)
+end
+
 @testset "codegen — an exec whose selected Recipe has no bound applier is REJECTED" begin
     seam = _cg_seam()
     @test_throws RK._LLowerReject RK.compile_leaf(_cg_ir(), seam,
