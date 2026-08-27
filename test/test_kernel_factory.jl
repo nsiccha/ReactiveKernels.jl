@@ -33,6 +33,25 @@ borrowfn(a) = a
 @rk_borrows borrowfn 1
 rngfn(r, x) = x
 @rk_rng rngfn 2 1
+# WRONG-ARITY: crit is declared arity 2; calling it with 1 positional must reject deterministically.
+@kernel wrongarity(x) = begin
+    go!() = begin
+        z = crit(x)
+        Base.fill!(x, z)
+    end
+end
+# REBIND adversary: a declared helper captured through a NON-const module slot; rebinding the slot
+# to a module without the helper must read as rebound (same detached-identity check as primitives).
+module Helpers; hot(a, b) = a + b; end
+@rk_pure Helpers.hot 2
+HelperMod = Helpers
+@kernel hotowner(x, y) = begin
+    go!() = begin
+        z = HelperMod.hot(x, y)
+        Base.fill!(x, z)
+    end
+end
+baremodule NoHot end
 
 # Faithful euclidean_phasepoint ENDPOINT (mirrors benchmark/nuts_kernel_authoring_fixture.jl):
 # methodless — owned set is the recipe closure seeded by the integrator's subject write-roots.
@@ -551,6 +570,19 @@ end
               RKS._kernel_declared_effect(borrowfn).kind === :pure
         @test RKS._kernel_declared_effect(rngfn).kind === :rng &&
               RKS._kernel_declared_effect(rngfn).rng_arg == 1
+
+        # WRONG ARITY: crit declared arity 2, called with 1 positional → deterministic reject
+        @test_throws RKS._KernelFactoryReject RKS._kernel_factory_owned_authoritative(wrongarity)
+
+        # REBIND: HelperMod.hot captured declared; rebinding HelperMod to a module without `hot`
+        # reads as rebound (same detached-identity re-resolution as a primitive/registered callee)
+        hc = only(c for c in RKS.kernel_callee_registrations(hotowner)
+                  if c.registration.kind === :declared_effect)
+        @test hc.target === Helpers.hot
+        @test !RKS.kernel_callee_rebound(hotowner, hc.ref)
+        @eval HelperMod = NoHot
+        @test RKS.kernel_callee_rebound(hotowner, hc.ref)
+        @eval HelperMod = Helpers
     end
 end
 
