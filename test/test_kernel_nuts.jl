@@ -65,6 +65,25 @@ end
     @test true                                                # both concrete rng types accepted, one scratch object
 end
 
+@testset "kernel_nuts — refresh math on a DENSE SPD metric matches chol.L*z + 0-B (uplo-correct, non-diagonal)" begin
+    # a DENSE (non-diagonal) SPD metric: a wrong unconditional LowerTriangular(factors) / wrong-uplo shortcut
+    # would give a different momentum than the reference `chol.L * z`; a diagonal metric would not catch it.
+    pf = _nuts_pf(); PL = RK.kernel_prepared_plan(pf); M = [2.0 0.5; 0.5 3.0]
+    d = _nuts_mkvals(pf, Float64)
+    for sl in RK.kernel_plan_slots(PL)
+        nm = String(sl.path[1]); nm == "metric" && (d[sl.canon] = M); nm == "chol_metric" && (d[sl.canon] = cholesky(M))
+    end
+    frame = RK._construct_nuts_frame(pf, d, 3; step_f = RK.partial(_NutsFix.leapfrog!; stepsize = 0.1), stats_f = nothing, min_dham = -1000)
+    RK.compile_prepared_initialization(pf, typeof(frame.init), typeof(frame.shared))(frame.init, frame.shared, RK.kernel_prepared_handles(pf))
+    RK._seed_nuts_children!(frame)
+    C = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame)
+    z = randn(Random.Xoshiro(7), 2); expected = cholesky(M).L * z    # reference: randn! then chol.L*z
+    C.refresh(frame.init, frame.shared, C.cfg.handles, Random.Xoshiro(7))   # same seed
+    @test _slot(pf, frame.init, :mom) ≈ expected                    # matches the reference on a DENSE metric
+    zerob(rf, ep, sh, h, rg) = (rf(ep, sh, h, rg); GC.gc(); @allocated rf(ep, sh, h, rg))
+    @test zerob(C.refresh, frame.init, frame.shared, C.cfg.handles, Random.Xoshiro(7)) == 0   # refresh exact 0-B
+end
+
 @testset "kernel_nuts — refresh exception safety: chol shape-throw leaves mom+dependents DIRTY (retry repairs)" begin
     pf = _nuts_pf(); frame = _nuts_frame(pf, Float64, 3)
     C = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame)

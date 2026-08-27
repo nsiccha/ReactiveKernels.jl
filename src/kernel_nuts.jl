@@ -44,8 +44,15 @@ end
 end
 @inline function (r::_CompiledRefresh{RandT, LmulT, MomSlot, CholSlot, Kills})(owned, shared, handles, rng) where {RandT, LmulT, MomSlot, CholSlot, Kills}
     _refresh_killall!(owned, Val(MomSlot), Val(Kills))               # kill mom + dependents BEFORE the writes
-    r.rand(rng, _canon_slot(owned, Val(MomSlot)))                    # randn!(rng, mom)
-    r.lmul(getproperty(_canon_slot(shared, Val(CholSlot)), :L), _canon_slot(owned, Val(MomSlot)))  # lmul!(chol.L, mom)
+    mom = _canon_slot(owned, Val(MomSlot))
+    r.rand(rng, mom)                                                 # randn!(rng, mom)
+    chol = _canon_slot(shared, Val(CholSlot))
+    # orientation-correct NON-ALLOCATING lower-factor view (RK): construct the triangular directly from the
+    # factors (inline-elidable) — `getproperty(chol,:L)` would allocate a wrapper AND could mask a wrong-uplo
+    # shortcut. uplo 'U' means factors hold the upper factor → the Cholesky L is its adjoint.
+    F = getfield(chol, :factors)
+    L = getfield(chol, :uplo) == Char(0x55) ? adjoint(LinearAlgebra.UpperTriangular(F)) : LinearAlgebra.LowerTriangular(F)
+    r.lmul(L, mom)                                                   # lmul!(chol.L, mom)
     _canon_bless!(owned, Val(MomSlot))                              # bless mom only after BOTH writes succeed
     owned
 end
@@ -67,13 +74,17 @@ function compile_refresh(pf, ::Type{OW}, ::Type{SH}, refresh_ir::MethodIR) where
     # EXACT authored shape (drives the concrete call method): [randn!(rng, self.mom), lmul!(self.chol_metric.L,
     # self.mom), return __self__]. Any drift rejects rather than mis-emitting.
     b = refresh_ir.body
-    (length(b) == 3 && b[3] isa _Return) || _l_reject("refresh_momentum!! must be exactly [randn!, lmul!, return]; got $(length(b)) statements")
+    (length(b) == 3 && b[3] isa _Return && getfield(b[3], :value) isa _SelfRef) ||
+        _l_reject("refresh_momentum!! must be exactly [randn!, lmul!, return __self__]; got $(length(b)) statements")
     (rc1, randfn) = _refresh_callable(b[1], 1)
-    (length(rc1.args) == 2 && rc1.args[1] isa _FormalRef && _is_selffield(rc1.args[2], (:mom,))) ||
-        _l_reject("refresh statement 1 must be `randn!(rng, self.mom)`; got args $(rc1.args)")
+    (length(rc1.args) == 2 && rc1.args[1] isa _FormalRef && _is_selffield(rc1.args[2], (:mom,)) && isempty(rc1.kw) && !rc1.broadcast) ||
+        _l_reject("refresh statement 1 must be `randn!(rng, self.mom)` (no kw/broadcast); got args $(rc1.args)")
     (rc2, lmulfn) = _refresh_callable(b[2], 2)
-    (length(rc2.args) == 2 && _is_selffield(rc2.args[1], (:chol_metric, :L)) && _is_selffield(rc2.args[2], (:mom,))) ||
-        _l_reject("refresh statement 2 must be `lmul!(self.chol_metric.L, self.mom)`; got args $(rc2.args)")
+    (length(rc2.args) == 2 && _is_selffield(rc2.args[1], (:chol_metric, :L)) && _is_selffield(rc2.args[2], (:mom,)) && isempty(rc2.kw) && !rc2.broadcast) ||
+        _l_reject("refresh statement 2 must be `lmul!(self.chol_metric.L, self.mom)` (no kw/broadcast); got args $(rc2.args)")
+    # the chol slot must hold a sanctioned Cholesky (its L-view is the momentum-refresh factor)
+    (fieldtype(SH, chol_slot) <: LinearAlgebra.Cholesky) ||
+        _l_reject("refresh: chol_metric slot is not a Cholesky ($(fieldtype(SH, chol_slot)))")
     _CompiledRefresh{typeof(randfn), typeof(lmulfn), mom_slot, chol_slot, kills}(randfn, lmulfn)
 end
 
