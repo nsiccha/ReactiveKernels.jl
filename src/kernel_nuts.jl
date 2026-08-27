@@ -268,8 +268,10 @@ function nfieldcall(x, lm, C::NCtx)
         # stats callable is NEVER dynamically invoked — then marks its produced diag slots via _stats_produced!.
         C.stats_noeffect && return :nothing
         writes = Any[nwrite(pw, lm, C) for pw in C.stats_ir.body[1:end-1]]   # validated: all diag-scalar writes
-        Expr(:block, writes...,
-             :(_stats_produced!(Core.getfield($(C.S), :diag), Core.getfield($(C.S), :stats))), :nothing)
+        # G7: no per-leaf `_stats_produced!` — the root `_diagnostics_reset!` already set pending=0x0f (all four
+        # produced) and DOMINATES the epoch, so re-marking the produced slots is redundant. The value writes
+        # (raw `_diag_set_value!` in nwrite) still run; the single root commit blesses the reset-set pending.
+        Expr(:block, writes..., :nothing)
     else
         error("nfieldcall: unsupported field callable `$fld`")
     end
@@ -450,7 +452,8 @@ function nwrite(pw::_PlaceWrite, lm, C)
     if t isa _SelfField && length(t.path) == 1
         f = t.path[1]                                    # frame-direct scalar / diag scalar
         if haskey(_DIAG, f)
-            set = :(_diag_set!($(C.S).diag, Val($(_DIAG[f])), $(nev(pw.rhs, lm, C))))
+            # G7: RAW value write (no per-leaf pending OR) — reset's pending=0x0f dominates the epoch.
+            set = :(_diag_set_value!($(C.S).diag, Val($(_DIAG[f])), $(nev(pw.rhs, lm, C))))
             # a `dham` write invalidates + PRODUCES the derived `diverged` (RK) via the dedicated frame seam, so
             # the authored `diverged && return ...` guard downstream reads the fresh derived value, not a stale bit.
             return f === :dham ? Expr(:block, set, :(_nuts_produce_diverged!($(C.S)))) : set

@@ -230,6 +230,13 @@ diagnostics_ham_type(::_DiagnosticsStore{Tham}) where {Tham} = Tham
     fn = QuoteNode(fieldname(_DiagnosticsStore, I))
     :(setfield!(s, $fn, v); setfield!(s, :pending, getfield(s, :pending) | (UInt(1) << ($I - 1))); s)
 end
+# G7: RAW diagnostic value write — value ONLY, no pending update. Valid where `_diagnostics_reset!` at
+# root-begin already set pending=0x0f (all four produced) and DOMINATES the whole epoch (nothing clears
+# pending until the root commit), so a per-leaf pending OR is redundant. Same value/throw semantics: the
+# value is written; committed is untouched (a throw before the root commit still leaves nothing committed).
+@generated function _diag_set_value!(s::_DiagnosticsStore, ::Val{I}, v) where {I}
+    :(setfield!(s, $(QuoteNode(fieldname(_DiagnosticsStore, I))), v); s)
+end
 # Within-epoch readability (RK 08:48): a diagnostic is READABLE once PRODUCED this epoch — a dominated
 # `stats_f` read of `acceptance_rate` is valid even though the COMMITTED mask is zero mid-epoch. Poc must
 # NOT recompute/reject on committed==0 alone; it consults `pending` for within-epoch reads.
