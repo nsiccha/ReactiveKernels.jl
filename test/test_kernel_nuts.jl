@@ -293,7 +293,7 @@ end
     #   (2) per-compilation LOCAL scratch — indented `ctr = Ref(0)` / `fspv = Dict(...)` inside a function.
     # Only a TOP-LEVEL construction (`^[const] Name = Container(` / `[`) is an offender. `_DIAG` (Dict) →
     # `_diag_index` pure dispatch; `_EP_SELF`/`_SCALAR_SELF` (Set) → immutable tuple / removed, this pins it.
-    nuts_files = ["kernel_nuts.jl", "kernel_control.jl", "kernel_codegen.jl"]   # production NUTS/control/codegen
+    nuts_files = ["kernel_nuts.jl", "kernel_nuts_native.jl", "kernel_control.jl", "kernel_codegen.jl"]
     #  ^-anchored (multiline): a leading-whitespace line can't match, so indented locals are excluded.
     #  A CONSTRUCTION is `Name = [Base./Core.]Container[{...}]( / [` — the container (optionally qualified and
     #  optionally with type params) is IMMEDIATELY followed by a `(`/`[` constructor call. A bare type ALIAS
