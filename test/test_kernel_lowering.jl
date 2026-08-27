@@ -383,3 +383,62 @@ end
     # but the velocity (kinetic) WAS invalidated by refresh -> the drift's velocity read recomputes once
     @test RK._l_recipe_exec_count(leaf, _LwPP, initpg, :dkin_dmom) == 1
 end
+
+@testset "lowering — ROLE-AWARE remap: owned keys per-endpoint DISTINCT, SHARED IDENTICAL (RK 06:47)" begin
+    role_of(id) = id in (20, 21, 22) ? :shared : :owned      # metric/chol/node shared; mom/dkin owned
+    body = RK._LComposed([
+        RK._LSchedStep(:write, RK._LKey((), 5), 0, ()),      # mom (owned)
+        RK._LSchedStep(:exec,  RK._LKey((), 10), 3, (10,)),  # dkin (owned)
+        RK._LSchedStep(:exec,  RK._LKey((), 21), 4, (21,)),  # chol (SHARED authority)
+    ])
+    fwd = RK._l_remap(body, (:fwd,), role_of); bwd = RK._l_remap(body, (:bwd,), role_of)
+    fk = [s.key for s in fwd]; bk = [s.key for s in bwd]
+    @test RK._LKey((:fwd,), 5) in fk && RK._LKey((:bwd,), 5) in bk && RK._LKey((:fwd,), 5) ∉ bk  # owned DISTINCT
+    @test RK._LKey((), 21) in fk && RK._LKey((), 21) in bk       # SHARED chol IDENTICAL across fwd/bwd
+    @test RK._LKey((:fwd,), 21) ∉ fk                            # shared never moved to the endpoint
+end
+
+@testset "lowering — SHARED metric write FAN-OUT vs OWNED write (RK 06:52)" begin
+    role_of(id) = id in (20, 21, 22) ? :shared : :owned
+    deps = Dict(20 => Set([21, 22, 10, 11]), 5 => Set([10, 11]))   # metric→chol/node/dkin/kin ; mom→dkin/kin
+    pg = RK._LPlanGraph((), nothing, Dict{Int,Int}(), Dict{Int,Vector{Int}}(),
+                        Dict{Int,Vector{Int}}(), deps, Set{Int}(), Dict{Int,Symbol}())
+    eps = ((:init,), (:fwd,), (:bwd,)); sp = (:shared,)
+    # SHARED metric(20) write: shared chol/node die ONCE at authority; owned dkin/kin die on ALL endpoints
+    cur = Set([RK._LKey(sp, 21), RK._LKey(sp, 22)])
+    for ep in eps, d in (10, 11); push!(cur, RK._LKey(ep, d)); end
+    RK._l_write_kill!(cur, pg, sp, 20; role_of = role_of, shared_path = sp, endpoints = eps)
+    @test RK._LKey(sp, 21) ∉ cur && RK._LKey(sp, 22) ∉ cur       # shared killed once
+    @test all(RK._LKey(ep, 10) ∉ cur && RK._LKey(ep, 11) ∉ cur for ep in eps)  # owned killed on EVERY endpoint
+    # OWNED mom(5) write at fwd: kills only fwd's owned dependents; init/bwd untouched
+    cur2 = Set{RK._LKey}(); for ep in eps, d in (10, 11); push!(cur2, RK._LKey(ep, d)); end
+    RK._l_write_kill!(cur2, pg, (:fwd,), 5; role_of = role_of, shared_path = sp, endpoints = eps)
+    @test RK._LKey((:fwd,), 10) ∉ cur2 && RK._LKey((:fwd,), 11) ∉ cur2         # fwd killed
+    @test RK._LKey((:init,), 10) in cur2 && RK._LKey((:bwd,), 10) in cur2      # init/bwd UNTOUCHED (no fan-out)
+end
+
+@testset "lowering — loop shape is IMMUTABLE Tuple metadata; different shape ≠ loop, no replanning (RK 06:54)" begin
+    role_of(_::Int) = :owned
+    body = RK._LComposed([RK._LSchedStep(:write, RK._LKey((), 5), 0, ())])
+    l3 = RK._l_loop(:p, (:proposals,), 1:3, body, role_of)
+    l4 = RK._l_loop(:p, (:proposals,), 1:4, body, role_of)
+    @test l3.indices === (1, 2, 3) && l3.indices isa Tuple{Vararg{Int}}    # IMMUTABLE Tuple shape, not a hot Vector
+    @test length(RK._l_loop_iterations(l3)) == 3 && length(RK._l_loop_iterations(l4)) == 4  # shape-keyed count
+    # distinct indexed-child paths (never collapsed): proposals[1..3].mom are three distinct keys
+    paths = [s.key.path for s in RK._l_loop_iterations(l3)]
+    @test Set(paths) == Set([(:proposals, 1), (:proposals, 2), (:proposals, 3)])
+    # SAME shape → identical model reconstruction (DETERMINISTIC/model-only; this is NOT a no-per-instance-
+    # replan proof — the real no-replan counter+poison gate is syntax's prepared factory, deferred to rebase).
+    @test RK._l_loop(:p, (:proposals,), 1:3, body, role_of).iterations == l3.iterations
+end
+
+@testset "lowering — replay ROLE-RESOLVES produced outputs: shared→authority key, owned→endpoint (RK 06:57)" begin
+    role_of(id) = id in (20, 21, 22) ? :shared : :owned
+    # an atomic exec on fwd producing BOTH an OWNED output (dkin=10) and a SHARED output (chol=21)
+    body = RK._LComposed([RK._LSchedStep(:exec, RK._LKey((:fwd,), 10), 3, (10, 21))])
+    cur = Set{RK._LKey}()
+    RK._l_replay!(cur, body, Dict{RK._LPath,RK._LPlanGraph}(); role_of = role_of, shared_path = (:shared,))
+    @test RK._LKey((:fwd,), 10) in cur          # OWNED output blessed at the endpoint (fwd)
+    @test RK._LKey((:shared,), 21) in cur       # SHARED output blessed ONLY at the authority path
+    @test RK._LKey((:fwd,), 21) ∉ cur           # NOT cloned onto the endpoint — one authority key
+end

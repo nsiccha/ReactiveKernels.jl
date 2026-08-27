@@ -317,6 +317,8 @@ function _l_flatten(sched, arm::Symbol = :both)
         elseif s isa _LBranchStep
             (arm === :then || arm === :both) && append!(out, _l_flatten(s.then_, arm))
             (arm === :else || arm === :both) && append!(out, _l_flatten(s.else_, arm))
+        elseif s isa _LLoopStep
+            append!(out, _l_flatten(_l_loop_iterations(s), arm))    # expand per-index remapped iterations
         end
     end
     out
@@ -326,6 +328,73 @@ end
 # gradient budget).
 _l_composed_exec_count(sched, rid::Int, arm::Symbol = :then) =
     count(s -> s.kind === :exec && s.recipe === rid, _l_flatten(sched, arm))
+
+# ---- ROLE-AWARE PATH/FORMAL REMAPPING (splice a callee's subject-relative schedule at an endpoint) ----
+#
+# A sibling/recursive call binds the callee's SUBJECT formal to a concrete actual endpoint. Inlining its
+# body remaps keys ROLE-AWARE (RK 06:47): an OWNED canonical value (mom/pos/kin/…) moves to the actual
+# endpoint path `to`; a SHARED sampler-authority value (metric/chol_metric/@node/grad_f) stays on the ONE
+# stable `shared_path`, so splicing the SAME leaf at fwd and bwd yields DISTINCT owned keys but IDENTICAL
+# shared keys — a metric invalidation/recompute is counted ONCE across both endpoints, never cloned.
+# `role_of(canon)` is the detached per-canonical role function (:owned|:shared). Pure identity keying.
+
+_l_endpoint_key(k::_LKey, to::_LPath, role_of, shared_path::_LPath) =
+    role_of(k.id) === :shared ? _LKey(shared_path, k.id) : _LKey(to, k.id)
+
+"Role-aware remap of a callee subject-relative sub-schedule onto the actual endpoint path `to`: OWNED keys
+→ `to`, SHARED authority keys → `shared_path` (one sampler-wide). Recurses through the combinators; a
+nested loop/inline is already role-remapped, so it passes through."
+function _l_remap(sched, to::_LPath, role_of; shared_path::_LPath = ())
+    out = _LComposed()
+    for s in sched
+        if s isa _LSchedStep
+            push!(out, _LSchedStep(s.kind, _l_endpoint_key(s.key, to, role_of, shared_path), s.recipe, s.outputs))
+        elseif s isa _LBranchStep
+            push!(out, _LBranchStep(_l_endpoint_key(s.cond, to, role_of, shared_path),
+                                    _l_remap(s.then_, to, role_of; shared_path = shared_path),
+                                    _l_remap(s.else_, to, role_of; shared_path = shared_path)))
+        elseif s isa _LInlineStep
+            push!(out, _LInlineStep(s.name, to, _l_remap(s.body, to, role_of; shared_path = shared_path)))
+        elseif s isa _LCopyStep
+            push!(out, _LCopyStep(to, s.src_path, s.physical, s.sources))     # dest is the actual endpoint
+        else
+            push!(out, s)                                                     # already-expanded loop iters, etc.
+        end
+    end
+    out
+end
+
+# Splice a callee's subject-relative sub-schedule as an inline step AT `at_path`, role-aware remapped.
+_l_inline_remap(name::Symbol, at_path::_LPath, body, role_of; shared_path::_LPath = ()) =
+    _LInlineStep(name, at_path, _l_remap(collect(Any, body), at_path, role_of; shared_path = shared_path))
+
+# ---- LOOP over indexed owned children (`for p in proposals` / `for t in trees`) ----------------------
+#
+# A loop runs `body` once per indexed CHILD of `over` (`proposals[i]`/`trees[i]`), each iteration role-aware
+# remapped to the child path `(over..., i)` — OWNED keys per-child-DISTINCT, SHARED authority IDENTICAL
+# across children (not cloned). `indices` is an immutable Tuple/range (the final bound metadata form, RK
+# 06:47). Iterations are PRE-EXPANDED at construction so the currentness replay needs no `role_of`.
+
+"A loop combinator over indexed children: `indices` (immutable Tuple) + the PRE-EXPANDED role-remapped
+`iterations`. `over` is the container path; `name` the loop var (reporting)."
+struct _LLoopStep
+    name::Symbol
+    over::_LPath
+    indices::Tuple{Vararg{Int}}
+    iterations::_LComposed
+end
+
+# Construct a loop: role-aware remap `body` (subject-relative) onto each child path `(over..., i)`.
+function _l_loop(name::Symbol, over::_LPath, indices, body, role_of; shared_path::_LPath = ())
+    idx = Tuple(indices)
+    iters = _LComposed(reduce(vcat,
+        (_l_remap(collect(Any, body), (over..., i), role_of; shared_path = shared_path) for i in idx);
+        init = Any[]))
+    _LLoopStep(name, over, idx, iters)
+end
+
+# The pre-expanded per-index iterations (no `role_of` needed — remapping happened at construction).
+_l_loop_iterations(s::_LLoopStep) = s.iterations
 
 # ---- copy!! structural transfer + multi-path currentness --------------------
 #
@@ -369,9 +438,32 @@ end
 # A direct owned-source write at `path` KILLS its endpoint DERIVED dependents' currentness (per the
 # endpoint dep graph — a momentum refresh kills the kinetic/momentum closure, NOT the gradient chain).
 # The written value is an authoritative SOURCE (always current, not tracked); only dependents change.
-function _l_write_kill!(current::Set{_LKey}, pg::_LPlanGraph, path::_LPath, write_id::Int)
+# The DEFAULT role: everything owned (single-endpoint schedules with no sampler-shared authority) — keeps
+# the pre-existing behavior when no `role_of` is supplied.
+_l_owned_role(_::Int) = :owned
+
+# ROLE-AWARE dependent path (RK 06:48): an OWNED dependent is killed at the write's endpoint `path`; a
+# SHARED dependent (chol/logdet closure) at the ONE `shared_path`, so a metric invalidation is counted
+# once across endpoints, never same-path-cloned.
+_l_dep_key(dep::Int, path::_LPath, role_of, shared_path::_LPath) =
+    role_of(dep) === :shared ? _LKey(shared_path, dep) : _LKey(path, dep)
+
+# Kill a write's dependents (RK 06:52 fan-out). A SHARED write (metric mutation) is FAN-OUT: shared
+# dependents (chol/logdet) die ONCE at `shared_path`; OWNED dependents (dkin/kin/ham) die on EVERY sampler
+# endpoint in `endpoints` (init/fwd/bwd/proposals) — each endpoint has its own copy. An OWNED write kills
+# owned dependents at its own `path` only; shared dependents (none expected) still resolve to `shared_path`.
+function _l_write_kill!(current::Set{_LKey}, pg::_LPlanGraph, path::_LPath, write_id::Int;
+                        role_of = _l_owned_role, shared_path::_LPath = (),
+                        endpoints::Tuple{Vararg{_LPath}} = (path,))
+    write_shared = role_of(write_id) === :shared
     for dep in get(pg.dependents, write_id, Set{Int}())
-        delete!(current, _LKey(path, dep))
+        if role_of(dep) === :shared
+            delete!(current, _LKey(shared_path, dep))                       # shared dep: once at authority
+        elseif write_shared
+            for ep in endpoints; delete!(current, _LKey(ep, dep)); end      # shared write → owned deps on ALL endpoints
+        else
+            delete!(current, _LKey(path, dep))                              # owned write → only this endpoint
+        end
     end
     current
 end
@@ -396,9 +488,9 @@ const _LTaken = Dict{_LKey,Symbol}
 # The currentness AFTER a root epoch COMMITS the SELECTED trace: replay the taken arm, blessing produces
 # + applying kills/copies. NEVER replays the inactive arm (that would falsely bless a dead endpoint).
 function _l_epoch_commit(entry::Set{_LKey}, body::_LComposed, pgs::Dict{_LPath,_LPlanGraph};
-                         taken::_LTaken = _LTaken())
+                         taken::_LTaken = _LTaken(), role_of = _l_owned_role, shared_path::_LPath = (), endpoints::Tuple{Vararg{_LPath}} = ())
     current = copy(entry)
-    _l_replay!(current, body, pgs; taken = taken)
+    _l_replay!(current, body, pgs; taken = taken, role_of = role_of, shared_path = shared_path, endpoints = endpoints)
     current
 end
 
@@ -406,33 +498,36 @@ end
 # `entry` MINUS every value invalidated by a (conservatively, ANY) executed write/copy in the body — the
 # executed-prefix dirty set. NEVER `copy(entry)` (that falsely re-exposes killed caches as current).
 function _l_epoch_on_exception(entry::Set{_LKey}, body::_LComposed, pgs::Dict{_LPath,_LPlanGraph};
-                               taken::_LTaken = _LTaken())
+                               taken::_LTaken = _LTaken(), role_of = _l_owned_role, shared_path::_LPath = (), endpoints::Tuple{Vararg{_LPath}} = ())
     dirty = copy(entry)
-    _l_apply_kills!(dirty, body, pgs; taken = taken)      # KILLS only — no produce blessed
+    _l_apply_kills!(dirty, body, pgs; taken = taken, role_of = role_of, shared_path = shared_path, endpoints = endpoints)  # KILLS only
     dirty
 end
 
 # Apply ONLY the invalidations of a body (writes kill dependents; a copy dirties dest's derived caches);
 # NEVER a produce/bless. The conservative dirty set after a mid-body exception. Branches: only the
 # selected arm's kills (if a specific trace threw) — default conservatively unions both arms' kills.
-function _l_apply_kills!(current::Set{_LKey}, sched, pgs::Dict{_LPath,_LPlanGraph}; taken::_LTaken = _LTaken())
+function _l_apply_kills!(current::Set{_LKey}, sched, pgs::Dict{_LPath,_LPlanGraph}; taken::_LTaken = _LTaken(),
+                         role_of = _l_owned_role, shared_path::_LPath = (), endpoints::Tuple{Vararg{_LPath}} = ())
     for s in sched
         if s isa _LSchedStep && s.kind === :write
             pg = get(pgs, s.key.path, nothing)
-            pg === nothing || _l_write_kill!(current, pg, s.key.path, s.key.id)
+            pg === nothing || _l_write_kill!(current, pg, s.key.path, s.key.id; role_of = role_of, shared_path = shared_path, endpoints = endpoints)
         elseif s isa _LInlineStep
-            _l_apply_kills!(current, s.body, pgs; taken = taken)
+            _l_apply_kills!(current, s.body, pgs; taken = taken, role_of = role_of, shared_path = shared_path, endpoints = endpoints)
         elseif s isa _LBranchStep
             if haskey(taken, s.cond)
-                _l_apply_kills!(current, taken[s.cond] === :then ? s.then_ : s.else_, pgs; taken = taken)
+                _l_apply_kills!(current, taken[s.cond] === :then ? s.then_ : s.else_, pgs; taken = taken, role_of = role_of, shared_path = shared_path, endpoints = endpoints)
             else                                          # unknown trace: conservatively dirty BOTH arms
-                _l_apply_kills!(current, s.then_, pgs; taken = taken)
-                _l_apply_kills!(current, s.else_, pgs; taken = taken)
+                _l_apply_kills!(current, s.then_, pgs; taken = taken, role_of = role_of, shared_path = shared_path, endpoints = endpoints)
+                _l_apply_kills!(current, s.else_, pgs; taken = taken, role_of = role_of, shared_path = shared_path, endpoints = endpoints)
             end
         elseif s isa _LCopyStep
-            for id in _l_copy_derived(s); delete!(current, _LKey(s.dest_path, id)); end
+            for id in _l_copy_derived(s); delete!(current, _l_dep_key(id, s.dest_path, role_of, shared_path)); end
+        elseif s isa _LLoopStep
+            _l_apply_kills!(current, _l_loop_iterations(s), pgs; taken = taken, role_of = role_of, shared_path = shared_path, endpoints = endpoints)
         elseif s isa _LEpochStep
-            _l_apply_kills!(current, s.body, pgs; taken = taken)
+            _l_apply_kills!(current, s.body, pgs; taken = taken, role_of = role_of, shared_path = shared_path, endpoints = endpoints)
         end
     end
     current
@@ -440,17 +535,18 @@ end
 
 # Replay a composed schedule's currentness effects over the SELECTED trace (produces bless; writes kill;
 # copies transfer; a branch replays ONLY its taken arm — never both). Keys (Path, canonical Value id).
-function _l_replay!(current::Set{_LKey}, sched, pgs::Dict{_LPath,_LPlanGraph}; taken::_LTaken = _LTaken())
+function _l_replay!(current::Set{_LKey}, sched, pgs::Dict{_LPath,_LPlanGraph}; taken::_LTaken = _LTaken(),
+                    role_of = _l_owned_role, shared_path::_LPath = (), endpoints::Tuple{Vararg{_LPath}} = ())
     for s in sched
         if s isa _LSchedStep
             if s.kind === :exec
-                for o in s.outputs; push!(current, _LKey(s.key.path, o)); end
+                for o in s.outputs; push!(current, _l_dep_key(o, s.key.path, role_of, shared_path)); end   # ROLE-resolved bless
             elseif s.kind === :write
                 pg = get(pgs, s.key.path, nothing)
-                pg === nothing || _l_write_kill!(current, pg, s.key.path, s.key.id)
+                pg === nothing || _l_write_kill!(current, pg, s.key.path, s.key.id; role_of = role_of, shared_path = shared_path, endpoints = endpoints)
             end
         elseif s isa _LInlineStep
-            _l_replay!(current, s.body, pgs; taken = taken)
+            _l_replay!(current, s.body, pgs; taken = taken, role_of = role_of, shared_path = shared_path, endpoints = endpoints)
         elseif s isa _LBranchStep
             # COMMIT is authoritative: every reached dynamic branch MUST have an explicit taken arm.
             # A missing/invalid trace is a bug — REJECT and bless nothing (never default an arm, never
@@ -460,11 +556,13 @@ function _l_replay!(current::Set{_LKey}, sched, pgs::Dict{_LPath,_LPlanGraph}; t
                 "selected runtime trace must encode it (never default/bless a guessed arm)")
             arm = taken[s.cond]
             (arm === :then || arm === :else) || _l_reject("invalid branch trace $(arm) for cond $(s.cond)")
-            _l_replay!(current, arm === :then ? s.then_ : s.else_, pgs; taken = taken)
+            _l_replay!(current, arm === :then ? s.then_ : s.else_, pgs; taken = taken, role_of = role_of, shared_path = shared_path, endpoints = endpoints)
         elseif s isa _LCopyStep
             _l_copy_transfer!(current, s)
+        elseif s isa _LLoopStep
+            _l_replay!(current, _l_loop_iterations(s), pgs; taken = taken, role_of = role_of, shared_path = shared_path, endpoints = endpoints)
         elseif s isa _LEpochStep
-            _l_replay!(current, s.body, pgs; taken = taken)
+            _l_replay!(current, s.body, pgs; taken = taken, role_of = role_of, shared_path = shared_path, endpoints = endpoints)
         end
     end
     current
