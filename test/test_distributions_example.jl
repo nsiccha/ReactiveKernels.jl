@@ -11,17 +11,16 @@ using ReactiveKernels: code_expr
         @test length(artifacts) == 3
         # Every source declares @kernel recipes.
         @test all(source -> occursin(r"@kernel \w+\(", source), all_sources())
-        # `compose` earns its place ONLY where a shared port must be unified:
-        # the multivariate source. The scalar densities are single recipes, so
-        # they must NOT shoehorn a compose call in for decoration.
-        continuous, discrete, multivariate = all_sources()
-        @test occursin("compose(", multivariate)
-        @test !occursin("compose(", continuous)
-        @test !occursin("compose(", discrete)
-        # Regression guard against the exp-then-log round trip: with logσ in
-        # HAND the density uses it directly (the -logσ term), never rebuilds σ
-        # via exp only to take log(σ) again. Scan code only — drop `#` comments
-        # so prose mentioning the anti-pattern doesn't trip the guard.
+        continuous, discrete, vectorized = all_sources()
+        # No forced API demonstrations: these are plain native densities. Nothing
+        # shoehorns a `compose` call; the vectorized source generates its batched
+        # kernel with `plate`.
+        @test all(source -> !occursin("compose(", source), all_sources())
+        @test occursin("plate(", vectorized)
+        # Regression guard against the exp-then-log round trip: with logσ in HAND
+        # the density uses it directly (the -logσ term), never rebuilds σ via exp
+        # only to take log(σ) again. Scan code only — drop `#` comments so prose
+        # mentioning the anti-pattern doesn't trip the guard.
         code_only(src) = join(
             (first(split(line, "#")) for line in eachsplit(src, "\n")), "\n",
         )
@@ -29,44 +28,26 @@ using ReactiveKernels: code_expr
         @test occursin("- logσ", continuous_code)
         @test !occursin("log(σ)", continuous_code)
         @test !occursin("log(exp", continuous_code)
-        # The compute path is Distributions.jl-free: the generated straight-line
-        # kernel references no distribution library.
+        # The compute path is Distributions.jl-free.
         @test all(artifacts) do artifact
             !occursin("Distributions", string(code_expr(artifact.kernel)))
         end
         # Values match the independent Distributions.jl oracle.
-        @test all(artifacts) do artifact
-            artifact.output isa Tuple ?
-                all(isapprox.(artifact.output, artifact.reference)) :
-                isapprox(artifact.output, artifact.reference)
-        end
+        @test all(artifact -> isapprox(artifact.output, artifact.reference), artifacts)
     end
 
-    @testset "native path allocates no more than the Distributions oracle" begin
+    @testset "allocation is well-formed; the scalar densities are 0-alloc" begin
         @test all(artifact -> artifact.allocated_bytes isa Int, artifacts)
         @test all(artifact -> artifact.reference_allocated_bytes isa Int, artifacts)
         @test all(artifact -> artifact.allocated_bytes >= 0, artifacts)
         @test all(artifact -> artifact.reference_allocated_bytes >= 0, artifacts)
-        # Scalar native kernels are fully non-allocating, and so is their oracle.
+        # The scalar native kernels are fully non-allocating, and so is their oracle.
         @test all(artifact -> artifact.allocated_bytes == 0, artifacts[1:2])
-        @test all(
-            artifact -> artifact.reference_allocated_bytes == 0,
-            artifacts[1:2],
-        )
-        # The multivariate native quadratic form avoids MvNormal construction,
-        # so it allocates strictly less than the Distributions.jl reference.
-        multivariate = last(artifacts)
-        @test multivariate.allocated_bytes > 0
-        @test multivariate.reference_allocated_bytes > 0
-        @test multivariate.allocated_bytes < multivariate.reference_allocated_bytes
+        @test all(artifact -> artifact.reference_allocated_bytes == 0, artifacts[1:2])
     end
 
     @testset "concrete inference evidence matches exact result types" begin
-        expected_returns = (
-            Float64,
-            Float64,
-            Tuple{Float64, Float64, Float64},
-        )
+        expected_returns = (Float64, Float64, Float64)
         for (artifact, expected_return) in zip(artifacts, expected_returns)
             observed = artifact.kernel(Tuple(artifact.inputs)...)
             @test isconcretetype(artifact.inferred_return)
@@ -74,21 +55,5 @@ using ReactiveKernels: code_expr
             @test artifact.inferred_return === expected_return
             @test typeof(observed) === expected_return
         end
-    end
-
-    @testset "shared coefficients feed both multivariate terms" begin
-        multivariate = last(artifacts)
-        selected = multivariate.kernel.plan.recipes
-        coefficient_uses = count(selected) do recipe
-            any(value -> value.name === :coefficients, recipe.inputs)
-        end
-
-        @test coefficient_uses >= 3
-        @test count(recipe -> any(
-            value -> value.name === :prior_logdensity, recipe.outputs,
-        ), selected) == 1
-        @test count(recipe -> any(
-            value -> value.name === :likelihood_logdensity, recipe.outputs,
-        ), selected) == 1
     end
 end

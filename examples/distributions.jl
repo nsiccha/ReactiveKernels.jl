@@ -10,7 +10,7 @@
 # against the Distributions.jl oracle — that is the only role the library plays.
 module DistributionExamples
 
-export CONTINUOUS_SOURCE, DISCRETE_SOURCE, MULTIVARIATE_SOURCE
+export CONTINUOUS_SOURCE, DISCRETE_SOURCE, VECTORIZED_SOURCE
 export all_sources, evaluate_source, run
 
 const CONTINUOUS_SOURCE = raw"""
@@ -115,103 +115,72 @@ docs_example = (;
 )
 """
 
-const MULTIVARIATE_SOURCE = raw"""
+const VECTORIZED_SOURCE = raw"""
 using Distributions
-using LinearAlgebra
 using BenchmarkTools
 
-# Native isotropic-Gaussian log density: a plain quadratic form. No MvNormal
-# object is constructed and no Distributions.jl call runs inside the kernel, so
-# the composed path allocates strictly less than the MvNormal reference below.
-isotropic_normal_logpdf(x, μ, scale) = begin
-    n = length(x)
-    residual = 0.0
-    @inbounds for i in eachindex(x)
-        residual += (x[i] - μ[i])^2
-    end
-    -0.5 * n * log(2π) - n * log(scale) - 0.5 * residual / scale^2
+# The SAME scalar per-observation Gaussian log density, authored ONCE.
+@kernel normal_logpdf(x::Float64, μ::Float64, logσ::Float64) = begin
+    σ::Float64 = exp(logσ)
+    z::Float64 = (x - μ) / σ
+    logdensity::Float64 = -0.5 * log(2π) - logσ - 0.5 * z^2
 end
 
-@kernel coefficient_prior(coefficients::Vector{Float64}, prior_scale::Float64) = begin
-    prior_mean::Vector{Float64} = zero(coefficients)
-    prior_logdensity::Float64 = isotropic_normal_logpdf(
-        coefficients, prior_mean, prior_scale,
-    )
-end
+# `plate` turns that scalar recipe into a VECTORIZED log density that does NO
+# repeated work: the shared-scale recipe σ = exp(logσ) is HOISTED and computed
+# ONCE above the batch loop, and only the per-observation residual runs N times.
+# `batched = (:x,)` marks the observations as varying per element while μ and the
+# log scale are shared. Passing a `Vector` for `x` is the only thing that makes
+# it batched — the author writes no broadcast and no sum.
+vectorized = plate(normal_logpdf;
+    have = (:x, :μ, :logσ), want = :logdensity, batched = (:x,))
 
-@kernel regression_likelihood(coefficients::Vector{Float64}, design::Matrix{Float64},
-                              observations::Vector{Float64}, noise_scale::Float64) = begin
-    mean::Vector{Float64} = design * coefficients
-    likelihood_logdensity::Float64 = isotropic_normal_logpdf(
-        observations, mean, noise_scale,
-    )
-end
+x = collect(range(-1.5, 1.5; length = 8))
+μ = 0.3
+logσ = log(1.2)
+inputs = (; x, μ, logσ)
+output = vectorized(x, μ, logσ)
 
-@kernel joint_density(prior_logdensity::Float64,
-                      likelihood_logdensity::Float64) = begin
-    logdensity::Float64 = prior_logdensity + likelihood_logdensity
-end
+# Distributions.jl oracle only: the summed per-observation log density.
+vectorized_reference(x, μ, logσ) = sum(logpdf.(Normal(μ, exp(logσ)), x))
+reference = vectorized_reference(Tuple(inputs)...)
 
-# This is where `compose` earns its place: three separately-authored recipes
-# share the same `coefficients` port, and `compose` unifies that port so the
-# planner sees one parameter feeding both the prior and the likelihood. (The
-# scalar examples above need no `compose` — each is a single recipe.)
-regression_kernel = prepare(
-    compose(coefficient_prior, regression_likelihood, joint_density);
-    have = (:coefficients, :prior_scale, :design, :observations, :noise_scale),
-    want = (:prior_logdensity, :likelihood_logdensity, :logdensity),
-)
+# The per-observation vector (LOO/WAIC) comes from the SAME authored kernel via
+# `reduce = nothing`, sharing the hoisted work — only the vector is materialized.
+per_obs = plate(normal_logpdf; have = (:x, :μ, :logσ), want = :logdensity,
+                batched = (:x,), reduce = nothing)(x, μ, logσ)
 
-inputs = (;
-    coefficients = [0.3, -0.4],
-    prior_scale = 1.5,
-    design = [1.0 -0.5; 1.0 0.25; 1.0 1.5],
-    observations = [0.8, 0.1, -0.4],
-    noise_scale = 0.7,
-)
-output = regression_kernel(Tuple(inputs)...)
-
-# Distributions.jl oracle (value and allocation reference only).
-function reference_density(
-    coefficients, prior_scale, design, observations, noise_scale,
-)
-    prior = logpdf(
-        MvNormal(zeros(length(coefficients)), abs2(prior_scale) * I),
-        coefficients,
-    )
-    likelihood = logpdf(
-        MvNormal(design * coefficients, abs2(noise_scale) * I),
-        observations,
-    )
-    (prior, likelihood, prior + likelihood)
-end
-reference = reference_density(Tuple(inputs)...)
-
-allocation_bytes(f, a, b, c, d, e) = @ballocated $f($a, $b, $c, $d, $e)
-allocated_bytes = allocation_bytes(regression_kernel, Tuple(inputs)...)
-reference_allocated_bytes = allocation_bytes(reference_density, Tuple(inputs)...)
+allocation_bytes(f, a, b, c) = @ballocated $f($a, $b, $c)
+allocated_bytes = allocation_bytes(vectorized, x, μ, logσ)
+reference_allocated_bytes = allocation_bytes(vectorized_reference, x, μ, logσ)
 inferred_return = only(Base.return_types(
-    regression_kernel, Tuple{map(typeof, Tuple(inputs))...},
-))
+    vectorized, Tuple{map(typeof, Tuple(inputs))...}))
 
-@assert all(output .≈ reference)
-@assert allocated_bytes < reference_allocated_bytes
-@assert !occursin("Distributions", string(code_expr(regression_kernel)))
+# exp(logσ) (the shared-scale recipe, __ops__[1]) appears exactly ONCE in the
+# lowered kernel — hoisted above the loop, never recomputed per observation.
+@assert length(collect(eachmatch(r"__ops__\[1\]",
+    string(code_expr(vectorized))))) == 1
+@assert output ≈ reference
+@assert per_obs ≈ logpdf.(Normal(μ, exp(logσ)), x)
+@assert sum(per_obs) ≈ output
+@assert inferred_return === Float64
+@assert !occursin("Distributions", string(code_expr(vectorized)))
 
 docs_example = (;
-    name = :multivariate_shared_coefficients,
-    origin = "native isotropic-Gaussian prior and likelihood (build executed)",
+    name = :vectorized_normal,
+    origin = "vectorized Gaussian log density via `plate` — invariants hoisted (build executed)",
     inputs,
-    kernel = regression_kernel,
+    kernel = vectorized,
     output,
     reference,
+    per_obs,
     allocated_bytes,
     reference_allocated_bytes,
     inferred_return,
 )
 """
 
-all_sources() = (CONTINUOUS_SOURCE, DISCRETE_SOURCE, MULTIVARIATE_SOURCE)
+all_sources() = (CONTINUOUS_SOURCE, DISCRETE_SOURCE, VECTORIZED_SOURCE)
 
 function evaluate_source(source::AbstractString)
     sandbox = Module(gensym(:DistributionExample), true, true)

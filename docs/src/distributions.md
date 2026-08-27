@@ -3,10 +3,9 @@
 These executable examples build log densities the way a probabilistic-programming
 layer on top of `ReactiveKernels` would want them: as ordinary `@kernel` recipes
 of closed-form arithmetic. The **compute path contains no `Distributions.jl`
-call** — each density is written out directly, a `have`/`want` `prepare` query
-lowers exactly the requested computation to a straight-line kernel, and `compose`
-enters only where several recipes share a parameter (the multivariate case
-below). That keeps the hot path free of distribution-object construction and
+call** — each density is written out directly, and a `have`/`want` `prepare`
+query lowers exactly the requested computation to a straight-line kernel. That
+keeps the hot path free of distribution-object construction and
 friendly to batching, lazy evaluation, and the non-allocating lowering under
 [Non-allocating kernels](nonallocating.md).
 
@@ -62,34 +61,36 @@ Main.ReactiveKernelsDocs.execute_example(
 )
 ```
 
-## Multivariate: shared regression coefficients
+## Vectorized: batched log densities with `plate`, no repeated work
 
-This is the case that actually needs `compose`. One coefficient vector feeds
-both an isotropic-Gaussian prior and an isotropic-Gaussian regression
-likelihood, each written as a native quadratic form (no `MvNormal` object), and
-a third recipe sums the two terms. `compose` unifies the shared `coefficients`
-port across those separately-authored recipes so the planner sees one parameter
-feeding both densities — which is what `compose` is *for*, and why the scalar
-examples above, being single recipes, use none. The joint value is checked
-against direct `MvNormal` calls.
+You author the **scalar** per-observation log density once, and `plate` generates
+the vectorized kernel that computes the batch **as efficiently as a hand-written
+Stan `reduce_sum` — with no repeated work**. `plate(spec; batched = (:x,))` takes
+the *scalar* `@kernel` (a transparent graph) plus which ports are batched, and
+the planner partitions its recipes by whether they depend on the batch: recipes
+that touch only the shared (scalar) ports — here `σ = exp(logσ)` — are computed
+**once**, hoisted above a fused per-observation loop, and only the batch-dependent
+residual runs `N` times. Nothing is materialized when the scalar total is wanted;
+`exp(logσ)` is emitted **exactly once** in the lowered kernel (asserted below from
+`code_expr`), never per observation. The same authored kernel yields the
+per-observation vector (for LOO/WAIC) via `reduce = nothing`, sharing that hoisted
+work. This is a pure planning/codegen concern — `ReactiveKernels` plans and
+computes, and does no AD — so `plate` is what makes a native vectorized log
+density *cheap*, not just correct.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
-    @__MODULE__, Main.DistributionExamples.MULTIVARIATE_SOURCE,
+    @__MODULE__, Main.DistributionExamples.VECTORIZED_SOURCE,
 )
 ```
 
 The sources record `BenchmarkTools.@ballocated` measurements behind a function
-barrier for both each prepared kernel and its equivalent direct
-`Distributions.jl` oracle call. The scalar paths measure **zero bytes** on both
-sides. The multivariate native path measures **strictly fewer bytes than the
-`MvNormal` reference**, because the quadratic form avoids distribution-object
-construction — reversing the situation of a wrapper that inherits the library's
-allocations. The scalar `Base.return_types` results are checked as exactly
-`Float64`, so allocation and inference are separate claims rather than an `Any`
-result being mistaken for a distribution cost. The separate non-allocating path
-that drives even the multivariate case to zero bytes is documented under
-[Non-allocating kernels](nonallocating.md).
+barrier for each prepared kernel and its equivalent direct `Distributions.jl`
+oracle call. The scalar paths measure **zero bytes** on both sides, and each
+`Base.return_types` result is checked as exactly `Float64`, so allocation and
+inference are separate claims rather than an `Any` result being mistaken for a
+distribution cost. The non-allocating lowering that drives even the batched case
+to zero bytes is documented under [Non-allocating kernels](nonallocating.md).
 
 ## The planner is domain-agnostic
 
