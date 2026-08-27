@@ -317,16 +317,47 @@ function _lf_kill_closure(plan::_KernelPlan, tgt::Int)
     stale
 end
 
-# DEMAND-recompute canonical id `c` into `current`: recompute its stale inputs first, then emit its producer
-# handle (which blesses its producer-owned outputs after success). A source is assumed available. Returns
-# the running destination-grad (pgrad) count.
-function _lf_demand!(stmts, c::Int, current::Set{Int}, plan::_KernelPlan,
-                    producer::Dict{Int,Int}, hidx, ::Type{OW}, ::Type{SH}) where {OW,SH}
-    (c in current || !haskey(producer, c)) && return 0
+# ENSURE canonical id `c` is current for a read (RK 09:08 stale-at-entry contract from the lowering model).
+# Dispatch on the COMPILE-TIME knowledge of c's validity in THIS invocation:
+#  * known-current (produced/written earlier here) → nothing;
+#  * known-stale (killed by a prior write here) → an UNCONDITIONAL recompute of its selected producer;
+#  * a non-producible SOURCE → a runtime assert it is entry-current (a dirty source cannot be repaired —
+#    it must be reset, never read stale);
+#  * a produced value whose ENTRY validity is UNKNOWN (not yet produced this invocation) → a runtime
+#    entry-ensure GUARD: recompute its producer ONLY if the real slot mask says dirty (0-B when already
+#    current, so a normal warmed leaf takes the empty branch and keeps grad +1/leaf).
+# Returns (unconditional_grads, conditional_grads) — the destination-grad count on the always-taken vs the
+# recovery-only path.
+function _lf_ensure!(stmts, c::Int, current::Set{Int}, stale::Set{Int}, plan::_KernelPlan,
+                     producer::Dict{Int,Int}, hidx, ::Type{OW}, ::Type{SH}) where {OW,SH}
+    c in current && return (0, 0)
+    role, slot = kernel_plan_field(plan, c); obj = role === :owned ? :owned : :shared
+    if !haskey(producer, c)                                       # non-producible source
+        push!(stmts, :(_canon_current($obj, Val($slot)) || error(
+            "leapfrog read of a DIRTY non-producible source (canon $($c)) — requires reset, never read stale")))
+        push!(current, c); return (0, 0)
+    elseif c in stale                                             # known-stale → unconditional recompute
+        return (_lf_recompute!(stmts, c, current, stale, plan, producer, hidx, OW, SH), 0)
+    else                                                          # produced, entry-unknown → conditional ensure
+        guard = Any[]
+        n = _lf_recompute!(guard, c, current, stale, plan, producer, hidx, OW, SH)
+        push!(stmts, Expr(:if, :(!_canon_current($obj, Val($slot))), Expr(:block, guard...)))
+        push!(current, c)                                         # current after the ensure regardless of branch
+        return (0, n)
+    end
+end
+
+# UNCONDITIONAL recompute of produced canon `c`: ensure its handle inputs first (recursively), then emit its
+# selected producer handle (blesses producer-owned outputs after success). Returns the grad count on this
+# always-taken path.
+function _lf_recompute!(stmts, c::Int, current::Set{Int}, stale::Set{Int}, plan::_KernelPlan,
+                        producer::Dict{Int,Int}, hidx, ::Type{OW}, ::Type{SH}) where {OW,SH}
     rid = producer[c]; (h, i) = hidx[rid]; n = 0
-    for inp in h.inputs; n += _lf_demand!(stmts, inp, current, plan, producer, hidx, OW, SH); end
+    for inp in h.inputs
+        (uc, _) = _lf_ensure!(stmts, inp, current, stale, plan, producer, hidx, OW, SH); n += uc
+    end
     _pp_emit_handle!(stmts, plan, h, i, OW, SH)
-    for o in h.owned; push!(current, o); end
+    for o in h.owned; delete!(stale, o); push!(current, o); end
     n + (recipe_handle_mode(h) === :destination ? 1 : 0)
 end
 
@@ -348,11 +379,14 @@ function compile_leapfrog(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, leaf_ir:
     hidx = Dict{Int,Tuple{Any,Int}}(recs[i] => (hs[i], i) for i in eachindex(hs))
     stepkw = gensym(:stepkw)
     stmts = Any[]
-    current = Set{Int}(s.canon for s in kernel_plan_slots(plan))   # post-init: everything current
-    ngrad = 0
+    # NO all-current seed (RK 09:08): entry validity of every plan-produced value is UNKNOWN in this
+    # invocation. `current` = canons made current HERE (by a produce/write); `stale` = canons killed HERE.
+    current = Set{Int}(); stale = Set{Int}()
+    ngrad_uncond = 0
     for pw in _exec_place_writes(leaf_ir)
-        for c in _lf_reads(pw.rhs, fc)                             # demand stale READ canons, authored order
-            ngrad += _lf_demand!(stmts, c, current, plan, producer, hidx, OW, SH)
+        for c in _lf_reads(pw.rhs, fc)                             # ensure READ canons, authored order
+            (uc, _) = _lf_ensure!(stmts, c, current, stale, plan, producer, hidx, OW, SH)
+            ngrad_uncond += uc
         end
         tgt = fc[pw.target.path[end]]
         deps = _lf_kill_closure(plan, tgt)
@@ -360,10 +394,13 @@ function compile_leapfrog(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, leaf_ir:
         for d in deps; _lf_mask!(stmts, plan, d, :kill); end
         _lf_write!(stmts, pw, plan, fc, stepkw, OW, SH)
         _lf_mask!(stmts, plan, tgt, :bless)                       # BLESS the written canon only AFTER success
-        for d in deps; delete!(current, d); end
-        push!(current, tgt)
+        for d in deps; delete!(current, d); push!(stale, d); end
+        delete!(stale, tgt); push!(current, tgt)                  # freshly written → current
     end
-    ngrad == 1 || _l_reject("executable leapfrog emitted $ngrad destination-grad recomputes; expected exactly one")
+    # the ALWAYS-TAKEN path runs exactly one destination-grad (the post-drift kick-2 recompute); the entry
+    # dpot ensure adds a SECOND grad only on the recovery (dirty-entry) branch.
+    ngrad_uncond == 1 || _l_reject(
+        "executable leapfrog emitted $ngrad_uncond unconditional destination-grad recomputes; expected exactly one")
     compile(:((owned, shared, handles, $stepkw) -> $(Expr(:block, stmts..., :(return owned)))))
 end
 

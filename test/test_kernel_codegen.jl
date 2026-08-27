@@ -269,20 +269,30 @@ const _FIXLF = _FixLF.leapfrog!
     @test abs(_pp_rd(plan, ow, sh, _pp_c(plan, :ham)) - ham0) < 0.01
 end
 
-@testset "executable leapfrog — grad throw leaves prefix committed + dpot dirty; RETRY re-runs grad correctly (RK 08:59)" begin
+@testset "executable leapfrog — stale-at-entry recovery: forced pgrad failure, RETRY analytic + grad Δ==2 (RK 09:06/09:08)" begin
     pf = _pp_pf(); plan = RK.kernel_prepared_plan(pf); hs = RK.kernel_prepared_handles(pf)
-    leaf = RK.method_irs(_PPFix.leapfrog!)[1]; d = 3
-    tg = _PPFix.ThrowOnGrad(0, 2)                                # ok at init (call 1), THROWS on kick-2 (call 2)
+    leaf = RK.method_irs(_PPFix.leapfrog!)[1]; d = 3; h = 0.1
+    tg = _PPFix.ThrowOnGrad(0, 2)                                # ok at init (call 1); throws on the post-drift grad
     ow, sh = _pp_construct(pf, plan, _pp_values(plan, Float64, d, tg))
-    RK.compile_prepared_initialization(pf, typeof(ow), typeof(sh))(ow, sh, hs)     # grad call #1
+    RK.compile_prepared_initialization(pf, typeof(ow), typeof(sh))(ow, sh, hs)     # grad call #1 (init)
     lf = RK.compile_leapfrog(pf, typeof(ow), typeof(sh), leaf)
-    @test_throws ErrorException lf(ow, sh, hs, (stepsize = 0.1,))                  # grad call #2 THROWS mid-leaf
-    @test _pp_cur(plan, ow, sh, _pp_c(plan, :mom)) && _pp_cur(plan, ow, sh, _pp_c(plan, :pos))  # prefix committed
-    @test !_pp_cur(plan, ow, sh, _pp_c(plan, :dpot_dpos))        # grad output DIRTY — retry cannot see it blessed
-    tg.throw_at = 999                                           # stop throwing → RETRY
-    lf(ow, sh, hs, (stepsize = 0.1,))                           # re-executes the grad (call #3)
-    @test _pp_cur(plan, ow, sh, _pp_c(plan, :dpot_dpos))        # grad output now CURRENT
-    @test _pp_rd(plan, ow, sh, _pp_c(plan, :dpot_dpos)) ≈ 2 .* _pp_rd(plan, ow, sh, _pp_c(plan, :pos))  # correct
+    @test_throws ErrorException lf(ow, sh, hs, (stepsize = h,))                    # post-drift grad #2 THROWS
+    # executed prefix committed (kick-1 mom + drift pos blessed); the throwing grad left dpot DIRTY
+    pos_pfx = copy(_pp_rd(plan, ow, sh, _pp_c(plan, :pos))); mom_pfx = copy(_pp_rd(plan, ow, sh, _pp_c(plan, :mom)))
+    @test _pp_cur(plan, ow, sh, _pp_c(plan, :mom)) && _pp_cur(plan, ow, sh, _pp_c(plan, :pos))
+    @test !_pp_cur(plan, ow, sh, _pp_c(plan, :dpot_dpos))
+    # RETRY: entry dpot is dirty → kick-1 entry-ensure recomputes it (grad), then post-drift grad → Δ == 2
+    tg.throw_at = 999; n_pre = tg.n
+    lf(ow, sh, hs, (stepsize = h,))
+    @test tg.n - n_pre == 2                                      # entry dpot recovery + post-drift recompute
+    # exact ANALYTIC recovery state (one leapfrog step from the committed prefix, gradient repaired at entry)
+    M = Matrix{Float64}(I(d)) .+ 0.5
+    mom_hh = mom_pfx .- h .* pos_pfx; pos_a = pos_pfx .+ h .* (M \ mom_hh); mom_a = mom_hh .- h .* pos_a
+    @test _pp_rd(plan, ow, sh, _pp_c(plan, :pos)) ≈ pos_a
+    @test _pp_rd(plan, ow, sh, _pp_c(plan, :mom)) ≈ mom_a
+    # final masks correct: gradient current, kinetic/ham dirty
+    @test _pp_cur(plan, ow, sh, _pp_c(plan, :dpot_dpos)) && _pp_cur(plan, ow, sh, _pp_c(plan, :pot))
+    @test !_pp_cur(plan, ow, sh, _pp_c(plan, :dkin_dmom)) && !_pp_cur(plan, ow, sh, _pp_c(plan, :ham))
 end
 
 @testset "executable leapfrog — authored qualified-slot alias rebind is REJECTED (RK 08:55/08:59)" begin
