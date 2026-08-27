@@ -1220,6 +1220,69 @@ end
         @test RKS._canon_current_mask(dest) == RKS._owner_mask(2, Int[])         # DIRTY — no stale blessed bit
     end
 
+    @testset "nuts_state — compiler-owned DIAGNOSTICS storage (concrete field ABI, F32/F64, pending/committed epoch) (RK 08:42/08:47/08:48)" begin
+        # F32/F64 type PRESERVATION — acceptance_rate/dham follow init.ham's type (no Float64 promotion)
+        d32 = RKS._diagnostics_store(Float32); d64 = RKS._diagnostics_store(Float64)
+        @test RKS.diagnostics_ham_type(d32) === Float32 && RKS.diagnostics_ham_type(d64) === Float64
+        @test typeof(RKS._diag_slot(d32, Val(3))) === Float32 && typeof(RKS._diag_slot(d64, Val(4))) === Float64
+        @test (@inferred RKS._diag_slot(d32, Val(3))) isa Float32          # Val accessor type-stable
+        # CONCRETE mutable field ABI (NOT the boxing _OwnerState tuple path) — every scalar op exact 0-B
+        # AND @inferred for BOTH F32 and F64 (oftype-parameterized value, typed loop)
+        _setn(d) = RKS._diag_set!(d, Val(1), 7)
+        _seta(d::RKS._DiagnosticsStore{T}) where {T} = RKS._diag_set!(d, Val(3), oftype(zero(T), 0.5))
+        _rst(d) = RKS._diagnostics_reset!(d)
+        _cmt(d) = RKS._diagnostics_root_commit!(d)
+        for d in (RKS._diagnostics_store(Float32), RKS._diagnostics_store(Float64))
+            _setn(d); _seta(d); _rst(d); _cmt(d)                            # warm this precision
+            @test (@allocated _setn(d)) == 0 && (@allocated _seta(d)) == 0
+            @test (@allocated _rst(d)) == 0 && (@allocated _cmt(d)) == 0
+            @test (@inferred _seta(d)) === d
+            @test (@inferred RKS._diag_slot(d, Val(3))) isa RKS.diagnostics_ham_type(d)
+        end
+        # RESET is the authoritative source write (RK 08:48): zeros COMMITTED (exception safety) + marks all
+        # four PENDING-PRODUCED (current within the epoch). A dominated stats_f read is valid mid-epoch.
+        RKS._diagnostics_reset!(d64)
+        @test RKS.diagnostics_committed_mask(d64) == UInt(0)               # nothing committed mid-epoch
+        @test all(RKS._diag_produced(d64, Val(i)) for i in 1:4)           # all four produced within-epoch
+        @test !any(RKS._diag_committed(d64, Val(i)) for i in 1:4)
+        # reset → stats read/update → commit: stats_f reads acceptance_rate (produced, valid) then updates
+        @test RKS._diag_produced(d64, Val(3))                              # acceptance_rate readable mid-epoch
+        RKS._diag_set!(d64, Val(1), 5); RKS._diag_set!(d64, Val(3), 0.8)   # stats writes n_steps + acceptance
+        RKS._diagnostics_root_commit!(d64)                                 # SINGLE root commit
+        @test RKS.diagnostics_committed_mask(d64) == UInt(0x0f)            # all four blessed at commit
+        @test RKS._diag_slot(d64, Val(1)) == 5 && RKS._diag_slot(d64, Val(3)) == 0.8
+        # THROW-before-commit: reset + producer writes but NO root commit → committed stays 0 (nothing
+        # falsely current cross-epoch)
+        dth = RKS._diagnostics_store(Float64)
+        RKS._diagnostics_root_commit!(dth)                                 # a prior epoch committed something
+        RKS._diagnostics_reset!(dth); RKS._diag_set!(dth, Val(2), 3)       # new epoch: reset + a write
+        # (epoch would throw here, before _diagnostics_root_commit!)
+        @test RKS.diagnostics_committed_mask(dth) == UInt(0)              # committed reset-zeroed, not blessed
+    end
+
+    @testset "nuts_state — MIXED endpoints+vectors+scalars frame: scalar 0-B, buffers direct, F32/F64 (RK 08:47/08:51)" begin
+        # a representative concrete top-frame slot group (the _CanonOwnedN field ABI, NOT _OwnerState): a
+        # buffer (endpoint mom), a buffer (tree), a scalar Int (n_steps), a scalar float (acceptance_rate).
+        # Cover BOTH scalar+buffer precision combos so the F32/F64 claim is literal (typed via oftype).
+        _sn(f) = RKS._canon_set!(f, Val(3), 9)                             # scalar n_steps
+        _sa(f) = RKS._canon_set!(f, Val(4), oftype(RKS._canon_slot(f, Val(4)), 0.7))  # scalar acceptance
+        _cp(f, s) = RKS._canon_copy_slot!(f, s, Val(1))                    # buffer copy — DIRECT array
+        for (Tsc, Tbuf) in ((Float32, Float64), (Float64, Float32))
+            mom = Tbuf[1, 2]; treebuf = Tsc[3, 4]
+            frame = RKS._CanonOwned4(mom, treebuf, 0, zero(Tsc), RKS._owner_mask(4, [1, 2]))
+            src = RKS._CanonOwned4(Tbuf[7, 8], Tsc[0, 0], 0, zero(Tsc), RKS._owner_mask(4, Int[]))
+            @test typeof(RKS._canon_slot(frame, Val(2))) === Vector{Tsc}   # buffer eltype preserved
+            @test typeof(RKS._canon_slot(frame, Val(4))) === Tsc           # scalar precision preserved
+            _sn(frame); _sa(frame); _cp(frame, src)                        # warm this precision
+            @test (@allocated _sn(frame)) == 0 && (@allocated _sa(frame)) == 0  # scalar setfield! exact 0-B
+            @test (@allocated _cp(frame, src)) == 0                         # buffer copy exact 0-B (direct)
+            @test (@inferred _cp(frame, src)) === frame                     # buffer copy @inferred
+            @test RKS._canon_slot(frame, Val(1)) === mom                    # buffer identity kept (direct)
+            @test RKS._canon_slot(frame, Val(3)) == 9 && RKS._canon_slot(frame, Val(4)) == oftype(zero(Tsc), 0.7)
+            @test (@inferred RKS._canon_slot(frame, Val(4))) isa Tsc
+        end
+    end
+
     @testset "poc binder/plan seam accessors (RK 04:41)" begin
         integ = RKS.kernel_registration(leapfrog_ep!)
         plan = RKS._kernel_factory_endpoint_plan(phasepoint_ep, integ)

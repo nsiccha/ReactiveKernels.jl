@@ -203,6 +203,60 @@ owner_current_mask(s::_OwnerState) = getfield(s, :current)
 @inline _owner_copy_current!(dest::_OwnerState{Tok,T,W}, src::_OwnerState{Tok,T,W}) where {Tok,T,W} =
     (setfield!(dest, :current, getfield(src, :current)); dest)
 
+# --- compiler-owned DIAGNOSTICS storage for nuts_state (RK 08:42) ------------------------------------
+#
+# A `nuts_state` owns four scalar diagnostics — `n_steps`/`reached_depth` (Int) and `acceptance_rate`/
+# `dham` (following `init.ham`'s type, so F32/F64 is PRESERVED — no Float64 promotion). They are the
+# compiler-owned storage the registered `stats_f` (nuts_stats!) writes (n_steps + acceptance_rate per
+# transition), `step!` writes (reached_depth per depth), and `start!` writes (dham per leaf). Slot order:
+# 1=n_steps, 2=reached_depth, 3=acceptance_rate, 4=dham. A Val-indexed get/set/bless seam (identical shape
+# to `_OwnerState`) so poc's root compiler reads/writes them literally; NO Ref, NO boxing, exact 0-B.
+mutable struct _DiagnosticsStore{Tham}
+    n_steps::Int
+    reached_depth::Int
+    acceptance_rate::Tham
+    dham::Tham
+    committed::UInt        # blessed at the SINGLE root commit — CROSS-epoch validity (0 mid-epoch)
+    pending::UInt          # PRODUCED within the current epoch (reset + producers) — within-epoch validity
+end
+# Constructed from `init.ham`'s TYPE — F32/F64 PRESERVED. `n_steps`/`reached_depth` are `Int`; the fresh
+# store has nothing produced or committed yet.
+_diagnostics_store(::Type{Tham}) where {Tham} =
+    _DiagnosticsStore{Tham}(0, 0, zero(Tham), zero(Tham), UInt(0), UInt(0))
+diagnostics_ham_type(::_DiagnosticsStore{Tham}) where {Tham} = Tham
+@generated _diag_slot(s::_DiagnosticsStore, ::Val{I}) where {I} = :(getfield(s, $(QuoteNode(fieldname(_DiagnosticsStore, I)))))
+# A producer write marks the slot PRODUCED (within-epoch); the value change + pending set are 0-B.
+@generated function _diag_set!(s::_DiagnosticsStore, ::Val{I}, v) where {I}
+    fn = QuoteNode(fieldname(_DiagnosticsStore, I))
+    :(setfield!(s, $fn, v); setfield!(s, :pending, getfield(s, :pending) | (UInt(1) << ($I - 1))); s)
+end
+# Within-epoch readability (RK 08:48): a diagnostic is READABLE once PRODUCED this epoch — a dominated
+# `stats_f` read of `acceptance_rate` is valid even though the COMMITTED mask is zero mid-epoch. Poc must
+# NOT recompute/reject on committed==0 alone; it consults `pending` for within-epoch reads.
+@inline _diag_produced(s::_DiagnosticsStore, ::Val{I}) where {I} =
+    (getfield(s, :pending) >> (I - 1)) & UInt(1) == UInt(1)
+@inline _diag_committed(s::_DiagnosticsStore, ::Val{I}) where {I} =
+    (getfield(s, :committed) >> (I - 1)) & UInt(1) == UInt(1)
+@inline _diag_bless!(s::_DiagnosticsStore, ::Val{I}) where {I} =
+    (setfield!(s, :pending, getfield(s, :pending) | (UInt(1) << (I - 1))); s)
+diagnostics_pending_mask(s::_DiagnosticsStore) = getfield(s, :pending)
+diagnostics_committed_mask(s::_DiagnosticsStore) = getfield(s, :committed)
+# Per-transition RESET (RK 08:42/08:48): reset is itself the AUTHORITATIVE source write for all four
+# diagnostics (zero in the preserved type). It ZEROS the committed mask (so an outer-epoch throw before
+# the root commit leaves nothing falsely current cross-epoch) AND marks all four PENDING-PRODUCED (they
+# are current within this epoch — not derived values awaiting a recipe). Exact 0-B.
+@inline function _diagnostics_reset!(s::_DiagnosticsStore{Tham}) where {Tham}
+    setfield!(s, :n_steps, 0); setfield!(s, :reached_depth, 0)
+    setfield!(s, :acceptance_rate, zero(Tham)); setfield!(s, :dham, zero(Tham))
+    setfield!(s, :committed, UInt(0))          # exception safety: nothing committed until the root commit
+    setfield!(s, :pending, UInt(0x0f))         # all four PRODUCED within the epoch
+    s
+end
+# The SINGLE root commit at epoch end (RK 08:48): bless every produced diagnostic into the committed mask.
+# A throw BEFORE this leaves `committed` at its reset-zeroed value — no diagnostic is falsely current.
+@inline _diagnostics_root_commit!(s::_DiagnosticsStore) =
+    (setfield!(s, :committed, getfield(s, :pending)); s)
+
 # --- callable field / partial resolution (RK callable-Token redirect) --------
 #
 # A callable FIELD (`step_f`, `stats_f`) must resolve to a REGISTERED kernel/intrinsic
