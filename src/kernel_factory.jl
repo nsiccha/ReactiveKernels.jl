@@ -883,6 +883,21 @@ function _kernel_construct_endpoint(::Val{Token}, plan::_KernelPlan, values,
      _canon_construct(Val(:shared), shared_vals, shared_mask))
 end
 
+# Construct ONLY the owned object (HAVE-only mask) — for owned CHILDREN (fwd/bwd/proposals) that share the
+# group's SINGLE shared authority by identity (RK 06:59): a child must NOT build/discard its own shared
+# copy. Same HAVE-only currentness as `_kernel_construct_endpoint`; the child is then seeded from init.
+function _kernel_construct_owned_child(::Val{Token}, plan::_KernelPlan, values) where {Token}
+    canons, roles = kernel_plan_superset(plan)
+    N = length(canons)
+    owned_vals = ntuple(N) do i
+        roles[i] === :owned ? deepcopy(values[canons[i]]) : nothing
+    end
+    prodk = Set{Int}(c for (c, _) in kernel_plan_producer(plan))
+    have = Set{Int}(c for c in kernel_plan_entry_current(plan) if !(c in prodk))
+    owned_mask = _owner_mask(N, Int[i for i in 1:N if roles[i] === :owned && canons[i] in have])
+    _canon_construct(Val(:owned), owned_vals, owned_mask)
+end
+
 function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol}; key_token = nothing)
     graph = _kernel_the_graph(skel)
     pmap = _kernel_ports_map(skel)
@@ -1058,6 +1073,38 @@ end
         dest
     end
 end
+# Seed an owned CHILD endpoint from `src` (init→fwd/bwd/proposals): value + VALIDITY transfer with ZERO
+# additional pgrad (RK 06:53/06:56). Restricted to `_CanonOwned` — SHARED authority is uncopyable BY TYPE
+# (referenced by identity, never seeded). EXCEPTION-SAFE: validate every buffer shape BEFORE any mutation,
+# DIRTIFY dest first, copy each slot, and install `src`'s saved mask ONLY after every slot succeeds — a
+# mid-copy `copyto!` throw leaves NO stale current bit. `dest === src` is a mask-preserving no-op. The
+# scalar-vs-buffer branch is generated from the CONCRETE fieldtype (no runtime `isa`); exact 0-B.
+@generated function _canon_copy_endpoint!(dest::S, src::S) where {S<:_CanonOwned}
+    N = fieldcount(S) - 1
+    W = fieldcount(fieldtype(S, N + 1))                  # `current::NTuple{W,UInt}`
+    valid = Any[]; copies = Any[]; zargs = Any[]
+    for i in 1:N
+        fn = QuoteNode(fieldname(S, i)); ft = fieldtype(S, i)
+        if ft <: AbstractArray
+            push!(valid, :(size(getfield(dest, $fn)) == size(getfield(src, $fn)) || throw(
+                _KernelFactoryReject("copy-endpoint buffer shape mismatch at owned slot $($i)"))))
+            push!(copies, :(copyto!(getfield(dest, $fn), getfield(src, $fn))))
+        elseif ft !== Nothing                            # a real scalar/isbits slot (skip Nothing role)
+            push!(copies, :(setfield!(dest, $fn, getfield(src, $fn))))
+        end
+    end
+    for _ in 1:W; push!(zargs, :(zero(UInt))); end       # LITERAL zero mask (no closure in returned AST)
+    zmask = Expr(:tuple, zargs...)
+    quote
+        dest === src && return dest                       # no-op: dest's mask unchanged
+        saved = getfield(src, :current)
+        $(valid...)                                       # ALL shape checks BEFORE any mutation
+        setfield!(dest, :current, $zmask)                 # DIRTIFY dest before copies
+        $(copies...)
+        setfield!(dest, :current, saved)                  # install validity ONLY after all slots succeed
+        dest
+    end
+end
 _canon_current_mask(s::_Canon) = getfield(s, :current)
 # Currentness of a canonical field (the field index IS the mask bit) — a producer BLESSES it.
 @inline _canon_current(s::_Canon, ::Val{I}) where {I} =
@@ -1147,6 +1194,41 @@ end
     _canon_bless2!(s, b.dest, b.pot)
     s
 end
+
+# --- PREPARED factory: the plan is captured ONCE at preparation (RK 06:55) --------------------------
+#
+# The callable constructor must consume a DEFINITION/PREPARATION-captured immutable plan with ZERO
+# planner / live-graph access per instance. `_prepare_factory` performs the SINGLE `plan(graph)`
+# invocation (inside `_kernel_factory_endpoint_plan`); the per-instance `_construct_prepared` reads only
+# the captured plan — it takes NO graph and never calls `plan()`, so poisoning the live graph after
+# preparation cannot change any constructed instance. The selected grad Recipe id and the endpoint Token
+# are TYPE parameters (type-level selected identity), so the grad binding stays @inferred.
+struct _PreparedFactory{Token,GR,P<:_KernelPlan,E<:Tuple}
+    plan::P
+    external::E     # the identity-kept (never deep-copied) shared canonical ids (grad_f/pot_f/stats_f)
+end
+kernel_prepared_plan(pf::_PreparedFactory) = pf.plan
+kernel_prepared_grad_recipe(::_PreparedFactory{Token,GR}) where {Token,GR} = GR
+kernel_prepared_token(::_PreparedFactory{Token}) where {Token} = Token
+
+function _prepare_factory(skel, integrator::_KernelRegistration, external::Tuple, grad_recipe::Int)
+    plan = _kernel_factory_endpoint_plan(skel, integrator)   # THE one planner call — at preparation only
+    _PreparedFactory{integrator.token, grad_recipe, typeof(plan), typeof(external)}(plan, external)
+end
+
+# Per-instance construction from the captured plan — NO graph, NO plan(). Builds the HAVE-only owned +
+# shared endpoint, then seeds the gradient via the type-stable binding (ONE pgrad, atomic pot+dpot).
+function _construct_prepared(pf::_PreparedFactory{Token,GR}, values, pgrad!, pos) where {Token,GR}
+    ow, sh = _kernel_construct_endpoint(Val(Token), pf.plan, values, pf.external)
+    _kernel_apply_grad!(_grad_binding_from_plan(pf.plan, Val(GR), pgrad!, ow), ow, pos)
+    (ow, sh)
+end
+
+# Seed the owned CHILD endpoints (fwd/bwd/proposals) from a constructed init — value + validity transfer,
+# ZERO additional pgrad (RK 06:53). Each child is an independently-constructed HAVE-only owned object of
+# the SAME layout; copy transfers init's producer-blessed state exactly.
+_seed_children!(init::_CanonOwned, children::Vararg{_CanonOwned}) =
+    (for c in children; _canon_copy_endpoint!(c, init); end; children)
 
 # The concrete family member for a given arity — a COMPILE-TIME type lookup (no runtime Symbol
 # dispatch, no runtime emission). A layout wider than the predeclared family throws a deterministic

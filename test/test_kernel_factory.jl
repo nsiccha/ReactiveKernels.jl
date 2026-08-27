@@ -114,6 +114,20 @@ end
 @kernel gradonly_step!(phasepoint; stepsize) = begin
     @. phasepoint.pos += stepsize * phasepoint.dham_dpos
 end
+# an ISOLATED duplicate whose live graph the prepared-factory poison test may mutate WITHOUT leaking
+# into the clean gradonly_ep used by the copy test (RK 06:59).
+@kernel gradonly_poison_ep(grad_f, pos) = begin
+    pot, dpot_dpos = grad_f(pos)
+    dham_dpos = dpot_dpos
+end
+@kernel gradonly_poison_step!(phasepoint; stepsize) = begin
+    @. phasepoint.pos += stepsize * phasepoint.dham_dpos
+end
+# a COUNTING in-place gradient — proves 'zero extra pgrad' non-vacuously (count stays 1 across child seeds)
+mutable struct CountingPgrad; n::Int; end
+(c::CountingPgrad)(dest, pos) = (c.n += 1; dest .= 2 .* pos; sum(abs2, pos))
+# function barrier for the whole-endpoint mixed scalar+buffer copy 0-B / @inferred gate (RK 07:02)
+_copyep0b(d, s) = RKS._canon_copy_endpoint!(d, s)
 # a SECOND, byte-identical endpoint DEFINITION — same slot/recipe SHAPE, DIFFERENT canonical
 # Value identities — to prove the plan key distinguishes definitions (RK 04:17c).
 @kernel phasepoint_ep2(pot_f, grad_f, metric, pos, mom) = begin
@@ -961,37 +975,106 @@ end
         @test RKS._canon_slot(o, Val(1)) == [2.0, 4.0]
     end
 
-    @testset "construction seam — HAVE-only start, TYPE-STABLE grad binding from selected recipe, one apply → entry_current (RK 05:47/05:59/06:49)" begin
+    @testset "construction seam — PREPARED plan (zero planner/graph per instance), HAVE-only, type-stable grad, mask==entry_current (RK 05:47/06:49/06:55)" begin
+        integ = RKS.kernel_registration(gradonly_poison_step!)   # ISOLATED endpoint — poison never leaks
+        g = RKS.kernel_graph(gradonly_poison_ep)
+        canonof(n) = RKS.canon_id(g, gradonly_poison_ep.ports[n].id)
+        cpos, cpot, cdpot, cgf = canonof(:pos), canonof(:pot), canonof(:dpot_dpos), canonof(:grad_f)
+        plan0 = RKS._kernel_factory_endpoint_plan(gradonly_poison_ep, integ)
+        prod = Dict(RKS.kernel_plan_producer(plan0))
+        @test haskey(prod, cpot) && haskey(prod, cdpot) && prod[cpot] == prod[cdpot]  # ONE grad recipe
+        gr = prod[cpot]
+        # PREPARE ONCE — the single plan(graph) call is here; the captured factory holds an immutable plan
+        pf = RKS._prepare_factory(gradonly_poison_ep, integ, (cgf,), gr)
+        key_before = RKS.kernel_plan_key(RKS.kernel_prepared_plan(pf))
+        canons, _ = RKS.kernel_plan_superset(RKS.kernel_prepared_plan(pf)); N = length(canons)
+        pos_slot = RKS.kernel_plan_field(plan0, cpos)[2]
+        pot_slot = RKS.kernel_plan_field(plan0, cpot)[2]
+        dpot_slot = RKS.kernel_plan_field(plan0, cdpot)[2]
+        # POISON the live (isolated) graph AFTER preparation — an alternate producer of dpot_dpos
+        RKS.add!(g; inputs = (gradonly_poison_ep.ports[:pos],), outputs = (gradonly_poison_ep.ports[:dpot_dpos],),
+                 op = identity, cost = 1.0, cse_key = nothing, effectful = false)
+        # CONSTRUCT two instances from the captured plan — ZERO plan()/graph access; poison is invisible
+        mkvals() = Dict{Int,Any}(cpos => [1.0, 2.0], cpot => 0.0, cdpot => [0.0, 0.0], cgf => pgrad_ex!)
+        ow1, _ = RKS._construct_prepared(pf, mkvals(), pgrad_ex!, [1.0, 2.0])
+        ow2, _ = RKS._construct_prepared(pf, mkvals(), pgrad_ex!, [1.0, 2.0])
+        @test RKS.kernel_plan_key(RKS.kernel_prepared_plan(pf)) === key_before   # captured key unchanged
+        # HAVE-only start proven via a bare construct (no grad yet): pos current, pot/dpot DIRTY
+        owr, _ = RKS._kernel_construct_endpoint(Val(RKS.kernel_prepared_token(pf)),
+                                                RKS.kernel_prepared_plan(pf), mkvals(), (cgf,))
+        @test RKS._canon_current(owr, Val(pos_slot))
+        @test !RKS._canon_current(owr, Val(pot_slot)) && !RKS._canon_current(owr, Val(dpot_slot))
+        # TYPE-STABLE binding derived from the detached selected recipe outputs (RK 06:49)
+        b = @inferred RKS._grad_binding_from_plan(RKS.kernel_prepared_plan(pf), Val(gr), pgrad_ex!, owr)
+        @test isconcretetype(typeof(b)) && b.dest === Val(dpot_slot) && b.pot === Val(pot_slot)
+        # both prepared instances: identical layout/values; ONE apply → FINAL mask == entry_current
+        ecowned = sort([RKS.kernel_plan_field(plan0, c)[2]
+                        for c in RKS.kernel_plan_entry_current(plan0)
+                        if RKS.kernel_plan_field(plan0, c)[1] === :owned])
+        for ow in (ow1, ow2)
+            @test RKS._canon_slot(ow, Val(dpot_slot)) == [2.0, 4.0] && RKS._canon_slot(ow, Val(pot_slot)) == 5.0
+            @test RKS._canon_current_mask(ow) == RKS._owner_mask(N, ecowned)     # mask == entry_current
+        end
+        @test RKS._canon_slot(ow1, Val(dpot_slot)) !== RKS._canon_slot(ow2, Val(dpot_slot))  # isolated buffers
+    end
+
+    @testset "construction seam — copy owned children (ONE shared, ZERO extra pgrad, exception-safe, 0-B) (RK 06:53/06:56/06:59)" begin
         integ = RKS.kernel_registration(gradonly_step!)
-        plan = RKS._kernel_factory_endpoint_plan(gradonly_ep, integ)
         g = RKS.kernel_graph(gradonly_ep)
         canonof(n) = RKS.canon_id(g, gradonly_ep.ports[n].id)
         cpos, cpot, cdpot, cgf = canonof(:pos), canonof(:pot), canonof(:dpot_dpos), canonof(:grad_f)
-        canons, _ = RKS.kernel_plan_superset(plan); N = length(canons)
-        # the selected grad recipe is the SAME producer for BOTH outputs (RK 05:47)
-        prod = Dict(RKS.kernel_plan_producer(plan))
-        @test haskey(prod, cpot) && haskey(prod, cdpot) && prod[cpot] == prod[cdpot]
-        gr = prod[cpot]
-        # CONSTRUCT: HAVE-only mask — pos (source) starts current, produced pot/dpot start DIRTY
-        vals = Dict{Int,Any}(cpos => [1.0, 2.0], cpot => 0.0, cdpot => [0.0, 0.0], cgf => pgrad_ex!)
-        ow, sh = RKS._kernel_construct_endpoint(Val(:grad), plan, vals, (cgf,))
-        pos_slot = RKS.kernel_plan_field(plan, cpos)[2]
-        pot_slot = RKS.kernel_plan_field(plan, cpot)[2]
+        gr = Dict(RKS.kernel_plan_producer(RKS._kernel_factory_endpoint_plan(gradonly_ep, integ)))[cpot]
+        pf = RKS._prepare_factory(gradonly_ep, integ, (cgf,), gr)
+        plan = RKS.kernel_prepared_plan(pf)
         dpot_slot = RKS.kernel_plan_field(plan, cdpot)[2]
-        @test RKS._canon_current(ow, Val(pos_slot))                             # HAVE source current
-        @test !RKS._canon_current(ow, Val(pot_slot)) && !RKS._canon_current(ow, Val(dpot_slot))  # dirty
-        # TYPE-STABLE binding derived from the detached selected recipe outputs (RK 06:49)
-        b = @inferred RKS._grad_binding_from_plan(plan, Val(gr), pgrad_ex!, ow)
-        @test isconcretetype(typeof(b))                                         # concrete prepared field
-        @test b.dest === Val(dpot_slot) && b.pot === Val(pot_slot)             # buffer=dest, scalar=pot
-        # ONE apply seeds both outputs atomically; grad recipe is the ONLY recipe → mask == entry_current
-        RKS._kernel_apply_grad!(b, ow, [1.0, 2.0])
-        @test RKS._canon_current(ow, Val(pot_slot)) && RKS._canon_current(ow, Val(dpot_slot))
-        @test RKS._canon_slot(ow, Val(dpot_slot)) == [2.0, 4.0] && RKS._canon_slot(ow, Val(pot_slot)) == 5.0
-        ecowned = sort([RKS.kernel_plan_field(plan, c)[2]
-                        for c in RKS.kernel_plan_entry_current(plan)
-                        if RKS.kernel_plan_field(plan, c)[1] === :owned])
-        @test RKS._canon_current_mask(ow) == RKS._owner_mask(N, ecowned)        # FINAL mask == entry_current
+        pot_slot = RKS.kernel_plan_field(plan, cpot)[2]
+        tok = RKS.kernel_prepared_token(pf)
+        mkvals(pg) = Dict{Int,Any}(cpos => [1.0, 2.0], cpot => 0.0, cdpot => [0.0, 0.0], cgf => pg)
+        pg = CountingPgrad(0)
+        # the GROUP builds the shared authority ONCE (init's full construct); children are OWNED-ONLY.
+        init, sh = RKS._construct_prepared(pf, mkvals(pg), pg, [1.0, 2.0])       # ONE pgrad (count -> 1)
+        @test pg.n == 1
+        fwd = RKS._kernel_construct_owned_child(Val(tok), plan, mkvals(pg))      # owned-only: NO shared built
+        bwd = RKS._kernel_construct_owned_child(Val(tok), plan, mkvals(pg))
+        @test pg.n == 1                                                          # constructing children ran NO pgrad
+        gbuf = RKS._canon_slot(fwd, Val(dpot_slot))
+        @test !RKS._canon_current(fwd, Val(dpot_slot))                          # child dirty pre-seed
+        RKS._seed_children!(init, fwd, bwd)
+        @test pg.n == 1                                                          # seeding children ran NO pgrad
+        for ch in (fwd, bwd)
+            @test RKS._canon_current_mask(ch) == RKS._canon_current_mask(init)  # VALIDITY transferred
+            @test RKS._canon_slot(ch, Val(dpot_slot)) == [2.0, 4.0] && RKS._canon_slot(ch, Val(pot_slot)) == 5.0
+        end
+        @test RKS._canon_slot(fwd, Val(dpot_slot)) === gbuf                     # child buffer identity kept
+        @test RKS._canon_slot(fwd, Val(dpot_slot)) !== RKS._canon_slot(init, Val(dpot_slot))  # NOT aliased
+        # dest === src is a mask+value-preserving no-op
+        m = RKS._canon_current_mask(init); v = copy(RKS._canon_slot(init, Val(dpot_slot)))
+        RKS._canon_copy_endpoint!(init, init)
+        @test RKS._canon_current_mask(init) == m && RKS._canon_slot(init, Val(dpot_slot)) == v
+        # whole mixed scalar+buffer copy: BOTH Float32 and Float64 via a function barrier — @inferred,
+        # result IDENTITY (returns dest), exact 0-B for each (RK 07:02)
+        for T in (Float32, Float64)
+            pgT = CountingPgrad(0)
+            vvT() = Dict{Int,Any}(cpos => T[1, 2], cpot => zero(T), cdpot => T[0, 0], cgf => pgT)
+            it, _ = RKS._construct_prepared(pf, vvT(), pgT, T[1, 2])
+            @test pgT.n == 1 && RKS._canon_slot(it, Val(pot_slot)) === T(5)     # F32/F64 scalar preserved
+            ch = RKS._kernel_construct_owned_child(Val(tok), plan, vvT())
+            RKS._seed_children!(it, ch)                                          # warm the specialization
+            @test pgT.n == 1                                                     # child seed ran NO pgrad
+            @test (@inferred _copyep0b(ch, it)) === ch                          # result identity, inferred
+            @test (@allocated _copyep0b(ch, it)) == 0                           # exact 0-B
+        end
+        # EXCEPTION-SAFE: a buffer-shape mismatch throws BEFORE any mutation → dest keeps OLD mask AND values
+        bad = RKS._kernel_construct_owned_child(Val(tok), plan,
+            Dict{Int,Any}(cpos => [9.0], cpot => 7.0, cdpot => [8.0], cgf => pg))
+        premask = RKS._canon_current_mask(bad); badpot = RKS._canon_slot(bad, Val(pot_slot))
+        badbuf = copy(RKS._canon_slot(bad, Val(dpot_slot)))
+        @test_throws RKS._KernelFactoryReject RKS._canon_copy_endpoint!(bad, init)
+        @test RKS._canon_current_mask(bad) == premask                          # mask untouched
+        @test RKS._canon_slot(bad, Val(pot_slot)) == badpot                    # values untouched (pre-validated)
+        @test RKS._canon_slot(bad, Val(dpot_slot)) == badbuf
+        # the copier is CanonOwned-only — shared authority is uncopyable BY TYPE
+        @test !hasmethod(RKS._canon_copy_endpoint!, Tuple{RKS._CanonShared, RKS._CanonShared})
     end
 
     @testset "poc binder/plan seam accessors (RK 04:41)" begin
