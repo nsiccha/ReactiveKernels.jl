@@ -108,3 +108,43 @@ collectstats!.
    (prove result===state). Add a discriminator: changing the internal leaf carrier cannot determine the
    public return. Do NOT document/export leaf result identity. (Soften the compile_leapfrog docstring's
    "returns the owned object (!!-style identity)" claim on the fold.)
+
+## ========== REBASED onto 58e3903 (HEAD f397a3c) — REAL-FRAME BINDING IN PROGRESS ==========
+Rebase clean (control 31/31, codegen 108/108, on 58e3903). Control compiler builds the REAL nuts_state CFG
+(step! 27 blocks, finish! 8, start! 14). Two committed control milestones on the new base: the design-B
+compiler + the real-nuts CFG (_SetReturn/_PlaceSwap/native collection loops).
+
+### _NutsFrame{EP,TREE,SH,Tham,M,STEP,STATS} contract (kernel_factory.jl:279), 18 fields in getfield order:
+1 init::EP<:_CanonOwned  2 fwd::EP  3 bwd::EP  4 trees::Vector{TREE} (len max_depth+1; TREE = NamedTuple
+(;log_weight::Vector, bwd=(;mom,dham_dmom), bwd_fwd=(;mom,dham_dmom), summed_mom=(;bwd,fwd)) — NOT canon)
+5 proposals::Vector{EP} (len max_depth+2, each _CanonOwned)  6 gofwd::Bool  7 may_sample::Bool
+8 may_continue::Bool  9 diverged::Bool  10 derived_pending::UInt  11 derived_committed::UInt
+12 diag::_DiagnosticsStore{Tham}(n_steps::Int,reached_depth::Int,acceptance_rate::Tham,dham::Tham,
+committed::UInt,pending::UInt)  13 shared::SH<:_CanonShared  14 entry_mask::M  15 step_f::STEP(_PreparedCallable)
+16 stats::STATS(_StatsBinding)  17 max_depth::Int  18 min_dham::Tham.
+
+### Binding plan (emit control compiler's nuts_state places -> frame accessors)
+- init/fwd/bwd/proposals[i]: _CanonOwned via canon ABI (_canon_slot/_canon_set!/_canon_bless!); NAMED-PORT
+  slot is compile-time `kernel_plan_named_slot_val(pf.plan, Val(:pos))` (syntax added; Val-name, 0-B).
+  => REUSE compile_prepared_initialization / compile_prepared_schedule / compile_leapfrog VERBATIM per endpoint.
+- trees[depth]: getfield(frame,:trees)[depth] NamedTuple; mutate via getproperty chains + broadcast/fill! (0-B).
+- proposals swap (swapproposal!): plain Vector element swap on getfield(frame,:proposals).
+- gofwd/may_sample/may_continue/diverged: getfield(frame, :field) (Bool); _nuts_frame_reset_control!.
+- diag n_steps/reached_depth/acceptance_rate/dham -> _diag_set!(diag, Val(1/2/3/4), v); _diagnostics_reset!/
+  _diagnostics_root_commit!; diverged via _nuts_produce_diverged!/_nuts_invalidate_diverged!/_nuts_derived_root_commit!.
+- step_f(ep) at start!(depth==1): resolve leaf MethodIR from prepared_callable_registration(nuts_frame_step(frame)).source
+  via method_irs; stepkw = prepared_callable_kwargs; splice compile_leapfrog(pf, typeof(ep), typeof(shared), leaf_ir)
+  -> fn(ep, shared, handles, stepkw). (Requested one-call helper prepared_callable_leaf(sf)->(leaf_ir,stepkw).)
+- stats_f/collectstats! -> nuts_frame_stats(frame) _StatsBinding + _stats_produced!(diag, binding).
+
+### Two-phase construction + intended run sequence (canonical: test_kernel_factory.jl:1316-1379)
+_construct_nuts_frame(pf, endpoint_values, max_depth; step_f, stats_f, min_dham) [unseeded, dirty] ->
+compile_prepared_initialization(pf, typeof(frame.init), typeof(frame.shared)); initfn(frame.init, frame.shared,
+kernel_prepared_handles(pf)) [one pgrad+chol; init mask==entry_current] -> _seed_nuts_children!(frame)
+[REJECTS unless init mask==entry_mask; _canon_copy_endpoint! into fwd/bwd/proposals, zero extra pgrad] ->
+run the compiled control machine over the frame under ONE outer epoch -> return the frame's authored return state
+(NOT the private leaf carrier; prove result===state). No nuts!! runtime entry exists yet — this is it to build.
+
+### The control compiler's EMIT is the piece to rebind: emit_effect/emit_val currently target a synthetic
+### S.field. Rebuild them to target the frame accessors above (endpoints canon ABI + trees getproperty +
+### control-scalar getfield + diag Val). The CFG/liveness/dispatcher/SCC-inlining logic is DONE + proven.
