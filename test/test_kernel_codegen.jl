@@ -454,6 +454,38 @@ end
     @test !occursin("broadcasted", string(RK._exec_rhs(scall, c2, true)))      # scalar registered call under @. → plain
 end
 
+mutable struct _SynthCopy{T}
+    pos::Vector{T}                                          # owned buffer slot 1
+    mom::Vector{T}                                          # owned buffer slot 2
+    pot::T                                                  # owned scalar slot 3
+    current::UInt64
+end
+ReactiveKernels._owner_copy_slot!(d::_SynthCopy, s::_SynthCopy, ::Val{1}) = (copyto!(d.pos, s.pos); d)
+ReactiveKernels._owner_copy_slot!(d::_SynthCopy, s::_SynthCopy, ::Val{2}) = (copyto!(d.mom, s.mom); d)
+ReactiveKernels._owner_copy_slot!(d::_SynthCopy, s::_SynthCopy, ::Val{3}) = (setfield!(d, :pot, getfield(s, :pot)); d)
+@generated function ReactiveKernels._owner_copy_current!(d::_SynthCopy, s::_SynthCopy, ::Val{S}) where {S}
+    m = reduce(|, (UInt64(1) << (i - 1) for i in S); init = UInt64(0))
+    :(setfield!(d, :current, (getfield(d, :current) & ~$m) | (getfield(s, :current) & $m)); d)
+end
+
+@testset "codegen — EXECUTABLE copy!! strong-update: full owned closure, dest identity, currentness, 0 B" begin
+    fn, meta = RK.compile_copy([1, 2, 3])
+    @test meta.slots == (1, 2, 3)
+    dest = _SynthCopy{Float64}(zeros(2), zeros(2), 0.0, UInt64(0))     # all-dirty
+    src  = _SynthCopy{Float64}([1.0, 2.0], [3.0, 4.0], 9.0, typemax(UInt64))  # all-current
+    p = dest.pos                                                       # capture dest's buffer identity
+    r = fn(dest, src)
+    @test r === dest                                                  # result === dest (identity preserved)
+    @test dest.pos == src.pos && dest.mom == src.mom && dest.pot == src.pot   # COMPLETE owned closure transferred
+    @test dest.pos === p                                             # copyto! in place — buffer NOT rebound
+    @test dest.current == 0b111                                       # owned-slot (1,2,3) currentness transferred
+    barrier(f, a, b) = @allocated f(a, b); barrier(fn, dest, src)
+    @test barrier(fn, dest, src) == 0                                # exact 0 B
+    @inferred fn(dest, src)
+    @test_throws RK._LLowerReject RK.compile_copy([1, 2, 2])          # duplicate (un-collapsed alias) rejects
+    @test_throws RK._LLowerReject RK.compile_copy(Int[])             # empty closure rejects
+end
+
 struct _CgEvilProp end
 Base.getproperty(::_CgEvilProp, ::Symbol) = error("side-effecting getproperty must NOT run in hot lowering")
 

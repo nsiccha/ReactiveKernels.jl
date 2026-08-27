@@ -45,6 +45,14 @@ function _shared_slot end
 function _owner_kill_current! end
 function _owner_bless_current! end
 
+# The Val-ABI structural copy of ONE owned physical slot dest←src (copyto! a buffer / setfield! a scalar,
+# per the slot's type — the storage layer decides) and the copy of its currentness bit. For copy!!'s
+# strong-update: the COMPLETE owned closure transfers, alias-collapsed, SHARED authority excluded.
+# Declared here so emitted copies resolve; storage types implement them (synthetic test state now; syntax's
+# `_canon_copy_slot!` on the rebase).
+function _owner_copy_slot! end
+function _owner_copy_current! end
+
 # ---- consume the seam: recompute graph from producer/recipes (NO second planner) --------------------
 
 # HAVE canonical ids from the seam ALONE: entry-current = HAVE ∪ producer-owned keys, so the sources are
@@ -441,6 +449,26 @@ function compile_effect_root(ir::MethodIR, fieldcanon::Dict{Symbol,Int}, slotof:
     fn = compile(:((state, $rng) -> $(Expr(:block, binds..., body..., :(return state)))))
     (fn, (; calls, owned_slots = unique(ctx.slots_used), written_canons = unique(written_canons),
           bless_slots, kill_slots = dep_slots))
+end
+
+"""
+    compile_copy(owned_slots) -> (fn, meta)
+
+Emit the executable structural strong-update `copy!!(dest, src)` (RK locked contract): the COMPLETE owned
+physical closure `owned_slots` (alias-collapsed, SHARED authority EXCLUDED) transfers dest←src slot-by-slot
+via `_owner_copy_slot!` (copyto! a buffer / setfield! a scalar — the storage layer decides by slot type),
+and the owned-closure currentness bits transfer via `_owner_copy_current!` — preserving dest's identity.
+`fn(dest, src)` returns dest at 0-B. Duplicate slots (un-collapsed aliases) reject.
+"""
+function compile_copy(owned_slots::Vector{Int})
+    isempty(owned_slots) && _l_reject("copy!! owned closure is empty")
+    length(unique(owned_slots)) == length(owned_slots) ||
+        _l_reject("copy!! owned slots contain duplicates — aliases must collapse to one physical slot")
+    slots = Tuple(sort(owned_slots))
+    body = Any[:(_owner_copy_slot!(dest, src, Val($I))) for I in slots]        # copyto!/setfield! per slot
+    push!(body, :(_owner_copy_current!(dest, src, Val($slots))))              # derived validity transfers
+    fn = compile(:((dest, src) -> $(Expr(:block, body..., :(return dest)))))
+    (fn, (; slots))
 end
 
 # A place INDEX expression (`trees[1]` → `1`): a literal index, or a bound formal (runtime), else reject.
