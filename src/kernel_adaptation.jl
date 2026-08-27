@@ -93,6 +93,12 @@ struct _DOrchestration{Borrow,SegmentForest} <: _SMDomainNode end
 # and exact `Base.eachcol` registration have passed the builtin borrow-domain check.
 struct _DSanctionedColumn{T} end
 
+# RGF's `Expr` body must remain strongly rooted because its cache deliberately holds only a WeakRef.  The hot
+# call path uses `generated_callfunc` (keyed on the concrete RGF type) and never traverses that body; LLVM and
+# allocation gates below prove the distinction.  Do not mislabel the retained library cache root as an
+# Any-free value graph.
+_sm_compiled_call(f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction) = f
+
 _sm_reject(msg) = throw(_LLowerReject(msg))
 
 function _sm_exact_callee(x::_RegisteredCall)
@@ -109,6 +115,7 @@ _sm_leaf_type(::Type{T}) where {T} = T <: AbstractArray ? eltype(T) : T
 function _sm_numeric_promote(argts::Tuple, opname::Symbol)
     !isempty(argts) && all(_kernel_dom_num_scalar, argts) ||
         _sm_reject("$opname operands $argts are outside the sanctioned builtin scalar domain")
+    any(==(Bool), argts) && _sm_reject("$opname does not admit Bool operands")
     P = promote_type(argts...)
     _kernel_dom_num_scalar(P) || _sm_reject("$opname promotes $argts to unsupported `$P`")
     P
@@ -120,9 +127,6 @@ function _sm_primitive_result(@nospecialize(f), argts::Tuple)
     if f === Base.:+ || f === Base.:*
         length(argts) >= 2 || _sm_reject("primitive `$f` requires at least two operands")
         return _sm_numeric_promote(argts, nameof(f))
-    elseif f === Base.:%
-        length(argts) == 2 || _sm_reject("primitive `%` requires exactly two operands")
-        return _sm_numeric_promote(argts, :%)
     elseif f === Base.:-
         length(argts) in (1, 2) || _sm_reject("primitive `-` requires one or two operands")
         return _sm_numeric_promote(argts, :-)
@@ -132,12 +136,6 @@ function _sm_primitive_result(@nospecialize(f), argts::Tuple)
         P <: AbstractFloat && return P
         all(_kernel_dom_int_scalar, argts) && return Float64 # Base integer `/` is floating division.
         _sm_reject("primitive `/` has no declared output rule for promoted type `$P`")
-    elseif f === Base.:\
-        length(argts) == 2 || _sm_reject("primitive `\\` requires exactly two operands")
-        P = _sm_numeric_promote(argts, Symbol("\\"))
-        P <: AbstractFloat && return P
-        all(_kernel_dom_int_scalar, argts) && return Float64
-        _sm_reject("primitive `\\` has no declared output rule for promoted type `$P`")
     elseif f === Base.:^
         length(argts) == 2 || _sm_reject("primitive `^` requires exactly two operands")
         P = _sm_numeric_promote(argts, :^)
@@ -163,17 +161,11 @@ function _sm_primitive_result(@nospecialize(f), argts::Tuple)
             _sm_reject("primitive `length` requires one sanctioned builtin container")
         return Int
     elseif f === Base.:(:)
-        length(argts) in (2, 3) && all(_kernel_dom_int_scalar, argts) ||
-            _sm_reject("primitive `Colon` requires two or three builtin integer scalars")
-        P = promote_type(argts...)
-        return length(argts) == 2 ? UnitRange{P} : StepRange{P,P}
-    elseif f === Base.:(==) || f === Base.:(!=) || f === Base.:< || f === Base.:> ||
-           f === Base.:<= || f === Base.:>=
-        length(argts) == 2 || _sm_reject("comparison `$f` requires exactly two operands")
-        _sm_numeric_promote(argts, nameof(f)); return Bool
-    elseif f === Base.:!
-        length(argts) == 1 && argts[1] === Bool || _sm_reject("primitive `!` requires Bool")
-        return Bool
+        length(argts) in (2, 3) && all(_kernel_dom_int_scalar, argts) &&
+            argts[1] !== Bool && all(==(argts[1]), argts) ||
+            _sm_reject("primitive `Colon` requires two or three identical builtin non-Bool integer scalars")
+        T = argts[1]
+        return length(argts) == 2 ? UnitRange{T} : StepRange{T,T}
     end
     _sm_reject("primitive `$f` has no sanctioned stateful-method output rule")
 end
@@ -286,13 +278,13 @@ function _sm_dtree(x, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH}, finfo, 
     end
 end
 
-function _sm_domain_forest(ir::MethodIR, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH}) where {OW,SH}
+function _sm_domain_forest(ir::MethodIR, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH}, typeauth) where {OW,SH}
     finfo = Dict{Symbol,Any}(); ltrees = Dict{Symbol,Any}(); nodes = Any[]
     p = 0
     for f in ir.formals
         if f.kind === :pos
             p += 1
-            isvec = f.type !== nothing && _resolve_sm_annotation(f.type) <: AbstractArray
+            isvec = f.type !== nothing && _resolve_sm_annotation(typeauth, f.type) <: AbstractArray
             finfo[f.name] = _DFormal{p,isvec}
         elseif f.kind === :kw
             dt = f.default === nothing ? Nothing : _sm_dtree(f.default, plan, fields, OW, SH, finfo, ltrees, false)
@@ -344,14 +336,18 @@ function _sm_validate_formals(ir::MethodIR)
     nothing
 end
 
-_resolve_sm_annotation(x::Type) = x
-_resolve_sm_annotation(x::GlobalRef) = begin
+_resolve_sm_annotation(typeauth, x::Type) = x
+_resolve_sm_annotation(typeauth, x::GlobalRef) = begin
+    matches = Tuple(a for a in typeauth if a.ref == x)
+    length(matches) == 1 || _sm_reject("type annotation `$x` has no unique definition-time authority")
+    captured = only(matches).value
     isdefined(x.mod, x.name) || _sm_reject("type annotation `$x` is unbound")
-    T = getglobal(x.mod, x.name)
-    T isa Type || _sm_reject("type annotation `$x` did not resolve to a Type")
-    T
+    current = getglobal(x.mod, x.name)
+    current === captured || _sm_reject("type annotation `$x` was rebound after kernel definition")
+    captured
 end
-_resolve_sm_annotation(x) = _sm_reject("type annotation `$x` is not an exact captured GlobalRef/Type")
+_resolve_sm_annotation(typeauth, x) = _sm_reject(
+    "type annotation `$x` is not an exact captured GlobalRef/Type")
 
 function _sm_emit_write!(stmts, pw::_PlaceWrite, syms, plan::_KernelPlan, fields,
                          ::Type{OW}, ::Type{SH}, formals, locals) where {OW,SH}
@@ -385,7 +381,7 @@ function _sm_global_written(plan::_KernelPlan, irs)
 end
 
 function compile_stateful_method(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, ir::MethodIR,
-                                 global_written::Set{Int}) where {OW,SH}
+                                 global_written::Set{Int}, typeauth) where {OW,SH}
     _sm_validate_formals(ir)
     any(st -> st isa _For, ir.body) && _sm_reject("control-bearing stateful method requires orchestration lowering")
     plan = kernel_prepared_plan(pf); hs = kernel_prepared_handles(pf); fields = _lf_canon_map(plan)
@@ -394,21 +390,31 @@ function compile_stateful_method(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, i
     producer = Dict{Int,Int}(c => r for (c, r) in kernel_plan_producer(plan) if !(c in global_written))
     syms = Dict{Any,Symbol}(); formals = Dict{Symbol,Bool}(); locals = Dict{Symbol,Bool}()
     stmts = Any[]; pos = 0; localid = 0
+    current = Set{Int}(); stale = Set{Int}(); ngrad = 0
     for f in ir.formals
         f.kind === :kwsplat && _sm_reject("keyword splat is supported only by matrix orchestration")
         s = Symbol("__sm_f_", f.name); syms[(:formal, f.name)] = s
         if f.kind === :pos
             pos += 1
-            formals[f.name] = f.type !== nothing && _resolve_sm_annotation(f.type) <: AbstractArray
+            formals[f.name] = f.type !== nothing && _resolve_sm_annotation(typeauth, f.type) <: AbstractArray
             push!(stmts, :(local $s = args[$pos]))
         else
+            dstmts = Any[]
+            if f.default !== nothing
+                dcurrent = copy(current); dstale = copy(stale)
+                for c in _lf_reads(f.default, fields)
+                    uc, _ = _lf_ensure!(dstmts, c, dcurrent, dstale,
+                                        plan, producer, hidx, OW, SH)
+                    ngrad += uc
+                end
+            end
             default = f.default === nothing ? :(throw(UndefKeywordError($(QuoteNode(f.name))))) :
-                _sm_rhs(f.default, syms, plan, fields, OW, SH, formals, locals, false)
+                Expr(:block, dstmts...,
+                    _sm_rhs(f.default, syms, plan, fields, OW, SH, formals, locals, false))
             push!(stmts, :(local $s = haskey(kw, $(QuoteNode(f.name))) ?
                 getfield(kw, $(QuoteNode(f.name))) : $default))
         end
     end
-    current = Set{Int}(); stale = Set{Int}(); ngrad = 0
     for st in ir.body
         if st isa _LocalAssign
             length(st.lhs) == 1 || _sm_reject("stateful local assignment must bind exactly one name")
@@ -439,14 +445,18 @@ function compile_stateful_method(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, i
     ngrad == 0 || _sm_reject("stateful method unexpectedly emitted $ngrad destination-gradient calls")
     fn = compile(:((owned, shared, handles, args, kw) ->
         $(Expr(:block, stmts..., :(return owned)))))
-    fn, _sm_domain_forest(ir, plan, fields, OW, SH)
+    _sm_compiled_call(fn), _sm_domain_forest(ir, plan, fields, OW, SH, typeauth)
 end
 
 # ---- exact eachcol orchestration + concrete overload set --------------------------------------------------
 
+struct _SMUnannotated end
 struct _SMArm{DispatchT,RequiredKw,KwNames,Forest,Fn}
     fn::Fn
 end
+
+_sm_domain_subtype(::Type{A}, ::Type{B}) where {A,B} =
+    A === B || B === _SMUnannotated || (A !== _SMUnannotated && A <: B)
 _sm_arm(::Type{T}, req::Tuple, names::Tuple, ::Type{F}, fn) where {T,F} =
     _SMArm{T,req,names,F,typeof(fn)}(fn)
 
@@ -466,12 +476,12 @@ function _sm_kw_contract(ir::MethodIR)
     Tuple(req), Tuple(names), splat
 end
 
-function _sm_dispatch_type(ir::MethodIR)
+function _sm_dispatch_type(ir::MethodIR, typeauth)
     f = only(filter(x -> x.kind === :pos, ir.formals))
-    f.type === nothing ? Any : _resolve_sm_annotation(f.type)
+    f.type === nothing ? _SMUnannotated : _resolve_sm_annotation(typeauth, f.type)
 end
 
-function _compile_sm_orchestration(ir::MethodIR, segment_fns, segment_forests, segment_types)
+function _compile_sm_orchestration(ir::MethodIR, segment_fns, segment_forests, segment_types, typeauth)
     _sm_validate_formals(ir)
     length(ir.body) == 1 && ir.body[1] isa _For ||
         _sm_reject("matrix orchestration body must be exactly one `for`")
@@ -480,6 +490,9 @@ function _compile_sm_orchestration(ir::MethodIR, segment_fns, segment_forests, s
     it = loop.iter
     it isa _RegisteredCall && length(it.args) == 1 && it.args[1] isa _FormalRef ||
         _sm_reject("matrix orchestration iterator must be captured `eachcol(x)`")
+    posformal = only(filter(f -> f.kind === :pos, ir.formals))
+    it.args[1].kind === :pos && it.args[1].arg === posformal.name ||
+        _sm_reject("matrix orchestration eachcol operand must be its sole positional formal")
     src = _lf_callee(it)
     src === Base.eachcol || _sm_reject("matrix orchestration admits only exact builtin `Base.eachcol`")
     getfield(it.registration, :kind) === :primitive || _sm_reject("eachcol lacks builtin primitive provenance")
@@ -489,13 +502,12 @@ function _compile_sm_orchestration(ir::MethodIR, segment_fns, segment_forests, s
     length(call.pos) == 1 && call.pos[1] isa _LocalRef && call.pos[1].name === loop.var[1] ||
         _sm_reject("matrix orchestration must pass exactly its eachcol loop value")
     splat_formal = findfirst(f -> f.kind === :kwsplat, ir.formals)
-    if !isempty(call.kw)
-        length(call.kw) == 1 || _sm_reject("matrix orchestration must forward exactly one keyword splat")
-        k, v = call.kw[1]
-        k === _KMIR_KWSPLAT && v isa _FormalRef && v.kind === :kwsplat && splat_formal !== nothing &&
-            v.arg === ir.formals[splat_formal].name ||
-            _sm_reject("matrix orchestration must forward its own exact kwargs splat")
-    end
+    splat_formal !== nothing && length(call.kw) == 1 ||
+        _sm_reject("matrix orchestration requires one outer kwargs splat and its exact forwarding")
+    k, v = only(call.kw)
+    k === _KMIR_KWSPLAT && v isa _FormalRef && v.kind === :kwsplat &&
+        v.arg === ir.formals[splat_formal].name ||
+        _sm_reject("matrix orchestration must forward its own exact kwargs splat")
     ids = MethodId[]
     for cand in call.candidates
         haskey(segment_fns, cand.id) && push!(ids, cand.id)
@@ -503,7 +515,7 @@ function _compile_sm_orchestration(ir::MethodIR, segment_fns, segment_forests, s
     length(ids) == 1 || _sm_reject("matrix orchestration does not resolve to one exact compiled segment MethodId")
     mid = only(ids)
     segformal = segment_types[mid]
-    segformal.type !== nothing && _resolve_sm_annotation(segformal.type) <: AbstractVector ||
+    segformal.type !== nothing && _resolve_sm_annotation(typeauth, segformal.type) <: AbstractVector ||
         _sm_reject("eachcol segment MethodId must accept an AbstractVector")
     seg = segment_fns[mid]
     fn = (owned, shared, handles, args, kw) -> begin
@@ -517,9 +529,9 @@ end
 
 @generated function _sm_dispatch(s::_SMSet{Name,Arms}, owned, shared, handles, x, kw::NamedTuple) where {Name,Arms}
     Ts = [A.parameters[1] for A in Arms.parameters]
-    applicable = [i for i in eachindex(Ts) if x <: Ts[i]]
+    applicable = [i for i in eachindex(Ts) if Ts[i] === _SMUnannotated || x <: Ts[i]]
     isempty(applicable) && return :(throw(MethodError(s, (x,))))
-    minima = [i for i in applicable if all(j -> Ts[i] <: Ts[j], applicable)]
+    minima = [i for i in applicable if all(j -> _sm_domain_subtype(Ts[i], Ts[j]), applicable)]
     length(minima) == 1 || return :(throw(ArgumentError("ambiguous overload for method `$Name`")))
     i = only(minima); A = Arms.parameters[i]
     T, Req, Names, Forest, Fn = A.parameters
@@ -528,7 +540,7 @@ end
     unknown = Tuple(n for n in supplied if !(n in Names))
     !isempty(unknown) && return :(throw(ArgumentError("method `$Name` rejects unknown keywords")))
     !isempty(missing) && return :(throw(UndefKeywordError($(QuoteNode(first(missing))))))
-    domok = T <: AbstractMatrix ? _kernel_dom_num_matrix(x) :
+    domok = T !== _SMUnannotated && T <: AbstractMatrix ? _kernel_dom_num_matrix(x) :
             T <: AbstractVector ? _kernel_dom_num_array(x) : _kernel_dom_num_scalar(x)
     domok || return :(throw(ArgumentError("method `$Name` rejects its positional argument domain")))
     try
@@ -546,6 +558,7 @@ end
 
 function compile_stateful_methods(skel, pf::_PreparedFactory, ::Type{OW}, ::Type{SH}) where {OW,SH}
     irs_all = method_irs(skel); plan = kernel_prepared_plan(pf)
+    typeauth = kernel_type_authorities(skel)
     global_written = _sm_global_written(plan, irs_all)
     byname = Dict{Symbol,Vector{MethodIR}}()
     for ir in irs_all; push!(get!(byname, ir.id.name, MethodIR[]), ir); end
@@ -559,27 +572,30 @@ function compile_stateful_methods(skel, pf::_PreparedFactory, ::Type{OW}, ::Type
             if any(st -> st isa _For, ir.body)
                 push!(orchestrations, ir)
             else
-                fn, forest = compile_stateful_method(pf, OW, SH, ir, global_written)
+                fn, forest = compile_stateful_method(pf, OW, SH, ir, global_written, typeauth)
                 segment_fns[ir.id] = fn; segment_forests[ir.id] = forest
                 segment_types[ir.id] = only(filter(f -> f.kind === :pos, ir.formals))
                 req, names, splat = _sm_kw_contract(ir)
                 splat && _sm_reject("straight-line adaptation method may not accept kwargs splat")
-                push!(arms, (_sm_dispatch_type(ir), ir.id, req, names, forest, fn))
+                push!(arms, (_sm_dispatch_type(ir, typeauth), ir.id, req, names, forest, fn))
             end
         end
         for ir in orchestrations
-            fn, forest, mid = _compile_sm_orchestration(ir, segment_fns, segment_forests, segment_types)
+            fn, forest, mid = _compile_sm_orchestration(
+                ir, segment_fns, segment_forests, segment_types, typeauth)
             # A matrix kwargs-splat is admitted only as exact forwarding to this segment, hence its effective
             # public contract is the segment's explicit keyword contract (unknown keywords reject).
             seg_ir = only(x for x in irs if x.id == mid)
             req, names, splat = _sm_kw_contract(seg_ir); splat && _sm_reject("segment kwargs splat unsupported")
-            push!(arms, (_sm_dispatch_type(ir), ir.id, req, names, forest, fn))
+            push!(arms, (_sm_dispatch_type(ir, typeauth), ir.id, req, names, forest, fn))
         end
         sort!(arms; by = a -> a[2].decl)
         for i in eachindex(arms), j in (i + 1):length(arms)
             Ti, Tj = arms[i][1], arms[j][1]
             Ti === Tj && _sm_reject("method `$name` has duplicate dispatch domain `$Ti`")
-            Base.typeintersect(Ti, Tj) === Union{} || Ti <: Tj || Tj <: Ti ||
+            overlap = Ti === _SMUnannotated || Tj === _SMUnannotated ||
+                Base.typeintersect(Ti, Tj) !== Union{}
+            !overlap || _sm_domain_subtype(Ti, Tj) || _sm_domain_subtype(Tj, Ti) ||
                 _sm_reject("method `$name` has incomparable overlapping domains `$Ti` and `$Tj`")
         end
         tup = Tuple(_sm_arm(a[1], a[3], a[4], a[5], a[6]) for a in arms)
@@ -616,7 +632,8 @@ function compile_stateful(skel, args...; kwargs...)
     epairs = Pair{Symbol,Any}[]
     for sl in kernel_plan_slots(plan)
         sl.canon in produced && !(sl.canon in written) || continue
-        push!(epairs, sl.path[end] => compile_prepared_ensure(pf, typeof(owned), typeof(shared), sl.path[end]))
+        push!(epairs, sl.path[end] => _sm_compiled_call(
+            compile_prepared_ensure(pf, typeof(owned), typeof(shared), sl.path[end])))
     end
     ensures = NamedTuple(sort!(epairs; by = first))
     enames = propertynames(ensures)
@@ -665,10 +682,16 @@ stateful_get(s::_StatefulState, ::Val{Name}) where {Name} = _stateful_get(s, Val
             RuntimeGeneratedFunctions.generated_callfunc(
                 getfield(getfield(getfield(s, :runtime), :ensures), $ei),
                 getfield(s, :owned), getfield(s, :shared), getfield(s, :handles))
+            _canon_current($obj, Val($slot)) ||
+                throw(ErrorException("stateful ensure left `$(Name)` dirty"))
             _canon_slot($obj, Val($slot))
         end
     end
-    :(_canon_slot($obj, Val($slot)))
+    quote
+        _canon_current($obj, Val($slot)) ||
+            throw(ErrorException("stateful field `$(Name)` is dirty and has no producer"))
+        _canon_slot($obj, Val($slot))
+    end
 end
 
 Base.getproperty(s::_StatefulState, name::Symbol) =

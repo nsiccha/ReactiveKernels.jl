@@ -772,7 +772,7 @@ end
         # all SEVEN authored declared-helper identities are captured (incl. min1exp)
         for (h, k) in ((:finiteorneginf, :pure), (:min1exp, :pure), (:badd, :pure),
                        (:randbernoullilog, :rng), (:logswapprob, :pure),
-                       (:compute_criterion, :pure), (:smooth, :pure))
+                       (:compute_criterion, :pure))
             d = RKS._kernel_declared_effect(getfield(RN, h))
             @test d !== nothing && d.kind === k
         end

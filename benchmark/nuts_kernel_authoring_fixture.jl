@@ -49,7 +49,6 @@ randbernoullilog(rng, logprob) = logprob > 0 ? true : -randexp(rng) < logprob
 logswapprob(tree) = tree.log_weight[1] - tree.log_weight[2]
 compute_criterion(mom, bwd_dham_dmom, fwd_dham_dmom) =
     (dot(mom, bwd_dham_dmom) > 0 && dot(mom, fwd_dham_dmom) > 0)
-smooth(prev, new, new_weight) = (1 - new_weight) * prev + new_weight * new
 
 # PUBLIC exact-identity effect declarations (973f7f4/bf7d2ed) — the compiler schedules these with visible
 # effects (registered primitives), never by body inference. Authors touch no internals.
@@ -59,7 +58,6 @@ smooth(prev, new, new_weight) = (1 - new_weight) * prev + new_weight * new
 @rk_rng randbernoullilog 2 1
 @rk_pure logswapprob 1
 @rk_pure compute_criterion 3
-@rk_pure smooth 3
 # Built-in RNG/effect primitives used by refresh_momentum!!: Random.randn! (ordered RNG, rng arg 1, writes/
 # result-aliases dest arg 2), LinearAlgebra.lmul! (reads matrix+dest, writes/aliases dest arg 2).
 
@@ -120,7 +118,8 @@ end
 # increments the owned n_steps (independent of pgrad + leapfrog body marker) and records running acceptance.
 @kernel nuts_stats!(state) = begin
     state.n_steps += 1
-    state.acceptance_rate = smooth(state.acceptance_rate, min1exp(state.dham), one(state.dham) / state.n_steps)
+    state.acceptance_rate = (one(state.dham) - one(state.dham) / state.n_steps) * state.acceptance_rate +
+                            (one(state.dham) / state.n_steps) * min1exp(state.dham)
     return state
 end
 

@@ -321,16 +321,17 @@ blocks = kernel_blocks()
     @test !has_reactive[]
     @test occursin("@kernel leapfrog!", SRC) && occursin("@kernel nuts!!", SRC)
     @test occursin("@kernel refresh_momentum!!", SRC) && occursin("@kernel nuts_stats!", SRC)   # free refresh + stats kernels
-    # public @rk_* exact-identity effect declarations (973f7f4/bf7d2ed) — SEVEN module helpers (incl. min1exp,
+    # public @rk_* exact-identity effect declarations (973f7f4/bf7d2ed) — SIX NUTS module helpers (incl. min1exp,
     # which nuts_stats! calls; the compiler is forbidden to inspect its body, so it MUST be declared).
     for d in ("@rk_pure finiteorneginf 1", "@rk_pure min1exp 1", "@rk_borrows badd 2", "@rk_rng randbernoullilog 2 1",
-              "@rk_pure logswapprob 1", "@rk_pure compute_criterion 3", "@rk_pure smooth 3")
+              "@rk_pure logswapprob 1", "@rk_pure compute_criterion 3")
         @test occursin(d, SRC)
     end
+    @test !occursin(r"@rk_(?:pure|borrows|rng)\s+smooth\b", SRC)
     # every ordinary module helper the authored kernels CALL must carry an @rk_* declaration (no body inference).
     @test occursin("min1exp(state.dham)", srcof(blocks[Symbol("nuts_stats!")].body)) && occursin("@rk_pure min1exp 1", SRC)
     println("  (@node) preserved; @reactive absent; free @kernel leapfrog!/refresh_momentum!!/nuts_stats!/nuts!!;")
-    println("      SEVEN public @rk_* helper effect declarations (incl. @rk_pure min1exp 1); copy!! is core. OK")
+    println("      SIX public @rk_* NUTS helper declarations (incl. @rk_pure min1exp 1); copy!! is core. OK")
 end
 
 # --- NON-VACUOUS lexical-shadowing inventory (nuts_state) --------------------------------------------

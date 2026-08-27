@@ -139,6 +139,8 @@ end
 # ordinary arithmetic, and every value call in both MethodIR families is a pure primitive registration.
 @testset "kernel_adaptation — DA/Welford authoring has no @rk helper/result/arity contract" begin
     src = read(joinpath(@__DIR__, "..", "benchmark", "nuts_kernel_authoring_fixture.jl"), String)
+    @test !occursin(r"(?m)^\s*@rk_.*\bsmooth\b", src)
+    @test !occursin(r"(?m)^\s*smooth\s*\(", src)
     wstart = findfirst("@kernel welford_var", src)
     dstart = findfirst("@kernel dual_averaging_state", src)
     dsrc = src[first(dstart):(first(wstart) - 1)]
@@ -176,6 +178,36 @@ end
 @kernel default_order_state(init) = begin
     value = zero(init)
     step!(x; a = x, b = a + one(a)) = value += b
+end
+
+AT = AbstractVector
+@kernel rebound_annotation_state(init) = begin
+    value = zero(init)
+    step!(x::AT) = value += one(value)
+end
+AT = AbstractMatrix
+
+@kernel bad_forward_state(template::AbstractVector) = begin
+    n = zero(eltype(template))
+    step!(x::AbstractVector; dn = one(n)) = n += dn
+    step!(x::AbstractMatrix; kwargs...) = for xi in eachcol(x)
+        step!(__self__, xi)
+    end
+end
+
+@kernel bad_iterator_formal_state(template::AbstractVector) = begin
+    n = zero(eltype(template))
+    step!(x::AbstractVector; dn = one(n)) = n += dn
+    step!(x::AbstractMatrix; y = x, kwargs...) = for xi in eachcol(y)
+        step!(__self__, xi; kwargs...)
+    end
+end
+
+@kernel dirty_default_state(init) = begin
+    n = one(init)
+    value = zero(init)
+    setn!(x) = n += x
+    use!(x; a = n) = value += a + x
 end
 
 @kernel bad_length_state(init) = begin
@@ -234,6 +266,14 @@ Base.getindex(x::_EvilMatrix, i::Int, j::Int) = (x.reads += 1; x.data[i,j])
     badout = _cstate(_AdaptBad.unsupported_result_state, 0)
     @test_throws ArgumentError RK.stateful_call!(badout, Val(:step!), 1)   # `&` has no output rule
     @test_throws Exception RK.compile_stateful(_AdaptBad.rebound_state, 0.0)
+    @test_throws RK._LLowerReject RK.compile_stateful(_AdaptBad.rebound_annotation_state, 0.0)
+
+    @test_throws RK._LLowerReject RK._sm_primitive_result(+, (Bool, Bool))
+    @test_throws RK._LLowerReject RK._sm_primitive_result(-, (Bool, Bool))
+    @test_throws RK._LLowerReject RK._sm_primitive_result(%, (Int8, UInt8))
+    @test RK._sm_primitive_result(:, (Int8, Int8)) === UnitRange{Int8}
+    @test RK._sm_primitive_result(:, (Int8, Int8, Int8)) === StepRange{Int8,Int8}
+    @test_throws RK._LLowerReject RK._sm_primitive_result(:, (Bool, Bool, Int8))
 end
 
 @testset "kernel_adaptation — authoritative keyword binder, including exact matrix kwsplat forwarding" begin
@@ -263,6 +303,16 @@ end
     dup = RK.MethodIR(ir.id, ir.self, (ir.formals..., ir.formals[end]), ir.body, ir.control,
                       ir.effects, ir.resolution_deps, ir.kind, ir.ok, ir.reason, ir.signature)
     @test_throws Exception RK._sm_validate_formals(dup)
+
+    @test_throws RK._LLowerReject RK.compile_stateful(_AdaptBad.bad_forward_state, zeros(2))
+    @test_throws RK._LLowerReject RK.compile_stateful(_AdaptBad.bad_iterator_formal_state, zeros(2))
+
+    kk = RK.compile_stateful(_AdaptBad.dirty_default_state, 0.0)
+    dirty = kk(0.0); pk = kk.prepared.plan
+    ns = RK.kernel_plan_slot(pk, :n); _, ni = RK.kernel_plan_field(pk, ns.canon)
+    RK._canon_set!(dirty.owned, Val(ni), 999.0); RK._canon_kill!(dirty.owned, Val(ni))
+    @test_throws ErrorException RK.stateful_call!(dirty, Val(:use!), 1.0)
+    @test RK.stateful_get(dirty, Val(:value)) == 0.0 # default guard threw before target kill
 end
 
 struct _Pick{S} end
@@ -309,6 +359,7 @@ end
     r = kr(1.0); pfr = getfield(kr, :prepared)
     @test_throws DomainError RK.stateful_call!(r, Val(:step!), -1.0)
     @test !_scur(pfr, getfield(r,:owned), getfield(r,:shared), :value)
+    @test_throws ErrorException RK.stateful_get(r, Val(:value))
 
     kd = RK.compile_stateful(_AdaptFix.dual_averaging_state, 0.65)
     d = kd(0.65); pfd = getfield(kd, :prepared)
@@ -329,7 +380,7 @@ end
         baseir.effects, baseir.resolution_deps, baseir.kind, baseir.ok, baseir.reason, baseir.signature)
     mu = RK.kernel_plan_slot(pfd.plan, :mu).canon
     @test_throws RK._LLowerReject RK.compile_stateful_method(pfd, typeof(getfield(d,:owned)),
-        typeof(getfield(d,:shared)), badir, Set((mu,)))
+        typeof(getfield(d,:shared)), badir, Set((mu,)), RK.kernel_type_authorities(_AdaptFix.dual_averaging_state))
 end
 
 function _hot_type_clean(T, seen = Set{Any}())
@@ -340,8 +391,24 @@ function _hot_type_clean(T, seen = Set{Any}())
     T <: Core.Box && return false
     T <: AbstractDict && return false
     isconcretetype(T) || return false
+    # RGF retains an Expr solely to root its weak code-cache entry. Its concrete type is the dispatch
+    # authority; generated_callfunc never reads the Expr on the hot path (separately pinned by LLVM/0-B).
+    T <: RK.RuntimeGeneratedFunctions.RuntimeGeneratedFunction && return true
     T isa DataType || return true
-    all(ft -> _hot_type_clean(ft, seen), fieldtypes(T))
+    all(ft -> _hot_type_clean(ft, seen), fieldtypes(T)) || return false
+    typeparam_clean(p) = begin
+        p === Any && return false
+        p === Function && return false
+        p isa Type && p <: Core.Box && return false
+        p isa Type && p <: AbstractDict && return false
+        if p isa DataType
+            return all(typeparam_clean, p.parameters)
+        elseif p isa Tuple
+            return all(typeparam_clean, p)
+        end
+        true
+    end
+    all(typeparam_clean, T.parameters)
 end
 
 
@@ -365,7 +432,7 @@ end
     end
 end
 
-@testset "kernel_adaptation — compiled hot state is concrete and retains no Dict/Any/Function/Core.Box" begin
+@testset "kernel_adaptation — hot dispatch graph is concrete/no Dict/Function/Box (RGF cache root explicit)" begin
     for (k, args) in ((RK.compile_stateful(_AdaptFix.dual_averaging_state, 0.65), (0.65,)),
                       (RK.compile_stateful(_AdaptFix.welford_var, zeros(3)), (zeros(3),)))
         s = k(args...)

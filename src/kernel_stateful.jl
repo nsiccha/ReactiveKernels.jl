@@ -423,7 +423,22 @@ function _kernel_thaw_method(m::NamedTuple)
 end
 _kernel_thaw_methods(methods) = Tuple(_kernel_thaw_method(m) for m in methods)
 
-struct _StatefulKernelSkeleton{Token,SN,M,R,C}
+struct _CapturedTypeAuthority{T}
+    ref::GlobalRef
+    value::T
+end
+function _kernel_capture_type_authorities(mod::Module, names::Tuple)
+    out = Any[]
+    for name in names
+        isdefined(mod, name) || continue
+        value = getglobal(mod, name)
+        value isa Type || continue
+        push!(out, _CapturedTypeAuthority(GlobalRef(mod, name), value))
+    end
+    Tuple(out)
+end
+
+struct _StatefulKernelSkeleton{Token,SN,M,R,C,T}
     name::Symbol
     mod::Module              # the DEFINITION module (for hygienic op GlobalRefs)
     spec_snapshot::SN        # DETACHED IMMUTABLE owner-spec provenance (a `_ChildSnapshot`);
@@ -431,20 +446,22 @@ struct _StatefulKernelSkeleton{Token,SN,M,R,C}
     methods::M               # per-method meta with DEEPLY FROZEN signature/call/body
     recipe_source::R         # frozen, detached recipe-statement source (see _FrozenExpr)
     callee_regs::C           # immutable def-time snapshot: authored callee ref => registration
+    type_authorities::T      # immutable def-time snapshot: bare formal annotation ref => exact Type
 end
 # `Token` is a phantom type parameter — the unique definition token, a per-expansion
 # gensym Symbol carried as `Val{Token}` (unique, typed overload identity, no minted
 # struct / no world-age hazard / no mutable registry). Supplied explicitly.
 _StatefulKernelSkeleton(name::Symbol, ::Val{Token}, mod::Module, spec_snapshot::SN,
                         methods::M, recipe_source::R,
-                        callee_regs::C) where {Token,SN,M,R,C} =
-    _StatefulKernelSkeleton{Token,SN,M,R,C}(name, mod, spec_snapshot, methods,
-                                            recipe_source, callee_regs)
+                        callee_regs::C, type_authorities::T) where {Token,SN,M,R,C,T} =
+    _StatefulKernelSkeleton{Token,SN,M,R,C,T}(name, mod, spec_snapshot, methods,
+                                              recipe_source, callee_regs, type_authorities)
 
 kernel_token(skel::_StatefulKernelSkeleton{Token}) where {Token} = Token
 kernel_module(skel::_StatefulKernelSkeleton) = getfield(skel, :mod)
 # D: immutable def-time snapshot of direct registered callees (detached identities).
 kernel_callee_registrations(skel::_StatefulKernelSkeleton) = getfield(skel, :callee_regs)
+kernel_type_authorities(skel::_StatefulKernelSkeleton) = getfield(skel, :type_authorities)
 # FRESH reconstructed planning `KernelSpec` per call from the detached snapshot — never
 # a shared live authority, so mutating a returned spec/graph cannot change a later read.
 kernel_spec(skel::_StatefulKernelSkeleton) = _kernel_reconstruct(getfield(skel, :spec_snapshot))
@@ -513,6 +530,11 @@ function _kernel_stateful_expand(name, signature_inputs, call_signature, block,
            sibling_calls = m.sibling_calls)
         for m in methods)
 
+    annotation_names = Symbol[]
+    for m in methods, annotation in _kernel_signature_annotations(m.signature)
+        annotation isa Symbol && !(annotation in annotation_names) && push!(annotation_names, annotation)
+    end
+
     # Capture the recipe-portion SOURCE as a detached, recursively-frozen AST (poc's
     # stateful MethodIR needs it — `Recipe.op` is opaque). Deep-copy each recipe
     # statement before stripping line numbers so the originals feeding `spec_expr`
@@ -539,7 +561,8 @@ function _kernel_stateful_expand(name, signature_inputs, call_signature, block,
              # sibling/owner-field/formal/local names excluded (pending/factory-time).
              _kernel_callee_capture_expr(
                  _kernel_mode1_callee_pairs(signature_inputs, recipe_stmts, methods),
-                 __module__))))
+                 __module__),
+             Expr(:call, _kernel_capture_type_authorities, __module__, QuoteNode(Tuple(annotation_names))))))
 end
 
 # --- Mode-2 free-method recognition (V7 implicit-field pivot) ----------------
