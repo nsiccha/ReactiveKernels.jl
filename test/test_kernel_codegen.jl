@@ -9,6 +9,7 @@
 
 using ReactiveKernels
 using LinearAlgebra
+using Random
 using Test
 const RK = ReactiveKernels
 
@@ -320,6 +321,148 @@ end
     ctx = RK._EmitCtx(Dict(:acceptance_rate => 2), Dict(2 => 2), Set{Int}([2]), (:x,), Int[], Symbol[])
     # the emitter REFUSES to normalize the opaque unregistered helper through spelling
     @test_throws RK._LLowerReject RK._emit_place_write!(Any[], accw, ctx, Symbol[])
+end
+
+module _CgRefreshFix
+    using ReactiveKernels, LinearAlgebra, Random
+    # refresh_momentum!!-shaped: ordered primitive effects; rng is a runtime keyword; mom OWNED, chol SHARED
+    @kernel refresh!!(phasepoint; rng) = begin
+        Random.randn!(rng, phasepoint.mom)
+        LinearAlgebra.lmul!(phasepoint.chol_metric.L, phasepoint.mom)
+        return phasepoint                                  # EXPLICIT return (final source form)
+    end
+    # renamed runtime-rng formal — ordering must still come from descriptor.rng_arg, not the name
+    @kernel refresh_renamed!!(phasepoint; generator) = begin
+        Random.randn!(generator, phasepoint.mom)
+        LinearAlgebra.lmul!(phasepoint.chol_metric.L, phasepoint.mom)
+        return phasepoint
+    end
+    # an UNEXPECTED extra effect statement (a third primitive) — must reject (exactly two ordered effects)
+    @kernel refresh_extra!!(phasepoint; rng) = begin
+        Random.randn!(rng, phasepoint.mom)
+        LinearAlgebra.lmul!(phasepoint.chol_metric.L, phasepoint.mom)
+        Random.randn!(rng, phasepoint.mom)
+        return phasepoint
+    end
+end
+
+# SYNTHETIC state with DISTINCT ABSOLUTE-SUPERSET indices: shared chol=1, owned mom=2 (role-local both=1
+# would mask the absolute-index ABI bug syntax just fixed). Plus a currentness bitmask.
+mutable struct _SynthRefresh{T}
+    chol::Cholesky{T,Matrix{T}}                            # SHARED, absolute slot 1
+    mom::Vector{T}                                         # OWNED, absolute slot 2
+    current::UInt64                                        # currentness mask
+end
+ReactiveKernels._shared_slot(s::_SynthRefresh, ::Val{1}) = getfield(s, :chol)
+ReactiveKernels._owner_slot(s::_SynthRefresh, ::Val{2}) = getfield(s, :mom)
+# currentness bits are ABSOLUTE STORAGE slot indices (Val-encoded tuples): slot I → bit (I-1). @generated
+# so the packing (here UInt64; syntax's is NTuple{W,UInt}) is a compile-time constant → one typed store.
+@generated function ReactiveKernels._owner_kill_current!(s::_SynthRefresh, ::Val{K}) where {K}
+    kill = reduce(|, (UInt64(1) << (i - 1) for i in K); init = UInt64(0))
+    :(setfield!(s, :current, getfield(s, :current) & ~$kill); s)
+end
+@generated function ReactiveKernels._owner_bless_current!(s::_SynthRefresh, ::Val{B}) where {B}
+    bless = reduce(|, (UInt64(1) << (i - 1) for i in B); init = UInt64(0))
+    :(setfield!(s, :current, getfield(s, :current) | $bless); s)
+end
+
+@testset "codegen — EXECUTABLE effect root (refresh shape): generic sequence, role-aware, currentness, F32/F64 0 B" begin
+    # ABSOLUTE superset slots: chol_metric(20)=1 shared, mom(10)=2 owned, kinetic dkin(11)=3/kin(12)=4 owned,
+    # dpot(8)=5 owned (position-gradient, NOT a mom dependent — stays current). killmap: mom kills kinetic.
+    fieldcanon = Dict(:mom => 10, :chol_metric => 20)
+    slotof     = Dict(10 => 2, 20 => 1, 11 => 3, 12 => 4, 8 => 5)
+    roleof     = Dict(10 => :owned, 20 => :shared)
+    killmap    = Dict(10 => [11, 12])                      # mom (10) → kinetic descendants (dkin, kin)
+    ir = RK.method_irs(_CgRefreshFix.refresh!!)[1]
+    fn, meta = RK.compile_effect_root(ir, fieldcanon, slotof, Set{Int}(), roleof, killmap)
+    @test length(meta.calls) == 2 && meta.owned_slots == [2]       # 2 ordered effects; mom (abs 2) only owned write
+    @test meta.bless_slots == (2,) && meta.kill_slots == (3, 4)     # bless mom slot, kill kinetic slots (absolute)
+    # ACCEPTANCE DISCRIMINATOR (NOT compiler authorization): the refresh body IS exactly randn! then lmul!
+    effs = [st for st in ir.body if st isa RK._ExprStmt]
+    @test getfield(effs[1].expr.registration, :source) === Random.randn!
+    @test getfield(effs[2].expr.registration, :source) === LinearAlgebra.lmul!
+    src = join(string.(meta.calls), " ")
+    @test findfirst("randn!", src)[1] < findfirst("lmul!", src)[1]  # descriptor/source order preserved
+    @test occursin("__s2", src) && meta.owned_slots == [2]         # OWNED mom bound to a local at abs slot 2
+    @test occursin("_shared_slot(state, Val(1))", src)             # SHARED chol via _shared_slot at abs 1
+    @test occursin("_kernel_property", src) && occursin(":L", src)  # chol_metric.L via core exact-type accessor
+    # renamed rng formal → SAME emission (ordering from descriptor.rng_arg, not the name)
+    ir2 = RK.method_irs(_CgRefreshFix.refresh_renamed!!)[1]
+    _, meta2 = RK.compile_effect_root(ir2, fieldcanon, slotof, Set{Int}(), roleof, killmap; rng = :generator)
+    @test replace(join(string.(meta.calls), " "), "rng" => "R") ==
+          replace(join(string.(meta2.calls), " "), "generator" => "R")
+    # NEGATIVE: an unlowered extra statement is fine (generic sequence) but a missing role rejects; a
+    # kill canon with no absolute slot rejects
+    @test_throws RK._LLowerReject RK.compile_effect_root(ir, fieldcanon, slotof, Set{Int}(),
+        Dict(10 => :owned), killmap)                              # chol role missing -> reject
+    @test_throws RK._LLowerReject RK.compile_effect_root(ir, fieldcanon, Dict(10 => 2, 20 => 1),
+        Set{Int}(), roleof, killmap)                             # kill canon 11/12 has no slot -> reject
+    # REJECT bless/kill OVERLAP: a written root that is its own dependent (mom → [mom]) is contradictory
+    @test_throws RK._LLowerReject RK.compile_effect_root(ir, fieldcanon, slotof, Set{Int}(),
+        roleof, Dict(10 => [10]))
+    # EXECUTE over real state, F32 and F64: mom mutated in place, currentness updated, @inferred, 0 B
+    barrier(f, s, r) = @allocated f(s, r)
+    for T in (Float64, Float32)
+        d = 4; M = Matrix{T}(2 * I, d, d)
+        st = _SynthRefresh{T}(cholesky(M), zeros(T, d), typemax(UInt64))   # start all-current
+        rng = Random.MersenneTwister(1)
+        fn(st, rng)
+        @test any(st.mom .!= 0) && eltype(st.mom) === T                    # randn!→lmul! filled+scaled mom
+        @test (st.current >> 1) & 1 == 1                                   # mom (slot 2, bit 1) BLESSED current
+        @test (st.current >> 2) & 1 == 0 && (st.current >> 3) & 1 == 0     # kinetic (slots 3,4) KILLED
+        @test (st.current >> 4) & 1 == 1                                   # dpot (slot 5) stays CURRENT
+        @inferred fn(st, rng)
+        barrier(fn, st, rng); barrier(fn, st, rng)
+        @test barrier(fn, st, rng) == 0                                    # exact 0 B
+    end
+    # EXCEPTION SOUNDNESS (RK 06:13): a mid-sequence throw (lmul! with a mismatched chol) leaves mom AND
+    # kinetic DIRTY (killed before each effect, never blessed); a retry with a valid chol recomputes+blesses.
+    let T = Float64
+        st = _SynthRefresh{T}(cholesky(Matrix{T}(2 * I, 3, 3)), zeros(T, 4), typemax(UInt64))  # 3×3 chol vs len-4 mom
+        @test_throws DimensionMismatch fn(st, Random.MersenneTwister(2))
+        @test (st.current >> 1) & 1 == 0                                   # mom DIRTY after the throw (not blessed)
+        @test (st.current >> 2) & 1 == 0 && (st.current >> 3) & 1 == 0     # kinetic DIRTY
+        st.chol = cholesky(Matrix{T}(2 * I, 4, 4))                         # retry with a valid factor
+        fn(st, Random.MersenneTwister(2))
+        @test (st.current >> 1) & 1 == 1                                   # mom re-BLESSED on the successful retry
+    end
+end
+
+module _CgVecFix
+    using ReactiveKernels
+    vadd(a::Number, b::Number) = a + b                     # a declared PURE scalar helper (broadcasts elementwise)
+    @rk_pure vadd 2
+    @kernel probe_vec!(phasepoint;) = begin
+        @. phasepoint.mom = vadd(phasepoint.mom, phasepoint.dham_dmom)   # declared helper over VECTOR slot args
+    end
+end
+
+@testset "codegen — vector vs scalar registered calls: fuse over vectors, plain when scalar/non-dotted" begin
+    # RK 06:02: registered-call vector-ness derives recursively from slot types, not `x.broadcast` alone.
+    seam = _cg_seam()
+    ctx() = RK._EmitCtx(RK._seam_field_canon(seam), RK._seam_slot_of_canon(seam),
+                        RK._seam_scalar_canons(seam), (), Int[], Symbol[])
+    # a DECLARED helper over VECTOR slot args, in a broadcast context → FUSED (broadcasted)
+    vcall = only(w.rhs for w in RK._exec_place_writes(RK.method_irs(_CgVecFix.probe_vec!)[1])
+                 if w.owner == (:mom,))
+    @test occursin("broadcasted", string(RK._exec_rhs(vcall, ctx(), true)))    # vector args + bcast → fused
+    @test !occursin("broadcasted", string(RK._exec_rhs(vcall, ctx(), false)))  # non-dotted → plain registered call
+    # a DECLARED helper over SCALAR args stays a PLAIN call even in a broadcast context (no re-alloc)
+    c2 = RK._EmitCtx(Dict(:acceptance_rate => 2), Dict(2 => 2), Set{Int}([2]), (:accepted,), Int[], Symbol[])
+    scall = only(w.rhs for w in RK._exec_place_writes(RK.method_irs(_CgStatsFix.probe_stats!)[1])
+                 if w.owner == (:acceptance_rate,))
+    @test !occursin("broadcasted", string(RK._exec_rhs(scall, c2, true)))      # scalar registered call under @. → plain
+end
+
+struct _CgEvilProp end
+Base.getproperty(::_CgEvilProp, ::Symbol) = error("side-effecting getproperty must NOT run in hot lowering")
+
+@testset "codegen — property accessor is SANCTIONED-ONLY (custom getproperty rejects, never runs)" begin
+    # RK 06:22: only Cholesky.L and NamedTuple fields are sanctioned; a custom `getproperty` is refused
+    # (and never invoked — the reject fires before it).
+    @test RK._kernel_property(cholesky(Matrix{Float64}(2 * I, 3, 3)), Val(:L)) isa LowerTriangular
+    @test RK._kernel_property((; log_weight = [1.0, 2.0]), Val(:log_weight)) == [1.0, 2.0]  # NamedTuple field
+    @test_throws RK._LLowerReject RK._kernel_property(_CgEvilProp(), Val(:x))                # rejected, not run
 end
 
 @testset "codegen — an exec whose selected Recipe has no bound applier is REJECTED" begin

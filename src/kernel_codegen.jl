@@ -31,6 +31,20 @@
 # where the accessor name is aligned with syntax's `_canon_set!`).
 function _owner_set! end
 
+# The Val-ABI SHARED read accessor (`_shared_slot(state, Val{J})`) — read-only authority slots (metric,
+# chol_metric, the @node value) live in the SHARED role, addressed separately from owned. Declared here so
+# emitted role-aware reads resolve; storage types implement it (synthetic test state now; syntax's
+# `_CanonSharedN` on the rebase, name aligned to `_canon_slot` on the shared struct).
+function _shared_slot end
+
+# The Val-ABI currentness-mask operations, for the epoch executed-prefix semantics (RK 06:13): KILL clears
+# the slots' current bits (a value about to be / just mutated is dirty until re-blessed); BLESS sets them
+# (a commit after the whole trace succeeds). Both take a Val-encoded ABSOLUTE slot-index tuple and do ONE
+# typed store — 0-B. Declared here so emitted currentness ops resolve; storage types implement them
+# (synthetic test mask now; syntax's `_canon_current_mask` NTuple{W,UInt} on the rebase).
+function _owner_kill_current! end
+function _owner_bless_current! end
+
 # ---- consume the seam: recompute graph from producer/recipes (NO second planner) --------------------
 
 # HAVE canonical ids from the seam ALONE: entry-current = HAVE ∪ producer-owned keys, so the sources are
@@ -182,8 +196,9 @@ function _exec_is_vec(x::_SelfField, ctx::_EmitCtx)
     id !== nothing && !(id in ctx.scalar_canons)     # a slot is VECTOR unless typed SCALAR by the metadata
 end
 _exec_is_vec(x::_OpCall, ctx::_EmitCtx) = any(a -> _exec_is_vec(a, ctx), x.args)
-# a declared/registered helper call (`smooth`, `min1exp`) yields a computed value, not a slot buffer.
-_exec_is_vec(::_RegisteredCall, ctx::_EmitCtx) = false
+# A registered pure/operator/helper call is VECTOR-dependent iff any ARGUMENT is (RK 06:02): a scalar-only
+# `oftype(stepsize, 0.5)` stays scalar (plain, even under `@.`); a `smooth` over vector args broadcasts.
+_exec_is_vec(x::_RegisteredCall, ctx::_EmitCtx) = any(a -> _exec_is_vec(a, ctx), x.args)
 
 function _exec_rhs(x::_OpCall, ctx::_EmitCtx, bcast::Bool)
     # source-only boundary: an OPAQUE (unregistered, non-operator) call must NOT be normalized through the
@@ -226,7 +241,9 @@ end
 function _exec_rhs(x::_RegisteredCall, ctx::_EmitCtx, bcast::Bool)
     callee = _exec_registered_callee(x)
     args = Any[_exec_rhs(a, ctx, bcast) for a in x.args]
-    (bcast && x.broadcast) ?                                    # only if the call itself was authored dotted
+    # Same rule as an operator (RK 06:02): broadcast ONLY in a broadcast context AND when vector-dependent.
+    # A scalar-only registered call (`oftype`) stays a plain call even under `@.`; a vector `smooth` fuses.
+    (bcast && _exec_is_vec(x, ctx)) ?
         Expr(:call, GlobalRef(Base, :broadcasted), callee, args...) :
         Expr(:call, callee, args...)                           # plain declared call (exact identity)
 end
@@ -300,10 +317,130 @@ function _emit_place_write!(stmts, pw::_PlaceWrite, ctx::_EmitCtx, all_formals::
         rhs = _exec_rhs(pw.rhs, ctx, false)
         base = _emit_place_ref(tgt.base, ctx)
         _bind_uses!(stmts, ctx, all_formals)
-        push!(stmts, Expr(:call, GlobalRef(Base, :setfield!), base, QuoteNode(tgt.field), rhs))  # nested field write
+        push!(stmts, Expr(:call, GlobalRef(Base, :setproperty!), base, QuoteNode(tgt.field), rhs))  # authored property write
     else
         _l_reject("unsupported write place $(typeof(tgt)) — expected dotted buffer / scalar owner / Index / Getfield")
     end
+end
+
+# CORE exact-type property accessor for an authored nested read (`chol_metric.L`) — explicit core type
+# lowering, NOT Julia-IR inference (RK 06:20). A SANCTIONED specialization returns the exact concrete
+# factor with NO property-wrapper allocation (raw `chol.L` allocates the `LowerTriangular` wrapper and is
+# uplo-unstable → 192 B); the generic fallback preserves authored `getproperty` for stable properties
+# (NamedTuple fields). New sanctioned types are added here, never authorized ad hoc.
+# SANCTIONED categories ONLY (RK 06:22 — a generic `getproperty` fallback would let an arbitrary custom
+# getproperty body into hot lowering, breaking the source-only boundary): Cholesky/:L → the exact concrete
+# factor; a NamedTuple field (tree/mv/trajectory data) → `getfield` (no custom getproperty). Anything else
+# REJECTS — expansion is only through an explicit property descriptor later, never ad hoc.
+@inline _kernel_property(x::Cholesky, ::Val{:L}) = LowerTriangular(getfield(x, :factors))
+@inline _kernel_property(x::NamedTuple, ::Val{P}) where {P} = getfield(x, P)
+_kernel_property(x, ::Val{P}) where {P} = _l_reject(
+    "unsanctioned authored property `$(P)` on $(typeof(x)) — only Cholesky.L and NamedTuple fields are " *
+    "sanctioned; a custom `getproperty` must not enter hot lowering (add a property descriptor to expand)")
+
+# emit `_kernel_property(base, Val(:field))` for a nested authored property read.
+_emit_property(base, field::Symbol) =
+    Expr(:call, :_kernel_property, base, Expr(:call, GlobalRef(Base, :Val), QuoteNode(field)))
+
+# Role-aware READ of a subject place (RK 06:00): an OWNED slot reads via `_owner_slot` (bound to a local),
+# a SHARED slot via `_shared_slot`, then a nested-property `getfield` chain for `chol_metric.L`. `roleof`:
+# canonical id → :owned|:shared — NOT the leaf's owned-first shortcut.
+function _emit_read(x::_SelfField, ctx::_EmitCtx, roleof::Dict{Int,Symbol})
+    isempty(x.path) && _l_reject("empty read place")
+    id = _l_canon_of(ctx.fieldcanon, x.path[1])
+    (id === nothing || !haskey(ctx.slotof, id)) && _l_reject("read root `$(x.path[1])` has no slot")
+    I = ctx.slotof[id]
+    haskey(roleof, id) || _l_reject("read root `$(x.path[1])` has no role in the detached role map (owned/shared)")
+    r = roleof[id]
+    (r === :owned || r === :shared) || _l_reject("invalid role $(r) for `$(x.path[1])` — expected :owned or :shared")
+    base = r === :shared ? :(_shared_slot(state, Val($I))) : (push!(ctx.slots_used, I); _slot_local(I))
+    for f in x.path[2:end]                                   # nested PROPERTY read (chol_metric.L is computed)
+        base = _emit_property(base, f)                          # core exact-type accessor (0-B, no wrapper)
+    end
+    base
+end
+
+# Emit ONE straight-line registered primitive-effect call from its CAPTURED descriptor — GENERIC over any
+# registered effect (never a hard-coded token, RK 06:10). The rng argument is the one at descriptor
+# `rng_arg` POSITION (never the formal name — a renamed rng still orders correctly) and becomes the runtime
+# `rng` parameter; other args are role-aware reads. `result_alias` is ignored (the write is in place).
+# Returns `(call_expr, written_canons)` — the canonical ids the descriptor WRITES (its `writes` positions →
+# the subject-field args), for the currentness bless/kill.
+function _emit_effect_call(es::_ExprStmt, ctx::_EmitCtx, roleof::Dict{Int,Symbol}, rng_param::Symbol)
+    rc = es.expr
+    (rc isa _RegisteredCall && rc.registration.kind === :primitive) ||
+        _l_reject("effect statement is not a registered primitive call: $(typeof(es.expr))")
+    eff = getfield(rc.registration, :primitive_effect)
+    # descriptor-vs-call defense (RK 06:19): codegen must not accept a forged/mismatched MethodIR — the
+    # actual arg count must equal the descriptor arity, and the keyword shape must be empty/supported.
+    length(rc.args) == eff.arity || _l_reject(
+        "effect call arity $(length(rc.args)) != descriptor arity $(eff.arity) — forged/mismatched descriptor")
+    isempty(rc.kw) || _l_reject("effect call has unsupported keyword arguments $(rc.kw)")
+    callee = _exec_registered_callee(rc)                    # detached captured identity, rebind-checked
+    args = Any[i == eff.rng_arg ? rng_param : _emit_read(a, ctx, roleof) for (i, a) in enumerate(rc.args)]
+    written = Int[]
+    for wpos in eff.writes                                  # descriptor writes → the written subject fields
+        (1 <= wpos <= length(rc.args)) || _l_reject("effect write position $(wpos) out of range")
+        a = rc.args[wpos]
+        a isa _SelfField || _l_reject("effect write arg $(wpos) is not a subject place: $(typeof(a))")
+        id = _l_canon_of(ctx.fieldcanon, a.path[1])
+        id === nothing && _l_reject("effect write field `$(a.path[1])` has no canonical id")
+        push!(written, id)
+    end
+    (Expr(:call, callee, args...), written)
+end
+
+"""
+    compile_effect_root(ir, fieldcanon, slotof, scalar_canons, roleof, killmap; rng = :rng) -> (fn, meta)
+
+GENERIC straight-line registered-effect-sequence lowering (RK 06:10 — the core compiler is NOT
+token-specific): emits, in SOURCE ORDER, every registered primitive-effect statement of `ir` (each from
+its captured descriptor — role-aware reads, rng by descriptor position), then an EXECUTABLE currentness
+update, then `return state`. `ir` must be exactly a straight line of registered effect ExprStmts + a
+terminal `return <subject>` — any other statement rejects. NO effect is hard-coded; refresh's exact
+`randn!`→`lmul!` shape is an ACCEPTANCE discriminator (in tests/fixture census), not this authorization.
+
+Currentness (RK 06:04/06:09): each effect's descriptor `writes` name the WRITTEN subject fields; their
+absolute storage slots are authoritatively BLESSED, and their dependents (`killmap[written_canon]`) are
+KILLED — position-gradient (not a dependent) stays current. Bless/kill are Val-encoded ABSOLUTE
+slot-index tuples handed to the `_owner_current_update!` mask API (the `NTuple{W,UInt}` packing is the
+storage layer's; never a hard-coded UInt64 here). `fn(state, rng)` mutates owned slots in place at 0-B.
+"""
+function compile_effect_root(ir::MethodIR, fieldcanon::Dict{Symbol,Int}, slotof::Dict{Int,Int},
+                             scalar_canons::Set{Int}, roleof::Dict{Int,Symbol},
+                             killmap::Dict{Int,Vector{Int}}; rng::Symbol = :rng)
+    ctx = _EmitCtx(fieldcanon, slotof, scalar_canons, (), Int[], Symbol[])
+    _slot(c) = (haskey(slotof, c) || _l_reject("canon $(c) has no absolute storage slot"); slotof[c])
+    body = Any[]; calls = Any[]; written_canons = Int[]; sawret = false
+    # EXECUTED-PREFIX epoch semantics (RK 06:13): KILL each effect's written roots + dependents BEFORE it
+    # runs, then execute; a mid-sequence throw thus leaves every reached write + dependent DIRTY (no bless).
+    for st in ir.body                                       # straight-line effects in SOURCE ORDER
+        if st isa _ExprStmt
+            call, written = _emit_effect_call(st, ctx, roleof, rng)
+            push!(calls, call); append!(written_canons, written)
+            kslots = Tuple(sort!(unique(vcat([_slot(c) for c in written],
+                                             [_slot(k) for c in written for k in get(killmap, c, Int[])]))))
+            push!(body, :(_owner_kill_current!(state, Val($kslots))))    # kill BEFORE the mutation
+            push!(body, call)
+        elseif st isa _Return && st.value isa _SelfRef
+            sawret = true
+        else
+            _l_reject("effect-root lowering permits only registered effect statements + `return <subject>`; " *
+                      "got an unlowered $(typeof(st))")
+        end
+    end
+    sawret || _l_reject("effect root must terminate in an explicit `return <subject>` (_Return(_SelfRef))")
+    # COMMIT (only after the whole trace succeeds): BLESS the authoritative written roots; dependents stay
+    # killed (dirty). Bless (written roots) and the residual dirty dependents must be DISJOINT (RK 06:13).
+    bless_slots = Tuple(sort!(unique(_slot(c) for c in written_canons)))
+    dep_slots   = Tuple(sort!(unique(_slot(k) for c in written_canons for k in get(killmap, c, Int[]))))
+    isempty(intersect(bless_slots, dep_slots)) ||
+        _l_reject("bless/kill overlap: written roots $(bless_slots) intersect dependents $(dep_slots)")
+    binds = Any[:($(_slot_local(I)) = _owner_slot(state, Val($I))) for I in unique(ctx.slots_used)]
+    push!(body, :(_owner_bless_current!(state, Val($bless_slots))))      # commit bless
+    fn = compile(:((state, $rng) -> $(Expr(:block, binds..., body..., :(return state)))))
+    (fn, (; calls, owned_slots = unique(ctx.slots_used), written_canons = unique(written_canons),
+          bless_slots, kill_slots = dep_slots))
 end
 
 # A place INDEX expression (`trees[1]` → `1`): a literal index, or a bound formal (runtime), else reject.
@@ -326,8 +463,7 @@ function _emit_place_ref(x::_SelfField, ctx::_EmitCtx)
 end
 _emit_place_ref(x::_Index, ctx::_EmitCtx) =
     Expr(:call, GlobalRef(Base, :getindex), _emit_place_ref(x.base, ctx), (_emit_index(i, ctx) for i in x.idxs)...)
-_emit_place_ref(x::_Getfield, ctx::_EmitCtx) =
-    Expr(:call, GlobalRef(Base, :getfield), _emit_place_ref(x.base, ctx), QuoteNode(x.field))
+_emit_place_ref(x::_Getfield, ctx::_EmitCtx) = _emit_property(_emit_place_ref(x.base, ctx), x.field)
 
 # The ordered subject `_PlaceWrite`s of a straight-line method body (same filter/order as `_l_write_steps`).
 function _exec_place_writes(ir::MethodIR)
