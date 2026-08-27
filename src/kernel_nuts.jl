@@ -39,6 +39,23 @@ struct _CompiledRefresh{RandT, LmulT, MomSlot, CholSlot, Kills}
     rand::RandT
     lmul::LmulT
 end
+# the momentum-refresh factor view `chol.L`, specialized by the Cholesky BACKING, ZERO-cost (compile-time
+# dispatch on the concrete chol type — no wrapper allocation, no runtime branch):
+#  - DIAGONAL-backed Cholesky: the `factors` Diagonal IS already the lower factor (a real Diagonal is
+#    self-adjoint and lower-triangular), so lmul! it DIRECTLY. This is not just cheaper — it is REQUIRED: at
+#    runtime `adjoint(UpperTriangular(::Diagonal))` canonicalizes to `LowerTriangular{T,Diagonal}`, which the
+#    dense uplo-wrapper prediction (`LowerTriangular{T,Adjoint{T,Diagonal}}`) does NOT match, so the wrapper
+#    path would emit a type the lmul! domain rejects. The bare `factors` Diagonal is the type `_kernel_dom_
+#    lmul_lhs` admits.
+#  - DENSE (Matrix-backed) Cholesky: the orientation-correct non-allocating lower view — for uplo='U' the
+#    factors hold U and `adjoint(UpperTriangular(F))` canonicalizes to `LowerTriangular{T,Adjoint{T,Matrix{T}}}`
+#    (the exact lazy factor the lmul! domain admits, syntax 5bfc290); for uplo='L', `LowerTriangular(F)`.
+#    `getproperty(chol,:L)` would allocate a wrapper.
+@inline _refresh_lfactor(chol::LinearAlgebra.Cholesky{<:Any, <:LinearAlgebra.Diagonal}) = getfield(chol, :factors)
+@inline function _refresh_lfactor(chol::LinearAlgebra.Cholesky)
+    F = getfield(chol, :factors)
+    getfield(chol, :uplo) == Char(0x55) ? adjoint(LinearAlgebra.UpperTriangular(F)) : LinearAlgebra.LowerTriangular(F)
+end
 @generated function _refresh_killall!(owned, ::Val{M}, ::Val{Ks}) where {M, Ks}
     Expr(:block, :(_canon_kill!(owned, Val($M))), (:(_canon_kill!(owned, Val($k))) for k in Ks)..., :(nothing))
 end
@@ -56,13 +73,7 @@ end
     _refresh_killall!(owned, Val(MomSlot), Val(Kills))               # kill mom + dependents BEFORE the writes
     r.rand(rng, mom)                                                 # randn!(rng, mom)
     chol = _canon_slot(shared, Val(CholSlot))
-    # orientation-correct NON-ALLOCATING lower-factor view (the already-correct 0-B path): for uplo='U' the
-    # factors hold U, and `adjoint(UpperTriangular(F))` CANONICALIZES in Julia to `LowerTriangular{T,Adjoint{T,
-    # Matrix{T}}}` (the exact lazy factor the lmul! domain admits, syntax 5bfc290); for uplo='L',
-    # `LowerTriangular(F)` over the concrete matrix. `getproperty(chol,:L)` would allocate a wrapper.
-    F = getfield(chol, :factors)
-    L = getfield(chol, :uplo) == Char(0x55) ? adjoint(LinearAlgebra.UpperTriangular(F)) : LinearAlgebra.LowerTriangular(F)
-    r.lmul(L, mom)                                                   # lmul!(chol.L, mom)
+    r.lmul(_refresh_lfactor(chol), mom)                             # lmul!(chol.L, mom) — backing-specialized 0-B view
     _canon_bless!(owned, Val(MomSlot))                              # bless mom only after BOTH writes succeed
     owned
 end
@@ -104,16 +115,25 @@ function compile_refresh(pf, ::Type{OW}, ::Type{SH}, refresh_ir::MethodIR) where
     # the chol slot must hold a sanctioned Cholesky (its L-view is the momentum-refresh factor)
     cholT = fieldtype(SH, chol_slot)
     (cholT <: LinearAlgebra.Cholesky) || _l_reject("refresh: chol_metric slot is not a Cholesky ($cholT)")
-    # CONCRETE-DOMAIN admission of the ACTUAL emitted lmul factor (RK / syntax 5bfc290): the call method's
-    # lower-factor view is `LowerTriangular{T,Matrix{T}}` (uplo='L') or the canonicalized `adjoint(
-    # UpperTriangular(F))` == `LowerTriangular{T,Adjoint{T,Matrix{T}}}` (uplo='U'); both — and no generic/custom
-    # backing — must pass the lmul! domain. uplo is a runtime field, so both forms can occur for the same cholT.
+    # CONCRETE-DOMAIN admission of the ACTUAL emitted lmul factor (RK / syntax 5bfc290), branched by the
+    # Cholesky BACKING so the guard validates the type `_refresh_lfactor` will really emit for THIS backing:
+    #  - DIAGONAL backing: the emitted factor is the bare `factors` Diagonal itself (self-adjoint lower factor);
+    #    validate `(facT, momT)` — NOT the dense uplo-wrapper types, which are not what runs and would falsely
+    #    reject (runtime `adjoint(UpperTriangular(::Diagonal))` canonicalizes to `LowerTriangular{T,Diagonal}`).
+    #  - DENSE (Matrix / other) backing: the lower-factor view is `LowerTriangular{T,facT}` (uplo='L') or the
+    #    canonicalized `LowerTriangular{T,Adjoint{T,facT}}` (uplo='U'); both — and no generic/custom backing —
+    #    must pass. uplo is a runtime field, so both forms can occur for the same cholT.
     momT = fieldtype(OW, mom_slot); facT = fieldtype(cholT, :factors); ET = eltype(facT)   # structural, no value/inference
-    Llow = LinearAlgebra.LowerTriangular{ET, facT}                                  # uplo='L' emitted type
-    Lupp = LinearAlgebra.LowerTriangular{ET, LinearAlgebra.Adjoint{ET, facT}}       # uplo='U' canonicalized type
-    (kernel_builtin_primitive_domain_ok(rc2.registration, (Llow, momT)) &&
-     kernel_builtin_primitive_domain_ok(rc2.registration, (Lupp, momT))) ||
-        _l_reject("refresh lmul! domain rejects the emitted Cholesky-L view over $facT with mom $momT")
+    if facT <: LinearAlgebra.Diagonal
+        kernel_builtin_primitive_domain_ok(rc2.registration, (facT, momT)) ||
+            _l_reject("refresh lmul! domain rejects the Diagonal Cholesky factor $facT with mom $momT")
+    else
+        Llow = LinearAlgebra.LowerTriangular{ET, facT}                              # uplo='L' emitted type
+        Lupp = LinearAlgebra.LowerTriangular{ET, LinearAlgebra.Adjoint{ET, facT}}   # uplo='U' canonicalized type
+        (kernel_builtin_primitive_domain_ok(rc2.registration, (Llow, momT)) &&
+         kernel_builtin_primitive_domain_ok(rc2.registration, (Lupp, momT))) ||
+            _l_reject("refresh lmul! domain rejects the emitted Cholesky-L view over $facT with mom $momT")
+    end
     _CompiledRefresh{typeof(randfn), typeof(lmulfn), mom_slot, chol_slot, kills}(randfn, lmulfn)
 end
 

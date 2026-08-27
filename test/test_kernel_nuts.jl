@@ -319,3 +319,27 @@ end
     @test !occursin(banned, "    ctr = Ref(0)")                  # indented local scratch — allowed
     @test !occursin(banned, "    fspv = Dict(m => 1 for m in x)")# indented local scratch — allowed
 end
+
+@testset "refresh factor view: Diagonal vs dense Cholesky backing (structural, 0-B)" begin
+    # `_refresh_lfactor(chol)` is the backing-specialized momentum-refresh factor (`chol.L`) used by
+    # _CompiledRefresh. Dense keeps the orientation-correct uplo wrapper; a Diagonal-backed Cholesky uses the
+    # bare `factors` Diagonal directly (self-adjoint lower factor) — zero wrapper, and the ONLY type the lmul!
+    # domain admits (runtime `adjoint(UpperTriangular(::Diagonal))` canonicalizes to `LowerTriangular{T,Diagonal}`,
+    # which the dense uplo-wrapper prediction does not match). Both must be math-faithful to `chol.L*mom` and 0-B.
+    for T in (Float64, Float32)
+        Md = T[4 0; 0 9]; chd = cholesky(Md); momd = T[1,2]
+        Ld = RK._refresh_lfactor(chd); yd = copy(momd); LinearAlgebra.lmul!(Ld, yd)
+        @test yd ≈ chd.L * momd                          # dense: math matches chol.L*mom
+        @test Ld isa LinearAlgebra.LowerTriangular       # dense: triangular view, unchanged path
+        Mg = LinearAlgebra.Diagonal(T[4,9]); chg = cholesky(Mg); momg = T[1,2]
+        @test chg.factors isa LinearAlgebra.Diagonal
+        Lg = RK._refresh_lfactor(chg); yg = copy(momg); LinearAlgebra.lmul!(Lg, yg)
+        @test yg ≈ chg.L * momg                          # diagonal: math matches chol.L*mom
+        @test Lg isa LinearAlgebra.Diagonal              # diagonal: bare factors, NO uplo wrapper / Adjoint
+        @test Lg === chg.factors                         # zero-cost: identity, no view allocation
+        barrier(ch, m) = LinearAlgebra.lmul!(RK._refresh_lfactor(ch), m)
+        barrier(chd, copy(momd)); barrier(chg, copy(momg))                 # warm both specializations
+        @test (@allocated barrier(chd, momd)) == 0       # dense exact 0-B
+        @test (@allocated barrier(chg, momg)) == 0       # diagonal exact 0-B
+    end
+end
