@@ -576,17 +576,6 @@ function _own_expr_effects!(st::_OwnState, cur::MethodId, x, env::Dict{Symbol,_P
             end
         elseif reg.kind === :intrinsic
             isempty(x.args) || _own_record!(st, cur, _kernel_place_of(x.args[1], env))  # copy!! dest
-        elseif reg.kind === :declared_effect
-            # an author-DECLARED helper (@rk_pure/@rk_borrows/@rk_rng): admissible over reactive
-            # places (NOT rejected as opaque). It owns only its DECLARED write positions (pure/rng
-            # readers have none → no spurious ownership); rng_arg/borrows/order are lowering metadata.
-            de = reg.primitive_effect
-            length(x.args) == de.arity || throw(_KernelFactoryReject(
-                "declared-effect $(de.token) captured for arity $(de.arity) but called with " *
-                "$(length(x.args)) positionals — unsupported arity"))
-            for w in de.writes
-                w <= length(x.args) && _own_record!(st, cur, _kernel_place_of(x.args[w], env))
-            end
         elseif reg.kind === :pure_primitive
             # An exact-identity RK-core PURE primitive (RK 06:01) — an ordinary/dotted/compound
             # operator or named Base/stdlib pure callable. Reads EVERY actual, writes NOTHING, any

@@ -87,7 +87,7 @@ function _native_validate_registered(x::_RegisteredCall)
         _native_reject(sprint(showerror,e))
     end
     pe = reg.primitive_effect
-    if reg.kind in (:primitive, :declared_effect)
+    if reg.kind === :primitive
         pe === nothing && _native_reject("$(reg.kind) call has no detached effect descriptor")
         length(x.args) == pe.arity || _native_reject(
             "captured $(reg.kind) call arity $(length(x.args)) disagrees with descriptor arity $(pe.arity)")

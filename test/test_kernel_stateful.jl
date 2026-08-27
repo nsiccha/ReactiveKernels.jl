@@ -382,7 +382,7 @@ end
         @test !(leapfrog! isa KernelSpec)
         @test !(leapfrog! isa RKS._StatefulKernelSkeleton)
         @test RKS.kernel_subject(leapfrog!) === :phasepoint
-        # shallow-declared effect roots on the subject (top owned fields)
+        # shallow authored effect roots on the subject (top owned fields)
         @test RKS.kernel_write_roots(leapfrog!) == (:mom, :pos)
         @test RKS.kernel_read_roots(leapfrog!) == (:dham_dpos, :dham_dmom)
         @test !RKS.kernel_is_bangbang(leapfrog!)          # `!` is not `!!`

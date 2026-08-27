@@ -49,7 +49,6 @@ export lower, lower_batched, replica, transform, compile
 export explain, code_expr, inputs, outputs, valtype
 export compose, PreparationCache, prepare!, canon_id
 export KernelSpec, @kernel, @node, kernel_graph, port, copy!!
-export @rk_pure, @rk_borrows, @rk_rng
 export DAGVisualization, visualize, dot_source, save_visualization
 # Reactive layer
 export ReactiveState, set!, get!, freeze!, unfreeze!, checkpoint, materialize!

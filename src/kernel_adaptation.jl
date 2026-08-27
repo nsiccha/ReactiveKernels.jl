@@ -69,7 +69,7 @@ end
 #
 # This is deliberately a small compiler for the adaptation surface, not a general Julia compiler.  It accepts
 # only the captured Base numeric primitives used by dual averaging and Welford, plus the captured builtin
-# `eachcol` borrow used by Welford's matrix orchestration.  An ordinary/declared helper is never granted purity,
+# `eachcol` borrow used by Welford's matrix orchestration. An ordinary helper is never granted purity,
 # arity, or a result type here.  Every call is rebind-checked against its captured GlobalRef and every primitive
 # application is validated, at specialization, against exact concrete operand types and an exhaustive result
 # rule below.  Unsupported syntax or a missing result rule is a compile-time rejection.

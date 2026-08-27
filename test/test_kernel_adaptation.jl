@@ -155,7 +155,6 @@ end
                 node isa RK._RegisteredCall && push!(kinds, node.registration.kind)
             end
         end
-        @test !(:declared_effect in kinds)
         @test all(k -> k in (:pure_primitive, :primitive), kinds)
     end
     emit_src = read(joinpath(@__DIR__, "..", "src", "kernel_adaptation.jl"), String)

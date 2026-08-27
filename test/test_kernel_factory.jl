@@ -5,17 +5,8 @@ using ReactiveKernels, Test
 using LinearAlgebra, Random
 const RKS = ReactiveKernels
 
-# a PURE helper reading reactive places by reference — admissible ONLY via an explicit exact
-# declaration (the public `@rk_pure`), never by body inference.
-crit(a, b) = a + b
-@rk_pure crit 2
-@kernel critowner(x, y) = begin
-    go!() = begin
-        z = crit(x, y)          # reads self places x,y — admissible via @rk_pure
-        Base.fill!(x, z)        # a real owned write so the closure runs
-    end
-end
-# an UNDECLARED helper on a self place stays opaque → the closure rejects by name.
+# An ordinary helper on a reactive place is opaque and fail-closed: body inference and callable
+# spelling are not effect authority.
 uncrit(a, b) = a + b
 @kernel undeclowner(x, y) = begin
     go!() = begin
@@ -23,41 +14,20 @@ uncrit(a, b) = a + b
         Base.fill!(x, z)
     end
 end
-# same-NAME cross-module helpers get DISTINCT identity-derived tokens (no collision).
-module CritA; f(a, b) = a + b; end
-module CritB; f(a, b) = a; end
-@rk_pure CritA.f 2
-@rk_pure CritB.f 2
-# borrow / rng declarations (top-level: method defs cannot live in a testset's local scope)
-borrowfn(a) = a
-@rk_borrows borrowfn 1
-rngfn(r, x) = x
-@rk_rng rngfn 2 1
-# WRONG-ARITY: crit is declared arity 2; calling it with 1 positional must reject deterministically.
-@kernel wrongarity(x) = begin
+# A captured sibling method is the supported authoring surface for visible helper logic. Its body is
+# frozen MethodIR and participates in the same ownership closure as its caller.
+@kernel siblingowner(x, y) = begin
+    add(a, b) = a + b
     go!() = begin
-        z = crit(x)
+        z = add(__self__, x, y)
         Base.fill!(x, z)
     end
 end
-# REBIND adversary: a declared helper captured through a NON-const module slot; rebinding the slot
-# to a module without the helper must read as rebound (same detached-identity check as primitives).
-module Helpers; hot(a, b) = a + b; end
-@rk_pure Helpers.hot 2
-HelperMod = Helpers
-@kernel hotowner(x, y) = begin
+# Exact built-in pure/effect primitives are the other supported path; their detached descriptors and
+# concrete type-domain checks remain compiler-owned.
+@kernel builtinowner(x, y) = begin
     go!() = begin
-        z = HelperMod.hot(x, y)
-        Base.fill!(x, z)
-    end
-end
-baremodule NoHot end
-# DESCRIPTOR-DRIFT adversary: same callable identity, re-declared with different SEMANTICS.
-driftfn(a, b) = a
-@rk_pure driftfn 2
-@kernel driftowner(x, y) = begin
-    go!() = begin
-        z = driftfn(x, y)
+        z = x + y
         Base.fill!(x, z)
     end
 end
@@ -688,7 +658,13 @@ end
         @test g.version == ver1
     end
 
-    @testset "public exact-identity effect descriptors (@rk_* + built-in RNG/linear-algebra effects)" begin
+    @testset "fail-closed helpers + registered siblings and exact built-in effects" begin
+        # The former public declaration API is fully retired rather than retained as a hidden shim.
+        for name in (Symbol("@rk_pure"), Symbol("@rk_borrows"), Symbol("@rk_rng"),
+                     :_kernel_declared_effect, :_effect_pure, :_effect_borrows, :_effect_rng)
+            @test !isdefined(RKS, name)
+        end
+
         # RK-core built-in RNG/effect primitives for refresh_momentum!!
         rn = RKS._kernel_primitive_effect(Random.randn!)
         @test rn.kind === :rng && rn.order === :ordered && rn.rng_arg == 1
@@ -696,63 +672,24 @@ end
         lm = RKS._kernel_primitive_effect(LinearAlgebra.lmul!)
         @test lm.kind === :effect && lm.writes == (2,) && lm.reads == (1, 2) && lm.result_alias == 2
 
-        # a DECLARED pure helper is captured detached as :declared_effect, IDENTITY-derived token
-        caps = RKS.kernel_callee_registrations(critowner)
-        dec = only(c for c in caps if c.registration.kind === :declared_effect)
-        @test dec.target === crit
-        @test dec.registration.primitive_effect.kind === :pure
-        @test dec.registration.primitive_effect.token === typeof(crit)
-        @test !RKS.kernel_callee_rebound(critowner, dec.ref)          # slot resolves → not rebound
-        # the closure ADMITS the declared helper over self places (no opaque reject); x owned via fill!
-        @test :x in RKS._kernel_factory_owned_authoritative(critowner)
-        # an UNDECLARED helper on a self place REJECTS by exact name
+        # An ordinary helper is omitted from captured registrations and remains opaque: neither its
+        # small body nor its spelling grants effect authority, so ownership fails closed.
+        @test !any(c -> c.target === uncrit, RKS.kernel_callee_registrations(undeclowner))
         @test_throws RKS._KernelFactoryReject RKS._kernel_factory_owned_authoritative(undeclowner)
 
-        # same-NAME cross-module helpers → DISTINCT identity-derived tokens (no collision)
-        @test RKS._kernel_declared_effect(CritA.f).token !== RKS._kernel_declared_effect(CritB.f).token
-        @test RKS._kernel_declared_effect(CritA.f).token === typeof(CritA.f)
-        # @rk_borrows marks the result as borrowing ALL actuals; @rk_rng names the RNG position
-        @test RKS._kernel_declared_effect(borrowfn).borrows == (1,) &&
-              RKS._kernel_declared_effect(borrowfn).kind === :pure
-        @test RKS._kernel_declared_effect(rngfn).kind === :rng &&
-              RKS._kernel_declared_effect(rngfn).rng_arg == 1
+        # Visible helper logic belongs in a captured sibling MethodIR; exact built-in arithmetic and
+        # fill! are also admitted through their compiler-owned identity/domain descriptors.
+        @test Set(ir.id.name for ir in RKS.method_irs(siblingowner)) == Set((:add, :go!))
+        @test RKS._kernel_factory_owned_authoritative(siblingowner) == Set((:x,))
+        @test RKS._kernel_factory_owned_authoritative(builtinowner) == Set((:x,))
+        bcaps = RKS.kernel_callee_registrations(builtinowner)
+        @test any(c -> c.registration.kind === :pure_primitive && c.target === Base.:+, bcaps)
+        @test any(c -> c.registration.kind === :primitive && c.target === Base.fill!, bcaps)
 
-        # WRONG ARITY: crit declared arity 2, called with 1 positional → deterministic reject
-        @test_throws RKS._KernelFactoryReject RKS._kernel_factory_owned_authoritative(wrongarity)
-
-        # REBIND: HelperMod.hot captured declared; rebinding HelperMod to a module without `hot`
-        # reads as rebound (same detached-identity re-resolution as a primitive/registered callee)
-        hc = only(c for c in RKS.kernel_callee_registrations(hotowner)
-                  if c.registration.kind === :declared_effect)
-        @test hc.target === Helpers.hot
-        @test !RKS.kernel_callee_rebound(hotowner, hc.ref)
-        @eval HelperMod = NoHot
-        @test RKS.kernel_callee_rebound(hotowner, hc.ref)
-        @eval HelperMod = Helpers
-
-        # DESCRIPTOR DRIFT (RK 04:29/04:30): re-declaring the SAME identity with different semantics
-        # (pure/arity-2 → rng) must read REBOUND via the WHOLE-descriptor comparison, even though
-        # `typeof(driftfn)` is unchanged — and WITHOUT mutating the captured snapshot.
-        dcap = only(c for c in RKS.kernel_callee_registrations(driftowner)
-                    if c.registration.kind === :declared_effect)
-        @test !RKS.kernel_rebound(dcap.registration, driftfn)     # descriptor matches
-        capsnap = dcap.registration.primitive_effect
-        @eval @rk_rng driftfn 2 1                                 # same identity, drifted semantics
-        @test RKS.kernel_rebound(dcap.registration, driftfn)      # whole-descriptor drift → rebound
-        @test dcap.registration.primitive_effect === capsnap      # captured snapshot UNMUTATED
-        @test dcap.registration.primitive_effect.kind === :pure
-        @eval @rk_pure driftfn 2                                  # restore
-
-        # constructor/macro VALIDATION: rngpos out of range and duplicate/out-of-range positions reject
-        @test_throws ArgumentError RKS._effect_rng(rngfn, 2, 3)   # rngpos 3 ∉ 1:2
-        @test_throws ArgumentError RKS._effect_check(2, (0,), "x")   # position 0 out of range
-        @test_throws ArgumentError RKS._effect_check(3, (1, 1), "x") # duplicate positions
-        @test_throws ArgumentError RKS._effect_check(0, (), "x")     # zero arity rejected (positive only)
-        @test_throws ArgumentError RKS._effect_check(-1, (), "x")    # negative arity rejected
         # Random.rand 2-positional ordered-RNG built-in (rand(rng, Bool) in step!)
         rd = RKS._kernel_primitive_effect(Random.rand)
         @test rd.kind === :rng && rd.rng_arg == 1 && rd.writes == () && rd.reads == (1, 2)
-        # Random.randexp is an exact arity-1 built-in authority, not an authored @rk_rng declaration.
+        # Random.randexp is an exact arity-1 built-in authority.
         re = RKS._kernel_primitive_effect(Random.randexp)
         @test re.kind === :rng && re.order === :ordered && re.rng_arg == 1
         @test re.arity == 1 && re.writes == () && re.reads == (1,) && re.result_alias === nothing
@@ -772,13 +709,12 @@ end
             Core.eval(RN, st)
         end
         ns = RN.nuts_state
-        # None of the six former ordinary helpers remains a module binding or a declared-effect capture.
+        # None of the six former ordinary helpers remains a module binding; the fixture exposes all
+        # hot logic as sibling MethodIR and sanctioned built-ins.
         for h in (:finiteorneginf, :min1exp, :badd, :randbernoullilog,
                   :logswapprob, :compute_criterion)
             @test !isdefined(RN, h)
         end
-        @test !any(c -> c.registration.kind === :declared_effect,
-                   RKS.kernel_callee_registrations(ns))
         @test any(c -> c.registration.source === Random.randexp &&
                        c.registration.kind === :primitive,
                   RKS.kernel_callee_registrations(ns))

@@ -783,9 +783,8 @@ end
 # semantics (destination owned-CLOSURE copy, shared authority untouched, `result === dest`,
 # shape/type checks), carried by its own registration, never flattened to a positional here.
 struct _PrimitiveEffect
-    token::Any                        # IDENTITY-derived exact definition identity — `typeof(target)`
-                                      #   for a declared helper, or a stable built-in Symbol. NEVER
-                                      #   name/spelling-derived (that collides cross-module).
+    token::Any                        # stable, exact built-in identity token. NEVER inferred from
+                                      #   name/spelling (which could collide cross-module).
     arity::Int                        # EXACT accepted positional arity — valid ONLY for that arity
     writes::Tuple{Vararg{Int}}        # positional actuals WRITTEN
     reads::Tuple{Vararg{Int}}         # positional actuals READ
@@ -796,32 +795,16 @@ struct _PrimitiveEffect
                                       #   all) — must NOT be cached/materialized as authoritative
     rng_arg::Union{Nothing,Int}       # the runtime RNG arg position (:rng only) — explicit, not by kind
 end
-# 5-arg back-compat: an RK-core positional-writer primitive (`Base.fill!`/`copyto!`).
+# Compact constructor for an RK-core positional-writer primitive (`Base.fill!`/`copyto!`).
 _PrimitiveEffect(token, arity, writes, reads, result_alias) =
     _PrimitiveEffect(token, arity, writes, reads, result_alias, :effect, :none, (), nothing)
-const _EffectDescriptor = _PrimitiveEffect
 
-# VALUE equality over the WHOLE descriptor (RK 04:29): a rebind check must detect a DECLARATION
-# DRIFT (arity/kind/order/writes/reads/result_alias/borrows/rng_arg changing) even when the
-# identity token `typeof(f)` is unchanged — comparing the token alone would falsely read unchanged.
+# VALUE equality over the WHOLE descriptor: a rebind check must detect any built-in contract drift
+# (arity/kind/order/writes/reads/result_alias/borrows/rng_arg), not merely compare the token.
 Base.:(==)(a::_PrimitiveEffect, b::_PrimitiveEffect) =
     a.token === b.token && a.arity == b.arity && a.writes == b.writes && a.reads == b.reads &&
     a.result_alias == b.result_alias && a.kind === b.kind && a.order === b.order &&
     a.borrows == b.borrows && a.rng_arg == b.rng_arg
-
-# Validate declared positional metadata is IN RANGE (1:arity) and NON-DUPLICATE (RK 04:29).
-function _effect_check(arity::Int, positions, what::String)
-    # A declared effect describes a positional subject/read contract, so arity must be POSITIVE
-    # (RK 04:33); a zero-arg effect would need a separate explicit contract, not a silent admit.
-    arity > 0 || throw(ArgumentError("declared effect arity must be > 0, got $arity"))
-    for p in positions
-        1 <= p <= arity || throw(ArgumentError(
-            "declared effect $what position $p out of range 1:$arity"))
-    end
-    length(unique(positions)) == length(positions) ||
-        throw(ArgumentError("declared effect $what positions $positions contain duplicates"))
-    positions
-end
 
 # Pure DISPATCH on the resolved VALUE identity — used AT OWNER DEFINITION (capture time),
 # so its result is SNAPSHOTTED detached (no mutable registry, no analysis-time reread).
@@ -839,23 +822,23 @@ _kernel_primitive_effect(@nospecialize(v)) =
     # RK-core built-in RNG/effect primitives for `refresh_momentum!!` (RK 2026-08-27):
     #   randn!(rng, dest): ordered RNG (arg 1 is the RNG), writes dest (arg 2), result aliases dest.
     v === Random.randn! ?
-        _EffectDescriptor(Symbol("__rk_rng_Random_randn!__"), 2, (2,), (1,), 2, :rng, :ordered, (), 1) :
+        _PrimitiveEffect(Symbol("__rk_rng_Random_randn!__"), 2, (2,), (1,), 2, :rng, :ordered, (), 1) :
     #   lmul!(A, dest): reads matrix A (arg 1) + dest (arg 2), writes dest (arg 2), result aliases dest.
     v === LinearAlgebra.lmul! ?
-        _EffectDescriptor(Symbol("__rk_effect_LinearAlgebra_lmul!__"), 2, (2,), (1, 2), 2, :effect, :none, (), nothing) :
+        _PrimitiveEffect(Symbol("__rk_effect_LinearAlgebra_lmul!__"), 2, (2,), (1, 2), 2, :effect, :none, (), nothing) :
     #   rand(rng, T): the 2-positional ordered-RNG form (`rand(rng, Bool)` in step!) — RNG is arg 1,
     #   no reactive WRITE (returns a fresh value); reads both actuals.
     v === Random.rand ?
-        _EffectDescriptor(Symbol("__rk_rng_Random_rand__"), 2, (), (1, 2), nothing, :rng, :ordered, (), 1) :
+        _PrimitiveEffect(Symbol("__rk_rng_Random_rand__"), 2, (), (1, 2), nothing, :rng, :ordered, (), 1) :
     #   randexp(rng): the exact 1-positional scalar exponential draw used by the authored NUTS
     #   accept/reject helper.  It reads only the RNG, writes no reactive place, returns a fresh scalar,
     #   and is ordered with every other RNG effect.  This is a built-in authority, not an author macro.
     v === Random.randexp ?
-        _EffectDescriptor(Symbol("__rk_rng_Random_randexp__"), 1, (), (1,), nothing, :rng, :ordered, (), 1) :
+        _PrimitiveEffect(Symbol("__rk_rng_Random_randexp__"), 1, (), (1,), nothing, :rng, :ordered, (), 1) :
     #   eachcol(A): NOT pure — reads A (arg 1) and returns a lazy VIEW iterator BORROWING arg 1 (RK
     #   06:10), so a yielded column aliases A and must NOT be treated as an independent value. No write.
     v === Base.eachcol ?
-        _EffectDescriptor(Symbol("__rk_borrows_Base_eachcol__"), 1, (), (1,), nothing, :pure, :none, (1,), nothing) :
+        _PrimitiveEffect(Symbol("__rk_borrows_Base_eachcol__"), 1, (), (1,), nothing, :pure, :none, (1,), nothing) :
     nothing
 
 # --- exact-identity PURE Base/stdlib primitive SET (RK 2026-08-27 provenance fix) -------------
@@ -912,7 +895,7 @@ _kernel_pure_primitive_value(@nospecialize(v)) = any(x -> x === v, _KERNEL_PURE_
 # `length(proposals)` sees an `Array{<endpoint-state>}` (non-numeric eltype) and `isnothing(stats_f)` sees
 # `Nothing` or a registered kernel object (RK 06:33). LOAD-BEARING: `kernel_pure_primitive_domain_ok` is
 # the exact predicate poc/the factory call at specialization; a same-generic overload on a custom
-# container/number REJECTS unless it carries an explicit `@rk_*` / registered-kernel declaration.
+# container/number REJECTS unless it is expressed through a registered kernel sibling or sanctioned builtin.
 #
 # Type-domain leaves. A numeric SCALAR must be RECURSIVELY-SAFE CONCRETE REPRESENTATION, not merely
 # `parentmodule ∈ Base/Core + isbits Number` (RK 06:43b): a Base-owned wrapper parameterized by a user
@@ -983,8 +966,7 @@ kernel_pure_primitive_domain_ok(reg, argtypes) =
 # authoritative contract ONLY over its supported builtin concrete domain — validated PER exact primitive +
 # arity/position (a single coarse all-args predicate is wrong: `lmul!` arg1 is a LinearAlgebra structured
 # matrix, `rand`'s arg2 is a `Type{Bool}`). A user method extending the SAME generic over an unsupported
-# domain REJECTS. A PUBLIC `@rk_*` declaration (`:declared_effect`) is the AUTHOR's trusted contract and is
-# NOT gated; only the silent core built-ins (`:primitive`) refuse to bless arbitrary overloads.
+# domain REJECTS. Only these exact built-ins (`:primitive`) receive a detached effect contract.
 _kernel_dom_num_array(::Type{T}) where {T} =
     T <: Array && _kernel_dom_builtin(T) && _kernel_dom_num_scalar(eltype(T))
 _kernel_dom_num_matrix(::Type{T}) where {T} =
@@ -1071,63 +1053,15 @@ Per-callee/arity SPECIALIZATION admission for a captured RK-core built-in EFFECT
 `copyto!`(Base Array dest+src), `randn!`(builtin RNG + numeric Array), `lmul!`(sanctioned LinearAlgebra/
 dense matrix + numeric Array), `rand`(builtin RNG + sample `Type`), `randexp`(builtin RNG),
 `eachcol`(Base numeric Matrix). A
-custom overload over an unsupported domain REJECTS. Author `@rk_*` declarations are trusted, not gated.
+custom overload over an unsupported domain REJECTS.
 """
 kernel_builtin_primitive_domain_ok(reg, argtypes) =
     reg.kind === :primitive && _kernel_effect_callee_domain_ok(reg.source, argtypes)
 
-# --- explicit exact-identity DECLARED effects for author helpers (RK ruling A/B) ----
-#
-# An ordinary helper called in a kernel body is OPAQUE unless its EXACT identity carries a detached
-# effect descriptor DECLARED next to the helper — never inferred from its body (the compiler
-# boundary forbids reflection). Authors use the PUBLIC one-line macros `@rk_pure` / `@rk_borrows` /
-# `@rk_rng` (below); they never touch `_kernel_declared_effect` or `_EffectDescriptor` directly.
-# The token is IDENTITY-derived (`typeof(target)`), so the same helper name in two modules does not
-# collide. `nothing` = undeclared → the ownership closure REJECTS it by exact name.
-_kernel_declared_effect(@nospecialize(v)) = nothing
-
-# Internal descriptor builders (token = identity `typeof(f)`), used by the public macros only.
-# Each VALIDATES its positional metadata (RK 04:29/04:30): positive arity, positions in range,
-# no duplicates.
-function _effect_pure(@nospecialize(f), arity::Int)
-    reads = _effect_check(arity, ntuple(identity, arity), "reads")
-    _EffectDescriptor(typeof(f), arity, (), reads, nothing, :pure, :none, (), nothing)
-end
-function _effect_borrows(@nospecialize(f), arity::Int)
-    reads = _effect_check(arity, ntuple(identity, arity), "reads")
-    _EffectDescriptor(typeof(f), arity, (), reads, nothing, :pure, :none, reads, nothing)
-end
-function _effect_rng(@nospecialize(f), arity::Int, rngpos::Int)
-    reads = _effect_check(arity, ntuple(identity, arity), "reads")
-    _effect_check(arity, (rngpos,), "rng_arg")
-    _EffectDescriptor(typeof(f), arity, (), reads, nothing, :rng, :ordered, (), rngpos)
-end
-
-"""
-    @rk_pure f arity
-
-Declare the ordinary helper `f` (a singleton function) as a PURE reader of its `arity` positional
-args — admissible over reactive places, never a writer. Hygienic/exact/rebind-checked; place it
-next to the helper. `@rk_borrows f arity` additionally marks the result as BORROWING all actuals
-(a lazy view must not be materialized). `@rk_rng f arity rngpos` declares an ORDERED
-RNG helper whose positional `rngpos` is the runtime RNG. Any unregistered helper stays opaque.
-"""
-macro rk_pure(f, arity)
-    :($(GlobalRef(@__MODULE__, :_kernel_declared_effect))(::typeof($(esc(f)))) =
-          $(GlobalRef(@__MODULE__, :_effect_pure))($(esc(f)), $(esc(arity))))
-end
-macro rk_borrows(f, arity)
-    :($(GlobalRef(@__MODULE__, :_kernel_declared_effect))(::typeof($(esc(f)))) =
-          $(GlobalRef(@__MODULE__, :_effect_borrows))($(esc(f)), $(esc(arity))))
-end
-macro rk_rng(f, arity, rngpos)
-    :($(GlobalRef(@__MODULE__, :_kernel_declared_effect))(::typeof($(esc(f)))) =
-          $(GlobalRef(@__MODULE__, :_effect_rng))($(esc(f)), $(esc(arity)), $(esc(rngpos))))
-end
-
 struct _KernelRegistration
     token::Any               # def-unique/intrinsic Token, or `nothing` for a stateless spec
-    kind::Symbol             # :free_method | :object_kernel | :stateless | :intrinsic | :primitive
+    kind::Symbol             # :free_method | :object_kernel | :stateless | :intrinsic |
+                             # :primitive | :pure_primitive
     subject::Union{Symbol,Nothing}    # Mode-2/intrinsic subject (first positional), else nothing
     write_roots::Tuple{Vararg{Symbol}}
     read_roots::Tuple{Vararg{Symbol}}
@@ -1231,20 +1165,15 @@ function kernel_rebound(captured::_KernelRegistration, current)
         end
         return current !== captured.source || !_kernel_pure_primitive_value(current)
     end
-    if captured.kind === :primitive || captured.kind === :declared_effect
-        # An RK-core primitive / author-declared-effect helper's target is NOT a registered kernel,
-        # so it is validated by RE-DERIVING its detached descriptor from the current value and
-        # comparing the ENTIRE descriptor (RK 04:29/04:30) — NOT only the identity token: a
-        # re-declaration of the SAME callable identity (typeof unchanged) that drifts arity / kind /
-        # order / writes / reads / result_alias / borrows / rng_arg must read as REBOUND.
+    if captured.kind === :primitive
+        # An RK-core primitive's target is not a registered kernel, so validate it by re-deriving
+        # the detached built-in descriptor and comparing the ENTIRE contract, not merely its token.
         capdesc = captured.primitive_effect
         if current isa _KernelRegistration
             return current.kind !== captured.kind || current.primitive_effect === nothing ||
                    current.primitive_effect != capdesc
         end
-        pe = current === nothing ? nothing :
-             (captured.kind === :primitive ? _kernel_primitive_effect(current) :
-              _kernel_declared_effect(current))
+        pe = current === nothing ? nothing : _kernel_primitive_effect(current)
         return pe === nothing || pe != capdesc
     end
     cur = current isa _KernelRegistration ? current : kernel_registration(current)
@@ -1506,22 +1435,13 @@ function _kernel_capture_callees(mod::Module, refs)
             # LOCAL/formal `fill!` never reaches here (excluded at ref collection).
             peff = _kernel_primitive_effect(target)
             if peff === nothing
-                # not an RK-core primitive — does the exact identity carry an author-DECLARED
-                # effect descriptor (@rk_pure/@rk_borrows/@rk_rng)? Capture it detached (kind
-                # :declared_effect); else is it an exact-identity RK-core PURE primitive (RK 06:01,
-                # incl. an operator's base identity)? Capture kind :pure_primitive (token
+                # Is it an exact-identity RK-core PURE primitive (including an operator's base
+                # identity)? Capture kind :pure_primitive (token
                 # typeof(target), source the exact value, no descriptor — reads-all/no-writes, any
                 # arity); else omit (opaque → the ownership closure rejects by name).
-                deff = _kernel_declared_effect(target)
-                if deff === nothing
-                    _kernel_pure_primitive_value(target) || continue
-                    reg = _KernelRegistration(typeof(target), :pure_primitive, nothing,
-                                              (), (), false, target, nothing)
-                    push!(caps, _CapturedCallee(cref, reg, target))
-                    continue
-                end
-                reg = _KernelRegistration(deff.token, :declared_effect, nothing,
-                                          (), (), false, target, deff)
+                _kernel_pure_primitive_value(target) || continue
+                reg = _KernelRegistration(typeof(target), :pure_primitive, nothing,
+                                          (), (), false, target, nothing)
                 push!(caps, _CapturedCallee(cref, reg, target))
                 continue
             end
