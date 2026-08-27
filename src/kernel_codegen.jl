@@ -24,6 +24,13 @@
 # registered destination-aware recipe appliers. `make_leaf_owner_state` + the applier binding below are
 # the sanctioned interim scaffold (RK 04:33); the layout/codegen consume the seam and do not change.
 
+# The Val-ABI SCALAR / whole-slot strong write the emitter targets (`_owner_set!(state, Val{I}, v)`, RK
+# 05:08) — the 0-B counterpart to `_owner_slot(state, Val{I})` (a constant `setfield!` on a per-slot mutable
+# field, NOT a tuple rebuild). Declared here as a generic function so emitted code resolves; storage types
+# implement it (a synthetic test state now; syntax's macro-emitted `_CanonOwnedN` struct on the rebase,
+# where the accessor name is aligned with syntax's `_canon_set!`).
+function _owner_set! end
+
 # ---- consume the seam: recompute graph from producer/recipes (NO second planner) --------------------
 
 # HAVE canonical ids from the seam ALONE: entry-current = HAVE ∪ producer-owned keys, so the sources are
@@ -141,20 +148,22 @@ mutable struct _EmitCtx
     formals_used::Vector{Symbol}
 end
 
-# Translate a MethodIR value node into a FUSED broadcast tree leaf/node: `_SelfField` → the slot's local
-# (a Vector leaf, bound before the broadcast); a bound method formal → its runtime LOCAL (loaded from the
-# binder NamedTuple, NEVER a baked constant — adaptation/reconstruction-safe); a literal → a scalar leaf;
-# an `_OpCall` → `Base.broadcasted(<exact-GlobalRef callee>, args...)`. The tree is FUSED (materialize!
-# writes it in place at 0 alloc) AND preserves exact callee identity — built directly rather than via
-# `@__dot__`, which only dots bare SYMBOL operators and would leave a GlobalRef head as an allocating op.
-_exec_rhs(x::_Lit, ctx::_EmitCtx) = x.value
-function _exec_rhs(x::_FormalRef, ctx::_EmitCtx)
+# Translate a MethodIR value node into an expression, given the authored BROADCAST CONTEXT `bcast` (the
+# enclosing `@.`/dotted write — the captured MethodIR broadcast authority, RK 05:31). `_SelfField` → the
+# slot's local (bound before use); a bound method formal → its runtime LOCAL (loaded from the binder
+# NamedTuple, NEVER a baked constant); a literal → a scalar leaf; an `_OpCall` → a plain call OR a fused
+# `Base.broadcasted(<exact-GlobalRef callee>, …)` — broadcast ONLY inside a broadcast context AND only for
+# a buffer-dependent op (an ORDINARY call with array args — `dot`, `getindex`, `lmul!`, `pgrad!` — is
+# NEVER broadcasted just because a slot is an AbstractArray). Exact callee identity is preserved on both
+# paths; built directly (not `@__dot__`, which only dots bare-symbol operators).
+_exec_rhs(x::_Lit, ctx::_EmitCtx, bcast::Bool) = x.value
+function _exec_rhs(x::_FormalRef, ctx::_EmitCtx, bcast::Bool)
     (x.arg in ctx.bound_names) || _l_reject(
         "method formal `$(x.arg)` is not bound by the partial binder (bound: $(ctx.bound_names))")
     x.arg in ctx.formals_used || push!(ctx.formals_used, x.arg)
     _kw_local(x.arg)                                            # runtime-loaded, never a baked constant
 end
-function _exec_rhs(x::_SelfField, ctx::_EmitCtx)
+function _exec_rhs(x::_SelfField, ctx::_EmitCtx, bcast::Bool)
     isempty(x.path) && _l_reject("empty subject-field read")
     id = _l_canon_of(ctx.fieldcanon, x.path[1])                # DETACHED seam map, never the live graph
     (id === nothing || !haskey(ctx.slotof, id)) && _l_reject("subject field `$(x.path[1])` has no owned slot")
@@ -174,11 +183,14 @@ function _exec_is_vec(x::_SelfField, ctx::_EmitCtx)
 end
 _exec_is_vec(x::_OpCall, ctx::_EmitCtx) = any(a -> _exec_is_vec(a, ctx), x.args)
 
-function _exec_rhs(x::_OpCall, ctx::_EmitCtx)
-    args = Any[_exec_rhs(a, ctx) for a in x.args]
-    _exec_is_vec(x, ctx) ?
-        Expr(:call, GlobalRef(Base, :broadcasted), _exec_callee(x.op), args...) :  # fused vector op
-        Expr(:call, _exec_callee(x.op), args...)                                   # scalar op, computed once
+function _exec_rhs(x::_OpCall, ctx::_EmitCtx, bcast::Bool)
+    args = Any[_exec_rhs(a, ctx, bcast) for a in x.args]
+    # Broadcast ONLY inside a broadcast context AND for a buffer-dependent op. Outside a broadcast (an
+    # ordinary call), or for a scalar-only subtree, emit a PLAIN call — an ordinary array-arg call
+    # (`dot`, `getindex`, `lmul!`) is never broadcast just because a slot is an AbstractArray (RK 05:31).
+    (bcast && _exec_is_vec(x, ctx)) ?
+        Expr(:call, GlobalRef(Base, :broadcasted), _exec_callee(x.op), args...) :  # fused buffer op
+        Expr(:call, _exec_callee(x.op), args...)                                   # plain call (scalar/ordinary)
 end
 
 # ---- consume the partial binder SOUNDLY (approved-only + token identity) -----------------------------
@@ -213,6 +225,71 @@ function resolve_step_binding(binder, seam::_KernelPlan)
         "the SAME integrator the endpoint plan was specialized under")
     kw
 end
+
+# Bind each referenced slot buffer to a local (before the write uses it) and merge referenced formals.
+function _bind_uses!(stmts, ctx::_EmitCtx, all_formals::Vector{Symbol})
+    for I in unique(ctx.slots_used); push!(stmts, :($(_slot_local(I)) = _owner_slot(state, Val($I)))); end
+    for f in ctx.formals_used; f in all_formals || push!(all_formals, f); end
+end
+
+# Emit ONE authored place-write, dispatched on the target place kind (RK 05:35 — a local assignment never
+# updates owner state): a DOTTED buffer write is a fused `materialize!` into the owned buffer; a scalar
+# owner field is `_owner_set!(state, Val{I}, rhs)`; a whole-field buffer strong write is `copyto!`; a
+# nested `_Index`/`_Getfield` place is the exact `setindex!`/`setfield!` navigated from the root slot.
+function _emit_place_write!(stmts, pw::_PlaceWrite, ctx::_EmitCtx, all_formals::Vector{Symbol})
+    tgt = pw.target
+    if pw.dot
+        lhs = _emit_place_ref(tgt, ctx)                 # top field → slot local; nested buffer → nav
+        rhs = _exec_rhs(pw.rhs, ctx, true)              # broadcast context
+        _bind_uses!(stmts, ctx, all_formals)
+        push!(stmts, Expr(:call, GlobalRef(Base, :materialize!), lhs, rhs))
+    elseif tgt isa _SelfField && length(tgt.path) == 1
+        id = _l_canon_of(ctx.fieldcanon, tgt.path[1])
+        (id === nothing || !haskey(ctx.slotof, id)) && _l_reject("write target `$(tgt.path[1])` has no owned slot")
+        I = ctx.slotof[id]
+        rhs = _exec_rhs(pw.rhs, ctx, false)             # ordinary context (no broadcast)
+        _bind_uses!(stmts, ctx, all_formals)
+        push!(stmts, id in ctx.scalar_canons ?
+            :(_owner_set!(state, Val($I), $rhs)) :                                   # SCALAR strong write
+            Expr(:call, GlobalRef(Base, :copyto!), :(_owner_slot(state, Val($I))), rhs))  # buffer whole-field
+    elseif tgt isa _Index
+        rhs = _exec_rhs(pw.rhs, ctx, false)
+        base = _emit_place_ref(tgt.base, ctx)
+        idxs = Any[_emit_index(i, ctx) for i in tgt.idxs]
+        _bind_uses!(stmts, ctx, all_formals)
+        push!(stmts, Expr(:call, GlobalRef(Base, :setindex!), base, rhs, idxs...))   # nested indexed write
+    elseif tgt isa _Getfield
+        rhs = _exec_rhs(pw.rhs, ctx, false)
+        base = _emit_place_ref(tgt.base, ctx)
+        _bind_uses!(stmts, ctx, all_formals)
+        push!(stmts, Expr(:call, GlobalRef(Base, :setfield!), base, QuoteNode(tgt.field), rhs))  # nested field write
+    else
+        _l_reject("unsupported write place $(typeof(tgt)) — expected dotted buffer / scalar owner / Index / Getfield")
+    end
+end
+
+# A place INDEX expression (`trees[1]` → `1`): a literal index, or a bound formal (runtime), else reject.
+_emit_index(x::_Lit, ctx::_EmitCtx) = x.value
+function _emit_index(x::_FormalRef, ctx::_EmitCtx)
+    (x.arg in ctx.bound_names) || _l_reject("index formal `$(x.arg)` is not a bound method formal")
+    x.arg in ctx.formals_used || push!(ctx.formals_used, x.arg)
+    _kw_local(x.arg)
+end
+_emit_index(x, ctx::_EmitCtx) = _l_reject("unsupported place index $(typeof(x)) — only literal/formal indices")
+
+# Build the ACCESS expression for a place: a root subject field → its slot local (bound before use); a
+# nested `_Index`/`_Getfield` navigates the slot VALUE with plain getindex/getfield (NOT slot accessors —
+# only the ROOT is a physical slot). Used both to read a nested place and to root a nested WRITE lvalue.
+function _emit_place_ref(x::_SelfField, ctx::_EmitCtx)
+    isempty(x.path) && _l_reject("empty place root")
+    id = _l_canon_of(ctx.fieldcanon, x.path[1])
+    (id === nothing || !haskey(ctx.slotof, id)) && _l_reject("place root `$(x.path[1])` has no owned slot")
+    I = ctx.slotof[id]; push!(ctx.slots_used, I); _slot_local(I)
+end
+_emit_place_ref(x::_Index, ctx::_EmitCtx) =
+    Expr(:call, GlobalRef(Base, :getindex), _emit_place_ref(x.base, ctx), (_emit_index(i, ctx) for i in x.idxs)...)
+_emit_place_ref(x::_Getfield, ctx::_EmitCtx) =
+    Expr(:call, GlobalRef(Base, :getfield), _emit_place_ref(x.base, ctx), QuoteNode(x.field))
 
 # The ordered subject `_PlaceWrite`s of a straight-line method body (same filter/order as `_l_write_steps`).
 function _exec_place_writes(ir::MethodIR)
@@ -289,13 +366,7 @@ function compile_leaf(ir::MethodIR, seam::_KernelPlan, binder;
         if s.kind === :write
             wi += 1; pw = writes[wi]
             ctx = _EmitCtx(fieldcanon, slotof, scalar_canons, Tuple(bound_names), Int[], Symbol[])
-            lhs = _exec_rhs(pw.target, ctx)                # slot local (the aliased buffer written in place)
-            rhs = _exec_rhs(pw.rhs, ctx)                   # fused broadcast tree (exact-identity callees)
-            for I in unique(ctx.slots_used)                # bind each slot buffer to a local first
-                push!(stmts, :($(_slot_local(I)) = _owner_slot(state, Val($I))))
-            end
-            for f in ctx.formals_used; f in all_formals || push!(all_formals, f); end
-            push!(stmts, Expr(:call, GlobalRef(Base, :materialize!), lhs, rhs))  # in-place fused broadcast
+            _emit_place_write!(stmts, pw, ctx, all_formals)   # target-kind dispatch (RK 05:35)
         elseif s.kind === :exec
             role = get(appliers, s.recipe, nothing)
             role === nothing && _l_reject("selected Recipe $(s.recipe) has no bound in-place applier")

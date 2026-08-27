@@ -235,6 +235,80 @@ end
     end
 end
 
+@testset "codegen — ORDINARY array calls are NOT broadcast (broadcast context is authority)" begin
+    # RK 05:31: slot kind partitions scalars only INSIDE an authored broadcast node. An ordinary call with
+    # array arguments (dot, getindex, lmul!, pgrad!) must stay a plain call even though its args are slots.
+    seam = _cg_seam()
+    ctx = RK._EmitCtx(RK._seam_field_canon(seam), RK._seam_slot_of_canon(seam),
+                      RK._seam_scalar_canons(seam), (:stepsize,), Int[], Symbol[])
+    mom = RK._SelfField((:mom,)); dkin = RK._SelfField((:dkin_dmom,))
+    # dot(mom, dkin_dmom) — array args, scalar RESULT; NEVER broadcast (element-wise dot is meaningless)
+    dotcall = RK._OpCall(GlobalRef(LinearAlgebra, :dot), (mom, dkin), (), false, :opaque)
+    e_ord = RK._exec_rhs(dotcall, ctx, false)                    # ordinary (non-dotted) context
+    @test e_ord.head === :call && !occursin("broadcasted", string(e_ord))
+    @test occursin("dot", string(e_ord))
+    # getindex(mom, 1) — array arg, indexed; a plain call outside a broadcast
+    getcall = RK._OpCall(GlobalRef(Base, :getindex), (mom, RK._Lit(1)), (), false, :opaque)
+    e_get = RK._exec_rhs(getcall, ctx, false)
+    @test e_get.head === :call && !occursin("broadcasted", string(e_get))
+    # SAME arithmetic op IS fused when it genuinely sits inside a broadcast context (the leapfrog `@.`)
+    mul = RK._OpCall(GlobalRef(Base, :*), (RK._Lit(0.5), mom), (), false, :operator_candidate)
+    @test occursin("broadcasted", string(RK._exec_rhs(mul, ctx, true)))     # bcast=true → fused
+    @test !occursin("broadcasted", string(RK._exec_rhs(mul, ctx, false)))   # bcast=false → plain
+end
+
+module _CgStatsFix
+    using ReactiveKernels, LogExpFunctions
+    smooth(prev, new, w) = (1 - w) * prev + w * new
+    # nuts_stats!-shaped: scalar subject writes (n_steps, acceptance_rate) + a nested indexed write
+    @kernel probe_stats!(s; accepted) = begin
+        s.n_steps += 1
+        s.acceptance_rate = smooth(s.acceptance_rate, accepted, 0.1)
+        s.trees[1].log_weight[1] = s.dham
+    end
+end
+
+# a SYNTHETIC concrete Val-ABI state (TEST-ONLY; syntax's _CanonOwnedN replaces it on the rebase): per-slot
+# mutable fields, `_owner_slot`/`_owner_set!` by Val index → constant getfield/setfield (0-B).
+mutable struct _SynthStats
+    n_steps::Int
+    acceptance_rate::Float64
+    dham::Float64
+    trees::Vector{NamedTuple{(:log_weight,),Tuple{Vector{Float64}}}}
+end
+ReactiveKernels._owner_slot(s::_SynthStats, ::Val{I}) where {I} = getfield(s, I)
+ReactiveKernels._owner_set!(s::_SynthStats, ::Val{I}, v) where {I} = (setfield!(s, I, v); s)
+
+@testset "codegen — EXECUTABLE nuts_stats! scalar + indexed writes update real state at 0 B" begin
+    ir = RK.method_irs(_CgStatsFix.probe_stats!)[1]
+    writes = RK._exec_place_writes(ir)
+    @test length(writes) == 3
+    # synthetic layout: n_steps→slot1, acceptance_rate→2, dham→3 (SCALARS), trees→4 (buffer)
+    fieldcanon = Dict(:n_steps => 1, :acceptance_rate => 2, :dham => 3, :trees => 4)
+    slotof     = Dict(1 => 1, 2 => 2, 3 => 3, 4 => 4)
+    scalars    = Set([1, 2, 3])                              # trees (4) is a buffer, not scalar
+    stmts = Any[]; formals = Symbol[]
+    for pw in writes
+        ctx = RK._EmitCtx(fieldcanon, slotof, scalars, (:accepted,), Int[], Symbol[])
+        RK._emit_place_write!(stmts, pw, ctx, formals)
+    end
+    src = join(string.(stmts), "\n")
+    @test occursin("_owner_set!(state, Val(1)", src)           # n_steps scalar strong write
+    @test occursin("_owner_set!(state, Val(2)", src)           # acceptance_rate scalar strong write
+    @test occursin("setindex!", src) && occursin("log_weight", src)  # nested indexed write, NOT a local assign
+    @test !occursin("broadcasted", src)                        # ordinary calls, never broadcast
+    loads = Any[:($(RK._kw_local(f)) = getfield(stepkw, $(QuoteNode(f)))) for f in formals]
+    fn = RK.compile(:((state, stepkw) -> $(Expr(:block, loads..., stmts..., :(return state)))))
+    st = _SynthStats(5, 0.4, -1.25, [(; log_weight = [-Inf, -Inf])])
+    fn(st, (; accepted = 1.0))
+    @test st.n_steps == 6                                      # n_steps += 1 updated REAL state
+    @test st.acceptance_rate ≈ 0.9 * 0.4 + 0.1 * 1.0          # smooth(0.4, 1.0, 0.1)
+    @test st.trees[1].log_weight[1] == -1.25                  # trees[1].log_weight[1] = dham
+    barrier(f, s, kw) = @allocated f(s, kw)
+    barrier(fn, st, (; accepted = 1.0))
+    @test barrier(fn, st, (; accepted = 1.0)) == 0            # exact 0 B
+end
+
 @testset "codegen — an exec whose selected Recipe has no bound applier is REJECTED" begin
     seam = _cg_seam()
     @test_throws RK._LLowerReject RK.compile_leaf(_cg_ir(), seam,
