@@ -315,3 +315,21 @@ end
     Core.eval(modx, :(Ops = Evil))                                                 # move the authored qualifier
     @test_throws RK._LLowerReject RK.compile_leapfrog(pf, typeof(ow), typeof(sh), leafq)
 end
+
+@testset "executable leapfrog — a DIRTY non-producible source is REJECTED before any write/pgrad (RK 09:14)" begin
+    pf = _pp_pf(); plan = RK.kernel_prepared_plan(pf); hs = RK.kernel_prepared_handles(pf)
+    leaf = RK.method_irs(_PPFix.leapfrog!)[1]; d = 3
+    cp = _PPFix.CountPgrad(0); ow, sh = _pp_construct(pf, plan, _pp_values(plan, Float64, d, cp))
+    RK.compile_prepared_initialization(pf, typeof(ow), typeof(sh))(ow, sh, hs)     # VALID init
+    lf = RK.compile_leapfrog(pf, typeof(ow), typeof(sh), leaf)
+    pos_b = copy(_pp_rd(plan, ow, sh, _pp_c(plan, :pos))); mom_b = copy(_pp_rd(plan, ow, sh, _pp_c(plan, :mom)))
+    n_b = cp.n
+    # explicitly KILL the owned `mom` non-producible source mask (kick-1 reads it FIRST, authored order)
+    fsm = RK.kernel_plan_field(plan, _pp_c(plan, :mom)); RK._canon_kill!(ow, Val(fsm[2]))
+    @test_throws ErrorException lf(ow, sh, hs, (stepsize = 0.1,))   # dirty-source assert throws — cannot repair
+    # thrown BEFORE any physical write / pgrad: state + grad-count unchanged
+    @test cp.n == n_b                                              # NO pgrad ran
+    @test _pp_rd(plan, ow, sh, _pp_c(plan, :pos)) == pos_b         # NO physical position write
+    @test _pp_rd(plan, ow, sh, _pp_c(plan, :mom)) == mom_b         # NO physical momentum write
+    @test !_pp_cur(plan, ow, sh, _pp_c(plan, :mom))                # source stays dirty (requires reset)
+end
