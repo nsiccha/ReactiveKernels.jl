@@ -509,6 +509,12 @@ end
         # aliased target's PRODUCER stays canonical: dham_dpos resolves to dpot_dpos's producer
         gph = RKS.kernel_graph(phasepoint_ep)
         @test !isempty(RKS.producers_of(gph, RKS.canon_id(gph, phasepoint_ep.ports[:dham_dpos].id)))
+        # the Plan's canonical-Value → (role, field index) map the storage family consumes
+        @test RKS.kernel_plan_field(plan, cdp) == (RKS.kernel_plan_slot(plan, :dham_dpos).role,
+                                                   RKS.kernel_plan_slot(plan, :dham_dpos).slot)
+        cmet = RKS.canon_id(gph, phasepoint_ep.ports[:metric].id)
+        @test RKS.kernel_plan_field(plan, cmet)[1] === :shared
+        @test RKS.kernel_plan_field(plan, -1) === nothing        # unknown canon → nothing
 
         # DETACHED recipe-input seam (RK 04:43): each selected recipe's canonical input Value ids,
         # captured as immutable Tuples so poc never rereads the live mutable graph.

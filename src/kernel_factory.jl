@@ -826,6 +826,14 @@ function kernel_plan_slot(p::_KernelPlan, field::Symbol)
 end
 kernel_plan_nowned(p::_KernelPlan) = length(unique(s.canon for s in p.slots if s.role === :owned))
 kernel_plan_nshared(p::_KernelPlan) = length(unique(s.canon for s in p.slots if s.role === :shared))
+# The Plan owns the canonical-Value → (role, physical field index) map that the storage family and
+# poc codegen consume (RK 05:11) — `(role::Symbol, slot::Int)` for a canonical Value id, else nothing.
+function kernel_plan_field(p::_KernelPlan, canon::Int)
+    for s in p.slots
+        s.canon == canon && return (s.role, s.slot)
+    end
+    nothing
+end
 
 function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol}; key_token = nothing)
     graph = _kernel_the_graph(skel)
