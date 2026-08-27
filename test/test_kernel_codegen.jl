@@ -486,6 +486,91 @@ end
     @test_throws RK._LLowerReject RK.compile_copy(Int[])             # empty closure rejects
 end
 
+module _CgTransFix
+    using ReactiveKernels, LinearAlgebra, Random
+    # a MIXED transition body: registered effects (refresh) THEN a subject place-write (a step counter)
+    @kernel transition!!(s; rng) = begin
+        Random.randn!(rng, s.mom)
+        LinearAlgebra.lmul!(s.chol_metric.L, s.mom)
+        s.n_steps += 1
+        return s
+    end
+    @kernel refresh_only!!(s; rng) = begin              # ONLY registered effects, no later place-write
+        Random.randn!(rng, s.mom)
+        LinearAlgebra.lmul!(s.chol_metric.L, s.mom)
+        return s
+    end
+    @kernel double_step!!(s; rng) = begin               # multi-write scalar — source-order (fresh reads)
+        s.n_steps += 1
+        s.n_steps += 1
+        return s
+    end
+end
+
+mutable struct _SynthTrans{T}
+    chol::Cholesky{T,Matrix{T}}                            # SHARED slot 1
+    mom::Vector{T}                                         # OWNED slot 2
+    n_steps::Int                                          # OWNED scalar slot 3
+    current::UInt64
+end
+ReactiveKernels._shared_slot(s::_SynthTrans, ::Val{1}) = getfield(s, :chol)
+ReactiveKernels._owner_slot(s::_SynthTrans, ::Val{2}) = getfield(s, :mom)
+ReactiveKernels._owner_slot(s::_SynthTrans, ::Val{3}) = getfield(s, :n_steps)
+ReactiveKernels._owner_set!(s::_SynthTrans, ::Val{3}, v) = (setfield!(s, :n_steps, v); s)
+@generated function ReactiveKernels._owner_kill_current!(s::_SynthTrans, ::Val{K}) where {K}
+    m = reduce(|, (UInt64(1) << (i - 1) for i in K); init = UInt64(0)); :(setfield!(s, :current, getfield(s, :current) & ~$m); s)
+end
+@generated function ReactiveKernels._owner_bless_current!(s::_SynthTrans, ::Val{B}) where {B}
+    m = reduce(|, (UInt64(1) << (i - 1) for i in B); init = UInt64(0)); :(setfield!(s, :current, getfield(s, :current) | $m); s)
+end
+
+@testset "codegen — OUTER EPOCH: mixed effects+write transition, single deferred bless, exception soundness" begin
+    fieldcanon = Dict(:mom => 10, :chol_metric => 20, :n_steps => 30)
+    slotof     = Dict(10 => 2, 20 => 1, 30 => 3)
+    roleof     = Dict(10 => :owned, 20 => :shared, 30 => :owned)
+    scalars    = Set([30])                                 # n_steps is a scalar owned slot
+    killmap    = Dict{Int,Vector{Int}}()                   # (no derived dependents in this demonstrator)
+    ir = RK.method_irs(_CgTransFix.transition!!)[1]
+    fn, meta = RK.compile_transition_root(ir, fieldcanon, slotof, scalars, roleof, killmap)
+    @test Set(meta.written) == Set([10, 30])              # mom + n_steps are the written roots
+    @test meta.bless_slots == (2, 3)                      # ONE deferred bless of both written slots
+    # SUCCESS: both mom (slot 2) and n_steps (slot 3) blessed only after the WHOLE body (deferred commit)
+    let T = Float64
+        st = _SynthTrans{T}(cholesky(Matrix{T}(2 * I, 4, 4)), zeros(T, 4), 0, UInt64(0))
+        fn(st, Random.MersenneTwister(1), (;))
+        @test st.n_steps == 1 && any(st.mom .!= 0)
+        @test (st.current >> 1) & 1 == 1 && (st.current >> 2) & 1 == 1   # mom(slot2)+n_steps(slot3) BLESSED
+        barrier(f, a, b, c) = @allocated f(a, b, c); barrier(fn, st, Random.MersenneTwister(1), (;))
+        @test barrier(fn, st, Random.MersenneTwister(1), (;)) == 0       # 0 B
+    end
+    # EXCEPTION: lmul! throws (mismatched chol) BEFORE the n_steps write + the single commit → mom is DIRTY
+    # (killed pre-effect, never blessed by a nested early commit); n_steps untouched.
+    let T = Float64
+        st = _SynthTrans{T}(cholesky(Matrix{T}(2 * I, 3, 3)), zeros(T, 4), 0, typemax(UInt64))
+        @test_throws DimensionMismatch fn(st, Random.MersenneTwister(2), (;))
+        @test (st.current >> 1) & 1 == 0                                 # mom NOT blessed (deferred commit unreached)
+        @test st.n_steps == 0                                           # the write after lmul! never ran
+    end
+    # EFFECTS-ONLY transition (no later place write) also executes F32/F64 0 B
+    let iro = RK.method_irs(_CgTransFix.refresh_only!!)[1]
+        fno, mo = RK.compile_transition_root(iro, fieldcanon, slotof, scalars, roleof, killmap)
+        @test Set(mo.written) == Set([10]) && mo.bless_slots == (2,)
+        barrier(f, a, b, c) = @allocated f(a, b, c)
+        for T in (Float64, Float32)
+            st = _SynthTrans{T}(cholesky(Matrix{T}(2 * I, 4, 4)), zeros(T, 4), 0, UInt64(0))
+            fno(st, Random.MersenneTwister(1), (;)); barrier(fno, st, Random.MersenneTwister(1), (;))
+            @test barrier(fno, st, Random.MersenneTwister(1), (;)) == 0
+        end
+    end
+    # MULTI-WRITE SCALAR: two n_steps += 1 must read FRESH each time (source-order) → 2, not 1 (no stale local)
+    let ird = RK.method_irs(_CgTransFix.double_step!!)[1]
+        fnd, _ = RK.compile_transition_root(ird, fieldcanon, slotof, scalars, roleof, killmap)
+        st = _SynthTrans{Float64}(cholesky(Matrix{Float64}(2 * I, 4, 4)), zeros(4), 0, UInt64(0))
+        fnd(st, Random.MersenneTwister(1), (;))
+        @test st.n_steps == 2                                          # fresh reads: 0→1→2, not a stale 0→1
+    end
+end
+
 struct _CgEvilProp end
 Base.getproperty(::_CgEvilProp, ::Symbol) = error("side-effecting getproperty must NOT run in hot lowering")
 

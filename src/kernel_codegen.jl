@@ -189,7 +189,11 @@ function _exec_rhs(x::_SelfField, ctx::_EmitCtx, bcast::Bool)
     isempty(x.path) && _l_reject("empty subject-field read")
     id = _l_canon_of(ctx.fieldcanon, x.path[1])                # DETACHED seam map, never the live graph
     (id === nothing || !haskey(ctx.slotof, id)) && _l_reject("subject field `$(x.path[1])` has no owned slot")
-    I = ctx.slotof[id]; push!(ctx.slots_used, I); _slot_local(I)
+    I = ctx.slotof[id]
+    # A SCALAR slot is read FRESH each use (RK 06:36): a hoisted scalar local goes stale after an
+    # `_owner_set!` write, breaking source-order for multi-write/read sequences. A BUFFER binds once to a
+    # local (stable pointer; in-place mutations are seen through it).
+    id in ctx.scalar_canons ? :(_owner_slot(state, Val($I))) : (push!(ctx.slots_used, I); _slot_local(I))
 end
 # Is a MethodIR value node VECTOR-valued (reads an array-typed slot) or a pure SCALAR (literals/bound
 # formals and scalar ops over them, e.g. `oftype(stepsize, 0.5)`)? Classification is a COMPILE-TIME
@@ -289,9 +293,11 @@ function resolve_step_binding(binder, seam::_KernelPlan)
     kw
 end
 
-# Bind each referenced slot buffer to a local (before the write uses it) and merge referenced formals.
-function _bind_uses!(stmts, ctx::_EmitCtx, all_formals::Vector{Symbol})
-    for I in unique(ctx.slots_used); push!(stmts, :($(_slot_local(I)) = _owner_slot(state, Val($I)))); end
+# Bind each referenced buffer slot to a local (before the write uses it) and merge referenced formals.
+# `bind=false` skips the buffer binding (the caller prepends exactly one binding per used slot instead —
+# RK 06:36) but still collects formals; `ctx.slots_used` records the buffers for that prepend.
+function _bind_uses!(stmts, ctx::_EmitCtx, all_formals::Vector{Symbol}; bind::Bool = true)
+    bind && for I in unique(ctx.slots_used); push!(stmts, :($(_slot_local(I)) = _owner_slot(state, Val($I)))); end
     for f in ctx.formals_used; f in all_formals || push!(all_formals, f); end
 end
 
@@ -299,19 +305,19 @@ end
 # updates owner state): a DOTTED buffer write is a fused `materialize!` into the owned buffer; a scalar
 # owner field is `_owner_set!(state, Val{I}, rhs)`; a whole-field buffer strong write is `copyto!`; a
 # nested `_Index`/`_Getfield` place is the exact `setindex!`/`setfield!` navigated from the root slot.
-function _emit_place_write!(stmts, pw::_PlaceWrite, ctx::_EmitCtx, all_formals::Vector{Symbol})
+function _emit_place_write!(stmts, pw::_PlaceWrite, ctx::_EmitCtx, all_formals::Vector{Symbol}; bind::Bool = true)
     tgt = pw.target
     if pw.dot
         lhs = _emit_place_ref(tgt, ctx)                 # top field → slot local; nested buffer → nav
         rhs = _exec_rhs(pw.rhs, ctx, true)              # broadcast context
-        _bind_uses!(stmts, ctx, all_formals)
+        _bind_uses!(stmts, ctx, all_formals; bind = bind)
         push!(stmts, Expr(:call, GlobalRef(Base, :materialize!), lhs, rhs))
     elseif tgt isa _SelfField && length(tgt.path) == 1
         id = _l_canon_of(ctx.fieldcanon, tgt.path[1])
         (id === nothing || !haskey(ctx.slotof, id)) && _l_reject("write target `$(tgt.path[1])` has no owned slot")
         I = ctx.slotof[id]
         rhs = _exec_rhs(pw.rhs, ctx, false)             # ordinary context (no broadcast)
-        _bind_uses!(stmts, ctx, all_formals)
+        _bind_uses!(stmts, ctx, all_formals; bind = bind)
         push!(stmts, id in ctx.scalar_canons ?
             :(_owner_set!(state, Val($I), $rhs)) :                                   # SCALAR strong write
             Expr(:call, GlobalRef(Base, :copyto!), :(_owner_slot(state, Val($I))), rhs))  # buffer whole-field
@@ -319,12 +325,12 @@ function _emit_place_write!(stmts, pw::_PlaceWrite, ctx::_EmitCtx, all_formals::
         rhs = _exec_rhs(pw.rhs, ctx, false)
         base = _emit_place_ref(tgt.base, ctx)
         idxs = Any[_emit_index(i, ctx) for i in tgt.idxs]
-        _bind_uses!(stmts, ctx, all_formals)
+        _bind_uses!(stmts, ctx, all_formals; bind = bind)
         push!(stmts, Expr(:call, GlobalRef(Base, :setindex!), base, rhs, idxs...))   # nested indexed write
     elseif tgt isa _Getfield
         rhs = _exec_rhs(pw.rhs, ctx, false)
         base = _emit_place_ref(tgt.base, ctx)
-        _bind_uses!(stmts, ctx, all_formals)
+        _bind_uses!(stmts, ctx, all_formals; bind = bind)
         push!(stmts, Expr(:call, GlobalRef(Base, :setproperty!), base, QuoteNode(tgt.field), rhs))  # authored property write
     else
         _l_reject("unsupported write place $(typeof(tgt)) — expected dotted buffer / scalar owner / Index / Getfield")
@@ -361,7 +367,9 @@ function _emit_read(x::_SelfField, ctx::_EmitCtx, roleof::Dict{Int,Symbol})
     haskey(roleof, id) || _l_reject("read root `$(x.path[1])` has no role in the detached role map (owned/shared)")
     r = roleof[id]
     (r === :owned || r === :shared) || _l_reject("invalid role $(r) for `$(x.path[1])` — expected :owned or :shared")
-    base = r === :shared ? :(_shared_slot(state, Val($I))) : (push!(ctx.slots_used, I); _slot_local(I))
+    base = r === :shared ? :(_shared_slot(state, Val($I))) :                     # shared authority: fresh read
+           id in ctx.scalar_canons ? :(_owner_slot(state, Val($I))) :            # owned SCALAR: fresh read (no stale local)
+           (push!(ctx.slots_used, I); _slot_local(I))                            # owned BUFFER: bound-once local
     for f in x.path[2:end]                                   # nested PROPERTY read (chol_metric.L is computed)
         base = _emit_property(base, f)                          # core exact-type accessor (0-B, no wrapper)
     end
@@ -469,6 +477,64 @@ function compile_copy(owned_slots::Vector{Int})
     push!(body, :(_owner_copy_current!(dest, src, Val($slots))))              # derived validity transfers
     fn = compile(:((dest, src) -> $(Expr(:block, body..., :(return dest)))))
     (fn, (; slots))
+end
+
+# The canonical id of a write target's ROOT subject field (navigating `_Index`/`_Getfield` to the root).
+function _write_root_canon(tgt, ctx::_EmitCtx)
+    t = tgt
+    while t isa _Index || t isa _Getfield; t = t.base; end
+    t isa _SelfField || _l_reject("write target root is not a subject field: $(typeof(tgt))")
+    id = _l_canon_of(ctx.fieldcanon, t.path[1])
+    id === nothing && _l_reject("write root `$(t.path[1])` has no canonical id")
+    id
+end
+
+"""
+    compile_transition_root(ir, fieldcanon, slotof, scalar_canons, roleof, killmap; rng=:rng) -> (fn, meta)
+
+Compose a mixed straight-line transition body (registered effect statements AND subject place-writes) into
+ONE OUTER EPOCH (RK 06:24): each statement KILLS its written root + dependents BEFORE it runs
+(executed-prefix), and a SINGLE deferred BLESS commits all written roots only after the whole body
+succeeds — so a later statement's exception cannot leave an earlier write (e.g. refresh's mom) blessed
+from a nested early commit. `fn(state, rng, stepkw)` mutates `state` in place at 0-B. This is the generic
+composer the public root reuses; branch/recursion combinators layer on top.
+"""
+function compile_transition_root(ir::MethodIR, fieldcanon::Dict{Symbol,Int}, slotof::Dict{Int,Int},
+                                 scalar_canons::Set{Int}, roleof::Dict{Int,Symbol},
+                                 killmap::Dict{Int,Vector{Int}}; rng::Symbol = :rng)
+    _slot(c) = (haskey(slotof, c) || _l_reject("canon $(c) has no absolute storage slot"); slotof[c])
+    killset(cs) = Tuple(sort!(unique(vcat([_slot(c) for c in cs],
+                                          [_slot(k) for c in cs for k in get(killmap, c, Int[])]))))
+    ctx = _EmitCtx(fieldcanon, slotof, scalar_canons, (), Int[], Symbol[])          # ONE ctx (RK 06:36)
+    body = Any[]; written_all = Int[]; all_formals = Symbol[]; sawret = false
+    for st in ir.body
+        if st isa _ExprStmt
+            call, written = _emit_effect_call(st, ctx, roleof, rng)                  # records buffer slots used
+            append!(written_all, written)
+            push!(body, :(_owner_kill_current!(state, Val($(killset(written))))))    # kill BEFORE the effect
+            push!(body, call)
+        elseif st isa _PlaceWrite && st.root === :self && st.owner !== nothing && !isempty(st.owner)
+            wc = _write_root_canon(st.target, ctx)
+            push!(written_all, wc)
+            push!(body, :(_owner_kill_current!(state, Val($(killset([wc]))))))       # kill BEFORE the write
+            _emit_place_write!(body, st, ctx, all_formals; bind = false)             # no inline bind (prepended)
+        elseif st isa _Return && st.value isa _SelfRef
+            sawret = true
+        else
+            _l_reject("transition root: unlowered statement $(typeof(st))")
+        end
+    end
+    sawret || _l_reject("transition root must terminate in `return <subject>`")
+    bless_slots = Tuple(sort!(unique(_slot(c) for c in written_all)))
+    dep_slots   = Tuple(sort!(unique(_slot(k) for c in written_all for k in get(killmap, c, Int[]))))
+    isempty(intersect(bless_slots, dep_slots)) ||
+        _l_reject("bless/kill overlap: written roots $(bless_slots) intersect dependents $(dep_slots)")
+    # PREPEND exactly one binding per used BUFFER slot (scalars read fresh inline; buffers are stable).
+    binds = Any[:($(_slot_local(I)) = _owner_slot(state, Val($I))) for I in unique(ctx.slots_used)]
+    loads = Any[:($(_kw_local(f)) = getfield(stepkw, $(QuoteNode(f)))) for f in all_formals]
+    push!(body, :(_owner_bless_current!(state, Val($bless_slots))))                  # ONE deferred commit
+    fn = compile(:((state, $rng, stepkw) -> $(Expr(:block, loads..., binds..., body..., :(return state)))))
+    (fn, (; written = unique(written_all), bless_slots, kill_slots = dep_slots))
 end
 
 # A place INDEX expression (`trees[1]` → `1`): a literal index, or a bound formal (runtime), else reject.
