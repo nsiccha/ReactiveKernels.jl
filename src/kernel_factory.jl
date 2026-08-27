@@ -198,3 +198,233 @@ end
 # `_KernelRegistration`, whose `:primitive` kind carries the descriptor). They are
 # consumed HERE by the interprocedural closure below, and captured DETACHED at owner
 # definition by `_kernel_capture_callees` (rebind-checked), never reread at analysis.
+
+# --- AUTHORITATIVE interprocedural ownership (formal-to-actual fixed point) ----
+#
+# The one API that produces the FINAL owned top-field set (the local `*_seed` helpers above
+# are never layout). It closes ownership TRANSITIVELY over sibling / subject-method /
+# registered / intrinsic / primitive / callable-field effects, mapping each callee's
+# subject/formal writes BACK through the caller's actual places to a FIXED POINT
+# (RK 2026-08-27). Requirements it discharges:
+#   (1) resolve sibling call edges (`_Call`/`_CallExpr`, receiver `__self__`);
+#   (2) map callee formal-writes back through caller actuals — owner fields (`_SelfField`),
+#       owned-alias locals (`t = trees[d]`), indexed/getfield children, and a caller's OWN
+#       formal (propagated up); branch/loop/guard arms all walked;
+#   (3) a registered/intrinsic call writes its SUBJECT (first actual); a `_FieldCall`
+#       (`step_f`) writes its subject ONLY when its RESOLVED registration is a subject-writer
+#       — a pure read-only callback (`pot_f`/`stats_f`, empty write-roots) never owns its arg;
+#   (4) `copy!!` = destination (first actual) owned-closure copy; an RK-core PRIMITIVE
+#       (`Base.fill!`) writes its descriptor positions AFTER an EXACT arity match; an OPAQUE
+#       named call (`evil!`, hint `:opaque`) touching a self place in subject position is
+#       REJECTED (no detached descriptor) — qualification / `!` spelling are NOT evidence;
+#   (5) iterate to a fixed point; `shared` is the complement, created by ONE API below.
+#
+# CALLABLE-FIELD holes (`step_f`) are FACTORY-TIME values, so this is a SPECIALIZATION-time
+# closure keyed by `field_regs` (authored callable-field name → resolved `_KernelRegistration`).
+# The owner-TOP-FIELD set is decidable here; the concrete sub-field LAYOUT is the later
+# `@generated` specialization (RK plan-template split 02:37).
+
+struct _KernelFactoryReject <: Exception
+    reason::String
+end
+Base.showerror(io::IO, e::_KernelFactoryReject) = print(io, "factory ownership: ", e.reason)
+
+# A subject-writer OWNS its first actual; a pure read-only callback (empty write-roots and
+# not a `!!`/intrinsic/primitive strong update) does not.
+_kernel_reg_writes_subject(reg::_KernelRegistration) =
+    reg.kind === :intrinsic || reg.kind === :primitive ||
+    !isempty(reg.write_roots) || reg.is_bang_bang
+
+# Classify a write PLACE `_MExpr` to an owner top-field or a caller formal position, else
+# `nothing` (escapes ownership). `aliases` maps owned-alias locals to their classification.
+function _kernel_factory_place_target(a, aliases)
+    a isa _SelfField && !isempty(a.path) && return (:self, a.path[1])
+    a isa _FormalRef                      && return (:formal, a.pos)
+    a isa _Index                          && return _kernel_factory_place_target(a.base, aliases)
+    a isa _Getfield                       && return _kernel_factory_place_target(a.base, aliases)
+    (a isa _LocalRef && haskey(aliases, a.name)) && return aliases[a.name]
+    nothing
+end
+
+# Per-method owned-alias map: a method-local `t = <owned place>` makes `t` an alias of that
+# place (RK req 2). Built once per method; later local rebinds keep the LAST binding.
+function _kernel_factory_aliases(ir::MethodIR)
+    al = Dict{Symbol,Any}()
+    for s in ir.body
+        _kmir_walk_calls_and_assigns(s) do n
+            if n isa _LocalAssign && length(n.lhs) == 1
+                cls = _kernel_factory_place_target(n.rhs, al)
+                cls === nothing ? delete!(al, n.lhs[1]) : (al[n.lhs[1]] = cls)
+            end
+        end
+    end
+    al
+end
+
+# Generic recursion over a MethodIR stmt/expr tree, calling `f` on every node (used for both
+# assign scanning and call collection — the methodir `_kmir_walk` is private to that file).
+function _kmir_walk_calls_and_assigns(f, x)
+    f(x)
+    if x isa _MExpr || x isa _MStmt
+        for i in 1:nfields(x)
+            _kmir_walk_calls_and_assigns(f, getfield(x, i))
+        end
+    elseif x isa Tuple
+        for e in x
+            _kmir_walk_calls_and_assigns(f, e)
+        end
+    elseif x isa Pair
+        _kmir_walk_calls_and_assigns(f, x.second)
+    end
+    nothing
+end
+
+# The WRITE-ACTUAL `_MExpr`s a single call node effects, given resolved `field_regs` and the
+# current `formalw` (callee-name → set of formal positions it mutates). REJECTS on an
+# unsupported primitive arity or an opaque self-place subject call. Returns `_MExpr[]`.
+function _kernel_factory_call_writes_of(n, field_regs, formalw_byname)
+    out = _MExpr[]
+    if n isa _RegisteredCall
+        reg = n.registration
+        if reg.kind === :primitive
+            pe = reg.primitive_effect
+            length(n.args) == pe.arity || throw(_KernelFactoryReject(
+                "primitive $(reg.token) captured for arity $(pe.arity) but called with " *
+                "$(length(n.args)) positionals — unsupported arity, refusing to summarize " *
+                "(higher-arity actuals would be silently dropped)"))
+            for w in pe.writes
+                w <= length(n.args) && push!(out, n.args[w])
+            end
+        else                                   # :intrinsic (copy!!) / :free_method / :object_kernel
+            isempty(n.args) || push!(out, n.args[1])   # writes its SUBJECT/dest = first actual
+        end
+    elseif n isa _FieldCall
+        reg = get(field_regs, isempty(n.path) ? :_ : n.path[1], nothing)
+        # unresolved hole → not decidable as a writer here (specialization supplies it); a
+        # RESOLVED subject-writer owns its subject actual.
+        if reg isa _KernelRegistration && _kernel_reg_writes_subject(reg) && !isempty(n.pos)
+            push!(out, n.pos[1])
+        end
+    elseif n isa _SubjectMethodCall
+        push!(out, n.subject)                  # a subject method mutates its receiver object
+    end
+    out
+end
+
+# For a SIBLING call, map the CALLEE's transitively-written formal positions back onto the
+# caller's actuals at those positions (RK req 1+2).
+function _kernel_factory_sibling_writes_of(n, formalw_byname)
+    out = _MExpr[]
+    if n isa _Call || n isa _CallExpr
+        for p in get(formalw_byname, n.name, Int[])
+            1 <= p <= length(n.pos) && push!(out, n.pos[p])
+        end
+    end
+    out
+end
+
+# REJECT an opaque named call (`evil!`, hint `:opaque`) whose SUBJECT (first actual) is a
+# self/owner place — no detached effect descriptor, so its footprint on an owned place is
+# unknowable (RK req 4). Operators (`:operator_candidate`) are value reads, admitted.
+function _kernel_factory_reject_opaque_self!(ir::MethodIR, aliases)
+    for s in ir.body
+        _kmir_walk_calls_and_assigns(s) do n
+            if n isa _OpCall && n.hint === :opaque && !isempty(n.args)
+                cls = _kernel_factory_place_target(n.args[1], aliases)
+                cls !== nothing && cls[1] === :self && throw(_KernelFactoryReject(
+                    "opaque call `$(n.op)` receives self place `$(cls[2])` in subject " *
+                    "position but carries NO detached effect descriptor (not a registered " *
+                    "@kernel / intrinsic / RK-core primitive); its effect on an owned field " *
+                    "is unknowable — register it or rewrite (qualification/`!` are not evidence)"))
+            end
+        end
+    end
+end
+
+"""
+    _kernel_factory_owned_authoritative(skel; field_regs=Dict()) -> Set{Symbol}
+
+The AUTHORITATIVE owned top-field set (RK 2026-08-27). `field_regs` maps each authored
+callable-field name (`:step_f`, `:stats_f`, …) to its factory-time resolved
+`_KernelRegistration`; an absent field stays an undecided hole. Throws `_KernelFactoryReject`
+on an opaque self-place subject call or an unsupported primitive arity.
+"""
+function _kernel_factory_owned_authoritative(skel; field_regs = Dict{Symbol,Any}())
+    irs = method_irs(skel)
+    isempty(irs) && return Set{Symbol}()
+    # An uncompilable method (a rejected grammar/dynamic-callee — e.g. a method-local `fill!`
+    # spoof resolves to a dynamic local callable, not the registered identity) makes the
+    # ownership closure unsound; REJECT deterministically rather than closing over a hole.
+    for ir in irs
+        ir.ok || throw(_KernelFactoryReject(
+            "method `$(ir.id.name)` is not compilable ($(ir.reason)); authoritative ownership " *
+            "cannot be closed over it"))
+    end
+    aliases = Dict{Any,Dict{Symbol,Any}}(ir.id => _kernel_factory_aliases(ir) for ir in irs)
+
+    # req 4: reject inadmissible opaque self-place calls up front (deterministic).
+    for ir in irs
+        _kernel_factory_reject_opaque_self!(ir, aliases[ir.id])
+    end
+
+    owned = Set{Symbol}()
+    formalw_byname = Dict{Symbol,Set{Int}}()   # callee name → formal positions it mutates
+    changed = true
+    while changed
+        changed = false
+        for ir in irs
+            al = aliases[ir.id]
+            name = ir.id.name
+            fw = get!(formalw_byname, name, Set{Int}())
+            # every write actual reached in this method (own calls + sibling formal-mapping)
+            sites = _MExpr[]
+            for s in ir.body
+                _kmir_walk_calls_and_assigns(s) do n
+                    append!(sites, _kernel_factory_call_writes_of(n, field_regs, formalw_byname))
+                    append!(sites, _kernel_factory_sibling_writes_of(n, formalw_byname))
+                end
+            end
+            # direct place-writes to self/alias owner fields (the LOCAL seed, folded in)
+            for wr in write_roots(ir)
+                owner = wr[2]
+                if owner isa Tuple && !isempty(owner)
+                    owner[1] in owned || (push!(owned, owner[1]); changed = true)
+                end
+            end
+            for a in sites
+                cls = _kernel_factory_place_target(a, al)
+                cls === nothing && continue
+                if cls[1] === :self
+                    cls[2] in owned || (push!(owned, cls[2]); changed = true)
+                else                                    # :formal — this method mutates formal p
+                    cls[2] in fw || (push!(fw, cls[2]); changed = true)
+                end
+            end
+        end
+    end
+
+    # recipe-graph closure: an owner field derived from owned inputs is owned (own graph).
+    graph = kernel_graph(kernel_spec(skel))
+    gchanged = true
+    while gchanged
+        gchanged = false
+        for r in graph.recipes
+            any(inp -> inp.name in owned, r.inputs) || continue
+            for out in r.outputs
+                out.name in owned || (push!(owned, out.name); gchanged = true)
+            end
+        end
+    end
+    intersect!(owned, Set{Symbol}(kernel_port_names(skel)))
+    owned
+end
+
+"""
+    _kernel_factory_shared(skel; field_regs=Dict()) -> Set{Symbol}
+
+The SHARED complement — the ONE API that creates `shared`, and ONLY after the authoritative
+owned closure (RK: shared is never a seed's `setdiff`). A port is shared iff it is not owned.
+"""
+_kernel_factory_shared(skel; field_regs = Dict{Symbol,Any}()) =
+    setdiff(Set{Symbol}(kernel_port_names(skel)),
+            _kernel_factory_owned_authoritative(skel; field_regs = field_regs))

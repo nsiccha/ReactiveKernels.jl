@@ -761,6 +761,8 @@ end
 # shape/type checks), carried by its own registration, never flattened to a positional here.
 struct _PrimitiveEffect
     token::Symbol
+    arity::Int                        # EXACT accepted positional arity — the descriptor is
+                                      # valid ONLY for a call of this many positionals
     writes::Tuple{Vararg{Int}}
     reads::Tuple{Vararg{Int}}
     result_alias::Union{Nothing,Int}
@@ -769,10 +771,16 @@ end
 # Pure DISPATCH on the resolved VALUE identity — used AT OWNER DEFINITION (capture time),
 # so its result is SNAPSHOTTED detached (no mutable registry, no analysis-time reread).
 # `nothing` = not an RK-core positional primitive. Each entry carries a DISTINCT token.
-# The 2-arg destination-write forms only; higher-arity `copyto!` (do/so/N) is out of scope.
+#
+# ARITY IS PART OF THE CONTRACT. Definition-time callee capture is arity-BLIND (it keys on
+# the callable identity, not the call shape), so a later `Base.copyto!(dest,src,do,so,n)`
+# resolves to this SAME registration. The descriptor therefore pins the EXACT positional
+# arity it describes (2), and the MethodIR/fixed-point consumer MUST match `length(args) ==
+# arity` and DETERMINISTICALLY REJECT any other arity — never silently summarize a
+# 5-positional `copyto!` with the 2-arg effect (args 3-5 dropped).
 _kernel_primitive_effect(@nospecialize(v)) =
-    v === Base.fill!   ? _PrimitiveEffect(Symbol("__rk_primitive_Base_fill!__"),   (1,), (2,), 1) :
-    v === Base.copyto! ? _PrimitiveEffect(Symbol("__rk_primitive_Base_copyto!__"), (1,), (2,), 1) :
+    v === Base.fill!   ? _PrimitiveEffect(Symbol("__rk_primitive_Base_fill!__"),   2, (1,), (2,), 1) :
+    v === Base.copyto! ? _PrimitiveEffect(Symbol("__rk_primitive_Base_copyto!__"), 2, (1,), (2,), 1) :
     nothing
 
 struct _KernelRegistration
@@ -871,6 +879,17 @@ by captured VALUE identity, so two distinct stateless specs read as a rebind —
 NEVER reports unchanged merely because there is no Token.
 """
 function kernel_rebound(captured::_KernelRegistration, current)
+    if captured.kind === :primitive
+        # An RK-core primitive's target is NOT a registered kernel (`kernel_registration` is
+        # nothing), so it is validated by RE-DERIVING its detached descriptor from the current
+        # value and comparing the DISTINCT token: rebound iff the slot no longer resolves to
+        # that exact primitive identity.
+        if current isa _KernelRegistration
+            return current.kind !== :primitive || current.token !== captured.token
+        end
+        pe = current === nothing ? nothing : _kernel_primitive_effect(current)
+        return pe === nothing || pe.token !== captured.token
+    end
     cur = current isa _KernelRegistration ? current : kernel_registration(current)
     cur === nothing && return true                 # binding gone / no longer a kernel
     if captured.token !== nothing

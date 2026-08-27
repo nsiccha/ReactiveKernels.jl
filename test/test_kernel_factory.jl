@@ -67,6 +67,37 @@ AliasMod = Base
 end
 baremodule NoFill end
 
+# ep-chain owner (faithful nuts_state shape): `fwd`/`bwd` become owned SOLELY through
+# `step! → finish!(fwd|bwd) → start!(ep) → step_f(ep)` — never a direct write. `step_f` is
+# the integrator hole (resolves to a subject-writer); `pot_f` a read-only callback whose
+# only argument `metric` must therefore stay SHARED, not spuriously owned.
+@kernel epowner(fwd, bwd, metric; step_f, pot_f) = begin
+    start!(ep) = step_f(ep)                       # step_f writes subject → start! writes formal 1
+    finish!(ep) = start!(__self__, ep)             # sibling call passes __self__ → writes formal 1
+    step!() = begin
+        finish!(__self__, fwd)                     # → fwd owned via the chain
+        finish!(__self__, bwd)                     # → bwd owned via the chain
+    end
+    energy!() = pot_f(metric)                      # pot_f read-only → metric NOT owned
+end
+
+# opaque-subject adversaries: an unregistered mutator on a self place carries no descriptor.
+module Qual
+    evil!(x) = x
+end
+@kernel evilowner(buf) = begin
+    go!() = evil!(buf)                       # bare unregistered → :opaque, self subject → REJECT
+end
+@kernel qevilowner(buf) = begin
+    go!() = Qual.evil!(buf)                  # qualified unregistered → :opaque, self subject → REJECT
+end
+
+# higher-arity primitive adversary: `copyto!(dest,src,do,so,n)` resolves to the SAME
+# registration as the 2-arg form but its arity does not match the descriptor → must REJECT.
+@kernel bigcopy(a, b) = begin
+    go!() = Base.copyto!(a, 1, b, 1, 3)
+end
+
 @testset "Inc3 factory substrate" begin
     @testset "LOCAL owned seed (not authoritative)" begin
         # the direct-write seed is exactly the mutated field
@@ -191,6 +222,45 @@ baremodule NoFill end
         @eval AliasMod = NoFill                                  # rebind the module slot
         @test RKS.kernel_callee_rebound(aliasfill, aprim.ref)    # NoFill has no `fill!`
         @eval AliasMod = Base                                    # restore
+    end
+
+    @testset "authoritative interprocedural ownership fixed point (step 2/3)" begin
+        # step_f resolves to the subject-writer leapfrog!; pot_f to a read-only callback.
+        stepreg = RKS.kernel_registration(leapfrog!)
+        @test RKS._kernel_reg_writes_subject(stepreg)            # leapfrog! writes (:mom,)
+        potreg = RKS._KernelRegistration(:pot_tok, :free_method, :phasepoint,
+                                         (), (:pot,), false, nothing)
+        @test !RKS._kernel_reg_writes_subject(potreg)            # empty write-roots → reader
+        fr = Dict(:step_f => stepreg, :pot_f => potreg)
+
+        owned = RKS._kernel_factory_owned_authoritative(epowner; field_regs = fr)
+        # fwd AND bwd owned SOLELY through the ep chain (neither is ever directly written)
+        @test :fwd in owned && :bwd in owned
+        # the read-only callback's argument is NOT spuriously owned
+        @test !(:metric in owned)
+        # shared is the COMPLEMENT, created only after the closure — excludes fwd/bwd
+        shared = RKS._kernel_factory_shared(epowner; field_regs = fr)
+        @test :metric in shared
+        @test !(:fwd in shared) && !(:bwd in shared)
+
+        # NON-VACUOUS: with step_f resolved to a READ-ONLY callable, the chain writes nothing,
+        # so fwd/bwd are NOT owned — ownership flows solely through the resolved write-roots.
+        fr_ro = Dict(:step_f => potreg, :pot_f => potreg)
+        owned_ro = RKS._kernel_factory_owned_authoritative(epowner; field_regs = fr_ro)
+        @test !(:fwd in owned_ro) && !(:bwd in owned_ro)
+
+        # unresolved hole (no field_regs): step_f undecided → chain writes nothing yet
+        @test isempty(RKS._kernel_factory_owned_authoritative(epowner))
+
+        # req 4 REJECTS: opaque unregistered mutator on a self place (bare + qualified), and a
+        # method-local `fill!` spoof (opaque at the call site) — qualification/`!` not evidence.
+        @test_throws RKS._KernelFactoryReject RKS._kernel_factory_owned_authoritative(evilowner)
+        @test_throws RKS._KernelFactoryReject RKS._kernel_factory_owned_authoritative(qevilowner)
+        @test_throws RKS._KernelFactoryReject RKS._kernel_factory_owned_authoritative(spooffill)
+        # exact Base.fill! is admitted (registered primitive) — filler closes with buf owned
+        @test :buf in RKS._kernel_factory_owned_authoritative(filler)
+        # higher-arity copyto! (5 positionals) mismatches the arity-2 descriptor → REJECT
+        @test_throws RKS._KernelFactoryReject RKS._kernel_factory_owned_authoritative(bigcopy)
     end
 end
 
