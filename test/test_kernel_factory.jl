@@ -102,6 +102,9 @@ mutable struct CountingGrad; n::Int; end
 # are 0-B; a loop-scoped variable captured by @allocated is what boxes).
 _canonset0b(o, v) = RKS._canon_set!(o, Val(1), v)
 _canoncopy0b(o, s) = RKS._canon_copy_slot!(o, s, Val(2))
+# in-place gradient callable (acceptance-hook shape): writes dest = 2*pos, RETURNS pot = sum(abs2,pos)
+pgrad_ex!(dest, pos) = (dest .= 2 .* pos; sum(abs2, pos))
+_applygrad0b(b, o, pos) = RKS._kernel_apply_grad!(b, o, pos)
 # a SECOND, byte-identical endpoint DEFINITION — same slot/recipe SHAPE, DIFFERENT canonical
 # Value identities — to prove the plan key distinguishes definitions (RK 04:17c).
 @kernel phasepoint_ep2(pot_f, grad_f, metric, pos, mom) = begin
@@ -882,6 +885,27 @@ end
         @test RKS._canon_slot_kind(mix, Val(3)) === :scalar && RKS._canon_slot_type(mix, Val(3)) === Int
         @test RKS._canon_slot_kind(mix, Val(4)) === :scalar && RKS._canon_slot_type(mix, Val(4)) === Bool
         @test (@inferred RKS._canon_slot_kind(mix, Val(2))) === :buffer   # type-stable classification
+    end
+
+    @testset "pgrad! destination-aware applier: atomic pot+grad, per-endpoint dest, 0-B (RK 05:02)" begin
+        b = RKS._grad_binding(pgrad_ex!, Val(1), Val(2))     # dest = grad slot 1, pot = slot 2
+        @test RKS.grad_binding_callable(b) === pgrad_ex!      # IDENTITY in the prepared handle (not Recipe.op)
+        for T in (Float32, Float64)
+            o = RKS._CanonOwned2(T[0, 0], T(0), RKS._owner_mask(2, [1, 2]))
+            gradbuf = RKS._canon_slot(o, Val(1))
+            pos = T[1, 2]
+            RKS._kernel_apply_grad!(b, o, pos)               # ONE call seeds grad + pot atomically
+            @test RKS._canon_slot(o, Val(1)) === gradbuf     # owned grad dest identity kept (no realloc)
+            @test RKS._canon_slot(o, Val(1)) == T[2, 4]      # grad written in place
+            @test RKS._canon_slot(o, Val(2)) == T(5)         # pot = sum(abs2,[1,2]) seeded from same call
+            # a SECOND endpoint uses the SAME typed callable but its OWN grad destination
+            o2 = RKS._CanonOwned2(T[0, 0], T(0), RKS._owner_mask(2, [1, 2]))
+            RKS._kernel_apply_grad!(b, o2, T[3, 4])
+            @test RKS._canon_slot(o, Val(1)) !== RKS._canon_slot(o2, Val(1))   # distinct dest per endpoint
+            # ALLOCATION-FREE (0-B) — one call, no unary wrapper, no scratch (warmed)
+            _applygrad0b(b, o, pos)
+            @test (@allocated _applygrad0b(b, o, pos)) == 0
+        end
     end
 
     @testset "poc binder/plan seam accessors (RK 04:41)" begin

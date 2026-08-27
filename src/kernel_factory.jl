@@ -1042,6 +1042,29 @@ _canon_current_mask(s::_Canon) = getfield(s, :current)
 end
 @generated _canon_slot_type(s::_Canon, ::Val{I}) where {I} = fieldtype(s, I)
 
+# --- pgrad! destination-aware applier (RK 04:24/04:36/05:02) ------------------
+#
+# The mathematical recipe is `pot, dpot_dpos = grad_f(pos)`, but the acceptance hook supplies an
+# in-place `pgrad!(dest, pos)::T` that WRITES the caller-owned gradient buffer `dest` and RETURNS
+# the potential. The factory destination-binds it to the multi-output grad recipe: the owned
+# canonical grad slot is the `dest`, the scalar return fills the owned `pot` slot — both canonical
+# outputs seeded ATOMICALLY in ONE call, no scratch, no allocating unary wrapper, no 2nd hot eval.
+# The binding holds pgrad!'s IDENTITY + the two Val slot indices (a prepared handle — NOT Recipe.op).
+struct _GradBinding{F,D,P}
+    pgrad!::F      # the in-place gradient callable (external authority, kept by identity)
+    dest::D        # Val{I}: the owned canonical GRAD slot (destination)
+    pot::P         # Val{J}: the owned canonical POT slot (scalar return)
+end
+_grad_binding(pgrad!, ::Val{I}, ::Val{J}) where {I,J} = _GradBinding(pgrad!, Val(I), Val(J))
+grad_binding_callable(b::_GradBinding) = b.pgrad!
+# One invocation seeds construction: pgrad!(grad_dest, pos) writes the owned grad buffer in place
+# (identity preserved) and returns pot, which is set into the pot slot — atomic, allocation-free.
+@inline function _kernel_apply_grad!(b::_GradBinding, s::_CanonOwned, pos)
+    pot = b.pgrad!(_canon_slot(s, b.dest), pos)   # writes grad dest in place, returns pot
+    _canon_set!(s, b.pot, pot)                    # seed pot atomically from the SAME call
+    s
+end
+
 # The concrete family member for a given arity — a COMPILE-TIME type lookup (no runtime Symbol
 # dispatch, no runtime emission). A layout wider than the predeclared family throws a deterministic
 # reject at the @generated boundary (per-N specialization → type-stable / @inferred, RK 05:24).
