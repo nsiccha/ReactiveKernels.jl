@@ -343,3 +343,100 @@ end
         @test (@allocated barrier(chg, momg)) == 0       # diagonal exact 0-B
     end
 end
+# Test-only regression pinning the end-to-end Diagonal-mass evidence for f8f5e2b (RK 18:57/19:11). Uses the
+# file's existing helpers _nuts_pf / _nuts_mkvals / _nuts_batch0b / _NutsFix / RK. NO Profile — the profiler was
+# measured to be an invalid instrument here (phantom potrs backtraces in the Diagonal path, dense/diagonal ratio
+# only 1.5–3.3x); no-potrs is proven DETERMINISTICALLY in an isolated child process.
+#
+# Equivalence note: a Diagonal-backed Cholesky solves element-wise while dense goes through LAPACK potrs (two
+# √-divisions), so the two are byte-identical ONLY for unit mass (trivial solve); a scaled Diagonal differs at
+# the ULP (F64 ~3e-16, F32 ~6e-8). Hence the byte-identical gate uses UNIT mass.
+
+@testset "kernel_nuts — Diagonal mass: unit-mass full-observable dense-equivalence + exact 0-B (F32/F64, both RNG)" begin
+    _mkframe(pf, T, md, metric) = begin
+        PL = RK.kernel_prepared_plan(pf); d = _nuts_mkvals(pf, T)
+        for sl in RK.kernel_plan_slots(PL)
+            nm = String(sl.path[1]); nm == "metric" && (d[sl.canon] = metric); nm == "chol_metric" && (d[sl.canon] = cholesky(metric))
+        end
+        fr = RK._construct_nuts_frame(pf, d, md; step_f = RK.partial(_NutsFix.leapfrog!; stepsize = T(0.3)), stats_f = _NutsFix.nuts_stats!, min_dham = -1000)
+        RK.compile_prepared_initialization(pf, typeof(fr.init), typeof(fr.shared))(fr.init, fr.shared, RK.kernel_prepared_handles(pf))
+        RK._seed_nuts_children!(fr); fr
+    end
+    # full HMC-observable snapshot (not pos only): position + every committed diagnostic + mask.
+    _obs(fr) = (pos = copy(RK._canon_slot(fr.init, Val(3))),
+                n_steps = RK._diag_slot(fr.diag, Val(1)), reached_depth = RK._diag_slot(fr.diag, Val(2)),
+                acceptance_rate = RK._diag_slot(fr.diag, Val(3)), dham = RK._diag_slot(fr.diag, Val(4)),
+                committed = RK.diagnostics_committed_mask(fr.diag))
+    for T in (Float64, Float32)
+        pf = _nuts_pf()
+        # UNIT mass: element-wise solve and dense potrs coincide exactly ⇒ byte-identical full observable set.
+        frD = _mkframe(pf, T, 5, LinearAlgebra.Diagonal(T[1, 1]))    # Diagonal identity mass (admitted)
+        CD = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frD)
+        frM = _mkframe(pf, T, 5, T[1 0; 0 1])                        # SAME operator, dense representation
+        CM = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frM)
+        rng = Random.Xoshiro(1); for _ in 1:200; CD.root!(frD, CD.scratch, rng); end
+        rng = Random.Xoshiro(1); for _ in 1:200; CM.root!(frM, CM.scratch, rng); end
+        oD = _obs(frD); oM = _obs(frM)
+        @test oD.pos == oM.pos                                       # position BYTE-identical (unit mass)
+        @test oD.n_steps == oM.n_steps
+        @test oD.reached_depth == oM.reached_depth
+        @test oD.acceptance_rate == oM.acceptance_rate
+        @test oD.dham == oM.dham                                     # diverged = !(dham>=min_dham) follows from this
+        @test oD.committed == oM.committed                          # committed diagnostics mask
+        # EXACT 0-B on the Diagonal path (a SCALED Diagonal, the real perf case): F32/F64 × both RNG, typed Val{N}.
+        frS = _mkframe(pf, T, 5, LinearAlgebra.Diagonal(T[2, 2])); CS = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frS)
+        for rg in (Random.Xoshiro(91), Random.MersenneTwister(2))
+            @test _nuts_batch0b(CS.root!, frS, CS.scratch, rg, Val(64)) == 0
+            @test _nuts_batch0b(CS.root!, frS, CS.scratch, rg, Val(256)) == 0
+        end
+    end
+end
+
+@testset "kernel_nuts — Diagonal mass: NO LAPACK potrs (deterministic, isolated child process)" begin
+    # The profiler cannot prove this (phantom potrs frames). Instead a CHILD process pirates LAPACK.potrs! to a
+    # hard sentinel error (F64+F32) — the piracy lives ONLY in the child, the main suite is untouched. Dense must
+    # HIT potrs (same-kind positive control, both eltypes); Diagonal must complete build+50 txn WITHOUT it. The
+    # child prints an explicit four-result receipt and exits 0 iff all four facts hold (so an empty child ≠ green).
+    fixture = abspath(joinpath(@__DIR__, "..", "benchmark", "nuts_kernel_authoring_fixture.jl"))
+    proj = abspath(joinpath(@__DIR__, ".."))
+    childsrc = raw"""
+    using LinearAlgebra, Random, ReactiveKernels
+    const RK = ReactiveKernels
+    for Tv in (Float64, Float32)
+        @eval LinearAlgebra.LAPACK.potrs!(u::AbstractChar, A::AbstractMatrix{$Tv}, B::AbstractVecOrMat{$Tv}) = error("POTRS_CALLED")
+    end
+    module _CF; include(ENV["RK_DIAG_FIXTURE"]); end
+    function _mk(T, metric)
+        pf = RK._prepare_factory(_CF.euclidean_phasepoint, RK.kernel_registration(_CF.leapfrog!))
+        PL = RK.kernel_prepared_plan(pf); d = Dict{Int,Any}()
+        for sl in RK.kernel_plan_slots(PL)
+            nm = String(sl.path[1])
+            d[sl.canon] = nm=="grad_f" ? ((dst,p)->(dst.=2 .*p; sum(abs2,p))) : nm=="metric" ? metric : nm=="chol_metric" ? cholesky(metric) : startswith(nm,"##node") ? zero(T) : nm=="pos" ? T[1,2] : nm=="mom" ? T[3,4] : (nm in ("dpot_dpos","dham_dpos","dkin_dmom","dham_dmom")) ? T[0,0] : zero(T)
+        end
+        fr = RK._construct_nuts_frame(pf, d, 5; step_f=RK.partial(_CF.leapfrog!; stepsize=T(0.3)), stats_f=_CF.nuts_stats!, min_dham=-1000)
+        RK.compile_prepared_initialization(pf, typeof(fr.init), typeof(fr.shared))(fr.init, fr.shared, RK.kernel_prepared_handles(pf))
+        RK._seed_nuts_children!(fr); (pf, fr)
+    end
+    function _outcome(T, metric)
+        try
+            pf, fr = _mk(T, metric)
+            C = RK.compile_nuts(pf, _CF.nuts_state, _CF.refresh_momentum!!, _CF.nuts!!, fr)
+            for _ in 1:50; C.root!(fr, C.scratch, Random.Xoshiro(3)); end
+            :completed
+        catch e
+            (e isa ErrorException && e.msg == "POTRS_CALLED") ? :threw_potrs : :other_error
+        end
+    end
+    dF64 = _outcome(Float64, [2.0 0; 0 2.0]); dF32 = _outcome(Float32, Float32[2 0; 0 2])
+    gF64 = _outcome(Float64, Diagonal([2.0, 2.0])); gF32 = _outcome(Float32, Diagonal(Float32[2, 2]))
+    println("RECEIPT dense_F64=", dF64, " dense_F32=", dF32, " diag_F64=", gF64, " diag_F32=", gF32)
+    exit((dF64 === :threw_potrs && dF32 === :threw_potrs && gF64 === :completed && gF32 === :completed) ? 0 : 1)
+    """
+    childfile = tempname() * ".jl"; write(childfile, childsrc)
+    out = IOBuffer()
+    cmd = setenv(`$(Base.julia_cmd()) --startup-file=no --project=$proj $childfile`, "RK_DIAG_FIXTURE" => fixture)
+    proc = run(pipeline(cmd; stdout = out, stderr = out); wait = false); wait(proc)
+    receipt = String(take!(out)); rm(childfile; force = true)
+    @test occursin("RECEIPT dense_F64=threw_potrs dense_F32=threw_potrs diag_F64=completed diag_F32=completed", receipt)
+    @test proc.exitcode == 0
+end
