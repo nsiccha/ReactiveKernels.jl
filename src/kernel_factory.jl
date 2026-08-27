@@ -958,3 +958,49 @@ function _kernel_construct_group(::Val{Token}, n::Int, owned_values::Tuple,
                                  shared::_SharedState) where {Token}
     (ntuple(_ -> _kernel_construct_owned(Val(Token), owned_values), n), shared)
 end
+
+# --- per-definition canonical-port SUPERSET storage (RK 05:11/05:12) -----------
+#
+# TWO parametric mutable templates over the SAME canonical-port superset — an OWNED object and a
+# per-sampler SHARED object. Each canonical field lives in EXACTLY ONE role (the selected Plan
+# role); the OTHER object's corresponding field is `Nothing`, so there is exactly ONE physical
+# value per canonical id — never a duplicated chol_metric / @node / metric / grad_f. Val indices
+# are plan-resolved WITHIN the selected role; `current` marks only selected canonical fields.
+#
+# WORLD-AGE CLEAN: the field superset / type FAMILY is fixed (predeclared / @kernel-macro-emitted),
+# NOT emitted from @generated/runtime planning. The SAME definition under a writer vs read-only
+# integrator gets a different Plan role/mask/layout SPECIALIZATION while the struct TYPES are
+# unchanged. (This N=3 pair proves the mechanism; the @kernel macro auto-emits the per-definition
+# pair — the next increment.)
+mutable struct _CanonOwned3{F1,F2,F3,W}
+    f1::F1
+    f2::F2
+    f3::F3
+    current::NTuple{W,UInt}
+end
+mutable struct _CanonShared3{F1,F2,F3,W}
+    f1::F1
+    f2::F2
+    f3::F3
+    current::NTuple{W,UInt}
+end
+const _Canon3 = Union{_CanonOwned3,_CanonShared3}
+# Val-indexed READ / WRITE — @generated to emit a LITERAL field-SYMBOL getfield/setfield! for the
+# concrete layout (RK 05:08/05:12), so per-slot mutation is exactly 0-B for mixed scalars + arrays
+# (a runtime-Int `setfield!` would box). `_canon_set!` replaces a scalar/isbits field; array buffers
+# are mutated in place by `_canon_copy_slot!`.
+@generated _canon_slot(s::_Canon3, ::Val{I}) where {I} = :(getfield(s, $(QuoteNode(fieldname(s, I)))))
+@generated function _canon_set!(s::_Canon3, ::Val{I}, v) where {I}
+    :(setfield!(s, $(QuoteNode(fieldname(s, I))), v); s)
+end
+# Structural copy of ONE selected slot preserving array identity: `copyto!` for a mutable array
+# buffer, `setfield!` for a scalar/isbits slot. Only ever called on a SELECTED (real) field.
+@generated function _canon_copy_slot!(dest::S, src::S, ::Val{I}) where {S<:_Canon3,I}
+    fn = QuoteNode(fieldname(S, I))
+    quote
+        d = getfield(dest, $fn)
+        d isa AbstractArray ? copyto!(d, getfield(src, $fn)) : setfield!(dest, $fn, getfield(src, $fn))
+        dest
+    end
+end
+_canon_current_mask(s::_Canon3) = getfield(s, :current)

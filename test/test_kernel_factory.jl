@@ -91,6 +91,10 @@ end
 # (identity + counter), never deep-copy it.
 mutable struct CountingGrad; n::Int; end
 (c::CountingGrad)(x) = (c.n += 1; x)
+# function barriers so 0-B measurements aren't polluted by a boxed loop-local (the ops themselves
+# are 0-B; a loop-scoped variable captured by @allocated is what boxes).
+_canonset0b(o, v) = RKS._canon_set!(o, Val(1), v)
+_canoncopy0b(o, s) = RKS._canon_copy_slot!(o, s, Val(2))
 # a SECOND, byte-identical endpoint DEFINITION — same slot/recipe SHAPE, DIFFERENT canonical
 # Value identities — to prove the plan key distinguishes definitions (RK 04:17c).
 @kernel phasepoint_ep2(pot_f, grad_f, metric, pos, mom) = begin
@@ -778,6 +782,37 @@ end
         @test RKS._shared_slot(sh, Val(2))[1] == 99.0
         @test RKS._shared_current(sh, Val(2)); RKS._shared_kill!(sh, Val(2))
         @test !RKS._shared_current(sh, Val(2))
+    end
+
+    @testset "canonical-port superset storage: owned/shared roles, no duplicate, 0-B (RK 05:11/12)" begin
+        # WRITER integrator: canonical slots {1,2} OWNED (scalar + array), {3} SHARED (array authority)
+        ow = RKS._CanonOwned3(1.0, [2.0, 3.0], nothing, RKS._owner_mask(3, [1, 2]))
+        sw = RKS._CanonShared3(nothing, nothing, [4.0, 5.0], RKS._owner_mask(3, [3]))
+        # exactly ONE physical value per canonical id — the OTHER role's field is Nothing
+        @test RKS._canon_slot(ow, Val(3)) === nothing && RKS._canon_slot(sw, Val(1)) === nothing
+        @test RKS._canon_slot(ow, Val(1)) == 1.0 && RKS._canon_slot(sw, Val(3)) == [4.0, 5.0]
+        @test (@inferred RKS._canon_slot(ow, Val(1))) == 1.0        # Val accessor type-stable
+        # READ-ONLY integrator: SAME struct family, DIFFERENT selected layout — {} owned, {1,2,3} shared
+        orr = RKS._CanonOwned3(nothing, nothing, nothing, RKS._owner_mask(3, Int[]))
+        srr = RKS._CanonShared3(6.0, [7.0], [8.0], RKS._owner_mask(3, [1, 2, 3]))
+        @test typeof(orr).name === typeof(ow).name                 # same TYPE FAMILY (no runtime emission)
+        @test all(RKS._canon_slot(orr, Val(i)) === nothing for i in 1:3)   # nothing owned (read-only)
+        @test RKS._canon_slot(srr, Val(1)) == 6.0                  # the physical value is in the shared role
+        # current mask marks ONLY selected canonical fields
+        @test RKS._canon_current_mask(ow) == RKS._owner_mask(3, [1, 2])
+        @test RKS._canon_current_mask(orr) == RKS._owner_mask(3, Int[])
+        # 0-B per-slot: scalar set + array copy + array identity, warmed, exact 0 B, mixed F32/F64
+        for T in (Float32, Float64)
+            o = RKS._CanonOwned3(T(1), T[2, 3], nothing, RKS._owner_mask(3, [1, 2]))
+            src = RKS._CanonOwned3(T(9), T[7, 8], nothing, RKS._owner_mask(3, [1, 2]))
+            v5 = T(5)                                    # pre-construct (dynamic `T(5)` would box)
+            _canonset0b(o, v5); _canoncopy0b(o, src)                                   # warmup
+            @test (@allocated _canonset0b(o, v5)) == 0                                 # scalar set 0-B
+            buf = RKS._canon_slot(o, Val(2))
+            @test (@allocated _canoncopy0b(o, src)) == 0                               # array copy 0-B
+            @test RKS._canon_slot(o, Val(2)) === buf                                   # array identity kept
+            @test RKS._canon_slot(o, Val(2)) == T[7, 8]                                # values transferred
+        end
     end
 
     @testset "poc binder/plan seam accessors (RK 04:41)" begin
