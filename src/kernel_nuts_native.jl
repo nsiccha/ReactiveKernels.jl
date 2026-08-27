@@ -447,13 +447,14 @@ function _native_method_map(::Type{P}) where {P<:_NativeProgram}
     end
     out
 end
-function _native_plan_slot(::Type{PlanT}, field::Symbol) where {PlanT<:_KernelPlan}
+function _native_plan_field(::Type{PlanT}, field::Symbol) where {PlanT<:_KernelPlan}
     key = PlanT.parameters[1]
     sig = key[2]
     i = findfirst(t -> t[1] == (field,), sig)
     i === nothing && _native_reject("plan has no named endpoint field `$field`")
-    sig[i][4]
+    (sig[i][3], sig[i][4])
 end
+_native_plan_slot(P::Type{<:_KernelPlan}, field::Symbol) = _native_plan_field(P, field)[2]
 
 _nn_tuple_params(T::Type{<:Tuple}) = T.parameters
 
@@ -481,18 +482,23 @@ end
 function _nn_ensure(C::_NativeEmitCtx, ep, field::Symbol)
     ensure = Expr(:call, GlobalRef(Core, :getfield), _nn_cfg(C, :ensures), QuoteNode(field))
     shared = Expr(:call, GlobalRef(Core, :getfield), C.frame, QuoteNode(:shared))
-    slot = _native_plan_slot(C.plan, field)
-    current = Expr(:call, GlobalRef(@__MODULE__, :_canon_current), ep, :(Val($slot)))
-    args=Any[ep,shared,_nn_cfg(C,:handles)]
+    role, slot = _native_plan_field(C.plan, field)
+    endpoint = :__nn_ensure_endpoint
+    object = role === :owned ? endpoint : role === :shared ? shared :
+        _native_reject("derived field `$field` has unsupported plan role `$role`")
+    current = Expr(:call, GlobalRef(@__MODULE__, :_canon_current), object, :(Val($slot)))
+    args=Any[endpoint,shared,_nn_cfg(C,:handles)]
     C.instrumented && push!(args,C.scratch)
     repair = Expr(:call, ensure, args...)
-    value = Expr(:call, GlobalRef(@__MODULE__, :_canon_slot), ep, :(Val($slot)))
+    value = Expr(:call, GlobalRef(@__MODULE__, :_canon_slot), object, :(Val($slot)))
     # Most recursive NUTS reads are repeats of a value already repaired in this transaction.  Keep the
     # currentness test in the generated caller so the hot/current path does not cross the separately compiled
     # ensure-function boundary.  The cold/dirty path still invokes the exact existing ensure, preserving its
     # recursive producer ordering, kill/bless protocol, and exception prefix; reread the physical slot only
     # after that call succeeds.
-    Expr(:block, Expr(:if, :(!$current), repair), value)
+    # The endpoint expression itself is evaluated exactly once, matching the old function-call boundary even
+    # for an indexed endpoint.  A lexical `let` makes nested ensures collision-free without a mutable gensym.
+    Expr(:let, Expr(:(=), endpoint, ep), Expr(:block, Expr(:if, :(!$current), repair), value))
 end
 
 function _nn_self_read(T::Type{<:_NNSelfField}, C::_NativeEmitCtx)

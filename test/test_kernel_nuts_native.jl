@@ -82,6 +82,13 @@ function (c::_NativeCountEnsure)(owned, shared, handles)
 end
 struct _NativeThrowEnsure end
 (::_NativeThrowEnsure)(owned, shared, handles) = throw(ErrorException("ensure boundary sentinel"))
+mutable struct _NativeIndexCounter
+    count::Vector{Int}
+end
+function (c::_NativeIndexCounter)()
+    c.count[1] += 1
+    1
+end
 
 
 @testset "native NUTS — generated root executes the real fixture" begin
@@ -172,6 +179,47 @@ end
     badcfg = (ensures = (ham = _NativeThrowEnsure(),), handles = C.cfg.handles)
     @test_throws ErrorException RK._nn_method0(P, Val(111), badcfg, f)
     @test !RK._canon_current(f.init, hslot)
+
+    # An indexed endpoint expression remains once-evaluated on both the bypass and repair paths.
+    index_calls = [0]; indexer = _NativeIndexCounter(index_calls)
+    idx = RK._NNRegistered{1, false, :index_counter, Tuple{}, Tuple{}, false}
+    proposal = RK._NNIndex{RK._NNSelfField{(:proposals,)}, Tuple{idx}}
+    indexed_ham = RK._NNGetfield{proposal, :ham}
+    MI = RK._NNMethod{112, :indexed_ensure_boundary, Tuple{}, Tuple{RK._NNExprStmt{indexed_ham}}}
+    PI = RK._NativeProgram{:indexed_ensure_boundary, typeof(plan), 112, Tuple{MI},
+                           (:ham,), RK._NNNoStats}
+    icfg = (ensures = (ham = counted,), handles = C.cfg.handles, callees = (indexer,))
+    ensure_before = calls[1]
+    @test RK._nn_method0(PI, Val(112), icfg, f) === f
+    @test index_calls[1] == 1
+    @test calls[1] == ensure_before
+    RK._canon_kill!(f.proposals[1], hslot)
+    @test RK._nn_method0(PI, Val(112), icfg, f) === f
+    @test index_calls[1] == 2
+    @test calls[1] == ensure_before + 1
+
+    # A derived shared slot is guarded and reread on `frame.shared`, while its repair still receives the
+    # physical owned endpoint plus shared authority.  Treating every derived field as owned would return the
+    # endpoint's placeholder slot rather than the sealed Cholesky value.
+    readchol = RK._NNSelfField{(:init, :chol_metric)}
+    child = RK._NNMethod{114, :read_shared_chol, Tuple{}, Tuple{RK._NNReturn{readchol}}}
+    childcall = RK._NNCallExpr{:read_shared_chol, 114, RK._NNSelf, Tuple{}, Tuple{}}
+    parent = RK._NNMethod{113, :shared_ensure_parent, Tuple{}, Tuple{RK._NNExprStmt{childcall}}}
+    PS = RK._NativeProgram{:shared_ensure_boundary, typeof(plan), 113, Tuple{parent, child},
+                           (:chol_metric,), RK._NNNoStats}
+    chol_ensure = RK.compile_prepared_ensure(pf, typeof(f.init), typeof(f.shared), :chol_metric)
+    chol_calls = [0]; counted_chol = _NativeCountEnsure(chol_ensure, chol_calls)
+    scfg = (ensures = (chol_metric = counted_chol,), handles = C.cfg.handles)
+    expected_chol = RK._canon_slot(f.shared,
+        RK.kernel_plan_named_slot_val(plan, Val(:chol_metric)))
+    @test RK._nn_method0(PS, Val(114), scfg, f) === expected_chol
+    @test chol_calls[1] == 0
+    cslot = RK.kernel_plan_named_slot_val(plan, Val(:chol_metric))
+    RK._canon_kill!(f.shared, cslot)
+    @test RK._nn_method0(PS, Val(114), scfg, f) ===
+          RK._canon_slot(f.shared, cslot)
+    @test chol_calls[1] == 1
+    @test RK._canon_current(f.shared, cslot)
 end
 
 @testset "native NUTS — full parity, concrete return, exact loop 0-B, two RNG, public Mode-2" begin
