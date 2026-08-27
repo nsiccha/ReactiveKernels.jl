@@ -186,6 +186,11 @@ _exec_is_vec(x::_OpCall, ctx::_EmitCtx) = any(a -> _exec_is_vec(a, ctx), x.args)
 _exec_is_vec(::_RegisteredCall, ctx::_EmitCtx) = false
 
 function _exec_rhs(x::_OpCall, ctx::_EmitCtx, bcast::Bool)
+    # source-only boundary: an OPAQUE (unregistered, non-operator) call must NOT be normalized through the
+    # emitter — helpers must be @rk_* declared (a `_RegisteredCall`). Only operator candidates emit here.
+    x.hint === :opaque && _l_reject(
+        "opaque unregistered call `$(x.op)` in an authored expression — a helper must be @rk_pure/" *
+        "@rk_borrows/@rk_rng declared (source-only compiler boundary), never emitted from spelling")
     args = Any[_exec_rhs(a, ctx, bcast) for a in x.args]
     # Broadcast ONLY inside a broadcast context AND for a buffer-dependent op. Outside a broadcast (an
     # ordinary call), or for a scalar-only subtree, emit a PLAIN call — an ordinary array-arg call
@@ -195,11 +200,28 @@ function _exec_rhs(x::_OpCall, ctx::_EmitCtx, bcast::Bool)
         Expr(:call, _exec_callee(x.op), args...)                                   # plain call (scalar/ordinary)
 end
 
-# The canonical GlobalRef for a REGISTERED/DECLARED call's captured source function — exact identity from
-# the registration (never spelling), enforcing the source-only compiler boundary (an UNREGISTERED helper
-# is an opaque `_OpCall`, never reaches here — the caller asserts `ir.ok`).
-_exec_registered_callee(x::_RegisteredCall) =
-    (f = getfield(x.registration, :source); GlobalRef(parentmodule(f), nameof(f)))
+# The GlobalRef for a captured callee TARGET — the AUTHORED qualified slot preserved (RK 05:47: never
+# re-derive via `parentmodule`/`nameof`, which can lose the authored slot). A qualified `Module.:name`
+# Expr keeps the AUTHORED module binding; a GlobalRef passes through.
+_captured_globalref(g::GlobalRef) = g
+function _captured_globalref(e::Expr)
+    (e.head === :. && length(e.args) == 2 && e.args[2] isa QuoteNode) ||
+        _l_reject("unsupported captured callee target $(e)")
+    GlobalRef(Core.eval(Main, e.args[1]), e.args[2].value)     # (Main._F).smooth → GlobalRef(Main._F, :smooth)
+end
+
+# The emitted callee for a REGISTERED/DECLARED call: the DETACHED authored captured target
+# (`ref.slot`/`ref.field`), REBIND-CHECKED against the registration's captured source — if the authored
+# slot has been rebound to a different function the emission is rejected (never silently binds the new
+# one). Enforces the source-only boundary; an UNREGISTERED helper never reaches here (opaque `_OpCall`).
+function _exec_registered_callee(x::_RegisteredCall)
+    ref = x.ref; src = getfield(x.registration, :source)
+    gref = ref.field === nothing ? _captured_globalref(ref.slot) :
+                                   GlobalRef(Core.eval(Main, ref.slot), ref.field)  # module-qualified primitive
+    getfield(gref.mod, gref.name) === src || _l_reject(
+        "captured callee $(gref) was REBOUND away from its registered source ($(src)) — stale/forged registration")
+    gref
+end
 
 function _exec_rhs(x::_RegisteredCall, ctx::_EmitCtx, bcast::Bool)
     callee = _exec_registered_callee(x)

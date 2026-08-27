@@ -205,58 +205,6 @@ module _CgTypedFix
     end
 end
 
-@testset "codegen — typed-half (oftype) leapfrog: scalar op is a PLAIN call, 0 B, F32-safe" begin
-    LFT = _CgTypedFix.leapfrog_typed!
-    seam = RK._kernel_factory_endpoint_plan(_CgPP, RK.kernel_registration(LFT))
-    ir = RK.method_irs(LFT)[1]
-    prod = Dict(kv[1] => kv[2] for kv in RK.kernel_plan_producer(seam))
-    ap = Dict(prod[RK._seam_canon(seam, :dpot_dpos)] => :pgrad, prod[RK._seam_canon(seam, :dkin_dmom)] => :velocity)
-    ri = RK._seam_recipe_inputs_snapshot(_CgPP, seam)
-    _, meta = RK.compile_leaf(ir, seam, _CgTypedFix.partial(LFT; stepsize = 0.1); recipe_inputs = ri, appliers = ap)
-    src = string(meta.body)
-    # MIXED expression `oftype(stepsize, 0.5) * stepsize * dham_dpos` (RK 05:26): the typed SCALAR
-    # coefficient is a PLAIN call (evaluated once), the VECTOR multiply is FUSED (broadcasted).
-    @test occursin("oftype(", src)
-    @test !occursin("broadcasted(Main._CgTypedFix.oftype", src) && !occursin("broadcasted(Base.oftype", src)
-    @test occursin("broadcasted(Main._CgTypedFix.:*", src)              # the vector op IS fused
-    # scalar coefficient appears once per half-kick RHS (2 half-kicks) — evaluated once each, not per-element
-    @test count(_ -> true, eachmatch(r"oftype\(", src)) == 2
-    barrier(fn, st, pg, cholf, kw) = @allocated fn(st, pg, cholf, kw)   # fn typed → true 0-B measurement
-    for T in (Float64, Float32)
-        fn, m = RK.compile_leaf(ir, seam, _CgTypedFix.partial(LFT; stepsize = T(0.1)); recipe_inputs = ri, appliers = ap)
-        d = 4; metric = Matrix{T}(2 * I, d, d); cholf = cholesky(metric); st = RK.make_leaf_owner_state(_CgPP, seam, T, d)
-        RK._owner_commit!(st, ntuple(i -> begin s = RK._owner_slot(st, Val(i))
-            s isa AbstractVector ? (s .= T.(1:d) ./ (i + 1)) : s end, m.nslots))
-        _quad!(RK._owner_slot(st, Val(m.dpotslot)), RK._owner_slot(st, Val(m.posslot)))
-        pg = _CountGrad(_quad!, 0); kw = (; stepsize = T(0.1))
-        barrier(fn, st, pg, cholf, kw); barrier(fn, st, pg, cholf, kw)
-        @test eltype(RK._owner_slot(st, Val(m.posslot))) === T           # no Float64 promotion (F32-safe)
-        @test barrier(fn, st, pg, cholf, kw) == 0                        # typed half is 0 alloc
-    end
-end
-
-@testset "codegen — ORDINARY array calls are NOT broadcast (broadcast context is authority)" begin
-    # RK 05:31: slot kind partitions scalars only INSIDE an authored broadcast node. An ordinary call with
-    # array arguments (dot, getindex, lmul!, pgrad!) must stay a plain call even though its args are slots.
-    seam = _cg_seam()
-    ctx = RK._EmitCtx(RK._seam_field_canon(seam), RK._seam_slot_of_canon(seam),
-                      RK._seam_scalar_canons(seam), (:stepsize,), Int[], Symbol[])
-    mom = RK._SelfField((:mom,)); dkin = RK._SelfField((:dkin_dmom,))
-    # dot(mom, dkin_dmom) — array args, scalar RESULT; NEVER broadcast (element-wise dot is meaningless)
-    dotcall = RK._OpCall(GlobalRef(LinearAlgebra, :dot), (mom, dkin), (), false, :opaque)
-    e_ord = RK._exec_rhs(dotcall, ctx, false)                    # ordinary (non-dotted) context
-    @test e_ord.head === :call && !occursin("broadcasted", string(e_ord))
-    @test occursin("dot", string(e_ord))
-    # getindex(mom, 1) — array arg, indexed; a plain call outside a broadcast
-    getcall = RK._OpCall(GlobalRef(Base, :getindex), (mom, RK._Lit(1)), (), false, :opaque)
-    e_get = RK._exec_rhs(getcall, ctx, false)
-    @test e_get.head === :call && !occursin("broadcasted", string(e_get))
-    # SAME arithmetic op IS fused when it genuinely sits inside a broadcast context (the leapfrog `@.`)
-    mul = RK._OpCall(GlobalRef(Base, :*), (RK._Lit(0.5), mom), (), false, :operator_candidate)
-    @test occursin("broadcasted", string(RK._exec_rhs(mul, ctx, true)))     # bcast=true → fused
-    @test !occursin("broadcasted", string(RK._exec_rhs(mul, ctx, false)))   # bcast=false → plain
-end
-
 module _CgStatsFix
     using ReactiveKernels, LogExpFunctions
     smooth(prev, new, w) = (1 - w) * prev + w * new
@@ -269,6 +217,44 @@ module _CgStatsFix
         s.acceptance_rate = smooth(s.acceptance_rate, min1exp(accepted), 0.1)
         s.trees[1].log_weight[1] = s.dham
     end
+end
+
+@testset "codegen — opaque exact-pure Base calls (oftype) REJECT pending the pure-primitive category" begin
+    # RK 05:54: MethodIR over the final ccb kernels shows the opaque exact-pure calls are
+    # oftype/one/zero/isnothing/logaddexp/eachcol. The source-only guard correctly REJECTS an opaque
+    # unregistered call rather than normalizing it from spelling. Once syntax lands the definition-time
+    # exact pure-primitive category these capture as identity-bound `_RegisteredCall :primitive`, the
+    # emitter lowers them, and the 0-B typed-half execution + a no-opaque-edge assertion return.
+    LFT = _CgTypedFix.leapfrog_typed!
+    seam = RK._kernel_factory_endpoint_plan(_CgPP, RK.kernel_registration(LFT))
+    ir = RK.method_irs(LFT)[1]
+    prod = Dict(kv[1] => kv[2] for kv in RK.kernel_plan_producer(seam))
+    ap = Dict(prod[RK._seam_canon(seam, :dpot_dpos)] => :pgrad, prod[RK._seam_canon(seam, :dkin_dmom)] => :velocity)
+    ri = RK._seam_recipe_inputs_snapshot(_CgPP, seam)
+    @test_throws RK._LLowerReject RK.compile_leaf(ir, seam, _CgTypedFix.partial(LFT; stepsize = 0.1);
+                                                  recipe_inputs = ri, appliers = ap)
+end
+
+@testset "codegen — ORDINARY array calls are NOT broadcast (broadcast context is authority)" begin
+    # RK 05:31: slot kind partitions scalars only INSIDE an authored broadcast node. A structural index
+    # and a DECLARED registered call with array/slot arguments must stay plain, even in a broadcast context.
+    seam = _cg_seam()
+    ctx() = RK._EmitCtx(RK._seam_field_canon(seam), RK._seam_slot_of_canon(seam),
+                        RK._seam_scalar_canons(seam), (:stepsize,), Int[], Symbol[])
+    mom = RK._SelfField((:mom,))
+    # getindex(mom, 1) via a structural _Index place → a plain getindex, never broadcast
+    e_get = RK._emit_place_ref(RK._Index(mom, (RK._Lit(1),)), ctx())
+    @test e_get.head === :call && !occursin("broadcasted", string(e_get)) && occursin("getindex", string(e_get))
+    # a DECLARED registered helper call is a plain call — never broadcast, even in a broadcast context
+    accw = only(w for w in RK._exec_place_writes(RK.method_irs(_CgStatsFix.probe_stats!)[1])
+                if w.owner == (:acceptance_rate,))
+    c2 = RK._EmitCtx(Dict(:acceptance_rate => 2), Dict(2 => 2), Set{Int}([2]), (:accepted,), Int[], Symbol[])
+    @test !occursin("broadcasted", string(RK._exec_rhs(accw.rhs, c2, true)))    # registered call: plain even bcast=true
+    @test occursin("smooth", string(RK._exec_rhs(accw.rhs, c2, false)))
+    # an arithmetic operator over a slot IS fused iff inside a broadcast context
+    mul = RK._OpCall(GlobalRef(Base, :*), (RK._Lit(0.5), mom), (), false, :operator_candidate)
+    @test occursin("broadcasted", string(RK._exec_rhs(mul, ctx(), true)))       # bcast=true → fused
+    @test !occursin("broadcasted", string(RK._exec_rhs(mul, ctx(), false)))     # bcast=false → plain
 end
 
 # a SYNTHETIC concrete Val-ABI state (TEST-ONLY; syntax's _CanonOwnedN replaces it on the rebase): per-slot
@@ -316,6 +302,24 @@ ReactiveKernels._owner_set!(s::_SynthStats, ::Val{I}, v) where {I} = (setfield!(
     barrier(f, s, kw) = @allocated f(s, kw)
     barrier(fn, st, (; accepted = 1.0))
     @test barrier(fn, st, (; accepted = 1.0)) == 0            # exact 0 B
+end
+
+module _CgUnregFix
+    using ReactiveKernels
+    unregged(a, b) = a + b                              # NOT @rk_* declared — an opaque helper
+    @kernel bad_stats!(s; x) = begin
+        s.acceptance_rate = unregged(s.acceptance_rate, x)
+    end
+end
+
+@testset "codegen — an UNREGISTERED helper is REJECTED at the source-only boundary (not normalized)" begin
+    ir = RK.method_irs(_CgUnregFix.bad_stats!)[1]
+    writes = RK._exec_place_writes(ir)
+    accw = only(w for w in writes if w.owner == (:acceptance_rate,))
+    @test accw.rhs isa RK._OpCall && accw.rhs.hint === :opaque   # opaque, not a _RegisteredCall
+    ctx = RK._EmitCtx(Dict(:acceptance_rate => 2), Dict(2 => 2), Set{Int}([2]), (:x,), Int[], Symbol[])
+    # the emitter REFUSES to normalize the opaque unregistered helper through spelling
+    @test_throws RK._LLowerReject RK._emit_place_write!(Any[], accw, ctx, Symbol[])
 end
 
 @testset "codegen — an exec whose selected Recipe has no bound applier is REJECTED" begin
