@@ -48,7 +48,7 @@ execution of it blesses current (a collateral raw output owned by a different re
 consumed at the syntax seam (not a caller Boolean) — this graph consumes whatever `Plan` it is handed."
 struct _LPlanGraph
     path::_LPath
-    plan::Plan
+    plan::Union{Plan,Nothing}                 # the core Plan (scaffolding path) or `nothing` (seam-derived)
     producer::Dict{Int,Int}                   # canon Value id -> its SELECTED OWNER Recipe id (plan.producer)
     recipe_owned::Dict{Int,Vector{Int}}       # Recipe id -> the canon Value ids it OWNS (atomic produce set)
     recipe_inputs::Dict{Int,Vector{Int}}      # Recipe id -> its canon input Value ids
@@ -79,15 +79,21 @@ function _l_plan_graph(plan::Plan, path::_LPath = (); name_of::Dict{Int,Symbol} 
     end
     recipe_inputs = Dict{Int,Vector{Int}}(
         rid => Int[canon_id(g, i.id) for i in r.inputs] for (rid, r) in ownerrecipes)
-    # reverse edges follow CHOSEN producer edges: input id -> owner recipes consuming it -> their OWNED
-    # outputs (never through a discarded collateral output).
+    dependents = _l_dependents(sources, producer, recipe_owned, recipe_inputs)
+    _LPlanGraph(path, plan, producer, recipe_owned, recipe_inputs, dependents, sources, name_of)
+end
+
+# The transitive KILL set per Value id: reverse edges follow CHOSEN producer edges — an input id ->
+# the owner recipes consuming it -> their OWNED outputs (never through a discarded collateral output).
+# Shared by the Plan-derived (`_l_plan_graph`) and seam-derived (`_l_seam_plan_graph`) builders.
+function _l_dependents(sources::Set{Int}, producer::Dict{Int,Int},
+                       recipe_owned::Dict{Int,Vector{Int}}, recipe_inputs::Dict{Int,Vector{Int}})
     consumers = Dict{Int,Vector{Int}}()
     for (rid, ins) in recipe_inputs, iid in ins
         push!(get!(consumers, iid, Int[]), rid)
     end
     dependents = Dict{Int,Set{Int}}()
-    allids = union(sources, keys(producer))
-    for start in allids
+    for start in union(sources, keys(producer))
         seen = Set{Int}(); stack = Int[]
         for rid in get(consumers, start, Int[]); append!(stack, get(recipe_owned, rid, Int[])); end
         while !isempty(stack)
@@ -98,7 +104,7 @@ function _l_plan_graph(plan::Plan, path::_LPath = (); name_of::Dict{Int,Symbol} 
         end
         dependents[start] = seen
     end
-    _LPlanGraph(path, plan, producer, recipe_owned, recipe_inputs, dependents, sources, name_of)
+    dependents
 end
 
 # The exact selected endpoint Plan for a compiled object `spec` — TEST/SCAFFOLDING HELPER ONLY.
