@@ -56,22 +56,23 @@ function _kernel_factory_local_owned_seed(skel)
     intersect!(owned, Set{Symbol}(kernel_port_names(skel)))
 end
 
-# --- authoritative ownership closure -----------------------------------------
+# --- PROVISIONAL ownership heuristic (NOT authoritative; NOT for layout) ------
 #
-# The AUTHORITATIVE owned set = local seed ∪ call-induced writes, then closed over the
-# recipe dep graph (an output derived from an owned field is owned). SHARED authority is
-# the complement — valid ONLY after this closed resolution — unified by captured value
-# identity at construction. `_kernel_factory_local_owned_seed` alone is NOT authoritative
-# (it misses `copy!!(init,…)` / `step_f(fwd)` call effects). Downstream layout consumes
-# THIS, never the local seed.
-#
-# NOTE (opaque-reject, RK 2026-08-27): opaque UNRESOLVED self-mutations must reject rather
-# than be guessed shared. That rule needs one clarification before it can be enforced
-# soundly here — the shadowing gate ALLOWS `Base.fill!`, a qualified opaque self-mutation
-# on an owned buffer, so "reject any opaque self-write" is not blanket. Flagged to RK; the
-# reject predicate lands once the sanctioned-opaque category is pinned. For now the closure
-# is derived; construction (later) is where an unresolvable effect becomes unconstructable.
-function _kernel_factory_owned_closure(skel)
+# ⚠ RK review of 39d4751: this closure and `_kernel_factory_call_writes` are only a
+# PROVISIONAL SEED — they must NOT finalize a layout. They miss inter-procedural effects:
+# in the real fixture `step_f(ep)` occurs in `start!(ep,…)` where `ep` is a FORMAL, and the
+# physical `fwd`/`bwd` actuals reach it only through the sibling chain
+# `step! → finish!(__self__, fwd|bwd,…) → start!(__self__, ep,…) → step_f(ep)`. The
+# AUTHORITATIVE closure (a later increment, `_kernel_factory_owned_authoritative`) must:
+# (1) resolve sibling/subject call edges; (2) map callee formal/subject effect-roots BACK
+# through caller actual places (owned aliases / indexed child paths / branch arms); (3)
+# resolve a `_FieldCall` through the captured registration's DECLARED subject write-roots
+# (not treat every first arg as a whole-object write); (4) interpret `copy!!` as a
+# destination owned-closure copy, and admit an opaque call touching a self/subject place
+# ONLY when its captured identity has a detached primitive effect descriptor (else REJECT);
+# (5) iterate to a FIXED POINT before shared=complement/layout. This `*_seed` is a
+# heuristic ONLY — never a layout source.
+function _kernel_factory_owned_seed(skel)
     owned = union(_kernel_factory_direct_writes(skel), _kernel_factory_call_writes(skel))
     graph = kernel_graph(kernel_spec(skel))
     changed = true

@@ -90,12 +90,14 @@ end
         @test :s in RKS._kernel_factory_call_writes(callowner)
     end
 
-    @testset "authoritative ownership closure (supersedes local seed)" begin
-        oc = RKS._kernel_factory_owned_closure(callowner)
-        # `s` is owned via the copy!! call — the LOCAL seed MISSES it, the closure catches it
+    @testset "owned SEED heuristic (PROVISIONAL — not authoritative/layout)" begin
+        # direct-subject case only: `copy!!(s, y)` has `s` as a direct first-actual, so the
+        # seed catches it. This is a heuristic — the AUTHORITATIVE inter-procedural closure
+        # (call-graph/formal-to-actual fixed point) supersedes it and is required for the
+        # real fixture (fwd/bwd reach the integrator only through the sibling ep chain).
+        oc = RKS._kernel_factory_owned_seed(callowner)
         @test :s in oc.owned
         @test !(:s in RKS._kernel_factory_local_owned_seed(callowner))
-        # sources `x`/`y` (unwritten) are SHARED authority, valid only after closure
         @test :x in oc.shared && :y in oc.shared
         @test isempty(intersect(oc.owned, oc.shared))
         @test union(oc.owned, oc.shared) == Set(RKS.kernel_port_names(callowner))
