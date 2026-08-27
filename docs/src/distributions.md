@@ -24,13 +24,9 @@ checked against. It is an example/test/documentation dependency, never a
 dependency of the package runtime and never part of the compute path.
 
 `ReactiveKernels` **plans and computes** the density; it provides **no AD of its
-own** — no pullbacks. But the prepared kernel is an ordinary Julia function, so
-these examples *interface* with an external AD — `Enzyme` via
-`DifferentiationInterface` — to check the kernel is differentiable by a
-consumer's AD, giving the same gradient as the closed-form density written as a
-plain function. `Enzyme` and `DifferentiationInterface` are example/test
-dependencies (`[extras]`), **never core dependencies** of the package, and
-`Enzyme` never differentiates through `Distributions.jl`.
+own** — no pullbacks — and AD is orthogonal to it, so nothing here differentiates.
+Each kernel value is checked against the `Distributions.jl` oracle; that is the
+only role the library plays.
 
 Each panel is produced from one build-executed artifact. **Raw input** retains
 the literal compact source evaluated during this documentation build, alongside
@@ -46,9 +42,7 @@ A single recipe evaluates the Gaussian log density `-½log2π - logσ - ½z²` i
 closed form from `have = (x, μ, logσ)`. Because `logσ` is a given, the `-logσ`
 term uses it directly and `σ = exp(logσ)` is derived once, only for the
 standardized residual `z = (x - μ)/σ` — no `log(exp(logσ))` round trip. The
-scalar value is checked against `Distributions.logpdf`, and a reverse-mode
-`Enzyme` gradient of the prepared kernel over `(x, μ, logσ)` against the same
-closed-form density written as a plain function.
+scalar value is checked against `Distributions.logpdf`.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
@@ -60,8 +54,7 @@ Main.ReactiveKernelsDocs.execute_example(
 
 A single recipe selects between the two numerically stable outcome
 log-probabilities `-log1pexp(∓logit)` on the observed bit. The kernel value is
-checked against a `Bernoulli` reference, and a one-dimensional `Enzyme` gradient
-with respect to the continuous logit against the native closed form.
+checked against a `Bernoulli` reference.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
@@ -78,9 +71,7 @@ a third recipe sums the two terms. `compose` unifies the shared `coefficients`
 port across those separately-authored recipes so the planner sees one parameter
 feeding both densities — which is what `compose` is *for*, and why the scalar
 examples above, being single recipes, use none. The joint value is checked
-against direct `MvNormal` calls, and the gradient with respect to the shared
-coefficients — held constant against the design, observations, and scales via
-`DifferentiationInterface`'s `Constant` — against the native total.
+against direct `MvNormal` calls.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
