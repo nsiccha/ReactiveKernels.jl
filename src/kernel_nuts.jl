@@ -30,35 +30,51 @@ end
 # written mom BLESSED only after both succeed — so an lmul! throw leaves mom DIRTY, never stale-blessed
 # (the one-outer-epoch exception-safety shape of the pre-rebase transition composer, retargeted to the
 # _CanonOwned/Plan ABI). Rebind-checked captured callees; returns `(owned, shared, handles, rng) -> owned`.
+# A CONCRETE callable refresh (RK): NOT an RGF — the RGF call boundary (`j_generated_callfunc`) allocates. The
+# two captured primitive callables (`Random.randn!`, `LinearAlgebra.lmul!`) are singletons stored in
+# concretely-typed fields (no Function/Any field, no baked identity); the mom/chol slots + mom-dependent kill
+# set are type parameters. The @inline call method uses literal `Val` slots and a type-level kill tuple, so it
+# inlines and is exact 0-B, and Julia specializes it per runtime rng type (root stays RNG-independent).
+struct _CompiledRefresh{RandT, LmulT, MomSlot, CholSlot, Kills}
+    rand::RandT
+    lmul::LmulT
+end
+@generated function _refresh_killall!(owned, ::Val{M}, ::Val{Ks}) where {M, Ks}
+    Expr(:block, :(_canon_kill!(owned, Val($M))), (:(_canon_kill!(owned, Val($k))) for k in Ks)..., :(nothing))
+end
+@inline function (r::_CompiledRefresh{RandT, LmulT, MomSlot, CholSlot, Kills})(owned, shared, handles, rng) where {RandT, LmulT, MomSlot, CholSlot, Kills}
+    _refresh_killall!(owned, Val(MomSlot), Val(Kills))               # kill mom + dependents BEFORE the writes
+    r.rand(rng, _canon_slot(owned, Val(MomSlot)))                    # randn!(rng, mom)
+    r.lmul(getproperty(_canon_slot(shared, Val(CholSlot)), :L), _canon_slot(owned, Val(MomSlot)))  # lmul!(chol.L, mom)
+    _canon_bless!(owned, Val(MomSlot))                              # bless mom only after BOTH writes succeed
+    owned
+end
+# validate one refresh primitive statement (registered :primitive, not rebound) and resolve its singleton callee
+function _refresh_callable(st, i)
+    (st isa _ExprStmt && st.expr isa _RegisteredCall) || _l_reject("refresh statement $i must be a registered primitive write")
+    rc = st.expr
+    getfield(rc.registration, :kind) === :primitive || _l_reject("refresh statement $i is not a registered primitive ($(getfield(rc.registration,:kind)))")
+    resolved = _kernel_resolve_captured_ref(rc.ref)
+    kernel_rebound(rc.registration, resolved) && _l_reject("refresh statement $i authored slot was REBOUND after definition")
+    (rc, resolved)
+end
+_is_selffield(x, path) = x isa _SelfField && x.path == path
 function compile_refresh(pf, ::Type{OW}, ::Type{SH}, refresh_ir::MethodIR) where {OW,SH}
     plan = kernel_prepared_plan(pf); fc = _lf_canon_map(plan)
-    rng = gensym(:rng); stmts = Any[]
-    mom_c = fc[:mom]; deps = _lf_kill_closure(plan, mom_c)
-    _lf_mask!(stmts, plan, mom_c, :kill)                              # kill mom + dependents BEFORE the writes
-    for d in deps; _lf_mask!(stmts, plan, d, :kill); end
-    argexpr(a) = a isa _FormalRef ? rng :
-        a isa _SelfField ? (let e = _pp_read(plan, fc[a.path[1]]); for seg in a.path[2:end]; e = Expr(:., e, QuoteNode(seg)); end; e end) :
-        _l_reject("refresh arg unsupported: $(typeof(a))")
-    # EXACT statement validation (no silent skip): the refresh body is exactly two captured registered
-    # primitive writes then a final `return __self__`.
+    mom_c = fc[:mom]; chol_c = fc[:chol_metric]
+    mom_slot = kernel_plan_field(plan, mom_c)[2]; chol_slot = kernel_plan_field(plan, chol_c)[2]
+    kills = Tuple(sort!(unique(Int[kernel_plan_field(plan, d)[2] for d in _lf_kill_closure(plan, mom_c)])))
+    # EXACT authored shape (drives the concrete call method): [randn!(rng, self.mom), lmul!(self.chol_metric.L,
+    # self.mom), return __self__]. Any drift rejects rather than mis-emitting.
     b = refresh_ir.body
     (length(b) == 3 && b[3] isa _Return) || _l_reject("refresh_momentum!! must be exactly [randn!, lmul!, return]; got $(length(b)) statements")
-    for i in 1:2
-        (b[i] isa _ExprStmt && b[i].expr isa _RegisteredCall) || _l_reject("refresh statement $i must be a registered primitive write")
-        rc = b[i].expr
-        getfield(rc.registration, :kind) === :primitive || _l_reject("refresh statement $i is not a registered primitive ($(getfield(rc.registration,:kind)))")
-        # DETACHED authored-slot provenance (RK): emit the authored GlobalRef(module, field) — NOT the
-        # registration's source FUNCTION OBJECT (which the RGF would embed + call via a dynamic
-        # generated_callfunc, allocating). Rebind-check first; resolve the authored module slot with getglobal.
-        kernel_rebound(rc.registration, _kernel_resolve_captured_ref(rc.ref)) &&
-            _l_reject("refresh statement $i authored slot was REBOUND after definition")
-        ref = rc.ref
-        (ref.slot isa GlobalRef) || _l_reject("refresh callee slot is not an authored GlobalRef")
-        mod = getglobal(ref.slot.mod, ref.slot.name)          # e.g. getglobal(owner, :Random) -> Random
-        push!(stmts, Expr(:call, GlobalRef(mod, ref.field), (argexpr(a) for a in rc.args)...))
-    end
-    _lf_mask!(stmts, plan, mom_c, :bless)                            # bless mom only after both writes succeed
-    compile(:((owned, shared, handles, $rng) -> $(Expr(:block, stmts..., :(return owned)))))
+    (rc1, randfn) = _refresh_callable(b[1], 1)
+    (length(rc1.args) == 2 && rc1.args[1] isa _FormalRef && _is_selffield(rc1.args[2], (:mom,))) ||
+        _l_reject("refresh statement 1 must be `randn!(rng, self.mom)`; got args $(rc1.args)")
+    (rc2, lmulfn) = _refresh_callable(b[2], 2)
+    (length(rc2.args) == 2 && _is_selffield(rc2.args[1], (:chol_metric, :L)) && _is_selffield(rc2.args[2], (:mom,))) ||
+        _l_reject("refresh statement 2 must be `lmul!(self.chol_metric.L, self.mom)`; got args $(rc2.args)")
+    _CompiledRefresh{typeof(randfn), typeof(lmulfn), mom_slot, chol_slot, kills}(randfn, lmulfn)
 end
 
 # Consume + VALIDATE the authored public root MethodIR (nuts!!) and DERIVE its operation order (RK): the root
