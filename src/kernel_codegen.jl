@@ -71,12 +71,24 @@ end
 # non-aliasing Vector domain. Keep the original rhs untouched until the result has also been checked: any IEEE
 # edge (signed/ordinary zero, Inf/NaN, intermediate overflow/underflow), shape issue, or alias delegates to the
 # generic three-argument method, reproducing its value, exception, and mutation-prefix semantics exactly.
+@inline function _pp_vector_overlaps(a::Vector{ET}, b::Vector{ET}) where {ET}
+    (isempty(a) || isempty(b)) && return false
+    # `Base.mightalias` misses distinct `unsafe_wrap`ped Vectors whose contiguous ranges overlap but begin at
+    # different addresses.  The fast helper's ABI is exact builtin Vector{ET}, so a GC-preserved range check is
+    # authoritative.  Compare address differences rather than forming an end pointer, which could overflow.
+    GC.@preserve a b begin
+        pa = UInt(pointer(a)); pb = UInt(pointer(b)); bytes = UInt(sizeof(ET))
+        pa <= pb ? pb - pa < UInt(length(a)) * bytes : pa - pb < UInt(length(b)) * bytes
+    end
+end
+
 @inline function _pp_diag_cholesky_ldiv!(dest::Vector{ET},
         factor::LinearAlgebra.Cholesky{ET,BT}, rhs::Vector{ET}) where {
         ET<:Union{Float32,Float64},BT<:LinearAlgebra.Diagonal{ET,Vector{ET}}}
     factors = getfield(factor, :factors); diag = getfield(factors, :diag)
     (length(dest) == length(rhs) == length(diag) &&
-     !Base.mightalias(dest, rhs) && !Base.mightalias(dest, diag) && !Base.mightalias(rhs, diag)) ||
+     !_pp_vector_overlaps(dest, rhs) && !_pp_vector_overlaps(dest, diag) &&
+     !_pp_vector_overlaps(rhs, diag)) ||
         return ldiv!(dest, factor, rhs)
     @inbounds for i in eachindex(diag, rhs)
         d = diag[i]; x = rhs[i]

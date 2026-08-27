@@ -415,7 +415,10 @@ function _generic_diag_native_root(C)
     ne == 2 || error("generic oracle expected exactly two ensure ldiv replacements, got $ne")
     ensures = NamedTuple{names}(Tuple(ens))
     cfg = merge(C.cfg, (leaf=leaf, ensures=ensures))
-    R = Core.apply_type(RK._CompiledNutsRootNative, C.program, typeof(C.refresh), typeof(cfg), typeof(C.cfg.handles))
+    RT = typeof(C.root!)
+    R = Core.apply_type(RK._CompiledNutsRootNative, C.program,
+        RT.parameters[2], RT.parameters[3], RT.parameters[4], RT.parameters[5],
+        typeof(C.refresh), typeof(cfg), typeof(C.cfg.handles))
     (root=R(C.refresh,cfg,C.cfg.handles), replacements=nl+ne)
 end
 

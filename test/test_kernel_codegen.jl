@@ -238,6 +238,26 @@ end
                 b=T[1,2]; r=unsafe_wrap(Vector{T},pointer(b),length(b);own=false)
                 @assert r !== b && Base.mightalias(r,b)
                 (zeros(T,2),Cholesky(Diagonal(b),'U',0),r)
+            end,
+            # `Base.mightalias` misses partially overlapping unsafe-wrapped builtin Vectors when their start
+            # pointers differ.  Exercise each operand pair so the helper's raw contiguous-range guard is pinned.
+            () -> begin
+                b=T[1,2,3,4]; d=unsafe_wrap(Vector{T},pointer(b,2),3;own=false)
+                f=unsafe_wrap(Vector{T},pointer(b),3;own=false)
+                @assert !Base.mightalias(d,f) && RK._pp_vector_overlaps(d,f)
+                (d,Cholesky(Diagonal(f),'U',0),T[5,6,7])
+            end,
+            () -> begin
+                b=T[3,4,5,6]; d=unsafe_wrap(Vector{T},pointer(b,2),3;own=false)
+                r=unsafe_wrap(Vector{T},pointer(b),3;own=false)
+                @assert !Base.mightalias(d,r) && RK._pp_vector_overlaps(d,r)
+                (d,Cholesky(Diagonal(T[1,2,3]),'U',0),r)
+            end,
+            () -> begin
+                b=T[1,2,3,4]; r=unsafe_wrap(Vector{T},pointer(b,2),3;own=false)
+                f=unsafe_wrap(Vector{T},pointer(b),3;own=false)
+                @assert !Base.mightalias(r,f) && RK._pp_vector_overlaps(r,f)
+                (zeros(T,3),Cholesky(Diagonal(f),'U',0),r)
             end
         )
         for make in scenarios
