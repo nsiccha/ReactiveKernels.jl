@@ -380,6 +380,8 @@ _kernel_binder_target(f::PartialFunction) = getfield(f, :func)
 # PartialFunction's `stepsize` etc.; never duck-typed. Bound numeric values stay runtime-typed
 # (a same-type binder with stepsize .1 vs .2 must not alias a compiled constant).
 _kernel_binder_kwargs(f::PartialFunction) = getfield(f, :kwargs)
+# Bound POSITIONAL actuals (left/right) — the factory validates a subject callable binds none (RK 09:36).
+_kernel_binder_positionals(f::PartialFunction) = (getfield(f, :largs), getfield(f, :rargs))
 
 _finite_or_neginf(x) = isfinite(x) ? x : typeof(x)(-Inf)
 _min1exp(x) = x >= 0 ? one(x) : exp(x)

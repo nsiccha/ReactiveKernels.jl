@@ -354,6 +354,9 @@ _kernel_binder_target(::Any) = nothing
 # for `PartialFunction` (in hmc.jl, after that type is declared) — the lowerer retrieves bound
 # kwargs (e.g. `stepsize`) without duck-typing `.kwargs`. `nothing` = not an approved binder.
 _kernel_binder_kwargs(::Any) = nothing
+# The bound POSITIONAL actuals of a binder as `(left, right)` tuples (RK 09:36) — a subject callable must
+# bind NO positionals (poc would silently ignore them). Default: none; `PartialFunction` opts in (hmc.jl).
+_kernel_binder_positionals(::Any) = ((), ())
 
 # Resolve a callable to its registered `_KernelRegistration`, recursing ONLY through the
 # binder trait. `nothing` if it is not a registered kernel/intrinsic (or approved binder).
@@ -1628,33 +1631,64 @@ prepared_callable_subject(c::_PreparedCallable) = c.registration.subject
 prepared_callable_write_roots(c::_PreparedCallable) = c.registration.write_roots
 prepared_callable_read_roots(c::_PreparedCallable) = c.registration.read_roots
 prepared_callable_source(c::_PreparedCallable) = c.registration.source
-# The REQUIRED (no-default) keyword names of a registered callable's captured signature — so a construction
-# can reject a missing required kwarg (RK 09:27) rather than defer it to codegen. Only a Mode-2 free method
-# carries a kwarg signature here; anything else has none.
-function _kernel_required_kwargs(source)
-    source isa _Mode2KernelSkeleton || return ()
+# The accepted keyword contract of a registered callable's captured signature: `(required names, ALL
+# accepted names, has-kwsplat)`. Typed (`stepsize::T`) and optional (`= default`) formals are recognized
+# via the formal-name parser — NOT only bare `Symbol` (RK 09:36). Only a Mode-2 free method carries one.
+function _kernel_signature_kwargs(source)
+    source isa _Mode2KernelSkeleton || return (Symbol[], Symbol[], false)
     sig = _kernel_thaw_ast(getfield(source, :method).signature)
     call = _kernel_peel_signature(sig)
-    (call isa Expr && call.head === :call) || return ()
-    req = Symbol[]
+    (call isa Expr && call.head === :call) || return (Symbol[], Symbol[], false)
+    req = Symbol[]; allkw = Symbol[]; kwsplat = false
     for a in call.args
         (a isa Expr && a.head === :parameters) || continue
         for p in a.args
-            p isa Symbol && push!(req, p)                # a BARE kwarg = required (no default)
+            if p isa Expr && p.head === :...
+                kwsplat = true
+            else
+                nm = _kernel_formal_base_name(p)
+                nm === nothing && continue
+                push!(allkw, nm)
+                (p isa Expr && p.head === :kw) || push!(req, nm)   # `:kw` (=default) is optional; else required
+            end
         end
     end
-    Tuple(req)
+    (req, allkw, kwsplat)
+end
+# Validate the ENTIRE approved binder contract of a callable field vs its captured signature (RK 09:36):
+# ZERO bound POSITIONAL actuals (a subject callable binds only keywords — poc would silently drop
+# positionals), every REQUIRED keyword bound, and NO extra keyword the signature does not accept (unless it
+# declares `; kwargs...`). A `partial(...)` wrapper can therefore never silently reduce to target semantics.
+function _validate_binder!(name::Symbol, v, source)
+    # REJECT a NESTED binder (RK 09:38): the binder's IMMEDIATE target must be the registered kernel, not
+    # another binder — registration resolution recurses through the target, so an inner binder's bound
+    # actuals (kwargs/positionals) would be silently dropped from the prepared record.
+    tgt = _kernel_binder_target(v)
+    (tgt !== nothing && _kernel_binder_target(tgt) !== nothing) && throw(_KernelFactoryReject(
+        "callable `$name` is a NESTED binder (a `partial` of a `partial`) — its immediate target must be " *
+        "the registered kernel; a nested binder's bound actuals would be silently dropped"))
+    left, right = _kernel_binder_positionals(v)
+    (isempty(left) && isempty(right)) || throw(_KernelFactoryReject(
+        "callable `$name` binds $(length(left) + length(right)) POSITIONAL actual(s) — a subject callable " *
+        "must bind NO positionals (poc would silently ignore them); bind only keywords"))
+    req, allkw, kwsplat = _kernel_signature_kwargs(source)
+    kw = _kernel_binder_kwargs(v)
+    bound = kw === nothing ? Symbol[] : collect(keys(kw))
+    for r in req
+        r in bound || throw(_KernelFactoryReject(
+            "callable `$name` is missing the REQUIRED keyword `$r` — bind it with `partial(...; $r = …)`; " *
+            "a missing required kwarg must not be deferred to codegen"))
+    end
+    kwsplat || for b in bound
+        b in allkw || throw(_KernelFactoryReject(
+            "callable `$name` binds keyword `$b` not accepted by its authored signature (no `; kwargs...`)"))
+    end
+    nothing
 end
 function _prepare_callable(name::Symbol, v)
     reg = _kernel_resolve_callable_or_reject(name, v)   # rejects opaque; the resolved registration is the
-    kw = _kernel_binder_kwargs(v)                        #   detached identity poc consumes (no reread)
-    bound = kw === nothing ? () : keys(kw)
-    for r in _kernel_required_kwargs(reg.source)        # validate bound kwargs vs the captured signature
-        r in bound || throw(_KernelFactoryReject(
-            "callable `$name` is missing the REQUIRED keyword `$r` — bind it with `partial(...; $r = …)` " *
-            "at construction; a missing required kwarg must not be deferred to codegen"))
-    end
-    _PreparedCallable(reg, kw)
+    _validate_binder!(name, v, reg.source)               #   detached identity poc consumes (no reread)
+    _PreparedCallable(reg, _kernel_binder_kwargs(v))
 end
 
 # The stats binding holds the captured `_KernelRegistration` (RK 09:25), not the raw stats_f, plus the
@@ -1676,6 +1710,7 @@ function _stats_binding(stats_f)
     reg === nothing && throw(_KernelFactoryReject(
         "stats_f = $(typeof(stats_f)) is opaque/unregistered — the diagnostics callback must be a " *
         "registered @kernel, not an opaque runtime callable"))
+    _validate_binder!(:stats_f, stats_f, reg.source)   # a partial wrapper cannot silently reduce semantics
     slots = Int[]
     for r in reg.write_roots
         s = _diagnostic_slot_of(r)

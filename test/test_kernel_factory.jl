@@ -146,6 +146,10 @@ end
     state.foo = state.foo + 1
     return state
 end
+# a step integrator with a TYPED required keyword (stepsize::Float64) — the parser must recognize it
+@kernel typedstep!(phasepoint; stepsize::Float64) = begin
+    @. phasepoint.pos += stepsize * phasepoint.dham_dpos
+end
 # a COUNTING in-place gradient — proves 'zero extra pgrad' non-vacuously (count stays 1 across child seeds)
 mutable struct CountingPgrad; n::Int; end
 (c::CountingPgrad)(dest, pos) = (c.n += 1; dest .= 2 .* pos; sum(abs2, pos))
@@ -1410,6 +1414,31 @@ end
         @test_throws RKS._KernelFactoryReject RKS._stats_binding(sin)
         # an UNMAPPABLE write-root REJECTS (no silent filter — never understate effects)
         @test_throws RKS._KernelFactoryReject RKS._stats_binding(badstats!)
+        # the SAME complete binder validation applies to stats_f — a partial wrapper cannot silently reduce
+        @test_throws RKS._KernelFactoryReject RKS._stats_binding(RKS.partial(synstats!, 42))   # bound positional
+        @test_throws RKS._KernelFactoryReject RKS._stats_binding(RKS.partial(synstats!; bogus = 1))  # extra kw
+    end
+
+    @testset "nuts_state — COMPLETE binder-contract validation for prepared callables (RK 09:36)" begin
+        pc(v) = RKS._prepare_callable(:step_f, v)
+        # a valid partial: registration captured + bound kwargs recorded
+        ok = pc(RKS.partial(leapfrog_ep!; stepsize = 0.1))
+        @test RKS.prepared_callable_registration(ok) === RKS.kernel_registration(leapfrog_ep!)
+        @test RKS.prepared_callable_kwargs(ok) == (; stepsize = 0.1)
+        # a TYPED required keyword (stepsize::Float64) is RECOGNIZED via the formal parser (not only Symbol)
+        @test RKS.prepared_callable_kwargs(pc(RKS.partial(typedstep!; stepsize = 0.1))) == (; stepsize = 0.1)
+        @test_throws RKS._KernelFactoryReject pc(typedstep!)                    # bare: missing typed stepsize
+        # missing required kw / extra kw / bound positional all REJECT
+        @test_throws RKS._KernelFactoryReject pc(leapfrog_ep!)                  # missing required stepsize
+        @test_throws RKS._KernelFactoryReject pc(RKS.partial(leapfrog_ep!; stepsize = 0.1, bogus = 1))  # extra kw
+        @test_throws RKS._KernelFactoryReject pc(RKS.partial(leapfrog_ep!, 42; stepsize = 0.1))          # positional (largs)
+        @test_throws RKS._KernelFactoryReject pc(RKS.partial(leapfrog_ep!, :, 42; stepsize = 0.1))       # positional (rargs)
+        # a NESTED binder (partial of a partial) REJECTS — inner actuals would be silently dropped (RK 09:38).
+        # The OUTER binding is otherwise VALID (stepsize accepted, no positional/extra kw), so ONLY the
+        # nested-binder guard makes it reject — non-vacuous (RK 09:41)
+        @test_throws RKS._KernelFactoryReject pc(RKS.partial(RKS.partial(leapfrog_ep!; stepsize = 0.1); stepsize = 0.2))
+        # an opaque callable rejects
+        @test_throws Union{RKS._KernelFactoryReject,ArgumentError} pc(sin)
     end
 
     @testset "nuts_state — MIXED endpoints+vectors+scalars frame: scalar 0-B, buffers direct, F32/F64 (RK 08:47/08:51)" begin
