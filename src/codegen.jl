@@ -94,6 +94,114 @@ function lower(p::Plan)
 end
 
 """
+    lower_batched(p::Plan; batched, reduce = :+) -> Expr
+
+Lower a plan to a batched, **loop-invariant-hoisting** kernel. The `batched` HAVE
+ports are arrays iterated element-wise; every recipe that does NOT (transitively)
+depend on a batched value is emitted ONCE above the loop (the hoist), and only
+the batch-dependent recipes run per element, their single scalar `want`
+accumulated by `reduce` (default `:+`, i.e. a sum). This is how a vectorized log
+density avoids recomputing shared work: e.g. `σ = exp(logσ)` / `log(σ)` is
+computed once, not per observation. The generated function has the same
+`(__ops__, have...)` signature as [`lower`](@ref) — batched ports passed as
+arrays, shared ports as scalars — and the whole batch is one straight-line pass
+that materializes no per-element vector.
+
+Restricted (this lowering) to single-output recipes and a single scalar `want`
+that is itself batched (the per-element density). `reduce` is spliced as a bare
+callee, so use a `Base` reducer symbol (`:+`).
+"""
+function lower_batched(p::Plan; batched, reduce = :+)
+    g = p.graph
+    length(p.want) == 1 || throw(ArgumentError(
+        "lower_batched requires a single scalar want; got $(length(p.want))"))
+    for r in p.recipes
+        length(r.outputs) == 1 || throw(ArgumentError(
+            "lower_batched requires single-output recipes; recipe $(r.id) has $(length(r.outputs)) outputs"))
+    end
+    batched_names = Set{Symbol}(batched isa Symbol ? (batched,) : batched)
+    names = _varnames(p)
+    nm(v) = names[canon_id(g, v.id)]
+
+    # Canonical ids of the batched HAVE ports — the arrays we index per element.
+    batched_input_ids = Set{Int}()
+    iter_port = nothing
+    for v in p.have
+        if v.name in batched_names
+            push!(batched_input_ids, canon_id(g, v.id))
+            iter_port === nothing && (iter_port = v)
+        end
+    end
+    iter_port === nothing && throw(ArgumentError(
+        "lower_batched: none of the have ports are batched (batched = $(sort(collect(batched_names))))"))
+
+    # Propagate batch-dependency over produced values in execution (topological)
+    # order: a value is batched iff its producing recipe consumes a batched value.
+    batched_vals = Set{Int}(batched_input_ids)
+    recipe_is_batched = falses(length(p.recipes))
+    for (k, r) in enumerate(p.recipes)
+        b = any(canon_id(g, inp.id) in batched_vals for inp in r.inputs)
+        recipe_is_batched[k] = b
+        b && for o in r.outputs
+            push!(batched_vals, canon_id(g, o.id))
+        end
+    end
+
+    want = only(p.want)
+    canon_id(g, want.id) in batched_vals || throw(ArgumentError(
+        "lower_batched: want :$(want.name) is loop-invariant (does not depend on a batched port); nothing to vectorize"))
+
+    idx = gensym(:i)
+    # A batched HAVE port is indexed by the loop var; everything else (an
+    # invariant value computed once, or a batched intermediate that is loop-local)
+    # is referenced by name.
+    argref(inp) = canon_id(g, inp.id) in batched_input_ids ?
+                  Expr(:ref, nm(inp), idx) : nm(inp)
+    callexpr(k, r) = Expr(:call, Expr(:ref, _OPS_ARG, k),
+                          (argref(inp) for inp in r.inputs)...)
+
+    argexprs = Any[_OPS_ARG]
+    for v in p.have
+        # A batched port arrives as an array, so it is left unannotated (Julia
+        # still specializes on the concrete array type); shared ports keep their
+        # declared scalar type.
+        push!(argexprs, canon_id(g, v.id) in batched_input_ids ?
+              nm(v) : :($(nm(v))::$(valtype(v))))
+    end
+
+    body = Expr(:block)
+    assigned = Set(canon_id(g, v.id) for v in p.have)
+    # Invariant recipes: emit ONCE, above the loop. This is the hoist.
+    for (k, r) in enumerate(p.recipes)
+        recipe_is_batched[k] && continue
+        out = only(r.outputs)
+        cid = canon_id(g, out.id)
+        cid in assigned && continue
+        push!(assigned, cid)
+        push!(body.args, Expr(:(=), nm(out), callexpr(k, r)))
+    end
+
+    acc = gensym(:acc)
+    push!(body.args, :($acc = zero($(valtype(want)))))
+
+    # The fused per-element loop: batched recipes only, the want accumulated.
+    loopbody = Expr(:block)
+    loop_assigned = copy(assigned)
+    for (k, r) in enumerate(p.recipes)
+        recipe_is_batched[k] || continue
+        out = only(r.outputs)
+        cid = canon_id(g, out.id)
+        cid in loop_assigned && continue
+        push!(loop_assigned, cid)
+        push!(loopbody.args, Expr(:(=), nm(out), callexpr(k, r)))
+    end
+    push!(loopbody.args, :($acc = $reduce($acc, $(nm(want)))))
+    push!(body.args, Expr(:for, :($idx = eachindex($(nm(iter_port)))), loopbody))
+    push!(body.args, Expr(:return, acc))
+    Expr(:function, Expr(:tuple, argexprs...), body)
+end
+
+"""
     transform(ast, passes...) -> Expr
 
 Apply zero or more AST passes (each an `Expr -> Expr` function) in order. This

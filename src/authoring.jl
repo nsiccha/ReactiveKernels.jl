@@ -1289,6 +1289,27 @@ function prepare_nonallocating(spec::KernelSpec;
     _kernel_signature_callable(prepared, spec.call_signature)
 end
 
+"""
+    plate(spec::KernelSpec; have, want, batched, reduce = :+) -> PreparedKernel
+
+Prepare a batched, loop-invariant-hoisting kernel from a scalar `@kernel` spec.
+The `batched` HAVE ports (a name or a collection of names) are passed as arrays
+and iterated element-wise; every recipe that depends only on the shared (scalar)
+ports is computed ONCE, hoisted above the loop; and the single scalar `want` is
+reduced over the batch (default a sum). This is how ReactiveKernels generates a
+Stan-parity vectorized log density that does no repeated work — e.g. `σ =
+exp(logσ)` / `log(σ)` is computed once, not per observation — in one fused pass
+that materializes no per-element vector. See [`lower_batched`](@ref).
+
+The scalar `spec` is authored per-element (one observation); `plate` is what
+turns it into the vectorized kernel. Restricted to single-output recipes and a
+single scalar `want` that itself depends on a batched port.
+"""
+function plate(spec::KernelSpec; have, want, batched, reduce = :+)
+    p = plan(spec; have = have, want = want)
+    _prepare(p, lower_batched(p; batched = batched, reduce = reduce))
+end
+
 inputs(spec::KernelSpec) = _kernel_selection(
     spec, _KERNEL_DEFAULT_BOUNDARY, spec.have_names, :have)
 outputs(spec::KernelSpec) = _kernel_selection(
