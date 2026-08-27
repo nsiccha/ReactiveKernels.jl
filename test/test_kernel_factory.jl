@@ -616,6 +616,45 @@ end
         rd = RKS._kernel_primitive_effect(Random.rand)
         @test rd.kind === :rng && rd.rng_arg == 1 && rd.writes == () && rd.reads == (1, 2)
     end
+
+    @testset "REAL nuts_state authoritative ownership (benchmark fixture, RK pt 5/7)" begin
+        # Eval the APPROVED benchmark/nuts_kernel_authoring_fixture.jl into an isolated module
+        # (selective import dodges the exported-name collision), declaring its HOT HELPERS via the
+        # PUBLIC effect macros BEFORE nuts_state is captured — no fixture source change, no body
+        # inference. This is the real end-to-end authoritative-ownership gate.
+        RN = Module(:RealNuts)
+        Core.eval(RN, :(using ReactiveKernels: @kernel, @node, partial, copy!!,
+                                               @rk_pure, @rk_borrows, @rk_rng))
+        Core.eval(RN, :(using LinearAlgebra, LogExpFunctions, Random))
+        fixsrc = read("/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-syntax/" *
+                      "benchmark/nuts_kernel_authoring_fixture.jl", String)
+        stmts = filter(s -> !(s isa LineNumberNode), Meta.parseall(fixsrc).args)
+        isnuts(st) = st isa Expr && st.head === :macrocall && st.args[1] === Symbol("@kernel") &&
+            (eq = st.args[end]; eq isa Expr && eq.head === :(=) && eq.args[1] isa Expr &&
+             eq.args[1].head === :call && eq.args[1].args[1] === :nuts_state)
+        decls = [:(@rk_pure finiteorneginf 1), :(@rk_borrows badd 2), :(@rk_rng randbernoullilog 2 1),
+                 :(@rk_pure logswapprob 1), :(@rk_pure compute_criterion 3), :(@rk_pure smooth 3)]
+        done = Ref(false)
+        for st in stmts
+            (st isa Expr && st.head === :using) && continue
+            if !done[] && isnuts(st)
+                for d in decls; Core.eval(RN, d); end
+                done[] = true
+            end
+            Core.eval(RN, st)
+        end
+        ns = RN.nuts_state
+        fr = Dict(:step_f => RKS.kernel_registration(RN.leapfrog!), :stats_f => nothing)
+        owned = RKS._kernel_factory_owned_authoritative(ns; field_regs = fr)
+        shared = RKS._kernel_factory_shared(ns; field_regs = fr)
+        # EXACT top-level owned set: init/fwd/bwd endpoints + trees/proposals + control flags
+        @test owned == Set((:init, :fwd, :bwd, :trees, :proposals,
+                            :gofwd, :may_sample, :may_continue, :dham, :diverged))
+        # SHARED: the callable field + scalar params (no unresolved field)
+        @test shared == Set((:step_f, :max_depth, :min_dham, :stats_f))
+        @test isempty(intersect(owned, shared))
+        @test union(owned, shared) == Set{Symbol}(RKS.kernel_port_names(ns))
+    end
 end
 
 end # module TestKernelFactory
