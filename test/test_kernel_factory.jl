@@ -15,6 +15,11 @@ const RKS = ReactiveKernels
     end
 end
 
+# a registered free integrator, for callable-field/partial resolution.
+@kernel leapfrog!(phasepoint; stepsize) = begin
+    @. phasepoint.mom -= stepsize * phasepoint.grad
+end
+
 @testset "Inc3 factory substrate" begin
     @testset "LOCAL owned seed (not authoritative)" begin
         # the direct-write seed is exactly the mutated field
@@ -41,6 +46,20 @@ end
         @test RKS._owner_slot(s, Val(1)) === 10
         # a different-typed tuple does not match the typed commit (layout stability)
         @test_throws MethodError RKS._owner_commit!(s, ("x", 1, 2))
+    end
+
+    @testset "callable field / partial resolution (toward gate 4)" begin
+        # `partial(leapfrog!; stepsize)` resolves to leapfrog!'s registered Token (binder
+        # is token-preserving).
+        reg = RKS._kernel_resolve_callable(partial(leapfrog!; stepsize = 0.1))
+        @test reg !== nothing && reg.token === RKS.kernel_token(leapfrog!)
+        # a bare registered kernel resolves directly
+        @test RKS._kernel_resolve_callable(leapfrog!).token === RKS.kernel_token(leapfrog!)
+        # an opaque Julia callable does NOT resolve → REJECT
+        @test RKS._kernel_resolve_callable(sin) === nothing
+        @test_throws ArgumentError RKS._kernel_resolve_callable_or_reject(:step_f, sin)
+        # a partial binding a NON-kernel rejects too
+        @test_throws ArgumentError RKS._kernel_resolve_callable_or_reject(:step_f, partial(sin; a = 1))
     end
 end
 

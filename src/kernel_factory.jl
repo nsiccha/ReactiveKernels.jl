@@ -79,3 +79,28 @@ owner_slots(s::_OwnerState) = getfield(s, :slots)
 # signature enforces layout/type stability — a different-typed tuple does not match.
 @inline _owner_commit!(s::_OwnerState{Token,T}, slots::T) where {Token,T} =
     (setfield!(s, :slots, slots); s)
+
+# --- callable field / partial resolution (RK callable-Token redirect) --------
+#
+# A callable FIELD (`step_f`, `stats_f`) must resolve to a REGISTERED kernel/intrinsic
+# TOKEN identity, or be REJECTED — never an opaque runtime callable. A `partial(kernel;…)`
+# is a static TOKEN-PRESERVING binder that wraps its target in a `func` slot; unwrap it
+# generically (independent of the binder's concrete type / include order) and resolve the
+# target's registration. Returns the `_KernelRegistration` (Token/effects) or `nothing`.
+function _kernel_resolve_callable(v)
+    reg = kernel_registration(v)
+    reg === nothing || return reg
+    (v isa Function && hasfield(typeof(v), :func)) &&
+        return _kernel_resolve_callable(getfield(v, :func))
+    nothing
+end
+
+# Resolve a callable field to its registered Token, or REJECT actionably.
+function _kernel_resolve_callable_or_reject(name::Symbol, v)
+    reg = _kernel_resolve_callable(v)
+    reg === nothing && throw(ArgumentError(
+        "callable field `$name` = $(typeof(v)) does not resolve to a registered @kernel/" *
+        "intrinsic Token identity; a factory-time callable field must be a registered kernel " *
+        "(or a `partial(...)` binder of one), never an opaque Julia callable."))
+    reg
+end
