@@ -376,6 +376,10 @@ partial(f, left, ::Colon, args...; kwargs...) =
 # binder trait (declared default-nothing in kernel_factory.jl) by exposing its wrapped
 # target. This is the ONLY sanctioned extension — the factory never duck-types `.func`.
 _kernel_binder_target(f::PartialFunction) = getfield(f, :func)
+# The bound keywords of the binder (RK 04:41) — the ONLY sanctioned way the lowerer reads a
+# PartialFunction's `stepsize` etc.; never duck-typed. Bound numeric values stay runtime-typed
+# (a same-type binder with stepsize .1 vs .2 must not alias a compiled constant).
+_kernel_binder_kwargs(f::PartialFunction) = getfield(f, :kwargs)
 
 _finite_or_neginf(x) = isfinite(x) ? x : typeof(x)(-Inf)
 _min1exp(x) = x >= 0 ? one(x) : exp(x)

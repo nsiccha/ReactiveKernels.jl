@@ -655,6 +655,50 @@ end
         @test isempty(intersect(owned, shared))
         @test union(owned, shared) == Set{Symbol}(RKS.kernel_port_names(ns))
     end
+
+    @testset "concrete no-Ref construction: isolation, independent masks, F32/F64 (step 5)" begin
+        for T in (Float32, Float64)
+            buf = T[1, 2, 3]
+            a = RKS._kernel_construct_owned(Val(:ep), (T(0), buf))
+            b = RKS._kernel_construct_owned(Val(:ep), (T(0), buf))
+            # OWNED buffers isolated: two instances never alias, neither aliases the caller input
+            @test RKS._owner_slot(a, Val(2)) !== RKS._owner_slot(b, Val(2))
+            @test RKS._owner_slot(a, Val(2)) !== buf
+            @test RKS._owner_slot(a, Val(2)) == buf               # value-equal (deepcopy)
+            # F32/F64 PRESERVED; NO Ref / widening / Any
+            @test eltype(RKS._owner_slot(a, Val(2))) === T && RKS._owner_slot(a, Val(1)) isa T
+            @test fieldtypes(typeof(RKS.owner_slots(a))) == (T, Vector{T})
+            @test !any(t -> t <: Ref, fieldtypes(typeof(RKS.owner_slots(a))))
+            # INDEPENDENT currentness masks per instance (init/fwd/bwd carry their own)
+            @test RKS._owner_current(a, Val(1)) && RKS._owner_current(b, Val(1))
+            RKS._owner_kill!(a, Val(1))
+            @test !RKS._owner_current(a, Val(1)) && RKS._owner_current(b, Val(1))
+            RKS._owner_bless!(a, Val(1))
+            @test RKS._owner_current(a, Val(1))
+            # copy!! currentness transfer: dest inherits src's mask
+            RKS._owner_kill!(b, Val(2))
+            RKS._owner_copy_current!(a, b)
+            @test !RKS._owner_current(a, Val(2))
+            # mask ops are ALLOCATION-FREE (0-B) after warmup
+            @test (@allocated RKS._owner_kill!(a, Val(1))) == 0
+            @test (@allocated RKS._owner_current(a, Val(2))) == 0
+        end
+    end
+
+    @testset "poc binder/plan seam accessors (RK 04:41)" begin
+        integ = RKS.kernel_registration(leapfrog_ep!)
+        plan = RKS._kernel_factory_endpoint_plan(phasepoint_ep, integ)
+        # the integrator/owner Token via a dedicated accessor (no key-tuple destructuring by codegen)
+        @test RKS.kernel_plan_token(plan) === integ.token
+        # binder-kwargs trait: extended ONLY for PartialFunction, retrieves bound kwargs
+        pf = partial(leapfrog!; stepsize = 0.1)
+        @test RKS._kernel_binder_kwargs(pf) == (; stepsize = 0.1)
+        @test RKS._kernel_binder_target(pf) === leapfrog!
+        @test RKS._kernel_binder_kwargs(sin) === nothing               # not a binder
+        @test RKS._kernel_binder_kwargs(EvilWrap(leapfrog!)) === nothing   # no duck-typing
+        # bound numeric stepsize stays runtime-typed: .1 vs .2 are the same PartialFunction TYPE
+        @test typeof(partial(leapfrog!; stepsize = 0.1)) === typeof(partial(leapfrog!; stepsize = 0.2))
+    end
 end
 
 end # module TestKernelFactory

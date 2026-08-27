@@ -145,8 +145,13 @@ end
 # order in `T`) is fixed by the plan AFTER the transitive effect closure.
 mutable struct _OwnerState{Token,T<:Tuple}
     slots::T
+    current::UInt      # allocation-free currentness BITMASK over the physical owned slots (RK
+                       #   04:39): bit (I-1) set ⇔ slot I is current. copy!! transfers it, a write
+                       #   KILLS selected dependents, a root commit BLESSES the produced trace.
+                       #   Per-instance (init/fwd/bwd carry INDEPENDENT masks). NOT a Dict/Set/Ref.
 end
-_OwnerState{Token}(slots::T) where {Token,T<:Tuple} = _OwnerState{Token,T}(slots)
+_OwnerState{Token}(slots::T, current::UInt = ~UInt(0)) where {Token,T<:Tuple} =
+    _OwnerState{Token,T}(slots, current)
 
 owner_token(::_OwnerState{Token}) where {Token} = Token
 owner_slots(s::_OwnerState) = getfield(s, :slots)
@@ -158,6 +163,17 @@ owner_slots(s::_OwnerState) = getfield(s, :slots)
 # signature enforces layout/type stability — a different-typed tuple does not match.
 @inline _owner_commit!(s::_OwnerState{Token,T}, slots::T) where {Token,T} =
     (setfield!(s, :slots, slots); s)
+
+# Currentness mask accessors — constant bit ops, allocation-free (Val-indexed physical slot).
+@inline _owner_current(s::_OwnerState, ::Val{I}) where {I} = (s.current >> (I - 1)) & UInt(1) == UInt(1)
+@inline _owner_kill!(s::_OwnerState, ::Val{I}) where {I} =                   # a write kills a slot
+    (setfield!(s, :current, s.current & ~(UInt(1) << (I - 1))); s)
+@inline _owner_bless!(s::_OwnerState, ::Val{I}) where {I} =                  # a producer blesses it
+    (setfield!(s, :current, s.current | (UInt(1) << (I - 1))); s)
+owner_current_mask(s::_OwnerState) = getfield(s, :current)
+# copy!! transfers currentness: the destination inherits the source's mask (RK 03:44/04:39).
+@inline _owner_copy_current!(dest::_OwnerState, src::_OwnerState) =
+    (setfield!(dest, :current, getfield(src, :current)); dest)
 
 # --- callable field / partial resolution (RK callable-Token redirect) --------
 #
@@ -172,6 +188,11 @@ owner_slots(s::_OwnerState) = getfield(s, :slots)
 # genuine Token through different call semantics, violating the explicit-registration
 # compiler boundary.
 _kernel_binder_target(::Any) = nothing
+
+# Parallel binder trait (RK 04:41): the BOUND KEYWORDS of a token-preserving binder, extended ONLY
+# for `PartialFunction` (in hmc.jl, after that type is declared) — the lowerer retrieves bound
+# kwargs (e.g. `stepsize`) without duck-typing `.kwargs`. `nothing` = not an approved binder.
+_kernel_binder_kwargs(::Any) = nothing
 
 # Resolve a callable to its registered `_KernelRegistration`, recursing ONLY through the
 # binder trait. `nothing` if it is not a registered kernel/intrinsic (or approved binder).
@@ -756,6 +777,9 @@ end
 _KernelPlan(key, slots::S, groups::A, producer::P, recipes::R, ec::E) where {S,A,P,R,E} =
     _KernelPlan{key,S,A,P,R,E}(slots, groups, producer, recipes, ec)
 kernel_plan_key(::_KernelPlan{Key}) where {Key} = Key
+# The integrator/owner definition Token (RK 04:41): poc proves `binder target Token == plan
+# integrator Token` through THIS accessor, never by destructuring the key tuple internals.
+kernel_plan_token(::_KernelPlan{Key}) where {Key} = Key[1]
 kernel_plan_slots(p::_KernelPlan) = p.slots
 kernel_plan_alias_groups(p::_KernelPlan) = p.alias_groups
 kernel_plan_producer(p::_KernelPlan) = p.producer
@@ -846,3 +870,14 @@ _kernel_factory_endpoint_plan(skel, integrator::_KernelRegistration) =
     _kernel_factory_plan(skel, _kernel_factory_endpoint_owned(skel, integrator),
                          _kernel_factory_endpoint_shared(skel, integrator);
                          key_token = integrator.token)
+
+# --- concrete per-instance CONSTRUCTION (isolation + shared identity, no-Ref) ---------------
+#
+# Build an isolated owner instance from the physical OWNED slot values: each is DEEP-COPIED so two
+# constructions never alias (endpoint isolation — init/fwd/bwd are pairwise-distinct owned buffers)
+# and neither aliases the caller's input; concrete types are PRESERVED (F32/F64, no widening/box/
+# Any); the currentness mask starts all-current. SHARED authority is referenced BY IDENTITY (the
+# caller threads the one shared tuple; it is never copied). No per-instance planning — the layout
+# and mask width come from the immutable plan (`Token` phantom-types the owner definition).
+@inline _kernel_construct_owned(::Val{Token}, owned_values::Tuple) where {Token} =
+    _OwnerState{Token}(map(deepcopy, owned_values))
