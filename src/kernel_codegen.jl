@@ -13,6 +13,14 @@ using LinearAlgebra: ldiv!
 
 
 # The ordered subject `_PlaceWrite`s of a straight-line method body (same filter/order as `_l_write_steps`).
+# DETERMINISTIC hot-emitter locals (RK): `gensym` uses a GLOBAL counter, so two compiles of the SAME immutable
+# Plan+MethodIR+config types produce RGF expressions with DIFFERENT local names -> different RGF TYPES ->
+# unstable prepared-sampler type identity + compile churn. `_dsym` draws from a PER-COMPILATION counter Ref
+# (created fresh at each top-level emitter entry and threaded through the emit context — NEVER a mutable global,
+# so nested/concurrent compiles do not race); since the emit order is a deterministic function of the inputs,
+# identical inputs yield byte-identical Exprs (and identical RGF types). Not a persistent cache.
+_dsym(ctr::Base.RefValue{Int}, p) = Symbol("__e_", p, "_", (ctr[] += 1))
+
 function _exec_place_writes(ir::MethodIR)
     ws = _PlaceWrite[]
     for s in ir.body
@@ -377,7 +385,7 @@ function compile_leapfrog(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, leaf_ir:
     producer = Dict{Int,Int}(c => r for (c, r) in kernel_plan_producer(plan))
     recs = kernel_plan_recipes(plan)
     hidx = Dict{Int,Tuple{Any,Int}}(recs[i] => (hs[i], i) for i in eachindex(hs))
-    stepkw = gensym(:stepkw)
+    stepkw = :__lf_stepkw
     stmts = Any[]
     # NO all-current seed (RK 09:08): entry validity of every plan-produced value is UNKNOWN in this
     # invocation. `current` = canons made current HERE (by a produce/write); `stale` = canons killed HERE.

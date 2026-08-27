@@ -92,8 +92,15 @@ function compile_refresh(pf, ::Type{OW}, ::Type{SH}, refresh_ir::MethodIR) where
     (length(rc2.args) == 2 && _is_selffield(rc2.args[1], (:chol_metric, :L)) && _is_selffield(rc2.args[2], (:mom,)) && isempty(rc2.kw) && !rc2.broadcast) ||
         _l_reject("refresh statement 2 must be `lmul!(self.chol_metric.L, self.mom)` (no kw/broadcast); got args $(rc2.args)")
     # the chol slot must hold a sanctioned Cholesky (its L-view is the momentum-refresh factor)
-    (fieldtype(SH, chol_slot) <: LinearAlgebra.Cholesky) ||
-        _l_reject("refresh: chol_metric slot is not a Cholesky ($(fieldtype(SH, chol_slot)))")
+    cholT = fieldtype(SH, chol_slot)
+    (cholT <: LinearAlgebra.Cholesky) || _l_reject("refresh: chol_metric slot is not a Cholesky ($cholT)")
+    # NOTE (reported to RK): a per-callee CONCRETE-DOMAIN gate on the emitted lmul factor is BLOCKED by a
+    # conflict — `cholesky(dense)` defaults to uplo='U', so the 0-B lazy lower-factor view is
+    # `adjoint(UpperTriangular(F))`, which `kernel_builtin_primitive_domain_ok` does NOT admit for lmul! (it
+    # admits only the MATERIALIZED `LowerTriangular`, i.e. an allocating `getproperty(chol,:L)`). Gating the
+    # emitted view therefore contradicts the exact-0-B requirement. Descriptor-drift is validated in
+    # `_refresh_callable`; the domain gate is pending RK's reconciliation (admit `Adjoint{UpperTriangular}` in
+    # the lmul! domain, or sanction the lazy-view path).
     _CompiledRefresh{typeof(randfn), typeof(lmulfn), mom_slot, chol_slot, kills}(randfn, lmulfn)
 end
 
@@ -196,6 +203,7 @@ struct NCtx
     runtimearg::Symbol       # the authored runtime-arg formal (rng) — threaded, NOT spilled to RNG-typed SoA
     argsym::Symbol           # the root parameter carrying the runtime rng (read directly everywhere)
     stats_ir                 # effectful nuts_stats! MethodIR (its writes are inlined) or nothing (no-effect)
+    ctr::Base.RefValue{Int}  # PER-COMPILATION deterministic-local counter (no global; nested compiles safe)
 end
 _cfg(C::NCtx, name::Symbol) = Expr(:call, GlobalRef(Core, :getfield), C.cfg, QuoteNode(name))
 # demand-ensure read of derived endpoint `field` on runtime endpoint expr `epexpr`
@@ -317,7 +325,7 @@ _is_end(i) = i isa _ExtRef && (r = i.ref; r isa GlobalRef && r.name === :end)
 function nindex(base_node, idxs, lm, C)
     be = nev(base_node, lm, C)
     any(_is_end, idxs) || return Expr(:ref, be, (nev(i, lm, C) for i in idxs)...)
-    b = gensym(:idxbase); nd = length(idxs)
+    b = _dsym(C.ctr, :idxbase); nd = length(idxs)
     parts = [ _is_end(idxs[d]) ? (nd == 1 ? :(lastindex($b)) : :(lastindex($b, $d))) : nev(idxs[d], lm, C)
               for d in eachindex(idxs) ]
     Expr(:let, Expr(:(=), b, be), Expr(:ref, b, parts...))
@@ -382,7 +390,7 @@ function nee(st, lm::Dict{Symbol,Symbol}, C::NCtx)
         lhs = _lasym(st.lhs)
         # register kind
         C.kinds[lhs] = nkind(st.rhs, C)
-        loc = get!(lm, lhs, gensym(String(lhs)))
+        loc = get!(lm, lhs, _dsym(C.ctr, lhs))
         Expr(:(=), loc, nev(st.rhs, lm, C))
     elseif st isa _PlaceWrite
         nwrite(st, lm, C)
@@ -399,7 +407,7 @@ function nee(st, lm::Dict{Symbol,Symbol}, C::NCtx)
         e = st.expr
         lv(v) = haskey(lm, v) ? lm[v] : error("loop local $v not stored")
         if e isa Tuple && e[1] === :for_native
-            fr = e[2]; lvar = gensym(String(fr.var[1])); lm2 = merge(lm, Dict(fr.var[1] => lvar))
+            fr = e[2]; lvar = _dsym(C.ctr, fr.var[1]); lm2 = merge(lm, Dict(fr.var[1] => lvar))
             bodyx = map(b -> nee(b, lm2, C), fr.body)
             Expr(:for, Expr(:(=), lvar, nev(fr.iter, lm, C)), Expr(:block, bodyx...))
         elseif e isa Tuple && e[1] === :while_native
@@ -487,7 +495,7 @@ end
 
 # ---- dispatcher assembly (adapted from compile_dispatcher, frame emit) ----
 function compile_nuts_dispatcher(irs0, PL; typemap, cap::Int, root_mid::Int, stats_noeffect::Bool, derived::Set{Symbol}, runtimearg::Symbol, stats_ir)
-    CFG = gensym(:cfg)  # runtime config NamedTuple: (leaf, handles, stepkw, ensures)
+    ctr = Ref(0); CFG = :__nuts_cfg   # per-compilation deterministic-local counter + fixed top-level names
     rec = defunctionalized_mids(irs0)
     by_mid = Dict{Int,Any}(ir.id.decl => ir for ir in irs0)
     irs = [ir for ir in irs0 if ir.id.decl in rec]
@@ -505,13 +513,13 @@ function compile_nuts_dispatcher(irs0, PL; typemap, cap::Int, root_mid::Int, sta
     end
     mids = sort(collect(keys(methods)))
     sidx = Dict{Int,Int}(m => i for (i,m) in enumerate(mids))
-    S = gensym(:frame); SC = gensym(:scratch); A0 = gensym(:arg0)
+    S = :__nuts_frame; SC = :__nuts_scratch; A0 = :__nuts_rng
     fspv = Dict(m => Symbol("fsp_$m") for m in mids); nstores = length(mids); ctrl_idx = nstores + 1
     method_arm(m) = begin
-        C = NCtx(S, PL, Dict{Symbol,Symbol}(), _DIAG, CFG, derived, stats_noeffect, by_mid, rec, runtimearg, A0, stats_ir)
+        C = NCtx(S, PL, Dict{Symbol,Symbol}(), _DIAG, CFG, derived, stats_noeffect, by_mid, rec, runtimearg, A0, stats_ir, ctr)
         # seed formal kinds: `ep` formals are endpoints
         for f in by_mid[m].formals; f.name === :ep && (C.kinds[:ep] = :endpoint); end
-        localmap = Dict{Symbol,Symbol}(nm => gensym(String(nm)) for nm in stored[m])
+        localmap = Dict{Symbol,Symbol}(nm => _dsym(ctr, nm) for nm in stored[m])
         pc_arms = Any[]
         spilled = Set{Symbol}(spilled_locals(by_mid[m], rec))
         blks = methods[m].blks

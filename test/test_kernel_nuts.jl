@@ -198,3 +198,23 @@ end
     # produced-slot mismatch (declared vs written) rejects
     @test_throws Exception RK._validate_stats_body(good, (1,))
 end
+
+@testset "kernel_nuts — STABLE type identity: two same-input compiles give identical root/fn/scratch/sampler types" begin
+    OwnerToken = RK.kernel_token(_NutsFix.nuts_state)
+    pf = _nuts_pf()
+    C1 = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, _nuts_frame(pf, Float64, 5))
+    C2 = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, _nuts_frame(pf, Float64, 5))
+    @test typeof(C1.root!) === typeof(C2.root!)               # deterministic emission -> identical RGF/root type
+    @test typeof(C1.fn) === typeof(C2.fn)
+    @test typeof(C1.scratch) === typeof(C2.scratch)
+    @test typeof(C1.cfg) === typeof(C2.cfg)                   # leaf + ensures RGF types stable too
+    @test C1.RootToken === C2.RootToken
+    # so two independently-built samplers share ONE concrete KernelObject type (stable prepared identity)
+    f1 = _nuts_frame(pf, Float64, 5); f2 = _nuts_frame(pf, Float64, 5)
+    Ca = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, f1)
+    Cb = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, f2)
+    s1 = RK.nuts_sampler(Val(OwnerToken), Val(Ca.RootToken), f1, Ca.root!, Ca.scratch)
+    s2 = RK.nuts_sampler(Val(OwnerToken), Val(Cb.RootToken), f2, Cb.root!, Cb.scratch)
+    @test typeof(s1) === typeof(s2)                           # RK's repeated same-signature type-identity gate
+    @test s1 !== s2 && RK.nuts_sampler_frame(s1) !== RK.nuts_sampler_frame(s2)   # but values/buffers isolated
+end
