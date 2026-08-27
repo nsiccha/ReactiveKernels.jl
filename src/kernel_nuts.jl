@@ -59,10 +59,19 @@ end
 # validate one refresh primitive statement (registered :primitive, not rebound) and resolve its singleton callee
 function _refresh_callable(st, i)
     (st isa _ExprStmt && st.expr isa _RegisteredCall) || _l_reject("refresh statement $i must be a registered primitive write")
-    rc = st.expr
-    getfield(rc.registration, :kind) === :primitive || _l_reject("refresh statement $i is not a registered primitive ($(getfield(rc.registration,:kind)))")
+    rc = st.expr; reg = rc.registration
+    getfield(reg, :kind) === :primitive || _l_reject("refresh statement $i is not a registered primitive ($(getfield(reg,:kind)))")
     resolved = _kernel_resolve_captured_ref(rc.ref)
-    kernel_rebound(rc.registration, resolved) && _l_reject("refresh statement $i authored slot was REBOUND after definition")
+    kernel_rebound(reg, resolved) && _l_reject("refresh statement $i authored slot was REBOUND after definition")
+    # STRICT primitive descriptor (RK): the CAPTURED effect descriptor must EXACTLY match the canonical
+    # registry descriptor for the resolved callee — identity/arity/writes/reads/result_alias/kind/order/
+    # borrows/rng_arg — so a drifted or spoofed primitive effect (wrong write position, wrong arity, wrong
+    # result-alias) is rejected, not merely kind+rebind-checked.
+    captured = getfield(reg, :primitive_effect)
+    captured === nothing && _l_reject("refresh statement $i primitive carries no effect descriptor")
+    canonical = _kernel_primitive_effect(resolved)
+    (canonical !== nothing && captured == canonical) ||
+        _l_reject("refresh statement $i primitive effect descriptor drifted from the canonical registry")
     (rc, resolved)
 end
 _is_selffield(x, path) = x isa _SelfField && x.path == path
