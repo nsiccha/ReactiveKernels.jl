@@ -417,7 +417,7 @@ end
     @test RK._LKey((:init,), 10) in cur2 && RK._LKey((:bwd,), 10) in cur2      # init/bwd UNTOUCHED (no fan-out)
 end
 
-@testset "lowering — loop shape is IMMUTABLE Tuple metadata; different shape ≠ loop, no replanning (RK 06:54)" begin
+@testset "lowering — loop shape is IMMUTABLE / DETERMINISTIC Tuple model metadata only (RK 06:54)" begin
     role_of(_::Int) = :owned
     body = RK._LComposed([RK._LSchedStep(:write, RK._LKey((), 5), 0, ())])
     l3 = RK._l_loop(:p, (:proposals,), 1:3, body, role_of)
