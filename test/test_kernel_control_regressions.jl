@@ -81,3 +81,27 @@ end
     @test la !== nothing && emitted2[la].lhs === (:ret,)   # lhs is a path-tuple, not a bare Symbol
     @test !any(e -> e isa RKC._ExprStmt && e.expr === effect, emitted2)
 end
+
+# EXECUTABLE discarded-return discriminator (RK): a real recursive @kernel whose base case tail is a
+# DISCARDED `return Base.fill!(buf, 7)`. Compiled through the control machine and RUN, it must mutate the
+# real buffer — the old build_region! dropped the return expression, leaving the buffer untouched.
+@kernel _fillrec(s) = begin
+    f(n) = if n <= 0
+        return Base.fill!(s.buf, 7)          # (:s,:buf): the emit's receiver-prefix drop yields S.buf
+    else
+        f(__self__, n - 1)
+    end
+end
+mutable struct _FillSt; buf::Vector{Int}; end
+
+@testset "control regression — EXECUTABLE discarded return Base.fill!(buf,7) mutates the buffer (e0393fc)" begin
+    irs = RKC.method_irs(_fillrec)
+    fdecl = first(ir.id.decl for ir in irs if ir.id.name === :f)
+    fn = RKC.compile_dispatcher(irs; typemap = Dict(fdecl => Dict(:n => Int)), cap = 16, root_mid = fdecl)
+    cap = 16
+    scratch = (RKC._FrameStore{fdecl, Tuple{Vector{Int}}}((Vector{Int}(undef, cap),)),
+               Vector{RKC._CtrlFrame}(undef, cap))
+    st = _FillSt(zeros(Int, 4))
+    fn(st, scratch, 3)                       # 3 recursions then the discarded base-case fill!
+    @test st.buf == fill(7, 4)               # OLD code left it [0,0,0,0] (return expr dropped)
+end
