@@ -195,15 +195,19 @@ end
 end
 
 function _pp_ldiv_outcome(make, solve)
-    dest, factor, rhs = make(); err = try
-        solve(dest, factor, rhs); nothing
-    catch e
-        e
+    made = make(); dest, factor, rhs = made[1], made[2], made[3]
+    owner = length(made) == 4 ? made[4] : nothing
+    GC.@preserve owner dest factor rhs begin
+        err = try
+            solve(dest, factor, rhs); nothing
+        catch e
+            e
+        end
+        bytes(x) = copy(reinterpret(UInt8, vec(x)))
+        (error_type=err === nothing ? nothing : typeof(err),
+         error_text=err === nothing ? nothing : sprint(showerror,err),
+         dest=bytes(dest),factor=bytes(factor.factors.diag),rhs=bytes(rhs))
     end
-    bytes(x) = copy(reinterpret(UInt8, vec(x)))
-    (error_type=err === nothing ? nothing : typeof(err),
-     error_text=err === nothing ? nothing : sprint(showerror,err),
-     dest=bytes(dest),factor=bytes(factor.factors.diag),rhs=bytes(rhs))
 end
 
 @testset "prepared-endpoint — Diagonal fast helper IEEE/alias adversaries match generic value + throw prefix" begin
@@ -245,19 +249,19 @@ end
                 b=T[1,2,3,4]; d=unsafe_wrap(Vector{T},pointer(b,2),3;own=false)
                 f=unsafe_wrap(Vector{T},pointer(b),3;own=false)
                 @assert !Base.mightalias(d,f) && RK._pp_vector_overlaps(d,f)
-                (d,Cholesky(Diagonal(f),'U',0),T[5,6,7])
+                (d,Cholesky(Diagonal(f),'U',0),T[5,6,7],b)
             end,
             () -> begin
                 b=T[3,4,5,6]; d=unsafe_wrap(Vector{T},pointer(b,2),3;own=false)
                 r=unsafe_wrap(Vector{T},pointer(b),3;own=false)
                 @assert !Base.mightalias(d,r) && RK._pp_vector_overlaps(d,r)
-                (d,Cholesky(Diagonal(T[1,2,3]),'U',0),r)
+                (d,Cholesky(Diagonal(T[1,2,3]),'U',0),r,b)
             end,
             () -> begin
                 b=T[1,2,3,4]; r=unsafe_wrap(Vector{T},pointer(b,2),3;own=false)
                 f=unsafe_wrap(Vector{T},pointer(b),3;own=false)
                 @assert !Base.mightalias(r,f) && RK._pp_vector_overlaps(r,f)
-                (zeros(T,3),Cholesky(Diagonal(f),'U',0),r)
+                (zeros(T,3),Cholesky(Diagonal(f),'U',0),r,b)
             end
         )
         for make in scenarios
