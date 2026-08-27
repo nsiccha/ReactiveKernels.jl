@@ -17,6 +17,7 @@ using Test
         include("test_kernel_control.jl")
         include("test_kernel_control_regressions.jl")
         include("test_kernel_nuts.jl")
+        include("test_kernel_nuts_native.jl")
         include("test_kernel_adaptation.jl")
         include("test_nonallocating_core.jl")
         include("test_composition_cse.jl")
