@@ -182,6 +182,8 @@ function _exec_is_vec(x::_SelfField, ctx::_EmitCtx)
     id !== nothing && !(id in ctx.scalar_canons)     # a slot is VECTOR unless typed SCALAR by the metadata
 end
 _exec_is_vec(x::_OpCall, ctx::_EmitCtx) = any(a -> _exec_is_vec(a, ctx), x.args)
+# a declared/registered helper call (`smooth`, `min1exp`) yields a computed value, not a slot buffer.
+_exec_is_vec(::_RegisteredCall, ctx::_EmitCtx) = false
 
 function _exec_rhs(x::_OpCall, ctx::_EmitCtx, bcast::Bool)
     args = Any[_exec_rhs(a, ctx, bcast) for a in x.args]
@@ -191,6 +193,20 @@ function _exec_rhs(x::_OpCall, ctx::_EmitCtx, bcast::Bool)
     (bcast && _exec_is_vec(x, ctx)) ?
         Expr(:call, GlobalRef(Base, :broadcasted), _exec_callee(x.op), args...) :  # fused buffer op
         Expr(:call, _exec_callee(x.op), args...)                                   # plain call (scalar/ordinary)
+end
+
+# The canonical GlobalRef for a REGISTERED/DECLARED call's captured source function — exact identity from
+# the registration (never spelling), enforcing the source-only compiler boundary (an UNREGISTERED helper
+# is an opaque `_OpCall`, never reaches here — the caller asserts `ir.ok`).
+_exec_registered_callee(x::_RegisteredCall) =
+    (f = getfield(x.registration, :source); GlobalRef(parentmodule(f), nameof(f)))
+
+function _exec_rhs(x::_RegisteredCall, ctx::_EmitCtx, bcast::Bool)
+    callee = _exec_registered_callee(x)
+    args = Any[_exec_rhs(a, ctx, bcast) for a in x.args]
+    (bcast && x.broadcast) ?                                    # only if the call itself was authored dotted
+        Expr(:call, GlobalRef(Base, :broadcasted), callee, args...) :
+        Expr(:call, callee, args...)                           # plain declared call (exact identity)
 end
 
 # ---- consume the partial binder SOUNDLY (approved-only + token identity) -----------------------------

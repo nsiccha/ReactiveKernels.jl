@@ -260,10 +260,13 @@ end
 module _CgStatsFix
     using ReactiveKernels, LogExpFunctions
     smooth(prev, new, w) = (1 - w) * prev + w * new
+    min1exp(x) = x >= 0 ? one(x) : exp(x)
+    @rk_pure smooth 3                                   # source-only boundary: helpers must be DECLARED,
+    @rk_pure min1exp 1                                  # not normalized as opaque through the emitter
     # nuts_stats!-shaped: scalar subject writes (n_steps, acceptance_rate) + a nested indexed write
     @kernel probe_stats!(s; accepted) = begin
         s.n_steps += 1
-        s.acceptance_rate = smooth(s.acceptance_rate, accepted, 0.1)
+        s.acceptance_rate = smooth(s.acceptance_rate, min1exp(accepted), 0.1)
         s.trees[1].log_weight[1] = s.dham
     end
 end
@@ -281,6 +284,12 @@ ReactiveKernels._owner_set!(s::_SynthStats, ::Val{I}, v) where {I} = (setfield!(
 
 @testset "codegen — EXECUTABLE nuts_stats! scalar + indexed writes update real state at 0 B" begin
     ir = RK.method_irs(_CgStatsFix.probe_stats!)[1]
+    @test ir.ok                                                # source-only boundary satisfied (no opaque edge)
+    # the helper calls resolve to DECLARED registrations (not opaque), with exact captured identity
+    accw = only(w for w in RK._exec_place_writes(ir) if w.owner == (:acceptance_rate,))
+    @test accw.rhs isa RK._RegisteredCall                      # smooth is a declared call, not _OpCall :opaque
+    @test getfield(accw.rhs.registration, :source) === _CgStatsFix.smooth
+    @test accw.rhs.registration.kind === :declared_effect
     writes = RK._exec_place_writes(ir)
     @test length(writes) == 3
     # synthetic layout: n_steps→slot1, acceptance_rate→2, dham→3 (SCALARS), trees→4 (buffer)
