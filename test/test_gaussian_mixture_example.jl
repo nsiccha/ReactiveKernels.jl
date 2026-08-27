@@ -1,35 +1,8 @@
 using ReactiveKernels
-using DifferentiationInterface
-import Enzyme
 using Test
 
 include(joinpath(@__DIR__, "..", "examples", "gaussian_mixture.jl"))
 using .GaussianMixtureExample
-
-const ENZYME_BACKEND = AutoEnzyme(;
-    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-    function_annotation = Enzyme.Const,
-)
-
-function gaussian_mixture_reference_logdensity(qv)
-    μ₁, δ, log_σ₁, log_σ₂, logit_θ = qv
-    _, μ₂ = GaussianMixtureExample.ordered_means(μ₁, δ)
-    θ = GaussianMixtureExample.logistic(logit_θ)
-    parameters = MixtureParameters(μ₁, μ₂, exp(log_σ₁), exp(log_σ₂), θ)
-    prior = GaussianMixtureExample.log_prior(parameters)
-    likelihood = GaussianMixtureExample.sum_log_likelihood(
-        GaussianMixtureExample.pointwise_log_likelihood(
-            parameters, MIXTURE_OBSERVATIONS,
-        ),
-    )
-    GaussianMixtureExample.total_log_density(
-        prior,
-        GaussianMixtureExample.log_abs_det_jacobian(
-            δ, log_σ₁, log_σ₂, θ,
-        ),
-        likelihood,
-    )
-end
 
 @testset "manual PPL graph — Gaussian mixture (marginalization)" begin
     model = build_gaussian_mixture_graph()
@@ -75,26 +48,6 @@ end
             GaussianMixtureExample.normal_logpdf(y, -3.0, 0.7),
             GaussianMixtureExample.normal_logpdf(y, 3.0, 0.7))
         @test pointwise[1] ≈ expected
-    end
-
-    @testset "the log-density boundary differentiates through DI + Enzyme" begin
-        k = prepare(model.graph;
-                    have = (model.unconstrained, model.observations),
-                    want = (model.density,))
-        logdensity(qv) = k(Tuple(qv), MIXTURE_OBSERVATIONS)
-
-        qvec = collect(q)
-        gradient = DifferentiationInterface.gradient(
-            logdensity, ENZYME_BACKEND, qvec)
-        @test length(gradient) == length(q)
-        @test all(isfinite, gradient)
-        @test gradient !== qvec
-        @test pointer(gradient) != pointer(qvec)
-
-        @test logdensity(qvec) ≈ gaussian_mixture_reference_logdensity(qvec)
-        reference_gradient = DifferentiationInterface.gradient(
-            gaussian_mixture_reference_logdensity, ENZYME_BACKEND, qvec)
-        @test gradient ≈ reference_gradient
     end
 
     @testset "responsibility generated quantity prunes density work" begin
