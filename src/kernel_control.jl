@@ -442,13 +442,19 @@ function defunctionalized_mids(irs)
 end
 
 # substitute positional formals with the call's actual arg expressions throughout a node tree.
+# COMPLETE generic formal-substitution walk (RK real-fixture fix): the hand-written per-type version missed
+# _PlaceWrite/_PlaceSwap/_Index/_LocalAssign/_If/_For/_Getfield/_SelfField/_SetReturn — node types that never
+# appeared in a synthetic inlined callee but DO in the real acyclic siblings (swapproposal!'s _PlaceSwap,
+# reset!'s _For + broadcasts, flip_neg!'s _PlaceWrite). Reflectively rebuild every _MExpr/_MStmt with each
+# field substituted (containers recursed), so a _FormalRef anywhere below is mapped to its call actual. The
+# reconstruction is identity for a node carrying no formal, so it matches the old behavior on the old types.
 function _subst(x, fmap::Dict{Symbol,Any})
     if x isa _FormalRef; get(fmap, x.arg, x)
-    elseif x isa _Guard; _Guard(x.op, _subst(x.cond, fmap), Tuple(_subst(b, fmap) for b in x.body))
-    elseif x isa _Return; _Return(x.value === nothing ? nothing : _subst(x.value, fmap))
-    elseif x isa _ExprStmt; _ExprStmt(_subst(x.expr, fmap))
-    elseif x isa _OpCall; _OpCall(x.op, Tuple(_subst(a, fmap) for a in x.args), x.kw, x.broadcast, x.hint)
-    elseif x isa _RegisteredCall; _RegisteredCall(x.ref, x.registration, x.intrinsic, Tuple(_subst(a, fmap) for a in x.args), x.kw, x.broadcast)
+    elseif x isa Tuple; Tuple(_subst(e, fmap) for e in x)
+    elseif x isa AbstractVector; Any[_subst(e, fmap) for e in x]
+    elseif x isa Pair; _subst(x.first, fmap) => _subst(x.second, fmap)
+    elseif x isa _MExpr || x isa _MStmt
+        T = typeof(x); T((_subst(getfield(x, f), fmap) for f in fieldnames(T))...)
     else x end
 end
 
@@ -483,12 +489,36 @@ function _inline_stmt!(out, st, by_mid, rec)
         push!(out, st)
     end
 end
+# Source-order sibling-call argument binding (RK 11:08 general contract, not a swapproposal!/`j` special-case):
+# bind supplied POSITIONAL then KEYWORD actuals, then fill each omitted formal's DEFAULT left-to-right in the
+# environment of the formals bound so far — so a later default depending on an earlier bound/defaulted formal
+# (`f(a, b=a+1)`) resolves. Actuals stay in the CALLER's scope (never substituted through the callee fmap);
+# only defaults are callee-scope and get `_subst`ed through the partial fmap. Rejects missing-required, extra
+# positional, and duplicate/unknown keyword — so no inlined formal silently leaks unbound.
 function _argmap(callee, call)
-    fmap = Dict{Symbol,Any}(); pos = 0
-    for f in callee.formals
-        f.kind === :pos || continue; pos += 1
-        pos <= length(call.pos) && (fmap[f.name] = call.pos[pos])
+    fmap = Dict{Symbol,Any}()
+    kwvals = Dict{Symbol,Any}()                              # supplied keyword actuals, by name
+    for kwa in call.kw
+        nm, val = kwa isa Pair ? (kwa.first, kwa.second) : (kwa[1], kwa[2])
+        haskey(kwvals, nm) && _l_ctrl_reject("call `$(call.name)` passes keyword `$nm` more than once")
+        kwvals[nm] = val
     end
+    npos = count(f -> f.kind === :pos, callee.formals)
+    length(call.pos) <= npos || _l_ctrl_reject(
+        "call `$(call.name)` passes $(length(call.pos)) positional args to `$(callee.id.name)` (takes $npos)")
+    pos = 0
+    for f in callee.formals
+        supplied = f.kind === :pos ? (pos += 1; pos <= length(call.pos) ? Some(call.pos[pos]) : nothing) :
+                                     (haskey(kwvals, f.name) ? Some(pop!(kwvals, f.name)) : nothing)
+        if supplied !== nothing
+            fmap[f.name] = something(supplied)               # caller-scope actual — left as-is
+        elseif getfield(f, :default) !== nothing
+            fmap[f.name] = _subst(getfield(f, :default), fmap)   # callee-scope default in earlier-formal env
+        elseif getfield(f, :required)
+            _l_ctrl_reject("call to `$(callee.id.name)` omits required $(f.kind) argument `$(f.name)`")
+        end
+    end
+    isempty(kwvals) || _l_ctrl_reject("call to `$(callee.id.name)` passes unknown keyword(s) $(collect(keys(kwvals)))")
     fmap
 end
 
