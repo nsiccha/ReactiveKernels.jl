@@ -42,14 +42,24 @@ end
 @generated function _refresh_killall!(owned, ::Val{M}, ::Val{Ks}) where {M, Ks}
     Expr(:block, :(_canon_kill!(owned, Val($M))), (:(_canon_kill!(owned, Val($k))) for k in Ks)..., :(nothing))
 end
+# PER-RNG-SPECIALIZATION domain admission, fully at COMPILE time (RK): a @generated guard keyed by the randn!
+# singleton type + the concrete rng/mom types — it resolves RandT's singleton and runs the builtin-domain gate
+# at generation, emitting literally `nothing` for an admitted rng (Xoshiro/MersenneTwister → NO hot validation
+# work, loop stays exact 0-B) or a `throw` for a custom/out-of-domain rng (rejected before any state change).
+@generated function _refresh_rng_domain!(::Type{RandT}, ::Type{RNG}, ::Type{MomT}) where {RandT, RNG, MomT}
+    _kernel_effect_callee_domain_ok(RandT.instance, (RNG, MomT)) ? :(nothing) :
+        :(throw(ArgumentError(string("refresh randn! rejects rng of type ", $RNG, " — not a builtin-RNG domain"))))
+end
 @inline function (r::_CompiledRefresh{RandT, LmulT, MomSlot, CholSlot, Kills})(owned, shared, handles, rng) where {RandT, LmulT, MomSlot, CholSlot, Kills}
+    mom = _canon_slot(owned, Val(MomSlot))                          # read (safe) — needed for the rng domain gate
+    _refresh_rng_domain!(RandT, typeof(rng), typeof(mom))          # REJECT a bad rng BEFORE any kill/write
     _refresh_killall!(owned, Val(MomSlot), Val(Kills))               # kill mom + dependents BEFORE the writes
-    mom = _canon_slot(owned, Val(MomSlot))
     r.rand(rng, mom)                                                 # randn!(rng, mom)
     chol = _canon_slot(shared, Val(CholSlot))
-    # orientation-correct NON-ALLOCATING lower-factor view (RK): construct the triangular directly from the
-    # factors (inline-elidable) — `getproperty(chol,:L)` would allocate a wrapper AND could mask a wrong-uplo
-    # shortcut. uplo 'U' means factors hold the upper factor → the Cholesky L is its adjoint.
+    # orientation-correct NON-ALLOCATING lower-factor view (the already-correct 0-B path): for uplo='U' the
+    # factors hold U, and `adjoint(UpperTriangular(F))` CANONICALIZES in Julia to `LowerTriangular{T,Adjoint{T,
+    # Matrix{T}}}` (the exact lazy factor the lmul! domain admits, syntax 5bfc290); for uplo='L',
+    # `LowerTriangular(F)` over the concrete matrix. `getproperty(chol,:L)` would allocate a wrapper.
     F = getfield(chol, :factors)
     L = getfield(chol, :uplo) == Char(0x55) ? adjoint(LinearAlgebra.UpperTriangular(F)) : LinearAlgebra.LowerTriangular(F)
     r.lmul(L, mom)                                                   # lmul!(chol.L, mom)
@@ -94,13 +104,16 @@ function compile_refresh(pf, ::Type{OW}, ::Type{SH}, refresh_ir::MethodIR) where
     # the chol slot must hold a sanctioned Cholesky (its L-view is the momentum-refresh factor)
     cholT = fieldtype(SH, chol_slot)
     (cholT <: LinearAlgebra.Cholesky) || _l_reject("refresh: chol_metric slot is not a Cholesky ($cholT)")
-    # NOTE (reported to RK): a per-callee CONCRETE-DOMAIN gate on the emitted lmul factor is BLOCKED by a
-    # conflict — `cholesky(dense)` defaults to uplo='U', so the 0-B lazy lower-factor view is
-    # `adjoint(UpperTriangular(F))`, which `kernel_builtin_primitive_domain_ok` does NOT admit for lmul! (it
-    # admits only the MATERIALIZED `LowerTriangular`, i.e. an allocating `getproperty(chol,:L)`). Gating the
-    # emitted view therefore contradicts the exact-0-B requirement. Descriptor-drift is validated in
-    # `_refresh_callable`; the domain gate is pending RK's reconciliation (admit `Adjoint{UpperTriangular}` in
-    # the lmul! domain, or sanction the lazy-view path).
+    # CONCRETE-DOMAIN admission of the ACTUAL emitted lmul factor (RK / syntax 5bfc290): the call method's
+    # lower-factor view is `LowerTriangular{T,Matrix{T}}` (uplo='L') or the canonicalized `adjoint(
+    # UpperTriangular(F))` == `LowerTriangular{T,Adjoint{T,Matrix{T}}}` (uplo='U'); both — and no generic/custom
+    # backing — must pass the lmul! domain. uplo is a runtime field, so both forms can occur for the same cholT.
+    momT = fieldtype(OW, mom_slot); facT = fieldtype(cholT, :factors); ET = eltype(facT)   # structural, no value/inference
+    Llow = LinearAlgebra.LowerTriangular{ET, facT}                                  # uplo='L' emitted type
+    Lupp = LinearAlgebra.LowerTriangular{ET, LinearAlgebra.Adjoint{ET, facT}}       # uplo='U' canonicalized type
+    (kernel_builtin_primitive_domain_ok(rc2.registration, (Llow, momT)) &&
+     kernel_builtin_primitive_domain_ok(rc2.registration, (Lupp, momT))) ||
+        _l_reject("refresh lmul! domain rejects the emitted Cholesky-L view over $facT with mom $momT")
     _CompiledRefresh{typeof(randfn), typeof(lmulfn), mom_slot, chol_slot, kills}(randfn, lmulfn)
 end
 

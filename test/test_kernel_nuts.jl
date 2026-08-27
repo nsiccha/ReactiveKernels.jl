@@ -218,3 +218,20 @@ end
     @test typeof(s1) === typeof(s2)                           # RK's repeated same-signature type-identity gate
     @test s1 !== s2 && RK.nuts_sampler_frame(s1) !== RK.nuts_sampler_frame(s2)   # but values/buffers isolated
 end
+
+@testset "kernel_nuts — refresh concrete-domain gate: valid factor/rng pass, custom RNG rejects before exec" begin
+    pf = _nuts_pf(); frame = _nuts_frame(pf, Float64, 3)
+    C = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame)
+    H = RK.kernel_prepared_handles(pf)
+    # Xoshiro + MersenneTwister pass the per-rng randn! domain (already exercised for loop-0-B elsewhere)
+    C.refresh(frame.init, frame.shared, H, Random.Xoshiro(1))
+    C.refresh(frame.init, frame.shared, H, Random.MersenneTwister(2))
+    @test true
+    # a custom RNG is REJECTED by the per-rng randn! domain guard BEFORE any kill/write — values AND masks stay
+    struct _CustomRNG <: Random.AbstractRNG end
+    momslot = RK.kernel_plan_named_slot_val(RK.kernel_prepared_plan(pf), Val(:mom))
+    mom_before = copy(RK._canon_slot(frame.init, momslot)); cur_before = RK._canon_current(frame.init, momslot)
+    @test_throws ArgumentError C.refresh(frame.init, frame.shared, H, _CustomRNG())
+    @test RK._canon_slot(frame.init, momslot) == mom_before        # mom value untouched
+    @test RK._canon_current(frame.init, momslot) == cur_before     # mom currentness mask untouched (rejected before kill)
+end
