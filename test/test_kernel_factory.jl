@@ -105,6 +105,15 @@ _canoncopy0b(o, s) = RKS._canon_copy_slot!(o, s, Val(2))
 # in-place gradient callable (acceptance-hook shape): writes dest = 2*pos, RETURNS pot = sum(abs2,pos)
 pgrad_ex!(dest, pos) = (dest .= 2 .* pos; sum(abs2, pos))
 _applygrad0b(b, o, pos) = RKS._kernel_apply_grad!(b, o, pos)
+# a pot_f-FREE gradient endpoint (mirrors the ccb final fixture's euclidean_phasepoint): a SINGLE grad
+# recipe produces BOTH the scalar potential `pot` and the buffer gradient `dpot_dpos` from `pos`.
+@kernel gradonly_ep(grad_f, pos) = begin
+    pot, dpot_dpos = grad_f(pos)
+    dham_dpos = dpot_dpos
+end
+@kernel gradonly_step!(phasepoint; stepsize) = begin
+    @. phasepoint.pos += stepsize * phasepoint.dham_dpos
+end
 # a SECOND, byte-identical endpoint DEFINITION — same slot/recipe SHAPE, DIFFERENT canonical
 # Value identities — to prove the plan key distinguishes definitions (RK 04:17c).
 @kernel phasepoint_ep2(pot_f, grad_f, metric, pos, mom) = begin
@@ -950,6 +959,39 @@ end
         RKS._kernel_apply_grad!(RKS._grad_binding(goodpg!, Val(1), Val(2)), o, [1.0, 2.0])
         @test RKS._canon_current(o, Val(1)) && RKS._canon_current(o, Val(2))
         @test RKS._canon_slot(o, Val(1)) == [2.0, 4.0]
+    end
+
+    @testset "construction seam — HAVE-only start, TYPE-STABLE grad binding from selected recipe, one apply → entry_current (RK 05:47/05:59/06:49)" begin
+        integ = RKS.kernel_registration(gradonly_step!)
+        plan = RKS._kernel_factory_endpoint_plan(gradonly_ep, integ)
+        g = RKS.kernel_graph(gradonly_ep)
+        canonof(n) = RKS.canon_id(g, gradonly_ep.ports[n].id)
+        cpos, cpot, cdpot, cgf = canonof(:pos), canonof(:pot), canonof(:dpot_dpos), canonof(:grad_f)
+        canons, _ = RKS.kernel_plan_superset(plan); N = length(canons)
+        # the selected grad recipe is the SAME producer for BOTH outputs (RK 05:47)
+        prod = Dict(RKS.kernel_plan_producer(plan))
+        @test haskey(prod, cpot) && haskey(prod, cdpot) && prod[cpot] == prod[cdpot]
+        gr = prod[cpot]
+        # CONSTRUCT: HAVE-only mask — pos (source) starts current, produced pot/dpot start DIRTY
+        vals = Dict{Int,Any}(cpos => [1.0, 2.0], cpot => 0.0, cdpot => [0.0, 0.0], cgf => pgrad_ex!)
+        ow, sh = RKS._kernel_construct_endpoint(Val(:grad), plan, vals, (cgf,))
+        pos_slot = RKS.kernel_plan_field(plan, cpos)[2]
+        pot_slot = RKS.kernel_plan_field(plan, cpot)[2]
+        dpot_slot = RKS.kernel_plan_field(plan, cdpot)[2]
+        @test RKS._canon_current(ow, Val(pos_slot))                             # HAVE source current
+        @test !RKS._canon_current(ow, Val(pot_slot)) && !RKS._canon_current(ow, Val(dpot_slot))  # dirty
+        # TYPE-STABLE binding derived from the detached selected recipe outputs (RK 06:49)
+        b = @inferred RKS._grad_binding_from_plan(plan, Val(gr), pgrad_ex!, ow)
+        @test isconcretetype(typeof(b))                                         # concrete prepared field
+        @test b.dest === Val(dpot_slot) && b.pot === Val(pot_slot)             # buffer=dest, scalar=pot
+        # ONE apply seeds both outputs atomically; grad recipe is the ONLY recipe → mask == entry_current
+        RKS._kernel_apply_grad!(b, ow, [1.0, 2.0])
+        @test RKS._canon_current(ow, Val(pot_slot)) && RKS._canon_current(ow, Val(dpot_slot))
+        @test RKS._canon_slot(ow, Val(dpot_slot)) == [2.0, 4.0] && RKS._canon_slot(ow, Val(pot_slot)) == 5.0
+        ecowned = sort([RKS.kernel_plan_field(plan, c)[2]
+                        for c in RKS.kernel_plan_entry_current(plan)
+                        if RKS.kernel_plan_field(plan, c)[1] === :owned])
+        @test RKS._canon_current_mask(ow) == RKS._owner_mask(N, ecowned)        # FINAL mask == entry_current
     end
 
     @testset "poc binder/plan seam accessors (RK 04:41)" begin

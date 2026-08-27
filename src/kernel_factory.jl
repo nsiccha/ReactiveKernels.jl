@@ -1107,6 +1107,36 @@ struct _GradBinding{F,D,P}
 end
 _grad_binding(pgrad!, ::Val{I}, ::Val{J}) where {I,J} = _GradBinding(pgrad!, Val(I), Val(J))
 grad_binding_callable(b::_GradBinding) = b.pgrad!
+
+# Derive the destination-aware grad binding SOLELY from the selected recipe's DETACHED canonical outputs
+# (RK 05:47) — NOT caller-supplied Vals. `Val{GR}` is the TYPE-LEVEL selected grad Recipe id the
+# construction driver bound to the external `pgrad!` authority. TYPE-STABLE (RK 06:49): a @generated
+# function keyed by the plan's structural `Key` (which carries the producer map + slot signature as a
+# value-tuple type parameter) plus the CONCRETE owned type derives LITERAL `dest`/`pot` Val indices at
+# compile time — so the returned `_GradBinding` field type is concrete/@inferred, never a runtime-`Val`
+# abstract binding stored in the prepared object. The recipe must be the selected producer for EXACTLY
+# its two OWNED outputs; the BUFFER output is the gradient `dest`, the SCALAR output is `pot`. No
+# Recipe.op — only the detached plan Key + the owned struct's field types.
+@generated function _grad_binding_from_plan(::_KernelPlan{Key}, ::Val{GR}, pgrad!,
+                                            owned::_CanonOwned) where {Key, GR}
+    producer = Key[4]                                   # Tuple of (canonical id, selected Recipe id)
+    slot_sig = Key[2]                                   # Tuple of (path, canon, role, absolute slot)
+    outs = Int[c for (c, rid) in producer if rid == GR]
+    length(outs) == 2 || return :(throw(_KernelFactoryReject(
+        "grad recipe $($GR) is the selected producer for $($(length(outs))) canonical output(s); a " *
+        "destination-aware gradient binding requires EXACTLY two (the gradient buffer + the potential)")))
+    slotof = Dict{Int,Tuple{Symbol,Int}}()
+    for (_, canon, role, slot) in slot_sig; slotof[canon] = (role, slot); end
+    fields = Union{Nothing,Tuple{Symbol,Int}}[get(slotof, c, nothing) for c in outs]
+    all(f -> f !== nothing && f[1] === :owned, fields) || return :(throw(_KernelFactoryReject(
+        "both grad-recipe outputs must be OWNED canonical slots")))
+    slots = Int[f[2] for f in fields]
+    kinds = Symbol[fieldtype(owned, s) <: AbstractArray ? :buffer : :scalar for s in slots]
+    (count(==(:buffer), kinds) == 1 && count(==(:scalar), kinds) == 1) || return :(throw(_KernelFactoryReject(
+        "grad-recipe outputs must be one BUFFER gradient dest + one SCALAR potential (found kinds $($kinds))")))
+    dest = slots[findfirst(==(:buffer), kinds)]; pot = slots[findfirst(==(:scalar), kinds)]
+    :(_GradBinding(pgrad!, Val($dest), Val($pot)))      # LITERAL indices -> concrete binding type
+end
 # One invocation seeds construction: pgrad!(grad_dest, pos) writes the owned grad buffer in place
 # (identity preserved) and returns pot, which is set into the pot slot — atomic, allocation-free.
 @inline function _kernel_apply_grad!(b::_GradBinding, s::_CanonOwned, pos)
