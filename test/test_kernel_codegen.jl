@@ -214,9 +214,13 @@ end
     ri = RK._seam_recipe_inputs_snapshot(_CgPP, seam)
     _, meta = RK.compile_leaf(ir, seam, _CgTypedFix.partial(LFT; stepsize = 0.1); recipe_inputs = ri, appliers = ap)
     src = string(meta.body)
-    # the scalar `oftype(stepsize, 0.5)` is a PLAIN call, NOT wrapped in broadcasted (which would allocate)
+    # MIXED expression `oftype(stepsize, 0.5) * stepsize * dham_dpos` (RK 05:26): the typed SCALAR
+    # coefficient is a PLAIN call (evaluated once), the VECTOR multiply is FUSED (broadcasted).
     @test occursin("oftype(", src)
     @test !occursin("broadcasted(Main._CgTypedFix.oftype", src) && !occursin("broadcasted(Base.oftype", src)
+    @test occursin("broadcasted(Main._CgTypedFix.:*", src)              # the vector op IS fused
+    # scalar coefficient appears once per half-kick RHS (2 half-kicks) — evaluated once each, not per-element
+    @test count(_ -> true, eachmatch(r"oftype\(", src)) == 2
     barrier(fn, st, pg, cholf, kw) = @allocated fn(st, pg, cholf, kw)   # fn typed → true 0-B measurement
     for T in (Float64, Float32)
         fn, m = RK.compile_leaf(ir, seam, _CgTypedFix.partial(LFT; stepsize = T(0.1)); recipe_inputs = ri, appliers = ap)

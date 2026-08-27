@@ -135,6 +135,7 @@ _kw_local(name::Symbol) = Symbol("__kw_", name)
 mutable struct _EmitCtx
     fieldcanon::Dict{Symbol,Int}
     slotof::Dict{Int,Int}
+    scalar_canons::Set{Int}                 # canonical ids of SCALAR-typed slots (detached type metadata)
     bound_names::Tuple{Vararg{Symbol}}
     slots_used::Vector{Int}
     formals_used::Vector{Symbol}
@@ -159,18 +160,23 @@ function _exec_rhs(x::_SelfField, ctx::_EmitCtx)
     (id === nothing || !haskey(ctx.slotof, id)) && _l_reject("subject field `$(x.path[1])` has no owned slot")
     I = ctx.slotof[id]; push!(ctx.slots_used, I); _slot_local(I)
 end
-# Is a MethodIR value node VECTOR-valued (reads an owned slot buffer) or a pure SCALAR (literals/bound
-# formals and scalar ops over them)? Only VECTOR ops broadcast; a scalar-only sub-expression
-# (`oftype(stepsize, 0.5)`, `0.5 * stepsize`) is emitted as a PLAIN call computed once — wrapping it in
-# `broadcasted` builds a nested scalar Broadcasted that does not fuse (→ a per-leaf allocation).
-_exec_is_vec(::_SelfField) = true          # every subject-field read in a leaf method is a slot buffer
-_exec_is_vec(::_Lit) = false
-_exec_is_vec(::_FormalRef) = false
-_exec_is_vec(x::_OpCall) = any(_exec_is_vec, x.args)
+# Is a MethodIR value node VECTOR-valued (reads an array-typed slot) or a pure SCALAR (literals/bound
+# formals and scalar ops over them, e.g. `oftype(stepsize, 0.5)`)? Classification is a COMPILE-TIME
+# decision driven by DETACHED slot-value-type metadata (`ctx.scalar_canons`), never operator spelling or a
+# runtime `isa` in hot code. Only VECTOR ops broadcast; a scalar-only sub-expression is emitted as a PLAIN
+# call computed once — wrapping it in `broadcasted` builds a nested scalar Broadcasted that does not fuse
+# (→ a per-leaf allocation).
+_exec_is_vec(::_Lit, ctx::_EmitCtx) = false
+_exec_is_vec(::_FormalRef, ctx::_EmitCtx) = false
+function _exec_is_vec(x::_SelfField, ctx::_EmitCtx)
+    id = _l_canon_of(ctx.fieldcanon, x.path[1])
+    id !== nothing && !(id in ctx.scalar_canons)     # a slot is VECTOR unless typed SCALAR by the metadata
+end
+_exec_is_vec(x::_OpCall, ctx::_EmitCtx) = any(a -> _exec_is_vec(a, ctx), x.args)
 
 function _exec_rhs(x::_OpCall, ctx::_EmitCtx)
     args = Any[_exec_rhs(a, ctx) for a in x.args]
-    _exec_is_vec(x) ?
+    _exec_is_vec(x, ctx) ?
         Expr(:call, GlobalRef(Base, :broadcasted), _exec_callee(x.op), args...) :  # fused vector op
         Expr(:call, _exec_callee(x.op), args...)                                   # scalar op, computed once
 end
@@ -232,6 +238,13 @@ _seam_field_canon(seam::_KernelPlan) = Dict{Symbol,Int}(s.path[end] => s.canon f
 # DETACHED canonical id → authored label map (reporting only, never authority), from the seam slots.
 _seam_name_of(seam::_KernelPlan) = Dict{Int,Symbol}(s.canon => s.path[end] for s in kernel_plan_slots(seam))
 
+# Canonical ids of SCALAR-typed owned slots — the detached type metadata that drives the emit-time
+# scalar/vector classification (RK 05:26). INTERIM: derived from the known scalar field NAMES; replaced by
+# the seam's per-slot value-type metadata when syntax's mutable-struct supersede lands — the codegen that
+# consumes `scalar_canons` does not change, only its source.
+_seam_scalar_canons(seam::_KernelPlan) =
+    Set{Int}(s.canon for s in kernel_plan_slots(seam) if s.role === :owned && s.path[end] in _LEAF_SCALAR_FIELDS)
+
 """
     compile_leaf(ir, seam, binder; recipe_inputs, appliers, path=()) -> (fn, meta)
 
@@ -255,6 +268,7 @@ function compile_leaf(ir::MethodIR, seam::_KernelPlan, binder;
     bound_names = keys(bound_kw)                            # bound formal NAMES only (values stay runtime)
 
     fieldcanon = _seam_field_canon(seam)                   # DETACHED authored-field→canon (never the graph)
+    scalar_canons = _seam_scalar_canons(seam)              # DETACHED scalar-slot type metadata (classification)
     pg = _l_seam_plan_graph(seam, recipe_inputs; name_of = _seam_name_of(seam), path = path)  # (1) no plan()/graph
     slotof = _seam_slot_of_canon(seam)                     # (2) physical layout from the seam
     entry = _l_seam_entry_current(seam)                    # (3) proven entry-current
@@ -274,7 +288,7 @@ function compile_leaf(ir::MethodIR, seam::_KernelPlan, binder;
     for s in sched
         if s.kind === :write
             wi += 1; pw = writes[wi]
-            ctx = _EmitCtx(fieldcanon, slotof, Tuple(bound_names), Int[], Symbol[])
+            ctx = _EmitCtx(fieldcanon, slotof, scalar_canons, Tuple(bound_names), Int[], Symbol[])
             lhs = _exec_rhs(pw.target, ctx)                # slot local (the aliased buffer written in place)
             rhs = _exec_rhs(pw.rhs, ctx)                   # fused broadcast tree (exact-identity callees)
             for I in unique(ctx.slots_used)                # bind each slot buffer to a local first
