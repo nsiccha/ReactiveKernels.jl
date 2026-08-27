@@ -82,7 +82,7 @@ example_nuts_binding(init, stepsize) =
     pot, dpot_dpos = grad_f(pos)                 # single selected grad recipe; factory binds grad_f=pgrad!(g,x)
     chol_metric = cholesky(metric)
     dkin_dmom = chol_metric \ mom
-    kin = .5 * (@node(logdet(chol_metric)) + dot(mom, dkin_dmom))
+    kin = oftype(pot, 0.5) * (@node(logdet(chol_metric)) + dot(mom, dkin_dmom))   # typed 1/2 (no Float64 promotion)
     ham = pot + kin
     dham_dpos = dpot_dpos
     dham_dmom = dkin_dmom
@@ -90,9 +90,9 @@ end
 
 # ---- FORM A: leapfrog! — RK-authored FREE @kernel with visible ordered effects -----------------------
 @kernel leapfrog!(phasepoint; stepsize) = begin
-    @. phasepoint.mom -= 0.5 * stepsize * phasepoint.dham_dpos
-    @. phasepoint.pos +=       stepsize * phasepoint.dham_dmom
-    @. phasepoint.mom -= 0.5 * stepsize * phasepoint.dham_dpos
+    @. phasepoint.mom -= oftype(stepsize, 0.5) * stepsize * phasepoint.dham_dpos   # typed half-step
+    @. phasepoint.pos +=                       stepsize * phasepoint.dham_dmom
+    @. phasepoint.mom -= oftype(stepsize, 0.5) * stepsize * phasepoint.dham_dpos
 end
 
 # ---- FORM A2: refresh_momentum!! — RK-authored FREE @kernel; SOURCE MUTATION ONLY ---------------------

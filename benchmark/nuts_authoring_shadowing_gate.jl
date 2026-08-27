@@ -81,7 +81,10 @@ blocks = kernel_blocks()
     end
     @test grad_recipe[]                                              # ONE destination-bound grad recipe (pot+dpot)
     @test !pot_f_producer[]                                          # no redundant pot-only producer call
-    println("  (grad) euclidean_phasepoint(grad_f, metric, pos, mom): one grad recipe, pot_f absent. OK")
+    # (grad-f32) kinetic 1/2 is typed — bare .5/0.5 would widen a Float32 phase point to Float64.
+    epb = srcof(ep0.body)
+    @test occursin("oftype(pot, 0.5)", epb) && !occursin("0.5 * (", epb)
+    println("  (grad) euclidean_phasepoint(grad_f, metric, pos, mom): one grad recipe, pot_f absent, typed 1/2. OK")
 
     # ---- FORM A: leapfrog! RK @kernel, exact 3-line mom/pos/mom -----------------------------------
     lf = blocks[:leapfrog!]; @test :stepsize in formals(lf.sig)
@@ -91,7 +94,10 @@ blocks = kernel_blocks()
     @test heads == [:(-=), :(+=), :(-=)]
     lb = srcof(lf.body)
     @test occursin("phasepoint.dham_dpos", lb) && occursin("phasepoint.dham_dmom", lb)
-    println("  (A) leapfrog! RK @kernel, exact 3-line Stormer-Verlet. OK")
+    # (A-f32) typed half-step coefficient — bare .5/0.5 would widen a Float32 stepsize to Float64.
+    @test occursin("oftype(stepsize, 0.5)", lb)                      # half-kicks use a typed 1/2
+    @test !occursin("0.5 * stepsize", lb) && !occursin("0.5 * (", lb)   # no bare untyped 1/2 at a kick site
+    println("  (A) leapfrog! RK @kernel, exact 3-line Stormer-Verlet, typed half-step. OK")
 
     # ---- FORM B (+22:46): implicit-field, no-Ref, TWO-DIRECT-BRANCH direction, runtime rng ---------
     ns = blocks[:nuts_state]; nb = srcof(ns.body)
@@ -318,6 +324,8 @@ let b = blocks[:nuts_state], fieldset = Set(b.fields) ∪ Set(b.sources)
     end
 end
 println("\nSTRENGTHENED STRUCTURAL GATE PASS (source-form / Meta.parseall — does not eval @kernel).")
-println("Construction verified SEPARATELY on the 612ceee Inc1 substrate (all six @kernel blocks define:")
-println("@node, implicit fields + __self__ receiver, free-kernel leapfrog!/nuts!!, stateful nuts_state).")
-println("Source-form + construction only — NO MethodIR/lowering/execution/parity/alloc/perf claim.")
+println("SOURCE-FORM VERIFIED ONLY. This updated eight-@kernel/effect-declaration source (euclidean_phasepoint,")
+println("leapfrog!, refresh_momentum!!, nuts_stats!, nuts_state, nuts!!, dual_averaging_state, welford_var) is")
+println("NOT YET constructed: construction is PENDING cherry-pick onto the current effects/factory substrate")
+println("(@rk_* declarations + @kernel source-capture + nuts!! execution seam). Does NOT inherit the prior")
+println("612ceee construction claim. NO MethodIR/lowering/execution/parity/alloc/perf claim.")
