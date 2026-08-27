@@ -41,6 +41,15 @@ end
     zero!() = Base.fill!(buf, 0.0)
 end
 
+# two-primitive capture: distinct primitives captured in one owner must carry DISTINCT
+# registration tokens (else they collide as _RegisteredCall edge / cache keys).
+@kernel dualprim(a, b) = begin
+    go!() = begin
+        Base.fill!(a, 0.0)
+        Base.copyto!(b, a)
+    end
+end
+
 # local-spoof adversary: a method-local `fill!` shadows the primitive → it is a body LOCAL,
 # excluded at ref collection, NEVER captured as the registered `Base.fill!` identity.
 @kernel spooffill(buf) = begin
@@ -125,9 +134,17 @@ baremodule NoFill end
     end
 
     @testset "identity-bound primitive effect registry" begin
-        # exact Base.fill! resolves to its declared destination write (positional 1)
-        @test RKS._kernel_primitive_effect(Base.fill!).writes == (1,)
-        # copy!! is NOT a generic positional primitive — it is the structural :intrinsic
+        # exact Base.fill! → complete positional descriptor: dest(1)=write, x(2)=read,
+        # result aliases positional 1 (so `x = fill!(buf,0)` preserves x===buf downstream).
+        pf = RKS._kernel_primitive_effect(Base.fill!)
+        @test pf.writes == (1,) && pf.reads == (2,) && pf.result_alias == 1
+        @test pf.token === Symbol("__rk_primitive_Base_fill!__")
+        # two-primitive collision discriminator: DISTINCT primitives carry DISTINCT tokens
+        # (a shared constant token would collide in _RegisteredCall edges / plan caches).
+        pc = RKS._kernel_primitive_effect(Base.copyto!)
+        @test pc.token === Symbol("__rk_primitive_Base_copyto!__")
+        @test pf.token !== pc.token
+        # copy!! is NOT a positional primitive — it is the structural :intrinsic
         # (owned-closure copy, result===dest), carried by its own registration.
         @test RKS._kernel_primitive_effect(copy!!) === nothing
         @test RKS.kernel_registration(copy!!).kind === :intrinsic
@@ -148,6 +165,13 @@ baremodule NoFill end
         @test prim.target === Base.fill!
         @test prim.registration.primitive_effect isa RKS._PrimitiveEffect
         @test prim.registration.primitive_effect.writes == (1,)
+        # the registration token is the primitive's DISTINCT identity (no shared constant)
+        @test prim.registration.token === Symbol("__rk_primitive_Base_fill!__")
+        # two captured primitives in one owner carry DISTINCT tokens (edge-key collision)
+        dcaps = [c for c in RKS.kernel_callee_registrations(dualprim)
+                 if c.registration.kind === :primitive]
+        @test length(dcaps) == 2
+        @test length(unique(c.registration.token for c in dcaps)) == 2
         # keyed by the AUTHORED SLOT — an independently reconstructed ref matches (value key)
         ref2 = RKS._CapturedCalleeRef(GlobalRef(@__MODULE__, :Base), :fill!)
         @test RKS.kernel_callee_registration(filler, ref2).primitive_effect.writes == (1,)

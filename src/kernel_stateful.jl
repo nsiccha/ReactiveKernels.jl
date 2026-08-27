@@ -750,23 +750,29 @@ end
 # NOT because it is `.`-qualified or bang-suffixed. Captured DETACHED at owner definition
 # (`_kernel_capture_callees`, kind `:primitive`), rebind-checked; never reread at analysis.
 
-# Declared effect of a VALUE-POSITION primitive: the positional actual indices that are
-# WRITES; every other positional is a READ (source order retained). For positional-effect
-# primitives only (e.g. `Base.fill!`). `copy!!` is NOT one of these — it is the RK-core
-# `:intrinsic` with STRONGER STRUCTURAL semantics (destination owned-CLOSURE copy, shared
-# authority untouched, `result === dest`, shape/type checks), carried by its own
-# registration, never flattened to a positional write here.
+# The COMPLETE positional-effect descriptor of an RK-core primitive: `token` a stable,
+# DISTINCT per-primitive identity (so two primitives never collide in `_RegisteredCall`
+# edges / plan caches — the whole registration is keyed by it); `writes` the positional
+# actuals written; `reads` the positional actuals read; `result_alias` the positional the
+# RETURNED value aliases (`Base.fill!`/`Base.copyto!` return their destination), or
+# `nothing`. So `x = Base.fill!(buf, 0)` is known to preserve `x === buf` in later lowering.
+# `copy!!` is NOT one of these — it is the RK-core `:intrinsic` with STRONGER STRUCTURAL
+# semantics (destination owned-CLOSURE copy, shared authority untouched, `result === dest`,
+# shape/type checks), carried by its own registration, never flattened to a positional here.
 struct _PrimitiveEffect
+    token::Symbol
     writes::Tuple{Vararg{Int}}
-    # NOTE: `Base.fill!` is currently admitted in DISCARDED-effect position only; a
-    # declared result-alias policy is needed before any value-position use.
+    reads::Tuple{Vararg{Int}}
+    result_alias::Union{Nothing,Int}
 end
 
 # Pure DISPATCH on the resolved VALUE identity — used AT OWNER DEFINITION (capture time),
 # so its result is SNAPSHOTTED detached (no mutable registry, no analysis-time reread).
-# `nothing` = not an RK-core value-position primitive.
+# `nothing` = not an RK-core positional primitive. Each entry carries a DISTINCT token.
+# The 2-arg destination-write forms only; higher-arity `copyto!` (do/so/N) is out of scope.
 _kernel_primitive_effect(@nospecialize(v)) =
-    v === Base.fill! ? _PrimitiveEffect((1,)) :    # fill!(dest, x): dest = write, x = read
+    v === Base.fill!   ? _PrimitiveEffect(Symbol("__rk_primitive_Base_fill!__"),   (1,), (2,), 1) :
+    v === Base.copyto! ? _PrimitiveEffect(Symbol("__rk_primitive_Base_copyto!__"), (1,), (2,), 1) :
     nothing
 
 struct _KernelRegistration
@@ -1050,7 +1056,8 @@ function _kernel_capture_callees(mod::Module, refs)
             # LOCAL/formal `fill!` never reaches here (excluded at ref collection).
             peff = _kernel_primitive_effect(target)
             peff === nothing && continue
-            reg = _KernelRegistration(Symbol("__rk_primitive__"), :primitive, nothing,
+            # keyed by the primitive's OWN distinct token (no cross-primitive collision)
+            reg = _KernelRegistration(peff.token, :primitive, nothing,
                                       (), (), false, target, peff)
             push!(caps, _CapturedCallee(cref, reg, target))
             continue
