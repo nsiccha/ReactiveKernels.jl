@@ -107,7 +107,8 @@ end
 
 # ---- reset/proposal restore via the RK-CORE registered structural strong-update `copy!!(dest, src)`
 # (result === dest): copies the COMPLETE OWNED authoritative closure from src into dest's EXISTING buffers,
-# preserves destination identity/currentness, leaves SHARED authority slots UNTOUCHED, collapses aliased
+# preserves destination object/buffer identity, transfers source currentness, leaves SHARED authority slots
+# UNTOUCHED, collapses aliased
 # projections to ONE physical copy, rejects incompatible shape/type/shared-authority identity.
 #   SHARED-BY-IDENTITY (untouched by copy!!): grad_f, metric, chol_metric + @node(logdet(chol_metric)). A
 #     metric mutation updates the ONE shared authority + its chol/@node closure EXACTLY once.

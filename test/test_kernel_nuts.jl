@@ -504,7 +504,7 @@ end
         out
     end
 
-    # === source drift: SPOOF-PROOF ===
+    # === local executable-fixture drift checks (the exact-AST authority is the benchmark shadowing gate) ===
     resetir = only(i for i in RK.method_irs(_NutsFix.nuts_state) if i.id.name === :reset!)
     _count_for(x) = (x isa RK._For ? 1 : 0) + ((x isa Tuple || x isa AbstractVector) ? sum(_count_for, x; init = 0) :
         (x isa RK._MExpr || x isa RK._MStmt) ? sum(f -> _count_for(getfield(x, f)), fieldnames(typeof(x)); init = 0) : 0)
