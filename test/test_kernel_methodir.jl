@@ -610,6 +610,24 @@ end
     @test eok(mkeff(Random.randn!), (rng, Vector{Float64}))         # refresh: randn!(rng, mom)
     @test eok(mkeff(LinearAlgebra.lmul!), (L, Vector{Float64}))     # refresh: lmul!(chol, mom); L=LowerTriangular{T,Matrix{T}}
     @test L <: LinearAlgebra.LowerTriangular && L.parameters[2] <: Matrix   # Cholesky.L backing is a Base Matrix
+    # the ALLOCATION-FREE uplo='U' Cholesky-L view POC emits (RK 13:52, kernel_nuts.jl:54):
+    # `adjoint(UpperTriangular(factors))`, which Julia CANONICALIZES to LowerTriangular{T,Adjoint{T,Matrix{T}}}
+    # — the lower factor as a lazy re-index of the stored upper triangle's concrete Matrix, never materialized.
+    UL = typeof(adjoint(LinearAlgebra.UpperTriangular(getfield(cholesky([2.0 0.5; 0.5 3.0]), :factors))))
+    @test UL <: LinearAlgebra.LowerTriangular{Float64,<:LinearAlgebra.Adjoint{Float64,<:Matrix{Float64}}}  # the exact canonical view
+    @test eok(mkeff(LinearAlgebra.lmul!), (UL, Vector{Float64}))    # POSITIVE: dense-Cholesky uplo='U' L-view lmul!
+    # NEGATIVE: the SAME LowerTriangular-over-Adjoint shape but backed by a CUSTOM matrix under the Adjoint
+    # (arbitrary lmul!/getindex) REJECTS — the concrete Base Matrix backing is proven RECURSIVELY through the view.
+    @test !eok(mkeff(LinearAlgebra.lmul!),
+               (LinearAlgebra.LowerTriangular{Float64,LinearAlgebra.Adjoint{Float64,_DomEvil.EvilArr}}, Vector{Float64}))
+    # NEGATIVE: a GENERIC bare Adjoint (of a plain dense Matrix) as the OUTER lhs REJECTS — only the wrapped view
+    @test !eok(mkeff(LinearAlgebra.lmul!), (LinearAlgebra.Adjoint{Float64,Matrix{Float64}}, Vector{Float64}))
+    # NEGATIVE (RK 13:59): the Adjoint-backing allowance is LOWER-triangular ONLY — Upper/Symmetric over an
+    # Adjoint have no emitting consumer and stay MATRIX-ONLY, so an Adjoint backing there REJECTS (no widening).
+    @test !eok(mkeff(LinearAlgebra.lmul!), (UpperTriangular{Float64,LinearAlgebra.Adjoint{Float64,Matrix{Float64}}}, Vector{Float64}))
+    @test !eok(mkeff(LinearAlgebra.lmul!), (Symmetric{Float64,LinearAlgebra.Adjoint{Float64,Matrix{Float64}}}, Vector{Float64}))
+    # ... while the SAME wrappers over a plain concrete Base Matrix still pass (matrix-only rule intact)
+    @test eok(mkeff(LinearAlgebra.lmul!), (UpperTriangular{Float64,Matrix{Float64}}, Vector{Float64}))
     @test eok(mkeff(LinearAlgebra.lmul!), (Diagonal{Float64,Vector{Float64}}, Vector{Float64}))
     @test eok(mkeff(Random.rand), (rng, Type{Bool}))               # step!: rand(rng, Bool)
     @test eok(mkeff(Base.eachcol), (Matrix{Float64},))             # Welford: eachcol(x)

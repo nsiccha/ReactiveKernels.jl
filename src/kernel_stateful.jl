@@ -969,12 +969,29 @@ function _kernel_dom_lmul_lhs(::Type{T}) where {T}
     S isa Type || return false
     if T <: LinearAlgebra.Diagonal
         return S <: Vector && _kernel_dom_num_array(S)         # Diagonal backs a concrete Base Vector
-    elseif T <: LinearAlgebra.LowerTriangular || T <: LinearAlgebra.UpperTriangular ||
+    elseif T <: LinearAlgebra.LowerTriangular
+        return _kernel_dom_lower_backing(S)                   # concrete Base Matrix OR the canonicalized Adjoint view
+    elseif T <: LinearAlgebra.UpperTriangular ||
            T <: LinearAlgebra.UnitLowerTriangular || T <: LinearAlgebra.UnitUpperTriangular ||
            T <: LinearAlgebra.Symmetric || T <: LinearAlgebra.Hermitian
-        return _kernel_dom_num_matrix(S)                       # backs a concrete Base numeric Matrix
+        return _kernel_dom_num_matrix(S)                      # MATRIX-ONLY: no consumer emits an Adjoint backing here
     end
     false
+end
+# The backing storage of a sanctioned LOWER-triangular wrapper: a concrete Base numeric `Matrix`, OR the
+# ALLOCATION-FREE `Adjoint` of one (RK 13:52/13:59). Julia CANONICALIZES `adjoint(UpperTriangular(F))` — POC's
+# uplo='U' Cholesky-L view (kernel_nuts.jl:54) — to `LowerTriangular{T,Adjoint{T,Matrix{T}}}`, so the outer
+# wrapper is a LowerTriangular whose BACKING is `Adjoint{T,Matrix{T}}`; that adjoint just re-indexes the same
+# concrete `F` with no allocation, so `lmul!(chol.L, mom)` stays 0-B. This Adjoint-backing allowance is
+# LOWER-triangular ONLY — the exact emitted view — never widened to Upper/Symmetric/Hermitian, which have no
+# such consumer and stay matrix-only. Recursively prove the `Adjoint`'s parent is a concrete Base numeric
+# `Matrix`; a custom backing under the `Adjoint` (or directly) is rejected.
+function _kernel_dom_lower_backing(::Type{S}) where {S}
+    _kernel_dom_num_matrix(S) && return true                  # concrete Base numeric Matrix
+    S <: LinearAlgebra.Adjoint || return false                # only the adjoint VIEW is additionally allowed
+    (S isa DataType && length(S.parameters) >= 2) || return false
+    P = S.parameters[2]                                        # the Adjoint's parent (the re-indexed storage)
+    P isa Type && _kernel_dom_num_matrix(P)                   # ... which must be a concrete Base numeric Matrix
 end
 # a supported `rand` sample spec at pos2: a `Type{S}` of a builtin sampleable numeric/Bool scalar, or a
 # numeric value spec.
