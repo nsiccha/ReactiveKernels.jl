@@ -54,7 +54,7 @@ The tests separately verify oracle parity, concrete `Float64` returns, invariant
 hoisting, exact zero-allocation native reduction, and output-only allocation in
 collect mode.
 
-## More families shared with ProbabilityMeasures
+## More scalar families shared with ProbabilityMeasures
 
 These compact recipes cover three qualitatively different shapes that are also
 implemented by ProbabilityMeasures.jl: a heavy-tailed Cauchy, the nondifferentiable
@@ -78,6 +78,47 @@ Main.ReactiveKernelsDocs.execute_example(
     @__MODULE__, Main.DistributionExamples.LOGNORMAL_SOURCE,
 )
 ```
+
+The same pattern extends without family-specific batching code. Exponential is
+authored from a log scale, Geometric from a success-probability logit, and
+Uniform from dynamic endpoints. Each block defines one scalar formula and then
+uses the ordinary `plate` API for independent observations; native and Reactant
+tests compile both forms from these exact source strings.
+
+```@eval
+Main.ReactiveKernelsDocs.execute_example(
+    @__MODULE__, Main.DistributionExamples.EXPONENTIAL_SOURCE,
+)
+```
+
+```@eval
+Main.ReactiveKernelsDocs.execute_example(
+    @__MODULE__, Main.DistributionExamples.GEOMETRIC_SOURCE,
+)
+```
+
+```@eval
+Main.ReactiveKernelsDocs.execute_example(
+    @__MODULE__, Main.DistributionExamples.UNIFORM_SOURCE,
+)
+```
+
+### Added-family native and Reactant benchmark
+
+The matched comparison uses the public vectorized log-density APIs in
+Distributions and ProbabilityMeasures and the generic RK `plate` generated from
+each scalar source above. Parameters are traced runtime inputs under Reactant;
+compilation and host↔device transfers are excluded from execution timings.
+
+```@eval
+Main.ReactiveKernelsDocs.render_scalar_gallery_benchmarks()
+```
+
+Each cell is the median of five minimum-time measurements. Unsupported
+Distributions + Reactant cells retain the constructor diagnostic instead of
+silently disappearing. The checked-in
+[gallery benchmark receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/scalar-distribution-gallery-v1.toml)
+contains raw samples, allocations, support results, and exact package pins.
 
 ## Structured families: multivariate Normal and AR(1)
 

@@ -8,7 +8,9 @@ import Enzyme
 import Reactant: @compile, @jit
 
 include(joinpath(@__DIR__, "..", "examples", "distribution_kernel_sources.jl"))
-using .DistributionKernelSources: MVNORMAL_SOURCE, AR1_SOURCE
+using .DistributionKernelSources:
+    EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE,
+    MVNORMAL_SOURCE, AR1_SOURCE
 
 function _evaluate_distribution_kernel_source(source::AbstractString)
     sandbox = Module(gensym(:ReactantDistributionKernel), true, true)
@@ -213,6 +215,49 @@ end
         @test lognormal_compiled(x, μ, logscale) ≈ lognormal_reference
         unsupported_x = Reactant.to_rarray(-1.0; track_numbers = true)
         @test lognormal_compiled(unsupported_x, μ, logscale) == -Inf
+    end
+
+    @testset "exact scalar gallery sources compile directly and through plate" begin
+        exponential = _evaluate_distribution_kernel_source(EXPONENTIAL_SOURCE)
+        ex_x_host, ex_logθ_host = Tuple(exponential.inputs)
+        ex_x, ex_logθ = Reactant.to_rarray.(
+            (ex_x_host, ex_logθ_host); track_numbers = true)
+        ex_compiled = @compile exponential.kernel(ex_x, ex_logθ)
+        @test ex_compiled(ex_x, ex_logθ) ≈ exponential.output
+        ex_bad_x = Reactant.to_rarray(-1.0; track_numbers = true)
+        @test ex_compiled(ex_bad_x, ex_logθ) == -Inf
+        ex_plate_x_host, _ = Tuple(exponential.plate_inputs)
+        ex_plate_x = Reactant.to_rarray(ex_plate_x_host)
+        ex_plate_compiled = @compile exponential.plated(ex_plate_x, ex_logθ)
+        @test ex_plate_compiled(ex_plate_x, ex_logθ) ≈ exponential.plate_output
+
+        geometric = _evaluate_distribution_kernel_source(GEOMETRIC_SOURCE)
+        geo_observed_host, geo_logitp_host = Tuple(geometric.inputs)
+        geo_observed = Reactant.to_rarray(geo_observed_host; track_numbers = true)
+        geo_logitp = Reactant.to_rarray(geo_logitp_host; track_numbers = true)
+        geo_compiled = @compile geometric.kernel(geo_observed, geo_logitp)
+        @test geo_compiled(geo_observed, geo_logitp) ≈ geometric.output
+        geo_bad = Reactant.to_rarray(-1; track_numbers = true)
+        @test geo_compiled(geo_bad, geo_logitp) == -Inf
+        geo_plate_host, _ = Tuple(geometric.plate_inputs)
+        geo_plate = Reactant.to_rarray(geo_plate_host)
+        geo_plate_compiled = @compile geometric.plated(geo_plate, geo_logitp)
+        @test geo_plate_compiled(geo_plate, geo_logitp) ≈ geometric.plate_output
+
+        uniform = _evaluate_distribution_kernel_source(UNIFORM_SOURCE)
+        uni_x_host, uni_lower_host, uni_upper_host = Tuple(uniform.inputs)
+        uni_x, uni_lower, uni_upper = Reactant.to_rarray.(
+            (uni_x_host, uni_lower_host, uni_upper_host); track_numbers = true)
+        uni_compiled = @compile uniform.kernel(uni_x, uni_lower, uni_upper)
+        @test uni_compiled(uni_x, uni_lower, uni_upper) ≈ uniform.output
+        uni_bad_x = Reactant.to_rarray(3.0; track_numbers = true)
+        @test uni_compiled(uni_bad_x, uni_lower, uni_upper) == -Inf
+        uni_plate_host, _, _ = Tuple(uniform.plate_inputs)
+        uni_plate = Reactant.to_rarray(uni_plate_host)
+        uni_plate_compiled = @compile uniform.plated(
+            uni_plate, uni_lower, uni_upper)
+        @test uni_plate_compiled(
+            uni_plate, uni_lower, uni_upper) ≈ uniform.plate_output
     end
 
     @testset "non-scalar MVN and AR(1) kernels compile and replica-map" begin

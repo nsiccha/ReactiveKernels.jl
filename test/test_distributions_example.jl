@@ -9,7 +9,7 @@ using ReactiveKernels: code_expr
     artifacts = map(evaluate_source, all_sources())
 
     @testset "sources build native recipes checked against a Distributions oracle" begin
-        @test length(artifacts) == 8
+        @test length(artifacts) == 11
         # Every source declares @kernel recipes.
         @test all(source -> occursin(r"@kernel \w+\(", source), all_sources())
         continuous, discrete, vectorized = all_sources()
@@ -39,7 +39,29 @@ using ReactiveKernels: code_expr
         _, μ, logσ = Tuple(lognormal.inputs)
         @test lognormal.kernel(-1.0, μ, logσ) == -Inf
 
-        mvnormal, ar1 = artifacts[7:8]
+        exponential, geometric, uniform = artifacts[7:9]
+        @test exponential.kernel(-1.0, exponential.inputs.logθ) == -Inf
+        @test geometric.kernel(-1, geometric.inputs.logitp) == -Inf
+        @test uniform.kernel(-1.1, uniform.inputs.lower, uniform.inputs.upper) == -Inf
+        @test uniform.kernel(
+            uniform.inputs.x, uniform.inputs.upper, uniform.inputs.lower) == -Inf
+
+        # Each newly authored scalar formula lifts through the generic `plate`
+        # path without a family-specific vectorized implementation.
+        for artifact in (exponential, geometric, uniform)
+            plated_inputs = Tuple(artifact.plate_inputs)
+            observations = first(plated_inputs)
+            shared = Base.tail(plated_inputs)
+            expected = sum(artifact.kernel(observation, shared...)
+                           for observation in observations)
+            @test artifact.plate_output ≈ expected
+            @test artifact.plated(plated_inputs...) ≈ expected
+            plated_code = string(code_expr(artifact.plated))
+            @test occursin("logdensity", plated_code)
+            @test !occursin("Distributions", plated_code)
+        end
+
+        mvnormal, ar1 = artifacts[10:11]
         mvn_code = string(code_expr(mvnormal.kernel))
         ar1_code = string(code_expr(ar1.kernel))
         @test all(name -> occursin(name, mvn_code),
@@ -125,13 +147,16 @@ using ReactiveKernels: code_expr
         @test all(artifact -> artifact.reference_allocated_bytes isa Int, artifacts)
         @test all(artifact -> artifact.allocated_bytes >= 0, artifacts)
         @test all(artifact -> artifact.reference_allocated_bytes >= 0, artifacts)
-        # The scalar native kernels are fully non-allocating, and so is their oracle.
-        @test all(artifact -> artifact.allocated_bytes == 0, artifacts[1:2])
-        @test all(artifact -> artifact.reference_allocated_bytes == 0, artifacts[1:2])
+        # Scalar native kernels are fully non-allocating, including the added
+        # Exponential/Geometric/Uniform formulas, and so are their oracles.
+        scalar_artifacts = artifacts[[1, 2, 4, 5, 6, 7, 8, 9]]
+        @test all(artifact -> artifact.allocated_bytes == 0, scalar_artifacts)
+        @test all(artifact -> artifact.reference_allocated_bytes == 0,
+                  scalar_artifacts)
     end
 
     @testset "concrete inference evidence matches exact result types" begin
-        expected_returns = ntuple(_ -> Float64, 8)
+        expected_returns = ntuple(_ -> Float64, 11)
         for (artifact, expected_return) in zip(artifacts, expected_returns)
             observed = artifact.kernel(Tuple(artifact.inputs)...)
             @test isconcretetype(artifact.inferred_return)

@@ -41,7 +41,7 @@ function check_rendered_docs(build_dir, page_tree)
     length(rendered) == length(sources) ||
         error("rendered site has $(length(rendered)) content pages; navigation config has $(length(sources))")
     expected_panels = Dict(
-        "distributions.md" => 8,
+        "distributions.md" => 11,
         "batched.md" => 1,
         "eight-schools.md" => 1,
         "linear-regression.md" => 1,

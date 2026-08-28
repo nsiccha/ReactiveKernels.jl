@@ -1,6 +1,109 @@
 module DistributionKernelSources
 
+export EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE
 export MVNORMAL_SOURCE, AR1_SOURCE
+
+const EXPONENTIAL_SOURCE = raw"""
+@kernel exponential_logpdf(x::Float64, logθ::Float64) = begin
+    invθ::Float64 = exp(-logθ)
+    logdensity::Float64 = x >= 0 ? -logθ - x * invθ : -Inf
+end
+
+exponential_kernel = prepare(exponential_logpdf;
+    have = (:x, :logθ), want = :logdensity)
+exponential_plated = plate(exponential_logpdf;
+    have = (:x, :logθ), want = :logdensity, batched = (:x,))
+
+x = 0.7
+logθ = log(1.3)
+inputs = (; x, logθ)
+output = exponential_kernel(Tuple(inputs)...)
+
+plate_x = [0.1, 0.7, 1.4, 2.1]
+plate_inputs = (; x = plate_x, logθ)
+plate_output = exponential_plated(Tuple(plate_inputs)...)
+
+docs_example = (;
+    name = :exponential_logscale,
+    origin = "one-sided Exponential log density from log scale (build executed)",
+    inputs,
+    kernel = exponential_kernel,
+    output,
+    plated = exponential_plated,
+    plate_inputs,
+    plate_output,
+)
+"""
+
+const GEOMETRIC_SOURCE = raw"""
+using LogExpFunctions: log1pexp
+
+@kernel geometric_logit_logpdf(observed::Int, logitp::Float64) = begin
+    logp::Float64 = -log1pexp(-logitp)
+    log1mp::Float64 = -log1pexp(logitp)
+    logdensity::Float64 = observed >= 0 ? logp + observed * log1mp : -Inf
+end
+
+geometric_kernel = prepare(geometric_logit_logpdf;
+    have = (:observed, :logitp), want = :logdensity)
+geometric_plated = plate(geometric_logit_logpdf;
+    have = (:observed, :logitp), want = :logdensity, batched = (:observed,))
+
+observed = 3
+logitp = 0.4
+inputs = (; observed, logitp)
+output = geometric_kernel(Tuple(inputs)...)
+
+plate_observed = [0, 1, 3, 2, 5]
+plate_inputs = (; observed = plate_observed, logitp)
+plate_output = geometric_plated(Tuple(plate_inputs)...)
+
+docs_example = (;
+    name = :geometric_logit,
+    origin = "Geometric failures-before-success log density from a logit (build executed)",
+    inputs,
+    kernel = geometric_kernel,
+    output,
+    plated = geometric_plated,
+    plate_inputs,
+    plate_output,
+)
+"""
+
+const UNIFORM_SOURCE = raw"""
+@kernel uniform_logpdf(
+        x::Float64, lower::Float64, upper::Float64) = begin
+    width::Float64 = upper - lower
+    valid::Bool = (lower < upper) & (x >= lower) & (x <= upper)
+    logdensity::Float64 = valid ? -log(width) : -Inf
+end
+
+uniform_kernel = prepare(uniform_logpdf;
+    have = (:x, :lower, :upper), want = :logdensity)
+uniform_plated = plate(uniform_logpdf;
+    have = (:x, :lower, :upper), want = :logdensity, batched = (:x,))
+
+x = 0.4
+lower = -1.0
+upper = 2.0
+inputs = (; x, lower, upper)
+output = uniform_kernel(Tuple(inputs)...)
+
+plate_x = [-0.8, -0.1, 0.4, 1.7]
+plate_inputs = (; x = plate_x, lower, upper)
+plate_output = uniform_plated(Tuple(plate_inputs)...)
+
+docs_example = (;
+    name = :uniform_bounded,
+    origin = "bounded Uniform log density with dynamic endpoints (build executed)",
+    inputs,
+    kernel = uniform_kernel,
+    output,
+    plated = uniform_plated,
+    plate_inputs,
+    plate_output,
+)
+"""
 
 const MVNORMAL_SOURCE = raw"""
 using LinearAlgebra: LowerTriangular, Symmetric, cholesky, diag, dot
