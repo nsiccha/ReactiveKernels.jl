@@ -298,13 +298,13 @@ _sp_wrong_order(spec; want) =
     ReactiveKernels.prepare_reactive(spec;
         have = Tuple(reverse(spec.have_names)), want = want)
 @reactive prepare=_sp_wrong_graph specialize=true _sp_bad_graph(pos, mom) = begin
-    y::typeof(pos) = pos
+    y::typeof(pos) = copy(pos)
 end
 @reactive prepare=_sp_wrong_want specialize=true _sp_bad_want(pos, mom) = begin
-    y::typeof(pos) = pos
+    y::typeof(pos) = copy(pos)
 end
 @reactive prepare=_sp_wrong_order specialize=true _sp_bad_order(pos, mom) = begin
-    y::typeof(pos) = pos
+    y::typeof(pos) = copy(pos)
 end
 
 _sp_ref(object, name) = typeof(getfield(object, :state).slots[

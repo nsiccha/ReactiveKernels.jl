@@ -23,7 +23,7 @@ features:
   - title: Optional cache-filling lowering
     details: prepare_nonallocating applies a final MutatingFunctions-backed AST rewrite, keeping mutation and allocation behavior independent of graph semantics.
   - title: Deliberately narrow
-    details: No dynamic scheduling, no AD, no PPL semantics, no symbolic algebra. It generates excellent plain Julia kernels for any pure dataflow graph.
+    details: No dynamic scheduling in a prepared hot kernel, no AD, no PPL semantics, no symbolic algebra. It generates excellent plain Julia kernels for pure dataflow graphs and rejects unproved effects in captured state-machine source.
 ---
 ```
 
@@ -87,10 +87,13 @@ the deliberate contrast with an invalidation-tracked reactive method body, where
 deferred or exception-conditional execution would defeat field-level
 invalidation and these forms are therefore rejected.
 
-The macro authors a graph, not a per-kernel object type. Compiled reactive state
-supports source mutation through `set!`, `mutate!`, and `touch!`; inline method
-definitions and ReactiveObjects-style magic `__self__` rewriting are not part of
-`@kernel`.
+This methodless form authors a graph, not a per-kernel object type. Compiled
+reactive state supports source mutation through `set!`, `mutate!`, and `touch!`.
+Method-bearing `@kernel` definitions enter a separate captured-source compiler
+with an implicit receiver and an exact registered-effect boundary; they are not
+ordinary stateless recipes. The [compiler capability and limits](compiler.md)
+page gives the full planner, lowering, state, control-flow, NUTS, and rejection
+contracts.
 
 ## Extend by named ports
 
