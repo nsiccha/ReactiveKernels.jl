@@ -14,9 +14,8 @@ use it directly in the normalizer and derive `σ = exp(logσ)` only for the
 standardized residual. RK performs graph planning and structural CSE, not
 algebraic rewriting such as cancelling `log(exp(logσ))`.
 
-Every panel is build-executed. **Raw input** is the complete authored path,
-**Generated kernel** is its actual `code_expr`, and **Compute DAG** is the plan
-that produced it.
+Each panel below shows the **Raw input** (the source), the **Generated kernel**
+(`code_expr`), and its **Compute DAG**.
 
 ## Continuous: Normal location and log scale
 
@@ -54,10 +53,6 @@ Main.ReactiveKernelsDocs.execute_example(
 )
 ```
 
-The tests separately verify oracle parity, concrete `Float64` returns, invariant
-hoisting, exact zero-allocation native reduction, and output-only allocation in
-collect mode.
-
 ## More scalar families shared with ProbabilityMeasures
 
 These compact recipes cover three qualitatively different shapes that are also
@@ -86,8 +81,7 @@ Main.ReactiveKernelsDocs.execute_example(
 The same pattern extends without family-specific batching code. Exponential is
 authored from a log scale, Geometric from a success-probability logit, and
 Uniform from dynamic endpoints. Each block defines one scalar formula and then
-uses the ordinary `plate` API for independent observations; native and Reactant
-tests compile both forms from these exact source strings.
+uses the ordinary `plate` API for independent observations.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
@@ -142,19 +136,15 @@ Main.ReactiveKernelsDocs.execute_example(
 )
 ```
 
-These rows are derived from the four `PreparedKernel`s built by that exact
-source. Matrix boundaries include a factorization recipe; pre-factorized
-boundaries cut the graph after it.
+These rows are derived from the four `PreparedKernel`s built by that source.
+Matrix boundaries include a factorization recipe; pre-factorized boundaries cut
+the graph after it.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_mvn_parametrization_plans(
     Main.DistributionExamples.MVNORMAL_SOURCE,
 )
 ```
-
-Native tests check all four results against the same `Distributions.MvNormal`
-oracle and require concrete `Float64` inference. Reactant compiles all four
-scalar kernels and all four whole-vector replica maps from the same source.
 
 The stationary AR(1) kernel similarly treats the complete sequence as one
 value. Its lagged residuals give an O(T) log density, including the stationary
@@ -169,15 +159,13 @@ Main.ReactiveKernelsDocs.execute_example(
 Both examples then apply `replica(...; batched = :x)`: a matrix represents
 independent vectors or independent series by columns. The inner coordinate/time
 axis remains coupled, while the added trailing axis maps the whole authored
-kernel. The native and Reactant tests compile both the scalar and replicated
-forms from these exact source strings.
+kernel.
 
 ### Structured native and Reactant benchmark
 
 The matched comparison below uses the covariance-Cholesky HAVE boundary and
-public multivariate-Normal log-density APIs. The four-boundary table above is a
-planner acceptance result; this timing table does not pretend that the three
-libraries expose equivalent construction-time parametrization APIs.
+public multivariate-Normal log-density APIs. It compares evaluation cost only,
+not construction-time parametrization APIs.
 For AR(1), Distributions and ProbabilityMeasures receive the mathematically
 equivalent dense MVN with its Cholesky factor computed before timing; RK runs
 the authored O(T) recurrence. Distribution construction, factorization,
@@ -216,10 +204,9 @@ exactly zero-allocation; the other native public interfaces allocate their
 vector of pointwise densities before summing it.
 
 Distributions + Reactant is marked unsupported because its exact public
-constructor rejects traced `μ` and `σ` values. This is a compatibility result,
-not an omitted measurement. First-shape compilation is recorded in the receipt
-for diagnostics but is not compared: RK's first sample includes Reactant service
-startup because it ran first.
+constructor rejects traced `μ` and `σ` values. First-shape compilation is
+recorded in the receipt for diagnostics but is not compared: RK's first sample
+includes Reactant service startup because it ran first.
 
 The machine-readable inputs and all five raw samples are checked in as the
 [benchmark receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/distribution-logdensity-v1.toml). The

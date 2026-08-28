@@ -37,10 +37,9 @@ unconstrained
 log prior + log Jacobian + log likelihood ──► unconstrained log density
 ```
 
-The panel below is one coherent, build-executed artifact. **Raw input** is the
-exact source that builds and runs the query, **Generated kernel** is
-`code_expr(density_kernel)` from that execution, and **Compute DAG** is the live
-colored `visualize(density_plan)` component.
+The panel below shows three views of this model: **Raw input** (the source),
+**Generated kernel** (`code_expr(density_kernel)`), and **Compute DAG**
+(`visualize(density_plan)`).
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_ppl_example(

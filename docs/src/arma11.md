@@ -38,10 +38,9 @@ The latent errors are a **first-class named port**: a query can ask for just the
 `errors`, the full `density`, or the one-step-ahead `forecast`, and the planner
 computes the recursion once and shares it.
 
-The panel below is one coherent, build-executed artifact. **Raw input** is the
-exact source that builds and runs the query, **Generated kernel** is
-`code_expr(density_kernel)` from that execution, and **Compute DAG** is the live
-colored `visualize(density_plan)` component.
+The panel below shows three views of this model: **Raw input** (the source),
+**Generated kernel** (`code_expr(density_kernel)`), and **Compute DAG**
+(`visualize(density_plan)`).
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_ppl_example(

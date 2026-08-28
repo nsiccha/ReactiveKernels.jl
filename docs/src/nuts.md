@@ -142,10 +142,6 @@ the drift test `test/test_nuts_docs_fixture.jl` keeps this page byte-identical t
 fixture, and this page renders live at
 <https://nsiccha.github.io/ReactiveKernels.jl/dev/nuts>.
 
-The fixture's comment preamble preserves its integration-stage provenance, so its
-“docs not sourced” staging line is historical rather than the page's current
-status. The table above is authoritative.
-
 The verbatim source below is the macro-free executable fixture as it exists today.
 Its helpers are inline arithmetic/control or captured sibling `@kernel` methods;
 there are no user-authored effect declarations. The fixture's `@node` use is

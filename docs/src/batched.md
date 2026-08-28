@@ -22,12 +22,12 @@ the native recipe only.
 
 ## One graph, two want boundaries
 
-The panel below is build-executed. It prepares the same graph twice —
-`want = :logdensity` for the total and `want = :per_obs` for the length-`N`
-vectorized pointwise density — checks both against a `Distributions.jl` oracle,
-and checks a full reverse-mode gradient over the `N`-dimensional batch against
-the analytic score `-(xᵢ - μ)/σ²`. The **Generated kernel** view confirms the
-lowered kernel names no distribution library.
+The panel below prepares the same graph twice — `want = :logdensity` for the
+total and `want = :per_obs` for the length-`N` vectorized pointwise density —
+checks both against a `Distributions.jl` oracle, and checks a full reverse-mode
+gradient over the `N`-dimensional batch against the analytic score
+`-(xᵢ - μ)/σ²`. The **Generated kernel** view confirms the lowered kernel names
+no distribution library.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
@@ -105,14 +105,10 @@ prep = prepare_gradient(primal, backend, x, Cache(buffer), Constant(μ), Constan
 gradient!(primal, grad, prep, backend, x, Cache(buffer), Constant(μ), Constant(logσ))
 ```
 
-## Reproducible integration gate
+## Reproducing the zero-allocation claims
 
-The default package tests stay independent of the unregistered weak dependency;
-the `Distributions.jl`-free value, want-pruning, and gradient checks above run in
-the default suite (`test/test_batched_example.jl`). The zero-allocation value and
-gradient claims need the pinned `MutatingFunctions` revision and are proven
-separately in `test/test_batched_nonallocating.jl`, run through the same gate as
-the other non-allocating tests:
+The zero-allocation value and gradient claims need the pinned `MutatingFunctions`
+revision. Reproduce them with:
 
 ```sh
 julia --startup-file=no test/run_nonallocating_integration.jl
