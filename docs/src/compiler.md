@@ -7,12 +7,13 @@ prepared hot path, and which source shapes are deliberately rejected.
 
 The word *compiler* is used here for three related but different pipelines:
 
-1. the public stateless have→want compiler, which selects recipes and emits a
+- the public stateless have→want compiler, which selects recipes and emits a
    straight-line Julia callable;
-2. the public reactive compiler, which fixes the same selected graph into typed
+- the public reactive compiler, which fixes the same selected graph into typed
    slots, validity bits, dependency closures, and generated lazy getters; and
-3. the source-captured state-machine compiler, which analyzes method-bearing
-   `@kernel` definitions using captured and validated effect metadata. Its most complete
+- the source-captured state-machine compiler, which analyzes method-bearing
+   `@kernel` definitions using captured and validated effect metadata. Its most
+   complete
    consumer is the sealed native NUTS acceptance artifact.
 
 Those surfaces share graph identities, producer selection, and currentness
@@ -93,24 +94,24 @@ order is retained.
 
 The planner then performs these steps:
 
-1. Starting from every wanted value not already in HAVE, walk producers
+- **Candidate frontier.** Starting from every wanted value not already in HAVE, walk producers
    backward until reaching HAVE. This forms the candidate-recipe frontier.
    Effectful recipes are excluded.
-2. Search exact subsets of that frontier with branch-and-bound. A search state
+- **Exact subset search.** Search exact subsets of that frontier with branch-and-bound. A search state
    contains selected recipes. Its available set is HAVE plus every selected
    output; its unresolved frontier is the unsatisfied WANTS plus inputs of
    selected recipes that are not yet available.
-3. Pick the first unresolved value and branch over every candidate recipe that
+- **Branching.** Pick the first unresolved value and branch over every candidate recipe that
    can produce it. Non-negative costs allow pruning any branch already more
    expensive than the incumbent.
-4. Rank complete selections lexicographically by total declared cost and then
+- **Ranking.** Rank complete selections lexicographically by total declared cost and then
    by number of recipes. Recipe identifiers provide deterministic traversal
    order; the cost is an author-supplied planning weight, not a timing estimate.
-5. Accept a complete selection only if availability-based Kahn ordering can
+- **Execution check.** Accept a complete selection only if availability-based Kahn ordering can
    execute it. Each ready recipe adds all of its outputs to the available set.
    This avoids inventing a cycle when overlapping multi-output recipes admit a
    valid order through a different producer.
-6. Record the topological recipe order and one selected owner recipe for each
+- **Recorded result.** Record the topological recipe order and one selected owner recipe for each
    produced canonical value. Collateral outputs from a non-owner recipe may be
    computed, but they never overwrite HAVE or an earlier selected owner.
 
@@ -243,16 +244,16 @@ has a monotonic version, a policy (`source`, `reactive`, or `frozen`), and—for
 reactive materialization—the versions of the actual selected HAVE leaves that
 produced it.
 
-On a demand, the state:
+On a demand, the state performs these operations in dependency order:
 
-1. forms effective HAVE from sources, frozen cut points, and recursively
+- **Effective HAVE.** Form effective HAVE from sources, frozen cut points, and recursively
    provenance-valid materializations;
-2. plans the missing request;
-3. extends the request only with nominated materialization boundaries that this
+- **Initial plan.** Plan the missing request;
+- **Boundary extension.** Extend the request only with nominated materialization boundaries that this
    plan actually produces;
-4. replans the extended boundary, reuses or prepares its stateless kernel, and
-   calls it with only the HAVE leaves the plan consumes; and
-5. stores nominated results with provenance from the selected producer paths,
+- **Prepared execution.** Replan the extended boundary, reuse or prepare its stateless kernel, and
+   call it with only the HAVE leaves the plan consumes; and
+- **Stored result.** Store nominated results with provenance from the selected producer paths,
    not from unused alternatives.
 
 Validation uses a recursion-stack cycle check, so shared provenance subgraphs
