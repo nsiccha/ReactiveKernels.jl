@@ -6,7 +6,7 @@ using Statistics
 # NUTS diagnostics are part of the external sampler exemplar, not RK's package API.
 isdefined(Main, :ReactiveKernelsNUTSExample) ||
     Base.include(Main, joinpath(@__DIR__, "nuts_runtime.jl"))
-using Main.ReactiveKernelsNUTSExample: NUTSDiagnostics
+using Main.ReactiveKernelsNUTSExample: NUTSDiagnostics, welford_var, step!
 
 export MomentsAccumulator, update, fit
 export HMCDiagnosticsAccumulator, record_transition, fit_diagnostics

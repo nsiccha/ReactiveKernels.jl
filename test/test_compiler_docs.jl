@@ -1,5 +1,7 @@
 using Test
 
+_compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
+
 @testset "compiler capability page is navigated, explicit, and code-free" begin
     root = joinpath(@__DIR__, "..")
     page_path = joinpath(root, "docs", "src", "compiler.md")
@@ -7,14 +9,14 @@ using Test
     index_path = joinpath(root, "docs", "src", "index.md")
 
     @test isfile(page_path)
-    page = read(page_path, String)
-    make = read(make_path, String)
-    index = read(index_path, String)
+    page = _compiler_docs_lf(read(page_path, String))
+    make = _compiler_docs_lf(read(make_path, String))
+    index = _compiler_docs_lf(read(index_path, String))
 
     @test occursin("\"Compiler capability and limits\" => \"compiler.md\"", make)
     @test occursin("compiler.md", index)
 
-    nuts = read(joinpath(root, "docs", "src", "nuts.md"), String)
+    nuts = _compiler_docs_lf(read(joinpath(root, "docs", "src", "nuts.md"), String))
     @test occursin("not an RK package API", nuts)
     @test occursin("External example only", nuts)
     @test occursin("The former `@rk_pure` / `@rk_borrows` / `@rk_rng` declarations no longer exist", nuts)
