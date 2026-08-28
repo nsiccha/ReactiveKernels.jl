@@ -1,21 +1,30 @@
 # NUTS sampling
 
-ReactiveKernels' No-U-Turn sampler is authored as eight method-bearing `@kernel`
-specifications modeled on ReactiveHMC.jl's algorithm structure. The public
-sampler is compiled, executable, and allocation-free in steady state. This page
-separates that implementation claim from the narrower performance evidence and
-keeps the complete authoring source available without making it the main reading
-flow.
+ReactiveKernels' source-compiler NUTS acceptance sampler is authored as a
+**single, method-bearing `@kernel` surface** — eight named specifications that
+together are the whole sampler — modeled on the ReactiveHMC.jl algorithm
+structure. This page shows that artifact's **authoring source** and measured
+performance. The separately packaged exported sampler is identified below.
 
-The public `nuts!!` sampler is **landed and executable on `main`**: `@kernel` lowers the
-NUTS source to a sealed, registry-free **native compiled recursion** (`compile_nuts_native`
-/ `_build_nuts_sampler`), and the public `nuts!!(state; rng)` mutates compiler-owned state
-in place and returns the **same object** (`result === state`, same concrete type) at
-**exact zero allocations**. The source below is embedded statically, copied from
-the reviewed fixture, and guarded byte-for-byte by
-`test/test_nuts_docs_fixture.jl`; it is not read or executed by the docs build.
-The checked-in G7 receipt measures work-normalized leapfrog throughput; it is
-not an end-to-end sampling or ESS benchmark.
+The fixture's public `nuts!!` entry is **landed and executable on `main`**: `@kernel`
+lowers the NUTS source to a sealed, registry-free **native compiled recursion**
+(`compile_nuts_native` / `_build_nuts_sampler`). That entry mutates compiler-owned
+state in place and returns the **same object** (`result === state`, same concrete
+type) at **exact zero allocations**. The source below is embedded statically from
+the reviewed `benchmark/nuts_kernel_authoring_fixture.jl` and guarded byte-for-byte
+by `test/test_nuts_docs_fixture.jl`; it is not read or executed by the docs build. The measured
+leapfrog-steps/s comparison against DynamicHMC, AdvancedHMC, and nsiccha/NUTS.jl
+is recorded in the static receipt [`benchmark/receipts/nuts-g7-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/nuts-g7-v1.toml)
+— parsed here, not re-run in CI. It is a work-normalized inner-loop receipt,
+not an end-to-end sampling, adaptation, wall-time, or ESS benchmark.
+
+Packaging matters: “public” here means the entry of the sealed compiler artifact;
+the builder and fixture are internal compiler
+acceptance surfaces, not the exported `nuts_state` constructor. The exported
+`nuts_state` / `CompiledNUTSState` path uses a compiled-reactive phase-point DAG and
+ordinary inferred Julia tree-growth orchestration. See [Compiler capability and
+limits](compiler.md#what-the-nuts-proof-does-and-does-not-establish) for the exact
+boundary and why the two implementations prove different things.
 
 ## Status — read this before the code
 
@@ -24,17 +33,19 @@ not an end-to-end sampling or ESS benchmark.
 | Source contract (the eight `@kernel` specs below, the seven `@rk_*` effect registrations, the plan shape) | **Landed and executable.** `pot_f` and `grad_f` are alternative producers of `pot`; the planner selects the needed recipe while retaining both read-only callable authorities by identity. |
 | All eight source specs construct; concrete phasepoint/frame init/recompute/copy verified | **Landed on `main`** — the compiler constructs and runs the whole sampler; sealed production certificate `mode = production`. |
 | Executable leapfrog (leaf scope) | **Verified** — analytic F32/F64; normal gradient Δ1, `@inferred`, exact 0-B; dirty-produced recovery analytic; dirty-source reject. |
-| Public `nuts!!` sampler (`step!`, tree growth, U-turn) | **Landed on `main`** — sealed registry-free native recursion; `nuts!!(state; rng) === state` (same object, fixed type), **exact 0-B** on the public path. |
+| Sealed fixture `nuts!!` (`step!`, tree growth, U-turn) | **Landed on `main`** — sealed registry-free native recursion; `nuts!!(state; rng) === state` (same object, fixed type), **exact 0-B** on the compiler acceptance path. |
+| Exported `nuts_state` / `CompiledNUTSState` | **Landed on `main`, separate path** — compiled-reactive Hamiltonian dependencies with ordinary inferred Julia recursion and proposal scratch; it is not the sealed fixture artifact. |
 | End-to-end sampling time and ESS | **Not measured for the current sealed-native path.** The earlier compiled-reactive implementation was about 4–7× slower than AdvancedHMC/DynamicHMC in matched warmup+draw wall time, so the inner-loop result must not be read as a blanket sampler-speed claim. |
 | Work-normalized inner-loop throughput | **Measured, narrow metric** — [`nuts-g7-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/nuts-g7-v1.toml) records 2.27M leapfrog steps/s for RK, 1.33M for AdvancedHMC, 1.42M for DynamicHMC, and 2.65M for nsiccha/NUTS.jl on the frozen AR(1) setup. |
 
 The sealed native compiler (`kernel_nuts_native.jl`, `_build_nuts_sampler`) and the
-minimal-reset authoring fixture are **on `main`**; the public `nuts!!` runs there. The
-performance figures cited on this page come from the static receipt, not a CI perf run.
-RK, AdvancedHMC, and DynamicHMC used one shared DifferentiationInterface+Enzyme
-gradient and matched target, mass, step size, and RNG schedule; the receipt also
-checks the gradient/work accounting. It does **not** measure adaptation, retained
-draws, ESS, or time-to-effective-sample.
+minimal-reset authoring fixture are **on `main`**. The performance figures cited on
+this page measure that acceptance artifact and come from the static receipt, not a
+CI perf run or the exported `CompiledNUTSState` path. RK, AdvancedHMC, and
+DynamicHMC used one shared DifferentiationInterface+Enzyme gradient and matched
+target, mass, step size, and RNG schedule; the receipt also checks gradient/work
+accounting. It does **not** measure adaptation, retained draws, ESS, or
+time-to-effective-sample.
 
 The ReactiveHMC.jl `ca9` structure is an **algorithm-structure reference only** — not
 a bitwise or RNG target; improvements may change arithmetic or ordering.
@@ -82,7 +93,7 @@ invalidates stale values.
   derived `diverged` recipe written once (never imperatively), and the tree-growth /
   U-turn / multinomial-swap logic as ordinary inner methods. Direction is two direct
   physical-endpoint branch calls, not a mutable current-view.
-- **`nuts!!(state; rng)`** — the public compiled entry: refresh momentum on the owned
+- **`nuts!!(state; rng)`** — the sealed fixture entry: refresh momentum on the owned
   `init`, `step!` the tree, `return state` (result **is** `state`; fixed shape/type).
 - **`dual_averaging_state`** / **`welford_var`** — the adaptation recurrences: Nesterov
   dual averaging (`m`/`H`/`μ` + `fit!(x)`) and streaming Welford variance
@@ -90,14 +101,14 @@ invalidates stale values.
 
 ## The locked compiler/lowering contract
 
-These are the properties the `@kernel` lowering is **locked to** and the landed public
-`nuts!!` entry **satisfies** (see the status table).
+These are the properties the `@kernel` lowering is **locked to** and the landed sealed
+fixture entry **satisfies** (see the status table).
 
-- **Captured source, exact effect registrations.** The compiler schedules the public
+- **Captured source, exact effect registrations.** The compiler schedules the fixture's
   `@rk_pure` / `@rk_borrows` / `@rk_rng` helpers by their *registered* effects, never by
   inferring the body. Authors touch no internals.
-- **Immutable plan.** Construction produces a fixed-shape, fixed-type plan; the public
-  entry mutates compiler-owned concrete state and returns the same object. The public
+- **Immutable plan.** Construction produces a fixed-shape, fixed-type plan; the sealed
+  entry mutates compiler-owned concrete state and returns the same object. The fixture
   identity holds: `nuts!!(state; rng)` returns `result === state` (same object, fixed
   concrete type) at **exact 0-B** — verified on the sealed native sampler.
 - **Input isolation and prepared storage.** Construction leaves caller inputs untouched

@@ -7,6 +7,7 @@ include(joinpath(@__DIR__, "..", "examples", "batched.jl"))
 
 site_pages = [
     "Home" => "index.md",
+    "Compiler capability and limits" => "compiler.md",
     "Building blocks" => [
         "Distribution log densities" => "distributions.md",
         "Batched log densities" => "batched.md",
