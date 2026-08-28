@@ -4,8 +4,8 @@ Online mean and variance are a compact example of the boundary between pure
 state transitions and reactive orchestration. A `MomentsAccumulator{T}` stores
 only `(n, mean, m2)`. Welford's update consumes one observation, while Chan's
 parallel formula combines independently processed partitions. The same
-building block also summarizes the per-transition diagnostics the
-compiled-reactive NUTS sampler reports as a `NUTSDiagnostics` — tree depth,
+building block also summarizes the per-transition diagnostics the compiled
+NUTS sampler reports as a `NUTSDiagnostics` — tree depth,
 leapfrog-step count, acceptance rate, and energy error — alongside an exact
 divergence count and maximum tree depth. All operations return new immutable
 values, so they are ordinary pure recipes rather than hidden mutation inside
@@ -85,7 +85,7 @@ partitioned = reduce(merge, parts)
 ## HMC sampling diagnostics
 
 `HMCDiagnosticsAccumulator{T}` ingests the canonical `NUTSDiagnostics` record
-the compiled-reactive sampler returns per transition — `depth`, `n_steps`,
+the compiled sampler returns per transition — `depth`, `n_steps`,
 `acceptance_rate`, `diverged`, and `energy_error` — storing online moments for
 depth, leapfrog count, acceptance rate, and energy error, plus an exact
 divergence count and maximum tree depth. Step size is **not** part of
