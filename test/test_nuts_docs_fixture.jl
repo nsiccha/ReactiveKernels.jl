@@ -12,7 +12,7 @@ using Test
     @test isfile(fixture_path)
     @test isfile(md_path)
 
-    fixture = rstrip(read(fixture_path, String))
+    fixture = rstrip(replace(read(fixture_path, String), "\r\n" => "\n", "\r" => "\n"))
     md_lines = readlines(md_path)
 
     # Locate the ```julia fence inside the details block under "## The authoring source".

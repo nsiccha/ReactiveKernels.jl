@@ -1,4 +1,4 @@
-# Flat compiled-reactive NUTS phase-point group — increments 1-2 of the ca9
+# External example runtime: flat compiled-reactive NUTS phase-point group — increments 1-2 of the ca9
 # ReactiveHMC port. Following poc's approved "(b) FLATTENED" verdict, the sampler
 # state is ONE wide `ReactiveProgram` spanning the `init`, `fwd`, and `bwd`
 # endpoints, with a `gofwd` HAVE source. The active-endpoint selection, the energy

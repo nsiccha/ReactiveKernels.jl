@@ -323,17 +323,25 @@ blocks = kernel_blocks()
     @test !has_reactive[]
     @test occursin("@kernel leapfrog!", SRC) && occursin("@kernel nuts!!", SRC)
     @test occursin("@kernel refresh_momentum!!", SRC) && occursin("@kernel nuts_stats!", SRC)   # free refresh + stats kernels
-    # public @rk_* exact-identity effect declarations (973f7f4/bf7d2ed) — SIX NUTS module helpers (incl. min1exp,
-    # which nuts_stats! calls; the compiler is forbidden to inspect its body, so it MUST be declared).
-    for d in ("@rk_pure finiteorneginf 1", "@rk_pure min1exp 1", "@rk_borrows badd 2", "@rk_rng randbernoullilog 2 1",
-              "@rk_pure logswapprob 1", "@rk_pure compute_criterion 3")
-        @test occursin(d, SRC)
-    end
-    @test !occursin(r"@rk_(?:pure|borrows|rng)\s+smooth\b", SRC)
-    # every ordinary module helper the authored kernels CALL must carry an @rk_* declaration (no body inference).
-    @test occursin("min1exp(state.dham)", srcof(blocks[Symbol("nuts_stats!")].body)) && occursin("@rk_pure min1exp 1", SRC)
+    # Production NUTS carries ZERO authored effect declarations and ZERO hot ordinary module helpers.  The
+    # scalar conditional helper is a captured nuts_state sibling; RNG/reductions remain direct expressions;
+    # stats exposes its exp ternary.
+    @test !occursin(r"@rk_(?:pure|borrows|rng)\b", SRC)
+    top_methods = Set(methodname(st) for st in _dropln(AST.args) if is_methoddef(st))
+    @test isempty(intersect(top_methods,
+        Set((:finiteorneginf, :min1exp, :badd, :randbernoullilog, :logswapprob, :compute_criterion))))
+    @test count(m -> methodname(m) === :finiteorneginf, ns.methods) == 1
+    @test count("Random.randexp(rng)", nb) == 2
+    finish_src = srcof(methodbody(method_named(ns, :finish!)))
+    @test count("for i = 1:length(suptree.summed_mom.fwd)", finish_src) == 2
+    @test occursin("backward_dot = zero(dham)", finish_src)
+    @test occursin("sum2_forward_dot +=", finish_src)
+    @test !occursin(r"zero\([^\n]*\[1\]\)", finish_src)
+    @test !occursin("Base.broadcasted", nb) && !occursin("compute_criterion", nb)
+    @test occursin("state.dham >= zero(state.dham)", stb) && occursin("exp(state.dham)", stb)
+    @test !occursin("min1exp(", SRC) && !occursin("badd(", SRC) && !occursin("logswapprob(", SRC)
     println("  (@node) preserved; @reactive absent; free @kernel leapfrog!/refresh_momentum!!/nuts_stats!/nuts!!;")
-    println("      SIX public @rk_* NUTS helper declarations (incl. @rk_pure min1exp 1); copy!! is core. OK")
+    println("      ZERO production @rk_* declarations; visible scalar/RNG/reduction expressions; copy!! is core. OK")
 end
 
 # --- NON-VACUOUS lexical-shadowing inventory (nuts_state) --------------------------------------------

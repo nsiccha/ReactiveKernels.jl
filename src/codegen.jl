@@ -475,9 +475,19 @@ function _replica_call(k::ReplicatedKernel{B,BT,OT}, args, marker) where {B,BT,O
     _replica_native_outputs(results, OT)
 end
 
-@inline function (k::PreparedKernel)(args...)
-    length(args) == length(k.inputs) || throw(MethodError(k, args))
-    k.f(k.ops, args...)
+# Emit positional arguments explicitly: on Julia 1.12, splatting the captured
+# `args` tuple into some RGF call shapes allocates even though the emitted
+# function itself is allocation-free. Keep the public call nongenerated so
+# reflection over it continues to accept abstract argument types.
+@generated function _prepared_call(k::PreparedKernel, args::A, ::Val{N}) where {A<:Tuple,N}
+    positional = [:(getfield(args, $index)) for index in 1:N]
+    :(k.f(k.ops, $(positional...)))
+end
+
+@inline function (k::PreparedKernel{F,O,IN,OUT})(
+        args::Vararg{Any,N}) where {F,O,IN,OUT,N}
+    N == fieldcount(IN) || throw(MethodError(k, args))
+    _prepared_call(k, args, Val(N))
 end
 
 function _prepare(p::Plan, ast::Expr)

@@ -1,4 +1,4 @@
-# Registry-free native NUTS control metadata.
+# External registry-free native NUTS compiler-acceptance backend.
 #
 # This file deliberately separates STRUCTURE from EMISSION.  A cold compiler lowers the detached
 # MethodIR values into zero-field node TYPES.  Generated native methods may later inspect only those
@@ -81,13 +81,13 @@ function _native_validate_registered(x::_RegisteredCall)
         return reg.source
     end
     callee = try
-        _lf_callee(x) # eager owner-world rebind validation; never called by generated code
+        _exec_captured_callee(x) # eager owner-world rebind validation; never called by generated code
     catch e
         e isa _LLowerReject || rethrow()
         _native_reject(sprint(showerror,e))
     end
     pe = reg.primitive_effect
-    if reg.kind in (:primitive, :declared_effect)
+    if reg.kind === :primitive
         pe === nothing && _native_reject("$(reg.kind) call has no detached effect descriptor")
         length(x.args) == pe.arity || _native_reject(
             "captured $(reg.kind) call arity $(length(x.args)) disagrees with descriptor arity $(pe.arity)")
@@ -1058,14 +1058,14 @@ end
 # per-compilation scratch; its type tape is frozen into the root/certificate before the sampler escapes.
 function _compile_native_ensure(pf::_PreparedFactory,::Type{OW},::Type{SH},field::Symbol,
         builder::_NutsEmissionBuilder) where {OW,SH}
-    plan=kernel_prepared_plan(pf); hs=kernel_prepared_handles(pf); fc=_lf_canon_map(plan)
+    plan=kernel_prepared_plan(pf); hs=kernel_prepared_handles(pf); fc=_exec_canon_map(plan)
     producer=Dict{Int,Int}(c=>r for (c,r) in kernel_plan_producer(plan))
     recs=kernel_plan_recipes(plan)
     hidx=Dict{Int,Tuple{Any,Int}}(recs[i]=>(hs[i],i) for i in eachindex(hs))
     haskey(fc,field) || _native_reject("demanded ensure has no canon for `$field`")
     c=fc[field]; stmts=Any[]; current=Set{Int}(); stale=Set{Int}()
     hook=_native_recipe_hook(builder,pf,:scratch)
-    _lf_ensure!(stmts,c,current,stale,plan,producer,hidx,OW,SH;recipe_hook=hook)
+    _exec_ensure!(stmts,c,current,stale,plan,producer,hidx,OW,SH;recipe_hook=hook)
     ret=_pp_read(plan,c)
     builder.instrumented ?
         compile(:((owned,shared,handles,scratch)->$(Expr(:block,stmts...,:(return $ret))))) :
@@ -1095,13 +1095,13 @@ end
 function _compile_native_metric_update(pf::_PreparedFactory,::Type{OW},::Type{SH},
         ::Val{Mode}) where {OW,SH,Mode}
     Mode in (:production,:instrumented) || _native_reject("unsupported metric-probe mode $Mode")
-    plan=kernel_prepared_plan(pf); hs=kernel_prepared_handles(pf); fc=_lf_canon_map(plan)
+    plan=kernel_prepared_plan(pf); hs=kernel_prepared_handles(pf); fc=_exec_canon_map(plan)
     metric=get(fc,:metric,nothing); metric===nothing && _native_reject("plan has no metric canon")
-    affected=Set{Int}((metric,_lf_kill_closure(plan,metric)...))
+    affected=Set{Int}((metric,_exec_kill_closure(plan,metric)...))
     stmts=Any[]
-    for c in sort!(collect(affected)); _lf_mask!(stmts,plan,c,:kill); end
+    for c in sort!(collect(affected)); _exec_mask!(stmts,plan,c,:kill); end
     push!(stmts,:(copyto!($(_pp_read(plan,metric)),new_metric)))
-    _lf_mask!(stmts,plan,metric,:bless)
+    _exec_mask!(stmts,plan,metric,:bless)
     hook=Mode===:instrumented ?
         ((i,h)->Expr(:call,GlobalRef(@__MODULE__,:_nuts_recipe_probe_complete!),:scratch,:(Val($i)))) :
         nothing

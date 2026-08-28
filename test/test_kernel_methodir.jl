@@ -63,7 +63,10 @@ end
             @test ir.ok                                        # no faithful shape is rejected
         end
     end
-    @test length(RK.method_irs(_NS)) == 9
+    @test length(RK.method_irs(_NS)) == 10
+    @test Tuple(ir.id.name for ir in RK.method_irs(_NS)) ==
+          (:finiteorneginf, :reset!, :collectstats!, :logadvanceprob, :swapproposal!, :step!,
+           :flip!, :flip_neg!, :finish!, :start!)
     @test length(RK.method_irs(_DA)) == 1
     @test length(RK.method_irs(_WV)) == 2              # vector + matrix step!
     @test length(RK.method_irs(_LF)) == 1              # Mode-2 free method
@@ -74,6 +77,7 @@ end
 
 @testset "implicit-field consumer gate — three orthogonal facts per method" begin
     facts(ir) = (ir.control, Set(ir.effects))
+    @test facts(_mir(_NS, :finiteorneginf)) == (:branch, Set())             # visible scalar conditional
     @test facts(_mir(_NS, :logadvanceprob)) == (:straight, Set())            # pure value method
     @test facts(_mir(_NS, :swapproposal!))  == (:straight, Set([:place_write]))
     @test _mir(_NS, :flip!).control          === :branch                     # `if depth > 1`
@@ -208,6 +212,15 @@ end
     @test any(e -> e isa RK._ACall && e.kind === :registered && e.id === typeof(*), all_ev)
     @test any(e -> e isa RK._ACall && e.kind === :registered && e.id === typeof(zero), all_ev)
     @test any(e -> e isa RK._ACall && e.kind === :registered && e.id === Symbol("__rk_rng_Random_rand__"), all_ev)
+    @test !any(e -> e isa RK._ACall && e.kind === :opaque, all_ev)
+    @test any(e -> e isa RK._ACall && e.kind === :registered &&
+                   e.id === Symbol("__rk_rng_Random_randexp__"), all_ev)
+    # Exact authored RNG order is unchanged from the former helper calls: the direction Bool draw precedes
+    # the step-level exponential accept draw, while recursive start! has exactly its one conditional draw.
+    rngtokens(ir) = [e.id for e in _ae_all(RK.access_events(ir)) if e isa RK._ACall &&
+                     e.id in (Symbol("__rk_rng_Random_rand__"), Symbol("__rk_rng_Random_randexp__"))]
+    @test rngtokens(st) == [Symbol("__rk_rng_Random_rand__"), Symbol("__rk_rng_Random_randexp__")]
+    @test rngtokens(_mir(_NS, :start!)) == [Symbol("__rk_rng_Random_randexp__")]
     # a write-only scalar (`gofwd = !gofwd`) contributes a WRITE with no read of its own terminal place
     fl = RK.access_events(_mir(_NS, :flip!))
     @test any(e -> e isa RK._AWrite && e.owner == (:gofwd,), _ae_all(fl))
@@ -619,7 +632,8 @@ end
     L = typeof(cholesky([2.0 0.0; 0.0 2.0]).L)
     @test eok(mkeff(Random.randn!), (rng, Vector{Float64}))         # refresh: randn!(rng, mom)
     @test eok(mkeff(LinearAlgebra.lmul!), (L, Vector{Float64}))     # refresh: lmul!(chol, mom); L=LowerTriangular{T,Matrix{T}}
-    @test L <: LinearAlgebra.LowerTriangular && L.parameters[2] <: Matrix   # Cholesky.L backing is a Base Matrix
+    @test L <: LinearAlgebra.LowerTriangular
+    @test RK._kernel_dom_lmul_lhs(L) # accepts the closed Base Matrix/Adjoint-backed representations
     # the ALLOCATION-FREE uplo='U' Cholesky-L view POC emits (RK 13:52, kernel_nuts.jl:54):
     # `adjoint(UpperTriangular(factors))`, which Julia CANONICALIZES to LowerTriangular{T,Adjoint{T,Matrix{T}}}
     # — the lower factor as a lazy re-index of the stored upper triangle's concrete Matrix, never materialized.
@@ -640,11 +654,14 @@ end
     @test eok(mkeff(LinearAlgebra.lmul!), (UpperTriangular{Float64,Matrix{Float64}}, Vector{Float64}))
     @test eok(mkeff(LinearAlgebra.lmul!), (Diagonal{Float64,Vector{Float64}}, Vector{Float64}))
     @test eok(mkeff(Random.rand), (rng, Type{Bool}))               # step!: rand(rng, Bool)
+    @test eok(mkeff(Random.randexp), (rng,))                       # inner accept/reject: randexp(rng)
+    @test !eok(mkeff(Random.randexp), (rng, Float64))              # exact arity 1 only
     @test eok(mkeff(Base.eachcol), (Matrix{Float64},))             # Welford: eachcol(x)
     @test eok(mkeff(Base.fill!), (Vector{Float64}, Float64))
     # NEGATIVES: custom rng/matrix/dest under the SAME generic REJECT
     @test !eok(mkeff(LinearAlgebra.lmul!), (Matrix{String}, Vector{Float64}))  # non-numeric matrix
     @test !eok(mkeff(Random.randn!), (Int, Vector{Float64}))                    # custom "rng"
+    @test !eok(mkeff(Random.randexp), (Int,))                                  # custom "rng"
     @test !eok(mkeff(Base.fill!), (_DomEvil.Mut, Float64))                      # custom dest
     # RK 06:43/06:44: a custom AbstractMatrix BACKING a LinearAlgebra wrapper must REJECT (the wrapper
     # parentmodule is not enough — its getindex/lmul! can carry arbitrary effects)

@@ -79,6 +79,37 @@ function _types_match(a, b)
     end
 end
 
+# Structural/value equality independent of Julia's `Expr ==` implementation.
+# Julia 1.13 deliberately stopped treating separately allocated Expr nodes as
+# equal, while this gate needs to prove that freeze/thaw preserves the complete
+# tree and mutable-container contents across supported Julia versions.
+function _ast_roundtrip_equal(a, b)
+    typeof(a) === typeof(b) || return false
+    if a isa Expr
+        a.head === b.head || return false
+        length(a.args) == length(b.args) || return false
+        return all(i -> _ast_roundtrip_equal(a.args[i], b.args[i]), eachindex(a.args))
+    elseif a isa QuoteNode
+        return _ast_roundtrip_equal(a.value, b.value)
+    elseif a isa AbstractVector
+        length(a) == length(b) || return false
+        return all(i -> _ast_roundtrip_equal(a[i], b[i]), eachindex(a))
+    elseif a isa AbstractDict
+        length(a) == length(b) || return false
+        return all(k -> haskey(b, k) && _ast_roundtrip_equal(a[k], b[k]), keys(a))
+    elseif a isa NamedTuple
+        keys(a) == keys(b) || return false
+        return all(k -> _ast_roundtrip_equal(getproperty(a, k), getproperty(b, k)), keys(a))
+    elseif a isa Tuple
+        length(a) == length(b) || return false
+        return all(i -> _ast_roundtrip_equal(a[i], b[i]), eachindex(a))
+    elseif a isa Pair
+        return _ast_roundtrip_equal(a.first, b.first) &&
+               _ast_roundtrip_equal(a.second, b.second)
+    end
+    isequal(a, b)
+end
+
 # --- top-level stateful fixtures (method-bearing ⇒ const ⇒ top-level only) ---
 # V7 implicit-field pivot: nested methods declare NO `self` formal; bare unshadowed
 # names are the owner's fields; `__self__` appears ONLY as the first actual of a
@@ -382,7 +413,7 @@ end
         @test !(leapfrog! isa KernelSpec)
         @test !(leapfrog! isa RKS._StatefulKernelSkeleton)
         @test RKS.kernel_subject(leapfrog!) === :phasepoint
-        # shallow-declared effect roots on the subject (top owned fields)
+        # shallow authored effect roots on the subject (top owned fields)
         @test RKS.kernel_write_roots(leapfrog!) == (:mom, :pos)
         @test RKS.kernel_read_roots(leapfrog!) == (:dham_dpos, :dham_dmom)
         @test !RKS.kernel_is_bangbang(leapfrog!)          # `!` is not `!!`
@@ -647,20 +678,21 @@ end
             @test fr isa RKS._FrozenExpr
             @test _frozen_all_immutable(fr)                      # (gate 5) exact structure
             thawed = RKS._kernel_thaw_ast(fr)
-            @test thawed == src && thawed !== src          # (gate 2) round-trip, fresh
+            @test _ast_roundtrip_equal(thawed, src) && thawed !== src # (gate 2) round-trip, fresh
         end
 
         # a thawed copy is fully detached — mutating it can't reach the frozen node.
         fr = RKS._kernel_freeze_ast(:(fwd = Ref(fwdbwd[gofwd ? 1 : 2])))
         t1 = RKS._kernel_thaw_ast(fr)
         t1.args[1] = :zzz
-        @test RKS._kernel_thaw_ast(fr) == :(fwd = Ref(fwdbwd[gofwd ? 1 : 2]))
+        @test _ast_roundtrip_equal(
+            RKS._kernel_thaw_ast(fr), :(fwd = Ref(fwdbwd[gofwd ? 1 : 2])))
 
         # a QuoteNode wrapping an Expr is frozen too — no raw Expr survives (gate 5).
         qn = Expr(:(=), :x, QuoteNode(Expr(:call, :+, :a, :b)))
         frq = RKS._kernel_freeze_ast(qn)
         @test _frozen_all_immutable(frq)
-        @test RKS._kernel_thaw_ast(frq) == qn
+        @test _ast_roundtrip_equal(RKS._kernel_thaw_ast(frq), qn)
     end
 
     @testset "freeze soundness: mutable containers round-trip, others reject" begin
@@ -676,7 +708,7 @@ end
             fr = RKS._kernel_freeze_ast(src)
             @test _frozen_all_immutable(fr)                        # no mutable object survives
             thawed = RKS._kernel_thaw_ast(fr)
-            @test thawed == src && thawed !== src                  # exact fresh round-trip
+            @test _ast_roundtrip_equal(thawed, src) && thawed !== src # exact fresh round-trip
             @test _types_match(thawed, src)                        # …incl. EXACT concrete typeof
         end
 
@@ -684,7 +716,8 @@ end
         fr = RKS._kernel_freeze_ast(Expr(:call, :f, [1, 2, 3]))
         t = RKS._kernel_thaw_ast(fr)
         push!(t.args[2], 99)                                       # mutate the thawed Vector
-        @test RKS._kernel_thaw_ast(fr) == Expr(:call, :f, [1, 2, 3])
+        @test _ast_roundtrip_equal(
+            RKS._kernel_thaw_ast(fr), Expr(:call, :f, [1, 2, 3]))
 
         # an UNSUPPORTED mutable leaf is REJECTED, not silently retained — bare, and
         # nested inside a QuoteNode or a Tuple.

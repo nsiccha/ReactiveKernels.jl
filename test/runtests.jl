@@ -1,6 +1,12 @@
 using ReactiveKernels
 using Test
 
+# Assert the package loads without sampler/compiler domain code before opting into
+# the external executable exemplar used by the remaining NUTS/HMC acceptance tests.
+include("test_package_boundary.jl")
+include(joinpath(@__DIR__, "..", "examples", "nuts_runtime.jl"))
+using .ReactiveKernelsNUTSExample
+
 @testset "ReactiveKernels" begin
     benchmark_only = ARGS == ["benchmark"]
     distributions_only = ARGS == ["distributions"]

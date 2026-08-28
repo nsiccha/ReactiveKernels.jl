@@ -1,5 +1,7 @@
 using Test
 
+_compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
+
 @testset "compiler capability page is navigated, explicit, and code-free" begin
     root = joinpath(@__DIR__, "..")
     page_path = joinpath(root, "docs", "src", "compiler.md")
@@ -7,18 +9,18 @@ using Test
     index_path = joinpath(root, "docs", "src", "index.md")
 
     @test isfile(page_path)
-    page = read(page_path, String)
-    make = read(make_path, String)
-    index = read(index_path, String)
+    page = _compiler_docs_lf(read(page_path, String))
+    make = _compiler_docs_lf(read(make_path, String))
+    index = _compiler_docs_lf(read(index_path, String))
 
     @test occursin("\"Compiler capability and limits\" => \"compiler.md\"", make)
     @test occursin("compiler.md", index)
 
-    nuts = read(joinpath(root, "docs", "src", "nuts.md"), String)
+    nuts = _compiler_docs_lf(read(joinpath(root, "docs", "src", "nuts.md"), String))
     @test occursin("not an RK package API", nuts)
-    @test occursin("Transitional and removal-bound, not an intended RK API", nuts)
-    @test occursin("not supported authoring API", nuts)
-    @test occursin("The verbatim source below still contains `@rk_pure`", nuts)
+    @test occursin("External example only", nuts)
+    @test occursin("The former `@rk_pure` / `@rk_borrows` / `@rk_rng` declarations no longer exist", nuts)
+    @test occursin("The verbatim source below is the macro-free executable fixture", nuts)
 
     for heading in (
         "## The stateless compiler",
@@ -38,9 +40,8 @@ using Test
         "does not call\n`code_lowered`",
         "Validity changes are exception-safe but values are not transactionally rolled\nback",
         "external compilation examples and acceptance evidence",
-        "currently exported `nuts_state` / `CompiledNUTSState` compatibility path",
-        "transitional and removal-bound compatibility for external",
-        "not the definitive authoring surface or a recommended public API",
+        "a bare `using ReactiveKernels` does not load or\nexport them",
+        "former `@rk_pure`, `@rk_borrows`, and `@rk_rng` declarations have\nbeen removed",
         "`@node` is unrelated to this removal boundary",
         "NUTS, log-density, or PPL domain API",
         "General Julia compiler replacement",

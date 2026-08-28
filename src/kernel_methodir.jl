@@ -600,8 +600,9 @@ end
 # separate `_RegisteredCall`, resolved from the captured snapshot BEFORE this): `:operator_candidate`
 # for an operator callee; else `:opaque`. RNG is NOT classified here — a call is not "rng" because an
 # actual is spelled `rng` (unsound: false-positives a global/renamed collision, misses a differently-
-# named typed RuntimeArg). `rand(...)`/`randbernoullilog(...)` are opaque externals; their actual reads
-# are preserved in source order, and RNG effect/ordering is deferred to a later trait/RuntimeArg fact.
+# named typed RuntimeArg). An unregistered RNG helper is still opaque; exact built-ins such as `rand`/
+# `randexp` resolve earlier as `_RegisteredCall`s; NUTS keeps its registered draws directly in the
+# consuming branch MethodIR.
 function _kmir_call_hint(callee, ex, ctx::_KMIRCtx)
     ((callee isa Symbol && Base.isoperator(callee)) || _kmir_dotted_op(callee)) && return :operator_candidate
     :opaque

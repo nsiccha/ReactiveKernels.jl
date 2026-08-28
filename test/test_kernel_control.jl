@@ -152,6 +152,14 @@ end
     Test.@inferred fn(_CtlAcc(0), mk(), 3)
 end
 
+@testset "control — native-loop accumulator is spilled to its successor block" begin
+    acc = RKC._LocalAssign((:acc,), RKC._Lit(1))
+    loop = RKC._For((:i,), RKC._Lit(1), (acc,))
+    raw = RKC._RawStmt((:for_native, loop))
+    @test RKC._block_writes([raw], Set([:acc])) == [:acc]
+    @test isempty(RKC._block_writes([raw], Set([:other])))
+end
+
 @testset "control — SUSPENDING while-loop + continue (skip i==2), cross-suspension local, 0-B" begin
     irs = RKC.method_irs(_CtlWhile.adv); cap=512
     drv = irs[findfirst(ir->ir.id.name===:driver!, irs)]

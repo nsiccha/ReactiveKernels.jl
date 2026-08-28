@@ -343,7 +343,7 @@ end
 @testset "warmup! window branch resets in place (static: no reconstruction)" begin
     # Durable static regression: the metric-window boundary must RESET the existing
     # adaptation/variance objects, never reconstruct them (the per-window recompile).
-    src = read(joinpath(pkgdir(ReactiveKernels), "src", "hmc.jl"), String)
+    src = read(joinpath(pkgdir(ReactiveKernels), "examples", "nuts_runtime", "hmc.jl"), String)
     lo = findfirst("iteration == window_ends[next_window]", src)
     hi = findnext("next_window += 1", src, last(lo))
     window_branch = src[first(lo):last(hi)]
