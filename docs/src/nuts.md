@@ -1,12 +1,13 @@
 # NUTS sampling
 
-ReactiveKernels' source-compiler NUTS acceptance sampler is authored as a
+This external NUTS compiler-acceptance exemplar is authored as a
 **single, method-bearing `@kernel` surface** — eight named specifications that
 together are the whole sampler — modeled on the ReactiveHMC.jl algorithm
 structure. This page shows that artifact's **authoring source** and measured
-performance. The separately packaged exported sampler is identified below.
+performance. It demonstrates what ReactiveKernels compiles; it is not a sampler
+API that ReactiveKernels intends to ship.
 
-The fixture's public `nuts!!` entry is **landed and executable on `main`**: `@kernel`
+The fixture's `nuts!!` entry is **landed as executable compiler evidence on `main`**: `@kernel`
 lowers the NUTS source to a sealed, registry-free **native compiled recursion**
 (`compile_nuts_native` / `_build_nuts_sampler`). That entry mutates compiler-owned
 state in place and returns the **same object** (`result === state`, same concrete
@@ -18,11 +19,12 @@ is recorded in the static receipt [`benchmark/receipts/nuts-g7-v1.toml`](https:/
 — parsed here, not re-run in CI. It is a work-normalized inner-loop receipt,
 not an end-to-end sampling, adaptation, wall-time, or ESS benchmark.
 
-Packaging matters: “public” here means the entry of the sealed compiler artifact;
-the builder and fixture are internal compiler
-acceptance surfaces, not the exported `nuts_state` constructor. The exported
-`nuts_state` / `CompiledNUTSState` path uses a compiled-reactive phase-point DAG and
-ordinary inferred Julia tree-growth orchestration. See [Compiler capability and
+Packaging matters: “public” inside the fixture comments means the entry of that
+sealed external artifact, not an RK package API. The builder and fixture are
+internal compiler acceptance surfaces. A currently exported `nuts_state` /
+`CompiledNUTSState` compatibility path uses a compiled-reactive phase-point DAG
+and ordinary inferred Julia tree-growth orchestration, but it is transitional and
+removal-bound rather than part of ReactiveKernels' intended support contract. See [Compiler capability and
 limits](compiler.md#what-the-nuts-proof-does-and-does-not-establish) for the exact
 boundary and why the two implementations prove different things.
 
@@ -30,18 +32,18 @@ boundary and why the two implementations prove different things.
 
 | Piece | State |
 |---|---|
-| Source contract (the eight `@kernel` specs below, the seven `@rk_*` effect registrations, the plan shape) | **Landed and executable.** `pot_f` and `grad_f` are alternative producers of `pot`; the planner selects the needed recipe while retaining both read-only callable authorities by identity. |
-| All eight source specs construct; concrete phasepoint/frame init/recompute/copy verified | **Landed on `main`** — the compiler constructs and runs the whole sampler; sealed production certificate `mode = production`. |
+| Source contract (the eight `@kernel` specs below, the seven `@rk_*` effect registrations, the plan shape) | **Landed as external compiler evidence.** `pot_f` and `grad_f` are alternative producers of `pot`; the planner selects the needed recipe while retaining both read-only callable authorities by identity. |
+| All eight source specs construct; concrete phasepoint/frame init/recompute/copy verified | **Verified on `main`** — the compiler constructs and runs the complete external fixture; its sealed certificate records `mode = production`, which describes compiler evidence rather than package API status. |
 | Executable leapfrog (leaf scope) | **Verified** — analytic F32/F64; normal gradient Δ1, `@inferred`, exact 0-B; dirty-produced recovery analytic; dirty-source reject. |
-| Sealed fixture `nuts!!` (`step!`, tree growth, U-turn) | **Landed on `main`** — sealed registry-free native recursion; `nuts!!(state; rng) === state` (same object, fixed type), **exact 0-B** on the compiler acceptance path. |
-| Exported `nuts_state` / `CompiledNUTSState` | **Landed on `main`, separate path** — compiled-reactive Hamiltonian dependencies with ordinary inferred Julia recursion and proposal scratch; it is not the sealed fixture artifact. |
+| Sealed fixture `nuts!!` (`step!`, tree growth, U-turn) | **Verified external exemplar** — sealed registry-free native recursion; `nuts!!(state; rng) === state` (same object, fixed type), **exact 0-B** on the compiler acceptance path. |
+| Current `nuts_state` / `CompiledNUTSState` compatibility surface | **Transitional and removal-bound, not an intended RK API.** It uses compiled-reactive Hamiltonian dependencies with ordinary inferred Julia recursion and proposal scratch; it is not the sealed fixture artifact or part of the definitive support contract. |
 | End-to-end sampling time and ESS | **Not measured for the current sealed-native path.** The earlier compiled-reactive implementation was about 4–7× slower than AdvancedHMC/DynamicHMC in matched warmup+draw wall time, so the inner-loop result must not be read as a blanket sampler-speed claim. |
 | Work-normalized inner-loop throughput | **Measured, narrow metric** — [`nuts-g7-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/nuts-g7-v1.toml) records 2.27M leapfrog steps/s for RK, 1.33M for AdvancedHMC, 1.42M for DynamicHMC, and 2.65M for nsiccha/NUTS.jl on the frozen AR(1) setup. |
 
 The sealed native compiler (`kernel_nuts_native.jl`, `_build_nuts_sampler`) and the
-minimal-reset authoring fixture are **on `main`**. The performance figures cited on
+minimal-reset external authoring fixture are **on `main` as compiler evidence**. The performance figures cited on
 this page measure that acceptance artifact and come from the static receipt, not a
-CI perf run or the exported `CompiledNUTSState` path. RK, AdvancedHMC, and
+CI perf run or the transitional `CompiledNUTSState` compatibility path. RK, AdvancedHMC, and
 DynamicHMC used one shared DifferentiationInterface+Enzyme gradient and matched
 target, mass, step size, and RNG schedule; the receipt also checks gradient/work
 accounting. It does **not** measure adaptation, retained draws, ESS, or

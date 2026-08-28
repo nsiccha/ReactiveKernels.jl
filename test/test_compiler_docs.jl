@@ -15,11 +15,8 @@ using Test
     @test occursin("compiler.md", index)
 
     nuts = read(joinpath(root, "docs", "src", "nuts.md"), String)
-    @test occursin(
-        "internal compiler\nacceptance surfaces, not the exported `nuts_state` constructor",
-        nuts,
-    )
-    @test occursin("Exported `nuts_state` / `CompiledNUTSState`", nuts)
+    @test occursin("not an RK package API", nuts)
+    @test occursin("Transitional and removal-bound, not an intended RK API", nuts)
 
     for heading in (
         "## The stateless compiler",
@@ -38,7 +35,9 @@ using Test
         "Structural CSE is explicit and conservative",
         "does not call\n`code_lowered`",
         "Validity changes are exception-safe but values are not transactionally rolled\nback",
-        "the exported `nuts_state` / `CompiledNUTSState` path currently uses",
+        "external compilation examples and acceptance evidence",
+        "currently exported `nuts_state` / `CompiledNUTSState` compatibility path",
+        "NUTS, log-density, or PPL domain API",
         "General Julia compiler replacement",
     )
         @test occursin(contract, page)
