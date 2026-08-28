@@ -5,6 +5,7 @@ using Documenter
 using LinearAlgebra
 using Markdown
 using ReactiveKernels
+using TOML
 
 struct RawHTML
     content::String
@@ -250,6 +251,138 @@ function execute_example(mod::Module, code::AbstractString;
         ),
     )
     render_examples((artifact,))
+end
+
+const _DISTRIBUTION_RECEIPT_PATH = joinpath(
+    dirname(@__DIR__), "benchmark", "receipts", "distribution-logdensity-v1.toml",
+)
+
+function _benchmark_time(ns)
+    value = Float64(ns)
+    value < 1_000 && return string(round(value; digits = 1), " ns")
+    value < 1_000_000 && return string(round(value / 1_000; digits = 2), " μs")
+    string(round(value / 1_000_000; digits = 2), " ms")
+end
+
+function _benchmark_bytes(bytes)
+    value = Int(bytes)
+    value < 1_024 && return "$value B"
+    value < 1_048_576 && return string(round(value / 1_024; digits = 1), " KiB")
+    string(round(value / 1_048_576; digits = 2), " MiB")
+end
+
+_benchmark_time_cell(row, name) = haskey(row, name) ?
+    _benchmark_time(row[name]["median_ns"]) : "unsupported"
+
+function _benchmark_allocation_cell(row, name)
+    haskey(row, name) || return "unsupported"
+    measurement = row[name]
+    string(_benchmark_bytes(measurement["median_bytes"]), " / ",
+           Int(measurement["median_allocs"]), " alloc")
+end
+
+"""
+    render_distribution_benchmarks() -> Markdown.MD
+
+Render the checked-in Normal log-density benchmark receipt. The docs build
+refuses a dirty/unpinned receipt or one on which the RK and ProbabilityMeasures
+Reactant compatibility gates did not pass.
+"""
+function render_distribution_benchmarks()
+    receipt = TOML.parsefile(_DISTRIBUTION_RECEIPT_PATH)
+    get(receipt, "schema", "") == "distribution-logdensity-v1" || error(
+        "unexpected distribution benchmark receipt schema",
+    )
+    pins = receipt["pins"]
+    get(pins, "reactivekernels_dirty", true) == false || error(
+        "distribution benchmark receipt was produced from a dirty RK tree",
+    )
+    support = receipt["support"]
+    get(support, "rk_reactant", false) || error(
+        "distribution benchmark receipt does not accept the RK Reactant path",
+    )
+    get(support, "probability_measures_reactant", false) || error(
+        "distribution benchmark receipt does not accept ProbabilityMeasures + Reactant",
+    )
+    protocol = receipt["protocol"]
+    get(protocol, "reactant_sync", false) || error("Reactant receipt is not synchronous")
+    get(protocol, "reactant_transfers_included", true) && error(
+        "Reactant receipt includes host/device transfers",
+    )
+
+    timing_rows = Vector{Any}[
+        Any[
+            "N", "RK native", "Distributions native", "ProbabilityMeasures native",
+            "RK + Reactant", "Distributions + Reactant", "ProbabilityMeasures + Reactant",
+        ],
+    ]
+    allocation_rows = Vector{Any}[
+        Any[
+            "N", "RK native", "Distributions native", "ProbabilityMeasures native",
+            "RK + Reactant", "ProbabilityMeasures + Reactant",
+        ],
+    ]
+    for row in receipt["measurements"]
+        push!(timing_rows, Any[
+            string(Int(row["n"])),
+            _benchmark_time_cell(row, "rk_native"),
+            _benchmark_time_cell(row, "distributions_native"),
+            _benchmark_time_cell(row, "probability_measures_native"),
+            _benchmark_time_cell(row, "rk_reactant"),
+            _benchmark_time_cell(row, "distributions_reactant"),
+            _benchmark_time_cell(row, "probability_measures_reactant"),
+        ])
+        push!(allocation_rows, Any[
+            string(Int(row["n"])),
+            _benchmark_allocation_cell(row, "rk_native"),
+            _benchmark_allocation_cell(row, "distributions_native"),
+            _benchmark_allocation_cell(row, "probability_measures_native"),
+            _benchmark_allocation_cell(row, "rk_reactant"),
+            _benchmark_allocation_cell(row, "probability_measures_reactant"),
+        ])
+    end
+
+    largest = last(receipt["measurements"])
+    ratio(numerator, denominator) = round(
+        largest[numerator]["median_ns"] / largest[denominator]["median_ns"];
+        digits = 2,
+    )
+    crossover = first(
+        row for row in receipt["measurements"]
+        if row["rk_reactant"]["median_ns"] < row["rk_native"]["median_ns"]
+    )
+    largest_n = Int(largest["n"])
+    crossover_n = Int(crossover["n"])
+    sha = first(String(pins["reactivekernels_sha"]), 10)
+    pm_sha = first(String(pins["probability_measures_sha"]), 10)
+    distributions_version = pins["distributions_version"]
+    reactant_version = pins["reactant_version"]
+    julia_version = pins["julia_version"]
+    cpu = receipt["environment"]["cpu"]
+    distributions_ratio = ratio("distributions_native", "rk_native")
+    probability_measures_ratio = ratio("probability_measures_native", "rk_native")
+    reactant_ratio = ratio("rk_native", "rk_reactant")
+    reactant_pm_ratio = ratio("probability_measures_reactant", "rk_reactant")
+
+    summary = "At N=$largest_n, native RK is " *
+              "$distributions_ratio× faster than Distributions and " *
+              "$probability_measures_ratio× " *
+              "faster than ProbabilityMeasures. RK + Reactant is " *
+              "$reactant_ratio× faster than native RK and " *
+              "$reactant_pm_ratio× faster " *
+              "than ProbabilityMeasures + Reactant. In the sampled sizes, Reactant first " *
+              "beats native RK at N=$crossover_n."
+    provenance = "Receipt pins: RK `$sha`; ProbabilityMeasures `$pm_sha`; " *
+                 "Distributions $distributions_version; Reactant $reactant_version; " *
+                 "Julia $julia_version; $cpu."
+
+    Markdown.MD(Any[
+        Markdown.Paragraph(Any[summary]),
+        Markdown.Table(timing_rows, fill(:r, 7)),
+        Markdown.Paragraph(Any[Markdown.Bold("Allocation receipts")]),
+        Markdown.Table(allocation_rows, fill(:r, 6)),
+        Markdown.Paragraph(Any[Markdown.Italic(provenance)]),
+    ])
 end
 
 # The NUTS `@kernel` authoring surface is embedded STATICALLY in docs/src/nuts.md as a plain ```julia
