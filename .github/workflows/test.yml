@@ -60,4 +60,10 @@ jobs:
           version: '1.10'
       - uses: julia-actions/cache@v2
       - name: Test optional Reactant compiler extension
+        env:
+          # The runner creates an isolated environment and then loads the exact
+          # Reactant/RK graph under test.  Avoid Pkg's earlier whole-environment
+          # auto-precompile, whose parallel Reactant extension workers can wait
+          # indefinitely on each other's cache locks on hosted runners.
+          JULIA_PKG_PRECOMPILE_AUTO: "0"
         run: julia --startup-file=no test/run_reactant_integration.jl
