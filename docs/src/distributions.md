@@ -122,6 +122,11 @@ compilation, and host↔device transfers are excluded from execution timings.
 Main.ReactiveKernelsDocs.render_structured_distribution_benchmarks()
 ```
 
+Each cell is the median of five minimum-time measurements. The
+[structured benchmark receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/structured-distribution-logdensity-v1.toml)
+contains all raw samples, allocation observations, compiler diagnostics, and
+exact package/commit pins; both tests and the docs build validate it.
+
 The unsupported Reactant cells are measured compatibility results. At the
 pinned versions, ProbabilityMeasures' full MVN uses scalar indexing of the
 traced vector, while Distributions has no full-MVN `logpdf` method for a traced
