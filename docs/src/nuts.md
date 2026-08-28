@@ -104,6 +104,31 @@ invalidates stale values.
   dual averaging (`m`/`H`/`μ` + `fit!(x)`) and streaming Welford variance
   (`n`/`mean`/`var` + `step!(x)`), each written as its update rule.
 
+## A selected kernel in the standard compiler view
+
+The complete sampler below is a method-bearing eight-spec artifact, not one
+stateless `Plan`: its recursive tree growth, ordered RNG effects, and in-place
+updates are sealed by the native method compiler. Its methodless Euclidean
+phasepoint recurrence *does* have an ordinary stateless plan, so it is the honest
+place to inspect NUTS work through the same three-pane view used by the
+distribution and batched examples.
+
+The panel is build-executed. **Raw input** contains the phasepoint math and the
+selected HAVE/WANT boundary; **Generated kernel** is the resulting
+`code_expr(kernel)`; **Compute DAG** is that exact `kernel.plan`. The potential-only
+recipe is an alternative producer: because the requested outputs include the
+position gradient, planning selects the combined value-and-gradient recipe and
+does not execute the redundant potential path. **Compare all** opens the standard
+side-by-side split view.
+
+```@eval
+Main.ReactiveKernelsDocs.render_nuts_phasepoint(@__MODULE__)
+```
+
+This docs-scoped stateless extraction mirrors the phasepoint recurrence for
+inspection; the full byte-locked eight-spec source later on this page remains the
+authoritative sealed NUTS compiler-acceptance fixture.
+
 ## The locked compiler/lowering contract
 
 These are the properties the `@kernel` lowering is **locked to** and the landed sealed

@@ -277,6 +277,64 @@ function execute_example(mod::Module, code::AbstractString;
     rendered
 end
 
+# A docs-scoped stateless extraction of the Euclidean phasepoint recurrence from
+# benchmark/nuts_kernel_authoring_fixture.jl. The complete eight-spec fixture
+# remains byte-locked in nuts.md; this smaller executable authority exists so the
+# selected Hamiltonian work can use the same PreparedKernel three-pane renderer
+# as every other stateless example.
+const NUTS_PHASEPOINT_SOURCE = raw"""
+using LinearAlgebra
+
+docs_nuts_potential(position) = sum(abs2, position) / 2
+docs_nuts_potential_gradient(position) =
+    (docs_nuts_potential(position), copy(position))
+
+@kernel docs_nuts_phasepoint(position, momentum, metric) = begin
+    potential = docs_nuts_potential(position)
+    potential, potential_gradient = docs_nuts_potential_gradient(position)
+    metric_cholesky = cholesky(metric)
+    momentum_gradient = metric_cholesky \ momentum
+    kinetic = oftype(potential, 0.5) *
+        (@node(logdet(metric_cholesky)) + dot(momentum, momentum_gradient))
+    hamiltonian = potential + kinetic
+    hamiltonian_position_gradient = potential_gradient
+    hamiltonian_momentum_gradient = momentum_gradient
+end
+
+inputs = (
+    position = [0.25, -0.5],
+    momentum = [0.4, 0.2],
+    metric = Diagonal([1.0, 2.0]),
+)
+kernel = prepare(
+    docs_nuts_phasepoint;
+    have = (:position, :momentum, :metric),
+    want = (
+        :hamiltonian,
+        :hamiltonian_position_gradient,
+        :hamiltonian_momentum_gradient,
+    ),
+)
+output = kernel(inputs.position, inputs.momentum, inputs.metric)
+
+docs_example = (;
+    name = :NUTS_phasepoint_Hamiltonian,
+    origin = "Euclidean phasepoint recurrence from the sealed NUTS fixture",
+    inputs,
+    kernel,
+    output,
+)
+"""
+
+"""
+    render_nuts_phasepoint(mod) -> Markdown.MD
+
+Build and execute the representative stateless phasepoint Hamiltonian from the
+sealed NUTS fixture, then render its selected plan through the standard shared
+Raw input / Generated kernel / Compute DAG UI.
+"""
+render_nuts_phasepoint(mod::Module) = execute_example(mod, NUTS_PHASEPOINT_SOURCE)
+
 """
     execute_ppl_example(mod, owner, source; setup) -> Markdown.MD
 

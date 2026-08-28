@@ -1,9 +1,10 @@
 # The NUTS authoring source shown on docs/src/nuts.md is embedded STATICALLY as a plain ```julia fence
 # (the exact bytes of benchmark/nuts_kernel_authoring_fixture.jl). A build-time
 # `@eval` render was abandoned after a throwing block once vanished silently.
-# Build-executed walkthrough evals are fatal now; NUTS remains deliberately
-# static, and this test is the LOUD drift guard that keeps its embedded block
-# byte-identical to the fixture.
+# Build-executed walkthrough evals are fatal now. The representative phasepoint
+# plan is rendered separately through that path; this test is the LOUD drift
+# guard that keeps the complete embedded eight-spec block byte-identical to the
+# fixture.
 using Test
 
 @testset "nuts.md static authoring block matches the fixture" begin
