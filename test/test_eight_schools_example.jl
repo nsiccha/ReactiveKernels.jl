@@ -5,7 +5,10 @@ include(joinpath(@__DIR__, "..", "examples", "eight_schools.jl"))
 using .EightSchoolsExample
 
 @testset "manual PPL graph — eight schools" begin
-    model = build_eight_schools_graph()
+    artifact = evaluate_eight_schools_source()
+    @test artifact.source == strip(EIGHT_SCHOOLS_SOURCE, '\n')
+    @test artifact.output == artifact.kernel(Tuple(artifact.inputs)...)
+    model = artifact.model
     q = [1.5, log(2.0), (0.25 .* (1:8))...]
 
     @testset "unconstrained -> constrained; Jacobian is optional" begin

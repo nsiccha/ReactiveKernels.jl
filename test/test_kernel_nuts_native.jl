@@ -13,7 +13,8 @@ _native_pf() = RK._prepare_factory(_NativeNutsFix.euclidean_phasepoint,
 function _native_vals(pf,T;metric=T[2 0;0 2])
     P=RK.kernel_prepared_plan(pf); m=metric; d=Dict{Int,Any}()
     for s in RK.kernel_plan_slots(P)
-        n=String(s.path[1]); d[s.canon] = n=="grad_f" ? ((dst,p)->(dst .= 2 .* p;sum(abs2,p))) :
+        n=String(s.path[1]); d[s.canon] = n=="pot_f" ? (p -> sum(abs2,p)) :
+          n=="grad_f" ? ((dst,p)->(dst .= 2 .* p;sum(abs2,p))) :
           n=="metric" ? m : n=="chol_metric" ? cholesky(m) : startswith(n,"##node") ? zero(T) :
           n=="pos" ? T[1,2] : n=="mom" ? T[3,4] :
           n in ("dpot_dpos","dham_dpos","dkin_dmom","dham_dmom") ? T[0,0] : zero(T)
@@ -274,7 +275,8 @@ end
     # The second fixture has the same source shape but a distinct definition token; construct with its own helpers.
     P2=RK.kernel_prepared_plan(p2); m=[2.0 0;0 2.0]; d=Dict{Int,Any}()
     for s in RK.kernel_plan_slots(P2)
-        n=String(s.path[1]); d[s.canon]=n=="grad_f" ? ((dst,p)->(dst .= 2 .* p;sum(abs2,p))) :
+        n=String(s.path[1]); d[s.canon]=n=="pot_f" ? (p -> sum(abs2,p)) :
+          n=="grad_f" ? ((dst,p)->(dst .= 2 .* p;sum(abs2,p))) :
           n=="metric" ? m : n=="chol_metric" ? cholesky(m) : startswith(n,"##node") ? 0.0 :
           n=="pos" ? [1.0,2] : n=="mom" ? [3.0,4] : n in ("dpot_dpos","dham_dpos","dkin_dmom","dham_dmom") ? [0.0,0] : 0.0
     end

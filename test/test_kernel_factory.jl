@@ -808,8 +808,8 @@ end
         owned_ns = RKS._kernel_factory_owned_authoritative(ns;
             field_regs = Dict(:step_f => RKS.kernel_registration(RN.leapfrog!), :stats_f => nothing))
         @test :reached_depth in owned_ns
-        # euclidean_phasepoint is pot_f-free (grad_f, metric, pos, mom)
-        @test :pot_f ∉ RKS._kernel_all_ports(RN.euclidean_phasepoint)
+        # euclidean_phasepoint retains pot_f as an alternative producer authority.
+        @test :pot_f in RKS._kernel_all_ports(RN.euclidean_phasepoint)
         @test :grad_f in RKS._kernel_all_ports(RN.euclidean_phasepoint)
     end
 
@@ -1619,7 +1619,8 @@ end
             m = T[2 0; 0 2]; d = Dict{Int,Any}()
             for s in RKS.kernel_plan_slots(plan)
                 nm = String(s.path[1])
-                d[s.canon] = nm == "grad_f" ? ((dst, p) -> (dst .= 2 .* p; sum(abs2, p))) :
+                d[s.canon] = nm == "pot_f" ? (p -> sum(abs2, p)) :
+                    nm == "grad_f" ? ((dst, p) -> (dst .= 2 .* p; sum(abs2, p))) :
                     nm == "metric" ? m : nm == "chol_metric" ? cholesky(m) : startswith(nm, "##node") ? zero(T) :
                     nm == "pos" ? T[1, 2] : nm == "mom" ? T[3, 4] :
                     (nm in ("dpot_dpos", "dham_dpos", "dkin_dmom", "dham_dmom")) ? T[0, 0] : zero(T)
@@ -1675,18 +1676,20 @@ end
         dpotv = RKS.kernel_plan_named_slot_val(plan, Val(:dpot_dpos))
         for T in (Float64, Float32)
             cg = _CG(0)
-            # the AUTHOR supplies ONLY the phasepoint sources (grad_f, metric, pos, mom) in signature order —
+            # the AUTHOR supplies ONLY the phasepoint sources (pot_f, grad_f, metric, pos, mom) in signature order —
             # NO canon-id Dict, NO pre-allocated derived storage. Keep the caller's own arrays to prove non-aliasing.
             cpos = T[1, 2]; cmom = T[3, 4]; cmetric = T[2 0; 0 2]
-            sources = (cg, cmetric, cpos, cmom)
+            potf = p -> sum(abs2, p)
+            sources = (potf, cg, cmetric, cpos, cmom)
             cvals = RKS._bootstrap_canon_values(plan, pf.handles, sources)
             @test cg.n == 1                                                    # exactly ONE gradient at bootstrap
-            # values match the reference computation (superset order: 5 node,6 pot,7 dpot,8 chol,9 dkin,10 kin,11 ham)
+            @test cvals[1] === potf && cvals[2] === cg                         # both callable authorities kept by identity
+            # values match the reference computation (superset order: 6 node,7 pot,8 dpot,9 chol,10 dkin,11 kin,12 ham)
             C = cholesky(T[2 0; 0 2]); dk = C \ T[3, 4]
-            @test cvals[6] ≈ sum(abs2, T[1, 2]) && cvals[7] ≈ 2 .* T[1, 2]     # pot, dpot_dpos
-            @test cvals[8] isa Cholesky && cvals[9] ≈ dk                       # chol_metric, dkin_dmom
-            @test cvals[11] ≈ cvals[6] + cvals[10]                            # ham = pot + kin
-            @test eltype(cvals[7]) === T && typeof(cvals[11]) === T           # F32/F64 preserved
+            @test cvals[7] ≈ sum(abs2, T[1, 2]) && cvals[8] ≈ 2 .* T[1, 2]     # pot, dpot_dpos
+            @test cvals[9] isa Cholesky && cvals[10] ≈ dk                      # chol_metric, dkin_dmom
+            @test cvals[12] ≈ cvals[7] + cvals[11]                            # ham = pot + kin
+            @test eltype(cvals[8]) === T && typeof(cvals[12]) === T           # F32/F64 preserved
             frame = RKS._construct_nuts_frame_bootstrapped(pf, cvals, 4;
                 step_f = RKS.partial(_ErgFix.leapfrog!; stepsize = T(0.1)), stats_f = _ErgFix.nuts_stats!, min_dham = -1000)
             @test cg.n == 1                                                    # frame build does NOT re-run the gradient
@@ -1697,7 +1700,7 @@ end
             @test RKS._canon_slot(frame.init, momv) !== cmom                  # init.mom is a COPY of caller mom
             @test RKS._canon_slot(frame.init, posv) == cpos                   # ... value-equal (seeded from source)
             # bootstrap-PRODUCED buffers (dpot_dpos) ARE retained by identity (fresh per bootstrap, no discard)
-            @test RKS._canon_slot(frame.init, dpotv) === cvals[7]
+            @test RKS._canon_slot(frame.init, dpotv) === cvals[8]
             @test RKS._canon_slot(frame.fwd, posv) !== RKS._canon_slot(frame.init, posv)  # child ISOLATED
             @test RKS._canon_slot(frame.fwd, posv) == RKS._canon_slot(frame.init, posv)   # ... but complete/seeded
             @test RKS.diagnostics_ham_type(frame.diag) === T
@@ -1713,8 +1716,9 @@ end
         # per-instance ISOLATION + same-signature IDENTICAL concrete frame type across bootstraps — TWO samplers
         # built from the SAME caller arrays must both be non-aliased from the caller AND from each other.
         spos = [1.0, 2.0]; smom = [3.0, 4.0]; smetric = [2.0 0; 0 2]
+        spotf = p -> sum(abs2, p)
         mkframe() = RKS._construct_nuts_frame_bootstrapped(pf,
-            RKS._bootstrap_canon_values(plan, pf.handles, (_CG(0), smetric, spos, smom)), 3;
+            RKS._bootstrap_canon_values(plan, pf.handles, (spotf, _CG(0), smetric, spos, smom)), 3;
             step_f = RKS.partial(_ErgFix.leapfrog!; stepsize = 0.1), stats_f = _ErgFix.nuts_stats!, min_dham = -1000)
         fa = mkframe(); fb = mkframe()
         @test typeof(fa) === typeof(fb)                                       # deterministic concrete frame type

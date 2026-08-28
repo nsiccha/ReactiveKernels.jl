@@ -46,49 +46,10 @@ exact source that builds and runs the query, **Generated kernel** is
 colored `visualize(density_plan)` component.
 
 ```@eval
-Main.ReactiveKernelsDocs.execute_example(@__MODULE__, raw"""
-@kernel model(logit_rate::Real,
-              trials::CountVector,
-              successes::CountVector,
-              new_trials::Int) = begin
-    rate::Real = BetaBinomialExample.logistic(logit_rate)
-    parameters::BetaBinomialParameters =
-        BetaBinomialExample.assemble_parameters(rate)
-    log_jacobian::Real = BetaBinomialExample.log_abs_det_jacobian(rate)
-
-    prior::Real = BetaBinomialExample.log_prior(parameters)
-    pointwise::NTuple{5,Real} = BetaBinomialExample.pointwise_log_likelihood(
-        parameters, trials, successes,
-    )
-    likelihood::Real = BetaBinomialExample.sum_log_likelihood(pointwise)
-    density::Real = BetaBinomialExample.total_log_density(
-        prior, log_jacobian, likelihood,
-    )
-    expected::Real = BetaBinomialExample.expected_successes(parameters, new_trials)
-    return density
-end
-
-logit_rate = 0.2
-trials = BETA_BINOMIAL_TRIALS
-successes = BETA_BINOMIAL_SUCCESSES
-
-density_kernel = prepare(model;
-    have = (:logit_rate, :trials, :successes),
-    want = (:prior, :log_jacobian, :pointwise, :likelihood, :density))
-
-output = density_kernel(logit_rate, trials, successes)
-prior, logjac, pointwise, likelihood, density = output
-@assert likelihood ≈ sum(pointwise)
-@assert density ≈ prior + logjac + likelihood
-
-docs_example = (;
-    name = :beta_binomial_density,
-    origin = "compact @kernel model (build executed)",
-    inputs = (; logit_rate, trials, successes),
-    kernel = density_kernel,
-    output,
+Main.ReactiveKernelsDocs.execute_ppl_example(
+    @__MODULE__, :BetaBinomialExample, :BETA_BINOMIAL_SOURCE;
+    setup = Main.ReactiveKernelsDocs.setup_beta_binomial!,
 )
-"""; setup = Main.ReactiveKernelsDocs.setup_beta_binomial!)
 ```
 
 Asking only for constrained parameters selects just the logistic transform and

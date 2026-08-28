@@ -1,39 +1,53 @@
 # NUTS sampling
 
-ReactiveKernels' No-U-Turn sampler is authored as eight method-bearing `@kernel`
-specifications modeled on ReactiveHMC.jl's algorithm structure. The public
-sampler is compiled, executable, and allocation-free in steady state. This page
-separates that implementation claim from the narrower performance evidence and
-keeps the complete authoring source available without making it the main reading
-flow.
+This external NUTS compiler-acceptance exemplar is authored as a
+**single, method-bearing `@kernel` surface** — eight named specifications that
+together are the whole sampler — modeled on the ReactiveHMC.jl algorithm
+structure. This page shows that artifact's **authoring source** and measured
+performance. It demonstrates what ReactiveKernels compiles; it is not a sampler
+API that ReactiveKernels intends to ship.
 
-The public `nuts!!` sampler is **landed and executable on `main`**: `@kernel` lowers the
-NUTS source to a sealed, registry-free **native compiled recursion** (`compile_nuts_native`
-/ `_build_nuts_sampler`), and the public `nuts!!(state; rng)` mutates compiler-owned state
-in place and returns the **same object** (`result === state`, same concrete type) at
-**exact zero allocations**. The source below is copied from the reviewed fixture
-and guarded byte-for-byte by `test/test_nuts_docs_fixture.jl`. The checked-in G7
-receipt measures work-normalized leapfrog throughput; it is not an end-to-end
-sampling or ESS benchmark.
+The fixture's `nuts!!` entry is **landed as executable compiler evidence on `main`**: `@kernel`
+lowers the NUTS source to a sealed, registry-free **native compiled recursion**
+(`compile_nuts_native` / `_build_nuts_sampler`). That entry mutates compiler-owned
+state in place and returns the **same object** (`result === state`, same concrete
+type) at **exact zero allocations**. The source below is embedded statically from
+the reviewed `benchmark/nuts_kernel_authoring_fixture.jl` and guarded byte-for-byte
+by `test/test_nuts_docs_fixture.jl`; it is not read or executed by the docs build. The measured
+leapfrog-steps/s comparison against DynamicHMC, AdvancedHMC, and nsiccha/NUTS.jl
+is recorded in the static receipt [`benchmark/receipts/nuts-g7-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/nuts-g7-v1.toml)
+— parsed here, not re-run in CI. It is a work-normalized inner-loop receipt,
+not an end-to-end sampling, adaptation, wall-time, or ESS benchmark.
+
+Packaging matters: “public” inside the fixture comments means the entry of that
+sealed external artifact, not an RK package API. The builder and fixture are
+internal compiler acceptance surfaces. A currently exported `nuts_state` /
+`CompiledNUTSState` compatibility path uses a compiled-reactive phase-point DAG
+and ordinary inferred Julia tree-growth orchestration, but it is transitional and
+removal-bound rather than part of ReactiveKernels' intended support contract. See [Compiler capability and
+limits](compiler.md#what-the-nuts-proof-does-and-does-not-establish) for the exact
+boundary and why the two implementations prove different things.
 
 ## Status — read this before the code
 
 | Piece | State |
 |---|---|
-| Source contract (the eight `@kernel` specs below, the seven `@rk_*` effect registrations, the plan shape) | **Executable current `main`; correction pending.** The fixture currently has one combined `grad_f` producer. The previously removed `pot_f` alternative producer is to be restored with compiler/ownership evidence; until that lands, the source below mirrors current `main` exactly. |
-| All eight source specs construct; concrete phasepoint/frame init/recompute/copy verified | **Landed on `main`** — the compiler constructs and runs the whole sampler; sealed production certificate `mode = production`. |
+| Source contract (the eight `@kernel` specs below, the seven `@rk_*` effect registrations, the plan shape) | **Landed as external compiler evidence.** `pot_f` and `grad_f` are alternative producers of `pot`; the planner selects the needed recipe while retaining both read-only callable authorities by identity. |
+| All eight source specs construct; concrete phasepoint/frame init/recompute/copy verified | **Verified on `main`** — the compiler constructs and runs the complete external fixture; its sealed certificate records `mode = production`, which describes compiler evidence rather than package API status. |
 | Executable leapfrog (leaf scope) | **Verified** — analytic F32/F64; normal gradient Δ1, `@inferred`, exact 0-B; dirty-produced recovery analytic; dirty-source reject. |
-| Public `nuts!!` sampler (`step!`, tree growth, U-turn) | **Landed on `main`** — sealed registry-free native recursion; `nuts!!(state; rng) === state` (same object, fixed type), **exact 0-B** on the public path. |
+| Sealed fixture `nuts!!` (`step!`, tree growth, U-turn) | **Verified external exemplar** — sealed registry-free native recursion; `nuts!!(state; rng) === state` (same object, fixed type), **exact 0-B** on the compiler acceptance path. |
+| Current `nuts_state` / `CompiledNUTSState` compatibility surface | **Transitional and removal-bound, not an intended RK API.** It uses compiled-reactive Hamiltonian dependencies with ordinary inferred Julia recursion and proposal scratch; it is not the sealed fixture artifact or part of the definitive support contract. |
 | End-to-end sampling time and ESS | **Not measured for the current sealed-native path.** The earlier compiled-reactive implementation was about 4–7× slower than AdvancedHMC/DynamicHMC in matched warmup+draw wall time, so the inner-loop result must not be read as a blanket sampler-speed claim. |
 | Work-normalized inner-loop throughput | **Measured, narrow metric** — [`nuts-g7-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/nuts-g7-v1.toml) records 2.27M leapfrog steps/s for RK, 1.33M for AdvancedHMC, 1.42M for DynamicHMC, and 2.65M for nsiccha/NUTS.jl on the frozen AR(1) setup. |
 
 The sealed native compiler (`kernel_nuts_native.jl`, `_build_nuts_sampler`) and the
-minimal-reset authoring fixture are **on `main`**; the public `nuts!!` runs there. The
-performance figures cited on this page come from the static receipt, not a CI perf run.
-RK, AdvancedHMC, and DynamicHMC used one shared DifferentiationInterface+Enzyme
-gradient and matched target, mass, step size, and RNG schedule; the receipt also
-checks the gradient/work accounting. It does **not** measure adaptation, retained
-draws, ESS, or time-to-effective-sample.
+minimal-reset external authoring fixture are **on `main` as compiler evidence**. The performance figures cited on
+this page measure that acceptance artifact and come from the static receipt, not a
+CI perf run or the transitional `CompiledNUTSState` compatibility path. RK, AdvancedHMC, and
+DynamicHMC used one shared DifferentiationInterface+Enzyme gradient and matched
+target, mass, step size, and RNG schedule; the receipt also checks gradient/work
+accounting. It does **not** measure adaptation, retained draws, ESS, or
+time-to-effective-sample.
 
 The ReactiveHMC.jl `ca9` structure is an **algorithm-structure reference only** — not
 a bitwise or RNG target; improvements may change arithmetic or ordering.
@@ -55,11 +69,11 @@ The design goal is that the *math is the code*: each `@kernel` reads as the recu
 it implements, and the compiler — not the author — schedules effects, owns storage, and
 invalidates stale values.
 
-- **`euclidean_phasepoint(grad_f, metric, pos, mom)`** — on current `main`, a phasepoint is
-  potential + kinetic energy at `(pos, mom)`. You write the four lines of physics
-  directly: one destination-bound gradient recipe produces `pot, dpot_dpos = grad_f(pos)`
-  (the pending source-contract correction will restore `pot_f` as an unselected
-  alternative producer), `chol_metric = cholesky(metric)`, the
+- **`euclidean_phasepoint(pot_f, grad_f, metric, pos, mom)`** — a phasepoint is
+  potential + kinetic energy at `(pos, mom)`. You write both valid ways to obtain
+  the potential: `pot = pot_f(pos)` and `pot, dpot_dpos = grad_f(pos)`. The planner
+  selects the gradient recipe when `dpot_dpos` is wanted, while retaining both
+  callable authorities by identity. Then `chol_metric = cholesky(metric)`, the
   kinetic term `kin = ½(logdet(chol_metric) + momᵀ M⁻¹ mom)`, and `ham = pot + kin`.
   The Hamiltonian-gradient fields are **alias projections that collapse onto the
   canonical owned gradient slots** — `dham_dpos` onto `dpot_dpos`, `dham_dmom` onto
@@ -81,7 +95,7 @@ invalidates stale values.
   derived `diverged` recipe written once (never imperatively), and the tree-growth /
   U-turn / multinomial-swap logic as ordinary inner methods. Direction is two direct
   physical-endpoint branch calls, not a mutable current-view.
-- **`nuts!!(state; rng)`** — the public compiled entry: refresh momentum on the owned
+- **`nuts!!(state; rng)`** — the sealed fixture entry: refresh momentum on the owned
   `init`, `step!` the tree, `return state` (result **is** `state`; fixed shape/type).
 - **`dual_averaging_state`** / **`welford_var`** — the adaptation recurrences: Nesterov
   dual averaging (`m`/`H`/`μ` + `fit!(x)`) and streaming Welford variance
@@ -89,17 +103,21 @@ invalidates stale values.
 
 ## The locked compiler/lowering contract
 
-These are the properties the `@kernel` lowering is **locked to** and the landed public
-`nuts!!` entry **satisfies** (see the status table).
+These are the properties the `@kernel` lowering is **locked to** and the landed sealed
+fixture entry **satisfies** (see the status table).
 
-- **Captured source, exact effect registrations.** The compiler schedules the public
+- **Captured source, exact effect registrations.** The compiler schedules the fixture's
   `@rk_pure` / `@rk_borrows` / `@rk_rng` helpers by their *registered* effects, never by
   inferring the body. Authors touch no internals.
-- **Immutable plan.** Construction produces a fixed-shape, fixed-type plan; the public
-  entry mutates compiler-owned concrete state and returns the same object. The public
+- **Immutable plan.** Construction produces a fixed-shape, fixed-type plan; the sealed
+  entry mutates compiler-owned concrete state and returns the same object. The fixture
   identity holds: `nuts!!(state; rng)` returns `result === state` (same object, fixed
   concrete type) at **exact 0-B** — verified on the sealed native sampler.
-- **Owned endpoints vs shared authority.** Read-only authority inputs (`grad_f`,
+- **Input isolation and prepared storage.** Construction leaves caller inputs untouched
+  and unaliased with writable sampler storage. Preparation creates compiler-owned
+  endpoint buffers; repeated calls reuse and mutate those buffers in place, and the
+  public result is the prepared state object itself.
+- **Owned endpoints vs shared authority.** Read-only authority inputs (`pot_f`, `grad_f`,
   `metric`, the metric-only `chol_metric` closure and the `@node(logdet(chol_metric))`
   value) are **shared by identity** across `init` / `fwd` / `bwd`; the integrator-written
   `pos`, `mom` and their derived closures (`pot`, `dpot_dpos`, `kin`, `ham`, and the
@@ -128,7 +146,7 @@ status. The table above is authoritative.
 ```julia
 # ReactiveHMC-STRUCTURE `@kernel` NUTS AUTHORING FIXTURE — FINAL executable-integration surface.
 # implicit-field, no-Ref (two-direct-branch direction), runtime rng, RK-visible leapfrog!/refresh_momentum!!/
-# copy!!, `!!` public entry, one destination-bound grad recipe (NO pot_f), public @rk_* helper effect
+# copy!!, `!!` public entry, pot_f + grad_f as alternative pot producers (pot_f RESTORED), public @rk_* helper effect
 # declarations, and a concrete registered zero-allocation stats callback over compiler-owned diagnostics state.
 #
 # Algorithm-STRUCTURE reference (NOT a bitwise target): ReactiveHMC.jl v0.1.0 (781sB @ ca9ea4ca) —
@@ -143,9 +161,10 @@ status. The table above is authoritative.
 #     is TWO DIRECT PHYSICAL-ENDPOINT BRANCH CALLS with a CONCRETE endpoint actual threaded as a plain formal.
 #  C) public `@kernel nuts!!(state; rng)` refreshes momentum then mutates compiler-owned concrete state +
 #     `return state` (result===state, fixed shape/type, 0-B, no RefValue).
-#  GRAD: euclidean_phasepoint takes ONLY grad_f — one destination-bound selected grad recipe produces pot+dpot
-#     (no redundant pot_f producer, no required-but-unused pot_f authority). The build hook passes the in-place
-#     pgrad!(g,x)::T unchanged; the factory binds it to each endpoint's owned dpot_dpos slot + pot scalar.
+#  GRAD: euclidean_phasepoint takes pot_f + grad_f as ALTERNATIVE producers of pot (pot_f RESTORED per user
+#     directive 2026-08-27T10:18:56 — its earlier removal was unauthorized); grad_f additionally produces dpot.
+#     pot_f is a shared-by-identity authority retained even when the planner selects grad_f for pot. The build
+#     hook passes the in-place pgrad!(g,x)::T unchanged; the factory binds it to each endpoint's dpot_dpos + pot.
 #  RNG is a TYPED RUNTIME arg, NOT sampler state; `step!(rng)` threads it; `nuts!!` calls refresh + step!(state,rng).
 #  RESET/COPY use the RK-CORE registered structural strong-update `copy!!(dest, src)` (result===dest).
 #  DIAGNOSTICS: nuts_state owns n_steps/reached_depth/acceptance_rate (+ existing dham/diverged); reset! zeros
@@ -156,8 +175,9 @@ status. The table above is authoritative.
 #  the compiler schedules them with visible effects (never body inference).
 #
 #  PINNED STRUCTURAL-COPY OWNERSHIP POLICY (`deepcopy(init)` is the STRUCTURAL MARKER):
-#   - SHARED BY IDENTITY across init/fwd/bwd: read-only authority inputs grad_f, metric, plus the metric-only
-#     closure chol_metric and the @node(logdet(chol_metric)) value (one slot). NO pot_f.
+#   - SHARED BY IDENTITY across init/fwd/bwd: read-only authority inputs pot_f, grad_f, metric, plus the
+#     metric-only closure chol_metric and the @node(logdet(chol_metric)) value (one slot). pot_f is the
+#     authored alternative pot producer, retained by identity even when its recipe is unselected.
 #   - OWNED/DISTINCT per endpoint: integrator-written pos, mom + endpoint closures/caches pot, dpot_dpos,
 #     dkin_dmom, kin, ham, dham_dpos, dham_dmom (aliased projections collapse to one physical slot).
 #
@@ -203,9 +223,15 @@ example_step_binding(stepsize) = partial(leapfrog!; stepsize = stepsize)
 example_nuts_binding(init, stepsize) =
     nuts_state(init; step_f = partial(leapfrog!; stepsize), stats_f = nuts_stats!)
 
-# ---- euclidean_phasepoint — ONE destination-bound grad recipe (pot+dpot); pot_f DROPPED; @node preserved ----
-@kernel euclidean_phasepoint(grad_f, metric, pos, mom) = begin
-    pot, dpot_dpos = grad_f(pos)                 # single selected grad recipe; factory binds grad_f=pgrad!(g,x)
+# ---- euclidean_phasepoint — pot_f + grad_f are ALTERNATIVE producers of pot; @node preserved -------------
+# `pot_f` is the authored alternative potential producer (restored per user directive
+# 2026-08-27T10:18:56 — its earlier removal was an unauthorized simplification). It is a
+# SHARED-BY-IDENTITY read-only authority, retained by identity even when the planner selects
+# `grad_f` (which produces pot as a byproduct of the needed dpot); the two `pot`-producing
+# recipes below are alternative producers, plan-resolved (see src/kernel_lowering.jl).
+@kernel euclidean_phasepoint(pot_f, grad_f, metric, pos, mom) = begin
+    pot = pot_f(pos)                             # pot_f: authored alternative producer of pot (kept by identity)
+    pot, dpot_dpos = grad_f(pos)                 # grad_f also produces pot (+dpot); factory binds grad_f=pgrad!(g,x)
     chol_metric = cholesky(metric)
     dkin_dmom = chol_metric \ mom
     kin = oftype(pot, 0.5) * (@node(logdet(chol_metric)) + dot(mom, dkin_dmom))   # typed 1/2 (no Float64 promotion)
@@ -236,7 +262,7 @@ end
 # preserves destination object/buffer identity, transfers source currentness, leaves SHARED authority slots
 # UNTOUCHED, collapses aliased
 # projections to ONE physical copy, rejects incompatible shape/type/shared-authority identity.
-#   SHARED-BY-IDENTITY (untouched by copy!!): grad_f, metric, chol_metric + @node(logdet(chol_metric)). A
+#   SHARED-BY-IDENTITY (untouched by copy!!): pot_f, grad_f, metric, chol_metric + @node(logdet(chol_metric)). A
 #     metric mutation updates the ONE shared authority + its chol/@node closure EXACTLY once.
 #   OWNED/DISTINCT (what copy!! moves): pos, mom + pot, dpot_dpos, dkin_dmom, kin, ham, dham_dpos, dham_dmom
 #     (aliased projections collapse to one physical copy). deepcopy(init) is the STRUCTURAL MARKER.

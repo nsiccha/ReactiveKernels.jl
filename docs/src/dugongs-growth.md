@@ -43,52 +43,10 @@ exact source that builds and runs the query, **Generated kernel** is
 colored `visualize(density_plan)` component.
 
 ```@eval
-Main.ReactiveKernelsDocs.execute_example(@__MODULE__, raw"""
-@kernel model(unconstrained::UnconstrainedParameters,
-              ages::RealVector,
-              lengths::RealVector,
-              new_age::Real) = begin
-    (α::Real, β::Real, u_λ::Real, log_τ::Real) =
-        DugongsGrowthExample.split_unconstrained(unconstrained)
-    λ::Real = DugongsGrowthExample.bounded_lambda(u_λ)
-    σ::Real = DugongsGrowthExample.sd_from_log_precision(log_τ)
-    parameters::DugongsParameters =
-        DugongsGrowthExample.assemble_parameters(α, β, λ, σ)
-    log_jacobian::Real = DugongsGrowthExample.log_abs_det_jacobian(u_λ, log_τ)
-
-    prior::Real = DugongsGrowthExample.log_prior(parameters)
-    pointwise::RealVector = DugongsGrowthExample.pointwise_log_likelihood(
-        parameters, ages, lengths,
-    )
-    likelihood::Real = DugongsGrowthExample.sum_log_likelihood(pointwise)
-    density::Real = DugongsGrowthExample.total_log_density(
-        prior, log_jacobian, likelihood,
-    )
-    predicted::Real = DugongsGrowthExample.predicted_length(parameters, new_age)
-    return density
-end
-
-q = (2.7, 1.0, 1.7, log(300.0))
-ages = DUGONGS_AGE
-lengths = DUGONGS_LENGTH
-
-density_kernel = prepare(model;
-    have = (:unconstrained, :ages, :lengths),
-    want = (:prior, :log_jacobian, :pointwise, :likelihood, :density))
-
-output = density_kernel(q, ages, lengths)
-prior, logjac, pointwise, likelihood, density = output
-@assert likelihood ≈ sum(pointwise)
-@assert density ≈ prior + logjac + likelihood
-
-docs_example = (;
-    name = :dugongs_density,
-    origin = "compact @kernel model (build executed) — posteriordb dugongs",
-    inputs = (; q, ages, lengths),
-    kernel = density_kernel,
-    output,
+Main.ReactiveKernelsDocs.execute_ppl_example(
+    @__MODULE__, :DugongsGrowthExample, :DUGONGS_SOURCE;
+    setup = Main.ReactiveKernelsDocs.setup_dugongs!,
 )
-"""; setup = Main.ReactiveKernelsDocs.setup_dugongs!)
 ```
 
 Asking only for constrained parameters selects just the transforms and assembly;

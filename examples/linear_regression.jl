@@ -2,9 +2,12 @@ module LinearRegressionExample
 
 using ReactiveKernels
 
+include("_ppl_source_authority.jl")
+
 export LinearRegressionParameters, LinearPrediction
 export LINREG_X, LINREG_Y
-export build_linear_regression_graph, demo
+export LINEAR_REGRESSION_SOURCE
+export evaluate_linear_regression_source, build_linear_regression_graph, demo
 
 const NPOINTS = 5
 const DataVector = NTuple{NPOINTS,Real}
@@ -85,6 +88,81 @@ function predict_new(parameters::LinearRegressionParameters,
     LinearPrediction(mean_new, y_new)
 end
 
+const LINEAR_REGRESSION_SOURCE = raw"""
+@kernel model(unconstrained::UnconstrainedParameters,
+              predictors::DataVector,
+              responses::DataVector,
+              new_predictor::Real,
+    prediction_innovation::Real) = begin
+    (α::Real, β::Real, log_σ::Real) =
+        split_unconstrained(unconstrained)
+    σ::Real = positive_scale(log_σ)
+    parameters::LinearRegressionParameters =
+        assemble_parameters(α, β, σ)
+    log_jacobian::Real =
+        log_abs_det_jacobian(log_σ)
+
+    prior::Real = log_prior(parameters)
+    pointwise::DataVector = pointwise_log_likelihood(
+        parameters, predictors, responses,
+    )
+    likelihood::Real = sum_log_likelihood(pointwise)
+    density::Real = total_log_density(
+        prior, log_jacobian, likelihood,
+    )
+    prediction::LinearPrediction = predict_new(
+        parameters, new_predictor, prediction_innovation,
+    )
+    return density
+end
+
+q = (1.0, 2.0, log(0.5))
+predictors = LINREG_X
+responses = LINREG_Y
+
+density_kernel = prepare(model;
+    have = (:unconstrained, :predictors, :responses),
+    want = (:prior, :log_jacobian, :pointwise, :likelihood, :density))
+
+output = density_kernel(q, predictors, responses)
+prior, logjac, pointwise, likelihood, density = output
+@assert likelihood ≈ sum(pointwise)
+@assert density ≈ prior + logjac + likelihood
+
+docs_example = (;
+    name = :linear_regression_density,
+    origin = "compact @kernel model (build executed)",
+    inputs = (; q, predictors, responses),
+    model,
+    kernel = density_kernel,
+    output,
+)
+"""
+
+function evaluate_linear_regression_source()
+    _evaluate_ppl_source(
+        LINEAR_REGRESSION_SOURCE,
+        @__MODULE__;
+        bindings = (
+            :LinearRegressionParameters,
+            :LinearPrediction,
+            :DataVector,
+            :UnconstrainedParameters,
+            :LINREG_X,
+            :LINREG_Y,
+            :split_unconstrained,
+            :positive_scale,
+            :assemble_parameters,
+            :log_abs_det_jacobian,
+            :log_prior,
+            :pointwise_log_likelihood,
+            :sum_log_likelihood,
+            :total_log_density,
+            :predict_new,
+        ),
+    )
+end
+
 """
     build_linear_regression_graph()
 
@@ -98,27 +176,7 @@ nodes. Prediction is deterministic for a caller-supplied standard-normal
 innovation; sampling that innovation remains outside the pure graph.
 """
 function build_linear_regression_graph()
-    @kernel model(unconstrained::UnconstrainedParameters,
-                  predictors::DataVector,
-                  responses::DataVector,
-                  new_predictor::Real,
-                  prediction_innovation::Real) = begin
-        (α::Real, β::Real, log_σ::Real) = split_unconstrained(unconstrained)
-        σ::Real = positive_scale(log_σ)
-        parameters::LinearRegressionParameters = assemble_parameters(α, β, σ)
-        log_jacobian::Real = log_abs_det_jacobian(log_σ)
-
-        prior::Real = log_prior(parameters)
-        pointwise::DataVector = pointwise_log_likelihood(
-            parameters, predictors, responses,
-        )
-        likelihood::Real = sum_log_likelihood(pointwise)
-        density::Real = total_log_density(prior, log_jacobian, likelihood)
-        prediction::LinearPrediction = predict_new(
-            parameters, new_predictor, prediction_innovation,
-        )
-        return density
-    end
+    evaluate_linear_regression_source().model
 end
 
 function demo()

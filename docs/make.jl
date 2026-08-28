@@ -7,6 +7,7 @@ include(joinpath(@__DIR__, "..", "examples", "batched.jl"))
 
 site_pages = [
     "Home" => "index.md",
+    "Compiler capability and limits" => "compiler.md",
     "Building blocks" => [
         "Distribution log densities" => "distributions.md",
         "Batched log densities" => "batched.md",
@@ -43,6 +44,10 @@ makedocs(
     # Build-executed examples must fail closed instead of silently losing their panel.
     warnonly = Documenter.except(:eval_block),
 )
+
+# A successful build must have executed and rendered every PPL walkthrough
+# exactly once. This catches an omitted page/block even when no eval error fires.
+ReactiveKernelsDocs.assert_ppl_examples_executed!()
 
 # Ensure a root index.html redirect exists
 let redirect = joinpath(@__DIR__, "build", "index.html")

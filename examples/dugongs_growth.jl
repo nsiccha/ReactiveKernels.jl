@@ -1,10 +1,12 @@
 module DugongsGrowthExample
 
 using ReactiveKernels
+include("_ppl_source_authority.jl")
 
 export DugongsParameters
 export DUGONGS_AGE, DUGONGS_LENGTH
 export build_dugongs_graph, demo
+export DUGONGS_SOURCE, evaluate_dugongs_source
 
 # A ReactiveKernels port of the `dugongs` model from posteriordb
 # (posterior `dugongs_data-dugongs_model`): a nonlinear asymptotic growth curve
@@ -106,6 +108,60 @@ total_log_density(log_prior::Real, log_jacobian::Real,
 predicted_length(parameters::DugongsParameters, new_age::Real) =
     growth_mean(parameters, new_age)
 
+const DUGONGS_SOURCE = raw"""
+@kernel model(unconstrained::UnconstrainedParameters,
+              ages::RealVector,
+              lengths::RealVector,
+              new_age::Real) = begin
+    (α::Real, β::Real, u_λ::Real, log_τ::Real) =
+        split_unconstrained(unconstrained)
+    λ::Real = bounded_lambda(u_λ)
+    σ::Real = sd_from_log_precision(log_τ)
+    parameters::DugongsParameters = assemble_parameters(α, β, λ, σ)
+    log_jacobian::Real = log_abs_det_jacobian(u_λ, log_τ)
+
+    prior::Real = log_prior(parameters)
+    pointwise::RealVector = pointwise_log_likelihood(parameters, ages, lengths)
+    likelihood::Real = sum_log_likelihood(pointwise)
+    density::Real = total_log_density(prior, log_jacobian, likelihood)
+    predicted::Real = predicted_length(parameters, new_age)
+    return density
+end
+
+q = (2.7, 1.0, 1.7, log(300.0))
+ages = DUGONGS_AGE
+lengths = DUGONGS_LENGTH
+
+density_kernel = prepare(model;
+    have = (:unconstrained, :ages, :lengths),
+    want = (:prior, :log_jacobian, :pointwise, :likelihood, :density))
+
+output = density_kernel(q, ages, lengths)
+prior, logjac, pointwise, likelihood, density = output
+@assert likelihood ≈ sum(pointwise)
+@assert density ≈ prior + logjac + likelihood
+
+docs_example = (;
+    name = :dugongs_density,
+    origin = "compact @kernel model (build executed) — posteriordb dugongs",
+    inputs = (; q, ages, lengths),
+    model,
+    kernel = density_kernel,
+    output,
+)
+"""
+
+function evaluate_dugongs_source()
+    _evaluate_ppl_source(DUGONGS_SOURCE, @__MODULE__; bindings = (
+        :DugongsParameters, :UnconstrainedParameters, :RealVector,
+        :DUGONGS_AGE, :DUGONGS_LENGTH,
+        :split_unconstrained, :bounded_lambda, :sd_from_log_precision,
+        :assemble_parameters, :log_abs_det_jacobian, :log_prior,
+        :pointwise_log_likelihood, :sum_log_likelihood,
+        :total_log_density, :predicted_length,
+    ))
+end
+
 """
     build_dugongs_graph()
 
@@ -116,26 +172,7 @@ pointwise log-likelihood, likelihood reduction, total density, and an
 expected-length generated quantity as separate named ports.
 """
 function build_dugongs_graph()
-    @kernel model(unconstrained::UnconstrainedParameters,
-                  ages::RealVector,
-                  lengths::RealVector,
-                  new_age::Real) = begin
-        (α::Real, β::Real, u_λ::Real, log_τ::Real) =
-            split_unconstrained(unconstrained)
-        λ::Real = bounded_lambda(u_λ)
-        σ::Real = sd_from_log_precision(log_τ)
-        parameters::DugongsParameters = assemble_parameters(α, β, λ, σ)
-        log_jacobian::Real = log_abs_det_jacobian(u_λ, log_τ)
-
-        prior::Real = log_prior(parameters)
-        pointwise::RealVector = pointwise_log_likelihood(
-            parameters, ages, lengths,
-        )
-        likelihood::Real = sum_log_likelihood(pointwise)
-        density::Real = total_log_density(prior, log_jacobian, likelihood)
-        predicted::Real = predicted_length(parameters, new_age)
-        return density
-    end
+    evaluate_dugongs_source().model
 end
 
 function demo()

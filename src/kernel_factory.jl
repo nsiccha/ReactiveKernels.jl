@@ -938,7 +938,8 @@ end
 
 # The deeply-immutable plan: a def-unique selected-plan `key`; per-path `slots`; deterministic
 # `alias_groups`; the exact selected `producer` map (canonical Value id → selected Recipe id);
-# the selected Plan `recipes` order; and the proven post-construction `entry_current` set.
+# the selected Plan `recipes` order; the proven post-construction `entry_current` set; and every
+# HAVE callable authority referenced by a backward-reachable `:portcall` candidate (selected or not).
 # `Key` is an actual VALUE type parameter (RK 04:17): the immutable structural selected-plan
 # identity — a Tuple of the owner/integrator Token + a per-slot (path, CANONICAL Value id, role,
 # slot) signature + alias groups + the (canonical Value id, Recipe id) producer signature + the
@@ -991,6 +992,9 @@ function kernel_plan_recipe_seam(p::_KernelPlan)
     Tuple((rid, get(inby, rid, ()), get(outby, rid, ()), get(ownby, rid, ())) for rid in p.recipes)
 end
 kernel_plan_key(::_KernelPlan{Key}) where {Key} = Key
+# Identity-kept HAVE callable authorities are selection-independent. Real factory plans store the
+# canonical ids in Key[9]; the empty fallback keeps hand-built legacy/synthetic plan keys inspectable.
+kernel_plan_external(::_KernelPlan{Key}) where {Key} = length(Key) >= 9 ? Key[9] : ()
 # The immutable OWNED entry-current currentness mask, emitted at COMPILE TIME from the plan's structural
 # Key (slot signature + Key[8] entry_current) — plan-once, NO per-instance Set/traversal (RK 09:19). A
 # constructed init MUST reach this mask before its owned children may be seeded.
@@ -1116,9 +1120,12 @@ end
 _plan_have_from_key(Key) = (prodk = Set{Int}(c for (c, _) in Key[4]); Int[c for c in Key[8] if !(c in prodk)])
 # The Form param of a `_KernelSourceOp{DefToken,Form,F,TF}` op type (`:portcall` / `:fused`).
 _sourceop_form_type(::Type{<:_KernelSourceOp{DefToken,Form}}) where {DefToken,Form} = Form
-# The identity-kept EXTERNAL canonical ids, derived at generation exactly as `_prepare_factory` does: the
-# callable FIRST input of every `:portcall` recipe (grad_f). No runtime field, no value type param needed.
+# The identity-kept EXTERNAL canonical ids. Real plans capture these selection-independently from ALL
+# backward-reachable `:portcall` candidates in Key[9], so an unselected alternative callable (pot_f)
+# cannot be deep-copied merely because another recipe won the plan. The selected-only fallback is for
+# pre-Key[9] synthetic/legacy plan keys; no current factory plan takes it.
 function _plan_external_from(Key, H)
+    length(Key) >= 9 && return Key[9]
     rin = Dict{Int,Vector{Int}}(rid => collect(ins) for (rid, ins) in Key[6])
     ext = Int[]
     for (idx, rid) in enumerate(Key[5])
@@ -1260,6 +1267,7 @@ function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol}; key
     want = Value[pmap[n] for n in names if !(n in havek)]
     haveplan = !isempty(want)
     producer_keys = Int[]      # canonical ids that HAVE a selected producer (recipe-owned)
+    external_ids = Int[]       # HAVE callable authorities from ALL reachable portcall candidates
     if haveplan
         pl = plan(graph; have = have, want = want)
         producer = Tuple(sort!([(cid, r.id) for (cid, r) in pl.producer]))
@@ -1278,6 +1286,17 @@ function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol}; key
         # The selected recipe OP VALUES in exact plan order (RK 07:20) — captured from the source-built
         # Recipe objects during THIS single planning pass, for the prepared executable handle tuple.
         selected_ops = Tuple((r.id, r.op) for r in pl.recipes)
+        # Selection-independent callable authority census (pot_f restoration prerequisite): candidates
+        # are the complete backward-reachable recipe frontier, including an alternative `pot_f(pos)`
+        # recipe that loses to the selected multi-output `grad_f(pos)`. Preserve the canonical first
+        # input of every source `:portcall` by identity; candidate order is deterministic by Recipe id.
+        for r in pl.candidates
+            op = r.op
+            (op isa _KernelSourceOp && kernel_sourceop_form(op) === :portcall && !isempty(r.inputs)) ||
+                continue
+            c = canon_id(graph, r.inputs[1].id)
+            c in external_ids || push!(external_ids, c)
+        end
         producer_keys = Int[cid for (cid, _) in producer]
     else
         producer = (); recipes = (); recipe_inputs = (); recipe_outputs = (); selected_ops = ()
@@ -1301,9 +1320,10 @@ function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol}; key
     # `kernel_spec` reads of one const definition, distinct across definitions) make two same-SHAPE
     # graphs under the same integrator produce DIFFERENT keys. NO objectid/hash/Recipe.op.
     slot_sig = Tuple((s.path, s.canon, s.role, s.slot) for s in slots)
-    # entry_current is appended as Key[8] (RK 09:19) so a type-level `kernel_plan_entry_owned_mask`
-    # accessor can emit the immutable owned entry mask at compile time — plan-once, no per-instance Set.
-    key = (key_token, slot_sig, groups, producer, recipes, recipe_inputs, recipe_outputs, Tuple(ec))
+    # entry_current is Key[8] (RK 09:19); selection-independent external authorities are Key[9]. Both
+    # remain immutable/type-level so generated construction needs neither a graph read nor a runtime Set.
+    external = Tuple(external_ids)
+    key = (key_token, slot_sig, groups, producer, recipes, recipe_inputs, recipe_outputs, Tuple(ec), external)
     plan_obj = _KernelPlan(key, Tuple(slots), groups, producer, recipes, Tuple(ec), recipe_inputs, recipe_outputs)
     with_ops ? (plan_obj, selected_ops) : plan_obj
 end
@@ -1659,16 +1679,9 @@ function _prepared_factory_from_plan(token, plan::_KernelPlan, ops; allow_destin
         "a free stateful kernel must not carry a :destination (external-grad) recipe"))
     length(dests) <= 1 || throw(_KernelFactoryReject("ambiguous: $(length(dests)) destination recipes"))
     grad_recipe = isempty(dests) ? 0 : dests[1]
-    # LIMITATION (RK, explicit): external = the FIRST input of every SELECTED :portcall recipe. Sufficient for
-    # the current pot_f-FREE fixture, but the later pot_f restoration needs ALL HAVE callable authorities
-    # retained even when their alternative recipe is UNSELECTED — not solved here.
-    ext = Int[]
-    for (o, s) in zip(ops, seam)
-        op = o[2]
-        (op isa _KernelSourceOp && kernel_sourceop_form(op) === :portcall && !isempty(s[2])) &&
-            (s[2][1] in ext || push!(ext, s[2][1]))
-    end
-    external = Tuple(ext)
+    # Read the selection-independent authority census captured while the live Plan (and its complete
+    # candidate frontier) was available. Prepared handles remain selected-only execution authority.
+    external = kernel_plan_external(plan)
     _PreparedFactory{token, grad_recipe, typeof(plan), typeof(handles), typeof(external)}(plan, handles, external)
 end
 

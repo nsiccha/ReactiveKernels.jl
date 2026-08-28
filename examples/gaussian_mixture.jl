@@ -1,10 +1,12 @@
 module GaussianMixtureExample
 
 using ReactiveKernels
+include("_ppl_source_authority.jl")
 
 export MixtureParameters
 export MIXTURE_OBSERVATIONS
 export build_gaussian_mixture_graph, demo
+export GAUSSIAN_MIXTURE_SOURCE, evaluate_gaussian_mixture_source
 
 # A ReactiveKernels port of the `low_dim_gauss_mix` model from posteriordb
 # (posterior `low_dim_gauss_mix-low_dim_gauss_mix`): a two-component Gaussian
@@ -121,6 +123,59 @@ function component1_responsibility(parameters::MixtureParameters, new_point::Rea
     exp(la - log_sum_exp(la, lb))
 end
 
+const GAUSSIAN_MIXTURE_SOURCE = raw"""
+@kernel model(unconstrained::UnconstrainedParameters,
+              observations::RealVector,
+              new_point::Real) = begin
+    (μ₁ᵤ::Real, δ::Real, log_σ₁::Real, log_σ₂::Real, logit_θ::Real) =
+        split_unconstrained(unconstrained)
+    (μ₁::Real, μ₂::Real) = ordered_means(μ₁ᵤ, δ)
+    σ₁::Real = exp_scale(log_σ₁)
+    σ₂::Real = exp_scale(log_σ₂)
+    θ::Real = logistic(logit_θ)
+    parameters::MixtureParameters = assemble_parameters(μ₁, μ₂, σ₁, σ₂, θ)
+    log_jacobian::Real = log_abs_det_jacobian(δ, log_σ₁, log_σ₂, θ)
+
+    prior::Real = log_prior(parameters)
+    pointwise::RealVector = pointwise_log_likelihood(parameters, observations)
+    likelihood::Real = sum_log_likelihood(pointwise)
+    density::Real = total_log_density(prior, log_jacobian, likelihood)
+    responsibility::Real = component1_responsibility(parameters, new_point)
+    return density
+end
+
+q = (-3.0, log(6.0), log(0.7), log(0.7), 0.0)
+observations = MIXTURE_OBSERVATIONS
+
+density_kernel = prepare(model;
+    have = (:unconstrained, :observations),
+    want = (:prior, :log_jacobian, :pointwise, :likelihood, :density))
+
+output = density_kernel(q, observations)
+prior, logjac, pointwise, likelihood, density = output
+@assert likelihood ≈ sum(pointwise)
+@assert density ≈ prior + logjac + likelihood
+
+docs_example = (;
+    name = :gaussian_mixture_density,
+    origin = "compact @kernel model (build executed) — posteriordb low_dim_gauss_mix",
+    inputs = (; q, observations),
+    model,
+    kernel = density_kernel,
+    output,
+)
+"""
+
+function evaluate_gaussian_mixture_source()
+    _evaluate_ppl_source(GAUSSIAN_MIXTURE_SOURCE, @__MODULE__; bindings = (
+        :MixtureParameters, :UnconstrainedParameters, :RealVector,
+        :MIXTURE_OBSERVATIONS, :split_unconstrained, :ordered_means,
+        :exp_scale, :logistic, :assemble_parameters, :log_abs_det_jacobian,
+        :log_prior, :pointwise_log_likelihood, :sum_log_likelihood,
+        :total_log_density, :component1_responsibility,
+    ))
+end
+
 """
     build_gaussian_mixture_graph()
 
@@ -132,26 +187,7 @@ likelihood reduction, total density, and a component-responsibility generated
 quantity remain separate named ports.
 """
 function build_gaussian_mixture_graph()
-    @kernel model(unconstrained::UnconstrainedParameters,
-                  observations::RealVector,
-                  new_point::Real) = begin
-        (μ₁ᵤ::Real, δ::Real, log_σ₁::Real, log_σ₂::Real, logit_θ::Real) =
-            split_unconstrained(unconstrained)
-        (μ₁::Real, μ₂::Real) = ordered_means(μ₁ᵤ, δ)
-        σ₁::Real = exp_scale(log_σ₁)
-        σ₂::Real = exp_scale(log_σ₂)
-        θ::Real = logistic(logit_θ)
-        parameters::MixtureParameters =
-            assemble_parameters(μ₁, μ₂, σ₁, σ₂, θ)
-        log_jacobian::Real = log_abs_det_jacobian(δ, log_σ₁, log_σ₂, θ)
-
-        prior::Real = log_prior(parameters)
-        pointwise::RealVector = pointwise_log_likelihood(parameters, observations)
-        likelihood::Real = sum_log_likelihood(pointwise)
-        density::Real = total_log_density(prior, log_jacobian, likelihood)
-        responsibility::Real = component1_responsibility(parameters, new_point)
-        return density
-    end
+    evaluate_gaussian_mixture_source().model
 end
 
 function demo()

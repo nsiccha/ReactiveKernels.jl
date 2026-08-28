@@ -5,7 +5,10 @@ include(joinpath(@__DIR__, "..", "examples", "dugongs_growth.jl"))
 using .DugongsGrowthExample
 
 @testset "manual PPL graph — dugongs (nonlinear growth)" begin
-    model = build_dugongs_graph()
+    artifact = evaluate_dugongs_source()
+    @test artifact.source == strip(DUGONGS_SOURCE, '\n')
+    @test artifact.output == artifact.kernel(Tuple(artifact.inputs)...)
+    model = artifact.model
     q = (2.7, 1.0, 1.7, log(300.0))
 
     @testset "unconstrained -> constrained; Jacobian is optional" begin

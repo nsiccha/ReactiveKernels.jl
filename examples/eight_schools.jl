@@ -1,9 +1,11 @@
 module EightSchoolsExample
 
 using ReactiveKernels
+include("_ppl_source_authority.jl")
 
 export EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA
 export build_eight_schools_graph, demo
+export EIGHT_SCHOOLS_SOURCE, evaluate_eight_schools_source
 
 const NSCHOOLS = 8
 const _LOG2PI = log(2π)
@@ -70,6 +72,58 @@ function predict_new_group(parameters, σ_new::Float64, innovations::Vector{Floa
     (; θ = θ_new, y = y_new)
 end
 
+const EIGHT_SCHOOLS_SOURCE = raw"""
+@kernel model(unconstrained::Vector{Float64},
+              observations::Vector{Float64},
+              observation_scales::Vector{Float64},
+              new_group_scale::Float64,
+              prediction_innovations::Vector{Float64}) = begin
+    (μ::Float64, log_τ::Float64, θ::Vector{Float64}) =
+        split_unconstrained(unconstrained)
+    τ::Float64 = positive_scale(log_τ)
+    parameters = assemble_parameters(μ, τ, θ)
+    log_jacobian::Float64 = log_abs_det_jacobian(log_τ)
+
+    prior::Float64 = log_prior(parameters)
+    likelihood::Float64 = plated_loglik(observations, θ, observation_scales)
+    density::Float64 = total_log_density(prior, log_jacobian, likelihood)
+    new_group = predict_new_group(
+        parameters, new_group_scale, prediction_innovations,
+    )
+    return density
+end
+
+q = [1.5, log(2.0), (0.25 .* (1:8))...]
+observations = EIGHT_SCHOOLS_Y
+observation_scales = EIGHT_SCHOOLS_SIGMA
+
+density_kernel = prepare(model;
+    have = (:unconstrained, :observations, :observation_scales),
+    want = (:prior, :log_jacobian, :likelihood, :density))
+
+output = density_kernel(q, observations, observation_scales)
+prior, logjac, likelihood, density = output
+@assert density ≈ prior + logjac + likelihood
+
+docs_example = (;
+    name = :eight_schools_density,
+    origin = "compact @kernel model (build executed)",
+    inputs = (; q, observations, observation_scales),
+    model,
+    kernel = density_kernel,
+    output,
+)
+"""
+
+function evaluate_eight_schools_source()
+    _evaluate_ppl_source(EIGHT_SCHOOLS_SOURCE, @__MODULE__; bindings = (
+        :EIGHT_SCHOOLS_Y, :EIGHT_SCHOOLS_SIGMA,
+        :split_unconstrained, :positive_scale, :assemble_parameters,
+        :log_abs_det_jacobian, :log_prior, :plated_loglik,
+        :total_log_density, :predict_new_group,
+    ))
+end
+
 """
     build_eight_schools_graph()
 
@@ -85,25 +139,7 @@ standard-normal innovations; sampling those innovations remains outside the pure
 graph.
 """
 function build_eight_schools_graph()
-    @kernel model(unconstrained::Vector{Float64},
-                  observations::Vector{Float64},
-                  observation_scales::Vector{Float64},
-                  new_group_scale::Float64,
-                  prediction_innovations::Vector{Float64}) = begin
-        (μ::Float64, log_τ::Float64, θ::Vector{Float64}) =
-            split_unconstrained(unconstrained)
-        τ::Float64 = positive_scale(log_τ)
-        parameters = assemble_parameters(μ, τ, θ)
-        log_jacobian::Float64 = log_abs_det_jacobian(log_τ)
-
-        prior::Float64 = log_prior(parameters)
-        likelihood::Float64 = plated_loglik(observations, θ, observation_scales)
-        density::Float64 = total_log_density(prior, log_jacobian, likelihood)
-        new_group = predict_new_group(
-            parameters, new_group_scale, prediction_innovations,
-        )
-        return density
-    end
+    evaluate_eight_schools_source().model
 end
 
 function demo()
