@@ -1,5 +1,6 @@
 using ReactiveKernels
 using Reactant
+using LinearAlgebra
 using LogExpFunctions: log1pexp
 using Random
 using Test
@@ -21,6 +22,38 @@ end
 
 @kernel reactant_bernoulli_logit(observed::Bool, logit::Float64) = begin
     ld::Float64 = observed ? -log1pexp(-logit) : -log1pexp(logit)
+end
+
+@kernel reactant_replica_transition(
+        q::Vector{Float64}, p0::Vector{Float64}, u::Float64,
+        stepsize::Float64) = begin
+    proposal::Vector{Float64} = q .+ stepsize .* p0
+    kinetic::Float64 = 0.5 * dot(p0, p0)
+    accept::Bool = log(u) < -0.05 * kinetic
+    q_next::Vector{Float64} = accept ? proposal : q
+    return (q_next, accept, kinetic)
+end
+
+@kernel reactant_hmc_transition(
+        grad_U::Function, pot::Function, q::Vector{Float64},
+        p0::Vector{Float64}, u::Float64, stepsize::Float64, L::Int) = begin
+    integrated::Tuple{Vector{Float64},Vector{Float64}} = let ε = stepsize
+        qq = q
+        pp = p0 .- (ε / 2) .* grad_U(q)
+        for _ in 1:(L - 1)
+            qq = qq .+ ε .* pp
+            pp = pp .- ε .* grad_U(qq)
+        end
+        qq = qq .+ ε .* pp
+        pp = pp .- (ε / 2) .* grad_U(qq)
+        (qq, pp)
+    end
+    qL::Vector{Float64} = integrated[1]
+    pL::Vector{Float64} = integrated[2]
+    H0::Float64 = pot(q) + 0.5 * dot(p0, p0)
+    HL::Float64 = pot(qL) + 0.5 * dot(pL, pL)
+    accept::Bool = log(u) < (H0 - HL)
+    q_next::Vector{Float64} = accept ? qL : q
 end
 
 _rk_call(k, x, μ, scale) = k(x, μ, scale)
@@ -54,6 +87,69 @@ end
         @test compiled(observed_false, logit) ≈ -log1pexp(0.7)
         @test kernel(true, 0.7) == -log1pexp(-0.7)
         @test kernel(false, 0.7) == -log1pexp(0.7)
+    end
+
+    @testset "whole scalar kernel maps over a trailing replica axis" begin
+        kernel = replica(
+            reactant_replica_transition; batched = (:q, :p0, :u))
+        q_host = reshape(collect(1.0:12.0), 3, 4)
+        p0_host = [0.1 0.5 0.2 0.8;
+                   0.2 0.4 0.3 0.7;
+                   0.3 0.3 0.4 0.6]
+        u_host = [0.1, 0.99, 0.2, 0.95]
+        stepsize_host = 0.25
+        reference = kernel(q_host, p0_host, u_host, stepsize_host)
+
+        q = Reactant.to_rarray(q_host)
+        p0 = Reactant.to_rarray(p0_host)
+        u = Reactant.to_rarray(u_host)
+        stepsize = Reactant.to_rarray(stepsize_host; track_numbers = true)
+        compiled = @compile kernel(q, p0, u, stepsize)
+        q_next, accept, kinetic = compiled(q, p0, u, stepsize)
+
+        @test Array(q_next) == reference[1]
+        @test Array(accept) == reference[2]
+        @test Array(kinetic) ≈ reference[3]
+    end
+
+    @testset "scalar-source HMC compiles once and replicas without a rewrite" begin
+        inverse_mass = [2.0 0.2 0.1;
+                        0.2 1.5 0.3;
+                        0.1 0.3 1.0]
+        grad_U = q -> inverse_mass * q
+        potential = q -> 0.5 * dot(q, inverse_mass * q)
+        q_host = reshape(collect(0.1:0.1:0.9), 3, 3)
+        p0_host = reverse(q_host; dims = 1)
+        u_host = [0.2, 0.8, 0.4]
+        stepsize_host = 0.05
+        leapfrog_steps = 3
+
+        scalar = prepare(reactant_hmc_transition)
+        q1 = Reactant.to_rarray(q_host[:, 1])
+        p1 = Reactant.to_rarray(p0_host[:, 1])
+        u1 = Reactant.to_rarray(u_host[1]; track_numbers = true)
+        stepsize = Reactant.to_rarray(stepsize_host; track_numbers = true)
+        scalar_compiled = @compile scalar(
+            grad_U, potential, q1, p1, u1, stepsize, leapfrog_steps)
+        scalar_reference = scalar(
+            grad_U, potential, q_host[:, 1], p0_host[:, 1], u_host[1],
+            stepsize_host, leapfrog_steps)
+        @test Array(scalar_compiled(
+            grad_U, potential, q1, p1, u1, stepsize, leapfrog_steps)) ≈
+              scalar_reference
+
+        replicated = replica(
+            reactant_hmc_transition; batched = (:q, :p0, :u))
+        reference = replicated(
+            grad_U, potential, q_host, p0_host, u_host,
+            stepsize_host, leapfrog_steps)
+        q = Reactant.to_rarray(q_host)
+        p0 = Reactant.to_rarray(p0_host)
+        u = Reactant.to_rarray(u_host)
+        compiled = @compile replicated(
+            grad_U, potential, q, p0, u, stepsize, leapfrog_steps)
+        @test Array(compiled(
+            grad_U, potential, q, p0, u, stepsize, leapfrog_steps)) ≈ reference
     end
 
     logscale_plan = plan(reactant_normal_logscale;

@@ -341,6 +341,140 @@ struct PreparedKernel{F,O,IN,OUT}
     ast::Expr
 end
 
+"""
+    ReplicatedKernel
+
+A callable produced by [`replica`](@ref). It preserves a scalar prepared
+kernel as the single source of truth and maps that complete callable over a
+trailing replica axis on selected HAVE ports.
+"""
+struct ReplicatedKernel{B,BT,OT,K,IN,OUT}
+    target::K
+    inputs::IN
+    outputs::OUT
+end
+
+@inline function (k::ReplicatedKernel{B})(args...) where {B}
+    length(args) == length(k.inputs) || throw(MethodError(k, args))
+    _replica_call(k, args, getfield(args, first(B)))
+end
+
+inputs(k::ReplicatedKernel) = k.inputs
+outputs(k::ReplicatedKernel) = k.outputs
+code_expr(k::ReplicatedKernel) = code_expr(k.target)
+
+function Base.show(io::IO, k::ReplicatedKernel{B}) where {B}
+    names = Tuple(k.inputs[i].name for i in B)
+    print(io, "ReplicatedKernel(batched=", names, ", target=")
+    show(io, k.target)
+    print(io, ")")
+end
+
+_replica_rank(::Type{T}) where {T<:Number} = 0
+_replica_rank(::Type{T}) where {T<:AbstractArray} = ndims(T)
+_replica_rank(::Type{T}) where {T} = throw(ArgumentError(
+    "replica batched ports must be Numbers or AbstractArrays; got $T"))
+
+function _replica(target, batched)
+    boundary = inputs(target)
+    names = Tuple(batched isa Symbol ? (batched,) : batched)
+    isempty(names) && throw(ArgumentError("replica requires at least one batched port"))
+    length(unique(names)) == length(names) || throw(ArgumentError(
+        "replica batched port names must be unique; got $(names)"))
+    all(name -> name isa Symbol, names) || throw(ArgumentError(
+        "replica batched ports must be Symbols; got $(names)"))
+
+    indices = map(names) do name
+        index = findfirst(value -> value.name === name, boundary)
+        index === nothing && throw(ArgumentError(
+            "replica batched port :$name is not in the prepared HAVE boundary"))
+        index
+    end
+    indices = Tuple(sort(collect(indices)))
+    input_types = Tuple{(valtype(boundary[i]) for i in indices)...}
+    foreach(_replica_rank, input_types.parameters)
+    output_types = Tuple{(valtype(value) for value in outputs(target))...}
+    all(type -> type <: Union{Number,AbstractArray}, output_types.parameters) ||
+        throw(ArgumentError(
+            "replica outputs must be Numbers or AbstractArrays; got $(output_types.parameters)"))
+    ReplicatedKernel{indices,input_types,output_types,typeof(target),
+                     typeof(boundary),typeof(outputs(target))}(
+        target, boundary, outputs(target))
+end
+
+"""
+    replica(kernel::PreparedKernel; batched) -> ReplicatedKernel
+
+Lift a complete scalar prepared kernel over a trailing replica axis. `batched`
+names the HAVE ports that receive that extra final dimension. Scalar batched
+ports therefore become vectors, vectors become matrices, and so on; shared
+ports retain their scalar-kernel shapes. Outputs receive the same trailing
+replica axis.
+
+The scalar kernel remains the only mathematical definition. In particular,
+reductions inside it still reduce only their original dimensions, so a scalar
+`dot(q, q)` becomes one dot product per replica rather than a reduction across
+replicas. Native Julia evaluates scalar replicas and stacks their results;
+optional array-compiler extensions may lower the same map to a backend batch
+primitive.
+"""
+replica(kernel::PreparedKernel; batched) = _replica(kernel, batched)
+
+@inline _replica_native_arg(arg, ::Type{T}, replica_index) where {T<:Number} =
+    arg[replica_index]
+@inline _replica_native_arg(arg, ::Type{T}, replica_index) where {T<:AbstractArray} =
+    copy(selectdim(arg, ndims(arg), replica_index))
+
+@generated function _replica_native_inputs(
+        ::Val{B}, ::Type{BT}, args::A, replica_index) where {B,BT,A}
+    batched_lookup = Dict(index => position for (position, index) in enumerate(B))
+    values = Any[]
+    for index in 1:length(A.parameters)
+        if haskey(batched_lookup, index)
+            position = batched_lookup[index]
+            push!(values, :(_replica_native_arg(
+                getfield(args, $index), $(BT.parameters[position]), replica_index)))
+        else
+            push!(values, :(getfield(args, $index)))
+        end
+    end
+    Expr(:tuple, values...)
+end
+
+_replica_stack(values, ::Type{T}) where {T<:Number} = collect(values)
+_replica_stack(values, ::Type{T}) where {T<:AbstractArray} = stack(values)
+
+function _replica_native_outputs(results, ::Type{OT}) where {OT<:Tuple}
+    output_types = OT.parameters
+    if length(output_types) == 1
+        return _replica_stack(results, only(output_types))
+    end
+    ntuple(length(output_types)) do output_index
+        _replica_stack((result[output_index] for result in results),
+                       output_types[output_index])
+    end
+end
+
+function _replica_call(k::ReplicatedKernel{B,BT,OT}, args, marker) where {B,BT,OT}
+    replica_count = size(marker, ndims(marker))
+    for index in B
+        arg = getfield(args, index)
+        expected_rank = _replica_rank(valtype(k.inputs[index])) + 1
+        ndims(arg) == expected_rank || throw(DimensionMismatch(
+            "replica port :$(k.inputs[index].name) has rank $(ndims(arg)); " *
+            "expected $expected_rank (scalar rank plus one trailing replica axis)"))
+        size(arg, ndims(arg)) == replica_count || throw(DimensionMismatch(
+            "replica port :$(k.inputs[index].name) has " *
+            "$(size(arg, ndims(arg))) replicas; expected $replica_count"))
+    end
+    results = map(1:replica_count) do replica_index
+        scalar_args = _replica_native_inputs(
+            Val(B), BT, args, replica_index)
+        k.target(scalar_args...)
+    end
+    _replica_native_outputs(results, OT)
+end
+
 @inline function (k::PreparedKernel)(args...)
     length(args) == length(k.inputs) || throw(MethodError(k, args))
     k.f(k.ops, args...)
