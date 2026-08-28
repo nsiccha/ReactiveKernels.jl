@@ -46,6 +46,7 @@ using Test
         include("test_online_stats_example.jl")
         include("test_distributions_example.jl")
         include("test_batched_example.jl")
+        include("test_hmc_example.jl")
         include("test_preexisting_examples.jl")
         include("test_corrected_core_examples.jl")
     end
