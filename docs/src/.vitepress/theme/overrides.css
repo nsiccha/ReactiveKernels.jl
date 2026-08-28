@@ -1,2 +1,251 @@
 /* Override default DocumenterVitepress styles here.
    This file is loaded after style.css, so rules here take precedence. */
+
+.rk-result-assets {
+  display: none;
+}
+
+.rk-aov-panel,
+.rk-result-table-section {
+  margin: 1.5rem 0;
+}
+
+.rk-aov-panel .aov-plot-area,
+.rk-aov-panel .u-w-full {
+  width: 100%;
+  min-width: 0;
+}
+
+.rk-result-figure {
+  margin: 0;
+  padding: 1rem;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 10px;
+  background: var(--vp-c-bg-soft);
+}
+
+.rk-result-figure > figcaption {
+  margin-bottom: 0.75rem;
+}
+
+.rk-result-caption-detail {
+  display: block;
+  margin-top: 0.2rem;
+  color: var(--vp-c-text-2);
+  font-size: 0.875rem;
+  font-weight: 400;
+}
+
+.rk-result-table-section > h3 {
+  margin: 0 0 0.2rem;
+}
+
+.rk-result-table-note {
+  margin: 0 0 0.75rem;
+  color: var(--vp-c-text-2);
+  font-size: 0.875rem;
+}
+
+.rk-sortable-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 8px;
+}
+
+.rk-sortable-table-wrap table {
+  display: table;
+  width: 100%;
+  margin: 0;
+  border-collapse: collapse;
+}
+
+.rk-sortable-table-wrap th,
+.rk-sortable-table-wrap td {
+  min-width: 7rem;
+  padding: 0.65rem 0.75rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.rk-sortable-table-wrap th {
+  background: var(--vp-c-bg-soft);
+}
+
+.rk-sortable-table-wrap th.u-pointer {
+  cursor: pointer;
+  user-select: none;
+}
+
+.rk-sortable-table-wrap th.u-pointer:hover,
+.rk-sortable-table-wrap th.u-pointer:focus-visible {
+  color: var(--vp-c-brand-1);
+}
+
+.rk-result-unsupported {
+  color: var(--vp-c-text-3);
+  font-style: italic;
+}
+
+.rk-support {
+  display: inline-block;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.rk-support-yes {
+  color: var(--vp-c-green-1);
+  background: var(--vp-c-green-soft);
+}
+
+.rk-support-no {
+  color: var(--vp-c-danger-1);
+  background: var(--vp-c-danger-soft);
+}
+
+.rk-support-partial {
+  color: var(--vp-c-yellow-1);
+  background: var(--vp-c-yellow-soft);
+}
+
+.rk-definition-grid,
+.rk-dag-legend {
+  display: grid;
+  grid-template-columns: minmax(10rem, 0.45fr) minmax(0, 1fr);
+  margin: 1.25rem 0;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.rk-definition-grid dt,
+.rk-definition-grid dd,
+.rk-dag-legend dt,
+.rk-dag-legend dd {
+  margin: 0;
+  padding: 0.7rem 0.85rem;
+  border-bottom: 1px solid var(--vp-c-divider);
+}
+
+.rk-definition-grid dt,
+.rk-dag-legend dt {
+  background: var(--vp-c-bg-soft);
+  font-weight: 650;
+}
+
+.rk-definition-grid > :nth-last-child(-n + 2),
+.rk-dag-legend > :nth-last-child(-n + 2) {
+  border-bottom: 0;
+}
+
+.rk-comparison-grid,
+.rk-status-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr));
+  gap: 1rem;
+  margin: 1.25rem 0;
+}
+
+.rk-comparison-card,
+.rk-status-card,
+.rk-pipeline-step > article {
+  margin: 0;
+  padding: 1rem;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 8px;
+  background: var(--vp-c-bg-soft);
+}
+
+.rk-comparison-card h3,
+.rk-status-card h3,
+.rk-pipeline-step h3 {
+  margin: 0 0 0.6rem;
+  font-size: 1rem;
+}
+
+.rk-comparison-card dl {
+  margin: 0;
+}
+
+.rk-comparison-card dt {
+  margin-top: 0.65rem;
+  color: var(--vp-c-text-2);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.rk-comparison-card dd {
+  margin: 0.15rem 0 0;
+}
+
+.rk-status-card p {
+  margin: 0;
+}
+
+.rk-pipeline {
+  display: grid;
+  gap: 0.85rem;
+  margin: 1.25rem 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: rk-pipeline;
+}
+
+.rk-pipeline-step {
+  position: relative;
+  counter-increment: rk-pipeline;
+  padding-left: 2.6rem;
+}
+
+.rk-pipeline-step::before {
+  position: absolute;
+  top: 0.85rem;
+  left: 0;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 999px;
+  background: var(--vp-c-brand-soft);
+  color: var(--vp-c-brand-1);
+  content: counter(rk-pipeline);
+  font-weight: 700;
+  line-height: 2rem;
+  text-align: center;
+}
+
+.rk-pipeline-step dl {
+  display: grid;
+  grid-template-columns: minmax(9rem, 0.35fr) 1fr;
+  gap: 0.35rem 0.8rem;
+  margin: 0;
+}
+
+.rk-pipeline-step dt {
+  color: var(--vp-c-text-2);
+  font-weight: 650;
+}
+
+.rk-pipeline-step dd {
+  margin: 0;
+}
+
+@media (max-width: 640px) {
+  .rk-definition-grid,
+  .rk-dag-legend,
+  .rk-pipeline-step dl {
+    grid-template-columns: 1fr;
+  }
+
+  .rk-definition-grid dt,
+  .rk-dag-legend dt {
+    border-bottom: 0;
+  }
+
+  .rk-pipeline-step {
+    padding-left: 0;
+    padding-top: 2.6rem;
+  }
+}

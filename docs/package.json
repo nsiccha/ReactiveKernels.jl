@@ -17,6 +17,9 @@
     "cytoscape-elk": "2.3.0",
     "elkjs": "0.9.3",
     "markdown-it-footnote": "^4.0.0",
+    "vega": "^5.33.0",
+    "vega-embed": "^6.29.0",
+    "vega-lite": "^5.23.0",
     "markdown-it": "^14.1.0",
     "vitepress": "^1.6.4",
     "vitepress-plugin-tabs": "^0.8.0"

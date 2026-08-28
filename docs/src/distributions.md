@@ -1,5 +1,9 @@
 # Native log densities as recipes
 
+```@eval
+Main.ReactiveKernelsDocs.render_result_assets()
+```
+
 `ReactiveKernels` is not a distribution library. A log density is ordinary
 arithmetic in a `@kernel`; `prepare` selects the requested have→want path and
 compiles it. `Distributions.jl` is used only by the tests and benchmarks as an

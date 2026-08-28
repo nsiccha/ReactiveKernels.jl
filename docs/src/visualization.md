@@ -80,14 +80,9 @@ The diagram is bipartite: values are ellipses, recipes are boxes, and every
 edge follows `value → recipe → value`. This keeps multi-input and multi-output
 recipes explicit rather than approximating them with ambiguous direct edges.
 
-| Appearance | Meaning |
-|---|---|
-| Green value | `HAVE` boundary; supplied by the caller |
-| Orange value | `WANT` boundary; returned by the kernel |
-| Grey recipe | Registered recipe on a full `Graph` |
-| Blue recipe | Selected computation |
-| Dashed grey recipe | Reachable alternative not selected |
-| Dashed red recipe | Effectful recipe, visible on a full `Graph` but never selectable |
+```@eval
+Main.ReactiveKernelsDocs.render_visualization_legend()
+```
 
 Canvas labels retain the complete value or operation name and wrap when needed.
 The node picker and inspector retain the full type, identity, cost, state, and
@@ -98,13 +93,9 @@ all alias names.
 
 The three formats serve different portability layers:
 
-| Need | Surface | Tradeoff |
-|---|---|---|
-| Interactive docs inspection | Cytoscape.js + ELK HTML | Libraries are pinned and bundled into the VitePress assets; fit, pan, zoom, focus, and structural inspection |
-| Interactive notebook/IDE inspection | Cytoscape.js + ELK HTML | Pinned packages load on demand; embedded SVG remains usable offline |
-| Files that render anywhere | `save_visualization("graph.svg", x)` | Static rather than interactive |
-| Standalone artifact | `save_visualization("graph.html", x)` | Opens directly with an embedded SVG; loads the pinned interactive libraries when online |
-| Large or publication-oriented layout | `dot_source` or `.dot` / `.gv` export | A downstream Graphviz renderer is needed, but ReactiveKernels does not impose its binary/artifact footprint on every user |
+```@eval
+Main.ReactiveKernelsDocs.render_visualization_surfaces()
+```
 
 Cytoscape.js owns the interactive graph renderer and event model; ELK owns the
 directed layered layout. ReactiveKernels' JavaScript is an adapter for semantic

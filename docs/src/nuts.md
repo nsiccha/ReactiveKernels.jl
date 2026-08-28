@@ -1,5 +1,9 @@
 # NUTS sampling
 
+```@eval
+Main.ReactiveKernelsDocs.render_result_assets()
+```
+
 This external NUTS compiler-acceptance exemplar is authored as a
 **single, method-bearing `@kernel` surface** — eight named specifications that
 together are the whole sampler — modeled on the ReactiveHMC.jl algorithm
@@ -30,16 +34,13 @@ boundary and why the two implementations prove different things.
 
 ## Status — read this before the code
 
-| Piece | State |
-|---|---|
-| Source contract (the eight `@kernel` specs below and the plan shape) | **Landed as external compiler evidence.** `pot_f` and `grad_f` are alternative producers of `pot`; the planner selects the needed recipe while retaining both read-only callable authorities by identity. |
-| Helper effect authority | **Macro-free.** Hot helpers are visible arithmetic/control or captured sibling `@kernel` methods; ordinary unregistered helpers reject. The former `@rk_pure` / `@rk_borrows` / `@rk_rng` declarations no longer exist. `@node` is unrelated and remains supported. |
-| All eight source specs construct; concrete phasepoint/frame init/recompute/copy verified | **Verified on `main`** — the compiler constructs and runs the complete external fixture; its sealed certificate records `mode = production`, which describes compiler evidence rather than package API status. |
-| Executable leapfrog (leaf scope) | **Verified** — analytic F32/F64; normal gradient Δ1, `@inferred`, exact 0-B; dirty-produced recovery analytic; dirty-source reject. |
-| Sealed fixture `nuts!!` (`step!`, tree growth, U-turn) | **Verified external exemplar** — sealed registry-free native recursion; `nuts!!(state; rng) === state` (same object, fixed type), **exact 0-B** on the compiler acceptance path. |
-| Compiled-reactive `nuts_state` / `CompiledNUTSState` implementation | **External example only.** It uses compiled-reactive Hamiltonian dependencies with ordinary inferred Julia recursion and proposal scratch; it is not loaded or exported by RK and is not the sealed fixture artifact. |
-| End-to-end sampling time and ESS | **Not measured for the current sealed-native path.** The earlier compiled-reactive implementation was about 4–7× slower than AdvancedHMC/DynamicHMC in matched warmup+draw wall time, so the inner-loop result must not be read as a blanket sampler-speed claim. |
-| Work-normalized inner-loop throughput | **Measured, narrow metric** — [`nuts-g7-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/nuts-g7-v1.toml) records 2.27M leapfrog steps/s for RK, 1.33M for AdvancedHMC, 1.42M for DynamicHMC, and 2.65M for nsiccha/NUTS.jl on the frozen AR(1) setup. |
+```@eval
+Main.ReactiveKernelsDocs.render_nuts_status()
+```
+
+```@eval
+Main.ReactiveKernelsDocs.render_nuts_g7_benchmark()
+```
 
 The sealed native compiler (`examples/nuts_runtime/kernel_nuts_native.jl`,
 `_build_nuts_sampler`) and the minimal-reset external authoring fixture are
