@@ -133,6 +133,13 @@ invalidate only the cached results whose provenance actually depended on them,
 and the same planner prepares and runs just the missing computation — all cache
 bookkeeping staying outside the generated kernel.
 
+Traceable mathematical `PreparedKernel`s can also run through the optional
+Reactant extension, and `replica` maps a complete scalar kernel across a trailing
+replica axis. That support is deliberately narrower than “all reactive state on
+an accelerator”: fixed-step HMC traces because its loop is static, while
+[adaptive NUTS](nuts.md#reactant-and-multiple-chains) remains a CPU sampler because
+tree termination and host RNG are data dependent.
+
 > **Status:** early development — the public API is still being shaped.
 
 See the [non-allocating workflow](nonallocating.md) for persistent array-cache
