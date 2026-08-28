@@ -9,8 +9,16 @@ testfile = joinpath(@__DIR__, "test_reactant.jl")
 
 mktempdir() do env
     Pkg.activate(env)
+    # The test file runs in `Main`, so every package it imports must be a direct
+    # dependency of this isolated environment.  A cold compile can otherwise
+    # mask the omission by loading ReactiveKernels' transitive dependencies.
     Pkg.add(PackageSpec(name = "Reactant", version = REACTANT_VERSION))
+    Pkg.pin(PackageSpec(name = "Reactant"))
     Pkg.develop(path = root)
+    Pkg.add([
+        PackageSpec(name = "Enzyme"),
+        PackageSpec(name = "LogExpFunctions"),
+    ])
     Pkg.instantiate()
 
     dep = Pkg.dependencies()[REACTANT_UUID]
