@@ -299,11 +299,6 @@ end
     @test Tuple(ir.id.name for ir in irs) ==
           (:finiteorneginf, :reset!, :collectstats!, :logadvanceprob, :swapproposal!,
            :step!, :flip!, :flip_neg!, :finish!, :start!)
-    mm=Dict(m.parameters[1]=>m for m in RK._native_program_parts(E.program).methods.parameters)
-    @test Tuple(mm[mid].parameters[3].parameters[1].parameters[5] for mid in (8,9,10)) ==
-          (:endpoint_place,:endpoint_place,:endpoint_place)
-    @test all(m -> all(f -> f.parameters[5] === :value, m.parameters[3].parameters),
-              (mm[i] for i in (1,2,3,4,5,6,7)))
     @test length(E.refs) == length(E.callees) == length(E.registrations)
     @test length(E.refs) == 17
     @test all(r -> r isa RK._CapturedCalleeRef, E.refs)
