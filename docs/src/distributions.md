@@ -83,16 +83,31 @@ Main.ReactiveKernelsDocs.execute_example(
 
 Non-scalar families use the same authoring idea, but they are not scalar
 `plate`s. The coordinates of a multivariate observation—and the time steps of
-an autoregressive series—are coupled inside one mathematical kernel. A
-Cholesky-parameterized multivariate Normal is therefore one vector kernel; its
-transparent steps expose centering, triangular whitening, the log determinant,
-and the quadratic form.
+an autoregressive series—are coupled inside one mathematical kernel.
+
+The multivariate Normal is authored once. Alternative recipes produce the same
+`half_logdet_cov` and `quadratic` ports from a covariance matrix, its Cholesky
+factor, a precision matrix, or its Cholesky factor. `prepare` starts at whichever
+representation is in HAVE and selects only that route to `logdensity`; callers
+do not convert everything to one privileged parametrization first.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
     @__MODULE__, Main.DistributionExamples.MVNORMAL_SOURCE,
 )
 ```
+
+These rows are derived from the four `PreparedKernel`s built by that exact
+source. Matrix boundaries include a factorization recipe; pre-factorized
+boundaries cut the graph after it.
+
+```@eval
+Main.ReactiveKernelsDocs.render_mvn_parametrization_plans(mvn_kernels)
+```
+
+Native tests check all four results against the same `Distributions.MvNormal`
+oracle and require concrete `Float64` inference. Reactant compiles all four
+scalar kernels and all four whole-vector replica maps from the same source.
 
 The stationary AR(1) kernel similarly treats the complete sequence as one
 value. Its lagged residuals give an O(T) log density, including the stationary
@@ -112,7 +127,10 @@ forms from these exact source strings.
 
 ### Structured native and Reactant benchmark
 
-The matched comparison below uses public multivariate-Normal log-density APIs.
+The matched comparison below uses the covariance-Cholesky HAVE boundary and
+public multivariate-Normal log-density APIs. The four-boundary table above is a
+planner acceptance result; this timing table does not pretend that the three
+libraries expose equivalent construction-time parametrization APIs.
 For AR(1), Distributions and ProbabilityMeasures receive the mathematically
 equivalent dense MVN with its Cholesky factor computed before timing; RK runs
 the authored O(T) recurrence. Distribution construction, factorization,
