@@ -1,3 +1,4 @@
+# External NUTS compiler-acceptance backend. This is example-owned code, not package API.
 # ============================================================================================
 # EXECUTABLE nuts_state CONTROL MACHINE (poc lane) — the frame-bound emitter that composes the design-B
 # control compiler (kernel_control.jl) with the prepared endpoint canon storage + the executable leapfrog
@@ -15,13 +16,13 @@
 # now-current value. Reuses the leapfrog `_lf_ensure!` machinery generalized to a runtime `owned` endpoint.
 function compile_prepared_ensure(pf, ::Type{OW}, ::Type{SH}, field::Symbol) where {OW,SH}
     plan = kernel_prepared_plan(pf); hs = kernel_prepared_handles(pf)
-    fc = _lf_canon_map(plan)
+    fc = _exec_canon_map(plan)
     producer = Dict{Int,Int}(c => r for (c, r) in kernel_plan_producer(plan))
     recs = kernel_plan_recipes(plan)
     hidx = Dict{Int,Tuple{Any,Int}}(recs[i] => (hs[i], i) for i in eachindex(hs))
     haskey(fc, field) || error("compile_prepared_ensure: no canon for field `$field`")
     c = fc[field]; stmts = Any[]; current = Set{Int}(); stale = Set{Int}()
-    _lf_ensure!(stmts, c, current, stale, plan, producer, hidx, OW, SH)
+    _exec_ensure!(stmts, c, current, stale, plan, producer, hidx, OW, SH)
     compile(:((owned, shared, handles) -> $(Expr(:block, stmts..., :(return $(_pp_read(plan, c)))))))
 end
 # Compile refresh_momentum!! on a runtime endpoint from its captured MethodIR (RK: derive kills from the IR +
@@ -97,10 +98,10 @@ function _refresh_callable(st, i)
 end
 _is_selffield(x, path) = x isa _SelfField && x.path == path
 function compile_refresh(pf, ::Type{OW}, ::Type{SH}, refresh_ir::MethodIR) where {OW,SH}
-    plan = kernel_prepared_plan(pf); fc = _lf_canon_map(plan)
+    plan = kernel_prepared_plan(pf); fc = _exec_canon_map(plan)
     mom_c = fc[:mom]; chol_c = fc[:chol_metric]
     mom_slot = kernel_plan_field(plan, mom_c)[2]; chol_slot = kernel_plan_field(plan, chol_c)[2]
-    kills = Tuple(sort!(unique(Int[kernel_plan_field(plan, d)[2] for d in _lf_kill_closure(plan, mom_c)])))
+    kills = Tuple(sort!(unique(Int[kernel_plan_field(plan, d)[2] for d in _exec_kill_closure(plan, mom_c)])))
     # EXACT authored shape (drives the concrete call method): [randn!(rng, self.mom), lmul!(self.chol_metric.L,
     # self.mom), return __self__]. Any drift rejects rather than mis-emitting.
     b = refresh_ir.body
@@ -218,7 +219,7 @@ end
 
 # derived endpoint fields (have a producer) — read of one must demand-ensure; source fields read raw.
 function derived_fields(pf)
-    plan = kernel_prepared_plan(pf); fc = _lf_canon_map(plan)
+    plan = kernel_prepared_plan(pf); fc = _exec_canon_map(plan)
     producer = Set{Int}(c for (c, _) in kernel_plan_producer(plan))
     Set{Symbol}(f for (f, c) in fc if c in producer)
 end
@@ -406,7 +407,7 @@ function nev(x, lm::Dict{Symbol,Symbol}, C::NCtx)
             length(x.args) == 2 || error("copy!! expects (dest, src); got $(length(x.args)) args")
             Expr(:call, :_canon_copy_endpoint!, nev(x.args[1], lm, C), nev(x.args[2], lm, C))
         else
-            Expr(:call, _lf_callee(x), (nev(a, lm, C) for a in x.args)...)
+            Expr(:call, _exec_captured_callee(x), (nev(a, lm, C) for a in x.args)...)
         end
     elseif x isa _FieldCall
         nfieldcall(x, lm, C)
@@ -505,7 +506,7 @@ function nrhs_dot(x, lm, C)
     if x isa _OpCall
         Expr(:call, GlobalRef(Base, :broadcasted), x.op, (nrhs_dot(a, lm, C) for a in x.args)...)
     elseif x isa _RegisteredCall
-        Expr(:call, GlobalRef(Base, :broadcasted), _lf_callee(x), (nrhs_dot(a, lm, C) for a in x.args)...)
+        Expr(:call, GlobalRef(Base, :broadcasted), _exec_captured_callee(x), (nrhs_dot(a, lm, C) for a in x.args)...)
     else
         nev(x, lm, C)   # leaf (field read / lit)
     end

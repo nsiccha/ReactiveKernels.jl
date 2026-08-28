@@ -5,6 +5,8 @@
 using LinearAlgebra
 using Random
 using ReactiveKernels
+include(joinpath(@__DIR__, "nuts_runtime.jl"))
+using .ReactiveKernelsNUTSExample
 using DifferentiationInterface
 import Enzyme
 

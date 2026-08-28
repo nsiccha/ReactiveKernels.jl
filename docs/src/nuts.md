@@ -20,11 +20,11 @@ is recorded in the static receipt [`benchmark/receipts/nuts-g7-v1.toml`](https:/
 not an end-to-end sampling, adaptation, wall-time, or ESS benchmark.
 
 Packaging matters: “public” inside the fixture comments means the entry of that
-sealed external artifact, not an RK package API. The builder and fixture are
-internal compiler acceptance surfaces. A currently exported `nuts_state` /
-`CompiledNUTSState` compatibility path uses a compiled-reactive phase-point DAG
-and ordinary inferred Julia tree-growth orchestration, but it is transitional and
-removal-bound rather than part of ReactiveKernels' intended support contract. See [Compiler capability and
+sealed external artifact, not an RK package API. The NUTS runtime, native emitter,
+compiled-reactive compatibility implementation, and domain types live under
+`examples/nuts_runtime/` and are loaded only through the explicit
+`ReactiveKernelsNUTSExample` module. A bare `using ReactiveKernels` neither loads
+nor exports them. See [Compiler capability and
 limits](compiler.md#what-the-nuts-proof-does-and-does-not-establish) for the exact
 boundary and why the two implementations prove different things.
 
@@ -33,18 +33,19 @@ boundary and why the two implementations prove different things.
 | Piece | State |
 |---|---|
 | Source contract (the eight `@kernel` specs below and the plan shape) | **Landed as external compiler evidence.** `pot_f` and `grad_f` are alternative producers of `pot`; the planner selects the needed recipe while retaining both read-only callable authorities by identity. |
-| Current fixture's `@rk_pure` / `@rk_borrows` / `@rk_rng` declarations | **Transitional and removal-bound compatibility, not supported authoring API.** The replacement keeps helpers as visible arithmetic/control or captured sibling `@kernel` methods; ordinary unregistered helpers continue to reject. `@node` is unrelated and remains supported. |
+| Helper effect authority | **Macro-free.** Hot helpers are visible arithmetic/control or captured sibling `@kernel` methods; ordinary unregistered helpers reject. The former `@rk_pure` / `@rk_borrows` / `@rk_rng` declarations no longer exist. `@node` is unrelated and remains supported. |
 | All eight source specs construct; concrete phasepoint/frame init/recompute/copy verified | **Verified on `main`** — the compiler constructs and runs the complete external fixture; its sealed certificate records `mode = production`, which describes compiler evidence rather than package API status. |
 | Executable leapfrog (leaf scope) | **Verified** — analytic F32/F64; normal gradient Δ1, `@inferred`, exact 0-B; dirty-produced recovery analytic; dirty-source reject. |
 | Sealed fixture `nuts!!` (`step!`, tree growth, U-turn) | **Verified external exemplar** — sealed registry-free native recursion; `nuts!!(state; rng) === state` (same object, fixed type), **exact 0-B** on the compiler acceptance path. |
-| Current `nuts_state` / `CompiledNUTSState` compatibility surface | **Transitional and removal-bound, not an intended RK API.** It uses compiled-reactive Hamiltonian dependencies with ordinary inferred Julia recursion and proposal scratch; it is not the sealed fixture artifact or part of the definitive support contract. |
+| Compiled-reactive `nuts_state` / `CompiledNUTSState` implementation | **External example only.** It uses compiled-reactive Hamiltonian dependencies with ordinary inferred Julia recursion and proposal scratch; it is not loaded or exported by RK and is not the sealed fixture artifact. |
 | End-to-end sampling time and ESS | **Not measured for the current sealed-native path.** The earlier compiled-reactive implementation was about 4–7× slower than AdvancedHMC/DynamicHMC in matched warmup+draw wall time, so the inner-loop result must not be read as a blanket sampler-speed claim. |
 | Work-normalized inner-loop throughput | **Measured, narrow metric** — [`nuts-g7-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/nuts-g7-v1.toml) records 2.27M leapfrog steps/s for RK, 1.33M for AdvancedHMC, 1.42M for DynamicHMC, and 2.65M for nsiccha/NUTS.jl on the frozen AR(1) setup. |
 
-The sealed native compiler (`kernel_nuts_native.jl`, `_build_nuts_sampler`) and the
-minimal-reset external authoring fixture are **on `main` as compiler evidence**. The performance figures cited on
-this page measure that acceptance artifact and come from the static receipt, not a
-CI perf run or the transitional `CompiledNUTSState` compatibility path. RK, AdvancedHMC, and
+The sealed native compiler (`examples/nuts_runtime/kernel_nuts_native.jl`,
+`_build_nuts_sampler`) and the minimal-reset external authoring fixture are
+**on `main` as compiler evidence**. The performance figures cited on this page
+measure that acceptance artifact and come from the static receipt, not a CI perf
+run or the external `CompiledNUTSState` comparison path. RK, AdvancedHMC, and
 DynamicHMC used one shared DifferentiationInterface+Enzyme gradient and matched
 target, mass, step size, and RNG schedule; the receipt also checks gradient/work
 accounting. It does **not** measure adaptation, retained draws, ESS, or
@@ -107,12 +108,11 @@ invalidates stale values.
 These are the properties the `@kernel` lowering is **locked to** and the landed sealed
 fixture entry **satisfies** (see the status table).
 
-- **Captured source and exact call authority.** The current external fixture still
-  schedules its removal-bound `@rk_pure` / `@rk_borrows` / `@rk_rng` compatibility
-  declarations by registered effects, never by body inference. Those macros are
-  evidence about the current snapshot, not the locked or recommended RK authoring
-  contract. The intended surface uses visible arithmetic/control or captured sibling
-  `@kernel` methods; ordinary unregistered helpers reject. `@node` remains supported.
+- **Captured source and exact call authority.** The external fixture uses visible
+  arithmetic/control and captured sibling `@kernel` methods; ordinary unregistered
+  helpers reject rather than acquiring inferred authority. The former `@rk_pure`,
+  `@rk_borrows`, and `@rk_rng` declarations have been removed. `@node` remains
+  supported.
 - **Immutable plan.** Construction produces a fixed-shape, fixed-type plan; the sealed
   entry mutates compiler-owned concrete state and returns the same object. The fixture
   identity holds: `nuts!!(state; rng)` returns `result === state` (same object, fixed
@@ -145,18 +145,17 @@ The fixture's comment preamble preserves its integration-stage provenance, so it
 “docs not sourced” staging line is historical rather than the page's current
 status. The table above is authoritative.
 
-The verbatim source below still contains `@rk_pure`, `@rk_borrows`, and `@rk_rng`
-because it records the executable external fixture as it exists today. Those
-declarations are transitional and removal-bound compatibility—not examples to copy
-as stable RK API. Their tracked replacement will inline simple helpers or capture
-them as sibling `@kernel` methods. The fixture's `@node` use is unrelated and stays.
+The verbatim source below is the macro-free executable fixture as it exists today.
+Its helpers are inline arithmetic/control or captured sibling `@kernel` methods;
+there are no user-authored effect declarations. The fixture's `@node` use is
+unrelated and stays.
 
 ::: details Show the complete byte-synchronized authoring fixture
 
 ```julia
 # ReactiveHMC-STRUCTURE `@kernel` NUTS AUTHORING FIXTURE — FINAL executable-integration surface.
 # implicit-field, no-Ref (two-direct-branch direction), runtime rng, RK-visible leapfrog!/refresh_momentum!!/
-# copy!!, `!!` public entry, pot_f + grad_f as alternative pot producers (pot_f RESTORED), public @rk_* helper effect
+# copy!!, `!!` public entry, pot_f + grad_f as alternative pot producers (pot_f RESTORED), no author effect
 # declarations, and a concrete registered zero-allocation stats callback over compiler-owned diagnostics state.
 #
 # Algorithm-STRUCTURE reference (NOT a bitwise target): ReactiveHMC.jl v0.1.0 (781sB @ ca9ea4ca) —
@@ -181,8 +180,8 @@ them as sibling `@kernel` methods. The fixture's `@node` use is unrelated and st
 #     them per transition; the registered stats_f (nuts_stats!) increments n_steps ONCE per collectstats!/leaf
 #     and records acceptance data — n_steps is produced by the callback, independent of pgrad + body marker.
 #  T-PRESERVING: all construction literals derive from the endpoint/template (zero/one/oftype/similar).
-#  @node(logdet(chol_metric)) preserved. Public @rk_* declarations register the pure/borrowing/rng helpers so
-#  the compiler schedules them with visible effects (never body inference).
+#  @node(logdet(chol_metric)) preserved. Every hot helper is an expression or captured sibling method whose
+#  primitive reads/RNG effects are visible in MethodIR; the production NUTS source needs no `@rk_*` declaration.
 #
 #  PINNED STRUCTURAL-COPY OWNERSHIP POLICY (`deepcopy(init)` is the STRUCTURAL MARKER):
 #   - SHARED BY IDENTITY across init/fwd/bwd: read-only authority inputs pot_f, grad_f, metric, plus the
@@ -192,32 +191,17 @@ them as sibling `@kernel` methods. The fixture's `@node` use is unrelated and st
 #     dkin_dmom, kin, ham, dham_dpos, dham_dmom (aliased projections collapse to one physical slot).
 #
 # STAGE: FINAL integration-input source surface for syntax cherry-pick + POC compile. CONSTRUCTION happens on
-# the factory/effects substrate (@kernel source-capture + @rk_* declarations + nuts!! execution seam). NO
+# the factory/effects substrate (@kernel source-capture + built-in primitive authority + nuts!! execution seam). NO
 # execution/parity/0-B/perf claim here; docs not sourced. Structural verification + lexical-shadowing inventory
 # via nuts_authoring_shadowing_gate.jl; executable certification via nuts_acceptance_harness.jl (c83, held).
 using ReactiveKernels
 using LinearAlgebra, LogExpFunctions, Random
 
-# ---- module helpers (algorithm-structure reference) — T-derived, no Int→Float64 -----------------------
+# ---- cold module helpers (construction only) — T-derived, no Int→Float64 ------------------------------
 fillf(f::Function, value, n::Int) = [f(value) for _ in 1:n]
-finiteorneginf(x) = isfinite(x) ? x : typeof(x)(-Inf)
-min1exp(x) = x >= 0 ? one(x) : exp(x)
-badd(args...) = Base.broadcasted(+, args...)
-randbernoullilog(rng, logprob) = logprob > 0 ? true : -randexp(rng) < logprob
-logswapprob(tree) = tree.log_weight[1] - tree.log_weight[2]
-compute_criterion(mom, bwd_dham_dmom, fwd_dham_dmom) =
-    (dot(mom, bwd_dham_dmom) > 0 && dot(mom, fwd_dham_dmom) > 0)
-
-# PUBLIC exact-identity effect declarations (973f7f4/bf7d2ed) — the compiler schedules these with visible
-# effects (registered primitives), never by body inference. Authors touch no internals.
-@rk_pure finiteorneginf 1
-@rk_pure min1exp 1
-@rk_borrows badd 2
-@rk_rng randbernoullilog 2 1
-@rk_pure logswapprob 1
-@rk_pure compute_criterion 3
 # Built-in RNG/effect primitives used by refresh_momentum!!: Random.randn! (ordered RNG, rng arg 1, writes/
-# result-aliases dest arg 2), LinearAlgebra.lmul! (reads matrix+dest, writes/aliases dest arg 2).
+# result-aliases dest arg 2), LinearAlgebra.lmul! (reads matrix+dest, writes/aliases dest arg 2). Each
+# accept/reject branch below directly exposes the exact built-in ordered Random.randexp(rng) authority.
 
 # T-derived tree/proposal buffers from the phasepoint/template arrays (zero/similar), sentinel via oftype(ham).
 trajectory(bwd, fwd) = (; bwd, fwd)
@@ -283,7 +267,8 @@ end
 @kernel nuts_stats!(state) = begin
     state.n_steps += 1
     state.acceptance_rate = (one(state.dham) - one(state.dham) / state.n_steps) * state.acceptance_rate +
-                            (one(state.dham) / state.n_steps) * min1exp(state.dham)
+                            (one(state.dham) / state.n_steps) *
+                            (state.dham >= zero(state.dham) ? one(state.dham) : exp(state.dham))
     return state
 end
 
@@ -304,6 +289,15 @@ end
     reached_depth = 0
     acceptance_rate = zero(init.ham)
 
+    # The remaining hot helper is a captured sibling method whose complete primitive body is part of
+    # MethodIR/native ProgramT.  RNG draws stay directly at their consuming branches, and the explicit
+    # reductions in finish! replace the former opaque `dot` + lazy `broadcasted(+)` helpers.  They preserve
+    # the real-valued NUTS criterion, while—as the fixture header states—the scalar reduction is not a
+    # bitwise BLAS-dot target.
+    finiteorneginf(x) = begin
+        result = (x - x == zero(x)) ? x : -(one(x) / zero(x))
+        result
+    end
     reset!() = begin
         gofwd = true
         may_sample = true
@@ -339,7 +333,10 @@ end
             rand(rng, Bool) && flip!(__self__, depth)
             gofwd ? finish!(__self__, fwd, depth, rng) : finish!(__self__, bwd, depth, rng)
             may_sample || break
-            randbernoullilog(rng, logswapprob(trees[depth])) && swapproposal!(__self__, depth)
+            ((trees[depth].log_weight[1] - trees[depth].log_weight[2]) >
+                zero(trees[depth].log_weight[1] - trees[depth].log_weight[2]) ? true :
+                -Random.randexp(rng) < (trees[depth].log_weight[1] - trees[depth].log_weight[2])) &&
+                swapproposal!(__self__, depth)
             may_continue || break
         end
         copy!!(init, proposals[end])                          # registered owned-copy (visible)
@@ -371,23 +368,48 @@ end
         start!(__self__, ep, depth, rng)
         may_continue || return may_sample = false
         suptree.log_weight[1] = logaddexp(tree.log_weight[1], tree.log_weight[2])
-        may_continue = if depth == 1
+        if depth == 1
             @. suptree.summed_mom.fwd = suptree.bwd.mom + ep.mom
-            compute_criterion(suptree.summed_mom.fwd, suptree.bwd.dham_dmom, ep.dham_dmom)
+
+            # Seed from the already-typed scalar diagnostic, not an array element: zero-length vector
+            # inputs retain Julia's ordinary empty-reduction value and never acquire an implicit [1] read.
+            backward_dot = zero(dham)
+            forward_dot = zero(dham)
+            for i in 1:length(suptree.summed_mom.fwd)
+                backward_dot += suptree.summed_mom.fwd[i] * suptree.bwd.dham_dmom[i]
+                forward_dot += suptree.summed_mom.fwd[i] * ep.dham_dmom[i]
+            end
+            may_continue = backward_dot > zero(backward_dot) && forward_dot > zero(forward_dot)
         else
             @. suptree.summed_mom.fwd = tree.summed_mom.bwd + tree.summed_mom.fwd
-            (
-                compute_criterion(suptree.summed_mom.fwd, suptree.bwd.dham_dmom, ep.dham_dmom) &&
-                compute_criterion(badd(tree.summed_mom.bwd, tree.bwd.mom),
-                                  suptree.bwd.dham_dmom, tree.bwd.dham_dmom) &&
-                compute_criterion(badd(tree.bwd_fwd.mom, tree.summed_mom.fwd),
-                                  tree.bwd_fwd.dham_dmom, ep.dham_dmom)
+            base_backward_dot = zero(dham)
+            base_forward_dot = zero(dham)
+            sum1_backward_dot = zero(dham)
+            sum1_forward_dot = zero(dham)
+            sum2_backward_dot = zero(dham)
+            sum2_forward_dot = zero(dham)
+            for i in 1:length(suptree.summed_mom.fwd)
+                base_backward_dot += suptree.summed_mom.fwd[i] * suptree.bwd.dham_dmom[i]
+                base_forward_dot += suptree.summed_mom.fwd[i] * ep.dham_dmom[i]
+                sum1_backward_dot += (tree.summed_mom.bwd[i] + tree.bwd.mom[i]) * suptree.bwd.dham_dmom[i]
+                sum1_forward_dot += (tree.summed_mom.bwd[i] + tree.bwd.mom[i]) * tree.bwd.dham_dmom[i]
+                sum2_backward_dot += (tree.bwd_fwd.mom[i] + tree.summed_mom.fwd[i]) * tree.bwd_fwd.dham_dmom[i]
+                sum2_forward_dot += (tree.bwd_fwd.mom[i] + tree.summed_mom.fwd[i]) * ep.dham_dmom[i]
+            end
+            may_continue = (
+                base_backward_dot > zero(base_backward_dot) &&
+                base_forward_dot > zero(base_forward_dot) &&
+                sum1_backward_dot > zero(sum1_backward_dot) &&
+                sum1_forward_dot > zero(sum1_forward_dot) &&
+                sum2_backward_dot > zero(sum2_backward_dot) &&
+                sum2_forward_dot > zero(sum2_forward_dot)
             )
         end
     end
     start!(ep, depth, rng) = if depth == 1
         step_f(ep)                                             # registered leapfrog! token, concrete ep
-        dham = finiteorneginf(init.ham - ep.ham)
+        raw_dham = init.ham - ep.ham
+        dham = finiteorneginf(__self__, raw_dham)
         collectstats!(__self__)                                # registered stats_f increments n_steps (per leaf)
         diverged && return may_continue = false
         trees[1].log_weight[1] = dham
@@ -397,8 +419,12 @@ end
         may_continue || return may_sample = false
         swapproposal!(__self__, depth - 1, depth)
         finish!(__self__, ep, depth - 1, rng)
-        if may_sample && randbernoullilog(rng, logadvanceprob(__self__, depth))
-            swapproposal!(__self__, depth - 1, depth)
+        if may_sample
+            if (trees[depth - 1].log_weight[1] - trees[depth].log_weight[1]) >
+                    zero(trees[depth - 1].log_weight[1] - trees[depth].log_weight[1]) ? true :
+                    -Random.randexp(rng) < (trees[depth - 1].log_weight[1] - trees[depth].log_weight[1])
+                swapproposal!(__self__, depth - 1, depth)
+            end
         end
     end
 end

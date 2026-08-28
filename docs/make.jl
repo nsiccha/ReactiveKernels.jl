@@ -1,5 +1,10 @@
 using Documenter, DocumenterVitepress, ReactiveKernels
 
+# Opt into the external NUTS/HMC compiler-acceptance exemplar for the sampling
+# and online-statistics pages. ReactiveKernels itself deliberately does not load it.
+include(joinpath(@__DIR__, "..", "examples", "nuts_runtime.jl"))
+using .ReactiveKernelsNUTSExample
+
 include("kernel_examples.jl")
 include("check_rendered.jl")
 include(joinpath(@__DIR__, "..", "examples", "distributions.jl"))

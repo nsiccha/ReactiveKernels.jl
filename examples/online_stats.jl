@@ -3,6 +3,11 @@ module OnlineStatsExample
 using ReactiveKernels
 using Statistics
 
+# NUTS diagnostics are part of the external sampler exemplar, not RK's package API.
+isdefined(Main, :ReactiveKernelsNUTSExample) ||
+    Base.include(Main, joinpath(@__DIR__, "nuts_runtime.jl"))
+using Main.ReactiveKernelsNUTSExample: NUTSDiagnostics
+
 export MomentsAccumulator, update, fit
 export HMCDiagnosticsAccumulator, record_transition, fit_diagnostics
 export sample_count, max_tree_depth, divergence_rate, divergence_percent

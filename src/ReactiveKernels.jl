@@ -30,17 +30,15 @@ include("authoring.jl")
 include("kernel_stateful.jl")
 include("kernel_methodir.jl")
 include("kernel_factory.jl")
+include("binders.jl")
 include("kernel_lowering.jl")
 include("kernel_codegen.jl")
+include("kernel_execution.jl")
 include("kernel_control.jl")
-include("kernel_nuts.jl")
-include("kernel_nuts_native.jl")
 include("kernel_adaptation.jl")
 include("reactive.jl")
 include("stateful.jl")
-include("hmc.jl")
 include("reactive_facade.jl")
-include("reactive_nuts.jl")
 include("visualization.jl")
 
 export Value, Recipe, Graph, Plan, PreparedKernel, ReplicatedKernel, NonAllocatingKernel, PlanningError
@@ -49,21 +47,13 @@ export lower, lower_batched, replica, transform, compile
 export explain, code_expr, inputs, outputs, valtype
 export compose, PreparationCache, prepare!, canon_id
 export KernelSpec, @kernel, @node, kernel_graph, port, copy!!
+export PartialFunction, partial
 export DAGVisualization, visualize, dot_source, save_visualization
 # Reactive layer
 export ReactiveState, set!, get!, freeze!, unfreeze!, checkpoint, materialize!
 export ReactiveProgram, CompiledReactiveState, ReactiveValue
 export prepare_reactive, prepare_reactive_nonallocating, statevalue, touch!, mutate!, copy_group!
 export ReactiveObject, @reactive
-# Reactive HMC/NUTS layer
-export ReactivePhasePoint, euclidean_phasepoint, riemannian_phasepoint
-export reactive_nuts_group, compiled_nuts_state, CompiledNUTSState
-export leapfrog!, generalized_leapfrog!, implicit_midpoint!, multistep
-export PartialFunction, partial, NUTSDiagnostics, nuts_state, step!
-export refresh_momentum!, diagnostics, sample!, reactive_program
-export find_initial_stepsize!, warmup!
-export DualAveragingState, dual_averaging_state, fit!
-export WelfordVariance, welford_var
-export TrajectoryStats, SamplingStats, trajectory_stats, sampling_stats, reset!
+export reactive_program
 
 end # module ReactiveKernels

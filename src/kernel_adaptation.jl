@@ -1,9 +1,9 @@
-# Lowering an AUTHORED free stateful @kernel (dual_averaging_state / welford_var) to a RUNNABLE object —
-# the AUTHORED recurrence, NOT the package @reactive type (HMC acceptance G3/G4). A stateful @kernel is a
+# Lowering an AUTHORED free stateful @kernel to a RUNNABLE object —
+# the AUTHORED recurrence, NOT the package @reactive type. A stateful @kernel is a
 # _StatefulKernelSkeleton: field-initializer recipes (m=one(init), H=zero(init), mu=…, current=exp(…))
 # captured through the stateless graph, plus mutating methods (fit!(x), step!(x;dn)) captured as MethodIRs.
 #
-# It reuses the SAME accepted substrate proven on nuts_state:
+# It reuses the same generic prepared-state substrate:
 #   * AUTHORITATIVE ownership (`_kernel_factory_owned_authoritative`/`_kernel_factory_shared`) — never a
 #     local-seed `setdiff` (that misses an interprocedural sibling write; welford's matrix `step!` writes
 #     n/mean/var ONLY through a `__self__` sibling call to the vector `step!`);
@@ -106,7 +106,7 @@ function _sm_exact_callee(x::_RegisteredCall)
         "stateful method value call `$(x.ref.slot)` is not a captured pure Base primitive")
     isempty(x.kw) || _sm_reject("stateful method primitive `$(x.ref.slot)` carries keywords")
     x.broadcast && _sm_reject("per-call dotted primitive `$(x.ref.slot)` is unsupported; use an authored @. write")
-    _lf_callee(x) # exact captured GlobalRef identity + rebind check
+    _exec_captured_callee(x) # exact captured GlobalRef identity + rebind check
 end
 
 _sm_leaf_type(::Type{_DSanctionedColumn{T}}) where {T} = T
@@ -369,7 +369,7 @@ function _sm_emit_write!(stmts, pw::_PlaceWrite, syms, plan::_KernelPlan, fields
 end
 
 function _sm_global_written(plan::_KernelPlan, irs)
-    fields = _lf_canon_map(plan); out = Set{Int}()
+    fields = _exec_canon_map(plan); out = Set{Int}()
     for ir in irs
         for (root, owner) in write_roots(ir)
             root === :self || continue
@@ -384,7 +384,7 @@ function compile_stateful_method(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, i
                                  global_written::Set{Int}, typeauth) where {OW,SH}
     _sm_validate_formals(ir)
     any(st -> st isa _For, ir.body) && _sm_reject("control-bearing stateful method requires orchestration lowering")
-    plan = kernel_prepared_plan(pf); hs = kernel_prepared_handles(pf); fields = _lf_canon_map(plan)
+    plan = kernel_prepared_plan(pf); hs = kernel_prepared_handles(pf); fields = _exec_canon_map(plan)
     recs = kernel_plan_recipes(plan)
     hidx = Dict{Int,Tuple{Any,Int}}(recs[i] => (hs[i], i) for i in eachindex(hs))
     producer = Dict{Int,Int}(c => r for (c, r) in kernel_plan_producer(plan) if !(c in global_written))
@@ -402,8 +402,8 @@ function compile_stateful_method(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, i
             dstmts = Any[]
             if f.default !== nothing
                 dcurrent = copy(current); dstale = copy(stale)
-                for c in _lf_reads(f.default, fields)
-                    uc, _ = _lf_ensure!(dstmts, c, dcurrent, dstale,
+                for c in _exec_reads(f.default, fields)
+                    uc, _ = _exec_ensure!(dstmts, c, dcurrent, dstale,
                                         plan, producer, hidx, OW, SH)
                     ngrad += uc
                 end
@@ -418,8 +418,8 @@ function compile_stateful_method(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, i
     for st in ir.body
         if st isa _LocalAssign
             length(st.lhs) == 1 || _sm_reject("stateful local assignment must bind exactly one name")
-            for c in _lf_reads(st.rhs, fields)
-                uc, _ = _lf_ensure!(stmts, c, current, stale, plan, producer, hidx, OW, SH); ngrad += uc
+            for c in _exec_reads(st.rhs, fields)
+                uc, _ = _exec_ensure!(stmts, c, current, stale, plan, producer, hidx, OW, SH); ngrad += uc
             end
             rhs = _sm_rhs(st.rhs, syms, plan, fields, OW, SH, formals, locals, false) # old env first
             isvec = _sm_isvector(st.rhs, plan, fields, OW, SH, formals, locals)
@@ -427,15 +427,15 @@ function compile_stateful_method(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, i
             syms[(:local, st.lhs[1])] = s; locals[st.lhs[1]] = isvec
             push!(stmts, :(local $s = $rhs))
         elseif st isa _PlaceWrite
-            for c in _lf_reads(st.rhs, fields)
-                uc, _ = _lf_ensure!(stmts, c, current, stale, plan, producer, hidx, OW, SH); ngrad += uc
+            for c in _exec_reads(st.rhs, fields)
+                uc, _ = _exec_ensure!(stmts, c, current, stale, plan, producer, hidx, OW, SH); ngrad += uc
             end
             tgt = get(fields, st.target.path[end], 0); tgt == 0 && _sm_reject("unknown stateful write target")
-            deps = _lf_kill_closure(plan, tgt)
-            _lf_mask!(stmts, plan, tgt, :kill)
-            for d in deps; _lf_mask!(stmts, plan, d, :kill); end
+            deps = _exec_kill_closure(plan, tgt)
+            _exec_mask!(stmts, plan, tgt, :kill)
+            for d in deps; _exec_mask!(stmts, plan, d, :kill); end
             _sm_emit_write!(stmts, st, syms, plan, fields, OW, SH, formals, locals)
-            _lf_mask!(stmts, plan, tgt, :bless)
+            _exec_mask!(stmts, plan, tgt, :bless)
             for d in deps; delete!(current, d); push!(stale, d); end
             delete!(stale, tgt); push!(current, tgt)
         else
@@ -493,7 +493,7 @@ function _compile_sm_orchestration(ir::MethodIR, segment_fns, segment_forests, s
     posformal = only(filter(f -> f.kind === :pos, ir.formals))
     it.args[1].kind === :pos && it.args[1].arg === posformal.name ||
         _sm_reject("matrix orchestration eachcol operand must be its sole positional formal")
-    src = _lf_callee(it)
+    src = _exec_captured_callee(it)
     src === Base.eachcol || _sm_reject("matrix orchestration admits only exact builtin `Base.eachcol`")
     getfield(it.registration, :kind) === :primitive || _sm_reject("eachcol lacks builtin primitive provenance")
     length(loop.body) == 1 && loop.body[1] isa _Call ||

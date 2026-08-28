@@ -829,7 +829,7 @@ end
 end
 
 @testset "reactive_nuts_group no longer constructs a Graph (source check)" begin
-    src = read(joinpath(@__DIR__, "..", "src", "reactive_nuts.jl"), String)
+    src = read(joinpath(@__DIR__, "..", "examples", "nuts_runtime", "reactive_nuts.jl"), String)
     # The construction path is the @reactive-authored object + a delegating wrapper.
     @test occursin("@reactive specialize=true prepare=_nuts_prepare\n" *
                    "        _reactive_nuts_group_object", src) ||

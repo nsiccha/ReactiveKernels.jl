@@ -294,7 +294,12 @@ end
     #   (2) per-compilation LOCAL scratch — indented `ctr = Ref(0)` / `fspv = Dict(...)` inside a function.
     # Only a TOP-LEVEL construction (`^[const] Name = Container(` / `[`) is an offender. `_DIAG` (Dict) →
     # `_diag_index` pure dispatch; `_EP_SELF`/`_SCALAR_SELF` (Set) → immutable tuple / removed, this pins it.
-    nuts_files = ["kernel_nuts.jl", "kernel_nuts_native.jl", "kernel_control.jl", "kernel_codegen.jl"]
+    nuts_files = [
+        joinpath("examples", "nuts_runtime", "kernel_nuts.jl"),
+        joinpath("examples", "nuts_runtime", "kernel_nuts_native.jl"),
+        joinpath("examples", "nuts_runtime", "kernel_codegen.jl"),
+        joinpath("src", "kernel_control.jl"),
+    ]
     #  ^-anchored (multiline): a leading-whitespace line can't match, so indented locals are excluded.
     #  A CONSTRUCTION is `Name = [Base./Core.]Container[{...}]( / [` — the container (optionally qualified and
     #  optionally with type params) is IMMEDIATELY followed by a `(`/`[` constructor call. A bare type ALIAS
@@ -302,9 +307,9 @@ end
     #  `Set{T}()`, `Base.RefValue(0)`; it allows `Dict{K,V}` / `Set{T}` aliases and indented function-local scratch.
     banned = r"^(const[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]*=[ \t]*(Base\.|Core\.)?(Dict|Set|IdDict|WeakKeyDict|Ref|RefValue|ObjectIdDict)(\{[^\n]*\})?[ \t]*[\(\[]"m
     for f in nuts_files
-        src = read(joinpath(@__DIR__, "..", "src", f), String)
+        src = read(joinpath(@__DIR__, "..", f), String)
         offenders = String[strip(m.match) for m in eachmatch(banned, src)]
-        isempty(offenders) || @error "module-level mutable-container construction in src/$f" offenders
+        isempty(offenders) || @error "module-level mutable-container construction in $f" offenders
         @test isempty(offenders)
     end
     # positive controls — the gate MUST fire on every construction shape:
@@ -404,6 +409,8 @@ end
     proj = abspath(joinpath(@__DIR__, ".."))
     childsrc = raw"""
     using LinearAlgebra, Random, ReactiveKernels
+    include(ENV["RK_NUTS_RUNTIME"])
+    using .ReactiveKernelsNUTSExample
     const RK = ReactiveKernels
     for Tv in (Float64, Float32)
         @eval LinearAlgebra.LAPACK.potrs!(u::AbstractChar, A::AbstractMatrix{$Tv}, B::AbstractVecOrMat{$Tv}) = error("POTRS_CALLED")
@@ -437,7 +444,9 @@ end
     """
     childfile = tempname() * ".jl"; write(childfile, childsrc)
     out = IOBuffer()
-    cmd = setenv(`$(Base.julia_cmd()) --startup-file=no --project=$proj $childfile`, "RK_DIAG_FIXTURE" => fixture)
+    runtime = abspath(joinpath(@__DIR__, "..", "examples", "nuts_runtime.jl"))
+    cmd = setenv(`$(Base.julia_cmd()) --startup-file=no --project=$proj $childfile`,
+                 "RK_DIAG_FIXTURE" => fixture, "RK_NUTS_RUNTIME" => runtime)
     proc = run(pipeline(cmd; stdout = out, stderr = out); wait = false); wait(proc)
     receipt = String(take!(out)); rm(childfile; force = true)
     @test occursin("RECEIPT dense_F64=threw_potrs dense_F32=threw_potrs diag_F64=completed diag_F32=completed", receipt)

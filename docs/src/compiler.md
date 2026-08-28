@@ -13,8 +13,7 @@ The word *compiler* is used here for three related but different pipelines:
    slots, validity bits, dependency closures, and generated lazy getters; and
 - the source-captured state-machine compiler, which analyzes method-bearing
    `@kernel` definitions using captured and validated effect metadata. Its most
-   complete
-   consumer is the sealed native NUTS acceptance artifact.
+   complete consumer is the external sealed native NUTS acceptance artifact.
 
 Those surfaces share graph identities, producer selection, and currentness
 rules. They do **not** share the same public stability or source-language
@@ -39,9 +38,9 @@ must stay inside the compiler's inspectable and registered subset.
 The method-bearing source compiler and its factory remain implementation
 surfaces rather than a general exported `prepare` API. NUTS, log-density, and
 PPL artifacts are external compilation examples and acceptance evidence, not
-domain APIs owned by ReactiveKernels. Any currently exported NUTS compatibility
-surface is transitional and removal-bound; it is not part of the definitive
-support contract below. See [What the NUTS proof does and does not
+domain APIs owned by ReactiveKernels. The NUTS runtime and domain surface live
+under `examples/nuts_runtime/`; a bare `using ReactiveKernels` does not load or
+export them. See [What the NUTS proof does and does not
 establish](#what-the-nuts-proof-does-and-does-not-establish).
 
 ## The stateless compiler
@@ -412,12 +411,9 @@ lowering must resolve it or reject it.
 
 Calls are authorized by exact identity, not by spelling. Built-in compiler
 descriptors describe arity, reads, writes, result aliasing/borrowing, and RNG
-position. The currently exported `@rk_pure`, `@rk_borrows`, and `@rk_rng`
-declarations are transitional and removal-bound compatibility for external
-fixtures, not the definitive authoring surface or a recommended public API.
-While that compatibility path exists, each declaration is an author-trusted
-contract; its replacement is ordinary visible arithmetic/control or a captured
-sibling `@kernel` method. Undeclared ordinary helpers remain unsupported and are
+position. The former `@rk_pure`, `@rk_borrows`, and `@rk_rng` declarations have
+been removed. External fixtures use ordinary visible arithmetic/control or a
+captured sibling `@kernel` method. Undeclared ordinary helpers remain unsupported and are
 not made pure because they have an operator-like name or receive an argument
 named `rng`. `@node` is unrelated to this removal boundary and remains part of
 graph authoring.
@@ -512,20 +508,14 @@ not establish arbitrary recursion, arbitrary containers or numeric subtypes,
 arbitrary integrators, automatic differentiation, PPL semantics, or a stable
 exported constructor for every method-bearing `@kernel`.
 
-There is also a package-boundary distinction:
-
-- the sealed `_build_nuts_sampler` compiler, fixture entry, and certificate
-  accessors are compiler-acceptance surfaces for an external NUTS exemplar, not
-  a sampler API shipped by ReactiveKernels; and
-- the currently exported `nuts_state` / `CompiledNUTSState` compatibility path
-  is transitional and removal-bound, not part of the intended support contract.
-  It uses a compiled-reactive phase-point group for Hamiltonian dependencies and
-  ordinary inferred Julia for recursive tree growth, RNG choices, and proposal
-  scratch.
+There is also a package-boundary distinction. The sealed `_build_nuts_sampler`
+compiler, fixture entry, certificate accessors, and the compiled-reactive
+`nuts_state` / `CompiledNUTSState` comparison path all live in the explicitly
+loaded external exemplar. None is loaded or exported by `ReactiveKernels`.
 
 Therefore “the sealed native compiler runs the NUTS fixture” must not be read as
-“ReactiveKernels exports or promises a NUTS API.” The fixture and transitional
-compatibility path are implemented and tested as compiler evidence, but neither
+“ReactiveKernels exports or promises a NUTS API.” The two external paths are
+implemented and tested as compiler evidence, but neither
 turns NUTS, log-density, or PPL models into the package's domain contract.
 
 ## Definitive support matrix
@@ -554,7 +544,7 @@ turns NUTS, log-density, or PPL models into the package's domain contract.
 | Reentrant/concurrent stateful kernel instance | No | Use one prepared mutable/cache-owning instance per independent caller |
 | Automatic differentiation | No compiler feature | AD may be an ordinary recipe/backend concern; the compiler does not choose or prove it |
 | PPL/model semantics | No compiler feature | Examples build log densities and samplers from ordinary recipes; there is no trace/address language |
-| NUTS, log-density, or PPL domain API | No | These are external compilation examples; any currently exported NUTS compatibility surface is transitional and removal-bound |
+| NUTS, log-density, or PPL domain API | No | These live in external compilation examples and are not loaded or exported by RK |
 | General dynamic scheduling in a hot kernel | No | Dynamic planning exists only in `ReactiveState` demand orchestration |
 | General Julia compiler replacement | No | Unsupported captured shapes reject; ordinary opaque stateless recipes remain ordinary Julia |
 
