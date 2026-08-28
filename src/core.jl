@@ -58,7 +58,7 @@ struct Recipe
 end
 
 """
-    _KernelSourceOp{DefToken,Form,F}
+    _KernelSourceOp{DefToken,Form,F,TF}
 
 An immutable wrapper marking a recipe operation SYNTHESIZED from captured `@kernel` source as
 COMPILER-OWNED provenance (RK 07:21). Authoring wraps ONLY the anonymous-closure path of
@@ -75,12 +75,38 @@ self-derive the DESTINATION contract (a port-call with one owned buffer + one ow
 The call forwards INLINE. A RAW anonymous closure inserted into a Graph carries no wrapper and is
 rejected as opaque when captured into a prepared handle.
 """
-struct _KernelSourceOp{DefToken,Form,F}
+struct _KernelSourceOp{DefToken,Form,F,TF}
     f::F
+    tensor_f::TF
 end
-_KernelSourceOp(::Val{DefToken}, ::Val{Form}, f::F) where {DefToken,Form,F} =
-    _KernelSourceOp{DefToken,Form,F}(f)
-@inline (op::_KernelSourceOp)(args...) = op.f(args...)
+_KernelSourceOp(::Val{DefToken}, ::Val{Form}, f::F, tensor_f::TF) where
+        {DefToken,Form,F,TF} =
+    _KernelSourceOp{DefToken,Form,F,TF}(f, tensor_f)
+# Preserve the established internal constructor for compiler fixtures and
+# already-authored handles; without an alternate body it uses the same callable
+# in both modes.
+_KernelSourceOp(token::Val, form::Val, f) = _KernelSourceOp(token, form, f, f)
+
+# Optional tracing extensions classify their scalar/array argument types as
+# tensorized.  The tuple fold is ordinary Julia dispatch over argument types,
+# so it is resolved while tracing rather than becoming data-dependent control
+# flow in the compiled program.
+@inline _kernel_source_arg_style(arg) = Val(:native)
+@inline _kernel_source_merge(::Val{:tensorized}, style) = Val(:tensorized)
+@inline _kernel_source_merge(::Val{:native}, style) = style
+@inline _kernel_source_style(::Tuple{}) = Val(:native)
+@inline function _kernel_source_style(args::Tuple)
+    _kernel_source_merge(
+        _kernel_source_arg_style(first(args)),
+        _kernel_source_style(Base.tail(args)),
+    )
+end
+@inline _kernel_source_call(::Val{:native}, op::_KernelSourceOp, args) =
+    op.f(args...)
+@inline _kernel_source_call(::Val{:tensorized}, op::_KernelSourceOp, args) =
+    op.tensor_f(args...)
+@inline (op::_KernelSourceOp)(args...) =
+    _kernel_source_call(_kernel_source_style(args), op, args)
 kernel_sourceop_token(::_KernelSourceOp{DefToken}) where {DefToken} = DefToken
 kernel_sourceop_form(::_KernelSourceOp{DefToken,Form}) where {DefToken,Form} = Form
 

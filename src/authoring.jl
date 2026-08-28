@@ -904,7 +904,26 @@ function _is_broadcast_operator(sym::Symbol)
     length(s) >= 2 && s[1] === '.' && Base.isoperator(Symbol(s[2:end]))
 end
 
-function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol})
+function _kernel_tensorized_rhs(ex)
+    ex isa Expr || return ex
+    ex.head in (:quote, :inert) && return ex
+    if ex.head === :if && length(ex.args) == 3
+        return Expr(:call, GlobalRef(Base, :ifelse),
+                    (_kernel_tensorized_rhs(arg) for arg in ex.args)...)
+    elseif ex.head === :&& && length(ex.args) == 2
+        return Expr(:call, GlobalRef(Base, :ifelse),
+                    _kernel_tensorized_rhs(ex.args[1]),
+                    _kernel_tensorized_rhs(ex.args[2]), false)
+    elseif ex.head === :|| && length(ex.args) == 2
+        return Expr(:call, GlobalRef(Base, :ifelse),
+                    _kernel_tensorized_rhs(ex.args[1]), true,
+                    _kernel_tensorized_rhs(ex.args[2]))
+    end
+    Expr(ex.head, (_kernel_tensorized_rhs(arg) for arg in ex.args)...)
+end
+
+function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
+                           tensorize::Bool = true)
     form = :fused
     if rhs isa Expr && rhs.head === :call && !isempty(rhs.args)
         callee = rhs.args[1]
@@ -927,7 +946,9 @@ function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol})
     Expr(:call, GlobalRef(@__MODULE__, :_KernelSourceOp),
          Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
          Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)),
-         Expr(:->, Expr(:tuple, deps...), rhs))
+         Expr(:->, Expr(:tuple, deps...), rhs),
+         Expr(:->, Expr(:tuple, deps...),
+              tensorize ? _kernel_tensorized_rhs(rhs) : rhs))
 end
 
 # `@node(expr)` recipe-node promotion, used by `_kernel_expand`. Kept HERE (ahead of
@@ -1182,10 +1203,10 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         end
         dep_values = Expr(:tuple, (port_vars[name] for name in deps)...)
         out_values = Expr(:tuple, (port_vars[name] for (name, _) in outputs)...)
-        op = _kernel_operation(rhs, deps, known)
         cost = get(metadata, :cost, 1.0)
         cse_key = get(metadata, :cse_key, nothing)
         effectful = get(metadata, :effectful, false)
+        op = _kernel_operation(rhs, deps, known; tensorize = !effectful)
         push!(body, :($add_ref($graph_var, $dep_values, $out_values,
                                $op, $cost, $cse_key, $effectful)))
     end

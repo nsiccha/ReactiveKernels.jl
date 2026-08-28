@@ -219,6 +219,78 @@ function lower_batched(p::Plan; batched, reduce = :+)
     Expr(:function, Expr(:tuple, argexprs...), body)
 end
 
+# Reactant deliberately rejects scalar indexing of traced arrays.  Keep the
+# ordinary loop lowering above as the native hot path, and compile this eager
+# tensor lowering alongside it for array-tracing backends.  Each dependent
+# recipe is materialized before the next one consumes it; Reactant sees those
+# broadcasts and the final reduction as tensor operations and can fuse them in
+# the compiled program.  This body is never selected for ordinary Julia arrays,
+# so the native exact-zero-allocation reducing contract is unchanged.
+function _lower_batched_tensorized(p::Plan; batched, reduce = :+)
+    g = p.graph
+    length(p.want) == 1 || throw(ArgumentError(
+        "lower_batched requires a single scalar want; got $(length(p.want))"))
+    for r in p.recipes
+        length(r.outputs) == 1 || throw(ArgumentError(
+            "lower_batched requires single-output recipes; recipe $(r.id) has $(length(r.outputs)) outputs"))
+    end
+    batched_names = Set{Symbol}(batched isa Symbol ? (batched,) : batched)
+    names = _varnames(p)
+    nm(v) = names[canon_id(g, v.id)]
+
+    batched_input_ids = Set{Int}()
+    for v in p.have
+        v.name in batched_names && push!(batched_input_ids, canon_id(g, v.id))
+    end
+    isempty(batched_input_ids) && throw(ArgumentError(
+        "lower_batched: none of the have ports are batched (batched = $(sort(collect(batched_names))))"))
+
+    batched_vals = Set{Int}(batched_input_ids)
+    recipe_is_batched = falses(length(p.recipes))
+    for (k, r) in enumerate(p.recipes)
+        dependent = any(canon_id(g, inp.id) in batched_vals for inp in r.inputs)
+        recipe_is_batched[k] = dependent
+        dependent && for output in r.outputs
+            push!(batched_vals, canon_id(g, output.id))
+        end
+    end
+
+    want = only(p.want)
+    canon_id(g, want.id) in batched_vals || throw(ArgumentError(
+        "lower_batched: want :$(want.name) is loop-invariant (does not depend on a batched port); nothing to vectorize"))
+
+    argexprs = Any[_OPS_ARG]
+    for v in p.have
+        push!(argexprs, canon_id(g, v.id) in batched_input_ids ?
+              nm(v) : :($(nm(v))::$(valtype(v))))
+    end
+
+    body = Expr(:block)
+    assigned = Set(canon_id(g, v.id) for v in p.have)
+    for (k, r) in enumerate(p.recipes)
+        out = only(r.outputs)
+        cid = canon_id(g, out.id)
+        cid in assigned && continue
+        push!(assigned, cid)
+        op = Expr(:ref, _OPS_ARG, k)
+        args = Any[nm(inp) for inp in r.inputs]
+        call = recipe_is_batched[k] ?
+               Expr(:call, GlobalRef(Base, :broadcast), op, args...) :
+               Expr(:call, op, args...)
+        push!(body.args, Expr(:(=), nm(out), call))
+    end
+
+    retval = if reduce === nothing
+        nm(want)
+    elseif reduce === :+
+        Expr(:call, GlobalRef(Base, :sum), nm(want))
+    else
+        Expr(:call, GlobalRef(Base, :reduce), reduce, nm(want))
+    end
+    push!(body.args, Expr(:return, retval))
+    Expr(:function, Expr(:tuple, argexprs...), body)
+end
+
 """
     transform(ast, passes...) -> Expr
 
@@ -235,6 +307,23 @@ Compile a lowered `Expr` into a native Julia function via
 `RuntimeGeneratedFunctions`. The returned callable takes `(__ops__, args...)`.
 """
 compile(ast::Expr) = @RuntimeGeneratedFunction(ast)
+
+# A plated kernel owns two compiled bodies but presents exactly the same
+# PreparedKernel API as every scalar kernel.  The batched input position is a
+# type parameter so choosing the native body remains inferred and allocation
+# free.  Optional backend extensions specialize `_batched_call` on their traced
+# array marker; ordinary arrays always take `native`.
+struct _BatchedFunctionPair{I,N,T}
+    native::N
+    tensorized::T
+end
+
+@inline function (f::_BatchedFunctionPair{I})(ops, args...) where {I}
+    _batched_call(f, ops, args, getfield(args, I))
+end
+
+@inline _batched_call(f::_BatchedFunctionPair, ops, args, marker) =
+    f.native(ops, args...)
 
 """
     PreparedKernel
@@ -261,6 +350,29 @@ function _prepare(p::Plan, ast::Expr)
     f = compile(ast)
     ops = ntuple(i -> p.recipes[i].op, length(p.recipes))
     PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, ast)
+end
+
+"""
+    _prepare_batched(p::Plan; batched, reduce = :+) -> PreparedKernel
+
+Internal constructor shared by public plate authoring and optional array
+compiler extensions.  It compiles both the allocation-free native loop and an
+eager tensorized body, then selects between them by the runtime array type.
+"""
+function _prepare_batched(p::Plan; batched, reduce = :+)
+    batched_names = Set{Symbol}(batched isa Symbol ? (batched,) : batched)
+    input_index = findfirst(v -> v.name in batched_names, p.have)
+    input_index === nothing && throw(ArgumentError(
+        "lower_batched: none of the have ports are batched (batched = $(sort(collect(batched_names))))"))
+
+    native_ast = lower_batched(p; batched = batched, reduce = reduce)
+    tensorized_ast = _lower_batched_tensorized(p; batched = batched, reduce = reduce)
+    native = compile(native_ast)
+    tensorized = compile(tensorized_ast)
+    f = _BatchedFunctionPair{input_index,typeof(native),typeof(tensorized)}(
+        native, tensorized)
+    ops = ntuple(i -> p.recipes[i].op, length(p.recipes))
+    PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast)
 end
 
 # The optional MutatingFunctions extension uses one typed cache cell per
