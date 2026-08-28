@@ -98,16 +98,64 @@ n_recipes = length(plan(hmc_transition;
 @assert mean_abserror < 0.3
 @assert size(samples, 1) == D
 
+# ----- RK derives the BATCHED (multi-chain) sampler from the SAME scalar source -----
+# `replica` maps the whole scalar `hmc_transition` over a trailing chain axis: the batched ports
+# `q`, `p0` become `[params × chains]` and `u` becomes `[chains]`; `grad_U`/`pot` stay scalar and
+# are applied per chain slice. The scalar source is UNCHANGED — there is no hand-written batched
+# sampler. Natively `replica` maps + stacks; under the optional Reactant compiler it lowers the
+# same scalar callable to a batch primitive (proven in the Reactant integration).
+replica_kernel = replica(hmc_transition; batched = (:q, :p0, :u))
+
+n_chains = 8
+
+# One native replica step equals applying the scalar kernel independently per chain.
+let Q = randn(rng, D, n_chains), P = randn(rng, D, n_chains), U = rand(rng, n_chains)
+    per_chain = reduce(hcat,
+        k(grad_U, pot, Q[:, c], P[:, c], U[c], 0.2, 25) for c in 1:n_chains)
+    global replica_matches_scalar =
+        replica_kernel(grad_U, pot, Q, P, U, 0.2, 25) ≈ per_chain
+end
+
+function run_chains(rep, grad_U, pot, Q0, rng; stepsize, L, warmup, draws)
+    Q = Q0
+    d, C = size(Q)
+    for _ in 1:warmup
+        Q = rep(grad_U, pot, Q, randn(rng, d, C), rand(rng, C), stepsize, L)
+    end
+    chains = Array{Float64}(undef, d, C, draws)
+    for i in 1:draws
+        Q = rep(grad_U, pot, Q, randn(rng, d, C), rand(rng, C), stepsize, L)
+        chains[:, :, i] = Q
+    end
+    chains
+end
+
+batched_draws = 2000
+batched_samples = run_chains(replica_kernel, grad_U, pot, randn(rng, D, n_chains), rng;
+                             stepsize = 0.2, L = 25, warmup = 2000, draws = batched_draws)
+pooled = reshape(batched_samples, D, n_chains * batched_draws)
+batched_cov_relerror = maximum(abs.(cov(pooled; dims = 2) .- Sigma)) / maximum(abs.(Sigma))
+
+# The batched sampler IS the scalar kernel mapped over chains, and it recovers the same target.
+@assert replica_matches_scalar
+@assert batched_cov_relerror < 0.1
+@assert size(batched_samples) == (D, n_chains, batched_draws)
+
 docs_example = (;
     name = :hmc_transition,
     origin = "scalar single-chain HMC transition (deterministic, injected momentum + MH uniform)",
     kernel = k,
+    replica_kernel,
     D,
+    n_chains,
     samples,
+    batched_samples,
     Sigma,
     estimated_cov,
     cov_relerror,
     mean_abserror,
+    batched_cov_relerror,
+    replica_matches_scalar,
     n_recipes,
 )
 """
@@ -132,8 +180,12 @@ function run(io::IO = stdout)
         println(io, artifact.name)
         println(io, "  params: ", artifact.D)
         println(io, "  recipes in prepared kernel: ", artifact.n_recipes)
-        println(io, "  relative cov error: ", artifact.cov_relerror)
+        println(io, "  single-chain relative cov error: ", artifact.cov_relerror)
         println(io, "  |mean| error (target 0): ", artifact.mean_abserror)
+        println(io, "  chains (via replica): ", artifact.n_chains)
+        println(io, "  replica step == per-chain scalar: ", artifact.replica_matches_scalar)
+        println(io, "  batched (", artifact.n_chains, "-chain) relative cov error: ",
+                artifact.batched_cov_relerror)
     end
     artifacts
 end
