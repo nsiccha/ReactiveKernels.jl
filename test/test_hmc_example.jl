@@ -22,6 +22,8 @@ include(joinpath(@__DIR__, "..", "examples", "hmc.jl"))
         # never a matrix batch adapter — `replica` maps them per chain slice.
         @test occursin("grad_U::Function", source)
         @test occursin("pot::Function", source)
+        # RK derives the multi-chain form from the SAME scalar source via `replica` — no rewrite.
+        @test occursin("replica(hmc_transition; batched = (:q, :p0, :u))", source)
     end
 
     @testset "prepares and recovers a correlated-Gaussian target single-chain" begin
@@ -33,5 +35,17 @@ include(joinpath(@__DIR__, "..", "examples", "hmc.jl"))
         @test artifact.mean_abserror < 0.3
         # A compact straight-line kernel (leapfrog captured as one recipe + the accept select).
         @test artifact.n_recipes ≥ 6
+    end
+
+    @testset "replica batches the SAME scalar source into the multi-chain sampler" begin
+        artifact = only(map(HMCExample.evaluate_source, HMCExample.all_sources()))
+        # One native replica step equals applying the scalar kernel independently per chain.
+        @test artifact.replica_matches_scalar
+        # Batched output is [params × chains × draws].
+        @test size(artifact.batched_samples, 1) == artifact.D
+        @test size(artifact.batched_samples, 2) == artifact.n_chains
+        @test artifact.n_chains > 1
+        # The multi-chain sampler recovers the same target as the single-chain source.
+        @test artifact.batched_cov_relerror < 0.1
     end
 end
