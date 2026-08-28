@@ -65,11 +65,12 @@ blocks = kernel_blocks()
     end
     @test !haskey(blocks, Symbol("copy!!"))   # copy!! is the RK-CORE intrinsic — NOT authored in the fixture
 
-    # ---- GRAD: euclidean_phasepoint takes ONLY grad_f (pot_f DROPPED — no required-but-unused authority) ----
+    # ---- GRAD: euclidean_phasepoint has pot_f + grad_f as ALTERNATIVE producers of pot (pot_f RESTORED per
+    #      user directive 2026-08-27T10:18:56 — the earlier removal was unauthorized) ----
     ep0 = blocks[:euclidean_phasepoint]; epf = formals(ep0.sig)
     @test :grad_f in epf && :metric in epf && :pos in epf && :mom in epf
-    @test !(:pot_f in epf)                                             # pot_f absent from the signature
-    # AST-based (formatting-robust): find the assignment (pot, dpot_dpos) = grad_f(pos).
+    @test :pot_f in epf                                               # pot_f RESTORED to the signature (authority)
+    # AST-based (formatting-robust): BOTH pot producers present — pot = pot_f(pos) AND (pot,dpot_dpos)=grad_f(pos).
     grad_recipe = Ref(false); pot_f_producer = Ref(false)
     _walk(ep0.body) do x
         x isa Expr || return
@@ -79,12 +80,12 @@ blocks = kernel_blocks()
         end
         x.head === :call && x.args[1] === :pot_f && (pot_f_producer[] = true)
     end
-    @test grad_recipe[]                                              # ONE destination-bound grad recipe (pot+dpot)
-    @test !pot_f_producer[]                                          # no redundant pot-only producer call
+    @test grad_recipe[]                                              # grad_f produces (pot, dpot_dpos)
+    @test pot_f_producer[]                                           # pot_f is the RESTORED alternative pot producer
     # (grad-f32) kinetic 1/2 is typed — bare .5/0.5 would widen a Float32 phase point to Float64.
     epb = srcof(ep0.body)
     @test occursin("oftype(pot, 0.5)", epb) && !occursin("0.5 * (", epb)
-    println("  (grad) euclidean_phasepoint(grad_f, metric, pos, mom): one grad recipe, pot_f absent, typed 1/2. OK")
+    println("  (grad) euclidean_phasepoint(pot_f, grad_f, metric, pos, mom): pot_f + grad_f alternative producers, typed 1/2. OK")
 
     # ---- FORM A: leapfrog! RK @kernel, exact 3-line mom/pos/mom -----------------------------------
     lf = blocks[:leapfrog!]; @test :stepsize in formals(lf.sig)
@@ -211,10 +212,11 @@ blocks = kernel_blocks()
 
     # (B-own) the pinned ownership policy is EXPECTED METADATA (documented, NOT hand-implemented): the
     #         shared authority + the complete owned set are named in the source.
-    for f in ("grad_f", "metric", "chol_metric"); @test occursin(f, SRC); end                # shared (NO pot_f)
-    # pot_f absence is proven on the euclidean_phasepoint signature/body above (not a text scan — comments
-    # legitimately mention "no pot_f"); assert it is not a formal of ANY authored @kernel block.
-    @test all(b -> !(:pot_f in formals(b.sig)), values(blocks))
+    for f in ("pot_f", "grad_f", "metric", "chol_metric"); @test occursin(f, SRC); end        # shared authorities (pot_f RESTORED)
+    # pot_f is a SHARED-BY-IDENTITY authority restored to euclidean_phasepoint ONLY (the alternative pot
+    # producer); it is not a formal of any OTHER authored @kernel block.
+    @test :pot_f in formals(blocks[:euclidean_phasepoint].sig)
+    @test all(b -> b === blocks[:euclidean_phasepoint] || !(:pot_f in formals(b.sig)), values(blocks))
     for f in ("pos", "mom", "dpot_dpos", "dkin_dmom", "dham_dpos", "dham_dmom", "pot", "kin", "ham")
         @test occursin(f, SRC)                                                                # owned
     end
