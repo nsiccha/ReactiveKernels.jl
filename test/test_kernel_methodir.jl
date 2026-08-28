@@ -632,7 +632,8 @@ end
     L = typeof(cholesky([2.0 0.0; 0.0 2.0]).L)
     @test eok(mkeff(Random.randn!), (rng, Vector{Float64}))         # refresh: randn!(rng, mom)
     @test eok(mkeff(LinearAlgebra.lmul!), (L, Vector{Float64}))     # refresh: lmul!(chol, mom); L=LowerTriangular{T,Matrix{T}}
-    @test L <: LinearAlgebra.LowerTriangular && L.parameters[2] <: Matrix   # Cholesky.L backing is a Base Matrix
+    @test L <: LinearAlgebra.LowerTriangular
+    @test RK._kernel_dom_lmul_lhs(L) # accepts the closed Base Matrix/Adjoint-backed representations
     # the ALLOCATION-FREE uplo='U' Cholesky-L view POC emits (RK 13:52, kernel_nuts.jl:54):
     # `adjoint(UpperTriangular(factors))`, which Julia CANONICALIZES to LowerTriangular{T,Adjoint{T,Matrix{T}}}
     # — the lower factor as a lazy re-index of the stored upper triangle's concrete Matrix, never materialized.
