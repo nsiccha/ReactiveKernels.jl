@@ -1,37 +1,53 @@
 # NUTS sampling
 
-ReactiveKernels' No-U-Turn sampler is authored as a **single, method-bearing
-`@kernel` surface** — eight named specifications that together are the whole sampler
-— modeled on the ReactiveHMC.jl algorithm structure. This page shows the **authoring
-source** below, and — now that the compiler is landed — the **measured performance** of
-the compiled sampler.
+ReactiveKernels' No-U-Turn sampler is authored as eight method-bearing `@kernel`
+specifications modeled on ReactiveHMC.jl's algorithm structure. The public
+sampler is compiled, executable, and allocation-free in steady state. This page
+separates that implementation claim from the narrower performance evidence and
+keeps the complete authoring source available without making it the main reading
+flow.
 
 The public `nuts!!` sampler is **landed and executable on `main`**: `@kernel` lowers the
 NUTS source to a sealed, registry-free **native compiled recursion** (`compile_nuts_native`
 / `_build_nuts_sampler`), and the public `nuts!!(state; rng)` mutates compiler-owned state
 in place and returns the **same object** (`result === state`, same concrete type) at
-**exact zero allocations**. The source below is **byte-synced, drift-proof** from the
-reviewed fixture (`benchmark/nuts_kernel_authoring_fixture.jl`), read at build time. The
-measured leapfrog-steps/s comparison against DynamicHMC, AdvancedHMC, and nsiccha/NUTS.jl
-is recorded in the static receipt [`benchmark/receipts/nuts-g7-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/nuts-g7-v1.toml)
-— parsed here, not re-run in CI. No ESS or wall-time result is claimed anywhere on this page.
+**exact zero allocations**. The source below is copied from the reviewed fixture
+and guarded byte-for-byte by `test/test_nuts_docs_fixture.jl`. The checked-in G7
+receipt measures work-normalized leapfrog throughput; it is not an end-to-end
+sampling or ESS benchmark.
 
 ## Status — read this before the code
 
 | Piece | State |
 |---|---|
-| Source contract (the eight `@kernel` specs below, the seven `@rk_*` effect registrations, the plan shape) | **Settled** — this is the reviewed authoring surface on `main`. |
+| Source contract (the eight `@kernel` specs below, the seven `@rk_*` effect registrations, the plan shape) | **Executable current `main`; correction pending.** The fixture currently has one combined `grad_f` producer. The previously removed `pot_f` alternative producer is to be restored with compiler/ownership evidence; until that lands, the source below mirrors current `main` exactly. |
 | All eight source specs construct; concrete phasepoint/frame init/recompute/copy verified | **Landed on `main`** — the compiler constructs and runs the whole sampler; sealed production certificate `mode = production`. |
 | Executable leapfrog (leaf scope) | **Verified** — analytic F32/F64; normal gradient Δ1, `@inferred`, exact 0-B; dirty-produced recovery analytic; dirty-source reject. |
 | Public `nuts!!` sampler (`step!`, tree growth, U-turn) | **Landed on `main`** — sealed registry-free native recursion; `nuts!!(state; rng) === state` (same object, fixed type), **exact 0-B** on the public path. |
-| Performance (work-normalized leapfrog-steps/s) | **Measured** — see [`benchmark/receipts/nuts-g7-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/nuts-g7-v1.toml): RK **beats AdvancedHMC and DynamicHMC** (~1.6–1.7×), and is ~0.86× of nsiccha/NUTS.jl (reported reference), all over ONE shared DifferentiationInterface+Enzyme gradient with matched target/mass/stepsize/RNG. **No** ESS, wall-time, bitwise/RNG oracle claim is made. |
+| End-to-end sampling time and ESS | **Not measured for the current sealed-native path.** The earlier compiled-reactive implementation was about 4–7× slower than AdvancedHMC/DynamicHMC in matched warmup+draw wall time, so the inner-loop result must not be read as a blanket sampler-speed claim. |
+| Work-normalized inner-loop throughput | **Measured, narrow metric** — [`nuts-g7-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/nuts-g7-v1.toml) records 2.27M leapfrog steps/s for RK, 1.33M for AdvancedHMC, 1.42M for DynamicHMC, and 2.65M for nsiccha/NUTS.jl on the frozen AR(1) setup. |
 
 The sealed native compiler (`kernel_nuts_native.jl`, `_build_nuts_sampler`) and the
 minimal-reset authoring fixture are **on `main`**; the public `nuts!!` runs there. The
 performance figures cited on this page come from the static receipt, not a CI perf run.
+RK, AdvancedHMC, and DynamicHMC used one shared DifferentiationInterface+Enzyme
+gradient and matched target, mass, step size, and RNG schedule; the receipt also
+checks the gradient/work accounting. It does **not** measure adaptation, retained
+draws, ESS, or time-to-effective-sample.
 
 The ReactiveHMC.jl `ca9` structure is an **algorithm-structure reference only** — not
 a bitwise or RNG target; improvements may change arithmetic or ordering.
+
+## Reactant and multiple chains
+
+Adaptive NUTS is currently a CPU sampler. Its U-turn/divergence exits, ragged tree
+depth, proposal swaps, and host RNG are data dependent, so they do not trace as a
+static Reactant program. The traceable alternative is the fixed-step HMC kernel in
+[`examples/hmc.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/hmc.jl):
+momentum and the Metropolis uniform are explicit inputs, the leapfrog count is
+static, and `replica` maps that scalar kernel across chains. This is a scoped
+compatibility statement, not a claim that arbitrary mutable or reactive state
+machines are accelerator compatible.
 
 ## The mathematical UX — what you write
 
@@ -39,10 +55,11 @@ The design goal is that the *math is the code*: each `@kernel` reads as the recu
 it implements, and the compiler — not the author — schedules effects, owns storage, and
 invalidates stale values.
 
-- **`euclidean_phasepoint(grad_f, metric, pos, mom)`** — a phasepoint is
+- **`euclidean_phasepoint(grad_f, metric, pos, mom)`** — on current `main`, a phasepoint is
   potential + kinetic energy at `(pos, mom)`. You write the four lines of physics
   directly: one destination-bound gradient recipe produces `pot, dpot_dpos = grad_f(pos)`
-  (there is **no** separate `pot_f` producer), `chol_metric = cholesky(metric)`, the
+  (the pending source-contract correction will restore `pot_f` as an unselected
+  alternative producer), `chol_metric = cholesky(metric)`, the
   kinetic term `kin = ½(logdet(chol_metric) + momᵀ M⁻¹ mom)`, and `ham = pot + kin`.
   The Hamiltonian-gradient fields are **alias projections that collapse onto the
   canonical owned gradient slots** — `dham_dpos` onto `dpot_dpos`, `dham_dmom` onto
@@ -101,6 +118,12 @@ verbatim from the durable fixture
 the drift test `test/test_nuts_docs_fixture.jl` keeps this page byte-identical to that
 fixture, and this page renders live at
 <https://nsiccha.github.io/ReactiveKernels.jl/dev/nuts>.
+
+The fixture's comment preamble preserves its integration-stage provenance, so its
+“docs not sourced” staging line is historical rather than the page's current
+status. The table above is authoritative.
+
+::: details Show the complete byte-synchronized authoring fixture
 
 ```julia
 # ReactiveHMC-STRUCTURE `@kernel` NUTS AUTHORING FIXTURE — FINAL executable-integration surface.
@@ -388,6 +411,8 @@ end
     end
 end
 ```
+
+:::
 
 ## How correctness is established (separately, not as docs content)
 
