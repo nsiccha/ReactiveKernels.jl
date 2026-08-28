@@ -102,7 +102,9 @@ source. Matrix boundaries include a factorization recipe; pre-factorized
 boundaries cut the graph after it.
 
 ```@eval
-Main.ReactiveKernelsDocs.render_mvn_parametrization_plans(mvn_kernels)
+Main.ReactiveKernelsDocs.render_mvn_parametrization_plans(
+    Main.DistributionExamples.MVNORMAL_SOURCE,
+)
 ```
 
 Native tests check all four results against the same `Distributions.MvNormal`

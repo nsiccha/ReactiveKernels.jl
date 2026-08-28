@@ -365,13 +365,18 @@ _markdown_table_cell(value) = Any[string(value)]
 _markdown_table_row(values...) = Any[_markdown_table_cell(value) for value in values]
 
 """
-    render_mvn_parametrization_plans(kernels) -> Markdown.MD
+    render_mvn_parametrization_plans(source) -> Markdown.MD
 
 Render the four plans prepared from the build-executed MVN source. This keeps
 the public HAVE/WANT claim tied to the actual selected boundaries and recipe
 counts rather than a hand-maintained prose list.
 """
-function render_mvn_parametrization_plans(kernels)
+function render_mvn_parametrization_plans(source::AbstractString)
+    sandbox = Module(gensym(:MVNParametrizationPlans), true, true)
+    Core.eval(sandbox, :(using ReactiveKernels))
+    _evaluate_source(sandbox, strip(source, '\n'))
+    artifact = Core.eval(sandbox, :docs_example)
+    kernels = artifact.kernels
     expected = (;
         covariance = ((:x, :μ, :covariance), "Covariance Σ"),
         cholesky = ((:x, :μ, :chol), "Covariance Cholesky L"),
