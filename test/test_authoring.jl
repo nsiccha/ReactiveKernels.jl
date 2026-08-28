@@ -101,6 +101,79 @@ end
         @test @inferred(kernel(f, h, 1.0, 2.0)) == 6.0
         allocated(k, f, h, x, y) = (k(f, h, x, y); @allocated k(f, h, x, y))
 
+        # A short expression body has one public result port named after the
+        # kernel. Construction remains declarative: the RHS is not executed
+        # until the prepared kernel is called.
+        expression_calls = Ref(0)
+        counted_increment(x) = (expression_calls[] += 1; x + 1)
+        @kernel increment(x) = counted_increment(x)
+        @test expression_calls[] == 0
+        @test keys(increment) == (:x, :increment)
+        @test inputs(increment) == (increment.x,)
+        @test outputs(increment) == (increment.increment,)
+        @test Tuple(v.name for v in only(kernel_graph(increment).recipes).inputs) == (:x,)
+        @test @inferred(prepare(increment)(2)) == 3
+        @test expression_calls[] == 1
+
+        @kernel square(x) = x * x
+        @test keys(square) == (:x, :square)
+        @test Tuple(v.name for v in outputs(square)) == (:square,)
+        @test @inferred(prepare(square)(3)) == 9
+        @test prepare(square; want = :x)(4) == 4
+
+        @kernel scaled_result(x, scale = 2) = x * scale
+        @test @inferred(prepare(scaled_result)(3)) == 6
+        @test @inferred(prepare(scaled_result)(3, 4)) == 12
+
+        # A tuple is the value of one result port; it is not confused with a
+        # tuple of graph boundary names as explicit `return (a, b)` is.
+        @kernel pair_result(x) = (x, x + 1)
+        @test Tuple(v.name for v in outputs(pair_result)) == (:pair_result,)
+        @test @inferred(prepare(pair_result)(5)) == (5, 6)
+
+        # Bare results are canonical aliases, including typed inputs: no
+        # identity recipe and no second physical value are introduced.
+        @kernel passthrough(x) = x
+        passthrough_graph = kernel_graph(passthrough)
+        @test keys(passthrough) == (:x, :passthrough)
+        @test isempty(passthrough_graph.recipes)
+        @test ReactiveKernels.canon_id(passthrough_graph, passthrough.x.id) ==
+              ReactiveKernels.canon_id(passthrough_graph, passthrough.passthrough.id)
+        @test @inferred(prepare(passthrough)(11)) == 11
+
+        @kernel typed_passthrough(x::Int) = x
+        typed_passthrough_graph = kernel_graph(typed_passthrough)
+        @test ReactiveKernels.valtype(typed_passthrough.typed_passthrough) === Int
+        @test isempty(typed_passthrough_graph.recipes)
+        @test ReactiveKernels.canon_id(typed_passthrough_graph, typed_passthrough.x.id) ==
+              ReactiveKernels.canon_id(
+                  typed_passthrough_graph, typed_passthrough.typed_passthrough.id,
+              )
+        @test @inferred(prepare(typed_passthrough)(13)) == 13
+
+        @kernel answer() = 42
+        @test inputs(answer) == ()
+        @test Tuple(v.name for v in outputs(answer)) == (:answer,)
+        @test @inferred(prepare(answer)()) == 42
+
+        # Block bodies retain their graph-shaped implicit-sink contract.
+        @kernel block_sinks(x) = begin
+            left = x + 1
+            right = x + 2
+        end
+        @test Tuple(v.name for v in outputs(block_sinks)) == (:left, :right)
+        @test prepare(block_sinks)(1) == (2, 3)
+
+        # Preserve the historical compact one-assignment graph body.
+        @kernel compact_assignment(x) = (compact_out = x + 1)
+        @test keys(compact_assignment) == (:x, :compact_out)
+        @test Tuple(v.name for v in outputs(compact_assignment)) == (:compact_out,)
+        @test @inferred(prepare(compact_assignment)(2)) == 3
+
+        @test_throws ArgumentError macroexpand(@__MODULE__, quote
+            @kernel same_name(same_name) = same_name
+        end)
+
         @kernel typed_model(f::typeof(f), h::typeof(h),
                             x::Float64, y::Float64) = begin
             a::Float64 = f(x, y)
