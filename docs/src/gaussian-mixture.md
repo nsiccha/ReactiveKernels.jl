@@ -45,55 +45,10 @@ exact source that builds and runs the query, **Generated kernel** is
 colored `visualize(density_plan)` component.
 
 ```@eval
-Main.ReactiveKernelsDocs.execute_example(@__MODULE__, raw"""
-@kernel model(unconstrained::UnconstrainedParameters,
-              observations::RealVector,
-              new_point::Real) = begin
-    (μ₁ᵤ::Real, δ::Real, log_σ₁::Real, log_σ₂::Real, logit_θ::Real) =
-        GaussianMixtureExample.split_unconstrained(unconstrained)
-    (μ₁::Real, μ₂::Real) = GaussianMixtureExample.ordered_means(μ₁ᵤ, δ)
-    σ₁::Real = GaussianMixtureExample.exp_scale(log_σ₁)
-    σ₂::Real = GaussianMixtureExample.exp_scale(log_σ₂)
-    θ::Real = GaussianMixtureExample.logistic(logit_θ)
-    parameters::MixtureParameters =
-        GaussianMixtureExample.assemble_parameters(μ₁, μ₂, σ₁, σ₂, θ)
-    log_jacobian::Real =
-        GaussianMixtureExample.log_abs_det_jacobian(δ, log_σ₁, log_σ₂, θ)
-
-    prior::Real = GaussianMixtureExample.log_prior(parameters)
-    pointwise::RealVector = GaussianMixtureExample.pointwise_log_likelihood(
-        parameters, observations,
-    )
-    likelihood::Real = GaussianMixtureExample.sum_log_likelihood(pointwise)
-    density::Real = GaussianMixtureExample.total_log_density(
-        prior, log_jacobian, likelihood,
-    )
-    responsibility::Real = GaussianMixtureExample.component1_responsibility(
-        parameters, new_point,
-    )
-    return density
-end
-
-q = (-3.0, log(6.0), log(0.7), log(0.7), 0.0)
-observations = MIXTURE_OBSERVATIONS
-
-density_kernel = prepare(model;
-    have = (:unconstrained, :observations),
-    want = (:prior, :log_jacobian, :pointwise, :likelihood, :density))
-
-output = density_kernel(q, observations)
-prior, logjac, pointwise, likelihood, density = output
-@assert likelihood ≈ sum(pointwise)
-@assert density ≈ prior + logjac + likelihood
-
-docs_example = (;
-    name = :gaussian_mixture_density,
-    origin = "compact @kernel model (build executed) — posteriordb low_dim_gauss_mix",
-    inputs = (; q, observations),
-    kernel = density_kernel,
-    output,
+Main.ReactiveKernelsDocs.execute_ppl_example(
+    @__MODULE__, :GaussianMixtureExample, :GAUSSIAN_MIXTURE_SOURCE;
+    setup = Main.ReactiveKernelsDocs.setup_gaussian_mixture!,
 )
-"""; setup = Main.ReactiveKernelsDocs.setup_gaussian_mixture!)
 ```
 
 Asking only for constrained parameters selects just the ordered-means transform,

@@ -5,7 +5,10 @@ include(joinpath(@__DIR__, "..", "examples", "poisson_gamma.jl"))
 using .PoissonGammaExample
 
 @testset "manual PPL graph — Poisson-Gamma" begin
-    model = build_poisson_gamma_graph()
+    artifact = evaluate_poisson_gamma_source()
+    @test artifact.source == strip(POISSON_GAMMA_SOURCE, '\n')
+    @test artifact.output == artifact.kernel(Tuple(artifact.inputs)...)
+    model = artifact.model
     log_rate = log(3.5)
 
     @testset "unconstrained -> constrained; Jacobian is optional" begin

@@ -36,6 +36,7 @@ using Test
         include("test_dugongs_example.jl")
         include("test_arma11_example.jl")
         include("test_gaussian_mixture_example.jl")
+        include("test_ppl_docs_source_authority.jl")
         include("test_hmc.jl")
         include("test_reactive_sampler_baseline.jl")
         include("test_reactive_nuts.jl")

@@ -5,7 +5,10 @@ include(joinpath(@__DIR__, "..", "examples", "gaussian_mixture.jl"))
 using .GaussianMixtureExample
 
 @testset "manual PPL graph — Gaussian mixture (marginalization)" begin
-    model = build_gaussian_mixture_graph()
+    artifact = evaluate_gaussian_mixture_source()
+    @test artifact.source == strip(GAUSSIAN_MIXTURE_SOURCE, '\n')
+    @test artifact.output == artifact.kernel(Tuple(artifact.inputs)...)
+    model = artifact.model
     q = (-3.0, log(6.0), log(0.7), log(0.7), 0.0)
 
     @testset "unconstrained -> constrained; Jacobian is optional" begin
