@@ -49,7 +49,6 @@ randbernoullilog(rng, logprob) = logprob > 0 ? true : -randexp(rng) < logprob
 logswapprob(tree) = tree.log_weight[1] - tree.log_weight[2]
 compute_criterion(mom, bwd_dham_dmom, fwd_dham_dmom) =
     (dot(mom, bwd_dham_dmom) > 0 && dot(mom, fwd_dham_dmom) > 0)
-smooth(prev, new, new_weight) = (1 - new_weight) * prev + new_weight * new
 
 # PUBLIC exact-identity effect declarations (973f7f4/bf7d2ed) — the compiler schedules these with visible
 # effects (registered primitives), never by body inference. Authors touch no internals.
@@ -59,7 +58,6 @@ smooth(prev, new, new_weight) = (1 - new_weight) * prev + new_weight * new
 @rk_rng randbernoullilog 2 1
 @rk_pure logswapprob 1
 @rk_pure compute_criterion 3
-@rk_pure smooth 3
 # Built-in RNG/effect primitives used by refresh_momentum!!: Random.randn! (ordered RNG, rng arg 1, writes/
 # result-aliases dest arg 2), LinearAlgebra.lmul! (reads matrix+dest, writes/aliases dest arg 2).
 
@@ -107,7 +105,8 @@ end
 
 # ---- reset/proposal restore via the RK-CORE registered structural strong-update `copy!!(dest, src)`
 # (result === dest): copies the COMPLETE OWNED authoritative closure from src into dest's EXISTING buffers,
-# preserves destination identity/currentness, leaves SHARED authority slots UNTOUCHED, collapses aliased
+# preserves destination object/buffer identity, transfers source currentness, leaves SHARED authority slots
+# UNTOUCHED, collapses aliased
 # projections to ONE physical copy, rejects incompatible shape/type/shared-authority identity.
 #   SHARED-BY-IDENTITY (untouched by copy!!): grad_f, metric, chol_metric + @node(logdet(chol_metric)). A
 #     metric mutation updates the ONE shared authority + its chol/@node closure EXACTLY once.
@@ -119,7 +118,8 @@ end
 # increments the owned n_steps (independent of pgrad + leapfrog body marker) and records running acceptance.
 @kernel nuts_stats!(state) = begin
     state.n_steps += 1
-    state.acceptance_rate = smooth(state.acceptance_rate, min1exp(state.dham), one(state.dham) / state.n_steps)
+    state.acceptance_rate = (one(state.dham) - one(state.dham) / state.n_steps) * state.acceptance_rate +
+                            (one(state.dham) / state.n_steps) * min1exp(state.dham)
     return state
 end
 
@@ -150,16 +150,15 @@ end
         acceptance_rate = zero(init.ham)
         copy!!(fwd, init)                 # registered owned-copy (visible)
         copy!!(bwd, init)
-        for p in proposals; copy!!(p, init); end
-        for t in trees
-            Base.fill!(t.log_weight, oftype(init.ham, -Inf))
-            @. t.bwd.mom = 0
-            @. t.bwd.dham_dmom = 0
-            @. t.bwd_fwd.mom = 0
-            @. t.bwd_fwd.dham_dmom = 0
-            @. t.summed_mom.bwd = 0
-            @. t.summed_mom.fwd = 0
-        end
+        # FAITHFUL RESET: source liveness establishes that the trajectory OVERWRITES every reached tree buffer
+        # and every reached proposal before any read; the committed stale-poison D1–D5 battery verifies the
+        # censused paths in test_kernel_nuts.jl (the eager-vs-minimal perf A/B is measured EXTERNALLY, not
+        # asserted here). Therefore clearing
+        # all trees + copying all proposals each transition is dead, O(max_depth) work. Seed ONLY the live-on-
+        # entry slots: fwd/bwd (start endpoints) and proposals[1]/proposals[end] (the sample fallbacks read when
+        # the sampler takes few/zero steps). trees[1].log_weight is seeded by step! before its first read.
+        copy!!(proposals[1], init)
+        copy!!(proposals[length(proposals)], init)
     end
     collectstats!() = isnothing(stats_f) || stats_f(__self__)
     logadvanceprob(depth) = trees[depth-1].log_weight[1] - trees[depth].log_weight[1]
@@ -272,8 +271,12 @@ end
     step!(x::AbstractVector; dn = one(n)) = begin
         n += dn
         w = dn / n
-        @. var = smooth(var, (x - smooth(mean, x, w)) * (x - mean), w)
-        @. mean = smooth(mean, x, w)
+        # Keep the adaptation recurrence self-contained in the sanctioned Base arithmetic surface.  In
+        # particular this method must not depend on an author-declared effect helper merely to tell the
+        # compiler the helper's arity/result domain: both smoothing operations are the ordinary affine
+        # formula, visible in the captured MethodIR.
+        @. var = (one(w) - w) * var + w * (x - ((one(w) - w) * mean + w * x)) * (x - mean)
+        @. mean = (one(w) - w) * mean + w * x
     end
     step!(x::AbstractMatrix; kwargs...) = for xi in eachcol(x)
         step!(__self__, xi; kwargs...)

@@ -27,6 +27,15 @@ include("planner.jl")
 include("codegen.jl")
 include("graphops.jl")
 include("authoring.jl")
+include("kernel_stateful.jl")
+include("kernel_methodir.jl")
+include("kernel_factory.jl")
+include("kernel_lowering.jl")
+include("kernel_codegen.jl")
+include("kernel_control.jl")
+include("kernel_nuts.jl")
+include("kernel_nuts_native.jl")
+include("kernel_adaptation.jl")
 include("reactive.jl")
 include("stateful.jl")
 include("hmc.jl")
@@ -39,7 +48,8 @@ export value, value!, add!, plan, prepare, prepare_nonallocating, plate
 export lower, lower_batched, transform, compile
 export explain, code_expr, inputs, outputs, valtype
 export compose, PreparationCache, prepare!, canon_id
-export KernelSpec, @kernel, kernel_graph, port
+export KernelSpec, @kernel, @node, kernel_graph, port, copy!!
+export @rk_pure, @rk_borrows, @rk_rng
 export DAGVisualization, visualize, dot_source, save_visualization
 # Reactive layer
 export ReactiveState, set!, get!, freeze!, unfreeze!, checkpoint, materialize!
