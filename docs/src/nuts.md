@@ -2,32 +2,33 @@
 
 ReactiveKernels' No-U-Turn sampler is authored as a **single, method-bearing
 `@kernel` surface** — eight named specifications that together are the whole sampler
-— modeled on the ReactiveHMC.jl algorithm structure. This page shows the **current
-authoring source** so you can read and give feedback on the syntax and the compiler
-contract while the executable lowering is being finished.
+— modeled on the ReactiveHMC.jl algorithm structure. This page shows the **authoring
+source** below, and — now that the compiler is landed — the **measured performance** of
+the compiled sampler.
 
-The source below is **byte-synced, drift-proof, from the reviewed fixture commit
-`ccb35d3`** (`benchmark/nuts_kernel_authoring_fixture.jl`), read at build time. The WIP
-compiler substrate on the `syntax` / `poc` / `hmc` branches already **constructs all
-eight `@kernel`s and executes the phasepoint and the leapfrog leaf**; this
-`docs`/`main` build deliberately renders the **source only**, because the tree/root
-(`nuts!!`) lowering is not yet landed on `main`. So no generated-kernel pane,
-Compute-DAG, parity oracle, allocation number, or throughput figure is shown here —
-those arrive when the tree/root lowering lands.
+The public `nuts!!` sampler is **landed and executable on `main`**: `@kernel` lowers the
+NUTS source to a sealed, registry-free **native compiled recursion** (`compile_nuts_native`
+/ `_build_nuts_sampler`), and the public `nuts!!(state; rng)` mutates compiler-owned state
+in place and returns the **same object** (`result === state`, same concrete type) at
+**exact zero allocations**. The source below is **byte-synced, drift-proof** from the
+reviewed fixture (`benchmark/nuts_kernel_authoring_fixture.jl`), read at build time. The
+measured leapfrog-steps/s comparison against DynamicHMC, AdvancedHMC, and nsiccha/NUTS.jl
+is recorded in the static receipt [`benchmark/receipts/nuts-g7-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/nuts-g7-v1.toml)
+— parsed here, not re-run in CI. No ESS or wall-time result is claimed anywhere on this page.
 
 ## Status — read this before the code
 
 | Piece | State |
 |---|---|
 | Source contract (the eight `@kernel` specs below, the seven `@rk_*` effect registrations, the plan shape) | **Settled** — this is the reviewed authoring surface on `main`. |
-| All eight source specs construct; concrete phasepoint/frame init/recompute/copy verified | **Verified on the WIP `poc`/`hmc` substrate** — executable there; **not** on `docs`/`main`. (DA/Welford runtime construction is a separate receipt, not this one.) |
-| Executable leapfrog (leaf scope) | **Verified** at accepted SHA `6085efd` — real `ccb` source; analytic F32/F64; normal gradient Δ1, `@inferred`, exact 0-B; dirty-produced recovery Δ2 analytic; dirty-source reject. |
-| Tree / root `nuts!!` lowering (`step!`, tree growth, U-turn, adaptation drive) | **In progress** — not yet lowered/landed. |
-| Final acceptance + performance | **Staged; RK arm pending** — the acceptance harness is fully staged/wired and the AHMC / DHMC + analytic arms run; the RK G1–G14 / full perf run awaits the public `nuts!!`. **No** ESS, wall-time, bitwise/RNG oracle, or throughput claim is made anywhere on this page. |
+| All eight source specs construct; concrete phasepoint/frame init/recompute/copy verified | **Landed on `main`** — the compiler constructs and runs the whole sampler; sealed production certificate `mode = production`. |
+| Executable leapfrog (leaf scope) | **Verified** — analytic F32/F64; normal gradient Δ1, `@inferred`, exact 0-B; dirty-produced recovery analytic; dirty-source reject. |
+| Public `nuts!!` sampler (`step!`, tree growth, U-turn) | **Landed on `main`** — sealed registry-free native recursion; `nuts!!(state; rng) === state` (same object, fixed type), **exact 0-B** on the public path. |
+| Performance (work-normalized leapfrog-steps/s) | **Measured** — see [`benchmark/receipts/nuts-g7-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/nuts-g7-v1.toml): RK **beats AdvancedHMC and DynamicHMC** (~1.6–1.7×), and is ~0.86× of nsiccha/NUTS.jl (reported reference), all over ONE shared DifferentiationInterface+Enzyme gradient with matched target/mass/stepsize/RNG. **No** ESS, wall-time, bitwise/RNG oracle claim is made. |
 
-The verified construction/phasepoint/leaf results above live on the WIP `poc`/`hmc`
-branches; those compiler commits are **not** on `main`. The `main` docs build carries
-the **source contract only**.
+The sealed native compiler (`kernel_nuts_native.jl`, `_build_nuts_sampler`) and the
+minimal-reset authoring fixture are **on `main`**; the public `nuts!!` runs there. The
+performance figures cited on this page come from the static receipt, not a CI perf run.
 
 The ReactiveHMC.jl `ca9` structure is an **algorithm-structure reference only** — not
 a bitwise or RNG target; improvements may change arithmetic or ordering.
@@ -56,9 +57,8 @@ invalidates stale values.
   update.
 - **`nuts_stats!(state)`** — a registered diagnostics callback over compiler-owned
   state: it increments the owned `n_steps` once per leaf and folds the running
-  acceptance rate, independent of the gradient and the integrator body. It is not
-  executable yet — only its registration, storage, and binding are being built;
-  zero-allocation execution is the locked target, not a delivered result.
+  acceptance rate, independent of the gradient and the integrator body. It runs on the
+  sealed sampler at zero allocations.
 - **`nuts_state(init; step_f, …)`** — the sampler state, authored **implicit-field**
   with **no `Ref`**: explicit fixed physical `init` / `fwd` / `bwd` endpoints, the
   derived `diverged` recipe written once (never imperatively), and the tree-growth /
@@ -70,21 +70,18 @@ invalidates stale values.
   dual averaging (`m`/`H`/`μ` + `fit!(x)`) and streaming Welford variance
   (`n`/`mean`/`var` + `step!(x)`), each written as its update rule.
 
-## The locked compiler/lowering contract and acceptance target
+## The locked compiler/lowering contract
 
-These are the properties the `@kernel` lowering is **locked to** and the public
-`nuts!!` entry is being **accepted against** — the leaf-scope pieces are verified today
-(see the status table); the whole-`nuts!!` guarantees are the acceptance target until
-the tree/root lowering passes.
+These are the properties the `@kernel` lowering is **locked to** and the landed public
+`nuts!!` entry **satisfies** (see the status table).
 
 - **Captured source, exact effect registrations.** The compiler schedules the public
   `@rk_pure` / `@rk_borrows` / `@rk_rng` helpers by their *registered* effects, never by
   inferring the body. Authors touch no internals.
 - **Immutable plan.** Construction produces a fixed-shape, fixed-type plan; the public
-  entry mutates compiler-owned concrete state and returns the same object. Today the
-  **leaf** returns its *owned endpoint* and is exact 0-B (verified, SHA `6085efd`); the
-  full **public identity** — `nuts!!` returning `result === state` at exact 0-B — remains
-  the acceptance target, pending the tree/root lowering.
+  entry mutates compiler-owned concrete state and returns the same object. The public
+  identity holds: `nuts!!(state; rng)` returns `result === state` (same object, fixed
+  concrete type) at **exact 0-B** — verified on the sealed native sampler.
 - **Owned endpoints vs shared authority.** Read-only authority inputs (`grad_f`,
   `metric`, the metric-only `chol_metric` closure and the `@node(logdet(chol_metric))`
   value) are **shared by identity** across `init` / `fwd` / `bwd`; the integrator-written
@@ -95,14 +92,13 @@ the tree/root lowering passes.
 - **No `Ref`.** State is implicit-field; direction is concrete branch calls threading a
   physical endpoint, so there is no aliasing indirection to reason about.
 
-## The authoring source (synced from `ccb35d3`, source-only)
+## The authoring source
 
-The block below is the exact reviewed source, read drift-proof at build time. It is the
-authoring *target* for the in-progress tree/root lowering — **not** an executable
-sampler on this build, and it carries no parity, allocation, or performance claim. The
-durable, inspectable copy on `main` is
-[`benchmark/nuts_kernel_authoring_fixture.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/nuts_kernel_authoring_fixture.jl)
-(provenance: reviewed fixture commit `ccb35d3`); this page renders live at
+The block below is the exact reviewed source, read drift-proof at build time — the
+authoring surface that `@kernel` lowers to the sealed native sampler now on `main`. The
+durable, inspectable copy is
+[`benchmark/nuts_kernel_authoring_fixture.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/nuts_kernel_authoring_fixture.jl);
+this page renders live at
 <https://nsiccha.github.io/ReactiveKernels.jl/dev/nuts>.
 
 ```@eval
