@@ -184,6 +184,31 @@ function _kernel_add!(graph::Graph, ins, outs, op, cost, cse_key, effectful)
          cost = cost, cse_key = cse_key, effectful = effectful)
 end
 
+# A SINGLE-DEFINITION bare-identity recipe `b = a` (RHS a bare port, not a call) makes `b` a
+# CANONICAL ALIAS of `a` (RK 2026-08-27): both authored names resolve to ONE canonical Value —
+# one physical slot, one shared validity/currentness — instead of a distinct Value joined by an
+# opaque identity Recipe. Both authored names stay in `ports`/`port_order` for reporting.
+#
+# SOUNDNESS: it merges canonical CLASSES (`src=canon_id(from)`, `dst=canon_id(to)`) and is a
+# NO-OP when they already coincide, so a reverse/transitive `a=b; b=a` cannot build a cycle or
+# reparent incorrectly. It collapses ONLY a PROVEN same-declared-type identity; a typed
+# conversion (`b::T = a::U`, T≠U) is uncertain, so the ordinary identity Recipe is kept instead.
+# The caller hard-aliases only outputs with EXACTLY ONE authored definition (`b=a; b=c` are
+# alternative producers, not a proof `a===c`).
+function _kernel_alias!(graph::Graph, from::Value, to::Value, op, cost)
+    src = canon_id(graph, from.id)
+    dst = canon_id(graph, to.id)
+    src == dst && return graph                       # already one class (reverse/transitive)
+    if valtype(from) == valtype(to)                  # proven same-type identity → collapse
+        graph.aliases[src] = dst
+        graph.version += 1                           # a real canonical mutation (like CSE/merge)
+    else                                             # typed conversion → keep the ordinary recipe
+        add!(graph; inputs = (to,), outputs = (from,), op = op,
+             cost = cost, cse_key = nothing, effectful = false)
+    end
+    graph
+end
+
 # --- macro parsing ---------------------------------------------------------
 
 _kernel_is_line(ex) = ex isa LineNumberNode
@@ -880,6 +905,7 @@ function _is_broadcast_operator(sym::Symbol)
 end
 
 function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol})
+    form = :fused
     if rhs isa Expr && rhs.head === :call && !isempty(rhs.args)
         callee = rhs.args[1]
         args = rhs.args[2:end]
@@ -887,14 +913,117 @@ function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol})
         if callee isa Symbol && !callee_is_port && !_is_broadcast_operator(callee) &&
            length(args) == length(deps) &&
            all(i -> args[i] === deps[i], eachindex(args))
-            return callee
+            return callee                                   # BARE exact identity — stays raw (validated)
         end
+        # a call THROUGH A PORT — `callable(args…)` where the callee itself is a port (RK 07:24): the
+        # first dep is the callable source, the rest are ordered args. Tagged `:portcall` so a prepared
+        # handle self-derives the destination contract from source shape + typed slots.
+        callee_is_port && !isempty(deps) && deps[1] === callee && (form = :portcall)
     end
-    Expr(:->, Expr(:tuple, deps...), rhs)
+    # A recipe operation synthesized from captured @kernel source, wrapped as COMPILER-OWNED provenance
+    # with a definition-unique gensym token (RK 07:21) + its Form, so a prepared handle distinguishes it
+    # from a manually-inserted raw (opaque) closure without IR inspection. Call forwards inline.
+    deftoken = gensym(:rk_srcop)
+    Expr(:call, GlobalRef(@__MODULE__, :_KernelSourceOp),
+         Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
+         Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)),
+         Expr(:->, Expr(:tuple, deps...), rhs))
+end
+
+# `@node(expr)` recipe-node promotion, used by `_kernel_expand`. Kept HERE (ahead of
+# `_kernel_expand`, not in kernel_stateful.jl) because authoring.jl loads first and a
+# `@doc`-embedded `@kernel` expands at load time — a forward ref would be undefined.
+
+# Is a macrocall head NAMED `@node` (bare or module-qualified)? A SYNTACTIC CANDIDATE
+# only — identity (the genuine RK `@node` binding vs a foreign `Evil.@node`) is
+# confirmed via `_kernel_resolve_binding`.
+_kernel_is_node_macro(m) =
+    m === Symbol("@node") ||
+    (m isa Expr && m.head === :(.) && length(m.args) >= 2 &&
+        m.args[2] == QuoteNode(Symbol("@node")))
+
+# Any `@node(...)` CANDIDATE (by name) anywhere in `x`?
+_kernel_has_node_marker(x) =
+    x isa Expr && (
+        (x.head === :macrocall && !isempty(x.args) && _kernel_is_node_macro(x.args[1])) ||
+        any(_kernel_has_node_marker, x.args))
+
+# Resolve a callee/macro-head AST (bare `name` or `Mod.name`) to its BINDING VALUE in
+# `mod`, or `nothing`. Reads bindings only (no call eval) — inside the compiler boundary.
+function _kernel_resolve_binding(mod::Module, callee)
+    if callee isa Symbol
+        isdefined(mod, callee) ? getglobal(mod, callee) : nothing
+    elseif callee isa Expr && callee.head === :(.) && length(callee.args) == 2 &&
+           callee.args[1] isa Symbol && callee.args[2] isa QuoteNode
+        outer = callee.args[1]
+        isdefined(mod, outer) || return nothing
+        outerval = getglobal(mod, outer)
+        outerval isa Module || return nothing
+        inner = callee.args[2].value
+        isdefined(outerval, inner) ? getglobal(outerval, inner) : nothing
+    else
+        nothing
+    end
+end
+
+# Heads under which lifting an `@node` OUT would change semantics: either CONTROL-
+# DEPENDENT (branch/loop — the node would become unconditional in the static graph) or
+# a DEFERRED/LEXICAL scope (lambda/function/do/let/quote — the node would escape a local
+# binding it references, an accidental capture). A genuine `@node` beneath any of these
+# is rejected, never silently hoisted. (Syntactic only — no Julia IR inference.)
+_kernel_is_nonstraight_head(h) =
+    h in (:if, :(&&), :(||), :for, :while, :comprehension, :generator, :try,
+          :(->), :function, :do, :let, :quote)
+
+# Promote every GENUINE RK `@node(expr)` in a recipe block into a distinct hygienic
+# recipe node (a `gensym`ed name, collision-free with any authored port), prepended in
+# authored order, replacing each occurrence with its node name. Three soundness rules
+# (RK 2026-08-26): (a) IDENTITY-AWARE — a foreign `@node` (e.g. `Evil.@node`) sharing
+# only the name is NOT promoted, it is left to expand as its own macro; (b) COLLISION-
+# FREE — the generated name is a `gensym`, so it cannot alias an authored port; (c) a
+# genuine `@node` in a NON-straight-line (branch/loop) context is REJECTED rather than
+# silently made unconditional. Returns the SAME block object (byte-identical) when
+# nothing is promoted. `mod === nothing` (no definition module) never promotes.
+function _kernel_lift_nodes(block, mod)
+    (block isa Expr && block.head === :block) || return block
+    _kernel_has_node_marker(block) || return block
+    lifted = Any[]
+    promoted = Ref(0)
+    is_rk_node = head -> mod isa Module && _kernel_resolve_binding(mod, head) === var"@node"
+    local rewrite
+    rewrite = function (x, straight::Bool)
+        x isa Expr || return x
+        if x.head === :macrocall && !isempty(x.args) && _kernel_is_node_macro(x.args[1])
+            if is_rk_node(x.args[1])
+                straight || throw(ArgumentError(
+                    "@node is only valid in a straight-line recipe context — not beneath a " *
+                    "branch/loop (?:/if/&&/||/for/while/try) or a deferred/lexical scope " *
+                    "(->/function/do/let/quote), whose local bindings a hoisted node would " *
+                    "escape. Increment 1 rejects it rather than silently changing semantics."))
+                inner = rewrite(x.args[end], straight)      # nested @node promoted first
+                nm = gensym(:node)
+                push!(lifted, Expr(:(=), nm, inner))
+                promoted[] += 1
+                return nm
+            else
+                # a foreign `@node` by name only — leave it for its own macro to expand.
+                return Expr(x.head, Any[rewrite(a, straight) for a in x.args]...)
+            end
+        end
+        sub = _kernel_is_nonstraight_head(x.head) ? false : straight
+        Expr(x.head, Any[rewrite(a, sub) for a in x.args]...)
+    end
+    new_stmts = Any[rewrite(s, true) for s in block.args]
+    promoted[] == 0 && return block            # nothing genuine promoted ⇒ unchanged
+    Expr(:block, vcat(lifted, new_stmts)...)
 end
 
 function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
-                        call_signature = nothing)
+                        call_signature = nothing, mod::Union{Module,Nothing} = nothing)
+    # Promote genuine RK `@node(expr)` markers into distinct schedulable recipe nodes
+    # (identity-aware, collision-free, straight-line-only). A no-op — byte-identical —
+    # for bodies with no `@node` (or only foreign `@node`).
+    block = _kernel_lift_nodes(block, mod)
     statements = block isa Expr && block.head === :block ? block.args : Any[block]
     graph_var = gensym(:kernel_graph)
     ports_var = gensym(:kernel_ports)
@@ -912,6 +1041,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     declare_ref = GlobalRef(@__MODULE__, :_kernel_declare!)
     push_unique_ref = GlobalRef(@__MODULE__, :_kernel_push_unique!)
     add_ref = GlobalRef(@__MODULE__, :_kernel_add!)
+    alias_ref = GlobalRef(@__MODULE__, :_kernel_alias!)
     spec_ref = GlobalRef(@__MODULE__, :KernelSpec)
     graph_ref = GlobalRef(@__MODULE__, :Graph)
     value_ref = GlobalRef(@__MODULE__, :Value)
@@ -1012,12 +1142,38 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         push!(prelude, :($push_unique_ref($have_var, $(QuoteNode(name)))))
     end
 
+    # Count authored recipe DEFINITIONS per output name — only a SINGLE-definition output may be
+    # hard-aliased (`b=a; b=c` are alternative producers of `b`, never a proof `a===c`).
+    def_count = Dict{Symbol,Int}()
+    for entry in entries
+        entry[1] === :recipe || continue
+        for (name, _) in entry[2]
+            def_count[name] = get(def_count, name, 0) + 1
+        end
+    end
+
     body = Any[]
     consumed_names = Set{Symbol}()
     produced_names = Symbol[]
     for entry in entries
         entry[1] === :recipe || continue
         _, outputs, authored_rhs, metadata = entry
+        # ALIAS-AT-EXPANSION (RK 2026-08-27): a bare-identity `b = a` — single output, RHS a bare
+        # DECLARED port (`known` is the full predeclared port namespace, forward refs included),
+        # not `b` itself, no `@recipe` metadata, and `b` has exactly ONE authored definition — is
+        # emitted as a canonical alias (proven same-type; typed conversions keep their recipe).
+        # No identity recipe is emitted for the collapsed pair; both labels stay for reporting.
+        if length(outputs) == 1 && authored_rhs isa Symbol && authored_rhs in known &&
+           authored_rhs != outputs[1][1] && isempty(metadata) &&
+           def_count[outputs[1][1]] == 1
+            op = _kernel_operation(authored_rhs, Symbol[authored_rhs], known)
+            cost = 1.0
+            push!(body, :($alias_ref($graph_var, $(port_vars[outputs[1][1]]),
+                                     $(port_vars[authored_rhs]), $op, $cost)))
+            _kernel_push_unique!(produced_names, outputs[1][1])
+            push!(consumed_names, authored_rhs)
+            continue
+        end
         rhs = _kernel_hygienic_catches(authored_rhs, known)
         deps = _kernel_free_ports(rhs, known)
         union!(consumed_names, deps)
@@ -1131,16 +1287,21 @@ function _kernel_named_signature(signature)
         (argument.name, argument.type_expr)
         for argument in (positional..., keywords...)
     ]
-    name, inputs, _kernel_call_signature_expr(positional, keywords)
+    # The first positional name is the Mode-2 subject candidate (a body mutating its
+    # fields selects the free-method path); keywords are never the subject.
+    positional_names = Tuple(argument.name for argument in positional)
+    name, inputs, _kernel_call_signature_expr(positional, keywords), positional_names
 end
 
 function _kernel_definition_parts(ex::Expr)
+    # Returns (name, inputs, call_signature, positional_names, raw_signature, block).
+    # `raw_signature` = `ex.args[1]` — the FULL authored signature AST (Mode-2 retains it).
     if ex.head === :(=) && length(ex.args) == 2
         named = _kernel_named_signature(ex.args[1])
-        named === nothing || return (named..., ex.args[2])
+        named === nothing || return (named..., ex.args[1], ex.args[2])
     elseif ex.head === :function && length(ex.args) == 2
         named = _kernel_named_signature(ex.args[1])
-        named === nothing || return (named..., ex.args[2])
+        named === nothing || return (named..., ex.args[1], ex.args[2])
     end
     nothing
 end
@@ -1199,29 +1360,44 @@ All recipe bodies resolve and capture names in the caller's scope. The macro
 only constructs closures and graph metadata; recipe bodies run only when a
 prepared kernel is invoked.
 
-A recipe RHS may contain arbitrary Julia, including control-flow and scoping
-forms — `try`/`catch`/`finally`, `let`, comprehensions, and `do` blocks. Each
-recipe is compiled into an opaque ordinary-Julia operation closed over its free
-ports, so these forms simply run as ordinary Julia inside that operation; there
-is no reactive invalidation to track through them, which is why they are safe
-here. Free-port detection flows through them, so a port referenced only inside a
-`try`, `let`, or comprehension is still discovered as a recipe dependency. A
-`catch` variable that collides with a port name is renamed hygienically, so the
-exception binding never shadows a port. This differs from an invalidation-tracked
-reactive method body, where deferred or exception-conditional execution would
-defeat field-level invalidation and such forms are therefore rejected — the
-opaque-operation model is exactly what lets `@kernel` admit them.
-
-`@kernel` authors a graph, not a new object type. Inline method definitions and
-ReactiveObjects-style `__self__` rewriting are not part of this macro. Stateful
-mutation is provided separately by [`prepare_reactive`](@ref), [`set!`](@ref),
-[`mutate!`](@ref), and [`touch!`](@ref).
+`@kernel` supports three authoring modes, discriminated by the body. A methodless
+recipe body authors a stateless graph `KernelSpec` — this docstring's primary form,
+byte-identical to earlier releases. A body with nested method definitions authors a
+stateful OBJECT kernel with an IMPLICIT synthesized receiver: nested methods declare
+no `self`/`__self__` formal, bare unshadowed names are the owner's fields, and
+`__self__` appears only as a sibling object-pass actual (`flip!(__self__, depth)`). A
+methodless body that mutates a field of its first positional subject — or ANY `!!`
+name (a strong same-object update) — authors a free METHOD (e.g.
+`leapfrog!(phasepoint; stepsize)`, `nuts!!(state; rng)`). Reactive mutation of a
+compiled stateless kernel remains available through [`prepare_reactive`](@ref),
+[`set!`](@ref), [`mutate!`](@ref), and [`touch!`](@ref).
 """
 macro kernel(ex)
     definition = ex isa Expr ? _kernel_definition_parts(ex) : nothing
-    definition === nothing && return esc(_kernel_expand(ex))
-    name, inputs, call_signature, block = definition
-    esc(Expr(:(=), name, _kernel_expand(block, inputs, call_signature)))
+    definition === nothing &&
+        return esc(_kernel_expand(ex, Tuple{Symbol,Any}[], nothing, __module__))
+    name, inputs, call_signature, positional_names, raw_signature, block = definition
+    # Discriminator (V7): nested methods ⇒ Mode-1 object kernel; else a methodless
+    # body that MUTATES a field of the FIRST positional subject ⇒ Mode-2 free method
+    # (independent of `!` spelling); else the byte-identical stateless expansion.
+    _kernel_body_has_methods(block) &&
+        return _kernel_stateful_expand(name, inputs, call_signature, block, __module__)
+    # `!!` is an EXPLICIT strong same-object update registration (locked Form C): it
+    # routes Mode-2 regardless of whether the mutation is direct or through a
+    # registered/delegated call (`nuts!!(state; rng) = begin step!(state, rng); state end`).
+    if _kernel_is_bangbang_name(name)
+        isempty(positional_names) && throw(ArgumentError(
+            "stateful @kernel `$name` (`!!` strong same-object update) needs a first " *
+            "positional subject to update in place"))
+        return _kernel_mode2_expand(name, inputs, call_signature, block,
+                                    positional_names[1], raw_signature, __module__)
+    end
+    if !isempty(positional_names) &&
+       _kernel_body_mutates_subject(block, positional_names[1])
+        return _kernel_mode2_expand(name, inputs, call_signature, block,
+                                    positional_names[1], raw_signature, __module__)
+    end
+    esc(Expr(:(=), name, _kernel_expand(block, inputs, call_signature, __module__)))
 end
 
 # --- named boundaries ------------------------------------------------------
@@ -1287,29 +1463,6 @@ function prepare_nonallocating(spec::KernelSpec;
         passes = passes)
     have === _KERNEL_DEFAULT_BOUNDARY || return prepared
     _kernel_signature_callable(prepared, spec.call_signature)
-end
-
-"""
-    plate(spec::KernelSpec; have, want, batched, reduce = :+) -> PreparedKernel
-
-Prepare a batched, loop-invariant-hoisting kernel from a scalar `@kernel` spec.
-The `batched` HAVE ports (a name or a collection of names) are passed as arrays
-and iterated element-wise; every recipe that depends only on the shared (scalar)
-ports is computed ONCE, hoisted above the loop; and the single scalar `want` is
-reduced over the batch (default a sum). Pass `reduce=nothing` to instead return
-the per-observation VECTOR of the want (for LOO/WAIC), still hoisting the shared
-work and materializing only that vector. This is how ReactiveKernels generates a
-Stan-parity vectorized log density that does no repeated work — e.g. `σ =
-exp(logσ)` / `log(σ)` is computed once, not per observation — in one fused pass
-that materializes no per-element vector. See [`lower_batched`](@ref).
-
-The scalar `spec` is authored per-element (one observation); `plate` is what
-turns it into the vectorized kernel. Restricted to single-output recipes and a
-single scalar `want` that itself depends on a batched port.
-"""
-function plate(spec::KernelSpec; have, want, batched, reduce = :+)
-    p = plan(spec; have = have, want = want)
-    _prepare(p, lower_batched(p; batched = batched, reduce = reduce))
 end
 
 inputs(spec::KernelSpec) = _kernel_selection(
