@@ -12,7 +12,7 @@ The word *compiler* is used here for three related but different pipelines:
 2. the public reactive compiler, which fixes the same selected graph into typed
    slots, validity bits, dependency closures, and generated lazy getters; and
 3. the source-captured state-machine compiler, which analyzes method-bearing
-   `@kernel` definitions using explicit effect registrations. Its most complete
+   `@kernel` definitions using captured and validated effect metadata. Its most complete
    consumer is the sealed native NUTS acceptance artifact.
 
 Those surfaces share graph identities, producer selection, and currentness
@@ -410,17 +410,23 @@ lowering must resolve it or reject it.
 ### Effects, ownership, and physical storage
 
 Calls are authorized by exact identity, not by spelling. Built-in compiler
-descriptors and public `@rk_pure`, `@rk_borrows`, and `@rk_rng` declarations
-describe arity, reads, writes, result aliasing/borrowing, and RNG position. A
-declaration is an author-trusted contract. Undeclared calls are not made pure
-because they have an operator-like name or receive an argument named `rng`.
+descriptors describe arity, reads, writes, result aliasing/borrowing, and RNG
+position. The currently exported `@rk_pure`, `@rk_borrows`, and `@rk_rng`
+declarations are transitional and removal-bound compatibility for external
+fixtures, not the definitive authoring surface or a recommended public API.
+While that compatibility path exists, each declaration is an author-trusted
+contract; its replacement is ordinary visible arithmetic/control or a captured
+sibling `@kernel` method. Undeclared ordinary helpers remain unsupported and are
+not made pure because they have an operator-like name or receive an argument
+named `rng`. `@node` is unrelated to this removal boundary and remains part of
+graph authoring.
 
 For compiler-known primitives, the implementation also checks the concrete
 specialization domain. Sanctioned Base numeric scalars, dense arrays, and the
 specific linear-algebra wrappers required by the compiled kernels are
 accepted. A user subtype that dispatches a custom overload through the same
-generic function is rejected unless it carries an explicit trusted
-declaration. This prevents generic-function identity from smuggling unknown
+generic function is rejected unless it is admitted by an exact, validated
+compiler rule. This prevents generic-function identity from smuggling unknown
 effects into compiled code.
 
 The factory computes an interprocedural ownership fixed point over direct
