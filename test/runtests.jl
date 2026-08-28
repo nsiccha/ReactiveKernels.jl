@@ -10,6 +10,7 @@ using Test
         include("test_stateless.jl")
         include("test_authoring.jl")
         include("test_plate.jl")
+        include("test_replica.jl")
         include("test_kernel_stateful.jl")
         include("test_kernel_methodir.jl")
         include("test_kernel_factory.jl")

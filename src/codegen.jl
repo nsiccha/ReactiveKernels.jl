@@ -219,6 +219,78 @@ function lower_batched(p::Plan; batched, reduce = :+)
     Expr(:function, Expr(:tuple, argexprs...), body)
 end
 
+# Reactant deliberately rejects scalar indexing of traced arrays.  Keep the
+# ordinary loop lowering above as the native hot path, and compile this eager
+# tensor lowering alongside it for array-tracing backends.  Each dependent
+# recipe is materialized before the next one consumes it; Reactant sees those
+# broadcasts and the final reduction as tensor operations and can fuse them in
+# the compiled program.  This body is never selected for ordinary Julia arrays,
+# so the native exact-zero-allocation reducing contract is unchanged.
+function _lower_batched_tensorized(p::Plan; batched, reduce = :+)
+    g = p.graph
+    length(p.want) == 1 || throw(ArgumentError(
+        "lower_batched requires a single scalar want; got $(length(p.want))"))
+    for r in p.recipes
+        length(r.outputs) == 1 || throw(ArgumentError(
+            "lower_batched requires single-output recipes; recipe $(r.id) has $(length(r.outputs)) outputs"))
+    end
+    batched_names = Set{Symbol}(batched isa Symbol ? (batched,) : batched)
+    names = _varnames(p)
+    nm(v) = names[canon_id(g, v.id)]
+
+    batched_input_ids = Set{Int}()
+    for v in p.have
+        v.name in batched_names && push!(batched_input_ids, canon_id(g, v.id))
+    end
+    isempty(batched_input_ids) && throw(ArgumentError(
+        "lower_batched: none of the have ports are batched (batched = $(sort(collect(batched_names))))"))
+
+    batched_vals = Set{Int}(batched_input_ids)
+    recipe_is_batched = falses(length(p.recipes))
+    for (k, r) in enumerate(p.recipes)
+        dependent = any(canon_id(g, inp.id) in batched_vals for inp in r.inputs)
+        recipe_is_batched[k] = dependent
+        dependent && for output in r.outputs
+            push!(batched_vals, canon_id(g, output.id))
+        end
+    end
+
+    want = only(p.want)
+    canon_id(g, want.id) in batched_vals || throw(ArgumentError(
+        "lower_batched: want :$(want.name) is loop-invariant (does not depend on a batched port); nothing to vectorize"))
+
+    argexprs = Any[_OPS_ARG]
+    for v in p.have
+        push!(argexprs, canon_id(g, v.id) in batched_input_ids ?
+              nm(v) : :($(nm(v))::$(valtype(v))))
+    end
+
+    body = Expr(:block)
+    assigned = Set(canon_id(g, v.id) for v in p.have)
+    for (k, r) in enumerate(p.recipes)
+        out = only(r.outputs)
+        cid = canon_id(g, out.id)
+        cid in assigned && continue
+        push!(assigned, cid)
+        op = Expr(:ref, _OPS_ARG, k)
+        args = Any[nm(inp) for inp in r.inputs]
+        call = recipe_is_batched[k] ?
+               Expr(:call, GlobalRef(Base, :broadcast), op, args...) :
+               Expr(:call, op, args...)
+        push!(body.args, Expr(:(=), nm(out), call))
+    end
+
+    retval = if reduce === nothing
+        nm(want)
+    elseif reduce === :+
+        Expr(:call, GlobalRef(Base, :sum), nm(want))
+    else
+        Expr(:call, GlobalRef(Base, :reduce), reduce, nm(want))
+    end
+    push!(body.args, Expr(:return, retval))
+    Expr(:function, Expr(:tuple, argexprs...), body)
+end
+
 """
     transform(ast, passes...) -> Expr
 
@@ -236,6 +308,23 @@ Compile a lowered `Expr` into a native Julia function via
 """
 compile(ast::Expr) = @RuntimeGeneratedFunction(ast)
 
+# A plated kernel owns two compiled bodies but presents exactly the same
+# PreparedKernel API as every scalar kernel.  The batched input position is a
+# type parameter so choosing the native body remains inferred and allocation
+# free.  Optional backend extensions specialize `_batched_call` on their traced
+# array marker; ordinary arrays always take `native`.
+struct _BatchedFunctionPair{I,N,T}
+    native::N
+    tensorized::T
+end
+
+@inline function (f::_BatchedFunctionPair{I})(ops, args...) where {I}
+    _batched_call(f, ops, args, getfield(args, I))
+end
+
+@inline _batched_call(f::_BatchedFunctionPair, ops, args, marker) =
+    f.native(ops, args...)
+
 """
     PreparedKernel
 
@@ -252,6 +341,140 @@ struct PreparedKernel{F,O,IN,OUT}
     ast::Expr
 end
 
+"""
+    ReplicatedKernel
+
+A callable produced by [`replica`](@ref). It preserves a scalar prepared
+kernel as the single source of truth and maps that complete callable over a
+trailing replica axis on selected HAVE ports.
+"""
+struct ReplicatedKernel{B,BT,OT,K,IN,OUT}
+    target::K
+    inputs::IN
+    outputs::OUT
+end
+
+@inline function (k::ReplicatedKernel{B})(args...) where {B}
+    length(args) == length(k.inputs) || throw(MethodError(k, args))
+    _replica_call(k, args, getfield(args, first(B)))
+end
+
+inputs(k::ReplicatedKernel) = k.inputs
+outputs(k::ReplicatedKernel) = k.outputs
+code_expr(k::ReplicatedKernel) = code_expr(k.target)
+
+function Base.show(io::IO, k::ReplicatedKernel{B}) where {B}
+    names = Tuple(k.inputs[i].name for i in B)
+    print(io, "ReplicatedKernel(batched=", names, ", target=")
+    show(io, k.target)
+    print(io, ")")
+end
+
+_replica_rank(::Type{T}) where {T<:Number} = 0
+_replica_rank(::Type{T}) where {T<:AbstractArray} = ndims(T)
+_replica_rank(::Type{T}) where {T} = throw(ArgumentError(
+    "replica batched ports must be Numbers or AbstractArrays; got $T"))
+
+function _replica(target, batched)
+    boundary = inputs(target)
+    names = Tuple(batched isa Symbol ? (batched,) : batched)
+    isempty(names) && throw(ArgumentError("replica requires at least one batched port"))
+    length(unique(names)) == length(names) || throw(ArgumentError(
+        "replica batched port names must be unique; got $(names)"))
+    all(name -> name isa Symbol, names) || throw(ArgumentError(
+        "replica batched ports must be Symbols; got $(names)"))
+
+    indices = map(names) do name
+        index = findfirst(value -> value.name === name, boundary)
+        index === nothing && throw(ArgumentError(
+            "replica batched port :$name is not in the prepared HAVE boundary"))
+        index
+    end
+    indices = Tuple(sort(collect(indices)))
+    input_types = Tuple{(valtype(boundary[i]) for i in indices)...}
+    foreach(_replica_rank, input_types.parameters)
+    output_types = Tuple{(valtype(value) for value in outputs(target))...}
+    all(type -> type <: Union{Number,AbstractArray}, output_types.parameters) ||
+        throw(ArgumentError(
+            "replica outputs must be Numbers or AbstractArrays; got $(output_types.parameters)"))
+    ReplicatedKernel{indices,input_types,output_types,typeof(target),
+                     typeof(boundary),typeof(outputs(target))}(
+        target, boundary, outputs(target))
+end
+
+"""
+    replica(kernel::PreparedKernel; batched) -> ReplicatedKernel
+
+Lift a complete scalar prepared kernel over a trailing replica axis. `batched`
+names the HAVE ports that receive that extra final dimension. Scalar batched
+ports therefore become vectors, vectors become matrices, and so on; shared
+ports retain their scalar-kernel shapes. Outputs receive the same trailing
+replica axis.
+
+The scalar kernel remains the only mathematical definition. In particular,
+reductions inside it still reduce only their original dimensions, so a scalar
+`dot(q, q)` becomes one dot product per replica rather than a reduction across
+replicas. Native Julia evaluates scalar replicas and stacks their results;
+optional array-compiler extensions may lower the same map to a backend batch
+primitive.
+"""
+replica(kernel::PreparedKernel; batched) = _replica(kernel, batched)
+
+@inline _replica_native_arg(arg, ::Type{T}, replica_index) where {T<:Number} =
+    arg[replica_index]
+@inline _replica_native_arg(arg, ::Type{T}, replica_index) where {T<:AbstractArray} =
+    copy(selectdim(arg, ndims(arg), replica_index))
+
+@generated function _replica_native_inputs(
+        ::Val{B}, ::Type{BT}, args::A, replica_index) where {B,BT,A}
+    batched_lookup = Dict(index => position for (position, index) in enumerate(B))
+    values = Any[]
+    for index in 1:length(A.parameters)
+        if haskey(batched_lookup, index)
+            position = batched_lookup[index]
+            push!(values, :(_replica_native_arg(
+                getfield(args, $index), $(BT.parameters[position]), replica_index)))
+        else
+            push!(values, :(getfield(args, $index)))
+        end
+    end
+    Expr(:tuple, values...)
+end
+
+_replica_stack(values, ::Type{T}) where {T<:Number} = collect(values)
+_replica_stack(values, ::Type{T}) where {T<:AbstractArray} = stack(values)
+
+function _replica_native_outputs(results, ::Type{OT}) where {OT<:Tuple}
+    output_types = OT.parameters
+    if length(output_types) == 1
+        return _replica_stack(results, only(output_types))
+    end
+    ntuple(length(output_types)) do output_index
+        _replica_stack((result[output_index] for result in results),
+                       output_types[output_index])
+    end
+end
+
+function _replica_call(k::ReplicatedKernel{B,BT,OT}, args, marker) where {B,BT,OT}
+    replica_count = size(marker, ndims(marker))
+    for index in B
+        arg = getfield(args, index)
+        expected_rank = _replica_rank(valtype(k.inputs[index])) + 1
+        ndims(arg) == expected_rank || throw(DimensionMismatch(
+            "replica port :$(k.inputs[index].name) has rank $(ndims(arg)); " *
+            "expected $expected_rank (scalar rank plus one trailing replica axis)"))
+        size(arg, ndims(arg)) == replica_count || throw(DimensionMismatch(
+            "replica port :$(k.inputs[index].name) has " *
+            "$(size(arg, ndims(arg))) replicas; expected $replica_count"))
+    end
+    results = map(1:replica_count) do replica_index
+        scalar_args = _replica_native_inputs(
+            Val(B), BT, args, replica_index)
+        k.target(scalar_args...)
+    end
+    _replica_native_outputs(results, OT)
+end
+
 @inline function (k::PreparedKernel)(args...)
     length(args) == length(k.inputs) || throw(MethodError(k, args))
     k.f(k.ops, args...)
@@ -261,6 +484,29 @@ function _prepare(p::Plan, ast::Expr)
     f = compile(ast)
     ops = ntuple(i -> p.recipes[i].op, length(p.recipes))
     PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, ast)
+end
+
+"""
+    _prepare_batched(p::Plan; batched, reduce = :+) -> PreparedKernel
+
+Internal constructor shared by public plate authoring and optional array
+compiler extensions.  It compiles both the allocation-free native loop and an
+eager tensorized body, then selects between them by the runtime array type.
+"""
+function _prepare_batched(p::Plan; batched, reduce = :+)
+    batched_names = Set{Symbol}(batched isa Symbol ? (batched,) : batched)
+    input_index = findfirst(v -> v.name in batched_names, p.have)
+    input_index === nothing && throw(ArgumentError(
+        "lower_batched: none of the have ports are batched (batched = $(sort(collect(batched_names))))"))
+
+    native_ast = lower_batched(p; batched = batched, reduce = reduce)
+    tensorized_ast = _lower_batched_tensorized(p; batched = batched, reduce = reduce)
+    native = compile(native_ast)
+    tensorized = compile(tensorized_ast)
+    f = _BatchedFunctionPair{input_index,typeof(native),typeof(tensorized)}(
+        native, tensorized)
+    ops = ntuple(i -> p.recipes[i].op, length(p.recipes))
+    PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast)
 end
 
 # The optional MutatingFunctions extension uses one typed cache cell per

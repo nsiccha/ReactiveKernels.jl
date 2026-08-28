@@ -904,7 +904,33 @@ function _is_broadcast_operator(sym::Symbol)
     length(s) >= 2 && s[1] === '.' && Base.isoperator(Symbol(s[2:end]))
 end
 
-function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol})
+function _kernel_tensorized_rhs(ex)
+    ex isa Expr || return ex
+    ex.head in (:quote, :inert) && return ex
+    if ex.head === :if && length(ex.args) == 3
+        # `broadcast(ifelse, ...)` is the common scalar/tensor select.  It is
+        # still scalar for scalar branches, while a traced scalar predicate is
+        # broadcast across array branches (Reactant deliberately has no
+        # `ifelse(::TracedBool, ::TracedArray, ::TracedArray)` method).
+        return Expr(:call, GlobalRef(Base, :broadcast),
+                    GlobalRef(Base, :ifelse),
+                    (_kernel_tensorized_rhs(arg) for arg in ex.args)...)
+    elseif ex.head === :&& && length(ex.args) == 2
+        return Expr(:call, GlobalRef(Base, :broadcast),
+                    GlobalRef(Base, :ifelse),
+                    _kernel_tensorized_rhs(ex.args[1]),
+                    _kernel_tensorized_rhs(ex.args[2]), false)
+    elseif ex.head === :|| && length(ex.args) == 2
+        return Expr(:call, GlobalRef(Base, :broadcast),
+                    GlobalRef(Base, :ifelse),
+                    _kernel_tensorized_rhs(ex.args[1]), true,
+                    _kernel_tensorized_rhs(ex.args[2]))
+    end
+    Expr(ex.head, (_kernel_tensorized_rhs(arg) for arg in ex.args)...)
+end
+
+function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
+                           tensorize::Bool = true)
     form = :fused
     if rhs isa Expr && rhs.head === :call && !isempty(rhs.args)
         callee = rhs.args[1]
@@ -927,7 +953,9 @@ function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol})
     Expr(:call, GlobalRef(@__MODULE__, :_KernelSourceOp),
          Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
          Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)),
-         Expr(:->, Expr(:tuple, deps...), rhs))
+         Expr(:->, Expr(:tuple, deps...), rhs),
+         Expr(:->, Expr(:tuple, deps...),
+              tensorize ? _kernel_tensorized_rhs(rhs) : rhs))
 end
 
 # `@node(expr)` recipe-node promotion, used by `_kernel_expand`. Kept HERE (ahead of
@@ -1182,10 +1210,10 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         end
         dep_values = Expr(:tuple, (port_vars[name] for name in deps)...)
         out_values = Expr(:tuple, (port_vars[name] for (name, _) in outputs)...)
-        op = _kernel_operation(rhs, deps, known)
         cost = get(metadata, :cost, 1.0)
         cse_key = get(metadata, :cse_key, nothing)
         effectful = get(metadata, :effectful, false)
+        op = _kernel_operation(rhs, deps, known; tensorize = !effectful)
         push!(body, :($add_ref($graph_var, $dep_values, $out_values,
                                $op, $cost, $cse_key, $effectful)))
     end
@@ -1518,6 +1546,28 @@ function prepare_nonallocating(spec::KernelSpec;
         passes = passes)
     have === _KERNEL_DEFAULT_BOUNDARY || return prepared
     _kernel_signature_callable(prepared, spec.call_signature)
+end
+
+"""
+    replica(spec::KernelSpec; batched, have=inputs(spec), want=outputs(spec), passes=())
+
+Prepare the scalar authored kernel and lift the complete callable over a shared
+trailing replica axis. See [`replica(::PreparedKernel)`](@ref).
+"""
+function replica(spec::KernelSpec;
+                 batched,
+                 have = _KERNEL_DEFAULT_BOUNDARY,
+                 want = _KERNEL_DEFAULT_BOUNDARY,
+                 passes = ())
+    prepared = prepare(plan(spec; have = have, want = want); passes = passes)
+    replicated = replica(prepared; batched = batched)
+    have === _KERNEL_DEFAULT_BOUNDARY || return replicated
+    _kernel_signature_callable(replicated, spec.call_signature)
+end
+
+function replica(callable::_KernelSignatureCallable; batched)
+    replicated = _replica(callable.target, batched)
+    _kernel_signature_callable(replicated, callable.signature)
 end
 
 inputs(spec::KernelSpec) = _kernel_selection(
