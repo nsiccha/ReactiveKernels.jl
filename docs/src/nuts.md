@@ -11,10 +11,11 @@ The public `nuts!!` sampler is **landed and executable on `main`**: `@kernel` lo
 NUTS source to a sealed, registry-free **native compiled recursion** (`compile_nuts_native`
 / `_build_nuts_sampler`), and the public `nuts!!(state; rng)` mutates compiler-owned state
 in place and returns the **same object** (`result === state`, same concrete type) at
-**exact zero allocations**. The source below is copied from the reviewed fixture
-and guarded byte-for-byte by `test/test_nuts_docs_fixture.jl`. The checked-in G7
-receipt measures work-normalized leapfrog throughput; it is not an end-to-end
-sampling or ESS benchmark.
+**exact zero allocations**. The source below is embedded statically, copied from
+the reviewed fixture, and guarded byte-for-byte by
+`test/test_nuts_docs_fixture.jl`; it is not read or executed by the docs build.
+The checked-in G7 receipt measures work-normalized leapfrog throughput; it is
+not an end-to-end sampling or ESS benchmark.
 
 ## Status — read this before the code
 

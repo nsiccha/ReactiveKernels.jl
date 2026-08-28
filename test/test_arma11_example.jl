@@ -5,7 +5,10 @@ include(joinpath(@__DIR__, "..", "examples", "arma11.jl"))
 using .ARMA11Example
 
 @testset "manual PPL graph — ARMA(1,1)" begin
-    model = build_arma11_graph()
+    artifact = evaluate_arma11_source()
+    @test artifact.source == strip(ARMA11_SOURCE, '\n')
+    @test artifact.output == artifact.kernel(Tuple(artifact.inputs)...)
+    model = artifact.model
     q = (0.0, 0.9, -0.2, log(0.15))
 
     @testset "latent errors are a first-class port" begin
