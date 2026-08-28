@@ -44,46 +44,10 @@ exact source that builds and runs the query, **Generated kernel** is
 colored `visualize(density_plan)` component.
 
 ```@eval
-Main.ReactiveKernelsDocs.execute_example(@__MODULE__, raw"""
-@kernel model(unconstrained::UnconstrainedParameters,
-              series::RealVector) = begin
-    (μ::Real, φ::Real, θ::Real, log_σ::Real) =
-        ARMA11Example.split_unconstrained(unconstrained)
-    σ::Real = ARMA11Example.positive_scale(log_σ)
-    parameters::ARMAParameters = ARMA11Example.assemble_parameters(μ, φ, θ, σ)
-    log_jacobian::Real = ARMA11Example.log_abs_det_jacobian(log_σ)
-
-    errors::RealVector = ARMA11Example.arma_errors(parameters, series)
-    prior::Real = ARMA11Example.log_prior(parameters)
-    pointwise::RealVector = ARMA11Example.pointwise_log_likelihood(errors, parameters)
-    likelihood::Real = ARMA11Example.sum_log_likelihood(pointwise)
-    density::Real = ARMA11Example.total_log_density(
-        prior, log_jacobian, likelihood,
-    )
-    forecast::Real = ARMA11Example.one_step_forecast(parameters, series, errors)
-    return density
-end
-
-q = (0.0, 0.9, -0.2, log(0.15))
-series = ARMA_SERIES
-
-density_kernel = prepare(model;
-    have = (:unconstrained, :series),
-    want = (:prior, :log_jacobian, :pointwise, :likelihood, :density))
-
-output = density_kernel(q, series)
-prior, logjac, pointwise, likelihood, density = output
-@assert likelihood ≈ sum(pointwise)
-@assert density ≈ prior + logjac + likelihood
-
-docs_example = (;
-    name = :arma11_density,
-    origin = "compact @kernel model (build executed) — posteriordb arma11",
-    inputs = (; q, series),
-    kernel = density_kernel,
-    output,
+Main.ReactiveKernelsDocs.execute_ppl_example(
+    @__MODULE__, :ARMA11Example, :ARMA11_SOURCE;
+    setup = Main.ReactiveKernelsDocs.setup_arma11!,
 )
-"""; setup = Main.ReactiveKernelsDocs.setup_arma11!)
 ```
 
 Because the errors are their own port, asking only for them prunes every density

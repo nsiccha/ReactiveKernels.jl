@@ -1,10 +1,12 @@
 module ARMA11Example
 
 using ReactiveKernels
+include("_ppl_source_authority.jl")
 
 export ARMAParameters
 export ARMA_SERIES
 export build_arma11_graph, demo
+export ARMA11_SOURCE, evaluate_arma11_source
 
 # A ReactiveKernels port of the `arma11` model from posteriordb
 # (posterior `arma-arma11`): a scalar ARMA(1, 1) time series. The interesting
@@ -122,6 +124,56 @@ one_step_forecast(parameters::ARMAParameters, series::RealVector,
                   errors::RealVector) =
     parameters.μ + parameters.φ * series[end] + parameters.θ * errors[end]
 
+const ARMA11_SOURCE = raw"""
+@kernel model(unconstrained::UnconstrainedParameters,
+              series::RealVector) = begin
+    (μ::Real, φ::Real, θ::Real, log_σ::Real) =
+        split_unconstrained(unconstrained)
+    σ::Real = positive_scale(log_σ)
+    parameters::ARMAParameters = assemble_parameters(μ, φ, θ, σ)
+    log_jacobian::Real = log_abs_det_jacobian(log_σ)
+
+    errors::RealVector = arma_errors(parameters, series)
+    prior::Real = log_prior(parameters)
+    pointwise::RealVector = pointwise_log_likelihood(errors, parameters)
+    likelihood::Real = sum_log_likelihood(pointwise)
+    density::Real = total_log_density(prior, log_jacobian, likelihood)
+    forecast::Real = one_step_forecast(parameters, series, errors)
+    return density
+end
+
+q = (0.0, 0.9, -0.2, log(0.15))
+series = ARMA_SERIES
+
+density_kernel = prepare(model;
+    have = (:unconstrained, :series),
+    want = (:prior, :log_jacobian, :pointwise, :likelihood, :density))
+
+output = density_kernel(q, series)
+prior, logjac, pointwise, likelihood, density = output
+@assert likelihood ≈ sum(pointwise)
+@assert density ≈ prior + logjac + likelihood
+
+docs_example = (;
+    name = :arma11_density,
+    origin = "compact @kernel model (build executed) — posteriordb arma11",
+    inputs = (; q, series),
+    model,
+    kernel = density_kernel,
+    output,
+)
+"""
+
+function evaluate_arma11_source()
+    _evaluate_ppl_source(ARMA11_SOURCE, @__MODULE__; bindings = (
+        :ARMAParameters, :UnconstrainedParameters, :RealVector, :ARMA_SERIES,
+        :split_unconstrained, :positive_scale, :assemble_parameters,
+        :log_abs_det_jacobian, :arma_errors, :log_prior,
+        :pointwise_log_likelihood, :sum_log_likelihood,
+        :total_log_density, :one_step_forecast,
+    ))
+end
+
 """
     build_arma11_graph()
 
@@ -133,22 +185,7 @@ Jacobian, prior, pointwise log-likelihood, likelihood reduction, and total
 density remain separate nodes.
 """
 function build_arma11_graph()
-    @kernel model(unconstrained::UnconstrainedParameters,
-                  series::RealVector) = begin
-        (μ::Real, φ::Real, θ::Real, log_σ::Real) =
-            split_unconstrained(unconstrained)
-        σ::Real = positive_scale(log_σ)
-        parameters::ARMAParameters = assemble_parameters(μ, φ, θ, σ)
-        log_jacobian::Real = log_abs_det_jacobian(log_σ)
-
-        errors::RealVector = arma_errors(parameters, series)
-        prior::Real = log_prior(parameters)
-        pointwise::RealVector = pointwise_log_likelihood(errors, parameters)
-        likelihood::Real = sum_log_likelihood(pointwise)
-        density::Real = total_log_density(prior, log_jacobian, likelihood)
-        forecast::Real = one_step_forecast(parameters, series, errors)
-        return density
-    end
+    evaluate_arma11_source().model
 end
 
 function demo()

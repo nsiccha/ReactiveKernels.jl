@@ -45,6 +45,10 @@ makedocs(
     warnonly = Documenter.except(:eval_block),
 )
 
+# A successful build must have executed and rendered every PPL walkthrough
+# exactly once. This catches an omitted page/block even when no eval error fires.
+ReactiveKernelsDocs.assert_ppl_examples_executed!()
+
 # Ensure a root index.html redirect exists
 let redirect = joinpath(@__DIR__, "build", "index.html")
     isfile(redirect) || write(redirect, """

@@ -1,10 +1,12 @@
 module PoissonGammaExample
 
 using ReactiveKernels
+include("_ppl_source_authority.jl")
 
 export PoissonGammaParameters
 export POISSON_COUNTS
 export build_poisson_gamma_graph, demo
+export POISSON_GAMMA_SOURCE, evaluate_poisson_gamma_source
 
 const NOBSERVATIONS = 6
 const CountVector = NTuple{NOBSERVATIONS,Int}
@@ -68,6 +70,53 @@ total_log_density(log_prior::Real, log_jacobian::Real,
 expected_count(parameters::PoissonGammaParameters, exposure::Real) =
     parameters.rate * exposure
 
+const POISSON_GAMMA_SOURCE = raw"""
+@kernel model(log_rate::Real,
+              counts::CountVector,
+              exposure::Real) = begin
+    rate::Real = positive_rate(log_rate)
+    parameters::PoissonGammaParameters = assemble_parameters(rate)
+    log_jacobian::Real = log_abs_det_jacobian(log_rate)
+
+    prior::Real = log_prior(parameters)
+    pointwise::NTuple{6,Real} = pointwise_log_likelihood(parameters, counts)
+    likelihood::Real = sum_log_likelihood(pointwise)
+    density::Real = total_log_density(prior, log_jacobian, likelihood)
+    expected::Real = expected_count(parameters, exposure)
+    return density
+end
+
+log_rate = log(3.5)
+counts = POISSON_COUNTS
+
+density_kernel = prepare(model;
+    have = (:log_rate, :counts),
+    want = (:prior, :log_jacobian, :pointwise, :likelihood, :density))
+
+output = density_kernel(log_rate, counts)
+prior, logjac, pointwise, likelihood, density = output
+@assert likelihood ≈ sum(pointwise)
+@assert density ≈ prior + logjac + likelihood
+
+docs_example = (;
+    name = :poisson_gamma_density,
+    origin = "compact @kernel model (build executed)",
+    inputs = (; log_rate, counts),
+    model,
+    kernel = density_kernel,
+    output,
+)
+"""
+
+function evaluate_poisson_gamma_source()
+    _evaluate_ppl_source(POISSON_GAMMA_SOURCE, @__MODULE__; bindings = (
+        :PoissonGammaParameters, :CountVector, :POISSON_COUNTS,
+        :positive_rate, :assemble_parameters, :log_abs_det_jacobian,
+        :log_prior, :pointwise_log_likelihood, :sum_log_likelihood,
+        :total_log_density, :expected_count,
+    ))
+end
+
 """
     build_poisson_gamma_graph()
 
@@ -81,20 +130,7 @@ The prior, pointwise log-likelihood, likelihood reduction, total density, and an
 expected-count generated quantity are separate nodes.
 """
 function build_poisson_gamma_graph()
-    @kernel model(log_rate::Real,
-                  counts::CountVector,
-                  exposure::Real) = begin
-        rate::Real = positive_rate(log_rate)
-        parameters::PoissonGammaParameters = assemble_parameters(rate)
-        log_jacobian::Real = log_abs_det_jacobian(log_rate)
-
-        prior::Real = log_prior(parameters)
-        pointwise::NTuple{6,Real} = pointwise_log_likelihood(parameters, counts)
-        likelihood::Real = sum_log_likelihood(pointwise)
-        density::Real = total_log_density(prior, log_jacobian, likelihood)
-        expected::Real = expected_count(parameters, exposure)
-        return density
-    end
+    evaluate_poisson_gamma_source().model
 end
 
 function demo()

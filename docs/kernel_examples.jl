@@ -85,10 +85,11 @@ function setup_eight_schools!(mod::Module)
     if !isdefined(mod, :EightSchoolsExample)
         Base.include(mod, joinpath(@__DIR__, "..", "examples", "eight_schools.jl"))
     end
-    # Constrained parameters and predictions are plain NamedTuples, so there are
-    # no custom types to import — only the model's data.
     Core.eval(mod, :(using .EightSchoolsExample:
-        EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA))
+        EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA,
+        split_unconstrained, positive_scale, assemble_parameters,
+        log_abs_det_jacobian, log_prior, plated_loglik,
+        total_log_density, predict_new_group))
     nothing
 end
 
@@ -99,7 +100,10 @@ function setup_linear_regression!(mod::Module)
     Core.eval(mod, :(using .LinearRegressionExample:
         LinearRegressionParameters, LinearPrediction,
         DataVector, UnconstrainedParameters,
-        LINREG_X, LINREG_Y))
+        LINREG_X, LINREG_Y,
+        split_unconstrained, positive_scale, assemble_parameters,
+        log_abs_det_jacobian, log_prior, pointwise_log_likelihood,
+        sum_log_likelihood, total_log_density, predict_new))
     nothing
 end
 
@@ -109,7 +113,10 @@ function setup_beta_binomial!(mod::Module)
     end
     Core.eval(mod, :(using .BetaBinomialExample:
         BetaBinomialParameters, CountVector,
-        BETA_BINOMIAL_TRIALS, BETA_BINOMIAL_SUCCESSES))
+        BETA_BINOMIAL_TRIALS, BETA_BINOMIAL_SUCCESSES,
+        logistic, assemble_parameters, log_abs_det_jacobian,
+        log_prior, pointwise_log_likelihood, sum_log_likelihood,
+        total_log_density, expected_successes))
     nothing
 end
 
@@ -118,7 +125,10 @@ function setup_poisson_gamma!(mod::Module)
         Base.include(mod, joinpath(@__DIR__, "..", "examples", "poisson_gamma.jl"))
     end
     Core.eval(mod, :(using .PoissonGammaExample:
-        PoissonGammaParameters, CountVector, POISSON_COUNTS))
+        PoissonGammaParameters, CountVector, POISSON_COUNTS,
+        positive_rate, assemble_parameters, log_abs_det_jacobian,
+        log_prior, pointwise_log_likelihood, sum_log_likelihood,
+        total_log_density, expected_count))
     nothing
 end
 
@@ -128,7 +138,11 @@ function setup_dugongs!(mod::Module)
     end
     Core.eval(mod, :(using .DugongsGrowthExample:
         DugongsParameters, UnconstrainedParameters, RealVector,
-        DUGONGS_AGE, DUGONGS_LENGTH))
+        DUGONGS_AGE, DUGONGS_LENGTH,
+        split_unconstrained, bounded_lambda, sd_from_log_precision,
+        assemble_parameters, log_abs_det_jacobian, log_prior,
+        pointwise_log_likelihood, sum_log_likelihood,
+        total_log_density, predicted_length))
     nothing
 end
 
@@ -137,7 +151,11 @@ function setup_arma11!(mod::Module)
         Base.include(mod, joinpath(@__DIR__, "..", "examples", "arma11.jl"))
     end
     Core.eval(mod, :(using .ARMA11Example:
-        ARMAParameters, UnconstrainedParameters, RealVector, ARMA_SERIES))
+        ARMAParameters, UnconstrainedParameters, RealVector, ARMA_SERIES,
+        split_unconstrained, positive_scale, assemble_parameters,
+        log_abs_det_jacobian, arma_errors, log_prior,
+        pointwise_log_likelihood, sum_log_likelihood,
+        total_log_density, one_step_forecast))
     nothing
 end
 
@@ -147,7 +165,10 @@ function setup_gaussian_mixture!(mod::Module)
     end
     Core.eval(mod, :(using .GaussianMixtureExample:
         MixtureParameters, UnconstrainedParameters, RealVector,
-        MIXTURE_OBSERVATIONS))
+        MIXTURE_OBSERVATIONS, split_unconstrained, ordered_means,
+        exp_scale, logistic, assemble_parameters, log_abs_det_jacobian,
+        log_prior, pointwise_log_likelihood, sum_log_likelihood,
+        total_log_density, component1_responsibility))
     nothing
 end
 
@@ -250,7 +271,57 @@ function execute_example(mod::Module, code::AbstractString;
             dag = executed.kernel.plan,
         ),
     )
-    render_examples((artifact,))
+    rendered = render_examples((artifact,))
+    _record_ppl_execution!(executed.name)
+    rendered
+end
+
+"""
+    execute_ppl_example(mod, owner, source; setup) -> Markdown.MD
+
+Load a PPL example module into the page sandbox, resolve its exported source
+authority only after setup, then execute those exact bytes through
+[`execute_example`](@ref). Symbols keep the docs call independent of evaluation
+order while making the owning example and source binding explicit.
+"""
+function execute_ppl_example(mod::Module, owner::Symbol, source::Symbol;
+                             setup, result::Symbol = :docs_example)
+    setup(mod)
+    isdefined(mod, owner) || error("PPL docs setup did not define module $owner")
+    owner_module = getfield(mod, owner)
+    isdefined(owner_module, source) || error("$owner does not define source $source")
+    code = getfield(owner_module, source)
+    code isa AbstractString || error("$owner.$source is not source text")
+    execute_example(mod, code; result, setup = nothing)
+end
+
+const EXPECTED_PPL_EXAMPLES = (
+    :eight_schools_density,
+    :linear_regression_density,
+    :beta_binomial_density,
+    :poisson_gamma_density,
+    :dugongs_density,
+    :arma11_density,
+    :gaussian_mixture_density,
+)
+const _PPL_EXECUTION_COUNTS = Dict(name => 0 for name in EXPECTED_PPL_EXAMPLES)
+
+function _record_ppl_execution!(name::Symbol)
+    haskey(_PPL_EXECUTION_COUNTS, name) || return nothing
+    _PPL_EXECUTION_COUNTS[name] += 1
+    nothing
+end
+
+function assert_ppl_examples_executed!()
+    failures = String[]
+    for name in EXPECTED_PPL_EXAMPLES
+        count = _PPL_EXECUTION_COUNTS[name]
+        count == 1 || push!(failures, "$name executed $count times (expected exactly once)")
+    end
+    isempty(failures) || error(
+        "PPL documentation execution gate failed:\n" * join(failures, "\n"),
+    )
+    nothing
 end
 
 const _DISTRIBUTION_RECEIPT_PATH = joinpath(
@@ -387,9 +458,9 @@ end
 
 # The NUTS `@kernel` authoring surface is embedded STATICALLY in docs/src/nuts.md as a plain ```julia
 # fenced block (the exact bytes of benchmark/nuts_kernel_authoring_fixture.jl). It is intentionally NOT
-# rendered by a build-time `@eval` here: makedocs runs with `warnonly = true`, so a throwing render block
-# would be swallowed and the kernel source would silently vanish from the page (this happened once). A
-# static fence cannot fail to render. The byte-for-byte match between nuts.md and the fixture is enforced
-# LOUDLY by test/test_nuts_docs_fixture.jl, not by build-time evaluation.
+# rendered by a build-time `@eval` here: it is a deliberately static publication
+# surface, byte-locked LOUDLY to benchmark/nuts_kernel_authoring_fixture.jl by
+# test/test_nuts_docs_fixture.jl. PPL walkthrough panels use the separate
+# build-execution gate above, and `eval_block` errors are fatal in docs/make.jl.
 
 end # module ReactiveKernelsDocs

@@ -6,18 +6,20 @@ together are the whole sampler — modeled on the ReactiveHMC.jl algorithm
 structure. This page shows that artifact's **authoring source** and measured
 performance. The separately packaged exported sampler is identified below.
 
-The fixture's `nuts!!` entry is **landed and executable on `main`**: `@kernel` lowers
-the NUTS source to a sealed, registry-free **native compiled recursion**
+The fixture's public `nuts!!` entry is **landed and executable on `main`**: `@kernel`
+lowers the NUTS source to a sealed, registry-free **native compiled recursion**
 (`compile_nuts_native` / `_build_nuts_sampler`). That entry mutates compiler-owned
 state in place and returns the **same object** (`result === state`, same concrete
-type) at **exact zero allocations**. The source below is **byte-synced,
-drift-proof** from `benchmark/nuts_kernel_authoring_fixture.jl`. The measured
+type) at **exact zero allocations**. The source below is embedded statically from
+the reviewed `benchmark/nuts_kernel_authoring_fixture.jl` and guarded byte-for-byte
+by `test/test_nuts_docs_fixture.jl`; it is not read or executed by the docs build. The measured
 leapfrog-steps/s comparison against DynamicHMC, AdvancedHMC, and nsiccha/NUTS.jl
 is recorded in the static receipt [`benchmark/receipts/nuts-g7-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/nuts-g7-v1.toml)
 — parsed here, not re-run in CI. It is a work-normalized inner-loop receipt,
 not an end-to-end sampling, adaptation, wall-time, or ESS benchmark.
 
-Packaging matters: the sealed builder and its `nuts!!` entry are internal compiler
+Packaging matters: “public” here means the entry of the sealed compiler artifact;
+the builder and fixture are internal compiler
 acceptance surfaces, not the exported `nuts_state` constructor. The exported
 `nuts_state` / `CompiledNUTSState` path uses a compiled-reactive phase-point DAG and
 ordinary inferred Julia tree-growth orchestration. See [Compiler capability and
@@ -28,7 +30,7 @@ boundary and why the two implementations prove different things.
 
 | Piece | State |
 |---|---|
-| Source contract (the eight `@kernel` specs below, the seven `@rk_*` effect registrations, the plan shape) | **Executable current `main`; correction pending.** The fixture currently has one combined `grad_f` producer. The previously removed `pot_f` alternative producer is to be restored with compiler/ownership evidence; until that lands, the source below mirrors current `main` exactly. |
+| Source contract (the eight `@kernel` specs below, the seven `@rk_*` effect registrations, the plan shape) | **Landed and executable.** `pot_f` and `grad_f` are alternative producers of `pot`; the planner selects the needed recipe while retaining both read-only callable authorities by identity. |
 | All eight source specs construct; concrete phasepoint/frame init/recompute/copy verified | **Landed on `main`** — the compiler constructs and runs the whole sampler; sealed production certificate `mode = production`. |
 | Executable leapfrog (leaf scope) | **Verified** — analytic F32/F64; normal gradient Δ1, `@inferred`, exact 0-B; dirty-produced recovery analytic; dirty-source reject. |
 | Sealed fixture `nuts!!` (`step!`, tree growth, U-turn) | **Landed on `main`** — sealed registry-free native recursion; `nuts!!(state; rng) === state` (same object, fixed type), **exact 0-B** on the compiler acceptance path. |
@@ -65,11 +67,11 @@ The design goal is that the *math is the code*: each `@kernel` reads as the recu
 it implements, and the compiler — not the author — schedules effects, owns storage, and
 invalidates stale values.
 
-- **`euclidean_phasepoint(grad_f, metric, pos, mom)`** — on current `main`, a phasepoint is
-  potential + kinetic energy at `(pos, mom)`. You write the four lines of physics
-  directly: one destination-bound gradient recipe produces `pot, dpot_dpos = grad_f(pos)`
-  (the pending source-contract correction will restore `pot_f` as an unselected
-  alternative producer), `chol_metric = cholesky(metric)`, the
+- **`euclidean_phasepoint(pot_f, grad_f, metric, pos, mom)`** — a phasepoint is
+  potential + kinetic energy at `(pos, mom)`. You write both valid ways to obtain
+  the potential: `pot = pot_f(pos)` and `pot, dpot_dpos = grad_f(pos)`. The planner
+  selects the gradient recipe when `dpot_dpos` is wanted, while retaining both
+  callable authorities by identity. Then `chol_metric = cholesky(metric)`, the
   kinetic term `kin = ½(logdet(chol_metric) + momᵀ M⁻¹ mom)`, and `ham = pot + kin`.
   The Hamiltonian-gradient fields are **alias projections that collapse onto the
   canonical owned gradient slots** — `dham_dpos` onto `dpot_dpos`, `dham_dmom` onto
@@ -109,7 +111,11 @@ fixture entry **satisfies** (see the status table).
   entry mutates compiler-owned concrete state and returns the same object. The fixture
   identity holds: `nuts!!(state; rng)` returns `result === state` (same object, fixed
   concrete type) at **exact 0-B** — verified on the sealed native sampler.
-- **Owned endpoints vs shared authority.** Read-only authority inputs (`grad_f`,
+- **Input isolation and prepared storage.** Construction leaves caller inputs untouched
+  and unaliased with writable sampler storage. Preparation creates compiler-owned
+  endpoint buffers; repeated calls reuse and mutate those buffers in place, and the
+  public result is the prepared state object itself.
+- **Owned endpoints vs shared authority.** Read-only authority inputs (`pot_f`, `grad_f`,
   `metric`, the metric-only `chol_metric` closure and the `@node(logdet(chol_metric))`
   value) are **shared by identity** across `init` / `fwd` / `bwd`; the integrator-written
   `pos`, `mom` and their derived closures (`pot`, `dpot_dpos`, `kin`, `ham`, and the

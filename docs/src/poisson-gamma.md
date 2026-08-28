@@ -46,47 +46,10 @@ exact source that builds and runs the query, **Generated kernel** is
 colored `visualize(density_plan)` component.
 
 ```@eval
-Main.ReactiveKernelsDocs.execute_example(@__MODULE__, raw"""
-@kernel model(log_rate::Real,
-              counts::CountVector,
-              exposure::Real) = begin
-    rate::Real = PoissonGammaExample.positive_rate(log_rate)
-    parameters::PoissonGammaParameters =
-        PoissonGammaExample.assemble_parameters(rate)
-    log_jacobian::Real = PoissonGammaExample.log_abs_det_jacobian(log_rate)
-
-    prior::Real = PoissonGammaExample.log_prior(parameters)
-    pointwise::NTuple{6,Real} = PoissonGammaExample.pointwise_log_likelihood(
-        parameters, counts,
-    )
-    likelihood::Real = PoissonGammaExample.sum_log_likelihood(pointwise)
-    density::Real = PoissonGammaExample.total_log_density(
-        prior, log_jacobian, likelihood,
-    )
-    expected::Real = PoissonGammaExample.expected_count(parameters, exposure)
-    return density
-end
-
-log_rate = log(3.5)
-counts = POISSON_COUNTS
-
-density_kernel = prepare(model;
-    have = (:log_rate, :counts),
-    want = (:prior, :log_jacobian, :pointwise, :likelihood, :density))
-
-output = density_kernel(log_rate, counts)
-prior, logjac, pointwise, likelihood, density = output
-@assert likelihood ≈ sum(pointwise)
-@assert density ≈ prior + logjac + likelihood
-
-docs_example = (;
-    name = :poisson_gamma_density,
-    origin = "compact @kernel model (build executed)",
-    inputs = (; log_rate, counts),
-    kernel = density_kernel,
-    output,
+Main.ReactiveKernelsDocs.execute_ppl_example(
+    @__MODULE__, :PoissonGammaExample, :POISSON_GAMMA_SOURCE;
+    setup = Main.ReactiveKernelsDocs.setup_poisson_gamma!,
 )
-"""; setup = Main.ReactiveKernelsDocs.setup_poisson_gamma!)
 ```
 
 Asking only for constrained parameters selects just the exponential transform

@@ -46,55 +46,10 @@ exact source that builds and runs the query, **Generated kernel** is
 colored `visualize(density_plan)` component.
 
 ```@eval
-Main.ReactiveKernelsDocs.execute_example(@__MODULE__, raw"""
-@kernel model(unconstrained::UnconstrainedParameters,
-              predictors::DataVector,
-              responses::DataVector,
-              new_predictor::Real,
-              prediction_innovation::Real) = begin
-    (α::Real, β::Real, log_σ::Real) =
-        LinearRegressionExample.split_unconstrained(unconstrained)
-    σ::Real = LinearRegressionExample.positive_scale(log_σ)
-    parameters::LinearRegressionParameters =
-        LinearRegressionExample.assemble_parameters(α, β, σ)
-    log_jacobian::Real =
-        LinearRegressionExample.log_abs_det_jacobian(log_σ)
-
-    prior::Real = LinearRegressionExample.log_prior(parameters)
-    pointwise::DataVector = LinearRegressionExample.pointwise_log_likelihood(
-        parameters, predictors, responses,
-    )
-    likelihood::Real = LinearRegressionExample.sum_log_likelihood(pointwise)
-    density::Real = LinearRegressionExample.total_log_density(
-        prior, log_jacobian, likelihood,
-    )
-    prediction::LinearPrediction = LinearRegressionExample.predict_new(
-        parameters, new_predictor, prediction_innovation,
-    )
-    return density
-end
-
-q = (1.0, 2.0, log(0.5))
-predictors = LINREG_X
-responses = LINREG_Y
-
-density_kernel = prepare(model;
-    have = (:unconstrained, :predictors, :responses),
-    want = (:prior, :log_jacobian, :pointwise, :likelihood, :density))
-
-output = density_kernel(q, predictors, responses)
-prior, logjac, pointwise, likelihood, density = output
-@assert likelihood ≈ sum(pointwise)
-@assert density ≈ prior + logjac + likelihood
-
-docs_example = (;
-    name = :linear_regression_density,
-    origin = "compact @kernel model (build executed)",
-    inputs = (; q, predictors, responses),
-    kernel = density_kernel,
-    output,
+Main.ReactiveKernelsDocs.execute_ppl_example(
+    @__MODULE__, :LinearRegressionExample, :LINEAR_REGRESSION_SOURCE;
+    setup = Main.ReactiveKernelsDocs.setup_linear_regression!,
 )
-"""; setup = Main.ReactiveKernelsDocs.setup_linear_regression!)
 ```
 
 Asking only for constrained parameters selects just the split, positive-scale,

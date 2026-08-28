@@ -5,7 +5,10 @@ include(joinpath(@__DIR__, "..", "examples", "linear_regression.jl"))
 using .LinearRegressionExample
 
 @testset "manual PPL graph — linear regression" begin
-    model = build_linear_regression_graph()
+    artifact = evaluate_linear_regression_source()
+    @test artifact.source == strip(LINEAR_REGRESSION_SOURCE, '\n')
+    @test artifact.output == artifact.kernel(Tuple(artifact.inputs)...)
+    model = artifact.model
     q = (1.0, 2.0, log(0.5))
 
     @testset "unconstrained -> constrained; Jacobian is optional" begin

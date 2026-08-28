@@ -5,7 +5,10 @@ include(joinpath(@__DIR__, "..", "examples", "beta_binomial.jl"))
 using .BetaBinomialExample
 
 @testset "manual PPL graph — beta-binomial" begin
-    model = build_beta_binomial_graph()
+    artifact = evaluate_beta_binomial_source()
+    @test artifact.source == strip(BETA_BINOMIAL_SOURCE, '\n')
+    @test artifact.output == artifact.kernel(Tuple(artifact.inputs)...)
+    model = artifact.model
     logit_rate = 0.2
 
     @testset "unconstrained -> constrained; Jacobian is optional" begin

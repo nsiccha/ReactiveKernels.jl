@@ -1,10 +1,12 @@
 module BetaBinomialExample
 
 using ReactiveKernels
+include("_ppl_source_authority.jl")
 
 export BetaBinomialParameters
 export BETA_BINOMIAL_TRIALS, BETA_BINOMIAL_SUCCESSES
 export build_beta_binomial_graph, demo
+export BETA_BINOMIAL_SOURCE, evaluate_beta_binomial_source
 
 const NEXPERIMENTS = 5
 const CountVector = NTuple{NEXPERIMENTS,Int}
@@ -71,6 +73,58 @@ total_log_density(log_prior::Real, log_jacobian::Real,
 expected_successes(parameters::BetaBinomialParameters, new_trials::Int) =
     parameters.rate * new_trials
 
+const BETA_BINOMIAL_SOURCE = raw"""
+@kernel model(logit_rate::Real,
+              trials::CountVector,
+              successes::CountVector,
+              new_trials::Int) = begin
+    rate::Real = logistic(logit_rate)
+    parameters::BetaBinomialParameters = assemble_parameters(rate)
+    log_jacobian::Real = log_abs_det_jacobian(rate)
+
+    prior::Real = log_prior(parameters)
+    pointwise::NTuple{5,Real} = pointwise_log_likelihood(
+        parameters, trials, successes,
+    )
+    likelihood::Real = sum_log_likelihood(pointwise)
+    density::Real = total_log_density(prior, log_jacobian, likelihood)
+    expected::Real = expected_successes(parameters, new_trials)
+    return density
+end
+
+logit_rate = 0.2
+trials = BETA_BINOMIAL_TRIALS
+successes = BETA_BINOMIAL_SUCCESSES
+
+density_kernel = prepare(model;
+    have = (:logit_rate, :trials, :successes),
+    want = (:prior, :log_jacobian, :pointwise, :likelihood, :density))
+
+output = density_kernel(logit_rate, trials, successes)
+prior, logjac, pointwise, likelihood, density = output
+@assert likelihood ≈ sum(pointwise)
+@assert density ≈ prior + logjac + likelihood
+
+docs_example = (;
+    name = :beta_binomial_density,
+    origin = "compact @kernel model (build executed)",
+    inputs = (; logit_rate, trials, successes),
+    model,
+    kernel = density_kernel,
+    output,
+)
+"""
+
+function evaluate_beta_binomial_source()
+    _evaluate_ppl_source(BETA_BINOMIAL_SOURCE, @__MODULE__; bindings = (
+        :BetaBinomialParameters, :CountVector,
+        :BETA_BINOMIAL_TRIALS, :BETA_BINOMIAL_SUCCESSES,
+        :logistic, :assemble_parameters, :log_abs_det_jacobian,
+        :log_prior, :pointwise_log_likelihood, :sum_log_likelihood,
+        :total_log_density, :expected_successes,
+    ))
+end
+
 """
     build_beta_binomial_graph()
 
@@ -85,23 +139,7 @@ reduction, total density, and an expected-count generated quantity are separate
 nodes.
 """
 function build_beta_binomial_graph()
-    @kernel model(logit_rate::Real,
-                  trials::CountVector,
-                  successes::CountVector,
-                  new_trials::Int) = begin
-        rate::Real = logistic(logit_rate)
-        parameters::BetaBinomialParameters = assemble_parameters(rate)
-        log_jacobian::Real = log_abs_det_jacobian(rate)
-
-        prior::Real = log_prior(parameters)
-        pointwise::NTuple{5,Real} = pointwise_log_likelihood(
-            parameters, trials, successes,
-        )
-        likelihood::Real = sum_log_likelihood(pointwise)
-        density::Real = total_log_density(prior, log_jacobian, likelihood)
-        expected::Real = expected_successes(parameters, new_trials)
-        return density
-    end
+    evaluate_beta_binomial_source().model
 end
 
 function demo()
