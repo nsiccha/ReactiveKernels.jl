@@ -252,74 +252,11 @@ function execute_example(mod::Module, code::AbstractString;
     render_examples((artifact,))
 end
 
-# ---- source-synced `@kernel` NUTS authoring surface (source-only, NOT executed) --------------------
-# The current production NUTS authoring surface is authored as eight method-bearing `@kernel`
-# specifications. Their stateful lowering (inline update methods + `__self__`) is mid-implementation on
-# the syntax/poc/hmc lanes and is NOT evaluable by today's function-shaped `@kernel`, so this page renders
-# the EXACT source text drift-proof at build time — it is NOT build-executed, and no generated-kernel /
-# Compute-DAG pane, parity, allocation, or performance claim is made. The file is byte-synced from the
-# canonical fixture commit below; if it drifts or is truncated the structural gate fails the build.
-const _AUTHORING_FIXTURE_PATH =
-    joinpath(dirname(@__DIR__), "benchmark", "nuts_kernel_authoring_fixture.jl")
-
-# Canonical origin of the synced source (benchmark/nuts_kernel_authoring_fixture.jl). Labelled on the page
-# so a reader can pin the exact reviewed surface; the docs copy is byte-identical to this commit's blob.
-const _AUTHORING_FIXTURE_ORIGIN_SHA = "ccb35d3"
-
-# The eight method-bearing `@kernel` specifications the production surface must expose.
-const _AUTHORING_FIXTURE_KERNELS = (
-    "euclidean_phasepoint", "leapfrog!", "refresh_momentum!!", "nuts_stats!",
-    "nuts_state", "nuts!!", "dual_averaging_state", "welford_var",
-)
-
-# The seven public `@rk_*` effect declarations the compiler schedules the helpers by. Their presence is
-# part of the surface contract; a kernel-name check alone is too weak.
-const _AUTHORING_FIXTURE_RK_DECLS = (
-    "@rk_pure finiteorneginf", "@rk_pure min1exp", "@rk_borrows badd",
-    "@rk_rng randbernoullilog", "@rk_pure logswapprob", "@rk_pure compute_criterion",
-    "@rk_pure smooth",
-)
-
-# Call/type spellings that MUST NOT appear in the executable authoring. `@reactive` must be gone (the
-# `@kernel` surface is the only public macro); no `Ref(`/`RefValue(`/`Ref{` may be constructed (the state
-# is implicit-field, no-Ref). The fixture's PROSE comments mention "Ref"/"RefValue"/"no-Ref", so the gate
-# matches the code spellings (trailing `(` / `{`) rather than the bare word, which would false-positive.
-const _AUTHORING_FIXTURE_FORBIDDEN = ("@reactive", "Ref(", "RefValue(", "Ref{")
-
-"""
-    render_authoring_fixture() -> Markdown.MD
-
-Render the source-synced eight-`@kernel` NUTS authoring surface as a plain Julia code block, read
-drift-proof from `benchmark/nuts_kernel_authoring_fixture.jl` at build time. It is NOT executed: no
-generated-kernel / Compute-DAG pane is produced, and no parity / allocation / performance / production
-claim is made. This is the exact reviewed *source* (compiler lowering in progress), byte-synced from the
-canonical fixture commit `$(_AUTHORING_FIXTURE_ORIGIN_SHA)`.
-
-The render is refused (fails the docs build) unless the synced source still exposes all eight
-`@kernel`s, all seven `@rk_*` effect declarations, and contains no `@reactive` and no
-`Ref(`/`RefValue(`/`Ref{` in its executable authoring — a stronger gate than name occurrence alone.
-"""
-function render_authoring_fixture()
-    src = read(_AUTHORING_FIXTURE_PATH, String)
-    for kernel in _AUTHORING_FIXTURE_KERNELS
-        occursin("@kernel $(kernel)(", src) || error(
-            "authoring fixture drift: `@kernel $(kernel)(...)` missing from " *
-            "$(_AUTHORING_FIXTURE_PATH); the synced source is stale or truncated.",
-        )
-    end
-    for decl in _AUTHORING_FIXTURE_RK_DECLS
-        occursin(decl, src) || error(
-            "authoring fixture drift: effect declaration `$(decl)` missing from " *
-            "$(_AUTHORING_FIXTURE_PATH); the seven `@rk_*` declarations are part of the surface contract.",
-        )
-    end
-    for forbidden in _AUTHORING_FIXTURE_FORBIDDEN
-        occursin(forbidden, src) && error(
-            "authoring fixture regression: forbidden token `$(forbidden)` appears in " *
-            "$(_AUTHORING_FIXTURE_PATH); `@kernel` is the only public macro and the authoring is no-Ref.",
-        )
-    end
-    Markdown.MD(Any[Markdown.Code("julia", rstrip(src))])
-end
+# The NUTS `@kernel` authoring surface is embedded STATICALLY in docs/src/nuts.md as a plain ```julia
+# fenced block (the exact bytes of benchmark/nuts_kernel_authoring_fixture.jl). It is intentionally NOT
+# rendered by a build-time `@eval` here: makedocs runs with `warnonly = true`, so a throwing render block
+# would be swallowed and the kernel source would silently vanish from the page (this happened once). A
+# static fence cannot fail to render. The byte-for-byte match between nuts.md and the fixture is enforced
+# LOUDLY by test/test_nuts_docs_fixture.jl, not by build-time evaluation.
 
 end # module ReactiveKernelsDocs
