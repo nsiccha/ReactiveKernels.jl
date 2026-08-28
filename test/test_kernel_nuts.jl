@@ -15,7 +15,8 @@ function _nuts_mkvals(pf, T)
     PL = RK.kernel_prepared_plan(pf); m = T[2 0; 0 2]; d = Dict{Int,Any}()
     for sl in RK.kernel_plan_slots(PL)
         nm = String(sl.path[1])
-        d[sl.canon] = nm == "grad_f" ? ((dst, p) -> (dst .= 2 .* p; sum(abs2, p))) :
+        d[sl.canon] = nm == "pot_f" ? (p -> sum(abs2, p)) :
+            nm == "grad_f" ? ((dst, p) -> (dst .= 2 .* p; sum(abs2, p))) :
             nm == "metric" ? m : nm == "chol_metric" ? cholesky(m) : startswith(nm, "##node") ? zero(T) :
             nm == "pos" ? T[1, 2] : nm == "mom" ? T[3, 4] :
             (nm in ("dpot_dpos", "dham_dpos", "dkin_dmom", "dham_dmom")) ? T[0, 0] : zero(T)
@@ -256,7 +257,7 @@ _rsame(v, s) = v isa LinearAlgebra.Cholesky ? v.factors == s : v isa AbstractArr
     pf = _nuts_pf(); PL = RK.kernel_prepared_plan(pf); pg = _CntGrad(0); m = Float64[2 0.5; 0.5 3]
     d = Dict{Int,Any}()
     for sl in RK.kernel_plan_slots(PL); nm = String(sl.path[1])
-        d[sl.canon] = nm=="grad_f" ? pg : nm=="metric" ? m : nm=="chol_metric" ? cholesky(m) : startswith(nm,"##node") ? 0.0 :
+        d[sl.canon] = nm=="pot_f" ? (p -> sum(abs2, p)) : nm=="grad_f" ? pg : nm=="metric" ? m : nm=="chol_metric" ? cholesky(m) : startswith(nm,"##node") ? 0.0 :
             nm=="pos" ? [1.0,2.0] : nm=="mom" ? [3.0,4.0] : (nm in ("dpot_dpos","dham_dpos","dkin_dmom","dham_dmom")) ? [0.0,0.0] : 0.0
     end
     frame = RK._construct_nuts_frame(pf, d, 3; step_f=RK.partial(_NutsFix.leapfrog!;stepsize=0.1), stats_f=nothing, min_dham=-1000)
@@ -365,7 +366,7 @@ end
     # full HMC-observable snapshot (not pos only): position + every committed diagnostic + mask + the PHYSICAL
     # derived-`diverged` field and its currentness bits (read directly, NOT inferred from dham — a stale/wrong
     # frame.diverged or derived-currentness bit must be caught).
-    _obs(fr) = (pos = copy(RK._canon_slot(fr.init, Val(3))),
+    _obs(pf, fr) = (pos = copy(_slot(pf, fr.init, :pos)),
                 n_steps = RK._diag_slot(fr.diag, Val(1)), reached_depth = RK._diag_slot(fr.diag, Val(2)),
                 acceptance_rate = RK._diag_slot(fr.diag, Val(3)), dham = RK._diag_slot(fr.diag, Val(4)),
                 committed = RK.diagnostics_committed_mask(fr.diag),
@@ -382,8 +383,8 @@ end
         # FULL-TRAJECTORY equivalence: snapshot the complete observable set after EVERY one of the 200 seeded
         # transitions (not just the terminal frame), so a transient mismatch that later reconverges, or a
         # stale/wrong diverged / derived-currentness bit at any step, is caught.
-        rngD = Random.Xoshiro(1); trajD = [(CD.root!(frD, CD.scratch, rngD); _obs(frD)) for _ in 1:200]
-        rngM = Random.Xoshiro(1); trajM = [(CM.root!(frM, CM.scratch, rngM); _obs(frM)) for _ in 1:200]
+        rngD = Random.Xoshiro(1); trajD = [(CD.root!(frD, CD.scratch, rngD); _obs(pf, frD)) for _ in 1:200]
+        rngM = Random.Xoshiro(1); trajM = [(CM.root!(frM, CM.scratch, rngM); _obs(pf, frM)) for _ in 1:200]
         @test trajD == trajM                                        # every observable at every step, byte-identical (unit mass)
         # EXACT 0-B on the Diagonal path (a SCALED Diagonal, the real perf case): F32/F64 × both RNG, typed Val{N}.
         frS = _mkframe(pf, T, 5, LinearAlgebra.Diagonal(T[2, 2])); CS = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frS)
@@ -413,7 +414,7 @@ end
         PL = RK.kernel_prepared_plan(pf); d = Dict{Int,Any}()
         for sl in RK.kernel_plan_slots(PL)
             nm = String(sl.path[1])
-            d[sl.canon] = nm=="grad_f" ? ((dst,p)->(dst.=2 .*p; sum(abs2,p))) : nm=="metric" ? metric : nm=="chol_metric" ? cholesky(metric) : startswith(nm,"##node") ? zero(T) : nm=="pos" ? T[1,2] : nm=="mom" ? T[3,4] : (nm in ("dpot_dpos","dham_dpos","dkin_dmom","dham_dmom")) ? T[0,0] : zero(T)
+            d[sl.canon] = nm=="pot_f" ? (p -> sum(abs2, p)) : nm=="grad_f" ? ((dst,p)->(dst.=2 .*p; sum(abs2,p))) : nm=="metric" ? metric : nm=="chol_metric" ? cholesky(metric) : startswith(nm,"##node") ? zero(T) : nm=="pos" ? T[1,2] : nm=="mom" ? T[3,4] : (nm in ("dpot_dpos","dham_dpos","dkin_dmom","dham_dmom")) ? T[0,0] : zero(T)
         end
         fr = RK._construct_nuts_frame(pf, d, 5; step_f=RK.partial(_CF.leapfrog!; stepsize=T(0.3)), stats_f=_CF.nuts_stats!, min_dham=-1000)
         RK.compile_prepared_initialization(pf, typeof(fr.init), typeof(fr.shared))(fr.init, fr.shared, RK.kernel_prepared_handles(pf))
@@ -461,10 +462,10 @@ end
     end
     # FULL selected-sample payload: all SEVEN physical owned init fields (the sample copied from proposals[end])
     # + init currentness mask + proposals[end] payload/mask, plus every diagnostic/mask and the physical diverged
-    # field & its currentness bits. Owned slots: pos3 mom4 pot6 dpot7 dkin9 kin10 ham11.
-    _slots(ep) = (copy(RK._canon_slot(ep, Val(3))), copy(RK._canon_slot(ep, Val(4))), RK._canon_slot(ep, Val(6)),
-                  copy(RK._canon_slot(ep, Val(7))), copy(RK._canon_slot(ep, Val(9))), RK._canon_slot(ep, Val(10)),
-                  RK._canon_slot(ep, Val(11)), RK._canon_current_mask(ep))
+    # field & its currentness bits. Owned slots: pos4 mom5 pot7 dpot8 dkin10 kin11 ham12.
+    _slots(ep) = (copy(RK._canon_slot(ep, Val(4))), copy(RK._canon_slot(ep, Val(5))), RK._canon_slot(ep, Val(7)),
+                  copy(RK._canon_slot(ep, Val(8))), copy(RK._canon_slot(ep, Val(10))), RK._canon_slot(ep, Val(11)),
+                  RK._canon_slot(ep, Val(12)), RK._canon_current_mask(ep))
     _obs(fr) = (init = _slots(fr.init), prop_end = _slots(getfield(fr, :proposals)[end]),
                 n_steps = RK._diag_slot(fr.diag, Val(1)), reached_depth = RK._diag_slot(fr.diag, Val(2)),
                 acceptance_rate = RK._diag_slot(fr.diag, Val(3)), dham = RK._diag_slot(fr.diag, Val(4)),
@@ -474,8 +475,8 @@ end
                 diverged_committed = RK.nuts_frame_diverged_committed(fr))
     _NAN(v::AbstractArray) = fill!(v, convert(eltype(v), NaN))
     _poison_ep!(ep) = begin                                   # ALL 7 physical owned fields (vectors + scalars)
-        for s in (3, 4, 7, 9); v = RK._canon_slot(ep, Val(s)); v isa AbstractArray && _NAN(v); end
-        for s in (6, 10, 11); RK._canon_set!(ep, Val(s), convert(eltype(RK._canon_slot(ep, Val(3))), NaN)); end
+        for s in (4, 5, 8, 10); v = RK._canon_slot(ep, Val(s)); v isa AbstractArray && _NAN(v); end
+        for s in (7, 11, 12); RK._canon_set!(ep, Val(s), convert(eltype(RK._canon_slot(ep, Val(4))), NaN)); end
     end
     _D1!(fr) = for t in getfield(fr, :trees); _NAN(t.log_weight); end
     _D2!(fr) = for t in getfield(fr, :trees); _NAN(t.bwd.mom); _NAN(t.bwd.dham_dmom); end

@@ -138,7 +138,7 @@ status. The table above is authoritative.
 ```julia
 # ReactiveHMC-STRUCTURE `@kernel` NUTS AUTHORING FIXTURE — FINAL executable-integration surface.
 # implicit-field, no-Ref (two-direct-branch direction), runtime rng, RK-visible leapfrog!/refresh_momentum!!/
-# copy!!, `!!` public entry, one destination-bound grad recipe (NO pot_f), public @rk_* helper effect
+# copy!!, `!!` public entry, pot_f + grad_f as alternative pot producers (pot_f RESTORED), public @rk_* helper effect
 # declarations, and a concrete registered zero-allocation stats callback over compiler-owned diagnostics state.
 #
 # Algorithm-STRUCTURE reference (NOT a bitwise target): ReactiveHMC.jl v0.1.0 (781sB @ ca9ea4ca) —
@@ -153,9 +153,10 @@ status. The table above is authoritative.
 #     is TWO DIRECT PHYSICAL-ENDPOINT BRANCH CALLS with a CONCRETE endpoint actual threaded as a plain formal.
 #  C) public `@kernel nuts!!(state; rng)` refreshes momentum then mutates compiler-owned concrete state +
 #     `return state` (result===state, fixed shape/type, 0-B, no RefValue).
-#  GRAD: euclidean_phasepoint takes ONLY grad_f — one destination-bound selected grad recipe produces pot+dpot
-#     (no redundant pot_f producer, no required-but-unused pot_f authority). The build hook passes the in-place
-#     pgrad!(g,x)::T unchanged; the factory binds it to each endpoint's owned dpot_dpos slot + pot scalar.
+#  GRAD: euclidean_phasepoint takes pot_f + grad_f as ALTERNATIVE producers of pot (pot_f RESTORED per user
+#     directive 2026-08-27T10:18:56 — its earlier removal was unauthorized); grad_f additionally produces dpot.
+#     pot_f is a shared-by-identity authority retained even when the planner selects grad_f for pot. The build
+#     hook passes the in-place pgrad!(g,x)::T unchanged; the factory binds it to each endpoint's dpot_dpos + pot.
 #  RNG is a TYPED RUNTIME arg, NOT sampler state; `step!(rng)` threads it; `nuts!!` calls refresh + step!(state,rng).
 #  RESET/COPY use the RK-CORE registered structural strong-update `copy!!(dest, src)` (result===dest).
 #  DIAGNOSTICS: nuts_state owns n_steps/reached_depth/acceptance_rate (+ existing dham/diverged); reset! zeros
@@ -166,8 +167,9 @@ status. The table above is authoritative.
 #  the compiler schedules them with visible effects (never body inference).
 #
 #  PINNED STRUCTURAL-COPY OWNERSHIP POLICY (`deepcopy(init)` is the STRUCTURAL MARKER):
-#   - SHARED BY IDENTITY across init/fwd/bwd: read-only authority inputs grad_f, metric, plus the metric-only
-#     closure chol_metric and the @node(logdet(chol_metric)) value (one slot). NO pot_f.
+#   - SHARED BY IDENTITY across init/fwd/bwd: read-only authority inputs pot_f, grad_f, metric, plus the
+#     metric-only closure chol_metric and the @node(logdet(chol_metric)) value (one slot). pot_f is the
+#     authored alternative pot producer, retained by identity even when its recipe is unselected.
 #   - OWNED/DISTINCT per endpoint: integrator-written pos, mom + endpoint closures/caches pot, dpot_dpos,
 #     dkin_dmom, kin, ham, dham_dpos, dham_dmom (aliased projections collapse to one physical slot).
 #
@@ -213,9 +215,15 @@ example_step_binding(stepsize) = partial(leapfrog!; stepsize = stepsize)
 example_nuts_binding(init, stepsize) =
     nuts_state(init; step_f = partial(leapfrog!; stepsize), stats_f = nuts_stats!)
 
-# ---- euclidean_phasepoint — ONE destination-bound grad recipe (pot+dpot); pot_f DROPPED; @node preserved ----
-@kernel euclidean_phasepoint(grad_f, metric, pos, mom) = begin
-    pot, dpot_dpos = grad_f(pos)                 # single selected grad recipe; factory binds grad_f=pgrad!(g,x)
+# ---- euclidean_phasepoint — pot_f + grad_f are ALTERNATIVE producers of pot; @node preserved -------------
+# `pot_f` is the authored alternative potential producer (restored per user directive
+# 2026-08-27T10:18:56 — its earlier removal was an unauthorized simplification). It is a
+# SHARED-BY-IDENTITY read-only authority, retained by identity even when the planner selects
+# `grad_f` (which produces pot as a byproduct of the needed dpot); the two `pot`-producing
+# recipes below are alternative producers, plan-resolved (see src/kernel_lowering.jl).
+@kernel euclidean_phasepoint(pot_f, grad_f, metric, pos, mom) = begin
+    pot = pot_f(pos)                             # pot_f: authored alternative producer of pot (kept by identity)
+    pot, dpot_dpos = grad_f(pos)                 # grad_f also produces pot (+dpot); factory binds grad_f=pgrad!(g,x)
     chol_metric = cholesky(metric)
     dkin_dmom = chol_metric \ mom
     kin = oftype(pot, 0.5) * (@node(logdet(chol_metric)) + dot(mom, dkin_dmom))   # typed 1/2 (no Float64 promotion)
@@ -246,7 +254,7 @@ end
 # preserves destination object/buffer identity, transfers source currentness, leaves SHARED authority slots
 # UNTOUCHED, collapses aliased
 # projections to ONE physical copy, rejects incompatible shape/type/shared-authority identity.
-#   SHARED-BY-IDENTITY (untouched by copy!!): grad_f, metric, chol_metric + @node(logdet(chol_metric)). A
+#   SHARED-BY-IDENTITY (untouched by copy!!): pot_f, grad_f, metric, chol_metric + @node(logdet(chol_metric)). A
 #     metric mutation updates the ONE shared authority + its chol/@node closure EXACTLY once.
 #   OWNED/DISTINCT (what copy!! moves): pos, mom + pot, dpot_dpos, dkin_dmom, kin, ham, dham_dpos, dham_dmom
 #     (aliased projections collapse to one physical copy). deepcopy(init) is the STRUCTURAL MARKER.
