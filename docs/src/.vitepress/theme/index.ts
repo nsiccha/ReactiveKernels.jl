@@ -23,6 +23,7 @@ import './docstrings.css' // You could setup your own, or else a default will be
 import Banner from '@/Banner.vue'
 import './overrides.css' // You could setup your own, or else a default will be copied.
 import { setupKernelExamples } from './kernel-example'
+import { setupResultVisualizations } from './result-visualization'
 
 function exposeDagLibraries() {
   if (typeof window === 'undefined') return
@@ -87,6 +88,7 @@ export const Theme: ThemeConfig = {
     // a DAG. The HTML component's pinned CDN fallback remains for notebooks
     // and saved standalone documents outside this host.
     exposeDagLibraries()
+    setupResultVisualizations()
     enhanceAppWithTabs(app);
     app.component('VersionPicker', VersionPicker);
     app.component('AuthorBadge', AuthorBadge)

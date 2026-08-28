@@ -6,6 +6,7 @@ include(joinpath(@__DIR__, "..", "examples", "nuts_runtime.jl"))
 using .ReactiveKernelsNUTSExample
 
 include("kernel_examples.jl")
+Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "result_views.jl"))
 include("check_rendered.jl")
 include(joinpath(@__DIR__, "..", "examples", "distributions.jl"))
 include(joinpath(@__DIR__, "..", "examples", "batched.jl"))

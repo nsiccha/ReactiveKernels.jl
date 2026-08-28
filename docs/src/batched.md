@@ -1,5 +1,9 @@
 # Batched log densities, for free
 
+```@eval
+Main.ReactiveKernelsDocs.render_result_assets()
+```
+
 A density written as **(1) an elementwise pointwise recipe over an array-typed
 port → (2) a `sum` reduction** plans to a single straight-line vectorized
 kernel. The author writes one *scalar* `normal_logpdf`; **batching is just
@@ -56,11 +60,9 @@ every call. The non-allocating lowering under
 calls, driving **both** want boundaries to **zero bytes** in steady state
 (measured behind a function barrier after warm-up):
 
-| path | steady-state bytes (N = 1000) |
-| --- | --- |
-| `prepare`, `want = :logdensity` | one per-obs vector (`8128` B) |
-| `prepare_nonallocating`, `want = :logdensity` | **0** |
-| `prepare_nonallocating`, `want = :per_obs` | **0** |
+```@eval
+Main.ReactiveKernelsDocs.render_batched_allocations()
+```
 
 This is the synergy the batched pattern was designed around: a preallocated
 batch buffer reused across the millions of serial density evaluations a sampler

@@ -17,12 +17,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Configure git for private repos
+        run: git config --global url."https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - uses: julia-actions/setup-julia@v2
         with:
           version: '1'
       - uses: julia-actions/cache@v2
       - name: Install dependencies
-        run: julia --project=docs -e 'using Pkg; Pkg.develop(PackageSpec(path=pwd())); Pkg.instantiate()'
+        run: |
+          DEPS="$RUNNER_TEMP/rk-docs-deps"
+          mkdir -p "$DEPS"
+          git clone -b dev https://github.com/nsiccha/AlgebraOfVega.jl.git "$DEPS/AlgebraOfVega.jl"
+          git clone -b kb-impl/DynamicObjects-sbpmx-reflect https://github.com/nsiccha/DynamicObjects.jl.git "$DEPS/DynamicObjects.jl"
+          git clone -b dev https://github.com/nsiccha/HTMX.jl.git "$DEPS/HTMX.jl"
+          git clone -b devibe https://github.com/nsiccha/HTMXObjects.jl.git "$DEPS/HTMXObjects.jl"
+          git clone https://github.com/nsiccha/Treebars.jl.git "$DEPS/Treebars.jl"
+          julia --project=docs -e '
+            using Pkg
+            deps = ENV["RUNNER_TEMP"] * "/rk-docs-deps"
+            Pkg.develop([
+              PackageSpec(path=pwd()),
+              PackageSpec(path=joinpath(deps, "AlgebraOfVega.jl")),
+              PackageSpec(path=joinpath(deps, "DynamicObjects.jl")),
+              PackageSpec(path=joinpath(deps, "HTMX.jl")),
+              PackageSpec(path=joinpath(deps, "HTMXObjects.jl")),
+              PackageSpec(path=joinpath(deps, "Treebars.jl")),
+            ])
+            Pkg.instantiate()
+          '
       - name: Build and deploy
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

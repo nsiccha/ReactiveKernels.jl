@@ -1,5 +1,9 @@
 # Compiler capability and limits
 
+```@eval
+Main.ReactiveKernelsDocs.render_result_assets()
+```
+
 ReactiveKernels has one small exact planner and several lowering surfaces built
 around it. This page is the capability contract: it says which decisions the
 compiler makes, which facts an author must supply, which work disappears from a
@@ -23,17 +27,9 @@ must stay inside the compiler's inspectable and registered subset.
 
 ## API map
 
-| Stage | Public surface | Result | Runtime work that remains |
-|---|---|---|---|
-| Author a dataflow graph | `@kernel`, `Graph`, `Value`, `Recipe`, `add!`, `merge`, `compose` | `KernelSpec` or `Graph` metadata | None; authoring executes no recipe body |
-| Select work | `plan`, `explain`, `inputs`, `outputs` | Inspectable `Plan` | None after preparation |
-| Emit a stateless kernel | `lower`, `transform`, `compile`, `prepare`, `prepare!`, `code_expr` | `PreparedKernel` | Only the selected recipe calls and their value flow |
-| Lift scalar work | `plate`, `lower_batched`, `replica` | Batched or replicated callable | One native loop/map or a backend tensor program |
-| Reuse recipe storage | `prepare_nonallocating` | `NonAllocatingKernel` | Selected calls plus cache mutation; no planner |
-| Plan demands dynamically | `ReactiveState`, `get!`, `materialize!`, `freeze!`, `checkpoint` | Open-ended incremental state | Planning and provenance bookkeeping at each demand |
-| Compile a closed state graph | `prepare_reactive`, `ReactiveProgram`, `CompiledReactiveState` | Typed slots and generated getters | Validity checks, required recipe calls, and invalidation worklists |
-| Author a reactive object | `@reactive`, `ReactiveObject` | Ordinary property/method facade over compiled state | The same compiled-state operations |
-| Inspect the selected graph | `visualize`, `dot_source`, `save_visualization` | Plan/DAG view | No effect on compilation |
+```@eval
+Main.ReactiveKernelsDocs.render_compiler_api_map()
+```
 
 The method-bearing source compiler and its factory remain implementation
 surfaces rather than a general exported `prepare` API. NUTS, log-density, and
@@ -520,33 +516,9 @@ turns NUTS, log-density, or PPL models into the package's domain contract.
 
 ## Definitive support matrix
 
-| Capability | Supported | Boundary or rejection |
-|---|---|---|
-| Exact selection among alternative producers | Yes | Finite acyclic graph; additive non-negative declared costs; exponential worst case |
-| Multi-output stateless recipes | Yes | One call, ordered tuple outputs; selected-owner rules discard collateral duplicates |
-| Arbitrary Julia inside a stateless recipe | Yes, as opaque execution | No internal effect, algebra, allocation, or control-flow analysis |
-| Graph structural CSE | Yes, opt-in | Same non-null key, canonical inputs, output arity/types, non-effectful only |
-| Algebraic/symbolic optimization | No | No commutativity, reassociation, constant folding, symbolic differentiation, or cost measurement |
-| Straight-line native preparation | Yes | Recipe operations still obey ordinary Julia behavior |
-| User AST passes | Yes | User is responsible for semantic preservation |
-| Multiple WANTS | Yes | Returned in request order |
-| Stateless signature defaults/keywords | Yes | Fixed arguments; no positional/keyword splats |
-| Plate map/reduce or collect | Yes | Single-output recipes and one batch-dependent scalar WANT; no scan/fold/parallel tree reduction |
-| Whole-kernel replica axis | Yes | Number/array ports and outputs; native map/stack may allocate |
-| Open-ended reactive demands | Yes | Planning/provenance work remains at each demand |
-| Fixed compiled reactive state | Yes | Graph and boundary frozen; mutable instance is not thread-safe |
-| In-place cache reuse | Optional | Single-output operation support and runtime types determine allocation behavior |
-| Reactive object field methods | Yes, declared grammar | No `let`, exceptions, comprehensions/generators, closures, `do`, or nested functions inside rewritten methods |
-| Captured method branches/loops/recursion | Yes, compiler subset | Exact source representation, ownership, effects, and overloads required |
-| Infer effects from arbitrary Julia methods | No | Source capture plus exact registrations only; no Julia IR/inference analysis |
-| Generic effectful operation fallback | No | Opaque or specialization-unsafe calls reject before executable lowering |
-| Runtime graph mutation after preparation | No | Cached stateless entries version out; compiled reactive programs throw version errors |
-| Reentrant/concurrent stateful kernel instance | No | Use one prepared mutable/cache-owning instance per independent caller |
-| Automatic differentiation | No compiler feature | AD may be an ordinary recipe/backend concern; the compiler does not choose or prove it |
-| PPL/model semantics | No compiler feature | Examples build log densities and samplers from ordinary recipes; there is no trace/address language |
-| NUTS, log-density, or PPL domain API | No | These live in external compilation examples and are not loaded or exported by RK |
-| General dynamic scheduling in a hot kernel | No | Dynamic planning exists only in `ReactiveState` demand orchestration |
-| General Julia compiler replacement | No | Unsupported captured shapes reject; ordinary opaque stateless recipes remain ordinary Julia |
+```@eval
+Main.ReactiveKernelsDocs.render_compiler_capabilities()
+```
 
 ## How to read a rejection
 
