@@ -45,7 +45,7 @@ function check_rendered_docs(build_dir, page_tree)
     expected_panels = Dict(
         "distributions.md" => 11,
         "batched.md" => 1,
-        "nuts.md" => 1,
+        "nuts.md" => 2,
         "eight-schools.md" => 1,
         "linear-regression.md" => 1,
         "beta-binomial.md" => 1,
@@ -68,7 +68,7 @@ function check_rendered_docs(build_dir, page_tree)
     )
     structural_markers = Dict(
         "compiler.md" => ("class=\"rk-pipeline\"",),
-        "nuts.md" => ("class=\"rk-status-grid\"",),
+        "nuts.md" => ("class=\"rk-status-grid\"", "Full compiled NUTS kernel"),
         "visualization.md" =>
             ("class=\"rk-dag-legend\"", "class=\"rk-comparison-grid\""),
     )
