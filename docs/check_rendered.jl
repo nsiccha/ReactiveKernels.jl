@@ -38,6 +38,8 @@ function check_rendered_docs(build_dir, page_tree)
 
     rendered = _rendered_html(build_dir)
     sources = _documented_sources(page_tree)
+    length(rendered) == length(sources) ||
+        error("rendered site has $(length(rendered)) content pages; navigation config has $(length(sources))")
     expected_panels = Dict(
         "distributions.md" => 6,
         "batched.md" => 1,
