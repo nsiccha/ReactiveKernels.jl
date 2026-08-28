@@ -1,4 +1,4 @@
-generated_at = "2026-08-28T12:21:14.244Z"
+generated_at = "2026-08-28T13:44:17.917Z"
 schema = "structured-distribution-logdensity-v1"
 
 [environment]
@@ -12,44 +12,7 @@ reactant_backend = "default CPU"
 family = "mvnormal_cholesky"
 max_abs_error = 8.881784197001252e-16
 n = 4
-rk_reactant_compile_seconds = 11.80998839
-
-    [measurements.distributions_native]
-    allocs = [2, 2, 2, 2, 2]
-    bytes = [192, 192, 192, 192, 192]
-    median_allocs = 2
-    median_bytes = 192
-    median_ns = 140.0
-    times_ns = [170.0, 131.0, 140.0, 140.0, 140.0]
-
-    [measurements.probability_measures_native]
-    allocs = [4, 4, 4, 4, 4]
-    bytes = [320, 320, 320, 320, 320]
-    median_allocs = 4
-    median_bytes = 320
-    median_ns = 120.0
-    times_ns = [120.0, 120.0, 120.0, 170.0, 120.0]
-
-    [measurements.rk_native]
-    allocs = [3, 3, 3, 3, 3]
-    bytes = [288, 288, 288, 288, 288]
-    median_allocs = 3
-    median_bytes = 288
-    median_ns = 170.0
-    times_ns = [170.0, 170.0, 170.0, 170.0, 170.0]
-
-    [measurements.rk_reactant]
-    allocs = [16, 16, 16, 16, 16]
-    bytes = [704, 704, 704, 704, 704]
-    median_allocs = 16
-    median_bytes = 704
-    median_ns = 3775.0
-    times_ns = [3775.0, 3876.0, 4086.0, 3775.0, 3706.0]
-[[measurements]]
-family = "stationary_ar1"
-max_abs_error = 8.881784197001252e-16
-n = 4
-rk_reactant_compile_seconds = 1.772656521
+rk_reactant_compile_seconds = 11.052020701
 
     [measurements.distributions_native]
     allocs = [2, 2, 2, 2, 2]
@@ -57,7 +20,7 @@ rk_reactant_compile_seconds = 1.772656521
     median_allocs = 2
     median_bytes = 192
     median_ns = 130.0
-    times_ns = [180.0, 220.0, 130.0, 130.0, 130.0]
+    times_ns = [130.0, 130.0, 130.0, 130.0, 140.0]
 
     [measurements.probability_measures_native]
     allocs = [4, 4, 4, 4, 4]
@@ -65,7 +28,44 @@ rk_reactant_compile_seconds = 1.772656521
     median_allocs = 4
     median_bytes = 320
     median_ns = 120.0
-    times_ns = [120.0, 110.0, 120.0, 120.0, 110.0]
+    times_ns = [130.0, 120.0, 120.0, 110.0, 170.0]
+
+    [measurements.rk_native]
+    allocs = [3, 3, 3, 3, 3]
+    bytes = [288, 288, 288, 288, 288]
+    median_allocs = 3
+    median_bytes = 288
+    median_ns = 160.0
+    times_ns = [200.0, 160.0, 160.0, 160.0, 160.0]
+
+    [measurements.rk_reactant]
+    allocs = [16, 16, 16, 16, 16]
+    bytes = [704, 704, 704, 704, 704]
+    median_allocs = 16
+    median_bytes = 704
+    median_ns = 3625.0
+    times_ns = [4006.0, 3625.0, 3645.0, 3625.0, 3545.0]
+[[measurements]]
+family = "stationary_ar1"
+max_abs_error = 8.881784197001252e-16
+n = 4
+rk_reactant_compile_seconds = 1.537652655
+
+    [measurements.distributions_native]
+    allocs = [2, 2, 2, 2, 2]
+    bytes = [192, 192, 192, 192, 192]
+    median_allocs = 2
+    median_bytes = 192
+    median_ns = 130.0
+    times_ns = [140.0, 130.0, 130.0, 130.0, 131.0]
+
+    [measurements.probability_measures_native]
+    allocs = [4, 4, 4, 4, 4]
+    bytes = [320, 320, 320, 320, 320]
+    median_allocs = 4
+    median_bytes = 320
+    median_ns = 110.0
+    times_ns = [120.0, 120.0, 110.0, 110.0, 110.0]
 
     [measurements.rk_native]
     allocs = [5, 5, 5, 5, 5]
@@ -73,57 +73,20 @@ rk_reactant_compile_seconds = 1.772656521
     median_allocs = 5
     median_bytes = 400
     median_ns = 110.0
-    times_ns = [110.0, 110.0, 110.0, 110.0, 170.0]
+    times_ns = [110.0, 110.0, 120.0, 110.0, 110.0]
 
     [measurements.rk_reactant]
     allocs = [16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 3074.0
-    times_ns = [3074.0, 3085.0, 2984.0, 2884.0, 3185.0]
+    median_ns = 2904.0
+    times_ns = [2843.0, 4646.0, 2904.0, 2904.0, 3114.0]
 [[measurements]]
 family = "mvnormal_cholesky"
 max_abs_error = 3.552713678800501e-15
 n = 16
-rk_reactant_compile_seconds = 0.169149681
-
-    [measurements.distributions_native]
-    allocs = [2, 2, 2, 2, 2]
-    bytes = [384, 384, 384, 384, 384]
-    median_allocs = 2
-    median_bytes = 384
-    median_ns = 270.0
-    times_ns = [270.0, 270.0, 270.0, 270.0, 280.0]
-
-    [measurements.probability_measures_native]
-    allocs = [16, 16, 16, 16, 16]
-    bytes = [2048, 2048, 2048, 2048, 2048]
-    median_allocs = 16
-    median_bytes = 2048
-    median_ns = 480.0
-    times_ns = [470.0, 460.0, 531.0, 480.0, 500.0]
-
-    [measurements.rk_native]
-    allocs = [3, 3, 3, 3, 3]
-    bytes = [576, 576, 576, 576, 576]
-    median_allocs = 3
-    median_bytes = 576
-    median_ns = 340.0
-    times_ns = [340.0, 340.0, 340.0, 330.0, 390.0]
-
-    [measurements.rk_reactant]
-    allocs = [16, 16, 16, 16, 16]
-    bytes = [704, 704, 704, 704, 704]
-    median_allocs = 16
-    median_bytes = 704
-    median_ns = 8842.0
-    times_ns = [8352.0, 8842.0, 8322.0, 9202.0, 10204.0]
-[[measurements]]
-family = "stationary_ar1"
-max_abs_error = 1.7763568394002505e-15
-n = 16
-rk_reactant_compile_seconds = 0.10874511
+rk_reactant_compile_seconds = 0.145207415
 
     [measurements.distributions_native]
     allocs = [2, 2, 2, 2, 2]
@@ -131,15 +94,52 @@ rk_reactant_compile_seconds = 0.10874511
     median_allocs = 2
     median_bytes = 384
     median_ns = 280.0
-    times_ns = [270.0, 380.0, 280.0, 280.0, 280.0]
+    times_ns = [340.0, 270.0, 270.0, 280.0, 280.0]
 
     [measurements.probability_measures_native]
     allocs = [16, 16, 16, 16, 16]
     bytes = [2048, 2048, 2048, 2048, 2048]
     median_allocs = 16
     median_bytes = 2048
-    median_ns = 470.0
-    times_ns = [470.0, 470.0, 460.0, 460.0, 470.0]
+    median_ns = 450.0
+    times_ns = [441.0, 691.0, 450.0, 450.0, 460.0]
+
+    [measurements.rk_native]
+    allocs = [3, 3, 3, 3, 3]
+    bytes = [576, 576, 576, 576, 576]
+    median_allocs = 3
+    median_bytes = 576
+    median_ns = 331.0
+    times_ns = [331.0, 330.0, 340.0, 330.0, 340.0]
+
+    [measurements.rk_reactant]
+    allocs = [16, 16, 16, 16, 16]
+    bytes = [704, 704, 704, 704, 704]
+    median_allocs = 16
+    median_bytes = 704
+    median_ns = 8592.0
+    times_ns = [7430.0, 8592.0, 20267.0, 9033.0, 7951.0]
+[[measurements]]
+family = "stationary_ar1"
+max_abs_error = 1.7763568394002505e-15
+n = 16
+rk_reactant_compile_seconds = 0.102759244
+
+    [measurements.distributions_native]
+    allocs = [2, 2, 2, 2, 2]
+    bytes = [384, 384, 384, 384, 384]
+    median_allocs = 2
+    median_bytes = 384
+    median_ns = 270.0
+    times_ns = [260.0, 270.0, 270.0, 270.0, 260.0]
+
+    [measurements.probability_measures_native]
+    allocs = [16, 16, 16, 16, 16]
+    bytes = [2048, 2048, 2048, 2048, 2048]
+    median_allocs = 16
+    median_bytes = 2048
+    median_ns = 450.0
+    times_ns = [440.0, 450.0, 450.0, 450.0, 440.0]
 
     [measurements.rk_native]
     allocs = [5, 5, 5, 5, 5]
@@ -147,163 +147,163 @@ rk_reactant_compile_seconds = 0.10874511
     median_allocs = 5
     median_bytes = 784
     median_ns = 120.0
-    times_ns = [120.0, 120.0, 120.0, 120.0, 120.0]
+    times_ns = [160.0, 120.0, 120.0, 120.0, 160.0]
 
     [measurements.rk_reactant]
     allocs = [16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 3014.0
-    times_ns = [3124.0, 3375.0, 2934.0, 2924.0, 3014.0]
+    median_ns = 2924.0
+    times_ns = [2864.0, 3135.0, 2924.0, 3044.0, 2914.0]
 [[measurements]]
 family = "mvnormal_cholesky"
 max_abs_error = 0.0
 n = 64
-rk_reactant_compile_seconds = 0.174366969
+rk_reactant_compile_seconds = 0.137518998
 
     [measurements.distributions_native]
     allocs = [2, 2, 2, 2, 2]
     bytes = [1152, 1152, 1152, 1152, 1152]
     median_allocs = 2
     median_bytes = 1152
-    median_ns = 901.0
-    times_ns = [901.0, 891.0, 901.0, 911.0, 921.0]
+    median_ns = 931.0
+    times_ns = [891.0, 1322.0, 931.0, 911.0, 1142.0]
 
     [measurements.probability_measures_native]
     allocs = [64, 64, 64, 64, 64]
     bytes = [20896, 20896, 20896, 20896, 20896]
     median_allocs = 64
     median_bytes = 20896
-    median_ns = 4517.0
-    times_ns = [4456.0, 4517.0, 4656.0, 4346.0, 4566.0]
+    median_ns = 4226.0
+    times_ns = [4226.0, 4206.0, 4667.0, 4587.0, 4135.0]
 
     [measurements.rk_native]
     allocs = [3, 3, 3, 3, 3]
     bytes = [1728, 1728, 1728, 1728, 1728]
     median_allocs = 3
     median_bytes = 1728
-    median_ns = 1062.0
-    times_ns = [1071.0, 1071.0, 1062.0, 1051.0, 1031.0]
+    median_ns = 1031.0
+    times_ns = [1031.0, 1041.0, 1031.0, 1011.0, 1031.0]
 
     [measurements.rk_reactant]
     allocs = [16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 29121.0
-    times_ns = [26587.0, 29831.0, 31904.0, 29121.0, 26346.0]
+    median_ns = 33756.0
+    times_ns = [33756.0, 33346.0, 33537.0, 40956.0, 33807.0]
 [[measurements]]
 family = "stationary_ar1"
 max_abs_error = 4.263256414560601e-14
 n = 64
-rk_reactant_compile_seconds = 0.189080847
+rk_reactant_compile_seconds = 0.114650118
 
     [measurements.distributions_native]
     allocs = [2, 2, 2, 2, 2]
     bytes = [1152, 1152, 1152, 1152, 1152]
     median_allocs = 2
     median_bytes = 1152
-    median_ns = 951.0
-    times_ns = [941.0, 941.0, 951.0, 951.0, 971.0]
+    median_ns = 911.0
+    times_ns = [911.0, 891.0, 901.0, 911.0, 921.0]
 
     [measurements.probability_measures_native]
     allocs = [64, 64, 64, 64, 64]
     bytes = [20896, 20896, 20896, 20896, 20896]
     median_allocs = 64
     median_bytes = 20896
-    median_ns = 4366.0
-    times_ns = [4526.0, 5067.0, 4096.0, 4366.0, 4336.0]
+    median_ns = 4677.0
+    times_ns = [4677.0, 4817.0, 4927.0, 4096.0, 4506.0]
 
     [measurements.rk_native]
     allocs = [5, 5, 5, 5, 5]
     bytes = [2368, 2368, 2368, 2368, 2368]
     median_allocs = 5
     median_bytes = 2368
-    median_ns = 250.0
-    times_ns = [250.0, 220.0, 250.0, 250.0, 250.0]
+    median_ns = 260.0
+    times_ns = [261.0, 150.0, 250.0, 260.0, 280.0]
 
     [measurements.rk_reactant]
     allocs = [16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 3435.0
-    times_ns = [4797.0, 3315.0, 3625.0, 3435.0, 3425.0]
+    median_ns = 3364.0
+    times_ns = [3254.0, 5527.0, 3314.0, 3414.0, 3364.0]
 [[measurements]]
 family = "mvnormal_cholesky"
 max_abs_error = 0.0
 n = 128
-rk_reactant_compile_seconds = 0.213020265
+rk_reactant_compile_seconds = 0.159903439
 
     [measurements.distributions_native]
     allocs = [2, 2, 2, 2, 2]
     bytes = [2176, 2176, 2176, 2176, 2176]
     median_allocs = 2
     median_bytes = 2176
-    median_ns = 2153.0
-    times_ns = [2153.0, 2873.0, 2023.0, 2083.0, 2173.0]
+    median_ns = 2002.0
+    times_ns = [2002.0, 1992.0, 2073.0, 2103.0, 1993.0]
 
     [measurements.probability_measures_native]
     allocs = [128, 128, 128, 128, 128]
     bytes = [76160, 76160, 76160, 76160, 76160]
     median_allocs = 128
     median_bytes = 76160
-    median_ns = 16833.0
-    times_ns = [16913.0, 16863.0, 16012.0, 16833.0, 16242.0]
+    median_ns = 16173.0
+    times_ns = [16173.0, 16333.0, 16162.0, 14560.0, 16823.0]
 
     [measurements.rk_native]
     allocs = [3, 3, 3, 3, 3]
     bytes = [3264, 3264, 3264, 3264, 3264]
     median_allocs = 3
     median_bytes = 3264
-    median_ns = 2334.0
-    times_ns = [2314.0, 2374.0, 2333.0, 2334.0, 2804.0]
+    median_ns = 2253.0
+    times_ns = [2153.0, 2333.0, 2253.0, 2263.0, 2243.0]
 
     [measurements.rk_reactant]
     allocs = [16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 175801.0
-    times_ns = [179047.0, 171495.0, 172408.0, 175853.0, 175801.0]
+    median_ns = 179957.0
+    times_ns = [179957.0, 176534.0, 181080.0, 177755.0, 182973.0]
 [[measurements]]
 family = "stationary_ar1"
 max_abs_error = 4.263256414560601e-14
 n = 128
-rk_reactant_compile_seconds = 0.136631749
+rk_reactant_compile_seconds = 0.12815517
 
     [measurements.distributions_native]
     allocs = [2, 2, 2, 2, 2]
     bytes = [2176, 2176, 2176, 2176, 2176]
     median_allocs = 2
     median_bytes = 2176
-    median_ns = 2093.0
-    times_ns = [2113.0, 2092.0, 2093.0, 2033.0, 2153.0]
+    median_ns = 2123.0
+    times_ns = [2263.0, 2023.0, 2023.0, 2183.0, 2123.0]
 
     [measurements.probability_measures_native]
     allocs = [128, 128, 128, 128, 128]
     bytes = [76160, 76160, 76160, 76160, 76160]
     median_allocs = 128
     median_bytes = 76160
-    median_ns = 18045.0
-    times_ns = [17374.0, 18145.0, 18045.0, 17314.0, 19467.0]
+    median_ns = 15561.0
+    times_ns = [16673.0, 15561.0, 14480.0, 15672.0, 15041.0]
 
     [measurements.rk_native]
     allocs = [5, 5, 5, 5, 5]
     bytes = [4416, 4416, 4416, 4416, 4416]
     median_allocs = 5
     median_bytes = 4416
-    median_ns = 301.0
-    times_ns = [480.0, 301.0, 291.0, 300.0, 371.0]
+    median_ns = 401.0
+    times_ns = [420.0, 410.0, 390.0, 401.0, 401.0]
 
     [measurements.rk_reactant]
     allocs = [16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 3385.0
-    times_ns = [3385.0, 3384.0, 3475.0, 3155.0, 3455.0]
+    median_ns = 3214.0
+    times_ns = [3245.0, 3164.0, 3185.0, 3214.0, 3415.0]
 
 [pins]
 distributions_version = "0.25.131"
@@ -313,14 +313,16 @@ probability_measures_version = "0.1.0"
 reactant_jll_version = "0.0.401+0"
 reactant_version = "0.2.278"
 reactivekernels_dirty = false
-reactivekernels_sha = "78be43d588abbf078dc0517c1c21223e73272b8f"
+reactivekernels_sha = "7b7b51a00775015801c1bd70c408d6501ab88766"
 
 [protocol]
 ar1_baseline = "equivalent dense MvNormal with precomputed Cholesky factor"
 construction_and_factorization_timed = false
 element_type = "Float64"
 estimator = "median of per-round BenchmarkTools minimum times"
-families = ["Cholesky-parameterized MVN", "stationary AR(1)"]
+families = ["MVN (Cholesky HAVE benchmark)", "stationary AR(1)"]
+mvn_all_boundaries_native_and_reactant_accepted = true
+mvn_have_boundaries = ["covariance", "cholesky", "precision", "precision_cholesky"]
 reactant_compile_time_in_timed_region = false
 reactant_sync = true
 reactant_transfers_included = false

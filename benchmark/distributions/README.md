@@ -26,9 +26,12 @@ tracked runtime values. Per-shape compilation diagnostics are retained in the
 receipt; the first RK compile includes Reactant service startup and is not used
 as a cross-library compile-time comparison.
 
-The structured benchmark compares the exact build-executed Cholesky MVN and
-stationary AR(1) sources against the public multivariate-Normal interfaces in
-Distributions and ProbabilityMeasures. The AR(1) baselines use its equivalent
-dense multivariate Normal with a factor computed before timing; RK evaluates
-the authored O(T) recurrence. Unsupported full-MVN Reactant paths are retained
+The structured benchmark compares the exact build-executed MVN and stationary
+AR(1) sources against the public multivariate-Normal interfaces in Distributions
+and ProbabilityMeasures. The matched MVN timing uses the covariance-Cholesky
+HAVE boundary; the same authored RK graph is separately acceptance-tested from
+covariance, covariance Cholesky, precision, and precision Cholesky boundaries,
+natively and under Reactant. The AR(1) baselines use its equivalent dense
+multivariate Normal with a factor computed before timing; RK evaluates the
+authored O(T) recurrence. Unsupported full-MVN Reactant paths are retained
 with their compiler diagnostics rather than silently omitted.

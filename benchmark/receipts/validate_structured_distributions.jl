@@ -7,6 +7,8 @@ const EXPECTED_STRUCTURED_PM_SHA =
     "7cf3a6e112aaae2097b8d401b256d1bce635e03e"
 const EXPECTED_STRUCTURED_SIZES = (4, 16, 64, 128)
 const EXPECTED_STRUCTURED_FAMILIES = ("mvnormal_cholesky", "stationary_ar1")
+const EXPECTED_MVN_HAVE_BOUNDARIES =
+    ("covariance", "cholesky", "precision", "precision_cholesky")
 
 _structured_median(values) = Statistics.median(Float64.(values))
 
@@ -44,6 +46,12 @@ function validate_structured_distribution_receipt(path::AbstractString)
             "Reactant compilation must be excluded from execution timings")
     require(get(protocol, "construction_and_factorization_timed", true) == false,
             "distribution construction/factorization exclusion must be explicit")
+    require(Tuple(get(protocol, "mvn_have_boundaries", String[])) ==
+            EXPECTED_MVN_HAVE_BOUNDARIES,
+            "MVN HAVE-boundary inventory must be complete and ordered")
+    require(get(protocol, "mvn_all_boundaries_native_and_reactant_accepted", false) ==
+            true,
+            "all MVN HAVE boundaries must pass native and Reactant acceptance")
     require(Int(get(protocol, "rounds", 0)) >= 5,
             "published receipt must contain at least five raw rounds")
 

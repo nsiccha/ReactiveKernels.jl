@@ -237,7 +237,7 @@ function evaluate_source(source::AbstractString)
         reference_call = (x, μ, logσ) -> logpdf(LogNormal(μ, exp(logσ)), x)
         reference = reference_call(inputs...)
         reference_allocated_bytes = _allocated(reference_call, x, μ, logσ)
-    elseif artifact.name === :multivariate_normal_cholesky
+    elseif artifact.name === :multivariate_normal_have_want
         x, μ, chol = inputs
         reference_call = (x, μ, chol) -> logpdf(MvNormal(μ, chol * chol'), x)
         reference = reference_call(inputs...)

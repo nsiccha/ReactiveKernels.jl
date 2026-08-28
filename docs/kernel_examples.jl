@@ -365,6 +365,51 @@ _markdown_table_cell(value) = Any[string(value)]
 _markdown_table_row(values...) = Any[_markdown_table_cell(value) for value in values]
 
 """
+    render_mvn_parametrization_plans(source) -> Markdown.MD
+
+Render the four plans prepared from the build-executed MVN source. This keeps
+the public HAVE/WANT claim tied to the actual selected boundaries and recipe
+counts rather than a hand-maintained prose list.
+"""
+function render_mvn_parametrization_plans(source::AbstractString)
+    sandbox = Module(gensym(:MVNParametrizationPlans), true, true)
+    Core.eval(sandbox, :(using ReactiveKernels))
+    _evaluate_source(sandbox, strip(source, '\n'))
+    artifact = Core.eval(sandbox, :docs_example)
+    kernels = artifact.kernels
+    expected = (;
+        covariance = ((:x, :μ, :covariance), "Covariance Σ"),
+        cholesky = ((:x, :μ, :chol), "Covariance Cholesky L"),
+        precision = ((:x, :μ, :precision), "Precision Ω"),
+        precision_cholesky =
+            ((:x, :μ, :precision_chol), "Precision Cholesky Q"),
+    )
+    propertynames(kernels) == propertynames(expected) || error(
+        "unexpected MVN parametrization inventory",
+    )
+    rows = Vector{Any}[
+        _markdown_table_row("Available representation", "HAVE boundary",
+                            "Selected recipes", "Plan cost"),
+    ]
+    for name in propertynames(expected)
+        kernel = getproperty(kernels, name)
+        kernel isa PreparedKernel || error("$name did not produce a PreparedKernel")
+        have, label = getproperty(expected, name)
+        observed_have = Tuple(value.name for value in inputs(kernel))
+        observed_have == have || error(
+            "$name selected HAVE $observed_have; expected $have",
+        )
+        push!(rows, _markdown_table_row(
+            label,
+            join(("`$port`" for port in have), ", "),
+            length(kernel.plan.recipes),
+            kernel.plan.cost,
+        ))
+    end
+    Markdown.MD(Any[Markdown.Table(rows, fill(:r, 4))])
+end
+
+"""
     render_distribution_benchmarks() -> Markdown.MD
 
 Render the checked-in Normal log-density benchmark receipt. The docs build
@@ -487,6 +532,11 @@ function render_structured_distribution_benchmarks()
         error("structured Reactant receipt is not synchronous")
     get(protocol, "reactant_transfers_included", true) &&
         error("structured Reactant receipt includes host/device transfers")
+    Tuple(get(protocol, "mvn_have_boundaries", String[])) ==
+        ("covariance", "cholesky", "precision", "precision_cholesky") ||
+        error("structured receipt does not cover every MVN HAVE boundary")
+    get(protocol, "mvn_all_boundaries_native_and_reactant_accepted", false) ||
+        error("structured receipt lacks all-boundary native/Reactant acceptance")
     support = receipt["support"]
     support_errors = receipt["support_errors"]
     for family in ("mvnormal_cholesky", "stationary_ar1")

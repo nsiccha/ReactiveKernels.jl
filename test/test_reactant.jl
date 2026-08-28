@@ -217,21 +217,27 @@ end
 
     @testset "non-scalar MVN and AR(1) kernels compile and replica-map" begin
         mvnormal = _evaluate_distribution_kernel_source(MVNORMAL_SOURCE)
-        mvn_x_host, mvn_μ_host, chol_host = Tuple(mvnormal.inputs)
-        mvn_x = Reactant.to_rarray(mvn_x_host)
-        mvn_μ = Reactant.to_rarray(mvn_μ_host)
-        chol = Reactant.to_rarray(chol_host)
-        mvn_kernel = mvnormal.kernel
-        mvn_compiled = @compile mvn_kernel(mvn_x, mvn_μ, chol)
-        @test mvn_compiled(mvn_x, mvn_μ, chol) ≈ mvnormal.output
-
-        mvn_replica_x_host, _, _ = Tuple(mvnormal.replica_inputs)
+        mvn_replica_x_host = mvnormal.replica_inputs.x
         mvn_replica_x = Reactant.to_rarray(mvn_replica_x_host)
-        mvn_replicated = mvnormal.replicated
-        mvn_replica_compiled = @compile mvn_replicated(
-            mvn_replica_x, mvn_μ, chol)
-        @test Array(mvn_replica_compiled(mvn_replica_x, mvn_μ, chol)) ≈
-              mvnormal.replica_output
+        for name in propertynames(mvnormal.kernels)
+            host_inputs = Tuple(getproperty(mvnormal.parametrization_inputs, name))
+            mvn_x = Reactant.to_rarray(host_inputs[1])
+            mvn_μ = Reactant.to_rarray(host_inputs[2])
+            representation = Reactant.to_rarray(host_inputs[3])
+
+            mvn_kernel = getproperty(mvnormal.kernels, name)
+            mvn_compiled = @compile mvn_kernel(mvn_x, mvn_μ, representation)
+            @test mvn_compiled(mvn_x, mvn_μ, representation) ≈
+                  getproperty(mvnormal.parametrization_outputs, name)
+
+            mvn_replicated = getproperty(mvnormal.replicated_kernels, name)
+            mvn_replica_compiled = @compile mvn_replicated(
+                mvn_replica_x, mvn_μ, representation)
+            expected = mvn_replicated(
+                mvn_replica_x_host, host_inputs[2], host_inputs[3])
+            @test Array(mvn_replica_compiled(
+                mvn_replica_x, mvn_μ, representation)) ≈ expected
+        end
 
         ar1 = _evaluate_distribution_kernel_source(AR1_SOURCE)
         ar_x_host, ar_μ_host, ar_ϕ_host, ar_logσ_host = Tuple(ar1.inputs)

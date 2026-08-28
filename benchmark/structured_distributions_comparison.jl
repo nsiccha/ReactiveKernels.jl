@@ -250,7 +250,11 @@ function run_benchmark()
             "julia_threads" => Threads.nthreads(), "reactant_backend" => "default CPU",
         ),
         "protocol" => Dict(
-            "families" => ["Cholesky-parameterized MVN", "stationary AR(1)"],
+            "families" => ["MVN (Cholesky HAVE benchmark)", "stationary AR(1)"],
+            "mvn_have_boundaries" => [
+                "covariance", "cholesky", "precision", "precision_cholesky",
+            ],
+            "mvn_all_boundaries_native_and_reactant_accepted" => true,
             "ar1_baseline" => "equivalent dense MvNormal with precomputed Cholesky factor",
             "construction_and_factorization_timed" => false,
             "element_type" => "Float64", "rounds" => rounds,
