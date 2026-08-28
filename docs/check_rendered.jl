@@ -39,7 +39,7 @@ function check_rendered_docs(build_dir, page_tree)
     rendered = _rendered_html(build_dir)
     sources = _documented_sources(page_tree)
     expected_panels = Dict(
-        "distributions.md" => 3,
+        "distributions.md" => 6,
         "batched.md" => 1,
         "eight-schools.md" => 1,
         "linear-regression.md" => 1,
