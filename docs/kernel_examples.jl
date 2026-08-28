@@ -352,6 +352,13 @@ function _benchmark_allocation_cell(row, name)
            Int(measurement["median_allocs"]), " alloc")
 end
 
+# `Markdown.Table` cells are vectors of inline nodes, not bare strings. Passing
+# a string directly makes MarkdownAST treat each character as an interpolated
+# Julia value; DocumenterVitepress then emits one warning per character even
+# though the final text looks plausible. Keep the table AST well formed.
+_markdown_table_cell(value) = Any[string(value)]
+_markdown_table_row(values...) = Any[_markdown_table_cell(value) for value in values]
+
 """
     render_distribution_benchmarks() -> Markdown.MD
 
@@ -382,19 +389,19 @@ function render_distribution_benchmarks()
     )
 
     timing_rows = Vector{Any}[
-        Any[
+        _markdown_table_row(
             "N", "RK native", "Distributions native", "ProbabilityMeasures native",
             "RK + Reactant", "Distributions + Reactant", "ProbabilityMeasures + Reactant",
-        ],
+        ),
     ]
     allocation_rows = Vector{Any}[
-        Any[
+        _markdown_table_row(
             "N", "RK native", "Distributions native", "ProbabilityMeasures native",
             "RK + Reactant", "ProbabilityMeasures + Reactant",
-        ],
+        ),
     ]
     for row in receipt["measurements"]
-        push!(timing_rows, Any[
+        push!(timing_rows, _markdown_table_row(
             string(Int(row["n"])),
             _benchmark_time_cell(row, "rk_native"),
             _benchmark_time_cell(row, "distributions_native"),
@@ -402,15 +409,15 @@ function render_distribution_benchmarks()
             _benchmark_time_cell(row, "rk_reactant"),
             _benchmark_time_cell(row, "distributions_reactant"),
             _benchmark_time_cell(row, "probability_measures_reactant"),
-        ])
-        push!(allocation_rows, Any[
+        ))
+        push!(allocation_rows, _markdown_table_row(
             string(Int(row["n"])),
             _benchmark_allocation_cell(row, "rk_native"),
             _benchmark_allocation_cell(row, "distributions_native"),
             _benchmark_allocation_cell(row, "probability_measures_native"),
             _benchmark_allocation_cell(row, "rk_reactant"),
             _benchmark_allocation_cell(row, "probability_measures_reactant"),
-        ])
+        ))
     end
 
     largest = last(receipt["measurements"])
@@ -450,9 +457,9 @@ function render_distribution_benchmarks()
     Markdown.MD(Any[
         Markdown.Paragraph(Any[summary]),
         Markdown.Table(timing_rows, fill(:r, 7)),
-        Markdown.Paragraph(Any[Markdown.Bold("Allocation receipts")]),
+        Markdown.Paragraph(Any[Markdown.Bold(Any["Allocation receipts"])]),
         Markdown.Table(allocation_rows, fill(:r, 6)),
-        Markdown.Paragraph(Any[Markdown.Italic(provenance)]),
+        Markdown.Paragraph(Any[Markdown.Italic(Any[provenance])]),
     ])
 end
 
