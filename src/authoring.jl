@@ -1306,6 +1306,48 @@ function _kernel_definition_parts(ex::Expr)
     nothing
 end
 
+# A short, expression-bodied stateless definition exposes its value as a port
+# named after the kernel:
+#
+#     @kernel square(x) = x * x     # HAVE x, WANT square
+#
+# Keep block bodies byte-identical: their established contract is graph-shaped
+# (implicit derived sinks, or an explicit return selecting existing ports). The
+# synthetic result assignment is introduced only after the Mode-1/Mode-2
+# discriminators have rejected the stateful paths.
+function _kernel_expression_result_body(name::Symbol, inputs, body, short_form::Bool)
+    # Julia wraps the RHS of `f(x) = expr` in a two-item block containing a
+    # LineNumberNode and `expr`. An explicit `begin ... end` has its own inner
+    # line marker/statements and stays on the established graph-body path.
+    short_form || return body
+    body isa Expr && body.head === :block && length(body.args) == 2 &&
+        _kernel_is_line(body.args[1]) || return body
+    result = body.args[2]
+    # Preserve the pre-existing compact graph forms `f(x) = (y = rhs)` and
+    # `f(x) = (x::T)`. Expression-result sugar applies to value expressions.
+    result isa Expr && (result.head === :(=) || result.head === :return ||
+        (result.head === :(::) && result.args[1] isa Symbol)) && return body
+
+    any(input -> input[1] === name, inputs) && throw(ArgumentError(
+        "expression-bodied @kernel `$name` cannot expose its result as :$name because " *
+        "the signature already declares an input port with that name; use a block body " *
+        "and choose an explicit result port"))
+
+    # A bare input result is a proven identity. Preserve its declared metadata
+    # type on the synthetic result so `_kernel_alias!` can collapse both labels
+    # to one canonical value/physical slot. Untyped inputs and computed results
+    # retain the ordinary metadata-only `Any` behavior.
+    lhs = name
+    if result isa Symbol
+        input_index = findfirst(input -> input[1] === result, inputs)
+        if input_index !== nothing
+            input_type = inputs[input_index][2]
+            input_type === nothing || (lhs = Expr(:(::), name, input_type))
+        end
+    end
+    Expr(:block, Expr(:(=), lhs, result), Expr(:return, name))
+end
+
 """
     @kernel model(f, x) = begin
         y = f(x)
@@ -1319,6 +1361,10 @@ end
     end
 
     prepare(affine)(3; offset = 4)
+
+    @kernel square(x) = x * x
+
+    prepare(square)(3)
 
     @kernel begin
         x::Float64
@@ -1351,6 +1397,13 @@ Every signature argument and assignment is exposed by name. `return` is
 optional: without one, derived sink ports form the default `want` boundary;
 with one, the returned port names replace that default. Either way, every port
 remains selectable through `spec[:name]` or `want = :name`.
+
+A short expression body is a compact single-result kernel. Its value is exposed
+as a port named after the kernel, and that port is the default `want` boundary:
+`@kernel square(x) = x * x` creates ports `:x` and `:square`. A bare identity
+such as `@kernel passthrough(x) = x` aliases the result port directly to the
+input without an identity recipe or an additional physical slot. Block bodies
+retain the graph-oriented sink/explicit-return behavior described above.
 
 Recipe metadata uses the compact form
 
@@ -1397,7 +1450,9 @@ macro kernel(ex)
         return _kernel_mode2_expand(name, inputs, call_signature, block,
                                     positional_names[1], raw_signature, __module__)
     end
-    esc(Expr(:(=), name, _kernel_expand(block, inputs, call_signature, __module__)))
+    stateless_body = _kernel_expression_result_body(name, inputs, block, ex.head === :(=))
+    esc(Expr(:(=), name,
+             _kernel_expand(stateless_body, inputs, call_signature, __module__)))
 end
 
 # --- named boundaries ------------------------------------------------------
