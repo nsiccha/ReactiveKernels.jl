@@ -79,7 +79,55 @@ Main.ReactiveKernelsDocs.execute_example(
 )
 ```
 
-## Native and Reactant benchmark
+## Structured families: multivariate Normal and AR(1)
+
+Non-scalar families use the same authoring idea, but they are not scalar
+`plate`s. The coordinates of a multivariate observation—and the time steps of
+an autoregressive series—are coupled inside one mathematical kernel. A
+Cholesky-parameterized multivariate Normal is therefore one vector kernel; its
+transparent steps expose centering, triangular whitening, the log determinant,
+and the quadratic form.
+
+```@eval
+Main.ReactiveKernelsDocs.execute_example(
+    @__MODULE__, Main.DistributionExamples.MVNORMAL_SOURCE,
+)
+```
+
+The stationary AR(1) kernel similarly treats the complete sequence as one
+value. Its lagged residuals give an O(T) log density, including the stationary
+initial-state term and an explicit `-Inf` result outside `abs(ϕ) < 1`.
+
+```@eval
+Main.ReactiveKernelsDocs.execute_example(
+    @__MODULE__, Main.DistributionExamples.AR1_SOURCE,
+)
+```
+
+Both examples then apply `replica(...; batched = :x)`: a matrix represents
+independent vectors or independent series by columns. The inner coordinate/time
+axis remains coupled, while the added trailing axis maps the whole authored
+kernel. The native and Reactant tests compile both the scalar and replicated
+forms from these exact source strings.
+
+### Structured native and Reactant benchmark
+
+The matched comparison below uses public multivariate-Normal log-density APIs.
+For AR(1), Distributions and ProbabilityMeasures receive the mathematically
+equivalent dense MVN with its Cholesky factor computed before timing; RK runs
+the authored O(T) recurrence. Distribution construction, factorization,
+compilation, and host↔device transfers are excluded from execution timings.
+
+```@eval
+Main.ReactiveKernelsDocs.render_structured_distribution_benchmarks()
+```
+
+The unsupported Reactant cells are measured compatibility results. At the
+pinned versions, ProbabilityMeasures' full MVN uses scalar indexing of the
+traced vector, while Distributions has no full-MVN `logpdf` method for a traced
+array. The receipt retains both diagnostics.
+
+## Scalar plate native and Reactant benchmark
 
 The comparison below evaluates the same batched Normal log density with shared
 location and scale parameters. The native columns use each library's idiomatic
