@@ -42,20 +42,14 @@ parameters ──► log prior
 log prior + log Jacobian + log likelihood ──► unconstrained log density
 ```
 
-The block below is the authored model, executed verbatim while the documentation
-is built. Its ordinary pure recipe functions are defined in the complete source
-linked above; the model source shown here is the single authority used by those
-tests and by this build. The likelihood is authored ONCE as a scalar per-school
-`@kernel` and `plate`d into a vectorized log density: it iterates the batched
-ports and sums the scalar result in one fused pass, materializing no
-per-observation vector (and hoisting any shared work above the loop).
+The likelihood is authored once as a scalar per-school `@kernel` and `plate`d
+into a vectorized log density: it iterates the batched ports and sums the scalar
+result in one fused pass, materializing no per-observation vector (and hoisting
+shared work above the loop).
 
-The panel below is one coherent, build-executed artifact—not three separately
-maintained snippets. **Raw input** is the exact source that builds and runs the
-query, **Generated kernel** is `code_expr(density_kernel)` from that execution,
-and **Compute DAG** is the live colored `visualize(density_plan)` component.
-Choose **Compare all** to inspect the same source, subkernel, and selected plan
-side by side without resetting the interactive DAG.
+The panel below shows three views of this model: **Raw input** (the source),
+**Generated kernel** (`code_expr(density_kernel)`), and **Compute DAG**
+(`visualize(density_plan)`). **Compare all** shows them side by side.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_ppl_example(

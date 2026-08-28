@@ -20,12 +20,11 @@ It fixes the storage type to a floating `T`, which keeps empty and singleton
 
 ## One source, generated subkernel, and colored plan
 
-The Raw pane below is the literal compact source executed by the docs build.
-It declares update/summary and partition-merge fragments with `@kernel`,
-composes them by name, and prepares only the streaming query. The Generated
-pane is `code_expr(update_kernel)` from that execution, and the Compute DAG is
-the selected `Plan` rendered by `visualize`; the unused partition branch is
-therefore absent from both generated views.
+The Raw pane below declares update/summary and partition-merge fragments with
+`@kernel`, composes them by name, and prepares only the streaming query. The
+Generated pane is `code_expr(update_kernel)`, and the Compute DAG is the selected
+`Plan` rendered by `visualize`; the unused partition branch is therefore absent
+from both generated views.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(@__MODULE__, raw"""
@@ -100,9 +99,7 @@ divergent transition (counted, not folded) and rejected otherwise.
 Independently summarized chain segments are mergeable, and the empty state is an
 exact identity.
 
-The compact block below is again the literal source executed by the docs build.
-Its Generated and Compute DAG panes therefore show the actual HMC diagnostics
-subkernel, not setup or include plumbing.
+The Generated and Compute DAG panes below show the HMC diagnostics subkernel.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(@__MODULE__, raw"""

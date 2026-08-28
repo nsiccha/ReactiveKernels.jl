@@ -121,11 +121,10 @@ authoring](online-stats.md#Mutation-friendly-reactive-authoring). Reach for a
 `prepare_nonallocating` kernel only for direct, single-caller execution, and
 copy any mutable result you need to keep before the next call.
 
-## Reproducible integration gate
+## Reproducing the extension tests
 
-The default package tests remain independent of the unregistered weak
-dependency. The optional extension is tested separately against the exact
-reviewed MutatingFunctions revision used above:
+The optional extension is tested against the exact reviewed MutatingFunctions
+revision used above:
 
 ```sh
 julia --startup-file=no test/run_nonallocating_integration.jl
@@ -133,5 +132,4 @@ julia --startup-file=no test/run_nonallocating_integration.jl
 
 This creates a temporary consumer environment, installs MutatingFunctions from
 the public URL at the pinned commit, develops the current ReactiveKernels tree,
-asserts the resolved revision, and runs the allocation/API tests. The GitHub
-Actions test workflow runs the same command in its own Julia 1.10 job.
+and runs the allocation/API tests.

@@ -35,15 +35,13 @@ unconstrained
 log prior + log Jacobian + log likelihood ──► unconstrained log density
 ```
 
-The important part is that these remain separate named ports. The compact block
-below is the authored model, executed verbatim while the documentation is built.
-Pointwise terms are a first-class port, so returning them together with the
-scalar density shares the likelihood computation rather than repeating it.
+These remain separate named ports: pointwise terms are a first-class port, so
+returning them together with the scalar density shares the likelihood
+computation rather than repeating it.
 
-The panel below is one coherent, build-executed artifact. **Raw input** is the
-exact source that builds and runs the query, **Generated kernel** is
-`code_expr(density_kernel)` from that execution, and **Compute DAG** is the live
-colored `visualize(density_plan)` component.
+The panel below shows three views of this model: **Raw input** (the source),
+**Generated kernel** (`code_expr(density_kernel)`), and **Compute DAG**
+(`visualize(density_plan)`).
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_ppl_example(
