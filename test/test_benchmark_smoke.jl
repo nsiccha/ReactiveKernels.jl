@@ -27,6 +27,14 @@ end
     end
 end
 
+@testset "distribution benchmark receipt validates" begin
+    validator = joinpath(_BENCH_DIR, "receipts", "validate_distributions.jl")
+    receipt = joinpath(_BENCH_DIR, "receipts", "distribution-logdensity-v1.toml")
+    @test isfile(receipt)
+    include(validator)
+    @test isempty(validate_distribution_receipt(receipt))
+end
+
 @testset "reproducibility guard: attached rejected, detached accepted, dirty rejected" begin
     include(joinpath(_BENCH_DIR, "_repro_guard.jl"))
     mktempdir() do dir

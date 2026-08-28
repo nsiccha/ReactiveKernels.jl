@@ -78,3 +78,32 @@ Main.ReactiveKernelsDocs.execute_example(
     @__MODULE__, Main.DistributionExamples.LOGNORMAL_SOURCE,
 )
 ```
+
+## Native and Reactant benchmark
+
+The comparison below evaluates the same batched Normal log density with shared
+location and scale parameters. The native columns use each library's idiomatic
+vectorized public interface; the Reactant columns compile the corresponding
+whole calculation with traced observations and traced shared parameters.
+
+```@eval
+Main.ReactiveKernelsDocs.render_distribution_benchmarks()
+```
+
+Each cell is the median of five minimum-time measurements, with Reactant work
+synchronized before timing. Compilation and host↔device transfers are excluded
+from execution times. The Reactant allocation cells report only the Julia host
+wrapper observed by `@allocated`, not device memory. Native RK's reduction is
+exactly zero-allocation; the other native public interfaces allocate their
+vector of pointwise densities before summing it.
+
+Distributions + Reactant is marked unsupported because its exact public
+constructor rejects traced `μ` and `σ` values. This is a compatibility result,
+not an omitted measurement. First-shape compilation is recorded in the receipt
+for diagnostics but is not compared: RK's first sample includes Reactant service
+startup because it ran first.
+
+The machine-readable inputs and all five raw samples are checked in as the
+[benchmark receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/distribution-logdensity-v1.toml). The
+docs build rejects a dirty/unpinned receipt or failed RK/ProbabilityMeasures
+Reactant acceptance, and the test suite independently re-derives every median.

@@ -1,0 +1,462 @@
+generated_at = "2026-08-28T08:55:34.641Z"
+schema = "distribution-logdensity-v1"
+
+[environment]
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+julia_threads = 1
+os = "Linux"
+reactant_backend = "default CPU"
+
+[[measurements]]
+max_abs_error = 0.0
+max_relative_error = 0.0
+n = 1
+probability_measures_reactant_compile_seconds = 2.954102247
+rk_reactant_compile_seconds = 9.495196624
+
+    [measurements.distributions_loop]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 30.0
+    times_ns = [30.0, 30.0, 30.0, 30.0, 30.0]
+
+    [measurements.distributions_native]
+    allocs = [1, 1, 1, 1, 1]
+    bytes = [64, 64, 64, 64, 64]
+    median_allocs = 1
+    median_bytes = 64
+    median_ns = 40.0
+    times_ns = [40.0, 40.0, 40.0, 50.0, 40.0]
+
+    [measurements.hand_hoisted]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 20.0
+    times_ns = [20.0, 20.0, 20.0, 20.0, 20.0]
+
+    [measurements.probability_measures_loop]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 30.0
+    times_ns = [30.0, 30.0, 30.0, 30.0, 30.0]
+
+    [measurements.probability_measures_native]
+    allocs = [1, 1, 1, 1, 1]
+    bytes = [64, 64, 64, 64, 64]
+    median_allocs = 1
+    median_bytes = 64
+    median_ns = 40.0
+    times_ns = [40.0, 40.0, 40.0, 40.0, 40.0]
+
+    [measurements.probability_measures_reactant]
+    allocs = [16, 16, 16, 16, 16]
+    bytes = [704, 704, 704, 704, 704]
+    median_allocs = 16
+    median_bytes = 704
+    median_ns = 3184.0
+    times_ns = [3104.0, 4997.0, 3015.0, 3335.0, 3184.0]
+
+    [measurements.rk_native]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 20.0
+    times_ns = [20.0, 20.0, 20.0, 20.0, 20.0]
+
+    [measurements.rk_reactant]
+    allocs = [16, 16, 16, 16, 16]
+    bytes = [704, 704, 704, 704, 704]
+    median_allocs = 16
+    median_bytes = 704
+    median_ns = 3225.0
+    times_ns = [3094.0, 3395.0, 3155.0, 3295.0, 3225.0]
+[[measurements]]
+max_abs_error = 2.2737367544323206e-13
+max_relative_error = 1.5543580317419439e-16
+n = 1000
+probability_measures_reactant_compile_seconds = 0.100824167
+rk_reactant_compile_seconds = 0.120449349
+
+    [measurements.distributions_loop]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 4737.0
+    times_ns = [4736.0, 4737.0, 4746.0, 4736.0, 4737.0]
+
+    [measurements.distributions_native]
+    allocs = [1, 1, 1, 1, 1]
+    bytes = [8128, 8128, 8128, 8128, 8128]
+    median_allocs = 1
+    median_bytes = 8128
+    median_ns = 4056.0
+    times_ns = [6779.0, 4035.0, 3906.0, 4085.0, 4056.0]
+
+    [measurements.hand_hoisted]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 941.0
+    times_ns = [941.0, 941.0, 951.0, 951.0, 941.0]
+
+    [measurements.probability_measures_loop]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 3504.0
+    times_ns = [3504.0, 3504.0, 3505.0, 3505.0, 3504.0]
+
+    [measurements.probability_measures_native]
+    allocs = [1, 1, 1, 1, 1]
+    bytes = [8128, 8128, 8128, 8128, 8128]
+    median_allocs = 1
+    median_bytes = 8128
+    median_ns = 3565.0
+    times_ns = [3565.0, 3585.0, 3605.0, 3555.0, 3555.0]
+
+    [measurements.probability_measures_reactant]
+    allocs = [16, 16, 16, 16, 16]
+    bytes = [704, 704, 704, 704, 704]
+    median_allocs = 16
+    median_bytes = 704
+    median_ns = 6158.0
+    times_ns = [8132.0, 6599.0, 4636.0, 6158.0, 5678.0]
+
+    [measurements.rk_native]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 951.0
+    times_ns = [951.0, 951.0, 951.0, 952.0, 952.0]
+
+    [measurements.rk_reactant]
+    allocs = [16, 16, 16, 16, 16]
+    bytes = [704, 704, 704, 704, 704]
+    median_allocs = 16
+    median_bytes = 704
+    median_ns = 8071.0
+    times_ns = [8071.0, 11056.0, 4546.0, 6038.0, 8552.0]
+[[measurements]]
+max_abs_error = 7.09405867382884e-11
+max_relative_error = 4.77977646671202e-15
+n = 10000
+probability_measures_reactant_compile_seconds = 0.086820448
+rk_reactant_compile_seconds = 0.088446772
+
+    [measurements.distributions_loop]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 48066.0
+    times_ns = [48757.0, 48437.0, 48066.0, 47937.0, 47706.0]
+
+    [measurements.distributions_native]
+    allocs = [2, 2, 2, 2, 2]
+    bytes = [80048, 80048, 80048, 80048, 80048]
+    median_allocs = 2
+    median_bytes = 80048
+    median_ns = 38543.0
+    times_ns = [38403.0, 38363.0, 38984.0, 38832.0, 38543.0]
+
+    [measurements.hand_hoisted]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 9192.0
+    times_ns = [9163.0, 9192.0, 9203.0, 9212.0, 9102.0]
+
+    [measurements.probability_measures_loop]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 34728.0
+    times_ns = [34999.0, 34728.0, 34598.0, 34598.0, 34748.0]
+
+    [measurements.probability_measures_native]
+    allocs = [2, 2, 2, 2, 2]
+    bytes = [80048, 80048, 80048, 80048, 80048]
+    median_allocs = 2
+    median_bytes = 80048
+    median_ns = 34858.0
+    times_ns = [34507.0, 34858.0, 34928.0, 34798.0, 35429.0]
+
+    [measurements.probability_measures_reactant]
+    allocs = [16, 16, 16, 16, 16]
+    bytes = [704, 704, 704, 704, 704]
+    median_allocs = 16
+    median_bytes = 704
+    median_ns = 21079.0
+    times_ns = [13639.0, 11176.0, 21630.0, 21269.0, 21079.0]
+
+    [measurements.rk_native]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 9553.0
+    times_ns = [9563.0, 9553.0, 9543.0, 9553.0, 9533.0]
+
+    [measurements.rk_reactant]
+    allocs = [16, 16, 16, 16, 16]
+    bytes = [704, 704, 704, 704, 704]
+    median_allocs = 16
+    median_bytes = 704
+    median_ns = 13349.0
+    times_ns = [13349.0, 10825.0, 17074.0, 14429.0, 11716.0]
+[[measurements]]
+max_abs_error = 1.2369127944111824e-10
+max_relative_error = 2.780303785492763e-15
+n = 30000
+probability_measures_reactant_compile_seconds = 0.078801918
+rk_reactant_compile_seconds = 0.081707059
+
+    [measurements.distributions_loop]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 142346.0
+    times_ns = [140634.0, 142547.0, 141785.0, 142496.0, 142346.0]
+
+    [measurements.distributions_native]
+    allocs = [2, 2, 2, 2, 2]
+    bytes = [240048, 240048, 240048, 240048, 240048]
+    median_allocs = 2
+    median_bytes = 240048
+    median_ns = 114498.0
+    times_ns = [114498.0, 112596.0, 114358.0, 115369.0, 120927.0]
+
+    [measurements.hand_hoisted]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 28569.0
+    times_ns = [28460.0, 28670.0, 28229.0, 28569.0, 28940.0]
+
+    [measurements.probability_measures_loop]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 105266.0
+    times_ns = [105266.0, 104985.0, 105196.0, 106817.0, 106848.0]
+
+    [measurements.probability_measures_native]
+    allocs = [2, 2, 2, 2, 2]
+    bytes = [240048, 240048, 240048, 240048, 240048]
+    median_allocs = 2
+    median_bytes = 240048
+    median_ns = 104154.0
+    times_ns = [104154.0, 104214.0, 103142.0, 107419.0, 102431.0]
+
+    [measurements.probability_measures_reactant]
+    allocs = [16, 16, 16, 16, 16]
+    bytes = [704, 704, 704, 704, 704]
+    median_allocs = 16
+    median_bytes = 704
+    median_ns = 25385.0
+    times_ns = [23913.0, 19687.0, 25385.0, 34498.0, 28940.0]
+
+    [measurements.rk_native]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 27528.0
+    times_ns = [27738.0, 27528.0, 27578.0, 26807.0, 26565.0]
+
+    [measurements.rk_reactant]
+    allocs = [16, 16, 16, 16, 16]
+    bytes = [704, 704, 704, 704, 704]
+    median_allocs = 16
+    median_bytes = 704
+    median_ns = 17004.0
+    times_ns = [16603.0, 17004.0, 28259.0, 30022.0, 15131.0]
+[[measurements]]
+max_abs_error = 1.1059455573558807e-9
+max_relative_error = 7.46895957629974e-15
+n = 100000
+probability_measures_reactant_compile_seconds = 0.086069771
+rk_reactant_compile_seconds = 0.085007534
+
+    [measurements.distributions_loop]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 475376.0
+    times_ns = [475206.0, 483227.0, 481835.0, 474864.0, 475376.0]
+
+    [measurements.distributions_native]
+    allocs = [2, 2, 2, 2, 2]
+    bytes = [800048, 800048, 800048, 800048, 800048]
+    median_allocs = 2
+    median_bytes = 800048
+    median_ns = 386634.0
+    times_ns = [398240.0, 386284.0, 378252.0, 386634.0, 389198.0]
+
+    [measurements.hand_hoisted]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 95061.0
+    times_ns = [94681.0, 95522.0, 93730.0, 95061.0, 96053.0]
+
+    [measurements.probability_measures_loop]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 349362.0
+    times_ns = [349362.0, 348140.0, 349393.0, 355009.0, 349302.0]
+
+    [measurements.probability_measures_native]
+    allocs = [2, 2, 2, 2, 2]
+    bytes = [800048, 800048, 800048, 800048, 800048]
+    median_allocs = 2
+    median_bytes = 800048
+    median_ns = 350384.0
+    times_ns = [356052.0, 350384.0, 356973.0, 344485.0, 342914.0]
+
+    [measurements.probability_measures_reactant]
+    allocs = [16, 16, 16, 16, 16]
+    bytes = [704, 704, 704, 704, 704]
+    median_allocs = 16
+    median_bytes = 704
+    median_ns = 44321.0
+    times_ns = [44601.0, 44321.0, 49057.0, 42930.0, 41738.0]
+
+    [measurements.rk_native]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 95802.0
+    times_ns = [95582.0, 95802.0, 95332.0, 97264.0, 96513.0]
+
+    [measurements.rk_reactant]
+    allocs = [16, 16, 16, 16, 16]
+    bytes = [704, 704, 704, 704, 704]
+    median_allocs = 16
+    median_bytes = 704
+    median_ns = 44521.0
+    times_ns = [38263.0, 41858.0, 47396.0, 48036.0, 44521.0]
+[[measurements]]
+max_abs_error = 6.915070116519928e-8
+max_relative_error = 4.6701024034436414e-14
+n = 1000000
+probability_measures_reactant_compile_seconds = 0.076736596
+rk_reactant_compile_seconds = 0.086157142
+
+    [measurements.distributions_loop]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 4.822166e6
+    times_ns = [4.822166e6, 4.821655e6, 4.761573e6, 4.988726e6, 4.864024e6]
+
+    [measurements.distributions_native]
+    allocs = [2, 2, 2, 2, 2]
+    bytes = [8000048, 8000048, 8000048, 8000048, 8000048]
+    median_allocs = 2
+    median_bytes = 8000048
+    median_ns = 3.951636e6
+    times_ns = [4.010555e6, 3.924417e6, 3.920983e6, 3.951636e6, 4.069118e6]
+
+    [measurements.hand_hoisted]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 946177.0
+    times_ns = [939978.0, 947857.0, 948669.0, 946177.0, 940348.0]
+
+    [measurements.probability_measures_loop]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 3.53473e6
+    times_ns = [3.578941e6, 3.52094e6, 3.53473e6, 3.570559e6, 3.516214e6]
+
+    [measurements.probability_measures_native]
+    allocs = [2, 2, 2, 2, 2]
+    bytes = [8000048, 8000048, 8000048, 8000048, 8000048]
+    median_allocs = 2
+    median_bytes = 8000048
+    median_ns = 3.598888e6
+    times_ns = [3.598888e6, 3.646835e6, 3.596325e6, 3.594201e6, 3.608802e6]
+
+    [measurements.probability_measures_reactant]
+    allocs = [16, 16, 16, 16, 16]
+    bytes = [704, 704, 704, 704, 704]
+    median_allocs = 16
+    median_bytes = 704
+    median_ns = 149096.0
+    times_ns = [175222.0, 138701.0, 196982.0, 149096.0, 143999.0]
+
+    [measurements.rk_native]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 938656.0
+    times_ns = [937835.0, 938656.0, 941600.0, 943432.0, 936253.0]
+
+    [measurements.rk_reactant]
+    allocs = [16, 16, 16, 16, 16]
+    bytes = [704, 704, 704, 704, 704]
+    median_allocs = 16
+    median_bytes = 704
+    median_ns = 119836.0
+    times_ns = [109671.0, 119836.0, 126625.0, 117091.0, 124442.0]
+
+[pins]
+distributions_version = "0.25.131"
+julia_version = "1.10.11"
+probability_measures_sha = "7cf3a6e112aaae2097b8d401b256d1bce635e03e"
+probability_measures_version = "0.1.0"
+reactant_jll_version = "0.0.401+0"
+reactant_version = "0.2.278"
+reactivekernels_dirty = false
+reactivekernels_sha = "f6b424cc360a1ac034f42c8425f04db101cdd384"
+
+[protocol]
+element_type = "Float64"
+estimator = "median of per-round BenchmarkTools minimum times"
+formula = "Normal log density with shared μ and σ"
+native_distributions_spelling = "sum(Distributions.logpdf.(Distributions.Normal(μ, σ), xs))"
+native_probability_measures_spelling = "sum(ProbabilityMeasures.logdensityof.(ProbabilityMeasures.Normal(μ, σ), xs))"
+reactant_compile_order = ["ReactiveKernels", "ProbabilityMeasures", "Distributions"]
+reactant_compile_time_in_timed_region = false
+reactant_compile_times_include_first_service_startup = true
+reactant_parameters_traced = true
+reactant_sync = true
+reactant_transfers_included = false
+rounds = 5
+samples_per_round = 200
+seconds_per_round = 0.25
+
+[support]
+distributions_reactant = false
+distributions_reactant_error = "MethodError: no method matching Distributions.Normal(::Reactant.TracedRNumber{Float64}, ::Reactant.TracedRNumber{Float64})"
+probability_measures_reactant = true
+rk_reactant = true
