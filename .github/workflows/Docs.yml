@@ -21,7 +21,9 @@ jobs:
         run: git config --global url."https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - uses: julia-actions/setup-julia@v2
         with:
-          version: '1'
+          # RuntimeGeneratedFunctions 0.5 currently fails under Julia 1.12's
+          # stricter world-age semantics; match the package's tested baseline.
+          version: '1.10'
       - uses: julia-actions/cache@v2
       - name: Install dependencies
         run: |
