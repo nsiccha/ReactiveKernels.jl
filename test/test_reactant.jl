@@ -56,6 +56,29 @@ end
     q_next::Vector{Float64} = accept ? qL : q
 end
 
+@kernel reactant_cauchy_logscale(
+        x::Float64, μ::Float64, logσ::Float64) = begin
+    σ::Float64 = exp(logσ)
+    z::Float64 = (x - μ) / σ
+    ld::Float64 = -log(π) - logσ - log1p(z^2)
+end
+
+@kernel reactant_laplace_logscale(
+        x::Float64, μ::Float64, logb::Float64) = begin
+    b::Float64 = exp(logb)
+    z::Float64 = (x - μ) / b
+    ld::Float64 = -log(2) - logb - abs(z)
+end
+
+@kernel reactant_lognormal_logscale(
+        x::Float64, μ::Float64, logσ::Float64) = begin
+    ld::Float64 = x > 0 ? begin
+        logx = log(x)
+        z = (logx - μ) / exp(logσ)
+        -0.5 * log(2π) - logσ - logx - 0.5 * z^2
+    end : -Inf
+end
+
 _rk_call(k, x, μ, scale) = k(x, μ, scale)
 _rk_allocated(k, x, μ, scale) = @allocated k(x, μ, scale)
 _rk_output_allocated(x) = @allocated similar(x, Float64)
@@ -150,6 +173,31 @@ end
             grad_U, potential, q, p0, u, stepsize, leapfrog_steps)
         @test Array(compiled(
             grad_U, potential, q, p0, u, stepsize, leapfrog_steps)) ≈ reference
+    end
+
+    @testset "distribution gallery operations and support selection" begin
+        cauchy = prepare(reactant_cauchy_logscale)
+        laplace = prepare(reactant_laplace_logscale)
+        lognormal = prepare(reactant_lognormal_logscale)
+        x, μ, logscale = Reactant.to_rarray.((1.4, 0.2, log(0.9));
+                                                    track_numbers = true)
+
+        cauchy_compiled = @compile cauchy(x, μ, logscale)
+        z = (1.4 - 0.2) / 0.9
+        @test cauchy_compiled(x, μ, logscale) ≈
+              -log(π) - log(0.9) - log1p(z^2)
+
+        laplace_compiled = @compile laplace(x, μ, logscale)
+        @test laplace_compiled(x, μ, logscale) ≈
+              -log(2) - log(0.9) - abs(z)
+
+        lognormal_compiled = @compile lognormal(x, μ, logscale)
+        logx = log(1.4)
+        lognormal_reference = -0.5 * log(2π) - log(0.9) - logx -
+                              0.5 * ((logx - 0.2) / 0.9)^2
+        @test lognormal_compiled(x, μ, logscale) ≈ lognormal_reference
+        unsupported_x = Reactant.to_rarray(-1.0; track_numbers = true)
+        @test lognormal_compiled(unsupported_x, μ, logscale) == -Inf
     end
 
     logscale_plan = plan(reactant_normal_logscale;

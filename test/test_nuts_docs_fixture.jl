@@ -14,7 +14,7 @@ using Test
     fixture = rstrip(read(fixture_path, String))
     md_lines = readlines(md_path)
 
-    # Locate the ```julia fence under "## The authoring source".
+    # Locate the ```julia fence inside the details block under "## The authoring source".
     hdr = findfirst(l -> startswith(l, "## The authoring source"), md_lines)
     @test hdr !== nothing
     open_idx = findnext(l -> l == "```julia", md_lines, hdr)
