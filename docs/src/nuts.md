@@ -104,14 +104,46 @@ invalidates stale values.
   dual averaging (`m`/`H`/`μ` + `fit!(x)`) and streaming Welford variance
   (`n`/`mean`/`var` + `step!(x)`), each written as its update rule.
 
-## A selected kernel in the standard compiler view
+## The full compiled kernel graph
 
-The complete sampler below is a method-bearing eight-spec artifact, not one
-stateless `Plan`: its recursive tree growth, ordered RNG effects, and in-place
-updates are sealed by the native method compiler. Its methodless Euclidean
-phasepoint recurrence *does* have an ordinary stateless plan, so it is the honest
-place to inspect NUTS work through the same three-pane view used by the
-distribution and batched examples.
+The graph below is the **full compiled NUTS kernel**: `reactive_nuts_group`
+compiles the entire per-transition Hamiltonian work into ONE flat
+`ReactiveProgram`, and this panel renders `reactive_program(group).plan` directly
+— a 67-node Compute DAG. The three phase-point endpoints `init`, `fwd`, and `bwd`
+each compute potential, gradient, kinetic term, and Hamiltonian; the three
+converge at the active-endpoint selection, the energy error `dham`, and the
+`diverged` flag, while the shared metric Cholesky and the potential/gradient
+authority fan into all three. This is the mathematical heart the sampler
+evaluates on every step.
+
+The tree recursion, leapfrog integration, U-turn criterion, and adaptation are
+ordinary type-stable Julia driver methods **outside** any reactive `Plan` — they
+*drive* this graph but are deliberately not graph recipes, so there is no single
+`Plan` for the whole sampler, only this compiled per-step program driven by
+native compiled recursion.
+
+The panel is build-executed. **Raw input** is the group construction;
+**Generated kernel** is the fused `:dham` (energy-error) getter `code_expr` — one
+representative compiled getter, not a whole-program listing; **Compute DAG** is
+that exact `reactive_program(group).plan`. **Compare all** opens the side-by-side
+split view. Read the graph as on the [DAG visualization](visualization.md) page:
+green nodes are `HAVE` inputs, orange nodes are `WANT` outputs, and blue nodes are
+the selected recipes that compute them.
+
+```@eval
+Main.ReactiveKernelsDocs.render_nuts_compiled_kernel_dag(@__MODULE__)
+```
+
+## A single Hamiltonian kernel (subordinate example)
+
+The graph above is the full compiled per-step kernel. This smaller panel zooms in
+on a **single Euclidean phasepoint** — one endpoint's Hamiltonian recurrence —
+extracted as an ordinary stateless `Plan`, so the core energy-and-gradient work
+can be read on its own through the same three-pane view used by the distribution
+and batched examples. It is a subordinate teaching extraction, not the full
+compiled sampler kernel: the complete sampler is the method-bearing eight-spec
+artifact below, whose recursive tree growth, ordered RNG effects, and in-place
+updates are sealed by the native method compiler and do not reduce to one plan.
 
 The panel is build-executed. **Raw input** contains the phasepoint math and the
 selected HAVE/WANT boundary; **Generated kernel** is the resulting

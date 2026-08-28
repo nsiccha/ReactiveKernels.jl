@@ -335,6 +335,68 @@ Raw input / Generated kernel / Compute DAG UI.
 """
 render_nuts_phasepoint(mod::Module) = execute_example(mod, NUTS_PHASEPOINT_SOURCE)
 
+# The FULL compiled NUTS kernel: reactive_nuts_group compiles the per-transition
+# init/fwd/bwd Hamiltonian work into ONE flat ReactiveProgram whose plan is the
+# 67-node Compute DAG. Unlike NUTS_PHASEPOINT_SOURCE (a stateless single-endpoint
+# extraction), this is the reactive three-endpoint group program. A trivial
+# analytic gradient and unit metric only instantiate the graph; its topology is
+# independent of the potential, so no AD backend is needed for the build.
+const NUTS_COMPILED_KERNEL_SOURCE = raw"""
+using LinearAlgebra
+
+# potential_gradient!(g, x) writes g in place and returns the SCALAR potential —
+# the reactive_nuts_group contract (see examples/nuts.jl). A trivial analytic
+# gradient suffices to build the graph; the compiled topology does not depend on it.
+docs_nuts_potential_gradient!(gradient, position) =
+    (gradient .= position; sum(abs2, position) / 2)
+
+dimension = 4
+# reactive_nuts_group is example-owned (loaded via ReactiveKernelsNUTSExample);
+# it compiles init/fwd/bwd Hamiltonian + dham + diverged into one ReactiveProgram.
+group = ReactiveKernels.reactive_nuts_group(
+    docs_nuts_potential_gradient!,
+    Matrix(1.0 * I, dimension, dimension),
+    zeros(dimension),
+    zeros(dimension),
+)
+program = reactive_program(group)
+
+# Generated pane: the fused reactive `:dham` (energy-error) getter — one
+# representative compiled getter, NOT a whole-program listing.
+generated_dham_getter = code_expr(program, getproperty(group.handles, :dham))
+# Compute DAG pane: the exact reactive_program(group).plan.
+compiled_plan = program.plan
+"""
+
+"""
+    render_nuts_compiled_kernel_dag(mod) -> Markdown.MD
+
+Build the FULL compiled NUTS kernel — the single flat `ReactiveProgram` that
+`reactive_nuts_group` compiles the per-transition Hamiltonian work into — and
+render it through the standard shared Raw input / Generated kernel / Compute DAG
+UI. The source is build-executed: the group and its `ReactiveProgram` are
+constructed while the docs build runs, and the Compute DAG is that exact
+`reactive_program(group).plan`. The Generated pane is the fused `:dham` getter, a
+representative reactive getter rather than a whole-program listing.
+"""
+function render_nuts_compiled_kernel_dag(mod::Module)
+    source = strip(NUTS_COMPILED_KERNEL_SOURCE, '\n')
+    Core.eval(mod, :(using ReactiveKernels))
+    _evaluate_source(mod, source)
+    program = Core.eval(mod, :program)
+    group = Core.eval(mod, :group)
+    program isa ReactiveKernels.ReactiveProgram || error(
+        "render_nuts_compiled_kernel_dag: source did not build a ReactiveProgram",
+    )
+    generated = _generated_source(
+        code_expr(program, getproperty(group.handles, :dham)))
+    blocks = Any[]
+    _three_pane_blocks!(
+        blocks, "Full compiled NUTS kernel — reactive group program",
+        source, generated, program.plan)
+    Markdown.MD(blocks)
+end
+
 """
     execute_ppl_example(mod, owner, source; setup) -> Markdown.MD
 
