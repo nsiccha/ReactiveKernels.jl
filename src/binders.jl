@@ -34,4 +34,3 @@ _kernel_binder_target(f::PartialFunction) = getfield(f, :func)
 _kernel_binder_kwargs(f::PartialFunction) = getfield(f, :kwargs)
 # Bound POSITIONAL actuals (left/right) — the factory validates a subject callable binds none (RK 09:36).
 _kernel_binder_positionals(f::PartialFunction) = (getfield(f, :largs), getfield(f, :rargs))
-

@@ -511,5 +511,3 @@ function _stats_produced!(diag::_DiagnosticsStore, b::_StatsBinding)
     for s in b.produced; _diag_bless!(diag, Val(s)); end
     diag
 end
-
-
