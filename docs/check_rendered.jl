@@ -45,6 +45,7 @@ function check_rendered_docs(build_dir, page_tree)
     expected_panels = Dict(
         "distributions.md" => 11,
         "batched.md" => 1,
+        "nuts.md" => 1,
         "eight-schools.md" => 1,
         "linear-regression.md" => 1,
         "beta-binomial.md" => 1,
@@ -118,6 +119,11 @@ function check_rendered_docs(build_dir, page_tree)
         if source == "eight-schools.md"
             for marker in ("Eight Schools Density", "Raw input", "Generated kernel", "Compute DAG")
                 occursin(marker, body) || error("Eight Schools page is missing marker: $marker")
+            end
+        end
+        if source == "nuts.md"
+            for marker in ("NUTS Phasepoint Hamiltonian", "Raw input", "Generated kernel", "Compute DAG")
+                occursin(marker, body) || error("NUTS page is missing three-pane marker: $marker")
             end
         end
     end
