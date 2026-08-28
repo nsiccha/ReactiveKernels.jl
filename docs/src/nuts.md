@@ -32,7 +32,8 @@ boundary and why the two implementations prove different things.
 
 | Piece | State |
 |---|---|
-| Source contract (the eight `@kernel` specs below, the seven `@rk_*` effect registrations, the plan shape) | **Landed as external compiler evidence.** `pot_f` and `grad_f` are alternative producers of `pot`; the planner selects the needed recipe while retaining both read-only callable authorities by identity. |
+| Source contract (the eight `@kernel` specs below and the plan shape) | **Landed as external compiler evidence.** `pot_f` and `grad_f` are alternative producers of `pot`; the planner selects the needed recipe while retaining both read-only callable authorities by identity. |
+| Current fixture's `@rk_pure` / `@rk_borrows` / `@rk_rng` declarations | **Transitional and removal-bound compatibility, not supported authoring API.** The replacement keeps helpers as visible arithmetic/control or captured sibling `@kernel` methods; ordinary unregistered helpers continue to reject. `@node` is unrelated and remains supported. |
 | All eight source specs construct; concrete phasepoint/frame init/recompute/copy verified | **Verified on `main`** — the compiler constructs and runs the complete external fixture; its sealed certificate records `mode = production`, which describes compiler evidence rather than package API status. |
 | Executable leapfrog (leaf scope) | **Verified** — analytic F32/F64; normal gradient Δ1, `@inferred`, exact 0-B; dirty-produced recovery analytic; dirty-source reject. |
 | Sealed fixture `nuts!!` (`step!`, tree growth, U-turn) | **Verified external exemplar** — sealed registry-free native recursion; `nuts!!(state; rng) === state` (same object, fixed type), **exact 0-B** on the compiler acceptance path. |
@@ -106,9 +107,12 @@ invalidates stale values.
 These are the properties the `@kernel` lowering is **locked to** and the landed sealed
 fixture entry **satisfies** (see the status table).
 
-- **Captured source, exact effect registrations.** The compiler schedules the fixture's
-  `@rk_pure` / `@rk_borrows` / `@rk_rng` helpers by their *registered* effects, never by
-  inferring the body. Authors touch no internals.
+- **Captured source and exact call authority.** The current external fixture still
+  schedules its removal-bound `@rk_pure` / `@rk_borrows` / `@rk_rng` compatibility
+  declarations by registered effects, never by body inference. Those macros are
+  evidence about the current snapshot, not the locked or recommended RK authoring
+  contract. The intended surface uses visible arithmetic/control or captured sibling
+  `@kernel` methods; ordinary unregistered helpers reject. `@node` remains supported.
 - **Immutable plan.** Construction produces a fixed-shape, fixed-type plan; the sealed
   entry mutates compiler-owned concrete state and returns the same object. The fixture
   identity holds: `nuts!!(state; rng)` returns `result === state` (same object, fixed
@@ -140,6 +144,12 @@ fixture, and this page renders live at
 The fixture's comment preamble preserves its integration-stage provenance, so its
 “docs not sourced” staging line is historical rather than the page's current
 status. The table above is authoritative.
+
+The verbatim source below still contains `@rk_pure`, `@rk_borrows`, and `@rk_rng`
+because it records the executable external fixture as it exists today. Those
+declarations are transitional and removal-bound compatibility—not examples to copy
+as stable RK API. Their tracked replacement will inline simple helpers or capture
+them as sibling `@kernel` methods. The fixture's `@node` use is unrelated and stays.
 
 ::: details Show the complete byte-synchronized authoring fixture
 
