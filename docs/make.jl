@@ -37,7 +37,8 @@ makedocs(
         "API"  => "api.md",
     ],
     checkdocs = :none,
-    warnonly = true,
+    # Build-executed examples must fail closed instead of silently losing their panel.
+    warnonly = Documenter.except(:eval_block),
 )
 
 # Ensure a root index.html redirect exists
