@@ -1570,6 +1570,24 @@ function replica(callable::_KernelSignatureCallable; batched)
     _kernel_signature_callable(replicated, callable.signature)
 end
 
+"""
+    plate(spec::KernelSpec; have, want, batched, reduce = :+) -> PreparedKernel
+
+Prepare a batched, loop-invariant-hoisting kernel from a scalar `@kernel` spec.
+The `batched` HAVE ports (a name or a collection of names) are passed as arrays;
+recipes that depend only on shared scalar ports are computed once, and the
+single scalar `want` is mapped over the batched values and reduced (a sum by
+default). Pass `reduce = nothing` to collect the per-element wants instead.
+
+The generated map/reduction form is both allocation-free for native reducing
+execution and traceable by array compilers such as Reactant. See
+[`lower_batched`](@ref).
+"""
+function plate(spec::KernelSpec; have, want, batched, reduce = :+)
+    p = plan(spec; have = have, want = want)
+    _prepare_batched(p; batched = batched, reduce = reduce)
+end
+
 inputs(spec::KernelSpec) = _kernel_selection(
     spec, _KERNEL_DEFAULT_BOUNDARY, spec.have_names, :have)
 outputs(spec::KernelSpec) = _kernel_selection(
