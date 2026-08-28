@@ -35,10 +35,13 @@ must stay inside the compiler's inspectable and registered subset.
 | Author a reactive object | `@reactive`, `ReactiveObject` | Ordinary property/method facade over compiled state | The same compiled-state operations |
 | Inspect the selected graph | `visualize`, `dot_source`, `save_visualization` | Plan/DAG view | No effect on compilation |
 
-The method-bearing source compiler, its factory, and its sealed NUTS builder are
-implementation surfaces rather than a general exported `prepare` API. The
-exported HMC/NUTS objects are described under [What the NUTS proof does and does
-not establish](#what-the-nuts-proof-does-and-does-not-establish).
+The method-bearing source compiler and its factory remain implementation
+surfaces rather than a general exported `prepare` API. NUTS, log-density, and
+PPL artifacts are external compilation examples and acceptance evidence, not
+domain APIs owned by ReactiveKernels. Any currently exported NUTS compatibility
+surface is transitional and removal-bound; it is not part of the definitive
+support contract below. See [What the NUTS proof does and does not
+establish](#what-the-nuts-proof-does-and-does-not-establish).
 
 ## The stateless compiler
 
@@ -471,8 +474,8 @@ effects reject instead of falling back to interpretation.
 
 ## What the NUTS proof does and does not establish
 
-The source-captured compiler's strongest end-to-end consumer is the reviewed
-eight-spec NUTS fixture shown on the [NUTS sampling](nuts.md) page. It exercises
+The source-captured compiler's strongest end-to-end external exemplar is the
+reviewed eight-spec NUTS fixture shown on the [NUTS sampling](nuts.md) page. It exercises
 alternative recipe planning, destination-bound potential/gradient production,
 owned and shared storage, endpoint copies, mutation kills, recomputation,
 recursive tree control, loops, early returns, RNG effects, optional statistics,
@@ -493,7 +496,7 @@ operations, and frame/root/scratch types. The acceptance evidence for that
 artifact verifies same-object mutation, inferred concrete return, exact
 zero allocation after construction, Float32/Float64 paths, two RNG types,
 exception/currentness behavior, and an instrumented emitted-operation census.
-The production root consults no graph, planner, mutable registry, or later-world
+The sealed acceptance root consults no graph, planner, mutable registry, or later-world
 method lookup.
 
 That proof is deliberately **not** a general Julia-recursion compiler proof. It
@@ -502,17 +505,21 @@ not establish arbitrary recursion, arbitrary containers or numeric subtypes,
 arbitrary integrators, automatic differentiation, PPL semantics, or a stable
 exported constructor for every method-bearing `@kernel`.
 
-There is also a packaging distinction:
+There is also a package-boundary distinction:
 
-- the sealed `_build_nuts_sampler` compiler and certificate accessors are
-  internal acceptance surfaces built from the reviewed fixture; and
-- the exported `nuts_state` / `CompiledNUTSState` path currently uses a public
-  compiled-reactive phase-point group for Hamiltonian dependencies and ordinary
-  inferred Julia for recursive tree growth, RNG choices, and proposal scratch.
+- the sealed `_build_nuts_sampler` compiler, fixture entry, and certificate
+  accessors are compiler-acceptance surfaces for an external NUTS exemplar, not
+  a sampler API shipped by ReactiveKernels; and
+- the currently exported `nuts_state` / `CompiledNUTSState` compatibility path
+  is transitional and removal-bound, not part of the intended support contract.
+  It uses a compiled-reactive phase-point group for Hamiltonian dependencies and
+  ordinary inferred Julia for recursive tree growth, RNG choices, and proposal
+  scratch.
 
 Therefore “the sealed native compiler runs the NUTS fixture” must not be read as
-“every call through the exported HMC API is that sealed artifact.” Both paths
-are implemented and tested, but they prove different compiler boundaries.
+“ReactiveKernels exports or promises a NUTS API.” The fixture and transitional
+compatibility path are implemented and tested as compiler evidence, but neither
+turns NUTS, log-density, or PPL models into the package's domain contract.
 
 ## Definitive support matrix
 
@@ -540,6 +547,7 @@ are implemented and tested, but they prove different compiler boundaries.
 | Reentrant/concurrent stateful kernel instance | No | Use one prepared mutable/cache-owning instance per independent caller |
 | Automatic differentiation | No compiler feature | AD may be an ordinary recipe/backend concern; the compiler does not choose or prove it |
 | PPL/model semantics | No compiler feature | Examples build log densities and samplers from ordinary recipes; there is no trace/address language |
+| NUTS, log-density, or PPL domain API | No | These are external compilation examples; any currently exported NUTS compatibility surface is transitional and removal-bound |
 | General dynamic scheduling in a hot kernel | No | Dynamic planning exists only in `ReactiveState` demand orchestration |
 | General Julia compiler replacement | No | Unsupported captured shapes reject; ordinary opaque stateless recipes remain ordinary Julia |
 
