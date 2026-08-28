@@ -7,6 +7,21 @@ using Test
 import Enzyme
 import Reactant: @compile, @jit
 
+include(joinpath(@__DIR__, "..", "examples", "distribution_kernel_sources.jl"))
+using .DistributionKernelSources: MVNORMAL_SOURCE, AR1_SOURCE
+
+function _evaluate_distribution_kernel_source(source::AbstractString)
+    sandbox = Module(gensym(:ReactantDistributionKernel), true, true)
+    Core.eval(sandbox, :(using ReactiveKernels))
+    parsed = Meta.parseall(source; filename = "reactant-distribution-kernel.jl")
+    expressions = parsed.head === :toplevel ? parsed.args : Any[parsed]
+    for expression in expressions
+        expression isa LineNumberNode && continue
+        Core.eval(sandbox, expression)
+    end
+    Core.eval(sandbox, :docs_example)
+end
+
 @kernel reactant_normal_logscale(
         x::Float64, μ::Float64 = 0.0, logσ::Float64 = 0.0) = begin
     σ::Float64 = exp(logσ)
@@ -198,6 +213,42 @@ end
         @test lognormal_compiled(x, μ, logscale) ≈ lognormal_reference
         unsupported_x = Reactant.to_rarray(-1.0; track_numbers = true)
         @test lognormal_compiled(unsupported_x, μ, logscale) == -Inf
+    end
+
+    @testset "non-scalar MVN and AR(1) kernels compile and replica-map" begin
+        mvnormal = _evaluate_distribution_kernel_source(MVNORMAL_SOURCE)
+        mvn_x_host, mvn_μ_host, chol_host = Tuple(mvnormal.inputs)
+        mvn_x = Reactant.to_rarray(mvn_x_host)
+        mvn_μ = Reactant.to_rarray(mvn_μ_host)
+        chol = Reactant.to_rarray(chol_host)
+        mvn_kernel = mvnormal.kernel
+        mvn_compiled = @compile mvn_kernel(mvn_x, mvn_μ, chol)
+        @test mvn_compiled(mvn_x, mvn_μ, chol) ≈ mvnormal.output
+
+        mvn_replica_x_host, _, _ = Tuple(mvnormal.replica_inputs)
+        mvn_replica_x = Reactant.to_rarray(mvn_replica_x_host)
+        mvn_replicated = mvnormal.replicated
+        mvn_replica_compiled = @compile mvn_replicated(
+            mvn_replica_x, mvn_μ, chol)
+        @test Array(mvn_replica_compiled(mvn_replica_x, mvn_μ, chol)) ≈
+              mvnormal.replica_output
+
+        ar1 = _evaluate_distribution_kernel_source(AR1_SOURCE)
+        ar_x_host, ar_μ_host, ar_ϕ_host, ar_logσ_host = Tuple(ar1.inputs)
+        ar_x = Reactant.to_rarray(ar_x_host)
+        ar_μ, ar_ϕ, ar_logσ = Reactant.to_rarray.(
+            (ar_μ_host, ar_ϕ_host, ar_logσ_host); track_numbers = true)
+        ar1_kernel = ar1.kernel
+        ar1_compiled = @compile ar1_kernel(ar_x, ar_μ, ar_ϕ, ar_logσ)
+        @test ar1_compiled(ar_x, ar_μ, ar_ϕ, ar_logσ) ≈ ar1.output
+
+        ar_replica_x_host, _, _, _ = Tuple(ar1.replica_inputs)
+        ar_replica_x = Reactant.to_rarray(ar_replica_x_host)
+        ar1_replicated = ar1.replicated
+        ar1_replica_compiled = @compile ar1_replicated(
+            ar_replica_x, ar_μ, ar_ϕ, ar_logσ)
+        @test Array(ar1_replica_compiled(
+            ar_replica_x, ar_μ, ar_ϕ, ar_logσ)) ≈ ar1.replica_output
     end
 
     logscale_plan = plan(reactant_normal_logscale;

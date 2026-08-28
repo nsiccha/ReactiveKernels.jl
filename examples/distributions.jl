@@ -12,13 +12,18 @@ module DistributionExamples
 
 export CONTINUOUS_SOURCE, DISCRETE_SOURCE, VECTORIZED_SOURCE
 export CAUCHY_SOURCE, LAPLACE_SOURCE, LOGNORMAL_SOURCE
+export MVNORMAL_SOURCE, AR1_SOURCE
 export all_sources, evaluate_source, run
 
 using Distributions
 using LogExpFunctions: logistic
 
+include("distribution_kernel_sources.jl")
+using .DistributionKernelSources: MVNORMAL_SOURCE, AR1_SOURCE
+
 _allocated(f, a, b) = @allocated f(a, b)
 _allocated(f, a, b, c) = @allocated f(a, b, c)
+_allocated(f, a, b, c, d) = @allocated f(a, b, c, d)
 
 const CONTINUOUS_SOURCE = raw"""
 @kernel normal_logpdf(x::Float64, μ::Float64, logσ::Float64) = begin
@@ -164,6 +169,7 @@ docs_example = (;
 all_sources() = (
     CONTINUOUS_SOURCE, DISCRETE_SOURCE, VECTORIZED_SOURCE,
     CAUCHY_SOURCE, LAPLACE_SOURCE, LOGNORMAL_SOURCE,
+    MVNORMAL_SOURCE, AR1_SOURCE,
 )
 
 function evaluate_source(source::AbstractString)
@@ -231,6 +237,25 @@ function evaluate_source(source::AbstractString)
         reference_call = (x, μ, logσ) -> logpdf(LogNormal(μ, exp(logσ)), x)
         reference = reference_call(inputs...)
         reference_allocated_bytes = _allocated(reference_call, x, μ, logσ)
+    elseif artifact.name === :multivariate_normal_cholesky
+        x, μ, chol = inputs
+        reference_call = (x, μ, chol) -> logpdf(MvNormal(μ, chol * chol'), x)
+        reference = reference_call(inputs...)
+        reference_allocated_bytes = _allocated(reference_call, x, μ, chol)
+    elseif artifact.name === :stationary_ar1
+        x, μ, ϕ, logσ = inputs
+        reference_call = function (x, μ, ϕ, logσ)
+            σ = exp(logσ)
+            abs(ϕ) < 1 || return -Inf
+            result = logpdf(Normal(μ, σ / sqrt(1 - ϕ^2)), first(x))
+            for t in 2:length(x)
+                conditional_mean = μ + ϕ * (x[t - 1] - μ)
+                result += logpdf(Normal(conditional_mean, σ), x[t])
+            end
+            result
+        end
+        reference = reference_call(inputs...)
+        reference_allocated_bytes = _allocated(reference_call, x, μ, ϕ, logσ)
     else
         error("unknown distribution example $(artifact.name)")
     end
