@@ -11,17 +11,16 @@
 module DistributionExamples
 
 export CONTINUOUS_SOURCE, DISCRETE_SOURCE, VECTORIZED_SOURCE
+export CAUCHY_SOURCE, LAPLACE_SOURCE, LOGNORMAL_SOURCE
 export all_sources, evaluate_source, run
 
-const CONTINUOUS_SOURCE = raw"""
 using Distributions
-using BenchmarkTools
+using LogExpFunctions: logistic
 
-# Native, Distributions.jl-free Gaussian log density as one have→want recipe.
-# We HAVE the log scale logσ, so the density uses it directly for the -logσ
-# term and derives σ = exp(logσ) only where the scale is genuinely needed (the
-# standardized residual). There is no exp-then-log round trip: log(σ) is never
-# recomputed from a σ we built out of the logσ we already hold.
+_allocated(f, a, b) = @allocated f(a, b)
+_allocated(f, a, b, c) = @allocated f(a, b, c)
+
+const CONTINUOUS_SOURCE = raw"""
 @kernel normal_logpdf(x::Float64, μ::Float64, logσ::Float64) = begin
     σ::Float64 = exp(logσ)
     z::Float64 = (x - μ) / σ
@@ -36,43 +35,18 @@ normal_kernel = prepare(normal_logpdf;
 inputs = (; x = 0.4, μ = -0.2, logσ = log(1.3))
 output = normal_kernel(Tuple(inputs)...)
 
-# Distributions.jl is an independent oracle only; it never runs in the kernel.
-normal_reference(x, μ, logσ) = logpdf(Normal(μ, exp(logσ)), x)
-reference = normal_reference(Tuple(inputs)...)
-
-allocation_bytes(f, a, b, c) = @ballocated $f($a, $b, $c)
-allocated_bytes = allocation_bytes(normal_kernel, Tuple(inputs)...)
-reference_allocated_bytes = allocation_bytes(normal_reference, Tuple(inputs)...)
-inferred_return = only(Base.return_types(
-    normal_kernel, Tuple{map(typeof, Tuple(inputs))...},
-))
-
-@assert output ≈ reference
-@assert !occursin("Distributions", string(code_expr(normal_kernel)))
-
 docs_example = (;
     name = :continuous_normal,
     origin = "native Gaussian log density (build executed)",
     inputs,
     kernel = normal_kernel,
     output,
-    reference,
-    allocated_bytes,
-    reference_allocated_bytes,
-    inferred_return,
 )
 """
 
 const DISCRETE_SOURCE = raw"""
-using Distributions
 using LogExpFunctions
-using BenchmarkTools
 
-# Native Bernoulli-logit log density as one have→want recipe. The observed
-# outcome selects between the two numerically stable log-probabilities
-# -log1pexp(∓logit) in closed form; no separate family/observation fragments
-# and nothing to compose. Differentiation is only with respect to the
-# continuous logit.
 @kernel bernoulli_logit_logpdf(observed::Bool, logit::Float64) = begin
     logdensity::Float64 = observed ? -log1pexp(-logit) : -log1pexp(logit)
 end
@@ -85,53 +59,22 @@ bernoulli_kernel = prepare(bernoulli_logit_logpdf;
 inputs = (; observed = true, logit = -0.7)
 output = bernoulli_kernel(Tuple(inputs)...)
 
-# Distributions.jl oracle only.
-bernoulli_reference(observed, logit) =
-    logpdf(Bernoulli(logistic(logit)), observed)
-reference = bernoulli_reference(Tuple(inputs)...)
-
-allocation_bytes(f, a, b) = @ballocated $f($a, $b)
-allocated_bytes = allocation_bytes(bernoulli_kernel, Tuple(inputs)...)
-reference_allocated_bytes = allocation_bytes(
-    bernoulli_reference, Tuple(inputs)...,
-)
-inferred_return = only(Base.return_types(
-    bernoulli_kernel, Tuple{map(typeof, Tuple(inputs))...},
-))
-
-@assert output ≈ reference
-@assert !occursin("Distributions", string(code_expr(bernoulli_kernel)))
-
 docs_example = (;
     name = :discrete_bernoulli_logit,
     origin = "native Bernoulli-logit log density (build executed)",
     inputs,
     kernel = bernoulli_kernel,
     output,
-    reference,
-    allocated_bytes,
-    reference_allocated_bytes,
-    inferred_return,
 )
 """
 
 const VECTORIZED_SOURCE = raw"""
-using Distributions
-using BenchmarkTools
-
-# The SAME scalar per-observation Gaussian log density, authored ONCE.
 @kernel normal_logpdf(x::Float64, μ::Float64, logσ::Float64) = begin
     σ::Float64 = exp(logσ)
     z::Float64 = (x - μ) / σ
     logdensity::Float64 = -0.5 * log(2π) - logσ - 0.5 * z^2
 end
 
-# `plate` turns that scalar recipe into a VECTORIZED log density that does NO
-# repeated work: the shared-scale recipe σ = exp(logσ) is HOISTED and computed
-# ONCE above the batch loop, and only the per-observation residual runs N times.
-# `batched = (:x,)` marks the observations as varying per element while μ and the
-# log scale are shared. Passing a `Vector` for `x` is the only thing that makes
-# it batched — the author writes no broadcast and no sum.
 vectorized = plate(normal_logpdf;
     have = (:x, :μ, :logσ), want = :logdensity, batched = (:x,))
 
@@ -141,46 +84,87 @@ logσ = log(1.2)
 inputs = (; x, μ, logσ)
 output = vectorized(x, μ, logσ)
 
-# Distributions.jl oracle only: the summed per-observation log density.
-vectorized_reference(x, μ, logσ) = sum(logpdf.(Normal(μ, exp(logσ)), x))
-reference = vectorized_reference(Tuple(inputs)...)
-
-# The per-observation vector (LOO/WAIC) comes from the SAME authored kernel via
-# `reduce = nothing`, sharing the hoisted work — only the vector is materialized.
-per_obs = plate(normal_logpdf; have = (:x, :μ, :logσ), want = :logdensity,
-                batched = (:x,), reduce = nothing)(x, μ, logσ)
-
-allocation_bytes(f, a, b, c) = @ballocated $f($a, $b, $c)
-allocated_bytes = allocation_bytes(vectorized, x, μ, logσ)
-reference_allocated_bytes = allocation_bytes(vectorized_reference, x, μ, logσ)
-inferred_return = only(Base.return_types(
-    vectorized, Tuple{map(typeof, Tuple(inputs))...}))
-
-# exp(logσ) (the shared-scale recipe, __ops__[1]) appears exactly ONCE in the
-# lowered kernel — hoisted above the loop, never recomputed per observation.
-@assert length(collect(eachmatch(r"__ops__\[1\]",
-    string(code_expr(vectorized))))) == 1
-@assert output ≈ reference
-@assert per_obs ≈ logpdf.(Normal(μ, exp(logσ)), x)
-@assert sum(per_obs) ≈ output
-@assert inferred_return === Float64
-@assert !occursin("Distributions", string(code_expr(vectorized)))
-
 docs_example = (;
     name = :vectorized_normal,
     origin = "vectorized Gaussian log density via `plate` — invariants hoisted (build executed)",
     inputs,
     kernel = vectorized,
     output,
-    reference,
-    per_obs,
-    allocated_bytes,
-    reference_allocated_bytes,
-    inferred_return,
 )
 """
 
-all_sources() = (CONTINUOUS_SOURCE, DISCRETE_SOURCE, VECTORIZED_SOURCE)
+const CAUCHY_SOURCE = raw"""
+@kernel cauchy_logpdf(x::Float64, μ::Float64, logσ::Float64) = begin
+    σ::Float64 = exp(logσ)
+    z::Float64 = (x - μ) / σ
+    logdensity::Float64 = -log(π) - logσ - log1p(z^2)
+end
+
+cauchy_kernel = prepare(cauchy_logpdf;
+    have = (:x, :μ, :logσ), want = :logdensity)
+
+inputs = (; x = 2.4, μ = -0.3, logσ = log(1.1))
+output = cauchy_kernel(Tuple(inputs)...)
+
+docs_example = (;
+    name = :cauchy_heavy_tail,
+    origin = "native Cauchy log density (build executed)",
+    inputs,
+    kernel = cauchy_kernel,
+    output,
+)
+"""
+
+const LAPLACE_SOURCE = raw"""
+@kernel laplace_logpdf(x::Float64, μ::Float64, logb::Float64) = begin
+    b::Float64 = exp(logb)
+    z::Float64 = (x - μ) / b
+    logdensity::Float64 = -log(2) - logb - abs(z)
+end
+
+laplace_kernel = prepare(laplace_logpdf;
+    have = (:x, :μ, :logb), want = :logdensity)
+
+inputs = (; x = -1.7, μ = 0.2, logb = log(0.8))
+output = laplace_kernel(Tuple(inputs)...)
+
+docs_example = (;
+    name = :laplace_sharp_peak,
+    origin = "native Laplace log density (build executed)",
+    inputs,
+    kernel = laplace_kernel,
+    output,
+)
+"""
+
+const LOGNORMAL_SOURCE = raw"""
+@kernel lognormal_logpdf(x::Float64, μ::Float64, logσ::Float64) = begin
+    logdensity::Float64 = x > 0 ? begin
+        logx = log(x)
+        z = (logx - μ) / exp(logσ)
+        -0.5 * log(2π) - logσ - logx - 0.5 * z^2
+    end : -Inf
+end
+
+lognormal_kernel = prepare(lognormal_logpdf;
+    have = (:x, :μ, :logσ), want = :logdensity)
+
+inputs = (; x = 1.4, μ = 0.2, logσ = log(0.9))
+output = lognormal_kernel(Tuple(inputs)...)
+
+docs_example = (;
+    name = :lognormal_positive_support,
+    origin = "native LogNormal log density with support guard (build executed)",
+    inputs,
+    kernel = lognormal_kernel,
+    output,
+)
+"""
+
+all_sources() = (
+    CONTINUOUS_SOURCE, DISCRETE_SOURCE, VECTORIZED_SOURCE,
+    CAUCHY_SOURCE, LAPLACE_SOURCE, LOGNORMAL_SOURCE,
+)
 
 function evaluate_source(source::AbstractString)
     sandbox = Module(gensym(:DistributionExample), true, true)
@@ -191,7 +175,69 @@ function evaluate_source(source::AbstractString)
         expression isa LineNumberNode && continue
         Core.eval(sandbox, expression)
     end
-    Core.eval(sandbox, :docs_example)
+    artifact = Core.eval(sandbox, :docs_example)
+    inputs = Tuple(artifact.inputs)
+    argtypes = Tuple{map(typeof, inputs)...}
+    inferred_return = only(Base.return_types(artifact.kernel, argtypes))
+    allocated_bytes = Base.invokelatest(_allocated, artifact.kernel, inputs...)
+
+    if artifact.name === :continuous_normal
+        x, μ, logσ = inputs
+        reference_call = (x, μ, logσ) -> logpdf(Normal(μ, exp(logσ)), x)
+        reference = reference_call(inputs...)
+        reference_allocated_bytes = _allocated(reference_call, x, μ, logσ)
+        return merge(artifact, (;
+            reference, allocated_bytes, reference_allocated_bytes, inferred_return,
+        ))
+    elseif artifact.name === :discrete_bernoulli_logit
+        observed, logit = inputs
+        reference_call = (observed, logit) ->
+            logpdf(Bernoulli(logistic(logit)), observed)
+        reference = reference_call(inputs...)
+        reference_allocated_bytes = _allocated(reference_call, observed, logit)
+        return merge(artifact, (;
+            reference, allocated_bytes, reference_allocated_bytes, inferred_return,
+        ))
+    elseif artifact.name === :vectorized_normal
+        x, μ, logσ = inputs
+        reference_call = (x, μ, logσ) ->
+            sum(logpdf.(Normal(μ, exp(logσ)), x))
+        reference = reference_call(inputs...)
+        reference_allocated_bytes = _allocated(reference_call, x, μ, logσ)
+        per_obs = Core.eval(sandbox, quote
+            per_obs_kernel = plate(
+                normal_logpdf;
+                have = (:x, :μ, :logσ), want = :logdensity,
+                batched = (:x,), reduce = nothing,
+            )
+            per_obs_kernel(Tuple(docs_example.inputs)...)
+        end)
+        return merge(artifact, (;
+            reference, per_obs, allocated_bytes,
+            reference_allocated_bytes, inferred_return,
+        ))
+    elseif artifact.name === :cauchy_heavy_tail
+        x, μ, logσ = inputs
+        reference_call = (x, μ, logσ) -> logpdf(Cauchy(μ, exp(logσ)), x)
+        reference = reference_call(inputs...)
+        reference_allocated_bytes = _allocated(reference_call, x, μ, logσ)
+    elseif artifact.name === :laplace_sharp_peak
+        x, μ, logb = inputs
+        reference_call = (x, μ, logb) -> logpdf(Laplace(μ, exp(logb)), x)
+        reference = reference_call(inputs...)
+        reference_allocated_bytes = _allocated(reference_call, x, μ, logb)
+    elseif artifact.name === :lognormal_positive_support
+        x, μ, logσ = inputs
+        reference_call = (x, μ, logσ) -> logpdf(LogNormal(μ, exp(logσ)), x)
+        reference = reference_call(inputs...)
+        reference_allocated_bytes = _allocated(reference_call, x, μ, logσ)
+    else
+        error("unknown distribution example $(artifact.name)")
+    end
+
+    merge(artifact, (;
+        reference, allocated_bytes, reference_allocated_bytes, inferred_return,
+    ))
 end
 
 function run(io::IO = stdout)

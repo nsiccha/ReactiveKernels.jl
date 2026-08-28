@@ -18,11 +18,21 @@ end
 @testset "benchmark scripts parse (anti-rot)" begin
     for name in ("nuts_comparison.jl", "nuts_comparison_body.jl",
                  "nuts_microbench.jl", "nuts_microbench_ca9.jl",
-                 "_ca9_microbench_body.jl", "_repro_guard.jl")
+                 "_ca9_microbench_body.jl", "_repro_guard.jl",
+                 "distributions_comparison.jl",
+                 joinpath("receipts", "validate_distributions.jl"))
         path = joinpath(_BENCH_DIR, name)
         @test isfile(path)
         @test _parses(path)
     end
+end
+
+@testset "distribution benchmark receipt validates" begin
+    validator = joinpath(_BENCH_DIR, "receipts", "validate_distributions.jl")
+    receipt = joinpath(_BENCH_DIR, "receipts", "distribution-logdensity-v1.toml")
+    @test isfile(receipt)
+    include(validator)
+    @test isempty(validate_distribution_receipt(receipt))
 end
 
 @testset "reproducibility guard: attached rejected, detached accepted, dirty rejected" begin

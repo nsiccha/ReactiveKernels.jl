@@ -8,7 +8,7 @@ using ReactiveKernels: code_expr
     artifacts = map(evaluate_source, all_sources())
 
     @testset "sources build native recipes checked against a Distributions oracle" begin
-        @test length(artifacts) == 3
+        @test length(artifacts) == 6
         # Every source declares @kernel recipes.
         @test all(source -> occursin(r"@kernel \w+\(", source), all_sources())
         continuous, discrete, vectorized = all_sources()
@@ -34,6 +34,9 @@ using ReactiveKernels: code_expr
         end
         # Values match the independent Distributions.jl oracle.
         @test all(artifact -> isapprox(artifact.output, artifact.reference), artifacts)
+        lognormal = artifacts[6]
+        _, μ, logσ = Tuple(lognormal.inputs)
+        @test lognormal.kernel(-1.0, μ, logσ) == -Inf
     end
 
     @testset "allocation is well-formed; the scalar densities are 0-alloc" begin
@@ -47,7 +50,7 @@ using ReactiveKernels: code_expr
     end
 
     @testset "concrete inference evidence matches exact result types" begin
-        expected_returns = (Float64, Float64, Float64)
+        expected_returns = ntuple(_ -> Float64, 6)
         for (artifact, expected_return) in zip(artifacts, expected_returns)
             observed = artifact.kernel(Tuple(artifact.inputs)...)
             @test isconcretetype(artifact.inferred_return)

@@ -31,6 +31,7 @@ site_pages = [
 
 makedocs(
     sitename = "ReactiveKernels.jl",
+    repo = "https://github.com/nsiccha/ReactiveKernels.jl",
     modules  = [ReactiveKernels],
     format   = DocumenterVitepress.MarkdownVitepress(
         repo = "github.com/nsiccha/ReactiveKernels.jl",

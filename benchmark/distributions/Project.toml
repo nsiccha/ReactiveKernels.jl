@@ -1,0 +1,12 @@
+[deps]
+BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
+Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
+ProbabilityMeasures = "d96443b0-2461-4412-bb6f-797ac5201ef9"
+Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+ReactiveKernels = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
+
+[compat]
+BenchmarkTools = "=1.8.0"
+Distributions = "=0.25.131"
+Reactant = "=0.2.278"
+julia = "1.10"
