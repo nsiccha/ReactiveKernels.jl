@@ -332,6 +332,10 @@ const _STRUCTURED_DISTRIBUTION_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts",
     "structured-distribution-logdensity-v1.toml",
 )
+const _SCALAR_GALLERY_RECEIPT_PATH = joinpath(
+    dirname(@__DIR__), "benchmark", "receipts",
+    "scalar-distribution-gallery-v1.toml",
+)
 
 function _benchmark_time(ns)
     value = Float64(ns)
@@ -509,6 +513,106 @@ function render_distribution_benchmarks()
         Markdown.Table(timing_rows, fill(:r, 7)),
         Markdown.Paragraph(Any[Markdown.Bold(Any["Allocation receipts"])]),
         Markdown.Table(allocation_rows, fill(:r, 6)),
+        Markdown.Paragraph(Any[Markdown.Italic(Any[provenance])]),
+    ])
+end
+
+"""
+    render_scalar_gallery_benchmarks() -> Markdown.MD
+
+Render the checked-in Exponential/Geometric/Uniform plate benchmark receipt.
+Every row requires native parity plus RK and ProbabilityMeasures Reactant
+acceptance; unsupported Distributions Reactant cells retain a diagnostic.
+"""
+function render_scalar_gallery_benchmarks()
+    receipt = TOML.parsefile(_SCALAR_GALLERY_RECEIPT_PATH)
+    get(receipt, "schema", "") == "scalar-distribution-gallery-v1" ||
+        error("unexpected scalar gallery benchmark receipt schema")
+    pins = receipt["pins"]
+    get(pins, "reactivekernels_dirty", true) == false || error(
+        "scalar gallery receipt was produced from a dirty RK tree",
+    )
+    protocol = receipt["protocol"]
+    get(protocol, "reactant_sync", false) ||
+        error("scalar gallery Reactant receipt is not synchronous")
+    get(protocol, "reactant_transfers_included", true) &&
+        error("scalar gallery Reactant receipt includes host/device transfers")
+    families = (
+        "exponential_logscale", "geometric_logit", "uniform_bounded",
+    )
+    Tuple(protocol["families"]) == families ||
+        error("unexpected scalar gallery family inventory")
+    support = receipt["support"]
+    support_errors = receipt["support_errors"]
+    for family in families
+        family_support = support[family]
+        get(family_support, "rk_reactant", false) ||
+            error("$family does not accept the RK Reactant path")
+        get(family_support, "probability_measures_reactant", false) ||
+            error("$family does not accept the ProbabilityMeasures Reactant path")
+        if !get(family_support, "distributions_reactant", false)
+            isempty(get(support_errors[family], "distributions_reactant", "")) &&
+                error("$family Distributions Reactant path lacks a diagnostic")
+        end
+    end
+
+    timing_rows = Vector{Any}[
+        _markdown_table_row(
+            "Family", "N", "RK native", "Distributions native",
+            "ProbabilityMeasures native", "RK + Reactant",
+            "Distributions + Reactant", "ProbabilityMeasures + Reactant",
+        ),
+    ]
+    family_label = Dict(
+        "exponential_logscale" => "Exponential",
+        "geometric_logit" => "Geometric",
+        "uniform_bounded" => "Uniform",
+    )
+    for row in receipt["measurements"]
+        push!(timing_rows, _markdown_table_row(
+            family_label[row["family"]],
+            string(Int(row["n"])),
+            _benchmark_time_cell(row, "rk_native"),
+            _benchmark_time_cell(row, "distributions_native"),
+            _benchmark_time_cell(row, "probability_measures_native"),
+            _benchmark_time_cell(row, "rk_reactant"),
+            _benchmark_time_cell(row, "distributions_reactant"),
+            _benchmark_time_cell(row, "probability_measures_reactant"),
+        ))
+    end
+
+    largest_n = maximum(Int(row["n"]) for row in receipt["measurements"])
+    ratio(row, numerator, denominator) = round(
+        row[numerator]["median_ns"] / row[denominator]["median_ns"];
+        digits = 2,
+    )
+    summaries = String[]
+    for family in families
+        row = only(filter(
+            candidate -> candidate["family"] == family &&
+                         Int(candidate["n"]) == largest_n,
+            receipt["measurements"],
+        ))
+        push!(summaries,
+            "$(family_label[family]): Distributions/RK native " *
+            "$(ratio(row, "distributions_native", "rk_native"))×, " *
+            "ProbabilityMeasures/RK native " *
+            "$(ratio(row, "probability_measures_native", "rk_native"))×, " *
+            "ProbabilityMeasures+Reactant/RK+Reactant " *
+            "$(ratio(row, "probability_measures_reactant", "rk_reactant"))×")
+    end
+    summary = "At N=$largest_n, measured runtime ratios (comparison/RK) are: " *
+              join(summaries, "; ") * "."
+    sha = first(String(pins["reactivekernels_sha"]), 10)
+    pm_sha = first(String(pins["probability_measures_sha"]), 10)
+    provenance = "Receipt pins: RK `$sha`; ProbabilityMeasures `$pm_sha`; " *
+                 "Distributions $(pins["distributions_version"]); " *
+                 "Reactant $(pins["reactant_version"]); Julia " *
+                 "$(pins["julia_version"]); $(receipt["environment"]["cpu"])."
+
+    Markdown.MD(Any[
+        Markdown.Paragraph(Any[summary]),
+        Markdown.Table(timing_rows, fill(:r, 8)),
         Markdown.Paragraph(Any[Markdown.Italic(Any[provenance])]),
     ])
 end

@@ -12,6 +12,7 @@ module DistributionExamples
 
 export CONTINUOUS_SOURCE, DISCRETE_SOURCE, VECTORIZED_SOURCE
 export CAUCHY_SOURCE, LAPLACE_SOURCE, LOGNORMAL_SOURCE
+export EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE
 export MVNORMAL_SOURCE, AR1_SOURCE
 export all_sources, evaluate_source, run
 
@@ -19,7 +20,9 @@ using Distributions
 using LogExpFunctions: logistic
 
 include("distribution_kernel_sources.jl")
-using .DistributionKernelSources: MVNORMAL_SOURCE, AR1_SOURCE
+using .DistributionKernelSources:
+    EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE,
+    MVNORMAL_SOURCE, AR1_SOURCE
 
 _allocated(f, a, b) = @allocated f(a, b)
 _allocated(f, a, b, c) = @allocated f(a, b, c)
@@ -169,6 +172,7 @@ docs_example = (;
 all_sources() = (
     CONTINUOUS_SOURCE, DISCRETE_SOURCE, VECTORIZED_SOURCE,
     CAUCHY_SOURCE, LAPLACE_SOURCE, LOGNORMAL_SOURCE,
+    EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE,
     MVNORMAL_SOURCE, AR1_SOURCE,
 )
 
@@ -237,6 +241,22 @@ function evaluate_source(source::AbstractString)
         reference_call = (x, μ, logσ) -> logpdf(LogNormal(μ, exp(logσ)), x)
         reference = reference_call(inputs...)
         reference_allocated_bytes = _allocated(reference_call, x, μ, logσ)
+    elseif artifact.name === :exponential_logscale
+        x, logθ = inputs
+        reference_call = (x, logθ) -> logpdf(Exponential(exp(logθ)), x)
+        reference = reference_call(inputs...)
+        reference_allocated_bytes = _allocated(reference_call, x, logθ)
+    elseif artifact.name === :geometric_logit
+        observed, logitp = inputs
+        reference_call = (observed, logitp) ->
+            logpdf(Geometric(logistic(logitp)), observed)
+        reference = reference_call(inputs...)
+        reference_allocated_bytes = _allocated(reference_call, observed, logitp)
+    elseif artifact.name === :uniform_bounded
+        x, lower, upper = inputs
+        reference_call = (x, lower, upper) -> logpdf(Uniform(lower, upper), x)
+        reference = reference_call(inputs...)
+        reference_allocated_bytes = _allocated(reference_call, x, lower, upper)
     elseif artifact.name === :multivariate_normal_have_want
         x, μ, chol = inputs
         reference_call = (x, μ, chol) -> logpdf(MvNormal(μ, chol * chol'), x)

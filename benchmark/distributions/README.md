@@ -13,6 +13,12 @@ julia --startup-file=no benchmark/receipts/validate_distributions.jl \
   benchmark/receipts/distribution-logdensity-v1.toml
 
 julia --startup-file=no --project=benchmark/distributions \
+  benchmark/scalar_distribution_gallery_comparison.jl \
+  --output=benchmark/receipts/scalar-distribution-gallery-v1.toml
+julia --startup-file=no benchmark/receipts/validate_scalar_gallery_distributions.jl \
+  benchmark/receipts/scalar-distribution-gallery-v1.toml
+
+julia --startup-file=no --project=benchmark/distributions \
   benchmark/structured_distributions_comparison.jl \
   --output=benchmark/receipts/structured-distribution-logdensity-v1.toml
 julia --startup-file=no benchmark/receipts/validate_structured_distributions.jl \
@@ -25,6 +31,11 @@ region; every compiled call uses `sync=true`, and both model parameters remain
 tracked runtime values. Per-shape compilation diagnostics are retained in the
 receipt; the first RK compile includes Reactant service startup and is not used
 as a cross-library compile-time comparison.
+
+The scalar-gallery benchmark compares the exact Exponential, Geometric, and
+Uniform scalar sources after their generic `plate` lift. It records two vector
+sizes per family, traces every model parameter under Reactant, and keeps an
+explicit diagnostic for any public comparison path that does not compile.
 
 The structured benchmark compares the exact build-executed MVN and stationary
 AR(1) sources against the public multivariate-Normal interfaces in Distributions
