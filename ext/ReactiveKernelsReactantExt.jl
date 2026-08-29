@@ -56,7 +56,7 @@ end
 # separately generated eager broadcast/reduction body, avoiding forbidden
 # scalar indexing while leaving XLA free to fuse the tensor operations.
 @inline function ReactiveKernels._batched_call(
-        f::ReactiveKernels._BatchedFunctionPair, ops, args,
+        f::ReactiveKernels._ArrayFunctionPair, ops, args,
         marker::Reactant.RArray)
     f.tensorized(ops, args...)
 end

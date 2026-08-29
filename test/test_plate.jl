@@ -18,6 +18,31 @@ using Test
     ld::Float64 = -0.5 * log(2π) - logσ - 0.5 * z^2
 end
 
+const embedded_plate_nlogpdf = plate(plate_nlogpdf;
+    have = (:x, :μ, :logσ), want = :ld, batched = :x)
+
+@kernel embedded_plate_model(x::Vector{Float64},
+                             μ::Float64,
+                             logσ::Float64) = begin
+    total::Float64 = embedded_plate_nlogpdf(x, μ, logσ)
+end
+
+const embedded_plate_middle = prepare(embedded_plate_model;
+    have = (:x, :μ, :logσ), want = :total)
+
+@kernel embedded_plate_outer(x::Vector{Float64},
+                             μ::Float64,
+                             logσ::Float64) = begin
+    total::Float64 = embedded_plate_middle(x, μ, logσ)
+end
+
+@kernel embedded_plate_shifted(x::Vector{Float64},
+                               μ::Float64,
+                               logσ::Float64) = begin
+    total::Float64 = embedded_plate_nlogpdf(x, μ, logσ)
+    shifted::Float64 = total + μ
+end
+
 # Function barrier so `@allocated` measures the kernel, not global-ref boxing.
 _plate_call(k, xs, μ, logσ) = k(xs, μ, logσ)
 
@@ -30,6 +55,44 @@ _plate_call(k, xs, μ, logσ) = k(xs, μ, logσ)
     @testset "value equals the summed per-observation density" begin
         ref = sum(-0.5 * log(2π) - logσ - 0.5 * ((xi - μ) / exp(logσ))^2 for xi in xs)
         @test k(xs, μ, logσ) ≈ ref
+    end
+
+    @testset "prepare splices generated plate code into an outer kernel" begin
+        embedded = prepare(embedded_plate_model;
+            have = (:x, :μ, :logσ), want = :total)
+        @test embedded(xs, μ, logσ) ≈ k(xs, μ, logσ)
+        generated = string(code_expr(embedded))
+        @test occursin("for ", generated)
+        @test !occursin("similar", generated)
+        @test !any(op -> op isa ReactiveKernels.PreparedKernel, embedded.ops)
+        @test length(embedded.ops) == length(embedded_plate_nlogpdf.ops)
+        readable = string(ReactiveKernels._readable_expr(
+            code_expr(embedded), embedded))
+        @test !occursin(r"__ops__\[\d+\]", readable)
+        @test occursin("-0.5", readable)
+    end
+
+    @testset "two-level composition preserves native and tensorized products" begin
+        outer = prepare(embedded_plate_outer;
+            have = (:x, :μ, :logσ), want = :total)
+        @test outer(xs, μ, logσ) ≈ k(xs, μ, logσ)
+        @test embedded_plate_middle.f isa ReactiveKernels._EmbeddedFunctionPair
+        @test outer.f isa ReactiveKernels._EmbeddedFunctionPair
+        @test occursin("for ", string(code_expr(outer)))
+        @test !occursin("for ", string(outer.f.tensorized_ast))
+        @test !any(op -> op isa ReactiveKernels.PreparedKernel, outer.ops)
+        @test length(outer.ops) == length(embedded_plate_nlogpdf.ops)
+    end
+
+    @testset "public raw Plan lowering retains its outer operation table" begin
+        raw_plan = plan(embedded_plate_shifted;
+            have = (:x, :μ, :logσ), want = :shifted)
+        raw_ast = ReactiveKernels.lower(raw_plan)
+        raw_ops = Tuple(recipe.op for recipe in raw_plan.recipes)
+        @test length(raw_ops) == 2
+        @test first(raw_ops) === embedded_plate_nlogpdf
+        @test ReactiveKernels.compile(raw_ast)(raw_ops, xs, μ, logσ) ≈
+              k(xs, μ, logσ) + μ
     end
 
     @testset "invariant `exp(logσ)` is hoisted ABOVE the loop (Stan-parity)" begin

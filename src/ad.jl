@@ -291,14 +291,44 @@ function ad_gradient(kernel::PreparedKernel,
     DifferentiationInterface.gradient(call, backend, point, contexts...)
 end
 
-function ad_gradient(prepared::PreparedADKernel{I}, args...; kwargs...) where {I}
+function _ad_prepared_arguments(
+        prepared::PreparedADKernel{I}, args, kwargs::NamedTuple) where {I}
     resolved = _ad_resolve(prepared.resolver, args, NamedTuple(kwargs))
     length(resolved) == length(inputs(prepared.kernel)) || throw(ArgumentError(
         "selected HAVE boundary expects $(length(inputs(prepared.kernel))) " *
         "values; got $(length(resolved))"))
-    point, contexts = _ad_arguments(Val(I), resolved)
+    _ad_arguments(Val(I), resolved)
+end
+
+function ad_gradient(prepared::PreparedADKernel, args...; kwargs...)
+    point, contexts = _ad_prepared_arguments(
+        prepared, args, NamedTuple(kwargs))
     DifferentiationInterface.gradient(
         prepared.call, prepared.preparation, prepared.backend,
+        point, contexts...)
+end
+
+"""
+    ad_value_and_gradient!(prepared, gradient, args...; kwargs...)
+
+Compute the scalar value and gradient for a reusable [`PreparedADKernel`](@ref),
+writing the gradient into `gradient`. Runtime arguments follow the original RK
+HAVE boundary; the prepared active port is reordered to DI position one, and
+every other current argument is rebound as a fresh
+`DifferentiationInterface.Constant` context.
+
+Returns the `(value, gradient)` pair from
+`DifferentiationInterface.value_and_gradient!`. The destination must be valid
+for the active argument's gradient and is mutated in place. Like
+[`ad_gradient`](@ref), this prepared object and its DI preparation are not
+thread-safe; use one per concurrent caller.
+"""
+function ad_value_and_gradient!(
+        prepared::PreparedADKernel, gradient, args...; kwargs...)
+    point, contexts = _ad_prepared_arguments(
+        prepared, args, NamedTuple(kwargs))
+    DifferentiationInterface.value_and_gradient!(
+        prepared.call, gradient, prepared.preparation, prepared.backend,
         point, contexts...)
 end
 

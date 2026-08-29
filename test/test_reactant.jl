@@ -9,6 +9,7 @@ import Reactant: @compile, @jit
 
 include(joinpath(@__DIR__, "..", "examples", "distribution_kernel_sources.jl"))
 using .DistributionKernelSources:
+    NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY,
     EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE,
     MVNORMAL_SOURCE, AR1_SOURCE
 include(joinpath(@__DIR__, "..", "examples", "eight_schools.jl"))
@@ -107,6 +108,31 @@ function _normal_reference(x, μ, logσ)
     -0.5 * log(2π) - logσ - 0.5 * ((x - μ) / exp(logσ))^2
 end
 
+const REACTANT_SOURCE_NORMAL_LOGSCALE = prepare(NORMAL_LOGDENSITY;
+    have = (:x, :location, :log_scale), want = :logdensity)
+
+@kernel reactant_embedded_source_normal(
+        x::Float64, location::Float64, log_scale::Float64) = begin
+    logdensity::Float64 =
+        REACTANT_SOURCE_NORMAL_LOGSCALE(x, location, log_scale)
+end
+
+const REACTANT_NESTED_PLATE = plate(reactant_normal_logscale;
+    have = (:x, :μ, :logσ), want = :ld, batched = :x)
+
+@kernel reactant_nested_plate_middle(
+        x::Vector{Float64}, μ::Float64, logσ::Float64) = begin
+    total::Float64 = REACTANT_NESTED_PLATE(x, μ, logσ)
+end
+
+const REACTANT_NESTED_MIDDLE = prepare(reactant_nested_plate_middle;
+    have = (:x, :μ, :logσ), want = :total)
+
+@kernel reactant_nested_plate_outer(
+        x::Vector{Float64}, μ::Float64, logσ::Float64) = begin
+    total::Float64 = REACTANT_NESTED_MIDDLE(x, μ, logσ)
+end
+
 @testset "Reactant optional compiler integration" begin
     @test Base.get_extension(ReactiveKernels, :ReactiveKernelsReactantExt) !== nothing
 
@@ -133,6 +159,19 @@ end
         @test prior ≈ reference_prior
         @test likelihood ≈ reference_likelihood
 
+        # The full posterior is another named-node selection over the same
+        # graph. Supplying the named latent HAVE boundary avoids scalar indexing
+        # into a traced packed vector without defining a second model path.
+        posterior_kernel = prepare(artifact.model;
+            have = (:μ, :log_τ, :θ, :observations, :observation_scales),
+            want = :posterior)
+        posterior_compiled = @compile posterior_kernel(
+            μ, log_τ, effects, observations, scales)
+        @test posterior_compiled(μ, log_τ, effects, observations, scales) ≈
+              posterior_kernel(
+                  q_host[1], q_host[2], q_host[3:end],
+                  EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA)
+
         pointwise_compiled = @compile artifact.pointwise_kernel(
             observations, effects, scales)
         @test Array(pointwise_compiled(observations, effects, scales)) ≈
@@ -152,6 +191,53 @@ end
                                                 track_numbers = true)
         compiled = @compile kernel(x, μ, logσ)
         @test compiled(x, μ, logσ) ≈ _normal_reference(0.2, 0.3, log(1.2))
+    end
+
+    @testset "reusable Normal and Cauchy sources compile and plate" begin
+        x_host = 0.4
+        location_host = -0.2
+        scale_host = 1.3
+        log_scale_host = log(scale_host)
+        x, location, scale, log_scale = Reactant.to_rarray.(
+            (x_host, location_host, scale_host, log_scale_host);
+            track_numbers = true)
+
+        for spec in (NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY)
+            scale_kernel = prepare(spec;
+                have = (:x, :location, :scale), want = :logdensity)
+            logscale_kernel = prepare(spec;
+                have = (:x, :location, :log_scale), want = :logdensity)
+            both_kernel = prepare(spec;
+                have = (:x, :location, :scale, :log_scale),
+                want = :logdensity)
+            scale_compiled = @compile scale_kernel(x, location, scale)
+            logscale_compiled = @compile logscale_kernel(x, location, log_scale)
+            both_compiled = @compile both_kernel(
+                x, location, scale, log_scale)
+            reference = scale_kernel(x_host, location_host, scale_host)
+            @test scale_compiled(x, location, scale) ≈ reference
+            @test logscale_compiled(x, location, log_scale) ≈ reference
+            @test both_compiled(x, location, scale, log_scale) ≈ reference
+        end
+
+        observations_host = [28.0, 8.0, -3.0, 7.0]
+        effects_host = [1.0, 1.5, -0.5, 0.25]
+        scales_host = [15.0, 10.0, 16.0, 11.0]
+        likelihood = plate(NORMAL_LOGDENSITY;
+            have = (:x, :location, :scale),
+            want = :logdensity, batched = (:x, :location, :scale))
+        observations = Reactant.to_rarray(observations_host)
+        effects = Reactant.to_rarray(effects_host)
+        scales = Reactant.to_rarray(scales_host)
+        likelihood_compiled = @compile likelihood(observations, effects, scales)
+        @test likelihood_compiled(observations, effects, scales) ≈
+              likelihood(observations_host, effects_host, scales_host)
+
+        embedded = prepare(reactant_embedded_source_normal)
+        embedded_compiled = @compile embedded(x, location, log_scale)
+        @test embedded_compiled(x, location, log_scale) ≈
+              REACTANT_SOURCE_NORMAL_LOGSCALE(
+                  x_host, location_host, log_scale_host)
     end
 
     @testset "dynamic Bool selection is tensorized without changing native semantics" begin
@@ -359,6 +445,25 @@ end
         traced_logσ = Reactant.to_rarray(fixed_logσ; track_numbers = true)
         traced_compiled = @compile kernel(x, traced_μ, traced_logσ)
         @test traced_compiled(x, traced_μ, traced_logσ) ≈ fixed_reference
+    end
+
+    @testset "two-level prepared composition retains the tensorized plate" begin
+        outer = prepare(reactant_nested_plate_outer;
+            have = (:x, :μ, :logσ), want = :total)
+        x_host = collect(range(-1.4, 1.3; length = 16))
+        μ_host = 0.3
+        logσ_host = log(1.2)
+        reference = sum(_normal_reference(xi, μ_host, logσ_host)
+                        for xi in x_host)
+        @test outer(x_host, μ_host, logσ_host) ≈ reference
+        @test outer.f isa ReactiveKernels._EmbeddedFunctionPair
+        @test !occursin("for ", string(outer.f.tensorized_ast))
+
+        x = Reactant.to_rarray(x_host)
+        μ = Reactant.to_rarray(μ_host; track_numbers = true)
+        logσ = Reactant.to_rarray(logσ_host; track_numbers = true)
+        compiled = @compile outer(x, μ, logσ)
+        @test compiled(x, μ, logσ) ≈ reference
     end
 
     @testset "plate tensor body: multiple batched inputs and collection" begin
