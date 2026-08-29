@@ -14,11 +14,12 @@ vector `x` given fixed `(μ, log σ)` — and every value is parity-checked agai
 the closed form before timing. Three modes are timed, each **with and without
 Reactant** compilation:
 
-| Mode | What it computes | ReactiveKernels | Turing.jl |
-|---|---|---|---|
-| `primal` | the scalar log density | `prepare(model; want = :logdensity)` | `LogDensityProblems.logdensity` |
-| `gradient` | ∂ log density / ∂x | reverse-mode Enzyme via DifferentiationInterface | reverse-mode Enzyme via DifferentiationInterface |
-| `gq` | pointwise log densities (a vector) | `prepare(model; want = :pointwise)` | `DynamicPPL.generated_quantities` |
+- **`primal`** — the scalar log density. ReactiveKernels evaluates
+  `prepare(model; want = :logdensity)`; Turing uses `LogDensityProblems.logdensity`.
+- **`gradient`** — ∂ log density / ∂x, via one shared reverse-mode Enzyme backend
+  through DifferentiationInterface on both sides.
+- **`gq`** — the pointwise log densities (a vector). ReactiveKernels evaluates
+  `prepare(model; want = :pointwise)`; Turing uses `DynamicPPL.generated_quantities`.
 
 The gradient uses one shared reverse-mode Enzyme backend through
 DifferentiationInterface on both sides; the benchmark asserts that the Enzyme
@@ -36,22 +37,16 @@ Reactant-traceable**; those cells are reported unsupported rather than faked.
 
 ## Results
 
-Median per-call time in **nanoseconds, lower is better**, from the static receipt
+Median per-call time on a **log time axis — lower (shorter) is better**. Each bar
+is read straight from the static receipt
 [`benchmark/receipts/eval-throughput-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/eval-throughput-v1.toml)
-(default CPU backend, `Float64`). `Turing + Reactant` is unsupported for every
-mode.
+(default CPU backend, `Float64`) while the docs build, so the picture cannot drift
+from the numbers. `Turing + Reactant` is unsupported for every mode and is
+omitted.
 
-| n | Mode | RK native | RK + Reactant | Turing native |
-|---:|---|---:|---:|---:|
-| 16 | primal | 45 | 3 560 | 121 |
-| 16 | gradient | 111 | 3 243 | 524 |
-| 16 | gq | 33 | 3 197 | 67 |
-| 256 | primal | 163 | 17 134 | 629 |
-| 256 | gradient | 801 | 17 254 | 4 588 |
-| 256 | gq | 167 | 10 657 | 410 |
-| 4096 | primal | 1 640 | 18 240 | 4 100 |
-| 4096 | gradient | 9 961 | 11 637 | 27 248 |
-| 4096 | gq | 1 340 | 10 155 | 2 766 |
+```@eval
+Main.ReactiveKernelsDocs.eval_throughput_chart()
+```
 
 ## What the numbers say
 

@@ -53,6 +53,113 @@ function _generated_source(expr::Expr)
     sprint(Base.show_unquoted, expr; context = :limit => false)
 end
 
+# --- eval-throughput visualization ----------------------------------------
+# A build-executed chart of the static eval-throughput receipt: grouped
+# horizontal bars on a log time axis, faceted by mode, one bar per timed series.
+# The bars are read straight from the receipt TOML, so the picture cannot drift
+# from the numbers. `RK + Reactant` and `Turing native` share the axis; Turing +
+# Reactant is unsupported and omitted.
+function _eval_throughput_receipt()
+    joinpath(pkgdir(ReactiveKernels), "benchmark", "receipts",
+             "eval-throughput-v1.toml")
+end
+
+function _fmt_ns(v)
+    v >= 1000 ? string(round(v / 1000; digits = 1), " µs") :
+                string(round(Int, v), " ns")
+end
+
+function eval_throughput_chart(; receipt = _eval_throughput_receipt())
+    data = TOML.parsefile(receipt)
+    measurements = data["measurements"]
+    modes = ("primal", "gradient", "gq")
+    sizes = (16, 256, 4096)
+    # label, implementation, variant, color (chosen to read on light AND dark).
+    series = (
+        ("RK native", "reactivekernels", "native", "#0a9d6b"),
+        ("RK + Reactant", "reactivekernels", "reactant", "#e08a1e"),
+        ("Turing native", "turing", "native", "#7b6cd9"),
+    )
+    med(impl, variant, mode, size) = begin
+        i = findfirst(m -> m["implementation"] == impl &&
+                           m["variant"] == variant &&
+                           m["mode"] == mode && m["size"] == size, measurements)
+        i === nothing ? nothing : float(measurements[i]["median_ns"])
+    end
+
+    # Log time axis shared across facets.
+    vmin, vmax = 10.0, 32_000.0
+    lg(v) = log10(clamp(v, vmin, vmax))
+    xL, xR = 132.0, 686.0                     # plot area in the 720-wide viewBox
+    xpix(v) = xL + (lg(v) - lg(vmin)) / (lg(vmax) - lg(vmin)) * (xR - xL)
+
+    barh, bargap, groupgap = 13.0, 5.0, 16.0
+    facet_title_h, facet_gap = 26.0, 20.0
+    rows_per_facet = length(sizes) * length(series)
+    facet_body_h = length(sizes) *
+        (length(series) * barh + (length(series) - 1) * bargap) +
+        (length(sizes) - 1) * groupgap
+    facet_h = facet_title_h + facet_body_h
+    top = 44.0                                # legend band
+    total_h = top + length(modes) * facet_h + (length(modes) - 1) * facet_gap + 24
+
+    io = IOBuffer()
+    print(io, """<svg viewBox="0 0 720 $(round(Int, total_h))" width="100%" """,
+        """role="img" aria-label="Evaluation throughput: median per-call time """,
+        """by mode, size and implementation" style="font: 12px/1.3 var(--vp-font-family-base, system-ui); color: var(--vp-c-text-1, currentColor);">""")
+
+    # Legend.
+    lx = xL
+    for (label, _, _, color) in series
+        print(io, """<rect x="$(round(lx;digits=1))" y="14" width="12" height="12" rx="2" fill="$color"/>""")
+        print(io, """<text x="$(round(lx+17;digits=1))" y="24" fill="currentColor">$label</text>""")
+        lx += 90 + 8 * length(label)
+    end
+
+    # Log gridlines + tick labels (10, 100, 1k, 10k).
+    for (tick, tlab) in ((10, "10 ns"), (100, "100 ns"), (1000, "1 µs"),
+                         (10_000, "10 µs"))
+        gx = round(xpix(tick); digits = 1)
+        print(io, """<line x1="$gx" y1="$(round(top;digits=1))" x2="$gx" """,
+            """y2="$(round(top + length(modes)*facet_h + (length(modes)-1)*facet_gap; digits=1))" """,
+            """stroke="var(--vp-c-divider, #ccc)" stroke-width="1" opacity="0.5"/>""")
+        print(io, """<text x="$gx" y="$(round(top-6;digits=1))" text-anchor="middle" """,
+            """fill="var(--vp-c-text-2, currentColor)" font-size="10">$tlab</text>""")
+    end
+
+    y = top
+    for mode in modes
+        print(io, """<text x="0" y="$(round(y+16;digits=1))" font-weight="600" """,
+            """fill="currentColor">$mode</text>""")
+        yb = y + facet_title_h
+        for size in sizes
+            print(io, """<text x="0" y="$(round(yb + (length(series)*barh + (length(series)-1)*bargap)/2 + 4; digits=1))" """,
+                """fill="var(--vp-c-text-2, currentColor)" font-size="11">n = $size</text>""")
+            for (label, impl, variant, color) in series
+                v = med(impl, variant, mode, size)
+                if v === nothing
+                    yb += barh + bargap
+                    continue
+                end
+                w = max(xpix(v) - xL, 1.0)
+                print(io, """<rect x="$(round(xL;digits=1))" y="$(round(yb;digits=1))" """,
+                    """width="$(round(w;digits=1))" height="$(round(barh;digits=1))" rx="2" """,
+                    """fill="$color"><title>$mode, n=$size, $label: $(_fmt_ns(v))</title></rect>""")
+                lx2 = xL + w + 5
+                print(io, """<text x="$(round(lx2;digits=1))" y="$(round(yb+barh-2;digits=1))" """,
+                    """font-size="10.5" fill="var(--vp-c-text-2, currentColor)">$(_fmt_ns(v))</text>""")
+                yb += barh + bargap
+            end
+            yb += groupgap - bargap
+        end
+        y += facet_h + facet_gap
+    end
+    print(io, "</svg>")
+    # Wrap in a Markdown.MD so Documenter's `@eval` renders the RawHTML block
+    # through the registered MarkdownAST conversion (same path as the PPL panels).
+    Markdown.MD(Any[RawHTML(String(take!(io)))])
+end
+
 function _dag_html(plan::Plan)
     # The docs content column is deliberately narrow. A top-to-bottom layout
     # keeps labels readable there without changing the public API's horizontal
