@@ -424,9 +424,10 @@ end
     _batched_call(f, ops, args, getfield(args, I))
 end
 
-struct _EmbeddedFunctionPair{I,N,T} <: _ArrayFunctionPair
+struct _EmbeddedFunctionPair{I,N,T,A} <: _ArrayFunctionPair
     native::N
     tensorized::T
+    tensorized_ast::A
 end
 
 @inline function (f::_EmbeddedFunctionPair{I})(ops, args...) where {I}
@@ -462,16 +463,24 @@ _embedded_kernel(kernel::PreparedKernel) = kernel
 _batched_options(::_BatchedFunctionPair{I,B,R}) where {I,B,R} = (B, R)
 function _embedded_ast(kernel::PreparedKernel, tensorized::Bool)
     tensorized || return kernel.ast
-    kernel.f isa _BatchedFunctionPair || return kernel.ast
-    batched, reduce = _batched_options(kernel.f)
-    _lower_batched_tensorized(
-        kernel.plan; batched = batched, reduce = reduce)
+    if kernel.f isa _BatchedFunctionPair
+        batched, reduce = _batched_options(kernel.f)
+        return _lower_batched_tensorized(
+            kernel.plan; batched = batched, reduce = reduce)
+    elseif kernel.f isa _EmbeddedFunctionPair
+        # The tensorized product may already contain arbitrarily nested plates
+        # and user AST passes. Preserve that exact prepared artifact instead of
+        # rebuilding from the native `kernel.ast`, which would silently restore
+        # scalar-indexing loops at the next composition level.
+        return kernel.f.tensorized_ast
+    end
+    kernel.ast
 end
 
 function _needs_embedded_tensorization(p::Plan)
     any(p.recipes) do recipe
         kernel = _embedded_kernel(recipe.op)
-        kernel !== nothing && kernel.f isa _BatchedFunctionPair
+        kernel !== nothing && kernel.f isa _ArrayFunctionPair
     end
 end
 
@@ -765,7 +774,8 @@ function prepare(p::Plan; passes = ())
     tensorized = compile(tensorized_ast)
     input_index = _embedded_marker_index(p)
     f = _EmbeddedFunctionPair{
-        input_index,typeof(native),typeof(tensorized)}(native, tensorized)
+        input_index,typeof(native),typeof(tensorized),typeof(tensorized_ast)}(
+            native, tensorized, tensorized_ast)
     PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast, recipes)
 end
 

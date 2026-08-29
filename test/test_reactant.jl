@@ -117,6 +117,22 @@ const REACTANT_SOURCE_NORMAL_LOGSCALE = prepare(NORMAL_LOGDENSITY;
         REACTANT_SOURCE_NORMAL_LOGSCALE(x, location, log_scale)
 end
 
+const REACTANT_NESTED_PLATE = plate(reactant_normal_logscale;
+    have = (:x, :μ, :logσ), want = :ld, batched = :x)
+
+@kernel reactant_nested_plate_middle(
+        x::Vector{Float64}, μ::Float64, logσ::Float64) = begin
+    total::Float64 = REACTANT_NESTED_PLATE(x, μ, logσ)
+end
+
+const REACTANT_NESTED_MIDDLE = prepare(reactant_nested_plate_middle;
+    have = (:x, :μ, :logσ), want = :total)
+
+@kernel reactant_nested_plate_outer(
+        x::Vector{Float64}, μ::Float64, logσ::Float64) = begin
+    total::Float64 = REACTANT_NESTED_MIDDLE(x, μ, logσ)
+end
+
 @testset "Reactant optional compiler integration" begin
     @test Base.get_extension(ReactiveKernels, :ReactiveKernelsReactantExt) !== nothing
 
@@ -429,6 +445,25 @@ end
         traced_logσ = Reactant.to_rarray(fixed_logσ; track_numbers = true)
         traced_compiled = @compile kernel(x, traced_μ, traced_logσ)
         @test traced_compiled(x, traced_μ, traced_logσ) ≈ fixed_reference
+    end
+
+    @testset "two-level prepared composition retains the tensorized plate" begin
+        outer = prepare(reactant_nested_plate_outer;
+            have = (:x, :μ, :logσ), want = :total)
+        x_host = collect(range(-1.4, 1.3; length = 16))
+        μ_host = 0.3
+        logσ_host = log(1.2)
+        reference = sum(_normal_reference(xi, μ_host, logσ_host)
+                        for xi in x_host)
+        @test outer(x_host, μ_host, logσ_host) ≈ reference
+        @test outer.f isa ReactiveKernels._EmbeddedFunctionPair
+        @test !occursin("for ", string(outer.f.tensorized_ast))
+
+        x = Reactant.to_rarray(x_host)
+        μ = Reactant.to_rarray(μ_host; track_numbers = true)
+        logσ = Reactant.to_rarray(logσ_host; track_numbers = true)
+        compiled = @compile outer(x, μ, logσ)
+        @test compiled(x, μ, logσ) ≈ reference
     end
 
     @testset "plate tensor body: multiple batched inputs and collection" begin

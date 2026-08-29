@@ -27,6 +27,15 @@ const embedded_plate_nlogpdf = plate(plate_nlogpdf;
     total::Float64 = embedded_plate_nlogpdf(x, μ, logσ)
 end
 
+const embedded_plate_middle = prepare(embedded_plate_model;
+    have = (:x, :μ, :logσ), want = :total)
+
+@kernel embedded_plate_outer(x::Vector{Float64},
+                             μ::Float64,
+                             logσ::Float64) = begin
+    total::Float64 = embedded_plate_middle(x, μ, logσ)
+end
+
 # Function barrier so `@allocated` measures the kernel, not global-ref boxing.
 _plate_call(k, xs, μ, logσ) = k(xs, μ, logσ)
 
@@ -54,6 +63,18 @@ _plate_call(k, xs, μ, logσ) = k(xs, μ, logσ)
             code_expr(embedded), embedded))
         @test !occursin(r"__ops__\[\d+\]", readable)
         @test occursin("-0.5", readable)
+    end
+
+    @testset "two-level composition preserves native and tensorized products" begin
+        outer = prepare(embedded_plate_outer;
+            have = (:x, :μ, :logσ), want = :total)
+        @test outer(xs, μ, logσ) ≈ k(xs, μ, logσ)
+        @test embedded_plate_middle.f isa ReactiveKernels._EmbeddedFunctionPair
+        @test outer.f isa ReactiveKernels._EmbeddedFunctionPair
+        @test occursin("for ", string(code_expr(outer)))
+        @test !occursin("for ", string(outer.f.tensorized_ast))
+        @test !any(op -> op isa ReactiveKernels.PreparedKernel, outer.ops)
+        @test length(outer.ops) == length(embedded_plate_nlogpdf.ops)
     end
 
     @testset "invariant `exp(logσ)` is hoisted ABOVE the loop (Stan-parity)" begin
