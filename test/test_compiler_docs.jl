@@ -8,12 +8,25 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     make_path = joinpath(root, "docs", "make.jl")
     index_path = joinpath(root, "docs", "src", "index.md")
     readme_path = joinpath(root, "README.md")
+    distributions_path = joinpath(root, "docs", "src", "distributions.md")
 
     @test isfile(page_path)
     page = _compiler_docs_lf(read(page_path, String))
     make = _compiler_docs_lf(read(make_path, String))
     index = _compiler_docs_lf(read(index_path, String))
     readme = _compiler_docs_lf(read(readme_path, String))
+    distributions = _compiler_docs_lf(read(distributions_path, String))
+
+    # The exported prepared value+in-place-gradient surface must remain visible
+    # at both public entry points, with its destination and Constant-rebinding
+    # contract rather than only a symbol mention.
+    for ad_docs in (readme, distributions)
+        @test occursin("ad_value_and_gradient!", ad_docs)
+        @test occursin("caller-owned", ad_docs)
+        @test occursin("returned_gradient === gradient_buffer", ad_docs)
+        @test occursin("Constant", ad_docs)
+        @test occursin("AutoEnzyme(; mode = Enzyme.Reverse)", ad_docs)
+    end
 
     @test occursin("\"Compiler capability and limits\" => \"compiler.md\"", make)
     @test occursin("compiler.md", index)

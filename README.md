@@ -95,11 +95,30 @@ affine_ad = prepare_ad(
     affine, backend, 3.0; active = :x, want = :y,
 )
 ad_gradient(affine_ad, 3.0; offset = 4.0)  # 2.0
+
+# An array-valued active port can also return the value while filling
+# caller-owned gradient storage in place.
+@kernel quadratic(q::Vector{Float64}; data::Vector{Float64}) = begin
+    objective::Float64 = sum(abs2, q .- data)
+end
+q = [1.0, 2.0]
+data = [0.5, -1.0]
+quadratic_ad = prepare_ad(
+    quadratic, backend, q; data, active = :q, want = :objective,
+)
+gradient_buffer = similar(q)
+value, returned_gradient = ad_value_and_gradient!(
+    quadratic_ad, gradient_buffer, q; data,
+)
+returned_gradient === gradient_buffer  # true; gradient_buffer == [1.0, 6.0]
 ```
 
 The backend is an `AbstractADType`; core code does not import Enzyme. Plain
 reverse mode is sufficient—no runtime-activity mode or function annotation is
-part of the RK boundary.
+part of the RK boundary. `ad_gradient` returns a gradient; the prepared-only
+`ad_value_and_gradient!` returns `(value, gradient)` and mutates the supplied
+gradient destination. Both rebuild DI `Constant` contexts from the current
+inactive arguments on every call.
 
 Like ReactiveObjects.jl's `@reactive` definitions, the primary `@kernel` form
 is a normal-looking function definition. Its arguments are the kernel's input

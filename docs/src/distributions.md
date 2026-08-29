@@ -32,17 +32,36 @@ import Enzyme
 
 backend = AutoEnzyme(; mode = Enzyme.Reverse)
 normal_ad = prepare_ad(
-    normal_logpdf, backend, x, μ, logσ;
+    normal_logdensity, backend, x, location, log_scale;
     active = :x, want = :logdensity,
 )
-dx = ad_gradient(normal_ad, x, μ, logσ)
+dx = ad_gradient(normal_ad, x, location, log_scale)
+
+# A prepared plate can return its value while filling caller-owned gradient
+# storage for its array-valued active port.
+vectorized = plate(normal_logdensity;
+    have = (:x, :location, :log_scale),
+    want = :logdensity, batched = :x,
+)
+x_batch = collect(range(-1.5, 1.5; length = 8))
+vectorized_ad = prepare_ad(
+    vectorized, backend, x_batch, location, log_scale; active = :x,
+)
+gradient_buffer = similar(x_batch)
+value, returned_gradient = ad_value_and_gradient!(
+    vectorized_ad, gradient_buffer, x_batch, location, log_scale,
+)
+@assert returned_gradient === gradient_buffer
 ```
 
 Preparation values establish backend types and shapes; later calls rebind the
 current inactive values instead of freezing the original data. The test suite
 exercises this configuration across all eleven scalar, plated, multivariate,
 and time-series examples below. No runtime-activity mode or function annotation
-is needed.
+is needed. Use `ad_gradient` when only the gradient is needed. For a reusable
+prepared boundary, `ad_value_and_gradient!` returns `(value, gradient)` and
+mutates the supplied destination; it applies the same active-port ordering and
+fresh `Constant` rebinding as `ad_gradient`.
 
 ## Continuous: Normal location and log scale
 
