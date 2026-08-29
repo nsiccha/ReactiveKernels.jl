@@ -18,6 +18,15 @@ using Test
     ld::Float64 = -0.5 * log(2π) - logσ - 0.5 * z^2
 end
 
+const embedded_plate_nlogpdf = plate(plate_nlogpdf;
+    have = (:x, :μ, :logσ), want = :ld, batched = :x)
+
+@kernel embedded_plate_model(x::Vector{Float64},
+                             μ::Float64,
+                             logσ::Float64) = begin
+    total::Float64 = embedded_plate_nlogpdf(x, μ, logσ)
+end
+
 # Function barrier so `@allocated` measures the kernel, not global-ref boxing.
 _plate_call(k, xs, μ, logσ) = k(xs, μ, logσ)
 
@@ -30,6 +39,21 @@ _plate_call(k, xs, μ, logσ) = k(xs, μ, logσ)
     @testset "value equals the summed per-observation density" begin
         ref = sum(-0.5 * log(2π) - logσ - 0.5 * ((xi - μ) / exp(logσ))^2 for xi in xs)
         @test k(xs, μ, logσ) ≈ ref
+    end
+
+    @testset "prepare splices generated plate code into an outer kernel" begin
+        embedded = prepare(embedded_plate_model;
+            have = (:x, :μ, :logσ), want = :total)
+        @test embedded(xs, μ, logσ) ≈ k(xs, μ, logσ)
+        generated = string(code_expr(embedded))
+        @test occursin("for ", generated)
+        @test !occursin("similar", generated)
+        @test !any(op -> op isa ReactiveKernels.PreparedKernel, embedded.ops)
+        @test length(embedded.ops) == length(embedded_plate_nlogpdf.ops)
+        readable = string(ReactiveKernels._readable_expr(
+            code_expr(embedded), embedded))
+        @test !occursin(r"__ops__\[\d+\]", readable)
+        @test occursin("-0.5", readable)
     end
 
     @testset "invariant `exp(logσ)` is hoisted ABOVE the loop (Stan-parity)" begin

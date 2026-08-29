@@ -12,6 +12,12 @@ _eight_schools_likelihood_allocated(kernel, observations, effects, scales) =
         kernel, observations, effects, scales,
     )
 
+_eight_schools_reference_normal(x, location, scale) =
+    -0.5 * log(2π) - log(scale) - 0.5 * ((x - location) / scale)^2
+
+_eight_schools_reference_cauchy(x, location, scale) =
+    -log(π) - log(scale) - log1p(((x - location) / scale)^2)
+
 function _build_and_constrain_eight_schools(q)
     model = build_eight_schools_graph()
     prepare(model; have = :unconstrained, want = :parameters)(q)
@@ -25,6 +31,32 @@ end
     )
     model = artifact.model
     q = [1.5, log(2.0), (0.25 .* (1:8))...]
+
+    @test occursin("NORMAL_LOGDENSITY", EIGHT_SCHOOLS_SOURCE)
+    @test occursin("CAUCHY_LOGDENSITY", EIGHT_SCHOOLS_SOURCE)
+    @test !occursin("@kernel school_", EIGHT_SCHOOLS_SOURCE)
+    @test artifact.normal_spec === EightSchoolsExample.NORMAL_LOGDENSITY
+    @test artifact.cauchy_spec === EightSchoolsExample.CAUCHY_LOGDENSITY
+    @test artifact.normal_factor.plan.graph === artifact.normal_spec.graph
+    @test artifact.cauchy_factor.plan.graph === artifact.cauchy_spec.graph
+    @test artifact.effects_prior_kernel.plan.graph === artifact.normal_spec.graph
+    @test artifact.pointwise_kernel.plan.graph === artifact.normal_spec.graph
+    @test artifact.likelihood_kernel.plan.graph === artifact.normal_spec.graph
+
+    @testset "one named model graph, with only the intentional transform alternative" begin
+        # Every model QOI has exactly one producer; constrained parameters alone
+        # intentionally have the two documented constrain-only vs
+        # constrain-plus-Jacobian producers.
+        producer_count(value) = count(model.graph.recipes) do recipe
+            any(output -> canon_id(model.graph, output.id) ==
+                          canon_id(model.graph, value.id), recipe.outputs)
+        end
+        @test producer_count(model.parameters) == 2
+        for value in (model.log_jacobian, model.prior, model.likelihood,
+                      model.pointwise, model.posterior, model.new_group)
+            @test producer_count(value) == 1
+        end
+    end
 
     # The public constructor is callable from ordinary compiled code: it clones
     # a module-load template instead of defining fresh recipe methods via
@@ -45,7 +77,7 @@ end
         @test likelihood isa Float64
 
         # The Wren-style Params/LogPrior/LogLikelihood selection uses the direct
-        # reducing plate. Unrequested pointwise/Jacobian/density nodes are absent
+        # reducing plate. Unrequested pointwise/Jacobian/posterior nodes are absent
         # from the compiled plan rather than skipped by runtime branches.
         produced = Set(
             canon_id(model.graph, output.id)
@@ -54,7 +86,7 @@ end
         @test canon_id(model.graph, model.likelihood.id) in produced
         @test !(canon_id(model.graph, model.pointwise.id) in produced)
         @test !(canon_id(model.graph, model.log_jacobian.id) in produced)
-        @test !(canon_id(model.graph, model.density.id) in produced)
+        @test !(canon_id(model.graph, model.posterior.id) in produced)
     end
 
     @testset "unconstrained -> constrained; Jacobian is optional" begin
@@ -63,7 +95,7 @@ end
                  want = (model.parameters,))
         # split (μ, log_τ, θ) + τ + the parameters-only producer.
         @test length(p.recipes) == 5
-        # The Jacobian-bearing producer and every density recipe are pruned.
+        # The Jacobian-bearing producer and every posterior recipe are pruned.
         produced = Set(canon_id(model.graph, o.id)
                        for r in p.recipes for o in r.outputs)
         @test !(canon_id(model.graph, model.log_jacobian.id) in produced)
@@ -83,35 +115,43 @@ end
         @test log_jacobian == q[2]
     end
 
-    @testset "density decomposition; likelihood is the summed pointwise density" begin
+    @testset "posterior decomposition; likelihood is the summed pointwise density" begin
         p = plan(model.graph;
                  have = (model.unconstrained, model.observations,
                          model.observation_scales),
                  want = (model.prior, model.log_jacobian,
-                         model.likelihood, model.density))
+                         model.likelihood, model.posterior))
 
         k = prepare(p)
-        prior, log_jacobian, likelihood, density =
+        prior, log_jacobian, likelihood, posterior =
             k(q, EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA)
 
         θ = q[3:end]
+        μ, τ = q[1], exp(q[2])
+        reference_prior =
+            _eight_schools_reference_normal(μ, 0.0, 5.0) +
+            log(2.0) + _eight_schools_reference_cauchy(τ, 0.0, 5.0) +
+            sum(_eight_schools_reference_normal(value, μ, τ) for value in θ)
         reference_likelihood = sum(
-            EightSchoolsExample.normal_logpdf(
+            _eight_schools_reference_normal(
                 EIGHT_SCHOOLS_Y[j], θ[j], EIGHT_SCHOOLS_SIGMA[j])
             for j in 1:8)
+        @test prior ≈ reference_prior
         @test likelihood ≈ reference_likelihood
-        @test density ≈ prior + log_jacobian + likelihood
+        @test posterior ≈ prior + log_jacobian + likelihood
 
-        density_only = plan(model.graph;
+        posterior_only = plan(model.graph;
             have = (model.unconstrained, model.observations,
                     model.observation_scales),
-            want = (model.density,))
-        fused_density = getfield(
-            artifact.sandbox, :fused_unconstrained_density)
-        @test any(r -> r.op === fused_density,
-                  density_only.recipes)
-        @test length(density_only.recipes) == 1
-        @test !any(r -> r.op === sum, density_only.recipes)
+            want = (model.posterior,))
+        @test length(posterior_only.recipes) > 1
+        @test !any(r -> r.op === sum, posterior_only.recipes)
+        posterior_kernel = prepare(posterior_only)
+        @test count(line -> occursin("for ", line),
+                    split(string(code_expr(posterior_kernel)), '\n')) == 2
+        @test !occursin("similar", string(code_expr(posterior_kernel)))
+        @test !any(op -> op isa ReactiveKernels.PreparedKernel,
+                   posterior_kernel.ops)
     end
 
     @testset "corrected core contracts hold on PPL paths" begin
@@ -157,20 +197,20 @@ end
 
         @testset "nested density provenance remains reusable" begin
             nested = build_eight_schools_graph()
-            checked_density = value!(nested.graph, :checked_log_density, Float64)
-            density_calls = Ref(0)
+            checked_posterior = value!(nested.graph, :checked_log_posterior, Float64)
+            posterior_calls = Ref(0)
             add!(nested.graph,
                  (nested.prior, nested.log_jacobian, nested.likelihood) =>
-                     checked_density,
+                     checked_posterior,
                  (prior, jacobian, likelihood) -> begin
-                     density_calls[] += 1
+                     posterior_calls[] += 1
                      prior + jacobian + likelihood
                  end)
 
             state = ReactiveState(
                 nested.graph;
                 materialize = (nested.parameters, nested.prior,
-                               nested.likelihood, checked_density),
+                               nested.likelihood, checked_posterior),
             )
             set!(state, nested.unconstrained, q)
             set!(state, nested.observations, EIGHT_SCHOOLS_Y)
@@ -179,9 +219,9 @@ end
             get!(state, nested.parameters)
             get!(state, nested.prior)
             get!(state, nested.likelihood)
-            first_density = get!(state, checked_density)
-            @test get!(state, checked_density) == first_density
-            @test density_calls[] == 1
+            first_posterior = get!(state, checked_posterior)
+            @test get!(state, checked_posterior) == first_posterior
+            @test posterior_calls[] == 1
         end
 
         @testset "checkpoint rejects stale transformed parameters" begin
@@ -210,7 +250,7 @@ end
             log_scale = value!(graph, :log_scale, Float64)
             effects = value!(graph, :effects, Vector{Float64})
             add!(graph, reserved => (location, log_scale, effects),
-                 EightSchoolsExample.split_unconstrained)
+                 x -> (x[1], x[2], x[3:end]))
 
             k = prepare(graph; have = (reserved,),
                         want = (location, log_scale, effects))
@@ -222,7 +262,7 @@ end
             recipe_count = length(model.graph.recipes)
             for invalid_cost in (-1.0, Inf, NaN)
                 @test_throws ArgumentError add!(
-                    model.graph, model.density => diagnostic, identity;
+                    model.graph, model.posterior => diagnostic, identity;
                     cost = invalid_cost)
             end
             @test length(model.graph.recipes) == recipe_count
@@ -237,12 +277,12 @@ end
                  want = (model.new_group,))
 
         # θ_new + y_new + the new_group NamedTuple; the split, transform, prior,
-        # likelihood, and density recipes are all pruned.
+        # likelihood, and posterior recipes are all pruned.
         @test length(p.recipes) == 3
         produced = Set(canon_id(model.graph, o.id)
                        for r in p.recipes for o in r.outputs)
         @test !(canon_id(model.graph, model.prior.id) in produced)
-        @test !(canon_id(model.graph, model.density.id) in produced)
+        @test !(canon_id(model.graph, model.posterior.id) in produced)
 
         prediction = prepare(p)(parameters, 12.0, [0.25, -1.0])
         @test prediction isa NamedTuple
@@ -253,12 +293,14 @@ end
     @testset "plate exposes pointwise values and a buffer-free total" begin
         θ = q[3:end]
         expected_pointwise = [
-            EightSchoolsExample.normal_logpdf(
+            _eight_schools_reference_normal(
                 EIGHT_SCHOOLS_Y[j], θ[j], EIGHT_SCHOOLS_SIGMA[j])
             for j in 1:8
         ]
 
         @test artifact.pointwise ≈ expected_pointwise
+        @test artifact.pointwise_kernel.plan.graph ===
+              artifact.likelihood_kernel.plan.graph
         likelihood = _eight_schools_likelihood_call(
             artifact.likelihood_kernel,
             EIGHT_SCHOOLS_Y, θ, EIGHT_SCHOOLS_SIGMA,
@@ -280,11 +322,4 @@ end
         ) == 0
     end
 
-    @testset "invalid constrained inputs fail explicitly" begin
-        @test_throws DomainError EightSchoolsExample.normal_logpdf(0.0, 0.0, 0.0)
-        @test_throws DomainError EightSchoolsExample.predict_new_group(
-            (; μ = 1.0, τ = 4.0, θ = fill(2.0, 8)), 0.0, [0.25, -1.0])
-        @test_throws DomainError EightSchoolsExample.log_prior(
-            (; μ = 1.0, τ = 0.0, θ = fill(2.0, 8)))
-    end
 end

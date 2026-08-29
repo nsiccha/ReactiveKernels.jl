@@ -224,7 +224,7 @@ end
         have = (
             model.unconstrained, model.observations, model.observation_scales,
         ),
-        want = (model.density,),
+        want = (model.posterior,),
     )
     density_calls = Ref(0)
     potential_calls = Ref(0)

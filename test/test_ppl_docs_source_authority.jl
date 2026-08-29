@@ -47,7 +47,7 @@ const PPL_SOURCE_CASES = (
         raw_generated = code_expr(artifact.kernel)
         readable_generated = sprint(
             Base.show_unquoted,
-            ReactiveKernels._readable_expr(raw_generated, artifact.kernel.plan);
+            ReactiveKernels._readable_expr(raw_generated, artifact.kernel);
             context = :limit => false,
         )
         @test raw_generated === code_expr(artifact.kernel)

@@ -143,6 +143,19 @@ end
         @test prior ≈ reference_prior
         @test likelihood ≈ reference_likelihood
 
+        # The full posterior is another named-node selection over the same
+        # graph. Supplying the named latent HAVE boundary avoids scalar indexing
+        # into a traced packed vector without defining a second model path.
+        posterior_kernel = prepare(artifact.model;
+            have = (:μ, :log_τ, :θ, :observations, :observation_scales),
+            want = :posterior)
+        posterior_compiled = @compile posterior_kernel(
+            μ, log_τ, effects, observations, scales)
+        @test posterior_compiled(μ, log_τ, effects, observations, scales) ≈
+              posterior_kernel(
+                  q_host[1], q_host[2], q_host[3:end],
+                  EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA)
+
         pointwise_compiled = @compile artifact.pointwise_kernel(
             observations, effects, scales)
         @test Array(pointwise_compiled(observations, effects, scales)) ≈

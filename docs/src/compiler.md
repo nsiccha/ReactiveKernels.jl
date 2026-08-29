@@ -215,6 +215,25 @@ This is map-plus-reduce/collect with invariant hoisting. It is not a general
 scan, fold with loop-carried state, segmented reduction, parallel reduction,
 associative tree reduction, or automatic prepared-kernel batching transform.
 
+### Prepared-kernel composition is flattened
+
+If an outer `@kernel` calls a prepared RK kernel, `prepare` treats it as
+compiler-owned recipe code: it alpha-renames and splices the inner generated
+statements into the outer function, remaps its operation-table slots, and emits
+one flat executable operation table. The inner
+`PreparedKernel`, `Plan`, and generated `Expr` are not runtime operations.
+
+For example, an author can prepare `reduced = plate(scalar_density; have =
+(:x, :μ, :logσ), want = :ld, batched = :x)` and call `reduced(x, μ, logσ)`
+inside an outer `@kernel`. The outer prepared function contains the plated
+statements directly rather than a runtime call through `reduced`.
+
+Nested plates retain both compiler products: ordinary arrays select the
+native fused loop, while traced arrays select the tensorized broadcast/reduce
+body. This is the static-friendly density boundary used by the PPL examples:
+plain reverse Enzyme sees one flat generated function, and Reactant still sees
+the array-native plate form.
+
 ### Replica: lift the entire scalar callable
 
 `replica` keeps a complete scalar `PreparedKernel` as the mathematical source
