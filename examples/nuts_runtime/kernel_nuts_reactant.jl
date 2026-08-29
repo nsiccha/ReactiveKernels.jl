@@ -126,3 +126,30 @@ Verified == the native reactive leapfrog and an independent hand-calc.
     mom = mom .- (0.5 * ss) .* ddpos(pos)     # recompute dham_dpos after the pos write
     (pos, mom)
 end
+
+"""
+    _nuts_tensor_ham(pos, mom, potf, ddmom, logdet_metric) -> ham
+
+The euclidean_phasepoint Hamiltonian (fixture L72-77) over tensor slices:
+`pot = potf(pos)`, `kin = ½·(logdet(metric) + dot(mom, dham_dmom))` with
+`dham_dmom = ddmom(mom) = metric⁻¹·mom`, `ham = pot + kin`. `logdet_metric` is
+the shared constant `@node(logdet(chol_metric))`. Used for the divergence check
+`dham = init.ham − ep.ham`. Verified == native `ham` across configs.
+"""
+@inline _nuts_tensor_kin(mom, ddmom, logdet_metric) =
+    oftype(logdet_metric, 0.5) * (logdet_metric + dot(mom, ddmom(mom)))
+@inline _nuts_tensor_ham(pos, mom, potf, ddmom, logdet_metric) =
+    potf(pos) + _nuts_tensor_kin(mom, ddmom, logdet_metric)
+
+"""
+    _nuts_tensor_uturn_depth1(summed_fwd, bwd_dhdmom, ep_dhdmom) -> Bool
+
+The depth-1 U-turn no-turn criterion (fixture finish! L221-227): both the
+backward and forward projections of the running summed momentum onto the
+respective `dham_dmom` must be strictly positive to keep going. Higher depths
+add the analogous sub-tree dot pairs (L228-251) — same shape, more terms.
+"""
+@inline function _nuts_tensor_uturn_depth1(summed_fwd, bwd_dhdmom, ep_dhdmom)
+    (dot(summed_fwd, bwd_dhdmom) > zero(eltype(summed_fwd))) &
+    (dot(summed_fwd, ep_dhdmom)  > zero(eltype(summed_fwd)))
+end
