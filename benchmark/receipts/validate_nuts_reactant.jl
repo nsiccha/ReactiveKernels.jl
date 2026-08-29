@@ -61,6 +61,13 @@ function validate_nuts_reactant_receipt(path)
     require(examined == rounds * transitions + rejected,
             "candidate counts must report every accepted and rejected bundle")
     require(rejected >= 0, "candidate rejection count must be nonnegative")
+    require(get(protocol, "floating_parity_absolute_tolerance", 0.0) ==
+                128eps(Float64),
+            "floating parity absolute tolerance must be exactly 128eps(Float64)")
+    require(get(protocol, "floating_parity_relative_tolerance", Inf) == 0.0,
+            "floating parity relative tolerance must be zero")
+    require(get(protocol, "control_and_random_consumption_parity", "") == "exact",
+            "control and random-consumption parity must be exact")
     for key in (
             "round_steps", "round_directions", "round_exponentials",
             "round_max_reached_depth", "round_divergences",
@@ -109,7 +116,8 @@ function validate_nuts_reactant_receipt(path)
             "same_authored_transition", "same_target_metric_state_depth_randomness",
             "matched_independent_start_states",
             "matched_control_flow_corpus", "parity_screening_reported",
-            "per_transition_observable_parity", "random_consumption_parity",
+            "per_transition_tolerance_bounded_phase_diagnostic_parity",
+            "exact_control_and_random_consumption_parity",
             "all_overflow_flags_zero")
         require(get(acceptance, key, false), "acceptance.$key must be true")
     end
@@ -127,7 +135,8 @@ if abspath(PROGRAM_FILE) == @__FILE__
         println(
             "VALIDATE OK — nuts-reactant-v1 receipt is self-consistent: ",
             "max_depth=10, synchronous execution, exact work/time medians, ",
-            "native/Reactant parity from independent matched starts, matched randomness, ",
+            "tolerance-bounded floating parity from independent matched starts, ",
+            "exact controls/randomness, ",
             "zero overflow, one stablehlo.while.",
         )
     else
