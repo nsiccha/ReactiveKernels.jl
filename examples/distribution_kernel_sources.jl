@@ -48,7 +48,10 @@ function _evaluate_spec_source(source::AbstractString, name::Symbol)
         expression isa LineNumberNode && continue
         Core.eval(@__MODULE__, expression)
     end
-    getfield(@__MODULE__, name)
+    # Julia 1.13 enforces the world age of bindings created by `Core.eval`.
+    # Read the freshly authored KernelSpec in the latest world; the returned
+    # immutable spec remains ordinary data for every subsequent caller.
+    Base.invokelatest(getfield, @__MODULE__, name)
 end
 
 const NORMAL_LOGDENSITY =
