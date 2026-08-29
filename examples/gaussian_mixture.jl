@@ -110,6 +110,17 @@ end
 
 sum_log_likelihood(log_likelihoods::RealVector) = sum(log_likelihoods)
 
+function fused_log_likelihood(parameters::MixtureParameters,
+                              observations::RealVector)
+    likelihood = zero(parameters.μ₁)
+    @inbounds for observation in observations
+        la = normal_logpdf(observation, parameters.μ₁, parameters.σ₁)
+        lb = normal_logpdf(observation, parameters.μ₂, parameters.σ₂)
+        likelihood += log_mix(parameters.θ, la, lb)
+    end
+    likelihood
+end
+
 total_log_density(log_prior::Real, log_jacobian::Real,
                   log_likelihood::Real) =
     log_prior + log_jacobian + log_likelihood
@@ -139,6 +150,9 @@ const GAUSSIAN_MIXTURE_SOURCE = raw"""
     prior::Real = log_prior(parameters)
     pointwise::RealVector = pointwise_log_likelihood(parameters, observations)
     likelihood::Real = sum_log_likelihood(pointwise)
+    # The cheaper density-only path fuses the scalar observation recipe into a
+    # reduction and avoids an active pointwise Vector under reverse AD.
+    likelihood::Real = fused_log_likelihood(parameters, observations)
     density::Real = total_log_density(prior, log_jacobian, likelihood)
     responsibility::Real = component1_responsibility(parameters, new_point)
     return density
@@ -172,7 +186,8 @@ function evaluate_gaussian_mixture_source()
         :MIXTURE_OBSERVATIONS, :split_unconstrained, :ordered_means,
         :exp_scale, :logistic, :assemble_parameters, :log_abs_det_jacobian,
         :log_prior, :pointwise_log_likelihood, :sum_log_likelihood,
-        :total_log_density, :component1_responsibility,
+        :fused_log_likelihood, :total_log_density,
+        :component1_responsibility,
     ))
 end
 
@@ -183,8 +198,8 @@ Build the posteriordb two-component Gaussian-mixture model as a declarative
 `ReactiveKernels.KernelSpec`. The per-observation likelihood marginalizes the
 discrete component label via `log_mix`, so no discrete parameter appears. The
 ordered-means transform + Jacobian, prior, pointwise (marginalized) likelihood,
-likelihood reduction, total density, and a component-responsibility generated
-quantity remain separate named ports.
+fused scalar-loop likelihood reduction, total density, and a
+component-responsibility generated quantity remain separate named ports.
 """
 function build_gaussian_mixture_graph()
     evaluate_gaussian_mixture_source().model

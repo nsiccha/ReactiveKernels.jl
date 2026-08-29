@@ -81,6 +81,30 @@ summed_loglik = plate(school_loglik;
 summed_school_prior = plate(school_prior;
     have = (:θ, :μ, :τ), want = :lp, batched = :θ)
 
+# The unconstrained AD boundary gets a second, fully fused producer. The
+# named-latent/pointwise boundaries above retain their `plate` lowering for
+# Reactant, while this scalar loop keeps nested PreparedKernels out of Enzyme's
+# operation table and materializes no active temporary vectors.
+function fused_unconstrained_density(unconstrained::Vector{Float64},
+                                      observations::Vector{Float64},
+                                      observation_scales::Vector{Float64})
+    μ = unconstrained[1]
+    log_τ = unconstrained[2]
+    τ = exp(log_τ)
+    prior =
+        -0.5 * log(2π) - log(5.0) - 0.5 * (μ / 5.0)^2 +
+        log(2) - log(π) - log(5.0) - log1p((τ / 5.0)^2)
+    likelihood = 0.0
+    @inbounds for j in eachindex(observations, observation_scales)
+        θⱼ = unconstrained[j + 2]
+        prior += -0.5 * log(2π) - log(τ) - 0.5 * ((θⱼ - μ) / τ)^2
+        likelihood += -0.5 * log(2π) - log(observation_scales[j]) -
+                      0.5 * ((observations[j] - θⱼ) /
+                             observation_scales[j])^2
+    end
+    prior + log_τ + likelihood
+end
+
 @kernel model(unconstrained::Vector{Float64},
               observations::Vector{Float64},
               observation_scales::Vector{Float64},
@@ -122,6 +146,11 @@ summed_school_prior = plate(school_prior;
 
     # Unconstrained-space log density.
     density::Float64 = prior + log_jacobian + likelihood
+
+    # Alternate producer for the unconstrained reverse-AD boundary. Planning
+    # selects this single fused recipe when only `density` is requested.
+    density::Float64 = fused_unconstrained_density(
+        unconstrained, observations, observation_scales)
 
     # Deterministic new-group prediction from standard-normal innovations, read
     # straight off the constrained `parameters` so the query can start there.
@@ -203,6 +232,13 @@ Wren-style accumulator tuple is therefore a static `want` selection, not a
 second evaluation framework. Prediction is deterministic for caller-supplied
 standard-normal innovations; sampling those innovations remains outside the
 pure graph.
+
+The unconstrained density boundary has a second, source-visible fused producer,
+so reverse AD neither materializes an active pointwise vector nor captures the
+nested plate kernels in its operation table. It differentiates through
+DifferentiationInterface with plain Enzyme reverse mode when observation data
+are passed as `Constant`s; no runtime-activity mode or function annotation is
+required. Named-latent and pointwise queries retain the plate route above.
 """
 function build_eight_schools_graph()
     compose(_EIGHT_SCHOOLS_GRAPH_TEMPLATE)

@@ -51,6 +51,14 @@ using .GaussianMixtureExample
             GaussianMixtureExample.normal_logpdf(y, -3.0, 0.7),
             GaussianMixtureExample.normal_logpdf(y, 3.0, 0.7))
         @test pointwise[1] ≈ expected
+
+        density_only = plan(model.graph;
+            have = (model.unconstrained, model.observations),
+            want = (model.density,))
+        @test any(r -> r.op === GaussianMixtureExample.fused_log_likelihood,
+                  density_only.recipes)
+        @test !any(r -> r.op === GaussianMixtureExample.pointwise_log_likelihood,
+                   density_only.recipes)
     end
 
     @testset "responsibility generated quantity prunes density work" begin

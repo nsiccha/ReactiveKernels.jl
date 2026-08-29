@@ -4,15 +4,11 @@
 Main.ReactiveKernelsDocs.render_result_assets()
 ```
 
-A density written as **(1) a per-element recipe over an array input → (2) a
-`sum`** turns into one straight-line kernel over the whole array. The author
-writes one *scalar* `normal_logpdf`; **batching is just passing a `Vector` where
-a scalar went**. From that one graph, asking for a different `want` gives either
-the per-observation log density (`want = :per_obs`, for LOO/WAIC/PSIS) or the
-total (`want = :logdensity`), and a single `Enzyme` reverse-mode pass takes the
-gradient of the whole batch at once. This is exactly Stan's mechanism — a
-vectorized density plus reverse-mode automatic differentiation — with no
-batching-specific user code.
+A density can expose both a per-element recipe over an array input and a fused
+scalar reduction. The author writes one scalar `normal_logpdf`; from that one
+graph, asking for a different `want` gives either the per-observation log density
+(`want = :per_obs`, for LOO/WAIC/PSIS) or the total (`want = :logdensity`). A
+single `Enzyme` reverse-mode pass takes the gradient of the whole batch at once.
 
 As in [Native log densities as recipes](distributions.md), the **compute path
 contains no `Distributions.jl` call**: the density is written out directly and
@@ -45,11 +41,10 @@ instead would produce an anonymous closure that allocates.
 
 `want = :per_obs` and `want = :logdensity` come from the *same* graph. The
 pruning happens when the kernel is prepared, not as an `if` at run time: the
-per-observation plan simply contains fewer recipes (the `sum` is gone, not
-skipped at run time), and the total plan computes the pointwise vector only as
-the intermediate its sum needs. There is no duplicated arithmetic, and the shared
-`σ = exp(logσ)` is computed once. The `eight_schools.jl` example splits
-`pointwise_log_likelihood` → `sum_log_likelihood` the same way.
+per-observation plan selects the broadcast producer, while the total plan
+selects a fused scalar-loop producer and never allocates the pointwise vector.
+Both compute the shared `σ = exp(logσ)` once. The PPL examples use the same
+two-producer pattern when they expose both pointwise and density-only queries.
 
 ## No memory we don't need: zero-allocation value
 
@@ -71,15 +66,12 @@ makes.
 
 The gradient over the whole `N`-dimensional batch is a **single** `Enzyme`
 reverse-mode pass — its cost is essentially independent of `N`, not the `N×` of a
-scalar loop (that is what reverse-mode buys you). The batch mixes the active
-parameter vector with the constant `μ`, `σ` inside the broadcast, so the backend
-runs with runtime activity (it decides per value which ones are being
-differentiated), and the function being differentiated is closed over as a
-constant (`Const`):
+scalar loop (that is what reverse-mode buys you). The owned buffer and shared
+parameters are classified explicitly at the DifferentiationInterface boundary,
+so ordinary reverse mode is sufficient:
 
 ```julia
-AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-             function_annotation = Enzyme.Const)
+AutoEnzyme(; mode = Enzyme.Reverse)
 ```
 
 The zero-allocation gradient reuses a preallocated batch buffer, but **not** the

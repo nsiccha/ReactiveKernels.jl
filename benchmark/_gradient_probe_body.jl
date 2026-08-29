@@ -8,8 +8,7 @@
 
 const RK = ReactiveKernels
 
-const BACKEND = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-                            function_annotation = Enzyme.Const)
+const BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 # log density of a standard normal (matches the comparator's _gaussian_logp): the
 # wrapper negates this into the POTENTIAL U(q)=+½‖q‖² with gradient +q — a valid
 # Gaussian, not the inverted one a +½ log density would produce.

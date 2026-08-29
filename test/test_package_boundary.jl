@@ -1,6 +1,15 @@
+using TOML
+
 @testset "package boundary — generic RK core, external NUTS exemplar" begin
     srcdir = joinpath(pkgdir(ReactiveKernels), "src")
     module_source = read(joinpath(srcdir, "ReactiveKernels.jl"), String)
+    project = TOML.parsefile(joinpath(pkgdir(ReactiveKernels), "Project.toml"))
+
+    for optional_ad in ("DifferentiationInterface", "Enzyme")
+        @test !haskey(project["deps"], optional_ad)
+        @test haskey(project["extras"], optional_ad)
+        @test optional_ad in project["targets"]["test"]
+    end
 
     for file in ("kernel_nuts.jl", "kernel_nuts_native.jl", "hmc.jl", "reactive_nuts.jl")
         @test !isfile(joinpath(srcdir, file))

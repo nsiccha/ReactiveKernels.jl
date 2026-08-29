@@ -6,16 +6,9 @@ using ReactiveKernels
 using Statistics
 using Test
 
-# Reverse-mode Enzyme through DifferentiationInterface for the eight-schools NUTS
-# gradient. Runtime activity is enabled because the prepared density kernel closes
-# over constant model data (observations and scales) that Enzyme's static activity
-# analysis cannot prove non-differentiable; the closure (which captures the
-# prepared kernel) is annotated `Const` because only the numeric position is
-# differentiated, never the kernel itself.
-const _HMC_ENZYME_BACKEND = AutoEnzyme(;
-    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-    function_annotation = Enzyme.Const,
-)
+# Reverse-mode Enzyme through DifferentiationInterface. The density-only PPL
+# plan has no active temporary container, so ordinary static activity suffices.
+const _HMC_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 
 _gaussian_potential(position) = sum(abs2, position) / 2
 # Analytic (value, gradient) callback — oracle/parity fixtures only.
@@ -336,9 +329,12 @@ end
     @test run_stats.full_history[1] == trajectory.positions
     @test run_stats.full_idxs[1] == trajectory.idxs
 
-    scales = [0.25, 4.0]
+    # Spell out the fixed two-dimensional metric instead of capturing a mutable
+    # Vector as temporary function state; static activity can then prove the
+    # complete boundary without runtime checks.
+    scales = (0.25, 4.0)
     anisotropic_potential(position) =
-        sum(abs2(position[index]) / scales[index] for index in eachindex(position)) / 2
+        (abs2(position[1]) / 0.25 + abs2(position[2]) / 4.0) / 2
     anisotropic_preparation =
         prepare_gradient(anisotropic_potential, _HMC_ENZYME_BACKEND, zeros(2))
     anisotropic_gradient!(gradient, position) = first(value_and_gradient!(

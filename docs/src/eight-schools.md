@@ -81,6 +81,15 @@ sees the resulting mathematical `PreparedKernel`. The packed `unconstrained`
 vector remains an alternate boundary for native HMC, but the PPL/Reactant path
 uses named latent ports and therefore never scalar-indexes a traced device array.
 
+The unconstrained density boundary has a second, source-visible fused producer.
+Planning selects that scalar loop for a density-only query, so reverse AD
+neither materializes an active pointwise vector nor captures the nested plate
+kernels in its operation table. The prepared density therefore differentiates
+through DifferentiationInterface with plain
+`AutoEnzyme(mode = Enzyme.Reverse)`, passing observations and scales as DI
+`Constant`s—no Enzyme runtime-activity mode or function annotation is required.
+Named-latent and pointwise queries keep the plate route above for Reactant.
+
 The panel below shows three views of this model: **Raw input** (the source), a
 readable **Generated kernel** derived from the executed kernel and selected
 plan, and the **Compute DAG** (`visualize(evaluation_kernel.plan)`). The exact

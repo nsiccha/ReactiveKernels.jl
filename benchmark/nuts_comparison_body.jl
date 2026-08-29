@@ -13,15 +13,10 @@ using Statistics
 
 # Every sampler's runtime gradient goes through this shared reverse-mode Enzyme
 # backend via DifferentiationInterface, so RK/AdvancedHMC/DynamicHMC differentiate
-# the SAME scalar log density and the comparison is fair. Runtime activity is on
-# and the differentiated function is annotated Const because only the numeric
-# position is differentiated, never any captured constant model data. The
-# handwritten analytic gradients below are correctness oracles only, never the
-# sampled path.
-const BENCHMARK_BACKEND = AutoEnzyme(;
-    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-    function_annotation = Enzyme.Const,
-)
+# the SAME scalar log density and the comparison is fair. These scalar targets
+# need only Enzyme's ordinary static activity analysis. The handwritten analytic
+# gradients below are correctness oracles only, never the sampled path.
+const BENCHMARK_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 
 abstract type CountedTarget end
 

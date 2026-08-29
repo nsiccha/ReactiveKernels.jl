@@ -37,6 +37,12 @@ unconstrained
 log prior + log Jacobian + log likelihood ──► unconstrained log density
 ```
 
+The likelihood port has two equivalent producers. Asking for pointwise terms
+selects the vector plus `sum`, while a density-only plan selects a fused scalar
+loop. The latter avoids an active temporary vector and is exercised with plain
+reverse-mode Enzyme through DifferentiationInterface (data passed as
+`Constant`s), without runtime activity or a function annotation.
+
 The panel below shows three views of this model: **Raw input** (the source), a
 readable **Generated kernel** derived from the executed kernel and selected
 plan, and the **Compute DAG** (`visualize(density_plan)`). The exact compiled AST
