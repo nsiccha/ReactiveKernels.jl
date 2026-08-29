@@ -382,3 +382,5 @@ end
         @test gradient[3] ≈ reference_σ
     end
 end
+
+include("test_kernel_nuts_reactant.jl")
