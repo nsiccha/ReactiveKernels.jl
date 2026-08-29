@@ -301,11 +301,15 @@ end
 function _nr_effects(st, ::Val{kind}, ::Val{pg}, e, d, cs, NP, ONE, active, cfg) where {kind,pg}
     if kind === :step
         if pg == 26
+            # `zero.(dham)`, unlike `dham .* 0`, is a true authored reset even when the
+            # prior transition ended with the finite-or-negative-infinity sentinel.
+            reset_dham = zero.(st.dham)
+            reset_diverged = ifelse.(reset_dham .>= st.min_dham, ONE .* 0, ONE)
             st = merge(st, (gofwd = _nr_sel(active, ONE, st.gofwd),
                 may_sample = _nr_sel(active, ONE, st.may_sample),
                 may_continue = _nr_sel(active, ONE, st.may_continue),
-                diverged = _nr_sel(active, ONE .* 0, st.diverged),
-                dham = _nr_sel(active, st.dham .* 0, st.dham),
+                diverged = _nr_sel(active, reset_diverged, st.diverged),
+                dham = _nr_sel(active, reset_dham, st.dham),
                 n_steps = _nr_sel(active, st.n_steps .* 0, st.n_steps),
                 reached_depth = _nr_sel(active, st.reached_depth .* 0, st.reached_depth),
                 acc = _nr_sel(active, st.acc .* 0, st.acc)))
@@ -316,10 +320,14 @@ function _nr_effects(st, ::Val{kind}, ::Val{pg}, e, d, cs, NP, ONE, active, cfg)
             st = _nr_copyowned(st, _nr_gv(st.prop, ONE .* 0 .+ NP), ONE, active)
         elseif pg == 22
             st = merge(st, (pp_mom = _nr_sel(active,
-                _nr_gset(st.pp_mom, ONE .+ 2, -_nr_gc(st.pp_mom, ONE .+ 2)), st.pp_mom),))
+                    _nr_gset(st.pp_mom, ONE .+ 2, -_nr_gc(st.pp_mom, ONE .+ 2)), st.pp_mom),
+                pp_dkin = _nr_sel(active,
+                    _nr_gset(st.pp_dkin, ONE .+ 2, -_nr_gc(st.pp_dkin, ONE .+ 2)), st.pp_dkin)))
         elseif pg == 23
             st = merge(st, (pp_mom = _nr_sel(active,
-                _nr_gset(st.pp_mom, ONE .+ 1, -_nr_gc(st.pp_mom, ONE .+ 1)), st.pp_mom),))
+                    _nr_gset(st.pp_mom, ONE .+ 1, -_nr_gc(st.pp_mom, ONE .+ 1)), st.pp_mom),
+                pp_dkin = _nr_sel(active,
+                    _nr_gset(st.pp_dkin, ONE .+ 1, -_nr_gc(st.pp_dkin, ONE .+ 1)), st.pp_dkin)))
         elseif pg == 21
             st = merge(st, (lw1 = _nr_sel(active,
                 _nr_gsetv(st.lw1, ONE, st.dham .* 0), st.lw1),))
