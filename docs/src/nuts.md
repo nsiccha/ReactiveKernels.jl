@@ -83,8 +83,10 @@ independently initialized to the same value for each native/Reactant transition
 pair outside the timed region. This prevents accumulated floating-point branch
 drift in a chaotic carried chain from silently changing the compared work. A
 deterministic candidate stream is screened outside timing, and the receipt
-publishes how many candidates were excluded because native/XLA U-turn sensitivity
-changed control flow. The frozen receipt reports synchronous CPU execution, full-transition wall time,
+publishes how many candidates were excluded after backend-sensitive transition
+parity mismatches. Floating phase-point and diagnostic values must match with
+`atol = 128eps(Float64)` and `rtol = 0`; control counters and random consumption
+must match exactly. The frozen receipt reports synchronous CPU execution, full-transition wall time,
 work-normalized leapfrog steps/s, and compilation separately. Compilation,
 host/device transfers, state setup, random-bundle generation, rebundling, and result readback
 are outside steady-state timing.

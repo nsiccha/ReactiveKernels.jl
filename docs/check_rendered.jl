@@ -72,7 +72,7 @@ function check_rendered_docs(build_dir, page_tree)
         "nuts.md" => (
             "class=\"rk-status-grid\"",
             "Full compiled NUTS kernel",
-            "Exact matched execution medians",
+            "Receipt medians for the matched-control corpus",
             "Compilation and first-call costs",
         ),
         "visualization.md" =>

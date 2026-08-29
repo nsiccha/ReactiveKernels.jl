@@ -806,10 +806,11 @@ function render_nuts_reactant_benchmark()
     get(protocol, "max_depth", 0) == 10 ||
         error("Reactant NUTS receipt does not exercise max_depth=10")
     acceptance = receipt["acceptance"]
-    get(acceptance, "per_transition_observable_parity", false) ||
-        error("Reactant NUTS receipt lacks transition parity")
-    get(acceptance, "random_consumption_parity", false) ||
-        error("Reactant NUTS receipt lacks random-consumption parity")
+    get(acceptance,
+        "per_transition_tolerance_bounded_phase_diagnostic_parity", false) ||
+        error("Reactant NUTS receipt lacks tolerance-bounded floating parity")
+    get(acceptance, "exact_control_and_random_consumption_parity", false) ||
+        error("Reactant NUTS receipt lacks exact control/random-consumption parity")
     get(acceptance, "matched_control_flow_corpus", false) ||
         error("Reactant NUTS receipt is not a matched-control corpus")
     get(acceptance, "parity_screening_reported", false) ||
@@ -850,6 +851,8 @@ function render_nuts_reactant_benchmark()
     compile_rows = [
         (stage = "Native source compile + first Julia JIT",
          seconds = Float64(compilation["native_seconds"])),
+        (stage = "Native first execution",
+         seconds = Float64(compilation["native_first_execution_seconds"])),
         (stage = "Reactant host lowering",
          seconds = Float64(compilation["reactant_lower_seconds"])),
         (stage = "Reactant XLA compile",
@@ -871,7 +874,7 @@ function render_nuts_reactant_benchmark()
     caption = "Frozen $(protocol["target"]), $(protocol["metric"]), step size " *
         "$(protocol["stepsize"]), max depth $(protocol["max_depth"]), " *
         "$(protocol["rounds"]) rounds × $(protocol["transitions_per_round"]) independent full transitions from matched starting states. " *
-        "Both arms consume identical pre-generated random bundles; $(protocol["candidate_bundles_rejected"]) of $(protocol["candidate_bundles_examined"]) deterministic candidates were excluded outside timing because floating-point U-turn sensitivity changed control flow. Timings exclude compilation, corpus screening, state setup, transfers, RNG generation, rebundling, and readback."
+        "Both arms consume identical pre-generated random bundles; $(protocol["candidate_bundles_rejected"]) of $(protocol["candidate_bundles_examined"]) deterministic candidates were excluded outside timing after backend-sensitive transition parity mismatches. Floating phase/diagnostic values use atol=$(protocol["floating_parity_absolute_tolerance"]) and rtol=$(protocol["floating_parity_relative_tolerance"]); controls and random consumption match exactly. Timings exclude compilation, corpus screening, state setup, transfers, RNG generation, rebundling, and readback."
     provenance = h.p(; class = "rk-result-provenance")(
         "Sources: ",
         h.a(h.code("benchmark/receipts/nuts-reactant-v1.toml");
@@ -887,7 +890,7 @@ function render_nuts_reactant_benchmark()
         _plot_block(spec; id = "nuts-reactant-transition-time",
             title = "Matched adaptive-NUTS transition time", description = caption),
         _result_table(rows, columns; id = "nuts-reactant-table",
-            title = "Exact matched execution medians",
+            title = "Receipt medians for the matched-control corpus",
             note = "This is a matched-control microbenchmark, not sampler throughput. The logarithmic plot keeps both measured arms visible. Lower transition time and higher leapfrog steps/s are better."),
         _result_table(compile_rows, compile_columns; id = "nuts-reactant-compile-table",
             title = "Compilation and first-call costs",
