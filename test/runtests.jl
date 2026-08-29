@@ -13,6 +13,7 @@ using .ReactiveKernelsNUTSExample
     ad_only = ARGS == ["ad"]
     ppl_ad_only = ARGS == ["ppl-ad"]
     batched_only = ARGS == ["batched"]
+    bijectors_only = ARGS == ["bijectors"]
     if distributions_only
         include("test_distributions_example.jl")
     elseif ad_only
@@ -21,6 +22,9 @@ using .ReactiveKernelsNUTSExample
         include("test_ppl_enzyme.jl")
     elseif batched_only
         include("test_batched_example.jl")
+    elseif bijectors_only
+        include("test_bijectors_example.jl")
+        include("test_bijectors_enzyme.jl")
     elseif !benchmark_only
         include("test_stateless.jl")
         include("test_ad.jl")
@@ -54,6 +58,8 @@ using .ReactiveKernelsNUTSExample
         include("test_dugongs_example.jl")
         include("test_arma11_example.jl")
         include("test_gaussian_mixture_example.jl")
+        include("test_bijectors_example.jl")
+        include("test_bijectors_enzyme.jl")
         include("test_ppl_enzyme.jl")
         include("test_ppl_docs_source_authority.jl")
         include("test_hmc.jl")
@@ -70,6 +76,6 @@ using .ReactiveKernelsNUTSExample
         include("test_preexisting_examples.jl")
         include("test_corrected_core_examples.jl")
     end
-    distributions_only || ad_only || ppl_ad_only || batched_only ||
+    distributions_only || ad_only || ppl_ad_only || batched_only || bijectors_only ||
         include("test_handwritten_benchmarks.jl")
 end
