@@ -1,0 +1,90 @@
+generated_at = "2026-08-29T19:34:17.929Z"
+schema = "nuts-reactant-v1"
+
+[acceptance]
+all_overflow_flags_zero = true
+matched_control_flow_corpus = true
+matched_independent_start_states = true
+parity_screening_reported = true
+per_transition_observable_parity = true
+random_consumption_parity = true
+same_authored_transition = true
+same_target_metric_state_depth_randomness = true
+stablehlo_while_count = 1
+
+[compilation]
+all_input_state_transfers_seconds = 0.134366181
+matched_corpus_screening_seconds = 3.336140165
+native_first_execution_seconds = 1.257443538
+native_seconds = 14.069085036
+reactant_first_execution_seconds = 0.721902318
+reactant_lower_seconds = 3.78463945
+reactant_total_seconds = 66.624283838
+reactant_xla_seconds = 62.839644388
+warm_input_transfer_seconds = 0.209427656
+
+[environment]
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+julia_threads = 1
+os = "Linux"
+reactant_backend = "default CPU"
+
+[medians]
+native_steps_per_second = 504555.9105284765
+native_transition_ms = 0.025637625000000004
+reactant_over_native_steps_per_second = 0.00274984304329036
+reactant_over_native_transition_time = 351.802141384001
+reactant_steps_per_second = 1387.4495605177644
+reactant_transition_ms = 9.019371375
+
+[pins]
+accepted_implementation_sha = "0c96826957b9eee177be5818239e30e587109d8c"
+authored_fixture_blob = "09667a966f32e9106e8092f0465bf3244a32ff83"
+julia_version = "1.10.11"
+reactant_jll_version = "0.0.401+0"
+reactant_version = "0.2.278"
+reactivekernels_dirty = false
+reactivekernels_sha = "688cf01905e048c1a76b1e8a2ec81888dc7a4bc2"
+
+[protocol]
+adaptation_measured = false
+bundle_seed_hex = "0x726b5f6e757473"
+candidate_bundles_examined = 295
+candidate_bundles_rejected = 7
+candidate_selection = "first N candidates with native/Reactant observable and random-consumption parity; screening is outside timing"
+compile_order = ["native source compiler", "Reactant lowering", "Reactant XLA compile"]
+compile_time_in_steady_state = false
+compile_times_include_first_julia_jit = true
+dimension = 5
+end_to_end_sampling_measured = false
+ess_measured = false
+host_device_transfers_in_steady_state = false
+input_rebundle_in_steady_state = false
+max_depth = 10
+metric = "unit diagonal Euclidean"
+parity_screening_in_steady_state = false
+per_transition_state_setup_in_steady_state = false
+randomness = "identical pre-generated full-capacity momentum/direction/exponential bundles selected from a deterministic candidate stream"
+reactant_sync = true
+result_readback_in_steady_state = false
+rng_generation_in_steady_state = false
+rounds = 9
+state = "independent matched starting state for every full adaptive transition"
+stepsize = 0.3
+target = "5D standard normal potential with analytic in-place gradient"
+timing = "per-call @elapsed; median of per-round aggregate synchronous execution"
+transitions_per_round = 32
+
+[raw]
+native_round_seconds = [0.0011212979999999997, 0.0011564769999999995, 0.000934707, 0.000655345, 0.0005935539999999998, 0.0007339619999999999, 0.0008204040000000002, 0.0008720539999999998, 0.0006029169999999997]
+native_steps_per_second = [342460.2558820225, 349336.8220898472, 449338.6697649638, 646987.4646178731, 714341.0709050905, 566786.8363757252, 487564.6632634652, 504555.9105284765, 636903.5870609059]
+native_transition_ms = [0.03504056249999999, 0.036139906249999985, 0.02920959375, 0.02047953125, 0.018548562499999994, 0.022936312499999997, 0.025637625000000004, 0.027251687499999993, 0.01884115624999999]
+reactant_round_seconds = [0.37707938499999993, 0.367827935, 0.30754227399999995, 0.24713052000000002, 0.24137473999999995, 0.248645157, 0.288619884, 0.31660796700000005, 0.2767668179999999]
+reactant_steps_per_second = [1018.3532043259274, 1098.339635351513, 1365.6659116723579, 1715.6925822031208, 1756.6046886264905, 1673.0669723038282, 1385.9058996780693, 1389.7312950435007, 1387.4495605177644]
+reactant_transition_ms = [11.783730781249998, 11.494622968749999, 9.610696062499999, 7.722828750000001, 7.542960624999998, 7.77016115625, 9.019371375, 9.893998968750001, 8.648963062499996]
+round_directions = [116, 119, 121, 121, 121, 120, 118, 123, 116]
+round_divergences = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+round_exponentials = [336, 366, 375, 382, 378, 381, 364, 399, 345]
+round_max_reached_depth = [4, 4, 4, 4, 4, 4, 4, 4, 4]
+round_steps = [384, 404, 420, 424, 424, 416, 400, 440, 384]

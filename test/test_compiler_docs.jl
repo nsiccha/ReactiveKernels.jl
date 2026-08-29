@@ -52,6 +52,15 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     @test !occursin("stays on the CPU because", index)
     @test occursin("examples/nuts_runtime/kernel_nuts_reactant.jl", nuts)
     @test occursin("test/test_kernel_nuts_reactant.jl", nuts)
+    @test occursin("### Measured Reactant performance", nuts)
+    @test occursin("render_nuts_reactant_benchmark()", nuts)
+    @test occursin("benchmark/nuts_reactant_comparison.jl", nuts)
+    @test occursin("benchmark/receipts/nuts-reactant-v1.toml", nuts)
+    @test occursin("same authored adaptive transition", lowercase(nuts))
+    @test occursin("matched-control compiler/runtime microbenchmark", nuts)
+    @test occursin("one synchronous compiled call per transition", nuts)
+    @test occursin("could amortize dispatch", nuts)
+    @test occursin("not adaptation", nuts)
 
     for heading in (
         "## The stateless compiler",
