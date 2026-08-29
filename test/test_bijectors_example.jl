@@ -9,9 +9,9 @@ _bijector_recipe_outputs(selected) = Set(
     output.name for recipe in selected.recipes for output in recipe.outputs
 )
 
-function _bijector_allocated(kernel::K, x::Float64) where {K}
-    kernel(x)
-    @allocated kernel(x)
+function _bijector_allocated(kernel::K, args::Vararg{Float64,N}) where {K,N}
+    kernel(args...)
+    @allocated kernel(args...)
 end
 
 @testset "bijectors as demand-planned RK kernels" begin
@@ -77,5 +77,41 @@ end
         @test _bijector_allocated(constrained, x) == 0
         @test _bijector_allocated(log_jacobian, x) == 0
         @test _bijector_allocated(joint, x) == 0
+    end
+
+    @testset "nested transforms form one prunable graph" begin
+        parameters_plan = plan(fused_bijector_model; want = :parameters)
+        jacobian_plan = plan(fused_bijector_model; want = :log_jacobian)
+        joint_plan = plan(
+            fused_bijector_model; want = (:parameters, :log_jacobian),
+        )
+
+        @test length(parameters_plan.recipes) == 5
+        @test length(jacobian_plan.recipes) == 7
+        @test length(joint_plan.recipes) == 10
+        for selected in (parameters_plan, jacobian_plan, joint_plan)
+            emitted = sprint(show, code_expr(selected))
+            @test !occursin("positive_bijector", emitted)
+            @test !occursin("unit_interval_bijector", emitted)
+        end
+
+        parameters = prepare(parameters_plan)
+        log_jacobian = prepare(jacobian_plan)
+        joint = prepare(joint_plan)
+        inputs = (0.7, -0.4)
+        expected_parameters = (
+            scale = exp(inputs[1]),
+            probability = inv(1 + exp(-inputs[2])),
+        )
+        expected_log_jacobian = inputs[1] - log1pexp(-inputs[2]) -
+                                log1pexp(inputs[2])
+        @test @inferred(parameters(inputs...)) == expected_parameters
+        @test @inferred(log_jacobian(inputs...)) ≈ expected_log_jacobian
+        observed_joint = @inferred joint(inputs...)
+        @test observed_joint[1] == expected_parameters
+        @test observed_joint[2] ≈ expected_log_jacobian
+        @test _bijector_allocated(parameters, inputs...) == 0
+        @test _bijector_allocated(log_jacobian, inputs...) == 0
+        @test _bijector_allocated(joint, inputs...) == 0
     end
 end

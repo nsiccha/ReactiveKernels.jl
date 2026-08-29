@@ -3,7 +3,7 @@ module BijectorKernelExample
 using ReactiveKernels
 using LogExpFunctions: log1pexp
 
-export positive_bijector, unit_interval_bijector, demo
+export positive_bijector, unit_interval_bijector, fused_bijector_model, demo
 
 """
 A positive-support bijector authored as one have/want graph.
@@ -40,6 +40,27 @@ inputs even when the constrained floating-point value rounds to zero or one.
         -unconstrained - log_normalizer : -log_normalizer
     log_jacobian::Float64 = log_constrained + log_complement
     return (constrained, log_jacobian)
+end
+
+"""
+Reuse both mathematical definitions inside one fused model transform graph.
+
+The nested calls are expanded while the graph is built. Selecting only
+`parameters` prunes every Jacobian-only node, selecting only `log_jacobian`
+prunes both constrained-value consumers, and selecting both shares the common
+unit-interval tail calculation.
+"""
+@kernel fused_bijector_model(log_scale::Float64,
+                             logit_probability::Float64) = begin
+    (scale::Float64, scale_log_jacobian::Float64) =
+        positive_bijector(log_scale)
+    (probability::Float64, probability_log_jacobian::Float64) =
+        unit_interval_bijector(logit_probability)
+    parameters::NamedTuple{
+        (:scale, :probability),Tuple{Float64,Float64}
+    } = (; scale, probability)
+    log_jacobian::Float64 = scale_log_jacobian + probability_log_jacobian
+    return (parameters, log_jacobian)
 end
 
 function demo(io::IO = stdout; unconstrained::Float64 = 0.7)

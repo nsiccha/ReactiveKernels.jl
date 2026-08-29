@@ -4,6 +4,15 @@ using LogExpFunctions: log1pexp
 
 const BIJECTOR_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 
+struct FusedBijectorObjective{K}
+    kernel::K
+end
+
+(objective::FusedBijectorObjective)(q) = objective.kernel(q[1], q[2])
+
+_fused_bijector_reference(q) =
+    q[1] - log1pexp(-q[2]) - log1pexp(q[2])
+
 @testset "bijector wants support plain DI + Enzyme reverse mode" begin
     cases = (
         (positive_bijector, 0.7, :constrained, exp),
@@ -32,4 +41,18 @@ const BIJECTOR_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
         )
         @test observed ≈ expected
     end
+
+    fused = FusedBijectorObjective(
+        prepare(fused_bijector_model; want = :log_jacobian),
+    )
+    q = [0.7, -0.4]
+    @test fused(q) ≈ _fused_bijector_reference(q)
+    observed = DifferentiationInterface.gradient(
+        fused, BIJECTOR_ENZYME_BACKEND, q,
+    )
+    expected = DifferentiationInterface.gradient(
+        _fused_bijector_reference, BIJECTOR_ENZYME_BACKEND, q,
+    )
+    @test all(isfinite, observed)
+    @test observed ≈ expected
 end
