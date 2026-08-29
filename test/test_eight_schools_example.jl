@@ -4,12 +4,58 @@ using Test
 include(joinpath(@__DIR__, "..", "examples", "eight_schools.jl"))
 using .EightSchoolsExample
 
+_eight_schools_likelihood_call(kernel, observations, effects, scales) =
+    kernel(observations, effects, scales)
+
+_eight_schools_likelihood_allocated(kernel, observations, effects, scales) =
+    @allocated _eight_schools_likelihood_call(
+        kernel, observations, effects, scales,
+    )
+
+function _build_and_constrain_eight_schools(q)
+    model = build_eight_schools_graph()
+    prepare(model; have = :unconstrained, want = :parameters)(q)
+end
+
 @testset "manual PPL graph — eight schools" begin
     artifact = evaluate_eight_schools_source()
     @test artifact.source == strip(EIGHT_SCHOOLS_SOURCE, '\n')
-    @test artifact.output == artifact.kernel(Tuple(artifact.inputs)...)
+    @test artifact.output == Base.invokelatest(
+        artifact.kernel, Tuple(artifact.inputs)...,
+    )
     model = artifact.model
     q = [1.5, log(2.0), (0.25 .* (1:8))...]
+
+    # The public constructor is callable from ordinary compiled code: it clones
+    # a module-load template instead of defining fresh recipe methods via
+    # Core.eval inside the caller's world.
+    @test _build_and_constrain_eight_schools(q).θ == q[3:end]
+
+    @testset "PPL accumulators are one static graph-output extraction" begin
+        @test artifact.requested_nodes ==
+              (:parameters, :prior, :likelihood)
+        @test Tuple(value.name for value in outputs(artifact.kernel)) ==
+              artifact.requested_nodes
+
+        parameters, prior, likelihood = artifact.output
+        @test parameters.μ == q[1]
+        @test parameters.τ ≈ exp(q[2])
+        @test parameters.θ == q[3:end]
+        @test prior isa Float64
+        @test likelihood isa Float64
+
+        # The Wren-style Params/LogPrior/LogLikelihood selection uses the direct
+        # reducing plate. Unrequested pointwise/Jacobian/density nodes are absent
+        # from the compiled plan rather than skipped by runtime branches.
+        produced = Set(
+            canon_id(model.graph, output.id)
+            for recipe in artifact.kernel.plan.recipes for output in recipe.outputs
+        )
+        @test canon_id(model.graph, model.likelihood.id) in produced
+        @test !(canon_id(model.graph, model.pointwise.id) in produced)
+        @test !(canon_id(model.graph, model.log_jacobian.id) in produced)
+        @test !(canon_id(model.graph, model.density.id) in produced)
+    end
 
     @testset "unconstrained -> constrained; Jacobian is optional" begin
         p = plan(model.graph;
@@ -55,6 +101,17 @@ using .EightSchoolsExample
             for j in 1:8)
         @test likelihood ≈ reference_likelihood
         @test density ≈ prior + log_jacobian + likelihood
+
+        density_only = plan(model.graph;
+            have = (model.unconstrained, model.observations,
+                    model.observation_scales),
+            want = (model.density,))
+        fused_density = getfield(
+            artifact.sandbox, :fused_unconstrained_density)
+        @test any(r -> r.op === fused_density,
+                  density_only.recipes)
+        @test length(density_only.recipes) == 1
+        @test !any(r -> r.op === sum, density_only.recipes)
     end
 
     @testset "corrected core contracts hold on PPL paths" begin
@@ -193,15 +250,34 @@ using .EightSchoolsExample
         @test prediction.y == -10.0
     end
 
-    @testset "the plated likelihood equals the summed per-school density" begin
-        # `plated_loglik` is the vectorized `plate` of the scalar per-school kernel.
+    @testset "plate exposes pointwise values and a buffer-free total" begin
         θ = q[3:end]
-        expected = sum(
+        expected_pointwise = [
             EightSchoolsExample.normal_logpdf(
                 EIGHT_SCHOOLS_Y[j], θ[j], EIGHT_SCHOOLS_SIGMA[j])
-            for j in 1:8)
-        @test EightSchoolsExample.plated_loglik(
-            EIGHT_SCHOOLS_Y, θ, EIGHT_SCHOOLS_SIGMA) ≈ expected
+            for j in 1:8
+        ]
+
+        @test artifact.pointwise ≈ expected_pointwise
+        likelihood = _eight_schools_likelihood_call(
+            artifact.likelihood_kernel,
+            EIGHT_SCHOOLS_Y, θ, EIGHT_SCHOOLS_SIGMA,
+        )
+        @test likelihood ≈ sum(expected_pointwise)
+
+        # Collect mode allocates exactly the requested pointwise result. The
+        # reducing plate instead emits a scalar accumulator loop, with no
+        # `similar` output buffer, and executes allocation-free after warmup.
+        @test occursin("similar", string(code_expr(artifact.pointwise_kernel)))
+        @test !occursin("similar", string(code_expr(artifact.likelihood_kernel)))
+        _eight_schools_likelihood_call(
+            artifact.likelihood_kernel,
+            EIGHT_SCHOOLS_Y, θ, EIGHT_SCHOOLS_SIGMA,
+        )
+        @test _eight_schools_likelihood_allocated(
+            artifact.likelihood_kernel,
+            EIGHT_SCHOOLS_Y, θ, EIGHT_SCHOOLS_SIGMA,
+        ) == 0
     end
 
     @testset "invalid constrained inputs fail explicitly" begin

@@ -1,4 +1,4 @@
-generated_at = "2026-08-28T15:13:29.572Z"
+generated_at = "2026-08-29T13:05:13.557Z"
 schema = "eval-throughput-v1"
 
 [environment]
@@ -10,166 +10,238 @@ reactant_backend = "default CPU"
 
 [[measurements]]
 implementation = "reactivekernels"
-median_ns = 45.426513671875
+median_ns = 43.194091796875
 mode = "primal"
 size = 16
 variant = "native"
 [[measurements]]
 implementation = "reactivekernels"
-median_ns = 3560.234375
+median_ns = 3625.15625
 mode = "primal"
 size = 16
 variant = "reactant"
 [[measurements]]
 implementation = "turing"
-median_ns = 121.33984374999999
+median_ns = 114.884765625
 mode = "primal"
 size = 16
 variant = "native"
 [[measurements]]
 implementation = "reactivekernels"
-median_ns = 111.2666015625
+median_ns = 91.3173828125
 mode = "gradient"
 size = 16
 variant = "native"
 [[measurements]]
 implementation = "reactivekernels"
-median_ns = 3243.375
+median_ns = 3823.5625
 mode = "gradient"
 size = 16
 variant = "reactant"
 [[measurements]]
 implementation = "turing"
-median_ns = 523.49609375
+median_ns = 508.90625
 mode = "gradient"
 size = 16
 variant = "native"
 [[measurements]]
 implementation = "reactivekernels"
-median_ns = 32.694091796875
+median_ns = 97.64453125
 mode = "gq"
 size = 16
 variant = "native"
 [[measurements]]
 implementation = "reactivekernels"
-median_ns = 3197.078125
+median_ns = 3642.84375
 mode = "gq"
 size = 16
 variant = "reactant"
 [[measurements]]
 implementation = "turing"
-median_ns = 66.7529296875
+median_ns = 64.875
 mode = "gq"
 size = 16
 variant = "native"
 [[measurements]]
+batch_size = 256
 implementation = "reactivekernels"
-median_ns = 163.271484375
+median_batch_ns = 14072.5625
+median_ns = 54.970947265625
+mode = "primal"
+size = 16
+variant = "reactant_replicated"
+[[measurements]]
+batch_size = 256
+implementation = "reactivekernels"
+median_batch_ns = 22621.25
+median_ns = 88.3642578125
+mode = "gradient"
+size = 16
+variant = "reactant_replicated"
+[[measurements]]
+batch_size = 256
+implementation = "reactivekernels"
+median_batch_ns = 24471.25
+median_ns = 95.5908203125
+mode = "gq"
+size = 16
+variant = "reactant_replicated"
+[[measurements]]
+implementation = "reactivekernels"
+median_ns = 138.619140625
 mode = "primal"
 size = 256
 variant = "native"
 [[measurements]]
 implementation = "reactivekernels"
-median_ns = 17133.75
+median_ns = 8151.249999999999
 mode = "primal"
 size = 256
 variant = "reactant"
 [[measurements]]
 implementation = "turing"
-median_ns = 629.421875
+median_ns = 950.53125
 mode = "primal"
 size = 256
 variant = "native"
 [[measurements]]
 implementation = "reactivekernels"
-median_ns = 800.55859375
+median_ns = 761.40234375
 mode = "gradient"
 size = 256
 variant = "native"
 [[measurements]]
 implementation = "reactivekernels"
-median_ns = 17253.8125
+median_ns = 10966.3125
 mode = "gradient"
 size = 256
 variant = "reactant"
 [[measurements]]
 implementation = "turing"
-median_ns = 4587.5625
+median_ns = 5127.75
 mode = "gradient"
 size = 256
 variant = "native"
 [[measurements]]
 implementation = "reactivekernels"
-median_ns = 166.646484375
+median_ns = 162.0302734375
 mode = "gq"
 size = 256
 variant = "native"
 [[measurements]]
 implementation = "reactivekernels"
-median_ns = 10657.1875
+median_ns = 8937.9375
 mode = "gq"
 size = 256
 variant = "reactant"
 [[measurements]]
 implementation = "turing"
-median_ns = 410.37109375
+median_ns = 449.83984375
 mode = "gq"
 size = 256
 variant = "native"
 [[measurements]]
+batch_size = 256
 implementation = "reactivekernels"
-median_ns = 1640.078125
+median_batch_ns = 40280.5
+median_ns = 157.345703125
+mode = "primal"
+size = 256
+variant = "reactant_replicated"
+[[measurements]]
+batch_size = 256
+implementation = "reactivekernels"
+median_batch_ns = 117242.0
+median_ns = 457.9765625
+mode = "gradient"
+size = 256
+variant = "reactant_replicated"
+[[measurements]]
+batch_size = 256
+implementation = "reactivekernels"
+median_batch_ns = 111835.0
+median_ns = 436.85546875
+mode = "gq"
+size = 256
+variant = "reactant_replicated"
+[[measurements]]
+implementation = "reactivekernels"
+median_ns = 1707.828125
 mode = "primal"
 size = 4096
 variant = "native"
 [[measurements]]
 implementation = "reactivekernels"
-median_ns = 18239.5
+median_ns = 12054.25
 mode = "primal"
 size = 4096
 variant = "reactant"
 [[measurements]]
 implementation = "turing"
-median_ns = 4100.328125
+median_ns = 4550.640625
 mode = "primal"
 size = 4096
 variant = "native"
 [[measurements]]
 implementation = "reactivekernels"
-median_ns = 9960.625
+median_ns = 10594.6875
 mode = "gradient"
 size = 4096
 variant = "native"
 [[measurements]]
 implementation = "reactivekernels"
-median_ns = 11637.3125
+median_ns = 10902.5625
 mode = "gradient"
 size = 4096
 variant = "reactant"
 [[measurements]]
 implementation = "turing"
-median_ns = 27247.5
+median_ns = 27558.25
 mode = "gradient"
 size = 4096
 variant = "native"
 [[measurements]]
 implementation = "reactivekernels"
-median_ns = 1340.16796875
+median_ns = 1452.78125
 mode = "gq"
 size = 4096
 variant = "native"
 [[measurements]]
 implementation = "reactivekernels"
-median_ns = 10155.25
+median_ns = 10241.625
 mode = "gq"
 size = 4096
 variant = "reactant"
 [[measurements]]
 implementation = "turing"
-median_ns = 2766.3125
+median_ns = 3016.359375
 mode = "gq"
 size = 4096
 variant = "native"
+[[measurements]]
+batch_size = 256
+implementation = "reactivekernels"
+median_batch_ns = 170505.0
+median_ns = 666.03515625
+mode = "primal"
+size = 4096
+variant = "reactant_replicated"
+[[measurements]]
+batch_size = 256
+implementation = "reactivekernels"
+median_batch_ns = 275570.0
+median_ns = 1076.4453125
+mode = "gradient"
+size = 4096
+variant = "reactant_replicated"
+[[measurements]]
+batch_size = 256
+implementation = "reactivekernels"
+median_batch_ns = 1.202478e6
+median_ns = 4697.1796875
+mode = "gq"
+size = 4096
+variant = "reactant_replicated"
 
 [pins]
 differentiationinterface_version = "0.7.21"
@@ -178,7 +250,7 @@ dynamicppl_version = "0.42.6"
 enzyme_version = "0.13.199"
 julia_version = "1.10.11"
 reactant_version = "0.2.278"
-reactivekernels_sha = "3a82a375f5f3603198c291dfbd4eb5562df4f435"
+reactivekernels_sha = "66701233f982d89fb0e00dfebd2d4bda608470ad"
 reactivekernels_version = "0.1.0"
 turing_version = "0.47.1"
 
@@ -193,7 +265,11 @@ modes = ["primal", "gradient", "gq"]
 reactant_compile_time_in_timed_region = false
 reactant_sync = true
 reactant_transfers_included = false
-rounds = 60
+replica_axis = "independent position vectors on the trailing x axis"
+replicas = 256
+replicated_gradient = "gradient of the sum of independent replicated log densities"
+replicated_median_ns = "whole-batch median divided by replicas; median_batch_ns is also retained"
+rounds = 50
 
 [support]
 turing_reactant = false

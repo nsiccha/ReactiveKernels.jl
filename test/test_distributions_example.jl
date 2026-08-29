@@ -1,9 +1,20 @@
 using Test
+using DifferentiationInterface
+using DifferentiationInterface: Constant
+import Enzyme
 using Distributions
 
 include(joinpath(@__DIR__, "..", "examples", "distributions.jl"))
 using .DistributionExamples
 using ReactiveKernels: code_expr
+
+const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
+
+struct SecondDistributionInput{K}
+    kernel::K
+end
+(call::SecondDistributionInput)(active, first_input) =
+    call.kernel(first_input, active)
 
 @testset "Native log-density examples" begin
     artifacts = map(evaluate_source, all_sources())
@@ -164,5 +175,40 @@ using ReactiveKernels: code_expr
             @test artifact.inferred_return === expected_return
             @test typeof(observed) === expected_return
         end
+    end
+
+    @testset "plain DI + Enzyme reverse mode covers every prepared density" begin
+        gradients = Dict{Symbol,Any}()
+        for artifact in artifacts
+            values = Tuple(artifact.inputs)
+            if artifact.name in (:discrete_bernoulli_logit, :geometric_logit)
+                call = SecondDistributionInput(artifact.kernel)
+                active = values[2]
+                constants = (Constant(values[1]),)
+            else
+                call = artifact.kernel
+                active = first(values)
+                constants = map(Constant, Base.tail(values))
+            end
+            gradient = DifferentiationInterface.gradient(
+                call, DISTRIBUTION_ENZYME_BACKEND, active, constants...)
+            gradients[artifact.name] = gradient
+            components = gradient isa Number ? (gradient,) : gradient
+            @test all(isfinite, components)
+        end
+
+        normal = artifacts[1]
+        x, μ, logσ = Tuple(normal.inputs)
+        @test gradients[:continuous_normal] ≈ -(x - μ) / exp(2logσ)
+
+        bernoulli = artifacts[2]
+        observed, logit = Tuple(bernoulli.inputs)
+        @test gradients[:discrete_bernoulli_logit] ≈
+              Int(observed) - 1 / (1 + exp(-logit))
+
+        vectorized = artifacts[3]
+        xbatch, μbatch, logσbatch = Tuple(vectorized.inputs)
+        @test gradients[:vectorized_normal] ≈
+              @. -(xbatch - μbatch) / exp(2logσbatch)
     end
 end

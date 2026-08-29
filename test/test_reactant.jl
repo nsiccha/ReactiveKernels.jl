@@ -11,6 +11,9 @@ include(joinpath(@__DIR__, "..", "examples", "distribution_kernel_sources.jl"))
 using .DistributionKernelSources:
     EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE,
     MVNORMAL_SOURCE, AR1_SOURCE
+include(joinpath(@__DIR__, "..", "examples", "eight_schools.jl"))
+using .EightSchoolsExample:
+    EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA, evaluate_eight_schools_source
 
 function _evaluate_distribution_kernel_source(source::AbstractString)
     sandbox = Module(gensym(:ReactantDistributionKernel), true, true)
@@ -106,6 +109,40 @@ end
 
 @testset "Reactant optional compiler integration" begin
     @test Base.get_extension(ReactiveKernels, :ReactiveKernelsReactantExt) !== nothing
+
+    @testset "eight-schools PPL extraction and plate boundaries compile" begin
+        artifact = evaluate_eight_schools_source()
+        q_host = [1.5, log(2.0), (0.25 .* (1:8))...]
+        μ = Reactant.to_rarray(q_host[1]; track_numbers = true)
+        log_τ = Reactant.to_rarray(q_host[2]; track_numbers = true)
+        effects = Reactant.to_rarray(q_host[3:end])
+        observations = Reactant.to_rarray(EIGHT_SCHOOLS_Y)
+        scales = Reactant.to_rarray(EIGHT_SCHOOLS_SIGMA)
+
+        # This is the intended PPL -> RK -> Reactant path: the PPL policy becomes
+        # one static named-node selection, then Reactant compiles that prepared
+        # mathematical kernel without seeing accumulator objects or graph state.
+        compiled = @compile artifact.kernel(
+            μ, log_τ, effects, observations, scales)
+        parameters, prior, likelihood = compiled(
+            μ, log_τ, effects, observations, scales)
+        reference_parameters, reference_prior, reference_likelihood = artifact.output
+        @test parameters.μ ≈ reference_parameters.μ
+        @test parameters.τ ≈ reference_parameters.τ
+        @test Array(parameters.θ) ≈ reference_parameters.θ
+        @test prior ≈ reference_prior
+        @test likelihood ≈ reference_likelihood
+
+        pointwise_compiled = @compile artifact.pointwise_kernel(
+            observations, effects, scales)
+        @test Array(pointwise_compiled(observations, effects, scales)) ≈
+              artifact.pointwise
+
+        likelihood_compiled = @compile artifact.likelihood_kernel(
+            observations, effects, scales)
+        @test likelihood_compiled(observations, effects, scales) ≈
+              reference_likelihood
+    end
 
     @testset "direct prepared scalar kernels keep program metadata static" begin
         # Defaulted named authoring returns the signature wrapper, so this also

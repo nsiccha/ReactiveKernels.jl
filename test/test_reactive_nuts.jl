@@ -14,10 +14,7 @@ using Test
 # copy/copyto!), and that the DI+Enzyme scalar-potential boundary is the sampled
 # gradient path with no shared caller buffer.
 
-const _NUTS_ENZYME_BACKEND = AutoEnzyme(;
-    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-    function_annotation = Enzyme.Const,
-)
+const _NUTS_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 
 # Standard normal potential: U(q) = 0.5||q||^2, grad U(q) = q. The sampler boundary
 # is in-place: fill the (slot-owned) gradient buffer, return the scalar potential.

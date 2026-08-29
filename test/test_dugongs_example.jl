@@ -49,6 +49,14 @@ using .DugongsGrowthExample
         @test all(isfinite, pointwise)
         @test likelihood ≈ sum(pointwise)
         @test density ≈ prior + log_jacobian + likelihood
+
+        density_only = plan(model.graph;
+            have = (model.unconstrained, model.ages, model.lengths),
+            want = (model.density,))
+        @test any(r -> r.op === DugongsGrowthExample.fused_log_likelihood,
+                  density_only.recipes)
+        @test !any(r -> r.op === DugongsGrowthExample.pointwise_log_likelihood,
+                   density_only.recipes)
     end
 
     @testset "generated quantity prunes density work" begin

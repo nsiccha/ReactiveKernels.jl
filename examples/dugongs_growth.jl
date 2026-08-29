@@ -100,6 +100,17 @@ end
 
 sum_log_likelihood(log_likelihoods::RealVector) = sum(log_likelihoods)
 
+function fused_log_likelihood(parameters::DugongsParameters,
+                              ages::RealVector,
+                              lengths::RealVector)
+    likelihood = zero(parameters.α)
+    @inbounds for i in eachindex(ages, lengths)
+        likelihood += normal_logpdf(
+            lengths[i], growth_mean(parameters, ages[i]), parameters.σ)
+    end
+    likelihood
+end
+
 total_log_density(log_prior::Real, log_jacobian::Real,
                   log_likelihood::Real) =
     log_prior + log_jacobian + log_likelihood
@@ -123,6 +134,9 @@ const DUGONGS_SOURCE = raw"""
     prior::Real = log_prior(parameters)
     pointwise::RealVector = pointwise_log_likelihood(parameters, ages, lengths)
     likelihood::Real = sum_log_likelihood(pointwise)
+    # The cheaper density-only path fuses the scalar observation recipe into a
+    # reduction and avoids an active pointwise Vector under reverse AD.
+    likelihood::Real = fused_log_likelihood(parameters, ages, lengths)
     density::Real = total_log_density(prior, log_jacobian, likelihood)
     predicted::Real = predicted_length(parameters, new_age)
     return density
@@ -158,7 +172,7 @@ function evaluate_dugongs_source()
         :split_unconstrained, :bounded_lambda, :sd_from_log_precision,
         :assemble_parameters, :log_abs_det_jacobian, :log_prior,
         :pointwise_log_likelihood, :sum_log_likelihood,
-        :total_log_density, :predicted_length,
+        :fused_log_likelihood, :total_log_density, :predicted_length,
     ))
 end
 
@@ -168,8 +182,8 @@ end
 Build the posteriordb dugongs asymptotic-growth model as a declarative
 `ReactiveKernels.KernelSpec`. The mean length `α − β·λ^age` is nonlinear in the
 parameters; the graph keeps the two support transforms + Jacobian, prior,
-pointwise log-likelihood, likelihood reduction, total density, and an
-expected-length generated quantity as separate named ports.
+pointwise log-likelihood, fused scalar-loop likelihood reduction, total density,
+and an expected-length generated quantity as separate named ports.
 """
 function build_dugongs_graph()
     evaluate_dugongs_source().model

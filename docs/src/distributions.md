@@ -18,6 +18,27 @@ Each panel below shows the **Raw input** (the source), a readable **Generated
 kernel** derived from the executed kernel and selected plan, and its **Compute
 DAG**. The exact compiled AST remains available through `code_expr`.
 
+## Optional reverse-mode AD through DifferentiationInterface
+
+AD remains outside the core dependency graph: Enzyme and
+DifferentiationInterface are test/example extras, just as Reactant is an
+optional extension. Prepared distribution kernels nevertheless have a tested
+fast path through DI's Enzyme backend. Mark non-active inputs with DI
+`Constant` and use ordinary reverse mode:
+
+```julia
+using DifferentiationInterface
+using DifferentiationInterface: Constant
+import Enzyme
+
+backend = AutoEnzyme(; mode = Enzyme.Reverse)
+dx = gradient(normal_kernel, backend, x, Constant(μ), Constant(logσ))
+```
+
+The test suite exercises this configuration across all eleven scalar, plated,
+multivariate, and time-series examples below. No runtime-activity mode or
+function annotation is needed.
+
 ## Continuous: Normal location and log scale
 
 The Gaussian uses three transparent steps: scale, standardized residual, and
@@ -196,6 +217,22 @@ whole calculation with traced observations and traced shared parameters.
 ```@eval
 Main.ReactiveKernelsDocs.render_distribution_benchmarks()
 ```
+
+### Amortizing the Reactant call boundary
+
+For a tiny scalar density, most of the compiled-call time is fixed host/runtime
+overhead. When observations are independent, the same scalar `PreparedKernel`
+can be lifted with `replica(...; batched = :x)` and evaluated once over a vector.
+The checked-in receipt measures 1, 16, and 256 independent one-observation
+evaluations per compiled call:
+
+```@eval
+Main.ReactiveKernelsDocs.render_distribution_amortization()
+```
+
+The allocation count and bytes are for the whole host-side invocation, not for
+each observation. Batching therefore avoids paying that wrapper once per logical
+evaluation; it does not change the latency of an isolated one-observation call.
 
 Each cell is the median of five minimum-time measurements, with Reactant work
 synchronized before timing. Compilation and host↔device transfers are excluded

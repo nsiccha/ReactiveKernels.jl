@@ -66,7 +66,8 @@ end
 
 # --- eval-throughput visualization ----------------------------------------
 # A build-executed chart of the static eval-throughput receipt: grouped
-# horizontal bars on a log time axis, faceted by mode, one bar per timed series.
+# horizontal bars on a log time axis, faceted by mode, one bar per single-call
+# latency series.
 # The bars are read straight from the receipt TOML, so the picture cannot drift
 # from the numbers. `RK + Reactant` and `Turing native` share the axis; Turing +
 # Reactant is unsupported and omitted.
@@ -116,7 +117,7 @@ function eval_throughput_chart(; receipt = _eval_throughput_receipt())
 
     io = IOBuffer()
     print(io, """<svg viewBox="0 0 720 $(round(Int, total_h))" width="100%" """,
-        """role="img" aria-label="Evaluation throughput: median per-call time """,
+        """role="img" aria-label="Single-call evaluation latency: median per-call time """,
         """by mode, size and implementation" style="font: 12px/1.3 var(--vp-font-family-base, system-ui); color: var(--vp-c-text-1, currentColor);">""")
 
     # Legend.
@@ -259,7 +260,7 @@ function setup_dugongs!(mod::Module)
         split_unconstrained, bounded_lambda, sd_from_log_precision,
         assemble_parameters, log_abs_det_jacobian, log_prior,
         pointwise_log_likelihood, sum_log_likelihood,
-        total_log_density, predicted_length))
+        fused_log_likelihood, total_log_density, predicted_length))
     nothing
 end
 
@@ -285,7 +286,7 @@ function setup_gaussian_mixture!(mod::Module)
         MIXTURE_OBSERVATIONS, split_unconstrained, ordered_means,
         exp_scale, logistic, assemble_parameters, log_abs_det_jacobian,
         log_prior, pointwise_log_likelihood, sum_log_likelihood,
-        total_log_density, component1_responsibility))
+        fused_log_likelihood, total_log_density, component1_responsibility))
     nothing
 end
 
@@ -542,7 +543,7 @@ function execute_ppl_example(mod::Module, owner::Symbol, source::Symbol;
 end
 
 const EXPECTED_PPL_EXAMPLES = (
-    :eight_schools_density,
+    :eight_schools_extraction,
     :linear_regression_density,
     :beta_binomial_density,
     :poisson_gamma_density,
