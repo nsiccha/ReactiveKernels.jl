@@ -18,7 +18,8 @@ function compose(gs::Graph...)
     for g in gs
         for r in g.recipes
             add!(out; inputs = r.inputs, outputs = r.outputs, op = r.op,
-                 cost = r.cost, cse_key = r.cse_key, effectful = r.effectful)
+                 cost = r.cost, cse_key = r.cse_key, effectful = r.effectful,
+                 source = r.source)
         end
     end
     out

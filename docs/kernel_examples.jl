@@ -53,6 +53,17 @@ function _generated_source(expr::Expr)
     sprint(Base.show_unquoted, expr; context = :limit => false)
 end
 
+function _readable_generated_source(expr::Expr, dag::Plan, label)
+    readable = ReactiveKernels._readable_expr(expr, dag)
+    occursin(r"__ops__\[\d+\]", string(readable)) && error(
+        "$label readable generated view retained an opaque operation slot",
+    )
+    occursin(r"\boperation\(", string(readable)) && error(
+        "$label readable generated view retained an unnamed operation",
+    )
+    _generated_source(readable)
+end
+
 # --- eval-throughput visualization ----------------------------------------
 # A build-executed chart of the static eval-throughput receipt: grouped
 # horizontal bars on a log time axis, faceted by mode, one bar per timed series.
@@ -291,7 +302,8 @@ end
 
 # The ONE shared three-view UI (Raw input / Generated kernel / Compute DAG). Both
 # the stateless PreparedKernel path and the ReactiveProgram path emit through this;
-# there is no second renderer. `dag` is the exact `Plan` consumed by `visualize`.
+# there is no second renderer. `generated` is a display-only readable copy of the
+# compiled AST; `dag` is the exact `Plan` consumed by `visualize`.
 function _three_pane_blocks!(blocks, title, source, generated, dag::Plan)
     push!(blocks, RawHTML("""
 <h2>$(title)</h2>
@@ -318,8 +330,10 @@ end
     render_examples(artifacts) -> Markdown.MD
 
 Render executable documentation artifacts in the standard three-view UI. Each
-artifact supplies its exact raw source/call, the `code_expr` captured from the
-executed `PreparedKernel`, and the selected `Plan` consumed by `visualize`.
+artifact supplies its exact raw source/call, the raw `code_expr` captured from
+the executed `PreparedKernel`, and the selected `Plan` consumed by `visualize`.
+The Generated kernel pane derives a readable, display-only expression from the
+raw AST and that plan without changing either artifact.
 """
 function render_examples(artifacts)
     blocks = Any[]
@@ -340,7 +354,9 @@ function render_examples(artifacts)
             "# Executed input\n", _plain_repr(artifact.inputs), "\n\n",
             "# Actual output\n", _plain_repr(artifact.output),
         )
-        generated = _generated_source(artifact.generated)
+        generated = _readable_generated_source(
+            artifact.generated, artifact.dag, artifact.name,
+        )
         _three_pane_blocks!(blocks, _example_title(artifact.name), source, generated, artifact.dag)
     end
     Markdown.MD(blocks)
@@ -467,8 +483,9 @@ group = ReactiveKernels.reactive_nuts_group(
 )
 program = reactive_program(group)
 
-# Generated pane: the fused reactive `:dham` (energy-error) getter — one
-# representative compiled getter, NOT a whole-program listing.
+# Raw generated artifact: the fused reactive `:dham` (energy-error) getter — one
+# representative compiled getter, NOT a whole-program listing. The renderer
+# turns its positional operation slots into readable recipe expressions.
 generated_dham_getter = code_expr(program, getproperty(group.handles, :dham))
 # Compute DAG pane: the exact reactive_program(group).plan.
 compiled_plan = program.plan
@@ -494,8 +511,10 @@ function render_nuts_compiled_kernel_dag(mod::Module)
     program isa ReactiveKernels.ReactiveProgram || error(
         "render_nuts_compiled_kernel_dag: source did not build a ReactiveProgram",
     )
-    generated = _generated_source(
-        code_expr(program, getproperty(group.handles, :dham)))
+    raw_generated = code_expr(program, getproperty(group.handles, :dham))
+    generated = _readable_generated_source(
+        raw_generated, program.plan, "render_nuts_compiled_kernel_dag",
+    )
     blocks = Any[]
     _three_pane_blocks!(
         blocks, "Full compiled NUTS kernel — reactive group program",

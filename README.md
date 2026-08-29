@@ -267,7 +267,10 @@ as executable `ExampleArtifact` records. Each record carries the corresponding
 compact `@kernel` source and runtime inputs, the real `PreparedKernel` and its
 executed output, the exact `code_expr` generated from that kernel, and its
 selected `Plan`. The visualization layer consumes the plan directly, so docs
-can render the colored compute DAG without reconstructing graph semantics:
+can render the colored compute DAG without reconstructing graph semantics. The
+docs' Generated kernel pane combines that raw AST with the selected plan to show
+named operations and retained authored expressions; it never presents the
+display-only copy as the compiled `code_expr`:
 
 ```julia
 include("examples/artifacts.jl")

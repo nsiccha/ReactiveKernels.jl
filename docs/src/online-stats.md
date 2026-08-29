@@ -22,9 +22,10 @@ It fixes the storage type to a floating `T`, which keeps empty and singleton
 
 The Raw pane below declares update/summary and partition-merge fragments with
 `@kernel`, composes them by name, and prepares only the streaming query. The
-Generated pane is `code_expr(update_kernel)`, and the Compute DAG is the selected
-`Plan` rendered by `visualize`; the unused partition branch is therefore absent
-from both generated views.
+Generated pane is a readable view derived from the executed kernel and selected
+`Plan`; the exact compiled AST remains available as `code_expr(update_kernel)`.
+The Compute DAG renders that plan with `visualize`, so the unused partition
+branch is absent from both generated views.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(@__MODULE__, raw"""

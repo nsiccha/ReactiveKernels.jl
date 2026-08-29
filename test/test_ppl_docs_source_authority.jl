@@ -37,6 +37,15 @@ const PPL_SOURCE_CASES = (
         artifact = evaluator()
         @test artifact.source == strip(source, '\n')
         @test artifact.output == artifact.kernel(Tuple(artifact.inputs)...)
+        raw_generated = code_expr(artifact.kernel)
+        readable_generated = sprint(
+            Base.show_unquoted,
+            ReactiveKernels._readable_expr(raw_generated, artifact.kernel.plan);
+            context = :limit => false,
+        )
+        @test raw_generated === code_expr(artifact.kernel)
+        @test !occursin(r"__ops__\[\d+\]", readable_generated)
+        @test !occursin(r"\boperation\(", readable_generated)
     end
 
     make_source = read(joinpath(@__DIR__, "..", "docs", "make.jl"), String)
@@ -45,6 +54,9 @@ const PPL_SOURCE_CASES = (
     )
     @test occursin("warnonly = Documenter.except(:eval_block)", make_source)
     @test occursin("assert_ppl_examples_executed!()", make_source)
+    @test occursin("ReactiveKernels._readable_expr", helper_source)
+    @test occursin("readable generated view retained an opaque operation slot",
+                   helper_source)
     for name in (
         :eight_schools_density,
         :linear_regression_density,

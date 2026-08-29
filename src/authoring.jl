@@ -179,9 +179,10 @@ function _kernel_push_unique!(names::Vector{Symbol}, name::Symbol)
     names
 end
 
-function _kernel_add!(graph::Graph, ins, outs, op, cost, cse_key, effectful)
+function _kernel_add!(graph::Graph, ins, outs, op, cost, cse_key, effectful,
+                      source = _NO_KERNEL_SOURCE)
     add!(graph; inputs = ins, outputs = outs, op = op,
-         cost = cost, cse_key = cse_key, effectful = effectful)
+         cost = cost, cse_key = cse_key, effectful = effectful, source = source)
 end
 
 # A SINGLE-DEFINITION bare-identity recipe `b = a` (RHS a bare port, not a call) makes `b` a
@@ -195,7 +196,8 @@ end
 # conversion (`b::T = a::U`, T≠U) is uncertain, so the ordinary identity Recipe is kept instead.
 # The caller hard-aliases only outputs with EXACTLY ONE authored definition (`b=a; b=c` are
 # alternative producers, not a proof `a===c`).
-function _kernel_alias!(graph::Graph, from::Value, to::Value, op, cost)
+function _kernel_alias!(graph::Graph, from::Value, to::Value, op, cost,
+                        source = _NO_KERNEL_SOURCE)
     src = canon_id(graph, from.id)
     dst = canon_id(graph, to.id)
     src == dst && return graph                       # already one class (reverse/transitive)
@@ -204,7 +206,7 @@ function _kernel_alias!(graph::Graph, from::Value, to::Value, op, cost)
         graph.version += 1                           # a real canonical mutation (like CSE/merge)
     else                                             # typed conversion → keep the ordinary recipe
         add!(graph; inputs = (to,), outputs = (from,), op = op,
-             cost = cost, cse_key = nothing, effectful = false)
+             cost = cost, cse_key = nothing, effectful = false, source = source)
     end
     graph
 end
@@ -1197,7 +1199,8 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
             op = _kernel_operation(authored_rhs, Symbol[authored_rhs], known)
             cost = 1.0
             push!(body, :($alias_ref($graph_var, $(port_vars[outputs[1][1]]),
-                                     $(port_vars[authored_rhs]), $op, $cost)))
+                                     $(port_vars[authored_rhs]), $op, $cost,
+                                     $(QuoteNode(authored_rhs)))))
             _kernel_push_unique!(produced_names, outputs[1][1])
             push!(consumed_names, authored_rhs)
             continue
@@ -1215,7 +1218,8 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         effectful = get(metadata, :effectful, false)
         op = _kernel_operation(rhs, deps, known; tensorize = !effectful)
         push!(body, :($add_ref($graph_var, $dep_values, $out_values,
-                               $op, $cost, $cse_key, $effectful)))
+                               $op, $cost, $cse_key, $effectful,
+                               $(QuoteNode(rhs)))))
     end
     if !saw_return
         for name in produced_names
@@ -1602,7 +1606,7 @@ function _kernel_clone_recipes!(graph::Graph, ports::Dict{Symbol,Value},
         outs = Tuple(ports[value.name] for value in recipe.outputs)
         add!(graph; inputs = ins, outputs = outs, op = recipe.op,
              cost = recipe.cost, cse_key = recipe.cse_key,
-             effectful = recipe.effectful)
+             effectful = recipe.effectful, source = recipe.source)
     end
     graph
 end

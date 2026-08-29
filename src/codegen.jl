@@ -669,6 +669,80 @@ catch
     string(op)
 end
 
+function _readable_callee(op)
+    name = try
+        nameof(op)
+    catch
+        nothing
+    end
+    name isa Symbol && !startswith(string(name), "#") ? name : :operation
+end
+
+function _operation_slot(node)
+    node isa Expr && node.head === :ref && length(node.args) == 2 &&
+        node.args[1] === _OPS_ARG && node.args[2] isa Int || return nothing
+    node.args[2]
+end
+
+function _readable_recipe_call(recipe::Recipe, args)
+    op = recipe.op
+    source = recipe.source
+    if !(source isa _NoKernelSource)
+        rhs = deepcopy(source)
+        bindings = Any[]
+        for (input, arg) in zip(recipe.inputs, args)
+            input.name === arg && continue
+            push!(bindings, Expr(:(=), input.name, arg))
+        end
+        isempty(bindings) && return rhs
+        header = length(bindings) == 1 ? only(bindings) : Expr(:block, bindings...)
+        return Expr(:let, header, Expr(:block, rhs))
+    end
+    Expr(:call, _readable_callee(op), args...)
+end
+
+function _readable_expr(node, recipes)
+    node isa Expr || return node
+
+    # Ordinary lowered kernels and pure reactive getters invoke an operation
+    # slot directly. In-place variants wrap the same slot in cache plumbing;
+    # the readable view deliberately shows the authored operation, not that
+    # execution-only machinery.
+    if node.head === :call && !isempty(node.args)
+        slot = _operation_slot(node.args[1])
+        if slot !== nothing && 1 <= slot <= length(recipes)
+            args = map(arg -> _readable_expr(arg, recipes), node.args[2:end])
+            return _readable_recipe_call(recipes[slot], args)
+        end
+        if node.args[1] === _CACHE_APPLY_ARG && length(node.args) >= 3
+            slot = _operation_slot(node.args[3])
+            if slot !== nothing && 1 <= slot <= length(recipes)
+                args = map(arg -> _readable_expr(arg, recipes), node.args[4:end])
+                return _readable_recipe_call(recipes[slot], args)
+            end
+        end
+    end
+
+    args = map(arg -> _readable_expr(arg, recipes), node.args)
+    if node.head === :function && !isempty(args)
+        signature = args[1]
+        if signature isa Expr && signature.head === :tuple
+            hidden = (_OPS_ARG, _CACHES_ARG, _CACHE_APPLY_ARG)
+            signature = Expr(:tuple, (arg for arg in signature.args
+                                      if !(arg isa Symbol && arg in hidden))...)
+            args[1] = signature
+        end
+    end
+    Expr(node.head, args...)
+end
+
+# Build a display-only copy of a lowered kernel or reactive getter. Positional
+# `__ops__[k]` calls become the selected recipe's named operation or its retained
+# authored RHS, and hidden operation/cache arguments are removed from the shown
+# signature. This internal explanatory expression is not executable authority;
+# `code_expr` remains the exact compiled AST.
+_readable_expr(ast::Expr, plan::Plan) = _readable_expr(ast, plan.recipes)
+
 function _recipe_line(r::Recipe)
     ins = join([string(v.name) for v in r.inputs], ", ")
     outs = length(r.outputs) == 1 ? string(r.outputs[1].name) :
