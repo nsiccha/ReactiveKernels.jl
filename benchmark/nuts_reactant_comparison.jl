@@ -2,8 +2,8 @@
 
 # Reproducible, opt-in benchmark of the accepted full-depth adaptive NUTS
 # transition through Reactant versus the source-faithful native compiler path.
-# Both arms execute the same authored fixture, target, metric, carried state,
-# maximum depth, and pre-generated random bundles. Compilation, host/device
+# Both arms execute the same authored fixture, target, metric, independently
+# matched start state, maximum depth, and pre-generated random bundles. Compilation, host/device
 # transfers, RNG generation, and result readback are outside steady-state timing.
 #
 # Run from any directory with:

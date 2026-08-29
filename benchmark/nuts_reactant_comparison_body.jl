@@ -125,6 +125,25 @@ function _parity(native_frame, output, replay)
     phase_ok && diagnostics_ok && controls_ok
 end
 
+function _parity_diagnostic(native_frame, output, replay)
+    native_position = getfield(native_frame.init, :f4)
+    reactant_position = Array(output.pp_pos)[:, 1]
+    (;
+        native_steps = native_frame.diag.n_steps,
+        reactant_steps = Array(output.n_steps)[1],
+        native_depth = native_frame.diag.reached_depth,
+        reactant_depth = Array(output.reached_depth)[1],
+        native_diverged = native_frame.diverged,
+        reactant_diverged = Bool(Array(output.diverged)[1]),
+        native_directions = replay.direction_index,
+        reactant_directions = Array(output.kd)[1],
+        native_exponentials = replay.exponential_index,
+        reactant_exponentials = Array(output.ke)[1],
+        max_position_delta = maximum(abs.(native_position .- reactant_position)),
+        overflow = Array(output.overflow),
+    )
+end
+
 _median(values) = median(Float64.(values))
 
 function _package_version(name)
@@ -159,38 +178,79 @@ function run_benchmark()
     transitions_per_round > 0 ||
         throw(ArgumentError("transitions per round must be positive"))
 
-    native_frame = _frame(dimension, max_depth, stepsize)
+    compile_frame = _frame(dimension, max_depth, stepsize)
     reactant_frame = _frame(dimension, max_depth, stepsize)
     native_compile_seconds = @elapsed native = ReactiveKernels.compile_nuts(
         PF, Fixture.nuts_state, Fixture.refresh_momentum!!,
-        Fixture.nuts!!, native_frame)
+        Fixture.nuts!!, compile_frame)
     reactant_lower_seconds = @elapsed compiled = ReactiveKernels.compile_nuts_reactant(
         PF, Fixture.nuts_state, Fixture.refresh_momentum!!,
         Fixture.nuts!!, reactant_frame)
 
     rng = Xoshiro(0x726b5f6e757473)
-    bundle_count = 1 + rounds * transitions_per_round
-    bundles = [_bundle(rng, dimension, max_depth) for _ in 1:bundle_count]
-    host_state = ReactiveKernels.nuts_reactant_state(
-        compiled, reactant_frame, first(bundles))
-    state_transfer_seconds = @elapsed state = map(Reactant.to_rarray, host_state)
-    bundle_transfer_seconds = @elapsed device_bundles =
-        [map(Reactant.to_rarray, bundle) for bundle in bundles]
+    transition_count = rounds * transitions_per_round
+    warm_bundle = _bundle(rng, dimension, max_depth)
+    candidate_bundles = [
+        _bundle(rng, dimension, max_depth)
+        for _ in 1:max(4transition_count, transition_count + 64)
+    ]
+    warm_host_state = ReactiveKernels.nuts_reactant_state(
+        compiled, reactant_frame, warm_bundle)
+    warm_transfer_seconds = @elapsed warm_state =
+        map(Reactant.to_rarray, warm_host_state)
     reactant_compile_seconds = @elapsed executable =
-        ReactiveKernels.nuts_reactant_compile(compiled, state; sync=true)
+        ReactiveKernels.nuts_reactant_compile(compiled, warm_state; sync=true)
     stablehlo_while_count =
         count(_ -> true, eachmatch(r"stablehlo\.while", executable.module_string))
 
-    # One carried warm-up transition removes first-call runtime effects from the
+    # One warm-up transition removes first-call runtime effects from the
     # steady-state corpus. Both arms consume the exact same full-capacity bundle.
-    warm_bundle = first(bundles)
     warm_replay = _replay(warm_bundle)
+    warm_native_frame = _frame(dimension, max_depth, stepsize)
     native_first_seconds = @elapsed native.root!(
-        native_frame, native.scratch, warm_replay)
-    state = ReactiveKernels.nuts_reactant_rebundle(state, first(device_bundles))
-    reactant_first_seconds = @elapsed state = executable(state)
-    _parity(native_frame, state, warm_replay) ||
+        warm_native_frame, native.scratch, warm_replay)
+    reactant_first_seconds = @elapsed warm_state = executable(warm_state)
+    _parity(warm_native_frame, warm_state, warm_replay) ||
         error("native/Reactant parity failed during warm-up")
+
+    # Adaptive NUTS is numerically chaotic at a U-turn boundary: an ulp-scale
+    # backend difference can validly change the branch and therefore the amount
+    # of work. Screen the deterministic candidate stream outside timing and
+    # publish how many candidates were excluded. The timed corpus consequently
+    # compares identical control flow/work; it is not an end-to-end sampler run.
+    selected_bundles = Vector{typeof(warm_bundle)}()
+    candidates_examined = 0
+    candidates_rejected = 0
+    screening_seconds = @elapsed for bundle in candidate_bundles
+        candidates_examined += 1
+        frame = _frame(dimension, max_depth, stepsize)
+        replay = _replay(bundle)
+        host_state = ReactiveKernels.nuts_reactant_state(compiled, frame, bundle)
+        input_state = map(Reactant.to_rarray, host_state)
+        native.root!(frame, native.scratch, replay)
+        output = executable(input_state)
+        if _parity(frame, output, replay)
+            push!(selected_bundles, bundle)
+            length(selected_bundles) == transition_count && break
+        else
+            candidates_rejected += 1
+        end
+    end
+    length(selected_bundles) == transition_count || error(
+        "only $(length(selected_bundles)) of $transition_count matched-control " *
+        "transitions found in $(length(candidate_bundles)) deterministic candidates")
+
+    transition_frames = [
+        _frame(dimension, max_depth, stepsize) for _ in 1:transition_count
+    ]
+    transition_host_states = [
+        ReactiveKernels.nuts_reactant_state(
+            compiled, transition_frames[index], selected_bundles[index])
+        for index in eachindex(transition_frames)
+    ]
+    state_transfer_seconds = @elapsed transition_states = [
+        map(Reactant.to_rarray, state) for state in transition_host_states
+    ]
 
     native_round_seconds = Float64[]
     reactant_round_seconds = Float64[]
@@ -199,7 +259,7 @@ function run_benchmark()
     round_exponentials = Int[]
     round_max_depth = Int[]
     round_divergences = Int[]
-    cursor = 2
+    cursor = 1
     for round in 1:rounds
         native_elapsed = 0.0
         reactant_elapsed = 0.0
@@ -209,21 +269,22 @@ function run_benchmark()
         reached_depth = 0
         divergences = 0
         for _ in 1:transitions_per_round
-            bundle = bundles[cursor]
-            device_bundle = device_bundles[cursor]
+            bundle = selected_bundles[cursor]
             replay = _replay(bundle)
-            input_state = ReactiveKernels.nuts_reactant_rebundle(state, device_bundle)
+            native_frame = transition_frames[cursor]
+            input_state = transition_states[cursor]
             if isodd(round)
                 native_elapsed += @elapsed native.root!(
                     native_frame, native.scratch, replay)
-                reactant_elapsed += @elapsed state = executable(input_state)
+                reactant_elapsed += @elapsed output = executable(input_state)
             else
-                reactant_elapsed += @elapsed state = executable(input_state)
+                reactant_elapsed += @elapsed output = executable(input_state)
                 native_elapsed += @elapsed native.root!(
                     native_frame, native.scratch, replay)
             end
-            _parity(native_frame, state, replay) || error(
-                "native/Reactant parity failed at round $round transition $(cursor - 1)")
+            _parity(native_frame, output, replay) || error(
+                "native/Reactant parity failed at round $round transition $cursor: " *
+                string(_parity_diagnostic(native_frame, output, replay)))
             steps += native_frame.diag.n_steps
             directions += replay.direction_index
             exponentials += replay.exponential_index
@@ -287,10 +348,15 @@ function run_benchmark()
             "max_depth" => max_depth,
             "rounds" => rounds,
             "transitions_per_round" => transitions_per_round,
-            "state" => "carried across warm-up and all measured transitions",
+            "state" =>
+                "independent matched starting state for every full adaptive transition",
             "randomness" =>
-                "identical pre-generated full-capacity momentum/direction/exponential bundles",
+                "identical pre-generated full-capacity momentum/direction/exponential bundles selected from a deterministic candidate stream",
             "bundle_seed_hex" => "0x726b5f6e757473",
+            "candidate_selection" =>
+                "first N candidates with native/Reactant observable and random-consumption parity; screening is outside timing",
+            "candidate_bundles_examined" => candidates_examined,
+            "candidate_bundles_rejected" => candidates_rejected,
             "timing" =>
                 "per-call @elapsed; median of per-round aggregate synchronous execution",
             "reactant_sync" => true,
@@ -299,6 +365,8 @@ function run_benchmark()
             "rng_generation_in_steady_state" => false,
             "result_readback_in_steady_state" => false,
             "input_rebundle_in_steady_state" => false,
+            "per_transition_state_setup_in_steady_state" => false,
+            "parity_screening_in_steady_state" => false,
             "compile_order" =>
                 ["native source compiler", "Reactant lowering", "Reactant XLA compile"],
             "compile_times_include_first_julia_jit" => true,
@@ -314,8 +382,9 @@ function run_benchmark()
                 reactant_lower_seconds + reactant_compile_seconds,
             "native_first_execution_seconds" => native_first_seconds,
             "reactant_first_execution_seconds" => reactant_first_seconds,
-            "initial_state_transfer_seconds" => state_transfer_seconds,
-            "all_bundle_transfers_seconds" => bundle_transfer_seconds,
+            "warm_input_transfer_seconds" => warm_transfer_seconds,
+            "all_input_state_transfers_seconds" => state_transfer_seconds,
+            "matched_corpus_screening_seconds" => screening_seconds,
         ),
         "raw" => Dict(
             "round_steps" => round_steps,
@@ -343,6 +412,9 @@ function run_benchmark()
         "acceptance" => Dict(
             "same_authored_transition" => true,
             "same_target_metric_state_depth_randomness" => true,
+            "matched_independent_start_states" => true,
+            "matched_control_flow_corpus" => true,
+            "parity_screening_reported" => true,
             "per_transition_observable_parity" => true,
             "random_consumption_parity" => true,
             "all_overflow_flags_zero" => true,

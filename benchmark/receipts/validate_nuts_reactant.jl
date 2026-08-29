@@ -44,7 +44,10 @@ function validate_nuts_reactant_receipt(path)
     for exclusion in (
             "compile_time_in_steady_state", "host_device_transfers_in_steady_state",
             "rng_generation_in_steady_state", "result_readback_in_steady_state",
-            "input_rebundle_in_steady_state", "adaptation_measured", "ess_measured",
+            "input_rebundle_in_steady_state",
+            "per_transition_state_setup_in_steady_state",
+            "parity_screening_in_steady_state",
+            "adaptation_measured", "ess_measured",
             "end_to_end_sampling_measured")
         require(get(protocol, exclusion, true) == false,
                 "protocol.$exclusion must be false")
@@ -53,6 +56,11 @@ function validate_nuts_reactant_receipt(path)
     rounds = Int(protocol["rounds"])
     transitions = Int(protocol["transitions_per_round"])
     require(rounds > 0 && transitions > 0, "round and transition counts must be positive")
+    examined = Int(get(protocol, "candidate_bundles_examined", 0))
+    rejected = Int(get(protocol, "candidate_bundles_rejected", -1))
+    require(examined == rounds * transitions + rejected,
+            "candidate counts must report every accepted and rejected bundle")
+    require(rejected >= 0, "candidate rejection count must be nonnegative")
     for key in (
             "round_steps", "round_directions", "round_exponentials",
             "round_max_reached_depth", "round_divergences",
@@ -99,6 +107,8 @@ function validate_nuts_reactant_receipt(path)
         "steps/s ratio mismatch")
     for key in (
             "same_authored_transition", "same_target_metric_state_depth_randomness",
+            "matched_independent_start_states",
+            "matched_control_flow_corpus", "parity_screening_reported",
             "per_transition_observable_parity", "random_consumption_parity",
             "all_overflow_flags_zero")
         require(get(acceptance, key, false), "acceptance.$key must be true")
@@ -117,7 +127,8 @@ if abspath(PROGRAM_FILE) == @__FILE__
         println(
             "VALIDATE OK — nuts-reactant-v1 receipt is self-consistent: ",
             "max_depth=10, synchronous execution, exact work/time medians, ",
-            "native/Reactant parity, matched randomness, zero overflow, one stablehlo.while.",
+            "native/Reactant parity from independent matched starts, matched randomness, ",
+            "zero overflow, one stablehlo.while.",
         )
     else
         foreach(println, errors)
