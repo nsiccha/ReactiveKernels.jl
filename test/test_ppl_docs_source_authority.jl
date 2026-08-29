@@ -36,7 +36,14 @@ const PPL_SOURCE_CASES = (
 
         artifact = evaluator()
         @test artifact.source == strip(source, '\n')
-        @test artifact.output == artifact.kernel(Tuple(artifact.inputs)...)
+        # `evaluator()` defines the authored recipe closures in a fresh sandbox.
+        # Cross that dynamic-evaluation boundary in the latest world, exactly as
+        # the docs renderer does, so inlined source operations remain reusable on
+        # Julia versions with stricter world-age enforcement.
+        observed = Base.invokelatest(
+            artifact.kernel, Tuple(artifact.inputs)...,
+        )
+        @test artifact.output == observed
         raw_generated = code_expr(artifact.kernel)
         readable_generated = sprint(
             Base.show_unquoted,
