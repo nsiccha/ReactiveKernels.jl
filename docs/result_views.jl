@@ -312,6 +312,100 @@ function render_distribution_benchmarks()
     ])
 end
 
+"""Render the replicated Reactant call boundary as total and per-evaluation time."""
+function render_distribution_amortization()
+    receipt = TOML.parsefile(_DISTRIBUTION_RECEIPT_PATH)
+    get(receipt, "schema", "") == "distribution-logdensity-v1" ||
+        error("unexpected distribution benchmark receipt schema")
+    measurements = receipt["measurements"]
+    direct = only(row for row in measurements if Int(row["n"]) == 1)
+    direct_ns = Float64(direct["rk_reactant"]["median_ns"])
+    rows = map(receipt["reactant_amortization"]) do row
+        measurement = row["rk_reactant_replicated"]
+        per_evaluation = Float64(row["median_ns_per_evaluation"])
+        (;
+            replicas = Int(row["replicas"]),
+            total_ns = Float64(measurement["median_ns"]),
+            per_evaluation_ns = per_evaluation,
+            host_bytes = Int(measurement["median_bytes"]),
+            host_allocs = Int(measurement["median_allocs"]),
+            speedup = direct_ns / per_evaluation,
+        )
+    end
+    largest = last(rows)
+    summary = "The direct one-observation compiled call takes $(_fmt_ns(direct_ns)). " *
+        "With $(largest.replicas) independent observations in one replica call, " *
+        "the normalized cost is $(_fmt_ns(largest.per_evaluation_ns)) " *
+        "($(round(largest.speedup; digits = 1))× lower), while the entire call " *
+        "still has $(largest.host_allocs) host allocations / $(largest.host_bytes) B."
+    columns = (
+        _column(:replicas, "Independent evaluations"),
+        _column(:total_ns, "Whole-call runtime";
+            format = (value, _) -> _fmt_ns(value)),
+        _column(:per_evaluation_ns, "Runtime / evaluation";
+            format = (value, _) -> _fmt_ns(value)),
+        _column(:host_allocs, "Host allocations"),
+        _column(:host_bytes, "Host bytes";
+            format = (value, _) -> string(value, " B")),
+        _column(:speedup, "Direct ÷ batched";
+            format = (value, _) -> string(round(value; digits = 1), "×")),
+    )
+    Markdown.MD(Any[
+        Markdown.Paragraph(Any[summary]),
+        _result_table(rows, columns; id = "normal-reactant-amortization",
+            title = "Reactant invocation-cost amortization"),
+    ])
+end
+
+"""Render PPL replica throughput separately from the single-call latency chart."""
+function render_eval_throughput_amortization()
+    receipt = TOML.parsefile(_eval_throughput_receipt())
+    replicas = Int(receipt["protocol"]["replicas"])
+    measurements = receipt["measurements"]
+    rows = NamedTuple[]
+    for n in (16, 256, 4096), mode in ("primal", "gradient", "gq")
+        direct = only(row for row in measurements
+            if Int(row["size"]) == n && row["mode"] == mode &&
+               row["implementation"] == "reactivekernels" &&
+               row["variant"] == "reactant")
+        replicated = only(row for row in measurements
+            if Int(row["size"]) == n && row["mode"] == mode &&
+               row["implementation"] == "reactivekernels" &&
+               row["variant"] == "reactant_replicated")
+        push!(rows, (;
+            n,
+            mode,
+            replicas = Int(replicated["batch_size"]),
+            direct_ns = Float64(direct["median_ns"]),
+            batch_ns = Float64(replicated["median_batch_ns"]),
+            per_evaluation_ns = Float64(replicated["median_ns"]),
+            speedup = Float64(direct["median_ns"]) /
+                Float64(replicated["median_ns"]),
+        ))
+    end
+    small = filter(row -> row.n == 16, rows)
+    small_speedups = getproperty.(small, :speedup)
+    summary = "At n=16, one $replicas-position call lowers normalized Reactant " *
+        "cost by $(round(minimum(small_speedups); digits = 1))–" *
+        "$(round(maximum(small_speedups); digits = 1))× across the three modes."
+    columns = (
+        _column(:n, "Position size"),
+        _column(:mode, "Mode"),
+        _column(:replicas, "Positions / call"),
+        _column(:direct_ns, "Direct call"; format = (value, _) -> _fmt_ns(value)),
+        _column(:batch_ns, "Whole batch"; format = (value, _) -> _fmt_ns(value)),
+        _column(:per_evaluation_ns, "Batch / position";
+            format = (value, _) -> _fmt_ns(value)),
+        _column(:speedup, "Direct ÷ batched";
+            format = (value, _) -> string(round(value; digits = 1), "×")),
+    )
+    Markdown.MD(Any[
+        Markdown.Paragraph(Any[summary]),
+        _result_table(rows, columns; id = "eval-reactant-amortization",
+            title = "Replicated PPL evaluation throughput"),
+    ])
+end
+
 """Render the scalar distribution gallery receipt as per-family plots and one table."""
 function render_scalar_gallery_benchmarks()
     receipt = TOML.parsefile(_SCALAR_GALLERY_RECEIPT_PATH)

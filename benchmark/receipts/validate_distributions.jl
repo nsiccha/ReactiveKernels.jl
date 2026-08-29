@@ -16,7 +16,10 @@ function validate_distribution_receipt(path::AbstractString)
 
     require(get(receipt, "schema", "") == "distribution-logdensity-v1",
             "schema must be distribution-logdensity-v1")
-    for section in ("pins", "environment", "protocol", "support", "measurements")
+    for section in (
+        "pins", "environment", "protocol", "support", "measurements",
+        "reactant_amortization",
+    )
         require(haskey(receipt, section), "missing $section")
     end
     isempty(errors) || return errors
@@ -50,6 +53,8 @@ function validate_distribution_receipt(path::AbstractString)
             "receipt must disclose first-service-startup compile timing")
     require(Int(get(protocol, "rounds", 0)) >= 5,
             "published receipt must contain at least five raw rounds")
+    require(Tuple(Int.(get(protocol, "reactant_replica_counts", Int[]))) ==
+            (1, 16, 256), "published receipt must use replica counts (1, 16, 256)")
 
     support = receipt["support"]
     require(get(support, "rk_reactant", false) == true,
@@ -115,6 +120,49 @@ function validate_distribution_receipt(path::AbstractString)
         end
     end
 
+    amortization = receipt["reactant_amortization"]
+    require(Tuple(Int(row["replicas"]) for row in amortization) == (1, 16, 256),
+            "amortization rows must use replica counts (1, 16, 256)")
+    wrapper_bytes = Int[]
+    wrapper_allocs = Int[]
+    for row in amortization
+        replicas = Int(row["replicas"])
+        require(Int(row["n"]) == 1,
+                "replicas=$replicas amortization row must represent one observation")
+        require(Float64(row["max_abs_error"]) <= 1e-10,
+                "replicas=$replicas exceeds value-parity tolerance")
+        require(haskey(row, "rk_reactant_replicated"),
+                "replicas=$replicas missing replicated measurement") || continue
+        measurement = row["rk_reactant_replicated"]
+        for raw_key in ("times_ns", "bytes", "allocs")
+            require(haskey(measurement, raw_key) && !isempty(measurement[raw_key]),
+                    "replicas=$replicas $raw_key missing")
+        end
+        all(haskey(measurement, key) for key in ("times_ns", "bytes", "allocs")) ||
+            continue
+        require(isapprox(
+            Float64(measurement["median_ns"]), _median(measurement["times_ns"]);
+            rtol = 1e-12,
+        ), "replicas=$replicas median_ns is not re-derived from raw rounds")
+        require(isapprox(
+            Float64(row["median_ns_per_evaluation"]),
+            Float64(measurement["median_ns"]) / replicas;
+            rtol = 1e-12,
+        ), "replicas=$replicas per-evaluation normalization mismatch")
+        require(Int(measurement["median_bytes"]) ==
+                round(Int, _median(measurement["bytes"])),
+                "replicas=$replicas median_bytes mismatch")
+        require(Int(measurement["median_allocs"]) ==
+                round(Int, _median(measurement["allocs"])),
+                "replicas=$replicas median_allocs mismatch")
+        push!(wrapper_bytes, Int(measurement["median_bytes"]))
+        push!(wrapper_allocs, Int(measurement["median_allocs"]))
+    end
+    require(length(unique(wrapper_bytes)) <= 1,
+            "host wrapper bytes must be independent of replica count")
+    require(length(unique(wrapper_allocs)) <= 1,
+            "host wrapper allocations must be independent of replica count")
+
     errors
 end
 
@@ -124,7 +172,7 @@ function main(path)
         receipt = TOML.parsefile(path)
         sizes = join((row["n"] for row in receipt["measurements"]), ", ")
         println("VALIDATE OK — distribution-logdensity-v1: sizes [$sizes], " *
-                "RK+ProbabilityMeasures Reactant paths accepted, raw medians re-derived")
+                "RK+ProbabilityMeasures Reactant paths and replica amortization accepted")
         return 0
     end
     foreach(println, errors)

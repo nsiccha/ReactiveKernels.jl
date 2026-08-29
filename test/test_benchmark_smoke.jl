@@ -24,6 +24,7 @@ end
                  "structured_distributions_comparison.jl",
                  "eval_throughput_comparison.jl",
                  "eval_throughput_comparison_body.jl",
+                 joinpath("receipts", "validate_eval_throughput.jl"),
                  joinpath("receipts", "validate_distributions.jl"),
                  joinpath("receipts", "validate_scalar_gallery_distributions.jl"),
                  joinpath("receipts", "validate_structured_distributions.jl"))
@@ -31,6 +32,14 @@ end
         @test isfile(path)
         @test _parses(path)
     end
+end
+
+@testset "evaluation throughput benchmark receipt validates" begin
+    validator = joinpath(_BENCH_DIR, "receipts", "validate_eval_throughput.jl")
+    receipt = joinpath(_BENCH_DIR, "receipts", "eval-throughput-v1.toml")
+    @test isfile(receipt)
+    include(validator)
+    @test isempty(validate_eval_throughput_receipt(receipt))
 end
 
 @testset "structured distribution benchmark receipt validates" begin

@@ -32,6 +32,13 @@ tracked runtime values. Per-shape compilation diagnostics are retained in the
 receipt; the first RK compile includes Reactant service startup and is not used
 as a cross-library compile-time comparison.
 
+The scalar Normal receipt also records a distinct invocation-amortization
+protocol: the scalar RK kernel is lifted with `replica(...; batched = :x)` and
+one compiled call evaluates 1, 16, or 256 independent observations. Whole-call
+timing and host allocations are retained alongside time normalized per logical
+evaluation. Override the exploratory counts with `RK_DENSITY_REPLICAS=1,4`;
+published receipts use `1,16,256`.
+
 The scalar-gallery benchmark compares the exact Exponential, Geometric, and
 Uniform scalar sources after their generic `plate` lift. It records two vector
 sizes per family, traces every model parameter under Reactant, and keeps an
