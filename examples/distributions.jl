@@ -12,6 +12,7 @@ module DistributionExamples
 
 export CONTINUOUS_SOURCE, DISCRETE_SOURCE, VECTORIZED_SOURCE
 export CAUCHY_SOURCE, LAPLACE_SOURCE, LOGNORMAL_SOURCE
+export NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY
 export EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE
 export MVNORMAL_SOURCE, AR1_SOURCE
 export all_sources, evaluate_source, run
@@ -21,6 +22,8 @@ using LogExpFunctions: logistic
 
 include("distribution_kernel_sources.jl")
 using .DistributionKernelSources:
+    NORMAL_LOGDENSITY_SOURCE, CAUCHY_LOGDENSITY_SOURCE,
+    NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY,
     EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE,
     MVNORMAL_SOURCE, AR1_SOURCE
 
@@ -28,25 +31,21 @@ _allocated(f, a, b) = @allocated f(a, b)
 _allocated(f, a, b, c) = @allocated f(a, b, c)
 _allocated(f, a, b, c, d) = @allocated f(a, b, c, d)
 
-const CONTINUOUS_SOURCE = raw"""
-@kernel normal_logpdf(x::Float64, μ::Float64, logσ::Float64) = begin
-    σ::Float64 = exp(logσ)
-    z::Float64 = (x - μ) / σ
-    logdensity::Float64 = -0.5 * log(2π) - logσ - 0.5 * z^2
-end
+const CONTINUOUS_SOURCE = NORMAL_LOGDENSITY_SOURCE * raw"""
 
-normal_kernel = prepare(normal_logpdf;
-    have = (:x, :μ, :logσ),
+normal_kernel = prepare(normal_logdensity;
+    have = (:x, :location, :log_scale),
     want = :logdensity,
 )
 
-inputs = (; x = 0.4, μ = -0.2, logσ = log(1.3))
+inputs = (; x = 0.4, location = -0.2, log_scale = log(1.3))
 output = normal_kernel(Tuple(inputs)...)
 
 docs_example = (;
     name = :continuous_normal,
     origin = "native Gaussian log density (build executed)",
     inputs,
+    spec = normal_logdensity,
     kernel = normal_kernel,
     output,
 )
@@ -76,48 +75,41 @@ docs_example = (;
 )
 """
 
-const VECTORIZED_SOURCE = raw"""
-@kernel normal_logpdf(x::Float64, μ::Float64, logσ::Float64) = begin
-    σ::Float64 = exp(logσ)
-    z::Float64 = (x - μ) / σ
-    logdensity::Float64 = -0.5 * log(2π) - logσ - 0.5 * z^2
-end
+const VECTORIZED_SOURCE = NORMAL_LOGDENSITY_SOURCE * raw"""
 
-vectorized = plate(normal_logpdf;
-    have = (:x, :μ, :logσ), want = :logdensity, batched = (:x,))
+vectorized = plate(normal_logdensity;
+    have = (:x, :location, :log_scale),
+    want = :logdensity, batched = (:x,))
 
 x = collect(range(-1.5, 1.5; length = 8))
-μ = 0.3
-logσ = log(1.2)
-inputs = (; x, μ, logσ)
-output = vectorized(x, μ, logσ)
+location = 0.3
+log_scale = log(1.2)
+inputs = (; x, location, log_scale)
+output = vectorized(x, location, log_scale)
 
 docs_example = (;
     name = :vectorized_normal,
     origin = "vectorized Gaussian log density via `plate` — invariants hoisted (build executed)",
     inputs,
+    spec = normal_logdensity,
     kernel = vectorized,
     output,
 )
 """
 
-const CAUCHY_SOURCE = raw"""
-@kernel cauchy_logpdf(x::Float64, μ::Float64, logσ::Float64) = begin
-    σ::Float64 = exp(logσ)
-    z::Float64 = (x - μ) / σ
-    logdensity::Float64 = -log(π) - logσ - log1p(z^2)
-end
+const CAUCHY_SOURCE = CAUCHY_LOGDENSITY_SOURCE * raw"""
 
-cauchy_kernel = prepare(cauchy_logpdf;
-    have = (:x, :μ, :logσ), want = :logdensity)
+cauchy_kernel = prepare(cauchy_logdensity;
+    have = (:x, :location, :log_scale), want = :logdensity)
 
-inputs = (; x = 2.4, μ = -0.3, logσ = log(1.1))
+inputs = (; x = 2.4, location = -0.3, log_scale = log(1.1))
 output = cauchy_kernel(Tuple(inputs)...)
 
 docs_example = (;
     name = :cauchy_heavy_tail,
     origin = "native Cauchy log density (build executed)",
     inputs,
+    spec = cauchy_logdensity,
     kernel = cauchy_kernel,
     output,
 )
@@ -192,10 +184,12 @@ function evaluate_source(source::AbstractString)
     allocated_bytes = Base.invokelatest(_allocated, artifact.kernel, inputs...)
 
     if artifact.name === :continuous_normal
-        x, μ, logσ = inputs
-        reference_call = (x, μ, logσ) -> logpdf(Normal(μ, exp(logσ)), x)
+        x, location, log_scale = inputs
+        reference_call = (x, location, log_scale) ->
+            logpdf(Normal(location, exp(log_scale)), x)
         reference = reference_call(inputs...)
-        reference_allocated_bytes = _allocated(reference_call, x, μ, logσ)
+        reference_allocated_bytes =
+            _allocated(reference_call, x, location, log_scale)
         return merge(artifact, (;
             reference, allocated_bytes, reference_allocated_bytes, inferred_return,
         ))
@@ -209,15 +203,16 @@ function evaluate_source(source::AbstractString)
             reference, allocated_bytes, reference_allocated_bytes, inferred_return,
         ))
     elseif artifact.name === :vectorized_normal
-        x, μ, logσ = inputs
-        reference_call = (x, μ, logσ) ->
-            sum(logpdf.(Normal(μ, exp(logσ)), x))
+        x, location, log_scale = inputs
+        reference_call = (x, location, log_scale) ->
+            sum(logpdf.(Normal(location, exp(log_scale)), x))
         reference = reference_call(inputs...)
-        reference_allocated_bytes = _allocated(reference_call, x, μ, logσ)
+        reference_allocated_bytes =
+            _allocated(reference_call, x, location, log_scale)
         per_obs = Core.eval(sandbox, quote
             per_obs_kernel = plate(
-                normal_logpdf;
-                have = (:x, :μ, :logσ), want = :logdensity,
+                normal_logdensity;
+                have = (:x, :location, :log_scale), want = :logdensity,
                 batched = (:x,), reduce = nothing,
             )
             per_obs_kernel(Tuple(docs_example.inputs)...)
@@ -227,10 +222,12 @@ function evaluate_source(source::AbstractString)
             reference_allocated_bytes, inferred_return,
         ))
     elseif artifact.name === :cauchy_heavy_tail
-        x, μ, logσ = inputs
-        reference_call = (x, μ, logσ) -> logpdf(Cauchy(μ, exp(logσ)), x)
+        x, location, log_scale = inputs
+        reference_call = (x, location, log_scale) ->
+            logpdf(Cauchy(location, exp(log_scale)), x)
         reference = reference_call(inputs...)
-        reference_allocated_bytes = _allocated(reference_call, x, μ, logσ)
+        reference_allocated_bytes =
+            _allocated(reference_call, x, location, log_scale)
     elseif artifact.name === :laplace_sharp_peak
         x, μ, logb = inputs
         reference_call = (x, μ, logb) -> logpdf(Laplace(μ, exp(logb)), x)

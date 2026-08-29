@@ -29,8 +29,11 @@ function ReactiveKernels.prepare_reactive_nonallocating(spec::ReactiveKernels.Ke
 end
 
 function ReactiveKernels.prepare_nonallocating(p::ReactiveKernels.Plan; passes = ())
-    ast = isempty(passes) ? ReactiveKernels.lower(p) :
-          ReactiveKernels.transform(ReactiveKernels.lower(p), passes...)
+    # Embedded prepared recipes are already allocation-free executable kernels.
+    # Keep them as one cache operation here; ordinary `prepare` is the boundary
+    # that splices their generated bodies into a flat operation table.
+    ast = ReactiveKernels._lower_unembedded(p)
+    isempty(passes) || (ast = ReactiveKernels.transform(ast, passes...))
     ReactiveKernels._prepare_nonallocating(
         p, ReactiveKernels._nonallocating_ast(ast), cache_apply!)
 end

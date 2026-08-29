@@ -53,8 +53,8 @@ function _generated_source(expr::Expr)
     sprint(Base.show_unquoted, expr; context = :limit => false)
 end
 
-function _readable_generated_source(expr::Expr, dag::Plan, label)
-    readable = ReactiveKernels._readable_expr(expr, dag)
+function _readable_generated_source(expr::Expr, context, label)
+    readable = ReactiveKernels._readable_expr(expr, context)
     occursin(r"__ops__\[\d+\]", string(readable)) && error(
         "$label readable generated view retained an opaque operation slot",
     )
@@ -204,10 +204,11 @@ function setup_eight_schools!(mod::Module)
     if !isdefined(mod, :EightSchoolsExample)
         Base.include(mod, joinpath(@__DIR__, "..", "examples", "eight_schools.jl"))
     end
-    # The authored kernel inlines every operation, so the executed panel needs
-    # only the observation data — no example helper is referenced.
+    # Bind the observations and the shared distribution KernelSpecs consumed by
+    # the displayed PPL assembly; no model-specific evaluator is injected.
     Core.eval(mod, :(using .EightSchoolsExample:
-        EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA))
+        EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA,
+        NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY))
     nothing
 end
 
@@ -356,7 +357,7 @@ function render_examples(artifacts)
             "# Actual output\n", _plain_repr(artifact.output),
         )
         generated = _readable_generated_source(
-            artifact.generated, artifact.dag, artifact.name,
+            artifact.generated, artifact.kernel, artifact.name,
         )
         _three_pane_blocks!(blocks, _example_title(artifact.name), source, generated, artifact.dag)
     end

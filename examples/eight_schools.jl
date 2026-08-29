@@ -2,119 +2,50 @@ module EightSchoolsExample
 
 using ReactiveKernels
 include("_ppl_source_authority.jl")
+include("distribution_kernel_sources.jl")
+using .DistributionKernelSources: NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY
 
 export EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA
 export build_eight_schools_graph, demo
 export EIGHT_SCHOOLS_SOURCE, evaluate_eight_schools_source
 
 const NSCHOOLS = 8
-const _LOG2PI = log(2π)
 
 const EIGHT_SCHOOLS_Y = [28.0, 8.0, -3.0, 7.0, -1.0, 1.0, 18.0, 12.0]
 const EIGHT_SCHOOLS_SIGMA = [15.0, 10.0, 16.0, 11.0, 9.0, 11.0, 10.0, 18.0]
 
-# --- Pure operations used as graph recipes ---------------------------------
-
-split_unconstrained(q::Vector{Float64}) = (q[1], q[2], q[3:end])
-
-positive_scale(log_τ::Float64) = exp(log_τ)
-
-# The constrained parameters are a plain NamedTuple — no opaque struct to look up.
-assemble_parameters(μ::Float64, τ::Float64, θ::Vector{Float64}) = (; μ, τ, θ)
-
-# Only τ is transformed: τ = exp(log_τ), hence log |dτ / dlog_τ| = log_τ.
-log_abs_det_jacobian(log_τ::Float64) = log_τ
-
-function normal_logpdf(x::Float64, location::Float64, scale::Float64)
-    scale > 0 || throw(DomainError(scale, "normal scale must be positive"))
-    z = (x - location) / scale
-    -0.5 * _LOG2PI - log(scale) - 0.5 * z^2
-end
-
-function half_cauchy_logpdf(x::Float64, scale::Float64)
-    x > 0 || throw(DomainError(x, "half-Cauchy variate must be positive"))
-    scale > 0 || throw(DomainError(scale, "half-Cauchy scale must be positive"))
-    log(2) - log(π) - log(scale) - log1p((x / scale)^2)
-end
-
-function log_prior(parameters)
-    lp = normal_logpdf(parameters.μ, 0.0, 5.0)
-    lp += half_cauchy_logpdf(parameters.τ, 5.0)
-    for θⱼ in parameters.θ
-        lp += normal_logpdf(θⱼ, parameters.μ, parameters.τ)
-    end
-    lp
-end
-
-total_log_density(log_prior::Float64, log_jacobian::Float64,
-                  log_likelihood::Float64) =
-    log_prior + log_jacobian + log_likelihood
-
-# A deterministic new-group prediction, returned as a plain NamedTuple.
-function predict_new_group(parameters, σ_new::Float64, innovations::Vector{Float64})
-    σ_new > 0 ||
-        throw(DomainError(σ_new, "new-group observation scale must be positive"))
-    θ_new = parameters.μ + parameters.τ * innovations[1]
-    y_new = θ_new + σ_new * innovations[2]
-    (; θ = θ_new, y = y_new)
-end
-
 const EIGHT_SCHOOLS_SOURCE = raw"""
-# One scalar likelihood factor. `plate` derives both useful batch boundaries
-# from this exact expression: collecting exposes the per-school nodes, while
-# reducing adds them in one fused loop with no pointwise buffer.
-@kernel school_loglik(y::Float64, θ::Float64, σ::Float64) = begin
-    ll::Float64 = -0.5 * log(2π) - log(σ) - 0.5 * ((y - θ) / σ)^2
-end
+# Reuse the distribution example's exact scalar graphs. The both-HAVE factors
+# let RK choose scale for standardization and log_scale for normalization,
+# avoiding a redundant exp or log. `plate` derives every per-school boundary
+# from the same Normal KernelSpec.
+normal_factor = prepare(NORMAL_LOGDENSITY;
+    have = (:x, :location, :scale, :log_scale), want = :logdensity)
+cauchy_factor = prepare(CAUCHY_LOGDENSITY;
+    have = (:x, :location, :scale, :log_scale), want = :logdensity)
 
-# The exchangeable effects prior is a second scalar factor lifted over schools.
-# Its reducing form avoids scalar iteration when the effect vector is traced.
-@kernel school_prior(θ::Float64, μ::Float64, τ::Float64) = begin
-    lp::Float64 = -0.5 * log(2π) - log(τ) - 0.5 * ((θ - μ) / τ)^2
-end
-
-pointwise_loglik = plate(school_loglik;
-    have = (:y, :θ, :σ), want = :ll, batched = (:y, :θ, :σ),
+pointwise_loglik = plate(NORMAL_LOGDENSITY;
+    have = (:x, :location, :scale), want = :logdensity,
+    batched = (:x, :location, :scale),
     reduce = nothing)
-summed_loglik = plate(school_loglik;
-    have = (:y, :θ, :σ), want = :ll, batched = (:y, :θ, :σ))
-summed_school_prior = plate(school_prior;
-    have = (:θ, :μ, :τ), want = :lp, batched = :θ)
-
-# The unconstrained AD boundary gets a second, fully fused producer. The
-# named-latent/pointwise boundaries above retain their `plate` lowering for
-# Reactant, while this scalar loop keeps nested PreparedKernels out of Enzyme's
-# operation table and materializes no active temporary vectors.
-function fused_unconstrained_density(unconstrained::Vector{Float64},
-                                      observations::Vector{Float64},
-                                      observation_scales::Vector{Float64})
-    μ = unconstrained[1]
-    log_τ = unconstrained[2]
-    τ = exp(log_τ)
-    prior =
-        -0.5 * log(2π) - log(5.0) - 0.5 * (μ / 5.0)^2 +
-        log(2) - log(π) - log(5.0) - log1p((τ / 5.0)^2)
-    likelihood = 0.0
-    @inbounds for j in eachindex(observations, observation_scales)
-        θⱼ = unconstrained[j + 2]
-        prior += -0.5 * log(2π) - log(τ) - 0.5 * ((θⱼ - μ) / τ)^2
-        likelihood += -0.5 * log(2π) - log(observation_scales[j]) -
-                      0.5 * ((observations[j] - θⱼ) /
-                             observation_scales[j])^2
-    end
-    prior + log_τ + likelihood
-end
+summed_loglik = plate(NORMAL_LOGDENSITY;
+    have = (:x, :location, :scale), want = :logdensity,
+    batched = (:x, :location, :scale))
+summed_school_prior = plate(NORMAL_LOGDENSITY;
+    have = (:x, :location, :scale, :log_scale), want = :logdensity,
+    batched = :x)
 
 @kernel model(unconstrained::Vector{Float64},
               observations::Vector{Float64},
               observation_scales::Vector{Float64},
               new_group_scale::Float64,
               prediction_innovations::Vector{Float64}) = begin
-    # Split the unconstrained vector into (μ, log_τ, θ) — plain indexing, no
-    # helper hiding the math.
+    # Split the unconstrained vector into (μ, log_τ, θ). The view keeps the
+    # generated evaluator from allocating a second effects vector.
     μ::Float64 = unconstrained[1]
     log_τ::Float64 = unconstrained[2]
-    θ::Vector{Float64} = unconstrained[3:end]
+    θ::AbstractVector{Float64} =
+        view(unconstrained, 3:length(unconstrained))
 
     # Support transform for the scale: τ = exp(log_τ).
     τ::Float64 = exp(log_τ)
@@ -124,16 +55,15 @@ end
     # alone; the second builds them together with the log Jacobian
     # log|dτ/dlog_τ| = log_τ, sharing the one transform. The planner takes the
     # first for a constrain-only query and the second whenever the Jacobian —
-    # hence the unconstrained density — is wanted.
+    # hence the unconstrained posterior — is wanted.
     parameters = (; μ, τ, θ)
     (parameters, log_jacobian::Float64) = ((; μ, τ, θ), log_τ)
 
     # log prior:  μ ~ Normal(0, 5),  τ ~ HalfCauchy(0, 5),  θⱼ ~ Normal(μ, τ).
-    μ_prior::Float64 =
-        -0.5 * log(2π) - log(5.0) - 0.5 * (μ / 5.0)^2
-    τ_prior::Float64 =
-        log(2) - log(π) - log(5.0) - log1p((τ / 5.0)^2)
-    effects_prior::Float64 = summed_school_prior(θ, μ, τ)
+    μ_prior::Float64 = normal_factor(μ, 0.0, 5.0, log(5.0))
+    τ_cauchy::Float64 = cauchy_factor(τ, 0.0, 5.0, log(5.0))
+    τ_prior::Float64 = log(2.0) + τ_cauchy
+    effects_prior::Float64 = summed_school_prior(θ, μ, τ, log_τ)
     prior::Float64 = μ_prior + τ_prior + effects_prior
 
     # The pointwise and summed boundaries come from the SAME scalar recipe.
@@ -144,13 +74,8 @@ end
     likelihood::Float64 =
         summed_loglik(observations, θ, observation_scales)
 
-    # Unconstrained-space log density.
-    density::Float64 = prior + log_jacobian + likelihood
-
-    # Alternate producer for the unconstrained reverse-AD boundary. Planning
-    # selects this single fused recipe when only `density` is requested.
-    density::Float64 = fused_unconstrained_density(
-        unconstrained, observations, observation_scales)
+    # Unconstrained-space log posterior.
+    posterior::Float64 = prior + log_jacobian + likelihood
 
     # Deterministic new-group prediction from standard-normal innovations, read
     # straight off the constrained `parameters` so the query can start there.
@@ -158,7 +83,7 @@ end
     y_new::Float64 = θ_new + new_group_scale * prediction_innovations[2]
     new_group = (; θ = θ_new, y = y_new)
 
-    return density
+    return posterior
 end
 
 μ = 1.5
@@ -200,14 +125,20 @@ docs_example = (;
     pointwise_extraction,
     pointwise,
     likelihood_kernel = summed_loglik,
+    effects_prior_kernel = summed_school_prior,
+    normal_factor,
+    cauchy_factor,
+    normal_spec = NORMAL_LOGDENSITY,
+    cauchy_spec = CAUCHY_LOGDENSITY,
 )
 """
 
 function evaluate_eight_schools_source()
-    # The authored kernel now inlines every operation, so the displayed/executed
-    # source needs only the observation data — no example helper is referenced.
+    # Bind only data and reusable distribution KernelSpecs. The authored source
+    # contains the complete PPL assembly and no model-specific helper evaluator.
     _evaluate_ppl_source(EIGHT_SCHOOLS_SOURCE, @__MODULE__; bindings = (
         :EIGHT_SCHOOLS_Y, :EIGHT_SCHOOLS_SIGMA,
+        :NORMAL_LOGDENSITY, :CAUCHY_LOGDENSITY,
     ))
 end
 
@@ -225,21 +156,21 @@ Build the centered eight-schools model as a declarative
 different PPL queries explicit `have`/`want` boundaries. Constrained parameters
 and predictions are plain NamedTuples, not custom types.
 
-One scalar per-school `@kernel` is lifted by `plate` into pointwise collection
-and fused-sum boundaries. The transform Jacobian, prior, pointwise likelihood,
-total likelihood, density, and prediction remain selectable named nodes. A
+The reusable Normal and Cauchy `KernelSpec`s from the distributions example are
+prepared or lifted by `plate`; the PPL source does not re-author their formulas.
+The transform Jacobian, prior, pointwise likelihood, total likelihood,
+posterior, and prediction remain selectable named nodes. A
 Wren-style accumulator tuple is therefore a static `want` selection, not a
 second evaluation framework. Prediction is deterministic for caller-supplied
 standard-normal innovations; sampling those innovations remains outside the
 pure graph.
 
-The unconstrained density boundary has a second, source-visible fused producer,
-so reverse AD neither materializes an active pointwise vector nor captures the
-nested plate kernels in its operation table. It differentiates through
-`prepare_ad`/`ad_gradient` with plain Enzyme reverse mode; observation data are
-passed as DI `Constant`s automatically. No runtime-activity mode or function
-annotation is required. Named-latent and pointwise queries retain the plate
-route above.
+The unconstrained posterior is generated from the same RK-authored transform,
+prior, and `plate` reductions as every other graph query. RK splices those
+generated reductions into one flat posterior kernel, so plain reverse Enzyme can
+differentiate only the unconstrained parameters while observations and scales
+cross the consumer-side DI boundary as `Constant`s. There is no bespoke
+handwritten model evaluator.
 """
 function build_eight_schools_graph()
     compose(_EIGHT_SCHOOLS_GRAPH_TEMPLATE)
@@ -249,7 +180,7 @@ function demo()
     model = build_eight_schools_graph()
     q = [0.0, log(5.0), zeros(NSCHOOLS)...]
 
-    println("Constrain only (the Jacobian and density branches are pruned):")
+    println("Constrain only (the Jacobian and posterior branches are pruned):")
     constrained_plan = plan(model; have = :unconstrained, want = :parameters)
     println(explain(constrained_plan))
     parameters = prepare(constrained_plan)(q)
@@ -275,10 +206,10 @@ function demo()
     println("pointwise log likelihoods = ", pointwise)
     println("their sum = ", sum(pointwise))
 
-    density = prepare(model;
+    posterior = prepare(model;
         have = (:unconstrained, :observations, :observation_scales),
-        want = :density)(q, EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA)
-    println("unconstrained log density = ", density)
+        want = :posterior)(q, EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA)
+    println("unconstrained log posterior = ", posterior)
 
     println("\nGenerated quantity from an already-constrained HAVE boundary:")
     generated_plan = plan(model;

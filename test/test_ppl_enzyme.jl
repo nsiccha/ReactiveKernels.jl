@@ -31,13 +31,19 @@ const PPL_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 function eight_schools_reference_density(q)
     μ, log_τ = q[1], q[2]
     τ = exp(log_τ)
-    parameters = (; μ, τ, θ = q[3:end])
+    θ = q[3:end]
+    normal(x, location, scale) =
+        -0.5 * log(2π) - log(scale) - 0.5 * ((x - location) / scale)^2
     likelihood = zero(μ)
     @inbounds for j in eachindex(EIGHT_SCHOOLS_Y)
-        likelihood += EightSchoolsExample.normal_logpdf(
-            EIGHT_SCHOOLS_Y[j], parameters.θ[j], EIGHT_SCHOOLS_SIGMA[j])
+        likelihood += normal(EIGHT_SCHOOLS_Y[j], θ[j], EIGHT_SCHOOLS_SIGMA[j])
     end
-    EightSchoolsExample.log_prior(parameters) + log_τ + likelihood
+    prior = normal(μ, 0.0, 5.0)
+    prior += log(2) - log(π) - log(5.0) - log1p((τ / 5.0)^2)
+    @inbounds for θj in θ
+        prior += normal(θj, μ, τ)
+    end
+    prior + log_τ + likelihood
 end
 
 function linear_regression_reference_density(q)
@@ -169,7 +175,6 @@ _gradient_vector(x) = collect(x)
 
 function check_plain_enzyme_gradient(
         artifact, have, reference_density, reference_gradient)
-    kernel = prepare(artifact.model; have, want = :density)
     values = if artifact.name === :eight_schools_extraction
         inputs = artifact.inputs
         ([inputs.μ, inputs.log_τ, inputs.θ...],
@@ -178,6 +183,8 @@ function check_plain_enzyme_gradient(
         Tuple(artifact.inputs)
     end
     active = first(values)
+    want = artifact.name === :eight_schools_extraction ? :posterior : :density
+    kernel = prepare(artifact.model; have, want)
 
     @test kernel(values...) ≈ reference_density(active)
     prepared = prepare_ad(

@@ -5,12 +5,102 @@ using Distributions
 
 include(joinpath(@__DIR__, "..", "examples", "distributions.jl"))
 using .DistributionExamples
-using ReactiveKernels: code_expr
+using ReactiveKernels: KernelSpec, @kernel, code_expr, plan, plate, prepare
+
+const NORMAL_LOGSCALE_KERNEL = prepare(NORMAL_LOGDENSITY;
+    have = (:x, :location, :log_scale), want = :logdensity)
+const CAUCHY_SCALE_KERNEL = prepare(CAUCHY_LOGDENSITY;
+    have = (:x, :location, :scale), want = :logdensity)
+
+@kernel embedded_distribution_logdensity(
+        x::Float64, location::Float64,
+        scale::Float64, log_scale::Float64) = begin
+    normal_term::Float64 = NORMAL_LOGSCALE_KERNEL(x, location, log_scale)
+    cauchy_term::Float64 = CAUCHY_SCALE_KERNEL(x, location, scale)
+    logdensity::Float64 = normal_term + cauchy_term
+end
+
+const EMBEDDED_DISTRIBUTION_KERNEL = prepare(embedded_distribution_logdensity;
+    have = (:x, :location, :scale, :log_scale), want = :logdensity)
 
 const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 
 @testset "Native log-density examples" begin
     artifacts = map(evaluate_source, all_sources())
+
+    @testset "reusable distribution KernelSpecs compose without Distributions" begin
+        @test NORMAL_LOGDENSITY isa KernelSpec
+        @test CAUCHY_LOGDENSITY isa KernelSpec
+        @test !isdefined(DistributionExamples.DistributionKernelSources,
+                         :Distributions)
+
+        x = 0.4
+        location = -0.2
+        scale = 1.3
+        log_scale = log(scale)
+        for (spec, reference) in (
+                (NORMAL_LOGDENSITY, logpdf(Normal(location, scale), x)),
+                (CAUCHY_LOGDENSITY, logpdf(Cauchy(location, scale), x)))
+            scale_kernel = prepare(spec;
+                have = (:x, :location, :scale), want = :logdensity)
+            logscale_kernel = prepare(spec;
+                have = (:x, :location, :log_scale), want = :logdensity)
+            both_kernel = prepare(spec;
+                have = (:x, :location, :scale, :log_scale),
+                want = :logdensity)
+            @test scale_kernel(x, location, scale) ≈ reference
+            @test logscale_kernel(x, location, log_scale) ≈ reference
+            @test both_kernel(x, location, scale, log_scale) ≈ reference
+            @test only(Base.return_types(
+                scale_kernel, Tuple{Float64,Float64,Float64})) === Float64
+            @test only(Base.return_types(
+                logscale_kernel, Tuple{Float64,Float64,Float64})) === Float64
+            @test DistributionExamples._allocated(
+                scale_kernel, x, location, scale) == 0
+            @test DistributionExamples._allocated(
+                logscale_kernel, x, location, log_scale) == 0
+            @test !occursin("Distributions", string(code_expr(scale_kernel)))
+            @test !occursin("Distributions", string(code_expr(logscale_kernel)))
+
+            both_plan = plan(spec;
+                have = (:x, :location, :scale, :log_scale),
+                want = :logdensity)
+            selected_inputs = Dict(
+                only(recipe.outputs).name =>
+                    map(input -> input.name, recipe.inputs)
+                for recipe in both_plan.recipes)
+            @test selected_inputs[:standardized] == (:x, :location, :scale)
+            @test selected_inputs[:negative_log_scale] == (:log_scale,)
+        end
+
+        observations = [28.0, 8.0, -3.0, 7.0]
+        effects = [1.0, 1.5, -0.5, 0.25]
+        scales = [15.0, 10.0, 16.0, 11.0]
+        likelihood = plate(NORMAL_LOGDENSITY;
+            have = (:x, :location, :scale),
+            want = :logdensity, batched = (:x, :location, :scale))
+        @test likelihood(observations, effects, scales) ≈ sum(
+            logpdf(Normal(effect, observation_scale), observation)
+            for (observation, effect, observation_scale) in
+                zip(observations, effects, scales))
+
+        effects_prior = plate(NORMAL_LOGDENSITY;
+            have = (:x, :location, :log_scale),
+            want = :logdensity, batched = :x)
+        @test effects_prior(effects, location, log_scale) ≈ sum(
+            logpdf(Normal(location, scale), effect) for effect in effects)
+
+        cauchy_logdensity = CAUCHY_SCALE_KERNEL(scale, 0.0, 5.0)
+        @test log(2) + cauchy_logdensity ≈
+              logpdf(truncated(Cauchy(0.0, 5.0), 0.0, Inf), scale)
+
+        @test EMBEDDED_DISTRIBUTION_KERNEL(
+            x, location, scale, log_scale) ≈
+            NORMAL_LOGSCALE_KERNEL(x, location, log_scale) +
+            CAUCHY_SCALE_KERNEL(x, location, scale)
+        @test !occursin("Distributions",
+                       string(code_expr(EMBEDDED_DISTRIBUTION_KERNEL)))
+    end
 
     @testset "sources build native recipes checked against a Distributions oracle" begin
         @test length(artifacts) == 11
@@ -22,16 +112,16 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
         # kernel with `plate`.
         @test all(source -> !occursin("compose(", source), all_sources())
         @test occursin("plate(", vectorized)
-        # Regression guard against the exp-then-log round trip: with logσ in HAND
-        # the density uses it directly (the -logσ term), never rebuilds σ via exp
-        # only to take log(σ) again. Scan code only — drop `#` comments so prose
+        # Regression guard against the exp-then-log round trip: with log_scale
+        # in HAVE the density uses it directly in the normalizer. Scan code
+        # only — drop `#` comments so prose
         # mentioning the anti-pattern doesn't trip the guard.
         code_only(src) = join(
             (first(split(line, "#")) for line in eachsplit(src, "\n")), "\n",
         )
         continuous_code = code_only(continuous)
-        @test occursin("- logσ", continuous_code)
-        @test !occursin("log(σ)", continuous_code)
+        @test occursin("-log_scale", continuous_code)
+        @test occursin("-log(scale)", continuous_code)
         @test !occursin("log(exp", continuous_code)
         # The compute path is Distributions.jl-free.
         @test all(artifacts) do artifact

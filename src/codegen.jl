@@ -39,6 +39,142 @@ function _varnames(p::Plan)
     out
 end
 
+_embedded_kernel(op) = nothing
+
+function _lhs_symbols!(symbols::Set{Symbol}, lhs)
+    lhs isa Symbol && return push!(symbols, lhs)
+    lhs isa Expr || return symbols
+    if lhs.head === :(::)
+        _lhs_symbols!(symbols, lhs.args[1])
+    elseif lhs.head === :tuple
+        foreach(item -> _lhs_symbols!(symbols, item), lhs.args)
+    end
+    symbols
+end
+
+function _local_symbols!(symbols::Set{Symbol}, node)
+    node isa Expr || return symbols
+    node.head === :quote && return symbols
+    if node.head === :(=)
+        _lhs_symbols!(symbols, node.args[1])
+    elseif node.head === :for
+        iteration = node.args[1]
+        iteration isa Expr && iteration.head === :(=) &&
+            _lhs_symbols!(symbols, iteration.args[1])
+    end
+    foreach(child -> _local_symbols!(symbols, child), node.args)
+    symbols
+end
+
+_signature_name(name::Symbol) = name
+_signature_name(annotation::Expr) = annotation.head === :(::) ?
+    _signature_name(annotation.args[1]) : throw(ArgumentError(
+        "embedded kernel has an unsupported argument form: $annotation"))
+
+function _rewrite_embedded(node, names::Dict{Symbol,Any}, op_offset::Int)
+    node isa Symbol && return get(names, node, node)
+    node isa Expr || return node
+    node.head === :quote && return node
+    if node.head === :ref && length(node.args) == 2 &&
+       node.args[1] === _OPS_ARG && node.args[2] isa Int
+        return Expr(:ref, _OPS_ARG, op_offset + node.args[2])
+    end
+    Expr(node.head,
+         (_rewrite_embedded(child, names, op_offset) for child in node.args)...)
+end
+
+function _embedded_statements(ast::Expr, callargs, lhs, op_offset::Int)
+    ast.head === :function || throw(ArgumentError(
+        "nested preparation requires an RK-generated function expression"))
+    signature, body = ast.args
+    signature isa Expr && signature.head === :tuple || throw(ArgumentError(
+        "embedded kernel has an unsupported signature"))
+    params = signature.args[2:end]
+    length(params) == length(callargs) || throw(ArgumentError(
+        "embedded kernel expected $(length(params)) inputs, got $(length(callargs))"))
+
+    names = Dict{Symbol,Any}()
+    for (param, callarg) in zip(params, callargs)
+        names[_signature_name(param)] = callarg
+    end
+    locals = _local_symbols!(Set{Symbol}(), body)
+    for local_name in locals
+        haskey(names, local_name) ||
+            (names[local_name] = gensym(Symbol(:embedded_, local_name)))
+    end
+
+    statements = Any[]
+    bodyargs = body.args
+    return_index = findlast(statement ->
+        statement isa Expr && statement.head === :return, bodyargs)
+    return_index === nothing && throw(ArgumentError(
+        "embedded RK kernel has no terminal return"))
+    any(statement -> statement isa Expr && statement.head === :return,
+        bodyargs[1:(return_index - 1)]) && throw(ArgumentError(
+            "embedded RK kernel has an early return"))
+    for statement in bodyargs[1:(return_index - 1)]
+        statement isa LineNumberNode && continue
+        push!(statements, _rewrite_embedded(statement, names, op_offset))
+    end
+    returned = _rewrite_embedded(
+        bodyargs[return_index].args[1], names, op_offset)
+    push!(statements, Expr(:(=), lhs, returned))
+    statements
+end
+
+function _lower_with_ops(p::Plan; tensorized::Bool = false,
+                         inline_embedded::Bool = true)
+    g = p.graph
+    names = _varnames(p)
+    nm(v) = names[canon_id(g, v.id)]
+    argexprs = Any[_OPS_ARG]
+    for v in p.have
+        push!(argexprs, :($(nm(v))::$(valtype(v))))
+    end
+    body = Expr(:block)
+    runtime_ops = Any[]
+    runtime_recipes = Recipe[]
+    # HAVE is authoritative, and the first selected producer of any other
+    # logical value owns its binding. Later recipes may emit that value as a
+    # collateral multi-output; execute the recipe but discard the duplicate so
+    # neither authoritative inputs nor earlier logical values are overwritten.
+    assigned = Set(canon_id(g, v.id) for v in p.have)
+    for r in p.recipes
+        callargs = Any[nm(inp) for inp in r.inputs]
+        lhsnames = Any[]
+        for output in r.outputs
+            cid = canon_id(g, output.id)
+            if cid in assigned
+                push!(lhsnames, gensym(Symbol(nm(output), :_discard)))
+            else
+                push!(assigned, cid)
+                push!(lhsnames, nm(output))
+            end
+        end
+        lhs = length(lhsnames) == 1 ? only(lhsnames) : Expr(:tuple, lhsnames...)
+        embedded = inline_embedded ? _embedded_kernel(r.op) : nothing
+        if embedded === nothing
+            push!(runtime_ops, r.op)
+            push!(runtime_recipes, r)
+            call = Expr(:call, Expr(:ref, _OPS_ARG, length(runtime_ops)),
+                        callargs...)
+            push!(body.args, Expr(:(=), lhs, call))
+        else
+            inner_ast = _embedded_ast(embedded, tensorized)
+            op_offset = length(runtime_ops)
+            append!(runtime_ops, embedded.ops)
+            append!(runtime_recipes, embedded.lowered_recipes)
+            append!(body.args,
+                    _embedded_statements(inner_ast, callargs, lhs, op_offset))
+        end
+    end
+    retval = length(p.want) == 1 ? nm(p.want[1]) :
+             Expr(:tuple, (nm(w) for w in p.want)...)
+    push!(body.args, Expr(:return, retval))
+    Expr(:function, Expr(:tuple, argexprs...), body),
+    Tuple(runtime_ops), Tuple(runtime_recipes)
+end
+
 """
     lower(p::Plan) -> Expr
 
@@ -53,45 +189,8 @@ Lower a plan to an ordinary anonymous-function `Expr` of the form
 This `Expr` is a first-class artifact: it may be inspected (`code_expr`) and
 rewritten (`transform`) before compilation (gist §9).
 """
-function lower(p::Plan)
-    g = p.graph
-    names = _varnames(p)
-    nm(v) = names[canon_id(g, v.id)]
-    argexprs = Any[_OPS_ARG]
-    for v in p.have
-        push!(argexprs, :($(nm(v))::$(valtype(v))))
-    end
-    body = Expr(:block)
-    # HAVE is authoritative, and the first selected producer of any other
-    # logical value owns its binding. Later recipes may emit that value as a
-    # collateral multi-output; execute the recipe but discard the duplicate so
-    # neither authoritative inputs nor earlier logical values are overwritten.
-    assigned = Set(canon_id(g, v.id) for v in p.have)
-    for (k, r) in enumerate(p.recipes)
-        callargs = Any[nm(inp) for inp in r.inputs]
-        call = Expr(:call, Expr(:ref, _OPS_ARG, k), callargs...)
-        lhsnames = Any[]
-        for output in r.outputs
-            cid = canon_id(g, output.id)
-            if cid in assigned
-                push!(lhsnames, gensym(Symbol(nm(output), :_discard)))
-            else
-                push!(assigned, cid)
-                push!(lhsnames, nm(output))
-            end
-        end
-        if length(lhsnames) == 1
-            push!(body.args, Expr(:(=), only(lhsnames), call))
-        else
-            lhs = Expr(:tuple, lhsnames...)
-            push!(body.args, Expr(:(=), lhs, call))
-        end
-    end
-    retval = length(p.want) == 1 ? nm(p.want[1]) :
-             Expr(:tuple, (nm(w) for w in p.want)...)
-    push!(body.args, Expr(:return, retval))
-    Expr(:function, Expr(:tuple, argexprs...), body)
-end
+lower(p::Plan) = first(_lower_with_ops(p; inline_embedded = false))
+_lower_unembedded(p::Plan) = lower(p)
 
 """
     lower_batched(p::Plan; batched, reduce = :+) -> Expr
@@ -313,7 +412,9 @@ compile(ast::Expr) = @RuntimeGeneratedFunction(ast)
 # type parameter so choosing the native body remains inferred and allocation
 # free.  Optional backend extensions specialize `_batched_call` on their traced
 # array marker; ordinary arrays always take `native`.
-struct _BatchedFunctionPair{I,N,T}
+abstract type _ArrayFunctionPair end
+
+struct _BatchedFunctionPair{I,B,R,N,T} <: _ArrayFunctionPair
     native::N
     tensorized::T
 end
@@ -322,7 +423,17 @@ end
     _batched_call(f, ops, args, getfield(args, I))
 end
 
-@inline _batched_call(f::_BatchedFunctionPair, ops, args, marker) =
+struct _EmbeddedFunctionPair{I,N,T,A} <: _ArrayFunctionPair
+    native::N
+    tensorized::T
+    tensorized_ast::A
+end
+
+@inline function (f::_EmbeddedFunctionPair{I})(ops, args...) where {I}
+    _batched_call(f, ops, args, getfield(args, I))
+end
+
+@inline _batched_call(f::_ArrayFunctionPair, ops, args, marker) =
     f.native(ops, args...)
 
 """
@@ -332,13 +443,51 @@ A small callable object holding the RGF-generated function, the positional
 `ops` tuple, and metadata (graph values in call/return order, the plan, and the
 lowered AST). Runtime invocation does not consult any planning logic.
 """
-struct PreparedKernel{F,O,IN,OUT}
+struct PreparedKernel{F,O,IN,OUT,RR}
     f::F
     ops::O
     inputs::IN
     outputs::OUT
     plan::Plan
     ast::Expr
+    lowered_recipes::RR
+end
+
+# Prepared RK kernels are compiler-owned program structure when used as recipe
+# operations. Flatten them automatically so ordinary composition of `plate`
+# and scalar prepared kernels produces one generated outer program rather than
+# an opaque nested callback.
+_embedded_kernel(kernel::PreparedKernel) = kernel
+
+_batched_options(::_BatchedFunctionPair{I,B,R}) where {I,B,R} = (B, R)
+function _embedded_ast(kernel::PreparedKernel, tensorized::Bool)
+    tensorized || return kernel.ast
+    if kernel.f isa _BatchedFunctionPair
+        batched, reduce = _batched_options(kernel.f)
+        return _lower_batched_tensorized(
+            kernel.plan; batched = batched, reduce = reduce)
+    elseif kernel.f isa _EmbeddedFunctionPair
+        # The tensorized product may already contain arbitrarily nested plates
+        # and user AST passes. Preserve that exact prepared artifact instead of
+        # rebuilding from the native `kernel.ast`, which would silently restore
+        # scalar-indexing loops at the next composition level.
+        return kernel.f.tensorized_ast
+    end
+    kernel.ast
+end
+
+function _needs_embedded_tensorization(p::Plan)
+    any(p.recipes) do recipe
+        kernel = _embedded_kernel(recipe.op)
+        kernel !== nothing && kernel.f isa _ArrayFunctionPair
+    end
+end
+
+function _embedded_marker_index(p::Plan)
+    index = findfirst(value -> valtype(value) <: AbstractArray, p.have)
+    index === nothing && throw(ArgumentError(
+        "an embedded plate requires an array-valued HAVE port in the outer kernel"))
+    index
 end
 
 """
@@ -490,10 +639,9 @@ end
     _prepared_call(k, args, Val(N))
 end
 
-function _prepare(p::Plan, ast::Expr)
+function _prepare(p::Plan, ast::Expr, ops::Tuple, recipes::Tuple)
     f = compile(ast)
-    ops = ntuple(i -> p.recipes[i].op, length(p.recipes))
-    PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, ast)
+    PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, ast, recipes)
 end
 
 """
@@ -513,10 +661,14 @@ function _prepare_batched(p::Plan; batched, reduce = :+)
     tensorized_ast = _lower_batched_tensorized(p; batched = batched, reduce = reduce)
     native = compile(native_ast)
     tensorized = compile(tensorized_ast)
-    f = _BatchedFunctionPair{input_index,typeof(native),typeof(tensorized)}(
-        native, tensorized)
+    batched_ports = Tuple(value.name for value in p.have
+                          if value.name in batched_names)
+    f = _BatchedFunctionPair{
+        input_index,batched_ports,reduce,typeof(native),typeof(tensorized)}(
+            native, tensorized)
     ops = ntuple(i -> p.recipes[i].op, length(p.recipes))
-    PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast)
+    PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast,
+                   Tuple(p.recipes))
 end
 
 # The optional MutatingFunctions extension uses one typed cache cell per
@@ -602,8 +754,29 @@ end
 Ergonomic composition of `plan -> lower -> transform -> compile`. `passes` is a
 tuple of AST passes applied before compilation.
 """
-prepare(p::Plan; passes = ()) =
-    _prepare(p, isempty(passes) ? lower(p) : transform(lower(p), passes...))
+function prepare(p::Plan; passes = ())
+    native_ast, ops, recipes = _lower_with_ops(p)
+    isempty(passes) || (native_ast = transform(native_ast, passes...))
+    if !_needs_embedded_tensorization(p)
+        return _prepare(p, native_ast, ops, recipes)
+    end
+
+    tensorized_ast, tensorized_ops, tensorized_recipes =
+        _lower_with_ops(p; tensorized = true)
+    tensorized_ops == ops || throw(ArgumentError(
+        "embedded native and tensorized kernels produced different operation tables"))
+    tensorized_recipes == recipes || throw(ArgumentError(
+        "embedded native and tensorized kernels produced different readable recipes"))
+    isempty(passes) ||
+        (tensorized_ast = transform(tensorized_ast, passes...))
+    native = compile(native_ast)
+    tensorized = compile(tensorized_ast)
+    input_index = _embedded_marker_index(p)
+    f = _EmbeddedFunctionPair{
+        input_index,typeof(native),typeof(tensorized),typeof(tensorized_ast)}(
+            native, tensorized, tensorized_ast)
+    PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast, recipes)
+end
 
 function prepare(g::Graph; have = (), want = (), passes = ())
     p = plan(g; have = have, want = want)
@@ -739,9 +912,13 @@ end
 # Build a display-only copy of a lowered kernel or reactive getter. Positional
 # `__ops__[k]` calls become the selected recipe's named operation or its retained
 # authored RHS, and hidden operation/cache arguments are removed from the shown
-# signature. This internal explanatory expression is not executable authority;
-# `code_expr` remains the exact compiled AST.
+# signature. Passing a PreparedKernel uses its flattened recipe sequence, so a
+# nested generated kernel never leaves mismatched or opaque operation slots.
+# This internal explanatory expression is not executable authority; `code_expr`
+# remains the exact compiled AST.
 _readable_expr(ast::Expr, plan::Plan) = _readable_expr(ast, plan.recipes)
+_readable_expr(ast::Expr, kernel::PreparedKernel) =
+    _readable_expr(ast, kernel.lowered_recipes)
 
 function _recipe_line(r::Recipe)
     ins = join([string(v.name) for v in r.inputs], ", ")
