@@ -21,7 +21,6 @@ export all_sources, evaluate_source, run
 const BATCHED_SOURCE = raw"""
 using Distributions
 using DifferentiationInterface
-using DifferentiationInterface: Constant
 import Enzyme
 using Random
 
@@ -81,11 +80,10 @@ reference_perobs = logpdf.(Normal(μ, σ), x)
 # temporary container, so plain Enzyme reverse mode is sufficient.
 analytic_gradient = @. -(x - μ) / σ^2
 backend = AutoEnzyme(; mode = Enzyme.Reverse)
-total_for_ad(v, pointwise, μ, logσ) = total_kernel(pointwise, v, μ, logσ)
-gradient = DifferentiationInterface.gradient(
-    total_for_ad, backend, x,
-    Constant(normal_logpdf), Constant(μ), Constant(logσ),
+prepared_gradient = prepare_ad(
+    total_kernel, backend, normal_logpdf, x, μ, logσ; active = :x,
 )
+gradient = ad_gradient(prepared_gradient, normal_logpdf, x, μ, logσ)
 
 # want-set pruning is structural, not a runtime branch: neither plan
 # materializes the other output representation.

@@ -1,6 +1,5 @@
 using Test
 using DifferentiationInterface
-using DifferentiationInterface: Constant
 import Enzyme
 using Distributions
 
@@ -9,12 +8,6 @@ using .DistributionExamples
 using ReactiveKernels: code_expr
 
 const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
-
-struct SecondDistributionInput{K}
-    kernel::K
-end
-(call::SecondDistributionInput)(active, first_input) =
-    call.kernel(first_input, active)
 
 @testset "Native log-density examples" begin
     artifacts = map(evaluate_source, all_sources())
@@ -181,17 +174,15 @@ end
         gradients = Dict{Symbol,Any}()
         for artifact in artifacts
             values = Tuple(artifact.inputs)
-            if artifact.name in (:discrete_bernoulli_logit, :geometric_logit)
-                call = SecondDistributionInput(artifact.kernel)
-                active = values[2]
-                constants = (Constant(values[1]),)
-            else
-                call = artifact.kernel
-                active = first(values)
-                constants = map(Constant, Base.tail(values))
-            end
-            gradient = DifferentiationInterface.gradient(
-                call, DISTRIBUTION_ENZYME_BACKEND, active, constants...)
+            active_index = artifact.name in (
+                :discrete_bernoulli_logit, :geometric_logit,
+            ) ? 2 : 1
+            active_name = inputs(artifact.kernel)[active_index].name
+            prepared = prepare_ad(
+                artifact.kernel, DISTRIBUTION_ENZYME_BACKEND, values...;
+                active = active_name,
+            )
+            gradient = ad_gradient(prepared, values...)
             gradients[artifact.name] = gradient
             components = gradient isa Number ? (gradient,) : gradient
             @test all(isfinite, components)

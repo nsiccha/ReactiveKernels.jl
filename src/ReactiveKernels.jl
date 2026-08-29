@@ -20,6 +20,7 @@ using RuntimeGeneratedFunctions
 using LinearAlgebra
 using LogExpFunctions
 using Random
+import DifferentiationInterface
 RuntimeGeneratedFunctions.init(@__MODULE__)
 
 include("core.jl")
@@ -27,6 +28,7 @@ include("planner.jl")
 include("codegen.jl")
 include("graphops.jl")
 include("authoring.jl")
+include("ad.jl")
 include("kernel_stateful.jl")
 include("kernel_methodir.jl")
 include("kernel_factory.jl")
@@ -41,8 +43,9 @@ include("stateful.jl")
 include("reactive_facade.jl")
 include("visualization.jl")
 
-export Value, Recipe, Graph, Plan, PreparedKernel, ReplicatedKernel, NonAllocatingKernel, PlanningError
+export Value, Recipe, Graph, Plan, PreparedKernel, PreparedADKernel, ReplicatedKernel, NonAllocatingKernel, PlanningError
 export value, value!, add!, plan, prepare, prepare_nonallocating, plate
+export prepare_ad, ad_gradient
 export lower, lower_batched, replica, transform, compile
 export explain, code_expr, inputs, outputs, valtype
 export compose, PreparationCache, prepare!, canon_id

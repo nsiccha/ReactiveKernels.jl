@@ -10,10 +10,20 @@ using .ReactiveKernelsNUTSExample
 @testset "ReactiveKernels" begin
     benchmark_only = ARGS == ["benchmark"]
     distributions_only = ARGS == ["distributions"]
+    ad_only = ARGS == ["ad"]
+    ppl_ad_only = ARGS == ["ppl-ad"]
+    batched_only = ARGS == ["batched"]
     if distributions_only
         include("test_distributions_example.jl")
+    elseif ad_only
+        include("test_ad.jl")
+    elseif ppl_ad_only
+        include("test_ppl_enzyme.jl")
+    elseif batched_only
+        include("test_batched_example.jl")
     elseif !benchmark_only
         include("test_stateless.jl")
+        include("test_ad.jl")
         include("test_authoring.jl")
         include("test_readable_expr.jl")
         include("test_plate.jl")
@@ -60,5 +70,6 @@ using .ReactiveKernelsNUTSExample
         include("test_preexisting_examples.jl")
         include("test_corrected_core_examples.jl")
     end
-    distributions_only || include("test_handwritten_benchmarks.jl")
+    distributions_only || ad_only || ppl_ad_only || batched_only ||
+        include("test_handwritten_benchmarks.jl")
 end

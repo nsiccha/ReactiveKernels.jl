@@ -1,7 +1,7 @@
-# Runnable NUTS workflow. DifferentiationInterface and Enzyme are OPTIONAL extras —
-# ReactiveKernels does not hard-depend on any AD backend — so run this under an
-# environment that provides them (e.g. `julia --project=docs examples/nuts.jl`, or a
-# project with DifferentiationInterface + Enzyme added), NOT the bare package env.
+# Runnable NUTS workflow. DifferentiationInterface is ReactiveKernels' generic
+# AD boundary, while Enzyme remains an OPTIONAL backend. Run this example under
+# an environment that provides Enzyme (for example
+# `julia --project=docs examples/nuts.jl`).
 using LinearAlgebra
 using Random
 using ReactiveKernels

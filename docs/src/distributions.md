@@ -20,24 +20,29 @@ DAG**. The exact compiled AST remains available through `code_expr`.
 
 ## Optional reverse-mode AD through DifferentiationInterface
 
-AD remains outside the core dependency graph: Enzyme and
-DifferentiationInterface are test/example extras, just as Reactant is an
-optional extension. Prepared distribution kernels nevertheless have a tested
-fast path through DI's Enzyme backend. Mark non-active inputs with DI
-`Constant` and use ordinary reverse mode:
+DifferentiationInterface is the package's backend-neutral scalar-gradient
+boundary; concrete AD engines remain optional. Enzyme is a test/example extra,
+just as Reactant is an optional extension, and core code never imports it.
+`prepare_ad` selects one active HAVE port once and supplies every other current
+HAVE value to DI as a `Constant` automatically:
 
 ```julia
 using DifferentiationInterface
-using DifferentiationInterface: Constant
 import Enzyme
 
 backend = AutoEnzyme(; mode = Enzyme.Reverse)
-dx = gradient(normal_kernel, backend, x, Constant(μ), Constant(logσ))
+normal_ad = prepare_ad(
+    normal_logpdf, backend, x, μ, logσ;
+    active = :x, want = :logdensity,
+)
+dx = ad_gradient(normal_ad, x, μ, logσ)
 ```
 
-The test suite exercises this configuration across all eleven scalar, plated,
-multivariate, and time-series examples below. No runtime-activity mode or
-function annotation is needed.
+Preparation values establish backend types and shapes; later calls rebind the
+current inactive values instead of freezing the original data. The test suite
+exercises this configuration across all eleven scalar, plated, multivariate,
+and time-series examples below. No runtime-activity mode or function annotation
+is needed.
 
 ## Continuous: Normal location and log scale
 
