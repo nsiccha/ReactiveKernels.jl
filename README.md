@@ -18,9 +18,17 @@ a prepared kernel.
 > first Phase 5 physical-lowering integrations: an optional
 > MutatingFunctions-backed non-allocating preparation path and an optional
 > Reactant extension for traceable mathematical kernels and whole-kernel
-> replicas. This is not blanket accelerator support for mutable state machines:
-> adaptive NUTS remains CPU-only because its tree control and host RNG are data
-> dependent. E-graph optimization remains future work.
+> replicas. The optional external
+> [adaptive-NUTS exemplar](examples/nuts_runtime/kernel_nuts_reactant.jl) compiles
+> one full-depth transition to one data-dependent traced `while`, with
+> pre-generated momentum, direction, and exponential tensors plus explicit
+> counters, so there is no host RNG inside the trace. That acceptance path is
+> scoped to `Float64`, a positive diagonal Euclidean metric, the locked authored
+> control-flow graph, and the current diagnostics callback. Overflow and
+> unsupported cases reject; the native adaptive API remains CPU execution. See
+> the [executable acceptance test](test/test_kernel_nuts_reactant.jl). This is
+> not blanket accelerator support for mutable state machines. E-graph
+> optimization remains future work.
 
 The runnable [`examples/eight_schools.jl`](examples/eight_schools.jl) shows how
 to build PPL semantics manually from ordinary recipes: unconstrained-to-

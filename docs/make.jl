@@ -48,8 +48,8 @@ makedocs(
     ),
     pages = site_pages,
     checkdocs = :none,
-    # Build-executed examples must fail closed instead of silently losing their panel.
-    warnonly = Documenter.except(:eval_block),
+    # Treat every docs warning as an error; build-executed examples must fail closed.
+    warnonly = false,
 )
 
 # A successful build must have executed and rendered every PPL walkthrough
