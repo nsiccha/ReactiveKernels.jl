@@ -542,7 +542,7 @@ function execute_ppl_example(mod::Module, owner::Symbol, source::Symbol;
 end
 
 const EXPECTED_PPL_EXAMPLES = (
-    :eight_schools_density,
+    :eight_schools_extraction,
     :linear_regression_density,
     :beta_binomial_density,
     :poisson_gamma_density,

@@ -31,7 +31,7 @@ const PPL_SOURCE_CASES = (
         @test occursin("examples/$example_name", page)
         @test length(findall("@kernel model(", example)) == 1
         @test occursin("@kernel model(", source)
-        @test occursin("density_kernel = prepare(model;", source)
+        @test occursin(r"\w+_kernel = prepare\(model;", source)
         @test occursin(r"inputs = \(;[\s\S]*?\),\n    model,\n    kernel", source)
 
         artifact = evaluator()
@@ -65,7 +65,7 @@ const PPL_SOURCE_CASES = (
     @test occursin("readable generated view retained an opaque operation slot",
                    helper_source)
     for name in (
-        :eight_schools_density,
+        :eight_schools_extraction,
         :linear_regression_density,
         :beta_binomial_density,
         :poisson_gamma_density,
