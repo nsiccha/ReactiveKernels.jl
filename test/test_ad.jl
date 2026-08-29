@@ -181,5 +181,13 @@ const TEST_AD_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
             multiple_wants, TEST_AD_BACKEND, 2.0;
             active = :q, want = (:first, :second),
         )
+
+        # Type annotations are optional authoring metadata. An abstractly typed
+        # output is validated against the exemplar result at preparation.
+        @kernel untyped_square(q) = q^2
+        @test ad_gradient(
+            untyped_square, TEST_AD_BACKEND, 3.0;
+            active = :q, want = :untyped_square,
+        ) ≈ 6.0
     end
 end

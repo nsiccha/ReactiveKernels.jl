@@ -154,9 +154,17 @@ function _ad_validate_kernel(kernel::PreparedKernel, active_index::Int,
         string(Tuple(output.name for output in outputs(kernel)))))
     output = only(outputs(kernel))
     output_type = valtype(output)
-    output_type <: Number || throw(ArgumentError(
-        "AD gradient preparation requires a scalar Number objective; " *
-        ":$(output.name) has type $output_type"))
+    if !(output_type <: Number)
+        observed_type = if isconcretetype(output_type)
+            output_type
+        else
+            typeof(kernel(args...))
+        end
+        observed_type <: Number || throw(ArgumentError(
+            "AD gradient preparation requires a scalar Number objective; " *
+            ":$(output.name) has declared type $output_type and exemplar " *
+            "result type $observed_type"))
+    end
 
     active = inputs(kernel)[active_index]
     _ad_differentiable_value(args[active_index]) || throw(ArgumentError(
