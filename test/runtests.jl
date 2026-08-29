@@ -15,6 +15,7 @@ using .ReactiveKernelsNUTSExample
     elseif !benchmark_only
         include("test_stateless.jl")
         include("test_authoring.jl")
+        include("test_readable_expr.jl")
         include("test_plate.jl")
         include("test_replica.jl")
         include("test_kernel_stateful.jl")

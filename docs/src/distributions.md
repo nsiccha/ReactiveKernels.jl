@@ -14,8 +14,9 @@ use it directly in the normalizer and derive `σ = exp(logσ)` only for the
 standardized residual. RK plans the graph and reuses a repeated subexpression,
 but it does no algebra — it will not cancel `log(exp(logσ))` for you.
 
-Each panel below shows the **Raw input** (the source), the **Generated kernel**
-(`code_expr`), and its **Compute DAG**.
+Each panel below shows the **Raw input** (the source), a readable **Generated
+kernel** derived from the executed kernel and selected plan, and its **Compute
+DAG**. The exact compiled AST remains available through `code_expr`.
 
 ## Continuous: Normal location and log scale
 

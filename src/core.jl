@@ -46,7 +46,13 @@ A pure computation mapping input graph values to one or more output graph
 values via `op`. `cost` is a deterministic planning hint (not measured
 runtime). `cse_key`, when non-`nothing`, opts the operation into structural CSE
 (gist §8). `effectful` operations are rejected by the planner (gist §12).
+`source` is optional authored-RHS metadata for cold-path readable rendering; it
+is kept on the planning recipe rather than the executable operation so it never
+enters prepared hot-state tuples.
 """
+struct _NoKernelSource end
+const _NO_KERNEL_SOURCE = _NoKernelSource()
+
 struct Recipe
     id::Int
     inputs::Tuple{Vararg{Value}}
@@ -55,7 +61,10 @@ struct Recipe
     cost::Float64
     cse_key::Any
     effectful::Bool
+    source::Any
 end
+Recipe(id, inputs, outputs, op, cost, cse_key, effectful) =
+    Recipe(id, inputs, outputs, op, cost, cse_key, effectful, _NO_KERNEL_SOURCE)
 
 """
     _KernelSourceOp{DefToken,Form,F,TF}
@@ -217,7 +226,8 @@ a single `Value` or a tuple of `Value`s. Referenced values are auto-registered.
 Returns the `Recipe`.
 """
 function add!(g::Graph; inputs, outputs, op,
-              cost::Real = 1.0, cse_key = nothing, effectful::Bool = false)
+              cost::Real = 1.0, cse_key = nothing, effectful::Bool = false,
+              source = _NO_KERNEL_SOURCE)
     ins = _astuple(inputs)
     outs = _astuple(outputs)
     recipe_cost = Float64(cost)
@@ -250,7 +260,8 @@ function add!(g::Graph; inputs, outputs, op,
 
     for v in ins; _register!(g, v); end
     for v in outs; _register!(g, v); end
-    r = Recipe(length(g.recipes) + 1, ins, outs, op, recipe_cost, cse_key, effectful)
+    r = Recipe(length(g.recipes) + 1, ins, outs, op, recipe_cost, cse_key,
+               effectful, source)
     push!(g.recipes, r)
     for v in outs
         push!(get!(g.producers, canon_id(g, v.id), Int[]), r.id)

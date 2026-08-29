@@ -37,9 +37,10 @@ unconstrained
 log prior + log Jacobian + log likelihood ──► unconstrained log density
 ```
 
-The panel below shows three views of this model: **Raw input** (the source),
-**Generated kernel** (`code_expr(density_kernel)`), and **Compute DAG**
-(`visualize(density_plan)`).
+The panel below shows three views of this model: **Raw input** (the source), a
+readable **Generated kernel** derived from the executed kernel and selected
+plan, and the **Compute DAG** (`visualize(density_plan)`). The exact compiled AST
+remains available as `code_expr(density_kernel)`.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_ppl_example(

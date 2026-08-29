@@ -123,9 +123,10 @@ ordinary type-stable Julia driver methods **outside** any reactive `Plan` — th
 native compiled recursion.
 
 The panel is build-executed. **Raw input** is the group construction;
-**Generated kernel** is the fused `:dham` (energy-error) getter `code_expr` — one
-representative compiled getter, not a whole-program listing; **Compute DAG** is
-that exact `reactive_program(group).plan`. **Compare all** opens the side-by-side
+**Generated kernel** is a readable view of the fused `:dham` (energy-error)
+getter — one representative compiled getter, not a whole-program listing; the
+exact getter AST remains available through `code_expr`. **Compute DAG** is that
+exact `reactive_program(group).plan`. **Compare all** opens the side-by-side
 split view. Read the graph as on the [DAG visualization](visualization.md) page:
 green nodes are `HAVE` inputs, orange nodes are `WANT` outputs, and blue nodes are
 the selected recipes that compute them.
@@ -146,8 +147,9 @@ artifact below, whose recursive tree growth, ordered RNG effects, and in-place
 updates are sealed by the native method compiler and do not reduce to one plan.
 
 The panel is build-executed. **Raw input** contains the phasepoint math and the
-selected HAVE/WANT boundary; **Generated kernel** is the resulting
-`code_expr(kernel)`; **Compute DAG** is that exact `kernel.plan`. The potential-only
+selected HAVE/WANT boundary; **Generated kernel** is a readable view derived
+from the executed kernel and exact `kernel.plan`, while `code_expr(kernel)`
+remains the compiled AST. **Compute DAG** is that same plan. The potential-only
 recipe is an alternative producer: because the requested outputs include the
 position gradient, planning selects the combined value-and-gradient recipe and
 does not execute the redundant potential path. **Compare all** opens the standard
