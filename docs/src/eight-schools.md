@@ -36,16 +36,20 @@ unconstrained ─ split ─ τ ────┤
                               └─ (parameters, log_jacobian)     (chosen: density)
 
 parameters ──► log prior
-          ──► log likelihood  (plated: vectorized over the schools)
+          ──► pointwise log likelihood ──► log likelihood
           ──► new-group prediction
 
 log prior + log Jacobian + log likelihood ──► unconstrained log density
 ```
 
-The likelihood is authored once as a scalar per-school `@kernel` and `plate`d
-into a vectorized log density: it iterates the batched ports and sums the scalar
-result in one pass, without building a per-observation vector (and it moves
-shared work above the loop).
+The block below is the authored model, executed verbatim while the documentation
+is built, and it is the single source authority used by both the tests and this
+build. Every operation is written out **inline** — the split is plain indexing,
+the transform is `exp(log_τ)`, and the prior and per-school likelihood are the
+distribution math spelled out directly — so nothing is hidden behind an opaque
+helper call: what you read in **Raw input** is exactly what runs. Constrained
+parameters and the new-group prediction are plain `NamedTuple`s, not custom
+types.
 
 The panel below shows three views of this model: **Raw input** (the source),
 **Generated kernel** (`code_expr(density_kernel)`), and **Compute DAG**

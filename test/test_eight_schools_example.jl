@@ -15,10 +15,13 @@ using .EightSchoolsExample
         p = plan(model.graph;
                  have = (model.unconstrained,),
                  want = (model.parameters,))
-        @test length(p.recipes) == 3
-        @test !any(r -> r.op === EightSchoolsExample.log_abs_det_jacobian,
-                   p.recipes)
-        @test !any(r -> r.op === EightSchoolsExample.log_prior, p.recipes)
+        # split (μ, log_τ, θ) + τ + the parameters-only producer.
+        @test length(p.recipes) == 5
+        # The Jacobian-bearing producer and every density recipe are pruned.
+        produced = Set(canon_id(model.graph, o.id)
+                       for r in p.recipes for o in r.outputs)
+        @test !(canon_id(model.graph, model.log_jacobian.id) in produced)
+        @test !(canon_id(model.graph, model.prior.id) in produced)
 
         parameters = prepare(p)(q)
         @test parameters isa NamedTuple
@@ -34,7 +37,7 @@ using .EightSchoolsExample
         @test log_jacobian == q[2]
     end
 
-    @testset "density decomposition; likelihood is a plated (vectorized) kernel" begin
+    @testset "density decomposition; likelihood is the summed pointwise density" begin
         p = plan(model.graph;
                  have = (model.unconstrained, model.observations,
                          model.observation_scales),
@@ -176,10 +179,13 @@ using .EightSchoolsExample
                          model.prediction_innovations),
                  want = (model.new_group,))
 
-        @test length(p.recipes) == 1
-        @test !any(r -> r.op === EightSchoolsExample.split_unconstrained,
-                   p.recipes)
-        @test !any(r -> r.op === EightSchoolsExample.log_prior, p.recipes)
+        # θ_new + y_new + the new_group NamedTuple; the split, transform, prior,
+        # likelihood, and density recipes are all pruned.
+        @test length(p.recipes) == 3
+        produced = Set(canon_id(model.graph, o.id)
+                       for r in p.recipes for o in r.outputs)
+        @test !(canon_id(model.graph, model.prior.id) in produced)
+        @test !(canon_id(model.graph, model.density.id) in produced)
 
         prediction = prepare(p)(parameters, 12.0, [0.25, -1.0])
         @test prediction isa NamedTuple

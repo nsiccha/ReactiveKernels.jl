@@ -22,6 +22,8 @@ end
                  "distributions_comparison.jl",
                  "scalar_distribution_gallery_comparison.jl",
                  "structured_distributions_comparison.jl",
+                 "eval_throughput_comparison.jl",
+                 "eval_throughput_comparison_body.jl",
                  joinpath("receipts", "validate_distributions.jl"),
                  joinpath("receipts", "validate_scalar_gallery_distributions.jl"),
                  joinpath("receipts", "validate_structured_distributions.jl"))

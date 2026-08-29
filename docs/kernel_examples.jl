@@ -85,11 +85,10 @@ function setup_eight_schools!(mod::Module)
     if !isdefined(mod, :EightSchoolsExample)
         Base.include(mod, joinpath(@__DIR__, "..", "examples", "eight_schools.jl"))
     end
+    # The authored kernel inlines every operation, so the executed panel needs
+    # only the observation data — no example helper is referenced.
     Core.eval(mod, :(using .EightSchoolsExample:
-        EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA,
-        split_unconstrained, positive_scale, assemble_parameters,
-        log_abs_det_jacobian, log_prior, plated_loglik,
-        total_log_density, predict_new_group))
+        EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA))
     nothing
 end
 

@@ -18,6 +18,7 @@ site_pages = [
         "Distribution log densities" => "distributions.md",
         "Batched log densities" => "batched.md",
         "Non-allocating kernels" => "nonallocating.md",
+        "Evaluation throughput vs Turing.jl" => "eval-throughput.md",
     ],
     "Probabilistic programming" => [
         "Eight schools" => "eight-schools.md",

@@ -78,18 +78,47 @@ const EIGHT_SCHOOLS_SOURCE = raw"""
               observation_scales::Vector{Float64},
               new_group_scale::Float64,
               prediction_innovations::Vector{Float64}) = begin
-    (μ::Float64, log_τ::Float64, θ::Vector{Float64}) =
-        split_unconstrained(unconstrained)
-    τ::Float64 = positive_scale(log_τ)
-    parameters = assemble_parameters(μ, τ, θ)
-    log_jacobian::Float64 = log_abs_det_jacobian(log_τ)
+    # Split the unconstrained vector into (μ, log_τ, θ) — plain indexing, no
+    # helper hiding the math.
+    μ::Float64 = unconstrained[1]
+    log_τ::Float64 = unconstrained[2]
+    θ::Vector{Float64} = unconstrained[3:end]
 
-    prior::Float64 = log_prior(parameters)
-    likelihood::Float64 = plated_loglik(observations, θ, observation_scales)
-    density::Float64 = total_log_density(prior, log_jacobian, likelihood)
-    new_group = predict_new_group(
-        parameters, new_group_scale, prediction_innovations,
-    )
+    # Support transform for the scale: τ = exp(log_τ).
+    τ::Float64 = exp(log_τ)
+
+    # Two producers for the SAME `parameters` port — RK's "multiple paths to one
+    # port". The first builds the constrained parameters (a plain NamedTuple)
+    # alone; the second builds them together with the log Jacobian
+    # log|dτ/dlog_τ| = log_τ, sharing the one transform. The planner takes the
+    # first for a constrain-only query and the second whenever the Jacobian —
+    # hence the unconstrained density — is wanted.
+    parameters = (; μ, τ, θ)
+    (parameters, log_jacobian::Float64) = ((; μ, τ, θ), log_τ)
+
+    # log prior:  μ ~ Normal(0, 5),  τ ~ HalfCauchy(0, 5),  θⱼ ~ Normal(μ, τ).
+    prior::Float64 =
+        (-0.5 * log(2π) - log(5.0) - 0.5 * (μ / 5.0)^2) +
+        (log(2) - log(π) - log(5.0) - log1p((τ / 5.0)^2)) +
+        sum(-0.5 * log(2π) - log(τ) - 0.5 * ((θ[j] - μ) / τ)^2
+            for j in eachindex(θ))
+
+    # Pointwise log likelihood:  yⱼ ~ Normal(θⱼ, σⱼ), written out per school.
+    pointwise::Vector{Float64} =
+        [-0.5 * log(2π) - log(observation_scales[j]) -
+             0.5 * ((observations[j] - θ[j]) / observation_scales[j])^2
+         for j in eachindex(observations)]
+    likelihood::Float64 = sum(pointwise)
+
+    # Unconstrained-space log density.
+    density::Float64 = prior + log_jacobian + likelihood
+
+    # Deterministic new-group prediction from standard-normal innovations, read
+    # straight off the constrained `parameters` so the query can start there.
+    θ_new::Float64 = parameters.μ + parameters.τ * prediction_innovations[1]
+    y_new::Float64 = θ_new + new_group_scale * prediction_innovations[2]
+    new_group = (; θ = θ_new, y = y_new)
+
     return density
 end
 
@@ -116,11 +145,10 @@ docs_example = (;
 """
 
 function evaluate_eight_schools_source()
+    # The authored kernel now inlines every operation, so the displayed/executed
+    # source needs only the observation data — no example helper is referenced.
     _evaluate_ppl_source(EIGHT_SCHOOLS_SOURCE, @__MODULE__; bindings = (
         :EIGHT_SCHOOLS_Y, :EIGHT_SCHOOLS_SIGMA,
-        :split_unconstrained, :positive_scale, :assemble_parameters,
-        :log_abs_det_jacobian, :log_prior, :plated_loglik,
-        :total_log_density, :predict_new_group,
     ))
 end
 
