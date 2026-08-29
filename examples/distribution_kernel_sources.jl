@@ -1,7 +1,60 @@
 module DistributionKernelSources
 
+using ReactiveKernels
+
+export NORMAL_LOGDENSITY_SOURCE, CAUCHY_LOGDENSITY_SOURCE
+export NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY
 export EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE
 export MVNORMAL_SOURCE, AR1_SOURCE
+
+const NORMAL_LOGDENSITY_SOURCE = raw"""
+@kernel normal_logdensity(
+        x::Float64, location::Float64,
+        scale::Float64, log_scale::Float64) = begin
+    # Either parameterization alone has equal total cost. With both in HAVE,
+    # the planner mixes the direct division and direct negative log scale.
+    @recipe (cost = 1.0) standardized::Float64 =
+        (x - location) / scale
+    @recipe (cost = 2.0) standardized::Float64 =
+        (x - location) / exp(log_scale)
+    @recipe (cost = 2.0) negative_log_scale::Float64 = -log(scale)
+    @recipe (cost = 1.0) negative_log_scale::Float64 = -log_scale
+    logdensity::Float64 =
+        -0.5 * log(2π) + negative_log_scale - 0.5 * standardized^2
+end
+"""
+
+const CAUCHY_LOGDENSITY_SOURCE = raw"""
+@kernel cauchy_logdensity(
+        x::Float64, location::Float64,
+        scale::Float64, log_scale::Float64) = begin
+    # Either parameterization alone has equal total cost. With both in HAVE,
+    # the planner mixes the direct division and direct negative log scale.
+    @recipe (cost = 1.0) standardized::Float64 =
+        (x - location) / scale
+    @recipe (cost = 2.0) standardized::Float64 =
+        (x - location) / exp(log_scale)
+    @recipe (cost = 2.0) negative_log_scale::Float64 = -log(scale)
+    @recipe (cost = 1.0) negative_log_scale::Float64 = -log_scale
+    logdensity::Float64 =
+        -log(π) + negative_log_scale - log1p(standardized^2)
+end
+"""
+
+function _evaluate_spec_source(source::AbstractString, name::Symbol)
+    parsed = Meta.parseall(source; filename = "distribution-kernel-source.jl")
+    expressions = parsed.head === :toplevel ? parsed.args : Any[parsed]
+    for expression in expressions
+        expression isa LineNumberNode && continue
+        Core.eval(@__MODULE__, expression)
+    end
+    getfield(@__MODULE__, name)
+end
+
+const NORMAL_LOGDENSITY =
+    _evaluate_spec_source(NORMAL_LOGDENSITY_SOURCE, :normal_logdensity)
+const CAUCHY_LOGDENSITY =
+    _evaluate_spec_source(CAUCHY_LOGDENSITY_SOURCE, :cauchy_logdensity)
 
 const EXPONENTIAL_SOURCE = raw"""
 @kernel exponential_logpdf(x::Float64, logθ::Float64) = begin

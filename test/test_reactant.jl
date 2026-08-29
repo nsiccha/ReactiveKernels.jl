@@ -9,6 +9,7 @@ import Reactant: @compile, @jit
 
 include(joinpath(@__DIR__, "..", "examples", "distribution_kernel_sources.jl"))
 using .DistributionKernelSources:
+    NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY,
     EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE,
     MVNORMAL_SOURCE, AR1_SOURCE
 include(joinpath(@__DIR__, "..", "examples", "eight_schools.jl"))
@@ -107,6 +108,15 @@ function _normal_reference(x, μ, logσ)
     -0.5 * log(2π) - logσ - 0.5 * ((x - μ) / exp(logσ))^2
 end
 
+const REACTANT_SOURCE_NORMAL_LOGSCALE = prepare(NORMAL_LOGDENSITY;
+    have = (:x, :location, :log_scale), want = :logdensity)
+
+@kernel reactant_embedded_source_normal(
+        x::Float64, location::Float64, log_scale::Float64) = begin
+    logdensity::Float64 =
+        REACTANT_SOURCE_NORMAL_LOGSCALE(x, location, log_scale)
+end
+
 @testset "Reactant optional compiler integration" begin
     @test Base.get_extension(ReactiveKernels, :ReactiveKernelsReactantExt) !== nothing
 
@@ -152,6 +162,53 @@ end
                                                 track_numbers = true)
         compiled = @compile kernel(x, μ, logσ)
         @test compiled(x, μ, logσ) ≈ _normal_reference(0.2, 0.3, log(1.2))
+    end
+
+    @testset "reusable Normal and Cauchy sources compile and plate" begin
+        x_host = 0.4
+        location_host = -0.2
+        scale_host = 1.3
+        log_scale_host = log(scale_host)
+        x, location, scale, log_scale = Reactant.to_rarray.(
+            (x_host, location_host, scale_host, log_scale_host);
+            track_numbers = true)
+
+        for spec in (NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY)
+            scale_kernel = prepare(spec;
+                have = (:x, :location, :scale), want = :logdensity)
+            logscale_kernel = prepare(spec;
+                have = (:x, :location, :log_scale), want = :logdensity)
+            both_kernel = prepare(spec;
+                have = (:x, :location, :scale, :log_scale),
+                want = :logdensity)
+            scale_compiled = @compile scale_kernel(x, location, scale)
+            logscale_compiled = @compile logscale_kernel(x, location, log_scale)
+            both_compiled = @compile both_kernel(
+                x, location, scale, log_scale)
+            reference = scale_kernel(x_host, location_host, scale_host)
+            @test scale_compiled(x, location, scale) ≈ reference
+            @test logscale_compiled(x, location, log_scale) ≈ reference
+            @test both_compiled(x, location, scale, log_scale) ≈ reference
+        end
+
+        observations_host = [28.0, 8.0, -3.0, 7.0]
+        effects_host = [1.0, 1.5, -0.5, 0.25]
+        scales_host = [15.0, 10.0, 16.0, 11.0]
+        likelihood = plate(NORMAL_LOGDENSITY;
+            have = (:x, :location, :scale),
+            want = :logdensity, batched = (:x, :location, :scale))
+        observations = Reactant.to_rarray(observations_host)
+        effects = Reactant.to_rarray(effects_host)
+        scales = Reactant.to_rarray(scales_host)
+        likelihood_compiled = @compile likelihood(observations, effects, scales)
+        @test likelihood_compiled(observations, effects, scales) ≈
+              likelihood(observations_host, effects_host, scales_host)
+
+        embedded = prepare(reactant_embedded_source_normal)
+        embedded_compiled = @compile embedded(x, location, log_scale)
+        @test embedded_compiled(x, location, log_scale) ≈
+              REACTANT_SOURCE_NORMAL_LOGSCALE(
+                  x_host, location_host, log_scale_host)
     end
 
     @testset "dynamic Bool selection is tensorized without changing native semantics" begin
