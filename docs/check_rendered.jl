@@ -58,7 +58,8 @@ function check_rendered_docs(build_dir, page_tree)
     expected_sortable_tables = Dict(
         "batched.md" => 1,
         "compiler.md" => 1,
-        "distributions.md" => 5,
+        "distributions.md" => 6,
+        "eval-throughput.md" => 1,
         "nuts.md" => 1,
     )
     expected_aov_panels = Dict(
