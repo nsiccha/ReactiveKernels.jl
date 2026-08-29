@@ -55,15 +55,29 @@ time-to-effective-sample.
 The ReactiveHMC.jl `ca9` structure is an **algorithm-structure reference only** — not
 a bitwise or RNG target; improvements may change arithmetic or ordering.
 
-## Reactant and multiple chains
+## Reactant adaptive transition and multiple chains
 
-Adaptive NUTS is currently a CPU sampler. Its U-turn/divergence exits, ragged tree
-depth, proposal swaps, and host RNG are data dependent, so they do not trace as a
-static Reactant program. The traceable alternative is the fixed-step HMC kernel in
-[`examples/hmc.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/hmc.jl):
-momentum and the Metropolis uniform are explicit inputs, the leapfrog count is
-static, and `replica` maps that scalar kernel across chains. This is a scoped
-compatibility statement, not a claim that arbitrary mutable or reactive state
+The optional external adaptive-NUTS exemplar compiles one full-depth transition
+to one data-dependent traced `while` and uses pre-generated momentum, direction,
+and exponential tensors plus explicit counters, so there is no host RNG inside
+the trace. This is a deliberately narrow compiler-acceptance path: it is
+scoped to `Float64`, a positive diagonal Euclidean metric, the locked authored
+control-flow graph, and the current diagnostics callback. Overflow and
+unsupported cases reject; the native adaptive API remains CPU execution.
+
+The source authority is
+[`examples/nuts_runtime/kernel_nuts_reactant.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/nuts_runtime/kernel_nuts_reactant.jl),
+and
+[`test/test_kernel_nuts_reactant.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/test/test_kernel_nuts_reactant.jl)
+is the executable acceptance authority. The test requires one `stablehlo.while`
+and checks the native oracle, random-input counters, divergence/nonfinite paths,
+and fail-closed specialization guards.
+
+The simpler fixed-step HMC kernel in
+[`examples/hmc.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/hmc.jl)
+also keeps momentum and its Metropolis uniform explicit, uses a static leapfrog
+count, and lets `replica` map the scalar kernel across chains. These are scoped
+compatibility statements, not a claim that arbitrary mutable or reactive state
 machines are accelerator compatible.
 
 ## The mathematical UX — what you write

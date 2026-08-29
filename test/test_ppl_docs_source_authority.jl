@@ -59,7 +59,8 @@ const PPL_SOURCE_CASES = (
     helper_source = read(
         joinpath(@__DIR__, "..", "docs", "kernel_examples.jl"), String,
     )
-    @test occursin("warnonly = Documenter.except(:eval_block)", make_source)
+    @test occursin("warnonly = false", make_source)
+    @test !occursin("warnonly = Documenter.except(:eval_block)", make_source)
     @test occursin("assert_ppl_examples_executed!()", make_source)
     @test occursin("ReactiveKernels._readable_expr", helper_source)
     @test occursin("readable generated view retained an opaque operation slot",

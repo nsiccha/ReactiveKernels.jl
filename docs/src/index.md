@@ -140,10 +140,15 @@ staying outside the generated kernel.
 Mathematical `PreparedKernel`s that Reactant can trace can also run on a GPU or
 TPU through the optional Reactant extension, and `replica` runs a whole scalar
 kernel across an extra batch axis (for example one column per chain). This is
-narrower than “run any reactive state on an accelerator”: fixed-step HMC works
-because its loop always runs the same number of steps, while
-[adaptive NUTS](nuts.md#reactant-and-multiple-chains) stays on the CPU because
-how far it walks each step, and its random draws, depend on the data.
+narrower than “run any reactive state on an accelerator.” The optional external
+[adaptive-NUTS exemplar](nuts.md#reactant-adaptive-transition-and-multiple-chains)
+compiles one full-depth transition to one data-dependent traced `while`, with
+pre-generated momentum, direction, and exponential tensors plus explicit
+counters, so there is no host RNG inside the trace. It is scoped to `Float64`, a
+positive diagonal Euclidean metric, the locked authored control-flow graph, and
+the current diagnostics callback. Overflow and unsupported cases reject; the
+native adaptive API remains CPU execution. Its example source and executable
+acceptance test are linked from the focused NUTS page.
 
 > **Status:** early development — the public API is still being shaped.
 

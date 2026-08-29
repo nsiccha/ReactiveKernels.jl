@@ -7,14 +7,17 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     page_path = joinpath(root, "docs", "src", "compiler.md")
     make_path = joinpath(root, "docs", "make.jl")
     index_path = joinpath(root, "docs", "src", "index.md")
+    readme_path = joinpath(root, "README.md")
 
     @test isfile(page_path)
     page = _compiler_docs_lf(read(page_path, String))
     make = _compiler_docs_lf(read(make_path, String))
     index = _compiler_docs_lf(read(index_path, String))
+    readme = _compiler_docs_lf(read(readme_path, String))
 
     @test occursin("\"Compiler capability and limits\" => \"compiler.md\"", make)
     @test occursin("compiler.md", index)
+    @test occursin("warnonly = false", make)
 
     nuts = _compiler_docs_lf(read(joinpath(root, "docs", "src", "nuts.md"), String))
     @test occursin("not an RK package API", nuts)
@@ -22,6 +25,33 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     @test occursin("The former `@rk_pure`,", nuts)
     @test occursin("declarations have been removed", nuts)
     @test occursin("The verbatim source below is the macro-free executable fixture", nuts)
+
+    # Keep every public entry point aligned with the executable Reactant
+    # acceptance boundary instead of reviving the obsolete CPU-only claim.
+    for public_source in (readme, nuts, index)
+        public_page = replace(public_source, r"(?m)^>\s?" => "")
+        public_page = replace(public_page, r"\s+" => " ")
+        for claim in (
+            "optional external",
+            "one full-depth transition",
+            "one data-dependent traced `while`",
+            "pre-generated momentum, direction, and exponential tensors",
+            "no host RNG inside the trace",
+            "`Float64`",
+            "positive diagonal Euclidean metric",
+            "locked authored control-flow graph",
+            "current diagnostics callback",
+            "Overflow and unsupported cases reject",
+            "native adaptive API remains CPU execution",
+        )
+            @test occursin(claim, public_page)
+        end
+    end
+    @test !occursin("adaptive NUTS remains CPU-only", readme)
+    @test !occursin("Adaptive NUTS is currently a CPU sampler", nuts)
+    @test !occursin("stays on the CPU because", index)
+    @test occursin("examples/nuts_runtime/kernel_nuts_reactant.jl", nuts)
+    @test occursin("test/test_kernel_nuts_reactant.jl", nuts)
 
     for heading in (
         "## The stateless compiler",
