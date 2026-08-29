@@ -183,6 +183,14 @@ must be explicit.
 Composition does not resolve same-name type disagreements, rename ports, infer
 adapter recipes, or merge incompatible call signatures semantically.
 
+A direct stateless `KernelSpec` call in another stateless `@kernel` is the
+call-site-oriented composition form. Each call clones the nested graph with
+fresh value identities and aliases its typed default HAVE/WANT boundary to the
+arguments and assignment outputs. This permits repeated calls without internal
+name collisions and leaves no residual runtime call: planning, CSE, lowering,
+reactive preparation, visualization, batching, and AD all operate on the one
+fused graph.
+
 ## Batch and replica lowering
 
 ### Plate: fuse a scalar density across observations

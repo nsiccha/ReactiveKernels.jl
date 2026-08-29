@@ -113,6 +113,43 @@ the base boundary by default. That makes an extended kernel a drop-in for the
 base while extra requested outputs opt into extra work. The explicit
 `boundary = :fragment` option replaces both defaults when that is intentional.
 
+## Reuse a kernel inside another kernel
+
+```julia
+@kernel unit_interval(x::Float64) = begin
+    magnitude::Float64 = abs(x)
+    tail::Float64 = exp(-magnitude)
+    probability::Float64 = x >= 0 ? inv(1 + tail) : tail / (1 + tail)
+    log_normalizer::Float64 = log1p(tail)
+    log_probability::Float64 = x >= 0 ? -log_normalizer : x - log_normalizer
+    log_complement::Float64 = x >= 0 ? -x - log_normalizer : -log_normalizer
+    log_jacobian::Float64 = log_probability + log_complement
+    return (probability, log_jacobian)
+end
+
+@kernel transformed_model(x::Float64) = begin
+    (probability::Float64, log_jacobian::Float64) = unit_interval(x)
+    score::Float64 = probability + log_jacobian
+    return (probability, log_jacobian, score)
+end
+```
+
+A direct call to a stateless `KernelSpec` inside another stateless `@kernel`
+is a graph-construction operation, not a runtime call. RK gives every call site
+fresh internal value identities, binds the nested HAVE/WANT boundary to the
+call arguments and assignment outputs, and splices the recipes into the outer
+graph. Preparing only `:probability` therefore omits the logarithmic path;
+preparing only `:log_jacobian` omits the probability recipe; requesting both
+shares `magnitude` and `tail`. The generated kernel contains no nested call.
+
+Nested graph calls currently take all default HAVE boundary ports positionally
+(supply optional positional values explicitly), must destructure the nested
+output boundary exactly, and require exact declared types at the outer input
+and output ports. Arguments are existing graph ports; assign a larger expression
+to its own recipe first. Put `@recipe` metadata inside the reusable kernel rather
+than on the call site. Each restriction is checked while the outer graph is
+constructed.
+
 ## See the selected DAG
 
 ```julia
