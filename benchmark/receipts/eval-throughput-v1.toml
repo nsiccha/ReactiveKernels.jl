@@ -1,0 +1,200 @@
+generated_at = "2026-08-28T15:13:29.572Z"
+schema = "eval-throughput-v1"
+
+[environment]
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+julia_threads = 1
+os = "Linux"
+reactant_backend = "default CPU"
+
+[[measurements]]
+implementation = "reactivekernels"
+median_ns = 45.426513671875
+mode = "primal"
+size = 16
+variant = "native"
+[[measurements]]
+implementation = "reactivekernels"
+median_ns = 3560.234375
+mode = "primal"
+size = 16
+variant = "reactant"
+[[measurements]]
+implementation = "turing"
+median_ns = 121.33984374999999
+mode = "primal"
+size = 16
+variant = "native"
+[[measurements]]
+implementation = "reactivekernels"
+median_ns = 111.2666015625
+mode = "gradient"
+size = 16
+variant = "native"
+[[measurements]]
+implementation = "reactivekernels"
+median_ns = 3243.375
+mode = "gradient"
+size = 16
+variant = "reactant"
+[[measurements]]
+implementation = "turing"
+median_ns = 523.49609375
+mode = "gradient"
+size = 16
+variant = "native"
+[[measurements]]
+implementation = "reactivekernels"
+median_ns = 32.694091796875
+mode = "gq"
+size = 16
+variant = "native"
+[[measurements]]
+implementation = "reactivekernels"
+median_ns = 3197.078125
+mode = "gq"
+size = 16
+variant = "reactant"
+[[measurements]]
+implementation = "turing"
+median_ns = 66.7529296875
+mode = "gq"
+size = 16
+variant = "native"
+[[measurements]]
+implementation = "reactivekernels"
+median_ns = 163.271484375
+mode = "primal"
+size = 256
+variant = "native"
+[[measurements]]
+implementation = "reactivekernels"
+median_ns = 17133.75
+mode = "primal"
+size = 256
+variant = "reactant"
+[[measurements]]
+implementation = "turing"
+median_ns = 629.421875
+mode = "primal"
+size = 256
+variant = "native"
+[[measurements]]
+implementation = "reactivekernels"
+median_ns = 800.55859375
+mode = "gradient"
+size = 256
+variant = "native"
+[[measurements]]
+implementation = "reactivekernels"
+median_ns = 17253.8125
+mode = "gradient"
+size = 256
+variant = "reactant"
+[[measurements]]
+implementation = "turing"
+median_ns = 4587.5625
+mode = "gradient"
+size = 256
+variant = "native"
+[[measurements]]
+implementation = "reactivekernels"
+median_ns = 166.646484375
+mode = "gq"
+size = 256
+variant = "native"
+[[measurements]]
+implementation = "reactivekernels"
+median_ns = 10657.1875
+mode = "gq"
+size = 256
+variant = "reactant"
+[[measurements]]
+implementation = "turing"
+median_ns = 410.37109375
+mode = "gq"
+size = 256
+variant = "native"
+[[measurements]]
+implementation = "reactivekernels"
+median_ns = 1640.078125
+mode = "primal"
+size = 4096
+variant = "native"
+[[measurements]]
+implementation = "reactivekernels"
+median_ns = 18239.5
+mode = "primal"
+size = 4096
+variant = "reactant"
+[[measurements]]
+implementation = "turing"
+median_ns = 4100.328125
+mode = "primal"
+size = 4096
+variant = "native"
+[[measurements]]
+implementation = "reactivekernels"
+median_ns = 9960.625
+mode = "gradient"
+size = 4096
+variant = "native"
+[[measurements]]
+implementation = "reactivekernels"
+median_ns = 11637.3125
+mode = "gradient"
+size = 4096
+variant = "reactant"
+[[measurements]]
+implementation = "turing"
+median_ns = 27247.5
+mode = "gradient"
+size = 4096
+variant = "native"
+[[measurements]]
+implementation = "reactivekernels"
+median_ns = 1340.16796875
+mode = "gq"
+size = 4096
+variant = "native"
+[[measurements]]
+implementation = "reactivekernels"
+median_ns = 10155.25
+mode = "gq"
+size = 4096
+variant = "reactant"
+[[measurements]]
+implementation = "turing"
+median_ns = 2766.3125
+mode = "gq"
+size = 4096
+variant = "native"
+
+[pins]
+differentiationinterface_version = "0.7.21"
+distributions_version = "0.25.131"
+dynamicppl_version = "0.42.6"
+enzyme_version = "0.13.199"
+julia_version = "1.10.11"
+reactant_version = "0.2.278"
+reactivekernels_sha = "3a82a375f5f3603198c291dfbd4eb5562df4f435"
+reactivekernels_version = "0.1.0"
+turing_version = "0.47.1"
+
+[protocol]
+element_type = "Float64"
+estimator = "minimum per-call time over rounds of an auto-sized inner batch"
+gq_definition = "pointwise log densities (vector)"
+gradient_backend = "reverse-mode Enzyme via DifferentiationInterface"
+gradient_wrt = "x"
+model = "iid Normal log density of a position vector x given fixed (mu, log-sigma)"
+modes = ["primal", "gradient", "gq"]
+reactant_compile_time_in_timed_region = false
+reactant_sync = true
+reactant_transfers_included = false
+rounds = 60
+
+[support]
+turing_reactant = false
+turing_reactant_reason = "Turing's DynamicPPL evaluation re-runs the model and is not a straight-line array program, so it is not Reactant-traceable."
