@@ -45,6 +45,7 @@ function check_rendered_docs(build_dir, page_tree)
     expected_panels = Dict(
         "distributions.md" => 11,
         "batched.md" => 1,
+        "bijectors.md" => 1,
         "nuts.md" => 2,
         "eight-schools.md" => 1,
         "linear-regression.md" => 1,
