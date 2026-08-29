@@ -17,13 +17,13 @@ hero:
 
 features:
   - title: Plan once, run millions of times
-    details: Preparation prunes to exactly the computations needed to turn have into want, selects among alternative producers, and does graph-level CSE — then emits ordinary Julia via RuntimeGeneratedFunctions.
-  - title: The graph is compile-time, not a scheduler
-    details: The prepared kernel is straight-line code. Reactive invalidation and cache bookkeeping live outside the hot kernel, never inside it.
-  - title: Optional cache-filling lowering
-    details: prepare_nonallocating applies a final MutatingFunctions-backed AST rewrite, keeping mutation and allocation behavior independent of graph semantics.
+    details: Preparation keeps exactly the steps needed to turn what you have into what you want, picks between alternative ways to compute a value, and reuses shared subexpressions — then generates an ordinary Julia function.
+  - title: A prepared kernel is just straight-line code
+    details: While it runs there is no graph to walk, nothing to schedule, and no cache to look up. All of that bookkeeping happens once, during preparation, not on every call.
+  - title: Optional buffer-reusing execution
+    details: prepare_nonallocating rewrites the generated function to reuse the same arrays across calls, so how much it allocates is separate from what the graph computes.
   - title: Deliberately narrow
-    details: No dynamic scheduling in a prepared hot kernel, no AD, no PPL semantics, no symbolic algebra. It generates excellent plain Julia kernels for pure dataflow graphs and rejects unproved effects in captured state-machine source.
+    details: No scheduler inside a prepared kernel, no automatic differentiation, no probabilistic-programming semantics, no symbolic algebra. It turns pure dataflow graphs into fast plain-Julia functions, and refuses code whose side effects it cannot check.
 ---
 ```
 
@@ -56,44 +56,45 @@ end
 prepare(affine)(3; offset = 4)  # 10
 ```
 
-The definition has ordinary function syntax, as in ReactiveObjects.jl, and its
-signature is the default input boundary. Functions are ordinary input ports:
-`f` and `h` execute only when the prepared kernel is called. Type annotations
-are optional metadata; omitting them does not prevent the generated function
-from specializing on concrete runtime values. Every named value is exposed as
+The definition uses ordinary function syntax (as in ReactiveObjects.jl), and
+its argument list is the default set of inputs. Functions like `f` and `h` are
+inputs too: they run only when the prepared kernel is called. Type annotations
+are optional; leaving them off does not stop the generated function from
+specializing on the concrete values you pass. Every named value is reachable as
 a port (`model.f`, `model.x`, `model.a`, `model.out`). With no explicit
-`return`, derived sinks such as `out` are the default output boundary; a
-`return` may select a different default without hiding anything. Declarations,
-intermediates, and alternative producers may be forward-referenced; tuple
-assignment is one multi-output recipe, and
-`@recipe (cost = ..., cse_key = ...)` exposes the existing planner metadata
-without dropping to the low-level builder.
+`return`, the derived values such as `out` are the default outputs; a `return`
+can pick different defaults without hiding any port. You may refer to a value
+before the line that defines it, a tuple assignment is one recipe with several
+outputs, and `@recipe (cost = ..., cse_key = ...)` sets a recipe's cost and
+reuse hints without dropping to the lower-level graph API.
 
 Trailing positional defaults and fixed keyword arguments follow ordinary Julia
-call syntax. Defaults are evaluated only when omitted, may refer to earlier
-arguments, and remain exposed input ports alongside required arguments. A
-keyword without a default is required. The prepared call adapter resolves the
-signature before entering the same generated positional kernel.
+call syntax. A default is evaluated only when you omit that argument, may refer
+to earlier arguments, and stays an input port like the required ones. A keyword
+with no default is required. The prepared kernel resolves the call signature
+before handing off to the same generated function underneath.
 
-A recipe right-hand side is ordinary Julia. Each recipe compiles into an opaque
-operation closed over its free ports, so control-flow and scoping forms —
-`try`/`catch`/`finally`, `let`, comprehensions, and `do` blocks — run as plain
-Julia inside that operation. Free-port detection flows through them, so a port
-used only inside a `try`, `let`, or comprehension is still discovered as a
-dependency, and a `catch` variable that happens to share a port's name is
-renamed so it never shadows the port. This is safe precisely because the recipe
-is opaque: there is no reactive invalidation to track through the branch. It is
-the deliberate contrast with an invalidation-tracked reactive method body, where
-deferred or exception-conditional execution would defeat field-level
-invalidation and these forms are therefore rejected.
+The right-hand side of a recipe is ordinary Julia. Each recipe becomes a single
+function that closes over the ports it reads, so control-flow and scoping forms
+— `try`/`catch`/`finally`, `let`, comprehensions, and `do` blocks — run as plain
+Julia inside it. RK still finds the ports a recipe depends on even when they are
+used only inside a `try`, `let`, or comprehension, and it renames a `catch`
+variable that happens to match a port name so the two never collide. This works
+because RK treats each recipe as a black box: it does not track changes line by
+line inside the recipe, it just reruns the whole recipe when one of its inputs
+changes. The reactive method bodies on the [compiler](compiler.md) page are the
+opposite case — there RK tracks changes field by field, so deferred or
+exception-conditional execution would break that tracking, and those forms are
+rejected.
 
-This methodless form authors a graph, not a per-kernel object type. Compiled
-reactive state supports source mutation through `set!`, `mutate!`, and `touch!`.
-Method-bearing `@kernel` definitions enter a separate captured-source compiler
-with an implicit receiver and an exact registered-effect boundary; they are not
-ordinary stateless recipes. The [compiler capability and limits](compiler.md)
-page gives the full planner, lowering, state, control-flow, NUTS, and rejection
-contracts.
+This function-shaped form describes a graph, not a new object type. Compiled
+reactive state lets you change inputs in place through `set!`, `mutate!`, and
+`touch!`. A `@kernel` that contains its own inner methods is handled by a
+separate, stricter compiler: it reads the method source directly and only allows
+calls whose effects it can account for, so it is not an ordinary stateless
+recipe.
+The [compiler capability and limits](compiler.md) page covers the full planning,
+code-generation, state, control-flow, NUTS, and rejection rules.
 
 ## Extend by named ports
 
@@ -130,18 +131,19 @@ bundle those libraries locally; standalone HTML retains the dependency-free SVG
 fallback. DOT export is available when a downstream tool needs Graphviz-quality
 publication layout.
 
-A second mode is **incremental / demand-driven** execution: previously
-materialized values join the effective `have` set, changed source values
-invalidate only the cached results whose provenance actually depended on them,
-and the same planner prepares and runs just the missing computation — all cache
-bookkeeping staying outside the generated kernel.
+A second mode is **incremental**, demand-driven execution: values you have
+already computed count as things you now `have`, changing a source input
+invalidates only the cached results that actually depended on it, and the
+planner reruns just the missing part — with all of that cache bookkeeping
+staying outside the generated kernel.
 
-Traceable mathematical `PreparedKernel`s can also run through the optional
-Reactant extension, and `replica` maps a complete scalar kernel across a trailing
-replica axis. That support is deliberately narrower than “all reactive state on
-an accelerator”: fixed-step HMC traces because its loop is static, while
-[adaptive NUTS](nuts.md#reactant-and-multiple-chains) remains a CPU sampler because
-tree termination and host RNG are data dependent.
+Mathematical `PreparedKernel`s that Reactant can trace can also run on a GPU or
+TPU through the optional Reactant extension, and `replica` runs a whole scalar
+kernel across an extra batch axis (for example one column per chain). This is
+narrower than “run any reactive state on an accelerator”: fixed-step HMC works
+because its loop always runs the same number of steps, while
+[adaptive NUTS](nuts.md#reactant-and-multiple-chains) stays on the CPU because
+how far it walks each step, and its random draws, depend on the data.
 
 > **Status:** early development — the public API is still being shaped.
 
