@@ -2,7 +2,7 @@ using Test
 
 _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
 
-@testset "compiler capability page is navigated, explicit, and code-free" begin
+@testset "compiler capability page is navigated, explicit, and prose-first" begin
     root = joinpath(@__DIR__, "..")
     page_path = joinpath(root, "docs", "src", "compiler.md")
     make_path = joinpath(root, "docs", "make.jl")
@@ -18,8 +18,9 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
 
     nuts = _compiler_docs_lf(read(joinpath(root, "docs", "src", "nuts.md"), String))
     @test occursin("not an RK package API", nuts)
-    @test occursin("External example only", nuts)
-    @test occursin("The former `@rk_pure` / `@rk_borrows` / `@rk_rng` declarations no longer exist", nuts)
+    @test occursin("external NUTS compiler-acceptance exemplar", nuts)
+    @test occursin("The former `@rk_pure`,", nuts)
+    @test occursin("declarations have been removed", nuts)
     @test occursin("The verbatim source below is the macro-free executable fixture", nuts)
 
     for heading in (
@@ -43,14 +44,17 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
         "a bare `using ReactiveKernels` does not load or\nexport them",
         "former `@rk_pure`, `@rk_borrows`, and `@rk_rng` declarations have\nbeen removed",
         "`@node` is unrelated to this removal boundary",
-        "NUTS, log-density, or PPL domain API",
-        "General Julia compiler replacement",
+        "NUTS, log-density, and\nPPL artifacts are external compilation examples and acceptance evidence",
+        "not** a general Julia-recursion compiler proof",
     )
         @test occursin(contract, page)
     end
 
-    # The compiler specification is deliberately algorithmic prose plus an API
-    # table. Executable/source examples belong on the focused example pages.
-    @test !occursin("```", page)
+    # The compiler specification is deliberately algorithmic prose plus three
+    # build-executed result/API panels. Source-code examples remain on the
+    # focused example pages.
+    @test count(==("```@eval"), split(page, '\n')) == 3
+    @test count(==("```"), split(page, '\n')) == 3
+    @test !occursin("```julia", page)
     @test !occursin("~~~", page)
 end
