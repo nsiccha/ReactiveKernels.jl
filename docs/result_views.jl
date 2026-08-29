@@ -21,6 +21,9 @@ const _SCALAR_GALLERY_RECEIPT_PATH = joinpath(
 const _NUTS_G7_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts", "nuts-g7-v1.toml",
 )
+const _NUTS_REACTANT_RECEIPT_PATH = joinpath(
+    dirname(@__DIR__), "benchmark", "receipts", "nuts-reactant-v1.toml",
+)
 
 _node_html(node) = sprint(show, MIME"text/html"(), node; context = :limit => false)
 
@@ -706,10 +709,17 @@ function render_nuts_status()
              h.strong("External example only. "),
              "It uses compiled-reactive Hamiltonian dependencies with ordinary inferred Julia recursion and proposal scratch; it is neither loaded nor exported by ReactiveKernels and is not the sealed fixture artifact.",
          )),
+        (title = "Adaptive transition through Reactant",
+         body = h.p(
+             h.strong("Compiled and measured. "),
+             "The accepted full-depth transition lowers to one data-dependent ",
+             h.code("stablehlo.while"),
+             ". Its separate matched native/Reactant receipt reports synchronous CPU wall time, work-normalized leapfrog throughput, and compile latency without claiming a speedup.",
+         )),
         (title = "End-to-end sampling time and ESS",
          body = h.p(
-             h.strong("Not measured for the current sealed-native path. "),
-             "The receipt-backed comparison below is work-normalized inner-loop throughput only; it supports no ESS or wall-time claim.",
+             h.strong("Not measured. "),
+             "The native G7 receipt is work-normalized inner-loop throughput. The Reactant receipt measures matched full-transition execution but excludes adaptation, retained draws, transfers, and ESS; neither supports a time-to-effective-sample claim.",
          )),
     ]
     Markdown.MD(Any[_static_block(_status_cards(rows))])
@@ -778,6 +788,113 @@ function render_nuts_g7_benchmark()
         _result_table(rows, columns; id = "nuts-g7-table",
             title = "Exact G7 receipt values",
             note = "Select a column heading to sort. RK ÷ sampler is RK's median divided by that sampler's median."),
+        _static_block(provenance),
+    ])
+end
+
+"""Render the frozen matched native/Reactant adaptive-NUTS receipt."""
+function render_nuts_reactant_benchmark()
+    receipt = TOML.parsefile(_NUTS_REACTANT_RECEIPT_PATH)
+    get(receipt, "schema", "") == "nuts-reactant-v1" ||
+        error("unexpected Reactant NUTS benchmark receipt schema")
+    pins = receipt["pins"]
+    get(pins, "reactivekernels_dirty", true) == false ||
+        error("Reactant NUTS receipt was produced from a dirty checkout")
+    protocol = receipt["protocol"]
+    get(protocol, "reactant_sync", false) ||
+        error("Reactant NUTS receipt is not synchronous")
+    get(protocol, "max_depth", 0) == 10 ||
+        error("Reactant NUTS receipt does not exercise max_depth=10")
+    acceptance = receipt["acceptance"]
+    get(acceptance,
+        "per_transition_tolerance_bounded_phase_diagnostic_parity", false) ||
+        error("Reactant NUTS receipt lacks tolerance-bounded floating parity")
+    get(acceptance, "exact_control_and_random_consumption_parity", false) ||
+        error("Reactant NUTS receipt lacks exact control/random-consumption parity")
+    get(acceptance, "matched_control_flow_corpus", false) ||
+        error("Reactant NUTS receipt is not a matched-control corpus")
+    get(acceptance, "parity_screening_reported", false) ||
+        error("Reactant NUTS receipt does not report parity screening")
+    get(acceptance, "all_overflow_flags_zero", false) ||
+        error("Reactant NUTS receipt has a capacity overflow")
+    get(acceptance, "stablehlo_while_count", 0) == 1 ||
+        error("Reactant NUTS receipt does not contain exactly one stablehlo.while")
+
+    medians = receipt["medians"]
+    native_ms = Float64(medians["native_transition_ms"])
+    reactant_ms = Float64(medians["reactant_transition_ms"])
+    native_steps = Float64(medians["native_steps_per_second"])
+    reactant_steps = Float64(medians["reactant_steps_per_second"])
+    time_ratio = Float64(medians["reactant_over_native_transition_time"])
+    throughput_ratio = Float64(medians["reactant_over_native_steps_per_second"])
+    rows = [
+        (backend = "Native source compiler", transition_ms = native_ms,
+         steps_per_second = native_steps, relative_time = 1.0),
+        (backend = "Reactant (CPU)", transition_ms = reactant_ms,
+         steps_per_second = reactant_steps, relative_time = time_ratio),
+    ]
+    spec = data(rows) *
+        mapping(:backend => "Backend", :transition_ms => "Median transition time (ms)") *
+        visual(BarPlot) *
+        config(height = 280, scales = scales(Y = (; scale = log10)))
+    columns = (
+        _column(:backend, "Backend"),
+        _column(:transition_ms, "Median transition";
+            format = (value, _) -> string(round(value; sigdigits=4), " ms")),
+        _column(:steps_per_second, "Leapfrog steps/s";
+            format = (value, _) -> string(round(Int, value))),
+        _column(:relative_time, "Time ÷ native";
+            format = (value, _) -> string(round(value; digits=1), "×")),
+    )
+
+    compilation = receipt["compilation"]
+    compile_rows = [
+        (stage = "Native source compile + first Julia JIT",
+         seconds = Float64(compilation["native_seconds"])),
+        (stage = "Native first execution",
+         seconds = Float64(compilation["native_first_execution_seconds"])),
+        (stage = "Reactant host lowering",
+         seconds = Float64(compilation["reactant_lower_seconds"])),
+        (stage = "Reactant XLA compile",
+         seconds = Float64(compilation["reactant_xla_seconds"])),
+        (stage = "Reactant first synchronous execution",
+         seconds = Float64(compilation["reactant_first_execution_seconds"])),
+    ]
+    compile_columns = (
+        _column(:stage, "Stage"),
+        _column(:seconds, "Elapsed";
+            format = (value, _) -> string(round(value; sigdigits=4), " s")),
+    )
+    summary = "On this frozen CPU receipt, Reactant took " *
+        "$(round(time_ratio; digits=1))× the native per-transition time " *
+        "($(round(reactant_ms; sigdigits=4)) ms vs $(round(native_ms; sigdigits=4)) ms) " *
+        "and delivered $(round(reactant_steps; sigdigits=4)) vs " *
+        "$(round(native_steps; sigdigits=4)) leapfrog steps/s " *
+        "($(round(throughput_ratio; sigdigits=4))× native). This is a measured slowdown, not a speedup claim or an inherent limit on batched/loop-amortized execution."
+    caption = "Frozen $(protocol["target"]), $(protocol["metric"]), step size " *
+        "$(protocol["stepsize"]), max depth $(protocol["max_depth"]), " *
+        "$(protocol["rounds"]) rounds × $(protocol["transitions_per_round"]) independent full transitions from matched starting states. " *
+        "Both arms consume identical pre-generated random bundles; $(protocol["candidate_bundles_rejected"]) of $(protocol["candidate_bundles_examined"]) deterministic candidates were excluded outside timing after backend-sensitive transition parity mismatches. Floating phase/diagnostic values use atol=$(protocol["floating_parity_absolute_tolerance"]) and rtol=$(protocol["floating_parity_relative_tolerance"]); controls and random consumption match exactly. Timings exclude compilation, corpus screening, state setup, transfers, RNG generation, rebundling, and readback."
+    provenance = h.p(; class = "rk-result-provenance")(
+        "Sources: ",
+        h.a(h.code("benchmark/receipts/nuts-reactant-v1.toml");
+            href = "https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/nuts-reactant-v1.toml"),
+        " generated by ",
+        h.a(h.code("benchmark/nuts_reactant_comparison.jl");
+            href = "https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/nuts_reactant_comparison.jl"),
+        ". Pins: Reactant $(pins["reactant_version"]), Reactant_jll $(pins["reactant_jll_version"]), Julia $(pins["julia_version"]), RK $(first(String(pins["reactivekernels_sha"]), 7)).",
+    )
+
+    Markdown.MD(Any[
+        Markdown.Paragraph(Any[summary]),
+        _plot_block(spec; id = "nuts-reactant-transition-time",
+            title = "Matched adaptive-NUTS transition time", description = caption),
+        _result_table(rows, columns; id = "nuts-reactant-table",
+            title = "Receipt medians for the matched-control corpus",
+            note = "This is a matched-control microbenchmark, not sampler throughput. The logarithmic plot keeps both measured arms visible. Lower transition time and higher leapfrog steps/s are better."),
+        _result_table(compile_rows, compile_columns; id = "nuts-reactant-compile-table",
+            title = "Compilation and first-call costs",
+            note = "Compile order is native source compiler, Reactant lowering, then Reactant XLA. These values are reported separately and are not in steady-state timing."),
         _static_block(provenance),
     ])
 end

@@ -60,16 +60,21 @@ function check_rendered_docs(build_dir, page_tree)
         "compiler.md" => 1,
         "distributions.md" => 6,
         "eval-throughput.md" => 1,
-        "nuts.md" => 1,
+        "nuts.md" => 3,
     )
     expected_aov_panels = Dict(
         "batched.md" => 1,
         "distributions.md" => 9,
-        "nuts.md" => 1,
+        "nuts.md" => 2,
     )
     structural_markers = Dict(
         "compiler.md" => ("class=\"rk-pipeline\"",),
-        "nuts.md" => ("class=\"rk-status-grid\"", "Full compiled NUTS kernel"),
+        "nuts.md" => (
+            "class=\"rk-status-grid\"",
+            "Full compiled NUTS kernel",
+            "Receipt medians for the matched-control corpus",
+            "Compilation and first-call costs",
+        ),
         "visualization.md" =>
             ("class=\"rk-dag-legend\"", "class=\"rk-comparison-grid\""),
     )

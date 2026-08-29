@@ -623,10 +623,10 @@ function nuts_reactant_rebundle(st, bundle)
                ndirs=bundle.ndirs, nexps=bundle.nexps))
 end
 
-function nuts_reactant_compile(C::_CompiledNutsReactant, state)
+function nuts_reactant_compile(C::_CompiledNutsReactant, state; sync::Bool=false)
     ext = Base.get_extension(@__MODULE__, :ReactiveKernelsReactantExt)
     ext === nothing && throw(ArgumentError("nuts_reactant_compile requires loading Reactant"))
-    ext.compile_nuts_reactant_executable(C.transition, state)
+    ext.compile_nuts_reactant_executable(C.transition, state; sync)
 end
 
 function nuts_reactant_writeback!(fr, st)
