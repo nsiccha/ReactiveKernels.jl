@@ -44,13 +44,25 @@ const _NR_PF = ReactiveKernels._prepare_factory(
     _NR_FIX.euclidean_phasepoint,
     ReactiveKernels.kernel_registration(_NR_FIX.leapfrog!))
 
-function _nr_test_values(::Type{T}; metric=T[2 0; 0 2]) where {T}
+_nr_quadratic_pot(p) = sum(abs2, p)
+function _nr_quadratic_grad!(dst, p)
+    dst .= 2 .* p
+    sum(abs2, p)
+end
+_nr_nan_pot(p) = oftype(sum(abs2, p), NaN)
+function _nr_nan_grad!(dst, p)
+    fill!(dst, zero(eltype(dst)))
+    oftype(sum(abs2, p), NaN)
+end
+
+function _nr_test_values(::Type{T}; metric=T[2 0; 0 2],
+        pot_f=_nr_quadratic_pot, grad_f=_nr_quadratic_grad!) where {T}
     values = Dict{Int,Any}()
     for slot in ReactiveKernels.kernel_plan_slots(
             ReactiveKernels.kernel_prepared_plan(_NR_PF))
         name = String(slot.path[1])
-        values[slot.canon] = name == "pot_f" ? (p -> sum(abs2, p)) :
-            name == "grad_f" ? ((dst, p) -> (dst .= 2 .* p; sum(abs2, p))) :
+        values[slot.canon] = name == "pot_f" ? pot_f :
+            name == "grad_f" ? grad_f :
             name == "metric" ? metric :
             name == "chol_metric" ? cholesky(metric) :
             startswith(name, "##node") ? zero(T) :
@@ -63,9 +75,10 @@ function _nr_test_values(::Type{T}; metric=T[2 0; 0 2]) where {T}
 end
 
 function _nr_test_frame(::Type{T}, max_depth;
-        metric=T[2 0; 0 2], min_dham=T(-1000)) where {T}
+        metric=T[2 0; 0 2], min_dham=T(-1000),
+        pot_f=_nr_quadratic_pot, grad_f=_nr_quadratic_grad!) where {T}
     frame = ReactiveKernels._construct_nuts_frame(
-        _NR_PF, _nr_test_values(T; metric), max_depth;
+        _NR_PF, _nr_test_values(T; metric, pot_f, grad_f), max_depth;
         step_f=ReactiveKernels.partial(_NR_FIX.leapfrog!; stepsize=T(0.1)),
         stats_f=_NR_FIX.nuts_stats!, min_dham)
     ReactiveKernels.compile_prepared_initialization(
@@ -302,6 +315,36 @@ end
         @test Array(reset_output.dham)[1] == 0.0
         @test Array(reset_output.diverged)[1] == 1
         @test _nr_reactant_matches_oracle(expected, reset_output, directions, exponentials)
+    end
+
+    @testset "repeated nonfinite leaves retain negative-infinity sentinel" begin
+        bundle = ReactiveKernels.nuts_reactant_bundle(
+            [1.0, 0.5], [false, false], [1.0, 1.0, 1.0], 2)
+        native_frame = _nr_test_frame(Float64, 2;
+            min_dham=-Inf, pot_f=_nr_nan_pot, grad_f=_nr_nan_grad!)
+        _nr_replay_native!(native_frame, bundle, [false, false], [1.0, 1.0, 1.0])
+
+        traced_frame = _nr_test_frame(Float64, 2;
+            min_dham=-Inf, pot_f=_nr_nan_pot, grad_f=_nr_nan_grad!)
+        nonfinite_compiled = ReactiveKernels.compile_nuts_reactant(
+            _NR_PF, _NR_FIX.nuts_state, _NR_FIX.refresh_momentum!!,
+            _NR_FIX.nuts!!, traced_frame)
+        state = map(Reactant.to_rarray, ReactiveKernels.nuts_reactant_state(
+            nonfinite_compiled, traced_frame, bundle))
+        executable = ReactiveKernels.nuts_reactant_compile(nonfinite_compiled, state)
+        output = executable(state)
+
+        @test native_frame.diag.dham == -Inf
+        @test !native_frame.diverged
+        @test native_frame.diag.n_steps == 3
+        @test native_frame.diag.reached_depth == 2
+        @test Array(output.dham)[1] == native_frame.diag.dham == -Inf
+        @test Bool(Array(output.diverged)[1]) == native_frame.diverged == false
+        @test Array(output.n_steps)[1] == native_frame.diag.n_steps == 3
+        @test Array(output.reached_depth)[1] == native_frame.diag.reached_depth == 2
+        @test Array(output.kd)[1] == 2
+        @test Array(output.ke)[1] == 3
+        @test all(iszero, Array(output.overflow))
     end
 
     @testset "unsupported specializations reject" begin

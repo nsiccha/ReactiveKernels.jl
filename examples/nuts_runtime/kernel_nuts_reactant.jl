@@ -262,7 +262,9 @@ function _nr_branch(st, ::Val{kind}, ::Val{pg}, d, e, active, ONE, cs) where {ki
             st.may_continue .!= 0, st
         elseif pg == 7
             diff = st.lw1[d] .- st.lw2[d]
-            consume = active .& (diff .<= 0)
+            # The authored `diff > 0 || -randexp(rng) < diff` consumes whenever
+            # `diff > 0` is false, including an unordered NaN from `-Inf - -Inf`.
+            consume = active .& .!(diff .> 0)
             ex, st = _nr_draw_exp(st, consume, ONE)
             ifelse.(diff .> 0, ONE .!= 0, (-ex) .< diff), st
         else
@@ -284,7 +286,7 @@ function _nr_branch(st, ::Val{kind}, ::Val{pg}, d, e, active, ONE, cs) where {ki
             st.may_sample .!= 0, st
         elseif pg == 8
             diff = st.lw1[d .- 1] .- st.lw1[d]
-            consume = active .& (diff .<= 0)
+            consume = active .& .!(diff .> 0)
             ex, st = _nr_draw_exp(st, consume, ONE)
             ifelse.(diff .> 0, ONE .!= 0, (-ex) .< diff), st
         else
@@ -418,7 +420,7 @@ function _nr_effects(st, ::Val{kind}, ::Val{pg}, e, d, cs, NP, ONE, active, cfg)
                 pp_mom = _nr_sel(active, _nr_gset(st.pp_mom, e, mom), st.pp_mom)))
             st = _nr_set_derived(st, e, active, cfg)
             raw = _nr_gv(st.pp_ham, ONE) .- _nr_gv(st.pp_ham, e)
-            finite = ifelse.((raw .- raw) .== 0, raw, st.dham .* 0 .+ cfg.neginf)
+            finite = ifelse.((raw .- raw) .== 0, raw, zero.(st.dham) .+ cfg.neginf)
             st = merge(st, (dham = _nr_sel(active, finite, st.dham),
                 diverged = _nr_sel(active, ifelse.(finite .>= st.min_dham, ONE .* 0, ONE), st.diverged)))
         elseif pg == 4
