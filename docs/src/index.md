@@ -23,7 +23,7 @@ features:
   - title: Optional buffer-reusing execution
     details: prepare_nonallocating rewrites the generated function to reuse the same arrays across calls, so how much it allocates is separate from what the graph computes.
   - title: Deliberately narrow
-    details: No scheduler inside a prepared kernel, no automatic differentiation, no probabilistic-programming semantics, no symbolic algebra. It turns pure dataflow graphs into fast plain-Julia functions, and refuses code whose side effects it cannot check.
+    details: No scheduler inside a prepared kernel, no bundled AD engine, no probabilistic-programming semantics, no symbolic algebra. It turns pure dataflow graphs into fast plain-Julia functions, offers a DifferentiationInterface boundary for scalar objectives, and refuses code whose side effects it cannot check.
 ---
 ```
 

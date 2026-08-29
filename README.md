@@ -30,6 +30,12 @@ a prepared kernel.
 > not blanket accelerator support for mutable state machines. E-graph
 > optimization remains future work.
 
+`DifferentiationInterface` is the package's backend-neutral scalar-gradient
+boundary. Concrete AD engines remain optional: in particular, Enzyme is not a
+ReactiveKernels dependency, just as Reactant is loaded only when requested.
+`prepare_ad` resolves one named active HAVE port once, passes every other
+current HAVE value as a DI `Constant`, and reuses the backend preparation.
+
 The runnable [`examples/eight_schools.jl`](examples/eight_schools.jl) shows how
 to build PPL semantics manually from ordinary recipes: unconstrained-to-
 constrained transforms, an optional log Jacobian, decomposed prior and
@@ -67,14 +73,33 @@ end
 k = prepare(chain)
 k(step, scale, 1.2)  # 4.4 — a straight-line kernel: b = 2*(x+1)
 
-@kernel affine(x, factor = 2; offset = factor - 1) = begin
-    y = factor * x + offset
+@kernel affine(x::Float64, factor::Float64 = 2.0;
+               offset::Float64 = factor - 1) = begin
+    y::Float64 = factor * x + offset
 end
 
 affine_kernel = prepare(affine)
-affine_kernel(3)                  # 7
-affine_kernel(3; offset = 4)      # 10
+affine_kernel(3.0)                  # 7.0
+affine_kernel(3.0; offset = 4.0)    # 10.0
 ```
+
+With an AD backend available, the same authored defaults and keywords carry
+through the reusable gradient boundary:
+
+```julia
+using DifferentiationInterface
+import Enzyme
+
+backend = AutoEnzyme(; mode = Enzyme.Reverse)
+affine_ad = prepare_ad(
+    affine, backend, 3.0; active = :x, want = :y,
+)
+ad_gradient(affine_ad, 3.0; offset = 4.0)  # 2.0
+```
+
+The backend is an `AbstractADType`; core code does not import Enzyme. Plain
+reverse mode is sufficient—no runtime-activity mode or function annotation is
+part of the RK boundary.
 
 Like ReactiveObjects.jl's `@reactive` definitions, the primary `@kernel` form
 is a normal-looking function definition. Its arguments are the kernel's input

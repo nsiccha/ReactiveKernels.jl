@@ -236,9 +236,10 @@ pure graph.
 The unconstrained density boundary has a second, source-visible fused producer,
 so reverse AD neither materializes an active pointwise vector nor captures the
 nested plate kernels in its operation table. It differentiates through
-DifferentiationInterface with plain Enzyme reverse mode when observation data
-are passed as `Constant`s; no runtime-activity mode or function annotation is
-required. Named-latent and pointwise queries retain the plate route above.
+`prepare_ad`/`ad_gradient` with plain Enzyme reverse mode; observation data are
+passed as DI `Constant`s automatically. No runtime-activity mode or function
+annotation is required. Named-latent and pointwise queries retain the plate
+route above.
 """
 function build_eight_schools_graph()
     compose(_EIGHT_SCHOOLS_GRAPH_TEMPLATE)

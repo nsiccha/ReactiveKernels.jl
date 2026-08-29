@@ -43,8 +43,8 @@ The likelihood port has two equivalent producers. Asking for pointwise terms
 selects the vector of marginalized `log_mix` values plus `sum`; a density-only
 plan selects a fused scalar loop. The latter avoids an active temporary vector
 and is exercised with plain reverse-mode Enzyme through
-DifferentiationInterface (observations passed as a `Constant`), without runtime
-activity or a function annotation.
+`prepare_ad`/`ad_gradient` (observations are supplied as a DI `Constant`
+automatically), without runtime activity or a function annotation.
 
 The panel below shows three views of this model: **Raw input** (the source), a
 readable **Generated kernel** derived from the executed kernel and selected

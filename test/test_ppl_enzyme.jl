@@ -1,6 +1,28 @@
 using DifferentiationInterface
-using DifferentiationInterface: Constant
 import Enzyme
+
+isdefined(@__MODULE__, :EightSchoolsExample) ||
+    include(joinpath(@__DIR__, "..", "examples", "eight_schools.jl"))
+isdefined(@__MODULE__, :LinearRegressionExample) ||
+    include(joinpath(@__DIR__, "..", "examples", "linear_regression.jl"))
+isdefined(@__MODULE__, :BetaBinomialExample) ||
+    include(joinpath(@__DIR__, "..", "examples", "beta_binomial.jl"))
+isdefined(@__MODULE__, :PoissonGammaExample) ||
+    include(joinpath(@__DIR__, "..", "examples", "poisson_gamma.jl"))
+isdefined(@__MODULE__, :DugongsGrowthExample) ||
+    include(joinpath(@__DIR__, "..", "examples", "dugongs_growth.jl"))
+isdefined(@__MODULE__, :ARMA11Example) ||
+    include(joinpath(@__DIR__, "..", "examples", "arma11.jl"))
+isdefined(@__MODULE__, :GaussianMixtureExample) ||
+    include(joinpath(@__DIR__, "..", "examples", "gaussian_mixture.jl"))
+
+using .EightSchoolsExample
+using .LinearRegressionExample
+using .BetaBinomialExample
+using .PoissonGammaExample
+using .DugongsGrowthExample
+using .ARMA11Example
+using .GaussianMixtureExample
 
 # This is deliberately the plain reverse backend: no runtime activity and no
 # function annotation. Non-active model data travel through DI as `Constant`s.
@@ -109,11 +131,12 @@ function check_plain_enzyme_gradient(artifact, have, reference_density)
         Tuple(artifact.inputs)
     end
     active = first(values)
-    constants = map(Constant, Base.tail(values))
 
     @test kernel(values...) ≈ reference_density(active)
-    gradient = DifferentiationInterface.gradient(
-        kernel, PPL_ENZYME_BACKEND, active, constants...)
+    prepared = prepare_ad(
+        kernel, PPL_ENZYME_BACKEND, values...; active = first(have),
+    )
+    gradient = ad_gradient(prepared, values...)
     reference_gradient = DifferentiationInterface.gradient(
         reference_density, PPL_ENZYME_BACKEND, active)
     observed = _gradient_vector(gradient)

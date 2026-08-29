@@ -12,9 +12,9 @@ single `Enzyme` reverse-mode pass takes the gradient of the whole batch at once.
 
 As in [Native log densities as recipes](distributions.md), the **compute path
 contains no `Distributions.jl` call**: the density is written out directly and
-`Distributions.jl` appears only as an independent oracle. Differentiation goes
-through `DifferentiationInterface` with the `Enzyme` reverse-mode backend, over
-the native recipe only.
+`Distributions.jl` appears only as an independent oracle. The native recipe is
+prepared through `prepare_ad` and evaluated through `ad_gradient`, using the
+plain `Enzyme` reverse-mode backend behind DifferentiationInterface.
 
 ## One graph, two want boundaries
 

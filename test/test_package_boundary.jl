@@ -5,10 +5,15 @@ using TOML
     module_source = read(joinpath(srcdir, "ReactiveKernels.jl"), String)
     project = TOML.parsefile(joinpath(pkgdir(ReactiveKernels), "Project.toml"))
 
-    for optional_ad in ("DifferentiationInterface", "Enzyme")
-        @test !haskey(project["deps"], optional_ad)
-        @test haskey(project["extras"], optional_ad)
-        @test optional_ad in project["targets"]["test"]
+    @test haskey(project["deps"], "DifferentiationInterface")
+    @test !haskey(project["extras"], "DifferentiationInterface")
+    @test "DifferentiationInterface" ∉ project["targets"]["test"]
+
+    @test !haskey(project["deps"], "Enzyme")
+    @test haskey(project["extras"], "Enzyme")
+    @test "Enzyme" in project["targets"]["test"]
+    @test all(readdir(srcdir; join = true)) do path
+        !isfile(path) || !occursin(r"\bEnzyme\b", read(path, String))
     end
 
     for file in ("kernel_nuts.jl", "kernel_nuts_native.jl", "hmc.jl", "reactive_nuts.jl")

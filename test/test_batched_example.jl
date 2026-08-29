@@ -16,7 +16,8 @@ using ReactiveKernels: code_expr
         @test occursin(r"@kernel \w+\(", source)
         @test occursin("broadcast(", source)
         @test occursin("AutoEnzyme", source)
-        @test occursin("DifferentiationInterface.gradient", source)
+        @test occursin("prepare_ad(", source)
+        @test occursin("ad_gradient(", source)
         # The AD path is Enzyme reverse mode through DifferentiationInterface —
         # the required backend — asserted positively by its concrete config.
         @test occursin("Enzyme.Reverse", source)
