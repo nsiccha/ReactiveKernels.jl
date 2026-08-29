@@ -260,7 +260,7 @@ function setup_dugongs!(mod::Module)
         split_unconstrained, bounded_lambda, sd_from_log_precision,
         assemble_parameters, log_abs_det_jacobian, log_prior,
         pointwise_log_likelihood, sum_log_likelihood,
-        total_log_density, predicted_length))
+        fused_log_likelihood, total_log_density, predicted_length))
     nothing
 end
 
@@ -286,7 +286,7 @@ function setup_gaussian_mixture!(mod::Module)
         MIXTURE_OBSERVATIONS, split_unconstrained, ordered_means,
         exp_scale, logistic, assemble_parameters, log_abs_det_jacobian,
         log_prior, pointwise_log_likelihood, sum_log_likelihood,
-        total_log_density, component1_responsibility))
+        fused_log_likelihood, total_log_density, component1_responsibility))
     nothing
 end
 

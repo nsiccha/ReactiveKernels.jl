@@ -28,12 +28,9 @@ batched_spec = @kernel batched_normal(
     logdensity::Float64 = sum(per_obs)
 end
 
-# Reverse-mode Enzyme over the batch mixes the active `x` with the constant
-# `μ`, `σ` inside the broadcast, so runtime activity is required; the closed-over
-# kernel/primal is Const.
-const BATCHED_BACKEND = AutoEnzyme(;
-    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-    function_annotation = Enzyme.Const)
+# The owned DI Cache gives Enzyme explicit activity at the call boundary, so
+# ordinary reverse mode suffices; no runtime activity or function annotation.
+const BATCHED_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 
 @testset "Batched log density: zero-allocation value and gradient" begin
     @test Base.get_extension(ReactiveKernels,

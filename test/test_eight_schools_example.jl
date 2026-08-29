@@ -101,6 +101,17 @@ end
             for j in 1:8)
         @test likelihood ≈ reference_likelihood
         @test density ≈ prior + log_jacobian + likelihood
+
+        density_only = plan(model.graph;
+            have = (model.unconstrained, model.observations,
+                    model.observation_scales),
+            want = (model.density,))
+        fused_density = getfield(
+            artifact.sandbox, :fused_unconstrained_density)
+        @test any(r -> r.op === fused_density,
+                  density_only.recipes)
+        @test length(density_only.recipes) == 1
+        @test !any(r -> r.op === sum, density_only.recipes)
     end
 
     @testset "corrected core contracts hold on PPL paths" begin

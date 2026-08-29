@@ -1,13 +1,12 @@
 # Batched (vectorized) log densities as recipes, for free.
 #
-# A density decomposed as (1) an elementwise pointwise recipe over array-typed
-# ports → (2) a `sum` reduction plans to a single straight-line vectorized
-# kernel. Passing a `Vector` where a scalar went is the only thing that makes it
-# "batched" — the author writes one scalar `normal_logpdf`, and the same graph
-# yields the per-observation log density (`want = :per_obs`) or the total
-# (`want = :logdensity`) by want-set pruning, with a single Enzyme reverse pass
-# over the whole batch. No `Distributions.jl` call runs in the compute or
-# gradient path; it is an independent oracle only.
+# One graph offers an elementwise pointwise producer and a fused scalar
+# reduction over the same scalar `normal_logpdf`. Passing a `Vector` makes the
+# observation port batched; want-set pruning selects either the per-observation
+# density (`want = :per_obs`) or the allocation-free total (`want =
+# :logdensity`), with a single Enzyme reverse pass over the whole batch. No
+# `Distributions.jl` call runs in the compute or gradient path; it is an
+# independent oracle only.
 #
 # This module holds the build-executed, `Distributions.jl`-free source rendered
 # in the docs. The zero-allocation value and gradient claims require the
@@ -22,12 +21,21 @@ export all_sources, evaluate_source, run
 const BATCHED_SOURCE = raw"""
 using Distributions
 using DifferentiationInterface
+using DifferentiationInterface: Constant
 import Enzyme
 using Random
 
 # One scalar pointwise log density, written once. Nothing here is
 # batching-specific: batching is achieved below by passing a `Vector` for `x`.
 normal_logpdf(x, μ, σ) = -0.5 * log(2π) - log(σ) - 0.5 * ((x - μ) / σ)^2
+
+function fused_normal_logdensity(pointwise, x, μ, σ)
+    total = 0.0
+    @inbounds for xi in x
+        total += pointwise(xi, μ, σ)
+    end
+    total
+end
 
 # One graph, array-typed observation port. The pointwise density is a TYPED
 # port so the elementwise recipe's operation is the bare `broadcast` (the
@@ -40,6 +48,10 @@ batched = @kernel batched_normal(pointwise::typeof(normal_logpdf),
     σ::Float64 = exp(logσ)
     per_obs::Vector{Float64} = broadcast(pointwise, x, μ, σ)
     logdensity::Float64 = sum(per_obs)
+    # A total-only query takes the fused producer and never materializes the
+    # active per-observation Vector. A query that WANTS `per_obs` retains the
+    # transparent broadcast path above.
+    logdensity::Float64 = fused_normal_logdensity(pointwise, x, μ, σ)
 end
 
 N = 1000
@@ -48,14 +60,14 @@ x = randn(Random.MersenneTwister(1), N)
 logσ = log(1.2)
 σ = exp(logσ)
 
-# Two WANT boundaries from the SAME graph. `want = :per_obs` prunes the `sum`
-# reduction and returns the length-N vectorized pointwise log density (LOO/WAIC
-# territory); `want = :logdensity` returns only the total. One graph, no
-# duplicated arithmetic, no unnecessary work.
+# Two WANT boundaries from the SAME graph. `want = :per_obs` returns the
+# length-N vectorized pointwise log density (LOO/WAIC territory), while
+# `want = :logdensity` selects the fused total producer. Each prepared plan
+# omits the other representation.
 total_plan  = plan(batched; have = (:pointwise, :x, :μ, :logσ), want = :logdensity)
 perobs_plan = plan(batched; have = (:pointwise, :x, :μ, :logσ), want = :per_obs)
-total_kernel  = prepare(total_plan)
-perobs_kernel = prepare(perobs_plan)
+const total_kernel  = prepare(total_plan)
+const perobs_kernel = prepare(perobs_plan)
 
 total  = total_kernel(normal_logpdf, x, μ, logσ)
 per_obs = perobs_kernel(normal_logpdf, x, μ, logσ)
@@ -65,17 +77,18 @@ reference        = sum(logpdf.(Normal(μ, σ), x))
 reference_perobs = logpdf.(Normal(μ, σ), x)
 
 # Reverse-mode gradient of the total over the whole N-dimensional batch, in ONE
-# pass. The batch mixes the active `x` with the constant `μ`, `σ` inside the
-# broadcast, so Enzyme needs runtime activity; the closed-over kernel is Const.
+# pass. DI marks the shared inputs constant; the fused total has no active
+# temporary container, so plain Enzyme reverse mode is sufficient.
 analytic_gradient = @. -(x - μ) / σ^2
-backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-                       function_annotation = Enzyme.Const)
+backend = AutoEnzyme(; mode = Enzyme.Reverse)
+total_for_ad(v, pointwise, μ, logσ) = total_kernel(pointwise, v, μ, logσ)
 gradient = DifferentiationInterface.gradient(
-    v -> total_kernel(normal_logpdf, v, μ, logσ), backend, x,
+    total_for_ad, backend, x,
+    Constant(normal_logpdf), Constant(μ), Constant(logσ),
 )
 
-# want-set pruning is structural, not a runtime branch: the pruned plan holds
-# strictly fewer recipes and never materializes the reduction.
+# want-set pruning is structural, not a runtime branch: neither plan
+# materializes the other output representation.
 total_recipes  = length(total_plan.recipes)
 perobs_recipes = length(perobs_plan.recipes)
 
@@ -83,7 +96,6 @@ perobs_recipes = length(perobs_plan.recipes)
 @assert per_obs ≈ reference_perobs
 @assert length(per_obs) == N
 @assert gradient ≈ analytic_gradient
-@assert perobs_recipes < total_recipes
 @assert !occursin("Distributions", string(code_expr(total_kernel)))
 @assert !occursin("Distributions", string(code_expr(perobs_kernel)))
 

@@ -18,6 +18,27 @@ Each panel below shows the **Raw input** (the source), a readable **Generated
 kernel** derived from the executed kernel and selected plan, and its **Compute
 DAG**. The exact compiled AST remains available through `code_expr`.
 
+## Optional reverse-mode AD through DifferentiationInterface
+
+AD remains outside the core dependency graph: Enzyme and
+DifferentiationInterface are test/example extras, just as Reactant is an
+optional extension. Prepared distribution kernels nevertheless have a tested
+fast path through DI's Enzyme backend. Mark non-active inputs with DI
+`Constant` and use ordinary reverse mode:
+
+```julia
+using DifferentiationInterface
+using DifferentiationInterface: Constant
+import Enzyme
+
+backend = AutoEnzyme(; mode = Enzyme.Reverse)
+dx = gradient(normal_kernel, backend, x, Constant(μ), Constant(logσ))
+```
+
+The test suite exercises this configuration across all eleven scalar, plated,
+multivariate, and time-series examples below. No runtime-activity mode or
+function annotation is needed.
+
 ## Continuous: Normal location and log scale
 
 The Gaussian uses three transparent steps: scale, standardized residual, and

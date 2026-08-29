@@ -20,7 +20,8 @@ using ReactiveKernels: code_expr
         # The AD path is Enzyme reverse mode through DifferentiationInterface —
         # the required backend — asserted positively by its concrete config.
         @test occursin("Enzyme.Reverse", source)
-        @test occursin("function_annotation = Enzyme.Const", source)
+        @test !occursin("set_runtime_activity", source)
+        @test !occursin("function_annotation", source)
         # The compute path is Distributions.jl-free on both want boundaries.
         @test !occursin("Distributions", string(code_expr(artifact.kernel)))
         @test !occursin("Distributions", string(code_expr(artifact.perobs_kernel)))
@@ -33,17 +34,15 @@ using ReactiveKernels: code_expr
         # matching the elementwise Distributions oracle.
         @test length(artifact.per_obs) == length(artifact.reference_perobs)
         @test artifact.per_obs ≈ artifact.reference_perobs
-        # Pruning is structural: the per-obs plan holds strictly fewer recipes
-        # (the `sum` reduction is dropped, not merely skipped at runtime).
-        @test artifact.perobs_recipes < artifact.total_recipes
-        @test artifact.total_recipes == 3
+        # Pruning is structural: the total plan selects the fused reduction and
+        # never materializes `per_obs`; the per-obs plan selects the broadcast
+        # and never computes `logdensity`.
+        @test artifact.total_recipes == 2
         @test artifact.perobs_recipes == 2
-        # The total kernel's plan carries exactly one reduction and one
-        # elementwise recipe over the observation vector.
         total_selected = artifact.kernel.plan.recipes
         perobs_selected = artifact.perobs_kernel.plan.recipes
         @test count(r -> any(v -> v.name === :per_obs, r.outputs),
-                    total_selected) == 1
+                    total_selected) == 0
         @test count(r -> any(v -> v.name === :logdensity, r.outputs),
                     perobs_selected) == 0
     end

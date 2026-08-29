@@ -39,7 +39,10 @@ using Distributions: MvNormal
 const LDP = DynamicPPL.LogDensityProblems
 
 # Reverse-mode Enzyme via DifferentiationInterface. This is the ONLY AD backend
-# used; there is no forward-mode contrast.
+# used; there is no forward-mode contrast. This comparator deliberately shares
+# one backend configuration with DynamicPPL, whose evaluation path still needs
+# runtime activity; it is not the configuration required by RK's prepared
+# densities (the PPL/distribution tests exercise those with plain Reverse).
 const BACKEND_ENZYME = DI.AutoEnzyme(;
     mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
     function_annotation = Enzyme.Const,

@@ -18,10 +18,7 @@ import Enzyme
 # gradient is DifferentiationInterface + reverse-mode Enzyme, prepared once and
 # written into the sampler's owned gradient buffer in place — no handwritten
 # gradient callback on the sampled path.
-const ENZYME_BACKEND = AutoEnzyme(;
-    mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-    function_annotation = Enzyme.Const,
-)
+const ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 
 potential(position) = sum(abs2, position) / 2
 
