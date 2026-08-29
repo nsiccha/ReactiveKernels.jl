@@ -150,6 +150,10 @@ to its own recipe first. Put `@recipe` metadata inside the reusable kernel rathe
 than on the call site. Each restriction is checked while the outer graph is
 constructed.
 
+The dedicated [Bijectors and constrained parameters](bijectors.md) page applies
+this composition rule to reusable support transforms, shows parameters-only and
+Jacobian-only pruning, and renders the resulting fused model DAG.
+
 ## See the selected DAG
 
 ```julia
