@@ -94,3 +94,35 @@ function _nuts_tensors_to_frame!(fr, s)
     _diag_set_value!(fr.diag, Val(3), s.acceptance_rate); _diag_set_value!(fr.diag, Val(4), s.dham)
     fr
 end
+
+# -----------------------------------------------------------------------------
+# Tensor numerics (increment B, incremental). Plain traceable Julia over gathered
+# phasepoint slices — no mutable structs, no reactive scheduler. Each op reproduces
+# the fixture's authored recipe INCLUDING the reactive derived-field recomputation
+# the compiler's _ensure_read seam performs at read points.
+# -----------------------------------------------------------------------------
+
+"""
+    _nuts_tensor_leapfrog(pos, mom, ss, ddpos, ddmom) -> (pos', mom')
+
+One leapfrog step (fixture `leapfrog!` L83-87) over tensor slices, with the
+reactive recomputation of the derived momenta made explicit at the read points:
+`ddpos(pos)` recomputes `dham_dpos` (the gradient, invalidated by a `pos` write),
+`ddmom(mom)` recomputes `dham_dmom` (the metric solve, invalidated by a `mom`
+write). The dependency order matches the authored kernel exactly:
+
+    mom -= ½·ss·dham_dpos(pos)     # dham_dpos current from the incoming pos
+    pos += ss·dham_dmom(mom)       # dham_dmom RECOMPUTED after the mom write
+    mom -= ½·ss·dham_dpos(pos)     # dham_dpos RECOMPUTED after the pos write
+
+`ddpos`/`ddmom` are the euclidean_phasepoint derived recipes (from grad_f and the
+metric Cholesky solve); they must be Reactant-traceable in the compiled path.
+Verified == the native reactive leapfrog and an independent hand-calc.
+"""
+@inline function _nuts_tensor_leapfrog(pos, mom, ss, ddpos, ddmom)
+    mom = mom .- (0.5 * ss) .* ddpos(pos)     # reads dham_dpos(pos_in); writes mom
+    dmom = ddmom(mom)                         # recompute dham_dmom after the mom write
+    pos = pos .+ ss .* dmom                   # writes pos
+    mom = mom .- (0.5 * ss) .* ddpos(pos)     # recompute dham_dpos after the pos write
+    (pos, mom)
+end
