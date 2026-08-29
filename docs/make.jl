@@ -10,6 +10,7 @@ Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "result_views.jl"))
 include("check_rendered.jl")
 include(joinpath(@__DIR__, "..", "examples", "distributions.jl"))
 include(joinpath(@__DIR__, "..", "examples", "batched.jl"))
+include(joinpath(@__DIR__, "..", "examples", "bijectors.jl"))
 
 site_pages = [
     "Home" => "index.md",
@@ -21,6 +22,7 @@ site_pages = [
         "Evaluation throughput vs Turing.jl" => "eval-throughput.md",
     ],
     "Probabilistic programming" => [
+        "Bijectors and constrained parameters" => "bijectors.md",
         "Eight schools" => "eight-schools.md",
         "Linear regression" => "linear-regression.md",
         "Beta-binomial" => "beta-binomial.md",
