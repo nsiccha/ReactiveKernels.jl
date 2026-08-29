@@ -32,13 +32,20 @@ jobs:
           cache-compiled: false
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
+        env:
+          # RuntimeGeneratedFunctions 0.5.25's own PrecompileTools workload
+          # hits a world-age MethodError on Julia >=1.12 before RK loads. The
+          # Julia 1 and pre lanes still run the complete bounds-checked suite;
+          # only compiled-module cache generation is bypassed until upstream
+          # fixes it. LTS keeps exercising the ordinary compiled path.
+          JULIA_PKG_PRECOMPILE_AUTO: ${{ matrix.julia-version == 'lts' && '1' || '0' }}
         with:
           # Coverage instrumentation is exercised on LTS. On Julia 1.12/pre it
           # adds counter allocations to the zero-allocation probe, so use those
-          # lanes for the ordinary compiled, zero-allocation contract instead.
+          # lanes for the ordinary non-coverage, zero-allocation contract instead.
           coverage: ${{ matrix.julia-version == 'lts' }}
           check_bounds: yes
-          compiled_modules: yes
+          compiled_modules: ${{ matrix.julia-version == 'lts' && 'yes' || 'no' }}
 
   nonallocating-integration:
     runs-on: ubuntu-latest
