@@ -118,7 +118,7 @@ function check_rendered_docs(build_dir, page_tree)
         end
 
         if source == "eight-schools.md"
-            for marker in ("Eight Schools Density", "Raw input", "Generated kernel", "Compute DAG")
+            for marker in ("Eight Schools Extraction", "Raw input", "Generated kernel", "Compute DAG")
                 occursin(marker, body) || error("Eight Schools page is missing marker: $marker")
             end
         end
