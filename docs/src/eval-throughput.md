@@ -1,4 +1,4 @@
-# Evaluation throughput vs Turing.jl
+# Evaluation latency and batched throughput vs Turing.jl
 
 This page compares **evaluation** throughput — how fast a log density is
 evaluated, differentiated, and turned into a generated quantity — between a
@@ -37,7 +37,7 @@ Reactant-traceable**; those cells are reported unsupported rather than faked.
 
 ## Results
 
-Median per-call time on a **log time axis — lower (shorter) is better**. Each bar
+Median single-call time on a **log time axis — lower (shorter) is better**. Each bar
 is read straight from the static receipt
 [`benchmark/receipts/eval-throughput-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/eval-throughput-v1.toml)
 (default CPU backend, `Float64`) while the docs build, so the picture cannot drift
@@ -48,18 +48,45 @@ omitted.
 Main.ReactiveKernelsDocs.eval_throughput_chart()
 ```
 
+## Avoiding the Reactant invocation cost
+
+The fixed cost cannot be removed from an isolated compiled call without changing
+what is measured: the public Reactant call must cross the host/compiler boundary
+and complete before a synchronous latency timing ends. It *can* be amortized when
+the application has independent work. `replica(kernel; batched = :x)` keeps one
+position per matrix column and lowers the whole map as one compiled invocation.
+
+The table below keeps the original direct-call timing beside a separate
+256-position throughput protocol. `Batch / position` is the measured whole-batch
+time divided by 256; it is not a claim about single-call latency. The gradient row
+differentiates the sum of the independent replicated log densities, yielding one
+gradient column per position.
+
+```@eval
+Main.ReactiveKernelsDocs.render_eval_throughput_amortization()
+```
+
+This is useful for independent likelihood evaluations, multiple chains, or other
+outer batches. A single Markov chain is sequential, so replica batching does not
+make one NUTS transition independent; there the analogous remedy is to compile
+the transition or sampler loop that contains the repeated evaluations, as in
+[NUTS sampling](nuts.md).
+
 ## What the numbers say
 
-- **ReactiveKernels native is the fastest path at every size and mode**, roughly
-  2.5–5.7× faster than the equivalent Turing evaluation. The fused straight-line
-  kernel avoids the per-call model-evaluation overhead of DynamicPPL.
+- **ReactiveKernels native wins every primal and gradient cell**, and the
+  generated-quantity cells from `n = 256` upward, by roughly 2.1–6.9×. The one
+  small-shape exception is generated quantities at `n = 16`, where Turing native
+  is about 1.5× faster. The fused straight-line kernel avoids most of the
+  per-call model-evaluation overhead of DynamicPPL.
 - **Reactant is a net loss for small CPU workloads.** Its per-call device
   dispatch/sync is a large fixed cost (~3 µs), so at `n = 16` the compiled path
   is ~30–80× slower than native. This is expected: Reactant targets large XLA
-  fusion and accelerators, not tiny CPU kernels.
+  fusion and accelerators, not tiny CPU kernels. The separate replica table above
+  shows throughput after that same boundary is shared by independent evaluations.
 - **That fixed cost amortizes as the work grows.** By `n = 4096` the Reactant
-  gradient (≈11.6 µs) is within ~1.2× of RK native and **faster than the Turing
-  native gradient** (≈27.2 µs); the trend points to Reactant winning at larger
+  gradient (≈10.9 µs) is within ~1.03× of RK native and **faster than the Turing
+  native gradient** (≈27.6 µs); the trend points to Reactant winning at larger
   sizes or on a GPU. This receipt uses the default CPU backend and does not
   measure an accelerator.
 - Numbers are one machine's CPU receipt; treat the **ratios**, not the absolute
@@ -70,9 +97,11 @@ Main.ReactiveKernelsDocs.eval_throughput_chart()
 ```julia
 julia --startup-file=no benchmark/eval_throughput_comparison.jl \
   --output=benchmark/receipts/eval-throughput-v1.toml
+julia --startup-file=no benchmark/receipts/validate_eval_throughput.jl \
+  benchmark/receipts/eval-throughput-v1.toml
 ```
 
 The script provisions a fresh, pinned environment (Reactant 0.2.278, Turing
 0.47.1, DynamicPPL 0.42.6, Enzyme 0.13.199, DifferentiationInterface 0.7.21) that
 never enters ReactiveKernels' root dependencies. A quick smoke run:
-`RK_EVAL_SIZES=16,64 RK_EVAL_ROUNDS=20 julia --startup-file=no benchmark/eval_throughput_comparison.jl`.
+`RK_EVAL_SIZES=16,64 RK_EVAL_ROUNDS=20 RK_EVAL_REPLICAS=8 julia --startup-file=no benchmark/eval_throughput_comparison.jl`.

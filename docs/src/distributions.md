@@ -197,6 +197,22 @@ whole calculation with traced observations and traced shared parameters.
 Main.ReactiveKernelsDocs.render_distribution_benchmarks()
 ```
 
+### Amortizing the Reactant call boundary
+
+For a tiny scalar density, most of the compiled-call time is fixed host/runtime
+overhead. When observations are independent, the same scalar `PreparedKernel`
+can be lifted with `replica(...; batched = :x)` and evaluated once over a vector.
+The checked-in receipt measures 1, 16, and 256 independent one-observation
+evaluations per compiled call:
+
+```@eval
+Main.ReactiveKernelsDocs.render_distribution_amortization()
+```
+
+The allocation count and bytes are for the whole host-side invocation, not for
+each observation. Batching therefore avoids paying that wrapper once per logical
+evaluation; it does not change the latency of an isolated one-observation call.
+
 Each cell is the median of five minimum-time measurements, with Reactant work
 synchronized before timing. Compilation and host↔device transfers are excluded
 from execution times. The Reactant allocation cells report only the Julia host

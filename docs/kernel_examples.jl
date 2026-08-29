@@ -66,7 +66,8 @@ end
 
 # --- eval-throughput visualization ----------------------------------------
 # A build-executed chart of the static eval-throughput receipt: grouped
-# horizontal bars on a log time axis, faceted by mode, one bar per timed series.
+# horizontal bars on a log time axis, faceted by mode, one bar per single-call
+# latency series.
 # The bars are read straight from the receipt TOML, so the picture cannot drift
 # from the numbers. `RK + Reactant` and `Turing native` share the axis; Turing +
 # Reactant is unsupported and omitted.
@@ -116,7 +117,7 @@ function eval_throughput_chart(; receipt = _eval_throughput_receipt())
 
     io = IOBuffer()
     print(io, """<svg viewBox="0 0 720 $(round(Int, total_h))" width="100%" """,
-        """role="img" aria-label="Evaluation throughput: median per-call time """,
+        """role="img" aria-label="Single-call evaluation latency: median per-call time """,
         """by mode, size and implementation" style="font: 12px/1.3 var(--vp-font-family-base, system-ui); color: var(--vp-c-text-1, currentColor);">""")
 
     # Legend.

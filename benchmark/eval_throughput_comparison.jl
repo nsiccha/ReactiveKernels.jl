@@ -22,7 +22,8 @@
 #   julia --startup-file=no benchmark/eval_throughput_comparison.jl
 #
 # Write the static receipt with --output=benchmark/receipts/eval-throughput-v1.toml
-# Quick smoke: prefix RK_EVAL_SIZES=16,64 and/or RK_EVAL_ROUNDS=20.
+# Quick smoke: prefix RK_EVAL_SIZES=16,64, RK_EVAL_ROUNDS=20, and/or
+# RK_EVAL_REPLICAS=8. Published receipts use 256 independent replicas per call.
 
 import Pkg
 

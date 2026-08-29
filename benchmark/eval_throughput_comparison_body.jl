@@ -16,6 +16,9 @@
 #     are reported unsupported — never faked.
 #   * Timing is a hand-rolled minimum of batched runs (BenchmarkTools pins JSON
 #     below the version Reactant needs, so it cannot be used here).
+#   * Replicated rows are a separate throughput protocol: one compiled call
+#     evaluates independent columns and reports both whole-batch and normalized
+#     per-evaluation time. They do not replace the single-call latency rows.
 
 using Dates
 using LinearAlgebra
@@ -72,6 +75,19 @@ end
 _rk_reactant_grad(kernel, x, μ, logσ) =
     Enzyme.gradient(Enzyme.Reverse, kernel, x, Enzyme.Const(μ), Enzyme.Const(logσ))
 
+_rk_replicated_sum(kernel, x, μ, logσ) = sum(kernel(x, μ, logσ))
+function _rk_reactant_replicated_grad(kernel, x, μ, logσ)
+    gradient = Enzyme.gradient(
+        Enzyme.Reverse,
+        Enzyme.Const(_rk_replicated_sum),
+        Enzyme.Const(kernel),
+        x,
+        Enzyme.Const(μ),
+        Enzyme.Const(logσ),
+    )
+    gradient[2]
+end
+
 _reference_pointwise(x, μ, logσ) =
     -0.5 .* ((x .- μ) ./ exp(logσ)) .^ 2 .- (logσ + 0.5 * log(2π))
 _reference_primal(x, μ, logσ) = sum(_reference_pointwise(x, μ, logσ))
@@ -113,8 +129,10 @@ function _sizes()
 end
 
 _rounds() = parse(Int, get(ENV, "RK_EVAL_ROUNDS", "50"))
+_replicas() = parse(Int, get(ENV, "RK_EVAL_REPLICAS", "256"))
 
-function _measure_size(n, rounds)
+function _measure_size(n, rounds, replicas)
+    replicas > 0 || throw(ArgumentError("RK_EVAL_REPLICAS must be positive"))
     (; μ, logσ, x) = _inputs(n)
     reference_primal = _reference_primal(x, μ, logσ)
     reference_gradient = _reference_gradient(x, μ, logσ)
@@ -122,6 +140,8 @@ function _measure_size(n, rounds)
 
     rk_primal = _rk_primal()
     rk_gq = _rk_gq()
+    rk_primal_replicated = replica(rk_primal; batched = :x)
+    rk_gq_replicated = replica(rk_gq; batched = :x)
     rk_primal_of_x(position) = rk_primal(position, μ, logσ)
     enzyme_preparation =
         DI.prepare_gradient(rk_primal_of_x, BACKEND_ENZYME, copy(x))
@@ -137,10 +157,18 @@ function _measure_size(n, rounds)
     device_x = Reactant.to_rarray(x)
     device_μ = Reactant.to_rarray(μ; track_numbers = true)
     device_logσ = Reactant.to_rarray(logσ; track_numbers = true)
+    x_replicated = [x[i] + 0.001 * (j - 1) for i in eachindex(x), j in 1:replicas]
+    device_x_replicated = Reactant.to_rarray(x_replicated)
     rk_primal_compiled = @compile sync = true rk_primal(device_x, device_μ, device_logσ)
     rk_gq_compiled = @compile sync = true rk_gq(device_x, device_μ, device_logσ)
     rk_grad_compiled =
         @compile sync = true _rk_reactant_grad(rk_primal, device_x, device_μ, device_logσ)
+    rk_primal_replicated_compiled = @compile sync = true rk_primal_replicated(
+        device_x_replicated, device_μ, device_logσ)
+    rk_gq_replicated_compiled = @compile sync = true rk_gq_replicated(
+        device_x_replicated, device_μ, device_logσ)
+    rk_grad_replicated_compiled = @compile sync = true _rk_reactant_replicated_grad(
+        rk_primal_replicated, device_x_replicated, device_μ, device_logσ)
 
     # Prove the requested backend is ACTUALLY exercised — correct output alone
     # does not distinguish Enzyme from any other AD backend (the exact trap that
@@ -166,6 +194,24 @@ function _measure_size(n, rounds)
     @assert approx(Array(rk_gq_compiled(device_x, device_μ, device_logσ)), reference_pointwise)
     @assert approx(DynamicPPL.generated_quantities(model, (x = x,)), reference_pointwise)
 
+    reference_pointwise_replicated = _reference_pointwise(x_replicated, μ, logσ)
+    reference_primal_replicated = vec(sum(reference_pointwise_replicated; dims = 1))
+    reference_gradient_replicated = _reference_gradient(x_replicated, μ, logσ)
+    @assert approx(rk_primal_replicated(x_replicated, μ, logσ),
+                   reference_primal_replicated)
+    @assert approx(rk_gq_replicated(x_replicated, μ, logσ),
+                   reference_pointwise_replicated)
+    @assert approx(Array(rk_primal_replicated_compiled(
+                       device_x_replicated, device_μ, device_logσ)),
+                   reference_primal_replicated)
+    @assert approx(Array(rk_gq_replicated_compiled(
+                       device_x_replicated, device_μ, device_logσ)),
+                   reference_pointwise_replicated)
+    @assert approx(Array(rk_grad_replicated_compiled(
+                       rk_primal_replicated, device_x_replicated,
+                       device_μ, device_logσ)),
+                   reference_gradient_replicated)
+
     ns(thunk) = _median_ns(thunk; rounds)
     cells = [
         ("primal", "reactivekernels", "native",
@@ -187,12 +233,32 @@ function _measure_size(n, rounds)
         ("gq", "turing", "native",
          ns(() -> DynamicPPL.generated_quantities(model, (x = x,)))),
     ]
-    map(cells) do (mode, implementation, variant, median_ns)
+    rows = map(cells) do (mode, implementation, variant, median_ns)
         Dict{String,Any}(
             "size" => n, "mode" => mode, "implementation" => implementation,
             "variant" => variant, "median_ns" => median_ns,
         )
     end
+    replicated_cells = [
+        ("primal", ns(() -> rk_primal_replicated_compiled(
+            device_x_replicated, device_μ, device_logσ))),
+        ("gradient", ns(() -> rk_grad_replicated_compiled(
+            rk_primal_replicated, device_x_replicated, device_μ, device_logσ))),
+        ("gq", ns(() -> rk_gq_replicated_compiled(
+            device_x_replicated, device_μ, device_logσ))),
+    ]
+    append!(rows, map(replicated_cells) do (mode, median_batch_ns)
+        Dict{String,Any}(
+            "size" => n,
+            "mode" => mode,
+            "implementation" => "reactivekernels",
+            "variant" => "reactant_replicated",
+            "batch_size" => replicas,
+            "median_batch_ns" => median_batch_ns,
+            "median_ns" => median_batch_ns / replicas,
+        )
+    end)
+    rows
 end
 
 function _output_path()
@@ -212,9 +278,10 @@ end
 function run_comparison()
     Random.seed!(0x51a7)
     rounds = _rounds()
+    replicas = _replicas()
     measurements = Dict{String,Any}[]
     for n in _sizes()
-        append!(measurements, _measure_size(n, rounds))
+        append!(measurements, _measure_size(n, rounds, replicas))
         @printf("size=%d complete\n", n)
     end
 
@@ -245,6 +312,12 @@ function run_comparison()
             "reactant_sync" => true,
             "reactant_transfers_included" => false,
             "reactant_compile_time_in_timed_region" => false,
+            "replicas" => replicas,
+            "replica_axis" => "independent position vectors on the trailing x axis",
+            "replicated_gradient" =>
+                "gradient of the sum of independent replicated log densities",
+            "replicated_median_ns" =>
+                "whole-batch median divided by replicas; median_batch_ns is also retained",
         ),
         "support" => Dict(
             "turing_reactant" => false,
