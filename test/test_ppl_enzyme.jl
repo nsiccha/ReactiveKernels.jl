@@ -118,10 +118,57 @@ function gaussian_mixture_reference_density(q)
         likelihood)
 end
 
+# Independent analytic score for the unconstrained Gaussian-mixture reference.
+# This is deliberately not differentiated with the backend under test: the RK
+# path below retains plain reverse-mode Enzyme, while the oracle follows the
+# closed-form responsibility-weighted derivatives of the marginalized mixture.
+function gaussian_mixture_reference_gradient(q)
+    μ₁, δ, log_σ₁, log_σ₂, logit_θ = q
+    mean_gap = exp(δ)
+    μ₂ = μ₁ + mean_gap
+    σ₁ = exp(log_σ₁)
+    σ₂ = exp(log_σ₂)
+    θ = inv(1 + exp(-logit_θ))
+
+    # Prior plus unconstraining-Jacobian score.
+    dμ₁ = -(μ₁ + μ₂) / 4
+    dδ = 1 - mean_gap * μ₂ / 4
+    dlog_σ₁ = 1 - σ₁^2 / 4
+    dlog_σ₂ = 1 - σ₂^2 / 4
+    dlogit_θ = 5 * (1 - 2θ)
+
+    log_weight₁ = log(θ)
+    log_weight₂ = log1p(-θ)
+    for observation in MIXTURE_OBSERVATIONS
+        z₁ = (observation - μ₁) / σ₁
+        z₂ = (observation - μ₂) / σ₂
+        log_odds = (log_weight₁ - log_σ₁ - 0.5z₁^2) -
+                   (log_weight₂ - log_σ₂ - 0.5z₂^2)
+        responsibility = if log_odds >= 0
+            inv(1 + exp(-log_odds))
+        else
+            odds = exp(log_odds)
+            odds / (1 + odds)
+        end
+        complement = 1 - responsibility
+
+        score_mean₁ = (observation - μ₁) / σ₁^2
+        score_mean₂ = (observation - μ₂) / σ₂^2
+        dμ₁ += responsibility * score_mean₁ + complement * score_mean₂
+        dδ += mean_gap * complement * score_mean₂
+        dlog_σ₁ += responsibility * (z₁^2 - 1)
+        dlog_σ₂ += complement * (z₂^2 - 1)
+        dlogit_θ += responsibility - θ
+    end
+
+    (dμ₁, dδ, dlog_σ₁, dlog_σ₂, dlogit_θ)
+end
+
 _gradient_vector(x::Number) = [x]
 _gradient_vector(x) = collect(x)
 
-function check_plain_enzyme_gradient(artifact, have, reference_density)
+function check_plain_enzyme_gradient(
+        artifact, have, reference_density, reference_gradient)
     kernel = prepare(artifact.model; have, want = :density)
     values = if artifact.name === :eight_schools_extraction
         inputs = artifact.inputs
@@ -137,10 +184,14 @@ function check_plain_enzyme_gradient(artifact, have, reference_density)
         kernel, PPL_ENZYME_BACKEND, values...; active = first(have),
     )
     gradient = ad_gradient(prepared, values...)
-    reference_gradient = DifferentiationInterface.gradient(
-        reference_density, PPL_ENZYME_BACKEND, active)
+    expected_gradient = if reference_gradient === nothing
+        DifferentiationInterface.gradient(
+            reference_density, PPL_ENZYME_BACKEND, active)
+    else
+        reference_gradient(active)
+    end
     observed = _gradient_vector(gradient)
-    expected = _gradient_vector(reference_gradient)
+    expected = _gradient_vector(expected_gradient)
     @test length(observed) == length(expected)
     @test all(isfinite, observed)
     @test all(isapprox.(observed, expected))
@@ -150,29 +201,31 @@ end
     cases = (
         (evaluate_eight_schools_source(),
          (:unconstrained, :observations, :observation_scales),
-         eight_schools_reference_density),
+         eight_schools_reference_density, nothing),
         (evaluate_linear_regression_source(),
          (:unconstrained, :predictors, :responses),
-         linear_regression_reference_density),
+         linear_regression_reference_density, nothing),
         (evaluate_beta_binomial_source(),
          (:logit_rate, :trials, :successes),
-         beta_binomial_reference_density),
+         beta_binomial_reference_density, nothing),
         (evaluate_poisson_gamma_source(),
          (:log_rate, :counts),
-         poisson_gamma_reference_density),
+         poisson_gamma_reference_density, nothing),
         (evaluate_dugongs_source(),
          (:unconstrained, :ages, :lengths),
-         dugongs_reference_density),
+         dugongs_reference_density, nothing),
         (evaluate_arma11_source(),
          (:unconstrained, :series),
-         arma11_reference_density),
+         arma11_reference_density, nothing),
         (evaluate_gaussian_mixture_source(),
          (:unconstrained, :observations),
-         gaussian_mixture_reference_density),
+         gaussian_mixture_reference_density,
+         gaussian_mixture_reference_gradient),
     )
-    for (artifact, have, reference_density) in cases
+    for (artifact, have, reference_density, reference_gradient) in cases
         @testset "$(artifact.name)" begin
-            check_plain_enzyme_gradient(artifact, have, reference_density)
+            check_plain_enzyme_gradient(
+                artifact, have, reference_density, reference_gradient)
         end
     end
 end
