@@ -71,6 +71,20 @@ function Base.getproperty(source::CallableSource, name::Symbol)
 end
 end
 
+module AuthoringNestedKernelFixture
+using ..ReactiveKernels
+
+@kernel qualified_piece(x::Float64) = begin
+    y::Float64 = x + 1
+    return y
+end
+
+@kernel qualified_sum(x::Float64, y::Float64) = begin
+    total::Float64 = x + y
+    return total
+end
+end
+
 @testset "Declarative kernel authoring" begin
     @testset "function-shaped definitions, optional types, and exposed ports" begin
         f_calls = Ref(0)
@@ -302,6 +316,120 @@ end
                 out = x
             end
         end)
+    end
+
+    @testset "direct stateless KernelSpec calls inline one fused graph" begin
+        @kernel nested_piece(x::Float64) = begin
+            shifted::Float64 = x + 1
+            squared::Float64 = abs2(shifted)
+            return (shifted, squared)
+        end
+
+        @kernel nested_model(left::Float64, right::Float64) = begin
+            (left_shifted::Float64, left_squared::Float64) = nested_piece(left)
+            (right_shifted::Float64, right_squared::Float64) = nested_piece(right)
+            total::Float64 = left_squared + right_squared
+            return (left_shifted, right_shifted, total)
+        end
+
+        @test length(kernel_graph(nested_model).recipes) == 5
+        left_plan = plan(nested_model; want = :left_shifted)
+        total_plan = plan(nested_model; want = :total)
+        @test length(left_plan.recipes) == 1
+        @test length(total_plan.recipes) == 5
+        @test @inferred(prepare(left_plan)(2.0, 4.0)) == 3.0
+        @test @inferred(prepare(total_plan)(2.0, 4.0)) == 34.0
+        @test !occursin("nested_piece", sprint(show, code_expr(total_plan)))
+        @test ReactiveState(nested_model; materialize = :total).graph ===
+              kernel_graph(nested_model)
+        @test visualize(total_plan).subject === total_plan
+
+        @kernel qualified_model(x::Float64) = begin
+            y::Float64 = AuthoringNestedKernelFixture.qualified_piece(x)
+            return y
+        end
+        @test @inferred(prepare(qualified_model)(2.0)) == 3.0
+
+        @kernel repeated_argument_model(x::Float64) = begin
+            y::Float64 = AuthoringNestedKernelFixture.qualified_sum(x, x)
+            return y
+        end
+        @test @inferred(prepare(repeated_argument_model)(2.0)) == 4.0
+        @test_throws ArgumentError macroexpand(@__MODULE__, quote
+            @kernel nested_expression_argument(x::Float64) = begin
+                y::Float64 =
+                    AuthoringNestedKernelFixture.qualified_sum(x, x + 1)
+                return y
+            end
+        end)
+
+        @kernel nested_cse_piece(x::Float64) = begin
+            @recipe (cse_key = :nested_increment) y::Float64 = x + 1
+            return y
+        end
+        @kernel nested_cse_model(x::Float64) = begin
+            first::Float64 = nested_cse_piece(x)
+            second::Float64 = nested_cse_piece(x)
+            return (first, second)
+        end
+        @test length(kernel_graph(nested_cse_model).recipes) == 1
+        @test @inferred(prepare(nested_cse_model)(2.0)) == (3.0, 3.0)
+
+        @kernel nested_identity(x::Int) = begin
+            y::Int = x
+            return y
+        end
+        @kernel identity_model(x::Int) = begin
+            y::Int = nested_identity(x)
+            return y
+        end
+        identity_graph = kernel_graph(identity_model)
+        @test isempty(identity_graph.recipes)
+        @test ReactiveKernels.canon_id(identity_graph, identity_model.x.id) ==
+              ReactiveKernels.canon_id(identity_graph, identity_model.y.id)
+        @test @inferred(prepare(identity_model)(3)) == 3
+
+        @test_throws ArgumentError begin
+            @kernel nested_bad_input(x::Int) = begin
+                (shifted::Float64, squared::Float64) = nested_piece(x)
+                return shifted
+            end
+        end
+        @test_throws ArgumentError begin
+            @kernel nested_bad_output(x::Float64) = begin
+                (shifted::Int, squared::Float64) = nested_piece(x)
+                return shifted
+            end
+        end
+        @test_throws ArgumentError begin
+            @kernel nested_bad_arity(x::Float64) = begin
+                shifted::Float64 = nested_piece(x)
+                return shifted
+            end
+        end
+        @test_throws ArgumentError begin
+            @kernel nested_bad_metadata(x::Float64) = begin
+                @recipe (cost = 2) (shifted::Float64, squared::Float64) =
+                    nested_piece(x)
+                return shifted
+            end
+        end
+
+        @kernel nested_default(x::Float64 = 1.0) = begin
+            y::Float64 = x + 1
+            return y
+        end
+        @kernel nested_explicit_default(x::Float64) = begin
+            y::Float64 = nested_default(x)
+            return y
+        end
+        @test @inferred(prepare(nested_explicit_default)(2.0)) == 3.0
+        @test_throws ArgumentError begin
+            @kernel nested_missing_default() = begin
+                y::Float64 = nested_default()
+                return y
+            end
+        end
     end
 
     @testset "typed ports, zero-execution construction, and metadata" begin

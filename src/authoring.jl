@@ -185,6 +185,101 @@ function _kernel_add!(graph::Graph, ins, outs, op, cost, cse_key, effectful,
          cost = cost, cse_key = cse_key, effectful = effectful, source = source)
 end
 
+_kernel_inline_signature_supported(::Any) = false
+_kernel_inline_signature_supported(::Nothing) = true
+function _kernel_inline_signature_supported(
+    ::_KernelCallSignature{P,K,M},
+) where {P,K,M}
+    isempty(K)
+end
+
+function _kernel_inline_call_inputs(ins, source)
+    source isa Expr && source.head === :call || return Tuple(ins)
+    available = Dict(value.name => value for value in ins)
+    args = source.args[2:end]
+    all(arg -> arg isa Symbol && haskey(available, arg), args) || return Tuple(ins)
+    Tuple(available[arg] for arg in args)
+end
+
+function _kernel_inline_alias!(graph::Graph, from::Value, to::Value, context)
+    from_type = valtype(from)
+    to_type = valtype(to)
+    from_type == to_type || throw(ArgumentError(
+        "nested kernel $context type mismatch: :$(from.name) has type $from_type, " *
+        "but :$(to.name) has type $to_type; declare the caller boundary with the " *
+        "exact nested boundary type"))
+    source = canon_id(graph, from.id)
+    target = canon_id(graph, to.id)
+    source == target && return graph
+    graph.aliases[source] = target
+    graph.version += 1
+    graph
+end
+
+"""
+Splice a direct stateless `KernelSpec` call into its caller's graph.
+
+The callee is cloned with fresh `Value` identities on every call, then its
+default HAVE boundary is aliased to the call arguments and its default WANT
+boundary to the assignment outputs. Consequently the outer planner sees every
+callee recipe and can prune, fuse, CSE, visualize, or prepare it normally; no
+runtime `KernelSpec` call remains.
+"""
+function _kernel_add!(graph::Graph, ins, outs, spec::KernelSpec, cost, cse_key,
+                      effectful, source = _NO_KERNEL_SOURCE)
+    cost == 1.0 && cse_key === nothing && effectful === false ||
+        throw(ArgumentError(
+            "nested KernelSpec calls do not accept call-site @recipe metadata; " *
+            "put cost, cse_key, or effectful metadata on the nested kernel's recipes"))
+    _kernel_inline_signature_supported(spec.call_signature) || throw(ArgumentError(
+        "nested KernelSpec calls currently require a positional-only boundary; " *
+        "prepare kernels with keyword inputs separately"))
+
+    child_inputs = inputs(spec)
+    child_outputs = outputs(spec)
+    call_inputs = _kernel_inline_call_inputs(ins, source)
+    length(call_inputs) == length(child_inputs) || throw(ArgumentError(
+        "nested KernelSpec call has $(length(call_inputs)) argument(s), but its default HAVE " *
+        "boundary has $(length(child_inputs)) port(s)"))
+    length(outs) == length(child_outputs) || throw(ArgumentError(
+        "nested KernelSpec call assigns $(length(outs)) output(s), but its default WANT " *
+        "boundary has $(length(child_outputs)) port(s); destructure that boundary exactly"))
+
+    child_graph = spec.graph
+    cloned = Dict{Int,Value}()
+    for id in sort!(collect(keys(child_graph.values)))
+        value = child_graph.values[id]
+        cloned[id] = value!(graph, value.name, valtype(value))
+    end
+
+    # Preserve all proven aliases before attaching the cloned boundary. Alias
+    # chains remain valid if a later boundary attachment reparents their final
+    # canonical representative.
+    for id in sort!(collect(keys(child_graph.aliases)))
+        _kernel_inline_alias!(
+            graph,
+            cloned[id],
+            cloned[canon_id(child_graph, id)],
+            "internal alias",
+        )
+    end
+    for (actual, formal) in zip(call_inputs, child_inputs)
+        _kernel_inline_alias!(graph, cloned[formal.id], actual, "input")
+    end
+    for (actual, formal) in zip(outs, child_outputs)
+        _kernel_inline_alias!(graph, actual, cloned[formal.id], "output")
+    end
+
+    for recipe in child_graph.recipes
+        add!(graph;
+             inputs = Tuple(cloned[value.id] for value in recipe.inputs),
+             outputs = Tuple(cloned[value.id] for value in recipe.outputs),
+             op = recipe.op, cost = recipe.cost, cse_key = recipe.cse_key,
+             effectful = recipe.effectful, source = recipe.source)
+    end
+    _reindex_producers!(graph)
+end
+
 # A SINGLE-DEFINITION bare-identity recipe `b = a` (RHS a bare port, not a call) makes `b` a
 # CANONICAL ALIAS of `a` (RK 2026-08-27): both authored names resolve to ONE canonical Value —
 # one physical slot, one shared validity/currentness — instead of a distinct Value joined by an
@@ -932,12 +1027,21 @@ function _kernel_tensorized_rhs(ex)
 end
 
 function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
-                           tensorize::Bool = true)
+                           tensorize::Bool = true,
+                           mod::Union{Module,Nothing} = nothing)
     form = :fused
     if rhs isa Expr && rhs.head === :call && !isempty(rhs.args)
         callee = rhs.args[1]
         args = rhs.args[2:end]
         callee_is_port = callee isa Symbol && callee in known
+        callee_is_spec = mod isa Module &&
+                         _kernel_resolve_binding(mod, callee) isa KernelSpec
+        if callee_is_spec && !callee_is_port
+            all(arg -> arg isa Symbol && arg in known, args) || throw(ArgumentError(
+                "nested KernelSpec call arguments must be declared graph ports; " *
+                "assign an expression to a port before passing it to the nested kernel"))
+            return callee
+        end
         if callee isa Symbol && !callee_is_port && !_is_broadcast_operator(callee) &&
            length(args) == length(deps) &&
            all(i -> args[i] === deps[i], eachindex(args))
@@ -1216,7 +1320,8 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         cost = get(metadata, :cost, 1.0)
         cse_key = get(metadata, :cse_key, nothing)
         effectful = get(metadata, :effectful, false)
-        op = _kernel_operation(rhs, deps, known; tensorize = !effectful)
+        op = _kernel_operation(rhs, deps, known;
+                               tensorize = !effectful, mod = mod)
         push!(body, :($add_ref($graph_var, $dep_values, $out_values,
                                $op, $cost, $cse_key, $effectful,
                                $(QuoteNode(rhs)))))
@@ -1429,6 +1534,13 @@ Every signature argument and assignment is exposed by name. `return` is
 optional: without one, derived sink ports form the default `want` boundary;
 with one, the returned port names replace that default. Either way, every port
 remains selectable through `spec[:name]` or `want = :name`.
+
+A direct call to another stateless `KernelSpec` on a recipe RHS splices that
+kernel's recipes into this graph during construction. Pass existing typed ports
+positionally and destructure the nested default output boundary exactly. Every
+call site receives fresh internal value identities, so repeated calls remain
+independent while the outer planner can prune or CSE their recipes. No nested
+runtime call remains in a prepared kernel.
 
 A short expression body is a compact single-result kernel. Its value is exposed
 as a port named after the kernel, and that port is the default `want` boundary:
