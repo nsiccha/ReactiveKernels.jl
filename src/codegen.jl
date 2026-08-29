@@ -189,9 +189,8 @@ Lower a plan to an ordinary anonymous-function `Expr` of the form
 This `Expr` is a first-class artifact: it may be inspected (`code_expr`) and
 rewritten (`transform`) before compilation (gist §9).
 """
-lower(p::Plan) = first(_lower_with_ops(p))
-_lower_unembedded(p::Plan) =
-    first(_lower_with_ops(p; inline_embedded = false))
+lower(p::Plan) = first(_lower_with_ops(p; inline_embedded = false))
+_lower_unembedded(p::Plan) = lower(p)
 
 """
     lower_batched(p::Plan; batched, reduce = :+) -> Expr

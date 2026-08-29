@@ -36,6 +36,13 @@ const embedded_plate_middle = prepare(embedded_plate_model;
     total::Float64 = embedded_plate_middle(x, μ, logσ)
 end
 
+@kernel embedded_plate_shifted(x::Vector{Float64},
+                               μ::Float64,
+                               logσ::Float64) = begin
+    total::Float64 = embedded_plate_nlogpdf(x, μ, logσ)
+    shifted::Float64 = total + μ
+end
+
 # Function barrier so `@allocated` measures the kernel, not global-ref boxing.
 _plate_call(k, xs, μ, logσ) = k(xs, μ, logσ)
 
@@ -75,6 +82,17 @@ _plate_call(k, xs, μ, logσ) = k(xs, μ, logσ)
         @test !occursin("for ", string(outer.f.tensorized_ast))
         @test !any(op -> op isa ReactiveKernels.PreparedKernel, outer.ops)
         @test length(outer.ops) == length(embedded_plate_nlogpdf.ops)
+    end
+
+    @testset "public raw Plan lowering retains its outer operation table" begin
+        raw_plan = plan(embedded_plate_shifted;
+            have = (:x, :μ, :logσ), want = :shifted)
+        raw_ast = ReactiveKernels.lower(raw_plan)
+        raw_ops = Tuple(recipe.op for recipe in raw_plan.recipes)
+        @test length(raw_ops) == 2
+        @test first(raw_ops) === embedded_plate_nlogpdf
+        @test ReactiveKernels.compile(raw_ast)(raw_ops, xs, μ, logσ) ≈
+              k(xs, μ, logσ) + μ
     end
 
     @testset "invariant `exp(logσ)` is hoisted ABOVE the loop (Stan-parity)" begin
