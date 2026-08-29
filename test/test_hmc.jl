@@ -238,20 +238,24 @@ end
         -logdensity(position)
     end
     # Public compiled-group boundary: differentiate the scalar potential
-    # (= -logdensity) with DI+Enzyme prepared ONCE, filling the passed owned
-    # gradient buffer in place. No handwritten or allocating sampled gradient.
-    # `potential_scalar` intentionally does NOT touch potential_calls — the
-    # separate potential-only closure above must stay uncalled in NUTS (== 0).
-    potential_scalar(position) = -logdensity(position)
+    # (= -posterior) with RK's shared DI+Enzyme wrapper prepared ONCE. The
+    # posterior value and derivative come from one generated-kernel evaluation;
+    # only the sampler-facing sign convention is applied here. Model data are
+    # rebound as DI Constants on every call, with plain reverse mode and no
+    # runtime-activity or function annotation.
     initial = zeros(10)
     initial[2] = log(5.0)
-    gradient_preparation =
-        prepare_gradient(potential_scalar, _HMC_ENZYME_BACKEND, copy(initial))
+    posterior_ad = prepare_ad(
+        density_kernel, _HMC_ENZYME_BACKEND,
+        copy(initial), observations, scales; active = :unconstrained,
+    )
     potential_gradient!(gradient, position) = begin
         gradient_calls[] += 1
-        first(value_and_gradient!(potential_scalar, gradient,
-                                  gradient_preparation, _HMC_ENZYME_BACKEND,
-                                  position))
+        density_calls[] += 1
+        posterior = first(ad_value_and_gradient!(
+            posterior_ad, gradient, position, observations, scales))
+        gradient .*= -1
+        -posterior
     end
     group = reactive_nuts_group(
         potential_gradient!, Diagonal(ones(10)), initial, zeros(10))
@@ -281,8 +285,8 @@ end
     @test warmup.final_stepsize > 0
     @test all(>(0), diag(warmup.metric))
     @test maximum(vec(std(chain.samples; dims = 2))) > 0.01
-    # The selected combined gradient recipe owns potential+gradient; the
-    # cheaper potential-only alternative must never be called in NUTS.
+    # The prepared RK/DI boundary owns potential+gradient; the separate
+    # potential-only alternative must never be called in NUTS.
     @test potential_calls[] == 0
     @test gradient_calls[] > 1
     @test density_calls[] > gradient_calls[]

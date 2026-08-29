@@ -43,6 +43,24 @@ const TEST_AD_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
             ) ≈ newdata .- 2newscale .* newparameters
         end
 
+        # The combined prepared boundary reuses the same active ordering and
+        # freshly rebound Constant data, while writing into caller-owned
+        # gradient storage.
+        changed_data = [1.5, -2.0, 0.25]
+        changed_parameters = [-0.1, 0.4, 0.8]
+        changed_scale = 0.6
+        changed_offset = -1.25
+        destination = fill(NaN, length(changed_parameters))
+        value, returned_gradient = ad_value_and_gradient!(
+            prepared, destination, changed_parameters, changed_scale;
+            data = changed_data, offset = changed_offset,
+        )
+        @test value ≈ sum(changed_parameters .* changed_data) -
+              changed_scale * sum(abs2, changed_parameters) + changed_offset
+        @test returned_gradient === destination
+        @test destination ≈
+              changed_data .- 2changed_scale .* changed_parameters
+
         @test_throws UndefKeywordError prepare_ad(
             objective, TEST_AD_BACKEND, parameters;
             data, active = :q,
