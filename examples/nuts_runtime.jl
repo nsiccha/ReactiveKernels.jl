@@ -19,6 +19,7 @@ const _RUNTIME_FILES = (
     "kernel_nuts_native.jl",
     "hmc.jl",
     "reactive_nuts.jl",
+    "kernel_nuts_reactant.jl",
 )
 
 # The exemplar extends private compiler seams deliberately, but only when explicitly
