@@ -1,7 +1,7 @@
 # Incremental and mergeable online statistics
 
-Online mean and variance are a compact example of the boundary between pure
-state transitions and reactive orchestration. A `MomentsAccumulator{T}` stores
+Online mean and variance are a compact example of the line between pure state
+updates and reactive bookkeeping. A `MomentsAccumulator{T}` stores
 only `(n, mean, m2)`. Welford's update consumes one observation, while Chan's
 parallel formula combines independently processed partitions. The same
 building block also summarizes the per-transition diagnostics the compiled
@@ -18,7 +18,7 @@ The complete runnable implementation is
 It fixes the storage type to a floating `T`, which keeps empty and singleton
 `NaN` results type-stable.
 
-## One source, generated subkernel, and colored plan
+## One source, its generated kernel, and its plan
 
 The Raw pane below declares update/summary and partition-merge fragments with
 `@kernel`, composes them by name, and prepares only the streaming query. The
@@ -201,8 +201,8 @@ when a merged count exceeds its largest finite value.
 `ReactiveState` treats `state` and `observation` as authoritative inputs.
 Replacing an observation invalidates and recomputes `updated`; it does not
 silently fold into the previous result. Advancing a stream means explicitly
-promoting the returned accumulator to the next `state` input. Frozen values
-remain cut points until `unfreeze!` is called.
+promoting the returned accumulator to the next `state` input. A frozen value
+stays fixed until you call `unfreeze!`.
 
 ## Mutation-friendly reactive authoring
 
@@ -237,14 +237,14 @@ end
 get!(state, total)                       # 15.0, recomputed on demand
 ```
 
-Derived values live in owned typed slots, so `freeze!`/`unfreeze!` and
+Derived values live in buffers the state owns, so `freeze!`/`unfreeze!` and
 `checkpoint` behave exactly as they do for `ReactiveState`: a frozen `total`
 stays fixed under later `mutate!` calls, and a checkpoint replays into a fresh
-`program(...; frozen = cp)` instance. This is the supported way to get
-mutation-friendly (`!!`-style) ergonomics inside a reactive layer. The direct
+`program(...; frozen = cp)` instance. This is the supported way to get in-place
+(`!!`-style) updates inside a reactive layer. The direct
 [`prepare_nonallocating`](nonallocating.md) kernels are a separate,
-single-caller optimization whose borrowed caches are not persisted through the
-reactive layers.
+single-caller tool whose borrowed caches are not carried through the reactive
+layers.
 
 ## Measurement contract
 
@@ -252,10 +252,10 @@ reactive layers.
 steady-state allocations in one run, and elapsed time in a separate run.
 `diagnostics_performance_report` applies the same measurement contract to the
 HMC diagnostics update kernel.
-`reactive_performance_report` does the same for the orchestration path, whose
-allocation count deliberately includes source versioning, invalidation,
-planning-cache lookup, and materialization. Timings are reported observations,
-not pass/fail thresholds.
+`reactive_performance_report` does the same for the reactive path, whose
+allocation count deliberately includes the reactive bookkeeping — version
+tracking, invalidation, the planning-cache lookup, and building the result.
+Timings are reported observations, not pass/fail thresholds.
 
 ```julia
 model = OnlineStatsExample.build_online_stats_graph()
