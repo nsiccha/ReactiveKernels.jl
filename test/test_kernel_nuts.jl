@@ -45,6 +45,42 @@ _slot(pf, ep, f) = RK._canon_slot(ep, RK.kernel_plan_named_slot_val(RK.kernel_pr
     @test RK._diag_slot(frame.diag, Val(4)) != 0.0            # dham is a real (fresh-momentum) energy error, not stale 0
 end
 
+@testset "kernel_nuts — source-semantic backward U-turn invalidates endpoint velocity" begin
+    pf = _nuts_pf()
+    values = _nuts_mkvals(pf, Float64)
+    plan = RK.kernel_prepared_plan(pf)
+    metric_canon = only(s.canon for s in RK.kernel_plan_slots(plan)
+        if s.path == (:metric,))
+    metric = values[metric_canon]
+    make_frame() = begin
+        frame = RK._construct_nuts_frame(pf, values, 8;
+            step_f=RK.partial(_NutsFix.leapfrog!; stepsize=0.1),
+            stats_f=_NutsFix.nuts_stats!, min_dham=-1000)
+        RK.compile_prepared_initialization(
+            pf, typeof(frame.init), typeof(frame.shared))(
+                frame.init, frame.shared, RK.kernel_prepared_handles(pf))
+        RK._seed_nuts_children!(frame)
+        frame
+    end
+    outputs = Any[]
+    for compile_transition in (RK.compile_nuts, RK.compile_nuts_native)
+        frame = make_frame()
+        compiled = compile_transition(
+            pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!,
+            _NutsFix.nuts!!, frame)
+        compiled.root!(frame, compiled.scratch, Random.Xoshiro(777))
+        position = copy(_slot(pf, frame.init, :pos))
+        momentum = copy(_slot(pf, frame.init, :mom))
+        velocity = copy(_slot(pf, frame.init, :dkin_dmom))
+        @test position ≈ [1.5941958933255589, 0.23013198901670232]
+        @test velocity ≈ metric \ momentum
+        @test frame.diag.reached_depth == 5
+        @test frame.diag.n_steps == 31
+        push!(outputs, (position, momentum, velocity))
+    end
+    @test outputs[1] == outputs[2]
+end
+
 # typed-batch allocation gate (RK): a fully-typed Val{N} while loop, warmed, so the LOOP path (not just a
 # single call) is measured — this is what an HMC sampler drives. The public root must be EXACTLY 0-B here.
 @inline function _nuts_batch(root, fr, sc, rng, ::Val{N}) where {N}

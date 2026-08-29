@@ -664,6 +664,86 @@ function _nn_rhs_dot(T::Type,C::_NativeEmitCtx)
     end
 end
 
+function _nn_endpoint_write_target(T::Type, C::_NativeEmitCtx)
+    if T <: _NNGetfield
+        B, field = T.parameters
+        _nn_kind(B, C) === :endpoint || return nothing
+        return (_nn_val(B, C), field)
+    elseif T <: _NNSelfField
+        path = T.parameters[1]
+        length(path) == 2 && path[1] in _EP_SELF || return nothing
+        endpoint = Expr(:call, GlobalRef(Core, :getfield), C.frame, QuoteNode(path[1]))
+        return (endpoint, path[2])
+    end
+    nothing
+end
+
+# Type-level equivalent of `_exec_kill_closure`, using only the immutable plan key available while
+# generating a `_NativeProgram` method.  Return physical owned slots because an endpoint carries only
+# the plan's owned storage.
+function _nn_endpoint_write_slots(P::Type{<:_KernelPlan}, field::Symbol)
+    key = P.parameters[1]
+    slot_signature = key[2]
+    producer = key[4]
+    recipes = key[5]
+    recipe_inputs = Dict{Int,Any}(key[6])
+
+    field_index = findfirst(entry -> entry[1] == (field,), slot_signature)
+    field_index === nothing && _native_reject("plan has no endpoint write field `$field`")
+    target_canon = slot_signature[field_index][2]
+    role, target_slot = _native_plan_field(P, field)
+    role === :owned || _native_reject("endpoint write target `$field` is not owned")
+
+    stale = Set{Int}()
+    changed = true
+    while changed
+        changed = false
+        for recipe in recipes
+            any(input -> input == target_canon || input in stale,
+                get(recipe_inputs, recipe, ())) || continue
+            for (canon, owner) in producer
+                owner == recipe || continue
+                if !(canon in stale)
+                    push!(stale, canon)
+                    changed = true
+                end
+            end
+        end
+    end
+    dependent_slots = sort!(unique(Int[
+        entry[4] for entry in slot_signature
+        if entry[3] === :owned && entry[2] in stale && entry[4] != target_slot
+    ]))
+    target_slot, dependent_slots
+end
+
+function _nn_endpoint_write(W::Type{<:_NNPlaceWrite}, C::_NativeEmitCtx,
+        endpoint_expr, field::Symbol; rhs_override=nothing)
+    T, Root, Owner, Alias, R, Dot = W.parameters
+    Dot || _native_reject("endpoint write to `$field` must be a broadcast write")
+    target_slot, dependent_slots = _nn_endpoint_write_slots(C.plan, field)
+    endpoint = gensym(:nn_write_endpoint)
+    rhs = gensym(:nn_write_rhs)
+    rhs_expr = rhs_override === nothing ? _nn_rhs_dot(R, C) : rhs_override
+    destination = Expr(:call, GlobalRef(@__MODULE__, :_canon_slot), endpoint,
+        :(Val($target_slot)))
+    effects = Any[
+        Expr(:call, GlobalRef(@__MODULE__, :_canon_kill!), endpoint,
+            :(Val($target_slot)))
+    ]
+    append!(effects, Any[
+        Expr(:call, GlobalRef(@__MODULE__, :_canon_kill!), endpoint, :(Val($slot)))
+        for slot in dependent_slots
+    ])
+    push!(effects,
+        Expr(:call, GlobalRef(Base, :materialize!), destination, rhs),
+        Expr(:call, GlobalRef(@__MODULE__, :_canon_bless!), endpoint,
+            :(Val($target_slot))))
+    body = Expr(:block, effects...)
+    Expr(:let, Expr(:(=), endpoint, endpoint_expr),
+        Expr(:let, Expr(:(=), rhs, rhs_expr), body))
+end
+
 function _nn_write(W::Type{<:_NNPlaceWrite},C::_NativeEmitCtx; rhs_override=nothing)
     T,Root,Owner,Alias,R,Dot=W.parameters
     rhs = rhs_override === nothing ? _nn_val(R,C) : rhs_override
@@ -676,6 +756,8 @@ function _nn_write(W::Type{<:_NNPlaceWrite},C::_NativeEmitCtx; rhs_override=noth
         end
         return Expr(:(=),Expr(:.,C.frame,QuoteNode(f)),rhs)
     end
+    endpoint = _nn_endpoint_write_target(T, C)
+    endpoint === nothing || return _nn_endpoint_write(W, C, endpoint...; rhs_override)
     dest=_nn_dest(T,C)
     Dot ? Expr(:call,GlobalRef(Base,:materialize!),dest,_nn_rhs_dot(R,C)) : Expr(:(=),dest,rhs)
 end

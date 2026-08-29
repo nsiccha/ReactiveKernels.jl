@@ -470,6 +470,46 @@ function nplace_lv(t, lm, C)
     end
 end
 
+function _n_endpoint_write_target(t, lm, C::NCtx)
+    if t isa _SelfField && length(t.path) == 2 && t.path[1] in _EP_SELF
+        endpoint = Expr(:call, GlobalRef(Core, :getfield), C.S, QuoteNode(t.path[1]))
+        return (endpoint, t.path[2])
+    elseif t isa _Getfield && nkind(t.base, C) === :endpoint
+        return (nev(t.base, lm, C), t.field)
+    end
+    nothing
+end
+
+# Endpoint writes mutate authored HAVE storage.  Evaluate the endpoint and complete RHS before
+# changing currentness, then invalidate the target and its producer-owned dependency closure before
+# materialize! can partially write.  Only a successful write revalidates the authored target.
+function _n_endpoint_write(pw::_PlaceWrite, lm, C::NCtx, endpoint_expr, field::Symbol)
+    pw.dot || _l_reject("endpoint write to `$field` must be a broadcast write")
+    canon_by_name = _exec_canon_map(C.PL)
+    haskey(canon_by_name, field) || _l_reject("endpoint write target `$field` has no prepared canon")
+    target_canon = canon_by_name[field]
+    role, target_slot = kernel_plan_field(C.PL, target_canon)
+    role === :owned || _l_reject("endpoint write target `$field` is not owned")
+    dependent_slots = sort!(unique(Int[
+        kernel_plan_field(C.PL, canon)[2]
+        for canon in _exec_kill_closure(C.PL, target_canon)
+        if kernel_plan_field(C.PL, canon)[1] === :owned
+    ]))
+
+    endpoint = _dsym(C.ctr, :write_endpoint)
+    rhs = _dsym(C.ctr, :write_rhs)
+    destination = :(_canon_slot($endpoint, Val($target_slot)))
+    effects = Any[:(_canon_kill!($endpoint, Val($target_slot)))]
+    append!(effects, Any[:(_canon_kill!($endpoint, Val($slot)))
+                         for slot in dependent_slots if slot != target_slot])
+    push!(effects,
+        :(Base.materialize!($destination, $rhs)),
+        :(_canon_bless!($endpoint, Val($target_slot))))
+    body = Expr(:block, effects...)
+    Expr(:let, Expr(:(=), endpoint, endpoint_expr),
+        Expr(:let, Expr(:(=), rhs, nrhs_dot(pw.rhs, lm, C)), body))
+end
+
 function nwrite(pw::_PlaceWrite, lm, C)
     t = pw.target
     if t isa _SelfField && length(t.path) == 1
@@ -483,6 +523,8 @@ function nwrite(pw::_PlaceWrite, lm, C)
         end
         return Expr(:(=), Expr(:., C.S, QuoteNode(f)), nev(pw.rhs, lm, C))
     end
+    endpoint = _n_endpoint_write_target(t, lm, C)
+    endpoint === nothing || return _n_endpoint_write(pw, lm, C, endpoint...)
     # endpoint canon field (self.fwd.mom or ep.mom) / tree NamedTuple / vector element
     dest = t isa _SelfField ? first(nself_read(t.path, C)) : ndest(t, lm, C)
     pw.dot ? :(Base.materialize!($dest, $(nrhs_dot(pw.rhs, lm, C)))) : Expr(:(=), dest, nev(pw.rhs, lm, C))

@@ -100,6 +100,25 @@ end
     @test RK.diagnostics_committed_mask(fr.diag) == UInt(0x0f)
 end
 
+@testset "native NUTS — type-level endpoint invalidation equals the plan closure" begin
+    pf = _native_pf()
+    plan = RK.kernel_prepared_plan(pf)
+    canon_by_name = RK._exec_canon_map(plan)
+    target = canon_by_name[:mom]
+    target_slot, dependent_slots = RK._nn_endpoint_write_slots(typeof(plan), :mom)
+    expected_slots = sort!(unique(Int[
+        RK.kernel_plan_field(plan, canon)[2]
+        for canon in RK._exec_kill_closure(plan, target)
+        if RK.kernel_plan_field(plan, canon)[1] === :owned &&
+            RK.kernel_plan_field(plan, canon)[2] != target_slot
+    ]))
+    named_slot(name) = typeof(RK.kernel_plan_named_slot_val(plan, Val(name))).parameters[1]
+    @test target_slot == RK.kernel_plan_field(plan, target)[2]
+    @test dependent_slots == expected_slots
+    @test Set(dependent_slots) == Set([
+        named_slot(:dkin_dmom), named_slot(:kin), named_slot(:ham)])
+end
+
 function _native_obs(pf,f)
     P=RK.kernel_prepared_plan(pf)
     slot(ep,n)=RK._canon_slot(ep,RK.kernel_plan_named_slot_val(P,Val(n)))
