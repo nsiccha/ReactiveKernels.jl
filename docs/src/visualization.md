@@ -1,8 +1,8 @@
 # DAG visualization
 
-ReactiveKernels separates the computation graph from its runtime kernel, so
-visualization is also a planning-time operation. It never participates in a
-prepared kernel's hot path.
+ReactiveKernels keeps the computation graph separate from the kernel that runs,
+so drawing a graph is a planning-time step. It never runs inside a prepared
+kernel.
 
 ## Quick use
 
@@ -25,8 +25,8 @@ dot_source(p)
 
 `Graph` supports the same calls and shows every registered recipe. A `Plan`
 shows only selected recipes by default, because that is usually the answer to
-“what will run?”. With `alternatives=true`, backward-reachable candidates that
-lost the cost selection remain visible as muted dashed nodes.
+“what will run?”. With `alternatives=true`, recipes that could have produced a
+wanted value but lost on cost stay visible as muted dashed nodes.
 
 The HTML view is rendered by
 [Cytoscape.js](https://js.cytoscape.org/) with the
@@ -76,9 +76,9 @@ interactive buttons.
 
 ## Reading a diagram
 
-The diagram is bipartite: values are ellipses, recipes are boxes, and every
-edge follows `value → recipe → value`. This keeps multi-input and multi-output
-recipes explicit rather than approximating them with ambiguous direct edges.
+The diagram has two kinds of node: values are ellipses and recipes are boxes,
+and every edge goes `value → recipe → value`. This keeps multi-input and
+multi-output recipes explicit instead of drawing ambiguous value-to-value edges.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_visualization_legend()
@@ -86,8 +86,8 @@ Main.ReactiveKernelsDocs.render_visualization_legend()
 
 Canvas labels retain the complete value or operation name and wrap when needed.
 The node picker and inspector retain the full type, identity, cost, state, and
-incoming/outgoing names. Structural-CSE aliases share one value node and list
-all alias names.
+incoming/outgoing names. When two values are recognized as the same (a shared
+subexpression), they share one node, which lists all their names.
 
 ## Why HTML plus SVG plus DOT?
 
@@ -104,7 +104,6 @@ static diagram format but not as strong for structural inspection; React Flow
 would introduce React into the Vue-based docs host; Sigma targets much larger
 free-form networks. Graph editing and runtime profiling remain out of scope.
 
-Successful `Plan`s are acyclic. A raw `Graph` may still contain a cycle; the
-built-in SVG keeps the involved nodes visible at a stable final rank so the
-backward edges expose the problem, while DOT remains available for a more
-sophisticated diagnostic layout.
+Successful `Plan`s have no cycles. A raw `Graph` can still contain one; the
+built-in SVG still shows the nodes involved so the looping edges are visible,
+while DOT is available for a more detailed diagnostic layout.

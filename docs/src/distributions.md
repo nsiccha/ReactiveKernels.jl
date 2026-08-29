@@ -11,8 +11,8 @@ independent oracle—the generated kernels below do not call it.
 
 Write formulas from values already in hand. If the model parameter is `logσ`,
 use it directly in the normalizer and derive `σ = exp(logσ)` only for the
-standardized residual. RK performs graph planning and structural CSE, not
-algebraic rewriting such as cancelling `log(exp(logσ))`.
+standardized residual. RK plans the graph and reuses a repeated subexpression,
+but it does no algebra — it will not cancel `log(exp(logσ))` for you.
 
 Each panel below shows the **Raw input** (the source), the **Generated kernel**
 (`code_expr`), and its **Compute DAG**.
@@ -41,11 +41,12 @@ Main.ReactiveKernelsDocs.execute_example(
 
 ## Batched: the same recipe with `plate`
 
-`plate` marks observation ports as batched and generates the reduction. Recipes
-depending only on shared parameters are hoisted: here `exp(logσ)` runs once,
-while the residual and density run per observation. The default returns the
-sum without an intermediate vector; `reduce = nothing` returns per-observation
-values for LOO/WAIC. Multiple ports may be batched together.
+`plate` marks observation ports as batched and adds the sum over observations.
+Steps that depend only on shared parameters are lifted out of the loop: here
+`exp(logσ)` runs once, while the residual and density run per observation. The
+default returns the sum without building an intermediate vector; `reduce =
+nothing` returns the per-observation values for LOO/WAIC. Several ports can be
+batched together.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
@@ -136,9 +137,9 @@ Main.ReactiveKernelsDocs.execute_example(
 )
 ```
 
-These rows are derived from the four `PreparedKernel`s built by that source.
-Matrix boundaries include a factorization recipe; pre-factorized boundaries cut
-the graph after it.
+These rows are derived from the four `PreparedKernel`s built by that source. When
+you start from a full matrix the plan includes the factorization; when you start
+from an already-factored form the plan skips it.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_mvn_parametrization_plans(
@@ -156,10 +157,9 @@ Main.ReactiveKernelsDocs.execute_example(
 )
 ```
 
-Both examples then apply `replica(...; batched = :x)`: a matrix represents
-independent vectors or independent series by columns. The inner coordinate/time
-axis remains coupled, while the added trailing axis maps the whole authored
-kernel.
+Both examples then apply `replica(...; batched = :x)`: a matrix holds independent
+vectors or independent series, one per column. The inner coordinate/time axis
+stays coupled, while the new trailing axis runs the whole kernel once per column.
 
 ### Structured native and Reactant benchmark
 
