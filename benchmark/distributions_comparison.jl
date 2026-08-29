@@ -30,6 +30,10 @@ const RK_REDUCE = plate(
     benchmark_normal_logpdf;
     have = (:x, :μ, :σ), want = :logdensity, batched = (:x,),
 )
+const RK_SCALAR = prepare(
+    benchmark_normal_logpdf; have = (:x, :μ, :σ), want = :logdensity,
+)
+const RK_REPLICATED = replica(RK_SCALAR; batched = :x)
 
 distributions_reduce(μ, σ, xs) =
     sum(Distributions.logpdf.(Distributions.Normal(μ, σ), xs))
@@ -58,6 +62,8 @@ function hand_hoisted_reduce(μ, σ, xs)
 end
 
 compile_rk(xs, μ, σ) = @compile sync = true RK_REDUCE(xs, μ, σ)
+compile_rk_replicated(xs, μ, σ) =
+    @compile sync = true RK_REPLICATED(xs, μ, σ)
 compile_pm(μ, σ, xs) = @compile sync = true probability_measures_reduce(μ, σ, xs)
 compile_distributions(μ, σ, xs) =
     @compile sync = true distributions_reduce(μ, σ, xs)
@@ -98,11 +104,45 @@ function _sizes()
     Tuple(parse(Int, strip(item)) for item in split(raw, ','))
 end
 
+function _replica_counts()
+    raw = get(ENV, "RK_DENSITY_REPLICAS", "")
+    isempty(raw) && return (1, 16, 256)
+    Tuple(parse(Int, strip(item)) for item in split(raw, ','))
+end
+
 function _output_path()
     for arg in ARGS
         startswith(arg, "--output=") && return split(arg, '='; limit = 2)[2]
     end
     nothing
+end
+
+function _reactant_amortization(μ, σ, rμ, rσ, rounds)
+    rows = Dict{String,Any}[]
+    for replicas in _replica_counts()
+        replicas > 0 || throw(ArgumentError("RK_DENSITY_REPLICAS must be positive"))
+        xs = [0.17 + 0.001 * (j - 1) for j in 1:replicas]
+        references = [RK_SCALAR(x, μ, σ) for x in xs]
+        native = RK_REPLICATED(xs, μ, σ)
+        isapprox(native, references; rtol = 1e-11) ||
+            error("native replicated value mismatch at replicas=$replicas")
+
+        rxs = Reactant.to_rarray(xs)
+        compile_s = @elapsed compiled = compile_rk_replicated(rxs, rμ, rσ)
+        observed = Array(compiled(rxs, rμ, rσ))
+        isapprox(observed, references; rtol = 1e-11) ||
+            error("Reactant replicated value mismatch at replicas=$replicas")
+        measurement = _measurement(compiled, rxs, rμ, rσ; rounds)
+        push!(rows, Dict{String,Any}(
+            "n" => 1,
+            "replicas" => replicas,
+            "max_abs_error" => maximum(abs.(observed .- references)),
+            "rk_reactant_replicated" => measurement,
+            "median_ns_per_evaluation" => measurement["median_ns"] / replicas,
+            "compile_seconds" => compile_s,
+        ))
+    end
+    rows
 end
 
 function run_benchmark()
@@ -199,6 +239,8 @@ function run_benchmark()
         @printf("N=%d complete\n", n)
     end
 
+    amortization = _reactant_amortization(μ, σ, rμ, rσ, rounds)
+
     receipt = Dict{String,Any}(
         "schema" => "distribution-logdensity-v1",
         "generated_at" => string(now(UTC), "Z"),
@@ -232,6 +274,11 @@ function run_benchmark()
             "reactant_compile_time_in_timed_region" => false,
             "reactant_compile_order" => ["ReactiveKernels", "ProbabilityMeasures", "Distributions"],
             "reactant_compile_times_include_first_service_startup" => true,
+            "reactant_replica_counts" => collect(_replica_counts()),
+            "reactant_replica_axis" =>
+                "independent one-observation data sets on the trailing x axis",
+            "reactant_replica_normalization" =>
+                "whole-batch median divided by replica count",
             "native_distributions_spelling" =>
                 "sum(Distributions.logpdf.(Distributions.Normal(μ, σ), xs))",
             "native_probability_measures_spelling" =>
@@ -244,6 +291,7 @@ function run_benchmark()
             "distributions_reactant_error" => distributions_reactant_error,
         ),
         "measurements" => rows,
+        "reactant_amortization" => amortization,
     )
 
     output = _output_path()
