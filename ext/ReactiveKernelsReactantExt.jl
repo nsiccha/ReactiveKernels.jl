@@ -217,7 +217,8 @@ function compile_nuts_reactant_transition(plan, cfg)
     Base.invokelatest(() -> Core.getglobal(@__MODULE__, fname))
 end
 
-compile_nuts_reactant_executable(transition, state) =
-    Base.invokelatest(Reactant.compile, transition, (state,); serializable=true)
+compile_nuts_reactant_executable(transition, state; sync::Bool=false) =
+    Base.invokelatest(
+        Reactant.compile, transition, (state,); serializable=true, sync)
 
 end # module ReactiveKernelsReactantExt

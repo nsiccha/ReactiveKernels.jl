@@ -1,0 +1,93 @@
+generated_at = "2026-08-29T20:07:08.202Z"
+schema = "nuts-reactant-v1"
+
+[acceptance]
+all_overflow_flags_zero = true
+exact_control_and_random_consumption_parity = true
+matched_control_flow_corpus = true
+matched_independent_start_states = true
+parity_screening_reported = true
+per_transition_tolerance_bounded_phase_diagnostic_parity = true
+same_authored_transition = true
+same_target_metric_state_depth_randomness = true
+stablehlo_while_count = 1
+
+[compilation]
+all_input_state_transfers_seconds = 0.173055392
+matched_corpus_screening_seconds = 3.567337072
+native_first_execution_seconds = 1.215014367
+native_seconds = 14.343494536
+reactant_first_execution_seconds = 0.507878105
+reactant_lower_seconds = 3.7744218
+reactant_total_seconds = 69.43705369999999
+reactant_xla_seconds = 65.6626319
+warm_input_transfer_seconds = 0.199723279
+
+[environment]
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+julia_threads = 1
+os = "Linux"
+reactant_backend = "default CPU"
+
+[medians]
+native_steps_per_second = 419846.0345870038
+native_transition_ms = 0.02858190625
+reactant_over_native_steps_per_second = 0.0029308207716765866
+reactant_over_native_transition_time = 385.0446108278729
+reactant_steps_per_second = 1230.4934790736374
+reactant_transition_ms = 11.005308968749997
+
+[pins]
+accepted_implementation_sha = "0c96826957b9eee177be5818239e30e587109d8c"
+authored_fixture_blob = "09667a966f32e9106e8092f0465bf3244a32ff83"
+julia_version = "1.10.11"
+reactant_jll_version = "0.0.401+0"
+reactant_version = "0.2.278"
+reactivekernels_dirty = false
+reactivekernels_sha = "583d614a1be9e372b2ddbbeacd2d1b2b296b3a20"
+
+[protocol]
+adaptation_measured = false
+bundle_seed_hex = "0x726b5f6e757473"
+candidate_bundles_examined = 295
+candidate_bundles_rejected = 7
+candidate_selection = "first N candidates with tolerance-bounded floating phase/diagnostic parity and exact control/random-consumption parity; screening is outside timing"
+compile_order = ["native source compiler", "Reactant lowering", "Reactant XLA compile"]
+compile_time_in_steady_state = false
+compile_times_include_first_julia_jit = true
+control_and_random_consumption_parity = "exact"
+dimension = 5
+end_to_end_sampling_measured = false
+ess_measured = false
+floating_parity_absolute_tolerance = 2.842170943040401e-14
+floating_parity_relative_tolerance = 0.0
+host_device_transfers_in_steady_state = false
+input_rebundle_in_steady_state = false
+max_depth = 10
+metric = "unit diagonal Euclidean"
+parity_screening_in_steady_state = false
+per_transition_state_setup_in_steady_state = false
+randomness = "identical pre-generated full-capacity momentum/direction/exponential bundles selected from a deterministic candidate stream"
+reactant_sync = true
+result_readback_in_steady_state = false
+rng_generation_in_steady_state = false
+rounds = 9
+state = "independent matched starting state for every full adaptive transition"
+stepsize = 0.3
+target = "5D standard normal potential with analytic in-place gradient"
+timing = "per-call @elapsed; median of per-round aggregate synchronous execution"
+transitions_per_round = 32
+
+[raw]
+native_round_seconds = [0.001611244, 0.0015404319999999998, 0.0013948989999999998, 0.001266236, 0.000888401, 0.0008210800000000001, 0.000848189, 0.000861597, 0.000914621]
+native_steps_per_second = [238325.16986874738, 262264.09215077333, 301097.0686766569, 334850.6913403189, 477261.95715673437, 506649.7783407219, 471593.0058041309, 510679.58686021424, 419846.0345870038]
+native_transition_ms = [0.050351375, 0.048138499999999994, 0.04359059375, 0.039569875, 0.02776253125, 0.02565875, 0.02650590625, 0.02692490625, 0.02858190625]
+reactant_round_seconds = [0.539416585, 0.424701435, 0.37507768300000005, 0.2928859299999999, 0.269509674, 0.25309897899999995, 0.325072832, 0.3574757230000001, 0.3521698869999999]
+reactant_steps_per_second = [711.8802251881076, 951.2564985799966, 1119.7680348260014, 1447.6625763484103, 1573.2273862644354, 1643.625753227555, 1230.4934790736374, 1230.8528151434773, 1090.3828356000242]
+reactant_transition_ms = [16.85676828125, 13.27191984375, 11.721177593750001, 9.152685312499997, 8.422177312499999, 7.909343093749999, 10.158526, 11.171116343750002, 11.005308968749997]
+round_directions = [116, 119, 121, 121, 121, 120, 118, 123, 116]
+round_divergences = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+round_exponentials = [336, 366, 375, 382, 378, 381, 364, 399, 345]
+round_max_reached_depth = [4, 4, 4, 4, 4, 4, 4, 4, 4]
+round_steps = [384, 404, 420, 424, 424, 416, 400, 440, 384]

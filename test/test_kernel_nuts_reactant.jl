@@ -202,7 +202,7 @@ end
         traced_frame = _nr_test_frame(Float64, 1)
         state = map(Reactant.to_rarray,
             ReactiveKernels.nuts_reactant_state(compiled, traced_frame, bundle))
-        executable = ReactiveKernels.nuts_reactant_compile(compiled, state)
+        executable = ReactiveKernels.nuts_reactant_compile(compiled, state; sync=true)
         output = executable(state)
         hlo = executable.module_string
 
