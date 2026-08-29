@@ -44,7 +44,7 @@ log prior + log Jacobian + log likelihood ──► unconstrained log density
 
 The likelihood is authored once as a scalar per-school `@kernel` and `plate`d
 into a vectorized log density: it iterates the batched ports and sums the scalar
-result in one fused pass, materializing no per-observation vector (and hoisting
+result in one pass, without building a per-observation vector (and it moves
 shared work above the loop).
 
 The panel below shows three views of this model: **Raw input** (the source),
