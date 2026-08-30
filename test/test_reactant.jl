@@ -525,4 +525,5 @@ end
     end
 end
 
+include("test_nutpie_reactant.jl")
 include("test_kernel_nuts_reactant.jl")
