@@ -21,7 +21,9 @@ using Test
     @test !occursin("JULIA_DEPOT_PATH", workflow)
     @test occursin("timeout-minutes: 90", package_matrix)
     @test occursin("julia-version: ['lts', '1', 'pre']", package_matrix)
+    @test occursin("julia-arch: [x64]", package_matrix)
     @test occursin("os: [ubuntu-latest, windows-latest, macOS-latest]", package_matrix)
+    @test occursin("uses: julia-actions/cache", package_matrix)
     @test !occursin(r"compiled_modules:\s*no", workflow)
     @test !occursin("cache-compiled: false", workflow)
     @test length(collect(eachmatch(r"compiled_modules:", workflow))) == 1
@@ -35,5 +37,6 @@ using Test
     @test occursin("Pkg.precompile(; strict=true)", smoke)
     @test occursin("using ReactiveKernels", smoke)
     @test occursin("timeout-minutes: 60", reactant)
+    @test occursin("uses: julia-actions/cache", reactant)
 
 end
