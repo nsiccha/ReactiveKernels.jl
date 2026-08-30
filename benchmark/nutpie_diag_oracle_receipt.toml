@@ -1,0 +1,5 @@
+oracle_source_sha256 = "02463d4e8cebf7d2381970a723f0f8b1704d052526add311e04f613e40d7a60c"
+oracle_output_sha256 = "8997973c2275d2944be62ab2a298104e0229768f3556c0b9c31bd39f45643866"
+rustc_version = "rustc 1.98.0 (88d9e12ae 2026-08-18)"
+execution_host = "official Rust Playground stable/release/edition-2021"
+exit_status = 0
