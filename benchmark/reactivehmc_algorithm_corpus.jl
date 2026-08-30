@@ -95,7 +95,7 @@ const CORPUS = (
         id = :relativistic_kinetic_energy,
         family = :energy,
         upstream = (file = "src/energies.jl", lines = 2:10, members = (:rke,)),
-        current_reactive_sources = (),
+        current_reactive_sources = ("benchmark/reactivehmc_rke_kernel_fixture.jl",),
         capabilities = (:derived_mutable_state, :nested_functions, :special_functions,
                         :captured_callable_and_constant_ports, :unsupported_operation_rejection),
         oracle = :deterministic_upstream,
