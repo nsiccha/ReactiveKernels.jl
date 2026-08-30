@@ -12,8 +12,11 @@ One deterministic Pathfinder local-approximation candidate.
 The optimizer path and standard-normal draws are explicit HAVE ports.  The
 kernel applies the curvature safeguard and diagonal recovery from Algorithm 3
 of Zhang et al. (2022), then the inverse-BFGS update underlying Algorithm 4.
-This fixture intentionally uses one retained `(step, gradient_delta)` pair:
-limited-memory size one is the smallest complete instance of the published
+Those operations also track Pathfinder.jl 0.10.7 at production revision
+`dba8c9acc25f2905078d428ddd50b5d9276c3847`: `gilbert_init`,
+`lbfgs_inverse_hessians`, `fit_mvnormals`, and `elbo_and_samples`. This fixture
+intentionally uses one retained `(step, gradient_delta)` pair: limited-memory
+size one is the smallest complete specialization of Pathfinder.jl's compact
 quasi-Newton construction.
 
 `logdensity` accepts a `dimension × draws` matrix and returns one target log

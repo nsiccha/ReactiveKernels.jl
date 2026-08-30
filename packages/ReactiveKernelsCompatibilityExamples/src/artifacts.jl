@@ -3,6 +3,17 @@ module CompatibilityArtifacts
 
 using ReactiveKernels
 
+if !isdefined(parentmodule(@__MODULE__), :ReactiveObjectsExamples)
+    Base.include(parentmodule(@__MODULE__), joinpath(
+        @__DIR__, "preexisting_reactiveobjects.jl",
+    ))
+end
+if !isdefined(parentmodule(@__MODULE__), :ReactiveHMCExamples)
+    Base.include(parentmodule(@__MODULE__), joinpath(
+        @__DIR__, "preexisting_reactivehmc.jl",
+    ))
+end
+
 using ..ReactiveHMCExamples
 using ..ReactiveObjectsExamples
 

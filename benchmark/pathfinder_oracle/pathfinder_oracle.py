@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone Pathfinder Algorithms 3/4 oracle using only Python's stdlib."""
+"""Standalone paper and Pathfinder.jl compact-history oracle using stdlib."""
 
 from __future__ import annotations
 
@@ -12,6 +12,15 @@ from pathlib import Path
 
 PAPER_URL = "https://jmlr.org/papers/volume23/21-0889/21-0889.pdf"
 PAPER_SHA256 = "8fe38816d4953e5b4e01a8b531abb9f3ea1d1f92041f6c2a7ce5e9c7037c8435"
+PATHFINDER_JL_REPOSITORY = "https://github.com/mlcolab/Pathfinder.jl"
+PATHFINDER_JL_REVISION = "dba8c9acc25f2905078d428ddd50b5d9276c3847"
+PATHFINDER_JL_VERSION = "0.10.7"
+PATHFINDER_JL_SOURCE_SHA256 = {
+    "inverse_hessian": "7a32c8e5b8359d2c7d813cae21885e7cafcb357cc1d15e8aebd5f020f38d3309",
+    "mvnormal": "9083a7856ddf4b2bf3199bff62487dddfbdfd7a5de54264c8ac04b26ef2e29b8",
+    "elbo": "5a35f03afb93fd6657f6a86040b1a4010e719022e3d9e9bf412a7303419e2611",
+    "singlepath": "972b3a1d206887c38ec9cd69d22c664f8103ad2f9657021f860cc485c0aba187",
+}
 
 
 def dot(left, right):
@@ -46,6 +55,23 @@ def matrix_scale(scale, matrix):
 
 def matrix_subtract(left, right):
     return matrix_add(left, matrix_scale(-1.0, right))
+
+
+def upper_triangular_inverse(matrix):
+    dimension = len(matrix)
+    inverse = [[0.0] * dimension for _ in range(dimension)]
+    for column in range(dimension):
+        solution = [0.0] * dimension
+        for row in reversed(range(dimension)):
+            residual = 1.0 if row == column else 0.0
+            residual -= sum(
+                matrix[row][j] * solution[j]
+                for j in range(row + 1, dimension)
+            )
+            solution[row] = residual / matrix[row][row]
+        for row in range(dimension):
+            inverse[row][column] = solution[row]
+    return inverse
 
 
 def cholesky(matrix):
@@ -127,6 +153,77 @@ def candidate(logdensity, position, gradient, alpha, step, gradient_delta,
     return {
         "alpha_next": alpha_next,
         "curvature_accepted": accepted,
+        "covariance": covariance,
+        "mean": mean,
+        "elbo_draws": elbo_draws,
+        "log_q": log_q,
+        "elbo": elbo,
+        "output_draws": output_draws,
+    }
+
+
+def compact_candidate(logdensity, position, gradient, alpha, history_steps,
+                      history_gradient_deltas, identity, elbo_noise,
+                      output_noise):
+    dimension = len(alpha)
+    history_length = len(history_steps[0])
+    diagonal = [[identity[row][column] * alpha[column]
+                 for column in range(dimension)]
+                for row in range(dimension)]
+    scaled_gradient_deltas = [
+        [alpha[row] * history_gradient_deltas[row][column]
+         for column in range(history_length)]
+        for row in range(dimension)
+    ]
+    history_cross = matmul(transpose(history_steps), history_gradient_deltas)
+    history_r = [
+        [history_cross[row][column] if row <= column else 0.0
+         for column in range(history_length)]
+        for row in range(history_length)
+    ]
+    history_r_inverse = upper_triangular_inverse(history_r)
+    history_diagonal = [
+        [history_cross[row][row] if row == column else 0.0
+         for column in range(history_length)]
+        for row in range(history_length)
+    ]
+    compact_middle = matrix_add(
+        history_diagonal,
+        matmul(transpose(history_gradient_deltas), scaled_gradient_deltas),
+    )
+    scaled_cross_projection = matmul(
+        scaled_gradient_deltas, history_r_inverse)
+    step_projection = matmul(history_steps, transpose(history_r_inverse))
+    covariance = matrix_add(
+        matrix_subtract(
+            matrix_subtract(
+                diagonal,
+                matmul(scaled_cross_projection, transpose(history_steps)),
+            ),
+            matmul(history_steps, transpose(scaled_cross_projection)),
+        ),
+        matmul(matmul(step_projection, compact_middle),
+               transpose(step_projection)),
+    )
+    mean = [theta + delta for theta, delta
+            in zip(position, matvec(covariance, gradient))]
+    factor = cholesky(covariance)
+    elbo_draws = add_vector_to_columns(mean, matmul(factor, elbo_noise))
+    output_draws = add_vector_to_columns(mean, matmul(factor, output_noise))
+    half_logdet = sum(math.log(factor[i][i]) for i in range(dimension))
+    log_q = [
+        -0.5 * dimension * math.log(2.0 * math.pi)
+        - half_logdet - 0.5 * dot(noise, noise)
+        for noise in columns(elbo_noise)
+    ]
+    target = logdensity(elbo_draws)
+    elbo = sum(p - q for p, q in zip(target, log_q)) / len(log_q)
+    return {
+        "alpha": alpha,
+        "history_steps": history_steps,
+        "history_gradient_deltas": history_gradient_deltas,
+        "history_cross": history_cross,
+        "compact_middle": compact_middle,
         "covariance": covariance,
         "mean": mean,
         "elbo_draws": elbo_draws,
@@ -220,6 +317,16 @@ def main():
         "paper_url": PAPER_URL,
         "paper_sha256": PAPER_SHA256,
         "algorithms": [1, 3, 4],
+        "pathfinder_jl_repository": PATHFINDER_JL_REPOSITORY,
+        "pathfinder_jl_revision": PATHFINDER_JL_REVISION,
+        "pathfinder_jl_version": PATHFINDER_JL_VERSION,
+        "pathfinder_jl_inverse_hessian_sha256":
+            PATHFINDER_JL_SOURCE_SHA256["inverse_hessian"],
+        "pathfinder_jl_mvnormal_sha256":
+            PATHFINDER_JL_SOURCE_SHA256["mvnormal"],
+        "pathfinder_jl_elbo_sha256": PATHFINDER_JL_SOURCE_SHA256["elbo"],
+        "pathfinder_jl_singlepath_sha256":
+            PATHFINDER_JL_SOURCE_SHA256["singlepath"],
         "oracle_source_sha256": source_sha256,
         "oracle_engine": "python-stdlib",
     })
@@ -234,6 +341,26 @@ def main():
         "curvature_tolerance": inputs["curvature_tolerance"],
         "best_index": best_index + 1,
     })
+    first_step = [current - old for current, old in
+                  zip(inputs["positions"][1], inputs["positions"][0])]
+    second_step = [current - old for current, old in
+                   zip(inputs["positions"][2], inputs["positions"][1])]
+    first_delta = [old - current for old, current in
+                   zip(inputs["gradients"][0], inputs["gradients"][1])]
+    second_delta = [old - current for old, current in
+                    zip(inputs["gradients"][1], inputs["gradients"][2])]
+    compact = compact_candidate(
+        logdensity,
+        inputs["positions"][2],
+        inputs["gradients"][2],
+        results[1]["alpha_next"],
+        transpose([first_step, second_step]),
+        transpose([first_delta, second_delta]),
+        inputs["identity"],
+        inputs["elbo_noise"][1],
+        inputs["output_noise"][1],
+    )
+    emit_section("pathfinder_jl_compact", compact)
     for index, result in enumerate(results, start=1):
         emit_section(
             f"candidate_{index}",

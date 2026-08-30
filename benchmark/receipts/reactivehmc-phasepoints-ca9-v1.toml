@@ -1,0 +1,55 @@
+schema = "reactivehmc-phasepoints-ca9-v1"
+
+[pins]
+reactivehmc_revision = "ca9ea4ca41924bb0e1fadc01c717e1333916aba6"
+phasepoints_sha256 = "b2eb1d28c347412fafcf6e9e5cac6b4c6c08801e5b6e2db83826806a79bdaaba"
+julia_version = "1.10.11"
+
+[inputs]
+position = [0.25, -0.5]
+momentum = [0.4, 0.1]
+speed = 1.5
+mass = 0.8
+alpha = 20.0
+
+[[cases]]
+name = "euclidean"
+pot = 0.15625
+ham = 0.24125000000000002
+dham_dpos = [0.25, -0.5]
+dham_dmom = [0.4, 0.1]
+
+[[cases]]
+name = "riemannian"
+pot = 0.15625
+ham = 0.3774282042123812
+dham_dpos = [0.4498615916955017, -0.8967999999999999]
+dham_dmom = [0.3764705882352941, 0.08]
+
+[[cases]]
+name = "softabs"
+pot = 0.15625
+ham = 0.37742820421238116
+dham_dpos = [0.4498615916955017, -0.8968]
+dham_dmom = [0.3764705882352941, 0.08000000000000002]
+
+[[cases]]
+name = "relativistic_euclidean"
+pot = 0.15625
+ham = 2.059536631067428
+dham_dpos = [0.25, -0.5]
+dham_dmom = [0.4728662437434604, 0.1182165609358651]
+
+[[cases]]
+name = "relativistic_riemannian"
+pot = 0.15625
+ham = 2.194663424437997
+dham_dpos = [0.4432577611304607, -0.8962035915520947]
+dham_dmom = [0.4466362879888547, 0.09491021119763163]
+
+[[cases]]
+name = "relativistic_softabs"
+pot = 0.15625
+ham = 2.1946634244379966
+dham_dpos = [0.4432577611304607, -0.8962035915520947]
+dham_dmom = [0.4466362879888547, 0.09491021119763164]

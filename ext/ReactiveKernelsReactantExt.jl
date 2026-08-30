@@ -246,6 +246,39 @@ function Reactant.traced_type_inner(
     T
 end
 
+# Reactant represents a traced Cholesky factorization as BatchedCholesky and
+# may tensorize a logical Diagonal factor directly to its backing array.  The
+# topology contract remains source-logical, so rebuild the traced wrapper while
+# treating the erased `:diag` step as representation-only.  Core still rejects
+# every other array structural path.
+@inline function ReactiveKernels._sm_structural_set(
+        value::Reactant.TracedLinearAlgebra.BatchedCholesky,
+        ::Val{Path}, replacement) where {Path}
+    first(Path) === :factors || throw(ArgumentError(
+        "traced Cholesky structural path must name `factors`"))
+    Reactant.TracedLinearAlgebra.BatchedCholesky(
+        ReactiveKernels._sm_structural_set(
+            value.factors, Val(Base.tail(Path)), replacement),
+        value.uplo, value.info)
+end
+
+# A structured-state port is the same immutable program resource plus its
+# generated repair table.  Standalone generic structured operations may
+# capture the port directly; its endpoint state remains dynamic only when
+# passed as an explicit argument.
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels._StructuredStatePort,
+        path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where
+        {T<:ReactiveKernels._StructuredStatePort}
+    T
+end
+
 # Native Julia arrays keep the fused scalar loop.  Reactant arrays select the
 # separately generated eager broadcast/reduction body, avoiding forbidden
 # scalar indexing while leaving XLA free to fuse the tensor operations.

@@ -64,6 +64,7 @@ export pure_callable_port, effect_callable_port, effect_lowering_port,
        structured_state_port
 export StatefulStateValue, OrderedRNGReplay, total_functional_lowering
 export initial_transition_effects, transition_with_effects
+export ValidatedCompiledTransition, validated_compiled_transition
 export functionalize_stateful, stateful_snapshot
 
 end # module ReactiveKernels

@@ -579,6 +579,28 @@ argument_types)` produces the backend-neutral functional program;
 control requires a positive finite loop bound. A bound violation, an active
 out-of-bounds indexed access, or exhausted effect storage sets a control
 overflow and rolls state plus auxiliary effects back atomically. The typed
+functional entry validates the outer plan's canonical aliases as well as any
+nested structured aliases. A fresh Reactant compilation rejects an
+independently converted counterfeit alias. For repeated calls, the raw backend
+executable must be wrapped with
+`validated_compiled_transition(compiled, transition)`. That generic host guard
+revalidates layout, shapes, canonical aliases, structured ports, and external
+authorities before dispatch. It restores frozen callable and nested structured
+external authorities (which are compiler metadata rather than backend data),
+then validates the returned owned-data alias topology. The
+effects-positional form also checks the dynamic effects carrier and method
+arguments. The backend executable itself enforces its traced leaf signature;
+the raw executable alone is outside the safe repeated-call contract because a
+flattened buffer ABI cannot represent Julia object identity. Straight-line and
+state-machine gates both prove valid repeated execution, identity-preserving
+outputs, and rejection of an independently converted counterfeit alias.
+
+Dynamic unit ranges are bounded with guarded successor steps in the authored
+integer type. The compiler neither subtracts extreme bounds nor adds host-Int
+offsets, avoiding wraparound and small-integer promotion while preserving an
+explicit overflow/rollback result.
+
+The typed
 `OrderedRNGReplay` value carries independent floating normal, Boolean uniform,
 and exact Float64 exponential tapes, per-kind cursors, one global ordered event
 tape/cursor, and sticky overflow. `randn!` is admitted only for an immediate
@@ -586,6 +608,10 @@ whole-vector state replacement with the declared destination/result alias;
 `rand(rng, Bool)` retains the exact captured type descriptor. Conditional
 source paths consume only the effects they enter, and an event-kind mismatch
 or exhausted tape fails closed while preserving the attempted replay receipt.
+Every consumed normal column is rechecked for finiteness and every consumed
+exponential for finiteness and nonnegativity, including dynamic traced tapes;
+invalid consumed data sets sticky overflow and atomically rolls state back,
+while unconsumed padding remains irrelevant.
 
 Auxiliary effects are explicit continuation state, not hidden compiler state.
 `initial_transition_effects(transition)` constructs the first value. Ordinary

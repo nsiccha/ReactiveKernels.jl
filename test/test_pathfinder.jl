@@ -4,6 +4,8 @@ using Test
 
 include(joinpath(@__DIR__, "..", "benchmark", "pathfinder_kernel_authoring_fixture.jl"))
 using .PathfinderKernelAuthoringFixture
+include(joinpath(@__DIR__, "..", "benchmark", "pathfinder_jl_kernel_authoring_fixture.jl"))
+using .PathfinderJLKernelAuthoringFixture
 include(joinpath(@__DIR__, "..", "benchmark", "pathfinder_external_corpus.jl"))
 using .PathfinderExternalCorpus
 
@@ -18,15 +20,76 @@ _pathfinder_matrix(rows) = reduce(vcat, permutedims(Float64.(row)) for row in ro
 
 @testset "Pathfinder mathematical kernel" begin
     @testset "external corpus keeps the parent schema without entering ReactiveHMC" begin
-        @test length(PathfinderExternalCorpus.CORPUS) == 1
-        entry = only(PathfinderExternalCorpus.CORPUS)
-        @test propertynames(entry) == PathfinderExternalCorpus.ENTRY_FIELDS
+        @test length(PathfinderExternalCorpus.CORPUS) == 2
+        entries = Dict(entry.id => entry for entry in PathfinderExternalCorpus.CORPUS)
+        @test Set(keys(entries)) ==
+              Set((:single_path_pathfinder, :pathfinder_jl_compact_lbfgs))
+        for candidate_entry in values(entries)
+            @test propertynames(candidate_entry) == PathfinderExternalCorpus.ENTRY_FIELDS
+            @test candidate_entry.minimum_acceptance === :native_and_reactant
+            @test all(path -> isfile(joinpath(@__DIR__, "..", path)),
+                      candidate_entry.current_reactive_sources)
+            @test candidate_entry.oracle.execution === :separate_python_process
+        end
+        entry = entries[:single_path_pathfinder]
         @test entry.id === :single_path_pathfinder
-        @test entry.minimum_acceptance === :native_and_reactant
-        @test occursin(r"^[0-9a-f]{64}$", entry.upstream.source_sha256)
-        @test all(path -> isfile(joinpath(@__DIR__, "..", path)),
-                  entry.current_reactive_sources)
-        @test entry.oracle.execution === :separate_python_process
+        @test occursin(r"^[0-9a-f]{64}$", entry.upstream.paper.source_sha256)
+        @test occursin(
+            r"^[0-9a-f]{40}$",
+            entry.upstream.implementation.revision,
+        )
+        @test length(entry.upstream.implementation.source_sha256) == 4
+        @test all(
+            pair -> occursin(r"^[0-9a-f]{64}$", last(pair)),
+            entry.upstream.implementation.source_sha256,
+        )
+        compact = entries[:pathfinder_jl_compact_lbfgs]
+        @test compact.oracle.section == "pathfinder_jl_compact"
+        @test :fixed_capacity_history in compact.capabilities
+        @test :compact_lbfgs in compact.capabilities
+    end
+
+    @testset "Pathfinder.jl compact two-history kernel matches its oracle" begin
+        receipt = TOML.parse(read(_PATHFINDER_ORACLE_RECEIPT, String))
+        expected = receipt["pathfinder_jl_compact"]
+        inputs = pathfinder_jl_fixture_inputs()
+        @test inputs.alpha ≈ expected["alpha"] rtol=1e-12 atol=1e-12
+        @test inputs.history_steps ≈
+              _pathfinder_matrix(expected["history_steps"]) rtol=1e-12 atol=1e-12
+        @test inputs.history_gradient_deltas ≈
+              _pathfinder_matrix(expected["history_gradient_deltas"]) rtol=1e-12 atol=1e-12
+
+        result = run_pathfinder_jl_fixture()
+        for field in (:history_cross, :compact_middle, :covariance, :elbo_draws, :output_draws)
+            @test getproperty(result, field) ≈
+                  _pathfinder_matrix(expected[string(field)]) rtol=1e-12 atol=1e-12
+        end
+        @test result.mean ≈ expected["mean"] rtol=1e-12 atol=1e-12
+        @test result.log_q ≈ expected["log_q"] rtol=1e-12 atol=1e-12
+        @test result.elbo ≈ expected["elbo"] rtol=1e-12 atol=1e-12
+
+        # The second history pair must be semantically active, not decorative.
+        paper_inputs = pathfinder_fixture_inputs()
+        paper_result = run_pathfinder_fixture().candidates[2]
+        @test norm(result.covariance - paper_result.covariance) > 1e-4
+        @test inputs.position == paper_inputs.positions[:, 3]
+
+        # The same authored graph also accepts a one-column static capacity;
+        # its compact form then reduces to the paper fixture's BFGS update.
+        one_pair_values = PATHFINDER_JL_CANDIDATE(
+            inputs.logdensity,
+            inputs.position,
+            inputs.gradient,
+            inputs.alpha,
+            inputs.history_steps[:, 2:2],
+            inputs.history_gradient_deltas[:, 2:2],
+            inputs.parameter_identity,
+            ones(1, 1),
+            inputs.elbo_standard_draws,
+            inputs.output_standard_draws,
+        )
+        one_pair = NamedTuple{PATHFINDER_JL_OUTPUTS}(one_pair_values)
+        @test one_pair.covariance ≈ paper_result.covariance rtol=1e-12 atol=1e-12
     end
 
     @testset "standalone physical oracle is source-locked and reproducible" begin
@@ -39,6 +102,13 @@ _pathfinder_matrix(rows) = reduce(vcat, permutedims(Float64.(row)) for row in ro
         receipt = TOML.parse(recorded)
         @test receipt["authority"]["paper_sha256"] ==
               PathfinderExternalCorpus.PAPER_AUTHORITY.source_sha256
+        @test receipt["authority"]["pathfinder_jl_revision"] ==
+              PathfinderExternalCorpus.PATHFINDER_JL_AUTHORITY.revision
+        for (source, digest) in
+                PathfinderExternalCorpus.PATHFINDER_JL_AUTHORITY.source_sha256
+            stem = splitext(basename(source))[1]
+            @test receipt["authority"]["pathfinder_jl_$(stem)_sha256"] == digest
+        end
         @test occursin(
             r"^[0-9a-f]{64}$",
             receipt["authority"]["oracle_source_sha256"],
