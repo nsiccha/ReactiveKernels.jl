@@ -6,6 +6,10 @@ const REACTANT_UUID = UUID("3c362404-f566-11ee-1572-e11a4b42c853")
 
 root = normpath(joinpath(@__DIR__, ".."))
 testfile = joinpath(@__DIR__, "test_reactant.jl")
+example_packages = (
+    joinpath(root, "packages", "ReactiveKernelsDistributionKernels"),
+    joinpath(root, "packages", "ReactiveKernelsPPLExamples"),
+)
 
 mktempdir() do env
     Pkg.activate(env)
@@ -14,7 +18,9 @@ mktempdir() do env
     # mask the omission by loading ReactiveKernels' transitive dependencies.
     Pkg.add(PackageSpec(name = "Reactant", version = REACTANT_VERSION))
     Pkg.pin(PackageSpec(name = "Reactant"))
-    Pkg.develop(path = root)
+    Pkg.develop([
+        PackageSpec(path = path) for path in (root, example_packages...)
+    ])
     Pkg.add([
         PackageSpec(name = "Enzyme"),
         PackageSpec(name = "LogExpFunctions"),

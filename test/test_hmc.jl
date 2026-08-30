@@ -214,8 +214,10 @@ end
 
 @testset "eight-schools graph and DI+Enzyme inside NUTS" begin
     if !isdefined(Main, :ReactiveKernelsPPLExamples)
-        package_directory = normpath(joinpath(@__DIR__, "..", "packages"))
-        package_directory in LOAD_PATH || pushfirst!(LOAD_PATH, package_directory)
+        if samefile(Base.active_project(), joinpath(@__DIR__, "..", "Project.toml"))
+            package_directory = normpath(joinpath(@__DIR__, "..", "packages"))
+            package_directory in LOAD_PATH || pushfirst!(LOAD_PATH, package_directory)
+        end
         Base.eval(Main, :(using ReactiveKernelsPPLExamples))
     end
     eight_schools = Main.ReactiveKernelsPPLExamples.EightSchoolsExample
