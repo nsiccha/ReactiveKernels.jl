@@ -226,7 +226,7 @@ end
                     stepsize=0.06, n_fi_steps=2),
             ([0.25, -0.5], [0.4, 0.1]),
         )
-        host_state = initial_state(transition)
+        host_state = initial_transition_state(transition)
         traced_state = map(host_state) do value
             Reactant.to_rarray(value; track_numbers=true)
         end

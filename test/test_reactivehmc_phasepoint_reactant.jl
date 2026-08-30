@@ -105,7 +105,7 @@ _rhmc_trace_source(value) = value
                     stepsize=0.06, n_fi_steps=2),
             host_sources,
         )
-        host_state = initial_state(transition)
+        host_state = initial_transition_state(transition)
         traced_state = map(_rhmc_trace_source, host_state)
         expected_transition = transition(host_state)
         compiled_transition = @compile transition(traced_state)

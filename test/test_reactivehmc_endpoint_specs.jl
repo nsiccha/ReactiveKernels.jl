@@ -36,10 +36,26 @@ end
                 partial(source; stepsize, n_fi_steps),
                 values(kernels.sources),
             )
-            state = initial_state(transition)
+            state = initial_transition_state(transition)
+            independent = initial_transition_state(transition)
+            groups = typeof(transition).parameters[2]
+            for group in groups
+                leader = first(group)
+                for alias in Base.tail(group)
+                    @test getfield(state, alias) === getfield(state, leader)
+                    @test getfield(independent, alias) ===
+                          getfield(independent, leader)
+                end
+            end
+            for name in propertynames(state)
+                value = getfield(state, name)
+                value isa AbstractArray && @test value !== getfield(independent, name)
+            end
             for name in propertynames(kernels.sources)
                 endswith(String(name), "_f") || continue
                 @test getfield(state, name) ===
+                      getfield(kernels.sources, name)
+                @test getfield(independent, name) ===
                       getfield(kernels.sources, name)
             end
             actual = transition(state)
