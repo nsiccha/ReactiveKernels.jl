@@ -2,7 +2,8 @@ using Pkg
 
 const _REPOSITORY_ROOT = normpath(joinpath(@__DIR__, ".."))
 const _ROOT_PROJECT = joinpath(_REPOSITORY_ROOT, "Project.toml")
-const _PPL_TEST_PACKAGE_PATHS = (
+const _ROOT_TEST_PACKAGE_PATHS = (
+    joinpath(_REPOSITORY_ROOT, "packages", "ReactiveKernelsCompatibilityExamples"),
     joinpath(_REPOSITORY_ROOT, "packages", "ReactiveKernelsDistributionKernels"),
     joinpath(_REPOSITORY_ROOT, "packages", "ReactiveKernelsPPLExamples"),
 )
@@ -13,7 +14,7 @@ const _PPL_TEST_PACKAGE_PATHS = (
 # A direct `julia --project=. test/runtests.jl` keeps using the explicitly
 # prepared `packages/` environment and must not mutate the root Project.toml.
 if !samefile(Base.active_project(), _ROOT_PROJECT)
-    Pkg.develop([PackageSpec(path = path) for path in _PPL_TEST_PACKAGE_PATHS])
+    Pkg.develop([PackageSpec(path = path) for path in _ROOT_TEST_PACKAGE_PATHS])
 end
 
 using ReactiveKernels
@@ -52,8 +53,9 @@ using .ReactiveKernelsNUTSExample
         include("test_walnuts_external_corpus.jl")
         include("test_walnuts_docs_fixture.jl")
         include("test_reactivehmc_rke_fixture.jl")
-        include("test_reactivehmc_hmc_fixture.jl")
         include("test_reactivehmc_rke_compiler.jl")
+        include("test_reactivehmc_hmc_fixture.jl")
+        include("test_reactivehmc_hmc_compiler.jl")
         include("test_compiler_docs.jl")
         include("test_kernel_adaptation.jl")
         include("test_nonallocating_core.jl")

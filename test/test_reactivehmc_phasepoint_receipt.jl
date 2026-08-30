@@ -1,13 +1,8 @@
 using ReactiveKernels
+using ReactiveKernelsCompatibilityExamples: ReactiveHMCExamples
 using Test
 import TOML
 
-if !isdefined(@__MODULE__, :ReactiveHMCExamples)
-    include(joinpath(
-        @__DIR__, "..", "packages", "ReactiveKernelsCompatibilityExamples",
-        "src", "preexisting_reactivehmc.jl",
-    ))
-end
 include(joinpath(@__DIR__, "..", "benchmark", "receipts",
                  "validate_reactivehmc_phasepoints.jl"))
 
@@ -18,6 +13,14 @@ function _phasepoint_observables(kernels, position, momentum)
        ham=kernels.hamiltonian(geometry, momentum),
        dham_dpos=kernels.dham_dpos(geometry, momentum),
        dham_dmom=kernels.dham_dmom(geometry, momentum))
+end
+
+function _phasepoint_spec_observables(kernels)
+    wanted = (:pot, :dham_dpos, :dham_dmom, :ham)
+    endpoint = prepare(
+        kernels.spec; have = propertynames(kernels.sources), want = wanted,
+    )
+    NamedTuple{wanted}(endpoint(values(kernels.sources)...))
 end
 
 @testset "ReactiveHMC six phase-point variants against physical receipt" begin
@@ -50,11 +53,27 @@ end
         "relativistic_softabs" => _phasepoint_observables(
             softabs.relativistic, position, momentum),
     )
+    direct = Dict(
+        "euclidean" => _phasepoint_spec_observables(euclidean.gaussian),
+        "riemannian" => _phasepoint_spec_observables(riemannian.gaussian),
+        "softabs" => _phasepoint_spec_observables(softabs.gaussian),
+        "relativistic_euclidean" =>
+            _phasepoint_spec_observables(euclidean.relativistic),
+        "relativistic_riemannian" =>
+            _phasepoint_spec_observables(riemannian.relativistic),
+        "relativistic_softabs" =>
+            _phasepoint_spec_observables(softabs.relativistic),
+    )
     for expected in receipt["cases"]
         observed = actual[expected["name"]]
+        direct_observed = direct[expected["name"]]
         for field in (:pot, :ham, :dham_dpos, :dham_dmom)
             @test isapprox(getproperty(observed, field), expected[string(field)];
                            rtol=2e-13, atol=2e-15)
+            @test isapprox(
+                getproperty(direct_observed, field), expected[string(field)];
+                rtol=2e-13, atol=2e-15,
+            )
         end
     end
 end

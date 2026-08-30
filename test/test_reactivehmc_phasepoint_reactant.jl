@@ -1,15 +1,10 @@
 using LinearAlgebra
 using ReactiveKernels
+using ReactiveKernelsCompatibilityExamples: ReactiveHMCExamples
 using Reactant
 using Test
 import Reactant: @compile
 
-if !isdefined(@__MODULE__, :ReactiveHMCExamples)
-    include(joinpath(
-        @__DIR__, "..", "packages", "ReactiveKernelsCompatibilityExamples",
-        "src", "preexisting_reactivehmc.jl",
-    ))
-end
 if !isdefined(@__MODULE__, :ReactiveHMCIntegratorFixture)
     include(joinpath(@__DIR__, "..", "benchmark",
                      "reactivehmc_integrator_kernel_fixture.jl"))
@@ -30,10 +25,23 @@ function _rhmc_metric_gradient(position)
     (pot, dpot, metric, derivative)
 end
 
-_rhmc_trace_source(value::AbstractVector) = Reactant.to_rarray(value)
-_rhmc_trace_source(value::Diagonal) =
-    Diagonal(Reactant.to_rarray(value.diag))
-_rhmc_trace_source(value) = value
+_rhmc_trace_source(value) =
+    _rhmc_trace_source(value, IdDict{Any,Any}())
+function _rhmc_trace_source(value::AbstractArray, seen)
+    get!(seen, value) do
+        Reactant.to_rarray(value)
+    end
+end
+_rhmc_trace_source(value::Diagonal, seen) =
+    Diagonal(_rhmc_trace_source(value.diag, seen))
+_rhmc_trace_source(value::LinearAlgebra.Cholesky, seen) =
+    LinearAlgebra.Cholesky(
+        _rhmc_trace_source(value.factors, seen), value.uplo, value.info)
+_rhmc_trace_source(value::NamedTuple, seen) =
+    map(child -> _rhmc_trace_source(child, seen), value)
+_rhmc_trace_source(value::Tuple, seen) =
+    map(child -> _rhmc_trace_source(child, seen), value)
+_rhmc_trace_source(value, seen) = value
 
 @testset "all six ReactiveHMC phase-point kernels compile generically" begin
     position_host = [0.25, -0.5]
@@ -68,7 +76,7 @@ _rhmc_trace_source(value) = value
     )
     position = Reactant.to_rarray(position_host)
     momentum = Reactant.to_rarray(momentum_host)
-    for construct in constructors
+    for (constructor_index, construct) in enumerate(constructors)
         kernels = construct()
         geometry_f = kernels.geometry
         dpos_f = kernels.dham_dpos
@@ -93,7 +101,7 @@ _rhmc_trace_source(value) = value
             kernels.spec; have = propertynames(kernels.sources), want = wanted,
         )
         host_sources = values(kernels.sources)
-        traced_sources = map(_rhmc_trace_source, host_sources)
+        traced_sources = _rhmc_trace_source(host_sources)
         expected_endpoint = endpoint(host_sources...)
         compiled_endpoint = @compile endpoint(traced_sources...)
         actual_endpoint = compiled_endpoint(traced_sources...)
@@ -109,12 +117,24 @@ _rhmc_trace_source(value) = value
             host_sources,
         )
         host_state = initial_transition_state(transition)
-        traced_state = map(_rhmc_trace_source, host_state)
+        # Trace once per source object so a canonical group remains one
+        # device value. Calling `to_rarray` independently per field would
+        # manufacture two distinct inputs and correctly fail the transition's
+        # alias contract before any compiled execution.
+        traced_state = _rhmc_trace_source(host_state)
         expected_transition = transition(host_state)
         compiled_transition = @compile transition(traced_state)
         actual_transition = compiled_transition(traced_state)
         @test Array(actual_transition.pos) ≈ expected_transition.pos
         @test Array(actual_transition.mom) ≈ expected_transition.mom
         @test actual_transition.ham ≈ expected_transition.ham
+
+        if constructor_index == 1
+            broken_alias = merge(traced_state, (dham_dpos=
+                Reactant.to_rarray(copy(host_state.dham_dpos)),))
+            @test_throws ArgumentError begin
+                @compile transition(broken_alias)
+            end
+        end
     end
 end

@@ -48,6 +48,92 @@ ReactiveKernels._sm_functional_argument_type_ok(
     {Actual<:Reactant.AbstractConcreteNumber,Expected} =
         _rk_reactant_logical_argument(Actual, Expected)
 
+function ReactiveKernels._sm_functional_argument_type_ok(
+        ::Type{Actual}, ::Type{Expected}) where
+        {Actual<:ReactiveKernels.OrderedRNGReplay,
+         Expected<:ReactiveKernels.OrderedRNGReplay}
+    all(fieldnames(Expected)) do name
+        ReactiveKernels._sm_functional_argument_type_ok(
+            fieldtype(Actual, name), fieldtype(Expected, name))
+    end
+end
+
+# Tensor wrappers are the optional compiler's logical representations of the
+# builtin scalar/array predicated-selection domain.  Keep these methods in the
+# extension so core never broadly authorizes arbitrary AbstractArray/Number
+# subtypes (and therefore never invokes user broadcast machinery).
+@inline ReactiveKernels._sm_predicated_select(
+    active, new::T, old::T) where {T<:Reactant.TracedRArray} =
+        ifelse.(active, new, old)
+@inline ReactiveKernels._sm_predicated_select(
+    active, new::T, old::T) where {T<:Reactant.TracedRNumber} =
+        ifelse(active, new, old)
+@inline ReactiveKernels._sm_predicated_select(
+    active, new::T, old::T) where {T<:Reactant.AbstractConcreteArray} =
+        ifelse.(active, new, old)
+@inline ReactiveKernels._sm_predicated_select(
+    active, new::T, old::T) where {T<:Reactant.AbstractConcreteNumber} =
+        ifelse(active, new, old)
+
+# A traced branch can legitimately meet a source literal or compiler-static
+# initial value of the same logical scalar type.  Keep that bridge exact: it
+# is not permission to promote or coerce a different authored domain.
+@inline function _rk_reactant_mixed_scalar_check(traced, host::Number)
+    ReactiveKernels._kernel_dom_num_scalar(typeof(host)) || throw(
+        ArgumentError("predicated functional state rejects non-builtin scalar `$(typeof(host))`"))
+    Reactant.unwrapped_eltype(typeof(traced)) === typeof(host) || throw(
+        ArgumentError("predicated functional state rejects mixed logical scalar types"))
+    nothing
+end
+
+@inline ReactiveKernels._sm_predicated_select(
+        active, traced::T, host::Number) where {T<:Reactant.TracedRNumber} = begin
+    _rk_reactant_mixed_scalar_check(traced, host)
+    ifelse(active, traced, host)
+end
+@inline ReactiveKernels._sm_predicated_select(
+        active, host::Number, traced::T) where {T<:Reactant.TracedRNumber} = begin
+    _rk_reactant_mixed_scalar_check(traced, host)
+    ifelse(active, host, traced)
+end
+@inline ReactiveKernels._sm_predicated_select(
+        active, traced::T, host::Number) where
+        {T<:Reactant.AbstractConcreteNumber} = begin
+    _rk_reactant_mixed_scalar_check(traced, host)
+    ifelse(active, traced, host)
+end
+@inline function ReactiveKernels._sm_predicated_select(
+        active, host::Number, traced::T) where
+        {T<:Reactant.AbstractConcreteNumber}
+    _rk_reactant_mixed_scalar_check(traced, host)
+    ifelse(active, host, traced)
+end
+
+@inline function _rk_reactant_traced_scalar_select(active, new, old)
+    Reactant.unwrapped_eltype(typeof(new)) ===
+        Reactant.unwrapped_eltype(typeof(old)) || throw(ArgumentError(
+            "predicated functional state rejects mixed logical scalar types"))
+    ifelse(active, new, old)
+end
+
+@inline ReactiveKernels._sm_predicated_select(
+        active, new::A, old::B) where
+        {A<:Reactant.AbstractConcreteNumber,B<:Reactant.TracedRNumber} =
+    _rk_reactant_traced_scalar_select(active, new, old)
+@inline ReactiveKernels._sm_predicated_select(
+        active, new::A, old::B) where
+        {A<:Reactant.TracedRNumber,B<:Reactant.AbstractConcreteNumber} =
+    _rk_reactant_traced_scalar_select(active, new, old)
+@inline ReactiveKernels._sm_predicated_select(
+        active, new::A, old::B) where
+        {A<:Reactant.AbstractConcreteNumber,
+         B<:Reactant.AbstractConcreteNumber} =
+    _rk_reactant_traced_scalar_select(active, new, old)
+@inline ReactiveKernels._sm_predicated_select(
+        active, new::A, old::B) where
+        {A<:Reactant.TracedRNumber,B<:Reactant.TracedRNumber} =
+    _rk_reactant_traced_scalar_select(active, new, old)
+
 @inline function ReactiveKernels._sm_functional_index(
         array::Reactant.TracedRArray, indices...)
     Reactant.@allowscalar getindex(array, indices...)
@@ -60,6 +146,16 @@ end
         setindex!(result, value, indices...)
         result
     end
+end
+
+@inline function ReactiveKernels._sm_ordered_rng_normal_value(
+        normals::Reactant.TracedRArray, index)
+    Reactant.@allowscalar copy(normals[:, index])
+end
+
+@inline function ReactiveKernels._sm_ordered_rng_scalar_value(
+        values::Reactant.TracedRArray, index)
+    Reactant.@allowscalar values[index]
 end
 
 # Named/defaulted @kernel signatures wrap a PreparedKernel plus immutable
@@ -120,6 +216,20 @@ function Reactant.traced_type_inner(
     T
 end
 
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels._FunctionalTransitionWithEffects,
+        path, mode; kwargs...)
+    previous
+end
+
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where
+        {T<:ReactiveKernels._FunctionalTransitionWithEffects}
+    T
+end
+
 # Free state transitions likewise contain only immutable generated program
 # structure and prepared repair kernels. The state NamedTuple passed to the
 # call is the complete dynamic traced value surface.
@@ -133,6 +243,39 @@ function Reactant.traced_type_inner(
         ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
         ndevices, runtime) where
         {T<:ReactiveKernels.CompiledStateTransition}
+    T
+end
+
+# Reactant represents a traced Cholesky factorization as BatchedCholesky and
+# may tensorize a logical Diagonal factor directly to its backing array.  The
+# topology contract remains source-logical, so rebuild the traced wrapper while
+# treating the erased `:diag` step as representation-only.  Core still rejects
+# every other array structural path.
+@inline function ReactiveKernels._sm_structural_set(
+        value::Reactant.TracedLinearAlgebra.BatchedCholesky,
+        ::Val{Path}, replacement) where {Path}
+    first(Path) === :factors || throw(ArgumentError(
+        "traced Cholesky structural path must name `factors`"))
+    Reactant.TracedLinearAlgebra.BatchedCholesky(
+        ReactiveKernels._sm_structural_set(
+            value.factors, Val(Base.tail(Path)), replacement),
+        value.uplo, value.info)
+end
+
+# A structured-state port is the same immutable program resource plus its
+# generated repair table.  Standalone generic structured operations may
+# capture the port directly; its endpoint state remains dynamic only when
+# passed as an explicit argument.
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels._StructuredStatePort,
+        path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where
+        {T<:ReactiveKernels._StructuredStatePort}
     T
 end
 

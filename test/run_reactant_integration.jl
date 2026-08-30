@@ -6,7 +6,9 @@ const REACTANT_UUID = UUID("3c362404-f566-11ee-1572-e11a4b42c853")
 
 root = normpath(joinpath(@__DIR__, ".."))
 testfile = joinpath(@__DIR__, "test_reactant.jl")
+phasepoint_testfile = joinpath(@__DIR__, "test_reactivehmc_phasepoint_reactant.jl")
 example_packages = (
+    joinpath(root, "packages", "ReactiveKernelsCompatibilityExamples"),
     joinpath(root, "packages", "ReactiveKernelsDistributionKernels"),
     joinpath(root, "packages", "ReactiveKernelsPPLExamples"),
 )
@@ -35,4 +37,5 @@ mktempdir() do env
 
     julia = Base.julia_cmd()
     run(`$julia --startup-file=no --check-bounds=yes --project=$env $testfile`)
+    run(`$julia --startup-file=no --check-bounds=yes --project=$env $phasepoint_testfile`)
 end

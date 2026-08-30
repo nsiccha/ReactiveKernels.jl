@@ -31,11 +31,12 @@ must stay inside the compiler's inspectable and registered subset.
 Main.ReactiveKernelsDocs.render_compiler_api_map()
 ```
 
-Most method-bearing source machinery and its general control factory remain
-implementation surfaces rather than a general exported `prepare` API. The
-narrow exported `compile_state_transition` seam described below is the
-exception: it combines a stateless endpoint `KernelSpec` with a bound free
-update method. NUTS, log-density, and
+Method-bearing compilation has a finite exported contract rather than a
+general Julia `prepare` API. `compile_state_transition` combines a stateless
+endpoint `KernelSpec` with a bound free update method. `compile_stateful`,
+`stateful_compiler_bindings`, and `functionalize_stateful` compile a captured
+stateful object and one selected method through explicit typed callable,
+nested-state, loop-bound, and argument-domain contracts. NUTS, log-density, and
 PPL artifacts are external compilation examples and acceptance evidence, not
 domain APIs owned by ReactiveKernels. The NUTS runtime and domain surface live
 under `examples/nuts_runtime/`; a bare `using ReactiveKernels` does not load or
@@ -518,6 +519,12 @@ authored array write produces a new array value, invalidates the written
 source's transitive derived closure, and recomputes a stale derived field only
 at its next source-ordered read. The same generated program is ordinary Julia
 and static program metadata to optional array compilers such as Reactant.
+Every call validates the exact recursive state layout, owned-array axes,
+canonical aliases, and external authority identities captured at construction.
+Group-aware structural copies isolate owned arrays without invoking user
+`deepcopy` methods or duplicating callable authorities. Authored broadcast
+assignment between builtin floating types retains Julia's destination-element
+conversion, including Float64 intermediates written into Float32 storage.
 
 The initial public source subset is intentionally finite. It admits direct
 owned-field writes, exact captured `map(copy, tuple)`, tuple and named
@@ -535,6 +542,115 @@ Gaussian and relativistic Euclidean, Riemannian, and diagonal-SoftAbs geometry.
 Both generalized leapfrog and implicit midpoint remain their ordinary authored
 mathematical kernels. Those examples validate a reusable compiler capability;
 they do not add geometry or integrator cases to compiler code.
+
+### Functional stateful methods and nested state contracts
+
+`compile_stateful` prepares a method-bearing `@kernel` after every callable
+field has an explicit entry in `stateful_compiler_bindings`. A
+`pure_callable_port` declares one exact argument/result contract and no
+mutation. An `effect_callable_port` additionally declares which positional
+values may be replaced, a functional lowering, and an auxiliary effect value.
+Both validate their replacement arguments, logical result, and effect-state
+type after lowering. A control-dependent lowering must be wrapped in
+`total_functional_lowering`, explicitly asserting that it is pure and total
+over inactive predicated values; an arbitrary partial callback rejects.
+`effect_lowering_port` is the distinct contract for a non-executable authority
+token whose compiler lowering has independent source-oracle evidence. It does
+not mislabel that token as an ordinary source callback.
+`StatefulStateValue` is the contract marker for a callback whose authored
+argument is `__self__`; the compiler substitutes and validates the concrete
+whole-state NamedTuple type rather than asking an application to reconstruct
+private storage types.
+
+`structured_state_port(compiled_transition)` binds a nested state field to the
+canonical alias groups, external authority identities, writable source fields,
+and derived-recipe closure of an ordinary `CompiledStateTransition`. A nested
+write is admitted only when that transition declares its first path field
+writable. The compiler updates every alias in the written canonical group and
+eagerly repairs the active transitive derived closure before the outer method
+continues. Structural copies and predicated rollback select or copy once per
+canonical group, so internal aliases remain aliases and external callbacks
+remain identical. None of this lowering dispatches on sampler, geometry,
+method, or field names.
+
+`functionalize_stateful(kernel, Val(:method); max_iterations,
+argument_types)` produces the backend-neutral functional program;
+`stateful_snapshot` supplies its initial value surface. Dynamic structured
+control requires a positive finite loop bound. A bound violation, an active
+out-of-bounds indexed access, or exhausted effect storage sets a control
+overflow and rolls state plus auxiliary effects back atomically. The typed
+functional entry validates the outer plan's canonical aliases as well as any
+nested structured aliases. A fresh Reactant compilation rejects an
+independently converted counterfeit alias. For repeated calls, the raw backend
+executable must be wrapped with
+`validated_compiled_transition(compiled, transition)`. That generic host guard
+revalidates layout, shapes, canonical aliases, structured ports, and external
+authorities before dispatch. It restores frozen callable and nested structured
+external authorities (which are compiler metadata rather than backend data),
+then validates the returned owned-data alias topology. The
+effects-positional form also checks the dynamic effects carrier and method
+arguments. The backend executable itself enforces its traced leaf signature;
+the raw executable alone is outside the safe repeated-call contract because a
+flattened buffer ABI cannot represent Julia object identity. Straight-line and
+state-machine gates both prove valid repeated execution, identity-preserving
+outputs, and rejection of an independently converted counterfeit alias.
+
+Dynamic unit ranges are bounded with guarded successor steps in the authored
+integer type. The compiler neither subtracts extreme bounds nor adds host-Int
+offsets, avoiding wraparound and small-integer promotion while preserving an
+explicit overflow/rollback result.
+
+The typed
+`OrderedRNGReplay` value carries independent floating normal, Boolean uniform,
+and exact Float64 exponential tapes, per-kind cursors, one global ordered event
+tape/cursor, and sticky overflow. `randn!` is admitted only for an immediate
+whole-vector state replacement with the declared destination/result alias;
+`rand(rng, Bool)` retains the exact captured type descriptor. Conditional
+source paths consume only the effects they enter, and an event-kind mismatch
+or exhausted tape fails closed while preserving the attempted replay receipt.
+Every consumed normal column is rechecked for finiteness and every consumed
+exponential for finiteness and nonnegativity, including dynamic traced tapes;
+invalid consumed data sets sticky overflow and atomically rolls state back,
+while unconsumed padding remains irrelevant.
+
+Auxiliary effects are explicit continuation state, not hidden compiler state.
+`initial_transition_effects(transition)` constructs the first value. Ordinary
+Julia may pass it as the `effects` keyword; `transition_with_effects(transition)`
+provides a positional callable for optional compilers, so callers can feed the
+returned `effects` into the next compiled invocation. Compiler program
+metadata is recursively snapshotted from a finite immutable/builtin domain;
+later mutation of authoring configuration cannot change compiled semantics.
+
+The fixed-step ReactiveHMC fixture is the first combined acceptance case. Its
+unchanged mathematical source refreshes momentum, executes generalized
+leapfrog, records statistics before divergence exit, conditionally consumes an
+exponential draw, and copies an accepted endpoint. The same generic compiler
+path matches the independent accept, reject, and divergence receipt in ordinary
+Julia and Reactant. A separate pinned physical case locks Float32
+position/momentum/normal draws together with the authored Float64 `randexp`
+result, exact bits, destination alias, and global RNG event order. That evidence
+admits reusable nested-state currentness, typed effects, ordered RNG, and mixed
+floating assignment capabilities; it is not an HMC case in compiler code.
+
+The mixed-precision gate separates source semantics from backend floating
+rounding. Raw tape bits, tape and destination types, the `randn!` result alias,
+event order, cursors, shapes, overflow/rollback, and every control decision are
+exact. Ordinary Julia execution of the generic lowering is also bit-identical
+to the independent physical receipt. The backend-neutral emitter preserves the
+authored operator tree: it introduces no `@fastmath`, `muladd`, `fma`, or
+arithmetic reassociation, and contains no HMC/field-name case. Reactant keeps
+the exact Float32/Float64
+field types and is checked against the physical result with explicit ULP
+distances, not an `isapprox` tolerance: positions `[0, 0]`; initial/final
+momenta `[1, 0]` Float32 ULPs; initial/final Hamiltonians `67_108_864` Float64
+ULPs; the three energy diagnostics `[68_719_476_736, 0, 8_589_934_592]`
+Float64 ULPs; and final `dham` `8_589_934_592` Float64 ULPs. The apparently
+large Float64 counts reflect diagnostics stored as Float64 after cancellation
+along a Float32 trajectory; they are the exact pinned distances, not a broad
+error allowance. Its divergence and acceptance margins remain greater than
+`900` and `0.49`, respectively, so the recorded rounding cannot approach a
+control threshold. A widened Float64 normal tape is rejected by both native
+and Reactant entry contracts.
 
 ## What the NUTS proof does and does not establish
 

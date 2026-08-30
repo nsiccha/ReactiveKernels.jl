@@ -26,21 +26,36 @@ hmc_sha256 == EXPECTED_HMC_SHA256 || error(
     "expected hmc.jl $EXPECTED_HMC_SHA256, read $hmc_sha256",
 )
 
-mutable struct ScriptedRNG <: AbstractRNG
-    normal::Vector{Float64}
-    exponential::Vector{Float64}
+mutable struct ScriptedRNG{NormalT<:AbstractFloat,ExponentialT<:AbstractFloat} <:
+               AbstractRNG
+    normal::Vector{NormalT}
+    exponential::Vector{ExponentialT}
     normal_calls::Int
     exponential_calls::Int
     events::Vector{String}
+    normal_destination_eltypes::Vector{String}
+    normal_return_aliases::Vector{Bool}
+    normal_destinations::Vector{Vector{NormalT}}
+    exponential_return_types::Vector{String}
+    exponential_returns::Vector{ExponentialT}
 end
 
-ScriptedRNG(normal, exponential) =
-    ScriptedRNG(copy(normal), copy(exponential), 0, 0, String[])
+function ScriptedRNG(normal::Vector{NormalT}, exponential::Vector{ExponentialT}) where
+        {NormalT<:AbstractFloat,ExponentialT<:AbstractFloat}
+    ScriptedRNG(
+        copy(normal), copy(exponential), 0, 0, String[], String[], Bool[],
+        Vector{NormalT}[], String[], ExponentialT[],
+    )
+end
 
 function Random.randn!(rng::ScriptedRNG, destination::AbstractVector)
     rng.normal_calls += 1
     push!(rng.events, "normal")
-    copyto!(destination, rng.normal)
+    result = copyto!(destination, rng.normal)
+    push!(rng.normal_destination_eltypes, string(eltype(destination)))
+    push!(rng.normal_return_aliases, result === destination)
+    push!(rng.normal_destinations, copy(destination))
+    result
 end
 
 function Random.randexp(rng::ScriptedRNG)
@@ -48,7 +63,10 @@ function Random.randexp(rng::ScriptedRNG)
     push!(rng.events, "exponential")
     rng.exponential_calls <= length(rng.exponential) ||
         error("unexpected exponential draw $(rng.exponential_calls)")
-    rng.exponential[rng.exponential_calls]
+    result = rng.exponential[rng.exponential_calls]
+    push!(rng.exponential_return_types, string(typeof(result)))
+    push!(rng.exponential_returns, result)
+    result
 end
 
 potential(position) = sum(abs2, position) / 2
@@ -71,6 +89,8 @@ println("hmc_sha256 = \"$hmc_sha256\"")
 println("julia_version = \"$(VERSION)\"")
 
 toml_array(values) = isempty(values) ? "[]" : repr(values)
+toml_float_array(values) = repr(Float64.(values))
+float_bits(values) = repr(bitstring.(values))
 
 for case in CASES
     initial_position = [0.1, -0.2]
@@ -116,5 +136,86 @@ for case in CASES
     println("fwd_mom = $(repr(state.fwd.mom))")
     println("fwd_ham = $(repr(state.fwd.ham))")
     println("dham = $(repr(state.dham))")
+    println("diverged = $(state.diverged)")
+end
+
+# Exercise the source with the two replay tape types the generic compiler must
+# preserve independently: `randn!` mutates and returns a Float32 destination,
+# while `randexp` produces the exact Float64 Metropolis variate.
+let
+    name = "float32_normal_float64_exponential"
+    stepsize = 0.25f0
+    n_steps = 3
+    min_dham = -1000.0f0
+    initial_position = Float32[0.1, -0.2]
+    initial_momentum = zeros(Float32, 2)
+    normal = Float32[0.3, -0.4]
+    exponential = Float64[0.5]
+    point = ReactiveHMC.euclidean_phasepoint(
+        potential,
+        potential_gradient,
+        Diagonal(ones(Float32, 2)),
+        copy(initial_position),
+        copy(initial_momentum),
+    )
+    stepper = phasepoint -> ReactiveHMC.leapfrog!(phasepoint; stepsize)
+    energy_errors = Float64[]
+    stats = state -> push!(energy_errors, state.dham)
+    rng = ScriptedRNG(normal, exponential)
+    state = ReactiveHMC.hmc_state(
+        point;
+        rng,
+        n_steps,
+        min_dham,
+        step_f=stepper,
+        stats_f=stats,
+    )
+    ReactiveHMC.step!(state)
+
+    rng.normal_destination_eltypes == ["Float32"] ||
+        error("physical randn! destination was not Float32")
+    rng.normal_return_aliases == [true] ||
+        error("physical randn! did not return its destination")
+    rng.exponential_return_types == ["Float64"] ||
+        error("physical randexp result was not Float64")
+
+    println()
+    println("[[mixed_precision_cases]]")
+    println("name = \"$name\"")
+    println("stepsize = $(repr(Float64(stepsize)))")
+    println("n_steps = $n_steps")
+    println("min_dham = $(repr(Float64(min_dham)))")
+    println("initial_position = $(toml_float_array(initial_position))")
+    println("initial_position_bits = $(float_bits(initial_position))")
+    println("normal_draw = $(toml_float_array(normal))")
+    println("normal_draw_bits = $(float_bits(normal))")
+    println("exponential_draws = $(toml_float_array(exponential))")
+    println("exponential_draw_bits = $(float_bits(exponential))")
+    println("normal_tape_eltype = \"$(eltype(normal))\"")
+    println("exponential_tape_eltype = \"$(eltype(exponential))\"")
+    println("normal_calls = $(rng.normal_calls)")
+    println("exponential_calls = $(rng.exponential_calls)")
+    println("rng_events = $(repr(rng.events))")
+    println("randn_destination_eltype = \"$(only(rng.normal_destination_eltypes))\"")
+    println("randn_returned_destination = $(only(rng.normal_return_aliases))")
+    println("randn_destination_bits = $(float_bits(only(rng.normal_destinations)))")
+    println("randexp_return_type = \"$(only(rng.exponential_return_types))\"")
+    println("randexp_return_bits = $(float_bits(rng.exponential_returns))")
+    println("energy_errors = $(toml_float_array(energy_errors))")
+    println("energy_error_bits = $(float_bits(energy_errors))")
+    println("init_pos = $(toml_float_array(state.init.pos))")
+    println("init_pos_bits = $(float_bits(state.init.pos))")
+    println("init_mom = $(toml_float_array(state.init.mom))")
+    println("init_mom_bits = $(float_bits(state.init.mom))")
+    println("init_ham = $(repr(Float64(state.init.ham)))")
+    println("init_ham_bits = $(repr([bitstring(state.init.ham)]))")
+    println("fwd_pos = $(toml_float_array(state.fwd.pos))")
+    println("fwd_pos_bits = $(float_bits(state.fwd.pos))")
+    println("fwd_mom = $(toml_float_array(state.fwd.mom))")
+    println("fwd_mom_bits = $(float_bits(state.fwd.mom))")
+    println("fwd_ham = $(repr(Float64(state.fwd.ham)))")
+    println("fwd_ham_bits = $(repr([bitstring(state.fwd.ham)]))")
+    println("dham = $(repr(Float64(state.dham)))")
+    println("dham_bits = $(repr([bitstring(state.dham)]))")
     println("diverged = $(state.diverged)")
 end

@@ -83,9 +83,16 @@ receiver-stripped); `kind` is `:pos`/`:kw`/`:possplat`/`:kwsplat`."
 struct _FormalRef <: _MExpr; arg::Symbol; pos::Int; kind::Symbol; end
 "A literal constant baked into the body."
 struct _Lit       <: _MExpr; value::Any; end
-"An external binding in VALUE position — a hygienic `GlobalRef` (deferred resolution in the definition
-module), NOT an eagerly-evaluated value."
-struct _ExtRef    <: _MExpr; ref::GlobalRef; end
+"An external binding in VALUE position. The hygienic `GlobalRef` remains the
+lookup authority; `captured` records its definition-time value solely so a
+narrow static-value consumer can reject later rebinding. A bare `_ExtRef`
+still has no general value or callable authority."
+struct _ExtRef <: _MExpr
+    ref::GlobalRef
+    captured::Any
+end
+_ExtRef(ref::GlobalRef) = _ExtRef(
+    ref, isdefined(ref.mod, ref.name) ? getglobal(ref.mod, ref.name) : nothing)
 "A callable used as a VALUE, backed by the same definition-time captured and
 rebind-checked registration as a direct call. This is required by exact
 higher-order builtins such as `map(copy, tuple)`; a bare `_ExtRef` never gains

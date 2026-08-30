@@ -369,6 +369,9 @@ function _own_field_reg(st::_OwnState, field::Symbol)
     fr[field]
 end
 
+_kernel_field_written_arguments(@nospecialize(descriptor)) = ()
+_kernel_field_effect_descriptor(@nospecialize(descriptor)) = false
+
 # Reject an opaque/non-pure call over a reactive actual in ANY position (RK block pt 6). An exact
 # pure primitive / operator is NO LONGER a live spelling exception here (RK 06:01) — it is captured
 # at definition as `:pure_primitive` and emitted as a `_RegisteredCall`, so any residual `_OpCall`
@@ -459,6 +462,12 @@ function _own_expr_effects!(st::_OwnState, cur::MethodId, x, env::Dict{Symbol,_P
             # resolved subject-writer: its DECLARED write-roots on the subject actual (owner fields
             # when the subject is __self__, e.g. `stats_f(__self__)` writing the diagnostics).
             _own_subject_write!(st, cur, x.pos[1], reg.write_roots, env)
+        elseif _kernel_field_effect_descriptor(reg)
+            for position in _kernel_field_written_arguments(reg)
+                position <= length(x.pos) || throw(_KernelFactoryReject(
+                    "callable field `$field` effect descriptor writes absent argument $position"))
+                _own_record!(st, cur, _kernel_place_of(x.pos[position], env))
+            end
         elseif !(reg isa _KernelRegistration) && !_kernel_field_registration_noeffect(reg)
             throw(_KernelFactoryReject(
                 "callable field `$field` has an unsupported effect descriptor " *
@@ -1431,12 +1440,37 @@ end
 # constructed instance. It self-discovers the destination recipe + external identity from source shape.
 
 # --- sanctioned graph-recipe BARE identities (RK 07:20) ---------------------------------------------
-# The exact LinearAlgebra graph-recipe primitives admitted as RAW recipe ops —
-# MINIMAL (RK 07:30): only `cholesky` and `logdet` (`\` is :ldiv, `+`/operators are in the pure set, and
-# `dot` lives INSIDE the trusted fused source op, never a raw recipe). Do not widen without a consumer.
-const _KERNEL_RECIPE_PRIMS = (LinearAlgebra.cholesky, LinearAlgebra.logdet)
+# The exact graph-recipe primitives admitted as RAW recipe ops. `deepcopy` is a
+# source-authored ownership marker, but the captured handle replaces it with the
+# compiler-owned structural copier below. The extensible Base generic is never
+# invoked by a prepared factory.
+const _KERNEL_RECIPE_PRIMS =
+    (LinearAlgebra.cholesky, LinearAlgebra.logdet, Base.deepcopy)
 _recipe_bare_op_ok(@nospecialize(op)) =
     _kernel_pure_primitive_value(op) || any(x -> x === op, _KERNEL_RECIPE_PRIMS)
+
+struct _StructuralCopyRecipe end
+const _STRUCTURAL_COPY_RECIPE = _StructuralCopyRecipe()
+@inline (::_StructuralCopyRecipe)(value) = _sm_structural_copy(value)
+
+_recipe_dom_deepcopy(::Type{T}) where {T} =
+    _kernel_dom_num_scalar(T) || T === Nothing || T <: Function ||
+    _kernel_dom_num_array(T) || _kernel_dom_diag(T) || _recipe_dom_chol(T) ||
+    (T <: NamedTuple && T isa DataType && all(_recipe_dom_deepcopy, fieldtypes(T))) ||
+    (T <: Tuple && T isa DataType && all(t -> t isa Type && _recipe_dom_deepcopy(t), T.parameters))
+
+# A raw `Base.deepcopy` call is safe only when the admitted aggregate contains
+# no callable authority. Function subtypes may define `deepcopy_internal`, so
+# even exact identity of the Base generic is not sufficient. Prepared handles
+# use `_StructuralCopyRecipe` instead; that compiler-owned path deliberately
+# retains callable authorities by identity.
+_recipe_dom_raw_deepcopy(::Type{T}) where {T} =
+    _kernel_dom_num_scalar(T) || T === Nothing ||
+    _kernel_dom_num_array(T) || _kernel_dom_diag(T) || _recipe_dom_chol(T) ||
+    (T <: NamedTuple && T isa DataType &&
+        all(_recipe_dom_raw_deepcopy, fieldtypes(T))) ||
+    (T <: Tuple && T isa DataType &&
+        all(t -> t isa Type && _recipe_dom_raw_deepcopy(t), T.parameters))
 
 # Per-callee SAFE-DOMAIN admission for a RAW recipe identity at CONCRETE binding (RK 07:30) — exact
 # identity is necessary but NOT sufficient (`cholesky`/`logdet`/`\`/`+` are extensible; a custom overload
@@ -1458,6 +1492,10 @@ per-callee domain. A custom-overload type over the same identity REJECTS.
 """
 function kernel_recipe_op_domain_ok(@nospecialize(op), argtypes)
     isempty(argtypes) && return false
+    op === Base.deepcopy && return length(argtypes) == 1 &&
+        _recipe_dom_raw_deepcopy(argtypes[1])
+    op isa _StructuralCopyRecipe && return length(argtypes) == 1 &&
+        _recipe_dom_deepcopy(argtypes[1])
     op === LinearAlgebra.cholesky && return length(argtypes) == 1 &&
         (_kernel_dom_num_matrix(argtypes[1]) || _kernel_dom_diag(argtypes[1]))
     op === LinearAlgebra.logdet && return length(argtypes) == 1 &&
@@ -1502,9 +1540,12 @@ struct _RecipeHandle{OP,MODE,IN,OUT,OWN}
 end
 recipe_handle_mode(::_RecipeHandle{OP,MODE}) where {OP,MODE} = MODE
 recipe_handle_op(h::_RecipeHandle) = h.op
+
 function _recipe_handle(op, ins, outs, owned)
     mode = _recipe_op_mode(op, length(owned), length(outs))
-    _RecipeHandle{typeof(op),mode,typeof(ins),typeof(outs),typeof(owned)}(op, ins, outs, owned)
+    captured = op === Base.deepcopy ? _STRUCTURAL_COPY_RECIPE : op
+    _RecipeHandle{typeof(captured),mode,typeof(ins),typeof(outs),typeof(owned)}(
+        captured, ins, outs, owned)
 end
 
 struct _PreparedFactory{Token,GR,P<:_KernelPlan,H<:Tuple,E<:Tuple}

@@ -56,7 +56,8 @@ _rke_bindings(callable=LambertW.lambertw;
         functional_state = functional_kernel(
             LambertW.lambertw; m=case["m"], c=case["c"])
         functional_quantile = _RKEC._functionalize_stateful(
-            functional_kernel, Val(:quantile_sq))
+            functional_kernel, Val(:quantile_sq);
+            argument_types=Tuple{Float64})
         snapshot = _RKEC._stateful_snapshot(functional_state)
         @test [functional_quantile(snapshot, q) for q in case["q"]] ≈
               case["quantile_sq"] atol=128eps(Float64) rtol=0
