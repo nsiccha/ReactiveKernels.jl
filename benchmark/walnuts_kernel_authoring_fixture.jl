@@ -12,14 +12,16 @@ include(joinpath(@__DIR__, "nuts_kernel_authoring_fixture.jl"))
 
 """Construct the external WALNUTS-D fixture with a fixed depth-10 default."""
 example_walnuts_binding(init, macro_time; max_step_halvings = 10,
-                         min_micro_steps = 1, max_error = oftype(init.ham, 0.1)) =
+                         min_micro_steps = 1, max_error = oftype(init.ham, 0.1),
+                         min_dham = oftype(init.ham, -1000)) =
     walnuts_state(init; step_f = leapfrog!, macro_time, max_step_halvings,
-                  min_micro_steps, max_error, stats_f = nuts_stats!)
+                  min_micro_steps, max_error, min_dham, stats_f = nuts_stats!)
 
 @kernel walnuts_state(init; step_f, macro_time,
                        max_depth = 10, max_step_halvings = 10,
                        min_micro_steps = 1,
-                       max_error = oftype(init.ham, 0.1), stats_f = nothing) = begin
+                       max_error = oftype(init.ham, 0.1),
+                       min_dham = oftype(init.ham, -1000), stats_f = nothing) = begin
     gofwd = true
     may_sample = true
     may_continue = true
@@ -30,7 +32,7 @@ example_walnuts_binding(init, macro_time; max_step_halvings = 10,
     trees = fillf(tree, init, max_depth + 1)
     proposals = fillf(deepcopy, init, max_depth + 2)
     dham = zero(init.ham)
-    diverged = !(dham >= -max_error)
+    diverged = !(dham >= min_dham)
     n_steps = 0
     reached_depth = 0
     acceptance_rate = zero(init.ham)
