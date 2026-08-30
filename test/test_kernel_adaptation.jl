@@ -10,6 +10,21 @@ module _AdaptFix
     include(joinpath(@__DIR__, "..", "benchmark", "nuts_kernel_authoring_fixture.jl"))
 end
 
+module _ReturnFix
+using ReactiveKernels
+
+# Deliberately not named after an HMC algorithm: this is the generic
+# zero-positional-constructor + value-returning-method capability shape.
+@kernel returning_energy(; mass = 1.0, speed = 2.0) = begin
+    scale = mass * speed^2
+    squared_scale = (mass * speed)^2
+    implicit_energy(x_squared) = scale * sqrt(x_squared / squared_scale + 1)
+    explicit_energy(x_squared) = begin
+        return scale * sqrt(x_squared / squared_scale + 1)
+    end
+end
+end
+
 _sval(pf, ow, sh, nm) = begin
     PL = RK.kernel_prepared_plan(pf); s = RK.kernel_plan_slot(PL, nm)
     role, slot = RK.kernel_plan_field(PL, s.canon)
@@ -86,6 +101,32 @@ end
             z = _cstate(_AdaptFix.dual_averaging_state, init)
             @test _hot_alloc(_da_batch!, z, T(0.5), n) == 0
         end
+    end
+end
+
+@testset "kernel_adaptation — functional dual averaging is source-derived" begin
+    kernel = RK.compile_stateful(_AdaptFix.dual_averaging_state, 0.65)
+    native = kernel(0.65)
+    functional = RK._functionalize_stateful(kernel, Val(:fit!))
+    snapshot = RK._stateful_snapshot(native)
+    for x in (0.91, 0.31, 0.63, 0.79)
+        RK.stateful_call!(native, Val(:fit!), x)
+        snapshot = functional(snapshot, x)
+        for name in propertynames(snapshot)
+            @test getfield(snapshot, name) ≈ RK.stateful_get(native, Val(name))
+        end
+    end
+    @test isempty(filter(name -> startswith(String(name), "_nr_"),
+                         propertynames(functional)))
+end
+
+@testset "kernel_adaptation — ordinary value returns are generic" begin
+    kernel = RK.compile_stateful(_ReturnFix.returning_energy)
+    state = kernel()
+    for x_squared in (0.0, 0.25, 4.0, 19.0)
+        expected = 4.0 * sqrt(x_squared / 4.0 + 1)
+        @test RK.stateful_call(state, Val(:implicit_energy), x_squared) ≈ expected
+        @test RK.stateful_call(state, Val(:explicit_energy), x_squared) ≈ expected
     end
 end
 

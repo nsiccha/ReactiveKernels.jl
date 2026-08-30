@@ -85,6 +85,7 @@ struct _DLit{T} <: _SMDomainNode end
 struct _DCall{Source,Dot,Args} <: _SMDomainNode end
 struct _DWrite{Target,Dot,Rhs} <: _SMDomainNode end
 struct _DValue{Rhs} <: _SMDomainNode end
+struct _DReturn{Rhs} <: _SMDomainNode end
 struct _DDefault{Name,Rhs} <: _SMDomainNode end
 struct _DOrchestration{Borrow,SegmentForest} <: _SMDomainNode end
 
@@ -200,6 +201,9 @@ function _sm_validate_node(::Type{_DWrite{T,D,R}}, argtypes, ::Type{KWT}) where 
 end
 _sm_validate_node(::Type{_DValue{R}}, argtypes, ::Type{KWT}) where {R,KWT} =
     (_sm_dtype(R, argtypes, KWT, false); nothing)
+_sm_validate_node(::Type{_DReturn{Nothing}}, argtypes, ::Type{KWT}) where {KWT} = nothing
+_sm_validate_node(::Type{_DReturn{R}}, argtypes, ::Type{KWT}) where {R,KWT} =
+    (_sm_dtype(R, argtypes, KWT, false); nothing)
 function _sm_validate_node(::Type{_DDefault{N,R}}, argtypes, ::Type{KWT}) where {N,R,KWT}
     N in KWT.parameters[1] || _sm_dtype(R, argtypes, KWT, false)
     nothing
@@ -292,7 +296,7 @@ function _sm_domain_forest(ir::MethodIR, plan::_KernelPlan, fields, ::Type{OW}, 
             dt === Nothing || push!(nodes, _DDefault{f.name,dt})
         end
     end
-    for st in ir.body
+    for (statement_index, st) in enumerate(ir.body)
         if st isa _LocalAssign
             length(st.lhs) == 1 || _sm_reject("stateful local assignment must bind exactly one name")
             t = _sm_dtree(st.rhs, plan, fields, OW, SH, finfo, ltrees, false) # old environment
@@ -306,6 +310,12 @@ function _sm_domain_forest(ir::MethodIR, plan::_KernelPlan, fields, ::Type{OW}, 
             push!(nodes, _DWrite{T,st.dot,t})
         elseif st isa _For
             # The sole supported control form is validated by `_compile_sm_orchestration`.
+        elseif st isa _Return
+            statement_index == length(ir.body) || _sm_reject(
+                "an ordinary straight-line return must terminate the method")
+            tree = st.value === nothing ? Nothing :
+                _sm_dtree(st.value, plan, fields, OW, SH, finfo, ltrees, false)
+            push!(nodes, _DReturn{tree})
         else
             _sm_reject("unsupported stateful method statement `$(typeof(st))`")
         end
@@ -415,7 +425,8 @@ function compile_stateful_method(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, i
                 getfield(kw, $(QuoteNode(f.name))) : $default))
         end
     end
-    for st in ir.body
+    returned = false
+    for (statement_index, st) in enumerate(ir.body)
         if st isa _LocalAssign
             length(st.lhs) == 1 || _sm_reject("stateful local assignment must bind exactly one name")
             for c in _exec_reads(st.rhs, fields)
@@ -438,13 +449,29 @@ function compile_stateful_method(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, i
             _exec_mask!(stmts, plan, tgt, :bless)
             for d in deps; delete!(current, d); push!(stale, d); end
             delete!(stale, tgt); push!(current, tgt)
+        elseif st isa _Return
+            statement_index == length(ir.body) || _sm_reject(
+                "an ordinary straight-line return must terminate the method")
+            if st.value === nothing
+                push!(stmts, :(return nothing))
+            else
+                for c in _exec_reads(st.value, fields)
+                    uc, _ = _exec_ensure!(stmts, c, current, stale, plan,
+                                          producer, hidx, OW, SH)
+                    ngrad += uc
+                end
+                rhs = _sm_rhs(st.value, syms, plan, fields, OW, SH,
+                              formals, locals, false)
+                push!(stmts, :(return $rhs))
+            end
+            returned = true
         else
             _sm_reject("unsupported straight-line statement `$(typeof(st))`")
         end
     end
     ngrad == 0 || _sm_reject("stateful method unexpectedly emitted $ngrad destination-gradient calls")
-    fn = compile(:((owned, shared, handles, args, kw) ->
-        $(Expr(:block, stmts..., :(return owned)))))
+    returned || push!(stmts, :(return owned))
+    fn = compile(:((owned, shared, handles, args, kw) -> $(Expr(:block, stmts...))))
     _sm_compiled_call(fn), _sm_domain_forest(ir, plan, fields, OW, SH, typeauth)
 end
 
@@ -622,6 +649,215 @@ struct _StatefulState{RT<:_StatefulRuntime,OW,SH,H}
     handles::H
 end
 
+# A backend-neutral, functional view of one authored stateful method.  The
+# RuntimeGeneratedFunction contains only source-derived expressions and calls
+# to ordinary PreparedKernels.  Optional compilers treat this wrapper as static
+# program structure and trace only `(state, argument)`.
+struct _FunctionalStatefulTransition{Names,F,E}
+    f::F
+    ensures::E
+end
+
+function (transition::_FunctionalStatefulTransition)(state, argument)
+    RuntimeGeneratedFunctions.generated_callfunc(
+        getfield(transition, :f), getfield(transition, :ensures), state,
+        argument)
+end
+
+_functional_state_names(::_StatefulKernel{S,PF,RT}) where {S,PF,RT} =
+    Tuple(entry[1] for entry in RT.parameters[3])
+
+@generated function _stateful_snapshot(state::_StatefulState{RT}) where {RT}
+    names = Tuple(entry[1] for entry in RT.parameters[3])
+    values = Any[:(stateful_get(state, Val($(QuoteNode(name))))) for name in names]
+    :(NamedTuple{$names}(($(values...),)))
+end
+
+function _sm_functional_rhs(x, syms, plan::_KernelPlan, fields,
+        ::Type{OW}, ::Type{SH}, formals, locals, dot::Bool) where {OW,SH}
+    if x isa _SelfField
+        name = x.path[end]
+        haskey(fields, name) || _sm_reject(
+            "functional stateful rhs reads unknown field `$name`")
+        haskey(syms, (:field, name)) || _sm_reject(
+            "functional stateful rhs has no value for field `$name`")
+        syms[(:field, name)]
+    elseif x isa _FormalRef
+        haskey(syms, (:formal, x.arg)) || _sm_reject(
+            "functional stateful rhs reads unbound formal `$(x.arg)`")
+        syms[(:formal, x.arg)]
+    elseif x isa _LocalRef
+        haskey(syms, (:local, x.name)) || _sm_reject(
+            "functional stateful rhs reads local `$(x.name)` before assignment")
+        syms[(:local, x.name)]
+    elseif x isa _Lit
+        x.value
+    elseif x isa _RegisteredCall
+        f = _sm_exact_callee(x)
+        args = Any[_sm_functional_rhs(
+            arg, syms, plan, fields, OW, SH, formals, locals, dot)
+                   for arg in x.args]
+        dot && _sm_isvector(x, plan, fields, OW, SH, formals, locals) ?
+            Expr(:call, GlobalRef(Base, :broadcasted), f, args...) :
+            Expr(:call, f, args...)
+    else
+        _sm_reject("unsupported functional stateful rhs node `$(typeof(x))`")
+    end
+end
+
+function _functional_stateful_method(kernel::_StatefulKernel{S,PF,RT,OW,SH},
+        ir::MethodIR) where {S,PF,RT,OW,SH}
+    _sm_validate_formals(ir)
+    any(formal -> formal.kind !== :pos, ir.formals) && _sm_reject(
+        "functional stateful transition currently requires positional-only methods")
+    any(statement -> statement isa _For, ir.body) && _sm_reject(
+        "functional stateful transition requires straight-line control")
+
+    skeleton = getfield(kernel, :skeleton)
+    spec = kernel_spec(skeleton)
+    plan = kernel_prepared_plan(getfield(kernel, :prepared))
+    fields = _exec_canon_map(plan)
+    names = _functional_state_names(kernel)
+    name_by_canon = Dict{Int,Symbol}()
+    for name in names
+        canon = get(fields, name, 0)
+        canon == 0 || get!(name_by_canon, canon, name)
+    end
+    all(canon -> haskey(name_by_canon, canon), values(fields)) || _sm_reject(
+        "functional stateful transition cannot name every canonical slot")
+
+    syms = Dict{Any,Symbol}()
+    formals = Dict{Symbol,Bool}()
+    locals = Dict{Symbol,Bool}()
+    statements = Any[]
+    for name in names
+        symbol = Symbol("__sf_field_", name)
+        syms[(:field, name)] = symbol
+        push!(statements,
+            :(local $symbol = getfield(state, $(QuoteNode(name)))))
+    end
+    positional = only(ir.formals)
+    argument_symbol = Symbol("__sf_arg_", positional.name)
+    syms[(:formal, positional.name)] = argument_symbol
+    formals[positional.name] = positional.type !== nothing &&
+        _resolve_sm_annotation(kernel_type_authorities(skeleton),
+                               positional.type) <: AbstractArray
+    push!(statements, :(local $argument_symbol = argument))
+
+    current = Set(values(fields))
+    stale = Set{Int}()
+    ensures = Any[]
+    field_order = Tuple(name for name in names if haskey(fields, name))
+    ensure! = function (canon::Int)
+        canon in current && return
+        haskey(name_by_canon, canon) || _sm_reject(
+            "functional stateful ensure cannot name canonical slot $canon")
+        name = name_by_canon[canon]
+        have = Tuple(field_name for field_name in field_order
+                     if fields[field_name] in current)
+        prepared = try
+            prepare(spec; have, want=name)
+        catch error
+            _sm_reject("functional stateful ensure for `$name` failed: " *
+                       sprint(showerror, error))
+        end
+        push!(ensures, prepared)
+        ensure_index = length(ensures)
+        arguments = Any[]
+        for input in inputs(prepared)
+            input_name = input.name
+            haskey(syms, (:field, input_name)) || _sm_reject(
+                "functional ensure for `$name` requires unknown input `$input_name`")
+            push!(arguments, syms[(:field, input_name)])
+        end
+        symbol = Symbol("__sf_ensure_", name, "_", ensure_index)
+        push!(statements, :(local $symbol =
+            getfield(ensures, $ensure_index)($(arguments...))))
+        syms[(:field, name)] = symbol
+        delete!(stale, canon)
+        push!(current, canon)
+        nothing
+    end
+
+    local_index = 0
+    for statement in ir.body
+        if statement isa _LocalAssign
+            length(statement.lhs) == 1 || _sm_reject(
+                "functional stateful local assignment must bind one name")
+            for canon in _exec_reads(statement.rhs, fields)
+                ensure!(canon)
+            end
+            rhs = _sm_functional_rhs(statement.rhs, syms, plan, fields,
+                OW, SH, formals, locals, false)
+            local_index += 1
+            name = statement.lhs[1]
+            symbol = Symbol("__sf_local_", name, "_", local_index)
+            syms[(:local, name)] = symbol
+            locals[name] = _sm_isvector(statement.rhs, plan, fields,
+                                        OW, SH, formals, locals)
+            push!(statements, :(local $symbol = $rhs))
+        elseif statement isa _PlaceWrite
+            (statement.root === :self && statement.target isa _SelfField &&
+             statement.owner !== nothing && !isempty(statement.owner)) ||
+                _sm_reject("functional stateful write is not a direct self-owned field")
+            for canon in _exec_reads(statement.rhs, fields)
+                ensure!(canon)
+            end
+            name = statement.target.path[end]
+            canon = get(fields, name, 0)
+            canon == 0 && _sm_reject(
+                "functional stateful write has no canonical slot for `$name`")
+            role, _ = kernel_plan_field(plan, canon)
+            role === :owned || _sm_reject(
+                "functional stateful method writes shared authority `$name`")
+            field_type = _pp_fieldtype(plan, canon, OW, SH)
+            rhs = _sm_functional_rhs(statement.rhs, syms, plan, fields,
+                OW, SH, formals, locals, statement.dot)
+            value = if field_type <: AbstractArray
+                statement.dot || _sm_reject(
+                    "functional array field `$name` requires an authored @. write")
+                Expr(:call, GlobalRef(Base, :materialize), rhs)
+            else
+                statement.dot && _sm_reject(
+                    "functional scalar field `$name` cannot use an authored @. write")
+                rhs
+            end
+            symbol = Symbol("__sf_write_", name, "_", length(statements) + 1)
+            push!(statements, :(local $symbol = $value))
+            syms[(:field, name)] = symbol
+            for dependent in _exec_kill_closure(plan, canon)
+                delete!(current, dependent)
+                push!(stale, dependent)
+            end
+            delete!(stale, canon)
+            push!(current, canon)
+        else
+            _sm_reject("unsupported functional stateful statement `$(typeof(statement))`")
+        end
+    end
+
+    # The functional ABI returns a fully materialized snapshot.  This makes the
+    # next invocation independent of host-side currentness masks while every
+    # stale read inside the authored method was still repaired at its exact
+    # source position above.
+    for name in field_order
+        ensure!(fields[name])
+    end
+    outputs = Any[syms[(:field, name)] for name in names]
+    push!(statements, :(return NamedTuple{$names}(($(outputs...),))))
+    fn = compile(:((ensures, state, argument) -> $(Expr(:block, statements...))))
+    _FunctionalStatefulTransition{names,typeof(fn),typeof(Tuple(ensures))}(
+        fn, Tuple(ensures))
+end
+
+function _functionalize_stateful(kernel::_StatefulKernel, ::Val{Name}) where {Name}
+    methods = Tuple(ir for ir in method_irs(getfield(kernel, :skeleton))
+                    if ir.id.name === Name)
+    length(methods) == 1 || _sm_reject(
+        "functional stateful method `$Name` must have exactly one captured overload")
+    _functional_stateful_method(kernel, only(methods))
+end
+
 function compile_stateful(skel, args...; kwargs...)
     pf = _prepare_stateful(skel)
     owned, shared = _construct_stateful(skel, pf, args...; kwargs...)
@@ -655,18 +891,20 @@ end
 end
 
 stateful_kernel(k::_StatefulKernel) = k
-stateful_call!(s::_StatefulState, ::Val{Name}, x; kwargs...) where {Name} =
+stateful_call(s::_StatefulState, ::Val{Name}, x; kwargs...) where {Name} =
     _stateful_call(s, Val(Name), x, values(kwargs))
+
+function stateful_call!(s::_StatefulState, ::Val{Name}, x; kwargs...) where {Name}
+    _stateful_call(s, Val(Name), x, values(kwargs))
+    s
+end
 
 @generated function _stateful_call(s::_StatefulState{RT}, ::Val{Name}, x, kw::NamedTuple) where {RT,Name}
     MS = RT.parameters[1]; names = MS.parameters[1]
     Name in names || return :(throw(ArgumentError("compiled state has no method `$Name`")))
     i = findfirst(==(Name), names)
-    quote
-        _sm_dispatch(getfield(getfield(s, :runtime), :methods)[$i], getfield(s, :owned),
-            getfield(s, :shared), getfield(s, :handles), x, kw)
-        s
-    end
+    :(_sm_dispatch(getfield(getfield(s, :runtime), :methods)[$i], getfield(s, :owned),
+        getfield(s, :shared), getfield(s, :handles), x, kw))
 end
 
 stateful_get(s::_StatefulState, ::Val{Name}) where {Name} = _stateful_get(s, Val(Name))

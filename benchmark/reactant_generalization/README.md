@@ -78,13 +78,13 @@ invariants. They are acceptance requirements, not NUTS implementation hints:
 
 The ordered admission frontier is:
 
-1. Riemannian kinetic energy (RKE)
+1. Dual averaging
 2. Euclidean phase point
 3. Leapfrog
 4. Generalized leapfrog
-5. SoftAbs metric
-6. Dual averaging
-7. Welford accumulation
+5. Welford accumulation
+6. Relativistic kinetic energy (RKE)
+7. SoftAbs metric
 8. Fixed-step HMC
 9. Adaptive NUTS
 10. Trajectory statistics

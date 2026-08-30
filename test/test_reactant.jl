@@ -7,6 +7,10 @@ using Test
 import Enzyme
 import Reactant: @compile, @jit
 
+module _ReactantStatefulFix
+include(joinpath(@__DIR__, "..", "benchmark", "nuts_kernel_authoring_fixture.jl"))
+end
+
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY,
     EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE,
@@ -133,6 +137,28 @@ end
 
 @testset "Reactant optional compiler integration" begin
     @test Base.get_extension(ReactiveKernels, :ReactiveKernelsReactantExt) !== nothing
+
+    @testset "source-derived functional state transition" begin
+        kernel = ReactiveKernels.compile_stateful(
+            _ReactantStatefulFix.dual_averaging_state, 0.65)
+        native_state = kernel(0.65)
+        transition = ReactiveKernels._functionalize_stateful(kernel, Val(:fit!))
+        host_state = ReactiveKernels._stateful_snapshot(native_state)
+        traced_state = map(
+            value -> Reactant.to_rarray(value; track_numbers = true), host_state)
+        traced_x = Reactant.to_rarray(0.91; track_numbers = true)
+        compiled = @compile transition(traced_state, traced_x)
+        for x_host in (0.91, 0.31, 0.63, 0.79)
+            traced_x = Reactant.to_rarray(x_host; track_numbers = true)
+            actual = compiled(traced_state, traced_x)
+            expected = transition(host_state, x_host)
+            for name in propertynames(expected)
+                @test getfield(actual, name) ≈ getfield(expected, name)
+            end
+            traced_state = actual
+            host_state = expected
+        end
+    end
 
     @testset "eight-schools PPL extraction and plate boundaries compile" begin
         artifact = evaluate_eight_schools_source()

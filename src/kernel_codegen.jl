@@ -259,6 +259,34 @@ function compile_prepared_initialization(pf::_PreparedFactory, ::Type{OW}, ::Typ
 end
 
 """
+    compile_prepared_ensure(pf, OW, SH, field) -> fn
+
+Compile a demand-driven repair for one named field of an arbitrary prepared
+kernel. The field and its producer chain come entirely from the captured plan;
+the returned callable repairs the field only when its currentness mask is dirty
+and then returns the current value.
+"""
+function compile_prepared_ensure(pf::_PreparedFactory, ::Type{OW}, ::Type{SH},
+                                 field::Symbol) where {OW,SH}
+    plan = kernel_prepared_plan(pf)
+    handles = kernel_prepared_handles(pf)
+    fields = _exec_canon_map(plan)
+    haskey(fields, field) || _l_reject(
+        "prepared ensure: field `$field` has no canonical slot")
+
+    producer = Dict{Int,Int}(c => r for (c, r) in kernel_plan_producer(plan))
+    recipes = kernel_plan_recipes(plan)
+    handle_index = Dict{Int,Tuple{Any,Int}}(
+        recipes[i] => (handles[i], i) for i in eachindex(handles))
+    canon = fields[field]
+    statements = Any[]
+    _exec_ensure!(statements, canon, Set{Int}(), Set{Int}(), plan,
+                  producer, handle_index, OW, SH)
+    compile(:((owned, shared, handles) ->
+        $(Expr(:block, statements..., :(return $(_pp_read(plan, canon)))))))
+end
+
+"""
     compile_prepared_schedule(pf, OW, SH, leaf_ir::MethodIR) -> fn
 
 The PUBLIC production POST-WRITE RECOMPUTE executor (RK 08:04 (c) / 08:37): takes the real transition/leaf

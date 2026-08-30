@@ -52,6 +52,22 @@ function Reactant.traced_type_inner(
     T
 end
 
+# Functional stateful transitions are immutable compiled programs. Their
+# PreparedKernel ensure tuple and RGF body are static metadata; only the
+# materialized state snapshot and method argument are traced.
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels._FunctionalStatefulTransition,
+        path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where
+        {T<:ReactiveKernels._FunctionalStatefulTransition}
+    T
+end
+
 # Native Julia arrays keep the fused scalar loop.  Reactant arrays select the
 # separately generated eager broadcast/reduction body, avoiding forbidden
 # scalar indexing while leaving XLA free to fuse the tensor operations.
