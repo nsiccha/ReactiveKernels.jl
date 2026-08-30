@@ -37,6 +37,10 @@ function validate_reactivehmc_hmc_receipt(path)
         require(length(case["energy_errors"]) ==
                 (case["diverged"] ? 1 : case["n_steps"]),
                 "$name: statistics count does not match the physical control path")
+        expected_events = case["diverged"] ? ["normal"] :
+            ["normal", "exponential"]
+        require(get(case, "rng_events", String[]) == expected_events,
+                "$name: RNG effects do not match the physical source order")
         require(!isempty(case["energy_errors"]) &&
                 last(case["energy_errors"]) == case["dham"],
                 "$name: final recorded statistic must equal dham")

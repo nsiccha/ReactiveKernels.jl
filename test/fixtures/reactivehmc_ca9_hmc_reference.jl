@@ -31,18 +31,21 @@ mutable struct ScriptedRNG <: AbstractRNG
     exponential::Vector{Float64}
     normal_calls::Int
     exponential_calls::Int
+    events::Vector{String}
 end
 
 ScriptedRNG(normal, exponential) =
-    ScriptedRNG(copy(normal), copy(exponential), 0, 0)
+    ScriptedRNG(copy(normal), copy(exponential), 0, 0, String[])
 
 function Random.randn!(rng::ScriptedRNG, destination::AbstractVector)
     rng.normal_calls += 1
+    push!(rng.events, "normal")
     copyto!(destination, rng.normal)
 end
 
 function Random.randexp(rng::ScriptedRNG)
     rng.exponential_calls += 1
+    push!(rng.events, "exponential")
     rng.exponential_calls <= length(rng.exponential) ||
         error("unexpected exponential draw $(rng.exponential_calls)")
     rng.exponential[rng.exponential_calls]
@@ -104,6 +107,7 @@ for case in CASES
     println("exponential_draws = $(toml_array(case.exponential))")
     println("normal_calls = $(rng.normal_calls)")
     println("exponential_calls = $(rng.exponential_calls)")
+    println("rng_events = $(repr(rng.events))")
     println("energy_errors = $(repr(energy_errors))")
     println("init_pos = $(repr(state.init.pos))")
     println("init_mom = $(repr(state.init.mom))")
