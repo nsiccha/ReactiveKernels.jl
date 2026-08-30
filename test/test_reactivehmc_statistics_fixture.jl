@@ -15,6 +15,7 @@ const RHMC_STATISTICS = ReactiveHMCStatisticsFixture
         :draws, :n_steps, :stepsizes, :acc_rate, :diverged,
         :full_history, :full_idxs, :history_counts,
         :dimension, :trajectory_capacity, :sample_capacity,
+        :reset_first,
         :first, :count, :sample_count,
         :trajectory_overflow, :sampling_overflow,
     )
@@ -26,6 +27,7 @@ const RHMC_STATISTICS = ReactiveHMCStatisticsFixture
     @test size(sources.draws) == (2, 4)
     @test size(sources.full_history) == (2, 8, 4)
     @test size(sources.full_idxs) == (8, 4)
+    @test sources.reset_first == 4
     @test sources.count == sources.sample_count == 0
     @test !sources.trajectory_overflow
     @test !sources.sampling_overflow
@@ -39,7 +41,9 @@ const RHMC_STATISTICS = ReactiveHMCStatisticsFixture
           findfirst("count += 1", source)
     @test occursin("trajectory_overflow && return trajectory_overflow", source)
     @test occursin("sampling_overflow = true\n            return sampling_overflow", source)
+    @test occursin("min1exp(x) = x > zero(x) ? one(x) : exp(x)", source)
     @test occursin("acceptance_sum += min1exp(__self__, dhams[column])", source)
+    @test occursin("acceptance_count = count > 1 ? count - 1 : 1", source)
     @test occursin("full_history[index, offset + 1, next_sample]", source)
 
     compiler_sources = String[]
