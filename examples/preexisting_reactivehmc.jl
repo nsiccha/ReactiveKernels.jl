@@ -52,30 +52,37 @@ end
 
 _tr_prod(a::AbstractMatrix, b::AbstractMatrix) = sum(a' .* b)
 
-function _metric_dmom(::Val{:gaussian}, chol, mom, speed, mass)
-    chol \ mom
+_metric_solve(metric::Diagonal, rhs) = rhs ./ metric.diag
+_metric_solve(metric, rhs) = cholesky(metric) \ rhs
+_metric_logdet(metric::Diagonal) = sum(log, metric.diag)
+_metric_logdet(metric) = logdet(cholesky(metric))
+_metric_inverse(metric::Diagonal) = Diagonal(one.(metric.diag) ./ metric.diag)
+_metric_inverse(metric) = Symmetric(inv(cholesky(metric)))
+
+function _metric_dmom(::Val{:gaussian}, metric, mom, speed, mass)
+    _metric_solve(metric, mom)
 end
 
-function _metric_dmom(::Val{:relativistic}, chol, mom, speed, mass)
-    dprekin = chol \ mom
+function _metric_dmom(::Val{:relativistic}, metric, mom, speed, mass)
+    dprekin = _metric_solve(metric, mom)
     sqrt_term = mass * sqrt(1 + dot(mom, dprekin) / (mass * speed)^2)
     dprekin ./ sqrt_term
 end
 
-function _metric_hamiltonian(::Val{:gaussian}, pot, chol, mom, speed, mass)
-    dkin = chol \ mom
-    pot + 0.5 * (logdet(chol) + dot(mom, dkin))
+function _metric_hamiltonian(::Val{:gaussian}, pot, metric, mom, speed, mass)
+    dkin = _metric_solve(metric, mom)
+    pot + 0.5 * (_metric_logdet(metric) + dot(mom, dkin))
 end
 
-function _metric_hamiltonian(::Val{:relativistic}, pot, chol, mom, speed, mass)
-    dprekin = chol \ mom
+function _metric_hamiltonian(::Val{:relativistic}, pot, metric, mom, speed, mass)
+    dprekin = _metric_solve(metric, mom)
     sqrt_term = mass * sqrt(1 + dot(mom, dprekin) / (mass * speed)^2)
-    pot + 0.5 * logdet(chol) + speed^2 * sqrt_term
+    pot + 0.5 * _metric_logdet(metric) + speed^2 * sqrt_term
 end
 
-function _riemannian_dpos(::Val{:gaussian}, mom, chol, inv_metric,
+function _riemannian_dpos(::Val{:gaussian}, mom, metric, inv_metric,
                           metric_grad, dpot, speed, mass)
-    dkin = chol \ mom
+    dkin = _metric_solve(metric, mom)
     dkin_dpos = map(eachslice(metric_grad; dims = 3)) do partial_metric
         0.5 * _tr_prod(inv_metric, partial_metric) -
             0.5 * dot(dkin, partial_metric, dkin)
@@ -83,9 +90,9 @@ function _riemannian_dpos(::Val{:gaussian}, mom, chol, inv_metric,
     dkin_dpos + dpot
 end
 
-function _riemannian_dpos(::Val{:relativistic}, mom, chol, inv_metric,
+function _riemannian_dpos(::Val{:relativistic}, mom, metric, inv_metric,
                           metric_grad, dpot, speed, mass)
-    dprekin = chol \ mom
+    dprekin = _metric_solve(metric, mom)
     sqrt_term = mass * sqrt(1 + dot(mom, dprekin) / (mass * speed)^2)
     dkin = dprekin ./ sqrt_term
     dkin_dpos = map(eachslice(metric_grad; dims = 3)) do partial_metric
@@ -100,8 +107,8 @@ function euclidean_phasepoint_kernels(kinetic::Val, pot_f, grad_f, metric0,
     pot0 = pot_f(pos0)
     _, dpot0 = grad_f(pos0)
     chol0 = cholesky(metric0)
-    dmom0 = _metric_dmom(kinetic, chol0, mom0, speed, mass)
-    ham0 = _metric_hamiltonian(kinetic, pot0, chol0, mom0, speed, mass)
+    dmom0 = _metric_dmom(kinetic, metric0, mom0, speed, mass)
+    ham0 = _metric_hamiltonian(kinetic, pot0, metric0, mom0, speed, mass)
 
     @kernel spec(pos::typeof(pos0), mom::typeof(mom0),
                  metric::typeof(metric0)) = begin
@@ -109,9 +116,9 @@ function euclidean_phasepoint_kernels(kinetic::Val, pot_f, grad_f, metric0,
         (pot, dpot::typeof(dpot0)) = grad_f(pos)
         chol::typeof(chol0) = cholesky(metric)
         dham_dmom::typeof(dmom0) =
-            _metric_dmom(kinetic, chol, mom, speed, mass)
+            _metric_dmom(kinetic, metric, mom, speed, mass)
         ham::typeof(ham0) =
-            _metric_hamiltonian(kinetic, pot, chol, mom, speed, mass)
+            _metric_hamiltonian(kinetic, pot, metric, mom, speed, mass)
         return ham
     end
 
@@ -137,12 +144,12 @@ function riemannian_phasepoint_kernels(kinetic::Val, pot_f, grad_f, metric_f,
     _, _, metric0 = metric_f(pos0)
     _, _, _, metric_grad0 = metric_grad_f(pos0)
     chol0 = cholesky(metric0)
-    inv_metric0 = Symmetric(inv(chol0))
-    dmom0 = _metric_dmom(kinetic, chol0, mom0, speed, mass)
+    inv_metric0 = _metric_inverse(metric0)
+    dmom0 = _metric_dmom(kinetic, metric0, mom0, speed, mass)
     dpos0 = _riemannian_dpos(
-        kinetic, mom0, chol0, inv_metric0, metric_grad0, dpot0, speed, mass,
+        kinetic, mom0, metric0, inv_metric0, metric_grad0, dpot0, speed, mass,
     )
-    ham0 = _metric_hamiltonian(kinetic, pot0, chol0, mom0, speed, mass)
+    ham0 = _metric_hamiltonian(kinetic, pot0, metric0, mom0, speed, mass)
 
     @kernel spec(pos::typeof(pos0), mom::typeof(mom0)) = begin
         pot::typeof(pot0) = pot_f(pos)
@@ -151,14 +158,14 @@ function riemannian_phasepoint_kernels(kinetic::Val, pot_f, grad_f, metric_f,
         (pot, dpot, metric, metric_grad::typeof(metric_grad0)) =
             metric_grad_f(pos)
         chol::typeof(chol0) = cholesky(metric)
-        inv_metric::typeof(inv_metric0) = Symmetric(inv(chol))
+        inv_metric::typeof(inv_metric0) = _metric_inverse(metric)
         dham_dmom::typeof(dmom0) =
-            _metric_dmom(kinetic, chol, mom, speed, mass)
+            _metric_dmom(kinetic, metric, mom, speed, mass)
         dham_dpos::typeof(dpos0) = _riemannian_dpos(
-            kinetic, mom, chol, inv_metric, metric_grad, dpot, speed, mass,
+            kinetic, mom, metric, inv_metric, metric_grad, dpot, speed, mass,
         )
         ham::typeof(ham0) =
-            _metric_hamiltonian(kinetic, pot, chol, mom, speed, mass)
+            _metric_hamiltonian(kinetic, pot, metric, mom, speed, mass)
         return ham
     end
 
@@ -169,11 +176,11 @@ function riemannian_phasepoint_kernels(kinetic::Val, pot_f, grad_f, metric_f,
     )
     dpos_kernel = prepare(
         spec;
-        have = (:mom, :chol, :inv_metric, :metric_grad, :dpot),
+        have = (:mom, :metric, :inv_metric, :metric_grad, :dpot),
         want = :dham_dpos,
     )
-    dmom_kernel = prepare(spec; have = (:chol, :mom), want = :dham_dmom)
-    ham_kernel = prepare(spec; have = (:pot, :chol, :mom), want = :ham)
+    dmom_kernel = prepare(spec; have = (:metric, :mom), want = :dham_dmom)
+    ham_kernel = prepare(spec; have = (:pot, :metric, :mom), want = :ham)
 
     geometry(p) = NamedTuple{
         (:pot, :dpot, :metric, :metric_grad, :chol, :inv_metric),
@@ -196,11 +203,31 @@ function riemannian_phasepoint_kernels(kinetic::Val, pot_f, grad_f, metric_f,
         ),
         geometry,
         dham_dpos = ((geo, p) -> dpos_kernel(
-            p, geo.chol, geo.inv_metric, geo.metric_grad, geo.dpot,
+            p, geo.metric, geo.inv_metric, geo.metric_grad, geo.dpot,
         )),
-        dham_dmom = ((geo, p) -> dmom_kernel(geo.chol, p)),
-        hamiltonian = ((geo, p) -> ham_kernel(geo.pot, geo.chol, p)),
+        dham_dmom = ((geo, p) -> dmom_kernel(geo.metric, p)),
+        hamiltonian = ((geo, p) -> ham_kernel(geo.pot, geo.metric, p)),
     )
+end
+
+function _softabs_jacobian(eigenvalues, metric_eigenvalues, alpha)
+    pre_i = reshape(eigenvalues, :, 1)
+    pre_j = reshape(eigenvalues, 1, :)
+    metric_i = reshape(metric_eigenvalues, :, 1)
+    metric_j = reshape(metric_eigenvalues, 1, :)
+    derivative = coth.(alpha .* pre_i) .-
+        pre_i .* alpha .* csch.(pre_i .* alpha) .^ 2
+    divided_difference = (metric_i .- metric_j) ./ (pre_i .- pre_j)
+    ifelse.(pre_i .== pre_j, derivative, divided_difference)
+end
+
+function _softabs_geometry(premetric::Diagonal, alpha)
+    eigenvalues = premetric.diag
+    eigenvectors = Diagonal(one.(eigenvalues))
+    metric_eigenvalues = eigenvalues .* coth.(alpha .* eigenvalues)
+    q_inv = Diagonal(one.(metric_eigenvalues) ./ metric_eigenvalues)
+    jacobian = _softabs_jacobian(eigenvalues, metric_eigenvalues, alpha)
+    (; eigenvalues, eigenvectors, metric_eigenvalues, q_inv, jacobian)
 end
 
 function _softabs_geometry(premetric, alpha)
@@ -209,17 +236,9 @@ function _softabs_geometry(premetric, alpha)
     eigenvectors = eig.vectors
     metric_eigenvalues = eigenvalues .* coth.(alpha .* eigenvalues)
     q_inv = eigenvectors ./ metric_eigenvalues'
-    jacobian = Base.broadcasted(
-        eigenvalues, metric_eigenvalues, eigenvalues', metric_eigenvalues',
-    ) do pre_i, metric_i, pre_j, metric_j
-        if pre_i == pre_j
-            coth(alpha * pre_i) - pre_i * alpha * csch(pre_i * alpha)^2
-        else
-            (metric_i - metric_j) / (pre_i - pre_j)
-        end
-    end
+    jacobian = _softabs_jacobian(eigenvalues, metric_eigenvalues, alpha)
     (; eigenvalues, eigenvectors, metric_eigenvalues, q_inv,
-       jacobian = collect(jacobian))
+       jacobian)
 end
 
 function _softabs_dmom(::Val{:gaussian}, geo, mom, speed, mass)

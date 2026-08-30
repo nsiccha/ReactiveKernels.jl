@@ -167,7 +167,7 @@ function reactivehmc_artifacts()
             RIEMANNIAN_SOURCE,
             (;
                 mom,
-                chol = relativistic_geometry.chol,
+                metric = relativistic_geometry.metric,
                 inv_metric = relativistic_geometry.inv_metric,
                 metric_grad = relativistic_geometry.metric_grad,
                 dpot = relativistic_geometry.dpot,
