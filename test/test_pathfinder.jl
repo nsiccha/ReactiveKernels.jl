@@ -31,7 +31,8 @@ _pathfinder_matrix(rows) = reduce(vcat, permutedims(Float64.(row)) for row in ro
 
     @testset "standalone physical oracle is source-locked and reproducible" begin
         python = Sys.which("python3")
-        python === nothing && error("Pathfinder oracle acceptance requires python3")
+        python === nothing && (python = Sys.which("python"))
+        python === nothing && error("Pathfinder oracle acceptance requires Python")
         recorded = read(_PATHFINDER_ORACLE_RECEIPT, String)
         reproduced = read(`$python $_PATHFINDER_ORACLE_SOURCE`, String)
         @test reproduced == recorded

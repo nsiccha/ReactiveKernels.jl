@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import sys
 from pathlib import Path
 
 
@@ -183,6 +184,9 @@ def emit_section(name, values, *, trailing_blank=True):
 
 
 def main():
+    # Keep the committed receipt byte-reproducible on Windows, where Python's
+    # default text stdout otherwise expands each LF to CRLF.
+    sys.stdout.reconfigure(newline="\n")
     inputs = fixture()
     alpha = list(inputs["initial_alpha"])
     results = []
