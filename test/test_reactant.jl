@@ -526,3 +526,4 @@ end
 end
 
 include("test_kernel_nuts_reactant.jl")
+include("test_pathfinder_reactant.jl")

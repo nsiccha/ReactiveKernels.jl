@@ -64,6 +64,7 @@ using .ReactiveKernelsNUTSExample
         include("test_ppl_enzyme.jl")
         include("test_ppl_docs_source_authority.jl")
         include("test_hmc.jl")
+        include("test_pathfinder.jl")
         include("test_reactive_sampler_baseline.jl")
         include("test_reactive_nuts.jl")
         include("test_reactive_adaptation.jl")
