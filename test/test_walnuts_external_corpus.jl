@@ -61,17 +61,26 @@ end
     @test byname[:start!].control == :recursive
     @test byname[:finish!].control == :recursive
 
-    # The source is admitted into MethodIR without pretending the two missing
-    # scalar operations are compiler-known.  These two opaque nodes are the
-    # smallest reusable value-domain gap handed to the generic compiler owner:
-    # abs(::builtin float) and div(::builtin Int, ::builtin Int).
+    # The exact builtin scalar contracts are compiler-known without changing
+    # the authored source: abs(::builtin float) and div(::builtin Int,
+    # ::builtin Int) must be captured as pure primitives, never opaque calls.
     opaque = Symbol[]
+    registered = Tuple{Symbol,Symbol}[]
     _walnuts_walk(byname[:macro_step!].body) do node
         if node isa ReactiveKernels._OpCall && node.hint === :opaque
             push!(opaque, node.op.name)
+        elseif node isa ReactiveKernels._RegisteredCall
+            registration = node.registration
+            source = getfield(registration, :source)
+            if source === abs || source === div
+                push!(registered,
+                    (nameof(source), getfield(registration, :kind)))
+            end
         end
     end
-    @test sort!(unique(opaque)) == [:abs, :div]
+    @test isempty(opaque)
+    @test sort!(unique(registered)) ==
+          [(:abs, :pure_primitive), (:div, :pure_primitive)]
 
     rec = ReactiveKernels.defunctionalized_mids(irs)
     @test Set(ir.id.name for ir in irs if ir.id.decl in rec) ==
