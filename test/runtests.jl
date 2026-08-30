@@ -78,6 +78,7 @@ using .ReactiveKernelsNUTSExample
         include("test_batched_example.jl")
         include("test_hmc_example.jl")
         include("test_preexisting_examples.jl")
+        include("test_reactivehmc_integrator_fixture.jl")
         include("test_corrected_core_examples.jl")
     end
     distributions_only || ad_only || ppl_ad_only || batched_only || bijectors_only ||
