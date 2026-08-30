@@ -6,6 +6,9 @@ using Test
     make = read(joinpath(root, "docs", "make.jl"), String)
     examples = read(joinpath(root, "docs", "kernel_examples.jl"), String)
     rendered_gate = read(joinpath(root, "docs", "check_rendered.jl"), String)
+    interactions = read(
+        joinpath(root, "benchmark", "reactivehmc_docs_interactions.jl"), String,
+    )
 
     @test occursin("\"Pathfinder approximation\" => \"pathfinder.md\"", make)
     @test occursin("render_pathfinder_kernels(@__MODULE__)", page)
@@ -22,9 +25,14 @@ using Test
     @test occursin("not a sampler API", page)
 
     @test occursin("pathfinder_kernel_authoring_fixture.jl", examples)
-    @test occursin("fixture.pathfinder_candidate", examples)
-    @test occursin("fixture.PATHFINDER_CANDIDATE", examples)
-    @test occursin("jl_fixture.PATHFINDER_JL_CANDIDATE", examples)
+    @test occursin("pathfinder_jl_kernel_authoring_fixture.jl", examples)
+    @test occursin("fixture.pathfinder_candidate", interactions)
+    @test occursin("fixture.pathfinder_jl_compact_candidate", interactions)
+    @test occursin("fixture.PATHFINDER_OUTPUTS", interactions)
+    @test occursin("fixture.PATHFINDER_JL_OUTPUTS", interactions)
+    @test occursin("kernel = prepare(", interactions)
+    @test occursin("output = kernel(Tuple(inputs)...)", interactions)
+    @test occursin("# Exact build-executed constructor / prepare / call", examples)
     @test occursin(":pathfinder_inverse_bfgs_geometry", examples)
     @test occursin(":pathfinder_local_gaussian_and_elbo", examples)
     @test occursin(":pathfinder_jl_compact_history", examples)

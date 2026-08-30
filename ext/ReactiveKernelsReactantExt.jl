@@ -23,6 +23,45 @@ function Reactant.traced_type_inner(
     T
 end
 
+function _rk_reactant_logical_argument(::Type{Actual}, ::Type{Expected}) where
+        {Actual,Expected}
+    expected_rank = Expected <: AbstractArray ? ndims(Expected) : 0
+    expected_eltype = Expected <: AbstractArray ? eltype(Expected) : Expected
+    ndims(Actual) == expected_rank &&
+        Reactant.unwrapped_eltype(Actual) === expected_eltype
+end
+
+ReactiveKernels._sm_functional_argument_type_ok(
+    ::Type{Actual}, ::Type{Expected}) where
+    {Actual<:Reactant.TracedRArray,Expected} =
+        _rk_reactant_logical_argument(Actual, Expected)
+ReactiveKernels._sm_functional_argument_type_ok(
+    ::Type{Actual}, ::Type{Expected}) where
+    {Actual<:Reactant.TracedRNumber,Expected} =
+        _rk_reactant_logical_argument(Actual, Expected)
+ReactiveKernels._sm_functional_argument_type_ok(
+    ::Type{Actual}, ::Type{Expected}) where
+    {Actual<:Reactant.AbstractConcreteArray,Expected} =
+        _rk_reactant_logical_argument(Actual, Expected)
+ReactiveKernels._sm_functional_argument_type_ok(
+    ::Type{Actual}, ::Type{Expected}) where
+    {Actual<:Reactant.AbstractConcreteNumber,Expected} =
+        _rk_reactant_logical_argument(Actual, Expected)
+
+@inline function ReactiveKernels._sm_functional_index(
+        array::Reactant.TracedRArray, indices...)
+    Reactant.@allowscalar getindex(array, indices...)
+end
+
+@inline function ReactiveKernels._sm_functional_indexed_copy(
+        array::Reactant.TracedRArray, value, indices...)
+    Reactant.@allowscalar begin
+        result = copy(array)
+        setindex!(result, value, indices...)
+        result
+    end
+end
+
 # Named/defaulted @kernel signatures wrap a PreparedKernel plus immutable
 # default providers.  The whole wrapper is likewise static program structure.
 function Reactant.make_tracer(
@@ -49,6 +88,51 @@ end
 function Reactant.traced_type_inner(
         ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
         ndevices, runtime) where {T<:ReactiveKernels.ReplicatedKernel}
+    T
+end
+
+# Functional stateful transitions are immutable compiled programs. Their
+# PreparedKernel ensure tuple and RGF body are static metadata; only the
+# materialized state snapshot and method argument are traced.
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels._FunctionalStatefulTransition,
+        path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where
+        {T<:ReactiveKernels._FunctionalStatefulTransition}
+    T
+end
+
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels._FunctionalStateMachineTransition,
+        path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where
+        {T<:ReactiveKernels._FunctionalStateMachineTransition}
+    T
+end
+
+# Free state transitions likewise contain only immutable generated program
+# structure and prepared repair kernels. The state NamedTuple passed to the
+# call is the complete dynamic traced value surface.
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels.CompiledStateTransition,
+        path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where
+        {T<:ReactiveKernels.CompiledStateTransition}
     T
 end
 

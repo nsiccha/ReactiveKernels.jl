@@ -5,7 +5,22 @@ using LogExpFunctions: log1pexp
 using Random
 using Test
 import Enzyme
+import LambertW
+import TOML
 import Reactant: @compile, @jit
+
+module _ReactantStatefulFix
+include(joinpath(@__DIR__, "..", "benchmark", "nuts_kernel_authoring_fixture.jl"))
+end
+
+include(joinpath(@__DIR__, "..", "benchmark",
+                 "reactivehmc_rke_kernel_fixture.jl"))
+include(joinpath(@__DIR__, "..", "benchmark",
+                 "reactivehmc_rke_functional_lowering.jl"))
+if !isdefined(@__MODULE__, :ReactiveHMCIntegratorFixture)
+    include(joinpath(@__DIR__, "..", "benchmark",
+                     "reactivehmc_integrator_kernel_fixture.jl"))
+end
 
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY,
@@ -75,6 +90,13 @@ end
     q_next::Vector{Float64} = accept ? qL : q
 end
 
+@kernel reactant_integrator_endpoint(
+        pos::Vector{Float64}, mom::Vector{Float64}) = begin
+    dham_dpos::Vector{Float64} = 2 .* pos
+    dham_dmom::Vector{Float64} = 3 .* mom
+    ham::Float64 = sum(abs2, pos) + sum(abs2, mom)
+end
+
 @kernel reactant_cauchy_logscale(
         x::Float64, μ::Float64, logσ::Float64) = begin
     σ::Float64 = exp(logσ)
@@ -133,6 +155,86 @@ end
 
 @testset "Reactant optional compiler integration" begin
     @test Base.get_extension(ReactiveKernels, :ReactiveKernelsReactantExt) !== nothing
+
+    @testset "source-derived functional state transition" begin
+        kernel = ReactiveKernels.compile_stateful(
+            _ReactantStatefulFix.dual_averaging_state, 0.65)
+        native_state = kernel(0.65)
+        transition = ReactiveKernels._functionalize_stateful(kernel, Val(:fit!))
+        host_state = ReactiveKernels._stateful_snapshot(native_state)
+        traced_state = map(
+            value -> Reactant.to_rarray(value; track_numbers = true), host_state)
+        traced_x = Reactant.to_rarray(0.91; track_numbers = true)
+        compiled = @compile transition(traced_state, traced_x)
+        for x_host in (0.91, 0.31, 0.63, 0.79)
+            traced_x = Reactant.to_rarray(x_host; track_numbers = true)
+            actual = compiled(traced_state, traced_x)
+            expected = transition(host_state, x_host)
+            for name in propertynames(expected)
+                @test getfield(actual, name) ≈ getfield(expected, name)
+            end
+            traced_state = actual
+            host_state = expected
+        end
+    end
+
+    @testset "source-derived RKE callable and sibling lowering" begin
+        receipt = TOML.parsefile(joinpath(@__DIR__, "..", "benchmark",
+            "receipts", "reactivehmc-rke-ca9-v1.toml"))
+        bindings = ReactiveKernels.stateful_compiler_bindings(
+            lambertw=ReactiveKernels.pure_callable_port(
+                LambertW.lambertw, Tuple{Float64,Int}, Float64;
+                functional_lowering=
+                    ReactiveHMCRKEFunctionalLowering.lambertw_minus_one))
+
+        for case in receipt["cases"]
+            kernel = ReactiveKernels.compile_stateful(
+                ReactiveHMCRKEFixture.rke, bindings, LambertW.lambertw;
+                m=case["m"], c=case["c"])
+            native_state = kernel(
+                LambertW.lambertw; m=case["m"], c=case["c"])
+            host_state = ReactiveKernels._stateful_snapshot(native_state)
+            traced_state = map(host_state) do value
+                value isa Number ?
+                    Reactant.to_rarray(value; track_numbers=true) : value
+            end
+
+            p_sq = ReactiveKernels._functionalize_stateful(
+                kernel, Val(:p_sq))
+            traced_x = Reactant.to_rarray(case["x_sq"][3]; track_numbers=true)
+            compiled_p_sq = @compile p_sq(traced_state, traced_x)
+            @test compiled_p_sq(traced_state, traced_x) ≈ case["p_sq"][3]
+
+            quantile = ReactiveKernels._functionalize_stateful(
+                kernel, Val(:quantile_sq))
+            traced_q = Reactant.to_rarray(case["q"][2]; track_numbers=true)
+            compiled_quantile = @compile quantile(traced_state, traced_q)
+            for (q, expected) in zip(case["q"], case["quantile_sq"])
+                traced_q = Reactant.to_rarray(q; track_numbers=true)
+                @test compiled_quantile(traced_state, traced_q) ≈ expected atol=128eps(Float64) rtol=0
+            end
+        end
+    end
+
+
+    @testset "generic static-loop state transition" begin
+        transition = compile_state_transition(
+            reactant_integrator_endpoint,
+            partial(ReactiveHMCIntegratorFixture.generalized_leapfrog!;
+                    stepsize=0.06, n_fi_steps=2),
+            ([0.25, -0.5], [0.4, 0.1]),
+        )
+        host_state = initial_transition_state(transition)
+        traced_state = map(host_state) do value
+            Reactant.to_rarray(value; track_numbers=true)
+        end
+        compiled = @compile transition(traced_state)
+        actual = compiled(traced_state)
+        expected = transition(host_state)
+        @test Array(actual.pos) ≈ expected.pos atol=2e-15 rtol=2e-13
+        @test Array(actual.mom) ≈ expected.mom atol=2e-15 rtol=2e-13
+        @test only(actual.ham) ≈ expected.ham atol=2e-15 rtol=2e-13
+    end
 
     @testset "eight-schools PPL extraction and plate boundaries compile" begin
         artifact = evaluate_eight_schools_source()
@@ -524,5 +626,6 @@ end
 end
 
 include("test_nutpie_reactant.jl")
+include("test_reactivehmc_statistics_reactant.jl")
 include("test_kernel_nuts_reactant.jl")
 include("test_pathfinder_reactant.jl")

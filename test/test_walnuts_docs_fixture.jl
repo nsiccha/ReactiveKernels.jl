@@ -8,6 +8,9 @@ using Test
     helpers = read(joinpath(root, "docs", "kernel_examples.jl"), String)
     make = read(joinpath(root, "docs", "make.jl"), String)
     rendered_check = read(joinpath(root, "docs", "check_rendered.jl"), String)
+    interactions = read(
+        joinpath(root, "benchmark", "reactivehmc_docs_interactions.jl"), String,
+    )
 
     for source_marker in (
         "@kernel walnuts_state(init; step_f, macro_time,",
@@ -27,7 +30,12 @@ using Test
     @test occursin("render_walnuts_source(:nuts_step)", page)
     @test occursin("render_walnuts_source(:nuts_leaf)", page)
     @test occursin("render_walnuts_source(:entry)", page)
+    @test occursin("render_walnuts_source_interaction()", page)
     @test occursin("render_walnuts_complete_source()", page)
+    @test occursin("WALNUTS_INSPECTION", interactions)
+    @test occursin("captured_method_count", interactions)
+    @test occursin("compiler_execution_claimed = false", interactions)
+    @test occursin("does **not** execute `walnuts!!`", page)
     @test occursin("\"WALNUTS-D mathematical kernel\" => \"walnuts.md\"", make)
     @test occursin("walnuts_kernel_authoring_fixture.jl", make)
     @test occursin("\"walnuts.md\" =>", rendered_check)

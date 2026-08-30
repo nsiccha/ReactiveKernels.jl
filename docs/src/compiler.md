@@ -31,8 +31,11 @@ must stay inside the compiler's inspectable and registered subset.
 Main.ReactiveKernelsDocs.render_compiler_api_map()
 ```
 
-The method-bearing source compiler and its factory remain implementation
-surfaces rather than a general exported `prepare` API. NUTS, log-density, and
+Most method-bearing source machinery and its general control factory remain
+implementation surfaces rather than a general exported `prepare` API. The
+narrow exported `compile_state_transition` seam described below is the
+exception: it combines a stateless endpoint `KernelSpec` with a bound free
+update method. NUTS, log-density, and
 PPL artifacts are external compilation examples and acceptance evidence, not
 domain APIs owned by ReactiveKernels. The NUTS runtime and domain surface live
 under `examples/nuts_runtime/`; a bare `using ReactiveKernels` does not load or
@@ -497,6 +500,41 @@ machine, a suspending `for` loop currently requires a two-bound unit range;
 non-suspending loops can retain an arbitrary native iterable. Exact overload
 narrowing is required before emission. Unsupported statements or unresolved
 effects reject instead of falling back to interpretation.
+
+### Functional free state transitions
+
+`compile_state_transition(spec, transition, endpoint_args;
+endpoint_kwargs=(;))` is the public, backend-neutral subset of the
+method-bearing compiler. `spec` supplies the endpoint's authoritative sources
+and have→want recipes. `transition` is a registered free mutating `@kernel`, or
+a `partial` of one that binds all of its required keyword controls. Construction
+uses the original endpoint and transition signature binders; it does not match
+the kernel's name, field names, or a program-counter census.
+
+The result is a `CompiledStateTransition`. `initial_transition_state(result)` returns an
+isolated, fully materialized named state while preserving external callable
+authorities by identity. Calling the result with that state is functional: an
+authored array write produces a new array value, invalidates the written
+source's transitive derived closure, and recomputes a stale derived field only
+at its next source-ordered read. The same generated program is ordinary Julia
+and static program metadata to optional array compilers such as Reactant.
+
+The initial public source subset is intentionally finite. It admits direct
+owned-field writes, exact captured `map(copy, tuple)`, tuple and named
+destructuring, bound non-Boolean numeric controls, and integer `Base.Colon`
+loops whose bounds are entirely static. Static loops are unrolled during
+lowering so validity is propagated through every authored iteration; this is
+not a host loop around traced execution. Indexed destinations,
+data-dependent branches/loops, arbitrary higher-order calls, and opaque
+callbacks reject. Callback computations used by endpoint recipes must be
+explicit endpoint ports so their authority is auditable and their identity is
+preserved.
+
+The six ReactiveHMC phase-point examples exercise this one compiler path for
+Gaussian and relativistic Euclidean, Riemannian, and diagonal-SoftAbs geometry.
+Both generalized leapfrog and implicit midpoint remain their ordinary authored
+mathematical kernels. Those examples validate a reusable compiler capability;
+they do not add geometry or integrator cases to compiler code.
 
 ## What the NUTS proof does and does not establish
 

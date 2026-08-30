@@ -423,7 +423,9 @@ function render_nutpie_diagonal_adaptation()
             dag = example.adaptation_kernel.plan,
         ),
     )
-    render_examples(artifacts)
+    rendered = render_examples(artifacts)
+    foreach(artifact -> _record_reactivehmc_docs_interaction!(artifact.name), artifacts)
+    rendered
 end
 
 # The ONE shared three-view UI (Raw input / Generated kernel / Compute DAG). Both
@@ -537,19 +539,6 @@ const _PATHFINDER_JL_FIXTURE_PATH = normpath(joinpath(
     @__DIR__, "..", "benchmark", "pathfinder_jl_kernel_authoring_fixture.jl",
 ))
 
-const _PATHFINDER_HAVE = (
-    :logdensity,
-    :position,
-    :gradient,
-    :alpha,
-    :step,
-    :gradient_delta,
-    :identity,
-    :elbo_standard_draws,
-    :output_standard_draws,
-    :curvature_tolerance,
-)
-
 function _pathfinder_authored_source()
     source = replace(
         read(_PATHFINDER_FIXTURE_PATH, String),
@@ -582,38 +571,35 @@ function _pathfinder_jl_authored_source()
     strip(source[first(start):(first(stop) - 1)], '\n')
 end
 
-function _pathfinder_inputs(fixture::Module)
-    # The fixture is included from this same Documenter `@eval` call. Cross the
-    # resulting world-age boundary explicitly before reading its fresh methods.
-    values = Base.invokelatest(fixture.pathfinder_fixture_inputs)
-    (;
-        logdensity = values.logdensity,
-        position = values.positions[:, 2],
-        gradient = values.gradients[:, 2],
-        alpha = values.initial_alpha,
-        step = values.positions[:, 2] .- values.positions[:, 1],
-        gradient_delta = values.gradients[:, 1] .- values.gradients[:, 2],
-        identity = values.identity,
-        elbo_standard_draws = values.elbo_standard_draws[:, :, 1],
-        output_standard_draws = values.output_standard_draws[:, :, 1],
-        curvature_tolerance = values.curvature_tolerance,
+function _source_locked_prepared_artifact(
+        interaction::AbstractString,
+        authored_source::AbstractString;
+        setup = nothing,
+        label::AbstractString = "docs interaction")
+    displayed_interaction = strip(interaction, '\n')
+    sandbox = Module(gensym(:SourceLockedDocsInteraction), true, true)
+    Core.eval(sandbox, :(using ReactiveKernels))
+    setup === nothing || setup(sandbox)
+    _evaluate_source(sandbox, displayed_interaction)
+    executed = Core.eval(sandbox, :docs_example)
+    executed.kernel isa PreparedKernel || error(
+        "$label did not produce a PreparedKernel",
     )
-end
-
-
-function _pathfinder_jl_inputs(fixture::Module)
-    values = Base.invokelatest(fixture.pathfinder_jl_fixture_inputs)
-    (;
-        logdensity = values.logdensity,
-        position = values.position,
-        gradient = values.gradient,
-        alpha = values.alpha,
-        history_steps = values.history_steps,
-        history_gradient_deltas = values.history_gradient_deltas,
-        parameter_identity = values.parameter_identity,
-        history_identity = values.history_identity,
-        elbo_standard_draws = values.elbo_standard_draws,
-        output_standard_draws = values.output_standard_draws,
+    observed = Base.invokelatest(executed.kernel, Tuple(executed.inputs)...)
+    isequal(observed, executed.output) || error(
+        "$label displayed call does not reproduce its displayed output",
+    )
+    merge(
+        executed,
+        (;
+            source = string(
+                strip(authored_source, '\n'),
+                "\n\n# Exact build-executed constructor / prepare / call\n",
+                displayed_interaction,
+            ),
+            generated = code_expr(executed.kernel),
+            dag = executed.kernel.plan,
+        ),
     )
 end
 
@@ -622,71 +608,40 @@ end
 
 Load the exact external Pathfinder fixtures and render two compiled cuts of the
 paper-oriented graph plus the multi-history compact L-BFGS kernel transcribed
-from Pathfinder.jl. All panels execute during the docs build and share the
-standard Raw input / Generated kernel / Compute DAG UI.
+from Pathfinder.jl. Every panel executes its displayed constructor, `prepare`,
+and call during the docs build and shares the standard Raw input / Generated
+kernel / Compute DAG UI.
 """
-function render_pathfinder_kernels(mod::Module)
-    if !isdefined(mod, :PathfinderKernelAuthoringFixture)
-        Base.include(mod, _PATHFINDER_FIXTURE_PATH)
-    end
-    fixture = getfield(mod, :PathfinderKernelAuthoringFixture)
-    fixture isa Module || error("Pathfinder fixture did not define its module")
-    if !isdefined(mod, :PathfinderJLKernelAuthoringFixture)
-        Base.include(mod, _PATHFINDER_JL_FIXTURE_PATH)
-    end
-    jl_fixture = getfield(mod, :PathfinderJLKernelAuthoringFixture)
-    jl_fixture isa Module || error("Pathfinder.jl fixture did not define its module")
-
-    inputs = _pathfinder_inputs(fixture)
-    jl_inputs = _pathfinder_jl_inputs(jl_fixture)
-    authored_source = _pathfinder_authored_source()
-    jl_authored_source = _pathfinder_jl_authored_source()
-    geometry_kernel = Base.invokelatest(
-        prepare,
-        fixture.pathfinder_candidate;
-        have = _PATHFINDER_HAVE,
-        want = (:alpha_next, :curvature_accepted, :covariance),
-    )
-    candidate_kernel = fixture.PATHFINDER_CANDIDATE
-    jl_candidate_kernel = jl_fixture.PATHFINDER_JL_CANDIDATE
-
-    geometry_output = Base.invokelatest(geometry_kernel, Tuple(inputs)...)
-    candidate_output = Base.invokelatest(candidate_kernel, Tuple(inputs)...)
-    jl_candidate_output =
-        Base.invokelatest(jl_candidate_kernel, Tuple(jl_inputs)...)
-    artifacts = (
+function render_pathfinder_kernels(::Module)
+    interactions = Main.ReactiveHMCDocsInteractions
+    fixtures = (
         (;
             name = :pathfinder_inverse_bfgs_geometry,
-            origin = "Algorithms 3/4 from the reviewed Pathfinder fixture; geometry WANT cut",
-            inputs,
-            kernel = geometry_kernel,
-            output = geometry_output,
-            source = authored_source,
-            generated = code_expr(geometry_kernel),
-            dag = geometry_kernel.plan,
+            authored_source = _pathfinder_authored_source(),
+            path = _PATHFINDER_FIXTURE_PATH,
         ),
         (;
             name = :pathfinder_local_gaussian_and_elbo,
-            origin = "Algorithms 3/4 from the reviewed Pathfinder fixture; full candidate WANT cut",
-            inputs,
-            kernel = candidate_kernel,
-            output = candidate_output,
-            source = authored_source,
-            generated = code_expr(candidate_kernel),
-            dag = candidate_kernel.plan,
+            authored_source = _pathfinder_authored_source(),
+            path = _PATHFINDER_FIXTURE_PATH,
         ),
         (;
             name = :pathfinder_jl_compact_history,
-            origin = "Pathfinder.jl 0.10.7 dba8c9a; two-history compact L-BFGS candidate",
-            inputs = jl_inputs,
-            kernel = jl_candidate_kernel,
-            output = jl_candidate_output,
-            source = jl_authored_source,
-            generated = code_expr(jl_candidate_kernel),
-            dag = jl_candidate_kernel.plan,
+            authored_source = _pathfinder_jl_authored_source(),
+            path = _PATHFINDER_JL_FIXTURE_PATH,
         ),
     )
-    render_examples(artifacts)
+    artifacts = map(fixtures) do fixture
+        interaction = interactions.pathfinder_interaction(fixture.name)
+        _source_locked_prepared_artifact(
+            interaction, fixture.authored_source;
+            setup = sandbox -> Base.include(sandbox, fixture.path),
+            label = "Pathfinder $(fixture.name)",
+        )
+    end
+    rendered = render_examples(artifacts)
+    foreach(artifact -> _record_reactivehmc_docs_interaction!(artifact.name), artifacts)
+    rendered
 end
 
 # A docs-scoped stateless extraction of the Euclidean phasepoint recurrence from
@@ -862,12 +817,381 @@ end
 
 # Benchmark and result rendering lives in result_views.jl.
 
-# The NUTS `@kernel` authoring surface is embedded STATICALLY in docs/src/nuts.md as a plain ```julia
-# fenced block (the exact bytes of benchmark/nuts_kernel_authoring_fixture.jl). It is intentionally NOT
-# rendered by a build-time `@eval` here: it is a deliberately static publication
-# surface, byte-locked LOUDLY to benchmark/nuts_kernel_authoring_fixture.jl by
-# test/test_nuts_docs_fixture.jl. PPL walkthrough panels use the separate
-# build-execution gate above, and `eval_block` errors are fatal in docs/make.jl.
+# The complete NUTS authoring surface is read from its fixture at docs build
+# time. This keeps the public code listing on the same source authority as the
+# compiler tests; `eval_block` failures are fatal in docs/make.jl.
+function _nuts_fixture_source()
+    isdefined(Main, :ReactiveKernelsDocsNUTSFixture) || error(
+        "NUTS authoring fixture was not loaded by docs/make.jl",
+    )
+    fixture = Main.ReactiveKernelsDocsNUTSFixture
+    path = joinpath(pkgdir(ReactiveKernels), "benchmark",
+                    "nuts_kernel_authoring_fixture.jl")
+    isfile(path) || error("NUTS authoring fixture is missing: $path")
+    source = replace(read(path, String), "\r\n" => "\n", "\r" => "\n")
+    expected = (
+        :euclidean_phasepoint, :leapfrog!, :refresh_momentum!!, :nuts_stats!,
+        :nuts_state, :nuts!!, :dual_averaging_state, :welford_var,
+    )
+    for name in expected
+        marker = "@kernel $(name)("
+        pattern = Regex("(?m)^@kernel " * string(name) * raw"\(")
+        count = length(collect(eachmatch(pattern, source)))
+        count == 1 || error(
+            "NUTS fixture must contain $marker exactly once; found $count",
+        )
+        isdefined(fixture, name) || error(
+            "build-loaded NUTS fixture does not define $name",
+        )
+    end
+    getfield(fixture, :euclidean_phasepoint) isa KernelSpec || error(
+        "build-loaded NUTS Euclidean phase point is not a KernelSpec",
+    )
+    for name in expected[2:end]
+        irs = ReactiveKernels.method_irs(getfield(fixture, name))
+        !isempty(irs) && all(ir -> ir.ok, irs) || error(
+            "build-loaded NUTS fixture has missing or rejected MethodIR for $name",
+        )
+    end
+    rstrip(source)
+end
+
+render_nuts_complete_source() =
+    Markdown.MD(Any[Markdown.Code("julia", _nuts_fixture_source())])
+
+function _run_source_locked_interaction(source::AbstractString, expected::Symbol)
+    displayed = strip(source, '\n')
+    sandbox = Module(gensym(:SourceLockedKernelInteraction), true, true)
+    Core.eval(sandbox, :(using ReactiveKernels))
+    _evaluate_source(sandbox, displayed)
+    interaction = Core.eval(sandbox, :docs_interaction)
+    interaction.name === expected || error(
+        "source-locked docs interaction returned $(interaction.name), expected $expected",
+    )
+    interaction.kind in (:native_execution, :fixture_receipt_inspection) ||
+        error("unexpected docs interaction kind: $(interaction.kind)")
+    displayed, interaction
+end
+
+function _render_source_locked_interaction(source::AbstractString, expected::Symbol,
+                                           title::AbstractString)
+    displayed, interaction = _run_source_locked_interaction(source, expected)
+    boundary = interaction.kind === :native_execution ?
+        "Native execution" : "Fixture / MethodIR / receipt inspection only"
+    blocks = Any[
+        RawHTML("""
+<article class="rk-source-interaction" data-rk-interaction="$(expected)"
+         data-rk-interaction-kind="$(interaction.kind)">
+<h3>$(title)</h3>
+<p><strong>Accepted boundary:</strong> $(boundary)</p>
+<h4>Exact build-executed interaction</h4>
+"""),
+        Markdown.Code("julia", displayed),
+        RawHTML("<h4>Observed output</h4>"),
+        Markdown.Code("julia", _plain_repr(interaction.output)),
+        RawHTML("</article>"),
+    ]
+    _record_reactivehmc_docs_interaction!(expected)
+    Markdown.MD(blocks)
+end
+
+render_nuts_source_interaction() = _render_source_locked_interaction(
+    Main.ReactiveHMCDocsInteractions.NUTS_INTERACTION,
+    :nuts_sampler_entry,
+    "Authored nuts!! native entry",
+)
+
+# --- ReactiveHMC compiler-corpus transparency ------------------------------
+
+const EXPECTED_REACTIVEHMC_DOC_INTERACTIONS = (
+    :pathfinder_inverse_bfgs_geometry,
+    :pathfinder_local_gaussian_and_elbo,
+    :pathfinder_jl_compact_history,
+    :nutpie_diagonal_initialize,
+    :nutpie_diagonal_adaptation,
+    :euclidean_phasepoint,
+    :relativistic_euclidean_phasepoint,
+    :riemannian_phasepoint,
+    :relativistic_riemannian_phasepoint,
+    :riemannian_softabs_phasepoint,
+    :relativistic_riemannian_softabs_phasepoint,
+    :relativistic_kinetic_energy,
+    :generalized_leapfrog,
+    :implicit_midpoint,
+    :statistics_state,
+    :fixed_step_hmc,
+    :nuts_sampler_entry,
+    :walnuts_entry_inspection,
+)
+const _REACTIVEHMC_DOC_INTERACTION_COUNTS =
+    Dict(name => 0 for name in EXPECTED_REACTIVEHMC_DOC_INTERACTIONS)
+
+function _record_reactivehmc_docs_interaction!(name::Symbol)
+    haskey(_REACTIVEHMC_DOC_INTERACTION_COUNTS, name) ||
+        error("unexpected ReactiveHMC docs example: $name")
+    _REACTIVEHMC_DOC_INTERACTION_COUNTS[name] += 1
+    nothing
+end
+
+function assert_reactivehmc_docs_interacted!()
+    failures = String[]
+    for name in EXPECTED_REACTIVEHMC_DOC_INTERACTIONS
+        count = _REACTIVEHMC_DOC_INTERACTION_COUNTS[name]
+        count == 1 ||
+            push!(failures, "$name interacted $count times (expected exactly once)")
+    end
+    isempty(failures) || error(
+        "ReactiveHMC documentation interaction gate failed:\n" *
+        join(failures, "\n"),
+    )
+    nothing
+end
+
+function _normalized_source(path::AbstractString)
+    isfile(path) || error("docs source authority is missing: $path")
+    replace(read(path, String), "\r\n" => "\n", "\r" => "\n")
+end
+
+function _phasepoint_authored_sources()
+    path = joinpath(
+        pkgdir(Main.ReactiveKernelsCompatibilityExamples), "src",
+        "preexisting_reactivehmc.jl",
+    )
+    source = _normalized_source(path)
+    euclidean_owner = _source_between(
+        source,
+        "function euclidean_phasepoint_kernels(",
+        "function riemannian_phasepoint_kernels(",
+    )
+    riemannian_owner = _source_between(
+        source,
+        "function riemannian_phasepoint_kernels(",
+        "function _softabs_jacobian(",
+    )
+    softabs_owner = _source_between(
+        source,
+        "function softabs_phasepoint_kernels(",
+        "function leapfrog!(",
+    )
+    (;
+        path,
+        euclidean = _source_between(
+            euclidean_owner, "    @kernel spec(", "\n    dpos_kernel =",
+        ),
+        riemannian = _source_between(
+            riemannian_owner, "    @kernel spec(", "\n    geometry_kernel =",
+        ),
+        softabs = _source_between(
+            softabs_owner, "    @kernel spec(", "\n    geometry_kernel =",
+        ),
+    )
+end
+
+function render_reactivehmc_phasepoints()
+    expected = (
+        :euclidean_phasepoint,
+        :relativistic_euclidean_phasepoint,
+        :riemannian_phasepoint,
+        :relativistic_riemannian_phasepoint,
+        :riemannian_softabs_phasepoint,
+        :relativistic_riemannian_softabs_phasepoint,
+    )
+    authority = _phasepoint_authored_sources()
+    authored = (
+        authority.euclidean,
+        authority.euclidean,
+        authority.riemannian,
+        authority.riemannian,
+        authority.softabs,
+        authority.softabs,
+    )
+    interactions = Main.ReactiveHMCDocsInteractions
+    artifacts = map(expected, authored) do name, source
+        _source_locked_prepared_artifact(
+            interactions.phasepoint_interaction(name), source;
+            label = "ReactiveHMC phase-point $name",
+        )
+    end
+    rendered = render_examples(artifacts)
+    foreach(artifact -> _record_reactivehmc_docs_interaction!(artifact.name), artifacts)
+    rendered
+end
+
+function _methodir_capture(skeleton)
+    registration = ReactiveKernels.kernel_registration(skeleton)
+    irs = ReactiveKernels.method_irs(skeleton)
+    !isempty(irs) || error("captured docs kernel has no MethodIR")
+    all(ir -> ir.ok, irs) || error(
+        "captured docs kernel contains rejected MethodIR: " *
+        join((string(ir.id.name, ": ", ir.reason) for ir in irs if !ir.ok), "; "),
+    )
+    registration_view = (;
+        kind = registration.kind,
+        subject = hasproperty(registration, :subject) ? registration.subject : nothing,
+        write_roots = hasproperty(registration, :write_roots) ?
+            registration.write_roots : (),
+        read_roots = hasproperty(registration, :read_roots) ?
+            registration.read_roots : (),
+    )
+    methods = Tuple((;
+        name = ir.id.name,
+        control = ir.control,
+        kind = ir.kind,
+        formals = Tuple((;
+            name = formal.name,
+            kind = formal.kind,
+            required = formal.required,
+        ) for formal in ir.formals),
+        effects = ir.effects,
+    ) for ir in irs)
+    _plain_repr((;
+        registration = registration_view,
+        ports = ReactiveKernels.kernel_port_names(skeleton),
+        methods,
+    ))
+end
+
+function _captured_source_block!(blocks, name::Symbol, title::AbstractString,
+                                 origin::AbstractString, source::AbstractString,
+                                 skeleton, interaction_source::AbstractString)
+    capture = _methodir_capture(skeleton)
+    displayed_interaction, interaction =
+        _run_source_locked_interaction(interaction_source, name)
+    boundary = interaction.kind === :native_execution ?
+        "Native compiler execution" :
+        "Fixture construction / MethodIR / independent-receipt inspection only"
+    push!(blocks, RawHTML("""
+<article class="rk-source-example" data-rk-source-authority="$(name)"
+         data-rk-interaction="$(name)"
+         data-rk-interaction-kind="$(interaction.kind)">
+<h3>$(title)</h3>
+<p><strong>Source authority:</strong> <code>$(origin)</code></p>
+<p><strong>Accepted boundary:</strong> $(boundary)</p>
+<h4>Authored source</h4>
+"""))
+    push!(blocks, Markdown.Code("julia", source))
+    push!(blocks, RawHTML("<h4>Compiler-captured MethodIR contract</h4>"))
+    push!(blocks, Markdown.Code("julia", capture))
+    push!(blocks, RawHTML("<h4>Exact build-executed interaction</h4>"))
+    push!(blocks, Markdown.Code("julia", displayed_interaction))
+    push!(blocks, RawHTML("<h4>Observed output</h4>"))
+    push!(blocks, Markdown.Code("julia", _plain_repr(interaction.output)))
+    push!(blocks, RawHTML("</article>"))
+    _record_reactivehmc_docs_interaction!(name)
+    blocks
+end
+
+function _reactivehmc_fixture_path(file::AbstractString)
+    joinpath(pkgdir(ReactiveKernels), "benchmark", file)
+end
+
+function render_reactivehmc_captured_sources(section::Symbol)
+    blocks = Any[]
+    if section === :rke
+        path = _reactivehmc_fixture_path("reactivehmc_rke_kernel_fixture.jl")
+        source = _normalized_source(path)
+        snippet = _source_between(
+            source, "@kernel rke(", "\n\nend # module ReactiveHMCRKEFixture",
+        )
+        _captured_source_block!(
+            blocks, :relativistic_kinetic_energy,
+            "Relativistic kinetic energy", relpath(path, pkgdir(ReactiveKernels)),
+            snippet, Main.ReactiveHMCRKEFixture.rke,
+            Main.ReactiveHMCDocsInteractions.RKE_INTERACTION,
+        )
+    elseif section === :integrators
+        path = _reactivehmc_fixture_path(
+            "reactivehmc_integrator_kernel_fixture.jl",
+        )
+        source = _normalized_source(path)
+        generalized = _source_between(
+            source, "@kernel generalized_leapfrog!(", "@kernel implicit_midpoint!(",
+        )
+        midpoint = _source_between(
+            source, "@kernel implicit_midpoint!(", "\n\nmultistep(",
+        )
+        origin = relpath(path, pkgdir(ReactiveKernels))
+        _captured_source_block!(
+            blocks, :generalized_leapfrog, "Generalized leapfrog",
+            origin, generalized,
+            Main.ReactiveHMCIntegratorFixture.generalized_leapfrog!,
+            Main.ReactiveHMCDocsInteractions.integrator_interaction(
+                :generalized_leapfrog,
+            ),
+        )
+        _captured_source_block!(
+            blocks, :implicit_midpoint, "Implicit midpoint",
+            origin, midpoint,
+            Main.ReactiveHMCIntegratorFixture.implicit_midpoint!,
+            Main.ReactiveHMCDocsInteractions.integrator_interaction(
+                :implicit_midpoint,
+            ),
+        )
+    elseif section === :statistics
+        path = _reactivehmc_fixture_path(
+            "reactivehmc_statistics_kernel_fixture.jl",
+        )
+        source = _normalized_source(path)
+        snippet = _source_between(
+            source, "@kernel statistics_state(",
+            "\n\nfunction initial_statistics_sources(",
+        )
+        _captured_source_block!(
+            blocks, :statistics_state,
+            "Trajectory and sampling statistics",
+            relpath(path, pkgdir(ReactiveKernels)), snippet,
+            Main.ReactiveHMCStatisticsFixture.statistics_state,
+            Main.ReactiveHMCDocsInteractions.STATISTICS_INTERACTION,
+        )
+    elseif section === :hmc
+        path = _reactivehmc_fixture_path("reactivehmc_hmc_kernel_fixture.jl")
+        source = _normalized_source(path)
+        snippet = _source_between(
+            source, "@kernel hmc_state(",
+            "\n\nend # module ReactiveHMCHMCFixture",
+        )
+        _captured_source_block!(
+            blocks, :fixed_step_hmc, "Fixed-step HMC",
+            relpath(path, pkgdir(ReactiveKernels)), snippet,
+            Main.ReactiveHMCHMCFixture.hmc_state,
+            Main.ReactiveHMCDocsInteractions.FIXED_HMC_INSPECTION,
+        )
+    else
+        error("unknown ReactiveHMC docs section: $section")
+    end
+    Markdown.MD(blocks)
+end
+
+_html_escape(value) = replace(
+    string(value), '&' => "&amp;", '<' => "&lt;", '>' => "&gt;",
+    '"' => "&quot;",
+)
+
+function render_reactivehmc_inventory()
+    isdefined(Main, :ReactiveHMCAlgorithmCorpus) ||
+        error("ReactiveHMC algorithm corpus was not loaded by docs/make.jl")
+    corpus = Main.ReactiveHMCAlgorithmCorpus
+    entries = corpus.CORPUS
+    length(entries) == 17 ||
+        error("ReactiveHMC docs inventory expected 17 entries; found $(length(entries))")
+    io = IOBuffer()
+    print(io, """<div class="rk-corpus-inventory">""")
+    for entry in entries
+        sources = join(entry.current_reactive_sources, ", ")
+        capabilities = join(string.(entry.capabilities), ", ")
+        print(io, """
+<article data-rk-corpus-id="$(_html_escape(entry.id))">
+<h3><code>$(_html_escape(entry.id))</code></h3>
+<p><strong>Family:</strong> $(_html_escape(entry.family))</p>
+<p><strong>Pinned upstream:</strong> <code>$(_html_escape(entry.upstream.file)):$(_html_escape(entry.upstream.lines))</code></p>
+<p><strong>RK source authority:</strong> <code>$(_html_escape(sources))</code></p>
+<p><strong>Acceptance boundary:</strong> $(_html_escape(entry.minimum_acceptance)); $(_html_escape(capabilities))</p>
+</article>
+""")
+    end
+    print(io, "</div>")
+    Markdown.MD(Any[RawHTML(String(take!(io)))])
+end
 
 # WALNUTS-D is a smaller external compiler fixture whose page emphasizes a few
 # mathematical/control slices and still offers its complete source.  Read those
@@ -949,5 +1273,11 @@ end
 
 render_walnuts_complete_source() =
     Markdown.MD(Any[Markdown.Code("julia", rstrip(_walnuts_fixture_source()))])
+
+render_walnuts_source_interaction() = _render_source_locked_interaction(
+    Main.ReactiveHMCDocsInteractions.WALNUTS_INSPECTION,
+    :walnuts_entry_inspection,
+    "WALNUTS fixture entry inspection",
+)
 
 end # module ReactiveKernelsDocs

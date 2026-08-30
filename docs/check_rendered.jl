@@ -47,6 +47,7 @@ function check_rendered_docs(build_dir, page_tree)
         "batched.md" => 1,
         "bijectors.md" => 1,
         "pathfinder.md" => 3,
+        "reactivehmc-corpus.md" => 6,
         "nuts.md" => 2,
         "nutpie-diagonal.md" => 2,
         "eight-schools.md" => 1,
@@ -57,6 +58,14 @@ function check_rendered_docs(build_dir, page_tree)
         "arma11.md" => 1,
         "gaussian-mixture.md" => 1,
         "online-stats.md" => 2,
+    )
+    expected_source_examples = Dict(
+        "reactivehmc-corpus.md" => 5,
+    )
+    expected_source_interactions = Dict(
+        "reactivehmc-corpus.md" => 5,
+        "nuts.md" => 1,
+        "walnuts.md" => 1,
     )
     expected_sortable_tables = Dict(
         "batched.md" => 1,
@@ -75,6 +84,8 @@ function check_rendered_docs(build_dir, page_tree)
         "nuts.md" => (
             "class=\"rk-status-grid\"",
             "Full compiled NUTS kernel",
+            "Authored nuts!! native entry",
+            "result = fixture.nuts!!(sampler; rng = Random.Xoshiro(1))",
             "Receipt medians for the matched-control corpus",
             "Compilation and first-call costs",
         ),
@@ -87,6 +98,24 @@ function check_rendered_docs(build_dir, page_tree)
             "Pathfinder Inverse Bfgs Geometry",
             "Pathfinder Local Gaussian And Elbo",
             "Pathfinder Jl Compact History",
+            "# Exact build-executed constructor / prepare / call",
+            "fixture.pathfinder_candidate",
+            "fixture.pathfinder_jl_compact_candidate",
+            "output = kernel(Tuple(inputs)...)",
+        ),
+        "reactivehmc-corpus.md" => (
+            "ReactiveHMC kernel corpus",
+            "Relativistic kinetic energy",
+            "Generalized leapfrog",
+            "Implicit midpoint",
+            "Trajectory and sampling statistics",
+            "Fixed-step HMC",
+            "# Exact build-executed constructor / prepare / call",
+            "compiled = RK.compile_stateful(",
+            "ReactiveKernels.compile_state_transition(",
+            "Fixture construction / MethodIR / independent-receipt inspection only",
+            "compiler_execution_claimed = false",
+            "ca9ea4ca41924bb0e1fadc01c717e1333916aba6",
         ),
         "walnuts.md" => (
             "WALNUTS-D as mathematical `@kernel` source",
@@ -96,6 +125,9 @@ function check_rendered_docs(build_dir, page_tree)
             "step!(directions, exponentials) = begin",
             "accepted = macro_step!(__self__, ep)",
             "@kernel walnuts!!(state; momentum, directions, exponentials)",
+            "WALNUTS fixture entry inspection",
+            "captured_method_count",
+            "compiler_execution_claimed = false",
             "Complete authored WALNUTS-D fixture",
         ),
         "visualization.md" =>
@@ -126,6 +158,19 @@ function check_rendered_docs(build_dir, page_tree)
             error("rendered $source has $observed executable panels; expected $expected")
         observed_panels += observed
 
+        source_examples = _occurrences(body, "class=\"rk-source-example\"")
+        expected_sources = get(expected_source_examples, source, 0)
+        source_examples == expected_sources || error(
+            "rendered $source has $source_examples captured-source examples; expected $expected_sources",
+        )
+
+        source_interactions = _occurrences(body, "class=\"rk-source-interaction\"") +
+            _occurrences(body, "class=\"rk-source-example\"")
+        expected_interactions = get(expected_source_interactions, source, 0)
+        source_interactions == expected_interactions || error(
+            "rendered $source has $source_interactions source-locked interactions; expected $expected_interactions",
+        )
+
         intermediate_path = joinpath(intermediate_dir, source)
         isfile(intermediate_path) ||
             error("DocumenterVitepress intermediate page is missing: $intermediate_path")
@@ -143,6 +188,37 @@ function check_rendered_docs(build_dir, page_tree)
         for marker in get(structural_markers, source, ())
             occursin(marker, intermediate) ||
                 error("rendered $source is missing structural result marker: $marker")
+        end
+
+        if source == "reactivehmc-corpus.md"
+            inventory_count = _occurrences(intermediate, "data-rk-corpus-id=")
+            inventory_count == 17 || error(
+                "ReactiveHMC corpus page rendered $inventory_count inventory entries; expected 17",
+            )
+            for marker in (
+                    "data-rk-source-authority=\"relativistic_kinetic_energy\"",
+                    "data-rk-source-authority=\"generalized_leapfrog\"",
+                    "data-rk-source-authority=\"implicit_midpoint\"",
+                    "data-rk-source-authority=\"statistics_state\"",
+                    "data-rk-source-authority=\"fixed_step_hmc\"",
+                )
+                count = _occurrences(intermediate, marker)
+                count == 1 || error(
+                    "ReactiveHMC corpus marker $marker occurred $count times; expected exactly once",
+                )
+            end
+            for marker in (
+                    "data-rk-interaction=\"relativistic_kinetic_energy\"",
+                    "data-rk-interaction=\"generalized_leapfrog\"",
+                    "data-rk-interaction=\"implicit_midpoint\"",
+                    "data-rk-interaction=\"statistics_state\"",
+                    "data-rk-interaction=\"fixed_step_hmc\"",
+                )
+                count = _occurrences(intermediate, marker)
+                count == 1 || error(
+                    "ReactiveHMC interaction marker $marker occurred $count times; expected exactly once",
+                )
+            end
         end
 
         if source == "eight-schools.md"

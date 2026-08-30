@@ -73,9 +73,11 @@ package's optimizer, tasking, or mutable path driver.
 The three panels below are built from the exact reviewed fixtures during the
 docs build. The first transpiles only the curvature-safe one-pair geometry; the
 second transpiles its complete local-Gaussian candidate and ELBO; the third is
-the Pathfinder.jl-like two-history compact kernel. Open **Raw input** to see the
-authored mathematical `@kernel`, **Generated kernel** for the lowered Julia,
-and **Compute DAG** for the selected have→want plan.
+the Pathfinder.jl-like two-history compact kernel. Open **Raw input** to see
+the authored mathematical `@kernel` followed by the exact build-executed
+fixture construction, `prepare`, and call that produced the displayed output;
+**Generated kernel** shows the lowered Julia, and **Compute DAG** shows that
+same prepared kernel's selected have→want plan.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_pathfinder_kernels(@__MODULE__)
@@ -84,11 +86,11 @@ Main.ReactiveKernelsDocs.render_pathfinder_kernels(@__MODULE__)
 ## What remains ordinary Julia
 
 The optimizer, circular-history policy, and RNG policy stay outside the
-`run_single_path` driver walks supplied positions and gradients, feeds one
-retained pair into the prepared kernel at a time, threads `alpha_next`, and
-selects the largest ELBO. Standard-normal tensors are HAVE values rather than a
-hidden RNG effect, so native Julia and Reactant execute the same deterministic
-mathematics.
+kernels. The `run_single_path` driver walks supplied positions and gradients,
+feeds one retained pair into the prepared kernel at a time, threads
+`alpha_next`, and selects the largest ELBO. Standard-normal tensors are HAVE
+values rather than a hidden RNG effect, so native Julia and Reactant execute
+the same deterministic mathematics.
 
 For the compact candidate, the caller snapshots the currently active circular
 history in chronological columns and supplies its matching ``H_0`` diagonal.
