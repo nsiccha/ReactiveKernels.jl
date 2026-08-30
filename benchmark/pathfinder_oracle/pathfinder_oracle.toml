@@ -2,7 +2,7 @@
 paper_url = "https://jmlr.org/papers/volume23/21-0889/21-0889.pdf"
 paper_sha256 = "8fe38816d4953e5b4e01a8b531abb9f3ea1d1f92041f6c2a7ce5e9c7037c8435"
 algorithms = [1,3,4]
-oracle_source_sha256 = "9fd49f4e0e6ef6123caad8ae95938c8267a75885c76752ea69dd37d66a6635c1"
+oracle_source_sha256 = "9580beb45df9ec5b8ca937d6d6be7597f4bedd1da729f5443586d1fbbb84a534"
 oracle_engine = "python-stdlib"
 
 [path]
