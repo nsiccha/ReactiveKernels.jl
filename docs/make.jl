@@ -15,6 +15,12 @@ using .ReactiveKernelsNUTSExample
 include(joinpath(@__DIR__, "..", "examples", "nutpie_diagonal_adaptation.jl"))
 import .NutpieDiagonalAdaptationExample
 
+# Parse the external WALNUTS-D mathematical authoring fixture during the docs
+# build.  The docs renderer below reads the exact source file for display, while
+# this include makes malformed or no-longer-admitted @kernel source fail the
+# GitHub Pages build instead of publishing a stale code listing.
+include(joinpath(@__DIR__, "..", "benchmark", "walnuts_kernel_authoring_fixture.jl"))
+
 include("kernel_examples.jl")
 Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "result_views.jl"))
 include("check_rendered.jl")
@@ -42,6 +48,7 @@ site_pages = [
         "Pathfinder approximation" => "pathfinder.md",
         "NUTS sampling" => "nuts.md",
         "Nutpie diagonal adaptation" => "nutpie-diagonal.md",
+        "WALNUTS-D mathematical kernel" => "walnuts.md",
         "Online statistics" => "online-stats.md",
     ],
     "Visualization" => "visualization.md",
