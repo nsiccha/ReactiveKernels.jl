@@ -112,6 +112,7 @@ struct _DTuple{Args} <: _SMDomainNode end
 struct _DNamedTuple{Names,Args} <: _SMDomainNode end
 struct _DProject{Parent,Key} <: _SMDomainNode end
 struct _DIndex{Base,Indices} <: _SMDomainNode end
+struct _DFixedTupleIndex{Element,Indices} <: _SMDomainNode end
 struct _DIfValue{Cond,Then,Else} <: _SMDomainNode end
 struct _DShortValue{Op,Lhs,Rhs} <: _SMDomainNode end
 struct _DWrite{Target,Dot,Rhs} <: _SMDomainNode end
@@ -135,12 +136,26 @@ _sm_builtin_array(::Type{T}) where {T} =
     _kernel_dom_num_array(T) ||
     (T <: BitArray && _kernel_dom_builtin(T) && eltype(T) === Bool)
 
-# Fixed homogeneous tuples are a backend-supported structural representation,
-# unlike Arrays whose elements are arbitrary Julia aggregates.  Admit dynamic
-# tuple indexing only when every element has one exact, recursively builtin
-# numeric layout.  Shape and topology remain bound by the frozen state
-# snapshot; callable/static authorities and user-defined wrappers stay out of
-# this ABI.
+# Exact primitive tensor leaves supported by finite structural backend ABIs.
+# Keep this narrower than the compiler's pure-number domain: wrapper numbers
+# and 128-bit integers have no accepted tensor representation.
+const _SM_FINITE_BACKEND_PRIMITIVES = (
+    Bool,
+    Int8, Int16, Int32, Int64,
+    UInt8, UInt16, UInt32, UInt64,
+    Float16, Float32, Float64,
+)
+
+_sm_finite_backend_primitive(::Type{T}) where {T} =
+    any(candidate -> candidate === T, _SM_FINITE_BACKEND_PRIMITIVES)
+
+_sm_finite_backend_array(::Type{A}) where {A} =
+    A <: Array && _kernel_dom_builtin(A) &&
+    _sm_finite_backend_primitive(eltype(A))
+
+# Type shape is only the first half of fixed structural admission.  An
+# explicit prototype binding additionally freezes axes and mutable alias
+# topology; this predicate alone never authorizes an indexed source program.
 function _sm_fixed_structural_dynamic_type(::Type{T}) where {T}
     _sm_finite_backend_primitive(T) && return true
     T <: Array && _sm_finite_backend_primitive(eltype(T)) && return true
@@ -252,7 +267,45 @@ struct _StructuredStatePort{T,R}
     repairs::R
 end
 
-struct _BoundStructuralCopyRecipe{P<:_StructuredStatePort}
+struct _SMFixedStructuralTuplePort{
+        T,Element,Capacity,Shape,ElementTopology,Topology}
+    shape_contract::Shape
+    element_topology::ElementTopology
+    topology_contract::Topology
+end
+
+function _sm_fixed_structural_tuple_port(values::T) where {T<:Tuple}
+    element = _sm_fixed_tuple_element_type(T)
+    element === nothing && throw(ArgumentError(
+        "fixed structural tuple prototype requires one nonempty homogeneous " *
+        "recursively builtin numeric element layout"))
+    element_shape = _sm_shape_contract(first(values))
+    element_topology = _sm_topology_contract(first(values))
+    for (index, value) in enumerate(values)
+        typeof(value) === element || throw(ArgumentError(
+            "fixed structural tuple element $index changed logical type"))
+        _sm_shape_contract_ok(value, element_shape) || throw(ArgumentError(
+            "fixed structural tuple element $index changed numeric axes"))
+        _sm_topology_contract(value) == element_topology ||
+            throw(ArgumentError(
+                "fixed structural tuple elements have conflicting mutable alias topology"))
+    end
+    topology = _sm_topology_contract(values)
+    for group in topology
+        element_indices = unique(first(path) for path in group)
+        length(element_indices) == 1 || throw(ArgumentError(
+            "fixed structural tuple prototype shares owned mutable storage " *
+            "across elements $(Tuple(element_indices))"))
+    end
+    port = _SMFixedStructuralTuplePort{
+        T,element,length(values),typeof(element_shape),
+        typeof(element_topology),typeof(topology)}(
+            element_shape, element_topology, topology)
+    _sm_fixed_tuple_validate(port, values)
+    port
+end
+
+struct _BoundStructuralCopyRecipe{P}
     port::P
 end
 
@@ -325,21 +378,35 @@ end
 
 _sm_freeze_compiler_port(port::_StructuredStatePort) =
     _sm_compiler_static_snapshot(port)
+_sm_freeze_compiler_port(port::_SMFixedStructuralTuplePort) = port
 
 function _sm_freeze_compiler_ports(ports::NamedTuple)
     map(_sm_freeze_compiler_port, ports)
 end
 
 @inline function (copy_recipe::_BoundStructuralCopyRecipe)(value)
-    _sm_validate_structured_state_port(getfield(copy_recipe, :port), value)
-    _sm_structured_copy(getfield(copy_recipe, :port), value)
+    port = getfield(copy_recipe, :port)
+    if port isa _StructuredStatePort
+        _sm_validate_structured_state_port(port, value)
+        return _sm_structured_copy(port, value)
+    elseif port isa _SMFixedStructuralTuplePort
+        return _sm_fixed_tuple_copy(port, value)
+    end
+    throw(ArgumentError(
+        "bound structural copy has unsupported compiler port"))
 end
 
 function kernel_recipe_op_domain_ok(
         copy_recipe::_BoundStructuralCopyRecipe, argtypes)
     length(argtypes) == 1 || return false
-    initial = getfield(getfield(copy_recipe, :port), :transition).initial
-    argtypes[1] === typeof(initial)
+    port = getfield(copy_recipe, :port)
+    if port isa _StructuredStatePort
+        initial = getfield(port, :transition).initial
+        return argtypes[1] === typeof(initial)
+    elseif port isa _SMFixedStructuralTuplePort
+        return argtypes[1] === typeof(port).parameters[1]
+    end
+    false
 end
 
 function _bind_stateful_structural_copies(
@@ -357,7 +424,8 @@ function _bind_stateful_structural_copies(
         destination === nothing && return handle
         name = slots[destination].path[end]
         binding = get(field_regs, name, nothing)
-        binding isa _StructuredStatePort || return handle
+        binding isa Union{
+            _StructuredStatePort,_SMFixedStructuralTuplePort} || return handle
         bound = _BoundStructuralCopyRecipe(binding)
         _RecipeHandle{
             typeof(bound),recipe_handle_mode(handle),typeof(handle.inputs),
@@ -654,6 +722,7 @@ end
 _kernel_field_registration_noeffect(::_PureCallablePort) = true
 _kernel_field_registration_noeffect(::_EffectCallablePort) = false
 _kernel_field_registration_noeffect(::_StructuredStatePort) = true
+_kernel_field_registration_noeffect(::_SMFixedStructuralTuplePort) = true
 
 """
     pure_callable_port(source, Tuple{ArgTypes...}, Result;
@@ -707,6 +776,9 @@ end
             if descriptor_type <: _StructuredStatePort
                 port = :(getfield(getfield(bindings, :fields), $(QuoteNode(name))))
                 return :(_sm_structured_copy($port, cvals[$index]))
+            elseif descriptor_type <: _SMFixedStructuralTuplePort
+                port = :(getfield(getfield(bindings, :fields), $(QuoteNode(name))))
+                return :(_sm_fixed_tuple_copy($port, cvals[$index]))
             elseif descriptor_type <: Union{_PureCallablePort,_EffectCallablePort}
                 return :(cvals[$index])
             end
@@ -1159,19 +1231,27 @@ function _sm_dtype(::Type{_DIndex{Parent,Indices}}, argtypes,
                    ::Type{KWT}, dot::Bool) where {Parent,Indices,KWT}
     dot && _sm_reject("indexed reads do not admit implicit broadcasting")
     T = _sm_dtype(Parent, argtypes, KWT, false)
-    tuple_element = _sm_fixed_tuple_element_type(T)
-    builtin_array = _sm_builtin_array(T)
-    (builtin_array || tuple_element !== nothing) || _sm_reject(
-        "indexed read requires builtin array or fixed homogeneous tuple storage, got `$T`")
-    rank = builtin_array ? ndims(T) : 1
-    length(Indices.parameters) == rank || _sm_reject(
-        "indexed read supplies $(length(Indices.parameters)) indices for rank $rank")
+    _sm_builtin_array(T) || _sm_reject(
+        "indexed read requires builtin structural array storage, got `$T`")
+    length(Indices.parameters) == ndims(T) || _sm_reject(
+        "indexed read supplies $(length(Indices.parameters)) indices for rank $(ndims(T))")
     for index in Indices.parameters
         IT = _sm_dtype(index, argtypes, KWT, false)
         _kernel_dom_int_scalar(IT) && IT !== Bool || _sm_reject(
             "indexed read requires builtin non-Bool integer indices, got `$IT`")
     end
-    tuple_element === nothing ? eltype(T) : tuple_element
+    eltype(T)
+end
+function _sm_dtype(::Type{_DFixedTupleIndex{Element,Indices}}, argtypes,
+                   ::Type{KWT}, dot::Bool) where {Element,Indices,KWT}
+    dot && _sm_reject(
+        "fixed structural tuple reads do not admit implicit broadcasting")
+    length(Indices.parameters) == 1 || _sm_reject(
+        "fixed structural tuple read requires one index")
+    IT = _sm_dtype(only(Indices.parameters), argtypes, KWT, false)
+    _kernel_dom_int_scalar(IT) && IT !== Bool || _sm_reject(
+        "fixed structural tuple read requires one builtin non-Bool integer index, got `$IT`")
+    Element
 end
 function _sm_dtype(::Type{_DIfValue{Cond,Then,Else}}, argtypes,
                    ::Type{KWT}, dot::Bool) where {Cond,Then,Else,KWT}
@@ -1286,22 +1366,18 @@ function _sm_validate_node(::Type{_DWrite{T,D,R}}, argtypes, ::Type{KWT}) where 
 end
 function _sm_validate_node(::Type{_DIndexedWrite{T,Indices,R}}, argtypes,
                            ::Type{KWT}) where {T,Indices,R,KWT}
-    tuple_element = _sm_fixed_tuple_element_type(T)
-    builtin_array = _sm_builtin_array(T)
-    (builtin_array || tuple_element !== nothing) || _sm_reject(
-        "indexed write requires builtin array or fixed homogeneous tuple storage, got `$T`")
-    rank = builtin_array ? ndims(T) : 1
-    length(Indices.parameters) == rank || _sm_reject(
-        "indexed write supplies $(length(Indices.parameters)) indices for rank $rank")
+    _sm_builtin_array(T) || _sm_reject(
+        "indexed write requires builtin structural array storage, got `$T`")
+    length(Indices.parameters) == ndims(T) || _sm_reject(
+        "indexed write supplies $(length(Indices.parameters)) indices for rank $(ndims(T))")
     for index in Indices.parameters
         IT = _sm_dtype(index, argtypes, KWT, false)
         _kernel_dom_int_scalar(IT) && IT !== Bool || _sm_reject(
             "indexed write requires builtin non-Bool integer indices, got `$IT`")
     end
     got = _sm_dtype(R, argtypes, KWT, false)
-    element = tuple_element === nothing ? eltype(T) : tuple_element
-    got === element || _sm_reject(
-        "indexed write result type `$got` does not exactly match element type `$element`")
+    got === eltype(T) || _sm_reject(
+        "indexed write result type `$got` does not exactly match element type `$(eltype(T))`")
     nothing
 end
 function _sm_validate_node(::Type{_DAliasWrite{Target,Dot,Rhs}}, argtypes,
@@ -1552,11 +1628,19 @@ function _sm_dtree(x, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH},
             false, field_regs, methods_by_id, stack)
         _DProject{parent,x.field}
     elseif x isa _Index
-        parent = _sm_dtree(x.base, plan, fields, OW, SH, finfo, ltrees,
-            false, field_regs, methods_by_id, stack)
         indices = Tuple{(_sm_dtree(index, plan, fields, OW, SH, finfo,
             ltrees, false, field_regs, methods_by_id, stack)
             for index in x.idxs)...}
+        if x.base isa _SelfField && length(x.base.path) == 1
+            root = only(x.base.path)
+            port = get(field_regs, root, nothing)
+            if port isa _SMFixedStructuralTuplePort
+                element = typeof(port).parameters[2]
+                return _DFixedTupleIndex{element,indices}
+            end
+        end
+        parent = _sm_dtree(x.base, plan, fields, OW, SH, finfo, ltrees,
+            false, field_regs, methods_by_id, stack)
         _DIndex{parent,indices}
     elseif x isa _IfExpr
         condition = _sm_dtree(x.cond, plan, fields, OW, SH, finfo,
@@ -2332,6 +2416,9 @@ function compile_stateful_method(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, i
             for c in _exec_reads(st.rhs, fields)
                 uc, _ = _exec_ensure!(stmts, c, current, stale, plan, producer, hidx, OW, SH); ngrad += uc
             end
+            st.root === :self && st.target isa _SelfField &&
+                st.owner !== nothing && !isempty(st.owner) || _sm_reject(
+                    "ordinary straight-line stateful writes require one direct self-owned field")
             tgt = get(fields, st.target.path[end], 0); tgt == 0 && _sm_reject("unknown stateful write target")
             deps = _exec_kill_closure(plan, tgt, producer)
             _exec_mask!(stmts, plan, tgt, :kill)
@@ -2490,7 +2577,17 @@ function compile_state_machine_method(pf::_PreparedFactory, ::Type{OW},
                 "state-machine root-array writes must name explicit indices")
             replacement = statement.dot ? :(Base.materialize($rhs_symbol)) : rhs_symbol
             value = if isempty(path)
-                replacement
+                descriptor = get(field_regs, name, nothing)
+                if descriptor isa _SMFixedStructuralTuplePort
+                    port = :(getfield(getfield(handles, :ports),
+                                      $(QuoteNode(name))))
+                    quote
+                        _sm_fixed_tuple_validate($port, $replacement)
+                        $replacement
+                    end
+                else
+                    replacement
+                end
             else
                 haskey(field_regs, name) &&
                     field_regs[name] isa _StructuredStatePort || _sm_reject(
@@ -2574,11 +2671,15 @@ function compile_state_machine_method(pf::_PreparedFactory, ::Type{OW},
                         role, slot = kernel_plan_field(plan, destination_canon)
                         role === :owned || _sm_reject(
                             "structural copy destination must be owned")
-                        value = if haskey(field_regs, destination_name) &&
-                                field_regs[destination_name] isa _StructuredStatePort
+                        descriptor = get(field_regs, destination_name, nothing)
+                        value = if descriptor isa _StructuredStatePort
                             port = :(getfield(getfield(handles, :ports),
                                               $(QuoteNode(destination_name))))
                             :(_sm_structured_copy($port, $source))
+                        elseif descriptor isa _SMFixedStructuralTuplePort
+                            port = :(getfield(getfield(handles, :ports),
+                                              $(QuoteNode(destination_name))))
+                            :(_sm_fixed_tuple_copy($port, $source))
                         else
                             :(_sm_structural_copy($source))
                         end
@@ -3206,6 +3307,11 @@ function _sm_restore_reusable_structured_state_port(
     _sm_normalize_compiled_state(transition, value)
 end
 
+function _sm_restore_reusable_fixed_tuple_port(
+        port::_SMFixedStructuralTuplePort, value)
+    _sm_fixed_tuple_validate(port, value)
+end
+
 function _sm_restore_reusable_state_ports(
         ports::NamedTuple, state, groups::Tuple)
     names = propertynames(state)
@@ -3221,6 +3327,8 @@ function _sm_restore_reusable_state_ports(
             value = getfield(state, descriptor_name)
             if port isa _StructuredStatePort
                 _sm_restore_reusable_structured_state_port(port, value)
+            elseif port isa _SMFixedStructuralTuplePort
+                _sm_restore_reusable_fixed_tuple_port(port, value)
             elseif port isa Union{_PureCallablePort,_EffectCallablePort}
                 getfield(port, :source)
             else
@@ -3556,6 +3664,105 @@ _sm_shape_contract_ok(value::LinearAlgebra.Cholesky, expected::Tuple) =
     _sm_shape_contract_ok(value.factors, expected)
 _sm_shape_contract_ok(value, expected) = false
 
+function _sm_fixed_tuple_validate_element(
+        port::_SMFixedStructuralTuplePort{T,Element}, value) where {T,Element}
+    _sm_functional_argument_type_ok(typeof(value), Element) ||
+        throw(ArgumentError(
+            "fixed structural tuple element changed its logical numeric layout"))
+    _sm_shape_contract_ok(value, getfield(port, :shape_contract)) ||
+        throw(ArgumentError(
+            "fixed structural tuple element changed its numeric axes"))
+    _sm_validate_topology_contract(
+        value, getfield(port, :element_topology))
+end
+
+function _sm_fixed_tuple_validate(
+        port::_SMFixedStructuralTuplePort{T,Element,Capacity}, values) where
+        {T,Element,Capacity}
+    values isa Tuple && length(values) == Capacity || throw(ArgumentError(
+        "fixed structural tuple changed its frozen capacity"))
+    _sm_functional_argument_type_ok(typeof(values), T) ||
+        throw(ArgumentError(
+            "fixed structural tuple changed its logical numeric layout"))
+    for value in values
+        _sm_fixed_tuple_validate_element(port, value)
+    end
+    _sm_validate_topology_contract(
+        values, getfield(port, :topology_contract))
+end
+
+function _sm_fixed_tuple_normalize_element(
+        port::_SMFixedStructuralTuplePort, value)
+    normalized = _sm_canonicalize_topology(
+        value, getfield(port, :element_topology))
+    _sm_fixed_tuple_validate_element(port, normalized)
+end
+
+function _sm_fixed_tuple_copy(
+        port::_SMFixedStructuralTuplePort, values)
+    _sm_fixed_tuple_validate(port, values)
+    copied = map(values) do value
+        _sm_fixed_tuple_normalize_element(
+            port, _sm_structural_copy(value))
+    end
+    _sm_fixed_tuple_validate(port, copied)
+end
+
+@generated function _sm_fixed_tuple_raw_read(values::T, index) where {T<:Tuple}
+    selected = :(getfield(values, 1))
+    for position in 2:length(T.parameters)
+        selected = :(_sm_predicated_select(
+            index .== oftype(index, $position),
+            getfield(values, $position), $selected))
+    end
+    selected
+end
+
+function _sm_fixed_tuple_read(
+        port::_SMFixedStructuralTuplePort, values, index)
+    _sm_fixed_tuple_validate(port, values)
+    _sm_fixed_tuple_normalize_element(
+        port, _sm_fixed_tuple_raw_read(values, index))
+end
+
+function _sm_fixed_tuple_element_set(
+        port::_SMFixedStructuralTuplePort, value,
+        ::Val{Path}, replacement) where {Path}
+    _sm_fixed_tuple_validate_element(port, value)
+    candidate = _sm_apply_topology_write(
+        value, Path, replacement, getfield(port, :element_topology))
+    _sm_fixed_tuple_validate_element(port, candidate)
+end
+
+@generated function _sm_fixed_tuple_raw_write(
+        values::T, value, index) where {T<:Tuple}
+    elements = Any[:(_sm_predicated_select(
+        index .== oftype(index, $position), value,
+        getfield(values, $position))) for position in 1:length(T.parameters)]
+    Expr(:tuple, elements...)
+end
+
+function _sm_fixed_tuple_write(
+        port::_SMFixedStructuralTuplePort, values, index, value)
+    _sm_fixed_tuple_validate(port, values)
+    _sm_fixed_tuple_validate_element(port, value)
+    raw = _sm_fixed_tuple_raw_write(values, value, index)
+    normalized = map(candidate ->
+        _sm_fixed_tuple_normalize_element(port, candidate), raw)
+    _sm_fixed_tuple_validate(port, normalized)
+end
+
+function _sm_fixed_tuple_select(
+        port::_SMFixedStructuralTuplePort, active, candidate, prior)
+    _sm_fixed_tuple_validate(port, candidate)
+    _sm_fixed_tuple_validate(port, prior)
+    raw = map((new, old) -> _sm_predicated_select(active, new, old),
+              candidate, prior)
+    normalized = map(value ->
+        _sm_fixed_tuple_normalize_element(port, value), raw)
+    _sm_fixed_tuple_validate(port, normalized)
+end
+
 function _sm_validate_functional_structured_state_port(
         port::_StructuredStatePort, value)
     transition = getfield(port, :transition)
@@ -3614,6 +3821,8 @@ function _sm_validate_functional_state_ports(ports::NamedTuple, state)
         value = getfield(state, name)
         if port isa _StructuredStatePort
             _sm_validate_functional_structured_state_port(port, value)
+        elseif port isa _SMFixedStructuralTuplePort
+            _sm_fixed_tuple_validate(port, value)
         elseif port isa Union{_PureCallablePort,_EffectCallablePort}
             value === getfield(port, :source) || throw(ArgumentError(
                 "functional state callable authority `$name` was replaced"))
@@ -3653,6 +3862,8 @@ function _sm_validate_reusable_state_ports(ports::NamedTuple, state)
         value = getfield(state, name)
         if port isa _StructuredStatePort
             _sm_validate_reusable_structured_state_port(port, value)
+        elseif port isa _SMFixedStructuralTuplePort
+            _sm_fixed_tuple_validate(port, value)
         elseif port isa Union{_PureCallablePort,_EffectCallablePort}
             value === getfield(port, :source) || throw(ArgumentError(
                 "reusable compiled state callable authority `$name` was replaced"))
@@ -3680,9 +3891,12 @@ function _sm_validate_reusable_raw_state_ports(ports::NamedTuple, state)
         hasproperty(state, name) || throw(ArgumentError(
             "raw backend state is missing compiler-bound field `$name`"))
         port = getfield(ports, name)
-        port isa _StructuredStatePort || continue
-        _sm_validate_reusable_raw_structured_state_port(
-            port, getfield(state, name))
+        if port isa _StructuredStatePort
+            _sm_validate_reusable_raw_structured_state_port(
+                port, getfield(state, name))
+        elseif port isa _SMFixedStructuralTuplePort
+            _sm_fixed_tuple_validate(port, getfield(state, name))
+        end
     end
     state
 end
@@ -3939,27 +4153,10 @@ end
 @inline _sm_safe_index(index, values::Tuple, ::Val{1}) =
     clamp.(index, one(index), oftype(index, length(values)))
 @inline _sm_functional_index(array, indices...) = getindex(array, indices...)
-@generated function _sm_functional_index(values::T, index) where {T<:Tuple}
-    isempty(T.parameters) && return :(throw(BoundsError(values, index)))
-    selected = :(getfield(values, 1))
-    for position in 2:length(T.parameters)
-        selected = :(_sm_predicated_select(
-            index .== oftype(index, $position),
-            getfield(values, $position), $selected))
-    end
-    selected
-end
 @inline function _sm_functional_indexed_copy(array, value, indices...)
     result = copy(array)
     setindex!(result, value, indices...)
     result
-end
-@generated function _sm_functional_indexed_copy(
-        values::T, value, index) where {T<:Tuple}
-    elements = Any[:(_sm_predicated_select(
-        index .== oftype(index, $position), value,
-        getfield(values, $position))) for position in 1:length(T.parameters)]
-    Expr(:tuple, elements...)
 end
 
 function (transition::_FunctionalStatefulTransition{
@@ -4443,6 +4640,15 @@ function _sm_functional_machine_rhs(x, syms, plan::_KernelPlan, fields,
             traced_value = :($value + zero($index_seed))
             push!(indices,
                 :(_sm_safe_index($traced_value, $base, Val($dimension))))
+        end
+        if x.base isa _SelfField && length(x.base.path) == 1
+            root = only(x.base.path)
+            if get(field_regs, root, nothing) isa _SMFixedStructuralTuplePort
+                length(indices) == 1 || _sm_reject(
+                    "fixed structural tuple read requires one index")
+                port = :(getfield(ports, $(QuoteNode(root))))
+                return :(_sm_fixed_tuple_read($port, $base, $(only(indices))))
+            end
         end
         :(_sm_functional_index($base, $(indices...)))
     elseif x isa _IfExpr
@@ -5017,19 +5223,39 @@ function _functional_state_machine_method(
                 :(_sm_functional_indexed_copy(
                     $old_leaf, $selected, $(indices...)))
             end
-            updated_alias = bind!(
+            descriptor = get(field_regs, name, nothing)
+            updated_expression = if descriptor isa _SMFixedStructuralTuplePort
+                port = :(getfield(ports, $(QuoteNode(name))))
+                :(_sm_fixed_tuple_element_set(
+                    $port, $alias_symbol,
+                    Val($(QuoteNode(path))), $replacement_leaf))
+            else
                 :(_sm_structural_set($alias_symbol,
-                    Val($(QuoteNode(path))), $replacement_leaf)),
+                    Val($(QuoteNode(path))), $replacement_leaf))
+            end
+            updated_alias = bind!(updated_expression,
                 :__sfm_alias_write_, local_name)
             push!(statements, :($alias_symbol = $updated_alias))
 
             root_indices = origin.indices
-            root_candidate = bind!(
-                :(_sm_functional_indexed_copy(
-                    $old, $updated_alias, $(root_indices...))),
-                :__sfm_alias_root_, name)
-            set_field!(name, :(_sm_predicated_select(
-                $active, $root_candidate, $old)))
+            if descriptor isa _SMFixedStructuralTuplePort
+                length(root_indices) == 1 || _sm_reject(
+                    "fixed structural tuple alias requires one root index")
+                port = :(getfield(ports, $(QuoteNode(name))))
+                root_candidate = bind!(
+                    :(_sm_fixed_tuple_write(
+                        $port, $old, $(only(root_indices)), $updated_alias)),
+                    :__sfm_alias_root_, name)
+                set_field!(name, :(_sm_fixed_tuple_select(
+                    $port, $active, $root_candidate, $old)))
+            else
+                root_candidate = bind!(
+                    :(_sm_functional_indexed_copy(
+                        $old, $updated_alias, $(root_indices...))),
+                    :__sfm_alias_root_, name)
+                set_field!(name, :(_sm_predicated_select(
+                    $active, $root_candidate, $old)))
+            end
         elseif statement.target isa _SelfField
             path = Base.tail(statement.target.path)
             nested_path = path
@@ -5039,8 +5265,15 @@ function _functional_state_machine_method(
                 "functional state-machine root-array writes require explicit indices")
             replacement = statement.dot ? :(Base.materialize($value)) : value
             if isempty(path)
-                set_field!(name,
-                    :(_sm_predicated_select($active, $replacement, $old)))
+                descriptor = get(field_regs, name, nothing)
+                if descriptor isa _SMFixedStructuralTuplePort
+                    port = :(getfield(ports, $(QuoteNode(name))))
+                    set_field!(name, :(_sm_fixed_tuple_select(
+                        $port, $active, $replacement, $old)))
+                else
+                    set_field!(name,
+                        :(_sm_predicated_select($active, $replacement, $old)))
+                end
             else
                 haskey(field_regs, name) &&
                     field_regs[name] isa _StructuredStatePort || _sm_reject(
@@ -5131,8 +5364,17 @@ function _functional_state_machine_method(
                         root_value=root_value,
                         indices=Tuple(captured_indices),
                     )
-                    :(_sm_functional_index(
-                        $root_value, $(captured_indices...)))
+                    descriptor = get(field_regs, root_name, nothing)
+                    if descriptor isa _SMFixedStructuralTuplePort
+                        length(captured_indices) == 1 || _sm_reject(
+                            "fixed structural tuple alias requires one index")
+                        port = :(getfield(ports, $(QuoteNode(root_name))))
+                        :(_sm_fixed_tuple_read(
+                            $port, $root_value, $(only(captured_indices))))
+                    else
+                        :(_sm_functional_index(
+                            $root_value, $(captured_indices...)))
+                    end
                 else
                     rhs(statement.rhs, local_syms, local_types, active)
                 end
@@ -5169,14 +5411,22 @@ function _functional_state_machine_method(
                     destination_canon != 0 && haskey(fields, source_name) ||
                         _sm_reject("functional structural copy references an unknown state root")
                     old = base_syms[(:field, destination_name)]
-                    if haskey(field_regs, destination_name) &&
-                            field_regs[destination_name] isa _StructuredStatePort
+                    descriptor = get(field_regs, destination_name, nothing)
+                    if descriptor isa _StructuredStatePort
                         port = :(getfield(ports,
                                           $(QuoteNode(destination_name))))
                         candidate = :(_sm_structured_copy(
                             $port, $(base_syms[(:field, source_name)])))
                         set_field!(destination_name,
                             :(_sm_structured_predicated_select(
+                                $port, $active, $candidate, $old)))
+                    elseif descriptor isa _SMFixedStructuralTuplePort
+                        port = :(getfield(ports,
+                                          $(QuoteNode(destination_name))))
+                        candidate = :(_sm_fixed_tuple_copy(
+                            $port, $(base_syms[(:field, source_name)])))
+                        set_field!(destination_name,
+                            :(_sm_fixed_tuple_select(
                                 $port, $active, $candidate, $old)))
                     else
                         candidate = :(_sm_structural_copy(
@@ -5287,6 +5537,13 @@ function _functional_state_machine_method(
                             set_field!(field,
                                 :(_sm_structured_predicated_select(
                                     $structured, $active, $replacement, $old)))
+                        elseif haskey(field_regs, field) &&
+                                field_regs[field] isa _SMFixedStructuralTuplePort
+                            fixed = :(getfield(ports,
+                                             $(QuoteNode(field))))
+                            set_field!(field,
+                                :(_sm_fixed_tuple_select(
+                                    $fixed, $active, $replacement, $old)))
                         else
                             set_field!(field, :(_sm_predicated_select(
                                 $active, $replacement, $old)))
@@ -5304,6 +5561,13 @@ function _functional_state_machine_method(
                                 set_field!(field,
                                     :(_sm_structured_predicated_select(
                                         $structured, $active, $value, $old)))
+                            elseif haskey(field_regs, field) &&
+                                    field_regs[field] isa _SMFixedStructuralTuplePort
+                                fixed = :(getfield(ports,
+                                                 $(QuoteNode(field))))
+                                set_field!(field,
+                                    :(_sm_fixed_tuple_select(
+                                        $fixed, $active, $value, $old)))
                             elseif haskey(field_regs, field) &&
                                     field_regs[field] isa Union{
                                         _PureCallablePort,_EffectCallablePort}
@@ -5515,6 +5779,11 @@ function _functional_state_machine_method(
                 field_regs[descriptor_name] isa _StructuredStatePort
             port = :(getfield(ports, $(QuoteNode(descriptor_name))))
             :(_sm_structured_predicated_select(
+                $port, $control_overflow, $initial, $current))
+        elseif haskey(field_regs, descriptor_name) &&
+                field_regs[descriptor_name] isa _SMFixedStructuralTuplePort
+            port = :(getfield(ports, $(QuoteNode(descriptor_name))))
+            :(_sm_fixed_tuple_select(
                 $port, $control_overflow, $initial, $current))
         elseif haskey(field_regs, descriptor_name) &&
                 field_regs[descriptor_name] isa Union{
@@ -6638,7 +6907,8 @@ function _validate_stateful_bindings!(skel, pf, owned, shared,
     field_regs = _stateful_field_regs(bindings)
     called = _kernel_factory_called_fields(skel)
     callable_fields = Set(name for (name, descriptor) in field_regs
-        if !(descriptor isa _StructuredStatePort))
+        if !(descriptor isa Union{
+            _StructuredStatePort,_SMFixedStructuralTuplePort}))
     callable_fields == called || throw(ArgumentError(
         "stateful callable bindings $(sort!(collect(callable_fields))) do not " *
         "exactly match called fields $(sort!(collect(called)))"))
@@ -6662,6 +6932,8 @@ function _validate_stateful_bindings!(skel, pf, owned, shared,
                 "stateful no-effect field `$name` must contain `nothing`"))
         elseif binding isa _StructuredStatePort
             _sm_validate_structured_state_port(binding, value)
+        elseif binding isa _SMFixedStructuralTuplePort
+            _sm_fixed_tuple_validate(binding, value)
         else
             throw(ArgumentError(
                 "stateful compiler binding `$name` has unsupported descriptor `$(typeof(binding))`"))

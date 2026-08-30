@@ -31,23 +31,6 @@ end
 struct _SMFiniteScalarColumnSpec{T} end
 struct _SMFiniteArrayColumnSpec{A,Shape,T} end
 
-# Exact primitive tensor leaves supported by the optional backend ABI.  Keep
-# this narrower than the stateful compiler's pure-numeric domain: wrapper
-# numbers and 128-bit integers do not have an accepted tensor representation.
-const _SM_FINITE_BACKEND_PRIMITIVES = (
-    Bool,
-    Int8, Int16, Int32, Int64,
-    UInt8, UInt16, UInt32, UInt64,
-    Float16, Float32, Float64,
-)
-
-_sm_finite_backend_primitive(::Type{T}) where {T} =
-    any(candidate -> candidate === T, _SM_FINITE_BACKEND_PRIMITIVES)
-
-_sm_finite_backend_array(::Type{A}) where {A} =
-    A <: Array && _kernel_dom_builtin(A) &&
-    _sm_finite_backend_primitive(eltype(A))
-
 struct _SMFiniteStructuralContract{
         Element,Capacity,Names,Schema,Specs,StaticValues,Paths,OwnedGroups}
     schema::Schema

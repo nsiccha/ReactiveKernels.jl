@@ -257,8 +257,12 @@ end
     fixture = StatefulFunctionalContractsFixture
     items = fixture.captured_alias_items()
     replacement = fixture.captured_alias_items(100.0)
+    port = _FSCR_RK._sm_fixed_structural_tuple_port(items)
+    bindings = _FSCR_RK.stateful_compiler_bindings(
+        items=port, replacement=port)
     kernel = _FSCR_RK.compile_stateful(
-        fixture.captured_index_alias, items, replacement, 1, 0)
+        fixture.captured_index_alias, bindings,
+        items, replacement, 1, 0)
     transition = _FSCR_RK.functionalize_stateful(
         kernel, Val(:step!); argument_types=Tuple{Float64,Bool})
     host_state = _FSCR_RK.stateful_snapshot(
@@ -273,8 +277,10 @@ end
     @test !Bool(result.control_overflow)
     @test Int(result.state.index) == 2
     @test Int(result.state.count) == 1
-    @test Array(result.state.items[1].buffer) == [41.0, 1.5]
-    @test Array(result.state.items[2].buffer) == items[2].buffer
+    @test Float64(result.state.observed) == 41.0
+    @test result.state.items[1].left === result.state.items[1].right
+    @test Array(result.state.items[1].left) == [41.0, 1.5]
+    @test Array(result.state.items[2].left) == items[2].left
 end
 
 

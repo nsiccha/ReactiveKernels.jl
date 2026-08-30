@@ -218,6 +218,9 @@ end
     fixture = StatefulFunctionalContractsFixture
     items = fixture.captured_alias_items()
     replacement = fixture.captured_alias_items(100.0)
+    port = _FSC_RK._sm_fixed_structural_tuple_port(items)
+    bindings = _FSC_RK.stateful_compiler_bindings(
+        items=port, replacement=port)
     @test _FSC_RK._sm_fixed_tuple_element_type(typeof(items)) ===
           typeof(first(items))
     for rejected in (
@@ -225,7 +228,7 @@ end
             ((leaf=1 + 2im,), (leaf=1 + 2im,)),
             ((authority=_FSCStaticAuthority(:a),),
              (authority=_FSCStaticAuthority(:b),)),
-            ((buffer=[1.0],), (buffer=Float32[1.0],)),
+            ((left=[1.0],), (left=Float32[1.0],)),
         )
         @test _FSC_RK._sm_fixed_tuple_element_type(
             typeof(rejected)) === nothing
@@ -239,17 +242,74 @@ end
     @test_throws _FSC_RK._LLowerReject _FSC_RK.functionalize_stateful(
         rational_kernel, Val(:step!);
         argument_types=Tuple{Float64,Bool})
+
+    unbound_kernel = _FSC_RK.compile_stateful(
+        fixture.captured_index_alias,
+        items, replacement, 1, 0)
+    @test_throws _FSC_RK._LLowerReject _FSC_RK.functionalize_stateful(
+        unbound_kernel, Val(:step!);
+        argument_types=Tuple{Float64,Bool})
+
+    split_alias = ntuple(3) do index
+        (left=[Float64(index), Float64(index) + 0.5],
+         right=[Float64(index), Float64(index) + 0.5])
+    end
+    @test_throws ArgumentError _FSC_RK._sm_fixed_tuple_validate(
+        port, split_alias)
+    @test_throws ArgumentError _FSC_RK._sm_fixed_tuple_select(
+        port, true, split_alias, items)
+
+    shared = [1.0, 1.5]
+    cross_shared = ntuple(3) do index
+        index <= 2 ? (left=shared, right=shared) : begin
+            storage = [3.0, 3.5]
+            (left=storage, right=storage)
+        end
+    end
+    @test_throws ArgumentError _FSC_RK._sm_fixed_structural_tuple_port(
+        cross_shared)
+    @test_throws ArgumentError _FSC_RK._sm_fixed_tuple_validate(
+        port, cross_shared)
+
+    straight_bindings = _FSC_RK.stateful_compiler_bindings(items=port)
+    straight_error = try
+        _FSC_RK.compile_stateful(
+            fixture.straight_index_alias,
+            straight_bindings, items, 1)
+        nothing
+    catch error
+        error
+    end
+    @test straight_error isa _FSC_RK._LLowerReject
+    @test sprint(showerror, straight_error) ==
+          "ReactiveKernels._LLowerReject(\"ordinary straight-line " *
+          "stateful writes require one direct self-owned field\")"
+
     kernel = _FSC_RK.compile_stateful(
-        fixture.captured_index_alias, items, replacement, 1, 0)
+        fixture.captured_index_alias, bindings,
+        items, replacement, 1, 0)
+
+    source = fixture.captured_index_alias_source_oracle(items, 1, 41.0)
+    @test source.initial_alias
+    @test source.final_alias
+    @test source.index == 2
+    @test source.observed == 41.0
+    @test source.items[1].left == [41.0, 1.5]
 
     native = kernel(items, replacement, 1, 0)
+    initial_native = _FSC_RK.stateful_snapshot(native)
+    @test initial_native.items[1].left === initial_native.items[1].right
     @test _FSC_RK.stateful_call(
         native, Val(:step!), 41.0, true)
     native_snapshot = _FSC_RK.stateful_snapshot(native)
     @test native_snapshot.index == 2
     @test native_snapshot.count == 1
-    @test native_snapshot.items[1].buffer == [41.0, 1.5]
-    @test native_snapshot.items[2].buffer == items[2].buffer
+    @test native_snapshot.observed == 41.0
+    @test native_snapshot.items[1].left ===
+          native_snapshot.items[1].right
+    @test native_snapshot.items[1].left == [41.0, 1.5]
+    @test native_snapshot.items[2].left == items[2].left
+    @test native_snapshot.items == source.items
 
     initial = _FSC_RK.stateful_snapshot(
         kernel(items, replacement, 1, 0))
@@ -260,10 +320,13 @@ end
     @test !functional.control_overflow
     @test functional.state.index == native_snapshot.index
     @test functional.state.count == native_snapshot.count
-    @test functional.state.items[1].buffer ==
-          native_snapshot.items[1].buffer
-    @test functional.state.items[2].buffer ==
-          native_snapshot.items[2].buffer
+    @test functional.state.observed == 41.0
+    @test functional.state.items[1].left ===
+          functional.state.items[1].right
+    @test functional.state.items[1].left ==
+          native_snapshot.items[1].left
+    @test functional.state.items[2].left ==
+          native_snapshot.items[2].left
 
     moved = kernel(items, replacement, 1, 0)
     @test _FSC_RK.stateful_call(
