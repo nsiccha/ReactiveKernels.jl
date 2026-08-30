@@ -4,7 +4,7 @@ using Test
 
 include(joinpath(@__DIR__, "..", "examples", "online_stats.jl"))
 const OSE = OnlineStatsExample
-using Main.ReactiveKernelsNUTSExample: NUTSDiagnostics, welford_var, step!
+using Main.ReactiveKernelsNUTSExample: NUTSDiagnostics
 
 @testset "OnlineStats-style reactive streaming and mergeable snapshots" begin
     @test isbitstype(OSE.MomentsAccumulator{Float64})
@@ -302,63 +302,61 @@ using Main.ReactiveKernelsNUTSExample: NUTSDiagnostics, welford_var, step!
         @test OSE.divergence_percent(narrow) === Float16(37.5)
     end
 
-    @testset "stateful @reactive moments mutate graph-owned sources" begin
-        statistics = OSE.online_moments()
+    @testset "ReactiveHMC-shaped method-bearing @kernel moments" begin
+        statistics = OSE.online_moments(1)
         @test statistics isa OSE.OnlineMoments
-        @test statistics isa ReactiveObject
-        @test statistics.n == 0
-        @test isnan(mean(statistics))
-        @test isnan(var(statistics))
-        @test isnan(var(statistics; corrected=false))
+        @test statistics.n == 0.0
+        @test statistics.mean == [0.0]
+        @test statistics.var == [0.0]
 
-        program = reactive_program(statistics)
         @test @inferred(OSE.update!(statistics, 1.0)) === statistics
-        @test statistics.n == 1
-        @test mean(statistics) == 1.0
-        @test isnan(var(statistics))
-        @test var(statistics; corrected=false) == 0.0
+        @test statistics.n == 1.0
+        @test mean(statistics) == [1.0]
+        @test all(isnan, var(statistics))
+        @test var(statistics; corrected=false) == [0.0]
 
         @test OSE.update!(statistics, 3.0) === statistics
-        @test statistics.n == 2
-        @test mean(statistics) == 2.0
-        @test var(statistics) == 2.0
-        @test OSE.snapshot(statistics) == OSE.fit([1.0, 3.0])
-        @test reactive_program(statistics) === program
+        @test statistics.n == 2.0
+        @test mean(statistics) == [2.0]
+        @test var(statistics) == [2.0]
+        @test OSE.snapshot(statistics) == (n=2.0, mean=[2.0], var=[1.0])
 
-        # Stateful fitting keeps object identity; snapshotting is explicit and
-        # reserved for the merge/persistence boundary.
-        fitted = OSE.online_moments()
-        @test OSE.fit!(fitted, [3.0, -1.0, 4.0, 1.0, 5.0]) === fitted
-        @test OSE.snapshot(fitted) == OSE.fit([3.0, -1.0, 4.0, 1.0, 5.0])
+        # Vector and matrix calls execute the two authored overloads.
+        fitted = OSE.online_moments(2)
+        OSE.step!(fitted, [1.0, 2.0])
+        OSE.step!(fitted, [3.0 5.0; 4.0 8.0])
+        @test fitted.n == 3.0
+        @test fitted.mean ≈ [3.0, 14 / 3]
 
-        # Copy detaches state while sharing the prepared program.
-        clone = copy(fitted)
-        @test reactive_program(clone) === reactive_program(fitted)
+        scalar = OSE.online_moments(1)
+        @test OSE.fit!(scalar, [3.0, -1.0, 4.0, 1.0, 5.0]) === scalar
+        @test only(scalar.mean) ≈ mean([3.0, -1.0, 4.0, 1.0, 5.0])
+
+        # Copy detaches compiler-owned state while sharing the compiled kernel.
+        clone = copy(scalar)
+        @test clone.kernel === scalar.kernel
         OSE.update!(clone, 99.0)
-        @test clone.n == fitted.n + 1
-        @test fitted.n == 5
+        @test clone.n == scalar.n + 1
+        @test scalar.n == 5
 
-        state32 = OSE.online_moments(Float32)
+        state32 = OSE.online_moments(1, Float32)
         @test OSE.update!(state32, 3) === state32
-        @test state32.mean isa Float32
-        @test mean(state32) isa Float32
-        @test var(state32) isa Float32
+        @test eltype(state32.mean) === Float32
+        @test eltype(mean(state32)) === Float32
+        @test eltype(var(state32)) === Float32
 
         @test OSE.reset!(statistics) === statistics
-        @test statistics.n == 0
-        @test isnan(mean(statistics))
-        @test reactive_program(statistics) === program
+        @test statistics.n == 0.0
+        @test statistics.mean == [0.0]
     end
 
-    @testset "stateful @reactive diagnostics mutate graph-owned sources" begin
+    @testset "mutable diagnostics convenience wrapper" begin
         statistics = OSE.online_diagnostics()
         @test statistics isa OSE.OnlineDiagnostics
-        @test statistics isa ReactiveObject
         @test OSE.sample_count(statistics) == 0
         @test isnan(OSE.divergence_percent(statistics))
 
         valid = NUTSDiagnostics(3, 7, 0.8, false, -0.05)
-        program = reactive_program(statistics)
         @test @inferred(OSE.record!(statistics, valid, 0.2)) === statistics
         @test OSE.sample_count(statistics) == 1
         @test OSE.max_tree_depth(statistics) == 3
@@ -367,7 +365,6 @@ using Main.ReactiveKernelsNUTSExample: NUTSDiagnostics, welford_var, step!
         @test OSE.mean_stepsize(statistics) == 0.2
         @test OSE.snapshot(statistics) ==
               OSE.record_transition(OSE.HMCDiagnosticsAccumulator(), valid, 0.2)
-        @test reactive_program(statistics) === program
 
         # Validate every field before the first graph-owned source write: a bad
         # transition leaves the state unchanged.
@@ -393,10 +390,9 @@ using Main.ReactiveKernelsNUTSExample: NUTSDiagnostics, welford_var, step!
         @test OSE.reset!(statistics) === statistics
         @test OSE.sample_count(statistics) == 0
         @test isnan(OSE.mean_stepsize(statistics))
-        @test reactive_program(statistics) === program
     end
 
-    @testset "metric adaptation reuses the canonical welford_var estimator" begin
+    @testset "metric adaptation uses the method-bearing welford kernel" begin
         report = OSE.metric_adaptation_report()
         @test report.dimension == 3
         @test report.count == length(OSE.METRIC_ADAPTATION_DRAWS)
@@ -404,11 +400,11 @@ using Main.ReactiveKernelsNUTSExample: NUTSDiagnostics, welford_var, step!
         @test length(report.variance) == 3
         @test all(report.variance .>= 0)
 
-        # The estimate matches the canonical welford_var it reuses, folded the
-        # same way (this is the sampler's own metric-adaptation statistic).
-        reference = welford_var(3)
+        # The report matches the page's exact ReactiveHMC-shaped kernel folded
+        # the same way (this is the sampler's metric-adaptation statistic).
+        reference = OSE.online_moments(3)
         for value in OSE.METRIC_ADAPTATION_DRAWS
-            step!(reference, value)
+            OSE.step!(reference, value)
         end
         @test report.mean ≈ reference.mean
         @test report.variance ≈ reference.var
@@ -462,13 +458,15 @@ using Main.ReactiveKernelsNUTSExample: NUTSDiagnostics, welford_var, step!
         @test reactive_report.result.n == 100
     end
 
-    @testset "reactive plan exposes derived statistics; partition DAG exposes merge" begin
-        statistics = OSE.online_moments()
-        reactive_view = visualize(reactive_program(statistics).plan)
-        reactive_dot = dot_source(reactive_view)
-        @test occursin("moment_average", reactive_dot)
-        @test occursin("sample_variance", reactive_dot)
-        @test occursin("population_variance", reactive_dot)
+    @testset "stateful Welford plan and partition DAG remain inspectable" begin
+        statistics = OSE.online_moments(3)
+        roles = Dict(
+            String(slot.path[end]) => ReactiveKernels.kernel_plan_field(
+                statistics.kernel.prepared.plan, slot.canon)[1]
+            for slot in ReactiveKernels.kernel_plan_slots(statistics.kernel.prepared.plan)
+        )
+        @test all(roles[name] === :owned for name in ("n", "mean", "var"))
+        @test roles["template"] === :shared
 
         model = OSE.build_partition_graph()
         merge_plan = plan(model;
@@ -487,24 +485,19 @@ using Main.ReactiveKernelsNUTSExample: NUTSDiagnostics, welford_var, step!
         @test occursin("merge", dot)
     end
 
-    @testset "public docs show stateful authoring and a partition-only kernel" begin
+    @testset "public docs show exact pinned @kernel authoring and separate merge" begin
         page = read(joinpath(@__DIR__, "..", "docs", "src", "online-stats.md"),
                     String)
-        @test occursin("render_online_stats_reactive_source(:moments)", page)
-        @test occursin("render_online_stats_reactive_source(:diagnostics)", page)
-        @test occursin("online_moments()", page)
-        @test occursin("OnlineStatsExample.update!", page)
-        @test occursin("reactive_program(statistics).plan", page)
+        @test occursin("render_online_stats_welford_source()", page)
+        @test occursin("ca9ea4ca41924bb0e1fadc01c717e1333916aba6", page)
+        @test occursin("online_moments(3)", page)
+        @test occursin("OnlineStatsExample.step!", page)
+        @test occursin("compile_stateful", page)
+        @test occursin("step!(__self__, xi; kwargs...)", page)
         @test occursin("@kernel partitions(", page)
-        @test occursin("OnlineStatsExample.record!", page)
-        @test occursin("transition::NUTSDiagnostics{Float64}", page)
         @test occursin("NUTSDiagnostics(3, 7, 0.91, false, -0.05)", page)
-        @test occursin("metric_adaptation_report", page)
-        @test occursin("welford_var", page)
-        @test occursin("build_partition_graph", page)
         @test occursin("Main.ReactiveKernelsDocs.execute_example", page)
-        @test !occursin("OnlineStatsExample.update(state", page)
-        @test !occursin("updated_diagnostics", page)
+        @test !occursin("@" * "reactive", page)
         @test !occursin("include(", page)
         @test !occursin("Graph()", page)
         @test !occursin("value!(", page)

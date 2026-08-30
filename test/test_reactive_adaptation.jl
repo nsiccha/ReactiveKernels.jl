@@ -6,8 +6,8 @@ using LinearAlgebra
 _ta_grad!(g, q) = (copyto!(g, q); sum(abs2, q) / 2)
 _ta_pos(D) = [sin(1.0i) for i in 1:D]
 
-# GAP-1a — reactive dual-averaging authored through @reactive specialize=true.
-# DualAveragingState stays a public NOMINAL wrapper type over the reactive object.
+# GAP-1a — reactive dual-averaging over explicit compiled state.
+# DualAveragingState stays a public nominal wrapper type.
 
 # Local ordinary Nesterov recurrence — parity ORACLE for this test only.
 mutable struct _OldDA{T}

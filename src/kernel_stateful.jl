@@ -12,7 +12,7 @@
 # `@node`/`deepcopy`/`partial`/`!!` source-marker recognition.
 #
 # It deliberately contains NO effect-lowering: no MethodIR/SSA, no `compile_update`
-# consumption, no epoch codegen, no `@reactive` deletion, no port migration, no
+# consumption, no epoch codegen, no legacy-facade deletion, no port migration, no
 # factory/execution. Those are later increments (poc's effect-lowering lane retargets
 # MethodIR onto this substrate only after this SHA clears review).
 

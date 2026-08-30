@@ -40,7 +40,6 @@ include("kernel_control.jl")
 include("kernel_adaptation.jl")
 include("reactive.jl")
 include("stateful.jl")
-include("reactive_facade.jl")
 include("visualization.jl")
 
 export Value, Recipe, Graph, Plan, PreparedKernel, PreparedADKernel, ReplicatedKernel, NonAllocatingKernel, PlanningError
@@ -56,7 +55,6 @@ export DAGVisualization, visualize, dot_source, save_visualization
 export ReactiveState, set!, get!, freeze!, unfreeze!, checkpoint, materialize!
 export ReactiveProgram, CompiledReactiveState, ReactiveValue
 export prepare_reactive, prepare_reactive_nonallocating, statevalue, touch!, mutate!, copy_group!
-export ReactiveObject, @reactive
 export reactive_program
 export CompiledStateTransition, compile_state_transition, initial_transition_state
 export compile_stateful, stateful_compiler_bindings

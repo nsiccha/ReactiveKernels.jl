@@ -2,7 +2,7 @@
 # src/energies.jl:2-10 at ca9ea4ca41924bb0e1fadc01c717e1333916aba6.
 #
 # There are exactly two authoring-boundary changes:
-#   1. `@reactive` becomes `@kernel`.
+#   1. ReactiveHMC object authoring becomes method-bearing `@kernel`.
 #   2. `lambertw` is an ordinary captured callable port rather than a package
 #      global, keeping LambertW out of ReactiveKernels core and exposing the
 #      generic callable-port compiler seam.

@@ -5,6 +5,15 @@
 # perform only generated validity checks and the selected recipe calls.
 
 """
+    reactive_program(object)
+
+Return the [`ReactiveProgram`](@ref) backing a public wrapper around compiled
+reactive state. Concrete wrapper types define the corresponding method; a bare
+[`CompiledReactiveState`](@ref) exposes its program directly as `state.program`.
+"""
+function reactive_program end
+
+"""
     ReactiveValue
 
 A state-local typed handle returned by [`statevalue`](@ref). Keep these handles in
@@ -579,9 +588,8 @@ end
 set!(state::CompiledReactiveState, graph_value::Value, value) =
     set!(state, statevalue(state, graph_value), value)
 
-# `assign!` is the INTERNAL direct-slot writer the @reactive facade lowers every
-# object field write to (both HAVE and derived), so the facade needs no
-# HAVE/derived branching. It writes the slot, marks it valid, and runs the
+# `assign!` is the internal direct-slot writer for explicit advanced state
+# overrides (both HAVE and derived). It writes the slot, marks it valid, and runs the
 # existing dependent-invalidation worklist — it never changes the frozen bit and
 # rejects a frozen slot. On a HAVE source it equals `set!`; on an unfrozen
 # derived slot it is a TEMPORARY OVERRIDE: `get!` short-circuits on the valid bit

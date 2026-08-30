@@ -916,8 +916,6 @@ function render_compiler_api_map()
          result = "Open-ended incremental state", runtime = "Planning and provenance bookkeeping at each demand"),
         (stage = "Compile a closed state graph", surface = "prepare_reactive, ReactiveProgram, CompiledReactiveState",
          result = "Typed slots and generated getters", runtime = "Validity checks, required recipe calls, and invalidation worklists"),
-        (stage = "Author a reactive object", surface = "@reactive, ReactiveObject",
-         result = "Ordinary property/method facade over compiled state", runtime = "The same compiled-state operations"),
         (stage = "Compile a free state transition", surface = "compile_state_transition, initial_transition_state, partial",
          result = "CompiledStateTransition", runtime = "Authored writes, statically unrolled control, and demand-driven derived-field repairs"),
         (stage = "Compile a bounded stateful method", surface = "compile_stateful, stateful_compiler_bindings, functionalize_stateful, stateful_snapshot",

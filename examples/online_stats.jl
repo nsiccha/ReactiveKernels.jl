@@ -6,10 +6,11 @@ using Statistics
 # NUTS diagnostics are part of the external sampler exemplar, not RK's package API.
 isdefined(Main, :ReactiveKernelsNUTSExample) ||
     Base.include(Main, joinpath(@__DIR__, "nuts_runtime.jl"))
-using Main.ReactiveKernelsNUTSExample: NUTSDiagnostics, welford_var, step!
+using Main.ReactiveKernelsNUTSExample: NUTSDiagnostics
 
 export MomentsAccumulator, update, fit
 export OnlineMoments, online_moments, update!, fit!, snapshot, reset!
+export welford_var, step!
 export HMCDiagnosticsAccumulator, record_transition, fit_diagnostics
 export OnlineDiagnostics, online_diagnostics, record!
 export sample_count, max_tree_depth, divergence_rate, divergence_percent
@@ -159,89 +160,99 @@ function Statistics.var(accumulator::MomentsAccumulator{T};
     T(W(accumulator.m2) / W(denominator))
 end
 
-_moment_average(n::Int, mean::T) where {T<:AbstractFloat} =
-    n == 0 ? T(NaN) : mean
-
-function _moment_variance(n::Int, m2::T, corrected::Bool) where {T<:AbstractFloat}
-    denominator = n - Int(corrected)
-    denominator > 0 || return T(NaN)
-    W = promote_type(T, Float64)
-    T(W(m2) / W(denominator))
-end
-
-# -- BEGIN DOCS: stateful online moments --
-@reactive specialize=true _online_moments_state(n, mean, m2) = begin
-    average::typeof(mean) = _moment_average(n, mean)
-    sample_variance::typeof(m2) = _moment_variance(n, m2, true)
-    population_variance::typeof(m2) = _moment_variance(n, m2, false)
-
-    update!(observation::Real) = begin
-        T = typeof(mean)
-        x = convert(T, observation)
-        old_n = n
-        old_mean = mean
-        old_m2 = m2
-
-        if old_n == 0
-            n = 1
-            mean = x
-            m2 = zero(T)
-        else
-            next_n = Base.checked_add(old_n, 1)
-            W = promote_type(T, Float64)
-            wide_x = W(x)
-            wide_mean = W(old_mean)
-            delta = wide_x - wide_mean
-            next_mean = wide_mean + delta / W(next_n)
-            increment = delta * (wide_x - next_mean)
-            wide_m2 = W(old_m2)
-            next_m2 = _nonnegative_m2(
-                wide_m2 + increment,
-                abs(wide_m2) + abs(increment),
-            )
-            n = next_n
-            mean = T(next_mean)
-            m2 = T(next_m2)
-        end
-        __self__
+# -- BEGIN DOCS: ReactiveHMC Welford @kernel --
+# Algorithm-structure authority: ReactiveHMC.jl
+# ca9ea4ca41924bb0e1fadc01c717e1333916aba6/src/adaptation.jl:47-59.
+# `smooth(old, new, w)` is expanded as `(1-w)*old + w*new` so the captured
+# MethodIR contains only the compiler's supported Base arithmetic primitives.
+@kernel welford_var(template::AbstractVector) = begin
+    n = zero(eltype(template))
+    mean = zero(template)
+    var = zero(template)
+    step!(x::AbstractVector; dn = one(n)) = begin
+        n += dn
+        w = dn / n
+        @. var = (one(w) - w) * var +
+            w * (x - ((one(w) - w) * mean + w * x)) * (x - mean)
+        @. mean = (one(w) - w) * mean + w * x
     end
-
-    fit!(observations) = begin
-        for observation in observations
-            update!(observation)
-        end
-        __self__
-    end
-
-    snapshot() = MomentsAccumulator{typeof(mean)}(n, mean, m2)
-
-    reset!() = begin
-        n = zero(n)
-        mean = zero(mean)
-        m2 = zero(m2)
-        __self__
+    step!(x::AbstractMatrix; kwargs...) = for xi in eachcol(x)
+        step!(__self__, xi; kwargs...)
     end
 end
-# -- END DOCS: stateful online moments --
+# -- END DOCS: ReactiveHMC Welford @kernel --
 
-"A stateful scalar-moments object authored through ReactiveKernels' `@reactive`."
-const OnlineMoments = ReactiveObject{:_online_moments_state}
+"Compiled state for the ReactiveHMC-shaped method-bearing `welford_var` kernel."
+mutable struct OnlineMoments{K,S}
+    kernel::K
+    state::S
+end
 
 """
-    online_moments(T=Float64)
+    online_moments(template)
+    online_moments(dimension, T=Float64)
 
-Construct a stateful reactive Welford accumulator. [`update!`](@ref) and
-[`fit!`](@ref) mutate its graph-owned `n`, `mean`, and `m2` sources in place;
-`average`, `sample_variance`, and `population_variance` are lazily invalidated
-derived values. Call [`snapshot`](@ref) only when an immutable, mergeable
-[`MomentsAccumulator`](@ref) value is needed at a partition boundary.
+Compile and instantiate the method-bearing [`welford_var`](@ref) kernel. The
+running `n`, componentwise `mean`, and population `var` are compiler-owned state;
+[`step!`](@ref) executes the authored vector or matrix overload in place.
 """
-online_moments(::Type{T}=Float64) where {T<:AbstractFloat} =
-    _online_moments_state(0, zero(T), zero(T))
+function online_moments(template::AbstractVector)
+    seed = zero(template)
+    kernel = compile_stateful(welford_var, seed)
+    OnlineMoments(kernel, kernel(seed))
+end
 
-Statistics.mean(statistics::OnlineMoments) = statistics.average
+online_moments(dimension::Integer=1, ::Type{T}=Float64) where {T<:AbstractFloat} =
+    (dimension > 0 || throw(ArgumentError("dimension must be positive"));
+     online_moments(zeros(T, dimension)))
+
+@inline function Base.getproperty(statistics::OnlineMoments, name::Symbol)
+    name in (:kernel, :state) && return getfield(statistics, name)
+    ReactiveKernels.stateful_get(getfield(statistics, :state), Val(name))
+end
+
+Base.propertynames(::OnlineMoments, private::Bool=false) =
+    private ? (:kernel, :state, :n, :mean, :var) : (:n, :mean, :var)
+
+function Base.copy(statistics::OnlineMoments)
+    OnlineMoments(getfield(statistics, :kernel), deepcopy(getfield(statistics, :state)))
+end
+
+function step!(statistics::OnlineMoments, x::AbstractVector; dn=one(statistics.n))
+    ReactiveKernels.stateful_call!(statistics.state, Val(:step!), x; dn)
+    statistics
+end
+
+function step!(statistics::OnlineMoments, x::AbstractMatrix; kwargs...)
+    ReactiveKernels.stateful_call!(statistics.state, Val(:step!), x; kwargs...)
+    statistics
+end
+
+update!(statistics::OnlineMoments, observation::Real) =
+    step!(statistics, [convert(eltype(statistics.mean), observation)])
+
+function fit!(statistics::OnlineMoments, observations)
+    for observation in observations
+        observation isa AbstractVector ? step!(statistics, observation) :
+            update!(statistics, observation)
+    end
+    statistics
+end
+
+snapshot(statistics::OnlineMoments) =
+    (n=statistics.n, mean=copy(statistics.mean), var=copy(statistics.var))
+
+function reset!(statistics::OnlineMoments)
+    seed = zero(statistics.mean)
+    statistics.state = statistics.kernel(seed)
+    statistics
+end
+
+Statistics.mean(statistics::OnlineMoments) = statistics.mean
 function Statistics.var(statistics::OnlineMoments; corrected::Bool=true)
-    corrected ? statistics.sample_variance : statistics.population_variance
+    corrected || return statistics.var
+    statistics.n > one(statistics.n) || return fill(eltype(statistics.var)(NaN), length(statistics.var))
+    statistics.var .* (statistics.n / (statistics.n - one(statistics.n)))
 end
 
 """
@@ -265,8 +276,8 @@ for every transition.
 This state deliberately does not claim to represent rank-normalized R-hat or
 ESS. Those diagnostics require retained, ordered draws from multiple chains and
 cannot be recovered exactly from a constant-size mergeable accumulator. For the
-reactive, in-place diagonal-metric variance the sampler adapts, reuse the
-canonical [`WelfordVariance`](@ref)/[`welford_var`](@ref) (see
+in-place diagonal-metric variance the sampler adapts, use this page's compiled,
+method-bearing [`welford_var`](@ref) kernel (see
 [`metric_adaptation_report`](@ref)) rather than this mergeable scalar surface.
 """
 struct HMCDiagnosticsAccumulator{T<:AbstractFloat}
@@ -487,154 +498,62 @@ function Base.merge(a::HMCDiagnosticsAccumulator{T},
     )
 end
 
-# -- BEGIN DOCS: stateful HMC diagnostics --
-@reactive specialize=true _online_diagnostics_state(
-        n_divergent, max_depth, depth, leapfrog_steps,
-        acceptance_rate, energy_error, stepsize) = begin
-    diagnostic_sample_count::Int = depth.n
-    diagnostic_max_tree_depth::Int = max_depth
-    diagnostic_divergence_percent::typeof(acceptance_rate.mean) =
-        _diagnostic_divergence_percent(n_divergent, depth.n, acceptance_rate.mean)
-    diagnostic_mean_tree_depth::typeof(depth.mean) = mean(depth)
-    diagnostic_mean_leapfrog_steps::typeof(leapfrog_steps.mean) =
-        mean(leapfrog_steps)
-    diagnostic_mean_acceptance_rate::typeof(acceptance_rate.mean) =
-        mean(acceptance_rate)
-    diagnostic_mean_energy_error::typeof(energy_error.mean) = mean(energy_error)
-    diagnostic_mean_stepsize::typeof(stepsize.mean) = mean(stepsize)
-
-    record!(diagnostics::NUTSDiagnostics,
-            stepsize_observation::Union{Real,Missing}=NaN) = begin
-        diagnostics.depth >= 0 ||
-            throw(DomainError(diagnostics.depth,
-                              "tree depth must be non-negative"))
-        diagnostics.n_steps >= 0 ||
-            throw(DomainError(diagnostics.n_steps,
-                              "leapfrog-step count must be non-negative"))
-
-        T = typeof(acceptance_rate.mean)
-        acceptance = convert(T, diagnostics.acceptance_rate)
-        isfinite(acceptance) && zero(T) <= acceptance <= one(T) ||
-            throw(DomainError(diagnostics.acceptance_rate,
-                              "acceptance rate must be finite and in [0, 1]"))
-
-        energy = convert(T, diagnostics.energy_error)
-        next_energy_error = if isfinite(energy)
-            update(energy_error, energy)
-        else
-            diagnostics.diverged ||
-                throw(DomainError(diagnostics.energy_error,
-                    "a non-finite energy error must be marked divergent"))
-            energy_error
-        end
-
-        next_stepsize = if ismissing(stepsize_observation)
-            stepsize
-        else
-            epsilon = convert(T, stepsize_observation)
-            if isnan(epsilon)
-                stepsize
-            elseif isfinite(epsilon) && epsilon > zero(T)
-                update(stepsize, epsilon)
-            else
-                throw(DomainError(stepsize_observation,
-                    "step size must be NaN/missing (unavailable) or finite and positive"))
-            end
-        end
-
-        next_divergences = diagnostics.diverged ?
-            Base.checked_add(n_divergent, 1) : n_divergent
-        next_max_depth = max(max_depth, Int(diagnostics.depth))
-        next_depth = update(depth, convert(T, diagnostics.depth))
-        next_leapfrog_steps = update(
-            leapfrog_steps, convert(T, diagnostics.n_steps))
-        next_acceptance_rate = update(acceptance_rate, acceptance)
-
-        n_divergent = next_divergences
-        max_depth = next_max_depth
-        depth = next_depth
-        leapfrog_steps = next_leapfrog_steps
-        acceptance_rate = next_acceptance_rate
-        energy_error = next_energy_error
-        stepsize = next_stepsize
-        __self__
-    end
-
-    fit!(transitions) = begin
-        for transition in transitions
-            record!(
-                _transition_diagnostics(transition),
-                _transition_stepsize(transition, typeof(acceptance_rate.mean)),
-            )
-        end
-        __self__
-    end
-
-    snapshot() = HMCDiagnosticsAccumulator{typeof(acceptance_rate.mean)}(
-        n_divergent,
-        max_depth,
-        depth,
-        leapfrog_steps,
-        acceptance_rate,
-        energy_error,
-        stepsize,
-    )
-
-    reset!() = begin
-        T = typeof(acceptance_rate.mean)
-        empty = MomentsAccumulator(T)
-        n_divergent = 0
-        max_depth = 0
-        depth = empty
-        leapfrog_steps = empty
-        acceptance_rate = empty
-        energy_error = empty
-        stepsize = empty
-        __self__
-    end
-end
-# -- END DOCS: stateful HMC diagnostics --
-
-function _diagnostic_divergence_percent(n_divergent::Int, n::Int, prototype::T) where {T}
-    n == 0 && return T(NaN)
-    W = promote_type(T, Float64)
-    T(W(100) * W(n_divergent) / W(n))
+"Mutable convenience wrapper around a mergeable diagnostics accumulator."
+mutable struct OnlineDiagnostics{T<:AbstractFloat}
+    accumulator::HMCDiagnosticsAccumulator{T}
 end
 
-"A stateful HMC-diagnostics object authored through ReactiveKernels' `@reactive`."
-const OnlineDiagnostics = ReactiveObject{:_online_diagnostics_state}
+@inline function Base.getproperty(statistics::OnlineDiagnostics, name::Symbol)
+    name === :accumulator && return getfield(statistics, :accumulator)
+    getproperty(getfield(statistics, :accumulator), name)
+end
+
+Base.propertynames(statistics::OnlineDiagnostics, private::Bool=false) =
+    private ? (:accumulator, propertynames(statistics.accumulator)... ) :
+              propertynames(statistics.accumulator)
 
 """
     online_diagnostics(T=Float64)
 
-Construct a stateful diagnostics recorder. [`record!`](@ref) mutates its
-graph-owned counters and sufficient-statistic sources, and the `diagnostic_*`
-summary fields recompute lazily. [`snapshot`](@ref) materializes an immutable
-[`HMCDiagnosticsAccumulator`](@ref) only for partition merging or persistence.
+Construct a mutable convenience recorder around the immutable, mergeable
+[`HMCDiagnosticsAccumulator`](@ref). This is deliberately separate from the
+ReactiveHMC-shaped method-bearing Welford kernel above.
 """
-function online_diagnostics(::Type{T}=Float64) where {T<:AbstractFloat}
-    empty = MomentsAccumulator(T)
-    _online_diagnostics_state(0, 0, empty, empty, empty, empty, empty)
+online_diagnostics(::Type{T}=Float64) where {T<:AbstractFloat} =
+    OnlineDiagnostics(HMCDiagnosticsAccumulator(T))
+
+function record!(statistics::OnlineDiagnostics, diagnostics::NUTSDiagnostics,
+                 stepsize::Union{Real,Missing}=NaN)
+    statistics.accumulator = record_transition(statistics.accumulator, diagnostics, stepsize)
+    statistics
 end
 
-sample_count(statistics::OnlineDiagnostics) = statistics.diagnostic_sample_count
-max_tree_depth(statistics::OnlineDiagnostics) =
-    statistics.diagnostic_max_tree_depth
-divergence_percent(statistics::OnlineDiagnostics) =
-    statistics.diagnostic_divergence_percent
-function divergence_rate(statistics::OnlineDiagnostics)
-    T = typeof(statistics.acceptance_rate.mean)
-    statistics.diagnostic_divergence_percent / T(100)
+function fit!(statistics::OnlineDiagnostics, transitions)
+    for transition in transitions
+        record!(statistics, _transition_diagnostics(transition),
+                _transition_stepsize(transition, typeof(statistics.acceptance_rate.mean)))
+    end
+    statistics
 end
-mean_tree_depth(statistics::OnlineDiagnostics) =
-    statistics.diagnostic_mean_tree_depth
+
+snapshot(statistics::OnlineDiagnostics) = statistics.accumulator
+Base.copy(statistics::OnlineDiagnostics) = OnlineDiagnostics(statistics.accumulator)
+function reset!(statistics::OnlineDiagnostics{T}) where {T}
+    statistics.accumulator = HMCDiagnosticsAccumulator(T)
+    statistics
+end
+
+sample_count(statistics::OnlineDiagnostics) = sample_count(statistics.accumulator)
+max_tree_depth(statistics::OnlineDiagnostics) = max_tree_depth(statistics.accumulator)
+divergence_percent(statistics::OnlineDiagnostics) = divergence_percent(statistics.accumulator)
+divergence_rate(statistics::OnlineDiagnostics) = divergence_rate(statistics.accumulator)
+mean_tree_depth(statistics::OnlineDiagnostics) = mean_tree_depth(statistics.accumulator)
 mean_leapfrog_steps(statistics::OnlineDiagnostics) =
-    statistics.diagnostic_mean_leapfrog_steps
+    mean_leapfrog_steps(statistics.accumulator)
 mean_acceptance_rate(statistics::OnlineDiagnostics) =
-    statistics.diagnostic_mean_acceptance_rate
-mean_energy_error(statistics::OnlineDiagnostics) =
-    statistics.diagnostic_mean_energy_error
-mean_stepsize(statistics::OnlineDiagnostics) = statistics.diagnostic_mean_stepsize
+    mean_acceptance_rate(statistics.accumulator)
+mean_energy_error(statistics::OnlineDiagnostics) = mean_energy_error(statistics.accumulator)
+mean_stepsize(statistics::OnlineDiagnostics) = mean_stepsize(statistics.accumulator)
 
 """
     build_partition_graph(T=Float64)
@@ -717,10 +636,11 @@ function diagnostics_performance_report(
 end
 
 @noinline function _run_reactive_updates!(statistics, iterations::Int)
-    one_value = one(typeof(statistics.mean))
+    one_value = one(eltype(statistics.mean))
+    observation = similar(statistics.mean)
     for i in 1:iterations
-        observation = isodd(i) ? -one_value : one_value
-        update!(statistics, observation)
+        fill!(observation, isodd(i) ? -one_value : one_value)
+        step!(statistics, observation)
     end
     statistics
 end
@@ -760,12 +680,10 @@ const METRIC_ADAPTATION_DRAWS = [
 """
     metric_adaptation_report(observations=METRIC_ADAPTATION_DRAWS)
 
-Showcase the canonical reactive [`welford_var`](@ref)/[`WelfordVariance`](@ref)
-estimator — the sampler's own in-place diagonal-metric adaptation statistic —
-by folding parameter-vector `observations` and reading back its online
-componentwise mean and variance. This deliberately reuses the exported canonical
-estimator rather than re-implementing a vector Welford: it is the reactive,
-in-place, history-dependent counterpart to the immutable, mergeable
+Showcase the exact ReactiveHMC-shaped method-bearing [`welford_var`](@ref)
+kernel by folding parameter-vector `observations` and reading back its online
+componentwise mean and variance. It is the compiler-backed, in-place,
+history-dependent counterpart to the immutable, mergeable
 [`MomentsAccumulator`](@ref) used for the scalar summaries above, and is *not*
 itself mergeable across partitions.
 """
@@ -778,9 +696,10 @@ function metric_adaptation_report(observations=METRIC_ADAPTATION_DRAWS)
     all(observation -> length(observation) == dimension, observations) ||
         throw(DimensionMismatch(
             "all observation vectors must share the same dimension"))
-    estimate = welford_var(dimension)
+    T = float(eltype(first(observations)))
+    estimate = online_moments(dimension, T)
     for value in observations
-        step!(estimate, value)
+        step!(estimate, T.(value))
     end
     (; dimension, count=estimate.n,
        mean=copy(estimate.mean), variance=copy(estimate.var))
@@ -788,7 +707,7 @@ end
 
 function demo()
     data = [1.0, 2.0, 4.0, 8.0]
-    statistics = online_moments()
+    statistics = online_moments(1)
     fit!(statistics, data)
     streaming = snapshot(statistics)
     partitions = (fit(data[1:1]), fit(data[2:3]), fit(data[4:4]))
@@ -814,12 +733,9 @@ function demo()
 
     println("streaming state = ", streaming)
     println("merged state    = ", merged)
-    println("mean = ", mean(statistics),
-            ", sample variance = ", var(statistics))
-    println("stateful moments plan:\n",
-            explain(reactive_program(statistics).plan))
-    println("generated average getter:\n", code_expr(
-        reactive_program(statistics), statistics.handles.average))
+    println("mean = ", only(mean(statistics)),
+            ", sample variance = ", only(var(statistics)))
+    println("stateful moments plan:\n", explain(statistics.kernel.prepared.plan))
     println("partition merge = ", partition_kernel(partitions[1], partitions[2]))
     println("partition DAG (DOT interchange):\n", dot_source(partition_plan))
     println("HMC diagnostics = ", diagnostics_snapshot)
@@ -828,7 +744,7 @@ function demo()
     println("max tree depth = ", max_tree_depth(diagnostics),
             ", mean energy error = ", mean_energy_error(diagnostics),
             ", mean step size = ", mean_stepsize(diagnostics))
-    println("metric adaptation (canonical welford_var) variance = ",
+    println("metric adaptation (compiled @kernel welford_var) variance = ",
             adaptation.variance)
     println("partition performance = ", partition_performance_report(
         prepare(partition_model;
