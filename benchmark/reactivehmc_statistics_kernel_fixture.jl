@@ -31,18 +31,19 @@ using ReactiveKernels
     dimension,
     trajectory_capacity,
     sample_capacity,
+    reset_first,
     first=1,
     count=0,
     sample_count=0,
     trajectory_overflow=false,
     sampling_overflow=false,
 ) = begin
-    min1exp(x) = min(one(x), exp(x))
+    min1exp(x) = x > zero(x) ? one(x) : exp(x)
 
     reset!(pos, dham_dpos, pot) = begin
         trajectory_overflow = trajectory_capacity < 1
         trajectory_overflow && return trajectory_overflow
-        first = 1 + div(trajectory_capacity - 1, 2)
+        first = reset_first
         count = 1
         for index in 1:dimension
             positions[index, first] = pos[index]
@@ -100,8 +101,9 @@ using ReactiveKernels
             end
             full_idxs[offset + 1, next_sample] = idxs[column]
         end
+        acceptance_count = count > 1 ? count - 1 : 1
         acc_rate[next_sample] =
-            (acceptance_sum - one(acceptance_sum)) / max(1, count - 1)
+            (acceptance_sum - one(acceptance_sum)) / acceptance_count
         history_counts[next_sample] = count
         sample_count = next_sample
         sampling_overflow
@@ -136,6 +138,7 @@ function initial_statistics_sources(
         dimension=Int(dimension),
         trajectory_capacity=Int(trajectory_capacity),
         sample_capacity=Int(sample_capacity),
+        reset_first=max(1, 1 + div(trajectory_capacity - 1, 2)),
         first=1,
         count=0,
         sample_count=0,
