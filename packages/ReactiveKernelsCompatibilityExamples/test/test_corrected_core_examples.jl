@@ -9,15 +9,22 @@ using ReactiveKernelsCompatibilityExamples.ReactiveHMCExamples: riemannian_examp
 
         kernel = prepare(
             riemannian.graph;
-            have = (v.pos, v.metric),
+            have = (riemannian.spec.metric_grad_f, v.pos, v.metric),
             want = (v.metric, v.dpot, v.metric_grad),
         )
-        metric, dpot, metric_grad = kernel(pos, supplied_metric)
+        metric, dpot, metric_grad = kernel(
+            riemannian.sources.metric_grad_f, pos, supplied_metric,
+        )
         @test metric === supplied_metric
         @test dpot == pos
         @test size(metric_grad) == (2, 2, 2)
 
         state = ReactiveState(riemannian.graph)
+        set!(
+            state,
+            riemannian.spec.metric_grad_f,
+            riemannian.sources.metric_grad_f,
+        )
         set!(state, v.pos, pos)
         set!(state, v.metric, supplied_metric)
         metric, dpot, metric_grad = get!(state, (v.metric, v.dpot, v.metric_grad))
@@ -135,12 +142,15 @@ using ReactiveKernelsCompatibilityExamples.ReactiveHMCExamples: riemannian_examp
         v = riemannian.values
         duplicate_have = prepare(
             riemannian.graph;
-            have = (v.pos, v.pos, v.metric),
+            have = (riemannian.spec.grad_f, v.pos, v.pos, v.metric),
             want = (v.metric, v.dpot),
         )
-        @test inputs(duplicate_have) == (v.pos, v.metric)
+        @test inputs(duplicate_have) ==
+              (riemannian.spec.grad_f, v.pos, v.metric)
         supplied_metric = Diagonal([3.0, 4.0])
-        @test duplicate_have([0.25, -0.5], supplied_metric)[1] === supplied_metric
+        @test duplicate_have(
+            riemannian.sources.grad_f, [0.25, -0.5], supplied_metric,
+        )[1] === supplied_metric
 
         invalid_graph = Graph()
         pos = value!(invalid_graph, :pos, Float64)
