@@ -71,6 +71,7 @@ using .ReactiveKernelsNUTSExample
         include("test_benchmark_smoke.jl")
         include("test_online_stats_example.jl")
         include("test_nutpie_diagonal_adaptation.jl")
+        include("test_reactivehmc_phasepoint_receipt.jl")
         include("test_reactivehmc_integrator_fixture.jl")
     end
     ad_only || include("test_handwritten_benchmarks.jl")
