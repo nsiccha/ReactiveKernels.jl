@@ -97,6 +97,9 @@ The pinned C++ oracle covers four distinguishing paths:
 Those counts and the exact endpoints live in
 [`benchmark/receipts/walnuts-upstream-macro-v1.tsv`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/walnuts-upstream-macro-v1.tsv).
 They are independent expected results, not output from either RK compiler.
+The receipt also locks its build-only Eigen dependency to full commit
+`bc3b39870ecb690a623a3f49149a358b95c5781d` from the vetted GitHub mirror;
+the capture does not trust a matching version tag alone.
 
 ## Complete authored WALNUTS-D fixture
 

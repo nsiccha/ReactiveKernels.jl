@@ -25,6 +25,15 @@ const BOB_CARPENTER_LINEAGE = (
     bob_carpenter_lines = 408,
 )
 
+# Build-only header authority for the independent C++ oracle. This is a
+# different forge/failure domain from Eigen's upstream GitLab and is locked by
+# full commit, not by a matching tag name.
+const ORACLE_TOOLCHAIN = (
+    eigen_repository = "https://github.com/eigen-mirror/eigen.git",
+    eigen_revision = "bc3b39870ecb690a623a3f49149a358b95c5781d",
+    eigen_tag = "5.0.1",
+)
+
 const EXTERNAL_CORPUS = (
     (
         id = :walnuts_d,

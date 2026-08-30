@@ -6,12 +6,17 @@ shapes: base-grid acceptance, dyadic refinement plus reverse checks, rejection
 by a coarser reverse grid, and exhaustion of every allowed forward grid.
 
 From an exact checkout of Walnutpie revision
-`4f051db7df57762a58ac851b0274fe57de342198` and an Eigen 5.0.1 include root:
+`4f051db7df57762a58ac851b0274fe57de342198` and an exact checkout of Eigen
+5.0.1 at `bc3b39870ecb690a623a3f49149a358b95c5781d` from the vetted
+cross-forge mirror `https://github.com/eigen-mirror/eigen.git`:
 
 ```sh
 julia --startup-file=no benchmark/walnuts_oracle/capture.jl \
-  /path/to/walnutpie /path/to/eigen-5.0.1
+  /path/to/walnutpie /path/to/eigen-mirror-at-bc3b398
 ```
+
+The capture rejects either tracked-dirty checkout and prints both exact source
+revisions into the receipt. A matching `5.0.1` tag name alone is not accepted.
 
 The committed receipt is
 `benchmark/receipts/walnuts-upstream-macro-v1.tsv`.  `logp_grad_calls` is an

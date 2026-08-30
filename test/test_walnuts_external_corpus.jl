@@ -21,6 +21,10 @@ const WFX = _WalnutsFixtureTest.WalnutsKernelAuthoringFixture
           "895a9b7a595b1bf15e9bcd7267bf1fa4fc36789a"
     @test WEC.BOB_CARPENTER_LINEAGE.blamed_lines ==
           WEC.BOB_CARPENTER_LINEAGE.bob_carpenter_lines == 408
+    @test WEC.ORACLE_TOOLCHAIN.eigen_repository ==
+          "https://github.com/eigen-mirror/eigen.git"
+    @test WEC.ORACLE_TOOLCHAIN.eigen_revision ==
+          "bc3b39870ecb690a623a3f49149a358b95c5781d"
 
     entry = only(WEC.EXTERNAL_CORPUS)
     @test propertynames(entry) == WEC.ENTRY_FIELDS
@@ -98,6 +102,8 @@ end
     @test "# execution=separate_cpp_process" in lines
     @test "# authority_revision=$(WEC.UPSTREAM.revision)" in lines
     @test "# authority_sha256=$(only(WEC.UPSTREAM.source_sha256).second)" in lines
+    @test "# eigen_repository=$(WEC.ORACLE_TOOLCHAIN.eigen_repository)" in lines
+    @test "# eigen_revision=$(WEC.ORACLE_TOOLCHAIN.eigen_revision)" in lines
 
     data = filter(line -> !startswith(line, '#'), lines)
     @test split(first(data), '\t') ==

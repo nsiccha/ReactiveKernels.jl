@@ -2,6 +2,8 @@
 # authority_revision=4f051db7df57762a58ac851b0274fe57de342198
 # authority_path=include/walnutpie/walnuts.hpp
 # authority_sha256=ab00138be5f6dee2d67108cafa11d42e99da3018b29d52d29bf4a07c545bdab5
+# eigen_repository=https://github.com/eigen-mirror/eigen.git
+# eigen_revision=bc3b39870ecb690a623a3f49149a358b95c5781d
 # execution=separate_cpp_process
 case	accepted	logp_grad_calls	theta	rho	joint	base_accept
 base_grid_accept	1	1	1.0249999999999999	0.19875000000000001	-0.54506328124999992	0.99993672075221618
