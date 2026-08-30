@@ -1,75 +1,112 @@
-# Incremental and mergeable online statistics
+# Stateful online statistics and mergeable snapshots
 
-Online mean and variance are a compact example of the line between pure state
-updates and reactive bookkeeping. A `MomentsAccumulator{T}` stores
-only `(n, mean, m2)`. Welford's update consumes one observation, while Chan's
-parallel formula combines independently processed partitions. The same
-building block also summarizes the per-transition diagnostics the compiled
-NUTS sampler reports as a `NUTSDiagnostics` — tree depth,
-leapfrog-step count, acceptance rate, and energy error — alongside an exact
-divergence count and maximum tree depth. All operations return new immutable
-values, so they are ordinary pure recipes rather than hidden mutation inside
-the graph. For the reactive, in-place diagonal-metric variance the sampler
-itself adapts, the example reuses the canonical `welford_var` estimator rather
-than re-implementing it.
+Online statistics are history-dependent, so the primary interface here follows
+ReactiveHMC's original shape: a stateful `@reactive` object owns the running
+statistics, and ordinary methods mutate those graph-owned sources. Callers use
+`update!`, `fit!`, or `record!`; they do **not** receive a complete replacement
+state and wire it back as the next input.
 
-The complete runnable implementation is
+Immutable values still have an important role. `MomentsAccumulator{T}` and
+`HMCDiagnosticsAccumulator{T}` are compact snapshots for partition boundaries,
+persistence, and Chan-style associative merging. Full-state return is therefore
+kept in the merge lane, where value semantics are useful, rather than imposed on
+the streaming lane.
+
+The complete executable authority is
 [`examples/online_stats.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/online_stats.jl).
-It fixes the storage type to a floating `T`, which keeps empty and singleton
-`NaN` results type-stable.
+The `@reactive` definitions displayed below are extracted from that exact file,
+which the documentation build also loads.
 
-## One source, its generated kernel, and its plan
+## Stateful Welford moments
 
-The Raw pane below declares update/summary and partition-merge fragments with
-`@kernel`, composes them by name, and prepares only the streaming query. The
-Generated pane is a readable view derived from the executed kernel and selected
-`Plan`; the exact compiled AST remains available as `code_expr(update_kernel)`.
-The Compute DAG renders that plan with `visualize`, so the unused partition
-branch is absent from both generated views.
+The three authoritative sources are `n`, `mean`, and `m2`. The summary fields
+are compiled reactive recipes: changing any source invalidates only the derived
+values that depend on it. The Welford recurrence itself lives visibly inside
+the object's `update!` method.
+
+```@eval
+Main.ReactiveKernelsDocs.render_online_stats_reactive_source(:moments)
+```
+
+The ergonomic streaming path keeps one object identity:
+
+```julia
+statistics = OnlineStatsExample.online_moments()
+
+OnlineStatsExample.update!(statistics, 1.0) === statistics
+OnlineStatsExample.fit!(statistics, [2.0, 4.0, 8.0]) === statistics
+
+Statistics.mean(statistics)
+Statistics.var(statistics)
+statistics.n
+```
+
+The actual compiled dependency graph remains inspectable. It contains the
+derived mean and variance recipes over the mutable HAVE sources; `update!` is
+the ordinary stateful method that writes those sources and triggers
+invalidation.
+
+```julia
+program = reactive_program(statistics)
+reactive_program(statistics).plan
+explain(program.plan)
+code_expr(program, statistics.handles.average)
+```
+
+Only materialize an immutable value when it is useful as a value:
+
+```julia
+snapshot = OnlineStatsExample.snapshot(statistics)
+@assert snapshot isa OnlineStatsExample.MomentsAccumulator{Float64}
+```
+
+## Partition merging stays pure
+
+Independent partitions naturally produce immutable sufficient-statistic
+snapshots. `Base.merge` combines them with Chan's parallel-variance formula;
+the empty snapshot is an exact identity. This is the one public `@kernel` lane
+that returns a complete state, deliberately scoped to a partition boundary.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(@__MODULE__, raw"""
-@kernel updates(state::MomentsAccumulator{Float64}, observation::Float64) = begin
-    updated::MomentsAccumulator{Float64} =
-        OnlineStatsExample.update(state, observation)
-    average::Float64 = Statistics.mean(updated)
-    sample_variance::Float64 = Statistics.var(updated)
-end
-
 @kernel partitions(left_partition::MomentsAccumulator{Float64},
                    right_partition::MomentsAccumulator{Float64}) = begin
     merged::MomentsAccumulator{Float64} =
         Base.merge(left_partition, right_partition)
+    merged_average::Float64 = Statistics.mean(merged)
+    merged_variance::Float64 = Statistics.var(merged)
+    return merged, merged_average, merged_variance
 end
 
-model = merge(updates, partitions)
-update_kernel = prepare(model;
-    have = (:state, :observation),
-    want = (:updated, :average, :sample_variance))
+# OnlineStatsExample.build_partition_graph() is the reusable source authority.
+merge_kernel = prepare(partitions;
+    have = (:left_partition, :right_partition),
+    want = (:merged, :merged_average, :merged_variance))
 
-seed = MomentsAccumulator()
-inputs = (seed, 3.0)
-output = update_kernel(inputs...)
+inputs = (
+    OnlineStatsExample.fit([1.0, 2.0]),
+    OnlineStatsExample.fit([4.0, 8.0]),
+)
+output = merge_kernel(inputs...)
 
 docs_example = (;
-    name = :online_moments_update,
-    origin = "compact @kernel update and merge model (build executed)",
+    name = :online_moments_partition_merge,
+    origin = "immutable Chan merge at an explicit partition boundary",
     inputs,
-    kernel = update_kernel,
+    kernel = merge_kernel,
     output,
 )
 """; setup = Main.ReactiveKernelsDocs.setup_online_stats!)
 ```
 
-## Streaming and partitioned execution
-
-The accumulator API is intentionally example-owned: `update` advances one
-stream and `Base.merge` combines two sufficient-statistic states. Empty states
-are exact merge identities.
+A streamed object and merged partitions agree without making state replacement
+the streaming API:
 
 ```julia
 data = [1.0, 2.0, 4.0, 8.0]
-streaming = OnlineStatsExample.fit(data)
+
+streaming = OnlineStatsExample.online_moments()
+OnlineStatsExample.fit!(streaming, data)
 
 parts = (
     OnlineStatsExample.fit(data[1:1]),
@@ -82,103 +119,58 @@ partitioned = reduce(merge, parts)
 @assert Statistics.var(partitioned) ≈ Statistics.var(streaming)
 ```
 
-## HMC sampling diagnostics
+## Stateful HMC diagnostics
 
-`HMCDiagnosticsAccumulator{T}` ingests the canonical `NUTSDiagnostics` record
-the compiled sampler returns per transition — `depth`, `n_steps`,
-`acceptance_rate`, `diverged`, and `energy_error` — storing online moments for
-depth, leapfrog count, acceptance rate, and energy error, plus an exact
-divergence count and maximum tree depth. Step size is **not** part of
-`NUTSDiagnostics` (it is adapted by the sampler's dual-averaging state), so it
-is supplied separately and summarized only when a finite, positive value is
-given; `NaN` (the default) or `missing` records the transition with an
-unavailable step size, while a non-positive or infinite value is rejected as
-invalid telemetry. The completed-transition `energy_error` is likewise folded
-only when finite: because the canonical sampler normalizes a non-finite error
-to `-Inf` and marks it divergent, a non-finite error is accepted only on a
-divergent transition (counted, not folded) and rejected otherwise.
-Independently summarized chain segments are mergeable, and the empty state is an
-exact identity.
-
-The Generated and Compute DAG panes below show the HMC diagnostics subkernel.
+HMC diagnostics follow the same ownership model. The reactive object owns exact
+divergence/max-depth counters and five immutable scalar-moment sources.
+`record!` validates a transition, computes every next component before the first
+write, and then mutates the graph-owned sources. Derived summaries invalidate
+lazily. `snapshot` is again reserved for merging or persistence.
 
 ```@eval
-Main.ReactiveKernelsDocs.execute_example(@__MODULE__, raw"""
-diagnostics = @kernel begin
-    diagnostics_state::HMCDiagnosticsAccumulator{Float64}
-    transition::NUTSDiagnostics{Float64}
-    stepsize_observation::Float64
-    updated_diagnostics::HMCDiagnosticsAccumulator{Float64} =
-        OnlineStatsExample.record_transition(
-            diagnostics_state,
-            transition,
-            stepsize_observation,
-        )
-    max_tree_depth::Int =
-        OnlineStatsExample.max_tree_depth(updated_diagnostics)
-    divergence_percent::Float64 =
-        OnlineStatsExample.divergence_percent(updated_diagnostics)
-    mean_acceptance_rate::Float64 =
-        OnlineStatsExample.mean_acceptance_rate(updated_diagnostics)
-    mean_energy_error::Float64 =
-        OnlineStatsExample.mean_energy_error(updated_diagnostics)
-    mean_stepsize::Float64 =
-        OnlineStatsExample.mean_stepsize(updated_diagnostics)
-    return updated_diagnostics, max_tree_depth, divergence_percent,
-           mean_acceptance_rate, mean_energy_error, mean_stepsize
-end
-
-diagnostics_kernel = prepare(diagnostics;
-    have = (:diagnostics_state, :transition, :stepsize_observation),
-    want = (:updated_diagnostics, :max_tree_depth, :divergence_percent,
-            :mean_acceptance_rate, :mean_energy_error, :mean_stepsize))
-
-seed = HMCDiagnosticsAccumulator()
-inputs = (seed, NUTSDiagnostics(3, 7, 0.91, false, -0.05), 0.25)
-output = diagnostics_kernel(inputs...)
-
-docs_example = (;
-    name = :hmc_transition_diagnostics,
-    origin = "compact @kernel HMC diagnostics reducer (build executed)",
-    inputs,
-    kernel = diagnostics_kernel,
-    output,
-)
-"""; setup = Main.ReactiveKernelsDocs.setup_online_stats!)
+Main.ReactiveKernelsDocs.render_online_stats_reactive_source(:diagnostics)
 ```
 
-Each transition is a canonical `NUTSDiagnostics`; step size is paired in
-explicitly and omitted (recorded as unavailable) when the sampler has not
-adapted one yet:
+Each transition is the canonical external sampler record. Step size remains a
+separate adaptation value because it is not a field of `NUTSDiagnostics`:
 
 ```julia
+diagnostics = OnlineStatsExample.online_diagnostics()
+
+transition::NUTSDiagnostics{Float64} =
+    NUTSDiagnostics(3, 7, 0.91, false, -0.05)
+OnlineStatsExample.record!(diagnostics, transition, 0.25) === diagnostics
+
 records = [
-    (diagnostics=NUTSDiagnostics(3, 7,  0.91, false, -0.05), stepsize=0.25),
-    (diagnostics=NUTSDiagnostics(5, 15, 0.83, true,  -6.0),  stepsize=0.20),
-    (diagnostics=NUTSDiagnostics(2, 5,  0.96, false, -0.01),),  # step size unavailable
+    (diagnostics=NUTSDiagnostics(5, 15, 0.83, true, -6.0), stepsize=0.20),
+    (diagnostics=NUTSDiagnostics(2, 5, 0.96, false, -0.01),),
 ]
-diagnostics = OnlineStatsExample.fit_diagnostics(records)
+OnlineStatsExample.fit!(diagnostics, records)
 
 @assert OnlineStatsExample.sample_count(diagnostics) == 3
 @assert diagnostics.n_divergent == 1
 @assert OnlineStatsExample.max_tree_depth(diagnostics) == 5
-@assert isnan(OnlineStatsExample.mean_stepsize(
-    OnlineStatsExample.fit_diagnostics(
-        [NUTSDiagnostics(1, 1, 0.9, false, 0.0)])))
 ```
 
-This fixed-size reducer intentionally does not approximate rank-normalized
+`NaN` or `missing` means an unavailable step size and is not folded. A finite
+non-positive or infinite step size is invalid telemetry. A non-finite energy
+error is accepted only on a divergent transition, where it contributes to the
+exact divergence count but not the finite energy-error moments. These checks
+happen before graph-owned state is mutated, so a rejected transition leaves the
+object unchanged.
+
+The immutable `HMCDiagnosticsAccumulator` remains mergeable across independently
+summarized chain segments. It intentionally does not approximate rank-normalized
 R-hat or bulk/tail ESS: exact versions require retained, ordered draws from
-multiple chains. WarmupHMC reports those from its retained sampling history,
-while divergence count and maximum tree depth are represented exactly here.
+multiple chains.
 
-### Reactive metric adaptation reuses the canonical estimator
+## Vector metric adaptation
 
-The mergeable scalar summaries above are distinct from the sampler's diagonal
-*metric* adaptation, which is a reactive, in-place, componentwise variance over
-parameter vectors. The example does not re-implement it: it reuses the exported
-canonical `welford_var`/`WelfordVariance`, the same estimator the sampler adapts
-its metric with.
+The scalar example above contains its own visible Welford recurrence. For the
+sampler's vector-valued diagonal metric, the example additionally reuses the
+external NUTS exemplar's canonical stateful `welford_var` implementation. That
+keeps HMC domain APIs outside the ReactiveKernels package while demonstrating
+that the sampler and this page share the same adaptation statistic.
 
 ```julia
 report = OnlineStatsExample.metric_adaptation_report()
@@ -188,90 +180,34 @@ report = OnlineStatsExample.metric_adaptation_report()
 @assert all(report.variance .>= 0)
 ```
 
+## Numeric and measurement contracts
+
 Empty means and variances are `NaN`. A singleton has a finite mean, `NaN`
 corrected variance, and zero uncorrected variance. Non-finite observations
-propagate `NaN` or positive infinity; a negative `m2`, including negative
-infinity, is rejected. Constant and large-offset streams retain nonnegative
-`m2`; only a finite negative value within the explicit floating-point rounding
-tolerance is clamped to zero. Count ratios use widened arithmetic before the
-result is stored back in `T`, so narrow storage such as `Float16` remains valid
-when a merged count exceeds its largest finite value.
+propagate `NaN` or positive infinity; negative `m2`, including negative
+infinity, is rejected. Count ratios use widened arithmetic before storage back
+in `T`, so narrow types such as `Float16` remain valid when merged counts exceed
+their largest finite floating value.
 
-## Reactive invalidation is explicit
-
-`ReactiveState` treats `state` and `observation` as authoritative inputs.
-Replacing an observation invalidates and recomputes `updated`; it does not
-silently fold into the previous result. Advancing a stream means explicitly
-promoting the returned accumulator to the next `state` input. A frozen value
-stays fixed until you call `unfreeze!`.
-
-## Mutation-friendly reactive authoring
-
-`MomentsAccumulator` is immutable on purpose: for a three-field sufficient
-statistic there is nothing to mutate in place, so pure `set!`/`get!` replacement
-is both correct and allocation-cheap. When state is instead a large **mutable**
-object — an array, a sampler phase point — where an in-place update avoids
-reallocating the whole buffer, ReactiveKernels provides a compiled reactive
-surface that keeps the same invalidation, freeze, and checkpoint guarantees.
-
-`prepare_reactive` fixes the have/want boundary once and returns a
-[`ReactiveProgram`](api.md); instantiate it to a `CompiledReactiveState`. Inside
-a `mutate!` transaction you edit the stored object for a declared source in
-place, and downstream slots are invalidated and lazily recomputed automatically
-— no manual round-trip through the returned value:
+The performance helpers separate construction from steady-state work:
 
 ```julia
-g = @kernel begin
-    weights::Vector{Float64}
-    total::Float64 = sum(weights)
-    return total
-end
+partition_model = OnlineStatsExample.build_partition_graph()
+partition_kernel = prepare(partition_model;
+    have = (:left_partition, :right_partition), want = :merged)
 
-program = prepare_reactive(g; have = (:weights,), want = (:total,))
-state   = program([1.0, 2.0, 3.0])
-total   = statevalue(program, port(g, :total))
-
-get!(state, total)                       # 6.0
-mutate!(state, port(g, :weights)) do w   # in-place edit of the owned buffer
-    w[1] = 10.0
-end
-get!(state, total)                       # 15.0, recomputed on demand
+partition = OnlineStatsExample.partition_performance_report(partition_kernel)
+streaming = OnlineStatsExample.reactive_performance_report()
+diagnostics = OnlineStatsExample.diagnostics_performance_report()
 ```
 
-Derived values live in buffers the state owns, so `freeze!`/`unfreeze!` and
-`checkpoint` behave exactly as they do for `ReactiveState`: a frozen `total`
-stays fixed under later `mutate!` calls, and a checkpoint replays into a fresh
-`program(...; frozen = cp)` instance. This is the supported way to get in-place
-(`!!`-style) updates inside a reactive layer. The direct
-[`prepare_nonallocating`](nonallocating.md) kernels are a separate,
-single-caller tool whose borrowed caches are not carried through the reactive
-layers.
+`partition_performance_report` measures the generated immutable merge kernel.
+`reactive_performance_report` and `diagnostics_performance_report` measure
+stateful method calls, including source writes and reactive invalidation but
+excluding object construction and program preparation. Timings are observations,
+not pass/fail thresholds.
 
-## Measurement contract
-
-`kernel_performance_report` warms the generated update kernel, measures
-steady-state allocations in one run, and elapsed time in a separate run.
-`diagnostics_performance_report` applies the same measurement contract to the
-HMC diagnostics update kernel.
-`reactive_performance_report` does the same for the reactive path, whose
-allocation count deliberately includes the reactive bookkeeping — version
-tracking, invalidation, the planning-cache lookup, and building the result.
-Timings are reported observations, not pass/fail thresholds.
-
-```julia
-model = OnlineStatsExample.build_online_stats_graph()
-kernel = prepare(model; have = (:state, :observation), want = :updated)
-
-direct = OnlineStatsExample.kernel_performance_report(kernel)
-diagnostics_kernel = prepare(model;
-    have = (:diagnostics_state, :transition, :stepsize_observation),
-    want = :updated_diagnostics)
-diagnostics = OnlineStatsExample.diagnostics_performance_report(
-    diagnostics_kernel)
-reactive = OnlineStatsExample.reactive_performance_report(model)
-```
-
-Run the full walkthrough from the repository root:
+Run the complete walkthrough from the repository root:
 
 ```sh
 julia --project=. examples/online_stats.jl
