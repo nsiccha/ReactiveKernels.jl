@@ -23,6 +23,11 @@ function _rhmc_metric_gradient(position)
     (pot, dpot, metric, derivative)
 end
 
+_rhmc_trace_source(value::AbstractVector) = Reactant.to_rarray(value)
+_rhmc_trace_source(value::Diagonal) =
+    Diagonal(Reactant.to_rarray(value.diag))
+_rhmc_trace_source(value) = value
+
 @testset "all six ReactiveHMC phase-point kernels compile generically" begin
     position_host = [0.25, -0.5]
     momentum_host = [0.4, 0.1]
@@ -75,5 +80,19 @@ end
         @test compiled_hamiltonian(actual_geometry, momentum) ≈ expected[1]
         @test Array(compiled_dpos(actual_geometry, momentum)) ≈ expected[2]
         @test Array(compiled_dmom(actual_geometry, momentum)) ≈ expected[3]
+
+        wanted = (:pot, :dham_dpos, :dham_dmom, :ham)
+        endpoint = prepare(
+            kernels.spec; have = propertynames(kernels.sources), want = wanted,
+        )
+        host_sources = values(kernels.sources)
+        traced_sources = map(_rhmc_trace_source, host_sources)
+        expected_endpoint = endpoint(host_sources...)
+        compiled_endpoint = @compile endpoint(traced_sources...)
+        actual_endpoint = compiled_endpoint(traced_sources...)
+        @test actual_endpoint[1] ≈ expected_endpoint[1]
+        @test Array(actual_endpoint[2]) ≈ expected_endpoint[2]
+        @test Array(actual_endpoint[3]) ≈ expected_endpoint[3]
+        @test actual_endpoint[4] ≈ expected_endpoint[4]
     end
 end
