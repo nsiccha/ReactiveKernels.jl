@@ -74,6 +74,47 @@ const CORPUS = (
         ),
         minimum_acceptance = :native_and_reactant,
     ),
+    (
+        id = :pathfinder_jl_compact_lbfgs,
+        family = :quasi_newton_variational_inference,
+        upstream = UPSTREAM_AUTHORITY,
+        current_reactive_sources = (
+            "benchmark/pathfinder_jl_kernel_authoring_fixture.jl",
+        ),
+        capabilities = (
+            :captured_callable_and_constant_ports,
+            :fixed_capacity_history,
+            :compact_lbfgs,
+            :triangular_solve,
+            :linear_algebra,
+            :factorization,
+            :batched_draw_transform,
+            :reduction,
+            :explicit_rng_effects,
+        ),
+        oracle = (
+            execution = :separate_python_process,
+            source = "benchmark/pathfinder_oracle/pathfinder_oracle.py",
+            receipt = "benchmark/pathfinder_oracle/pathfinder_oracle.toml",
+            section = "pathfinder_jl_compact",
+        ),
+        comparison = (
+            exact = (),
+            numeric = (
+                :history_cross,
+                :compact_middle,
+                :covariance,
+                :mean,
+                :elbo_draws,
+                :log_q,
+                :elbo,
+                :output_draws,
+            ),
+            atol = 1e-12,
+            rtol = 1e-12,
+        ),
+        minimum_acceptance = :native_and_reactant,
+    ),
 )
 
 end # module PathfinderExternalCorpus

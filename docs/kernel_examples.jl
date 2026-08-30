@@ -533,6 +533,9 @@ end
 const _PATHFINDER_FIXTURE_PATH = normpath(joinpath(
     @__DIR__, "..", "benchmark", "pathfinder_kernel_authoring_fixture.jl",
 ))
+const _PATHFINDER_JL_FIXTURE_PATH = normpath(joinpath(
+    @__DIR__, "..", "benchmark", "pathfinder_jl_kernel_authoring_fixture.jl",
+))
 
 const _PATHFINDER_HAVE = (
     :logdensity,
@@ -563,6 +566,22 @@ function _pathfinder_authored_source()
     strip(source[first(start):(first(stop) - 1)], '\n')
 end
 
+function _pathfinder_jl_authored_source()
+    source = replace(
+        read(_PATHFINDER_JL_FIXTURE_PATH, String),
+        "\r\n" => "\n",
+        "\r" => "\n",
+    )
+    start_marker = "@kernel pathfinder_jl_compact_candidate("
+    stop_marker = "\nconst PATHFINDER_JL_OUTPUTS"
+    start = findfirst(start_marker, source)
+    stop = findfirst(stop_marker, source)
+    start === nothing && error("Pathfinder.jl fixture lost its authored @kernel")
+    stop === nothing && error("Pathfinder.jl fixture lost its prepare boundary")
+    first(start) < first(stop) || error("Pathfinder.jl fixture source markers are reversed")
+    strip(source[first(start):(first(stop) - 1)], '\n')
+end
+
 function _pathfinder_inputs(fixture::Module)
     # The fixture is included from this same Documenter `@eval` call. Cross the
     # resulting world-age boundary explicitly before reading its fresh methods.
@@ -581,13 +600,30 @@ function _pathfinder_inputs(fixture::Module)
     )
 end
 
+
+function _pathfinder_jl_inputs(fixture::Module)
+    values = Base.invokelatest(fixture.pathfinder_jl_fixture_inputs)
+    (;
+        logdensity = values.logdensity,
+        position = values.position,
+        gradient = values.gradient,
+        alpha = values.alpha,
+        history_steps = values.history_steps,
+        history_gradient_deltas = values.history_gradient_deltas,
+        parameter_identity = values.parameter_identity,
+        history_identity = values.history_identity,
+        elbo_standard_draws = values.elbo_standard_draws,
+        output_standard_draws = values.output_standard_draws,
+    )
+end
+
 """
     render_pathfinder_kernels(mod) -> Markdown.MD
 
-Load the exact external Pathfinder fixture and render two compiled cuts of its
-single authored mathematical graph: the curvature-safe inverse-BFGS geometry,
-and the complete local-Gaussian/ELBO candidate.  Both panels execute during the
-docs build and share the standard Raw input / Generated kernel / Compute DAG UI.
+Load the exact external Pathfinder fixtures and render two compiled cuts of the
+paper-oriented graph plus the multi-history compact L-BFGS kernel transcribed
+from Pathfinder.jl. All panels execute during the docs build and share the
+standard Raw input / Generated kernel / Compute DAG UI.
 """
 function render_pathfinder_kernels(mod::Module)
     if !isdefined(mod, :PathfinderKernelAuthoringFixture)
@@ -595,9 +631,16 @@ function render_pathfinder_kernels(mod::Module)
     end
     fixture = getfield(mod, :PathfinderKernelAuthoringFixture)
     fixture isa Module || error("Pathfinder fixture did not define its module")
+    if !isdefined(mod, :PathfinderJLKernelAuthoringFixture)
+        Base.include(mod, _PATHFINDER_JL_FIXTURE_PATH)
+    end
+    jl_fixture = getfield(mod, :PathfinderJLKernelAuthoringFixture)
+    jl_fixture isa Module || error("Pathfinder.jl fixture did not define its module")
 
     inputs = _pathfinder_inputs(fixture)
+    jl_inputs = _pathfinder_jl_inputs(jl_fixture)
     authored_source = _pathfinder_authored_source()
+    jl_authored_source = _pathfinder_jl_authored_source()
     geometry_kernel = Base.invokelatest(
         prepare,
         fixture.pathfinder_candidate;
@@ -605,9 +648,12 @@ function render_pathfinder_kernels(mod::Module)
         want = (:alpha_next, :curvature_accepted, :covariance),
     )
     candidate_kernel = fixture.PATHFINDER_CANDIDATE
+    jl_candidate_kernel = jl_fixture.PATHFINDER_JL_CANDIDATE
 
     geometry_output = Base.invokelatest(geometry_kernel, Tuple(inputs)...)
     candidate_output = Base.invokelatest(candidate_kernel, Tuple(inputs)...)
+    jl_candidate_output =
+        Base.invokelatest(jl_candidate_kernel, Tuple(jl_inputs)...)
     artifacts = (
         (;
             name = :pathfinder_inverse_bfgs_geometry,
@@ -628,6 +674,16 @@ function render_pathfinder_kernels(mod::Module)
             source = authored_source,
             generated = code_expr(candidate_kernel),
             dag = candidate_kernel.plan,
+        ),
+        (;
+            name = :pathfinder_jl_compact_history,
+            origin = "Pathfinder.jl 0.10.7 dba8c9a; two-history compact L-BFGS candidate",
+            inputs = jl_inputs,
+            kernel = jl_candidate_kernel,
+            output = jl_candidate_output,
+            source = jl_authored_source,
+            generated = code_expr(jl_candidate_kernel),
+            dag = jl_candidate_kernel.plan,
         ),
     )
     render_examples(artifacts)

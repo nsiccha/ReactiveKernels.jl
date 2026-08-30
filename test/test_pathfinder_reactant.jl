@@ -4,6 +4,10 @@ if !isdefined(Main, :PathfinderKernelAuthoringFixture)
     include(joinpath(@__DIR__, "..", "benchmark", "pathfinder_kernel_authoring_fixture.jl"))
 end
 using .PathfinderKernelAuthoringFixture
+if !isdefined(Main, :PathfinderJLKernelAuthoringFixture)
+    include(joinpath(@__DIR__, "..", "benchmark", "pathfinder_jl_kernel_authoring_fixture.jl"))
+end
+using .PathfinderJLKernelAuthoringFixture
 
 @testset "Pathfinder candidate compiles once and replays the path through Reactant" begin
     inputs = pathfinder_fixture_inputs()
@@ -81,4 +85,48 @@ using .PathfinderKernelAuthoringFixture
     compiled_best = argmax(compiled_elbos)
     @test compiled_best == native.best_index
     @test Array(compiled_candidates[compiled_best].output_draws) ≈ native.draws
+end
+
+@testset "Pathfinder.jl compact-history candidate compiles through Reactant" begin
+    inputs = pathfinder_jl_fixture_inputs()
+    kernel = PATHFINDER_JL_CANDIDATE
+    compiled = @compile kernel(
+        inputs.logdensity,
+        Reactant.to_rarray(inputs.position),
+        Reactant.to_rarray(inputs.gradient),
+        Reactant.to_rarray(inputs.alpha),
+        Reactant.to_rarray(inputs.history_steps),
+        Reactant.to_rarray(inputs.history_gradient_deltas),
+        Reactant.to_rarray(inputs.parameter_identity),
+        Reactant.to_rarray(inputs.history_identity),
+        Reactant.to_rarray(inputs.elbo_standard_draws),
+        Reactant.to_rarray(inputs.output_standard_draws),
+    )
+    values = compiled(
+        inputs.logdensity,
+        Reactant.to_rarray(inputs.position),
+        Reactant.to_rarray(inputs.gradient),
+        Reactant.to_rarray(inputs.alpha),
+        Reactant.to_rarray(inputs.history_steps),
+        Reactant.to_rarray(inputs.history_gradient_deltas),
+        Reactant.to_rarray(inputs.parameter_identity),
+        Reactant.to_rarray(inputs.history_identity),
+        Reactant.to_rarray(inputs.elbo_standard_draws),
+        Reactant.to_rarray(inputs.output_standard_draws),
+    )
+    observed = NamedTuple{PATHFINDER_JL_OUTPUTS}(values)
+    expected = run_pathfinder_jl_fixture()
+    for field in (
+            :history_cross,
+            :compact_middle,
+            :covariance,
+            :mean,
+            :elbo_draws,
+            :log_q,
+            :output_draws,
+        )
+        @test Array(getproperty(observed, field)) ≈
+              getproperty(expected, field) rtol=1e-12 atol=1e-12
+    end
+    @test observed.elbo ≈ expected.elbo rtol=1e-12 atol=1e-12
 end
