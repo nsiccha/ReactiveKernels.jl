@@ -378,6 +378,16 @@ function _effect_callable_port(::Val{Mode}, @nospecialize(source),
         source, functional_lowering, initial_effect_state, topology)
 end
 
+"""
+    effect_callable_port(source, Tuple{ArgTypes...}, Result;
+                         written_arguments=(), initial_effect_state=nothing,
+                         functional_lowering)
+
+Declare the exact source callable, positional argument/result contract,
+written argument positions, and auxiliary effect state used by functional
+compiler lowering. The lowering returns `(arguments, result, effect_state)`;
+arbitrary callable fields remain rejected.
+"""
 effect_callable_port(source, argtypes::Type{<:Tuple}, result::Type;
                      kwargs...) =
     _effect_callable_port(Val(:source), source, argtypes, result; kwargs...)
@@ -614,6 +624,14 @@ _kernel_field_registration_noeffect(::_PureCallablePort) = true
 _kernel_field_registration_noeffect(::_EffectCallablePort) = false
 _kernel_field_registration_noeffect(::_StructuredStatePort) = true
 
+"""
+    pure_callable_port(source, Tuple{ArgTypes...}, Result;
+                       functional_lowering=source)
+
+Declare an exact source callable and argument/result contract with no mutation
+effect. `functional_lowering` is immutable compiler metadata and must implement
+the same logical result contract for optional functional backends.
+"""
 function pure_callable_port(@nospecialize(source), ::Type{ArgTypes},
         ::Type{Result}; functional_lowering=source) where {ArgTypes<:Tuple,Result}
     all(isconcretetype, ArgTypes.parameters) || throw(ArgumentError(
