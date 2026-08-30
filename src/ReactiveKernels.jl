@@ -58,5 +58,6 @@ export ReactiveProgram, CompiledReactiveState, ReactiveValue
 export prepare_reactive, prepare_reactive_nonallocating, statevalue, touch!, mutate!, copy_group!
 export ReactiveObject, @reactive
 export reactive_program
+export CompiledStateTransition, compile_state_transition, initial_state
 
 end # module ReactiveKernels

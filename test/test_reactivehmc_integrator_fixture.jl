@@ -16,10 +16,74 @@ include(joinpath(@__DIR__, "..", "benchmark", "receipts",
 
 const RHMC_INTEGRATORS = ReactiveHMCIntegratorFixture
 
+module _IntegratorCompilerEndpoint
+using ReactiveKernels
+
+@kernel endpoint(pos::Vector{Float64}, mom::Vector{Float64}) = begin
+    dham_dpos::Vector{Float64} = 2 .* pos
+    dham_dmom::Vector{Float64} = 3 .* mom
+    ham::Float64 = sum(abs2, pos) + sum(abs2, mom)
+end
+
+end
+
 function _integrator_observables(point, kernels)
     (; pos=point.pos, mom=point.mom, ham=point.ham,
        dham_dpos=kernels.dham_dpos(point.geometry, point.mom),
        dham_dmom=kernels.dham_dmom(point.geometry, point.mom))
+end
+
+@testset "generic functional integrator compiler" begin
+    pos = [0.25, -0.5]
+    mom = [0.4, 0.1]
+    stepsize = 0.06
+    n_fi_steps = 2
+    kernels = (;
+        geometry = p -> (; pos=p),
+        dham_dpos = (geometry, _) -> 2 .* geometry.pos,
+        dham_dmom = (_, p) -> 3 .* p,
+        hamiltonian = (geometry, p) ->
+            sum(abs2, geometry.pos) + sum(abs2, p),
+    )
+
+    for (source, oracle) in (
+            RHMC_INTEGRATORS.generalized_leapfrog! =>
+                ReactiveHMCExamples.generalized_leapfrog!,
+            RHMC_INTEGRATORS.implicit_midpoint! =>
+                ReactiveHMCExamples.implicit_midpoint!,
+        )
+        transition = compile_state_transition(
+            _IntegratorCompilerEndpoint.endpoint,
+            partial(source; stepsize, n_fi_steps),
+            (pos, mom),
+        )
+        state = initial_state(transition)
+        independent = initial_state(transition)
+        @test propertynames(state) ==
+              (:pos, :mom, :dham_dpos, :dham_dmom, :ham)
+        @test state.pos !== independent.pos
+        @test state.mom !== independent.mom
+        actual = transition(state)
+        expected = oracle(
+            copy(pos), copy(mom), kernels; stepsize, n_fi_steps)
+        @test actual.pos ≈ expected.pos atol=2e-15 rtol=2e-13
+        @test actual.mom ≈ expected.mom atol=2e-15 rtol=2e-13
+        @test actual.ham ≈ expected.ham atol=2e-15 rtol=2e-13
+        @test pos == [0.25, -0.5]
+        @test mom == [0.4, 0.1]
+    end
+
+    @test_throws ReactiveKernels._KernelFactoryReject compile_state_transition(
+        _IntegratorCompilerEndpoint.endpoint,
+        RHMC_INTEGRATORS.generalized_leapfrog!,
+        (pos, mom),
+    )
+    @test_throws ReactiveKernels._LLowerReject compile_state_transition(
+        _IntegratorCompilerEndpoint.endpoint,
+        partial(RHMC_INTEGRATORS.generalized_leapfrog!;
+                stepsize, n_fi_steps=1025),
+        (pos, mom),
+    )
 end
 
 @testset "ReactiveHMC integrator source and independent receipt" begin

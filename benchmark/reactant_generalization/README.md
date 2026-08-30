@@ -38,6 +38,18 @@ uniformly even when acyclic, and keeps truly acyclic siblings inlined. The
 native dispatcher and the Reactant backend can therefore share one topology
 authority.
 
+The next admitted executable slice is the public, backend-neutral
+`compile_state_transition` seam. It combines an endpoint `KernelSpec` with a
+bound free update method, lowers exact `map(copy, tuple)` and tuple/named
+destructuring, statically unrolls captured integer `Base.Colon` loops, and
+threads selected-recipe currentness through every iteration. The same compiler
+path executes generalized leapfrog and implicit midpoint over all six
+Gaussian/relativistic Euclidean, Riemannian, and diagonal-SoftAbs endpoint
+specs. Compiler code contains no integrator, geometry, field-name, or program-
+counter cases. Indexed writes and data-dependent structured control remain the
+next admission boundary; the specialized adaptive-NUTS emitter is not yet
+removed.
+
 ## Acceptance rules for every increment
 
 1. Add a kernel whose semantics cannot be satisfied by the previously admitted
