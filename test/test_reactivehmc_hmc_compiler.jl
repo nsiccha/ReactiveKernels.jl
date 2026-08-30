@@ -312,6 +312,52 @@ end
     straight_result = straight_transition(straight_state, [3.0])
     @test straight_result.a === straight_result.b
     @test straight_result.a == [3.0]
+    @test typeof(straight_transition).parameters[4] === true
+    guarded_straight = ReactiveKernels.validated_compiled_transition(
+        straight_transition, straight_transition)
+    guarded_straight_result = guarded_straight(straight_state, [3.0])
+    @test guarded_straight_result.a === guarded_straight_result.b
+    @test guarded_straight_result.a == [3.0]
+
+    result_kernel = ReactiveKernels.compile_stateful(
+        _SFC.straight_result_contract, 2.0, 3)
+    result_native = result_kernel(2.0, 3)
+    result_state = ReactiveKernels.stateful_snapshot(result_native)
+    @test ReactiveKernels.stateful_call(
+        result_native, Val(:named_result), 2.0) ==
+        (value=4.0, count=3)
+    @test ReactiveKernels.stateful_call(
+        result_native, Val(:nothing_result), true) === nothing
+    @test_throws ReactiveKernels._LLowerReject begin
+        ReactiveKernels.functionalize_stateful(
+            result_kernel, Val(:named_result))
+    end
+    named_result = ReactiveKernels.functionalize_stateful(
+        result_kernel, Val(:named_result);
+        argument_types=Tuple{Float64})
+    @test typeof(named_result).parameters[4] === false
+    @test typeof(named_result).parameters[7] ===
+          NamedTuple{(:value,:count),Tuple{Float64,Int}}
+    @test named_result(result_state, 2.0) == (value=4.0, count=3)
+    guarded_named = ReactiveKernels.validated_compiled_transition(
+        named_result, named_result)
+    @test guarded_named(result_state, 2.0) == (value=4.0, count=3)
+    wrong_named = ReactiveKernels.validated_compiled_transition(
+        (state, scale) -> (value=4.0, count=3.0), named_result)
+    @test_throws ArgumentError wrong_named(result_state, 2.0)
+
+    nothing_result = ReactiveKernels.functionalize_stateful(
+        result_kernel, Val(:nothing_result);
+        argument_types=Tuple{Bool})
+    @test typeof(nothing_result).parameters[4] === false
+    @test typeof(nothing_result).parameters[7] === Nothing
+    @test nothing_result(result_state, true) === nothing
+    guarded_nothing = ReactiveKernels.validated_compiled_transition(
+        nothing_result, nothing_result)
+    @test guarded_nothing(result_state, false) === nothing
+    wrong_nothing = ReactiveKernels.validated_compiled_transition(
+        (state, take) -> result_state, nothing_result)
+    @test_throws ArgumentError wrong_nothing(result_state, true)
 
     independent_kernel = ReactiveKernels.compile_stateful(
         _SFC.independent_arrays_machine, [1.0], [2.0], 0)

@@ -200,13 +200,14 @@ end
             end
 
             p_sq = ReactiveKernels._functionalize_stateful(
-                kernel, Val(:p_sq))
+                kernel, Val(:p_sq); argument_types=Tuple{Float64})
             traced_x = Reactant.to_rarray(case["x_sq"][3]; track_numbers=true)
             compiled_p_sq = @compile p_sq(traced_state, traced_x)
             @test compiled_p_sq(traced_state, traced_x) ≈ case["p_sq"][3]
 
             quantile = ReactiveKernels._functionalize_stateful(
-                kernel, Val(:quantile_sq))
+                kernel, Val(:quantile_sq);
+                argument_types=Tuple{Float64})
             traced_q = Reactant.to_rarray(case["q"][2]; track_numbers=true)
             compiled_quantile = @compile quantile(traced_state, traced_q)
             for (q, expected) in zip(case["q"], case["quantile_sq"])

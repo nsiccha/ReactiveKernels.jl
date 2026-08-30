@@ -521,10 +521,43 @@ end
         [9.0, 9.0]
     @test Int(authored_nested_result.state.count) == 1
 
+    result_kernel = ReactiveKernels.compile_stateful(
+        _RHMC_FUNCTIONAL_REACTANT.straight_result_contract, 2.0, 3)
+    result_state_host = ReactiveKernels.stateful_snapshot(
+        result_kernel(2.0, 3))
+    result_state = _rhmc_hmc_trace(result_state_host)
+    result_scale = _rhmc_hmc_traced_number(2.0)
+    named_result = ReactiveKernels.functionalize_stateful(
+        result_kernel, Val(:named_result);
+        argument_types=Tuple{Float64})
+    @test typeof(named_result).parameters[4] === false
+    compiled_named = @compile named_result(result_state, result_scale)
+    raw_named = compiled_named(result_state, result_scale)
+    @test propertynames(raw_named) == (:value, :count)
+    @test Float64(raw_named.value) == 4.0
+    @test Int(raw_named.count) == 3
+    guarded_named = ReactiveKernels.validated_compiled_transition(
+        compiled_named, named_result)
+    guarded_named_result = guarded_named(result_state, result_scale)
+    @test Float64(guarded_named_result.value) == 4.0
+    @test Int(guarded_named_result.count) == 3
+
+    nothing_result = ReactiveKernels.functionalize_stateful(
+        result_kernel, Val(:nothing_result);
+        argument_types=Tuple{Bool})
+    @test typeof(nothing_result).parameters[4] === false
+    result_take = _rhmc_hmc_traced_number(true)
+    compiled_nothing = @compile nothing_result(result_state, result_take)
+    @test compiled_nothing(result_state, result_take) === nothing
+    guarded_nothing = ReactiveKernels.validated_compiled_transition(
+        compiled_nothing, nothing_result)
+    @test guarded_nothing(result_state, result_take) === nothing
+
     straight_kernel = ReactiveKernels.compile_stateful(
         _RHMC_FUNCTIONAL_REACTANT.straight_alias, [0.0])
     straight_transition = ReactiveKernels.functionalize_stateful(
         straight_kernel, Val(:fit!))
+    @test typeof(straight_transition).parameters[4] === true
     straight_state_host = ReactiveKernels.stateful_snapshot(
         straight_kernel([0.0]))
     straight_state = _rhmc_hmc_trace(straight_state_host)

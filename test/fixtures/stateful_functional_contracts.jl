@@ -99,6 +99,19 @@ end
     end
 end
 
+# These two explicit-return methods deliberately share a state whose field
+# names equal the NamedTuple result layout. The functional ABI must use the
+# source-derived return contract, never infer "returns state" from names or
+# runtime result shape.
+@kernel straight_result_contract(value=2.0, count=3) = begin
+    named_result(scale) = begin
+        return (; value=value * scale, count=count)
+    end
+    nothing_result(take) = begin
+        return
+    end
+end
+
 @kernel outer_alias_effect(seed, callback=nothing, count=0) = begin
     a = deepcopy(seed)
     b = a

@@ -107,6 +107,7 @@ struct _DStructuredStateCopy{Destination,Source} <: _SMDomainNode end
 struct _DPortCall{Declared,Result,Args} <: _SMDomainNode end
 struct _DEffectPortCall{Declared,Result,Written,EffectState,Args} <: _SMDomainNode end
 struct _DTuple{Args} <: _SMDomainNode end
+struct _DNamedTuple{Names,Args} <: _SMDomainNode end
 struct _DProject{Parent,Key} <: _SMDomainNode end
 struct _DIndex{Base,Indices} <: _SMDomainNode end
 struct _DIfValue{Cond,Then,Else} <: _SMDomainNode end
@@ -1017,6 +1018,14 @@ function _sm_dtype(::Type{_DTuple{Args}}, argtypes,
     dot && _sm_reject("tuple construction does not admit implicit broadcasting")
     Tuple{(_sm_dtype(A, argtypes, KWT, false) for A in Args.parameters)...}
 end
+function _sm_dtype(::Type{_DNamedTuple{Names,Args}}, argtypes,
+                   ::Type{KWT}, dot::Bool) where {Names,Args,KWT}
+    dot && _sm_reject(
+        "named-tuple construction does not admit implicit broadcasting")
+    values = Tuple{(_sm_dtype(A, argtypes, KWT, false)
+                    for A in Args.parameters)...}
+    NamedTuple{Names,values}
+end
 function _sm_dtype(::Type{_DProject{Parent,Key}}, argtypes,
                    ::Type{KWT}, dot::Bool) where {Parent,Key,KWT}
     T = _sm_dtype(Parent, argtypes, KWT, false)
@@ -1267,6 +1276,10 @@ function _sm_rhs(x, syms, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH},
     elseif x isa _TupleExpr
         Expr(:tuple, (_sm_rhs(a, syms, plan, fields, OW, SH, formals,
                               locals, false, field_regs) for a in x.elts)...)
+    elseif x isa _NamedTuple
+        values = Any[_sm_rhs(a, syms, plan, fields, OW, SH, formals,
+                             locals, false, field_regs) for a in x.vals]
+        :(NamedTuple{$(x.names)}(($(values...),)))
     elseif x isa _Index
         base = _sm_rhs(x.base, syms, plan, fields, OW, SH, formals,
                        locals, false, field_regs)
@@ -1374,6 +1387,10 @@ function _sm_dtree(x, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH},
         children = Tuple{(_sm_dtree(a, plan, fields, OW, SH, finfo, ltrees,
             false, field_regs, methods_by_id, stack) for a in x.elts)...}
         _DTuple{children}
+    elseif x isa _NamedTuple
+        children = Tuple{(_sm_dtree(a, plan, fields, OW, SH, finfo, ltrees,
+            false, field_regs, methods_by_id, stack) for a in x.vals)...}
+        _DNamedTuple{x.names,children}
     elseif x isa _Index
         parent = _sm_dtree(x.base, plan, fields, OW, SH, finfo, ltrees,
             false, field_regs, methods_by_id, stack)
@@ -2633,7 +2650,9 @@ end
 # RuntimeGeneratedFunction contains only source-derived expressions and calls
 # to ordinary PreparedKernels.  Optional compilers treat this wrapper as static
 # program structure and trace only `(state, argument)`.
-struct _FunctionalStatefulTransition{Names,Groups,StateType,F,E,P,C,T}
+struct _FunctionalStatefulTransition{
+        Names,Groups,StateType,ReturnsState,ArgumentTypes,ReturnSpec,ReturnType,
+        F,E,P,C,T}
     f::F
     ensures::E
     ports::P
@@ -3284,8 +3303,26 @@ function _sm_validate_compiled_arguments_input(
     arguments
 end
 
-_sm_validate_compiled_arguments_input(
-    ::_FunctionalStatefulTransition, arguments::Tuple) = arguments
+function _sm_validate_compiled_arguments_input(
+        transition::_FunctionalStatefulTransition{
+            Names,Groups,StateType,true}, arguments::Tuple) where
+        {Names,Groups,StateType}
+    length(arguments) == 1 || throw(MethodError(transition, arguments))
+    arguments
+end
+
+function _sm_validate_compiled_arguments_input(
+        transition::_FunctionalStatefulTransition{
+            Names,Groups,StateType,false,ArgumentTypes},
+        arguments::Tuple) where
+        {Names,Groups,StateType,ArgumentTypes}
+    length(arguments) == 1 || throw(MethodError(transition, arguments))
+    _sm_functional_argument_type_ok(
+        typeof(arguments), ArgumentTypes) || throw(ArgumentError(
+            "functional straight-line result arguments do not match their " *
+            "logical contract"))
+    arguments
+end
 
 function _sm_validate_compiled_effects_input(
         transition::_FunctionalStateMachineTransition{
@@ -3419,16 +3456,18 @@ end
     result
 end
 
-function (transition::_FunctionalStatefulTransition{Names,Groups,StateType})(
-        state, argument) where {Names,Groups,StateType}
+function (transition::_FunctionalStatefulTransition{
+        Names,Groups,StateType,ReturnsState})(state, argument) where
+        {Names,Groups,StateType,ReturnsState}
     _sm_validate_compiled_state_input(transition, state)
-    result = RuntimeGeneratedFunctions.generated_callfunc(
+    _sm_validate_compiled_arguments_input(transition, (argument,))
+    raw_result = RuntimeGeneratedFunctions.generated_callfunc(
         getfield(transition, :f), getfield(transition, :ensures),
         getfield(transition, :ports), state, argument)
-    result = _sm_restore_reusable_compiled_output(transition, result)
-    _sm_validate_topology_contract(
-        result, getfield(transition, :topology_contract))
-    result
+    _sm_validate_reusable_compiled_raw_output(
+        transition, raw_result, (argument,))
+    result = _sm_restore_reusable_compiled_output(transition, raw_result)
+    _sm_validate_reusable_compiled_output(transition, result)
 end
 
 function _sm_validate_compiled_state_input(
@@ -3566,16 +3605,20 @@ function _sm_restore_reusable_compiled_output(
 end
 
 function _sm_validate_reusable_compiled_output(
-        transition::_FunctionalStatefulTransition, result)
+        transition::_FunctionalStatefulTransition{
+            Names,Groups,StateType,true}, result) where
+        {Names,Groups,StateType}
     _sm_validate_reusable_compiled_state_input(transition, result)
     result
 end
 
 function _sm_validate_reusable_compiled_raw_output(
-        transition::_FunctionalStatefulTransition{Names}, result,
+        transition::_FunctionalStatefulTransition{
+            Names,Groups,StateType,true}, result,
         live_arguments::Tuple=()) where
-        {Names}
-    propertynames(result) == Names || throw(ArgumentError(
+        {Names,Groups,StateType}
+    result isa NamedTuple && propertynames(result) == Names ||
+        throw(ArgumentError(
         "raw backend stateful state has the wrong layout"))
     _sm_shape_contract_ok(result, getfield(transition, :shape_contract)) ||
         throw(ArgumentError(
@@ -3588,13 +3631,42 @@ function _sm_validate_reusable_compiled_raw_output(
 end
 
 function _sm_restore_reusable_compiled_output(
-        transition::_FunctionalStatefulTransition{Names,Groups},
-        result) where {Names,Groups}
+        transition::_FunctionalStatefulTransition{
+            Names,Groups,StateType,true}, result) where
+        {Names,Groups,StateType}
     canonical = _sm_canonicalize_topology(
         result, getfield(transition, :topology_contract))
     _sm_restore_reusable_state_ports(
         getfield(transition, :ports), canonical, Groups)
 end
+
+function _sm_validate_straight_result(
+        transition::_FunctionalStatefulTransition{
+            Names,Groups,StateType,false,ArgumentTypes,ReturnSpec,ReturnType},
+        result) where
+        {Names,Groups,StateType,ArgumentTypes,ReturnSpec,ReturnType}
+    _sm_functional_argument_type_ok(typeof(result), ReturnType) ||
+        throw(ArgumentError(
+            "functional straight-line result does not match `$ReturnType`"))
+    result
+end
+
+_sm_validate_reusable_compiled_output(
+    transition::_FunctionalStatefulTransition{
+        Names,Groups,StateType,false}, result) where
+        {Names,Groups,StateType} =
+    _sm_validate_straight_result(transition, result)
+
+_sm_validate_reusable_compiled_raw_output(
+    transition::_FunctionalStatefulTransition{
+        Names,Groups,StateType,false}, result,
+    live_arguments::Tuple=()) where {Names,Groups,StateType} =
+    _sm_validate_straight_result(transition, result)
+
+_sm_restore_reusable_compiled_output(
+    ::_FunctionalStatefulTransition{
+        Names,Groups,StateType,false}, result) where
+        {Names,Groups,StateType} = result
 
 _functional_state_names(::_StatefulKernel{S,PF,RT}) where {S,PF,RT} =
     Tuple(entry[1] for entry in RT.parameters[3])
@@ -3638,6 +3710,11 @@ function _sm_functional_rhs(x, syms, plan::_KernelPlan, fields,
         Expr(:tuple, (_sm_functional_rhs(
             arg, syms, plan, fields, OW, SH, formals, locals, false,
             field_regs, methods_by_id, stack, ensure_field) for arg in x.elts)...)
+    elseif x isa _NamedTuple
+        values = Any[_sm_functional_rhs(
+            arg, syms, plan, fields, OW, SH, formals, locals, false,
+            field_regs, methods_by_id, stack, ensure_field) for arg in x.vals]
+        :(NamedTuple{$(x.names)}(($(values...),)))
     elseif x isa _RegisteredCall
         effect = getfield(x.registration, :primitive_effect)
         f = if effect isa _PrimitiveEffect && effect.kind === :rng
@@ -4862,9 +4939,36 @@ function _functional_state_machine_method(
             getfield(kernel, :topology_contract))
 end
 
+function _sm_straight_return_spec(::Type{Forest}) where {Forest}
+    returns = Type[]
+    for node in Forest.parameters
+        node <: _DReturn || continue
+        push!(returns, node.parameters[1])
+    end
+    length(returns) == 1 || _sm_reject(
+        "functional straight-line result requires one source-derived return")
+    only(returns)
+end
+
+function _sm_straight_result_domain(::Type{T}) where {T}
+    T === Nothing && return true
+    _kernel_dom_num_scalar(T) && return true
+    if T <: NamedTuple
+        return all(_sm_straight_result_domain(fieldtype(T, name))
+                   for name in fieldnames(T))
+    elseif T <: Tuple
+        return all(parameter isa Type && _sm_straight_result_domain(parameter)
+                   for parameter in T.parameters)
+    end
+    false
+end
+
 function _functional_stateful_method(
-        kernel::_StatefulKernel{S,PF,RT,OW,SH,B,C,T}, ir::MethodIR) where
-        {S,PF,RT,OW,SH,B,C,T}
+        kernel::_StatefulKernel{S,PF,RT,OW,SH,B,C,T}, ir::MethodIR,
+        ::Val{ReturnsState}, ::Type{ArgumentTypes}, ::Type{ReturnSpec},
+        ::Type{ExplicitReturnType}) where
+        {S,PF,RT,OW,SH,B,C,T,ReturnsState,ArgumentTypes,ReturnSpec,
+         ExplicitReturnType}
     _sm_validate_formals(ir)
     any(formal -> formal.kind !== :pos, ir.formals) && _sm_reject(
         "functional stateful transition currently requires positional-only methods")
@@ -5060,9 +5164,10 @@ function _functional_stateful_method(
     fn = compile(:((ensures, ports, state, argument) ->
         $(Expr(:block, statements...))))
     state_type = _sm_state_snapshot_type(plan, OW, SH)
+    return_type = ReturnsState ? state_type : ExplicitReturnType
     _FunctionalStatefulTransition{
-        names,alias_groups,state_type,typeof(fn),typeof(Tuple(ensures)),
-        typeof(ports),C,T}(
+        names,alias_groups,state_type,ReturnsState,ArgumentTypes,ReturnSpec,
+        return_type,typeof(fn),typeof(Tuple(ensures)),typeof(ports),C,T}(
             fn, Tuple(ensures), ports, getfield(kernel, :shape_contract),
             getfield(kernel, :topology_contract))
 end
@@ -5093,9 +5198,31 @@ function _functionalize_stateful(kernel::_StatefulKernel, ::Val{Name};
         return _functional_state_machine_method(
             kernel, ir, bound, argument_types, declared, forest)
     end
-    max_iterations === nothing && argument_types === nothing || _sm_reject(
-        "machine bounds/contracts are only valid for a structured state-machine method")
-    _functional_stateful_method(kernel, ir)
+    max_iterations === nothing || _sm_reject(
+        "max_iterations is only valid for a structured state-machine method")
+    explicit_return = any(statement -> statement isa _Return, ir.body)
+    if explicit_return
+        argument_types isa Type && argument_types <: Tuple &&
+            length(argument_types.parameters) == 1 || _sm_reject(
+                "functional straight-line result method `$Name` requires one " *
+                "logical Tuple argument_types contract")
+        arms = getfield(runtime_method, :arms)
+        length(arms) == 1 || _sm_reject(
+            "functional straight-line result method `$Name` requires one runtime arm")
+        forest = typeof(only(arms)).parameters[4]
+        return_spec = _sm_straight_return_spec(forest)
+        return_type = _sm_return_dtype(
+            return_spec, Tuple(argument_types.parameters), NamedTuple{})
+        _sm_straight_result_domain(return_type) || _sm_reject(
+            "functional straight-line result method `$Name` returns unsupported " *
+            "logical type `$return_type`")
+        return _functional_stateful_method(
+            kernel, ir, Val(false), argument_types, return_spec, return_type)
+    end
+    argument_types === nothing || _sm_reject(
+        "argument_types is required only for an explicit straight-line result")
+    _functional_stateful_method(
+        kernel, ir, Val(true), Nothing, Nothing, Nothing)
 end
 
 """
@@ -5105,8 +5232,11 @@ end
 
 Compile one captured method of a compiled stateful kernel into a
 backend-neutral functional transition. Structured dynamic control requires an
-explicit finite `max_iterations` and logical `argument_types`; unsupported
-domains fail closed before backend tracing.
+explicit finite `max_iterations` and logical `argument_types`. A straight-line
+method with an explicit source return requires its one-argument logical
+`argument_types` contract so the exact return type can be derived from MethodIR;
+a mutation-only method retains the state-returning ABI. Unsupported domains fail
+closed before backend tracing.
 """
 functionalize_stateful(kernel::_StatefulKernel, method::Val; kwargs...) =
     _functionalize_stateful(kernel, method; kwargs...)
