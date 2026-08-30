@@ -46,7 +46,7 @@ function check_rendered_docs(build_dir, page_tree)
         "distributions.md" => 11,
         "batched.md" => 1,
         "bijectors.md" => 1,
-        "pathfinder.md" => 2,
+        "pathfinder.md" => 3,
         "nuts.md" => 2,
         "nutpie-diagonal.md" => 2,
         "eight-schools.md" => 1,
@@ -86,6 +86,7 @@ function check_rendered_docs(build_dir, page_tree)
         "pathfinder.md" => (
             "Pathfinder Inverse Bfgs Geometry",
             "Pathfinder Local Gaussian And Elbo",
+            "Pathfinder Jl Compact History",
         ),
         "walnuts.md" => (
             "WALNUTS-D as mathematical `@kernel` source",
@@ -165,6 +166,7 @@ function check_rendered_docs(build_dir, page_tree)
             for marker in (
                     "Pathfinder Inverse Bfgs Geometry",
                     "Pathfinder Local Gaussian And Elbo",
+                    "Pathfinder Jl Compact History",
                     "Raw input",
                     "Generated kernel",
                     "Compute DAG",
