@@ -478,7 +478,8 @@ module _ProvAdv
     @kernel pcmp(a, b, o) = begin; c!() = begin; o = (b < a < b) ? a : b; end; end
     # a LOCAL formal `oftype` shadows Base.oftype -> NOT the captured Base pure primitive.
     @kernel plocal(v, w) = begin; h!(oftype) = begin; v = oftype(w); end; end
-    # a higher-order helper (`map`, excluded from the pure set) stays OPAQUE over a reactive place.
+    # `map` has only one admitted higher-order domain: exact map(copy, tuple-of-builtin-arrays).
+    # This different `map(w, w)` shape is captured by identity but rejects at specialization.
     @kernel phigher(v, w) = begin; m!() = begin; v = map(w, w); end; end
     # DEFAULT left-to-right: a later kw formal `zero` must NOT suppress capture of the pure `zero` in the
     # earlier `x` default (RK 06:28).
@@ -507,7 +508,11 @@ end
     @test RK._KERNEL_PURE_PRIMS isa Tuple
     @test !(RK._KERNEL_PURE_PRIMS isa Union{Base.IdSet,AbstractDict,AbstractSet})
     @test all(f -> RK._kernel_pure_primitive_value(f), RK._KERNEL_PURE_PRIMS)   # === scan, no membership struct
-    @test RK._kernel_pure_primitive_value(Base.oftype) && !RK._kernel_pure_primitive_value(map)
+    @test RK._kernel_pure_primitive_value(Base.oftype) && RK._kernel_pure_primitive_value(map)
+    @test RK._kernel_pure_callee_domain_ok(
+        map, (typeof(copy), Tuple{Vector{Float64},Vector{Float64}}))
+    @test !RK._kernel_pure_callee_domain_ok(map, (typeof(identity), Tuple{Vector{Float64}}))
+    @test !RK._kernel_pure_callee_domain_ok(map, (typeof(copy), Vector{Float64}))
 end
 
 @testset "provenance — Julia AST reality for operator forms (RK 06:07)" begin
@@ -556,14 +561,17 @@ end
     @test any(e -> e isa RK._AGuard && any(g -> g isa RK._ACall, e.body), ev)   # op2 guarded
 end
 
-@testset "provenance — eachcol borrows(1) descriptor; higher-order + local shadow stay non-pure (RK 06:09/06:10)" begin
+@testset "provenance — eachcol borrows(1); higher-order map is exact-domain only (RK 06:09/06:10)" begin
     wm = _mirs(_WV, :step!)[2]                                   # matrix Welford step! iterates eachcol(x)
     @test any(e -> e isa Tuple && e[1] === :registered && e[3] === Symbol("__rk_borrows_Base_eachcol__"),
               RK.call_edges(wm))
-    # higher-order `map` is OPAQUE (excluded from the pure set)
+    # The Base.map identity is captured, but an arbitrary callable/second operand
+    # does not become a sanctioned higher-order application.
     m = _mir(_ProvAdv.phigher, :m!)
-    @test _body_find(n -> n isa RK._OpCall && n.hint === :opaque, m)
-    @test !_body_find(n -> n isa RK._RegisteredCall && n.registration.kind === :pure_primitive, m)
+    @test _body_find(n -> n isa RK._RegisteredCall &&
+                          n.registration.source === Base.map, m)
+    @test !_body_find(n -> n isa RK._CallableRef &&
+                           n.registration.source === Base.copy, m)
     # a LOCAL formal `oftype` never resolves to the Base pure primitive
     h = _mir(_ProvAdv.plocal, :h!)
     @test !_body_find(n -> n isa RK._RegisteredCall && n.registration.source === Base.oftype, h)

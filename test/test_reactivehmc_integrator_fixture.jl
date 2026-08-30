@@ -35,6 +35,26 @@ end
         RHMC_INTEGRATORS.implicit_midpoint!) ==
         (:phasepoint, :stepsize, :n_fi_steps)
 
+    generalized_ir = only(ReactiveKernels.method_irs(
+        RHMC_INTEGRATORS.generalized_leapfrog!))
+    copied = generalized_ir.body[1]
+    @test copied isa ReactiveKernels._LocalAssign
+    @test copied.lhs == (:pos0, :mom0) && copied.style === :tuple
+    @test copied.rhs isa ReactiveKernels._RegisteredCall
+    @test copied.rhs.registration.source === Base.map
+    @test copied.rhs.args[1] isa ReactiveKernels._CallableRef
+    @test copied.rhs.args[1].registration.source === Base.copy
+    @test copied.rhs.args[2] isa ReactiveKernels._TupleExpr
+
+    midpoint_ir = only(ReactiveKernels.method_irs(
+        RHMC_INTEGRATORS.implicit_midpoint!))
+    midpoint_loop = only(statement for statement in midpoint_ir.body
+                         if statement isa ReactiveKernels._For)
+    named = midpoint_loop.body[1]
+    @test named isa ReactiveKernels._LocalAssign
+    @test named.lhs == (:dham_dmom, :dham_dpos)
+    @test named.style === :named && named.rhs isa ReactiveKernels._SelfRef
+
     source_path = joinpath(@__DIR__, "..", "benchmark",
                            "reactivehmc_integrator_kernel_fixture.jl")
     source = read(source_path, String)

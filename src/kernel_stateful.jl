@@ -878,6 +878,7 @@ _kernel_primitive_effect(@nospecialize(v)) =
 const _KERNEL_PURE_PRIMS = (Base.:+, Base.:-, Base.:*, Base.:/, Base.:\, Base.:^, Base.:%,
           Base.:(==), Base.:(!=), Base.:<, Base.:>, Base.:<=, Base.:>=, Base.:!, Base.:&, Base.:|, Base.xor,
           Base.zero, Base.one, Base.oftype, Base.isnothing, Base.length, Base.:(:),
+          Base.copy, Base.map,
           Base.exp, Base.log, Base.sqrt,          # unary Real-domain transcendentals (pure, effect-free)
           LogExpFunctions.logaddexp)
 # EXACT-IDENTITY VALUE test (`===` scan over the immutable tuple) — used at capture (definition-time
@@ -937,6 +938,15 @@ _kernel_dom_isnothing(::Type{T}) where {T} =
 # PER-CALLEE dispatch on the captured exact identity (`reg.source`).
 function _kernel_pure_callee_domain_ok(@nospecialize(f), argtypes)
     isempty(argtypes) && return false
+    f === Base.copy && return length(argtypes) == 1 && _kernel_dom_num_array(argtypes[1])
+    if f === Base.map
+        length(argtypes) == 2 || return false
+        argtypes[1] === typeof(Base.copy) || return false
+        T = argtypes[2]
+        T <: Tuple || return false
+        return !isempty(T.parameters) &&
+            all(t -> t isa Type && _kernel_dom_num_array(t), T.parameters)
+    end
     f === Base.length   && return length(argtypes) == 1 && _kernel_dom_container(argtypes[1])
     f === Base.isnothing && return length(argtypes) == 1 && _kernel_dom_isnothing(argtypes[1])
     f === Base.:(:)     && return all(_kernel_dom_int_scalar, argtypes)            # Colon: integer numeric
@@ -1347,6 +1357,24 @@ function _kernel_body_callee_refs(body, exclusions)
             elseif c isa Expr && c.head === :(.) && length(c.args) == 2 &&
                    c.args[1] isa Symbol && c.args[2] isa QuoteNode
                 add!((c.args[1], c.args[2].value))
+            end
+            # The nonseparable integrators use the ordinary Julia ownership-copy
+            # idiom `map(copy, tuple)`. Capture the callable VALUE as well as the
+            # call head so MethodIR can carry both definition-time identities.
+            # This is not spelling authority: specialization later requires exact
+            # Base.map/Base.copy identities and a tuple of builtin numeric arrays.
+            map_head = c === :map || (c isa Expr && c.head === :(.) &&
+                length(c.args) == 2 && c.args[1] === :Base &&
+                c.args[2] isa QuoteNode && c.args[2].value === :map)
+            if map_head && length(x.args) >= 2
+                callable = x.args[2]
+                if callable isa Symbol
+                    add!(callable in exclusions ? nothing : callable)
+                elseif callable isa Expr && callable.head === :(.) &&
+                       length(callable.args) == 2 && callable.args[1] isa Symbol &&
+                       callable.args[2] isa QuoteNode
+                    add!((callable.args[1], callable.args[2].value))
+                end
             end
         elseif x.head === :comparison                      # CHAINED `a < b <= c` (RK 06:08): the operators
             for i in 2:2:length(x.args)                    #   are bare Symbols at even positions — capture

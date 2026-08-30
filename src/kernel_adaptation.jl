@@ -84,6 +84,8 @@ struct _DKw{Name,Default} <: _SMDomainNode end
 struct _DLit{T} <: _SMDomainNode end
 struct _DCall{Source,Dot,Args} <: _SMDomainNode end
 struct _DPortCall{Declared,Result,Args} <: _SMDomainNode end
+struct _DTuple{Args} <: _SMDomainNode end
+struct _DProject{Parent,Key} <: _SMDomainNode end
 struct _DWrite{Target,Dot,Rhs} <: _SMDomainNode end
 struct _DValue{Rhs} <: _SMDomainNode end
 struct _DReturn{Rhs} <: _SMDomainNode end
@@ -163,6 +165,14 @@ function _sm_exact_callee(x::_RegisteredCall)
     _exec_captured_callee(x) # exact captured GlobalRef identity + rebind check
 end
 
+function _sm_exact_callable(x::_CallableRef)
+    getfield(x.registration, :kind) === :pure_primitive || _sm_reject(
+        "callable value `$(x.ref.slot)` is not a captured pure Base primitive")
+    kernel_rebound(x.registration, _kernel_resolve_captured_ref(x.ref)) &&
+        _sm_reject("captured callable value `$(x.ref.slot)` was rebound")
+    getfield(x.registration, :source)
+end
+
 _sm_leaf_type(::Type{_DSanctionedColumn{T}}) where {T} = T
 _sm_leaf_type(::Type{T}) where {T} = T <: AbstractArray ? eltype(T) : T
 
@@ -178,7 +188,19 @@ end
 # Exhaustive output rules for the precise primitive set admitted by this emitter.  There is intentionally no
 # fallback and no `promote_op`, return-type inference, method-body inspection, or arbitrary call execution.
 function _sm_primitive_result(@nospecialize(f), argts::Tuple)
-    if f === Base.:+ || f === Base.:*
+    if f === Base.copy
+        length(argts) == 1 && _kernel_dom_num_array(argts[1]) ||
+            _sm_reject("primitive `copy` requires one builtin numeric array")
+        return argts[1]
+    elseif f === Base.map
+        length(argts) == 2 && argts[1] === typeof(Base.copy) ||
+            _sm_reject("primitive `map` is admitted only as map(copy, tuple)")
+        T = argts[2]
+        T <: Tuple && !isempty(T.parameters) &&
+            all(t -> t isa Type && _kernel_dom_num_array(t), T.parameters) ||
+            _sm_reject("primitive `map(copy, ...)` requires a nonempty tuple of builtin numeric arrays")
+        return T
+    elseif f === Base.:+ || f === Base.:*
         length(argts) >= 2 || _sm_reject("primitive `$f` requires at least two operands")
         return _sm_numeric_promote(argts, nameof(f))
     elseif f === Base.:-
@@ -239,6 +261,23 @@ function _sm_dtype(::Type{_DKw{N,D}}, argtypes, ::Type{KWT}, dot::Bool) where {N
     _sm_dtype(D, argtypes, KWT, dot)
 end
 _sm_dtype(::Type{_DLit{T}}, argtypes, ::Type{KWT}, dot::Bool) where {T,KWT} = T
+function _sm_dtype(::Type{_DTuple{Args}}, argtypes,
+                   ::Type{KWT}, dot::Bool) where {Args,KWT}
+    dot && _sm_reject("tuple construction does not admit implicit broadcasting")
+    Tuple{(_sm_dtype(A, argtypes, KWT, false) for A in Args.parameters)...}
+end
+function _sm_dtype(::Type{_DProject{Parent,Key}}, argtypes,
+                   ::Type{KWT}, dot::Bool) where {Parent,Key,KWT}
+    dot && _sm_reject("destructured projection does not admit implicit broadcasting")
+    T = _sm_dtype(Parent, argtypes, KWT, false)
+    (T <: Tuple || T <: NamedTuple) || _sm_reject(
+        "destructuring requires a concrete tuple or named tuple, got `$T`")
+    try
+        fieldtype(T, Key)
+    catch
+        _sm_reject("destructuring projection `$Key` is absent from `$T`")
+    end
+end
 function _sm_dtype(::Type{_DCall{S,D,A}}, argtypes, ::Type{KWT}, dot::Bool) where {S,D,A,KWT}
     ats = ntuple(i -> _sm_dtype(A.parameters[i], argtypes, KWT, D), length(A.parameters))
     f = S.instance
@@ -313,6 +352,11 @@ function _sm_rhs(x, syms, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH},
         syms[(:local, x.name)]
     elseif x isa _Lit
         x.value
+    elseif x isa _CallableRef
+        _sm_exact_callable(x)
+    elseif x isa _TupleExpr
+        Expr(:tuple, (_sm_rhs(a, syms, plan, fields, OW, SH, formals,
+                              locals, false, field_regs) for a in x.elts)...)
     elseif x isa _RegisteredCall
         f = _sm_exact_callee(x)
         args = Any[_sm_rhs(a, syms, plan, fields, OW, SH, formals,
@@ -369,6 +413,12 @@ function _sm_dtree(x, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH},
         ltrees[x.name]
     elseif x isa _Lit
         _DLit{typeof(x.value)}
+    elseif x isa _CallableRef
+        _DLit{typeof(_sm_exact_callable(x))}
+    elseif x isa _TupleExpr
+        children = Tuple{(_sm_dtree(a, plan, fields, OW, SH, finfo, ltrees,
+            false, field_regs, methods_by_id, stack) for a in x.elts)...}
+        _DTuple{children}
     elseif x isa _RegisteredCall
         f = _sm_exact_callee(x)
         children = Tuple{(_sm_dtree(a, plan, fields, OW, SH, finfo, ltrees,
@@ -391,6 +441,85 @@ function _sm_dtree(x, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH},
     else
         _sm_reject("unsupported domain-forest node `$(typeof(x))`")
     end
+end
+
+function _sm_local_trees(statement::_LocalAssign, rhs_tree,
+        plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH}) where {OW,SH}
+    names = statement.lhs
+    if statement.style === :single
+        length(names) == 1 || _sm_reject("single local assignment must bind one name")
+        return (rhs_tree,)
+    elseif statement.style === :tuple
+        return Tuple(_DProject{rhs_tree,index} for index in eachindex(names))
+    elseif statement.style === :named
+        statement.rhs isa _SelfRef || _sm_reject(
+            "named destructuring is currently admitted only from the state receiver")
+        return Tuple(begin
+            canon = get(fields, name, 0)
+            canon == 0 && _sm_reject(
+                "named destructuring reads unknown state field `$name`")
+            _DSlot{_pp_fieldtype(plan, canon, OW, SH)}
+        end for name in names)
+    end
+    _sm_reject("unknown local-assignment style `$(statement.style)`")
+end
+
+function _sm_tuple_source(x::_TupleExpr)
+    x.elts
+end
+function _sm_tuple_source(x::_RegisteredCall)
+    _sm_exact_callee(x) === Base.map || _sm_reject(
+        "tuple destructuring call must be the captured Base.map")
+    length(x.args) == 2 || _sm_reject(
+        "tuple destructuring map must have exactly two arguments")
+    x.args[1] isa _CallableRef && _sm_exact_callable(x.args[1]) === Base.copy ||
+        _sm_reject("tuple destructuring map is admitted only with captured Base.copy")
+    x.args[2] isa _TupleExpr || _sm_reject(
+        "tuple destructuring map(copy, ...) requires a literal tuple source")
+    x.args[2].elts
+end
+_sm_tuple_source(x) = _sm_reject(
+    "tuple destructuring requires a tuple expression or exact map(copy, tuple), got `$(typeof(x))`")
+
+function _sm_local_vector_flags(statement::_LocalAssign, plan::_KernelPlan,
+        fields, ::Type{OW}, ::Type{SH}, formals, locals) where {OW,SH}
+    if statement.style === :single
+        return (_sm_isvector(statement.rhs, plan, fields, OW, SH,
+                             formals, locals),)
+    elseif statement.style === :tuple
+        sources = _sm_tuple_source(statement.rhs)
+        length(sources) == length(statement.lhs) || _sm_reject(
+            "tuple destructuring arity $(length(statement.lhs)) does not match " *
+            "source arity $(length(sources))")
+        return Tuple(_sm_isvector(source, plan, fields, OW, SH,
+                                  formals, locals) for source in sources)
+    elseif statement.style === :named
+        statement.rhs isa _SelfRef || _sm_reject(
+            "named destructuring is currently admitted only from the state receiver")
+        return Tuple(begin
+            canon = get(fields, name, 0)
+            canon == 0 && _sm_reject(
+                "named destructuring reads unknown state field `$name`")
+            _pp_fieldtype(plan, canon, OW, SH) <: AbstractArray
+        end for name in statement.lhs)
+    end
+    _sm_reject("unknown local-assignment style `$(statement.style)`")
+end
+
+function _sm_local_reads(statement::_LocalAssign, fields)
+    if statement.style === :named
+        statement.rhs isa _SelfRef || _sm_reject(
+            "named destructuring is currently admitted only from the state receiver")
+        canons = Int[]
+        for name in statement.lhs
+            canon = get(fields, name, 0)
+            canon == 0 && _sm_reject(
+                "named destructuring reads unknown state field `$name`")
+            push!(canons, canon)
+        end
+        return canons
+    end
+    _exec_reads(statement.rhs, fields)
 end
 
 function _sm_sibling_result_tree(call::_CallExpr, plan::_KernelPlan, fields,
@@ -448,11 +577,13 @@ function _sm_sibling_result_tree(call::_CallExpr, plan::_KernelPlan, fields,
     nested_stack = [stack..., method_id]
     for (statement_index, statement) in enumerate(ir.body)
         if statement isa _LocalAssign
-            length(statement.lhs) == 1 || _sm_reject(
-                "value-position sibling local assignment must bind one name")
-            locals[only(statement.lhs)] = _sm_dtree(statement.rhs, plan,
-                fields, OW, SH, formals, locals, false, field_regs,
-                methods_by_id, nested_stack)
+            rhs_tree = statement.style === :named ? _DLit{Nothing} :
+                _sm_dtree(statement.rhs, plan, fields, OW, SH, formals,
+                    locals, false, field_regs, methods_by_id, nested_stack)
+            trees = _sm_local_trees(statement, rhs_tree, plan, fields, OW, SH)
+            for (name, tree) in zip(statement.lhs, trees)
+                locals[name] = tree
+            end
         elseif statement isa _Return
             statement_index == length(ir.body) || _sm_reject(
                 "value-position sibling return must terminate the method")
@@ -487,11 +618,15 @@ function _sm_domain_forest(ir::MethodIR, plan::_KernelPlan, fields,
     end
     for (statement_index, st) in enumerate(ir.body)
         if st isa _LocalAssign
-            length(st.lhs) == 1 || _sm_reject("stateful local assignment must bind exactly one name")
-            t = _sm_dtree(st.rhs, plan, fields, OW, SH, finfo, ltrees,
-                false, field_regs, methods_by_id, MethodId[ir.id]) # old environment
-            ltrees[st.lhs[1]] = t
-            push!(nodes, _DValue{t})
+            rhs_tree = st.style === :named ? _DLit{Nothing} :
+                _sm_dtree(st.rhs, plan, fields, OW, SH, finfo, ltrees,
+                    false, field_regs, methods_by_id,
+                    MethodId[ir.id]) # old environment
+            trees = _sm_local_trees(st, rhs_tree, plan, fields, OW, SH)
+            for (name, tree) in zip(st.lhs, trees)
+                ltrees[name] = tree
+                push!(nodes, _DValue{tree})
+            end
         elseif st isa _PlaceWrite
             st.target isa _SelfField || _sm_reject("stateful write target must be a direct self field")
             c = get(fields, st.target.path[end], 0); c == 0 && _sm_reject("stateful write has no canonical slot")
@@ -625,16 +760,32 @@ function compile_stateful_method(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, i
     returned = false
     for (statement_index, st) in enumerate(ir.body)
         if st isa _LocalAssign
-            length(st.lhs) == 1 || _sm_reject("stateful local assignment must bind exactly one name")
-            for c in _exec_reads(st.rhs, fields)
+            for c in _sm_local_reads(st, fields)
                 uc, _ = _exec_ensure!(stmts, c, current, stale, plan, producer, hidx, OW, SH); ngrad += uc
             end
-            rhs = _sm_rhs(st.rhs, syms, plan, fields, OW, SH, formals,
-                          locals, false, field_regs) # old env first
-            isvec = _sm_isvector(st.rhs, plan, fields, OW, SH, formals, locals)
-            localid += 1; s = Symbol("__sm_l_", st.lhs[1], "_", localid)
-            syms[(:local, st.lhs[1])] = s; locals[st.lhs[1]] = isvec
-            push!(stmts, :(local $s = $rhs))
+            flags = _sm_local_vector_flags(st, plan, fields, OW, SH,
+                                           formals, locals)
+            values = if st.style === :named
+                Any[_pp_read(plan, fields[name]) for name in st.lhs]
+            else
+                rhs = _sm_rhs(st.rhs, syms, plan, fields, OW, SH,
+                              formals, locals, false, field_regs) # old env first
+                if st.style === :single
+                    Any[rhs]
+                else
+                    localid += 1
+                    temp = Symbol("__sm_tuple_", localid)
+                    push!(stmts, :(local $temp = $rhs))
+                    Any[:(getfield($temp, $index)) for index in eachindex(st.lhs)]
+                end
+            end
+            for (name, value, isvec) in zip(st.lhs, values, flags)
+                localid += 1
+                symbol = Symbol("__sm_l_", name, "_", localid)
+                syms[(:local, name)] = symbol
+                locals[name] = isvec
+                push!(stmts, :(local $symbol = $value))
+            end
         elseif st isa _PlaceWrite
             for c in _exec_reads(st.rhs, fields)
                 uc, _ = _exec_ensure!(stmts, c, current, stale, plan, producer, hidx, OW, SH); ngrad += uc
@@ -914,6 +1065,12 @@ function _sm_functional_rhs(x, syms, plan::_KernelPlan, fields,
         syms[(:local, x.name)]
     elseif x isa _Lit
         x.value
+    elseif x isa _CallableRef
+        _sm_exact_callable(x)
+    elseif x isa _TupleExpr
+        Expr(:tuple, (_sm_functional_rhs(
+            arg, syms, plan, fields, OW, SH, formals, locals, false,
+            field_regs, methods_by_id, stack, ensure_field) for arg in x.elts)...)
     elseif x isa _RegisteredCall
         f = _sm_exact_callee(x)
         args = Any[_sm_functional_rhs(
@@ -1016,19 +1173,44 @@ function _sm_functional_sibling_rhs(call::_CallExpr, syms, plan::_KernelPlan,
     block = Any[]
     for (statement_index, statement) in enumerate(ir.body)
         if statement isa _LocalAssign
-            length(statement.lhs) == 1 || _sm_reject(
-                "functional sibling local assignment must bind one name")
-            rhs = _sm_functional_rhs(statement.rhs, callee_syms, plan,
-                fields, OW, SH, callee_formals, callee_locals, false,
-                field_regs, methods_by_id, nested_stack, ensure_field)
-            local_index += 1
-            name = only(statement.lhs)
-            symbol = Symbol("__sf_sibling_", method_id.name, "_", name,
-                            "_", local_index)
-            callee_syms[(:local, name)] = symbol
-            callee_locals[name] = _sm_isvector(statement.rhs, plan, fields,
-                OW, SH, callee_formals, callee_locals)
-            push!(block, :(local $symbol = $rhs))
+            if ensure_field !== nothing
+                for canon in _sm_local_reads(statement, fields)
+                    ensure_field(canon)
+                end
+            end
+            flags = _sm_local_vector_flags(statement, plan, fields, OW, SH,
+                callee_formals, callee_locals)
+            values = if statement.style === :named
+                named_values = Any[]
+                for name in statement.lhs
+                    haskey(callee_syms, (:field, name)) || _sm_reject(
+                        "functional named destructuring has no state field `$name`")
+                    push!(named_values, callee_syms[(:field, name)])
+                end
+                named_values
+            else
+                rhs = _sm_functional_rhs(statement.rhs, callee_syms, plan,
+                    fields, OW, SH, callee_formals, callee_locals, false,
+                    field_regs, methods_by_id, nested_stack, ensure_field)
+                if statement.style === :single
+                    Any[rhs]
+                else
+                    local_index += 1
+                    temp = Symbol("__sf_sibling_tuple_", method_id.name,
+                                  "_", local_index)
+                    push!(block, :(local $temp = $rhs))
+                    Any[:(getfield($temp, $index))
+                        for index in eachindex(statement.lhs)]
+                end
+            end
+            for (name, value, isvec) in zip(statement.lhs, values, flags)
+                local_index += 1
+                symbol = Symbol("__sf_sibling_", method_id.name, "_", name,
+                                "_", local_index)
+                callee_syms[(:local, name)] = symbol
+                callee_locals[name] = isvec
+                push!(block, :(local $symbol = $value))
+            end
         elseif statement isa _Return
             statement_index == length(ir.body) || _sm_reject(
                 "functional sibling return must terminate the method")
@@ -1126,21 +1308,40 @@ function _functional_stateful_method(kernel::_StatefulKernel{S,PF,RT,OW,SH,B},
     returned = false
     for (statement_index, statement) in enumerate(ir.body)
         if statement isa _LocalAssign
-            length(statement.lhs) == 1 || _sm_reject(
-                "functional stateful local assignment must bind one name")
-            for canon in _exec_reads(statement.rhs, fields)
+            for canon in _sm_local_reads(statement, fields)
                 ensure!(canon)
             end
-            rhs = _sm_functional_rhs(statement.rhs, syms, plan, fields,
-                OW, SH, formals, locals, false, field_regs, methods_by_id,
-                MethodId[ir.id], ensure!)
-            local_index += 1
-            name = statement.lhs[1]
-            symbol = Symbol("__sf_local_", name, "_", local_index)
-            syms[(:local, name)] = symbol
-            locals[name] = _sm_isvector(statement.rhs, plan, fields,
-                                        OW, SH, formals, locals)
-            push!(statements, :(local $symbol = $rhs))
+            flags = _sm_local_vector_flags(statement, plan, fields, OW, SH,
+                                           formals, locals)
+            values = if statement.style === :named
+                named_values = Any[]
+                for name in statement.lhs
+                    haskey(syms, (:field, name)) || _sm_reject(
+                        "functional named destructuring has no state field `$name`")
+                    push!(named_values, syms[(:field, name)])
+                end
+                named_values
+            else
+                rhs = _sm_functional_rhs(statement.rhs, syms, plan, fields,
+                    OW, SH, formals, locals, false, field_regs, methods_by_id,
+                    MethodId[ir.id], ensure!)
+                if statement.style === :single
+                    Any[rhs]
+                else
+                    local_index += 1
+                    temp = Symbol("__sf_tuple_", local_index)
+                    push!(statements, :(local $temp = $rhs))
+                    Any[:(getfield($temp, $index))
+                        for index in eachindex(statement.lhs)]
+                end
+            end
+            for (name, value, isvec) in zip(statement.lhs, values, flags)
+                local_index += 1
+                symbol = Symbol("__sf_local_", name, "_", local_index)
+                syms[(:local, name)] = symbol
+                locals[name] = isvec
+                push!(statements, :(local $symbol = $value))
+            end
         elseif statement isa _PlaceWrite
             (statement.root === :self && statement.target isa _SelfField &&
              statement.owner !== nothing && !isempty(statement.owner)) ||
