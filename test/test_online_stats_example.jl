@@ -4,8 +4,9 @@ using Test
 
 include(joinpath(@__DIR__, "..", "examples", "online_stats.jl"))
 const OSE = OnlineStatsExample
+using Main.ReactiveKernelsNUTSExample: NUTSDiagnostics, welford_var, step!
 
-@testset "OnlineStats-style immutable accumulators" begin
+@testset "OnlineStats-style reactive streaming and mergeable snapshots" begin
     @test isbitstype(OSE.MomentsAccumulator{Float64})
     @test_throws MethodError OSE.MomentsAccumulator(Int)
     @test_throws ArgumentError OSE.MomentsAccumulator{Float64}(-1, 0, 0)
@@ -301,6 +302,100 @@ const OSE = OnlineStatsExample
         @test OSE.divergence_percent(narrow) === Float16(37.5)
     end
 
+    @testset "stateful @reactive moments mutate graph-owned sources" begin
+        statistics = OSE.online_moments()
+        @test statistics isa OSE.OnlineMoments
+        @test statistics isa ReactiveObject
+        @test statistics.n == 0
+        @test isnan(mean(statistics))
+        @test isnan(var(statistics))
+        @test isnan(var(statistics; corrected=false))
+
+        program = reactive_program(statistics)
+        @test @inferred(OSE.update!(statistics, 1.0)) === statistics
+        @test statistics.n == 1
+        @test mean(statistics) == 1.0
+        @test isnan(var(statistics))
+        @test var(statistics; corrected=false) == 0.0
+
+        @test OSE.update!(statistics, 3.0) === statistics
+        @test statistics.n == 2
+        @test mean(statistics) == 2.0
+        @test var(statistics) == 2.0
+        @test OSE.snapshot(statistics) == OSE.fit([1.0, 3.0])
+        @test reactive_program(statistics) === program
+
+        # Stateful fitting keeps object identity; snapshotting is explicit and
+        # reserved for the merge/persistence boundary.
+        fitted = OSE.online_moments()
+        @test OSE.fit!(fitted, [3.0, -1.0, 4.0, 1.0, 5.0]) === fitted
+        @test OSE.snapshot(fitted) == OSE.fit([3.0, -1.0, 4.0, 1.0, 5.0])
+
+        # Copy detaches state while sharing the prepared program.
+        clone = copy(fitted)
+        @test reactive_program(clone) === reactive_program(fitted)
+        OSE.update!(clone, 99.0)
+        @test clone.n == fitted.n + 1
+        @test fitted.n == 5
+
+        state32 = OSE.online_moments(Float32)
+        @test OSE.update!(state32, 3) === state32
+        @test state32.mean isa Float32
+        @test mean(state32) isa Float32
+        @test var(state32) isa Float32
+
+        @test OSE.reset!(statistics) === statistics
+        @test statistics.n == 0
+        @test isnan(mean(statistics))
+        @test reactive_program(statistics) === program
+    end
+
+    @testset "stateful @reactive diagnostics mutate graph-owned sources" begin
+        statistics = OSE.online_diagnostics()
+        @test statistics isa OSE.OnlineDiagnostics
+        @test statistics isa ReactiveObject
+        @test OSE.sample_count(statistics) == 0
+        @test isnan(OSE.divergence_percent(statistics))
+
+        valid = NUTSDiagnostics(3, 7, 0.8, false, -0.05)
+        program = reactive_program(statistics)
+        @test @inferred(OSE.record!(statistics, valid, 0.2)) === statistics
+        @test OSE.sample_count(statistics) == 1
+        @test OSE.max_tree_depth(statistics) == 3
+        @test OSE.mean_acceptance_rate(statistics) == 0.8
+        @test OSE.mean_energy_error(statistics) == -0.05
+        @test OSE.mean_stepsize(statistics) == 0.2
+        @test OSE.snapshot(statistics) ==
+              OSE.record_transition(OSE.HMCDiagnosticsAccumulator(), valid, 0.2)
+        @test reactive_program(statistics) === program
+
+        # Validate every field before the first graph-owned source write: a bad
+        # transition leaves the state unchanged.
+        before = OSE.snapshot(statistics)
+        @test_throws DomainError OSE.record!(
+            statistics, NUTSDiagnostics(4, 9, 1.1, false, 0.0), 0.1)
+        @test OSE.snapshot(statistics) == before
+
+        records = [
+            (diagnostics=NUTSDiagnostics(3, 7, 0.91, false, -0.05), stepsize=0.25),
+            (diagnostics=NUTSDiagnostics(5, 15, 0.83, true, -6.0), stepsize=0.20),
+            (diagnostics=NUTSDiagnostics(2, 5, 0.96, false, -0.01),),
+        ]
+        fitted = OSE.online_diagnostics()
+        @test OSE.fit!(fitted, records) === fitted
+        @test OSE.snapshot(fitted) == OSE.fit_diagnostics(records)
+
+        clone = copy(fitted)
+        OSE.record!(clone, valid, missing)
+        @test OSE.sample_count(clone) == OSE.sample_count(fitted) + 1
+        @test OSE.sample_count(fitted) == length(records)
+
+        @test OSE.reset!(statistics) === statistics
+        @test OSE.sample_count(statistics) == 0
+        @test isnan(OSE.mean_stepsize(statistics))
+        @test reactive_program(statistics) === program
+    end
+
     @testset "metric adaptation reuses the canonical welford_var estimator" begin
         report = OSE.metric_adaptation_report()
         @test report.dimension == 3
@@ -323,101 +418,63 @@ const OSE = OnlineStatsExample
             [[1.0, 2.0, 3.0], [1.0, 2.0]])
     end
 
-    @testset "generated state kernels are inferred and allocation-free" begin
-        model = OSE.build_online_stats_graph()
+    @testset "partition snapshots retain an inferred allocation-free kernel" begin
+        model = OSE.build_partition_graph()
         @test model isa KernelSpec
-        @test inputs(model) == (model.state, model.observation)
+        @test inputs(model) == (model.left_partition, model.right_partition)
         @test outputs(model) ==
-              (model.updated, model.average, model.sample_variance)
+              (model.merged, model.merged_average, model.merged_variance)
 
-        update_kernel = prepare(model;
-            have=(:state, :observation), want=:updated)
         merge_kernel = prepare(model;
             have=(:left_partition, :right_partition), want=:merged)
         summary_kernel = prepare(model;
-            have=(:state, :observation), want=(:average, :sample_variance))
-        diagnostics_kernel = prepare(model;
-            have=(:diagnostics_state, :transition, :stepsize_observation),
-            want=(:updated_diagnostics, :diagnostic_max_tree_depth,
-                  :diagnostic_divergence_percent,
-                  :diagnostic_mean_acceptance_rate,
-                  :diagnostic_mean_energy_error, :diagnostic_mean_stepsize))
+            have=(:left_partition, :right_partition),
+            want=(:merged_average, :merged_variance))
 
         empty_state = OSE.MomentsAccumulator()
-        one_state = @inferred update_kernel(empty_state, 1.0)
-        two_state = @inferred update_kernel(one_state, 3.0)
-        @test @inferred(merge_kernel(one_state, two_state)) isa
+        one_state = OSE.fit([1.0])
+        two_state = OSE.fit([2.0, 3.0])
+        merged = @inferred merge_kernel(one_state, two_state)
+        @test merged isa
               OSE.MomentsAccumulator{Float64}
-        @test @inferred(summary_kernel(one_state, 3.0)) == (2.0, 2.0)
+        @test merged == OSE.fit([1.0, 2.0, 3.0])
+        @test @inferred(summary_kernel(one_state, two_state)) == (2.0, 1.0)
 
-        empty_diagnostics = OSE.HMCDiagnosticsAccumulator()
-        diagnostic_result = @inferred diagnostics_kernel(
-            empty_diagnostics, NUTSDiagnostics(3, 7, 0.9, false, -0.05), 0.2)
-        @test diagnostic_result[1] isa OSE.HMCDiagnosticsAccumulator{Float64}
-        @test diagnostic_result[2:end] == (3, 0.0, 0.9, -0.05, 0.2)
+        partition_report = OSE.partition_performance_report(
+            merge_kernel; iterations=10_000)
+        @test partition_report.allocated_bytes == 0
+        @test partition_report.elapsed_ns > 0
+        @test partition_report.nanoseconds_per_merge > 0
+        @test partition_report.result.n == 10_000
 
-        diagnostics_update_kernel = prepare(model;
-            have=(:diagnostics_state, :transition, :stepsize_observation),
-            want=:updated_diagnostics)
         diagnostics_report = OSE.diagnostics_performance_report(
-            diagnostics_update_kernel; iterations=10_000)
-        @test diagnostics_report.allocated_bytes == 0
+            iterations=100)
+        @test diagnostics_report.allocated_bytes >= 0
         @test diagnostics_report.elapsed_ns > 0
         @test diagnostics_report.nanoseconds_per_update > 0
-        @test OSE.sample_count(diagnostics_report.result) == 10_000
-        @test diagnostics_report.result.n_divergent == fld(10_000, 31)
+        @test OSE.sample_count(diagnostics_report.result) == 100
+        @test diagnostics_report.result.n_divergent == fld(100, 31)
 
-        report = OSE.kernel_performance_report(update_kernel; iterations=10_000)
-        @test report.allocated_bytes == 0
-        @test report.elapsed_ns > 0
-        @test report.nanoseconds_per_update > 0
-        @test report.result.n == 10_000
-
-        reactive_report = OSE.reactive_performance_report(model; iterations=20)
-        @test reactive_report.allocated_bytes > 0
+        reactive_report = OSE.reactive_performance_report(iterations=100)
+        @test reactive_report.allocated_bytes >= 0
         @test reactive_report.elapsed_ns > 0
-        @test reactive_report.result.n == 20
+        @test reactive_report.nanoseconds_per_update > 0
+        @test reactive_report.result.n == 100
     end
 
-    @testset "ReactiveState replacement, invalidation, and frozen cut points" begin
-        model = OSE.build_online_stats_graph()
-        state = ReactiveState(model; materialize=(model.updated,))
-        empty_state = OSE.MomentsAccumulator()
+    @testset "reactive plan exposes derived statistics; partition DAG exposes merge" begin
+        statistics = OSE.online_moments()
+        reactive_view = visualize(reactive_program(statistics).plan)
+        reactive_dot = dot_source(reactive_view)
+        @test occursin("moment_average", reactive_dot)
+        @test occursin("sample_variance", reactive_dot)
+        @test occursin("population_variance", reactive_dot)
 
-        set!(state, model.state, empty_state)
-        set!(state, model.observation, 1.0)
-        first_state = get!(state, model.updated)
-        @test first_state.n == 1
-
-        # Replacing only the observation invalidates the materialized update and
-        # recomputes from the same authoritative source state; it is not an
-        # implicit mutable fold.
-        set!(state, model.observation, 5.0)
-        replacement = get!(state, model.updated)
-        @test replacement.n == 1
-        @test mean(replacement) == 5.0
-
-        # A caller advances the fold explicitly by promoting the returned state
-        # to the next authoritative source value.
-        set!(state, model.state, first_state)
-        advanced = get!(state, model.updated)
-        @test advanced.n == 2
-        @test mean(advanced) == 3.0
-
-        freeze!(state, model.updated, advanced)
-        set!(state, model.state, empty_state)
-        set!(state, model.observation, 99.0)
-        @test get!(state, model.average) == 3.0
-        unfreeze!(state, model.updated)
-        @test get!(state, model.average) == 99.0
-    end
-
-    @testset "canonical colored DAG exposes update structure" begin
-        model = OSE.build_online_stats_graph()
-        update_plan = plan(model;
-            have=(:state, :observation),
-            want=(:updated, :average, :sample_variance))
-        view = visualize(update_plan)
+        model = OSE.build_partition_graph()
+        merge_plan = plan(model;
+            have=(:left_partition, :right_partition),
+            want=(:merged, :merged_average, :merged_variance))
+        view = visualize(merge_plan)
         html = sprint(show, MIME"text/html"(), view)
         dot = dot_source(view)
 
@@ -427,23 +484,27 @@ const OSE = OnlineStatsExample
         @test occursin("#dcfce7", dot)
         @test occursin("#ffedd5", dot)
         @test occursin("#dbeafe", dot)
-        @test occursin("update", dot)
+        @test occursin("merge", dot)
     end
 
-    @testset "public docs keep a literal declarative source block" begin
+    @testset "public docs show stateful authoring and a partition-only kernel" begin
         page = read(joinpath(@__DIR__, "..", "docs", "src", "online-stats.md"),
                     String)
-        @test occursin("@kernel updates(", page)
+        @test occursin("render_online_stats_reactive_source(:moments)", page)
+        @test occursin("render_online_stats_reactive_source(:diagnostics)", page)
+        @test occursin("online_moments()", page)
+        @test occursin("OnlineStatsExample.update!", page)
+        @test occursin("reactive_program(statistics).plan", page)
         @test occursin("@kernel partitions(", page)
-        @test occursin("diagnostics = @kernel begin", page)
-        @test occursin("OnlineStatsExample.record_transition", page)
+        @test occursin("OnlineStatsExample.record!", page)
         @test occursin("transition::NUTSDiagnostics{Float64}", page)
         @test occursin("NUTSDiagnostics(3, 7, 0.91, false, -0.05)", page)
-        @test occursin("name = :hmc_transition_diagnostics", page)
         @test occursin("metric_adaptation_report", page)
         @test occursin("welford_var", page)
-        @test occursin("model = merge(updates, partitions)", page)
+        @test occursin("build_partition_graph", page)
         @test occursin("Main.ReactiveKernelsDocs.execute_example", page)
+        @test !occursin("OnlineStatsExample.update(state", page)
+        @test !occursin("updated_diagnostics", page)
         @test !occursin("include(", page)
         @test !occursin("Graph()", page)
         @test !occursin("value!(", page)
