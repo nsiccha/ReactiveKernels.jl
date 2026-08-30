@@ -7,8 +7,6 @@ using Test
 import Enzyme
 import Reactant: @compile, @jit
 
-const _EXAMPLE_PACKAGE_DIRECTORY = normpath(joinpath(@__DIR__, "..", "packages"))
-_EXAMPLE_PACKAGE_DIRECTORY in LOAD_PATH || pushfirst!(LOAD_PATH, _EXAMPLE_PACKAGE_DIRECTORY)
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY,
     EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE,

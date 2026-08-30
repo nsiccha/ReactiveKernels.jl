@@ -1,3 +1,21 @@
+using Pkg
+
+const _REPOSITORY_ROOT = normpath(joinpath(@__DIR__, ".."))
+const _ROOT_PROJECT = joinpath(_REPOSITORY_ROOT, "Project.toml")
+const _PPL_TEST_PACKAGE_PATHS = (
+    joinpath(_REPOSITORY_ROOT, "packages", "ReactiveKernelsDistributionKernels"),
+    joinpath(_REPOSITORY_ROOT, "packages", "ReactiveKernelsPPLExamples"),
+)
+
+# `Pkg.test` evaluates this file in a temporary test environment. Julia 1.10
+# ignores the nested projects' `[sources]` entries, so materialize the local
+# packages used by the cross-package HMC acceptance before loading the suite.
+# A direct `julia --project=. test/runtests.jl` keeps using the explicitly
+# prepared `packages/` environment and must not mutate the root Project.toml.
+if !samefile(Base.active_project(), _ROOT_PROJECT)
+    Pkg.develop([PackageSpec(path = path) for path in _PPL_TEST_PACKAGE_PATHS])
+end
+
 using ReactiveKernels
 using Test
 
