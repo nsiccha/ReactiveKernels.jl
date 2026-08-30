@@ -3,6 +3,17 @@ module CompatibilityArtifacts
 
 using ReactiveKernels
 
+if !isdefined(parentmodule(@__MODULE__), :ReactiveObjectsExamples)
+    Base.include(parentmodule(@__MODULE__), joinpath(
+        @__DIR__, "preexisting_reactiveobjects.jl",
+    ))
+end
+if !isdefined(parentmodule(@__MODULE__), :ReactiveHMCExamples)
+    Base.include(parentmodule(@__MODULE__), joinpath(
+        @__DIR__, "preexisting_reactivehmc.jl",
+    ))
+end
+
 using ..ReactiveHMCExamples
 using ..ReactiveObjectsExamples
 
@@ -127,27 +138,47 @@ function reactivehmc_artifacts()
     softabs = softabs_examples()
     metric = euclidean.gaussian.geometry(pos).metric
     relativistic_geometry = riemannian.relativistic.geometry(pos)
+    euclidean_sources = euclidean.gaussian.sources
+    relativistic_euclidean_sources = euclidean.relativistic.sources
+    riemannian_sources = riemannian.gaussian.sources
+    softabs_sources = softabs.gaussian.sources
+    relativistic_softabs_sources = softabs.relativistic.sources
 
     ExampleArtifact[
         _artifact(
             :euclidean_phasepoint,
             REACTIVEHMC_ORIGIN,
             EUCLIDEAN_SOURCE,
-            (; pos, metric, mom),
+            (;
+                pot_f = euclidean_sources.pot_f,
+                grad_f = euclidean_sources.grad_f,
+                pos, mom, metric,
+            ),
             euclidean.gaussian.prepared.ham,
         ),
         _artifact(
             :relativistic_euclidean_phasepoint,
             REACTIVEHMC_ORIGIN,
             EUCLIDEAN_SOURCE,
-            (; pos, metric, mom),
+            (;
+                pot_f = relativistic_euclidean_sources.pot_f,
+                grad_f = relativistic_euclidean_sources.grad_f,
+                pos, mom, metric,
+            ),
             euclidean.relativistic.prepared.ham,
         ),
         _artifact(
             :riemannian_phasepoint,
             REACTIVEHMC_ORIGIN,
             RIEMANNIAN_SOURCE,
-            (; pos),
+            (;
+                pot_f = riemannian_sources.pot_f,
+                grad_f = riemannian_sources.grad_f,
+                metric_f = riemannian_sources.metric_f,
+                metric_grad_f = riemannian_sources.metric_grad_f,
+                metric_inverse_f = riemannian_sources.metric_inverse_f,
+                pos,
+            ),
             riemannian.gaussian.prepared.geometry,
         ),
         _artifact(
@@ -156,7 +187,7 @@ function reactivehmc_artifacts()
             RIEMANNIAN_SOURCE,
             (;
                 mom,
-                chol = relativistic_geometry.chol,
+                metric = relativistic_geometry.metric,
                 inv_metric = relativistic_geometry.inv_metric,
                 metric_grad = relativistic_geometry.metric_grad,
                 dpot = relativistic_geometry.dpot,
@@ -167,42 +198,78 @@ function reactivehmc_artifacts()
             :riemannian_softabs_phasepoint,
             REACTIVEHMC_ORIGIN,
             SOFTABS_SOURCE,
-            (; pos),
+            (;
+                pot_f = softabs_sources.pot_f,
+                grad_f = softabs_sources.grad_f,
+                premetric_f = softabs_sources.premetric_f,
+                premetric_grad_f = softabs_sources.premetric_grad_f,
+                softabs_geometry_f = softabs_sources.softabs_geometry_f,
+                pos,
+            ),
             softabs.gaussian.prepared.geometry,
         ),
         _artifact(
             :relativistic_riemannian_softabs_phasepoint,
             REACTIVEHMC_ORIGIN,
             SOFTABS_SOURCE,
-            (; pos),
+            (;
+                pot_f = relativistic_softabs_sources.pot_f,
+                grad_f = relativistic_softabs_sources.grad_f,
+                premetric_f = relativistic_softabs_sources.premetric_f,
+                premetric_grad_f = relativistic_softabs_sources.premetric_grad_f,
+                softabs_geometry_f =
+                    relativistic_softabs_sources.softabs_geometry_f,
+                pos,
+            ),
             softabs.relativistic.prepared.geometry,
         ),
         _artifact(
             :leapfrog,
             REACTIVEHMC_ORIGIN,
             EUCLIDEAN_SOURCE,
-            (; pos),
+            (; grad_f = euclidean_sources.grad_f, pos),
             euclidean.gaussian.prepared.dpos,
         ),
         _artifact(
             :generalized_leapfrog,
             REACTIVEHMC_ORIGIN,
             RIEMANNIAN_SOURCE,
-            (; pos),
+            (;
+                pot_f = riemannian_sources.pot_f,
+                grad_f = riemannian_sources.grad_f,
+                metric_f = riemannian_sources.metric_f,
+                metric_grad_f = riemannian_sources.metric_grad_f,
+                metric_inverse_f = riemannian_sources.metric_inverse_f,
+                pos,
+            ),
             riemannian.gaussian.prepared.geometry,
         ),
         _artifact(
             :implicit_midpoint,
             REACTIVEHMC_ORIGIN,
             RIEMANNIAN_SOURCE,
-            (; pos),
+            (;
+                pot_f = riemannian_sources.pot_f,
+                grad_f = riemannian_sources.grad_f,
+                metric_f = riemannian_sources.metric_f,
+                metric_grad_f = riemannian_sources.metric_grad_f,
+                metric_inverse_f = riemannian_sources.metric_inverse_f,
+                pos,
+            ),
             riemannian.gaussian.prepared.geometry,
         ),
         _artifact(
             :multistep,
             REACTIVEHMC_ORIGIN,
             SOFTABS_SOURCE,
-            (; pos),
+            (;
+                pot_f = softabs_sources.pot_f,
+                grad_f = softabs_sources.grad_f,
+                premetric_f = softabs_sources.premetric_f,
+                premetric_grad_f = softabs_sources.premetric_grad_f,
+                softabs_geometry_f = softabs_sources.softabs_geometry_f,
+                pos,
+            ),
             softabs.gaussian.prepared.geometry,
         ),
     ]
