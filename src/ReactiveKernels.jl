@@ -59,5 +59,9 @@ export prepare_reactive, prepare_reactive_nonallocating, statevalue, touch!, mut
 export ReactiveObject, @reactive
 export reactive_program
 export CompiledStateTransition, compile_state_transition, initial_transition_state
+export compile_stateful, stateful_compiler_bindings
+export pure_callable_port, effect_callable_port, structured_state_port
+export StatefulStateValue, OrderedRNGReplay
+export functionalize_stateful, stateful_snapshot
 
 end # module ReactiveKernels

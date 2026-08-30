@@ -954,8 +954,13 @@ function _kernel_pure_callee_domain_ok(@nospecialize(f), argtypes)
     (f === Base.zero || f === Base.one) && return length(argtypes) == 1 && _kernel_dom_num_value(argtypes[1])
     # unary transcendentals (RK 14:35 / POC G3): SCALAR-only Real domain — a single-application `exp/log/sqrt`
     # of a numeric scalar leaf is pure and 0-B; NOT admitted over arrays (matrix `exp` is different semantics).
-    (f === Base.exp || f === Base.log || f === Base.sqrt) &&
+    (f === Base.exp || f === Base.log) &&
         return length(argtypes) == 1 && _kernel_dom_num_scalar(argtypes[1])
+    f === Base.sqrt && return length(argtypes) == 1 &&
+        (_kernel_dom_num_scalar(argtypes[1]) || _kernel_dom_diag(argtypes[1]))
+    f === Base.:* && length(argtypes) == 2 &&
+        _kernel_dom_diag(argtypes[1]) && _kernel_dom_num_array(argtypes[2]) &&
+        eltype(argtypes[1]) === eltype(argtypes[2]) && return true
     # arithmetic / comparison / logical / logaddexp: numeric leaves OR numeric arrays (broadcast eltype).
     all(_kernel_dom_num_value, argtypes)
 end

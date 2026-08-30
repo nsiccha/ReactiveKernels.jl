@@ -82,10 +82,14 @@ end
 abstract type _SMDomainNode end
 struct _DSlot{T} <: _SMDomainNode end
 struct _DFormal{Pos,IsVector} <: _SMDomainNode end
+struct _DSelfState{T} <: _SMDomainNode end
 struct _DKw{Name,Default} <: _SMDomainNode end
 struct _DLit{T} <: _SMDomainNode end
 struct _DCall{Source,Dot,Args} <: _SMDomainNode end
+struct _DOrderedRNGCall{Token,Args} <: _SMDomainNode end
+struct _DStructuralCopy{Destination,Source} <: _SMDomainNode end
 struct _DPortCall{Declared,Result,Args} <: _SMDomainNode end
+struct _DEffectPortCall{Declared,Result,Written,EffectState,Args} <: _SMDomainNode end
 struct _DTuple{Args} <: _SMDomainNode end
 struct _DProject{Parent,Key} <: _SMDomainNode end
 struct _DIndex{Base,Indices} <: _SMDomainNode end
@@ -132,7 +136,180 @@ struct _PureCallablePort{ArgTypes<:Tuple,Result,F,L}
     functional_lowering::L
 end
 
+
+"""
+    effect_callable_port(source, Tuple{ArgTypes...}, Result;
+                         written_arguments=(), initial_effect_state=nothing,
+                         functional_lowering)
+
+Explicit effect contract for a callable state field. The source callable is
+identity-checked at construction. `written_arguments` declares exactly which
+positional subjects it may mutate; the functional lowering returns a
+NamedTuple `(arguments, result, effect_state)` carrying replacement arguments
+and an explicit auxiliary effect state. This is the effectful counterpart to
+`pure_callable_port`; arbitrary callable fields remain rejected.
+"""
+struct _EffectCallablePort{
+        ArgTypes<:Tuple,Result,Written,EffectState,F,L,S}
+    source::F
+    functional_lowering::L
+    initial_effect_state::S
+end
+
+# A nested structured state is not a callable effect.  Its compiler binding
+# carries a separately compiled state-transition contract whose endpoint graph
+# defines canonical aliases and derived-field currentness.  Concrete repair
+# programs are generated when `structured_state_port` is constructed below.
+struct _StructuredStateRepair{Names,F,E}
+    f::F
+    ensures::E
+end
+
+@inline function (repair::_StructuredStateRepair)(state)
+    RuntimeGeneratedFunctions.generated_callfunc(
+        getfield(repair, :f), getfield(repair, :ensures), state)
+end
+
+struct _StructuredStatePort{T,R}
+    transition::T
+    repairs::R
+end
+
+"""
+    StatefulStateValue
+
+Compiler-contract marker for the complete materialized state passed by an
+authored `__self__` callable effect.  Use it only inside the argument tuple of
+[`effect_callable_port`](@ref); the concrete NamedTuple layout is derived and
+validated from the stateful kernel being compiled.
+"""
+struct StatefulStateValue end
+
+_kernel_field_written_arguments(
+    ::_EffectCallablePort{ArgTypes,Result,Written}) where
+    {ArgTypes,Result,Written} = Written
+_kernel_field_effect_descriptor(::_EffectCallablePort) = true
+
+function effect_callable_port(@nospecialize(source), ::Type{ArgTypes},
+        ::Type{Result}; written_arguments=(), initial_effect_state=nothing,
+        functional_lowering) where {ArgTypes<:Tuple,Result}
+    all(isconcretetype, ArgTypes.parameters) || throw(ArgumentError(
+        "effect callable port argument types must all be concrete"))
+    isconcretetype(Result) || throw(ArgumentError(
+        "effect callable port result type must be concrete"))
+    written = Tuple(Int(position) for position in written_arguments)
+    length(unique(written)) == length(written) &&
+        all(position -> 1 <= position <= length(ArgTypes.parameters), written) ||
+        throw(ArgumentError(
+            "effect callable port written arguments must be unique valid positions"))
+    _EffectCallablePort{ArgTypes,Result,written,typeof(initial_effect_state),
+        typeof(source),typeof(functional_lowering),typeof(initial_effect_state)}(
+        source, functional_lowering, initial_effect_state)
+end
+
+"""
+    OrderedRNGReplay(normals, uniforms, exponentials)
+
+Typed, finite replay storage for ordered RNG effects in a functionalized
+state-machine method. `normals` stores one vector draw per matrix column;
+`uniforms` and `exponentials` store scalar draws. Counters and sticky overflow
+are part of the value so conditional source paths consume only when active and
+capacity failures are observable rather than silently clamped.
+"""
+struct OrderedRNGReplay{N,U,E,NI,UI,EI,O}
+    normals::N
+    uniforms::U
+    exponentials::E
+    normal_index::NI
+    uniform_index::UI
+    exponential_index::EI
+    overflow::O
+end
+
+@inline _sm_ordered_rng_normal_value(normals, index) =
+    copy(normals[:, index])
+@inline _sm_ordered_rng_scalar_value(values, index) = values[index]
+
+@inline function _sm_ordered_rng_normal_candidate(replay::OrderedRNGReplay,
+                                                   destination)
+    size(replay.normals, 1) == length(destination) || throw(ArgumentError(
+        "ordered RNG normal width does not match the authored destination"))
+    index = replay.normal_index
+    valid = .!replay.overflow .& (index .>= one(index)) .&
+        (index .<= size(replay.normals, 2))
+    safe = clamp.(index, one(index), size(replay.normals, 2))
+    value = _sm_ordered_rng_normal_value(replay.normals, safe)
+    next_index = ifelse.(valid, index .+ one(index), index)
+    next = OrderedRNGReplay(
+        replay.normals, replay.uniforms, replay.exponentials,
+        next_index, replay.uniform_index, replay.exponential_index,
+        replay.overflow .| .!valid)
+    (value=value, replay=next, valid=valid)
+end
+
+@inline function _sm_ordered_rng_uniform_candidate(replay::OrderedRNGReplay)
+    index = replay.uniform_index
+    valid = .!replay.overflow .& (index .>= one(index)) .&
+        (index .<= length(replay.uniforms))
+    safe = clamp.(index, one(index), length(replay.uniforms))
+    value = _sm_ordered_rng_scalar_value(replay.uniforms, safe)
+    next_index = ifelse.(valid, index .+ one(index), index)
+    next = OrderedRNGReplay(
+        replay.normals, replay.uniforms, replay.exponentials,
+        replay.normal_index, next_index, replay.exponential_index,
+        replay.overflow .| .!valid)
+    (value=value, replay=next, valid=valid)
+end
+
+@inline function _sm_ordered_rng_exponential_candidate(replay::OrderedRNGReplay)
+    index = replay.exponential_index
+    valid = .!replay.overflow .& (index .>= one(index)) .&
+        (index .<= length(replay.exponentials))
+    safe = clamp.(index, one(index), length(replay.exponentials))
+    value = _sm_ordered_rng_scalar_value(replay.exponentials, safe)
+    next_index = ifelse.(valid, index .+ one(index), index)
+    next = OrderedRNGReplay(
+        replay.normals, replay.uniforms, replay.exponentials,
+        replay.normal_index, replay.uniform_index, next_index,
+        replay.overflow .| .!valid)
+    (value=value, replay=next, valid=valid)
+end
+
+function _sm_validate_ordered_rng_storage(replay::OrderedRNGReplay)
+    size(replay.normals, 1) > 0 && size(replay.normals, 2) > 0 ||
+        throw(ArgumentError(
+            "ordered RNG normal tape must have positive static axes"))
+    !isempty(replay.uniforms) || throw(ArgumentError(
+        "ordered RNG uniform tape must contain one fail-closed padding value"))
+    !isempty(replay.exponentials) || throw(ArgumentError(
+        "ordered RNG exponential tape must contain one fail-closed padding value"))
+    replay
+end
+
+function OrderedRNGReplay(normals::AbstractMatrix, uniforms::AbstractVector{Bool},
+                          exponentials::AbstractVector)
+    _kernel_dom_num_matrix(typeof(normals)) || throw(ArgumentError(
+        "ordered RNG normal tape must be a builtin numeric matrix"))
+    _sm_builtin_array(typeof(uniforms)) || throw(ArgumentError(
+        "ordered RNG uniform tape must be a builtin Bool vector"))
+    _kernel_dom_num_array(typeof(exponentials)) || throw(ArgumentError(
+        "ordered RNG exponential tape must be a builtin numeric vector"))
+    eltype(normals) === eltype(exponentials) || throw(ArgumentError(
+        "ordered RNG normal and exponential tapes must share one element type"))
+    all(isfinite, normals) || throw(ArgumentError(
+        "ordered RNG normal tape must contain finite values"))
+    all(value -> isfinite(value) && value >= zero(value), exponentials) ||
+        throw(ArgumentError(
+            "ordered RNG exponential tape must contain finite nonnegative values"))
+    _sm_validate_ordered_rng_storage(
+        OrderedRNGReplay(normals, uniforms, exponentials, 1, 1, 1, false))
+end
+
+_sm_ordered_rng_replay_type(::Type{T}) where {T} = T <: OrderedRNGReplay
+
 _kernel_field_registration_noeffect(::_PureCallablePort) = true
+_kernel_field_registration_noeffect(::_EffectCallablePort) = false
+_kernel_field_registration_noeffect(::_StructuredStatePort) = true
 
 function pure_callable_port(@nospecialize(source), ::Type{ArgTypes},
         ::Type{Result}; functional_lowering=source) where {ArgTypes<:Tuple,Result}
@@ -159,12 +336,29 @@ stateful_compiler_bindings(; fields...) =
     value
 end
 
+@inline function _sm_checked_effect_call(::Type{Result}, callable,
+                                         args...) where {Result}
+    value = callable(args...)
+    value isa Result || throw(ArgumentError(
+        "stateful effect port returned `$(typeof(value))`, expected `$Result`"))
+    value
+end
+
 function _sm_pure_port(field_regs, name::Symbol)
     haskey(field_regs, name) || _sm_reject(
         "callable field `$name` has no compiler binding")
     port = field_regs[name]
     port isa _PureCallablePort || _sm_reject(
         "callable field `$name` is not a typed pure callable port")
+    port
+end
+
+function _sm_effect_port(field_regs, name::Symbol)
+    haskey(field_regs, name) || _sm_reject(
+        "callable field `$name` has no compiler binding")
+    port = field_regs[name]
+    port isa _EffectCallablePort || _sm_reject(
+        "callable field `$name` is not a typed effect callable port")
     port
 end
 
@@ -176,6 +370,59 @@ _sm_compiled_call(f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction) = f
 
 _sm_reject(msg) = throw(_LLowerReject(msg))
 
+_sm_structural_path_type(::Type{T}, ::Val{()}) where {T} = T
+function _sm_structural_path_type(::Type{T}, ::Val{Path}) where {T,Path}
+    T <: NamedTuple || _sm_reject(
+        "nested state paths require a concrete NamedTuple root, got `$T`")
+    name = first(Path)
+    name in fieldnames(T) || _sm_reject(
+        "nested state path `$name` is absent from `$T`")
+    _sm_structural_path_type(fieldtype(T, name), Val(Base.tail(Path)))
+end
+
+
+function _sm_state_snapshot_type(plan::_KernelPlan, ::Type{OW},
+                                 ::Type{SH}) where {OW,SH}
+    names = Tuple(slot.path[end] for slot in kernel_plan_slots(plan))
+    types = Tuple(_pp_fieldtype(plan, slot.canon, OW, SH)
+                  for slot in kernel_plan_slots(plan))
+    NamedTuple{names,Tuple{types...}}
+end
+
+function _sm_state_snapshot_expr(plan::_KernelPlan)
+    names = Tuple(slot.path[end] for slot in kernel_plan_slots(plan))
+    values = Any[_pp_read(plan, slot.canon) for slot in kernel_plan_slots(plan)]
+    :(NamedTuple{$names}(($(values...),)))
+end
+
+@inline _sm_structural_get(value, ::Val{()}) = value
+@inline function _sm_structural_get(value, ::Val{Path}) where {Path}
+    _sm_structural_get(getfield(value, first(Path)), Val(Base.tail(Path)))
+end
+
+@inline _sm_structural_set(value, ::Val{()}, replacement) = replacement
+@inline function _sm_structural_set(value::NamedTuple, ::Val{Path}, replacement) where {Path}
+    name = first(Path)
+    child = _sm_structural_set(
+        getfield(value, name), Val(Base.tail(Path)), replacement)
+    merge(value, NamedTuple{(name,)}((child,)))
+end
+@inline _sm_structural_copy(value::AbstractArray) = copy(value)
+@inline _sm_structural_copy(value::NamedTuple) = map(_sm_structural_copy, value)
+@inline _sm_structural_copy(value::Tuple) = map(_sm_structural_copy, value)
+@inline _sm_structural_copy(value::LinearAlgebra.Cholesky) =
+    LinearAlgebra.Cholesky(
+        _sm_structural_copy(value.factors), value.uplo, value.info)
+@inline _sm_structural_copy(value) = value
+@inline _sm_sanctioned_sqrt(value) = sqrt(value)
+@inline _sm_sanctioned_sqrt(value::LinearAlgebra.Diagonal) =
+    LinearAlgebra.Diagonal(sqrt.(value.diag))
+@inline _sm_sanctioned_mul(lhs, rhs) = lhs * rhs
+@inline _sm_sanctioned_mul(lhs::LinearAlgebra.Diagonal,
+                           rhs::AbstractVector) = lhs.diag .* rhs
+@inline _sm_sanctioned_mul(lhs, rhs, third, rest...) =
+    _sm_sanctioned_mul(_sm_sanctioned_mul(lhs, rhs), third, rest...)
+
 function _sm_exact_callee(x::_RegisteredCall; allow_broadcast::Bool=false)
     getfield(x.registration, :kind) === :pure_primitive || _sm_reject(
         "stateful method value call `$(x.ref.slot)` is not a captured pure Base primitive")
@@ -183,6 +430,23 @@ function _sm_exact_callee(x::_RegisteredCall; allow_broadcast::Bool=false)
     x.broadcast && !allow_broadcast && _sm_reject(
         "per-call dotted primitive `$(x.ref.slot)` is unsupported outside an authored @. write")
     _exec_captured_callee(x) # exact captured GlobalRef identity + rebind check
+end
+
+function _sm_exact_ordered_rng(x::_RegisteredCall)
+    registration = getfield(x, :registration)
+    registration.kind === :primitive || _sm_reject(
+        "ordered RNG call is not a captured builtin primitive")
+    effect = registration.primitive_effect
+    effect isa _PrimitiveEffect && effect.kind === :rng &&
+        effect.order === :ordered || _sm_reject(
+        "captured primitive does not carry an ordered RNG effect")
+    isempty(x.kw) && !x.broadcast || _sm_reject(
+        "ordered RNG effects reject keywords and broadcasting")
+    length(x.args) == effect.arity || _sm_reject(
+        "ordered RNG effect arity differs from its captured descriptor")
+    kernel_rebound(registration, _kernel_resolve_captured_ref(x.ref)) &&
+        _sm_reject("captured ordered RNG primitive was rebound")
+    effect
 end
 
 function _sm_exact_callable(x::_CallableRef)
@@ -220,6 +484,11 @@ function _sm_primitive_result(@nospecialize(f), argts::Tuple)
             all(t -> t isa Type && _kernel_dom_num_array(t), T.parameters) ||
             _sm_reject("primitive `map(copy, ...)` requires a nonempty tuple of builtin numeric arrays")
         return T
+    elseif f === Base.:* && length(argts) == 2 &&
+            _kernel_dom_diag(argts[1]) && _kernel_dom_num_array(argts[2])
+        eltype(argts[1]) === eltype(argts[2]) || _sm_reject(
+            "diagonal multiplication requires one shared element type")
+        return argts[2]
     elseif f === Base.:+ || f === Base.:*
         length(argts) >= 2 || _sm_reject("primitive `$f` requires at least two operands")
         return _sm_numeric_promote(argts, nameof(f))
@@ -250,6 +519,8 @@ function _sm_primitive_result(@nospecialize(f), argts::Tuple)
         length(argts) == 2 && all(_kernel_dom_num_scalar, argts) ||
             _sm_reject("primitive `oftype` requires two builtin numeric scalars")
         return argts[1]
+    elseif f === Base.sqrt && length(argts) == 1 && _kernel_dom_diag(argts[1])
+        return argts[1]
     elseif f === Base.exp || f === Base.log || f === Base.sqrt
         length(argts) == 1 && _kernel_dom_num_scalar(argts[1]) ||
             _sm_reject("primitive `$f` requires one builtin numeric scalar")
@@ -271,7 +542,46 @@ function _sm_primitive_result(@nospecialize(f), argts::Tuple)
     _sm_reject("primitive `$f` has no sanctioned stateful-method output rule")
 end
 
+function _sm_ordered_rng_result(token, argts::Tuple)
+    isempty(argts) && _sm_reject("ordered RNG effect has no RNG argument")
+    replay = first(argts)
+    replay_ok = _sm_ordered_rng_replay_type(replay)
+    if token === Symbol("__rk_rng_Random_randn!__")
+        length(argts) == 2 && _kernel_dom_num_array(argts[2]) ||
+            _sm_reject("randn! replay requires one builtin numeric destination array")
+        if replay_ok
+            normals = fieldtype(replay, :normals)
+            _kernel_dom_num_matrix(normals) &&
+                eltype(normals) === eltype(argts[2]) || _sm_reject(
+                "randn! replay tape and destination must share one builtin element type")
+        else
+            _kernel_effect_callee_domain_ok(Random.randn!, argts) ||
+                _sm_reject("randn! rejects exact operand types $argts")
+        end
+        return argts[2]
+    elseif token === Symbol("__rk_rng_Random_randexp__")
+        length(argts) == 1 || _sm_reject("randexp replay requires one RNG argument")
+        if replay_ok
+            exponentials = fieldtype(replay, :exponentials)
+            _kernel_dom_num_array(exponentials) || _sm_reject(
+                "randexp replay requires a builtin numeric exponential tape")
+            return eltype(exponentials)
+        end
+        _kernel_effect_callee_domain_ok(Random.randexp, argts) ||
+            _sm_reject("randexp rejects exact operand types $argts")
+        return Float64
+    elseif token === Symbol("__rk_rng_Random_rand__")
+        length(argts) == 2 || _sm_reject("rand replay requires RNG and sample spec")
+        replay_ok || _kernel_effect_callee_domain_ok(Random.rand, argts) ||
+            _sm_reject("rand rejects exact operand types $argts")
+        return Bool
+    end
+    _sm_reject("unknown ordered RNG token `$token`")
+end
+
 _sm_dtype(::Type{_DSlot{T}}, argtypes, ::Type{KWT}, dot::Bool) where {T,KWT} = dot ? _sm_leaf_type(T) : T
+_sm_dtype(::Type{_DSelfState{T}}, argtypes, ::Type{KWT}, dot::Bool) where {T,KWT} =
+    dot ? _sm_reject("whole-state values do not admit broadcasting") : T
 function _sm_dtype(::Type{_DFormal{P,V}}, argtypes, ::Type{KWT}, dot::Bool) where {P,V,KWT}
     P <= length(argtypes) || _sm_reject("formal position $P is absent")
     T = argtypes[P]
@@ -355,12 +665,45 @@ function _sm_dtype(::Type{_DCall{S,D,A}}, argtypes, ::Type{KWT}, dot::Bool) wher
     result = _sm_primitive_result(f, ats)
     dot && !D ? _sm_leaf_type(result) : result
 end
+function _sm_dtype(::Type{_DOrderedRNGCall{Token,Args}}, argtypes,
+                   ::Type{KWT}, dot::Bool) where {Token,Args,KWT}
+    dot && _sm_reject("ordered RNG effects do not admit broadcasting")
+    actual = Tuple(_sm_dtype(A, argtypes, KWT, false) for A in Args.parameters)
+    _sm_ordered_rng_result(Token, actual)
+end
+function _sm_dtype(::Type{_DStructuralCopy{Destination,Source}}, argtypes,
+                   ::Type{KWT}, dot::Bool) where {Destination,Source,KWT}
+    dot && _sm_reject("structural copy does not admit broadcasting")
+    DT = _sm_dtype(Destination, argtypes, KWT, false)
+    ST = _sm_dtype(Source, argtypes, KWT, false)
+    DT === ST || _sm_reject(
+        "structural copy requires one exact source/destination type, got `$DT` and `$ST`")
+    _recipe_dom_deepcopy(DT) || _sm_reject(
+        "structural copy rejects unsupported aggregate type `$DT`")
+    DT
+end
 function _sm_dtype(::Type{_DPortCall{Declared,Result,Args}}, argtypes,
                    ::Type{KWT}, dot::Bool) where {Declared,Result,Args,KWT}
     dot && _sm_reject("typed pure callable ports do not admit implicit broadcasting")
     actual = Tuple(_sm_dtype(A, argtypes, KWT, false) for A in Args.parameters)
     actual == Tuple(Declared.parameters) || _sm_reject(
         "typed pure callable port expects $(Tuple(Declared.parameters)), got $actual")
+    Result
+end
+function _sm_dtype(::Type{_DEffectPortCall{
+        Declared,Result,Written,EffectState,Args}}, argtypes,
+        ::Type{KWT}, dot::Bool) where
+        {Declared,Result,Written,EffectState,Args,KWT}
+    dot && _sm_reject("typed effect callable ports do not admit broadcasting")
+    actual = Tuple(_sm_dtype(A, argtypes, KWT, false) for A in Args.parameters)
+    declared = Tuple(Declared.parameters)
+    contract_ok = all(zip(actual, declared)) do (got, expected)
+        expected === StatefulStateValue ? got <: NamedTuple : got === expected
+    end
+    contract_ok || _sm_reject(
+        "typed effect callable port expects $declared, got $actual")
+    all(position -> 1 <= position <= length(actual), Written) || _sm_reject(
+        "typed effect callable port writes an absent positional argument")
     Result
 end
 function _sm_validate_node(::Type{_DWrite{T,D,R}}, argtypes, ::Type{KWT}) where {T,D,R,KWT}
@@ -446,7 +789,11 @@ end
 
 function _sm_isvector(x, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH}, formals, locals) where {OW,SH}
     if x isa _SelfField
-        haskey(fields, x.path[end]) && _pp_fieldtype(plan, fields[x.path[end]], OW, SH) <: AbstractArray
+        root = first(x.path)
+        haskey(fields, root) && _sm_structural_path_type(
+            _pp_fieldtype(plan, fields[root], OW, SH), Val(Base.tail(x.path))) <: AbstractArray
+    elseif x isa _SelfRef
+        false
     elseif x isa _FormalRef
         get(formals, x.arg, false)
     elseif x isa _LocalRef
@@ -461,8 +808,13 @@ end
 function _sm_rhs(x, syms, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH},
                  formals, locals, dot::Bool, field_regs=Dict{Symbol,Any}()) where {OW,SH}
     if x isa _SelfField
-        haskey(fields, x.path[end]) || _sm_reject("stateful rhs reads unknown field `$(x.path[end])`")
-        _pp_read(plan, fields[x.path[end]])
+        root = first(x.path)
+        haskey(fields, root) || _sm_reject("stateful rhs reads unknown field `$root`")
+        value = _pp_read(plan, fields[root])
+        isempty(Base.tail(x.path)) ? value :
+            :(_sm_structural_get($value, Val($(QuoteNode(Base.tail(x.path))))))
+    elseif x isa _SelfRef
+        _sm_state_snapshot_expr(plan)
     elseif x isa _FormalRef
         haskey(syms, (:formal, x.arg)) || _sm_reject("stateful rhs reads unbound formal `$(x.arg)`")
         syms[(:formal, x.arg)]
@@ -500,26 +852,40 @@ function _sm_rhs(x, syms, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH},
                       locals, false, field_regs)
         Expr(x.op, lhs, rhs)
     elseif x isa _RegisteredCall
-        f = _sm_exact_callee(x; allow_broadcast=dot)
+        effect = getfield(x.registration, :primitive_effect)
+        f = if effect isa _PrimitiveEffect && effect.kind === :rng
+            _sm_exact_ordered_rng(x)
+            _exec_captured_callee(x)
+        else
+            _sm_exact_callee(x; allow_broadcast=dot)
+        end
         args = Any[_sm_rhs(a, syms, plan, fields, OW, SH, formals,
                            locals, dot, field_regs) for a in x.args]
         dot && _sm_isvector(x, plan, fields, OW, SH, formals, locals) ?
-            Expr(:call, GlobalRef(Base, :broadcasted), f, args...) : Expr(:call, f, args...)
+            Expr(:call, GlobalRef(Base, :broadcasted), f, args...) :
+            Expr(:call, f === Base.sqrt ? :_sm_sanctioned_sqrt :
+                f === Base.:* ? :_sm_sanctioned_mul : f, args...)
     elseif x isa _FieldCall
         length(x.path) == 1 || _sm_reject(
-            "typed pure callable port must be a direct state field")
+            "typed callable port must be a direct state field")
         isempty(x.kw) || _sm_reject(
-            "typed pure callable port keywords are not yet admitted")
-        dot && _sm_reject("typed pure callable ports do not admit implicit broadcasting")
+            "typed callable port keywords are not yet admitted")
+        dot && _sm_reject("typed callable ports do not admit implicit broadcasting")
         name = x.path[1]
-        port = _sm_pure_port(field_regs, name)
+        haskey(field_regs, name) || _sm_reject(
+            "callable field `$name` has no compiler binding")
+        port = field_regs[name]
+        port isa Union{_PureCallablePort,_EffectCallablePort} || _sm_reject(
+            "callable field `$name` has no typed callable-port contract")
         canon = get(fields, name, 0)
         canon == 0 && _sm_reject(
-            "typed pure callable port `$name` has no canonical slot")
+            "typed callable port `$name` has no canonical slot")
         args = Any[_sm_rhs(a, syms, plan, fields, OW, SH, formals,
                            locals, false, field_regs) for a in x.pos]
         Result = typeof(port).parameters[2]
-        Expr(:call, :_sm_checked_pure_call, Result, _pp_read(plan, canon), args...)
+        checked = port isa _PureCallablePort ? :_sm_checked_pure_call :
+            :_sm_checked_effect_call
+        Expr(:call, checked, Result, _pp_read(plan, canon), args...)
     elseif x isa _CallExpr
         x.target isa _SelfRef || _sm_reject(
             "value-position sibling call must target the current state")
@@ -543,8 +909,12 @@ function _sm_dtree(x, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH},
                    finfo, ltrees, dot::Bool, field_regs=Dict{Symbol,Any}(),
                    methods_by_id=Dict{MethodId,MethodIR}(), stack=MethodId[]) where {OW,SH}
     if x isa _SelfField
-        haskey(fields, x.path[end]) || _sm_reject("domain forest reads unknown field `$(x.path[end])`")
-        _DSlot{_pp_fieldtype(plan, fields[x.path[end]], OW, SH)}
+        root = first(x.path)
+        haskey(fields, root) || _sm_reject("domain forest reads unknown field `$root`")
+        root_type = _pp_fieldtype(plan, fields[root], OW, SH)
+        _DSlot{_sm_structural_path_type(root_type, Val(Base.tail(x.path)))}
+    elseif x isa _SelfRef
+        _DSelfState{_sm_state_snapshot_type(plan, OW, SH)}
     elseif x isa _FormalRef
         haskey(finfo, x.arg) || _sm_reject("domain forest reads unbound formal `$(x.arg)`")
         finfo[x.arg]
@@ -583,21 +953,46 @@ function _sm_dtree(x, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH},
             false, field_regs, methods_by_id, stack)
         _DShortValue{x.op,lhs,rhs}
     elseif x isa _RegisteredCall
-        f = _sm_exact_callee(x; allow_broadcast=dot)
+        if getfield(x.registration, :kind) === :intrinsic
+            getfield(x.registration, :source) === copy!! && length(x.args) == 2 ||
+                _sm_reject("unsupported stateful intrinsic call")
+            destination = _sm_dtree(x.args[1], plan, fields, OW, SH, finfo,
+                ltrees, false, field_regs, methods_by_id, stack)
+            source = _sm_dtree(x.args[2], plan, fields, OW, SH, finfo,
+                ltrees, false, field_regs, methods_by_id, stack)
+            return _DStructuralCopy{destination,source}
+        end
         children = Tuple{(_sm_dtree(a, plan, fields, OW, SH, finfo, ltrees,
             dot, field_regs, methods_by_id, stack) for a in x.args)...}
-        _DCall{typeof(f),dot,children}
+        effect = getfield(x.registration, :primitive_effect)
+        if effect isa _PrimitiveEffect && effect.kind === :rng
+            _sm_exact_ordered_rng(x)
+            _DOrderedRNGCall{effect.token,children}
+        else
+            f = _sm_exact_callee(x; allow_broadcast=dot)
+            _DCall{typeof(f),dot,children}
+        end
     elseif x isa _FieldCall
         length(x.path) == 1 || _sm_reject(
-            "typed pure callable port must be a direct state field")
+            "typed callable port must be a direct state field")
         isempty(x.kw) || _sm_reject(
-            "typed pure callable port keywords are not yet admitted")
-        port = _sm_pure_port(field_regs, x.path[1])
+            "typed callable port keywords are not yet admitted")
+        haskey(field_regs, x.path[1]) || _sm_reject(
+            "callable field `$(x.path[1])` has no compiler binding")
+        port = field_regs[x.path[1]]
         P = typeof(port)
-        declared, result = P.parameters[1], P.parameters[2]
         children = Tuple{(_sm_dtree(a, plan, fields, OW, SH, finfo, ltrees,
             false, field_regs, methods_by_id, stack) for a in x.pos)...}
-        _DPortCall{declared,result,children}
+        if port isa _PureCallablePort
+            declared, result = P.parameters[1], P.parameters[2]
+            _DPortCall{declared,result,children}
+        elseif port isa _EffectCallablePort
+            declared, result, written, effect_state =
+                P.parameters[1], P.parameters[2], P.parameters[3], P.parameters[4]
+            _DEffectPortCall{declared,result,written,effect_state,children}
+        else
+            _sm_reject("callable field `$(x.path[1])` has no typed callable-port contract")
+        end
     elseif x isa _CallExpr
         _sm_sibling_result_tree(x, plan, fields, OW, SH, finfo, ltrees,
                                 field_regs, methods_by_id, stack)
@@ -871,12 +1266,15 @@ function _sm_machine_domain_forest(ir::MethodIR, plan::_KernelPlan, fields,
             elseif statement isa _PlaceWrite
                 statement.root === :self && statement.owner !== nothing &&
                     length(statement.owner) == 1 || _sm_reject(
-                        "state-machine writes must target one direct owned field")
+                        "state-machine writes must target one owned state root")
                 name = only(statement.owner)
                 canon = get(fields, name, 0)
                 canon == 0 && _sm_reject(
                     "state-machine write has no canonical slot for `$name`")
-                T = _pp_fieldtype(plan, canon, OW, SH)
+                root_type = _pp_fieldtype(plan, canon, OW, SH)
+                target_path = statement.target isa _SelfField ?
+                    Base.tail(statement.target.path) : ()
+                T = _sm_structural_path_type(root_type, Val(target_path))
                 rhs = _sm_dtree(statement.rhs, plan, fields, OW, SH,
                     finfo, ltrees, false, field_regs, methods_by_id,
                     MethodId[ir.id])
@@ -1016,7 +1414,8 @@ function _sm_emit_write!(stmts, pw::_PlaceWrite, syms, plan::_KernelPlan, fields
     end
 end
 
-function _sm_global_written(plan::_KernelPlan, irs)
+function _sm_global_written(plan::_KernelPlan, irs,
+                            field_regs=Dict{Symbol,Any}())
     fields = _exec_canon_map(plan); out = Set{Int}()
     for ir in irs
         for (root, owner) in write_roots(ir)
@@ -1024,8 +1423,39 @@ function _sm_global_written(plan::_KernelPlan, irs)
             owner isa Tuple && !isempty(owner) || continue
             haskey(fields, owner[1]) && push!(out, fields[owner[1]])
         end
+        for node in _kmir_leaves(ir)
+            node isa _FieldCall && length(node.path) == 1 || continue
+            name = only(node.path)
+            haskey(field_regs, name) || continue
+            descriptor = field_regs[name]
+            for position in _kernel_field_written_arguments(descriptor)
+                position <= length(node.pos) || _sm_reject(
+                    "callable field `$name` writes an absent argument")
+                actual = node.pos[position]
+                if actual isa _SelfField && !isempty(actual.path)
+                    root = first(actual.path)
+                    haskey(fields, root) && push!(out, fields[root])
+                elseif actual isa _SelfRef
+                    union!(out, values(fields))
+                else
+                    _sm_reject("callable field `$name` must expose each written " *
+                        "state root directly for currentness planning")
+                end
+            end
+        end
     end
     out
+end
+
+function _sm_active_producer(plan::_KernelPlan, global_written::Set{Int})
+    recipe_outputs = Dict{Int,Vector{Int}}(
+        recipe => collect(outputs)
+        for (recipe, outputs) in kernel_plan_producer_owned(plan))
+    disabled = Set(recipe for (recipe, outputs) in recipe_outputs
+                   if any(in(global_written), outputs))
+    Dict{Int,Int}(canon => recipe
+        for (canon, recipe) in kernel_plan_producer(plan)
+        if !(recipe in disabled))
 end
 
 function compile_stateful_method(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, ir::MethodIR,
@@ -1036,7 +1466,7 @@ function compile_stateful_method(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, i
     plan = kernel_prepared_plan(pf); hs = kernel_prepared_handles(pf); fields = _exec_canon_map(plan)
     recs = kernel_plan_recipes(plan)
     hidx = Dict{Int,Tuple{Any,Int}}(recs[i] => (hs[i], i) for i in eachindex(hs))
-    producer = Dict{Int,Int}(c => r for (c, r) in kernel_plan_producer(plan) if !(c in global_written))
+    producer = _sm_active_producer(plan, global_written)
     syms = Dict{Any,Symbol}(); formals = Dict{Symbol,Bool}(); locals = Dict{Symbol,Bool}()
     stmts = Any[]; pos = 0; localid = 0
     current = Set{Int}(); stale = Set{Int}(); ngrad = 0
@@ -1099,7 +1529,7 @@ function compile_stateful_method(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, i
                 uc, _ = _exec_ensure!(stmts, c, current, stale, plan, producer, hidx, OW, SH); ngrad += uc
             end
             tgt = get(fields, st.target.path[end], 0); tgt == 0 && _sm_reject("unknown stateful write target")
-            deps = _exec_kill_closure(plan, tgt)
+            deps = _exec_kill_closure(plan, tgt, producer)
             _exec_mask!(stmts, plan, tgt, :kill)
             for d in deps; _exec_mask!(stmts, plan, d, :kill); end
             _sm_emit_write!(stmts, st, syms, plan, fields, OW, SH,
@@ -1141,12 +1571,16 @@ compile_stateful_method(pf::_PreparedFactory, ::Type{OW}, ::Type{SH},
         Dict{Symbol,Any}(), Dict{MethodId,MethodIR}(ir.id => ir))
 
 function compile_state_machine_method(pf::_PreparedFactory, ::Type{OW},
-        ::Type{SH}, ir::MethodIR, typeauth, field_regs,
+        ::Type{SH}, ir::MethodIR, global_written::Set{Int}, typeauth, field_regs,
         methods_by_id) where {OW,SH}
     _sm_validate_machine_formals(ir)
     plan = kernel_prepared_plan(pf)
-    isempty(kernel_plan_producer(plan)) || _sm_reject(
-        "structured state-machine lowering currently requires source-only state fields")
+    handles = kernel_prepared_handles(pf)
+    recipes = kernel_plan_recipes(plan)
+    handle_index = Dict{Int,Tuple{Any,Int}}(
+        recipes[index] => (handles[index], index)
+        for index in eachindex(handles))
+    producer = _sm_active_producer(plan, global_written)
     fields = _exec_canon_map(plan)
     syms = Dict{Any,Symbol}()
     formals = Dict{Symbol,Bool}()
@@ -1156,6 +1590,47 @@ function compile_state_machine_method(pf::_PreparedFactory, ::Type{OW},
     fresh(prefix, name=:value) = begin
         serial[] += 1
         Symbol(prefix, name, "_", serial[])
+    end
+
+
+    invalidate! = function (destination, roots)
+        root_set = Set(roots)
+        dependents = Set{Int}()
+        for root in roots
+            union!(dependents, _exec_kill_closure(plan, root, producer))
+        end
+        setdiff!(dependents, root_set)
+        for canon in roots
+            _exec_mask!(destination, plan, canon, :kill)
+        end
+        for canon in sort!(collect(dependents))
+            _exec_mask!(destination, plan, canon, :kill)
+        end
+        dependents
+    end
+    repair! = function (destination, roots, dependents)
+        for canon in roots
+            _exec_mask!(destination, plan, canon, :bless)
+        end
+        current = Set(values(fields))
+        stale = Set(dependents)
+        for canon in dependents
+            delete!(current, canon)
+        end
+        for canon in roots
+            delete!(stale, canon)
+            push!(current, canon)
+        end
+        unconditional = 0
+        for canon in sort!(collect(dependents))
+            haskey(producer, canon) || continue
+            emitted, _ = _exec_ensure!(destination, canon, current, stale,
+                plan, producer, handle_index, OW, SH)
+            unconditional += emitted
+        end
+        unconditional == 0 || _sm_reject(
+            "structured state repair unexpectedly emitted $unconditional destination-gradient calls")
+        nothing
     end
 
     for (position, formal) in enumerate(ir.formals)
@@ -1178,7 +1653,7 @@ function compile_state_machine_method(pf::_PreparedFactory, ::Type{OW},
         role, slot = kernel_plan_field(plan, canon)
         role === :owned || _sm_reject(
             "state-machine writes shared authority `$name`")
-        field_type = _pp_fieldtype(plan, canon, OW, SH)
+        root_type = _pp_fieldtype(plan, canon, OW, SH)
         statement.dot && _sm_reject(
             "state-machine writes do not admit authored broadcasting")
 
@@ -1186,13 +1661,37 @@ function compile_state_machine_method(pf::_PreparedFactory, ::Type{OW},
                       formals, block_locals, false, field_regs)
         rhs_symbol = fresh(:__smm_rhs_, name)
         push!(destination, :(local $rhs_symbol = $rhs))
+        dependents = invalidate!(destination, (canon,))
         if statement.target isa _SelfField
-            field_type <: AbstractArray && _sm_reject(
-                "state-machine array writes must name explicit indices")
-            push!(destination, :(_canon_kill!(owned, Val($slot))))
-            push!(destination, :(_canon_set!(owned, Val($slot), $rhs_symbol)))
-            push!(destination, :(_canon_bless!(owned, Val($slot))))
+            path = Base.tail(statement.target.path)
+            field_type = _sm_structural_path_type(root_type, Val(path))
+            field_type <: AbstractArray && isempty(path) && _sm_reject(
+                "state-machine root-array writes must name explicit indices")
+            value = if isempty(path)
+                rhs_symbol
+            else
+                haskey(field_regs, name) &&
+                    field_regs[name] isa _StructuredStatePort || _sm_reject(
+                    "nested state write `$name.$(join(path, '.'))` requires " *
+                    "a structured_state_port binding")
+                first(path) in propertynames(
+                    getfield(field_regs[name], :repairs)) || _sm_reject(
+                    "nested state write `$name.$(join(path, '.'))` is not " *
+                    "declared writable by its compiled transition")
+                root = _pp_read(plan, canon)
+                port = :(getfield(getfield(handles, :ports),
+                                  $(QuoteNode(name))))
+                changed = :(_sm_structured_set($port, $root,
+                    Val($(QuoteNode(path))), $rhs_symbol))
+                repair_name = first(path)
+                repair = :(getfield(getfield($port, :repairs),
+                                    $(QuoteNode(repair_name))))
+                :($repair($changed))
+            end
+            push!(destination, :(_canon_set!(owned, Val($slot), $value)))
+            repair!(destination, (canon,), dependents)
         elseif statement.target isa _Index
+            field_type = root_type
             field_type <: AbstractArray || _sm_reject(
                 "state-machine indexed write target `$name` is not an array")
             statement.target.base isa _SelfField &&
@@ -1209,10 +1708,9 @@ function compile_state_machine_method(pf::_PreparedFactory, ::Type{OW},
                 push!(destination, :(local $symbol = $value))
                 push!(index_symbols, symbol)
             end
-            push!(destination, :(_canon_kill!(owned, Val($slot))))
             push!(destination,
                 :(setindex!($array_symbol, $rhs_symbol, $(index_symbols...))))
-            push!(destination, :(_canon_bless!(owned, Val($slot))))
+            repair!(destination, (canon,), dependents)
         else
             _sm_reject("unsupported state-machine write target " *
                        "`$(typeof(statement.target))`")
@@ -1237,9 +1735,68 @@ function compile_state_machine_method(pf::_PreparedFactory, ::Type{OW},
                     block_locals)
                 push!(destination, :($symbol = $rhs))
             elseif statement isa _ExprStmt
-                value = _sm_rhs(statement.expr, block_syms, plan, fields,
-                    OW, SH, formals, block_locals, false, field_regs)
-                push!(destination, value)
+                expression = statement.expr
+                if expression isa _RegisteredCall &&
+                        getfield(expression.registration, :kind) === :intrinsic
+                    getfield(expression.registration, :source) === copy!! &&
+                        length(expression.args) == 2 || _sm_reject(
+                        "unsupported state-machine intrinsic effect")
+                    dest, src = expression.args
+                    dest isa _SelfField && src isa _SelfField &&
+                        length(dest.path) == 1 && length(src.path) == 1 ||
+                        _sm_reject("structural copy requires two direct state roots")
+                    destination_name, source_name = only(dest.path), only(src.path)
+                    destination_canon = get(fields, destination_name, 0)
+                    source_canon = get(fields, source_name, 0)
+                    destination_canon != 0 && source_canon != 0 || _sm_reject(
+                        "structural copy references an unknown state root")
+                    role, slot = kernel_plan_field(plan, destination_canon)
+                    role === :owned || _sm_reject(
+                        "structural copy destination must be owned")
+                    value = if haskey(field_regs, destination_name) &&
+                            field_regs[destination_name] isa _StructuredStatePort
+                        port = :(getfield(getfield(handles, :ports),
+                                          $(QuoteNode(destination_name))))
+                        :(_sm_structured_copy(
+                            $port, $(_pp_read(plan, source_canon))))
+                    else
+                        :(_sm_structural_copy(
+                            $(_pp_read(plan, source_canon))))
+                    end
+                    dependents = invalidate!(destination,
+                                             (destination_canon,))
+                    push!(destination,
+                        :(_canon_set!(owned, Val($slot), $value)))
+                    repair!(destination, (destination_canon,), dependents)
+                elseif expression isa _FieldCall &&
+                        length(expression.path) == 1 &&
+                        haskey(field_regs, only(expression.path)) &&
+                        field_regs[only(expression.path)] isa _EffectCallablePort
+                    name = only(expression.path)
+                    port = field_regs[name]
+                    roots = Int[]
+                    for position in _kernel_field_written_arguments(port)
+                        position <= length(expression.pos) || _sm_reject(
+                            "effect callable `$name` writes an absent argument")
+                        actual = expression.pos[position]
+                        actual isa _SelfField && !isempty(actual.path) ||
+                            _sm_reject("effect callable `$name` must expose each " *
+                                "written state root directly")
+                        root = first(actual.path)
+                        haskey(fields, root) || _sm_reject(
+                            "effect callable `$name` writes unknown root `$root`")
+                        push!(roots, fields[root])
+                    end
+                    dependents = invalidate!(destination, roots)
+                    value = _sm_rhs(expression, block_syms, plan, fields,
+                        OW, SH, formals, block_locals, false, field_regs)
+                    push!(destination, value)
+                    repair!(destination, roots, dependents)
+                else
+                    value = _sm_rhs(expression, block_syms, plan, fields,
+                        OW, SH, formals, block_locals, false, field_regs)
+                    push!(destination, value)
+                end
             elseif statement isa _PlaceWrite
                 emit_write!(statement, destination, block_syms, block_locals)
             elseif statement isa _Guard
@@ -1398,6 +1955,7 @@ end
 function _sm_machine_actual_domain_ok(::Type{Actual}, ::Type{Declared}) where
         {Actual,Declared}
     Declared === _SMUnannotated || Actual <: Declared || return false
+    _sm_ordered_rng_replay_type(Actual) && return true
     Actual <: AbstractMatrix && return _kernel_dom_num_matrix(Actual)
     Actual <: AbstractArray && return _sm_builtin_array(Actual)
     _kernel_dom_num_scalar(Actual)
@@ -1476,7 +2034,7 @@ function compile_stateful_methods(skel, pf::_PreparedFactory, ::Type{OW},
                                   ::Type{SH}, field_regs=Dict{Symbol,Any}()) where {OW,SH}
     irs_all = method_irs(skel); plan = kernel_prepared_plan(pf)
     typeauth = kernel_type_authorities(skel)
-    global_written = _sm_global_written(plan, irs_all)
+    global_written = _sm_global_written(plan, irs_all, field_regs)
     methods_by_id = Dict{MethodId,MethodIR}(ir.id => ir for ir in irs_all)
     byname = Dict{Symbol,Vector{MethodIR}}()
     for ir in irs_all; push!(get!(byname, ir.id.name, MethodIR[]), ir); end
@@ -1492,7 +2050,8 @@ function compile_stateful_methods(skel, pf::_PreparedFactory, ::Type{OW},
                 ir.body, statement -> statement isa Union{_If,_Guard})
             if positional != 1 || structured
                 fn, forest = compile_state_machine_method(
-                    pf, OW, SH, ir, typeauth, field_regs, methods_by_id)
+                    pf, OW, SH, ir, global_written, typeauth, field_regs,
+                    methods_by_id)
                 declared = _sm_machine_declared_types(ir, typeauth)
                 push!(pairs, name => _SMMachineSet{name,declared,forest,
                     typeof(fn)}(fn))
@@ -1545,6 +2104,19 @@ struct _StatefulRuntime{MS<:NamedTuple,ENS<:NamedTuple,Access}
     methods::MS
     ensures::ENS
 end
+
+# Native generated methods already receive the immutable prepared-handle
+# tuple.  Thread compiler bindings through the same static resource without
+# changing the generated call ABI; indexed access remains the exact handle
+# access used by recipe emission.
+struct _StatefulResources{H,P}
+    handles::H
+    ports::P
+end
+Base.getindex(resources::_StatefulResources, index::Int) =
+    getfield(resources, :handles)[index]
+Base.length(resources::_StatefulResources) =
+    length(getfield(resources, :handles))
 struct _StatefulKernel{S,PF,RT<:_StatefulRuntime,OW,SH,B}
     skeleton::S
     prepared::PF
@@ -1572,9 +2144,10 @@ end
 # fixed positional arity.  The wrapper is immutable compiler metadata just as
 # the straight-line transition above is; only state and arguments are dynamic.
 struct _FunctionalStateMachineTransition{
-        Names,ArrayNames,Iterations,ArgumentTypes,Declared,Forest,F,P}
+        Names,ArrayNames,Iterations,ArgumentTypes,Declared,Forest,F,P,E}
     f::F
     ports::P
+    ensures::E
 end
 
 _sm_functional_argument_type_ok(::Type{Actual}, ::Type{Expected}) where
@@ -1597,16 +2170,57 @@ function _sm_functional_machine_call(
         for (A, E) in zip(actual, expected)) ||
         throw(ArgumentError(
             "functional state-machine arguments do not match their logical contract"))
+    for argument in arguments
+        argument isa OrderedRNGReplay &&
+            _sm_validate_ordered_rng_storage(argument)
+    end
     for name in ArrayNames
         message = "functional state-machine array `$name` has a zero axis"
         all(>(0), size(getfield(state, name))) || throw(ArgumentError(message))
     end
     RuntimeGeneratedFunctions.generated_callfunc(
-        getfield(transition, :f), getfield(transition, :ports), state,
-        arguments)
+        getfield(transition, :f), getfield(transition, :ports),
+        getfield(transition, :ensures), state, arguments)
 end
 
 @inline _sm_predicated_select(active, new, old) = ifelse.(active, new, old)
+@inline _sm_predicated_select(active::Number, new::Number, old::Number) =
+    ifelse(active, new, old)
+@inline function _sm_predicated_select(active, new::F, old::F) where {F<:Function}
+    new === old || throw(ArgumentError(
+        "predicated functional state cannot select between callable authorities"))
+    new
+end
+@inline _sm_predicated_select(active, ::Nothing, ::Nothing) = nothing
+@inline _sm_predicated_select(active, new::NamedTuple, old::NamedTuple) =
+    map((candidate, prior) -> _sm_predicated_select(active, candidate, prior),
+        new, old)
+@inline _sm_predicated_select(active, new::Tuple, old::Tuple) =
+    map((candidate, prior) -> _sm_predicated_select(active, candidate, prior),
+        new, old)
+@inline _sm_predicated_select(active, new::LinearAlgebra.Diagonal,
+                              old::LinearAlgebra.Diagonal) =
+    LinearAlgebra.Diagonal(
+        _sm_predicated_select(active, new.diag, old.diag))
+@inline function _sm_predicated_select(active,
+        new::LinearAlgebra.Cholesky, old::LinearAlgebra.Cholesky)
+    new.uplo == old.uplo && new.info == old.info || throw(ArgumentError(
+        "predicated functional state cannot change Cholesky metadata"))
+    LinearAlgebra.Cholesky(
+        _sm_predicated_select(active, new.factors, old.factors),
+        new.uplo, new.info)
+end
+@inline _sm_predicated_select(active, new::OrderedRNGReplay,
+                              old::OrderedRNGReplay) =
+    OrderedRNGReplay(
+        _sm_predicated_select(active, new.normals, old.normals),
+        _sm_predicated_select(active, new.uniforms, old.uniforms),
+        _sm_predicated_select(active, new.exponentials, old.exponentials),
+        _sm_predicated_select(active, new.normal_index, old.normal_index),
+        _sm_predicated_select(active, new.uniform_index, old.uniform_index),
+        _sm_predicated_select(active, new.exponential_index,
+                              old.exponential_index),
+        _sm_predicated_select(active, new.overflow, old.overflow))
 @inline _sm_predicated_and(lhs, rhs) = lhs .& rhs
 @inline _sm_predicated_or(lhs, rhs) = lhs .| rhs
 @inline _sm_predicated_not(value) = .!value
@@ -1640,13 +2254,15 @@ function _sm_functional_rhs(x, syms, plan::_KernelPlan, fields,
         methods_by_id=Dict{MethodId,MethodIR}(), stack=MethodId[],
         ensure_field=nothing) where {OW,SH}
     if x isa _SelfField
-        name = x.path[end]
+        name = first(x.path)
         haskey(fields, name) || _sm_reject(
             "functional stateful rhs reads unknown field `$name`")
         ensure_field === nothing || ensure_field(fields[name])
         haskey(syms, (:field, name)) || _sm_reject(
             "functional stateful rhs has no value for field `$name`")
-        syms[(:field, name)]
+        value = syms[(:field, name)]
+        isempty(Base.tail(x.path)) ? value :
+            :(_sm_structural_get($value, Val($(QuoteNode(Base.tail(x.path))))))
     elseif x isa _FormalRef
         haskey(syms, (:formal, x.arg)) || _sm_reject(
             "functional stateful rhs reads unbound formal `$(x.arg)`")
@@ -1664,14 +2280,21 @@ function _sm_functional_rhs(x, syms, plan::_KernelPlan, fields,
             arg, syms, plan, fields, OW, SH, formals, locals, false,
             field_regs, methods_by_id, stack, ensure_field) for arg in x.elts)...)
     elseif x isa _RegisteredCall
-        f = _sm_exact_callee(x; allow_broadcast=dot)
+        effect = getfield(x.registration, :primitive_effect)
+        f = if effect isa _PrimitiveEffect && effect.kind === :rng
+            _sm_exact_ordered_rng(x)
+            _exec_captured_callee(x)
+        else
+            _sm_exact_callee(x; allow_broadcast=dot)
+        end
         args = Any[_sm_functional_rhs(
             arg, syms, plan, fields, OW, SH, formals, locals, dot,
             field_regs, methods_by_id, stack, ensure_field)
                    for arg in x.args]
         dot && _sm_isvector(x, plan, fields, OW, SH, formals, locals) ?
             Expr(:call, GlobalRef(Base, :broadcasted), f, args...) :
-            Expr(:call, f, args...)
+            Expr(:call, f === Base.sqrt ? :_sm_sanctioned_sqrt :
+                f === Base.:* ? :_sm_sanctioned_mul : f, args...)
     elseif x isa _FieldCall
         length(x.path) == 1 || _sm_reject(
             "functional pure callable port must be a direct state field")
@@ -1821,13 +2444,15 @@ end
 
 function _sm_functional_machine_rhs(x, syms, plan::_KernelPlan, fields,
         ::Type{OW}, ::Type{SH}, formals, locals, dot::Bool, field_regs,
-        methods_by_id, stack) where {OW,SH}
+        methods_by_id, stack, active=nothing, rng_effect=nothing) where {OW,SH}
     if x isa _SelfField
-        name = x.path[end]
-        length(x.path) == 1 && haskey(fields, name) &&
+        name = first(x.path)
+        haskey(fields, name) &&
             haskey(syms, (:field, name)) || _sm_reject(
-            "functional state-machine read requires one known state field")
-        syms[(:field, name)]
+            "functional state-machine read requires one known state root")
+        value = syms[(:field, name)]
+        isempty(Base.tail(x.path)) ? value :
+            :(_sm_structural_get($value, Val($(QuoteNode(Base.tail(x.path))))))
     elseif x isa _FormalRef
         haskey(syms, (:formal, x.arg)) || _sm_reject(
             "functional state-machine reads unbound formal `$(x.arg)`")
@@ -1842,11 +2467,13 @@ function _sm_functional_machine_rhs(x, syms, plan::_KernelPlan, fields,
         _sm_exact_callable(x)
     elseif x isa _TupleExpr
         Expr(:tuple, (_sm_functional_machine_rhs(arg, syms, plan, fields,
-            OW, SH, formals, locals, false, field_regs, methods_by_id, stack)
+            OW, SH, formals, locals, false, field_regs, methods_by_id, stack,
+            active, rng_effect)
             for arg in x.elts)...)
     elseif x isa _Index
         base = _sm_functional_machine_rhs(x.base, syms, plan, fields,
-            OW, SH, formals, locals, false, field_regs, methods_by_id, stack)
+            OW, SH, formals, locals, false, field_regs, methods_by_id, stack,
+            active, rng_effect)
         indices = Any[]
         index_seed = get(syms, (:compiler, :index_seed), nothing)
         index_seed === nothing && _sm_reject(
@@ -1854,7 +2481,7 @@ function _sm_functional_machine_rhs(x, syms, plan::_KernelPlan, fields,
         for (dimension, index) in enumerate(x.idxs)
             value = _sm_functional_machine_rhs(index, syms, plan, fields,
                 OW, SH, formals, locals, false, field_regs, methods_by_id,
-                stack)
+                stack, active, rng_effect)
             traced_value = :($value + zero($index_seed))
             push!(indices,
                 :(_sm_safe_index($traced_value, $base, Val($dimension))))
@@ -1862,28 +2489,54 @@ function _sm_functional_machine_rhs(x, syms, plan::_KernelPlan, fields,
         :(_sm_functional_index($base, $(indices...)))
     elseif x isa _IfExpr
         condition = _sm_functional_machine_rhs(x.cond, syms, plan, fields,
-            OW, SH, formals, locals, false, field_regs, methods_by_id, stack)
+            OW, SH, formals, locals, false, field_regs, methods_by_id, stack,
+            active, rng_effect)
+        then_active = active === nothing ? nothing :
+            :(_sm_predicated_and($active, $condition))
+        else_active = active === nothing ? nothing :
+            :(_sm_predicated_and($active, _sm_predicated_not($condition)))
         then_value = _sm_functional_machine_rhs(x.thenv, syms, plan, fields,
-            OW, SH, formals, locals, false, field_regs, methods_by_id, stack)
+            OW, SH, formals, locals, false, field_regs, methods_by_id, stack,
+            then_active, rng_effect)
         else_value = _sm_functional_machine_rhs(x.elsev, syms, plan, fields,
-            OW, SH, formals, locals, false, field_regs, methods_by_id, stack)
+            OW, SH, formals, locals, false, field_regs, methods_by_id, stack,
+            else_active, rng_effect)
         :(_sm_predicated_select($condition, $then_value, $else_value))
     elseif x isa _Short
         lhs = _sm_functional_machine_rhs(x.lhs, syms, plan, fields,
-            OW, SH, formals, locals, false, field_regs, methods_by_id, stack)
+            OW, SH, formals, locals, false, field_regs, methods_by_id, stack,
+            active, rng_effect)
+        execute = x.op === :&& ? lhs : x.op === :|| ?
+            :(_sm_predicated_not($lhs)) : nothing
+        execute === nothing && _sm_reject(
+            "unsupported functional short-circuit operator `$(x.op)`")
+        rhs_active = active === nothing ? nothing :
+            :(_sm_predicated_and($active, $execute))
         rhs = _sm_functional_machine_rhs(x.rhs, syms, plan, fields,
-            OW, SH, formals, locals, false, field_regs, methods_by_id, stack)
+            OW, SH, formals, locals, false, field_regs, methods_by_id, stack,
+            rhs_active, rng_effect)
         x.op === :&& ? :(_sm_predicated_and($lhs, $rhs)) :
         x.op === :|| ? :(_sm_predicated_or($lhs, $rhs)) :
         _sm_reject("unsupported functional short-circuit operator `$(x.op)`")
     elseif x isa _RegisteredCall
-        f = _sm_exact_callee(x; allow_broadcast=dot)
+        effect = getfield(x.registration, :primitive_effect)
         arguments = Any[_sm_functional_machine_rhs(arg, syms, plan, fields,
-            OW, SH, formals, locals, dot, field_regs, methods_by_id, stack)
+            OW, SH, formals, locals, dot, field_regs, methods_by_id, stack,
+            active, rng_effect)
             for arg in x.args]
+        if effect isa _PrimitiveEffect && effect.kind === :rng
+            _sm_exact_ordered_rng(x)
+            active === nothing && _sm_reject(
+                "ordered RNG lowering requires an explicit source-path predicate")
+            rng_effect === nothing && _sm_reject(
+                "ordered RNG lowering has no typed replay implementation")
+            return rng_effect(x, syms, active, arguments)
+        end
+        f = _sm_exact_callee(x; allow_broadcast=dot)
         dot && _sm_isvector(x, plan, fields, OW, SH, formals, locals) ?
             Expr(:call, GlobalRef(Base, :broadcasted), f, arguments...) :
-            Expr(:call, f, arguments...)
+            Expr(:call, f === Base.sqrt ? :_sm_sanctioned_sqrt :
+                f === Base.:* ? :_sm_sanctioned_mul : f, arguments...)
     elseif x isa _FieldCall
         length(x.path) == 1 || _sm_reject(
             "functional state-machine callable port must be direct")
@@ -1894,14 +2547,16 @@ function _sm_functional_machine_rhs(x, syms, plan::_KernelPlan, fields,
         name = only(x.path)
         _sm_pure_port(field_regs, name)
         arguments = Any[_sm_functional_machine_rhs(arg, syms, plan, fields,
-            OW, SH, formals, locals, false, field_regs, methods_by_id, stack)
+            OW, SH, formals, locals, false, field_regs, methods_by_id, stack,
+            active, rng_effect)
             for arg in x.pos]
         Expr(:call,
             :(getfield(getfield(ports, $(QuoteNode(name))),
                        :functional_lowering)), arguments...)
     elseif x isa _CallExpr
         _sm_functional_machine_sibling_rhs(x, syms, plan, fields, OW, SH,
-            formals, locals, field_regs, methods_by_id, stack)
+            formals, locals, field_regs, methods_by_id, stack, active,
+            rng_effect)
     else
         _sm_reject("unsupported functional state-machine rhs `$(typeof(x))`")
     end
@@ -1909,7 +2564,8 @@ end
 
 function _sm_functional_machine_sibling_rhs(call::_CallExpr, syms,
         plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH}, caller_formals,
-        caller_locals, field_regs, methods_by_id, stack) where {OW,SH}
+        caller_locals, field_regs, methods_by_id, stack, active=nothing,
+        rng_effect=nothing) where {OW,SH}
     call.target isa _SelfRef || _sm_reject(
         "functional state-machine sibling call must target current state")
     length(call.candidates) == 1 || _sm_reject(
@@ -1932,7 +2588,8 @@ function _sm_functional_machine_sibling_rhs(call::_CallExpr, syms,
     for (formal, actual) in zip(ir.formals, call.pos)
         callee_syms[(:formal, formal.name)] = _sm_functional_machine_rhs(
             actual, syms, plan, fields, OW, SH, caller_formals,
-            caller_locals, false, field_regs, methods_by_id, stack)
+            caller_locals, false, field_regs, methods_by_id, stack, active,
+            rng_effect)
         # The pure conditional helper admitted below operates on scalars. More
         # general sibling array helpers require their own typed contract.
         formal.type === nothing || _sm_reject(
@@ -1946,7 +2603,10 @@ function _sm_functional_machine_sibling_rhs(call::_CallExpr, syms,
         "functional state-machine sibling must be one conditional value")
     branch = only(ir.body)
     nested = [stack..., method_id]
-    branch_value = function (body)
+    condition = _sm_functional_machine_rhs(branch.cond, callee_syms, plan,
+        fields, OW, SH, callee_formals, Dict{Symbol,Bool}(), false,
+        field_regs, methods_by_id, nested, active, rng_effect)
+    branch_value = function (body, branch_active)
         length(body) == 1 || _sm_reject(
             "functional state-machine sibling branch must contain one value")
         statement = only(body)
@@ -1956,13 +2616,14 @@ function _sm_functional_machine_sibling_rhs(call::_CallExpr, syms,
             "functional state-machine sibling branch has no value")
         _sm_functional_machine_rhs(value, callee_syms, plan, fields, OW, SH,
             callee_formals, Dict{Symbol,Bool}(), false, field_regs,
-            methods_by_id, nested)
+            methods_by_id, nested, branch_active, rng_effect)
     end
-    condition = _sm_functional_machine_rhs(branch.cond, callee_syms, plan,
-        fields, OW, SH, callee_formals, Dict{Symbol,Bool}(), false,
-        field_regs, methods_by_id, nested)
-    then_value = branch_value(branch.thenb)
-    else_value = branch_value(branch.elseb)
+    then_active = active === nothing ? nothing :
+        :(_sm_predicated_and($active, $condition))
+    else_active = active === nothing ? nothing :
+        :(_sm_predicated_and($active, _sm_predicated_not($condition)))
+    then_value = branch_value(branch.thenb, then_active)
+    else_value = branch_value(branch.elseb, else_active)
     :(_sm_predicated_select($condition, $then_value, $else_value))
 end
 
@@ -1986,15 +2647,21 @@ function _functional_state_machine_method(
     field_regs = _stateful_field_regs(getfield(kernel, :bindings))
     methods_by_id = Dict{MethodId,MethodIR}(
         method.id => method for method in method_irs(skeleton))
+    spec = kernel_spec(skeleton)
     plan = kernel_prepared_plan(getfield(kernel, :prepared))
-    isempty(kernel_plan_producer(plan)) || _sm_reject(
-        "functional structured lowering currently requires source-only state fields")
     fields = _exec_canon_map(plan)
+    global_written = _sm_global_written(
+        plan, values(methods_by_id), field_regs)
+    producer = _sm_active_producer(plan, global_written)
     names = _functional_state_names(kernel)
+    name_by_canon = Dict{Int,Symbol}()
     aliases = Dict{Int,Vector{Symbol}}()
     for name in names
         canon = get(fields, name, 0)
-        canon == 0 || push!(get!(aliases, canon, Symbol[]), name)
+        if canon != 0
+            get!(name_by_canon, canon, name)
+            push!(get!(aliases, canon, Symbol[]), name)
+        end
     end
     array_name_buffer = Symbol[]
     for name in names
@@ -2005,7 +2672,9 @@ function _functional_state_machine_method(
     array_names = Tuple(array_name_buffer)
 
     statements = Any[]
+    ensures = Any[]
     base_syms = Dict{Any,Symbol}()
+    effect_syms = Dict{Symbol,Symbol}()
     formals = Dict{Symbol,Bool}()
     locals = Dict{Symbol,Bool}()
     serial = Ref(0)
@@ -2025,25 +2694,19 @@ function _functional_state_machine_method(
         push!(statements,
             :(local $symbol = getfield(state, $(QuoteNode(name)))))
     end
-    initial_field_syms = copy(base_syms)
-    predicate_index = findfirst(names) do name
-        canon = get(fields, name, 0)
-        canon == 0 && return false
-        role, _ = kernel_plan_field(plan, canon)
-        field_type = _pp_fieldtype(plan, canon, OW, SH)
-        role === :owned && _kernel_dom_int_scalar(field_type) &&
-            field_type !== Bool
+    initial_effect_syms = Dict{Symbol,Symbol}()
+    for name in propertynames(getfield(getfield(kernel, :bindings), :fields))
+        port = getfield(getfield(getfield(kernel, :bindings), :fields), name)
+        port isa _EffectCallablePort || continue
+        initial = fresh(:__sfm_initial_effect_, name)
+        symbol = fresh(:__sfm_effect_, name)
+        initial_effect_syms[name] = initial
+        effect_syms[name] = symbol
+        push!(statements, :(local $initial = getfield(
+            getfield(ports, $(QuoteNode(name))), :initial_effect_state)))
+        push!(statements, :(local $symbol = $initial))
     end
-    predicate_index === nothing && _sm_reject(
-        "functional state-machine requires one owned builtin scalar predicate carrier")
-    predicate_name = names[predicate_index]
-    predicate_source = base_syms[(:field, predicate_name)]
-    base_syms[(:compiler, :index_seed)] = predicate_source
-    predicate_true = bind!(
-        :(zero($predicate_source) == zero($predicate_source)),
-        :__sfm_predicate_true_)
-    predicate_false = bind!(
-        :(_sm_predicated_not($predicate_true)), :__sfm_predicate_false_)
+    initial_field_syms = copy(base_syms)
     for (position, formal) in enumerate(ir.formals)
         symbol = fresh(:__sfm_formal_, formal.name)
         base_syms[(:formal, formal.name)] = symbol
@@ -2052,6 +2715,42 @@ function _functional_state_machine_method(
                                    formal.type) <: AbstractArray
         push!(statements, :(local $symbol = arguments[$position]))
     end
+    predicate_index = findfirst(names) do name
+        canon = get(fields, name, 0)
+        canon == 0 && return false
+        role, _ = kernel_plan_field(plan, canon)
+        field_type = _pp_fieldtype(plan, canon, OW, SH)
+        role === :owned && _kernel_dom_num_scalar(field_type)
+    end
+    predicate_index === nothing && _sm_reject(
+        "functional state-machine requires one owned builtin scalar predicate carrier")
+    predicate_name = names[predicate_index]
+    predicate_source = base_syms[(:field, predicate_name)]
+    index_index = findfirst(names) do name
+        canon = get(fields, name, 0)
+        canon == 0 && return false
+        role, _ = kernel_plan_field(plan, canon)
+        field_type = _pp_fieldtype(plan, canon, OW, SH)
+        role === :owned && _kernel_dom_int_scalar(field_type) &&
+            field_type !== Bool
+    end
+    index_source = if index_index !== nothing
+        base_syms[(:field, names[index_index])]
+    else
+        replay_position = findfirst(_sm_ordered_rng_replay_type, argument_types)
+        replay_position === nothing && _sm_reject(
+            "functional state-machine requires an owned integer or ordered-RNG cursor for dynamic indexing")
+        replay_formal = ir.formals[replay_position].name
+        replay_symbol = base_syms[(:formal, replay_formal)]
+        bind!(:(getfield($replay_symbol, :normal_index)),
+              :__sfm_index_seed_)
+    end
+    base_syms[(:compiler, :index_seed)] = index_source
+    predicate_true = bind!(
+        :(zero($predicate_source) == zero($predicate_source)),
+        :__sfm_predicate_true_)
+    predicate_false = bind!(
+        :(_sm_predicated_not($predicate_true)), :__sfm_predicate_false_)
     control_overflow = bind!(predicate_false, :__sfm_control_overflow_)
     return_seen = bind!(predicate_false, :__sfm_return_seen_)
     return_value = Ref{Any}(nothing)
@@ -2063,10 +2762,11 @@ function _functional_state_machine_method(
         end
         result
     end
-    rhs = (expression, local_syms, local_types) ->
+    rng_effect! = nothing
+    rhs = (expression, local_syms, local_types, active=predicate_false) ->
         _sm_functional_machine_rhs(expression, combined(local_syms), plan,
             fields, OW, SH, formals, local_types, false, field_regs,
-            methods_by_id, MethodId[ir.id])
+            methods_by_id, MethodId[ir.id], active, rng_effect!)
     mark_invalid! = function (active, valid)
         invalid = bind!(
             :(_sm_predicated_and($active, _sm_predicated_not($valid))),
@@ -2075,6 +2775,55 @@ function _functional_state_machine_method(
             :(_sm_predicated_or($control_overflow, $invalid)),
             :__sfm_control_overflow_)
         bind!(:(_sm_predicated_and($active, $valid)), :__sfm_active_)
+    end
+    rng_effect! = function (call, syms, active, arguments)
+        effect = _sm_exact_ordered_rng(call)
+        position = effect.rng_arg
+        position isa Int && position <= length(arguments) || _sm_reject(
+            "ordered RNG descriptor has no valid replay argument")
+        replay = arguments[position]
+        logical_position = findfirst(isequal(replay),
+            Any[base_syms[(:formal, formal.name)] for formal in ir.formals])
+        logical_position === nothing && _sm_reject(
+            "ordered RNG replay must be threaded from one direct method formal")
+        replay_type = argument_types[logical_position]
+        _sm_ordered_rng_replay_type(replay_type) || _sm_reject(
+            "ordered RNG formal does not carry the typed replay contract")
+        available = bind!(
+            :(_sm_predicated_and($active,
+                _sm_predicated_not($control_overflow))),
+            :__sfm_rng_active_)
+        candidate_expression = if effect.token ===
+                Symbol("__rk_rng_Random_randn!__")
+            length(arguments) == 2 || _sm_reject(
+                "ordered normal replay requires one destination")
+            :(_sm_ordered_rng_normal_candidate(
+                $replay, $(arguments[2])))
+        elseif effect.token === Symbol("__rk_rng_Random_rand__")
+            length(arguments) == 2 || _sm_reject(
+                "ordered uniform replay requires one sample descriptor")
+            :(_sm_ordered_rng_uniform_candidate($replay))
+        elseif effect.token === Symbol("__rk_rng_Random_randexp__")
+            length(arguments) == 1 || _sm_reject(
+                "ordered exponential replay accepts only its replay")
+            :(_sm_ordered_rng_exponential_candidate($replay))
+        else
+            _sm_reject("ordered RNG token `$(effect.token)` has no replay lowering")
+        end
+        candidate = bind!(candidate_expression, :__sfm_rng_candidate_)
+        valid = bind!(:(getfield($candidate, :valid)), :__sfm_rng_valid_)
+        mark_invalid!(available, valid)
+        replacement = :(getfield($candidate, :replay))
+        updated = bind!(
+            :(_sm_predicated_select($available, $replacement, $replay)),
+            :__sfm_rng_replay_)
+        for (key, value) in collect(syms)
+            isequal(value, replay) && (syms[key] = updated)
+        end
+        for (key, value) in collect(base_syms)
+            isequal(value, replay) && (base_syms[key] = updated)
+        end
+        :(getfield($candidate, :value))
     end
     walk_bounds! = nothing
     walk_bounds! = function (expression, initial_active,
@@ -2159,12 +2908,71 @@ function _functional_state_machine_method(
         end
         symbol
     end
+    repair_after! = function (roots, active)
+        root_set = Set(roots)
+        stale = Set{Int}()
+        for root in roots
+            union!(stale, _exec_kill_closure(plan, root, producer))
+        end
+        setdiff!(stale, root_set)
+        repaired = Set{Int}()
+        repair_one! = nothing
+        repair_one! = function (canon)
+            canon in stale || return
+            haskey(producer, canon) || _sm_reject(
+                "functional state-machine cannot repair derived canon $canon")
+            recipe = producer[canon]
+            handle_position = findfirst(==(recipe), kernel_plan_recipes(plan))
+            handle_position === nothing && _sm_reject(
+                "functional state-machine has no selected handle for canon $canon")
+            handle = kernel_prepared_handles(getfield(kernel, :prepared))[
+                handle_position]
+            for input in handle.inputs
+                input in stale && repair_one!(input)
+            end
+            name = get(name_by_canon, canon, nothing)
+            name === nothing && _sm_reject(
+                "functional state-machine cannot name derived canon $canon")
+            have = Tuple(name_by_canon[current]
+                for current in sort!(collect(keys(name_by_canon)))
+                if !(current in stale))
+            prepared = try
+                prepare(spec; have, want=name)
+            catch error
+                _sm_reject("functional state-machine repair for `$name` failed: " *
+                    sprint(showerror, error))
+            end
+            push!(ensures, prepared)
+            ensure_index = length(ensures)
+            arguments = Any[]
+            for input in inputs(prepared)
+                haskey(base_syms, (:field, input.name)) || _sm_reject(
+                    "functional state-machine repair for `$name` requires " *
+                    "unknown input `$(input.name)`")
+                push!(arguments, base_syms[(:field, input.name)])
+            end
+            candidate = bind!(
+                :(getfield(ensures, $ensure_index)($(arguments...))),
+                :__sfm_repair_, name)
+            old = base_syms[(:field, name)]
+            set_field!(name,
+                :(_sm_predicated_select($active, $candidate, $old)))
+            delete!(stale, canon)
+            push!(repaired, canon)
+            nothing
+        end
+        while !isempty(stale)
+            canon = first(sort!(collect(stale)))
+            repair_one!(canon)
+        end
+        repaired
+    end
 
     emit_write! = function (statement::_PlaceWrite, active,
                             local_syms, local_types)
         statement.root === :self && statement.owner !== nothing &&
             length(statement.owner) == 1 || _sm_reject(
-            "functional state-machine write must target one owned field")
+            "functional state-machine write must target one owned state root")
         name = only(statement.owner)
         canon = get(fields, name, 0)
         canon == 0 && _sm_reject(
@@ -2174,13 +2982,36 @@ function _functional_state_machine_method(
             "functional state-machine writes shared authority `$name`")
         statement.dot && _sm_reject(
             "functional state-machine writes reject authored broadcasting")
-        value = rhs(statement.rhs, local_syms, local_types)
+        value = rhs(statement.rhs, local_syms, local_types, active)
         old = base_syms[(:field, name)]
+        nested_path = ()
         if statement.target isa _SelfField
-            _pp_fieldtype(plan, canon, OW, SH) <: AbstractArray && _sm_reject(
-                "functional state-machine array writes require explicit indices")
-            set_field!(name,
-                :(_sm_predicated_select($active, $value, $old)))
+            path = Base.tail(statement.target.path)
+            nested_path = path
+            target_type = _sm_structural_path_type(
+                _pp_fieldtype(plan, canon, OW, SH), Val(path))
+            target_type <: AbstractArray && isempty(path) && _sm_reject(
+                "functional state-machine root-array writes require explicit indices")
+            if isempty(path)
+                set_field!(name,
+                    :(_sm_predicated_select($active, $value, $old)))
+            else
+                haskey(field_regs, name) &&
+                    field_regs[name] isa _StructuredStatePort || _sm_reject(
+                    "nested state write `$name.$(join(path, '.'))` requires " *
+                    "a structured_state_port binding")
+                first(path) in propertynames(
+                    getfield(field_regs[name], :repairs)) || _sm_reject(
+                    "nested state write `$name.$(join(path, '.'))` is not " *
+                    "declared writable by its compiled transition")
+                port = :(getfield(ports, $(QuoteNode(name))))
+                old_leaf = :(_sm_structural_get(
+                    $old, Val($(QuoteNode(path)))))
+                selected = :(_sm_predicated_select(
+                    $active, $value, $old_leaf))
+                set_field!(name, :(_sm_structured_set(
+                    $port, $old, Val($(QuoteNode(path))), $selected)))
+            end
         elseif statement.target isa _Index
             statement.target.base isa _SelfField &&
                 length(statement.target.base.path) == 1 &&
@@ -2188,7 +3019,7 @@ function _functional_state_machine_method(
                 "functional state-machine indexed write must target its field directly")
             indices = Any[]
             for (dimension, index) in enumerate(statement.target.idxs)
-                raw = rhs(index, local_syms, local_types)
+                raw = rhs(index, local_syms, local_types, active)
                 raw = :($raw + zero($predicate_source))
                 push!(indices,
                     :(_sm_safe_index($raw, $old, Val($dimension))))
@@ -2206,6 +3037,18 @@ function _functional_state_machine_method(
             _sm_reject("unsupported functional state-machine write target " *
                        "`$(typeof(statement.target))`")
         end
+        if !isempty(nested_path)
+            port = :(getfield(ports, $(QuoteNode(name))))
+            repair_name = first(nested_path)
+            repair = :(getfield(getfield($port, :repairs),
+                                $(QuoteNode(repair_name))))
+            changed = base_syms[(:field, name)]
+            candidate = bind!(:($repair($changed)),
+                              :__sfm_nested_repair_, name)
+            set_field!(name, :(_sm_structured_predicated_select(
+                $port, $active, $candidate, $changed)))
+        end
+        repair_after!((canon,), active)
         nothing
     end
 
@@ -2219,7 +3062,7 @@ function _functional_state_machine_method(
                 name = only(statement.lhs)
                 active = walk_bounds!(statement.rhs, active,
                                       local_syms, local_types)
-                value = rhs(statement.rhs, local_syms, local_types)
+                value = rhs(statement.rhs, local_syms, local_types, active)
                 if haskey(local_syms, name)
                     symbol = local_syms[name]
                     push!(statements, :($symbol = _sm_predicated_select(
@@ -2233,8 +3076,114 @@ function _functional_state_machine_method(
                     statement.rhs, plan, fields, OW, SH, formals,
                     local_types)
             elseif statement isa _ExprStmt
-                _sm_reject("functional state-machine effect-position " *
-                           "expressions are not admitted")
+                call = statement.expr
+                if call isa _RegisteredCall &&
+                        getfield(call.registration, :kind) === :intrinsic
+                    getfield(call.registration, :source) === copy!! &&
+                        length(call.args) == 2 || _sm_reject(
+                        "unsupported functional state-machine intrinsic effect")
+                    dest, src = call.args
+                    dest isa _SelfField && src isa _SelfField &&
+                        length(dest.path) == 1 && length(src.path) == 1 ||
+                        _sm_reject("functional structural copy requires two state roots")
+                    destination_name, source_name = only(dest.path), only(src.path)
+                    destination_canon = get(fields, destination_name, 0)
+                    destination_canon != 0 && haskey(fields, source_name) ||
+                        _sm_reject("functional structural copy references an unknown state root")
+                    old = base_syms[(:field, destination_name)]
+                    if haskey(field_regs, destination_name) &&
+                            field_regs[destination_name] isa _StructuredStatePort
+                        port = :(getfield(ports,
+                                          $(QuoteNode(destination_name))))
+                        candidate = :(_sm_structured_copy(
+                            $port, $(base_syms[(:field, source_name)])))
+                        set_field!(destination_name,
+                            :(_sm_structured_predicated_select(
+                                $port, $active, $candidate, $old)))
+                    else
+                        candidate = :(_sm_structural_copy(
+                            $(base_syms[(:field, source_name)])))
+                        set_field!(destination_name, :(_sm_predicated_select(
+                            $active, $candidate, $old)))
+                    end
+                    repair_after!((destination_canon,), active)
+                    continue
+                end
+                call isa _FieldCall && length(call.path) == 1 || _sm_reject(
+                    "functional state-machine effect-position expressions " *
+                    "require one typed callable field")
+                name = only(call.path)
+                port = _sm_effect_port(field_regs, name)
+                isempty(call.kw) || _sm_reject(
+                    "functional effect callable ports reject keywords")
+                arguments = Any[]
+                for argument in call.pos
+                    if argument isa _SelfRef
+                        push!(arguments, :(NamedTuple{$names}(($(
+                            Any[base_syms[(:field, field)] for field in names]...),))))
+                    else
+                        active = walk_bounds!(argument, active,
+                            local_syms, local_types)
+                        push!(arguments,
+                            rhs(argument, local_syms, local_types, active))
+                    end
+                end
+                effect = effect_syms[name]
+                candidate = bind!(:(getfield(
+                    getfield(ports, $(QuoteNode(name))), :functional_lowering)(
+                    $effect, $(arguments...))), :__sfm_effect_call_, name)
+                replacement_effect = :(getfield($candidate, :effect_state))
+                push!(statements, :($effect = _sm_predicated_select(
+                    $active, $replacement_effect, $effect)))
+                written = _kernel_field_written_arguments(port)
+                written_roots = Int[]
+                for position in written
+                    actual = call.pos[position]
+                    replacement = :(getfield(
+                        getfield($candidate, :arguments), $position))
+                    if actual isa _SelfField && length(actual.path) == 1
+                        field = only(actual.path)
+                        canon = get(fields, field, 0)
+                        canon != 0 || _sm_reject(
+                            "functional effect callable writes unknown root `$field`")
+                        push!(written_roots, canon)
+                        old = base_syms[(:field, field)]
+                        if haskey(field_regs, field) &&
+                                field_regs[field] isa _StructuredStatePort
+                            structured = :(getfield(ports,
+                                             $(QuoteNode(field))))
+                            set_field!(field,
+                                :(_sm_structured_predicated_select(
+                                    $structured, $active, $replacement, $old)))
+                        else
+                            set_field!(field, :(_sm_predicated_select(
+                                $active, $replacement, $old)))
+                        end
+                    elseif actual isa _SelfRef
+                        append!(written_roots, values(fields))
+                        for field in names
+                            old = base_syms[(:field, field)]
+                            value = :(getfield($replacement,
+                                $(QuoteNode(field))))
+                            if haskey(field_regs, field) &&
+                                    field_regs[field] isa _StructuredStatePort
+                                structured = :(getfield(ports,
+                                                 $(QuoteNode(field))))
+                                set_field!(field,
+                                    :(_sm_structured_predicated_select(
+                                        $structured, $active, $value, $old)))
+                            else
+                                set_field!(field, :(_sm_predicated_select(
+                                    $active, $value, $old)))
+                            end
+                        end
+                    else
+                        _sm_reject("functional effect callable written " *
+                            "arguments must be a state root or the whole receiver")
+                    end
+                end
+                isempty(written_roots) ||
+                    repair_after!(unique(written_roots), active)
             elseif statement isa _PlaceWrite
                 active = walk_bounds!(statement.rhs, active,
                                       local_syms, local_types)
@@ -2246,7 +3195,8 @@ function _functional_state_machine_method(
                     "unsupported functional state-machine guard `$(statement.op)`")
                 active = walk_bounds!(statement.cond, active,
                                       local_syms, local_types)
-                condition = bind!(rhs(statement.cond, local_syms, local_types),
+                condition = bind!(rhs(statement.cond, local_syms, local_types,
+                                      active),
                                   :__sfm_condition_)
                 execute = statement.op === :&& ? condition :
                     bind!(:(_sm_predicated_not($condition)), :__sfm_not_)
@@ -2263,7 +3213,8 @@ function _functional_state_machine_method(
             elseif statement isa _If
                 active = walk_bounds!(statement.cond, active,
                                       local_syms, local_types)
-                condition = bind!(rhs(statement.cond, local_syms, local_types),
+                condition = bind!(rhs(statement.cond, local_syms, local_types,
+                                      active),
                                   :__sfm_condition_)
                 then_active = bind!(
                     :(_sm_predicated_and($active, $condition)),
@@ -2295,8 +3246,8 @@ function _functional_state_machine_method(
                                       local_syms, local_types)
                 active = walk_bounds!(iterator.args[2], active,
                                       local_syms, local_types)
-                lower = rhs(iterator.args[1], local_syms, local_types)
-                upper = rhs(iterator.args[2], local_syms, local_types)
+                lower = rhs(iterator.args[1], local_syms, local_types, active)
+                upper = rhs(iterator.args[2], local_syms, local_types, active)
                 span = bind!(:($upper - $lower + 1), :__sfm_loop_span_, name)
                 within_bound = bind!(:($span <= $max_iterations),
                                      :__sfm_loop_bound_, name)
@@ -2332,7 +3283,7 @@ function _functional_state_machine_method(
                 else
                     active = walk_bounds!(statement.value, active,
                                           local_syms, local_types)
-                    rhs(statement.value, local_syms, local_types)
+                    rhs(statement.value, local_syms, local_types, active)
                 end
                 if return_value[] === nothing
                     return_value[] = bind!(value, :__sfm_return_value_)
@@ -2357,24 +3308,43 @@ function _functional_state_machine_method(
 
     start_active = bind!(predicate_true, :__sfm_active_)
     emit_block!(ir.body, start_active, Dict{Symbol,Symbol}(), locals)
-    outputs = Any[:(_sm_predicated_select(
-        $control_overflow, $(initial_field_syms[(:field, name)]),
-        $(base_syms[(:field, name)]))) for name in names]
+    outputs = Any[]
+    for name in names
+        initial = initial_field_syms[(:field, name)]
+        current = base_syms[(:field, name)]
+        if haskey(field_regs, name) &&
+                field_regs[name] isa _StructuredStatePort
+            port = :(getfield(ports, $(QuoteNode(name))))
+            push!(outputs, :(_sm_structured_predicated_select(
+                $port, $control_overflow, $initial, $current)))
+        else
+            push!(outputs, :(_sm_predicated_select(
+                $control_overflow, $initial, $current)))
+        end
+    end
     result = return_value[] === nothing ? nothing : return_value[]
     returned = :(_sm_predicated_select(
         $control_overflow, $predicate_false, $return_seen))
+    effect_names = Tuple(sort!(collect(keys(effect_syms))))
+    effects = Any[:(_sm_predicated_select(
+        $control_overflow, $(initial_effect_syms[name]), $(effect_syms[name])))
+        for name in effect_names]
+    formal_outputs = Any[base_syms[(:formal, formal.name)] for formal in ir.formals]
     push!(statements, :(return (
         state=NamedTuple{$names}(($(outputs...),)),
+        arguments=($(formal_outputs...),),
         result=$result,
         returned=$returned,
         control_overflow=$control_overflow,
+        effects=NamedTuple{$effect_names}(($(effects...),)),
     )))
     ports = getfield(getfield(kernel, :bindings), :fields)
-    fn = compile(:((ports, state, arguments) ->
+    fn = compile(:((ports, ensures, state, arguments) ->
         $(Expr(:block, statements...))))
     _FunctionalStateMachineTransition{
         names,array_names,max_iterations,ArgumentTypes,Declared,Forest,
-        typeof(fn),typeof(ports)}(fn, ports)
+        typeof(fn),typeof(ports),typeof(Tuple(ensures))}(
+            fn, ports, Tuple(ensures))
 end
 
 function _functional_stateful_method(kernel::_StatefulKernel{S,PF,RT,OW,SH,B},
@@ -2392,6 +3362,9 @@ function _functional_stateful_method(kernel::_StatefulKernel{S,PF,RT,OW,SH,B},
     spec = kernel_spec(skeleton)
     plan = kernel_prepared_plan(getfield(kernel, :prepared))
     fields = _exec_canon_map(plan)
+    global_written = _sm_global_written(
+        plan, values(methods_by_id), field_regs)
+    producer = _sm_active_producer(plan, global_written)
     names = _functional_state_names(kernel)
     name_by_canon = Dict{Int,Symbol}()
     for name in names
@@ -2522,7 +3495,7 @@ function _functional_stateful_method(kernel::_StatefulKernel{S,PF,RT,OW,SH,B},
             symbol = Symbol("__sf_write_", name, "_", length(statements) + 1)
             push!(statements, :(local $symbol = $value))
             syms[(:field, name)] = symbol
-            for dependent in _exec_kill_closure(plan, canon)
+            for dependent in _exec_kill_closure(plan, canon, producer)
                 delete!(current, dependent)
                 push!(stale, dependent)
             end
@@ -2591,6 +3564,22 @@ function _functionalize_stateful(kernel::_StatefulKernel, ::Val{Name};
     _functional_stateful_method(kernel, ir)
 end
 
+"""
+    functionalize_stateful(kernel, ::Val{method};
+                           max_iterations=nothing,
+                           argument_types=nothing)
+
+Compile one captured method of a compiled stateful kernel into a
+backend-neutral functional transition. Structured dynamic control requires an
+explicit finite `max_iterations` and logical `argument_types`; unsupported
+domains fail closed before backend tracing.
+"""
+functionalize_stateful(kernel::_StatefulKernel, method::Val; kwargs...) =
+    _functionalize_stateful(kernel, method; kwargs...)
+
+"""Return the fully materialized NamedTuple value surface of compiled state."""
+stateful_snapshot(state::_StatefulState) = _stateful_snapshot(state)
+
 # ============================================================================================
 # FREE STATE TRANSITIONS
 #
@@ -2610,10 +3599,12 @@ A backend-neutral functional state transition compiled from a free mutating
 returned by [`initial_transition_state`](@ref). The transition's bound controls, prepared
 derived-field repairs, and generated program are immutable compiler metadata.
 """
-struct CompiledStateTransition{Names,Groups,ExternalGroups,F,E,I}
+struct CompiledStateTransition{
+        Names,Groups,ExternalGroups,WritableNames,F,E,I,R}
     f::F
     ensures::E
     initial::I
+    structured_repairs::R
 end
 
 function (transition::CompiledStateTransition)(state)
@@ -2640,6 +3631,182 @@ end
     values = Any[aliases[name] for name in Names]
     push!(statements, :(return NamedTuple{Names}(($(values...),))))
     Expr(:block, statements...)
+end
+
+function _sm_validate_structured_state_port(port::_StructuredStatePort, value)
+    transition = getfield(port, :transition)
+    initial = getfield(transition, :initial)
+    typeof(value) === typeof(initial) || throw(ArgumentError(
+        "structured state value has type `$(typeof(value))`, expected " *
+        "`$(typeof(initial))`"))
+    transition_type = typeof(transition)
+    names, groups, external_groups = transition_type.parameters[1:3]
+    for (group_index, group) in enumerate(groups)
+        leader = getfield(value, first(group))
+        all(name -> getfield(value, name) === leader, group) ||
+            throw(ArgumentError(
+                "structured state value does not preserve canonical aliases $group"))
+        if group_index in external_groups
+            leader === getfield(initial, first(group)) || throw(ArgumentError(
+                "structured state external authority `$(first(group))` differs " *
+                "from its compiled transition identity"))
+        end
+    end
+    value
+end
+
+@generated function _sm_structured_copy(
+        port::_StructuredStatePort{T}, value) where {T}
+    Names, Groups, ExternalGroups = T.parameters[1:3]
+    statements = Any[]
+    aliases = Dict{Symbol,Symbol}()
+    for (group_index, group) in enumerate(Groups)
+        symbol = Symbol("__structured_copy_group_", group_index)
+        source = :(getfield(value, $(QuoteNode(first(group)))))
+        copied = group_index in ExternalGroups ? source :
+            :(_sm_structural_copy($source))
+        push!(statements, :(local $symbol = $copied))
+        for name in group
+            aliases[name] = symbol
+        end
+    end
+    values = Any[aliases[name] for name in Names]
+    constructor = NamedTuple{Names}
+    push!(statements, :($constructor(($(values...),))))
+    Expr(:block, statements...)
+end
+
+@generated function _sm_structured_set(
+        port::_StructuredStatePort{T}, value, ::Val{Path}, replacement) where
+        {T,Path}
+    isempty(Path) && return :(replacement)
+    Names, Groups = T.parameters[1:2]
+    target = first(Path)
+    group_index = findfirst(group -> target in group, Groups)
+    group_index === nothing && return :(throw(ArgumentError(
+        "structured state path has no canonical field `$target`")))
+    target_group = Groups[group_index]
+    leader = first(target_group)
+    child = :(_sm_structural_set(
+        getfield(value, $(QuoteNode(target))),
+        Val($(QuoteNode(Base.tail(Path)))), replacement))
+    statements = Any[:(local __structured_set_child = $child)]
+    aliases = Dict{Symbol,Any}()
+    for group in Groups
+        source = group === target_group ? :__structured_set_child :
+            :(getfield(value, $(QuoteNode(first(group)))))
+        for name in group
+            aliases[name] = source
+        end
+    end
+    values = Any[aliases[name] for name in Names]
+    constructor = NamedTuple{Names}
+    push!(statements, :($constructor(($(values...),))))
+    Expr(:block, statements...)
+end
+
+@generated function _sm_structured_predicated_select(
+        port::_StructuredStatePort{T}, active, candidate, prior) where {T}
+    Names, Groups = T.parameters[1:2]
+    statements = Any[]
+    aliases = Dict{Symbol,Symbol}()
+    for (group_index, group) in enumerate(Groups)
+        symbol = Symbol("__structured_select_group_", group_index)
+        new = :(getfield(candidate, $(QuoteNode(first(group)))))
+        old = :(getfield(prior, $(QuoteNode(first(group)))))
+        push!(statements,
+            :(local $symbol = _sm_predicated_select(active, $new, $old)))
+        for name in group
+            aliases[name] = symbol
+        end
+    end
+    values = Any[aliases[name] for name in Names]
+    constructor = NamedTuple{Names}
+    push!(statements, :($constructor(($(values...),))))
+    Expr(:block, statements...)
+end
+
+function _compile_structured_state_repair(
+        spec::KernelSpec, pf::_PreparedFactory, names::Tuple,
+        target_name::Symbol)
+    plan = kernel_prepared_plan(pf)
+    fields = _exec_canon_map(plan)
+    haskey(fields, target_name) || _sm_reject(
+        "structured state repair has no field `$target_name`")
+    names_by_canon = Dict{Int,Vector{Symbol}}()
+    for name in names
+        push!(get!(names_by_canon, fields[name], Symbol[]), name)
+    end
+    name_by_canon = Dict(canon => first(aliases)
+                         for (canon, aliases) in names_by_canon)
+    target = fields[target_name]
+    stale = _exec_kill_closure(plan, target)
+    delete!(stale, target)
+    current = Set(values(fields))
+    setdiff!(current, stale)
+    statements = Any[]
+    ensures = Any[]
+    symbols = Dict{Symbol,Any}()
+    for (canon, aliases) in names_by_canon
+        leader = first(aliases)
+        symbol = Symbol("__structured_field_", leader)
+        push!(statements,
+            :(local $symbol = getfield(state, $(QuoteNode(leader)))))
+        for alias in aliases
+            symbols[alias] = symbol
+        end
+    end
+    while !isempty(stale)
+        canon = first(sort!(collect(stale)))
+        haskey(Dict(kernel_plan_producer(plan)), canon) || _sm_reject(
+            "structured state cannot repair derived canon $canon")
+        name = name_by_canon[canon]
+        have = Tuple(name_by_canon[c]
+            for c in sort!(collect(current)) if haskey(name_by_canon, c))
+        prepared = try
+            prepare(spec; have, want=name)
+        catch error
+            _sm_reject("structured state repair for `$name` failed: " *
+                       sprint(showerror, error))
+        end
+        push!(ensures, prepared)
+        ensure_index = length(ensures)
+        arguments = Any[]
+        for input in inputs(prepared)
+            haskey(symbols, input.name) || _sm_reject(
+                "structured state repair for `$name` requires unknown input " *
+                "`$(input.name)`")
+            push!(arguments, symbols[input.name])
+        end
+        symbol = Symbol("__structured_repair_", name, "_", ensure_index)
+        push!(statements, :(local $symbol =
+            getfield(ensures, $ensure_index)($(arguments...))))
+        for alias in names_by_canon[canon]
+            symbols[alias] = symbol
+        end
+        delete!(stale, canon)
+        push!(current, canon)
+    end
+    outputs = Any[symbols[name] for name in names]
+    push!(statements, :(return NamedTuple{$names}(($(outputs...),))))
+    fn = compile(:((ensures, state) -> $(Expr(:block, statements...))))
+    _StructuredStateRepair{names,typeof(fn),typeof(Tuple(ensures))}(
+        fn, Tuple(ensures))
+end
+
+"""
+    structured_state_port(transition::CompiledStateTransition)
+
+Bind a nested state value to the canonical-alias and derived-currentness
+contract of a compiled state transition.  Stateful lowering may then admit
+source-authored nested writes such as `outer.inner.x = value` without knowing
+any domain field names: the transition's KernelSpec determines which derived
+fields must be repaired.  External authorities remain identity-bound.
+"""
+function structured_state_port(transition::CompiledStateTransition)
+    repairs = getfield(transition, :structured_repairs)
+    _StructuredStatePort{typeof(transition),typeof(repairs)}(
+        transition, repairs)
 end
 
 function _transition_sources(spec::KernelSpec, pf, args::Tuple,
@@ -2954,8 +4121,15 @@ function _compile_state_transition(spec::KernelSpec, pf::_PreparedFactory,
     external_canons = Set(kernel_prepared_external(pf))
     external_groups = Tuple(index for (index, canon) in enumerate(canons)
                             if canon in external_canons)
-    CompiledStateTransition{names,groups,external_groups,typeof(fn),
-        typeof(Tuple(ensures)),typeof(initial)}(fn, Tuple(ensures), initial)
+    writable_names = Tuple(sort!(collect(
+        prepared_callable_write_roots(callable))))
+    structured_repairs = NamedTuple{writable_names}(Tuple(
+        _compile_structured_state_repair(spec, pf, names, name)
+        for name in writable_names))
+    CompiledStateTransition{
+        names,groups,external_groups,writable_names,typeof(fn),
+        typeof(Tuple(ensures)),typeof(initial),typeof(structured_repairs)}(
+            fn, Tuple(ensures), initial, structured_repairs)
 end
 
 """
@@ -2994,8 +4168,10 @@ function _validate_stateful_bindings!(skel, pf, owned, shared,
                                       bindings::_StatefulCompilerBindings)
     field_regs = _stateful_field_regs(bindings)
     called = _kernel_factory_called_fields(skel)
-    Set(keys(field_regs)) == called || throw(ArgumentError(
-        "stateful compiler bindings $(sort!(collect(keys(field_regs)))) do not " *
+    callable_fields = Set(name for (name, descriptor) in field_regs
+        if !(descriptor isa _StructuredStatePort))
+    callable_fields == called || throw(ArgumentError(
+        "stateful callable bindings $(sort!(collect(callable_fields))) do not " *
         "exactly match called fields $(sort!(collect(called)))"))
     plan = kernel_prepared_plan(pf)
     fields = _exec_canon_map(plan)
@@ -3006,15 +4182,17 @@ function _validate_stateful_bindings!(skel, pf, owned, shared,
         role, slot = kernel_plan_field(plan, canon)
         object = role === :owned ? owned : shared
         value = _canon_slot(object, Val(slot))
-        if binding isa _PureCallablePort
+        if binding isa Union{_PureCallablePort,_EffectCallablePort}
             value === getfield(binding, :source) || throw(ArgumentError(
-                "stateful pure callable field `$name` differs from its bound identity"))
+                "stateful callable field `$name` differs from its bound identity"))
         elseif binding isa _KernelRegistration
             kernel_rebound(binding, value) && throw(ArgumentError(
                 "stateful registered callable field `$name` differs from its bound identity"))
         elseif binding === nothing
             value === nothing || throw(ArgumentError(
                 "stateful no-effect field `$name` must contain `nothing`"))
+        elseif binding isa _StructuredStatePort
+            _sm_validate_structured_state_port(binding, value)
         else
             throw(ArgumentError(
                 "stateful compiler binding `$name` has unsupported descriptor `$(typeof(binding))`"))
@@ -3035,7 +4213,7 @@ function compile_stateful(skel, bindings::_StatefulCompilerBindings,
     plan = kernel_prepared_plan(pf); irs = method_irs(skel)
     methods = compile_stateful_methods(
         skel, pf, typeof(owned), typeof(shared), field_regs)
-    written = _sm_global_written(plan, irs)
+    written = _sm_global_written(plan, irs, field_regs)
     produced = Set(c for (c, _) in kernel_plan_producer(plan))
     epairs = Pair{Symbol,Any}[]
     for sl in kernel_plan_slots(plan)
@@ -3061,8 +4239,11 @@ end
         throw(ArgumentError("compiled stateful kernel received constructor arguments with different storage types"))
     _validate_stateful_bindings!(getfield(k, :skeleton), getfield(k, :prepared),
                                  owned, shared, getfield(k, :bindings))
-    _StatefulState{typeof(k.runtime),typeof(owned),typeof(shared),typeof(kernel_prepared_handles(k.prepared))}(
-        k.runtime, owned, shared, kernel_prepared_handles(k.prepared))
+    resources = _StatefulResources(
+        kernel_prepared_handles(k.prepared),
+        getfield(getfield(k, :bindings), :fields))
+    _StatefulState{typeof(k.runtime),typeof(owned),typeof(shared),typeof(resources)}(
+        k.runtime, owned, shared, resources)
 end
 
 stateful_kernel(k::_StatefulKernel) = k

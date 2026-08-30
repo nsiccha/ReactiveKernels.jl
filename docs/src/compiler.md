@@ -31,11 +31,12 @@ must stay inside the compiler's inspectable and registered subset.
 Main.ReactiveKernelsDocs.render_compiler_api_map()
 ```
 
-Most method-bearing source machinery and its general control factory remain
-implementation surfaces rather than a general exported `prepare` API. The
-narrow exported `compile_state_transition` seam described below is the
-exception: it combines a stateless endpoint `KernelSpec` with a bound free
-update method. NUTS, log-density, and
+Method-bearing compilation has a finite exported contract rather than a
+general Julia `prepare` API. `compile_state_transition` combines a stateless
+endpoint `KernelSpec` with a bound free update method. `compile_stateful`,
+`stateful_compiler_bindings`, and `functionalize_stateful` compile a captured
+stateful object and one selected method through explicit typed callable,
+nested-state, loop-bound, and argument-domain contracts. NUTS, log-density, and
 PPL artifacts are external compilation examples and acceptance evidence, not
 domain APIs owned by ReactiveKernels. The NUTS runtime and domain surface live
 under `examples/nuts_runtime/`; a bare `using ReactiveKernels` does not load or
@@ -535,6 +536,49 @@ Gaussian and relativistic Euclidean, Riemannian, and diagonal-SoftAbs geometry.
 Both generalized leapfrog and implicit midpoint remain their ordinary authored
 mathematical kernels. Those examples validate a reusable compiler capability;
 they do not add geometry or integrator cases to compiler code.
+
+### Functional stateful methods and nested state contracts
+
+`compile_stateful` prepares a method-bearing `@kernel` after every callable
+field has an explicit entry in `stateful_compiler_bindings`. A
+`pure_callable_port` declares one exact argument/result contract and no
+mutation. An `effect_callable_port` additionally declares which positional
+values may be replaced, a functional lowering, and an auxiliary effect value.
+`StatefulStateValue` is the contract marker for a callback whose authored
+argument is `__self__`; the compiler substitutes and validates the concrete
+whole-state NamedTuple type rather than asking an application to reconstruct
+private storage types.
+
+`structured_state_port(compiled_transition)` binds a nested state field to the
+canonical alias groups, external authority identities, writable source fields,
+and derived-recipe closure of an ordinary `CompiledStateTransition`. A nested
+write is admitted only when that transition declares its first path field
+writable. The compiler updates every alias in the written canonical group and
+eagerly repairs the active transitive derived closure before the outer method
+continues. Structural copies and predicated rollback select or copy once per
+canonical group, so internal aliases remain aliases and external callbacks
+remain identical. None of this lowering dispatches on sampler, geometry,
+method, or field names.
+
+`functionalize_stateful(kernel, Val(:method); max_iterations,
+argument_types)` produces the backend-neutral functional program;
+`stateful_snapshot` supplies its initial value surface. Dynamic structured
+control requires a positive finite loop bound. A bound violation, an active
+out-of-bounds indexed access, or exhausted effect storage sets a control
+overflow and rolls state plus auxiliary effects back atomically. The typed
+`OrderedRNGReplay` value carries finite normal, Boolean, and exponential tapes,
+source-ordered cursors, and sticky overflow. Conditional source paths consume
+only the streams they enter; valid effects before a later exhausted draw remain
+visible in the returned replay value.
+
+The fixed-step ReactiveHMC fixture is the first combined acceptance case. Its
+unchanged mathematical source refreshes momentum, executes generalized
+leapfrog, records statistics before divergence exit, conditionally consumes an
+exponential draw, and copies an accepted endpoint. The same generic compiler
+path matches the independent accept, reject, and divergence receipt in ordinary
+Julia and Reactant. That evidence admits reusable nested-state currentness,
+typed effects, and ordered RNG capabilities; it is not an HMC case in compiler
+code.
 
 ## What the NUTS proof does and does not establish
 

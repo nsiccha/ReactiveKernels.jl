@@ -920,6 +920,8 @@ function render_compiler_api_map()
          result = "Ordinary property/method facade over compiled state", runtime = "The same compiled-state operations"),
         (stage = "Compile a free state transition", surface = "compile_state_transition, initial_transition_state, partial",
          result = "CompiledStateTransition", runtime = "Authored writes, statically unrolled control, and demand-driven derived-field repairs"),
+        (stage = "Compile a bounded stateful method", surface = "compile_stateful, stateful_compiler_bindings, functionalize_stateful, stateful_snapshot",
+         result = "Typed native state plus a backend-neutral functional transition", runtime = "Source-ordered structured control, canonical nested-state repairs, typed effects, and explicit overflow"),
         (stage = "Inspect the selected graph", surface = "visualize, dot_source, save_visualization",
          result = "Plan/DAG view", runtime = "No effect on compilation"),
     ]

@@ -628,4 +628,5 @@ end
 end
 
 include("test_reactivehmc_statistics_reactant.jl")
+include("test_reactivehmc_hmc_reactant.jl")
 include("test_kernel_nuts_reactant.jl")

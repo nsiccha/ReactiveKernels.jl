@@ -46,6 +46,7 @@ using .ReactiveKernelsNUTSExample
         include("test_reactivehmc_rke_fixture.jl")
         include("test_reactivehmc_rke_compiler.jl")
         include("test_reactivehmc_hmc_fixture.jl")
+        include("test_reactivehmc_hmc_compiler.jl")
         include("test_compiler_docs.jl")
         include("test_kernel_adaptation.jl")
         include("test_nonallocating_core.jl")

@@ -7,7 +7,8 @@ _exec_canon_map(plan::_KernelPlan) = Dict{Symbol,Int}(s.path[end] => s.canon for
 # The canonical ids a RHS reads, in AUTHORED ORDER (RK 08:51: no Set authority) — dedup first-occurrence.
 function _exec_reads!(acc::Vector{Int}, x, fc::Dict{Symbol,Int})
     if x isa _SelfField
-        haskey(fc, x.path[end]) && !(fc[x.path[end]] in acc) && push!(acc, fc[x.path[end]])
+        root = first(x.path)
+        haskey(fc, root) && !(fc[root] in acc) && push!(acc, fc[root])
     elseif x isa _RegisteredCall || x isa _OpCall
         for a in x.args; _exec_reads!(acc, a, fc); end
         for pair in x.kw; _exec_reads!(acc, pair.second, fc); end
@@ -46,7 +47,8 @@ end
 
 # The write-kill closure from a freshly-written canon `tgt`: canons transitively STALE because a recipe
 # reads `tgt` (or a newly-stale id) and produces them — propagating ONLY through producer-owned outputs.
-function _exec_kill_closure(plan::_KernelPlan, tgt::Int)
+function _exec_kill_closure(plan::_KernelPlan, tgt::Int,
+                            producer=nothing)
     rin   = Dict{Int,Vector{Int}}(rid => collect(ins) for (rid, ins) in kernel_plan_recipe_inputs(plan))
     owned = Dict{Int,Vector{Int}}(rid => collect(os)  for (rid, os)  in kernel_plan_producer_owned(plan))
     stale = Set{Int}(); changed = true
@@ -54,7 +56,10 @@ function _exec_kill_closure(plan::_KernelPlan, tgt::Int)
         changed = false
         for rid in kernel_plan_recipes(plan)
             any(c -> c == tgt || c in stale, get(rin, rid, Int[])) || continue
-            for c in get(owned, rid, Int[]); c in stale || (push!(stale, c); changed = true); end
+            for c in get(owned, rid, Int[])
+                producer === nothing || get(producer, c, 0) == rid || continue
+                c in stale || (push!(stale, c); changed = true)
+            end
         end
     end
     stale

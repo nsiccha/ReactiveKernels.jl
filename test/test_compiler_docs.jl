@@ -82,6 +82,7 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
         "## Batch and replica lowering",
         "## Incremental and compiled reactive execution",
         "## Source-captured method compiler",
+        "### Functional stateful methods and nested state contracts",
         "## What the NUTS proof does and does not establish",
         "## Definitive support matrix",
     )
@@ -95,6 +96,10 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
         "does not call\n`code_lowered`",
         "Validity changes are exception-safe but values are not transactionally rolled\nback",
         "external compilation examples and acceptance evidence",
+        "`structured_state_port(compiled_transition)`",
+        "`StatefulStateValue`",
+        "`OrderedRNGReplay`",
+        "None of this lowering dispatches on sampler, geometry,\nmethod, or field names",
         "a bare `using ReactiveKernels` does not load or\nexport them",
         "former `@rk_pure`, `@rk_borrows`, and `@rk_rng` declarations have\nbeen removed",
         "`@node` is unrelated to this removal boundary",

@@ -48,6 +48,16 @@ ReactiveKernels._sm_functional_argument_type_ok(
     {Actual<:Reactant.AbstractConcreteNumber,Expected} =
         _rk_reactant_logical_argument(Actual, Expected)
 
+function ReactiveKernels._sm_functional_argument_type_ok(
+        ::Type{Actual}, ::Type{Expected}) where
+        {Actual<:ReactiveKernels.OrderedRNGReplay,
+         Expected<:ReactiveKernels.OrderedRNGReplay}
+    all(fieldnames(Expected)) do name
+        ReactiveKernels._sm_functional_argument_type_ok(
+            fieldtype(Actual, name), fieldtype(Expected, name))
+    end
+end
+
 @inline function ReactiveKernels._sm_functional_index(
         array::Reactant.TracedRArray, indices...)
     Reactant.@allowscalar getindex(array, indices...)
@@ -60,6 +70,16 @@ end
         setindex!(result, value, indices...)
         result
     end
+end
+
+@inline function ReactiveKernels._sm_ordered_rng_normal_value(
+        normals::Reactant.TracedRArray, index)
+    Reactant.@allowscalar copy(normals[:, index])
+end
+
+@inline function ReactiveKernels._sm_ordered_rng_scalar_value(
+        values::Reactant.TracedRArray, index)
+    Reactant.@allowscalar values[index]
 end
 
 # Named/defaulted @kernel signatures wrap a PreparedKernel plus immutable
