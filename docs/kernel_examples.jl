@@ -298,7 +298,8 @@ function setup_online_stats!(mod::Module)
     Core.eval(mod, :(using Statistics))
     Core.eval(mod, :(using Main.ReactiveKernelsNUTSExample: NUTSDiagnostics))
     Core.eval(mod, :(using .OnlineStatsExample:
-        MomentsAccumulator, HMCDiagnosticsAccumulator))
+        MomentsAccumulator, HMCDiagnosticsAccumulator,
+        OnlineMoments, OnlineDiagnostics, online_moments, online_diagnostics))
     nothing
 end
 
@@ -312,6 +313,30 @@ function _source_between(source::AbstractString, start_marker::AbstractString,
     duplicate = findnext(start_marker, source, search_from)
     duplicate === nothing || error("docs source marker is ambiguous: $start_marker")
     strip(source[first(start):prevind(source, first(stop))], '\n')
+end
+
+"""
+    render_online_stats_reactive_source(which) -> Markdown.MD
+
+Render the exact build-loaded `@reactive` definition from
+`examples/online_stats.jl`. The page therefore cannot drift from the executable
+stateful moments/diagnostics authoring it describes.
+"""
+function render_online_stats_reactive_source(which::Symbol)
+    path = joinpath(pkgdir(ReactiveKernels), "examples", "online_stats.jl")
+    source = read(path, String)
+    start_marker, stop_marker = if which === :moments
+        ("@reactive specialize=true _online_moments_state(",
+         "# -- END DOCS: stateful online moments --")
+    elseif which === :diagnostics
+        ("@reactive specialize=true _online_diagnostics_state(",
+         "# -- END DOCS: stateful HMC diagnostics --")
+    else
+        throw(ArgumentError(
+            "online-statistics source must be :moments or :diagnostics"))
+    end
+    Markdown.MD(Any[Markdown.Code(
+        "julia", _source_between(source, start_marker, stop_marker))])
 end
 
 function _nutpie_kernel_sources()

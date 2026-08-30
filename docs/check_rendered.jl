@@ -72,7 +72,7 @@ function check_rendered_docs(build_dir, page_tree)
         "dugongs-growth.md" => 1,
         "arma11.md" => 1,
         "gaussian-mixture.md" => 1,
-        "online-stats.md" => 2,
+        "online-stats.md" => 1,
     )
     expected_source_examples = Dict(
         "reactivehmc-corpus.md" => 5,

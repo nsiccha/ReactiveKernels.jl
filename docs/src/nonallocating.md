@@ -119,8 +119,9 @@ state owns outright.
 If you want in-place updates *and* the reactive machinery, use `prepare_reactive`
 → `CompiledReactiveState`: `mutate!`/`touch!` edit the declared mutable inputs in
 place, and derived values live in buffers the state owns. Ownership,
-invalidation, and freeze/checkpoint all still work; see [Mutation-friendly
-reactive authoring](online-stats.md#Mutation-friendly-reactive-authoring). Reach
+invalidation, and freeze/checkpoint all still work; for the public object/method
+form over the same state machinery, see [Stateful Welford
+moments](online-stats.md#stateful-welford-moments). Reach
 for a `prepare_nonallocating` kernel only for direct, single-caller use, and copy
 any mutable result you need to keep before the next call.
 
