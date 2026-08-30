@@ -519,6 +519,12 @@ authored array write produces a new array value, invalidates the written
 source's transitive derived closure, and recomputes a stale derived field only
 at its next source-ordered read. The same generated program is ordinary Julia
 and static program metadata to optional array compilers such as Reactant.
+Every call validates the exact recursive state layout, owned-array axes,
+canonical aliases, and external authority identities captured at construction.
+Group-aware structural copies isolate owned arrays without invoking user
+`deepcopy` methods or duplicating callable authorities. Authored broadcast
+assignment between builtin floating types retains Julia's destination-element
+conversion, including Float64 intermediates written into Float32 storage.
 
 The initial public source subset is intentionally finite. It admits direct
 owned-field writes, exact captured `map(copy, tuple)`, tuple and named
@@ -544,6 +550,13 @@ field has an explicit entry in `stateful_compiler_bindings`. A
 `pure_callable_port` declares one exact argument/result contract and no
 mutation. An `effect_callable_port` additionally declares which positional
 values may be replaced, a functional lowering, and an auxiliary effect value.
+Both validate their replacement arguments, logical result, and effect-state
+type after lowering. A control-dependent lowering must be wrapped in
+`total_functional_lowering`, explicitly asserting that it is pure and total
+over inactive predicated values; an arbitrary partial callback rejects.
+`effect_lowering_port` is the distinct contract for a non-executable authority
+token whose compiler lowering has independent source-oracle evidence. It does
+not mislabel that token as an ordinary source callback.
 `StatefulStateValue` is the contract marker for a callback whose authored
 argument is `__self__`; the compiler substitutes and validates the concrete
 whole-state NamedTuple type rather than asking an application to reconstruct
@@ -566,19 +579,52 @@ argument_types)` produces the backend-neutral functional program;
 control requires a positive finite loop bound. A bound violation, an active
 out-of-bounds indexed access, or exhausted effect storage sets a control
 overflow and rolls state plus auxiliary effects back atomically. The typed
-`OrderedRNGReplay` value carries finite normal, Boolean, and exponential tapes,
-source-ordered cursors, and sticky overflow. Conditional source paths consume
-only the streams they enter; valid effects before a later exhausted draw remain
-visible in the returned replay value.
+`OrderedRNGReplay` value carries independent floating normal, Boolean uniform,
+and exact Float64 exponential tapes, per-kind cursors, one global ordered event
+tape/cursor, and sticky overflow. `randn!` is admitted only for an immediate
+whole-vector state replacement with the declared destination/result alias;
+`rand(rng, Bool)` retains the exact captured type descriptor. Conditional
+source paths consume only the effects they enter, and an event-kind mismatch
+or exhausted tape fails closed while preserving the attempted replay receipt.
+
+Auxiliary effects are explicit continuation state, not hidden compiler state.
+`initial_transition_effects(transition)` constructs the first value. Ordinary
+Julia may pass it as the `effects` keyword; `transition_with_effects(transition)`
+provides a positional callable for optional compilers, so callers can feed the
+returned `effects` into the next compiled invocation. Compiler program
+metadata is recursively snapshotted from a finite immutable/builtin domain;
+later mutation of authoring configuration cannot change compiled semantics.
 
 The fixed-step ReactiveHMC fixture is the first combined acceptance case. Its
 unchanged mathematical source refreshes momentum, executes generalized
 leapfrog, records statistics before divergence exit, conditionally consumes an
 exponential draw, and copies an accepted endpoint. The same generic compiler
 path matches the independent accept, reject, and divergence receipt in ordinary
-Julia and Reactant. That evidence admits reusable nested-state currentness,
-typed effects, and ordered RNG capabilities; it is not an HMC case in compiler
-code.
+Julia and Reactant. A separate pinned physical case locks Float32
+position/momentum/normal draws together with the authored Float64 `randexp`
+result, exact bits, destination alias, and global RNG event order. That evidence
+admits reusable nested-state currentness, typed effects, ordered RNG, and mixed
+floating assignment capabilities; it is not an HMC case in compiler code.
+
+The mixed-precision gate separates source semantics from backend floating
+rounding. Raw tape bits, tape and destination types, the `randn!` result alias,
+event order, cursors, shapes, overflow/rollback, and every control decision are
+exact. Ordinary Julia execution of the generic lowering is also bit-identical
+to the independent physical receipt. The backend-neutral emitter preserves the
+authored operator tree: it introduces no `@fastmath`, `muladd`, `fma`, or
+arithmetic reassociation, and contains no HMC/field-name case. Reactant keeps
+the exact Float32/Float64
+field types and is checked against the physical result with explicit ULP
+distances, not an `isapprox` tolerance: positions `[0, 0]`; initial/final
+momenta `[1, 0]` Float32 ULPs; initial/final Hamiltonians `67_108_864` Float64
+ULPs; the three energy diagnostics `[68_719_476_736, 0, 8_589_934_592]`
+Float64 ULPs; and final `dham` `8_589_934_592` Float64 ULPs. The apparently
+large Float64 counts reflect diagnostics stored as Float64 after cancellation
+along a Float32 trajectory; they are the exact pinned distances, not a broad
+error allowance. Its divergence and acceptance margins remain greater than
+`900` and `0.49`, respectively, so the recorded rounding cannot approach a
+control threshold. A widened Float64 normal tape is rejected by both native
+and Reactant entry contracts.
 
 ## What the NUTS proof does and does not establish
 

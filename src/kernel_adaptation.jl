@@ -25,7 +25,9 @@ function _prepare_stateful(skel; field_regs = Dict{Symbol,Any}())
     owned = _kernel_factory_owned_authoritative(skel; field_regs = field_regs)
     shared = _kernel_factory_shared(skel; field_regs = field_regs)
     plan, ops = _kernel_factory_plan(skel, owned, shared; key_token = kernel_token(skel), with_ops = true)
-    _prepared_factory_from_plan(kernel_token(skel), plan, ops; allow_destination = false)
+    prepared = _prepared_factory_from_plan(
+        kernel_token(skel), plan, ops; allow_destination = false)
+    _bind_stateful_structural_copies(prepared, field_regs)
 end
 
 # Resolve the HAVE source VALUES for a construction call through the AUTHORITATIVE signature binder, then map
@@ -63,6 +65,18 @@ function _construct_stateful(skel, pf, args...; kwargs...)
     _construct_endpoint_from_values(plan, handles, cvals)
 end
 
+# Callable/structured compiler bindings change how owned values are isolated:
+# structured endpoint states must be copied once per canonical ownership group
+# while external authorities retain identity.  Keep that contract on a
+# deliberately distinct internal entry point so a constructor value can never
+# be mistaken for an untyped third-position `bindings` argument.
+function _construct_bound_stateful(skel, pf, bindings, args...; kwargs...)
+    sources = _stateful_sources(skel, pf, args, NamedTuple(kwargs))
+    plan = kernel_prepared_plan(pf); handles = kernel_prepared_handles(pf)
+    cvals = _bootstrap_canon_values(plan, handles, sources)
+    _construct_stateful_endpoint_from_values(plan, handles, cvals, bindings)
+end
+
 
 # ============================================================================================
 # AUTHORED STATEFUL METHOD EXECUTION (G3/G4)
@@ -81,6 +95,7 @@ end
 
 abstract type _SMDomainNode end
 struct _DSlot{T} <: _SMDomainNode end
+struct _DStaticType{T} <: _SMDomainNode end
 struct _DFormal{Pos,IsVector} <: _SMDomainNode end
 struct _DSelfState{T} <: _SMDomainNode end
 struct _DKw{Name,Default} <: _SMDomainNode end
@@ -88,6 +103,7 @@ struct _DLit{T} <: _SMDomainNode end
 struct _DCall{Source,Dot,Args} <: _SMDomainNode end
 struct _DOrderedRNGCall{Token,Args} <: _SMDomainNode end
 struct _DStructuralCopy{Destination,Source} <: _SMDomainNode end
+struct _DStructuredStateCopy{Destination,Source} <: _SMDomainNode end
 struct _DPortCall{Declared,Result,Args} <: _SMDomainNode end
 struct _DEffectPortCall{Declared,Result,Written,EffectState,Args} <: _SMDomainNode end
 struct _DTuple{Args} <: _SMDomainNode end
@@ -136,6 +152,21 @@ struct _PureCallablePort{ArgTypes<:Tuple,Result,F,L}
     functional_lowering::L
 end
 
+"""
+    total_functional_lowering(lowering)
+
+Explicit compiler contract that `lowering` is pure and total over every value
+in its declared logical argument domain. Structured predication may evaluate a
+lowering for a source-inactive lane and select its result away, so arbitrary
+lowerings are rejected there unless wrapped by this reviewed declaration.
+"""
+struct _TotalFunctionalLowering{L}
+    lowering::L
+end
+@inline (total::_TotalFunctionalLowering)(args...) =
+    getfield(total, :lowering)(args...)
+total_functional_lowering(lowering) = _TotalFunctionalLowering(lowering)
+
 
 """
     effect_callable_port(source, Tuple{ArgTypes...}, Result;
@@ -150,11 +181,24 @@ and an explicit auxiliary effect state. This is the effectful counterpart to
 `pure_callable_port`; arbitrary callable fields remain rejected.
 """
 struct _EffectCallablePort{
-        ArgTypes<:Tuple,Result,Written,EffectState,F,L,S}
+        ArgTypes<:Tuple,Result,Written,EffectState,F,L,S,Mode}
     source::F
     functional_lowering::L
     initial_effect_state::S
 end
+
+# Auxiliary effect state crosses an optional compiler boundary, so selection
+# must never fall through Julia's extensible broadcast machinery.  Admit only
+# recursively structural builtin values with an explicit predicated-selection
+# implementation below.
+_sm_effect_state_domain(::Type{T}) where {T} =
+    T === Nothing || _kernel_dom_num_scalar(T) || _sm_builtin_array(T) ||
+    _kernel_dom_diag(T) || _recipe_dom_chol(T) ||
+    _sm_ordered_rng_replay_type(T) ||
+    (T <: NamedTuple && T isa DataType &&
+        all(_sm_effect_state_domain, fieldtypes(T))) ||
+    (T <: Tuple && T isa DataType &&
+        all(t -> t isa Type && _sm_effect_state_domain(t), T.parameters))
 
 # A nested structured state is not a callable effect.  Its compiler binding
 # carries a separately compiled state-transition contract whose endpoint graph
@@ -175,6 +219,113 @@ struct _StructuredStatePort{T,R}
     repairs::R
 end
 
+struct _BoundStructuralCopyRecipe{P<:_StructuredStatePort}
+    port::P
+end
+
+@inline _sm_compiler_static_snapshot(value::Nothing) = nothing
+@inline _sm_compiler_static_snapshot(value::Number) = value
+@inline _sm_compiler_static_snapshot(value::Symbol) = value
+@inline _sm_compiler_static_snapshot(value::Type) = value
+@inline function _sm_compiler_static_snapshot(value::A) where {A<:AbstractArray}
+    _sm_builtin_array(A) || throw(ArgumentError(
+        "compiler-static metadata rejects non-builtin array `$A`"))
+    copy(value)
+end
+@inline _sm_compiler_static_snapshot(value::NamedTuple) =
+    map(_sm_compiler_static_snapshot, value)
+@inline _sm_compiler_static_snapshot(value::Tuple) =
+    map(_sm_compiler_static_snapshot, value)
+@inline _sm_compiler_static_snapshot(value::LinearAlgebra.Diagonal) =
+    LinearAlgebra.Diagonal(_sm_compiler_static_snapshot(value.diag))
+@inline _sm_compiler_static_snapshot(value::LinearAlgebra.Cholesky) =
+    LinearAlgebra.Cholesky(
+        _sm_compiler_static_snapshot(value.factors), value.uplo, value.info)
+@inline _sm_compiler_static_snapshot(value::PreparedKernel) = value
+@inline _sm_compiler_static_snapshot(
+    value::RuntimeGeneratedFunctions.RuntimeGeneratedFunction) = value
+function _sm_compiler_static_snapshot(value::_StructuredStatePort)
+    _StructuredStatePort(
+        _sm_compiler_static_snapshot(getfield(value, :transition)),
+        getfield(value, :repairs))
+end
+
+@generated function _sm_compiler_static_snapshot(value::T) where {T}
+    ismutabletype(T) && return :(throw(ArgumentError(
+        "compiler-static metadata rejects mutable value type `$T`")))
+    isconcretetype(T) || return :(throw(ArgumentError(
+        "compiler-static metadata requires a concrete value type `$T`")))
+    fieldcount(T) == 0 && return :(value)
+    fields = Any[:(_sm_compiler_static_snapshot(
+        getfield(value, $index))) for index in 1:fieldcount(T)]
+    Expr(:new, T, fields...)
+end
+
+function _sm_freeze_compiler_port(port::_PureCallablePort{
+        ArgTypes,Result}) where {ArgTypes,Result}
+    lowering = _sm_compiler_static_snapshot(port.functional_lowering)
+    _PureCallablePort{
+        ArgTypes,Result,typeof(port.source),typeof(lowering)}(
+            port.source, lowering)
+end
+
+function _sm_freeze_compiler_port(port::_EffectCallablePort{
+        ArgTypes,Result,Written,EffectState,F,L,S,Mode}) where
+        {ArgTypes,Result,Written,EffectState,F,L,S,Mode}
+    lowering = _sm_compiler_static_snapshot(port.functional_lowering)
+    initial = _sm_compiler_static_snapshot(port.initial_effect_state)
+    _EffectCallablePort{
+        ArgTypes,Result,Written,typeof(initial),typeof(port.source),
+        typeof(lowering),typeof(initial),Mode}(port.source, lowering, initial)
+end
+
+_sm_freeze_compiler_port(port::_StructuredStatePort) = port
+
+function _sm_freeze_compiler_ports(ports::NamedTuple)
+    map(_sm_freeze_compiler_port, ports)
+end
+
+@inline function (copy_recipe::_BoundStructuralCopyRecipe)(value)
+    _sm_validate_structured_state_port(getfield(copy_recipe, :port), value)
+    _sm_structured_copy(getfield(copy_recipe, :port), value)
+end
+
+function kernel_recipe_op_domain_ok(
+        copy_recipe::_BoundStructuralCopyRecipe, argtypes)
+    length(argtypes) == 1 || return false
+    initial = getfield(getfield(copy_recipe, :port), :transition).initial
+    argtypes[1] === typeof(initial)
+end
+
+function _bind_stateful_structural_copies(
+        prepared::_PreparedFactory, field_regs)
+    plan = kernel_prepared_plan(prepared)
+    handles = kernel_prepared_handles(prepared)
+    seam = kernel_plan_recipe_seam(plan)
+    slots = kernel_plan_slots(plan)
+    rebound = map(handles, seam) do handle, recipe
+        op = recipe_handle_op(handle)
+        op isa _StructuralCopyRecipe || return handle
+        outputs = recipe[3]
+        length(outputs) == 1 || return handle
+        destination = findfirst(slot -> slot.canon == only(outputs), slots)
+        destination === nothing && return handle
+        name = slots[destination].path[end]
+        binding = get(field_regs, name, nothing)
+        binding isa _StructuredStatePort || return handle
+        bound = _BoundStructuralCopyRecipe(binding)
+        _RecipeHandle{
+            typeof(bound),recipe_handle_mode(handle),typeof(handle.inputs),
+            typeof(handle.outputs),typeof(handle.owned)}(
+                bound, handle.inputs, handle.outputs, handle.owned)
+    end
+    _PreparedFactory{
+        kernel_prepared_token(prepared),
+        kernel_prepared_grad_recipe(prepared),typeof(plan),typeof(rebound),
+        typeof(kernel_prepared_external(prepared))}(
+            plan, rebound, kernel_prepared_external(prepared))
+end
+
 """
     StatefulStateValue
 
@@ -190,40 +341,141 @@ _kernel_field_written_arguments(
     {ArgTypes,Result,Written} = Written
 _kernel_field_effect_descriptor(::_EffectCallablePort) = true
 
-function effect_callable_port(@nospecialize(source), ::Type{ArgTypes},
+function _effect_callable_port(::Val{Mode}, @nospecialize(source),
+        ::Type{ArgTypes},
         ::Type{Result}; written_arguments=(), initial_effect_state=nothing,
-        functional_lowering) where {ArgTypes<:Tuple,Result}
+        functional_lowering) where {Mode,ArgTypes<:Tuple,Result}
     all(isconcretetype, ArgTypes.parameters) || throw(ArgumentError(
         "effect callable port argument types must all be concrete"))
     isconcretetype(Result) || throw(ArgumentError(
         "effect callable port result type must be concrete"))
+    _sm_effect_state_domain(typeof(initial_effect_state)) ||
+        throw(ArgumentError(
+            "effect callable port state must use the recursive builtin domain"))
     written = Tuple(Int(position) for position in written_arguments)
     length(unique(written)) == length(written) &&
         all(position -> 1 <= position <= length(ArgTypes.parameters), written) ||
         throw(ArgumentError(
             "effect callable port written arguments must be unique valid positions"))
     _EffectCallablePort{ArgTypes,Result,written,typeof(initial_effect_state),
-        typeof(source),typeof(functional_lowering),typeof(initial_effect_state)}(
+        typeof(source),typeof(functional_lowering),typeof(initial_effect_state),
+        Mode}(
         source, functional_lowering, initial_effect_state)
 end
 
+effect_callable_port(source, argtypes::Type{<:Tuple}, result::Type;
+                     kwargs...) =
+    _effect_callable_port(Val(:source), source, argtypes, result; kwargs...)
+
 """
-    OrderedRNGReplay(normals, uniforms, exponentials)
+    effect_lowering_port(authority, Tuple{ArgTypes...}, Result; ...)
+
+Compiler-authority variant of [`effect_callable_port`](@ref). `authority` is
+identity-checked in the authored state but is deliberately not executable as
+the effect's source implementation: native `stateful_call!` rejects the call.
+The reviewed `functional_lowering` is the semantic implementation and must be
+validated directly against an independent ordinary source oracle. This narrow
+contract is for source IR whose mutation ABI cannot cross an immutable value
+boundary without an explicit replacement.
+"""
+effect_lowering_port(authority, argtypes::Type{<:Tuple}, result::Type;
+                     kwargs...) =
+    _effect_callable_port(
+        Val(:lowering_authority), authority, argtypes, result; kwargs...)
+
+"""
+    OrderedRNGReplay(normals, uniforms, exponentials, events)
 
 Typed, finite replay storage for ordered RNG effects in a functionalized
 state-machine method. `normals` stores one vector draw per matrix column;
-`uniforms` and `exponentials` store scalar draws. Counters and sticky overflow
-are part of the value so conditional source paths consume only when active and
-capacity failures are observable rather than silently clamped.
+`uniforms` and `exponentials` store scalar draws. `events` is the independent
+source-ordered sequence of `:normal`, `:uniform`, and `:exponential` effects.
+Per-kind counters, the global event cursor, and sticky overflow are part of the
+value so conditional source paths consume only when active and capacity or
+ordering failures are observable rather than silently clamped.
 """
-struct OrderedRNGReplay{N,U,E,NI,UI,EI,O}
+struct _OrderedRNGCompilerToken end
+const _ORDERED_RNG_COMPILER_TOKEN = _OrderedRNGCompilerToken()
+
+struct OrderedRNGReplay{N,U,E,T,NI,UI,EI,TI,O}
     normals::N
     uniforms::U
     exponentials::E
+    event_tokens::T
     normal_index::NI
     uniform_index::UI
     exponential_index::EI
+    event_index::TI
     overflow::O
+    function OrderedRNGReplay{N,U,E,T,NI,UI,EI,TI,O}(
+            normals::N, uniforms::U, exponentials::E, event_tokens::T,
+            normal_index::NI, uniform_index::UI, exponential_index::EI,
+            event_index::TI, overflow::O, ::_OrderedRNGCompilerToken) where
+            {N,U,E,T,NI,UI,EI,TI,O}
+        new{N,U,E,T,NI,UI,EI,TI,O}(
+            normals, uniforms, exponentials, event_tokens, normal_index,
+            uniform_index, exponential_index, event_index, overflow)
+    end
+end
+
+# The unchecked constructor is deliberately private and token-gated.  It is
+# used only to rebuild an already validated replay while tracing tensorized
+# cursors.  Public callers get the validating value-plus-event-tape
+# constructor below; there is no public full-field cursor escape hatch.
+@inline _sm_ordered_rng_reconstruct(
+        normals, uniforms, exponentials, event_tokens, normal_index,
+        uniform_index, exponential_index, event_index, overflow) =
+    OrderedRNGReplay{
+        typeof(normals),typeof(uniforms),typeof(exponentials),typeof(event_tokens),
+        typeof(normal_index),typeof(uniform_index),typeof(exponential_index),
+        typeof(event_index),typeof(overflow)}(
+            normals, uniforms, exponentials, event_tokens, normal_index,
+            uniform_index, exponential_index, event_index, overflow,
+            _ORDERED_RNG_COMPILER_TOKEN)
+
+function _sm_ordered_rng_with_cursors(
+        replay::OrderedRNGReplay, normal_index, uniform_index,
+        exponential_index, event_index, overflow)
+    typeof(normal_index) === typeof(replay.normal_index) &&
+        typeof(uniform_index) === typeof(replay.uniform_index) &&
+        typeof(exponential_index) === typeof(replay.exponential_index) &&
+        typeof(event_index) === typeof(replay.event_index) &&
+        typeof(overflow) === typeof(replay.overflow) || throw(ArgumentError(
+            "ordered RNG cursor values must preserve their exact builtin types"))
+    _kernel_dom_int_scalar(typeof(normal_index)) &&
+        typeof(normal_index) !== Bool &&
+        _kernel_dom_int_scalar(typeof(uniform_index)) &&
+        typeof(uniform_index) !== Bool &&
+        _kernel_dom_int_scalar(typeof(exponential_index)) &&
+        typeof(exponential_index) !== Bool &&
+        _kernel_dom_int_scalar(typeof(event_index)) &&
+        typeof(event_index) !== Bool && typeof(overflow) === Bool ||
+        throw(ArgumentError(
+            "ordered RNG cursors require builtin non-Bool integers and Bool overflow"))
+    _sm_ordered_rng_reconstruct(
+        replay.normals, replay.uniforms, replay.exponentials,
+        replay.event_tokens, normal_index, uniform_index, exponential_index,
+        event_index, overflow)
+end
+
+const _ORDERED_RNG_NORMAL = UInt8(1)
+const _ORDERED_RNG_UNIFORM = UInt8(2)
+const _ORDERED_RNG_EXPONENTIAL = UInt8(3)
+
+_sm_ordered_rng_event_code(event::Symbol) =
+    event === :normal ? _ORDERED_RNG_NORMAL :
+    event === :uniform ? _ORDERED_RNG_UNIFORM :
+    event === :exponential ? _ORDERED_RNG_EXPONENTIAL :
+    throw(ArgumentError("unknown ordered RNG event `$event`"))
+
+@inline function _sm_ordered_rng_event(replay::OrderedRNGReplay, code)
+    index = replay.event_index
+    in_range = (index .>= one(index)) .&
+        (index .<= length(replay.event_tokens))
+    safe = clamp.(index, one(index), length(replay.event_tokens))
+    token = _sm_ordered_rng_scalar_value(replay.event_tokens, safe)
+    valid = .!replay.overflow .& in_range .& (token .== code)
+    valid, ifelse.(valid, index .+ one(index), index)
 end
 
 @inline _sm_ordered_rng_normal_value(normals, index) =
@@ -232,46 +484,54 @@ end
 
 @inline function _sm_ordered_rng_normal_candidate(replay::OrderedRNGReplay,
                                                    destination)
+    ndims(destination) == 1 || throw(ArgumentError(
+        "ordered RNG normal replay supports vector destinations only"))
     size(replay.normals, 1) == length(destination) || throw(ArgumentError(
         "ordered RNG normal width does not match the authored destination"))
     index = replay.normal_index
-    valid = .!replay.overflow .& (index .>= one(index)) .&
+    event_valid, next_event = _sm_ordered_rng_event(
+        replay, _ORDERED_RNG_NORMAL)
+    valid = event_valid .& (index .>= one(index)) .&
         (index .<= size(replay.normals, 2))
     safe = clamp.(index, one(index), size(replay.normals, 2))
     value = _sm_ordered_rng_normal_value(replay.normals, safe)
     next_index = ifelse.(valid, index .+ one(index), index)
-    next = OrderedRNGReplay(
+    next = _sm_ordered_rng_reconstruct(
         replay.normals, replay.uniforms, replay.exponentials,
-        next_index, replay.uniform_index, replay.exponential_index,
-        replay.overflow .| .!valid)
+        replay.event_tokens, next_index, replay.uniform_index,
+        replay.exponential_index, next_event, replay.overflow .| .!valid)
     (value=value, replay=next, valid=valid)
 end
 
 @inline function _sm_ordered_rng_uniform_candidate(replay::OrderedRNGReplay)
     index = replay.uniform_index
-    valid = .!replay.overflow .& (index .>= one(index)) .&
+    event_valid, next_event = _sm_ordered_rng_event(
+        replay, _ORDERED_RNG_UNIFORM)
+    valid = event_valid .& (index .>= one(index)) .&
         (index .<= length(replay.uniforms))
     safe = clamp.(index, one(index), length(replay.uniforms))
     value = _sm_ordered_rng_scalar_value(replay.uniforms, safe)
     next_index = ifelse.(valid, index .+ one(index), index)
-    next = OrderedRNGReplay(
+    next = _sm_ordered_rng_reconstruct(
         replay.normals, replay.uniforms, replay.exponentials,
-        replay.normal_index, next_index, replay.exponential_index,
-        replay.overflow .| .!valid)
+        replay.event_tokens, replay.normal_index, next_index,
+        replay.exponential_index, next_event, replay.overflow .| .!valid)
     (value=value, replay=next, valid=valid)
 end
 
 @inline function _sm_ordered_rng_exponential_candidate(replay::OrderedRNGReplay)
     index = replay.exponential_index
-    valid = .!replay.overflow .& (index .>= one(index)) .&
+    event_valid, next_event = _sm_ordered_rng_event(
+        replay, _ORDERED_RNG_EXPONENTIAL)
+    valid = event_valid .& (index .>= one(index)) .&
         (index .<= length(replay.exponentials))
     safe = clamp.(index, one(index), length(replay.exponentials))
     value = _sm_ordered_rng_scalar_value(replay.exponentials, safe)
     next_index = ifelse.(valid, index .+ one(index), index)
-    next = OrderedRNGReplay(
+    next = _sm_ordered_rng_reconstruct(
         replay.normals, replay.uniforms, replay.exponentials,
-        replay.normal_index, replay.uniform_index, next_index,
-        replay.overflow .| .!valid)
+        replay.event_tokens, replay.normal_index, replay.uniform_index,
+        next_index, next_event, replay.overflow .| .!valid)
     (value=value, replay=next, valid=valid)
 end
 
@@ -283,29 +543,53 @@ function _sm_validate_ordered_rng_storage(replay::OrderedRNGReplay)
         "ordered RNG uniform tape must contain one fail-closed padding value"))
     !isempty(replay.exponentials) || throw(ArgumentError(
         "ordered RNG exponential tape must contain one fail-closed padding value"))
+    !isempty(replay.event_tokens) || throw(ArgumentError(
+        "ordered RNG event tape must contain one source effect"))
     replay
 end
 
 function OrderedRNGReplay(normals::AbstractMatrix, uniforms::AbstractVector{Bool},
-                          exponentials::AbstractVector)
-    _kernel_dom_num_matrix(typeof(normals)) || throw(ArgumentError(
-        "ordered RNG normal tape must be a builtin numeric matrix"))
+                          exponentials::AbstractVector, events)
+    _kernel_dom_num_matrix(typeof(normals)) &&
+        eltype(normals) <: AbstractFloat || throw(ArgumentError(
+        "ordered RNG normal tape must be a builtin floating matrix"))
     _sm_builtin_array(typeof(uniforms)) || throw(ArgumentError(
         "ordered RNG uniform tape must be a builtin Bool vector"))
-    _kernel_dom_num_array(typeof(exponentials)) || throw(ArgumentError(
-        "ordered RNG exponential tape must be a builtin numeric vector"))
-    eltype(normals) === eltype(exponentials) || throw(ArgumentError(
-        "ordered RNG normal and exponential tapes must share one element type"))
+    _kernel_dom_num_array(typeof(exponentials)) &&
+        ndims(typeof(exponentials)) == 1 && eltype(exponentials) === Float64 ||
+        throw(ArgumentError(
+            "ordered RNG exponential tape must be a builtin Float64 vector"))
     all(isfinite, normals) || throw(ArgumentError(
         "ordered RNG normal tape must contain finite values"))
     all(value -> isfinite(value) && value >= zero(value), exponentials) ||
         throw(ArgumentError(
             "ordered RNG exponential tape must contain finite nonnegative values"))
+    event_tokens = UInt8[_sm_ordered_rng_event_code(event) for event in events]
+    count(==(_ORDERED_RNG_NORMAL), event_tokens) <= size(normals, 2) ||
+        throw(ArgumentError("ordered RNG event tape exceeds normal capacity"))
+    count(==(_ORDERED_RNG_UNIFORM), event_tokens) <= length(uniforms) ||
+        throw(ArgumentError("ordered RNG event tape exceeds uniform capacity"))
+    count(==(_ORDERED_RNG_EXPONENTIAL), event_tokens) <= length(exponentials) ||
+        throw(ArgumentError("ordered RNG event tape exceeds exponential capacity"))
     _sm_validate_ordered_rng_storage(
-        OrderedRNGReplay(normals, uniforms, exponentials, 1, 1, 1, false))
+        _sm_ordered_rng_reconstruct(
+            normals, uniforms, exponentials, event_tokens, 1, 1, 1, 1,
+            false))
 end
 
-_sm_ordered_rng_replay_type(::Type{T}) where {T} = T <: OrderedRNGReplay
+function _sm_ordered_rng_replay_type(::Type{T}) where {T}
+    T <: OrderedRNGReplay || return false
+    N, U, E, Tokens, NI, UI, EI, TI, O = T.parameters
+    _kernel_dom_num_matrix(N) && eltype(N) <: AbstractFloat &&
+        _sm_builtin_array(U) && ndims(U) == 1 && eltype(U) === Bool &&
+        _kernel_dom_num_array(E) && ndims(E) == 1 && eltype(E) === Float64 &&
+        _kernel_dom_num_array(Tokens) && ndims(Tokens) == 1 &&
+        eltype(Tokens) === UInt8 &&
+        _kernel_dom_int_scalar(NI) && NI !== Bool &&
+        _kernel_dom_int_scalar(UI) && UI !== Bool &&
+        _kernel_dom_int_scalar(EI) && EI !== Bool &&
+        _kernel_dom_int_scalar(TI) && TI !== Bool && O === Bool
+end
 
 _kernel_field_registration_noeffect(::_PureCallablePort) = true
 _kernel_field_registration_noeffect(::_EffectCallablePort) = false
@@ -325,6 +609,60 @@ struct _StatefulCompilerBindings{Fields<:NamedTuple}
     fields::Fields
 end
 
+@generated function _construct_stateful_endpoint_from_values(
+        ::_KernelPlan{Key}, handles::H, cvals::Tuple,
+        bindings::_StatefulCompilerBindings{Fields}) where {Key,H,Fields}
+    canons, roles = _plan_superset_from_key(Key)
+    count = length(canons)
+    have = Set{Int}(_plan_have_from_key(Key))
+    external = Set{Int}(_plan_external_from(Key, H))
+    slot_signature = Key[2]
+    binding_names = Fields.parameters[1]
+    binding_types = Fields.parameters[2].parameters
+    binding_type(name) = begin
+        position = findfirst(==(name), binding_names)
+        position === nothing ? Nothing : binding_types[position]
+    end
+    canonical_name(canon) = begin
+        position = findfirst(slot -> slot[2] == canon, slot_signature)
+        position === nothing ? nothing : slot_signature[position][1][end]
+    end
+    disposition(index) = begin
+        canon = canons[index]
+        canon in external && return :(cvals[$index])
+        canon in have || return :(cvals[$index])
+        name = canonical_name(canon)
+        if name !== nothing
+            descriptor_type = binding_type(name)
+            if descriptor_type <: _StructuredStatePort
+                port = :(getfield(getfield(bindings, :fields), $(QuoteNode(name))))
+                return :(_sm_structured_copy($port, cvals[$index]))
+            elseif descriptor_type <: Union{_PureCallablePort,_EffectCallablePort}
+                return :(cvals[$index])
+            end
+        end
+        :(deepcopy(cvals[$index]))
+    end
+    owned_fields = Any[
+        roles[index] === :owned ? disposition(index) : :nothing
+        for index in 1:count]
+    shared_fields = Any[
+        roles[index] === :shared ? disposition(index) : :nothing
+        for index in 1:count]
+    owned_mask = _owner_mask(
+        count, Int[index for index in 1:count if roles[index] === :owned])
+    shared_mask = _owner_mask(
+        count, Int[index for index in 1:count if roles[index] === :shared])
+    owned_type = Symbol(:_CanonOwned, count)
+    shared_type = Symbol(:_CanonShared, count)
+    quote
+        length(cvals) == $count || throw(_KernelFactoryReject(
+            "stateful bootstrap value arity mismatch (superset $count)"))
+        ($owned_type($(owned_fields...), $owned_mask),
+         $shared_type($(shared_fields...), $shared_mask))
+    end
+end
+
 stateful_compiler_bindings(; fields...) =
     _StatefulCompilerBindings(values(fields))
 
@@ -336,12 +674,23 @@ stateful_compiler_bindings(; fields...) =
     value
 end
 
-@inline function _sm_checked_effect_call(::Type{Result}, callable,
-                                         args...) where {Result}
+@inline function _sm_checked_effect_call(
+        ::_EffectCallablePort{ArgTypes,Result,Written,EffectState,F,L,S,
+                             :source}, callable, args...) where
+        {ArgTypes,Result,Written,EffectState,F,L,S}
     value = callable(args...)
     value isa Result || throw(ArgumentError(
         "stateful effect port returned `$(typeof(value))`, expected `$Result`"))
     value
+end
+
+@inline function _sm_checked_effect_call(
+        ::_EffectCallablePort{ArgTypes,Result,Written,EffectState,F,L,S,
+                             :lowering_authority}, callable, args...) where
+        {ArgTypes,Result,Written,EffectState,F,L,S}
+    throw(ArgumentError(
+        "lowering-authority effect ports are functional-only and require " *
+        "independent source-oracle validation"))
 end
 
 function _sm_pure_port(field_regs, name::Symbol)
@@ -547,8 +896,10 @@ function _sm_ordered_rng_result(token, argts::Tuple)
     replay = first(argts)
     replay_ok = _sm_ordered_rng_replay_type(replay)
     if token === Symbol("__rk_rng_Random_randn!__")
-        length(argts) == 2 && _kernel_dom_num_array(argts[2]) ||
-            _sm_reject("randn! replay requires one builtin numeric destination array")
+        length(argts) == 2 && _kernel_dom_num_array(argts[2]) &&
+            argts[2] <: AbstractVector && eltype(argts[2]) <: AbstractFloat ||
+            _sm_reject(
+                "randn! replay requires one builtin floating vector destination")
         if replay_ok
             normals = fieldtype(replay, :normals)
             _kernel_dom_num_matrix(normals) &&
@@ -563,23 +914,36 @@ function _sm_ordered_rng_result(token, argts::Tuple)
         length(argts) == 1 || _sm_reject("randexp replay requires one RNG argument")
         if replay_ok
             exponentials = fieldtype(replay, :exponentials)
-            _kernel_dom_num_array(exponentials) || _sm_reject(
-                "randexp replay requires a builtin numeric exponential tape")
-            return eltype(exponentials)
+            _kernel_dom_num_array(exponentials) &&
+                ndims(exponentials) == 1 && eltype(exponentials) === Float64 ||
+                _sm_reject(
+                    "randexp replay requires a builtin Float64 exponential tape")
+            return Float64
         end
         _kernel_effect_callee_domain_ok(Random.randexp, argts) ||
             _sm_reject("randexp rejects exact operand types $argts")
         return Float64
     elseif token === Symbol("__rk_rng_Random_rand__")
         length(argts) == 2 || _sm_reject("rand replay requires RNG and sample spec")
-        replay_ok || _kernel_effect_callee_domain_ok(Random.rand, argts) ||
-            _sm_reject("rand rejects exact operand types $argts")
+        argts[2] === Type{Bool} || _sm_reject(
+            "ordered Bool replay requires exact sample descriptor `Bool`, got `$(argts[2])`")
+        if replay_ok
+            uniforms = fieldtype(replay, :uniforms)
+            _sm_builtin_array(uniforms) && ndims(uniforms) == 1 &&
+                eltype(uniforms) === Bool || _sm_reject(
+                "rand replay requires a builtin Bool vector tape")
+        else
+            _kernel_effect_callee_domain_ok(Random.rand, argts) ||
+                _sm_reject("rand rejects exact operand types $argts")
+        end
         return Bool
     end
     _sm_reject("unknown ordered RNG token `$token`")
 end
 
 _sm_dtype(::Type{_DSlot{T}}, argtypes, ::Type{KWT}, dot::Bool) where {T,KWT} = dot ? _sm_leaf_type(T) : T
+_sm_dtype(::Type{_DStaticType{T}}, argtypes, ::Type{KWT}, dot::Bool) where {T,KWT} =
+    dot ? _sm_reject("static type descriptors do not admit broadcasting") : Type{T}
 _sm_dtype(::Type{_DSelfState{T}}, argtypes, ::Type{KWT}, dot::Bool) where {T,KWT} =
     dot ? _sm_reject("whole-state values do not admit broadcasting") : T
 function _sm_dtype(::Type{_DFormal{P,V}}, argtypes, ::Type{KWT}, dot::Bool) where {P,V,KWT}
@@ -680,6 +1044,17 @@ function _sm_dtype(::Type{_DStructuralCopy{Destination,Source}}, argtypes,
         "structural copy requires one exact source/destination type, got `$DT` and `$ST`")
     _recipe_dom_deepcopy(DT) || _sm_reject(
         "structural copy rejects unsupported aggregate type `$DT`")
+    DT
+end
+function _sm_dtype(::Type{_DStructuredStateCopy{Destination,Source}}, argtypes,
+                   ::Type{KWT}, dot::Bool) where {Destination,Source,KWT}
+    dot && _sm_reject("structured state copy does not admit broadcasting")
+    DT = _sm_dtype(Destination, argtypes, KWT, false)
+    ST = _sm_dtype(Source, argtypes, KWT, false)
+    DT === ST || _sm_reject(
+        "structured state copy requires one exact source/destination type, got `$DT` and `$ST`")
+    DT <: NamedTuple || _sm_reject(
+        "structured state copy requires a concrete NamedTuple state, got `$DT`")
     DT
 end
 function _sm_dtype(::Type{_DPortCall{Declared,Result,Args}}, argtypes,
@@ -805,6 +1180,16 @@ function _sm_isvector(x, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH}, form
     end
 end
 
+function _sm_exact_static_type(x::_ExtRef)
+    captured = x.captured
+    captured isa DataType && _kernel_dom_num_scalar(captured) || _sm_reject(
+        "external value `$(x.ref)` is not a sanctioned builtin scalar type descriptor")
+    isdefined(x.ref.mod, x.ref.name) &&
+        getglobal(x.ref.mod, x.ref.name) === captured || _sm_reject(
+        "external type descriptor `$(x.ref)` was rebound after source capture")
+    captured
+end
+
 function _sm_rhs(x, syms, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH},
                  formals, locals, dot::Bool, field_regs=Dict{Symbol,Any}()) where {OW,SH}
     if x isa _SelfField
@@ -823,6 +1208,8 @@ function _sm_rhs(x, syms, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH},
         syms[(:local, x.name)]
     elseif x isa _Lit
         x.value
+    elseif x isa _ExtRef
+        _sm_exact_static_type(x)
     elseif x isa _CallableRef
         _sm_exact_callable(x)
     elseif x isa _TupleExpr
@@ -883,9 +1270,13 @@ function _sm_rhs(x, syms, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH},
         args = Any[_sm_rhs(a, syms, plan, fields, OW, SH, formals,
                            locals, false, field_regs) for a in x.pos]
         Result = typeof(port).parameters[2]
-        checked = port isa _PureCallablePort ? :_sm_checked_pure_call :
-            :_sm_checked_effect_call
-        Expr(:call, checked, Result, _pp_read(plan, canon), args...)
+        if port isa _PureCallablePort
+            Expr(:call, :_sm_checked_pure_call, Result,
+                 _pp_read(plan, canon), args...)
+        else
+            Expr(:call, :_sm_checked_effect_call, port,
+                 _pp_read(plan, canon), args...)
+        end
     elseif x isa _CallExpr
         x.target isa _SelfRef || _sm_reject(
             "value-position sibling call must target the current state")
@@ -923,6 +1314,8 @@ function _sm_dtree(x, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH},
         ltrees[x.name]
     elseif x isa _Lit
         _DLit{typeof(x.value)}
+    elseif x isa _ExtRef
+        _DStaticType{_sm_exact_static_type(x)}
     elseif x isa _CallableRef
         _DLit{typeof(_sm_exact_callable(x))}
     elseif x isa _TupleExpr
@@ -960,7 +1353,14 @@ function _sm_dtree(x, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH},
                 ltrees, false, field_regs, methods_by_id, stack)
             source = _sm_dtree(x.args[2], plan, fields, OW, SH, finfo,
                 ltrees, false, field_regs, methods_by_id, stack)
-            return _DStructuralCopy{destination,source}
+            target = x.args[1]
+            structured = target isa _SelfField &&
+                length(target.path) == 1 &&
+                get(field_regs, only(target.path), nothing) isa
+                    _StructuredStatePort
+            return structured ?
+                _DStructuredStateCopy{destination,source} :
+                _DStructuralCopy{destination,source}
         end
         children = Tuple{(_sm_dtree(a, plan, fields, OW, SH, finfo, ltrees,
             dot, field_regs, methods_by_id, stack) for a in x.args)...}
@@ -1226,9 +1626,54 @@ function _sm_domain_forest(ir::MethodIR, plan::_KernelPlan, fields,
     Tuple{nodes...}
 end
 
+_sm_is_ordered_randn(node) =
+    node isa _RegisteredCall &&
+    getfield(node.registration, :primitive_effect) isa _PrimitiveEffect &&
+    getfield(node.registration, :primitive_effect).kind === :rng &&
+    getfield(node.registration, :primitive_effect).token ===
+        Symbol("__rk_rng_Random_randn!__")
+
+function _sm_validate_randn_destination(expression, destination)
+    _kmir_walk(expression) do node
+        _sm_is_ordered_randn(node) || return
+        destination isa _SelfField || _sm_reject(
+            "ordered randn! must be immediately assigned to its exact state destination")
+        length(node.args) == 2 && node.args[2] isa _SelfField &&
+            node.args[2].path == destination.path || _sm_reject(
+            "ordered randn! destination must be the exact state field assigned by its enclosing write")
+    end
+    nothing
+end
+
+function _sm_validate_randn_write_shapes(body)
+    for statement in body
+        if statement isa _PlaceWrite
+            _sm_validate_randn_destination(statement.rhs, statement.target)
+            _sm_validate_randn_destination(statement.target, nothing)
+        elseif statement isa _Guard
+            _sm_validate_randn_destination(statement.cond, nothing)
+            _sm_validate_randn_write_shapes(statement.body)
+        elseif statement isa _If
+            _sm_validate_randn_destination(statement.cond, nothing)
+            _sm_validate_randn_write_shapes(statement.thenb)
+            _sm_validate_randn_write_shapes(statement.elseb)
+        elseif statement isa _For
+            _sm_validate_randn_destination(statement.iter, nothing)
+            _sm_validate_randn_write_shapes(statement.body)
+        else
+            _kmir_walk(statement) do node
+                _sm_is_ordered_randn(node) && _sm_reject(
+                    "ordered randn! is admitted only inside an immediate exact state-field assignment")
+            end
+        end
+    end
+    nothing
+end
+
 function _sm_machine_domain_forest(ir::MethodIR, plan::_KernelPlan, fields,
         ::Type{OW}, ::Type{SH}, typeauth, field_regs,
         methods_by_id) where {OW,SH}
+    _sm_validate_randn_write_shapes(ir.body)
     finfo = Dict{Symbol,Any}()
     position = 0
     for formal in ir.formals
@@ -2117,11 +2562,12 @@ Base.getindex(resources::_StatefulResources, index::Int) =
     getfield(resources, :handles)[index]
 Base.length(resources::_StatefulResources) =
     length(getfield(resources, :handles))
-struct _StatefulKernel{S,PF,RT<:_StatefulRuntime,OW,SH,B}
+struct _StatefulKernel{S,PF,RT<:_StatefulRuntime,OW,SH,B,C}
     skeleton::S
     prepared::PF
     runtime::RT
     bindings::B
+    shape_contract::C
 end
 struct _StatefulState{RT<:_StatefulRuntime,OW,SH,H}
     runtime::RT
@@ -2134,34 +2580,245 @@ end
 # RuntimeGeneratedFunction contains only source-derived expressions and calls
 # to ordinary PreparedKernels.  Optional compilers treat this wrapper as static
 # program structure and trace only `(state, argument)`.
-struct _FunctionalStatefulTransition{Names,F,E,P}
+struct _FunctionalStatefulTransition{Names,StateType,F,E,P,C}
     f::F
     ensures::E
     ports::P
+    shape_contract::C
 end
 
 # Structured MethodIR uses a tuple ABI because authored methods may have any
 # fixed positional arity.  The wrapper is immutable compiler metadata just as
 # the straight-line transition above is; only state and arguments are dynamic.
 struct _FunctionalStateMachineTransition{
-        Names,ArrayNames,Iterations,ArgumentTypes,Declared,Forest,F,P,E}
+        Names,ArrayNames,StateType,EffectType,Iterations,ArgumentTypes,
+        Declared,Forest,F,P,E,C}
     f::F
     ports::P
     ensures::E
+    shape_contract::C
 end
+
+# Keyword arguments are convenient for ordinary Julia, but optional compiler
+# thunks do not necessarily retain a dynamic keyword ABI.  This callable view
+# makes the auxiliary effect carrier an ordinary validated positional input so
+# repeated compiled invocations can thread it without baking it into a trace.
+struct _FunctionalTransitionWithEffects{T}
+    transition::T
+end
+
+function (runner::_FunctionalTransitionWithEffects)(
+        state, effects, arguments...)
+    _sm_functional_machine_call(
+        getfield(runner, :transition), state, effects, arguments)
+end
+
+"""
+    transition_with_effects(transition)
+
+Return a positional callable `(state, effects, arguments...)` for a
+functionalized structured state-machine method. This is the optional-compiler
+ABI for explicitly threading the auxiliary value returned as `result.effects`
+into a later invocation.
+"""
+transition_with_effects(transition::_FunctionalStateMachineTransition) =
+    _FunctionalTransitionWithEffects(transition)
 
 _sm_functional_argument_type_ok(::Type{Actual}, ::Type{Expected}) where
     {Actual,Expected} = Actual === Expected
 
-function (transition::_FunctionalStateMachineTransition)(state, arguments...)
-    _sm_functional_machine_call(transition, state, arguments)
+function _sm_functional_argument_type_ok(
+        ::Type{Actual}, ::Type{Expected}) where
+        {Actual<:NamedTuple,Expected<:NamedTuple}
+    fieldnames(Actual) == fieldnames(Expected) &&
+        all(_sm_functional_argument_type_ok(
+                fieldtype(Actual, name), fieldtype(Expected, name))
+            for name in fieldnames(Expected))
+end
+
+function _sm_functional_argument_type_ok(
+        ::Type{Actual}, ::Type{Expected}) where
+        {Actual<:Tuple,Expected<:Tuple}
+    length(Actual.parameters) == length(Expected.parameters) &&
+        all(_sm_functional_argument_type_ok(A, E)
+            for (A, E) in zip(Actual.parameters, Expected.parameters))
+end
+
+function _sm_functional_argument_type_ok(
+        ::Type{Actual}, ::Type{Expected}) where
+        {Actual<:LinearAlgebra.Diagonal,Expected<:LinearAlgebra.Diagonal}
+    _sm_functional_argument_type_ok(
+        fieldtype(Actual, :diag), fieldtype(Expected, :diag))
+end
+
+function _sm_functional_argument_type_ok(
+        ::Type{Actual}, ::Type{Expected}) where
+        {Actual<:LinearAlgebra.Cholesky,Expected<:LinearAlgebra.Cholesky}
+    _sm_functional_argument_type_ok(
+        fieldtype(Actual, :factors), fieldtype(Expected, :factors)) &&
+        fieldtype(Actual, :uplo) === fieldtype(Expected, :uplo) &&
+        fieldtype(Actual, :info) === fieldtype(Expected, :info)
+end
+
+function _sm_validate_functional_effect_candidate(
+        ::_EffectCallablePort{ArgTypes,Result,Written,EffectState}, candidate,
+        ::Type{ExpectedArguments}) where
+        {ArgTypes,Result,Written,EffectState,ExpectedArguments<:Tuple}
+    candidate isa NamedTuple &&
+        propertynames(candidate) == (:arguments, :result, :effect_state) ||
+        throw(ArgumentError(
+            "functional effect lowering must return exactly " *
+            "(arguments, result, effect_state)"))
+    candidate.arguments isa Tuple || throw(ArgumentError(
+        "functional effect lowering arguments must be one positional tuple"))
+    _sm_functional_argument_type_ok(
+        typeof(candidate.arguments), ExpectedArguments) ||
+        throw(ArgumentError(
+            "functional effect lowering replacement arguments do not match " *
+            "their logical contract"))
+    _sm_functional_argument_type_ok(typeof(candidate.result), Result) ||
+        throw(ArgumentError(
+            "functional effect lowering result does not match `$Result`"))
+    _sm_functional_argument_type_ok(
+        typeof(candidate.effect_state), EffectState) ||
+        throw(ArgumentError(
+            "functional effect lowering state does not match `$EffectState`"))
+    candidate
+end
+
+function _sm_validate_functional_result(::Type{Expected}, candidate) where {Expected}
+    _sm_functional_argument_type_ok(typeof(candidate), Expected) ||
+        throw(ArgumentError(
+            "functional callable result does not match `$Expected`"))
+    candidate
+end
+
+_sm_functional_shape_ok(actual, expected) = true
+_sm_functional_shape_ok(actual::AbstractArray, expected::AbstractArray) =
+    size(actual) == size(expected)
+_sm_functional_shape_ok(actual::NamedTuple, expected::NamedTuple) =
+    propertynames(actual) == propertynames(expected) &&
+    all(_sm_functional_shape_ok(
+            getfield(actual, name), getfield(expected, name))
+        for name in propertynames(expected))
+_sm_functional_shape_ok(actual::Tuple, expected::Tuple) =
+    length(actual) == length(expected) &&
+    all(_sm_functional_shape_ok(a, e) for (a, e) in zip(actual, expected))
+_sm_functional_shape_ok(
+        actual::LinearAlgebra.Diagonal, expected::LinearAlgebra.Diagonal) =
+    _sm_functional_shape_ok(actual.diag, expected.diag)
+_sm_functional_shape_ok(
+        actual::LinearAlgebra.Cholesky, expected::LinearAlgebra.Cholesky) =
+    _sm_functional_shape_ok(actual.factors, expected.factors)
+
+_sm_shape_contract(value) = nothing
+_sm_shape_contract(value::AbstractArray) = size(value)
+_sm_shape_contract(value::NamedTuple) = map(_sm_shape_contract, value)
+_sm_shape_contract(value::Tuple) = map(_sm_shape_contract, value)
+_sm_shape_contract(value::LinearAlgebra.Diagonal) =
+    _sm_shape_contract(value.diag)
+_sm_shape_contract(value::LinearAlgebra.Cholesky) =
+    _sm_shape_contract(value.factors)
+
+_sm_shape_contract_ok(value, ::Nothing) = true
+_sm_shape_contract_ok(value::AbstractArray, expected::Tuple) =
+    size(value) == expected
+_sm_shape_contract_ok(value::NamedTuple, expected::NamedTuple) =
+    propertynames(value) == propertynames(expected) &&
+    all(_sm_shape_contract_ok(getfield(value, name), getfield(expected, name))
+        for name in propertynames(expected))
+_sm_shape_contract_ok(value::Tuple, expected::Tuple) =
+    length(value) == length(expected) &&
+    all(_sm_shape_contract_ok(actual, contract)
+        for (actual, contract) in zip(value, expected))
+_sm_shape_contract_ok(value::LinearAlgebra.Diagonal, expected::Tuple) =
+    _sm_shape_contract_ok(value.diag, expected)
+_sm_shape_contract_ok(value::LinearAlgebra.Cholesky, expected::Tuple) =
+    _sm_shape_contract_ok(value.factors, expected)
+_sm_shape_contract_ok(value, expected) = false
+
+function _sm_validate_functional_structured_state_port(
+        port::_StructuredStatePort, value)
+    transition = getfield(port, :transition)
+    initial = getfield(transition, :initial)
+    _sm_functional_argument_type_ok(typeof(value), typeof(initial)) ||
+        throw(ArgumentError(
+            "functional structured state does not match its logical layout"))
+    _sm_functional_shape_ok(value, initial) || throw(ArgumentError(
+        "functional structured state does not match its compiled shapes"))
+    names, groups, external_groups = typeof(transition).parameters[1:3]
+    propertynames(value) == names || throw(ArgumentError(
+        "functional structured state has the wrong field layout"))
+    for (group_index, group) in enumerate(groups)
+        leader = getfield(value, first(group))
+        all(name -> getfield(value, name) === leader, group) ||
+            throw(ArgumentError(
+                "functional structured state does not preserve canonical " *
+                "aliases $group"))
+        if group_index in external_groups
+            leader === getfield(initial, first(group)) ||
+                throw(ArgumentError(
+                    "functional structured state external authority " *
+                    "`$(first(group))` was replaced"))
+        end
+    end
+    value
+end
+
+function _sm_validate_functional_state_ports(ports::NamedTuple, state)
+    for name in propertynames(ports)
+        port = getfield(ports, name)
+        hasproperty(state, name) || throw(ArgumentError(
+            "functional state is missing compiler-bound field `$name`"))
+        value = getfield(state, name)
+        if port isa _StructuredStatePort
+            _sm_validate_functional_structured_state_port(port, value)
+        elseif port isa Union{_PureCallablePort,_EffectCallablePort}
+            value === getfield(port, :source) || throw(ArgumentError(
+                "functional state callable authority `$name` was replaced"))
+        end
+    end
+    state
+end
+
+function (transition::_FunctionalStateMachineTransition)(
+        state, arguments...; effects=initial_transition_effects(transition))
+    _sm_functional_machine_call(transition, state, effects, arguments)
+end
+
+
+"""
+    initial_transition_effects(transition)
+
+Construct an isolated initial auxiliary-effect carrier for a functionalized
+structured state-machine method. Thread the returned `effects` from each call
+into the next call instead of recreating this value between transitions.
+"""
+function initial_transition_effects(
+        transition::_FunctionalStateMachineTransition)
+    pairs = Pair{Symbol,Any}[]
+    for name in propertynames(getfield(transition, :ports))
+        port = getfield(getfield(transition, :ports), name)
+        port isa _EffectCallablePort || continue
+        push!(pairs, name =>
+            _sm_structural_copy(getfield(port, :initial_effect_state)))
+    end
+    NamedTuple(sort!(pairs; by=first))
 end
 
 function _sm_functional_machine_call(
         transition::_FunctionalStateMachineTransition{
-            Names,ArrayNames,Iterations,ArgumentTypes,Declared,Forest},
-        state, arguments::Tuple) where
-        {Names,ArrayNames,Iterations,ArgumentTypes,Declared,Forest}
+            Names,ArrayNames,StateType,EffectType,Iterations,ArgumentTypes,
+            Declared,Forest}, state, effects, arguments::Tuple) where
+        {Names,ArrayNames,StateType,EffectType,Iterations,ArgumentTypes,
+         Declared,Forest}
+    propertynames(state) == Names &&
+        _sm_functional_argument_type_ok(typeof(state), StateType) ||
+        throw(ArgumentError(
+            "functional state-machine state does not match its logical contract"))
+    _sm_shape_contract_ok(state, getfield(transition, :shape_contract)) ||
+        throw(ArgumentError(
+            "functional state-machine state does not match its compiled axes"))
     actual = typeof.(arguments)
     expected = Tuple(ArgumentTypes.parameters)
     length(actual) == length(expected) ||
@@ -2174,22 +2831,40 @@ function _sm_functional_machine_call(
         argument isa OrderedRNGReplay &&
             _sm_validate_ordered_rng_storage(argument)
     end
+    _sm_validate_functional_state_ports(getfield(transition, :ports), state)
+    _sm_functional_argument_type_ok(typeof(effects), EffectType) ||
+        throw(ArgumentError(
+            "functional state-machine effects do not match their logical contract"))
+    initial_effects = initial_transition_effects(transition)
+    _sm_functional_shape_ok(effects, initial_effects) || throw(ArgumentError(
+        "functional state-machine effects do not match their compiled axes"))
     for name in ArrayNames
         message = "functional state-machine array `$name` has a zero axis"
         all(>(0), size(getfield(state, name))) || throw(ArgumentError(message))
     end
     RuntimeGeneratedFunctions.generated_callfunc(
         getfield(transition, :f), getfield(transition, :ports),
-        getfield(transition, :ensures), state, arguments)
+        getfield(transition, :ensures), state, arguments, effects)
 end
 
-@inline _sm_predicated_select(active, new, old) = ifelse.(active, new, old)
-@inline _sm_predicated_select(active::Number, new::Number, old::Number) =
+@inline function _sm_predicated_select(active, new::T, old::T) where {T}
+    throw(ArgumentError(
+        "predicated functional state rejects unsupported value type `$T`"))
+end
+@inline function _sm_predicated_select(active, new::T, old::T) where {T<:Number}
+    _kernel_dom_num_scalar(T) || throw(ArgumentError(
+        "predicated functional state rejects non-builtin scalar `$T`"))
     ifelse(active, new, old)
-@inline function _sm_predicated_select(active, new::F, old::F) where {F<:Function}
+end
+@inline function _sm_predicated_select(active, new::A, old::A) where {A<:AbstractArray}
+    _sm_builtin_array(A) || throw(ArgumentError(
+        "predicated functional state rejects non-builtin array `$A`"))
+    ifelse.(active, new, old)
+end
+@inline function _sm_authority_predicated_select(active, new, old)
     new === old || throw(ArgumentError(
         "predicated functional state cannot select between callable authorities"))
-    new
+    old
 end
 @inline _sm_predicated_select(active, ::Nothing, ::Nothing) = nothing
 @inline _sm_predicated_select(active, new::NamedTuple, old::NamedTuple) =
@@ -2212,18 +2887,23 @@ end
 end
 @inline _sm_predicated_select(active, new::OrderedRNGReplay,
                               old::OrderedRNGReplay) =
-    OrderedRNGReplay(
+    _sm_ordered_rng_reconstruct(
         _sm_predicated_select(active, new.normals, old.normals),
         _sm_predicated_select(active, new.uniforms, old.uniforms),
         _sm_predicated_select(active, new.exponentials, old.exponentials),
+        _sm_predicated_select(active, new.event_tokens, old.event_tokens),
         _sm_predicated_select(active, new.normal_index, old.normal_index),
         _sm_predicated_select(active, new.uniform_index, old.uniform_index),
         _sm_predicated_select(active, new.exponential_index,
                               old.exponential_index),
+        _sm_predicated_select(active, new.event_index, old.event_index),
         _sm_predicated_select(active, new.overflow, old.overflow))
 @inline _sm_predicated_and(lhs, rhs) = lhs .& rhs
 @inline _sm_predicated_or(lhs, rhs) = lhs .| rhs
 @inline _sm_predicated_not(value) = .!value
+@inline _sm_predicated_safe_one(value::Number) = one(value)
+@inline _sm_predicated_safe_one(value::LinearAlgebra.Diagonal) =
+    LinearAlgebra.Diagonal(one.(value.diag))
 @inline _sm_safe_index(index, array, ::Val{Dimension}) where {Dimension} =
     clamp.(index, one(index), size(array, Dimension))
 @inline _sm_functional_index(array, indices...) = getindex(array, indices...)
@@ -2233,7 +2913,16 @@ end
     result
 end
 
-function (transition::_FunctionalStatefulTransition)(state, argument)
+function (transition::_FunctionalStatefulTransition{Names,StateType})(
+        state, argument) where {Names,StateType}
+    propertynames(state) == Names &&
+        _sm_functional_argument_type_ok(typeof(state), StateType) ||
+        throw(ArgumentError(
+            "functional stateful state does not match its logical contract"))
+    _sm_shape_contract_ok(state, getfield(transition, :shape_contract)) ||
+        throw(ArgumentError(
+            "functional stateful state does not match its compiled axes"))
+    _sm_validate_functional_state_ports(getfield(transition, :ports), state)
     RuntimeGeneratedFunctions.generated_callfunc(
         getfield(transition, :f), getfield(transition, :ensures),
         getfield(transition, :ports), state, argument)
@@ -2273,6 +2962,8 @@ function _sm_functional_rhs(x, syms, plan::_KernelPlan, fields,
         syms[(:local, x.name)]
     elseif x isa _Lit
         x.value
+    elseif x isa _ExtRef
+        _sm_exact_static_type(x)
     elseif x isa _CallableRef
         _sm_exact_callable(x)
     elseif x isa _TupleExpr
@@ -2315,9 +3006,11 @@ function _sm_functional_rhs(x, syms, plan::_KernelPlan, fields,
         # the native path. A functional lowering instead returns the optional
         # compiler's traced representation of that logical result, so a Julia
         # `isa Result` check here would reject a valid traced scalar wrapper.
-        Expr(:call,
-             :(getfield(getfield(ports, $(QuoteNode(name))),
-                        :functional_lowering)), args...)
+        lowering = Expr(:call,
+            :(getfield(getfield(ports, $(QuoteNode(name))),
+                       :functional_lowering)), args...)
+        :(_sm_validate_functional_result($(typeof(port).parameters[2]),
+                                         $lowering))
     elseif x isa _CallExpr
         _sm_functional_sibling_rhs(x, syms, plan, fields, OW, SH,
             formals, locals, field_regs, methods_by_id, stack, ensure_field)
@@ -2463,6 +3156,8 @@ function _sm_functional_machine_rhs(x, syms, plan::_KernelPlan, fields,
         syms[(:local, x.name)]
     elseif x isa _Lit
         x.value
+    elseif x isa _ExtRef
+        _sm_exact_static_type(x)
     elseif x isa _CallableRef
         _sm_exact_callable(x)
     elseif x isa _TupleExpr
@@ -2533,6 +3228,24 @@ function _sm_functional_machine_rhs(x, syms, plan::_KernelPlan, fields,
             return rng_effect(x, syms, active, arguments)
         end
         f = _sm_exact_callee(x; allow_broadcast=dot)
+        if active !== nothing
+            if f === Base.sqrt || f === Base.log
+                arguments[1] = :(_sm_predicated_select(
+                    $active, $(arguments[1]),
+                    _sm_predicated_safe_one($(arguments[1]))))
+            elseif f === Base.:^
+                arguments[1] = :(_sm_predicated_select(
+                    $active, $(arguments[1]),
+                    _sm_predicated_safe_one($(arguments[1]))))
+            elseif f === Base.:/
+                arguments[2] = :(_sm_predicated_select(
+                    $active, $(arguments[2]),
+                    _sm_predicated_safe_one($(arguments[2]))))
+            elseif f === Base.:(:) && length(arguments) == 3
+                arguments[2] = :(_sm_predicated_select(
+                    $active, $(arguments[2]), one($(arguments[2]))))
+            end
+        end
         dot && _sm_isvector(x, plan, fields, OW, SH, formals, locals) ?
             Expr(:call, GlobalRef(Base, :broadcasted), f, arguments...) :
             Expr(:call, f === Base.sqrt ? :_sm_sanctioned_sqrt :
@@ -2545,14 +3258,19 @@ function _sm_functional_machine_rhs(x, syms, plan::_KernelPlan, fields,
         dot && _sm_reject(
             "functional state-machine callable port rejects broadcasting")
         name = only(x.path)
-        _sm_pure_port(field_regs, name)
+        port = _sm_pure_port(field_regs, name)
+        port.functional_lowering isa _TotalFunctionalLowering || _sm_reject(
+            "control-dependent pure callable `$name` requires an explicit " *
+            "total_functional_lowering contract")
         arguments = Any[_sm_functional_machine_rhs(arg, syms, plan, fields,
             OW, SH, formals, locals, false, field_regs, methods_by_id, stack,
             active, rng_effect)
             for arg in x.pos]
-        Expr(:call,
+        lowering = Expr(:call,
             :(getfield(getfield(ports, $(QuoteNode(name))),
                        :functional_lowering)), arguments...)
+        :(_sm_validate_functional_result($(typeof(port).parameters[2]),
+                                         $lowering))
     elseif x isa _CallExpr
         _sm_functional_machine_sibling_rhs(x, syms, plan, fields, OW, SH,
             formals, locals, field_regs, methods_by_id, stack, active,
@@ -2628,9 +3346,9 @@ function _sm_functional_machine_sibling_rhs(call::_CallExpr, syms,
 end
 
 function _functional_state_machine_method(
-        kernel::_StatefulKernel{S,PF,RT,OW,SH,B}, ir::MethodIR,
+        kernel::_StatefulKernel{S,PF,RT,OW,SH,B,C}, ir::MethodIR,
         max_iterations::Int, ::Type{ArgumentTypes}, ::Type{Declared},
-        ::Type{Forest}) where {S,PF,RT,OW,SH,B,ArgumentTypes,Declared,Forest}
+        ::Type{Forest}) where {S,PF,RT,OW,SH,B,C,ArgumentTypes,Declared,Forest}
     max_iterations >= 1 || _sm_reject(
         "functional state-machine bound must be positive")
     _sm_validate_machine_formals(ir)
@@ -2645,6 +3363,8 @@ function _functional_state_machine_method(
 
     skeleton = getfield(kernel, :skeleton)
     field_regs = _stateful_field_regs(getfield(kernel, :bindings))
+    ports = _sm_freeze_compiler_ports(
+        getfield(getfield(kernel, :bindings), :fields))
     methods_by_id = Dict{MethodId,MethodIR}(
         method.id => method for method in method_irs(skeleton))
     spec = kernel_spec(skeleton)
@@ -2695,15 +3415,15 @@ function _functional_state_machine_method(
             :(local $symbol = getfield(state, $(QuoteNode(name)))))
     end
     initial_effect_syms = Dict{Symbol,Symbol}()
-    for name in propertynames(getfield(getfield(kernel, :bindings), :fields))
-        port = getfield(getfield(getfield(kernel, :bindings), :fields), name)
+    for name in propertynames(ports)
+        port = getfield(ports, name)
         port isa _EffectCallablePort || continue
         initial = fresh(:__sfm_initial_effect_, name)
         symbol = fresh(:__sfm_effect_, name)
         initial_effect_syms[name] = initial
         effect_syms[name] = symbol
         push!(statements, :(local $initial = getfield(
-            getfield(ports, $(QuoteNode(name))), :initial_effect_state)))
+            input_effects, $(QuoteNode(name)))))
         push!(statements, :(local $symbol = $initial))
     end
     initial_field_syms = copy(base_syms)
@@ -3114,6 +3834,10 @@ function _functional_state_machine_method(
                     "require one typed callable field")
                 name = only(call.path)
                 port = _sm_effect_port(field_regs, name)
+                port.functional_lowering isa _TotalFunctionalLowering ||
+                    _sm_reject(
+                        "control-dependent effect callable `$name` requires " *
+                        "an explicit total_functional_lowering contract")
                 isempty(call.kw) || _sm_reject(
                     "functional effect callable ports reject keywords")
                 arguments = Any[]
@@ -3129,9 +3853,21 @@ function _functional_state_machine_method(
                     end
                 end
                 effect = effect_syms[name]
-                candidate = bind!(:(getfield(
+                raw_candidate = bind!(:(getfield(
                     getfield(ports, $(QuoteNode(name))), :functional_lowering)(
-                    $effect, $(arguments...))), :__sfm_effect_call_, name)
+                    $effect, $(arguments...))), :__sfm_effect_raw_, name)
+                declared_types = typeof(port).parameters[1].parameters
+                snapshot_type = _sm_state_snapshot_type(plan, OW, SH)
+                expected_types = map(declared_types) do declared_type
+                    declared_type === StatefulStateValue ? snapshot_type :
+                        declared_type
+                end
+                expected_arguments = Tuple{expected_types...}
+                candidate = bind!(
+                    :(_sm_validate_functional_effect_candidate(
+                        getfield(ports, $(QuoteNode(name))), $raw_candidate,
+                        $expected_arguments)),
+                    :__sfm_effect_call_, name)
                 replacement_effect = :(getfield($candidate, :effect_state))
                 push!(statements, :($effect = _sm_predicated_select(
                     $active, $replacement_effect, $effect)))
@@ -3172,6 +3908,12 @@ function _functional_state_machine_method(
                                 set_field!(field,
                                     :(_sm_structured_predicated_select(
                                         $structured, $active, $value, $old)))
+                            elseif haskey(field_regs, field) &&
+                                    field_regs[field] isa Union{
+                                        _PureCallablePort,_EffectCallablePort}
+                                set_field!(field,
+                                    :(_sm_authority_predicated_select(
+                                        $active, $value, $old)))
                             else
                                 set_field!(field, :(_sm_predicated_select(
                                     $active, $value, $old)))
@@ -3317,6 +4059,11 @@ function _functional_state_machine_method(
             port = :(getfield(ports, $(QuoteNode(name))))
             push!(outputs, :(_sm_structured_predicated_select(
                 $port, $control_overflow, $initial, $current)))
+        elseif haskey(field_regs, name) &&
+                field_regs[name] isa Union{
+                    _PureCallablePort,_EffectCallablePort}
+            push!(outputs, :(_sm_authority_predicated_select(
+                $control_overflow, $initial, $current)))
         else
             push!(outputs, :(_sm_predicated_select(
                 $control_overflow, $initial, $current)))
@@ -3338,17 +4085,23 @@ function _functional_state_machine_method(
         control_overflow=$control_overflow,
         effects=NamedTuple{$effect_names}(($(effects...),)),
     )))
-    ports = getfield(getfield(kernel, :bindings), :fields)
-    fn = compile(:((ports, ensures, state, arguments) ->
+    fn = compile(:((ports, ensures, state, arguments, input_effects) ->
         $(Expr(:block, statements...))))
+    state_type = _sm_state_snapshot_type(plan, OW, SH)
+    initial_effect_values = Any[
+        _sm_structural_copy(getfield(getfield(ports, name),
+                                     :initial_effect_state))
+        for name in effect_names]
+    effect_type = typeof(NamedTuple{effect_names}((initial_effect_values...,)))
     _FunctionalStateMachineTransition{
-        names,array_names,max_iterations,ArgumentTypes,Declared,Forest,
-        typeof(fn),typeof(ports),typeof(Tuple(ensures))}(
-            fn, ports, Tuple(ensures))
+        names,array_names,state_type,effect_type,max_iterations,ArgumentTypes,
+        Declared,Forest,
+        typeof(fn),typeof(ports),typeof(Tuple(ensures)),C}(
+            fn, ports, Tuple(ensures), getfield(kernel, :shape_contract))
 end
 
-function _functional_stateful_method(kernel::_StatefulKernel{S,PF,RT,OW,SH,B},
-        ir::MethodIR) where {S,PF,RT,OW,SH,B}
+function _functional_stateful_method(kernel::_StatefulKernel{S,PF,RT,OW,SH,B,C},
+        ir::MethodIR) where {S,PF,RT,OW,SH,B,C}
     _sm_validate_formals(ir)
     any(formal -> formal.kind !== :pos, ir.formals) && _sm_reject(
         "functional stateful transition currently requires positional-only methods")
@@ -3526,11 +4279,14 @@ function _functional_stateful_method(kernel::_StatefulKernel{S,PF,RT,OW,SH,B},
         outputs = Any[syms[(:field, name)] for name in names]
         push!(statements, :(return NamedTuple{$names}(($(outputs...),))))
     end
-    ports = getfield(getfield(kernel, :bindings), :fields)
+    ports = _sm_freeze_compiler_ports(
+        getfield(getfield(kernel, :bindings), :fields))
     fn = compile(:((ensures, ports, state, argument) ->
         $(Expr(:block, statements...))))
-    _FunctionalStatefulTransition{names,typeof(fn),typeof(Tuple(ensures)),
-        typeof(ports)}(fn, Tuple(ensures), ports)
+    state_type = _sm_state_snapshot_type(plan, OW, SH)
+    _FunctionalStatefulTransition{
+        names,state_type,typeof(fn),typeof(Tuple(ensures)),typeof(ports),C}(
+            fn, Tuple(ensures), ports, getfield(kernel, :shape_contract))
 end
 
 function _functionalize_stateful(kernel::_StatefulKernel, ::Val{Name};
@@ -3607,7 +4363,35 @@ struct CompiledStateTransition{
     structured_repairs::R
 end
 
-function (transition::CompiledStateTransition)(state)
+function _sm_compiler_static_snapshot(value::CompiledStateTransition)
+    typeof(value)(
+        getfield(value, :f), getfield(value, :ensures),
+        initial_transition_state(value),
+        getfield(value, :structured_repairs))
+end
+
+function (transition::CompiledStateTransition{Names,Groups,ExternalGroups})(
+        state) where {Names,Groups,ExternalGroups}
+    initial = getfield(transition, :initial)
+    propertynames(state) == Names &&
+        _sm_functional_argument_type_ok(typeof(state), typeof(initial)) ||
+        throw(ArgumentError(
+            "compiled state transition input does not match its logical contract"))
+    _sm_functional_shape_ok(state, initial) || throw(ArgumentError(
+        "compiled state transition input does not match its compiled axes"))
+    for (group_index, group) in enumerate(Groups)
+        leader = getfield(state, first(group))
+        all(name -> getfield(state, name) === leader, group) ||
+            throw(ArgumentError(
+                "compiled state transition input does not preserve canonical " *
+                "aliases $group"))
+        if group_index in ExternalGroups
+            leader === getfield(initial, first(group)) ||
+                throw(ArgumentError(
+                    "compiled state transition external authority " *
+                    "`$(first(group))` was replaced"))
+        end
+    end
     RuntimeGeneratedFunctions.generated_callfunc(
         getfield(transition, :f), getfield(transition, :ensures), state)
 end
@@ -3622,7 +4406,8 @@ end
         leader = first(group)
         value = Symbol("__transition_initial_group_", group_index)
         source = :(getfield(getfield(transition, :initial), $(QuoteNode(leader))))
-        rhs = group_index in ExternalGroups ? source : :(deepcopy($source))
+        rhs = group_index in ExternalGroups ? source :
+            :(_sm_structural_copy($source))
         push!(statements, :(local $value = $rhs))
         for name in group
             aliases[name] = value
@@ -3707,15 +4492,24 @@ end
 
 @generated function _sm_structured_predicated_select(
         port::_StructuredStatePort{T}, active, candidate, prior) where {T}
-    Names, Groups = T.parameters[1:2]
+    Names, Groups, ExternalGroups = T.parameters[1:3]
     statements = Any[]
     aliases = Dict{Symbol,Symbol}()
     for (group_index, group) in enumerate(Groups)
         symbol = Symbol("__structured_select_group_", group_index)
         new = :(getfield(candidate, $(QuoteNode(first(group)))))
         old = :(getfield(prior, $(QuoteNode(first(group)))))
-        push!(statements,
-            :(local $symbol = _sm_predicated_select(active, $new, $old)))
+        if group_index in ExternalGroups
+            push!(statements, quote
+                $new === $old || throw(ArgumentError(
+                    "structured state external authority `$(first(group))` " *
+                    "cannot be replaced by predicated selection"))
+                local $symbol = $old
+            end)
+        else
+            push!(statements,
+                :(local $symbol = _sm_predicated_select(active, $new, $old)))
+        end
         for name in group
             aliases[name] = symbol
         end
@@ -4054,9 +4848,13 @@ function _compile_state_transition(spec::KernelSpec, pf::_PreparedFactory,
                     Dict{MethodId,MethodIR}(), MethodId[ir.id])
                 got = validate_tree(tree, statement.dot)
                 wanted = statement.dot ? _sm_leaf_type(field_type) : field_type
-                got === wanted || _sm_reject(
+                float_broadcast_conversion = statement.dot &&
+                    got <: AbstractFloat && wanted <: AbstractFloat &&
+                    _kernel_dom_num_scalar(got) &&
+                    _kernel_dom_num_scalar(wanted)
+                (got === wanted || float_broadcast_conversion) || _sm_reject(
                     "functional transition write result type `$got` does not " *
-                    "exactly match destination `$wanted`")
+                    "exactly match destination `$name::$wanted`")
                 rhs = _sm_functional_rhs(statement.rhs, syms, plan,
                     fields, OW, SH, formals, locals, statement.dot,
                     Dict{Symbol,Any}(), Dict{MethodId,MethodIR}(),
@@ -4064,7 +4862,10 @@ function _compile_state_transition(spec::KernelSpec, pf::_PreparedFactory,
                 value = if field_type <: AbstractArray
                     statement.dot || _sm_reject(
                         "functional transition array `$name` requires an authored @. write")
-                    Expr(:call, GlobalRef(Base, :materialize), rhs)
+                    converted = float_broadcast_conversion ?
+                        Expr(:call, GlobalRef(Base, :broadcasted), wanted, rhs) :
+                        rhs
+                    Expr(:call, GlobalRef(Base, :materialize), converted)
                 else
                     statement.dot && _sm_reject(
                         "functional transition scalar `$name` cannot use an authored @. write")
@@ -4208,7 +5009,8 @@ function compile_stateful(skel, bindings::_StatefulCompilerBindings,
                           args...; kwargs...)
     field_regs = _stateful_field_regs(bindings)
     pf = _prepare_stateful(skel; field_regs)
-    owned, shared = _construct_stateful(skel, pf, args...; kwargs...)
+    owned, shared = _construct_bound_stateful(
+        skel, pf, bindings, args...; kwargs...)
     _validate_stateful_bindings!(skel, pf, owned, shared, bindings)
     plan = kernel_prepared_plan(pf); irs = method_irs(skel)
     methods = compile_stateful_methods(
@@ -4229,12 +5031,20 @@ function compile_stateful(skel, bindings::_StatefulCompilerBindings,
         (sl.path[end], role, slot, ei === nothing ? 0 : ei)
     end for sl in kernel_plan_slots(plan))
     runtime = _StatefulRuntime{typeof(methods),typeof(ensures),access}(methods, ensures)
+    resources = _StatefulResources(
+        kernel_prepared_handles(pf), getfield(bindings, :fields))
+    initial_state = _StatefulState{
+        typeof(runtime),typeof(owned),typeof(shared),typeof(resources)}(
+            runtime, owned, shared, resources)
+    contract = _sm_shape_contract(_stateful_snapshot(initial_state))
     _StatefulKernel{typeof(skel),typeof(pf),typeof(runtime),typeof(owned),
-        typeof(shared),typeof(bindings)}(skel, pf, runtime, bindings)
+        typeof(shared),typeof(bindings),typeof(contract)}(
+            skel, pf, runtime, bindings, contract)
 end
 
 (k::_StatefulKernel)(args...; kwargs...) = begin
-    owned, shared = _construct_stateful(k.skeleton, k.prepared, args...; kwargs...)
+    owned, shared = _construct_bound_stateful(
+        k.skeleton, k.prepared, k.bindings, args...; kwargs...)
     typeof(owned) === typeof(k).parameters[4] && typeof(shared) === typeof(k).parameters[5] ||
         throw(ArgumentError("compiled stateful kernel received constructor arguments with different storage types"))
     _validate_stateful_bindings!(getfield(k, :skeleton), getfield(k, :prepared),

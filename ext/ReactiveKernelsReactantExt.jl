@@ -58,6 +58,82 @@ function ReactiveKernels._sm_functional_argument_type_ok(
     end
 end
 
+# Tensor wrappers are the optional compiler's logical representations of the
+# builtin scalar/array predicated-selection domain.  Keep these methods in the
+# extension so core never broadly authorizes arbitrary AbstractArray/Number
+# subtypes (and therefore never invokes user broadcast machinery).
+@inline ReactiveKernels._sm_predicated_select(
+    active, new::T, old::T) where {T<:Reactant.TracedRArray} =
+        ifelse.(active, new, old)
+@inline ReactiveKernels._sm_predicated_select(
+    active, new::T, old::T) where {T<:Reactant.TracedRNumber} =
+        ifelse(active, new, old)
+@inline ReactiveKernels._sm_predicated_select(
+    active, new::T, old::T) where {T<:Reactant.AbstractConcreteArray} =
+        ifelse.(active, new, old)
+@inline ReactiveKernels._sm_predicated_select(
+    active, new::T, old::T) where {T<:Reactant.AbstractConcreteNumber} =
+        ifelse(active, new, old)
+
+# A traced branch can legitimately meet a source literal or compiler-static
+# initial value of the same logical scalar type.  Keep that bridge exact: it
+# is not permission to promote or coerce a different authored domain.
+@inline function _rk_reactant_mixed_scalar_check(traced, host::Number)
+    ReactiveKernels._kernel_dom_num_scalar(typeof(host)) || throw(
+        ArgumentError("predicated functional state rejects non-builtin scalar `$(typeof(host))`"))
+    Reactant.unwrapped_eltype(typeof(traced)) === typeof(host) || throw(
+        ArgumentError("predicated functional state rejects mixed logical scalar types"))
+    nothing
+end
+
+@inline ReactiveKernels._sm_predicated_select(
+        active, traced::T, host::Number) where {T<:Reactant.TracedRNumber} = begin
+    _rk_reactant_mixed_scalar_check(traced, host)
+    ifelse(active, traced, host)
+end
+@inline ReactiveKernels._sm_predicated_select(
+        active, host::Number, traced::T) where {T<:Reactant.TracedRNumber} = begin
+    _rk_reactant_mixed_scalar_check(traced, host)
+    ifelse(active, host, traced)
+end
+@inline ReactiveKernels._sm_predicated_select(
+        active, traced::T, host::Number) where
+        {T<:Reactant.AbstractConcreteNumber} = begin
+    _rk_reactant_mixed_scalar_check(traced, host)
+    ifelse(active, traced, host)
+end
+@inline function ReactiveKernels._sm_predicated_select(
+        active, host::Number, traced::T) where
+        {T<:Reactant.AbstractConcreteNumber}
+    _rk_reactant_mixed_scalar_check(traced, host)
+    ifelse(active, host, traced)
+end
+
+@inline function _rk_reactant_traced_scalar_select(active, new, old)
+    Reactant.unwrapped_eltype(typeof(new)) ===
+        Reactant.unwrapped_eltype(typeof(old)) || throw(ArgumentError(
+            "predicated functional state rejects mixed logical scalar types"))
+    ifelse(active, new, old)
+end
+
+@inline ReactiveKernels._sm_predicated_select(
+        active, new::A, old::B) where
+        {A<:Reactant.AbstractConcreteNumber,B<:Reactant.TracedRNumber} =
+    _rk_reactant_traced_scalar_select(active, new, old)
+@inline ReactiveKernels._sm_predicated_select(
+        active, new::A, old::B) where
+        {A<:Reactant.TracedRNumber,B<:Reactant.AbstractConcreteNumber} =
+    _rk_reactant_traced_scalar_select(active, new, old)
+@inline ReactiveKernels._sm_predicated_select(
+        active, new::A, old::B) where
+        {A<:Reactant.AbstractConcreteNumber,
+         B<:Reactant.AbstractConcreteNumber} =
+    _rk_reactant_traced_scalar_select(active, new, old)
+@inline ReactiveKernels._sm_predicated_select(
+        active, new::A, old::B) where
+        {A<:Reactant.TracedRNumber,B<:Reactant.TracedRNumber} =
+    _rk_reactant_traced_scalar_select(active, new, old)
+
 @inline function ReactiveKernels._sm_functional_index(
         array::Reactant.TracedRArray, indices...)
     Reactant.@allowscalar getindex(array, indices...)
@@ -137,6 +213,20 @@ function Reactant.traced_type_inner(
         ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
         ndevices, runtime) where
         {T<:ReactiveKernels._FunctionalStateMachineTransition}
+    T
+end
+
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels._FunctionalTransitionWithEffects,
+        path, mode; kwargs...)
+    previous
+end
+
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where
+        {T<:ReactiveKernels._FunctionalTransitionWithEffects}
     T
 end
 

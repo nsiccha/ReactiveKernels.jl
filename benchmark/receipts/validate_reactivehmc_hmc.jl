@@ -37,6 +37,10 @@ function validate_reactivehmc_hmc_receipt(path)
         require(length(case["energy_errors"]) ==
                 (case["diverged"] ? 1 : case["n_steps"]),
                 "$name: statistics count does not match the physical control path")
+        expected_events = case["diverged"] ? ["normal"] :
+            ["normal", "exponential"]
+        require(get(case, "rng_events", String[]) == expected_events,
+                "$name: RNG effects do not match the physical source order")
         require(!isempty(case["energy_errors"]) &&
                 last(case["energy_errors"]) == case["dham"],
                 "$name: final recorded statistic must equal dham")
@@ -66,6 +70,42 @@ function validate_reactivehmc_hmc_receipt(path)
             "divergence case must declare no Metropolis draw")
     require(diverged["init_pos"] == diverged["initial_position"],
             "divergence changed the retained position")
+
+    require(haskey(receipt, "mixed_precision_cases"),
+            "missing [[mixed_precision_cases]]")
+    haskey(receipt, "mixed_precision_cases") || return errors
+    mixed_cases = receipt["mixed_precision_cases"]
+    require(length(mixed_cases) == 1,
+            "expected one Float32-normal/Float64-exponential physical case")
+    length(mixed_cases) == 1 || return errors
+    mixed = only(mixed_cases)
+    require(mixed["name"] == "float32_normal_float64_exponential",
+            "wrong mixed-precision case name")
+    require(mixed["normal_tape_eltype"] == "Float32",
+            "mixed case normal tape must be Float32")
+    require(mixed["exponential_tape_eltype"] == "Float64",
+            "mixed case exponential tape must be Float64")
+    require(mixed["normal_calls"] == 1 && mixed["exponential_calls"] == 1,
+            "mixed case must consume one normal and one exponential effect")
+    require(mixed["rng_events"] == ["normal", "exponential"],
+            "mixed case RNG effect order drifted")
+    require(mixed["randn_destination_eltype"] == "Float32",
+            "physical randn! destination must be Float32")
+    require(mixed["randn_returned_destination"],
+            "physical randn! must return the mutated destination")
+    require(mixed["normal_draw_bits"] == mixed["randn_destination_bits"],
+            "physical randn! destination bits differ from its Float32 tape")
+    require(mixed["randexp_return_type"] == "Float64",
+            "physical randexp return must remain Float64")
+    require(mixed["exponential_draw_bits"] == mixed["randexp_return_bits"],
+            "physical randexp bits differ from its Float64 tape")
+    require(length(mixed["energy_error_bits"]) == mixed["n_steps"],
+            "mixed case statistics count does not match its source loop")
+    require(last(mixed["energy_error_bits"]) == only(mixed["dham_bits"]),
+            "mixed case final statistic bits must equal dham bits")
+    require(!mixed["diverged"], "mixed case unexpectedly diverged")
+    require(mixed["init_pos_bits"] == mixed["fwd_pos_bits"],
+            "mixed case accepted proposal was not copied into init")
     errors
 end
 

@@ -1440,21 +1440,37 @@ end
 # constructed instance. It self-discovers the destination recipe + external identity from source shape.
 
 # --- sanctioned graph-recipe BARE identities (RK 07:20) ---------------------------------------------
-# The exact graph-recipe primitives admitted as RAW recipe ops. `deepcopy` is the
-# source-authored ownership marker used when one state field starts as an
-# isolated structural copy of another. Its concrete domain is checked below;
-# arbitrary user structs (and therefore user `deepcopy_internal` methods) stay
-# outside the compiler boundary.
+# The exact graph-recipe primitives admitted as RAW recipe ops. `deepcopy` is a
+# source-authored ownership marker, but the captured handle replaces it with the
+# compiler-owned structural copier below. The extensible Base generic is never
+# invoked by a prepared factory.
 const _KERNEL_RECIPE_PRIMS =
     (LinearAlgebra.cholesky, LinearAlgebra.logdet, Base.deepcopy)
 _recipe_bare_op_ok(@nospecialize(op)) =
     _kernel_pure_primitive_value(op) || any(x -> x === op, _KERNEL_RECIPE_PRIMS)
+
+struct _StructuralCopyRecipe end
+const _STRUCTURAL_COPY_RECIPE = _StructuralCopyRecipe()
+@inline (::_StructuralCopyRecipe)(value) = _sm_structural_copy(value)
 
 _recipe_dom_deepcopy(::Type{T}) where {T} =
     _kernel_dom_num_scalar(T) || T === Nothing || T <: Function ||
     _kernel_dom_num_array(T) || _kernel_dom_diag(T) || _recipe_dom_chol(T) ||
     (T <: NamedTuple && T isa DataType && all(_recipe_dom_deepcopy, fieldtypes(T))) ||
     (T <: Tuple && T isa DataType && all(t -> t isa Type && _recipe_dom_deepcopy(t), T.parameters))
+
+# A raw `Base.deepcopy` call is safe only when the admitted aggregate contains
+# no callable authority. Function subtypes may define `deepcopy_internal`, so
+# even exact identity of the Base generic is not sufficient. Prepared handles
+# use `_StructuralCopyRecipe` instead; that compiler-owned path deliberately
+# retains callable authorities by identity.
+_recipe_dom_raw_deepcopy(::Type{T}) where {T} =
+    _kernel_dom_num_scalar(T) || T === Nothing ||
+    _kernel_dom_num_array(T) || _kernel_dom_diag(T) || _recipe_dom_chol(T) ||
+    (T <: NamedTuple && T isa DataType &&
+        all(_recipe_dom_raw_deepcopy, fieldtypes(T))) ||
+    (T <: Tuple && T isa DataType &&
+        all(t -> t isa Type && _recipe_dom_raw_deepcopy(t), T.parameters))
 
 # Per-callee SAFE-DOMAIN admission for a RAW recipe identity at CONCRETE binding (RK 07:30) — exact
 # identity is necessary but NOT sufficient (`cholesky`/`logdet`/`\`/`+` are extensible; a custom overload
@@ -1477,6 +1493,8 @@ per-callee domain. A custom-overload type over the same identity REJECTS.
 function kernel_recipe_op_domain_ok(@nospecialize(op), argtypes)
     isempty(argtypes) && return false
     op === Base.deepcopy && return length(argtypes) == 1 &&
+        _recipe_dom_raw_deepcopy(argtypes[1])
+    op isa _StructuralCopyRecipe && return length(argtypes) == 1 &&
         _recipe_dom_deepcopy(argtypes[1])
     op === LinearAlgebra.cholesky && return length(argtypes) == 1 &&
         (_kernel_dom_num_matrix(argtypes[1]) || _kernel_dom_diag(argtypes[1]))
@@ -1522,9 +1540,12 @@ struct _RecipeHandle{OP,MODE,IN,OUT,OWN}
 end
 recipe_handle_mode(::_RecipeHandle{OP,MODE}) where {OP,MODE} = MODE
 recipe_handle_op(h::_RecipeHandle) = h.op
+
 function _recipe_handle(op, ins, outs, owned)
     mode = _recipe_op_mode(op, length(owned), length(outs))
-    _RecipeHandle{typeof(op),mode,typeof(ins),typeof(outs),typeof(owned)}(op, ins, outs, owned)
+    captured = op === Base.deepcopy ? _STRUCTURAL_COPY_RECIPE : op
+    _RecipeHandle{typeof(captured),mode,typeof(ins),typeof(outs),typeof(owned)}(
+        captured, ins, outs, owned)
 end
 
 struct _PreparedFactory{Token,GR,P<:_KernelPlan,H<:Tuple,E<:Tuple}

@@ -105,6 +105,17 @@ end
     @test occursin("randbernoullilog(__self__, rng, dham) && copy!!(init, fwd)", source)
     @test !occursin(r"^\s*rcopy!\("m, source)
 
+    reference_path = joinpath(
+        @__DIR__, "fixtures", "reactivehmc_ca9_hmc_reference.jl",
+    )
+    reference = read(reference_path, String)
+    @test occursin("normal = Float32[0.3, -0.4]", reference)
+    @test occursin("exponential = Float64[0.5]", reference)
+    @test occursin("result === destination", reference)
+    @test occursin("string(eltype(destination))", reference)
+    @test occursin("string(typeof(result))", reference)
+    @test occursin("float_bits(rng.exponential_returns)", reference)
+
     receipt_path = joinpath(@__DIR__, "..", "benchmark", "receipts",
                             "reactivehmc-hmc-ca9-v1.toml")
     receipt = TOML.parsefile(receipt_path)
