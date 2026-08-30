@@ -49,6 +49,7 @@ using .ReactiveKernelsNUTSExample
         include("test_nuts_docs_fixture.jl")
         include("test_reactivehmc_algorithm_corpus.jl")
         include("test_walnuts_external_corpus.jl")
+        include("test_walnuts_docs_fixture.jl")
         include("test_compiler_docs.jl")
         include("test_kernel_adaptation.jl")
         include("test_nonallocating_core.jl")

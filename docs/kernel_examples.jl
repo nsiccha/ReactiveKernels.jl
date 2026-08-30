@@ -813,4 +813,85 @@ end
 # test/test_nuts_docs_fixture.jl. PPL walkthrough panels use the separate
 # build-execution gate above, and `eval_block` errors are fatal in docs/make.jl.
 
+# WALNUTS-D is a smaller external compiler fixture whose page emphasizes a few
+# mathematical/control slices and still offers its complete source.  Read those
+# bytes directly from the authoritative fixture: the page must never drift into
+# hand-transcribed pseudocode.  docs/make.jl includes the fixture before loading
+# the page, so this display also requires the real @kernel definitions to parse.
+function _walnuts_fixture_source()
+    isdefined(Main, :WalnutsKernelAuthoringFixture) || error(
+        "WALNUTS-D authoring fixture was not loaded by docs/make.jl",
+    )
+    fixture = getfield(Main, :WalnutsKernelAuthoringFixture)
+    irs = ReactiveKernels.method_irs(getfield(fixture, :walnuts_state))
+    length(irs) == 15 && all(ir -> ir.ok, irs) || error(
+        "WALNUTS-D docs source no longer has its admitted 15-method MethodIR",
+    )
+    path = joinpath(pkgdir(ReactiveKernels), "benchmark",
+                    "walnuts_kernel_authoring_fixture.jl")
+    isfile(path) || error("WALNUTS-D authoring fixture is missing: $path")
+    replace(read(path, String), "\r\n" => "\n", "\r" => "\n")
+end
+
+function _walnuts_source_between(source, first_line, next_line; drop_last = false)
+    lines = split(source, '\n'; keepempty = true)
+    first_index = findfirst(line -> startswith(line, first_line), lines)
+    first_index === nothing && error(
+        "WALNUTS-D docs source start anchor vanished: $first_line",
+    )
+    next_index = findnext(line -> startswith(line, next_line), lines,
+                          first_index + 1)
+    next_index === nothing && error(
+        "WALNUTS-D docs source end anchor vanished: $next_line",
+    )
+    selected = collect(lines[first_index:(next_index - 1)])
+    while !isempty(selected) && isempty(last(selected))
+        pop!(selected)
+    end
+    drop_last && !isempty(selected) && pop!(selected)
+    rstrip(join(selected, "\n"))
+end
+
+function render_walnuts_source(section::Symbol)
+    source = _walnuts_fixture_source()
+    snippet = if section === :state
+        _walnuts_source_between(
+            source,
+            "@kernel walnuts_state(init; step_f, macro_time,",
+            "    finiteorneginf(x) = begin",
+        )
+    elseif section === :macro_step
+        _walnuts_source_between(
+            source,
+            "    macro_step!(ep) = begin",
+            "    next_direction!(stream) = begin",
+        )
+    elseif section === :nuts_step
+        _walnuts_source_between(
+            source,
+            "    step!(directions, exponentials) = begin",
+            "    flip!(depth) = if depth > 1",
+        )
+    elseif section === :nuts_leaf
+        _walnuts_source_between(
+            source,
+            "    start!(ep, depth, exponentials) = if depth == 1",
+            "# All stochastic inputs are explicit values.",
+            drop_last = true,
+        )
+    elseif section === :entry
+        _walnuts_source_between(
+            source,
+            "@kernel walnuts!!(state; momentum, directions, exponentials)",
+            "end # module WalnutsKernelAuthoringFixture",
+        )
+    else
+        error("unknown WALNUTS-D docs source section: $section")
+    end
+    Markdown.MD(Any[Markdown.Code("julia", snippet)])
+end
+
+render_walnuts_complete_source() =
+    Markdown.MD(Any[Markdown.Code("julia", rstrip(_walnuts_fixture_source()))])
+
 end # module ReactiveKernelsDocs

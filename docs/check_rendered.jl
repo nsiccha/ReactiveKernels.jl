@@ -87,6 +87,16 @@ function check_rendered_docs(build_dir, page_tree)
             "Pathfinder Inverse Bfgs Geometry",
             "Pathfinder Local Gaussian And Elbo",
         ),
+        "walnuts.md" => (
+            "WALNUTS-D as mathematical `@kernel` source",
+            "Fixed macro time, dyadic micro grids",
+            "macro_step!(ep) = begin",
+            "reverse_num_steps = div(reverse_num_steps, 2)",
+            "step!(directions, exponentials) = begin",
+            "accepted = macro_step!(__self__, ep)",
+            "@kernel walnuts!!(state; momentum, directions, exponentials)",
+            "Complete authored WALNUTS-D fixture",
+        ),
         "visualization.md" =>
             ("class=\"rk-dag-legend\"", "class=\"rk-comparison-grid\""),
     )
