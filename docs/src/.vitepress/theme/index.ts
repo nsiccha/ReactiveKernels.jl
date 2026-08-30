@@ -20,7 +20,6 @@ import { enhanceAppWithTabs } from 'vitepress-plugin-tabs/client'
 import '@nolebase/vitepress-plugin-enhanced-readabilities/client/style.css'
 import './style.css' // You could setup your own, or else a default will be copied.
 import './docstrings.css' // You could setup your own, or else a default will be copied.
-import Banner from '@/Banner.vue'
 import './overrides.css' // You could setup your own, or else a default will be copied.
 import { setupKernelExamples } from './kernel-example'
 import { setupResultVisualizations } from './result-visualization'
@@ -73,7 +72,6 @@ export const Theme: ThemeConfig = {
   extends: DefaultTheme,
   Layout() {
     return h(DefaultTheme.Layout, null, {
-      'layout-bottom': () => h(Banner),
       'nav-bar-content-after': () => [
         h(NolebaseEnhancedReadabilitiesMenu), // Enhanced Readabilities menu
       ],

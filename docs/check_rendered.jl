@@ -28,6 +28,21 @@ end
 
 _occurrences(text, needle) = length(split(text, needle)) - 1
 
+function _check_warning_banner_absent(build_dir)
+    rendered_assets = String[]
+    for (root, _, files) in walkdir(build_dir), file in files
+        any(endswith(file, suffix) for suffix in (".html", ".css", ".js")) &&
+            push!(rendered_assets, joinpath(root, file))
+    end
+    isempty(rendered_assets) && error("rendered site contains no HTML/CSS/JS assets")
+    rendered = join((read(path, String) for path in rendered_assets), "\n")
+    occursin("warning-banner", rendered) &&
+        error("rendered site must not contain the removed warning banner")
+    occursin("You are viewing the dev branch", rendered) &&
+        error("rendered site must not contain the removed dev-branch warning")
+    nothing
+end
+
 """Fail the docs build if a configured page or executable example vanished."""
 function check_rendered_docs(build_dir, page_tree)
     isdir(build_dir) || error("docs build directory is missing: $build_dir")
@@ -255,6 +270,7 @@ function check_rendered_docs(build_dir, page_tree)
     expected_total = sum(values(expected_panels))
     observed_panels == expected_total ||
         error("rendered site has $observed_panels executable panels; expected $expected_total")
+    _check_warning_banner_absent(build_dir)
     @info "Rendered docs structure verified" pages=length(sources) executable_panels=observed_panels
     return nothing
 end

@@ -56,13 +56,16 @@ diagonal ``H_0``. The transpiled graph evaluates
 
 ```math
 \begin{aligned}
-B &= [H_0Y\quad S], & R &= \operatorname{triu}(S^T Y), \\
-D &= \begin{bmatrix}0&-R^{-1}\\-R^{-T}&R^{-T}(E+Y^TH_0Y)R^{-1}\end{bmatrix},
-& H &= H_0 + BDB^T,
+B &= [H_0Y\quad S], \\
+R &= \operatorname{triu}(S^T Y), \\
+D &= \begin{bmatrix}0&-R^{-1}\\-R^{-T}&R^{-T}(E+Y^TH_0Y)R^{-1}\end{bmatrix}, \\
+H &= H_0 + BDB^T,
 \end{aligned}
 ```
 
-then forms the same local Gaussian, draws, log density, and ELBO as
+The four relations are stacked so the complete compact expression remains
+visible on narrow screens. The kernel then forms the same local Gaussian,
+draws, log density, and ELBO as
 Pathfinder.jl. Both retained pairs are active: its deterministic covariance is
 different from the one-pair fixture. Fixed explicit history capacity replaces
 Pathfinder.jl's mutable circular buffers, while preserving the production
