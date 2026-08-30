@@ -4572,14 +4572,18 @@ function _functional_state_machine_method(
     all(_sm_machine_actual_domain_ok(actual, expected)
         for (actual, expected) in zip(argument_types, declared)) || _sm_reject(
         "functional state-machine logical arguments violate declared domains")
+    skeleton = getfield(kernel, :skeleton)
+    captured_methods = method_irs(skeleton)
+    ir.id.decl in defunctionalized_mids(captured_methods) && _sm_reject(
+        "recursive functional state-machine SCC lowering is not implemented " *
+        "for root `$(ir.id.name)`")
     _sm_validate_forest(Forest, argument_types, NamedTuple{})
 
-    skeleton = getfield(kernel, :skeleton)
     field_regs = _stateful_field_regs(getfield(kernel, :bindings))
     ports = _sm_freeze_compiler_ports(
         getfield(getfield(kernel, :bindings), :fields))
     methods_by_id = Dict{MethodId,MethodIR}(
-        method.id => method for method in method_irs(skeleton))
+        method.id => method for method in captured_methods)
     spec = kernel_spec(skeleton)
     plan = kernel_prepared_plan(getfield(kernel, :prepared))
     fields = _exec_canon_map(plan)
@@ -4928,10 +4932,13 @@ function _functional_state_machine_method(
             haskey(local_origins, local_name) || _sm_reject(
                 "aliased state write local `$local_name` has no direct state origin")
             origin = local_origins[local_name]
-            origin isa _Index && origin.base isa _SelfField &&
-                length(origin.base.path) == 1 &&
-                only(origin.base.path) === name || _sm_reject(
+            source = origin.source
+            source isa _Index && source.base isa _SelfField &&
+                length(source.base.path) == 1 &&
+                only(source.base.path) === name || _sm_reject(
                 "aliased state write origin is not a direct element of `$name`")
+            isequal(origin.root_value, old) || _sm_reject(
+                "aliased state write root `$name` changed after alias binding")
             alias_symbol = local_syms[local_name]
             old_leaf = :(_sm_structural_get(
                 $alias_symbol, Val($(QuoteNode(path)))))
@@ -4962,13 +4969,7 @@ function _functional_state_machine_method(
                 :__sfm_alias_write_, local_name)
             push!(statements, :($alias_symbol = $updated_alias))
 
-            root_indices = Any[]
-            for (dimension, index) in enumerate(origin.idxs)
-                raw = rhs(index, local_syms, local_types, active)
-                raw = :($raw + zero($index_source))
-                push!(root_indices,
-                    :(_sm_safe_index($raw, $old, Val($dimension))))
-            end
+            root_indices = origin.indices
             root_candidate = bind!(
                 :(_sm_functional_indexed_copy(
                     $old, $updated_alias, $(root_indices...))),
@@ -5054,7 +5055,33 @@ function _functional_state_machine_method(
                 name = only(statement.lhs)
                 active = walk_bounds!(statement.rhs, active,
                                       local_syms, local_types)
-                value = rhs(statement.rhs, local_syms, local_types, active)
+                alias_origin = nothing
+                value = if statement.rhs isa _Index &&
+                        statement.rhs.base isa _SelfField &&
+                        length(statement.rhs.base.path) == 1
+                    source = statement.rhs
+                    root_name = only(source.base.path)
+                    root_value = base_syms[(:field, root_name)]
+                    captured_indices = Any[]
+                    for (dimension, index) in enumerate(source.idxs)
+                        raw = rhs(index, local_syms, local_types, active)
+                        traced = :($raw + zero($index_source))
+                        captured = bind!(
+                            :(_sm_safe_index(
+                                $traced, $root_value, Val($dimension))),
+                            :__sfm_alias_index_, name)
+                        push!(captured_indices, captured)
+                    end
+                    alias_origin = (
+                        source=source,
+                        root_value=root_value,
+                        indices=Tuple(captured_indices),
+                    )
+                    :(_sm_functional_index(
+                        $root_value, $(captured_indices...)))
+                else
+                    rhs(statement.rhs, local_syms, local_types, active)
+                end
                 if haskey(local_syms, name)
                     symbol = local_syms[name]
                     push!(statements, :($symbol = _sm_predicated_select(
@@ -5067,10 +5094,8 @@ function _functional_state_machine_method(
                 local_types[name] = _sm_isvector(
                     statement.rhs, plan, fields, OW, SH, formals,
                     local_types)
-                if statement.rhs isa _Index &&
-                        statement.rhs.base isa _SelfField &&
-                        length(statement.rhs.base.path) == 1
-                    local_origins[name] = statement.rhs
+                if alias_origin !== nothing
+                    local_origins[name] = alias_origin
                 else
                     pop!(local_origins, name, nothing)
                 end

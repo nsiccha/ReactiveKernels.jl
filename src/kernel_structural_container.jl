@@ -31,6 +31,23 @@ end
 struct _SMFiniteScalarColumnSpec{T} end
 struct _SMFiniteArrayColumnSpec{A,Shape,T} end
 
+# Exact primitive tensor leaves supported by the optional backend ABI.  Keep
+# this narrower than the stateful compiler's pure-numeric domain: wrapper
+# numbers and 128-bit integers do not have an accepted tensor representation.
+const _SM_FINITE_BACKEND_PRIMITIVES = (
+    Bool,
+    Int8, Int16, Int32, Int64,
+    UInt8, UInt16, UInt32, UInt64,
+    Float16, Float32, Float64,
+)
+
+_sm_finite_backend_primitive(::Type{T}) where {T} =
+    any(candidate -> candidate === T, _SM_FINITE_BACKEND_PRIMITIVES)
+
+_sm_finite_backend_array(::Type{A}) where {A} =
+    A <: Array && _kernel_dom_builtin(A) &&
+    _sm_finite_backend_primitive(eltype(A))
+
 struct _SMFiniteStructuralContract{
         Element,Capacity,Names,Schema,Specs,StaticValues,Paths,OwnedGroups}
     schema::Schema
@@ -99,7 +116,7 @@ function _sm_finite_schema!(builder::_SMFiniteStructuralBuilder,
     if static_index !== nothing
         builder.static_used[static_index] = true
         return _SMFiniteStaticNode{static_index,typeof(value)}()
-    elseif _kernel_dom_num_scalar(typeof(value))
+    elseif _sm_finite_backend_primitive(typeof(value))
         return _sm_finite_add_scalar!(builder, value, path)
     elseif value isa LinearAlgebra.Diagonal
         child = _sm_finite_schema!(
@@ -122,13 +139,13 @@ function _sm_finite_schema!(builder::_SMFiniteStructuralBuilder,
             for index in eachindex(value))
         return _SMFiniteTupleNode{typeof(children)}(children)
     elseif value isa AbstractArray
-        _kernel_dom_num_array(typeof(value)) || throw(ArgumentError(
-            "finite structural prototype rejects non-builtin numeric array `$(typeof(value))` at $path"))
+        _sm_finite_backend_array(typeof(value)) || throw(ArgumentError(
+            "finite structural prototype rejects unsupported backend array `$(typeof(value))` at $path"))
         return _sm_finite_add_array!(builder, value, path)
     end
     throw(ArgumentError(
         "finite structural prototype leaf `$(typeof(value))` at $path is not " *
-        "builtin numeric storage or an explicitly bound static identity"))
+        "a backend primitive or an explicitly bound static identity"))
 end
 
 function _sm_finite_validate_node(
@@ -431,13 +448,35 @@ function _sm_finite_encode_element(
         contract.representative_paths)
 end
 
+@inline _sm_finite_scalar_candidate(column, value) =
+    oftype.(column, value)
+@inline _sm_finite_scalar_candidate(column::Array{Bool}, value::Bool) =
+    fill(value, size(column))
+
+@inline function _sm_finite_array_candidate(
+        column, value, ::Val{Rank}) where {Rank}
+    oftype.(column, reshape(value, (size(value)..., 1)))
+end
+@inline function _sm_finite_array_candidate(
+        column::Array{Bool}, value::Array{Bool,Rank},
+        ::Val{Rank}) where {Rank}
+    repeat(reshape(value, (size(value)..., 1));
+           outer=(ntuple(_ -> 1, Rank)..., size(column, Rank + 1)))
+end
+
+@inline _sm_finite_select(active, candidate, prior) =
+    _sm_predicated_select(active, candidate, prior)
+@inline _sm_finite_select(
+        active, candidate::Array{Bool,N}, prior::Array{Bool,N}) where {N} =
+    Array(_sm_predicated_select(active, candidate, prior))
+
 @inline function _sm_finite_store_column(
         column, value, index, active,
         spec::_SMFiniteScalarColumnSpec)
     positions = collect(axes(column, 1))
     selected = _sm_predicated_and(active, positions .== index)
-    candidate = zero.(column) .+ value
-    _sm_predicated_select(selected, candidate, column)
+    candidate = _sm_finite_scalar_candidate(column, value)
+    _sm_finite_select(selected, candidate, column)
 end
 
 @inline function _sm_finite_store_column(
@@ -448,9 +487,8 @@ end
     selector_shape = (ntuple(_ -> 1, rank)..., length(positions))
     selected = _sm_predicated_and(
         active, reshape(positions .== index, selector_shape))
-    candidate_shape = (Shape..., 1)
-    candidate = reshape(value, candidate_shape) .+ zero.(column)
-    _sm_predicated_select(selected, candidate, column)
+    candidate = _sm_finite_array_candidate(column, value, Val(rank))
+    _sm_finite_select(selected, candidate, column)
 end
 
 function _sm_finite_write_encoded(
@@ -528,7 +566,7 @@ function _sm_finite_structural_select(
         active, candidate, prior) where {Element,Capacity,Names}
     _sm_finite_validate_raw(contract, candidate)
     _sm_finite_validate_raw(contract, prior)
-    columns = map(_sm_predicated_select,
+    columns = map(_sm_finite_select,
                   ntuple(_ -> active, length(contract.specs)),
                   values(candidate), values(prior))
     NamedTuple{Names}(columns)

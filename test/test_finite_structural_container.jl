@@ -31,6 +31,11 @@ function _fsc_assert_element_contract(actual, expected, authority)
     @test actual.factorization.factors.diag === actual.factor_alias
 end
 
+_fsc_bool_element(seed) = (;
+    flag=isodd(seed),
+    mask=Bool[isodd(seed), iseven(seed)],
+)
+
 @testset "finite structural vector uses a numeric SoA ABI" begin
     authority = _FSCStaticAuthority(:bound)
     prototype = [_fsc_element(index, authority) for index in 1:3]
@@ -55,7 +60,7 @@ end
     @test propertynames(raw) == typeof(contract).parameters[3]
     @test all(column ->
         column isa Array &&
-        _FSC_RK._kernel_dom_num_scalar(eltype(column)), values(raw))
+        _FSC_RK._sm_finite_backend_primitive(eltype(column)), values(raw))
     @test all(size(column, ndims(column)) == length(prototype)
               for column in values(raw))
 
@@ -129,6 +134,102 @@ end
         contract, raw, 0, 4, false)
     @test !inactive_swap.overflow
     @test inactive_swap.storage == raw
+end
+
+
+@testset "finite structural Bool scalar and array operations preserve types" begin
+    prototype = [_fsc_bool_element(index) for index in 1:3]
+    contract = _FSC_RK._sm_finite_structural_contract(prototype)
+    raw = _FSC_RK._sm_finite_structural_pack(contract, prototype)
+
+    @test all(column -> column isa Array{Bool}, values(raw))
+    @test _FSC_RK._sm_finite_structural_read(
+        contract, raw, 2).value == prototype[2]
+
+    replacement = (flag=false, mask=Bool[false, false])
+    written = _FSC_RK._sm_finite_structural_write(
+        contract, raw, 2, replacement)
+    @test !written.overflow
+    @test all(column -> eltype(column) === Bool, values(written.storage))
+    written_values = _FSC_RK._sm_finite_structural_unpack(
+        contract, written.storage)
+    @test written_values[2] == replacement
+    @test written_values[1] == prototype[1]
+
+    copied = _FSC_RK._sm_finite_structural_copy(
+        contract, raw, 3, 1)
+    @test !copied.overflow
+    @test _FSC_RK._sm_finite_structural_unpack(
+        contract, copied.storage)[3] == prototype[1]
+
+    swapped = _FSC_RK._sm_finite_structural_swap(
+        contract, raw, 1, 3)
+    @test !swapped.overflow
+    swapped_values = _FSC_RK._sm_finite_structural_unpack(
+        contract, swapped.storage)
+    @test swapped_values[1] == prototype[3]
+    @test swapped_values[3] == prototype[1]
+
+    @test _FSC_RK._sm_finite_structural_select(
+        contract, true, written.storage, raw) == written.storage
+    @test _FSC_RK._sm_finite_structural_select(
+        contract, false, written.storage, raw) == raw
+
+    invalid = _FSC_RK._sm_finite_structural_write(
+        contract, raw, 0, replacement)
+    @test invalid.overflow
+    @test invalid.storage == raw
+    inactive = _FSC_RK._sm_finite_structural_write(
+        contract, raw, 0, replacement, false)
+    @test !inactive.overflow
+    @test inactive.storage == raw
+end
+
+
+@testset "finite structural alias writes retain the bound index" begin
+    prototype = [_fsc_bool_element(index) for index in 1:3]
+    contract = _FSC_RK._sm_finite_structural_contract(prototype)
+    raw = _FSC_RK._sm_finite_structural_pack(contract, prototype)
+
+    index = 1
+    captured_index = index
+    bound = _FSC_RK._sm_finite_structural_read(
+        contract, raw, captured_index)
+    index += 1
+    replacement = (
+        flag=!bound.value.flag,
+        mask=map(!, bound.value.mask),
+    )
+    written = _FSC_RK._sm_finite_structural_write(
+        contract, raw, captured_index, replacement)
+    values_after = _FSC_RK._sm_finite_structural_unpack(
+        contract, written.storage)
+    @test index == 2
+    @test values_after[1] == replacement
+    @test values_after[2] == prototype[2]
+end
+
+
+@testset "finite structural backend leaves reject unsupported wrappers" begin
+    unsupported = Any[
+        1 // 2,
+        ComplexF64(1, 2),
+        Rational{Int}[1 // 2, 2 // 3],
+        ComplexF64[1 + 2im, 3 + 4im],
+        Int128(1),
+        Int128[1, 2],
+        big(1),
+        BigInt[1, 2],
+        big(1.0),
+        BigFloat[1, 2],
+        BitVector([true, false]),
+    ]
+    for value in unsupported
+        prototype = [(leaf=deepcopy(value),) for _ in 1:2]
+        @test_throws ArgumentError begin
+            _FSC_RK._sm_finite_structural_contract(prototype)
+        end
+    end
 end
 
 @testset "finite structural fresh and reused inputs reject counterfeits" begin
@@ -262,4 +363,95 @@ end
         tree_contract, tree_raw)
     @test tree_roundtrip == trees
     @test all(column -> column isa Array, values(tree_raw))
+end
+
+
+@testset "locked authored fixture reaches the named pre-SCC frontier" begin
+    if !isdefined(@__MODULE__, :WalnutsCompilerSupport)
+        include(joinpath(@__DIR__, "fixtures",
+                         "walnuts_compiler_support.jl"))
+    end
+    support = WalnutsCompilerSupport
+    case = first(support.ORACLE_CASES)
+    max_depth = 10
+    directions = fill(false, max_depth)
+    exponentials = fill(1.0, 2^max_depth)
+
+    endpoint_transition, point = support.endpoint(
+        case.stiffness, case.theta, case.rho)
+    structured = _FSC_RK.structured_state_port(endpoint_transition)
+    step_source = support.EndpointEffectAuthority()
+    step_port = _FSC_RK.effect_lowering_port(
+        step_source, Tuple{typeof(point)}, Nothing;
+        written_arguments=(1,), initial_effect_state=nothing,
+        functional_lowering=_FSC_RK.total_functional_lowering(
+            support.GaussianLeapfrogLowering(case.stiffness)))
+    stats_source = support.StatisticsEffectAuthority()
+    stats_port = _FSC_RK.effect_lowering_port(
+        stats_source, Tuple{_FSC_RK.StatefulStateValue}, Nothing;
+        written_arguments=(),
+        initial_effect_state=(
+            n_steps=0, acceptance_rate=zero(case.theta)),
+        functional_lowering=_FSC_RK.total_functional_lowering(
+            support.statistics_lowering))
+    bindings = _FSC_RK.stateful_compiler_bindings(
+        init=structured,
+        fwd=structured,
+        bwd=structured,
+        candidate=structured,
+        reverse_candidate=structured,
+        step_f=step_port,
+        stats_f=stats_port,
+    )
+    kernel = _FSC_RK.compile_stateful(
+        support.WFX.walnuts_state, bindings, point;
+        step_f=step_source,
+        macro_time=case.macro_time,
+        max_depth,
+        max_step_halvings=case.max_step_halvings,
+        min_micro_steps=case.min_micro_steps,
+        max_error=case.max_error,
+        min_dham=-1000.0,
+        stats_f=stats_source)
+    state = kernel(
+        point;
+        step_f=step_source,
+        macro_time=case.macro_time,
+        max_depth,
+        max_step_halvings=case.max_step_halvings,
+        min_micro_steps=case.min_micro_steps,
+        max_error=case.max_error,
+        min_dham=-1000.0,
+        stats_f=stats_source)
+    snapshot = _FSC_RK.stateful_snapshot(state)
+
+    static_values = _FSC_RK._sm_finite_static_values(structured)
+    proposal_contract = _FSC_RK._sm_finite_structural_contract(
+        snapshot.proposals; static_values)
+    proposal_raw = _FSC_RK._sm_finite_structural_pack(
+        proposal_contract, snapshot.proposals)
+    tree_contract = _FSC_RK._sm_finite_structural_contract(snapshot.trees)
+    tree_raw = _FSC_RK._sm_finite_structural_pack(
+        tree_contract, snapshot.trees)
+    @test length(snapshot.proposals) == max_depth + 2
+    @test length(snapshot.trees) == max_depth + 1
+    @test _FSC_RK._sm_finite_structural_unpack(
+        proposal_contract, proposal_raw) == snapshot.proposals
+    @test _FSC_RK._sm_finite_structural_unpack(
+        tree_contract, tree_raw) == snapshot.trees
+
+    frontier = try
+        _FSC_RK.functionalize_stateful(
+            kernel, Val(:step!);
+            max_iterations=1_000_000,
+            argument_types=Tuple{
+                typeof(directions),typeof(exponentials)})
+        nothing
+    catch error
+        error
+    end
+    @test frontier isa _FSC_RK._LLowerReject
+    @test sprint(showerror, frontier) ==
+          "ReactiveKernels._LLowerReject(\"recursive functional " *
+          "state-machine SCC lowering is not implemented for root `step!`\")"
 end
