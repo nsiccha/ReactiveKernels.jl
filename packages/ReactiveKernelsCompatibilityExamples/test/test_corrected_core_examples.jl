@@ -3,24 +3,36 @@ using ReactiveKernelsCompatibilityExamples.ReactiveHMCExamples: riemannian_examp
 @testset "corrected core through preexisting ecosystem patterns" begin
     @testset "partially supplied Riemannian geometry is authoritative" begin
         riemannian = riemannian_examples().gaussian
-        v = riemannian.values
+        spec = riemannian.spec
+        sources = riemannian.sources
         pos = [0.25, -0.5]
         supplied_metric = Diagonal([3.0, 4.0])
 
         kernel = prepare(
-            riemannian.graph;
-            have = (v.pos, v.metric),
-            want = (v.metric, v.dpot, v.metric_grad),
+            spec;
+            have = (
+                spec.grad_f, spec.metric_f, spec.metric_grad_f,
+                spec.pos, spec.metric,
+            ),
+            want = (spec.metric, spec.dpot, spec.metric_grad),
         )
-        metric, dpot, metric_grad = kernel(pos, supplied_metric)
+        metric, dpot, metric_grad = kernel(
+            sources.grad_f, sources.metric_f, sources.metric_grad_f,
+            pos, supplied_metric,
+        )
         @test metric === supplied_metric
         @test dpot == pos
         @test size(metric_grad) == (2, 2, 2)
 
-        state = ReactiveState(riemannian.graph)
-        set!(state, v.pos, pos)
-        set!(state, v.metric, supplied_metric)
-        metric, dpot, metric_grad = get!(state, (v.metric, v.dpot, v.metric_grad))
+        state = ReactiveState(spec)
+        set!(state, spec.grad_f, sources.grad_f)
+        set!(state, spec.metric_f, sources.metric_f)
+        set!(state, spec.metric_grad_f, sources.metric_grad_f)
+        set!(state, spec.pos, pos)
+        set!(state, spec.metric, supplied_metric)
+        metric, dpot, metric_grad = get!(
+            state, (spec.metric, spec.dpot, spec.metric_grad),
+        )
         @test metric === supplied_metric
         @test dpot == pos
         @test size(metric_grad) == (2, 2, 2)
@@ -132,15 +144,25 @@ using ReactiveKernelsCompatibilityExamples.ReactiveHMCExamples: riemannian_examp
         @test prepare(graph; have = (user_ops,), want = (hamiltonian,))(3.0) == 9.0
 
         riemannian = riemannian_examples().gaussian
-        v = riemannian.values
+        spec = riemannian.spec
+        sources = riemannian.sources
         duplicate_have = prepare(
-            riemannian.graph;
-            have = (v.pos, v.pos, v.metric),
-            want = (v.metric, v.dpot),
+            spec;
+            have = (
+                spec.grad_f, spec.metric_f, spec.metric_grad_f,
+                spec.pos, spec.pos, spec.metric,
+            ),
+            want = (spec.metric, spec.dpot),
         )
-        @test inputs(duplicate_have) == (v.pos, v.metric)
+        @test inputs(duplicate_have) == (
+            spec.grad_f, spec.metric_f, spec.metric_grad_f,
+            spec.pos, spec.metric,
+        )
         supplied_metric = Diagonal([3.0, 4.0])
-        @test duplicate_have([0.25, -0.5], supplied_metric)[1] === supplied_metric
+        @test duplicate_have(
+            sources.grad_f, sources.metric_f, sources.metric_grad_f,
+            [0.25, -0.5], supplied_metric,
+        )[1] === supplied_metric
 
         invalid_graph = Graph()
         pos = value!(invalid_graph, :pos, Float64)

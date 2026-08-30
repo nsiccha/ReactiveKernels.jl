@@ -11,20 +11,6 @@
 # Per-block liveness loads only columns with a reaching definition live across the suspension. No Core.eval,
 # no Julia-IR inference, no synthetic storage.
 # ============================================================================================
-# demand-ensure a single derived FIELD's canon on a runtime endpoint (recompute the producer chain only if
-# the slot mask says dirty — 0-B when current, no extra pgrad when the gradient is current), returning the
-# now-current value. Reuses the leapfrog `_lf_ensure!` machinery generalized to a runtime `owned` endpoint.
-function compile_prepared_ensure(pf, ::Type{OW}, ::Type{SH}, field::Symbol) where {OW,SH}
-    plan = kernel_prepared_plan(pf); hs = kernel_prepared_handles(pf)
-    fc = _exec_canon_map(plan)
-    producer = Dict{Int,Int}(c => r for (c, r) in kernel_plan_producer(plan))
-    recs = kernel_plan_recipes(plan)
-    hidx = Dict{Int,Tuple{Any,Int}}(recs[i] => (hs[i], i) for i in eachindex(hs))
-    haskey(fc, field) || error("compile_prepared_ensure: no canon for field `$field`")
-    c = fc[field]; stmts = Any[]; current = Set{Int}(); stale = Set{Int}()
-    _exec_ensure!(stmts, c, current, stale, plan, producer, hidx, OW, SH)
-    compile(:((owned, shared, handles) -> $(Expr(:block, stmts..., :(return $(_pp_read(plan, c)))))))
-end
 # Compile refresh_momentum!! on a runtime endpoint from its captured MethodIR (RK: derive kills from the IR +
 # primitive descriptors, not by name). Emits the authored source writes (randn!(rng, mom); lmul!(chol.L, mom))
 # with the mom-dependents (kin/velocity/ham/dham_dmom) KILLED BEFORE the writes (executed-prefix) and the

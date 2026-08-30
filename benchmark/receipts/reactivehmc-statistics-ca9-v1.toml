@@ -1,0 +1,74 @@
+schema = "reactivehmc-statistics-ca9-v1"
+
+[pins]
+reactivehmc_revision = "ca9ea4ca41924bb0e1fadc01c717e1333916aba6"
+statistics_sha256 = "20baff1337a3e7c5926f01e104484168dd9783fe397366ebcb78ad3501eb1f69"
+julia_version = "1.10.11"
+
+[inputs]
+dimension = 2
+reset_pos = [0.25, -0.5]
+reset_dham_dpos = [0.2, -0.4]
+reset_pot = 0.15625
+
+[[events]]
+name = "append_one"
+go_forward = true
+pos = [0.4, -0.3]
+dham_dpos = [0.5, -0.6]
+pot = 0.125
+dham = -0.1
+
+[[events]]
+name = "prepend"
+go_forward = false
+pos = [-0.2, 0.6]
+dham_dpos = [-0.3, 0.7]
+pot = 0.2
+dham = -0.2
+
+[[events]]
+name = "append_two"
+go_forward = true
+pos = [0.55, -0.1]
+dham_dpos = [0.65, -0.2]
+pot = 0.15625
+dham = -0.05
+
+[second_trajectory]
+reset_pos = [0.7, 0.8]
+reset_dham_dpos = [0.75, 0.85]
+reset_pot = 0.565
+go_forward = true
+pos = [0.9, 1.0]
+dham_dpos = [0.95, 1.05]
+pot = 0.905
+dham = -1.5
+
+[trajectory]
+positions = [[-0.2, 0.6], [0.25, -0.5], [0.4, -0.3], [0.55, -0.1]]
+gradients = [[0.3, -0.7], [-0.2, 0.4], [-0.5, 0.6], [-0.65, 0.2]]
+dhams = [-0.2, 0.0, -0.1, -0.05]
+pots = [0.2, 0.15625, 0.125, 0.15625]
+idxs = [2, 0, 1, 3]
+
+[[samples]]
+name = "first"
+init_pos = [1.0, -1.0]
+stepsize = 0.125
+diverged = false
+
+[[samples]]
+name = "second"
+init_pos = [-1.0, 2.0]
+stepsize = 0.0625
+diverged = true
+
+[sampling]
+draws = [[1.0, -1.0], [-1.0, 2.0]]
+n_steps = [3, 1]
+stepsizes = [0.125, 0.0625]
+acc_rate = [0.8915991985382185, 0.2231301601484299]
+diverged = [false, true]
+full_history = [[[-0.2, 0.6], [0.25, -0.5], [0.4, -0.3], [0.55, -0.1]], [[0.7, 0.8], [0.9, 1.0]]]
+full_idxs = [[2, 0, 1, 3], [0, 1]]
