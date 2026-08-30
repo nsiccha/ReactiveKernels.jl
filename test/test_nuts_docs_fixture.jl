@@ -22,7 +22,8 @@ using Test
         :nuts_state, :nuts!!, :dual_averaging_state, :welford_var,
     )
         marker = "@kernel $(name)("
-        @test length(split(fixture, marker)) - 1 == 1
+        pattern = Regex("(?m)^@kernel " * string(name) * raw"\(")
+        @test length(collect(eachmatch(pattern, fixture))) == 1
         @test occursin("marker = \"@kernel \$(name)(\"", helpers)
     end
 end

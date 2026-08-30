@@ -3,7 +3,10 @@ using Test
 import TOML
 
 if !isdefined(@__MODULE__, :ReactiveHMCExamples)
-    include(joinpath(@__DIR__, "..", "examples", "preexisting_reactivehmc.jl"))
+    include(joinpath(
+        @__DIR__, "..", "packages", "ReactiveKernelsCompatibilityExamples",
+        "src", "preexisting_reactivehmc.jl",
+    ))
 end
 include(joinpath(@__DIR__, "..", "benchmark", "receipts",
                  "validate_reactivehmc_phasepoints.jl"))

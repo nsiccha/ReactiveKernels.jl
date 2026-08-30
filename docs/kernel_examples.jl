@@ -876,7 +876,8 @@ function _nuts_fixture_source()
     )
     for name in expected
         marker = "@kernel $(name)("
-        count = length(split(source, marker)) - 1
+        pattern = Regex("(?m)^@kernel " * string(name) * raw"\(")
+        count = length(collect(eachmatch(pattern, source)))
         count == 1 || error(
             "NUTS fixture must contain $marker exactly once; found $count",
         )
