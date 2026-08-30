@@ -37,7 +37,7 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     @test occursin("external NUTS compiler-acceptance exemplar", nuts)
     @test occursin("The former `@rk_pure`,", nuts)
     @test occursin("declarations have been removed", nuts)
-    @test occursin("The verbatim source below is the macro-free executable fixture", nuts)
+    @test occursin("The build-loaded source below is the macro-free executable fixture", nuts)
 
     # Keep every public entry point aligned with the executable Reactant
     # acceptance boundary instead of reviving the obsolete CPU-only claim.
