@@ -302,6 +302,130 @@ function setup_online_stats!(mod::Module)
     nothing
 end
 
+function _source_between(source::AbstractString, start_marker::AbstractString,
+                         stop_marker::AbstractString)
+    start = findfirst(start_marker, source)
+    start === nothing && error("docs source marker is missing: $start_marker")
+    search_from = nextind(source, last(start))
+    stop = findnext(stop_marker, source, search_from)
+    stop === nothing && error("docs source stop marker is missing: $stop_marker")
+    duplicate = findnext(start_marker, source, search_from)
+    duplicate === nothing || error("docs source marker is ambiguous: $start_marker")
+    strip(source[first(start):prevind(source, first(stop))], '\n')
+end
+
+function _nutpie_kernel_sources()
+    path = joinpath(pkgdir(ReactiveKernels), "examples",
+                    "nutpie_diagonal_adaptation.jl")
+    source = read(path, String)
+    initialize = _source_between(
+        source,
+        "@kernel nutpie_diagonal_initialize(",
+        "# One functional adaptation step.",
+    )
+    adaptation = _source_between(
+        source,
+        "@kernel nutpie_diagonal_adaptation(",
+        "const INITIALIZE_INPUTS",
+    )
+    (; path, initialize, adaptation)
+end
+
+function _port_call_source(kernel_name::AbstractString, spec_name::AbstractString,
+                           inputs, outputs)
+    input_lines = join(("        " * string(name) for name in inputs), ",\n")
+    string(
+        kernel_name, " = prepare(", spec_name, ";\n",
+        "    have = ", repr(inputs), ",\n",
+        "    want = ", repr(outputs), ",\n",
+        ")\n",
+        "result = ", kernel_name, "(\n", input_lines, ",\n)",
+    )
+end
+
+"""
+    render_nutpie_diagonal_adaptation() -> Markdown.MD
+
+Read the two real nutpie diagonal-adaptation `@kernel` definitions from their
+example-owned source, execute their native prepared forms, and render the live
+generated kernels and exact plans through the shared three-pane docs UI.
+"""
+function render_nutpie_diagonal_adaptation()
+    example = Main.NutpieDiagonalAdaptationExample
+    sources = _nutpie_kernel_sources()
+
+    initialize_inputs = (;
+        position = copy(example.ORACLE_INPUTS.init_position),
+        gradient = copy(example.ORACLE_INPUTS.init_gradient),
+    )
+    initialize_output = Base.invokelatest(
+        example.initialize_kernel, Tuple(initialize_inputs)...)
+    initialize_source = string(
+        sources.initialize, "\n\n",
+        _port_call_source(
+            "initialize_kernel", "nutpie_diagonal_initialize",
+            example.INITIALIZE_INPUTS, example.INITIALIZE_OUTPUTS,
+        ),
+    )
+
+    initial = example.initial_state(
+        example.ORACLE_INPUTS.init_position,
+        example.ORACLE_INPUTS.init_gradient,
+    )
+    first_step = example.ORACLE_INPUTS.steps[1]
+    state = example.advance(
+        initial, first_step.position, first_step.gradient;
+        is_good = first_step.is_good,
+        switch_now = first_step.switch_now,
+        adapt_now = first_step.adapt_now,
+    )
+    step = example.ORACLE_INPUTS.steps[2]
+    adaptation_values = (
+        state.draw_mean, state.draw_variance,
+        state.grad_mean, state.grad_variance, state.count,
+        state.background_draw_mean, state.background_draw_variance,
+        state.background_grad_mean, state.background_grad_variance,
+        state.background_count, state.stds, state.inv_stds,
+        state.transformation_mean, state.logdet, state.transformation_id,
+        step.position, step.gradient,
+        step.is_good, step.switch_now, step.adapt_now,
+    )
+    adaptation_inputs = NamedTuple{example.ADAPTATION_INPUTS}(adaptation_values)
+    adaptation_output = Base.invokelatest(
+        example.adaptation_kernel, Tuple(adaptation_inputs)...)
+    adaptation_source = string(
+        sources.adaptation, "\n\n",
+        _port_call_source(
+            "adaptation_kernel", "nutpie_diagonal_adaptation",
+            example.ADAPTATION_INPUTS, example.ADAPTATION_OUTPUTS,
+        ),
+    )
+
+    artifacts = (
+        (;
+            name = :nutpie_diagonal_initialize,
+            origin = relpath(sources.path, pkgdir(ReactiveKernels)),
+            source = initialize_source,
+            inputs = initialize_inputs,
+            kernel = example.initialize_kernel,
+            output = initialize_output,
+            generated = code_expr(example.initialize_kernel),
+            dag = example.initialize_kernel.plan,
+        ),
+        (;
+            name = :nutpie_diagonal_adaptation,
+            origin = relpath(sources.path, pkgdir(ReactiveKernels)),
+            source = adaptation_source,
+            inputs = adaptation_inputs,
+            kernel = example.adaptation_kernel,
+            output = adaptation_output,
+            generated = code_expr(example.adaptation_kernel),
+            dag = example.adaptation_kernel.plan,
+        ),
+    )
+    render_examples(artifacts)
+end
+
 # The ONE shared three-view UI (Raw input / Generated kernel / Compute DAG). Both
 # the stateless PreparedKernel path and the ReactiveProgram path emit through this;
 # there is no second renderer. `generated` is a display-only readable copy of the

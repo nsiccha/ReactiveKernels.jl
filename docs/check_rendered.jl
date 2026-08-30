@@ -47,6 +47,7 @@ function check_rendered_docs(build_dir, page_tree)
         "batched.md" => 1,
         "bijectors.md" => 1,
         "nuts.md" => 2,
+        "nutpie-diagonal.md" => 2,
         "eight-schools.md" => 1,
         "linear-regression.md" => 1,
         "beta-binomial.md" => 1,
@@ -75,6 +76,11 @@ function check_rendered_docs(build_dir, page_tree)
             "Full compiled NUTS kernel",
             "Receipt medians for the matched-control corpus",
             "Compilation and first-call costs",
+        ),
+        "nutpie-diagonal.md" => (
+            "@kernel nutpie_diagonal_initialize",
+            "@kernel nutpie_diagonal_adaptation",
+            "97be9ab88cfaadfafd9e5f4409a3b1d5af62805a",
         ),
         "visualization.md" =>
             ("class=\"rk-dag-legend\"", "class=\"rk-comparison-grid\""),
@@ -131,6 +137,13 @@ function check_rendered_docs(build_dir, page_tree)
         if source == "nuts.md"
             for marker in ("NUTS Phasepoint Hamiltonian", "Raw input", "Generated kernel", "Compute DAG")
                 occursin(marker, body) || error("NUTS page is missing three-pane marker: $marker")
+            end
+        end
+        if source == "nutpie-diagonal.md"
+            for marker in ("Nutpie Diagonal Initialize", "Nutpie Diagonal Adaptation",
+                           "Raw input", "Generated kernel", "Compute DAG")
+                occursin(marker, body) ||
+                    error("nutpie diagonal page is missing marker: $marker")
             end
         end
     end

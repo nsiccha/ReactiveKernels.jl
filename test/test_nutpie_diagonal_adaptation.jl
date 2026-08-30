@@ -105,4 +105,17 @@ end
     initialized_stds = _nutpie_floats(stages[1]["stds"])
     @test state.stds[2:4] == initialized_stds[2:4]
     @test state == NutpieDiagonalAdaptationExample.run()
+
+    docs_page = read(joinpath(@__DIR__, "..", "docs", "src",
+                              "nutpie-diagonal.md"), String)
+    docs_make = read(joinpath(@__DIR__, "..", "docs", "make.jl"), String)
+    docs_helpers = read(joinpath(@__DIR__, "..", "docs",
+                                 "kernel_examples.jl"), String)
+    @test occursin("render_nutpie_diagonal_adaptation", docs_page)
+    @test occursin("\"Nutpie diagonal adaptation\" => \"nutpie-diagonal.md\"",
+                   docs_make)
+    @test occursin("examples/nutpie_diagonal_adaptation.jl", docs_page)
+    @test occursin("_nutpie_kernel_sources", docs_helpers)
+    @test !occursin("@kernel nutpie_diagonal_initialize(", docs_page)
+    @test !occursin("@kernel nutpie_diagonal_adaptation(", docs_page)
 end
