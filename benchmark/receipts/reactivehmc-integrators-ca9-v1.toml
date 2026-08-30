@@ -1,0 +1,55 @@
+schema = "reactivehmc-integrators-ca9-v1"
+
+[pins]
+reactivehmc_revision = "ca9ea4ca41924bb0e1fadc01c717e1333916aba6"
+integrators_sha256 = "39503d11f870d5942f9fe4a06065ea75d822b0702cc56c0824bff9f5d2c02b92"
+phasepoints_sha256 = "b2eb1d28c347412fafcf6e9e5cac6b4c6c08801e5b6e2db83826806a79bdaaba"
+julia_version = "1.10.11"
+
+[inputs]
+position = [0.25, -0.5]
+momentum = [0.4, 0.1]
+
+[[cases]]
+name = "leapfrog"
+stepsize = 0.1
+n_fi_steps = 0
+n_steps = 1
+pos = [0.28875, -0.4875]
+mom = [0.3730625, 0.149375]
+ham = 0.241260666015625
+dham_dpos = [0.28875, -0.4875]
+dham_dmom = [0.3730625, 0.149375]
+
+[[cases]]
+name = "generalized_leapfrog"
+stepsize = 0.1
+n_fi_steps = 4
+n_steps = 1
+pos = [0.28520232104493864, -0.4883730958011467]
+mom = [0.3516002788802706, 0.18846682960847463]
+ham = 0.37748036904837423
+dham_dpos = [0.5187984807083383, -0.8713877495128616]
+dham_dmom = [0.3251522745369558, 0.152172442078134]
+
+[[cases]]
+name = "implicit_midpoint"
+stepsize = 0.1
+n_fi_steps = 4
+n_steps = 1
+pos = [0.2850679570020114, -0.4884076255777887]
+mom = [0.35157100084195203, 0.1884748779251397]
+ham = 0.3774324709781596
+dham_dpos = [0.5185734951396592, -0.8714382708923563]
+dham_dmom = [0.3251482388620682, 0.1521747963313234]
+
+[[cases]]
+name = "multistep"
+stepsize = 0.06
+n_fi_steps = 2
+n_steps = 3
+pos = [0.27169001546238103, -0.49389919837879953]
+mom = [0.37172800094491515, 0.15343340471871372]
+ham = 0.3774295471967605
+dham_dpos = [0.49214516765451743, -0.8834303872021527]
+dham_dmom = [0.34617493715955006, 0.12334505403882683]
