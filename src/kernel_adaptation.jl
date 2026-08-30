@@ -98,6 +98,7 @@ struct _DCondition{Rhs} <: _SMDomainNode end
 struct _DIterator{Rhs} <: _SMDomainNode end
 struct _DLoopValue{Iterator} <: _SMDomainNode end
 struct _DLocalMerge{Before,After} <: _SMDomainNode end
+struct _DReturnMerge{Before,After} <: _SMDomainNode end
 struct _DReturn{Rhs} <: _SMDomainNode end
 struct _DDefault{Name,Rhs} <: _SMDomainNode end
 struct _DOrchestration{Borrow,SegmentForest} <: _SMDomainNode end
@@ -392,6 +393,17 @@ function _sm_validate_node(::Type{_DLocalMerge{Before,After}}, argtypes,
     new = _sm_dtype(After, argtypes, KWT, false)
     old === new || _sm_reject(
         "state-machine local reassignment changes type from `$old` to `$new`")
+    nothing
+end
+_sm_return_dtype(::Type{Nothing}, argtypes, ::Type{KWT}) where {KWT} = Nothing
+_sm_return_dtype(::Type{R}, argtypes, ::Type{KWT}) where {R,KWT} =
+    _sm_dtype(R, argtypes, KWT, false)
+function _sm_validate_node(::Type{_DReturnMerge{Before,After}}, argtypes,
+                           ::Type{KWT}) where {Before,After,KWT}
+    old = _sm_return_dtype(Before, argtypes, KWT)
+    new = _sm_return_dtype(After, argtypes, KWT)
+    old === new || _sm_reject(
+        "state-machine alternative returns change type from `$old` to `$new`")
     nothing
 end
 function _sm_validate_node(::Type{_DCondition{R}}, argtypes,
@@ -834,6 +846,8 @@ function _sm_machine_domain_forest(ir::MethodIR, plan::_KernelPlan, fields,
     end
 
     nodes = Any[]
+    return_seen = Ref(false)
+    return_tree = Ref{Any}()
     build! = nothing
     build! = function (body, ltrees)
         for statement in body
@@ -913,6 +927,12 @@ function _sm_machine_domain_forest(ir::MethodIR, plan::_KernelPlan, fields,
                     _sm_dtree(statement.value, plan, fields, OW, SH,
                         finfo, ltrees, false, field_regs, methods_by_id,
                         MethodId[ir.id])
+                if return_seen[]
+                    push!(nodes, _DReturnMerge{return_tree[],tree})
+                else
+                    return_seen[] = true
+                    return_tree[] = tree
+                end
                 push!(nodes, _DReturn{tree})
             else
                 _sm_reject("unsupported state-machine statement `$(typeof(statement))`")

@@ -38,6 +38,13 @@ end
         end
     end
 end
+
+@kernel changing_return_type(value=0.0) = begin
+    step!(flag) = begin
+        flag && return true
+        return value
+    end
+end
 end
 
 function _statistics_kernel_and_state(sources)
@@ -319,4 +326,9 @@ end
     @test occursin("maybe-bound local `hidden`", sprint(showerror, leak_error))
     @test_throws ReactiveKernels._LLowerReject ReactiveKernels.compile_stateful(
         _StructuredCompilerNegatives.shadowing_loop_local, 0.0)
+
+    return_kernel = ReactiveKernels.compile_stateful(
+        _StructuredCompilerNegatives.changing_return_type, 0.0)
+    @test_throws ReactiveKernels._LLowerReject ReactiveKernels._functionalize_stateful(
+        return_kernel, Val(:step!); argument_types=Tuple{Bool})
 end
