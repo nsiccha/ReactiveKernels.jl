@@ -36,7 +36,7 @@ ReactiveKernels dependency, just as Reactant is loaded only when requested.
 `prepare_ad` resolves one named active HAVE port once, passes every other
 current HAVE value as a DI `Constant`, and reuses the backend preparation.
 
-The runnable [`examples/eight_schools.jl`](examples/eight_schools.jl) shows how
+The runnable [`ReactiveKernelsPPLExamples` eight-schools source](packages/ReactiveKernelsPPLExamples/src/eight_schools.jl) shows how
 to build PPL semantics manually from ordinary recipes: unconstrained-to-
 constrained transforms, an optional log Jacobian, decomposed prior and
 likelihood terms, pointwise log likelihoods, total log density, and new-group
@@ -287,9 +287,18 @@ k    = compile(ast2)
 k    = prepare(p; passes = (mypass,))
 ```
 
+## Nested example packages
+
+The exhaustive example corpus is split into ordinary Julia packages under
+[`packages/`](packages/README.md). Their dependency graph is layered and
+acyclic, core never depends upward on an example package, and the root
+`docs/` environment remains the sole documentation site and integration sink.
+Package-local tests own semantics; the root docs build owns cross-package
+source identity and presentation acceptance.
+
 ## Preexisting ecosystem examples
 
-[`examples/preexisting.jl`](examples/preexisting.jl) ports the examples that
+[`ReactiveKernelsCompatibilityExamples`](packages/ReactiveKernelsCompatibilityExamples/examples/preexisting.jl) ports the examples that
 predate this package and exercises them against the public API:
 
 - ReactiveObjects.jl's chain, diamond, and shared-intermediate gallery graphs;
@@ -314,7 +323,7 @@ threshold.
 The source revisions are pinned in the example files so the compatibility
 corpus is auditable.
 
-For documentation, `examples/artifacts.jl` exposes all 13 compatibility cases
+For documentation, `ReactiveKernelsCompatibilityExamples` exposes all 13 compatibility cases
 as executable `ExampleArtifact` records. Each record carries the corresponding
 compact `@kernel` source and runtime inputs, the real `PreparedKernel` and its
 executed output, the exact `code_expr` generated from that kernel, and its
@@ -325,8 +334,7 @@ named operations and retained authored expressions; it never presents the
 display-only copy as the compiled `code_expr`:
 
 ```julia
-include("examples/artifacts.jl")
-using .CompatibilityArtifacts
+using ReactiveKernelsCompatibilityExamples.CompatibilityArtifacts
 
 artifact = only(filter(x -> x.name == :reactiveobjects_chain, all_artifacts()))
 artifact.source       # original input/source
@@ -410,14 +418,16 @@ After warm-up, a prepared kernel over non-allocating scalar operations adds
 **zero** orchestration allocations — the generated code calls operation
 implementations directly through a positional tuple (no world-age globals, no
 graph objects on the hot path). See `test/test_stateless.jl` and
-`examples/demo.jl`.
+[`ReactiveKernelsKernelExamples/examples/demo.jl`](packages/ReactiveKernelsKernelExamples/examples/demo.jl).
 
 ## Running
 
 ```julia
 julia --project=. -e 'using Pkg; Pkg.test()'   # full package suite
 julia --project=. -e 'using Pkg; Pkg.test(test_args=["benchmark"])'
-julia --project=. examples/demo.jl             # runnable walkthrough
-julia --project=. examples/eight_schools.jl    # manual PPL graph
-julia --project=. examples/preexisting.jl      # ReactiveObjects/ReactiveHMC ports
+julia --project=packages packages/setup.jl     # resolve nested local packages
+julia --project=packages packages/test.jl      # all nested package suites
+julia --project=packages packages/ReactiveKernelsKernelExamples/examples/demo.jl
+julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.EightSchoolsExample.demo()'
+julia --project=packages packages/ReactiveKernelsCompatibilityExamples/examples/preexisting.jl
 ```

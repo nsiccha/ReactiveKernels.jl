@@ -12,7 +12,27 @@ HTMXObjects = "b12ef442-5798-4353-80f3-9562b03a0cb6"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 LogExpFunctions = "2ab3a3ac-af41-5b50-aa03-7779005ae688"
 ReactiveKernels = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
+ReactiveKernelsBatchingExamples = "00050de8-5ab0-44ad-ad08-8f6b0ddc01dd"
+ReactiveKernelsCompatibilityExamples = "b8c154ef-4cb8-413d-9282-0e653aa014e1"
+ReactiveKernelsDistributionKernels = "4b169cd9-fc12-43fd-ba39-43e54ed8db7a"
+ReactiveKernelsKernelExamples = "c1a917b0-63b1-4b16-afa9-60dbf16f95f3"
+ReactiveKernelsPPLExamples = "a4d4be3d-45c5-49cc-80d7-34e606a16bce"
 Treebars = "e1e568c4-3a56-40a4-95fa-9b9c6c16fccb"
 
 [sources.ReactiveKernels]
 path = ".."
+
+[sources.ReactiveKernelsBatchingExamples]
+path = "../packages/ReactiveKernelsBatchingExamples"
+
+[sources.ReactiveKernelsCompatibilityExamples]
+path = "../packages/ReactiveKernelsCompatibilityExamples"
+
+[sources.ReactiveKernelsDistributionKernels]
+path = "../packages/ReactiveKernelsDistributionKernels"
+
+[sources.ReactiveKernelsKernelExamples]
+path = "../packages/ReactiveKernelsKernelExamples"
+
+[sources.ReactiveKernelsPPLExamples]
+path = "../packages/ReactiveKernelsPPLExamples"

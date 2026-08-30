@@ -7,7 +7,7 @@ This example ports the `dugongs` model from
 mean is a **nonlinear** function of the parameters — an asymptotic growth curve.
 
 The complete runnable source is
-[`examples/dugongs_growth.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/dugongs_growth.jl).
+[`packages/ReactiveKernelsPPLExamples/src/dugongs_growth.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsPPLExamples/src/dugongs_growth.jl).
 It relates the length `Yᵢ` of 27 dugongs to their age `xᵢ`:
 
 ```math
@@ -81,5 +81,5 @@ predicted = generated_kernel(parameters, 20.0)
 Run the walkthrough from the repository root:
 
 ```sh
-julia --project=. examples/dugongs_growth.jl
+julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.DugongsGrowthExample.demo()'
 ```

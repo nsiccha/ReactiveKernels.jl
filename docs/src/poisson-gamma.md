@@ -7,7 +7,7 @@ responsible only for selecting the computation required by a particular
 `have`/`want` query.
 
 The complete runnable source is
-[`examples/poisson_gamma.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/poisson_gamma.jl).
+[`packages/ReactiveKernelsPPLExamples/src/poisson_gamma.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsPPLExamples/src/poisson_gamma.jl).
 It implements a shared-rate count model
 
 ```math
@@ -77,5 +77,5 @@ expected = generated_kernel(parameters, 4.0)
 Run the walkthrough from the repository root:
 
 ```sh
-julia --project=. examples/poisson_gamma.jl
+julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.PoissonGammaExample.demo()'
 ```

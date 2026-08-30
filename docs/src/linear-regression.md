@@ -7,7 +7,7 @@ responsible only for selecting the computation required by a particular
 `have`/`want` query.
 
 The complete runnable source is
-[`examples/linear_regression.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/linear_regression.jl).
+[`packages/ReactiveKernelsPPLExamples/src/linear_regression.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsPPLExamples/src/linear_regression.jl).
 It implements a simple Gaussian regression
 
 ```math
@@ -81,5 +81,5 @@ prepared kernel without hiding an effect from the planner.
 Run the walkthrough from the repository root:
 
 ```sh
-julia --project=. examples/linear_regression.jl
+julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.LinearRegressionExample.demo()'
 ```

@@ -202,7 +202,7 @@ end
 
 function setup_eight_schools!(mod::Module)
     if !isdefined(mod, :EightSchoolsExample)
-        Base.include(mod, joinpath(@__DIR__, "..", "examples", "eight_schools.jl"))
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: EightSchoolsExample))
     end
     # Bind the observations and the shared distribution KernelSpecs consumed by
     # the displayed PPL assembly; no model-specific evaluator is injected.
@@ -214,7 +214,7 @@ end
 
 function setup_linear_regression!(mod::Module)
     if !isdefined(mod, :LinearRegressionExample)
-        Base.include(mod, joinpath(@__DIR__, "..", "examples", "linear_regression.jl"))
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: LinearRegressionExample))
     end
     Core.eval(mod, :(using .LinearRegressionExample:
         LinearRegressionParameters, LinearPrediction,
@@ -228,7 +228,7 @@ end
 
 function setup_beta_binomial!(mod::Module)
     if !isdefined(mod, :BetaBinomialExample)
-        Base.include(mod, joinpath(@__DIR__, "..", "examples", "beta_binomial.jl"))
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: BetaBinomialExample))
     end
     Core.eval(mod, :(using .BetaBinomialExample:
         BetaBinomialParameters, CountVector,
@@ -241,7 +241,7 @@ end
 
 function setup_poisson_gamma!(mod::Module)
     if !isdefined(mod, :PoissonGammaExample)
-        Base.include(mod, joinpath(@__DIR__, "..", "examples", "poisson_gamma.jl"))
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: PoissonGammaExample))
     end
     Core.eval(mod, :(using .PoissonGammaExample:
         PoissonGammaParameters, CountVector, POISSON_COUNTS,
@@ -253,7 +253,7 @@ end
 
 function setup_dugongs!(mod::Module)
     if !isdefined(mod, :DugongsGrowthExample)
-        Base.include(mod, joinpath(@__DIR__, "..", "examples", "dugongs_growth.jl"))
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: DugongsGrowthExample))
     end
     Core.eval(mod, :(using .DugongsGrowthExample:
         DugongsParameters, UnconstrainedParameters, RealVector,
@@ -267,7 +267,7 @@ end
 
 function setup_arma11!(mod::Module)
     if !isdefined(mod, :ARMA11Example)
-        Base.include(mod, joinpath(@__DIR__, "..", "examples", "arma11.jl"))
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: ARMA11Example))
     end
     Core.eval(mod, :(using .ARMA11Example:
         ARMAParameters, UnconstrainedParameters, RealVector, ARMA_SERIES,
@@ -280,7 +280,7 @@ end
 
 function setup_gaussian_mixture!(mod::Module)
     if !isdefined(mod, :GaussianMixtureExample)
-        Base.include(mod, joinpath(@__DIR__, "..", "examples", "gaussian_mixture.jl"))
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: GaussianMixtureExample))
     end
     Core.eval(mod, :(using .GaussianMixtureExample:
         MixtureParameters, UnconstrainedParameters, RealVector,

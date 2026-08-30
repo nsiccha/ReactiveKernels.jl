@@ -9,7 +9,7 @@ out analytically, exactly as Stan does with `log_mix` (a numerically stable
 two-term `log_sum_exp`). No discrete parameter ever appears in the graph.
 
 The complete runnable source is
-[`examples/gaussian_mixture.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/gaussian_mixture.jl).
+[`packages/ReactiveKernelsPPLExamples/src/gaussian_mixture.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsPPLExamples/src/gaussian_mixture.jl).
 It models observations `yₙ` as a two-component mixture:
 
 ```math
@@ -86,5 +86,5 @@ responsibility = generated_kernel(parameters, 2.5)
 Run the walkthrough from the repository root:
 
 ```sh
-julia --project=. examples/gaussian_mixture.jl
+julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.GaussianMixtureExample.demo()'
 ```

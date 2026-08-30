@@ -7,13 +7,13 @@ using Test
 import Enzyme
 import Reactant: @compile, @jit
 
-include(joinpath(@__DIR__, "..", "examples", "distribution_kernel_sources.jl"))
-using .DistributionKernelSources:
+const _EXAMPLE_PACKAGE_DIRECTORY = normpath(joinpath(@__DIR__, "..", "packages"))
+_EXAMPLE_PACKAGE_DIRECTORY in LOAD_PATH || pushfirst!(LOAD_PATH, _EXAMPLE_PACKAGE_DIRECTORY)
+using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY,
     EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE,
     MVNORMAL_SOURCE, AR1_SOURCE
-include(joinpath(@__DIR__, "..", "examples", "eight_schools.jl"))
-using .EightSchoolsExample:
+using ReactiveKernelsPPLExamples.EightSchoolsExample:
     EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA, evaluate_eight_schools_source
 
 function _evaluate_distribution_kernel_source(source::AbstractString)
@@ -527,3 +527,4 @@ end
 
 include("test_nutpie_reactant.jl")
 include("test_kernel_nuts_reactant.jl")
+include("test_pathfinder_reactant.jl")
