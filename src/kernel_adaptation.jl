@@ -135,6 +135,34 @@ _sm_builtin_array(::Type{T}) where {T} =
     _kernel_dom_num_array(T) ||
     (T <: BitArray && _kernel_dom_builtin(T) && eltype(T) === Bool)
 
+# Fixed homogeneous tuples are a backend-supported structural representation,
+# unlike Arrays whose elements are arbitrary Julia aggregates.  Admit dynamic
+# tuple indexing only when every element has one exact, recursively builtin
+# numeric layout.  Shape and topology remain bound by the frozen state
+# snapshot; callable/static authorities and user-defined wrappers stay out of
+# this ABI.
+function _sm_fixed_structural_dynamic_type(::Type{T}) where {T}
+    _sm_finite_backend_primitive(T) && return true
+    T <: Array && _sm_finite_backend_primitive(eltype(T)) && return true
+    if T <: NamedTuple && T isa DataType
+        return all(_sm_fixed_structural_dynamic_type, fieldtypes(T))
+    elseif T <: Tuple && T isa DataType
+        return all(parameter -> parameter isa Type &&
+            _sm_fixed_structural_dynamic_type(parameter), T.parameters)
+    end
+    false
+end
+
+function _sm_fixed_tuple_element_type(::Type{T}) where {T}
+    T <: Tuple && T isa DataType || return nothing
+    parameters = T.parameters
+    isempty(parameters) && return nothing
+    element = first(parameters)
+    element isa Type && all(parameter -> parameter === element, parameters) &&
+        _sm_fixed_structural_dynamic_type(element) || return nothing
+    element
+end
+
 # A column yielded by `eachcol(::Matrix{T})` is a builtin, non-owning view, not a fabricated `Vector{T}`.
 # The marker exists only while validating the segment forest; it can arise solely after the concrete Matrix
 # and exact `Base.eachcol` registration have passed the builtin borrow-domain check.
@@ -1131,16 +1159,19 @@ function _sm_dtype(::Type{_DIndex{Parent,Indices}}, argtypes,
                    ::Type{KWT}, dot::Bool) where {Parent,Indices,KWT}
     dot && _sm_reject("indexed reads do not admit implicit broadcasting")
     T = _sm_dtype(Parent, argtypes, KWT, false)
-    _sm_builtin_array(T) || _sm_reject(
-        "indexed read requires builtin structural array storage, got `$T`")
-    length(Indices.parameters) == ndims(T) || _sm_reject(
-        "indexed read supplies $(length(Indices.parameters)) indices for rank $(ndims(T))")
+    tuple_element = _sm_fixed_tuple_element_type(T)
+    builtin_array = _sm_builtin_array(T)
+    (builtin_array || tuple_element !== nothing) || _sm_reject(
+        "indexed read requires builtin array or fixed homogeneous tuple storage, got `$T`")
+    rank = builtin_array ? ndims(T) : 1
+    length(Indices.parameters) == rank || _sm_reject(
+        "indexed read supplies $(length(Indices.parameters)) indices for rank $rank")
     for index in Indices.parameters
         IT = _sm_dtype(index, argtypes, KWT, false)
         _kernel_dom_int_scalar(IT) && IT !== Bool || _sm_reject(
             "indexed read requires builtin non-Bool integer indices, got `$IT`")
     end
-    eltype(T)
+    tuple_element === nothing ? eltype(T) : tuple_element
 end
 function _sm_dtype(::Type{_DIfValue{Cond,Then,Else}}, argtypes,
                    ::Type{KWT}, dot::Bool) where {Cond,Then,Else,KWT}
@@ -1255,18 +1286,22 @@ function _sm_validate_node(::Type{_DWrite{T,D,R}}, argtypes, ::Type{KWT}) where 
 end
 function _sm_validate_node(::Type{_DIndexedWrite{T,Indices,R}}, argtypes,
                            ::Type{KWT}) where {T,Indices,R,KWT}
-    _sm_builtin_array(T) || _sm_reject(
-        "indexed write requires builtin structural array storage, got `$T`")
-    length(Indices.parameters) == ndims(T) || _sm_reject(
-        "indexed write supplies $(length(Indices.parameters)) indices for rank $(ndims(T))")
+    tuple_element = _sm_fixed_tuple_element_type(T)
+    builtin_array = _sm_builtin_array(T)
+    (builtin_array || tuple_element !== nothing) || _sm_reject(
+        "indexed write requires builtin array or fixed homogeneous tuple storage, got `$T`")
+    rank = builtin_array ? ndims(T) : 1
+    length(Indices.parameters) == rank || _sm_reject(
+        "indexed write supplies $(length(Indices.parameters)) indices for rank $rank")
     for index in Indices.parameters
         IT = _sm_dtype(index, argtypes, KWT, false)
         _kernel_dom_int_scalar(IT) && IT !== Bool || _sm_reject(
             "indexed write requires builtin non-Bool integer indices, got `$IT`")
     end
     got = _sm_dtype(R, argtypes, KWT, false)
-    got === eltype(T) || _sm_reject(
-        "indexed write result type `$got` does not exactly match element type `$(eltype(T))`")
+    element = tuple_element === nothing ? eltype(T) : tuple_element
+    got === element || _sm_reject(
+        "indexed write result type `$got` does not exactly match element type `$element`")
     nothing
 end
 function _sm_validate_node(::Type{_DAliasWrite{Target,Dot,Rhs}}, argtypes,
@@ -3901,11 +3936,30 @@ end
     LinearAlgebra.Diagonal(one.(value.diag))
 @inline _sm_safe_index(index, array, ::Val{Dimension}) where {Dimension} =
     clamp.(index, one(index), size(array, Dimension))
+@inline _sm_safe_index(index, values::Tuple, ::Val{1}) =
+    clamp.(index, one(index), oftype(index, length(values)))
 @inline _sm_functional_index(array, indices...) = getindex(array, indices...)
+@generated function _sm_functional_index(values::T, index) where {T<:Tuple}
+    isempty(T.parameters) && return :(throw(BoundsError(values, index)))
+    selected = :(getfield(values, 1))
+    for position in 2:length(T.parameters)
+        selected = :(_sm_predicated_select(
+            index .== oftype(index, $position),
+            getfield(values, $position), $selected))
+    end
+    selected
+end
 @inline function _sm_functional_indexed_copy(array, value, indices...)
     result = copy(array)
     setindex!(result, value, indices...)
     result
+end
+@generated function _sm_functional_indexed_copy(
+        values::T, value, index) where {T<:Tuple}
+    elements = Any[:(_sm_predicated_select(
+        index .== oftype(index, $position), value,
+        getfield(values, $position))) for position in 1:length(T.parameters)]
+    Expr(:tuple, elements...)
 end
 
 function (transition::_FunctionalStatefulTransition{

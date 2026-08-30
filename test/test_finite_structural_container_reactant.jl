@@ -36,6 +36,22 @@ _fscr_trace_raw(raw) = map(Reactant.to_rarray, raw)
 _fscr_host_raw(raw) = map(Array, raw)
 _fscr_traced(value) = Reactant.to_rarray(value; track_numbers=true)
 
+function _fscr_trace_value(value)
+    _fscr_trace_value(value, IdDict{Any,Any}())
+end
+function _fscr_trace_value(value::AbstractArray, seen)
+    get!(seen, value) do
+        Reactant.to_rarray(value)
+    end
+end
+_fscr_trace_value(value::Number, seen) =
+    Reactant.to_rarray(value; track_numbers=true)
+_fscr_trace_value(value::NamedTuple, seen) =
+    map(child -> _fscr_trace_value(child, seen), value)
+_fscr_trace_value(value::Tuple, seen) =
+    map(child -> _fscr_trace_value(child, seen), value)
+_fscr_trace_value(value, seen) = value
+
 struct _FSCRRead{C}
     contract::C
 end
@@ -230,6 +246,35 @@ end
         mask=.!prototype[1].mask,
     )
     @test values_after[2] == prototype[2]
+end
+
+
+@testset "authored state-machine captured index executes through Reactant" begin
+    if !isdefined(@__MODULE__, :StatefulFunctionalContractsFixture)
+        include(joinpath(@__DIR__, "fixtures",
+                         "stateful_functional_contracts.jl"))
+    end
+    fixture = StatefulFunctionalContractsFixture
+    items = fixture.captured_alias_items()
+    replacement = fixture.captured_alias_items(100.0)
+    kernel = _FSCR_RK.compile_stateful(
+        fixture.captured_index_alias, items, replacement, 1, 0)
+    transition = _FSCR_RK.functionalize_stateful(
+        kernel, Val(:step!); argument_types=Tuple{Float64,Bool})
+    host_state = _FSCR_RK.stateful_snapshot(
+        kernel(items, replacement, 1, 0))
+    traced_state = _fscr_trace_value(host_state)
+    traced_value = _fscr_traced(41.0)
+    traced_take = _fscr_traced(true)
+    compiled = @compile transition(
+        traced_state, traced_value, traced_take)
+    result = compiled(traced_state, traced_value, traced_take)
+    @test Bool(result.returned) && Bool(result.result)
+    @test !Bool(result.control_overflow)
+    @test Int(result.state.index) == 2
+    @test Int(result.state.count) == 1
+    @test Array(result.state.items[1].buffer) == [41.0, 1.5]
+    @test Array(result.state.items[2].buffer) == items[2].buffer
 end
 
 

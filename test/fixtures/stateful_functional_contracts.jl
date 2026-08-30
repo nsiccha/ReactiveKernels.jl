@@ -169,6 +169,35 @@ end
     end
 end
 
+captured_alias_items(offset=0.0) = ntuple(3) do index
+    (buffer=[offset + index, offset + index + 0.5],)
+end
+
+# This source deliberately changes the dynamic index after binding `item`.
+# The subsequent aliased leaf write must retain the address selected at the
+# local assignment, both in ordinary execution and in functional lowering.
+@kernel captured_index_alias(items_seed, replacement_seed, index=1, count=0) = begin
+    items = deepcopy(items_seed)
+    replacement = deepcopy(replacement_seed)
+    step!(value, take) = begin
+        take || return false
+        item = items[index]
+        index += 1
+        item.buffer[1] = value
+        count += 1
+        return true
+    end
+    move_root!(value, take) = begin
+        take || return false
+        item = items[index]
+        index += 1
+        copy!!(items, replacement)
+        item.buffer[1] = value
+        count += 1
+        return true
+    end
+end
+
 @kernel wrapped_storage_alias(initial, count=0) = begin
     step!(take) = begin
         take || return false

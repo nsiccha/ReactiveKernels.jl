@@ -210,6 +210,82 @@ end
 end
 
 
+@testset "authored state-machine alias retains its bound structural index" begin
+    if !isdefined(@__MODULE__, :StatefulFunctionalContractsFixture)
+        include(joinpath(@__DIR__, "fixtures",
+                         "stateful_functional_contracts.jl"))
+    end
+    fixture = StatefulFunctionalContractsFixture
+    items = fixture.captured_alias_items()
+    replacement = fixture.captured_alias_items(100.0)
+    @test _FSC_RK._sm_fixed_tuple_element_type(typeof(items)) ===
+          typeof(first(items))
+    for rejected in (
+            ((leaf=1 // 2,), (leaf=1 // 2,)),
+            ((leaf=1 + 2im,), (leaf=1 + 2im,)),
+            ((authority=_FSCStaticAuthority(:a),),
+             (authority=_FSCStaticAuthority(:b),)),
+            ((buffer=[1.0],), (buffer=Float32[1.0],)),
+        )
+        @test _FSC_RK._sm_fixed_tuple_element_type(
+            typeof(rejected)) === nothing
+    end
+    rational_items = ntuple(3) do index
+        (buffer=Rational{Int}[index // 1, (index + 1) // 1],)
+    end
+    rational_kernel = _FSC_RK.compile_stateful(
+        fixture.captured_index_alias,
+        rational_items, rational_items, 1, 0)
+    @test_throws _FSC_RK._LLowerReject _FSC_RK.functionalize_stateful(
+        rational_kernel, Val(:step!);
+        argument_types=Tuple{Float64,Bool})
+    kernel = _FSC_RK.compile_stateful(
+        fixture.captured_index_alias, items, replacement, 1, 0)
+
+    native = kernel(items, replacement, 1, 0)
+    @test _FSC_RK.stateful_call(
+        native, Val(:step!), 41.0, true)
+    native_snapshot = _FSC_RK.stateful_snapshot(native)
+    @test native_snapshot.index == 2
+    @test native_snapshot.count == 1
+    @test native_snapshot.items[1].buffer == [41.0, 1.5]
+    @test native_snapshot.items[2].buffer == items[2].buffer
+
+    initial = _FSC_RK.stateful_snapshot(
+        kernel(items, replacement, 1, 0))
+    transition = _FSC_RK.functionalize_stateful(
+        kernel, Val(:step!); argument_types=Tuple{Float64,Bool})
+    functional = transition(initial, 41.0, true)
+    @test functional.returned && functional.result
+    @test !functional.control_overflow
+    @test functional.state.index == native_snapshot.index
+    @test functional.state.count == native_snapshot.count
+    @test functional.state.items[1].buffer ==
+          native_snapshot.items[1].buffer
+    @test functional.state.items[2].buffer ==
+          native_snapshot.items[2].buffer
+
+    moved = kernel(items, replacement, 1, 0)
+    @test _FSC_RK.stateful_call(
+        moved, Val(:move_root!), 77.0, true)
+    moved_snapshot = _FSC_RK.stateful_snapshot(moved)
+    @test moved_snapshot.items == replacement
+    @test moved_snapshot.index == 2
+    root_error = try
+        _FSC_RK.functionalize_stateful(
+            kernel, Val(:move_root!);
+            argument_types=Tuple{Float64,Bool})
+        nothing
+    catch error
+        error
+    end
+    @test root_error isa _FSC_RK._LLowerReject
+    @test sprint(showerror, root_error) ==
+          "ReactiveKernels._LLowerReject(\"aliased state write root " *
+          "`items` changed after alias binding\")"
+end
+
+
 @testset "finite structural backend leaves reject unsupported wrappers" begin
     unsupported = Any[
         1 // 2,
@@ -376,76 +452,20 @@ end
     max_depth = 10
     directions = fill(false, max_depth)
     exponentials = fill(1.0, 2^max_depth)
-
-    endpoint_transition, point = support.endpoint(
-        case.stiffness, case.theta, case.rho)
-    structured = _FSC_RK.structured_state_port(endpoint_transition)
-    step_source = support.EndpointEffectAuthority()
-    step_port = _FSC_RK.effect_lowering_port(
-        step_source, Tuple{typeof(point)}, Nothing;
-        written_arguments=(1,), initial_effect_state=nothing,
-        functional_lowering=_FSC_RK.total_functional_lowering(
-            support.GaussianLeapfrogLowering(case.stiffness)))
-    stats_source = support.StatisticsEffectAuthority()
-    stats_port = _FSC_RK.effect_lowering_port(
-        stats_source, Tuple{_FSC_RK.StatefulStateValue}, Nothing;
-        written_arguments=(),
-        initial_effect_state=(
-            n_steps=0, acceptance_rate=zero(case.theta)),
-        functional_lowering=_FSC_RK.total_functional_lowering(
-            support.statistics_lowering))
-    bindings = _FSC_RK.stateful_compiler_bindings(
-        init=structured,
-        fwd=structured,
-        bwd=structured,
-        candidate=structured,
-        reverse_candidate=structured,
-        step_f=step_port,
-        stats_f=stats_port,
-    )
-    kernel = _FSC_RK.compile_stateful(
-        support.WFX.walnuts_state, bindings, point;
-        step_f=step_source,
-        macro_time=case.macro_time,
-        max_depth,
-        max_step_halvings=case.max_step_halvings,
-        min_micro_steps=case.min_micro_steps,
-        max_error=case.max_error,
-        min_dham=-1000.0,
-        stats_f=stats_source)
-    state = kernel(
-        point;
-        step_f=step_source,
-        macro_time=case.macro_time,
-        max_depth,
-        max_step_halvings=case.max_step_halvings,
-        min_micro_steps=case.min_micro_steps,
-        max_error=case.max_error,
-        min_dham=-1000.0,
-        stats_f=stats_source)
-    snapshot = _FSC_RK.stateful_snapshot(state)
-
-    static_values = _FSC_RK._sm_finite_static_values(structured)
-    proposal_contract = _FSC_RK._sm_finite_structural_contract(
-        snapshot.proposals; static_values)
-    proposal_raw = _FSC_RK._sm_finite_structural_pack(
-        proposal_contract, snapshot.proposals)
-    tree_contract = _FSC_RK._sm_finite_structural_contract(snapshot.trees)
-    tree_raw = _FSC_RK._sm_finite_structural_pack(
-        tree_contract, snapshot.trees)
-    @test length(snapshot.proposals) == max_depth + 2
-    @test length(snapshot.trees) == max_depth + 1
+    setup = support._build_case_setup(
+        case; max_depth, min_dham=-1000.0, directions, exponentials)
+    @test length(setup.snapshot.proposals) == max_depth + 2
+    @test length(setup.snapshot.trees) == max_depth + 1
     @test _FSC_RK._sm_finite_structural_unpack(
-        proposal_contract, proposal_raw) == snapshot.proposals
+        setup.proposal_contract,
+        setup.proposal_raw) == setup.snapshot.proposals
     @test _FSC_RK._sm_finite_structural_unpack(
-        tree_contract, tree_raw) == snapshot.trees
+        setup.tree_contract,
+        setup.tree_raw) == setup.snapshot.trees
 
     frontier = try
-        _FSC_RK.functionalize_stateful(
-            kernel, Val(:step!);
-            max_iterations=1_000_000,
-            argument_types=Tuple{
-                typeof(directions),typeof(exponentials)})
+        support._build_case_transition(
+            setup; max_iterations=1_000_000)
         nothing
     catch error
         error

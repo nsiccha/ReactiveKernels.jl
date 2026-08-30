@@ -96,10 +96,9 @@ function endpoint(stiffness, theta, rho)
     transition, RK.initial_transition_state(transition)
 end
 
-function build_case(case; max_depth=1, min_dham=-1000.0,
-                    directions=fill(false, max_depth),
-                    exponentials=fill(1.0, max(2^max_depth, 1)),
-                    max_iterations=1_000_000)
+function _build_case_setup(case; max_depth=1, min_dham=-1000.0,
+                           directions=fill(false, max_depth),
+                           exponentials=fill(1.0, max(2^max_depth, 1)))
     endpoint_transition, point = endpoint(
         case.stiffness, case.theta, case.rho)
     structured = RK.structured_state_port(endpoint_transition)
@@ -137,12 +136,35 @@ function build_case(case; max_depth=1, min_dham=-1000.0,
         min_micro_steps=case.min_micro_steps, max_error=case.max_error,
         min_dham, stats_f=stats_source)
     snapshot = RK.stateful_snapshot(state)
-    transition = RK.functionalize_stateful(
-        kernel, Val(:step!); max_iterations,
-        argument_types=Tuple{typeof(directions),typeof(exponentials)})
-    (; endpoint_transition, structured, kernel, snapshot, transition,
+    static_values = RK._sm_finite_static_values(structured)
+    proposal_contract = RK._sm_finite_structural_contract(
+        snapshot.proposals; static_values)
+    proposal_raw = RK._sm_finite_structural_pack(
+        proposal_contract, snapshot.proposals)
+    tree_contract = RK._sm_finite_structural_contract(snapshot.trees)
+    tree_raw = RK._sm_finite_structural_pack(
+        tree_contract, snapshot.trees)
+    (; endpoint_transition, structured, kernel, snapshot,
        step_source, step_port, stats_source, stats_port,
-       directions, exponentials)
+       directions, exponentials, proposal_contract, proposal_raw,
+       tree_contract, tree_raw)
+end
+
+function _build_case_transition(setup; max_iterations=1_000_000)
+    RK.functionalize_stateful(
+        setup.kernel, Val(:step!); max_iterations,
+        argument_types=Tuple{
+            typeof(setup.directions),typeof(setup.exponentials)})
+end
+
+function build_case(case; max_depth=1, min_dham=-1000.0,
+                    directions=fill(false, max_depth),
+                    exponentials=fill(1.0, max(2^max_depth, 1)),
+                    max_iterations=1_000_000)
+    setup = _build_case_setup(
+        case; max_depth, min_dham, directions, exponentials)
+    transition = _build_case_transition(setup; max_iterations)
+    merge(setup, (; transition))
 end
 
 function result_values(result)
