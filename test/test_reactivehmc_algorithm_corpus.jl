@@ -49,8 +49,7 @@ const RHMC_CORPUS = ReactiveHMCAlgorithmCorpus
     repo_root = normpath(joinpath(@__DIR__, ".."))
     @test all(e -> all(p -> isfile(joinpath(repo_root, p)), e.current_reactive_sources),
               RHMC_CORPUS.CORPUS)
-    @test only(filter(e -> isempty(e.current_reactive_sources), RHMC_CORPUS.CORPUS)).id ==
-          :relativistic_kinetic_energy
+    @test all(e -> !isempty(e.current_reactive_sources), RHMC_CORPUS.CORPUS)
 
     exercised = Set(Iterators.flatten(e.capabilities for e in RHMC_CORPUS.CORPUS))
     @test Set(RHMC_CORPUS.REQUIRED_FRONTIER_CAPABILITIES) ⊆ exercised
