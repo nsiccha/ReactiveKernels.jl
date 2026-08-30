@@ -23,7 +23,16 @@ _pathfinder_matrix(rows) = reduce(vcat, permutedims(Float64.(row)) for row in ro
         @test propertynames(entry) == PathfinderExternalCorpus.ENTRY_FIELDS
         @test entry.id === :single_path_pathfinder
         @test entry.minimum_acceptance === :native_and_reactant
-        @test occursin(r"^[0-9a-f]{64}$", entry.upstream.source_sha256)
+        @test occursin(r"^[0-9a-f]{64}$", entry.upstream.paper.source_sha256)
+        @test occursin(
+            r"^[0-9a-f]{40}$",
+            entry.upstream.implementation.revision,
+        )
+        @test length(entry.upstream.implementation.source_sha256) == 4
+        @test all(
+            pair -> occursin(r"^[0-9a-f]{64}$", last(pair)),
+            entry.upstream.implementation.source_sha256,
+        )
         @test all(path -> isfile(joinpath(@__DIR__, "..", path)),
                   entry.current_reactive_sources)
         @test entry.oracle.execution === :separate_python_process
@@ -39,6 +48,13 @@ _pathfinder_matrix(rows) = reduce(vcat, permutedims(Float64.(row)) for row in ro
         receipt = TOML.parse(recorded)
         @test receipt["authority"]["paper_sha256"] ==
               PathfinderExternalCorpus.PAPER_AUTHORITY.source_sha256
+        @test receipt["authority"]["pathfinder_jl_revision"] ==
+              PathfinderExternalCorpus.PATHFINDER_JL_AUTHORITY.revision
+        for (source, digest) in
+                PathfinderExternalCorpus.PATHFINDER_JL_AUTHORITY.source_sha256
+            stem = splitext(basename(source))[1]
+            @test receipt["authority"]["pathfinder_jl_$(stem)_sha256"] == digest
+        end
         @test occursin(
             r"^[0-9a-f]{64}$",
             receipt["authority"]["oracle_source_sha256"],
