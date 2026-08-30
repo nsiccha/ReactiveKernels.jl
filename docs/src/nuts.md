@@ -109,7 +109,7 @@ This is a matched-control compiler/runtime microbenchmark on a fixed target, not
 retained-draw, ESS, accelerator-transfer, or time-to-effective-sample evidence.
 
 The simpler fixed-step HMC kernel in
-[`examples/hmc.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/hmc.jl)
+[`packages/ReactiveKernelsKernelExamples/src/hmc.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsKernelExamples/src/hmc.jl)
 also keeps momentum and its Metropolis uniform explicit, uses a static leapfrog
 count, and lets `replica` map the scalar kernel across chains. These are scoped
 compatibility statements, not a claim that arbitrary mutable or reactive state

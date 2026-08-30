@@ -1,0 +1,27 @@
+name = "ReactiveKernelsBatchingExamples"
+uuid = "00050de8-5ab0-44ad-ad08-8f6b0ddc01dd"
+authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+DifferentiationInterface = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"
+ReactiveKernels = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
+
+[weakdeps]
+Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
+MutatingFunctions = "8a4c2d94-4b3b-4f9e-be63-a3c0cd816e3a"
+
+[compat]
+DifferentiationInterface = "0.7"
+Enzyme = "0.13"
+MutatingFunctions = "0.1"
+ReactiveKernels = "0.1"
+julia = "1.10"
+
+[extras]
+Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Distributions", "Enzyme", "Random", "Test"]

@@ -7,7 +7,7 @@ the equivalent of Wren's `Params`, `LogPrior`, and `LogLikelihood` accumulators
 is one `want = (:parameters, :prior, :likelihood)` boundary.
 
 The complete runnable source is
-[`examples/eight_schools.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/eight_schools.jl).
+[`packages/ReactiveKernelsPPLExamples/src/eight_schools.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsPPLExamples/src/eight_schools.jl).
 It implements the centered model
 
 ```math
@@ -141,5 +141,5 @@ kernel without hiding an effect from the planner.
 Run the walkthrough from the repository root:
 
 ```sh
-julia --project=. examples/eight_schools.jl
+julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.EightSchoolsExample.demo()'
 ```

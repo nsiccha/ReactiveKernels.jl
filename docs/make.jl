@@ -1,4 +1,9 @@
 using Documenter, DocumenterVitepress, ReactiveKernels
+using ReactiveKernelsBatchingExamples
+using ReactiveKernelsCompatibilityExamples
+using ReactiveKernelsDistributionKernels
+using ReactiveKernelsKernelExamples
+using ReactiveKernelsPPLExamples
 
 # Opt into the external NUTS/HMC compiler-acceptance exemplar for the sampling
 # and online-statistics pages. ReactiveKernels itself deliberately does not load it.
@@ -8,9 +13,6 @@ using .ReactiveKernelsNUTSExample
 include("kernel_examples.jl")
 Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "result_views.jl"))
 include("check_rendered.jl")
-include(joinpath(@__DIR__, "..", "examples", "distributions.jl"))
-include(joinpath(@__DIR__, "..", "examples", "batched.jl"))
-include(joinpath(@__DIR__, "..", "examples", "bijectors.jl"))
 
 site_pages = [
     "Home" => "index.md",
@@ -42,7 +44,14 @@ site_pages = [
 makedocs(
     sitename = "ReactiveKernels.jl",
     repo = "https://github.com/nsiccha/ReactiveKernels.jl",
-    modules  = [ReactiveKernels],
+    modules  = [
+        ReactiveKernels,
+        ReactiveKernelsDistributionKernels,
+        ReactiveKernelsKernelExamples,
+        ReactiveKernelsBatchingExamples,
+        ReactiveKernelsPPLExamples,
+        ReactiveKernelsCompatibilityExamples,
+    ],
     format   = DocumenterVitepress.MarkdownVitepress(
         repo = "github.com/nsiccha/ReactiveKernels.jl",
         devurl = "dev",

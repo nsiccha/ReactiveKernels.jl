@@ -39,6 +39,11 @@ jobs:
             deps = ENV["RUNNER_TEMP"] * "/rk-docs-deps"
             Pkg.develop([
               PackageSpec(path=pwd()),
+              PackageSpec(path=joinpath(pwd(), "packages", "ReactiveKernelsDistributionKernels")),
+              PackageSpec(path=joinpath(pwd(), "packages", "ReactiveKernelsKernelExamples")),
+              PackageSpec(path=joinpath(pwd(), "packages", "ReactiveKernelsBatchingExamples")),
+              PackageSpec(path=joinpath(pwd(), "packages", "ReactiveKernelsPPLExamples")),
+              PackageSpec(path=joinpath(pwd(), "packages", "ReactiveKernelsCompatibilityExamples")),
               PackageSpec(path=joinpath(deps, "AlgebraOfVega.jl")),
               PackageSpec(path=joinpath(deps, "DynamicObjects.jl")),
               PackageSpec(path=joinpath(deps, "HTMX.jl")),

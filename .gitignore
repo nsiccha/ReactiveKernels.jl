@@ -1,4 +1,5 @@
 /Manifest.toml
+/packages/Manifest.toml
 /scratchpad_gist.md
 *.cov
 /docs/build/

@@ -7,7 +7,7 @@ responsible only for selecting the computation required by a particular
 `have`/`want` query.
 
 The complete runnable source is
-[`examples/beta_binomial.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/beta_binomial.jl).
+[`packages/ReactiveKernelsPPLExamples/src/beta_binomial.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsPPLExamples/src/beta_binomial.jl).
 It implements the classic shared-rate coin-flip model
 
 ```math
@@ -77,5 +77,5 @@ expected = generated_kernel(parameters, 20)
 Run the walkthrough from the repository root:
 
 ```sh
-julia --project=. examples/beta_binomial.jl
+julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.BetaBinomialExample.demo()'
 ```

@@ -9,7 +9,7 @@ walking the series in order, and that stateful computation lives inside the log
 density.
 
 The complete runnable source is
-[`examples/arma11.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/arma11.jl).
+[`packages/ReactiveKernelsPPLExamples/src/arma11.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsPPLExamples/src/arma11.jl).
 It models a scalar series `y₁,…,y_T`:
 
 ```math
@@ -74,5 +74,5 @@ forecast = forecast_kernel(parameters, series)
 Run the walkthrough from the repository root:
 
 ```sh
-julia --project=. examples/arma11.jl
+julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.ARMA11Example.demo()'
 ```
