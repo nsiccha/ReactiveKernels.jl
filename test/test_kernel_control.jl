@@ -87,6 +87,33 @@ end
 _ctl_st1(cap) = RKC._FrameStore{1,Tuple{Vector{Int}}}((Vector{Int}(undef,cap),))
 _ctl_st2(cap) = RKC._FrameStore{2,Tuple{Vector{Int}}}((Vector{Int}(undef,cap),))
 
+@testset "control — backend-neutral program retains source CFG and effects" begin
+    irs = RKC.method_irs(_CtlMS.adv)
+    program = RKC._control_program_from_irs(irs; root_mid=1)
+    @test program.methods == (1, 2)
+    @test program.names == Dict(1 => :ping!, 2 => :pong!)
+    @test program.stored == Dict(1 => (:k,), 2 => (:x,))
+    @test program.formal_positions ==
+          Dict(1 => Dict(:k => 1), 2 => Dict(:x => 1))
+    @test program.root_mid == 1
+    @test program.root_entry == program.entries[1]
+    @test all(block -> block.mid in program.methods, program.blocks)
+    @test all(block -> block.name == program.names[block.mid], program.blocks)
+    @test any(block -> block.term === :call && block.callee_mid != 0,
+              program.blocks)
+    @test any(block -> block.term === :branch && hasproperty(block, :condition),
+              program.blocks)
+    @test any(block -> !isempty(block.effects), program.blocks)
+
+    by_name = RKC._control_program(_CtlMS.adv; root_name=:ping!)
+    @test by_name.root_mid == program.root_mid
+    @test map(block -> (block.mid, block.pc, block.term), by_name.blocks) ==
+          map(block -> (block.mid, block.pc, block.term), program.blocks)
+
+    @test_throws ArgumentError RKC._control_program(_CtlMS.adv;
+                                                     root_name=:missing!)
+end
+
 @testset "control — mutual+self recursion (2^n) + acyclic-inlined base, 0-B/@inferred" begin
     irs = RKC.method_irs(_CtlMS.adv); cap=256
     @test sort(collect(RKC.defunctionalized_mids(irs))) == [1,2]        # only ping!/pong! defunctionalized

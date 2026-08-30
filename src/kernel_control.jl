@@ -452,6 +452,104 @@ function defunctionalized_mids(irs)
     defunc
 end
 
+# ======================= backend-neutral control program =======================
+#
+# `compile_dispatcher` above emits one native implementation of the captured
+# control machine.  Optional backends need the same source-derived topology,
+# but must not rediscover it through a kernel-specific list of methods, block
+# counts, or program-counter meanings.  `_control_program` is that shared
+# boundary: it freezes the defunctionalized/inlined CFG and retains each
+# block's normalized MethodIR effects for a later backend-specific value/effect
+# lowering pass.
+#
+# The root is framed even when it is acyclic.  That gives a backend one uniform
+# entry/return protocol for a plain data-dependent loop as well as recursive
+# control.  Truly acyclic sibling callees remain inlined by `build_method`.
+function _control_program_from_irs(irs0; root_mid::Int)
+    irs = Tuple(irs0)
+    by_mid = Dict{Int,Any}(ir.id.decl => ir for ir in irs)
+    haskey(by_mid, root_mid) || throw(ArgumentError(
+        "control-program root method $root_mid is not present in the captured MethodIR"))
+
+    framed = defunctionalized_mids(irs)
+    push!(framed, root_mid)
+    methods = sort!(collect(framed))
+    midpos = Dict(m => i for (i, m) in enumerate(methods))
+    names = Dict(m => by_mid[m].id.name for m in methods)
+    entries = Dict{Int,Int}()
+    built = Dict{Int,Any}()
+    spilled = Dict{Int,Tuple{Vararg{Symbol}}}()
+    stored = Dict{Int,Tuple{Vararg{Symbol}}}()
+    formal_positions = Dict{Int,Dict{Symbol,Int}}()
+    for mid in methods
+        cfg = build_method(by_mid[mid], by_mid, framed)
+        built[mid] = cfg
+        entries[mid] = cfg.entry
+        spilled[mid] = Tuple(spilled_locals(by_mid[mid], framed))
+        stored[mid] = Tuple(unique(vcat(live_formals(by_mid[mid], cfg.blks),
+                                          collect(spilled[mid]))))
+        position = Dict{Symbol,Int}()
+        positional = 0
+        for formal in by_mid[mid].formals
+            formal.kind === :pos || continue
+            positional += 1
+            position[formal.name] = positional
+        end
+        formal_positions[mid] = position
+    end
+
+    blocks = Any[]
+    for mid in methods
+        for block in sort(built[mid].blks; by = x -> x.pc)
+            term = block.term
+            common = (; mid, name=names[mid], pc=block.pc,
+                effects=Tuple(block.effects),
+                writes=Tuple(_block_writes(block.effects, Set(spilled[mid]))),
+                midpos=midpos[mid])
+            if term isa TRet
+                push!(blocks, merge(common, (; term=:return, then_pc=0,
+                    else_pc=0, callee_mid=0, callee_entry=0,
+                    resume_pc=0, callee_midpos=0)))
+            elseif term isa TGoto
+                push!(blocks, merge(common, (; term=:goto,
+                    then_pc=term.pc, else_pc=0, callee_mid=0,
+                    callee_entry=0, resume_pc=0, callee_midpos=0)))
+            elseif term isa TBranch
+                push!(blocks, merge(common, (; term=:branch,
+                    then_pc=term.then_pc, else_pc=term.else_pc,
+                    callee_mid=0, callee_entry=0, resume_pc=0,
+                    callee_midpos=0, condition=term.cond)))
+            elseif term isa TCall
+                haskey(entries, term.callee_mid) || throw(ArgumentError(
+                    "control-program call from method $mid block $(block.pc) " *
+                    "targets non-framed method $(term.callee_mid)"))
+                push!(blocks, merge(common, (; term=:call, then_pc=0,
+                    else_pc=0, callee_mid=term.callee_mid,
+                    callee_entry=entries[term.callee_mid],
+                    resume_pc=term.resume_pc,
+                    callee_midpos=midpos[term.callee_mid],
+                    arguments=Tuple(term.args))))
+            else
+                throw(ArgumentError(
+                    "unsupported control-program terminator $(typeof(term))"))
+            end
+        end
+    end
+
+    (; methods=Tuple(methods), midpos, names, entries, spilled, stored,
+       formal_positions,
+       blocks=Tuple(blocks), root_mid, root_entry=entries[root_mid])
+end
+
+function _control_program(skel; root_name::Symbol)
+    irs = method_irs(skel)
+    roots = [ir.id.decl for ir in irs if ir.id.name === root_name]
+    length(roots) == 1 || throw(ArgumentError(
+        "control-program root `$root_name` must resolve to exactly one captured method; " *
+        "found $(length(roots))"))
+    _control_program_from_irs(irs; root_mid=only(roots))
+end
+
 # substitute positional formals with the call's actual arg expressions throughout a node tree.
 # COMPLETE generic formal-substitution walk (RK real-fixture fix): the hand-written per-type version missed
 # _PlaceWrite/_PlaceSwap/_Index/_LocalAssign/_If/_For/_Getfield/_SelfField/_SetReturn — node types that never
