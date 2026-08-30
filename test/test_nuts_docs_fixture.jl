@@ -5,16 +5,32 @@ using Test
     fixture_path = joinpath(root, "benchmark", "nuts_kernel_authoring_fixture.jl")
     page_path = joinpath(root, "docs", "src", "nuts.md")
     helpers_path = joinpath(root, "docs", "kernel_examples.jl")
+    make_path = joinpath(root, "docs", "make.jl")
+    interactions_path = joinpath(
+        root, "benchmark", "reactivehmc_docs_interactions.jl",
+    )
 
     fixture = rstrip(replace(
         read(fixture_path, String), "\r\n" => "\n", "\r" => "\n",
     ))
     page = read(page_path, String)
     helpers = read(helpers_path, String)
+    make = read(make_path, String)
+    interactions = read(interactions_path, String)
 
     @test occursin("render_nuts_complete_source()", page)
+    @test occursin("render_nuts_source_interaction()", page)
     @test occursin("function _nuts_fixture_source()", helpers)
     @test occursin("Markdown.Code(\"julia\", _nuts_fixture_source())", helpers)
+    @test occursin("module ReactiveKernelsDocsNUTSFixture", make)
+    @test occursin("nuts_kernel_authoring_fixture.jl", make)
+    @test occursin("NUTS_INTERACTION", interactions)
+    @test occursin("_build_nuts_sampler(", interactions)
+    @test occursin(
+        "result = fixture.nuts!!(sampler; rng = Random.Xoshiro(1))",
+        interactions,
+    )
+    @test !occursin("it is not read or executed by the docs build", page)
     @test !occursin("Show the complete byte-synchronized authoring fixture", page)
 
     for name in (

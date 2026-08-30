@@ -15,9 +15,10 @@ The fixture's `nuts!!` entry is **landed as executable compiler evidence on `mai
 lowers the NUTS source to a sealed, registry-free **native compiled recursion**
 (`compile_nuts_native` / `_build_nuts_sampler`). That entry mutates compiler-owned
 state in place and returns the **same object** (`result === state`, same concrete
-type) at **exact zero allocations**. The source below is embedded statically from
-the reviewed `benchmark/nuts_kernel_authoring_fixture.jl` and guarded byte-for-byte
-by `test/test_nuts_docs_fixture.jl`; it is not read or executed by the docs build. The measured
+type) at **exact zero allocations**. The docs build loads the reviewed
+`benchmark/nuts_kernel_authoring_fixture.jl` in an isolated module, reads the
+displayed source from that same file, admits its captured kernels, and executes
+the exact source-locked `nuts!!` interaction shown below. The measured
 leapfrog-steps/s comparison against DynamicHMC, AdvancedHMC, and nsiccha/NUTS.jl
 is recorded in the static receipt [`benchmark/receipts/nuts-g7-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/nuts-g7-v1.toml)
 — parsed here, not re-run in CI. It is a work-normalized inner-loop receipt,
@@ -245,14 +246,27 @@ fixture entry **satisfies** (see the status table).
 - **No `Ref`.** State is implicit-field; direction is concrete branch calls threading a
   physical endpoint, so there is no aliasing indirection to reason about.
 
+## Build-executed authored sampler entry
+
+The following interaction is evaluated verbatim during the docs build. It
+constructs the sealed sampler from the build-loaded fixture, calls that
+fixture's authored `nuts!!` entry with an explicit `Xoshiro(1)`, and displays
+the resulting diagnostics. Publication fails if the returned object identity or
+committed diagnostics drift.
+
+```@eval
+Main.ReactiveKernelsDocs.render_nuts_source_interaction()
+```
+
 ## The authoring source
 
 The block below is the **exact reviewed authoring source** — the surface that `@kernel`
 lowers to the sealed, registry-free native NUTS sampler now on `main`. The docs build
 reads it directly from the durable fixture
 [`benchmark/nuts_kernel_authoring_fixture.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/nuts_kernel_authoring_fixture.jl);
-loads its eight captured kernels, and refuses to publish if any expected definition or
-MethodIR vanishes. This page renders live at
+loads all eight definitions in an isolated module, requires the captured MethodIR
+for every method-bearing definition, and refuses to publish if the compiled
+sampler interaction above fails. This page renders live at
 <https://nsiccha.github.io/ReactiveKernels.jl/dev/nuts>.
 
 The build-loaded source below is the macro-free executable fixture as it exists today.

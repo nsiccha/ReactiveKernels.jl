@@ -7,7 +7,10 @@ locked in
 [`benchmark/reactivehmc_algorithm_corpus.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/reactivehmc_algorithm_corpus.jl).
 Each rendered kernel below is read from its real package or benchmark authority
 during the docs build. The build also loads that file, checks its captured
-MethodIR, and requires every example on this page to execute exactly once.
+MethodIR, and requires exactly one source-locked user interaction per example.
+Supported prepared/compiler paths execute natively; fixtures whose compiler
+acceptance is still held stop visibly at construction, MethodIR, and independent
+receipt inspection.
 
 The corpus separates three kinds of evidence:
 
@@ -41,7 +44,9 @@ renders that same kernel's selected `Plan` as the Compute DAG.
 Open **Raw input** for the exact source extracted from
 [`packages/ReactiveKernelsCompatibilityExamples/src/preexisting_reactivehmc.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsCompatibilityExamples/src/preexisting_reactivehmc.jl).
 The two kinetic variants deliberately share authored source but have distinct
-captured callable/scalar authorities and executable plans.
+captured callable/scalar authorities and executable plans. Each Raw input pane
+also contains the exact constructor, `prepare`, and call expression that produced
+its displayed output.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_reactivehmc_phasepoints()
@@ -52,7 +57,9 @@ Main.ReactiveKernelsDocs.render_reactivehmc_phasepoints()
 ReactiveHMC's relativistic kinetic-energy construction is captured as an object
 kernel with nested energy, density, CDF, and quantile methods. The Lambert-W
 implementation remains an explicit callable port, so ReactiveKernels does not
-gain a hidden package dependency or an algorithm-name special case.
+gain a hidden package dependency or an algorithm-name special case. The
+interaction shown below compiles the loaded fixture, calls its quantile method,
+and checks the observed value against the independent receipt.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_reactivehmc_captured_sources(:rke)
@@ -64,7 +71,8 @@ These are the source-faithful nonseparable integrators. Their fixed-point loops
 and ordered phase-point writes remain ordinary authored control; `multistep`
 stays an ordinary higher-order Julia wrapper because it owns no reactive state.
 The compiler-capture block is generated from the loaded kernel's MethodIR, not
-from a documentation-only description.
+from a documentation-only description. The displayed interactions compile and
+run each transition against its pinned receipt case.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_reactivehmc_captured_sources(:integrators)
@@ -77,7 +85,8 @@ per-transition sampling summaries. Capacity exhaustion is explicit and sticky;
 direction-dependent prepend/append order, reveal indices, acceptance reduction,
 and detached history copies are all visible in the source. This replaces dynamic
 container growth with an explicit compiler boundary while preserving the pinned
-callback order.
+callback order. The displayed interaction resets the compiled state, records the
+receipt's trajectory and sample, then reads back the resulting statistics.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_reactivehmc_captured_sources(:statistics)
@@ -88,7 +97,9 @@ Main.ReactiveKernelsDocs.render_reactivehmc_captured_sources(:statistics)
 The fixed-step HMC fixture and its independent control/RNG receipt are accepted.
 The source below exposes momentum refresh, ordered integration, statistics before
 divergence exit, and the final log-Bernoulli copy decision. Its compiler-capture
-pane is the accepted MethodIR/oracle evidence.
+pane is the accepted MethodIR/oracle evidence. Its displayed interaction is
+deliberately limited to fixture construction, MethodIR, and receipt-control
+inspection; it does not run the fixed-HMC kernel.
 
 This is intentionally **not** a claim that the later generic callable/RNG
 functional compiler implementation is accepted: that implementation remains
@@ -106,11 +117,13 @@ independent evidence remain readable:
 
 - [NUTS sampling](nuts.md) build-loads the eight-kernel authoring fixture,
   including leapfrog, momentum refresh, diagnostics, NUTS state/entry, dual
-  averaging, and Welford variance. Its full reactive group remains the primary
-  three-pane NUTS view.
+  averaging, and Welford variance. It also compiles and executes a source-locked
+  `nuts!!` interaction; its full reactive group remains the primary three-pane
+  NUTS view.
 - [WALNUTS-D](walnuts.md) shows fixed-macro-time dyadic refinement, reverse-grid
   rejection, the depth-10 NUTS leaf, explicit replay streams, and the complete
-  authored source.
+  authored source. Its current interaction is honest fixture/MethodIR/receipt
+  inspection only, with no native or Reactant compiler-success claim.
 - [Nutpie diagonal adaptation](nutpie-diagonal.md) executes its initialization
   and adaptation kernels against an independent Rust oracle.
 - [Pathfinder approximation](pathfinder.md) executes two WANT cuts of one

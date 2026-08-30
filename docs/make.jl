@@ -10,6 +10,13 @@ using ReactiveKernelsPPLExamples
 include(joinpath(@__DIR__, "..", "examples", "nuts_runtime.jl"))
 using .ReactiveKernelsNUTSExample
 
+# Load the exact method-bearing NUTS authoring fixture in an isolated namespace.
+# Its public `nuts!!` entry is executed by a source-locked interaction on nuts.md;
+# keeping it separate avoids rebinding the runtime exemplar's ordinary API.
+module ReactiveKernelsDocsNUTSFixture
+include(joinpath(@__DIR__, "..", "benchmark", "nuts_kernel_authoring_fixture.jl"))
+end
+
 # Opt into the standalone nutpie/nuts-rs diagonal-adaptation compiler corpus.
 # It remains an external mathematical example rather than a package API.
 include(joinpath(@__DIR__, "..", "examples", "nutpie_diagonal_adaptation.jl"))
@@ -26,9 +33,11 @@ include(joinpath(@__DIR__, "..", "benchmark", "walnuts_kernel_authoring_fixture.
 # MethodIR; malformed or rejected source therefore fails the docs build.
 include(joinpath(@__DIR__, "..", "benchmark", "reactivehmc_algorithm_corpus.jl"))
 include(joinpath(@__DIR__, "..", "benchmark", "reactivehmc_rke_kernel_fixture.jl"))
+include(joinpath(@__DIR__, "..", "benchmark", "reactivehmc_rke_functional_lowering.jl"))
 include(joinpath(@__DIR__, "..", "benchmark", "reactivehmc_integrator_kernel_fixture.jl"))
 include(joinpath(@__DIR__, "..", "benchmark", "reactivehmc_statistics_kernel_fixture.jl"))
 include(joinpath(@__DIR__, "..", "benchmark", "reactivehmc_hmc_kernel_fixture.jl"))
+include(joinpath(@__DIR__, "..", "benchmark", "reactivehmc_docs_interactions.jl"))
 
 include("kernel_examples.jl")
 Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "result_views.jl"))
@@ -90,7 +99,7 @@ makedocs(
 # A successful build must have executed and rendered every PPL walkthrough
 # exactly once. This catches an omitted page/block even when no eval error fires.
 ReactiveKernelsDocs.assert_ppl_examples_executed!()
-ReactiveKernelsDocs.assert_reactivehmc_docs_executed!()
+ReactiveKernelsDocs.assert_reactivehmc_docs_interacted!()
 
 # Ensure a root index.html redirect exists
 let redirect = joinpath(@__DIR__, "build", "index.html")

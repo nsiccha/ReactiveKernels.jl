@@ -8,8 +8,8 @@ reverse grid would also pass, the leaf is rejected. Accepted leaves are combined
 by the ordinary depth-10 multinomial NUTS recursion shown on the
 [NUTS sampling](nuts.md) page.
 
-This is an external compiler-acceptance fixture, not a sampler API exported by
-ReactiveKernels. The source authority is the released
+This is an external compiler-acceptance candidate fixture, not a sampler API
+exported by ReactiveKernels. The source authority is the released
 [`walnuts.hpp` at `4f051db`](https://github.com/flatironinstitute/walnutpie/blob/4f051db7df57762a58ac851b0274fe57de342198/include/walnutpie/walnuts.hpp),
 with Bob Carpenter's earlier
 [`walnuts.py` at `895a9b7`](https://github.com/bob-carpenter/walnuts/blob/895a9b7a595b1bf15e9bcd7267bf1fa4fc36789a/walnuts/walnuts.py)
@@ -26,9 +26,9 @@ transcription.
 ## State, bounds, and observable replay
 
 The authored state fixes the depth-10 default, macro-step refinement bound, and
-the independent observables used to compare native and Reactant execution. All
-randomness is supplied as runtime data; stream positions and overflow are part
-of the result rather than hidden host RNG state.
+the independent observables a future accepted native/Reactant comparison must
+use. All randomness is supplied as runtime data; stream positions and overflow
+are part of the result rather than hidden host RNG state.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_walnuts_source(:state)
@@ -74,12 +74,25 @@ Main.ReactiveKernelsDocs.render_walnuts_source(:nuts_leaf)
 ## Public fixture entry: stochastic values are explicit
 
 The fixture entry receives momentum, directions, and exponentials as typed
-runtime arguments. Native and Reactant therefore consume the same pre-generated
-values in the same source order, and an independent test can compare exact
-stream counters and control decisions.
+runtime arguments. This makes identical pre-generated streams and exact counter
+comparison part of the intended native/Reactant acceptance contract; it is not,
+by itself, evidence that either generic compiler path is accepted.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_walnuts_source(:entry)
+```
+
+## Build inspection — no compiler-execution claim
+
+The exact interaction below is evaluated during the docs build. It constructs
+the loaded fixture boundary, requires all 15 state methods to remain admitted,
+inspects the explicit entry keywords, and counts the independent C++ receipt
+cases. It intentionally does **not** execute `walnuts!!` and makes no native or
+Reactant compiler-success claim while that generic compiler boundary remains
+held.
+
+```@eval
+Main.ReactiveKernelsDocs.render_walnuts_source_interaction()
 ```
 
 ## Independent control receipt
