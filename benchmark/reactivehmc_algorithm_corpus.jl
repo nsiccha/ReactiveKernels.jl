@@ -69,7 +69,7 @@ const INDEPENDENT_ORACLE_CONTRACT = (
     execution = :separate_julia_process,
     revision = UPSTREAM.revision,
     required_observables = (
-        :initial_transition_state,
+        :initial_state,
         :final_state,
         :ordered_mutations,
         :control_counts,
