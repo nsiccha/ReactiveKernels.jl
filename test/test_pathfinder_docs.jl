@@ -9,6 +9,7 @@ using Test
     interactions = read(
         joinpath(root, "benchmark", "reactivehmc_docs_interactions.jl"), String,
     )
+    theme = read(joinpath(root, "docs", "src", ".vitepress", "theme", "index.ts"), String)
 
     @test occursin("\"Pathfinder approximation\" => \"pathfinder.md\"", make)
     @test occursin("render_pathfinder_kernels(@__MODULE__)", page)
@@ -22,7 +23,14 @@ using Test
     @test occursin("Pathfinder.jl-like compact history", page)
     @test occursin("pathfinder_jl_compact_candidate", page)
     @test occursin("two chronological", page)
+    @test occursin("visible on narrow screens", page)
+    @test !occursin(" & R &=", page)
+    @test !occursin("& H &=", page)
     @test occursin("not a sampler API", page)
+    @test !isfile(joinpath(root, "docs", "src", "components", "Banner.vue"))
+    @test !occursin("@/Banner.vue", theme)
+    @test !occursin("layout-bottom", theme)
+    @test occursin("rendered site must not contain the removed warning banner", rendered_gate)
 
     @test occursin("pathfinder_kernel_authoring_fixture.jl", examples)
     @test occursin("pathfinder_jl_kernel_authoring_fixture.jl", examples)
