@@ -86,6 +86,14 @@ struct _Lit       <: _MExpr; value::Any; end
 "An external binding in VALUE position — a hygienic `GlobalRef` (deferred resolution in the definition
 module), NOT an eagerly-evaluated value."
 struct _ExtRef    <: _MExpr; ref::GlobalRef; end
+"A callable used as a VALUE, backed by the same definition-time captured and
+rebind-checked registration as a direct call. This is required by exact
+higher-order builtins such as `map(copy, tuple)`; a bare `_ExtRef` never gains
+callable authority merely because it happens to contain a function."
+struct _CallableRef <: _MExpr
+    ref::_CapturedCalleeRef
+    registration::_KernelRegistration
+end
 "An OPERATOR / OPAQUE-external application `op(args...; kw...)`; `op` is a hygienic `GlobalRef` (the
 later trait consumer resolves it for `typeof`-dispatch). `broadcast` marks an expression-position dotted
 operator (`a .+ b`). `hint` ∈ (`:operator_candidate` — an operator callee, a HINT not proof;
@@ -201,9 +209,17 @@ struct _Formal
     default::Union{Nothing,_MExpr}
 end
 
-"A method-local (re)bind `lhs = rhs`; `lhs` is 1+ names (a tuple for destructuring). A compound
-`x op= rhs` is normalized so `rhs` reads the pre-write value of `x`."
-struct _LocalAssign <: _MStmt; lhs::Tuple{Vararg{Symbol}}; rhs::_MExpr; end
+"A method-local (re)bind `lhs = rhs`; `lhs` is 1+ names. `style` is `:single`,
+`:tuple`, or `:named` (`(; a, b) = rhs`) so later lowering can evaluate the RHS
+once and project by position or property without re-reading source syntax. A
+compound `x op= rhs` is normalized so `rhs` reads the pre-write value of `x`."
+struct _LocalAssign <: _MStmt
+    lhs::Tuple{Vararg{Symbol}}
+    rhs::_MExpr
+    style::Symbol
+end
+_LocalAssign(lhs::Tuple{Vararg{Symbol}}, rhs::_MExpr) =
+    _LocalAssign(lhs, rhs, length(lhs) == 1 ? :single : :tuple)
 "One arity/kw-matching overload candidate of a sibling call: its declaration-unique `MethodId` + the
 callee's SECONDARY derived `kind` (informational; identity is the `id`)."
 struct _CallCandidate; id::MethodId; kind::Symbol; end
@@ -648,6 +664,9 @@ function _kmexpr(ex, ctx::_KMIRCtx, shadow::Set{Symbol}; bcast::Bool=false)
     if ex isa Symbol
         (ex in shadow) && return _LocalRef(ex)
         haskey(ctx.formalpos, ex) && return _FormalRef(ex, ctx.formalpos[ex], ctx.formalkind[ex])
+        cc = _kmir_lookup_captured(ex, ctx)
+        cc !== nothing && cc.registration.kind === :pure_primitive &&
+            return _CallableRef(cc.ref, cc.registration)
         return _ExtRef(GlobalRef(ctx.mod, ex))
     end
     (ex isa Expr) || return _Lit(ex)
@@ -666,6 +685,9 @@ function _kmexpr(ex, ctx::_KMIRCtx, shadow::Set{Symbol}; bcast::Bool=false)
     end
     m(node) = _kmexpr(node, ctx, shadow; bcast=bcast)
     if ex.head === :. && length(ex.args) == 2 && ex.args[2] isa QuoteNode
+        cc = _kmir_lookup_captured(ex, ctx)
+        cc !== nothing && cc.registration.kind === :pure_primitive &&
+            return _CallableRef(cc.ref, cc.registration)
         return _Getfield(m(ex.args[1]), ex.args[2].value)
     elseif ex.head === :ref
         return _Index(m(ex.args[1]), Tuple(m(a) for a in ex.args[2:end]))
@@ -849,7 +871,11 @@ function _kmstmt_assign(ex, ctx::_KMIRCtx, shadow::Set{Symbol})
         end
         dot && _kmir_reject("a dotted destructuring bind is not compilable")
         names = Symbol[]; _kmir_assign_names!(names, lhs)
-        return (_LocalAssign(Tuple(names), _kmexpr(rhs, ctx, shadow)), Set{Symbol}(names))
+        isempty(names) && _kmir_reject("a destructuring bind contains no local names")
+        named = length(lhs.args) == 1 && lhs.args[1] isa Expr &&
+                lhs.args[1].head === :parameters
+        style = named ? :named : :tuple
+        return (_LocalAssign(Tuple(names), _kmexpr(rhs, ctx, shadow), style), Set{Symbol}(names))
     end
     # a PLACE write (field-rooted / owned-alias / indexed-nested / deferred) — never rejected.
     if _kmir_is_place_lhs(lhs, ctx, shadow)
@@ -887,6 +913,8 @@ function _kmir_assign_names!(names, lhs)
     elseif lhs isa Expr && lhs.head === :(::)
         _kmir_assign_names!(names, lhs.args[1])
     elseif lhs isa Expr && lhs.head === :tuple
+        for e in lhs.args; _kmir_assign_names!(names, e); end
+    elseif lhs isa Expr && lhs.head === :parameters
         for e in lhs.args; _kmir_assign_names!(names, e); end
     end
     names

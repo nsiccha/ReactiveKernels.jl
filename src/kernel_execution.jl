@@ -11,6 +11,8 @@ function _exec_reads!(acc::Vector{Int}, x, fc::Dict{Symbol,Int})
     elseif x isa _RegisteredCall || x isa _OpCall
         for a in x.args; _exec_reads!(acc, a, fc); end
         for pair in x.kw; _exec_reads!(acc, pair.second, fc); end
+    elseif x isa _TupleExpr
+        for element in x.elts; _exec_reads!(acc, element, fc); end
     elseif x isa _FieldCall
         !isempty(x.path) && haskey(fc, x.path[1]) &&
             !(fc[x.path[1]] in acc) && push!(acc, fc[x.path[1]])
