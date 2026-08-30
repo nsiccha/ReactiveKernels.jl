@@ -38,6 +38,38 @@ function _rhmc_test_state(actual, expected)
     end
 end
 
+function _rhmc_test_statistics_receipt(state, receipt)
+    trajectory = receipt["trajectory"]
+    sampling = receipt["sampling"]
+    first_history = reduce(hcat, sampling["full_history"][1])
+    second_history = reduce(hcat, sampling["full_history"][2])
+
+    # The live trajectory has already been reset for sample two. The first
+    # trajectory must survive only in its detached sample snapshot.
+    @test Reactant.to_number(state.first) == 4
+    @test Reactant.to_number(state.count) == 2
+    @test Reactant.to_number(state.sample_count) == 2
+    @test Array(state.positions[:, 4:5]) == [0.7 0.9; 0.8 1.0]
+    @test Array(state.gradients[:, 4:5]) == [-0.75 -0.95; -0.85 -1.05]
+    @test Array(state.dhams[4:5]) == [0.0, -1.5]
+    @test Array(state.pots[4:5]) == [0.565, 0.905]
+    @test Array(state.idxs[4:5]) == [0, 1]
+
+    @test Array(state.full_history[:, 1:4, 1]) == first_history
+    @test Array(state.full_idxs[1:4, 1]) == sampling["full_idxs"][1]
+    @test Array(state.full_history[:, 1:2, 2]) == second_history
+    @test Array(state.full_idxs[1:2, 2]) == sampling["full_idxs"][2]
+    @test Array(state.history_counts[1:2]) == [4, 2]
+    @test first_history == reduce(hcat, trajectory["positions"])
+    @test Array(state.draws[:, 1:2]) == reduce(hcat, sampling["draws"])
+    @test Array(state.n_steps[1:2]) == sampling["n_steps"]
+    @test Array(state.stepsizes[1:2]) == sampling["stepsizes"]
+    @test Array(state.acc_rate[1:2]) ≈ sampling["acc_rate"] atol=128eps(Float64) rtol=0
+    @test Array(state.diverged[1:2]) == sampling["diverged"]
+    @test !Bool(Reactant.to_number(state.trajectory_overflow))
+    @test !Bool(Reactant.to_number(state.sampling_overflow))
+end
+
 function _rhmc_native_statistics_receipt!(state)
     @test !ReactiveKernels.stateful_call(
         state, Val(:reset!), [0.25, -0.5], [0.2, -0.4], 0.15625)
@@ -73,7 +105,10 @@ end
 @testset "Reactant executes the source-derived statistics state machine" begin
     sources = _RHMC_REACTANT_STATS.initial_statistics_sources(2, 8, 4)
     kernel, native = _rhmc_statistics_kernel(sources)
-    expected = _rhmc_native_statistics_receipt!(native)
+    native_expected = _rhmc_native_statistics_receipt!(native)
+    receipt = TOML.parsefile(joinpath(
+        @__DIR__, "..", "benchmark", "receipts",
+        "reactivehmc-statistics-ca9-v1.toml"))
     _, fresh = _rhmc_statistics_kernel(sources)
 
     reset = ReactiveKernels._functionalize_stateful(
@@ -114,11 +149,10 @@ end
     state = _rhmc_call_compiled(
         compiled_sample, state, [-1.0, 2.0], 0.0625, true)
 
-    _rhmc_test_state(state, expected)
-    @test Array(state.full_history[:, 1:4, 1]) ==
-          [-0.2 0.25 0.4 0.55; 0.6 -0.5 -0.3 -0.1]
-    @test Array(state.draws[:, 1:2]) == [1.0 -1.0; -1.0 2.0]
-    @test Array(state.history_counts[1:2]) == [4, 2]
+    _rhmc_test_statistics_receipt(state, receipt)
+    # Native parity is supplementary: the independent physical receipt above
+    # is the authority, so a same-engine bug cannot define expected behavior.
+    _rhmc_test_state(state, native_expected)
 
     # A too-small static bound is an observable compilation failure, not a
     # silently shortened source loop. The whole state rolls back atomically.
@@ -128,6 +162,20 @@ end
     initial = _rhmc_trace_state(ReactiveKernels._stateful_snapshot(fresh))
     compiled_bounded = @compile bounded(initial, reset_args...)
     output = compiled_bounded(initial, reset_args...)
+    @test Bool(_rhmc_host_value(output.control_overflow))
+    @test !Bool(_rhmc_host_value(output.returned))
+    _rhmc_test_state(output.state, ReactiveKernels._stateful_snapshot(fresh))
+
+    # Exercise the Reactant-specific dynamic-index helpers with an active OOB
+    # source read. It must report compiler overflow and roll back the whole
+    # transition instead of committing a clamped value.
+    short_position = _rhmc_trace_value([0.25])
+    full_gradient = _rhmc_trace_value([0.2, -0.4])
+    traced_potential = _rhmc_trace_value(0.15625)
+    compiled_oob = @compile reset(
+        initial, short_position, full_gradient, traced_potential)
+    output = compiled_oob(
+        initial, short_position, full_gradient, traced_potential)
     @test Bool(_rhmc_host_value(output.control_overflow))
     @test !Bool(_rhmc_host_value(output.returned))
     _rhmc_test_state(output.state, ReactiveKernels._stateful_snapshot(fresh))
