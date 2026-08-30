@@ -499,41 +499,31 @@ function _nr_finish(st)
 end
 
 function _nr_plan(skel)
-    irs = method_irs(skel); rec = defunctionalized_mids(irs)
-    by_mid = Dict(ir.id.decl => ir for ir in irs)
-    named = Dict(ir.id.name => ir.id.decl for ir in irs if ir.id.decl in rec)
+    generic = _control_program(skel; root_name=:step!)
+    named = Dict(name => mid for (mid, name) in generic.names)
     Set(keys(named)) == Set((:step!, :finish!, :start!)) || throw(ArgumentError(
         "compile_nuts_reactant supports the captured step!/finish!/start! NUTS CFG; got $(sort!(collect(keys(named))))"))
-    methods = sort!(collect(rec)); midpos = Dict(m => i for (i, m) in enumerate(methods))
-    entries = Dict{Int,Int}(); blocks = NamedTuple[]
+    methods = collect(generic.methods)
+    midpos = generic.midpos
+    entries = generic.entries
+    blocks = NamedTuple[]
     kinds = Dict(named[:step!] => :step, named[:finish!] => :finish, named[:start!] => :start)
-    built = Dict{Int,Any}()
-    for m in methods
-        c = build_method(by_mid[m], by_mid, rec); built[m] = c; entries[m] = c.entry
-    end
     expected = Dict(:step => 26, :finish => 15, :start => 15)
     for m in methods
-        c = built[m]; kind = kinds[m]
-        length(c.blks) == expected[kind] || throw(ArgumentError(
-            "compile_nuts_reactant rejects drifted $kind CFG: expected $(expected[kind]) blocks, got $(length(c.blks))"))
-        for b in sort(c.blks; by = x -> x.pc)
-            t = b.term
-            if t isa TRet
-                push!(blocks, (; mid=m, kind, pc=b.pc, tt=:ret, ta=0, tb=0, cm=0, ce=0, resume=0,
-                    mp=midpos[m], mpc=1))
-            elseif t isa TGoto
-                push!(blocks, (; mid=m, kind, pc=b.pc, tt=:goto, ta=t.pc, tb=0, cm=0, ce=0, resume=0,
-                    mp=midpos[m], mpc=1))
-            elseif t isa TBranch
-                push!(blocks, (; mid=m, kind, pc=b.pc, tt=:branch, ta=t.then_pc, tb=t.else_pc,
-                    cm=0, ce=0, resume=0, mp=midpos[m], mpc=1))
-            elseif t isa TCall
-                haskey(entries, t.callee_mid) || throw(ArgumentError("compile_nuts_reactant rejects an opaque CFG call"))
-                push!(blocks, (; mid=m, kind, pc=b.pc, tt=:call, ta=0, tb=0, cm=t.callee_mid,
-                    ce=entries[t.callee_mid], resume=t.resume_pc, mp=midpos[m], mpc=midpos[t.callee_mid]))
-            else
-                throw(ArgumentError("compile_nuts_reactant rejects terminator $(typeof(t))"))
-            end
+        kind = kinds[m]
+        count(b -> b.mid == m, generic.blocks) == expected[kind] || throw(ArgumentError(
+            "compile_nuts_reactant rejects drifted $kind CFG: expected $(expected[kind]) blocks, got " *
+            "$(count(b -> b.mid == m, generic.blocks))"))
+    end
+    for b in generic.blocks
+        kind = kinds[b.mid]
+        tt = b.term === :return ? :ret : b.term
+        push!(blocks, (; mid=b.mid, kind, pc=b.pc, tt,
+            ta=b.then_pc, tb=b.else_pc, cm=b.callee_mid,
+            ce=b.callee_entry, resume=b.resume_pc,
+            mp=b.midpos, mpc=b.callee_midpos))
+        if tt === :call && b.callee_mid == 0
+            throw(ArgumentError("compile_nuts_reactant rejects an opaque CFG call"))
         end
     end
     (; blocks=Tuple(blocks), methods=Tuple(methods), midpos, entries,
