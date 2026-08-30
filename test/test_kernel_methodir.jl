@@ -481,6 +481,14 @@ module _ProvAdv
     # `map` has only one admitted higher-order domain: exact map(copy, tuple-of-builtin-arrays).
     # This different `map(w, w)` shape is captured by identity but rejects at specialization.
     @kernel phigher(v, w) = begin; m!() = begin; v = map(w, w); end; end
+    # The two scalar helpers exercised by WALNUTS-D remain ordinary exact Base
+    # identities; neither is admitted by spelling or by a sampler-specific rule.
+    @kernel pscalar(v, n) = begin
+        s!() = begin
+            v = abs(v)
+            n = div(n, 2)
+        end
+    end
     # DEFAULT left-to-right: a later kw formal `zero` must NOT suppress capture of the pure `zero` in the
     # earlier `x` default (RK 06:28).
     @kernel pdefformal(v, w) = begin; m!(; x = zero(w), zero = 1) = begin; v = x; end; end
@@ -509,6 +517,7 @@ end
     @test !(RK._KERNEL_PURE_PRIMS isa Union{Base.IdSet,AbstractDict,AbstractSet})
     @test all(f -> RK._kernel_pure_primitive_value(f), RK._KERNEL_PURE_PRIMS)   # === scan, no membership struct
     @test RK._kernel_pure_primitive_value(Base.oftype) && RK._kernel_pure_primitive_value(map)
+    @test RK._kernel_pure_primitive_value(Base.abs) && RK._kernel_pure_primitive_value(Base.div)
     @test RK._kernel_pure_callee_domain_ok(
         map, (typeof(copy), Tuple{Vector{Float64},Vector{Float64}}))
     @test !RK._kernel_pure_callee_domain_ok(map, (typeof(identity), Tuple{Vector{Float64}}))
@@ -572,6 +581,11 @@ end
                           n.registration.source === Base.map, m)
     @test !_body_find(n -> n isa RK._CallableRef &&
                            n.registration.source === Base.copy, m)
+    scalar = _mir(_ProvAdv.pscalar, :s!)
+    @test _body_find(n -> n isa RK._RegisteredCall &&
+                          n.registration.source === Base.abs, scalar)
+    @test _body_find(n -> n isa RK._RegisteredCall &&
+                          n.registration.source === Base.div, scalar)
     # a LOCAL formal `oftype` never resolves to the Base pure primitive
     h = _mir(_ProvAdv.plocal, :h!)
     @test !_body_find(n -> n isa RK._RegisteredCall && n.registration.source === Base.oftype, h)
@@ -610,11 +624,27 @@ end
     # arithmetic/oftype/zero/one over numeric scalars + arrays; Colon over integers
     @test dok(mkpure(Base.:+), (Float64, Float64)) && dok(mkpure(Base.:+), (Vector{Float32}, Vector{Float32}))
     @test dok(mkpure(Base.oftype), (Float64, Float64)) && dok(mkpure(Base.:(:)), (Int, Int))
+    @test dok(mkpure(Base.abs), (Float16,)) && dok(mkpure(Base.abs), (Float32,)) &&
+          dok(mkpure(Base.abs), (Float64,))
+    @test dok(mkpure(Base.div), (Int, Int)) && dok(mkpure(Base.div), (Int32, Int32))
     # NEGATIVES: a custom container / number under the SAME generic identity REJECTS
     @test !dok(mkpure(Base.length), (_DomEvil.Mut,))
     @test !dok(mkpure(Base.:+), (_DomEvil.Mut, _DomEvil.Mut))
     @test !dok(mkpure(Base.:+), (_DomEvil.Imm, _DomEvil.Imm))        # user isbits<:Number still rejects
     @test !dok(mkpure(Base.:(:)), (Float64, Float64))                # Colon needs integers
+    @test !dok(mkpure(Base.abs), (Bool,))
+    @test !dok(mkpure(Base.abs), (Int,))
+    @test !dok(mkpure(Base.abs), (_DomEvil.Imm,))
+    @test !dok(mkpure(Base.abs), (ComplexF64,))
+    @test !dok(mkpure(Base.abs), (Rational{Int},))
+    @test !dok(mkpure(Base.abs), (Vector{Float64},))
+    @test !dok(mkpure(Base.div), (Bool, Bool))
+    @test !dok(mkpure(Base.div), (Float64, Float64))
+    @test !dok(mkpure(Base.div), (Int32, Int64))
+    @test !dok(mkpure(Base.div), (Vector{Int}, Vector{Int}))
+    @test !dok(mkpure(Base.div), (Complex{Int}, Complex{Int}))
+    @test !dok(mkpure(Base.div), (Rational{Int}, Rational{Int}))
+    @test !dok(mkpure(Base.div), (_DomEvil.UInt2, _DomEvil.UInt2))
     # RK 06:43b/06:44: recursively-safe concrete representation — a Base-owned numeric wrapper
     # parameterized by a USER type dispatches user code and REJECTS; a builtin-param wrapper is admitted.
     @test dok(mkpure(Base.:+), (Complex{Float64}, Complex{Float64}))

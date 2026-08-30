@@ -1270,7 +1270,9 @@ end
 abstract type _CanonOwned end
 abstract type _CanonShared end
 const _Canon = Union{_CanonOwned,_CanonShared}
-const _CANON_MAXN = 32
+# Keep the package-load, world-age-clean family generic and bounded, with
+# headroom for ordinary composed kernels wider than one machine word.
+const _CANON_MAXN = 64
 for N in 1:_CANON_MAXN
     tp = [Symbol(:F, i) for i in 1:N]
     flds = [:($(Symbol(:f, i))::$(Symbol(:F, i))) for i in 1:N]

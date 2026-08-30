@@ -893,9 +893,34 @@ end
         @test s2 isa RKS._CanonShared2 && RKS._canon_slot(s2, Val(1)) === nothing
         @test RKS._canon_owned_type(Val(5)) === RKS._CanonOwned5   # world-age-clean compile-time lookup
         @test RKS._canon_shared_type(Val(1)) === RKS._CanonShared1
+        # Generic composed states wider than the former 32-field ceiling and at the exact
+        # declared boundary remain package-load declared and type-stable. Both roles exercise
+        # multiword masks/currentness; nothing here is keyed to a sampler or field spelling.
+        wide33 = ntuple(i -> Float64(i), 33)
+        mask33 = RKS._owner_mask(33, [1, 33])
+        o33 = @inferred RKS._canon_construct(Val(:owned), wide33, mask33)
+        s33 = @inferred RKS._canon_construct(Val(:shared), wide33, mask33)
+        @test o33 isa RKS._CanonOwned33 && s33 isa RKS._CanonShared33
+        @test RKS._canon_slot(o33, Val(33)) == 33.0
+        @test RKS._canon_slot(s33, Val(33)) == 33.0
+        @test RKS._canon_current_mask(o33) == mask33 == RKS._canon_current_mask(s33)
+        @test RKS._canon_current(o33, Val(1)) && RKS._canon_current(o33, Val(33))
+        @test !RKS._canon_current(s33, Val(32)) && RKS._canon_current(s33, Val(33))
+
+        wide64 = ntuple(i -> Float64(i), RKS._CANON_MAXN)
+        mask64 = RKS._owner_mask(RKS._CANON_MAXN, [1, RKS._CANON_MAXN])
+        o64 = @inferred RKS._canon_construct(Val(:owned), wide64, mask64)
+        s64 = @inferred RKS._canon_construct(Val(:shared), wide64, mask64)
+        @test o64 isa RKS._CanonOwned64 && s64 isa RKS._CanonShared64
+        @test RKS._canon_slot(o64, Val(64)) == 64.0
+        @test RKS._canon_slot(s64, Val(64)) == 64.0
+        @test RKS._canon_current_mask(o64) == mask64 == RKS._canon_current_mask(s64)
+        @test RKS._canon_current(o64, Val(1)) && RKS._canon_current(o64, Val(64))
+        @test !RKS._canon_current(s64, Val(63)) && RKS._canon_current(s64, Val(64))
         # a layout wider than the predeclared family arity rejects deterministically
         wide = ntuple(i -> Float64(i), RKS._CANON_MAXN + 1)
         @test_throws RKS._KernelFactoryReject RKS._canon_construct(Val(:owned), wide, RKS._owner_mask(length(wide)))
+        @test_throws RKS._KernelFactoryReject RKS._canon_construct(Val(:shared), wide, RKS._owner_mask(length(wide)))
 
         # SCALAR-vs-BUFFER classification for poc expression emission (RK 05:30): from the concrete
         # field TYPE by Val index (literal fieldtype), NOT names — Int/Bool/Float scalars vs vectors.

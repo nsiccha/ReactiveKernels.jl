@@ -193,6 +193,18 @@ end
     @test dormant_result.state == dormant_state
     @test !dormant_result.control_overflow
 
+    zero_kernel = ReactiveKernels.compile_stateful(
+        _SFC.zero_argument_branch, true, 0)
+    zero_native = zero_kernel(true, 0)
+    @test ReactiveKernels.stateful_call(zero_native, Val(:step!))
+    @test ReactiveKernels.stateful_snapshot(zero_native).count == 1
+    zero_transition = ReactiveKernels.functionalize_stateful(
+        zero_kernel, Val(:step!); argument_types=Tuple{})
+    zero_result = zero_transition(
+        ReactiveKernels.stateful_snapshot(zero_kernel(true, 0)))
+    @test zero_result.returned && zero_result.result
+    @test zero_result.state.count == 1
+
     drift_kernel = ReactiveKernels.compile_stateful(_SFC.drift, 4.0, 0)
     drift = ReactiveKernels.functionalize_stateful(
         drift_kernel, Val(:step!); argument_types=Tuple{Bool})

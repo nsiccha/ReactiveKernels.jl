@@ -58,6 +58,13 @@ end
     end
 end
 
+@kernel zero_argument_branch(take=true, count=0) = begin
+    step!() = begin
+        take && (count += 1)
+        return take
+    end
+end
+
 @kernel small_loop(count=0) = begin
     step!(lo::Int8, hi::Int8) = begin
         lo <= hi || return false
