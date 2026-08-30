@@ -56,7 +56,7 @@ jobs:
       # upstream precompile regression returns, it fails here directly without
       # changing the full suite's execution model.
       - name: Precompile and load ReactiveKernels
-        run: julia --startup-file=no --compiled-modules=yes --project -e 'using Pkg; Pkg.instantiate(); Pkg.precompile(; strict=true); using ReactiveKernels'
+        run: julia --startup-file=no --compiled-modules=yes --project=@stdlib -e 'using Pkg; Pkg.activate(pwd()); Pkg.instantiate(); Pkg.precompile(; strict=true); using ReactiveKernels'
 
   nonallocating-integration:
     runs-on: ubuntu-latest
