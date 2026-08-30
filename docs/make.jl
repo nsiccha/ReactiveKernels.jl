@@ -21,6 +21,15 @@ import .NutpieDiagonalAdaptationExample
 # GitHub Pages build instead of publishing a stale code listing.
 include(joinpath(@__DIR__, "..", "benchmark", "walnuts_kernel_authoring_fixture.jl"))
 
+# Load the accepted ReactiveHMC compiler-corpus authorities themselves. The
+# corpus page extracts source from these exact files and inspects their captured
+# MethodIR; malformed or rejected source therefore fails the docs build.
+include(joinpath(@__DIR__, "..", "benchmark", "reactivehmc_algorithm_corpus.jl"))
+include(joinpath(@__DIR__, "..", "benchmark", "reactivehmc_rke_kernel_fixture.jl"))
+include(joinpath(@__DIR__, "..", "benchmark", "reactivehmc_integrator_kernel_fixture.jl"))
+include(joinpath(@__DIR__, "..", "benchmark", "reactivehmc_statistics_kernel_fixture.jl"))
+include(joinpath(@__DIR__, "..", "benchmark", "reactivehmc_hmc_kernel_fixture.jl"))
+
 include("kernel_examples.jl")
 Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "result_views.jl"))
 include("check_rendered.jl")
@@ -46,6 +55,7 @@ site_pages = [
     ],
     "Sampling" => [
         "Pathfinder approximation" => "pathfinder.md",
+        "ReactiveHMC kernel corpus" => "reactivehmc-corpus.md",
         "NUTS sampling" => "nuts.md",
         "Nutpie diagonal adaptation" => "nutpie-diagonal.md",
         "WALNUTS-D mathematical kernel" => "walnuts.md",
@@ -80,6 +90,7 @@ makedocs(
 # A successful build must have executed and rendered every PPL walkthrough
 # exactly once. This catches an omitted page/block even when no eval error fires.
 ReactiveKernelsDocs.assert_ppl_examples_executed!()
+ReactiveKernelsDocs.assert_reactivehmc_docs_executed!()
 
 # Ensure a root index.html redirect exists
 let redirect = joinpath(@__DIR__, "build", "index.html")

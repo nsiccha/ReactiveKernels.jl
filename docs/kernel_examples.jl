@@ -862,12 +862,299 @@ end
 
 # Benchmark and result rendering lives in result_views.jl.
 
-# The NUTS `@kernel` authoring surface is embedded STATICALLY in docs/src/nuts.md as a plain ```julia
-# fenced block (the exact bytes of benchmark/nuts_kernel_authoring_fixture.jl). It is intentionally NOT
-# rendered by a build-time `@eval` here: it is a deliberately static publication
-# surface, byte-locked LOUDLY to benchmark/nuts_kernel_authoring_fixture.jl by
-# test/test_nuts_docs_fixture.jl. PPL walkthrough panels use the separate
-# build-execution gate above, and `eval_block` errors are fatal in docs/make.jl.
+# The complete NUTS authoring surface is read from its fixture at docs build
+# time. This keeps the public code listing on the same source authority as the
+# compiler tests; `eval_block` failures are fatal in docs/make.jl.
+function _nuts_fixture_source()
+    path = joinpath(pkgdir(ReactiveKernels), "benchmark",
+                    "nuts_kernel_authoring_fixture.jl")
+    isfile(path) || error("NUTS authoring fixture is missing: $path")
+    source = replace(read(path, String), "\r\n" => "\n", "\r" => "\n")
+    expected = (
+        :euclidean_phasepoint, :leapfrog!, :refresh_momentum!!, :nuts_stats!,
+        :nuts_state, :nuts!!, :dual_averaging_state, :welford_var,
+    )
+    for name in expected
+        marker = "@kernel $(name)("
+        count = length(split(source, marker)) - 1
+        count == 1 || error(
+            "NUTS fixture must contain $marker exactly once; found $count",
+        )
+    end
+    rstrip(source)
+end
+
+render_nuts_complete_source() =
+    Markdown.MD(Any[Markdown.Code("julia", _nuts_fixture_source())])
+
+# --- ReactiveHMC compiler-corpus transparency ------------------------------
+
+const EXPECTED_REACTIVEHMC_DOC_EXAMPLES = (
+    :euclidean_phasepoint,
+    :relativistic_euclidean_phasepoint,
+    :riemannian_phasepoint,
+    :relativistic_riemannian_phasepoint,
+    :riemannian_softabs_phasepoint,
+    :relativistic_riemannian_softabs_phasepoint,
+    :relativistic_kinetic_energy,
+    :generalized_leapfrog,
+    :implicit_midpoint,
+    :statistics_state,
+    :fixed_step_hmc,
+)
+const _REACTIVEHMC_DOC_EXECUTION_COUNTS =
+    Dict(name => 0 for name in EXPECTED_REACTIVEHMC_DOC_EXAMPLES)
+
+function _record_reactivehmc_docs_execution!(name::Symbol)
+    haskey(_REACTIVEHMC_DOC_EXECUTION_COUNTS, name) ||
+        error("unexpected ReactiveHMC docs example: $name")
+    _REACTIVEHMC_DOC_EXECUTION_COUNTS[name] += 1
+    nothing
+end
+
+function assert_reactivehmc_docs_executed!()
+    failures = String[]
+    for name in EXPECTED_REACTIVEHMC_DOC_EXAMPLES
+        count = _REACTIVEHMC_DOC_EXECUTION_COUNTS[name]
+        count == 1 ||
+            push!(failures, "$name executed $count times (expected exactly once)")
+    end
+    isempty(failures) || error(
+        "ReactiveHMC documentation execution gate failed:\n" *
+        join(failures, "\n"),
+    )
+    nothing
+end
+
+function _normalized_source(path::AbstractString)
+    isfile(path) || error("docs source authority is missing: $path")
+    replace(read(path, String), "\r\n" => "\n", "\r" => "\n")
+end
+
+function _phasepoint_authored_sources()
+    path = joinpath(
+        pkgdir(ReactiveKernelsCompatibilityExamples), "src",
+        "preexisting_reactivehmc.jl",
+    )
+    source = _normalized_source(path)
+    euclidean_owner = _source_between(
+        source,
+        "function euclidean_phasepoint_kernels(",
+        "function riemannian_phasepoint_kernels(",
+    )
+    riemannian_owner = _source_between(
+        source,
+        "function riemannian_phasepoint_kernels(",
+        "function _softabs_jacobian(",
+    )
+    softabs_owner = _source_between(
+        source,
+        "function softabs_phasepoint_kernels(",
+        "function leapfrog!(",
+    )
+    (;
+        path,
+        euclidean = _source_between(
+            euclidean_owner, "    @kernel spec(", "\n    dpos_kernel =",
+        ),
+        riemannian = _source_between(
+            riemannian_owner, "    @kernel spec(", "\n    geometry_kernel =",
+        ),
+        softabs = _source_between(
+            softabs_owner, "    @kernel spec(", "\n    geometry_kernel =",
+        ),
+    )
+end
+
+function render_reactivehmc_phasepoints()
+    artifacts = ReactiveKernelsCompatibilityExamples.CompatibilityArtifacts.reactivehmc_artifacts()
+    expected = EXPECTED_REACTIVEHMC_DOC_EXAMPLES[1:6]
+    length(artifacts) >= length(expected) ||
+        error("ReactiveHMC phasepoint artifacts are incomplete")
+    Tuple(a.name for a in artifacts[1:6]) == expected ||
+        error("ReactiveHMC phasepoint artifact order changed")
+
+    authority = _phasepoint_authored_sources()
+    variants = (
+        (:gaussian, authority.euclidean),
+        (:relativistic, authority.euclidean),
+        (:gaussian, authority.riemannian),
+        (:relativistic, authority.riemannian),
+        (:gaussian, authority.softabs),
+        (:relativistic, authority.softabs),
+    )
+    origin = relpath(authority.path, pkgdir(ReactiveKernels))
+    rendered = map(artifacts[1:6], variants) do artifact, variant
+        kinetic, source = variant
+        _record_reactivehmc_docs_execution!(artifact.name)
+        (;
+            name = artifact.name,
+            origin = string(origin, " · kinetic = Val(:", kinetic, ")"),
+            source,
+            inputs = artifact.inputs,
+            kernel = artifact.kernel,
+            output = artifact.output,
+            generated = artifact.generated,
+            dag = artifact.dag,
+        )
+    end
+    render_examples(rendered)
+end
+
+function _methodir_capture(skeleton)
+    registration = kernel_registration(skeleton)
+    irs = method_irs(skeleton)
+    !isempty(irs) || error("captured docs kernel has no MethodIR")
+    all(ir -> ir.ok, irs) || error(
+        "captured docs kernel contains rejected MethodIR: " *
+        join((string(ir.id.name, ": ", ir.reason) for ir in irs if !ir.ok), "; "),
+    )
+    registration_view = (;
+        kind = registration.kind,
+        subject = hasproperty(registration, :subject) ? registration.subject : nothing,
+        write_roots = hasproperty(registration, :write_roots) ?
+            registration.write_roots : (),
+        read_roots = hasproperty(registration, :read_roots) ?
+            registration.read_roots : (),
+    )
+    methods = Tuple((;
+        name = ir.id.name,
+        control = ir.control,
+        kind = ir.kind,
+        formals = Tuple((;
+            name = formal.name,
+            kind = formal.kind,
+            required = formal.required,
+        ) for formal in ir.formals),
+        effects = ir.effects,
+    ) for ir in irs)
+    _plain_repr((;
+        registration = registration_view,
+        ports = kernel_port_names(skeleton),
+        methods,
+    ))
+end
+
+function _captured_source_block!(blocks, name::Symbol, title::AbstractString,
+                                 origin::AbstractString, source::AbstractString,
+                                 skeleton)
+    _record_reactivehmc_docs_execution!(name)
+    capture = _methodir_capture(skeleton)
+    push!(blocks, RawHTML("""
+<article class="rk-source-example" data-rk-source-authority="$(name)">
+<h3>$(title)</h3>
+<p><strong>Source authority:</strong> <code>$(origin)</code></p>
+<h4>Authored source</h4>
+"""))
+    push!(blocks, Markdown.Code("julia", source))
+    push!(blocks, RawHTML("<h4>Compiler-captured MethodIR contract</h4>"))
+    push!(blocks, Markdown.Code("julia", capture))
+    push!(blocks, RawHTML("</article>"))
+    blocks
+end
+
+function _reactivehmc_fixture_path(file::AbstractString)
+    joinpath(pkgdir(ReactiveKernels), "benchmark", file)
+end
+
+function render_reactivehmc_captured_sources(section::Symbol)
+    blocks = Any[]
+    if section === :rke
+        path = _reactivehmc_fixture_path("reactivehmc_rke_kernel_fixture.jl")
+        source = _normalized_source(path)
+        snippet = _source_between(
+            source, "@kernel rke(", "\n\nend # module ReactiveHMCRKEFixture",
+        )
+        _captured_source_block!(
+            blocks, :relativistic_kinetic_energy,
+            "Relativistic kinetic energy", relpath(path, pkgdir(ReactiveKernels)),
+            snippet, Main.ReactiveHMCRKEFixture.rke,
+        )
+    elseif section === :integrators
+        path = _reactivehmc_fixture_path(
+            "reactivehmc_integrator_kernel_fixture.jl",
+        )
+        source = _normalized_source(path)
+        generalized = _source_between(
+            source, "@kernel generalized_leapfrog!(", "@kernel implicit_midpoint!(",
+        )
+        midpoint = _source_between(
+            source, "@kernel implicit_midpoint!(", "\n\nmultistep(",
+        )
+        origin = relpath(path, pkgdir(ReactiveKernels))
+        _captured_source_block!(
+            blocks, :generalized_leapfrog, "Generalized leapfrog",
+            origin, generalized,
+            Main.ReactiveHMCIntegratorFixture.generalized_leapfrog!,
+        )
+        _captured_source_block!(
+            blocks, :implicit_midpoint, "Implicit midpoint",
+            origin, midpoint,
+            Main.ReactiveHMCIntegratorFixture.implicit_midpoint!,
+        )
+    elseif section === :statistics
+        path = _reactivehmc_fixture_path(
+            "reactivehmc_statistics_kernel_fixture.jl",
+        )
+        source = _normalized_source(path)
+        snippet = _source_between(
+            source, "@kernel statistics_state(",
+            "\n\nfunction initial_statistics_sources(",
+        )
+        _captured_source_block!(
+            blocks, :statistics_state,
+            "Trajectory and sampling statistics",
+            relpath(path, pkgdir(ReactiveKernels)), snippet,
+            Main.ReactiveHMCStatisticsFixture.statistics_state,
+        )
+    elseif section === :hmc
+        path = _reactivehmc_fixture_path("reactivehmc_hmc_kernel_fixture.jl")
+        source = _normalized_source(path)
+        snippet = _source_between(
+            source, "@kernel hmc_state(",
+            "\n\nend # module ReactiveHMCHMCFixture",
+        )
+        _captured_source_block!(
+            blocks, :fixed_step_hmc, "Fixed-step HMC",
+            relpath(path, pkgdir(ReactiveKernels)), snippet,
+            Main.ReactiveHMCHMCFixture.hmc_state,
+        )
+    else
+        error("unknown ReactiveHMC docs section: $section")
+    end
+    Markdown.MD(blocks)
+end
+
+_html_escape(value) = replace(
+    string(value), '&' => "&amp;", '<' => "&lt;", '>' => "&gt;",
+    '"' => "&quot;",
+)
+
+function render_reactivehmc_inventory()
+    isdefined(Main, :ReactiveHMCAlgorithmCorpus) ||
+        error("ReactiveHMC algorithm corpus was not loaded by docs/make.jl")
+    corpus = Main.ReactiveHMCAlgorithmCorpus
+    entries = corpus.CORPUS
+    length(entries) == 17 ||
+        error("ReactiveHMC docs inventory expected 17 entries; found $(length(entries))")
+    io = IOBuffer()
+    print(io, """<div class="rk-corpus-inventory">""")
+    for entry in entries
+        sources = join(entry.current_reactive_sources, ", ")
+        capabilities = join(string.(entry.capabilities), ", ")
+        print(io, """
+<article data-rk-corpus-id="$(_html_escape(entry.id))">
+<h3><code>$(_html_escape(entry.id))</code></h3>
+<p><strong>Family:</strong> $(_html_escape(entry.family))</p>
+<p><strong>Pinned upstream:</strong> <code>$(_html_escape(entry.upstream.file)):$(_html_escape(entry.upstream.lines))</code></p>
+<p><strong>RK source authority:</strong> <code>$(_html_escape(sources))</code></p>
+<p><strong>Acceptance boundary:</strong> $(_html_escape(entry.minimum_acceptance)); $(_html_escape(capabilities))</p>
+</article>
+""")
+    end
+    print(io, "</div>")
+    Markdown.MD(Any[RawHTML(String(take!(io)))])
+end
 
 # WALNUTS-D is a smaller external compiler fixture whose page emphasizes a few
 # mathematical/control slices and still offers its complete source.  Read those
