@@ -1,0 +1,66 @@
+schema = "reactivehmc-hmc-ca9-v1"
+
+[pins]
+reactivehmc_revision = "ca9ea4ca41924bb0e1fadc01c717e1333916aba6"
+hmc_sha256 = "5d341facd929201ada08800e8d0194ec187f637ae036dd448461022a2bb577ea"
+julia_version = "1.10.11"
+
+[[cases]]
+name = "accepted"
+stepsize = 0.25
+n_steps = 3
+min_dham = -1000.0
+initial_position = [0.1, -0.2]
+normal_draw = [0.3, -0.4]
+exponential_draws = [0.5]
+normal_calls = 1
+exponential_calls = 1
+energy_errors = [-0.0005142974853515614, -0.001098105013370515, -0.0016077512002084515]
+init_pos = [0.27957763671875, -0.4214599609375]
+init_mom = [0.15133209228515626, -0.15659484863281245]
+init_ham = 0.15160775120020845
+fwd_pos = [0.27957763671875, -0.4214599609375]
+fwd_mom = [0.15133209228515626, -0.15659484863281245]
+fwd_ham = 0.15160775120020845
+dham = -0.0016077512002084515
+diverged = false
+
+[[cases]]
+name = "rejected"
+stepsize = 1.25
+n_steps = 2
+min_dham = -1000.0
+initial_position = [0.1, -0.2]
+normal_draw = [1.2, -0.8]
+exponential_draws = [0.01]
+normal_calls = 1
+exponential_calls = 1
+energy_errors = [-0.6553745269775391, -0.06562832742929481]
+init_pos = [0.1, -0.2]
+init_mom = [1.2, -0.8]
+init_ham = 1.065
+fwd_pos = [0.5658203125000001, -0.25664062499999996]
+fwd_mom = [-1.1184814453125, 0.790087890625]
+fwd_ham = 1.1306283274292948
+dham = -0.06562832742929481
+diverged = false
+
+[[cases]]
+name = "diverged"
+stepsize = 2.0
+n_steps = 3
+min_dham = -0.1
+initial_position = [0.1, -0.2]
+normal_draw = [1.2, -0.8]
+exponential_draws = []
+normal_calls = 1
+exponential_calls = 0
+energy_errors = [-3.6]
+init_pos = [0.1, -0.2]
+init_mom = [1.2, -0.8]
+init_ham = 1.065
+fwd_pos = [2.3, -1.4000000000000001]
+fwd_mom = [-1.2, 0.8]
+fwd_ham = 4.665
+dham = -3.6
+diverged = true
