@@ -316,27 +316,21 @@ function _source_between(source::AbstractString, start_marker::AbstractString,
 end
 
 """
-    render_online_stats_reactive_source(which) -> Markdown.MD
+    render_online_stats_welford_source() -> Markdown.MD
 
-Render the exact build-loaded `@reactive` definition from
-`examples/online_stats.jl`. The page therefore cannot drift from the executable
-stateful moments/diagnostics authoring it describes.
+Render the exact build-loaded, method-bearing `@kernel welford_var` definition
+from `examples/online_stats.jl`. The page therefore cannot drift from the
+executable ReactiveHMC-shaped source it describes.
 """
-function render_online_stats_reactive_source(which::Symbol)
+function render_online_stats_welford_source()
     path = joinpath(pkgdir(ReactiveKernels), "examples", "online_stats.jl")
     source = read(path, String)
-    start_marker, stop_marker = if which === :moments
-        ("@reactive specialize=true _online_moments_state(",
-         "# -- END DOCS: stateful online moments --")
-    elseif which === :diagnostics
-        ("@reactive specialize=true _online_diagnostics_state(",
-         "# -- END DOCS: stateful HMC diagnostics --")
-    else
-        throw(ArgumentError(
-            "online-statistics source must be :moments or :diagnostics"))
-    end
     Markdown.MD(Any[Markdown.Code(
-        "julia", _source_between(source, start_marker, stop_marker))])
+        "julia", _source_between(
+            source,
+            "@kernel welford_var(template::AbstractVector)",
+            "# -- END DOCS: ReactiveHMC Welford @kernel --",
+        ))])
 end
 
 function _nutpie_kernel_sources()

@@ -36,6 +36,13 @@ using TOML
     end
 
     @test isdefined(ReactiveKernels, Symbol("@node"))
+    @test isdefined(ReactiveKernels, Symbol("@kernel"))
+    retired_object_macro = Symbol("@", "reactive")
+    @test !isdefined(ReactiveKernels, retired_object_macro)
+    @test retired_object_macro ∉ names(ReactiveKernels, all = true)
+    retired_object_type = Symbol("Reactive", "Object")
+    @test !isdefined(ReactiveKernels, retired_object_type)
+    @test retired_object_type ∉ names(ReactiveKernels, all = true)
     @test :partial in names(ReactiveKernels)
     @test :reactive_program in names(ReactiveKernels)
 

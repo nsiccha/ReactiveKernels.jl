@@ -774,13 +774,13 @@ end
         step_f = partial(leapfrog!; stepsize = 0.2, bogus = true))
 end
 
-@testset "reactive_nuts_group authored via @reactive — actual-group regressions" begin
+@testset "reactive_nuts_group explicit prepared graph — actual-group regressions" begin
     D = 4
     metric = Matrix{Float64}(I, D, D)
     grp = reactive_nuts_group(_std_pot_grad!, metric, _det_pos(D), _det_mom(D))
 
-    # The group is the public @reactive object; reactive_program is its authored program.
-    @test grp isa ReactiveKernels.ReactiveObject
+    # The external comparison group is an explicit prepared phase point.
+    @test grp isa ReactiveKernels.ReactivePhasePoint
     @test reactive_program(grp) === grp.state.program
     @test reactive_program(grp) isa ReactiveKernels.ReactiveProgram
     # No hot slot is Ref{Any} (concrete state/getter/slots).
@@ -825,18 +825,14 @@ end
     @test @allocated(_lf!(g1, 1000)) == 0
 end
 
-@testset "reactive_nuts_group no longer constructs a Graph (source check)" begin
+@testset "reactive_nuts_group has no second public authoring macro" begin
     src = read(joinpath(@__DIR__, "..", "examples", "nuts_runtime", "reactive_nuts.jl"), String)
-    # The construction path is the @reactive-authored object + a delegating wrapper.
-    @test occursin("@reactive specialize=true prepare=_nuts_prepare\n" *
-                   "        _reactive_nuts_group_object", src) ||
-          occursin("@reactive specialize=true prepare=_nuts_prepare _reactive_nuts_group_object", src)
-    # The reactive_nuts_group WRAPPER delegates and never builds a Graph directly.
+    @test !occursin("@" * "reactive", src)
+    # The legacy comparison path is explicit low-level graph construction.
     wrapper = match(r"function reactive_nuts_group\(.*?\n(.*?)\nend"s, src)
     @test wrapper !== nothing
     body = wrapper.captures[1]
-    @test occursin("_reactive_nuts_group_object", body)
-    @test !occursin("Graph()", body)
-    @test !occursin("value!(", body)
-    @test !occursin("add!(", body)
+    @test occursin("Graph()", body)
+    @test occursin("value!(", body)
+    @test occursin("add!(", body)
 end

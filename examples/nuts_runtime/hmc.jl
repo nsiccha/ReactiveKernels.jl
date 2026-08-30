@@ -718,7 +718,7 @@ end
 
 "Mutable Nesterov dual-averaging state matching ReactiveHMC's adaptation rule."
 # The Nesterov dual-averaging step-size adaptation is a public compiled-reactive
-# object authored through `@reactive specialize=true` — see
+# object stored in compiled reactive state — see
 # `src/reactive_nuts.jl` (`dual_averaging_state`, `fit!`). Its accumulators are
 # mutable HAVE sources and the current/final step sizes are reactive derived nodes,
 # generic over the step-size precision; there is no ordinary mutable shadow struct.
@@ -727,7 +727,7 @@ end
 _smooth(previous, new, weight) = (1 - weight) * previous + weight * new
 
 # The online Welford variance estimate is a public compiled-reactive object
-# authored through `@reactive specialize=true` — see `src/reactive_nuts.jl`
+# stored in compiled reactive state — see `reactive_nuts.jl`
 # (`WelfordVariance`, `welford_var`). Its n/mean/var accumulators are the reactive
 # object's mutable HAVE sources; `step!` mutates them in place. There is no ordinary
 # mutable shadow struct.
@@ -963,6 +963,6 @@ end
 
 
 # TrajectoryStats and SamplingStats — the optional trajectory/sampling recorders —
-# are public compiled-reactive objects authored through @reactive specialize=true;
+# are public wrappers over compiled reactive state;
 # see `src/reactive_nuts.jl`. Their authoritative buffers/counters/history live only
 # in the wrapped reactive object; there are no ordinary mutable shadow structs.

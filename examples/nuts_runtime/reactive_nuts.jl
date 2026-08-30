@@ -21,10 +21,10 @@
 # `copyto!` deep-copy the buffers and distinct proposals never alias — the property
 # a caller-shared or program-level buffer would violate.
 #
-# The group is authored through the PUBLIC `@reactive` facade (per-construction
-# `specialize=true` + `prepare=_nuts_prepare`), so it is a `ReactiveObject` whose
-# every node is reachable as a property; there is no hand-built Graph. It is
-# AD-agnostic: `potential_gradient!(gradient, position) -> potential` is the
+# The group is built as an explicitly prepared `ReactiveProgram`. The package's
+# only public authoring macro is `@kernel`; this legacy comparison path therefore
+# uses the low-level graph API instead of carrying a second object-authoring macro.
+# It is AD-agnostic: `potential_gradient!(gradient, position) -> potential` is the
 # caller-supplied scalar-potential boundary that fills the passed (slot-owned)
 # gradient buffer in place — the DI+Enzyme `value_and_gradient!` is wired in at the
 # call site with no shared caller buffer.
@@ -61,7 +61,7 @@ end
 # used on the first evaluation and in the pure program — allocates a fresh bundle,
 # while the in-place `cache_apply` methods below reuse the slot bundle's buffer.
 # `potential_gradient!(gradient, position) -> potential` is a HAVE source read by the
-# gradient bundle recipe (so the authored @reactive group can take it as a port).
+# gradient bundle recipe (so the explicit group can take it as a port).
 @inline function _grad_bundle(potential_gradient!, position)
     gradient = similar(position)
     value = potential_gradient!(gradient, position)
@@ -93,13 +93,6 @@ end
     cache
 end
 @inline _nuts_cache_apply(cache, op, args...) = op(args...)
-
-# The injected `prepare=` callable for the authored @reactive NUTS group: the owned
-# bundle recipes reuse their per-slot buffer in place through the MutatingFunctions-
-# agnostic cache hook; all other recipes stay on the pure branch.
-_nuts_prepare(spec; want) = _prepare_reactive(
-    spec; want = want, cache_apply = _nuts_cache_apply,
-    is_mutating = _nuts_is_mutating)
 
 # Route ONLY the two owned bundle recipes through the in-place hook; the scalar and
 # borrowed-vector projections stay on the pure (allocation-free) branch.
@@ -138,89 +131,115 @@ end
 @inline _energy_error(init_ham, active_ham) = _finite_or_neginf(init_ham - active_ham)
 @inline _is_divergent(energy_error, threshold) = !(energy_error >= threshold)
 
-# The flat compiled-reactive NUTS phase-point group, authored through the PUBLIC
-# `@reactive` surface (per-construction specialize=true so it is generic over the
-# closure/precision/metric-storage; prepare=_nuts_prepare so each endpoint's owned
-# value/gradient + kinetic bundles reuse their per-slot buffer in place). Runtime-
-# derived annotations (`typeof`/`eltype`) keep every hot slot concrete. The three
-# endpoints are written out (the facade has no loop form); they differ only by
-# their HAVE sources. Exposed field names match the previous hand-built group
-# exactly, so `CompiledNUTSState` consumes it unchanged.
-@reactive specialize=true prepare=_nuts_prepare _reactive_nuts_group_object(
-        potential_gradient!, metric, gofwd, min_dham,
-        may_sample, may_continue, depth, n_steps, acceptance_sum,
-        last_energy_error, last_diverged,
-        init_pos, init_mom, fwd_pos, fwd_mom, bwd_pos, bwd_mom) = begin
-    # gofwd + the sampler control/diagnostic fields are public reactive HAVE sources
-    # on this group — the CompiledNUTSState transition reads/writes them here rather
-    # than in ordinary mutable struct fields (GAP-1d). `last_energy_error`/
-    # `last_diverged` are per-transition DIAGNOSTIC SNAPSHOTS assigned from the
-    # consumed live `dham`/`diverged`; the live derived `dham`/`diverged` stay the
-    # reactive computation used for acceptance/divergence (restore may legitimately
-    # change live dham, which must NOT retroactively rewrite the snapshot).
-    chol_metric::typeof(cholesky(metric)) = cholesky(metric)
-
-    init_valgrad::_ValueGradient{eltype(init_pos),typeof(init_pos)} =
-        _grad_bundle(potential_gradient!, init_pos)
-    init_pot::eltype(init_pos) = _vg_value(init_valgrad)
-    init_dpot_dpos::typeof(init_pos) = _vg_gradient(init_valgrad)
-    init_kinetic::_Kinetic{eltype(init_pos),typeof(init_pos)} =
-        _kin_bundle(chol_metric, init_mom)
-    init_kin::eltype(init_pos) = _kn_kinetic(init_kinetic)
-    init_dham_dmom::typeof(init_pos) = _kn_velocity(init_kinetic)
-    init_ham::eltype(init_pos) = init_pot + init_kin
-
-    fwd_valgrad::_ValueGradient{eltype(fwd_pos),typeof(fwd_pos)} =
-        _grad_bundle(potential_gradient!, fwd_pos)
-    fwd_pot::eltype(fwd_pos) = _vg_value(fwd_valgrad)
-    fwd_dpot_dpos::typeof(fwd_pos) = _vg_gradient(fwd_valgrad)
-    fwd_kinetic::_Kinetic{eltype(fwd_pos),typeof(fwd_pos)} =
-        _kin_bundle(chol_metric, fwd_mom)
-    fwd_kin::eltype(fwd_pos) = _kn_kinetic(fwd_kinetic)
-    fwd_dham_dmom::typeof(fwd_pos) = _kn_velocity(fwd_kinetic)
-    fwd_ham::eltype(fwd_pos) = fwd_pot + fwd_kin
-
-    bwd_valgrad::_ValueGradient{eltype(bwd_pos),typeof(bwd_pos)} =
-        _grad_bundle(potential_gradient!, bwd_pos)
-    bwd_pot::eltype(bwd_pos) = _vg_value(bwd_valgrad)
-    bwd_dpot_dpos::typeof(bwd_pos) = _vg_gradient(bwd_valgrad)
-    bwd_kinetic::_Kinetic{eltype(bwd_pos),typeof(bwd_pos)} =
-        _kin_bundle(chol_metric, bwd_mom)
-    bwd_kin::eltype(bwd_pos) = _kn_kinetic(bwd_kinetic)
-    bwd_dham_dmom::typeof(bwd_pos) = _kn_velocity(bwd_kinetic)
-    bwd_ham::eltype(bwd_pos) = bwd_pot + bwd_kin
-
-    active_ham::eltype(init_pos) = _active_select(gofwd, fwd_ham, bwd_ham)
-    dham::eltype(init_pos) = _energy_error(init_ham, active_ham)
-    diverged::Bool = _is_divergent(dham, min_dham)
-end
-
 """
     reactive_nuts_group(potential_gradient!, metric, position, momentum;
                         gofwd = true, min_dham = -1000.0)
 
-Build the flat compiled-reactive NUTS phase-point group (a
-[`ReactiveObject`](@ref) authored through the public `@reactive` surface). All
-three endpoints (`init`, `fwd`, `bwd`) are initialized from `(position, momentum)`;
-each is given its OWN copy so the endpoints never alias.
+Build the flat compiled-reactive NUTS phase-point group. All three endpoints
+(`init`, `fwd`, `bwd`) are initialized from `(position, momentum)`; each is given
+its own copy so the endpoints never alias. This external comparison path uses an
+explicit `Graph`/`ReactiveProgram`; stateful public authoring uses `@kernel`.
 """
 function reactive_nuts_group(potential_gradient!, metric, position, momentum;
                              gofwd::Bool = true,
                              min_dham::Real = _REACTIVE_NUTS_DEFAULT_MIN_DHAM)
     scalar = eltype(position)
     threshold = convert(scalar, min_dham)
-    _reactive_nuts_group_object(
+    chol0 = cholesky(metric)
+    gradient0 = _grad_bundle(potential_gradient!, position)
+    kinetic0 = _kin_bundle(chol0, momentum)
+    ham0 = gradient0.value + kinetic0.kinetic
+
+    graph = Graph()
+    potential_gradient_value = value!(graph, :potential_gradient!, typeof(potential_gradient!))
+    metric_value = value!(graph, :metric, typeof(metric))
+    gofwd_value = value!(graph, :gofwd, Bool)
+    min_dham_value = value!(graph, :min_dham, typeof(threshold))
+    may_sample = value!(graph, :may_sample, Bool)
+    may_continue = value!(graph, :may_continue, Bool)
+    depth = value!(graph, :depth, Int)
+    n_steps = value!(graph, :n_steps, Int)
+    acceptance_sum = value!(graph, :acceptance_sum, scalar)
+    last_energy_error = value!(graph, :last_energy_error, scalar)
+    last_diverged = value!(graph, :last_diverged, Bool)
+    chol = value!(graph, :chol_metric, typeof(chol0))
+    add!(graph, metric_value => chol, cholesky)
+
+    ports = Dict{Symbol,Any}()
+    for endpoint in _REACTIVE_NUTS_ENDPOINTS
+        pos = ports[Symbol(endpoint, :_pos)] =
+            value!(graph, Symbol(endpoint, :_pos), typeof(position))
+        mom = ports[Symbol(endpoint, :_mom)] =
+            value!(graph, Symbol(endpoint, :_mom), typeof(momentum))
+        valgrad = ports[Symbol(endpoint, :_valgrad)] =
+            value!(graph, Symbol(endpoint, :_valgrad), typeof(gradient0))
+        pot = ports[Symbol(endpoint, :_pot)] =
+            value!(graph, Symbol(endpoint, :_pot), typeof(gradient0.value))
+        dpot = ports[Symbol(endpoint, :_dpot_dpos)] =
+            value!(graph, Symbol(endpoint, :_dpot_dpos), typeof(gradient0.gradient))
+        kinetic = ports[Symbol(endpoint, :_kinetic)] =
+            value!(graph, Symbol(endpoint, :_kinetic), typeof(kinetic0))
+        kin = ports[Symbol(endpoint, :_kin)] =
+            value!(graph, Symbol(endpoint, :_kin), typeof(kinetic0.kinetic))
+        dmom = ports[Symbol(endpoint, :_dham_dmom)] =
+            value!(graph, Symbol(endpoint, :_dham_dmom), typeof(kinetic0.velocity))
+        ham = ports[Symbol(endpoint, :_ham)] =
+            value!(graph, Symbol(endpoint, :_ham), typeof(ham0))
+        add!(graph, (potential_gradient_value, pos) => valgrad, _grad_bundle)
+        add!(graph, valgrad => pot, _vg_value)
+        add!(graph, valgrad => dpot, _vg_gradient)
+        add!(graph, (chol, mom) => kinetic, _kin_bundle)
+        add!(graph, kinetic => kin, _kn_kinetic)
+        add!(graph, kinetic => dmom, _kn_velocity)
+        add!(graph, (pot, kin) => ham, +)
+    end
+
+    active_ham = value!(graph, :active_ham, typeof(ham0))
+    add!(graph, (gofwd_value, ports[:fwd_ham], ports[:bwd_ham]) => active_ham,
+         _active_select)
+    dham = value!(graph, :dham, typeof(ham0))
+    add!(graph, (ports[:init_ham], active_ham) => dham, _energy_error)
+    diverged = value!(graph, :diverged, Bool)
+    add!(graph, (dham, min_dham_value) => diverged, _is_divergent)
+
+    controls = (may_sample, may_continue, depth, n_steps, acceptance_sum,
+                last_energy_error, last_diverged)
+    haves = (potential_gradient_value, metric_value, gofwd_value, min_dham_value,
+             controls...,
+             ports[:init_pos], ports[:init_mom],
+             ports[:fwd_pos], ports[:fwd_mom],
+             ports[:bwd_pos], ports[:bwd_mom])
+    endpoint_values = Tuple(ports[Symbol(endpoint, suffix)]
+        for endpoint in _REACTIVE_NUTS_ENDPOINTS
+        for suffix in (:_pos, :_mom, :_valgrad, :_pot, :_dpot_dpos,
+                       :_kinetic, :_kin, :_dham_dmom, :_ham))
+    wants = (metric_value, gofwd_value, min_dham_value, controls..., chol,
+             active_ham, dham, diverged, endpoint_values...)
+    program = _prepare_reactive(graph; have = haves, want = wants,
+                                cache_apply = _nuts_cache_apply,
+                                is_mutating = _nuts_is_mutating)
+    state = program(
         potential_gradient!, metric, gofwd, threshold,
-        # sampler control + diagnostic-snapshot sources, at their reset values:
         true, true, 0, 0, zero(scalar), zero(scalar), false,
         copy(position), copy(momentum),
         copy(position), copy(momentum),
         copy(position), copy(momentum))
+
+    names = (:potential_gradient!, :metric, :gofwd, :min_dham,
+             :may_sample, :may_continue, :depth, :n_steps, :acceptance_sum,
+             :last_energy_error, :last_diverged, :chol_metric,
+             :active_ham, :dham, :diverged,
+             (Symbol(endpoint, suffix)
+              for endpoint in _REACTIVE_NUTS_ENDPOINTS
+              for suffix in (:_pos, :_mom, :_valgrad, :_pot, :_dpot_dpos,
+                             :_kinetic, :_kin, :_dham_dmom, :_ham))...)
+    handles = (potential_gradient_value, metric_value, gofwd_value, min_dham_value,
+               controls..., chol, active_ham, dham, diverged, endpoint_values...)
+    _phasepoint(program, state, NamedTuple{names}(handles))
 end
 
-# The authored group is a ReactiveObject; the sampler accepts either it or a bare
-# ReactivePhasePoint (both are the identical `state`/`handles` runtime surface).
-const _NUTSGroup = Union{ReactivePhasePoint,ReactiveObject}
+# The external sampler consumes the explicit compiled-reactive group above.
+const _NUTSGroup = ReactivePhasePoint
 
 # ---------------------------------------------------------------------------
 # CompiledNUTSState — the ca9 multinomial NUTS transition running on the flat
@@ -304,7 +323,7 @@ end
 # (...)` branch which would infer a Union in the hot transition loop.
 # Internal fast accessors that bypass the Symbol -> Val getproperty layer: the group
 # is a real struct field (getfield), and each group port/derived is read through the
-# ReactiveObject's GENERATED `Val` getter directly (still a plain reactive get!, same
+# phase-point's generated `Val` getter directly (still a plain reactive get!, same
 # one-authority handle) rather than `group.name` (which re-enters Symbol dispatch and
 # dominated the transition wall time). Hot-recursion code must use these, not
 # `state.foo`/`group.foo`; the public Symbol path (below) is unchanged.
@@ -423,8 +442,8 @@ interface — [`step!`](@ref), [`sample!`](@ref), [`refresh_momentum!`](@ref),
 Boundary (honest): the per-transition Hamiltonian work — each endpoint's
 potential/gradient/kinetic/velocity, the active-endpoint selection, the energy
 error `dham`, and the `diverged` flag — is compiled reactive state in the group's
-`ReactiveProgram` ([`reactive_program`](@ref)), which is authored through the
-public `@reactive` facade ([`reactive_nuts_group`](@ref)). The dependency-bearing
+`ReactiveProgram` ([`reactive_program`](@ref)), built by
+[`reactive_nuts_group`](@ref). The dependency-bearing
 control and diagnostic fields are reactive HAVE sources on that same group too:
 `go_forward` (the `gofwd` selection), `may_sample`, `may_continue`, `depth`,
 `n_steps`, `acceptance_sum`, and the completed-transition diagnostic snapshots
@@ -820,8 +839,8 @@ _is_reactive_nuts_group(point::_NUTSGroup) =
         (:gofwd, :min_dham, :init_pos, :fwd_pos, :bwd_pos, :dham))
 
 # ---------------------------------------------------------------------------
-# GAP-1 — reactive step-size adaptation authored through the public @reactive
-# facade (no ordinary mutable shadow struct). ca9's design: the dual-averaging
+# GAP-1 — reactive step-size adaptation over an explicitly prepared graph (no
+# ordinary mutable shadow struct). ca9's design: the dual-averaging
 # accumulators are the object's mutable HAVE sources, the current / final step
 # sizes are compiled reactive DERIVED nodes, and `fit!` is an ordinary method that
 # mutates the accumulator sources while READING the reactive `log_current`.
@@ -829,35 +848,38 @@ _is_reactive_nuts_group(point::_NUTSGroup) =
 # with concrete slots; the numeric recurrence is byte-identical to ReactiveHMC's.
 # ---------------------------------------------------------------------------
 
-@reactive specialize=true _dual_averaging_object(
-        iteration, error, log_final, center,
-        target, regularization_scale, relaxation_exponent, offset) = begin
-    log_current::typeof(center) =
-        center - sqrt(iteration) / regularization_scale * error
-    current::typeof(center) = exp(log_current)
-    final::typeof(center) = exp(log_final)
-    fit!(acceptance_rate) = begin
-        new_iteration = iteration + 1
-        new_error = error +
-            (target - acceptance_rate - error) / (new_iteration + offset)
-        iteration = new_iteration
-        error = new_error
-        weight = new_iteration^(-relaxation_exponent)
-        # Reads the reactive `log_current` (recomputed from the just-mutated
-        # iteration/error sources), then advances the running-average source.
-        log_final = log_final + weight * (log_current - log_final)
-        __self__
-    end
+function _dual_averaging_object(
+    iteration, error, log_final, center,
+    target, regularization_scale, relaxation_exponent, offset,
+)
+    graph = Graph()
+    source_names = (:iteration, :error, :log_final, :center, :target,
+                    :regularization_scale, :relaxation_exponent, :offset)
+    initial = (iteration, error, log_final, center, target,
+               regularization_scale, relaxation_exponent, offset)
+    sources = NamedTuple{source_names}(Tuple(
+        value!(graph, name, typeof(value)) for (name, value) in zip(source_names, initial)))
+    log_current = value!(graph, :log_current, typeof(center))
+    current = value!(graph, :current, typeof(center))
+    final = value!(graph, :final, typeof(center))
+    add!(graph, (sources.center, sources.iteration, sources.regularization_scale,
+                 sources.error) => log_current,
+         (c, m, scale, h) -> c - sqrt(m) / scale * h)
+    add!(graph, log_current => current, exp)
+    add!(graph, sources.log_final => final, exp)
+    values = merge(sources, (; log_current, current, final))
+    program = _prepare_reactive(graph; have = Tuple(sources), want = Tuple(values))
+    _phasepoint(program, program(initial...), values)
 end
 
 """
     DualAveragingState
 
 Public nominal type for the reactive Nesterov dual-averaging step-size adaptation.
-A THIN wrapper around the compiled-reactive `@reactive` object that holds ALL
+A thin wrapper around the compiled reactive state that holds all
 dependency-bearing state; it adds no authoritative fields of its own and forwards
 property reads (`state.current`, `state.final`, `state.iteration`, …) and
-[`fit!`](@ref) to the wrapped reactive object.
+[`fit!`](@ref) to the wrapped compiled state.
 """
 struct DualAveragingState{O}
     object::O
@@ -867,20 +889,29 @@ end
     name === :object ? getfield(state, :object) :
     getproperty(getfield(state, :object), name)
 # The old DualAveragingState was mutable: forward public field assignment to the
-# wrapped reactive object (mutating a HAVE source invalidates the derived
+# wrapped compiled state (mutating a HAVE source invalidates the derived
 # current/final), returning the assigned value for Julia assignment semantics.
 @inline Base.setproperty!(state::DualAveragingState, name::Symbol, value) =
     setproperty!(getfield(state, :object), name, value)
 Base.propertynames(state::DualAveragingState, private::Bool = false) =
     propertynames(getfield(state, :object), private)
-# Ownership: copying the wrapper deep-copies the underlying reactive object's state,
+# Ownership: copying the wrapper deep-copies the underlying compiled state,
 # so the clone is detached from the source (bidirectional isolation).
 Base.copy(state::DualAveragingState) =
     DualAveragingState(copy(getfield(state, :object)))
 
 "Advance the reactive dual-averaging accumulators by one acceptance observation."
 function fit!(state::DualAveragingState, acceptance_rate)
-    fit!(getfield(state, :object), acceptance_rate)
+    object = getfield(state, :object)
+    new_iteration = object.iteration + 1
+    new_error = object.error +
+        (object.target - acceptance_rate - object.error) /
+        (new_iteration + object.offset)
+    object.iteration = new_iteration
+    object.error = new_error
+    weight = new_iteration^(-object.relaxation_exponent)
+    object.log_final = object.log_final +
+        weight * (object.log_current - object.log_final)
     state
 end
 
@@ -931,30 +962,30 @@ function reset!(state::DualAveragingState, initial; target = 0.8,
 end
 
 # ---------------------------------------------------------------------------
-# GAP-1b — reactive online Welford variance authored through @reactive
-# specialize=true. n/mean/var live ONLY in the reactive object's mutable HAVE
+# GAP-1b — reactive online Welford variance over an explicitly prepared graph.
+# n/mean/var live only in the reactive state's mutable HAVE
 # sources; the `step!` method mutates the mean/var arrays IN PLACE (through the
 # facade's dotted-assignment => mutate! path) so invalidation/ownership stay sound.
 # `WelfordVariance` stays a public nominal wrapper type, generic over precision.
 # ---------------------------------------------------------------------------
 
-@reactive specialize=true _welford_object(n, mean, var) = begin
-    step!(value; weight = 1) = begin
-        n = n + weight
-        fraction = weight / n
-        @. var = _smooth(var,
-                         (value - _smooth(mean, value, fraction)) * (value - mean),
-                         fraction)
-        @. mean = _smooth(mean, value, fraction)
-        __self__
-    end
+function _reactive_container(names::Tuple, initial::Tuple)
+    graph = Graph()
+    values = NamedTuple{names}(Tuple(
+        value!(graph, name, typeof(value)) for (name, value) in zip(names, initial)))
+    ports = Tuple(values)
+    program = _prepare_reactive(graph; have = ports, want = ports)
+    _phasepoint(program, program(initial...), values)
 end
+
+_welford_object(n, mean, var) =
+    _reactive_container((:n, :mean, :var), (n, mean, var))
 
 """
     WelfordVariance
 
 Public nominal type for the reactive online componentwise variance estimate — a
-THIN wrapper over the compiled-reactive `@reactive` object that holds ALL
+thin wrapper over compiled reactive state that holds all
 dependency-bearing `n`/`mean`/`var` state; it adds no authoritative fields and
 forwards property reads/writes and [`step!`](@ref) to the wrapped object.
 """
@@ -972,9 +1003,8 @@ Base.propertynames(estimate::WelfordVariance, private::Bool = false) =
 Base.copy(estimate::WelfordVariance) =
     WelfordVariance(copy(getfield(estimate, :object)))
 
-# reactive_program forwarding so the generic artifact-inventory API resolves for the
-# nominal wrappers (reactive_program(::ReactiveObject) is defined by the facade;
-# state.program also reads directly).
+# `reactive_program` forwarding keeps the artifact-inventory API available for the
+# nominal wrappers.
 reactive_program(state::DualAveragingState) =
     reactive_program(getfield(state, :object))
 reactive_program(estimate::WelfordVariance) =
@@ -1008,8 +1038,25 @@ function reset!(estimate::WelfordVariance)
 end
 
 "Fold one observation vector into the reactive Welford estimate (in place)."
-step!(estimate::WelfordVariance, value::AbstractVector; weight = 1) =
-    (step!(getfield(estimate, :object), value; weight = weight); estimate)
+function step!(estimate::WelfordVariance, value::AbstractVector; weight = 1)
+    object = getfield(estimate, :object)
+    object.n = object.n + weight
+    fraction = weight / object.n
+    mean = object.mean
+    mutate!(object, :var) do variance
+        @. variance = _smooth(
+            variance,
+            (value - _smooth(mean, value, fraction)) * (value - mean),
+            fraction,
+        )
+        variance
+    end
+    mutate!(object, :mean) do running_mean
+        @. running_mean = _smooth(running_mean, value, fraction)
+        running_mean
+    end
+    estimate
+end
 "Fold each column of a matrix into the reactive Welford estimate."
 function step!(estimate::WelfordVariance, values::AbstractMatrix; kwargs...)
     for value in eachcol(values)
@@ -1020,7 +1067,7 @@ end
 
 # ---------------------------------------------------------------------------
 # GAP-1c — reactive trajectory / sampling recorders. The authoritative
-# buffers/counters/history live ONLY in a specialize=true @reactive object (its
+# buffers/counters/history live only in an explicitly prepared state (its
 # HAVE sources); the derived `positions`/`gradients` VIEWS are computed in the
 # wrapper (not reactive SubArray slots, which would break generic copy). Every
 # resize/copy/push!/empty!/hcat mutation routes through the reactive boundary
@@ -1028,15 +1075,17 @@ end
 # SamplingStats stay public nominal wrapper types.
 # ---------------------------------------------------------------------------
 
-@reactive specialize=true _trajectory_object(
-        dim, position_storage, gradient_storage, dhams, pots, idxs, first, count) =
-    begin end
+_trajectory_object(dim, position_storage, gradient_storage, dhams, pots, idxs, first, count) =
+    _reactive_container(
+        (:dim, :position_storage, :gradient_storage, :dhams, :pots, :idxs, :first, :count),
+        (dim, position_storage, gradient_storage, dhams, pots, idxs, first, count),
+    )
 
 """
     TrajectoryStats
     trajectory_stats(dimension, T=Float64)
 
-Optional recorder (public nominal wrapper over a `@reactive` object) for one NUTS
+Optional recorder (public nominal wrapper over compiled reactive state) for one NUTS
 transition's ordered positions, gradients, energy errors, potentials, and reveal
 order. Pass as `stats_f` to [`nuts_state`](@ref); [`sample!`](@ref) resets it.
 """
@@ -1081,7 +1130,7 @@ end
 Base.copy(stats::TrajectoryStats) =
     TrajectoryStats(copy(getfield(stats, :object)))
 
-# Public source-field assignment forwards to the reactive object (the old struct was
+# Public source-field assignment forwards to the compiled state (the old struct was
 # mutable); the computed views are read-only.
 @inline function Base.setproperty!(stats::TrajectoryStats, name::Symbol, value)
     (name === :positions || name === :gradients) && throw(ArgumentError(
@@ -1173,17 +1222,22 @@ function (stats::TrajectoryStats)(state::AbstractNUTSState)
     stats
 end
 
-@reactive specialize=true _sampling_object(
-        trajectory, draws, n_steps, stepsizes, acc_rate, diverged,
-        full_history, full_idxs) = begin end
+_sampling_object(trajectory, draws, n_steps, stepsizes, acc_rate, diverged,
+                 full_history, full_idxs) =
+    _reactive_container(
+        (:trajectory, :draws, :n_steps, :stepsizes, :acc_rate, :diverged,
+         :full_history, :full_idxs),
+        (trajectory, draws, n_steps, stepsizes, acc_rate, diverged,
+         full_history, full_idxs),
+    )
 
 """
     SamplingStats
     sampling_stats(trajectory_stats)
 
 Public nominal wrapper accumulating per-transition draws, leapfrog counts,
-stepsizes, acceptance rates, divergence flags, and optional trajectory history in a
-`@reactive` object. Call as `stats(state, adaptation_state)` after a transition.
+stepsizes, acceptance rates, divergence flags, and optional trajectory history in
+compiled reactive state. Call as `stats(state, adaptation_state)` after a transition.
 """
 struct SamplingStats{O}
     object::O
@@ -1207,7 +1261,7 @@ function Base.copy(stats::SamplingStats)
         copy(o.trajectory), copy(o.draws), copy(o.n_steps), copy(o.stepsizes),
         copy(o.acc_rate), copy(o.diverged),
         [copy(h) for h in o.full_history], [copy(i) for i in o.full_idxs])
-    SamplingStats(ReactiveObject{:_sampling_object}(newstate, o.handles))
+    SamplingStats(ReactivePhasePoint(newstate, o.handles))
 end
 
 function sampling_stats(trajectory::TrajectoryStats)

@@ -1,5 +1,5 @@
 # Gates for lowering an AUTHORED free stateful @kernel (dual_averaging_state / welford_var) to a runnable
-# object — the AUTHORED recurrence, NOT the package @reactive type (HMC acceptance G3/G4).  Construction and
+# object — the authored recurrence, not a compatibility facade (HMC acceptance G3/G4). Construction and
 # method execution share the authoritative plan/ownership/bootstrap substrate; the hot method ABI is concrete,
 # inferred, and allocation-free.
 using Test, LinearAlgebra, InteractiveUtils

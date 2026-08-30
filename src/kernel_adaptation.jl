@@ -1,5 +1,5 @@
 # Lowering an AUTHORED free stateful @kernel to a RUNNABLE object —
-# the AUTHORED recurrence, NOT the package @reactive type. A stateful @kernel is a
+# the authored recurrence, not a compatibility facade. A stateful @kernel is a
 # _StatefulKernelSkeleton: field-initializer recipes (m=one(init), H=zero(init), mu=…, current=exp(…))
 # captured through the stateless graph, plus mutating methods (fit!(x), step!(x;dn)) captured as MethodIRs.
 #

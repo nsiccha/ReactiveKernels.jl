@@ -322,33 +322,6 @@ A compiled state is mutable and not thread-safe. A generated getter can be
 inferred and allocation-free for a compatible operation set, but the compiler
 does not promise that arbitrary recipe operations allocate nothing.
 
-### `@reactive` object grammar
-
-`@reactive` is a facade over `ReactiveProgram`. Signature arguments become
-mutable HAVE sources, top-level body assignments become derived recipes, and
-inner methods become ordinary type-stable methods over a generated
-`ReactiveObject`. Reads demand the appropriate slot; whole-field and in-place
-writes route through compiled-state assignment and invalidation.
-
-Its method rewriter supports straight-line code, `if`/`elseif`, `&&`/`||`,
-`for`/`while`, indexing, property chains, `@.` broadcast, compound and
-destructuring assignment, and sibling-method calls. It tracks straight-line
-aliases of reactive fields and rejects a later mutation when control-flow paths
-could make the alias refer to different roots.
-
-It rejects `let`, `try`/`catch`, comprehensions and generators, `do` blocks,
-anonymous functions, and nested function definitions inside a rewritten
-method. Those forms create bindings, deferred execution, or exceptional paths
-for which the rewriter cannot prove which reactive root to invalidate. Move
-that logic into supported control flow, a sibling method, or an ordinary
-wrapper that supplies a port.
-
-`specialize=true` builds a program in the constructor with HAVE port types
-derived from runtime values. The default reuses one definition-level program.
-An injected `prepare=` hook must return a `ReactiveProgram` from the same graph
-with the exact signature boundary and all exposed ports; the macro validates
-those facts.
-
 ## Allocation-reusing preparation
 
 The optional MutatingFunctions extension changes call lowering, not graph

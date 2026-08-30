@@ -316,10 +316,11 @@ blocks = kernel_blocks()
     @test occursin("state.n_steps += 1", stb)                                # one increment per collectstats!/leaf
     @test occursin("stats_f = nuts_stats!", SRC)                             # production binding is the registered callback (not nothing)
 
-    # ---- @node preserved; @reactive-as-macro absent; free @kernel leapfrog!/rcopy!!/nuts!! ----------
+    # ---- @node preserved; retired object macro absent; free @kernel leapfrog!/rcopy!!/nuts!! ----------
     @test occursin("@node(logdet(chol_metric))", SRC)
     has_reactive = Ref(false)
-    _walk(AST) do x; x isa Expr && x.head === :macrocall && x.args[1] === Symbol("@reactive") && (has_reactive[] = true); end
+    retired_macro = Symbol("@", "reactive")
+    _walk(AST) do x; x isa Expr && x.head === :macrocall && x.args[1] === retired_macro && (has_reactive[] = true); end
     @test !has_reactive[]
     @test occursin("@kernel leapfrog!", SRC) && occursin("@kernel nuts!!", SRC)
     @test occursin("@kernel refresh_momentum!!", SRC) && occursin("@kernel nuts_stats!", SRC)   # free refresh + stats kernels
@@ -340,7 +341,7 @@ blocks = kernel_blocks()
     @test !occursin("Base.broadcasted", nb) && !occursin("compute_criterion", nb)
     @test occursin("state.dham >= zero(state.dham)", stb) && occursin("exp(state.dham)", stb)
     @test !occursin("min1exp(", SRC) && !occursin("badd(", SRC) && !occursin("logswapprob(", SRC)
-    println("  (@node) preserved; @reactive absent; free @kernel leapfrog!/refresh_momentum!!/nuts_stats!/nuts!!;")
+    println("  (@node) preserved; retired object macro absent; free @kernel leapfrog!/refresh_momentum!!/nuts_stats!/nuts!!;")
     println("      ZERO production @rk_* declarations; visible scalar/RNG/reduction expressions; copy!! is core. OK")
 end
 

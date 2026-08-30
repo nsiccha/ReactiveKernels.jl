@@ -120,7 +120,7 @@ part of the RK boundary. `ad_gradient` returns a gradient; the prepared-only
 gradient destination. Both rebuild DI `Constant` contexts from the current
 inactive arguments on every call.
 
-Like ReactiveObjects.jl's `@reactive` definitions, the primary `@kernel` form
+Like ReactiveObjects.jl's object definitions, the primary `@kernel` form
 is a normal-looking function definition. Its arguments are the kernel's input
 ports, including function-valued inputs such as `step` and `scale`. Type
 annotations are optional metadata: generated kernels still specialize on the
