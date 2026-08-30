@@ -67,12 +67,14 @@ end
 # ============================================================================================
 # AUTHORED STATEFUL METHOD EXECUTION (G3/G4)
 #
-# This is deliberately a small compiler for the adaptation surface, not a general Julia compiler.  It accepts
-# only the captured Base numeric primitives used by dual averaging and Welford, plus the captured builtin
-# `eachcol` borrow used by Welford's matrix orchestration. An ordinary helper is never granted purity,
-# arity, or a result type here.  Every call is rebind-checked against its captured GlobalRef and every primitive
-# application is validated, at specialization, against exact concrete operand types and an exhaustive result
-# rule below.  Unsupported syntax or a missing result rule is a compile-time rejection.
+# This is deliberately a finite compiler for authored object-kernel methods,
+# not a general Julia compiler. It accepts an explicit set of scalar/array
+# primitives, structured branches and bounded loops, indexed state access, and
+# registered callable ports. An ordinary helper is never granted purity, arity,
+# or a result type here. Every call is rebind-checked against its captured
+# GlobalRef and every primitive application is validated, at specialization,
+# against exact concrete operand types and an exhaustive result rule below.
+# Unsupported syntax or a missing result rule is a compile-time rejection.
 # ============================================================================================
 
 # ---- finite, type-level domain/result forest ---------------------------------------------------------------
@@ -86,11 +88,27 @@ struct _DCall{Source,Dot,Args} <: _SMDomainNode end
 struct _DPortCall{Declared,Result,Args} <: _SMDomainNode end
 struct _DTuple{Args} <: _SMDomainNode end
 struct _DProject{Parent,Key} <: _SMDomainNode end
+struct _DIndex{Base,Indices} <: _SMDomainNode end
+struct _DIfValue{Cond,Then,Else} <: _SMDomainNode end
+struct _DShortValue{Op,Lhs,Rhs} <: _SMDomainNode end
 struct _DWrite{Target,Dot,Rhs} <: _SMDomainNode end
+struct _DIndexedWrite{Target,Indices,Rhs} <: _SMDomainNode end
 struct _DValue{Rhs} <: _SMDomainNode end
+struct _DCondition{Rhs} <: _SMDomainNode end
+struct _DIterator{Rhs} <: _SMDomainNode end
+struct _DLoopValue{Iterator} <: _SMDomainNode end
+struct _DLocalMerge{Before,After} <: _SMDomainNode end
 struct _DReturn{Rhs} <: _SMDomainNode end
 struct _DDefault{Name,Rhs} <: _SMDomainNode end
 struct _DOrchestration{Borrow,SegmentForest} <: _SMDomainNode end
+
+# State-machine storage may use Base's packed Bool arrays.  Keep this local to
+# the state-machine boundary: the ordinary numeric primitive domain remains
+# intentionally narrower, while indexed reads/writes of Bool state are exact
+# and do not imply arbitrary BitArray primitive support.
+_sm_builtin_array(::Type{T}) where {T} =
+    _kernel_dom_num_array(T) ||
+    (T <: BitArray && _kernel_dom_builtin(T) && eltype(T) === Bool)
 
 # A column yielded by `eachcol(::Matrix{T})` is a builtin, non-owning view, not a fabricated `Vector{T}`.
 # The marker exists only while validating the segment forest; it can arise solely after the concrete Matrix
@@ -218,6 +236,11 @@ function _sm_primitive_result(@nospecialize(f), argts::Tuple)
         P = _sm_numeric_promote(argts, :^)
         P <: AbstractFloat || _sm_reject("primitive `^` is admitted here only for builtin floating operands")
         return P
+    elseif f in (Base.:(==), Base.:(!=), Base.:<, Base.:>, Base.:<=, Base.:>=)
+        length(argts) == 2 || _sm_reject(
+            "primitive `$f` requires exactly two operands")
+        _sm_numeric_promote(argts, nameof(f))
+        return Bool
     elseif f === Base.zero || f === Base.one
         length(argts) == 1 && _kernel_dom_num_scalar(argts[1]) ||
             _sm_reject("primitive `$f` requires one builtin numeric scalar")
@@ -279,6 +302,50 @@ function _sm_dtype(::Type{_DProject{Parent,Key}}, argtypes,
     end
     dot ? _sm_leaf_type(projected) : projected
 end
+function _sm_dtype(::Type{_DIndex{Parent,Indices}}, argtypes,
+                   ::Type{KWT}, dot::Bool) where {Parent,Indices,KWT}
+    dot && _sm_reject("indexed reads do not admit implicit broadcasting")
+    T = _sm_dtype(Parent, argtypes, KWT, false)
+    _sm_builtin_array(T) || _sm_reject(
+        "indexed read requires a builtin numeric array, got `$T`")
+    length(Indices.parameters) == ndims(T) || _sm_reject(
+        "indexed read supplies $(length(Indices.parameters)) indices for rank $(ndims(T))")
+    for index in Indices.parameters
+        IT = _sm_dtype(index, argtypes, KWT, false)
+        _kernel_dom_int_scalar(IT) && IT !== Bool || _sm_reject(
+            "indexed read requires builtin non-Bool integer indices, got `$IT`")
+    end
+    eltype(T)
+end
+function _sm_dtype(::Type{_DIfValue{Cond,Then,Else}}, argtypes,
+                   ::Type{KWT}, dot::Bool) where {Cond,Then,Else,KWT}
+    dot && _sm_reject("conditional values do not admit implicit broadcasting")
+    CT = _sm_dtype(Cond, argtypes, KWT, false)
+    CT === Bool || _sm_reject("conditional value requires Bool condition, got `$CT`")
+    TT = _sm_dtype(Then, argtypes, KWT, false)
+    ET = _sm_dtype(Else, argtypes, KWT, false)
+    TT === ET || _sm_reject(
+        "conditional branches must have one exact type, got `$TT` and `$ET`")
+    TT
+end
+function _sm_dtype(::Type{_DShortValue{Op,Lhs,Rhs}}, argtypes,
+                   ::Type{KWT}, dot::Bool) where {Op,Lhs,Rhs,KWT}
+    dot && _sm_reject("short-circuit values do not admit implicit broadcasting")
+    Op in (:&&, :||) || _sm_reject("unsupported short-circuit operator `$Op`")
+    LT = _sm_dtype(Lhs, argtypes, KWT, false)
+    RT = _sm_dtype(Rhs, argtypes, KWT, false)
+    LT === Bool && RT === Bool || _sm_reject(
+        "short-circuit operands must both be Bool, got `$LT` and `$RT`")
+    Bool
+end
+function _sm_dtype(::Type{_DLoopValue{Iterator}}, argtypes,
+                   ::Type{KWT}, dot::Bool) where {Iterator,KWT}
+    dot && _sm_reject("loop values do not admit implicit broadcasting")
+    T = _sm_dtype(Iterator, argtypes, KWT, false)
+    T <: AbstractUnitRange || _sm_reject(
+        "loop value requires an integer unit range, got `$T`")
+    eltype(T)
+end
 function _sm_dtype(::Type{_DCall{S,D,A}}, argtypes, ::Type{KWT}, dot::Bool) where {S,D,A,KWT}
     ats = ntuple(i -> _sm_dtype(A.parameters[i], argtypes, KWT, D), length(A.parameters))
     f = S.instance
@@ -301,8 +368,46 @@ function _sm_validate_node(::Type{_DWrite{T,D,R}}, argtypes, ::Type{KWT}) where 
     got === want || _sm_reject("stateful write result type `$got` does not exactly match destination `$want`")
     nothing
 end
+function _sm_validate_node(::Type{_DIndexedWrite{T,Indices,R}}, argtypes,
+                           ::Type{KWT}) where {T,Indices,R,KWT}
+    _sm_builtin_array(T) || _sm_reject(
+        "indexed write requires a builtin numeric array, got `$T`")
+    length(Indices.parameters) == ndims(T) || _sm_reject(
+        "indexed write supplies $(length(Indices.parameters)) indices for rank $(ndims(T))")
+    for index in Indices.parameters
+        IT = _sm_dtype(index, argtypes, KWT, false)
+        _kernel_dom_int_scalar(IT) && IT !== Bool || _sm_reject(
+            "indexed write requires builtin non-Bool integer indices, got `$IT`")
+    end
+    got = _sm_dtype(R, argtypes, KWT, false)
+    got === eltype(T) || _sm_reject(
+        "indexed write result type `$got` does not exactly match element type `$(eltype(T))`")
+    nothing
+end
 _sm_validate_node(::Type{_DValue{R}}, argtypes, ::Type{KWT}) where {R,KWT} =
     (_sm_dtype(R, argtypes, KWT, false); nothing)
+function _sm_validate_node(::Type{_DLocalMerge{Before,After}}, argtypes,
+                           ::Type{KWT}) where {Before,After,KWT}
+    old = _sm_dtype(Before, argtypes, KWT, false)
+    new = _sm_dtype(After, argtypes, KWT, false)
+    old === new || _sm_reject(
+        "state-machine local reassignment changes type from `$old` to `$new`")
+    nothing
+end
+function _sm_validate_node(::Type{_DCondition{R}}, argtypes,
+                           ::Type{KWT}) where {R,KWT}
+    T = _sm_dtype(R, argtypes, KWT, false)
+    T === Bool || _sm_reject("control condition must be Bool, got `$T`")
+    nothing
+end
+function _sm_validate_node(::Type{_DIterator{R}}, argtypes,
+                           ::Type{KWT}) where {R,KWT}
+    T = _sm_dtype(R, argtypes, KWT, false)
+    T <: AbstractUnitRange && _kernel_dom_int_scalar(eltype(T)) &&
+        eltype(T) !== Bool || _sm_reject(
+            "state-machine loop requires a builtin integer unit range, got `$T`")
+    nothing
+end
 _sm_validate_node(::Type{_DReturn{Nothing}}, argtypes, ::Type{KWT}) where {KWT} = nothing
 _sm_validate_node(::Type{_DReturn{R}}, argtypes, ::Type{KWT}) where {R,KWT} =
     (_sm_dtype(R, argtypes, KWT, false); nothing)
@@ -359,6 +464,29 @@ function _sm_rhs(x, syms, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH},
     elseif x isa _TupleExpr
         Expr(:tuple, (_sm_rhs(a, syms, plan, fields, OW, SH, formals,
                               locals, false, field_regs) for a in x.elts)...)
+    elseif x isa _Index
+        base = _sm_rhs(x.base, syms, plan, fields, OW, SH, formals,
+                       locals, false, field_regs)
+        indices = Any[_sm_rhs(index, syms, plan, fields, OW, SH,
+                              formals, locals, false, field_regs)
+                      for index in x.idxs]
+        Expr(:ref, base, indices...)
+    elseif x isa _IfExpr
+        condition = _sm_rhs(x.cond, syms, plan, fields, OW, SH, formals,
+                            locals, false, field_regs)
+        then_value = _sm_rhs(x.thenv, syms, plan, fields, OW, SH, formals,
+                             locals, false, field_regs)
+        else_value = _sm_rhs(x.elsev, syms, plan, fields, OW, SH, formals,
+                             locals, false, field_regs)
+        Expr(:if, condition, then_value, else_value)
+    elseif x isa _Short
+        x.op in (:&&, :||) || _sm_reject(
+            "unsupported stateful short-circuit operator `$(x.op)`")
+        lhs = _sm_rhs(x.lhs, syms, plan, fields, OW, SH, formals,
+                      locals, false, field_regs)
+        rhs = _sm_rhs(x.rhs, syms, plan, fields, OW, SH, formals,
+                      locals, false, field_regs)
+        Expr(x.op, lhs, rhs)
     elseif x isa _RegisteredCall
         f = _sm_exact_callee(x; allow_broadcast=dot)
         args = Any[_sm_rhs(a, syms, plan, fields, OW, SH, formals,
@@ -383,19 +511,17 @@ function _sm_rhs(x, syms, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH},
     elseif x isa _CallExpr
         x.target isa _SelfRef || _sm_reject(
             "value-position sibling call must target the current state")
-        length(x.pos) == 1 || _sm_reject(
-            "value-position sibling call currently requires one positional argument")
         any(pair -> pair.first === _KMIR_KWSPLAT, x.kw) && _sm_reject(
             "value-position sibling call does not admit a keyword splat")
-        argument = _sm_rhs(only(x.pos), syms, plan, fields, OW, SH,
-                           formals, locals, false, field_regs)
+        arguments = Any[_sm_rhs(argument, syms, plan, fields, OW, SH,
+            formals, locals, false, field_regs) for argument in x.pos]
         keyword_names = Tuple(first.(x.kw))
         keyword_values = Any[_sm_rhs(pair.second, syms, plan, fields, OW,
             SH, formals, locals, false, field_regs) for pair in x.kw]
         keywords = :(NamedTuple{$keyword_names}(($(keyword_values...),)))
         name = x.name
-        :(_sm_dispatch(getfield(methods, $(QuoteNode(name))), methods,
-            owned, shared, handles, $argument, $keywords))
+        :(_sm_dispatch_args(getfield(methods, $(QuoteNode(name))), methods,
+            owned, shared, handles, ($(arguments...),), $keywords))
     else
         _sm_reject("unsupported stateful rhs node `$(typeof(x))`")
     end
@@ -421,6 +547,29 @@ function _sm_dtree(x, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH},
         children = Tuple{(_sm_dtree(a, plan, fields, OW, SH, finfo, ltrees,
             false, field_regs, methods_by_id, stack) for a in x.elts)...}
         _DTuple{children}
+    elseif x isa _Index
+        parent = _sm_dtree(x.base, plan, fields, OW, SH, finfo, ltrees,
+            false, field_regs, methods_by_id, stack)
+        indices = Tuple{(_sm_dtree(index, plan, fields, OW, SH, finfo,
+            ltrees, false, field_regs, methods_by_id, stack)
+            for index in x.idxs)...}
+        _DIndex{parent,indices}
+    elseif x isa _IfExpr
+        condition = _sm_dtree(x.cond, plan, fields, OW, SH, finfo,
+            ltrees, false, field_regs, methods_by_id, stack)
+        then_value = _sm_dtree(x.thenv, plan, fields, OW, SH, finfo,
+            ltrees, false, field_regs, methods_by_id, stack)
+        else_value = _sm_dtree(x.elsev, plan, fields, OW, SH, finfo,
+            ltrees, false, field_regs, methods_by_id, stack)
+        _DIfValue{condition,then_value,else_value}
+    elseif x isa _Short
+        x.op in (:&&, :||) || _sm_reject(
+            "unsupported domain short-circuit operator `$(x.op)`")
+        lhs = _sm_dtree(x.lhs, plan, fields, OW, SH, finfo, ltrees,
+            false, field_regs, methods_by_id, stack)
+        rhs = _sm_dtree(x.rhs, plan, fields, OW, SH, finfo, ltrees,
+            false, field_regs, methods_by_id, stack)
+        _DShortValue{x.op,lhs,rhs}
     elseif x isa _RegisteredCall
         f = _sm_exact_callee(x; allow_broadcast=dot)
         children = Tuple{(_sm_dtree(a, plan, fields, OW, SH, finfo, ltrees,
@@ -577,6 +726,24 @@ function _sm_sibling_result_tree(call::_CallExpr, plan::_KernelPlan, fields,
 
     locals = Dict{Symbol,Any}()
     nested_stack = [stack..., method_id]
+    if length(ir.body) == 1 && only(ir.body) isa _If
+        branch = only(ir.body)
+        branch_value = function (body)
+            length(body) == 1 || _sm_reject(
+                "value-position conditional branch must contain one value")
+            statement = only(body)
+            value = statement isa _ExprStmt ? statement.expr :
+                    statement isa _Return ? statement.value : nothing
+            value === nothing && _sm_reject(
+                "value-position conditional branch must end in a value")
+            _sm_dtree(value, plan, fields, OW, SH, formals, locals,
+                false, field_regs, methods_by_id, nested_stack)
+        end
+        condition = _sm_dtree(branch.cond, plan, fields, OW, SH,
+            formals, locals, false, field_regs, methods_by_id, nested_stack)
+        return _DIfValue{condition,branch_value(branch.thenb),
+                        branch_value(branch.elseb)}
+    end
     for (statement_index, statement) in enumerate(ir.body)
         if statement isa _LocalAssign
             rhs_tree = statement.style === :named ? _DLit{Nothing} :
@@ -652,6 +819,111 @@ function _sm_domain_forest(ir::MethodIR, plan::_KernelPlan, fields,
     Tuple{nodes...}
 end
 
+function _sm_machine_domain_forest(ir::MethodIR, plan::_KernelPlan, fields,
+        ::Type{OW}, ::Type{SH}, typeauth, field_regs,
+        methods_by_id) where {OW,SH}
+    finfo = Dict{Symbol,Any}()
+    position = 0
+    for formal in ir.formals
+        formal.kind === :pos || _sm_reject(
+            "state-machine methods currently require positional-only formals")
+        position += 1
+        annotated = formal.type !== nothing &&
+            _resolve_sm_annotation(typeauth, formal.type) <: AbstractArray
+        finfo[formal.name] = _DFormal{position,annotated}
+    end
+
+    nodes = Any[]
+    build! = nothing
+    build! = function (body, ltrees)
+        for statement in body
+            if statement isa _LocalAssign
+                statement.style === :single || _sm_reject(
+                    "state-machine local assignment currently requires one name")
+                tree = _sm_dtree(statement.rhs, plan, fields, OW, SH,
+                    finfo, ltrees, false, field_regs, methods_by_id,
+                    MethodId[ir.id])
+                name = only(statement.lhs)
+                if haskey(ltrees, name)
+                    push!(nodes, _DLocalMerge{ltrees[name],tree})
+                end
+                ltrees[name] = tree
+                push!(nodes, _DValue{tree})
+            elseif statement isa _ExprStmt
+                tree = _sm_dtree(statement.expr, plan, fields, OW, SH,
+                    finfo, ltrees, false, field_regs, methods_by_id,
+                    MethodId[ir.id])
+                push!(nodes, _DValue{tree})
+            elseif statement isa _PlaceWrite
+                statement.root === :self && statement.owner !== nothing &&
+                    length(statement.owner) == 1 || _sm_reject(
+                        "state-machine writes must target one direct owned field")
+                name = only(statement.owner)
+                canon = get(fields, name, 0)
+                canon == 0 && _sm_reject(
+                    "state-machine write has no canonical slot for `$name`")
+                T = _pp_fieldtype(plan, canon, OW, SH)
+                rhs = _sm_dtree(statement.rhs, plan, fields, OW, SH,
+                    finfo, ltrees, false, field_regs, methods_by_id,
+                    MethodId[ir.id])
+                if statement.target isa _SelfField
+                    statement.dot && _sm_reject(
+                        "state-machine direct writes do not admit authored broadcasting")
+                    push!(nodes, _DWrite{T,false,rhs})
+                elseif statement.target isa _Index
+                    statement.dot && _sm_reject(
+                        "state-machine indexed writes do not admit authored broadcasting")
+                    statement.target.base isa _SelfField &&
+                        length(statement.target.base.path) == 1 &&
+                        only(statement.target.base.path) === name || _sm_reject(
+                            "state-machine indexed write must index its owned field directly")
+                    indices = Tuple{(_sm_dtree(index, plan, fields, OW, SH,
+                        finfo, ltrees, false, field_regs, methods_by_id,
+                        MethodId[ir.id]) for index in statement.target.idxs)...}
+                    push!(nodes, _DIndexedWrite{T,indices,rhs})
+                else
+                    _sm_reject("unsupported state-machine write target " *
+                               "`$(typeof(statement.target))`")
+                end
+            elseif statement isa _Guard
+                push!(nodes, _DCondition{_sm_dtree(
+                    statement.cond, plan, fields, OW, SH, finfo, ltrees,
+                    false, field_regs, methods_by_id, MethodId[ir.id])})
+                build!(statement.body, copy(ltrees))
+            elseif statement isa _If
+                push!(nodes, _DCondition{_sm_dtree(
+                    statement.cond, plan, fields, OW, SH, finfo, ltrees,
+                    false, field_regs, methods_by_id, MethodId[ir.id])})
+                build!(statement.thenb, copy(ltrees))
+                build!(statement.elseb, copy(ltrees))
+            elseif statement isa _For
+                length(statement.var) == 1 || _sm_reject(
+                    "state-machine loop must bind one local")
+                haskey(ltrees, only(statement.var)) && _sm_reject(
+                    "state-machine loop variable `$(only(statement.var))` shadows an active local")
+                iterator = _sm_dtree(statement.iter, plan, fields, OW, SH,
+                    finfo, ltrees, false, field_regs, methods_by_id,
+                    MethodId[ir.id])
+                push!(nodes, _DIterator{iterator})
+                nested = copy(ltrees)
+                nested[only(statement.var)] = _DLoopValue{iterator}
+                build!(statement.body, nested)
+            elseif statement isa _Return
+                tree = statement.value === nothing ? Nothing :
+                    _sm_dtree(statement.value, plan, fields, OW, SH,
+                        finfo, ltrees, false, field_regs, methods_by_id,
+                        MethodId[ir.id])
+                push!(nodes, _DReturn{tree})
+            else
+                _sm_reject("unsupported state-machine statement `$(typeof(statement))`")
+            end
+        end
+        nothing
+    end
+    build!(ir.body, Dict{Symbol,Any}())
+    Tuple{nodes...}
+end
+
 # ---- executable straight-line method ----------------------------------------------------------------------
 
 function _sm_validate_formals(ir::MethodIR)
@@ -672,6 +944,20 @@ function _sm_validate_formals(ir::MethodIR)
         end
     end
     npos == 1 || _sm_reject("adaptation methods require exactly one positional formal (got $npos)")
+    nothing
+end
+
+function _sm_validate_machine_formals(ir::MethodIR)
+    names = Set{Symbol}()
+    isempty(ir.formals) && _sm_reject(
+        "state-machine methods require at least one positional formal")
+    for formal in ir.formals
+        formal.name in names && _sm_reject(
+            "method `$(ir.id.name)` duplicates formal `$(formal.name)`")
+        push!(names, formal.name)
+        formal.kind === :pos || _sm_reject(
+            "state-machine methods currently require positional-only formals")
+    end
     nothing
 end
 
@@ -834,6 +1120,166 @@ compile_stateful_method(pf::_PreparedFactory, ::Type{OW}, ::Type{SH},
     compile_stateful_method(pf, OW, SH, ir, global_written, typeauth,
         Dict{Symbol,Any}(), Dict{MethodId,MethodIR}(ir.id => ir))
 
+function compile_state_machine_method(pf::_PreparedFactory, ::Type{OW},
+        ::Type{SH}, ir::MethodIR, typeauth, field_regs,
+        methods_by_id) where {OW,SH}
+    _sm_validate_machine_formals(ir)
+    plan = kernel_prepared_plan(pf)
+    isempty(kernel_plan_producer(plan)) || _sm_reject(
+        "structured state-machine lowering currently requires source-only state fields")
+    fields = _exec_canon_map(plan)
+    syms = Dict{Any,Symbol}()
+    formals = Dict{Symbol,Bool}()
+    locals = Dict{Symbol,Bool}()
+    statements = Any[]
+    serial = Ref(0)
+    fresh(prefix, name=:value) = begin
+        serial[] += 1
+        Symbol(prefix, name, "_", serial[])
+    end
+
+    for (position, formal) in enumerate(ir.formals)
+        symbol = fresh(:__smm_formal_, formal.name)
+        syms[(:formal, formal.name)] = symbol
+        formals[formal.name] = formal.type !== nothing &&
+            _resolve_sm_annotation(typeauth, formal.type) <: AbstractArray
+        push!(statements, :(local $symbol = args[$position]))
+    end
+
+    emit_write! = function (statement::_PlaceWrite, destination,
+                            block_syms, block_locals)
+        statement.root === :self && statement.owner !== nothing &&
+            length(statement.owner) == 1 || _sm_reject(
+                "state-machine writes must target one direct owned field")
+        name = only(statement.owner)
+        canon = get(fields, name, 0)
+        canon == 0 && _sm_reject(
+            "state-machine write has no canonical slot for `$name`")
+        role, slot = kernel_plan_field(plan, canon)
+        role === :owned || _sm_reject(
+            "state-machine writes shared authority `$name`")
+        field_type = _pp_fieldtype(plan, canon, OW, SH)
+        statement.dot && _sm_reject(
+            "state-machine writes do not admit authored broadcasting")
+
+        rhs = _sm_rhs(statement.rhs, block_syms, plan, fields, OW, SH,
+                      formals, block_locals, false, field_regs)
+        rhs_symbol = fresh(:__smm_rhs_, name)
+        push!(destination, :(local $rhs_symbol = $rhs))
+        if statement.target isa _SelfField
+            field_type <: AbstractArray && _sm_reject(
+                "state-machine array writes must name explicit indices")
+            push!(destination, :(_canon_kill!(owned, Val($slot))))
+            push!(destination, :(_canon_set!(owned, Val($slot), $rhs_symbol)))
+            push!(destination, :(_canon_bless!(owned, Val($slot))))
+        elseif statement.target isa _Index
+            field_type <: AbstractArray || _sm_reject(
+                "state-machine indexed write target `$name` is not an array")
+            statement.target.base isa _SelfField &&
+                length(statement.target.base.path) == 1 &&
+                only(statement.target.base.path) === name || _sm_reject(
+                    "state-machine indexed write must index its owned field directly")
+            array_symbol = fresh(:__smm_array_, name)
+            push!(destination, :(local $array_symbol = $(_pp_read(plan, canon))))
+            index_symbols = Symbol[]
+            for index in statement.target.idxs
+                symbol = fresh(:__smm_index_, name)
+                value = _sm_rhs(index, block_syms, plan, fields, OW, SH,
+                                formals, block_locals, false, field_regs)
+                push!(destination, :(local $symbol = $value))
+                push!(index_symbols, symbol)
+            end
+            push!(destination, :(_canon_kill!(owned, Val($slot))))
+            push!(destination,
+                :(setindex!($array_symbol, $rhs_symbol, $(index_symbols...))))
+            push!(destination, :(_canon_bless!(owned, Val($slot))))
+        else
+            _sm_reject("unsupported state-machine write target " *
+                       "`$(typeof(statement.target))`")
+        end
+        nothing
+    end
+
+    emit_block! = nothing
+    emit_block! = function (body, destination, block_syms, block_locals)
+        for statement in body
+            if statement isa _LocalAssign
+                statement.style === :single || _sm_reject(
+                    "state-machine local assignment currently requires one name")
+                name = only(statement.lhs)
+                symbol = get!(block_syms, (:local, name)) do
+                    fresh(:__smm_local_, name)
+                end
+                rhs = _sm_rhs(statement.rhs, block_syms, plan, fields, OW, SH,
+                              formals, block_locals, false, field_regs)
+                block_locals[name] = _sm_isvector(
+                    statement.rhs, plan, fields, OW, SH, formals,
+                    block_locals)
+                push!(destination, :($symbol = $rhs))
+            elseif statement isa _ExprStmt
+                value = _sm_rhs(statement.expr, block_syms, plan, fields,
+                    OW, SH, formals, block_locals, false, field_regs)
+                push!(destination, value)
+            elseif statement isa _PlaceWrite
+                emit_write!(statement, destination, block_syms, block_locals)
+            elseif statement isa _Guard
+                statement.op in (:&&, :||) || _sm_reject(
+                    "unsupported state-machine guard `$(statement.op)`")
+                condition = _sm_rhs(statement.cond, block_syms, plan, fields,
+                    OW, SH, formals, block_locals, false, field_regs)
+                branch = Any[]
+                emit_block!(statement.body, branch, copy(block_syms),
+                            copy(block_locals))
+                test = statement.op === :&& ? condition : :(!$condition)
+                push!(destination, Expr(:if, test, Expr(:block, branch...), nothing))
+            elseif statement isa _If
+                condition = _sm_rhs(statement.cond, block_syms, plan, fields,
+                    OW, SH, formals, block_locals, false, field_regs)
+                then_branch = Any[]
+                else_branch = Any[]
+                emit_block!(statement.thenb, then_branch, copy(block_syms),
+                            copy(block_locals))
+                emit_block!(statement.elseb, else_branch, copy(block_syms),
+                            copy(block_locals))
+                push!(destination, Expr(:if, condition,
+                    Expr(:block, then_branch...), Expr(:block, else_branch...)))
+            elseif statement isa _For
+                length(statement.var) == 1 || _sm_reject(
+                    "state-machine loop must bind one local")
+                name = only(statement.var)
+                haskey(block_syms, (:local, name)) && _sm_reject(
+                    "state-machine loop variable `$name` shadows an active local")
+                loop_syms = copy(block_syms)
+                loop_locals = copy(block_locals)
+                variable = fresh(:__smm_loop_, name)
+                loop_syms[(:local, name)] = variable
+                loop_locals[name] = false
+                iterator = _sm_rhs(statement.iter, block_syms, plan, fields,
+                    OW, SH, formals, block_locals, false, field_regs)
+                loop_body = Any[]
+                emit_block!(statement.body, loop_body, loop_syms, loop_locals)
+                push!(destination, Expr(:for, Expr(:(=), variable, iterator),
+                                        Expr(:block, loop_body...)))
+            elseif statement isa _Return
+                value = statement.value === nothing ? nothing :
+                    _sm_rhs(statement.value, block_syms, plan, fields, OW, SH,
+                            formals, block_locals, false, field_regs)
+                push!(destination, Expr(:return, value))
+            else
+                _sm_reject("unsupported state-machine statement " *
+                           "`$(typeof(statement))`")
+            end
+        end
+        nothing
+    end
+    emit_block!(ir.body, statements, syms, locals)
+    fn = compile(:((methods, owned, shared, handles, args, kw) ->
+        $(Expr(:block, statements...))))
+    forest = _sm_machine_domain_forest(ir, plan, fields, OW, SH,
+        typeauth, field_regs, methods_by_id)
+    _sm_compiled_call(fn), forest
+end
+
 # ---- exact eachcol orchestration + concrete overload set --------------------------------------------------
 
 struct _SMUnannotated end
@@ -848,6 +1294,10 @@ _sm_arm(::Type{T}, req::Tuple, names::Tuple, ::Type{F}, fn) where {T,F} =
 
 struct _SMSet{Name,Arms<:Tuple}
     arms::Arms
+end
+
+struct _SMMachineSet{Name,Declared,Forest,Fn}
+    fn::Fn
 end
 
 (s::_SMSet)(owned, shared, handles, x; kwargs...) = begin
@@ -919,6 +1369,48 @@ end
 _sm_dispatch(s::_SMSet, owned, shared, handles, x, kw::NamedTuple) =
     _sm_dispatch(s, NamedTuple(), owned, shared, handles, x, kw)
 
+function _sm_machine_declared_types(ir::MethodIR, typeauth)
+    Tuple{(formal.type === nothing ? _SMUnannotated :
+           _resolve_sm_annotation(typeauth, formal.type)
+           for formal in ir.formals)...}
+end
+
+function _sm_machine_actual_domain_ok(::Type{Actual}, ::Type{Declared}) where
+        {Actual,Declared}
+    Declared === _SMUnannotated || Actual <: Declared || return false
+    Actual <: AbstractMatrix && return _kernel_dom_num_matrix(Actual)
+    Actual <: AbstractArray && return _sm_builtin_array(Actual)
+    _kernel_dom_num_scalar(Actual)
+end
+
+function _sm_dispatch_args(s::_SMSet, methods, owned, shared, handles,
+                           args::Tuple, kw::NamedTuple)
+    length(args) == 1 || throw(MethodError(s, args))
+    _sm_dispatch(s, methods, owned, shared, handles, only(args), kw)
+end
+
+@generated function _sm_dispatch_args(
+        s::_SMMachineSet{Name,Declared,Forest,Fn}, methods, owned,
+        shared, handles, args::Tuple, kw::NamedTuple) where
+        {Name,Declared,Forest,Fn}
+    isempty(kw.parameters[1]) || return :(
+        throw(ArgumentError("state-machine method `$Name` rejects keywords")))
+    actual = Tuple(args.parameters)
+    declared = Tuple(Declared.parameters)
+    length(actual) == length(declared) || return :(throw(MethodError(s, args)))
+    all(_sm_machine_actual_domain_ok(A, D)
+        for (A, D) in zip(actual, declared)) || return :(
+            throw(ArgumentError("state-machine method `$Name` rejects its positional argument domain")))
+    try
+        _sm_validate_forest(Forest, actual, NamedTuple{})
+    catch error
+        message = error isa _LLowerReject ? error.reason : sprint(showerror, error)
+        return :(throw(ArgumentError($message)))
+    end
+    :(RuntimeGeneratedFunctions.generated_callfunc(getfield(s, :fn), methods,
+        owned, shared, handles, args, kw))
+end
+
 @generated function _sm_dispatch(s::_SMSet{Name,Arms}, methods, owned,
         shared, handles, x, kw::NamedTuple) where {Name,Arms}
     Ts = [A.parameters[1] for A in Arms.parameters]
@@ -949,6 +1441,17 @@ _sm_dispatch(s::_SMSet, owned, shared, handles, x, kw::NamedTuple) =
     :(return $call)
 end
 
+function _sm_nested_statement(body, predicate)
+    any(body) do statement
+        predicate(statement) ||
+        (statement isa _If &&
+            (_sm_nested_statement(statement.thenb, predicate) ||
+             _sm_nested_statement(statement.elseb, predicate))) ||
+        (statement isa Union{_Guard,_For,_While} &&
+            _sm_nested_statement(statement.body, predicate))
+    end
+end
+
 function compile_stateful_methods(skel, pf::_PreparedFactory, ::Type{OW},
                                   ::Type{SH}, field_regs=Dict{Symbol,Any}()) where {OW,SH}
     irs_all = method_irs(skel); plan = kernel_prepared_plan(pf)
@@ -960,6 +1463,22 @@ function compile_stateful_methods(skel, pf::_PreparedFactory, ::Type{OW},
     pairs = Pair{Symbol,Any}[]
     for name in sort!(collect(keys(byname)))
         irs = sort(byname[name]; by = ir -> ir.id.decl)
+        if length(irs) == 1
+            ir = only(irs)
+            _sm_nested_statement(ir.body, statement -> statement isa _While) &&
+                _sm_reject("structured state-machine lowering does not admit while loops")
+            positional = count(formal -> formal.kind === :pos, ir.formals)
+            structured = _sm_nested_statement(
+                ir.body, statement -> statement isa Union{_If,_Guard})
+            if positional != 1 || structured
+                fn, forest = compile_state_machine_method(
+                    pf, OW, SH, ir, typeauth, field_regs, methods_by_id)
+                declared = _sm_machine_declared_types(ir, typeauth)
+                push!(pairs, name => _SMMachineSet{name,declared,forest,
+                    typeof(fn)}(fn))
+                continue
+            end
+        end
         segment_fns = Dict{MethodId,Any}(); segment_forests = Dict{MethodId,Any}()
         segment_types = Dict{MethodId,_Formal}(); arms = Any[]; orchestrations = MethodIR[]
         for ir in irs
@@ -1027,6 +1546,57 @@ struct _FunctionalStatefulTransition{Names,F,E,P}
     f::F
     ensures::E
     ports::P
+end
+
+# Structured MethodIR uses a tuple ABI because authored methods may have any
+# fixed positional arity.  The wrapper is immutable compiler metadata just as
+# the straight-line transition above is; only state and arguments are dynamic.
+struct _FunctionalStateMachineTransition{
+        Names,ArrayNames,Iterations,ArgumentTypes,Declared,Forest,F,P}
+    f::F
+    ports::P
+end
+
+_sm_functional_argument_type_ok(::Type{Actual}, ::Type{Expected}) where
+    {Actual,Expected} = Actual === Expected
+
+function (transition::_FunctionalStateMachineTransition)(state, arguments...)
+    _sm_functional_machine_call(transition, state, arguments)
+end
+
+function _sm_functional_machine_call(
+        transition::_FunctionalStateMachineTransition{
+            Names,ArrayNames,Iterations,ArgumentTypes,Declared,Forest},
+        state, arguments::Tuple) where
+        {Names,ArrayNames,Iterations,ArgumentTypes,Declared,Forest}
+    actual = typeof.(arguments)
+    expected = Tuple(ArgumentTypes.parameters)
+    length(actual) == length(expected) ||
+        throw(MethodError(transition, (state, arguments...)))
+    all(_sm_functional_argument_type_ok(A, E)
+        for (A, E) in zip(actual, expected)) ||
+        throw(ArgumentError(
+            "functional state-machine arguments do not match their logical contract"))
+    for name in ArrayNames
+        message = "functional state-machine array `$name` has a zero axis"
+        all(>(0), size(getfield(state, name))) || throw(ArgumentError(message))
+    end
+    RuntimeGeneratedFunctions.generated_callfunc(
+        getfield(transition, :f), getfield(transition, :ports), state,
+        arguments)
+end
+
+@inline _sm_predicated_select(active, new, old) = ifelse.(active, new, old)
+@inline _sm_predicated_and(lhs, rhs) = lhs .& rhs
+@inline _sm_predicated_or(lhs, rhs) = lhs .| rhs
+@inline _sm_predicated_not(value) = .!value
+@inline _sm_safe_index(index, array, ::Val{Dimension}) where {Dimension} =
+    clamp.(index, one(index), size(array, Dimension))
+@inline _sm_functional_index(array, indices...) = getindex(array, indices...)
+@inline function _sm_functional_indexed_copy(array, value, indices...)
+    result = copy(array)
+    setindex!(result, value, indices...)
+    result
 end
 
 function (transition::_FunctionalStatefulTransition)(state, argument)
@@ -1137,7 +1707,7 @@ function _sm_functional_sibling_rhs(call::_CallExpr, syms, plan::_KernelPlan,
     any(pair -> pair.first === _KMIR_KWSPLAT, call.kw) && _sm_reject(
         "functional value-position sibling call does not admit a keyword splat")
 
-    callee_syms = copy(syms)
+    callee_syms = Dict{Any,Any}(syms)
     callee_formals = Dict{Symbol,Bool}()
     position = 0
     for formal in ir.formals
@@ -1227,6 +1797,564 @@ function _sm_functional_sibling_rhs(call::_CallExpr, syms, plan::_KernelPlan,
         end
     end
     _sm_reject("functional sibling method has no return")
+end
+
+function _sm_functional_machine_rhs(x, syms, plan::_KernelPlan, fields,
+        ::Type{OW}, ::Type{SH}, formals, locals, dot::Bool, field_regs,
+        methods_by_id, stack) where {OW,SH}
+    if x isa _SelfField
+        name = x.path[end]
+        length(x.path) == 1 && haskey(fields, name) &&
+            haskey(syms, (:field, name)) || _sm_reject(
+            "functional state-machine read requires one known state field")
+        syms[(:field, name)]
+    elseif x isa _FormalRef
+        haskey(syms, (:formal, x.arg)) || _sm_reject(
+            "functional state-machine reads unbound formal `$(x.arg)`")
+        syms[(:formal, x.arg)]
+    elseif x isa _LocalRef
+        haskey(syms, (:local, x.name)) || _sm_reject(
+            "functional state-machine reads local `$(x.name)` before assignment")
+        syms[(:local, x.name)]
+    elseif x isa _Lit
+        x.value
+    elseif x isa _CallableRef
+        _sm_exact_callable(x)
+    elseif x isa _TupleExpr
+        Expr(:tuple, (_sm_functional_machine_rhs(arg, syms, plan, fields,
+            OW, SH, formals, locals, false, field_regs, methods_by_id, stack)
+            for arg in x.elts)...)
+    elseif x isa _Index
+        base = _sm_functional_machine_rhs(x.base, syms, plan, fields,
+            OW, SH, formals, locals, false, field_regs, methods_by_id, stack)
+        indices = Any[]
+        index_seed = get(syms, (:compiler, :index_seed), nothing)
+        index_seed === nothing && _sm_reject(
+            "functional state-machine index has no traced integer carrier")
+        for (dimension, index) in enumerate(x.idxs)
+            value = _sm_functional_machine_rhs(index, syms, plan, fields,
+                OW, SH, formals, locals, false, field_regs, methods_by_id,
+                stack)
+            traced_value = :($value + zero($index_seed))
+            push!(indices,
+                :(_sm_safe_index($traced_value, $base, Val($dimension))))
+        end
+        :(_sm_functional_index($base, $(indices...)))
+    elseif x isa _IfExpr
+        condition = _sm_functional_machine_rhs(x.cond, syms, plan, fields,
+            OW, SH, formals, locals, false, field_regs, methods_by_id, stack)
+        then_value = _sm_functional_machine_rhs(x.thenv, syms, plan, fields,
+            OW, SH, formals, locals, false, field_regs, methods_by_id, stack)
+        else_value = _sm_functional_machine_rhs(x.elsev, syms, plan, fields,
+            OW, SH, formals, locals, false, field_regs, methods_by_id, stack)
+        :(_sm_predicated_select($condition, $then_value, $else_value))
+    elseif x isa _Short
+        lhs = _sm_functional_machine_rhs(x.lhs, syms, plan, fields,
+            OW, SH, formals, locals, false, field_regs, methods_by_id, stack)
+        rhs = _sm_functional_machine_rhs(x.rhs, syms, plan, fields,
+            OW, SH, formals, locals, false, field_regs, methods_by_id, stack)
+        x.op === :&& ? :(_sm_predicated_and($lhs, $rhs)) :
+        x.op === :|| ? :(_sm_predicated_or($lhs, $rhs)) :
+        _sm_reject("unsupported functional short-circuit operator `$(x.op)`")
+    elseif x isa _RegisteredCall
+        f = _sm_exact_callee(x; allow_broadcast=dot)
+        arguments = Any[_sm_functional_machine_rhs(arg, syms, plan, fields,
+            OW, SH, formals, locals, dot, field_regs, methods_by_id, stack)
+            for arg in x.args]
+        dot && _sm_isvector(x, plan, fields, OW, SH, formals, locals) ?
+            Expr(:call, GlobalRef(Base, :broadcasted), f, arguments...) :
+            Expr(:call, f, arguments...)
+    elseif x isa _FieldCall
+        length(x.path) == 1 || _sm_reject(
+            "functional state-machine callable port must be direct")
+        isempty(x.kw) || _sm_reject(
+            "functional state-machine callable port rejects keywords")
+        dot && _sm_reject(
+            "functional state-machine callable port rejects broadcasting")
+        name = only(x.path)
+        _sm_pure_port(field_regs, name)
+        arguments = Any[_sm_functional_machine_rhs(arg, syms, plan, fields,
+            OW, SH, formals, locals, false, field_regs, methods_by_id, stack)
+            for arg in x.pos]
+        Expr(:call,
+            :(getfield(getfield(ports, $(QuoteNode(name))),
+                       :functional_lowering)), arguments...)
+    elseif x isa _CallExpr
+        _sm_functional_machine_sibling_rhs(x, syms, plan, fields, OW, SH,
+            formals, locals, field_regs, methods_by_id, stack)
+    else
+        _sm_reject("unsupported functional state-machine rhs `$(typeof(x))`")
+    end
+end
+
+function _sm_functional_machine_sibling_rhs(call::_CallExpr, syms,
+        plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH}, caller_formals,
+        caller_locals, field_regs, methods_by_id, stack) where {OW,SH}
+    call.target isa _SelfRef || _sm_reject(
+        "functional state-machine sibling call must target current state")
+    length(call.candidates) == 1 || _sm_reject(
+        "functional state-machine sibling call must resolve exactly")
+    method_id = only(call.candidates).id
+    haskey(methods_by_id, method_id) || _sm_reject(
+        "functional state-machine sibling has no captured MethodIR")
+    method_id in stack && _sm_reject(
+        "recursive functional state-machine value call is unsupported")
+    ir = methods_by_id[method_id]
+    all(formal -> formal.kind === :pos, ir.formals) || _sm_reject(
+        "functional state-machine sibling requires positional-only formals")
+    isempty(call.kw) || _sm_reject(
+        "functional state-machine sibling rejects keyword actuals")
+    length(call.pos) == length(ir.formals) || _sm_reject(
+        "functional state-machine sibling arity mismatch")
+
+    callee_syms = Dict{Any,Any}(syms)
+    callee_formals = Dict{Symbol,Bool}()
+    for (formal, actual) in zip(ir.formals, call.pos)
+        callee_syms[(:formal, formal.name)] = _sm_functional_machine_rhs(
+            actual, syms, plan, fields, OW, SH, caller_formals,
+            caller_locals, false, field_regs, methods_by_id, stack)
+        # The pure conditional helper admitted below operates on scalars. More
+        # general sibling array helpers require their own typed contract.
+        formal.type === nothing || _sm_reject(
+            "functional conditional sibling currently requires unannotated scalar formals")
+        callee_formals[formal.name] = false
+    end
+    # Value-position helpers admitted here are deliberately pure.  The first
+    # structured capability is a source-visible conditional with one terminal
+    # value in each branch; effects remain in the caller.
+    length(ir.body) == 1 && only(ir.body) isa _If || _sm_reject(
+        "functional state-machine sibling must be one conditional value")
+    branch = only(ir.body)
+    nested = [stack..., method_id]
+    branch_value = function (body)
+        length(body) == 1 || _sm_reject(
+            "functional state-machine sibling branch must contain one value")
+        statement = only(body)
+        value = statement isa _ExprStmt ? statement.expr :
+                statement isa _Return ? statement.value : nothing
+        value === nothing && _sm_reject(
+            "functional state-machine sibling branch has no value")
+        _sm_functional_machine_rhs(value, callee_syms, plan, fields, OW, SH,
+            callee_formals, Dict{Symbol,Bool}(), false, field_regs,
+            methods_by_id, nested)
+    end
+    condition = _sm_functional_machine_rhs(branch.cond, callee_syms, plan,
+        fields, OW, SH, callee_formals, Dict{Symbol,Bool}(), false,
+        field_regs, methods_by_id, nested)
+    then_value = branch_value(branch.thenb)
+    else_value = branch_value(branch.elseb)
+    :(_sm_predicated_select($condition, $then_value, $else_value))
+end
+
+function _functional_state_machine_method(
+        kernel::_StatefulKernel{S,PF,RT,OW,SH,B}, ir::MethodIR,
+        max_iterations::Int, ::Type{ArgumentTypes}, ::Type{Declared},
+        ::Type{Forest}) where {S,PF,RT,OW,SH,B,ArgumentTypes,Declared,Forest}
+    max_iterations >= 1 || _sm_reject(
+        "functional state-machine bound must be positive")
+    _sm_validate_machine_formals(ir)
+    argument_types = Tuple(ArgumentTypes.parameters)
+    declared = Tuple(Declared.parameters)
+    length(argument_types) == length(declared) || _sm_reject(
+        "functional state-machine logical argument arity mismatch")
+    all(_sm_machine_actual_domain_ok(actual, expected)
+        for (actual, expected) in zip(argument_types, declared)) || _sm_reject(
+        "functional state-machine logical arguments violate declared domains")
+    _sm_validate_forest(Forest, argument_types, NamedTuple{})
+
+    skeleton = getfield(kernel, :skeleton)
+    field_regs = _stateful_field_regs(getfield(kernel, :bindings))
+    methods_by_id = Dict{MethodId,MethodIR}(
+        method.id => method for method in method_irs(skeleton))
+    plan = kernel_prepared_plan(getfield(kernel, :prepared))
+    isempty(kernel_plan_producer(plan)) || _sm_reject(
+        "functional structured lowering currently requires source-only state fields")
+    fields = _exec_canon_map(plan)
+    names = _functional_state_names(kernel)
+    aliases = Dict{Int,Vector{Symbol}}()
+    for name in names
+        canon = get(fields, name, 0)
+        canon == 0 || push!(get!(aliases, canon, Symbol[]), name)
+    end
+    array_name_buffer = Symbol[]
+    for name in names
+        canon = get(fields, name, 0)
+        canon != 0 && _pp_fieldtype(plan, canon, OW, SH) <: AbstractArray &&
+            push!(array_name_buffer, name)
+    end
+    array_names = Tuple(array_name_buffer)
+
+    statements = Any[]
+    base_syms = Dict{Any,Symbol}()
+    formals = Dict{Symbol,Bool}()
+    locals = Dict{Symbol,Bool}()
+    serial = Ref(0)
+    fresh(prefix, name=:value) = begin
+        serial[] += 1
+        Symbol(prefix, name, "_", serial[])
+    end
+    bind! = function (expression, prefix, name=:value)
+        symbol = fresh(prefix, name)
+        push!(statements, :(local $symbol = $expression))
+        symbol
+    end
+
+    for name in names
+        symbol = fresh(:__sfm_field_, name)
+        base_syms[(:field, name)] = symbol
+        push!(statements,
+            :(local $symbol = getfield(state, $(QuoteNode(name)))))
+    end
+    initial_field_syms = copy(base_syms)
+    predicate_index = findfirst(names) do name
+        canon = get(fields, name, 0)
+        canon == 0 && return false
+        role, _ = kernel_plan_field(plan, canon)
+        field_type = _pp_fieldtype(plan, canon, OW, SH)
+        role === :owned && _kernel_dom_int_scalar(field_type) &&
+            field_type !== Bool
+    end
+    predicate_index === nothing && _sm_reject(
+        "functional state-machine requires one owned builtin scalar predicate carrier")
+    predicate_name = names[predicate_index]
+    predicate_source = base_syms[(:field, predicate_name)]
+    base_syms[(:compiler, :index_seed)] = predicate_source
+    predicate_true = bind!(
+        :(zero($predicate_source) == zero($predicate_source)),
+        :__sfm_predicate_true_)
+    predicate_false = bind!(
+        :(_sm_predicated_not($predicate_true)), :__sfm_predicate_false_)
+    for (position, formal) in enumerate(ir.formals)
+        symbol = fresh(:__sfm_formal_, formal.name)
+        base_syms[(:formal, formal.name)] = symbol
+        formals[formal.name] = formal.type !== nothing &&
+            _resolve_sm_annotation(kernel_type_authorities(skeleton),
+                                   formal.type) <: AbstractArray
+        push!(statements, :(local $symbol = arguments[$position]))
+    end
+    control_overflow = bind!(predicate_false, :__sfm_control_overflow_)
+    return_seen = bind!(predicate_false, :__sfm_return_seen_)
+    return_value = Ref{Any}(nothing)
+
+    combined = function (local_syms)
+        result = copy(base_syms)
+        for (name, symbol) in local_syms
+            result[(:local, name)] = symbol
+        end
+        result
+    end
+    rhs = (expression, local_syms, local_types) ->
+        _sm_functional_machine_rhs(expression, combined(local_syms), plan,
+            fields, OW, SH, formals, local_types, false, field_regs,
+            methods_by_id, MethodId[ir.id])
+    mark_invalid! = function (active, valid)
+        invalid = bind!(
+            :(_sm_predicated_and($active, _sm_predicated_not($valid))),
+            :__sfm_invalid_)
+        control_overflow = bind!(
+            :(_sm_predicated_or($control_overflow, $invalid)),
+            :__sfm_control_overflow_)
+        bind!(:(_sm_predicated_and($active, $valid)), :__sfm_active_)
+    end
+    walk_bounds! = nothing
+    walk_bounds! = function (expression, initial_active,
+                             local_syms, local_types)
+        active = initial_active
+        if expression isa _Index
+            active = walk_bounds!(expression.base, active,
+                                  local_syms, local_types)
+            for index in expression.idxs
+                active = walk_bounds!(index, active, local_syms, local_types)
+            end
+            base = rhs(expression.base, local_syms, local_types)
+            valid = bind!(predicate_true, :__sfm_index_valid_)
+            for (dimension, index) in enumerate(expression.idxs)
+                raw = rhs(index, local_syms, local_types)
+                lower = bind!(:($raw >= one($raw)), :__sfm_index_lower_)
+                upper = bind!(:($raw <= size($base, $dimension)),
+                              :__sfm_index_upper_)
+                valid = bind!(
+                    :(_sm_predicated_and($valid,
+                        _sm_predicated_and($lower, $upper))),
+                    :__sfm_index_valid_)
+            end
+            return mark_invalid!(active, valid)
+        elseif expression isa _IfExpr
+            active = walk_bounds!(expression.cond, active,
+                                  local_syms, local_types)
+            condition = bind!(rhs(expression.cond, local_syms, local_types),
+                              :__sfm_condition_)
+            then_active = bind!(
+                :(_sm_predicated_and($active, $condition)),
+                :__sfm_active_)
+            else_active = bind!(
+                :(_sm_predicated_and($active,
+                    _sm_predicated_not($condition))), :__sfm_active_)
+            then_remaining = walk_bounds!(expression.thenv, then_active,
+                                          local_syms, local_types)
+            else_remaining = walk_bounds!(expression.elsev, else_active,
+                                          local_syms, local_types)
+            return bind!(
+                :(_sm_predicated_or($then_remaining, $else_remaining)),
+                :__sfm_active_)
+        elseif expression isa _Short
+            active = walk_bounds!(expression.lhs, active,
+                                  local_syms, local_types)
+            lhs = bind!(rhs(expression.lhs, local_syms, local_types),
+                        :__sfm_condition_)
+            execute = expression.op === :&& ? lhs :
+                expression.op === :|| ?
+                    bind!(:(_sm_predicated_not($lhs)), :__sfm_not_) :
+                    _sm_reject("unsupported bounded short-circuit operator `$(expression.op)`")
+            rhs_active = bind!(
+                :(_sm_predicated_and($active, $execute)), :__sfm_active_)
+            skipped = bind!(
+                :(_sm_predicated_and($active,
+                    _sm_predicated_not($execute))), :__sfm_active_)
+            rhs_remaining = walk_bounds!(expression.rhs, rhs_active,
+                                         local_syms, local_types)
+            return bind!(
+                :(_sm_predicated_or($rhs_remaining, $skipped)),
+                :__sfm_active_)
+        end
+
+        children = expression isa _RegisteredCall ? expression.args :
+            expression isa _TupleExpr ? expression.elts :
+            expression isa _CallExpr ?
+                (expression.pos..., (pair.second for pair in expression.kw)...) :
+            expression isa _FieldCall ?
+                (expression.pos..., (pair.second for pair in expression.kw)...) : ()
+        for child in children
+            active = walk_bounds!(child, active, local_syms, local_types)
+        end
+        active
+    end
+    set_field! = function (name::Symbol, value)
+        canon = get(fields, name, 0)
+        canon == 0 && _sm_reject(
+            "functional state-machine write has no canonical slot for `$name`")
+        symbol = bind!(value, :__sfm_field_write_, name)
+        for alias in get(aliases, canon, Symbol[name])
+            base_syms[(:field, alias)] = symbol
+        end
+        symbol
+    end
+
+    emit_write! = function (statement::_PlaceWrite, active,
+                            local_syms, local_types)
+        statement.root === :self && statement.owner !== nothing &&
+            length(statement.owner) == 1 || _sm_reject(
+            "functional state-machine write must target one owned field")
+        name = only(statement.owner)
+        canon = get(fields, name, 0)
+        canon == 0 && _sm_reject(
+            "functional state-machine write has no canonical slot for `$name`")
+        role, _ = kernel_plan_field(plan, canon)
+        role === :owned || _sm_reject(
+            "functional state-machine writes shared authority `$name`")
+        statement.dot && _sm_reject(
+            "functional state-machine writes reject authored broadcasting")
+        value = rhs(statement.rhs, local_syms, local_types)
+        old = base_syms[(:field, name)]
+        if statement.target isa _SelfField
+            _pp_fieldtype(plan, canon, OW, SH) <: AbstractArray && _sm_reject(
+                "functional state-machine array writes require explicit indices")
+            set_field!(name,
+                :(_sm_predicated_select($active, $value, $old)))
+        elseif statement.target isa _Index
+            statement.target.base isa _SelfField &&
+                length(statement.target.base.path) == 1 &&
+                only(statement.target.base.path) === name || _sm_reject(
+                "functional state-machine indexed write must target its field directly")
+            indices = Any[]
+            for (dimension, index) in enumerate(statement.target.idxs)
+                raw = rhs(index, local_syms, local_types)
+                raw = :($raw + zero($predicate_source))
+                push!(indices,
+                    :(_sm_safe_index($raw, $old, Val($dimension))))
+            end
+            selected = fresh(:__sfm_indexed_value_, name)
+            push!(statements, :(local $selected = _sm_predicated_select(
+                $active, $value,
+                _sm_functional_index($old, $(indices...)))))
+            candidate = bind!(
+                :(_sm_functional_indexed_copy(
+                    $old, $selected, $(indices...))),
+                :__sfm_indexed_copy_, name)
+            set_field!(name, candidate)
+        else
+            _sm_reject("unsupported functional state-machine write target " *
+                       "`$(typeof(statement.target))`")
+        end
+        nothing
+    end
+
+    emit_block! = nothing
+    emit_block! = function (body, initial_active, local_syms, local_types)
+        active = initial_active
+        for statement in body
+            if statement isa _LocalAssign
+                statement.style === :single || _sm_reject(
+                    "functional state-machine local assignment requires one name")
+                name = only(statement.lhs)
+                active = walk_bounds!(statement.rhs, active,
+                                      local_syms, local_types)
+                value = rhs(statement.rhs, local_syms, local_types)
+                if haskey(local_syms, name)
+                    symbol = local_syms[name]
+                    push!(statements, :($symbol = _sm_predicated_select(
+                        $active, $value, $symbol)))
+                else
+                    symbol = fresh(:__sfm_local_, name)
+                    local_syms[name] = symbol
+                    push!(statements, :(local $symbol = $value))
+                end
+                local_types[name] = _sm_isvector(
+                    statement.rhs, plan, fields, OW, SH, formals,
+                    local_types)
+            elseif statement isa _ExprStmt
+                _sm_reject("functional state-machine effect-position " *
+                           "expressions are not admitted")
+            elseif statement isa _PlaceWrite
+                active = walk_bounds!(statement.rhs, active,
+                                      local_syms, local_types)
+                statement.target isa _Index && (active = walk_bounds!(
+                    statement.target, active, local_syms, local_types))
+                emit_write!(statement, active, local_syms, local_types)
+            elseif statement isa _Guard
+                statement.op in (:&&, :||) || _sm_reject(
+                    "unsupported functional state-machine guard `$(statement.op)`")
+                active = walk_bounds!(statement.cond, active,
+                                      local_syms, local_types)
+                condition = bind!(rhs(statement.cond, local_syms, local_types),
+                                  :__sfm_condition_)
+                execute = statement.op === :&& ? condition :
+                    bind!(:(_sm_predicated_not($condition)), :__sfm_not_)
+                branch_active = bind!(
+                    :(_sm_predicated_and($active, $execute)), :__sfm_active_)
+                skipped = bind!(
+                    :(_sm_predicated_and($active,
+                        _sm_predicated_not($execute))), :__sfm_active_)
+                remaining = emit_block!(statement.body, branch_active,
+                    copy(local_syms), copy(local_types))
+                active = bind!(
+                    :(_sm_predicated_or($remaining, $skipped)),
+                    :__sfm_active_)
+            elseif statement isa _If
+                active = walk_bounds!(statement.cond, active,
+                                      local_syms, local_types)
+                condition = bind!(rhs(statement.cond, local_syms, local_types),
+                                  :__sfm_condition_)
+                then_active = bind!(
+                    :(_sm_predicated_and($active, $condition)),
+                    :__sfm_active_)
+                else_active = bind!(
+                    :(_sm_predicated_and($active,
+                        _sm_predicated_not($condition))), :__sfm_active_)
+                then_remaining = emit_block!(statement.thenb, then_active,
+                    copy(local_syms), copy(local_types))
+                else_remaining = emit_block!(statement.elseb, else_active,
+                    copy(local_syms), copy(local_types))
+                active = bind!(
+                    :(_sm_predicated_or($then_remaining, $else_remaining)),
+                    :__sfm_active_)
+            elseif statement isa _For
+                length(statement.var) == 1 || _sm_reject(
+                    "functional state-machine loop must bind one local")
+                name = only(statement.var)
+                haskey(local_syms, name) && _sm_reject(
+                    "functional state-machine loop variable `$name` shadows an active local")
+                statement.iter isa _RegisteredCall || _sm_reject(
+                    "functional state-machine loop requires captured Base.Colon")
+                iterator = statement.iter
+                _sm_exact_callee(iterator) === Base.:(:) &&
+                    !iterator.broadcast && isempty(iterator.kw) &&
+                    length(iterator.args) == 2 || _sm_reject(
+                    "functional state-machine loop requires a two-bound unit range")
+                active = walk_bounds!(iterator.args[1], active,
+                                      local_syms, local_types)
+                active = walk_bounds!(iterator.args[2], active,
+                                      local_syms, local_types)
+                lower = rhs(iterator.args[1], local_syms, local_types)
+                upper = rhs(iterator.args[2], local_syms, local_types)
+                span = bind!(:($upper - $lower + 1), :__sfm_loop_span_, name)
+                within_bound = bind!(:($span <= $max_iterations),
+                                     :__sfm_loop_bound_, name)
+                alive = mark_invalid!(active, within_bound)
+                for offset in 0:(max_iterations - 1)
+                    candidate = bind!(
+                        :($lower + $offset + zero($predicate_source)),
+                                      :__sfm_loop_value_, name)
+                    in_range = bind!(:($candidate <= $upper),
+                                     :__sfm_loop_test_, name)
+                    participates = bind!(
+                        :(_sm_predicated_and($alive, $in_range)),
+                        :__sfm_active_, name)
+                    loop_syms = copy(local_syms)
+                    loop_types = copy(local_types)
+                    loop_syms[name] = candidate
+                    loop_types[name] = false
+                    remaining = emit_block!(statement.body, participates,
+                        loop_syms, loop_types)
+                    returned = bind!(
+                        :(_sm_predicated_and($participates,
+                            _sm_predicated_not($remaining))),
+                        :__sfm_returned_, name)
+                    alive = bind!(
+                        :(_sm_predicated_and($alive,
+                            _sm_predicated_not($returned))),
+                        :__sfm_active_, name)
+                end
+                active = alive
+            elseif statement isa _Return
+                value = if statement.value === nothing
+                    nothing
+                else
+                    active = walk_bounds!(statement.value, active,
+                                          local_syms, local_types)
+                    rhs(statement.value, local_syms, local_types)
+                end
+                if return_value[] === nothing
+                    return_value[] = bind!(value, :__sfm_return_value_)
+                else
+                    push!(statements,
+                        :($(return_value[]) = _sm_predicated_select(
+                            $active, $value, $(return_value[]))))
+                end
+                return_seen = bind!(
+                    :(_sm_predicated_or($return_seen, $active)),
+                    :__sfm_return_seen_)
+                active = bind!(
+                    :(_sm_predicated_and($active, $predicate_false)),
+                    :__sfm_active_)
+            else
+                _sm_reject("unsupported functional state-machine statement " *
+                           "`$(typeof(statement))`")
+            end
+        end
+        active
+    end
+
+    start_active = bind!(predicate_true, :__sfm_active_)
+    emit_block!(ir.body, start_active, Dict{Symbol,Symbol}(), locals)
+    outputs = Any[:(_sm_predicated_select(
+        $control_overflow, $(initial_field_syms[(:field, name)]),
+        $(base_syms[(:field, name)]))) for name in names]
+    result = return_value[] === nothing ? nothing : return_value[]
+    returned = :(_sm_predicated_select(
+        $control_overflow, $predicate_false, $return_seen))
+    push!(statements, :(return (
+        state=NamedTuple{$names}(($(outputs...),)),
+        result=$result,
+        returned=$returned,
+        control_overflow=$control_overflow,
+    )))
+    ports = getfield(getfield(kernel, :bindings), :fields)
+    fn = compile(:((ports, state, arguments) ->
+        $(Expr(:block, statements...))))
+    _FunctionalStateMachineTransition{
+        names,array_names,max_iterations,ArgumentTypes,Declared,Forest,
+        typeof(fn),typeof(ports)}(fn, ports)
 end
 
 function _functional_stateful_method(kernel::_StatefulKernel{S,PF,RT,OW,SH,B},
@@ -1412,12 +2540,35 @@ function _functional_stateful_method(kernel::_StatefulKernel{S,PF,RT,OW,SH,B},
         typeof(ports)}(fn, Tuple(ensures), ports)
 end
 
-function _functionalize_stateful(kernel::_StatefulKernel, ::Val{Name}) where {Name}
+function _functionalize_stateful(kernel::_StatefulKernel, ::Val{Name};
+                                 max_iterations=nothing,
+                                 argument_types=nothing) where {Name}
     methods = Tuple(ir for ir in method_irs(getfield(kernel, :skeleton))
                     if ir.id.name === Name)
     length(methods) == 1 || _sm_reject(
         "functional stateful method `$Name` must have exactly one captured overload")
-    _functional_stateful_method(kernel, only(methods))
+    ir = only(methods)
+    runtime_method = getproperty(getfield(getfield(kernel, :runtime), :methods),
+                                 Name)
+    if runtime_method isa _SMMachineSet
+        argument_types isa Type && argument_types <: Tuple || _sm_reject(
+            "functional state-machine method `$Name` requires a logical Tuple argument_types contract")
+        has_loop = _sm_nested_statement(
+            ir.body, statement -> statement isa _For)
+        bound = max_iterations === nothing ?
+            (has_loop ? _sm_reject(
+                "functional state-machine method `$Name` requires max_iterations") : 1) :
+            (max_iterations isa Integer ? Int(max_iterations) :
+             _sm_reject("max_iterations must be an integer"))
+        runtime_type = typeof(runtime_method)
+        declared = runtime_type.parameters[2]
+        forest = runtime_type.parameters[3]
+        return _functional_state_machine_method(
+            kernel, ir, bound, argument_types, declared, forest)
+    end
+    max_iterations === nothing && argument_types === nothing || _sm_reject(
+        "machine bounds/contracts are only valid for a structured state-machine method")
+    _functional_stateful_method(kernel, ir)
 end
 
 # ============================================================================================
@@ -1895,21 +3046,22 @@ end
 end
 
 stateful_kernel(k::_StatefulKernel) = k
-stateful_call(s::_StatefulState, ::Val{Name}, x; kwargs...) where {Name} =
-    _stateful_call(s, Val(Name), x, values(kwargs))
+stateful_call(s::_StatefulState, ::Val{Name}, args...; kwargs...) where {Name} =
+    _stateful_call_args(s, Val(Name), args, values(kwargs))
 
-function stateful_call!(s::_StatefulState, ::Val{Name}, x; kwargs...) where {Name}
-    _stateful_call(s, Val(Name), x, values(kwargs))
+function stateful_call!(s::_StatefulState, ::Val{Name}, args...; kwargs...) where {Name}
+    _stateful_call_args(s, Val(Name), args, values(kwargs))
     s
 end
 
-@generated function _stateful_call(s::_StatefulState{RT}, ::Val{Name}, x, kw::NamedTuple) where {RT,Name}
+@generated function _stateful_call_args(s::_StatefulState{RT}, ::Val{Name},
+        args::Tuple, kw::NamedTuple) where {RT,Name}
     MS = RT.parameters[1]; names = MS.parameters[1]
     Name in names || return :(throw(ArgumentError("compiled state has no method `$Name`")))
     i = findfirst(==(Name), names)
-    :(_sm_dispatch(getfield(getfield(s, :runtime), :methods)[$i],
+    :(_sm_dispatch_args(getfield(getfield(s, :runtime), :methods)[$i],
         getfield(getfield(s, :runtime), :methods), getfield(s, :owned),
-        getfield(s, :shared), getfield(s, :handles), x, kw))
+        getfield(s, :shared), getfield(s, :handles), args, kw))
 end
 
 stateful_get(s::_StatefulState, ::Val{Name}) where {Name} = _stateful_get(s, Val(Name))

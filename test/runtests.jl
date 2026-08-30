@@ -76,8 +76,10 @@ using .ReactiveKernelsNUTSExample
         include("test_nutpie_diagonal_adaptation.jl")
         include("test_reactivehmc_phasepoint_receipt.jl")
         include("test_reactivehmc_integrator_fixture.jl")
+        include("test_reactivehmc_endpoint_specs.jl")
         include("test_reactivehmc_statistics_receipt.jl")
         include("test_reactivehmc_statistics_fixture.jl")
+        include("test_reactivehmc_statistics_compiler.jl")
     end
     ad_only || include("test_handwritten_benchmarks.jl")
 end
