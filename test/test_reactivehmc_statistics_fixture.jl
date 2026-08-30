@@ -40,6 +40,7 @@ const RHMC_STATISTICS = ReactiveHMCStatisticsFixture
     @test findfirst("idxs[column] = count", source) <
           findfirst("count += 1", source)
     @test occursin("trajectory_overflow && return trajectory_overflow", source)
+    @test occursin("reset_first < 1 || reset_first > trajectory_capacity", source)
     @test occursin("sampling_overflow = true\n            return sampling_overflow", source)
     @test occursin("min1exp(x) = x > zero(x) ? one(x) : exp(x)", source)
     @test occursin("acceptance_sum += min1exp(__self__, dhams[column])", source)

@@ -41,7 +41,8 @@ using ReactiveKernels
     min1exp(x) = x > zero(x) ? one(x) : exp(x)
 
     reset!(pos, dham_dpos, pot) = begin
-        trajectory_overflow = trajectory_capacity < 1
+        trajectory_overflow = trajectory_capacity < 1 ||
+            reset_first < 1 || reset_first > trajectory_capacity
         trajectory_overflow && return trajectory_overflow
         first = reset_first
         count = 1
