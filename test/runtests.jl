@@ -27,6 +27,7 @@ include(joinpath(@__DIR__, "..", "examples", "nuts_runtime.jl"))
 using .ReactiveKernelsNUTSExample
 
 @testset "ReactiveKernels" begin
+    include("test_ci_compiled_modules.jl")
     benchmark_only = ARGS == ["benchmark"]
     ad_only = ARGS == ["ad"]
     if ad_only

@@ -25,27 +25,38 @@ jobs:
           version: ${{ matrix.julia-version }}
           arch: ${{ matrix.julia-arch }}
       - uses: julia-actions/cache@v2
-        with:
-          # Compiled caches are sensitive to Julia's coverage/bounds flags and
-          # RuntimeGeneratedFunctions' generated method worlds. Rebuild them
-          # for each job while retaining package, artifact, and registry caches.
-          cache-compiled: false
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
-        env:
-          # RuntimeGeneratedFunctions 0.5.25's own PrecompileTools workload
-          # hits a world-age MethodError on Julia >=1.12 before RK loads. The
-          # Julia 1 and pre lanes still run the complete bounds-checked suite;
-          # only compiled-module cache generation is bypassed until upstream
-          # fixes it. LTS keeps exercising the ordinary compiled path.
-          JULIA_PKG_PRECOMPILE_AUTO: ${{ matrix.julia-version == 'lts' && '1' || '0' }}
         with:
           # Coverage instrumentation is exercised on LTS. On Julia 1.12/pre it
           # adds counter allocations to the zero-allocation probe, so use those
           # lanes for the ordinary non-coverage, zero-allocation contract instead.
           coverage: ${{ matrix.julia-version == 'lts' }}
           check_bounds: yes
-          compiled_modules: ${{ matrix.julia-version == 'lts' && 'yes' || 'no' }}
+          # Every package acceptance lane exercises Julia's ordinary compiled
+          # module path. Compatibility failures must remain visible rather than
+          # being converted into a cacheless full-suite run.
+          compiled_modules: "yes"
+
+  compiled-module-smoke:
+    name: compiled-module precompile/load (${{ matrix.julia-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        julia-version: ['1', 'pre']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.julia-version }}
+          arch: x64
+      # Deliberately omit julia-actions/cache: this small job proves that a
+      # fresh compiled-module depot can precompile and load the package. If an
+      # upstream precompile regression returns, it fails here directly without
+      # changing the full suite's execution model.
+      - name: Precompile and load ReactiveKernels
+        run: julia --startup-file=no --compiled-modules=yes --project -e 'using Pkg; Pkg.instantiate(); Pkg.precompile(; strict=true); using ReactiveKernels'
 
   nonallocating-integration:
     runs-on: ubuntu-latest
