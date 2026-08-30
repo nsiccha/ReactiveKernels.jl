@@ -65,6 +65,15 @@ end
     end
 end
 
+@kernel scalar_abs_div(abs_value=0.0, quotient=0, count=0) = begin
+    step!(input, numerator, denominator) = begin
+        abs_value = abs(input)
+        quotient = div(numerator, denominator)
+        count += 1
+        return true
+    end
+end
+
 @kernel small_loop(count=0) = begin
     step!(lo::Int8, hi::Int8) = begin
         lo <= hi || return false
