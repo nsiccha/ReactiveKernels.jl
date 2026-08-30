@@ -1,9 +1,7 @@
 using ReactiveKernels
+using ReactiveKernelsCompatibilityExamples: ReactiveHMCExamples
 using Test
 
-if !isdefined(@__MODULE__, :ReactiveHMCExamples)
-    include(joinpath(@__DIR__, "..", "examples", "preexisting_reactivehmc.jl"))
-end
 if !isdefined(@__MODULE__, :ReactiveHMCIntegratorFixture)
     include(joinpath(@__DIR__, "..", "benchmark",
                      "reactivehmc_integrator_kernel_fixture.jl"))

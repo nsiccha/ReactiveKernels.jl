@@ -1,10 +1,8 @@
 using ReactiveKernels
+using ReactiveKernelsCompatibilityExamples: ReactiveHMCExamples
 using Test
 import TOML
 
-if !isdefined(@__MODULE__, :ReactiveHMCExamples)
-    include(joinpath(@__DIR__, "..", "examples", "preexisting_reactivehmc.jl"))
-end
 include(joinpath(@__DIR__, "..", "benchmark", "receipts",
                  "validate_reactivehmc_phasepoints.jl"))
 

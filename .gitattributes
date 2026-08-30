@@ -1,0 +1,5 @@
+# These physical-oracle bodies have byte-exact SHA-256 receipts.
+benchmark/nutpie_diag_oracle.rs text eol=lf
+benchmark/nutpie_diag_oracle.toml text eol=lf
+benchmark/pathfinder_oracle/pathfinder_oracle.py text eol=lf
+benchmark/pathfinder_oracle/pathfinder_oracle.toml text eol=lf

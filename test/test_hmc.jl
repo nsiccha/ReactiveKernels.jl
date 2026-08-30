@@ -213,12 +213,17 @@ end
 end
 
 @testset "eight-schools graph and DI+Enzyme inside NUTS" begin
-    if !isdefined(Main, :EightSchoolsExample)
-        include(joinpath(@__DIR__, "..", "examples", "eight_schools.jl"))
+    if !isdefined(Main, :ReactiveKernelsPPLExamples)
+        if samefile(Base.active_project(), joinpath(@__DIR__, "..", "Project.toml"))
+            package_directory = normpath(joinpath(@__DIR__, "..", "packages"))
+            package_directory in LOAD_PATH || pushfirst!(LOAD_PATH, package_directory)
+        end
+        Base.eval(Main, :(using ReactiveKernelsPPLExamples))
     end
-    model = Main.EightSchoolsExample.build_eight_schools_graph()
-    observations = Main.EightSchoolsExample.EIGHT_SCHOOLS_Y
-    scales = Main.EightSchoolsExample.EIGHT_SCHOOLS_SIGMA
+    eight_schools = Main.ReactiveKernelsPPLExamples.EightSchoolsExample
+    model = eight_schools.build_eight_schools_graph()
+    observations = eight_schools.EIGHT_SCHOOLS_Y
+    scales = eight_schools.EIGHT_SCHOOLS_SIGMA
     density_kernel = prepare(
         model.graph;
         have = (

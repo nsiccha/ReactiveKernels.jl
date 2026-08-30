@@ -1,0 +1,18 @@
+name = "ReactiveKernelsCompatibilityExamples"
+uuid = "b8c154ef-4cb8-413d-9282-0e653aa014e1"
+authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+ReactiveKernels = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
+
+[compat]
+ReactiveKernels = "0.1"
+julia = "1.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]

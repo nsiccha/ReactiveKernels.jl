@@ -1,3 +1,22 @@
+using Pkg
+
+const _REPOSITORY_ROOT = normpath(joinpath(@__DIR__, ".."))
+const _ROOT_PROJECT = joinpath(_REPOSITORY_ROOT, "Project.toml")
+const _ROOT_TEST_PACKAGE_PATHS = (
+    joinpath(_REPOSITORY_ROOT, "packages", "ReactiveKernelsCompatibilityExamples"),
+    joinpath(_REPOSITORY_ROOT, "packages", "ReactiveKernelsDistributionKernels"),
+    joinpath(_REPOSITORY_ROOT, "packages", "ReactiveKernelsPPLExamples"),
+)
+
+# `Pkg.test` evaluates this file in a temporary test environment. Julia 1.10
+# ignores the nested projects' `[sources]` entries, so materialize the local
+# packages used by the cross-package HMC acceptance before loading the suite.
+# A direct `julia --project=. test/runtests.jl` keeps using the explicitly
+# prepared `packages/` environment and must not mutate the root Project.toml.
+if !samefile(Base.active_project(), _ROOT_PROJECT)
+    Pkg.develop([PackageSpec(path = path) for path in _ROOT_TEST_PACKAGE_PATHS])
+end
+
 using ReactiveKernels
 using Test
 
@@ -9,22 +28,9 @@ using .ReactiveKernelsNUTSExample
 
 @testset "ReactiveKernels" begin
     benchmark_only = ARGS == ["benchmark"]
-    distributions_only = ARGS == ["distributions"]
     ad_only = ARGS == ["ad"]
-    ppl_ad_only = ARGS == ["ppl-ad"]
-    batched_only = ARGS == ["batched"]
-    bijectors_only = ARGS == ["bijectors"]
-    if distributions_only
-        include("test_distributions_example.jl")
-    elseif ad_only
+    if ad_only
         include("test_ad.jl")
-    elseif ppl_ad_only
-        include("test_ppl_enzyme.jl")
-    elseif batched_only
-        include("test_batched_example.jl")
-    elseif bijectors_only
-        include("test_bijectors_example.jl")
-        include("test_bijectors_enzyme.jl")
     elseif !benchmark_only
         include("test_stateless.jl")
         include("test_ad.jl")
@@ -56,18 +62,8 @@ using .ReactiveKernelsNUTSExample
         include("test_stateful.jl")
         include("test_visualization.jl")
         include("test_adversarial.jl")
-        include("test_eight_schools_example.jl")
-        include("test_linear_regression_example.jl")
-        include("test_beta_binomial_example.jl")
-        include("test_poisson_gamma_example.jl")
-        include("test_dugongs_example.jl")
-        include("test_arma11_example.jl")
-        include("test_gaussian_mixture_example.jl")
-        include("test_bijectors_example.jl")
-        include("test_bijectors_enzyme.jl")
-        include("test_ppl_enzyme.jl")
-        include("test_ppl_docs_source_authority.jl")
         include("test_hmc.jl")
+        include("test_pathfinder.jl")
         include("test_reactive_sampler_baseline.jl")
         include("test_reactive_nuts.jl")
         include("test_reactive_adaptation.jl")
@@ -75,17 +71,12 @@ using .ReactiveKernelsNUTSExample
         include("test_reactive_facade_ca9.jl")
         include("test_benchmark_smoke.jl")
         include("test_online_stats_example.jl")
-        include("test_distributions_example.jl")
-        include("test_batched_example.jl")
-        include("test_hmc_example.jl")
-        include("test_preexisting_examples.jl")
+        include("test_nutpie_diagonal_adaptation.jl")
         include("test_reactivehmc_integrator_fixture.jl")
         include("test_reactivehmc_endpoint_specs.jl")
         include("test_reactivehmc_statistics_receipt.jl")
         include("test_reactivehmc_statistics_fixture.jl")
         include("test_reactivehmc_statistics_compiler.jl")
-        include("test_corrected_core_examples.jl")
     end
-    distributions_only || ad_only || ppl_ad_only || batched_only || bijectors_only ||
-        include("test_handwritten_benchmarks.jl")
+    ad_only || include("test_handwritten_benchmarks.jl")
 end

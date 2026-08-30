@@ -8,7 +8,8 @@ const MUTATING_FUNCTIONS_UUID = UUID("8a4c2d94-4b3b-4f9e-be63-a3c0cd816e3a")
 root = normpath(joinpath(@__DIR__, ".."))
 testfiles = [joinpath(@__DIR__, "test_nonallocating.jl"),
              joinpath(@__DIR__, "test_reactive_nonallocating.jl"),
-             joinpath(@__DIR__, "test_batched_nonallocating.jl")]
+             joinpath(root, "packages", "ReactiveKernelsBatchingExamples",
+                      "test", "test_batched_nonallocating.jl")]
 
 mktempdir() do env
     Pkg.activate(env)
