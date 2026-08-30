@@ -23,6 +23,7 @@ mktempdir() do env
     ])
     Pkg.add([
         PackageSpec(name = "Enzyme"),
+        PackageSpec(name = "LambertW"),
         PackageSpec(name = "LogExpFunctions"),
     ])
     Pkg.instantiate()

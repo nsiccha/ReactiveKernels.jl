@@ -356,7 +356,7 @@ end
 end
 
 struct _Pick{S} end
-(::_Pick{S})(owned, shared, handles, args, kw) where {S} = S
+(::_Pick{S})(methods, owned, shared, handles, args, kw) where {S} = S
 
 function _pickset(types)
     arms = Tuple(RK._sm_arm(T, (), (), Tuple{}, _Pick{tag}()) for (T, tag) in types)

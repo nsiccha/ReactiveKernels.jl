@@ -5,11 +5,18 @@ using LogExpFunctions: log1pexp
 using Random
 using Test
 import Enzyme
+import LambertW
+import TOML
 import Reactant: @compile, @jit
 
 module _ReactantStatefulFix
 include(joinpath(@__DIR__, "..", "benchmark", "nuts_kernel_authoring_fixture.jl"))
 end
+
+include(joinpath(@__DIR__, "..", "benchmark",
+                 "reactivehmc_rke_kernel_fixture.jl"))
+include(joinpath(@__DIR__, "..", "benchmark",
+                 "reactivehmc_rke_functional_lowering.jl"))
 
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY,
@@ -157,6 +164,44 @@ end
             end
             traced_state = actual
             host_state = expected
+        end
+    end
+
+    @testset "source-derived RKE callable and sibling lowering" begin
+        receipt = TOML.parsefile(joinpath(@__DIR__, "..", "benchmark",
+            "receipts", "reactivehmc-rke-ca9-v1.toml"))
+        bindings = ReactiveKernels.stateful_compiler_bindings(
+            lambertw=ReactiveKernels.pure_callable_port(
+                LambertW.lambertw, Tuple{Float64,Int}, Float64;
+                functional_lowering=
+                    ReactiveHMCRKEFunctionalLowering.lambertw_minus_one))
+
+        for case in receipt["cases"]
+            kernel = ReactiveKernels.compile_stateful(
+                ReactiveHMCRKEFixture.rke, bindings, LambertW.lambertw;
+                m=case["m"], c=case["c"])
+            native_state = kernel(
+                LambertW.lambertw; m=case["m"], c=case["c"])
+            host_state = ReactiveKernels._stateful_snapshot(native_state)
+            traced_state = map(host_state) do value
+                value isa Number ?
+                    Reactant.to_rarray(value; track_numbers=true) : value
+            end
+
+            p_sq = ReactiveKernels._functionalize_stateful(
+                kernel, Val(:p_sq))
+            traced_x = Reactant.to_rarray(case["x_sq"][3]; track_numbers=true)
+            compiled_p_sq = @compile p_sq(traced_state, traced_x)
+            @test compiled_p_sq(traced_state, traced_x) ≈ case["p_sq"][3]
+
+            quantile = ReactiveKernels._functionalize_stateful(
+                kernel, Val(:quantile_sq))
+            traced_q = Reactant.to_rarray(case["q"][2]; track_numbers=true)
+            compiled_quantile = @compile quantile(traced_state, traced_q)
+            for (q, expected) in zip(case["q"], case["quantile_sq"])
+                traced_q = Reactant.to_rarray(q; track_numbers=true)
+                @test compiled_quantile(traced_state, traced_q) ≈ expected atol=128eps(Float64) rtol=0
+            end
         end
     end
 

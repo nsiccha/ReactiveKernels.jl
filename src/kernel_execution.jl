@@ -10,6 +10,15 @@ function _exec_reads!(acc::Vector{Int}, x, fc::Dict{Symbol,Int})
         haskey(fc, x.path[end]) && !(fc[x.path[end]] in acc) && push!(acc, fc[x.path[end]])
     elseif x isa _RegisteredCall || x isa _OpCall
         for a in x.args; _exec_reads!(acc, a, fc); end
+        for pair in x.kw; _exec_reads!(acc, pair.second, fc); end
+    elseif x isa _FieldCall
+        !isempty(x.path) && haskey(fc, x.path[1]) &&
+            !(fc[x.path[1]] in acc) && push!(acc, fc[x.path[1]])
+        for a in x.pos; _exec_reads!(acc, a, fc); end
+        for pair in x.kw; _exec_reads!(acc, pair.second, fc); end
+    elseif x isa _CallExpr
+        for a in x.pos; _exec_reads!(acc, a, fc); end
+        for pair in x.kw; _exec_reads!(acc, pair.second, fc); end
     end
     acc
 end
