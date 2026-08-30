@@ -10,6 +10,11 @@ using ReactiveKernelsPPLExamples
 include(joinpath(@__DIR__, "..", "examples", "nuts_runtime.jl"))
 using .ReactiveKernelsNUTSExample
 
+# Opt into the standalone nutpie/nuts-rs diagonal-adaptation compiler corpus.
+# It remains an external mathematical example rather than a package API.
+include(joinpath(@__DIR__, "..", "examples", "nutpie_diagonal_adaptation.jl"))
+import .NutpieDiagonalAdaptationExample
+
 include("kernel_examples.jl")
 Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "result_views.jl"))
 include("check_rendered.jl")
@@ -35,6 +40,7 @@ site_pages = [
     ],
     "Sampling" => [
         "NUTS sampling" => "nuts.md",
+        "Nutpie diagonal adaptation" => "nutpie-diagonal.md",
         "Online statistics" => "online-stats.md",
     ],
     "Visualization" => "visualization.md",
