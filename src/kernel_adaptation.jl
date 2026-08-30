@@ -1436,10 +1436,10 @@ end
 
 A backend-neutral functional state transition compiled from a free mutating
 `@kernel` and an endpoint `KernelSpec`. Call it with the materialized state
-returned by [`initial_state`](@ref). The transition's bound controls, prepared
+returned by [`initial_transition_state`](@ref). The transition's bound controls, prepared
 derived-field repairs, and generated program are immutable compiler metadata.
 """
-struct CompiledStateTransition{Names,External,F,E,I}
+struct CompiledStateTransition{Names,Groups,ExternalGroups,F,E,I}
     f::F
     ensures::E
     initial::I
@@ -1451,13 +1451,24 @@ function (transition::CompiledStateTransition)(state)
 end
 
 """Return an isolated, fully materialized starting state for `transition`."""
-@generated function initial_state(
-        transition::CompiledStateTransition{Names,External}) where {Names,External}
-    values = Any[name in External ?
-        :(getfield(getfield(transition, :initial), $(QuoteNode(name)))) :
-        :(deepcopy(getfield(getfield(transition, :initial), $(QuoteNode(name)))))
-        for name in Names]
-    :(NamedTuple{Names}(($(values...),)))
+@generated function initial_transition_state(
+        transition::CompiledStateTransition{Names,Groups,ExternalGroups}) where
+        {Names,Groups,ExternalGroups}
+    statements = Any[]
+    aliases = Dict{Symbol,Symbol}()
+    for (group_index, group) in enumerate(Groups)
+        leader = first(group)
+        value = Symbol("__transition_initial_group_", group_index)
+        source = :(getfield(getfield(transition, :initial), $(QuoteNode(leader))))
+        rhs = group_index in ExternalGroups ? source : :(deepcopy($source))
+        push!(statements, :(local $value = $rhs))
+        for name in group
+            aliases[name] = value
+        end
+    end
+    values = Any[aliases[name] for name in Names]
+    push!(statements, :(return NamedTuple{Names}(($(values...),))))
+    Expr(:block, statements...)
 end
 
 function _transition_sources(spec::KernelSpec, pf, args::Tuple,
@@ -1767,10 +1778,13 @@ function _compile_state_transition(spec::KernelSpec, pf::_PreparedFactory,
     outputs = Any[syms[(:field, name)] for name in names]
     push!(statements, :(return NamedTuple{$names}(($(outputs...),))))
     fn = compile(:((ensures, state) -> $(Expr(:block, statements...))))
-    external = Tuple(name for name in names
-        if fields[name] in kernel_prepared_external(pf))
-    CompiledStateTransition{names,external,typeof(fn),typeof(Tuple(ensures)),
-        typeof(initial)}(fn, Tuple(ensures), initial)
+    canons = sort!(collect(keys(names_by_canon)))
+    groups = Tuple(Tuple(names_by_canon[canon]) for canon in canons)
+    external_canons = Set(kernel_prepared_external(pf))
+    external_groups = Tuple(index for (index, canon) in enumerate(canons)
+                            if canon in external_canons)
+    CompiledStateTransition{names,groups,external_groups,typeof(fn),
+        typeof(Tuple(ensures)),typeof(initial)}(fn, Tuple(ensures), initial)
 end
 
 """

@@ -57,8 +57,8 @@ end
             partial(source; stepsize, n_fi_steps),
             (pos, mom),
         )
-        state = initial_state(transition)
-        independent = initial_state(transition)
+        state = initial_transition_state(transition)
+        independent = initial_transition_state(transition)
         @test propertynames(state) ==
               (:pos, :mom, :dham_dpos, :dham_dmom, :ham)
         @test state.pos !== independent.pos

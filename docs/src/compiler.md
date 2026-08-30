@@ -511,7 +511,7 @@ a `partial` of one that binds all of its required keyword controls. Construction
 uses the original endpoint and transition signature binders; it does not match
 the kernel's name, field names, or a program-counter census.
 
-The result is a `CompiledStateTransition`. `initial_state(result)` returns an
+The result is a `CompiledStateTransition`. `initial_transition_state(result)` returns an
 isolated, fully materialized named state while preserving external callable
 authorities by identity. Calling the result with that state is functional: an
 authored array write produces a new array value, invalidates the written
