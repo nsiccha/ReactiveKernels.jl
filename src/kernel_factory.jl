@@ -459,8 +459,12 @@ function _own_expr_effects!(st::_OwnState, cur::MethodId, x, env::Dict{Symbol,_P
             # resolved subject-writer: its DECLARED write-roots on the subject actual (owner fields
             # when the subject is __self__, e.g. `stats_f(__self__)` writing the diagnostics).
             _own_subject_write!(st, cur, x.pos[1], reg.write_roots, env)
+        elseif !(reg isa _KernelRegistration) && !_kernel_field_registration_noeffect(reg)
+            throw(_KernelFactoryReject(
+                "callable field `$field` has an unsupported effect descriptor " *
+                "`$(typeof(reg))`"))
         end
-        # reg === nothing (resolved no-effect) → no write
+        # explicit no-effect descriptor → no write
     elseif x isa _SubjectMethodCall
         # RK block pt 3: EXACT resolution — match owner methods by name AND arity (self-subject).
         # A matched method writes the RECEIVER iff it self-writes; its formal-writes map to the
@@ -486,6 +490,12 @@ function _own_expr_effects!(st::_OwnState, cur::MethodId, x, env::Dict{Symbol,_P
     end
     nothing
 end
+
+# Extensible compiler contract for a resolved callable-field descriptor which
+# provably writes no reactive subject. `nothing` is the existing optional-field
+# sentinel; domain compilers may add typed, runtime-checked pure call ports.
+_kernel_field_registration_noeffect(::Any) = false
+_kernel_field_registration_noeffect(::Nothing) = true
 
 # Walk one statement in SOURCE ORDER, threading + returning the env (branch/loop/guard merged).
 function _own_stmt!(st::_OwnState, cur::MethodId, s, env::Dict{Symbol,_Places})::Dict{Symbol,_Places}
