@@ -68,6 +68,22 @@ function Reactant.traced_type_inner(
     T
 end
 
+# Free state transitions likewise contain only immutable generated program
+# structure and prepared repair kernels. The state NamedTuple passed to the
+# call is the complete dynamic traced value surface.
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels.CompiledStateTransition,
+        path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where
+        {T<:ReactiveKernels.CompiledStateTransition}
+    T
+end
+
 # Native Julia arrays keep the fused scalar loop.  Reactant arrays select the
 # separately generated eager broadcast/reduction body, avoiding forbidden
 # scalar indexing while leaving XLA free to fuse the tensor operations.

@@ -157,11 +157,12 @@ _sm_compiled_call(f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction) = f
 
 _sm_reject(msg) = throw(_LLowerReject(msg))
 
-function _sm_exact_callee(x::_RegisteredCall)
+function _sm_exact_callee(x::_RegisteredCall; allow_broadcast::Bool=false)
     getfield(x.registration, :kind) === :pure_primitive || _sm_reject(
         "stateful method value call `$(x.ref.slot)` is not a captured pure Base primitive")
     isempty(x.kw) || _sm_reject("stateful method primitive `$(x.ref.slot)` carries keywords")
-    x.broadcast && _sm_reject("per-call dotted primitive `$(x.ref.slot)` is unsupported; use an authored @. write")
+    x.broadcast && !allow_broadcast && _sm_reject(
+        "per-call dotted primitive `$(x.ref.slot)` is unsupported outside an authored @. write")
     _exec_captured_callee(x) # exact captured GlobalRef identity + rebind check
 end
 
@@ -268,22 +269,23 @@ function _sm_dtype(::Type{_DTuple{Args}}, argtypes,
 end
 function _sm_dtype(::Type{_DProject{Parent,Key}}, argtypes,
                    ::Type{KWT}, dot::Bool) where {Parent,Key,KWT}
-    dot && _sm_reject("destructured projection does not admit implicit broadcasting")
     T = _sm_dtype(Parent, argtypes, KWT, false)
     (T <: Tuple || T <: NamedTuple) || _sm_reject(
         "destructuring requires a concrete tuple or named tuple, got `$T`")
-    try
+    projected = try
         fieldtype(T, Key)
     catch
         _sm_reject("destructuring projection `$Key` is absent from `$T`")
     end
+    dot ? _sm_leaf_type(projected) : projected
 end
 function _sm_dtype(::Type{_DCall{S,D,A}}, argtypes, ::Type{KWT}, dot::Bool) where {S,D,A,KWT}
     ats = ntuple(i -> _sm_dtype(A.parameters[i], argtypes, KWT, D), length(A.parameters))
     f = S.instance
     _kernel_pure_callee_domain_ok(f, ats) ||
         _sm_reject("captured primitive `$f` rejects exact operand types $ats")
-    _sm_primitive_result(f, ats)
+    result = _sm_primitive_result(f, ats)
+    dot && !D ? _sm_leaf_type(result) : result
 end
 function _sm_dtype(::Type{_DPortCall{Declared,Result,Args}}, argtypes,
                    ::Type{KWT}, dot::Bool) where {Declared,Result,Args,KWT}
@@ -358,7 +360,7 @@ function _sm_rhs(x, syms, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH},
         Expr(:tuple, (_sm_rhs(a, syms, plan, fields, OW, SH, formals,
                               locals, false, field_regs) for a in x.elts)...)
     elseif x isa _RegisteredCall
-        f = _sm_exact_callee(x)
+        f = _sm_exact_callee(x; allow_broadcast=dot)
         args = Any[_sm_rhs(a, syms, plan, fields, OW, SH, formals,
                            locals, dot, field_regs) for a in x.args]
         dot && _sm_isvector(x, plan, fields, OW, SH, formals, locals) ?
@@ -420,7 +422,7 @@ function _sm_dtree(x, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH},
             false, field_regs, methods_by_id, stack) for a in x.elts)...}
         _DTuple{children}
     elseif x isa _RegisteredCall
-        f = _sm_exact_callee(x)
+        f = _sm_exact_callee(x; allow_broadcast=dot)
         children = Tuple{(_sm_dtree(a, plan, fields, OW, SH, finfo, ltrees,
             dot, field_regs, methods_by_id, stack) for a in x.args)...}
         _DCall{typeof(f),dot,children}
@@ -1072,7 +1074,7 @@ function _sm_functional_rhs(x, syms, plan::_KernelPlan, fields,
             arg, syms, plan, fields, OW, SH, formals, locals, false,
             field_regs, methods_by_id, stack, ensure_field) for arg in x.elts)...)
     elseif x isa _RegisteredCall
-        f = _sm_exact_callee(x)
+        f = _sm_exact_callee(x; allow_broadcast=dot)
         args = Any[_sm_functional_rhs(
             arg, syms, plan, fields, OW, SH, formals, locals, dot,
             field_regs, methods_by_id, stack, ensure_field)
@@ -1416,6 +1418,387 @@ function _functionalize_stateful(kernel::_StatefulKernel, ::Val{Name}) where {Na
     length(methods) == 1 || _sm_reject(
         "functional stateful method `$Name` must have exactly one captured overload")
     _functional_stateful_method(kernel, only(methods))
+end
+
+# ============================================================================================
+# FREE STATE TRANSITIONS
+#
+# A free `@kernel transition!(state; static_controls...)` and a stateless endpoint `KernelSpec`
+# describe complementary halves of the same program: MethodIR carries ordered writes/control, while
+# the KernelSpec carries the have→want recipes that repair derived fields after a write.  This seam
+# combines them without an algorithm-name table.  Every loop admitted here has a definition-captured
+# `Base.Colon` iterator whose bounds resolve entirely from bound scalar controls; it is unrolled while
+# lowering so currentness is propagated separately through every authored iteration.
+# ============================================================================================
+
+"""
+    CompiledStateTransition
+
+A backend-neutral functional state transition compiled from a free mutating
+`@kernel` and an endpoint `KernelSpec`. Call it with the materialized state
+returned by [`initial_state`](@ref). The transition's bound controls, prepared
+derived-field repairs, and generated program are immutable compiler metadata.
+"""
+struct CompiledStateTransition{Names,External,F,E,I}
+    f::F
+    ensures::E
+    initial::I
+end
+
+function (transition::CompiledStateTransition)(state)
+    RuntimeGeneratedFunctions.generated_callfunc(
+        getfield(transition, :f), getfield(transition, :ensures), state)
+end
+
+"""Return an isolated, fully materialized starting state for `transition`."""
+@generated function initial_state(
+        transition::CompiledStateTransition{Names,External}) where {Names,External}
+    values = Any[name in External ?
+        :(getfield(getfield(transition, :initial), $(QuoteNode(name)))) :
+        :(deepcopy(getfield(getfield(transition, :initial), $(QuoteNode(name)))))
+        for name in Names]
+    :(NamedTuple{Names}(($(values...),)))
+end
+
+function _transition_sources(spec::KernelSpec, pf, args::Tuple,
+                             kwargs::NamedTuple)
+    sig = getfield(spec, :call_signature)
+    sig isa _KernelCallSignature || throw(_KernelFactoryReject(
+        "transition endpoint has no keyword call signature"))
+    P, K = typeof(sig).parameters[1], typeof(sig).parameters[2]
+    resolved = _kernel_signature_invoke(
+        _KernelSignatureCallable(tuple, sig), args, kwargs)
+    names = (P..., K...)
+    plan = kernel_prepared_plan(pf)
+    canon_name = Dict{Int,Symbol}(
+        slot.canon => slot.path[end] for slot in kernel_plan_slots(plan))
+    have_names = Tuple(canon_name[canon]
+        for canon in _plan_have_from_key(kernel_plan_key(plan)))
+    names === have_names || throw(_KernelFactoryReject(
+        "transition endpoint signature order $names ≠ plan HAVE-canon order " *
+        "$have_names — reorder unsupported"))
+    resolved
+end
+
+@generated function _transition_snapshot(plan::_KernelPlan{Key},
+        owned::OW, shared::SH) where {Key,OW,SH}
+    slots = Key[2]
+    names = Symbol[]
+    reads = Any[]
+    for (path, canon, role, slot) in slots
+        name = path[end]
+        name in names && continue
+        push!(names, name)
+        object = role === :owned ? :owned : :shared
+        push!(reads, :(_canon_slot($object, Val($slot))))
+    end
+    names_tuple = Tuple(names)
+    :(NamedTuple{$names_tuple}(($(reads...),)))
+end
+
+function _transition_bound_formals(callable::_PreparedCallable, ir::MethodIR)
+    source = prepared_callable_source(callable)
+    source isa _Mode2KernelSkeleton || _sm_reject(
+        "state transition must be a free mutating @kernel")
+    sig = getfield(getfield(source, :spec_snapshot), :call_signature)
+    sig isa _KernelCallSignature || _sm_reject(
+        "state transition has no captured call signature")
+    P, K = typeof(sig).parameters[1], typeof(sig).parameters[2]
+    length(P) == 1 && only(P) === prepared_callable_subject(callable) ||
+        _sm_reject("state transition must have only its subject positional formal")
+    kwargs = prepared_callable_kwargs(callable)
+    kwargs === nothing && (kwargs = NamedTuple())
+    resolved = _kernel_signature_invoke(
+        _KernelSignatureCallable(tuple, sig), (nothing,), kwargs)
+    expected = Tuple(formal.name for formal in ir.formals)
+    expected === K || _sm_reject(
+        "state transition MethodIR formals $expected do not match captured keywords $K")
+    values = Base.tail(resolved)
+    NamedTuple{expected}(values)
+end
+
+function _transition_static_value(x, bound::NamedTuple)
+    if x isa _Lit
+        return x.value
+    elseif x isa _FormalRef
+        x.kind === :kw || _sm_reject(
+            "static transition control must be a bound keyword")
+        x.arg in propertynames(bound) || _sm_reject(
+            "static transition control `$(x.arg)` is unbound")
+        return getfield(bound, x.arg)
+    elseif x isa _RegisteredCall
+        f = _sm_exact_callee(x)
+        f === Base.:(:) || _sm_reject(
+            "static transition iterator must be captured Base.Colon")
+        args = Tuple(_transition_static_value(arg, bound) for arg in x.args)
+        _kernel_pure_callee_domain_ok(f, typeof.(args)) || _sm_reject(
+            "static Base.Colon rejects exact operand types $(typeof.(args))")
+        _sm_primitive_result(f, typeof.(args))
+        return f(args...)
+    end
+    _sm_reject("static transition control contains `$(typeof(x))`")
+end
+
+function _compile_state_transition(spec::KernelSpec, pf::_PreparedFactory,
+        callable::_PreparedCallable, ir::MethodIR, ::Type{OW},
+        ::Type{SH}, initial) where {OW,SH}
+    ir.control in (:straight, :loop) || _sm_reject(
+        "functional state transition admits straight-line and static-loop control, " *
+        "got `$(ir.control)`")
+    ir.ok || _sm_reject("functional state transition MethodIR is invalid: $(ir.reason)")
+
+    bound = _transition_bound_formals(callable, ir)
+    plan = kernel_prepared_plan(pf)
+    fields = _exec_canon_map(plan)
+    names = propertynames(initial)
+    names_by_canon = Dict{Int,Vector{Symbol}}()
+    for name in names
+        canon = get(fields, name, 0)
+        canon == 0 && _sm_reject(
+            "transition snapshot field `$name` has no canonical slot")
+        push!(get!(names_by_canon, canon, Symbol[]), name)
+    end
+    Set(keys(names_by_canon)) == Set(values(fields)) || _sm_reject(
+        "transition snapshot does not name every canonical slot")
+    name_by_canon = Dict(canon => first(aliases)
+                         for (canon, aliases) in names_by_canon)
+
+    syms = Dict{Any,Any}()
+    formals = Dict{Symbol,Bool}()
+    finfo = Dict{Symbol,Any}()
+    locals = Dict{Symbol,Bool}()
+    ltrees = Dict{Symbol,Any}()
+    statements = Any[]
+    ensures = Any[]
+    current = Set(values(fields))
+    stale = Set{Int}()
+    serial = Ref(0)
+    fresh(prefix, name=:value) = begin
+        serial[] += 1
+        Symbol(prefix, name, "_", serial[])
+    end
+
+    for name in names
+        symbol = fresh(:__ft_field_, name)
+        syms[(:field, name)] = symbol
+        push!(statements,
+            :(local $symbol = getfield(state, $(QuoteNode(name)))))
+    end
+    for formal in ir.formals
+        formal.kind === :kw || _sm_reject(
+            "functional state transition controls must be keywords")
+        value = getfield(bound, formal.name)
+        (_kernel_dom_num_scalar(typeof(value)) && !(value isa Bool)) ||
+            _sm_reject("bound transition control `$(formal.name)` must be a " *
+                       "builtin non-Bool numeric scalar, got `$(typeof(value))`")
+        if formal.type !== nothing
+            annotation = _resolve_sm_annotation(
+                kernel_type_authorities(prepared_callable_source(callable)),
+                formal.type)
+            value isa annotation || _sm_reject(
+                "bound transition control `$(formal.name)` has type " *
+                "`$(typeof(value))`, expected `$annotation`")
+        end
+        syms[(:formal, formal.name)] = value
+        formals[formal.name] = false
+        finfo[formal.name] = _DLit{typeof(value)}
+    end
+
+    field_order = Tuple(first(names_by_canon[canon])
+                        for canon in sort!(collect(keys(names_by_canon))))
+    ensure! = function (canon::Int)
+        canon in current && return
+        haskey(name_by_canon, canon) || _sm_reject(
+            "functional transition ensure cannot name canonical slot $canon")
+        name = name_by_canon[canon]
+        have = Tuple(field_name for field_name in field_order
+                     if fields[field_name] in current)
+        prepared = try
+            prepare(spec; have, want=name)
+        catch error
+            _sm_reject("functional transition ensure for `$name` failed: " *
+                       sprint(showerror, error))
+        end
+        push!(ensures, prepared)
+        ensure_index = length(ensures)
+        arguments = Any[]
+        for input in inputs(prepared)
+            input_name = input.name
+            haskey(syms, (:field, input_name)) || _sm_reject(
+                "functional transition ensure for `$name` requires unknown " *
+                "input `$input_name`")
+            push!(arguments, syms[(:field, input_name)])
+        end
+        symbol = fresh(:__ft_ensure_, name)
+        push!(statements, :(local $symbol =
+            getfield(ensures, $ensure_index)($(arguments...))))
+        for alias in names_by_canon[canon]
+            syms[(:field, alias)] = symbol
+        end
+        delete!(stale, canon)
+        push!(current, canon)
+        nothing
+    end
+
+    validate_tree(tree, dot=false) =
+        _sm_dtype(tree, (), NamedTuple{}, dot)
+
+    emit_block! = nothing
+    emit_block! = function (body)
+        for (statement_index, statement) in enumerate(body)
+            if statement isa _LocalAssign
+                for canon in _sm_local_reads(statement, fields)
+                    ensure!(canon)
+                end
+                rhs_tree = statement.style === :named ? _DLit{Nothing} :
+                    _sm_dtree(statement.rhs, plan, fields, OW, SH, finfo,
+                        ltrees, false, Dict{Symbol,Any}(),
+                        Dict{MethodId,MethodIR}(), MethodId[ir.id])
+                trees = _sm_local_trees(
+                    statement, rhs_tree, plan, fields, OW, SH)
+                foreach(tree -> validate_tree(tree), trees)
+                flags = _sm_local_vector_flags(statement, plan, fields,
+                    OW, SH, formals, locals)
+                values = if statement.style === :named
+                    Any[syms[(:field, name)] for name in statement.lhs]
+                else
+                    rhs = _sm_functional_rhs(statement.rhs, syms, plan,
+                        fields, OW, SH, formals, locals, false,
+                        Dict{Symbol,Any}(), Dict{MethodId,MethodIR}(),
+                        MethodId[ir.id], ensure!)
+                    if statement.style === :single
+                        Any[rhs]
+                    else
+                        temporary = fresh(:__ft_tuple_)
+                        push!(statements, :(local $temporary = $rhs))
+                        Any[:(getfield($temporary, $index))
+                            for index in eachindex(statement.lhs)]
+                    end
+                end
+                for (name, value, isvector, tree) in
+                        zip(statement.lhs, values, flags, trees)
+                    symbol = fresh(:__ft_local_, name)
+                    syms[(:local, name)] = symbol
+                    locals[name] = isvector
+                    ltrees[name] = tree
+                    push!(statements, :(local $symbol = $value))
+                end
+            elseif statement isa _PlaceWrite
+                (statement.root === :self &&
+                 statement.target isa _SelfField &&
+                 statement.owner !== nothing &&
+                 length(statement.target.path) == 1) || _sm_reject(
+                    "functional transition write must target a direct subject field")
+                for canon in _exec_reads(statement.rhs, fields)
+                    ensure!(canon)
+                end
+                name = only(statement.target.path)
+                canon = get(fields, name, 0)
+                canon == 0 && _sm_reject(
+                    "functional transition write has no canonical slot for `$name`")
+                role, _ = kernel_plan_field(plan, canon)
+                role === :owned || _sm_reject(
+                    "functional transition writes shared authority `$name`")
+                field_type = _pp_fieldtype(plan, canon, OW, SH)
+                tree = _sm_dtree(statement.rhs, plan, fields, OW, SH,
+                    finfo, ltrees, statement.dot, Dict{Symbol,Any}(),
+                    Dict{MethodId,MethodIR}(), MethodId[ir.id])
+                got = validate_tree(tree, statement.dot)
+                wanted = statement.dot ? _sm_leaf_type(field_type) : field_type
+                got === wanted || _sm_reject(
+                    "functional transition write result type `$got` does not " *
+                    "exactly match destination `$wanted`")
+                rhs = _sm_functional_rhs(statement.rhs, syms, plan,
+                    fields, OW, SH, formals, locals, statement.dot,
+                    Dict{Symbol,Any}(), Dict{MethodId,MethodIR}(),
+                    MethodId[ir.id], ensure!)
+                value = if field_type <: AbstractArray
+                    statement.dot || _sm_reject(
+                        "functional transition array `$name` requires an authored @. write")
+                    Expr(:call, GlobalRef(Base, :materialize), rhs)
+                else
+                    statement.dot && _sm_reject(
+                        "functional transition scalar `$name` cannot use an authored @. write")
+                    rhs
+                end
+                symbol = fresh(:__ft_write_, name)
+                push!(statements, :(local $symbol = $value))
+                for alias in names_by_canon[canon]
+                    syms[(:field, alias)] = symbol
+                end
+                for dependent in _exec_kill_closure(plan, canon)
+                    delete!(current, dependent)
+                    push!(stale, dependent)
+                end
+                delete!(stale, canon)
+                push!(current, canon)
+            elseif statement isa _For
+                length(statement.var) == 1 || _sm_reject(
+                    "static transition loop must bind one local")
+                values = _transition_static_value(statement.iter, bound)
+                values isa AbstractUnitRange || _sm_reject(
+                    "static transition loop iterator must be an integer unit range")
+                length(values) <= 1024 || _sm_reject(
+                    "static transition loop has $(length(values)) iterations; maximum is 1024")
+                variable = only(statement.var)
+                for value in values
+                    syms[(:local, variable)] = value
+                    locals[variable] = false
+                    ltrees[variable] = _DLit{typeof(value)}
+                    emit_block!(statement.body)
+                end
+            elseif statement isa _Return
+                statement_index == length(body) || _sm_reject(
+                    "functional transition return must terminate its block")
+                statement.value === nothing || _sm_reject(
+                    "functional mutating transition may return only nothing")
+            else
+                _sm_reject("unsupported functional transition statement " *
+                           "`$(typeof(statement))`")
+            end
+        end
+        nothing
+    end
+
+    emit_block!(ir.body)
+    for field_name in field_order
+        ensure!(fields[field_name])
+    end
+    outputs = Any[syms[(:field, name)] for name in names]
+    push!(statements, :(return NamedTuple{$names}(($(outputs...),))))
+    fn = compile(:((ensures, state) -> $(Expr(:block, statements...))))
+    external = Tuple(name for name in names
+        if fields[name] in kernel_prepared_external(pf))
+    CompiledStateTransition{names,external,typeof(fn),typeof(Tuple(ensures)),
+        typeof(initial)}(fn, Tuple(ensures), initial)
+end
+
+"""
+    compile_state_transition(spec, transition, endpoint_args=(); endpoint_kwargs=(;))
+
+Compile a bound free mutating `@kernel` into a functional state transition over
+the endpoint described by `spec`. `transition` must be the registered kernel or
+a `partial` that binds every required transition keyword. Endpoint constructor
+arguments are resolved with the original `@kernel` signature. Data-dependent
+control is rejected; captured integer `Base.Colon` loops are statically
+unrolled with derived-field currentness propagated through every iteration.
+"""
+function compile_state_transition(spec::KernelSpec, transition,
+        endpoint_args::Tuple=(); endpoint_kwargs::NamedTuple=NamedTuple())
+    callable = _prepare_callable(:transition, transition)
+    registration = prepared_callable_registration(callable)
+    registration.kind === :free_method || throw(ArgumentError(
+        "state transition must resolve to a free mutating @kernel"))
+    ir, _ = prepared_callable_leaf(callable)
+    pf = _prepare_factory(spec, registration)
+    sources = _transition_sources(spec, pf, endpoint_args, endpoint_kwargs)
+    plan = kernel_prepared_plan(pf)
+    handles = kernel_prepared_handles(pf)
+    values = _bootstrap_canon_values(plan, handles, sources)
+    owned, shared = _construct_endpoint_from_values(plan, handles, values)
+    initial = _transition_snapshot(plan, owned, shared)
+    _compile_state_transition(spec, pf, callable, ir,
+        typeof(owned), typeof(shared), initial)
 end
 
 _stateful_field_regs(bindings::_StatefulCompilerBindings) =

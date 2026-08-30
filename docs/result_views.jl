@@ -918,6 +918,8 @@ function render_compiler_api_map()
          result = "Typed slots and generated getters", runtime = "Validity checks, required recipe calls, and invalidation worklists"),
         (stage = "Author a reactive object", surface = "@reactive, ReactiveObject",
          result = "Ordinary property/method facade over compiled state", runtime = "The same compiled-state operations"),
+        (stage = "Compile a free state transition", surface = "compile_state_transition, initial_state, partial",
+         result = "CompiledStateTransition", runtime = "Authored writes, statically unrolled control, and demand-driven derived-field repairs"),
         (stage = "Inspect the selected graph", surface = "visualize, dot_source, save_visualization",
          result = "Plan/DAG view", runtime = "No effect on compilation"),
     ]
@@ -956,6 +958,7 @@ function render_compiler_capabilities()
         (capability = "In-place cache reuse", supported = "Optional", boundary = "Single-output operation support and runtime types determine allocation behavior"),
         (capability = "Reactive object field methods", supported = "Yes, declared grammar", boundary = "No let, exceptions, comprehensions/generators, closures, do, or nested functions inside rewritten methods"),
         (capability = "Captured method branches/loops/recursion", supported = "Yes, compiler subset", boundary = "Exact source representation, ownership, effects, and overloads required"),
+        (capability = "Functional free state transition", supported = "Yes, narrow public subset", boundary = "Direct owned writes; exact map/copy/destructuring; bound numeric controls; captured finite Colon loops are statically unrolled"),
         (capability = "Infer effects from arbitrary Julia methods", supported = "No", boundary = "Source capture plus exact registrations only; no Julia IR/inference analysis"),
         (capability = "Generic effectful operation fallback", supported = "No", boundary = "Opaque or specialization-unsafe calls reject before executable lowering"),
         (capability = "Runtime graph mutation after preparation", supported = "No", boundary = "Cached stateless entries version out; compiled reactive programs throw version errors"),

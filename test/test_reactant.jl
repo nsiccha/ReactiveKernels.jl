@@ -17,6 +17,10 @@ include(joinpath(@__DIR__, "..", "benchmark",
                  "reactivehmc_rke_kernel_fixture.jl"))
 include(joinpath(@__DIR__, "..", "benchmark",
                  "reactivehmc_rke_functional_lowering.jl"))
+if !isdefined(@__MODULE__, :ReactiveHMCIntegratorFixture)
+    include(joinpath(@__DIR__, "..", "benchmark",
+                     "reactivehmc_integrator_kernel_fixture.jl"))
+end
 
 include(joinpath(@__DIR__, "..", "examples", "distribution_kernel_sources.jl"))
 using .DistributionKernelSources:
@@ -86,6 +90,13 @@ end
     HL::Float64 = pot(qL) + 0.5 * dot(pL, pL)
     accept::Bool = log(u) < (H0 - HL)
     q_next::Vector{Float64} = accept ? qL : q
+end
+
+@kernel reactant_integrator_endpoint(
+        pos::Vector{Float64}, mom::Vector{Float64}) = begin
+    dham_dpos::Vector{Float64} = 2 .* pos
+    dham_dmom::Vector{Float64} = 3 .* mom
+    ham::Float64 = sum(abs2, pos) + sum(abs2, mom)
 end
 
 @kernel reactant_cauchy_logscale(
@@ -205,6 +216,26 @@ end
                 @test compiled_quantile(traced_state, traced_q) ≈ expected atol=128eps(Float64) rtol=0
             end
         end
+    end
+
+
+    @testset "generic static-loop state transition" begin
+        transition = compile_state_transition(
+            reactant_integrator_endpoint,
+            partial(ReactiveHMCIntegratorFixture.generalized_leapfrog!;
+                    stepsize=0.06, n_fi_steps=2),
+            ([0.25, -0.5], [0.4, 0.1]),
+        )
+        host_state = initial_state(transition)
+        traced_state = map(host_state) do value
+            Reactant.to_rarray(value; track_numbers=true)
+        end
+        compiled = @compile transition(traced_state)
+        actual = compiled(traced_state)
+        expected = transition(host_state)
+        @test Array(actual.pos) ≈ expected.pos atol=2e-15 rtol=2e-13
+        @test Array(actual.mom) ≈ expected.mom atol=2e-15 rtol=2e-13
+        @test only(actual.ham) ≈ expected.ham atol=2e-15 rtol=2e-13
     end
 
     @testset "eight-schools PPL extraction and plate boundaries compile" begin

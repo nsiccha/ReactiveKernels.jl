@@ -7,6 +7,10 @@ import Reactant: @compile
 if !isdefined(@__MODULE__, :ReactiveHMCExamples)
     include(joinpath(@__DIR__, "..", "examples", "preexisting_reactivehmc.jl"))
 end
+if !isdefined(@__MODULE__, :ReactiveHMCIntegratorFixture)
+    include(joinpath(@__DIR__, "..", "benchmark",
+                     "reactivehmc_integrator_kernel_fixture.jl"))
+end
 
 _rhmc_potential(position) = sum(abs2, position) / 2
 _rhmc_gradient(position) = (_rhmc_potential(position), position)
@@ -94,5 +98,20 @@ _rhmc_trace_source(value) = value
         @test Array(actual_endpoint[2]) ≈ expected_endpoint[2]
         @test Array(actual_endpoint[3]) ≈ expected_endpoint[3]
         @test actual_endpoint[4] ≈ expected_endpoint[4]
+
+        transition = compile_state_transition(
+            kernels.spec,
+            partial(ReactiveHMCIntegratorFixture.generalized_leapfrog!;
+                    stepsize=0.06, n_fi_steps=2),
+            host_sources,
+        )
+        host_state = initial_state(transition)
+        traced_state = map(_rhmc_trace_source, host_state)
+        expected_transition = transition(host_state)
+        compiled_transition = @compile transition(traced_state)
+        actual_transition = compiled_transition(traced_state)
+        @test Array(actual_transition.pos) ≈ expected_transition.pos
+        @test Array(actual_transition.mom) ≈ expected_transition.mom
+        @test actual_transition.ham ≈ expected_transition.ham
     end
 end
