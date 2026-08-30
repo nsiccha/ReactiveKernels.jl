@@ -1,0 +1,34 @@
+[deps]
+ReactiveKernels = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
+ReactiveKernelsBatchingExamples = "00050de8-5ab0-44ad-ad08-8f6b0ddc01dd"
+ReactiveKernelsCompatibilityExamples = "b8c154ef-4cb8-413d-9282-0e653aa014e1"
+ReactiveKernelsDistributionKernels = "4b169cd9-fc12-43fd-ba39-43e54ed8db7a"
+ReactiveKernelsKernelExamples = "c1a917b0-63b1-4b16-afa9-60dbf16f95f3"
+ReactiveKernelsPPLExamples = "a4d4be3d-45c5-49cc-80d7-34e606a16bce"
+
+[compat]
+ReactiveKernels = "0.1"
+ReactiveKernelsBatchingExamples = "0.1"
+ReactiveKernelsCompatibilityExamples = "0.1"
+ReactiveKernelsDistributionKernels = "0.1"
+ReactiveKernelsKernelExamples = "0.1"
+ReactiveKernelsPPLExamples = "0.1"
+julia = "1.10"
+
+[sources.ReactiveKernels]
+path = ".."
+
+[sources.ReactiveKernelsBatchingExamples]
+path = "ReactiveKernelsBatchingExamples"
+
+[sources.ReactiveKernelsCompatibilityExamples]
+path = "ReactiveKernelsCompatibilityExamples"
+
+[sources.ReactiveKernelsDistributionKernels]
+path = "ReactiveKernelsDistributionKernels"
+
+[sources.ReactiveKernelsKernelExamples]
+path = "ReactiveKernelsKernelExamples"
+
+[sources.ReactiveKernelsPPLExamples]
+path = "ReactiveKernelsPPLExamples"

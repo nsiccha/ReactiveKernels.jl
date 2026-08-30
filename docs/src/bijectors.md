@@ -12,7 +12,7 @@ graph port, and `prepare(...; want = ...)` selects the required backward slice
 before the model runs.
 
 The complete runnable source is
-[`examples/bijectors.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/bijectors.jl).
+[`packages/ReactiveKernelsKernelExamples/src/bijectors.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsKernelExamples/src/bijectors.jl).
 Its `BIJECTOR_KERNEL_SOURCE` constant is the single source authority executed by
 the example, tests, and the panel on this page.
 

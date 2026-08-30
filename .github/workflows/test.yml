@@ -58,6 +58,19 @@ jobs:
       - name: Test optional MutatingFunctions extension
         run: julia --startup-file=no test/run_nonallocating_integration.jl
 
+  example-packages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.10'
+      - uses: julia-actions/cache@v2
+      - name: Resolve nested example packages
+        run: julia --startup-file=no --project=packages packages/setup.jl
+      - name: Test nested example packages
+        run: julia --startup-file=no --project=packages packages/test.jl
+
   reactant-integration:
     runs-on: ubuntu-latest
     steps:
