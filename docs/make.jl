@@ -39,6 +39,7 @@ site_pages = [
         "Gaussian mixture" => "gaussian-mixture.md",
     ],
     "Sampling" => [
+        "Pathfinder approximation" => "pathfinder.md",
         "NUTS sampling" => "nuts.md",
         "Nutpie diagonal adaptation" => "nutpie-diagonal.md",
         "Online statistics" => "online-stats.md",

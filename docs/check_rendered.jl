@@ -46,6 +46,7 @@ function check_rendered_docs(build_dir, page_tree)
         "distributions.md" => 11,
         "batched.md" => 1,
         "bijectors.md" => 1,
+        "pathfinder.md" => 2,
         "nuts.md" => 2,
         "nutpie-diagonal.md" => 2,
         "eight-schools.md" => 1,
@@ -81,6 +82,10 @@ function check_rendered_docs(build_dir, page_tree)
             "@kernel nutpie_diagonal_initialize",
             "@kernel nutpie_diagonal_adaptation",
             "97be9ab88cfaadfafd9e5f4409a3b1d5af62805a",
+        ),
+        "pathfinder.md" => (
+            "Pathfinder Inverse Bfgs Geometry",
+            "Pathfinder Local Gaussian And Elbo",
         ),
         "visualization.md" =>
             ("class=\"rk-dag-legend\"", "class=\"rk-comparison-grid\""),
@@ -144,6 +149,17 @@ function check_rendered_docs(build_dir, page_tree)
                            "Raw input", "Generated kernel", "Compute DAG")
                 occursin(marker, body) ||
                     error("nutpie diagonal page is missing marker: $marker")
+            end
+        end
+        if source == "pathfinder.md"
+            for marker in (
+                    "Pathfinder Inverse Bfgs Geometry",
+                    "Pathfinder Local Gaussian And Elbo",
+                    "Raw input",
+                    "Generated kernel",
+                    "Compute DAG",
+                )
+                occursin(marker, body) || error("Pathfinder page is missing marker: $marker")
             end
         end
     end

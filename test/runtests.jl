@@ -59,6 +59,7 @@ using .ReactiveKernelsNUTSExample
         include("test_adversarial.jl")
         include("test_hmc.jl")
         include("test_pathfinder.jl")
+        include("test_pathfinder_docs.jl")
         include("test_reactive_sampler_baseline.jl")
         include("test_reactive_nuts.jl")
         include("test_reactive_adaptation.jl")

@@ -12,6 +12,15 @@ from pathlib import Path
 
 PAPER_URL = "https://jmlr.org/papers/volume23/21-0889/21-0889.pdf"
 PAPER_SHA256 = "8fe38816d4953e5b4e01a8b531abb9f3ea1d1f92041f6c2a7ce5e9c7037c8435"
+PATHFINDER_JL_REPOSITORY = "https://github.com/mlcolab/Pathfinder.jl"
+PATHFINDER_JL_REVISION = "dba8c9acc25f2905078d428ddd50b5d9276c3847"
+PATHFINDER_JL_VERSION = "0.10.7"
+PATHFINDER_JL_SOURCE_SHA256 = {
+    "inverse_hessian": "7a32c8e5b8359d2c7d813cae21885e7cafcb357cc1d15e8aebd5f020f38d3309",
+    "mvnormal": "9083a7856ddf4b2bf3199bff62487dddfbdfd7a5de54264c8ac04b26ef2e29b8",
+    "elbo": "5a35f03afb93fd6657f6a86040b1a4010e719022e3d9e9bf412a7303419e2611",
+    "singlepath": "972b3a1d206887c38ec9cd69d22c664f8103ad2f9657021f860cc485c0aba187",
+}
 
 
 def dot(left, right):
@@ -220,6 +229,16 @@ def main():
         "paper_url": PAPER_URL,
         "paper_sha256": PAPER_SHA256,
         "algorithms": [1, 3, 4],
+        "pathfinder_jl_repository": PATHFINDER_JL_REPOSITORY,
+        "pathfinder_jl_revision": PATHFINDER_JL_REVISION,
+        "pathfinder_jl_version": PATHFINDER_JL_VERSION,
+        "pathfinder_jl_inverse_hessian_sha256":
+            PATHFINDER_JL_SOURCE_SHA256["inverse_hessian"],
+        "pathfinder_jl_mvnormal_sha256":
+            PATHFINDER_JL_SOURCE_SHA256["mvnormal"],
+        "pathfinder_jl_elbo_sha256": PATHFINDER_JL_SOURCE_SHA256["elbo"],
+        "pathfinder_jl_singlepath_sha256":
+            PATHFINDER_JL_SOURCE_SHA256["singlepath"],
         "oracle_source_sha256": source_sha256,
         "oracle_engine": "python-stdlib",
     })

@@ -525,6 +525,114 @@ function execute_example(mod::Module, code::AbstractString;
     rendered
 end
 
+# Pathfinder is an external compiler-acceptance artifact, so the documentation
+# loads its reviewed benchmark fixture instead of maintaining a second copy of
+# the mathematics.  The raw pane is extracted from that same file through the
+# full prepare boundary; the generated panes and DAGs come from the actual
+# PreparedKernels constructed during the docs build.
+const _PATHFINDER_FIXTURE_PATH = normpath(joinpath(
+    @__DIR__, "..", "benchmark", "pathfinder_kernel_authoring_fixture.jl",
+))
+
+const _PATHFINDER_HAVE = (
+    :logdensity,
+    :position,
+    :gradient,
+    :alpha,
+    :step,
+    :gradient_delta,
+    :identity,
+    :elbo_standard_draws,
+    :output_standard_draws,
+    :curvature_tolerance,
+)
+
+function _pathfinder_authored_source()
+    source = replace(
+        read(_PATHFINDER_FIXTURE_PATH, String),
+        "\r\n" => "\n",
+        "\r" => "\n",
+    )
+    start_marker = "@kernel pathfinder_candidate("
+    stop_marker = "\n\"\"\"Run the same prepared candidate kernel"
+    start = findfirst(start_marker, source)
+    stop = findfirst(stop_marker, source)
+    start === nothing && error("Pathfinder fixture lost its authored @kernel")
+    stop === nothing && error("Pathfinder fixture lost its prepare boundary")
+    first(start) < first(stop) || error("Pathfinder fixture source markers are reversed")
+    strip(source[first(start):(first(stop) - 1)], '\n')
+end
+
+function _pathfinder_inputs(fixture::Module)
+    # The fixture is included from this same Documenter `@eval` call. Cross the
+    # resulting world-age boundary explicitly before reading its fresh methods.
+    values = Base.invokelatest(fixture.pathfinder_fixture_inputs)
+    (;
+        logdensity = values.logdensity,
+        position = values.positions[:, 2],
+        gradient = values.gradients[:, 2],
+        alpha = values.initial_alpha,
+        step = values.positions[:, 2] .- values.positions[:, 1],
+        gradient_delta = values.gradients[:, 1] .- values.gradients[:, 2],
+        identity = values.identity,
+        elbo_standard_draws = values.elbo_standard_draws[:, :, 1],
+        output_standard_draws = values.output_standard_draws[:, :, 1],
+        curvature_tolerance = values.curvature_tolerance,
+    )
+end
+
+"""
+    render_pathfinder_kernels(mod) -> Markdown.MD
+
+Load the exact external Pathfinder fixture and render two compiled cuts of its
+single authored mathematical graph: the curvature-safe inverse-BFGS geometry,
+and the complete local-Gaussian/ELBO candidate.  Both panels execute during the
+docs build and share the standard Raw input / Generated kernel / Compute DAG UI.
+"""
+function render_pathfinder_kernels(mod::Module)
+    if !isdefined(mod, :PathfinderKernelAuthoringFixture)
+        Base.include(mod, _PATHFINDER_FIXTURE_PATH)
+    end
+    fixture = getfield(mod, :PathfinderKernelAuthoringFixture)
+    fixture isa Module || error("Pathfinder fixture did not define its module")
+
+    inputs = _pathfinder_inputs(fixture)
+    authored_source = _pathfinder_authored_source()
+    geometry_kernel = Base.invokelatest(
+        prepare,
+        fixture.pathfinder_candidate;
+        have = _PATHFINDER_HAVE,
+        want = (:alpha_next, :curvature_accepted, :covariance),
+    )
+    candidate_kernel = fixture.PATHFINDER_CANDIDATE
+
+    geometry_output = Base.invokelatest(geometry_kernel, Tuple(inputs)...)
+    candidate_output = Base.invokelatest(candidate_kernel, Tuple(inputs)...)
+    artifacts = (
+        (;
+            name = :pathfinder_inverse_bfgs_geometry,
+            origin = "Algorithms 3/4 from the reviewed Pathfinder fixture; geometry WANT cut",
+            inputs,
+            kernel = geometry_kernel,
+            output = geometry_output,
+            source = authored_source,
+            generated = code_expr(geometry_kernel),
+            dag = geometry_kernel.plan,
+        ),
+        (;
+            name = :pathfinder_local_gaussian_and_elbo,
+            origin = "Algorithms 3/4 from the reviewed Pathfinder fixture; full candidate WANT cut",
+            inputs,
+            kernel = candidate_kernel,
+            output = candidate_output,
+            source = authored_source,
+            generated = code_expr(candidate_kernel),
+            dag = candidate_kernel.plan,
+        ),
+    )
+    render_examples(artifacts)
+end
+
 # A docs-scoped stateless extraction of the Euclidean phasepoint recurrence from
 # benchmark/nuts_kernel_authoring_fixture.jl. The complete eight-spec fixture
 # remains byte-locked in nuts.md; this smaller executable authority exists so the
