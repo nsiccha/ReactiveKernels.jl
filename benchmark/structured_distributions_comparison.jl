@@ -13,7 +13,7 @@ using Random
 using Reactant
 using ReactiveKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
-    AR1_SOURCE, MVNORMAL_SOURCE
+    MVNORMAL_SOURCE
 using Statistics
 using TOML
 
@@ -32,14 +32,11 @@ function _evaluate_source(source)
 end
 
 const MVN_EXAMPLE = _evaluate_source(MVNORMAL_SOURCE)
-const AR1_EXAMPLE = _evaluate_source(AR1_SOURCE)
 
 _pm_logdensity(d, x) = ProbabilityMeasures.logdensityof(d, x)
 _distributions_logpdf(d, x) = Distributions.logpdf(d, x)
 
 _compile_rk_mvn(k, x, μ, L) = @compile sync = true k(x, μ, L)
-_compile_rk_ar1(k, x, μ, ϕ, log_scale) =
-    @compile sync = true k(x, μ, ϕ, log_scale)
 _compile_pm(d, x) = @compile sync = true _pm_logdensity(d, x)
 _compile_distributions(d, x) =
     @compile sync = true _distributions_logpdf(d, x)
@@ -76,15 +73,6 @@ function _mvn_inputs(n)
         end
     end
     (; x, μ, L)
-end
-
-function _ar1_inputs(n)
-    μ, ϕ, log_scale = 0.2, 0.65, log(0.7)
-    σ = exp(log_scale)
-    x = μ .+ [0.4sin(0.23i) + 0.15cos(0.41i) for i in 1:n]
-    covariance = [σ^2 / (1 - ϕ^2) * ϕ^abs(i - j) for i in 1:n, j in 1:n]
-    L = Matrix(cholesky(Symmetric(covariance)).L)
-    (; x, μ, ϕ, log_scale, mean = fill(μ, n), L)
 end
 
 function _package_version(name)
@@ -175,12 +163,11 @@ function run_benchmark()
         "rk_reactant" => true,
         "probability_measures_reactant" => true,
         "distributions_reactant" => true,
-    ) for family in ("mvnormal_cholesky", "stationary_ar1"))
+    ) for family in ("mvnormal_cholesky",))
     errors = Dict(family => Dict{String,String}() for family in keys(support))
     rows = Dict{String,Any}[]
 
     mvn_kernel = MVN_EXAMPLE.kernel
-    ar1_kernel = AR1_EXAMPLE.kernel
     for n in _sizes()
         mvn = _mvn_inputs(n)
         pm_mvn = ProbabilityMeasures.MvNormal(mvn.μ, mvn.L)
@@ -203,31 +190,7 @@ function run_benchmark()
                    pm_mvn, dist_mvn, mvn.x, rmx, baselines, rounds)
         row["rk_reactant_compile_seconds"] = mvn_compile_s
         push!(rows, row)
-
-        ar = _ar1_inputs(n)
-        pm_ar = ProbabilityMeasures.MvNormal(ar.mean, ar.L)
-        dist_ar = Distributions.MvNormal(ar.mean, Symmetric(ar.L * ar.L'))
-        ar_reference = ar1_kernel(ar.x, ar.μ, ar.ϕ, ar.log_scale)
-        ar_values = (
-            ar_reference, _distributions_logpdf(dist_ar, ar.x),
-            _pm_logdensity(pm_ar, ar.x),
-        )
-        all(value -> isapprox(value, ar_reference; rtol = 1e-10),
-            (ar_values[2], ar_values[3])) || error("AR(1) parity mismatch at n=$n")
-        rax = Reactant.to_rarray(ar.x)
-        raμ, raϕ, ralog_scale = Reactant.to_rarray.((ar.μ, ar.ϕ, ar.log_scale);
-                                                    track_numbers = true)
-        ar_compile_s = @elapsed ar_compiled =
-            _compile_rk_ar1(ar1_kernel, rax, raμ, raϕ, ralog_scale)
-        baselines = _baseline_reactant!(support, errors, "stationary_ar1",
-                                        pm_ar, dist_ar, rax, ar_reference)
-        row = _row("stationary_ar1", n, ar_reference, ar_values,
-                   ar1_kernel, (ar.x, ar.μ, ar.ϕ, ar.log_scale),
-                   ar_compiled, (rax, raμ, raϕ, ralog_scale),
-                   pm_ar, dist_ar, ar.x, rax, baselines, rounds)
-        row["rk_reactant_compile_seconds"] = ar_compile_s
-        push!(rows, row)
-        @printf("n=%d MVN+AR complete\n", n)
+        @printf("n=%d MVN complete\n", n)
     end
 
     receipt = Dict{String,Any}(
@@ -249,12 +212,11 @@ function run_benchmark()
             "julia_threads" => Threads.nthreads(), "reactant_backend" => "default CPU",
         ),
         "protocol" => Dict(
-            "families" => ["MVN (Cholesky HAVE benchmark)", "stationary AR(1)"],
+            "families" => ["MVN (Cholesky HAVE benchmark)"],
             "mvn_have_boundaries" => [
                 "covariance", "cholesky", "precision", "precision_cholesky",
             ],
             "mvn_all_boundaries_native_and_reactant_accepted" => true,
-            "ar1_baseline" => "equivalent dense MvNormal with precomputed Cholesky factor",
             "construction_and_factorization_timed" => false,
             "element_type" => "Float64", "rounds" => rounds,
             "estimator" => "median of per-round BenchmarkTools minimum times",

@@ -39,17 +39,19 @@ timing and host allocations are retained alongside time normalized per logical
 evaluation. Override the exploratory counts with `RK_DENSITY_REPLICAS=1,4`;
 published receipts use `1,16,256`.
 
-The scalar-gallery benchmark compares the exact Exponential, Geometric, and
-Uniform scalar sources after their generic `plate` lift. It records two vector
-sizes per family, traces every model parameter under Reactant, and keeps an
-explicit diagnostic for any public comparison path that does not compile.
+The scalar-gallery benchmark compares the public Cauchy, Laplace, Bernoulli,
+LogNormal, Exponential, Geometric, and Uniform objects after their generic
+`plate` lift. Normal has its separate shared-object/control benchmark. The
+gallery records two vector sizes per family, traces every model parameter under
+Reactant, and keeps an explicit diagnostic for any public comparison path that
+does not compile.
 
-The structured benchmark compares the exact build-executed MVN and stationary
-AR(1) sources against the public multivariate-Normal interfaces in Distributions
-and ProbabilityMeasures. The matched MVN timing uses the covariance-Cholesky
-HAVE boundary; the same authored RK graph is separately acceptance-tested from
+The structured benchmark compares the exact build-executed MVN source against
+the public multivariate-Normal interfaces in Distributions and
+ProbabilityMeasures. The matched timing uses the covariance-Cholesky HAVE
+boundary; the same authored RK graph is separately acceptance-tested from
 covariance, covariance Cholesky, precision, and precision Cholesky boundaries,
-natively and under Reactant. The AR(1) baselines use its equivalent dense
-multivariate Normal with a factor computed before timing; RK evaluates the
-authored O(T) recurrence. Unsupported full-MVN Reactant paths are retained
-with their compiler diagnostics rather than silently omitted.
+natively and under Reactant. AR(1) is intentionally absent because neither
+comparison package exposes a native AR(1) distribution. Unsupported full-MVN
+Reactant paths are retained with their compiler diagnostics rather than silently
+omitted.

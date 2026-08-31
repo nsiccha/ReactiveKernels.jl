@@ -135,10 +135,12 @@ Main.ReactiveKernelsDocs.execute_example(
 
 ### Scalar-family native and Reactant benchmark
 
-The matched comparison uses the public vectorized log-density APIs in
-Distributions and ProbabilityMeasures and the generic RK `plate` generated from
-each scalar source above. Parameters are traced runtime inputs under Reactant;
-compilation and host↔device transfers are excluded from execution timings.
+The matched comparison uses native Cauchy, Laplace, Bernoulli, LogNormal,
+Exponential, Geometric, and Uniform measures from both Distributions and
+ProbabilityMeasures and the generic RK `plate` generated from each public
+object above. Normal has its dedicated shared-object/control benchmark below.
+Parameters are traced runtime inputs under Reactant; compilation and
+host↔device transfers are excluded from execution timings.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_scalar_gallery_benchmarks()
@@ -200,11 +202,11 @@ stays coupled, while the new trailing axis runs the whole kernel once per column
 
 The matched comparison below uses the covariance-Cholesky HAVE boundary and
 public multivariate-Normal log-density APIs. It compares evaluation cost only,
-not construction-time parametrization APIs.
-For AR(1), Distributions and ProbabilityMeasures receive the mathematically
-equivalent dense MVN with its Cholesky factor computed before timing; RK runs
-the authored O(T) recurrence. Distribution construction, factorization,
-compilation, and host↔device transfers are excluded from execution timings.
+not construction-time parametrization APIs. Distribution construction,
+factorization, compilation, and host↔device transfers are excluded from
+execution timings. AR(1) is not benchmarked: neither comparison package exposes
+a native AR(1) distribution, so substituting a dense MVN would not be a matched
+library comparison.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_structured_distribution_benchmarks()

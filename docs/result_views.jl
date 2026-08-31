@@ -431,7 +431,15 @@ function render_scalar_gallery_benchmarks()
         error("scalar gallery Reactant receipt is not synchronous")
     get(protocol, "reactant_transfers_included", true) &&
         error("scalar gallery Reactant receipt includes host/device transfers")
-    families = ("exponential_logscale", "geometric_logit", "uniform_bounded")
+    families = (
+        "cauchy_location_scale",
+        "laplace_location_scale",
+        "bernoulli_logit",
+        "lognormal_logscale",
+        "exponential_logscale",
+        "geometric_logit",
+        "uniform_bounded",
+    )
     Tuple(protocol["families"]) == families ||
         error("unexpected scalar gallery family inventory")
     support = receipt["support"]
@@ -449,6 +457,10 @@ function render_scalar_gallery_benchmarks()
     end
 
     family_label = Dict(
+        "cauchy_location_scale" => "Cauchy",
+        "laplace_location_scale" => "Laplace",
+        "bernoulli_logit" => "Bernoulli",
+        "lognormal_logscale" => "LogNormal",
         "exponential_logscale" => "Exponential",
         "geometric_logit" => "Geometric",
         "uniform_bounded" => "Uniform",
@@ -516,7 +528,7 @@ function render_structured_distribution_benchmarks()
         error("structured receipt lacks all-boundary native/Reactant acceptance")
     support = receipt["support"]
     support_errors = receipt["support_errors"]
-    for family in ("mvnormal_cholesky", "stationary_ar1")
+    for family in ("mvnormal_cholesky",)
         family_support = support[family]
         get(family_support, "rk_reactant", false) ||
             error("$family does not accept the RK Reactant path")
@@ -527,30 +539,26 @@ function render_structured_distribution_benchmarks()
         end
     end
 
-    family_label = Dict(
-        "mvnormal_cholesky" => "MVN (Cholesky)",
-        "stationary_ar1" => "AR(1)",
-    )
+    family_label = Dict("mvnormal_cholesky" => "MVN (Cholesky)")
     measurements = receipt["measurements"]
     rows = _timing_rows(measurements;
         family = measurement -> family_label[measurement["family"]])
-    largest_ar = last(filter(row -> row["family"] == "stationary_ar1", measurements))
-    n = Int(largest_ar["n"])
-    ar_dist_ratio = round(
-        largest_ar["distributions_native"]["median_ns"] /
-        largest_ar["rk_native"]["median_ns"];
+    largest = last(measurements)
+    n = Int(largest["n"])
+    dist_ratio = round(
+        largest["distributions_native"]["median_ns"] /
+        largest["rk_native"]["median_ns"];
         digits = 2,
     )
-    ar_pm_ratio = round(
-        largest_ar["probability_measures_native"]["median_ns"] /
-        largest_ar["rk_native"]["median_ns"];
+    pm_ratio = round(
+        largest["probability_measures_native"]["median_ns"] /
+        largest["rk_native"]["median_ns"];
         digits = 2,
     )
-    summary = "At N=$n, the authored O(T) AR(1) kernel is " *
-        "$ar_dist_ratio× faster than the equivalent dense Distributions MvNormal and " *
-        "$ar_pm_ratio× faster than the ProbabilityMeasures MvNormal on this machine. " *
+    summary = "At N=$n, measured full-MVN runtime ratios (comparison/RK) are " *
+        "Distributions $dist_ratio× and ProbabilityMeasures $pm_ratio×. " *
         "Full-MVN Reactant cells for both comparison libraries are unsupported; " *
-        "RK compiles both structured kernels."
+        "the RK MVN kernel compiles."
     provenance = "Receipt pins: RK `$(first(String(pins["reactivekernels_sha"]), 10))`; " *
         "ProbabilityMeasures `$(first(String(pins["probability_measures_sha"]), 10))`; " *
         "Distributions $(pins["distributions_version"]); Reactant " *
@@ -558,10 +566,10 @@ function render_structured_distribution_benchmarks()
         "$(receipt["environment"]["cpu"])."
 
     blocks = Any[Markdown.Paragraph(Any[summary])]
-    for label in ("MVN (Cholesky)", "AR(1)")
+    for label in ("MVN (Cholesky)",)
         family_rows = filter(row -> row.family == label, rows)
-        plot_id = label == "AR(1)" ? "structured-ar1-runtime" : "structured-mvn-runtime"
-        push!(blocks, _timing_plot(family_rows; id = plot_id, title = "$label runtime"))
+        push!(blocks, _timing_plot(family_rows;
+            id = "structured-mvn-runtime", title = "$label runtime"))
     end
     push!(blocks,
         _result_table(rows, _timing_columns(; include_family = true);
