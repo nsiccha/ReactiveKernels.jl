@@ -11,6 +11,7 @@ permissions:
   contents: read
 jobs:
   test:
+    name: test (${{ matrix.julia-version }}, ${{ matrix.julia-arch }}, ${{ matrix.os }}, ${{ matrix.test-shard }})
     runs-on: ${{ matrix.os }}
     # Current/pre make sustained progress through the compiler-heavy HMC
     # acceptance beyond 90 minutes on hosted runners; keep a bounded margin.
@@ -21,6 +22,10 @@ jobs:
         julia-version: ['lts', '1', 'pre']
         julia-arch: [x64]
         os: [ubuntu-latest, windows-latest, macOS-latest]
+        # Each Julia/OS cell runs both disjoint partitions. Their concatenation
+        # is the ordinary full-suite file order in test/runtests.jl, so the
+        # critical path is shorter without dropping cross-platform assertions.
+        test-shard: [core, acceptance]
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
@@ -40,6 +45,7 @@ jobs:
           # module path. Compatibility failures must remain visible rather than
           # being converted into a cacheless full-suite run.
           compiled_modules: "yes"
+          test_args: ${{ matrix.test-shard }}
 
   compiled-module-smoke:
     name: compiled-module precompile/load (${{ matrix.julia-version }})

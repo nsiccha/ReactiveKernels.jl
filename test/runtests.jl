@@ -24,68 +24,142 @@ using ReactiveKernels
 import ReactiveKernelsNUTSExamples
 using Test
 
+const _MATRIX_CORE_TESTS = (
+    "test_runtests_selector.jl",
+    "test_stateless.jl",
+    "test_ad.jl",
+    "test_authoring.jl",
+    "test_readable_expr.jl",
+    "test_plate.jl",
+    "test_replica.jl",
+    "test_kernel_stateful.jl",
+    "test_kernel_methodir.jl",
+    "test_kernel_factory.jl",
+    "test_kernel_lowering.jl",
+    "test_kernel_codegen.jl",
+    "test_kernel_control.jl",
+    "test_kernel_control_regressions.jl",
+    "test_kernel_nuts.jl",
+    "test_kernel_nuts_native.jl",
+    "test_nuts_docs_fixture.jl",
+    "test_reactivehmc_algorithm_corpus.jl",
+    "test_reactivehmc_corpus_docs.jl",
+    "test_walnuts_external_corpus.jl",
+    "test_walnuts_docs_fixture.jl",
+    "test_reactivehmc_rke_fixture.jl",
+    "test_reactivehmc_rke_compiler.jl",
+    "test_reactivehmc_hmc_fixture.jl",
+)
+
+const _MATRIX_ACCEPTANCE_TESTS = (
+    "test_reactivehmc_hmc_compiler.jl",
+    "test_finite_structural_container.jl",
+    "test_compiler_docs.jl",
+    "test_kernel_adaptation.jl",
+    "test_nonallocating_core.jl",
+    "test_composition_cse.jl",
+    "test_deterministic_ast.jl",
+    "test_reactive.jl",
+    "test_stateful.jl",
+    "test_visualization.jl",
+    "test_adversarial.jl",
+    "test_hmc.jl",
+    "test_pathfinder.jl",
+    "test_pathfinder_docs.jl",
+    "test_reactive_sampler_baseline.jl",
+    "test_reactive_nuts.jl",
+    "test_reactive_adaptation.jl",
+    "test_benchmark_smoke.jl",
+    "test_online_stats_example.jl",
+    "test_nutpie_diagonal_adaptation.jl",
+    "test_reactivehmc_phasepoint_receipt.jl",
+    "test_reactivehmc_integrator_fixture.jl",
+    "test_reactivehmc_endpoint_specs.jl",
+    "test_reactivehmc_statistics_receipt.jl",
+    "test_reactivehmc_statistics_fixture.jl",
+    "test_reactivehmc_statistics_compiler.jl",
+)
+
+const _FULL_TESTS = (_MATRIX_CORE_TESTS..., _MATRIX_ACCEPTANCE_TESTS...)
+
+const _TEST_FILE_ORDER = (
+    "test_package_boundary.jl",
+    "test_ci_compiled_modules.jl",
+    _FULL_TESTS...,
+    "test_handwritten_benchmarks.jl",
+)
+
+const _TEST_GROUPS = ("core", "acceptance", "ad", "benchmark")
+
+function _test_group_files(selector::String)
+    selector == "core" && return (
+        "test_package_boundary.jl", "test_ci_compiled_modules.jl",
+        _MATRIX_CORE_TESTS...,
+    )
+    selector == "acceptance" && return (
+        _MATRIX_ACCEPTANCE_TESTS..., "test_handwritten_benchmarks.jl",
+    )
+    selector == "ad" && return (
+        "test_package_boundary.jl", "test_ci_compiled_modules.jl", "test_ad.jl",
+    )
+    selector == "benchmark" && return (
+        "test_package_boundary.jl", "test_ci_compiled_modules.jl",
+        "test_handwritten_benchmarks.jl",
+    )
+    nothing
+end
+
+function _test_file_selector(selector::String)
+    basename(selector) == selector || return nothing
+    file = endswith(selector, ".jl") ? selector : selector * ".jl"
+    file in _TEST_FILE_ORDER ? file : nothing
+end
+
+function _select_test_files(selectors::AbstractVector{<:AbstractString})
+    isempty(selectors) && return _TEST_FILE_ORDER
+
+    requested = Set{String}()
+    unknown = String[]
+    for raw_selector in selectors
+        selector = String(raw_selector)
+        group = _test_group_files(selector)
+        if group !== nothing
+            union!(requested, group)
+            continue
+        end
+        file = _test_file_selector(selector)
+        if file === nothing
+            push!(unknown, selector)
+        else
+            push!(requested, file)
+        end
+    end
+
+    if !isempty(unknown)
+        unknown = sort!(unique!(unknown))
+        throw(ArgumentError(
+            "unknown test selector(s): $(join(repr.(unknown), ", ")). " *
+            "Known groups: $(join(_TEST_GROUPS, ", ")). " *
+            "Known files: $(join(_TEST_FILE_ORDER, ", "))"))
+    end
+
+    Tuple(file for file in _TEST_FILE_ORDER if file in requested)
+end
+
+@assert isempty(intersect(Set(_MATRIX_CORE_TESTS), Set(_MATRIX_ACCEPTANCE_TESTS)))
+@assert all(isfile(joinpath(@__DIR__, file)) for file in _FULL_TESTS)
+@assert _select_test_files(["core", "acceptance"]) == _TEST_FILE_ORDER
+
+const _SELECTED_TEST_FILES = _select_test_files(ARGS)
+
 # Assert the package loads without sampler/compiler domain code before opting into
 # the external executable exemplar used by the remaining NUTS/HMC acceptance tests.
-include("test_package_boundary.jl")
+# The matrix core shard and the historical ad/benchmark groups own this assertion.
+"test_package_boundary.jl" in _SELECTED_TEST_FILES &&
+    include("test_package_boundary.jl")
 include(joinpath(@__DIR__, "..", "examples", "nuts_runtime.jl"))
 using .ReactiveKernelsNUTSExample
 
 @testset "ReactiveKernels" begin
-    include("test_ci_compiled_modules.jl")
-    benchmark_only = ARGS == ["benchmark"]
-    ad_only = ARGS == ["ad"]
-    if ad_only
-        include("test_ad.jl")
-    elseif !benchmark_only
-        include("test_stateless.jl")
-        include("test_ad.jl")
-        include("test_authoring.jl")
-        include("test_readable_expr.jl")
-        include("test_plate.jl")
-        include("test_replica.jl")
-        include("test_kernel_stateful.jl")
-        include("test_kernel_methodir.jl")
-        include("test_kernel_factory.jl")
-        include("test_kernel_lowering.jl")
-        include("test_kernel_codegen.jl")
-        include("test_kernel_control.jl")
-        include("test_kernel_control_regressions.jl")
-        include("test_kernel_nuts.jl")
-        include("test_kernel_nuts_native.jl")
-        include("test_nuts_docs_fixture.jl")
-        include("test_reactivehmc_algorithm_corpus.jl")
-        include("test_reactivehmc_corpus_docs.jl")
-        include("test_walnuts_external_corpus.jl")
-        include("test_walnuts_docs_fixture.jl")
-        include("test_reactivehmc_rke_fixture.jl")
-        include("test_reactivehmc_rke_compiler.jl")
-        include("test_reactivehmc_hmc_fixture.jl")
-        include("test_reactivehmc_hmc_compiler.jl")
-        include("test_finite_structural_container.jl")
-        include("test_compiler_docs.jl")
-        include("test_kernel_adaptation.jl")
-        include("test_nonallocating_core.jl")
-        include("test_composition_cse.jl")
-        include("test_deterministic_ast.jl")
-        include("test_reactive.jl")
-        include("test_stateful.jl")
-        include("test_visualization.jl")
-        include("test_adversarial.jl")
-        include("test_hmc.jl")
-        include("test_pathfinder.jl")
-        include("test_pathfinder_docs.jl")
-        include("test_reactive_sampler_baseline.jl")
-        include("test_reactive_nuts.jl")
-        include("test_reactive_adaptation.jl")
-        include("test_benchmark_smoke.jl")
-        include("test_online_stats_example.jl")
-        include("test_nutpie_diagonal_adaptation.jl")
-        include("test_reactivehmc_phasepoint_receipt.jl")
-        include("test_reactivehmc_integrator_fixture.jl")
-        include("test_reactivehmc_endpoint_specs.jl")
-        include("test_reactivehmc_statistics_receipt.jl")
-        include("test_reactivehmc_statistics_fixture.jl")
-        include("test_reactivehmc_statistics_compiler.jl")
-    end
-    ad_only || include("test_handwritten_benchmarks.jl")
+    foreach(include, filter(!=("test_package_boundary.jl"), _SELECTED_TEST_FILES))
 end
