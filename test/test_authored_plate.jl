@@ -44,6 +44,19 @@ end
     return sum(pointwise)
 end
 
+@kernel authored_eight_schools_prior(
+        θ::Vector{Float64}, μ::Float64, τ::Float64, log_τ::Float64) = begin
+    μ_prior::Float64 = authored_normal(0.0, 5.0).logpdf(μ)
+    τ_cauchy::Float64 = authored_cauchy(;
+        location = 0.0, scale = τ, log_scale = log_τ).logpdf(τ)
+    effects_pointwise = plate(θ, μ, τ, log_τ) do θj, μj, τj, log_τj
+        authored_normal(;
+            location = μj, scale = τj, log_scale = log_τj).logpdf(θj)
+    end
+    prior::Float64 = μ_prior + τ_cauchy + sum(effects_pointwise)
+    return prior
+end
+
 @kernel untyped_authored_normal_loglik(x, location, scale) = begin
     pointwise = plate(x, location, scale) do xi, li, si
         authored_normal(li, si).logpdf(xi)
@@ -222,6 +235,22 @@ end
     @test [only(recipe.outputs).name for recipe in both_have_scalar.recipes] ==
           [:standardized, Symbol("standard.logpdf"), :logpdf]
     @test !occursin("KernelObjectSpec", string(code_expr(both_have)))
+
+    θ = [0.25 * index for index in 1:8]
+    μ = 1.5
+    τ = 2.0
+    log_τ = log(τ)
+    eight_schools_prior = prepare(authored_eight_schools_prior)
+    expected_prior =
+        _authored_plate_normal(μ, 0.0, 5.0) +
+        _authored_plate_cauchy(τ, 0.0, τ) +
+        sum(_authored_plate_normal(value, μ, τ) for value in θ)
+    @test eight_schools_prior(θ, μ, τ, log_τ) ≈ expected_prior
+    eight_schools_plan = plan(authored_eight_schools_prior)
+    @test any(recipe -> recipe.source == 0.0, eight_schools_plan.recipes)
+    @test any(recipe -> recipe.source == 5.0, eight_schools_plan.recipes)
+    @test all(!(recipe.op isa PreparedKernel) for recipe in eight_schools_plan.recipes)
+    @test !occursin("KernelObjectSpec", string(code_expr(eight_schools_prior)))
 
     # Julia broadcast semantics include singleton expansion.
     @test pointwise(xs, locations[1:1], scale) ≈
