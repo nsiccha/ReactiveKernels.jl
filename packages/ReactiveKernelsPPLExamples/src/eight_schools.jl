@@ -2,8 +2,6 @@ module EightSchoolsExample
 
 using ReactiveKernels
 using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
-using ReactiveKernelsDistributionKernels.DistributionKernelSources:
-    NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY
 
 export EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA
 export build_eight_schools_graph, demo
@@ -15,25 +13,7 @@ const EIGHT_SCHOOLS_Y = [28.0, 8.0, -3.0, 7.0, -1.0, 1.0, 18.0, 12.0]
 const EIGHT_SCHOOLS_SIGMA = [15.0, 10.0, 16.0, 11.0, 9.0, 11.0, 10.0, 18.0]
 
 const EIGHT_SCHOOLS_SOURCE = raw"""
-# Reuse the distribution example's exact scalar graphs. The both-HAVE factors
-# let RK choose scale for standardization and log_scale for normalization,
-# avoiding a redundant exp or log. `plate` derives every per-school boundary
-# from the same Normal KernelSpec.
-normal_factor = prepare(NORMAL_LOGDENSITY;
-    have = (:x, :location, :scale, :log_scale), want = :logpdf)
-cauchy_factor = prepare(CAUCHY_LOGDENSITY;
-    have = (:x, :location, :scale, :log_scale), want = :logpdf)
-
-pointwise_loglik = plate(NORMAL_LOGDENSITY;
-    have = (:x, :location, :scale), want = :logpdf,
-    batched = (:x, :location, :scale),
-    reduce = nothing)
-summed_loglik = plate(NORMAL_LOGDENSITY;
-    have = (:x, :location, :scale), want = :logpdf,
-    batched = (:x, :location, :scale))
-summed_school_prior = plate(NORMAL_LOGDENSITY;
-    have = (:x, :location, :scale, :log_scale), want = :logpdf,
-    batched = :x)
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauchy
 
 @kernel model(unconstrained::Vector{Float64},
               observations::Vector{Float64},
@@ -59,20 +39,28 @@ summed_school_prior = plate(NORMAL_LOGDENSITY;
     parameters = (; μ, τ, θ)
     (parameters, log_jacobian::Float64) = ((; μ, τ, θ), log_τ)
 
-    # log prior:  μ ~ Normal(0, 5),  τ ~ HalfCauchy(0, 5),  θⱼ ~ Normal(μ, τ).
-    μ_prior::Float64 = normal_factor(μ, 0.0, 5.0, log(5.0))
-    τ_cauchy::Float64 = cauchy_factor(τ, 0.0, 5.0, log(5.0))
+    # Log prior: μ ~ Normal(0, 5), τ ~ HalfCauchy(0, 5),
+    # and θⱼ ~ Normal(μ, τ). Supplying both τ and log_τ to the nested Cauchy
+    # and Normal objects makes both graph values authoritative HAVE inputs:
+    # neither representation is recomputed or checked against the other.
+    μ_prior::Float64 = normal(0.0, 5.0).logpdf(μ)
+    τ_cauchy::Float64 = cauchy(;
+        location = 0.0, scale = τ, log_scale = log_τ).logpdf(τ)
     τ_prior::Float64 = log(2.0) + τ_cauchy
-    effects_prior::Float64 = summed_school_prior(θ, μ, τ, log_τ)
+    effects_pointwise = plate(θ, μ, τ, log_τ) do θj, μj, τj, log_τj
+        normal(;
+            location = μj, scale = τj, log_scale = log_τj).logpdf(θj)
+    end
+    effects_prior::Float64 = sum(effects_pointwise)
     prior::Float64 = μ_prior + τ_prior + effects_prior
 
-    # The pointwise and summed boundaries come from the SAME scalar recipe.
-    # A query for `pointwise` materializes that requested output vector; a query
-    # for `likelihood` takes the direct plate reduction and allocates no buffer.
-    pointwise::Vector{Float64} =
-        pointwise_loglik(observations, θ, observation_scales)
-    likelihood::Float64 =
-        summed_loglik(observations, θ, observation_scales)
+    # The pointwise and summed likelihood boundaries are one authored plate.
+    # A query for `pointwise` materializes that requested result; a query for
+    # `likelihood` fuses the sum into the traversal and allocates no buffer.
+    pointwise = plate(observations, θ, observation_scales) do yj, θj, σj
+        normal(θj, σj).logpdf(yj)
+    end
+    likelihood::Float64 = sum(pointwise)
 
     # Unconstrained-space log posterior.
     posterior::Float64 = prior + log_jacobian + likelihood
@@ -105,13 +93,26 @@ evaluation_kernel = prepare(model;
 output = evaluation_kernel(μ, log_τ, θ, observations, observation_scales)
 parameters, prior, likelihood = output
 
-# Pointwise likelihoods are just another extraction boundary. This collector is
-# absent from `evaluation_kernel`; its total uses `summed_loglik` directly.
+# Pointwise likelihoods and their total are alternate cuts through the same
+# authored plate node. Total-only lowering fuses the sum; requesting both fills
+# the pointwise result and accumulates the total in that same traversal.
 pointwise_extraction = prepare(model;
     have = (:θ, :observations, :observation_scales),
     want = :pointwise)
+likelihood_extraction = prepare(model;
+    have = (:θ, :observations, :observation_scales),
+    want = :likelihood)
+pointwise_and_likelihood_extraction = prepare(model;
+    have = (:θ, :observations, :observation_scales),
+    want = (:pointwise, :likelihood))
 pointwise = pointwise_extraction(θ, observations, observation_scales)
+extracted_likelihood =
+    likelihood_extraction(θ, observations, observation_scales)
+pointwise_and_likelihood =
+    pointwise_and_likelihood_extraction(θ, observations, observation_scales)
 @assert likelihood ≈ sum(pointwise)
+@assert extracted_likelihood ≈ likelihood
+@assert pointwise_and_likelihood == (pointwise, likelihood)
 
 docs_example = (;
     name = :eight_schools_extraction,
@@ -121,24 +122,22 @@ docs_example = (;
     kernel = evaluation_kernel,
     output,
     requested_nodes,
-    pointwise_kernel = pointwise_loglik,
     pointwise_extraction,
+    likelihood_extraction,
+    pointwise_and_likelihood_extraction,
     pointwise,
-    likelihood_kernel = summed_loglik,
-    effects_prior_kernel = summed_school_prior,
-    normal_factor,
-    cauchy_factor,
-    normal_spec = NORMAL_LOGDENSITY,
-    cauchy_spec = CAUCHY_LOGDENSITY,
+    pointwise_and_likelihood,
+    normal_object = normal,
+    cauchy_object = cauchy,
 )
 """
 
 function evaluate_eight_schools_source()
-    # Bind only data and reusable distribution KernelSpecs. The authored source
-    # contains the complete PPL assembly and no model-specific helper evaluator.
+    # Bind only the data. The authored source imports the reusable distribution
+    # objects itself and contains the complete PPL assembly with no helper
+    # evaluator or separately prepared density/plate path.
     _evaluate_ppl_source(EIGHT_SCHOOLS_SOURCE, @__MODULE__; bindings = (
         :EIGHT_SCHOOLS_Y, :EIGHT_SCHOOLS_SIGMA,
-        :NORMAL_LOGDENSITY, :CAUCHY_LOGDENSITY,
     ))
 end
 
@@ -161,8 +160,9 @@ Build the centered eight-schools model as a declarative
 different PPL queries explicit `have`/`want` boundaries. Constrained parameters
 and predictions are plain NamedTuples, not custom types.
 
-The reusable Normal and Cauchy `KernelSpec`s from the distributions example are
-prepared or lifted by `plate`; the PPL source does not re-author their formulas.
+The reusable Normal and Cauchy kernel objects from the distributions example are
+included directly by ordinary endpoint calls inside the model's authored plate
+blocks; the PPL source does not re-author their formulas or prepare helper paths.
 The transform Jacobian, prior, pointwise likelihood, total likelihood,
 posterior, and prediction remain selectable named nodes. A
 Wren-style accumulator tuple is therefore a static `want` selection, not a

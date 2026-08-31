@@ -1,4 +1,5 @@
 using ReactiveKernelsPPLExamples.EightSchoolsExample
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauchy
 
 _eight_schools_likelihood_call(kernel, observations, effects, scales) =
     kernel(observations, effects, scales)
@@ -28,16 +29,18 @@ end
     model = artifact.model
     q = [1.5, log(2.0), (0.25 .* (1:8))...]
 
-    @test occursin("NORMAL_LOGDENSITY", EIGHT_SCHOOLS_SOURCE)
-    @test occursin("CAUCHY_LOGDENSITY", EIGHT_SCHOOLS_SOURCE)
+    @test !occursin("NORMAL_LOGDENSITY", EIGHT_SCHOOLS_SOURCE)
+    @test !occursin("CAUCHY_LOGDENSITY", EIGHT_SCHOOLS_SOURCE)
+    @test !occursin(r"(?m)^\s*\w+\s*=\s*prepare\(", EIGHT_SCHOOLS_SOURCE)
+    @test occursin("normal(0.0, 5.0).logpdf(μ)", EIGHT_SCHOOLS_SOURCE)
+    @test occursin("cauchy(;", EIGHT_SCHOOLS_SOURCE)
+    @test length(split(EIGHT_SCHOOLS_SOURCE, "pointwise = plate(")) - 1 == 2
     @test !occursin("@kernel school_", EIGHT_SCHOOLS_SOURCE)
-    @test artifact.normal_spec === EightSchoolsExample.NORMAL_LOGDENSITY
-    @test artifact.cauchy_spec === EightSchoolsExample.CAUCHY_LOGDENSITY
-    @test artifact.normal_factor.plan.graph === artifact.normal_spec.graph
-    @test artifact.cauchy_factor.plan.graph === artifact.cauchy_spec.graph
-    @test artifact.effects_prior_kernel.plan.graph === artifact.normal_spec.graph
-    @test artifact.pointwise_kernel.plan.graph === artifact.normal_spec.graph
-    @test artifact.likelihood_kernel.plan.graph === artifact.normal_spec.graph
+    @test artifact.normal_object === normal
+    @test artifact.cauchy_object === cauchy
+    @test artifact.pointwise_extraction.plan.graph === model.graph
+    @test artifact.likelihood_extraction.plan.graph === model.graph
+    @test artifact.pointwise_and_likelihood_extraction.plan.graph === model.graph
 
     @testset "one named model graph, with only the intentional transform alternative" begin
         # Every model QOI has exactly one producer; constrained parameters alone
@@ -48,7 +51,8 @@ end
                           canon_id(model.graph, value.id), recipe.outputs)
         end
         @test producer_count(model.parameters) == 2
-        for value in (model.log_jacobian, model.prior, model.likelihood,
+        for value in (model.log_jacobian, model.effects_pointwise,
+                      model.effects_prior, model.prior, model.likelihood,
                       model.pointwise, model.posterior, model.new_group)
             @test producer_count(value) == 1
         end
@@ -295,25 +299,31 @@ end
         ]
 
         @test artifact.pointwise ≈ expected_pointwise
-        @test artifact.pointwise_kernel.plan.graph ===
-              artifact.likelihood_kernel.plan.graph
+        @test artifact.pointwise_extraction.plan.graph ===
+              artifact.likelihood_extraction.plan.graph
+        @test artifact.pointwise_extraction.plan.graph ===
+              artifact.pointwise_and_likelihood_extraction.plan.graph
         likelihood = _eight_schools_likelihood_call(
-            artifact.likelihood_kernel,
+            artifact.likelihood_extraction,
             EIGHT_SCHOOLS_Y, θ, EIGHT_SCHOOLS_SIGMA,
         )
         @test likelihood ≈ sum(expected_pointwise)
+        @test artifact.pointwise_and_likelihood ==
+              (expected_pointwise, likelihood)
 
-        # Collect mode allocates exactly the requested pointwise result. The
-        # reducing plate instead emits a scalar accumulator loop, with no
-        # `similar` output buffer, and executes allocation-free after warmup.
-        @test occursin("similar", string(code_expr(artifact.pointwise_kernel)))
-        @test !occursin("similar", string(code_expr(artifact.likelihood_kernel)))
+        # The one authored plate lowers three ways. Pointwise-only allocates
+        # exactly its requested result; total-only emits a scalar accumulator
+        # with no output buffer; both-wants fills and sums in one traversal.
+        @test occursin("similar", string(code_expr(artifact.pointwise_extraction)))
+        @test !occursin("similar", string(code_expr(artifact.likelihood_extraction)))
+        @test occursin("similar",
+            string(code_expr(artifact.pointwise_and_likelihood_extraction)))
         _eight_schools_likelihood_call(
-            artifact.likelihood_kernel,
+            artifact.likelihood_extraction,
             EIGHT_SCHOOLS_Y, θ, EIGHT_SCHOOLS_SIGMA,
         )
         @test _eight_schools_likelihood_allocated(
-            artifact.likelihood_kernel,
+            artifact.likelihood_extraction,
             EIGHT_SCHOOLS_Y, θ, EIGHT_SCHOOLS_SIGMA,
         ) == 0
     end

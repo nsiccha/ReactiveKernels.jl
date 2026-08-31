@@ -53,19 +53,25 @@ log prior + log Jacobian + log likelihood ──► unconstrained log posterior
 The block below is the authored model, executed verbatim while the documentation
 is built, and it is the single source authority used by both the tests and this
 build. Every model-level operation is visible there: the split is plain
-indexing, the transform is `exp(log_τ)`, and the likelihood and prior reuse the
-Normal/Cauchy `KernelSpec`s from the distributions example. The PPL source does
-not re-author either density formula; `plate` derives its pointwise and reducing
-forms from the shared Normal graph.
+indexing, the transform is `exp(log_τ)`, and ordinary
+`normal(...).logpdf(...)` / `cauchy(...).logpdf(...)` calls include the reusable
+distribution objects transparently. The PPL source does not re-author either
+density formula and does not prepare helper factor or plate kernels.
 Constrained parameters and the new-group prediction are plain `NamedTuple`s, not
 custom types.
 
-The reducing plate emits a scalar accumulator loop directly: it does not first
-build a pointwise vector and therefore needs neither an output buffer nor an
-allocation. Asking for `pointwise` selects the collecting plate instead, where
-the one allocated vector is the requested result itself. These are static
-prepared boundaries over the same scalar recipe, and both remain traceable by
-Reactant.
+Each batched term is authored once as `pointwise = plate(...) do ... end`, with
+an ordinary `sum(pointwise)` consumer in the same graph. A total-only query
+emits a scalar accumulator loop directly, without building a pointwise vector;
+asking for `pointwise` materializes only that requested result, and asking for
+both fills it while accumulating the sum in the same traversal. These are
+static prepared boundaries over one authored plate node, and all remain
+traceable by Reactant.
+
+The hierarchical prior already contains both `τ = exp(log_τ)` and `log_τ`.
+Its nested Normal and Cauchy calls bind both named ports as authoritative HAVE
+values. RK therefore uses `τ` for standardization and `log_τ` for normalization
+without recomputing or validating either representation.
 
 The three Wren-style outputs are likewise not three RK-specific accumulator
 types. They are a static tuple of graph nodes:
@@ -89,13 +95,13 @@ sees the resulting mathematical `PreparedKernel`. The packed `unconstrained`
 vector and the named latent ports are alternate HAVE boundaries over that same
 graph, not alternate implementations of the mathematics.
 
-The unconstrained posterior uses that same RK-generated transform, prior, and two
-reducing `plate` kernels. Preparation splices both generated loops into one flat
-posterior kernel; there is no separately handwritten fused evaluator or nested
-`PreparedKernel`. The shared RK/DI preparation API marks observations and
-scales constant so only the unconstrained parameters receive adjoints, without
-runtime activity. The same plate-authored source retains tensorized lowering
-for Reactant.
+The unconstrained posterior uses that same RK-generated transform, prior, and
+the two authored plate nodes for school effects and observations. Preparation
+fuses each sum into its traversal and emits one flat posterior kernel; there is
+no separately handwritten fused evaluator or nested `PreparedKernel`. The
+shared RK/DI preparation API marks observations and scales constant so only the
+unconstrained parameters receive adjoints, without runtime activity. The same
+plate-authored source retains tensorized lowering for Reactant.
 
 The panel below shows three views of this model: **Raw input** (the source), a
 readable **Generated kernel** derived from the executed kernel and selected
