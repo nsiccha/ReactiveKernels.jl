@@ -1,7 +1,8 @@
 using Distributions: Bernoulli, Cauchy, Exponential, Geometric, Laplace,
     LogNormal, MvNormal, Normal, Uniform, cdf, logpdf, quantile
 using LinearAlgebra: Symmetric, cholesky
-using ReactiveKernels: KernelObjectSpec, KernelSpec, extract, plan, prepare
+using ReactiveKernels: @kernel, KernelObjectSpec, KernelSpec, code_expr, extract,
+    plan, plate, prepare
 using ReactiveKernelsDistributionKernels: DistributionKernelSources
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     LOCATION_SCALE_SOURCE,
@@ -13,6 +14,20 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     exponential, geometric, uniform, mvnormal, ar1,
     NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY
 using Test
+
+@kernel _public_normal_plate_total(
+        x::Vector{Float64}, location::Vector{Float64},
+        scale::Vector{Float64}) = begin
+    pointwise = plate(x, location, scale) do xi, li, si
+        normal(li, si).logpdf(xi)
+    end
+    return sum(pointwise)
+end
+
+function _public_normal_plate_allocated(kernel, x, location, scale)
+    kernel(x, location, scale)
+    @allocated kernel(x, location, scale)
+end
 
 @testset "distribution kernel foundation" begin
     @test all(object -> hasproperty(object, :logpdf),
@@ -32,6 +47,19 @@ using Test
          LOGNORMAL_KERNEL_SOURCE, EXPONENTIAL_KERNEL_SOURCE,
          GEOMETRIC_KERNEL_SOURCE, UNIFORM_KERNEL_SOURCE,
          MVNORMAL_KERNEL_SOURCE, AR1_KERNEL_SOURCE))
+
+    @testset "public location-scale plate is allocation-free" begin
+        xs = [-1.2, -0.1, 0.7, 1.8]
+        locations = [0.1, 0.2, 0.4, 0.5]
+        scales = [0.8, 1.0, 1.3, 1.5]
+        total = prepare(_public_normal_plate_total)
+        reference = sum(logpdf.(Normal.(locations, scales), xs))
+
+        @test total(xs, locations, scales) ≈ reference
+        @test !occursin("similar", string(code_expr(total)))
+        @test _public_normal_plate_allocated(
+            total, xs, locations, scales) == 0
+    end
 
     x, location, scale = 0.4, -0.2, 1.3
     p = 0.73
