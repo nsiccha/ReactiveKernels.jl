@@ -90,13 +90,17 @@ const _MATRIX_ACCEPTANCE_SAMPLERS_TESTS = (
     "test_reactivehmc_statistics_compiler.jl",
 )
 
+const _MATRIX_ACCEPTANCE_BENCHMARK_TESTS = ("test_handwritten_benchmarks.jl",)
+
 const _MATRIX_ACCEPTANCE_SHARD_GROUPS = (
     "acceptance-compiler", "acceptance-runtime", "acceptance-samplers",
+    "acceptance-benchmarks",
 )
 const _MATRIX_ACCEPTANCE_SHARDS = (
     _MATRIX_ACCEPTANCE_COMPILER_TESTS,
     _MATRIX_ACCEPTANCE_RUNTIME_TESTS,
     _MATRIX_ACCEPTANCE_SAMPLERS_TESTS,
+    _MATRIX_ACCEPTANCE_BENCHMARK_TESTS,
 )
 const _MATRIX_ACCEPTANCE_TESTS = (
     _MATRIX_ACCEPTANCE_COMPILER_TESTS...,
@@ -127,9 +131,8 @@ function _test_group_files(selector::String)
     )
     selector == "acceptance-compiler" && return _MATRIX_ACCEPTANCE_COMPILER_TESTS
     selector == "acceptance-runtime" && return _MATRIX_ACCEPTANCE_RUNTIME_TESTS
-    selector == "acceptance-samplers" && return (
-        _MATRIX_ACCEPTANCE_SAMPLERS_TESTS..., "test_handwritten_benchmarks.jl",
-    )
+    selector == "acceptance-samplers" && return _MATRIX_ACCEPTANCE_SAMPLERS_TESTS
+    selector == "acceptance-benchmarks" && return _MATRIX_ACCEPTANCE_BENCHMARK_TESTS
     selector == "ad" && return (
         "test_package_boundary.jl", "test_ci_compiled_modules.jl", "test_ad.jl",
     )
@@ -178,7 +181,8 @@ function _select_test_files(selectors::AbstractVector{<:AbstractString})
 end
 
 @assert isempty(intersect(Set(_MATRIX_CORE_TESTS), Set(_MATRIX_ACCEPTANCE_TESTS)))
-@assert Tuple(Iterators.flatten(_MATRIX_ACCEPTANCE_SHARDS)) == _MATRIX_ACCEPTANCE_TESTS
+@assert Tuple(Iterators.flatten(_MATRIX_ACCEPTANCE_SHARDS)) ==
+    (_MATRIX_ACCEPTANCE_TESTS..., _MATRIX_ACCEPTANCE_BENCHMARK_TESTS...)
 @assert all(
     isempty(intersect(Set(_MATRIX_ACCEPTANCE_SHARDS[i]),
                       Set(_MATRIX_ACCEPTANCE_SHARDS[j])))
