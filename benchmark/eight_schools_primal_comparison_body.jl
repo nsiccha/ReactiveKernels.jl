@@ -375,6 +375,7 @@ function run_comparison()
         "pins" => Dict(
             "reactivekernels_sha" => get(
                 ENV, "REACTIVEKERNELS_CANDIDATE_SHA", "unknown"),
+            "reactivekernels_dirty" => false,
             (string(lowercase(name), "_version") => _package_version(name)
              for name in COMPARISON_PACKAGES)...,
             "julia_version" => string(VERSION),

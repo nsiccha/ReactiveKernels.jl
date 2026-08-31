@@ -40,6 +40,8 @@ function validate_eight_schools_primal_receipt(path::AbstractString)
     end
     require(occursin(r"^[0-9a-f]{40}$", get(pins, "reactivekernels_sha", "")),
             "ReactiveKernels receipt pin must be a full commit SHA")
+    require(get(pins, "reactivekernels_dirty", true) == false,
+            "receipt must come from a clean detached ReactiveKernels tree")
 
     protocol = receipt["protocol"]
     require(Tuple(protocol["input_boundaries"]) == EXPECTED_BOUNDARIES,

@@ -87,6 +87,7 @@ function check_rendered_docs(build_dir, page_tree)
         "batched.md" => 2,
         "compiler.md" => 1,
         "distributions.md" => 6,
+        "eight-schools.md" => 1,
         "eval-throughput.md" => 1,
         "nuts.md" => 3,
     )

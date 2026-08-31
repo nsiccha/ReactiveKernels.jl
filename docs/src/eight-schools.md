@@ -1,10 +1,15 @@
 # Declarative PPL kernel: eight schools
 
+```@eval
+Main.ReactiveKernelsDocs.render_result_assets()
+```
+
 `ReactiveKernels` has no built-in probabilistic-programming semantics. This
 example assembles the model from reusable declarative distribution kernels,
-ordinary transforms, and `plate`. PPL evaluation policies then reduce to named graph-output selection:
-the equivalent of Wren's `Params`, `LogPrior`, and `LogLikelihood` accumulators
-is one `want = (:parameters, :prior, :likelihood)` boundary.
+ordinary transforms, and `plate`. PPL evaluation policies then reduce to named
+graph-output selection: the equivalent of Wren's `Params`, `LogPrior`, and
+`LogLikelihood` accumulators is one
+`want = (:parameters, :prior, :likelihood)` boundary.
 
 The complete runnable source is
 [`packages/ReactiveKernelsPPLExamples/src/eight_schools.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsPPLExamples/src/eight_schools.jl).
@@ -69,10 +74,8 @@ custom types.
 Each batched term is authored once as `pointwise = plate(...) do ... end`, with
 an ordinary `sum(pointwise)` consumer in the same graph. A total-only query
 emits a scalar accumulator loop directly, without building a pointwise vector;
-asking for `pointwise` materializes only that requested result, and asking for
-both fills it while accumulating the sum in the same traversal. These are
-static prepared boundaries over one authored plate node, and all remain
-traceable by Reactant.
+asking for `pointwise` materializes only that requested result. These are static
+prepared boundaries over one authored plate node.
 
 The hierarchical prior already contains both `τ = exp(log_τ)` and `log_τ`.
 Each effects Normal binds both named ports as authoritative HAVE values, so RK
@@ -97,8 +100,7 @@ Because selection happens during planning, the generated kernel contains only
 the backward slice needed for those nodes. In particular, it uses the fused
 likelihood reduction and prunes the pointwise collector, Jacobian, posterior, and
 prediction branches. An eventual PPL-to-RK transpiler only needs to retain the
-mapping from PPL results to these named ports; RK handles extraction and Reactant
-sees the resulting mathematical `PreparedKernel`. The packed `unconstrained`
+mapping from PPL results to these named ports; RK handles extraction. The packed `unconstrained`
 vector and the named latent ports are alternate HAVE boundaries over that same
 graph, not alternate implementations of the mathematics.
 
@@ -108,16 +110,13 @@ constrained-space call supplies `parameters = (; μ, τ, θ)` and asks for
 `unconstrained` vector and asks for the distinguished `posterior` return. The former computes
 `log_τ = log(τ)` once for the distribution normalization terms and prunes the
 transform Jacobian; the latter uses the supplied `log_τ`, computes `τ`, and adds
-the Jacobian. Prior-only, likelihood-only, pointwise-only, and pointwise-plus-
-total are further slices of this same graph.
+the Jacobian. Prior-only, likelihood-only, and pointwise-only are further slices
+of this same graph.
 
 The unconstrained posterior uses that same RK-generated transform, prior, and
 the two authored plate nodes for school effects and observations. Preparation
 fuses each sum into its traversal and emits one flat posterior kernel; there is
-no separately handwritten fused evaluator or nested `PreparedKernel`. The
-shared RK/DI preparation API marks observations and scales constant so only the
-unconstrained parameters receive adjoints, without runtime activity. The same
-plate-authored source retains tensorized lowering for Reactant.
+no separately handwritten fused evaluator or nested `PreparedKernel`.
 
 The panel below shows three views of this model: **Raw input** (the source), a
 readable **Generated kernel** derived from the executed kernel and selected
@@ -130,6 +129,40 @@ Main.ReactiveKernelsDocs.execute_ppl_example(
     @__MODULE__, :EightSchoolsExample, :EIGHT_SCHOOLS_SOURCE;
     setup = Main.ReactiveKernelsDocs.setup_eight_schools!,
 )
+```
+
+## Primal capability and log-density performance
+
+The benchmark below prepares the exact authored graph above from three useful
+starting boundaries and asks for four model outcomes. `Packed unconstrained`
+matches a sampler's linked parameter vector. `Constrained parameters` starts
+after support transforms. `Likelihood inputs only` supplies just `θ`, the
+observations, and their scales, allowing RK to prune every prior and transform.
+
+The RK cells are HAVE/WANT cuts of one graph, not wrapper models. The manual
+cells are direct handwritten Julia controls. Turing uses its native public
+interfaces: a fixed-transform `LogDensityFunction` for packed parameters,
+`logjoint` / `logprior` / `loglikelihood` for constrained parameters, and
+`pointwise_loglikelihoods` for pointwise values. Blank cells stay blank when no
+matching public Turing boundary exists; the benchmark does not invent an
+equivalent helper. Setup, graph preparation, parameter linking, and transform
+discovery are outside the timed region.
+
+```@eval
+Main.ReactiveKernelsDocs.render_eight_schools_primal_benchmarks()
+```
+
+Each cell reports the median of ten independent BenchmarkTools minimum-time
+rounds together with steady-state allocation bytes and counts. Every supported
+cell must agree numerically with the handwritten control before it is timed.
+
+Reproduce the pinned receipt from a clean detached checkout:
+
+```sh
+julia --startup-file=no benchmark/eight_schools_primal_comparison.jl \
+  --output=benchmark/receipts/eight-schools-primal-v1.toml
+julia --startup-file=no benchmark/receipts/validate_eight_schools_primal.jl \
+  benchmark/receipts/eight-schools-primal-v1.toml
 ```
 
 Asking only for constrained parameters selects the parameters-only producer, so
