@@ -29,6 +29,28 @@ end
         -0.5 * sum(abs2, x .- location)
 end
 
+const _AUTHORED_PLATE_SCALE_CALLS = Ref(0)
+_authored_plate_counted_log(scale) =
+    (_AUTHORED_PLATE_SCALE_CALLS[] += 1; log(scale))
+
+# This helper is a transparent RK graph. Its leaf operation is an ordinary
+# opaque Julia callable, which carries the normal RK pure-recipe contract.
+@kernel authored_counted_scale(scale) = begin
+    log_scale::Float64 = _authored_plate_counted_log(scale)
+    return log_scale
+end
+
+@kernel authored_axis_loglik(x, location, scale) = begin
+    pointwise = plate(x, location, scale) do xi, li, si
+        log_scale::Float64 = authored_counted_scale(si)
+        residual::Float64 = xi - li
+        logpdf::Float64 =
+            -0.5 * log(2π) - log_scale - 0.5 * (residual / si)^2
+        return logpdf
+    end
+    return sum(pointwise)
+end
+
 @kernel authored_normal_loglik(x::Vector{Float64}, location, scale) = begin
     pointwise = plate(x, location, scale) do xi, li, si
         authored_normal(li, si).logpdf(xi)
@@ -121,6 +143,9 @@ function _authored_plate_allocated(kernel, a, b, c)
     kernel(a, b, c)
     @allocated kernel(a, b, c)
 end
+
+_authored_plate_steady_allocated(kernel, a, b, c) =
+    @allocated kernel(a, b, c)
 
 struct _AuthoredPlateBackendArray <: AbstractVector{Float64}
     values::Vector{Float64}
@@ -331,6 +356,69 @@ end
 
     @test_throws DimensionMismatch total(xs, locations[1:3], scales)
     @test_throws DimensionMismatch total(xs, [locations; 0.6], scales)
+end
+
+@testset "authored plate block: graph-derived broadcast scheduling" begin
+    observations = collect(range(-1.0, 1.0; length = 7))
+    locations = reshape([-0.4, 0.2, 0.7], 1, :)
+    scales = reshape([0.8, 1.1, 1.7, 2.2], 1, 1, :)
+    reference = _authored_plate_normal.(observations, locations, scales)
+
+    total = prepare(authored_axis_loglik)
+    pointwise = prepare(extract(authored_axis_loglik; want = :pointwise))
+    both = prepare(extract(
+        authored_axis_loglik; want = (:pointwise, :__return__)))
+
+    scalar_plan = plate_body(first(plan(authored_axis_loglik).recipes))
+    scalar_names = [only(recipe.outputs).name for recipe in scalar_plan.recipes]
+    @test :log_scale in scalar_names
+    @test all(!(recipe.op isa PreparedKernel) for recipe in scalar_plan.recipes)
+
+    # Julia's instantiated broadcast dimensions are the logical axes. The
+    # transparent dependency graph proves that `log(scale)` depends only on
+    # the third one, so it runs once per scale coordinate, not once per cell.
+    for (kernel, expected) in (
+            (total, sum(reference)),
+            (pointwise, reference))
+        _AUTHORED_PLATE_SCALE_CALLS[] = 0
+        @test kernel(observations, locations, scales) ≈ expected
+        @test _AUTHORED_PLATE_SCALE_CALLS[] == length(scales)
+    end
+    _AUTHORED_PLATE_SCALE_CALLS[] = 0
+    both_result = both(observations, locations, scales)
+    @test first(both_result) ≈ reference
+    @test last(both_result) ≈ sum(reference)
+    @test _AUTHORED_PLATE_SCALE_CALLS[] == length(scales)
+
+    generated = string(code_expr(total))
+    @test occursin("_plate_dependency_changed", generated)
+    @test _authored_plate_head_count(code_expr(total), :for) == 1
+    @test !occursin("similar", generated)
+    @test !occursin("for ", string(total.f.tensorized_ast))
+
+    total(observations, locations, scales)
+    _AUTHORED_PLATE_SCALE_CALLS[] = 0
+    @test _authored_plate_steady_allocated(
+        total, observations, locations, scales) == 0
+    @test _AUTHORED_PLATE_SCALE_CALLS[] == length(scales)
+
+    # Broadcast compatibility is established before any pure recipe executes.
+    _AUTHORED_PLATE_SCALE_CALLS[] = 0
+    @test_throws DimensionMismatch total(
+        observations, vec(locations), scales)
+    @test _AUTHORED_PLATE_SCALE_CALLS[] == 0
+
+    # A plate is a pure map/reduction contract. Ordinary opaque leaf callables
+    # are pure by default; a recipe explicitly known to be effectful is not a
+    # plate execution mode and cannot be selected into the scalar plan.
+    @test_throws PlanningError (@kernel begin
+        scale
+        pointwise = plate(scale) do si
+            @recipe (effectful = true) y = si + 1
+            return y
+        end
+        return sum(pointwise)
+    end)
 end
 
 @testset "authored plate block: second transparent object endpoint" begin

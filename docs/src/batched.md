@@ -14,9 +14,10 @@ three useful views without a second density formula:
 - `extract(normal_loglik; want = (:pointwise, :__return__))` returns both in one
   traversal.
 
-The scalar endpoint is the canonical transparent `normal` distribution object
-from [Distribution kernels](distributions.md). `Distributions.jl` remains an
-independent numerical oracle; it is absent from every generated compute path.
+The scalar endpoint is the canonical transparent RK `normal` kernel object
+from [Distribution kernels](distributions.md). It is not
+`Distributions.jl.Normal`: `Distributions.jl` remains an independent numerical
+oracle and is absent from every generated compute path.
 
 ## One authored graph, three queries
 
@@ -46,6 +47,27 @@ shapes raise `DimensionMismatch`.
 There is no separate public axis or scheduling language. The one-axis example
 above is the simplest case of that contract; multidimensional inputs use the
 same broadcast rules.
+
+## A plate is a pure RK subgraph
+
+The `do` block is not an opaque batch callback. ReactiveKernels lowers it to an
+ordinary scalar graph, and transparent nested kernels or distribution objects
+are spliced into that graph before planning. Each selected recipe therefore has
+an exact transitive set of plated HAVE dependencies.
+
+Those dependencies determine execution frequency. After Julia instantiates the
+broadcast axes, native lowering places each recipe at its narrowest valid loop
+boundary. For inputs shaped like `x`, `reshape(location, 1, :)`, and
+`reshape(scale, 1, 1, :)`, work depending only on `scale` runs once per scale
+coordinate and its scalar result is reused across the two inner dimensions.
+There is still one Cartesian traversal, and no axis-sized intermediate is
+created for the reused value.
+
+Purity is the plate contract, just as it is for ordinary stateless RK recipes.
+RK does not inspect an opaque Julia callable to prove its implementation pure;
+adding it as an ordinary recipe asserts that contract. A recipe explicitly
+marked `effectful=true` is excluded by planning and therefore cannot enter a
+plate. Work with observable effects belongs outside `plate`.
 
 ## Measured parity with the established plate path
 
