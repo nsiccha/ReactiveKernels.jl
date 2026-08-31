@@ -2,7 +2,6 @@
 
 using BenchmarkTools
 using Dates
-using LinearAlgebra
 using Pkg
 using Statistics
 using TOML
@@ -11,7 +10,8 @@ using ReactiveKernelsPPLExamples.EightSchoolsExample:
     EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA, build_eight_schools_graph
 import DynamicPPL
 import Turing
-using Distributions: Cauchy, MvNormal, Normal, truncated
+using Turing: filldist
+using Distributions: Cauchy, Normal, truncated
 
 const LDP = DynamicPPL.LogDensityProblems
 const DEFAULT_EIGHT_SCHOOLS_ROUNDS = 10
@@ -24,7 +24,12 @@ const COMPARISON_PACKAGES = (
 Turing.@model function turing_eight_schools(observations, observation_scales)
     μ ~ Normal(0, 5)
     τ ~ truncated(Cauchy(0, 5); lower = 0)
-    θ ~ MvNormal(fill(μ, length(observations)), τ^2 * I)
+    # θⱼ ~ Normal(μ, τ) as an i.i.d. product. This is the exact centered
+    # Eight Schools prior that `MvNormal(fill(μ, J), τ^2 * I)` encodes, but the
+    # `filldist` form avoids the mean-vector allocation and the dense MvNormal
+    # evaluation path, so it is the allocation-lighter public Turing baseline
+    # while keeping the identical density and linked parameter order.
+    θ ~ filldist(Normal(μ, τ), length(observations))
     for j in eachindex(observations)
         observations[j] ~ Normal(θ[j], observation_scales[j])
     end
