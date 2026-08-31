@@ -19,6 +19,7 @@ ReactiveKernelsKernelExamples = "c1a917b0-63b1-4b16-afa9-60dbf16f95f3"
 ReactiveKernelsHMCDiagnostics = "7283f29e-af9b-44bd-b98f-4e6318e8ac2b"
 ReactiveKernelsNUTSExamples = "1bd07bcb-ec6f-4af5-8d58-21805f68d06f"
 ReactiveKernelsPPLExamples = "a4d4be3d-45c5-49cc-80d7-34e606a16bce"
+SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 ReactiveKernelsStreamingStats = "fe060097-a659-4245-b1df-751eb37b739a"
 Treebars = "e1e568c4-3a56-40a4-95fa-9b9c6c16fccb"
 

@@ -85,7 +85,8 @@ function _plot_block(spec; id::AbstractString, title::AbstractString,
 end
 
 const _TIMING_BACKENDS = (
-    ("rk_native", "RK native"),
+    ("rk_native", "RK shared object"),
+    ("rk_direct_native", "RK one-off control"),
     ("distributions_native", "Distributions native"),
     ("probability_measures_native", "ProbabilityMeasures native"),
     ("rk_reactant", "RK + Reactant"),
@@ -94,7 +95,8 @@ const _TIMING_BACKENDS = (
 )
 
 const _ALLOCATION_BACKENDS = (
-    ("rk_native", "RK native"),
+    ("rk_native", "RK shared object"),
+    ("rk_direct_native", "RK one-off control"),
     ("distributions_native", "Distributions native"),
     ("probability_measures_native", "ProbabilityMeasures native"),
     ("rk_reactant", "RK + Reactant"),
@@ -288,10 +290,17 @@ function render_distribution_benchmarks()
         if row["rk_reactant"]["median_ns"] < row["rk_native"]["median_ns"])
     largest_n = Int(largest["n"])
     crossover_n = Int(crossover["n"])
+    shared_control_ratio = round(
+        largest["rk_native"]["median_ns"] /
+        largest["rk_direct_native"]["median_ns"];
+        digits = 2,
+    )
     summary = "At N=$largest_n, native RK is " *
         "$(ratio("distributions_native", "rk_native"))× faster than Distributions and " *
         "$(ratio("probability_measures_native", "rk_native"))× faster than " *
-        "ProbabilityMeasures. RK + Reactant is " *
+        "ProbabilityMeasures. The shared-object/one-off-control runtime ratio is " *
+        "$shared_control_ratio× (1× is identical). " *
+        "RK + Reactant is " *
         "$(ratio("rk_native", "rk_reactant"))× faster than native RK and " *
         "$(ratio("probability_measures_reactant", "rk_reactant"))× faster than " *
         "ProbabilityMeasures + Reactant. In the sampled sizes, Reactant first " *

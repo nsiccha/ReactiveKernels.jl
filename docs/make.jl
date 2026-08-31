@@ -56,9 +56,11 @@ include("check_rendered.jl")
 site_pages = [
     "Home" => "index.md",
     "Compiler capability and limits" => "compiler.md",
-    "Building blocks" => [
-        "Distribution log densities" => "distributions.md",
+    "Distributions" => [
+        "Distribution kernels" => "distributions.md",
         "Batched log densities" => "batched.md",
+    ],
+    "Building blocks" => [
         "Non-allocating kernels" => "nonallocating.md",
     ],
     "Automatic differentiation" => [

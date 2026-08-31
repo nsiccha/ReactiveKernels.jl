@@ -39,6 +39,13 @@ struct _KernelCallSignature{P,K,M,D}
     defaults::D
 end
 
+# A pure object endpoint has a full graph boundary, but authored endpoint
+# application spells only the method parameters.  Owner HAVE ports are filled
+# transparently by same-name caller ports during graph construction.
+struct _KernelEndpointCallSignature{Implicit,Explicit} end
+_kernel_endpoint_call_signature(::Val{I}, ::Val{E}) where {I,E} =
+    _KernelEndpointCallSignature{I,E}()
+
 function _kernel_call_signature(::Val{P}, ::Val{K}, ::Val{M}, defaults::D) where {P,K,M,D}
     _KernelCallSignature{P,K,M,D}(defaults)
 end
@@ -117,6 +124,7 @@ end
 end
 
 _kernel_signature_callable(target, ::Nothing) = target
+_kernel_signature_callable(target, ::_KernelEndpointCallSignature) = target
 function _kernel_signature_callable(
     target, signature::_KernelCallSignature{P,K,M},
 ) where {P,K,M}
@@ -185,15 +193,30 @@ function _kernel_add!(graph::Graph, ins, outs, op, cost, cse_key, effectful,
          cost = cost, cse_key = cse_key, effectful = effectful, source = source)
 end
 
+# A definition-stable structural key for compiler-owned source operations.  It
+# is deliberately unavailable to arbitrary Graph closures: only `@kernel` can
+# mint `_KernelSourceOp{Token}`.  Reusing a captured child therefore reuses the
+# key, while separately authored formulas have different Token parameters.
+struct _KernelProvenanceKey{Token} end
+
+_kernel_provenance_key(recipe::Recipe) =
+    _kernel_provenance_key(recipe.op, recipe.cse_key, recipe.effectful)
+_kernel_provenance_key(op, key, ::Bool) = key
+function _kernel_provenance_key(op::_KernelSourceOp{Token}, key, effectful::Bool) where {Token}
+    key === nothing && !effectful ? _KernelProvenanceKey{Token}() : key
+end
+
 _kernel_inline_signature_supported(::Any) = false
 _kernel_inline_signature_supported(::Nothing) = true
+_kernel_inline_signature_supported(::_KernelEndpointCallSignature) = true
 function _kernel_inline_signature_supported(
     ::_KernelCallSignature{P,K,M},
 ) where {P,K,M}
     isempty(K)
 end
 
-function _kernel_inline_call_inputs(ins, source)
+function _kernel_inline_call_inputs(ins, source, signature = nothing)
+    signature isa _KernelEndpointCallSignature && return Tuple(ins)
     source isa Expr && source.head === :call || return Tuple(ins)
     available = Dict(value.name => value for value in ins)
     args = source.args[2:end]
@@ -237,7 +260,7 @@ function _kernel_add!(graph::Graph, ins, outs, spec::KernelSpec, cost, cse_key,
 
     child_inputs = inputs(spec)
     child_outputs = outputs(spec)
-    call_inputs = _kernel_inline_call_inputs(ins, source)
+    call_inputs = _kernel_inline_call_inputs(ins, source, spec.call_signature)
     length(call_inputs) == length(child_inputs) || throw(ArgumentError(
         "nested KernelSpec call has $(length(call_inputs)) argument(s), but its default HAVE " *
         "boundary has $(length(child_inputs)) port(s)"))
@@ -274,7 +297,8 @@ function _kernel_add!(graph::Graph, ins, outs, spec::KernelSpec, cost, cse_key,
         add!(graph;
              inputs = Tuple(cloned[value.id] for value in recipe.inputs),
              outputs = Tuple(cloned[value.id] for value in recipe.outputs),
-             op = recipe.op, cost = recipe.cost, cse_key = recipe.cse_key,
+             op = recipe.op, cost = recipe.cost,
+             cse_key = _kernel_provenance_key(recipe),
              effectful = recipe.effectful, source = recipe.source)
     end
     _reindex_producers!(graph)
@@ -1028,19 +1052,22 @@ end
 
 function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
                            tensorize::Bool = true,
-                           mod::Union{Module,Nothing} = nothing)
+                           mod::Union{Module,Nothing} = nothing,
+                           nested_specs = Dict{Symbol,Any}())
     form = :fused
     if rhs isa Expr && rhs.head === :call && !isempty(rhs.args)
         callee = rhs.args[1]
         args = rhs.args[2:end]
         callee_is_port = callee isa Symbol && callee in known
-        callee_is_spec = mod isa Module &&
-                         _kernel_resolve_binding(mod, callee) isa KernelSpec
+        generated_spec = callee isa Symbol ? get(nested_specs, callee, nothing) : nothing
+        callee_is_spec = generated_spec !== nothing ||
+                         (mod isa Module &&
+                          _kernel_resolve_binding(mod, callee) isa KernelSpec)
         if callee_is_spec && !callee_is_port
             all(arg -> arg isa Symbol && arg in known, args) || throw(ArgumentError(
                 "nested KernelSpec call arguments must be declared graph ports; " *
                 "assign an expression to a port before passing it to the nested kernel"))
-            return callee
+            return generated_spec === nothing ? callee : generated_spec
         end
         if callee isa Symbol && !callee_is_port && !_is_broadcast_operator(callee) &&
            length(args) == length(deps) &&
@@ -1062,6 +1089,30 @@ function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
          Expr(:->, Expr(:tuple, deps...), rhs),
          Expr(:->, Expr(:tuple, deps...),
               tensorize ? _kernel_tensorized_rhs(rhs) : rhs))
+end
+
+function _kernel_nested_endpoint_deps(rhs, deps::Vector{Symbol}, known::Set{Symbol},
+                                      mod, nested_specs)
+    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) || return deps
+    callee = rhs.args[1]
+    generated = callee isa Symbol ? get(nested_specs, callee, nothing) : nothing
+    spec = generated isa KernelSpec ? generated :
+           (mod isa Module ? _kernel_resolve_binding(mod, callee) : nothing)
+    spec isa KernelSpec || return deps
+    signature = spec.call_signature
+    signature isa _KernelEndpointCallSignature || return deps
+    implicit, explicit = typeof(signature).parameters
+    args = rhs.args[2:end]
+    length(args) == length(explicit) || throw(ArgumentError(
+        "endpoint application expects $(length(explicit)) explicit argument(s) " *
+        "($(join(string.(explicit), ", "))), got $(length(args))"))
+    all(arg -> arg isa Symbol && arg in known, args) || throw(ArgumentError(
+        "endpoint application arguments must be named caller ports"))
+    for name in implicit
+        name in known || throw(ArgumentError(
+            "endpoint application needs implicit owner port :$name in the caller graph"))
+    end
+    Symbol[implicit...; args...]
 end
 
 # `@node(expr)` recipe-node promotion, used by `_kernel_expand`. Kept HERE (ahead of
@@ -1092,9 +1143,14 @@ function _kernel_resolve_binding(mod::Module, callee)
         outer = callee.args[1]
         isdefined(mod, outer) || return nothing
         outerval = getglobal(mod, outer)
-        outerval isa Module || return nothing
         inner = callee.args[2].value
-        isdefined(outerval, inner) ? getglobal(outerval, inner) : nothing
+        if outerval isa Module
+            isdefined(outerval, inner) ? getglobal(outerval, inner) : nothing
+        elseif outerval isa Union{_StatefulKernelSkeleton,KernelObjectSpec}
+            inner in kernel_endpoint_names(outerval) ? getproperty(outerval, inner) : nothing
+        else
+            nothing
+        end
     else
         nothing
     end
@@ -1153,7 +1209,8 @@ function _kernel_lift_nodes(block, mod)
 end
 
 function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
-                        call_signature = nothing, mod::Union{Module,Nothing} = nothing)
+                        call_signature = nothing, mod::Union{Module,Nothing} = nothing;
+                        nested_specs = Dict{Symbol,Any}())
     # Promote genuine RK `@node(expr)` markers into distinct schedulable recipe nodes
     # (identity-aware, collision-free, straight-line-only). A no-op — byte-identical —
     # for bodies with no `@node` (or only foreign `@node`).
@@ -1311,6 +1368,8 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         end
         rhs = _kernel_hygienic_catches(authored_rhs, known)
         deps = _kernel_free_ports(rhs, known)
+        deps = _kernel_nested_endpoint_deps(
+            rhs, deps, known, mod, nested_specs)
         union!(consumed_names, deps)
         for (name, _) in outputs
             _kernel_push_unique!(produced_names, name)
@@ -1321,7 +1380,8 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         cse_key = get(metadata, :cse_key, nothing)
         effectful = get(metadata, :effectful, false)
         op = _kernel_operation(rhs, deps, known;
-                               tensorize = !effectful, mod = mod)
+                               tensorize = !effectful, mod = mod,
+                               nested_specs = nested_specs)
         push!(body, :($add_ref($graph_var, $dep_values, $out_values,
                                $op, $cost, $cse_key, $effectful,
                                $(QuoteNode(rhs)))))
@@ -1559,18 +1619,31 @@ prepared kernel is invoked.
 
 `@kernel` supports three authoring modes, discriminated by the body. A methodless
 recipe body authors a stateless graph `KernelSpec` — this docstring's primary form,
-byte-identical to earlier releases. A body with nested method definitions authors a
-stateful OBJECT kernel with an IMPLICIT synthesized receiver: nested methods declare
-no `self`/`__self__` formal, bare unshadowed names are the owner's fields, and
-`__self__` appears only as a sibling object-pass actual (`flip!(__self__, depth)`). A
-methodless body that mutates a field of its first positional subject — or ANY `!!`
-name (a strong same-object update) — authors a free METHOD (e.g.
+byte-identical to earlier releases. A body with nested method definitions authors an
+OBJECT kernel with an IMPLICIT synthesized receiver: pure straight-line methods are
+transparent named endpoints, while effectful or control-flow methods remain available
+to the stricter stateful compiler. Nested methods declare no `self`/`__self__` formal,
+bare unshadowed names are the owner's fields, and `__self__` appears only as a sibling
+object-pass actual (`flip!(__self__, depth)`). A methodless body that mutates a field
+of its first positional subject — or ANY `!!` name (a strong same-object update) —
+authors a free METHOD (e.g.
 `leapfrog!(phasepoint; stepsize)`, `nuts!!(state; rng)`). Reactive mutation of a
 compiled stateless kernel remains available through [`prepare_reactive`](@ref),
 [`set!`](@ref), [`mutate!`](@ref), and [`touch!`](@ref).
 """
 macro kernel(ex)
     definition = ex isa Expr ? _kernel_definition_parts(ex) : nothing
+    if definition === nothing && ex isa Expr && ex.head === :(=) &&
+       length(ex.args) == 2 && ex.args[1] isa Symbol &&
+       ex.args[2] isa Expr && ex.args[2].head === :call
+        target = _kernel_resolve_binding(__module__, ex.args[2].args[1])
+        if target isa Union{_StatefulKernelSkeleton,KernelObjectSpec}
+            # Construction-time specialization sugar.  The call returns a
+            # transparent object specification; the new binding remains a
+            # stable top-level definition just like a method-bearing @kernel.
+            return esc(Expr(:const, ex))
+        end
+    end
     definition === nothing &&
         return esc(_kernel_expand(ex, Tuple{Symbol,Any}[], nothing, __module__))
     name, inputs, call_signature, positional_names, raw_signature, block = definition
@@ -1627,6 +1700,30 @@ function _kernel_selection(spec::KernelSpec, selection, defaults::Vector{Symbol}
     end
     Tuple(values)
 end
+
+"""
+    extract(spec::KernelSpec; have=inputs(spec), want=outputs(spec)) -> KernelSpec
+
+Create a transparent named-boundary view of `spec`.  The returned value shares
+the same ordinary graph and named ports; only its default HAVE/WANT boundary is
+changed.  Planning and preparation therefore use exactly the same recipes as
+an explicit `plan(spec; have, want)` call.
+"""
+function extract(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
+                 want = _KERNEL_DEFAULT_BOUNDARY)
+    selected_have = _kernel_selection(spec, have, spec.have_names, :have)
+    selected_want = _kernel_selection(spec, want, spec.want_names, :want)
+    KernelSpec(spec.graph, spec.ports, spec.port_order,
+               Symbol[value.name for value in selected_have],
+               Symbol[value.name for value in selected_want], nothing)
+end
+
+# Construction sugar for an already-authored boundary.  Runtime values still
+# go through `prepare(spec)(args...)`; calling the declarative spec itself is a
+# graph-view operation and cannot hide execution.
+(spec::KernelSpec)(; have = _KERNEL_DEFAULT_BOUNDARY,
+                   want = _KERNEL_DEFAULT_BOUNDARY) =
+    extract(spec; have = have, want = want)
 
 function plan(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
               want = _KERNEL_DEFAULT_BOUNDARY)
@@ -1711,41 +1808,63 @@ outputs(spec::KernelSpec) = _kernel_selection(
 
 # --- pure named-port composition ------------------------------------------
 
-function _kernel_clone_recipes!(graph::Graph, ports::Dict{Symbol,Value},
+function _kernel_clone_value_map!(graph::Graph, ports::Dict{Symbol,Value},
+                                  spec::KernelSpec)
+    public_ids = Dict(value.id => ports[name] for (name, value) in spec.ports)
+    mapped = Dict{Int,Value}()
+    for id in sort!(collect(keys(spec.graph.values)))
+        source = spec.graph.values[id]
+        mapped[id] = get(public_ids, id) do
+            # Nested inclusions carry graph-visible values which intentionally
+            # are not public ports.  Preserve them by identity mapping rather
+            # than assuming every recipe value can be recovered by name.
+            value!(graph, source.name, valtype(source))
+        end
+    end
+    mapped
+end
+
+function _kernel_clone_recipes!(graph::Graph, mapped::Dict{Int,Value},
                                 spec::KernelSpec)
     for recipe in spec.graph.recipes
-        ins = Tuple(ports[value.name] for value in recipe.inputs)
-        outs = Tuple(ports[value.name] for value in recipe.outputs)
+        ins = Tuple(mapped[value.id] for value in recipe.inputs)
+        outs = Tuple(mapped[value.id] for value in recipe.outputs)
         add!(graph; inputs = ins, outputs = outs, op = recipe.op,
-             cost = recipe.cost, cse_key = recipe.cse_key,
+             cost = recipe.cost, cse_key = _kernel_provenance_key(recipe),
              effectful = recipe.effectful, source = recipe.source)
     end
     graph
 end
 
-function _kernel_clone_aliases!(graph::Graph, ports::Dict{Symbol,Value},
+function _kernel_clone_aliases!(graph::Graph, mapped::Dict{Int,Value},
                                 spec::KernelSpec)
-    relations = Tuple{Symbol,Symbol}[]
+    relations = Tuple{Int,Int}[]
     for alias_id in keys(spec.graph.aliases)
         canonical_id = canon_id(spec.graph, alias_id)
-        push!(relations, (
-            spec.graph.values[alias_id].name,
-            spec.graph.values[canonical_id].name,
-        ))
+        push!(relations, (alias_id, canonical_id))
     end
     sort!(relations)
-    for (alias_name, canonical_name) in relations
-        alias_id = ports[alias_name].id
-        canonical_id = canon_id(graph, ports[canonical_name].id)
-        alias_id == canonical_id && continue
-        if haskey(graph.aliases, alias_id)
-            canon_id(graph, alias_id) == canonical_id || throw(ArgumentError(
-                "cannot merge structural aliases for port :$alias_name"))
-            continue
+    for (source_id, target_id) in relations
+        alias = mapped[source_id]
+        canonical = mapped[target_id]
+        alias_id = alias.id
+        canonical_id = canon_id(graph, canonical.id)
+        source_id = canon_id(graph, alias_id)
+        source_id == canonical_id && continue
+        valtype(graph.values[source_id]) == valtype(graph.values[canonical_id]) ||
+            throw(ArgumentError(
+                "cannot merge structural aliases for value :$(alias.name): " *
+                "$(valtype(graph.values[source_id])) does not match " *
+                "$(valtype(graph.values[canonical_id]))"))
+        if source_id != alias_id
+            # A repeated transparent inclusion can attach the same public
+            # boundary to another fresh internal child value.  Union that new
+            # root into the already-established canonical class instead of
+            # requiring one alias source to point at two targets.
+            graph.aliases[canonical_id] = source_id
+        else
+            graph.aliases[source_id] = canonical_id
         end
-        canon_id(graph, canonical_id) == alias_id && throw(ArgumentError(
-            "cannot merge structural aliases: :$alias_name and :$canonical_name would form a cycle"))
-        graph.aliases[alias_id] = canonical_id
         graph.version += 1
     end
     graph
@@ -1790,10 +1909,14 @@ function Base.merge(base::KernelSpec, fragment::KernelSpec; boundary::Symbol = :
         haskey(ports, name) && continue
         _kernel_declare!(graph, ports, order, name, valtype(spec.ports[name]))
     end
-    _kernel_clone_recipes!(graph, ports, base)
-    _kernel_clone_aliases!(graph, ports, base)
-    _kernel_clone_recipes!(graph, ports, fragment)
-    _kernel_clone_aliases!(graph, ports, fragment)
+    base_values = _kernel_clone_value_map!(graph, ports, base)
+    fragment_values = _kernel_clone_value_map!(graph, ports, fragment)
+    # Boundary/internal aliases must be established before recipe insertion so
+    # provenance CSE sees the final canonical inputs.
+    _kernel_clone_aliases!(graph, base_values, base)
+    _kernel_clone_aliases!(graph, fragment_values, fragment)
+    _kernel_clone_recipes!(graph, base_values, base)
+    _kernel_clone_recipes!(graph, fragment_values, fragment)
     _kernel_reindex_producers!(graph)
 
     chosen = boundary === :base ? base : fragment

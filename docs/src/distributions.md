@@ -1,27 +1,26 @@
-# Native log densities as recipes
+# Distribution kernels
 
 ```@eval
 Main.ReactiveKernelsDocs.render_result_assets()
 ```
 
-`ReactiveKernels` is not a distribution library. A log density is ordinary
-arithmetic in a `@kernel`; `prepare` selects the requested have→want path and
-compiles it. `Distributions.jl` is used only by the tests and benchmarks as an
-independent oracle—the generated kernels below do not call it.
-
-Write formulas from values already in hand. If the model parameter is `logσ`,
-use it directly in the normalizer and derive `σ = exp(logσ)` only for the
-standardized residual. RK plans the graph and reuses a repeated subexpression,
-but it does no algebra — it will not cancel `log(exp(logσ))` for you.
+Distribution kernels are ordinary transparent `@kernel` graphs. A standard
+family owns operations such as `logpdf`, `cdf`, and `quantile`; one shared
+location-scale kernel supplies translation, scaling, standardization, and the
+inverse standardization route. `Distributions.jl` appears only in tests and
+benchmarks as an independent oracle—the generated kernels below do not call it.
 
 Each panel below shows the **Raw input** (the source), a readable **Generated
 kernel** derived from the executed kernel and selected plan, and its **Compute
 DAG**. The exact compiled AST remains available through `code_expr`.
 
-## Continuous: Normal location and log scale
+## One location-scale graph, several families
 
-The Gaussian uses three transparent steps: scale, standardized residual, and
-log density. The test suite checks the result against `Distributions.logpdf`.
+The complete authoring surface is below. `standard_normal`, `standard_cauchy`,
+and `standard_laplace` contain only their standard-family mathematics.
+`location_scale` supplies the shared transformation once. The final three lines
+bind concrete, immutable kernel objects—`normal` is graph data with named ports,
+not a closure hidden behind a global function.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
@@ -29,25 +28,37 @@ Main.ReactiveKernelsDocs.execute_example(
 )
 ```
 
-## Discrete: Bernoulli observation with a logit
+The simple path stays simple: `prepare(normal.logpdf)` asks for the distinguished
+result of that endpoint. Inside another `@kernel`, `normal.logpdf(x)` splices the
+same transparent graph into the caller; it does not insert an opaque runtime
+call.
 
-The Bernoulli-logit recipe selects the stable `-log1pexp(∓logit)` expression for
-the observed bit.
+Every named boundary remains selectable. For example, one plan can request both
+the density and CDF:
 
-```@eval
-Main.ReactiveKernelsDocs.execute_example(
-    @__MODULE__, Main.DistributionExamples.DISCRETE_SOURCE,
-)
+```julia
+joint = extract(normal;
+    have = (:x, :location, :scale),
+    want = (:logpdf, :cdf))
 ```
 
-## Batched: the same recipe with `plate`
+Both endpoints reuse the same `standardized(x)` node. `quantile(p)` follows the
+explicit inverse edge `inv(standardized, z)`. The graph also contains both
+`log_scale = log(scale)` and `scale = exp(log_scale)`, so callers may start from
+either representation. When a caller supplies both, RK respects both HAVE
+values: it neither recomputes nor validates either one.
 
-`plate` marks observation ports as batched and adds the sum over observations.
-Steps that depend only on shared parameters are lifted out of the loop: here
-`exp(logσ)` runs once, while the residual and density run per observation. The
-default returns the sum without building an intermediate vector; `reduce =
-nothing` returns the per-observation values for LOO/WAIC. Several ports can be
-batched together.
+Included child ports retain scoped names rather than colliding with the outer
+result. For example, `normal[Symbol("standard.logpdf")]` addresses the standard
+family term, while `normal.logpdf` addresses the adjusted location-scale
+result; either can be passed to `extract`.
+
+## Batched: the same endpoint with `plate`
+
+`plate` lifts `normal.logpdf` over observations and sums the results. Work that
+depends only on the shared location and scale stays outside the observation
+loop. `reduce = nothing` selects the same per-observation values for LOO, WAIC,
+or PSIS.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
@@ -55,12 +66,11 @@ Main.ReactiveKernelsDocs.execute_example(
 )
 ```
 
-## More scalar families shared with ProbabilityMeasures
+## Other standard location-scale families
 
-These compact recipes cover three qualitatively different shapes that are also
-implemented by ProbabilityMeasures.jl: a heavy-tailed Cauchy, the nondifferentiable
-peak of a Laplace density, and a positive-support LogNormal with an explicit
-`-Inf` support result.
+Cauchy and Laplace use exactly the same `location_scale` graph. Their examples
+only select the family object and prepare its `logpdf` endpoint; neither repeats
+the transform or normalization plumbing.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
@@ -74,16 +84,33 @@ Main.ReactiveKernelsDocs.execute_example(
 )
 ```
 
+## Discrete: Bernoulli observation with a logit
+
+The Bernoulli-logit kernel selects the stable `-log1pexp(∓logit)` expression for
+the observed bit.
+
+```@eval
+Main.ReactiveKernelsDocs.execute_example(
+    @__MODULE__, Main.DistributionExamples.DISCRETE_SOURCE,
+)
+```
+
+## Positive-support and bounded families
+
+LogNormal, Exponential, Geometric, and Uniform illustrate shapes that are not a
+location-scale lift of one of the standard objects above. Each remains a compact
+mathematical kernel with an explicit support result.
+
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
     @__MODULE__, Main.DistributionExamples.LOGNORMAL_SOURCE,
 )
 ```
 
-The same pattern extends without family-specific batching code. Exponential is
-authored from a log scale, Geometric from a success-probability logit, and
-Uniform from dynamic endpoints. Each block defines one scalar formula and then
-uses the ordinary `plate` API for independent observations.
+Exponential is authored from a log scale, Geometric from a
+success-probability logit, and Uniform from dynamic endpoints. The ordinary
+`plate` API handles independent observations without family-specific batching
+code.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
@@ -126,7 +153,7 @@ Non-scalar families use the same authoring idea, but they are not scalar
 `plate`s. The coordinates of a multivariate observation—and the time steps of
 an autoregressive series—are coupled inside one mathematical kernel.
 
-The multivariate Normal is authored once. Alternative recipes produce the same
+The multivariate Normal is authored once. Alternative graph paths produce the same
 `half_logdet_cov` and `quadratic` ports from a covariance matrix, its Cholesky
 factor, a precision matrix, or its Cholesky factor. `prepare` starts at whichever
 representation is in HAVE and selects only that route to `logdensity`; callers
@@ -189,7 +216,9 @@ array. The receipt retains both diagnostics.
 ## Scalar plate native and Reactant benchmark
 
 The comparison below evaluates the same batched Normal log density with shared
-location and scale parameters. The native columns use each library's idiomatic
+location and scale parameters. It includes both the shared `normal.logpdf`
+object and a one-off RK formula as a matched control, so reuse overhead is
+measured directly. The other native columns use each library's idiomatic
 vectorized public interface; the Reactant columns compile the corresponding
 whole calculation with traced observations and traced shared parameters.
 

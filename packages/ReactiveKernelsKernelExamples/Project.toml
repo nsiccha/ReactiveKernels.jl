@@ -10,6 +10,7 @@ LogExpFunctions = "2ab3a3ac-af41-5b50-aa03-7779005ae688"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 ReactiveKernels = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
 ReactiveKernelsDistributionKernels = "4b169cd9-fc12-43fd-ba39-43e54ed8db7a"
+SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 
 [compat]
@@ -19,6 +20,7 @@ Enzyme = "0.13"
 LogExpFunctions = "0.3"
 ReactiveKernels = "0.1"
 ReactiveKernelsDistributionKernels = "0.1"
+SpecialFunctions = "2"
 julia = "1.10"
 
 [extras]

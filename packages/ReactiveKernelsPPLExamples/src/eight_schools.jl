@@ -20,19 +20,19 @@ const EIGHT_SCHOOLS_SOURCE = raw"""
 # avoiding a redundant exp or log. `plate` derives every per-school boundary
 # from the same Normal KernelSpec.
 normal_factor = prepare(NORMAL_LOGDENSITY;
-    have = (:x, :location, :scale, :log_scale), want = :logdensity)
+    have = (:x, :location, :scale, :log_scale), want = :logpdf)
 cauchy_factor = prepare(CAUCHY_LOGDENSITY;
-    have = (:x, :location, :scale, :log_scale), want = :logdensity)
+    have = (:x, :location, :scale, :log_scale), want = :logpdf)
 
 pointwise_loglik = plate(NORMAL_LOGDENSITY;
-    have = (:x, :location, :scale), want = :logdensity,
+    have = (:x, :location, :scale), want = :logpdf,
     batched = (:x, :location, :scale),
     reduce = nothing)
 summed_loglik = plate(NORMAL_LOGDENSITY;
-    have = (:x, :location, :scale), want = :logdensity,
+    have = (:x, :location, :scale), want = :logpdf,
     batched = (:x, :location, :scale))
 summed_school_prior = plate(NORMAL_LOGDENSITY;
-    have = (:x, :location, :scale, :log_scale), want = :logdensity,
+    have = (:x, :location, :scale, :log_scale), want = :logpdf,
     batched = :x)
 
 @kernel model(unconstrained::Vector{Float64},
