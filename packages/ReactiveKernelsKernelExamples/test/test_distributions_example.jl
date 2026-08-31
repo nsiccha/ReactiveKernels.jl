@@ -6,7 +6,7 @@ using Distributions
 using ReactiveKernelsDistributionKernels: DistributionKernelSources
 using ReactiveKernelsKernelExamples.DistributionExamples
 using ReactiveKernels: KernelObjectSpec, KernelSpec, @kernel, code_expr,
-    extract, plan, plate, prepare
+    ad_gradient, extract, inputs, plan, plate, prepare, prepare_ad
 
 const NORMAL_LOGSCALE_KERNEL = prepare(NORMAL_LOGDENSITY;
     have = (:x, :location, :log_scale), want = :logpdf)
@@ -30,6 +30,9 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
     artifacts = map(evaluate_source, all_sources())
 
     @testset "reusable distribution objects compose without Distributions" begin
+        @test all(object -> hasproperty(object, :logpdf),
+            (normal, cauchy, laplace, bernoulli, lognormal,
+             exponential, geometric, uniform, mvnormal, ar1))
         @test all(object -> object isa KernelObjectSpec, (normal, cauchy, laplace))
         @test NORMAL_LOGDENSITY isa KernelSpec
         @test CAUCHY_LOGDENSITY isa KernelSpec
@@ -138,10 +141,10 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
         # kernel with `plate`.
         @test all(source -> !occursin("compose(", source), all_sources())
         @test occursin("plate(", vectorized)
-        # The first example defines the shared family objects once and then
-        # prepares the natural Normal logpdf endpoint.
-        @test !occursin("@recipe", continuous)
-        @test !occursin("cost =", continuous)
+        # Every public distribution source is an ordinary method-bearing object;
+        # implementation metadata is absent from the complete docs corpus.
+        @test all(source -> !occursin("@recipe", source), all_sources())
+        @test all(source -> !occursin("cost =", source), all_sources())
         @test !occursin("negative_log_scale", continuous)
         @test occursin("@kernel standard_normal()", continuous)
         @test occursin("@kernel location_scale(standard", continuous)
@@ -149,6 +152,12 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
         @test occursin("prepare(normal.logpdf)", continuous)
         @test occursin("plate(normal.logpdf", vectorized)
         @test !occursin("@kernel normal_logdensity", vectorized)
+        @test occursin("@kernel bernoulli(", discrete)
+        @test occursin("prepare(bernoulli.logpdf", discrete)
+        @test occursin("@kernel mvnormal(", MVNORMAL_SOURCE)
+        @test occursin("prepare(mvnormal.logpdf", MVNORMAL_SOURCE)
+        @test occursin("@kernel ar1(", AR1_SOURCE)
+        @test occursin("prepare(ar1.logpdf", AR1_SOURCE)
         # The compute path is Distributions.jl-free.
         @test all(artifacts) do artifact
             !occursin("Distributions", string(code_expr(artifact.kernel)))
@@ -156,11 +165,11 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
         # Values match the independent Distributions.jl oracle.
         @test all(artifact -> isapprox(artifact.output, artifact.reference), artifacts)
         lognormal = artifacts[6]
-        _, μ, logσ = Tuple(lognormal.inputs)
-        @test lognormal.kernel(-1.0, μ, logσ) == -Inf
+        _, location, log_scale = Tuple(lognormal.inputs)
+        @test lognormal.kernel(-1.0, location, log_scale) == -Inf
 
         exponential, geometric, uniform = artifacts[7:9]
-        @test exponential.kernel(-1.0, exponential.inputs.logθ) == -Inf
+        @test exponential.kernel(-1.0, exponential.inputs.log_scale) == -Inf
         @test geometric.kernel(-1, geometric.inputs.logitp) == -Inf
         @test uniform.kernel(-1.1, uniform.inputs.lower, uniform.inputs.upper) == -Inf
         @test uniform.kernel(
@@ -177,7 +186,7 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
             @test artifact.plate_output ≈ expected
             @test artifact.plated(plated_inputs...) ≈ expected
             plated_code = string(code_expr(artifact.plated))
-            @test occursin("logdensity", plated_code)
+            @test occursin("logpdf", plated_code)
             @test !occursin("Distributions", plated_code)
         end
 
@@ -186,9 +195,9 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
         ar1_code = string(code_expr(ar1.kernel))
         @test all(name -> occursin(name, mvn_code),
                   ("centered", "whitened", "half_logdet_cov", "quadratic",
-                   "logdensity"))
+                   "logpdf"))
         @test all(name -> occursin(name, ar1_code),
-                  ("centered", "innovations", "transition_ss", "valid", "logdensity"))
+                  ("centered", "innovations", "transition_ss", "valid", "logpdf"))
         @test occursin("LowerTriangular", MVNORMAL_SOURCE)
         @test occursin("cholesky(Symmetric(covariance))", MVNORMAL_SOURCE)
         @test occursin("cholesky(Symmetric(precision))", MVNORMAL_SOURCE)
@@ -228,9 +237,9 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
               mvnormal.kernels.cholesky.plan.cost
         @test mvnormal.kernels.precision.plan.cost >
               mvnormal.kernels.precision_cholesky.plan.cost
-        _, arμ, arϕ, arlogσ = Tuple(ar1.inputs)
-        @test ar1.kernel(ar1.inputs.x, arμ, 1.0, arlogσ) == -Inf
-        @test ar1.kernel(ar1.inputs.x, arμ, -1.0, arlogσ) == -Inf
+        _, arμ, arϕ, arlog_scale = Tuple(ar1.inputs)
+        @test ar1.kernel(ar1.inputs.x, arμ, 1.0, arlog_scale) == -Inf
+        @test ar1.kernel(ar1.inputs.x, arμ, -1.0, arlog_scale) == -Inf
 
         # `replica` adds one trailing independent-replica axis. It does not
         # scalar-plate coordinates/time: each vector or series remains one

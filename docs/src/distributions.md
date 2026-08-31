@@ -84,10 +84,12 @@ Main.ReactiveKernelsDocs.execute_example(
 )
 ```
 
-## Discrete: Bernoulli observation with a logit
+## Discrete distribution objects
 
-The Bernoulli-logit kernel selects the stable `-log1pexp(∓logit)` expression for
-the observed bit.
+`bernoulli` is the same kind of object as `normal`: `bernoulli.logpdf`,
+`bernoulli.cdf`, and `bernoulli.quantile` are transparent endpoints. Its graph
+contains both `p` and `logit`, so callers can supply either representation while
+the log-density endpoint keeps the stable `-log1pexp(∓logit)` expression.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
@@ -97,9 +99,10 @@ Main.ReactiveKernelsDocs.execute_example(
 
 ## Positive-support and bounded families
 
-LogNormal, Exponential, Geometric, and Uniform illustrate shapes that are not a
-location-scale lift of one of the standard objects above. Each remains a compact
-mathematical kernel with an explicit support result.
+LogNormal, Exponential, Geometric, and Uniform illustrate shapes that are not all
+plain location-scale lifts. They still use the same object surface: each family
+owns its supported `logpdf`, `cdf`, and `quantile` endpoints, with named
+intermediate ports left available to `extract`.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
@@ -107,10 +110,10 @@ Main.ReactiveKernelsDocs.execute_example(
 )
 ```
 
-Exponential is authored from a log scale, Geometric from a
-success-probability logit, and Uniform from dynamic endpoints. The ordinary
-`plate` API handles independent observations without family-specific batching
-code.
+Exponential accepts scale or log scale, Geometric accepts success probability or
+its logit, and Uniform accepts runtime bounds. Explicit HAVE values remain
+authoritative in every case. The ordinary `plate` API lifts each `.logpdf`
+endpoint over independent observations without family-specific batching code.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
@@ -130,7 +133,7 @@ Main.ReactiveKernelsDocs.execute_example(
 )
 ```
 
-### Added-family native and Reactant benchmark
+### Scalar-family native and Reactant benchmark
 
 The matched comparison uses the public vectorized log-density APIs in
 Distributions and ProbabilityMeasures and the generic RK `plate` generated from
@@ -149,15 +152,18 @@ contains raw samples, allocations, support results, and exact package pins.
 
 ## Structured families: multivariate Normal and AR(1)
 
-Non-scalar families use the same authoring idea, but they are not scalar
+Non-scalar families are method-bearing objects too: `mvnormal.logpdf` and
+`ar1.logpdf` are the currently implemented endpoints. They are not scalar
 `plate`s. The coordinates of a multivariate observation—and the time steps of
-an autoregressive series—are coupled inside one mathematical kernel.
+an autoregressive series—are coupled inside one mathematical operation.
 
-The multivariate Normal is authored once. Alternative graph paths produce the same
+The multivariate Normal is authored once. Ordinary repeated assignments expose
+alternative graph paths that produce the same
 `half_logdet_cov` and `quadratic` ports from a covariance matrix, its Cholesky
 factor, a precision matrix, or its Cholesky factor. `prepare` starts at whichever
-representation is in HAVE and selects only that route to `logdensity`; callers
-do not convert everything to one privileged parametrization first.
+representation is in HAVE and selects only that route to `mvnormal.logpdf`;
+callers do not convert everything to one privileged parametrization first.
+Repeated assignments are the complete authoring surface for these alternatives.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
@@ -175,9 +181,10 @@ Main.ReactiveKernelsDocs.render_mvn_parametrization_plans(
 )
 ```
 
-The stationary AR(1) kernel similarly treats the complete sequence as one
-value. Its lagged residuals give an O(T) log density, including the stationary
-initial-state term and an explicit `-Inf` result outside `abs(ϕ) < 1`.
+The `ar1` object similarly treats the complete sequence as one value. Its
+`logpdf` endpoint uses lagged residuals for an O(T) density, including the
+stationary initial-state term and an explicit `-Inf` result outside
+`abs(ϕ) < 1`. Scale and log scale are equivalent HAVE boundaries here as well.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
