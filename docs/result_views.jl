@@ -965,7 +965,6 @@ function render_compiler_capabilities()
         (capability = "Generic effectful operation fallback", supported = "No", boundary = "Opaque or specialization-unsafe calls reject before executable lowering"),
         (capability = "Runtime graph mutation after preparation", supported = "No", boundary = "Cached stateless entries version out; compiled reactive programs throw version errors"),
         (capability = "Reentrant/concurrent stateful kernel instance", supported = "No", boundary = "Use one prepared mutable/cache-owning instance per independent caller"),
-        (capability = "Automatic differentiation", supported = "No compiler feature", boundary = "AD may be an ordinary recipe/backend concern; the compiler does not choose or prove it"),
         (capability = "PPL/model semantics", supported = "No compiler feature", boundary = "Examples build log densities and samplers from ordinary recipes; there is no trace/address language"),
         (capability = "NUTS, log-density, or PPL domain API", supported = "No", boundary = "These live in external compilation examples and are not loaded or exported by RK"),
         (capability = "General dynamic scheduling in a hot kernel", supported = "No", boundary = "Dynamic planning exists only in ReactiveState demand orchestration"),

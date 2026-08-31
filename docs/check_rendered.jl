@@ -58,6 +58,7 @@ function check_rendered_docs(build_dir, page_tree)
     length(rendered) == length(sources) ||
         error("rendered site has $(length(rendered)) content pages; navigation config has $(length(sources))")
     expected_panels = Dict(
+        "automatic-differentiation.md" => 1,
         "distributions.md" => 11,
         "batched.md" => 1,
         "bijectors.md" => 1,
@@ -95,6 +96,12 @@ function check_rendered_docs(build_dir, page_tree)
         "nuts.md" => 2,
     )
     structural_markers = Dict(
+        "automatic-differentiation.md" => (
+            "Automatic differentiation",
+            "Prepare once, then request gradients or value-and-gradient",
+            "returned_gradient === gradient_buffer",
+            "Batched Normal",
+        ),
         "compiler.md" => ("class=\"rk-pipeline\"",),
         "nuts.md" => (
             "class=\"rk-status-grid\"",
