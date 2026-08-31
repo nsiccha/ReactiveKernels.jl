@@ -41,6 +41,8 @@ using Test
 
         @test :log_scale in outputs_of(scale_plan)
         @test !(:scale in outputs_of(scale_plan))
+        @test outputs_of(scale_plan) ==
+              [:log_scale, :standardized, Symbol("standard.logpdf"), :logpdf]
         @test :scale in outputs_of(logscale_plan)
         @test !(:log_scale in outputs_of(logscale_plan))
         @test !(:scale in outputs_of(both_plan))
@@ -58,6 +60,13 @@ using Test
         @test all(isapprox.(prepare(joint)(x, location, scale),
             (logpdf(Normal(location, scale), x),
              cdf(Normal(location, scale), x))))
+
+        standard_term = extract(normal;
+            have = (:x, :location, :scale),
+            want = Symbol("standard.logpdf"))
+        @test haskey(normal, Symbol("standard.logpdf"))
+        @test prepare(standard_term)(x, location, scale) ≈
+              logpdf(Normal(), (x - location) / scale)
 
         scale_from_log = extract(normal;
             have = (:log_scale,), want = :scale)

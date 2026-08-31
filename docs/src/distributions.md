@@ -48,6 +48,11 @@ explicit inverse edge `inv(standardized, z)`. The graph also contains both
 either representation. When a caller supplies both, RK respects both HAVE
 values: it neither recomputes nor validates either one.
 
+Included child ports retain scoped names rather than colliding with the outer
+result. For example, `normal[Symbol("standard.logpdf")]` addresses the standard
+family term, while `normal.logpdf` addresses the adjusted location-scale
+result; either can be passed to `extract`.
+
 ## Batched: the same endpoint with `plate`
 
 `plate` lifts `normal.logpdf` over observations and sums the results. Work that

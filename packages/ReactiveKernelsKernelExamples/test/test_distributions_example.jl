@@ -85,6 +85,9 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
                       (scale_outputs, logscale_outputs, both_outputs))
             @test all(outputs -> last(outputs) === :logpdf,
                       (scale_outputs, logscale_outputs, both_outputs))
+            @test all(outputs -> length(outputs) == length(unique(outputs)),
+                      (scale_outputs, logscale_outputs, both_outputs))
+            @test Symbol("standard.logpdf") in scale_outputs
         end
 
         joint = extract(normal;
