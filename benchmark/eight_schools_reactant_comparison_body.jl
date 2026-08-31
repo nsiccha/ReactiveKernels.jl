@@ -268,7 +268,9 @@ function run_comparison()
             comparable = _comparable(definition.outcome, compiled_value)
             isapprox(comparable, native_value; rtol = 1e-11, atol = 1e-12) ||
                 error("native/Reactant value parity failed")
-            row["max_abs_error"] = maximum(abs.(comparable .- native_value))
+            row["max_abs_error"] = comparable isa Number ?
+                abs(comparable - native_value) :
+                maximum(abs.(comparable .- native_value))
             row["rk_reactant"] = _measurement(
                 compiled, traced_args...; rounds, target_seconds)
             row["rk_reactant_supported"] = true
