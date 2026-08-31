@@ -40,20 +40,20 @@ const EXPONENTIAL_EXAMPLE = _evaluate_source(EXPONENTIAL_SOURCE)
 const GEOMETRIC_EXAMPLE = _evaluate_source(GEOMETRIC_SOURCE)
 const UNIFORM_EXAMPLE = _evaluate_source(UNIFORM_SOURCE)
 
-rk_exponential(xs, logθ) = EXPONENTIAL_EXAMPLE.plated(xs, logθ)
+rk_exponential(xs, log_scale) = EXPONENTIAL_EXAMPLE.plated(xs, log_scale)
 rk_geometric(observed, logitp) = GEOMETRIC_EXAMPLE.plated(observed, logitp)
 rk_uniform(xs, lower, upper) = UNIFORM_EXAMPLE.plated(xs, lower, upper)
 
-distributions_exponential(xs, logθ) =
-    sum(Distributions.logpdf.(Distributions.Exponential(exp(logθ)), xs))
+distributions_exponential(xs, log_scale) =
+    sum(Distributions.logpdf.(Distributions.Exponential(exp(log_scale)), xs))
 distributions_geometric(observed, logitp) =
     sum(Distributions.logpdf.(Distributions.Geometric(logistic(logitp)), observed))
 distributions_uniform(xs, lower, upper) =
     sum(Distributions.logpdf.(Distributions.Uniform(lower, upper), xs))
 
-probability_measures_exponential(xs, logθ) = sum(
+probability_measures_exponential(xs, log_scale) = sum(
     ProbabilityMeasures.logdensityof.(
-        ProbabilityMeasures.Exponential(exp(logθ)), xs))
+        ProbabilityMeasures.Exponential(exp(log_scale)), xs))
 probability_measures_geometric(observed, logitp) = sum(
     ProbabilityMeasures.logdensityof.(
         ProbabilityMeasures.Geometric(logistic(logitp)), observed))
@@ -93,13 +93,13 @@ end
 
 function _family_case(family, n)
     if family == "exponential_logscale"
-        logθ = log(1.3)
+        log_scale = log(1.3)
         xs = [0.05 + abs(sin(0.017i)) + 0.002(i % 11) for i in 1:n]
         return (;
-            native = (xs, logθ),
+            native = (xs, log_scale),
             traced = (
                 Reactant.to_rarray(xs),
-                Reactant.to_rarray(logθ; track_numbers = true),
+                Reactant.to_rarray(log_scale; track_numbers = true),
             ),
             rk = rk_exponential,
             distributions = distributions_exponential,

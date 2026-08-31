@@ -21,15 +21,16 @@ const PROBABILITY_MEASURES_SHA = "7cf3a6e112aaae2097b8d401b256d1bce635e03e"
 const DEFAULT_SIZES = (1, 1_000, 10_000, 30_000, 100_000, 1_000_000)
 const DEFAULT_ROUNDS = 5
 
-@kernel benchmark_normal_logpdf(x::Float64, μ::Float64, σ::Float64) = begin
-    logσ::Float64 = log(σ)
-    z::Float64 = (x - μ) / σ
-    logdensity::Float64 = -0.5 * log(2π) - logσ - 0.5 * z^2
+@kernel benchmark_normal_logpdf(
+        x::Float64, location::Float64, scale::Float64) = begin
+    log_scale::Float64 = log(scale)
+    standardized::Float64 = (x - location) / scale
+    logpdf::Float64 = -0.5 * log(2π) - log_scale - 0.5 * standardized^2
 end
 
 const RK_DIRECT_REDUCE = plate(
     benchmark_normal_logpdf;
-    have = (:x, :μ, :σ), want = :logdensity, batched = (:x,),
+    have = (:x, :location, :scale), want = :logpdf, batched = (:x,),
 )
 const RK_REDUCE = plate(
     normal.logpdf;

@@ -1,4 +1,4 @@
-generated_at = "2026-08-28T15:02:48.165Z"
+generated_at = "2026-08-31T11:59:44.901Z"
 schema = "scalar-distribution-gallery-v1"
 
 [environment]
@@ -13,283 +13,283 @@ family = "exponential_logscale"
 max_abs_error = 5.684341886080801e-13
 max_relative_error = 7.157488342055094e-16
 n = 1000
-probability_measures_reactant_compile_seconds = 2.68201966
-rk_reactant_compile_seconds = 9.488614316
+probability_measures_reactant_compile_seconds = 3.140129756
+rk_reactant_compile_seconds = 10.586981752
 
     [measurements.distributions_native]
     allocs = [1, 1, 1, 1, 1]
     bytes = [8128, 8128, 8128, 8128, 8128]
     median_allocs = 1
     median_bytes = 8128
-    median_ns = 3524.0
-    times_ns = [5287.0, 3524.0, 3495.0, 3394.0, 3535.0]
+    median_ns = 3555.0
+    times_ns = [3735.0, 3565.0, 3475.0, 3555.0, 3555.0]
 
     [measurements.probability_measures_native]
     allocs = [1, 1, 1, 1, 1]
     bytes = [8128, 8128, 8128, 8128, 8128]
     median_allocs = 1
     median_bytes = 8128
-    median_ns = 3795.0
-    times_ns = [3685.0, 5738.0, 3795.0, 3795.0, 3775.0]
+    median_ns = 3745.0
+    times_ns = [3686.0, 3745.0, 3955.0, 3625.0, 3825.0]
 
     [measurements.probability_measures_reactant]
     allocs = [16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 5908.0
-    times_ns = [11616.0, 14791.0, 5908.0, 3845.0, 4406.0]
+    median_ns = 5438.0
+    times_ns = [10594.0, 4136.0, 5438.0, 5728.0, 4927.0]
 
     [measurements.rk_native]
     allocs = [0, 0, 0, 0, 0]
     bytes = [0, 0, 0, 0, 0]
     median_allocs = 0
     median_bytes = 0
-    median_ns = 540.0
-    times_ns = [540.0, 540.0, 540.0, 540.0, 540.0]
+    median_ns = 1021.0
+    times_ns = [1021.0, 1021.0, 1021.0, 1011.0, 1011.0]
 
     [measurements.rk_reactant]
     allocs = [16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 4997.0
-    times_ns = [4777.0, 3896.0, 4997.0, 10464.0, 5167.0]
+    median_ns = 10935.0
+    times_ns = [3845.0, 12197.0, 10935.0, 3976.0, 16292.0]
 [[measurements]]
 family = "exponential_logscale"
 max_abs_error = 5.820766091346741e-10
 max_relative_error = 7.292841937473601e-15
 n = 100000
-probability_measures_reactant_compile_seconds = 0.094868166
-rk_reactant_compile_seconds = 0.100745971
+probability_measures_reactant_compile_seconds = 0.110054036
+rk_reactant_compile_seconds = 0.10920845
 
     [measurements.distributions_native]
     allocs = [2, 2, 2, 2, 2]
     bytes = [800048, 800048, 800048, 800048, 800048]
     median_allocs = 2
     median_bytes = 800048
-    median_ns = 335102.0
-    times_ns = [327752.0, 336594.0, 335102.0, 341852.0, 332780.0]
+    median_ns = 341391.0
+    times_ns = [341952.0, 341391.0, 339848.0, 343794.0, 337416.0]
 
     [measurements.probability_measures_native]
     allocs = [2, 2, 2, 2, 2]
     bytes = [800048, 800048, 800048, 800048, 800048]
     median_allocs = 2
     median_bytes = 800048
-    median_ns = 357474.0
-    times_ns = [360418.0, 354530.0, 361199.0, 357474.0, 350574.0]
+    median_ns = 362299.0
+    times_ns = [361109.0, 364542.0, 358905.0, 362299.0, 365445.0]
 
     [measurements.probability_measures_reactant]
     allocs = [16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 31133.0
-    times_ns = [31073.0, 31965.0, 32234.0, 29081.0, 31133.0]
+    median_ns = 43190.0
+    times_ns = [52402.0, 43190.0, 45513.0, 42098.0, 42418.0]
 
     [measurements.rk_native]
     allocs = [0, 0, 0, 0, 0]
     bytes = [0, 0, 0, 0, 0]
     median_allocs = 0
     median_bytes = 0
-    median_ns = 50019.0
-    times_ns = [49659.0, 49788.0, 50019.0, 50590.0, 50209.0]
+    median_ns = 96333.0
+    times_ns = [97565.0, 96743.0, 94280.0, 96293.0, 96333.0]
 
     [measurements.rk_reactant]
     allocs = [16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 34478.0
-    times_ns = [34478.0, 34567.0, 31013.0, 35068.0, 27147.0]
+    median_ns = 44772.0
+    times_ns = [44772.0, 41227.0, 62877.0, 40566.0, 50059.0]
 [[measurements]]
 family = "geometric_logit"
 max_abs_error = 1.1823431123048067e-11
 max_relative_error = 2.841198241754538e-15
 n = 1000
-probability_measures_reactant_compile_seconds = 2.381651701
-rk_reactant_compile_seconds = 2.568007396
+probability_measures_reactant_compile_seconds = 2.749015558
+rk_reactant_compile_seconds = 3.118152059
 
     [measurements.distributions_native]
     allocs = [1, 1, 1, 1, 1]
     bytes = [8128, 8128, 8128, 8128, 8128]
     median_allocs = 1
     median_bytes = 8128
-    median_ns = 7620.0
-    times_ns = [7620.0, 7730.0, 7601.0, 7620.0, 7621.0]
+    median_ns = 7610.0
+    times_ns = [7761.0, 7600.0, 7610.0, 7551.0, 7931.0]
 
     [measurements.probability_measures_native]
     allocs = [1, 1, 1, 1, 1]
     bytes = [8128, 8128, 8128, 8128, 8128]
     median_allocs = 1
     median_bytes = 8128
-    median_ns = 7450.0
-    times_ns = [7481.0, 7340.0, 7480.0, 7450.0, 7320.0]
+    median_ns = 7551.0
+    times_ns = [7581.0, 7590.0, 7430.0, 7341.0, 7551.0]
 
     [measurements.probability_measures_reactant]
     allocs = [16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 10995.0
-    times_ns = [10224.0, 11676.0, 10995.0, 10865.0, 12498.0]
+    median_ns = 10885.0
+    times_ns = [10044.0, 11656.0, 10885.0, 11045.0, 8522.0]
 
     [measurements.rk_native]
     allocs = [0, 0, 0, 0, 0]
     bytes = [0, 0, 0, 0, 0]
     median_allocs = 0
     median_bytes = 0
-    median_ns = 650.0
-    times_ns = [650.0, 650.0, 651.0, 651.0, 650.0]
+    median_ns = 671.0
+    times_ns = [671.0, 671.0, 671.0, 671.0, 671.0]
 
     [measurements.rk_reactant]
     allocs = [16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 5498.0
-    times_ns = [5077.0, 4045.0, 5498.0, 11095.0, 11185.0]
+    median_ns = 10835.0
+    times_ns = [12637.0, 10835.0, 9312.0, 12387.0, 10595.0]
 [[measurements]]
 family = "geometric_logit"
 max_abs_error = 5.390029400587082e-8
 max_relative_error = 1.2941123579262655e-13
 n = 100000
-probability_measures_reactant_compile_seconds = 0.117795257
-rk_reactant_compile_seconds = 0.113692173
+probability_measures_reactant_compile_seconds = 0.137481104
+rk_reactant_compile_seconds = 0.152159719
 
     [measurements.distributions_native]
     allocs = [2, 2, 2, 2, 2]
     bytes = [800048, 800048, 800048, 800048, 800048]
     median_allocs = 2
     median_bytes = 800048
-    median_ns = 745579.0
-    times_ns = [745579.0, 757465.0, 726563.0, 749424.0, 736507.0]
+    median_ns = 746190.0
+    times_ns = [743276.0, 746190.0, 748442.0, 744617.0, 763163.0]
 
     [measurements.probability_measures_native]
     allocs = [2, 2, 2, 2, 2]
     bytes = [800048, 800048, 800048, 800048, 800048]
     median_allocs = 2
     median_bytes = 800048
-    median_ns = 726873.0
-    times_ns = [727204.0, 712223.0, 706335.0, 728826.0, 726873.0]
+    median_ns = 733392.0
+    times_ns = [736016.0, 733392.0, 724040.0, 725512.0, 742766.0]
 
     [measurements.probability_measures_reactant]
     allocs = [16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 37913.0
-    times_ns = [37272.0, 38673.0, 35619.0, 37913.0, 43250.0]
+    median_ns = 48156.0
+    times_ns = [76545.0, 48156.0, 40887.0, 39124.0, 52582.0]
 
     [measurements.rk_native]
     allocs = [0, 0, 0, 0, 0]
     bytes = [0, 0, 0, 0, 0]
     median_allocs = 0
     median_bytes = 0
-    median_ns = 62266.0
-    times_ns = [63238.0, 61675.0, 62016.0, 62266.0, 62316.0]
+    median_ns = 61605.0
+    times_ns = [59493.0, 61614.0, 61195.0, 61605.0, 61715.0]
 
     [measurements.rk_reactant]
     allocs = [16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 34408.0
-    times_ns = [42589.0, 33656.0, 34408.0, 39695.0, 33226.0]
+    median_ns = 48787.0
+    times_ns = [49238.0, 48537.0, 50169.0, 46064.0, 48787.0]
 [[measurements]]
 family = "uniform_bounded"
 max_abs_error = 2.864908310584724e-11
 max_relative_error = 2.6077519249833716e-14
 n = 1000
-probability_measures_reactant_compile_seconds = 2.043300816
-rk_reactant_compile_seconds = 2.971379584
+probability_measures_reactant_compile_seconds = 2.616707944
+rk_reactant_compile_seconds = 3.681251065
 
     [measurements.distributions_native]
     allocs = [1, 1, 1, 1, 1]
     bytes = [8128, 8128, 8128, 8128, 8128]
     median_allocs = 1
     median_bytes = 8128
-    median_ns = 3725.0
-    times_ns = [3725.0, 3745.0, 3695.0, 3735.0, 3675.0]
+    median_ns = 3835.0
+    times_ns = [3856.0, 3775.0, 3835.0, 3816.0, 3865.0]
 
     [measurements.probability_measures_native]
     allocs = [1, 1, 1, 1, 1]
     bytes = [8128, 8128, 8128, 8128, 8128]
     median_allocs = 1
     median_bytes = 8128
-    median_ns = 3575.0
-    times_ns = [3505.0, 3595.0, 5908.0, 3565.0, 3575.0]
+    median_ns = 3645.0
+    times_ns = [3615.0, 3665.0, 3645.0, 3806.0, 3595.0]
 
     [measurements.probability_measures_reactant]
     allocs = [16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 9163.0
-    times_ns = [9163.0, 4707.0, 4666.0, 11506.0, 12768.0]
+    median_ns = 11977.0
+    times_ns = [12437.0, 12127.0, 8752.0, 9153.0, 11977.0]
 
     [measurements.rk_native]
     allocs = [0, 0, 0, 0, 0]
     bytes = [0, 0, 0, 0, 0]
     median_allocs = 0
     median_bytes = 0
-    median_ns = 3385.0
-    times_ns = [3374.0, 3375.0, 3385.0, 3404.0, 3434.0]
+    median_ns = 4096.0
+    times_ns = [4096.0, 4096.0, 4096.0, 4095.0, 4096.0]
 
     [measurements.rk_reactant]
     allocs = [16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 7811.0
-    times_ns = [4186.0, 4146.0, 15842.0, 7811.0, 15160.0]
+    median_ns = 11275.0
+    times_ns = [11275.0, 10735.0, 13969.0, 10795.0, 11356.0]
 [[measurements]]
 family = "uniform_bounded"
 max_abs_error = 1.6909325495362282e-8
 max_relative_error = 1.5391531361682392e-13
 n = 100000
-probability_measures_reactant_compile_seconds = 0.096539542
-rk_reactant_compile_seconds = 0.105509796
+probability_measures_reactant_compile_seconds = 0.10496203
+rk_reactant_compile_seconds = 0.120962289
 
     [measurements.distributions_native]
     allocs = [2, 2, 2, 2, 2]
     bytes = [800048, 800048, 800048, 800048, 800048]
     median_allocs = 2
     median_bytes = 800048
-    median_ns = 356742.0
-    times_ns = [364293.0, 356742.0, 357113.0, 353267.0, 348451.0]
+    median_ns = 369539.0
+    times_ns = [373865.0, 372064.0, 361980.0, 369539.0, 365794.0]
 
     [measurements.probability_measures_native]
     allocs = [2, 2, 2, 2, 2]
     bytes = [800048, 800048, 800048, 800048, 800048]
     median_allocs = 2
     median_bytes = 800048
-    median_ns = 340611.0
-    times_ns = [340611.0, 341512.0, 342223.0, 340209.0, 334131.0]
+    median_ns = 344496.0
+    times_ns = [348111.0, 343503.0, 336124.0, 345237.0, 344496.0]
 
     [measurements.probability_measures_reactant]
     allocs = [16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 34748.0
-    times_ns = [45893.0, 34748.0, 33527.0, 32335.0, 46034.0]
+    median_ns = 44372.0
+    times_ns = [50289.0, 44372.0, 43710.0, 44431.0, 34567.0]
 
     [measurements.rk_native]
     allocs = [0, 0, 0, 0, 0]
     bytes = [0, 0, 0, 0, 0]
     median_allocs = 0
     median_bytes = 0
-    median_ns = 341151.0
-    times_ns = [341151.0, 340570.0, 346607.0, 344226.0, 338998.0]
+    median_ns = 395747.0
+    times_ns = [395445.0, 395747.0, 398110.0, 397259.0, 395156.0]
 
     [measurements.rk_reactant]
     allocs = [16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 35439.0
-    times_ns = [39555.0, 29550.0, 35439.0, 41267.0, 33446.0]
+    median_ns = 44842.0
+    times_ns = [44842.0, 46734.0, 44741.0, 47696.0, 32685.0]
 
 [pins]
 distributions_version = "0.25.131"
@@ -299,7 +299,7 @@ probability_measures_version = "0.1.0"
 reactant_jll_version = "0.0.401+0"
 reactant_version = "0.2.278"
 reactivekernels_dirty = false
-reactivekernels_sha = "87deee50e73c64265b6babf8cc5f7321931f4e3a"
+reactivekernels_sha = "cf98b3c9c342f11eea1cc191c13a53982ef26ad7"
 
 [protocol]
 estimator = "median of per-round BenchmarkTools minimum times"

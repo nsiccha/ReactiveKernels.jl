@@ -7,7 +7,9 @@ module DistributionExamples
 
 export CONTINUOUS_SOURCE, DISCRETE_SOURCE, VECTORIZED_SOURCE
 export CAUCHY_SOURCE, LAPLACE_SOURCE, LOGNORMAL_SOURCE
-export LOCATION_SCALE_SOURCE, normal, cauchy, laplace
+export LOCATION_SCALE_SOURCE
+export normal, cauchy, laplace, bernoulli, lognormal
+export exponential, geometric, uniform, mvnormal, ar1
 export NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY
 export EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE
 export MVNORMAL_SOURCE, AR1_SOURCE
@@ -18,6 +20,8 @@ using LogExpFunctions: logistic
 
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     LOCATION_SCALE_SOURCE, normal, cauchy, laplace,
+    BERNOULLI_SOURCE, LOGNORMAL_SOURCE,
+    bernoulli, lognormal, exponential, geometric, uniform, mvnormal, ar1,
     NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY,
     EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE,
     MVNORMAL_SOURCE, AR1_SOURCE
@@ -43,29 +47,7 @@ docs_example = (;
 )
 """
 
-const DISCRETE_SOURCE = raw"""
-using LogExpFunctions
-
-@kernel bernoulli_logit_logpdf(observed::Bool, logit::Float64) = begin
-    logdensity::Float64 = observed ? -log1pexp(-logit) : -log1pexp(logit)
-end
-
-bernoulli_kernel = prepare(bernoulli_logit_logpdf;
-    have = (:observed, :logit),
-    want = :logdensity,
-)
-
-inputs = (; observed = true, logit = -0.7)
-output = bernoulli_kernel(Tuple(inputs)...)
-
-docs_example = (;
-    name = :discrete_bernoulli_logit,
-    origin = "native Bernoulli-logit log density (build executed)",
-    inputs,
-    kernel = bernoulli_kernel,
-    output,
-)
-"""
+const DISCRETE_SOURCE = BERNOULLI_SOURCE
 
 const VECTORIZED_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
@@ -121,30 +103,6 @@ docs_example = (;
     origin = "native Laplace log density (build executed)",
     inputs,
     kernel = laplace_kernel,
-    output,
-)
-"""
-
-const LOGNORMAL_SOURCE = raw"""
-@kernel lognormal_logpdf(x::Float64, μ::Float64, logσ::Float64) = begin
-    logdensity::Float64 = x > 0 ? begin
-        logx = log(x)
-        z = (logx - μ) / exp(logσ)
-        -0.5 * log(2π) - logσ - logx - 0.5 * z^2
-    end : -Inf
-end
-
-lognormal_kernel = prepare(lognormal_logpdf;
-    have = (:x, :μ, :logσ), want = :logdensity)
-
-inputs = (; x = 1.4, μ = 0.2, logσ = log(0.9))
-output = lognormal_kernel(Tuple(inputs)...)
-
-docs_example = (;
-    name = :lognormal_positive_support,
-    origin = "native LogNormal log density with support guard (build executed)",
-    inputs,
-    kernel = lognormal_kernel,
     output,
 )
 """
@@ -224,15 +182,18 @@ function evaluate_source(source::AbstractString)
         reference_allocated_bytes =
             _allocated(reference_call, location, scale, x)
     elseif artifact.name === :lognormal_positive_support
-        x, μ, logσ = inputs
-        reference_call = (x, μ, logσ) -> logpdf(LogNormal(μ, exp(logσ)), x)
+        x, location, log_scale = inputs
+        reference_call = (x, location, log_scale) ->
+            logpdf(LogNormal(location, exp(log_scale)), x)
         reference = reference_call(inputs...)
-        reference_allocated_bytes = _allocated(reference_call, x, μ, logσ)
+        reference_allocated_bytes =
+            _allocated(reference_call, x, location, log_scale)
     elseif artifact.name === :exponential_logscale
-        x, logθ = inputs
-        reference_call = (x, logθ) -> logpdf(Exponential(exp(logθ)), x)
+        x, log_scale = inputs
+        reference_call = (x, log_scale) ->
+            logpdf(Exponential(exp(log_scale)), x)
         reference = reference_call(inputs...)
-        reference_allocated_bytes = _allocated(reference_call, x, logθ)
+        reference_allocated_bytes = _allocated(reference_call, x, log_scale)
     elseif artifact.name === :geometric_logit
         observed, logitp = inputs
         reference_call = (observed, logitp) ->
@@ -250,9 +211,9 @@ function evaluate_source(source::AbstractString)
         reference = reference_call(inputs...)
         reference_allocated_bytes = _allocated(reference_call, x, μ, chol)
     elseif artifact.name === :stationary_ar1
-        x, μ, ϕ, logσ = inputs
-        reference_call = function (x, μ, ϕ, logσ)
-            σ = exp(logσ)
+        x, μ, ϕ, log_scale = inputs
+        reference_call = function (x, μ, ϕ, log_scale)
+            σ = exp(log_scale)
             abs(ϕ) < 1 || return -Inf
             result = logpdf(Normal(μ, σ / sqrt(1 - ϕ^2)), first(x))
             for t in 2:length(x)
@@ -262,7 +223,8 @@ function evaluate_source(source::AbstractString)
             result
         end
         reference = reference_call(inputs...)
-        reference_allocated_bytes = _allocated(reference_call, x, μ, ϕ, logσ)
+        reference_allocated_bytes =
+            _allocated(reference_call, x, μ, ϕ, log_scale)
     else
         error("unknown distribution example $(artifact.name)")
     end
