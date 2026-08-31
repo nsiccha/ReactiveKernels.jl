@@ -9,7 +9,7 @@ scalar reduction. The author writes one scalar `normal_logpdf`; from that one
 graph, asking for a different `want` gives either the per-observation log density
 (`want = :per_obs`, for LOO/WAIC/PSIS) or the total (`want = :logdensity`).
 
-As in [Native log densities as recipes](distributions.md), the **compute path
+As in [Distribution kernels](distributions.md), the **compute path
 contains no `Distributions.jl` call**: the density is written out directly and
 `Distributions.jl` appears only as an independent oracle.
 
