@@ -22,9 +22,10 @@ using Distributions
 using Random
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 
-# The canonical Normal object supplies the transparent scalar endpoint. The
-# likelihood itself is authored once: `pointwise` remains a queryable graph
-# value and the distinguished return is its sum.
+# The canonical RK `normal` kernel object supplies the transparent scalar
+# endpoint; it is not `Distributions.jl.Normal`. The likelihood itself is
+# authored once: `pointwise` remains a queryable graph value and the
+# distinguished return is its sum.
 @kernel normal_loglik(x, location, scale) = begin
     pointwise = plate(x, location, scale) do xi, li, si
         normal(li, si).logpdf(xi)

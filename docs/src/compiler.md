@@ -199,12 +199,27 @@ fused graph.
 
 ### Plate: fuse a scalar density across observations
 
-`plate` starts from one scalar plan. It marks nominated HAVE ports as batched,
-then propagates batch-dependence through selected recipes in topological order.
-Recipes with no transitive dependency on a batched port are emitted once above
-the loop. Dependent recipes are emitted once per index. The single per-element
-WANT is either accumulated with a reducer (sum by default) or collected into a
-new vector.
+`plate` starts from one pure scalar plan. An authored `plate(...) do` body is an
+ordinary RK graph: transparent nested `KernelSpec` and kernel-object calls are
+spliced before planning, so their internal dependencies remain visible. An
+ordinary opaque Julia operation keeps the normal `Recipe` contract—pure unless
+explicitly marked otherwise—without implementation inspection. Effectful
+recipes are excluded by the planner and cannot form a plate plan.
+
+Plated HAVE values follow Julia broadcasting. Compatible dimensions zip,
+singleton dimensions expand, scalars repeat, and `Ref(value)` makes an
+array-valued input atomic. The complete broadcast shape is instantiated before
+any recipe executes or output is mutated.
+
+Lowering propagates each selected recipe's transitive plated HAVE dependencies.
+Native Cartesian traversal recomputes a recipe only when a broadcast dimension
+kept by one of those roots changes. This is the dynamic equivalent of placing
+the recipe at its narrowest valid nested-loop boundary: work depending only on
+an outer scale dimension runs once per scale coordinate, with its last scalar
+result reused through inner dimensions and no axis-sized cache. Recipes with no
+plated dependency are emitted once above the traversal. The per-element WANT is
+either accumulated with a reducer (sum by default) or collected in the one
+requested broadcast-shaped output.
 
 The native reducing body materializes no per-observation result vector. A
 second eager tensor body expresses dependent operations as broadcasts and the
@@ -214,18 +229,18 @@ loop.
 
 The current plate domain is deliberately narrow:
 
-- at least one named HAVE port must be batched;
+- at least one non-`Ref` HAVE value must instantiate a broadcast axis;
 - every selected recipe must have exactly one output;
 - there must be exactly one scalar WANT, and it must transitively depend on a
   batched port;
-- all batched ports are indexed over the first nominated port's `eachindex`, so
-  compatible axes are the caller's responsibility; and
+- the native dependency scheduler assumes the scalar recipe contract is pure;
+  known effectful recipes cannot be selected; and
 - a non-null reducer is spliced as a bare callable, with the documented surface
   intended for Base reducer symbols.
 
-This is map-plus-reduce/collect with invariant hoisting. It is not a general
-scan, fold with loop-carried state, segmented reduction, parallel reduction,
-associative tree reduction, or automatic prepared-kernel batching transform.
+This is dependency-stratified map-plus-reduce/collect. It is not a general scan,
+fold with loop-carried state, segmented reduction, parallel reduction,
+associative tree reduction, or an effect-ordering construct.
 
 ### Prepared-kernel composition is flattened
 
