@@ -75,6 +75,42 @@ end
     active, new::T, old::T) where {T<:Reactant.AbstractConcreteNumber} =
         ifelse(active, new, old)
 
+@inline function _rk_reactant_mixed_array_check(traced, host::AbstractArray)
+    ReactiveKernels._sm_builtin_array(typeof(host)) || throw(
+        ArgumentError("predicated functional state rejects non-builtin array `$(typeof(host))`"))
+    ndims(traced) == ndims(host) && size(traced) == size(host) || throw(
+        ArgumentError("predicated functional state rejects mixed array axes"))
+    Reactant.unwrapped_eltype(typeof(traced)) === eltype(host) || throw(
+        ArgumentError("predicated functional state rejects mixed logical array types"))
+    nothing
+end
+
+@inline function _rk_reactant_mixed_array_select(active, traced, host)
+    _rk_reactant_mixed_array_check(traced, host)
+    ifelse.(active, traced, host)
+end
+@inline function _rk_reactant_mixed_array_select_reverse(active, host, traced)
+    _rk_reactant_mixed_array_check(traced, host)
+    ifelse.(active, host, traced)
+end
+
+@inline ReactiveKernels._sm_predicated_select(
+        active, traced::T, host::AbstractArray) where
+        {T<:Reactant.TracedRArray} =
+    _rk_reactant_mixed_array_select(active, traced, host)
+@inline ReactiveKernels._sm_predicated_select(
+        active, host::AbstractArray, traced::T) where
+        {T<:Reactant.TracedRArray} =
+    _rk_reactant_mixed_array_select_reverse(active, host, traced)
+@inline ReactiveKernels._sm_predicated_select(
+        active, traced::T, host::AbstractArray) where
+        {T<:Reactant.AbstractConcreteArray} =
+    _rk_reactant_mixed_array_select(active, traced, host)
+@inline ReactiveKernels._sm_predicated_select(
+        active, host::AbstractArray, traced::T) where
+        {T<:Reactant.AbstractConcreteArray} =
+    _rk_reactant_mixed_array_select_reverse(active, host, traced)
+
 # A traced branch can legitimately meet a source literal or compiler-static
 # initial value of the same logical scalar type.  Keep that bridge exact: it
 # is not permission to promote or coerce a different authored domain.

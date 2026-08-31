@@ -36,18 +36,6 @@ step_lowering(transition) = (effect, point) -> (
     effect_state=effect,
 )
 
-function stats_lowering(effect, state)
-    next = effect.count + one(effect.count)
-    errors = ntuple(length(effect.errors)) do index
-        ifelse(next == index, state.dham, effect.errors[index])
-    end
-    (
-        arguments=(state,),
-        result=nothing,
-        effect_state=(errors=errors, count=next),
-    )
-end
-
 function build_case(case; potential_f=potential, gradient_f=gradient,
                     numeric_type=Float64)
     T = numeric_type
@@ -81,9 +69,6 @@ function build_case(case; potential_f=potential, gradient_f=gradient,
     stats_port = RK.effect_callable_port(
         stats_source, Tuple{RK.StatefulStateValue}, Nothing;
         written_arguments=(),
-        initial_effect_state=(
-            errors=ntuple(_ -> zero(diagnostic_type), n_steps), count=0),
-        functional_lowering=RK.total_functional_lowering(stats_lowering),
     )
     bindings = RK.stateful_compiler_bindings(
         init=structured,
@@ -109,8 +94,9 @@ function build_case(case; potential_f=potential, gradient_f=gradient,
        step_source, stats_source, step_port, stats_port)
 end
 
-function result_values(result)
-    count = Int(result.effects.stats_f.count)
+function result_values(program, result)
+    RK.drain_observations!(program.transition, result)
+    count = program.stats_source.count
     (
         init_pos=result.state.init.pos,
         init_mom=result.state.init.mom,
@@ -120,7 +106,7 @@ function result_values(result)
         fwd_ham=result.state.fwd.ham,
         dham=result.state.dham,
         diverged=result.state.diverged,
-        energy_errors=result.effects.stats_f.errors[1:count],
+        energy_errors=program.stats_source.errors[1:count],
         normal_calls=result.arguments[1].normal_index - 1,
         exponential_calls=result.arguments[1].exponential_index - 1,
         rng_event_calls=result.arguments[1].event_index - 1,
