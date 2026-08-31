@@ -10,7 +10,7 @@ using Reactant: @compile
 using ReactiveKernels
 using ReactiveKernelsPPLExamples.EightSchoolsExample:
     EIGHT_SCHOOLS_SOURCE, EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA,
-    evaluate_eight_schools_source
+    build_eight_schools_graph
 
 const DEFAULT_EIGHT_SCHOOLS_REACTANT_ROUNDS = 20
 const DEFAULT_EIGHT_SCHOOLS_REACTANT_TARGET_SECONDS = 0.02
@@ -212,10 +212,16 @@ function run_comparison()
     unconstrained = [mu, log_tau, theta...]
     parameters = (; μ = mu, τ = tau, θ = theta)
 
-    artifact = evaluate_eight_schools_source()
-    preparation_seconds = @elapsed definitions = _definitions(
-        artifact.model, unconstrained, parameters, theta,
-        observations, observation_scales)
+    model = definitions = nothing
+    preparation_seconds = @elapsed begin
+        # This graph is cloned from the template evaluated from
+        # EIGHT_SCHOOLS_SOURCE during package initialization. Re-evaluating the
+        # source here would create newer-world closures inside this function.
+        model = build_eight_schools_graph()
+        definitions = _definitions(
+            model, unconstrained, parameters, theta,
+            observations, observation_scales)
+    end
 
     primal_path = joinpath(
         @__DIR__, "receipts", "eight-schools-primal-v1.toml")
