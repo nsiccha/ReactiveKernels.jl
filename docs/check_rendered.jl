@@ -91,7 +91,7 @@ function check_rendered_docs(build_dir, page_tree)
         "nuts.md" => 3,
     )
     expected_aov_panels = Dict(
-        "batched.md" => 1,
+        "batched.md" => 2,
         "distributions.md" => 12,
         "nuts.md" => 2,
     )
