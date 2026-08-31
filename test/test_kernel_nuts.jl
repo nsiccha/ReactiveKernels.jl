@@ -443,7 +443,10 @@ end
     # HIT potrs (same-kind positive control, both eltypes); Diagonal must complete build+50 txn WITHOUT it. The
     # child prints an explicit four-result receipt and exits 0 iff all four facts hold (so an empty child ≠ green).
     fixture = abspath(joinpath(@__DIR__, "..", "benchmark", "nuts_kernel_authoring_fixture.jl"))
-    proj = abspath(joinpath(@__DIR__, "..", "packages"))
+    # Reuse the caller's resolved environment. Under `Pkg.test` the local root
+    # and nested NUTS package live in its temporary manifest; the checked-in
+    # `packages/Project.toml` has no manifest and Julia 1.10 ignores `[sources]`.
+    proj = dirname(Base.active_project())
     childsrc = raw"""
     using LinearAlgebra, Random, ReactiveKernels, ReactiveKernelsNUTSExamples
     include(ENV["RK_NUTS_RUNTIME"])
