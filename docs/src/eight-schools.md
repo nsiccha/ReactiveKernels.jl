@@ -75,9 +75,10 @@ static prepared boundaries over one authored plate node, and all remain
 traceable by Reactant.
 
 The hierarchical prior already contains both `τ = exp(log_τ)` and `log_τ`.
-Its nested Normal and Cauchy calls bind both named ports as authoritative HAVE
-values. RK therefore uses `τ` for standardization and `log_τ` for normalization
-without recomputing or validating either representation.
+Each effects Normal binds both named ports as authoritative HAVE values, so RK
+uses `τ` for standardization and `log_τ` for normalization without recomputing
+or validating either representation. The half-Cauchy hyperprior independently
+retains its fixed scale `5`.
 
 The three Wren-style outputs are likewise not three RK-specific accumulator
 types. They are a static tuple of graph nodes:

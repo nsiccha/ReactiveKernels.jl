@@ -33,7 +33,7 @@ end
     @test !occursin("CAUCHY_LOGDENSITY", EIGHT_SCHOOLS_SOURCE)
     @test !occursin(r"(?m)^\s*\w+\s*=\s*prepare\(", EIGHT_SCHOOLS_SOURCE)
     @test occursin("normal(0.0, 5.0).logpdf(μ)", EIGHT_SCHOOLS_SOURCE)
-    @test occursin("cauchy(;", EIGHT_SCHOOLS_SOURCE)
+    @test occursin("cauchy(0.0, 5.0).logpdf(τ)", EIGHT_SCHOOLS_SOURCE)
     @test length(split(EIGHT_SCHOOLS_SOURCE, "pointwise = plate(")) - 1 == 2
     @test !occursin("@kernel school_", EIGHT_SCHOOLS_SOURCE)
     @test artifact.normal_object === normal

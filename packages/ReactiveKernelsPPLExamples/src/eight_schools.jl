@@ -50,12 +50,11 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
         (parameters.μ, parameters.τ, parameters.θ)
 
     # Log prior: μ ~ Normal(0, 5), τ ~ HalfCauchy(0, 5),
-    # and θⱼ ~ Normal(μ, τ). Supplying both τ and log_τ to the nested Cauchy
-    # and Normal objects makes both graph values authoritative HAVE inputs:
-    # neither representation is recomputed or checked against the other.
+    # and θⱼ ~ Normal(μ, τ). The half-Cauchy keeps its fixed scale 5. Supplying
+    # both τ and log_τ to each effects Normal makes both graph values
+    # authoritative HAVE inputs: neither is recomputed or checked.
     μ_prior::Float64 = normal(0.0, 5.0).logpdf(μ)
-    τ_cauchy::Float64 = cauchy(;
-        location = 0.0, scale = τ, log_scale = log_τ).logpdf(τ)
+    τ_cauchy::Float64 = cauchy(0.0, 5.0).logpdf(τ)
     τ_prior::Float64 = log(2.0) + τ_cauchy
     effects_pointwise = plate(θ, μ, τ, log_τ) do θj, μj, τj, log_τj
         normal(;
