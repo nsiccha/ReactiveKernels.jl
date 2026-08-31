@@ -24,6 +24,9 @@ const _DISTRIBUTION_GRADIENT_RECEIPT_PATH = joinpath(
 const _EIGHT_SCHOOLS_PRIMAL_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts", "eight-schools-primal-v1.toml",
 )
+const _EIGHT_SCHOOLS_AD_RECEIPT_PATH = joinpath(
+    dirname(@__DIR__), "benchmark", "receipts", "eight-schools-ad-v1.toml",
+)
 const _NUTS_G7_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts", "nuts-g7-v1.toml",
 )
@@ -1021,6 +1024,211 @@ function render_eight_schools_primal_benchmarks()
             title = "Primal boundary × outcome matrix",
             note = "Each measured cell is median runtime; bytes; allocations. " *
                    "A blank cell means that backend has no matching public boundary."),
+        Markdown.Paragraph(Any[Markdown.Italic(Any[provenance])]),
+    ])
+end
+
+const _EIGHT_SCHOOLS_AD_IMPLEMENTATIONS = (
+    ("rk_native", "ReactiveKernels"),
+    ("manual_enzyme", "Manual Julia control"),
+    ("turing_enzyme", "Turing / DynamicPPL"),
+)
+const _EIGHT_SCHOOLS_AD_SUPPORTED = Set((
+    ("packed_unconstrained", "joint"),
+    ("packed_unconstrained", "prior"),
+    ("packed_unconstrained", "likelihood"),
+    ("minimal_likelihood", "likelihood"),
+))
+
+function _eight_schools_ad_plot(rows, metric;
+                                id::AbstractString, title::AbstractString)
+    label = metric === :median_ns ? "Median value + gradient runtime (ns)" :
+        "Median allocated bytes"
+    scale = metric === :median_ns ? log10 : symlog
+    cell_order = unique(getproperty.(rows, :cell))
+    spec = data(rows) *
+        mapping(
+            :cell => sorter(cell_order) => "Scalar matrix cell",
+            metric => label;
+            color = :implementation => "Implementation",
+        ) *
+        visual(BarPlot) *
+        config(height = 320, scales = scales(Y = (; scale)))
+    description = metric === :median_ns ?
+        "Preparation and first execution are excluded; the runtime axis is logarithmic." :
+        "The symlog byte axis retains the four genuine zero-allocation RK measurements."
+    _plot_block(spec; id, title, description)
+end
+
+function _eight_schools_ad_cell(value, _)
+    value === missing && return ""
+    "$(_fmt_ns(value.median_ns)); $(value.median_bytes) B; " *
+    "$(value.median_allocs) alloc"
+end
+
+_eight_schools_ad_sort(value, _) =
+    value === missing ? nothing : value.median_ns
+
+"""Render the exact Eight Schools AD matrix and separated setup evidence."""
+function render_eight_schools_ad_benchmarks()
+    receipt = TOML.parsefile(_EIGHT_SCHOOLS_AD_RECEIPT_PATH)
+    get(receipt, "schema", "") == "eight-schools-ad-v1" ||
+        error("unexpected Eight Schools AD receipt schema")
+    pins = receipt["pins"]
+    get(pins, "reactivekernels_dirty", true) == false ||
+        error("Eight Schools AD receipt was produced from a dirty tree")
+    occursin(r"^[0-9a-f]{40}$", get(pins, "reactivekernels_sha", "")) ||
+        error("Eight Schools AD receipt lacks an exact candidate SHA")
+    model_source = pins["model_source"]
+    get(model_source, "path", "") ==
+        "packages/ReactiveKernelsPPLExamples/src/eight_schools.jl" ||
+        error("Eight Schools AD model authority drifted")
+    occursin(r"^[0-9a-f]{40}$", get(model_source, "commit", "")) ||
+        error("Eight Schools AD model authority lacks a published SHA")
+
+    protocol = receipt["protocol"]
+    Tuple(String.(protocol["input_boundaries"])) == _EIGHT_SCHOOLS_BOUNDARIES ||
+        error("Eight Schools AD input-boundary inventory changed")
+    Tuple(String.(protocol["outcomes"])) == _EIGHT_SCHOOLS_OUTCOMES ||
+        error("Eight Schools AD outcome inventory changed")
+    get(protocol, "pointwise_jacobian_or_vjp_invented", true) == false ||
+        error("Eight Schools AD receipt invented a pointwise Jacobian/VJP")
+    get(protocol, "preparation_in_timed_region", true) == false ||
+        error("Eight Schools AD steady-state timing includes preparation")
+    get(protocol, "first_execution_in_steady_state_region", true) == false ||
+        error("Eight Schools AD steady-state timing includes first execution")
+    Int(get(protocol, "rounds", 0)) >= 10 ||
+        error("Eight Schools AD receipt lacks ten raw rounds")
+
+    measurements = receipt["measurements"]
+    length(measurements) ==
+        length(_EIGHT_SCHOOLS_BOUNDARIES) * length(_EIGHT_SCHOOLS_OUTCOMES) ||
+        error("Eight Schools AD receipt is not a complete 3×4 matrix")
+    indexed = Dict((String(row["boundary"]), String(row["outcome"])) => row
+                   for row in measurements)
+    length(indexed) == length(measurements) ||
+        error("Eight Schools AD receipt contains duplicate matrix rows")
+
+    boundary_labels = Dict(
+        "packed_unconstrained" => "Packed unconstrained",
+        "constrained_parameters" => "Constrained parameters",
+        "minimal_likelihood" => "Likelihood inputs only",
+    )
+    outcome_labels = Dict(
+        "joint" => "Joint",
+        "prior" => "Prior",
+        "likelihood" => "Likelihood",
+        "pointwise" => "Pointwise likelihood",
+    )
+    matrix_rows = NamedTuple[]
+    plot_rows = NamedTuple[]
+    setup_rows = NamedTuple[]
+    for boundary in _EIGHT_SCHOOLS_BOUNDARIES,
+        outcome in _EIGHT_SCHOOLS_OUTCOMES
+        row = get(indexed, (boundary, outcome), nothing)
+        isnothing(row) && error("missing Eight Schools AD row: $boundary / $outcome")
+        expected_support = (boundary, outcome) in _EIGHT_SCHOOLS_AD_SUPPORTED
+        get(row, "supported", false) == expected_support ||
+            error("Eight Schools AD support drifted for $boundary / $outcome")
+        cell = string(boundary_labels[boundary], " / ", outcome_labels[outcome])
+        values = Dict{String,Any}()
+        for (key, implementation) in _EIGHT_SCHOOLS_AD_IMPLEMENTATIONS
+            values[key] = haskey(row, key) ? _eight_schools_measurement(row, key) : missing
+            haskey(row, key) || continue
+            result = row[key]
+            length(result["times_ns"]) >= 10 ||
+                error("insufficient Eight Schools AD rounds for $cell / $implementation")
+            push!(plot_rows, (;
+                cell,
+                implementation,
+                median_ns = Float64(result["median_ns"]),
+                median_bytes = Int(result["median_bytes"]),
+            ))
+            push!(setup_rows, (;
+                cell,
+                implementation,
+                preparation_seconds = Float64(result["preparation_seconds"]),
+                preparation_bytes = Int(result["preparation_bytes"]),
+                first_execution_seconds =
+                    Float64(result["first_execution_seconds"]),
+                first_execution_bytes = Int(result["first_execution_bytes"]),
+            ))
+        end
+        push!(matrix_rows, (;
+            boundary = boundary_labels[boundary],
+            outcome = outcome_labels[outcome],
+            active = expected_support ? String(row["active_port"]) : "",
+            status = expected_support ? "measured" : String(row["unsupported_reason"]),
+            rk_native = values["rk_native"],
+            manual_enzyme = values["manual_enzyme"],
+            turing_enzyme = values["turing_enzyme"],
+        ))
+    end
+
+    rk_rows = [row["rk_native"] for row in measurements if get(row, "supported", false)]
+    zero_rk = count(row -> Int(row["median_bytes"]) == 0 &&
+                           Int(row["median_allocs"]) == 0, rk_rows)
+    zero_rk == 4 || error("Eight Schools AD receipt lost a zero-allocation RK cell")
+    turing_rows = filter(row -> row.implementation == "Turing / DynamicPPL", plot_rows)
+    turing_bytes = getproperty.(turing_rows, :median_bytes)
+    summary = "All four differentiable scalar cells supported by the public RK " *
+        "boundary have a zero-byte, zero-allocation steady-state value-and-gradient " *
+        "path. The three matched DynamicPPL cells allocate " *
+        "$(minimum(turing_bytes))–$(maximum(turing_bytes)) B. Pointwise remains " *
+        "blank because there is no useful matched public Jacobian/VJP contract; " *
+        "the constrained NamedTuple boundary is likewise reported unsupported."
+
+    matrix_columns = (
+        _column(:boundary, "Starting boundary"),
+        _column(:outcome, "Requested outcome"),
+        _column(:active, "Active port";
+            format = (value, _) -> isempty(value) ? "" : h.code(value)),
+        _column(:rk_native, "RK + Enzyme";
+            format = _eight_schools_ad_cell, sort = _eight_schools_ad_sort),
+        _column(:manual_enzyme, "Manual + Enzyme";
+            format = _eight_schools_ad_cell, sort = _eight_schools_ad_sort),
+        _column(:turing_enzyme, "Turing + Enzyme";
+            format = _eight_schools_ad_cell, sort = _eight_schools_ad_sort),
+        _column(:status, "Status";
+            format = (value, _) -> value == "measured" ? value :
+                h.span(value; class = "rk-result-unsupported")),
+    )
+    setup_columns = (
+        _column(:cell, "Scalar matrix cell"),
+        _column(:implementation, "Implementation"),
+        _column(:preparation_seconds, "Preparation";
+            format = (value, _) -> string(round(value; sigdigits = 4), " s")),
+        _column(:preparation_bytes, "Preparation bytes";
+            format = (value, _) -> string(value, " B")),
+        _column(:first_execution_seconds, "First execution";
+            format = (value, _) -> string(round(value; sigdigits = 4), " s")),
+        _column(:first_execution_bytes, "First-execution bytes";
+            format = (value, _) -> string(value, " B")),
+    )
+    provenance = "Receipt pin: RK `$(pins["reactivekernels_sha"])`; published " *
+        "model authority `$(model_source["commit"])`; " *
+        "DifferentiationInterface $(pins["differentiationinterface_version"]); " *
+        "Enzyme $(pins["enzyme_version"]); Turing $(pins["turing_version"]); " *
+        "Julia $(pins["julia_version"]); $(receipt["environment"]["cpu"])."
+
+    Markdown.MD(Any[
+        Markdown.Paragraph(Any[summary]),
+        _eight_schools_ad_plot(plot_rows, :median_ns;
+            id = "eight-schools-ad-runtime",
+            title = "Eight Schools value-and-gradient runtime"),
+        _eight_schools_ad_plot(plot_rows, :median_bytes;
+            id = "eight-schools-ad-allocation",
+            title = "Eight Schools value-and-gradient allocation"),
+        _result_table(matrix_rows, matrix_columns;
+            id = "eight-schools-ad-matrix",
+            title = "AD boundary × outcome matrix",
+            note = "Measured cells show median value-and-gradient runtime; bytes; " *
+                   "allocations. Unsupported cells retain their exact reason."),
+        _result_table(setup_rows, setup_columns;
+            id = "eight-schools-ad-setup",
+            title = "Preparation, compilation, and first execution",
+            note = "These one-time costs are retained separately and excluded " *
+                   "from the steady-state plots and matrix."),
         Markdown.Paragraph(Any[Markdown.Italic(Any[provenance])]),
     ])
 end

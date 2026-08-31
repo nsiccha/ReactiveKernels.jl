@@ -45,6 +45,16 @@ end
     end
 end
 
+@testset "Eight Schools AD benchmark receipt validates" begin
+    validator = joinpath(
+        _BENCH_DIR, "receipts", "validate_eight_schools_ad.jl")
+    receipt = joinpath(
+        _BENCH_DIR, "receipts", "eight-schools-ad-v1.toml")
+    @test isfile(receipt)
+    include(validator)
+    @test isempty(validate_eight_schools_ad_receipt(receipt))
+end
+
 @testset "Eight Schools Reactant benchmark receipt validates" begin
     validator = joinpath(
         _BENCH_DIR, "receipts", "validate_eight_schools_reactant.jl")

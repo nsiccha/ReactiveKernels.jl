@@ -123,6 +123,42 @@ values, so no mutable destination is needed. The checked-in
 retains all raw times, allocation bytes/counts, analytic errors, source-receipt
 links, and exact package pins.
 
+## Eight Schools model gradient matrix
+
+This is the AD-only companion to the
+[Eight Schools primal matrix](eight-schools.md). It prepares scalar selections
+of that page's exact published
+[`eight_schools.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsPPLExamples/src/eight_schools.jl)
+graph; no prior, likelihood, transform, or distribution formula is copied into
+an AD-specific RK evaluator. The optimized Turing model and manual Julia control
+are loaded from the primal benchmark authority as well.
+
+```@eval
+Main.ReactiveKernelsDocs.render_eight_schools_ad_benchmarks()
+```
+
+The four scalar gradient cells are the packed unconstrained joint, prior, and
+likelihood plus the minimal θ-only likelihood. Each uses a prepared,
+caller-owned value-and-gradient path and is checked against central finite
+differences before timing. The constrained parameter object is not a supported
+active storage type for the public RK AD boundary. Pointwise output remains
+blank because neither compared public surface offers a useful matched
+Jacobian/VJP contract; the benchmark does not invent a fused pointwise-plus-total
+surrogate.
+
+The checked-in
+[Eight Schools AD receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/eight-schools-ad-v1.toml)
+retains ten raw rounds, source and primal-receipt pins, parity errors,
+preparation/first-execution costs, and steady-state timing and allocation data.
+Reproduce and validate it with:
+
+```sh
+julia --startup-file=no benchmark/eight_schools_ad_comparison.jl \
+  --output=benchmark/receipts/eight-schools-ad-v1.toml
+julia --startup-file=no benchmark/receipts/validate_eight_schools_ad.jl \
+  benchmark/receipts/eight-schools-ad-v1.toml
+```
+
 ## Owned storage, not borrowed caches
 
 Do not differentiate a `NonAllocatingKernel` whose recipe caches are borrowed
