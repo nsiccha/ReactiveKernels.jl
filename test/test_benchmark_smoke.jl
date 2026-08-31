@@ -22,6 +22,7 @@ end
                  "distributions_comparison.jl",
                  "scalar_distribution_gallery_comparison.jl",
                  "structured_distributions_comparison.jl",
+                 "distribution_gradients.jl",
                  "nuts_reactant_comparison.jl",
                  "nuts_reactant_comparison_body.jl",
                  "eval_throughput_comparison.jl",
@@ -30,7 +31,8 @@ end
                  joinpath("receipts", "validate_eval_throughput.jl"),
                  joinpath("receipts", "validate_distributions.jl"),
                  joinpath("receipts", "validate_scalar_gallery_distributions.jl"),
-                 joinpath("receipts", "validate_structured_distributions.jl"))
+                 joinpath("receipts", "validate_structured_distributions.jl"),
+                 joinpath("receipts", "validate_distribution_gradients.jl"))
         path = joinpath(_BENCH_DIR, name)
         @test isfile(path)
         @test _parses(path)
@@ -81,6 +83,16 @@ end
     @test isfile(receipt)
     include(validator)
     @test isempty(validate_distribution_receipt(receipt))
+end
+
+@testset "distribution gradient benchmark receipt validates" begin
+    validator = joinpath(
+        _BENCH_DIR, "receipts", "validate_distribution_gradients.jl")
+    receipt = joinpath(
+        _BENCH_DIR, "receipts", "distribution-gradient-v1.toml")
+    @test isfile(receipt)
+    include(validator)
+    @test isempty(validate_distribution_gradient_receipt(receipt))
 end
 
 @testset "reproducibility guard: attached rejected, detached accepted, dirty rejected" begin
