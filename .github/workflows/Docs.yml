@@ -15,6 +15,8 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      RK_RENDERED_DOCS_REPORT: ${{ runner.temp }}/rendered-docs-advisories.json
     steps:
       - uses: actions/checkout@v4
       - name: Configure git for private repos
@@ -24,6 +26,8 @@ jobs:
           # RuntimeGeneratedFunctions 0.5 currently fails under Julia 1.12's
           # stricter world-age semantics; match the package's tested baseline.
           version: '1.10'
+      - name: Initialize rendered-docs advisory report
+        run: julia --startup-file=no -e 'include("docs/check_rendered.jl"); initialize_rendered_docs_report()'
       - uses: julia-actions/cache@v2
       - name: Install dependencies
         run: |
@@ -55,7 +59,17 @@ jobs:
             ])
             Pkg.instantiate()
           '
+      - name: Test rendered-docs contract
+        run: julia --startup-file=no docs/test_rendered_contracts.jl
       - name: Build and deploy
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: julia --project=docs docs/make.jl
+      - name: Upload rendered-docs advisory report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rendered-docs-advisories
+          path: ${{ runner.temp }}/rendered-docs-advisories.json
+          if-no-files-found: error
+          retention-days: 14
