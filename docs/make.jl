@@ -70,6 +70,7 @@ site_pages = [
     "Probabilistic programming" => [
         "Bijectors and constrained parameters" => "bijectors.md",
         "Eight schools" => "eight-schools.md",
+        "Eight schools with Reactant" => "eight-schools-reactant.md",
         "Linear regression" => "linear-regression.md",
         "Beta-binomial" => "beta-binomial.md",
         "Poisson-Gamma" => "poisson-gamma.md",

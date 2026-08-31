@@ -1,0 +1,255 @@
+generated_at = "2026-08-31T21:42:55.005Z"
+schema = "eight-schools-reactant-v1"
+
+[environment]
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+julia_threads = 1
+os = "Linux"
+reactant_backend = "default CPU"
+
+[[measurements]]
+boundary = "packed_unconstrained"
+description = "full joint including the transform Jacobian"
+outcome = "joint"
+reactant_compile_seconds = 4.671567868
+reactant_transfer_seconds = 0.172425285
+rk_native_supported = true
+rk_reactant_error = "Scalar indexing is disallowed."
+rk_reactant_supported = false
+
+    [measurements.rk_native]
+    calls_per_round = 524288
+    median_ns = 69.09744453430176
+    times_ns = [65.84147071838379, 96.03282165527344, 83.94823265075684, 66.67607688903809, 68.48507690429688, 76.96201705932617, 65.17656707763672, 64.99215888977051, 93.37777519226074, 67.27149200439453, 97.94656562805176, 64.96280288696289, 63.78218460083008, 77.87131881713867, 76.5737361907959, 98.68783378601074, 68.97328567504883, 69.22160339355469, 75.75404739379883, 63.64567756652832]
+[[measurements]]
+boundary = "packed_unconstrained"
+description = "log prior including the transform Jacobian"
+outcome = "prior"
+reactant_compile_seconds = 2.538308807
+reactant_transfer_seconds = 0.00700576
+rk_native_supported = true
+rk_reactant_error = "Scalar indexing is disallowed."
+rk_reactant_supported = false
+
+    [measurements.rk_native]
+    calls_per_round = 524288
+    median_ns = 25.261507034301758
+    times_ns = [65.37858581542969, 22.78573989868164, 22.91693687438965, 22.51313018798828, 30.898921966552734, 56.75773048400879, 22.804344177246094, 22.40993309020996, 22.672954559326172, 24.999963760375977, 25.52305030822754, 24.89628791809082, 56.55622482299805, 27.02664566040039, 26.670454025268555, 27.50859260559082, 22.30098533630371, 22.45393943786621, 52.35113334655762, 35.04933547973633]
+[[measurements]]
+boundary = "packed_unconstrained"
+description = "summed log likelihood after unpacking the latent vector"
+max_abs_error = 0.0
+outcome = "likelihood"
+reactant_compile_seconds = 12.152534157
+reactant_first_execution_seconds = 0.269930014
+reactant_transfer_seconds = 9.3057e-5
+rk_native_supported = true
+rk_reactant_supported = true
+
+    [measurements.rk_native]
+    calls_per_round = 524288
+    median_ns = 42.54696846008301
+    times_ns = [40.962236404418945, 41.00129508972168, 42.18275451660156, 50.86960029602051, 40.60136604309082, 43.41904640197754, 42.406259536743164, 70.98325729370117, 42.28014373779297, 42.06488800048828, 125.61332321166992, 60.0330810546875, 41.315277099609375, 51.679222106933594, 44.66066932678223, 42.68767738342285, 42.00818061828613, 52.55683898925781, 42.213850021362305, 47.05882263183594]
+
+    [measurements.rk_reactant]
+    calls_per_round = 4096
+    median_ns = 5620.7545166015625
+    times_ns = [4595.24658203125, 8279.237060546875, 4911.3369140625, 5917.426025390625, 5815.18017578125, 9764.06494140625, 5779.376708984375, 6219.78857421875, 9855.4873046875, 4952.2353515625, 5375.115966796875, 5190.368896484375, 9627.72216796875, 5462.13232421875, 36994.9287109375, 8939.8642578125, 4128.7880859375, 4262.192138671875, 4864.7392578125, 4063.585693359375]
+[[measurements]]
+boundary = "packed_unconstrained"
+description = "eight pointwise log likelihoods after unpacking"
+max_abs_error = 0.0
+outcome = "pointwise"
+reactant_compile_seconds = 2.697233908
+reactant_first_execution_seconds = 0.024526545
+reactant_transfer_seconds = 9.2087e-5
+rk_native_supported = true
+rk_reactant_supported = true
+
+    [measurements.rk_native]
+    calls_per_round = 262144
+    median_ns = 102.33576202392578
+    times_ns = [171.92049407958984, 118.29859161376953, 79.18032455444336, 120.0097427368164, 104.34957122802734, 57.006160736083984, 177.46432876586914, 75.13731384277344, 119.3176040649414, 82.25910186767578, 123.73309707641602, 84.03810119628906, 119.30392456054688, 58.00157165527344, 110.73754501342773, 63.429927825927734, 100.32195281982422, 70.07884216308594, 146.8023567199707, 73.76239395141602]
+
+    [measurements.rk_reactant]
+    calls_per_round = 4096
+    median_ns = 4263.78125
+    times_ns = [5656.225830078125, 3859.62548828125, 3693.59814453125, 5046.57470703125, 9943.770751953125, 3645.880859375, 4033.639892578125, 4340.671875, 8053.54736328125, 5009.981201171875, 4186.890625, 4136.26416015625, 3780.625, 8165.9658203125, 5955.464111328125, 4042.634033203125, 3546.772216796875, 3886.738037109375, 9515.237548828125, 6266.503662109375]
+[[measurements]]
+boundary = "constrained_parameters"
+description = "full joint excluding the transform Jacobian"
+max_abs_error = 0.0
+outcome = "joint"
+reactant_compile_seconds = 4.990840913
+reactant_first_execution_seconds = 0.095855807
+reactant_transfer_seconds = 0.037968518
+rk_native_supported = true
+rk_reactant_supported = true
+
+    [measurements.rk_native]
+    calls_per_round = 131072
+    median_ns = 54.058677673339844
+    times_ns = [56.506431579589844, 53.90778350830078, 53.92475891113281, 63.12451934814453, 54.352203369140625, 53.038978576660156, 52.55047607421875, 170.8162612915039, 53.25878143310547, 53.75537109375, 53.77027130126953, 53.467803955078125, 54.21461486816406, 53.08282470703125, 53.81733703613281, 56.3472900390625, 55.22117614746094, 54.192596435546875, 54.22492218017578, 54.37245178222656]
+
+    [measurements.rk_reactant]
+    calls_per_round = 1024
+    median_ns = 5514.3359375
+    times_ns = [7166.814453125, 7113.0, 6675.5908203125, 6648.326171875, 5027.302734375, 4572.759765625, 5941.9716796875, 6436.3359375, 5474.8720703125, 10433.818359375, 7018.6416015625, 6983.33984375, 4567.8505859375, 4631.7861328125, 5139.166015625, 5501.0419921875, 5379.359375, 5362.5888671875, 5527.6298828125, 4861.8994140625]
+[[measurements]]
+boundary = "constrained_parameters"
+description = "constrained-space log prior"
+max_abs_error = 0.0
+outcome = "prior"
+reactant_compile_seconds = 3.075370569
+reactant_first_execution_seconds = 0.038351635
+reactant_transfer_seconds = 0.014937104
+rk_native_supported = true
+rk_reactant_supported = true
+
+    [measurements.rk_native]
+    calls_per_round = 1048576
+    median_ns = 23.4144344329834
+    times_ns = [38.14932060241699, 25.901933670043945, 18.27628231048584, 19.07750129699707, 30.894387245178223, 24.927576065063477, 24.48933982849121, 17.804258346557617, 28.936484336853027, 23.297805786132812, 22.359776496887207, 20.107152938842773, 26.626380920410156, 20.65900421142578, 23.552063941955566, 23.531063079833984, 26.454157829284668, 21.39796733856201, 22.953704833984375, 22.839563369750977]
+
+    [measurements.rk_reactant]
+    calls_per_round = 8192
+    median_ns = 5644.707458496094
+    times_ns = [4424.9715576171875, 4277.4671630859375, 3998.92529296875, 5911.999755859375, 3992.0284423828125, 6063.2679443359375, 19112.760986328125, 8174.8203125, 4998.841552734375, 5901.7745361328125, 4693.82861328125, 7242.924072265625, 3727.7860107421875, 3766.55908203125, 5635.5455322265625, 4862.6649169921875, 8386.259399414062, 5653.869384765625, 23515.847900390625, 6326.6033935546875]
+[[measurements]]
+boundary = "constrained_parameters"
+description = "summed log likelihood"
+max_abs_error = 0.0
+outcome = "likelihood"
+reactant_compile_seconds = 1.91567698
+reactant_first_execution_seconds = 0.022894564
+reactant_transfer_seconds = 0.000128878
+rk_native_supported = true
+rk_reactant_supported = true
+
+    [measurements.rk_native]
+    calls_per_round = 524288
+    median_ns = 62.755428314208984
+    times_ns = [43.3956298828125, 71.92073249816895, 37.670419692993164, 40.917219161987305, 56.48309516906738, 77.19140434265137, 39.07443046569824, 66.46569061279297, 99.4072437286377, 78.47260093688965, 81.97990226745605, 75.21029472351074, 62.20450401306152, 94.70448684692383, 41.83450698852539, 37.096357345581055, 67.91595840454102, 40.97474670410156, 37.68992233276367, 63.306352615356445]
+
+    [measurements.rk_reactant]
+    calls_per_round = 8192
+    median_ns = 4892.6170654296875
+    times_ns = [4690.476806640625, 5106.432373046875, 4625.662109375, 4537.7418212890625, 14232.162231445312, 6021.3216552734375, 5823.3082275390625, 6144.4027099609375, 6240.242919921875, 6275.63720703125, 4883.322021484375, 4220.9476318359375, 4227.0203857421875, 5157.553955078125, 4792.3824462890625, 4471.1031494140625, 31624.977416992188, 4720.43505859375, 4901.912109375, 4668.6607666015625]
+[[measurements]]
+boundary = "constrained_parameters"
+description = "eight pointwise log likelihoods"
+max_abs_error = 0.0
+outcome = "pointwise"
+reactant_compile_seconds = 1.805915581
+reactant_first_execution_seconds = 0.029394076
+reactant_transfer_seconds = 9.8486e-5
+rk_native_supported = true
+rk_reactant_supported = true
+
+    [measurements.rk_native]
+    calls_per_round = 262144
+    median_ns = 89.5411376953125
+    times_ns = [71.93305206298828, 113.11272048950195, 75.16336441040039, 111.45100021362305, 71.76776123046875, 88.97933578491211, 70.02104568481445, 94.46125030517578, 110.00835418701172, 134.4226531982422, 111.06025695800781, 102.40432739257812, 70.85215759277344, 90.10293960571289, 69.56464004516602, 88.04550552368164, 70.03044128417969, 91.5560188293457, 71.66481399536133, 102.99310302734375]
+
+    [measurements.rk_reactant]
+    calls_per_round = 8192
+    median_ns = 4473.929504394531
+    times_ns = [5667.650390625, 5048.6719970703125, 4262.5430908203125, 13437.946044921875, 5203.50830078125, 3894.70068359375, 3796.732421875, 3980.6724853515625, 4800.5504150390625, 4903.3277587890625, 4551.587890625, 5211.91455078125, 4584.123046875, 4323.23583984375, 4256.0618896484375, 18690.807006835938, 4116.195068359375, 4396.2711181640625, 3856.052490234375, 3922.7972412109375]
+[[measurements]]
+boundary = "minimal_likelihood"
+description = "unsupported without prior parameters"
+outcome = "joint"
+rk_native_error = "unsupported without prior parameters"
+rk_native_supported = false
+rk_reactant_error = "unsupported without prior parameters"
+rk_reactant_supported = false
+[[measurements]]
+boundary = "minimal_likelihood"
+description = "unsupported without prior parameters"
+outcome = "prior"
+rk_native_error = "unsupported without prior parameters"
+rk_native_supported = false
+rk_reactant_error = "unsupported without prior parameters"
+rk_reactant_supported = false
+[[measurements]]
+boundary = "minimal_likelihood"
+description = "summed likelihood from θ, observations, and scales only"
+max_abs_error = 0.0
+outcome = "likelihood"
+reactant_compile_seconds = 1.764012909
+reactant_first_execution_seconds = 0.022464932
+reactant_transfer_seconds = 8.6188e-5
+rk_native_supported = true
+rk_reactant_supported = true
+
+    [measurements.rk_native]
+    calls_per_round = 1048576
+    median_ns = 40.49206209182739
+    times_ns = [37.06480407714844, 40.44233989715576, 39.7953519821167, 52.946083068847656, 39.70737838745117, 38.685988426208496, 38.7935094833374, 39.411664962768555, 38.459129333496094, 38.71674728393555, 40.86604976654053, 42.58107089996338, 40.25130271911621, 43.41994380950928, 42.58448791503906, 50.86063194274902, 40.54178428649902, 46.87724018096924, 45.05784034729004, 40.6744499206543]
+
+    [measurements.rk_reactant]
+    calls_per_round = 8192
+    median_ns = 4038.3576049804688
+    times_ns = [3805.7205810546875, 9683.24658203125, 3736.6300048828125, 5181.6141357421875, 5372.12841796875, 4732.28369140625, 4074.61669921875, 4002.0985107421875, 3783.6148681640625, 4088.2635498046875, 4114.5936279296875, 4200.2135009765625, 4373.9552001953125, 17946.72705078125, 3766.9927978515625, 3797.5294189453125, 3951.529541015625, 3911.51220703125, 3804.301513671875, 3887.7098388671875]
+[[measurements]]
+boundary = "minimal_likelihood"
+description = "pointwise likelihoods from θ, observations, and scales only"
+max_abs_error = 0.0
+outcome = "pointwise"
+reactant_compile_seconds = 1.574472138
+reactant_first_execution_seconds = 0.022299404
+reactant_transfer_seconds = 8.2192e-5
+rk_native_supported = true
+rk_reactant_supported = true
+
+    [measurements.rk_native]
+    calls_per_round = 131072
+    median_ns = 81.89597702026367
+    times_ns = [56.18395233154297, 55.78240203857422, 84.01361846923828, 161.1627426147461, 54.472991943359375, 55.061798095703125, 87.19908905029297, 153.89289093017578, 57.363182067871094, 54.60737609863281, 78.35670471191406, 117.2789306640625, 55.586509704589844, 58.891693115234375, 79.77833557128906, 152.761962890625, 88.17317199707031, 89.86365509033203, 90.40211486816406, 124.66215515136719]
+
+    [measurements.rk_reactant]
+    calls_per_round = 8192
+    median_ns = 3678.0091552734375
+    times_ns = [3500.9815673828125, 3697.1383056640625, 3500.946044921875, 3543.0831298828125, 3487.9461669921875, 3458.19189453125, 14506.79150390625, 3961.433349609375, 3828.837158203125, 4271.822265625, 3778.545654296875, 3898.8055419921875, 3458.1773681640625, 3339.9501953125, 3449.3760986328125, 3658.8800048828125, 3777.1448974609375, 19197.317138671875, 4125.9716796875, 3648.236572265625]
+
+[pins]
+julia_version = "1.10.11"
+primal_receipt_reactivekernels_sha = "8a3225a16ee6b851eebd3a2f7dff88203120615f"
+primal_receipt_sha256 = "b3f108fb6a205a5e30138c2d4cf8e7a4fca7183d42fdd31c48829a5dab9fd37d"
+reactant_jll_version = "0.0.401+0"
+reactant_version = "0.2.278"
+reactivekernels_dirty = false
+reactivekernels_sha = "51660b3fb736d246c055b305c695d00f2cb86d06"
+reactivekernels_version = "0.1.0"
+reactivekernelsdistributionkernels_version = "0.1.0"
+reactivekernelspplexamples_version = "0.1.0"
+source_authority_blob = "9f67aad217a698d88f66db2271bfb9d7a3579a61"
+source_authority_path = "packages/ReactiveKernelsPPLExamples/src/eight_schools.jl"
+source_text_sha256 = "79c26e1af246047ed6c4aa81b854a568a08d77a98d12614d0cca9324690046b5"
+
+[protocol]
+estimator = "median per-call time from calibrated elapsed batches"
+generated_predictions_included = false
+gradients_included = false
+input_boundaries = ["packed_unconstrained", "constrained_parameters", "minimal_likelihood"]
+matrix_source = "benchmark/receipts/eight-schools-primal-v1.toml"
+model = "centered Eight Schools"
+outcomes = ["joint", "prior", "likelihood", "pointwise"]
+parity_atol = 1.0e-12
+parity_rtol = 1.0e-11
+preparation_in_timed_region = false
+reactant_compile_time_in_timed_region = false
+reactant_readback_in_timed_region = false
+reactant_sync = true
+reactant_transfers_in_timed_region = false
+rounds = 20
+setup_in_timed_region = false
+source_reused = true
+target_seconds_per_round = 0.02
+unsupported_cells_recorded = true
+
+[setup]
+environment_seconds = 14.063131525
+kernel_preparation_seconds = 4.632070213
+package_precompile_seconds = 16.12571191
