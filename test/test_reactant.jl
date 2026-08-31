@@ -280,15 +280,23 @@ end
                   q_host[1], q_host[2], q_host[3:end],
                   EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA)
 
-        pointwise_compiled = @compile artifact.pointwise_kernel(
+        pointwise_compiled = @compile artifact.pointwise_extraction(
             observations, effects, scales)
         @test Array(pointwise_compiled(observations, effects, scales)) ≈
               artifact.pointwise
 
-        likelihood_compiled = @compile artifact.likelihood_kernel(
+        likelihood_compiled = @compile artifact.likelihood_extraction(
             observations, effects, scales)
         @test likelihood_compiled(observations, effects, scales) ≈
               reference_likelihood
+
+        pointwise_and_likelihood_compiled =
+            @compile artifact.pointwise_and_likelihood_extraction(
+                observations, effects, scales)
+        compiled_pointwise, compiled_likelihood =
+            pointwise_and_likelihood_compiled(observations, effects, scales)
+        @test Array(compiled_pointwise) ≈ artifact.pointwise
+        @test compiled_likelihood ≈ reference_likelihood
     end
 
     @testset "direct prepared scalar kernels keep program metadata static" begin

@@ -299,6 +299,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "batched.md" => 2,
         "compiler.md" => 1,
         "distributions.md" => 6,
+        "eight-schools.md" => 1,
         "eval-throughput.md" => 1,
         "nuts.md" => 3,
     )
@@ -375,7 +376,8 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
     )
     body_markers = Dict(
         "eight-schools.md" =>
-            ("Eight Schools Extraction", "Raw input", "Generated kernel", "Compute DAG"),
+            ("Eight Schools Extraction", "Raw input", "Generated kernel", "Compute DAG",
+             "Primal boundary × outcome matrix"),
         "nuts.md" =>
             ("NUTS Phasepoint Hamiltonian", "Raw input", "Generated kernel", "Compute DAG"),
         "nutpie-diagonal.md" => (
