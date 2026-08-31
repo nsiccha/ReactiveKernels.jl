@@ -2,6 +2,8 @@
 
 module DistributionComparison
 
+include("distribution_benchmark_cases.jl")
+
 using BenchmarkTools
 using Dates
 using Distributions
@@ -15,10 +17,13 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 using Statistics
 using TOML
 
+using .DistributionBenchmarkCases:
+    NORMAL_SIZES, normal_observations, normal_parameters
+
 using Reactant: @compile
 
 const PROBABILITY_MEASURES_SHA = "7cf3a6e112aaae2097b8d401b256d1bce635e03e"
-const DEFAULT_SIZES = (1, 1_000, 10_000, 30_000, 100_000, 1_000_000)
+const DEFAULT_SIZES = NORMAL_SIZES
 const DEFAULT_ROUNDS = 5
 
 @kernel benchmark_normal_logpdf(
@@ -183,7 +188,8 @@ function run_benchmark()
         error("authored Reactant lowering is not a fused reduction")
 
     Random.seed!(0x5eed)
-    μ, σ = 0.3, 1.2
+    parameters = normal_parameters()
+    μ, σ = parameters.location, parameters.scale
     rμ = Reactant.ConcreteRNumber(μ)
     rσ = Reactant.ConcreteRNumber(σ)
     rounds = parse(Int, get(ENV, "RK_DENSITY_BENCH_ROUNDS", string(DEFAULT_ROUNDS)))
@@ -193,7 +199,7 @@ function run_benchmark()
     distributions_reactant_error = ""
 
     for n in _sizes()
-        xs = randn(n)
+        xs = normal_observations(n)
         rxs = Reactant.to_rarray(xs)
         reference = hand_hoisted_reduce(μ, σ, xs)
 
