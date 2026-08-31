@@ -12,14 +12,12 @@ using ProbabilityMeasures
 using Random
 using Reactant
 using ReactiveKernels
+using ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE
 using Statistics
 using TOML
 
 using Reactant: @compile
-
-include(joinpath(@__DIR__, "..", "examples", "distribution_kernel_sources.jl"))
-using .DistributionKernelSources:
-    EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE
 
 const PROBABILITY_MEASURES_SHA = "7cf3a6e112aaae2097b8d401b256d1bce635e03e"
 const DEFAULT_SIZES = (1_000, 100_000)

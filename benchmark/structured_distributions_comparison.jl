@@ -12,13 +12,12 @@ using ProbabilityMeasures
 using Random
 using Reactant
 using ReactiveKernels
+using ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    AR1_SOURCE, MVNORMAL_SOURCE
 using Statistics
 using TOML
 
 using Reactant: @compile
-
-include(joinpath(@__DIR__, "..", "examples", "distribution_kernel_sources.jl"))
-using .DistributionKernelSources: AR1_SOURCE, MVNORMAL_SOURCE
 
 const PROBABILITY_MEASURES_SHA = "7cf3a6e112aaae2097b8d401b256d1bce635e03e"
 const DEFAULT_SIZES = (4, 16, 64, 128)
