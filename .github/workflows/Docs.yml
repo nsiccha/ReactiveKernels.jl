@@ -55,7 +55,18 @@ jobs:
             ])
             Pkg.instantiate()
           '
+      - name: Test rendered-docs contract
+        run: julia --startup-file=no docs/test_rendered_contracts.jl
       - name: Build and deploy
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RK_RENDERED_DOCS_REPORT: ${{ runner.temp }}/rendered-docs-advisories.json
         run: julia --project=docs docs/make.jl
+      - name: Upload rendered-docs advisory report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rendered-docs-advisories
+          path: ${{ runner.temp }}/rendered-docs-advisories.json
+          if-no-files-found: ignore
+          retention-days: 14
