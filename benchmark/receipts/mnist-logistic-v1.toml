@@ -1,0 +1,251 @@
+generated_at = "2026-08-31T23:50:42.163Z"
+schema = "mnist-logistic-v1"
+
+[environment]
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+julia_threads = 1
+os = "Linux"
+
+[[measurements]]
+boundary = "packed_unconstrained"
+description = "full joint over the flattened sampler vector"
+outcome = "joint"
+
+    [measurements.manual_julia]
+    allocs = [7, 7, 7, 7, 7, 7, 7, 7, 7, 7]
+    bytes = [9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272]
+    median_allocs = 7
+    median_bytes = 9120272
+    median_ns = 8.86436735e7
+    times_ns = [2.07461964e8, 6.262674e7, 6.4471796e7, 6.8844848e7, 1.05806862e8, 1.94286959e8, 8.8341016e7, 2.12937159e8, 8.8946331e7, 7.7817037e7]
+
+    [measurements.rk_native]
+    allocs = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9]
+    bytes = [13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320]
+    median_allocs = 9
+    median_bytes = 13920320
+    median_ns = 7.61455705e7
+    times_ns = [7.5835693e7, 6.1239165e7, 5.8178664e7, 7.5981104e7, 6.3860582e7, 8.1174878e7, 8.3256051e7, 8.5492796e7, 7.6310037e7, 1.15343338e8]
+
+    [measurements.turing_native]
+    allocs = [17, 17, 17, 17, 17, 17, 17, 17, 17, 17]
+    bytes = [20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512]
+    median_allocs = 17
+    median_bytes = 20160512
+    median_ns = 9.69675465e7
+    times_ns = [1.44575186e8, 1.01381587e8, 8.5861093e7, 8.9753575e7, 8.9307499e7, 1.01008762e8, 9.2926331e7, 1.26191754e8, 7.9521398e7, 1.03356912e8]
+[[measurements]]
+boundary = "packed_unconstrained"
+description = "standard-normal coefficient log prior"
+outcome = "prior"
+
+    [measurements.manual_julia]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 421.0
+    times_ns = [421.0, 420.0, 421.0, 430.0, 420.0, 430.0, 420.0, 420.0, 421.0, 421.0]
+
+    [measurements.rk_native]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 4015.0
+    times_ns = [3975.0, 4046.0, 4005.0, 4115.0, 4065.0, 4125.0, 3985.0, 4005.0, 4025.0, 3946.0]
+
+    [measurements.turing_native]
+    allocs = [17, 17, 17, 17, 17, 17, 17, 17, 17, 17]
+    bytes = [20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512]
+    median_allocs = 17
+    median_bytes = 20160512
+    median_ns = 8.3182659e7
+    times_ns = [2.00282759e8, 9.0249848e7, 7.6570346e7, 8.9923278e7, 8.9794972e7, 5.7713833e7, 7.575469e7, 7.0991811e7, 6.8135539e7, 9.1414255e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+description = "summed softmax categorical log likelihood"
+outcome = "likelihood"
+
+    [measurements.manual_julia]
+    allocs = [7, 7, 7, 7, 7, 7, 7, 7, 7, 7]
+    bytes = [9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272]
+    median_allocs = 7
+    median_bytes = 9120272
+    median_ns = 6.68825405e7
+    times_ns = [7.4994843e7, 7.5893693e7, 5.9867444e7, 5.4526815e7, 6.346004e7, 5.7319248e7, 6.8026068e7, 9.9962688e7, 8.8275055e7, 6.5739013e7]
+
+    [measurements.rk_native]
+    allocs = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9]
+    bytes = [13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320]
+    median_allocs = 9
+    median_bytes = 13920320
+    median_ns = 6.5198387e7
+    times_ns = [6.3271309e7, 5.4637077e7, 5.2930042e7, 6.1608545e7, 6.9425219e7, 6.7125465e7, 1.03187628e8, 9.9341232e7, 2.78845966e8, 5.7124739e7]
+
+    [measurements.turing_native]
+    allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
+    bytes = [20160384, 20160384, 20160384, 20160384, 20160384, 20160384, 20160384, 20160384, 20160384, 20160384]
+    median_allocs = 16
+    median_bytes = 20160384
+    median_ns = 1.46498029e8
+    times_ns = [9.8363883e7, 6.6782984e7, 7.6431065e7, 1.12316162e8, 7.6780166e7, 1.80679896e8, 1.84203769e8, 2.28111442e8, 2.02189771e8, 1.84255118e8]
+[[measurements]]
+boundary = "packed_unconstrained"
+description = "per-observation softmax categorical log likelihoods"
+outcome = "pointwise"
+
+    [measurements.manual_julia]
+    allocs = [7, 7, 7, 7, 7, 7, 7, 7, 7, 7]
+    bytes = [9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272]
+    median_allocs = 7
+    median_bytes = 9120272
+    median_ns = 9.51516455e7
+    times_ns = [9.5096714e7, 8.8113641e7, 8.0926476e7, 9.5206577e7, 1.18531295e8, 1.17940981e8, 1.04692374e8, 1.13998842e8, 9.4198176e7, 9.1000664e7]
+
+    [measurements.rk_native]
+    allocs = [11, 11, 11, 11, 11, 11, 11, 11, 11, 11]
+    bytes = [14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368]
+    median_allocs = 11
+    median_bytes = 14400368
+    median_ns = 1.660545445e8
+    times_ns = [2.35569212e8, 1.98496826e8, 2.06770931e8, 1.59552268e8, 1.68162097e8, 1.86135844e8, 1.57778281e8, 1.63946992e8, 1.24822265e8, 1.25109261e8]
+[[measurements]]
+boundary = "structured_parameters"
+description = "full joint over the (W, b) coefficients"
+outcome = "joint"
+
+    [measurements.manual_julia]
+    allocs = [10, 10, 10, 10, 10, 10, 10, 10, 10, 10]
+    bytes = [9176848, 9176848, 9176848, 9176848, 9176848, 9176848, 9176848, 9176848, 9176848, 9176848]
+    median_allocs = 10
+    median_bytes = 9176848
+    median_ns = 1.155107395e8
+    times_ns = [9.0075467e7, 1.14755248e8, 1.16266231e8, 8.8327335e7, 1.17438901e8, 1.26321994e8, 8.6050415e7, 9.8094001e7, 1.49176365e8, 1.77172266e8]
+
+    [measurements.rk_native]
+    allocs = [12, 12, 12, 12, 12, 12, 12, 12, 12, 12]
+    bytes = [13976896, 13976896, 13976896, 13976896, 13976896, 13976896, 13976896, 13976896, 13976896, 13976896]
+    median_allocs = 12
+    median_bytes = 13976896
+    median_ns = 1.13630971e8
+    times_ns = [1.14234419e8, 1.18175265e8, 1.13027523e8, 9.027157e7, 4.0302184e8, 1.3435799e8, 1.73825871e8, 8.6371088e7, 1.00599556e8, 8.5603209e7]
+
+    [measurements.turing_native]
+    allocs = [17, 17, 17, 17, 17, 17, 17, 17, 17, 17]
+    bytes = [20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512]
+    median_allocs = 17
+    median_bytes = 20160512
+    median_ns = 9.67224935e7
+    times_ns = [1.06830874e8, 9.4865146e7, 7.9114576e7, 9.8579841e7, 8.2824354e7, 1.41603165e8, 1.1089443e8, 1.07910563e8, 8.6122044e7, 5.7910753e7]
+[[measurements]]
+boundary = "structured_parameters"
+description = "standard-normal coefficient log prior"
+outcome = "prior"
+
+    [measurements.manual_julia]
+    allocs = [4, 4, 4, 4, 4, 4, 4, 4, 4, 4]
+    bytes = [56704, 56704, 56704, 56704, 56704, 56704, 56704, 56704, 56704, 56704]
+    median_allocs = 4
+    median_bytes = 56704
+    median_ns = 2238.0
+    times_ns = [2333.0, 2203.0, 2283.0, 2393.0, 2253.0, 2254.0, 2043.0, 2173.0, 2223.0, 2193.0]
+
+    [measurements.rk_native]
+    allocs = [4, 4, 4, 4, 4, 4, 4, 4, 4, 4]
+    bytes = [56704, 56704, 56704, 56704, 56704, 56704, 56704, 56704, 56704, 56704]
+    median_allocs = 4
+    median_bytes = 56704
+    median_ns = 6734.0
+    times_ns = [6620.0, 6960.0, 6759.0, 6679.0, 10294.0, 6809.0, 6709.0, 6799.0, 6680.0, 6650.0]
+
+    [measurements.turing_native]
+    allocs = [17, 17, 17, 17, 17, 17, 17, 17, 17, 17]
+    bytes = [20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512]
+    median_allocs = 17
+    median_bytes = 20160512
+    median_ns = 5.92065215e7
+    times_ns = [6.6713919e7, 5.1106427e7, 6.245363e7, 6.8124265e7, 5.4161071e7, 6.0310625e7, 5.3784751e7, 5.7891476e7, 5.8102418e7, 6.1566277e7]
+[[measurements]]
+boundary = "structured_parameters"
+description = "summed softmax categorical log likelihood"
+outcome = "likelihood"
+
+    [measurements.manual_julia]
+    allocs = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6]
+    bytes = [9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144]
+    median_allocs = 6
+    median_bytes = 9120144
+    median_ns = 6.09500665e7
+    times_ns = [5.2011975e7, 6.2380951e7, 6.3172573e7, 6.8140266e7, 5.886415e7, 6.3734248e7, 5.6736132e7, 5.166674e7, 5.9519182e7, 7.1840111e7]
+
+    [measurements.rk_native]
+    allocs = [8, 8, 8, 8, 8, 8, 8, 8, 8, 8]
+    bytes = [13920192, 13920192, 13920192, 13920192, 13920192, 13920192, 13920192, 13920192, 13920192, 13920192]
+    median_allocs = 8
+    median_bytes = 13920192
+    median_ns = 6.0879164e7
+    times_ns = [5.8194855e7, 7.2527519e7, 7.0077248e7, 5.8628484e7, 5.3316315e7, 5.1258656e7, 5.5101889e7, 6.7581306e7, 6.499725e7, 6.3129844e7]
+
+    [measurements.turing_native]
+    allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
+    bytes = [20160384, 20160384, 20160384, 20160384, 20160384, 20160384, 20160384, 20160384, 20160384, 20160384]
+    median_allocs = 16
+    median_bytes = 20160384
+    median_ns = 6.03758595e7
+    times_ns = [6.9482228e7, 8.6626931e7, 5.521827e7, 5.2351184e7, 6.257603e7, 5.5946413e7, 6.4372338e7, 5.8311246e7, 5.1829083e7, 6.2440473e7]
+[[measurements]]
+boundary = "structured_parameters"
+description = "per-observation softmax categorical log likelihoods"
+outcome = "pointwise"
+
+    [measurements.manual_julia]
+    allocs = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6]
+    bytes = [9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144]
+    median_allocs = 6
+    median_bytes = 9120144
+    median_ns = 6.6189375e7
+    times_ns = [7.0965203e7, 6.7674072e7, 7.4296569e7, 6.9036012e7, 5.8623287e7, 6.3725595e7, 6.4704678e7, 5.2985169e7, 7.313741e7, 6.4317142e7]
+
+    [measurements.rk_native]
+    allocs = [10, 10, 10, 10, 10, 10, 10, 10, 10, 10]
+    bytes = [14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240]
+    median_allocs = 10
+    median_bytes = 14400240
+    median_ns = 7.19045145e7
+    times_ns = [9.2827446e7, 6.4178301e7, 5.634276e7, 1.49274779e8, 7.7228946e7, 6.9848553e7, 6.8013242e7, 7.0659501e7, 7.3149528e7, 7.3444975e7]
+
+[pins]
+benchmarktools_version = "1.6.3"
+distributions_version = "0.25.131"
+dynamicppl_version = "0.42.6"
+julia_version = "1.10.11"
+mldatasets_version = "0.7.21"
+nnlib_version = "0.9.45"
+reactivekernels_dirty = false
+reactivekernels_sha = "074e3987f1cc287b7ecb55fd228d42ecd1c140c8"
+reactivekernels_version = "0.1.0"
+reactivekernelsdistributionkernels_version = "0.1.0"
+reactivekernelspplexamples_version = "0.1.0"
+turing_version = "0.47.1"
+
+[protocol]
+data = "MLDatasets MNIST train split, first N images"
+estimator = "median of per-round BenchmarkTools minimum times"
+gradients_included = false
+input_boundaries = ["packed_unconstrained", "structured_parameters"]
+model = "multinomial-logistic MNIST classifier"
+num_classes = 10
+num_features = 784
+num_observations = 60000
+outcomes = ["joint", "prior", "likelihood", "pointwise"]
+parity_atol = 1.0e-9
+parity_rtol = 1.0e-9
+preparation_in_timed_region = false
+rounds = 10
+samples_per_round = 200
+seconds_per_round = 0.2
+setup_in_timed_region = false
+turing_pointwise_supported = false
+turing_transform_strategy = "fixed transforms"
