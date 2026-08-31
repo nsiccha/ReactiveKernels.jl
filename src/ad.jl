@@ -342,3 +342,77 @@ function Base.show(io::IO, prepared::PreparedADKernel{I}) where {I}
     show(io, prepared.kernel)
     print(io, ")")
 end
+
+# --- Reactant-compiled automatic differentiation -----------------------------
+# The AD analog of the primal Reactant path (`@compile sync=true kernel(args...)`).
+# These take a native `PreparedADKernel` — which already owns the scalar-WANT /
+# single-active-port validation and the authored-HAVE-order reorder — and compile
+# a DifferentiationInterface gradient (or value-and-gradient) through Reactant.
+#
+# The differentiation engine stays the caller's DifferentiationInterface backend
+# (the one passed to `prepare_ad`), so ReactiveKernels imports no concrete AD
+# engine here: `AutoEnzyme(mode = Enzyme.Reverse)` traces through Reactant with
+# exact parity against the native reverse pass. The real methods live in
+# `ext/ReactiveKernelsReactantExt.jl` and are selected when the active argument is
+# a Reactant-traced value; without the Reactant weak dependency loaded (or with a
+# host-array active argument) these raise a clear, actionable error instead of a
+# bare `MethodError`.
+
+function _reactant_ad_marker(prepared::PreparedADKernel{I}, args::Tuple) where {I}
+    length(args) == length(inputs(prepared.kernel)) || throw(ArgumentError(
+        "Reactant AD compilation expects the $(length(inputs(prepared.kernel)))-value " *
+        "HAVE boundary $(Tuple(input.name for input in inputs(prepared.kernel))); " *
+        "got $(length(args)) argument(s)"))
+    getfield(args, I)
+end
+
+# Selected by the Reactant extension on `marker::Reactant.RArray` /
+# `Reactant.RNumber`. This fallback fires when Reactant is not loaded or the
+# active argument was not traced.
+_reactant_compile_ad(::Val, ::PreparedADKernel, marker, args...; kwargs...) =
+    throw(ArgumentError(
+        "Reactant-compiled AD requires the Reactant weak dependency (`using Reactant`) " *
+        "and a Reactant-traced active argument (e.g. `Reactant.to_rarray(active)`); " *
+        "the active argument is a $(typeof(marker))"))
+
+"""
+    compile_ad_gradient(prepared::PreparedADKernel, traced_args...; sync = true)
+
+Reactant/XLA-compile the gradient of a [`PreparedADKernel`](@ref) with respect to
+its one active HAVE port. `traced_args` are the selected HAVE values in authored
+order, already traced with `Reactant.to_rarray` (matching the primal Reactant
+path). Returns a compiled callable that accepts the same traced boundary and
+returns the gradient with respect to the active port; every inactive HAVE is
+held constant, exactly as on the native [`ad_gradient`](@ref) path.
+
+This is the AD analog of compiling the primal kernel with
+`@compile sync = true kernel(traced_args...)`. It is only possible where the
+primal kernel itself compiles through Reactant; where it does not, the underlying
+`@compile` error propagates unchanged.
+
+Requires the Reactant weak dependency to be loaded. The differentiation engine is
+the DifferentiationInterface backend passed to [`prepare_ad`](@ref).
+"""
+function compile_ad_gradient(prepared::PreparedADKernel, args...; sync::Bool = true)
+    _reactant_compile_ad(Val(:gradient), prepared,
+                         _reactant_ad_marker(prepared, args), args...; sync)
+end
+
+"""
+    compile_ad_value_and_gradient(prepared::PreparedADKernel, traced_args...; sync = true)
+
+Reactant/XLA-compile the scalar value and gradient of a [`PreparedADKernel`](@ref)
+together, mirroring the native [`ad_value_and_gradient!`](@ref) boundary. Returns
+a compiled callable that accepts the traced HAVE boundary in authored order and
+returns the `(value, gradient)` pair (a traced scalar and a traced gradient with
+respect to the active port). This is the sampler-facing surface: one compiled
+call yields both the potential and its gradient.
+
+Like [`compile_ad_gradient`](@ref), this requires the Reactant weak dependency,
+reuses the DifferentiationInterface backend from [`prepare_ad`](@ref), and only
+compiles where the primal kernel itself compiles through Reactant.
+"""
+function compile_ad_value_and_gradient(prepared::PreparedADKernel, args...; sync::Bool = true)
+    _reactant_compile_ad(Val(:value_and_gradient), prepared,
+                         _reactant_ad_marker(prepared, args), args...; sync)
+end
