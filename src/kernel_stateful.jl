@@ -783,6 +783,16 @@ function _kernel_endpoint_templates_expr(signature_inputs, recipe_stmts,
                                          methods::Vector{_KernelMethod}, mod::Module)
     endpoints = _KernelMethod[m for m in methods if _kernel_endpoint_candidate(m)]
     owner_names = _kernel_endpoint_owner_names(signature_inputs, recipe_stmts)
+    seen_endpoints = Set{Symbol}()
+    for endpoint in endpoints
+        endpoint.name in seen_endpoints && throw(ArgumentError(
+            "pure endpoint :$(endpoint.name) is defined more than once; " *
+            "transparent kernel objects require one distinguished return per endpoint name"))
+        push!(seen_endpoints, endpoint.name)
+        endpoint.name in owner_names && throw(ArgumentError(
+            "pure endpoint :$(endpoint.name) collides with an owner port of the same name; " *
+            "rename either the port or the endpoint explicitly"))
+    end
     binding_names = _kernel_endpoint_binding_names(endpoints, owner_names)
     residual_owner_names = Symbol[n for n in owner_names if !(n in binding_names)]
     endpoint_names = Set(m.name for m in endpoints)
@@ -922,7 +932,14 @@ function Base.show(io::IO, skel::_StatefulKernelSkeleton)
           " method(s), ", length(kernel_endpoint_names(skel)), " pure endpoint(s))")
 end
 
-"A transparently kernel-bound specialization of a method-bearing object."
+"""
+    KernelObjectSpec
+
+A transparent specialization produced by binding kernel-valued ports of a
+method-bearing `@kernel` object. Pure endpoint properties such as
+`normal.logpdf` are ordinary [`KernelSpec`](@ref) views; use [`extract`](@ref)
+to choose any other named HAVE/WANT cut.
+"""
 struct KernelObjectSpec{S,B}
     skeleton::S
     bindings::B

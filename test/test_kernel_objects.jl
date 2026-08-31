@@ -71,6 +71,15 @@ end
     @test !occursin("KernelSpec", sprint(show,
         code_expr(plan(F.nested_normal_logpdf))))
 
+    @test_throws ArgumentError @macroexpand @kernel duplicate_endpoints() = begin
+        endpoint(x::Float64)::Float64 = x
+        endpoint(y::Float64)::Float64 = y
+    end
+    @test_throws ArgumentError @macroexpand @kernel colliding_endpoint(x::Float64) = begin
+        endpoint::Float64 = x + 1
+        endpoint(y::Float64)::Float64 = y
+    end
+
     @testset "ordinary and alternate location-scale cuts" begin
         outputs_of(p) = [only(recipe.outputs).name for recipe in p.recipes]
         scale_plan = plan(F.normal.logpdf;
@@ -194,4 +203,9 @@ end
         @test_throws PlanningError plan(repeated_effect)
         @test calls[] == 0
     end
+
+    docs = read(joinpath(@__DIR__, "..", "docs", "src", "index.md"), String)
+    @test occursin("@kernel normal = location_scale(standard_normal)", docs)
+    @test occursin("logdensity::Float64 = normal.logpdf(x)", docs)
+    @test occursin("have = (:x, :location, :log_scale), want = :logpdf", docs)
 end

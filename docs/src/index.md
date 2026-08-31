@@ -89,10 +89,10 @@ rejected.
 
 This function-shaped form describes a graph, not a new object type. Compiled
 reactive state lets you change inputs in place through `set!`, `mutate!`, and
-`touch!`. A `@kernel` that contains its own inner methods is handled by a
-separate, stricter compiler: it reads the method source directly and only allows
-calls whose effects it can account for, so it is not an ordinary stateless
-recipe.
+`touch!`. A `@kernel` that contains its own inner methods can expose pure,
+straight-line methods as transparent endpoints. Methods with mutation or control
+flow remain on the separate, stricter stateful compiler: it reads their source
+directly and only allows calls whose effects it can account for.
 The [compiler capability and limits](compiler.md) page covers the full planning,
 code-generation, state, control-flow, NUTS, and rejection rules.
 
@@ -153,6 +153,70 @@ constructed.
 The dedicated [Bijectors and constrained parameters](bijectors.md) page applies
 this composition rule to reusable support transforms, shows parameters-only and
 Jacobian-only pruning, and renders the resulting fused model DAG.
+
+## Author transparent kernel objects
+
+Inner methods give related kernels one concise, named home. This location-scale
+kernel binds a standard distribution once and keeps its natural public boundary
+at `(location, scale)`:
+
+```julia
+@kernel standard_normal() = begin
+    logpdf(z::Float64)::Float64 = -0.5 * log(2π) - 0.5z^2
+end
+
+@kernel location_scale(standard, location::Float64, scale::Float64) = begin
+    log_scale::Float64 = log(scale)
+    scale::Float64 = exp(log_scale)
+
+    standardized(x::Float64)::Float64 = (x - location) / scale
+    inv(standardized, z::Float64)::Float64 = location + scale * z
+
+    logpdf(x::Float64)::Float64 = begin
+        z::Float64 = standardized(x)
+        standard.logpdf(z) - log_scale
+    end
+end
+
+@kernel normal = location_scale(standard_normal)
+```
+
+The endpoint is both directly preparable and naturally composable in another
+authored kernel:
+
+```julia
+normal_logpdf = prepare(normal.logpdf)
+normal_logpdf(0.0, 2.0, 1.0)  # location, scale, x
+
+@kernel model(x::Float64, location::Float64, scale::Float64) = begin
+    logdensity::Float64 = normal.logpdf(x)
+end
+```
+
+`normal.logpdf(x)` requests the endpoint's one distinguished result and splices
+the same transparent graph path as any other nested kernel call. Its residual
+owner ports, `location` and `scale`, connect by name; `x` is the explicit method
+argument. No object call or graph traversal remains in the prepared function.
+
+Named relations stay available as alternate cuts. Here `scale = exp(log_scale)`
+and `log_scale = log(scale)` are ordinary bidirectional recipes: the natural
+constructor has `scale`, while this view starts from `log_scale` instead:
+
+```julia
+from_log_scale = extract(normal;
+    have = (:x, :location, :log_scale), want = :logpdf)
+```
+
+If both sides are in `have`, the planner treats both as authoritative and runs
+neither conversion. `inv(standardized, z)` is an explicit authored inverse edge,
+not symbolic inversion. Joint extraction such as
+`want = (:logpdf, :standardized)` shares the same standardized value
+automatically; separately authored or effectful work is never merged merely
+because its expressions look alike.
+
+`extract` returns an ordinary `KernelSpec`, so `prepare`, `plate`, `ReactiveState`,
+and the optional `prepare_nonallocating` path apply without an object-specific
+runtime.
 
 ## See the selected DAG
 
