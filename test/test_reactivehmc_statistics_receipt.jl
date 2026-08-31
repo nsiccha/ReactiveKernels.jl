@@ -1,4 +1,5 @@
 using ReactiveKernels
+using ReactiveKernelsNUTSExamples
 using Test
 import TOML
 
@@ -8,7 +9,7 @@ include(joinpath(@__DIR__, "..", "benchmark", "receipts",
 const _StatsPoint = @NamedTuple{pos::Vector{Float64},
                                 dham_dpos::Vector{Float64}, pot::Float64}
 
-struct _StatisticsReceiptState <: ReactiveKernels.AbstractNUTSState
+struct _StatisticsReceiptState <: ReactiveKernelsNUTSExamples.AbstractNUTSState
     go_forward::Bool
     fwd::_StatsPoint
     energy_error::Float64
@@ -18,11 +19,11 @@ struct _StatisticsReceiptState <: ReactiveKernels.AbstractNUTSState
     acceptance_rate::Float64
 end
 
-ReactiveKernels._traj_fwd_pos(state::_StatisticsReceiptState) = state.fwd.pos
-ReactiveKernels._traj_fwd_dpos(state::_StatisticsReceiptState) =
+ReactiveKernelsNUTSExamples._traj_fwd_pos(state::_StatisticsReceiptState) = state.fwd.pos
+ReactiveKernelsNUTSExamples._traj_fwd_dpos(state::_StatisticsReceiptState) =
     state.fwd.dham_dpos
-ReactiveKernels._traj_fwd_pot(state::_StatisticsReceiptState) = state.fwd.pot
-ReactiveKernels.diagnostics(state::_StatisticsReceiptState) =
+ReactiveKernelsNUTSExamples._traj_fwd_pot(state::_StatisticsReceiptState) = state.fwd.pot
+ReactiveKernelsNUTSExamples.diagnostics(state::_StatisticsReceiptState) =
     (; acceptance_rate=state.acceptance_rate)
 
 _stats_point(pos, dham_dpos, pot) =

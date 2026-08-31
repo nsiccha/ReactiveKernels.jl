@@ -16,7 +16,10 @@ ReactiveKernelsBatchingExamples = "00050de8-5ab0-44ad-ad08-8f6b0ddc01dd"
 ReactiveKernelsCompatibilityExamples = "b8c154ef-4cb8-413d-9282-0e653aa014e1"
 ReactiveKernelsDistributionKernels = "4b169cd9-fc12-43fd-ba39-43e54ed8db7a"
 ReactiveKernelsKernelExamples = "c1a917b0-63b1-4b16-afa9-60dbf16f95f3"
+ReactiveKernelsHMCDiagnostics = "7283f29e-af9b-44bd-b98f-4e6318e8ac2b"
+ReactiveKernelsNUTSExamples = "1bd07bcb-ec6f-4af5-8d58-21805f68d06f"
 ReactiveKernelsPPLExamples = "a4d4be3d-45c5-49cc-80d7-34e606a16bce"
+ReactiveKernelsStreamingStats = "fe060097-a659-4245-b1df-751eb37b739a"
 Treebars = "e1e568c4-3a56-40a4-95fa-9b9c6c16fccb"
 
 [sources.ReactiveKernels]
@@ -34,5 +37,14 @@ path = "../packages/ReactiveKernelsDistributionKernels"
 [sources.ReactiveKernelsKernelExamples]
 path = "../packages/ReactiveKernelsKernelExamples"
 
+[sources.ReactiveKernelsHMCDiagnostics]
+path = "../packages/ReactiveKernelsHMCDiagnostics"
+
+[sources.ReactiveKernelsNUTSExamples]
+path = "../packages/ReactiveKernelsNUTSExamples"
+
 [sources.ReactiveKernelsPPLExamples]
 path = "../packages/ReactiveKernelsPPLExamples"
+
+[sources.ReactiveKernelsStreamingStats]
+path = "../packages/ReactiveKernelsStreamingStats"

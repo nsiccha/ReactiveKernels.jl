@@ -1150,8 +1150,8 @@ function _compile_native_ensure(pf::_PreparedFactory,::Type{OW},::Type{SH},field
     _exec_ensure!(stmts,c,current,stale,plan,producer,hidx,OW,SH;recipe_hook=hook)
     ret=_pp_read(plan,c)
     builder.instrumented ?
-        compile(:((owned,shared,handles,scratch)->$(Expr(:block,stmts...,:(return $ret))))) :
-        compile(:((owned,shared,handles)->$(Expr(:block,stmts...,:(return $ret)))))
+        _nuts_compile(:((owned,shared,handles,scratch)->$(Expr(:block,stmts...,:(return $ret))))) :
+        _nuts_compile(:((owned,shared,handles)->$(Expr(:block,stmts...,:(return $ret)))))
 end
 
 function _native_demanded_fields(pf,skel)
@@ -1198,7 +1198,7 @@ function _compile_native_metric_update(pf::_PreparedFactory,::Type{OW},::Type{SH
     end
     args=Mode===:instrumented ? :((owned,shared,handles,scratch,new_metric)) :
                                 :((owned,shared,handles,new_metric))
-    compile(:($args -> $(Expr(:block,stmts...,:(return owned)))))
+    _nuts_compile(:($args -> $(Expr(:block,stmts...,:(return owned)))))
 end
 
 struct _NutsRefreshBodyMarker{RefreshT} end

@@ -1,4 +1,5 @@
 using TOML
+import ReactiveKernelsNUTSExamples
 
 @testset "package boundary — generic RK core, external NUTS exemplar" begin
     srcdir = joinpath(pkgdir(ReactiveKernels), "src")
@@ -49,6 +50,7 @@ using TOML
     @test isfile(joinpath(pkgdir(ReactiveKernels), "examples", "nuts_runtime.jl"))
     for file in ("kernel_factory.jl", "kernel_codegen.jl", "kernel_nuts.jl",
                  "kernel_nuts_native.jl", "hmc.jl", "reactive_nuts.jl")
-        @test isfile(joinpath(pkgdir(ReactiveKernels), "examples", "nuts_runtime", file))
+        @test isfile(joinpath(pkgdir(ReactiveKernelsNUTSExamples), "src",
+                              "nuts_runtime", file))
     end
 end

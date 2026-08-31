@@ -19,7 +19,7 @@ a prepared kernel.
 > MutatingFunctions-backed non-allocating preparation path and an optional
 > Reactant extension for traceable mathematical kernels and whole-kernel
 > replicas. The optional external
-> [adaptive-NUTS exemplar](examples/nuts_runtime/kernel_nuts_reactant.jl) compiles
+> [adaptive-NUTS exemplar](packages/ReactiveKernelsNUTSExamples/src/nuts_runtime/kernel_nuts_reactant.jl) compiles
 > one full-depth transition to one data-dependent traced `while`, with
 > pre-generated momentum, direction, and exponential tensors plus explicit
 > counters, so there is no host RNG inside the trace. That acceptance path is

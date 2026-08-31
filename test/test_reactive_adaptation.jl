@@ -1,4 +1,5 @@
 using ReactiveKernels
+using ReactiveKernelsNUTSExamples
 using Test
 using Random
 using LinearAlgebra
@@ -185,7 +186,7 @@ end
     exp_pos = [100.0]; exp_dh = [0.0]
     function _drive!(stats, prepend, val)
         obj = getfield(stats, :object); gs = obj.state; h = obj.handles
-        col = ReactiveKernels._reserve_trajectory_column!(stats, prepend)
+        col = ReactiveKernelsNUTSExamples._reserve_trajectory_column!(stats, prepend)
         ReactiveKernels.mutate!(gs, h.position_storage) do s; s[:, col] .= val; s; end
         ReactiveKernels.mutate!(gs, h.gradient_storage) do s; s[:, col] .= -val; s; end
         if prepend
@@ -326,7 +327,7 @@ end
     _wr_pot(q) = sum(abs2, q) / 2
     D = 4; q0 = [sin(1.0i) for i in 1:D]
     metric = Matrix{Float64}(I, D, D)
-    oracle = ReactiveKernels._oracle_nuts_state(
+    oracle = ReactiveKernelsNUTSExamples._oracle_nuts_state(
         euclidean_phasepoint(_wr_pot, _wr_valgrad, metric, copy(q0), zeros(D));
         rng = Xoshiro(321), step_f = partial(leapfrog!; stepsize = 0.5), max_depth = 6)
     compiled = nuts_state(reactive_nuts_group(_wr_grad!, metric, copy(q0), zeros(D));
@@ -343,7 +344,8 @@ end
 @testset "warmup! window branch resets in place (static: no reconstruction)" begin
     # Durable static regression: the metric-window boundary must RESET the existing
     # adaptation/variance objects, never reconstruct them (the per-window recompile).
-    src = read(joinpath(pkgdir(ReactiveKernels), "examples", "nuts_runtime", "hmc.jl"), String)
+    src = read(joinpath(pkgdir(ReactiveKernelsNUTSExamples), "src",
+                        "nuts_runtime", "hmc.jl"), String)
     lo = findfirst("iteration == window_ends[next_window]", src)
     hi = findnext("next_window += 1", src, last(lo))
     window_branch = src[first(lo):last(hi)]

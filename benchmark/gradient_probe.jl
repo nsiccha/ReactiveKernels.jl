@@ -24,7 +24,10 @@ function _run()
     mktempdir(prefix = "rk-gradient-probe-") do env
         Pkg.activate(env)
         Pkg.add(Pkg.PackageSpec(url = "https://github.com/nsiccha/MutatingFunctions.jl", rev = _MF_REV))
-        Pkg.develop(path = root)
+        Pkg.develop([
+            Pkg.PackageSpec(path = root),
+            Pkg.PackageSpec(path = joinpath(root, "packages", "ReactiveKernelsNUTSExamples")),
+        ])
         Pkg.add([
             Pkg.PackageSpec(name = "DifferentiationInterface", version = v"0.7.21"),
             Pkg.PackageSpec(name = "Enzyme", version = v"0.13.199")])
@@ -40,6 +43,7 @@ function _inner()
         using DifferentiationInterface
         import Enzyme
         using ReactiveKernels
+        using ReactiveKernelsNUTSExamples
     end
     Base.include(@__MODULE__, joinpath(@__DIR__, "_gradient_probe_body.jl"))
 end
