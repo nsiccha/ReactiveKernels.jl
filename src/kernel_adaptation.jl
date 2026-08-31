@@ -2143,6 +2143,25 @@ function _sm_machine_domain_forest(ir::MethodIR, plan::_KernelPlan, fields,
                     push!(nodes, _DValue{tree})
                 end
             elseif statement isa _PlaceWrite
+                # Mutation-profile B whole-state `.=`.  A direct state root
+                # bound by a structured_state_port is an identity-preserving
+                # structural transfer, not NamedTuple/leaf broadcasting.
+                # Keep the source general enough for proposal indexing; exact
+                # source/destination type is checked by the copy domain.
+                if statement.dot && statement.target isa _SelfField &&
+                        length(statement.target.path) == 1 &&
+                        get(field_regs, only(statement.target.path), nothing) isa
+                            _StructuredStatePort
+                    destination = _sm_dtree(statement.target, plan, fields,
+                        OW, SH, finfo, ltrees, false, field_regs,
+                        methods_by_id, MethodId[ir.id])
+                    source = _sm_dtree(statement.rhs, plan, fields, OW, SH,
+                        finfo, ltrees, false, field_regs, methods_by_id,
+                        MethodId[ir.id])
+                    copy_domain = _DStructuredStateCopy{destination,source}
+                    push!(nodes, _DValue{copy_domain})
+                    continue
+                end
                 statement.root in (:self, :alias) && statement.owner !== nothing &&
                     length(statement.owner) == 1 || _sm_reject(
                         "state-machine write root `$(statement.root)` / owner " *
@@ -2568,6 +2587,19 @@ function compile_state_machine_method(pf::_PreparedFactory, ::Type{OW},
         role === :owned || _sm_reject(
             "state-machine writes shared authority `$name`")
         root_type = _pp_fieldtype(plan, canon, OW, SH)
+
+        if statement.dot && statement.target isa _SelfField &&
+                length(statement.target.path) == 1 &&
+                get(field_regs, name, nothing) isa _StructuredStatePort
+            source = _sm_rhs(statement.rhs, block_syms, plan, fields, OW, SH,
+                formals, block_locals, false, field_regs)
+            port = :(getfield(getfield(handles, :ports), $(QuoteNode(name))))
+            value = :(_sm_structured_copy($port, $source))
+            dependents = invalidate!(destination, (canon,))
+            push!(destination, :(_canon_set!(owned, Val($slot), $value)))
+            repair!(destination, (canon,), dependents)
+            return nothing
+        end
 
         rhs = _sm_rhs(statement.rhs, block_syms, plan, fields, OW, SH,
                       formals, block_locals, statement.dot, field_regs)
@@ -5586,6 +5618,18 @@ function _functional_state_machine_method(
         role, _ = kernel_plan_field(plan, canon)
         role === :owned || _sm_reject(
             "functional state-machine writes shared authority `$name`")
+        if statement.dot && statement.target isa _SelfField &&
+                length(statement.target.path) == 1 &&
+                get(field_regs, name, nothing) isa _StructuredStatePort
+            source = rhs(statement.rhs, local_syms, local_types, active, false)
+            old = base_syms[(:field, name)]
+            port = :(getfield(ports, $(QuoteNode(name))))
+            candidate = :(_sm_structured_copy($port, $source))
+            set_field!(name, :(_sm_structured_predicated_select(
+                $port, $active, $candidate, $old)))
+            repair_after!((canon,), active)
+            return nothing
+        end
         value = rhs(statement.rhs, local_syms, local_types, active,
                     statement.dot)
         old = base_syms[(:field, name)]

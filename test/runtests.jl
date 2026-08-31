@@ -42,6 +42,7 @@ const _MATRIX_CORE_TESTS = (
     "test_kernel_control_regressions.jl",
     "test_kernel_nuts.jl",
     "test_kernel_nuts_native.jl",
+    "test_mutation_profile_b.jl",
     "test_nuts_docs_fixture.jl",
     "test_reactivehmc_algorithm_corpus.jl",
     "test_reactivehmc_corpus_docs.jl",

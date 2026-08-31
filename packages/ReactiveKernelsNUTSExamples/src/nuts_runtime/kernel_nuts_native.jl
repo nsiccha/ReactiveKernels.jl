@@ -738,7 +738,8 @@ function _nn_endpoint_write(W::Type{<:_NNPlaceWrite}, C::_NativeEmitCtx,
     push!(effects,
         Expr(:call, GlobalRef(Base, :materialize!), destination, rhs),
         Expr(:call, GlobalRef(@__MODULE__, :_canon_bless!), endpoint,
-            :(Val($target_slot))))
+            :(Val($target_slot))),
+        destination)
     body = Expr(:block, effects...)
     Expr(:let, Expr(:(=), endpoint, endpoint_expr),
         Expr(:let, Expr(:(=), rhs, rhs_expr), body))
@@ -747,14 +748,23 @@ end
 function _nn_write(W::Type{<:_NNPlaceWrite},C::_NativeEmitCtx; rhs_override=nothing)
     T,Root,Owner,Alias,R,Dot=W.parameters
     rhs = rhs_override === nothing ? _nn_val(R,C) : rhs_override
+    # Same typed whole-endpoint distinction as the MethodIR emitter. Numeric
+    # and leaf broadcasts remain Base.materialize! writes below.
+    if Dot && _nn_kind(T, C) === :endpoint && _nn_kind(R, C) === :endpoint
+        return Expr(:call, GlobalRef(@__MODULE__, :_canon_copy_endpoint!),
+                    _nn_val(T, C), rhs)
+    end
     if T <: _NNSelfField && length(T.parameters[1])==1
         f=T.parameters[1][1]
         if _is_diag(f)
+            Dot && _native_reject("broadcast write to diagnostic `$f` is unsupported")
             set=Expr(:call,GlobalRef(@__MODULE__,:_diag_set_value!),
                      Expr(:call,GlobalRef(Core,:getfield),C.frame,QuoteNode(:diag)),:(Val($(_diag_index(f)))),rhs)
             return f===:dham ? Expr(:block,set,Expr(:call,GlobalRef(@__MODULE__,:_nuts_produce_diverged!),C.frame)) : set
         end
-        return Expr(:(=),Expr(:.,C.frame,QuoteNode(f)),rhs)
+        destination = Expr(:.,C.frame,QuoteNode(f))
+        return Dot ? Expr(:call,GlobalRef(Base,:materialize!),destination,_nn_rhs_dot(R,C)) :
+                     Expr(:(=),destination,rhs)
     end
     endpoint = _nn_endpoint_write_target(T, C)
     endpoint === nothing || return _nn_endpoint_write(W, C, endpoint...; rhs_override)
@@ -806,7 +816,17 @@ function _nn_stmt(T::Type,C::_NativeEmitCtx)
         rhs=Any[_nn_val(w.parameters[5],C) for w in W]
         Expr(:(=),Expr(:tuple,lhs...),Expr(:tuple,rhs...))
     elseif T <: _NNWriteReturn
-        W=T.parameters[1]; W.parameters[6] && _native_reject("broadcast set-return unsupported")
+        W=T.parameters[1]
+        if W.parameters[6]
+            # Julia's `return destination .= rhs` mutates once and returns the
+            # destination, not the broadcasted RHS. Reuse the ordinary dotted
+            # write lowering and bind its destination-valued result, so even a
+            # computed destination is evaluated only once. State methods still
+            # retain their frame-return ABI.
+            tmp = :__nn_writeret_destination
+            result = C.value_method ? tmp : C.frame
+            return Expr(:let, Expr(:(=),tmp,_nn_write(W,C)), Expr(:return,result))
+        end
         # One lexical temporary makes the contract explicit: evaluate RHS once, write it, then RETURN now.
         tmp=:__nn_writeret_value; rhs=_nn_val(W.parameters[5],C)
         Expr(:let,Expr(:(=),tmp,rhs),Expr(:block,_nn_write(W,C;rhs_override=tmp),
