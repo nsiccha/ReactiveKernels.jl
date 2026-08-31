@@ -1,5 +1,9 @@
 # Automatic differentiation
 
+```@eval
+Main.ReactiveKernelsDocs.render_result_assets()
+```
+
 ReactiveKernels exposes automatic differentiation through
 `DifferentiationInterface`. The package owns the prepared-kernel boundary, not
 a concrete differentiation engine: Enzyme is an optional test and example
@@ -91,6 +95,70 @@ The resulting gradient is checked against the analytic score
 prepared plan executed during this docs build; it is not a parallel
 illustrative copy.
 
+## Distribution gradient latency and allocation
+
+The following receipt reuses exactly the three benchmark inventories on the
+[Distribution kernels](distributions.md) page: the Normal plate sizes, all seven
+scalar-gallery families and sizes, and the covariance-Cholesky MVN sizes. AR(1)
+remains outside this benchmark for the same reason it is absent there. This is
+deliberately a distribution-only allocation claim; the broader bijector and PPL
+coverage below remains correctness evidence.
+
+Continuous scalar families, Normal, and MVN differentiate the observation port
+`x`. Bernoulli and Geometric differentiate their scalar logit ports because
+integer observations cannot be active. Each row is checked against an analytic
+gradient before timing.
+
+```@eval
+Main.ReactiveKernelsDocs.render_distribution_gradient_benchmarks()
+```
+
+Every cell is the median of five minimum-time measurements after preparation.
+The two timing series perform different documented work: `ad_gradient` returns
+the gradient only and owns any vector it returns;
+`ad_value_and_gradient!` computes both the value and gradient while filling a
+caller-owned vector. Scalar logit gradients are returned as isbits `Float64`
+values, so no mutable destination is needed. The checked-in
+[gradient benchmark receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/distribution-gradient-v1.toml)
+retains all raw times, allocation bytes/counts, analytic errors, source-receipt
+links, and exact package pins.
+
+## Eight Schools model gradient matrix
+
+This is the AD-only companion to the
+[Eight Schools primal matrix](eight-schools.md). It prepares scalar selections
+of that page's exact published
+[`eight_schools.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsPPLExamples/src/eight_schools.jl)
+graph; no prior, likelihood, transform, or distribution formula is copied into
+an AD-specific RK evaluator. The optimized Turing model and manual Julia control
+are loaded from the primal benchmark authority as well.
+
+```@eval
+Main.ReactiveKernelsDocs.render_eight_schools_ad_benchmarks()
+```
+
+The four scalar gradient cells are the packed unconstrained joint, prior, and
+likelihood plus the minimal θ-only likelihood. Each uses a prepared,
+caller-owned value-and-gradient path and is checked against central finite
+differences before timing. The constrained parameter object is not a supported
+active storage type for the public RK AD boundary. Pointwise output remains
+blank because neither compared public surface offers a useful matched
+Jacobian/VJP contract; the benchmark does not invent a fused pointwise-plus-total
+surrogate.
+
+The checked-in
+[Eight Schools AD receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/eight-schools-ad-v1.toml)
+retains ten raw rounds, source and primal-receipt pins, parity errors,
+preparation/first-execution costs, and steady-state timing and allocation data.
+Reproduce and validate it with:
+
+```sh
+julia --startup-file=no benchmark/eight_schools_ad_comparison.jl \
+  --output=benchmark/receipts/eight-schools-ad-v1.toml
+julia --startup-file=no benchmark/receipts/validate_eight_schools_ad.jl \
+  benchmark/receipts/eight-schools-ad-v1.toml
+```
+
 ## Owned storage, not borrowed caches
 
 Do not differentiate a `NonAllocatingKernel` whose recipe caches are borrowed
@@ -98,9 +166,9 @@ and overwritten on every call. A reverse pass needs the forward intermediates
 to remain valid until the backward pass consumes them, so cache reuse at that
 boundary can silently corrupt derivatives.
 
-For a zero-allocation derivative, keep the primal operation explicit and give
-DifferentiationInterface an owned `Cache` for its reusable batch buffer. The
-focused executable authority is
+When a derivative needs reusable batch storage, keep the primal operation
+explicit and give DifferentiationInterface an owned `Cache` for that buffer.
+The focused executable authority is
 [`packages/ReactiveKernelsBatchingExamples/test/test_batched_nonallocating.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsBatchingExamples/test/test_batched_nonallocating.jl).
 It checks the caller-owned buffer, the backend cache, the analytic score, and
 zero steady-state allocations. Reproduce that boundary from the repository

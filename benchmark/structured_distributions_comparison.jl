@@ -2,6 +2,8 @@
 
 module StructuredDistributionComparison
 
+include("distribution_benchmark_cases.jl")
+
 using BenchmarkTools
 using Dates
 using Distributions
@@ -17,10 +19,12 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
 using Statistics
 using TOML
 
+using .DistributionBenchmarkCases: STRUCTURED_SIZES, mvn_inputs
+
 using Reactant: @compile
 
 const PROBABILITY_MEASURES_SHA = "7cf3a6e112aaae2097b8d401b256d1bce635e03e"
-const DEFAULT_SIZES = (4, 16, 64, 128)
+const DEFAULT_SIZES = STRUCTURED_SIZES
 const DEFAULT_ROUNDS = 5
 
 function _evaluate_source(source)
@@ -60,19 +64,6 @@ function _measurement(f, args...; rounds::Int)
         "allocs" => allocs,
         "median_allocs" => Int(median(allocs)),
     )
-end
-
-function _mvn_inputs(n)
-    μ = collect(range(-0.4, 0.6; length = n))
-    x = μ .+ [0.7sin(0.31i) - 0.2cos(0.17i) for i in 1:n]
-    L = zeros(n, n)
-    for i in 1:n
-        L[i, i] = 0.9 + 0.002i
-        for j in 1:(i - 1)
-            L[i, j] = 0.04sin(0.13i + 0.29j) / sqrt(n)
-        end
-    end
-    (; x, μ, L)
 end
 
 function _package_version(name)
@@ -169,23 +160,24 @@ function run_benchmark()
 
     mvn_kernel = MVN_EXAMPLE.kernel
     for n in _sizes()
-        mvn = _mvn_inputs(n)
-        pm_mvn = ProbabilityMeasures.MvNormal(mvn.μ, mvn.L)
-        dist_mvn = Distributions.MvNormal(mvn.μ, Symmetric(mvn.L * mvn.L'))
-        mvn_reference = mvn_kernel(mvn.x, mvn.μ, mvn.L)
+        mvn = mvn_inputs(n)
+        pm_mvn = ProbabilityMeasures.MvNormal(mvn.μ, mvn.chol)
+        dist_mvn = Distributions.MvNormal(
+            mvn.μ, Symmetric(mvn.chol * mvn.chol'))
+        mvn_reference = mvn_kernel(mvn.x, mvn.μ, mvn.chol)
         mvn_values = (
             mvn_reference, _distributions_logpdf(dist_mvn, mvn.x),
             _pm_logdensity(pm_mvn, mvn.x),
         )
         all(value -> isapprox(value, mvn_reference; rtol = 1e-10),
             (mvn_values[2], mvn_values[3])) || error("MVN parity mismatch at n=$n")
-        rmx, rmμ, rmL = Reactant.to_rarray.((mvn.x, mvn.μ, mvn.L))
+        rmx, rmμ, rmL = Reactant.to_rarray.((mvn.x, mvn.μ, mvn.chol))
         mvn_compile_s = @elapsed mvn_compiled =
             _compile_rk_mvn(mvn_kernel, rmx, rmμ, rmL)
         baselines = _baseline_reactant!(support, errors, "mvnormal_cholesky",
                                         pm_mvn, dist_mvn, rmx, mvn_reference)
         row = _row("mvnormal_cholesky", n, mvn_reference, mvn_values,
-                   mvn_kernel, (mvn.x, mvn.μ, mvn.L),
+                   mvn_kernel, (mvn.x, mvn.μ, mvn.chol),
                    mvn_compiled, (rmx, rmμ, rmL),
                    pm_mvn, dist_mvn, mvn.x, rmx, baselines, rounds)
         row["rk_reactant_compile_seconds"] = mvn_compile_s

@@ -22,6 +22,9 @@ end
                  "distributions_comparison.jl",
                  "scalar_distribution_gallery_comparison.jl",
                  "structured_distributions_comparison.jl",
+                 "distribution_gradients.jl",
+                 "eight_schools_ad_comparison.jl",
+                 "eight_schools_ad_comparison_body.jl",
                  "eight_schools_reactant_comparison.jl",
                  "eight_schools_reactant_comparison_body.jl",
                  "nuts_reactant_comparison.jl",
@@ -33,12 +36,23 @@ end
                  joinpath("receipts", "validate_distributions.jl"),
                  joinpath("receipts", "validate_scalar_gallery_distributions.jl"),
                  joinpath("receipts", "validate_structured_distributions.jl"),
+                 joinpath("receipts", "validate_distribution_gradients.jl"),
+                 joinpath("receipts", "validate_eight_schools_ad.jl"),
                  joinpath("receipts", "validate_eight_schools_reactant.jl"))
-
         path = joinpath(_BENCH_DIR, name)
         @test isfile(path)
         @test _parses(path)
     end
+end
+
+@testset "Eight Schools AD benchmark receipt validates" begin
+    validator = joinpath(
+        _BENCH_DIR, "receipts", "validate_eight_schools_ad.jl")
+    receipt = joinpath(
+        _BENCH_DIR, "receipts", "eight-schools-ad-v1.toml")
+    @test isfile(receipt)
+    include(validator)
+    @test isempty(validate_eight_schools_ad_receipt(receipt))
 end
 
 @testset "Eight Schools Reactant benchmark receipt validates" begin
@@ -95,6 +109,16 @@ end
     @test isfile(receipt)
     include(validator)
     @test isempty(validate_distribution_receipt(receipt))
+end
+
+@testset "distribution gradient benchmark receipt validates" begin
+    validator = joinpath(
+        _BENCH_DIR, "receipts", "validate_distribution_gradients.jl")
+    receipt = joinpath(
+        _BENCH_DIR, "receipts", "distribution-gradient-v1.toml")
+    @test isfile(receipt)
+    include(validator)
+    @test isempty(validate_distribution_gradient_receipt(receipt))
 end
 
 @testset "reproducibility guard: attached rejected, detached accepted, dirty rejected" begin
