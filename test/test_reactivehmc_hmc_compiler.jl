@@ -559,7 +559,7 @@ end
 
     effect_source = _EffectSource(0)
     unwrapped_effect_hits = Ref(0)
-    unwrapped_effect = ReactiveKernels.effect_callable_port(
+    unwrapped_effect = ReactiveKernels.effect_lowering_port(
         effect_source, Tuple{ReactiveKernels.StatefulStateValue}, Nothing;
         initial_effect_state=0,
         functional_lowering=(effect, state) -> begin
@@ -578,7 +578,7 @@ end
     @test unwrapped_effect_hits[] == 0
 
     configured = _ConfiguredEffect([2])
-    port = ReactiveKernels.effect_callable_port(
+    port = ReactiveKernels.effect_lowering_port(
         effect_source, Tuple{ReactiveKernels.StatefulStateValue}, Nothing;
         initial_effect_state=0,
         functional_lowering=ReactiveKernels.total_functional_lowering(
@@ -590,7 +590,7 @@ end
     @test first_result.state.count == 1
     second_result = program.transition(
         first_result.state, true; effects=first_result.effects)
-    @test second_result.effects.callback == 4
+    @test second_result.effects.callback == 2
     @test second_result.state.count == 2
 
     # Mutating the authoring metadata after functionalization changes the
@@ -606,7 +606,7 @@ end
     @test typeof(counterfeit) === typeof(program.snapshot)
     @test_throws ArgumentError program.transition(counterfeit, true)
 
-    wrong_result = ReactiveKernels.effect_callable_port(
+    wrong_result = ReactiveKernels.effect_lowering_port(
         effect_source, Tuple{ReactiveKernels.StatefulStateValue}, Nothing;
         initial_effect_state=0,
         functional_lowering=ReactiveKernels.total_functional_lowering(
@@ -617,7 +617,7 @@ end
     @test_throws ArgumentError wrong_result_program.transition(
         wrong_result_program.snapshot, true)
 
-    wrong_effect = ReactiveKernels.effect_callable_port(
+    wrong_effect = ReactiveKernels.effect_lowering_port(
         effect_source, Tuple{ReactiveKernels.StatefulStateValue}, Nothing;
         initial_effect_state=0,
         functional_lowering=ReactiveKernels.total_functional_lowering(
@@ -628,7 +628,7 @@ end
     @test_throws ArgumentError wrong_effect_program.transition(
         wrong_effect_program.snapshot, true)
 
-    wrong_effect_shape = ReactiveKernels.effect_callable_port(
+    wrong_effect_shape = ReactiveKernels.effect_lowering_port(
         effect_source, Tuple{ReactiveKernels.StatefulStateValue}, Nothing;
         initial_effect_state=[0.0, 0.0],
         functional_lowering=ReactiveKernels.total_functional_lowering(
@@ -638,7 +638,7 @@ end
     @test_throws ArgumentError wrong_effect_shape_program.transition(
         wrong_effect_shape_program.snapshot, true)
 
-    wrong_arguments = ReactiveKernels.effect_callable_port(
+    wrong_arguments = ReactiveKernels.effect_lowering_port(
         effect_source, Tuple{ReactiveKernels.StatefulStateValue}, Nothing;
         initial_effect_state=0,
         functional_lowering=ReactiveKernels.total_functional_lowering(
@@ -650,7 +650,7 @@ end
     @test_throws ArgumentError wrong_arguments_program.transition(
         wrong_arguments_program.snapshot, true)
 
-    mutable_lowering = ReactiveKernels.effect_callable_port(
+    mutable_lowering = ReactiveKernels.effect_lowering_port(
         effect_source, Tuple{ReactiveKernels.StatefulStateValue}, Nothing;
         initial_effect_state=0,
         functional_lowering=ReactiveKernels.total_functional_lowering(
@@ -663,7 +663,7 @@ end
         mutable_kernel, Val(:step!); argument_types=Tuple{Bool})
 
     initial_array = [0]
-    array_port = ReactiveKernels.effect_callable_port(
+    array_port = ReactiveKernels.effect_lowering_port(
         effect_source, Tuple{ReactiveKernels.StatefulStateValue}, Nothing;
         initial_effect_state=initial_array,
         functional_lowering=ReactiveKernels.total_functional_lowering(
@@ -677,7 +677,7 @@ end
 
     effect_backing = [0.0]
     aliased_effect = (left=effect_backing, right=effect_backing)
-    alias_effect_port = ReactiveKernels.effect_callable_port(
+    alias_effect_port = ReactiveKernels.effect_lowering_port(
         effect_source, Tuple{ReactiveKernels.StatefulStateValue}, Nothing;
         initial_effect_state=aliased_effect,
         functional_lowering=ReactiveKernels.total_functional_lowering(
@@ -698,7 +698,7 @@ end
     @test_throws ArgumentError alias_effect_program.transition(
         alias_effect_program.snapshot, true; effects=broken_effects)
 
-    broken_effect_port = ReactiveKernels.effect_callable_port(
+    broken_effect_port = ReactiveKernels.effect_lowering_port(
         effect_source, Tuple{ReactiveKernels.StatefulStateValue}, Nothing;
         initial_effect_state=aliased_effect,
         functional_lowering=ReactiveKernels.total_functional_lowering(
@@ -709,7 +709,7 @@ end
         broken_effect_program.snapshot, true)
 
     distinct_effect = (left=[0.0], right=[0.0])
-    merged_effect_port = ReactiveKernels.effect_callable_port(
+    merged_effect_port = ReactiveKernels.effect_lowering_port(
         effect_source, Tuple{ReactiveKernels.StatefulStateValue}, Nothing;
         initial_effect_state=distinct_effect,
         functional_lowering=ReactiveKernels.total_functional_lowering(
@@ -724,7 +724,7 @@ end
     frozen_config = ReactiveKernels._sm_compiler_static_snapshot(config)
     @test frozen_config.left === frozen_config.right
     @test frozen_config.left !== config_backing
-    config_port = ReactiveKernels.effect_callable_port(
+    config_port = ReactiveKernels.effect_lowering_port(
         effect_source, Tuple{ReactiveKernels.StatefulStateValue}, Nothing;
         initial_effect_state=0,
         functional_lowering=ReactiveKernels.total_functional_lowering(
@@ -737,7 +737,7 @@ end
 
     sequential_backing = [0.0]
     sequential_effect = (left=sequential_backing, right=sequential_backing)
-    sequential_port = ReactiveKernels.effect_callable_port(
+    sequential_port = ReactiveKernels.effect_lowering_port(
         effect_source, Tuple{ReactiveKernels.StatefulStateValue}, Nothing;
         initial_effect_state=sequential_effect,
         functional_lowering=ReactiveKernels.total_functional_lowering(
@@ -757,7 +757,7 @@ end
     @test inactive_sequential.effects.callback.left == [0.0]
     @test inactive_sequential.state.count == 0
 
-    @test_throws ArgumentError ReactiveKernels.effect_callable_port(
+    @test_throws ArgumentError ReactiveKernels.effect_lowering_port(
         effect_source, Tuple{ReactiveKernels.StatefulStateValue}, Nothing;
         initial_effect_state=_EffectSource(0),
         functional_lowering=ReactiveKernels.total_functional_lowering(
@@ -932,7 +932,7 @@ end
         straight_state, [3.0])
 
     authority_source = _EffectSource(0)
-    authority_port = ReactiveKernels.effect_callable_port(
+    authority_port = ReactiveKernels.effect_lowering_port(
         authority_source,
         Tuple{ReactiveKernels.StatefulStateValue}, Nothing;
         initial_effect_state=nothing,
@@ -1004,15 +1004,6 @@ end
     @test lowering_candidate.result === nothing
     @test lowering_candidate.effect_state === nothing
 
-    stats_source = _RHMC_HMC_COMPILER.StatisticsRecorder(zeros(1), 0)
-    stats_source(program.snapshot)
-    stats_candidate = _RHMC_HMC_COMPILER.stats_lowering(
-        (errors=(0.0,), count=0), program.snapshot)
-    @test stats_candidate.result === nothing
-    @test stats_candidate.arguments == (program.snapshot,)
-    @test stats_candidate.effect_state.count == stats_source.count
-    @test only(stats_candidate.effect_state.errors) ==
-          only(stats_source.errors)
 end
 
 _hmc_receipt_numeric_matches(actual::Float64, expected) =
@@ -1060,7 +1051,7 @@ end
 
         result = compiled.transition(compiled.snapshot, compiled.replay)
         _assert_hmc_receipt(
-            _RHMC_HMC_COMPILER.result_values(result), case)
+            _RHMC_HMC_COMPILER.result_values(compiled, result), case)
         @test result.state.init.dpot === result.state.init.dham_dpos
         @test result.state.fwd.dpot === result.state.fwd.dham_dpos
         @test result.state.init.pos !== result.state.fwd.pos
@@ -1078,7 +1069,7 @@ end
     @test eltype(compiled.replay.normals) === Float32
     @test eltype(compiled.replay.exponentials) === Float64
     result = compiled.transition(compiled.snapshot, compiled.replay)
-    actual = _RHMC_HMC_COMPILER.result_values(result)
+    actual = _RHMC_HMC_COMPILER.result_values(compiled, result)
     _assert_hmc_receipt(actual, mixed)
     @test bitstring.(collect(actual.init_pos)) == mixed["init_pos_bits"]
     @test bitstring.(collect(actual.init_mom)) == mixed["init_mom_bits"]
@@ -1216,8 +1207,8 @@ end
     @test result.arguments[1].exponential_index ==
           exhausted.exponential_index
     @test result.state == compiled.snapshot
-    @test result.effects.stats_f.count == 0
-    @test all(iszero, result.effects.stats_f.errors)
+    @test result.outbox.stats_f.count == 0
+    @test !result.outbox.stats_f.overflow
 
     # Constructor validation is not the dynamic contract: mutable host tapes
     # and traced tape values must be checked at the exact consumed draw.
@@ -1231,7 +1222,7 @@ end
     @test invalid_exponential.control_overflow
     @test invalid_exponential.arguments[1].overflow
     @test invalid_exponential.state == compiled.snapshot
-    @test invalid_exponential.effects.stats_f.count == 0
+    @test invalid_exponential.outbox.stats_f.count == 0
 
     invalid_normals = copy(replay.normals)
     invalid_normal_replay = ReactiveKernels.OrderedRNGReplay(
@@ -1243,7 +1234,7 @@ end
     @test invalid_normal.control_overflow
     @test invalid_normal.arguments[1].overflow
     @test invalid_normal.state == compiled.snapshot
-    @test invalid_normal.effects.stats_f.count == 0
+    @test invalid_normal.outbox.stats_f.count == 0
 
     @test_throws ArgumentError ReactiveKernels.OrderedRNGReplay(
         reshape([0.1, -0.2], :, 1), Bool[], [0.5], (:normal,))

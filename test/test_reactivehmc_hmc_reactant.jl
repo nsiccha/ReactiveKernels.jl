@@ -279,8 +279,9 @@ _rhmc_ulp_distance(actual::T, expected::T) where {T<:AbstractFloat} =
     end
 end
 
-function _rhmc_hmc_host_values(result)
-    count = Int(result.effects.stats_f.count)
+function _rhmc_hmc_host_values(program, result)
+    ReactiveKernels.drain_observations!(program.transition, result)
+    count = program.stats_source.count
     (
         init_pos=Array(result.state.init.pos),
         init_mom=Array(result.state.init.mom),
@@ -290,8 +291,7 @@ function _rhmc_hmc_host_values(result)
         fwd_ham=Float64(result.state.fwd.ham),
         dham=Float64(result.state.dham),
         diverged=Bool(result.state.diverged),
-        energy_errors=Tuple(Float64(value)
-                            for value in result.effects.stats_f.errors[1:count]),
+        energy_errors=Tuple(program.stats_source.errors[1:count]),
         normal_calls=Int(result.arguments[1].normal_index) - 1,
         exponential_calls=Int(result.arguments[1].exponential_index) - 1,
         rng_event_calls=Int(result.arguments[1].event_index) - 1,
@@ -738,7 +738,7 @@ end
 
     source = _RHMCReactantEffectSource(:source)
     configuration = [2]
-    effect_port = ReactiveKernels.effect_callable_port(
+    effect_port = ReactiveKernels.effect_lowering_port(
         source, Tuple{ReactiveKernels.StatefulStateValue}, Nothing;
         initial_effect_state=0,
         functional_lowering=ReactiveKernels.total_functional_lowering(
@@ -758,7 +758,7 @@ end
         first_result.state, first_result.effects, take)
     @test Int(first_result.effects.callback) == 2
     @test Int(first_result.state.count) == 1
-    @test Int(second_result.effects.callback) == 4
+    @test Int(second_result.effects.callback) == 2
     @test Int(second_result.state.count) == 2
 
     counterfeit_source = merge(
@@ -783,7 +783,7 @@ end
         @compile pure_program.transition(pure_state, value, take)
     end
 
-    wrong_effect = ReactiveKernels.effect_callable_port(
+    wrong_effect = ReactiveKernels.effect_lowering_port(
         source, Tuple{ReactiveKernels.StatefulStateValue}, Nothing;
         initial_effect_state=0,
         functional_lowering=ReactiveKernels.total_functional_lowering(
@@ -804,7 +804,7 @@ end
     end
 
 
-    wrong_effect_shape = ReactiveKernels.effect_callable_port(
+    wrong_effect_shape = ReactiveKernels.effect_lowering_port(
         source, Tuple{ReactiveKernels.StatefulStateValue}, Nothing;
         initial_effect_state=[0.0, 0.0],
         functional_lowering=ReactiveKernels.total_functional_lowering(
@@ -824,7 +824,7 @@ end
     end
 
     initial_array_effect = [0]
-    array_effect = ReactiveKernels.effect_callable_port(
+    array_effect = ReactiveKernels.effect_lowering_port(
         source, Tuple{ReactiveKernels.StatefulStateValue}, Nothing;
         initial_effect_state=initial_array_effect,
         functional_lowering=ReactiveKernels.total_functional_lowering(
@@ -849,7 +849,7 @@ end
 
     effect_backing = [0.0]
     aliased_effect = (left=effect_backing, right=effect_backing)
-    alias_effect_port = ReactiveKernels.effect_callable_port(
+    alias_effect_port = ReactiveKernels.effect_lowering_port(
         source, Tuple{ReactiveKernels.StatefulStateValue}, Nothing;
         initial_effect_state=aliased_effect,
         functional_lowering=ReactiveKernels.total_functional_lowering(
@@ -885,7 +885,7 @@ end
     @test_throws ArgumentError guarded_alias_effect(
         alias_effect_state, broken_effects, take)
 
-    broken_alias_port = ReactiveKernels.effect_callable_port(
+    broken_alias_port = ReactiveKernels.effect_lowering_port(
         source, Tuple{ReactiveKernels.StatefulStateValue}, Nothing;
         initial_effect_state=aliased_effect,
         functional_lowering=ReactiveKernels.total_functional_lowering(
@@ -904,7 +904,7 @@ end
     end
 
     distinct_effect = (left=[0.0], right=[0.0])
-    merged_alias_port = ReactiveKernels.effect_callable_port(
+    merged_alias_port = ReactiveKernels.effect_lowering_port(
         source, Tuple{ReactiveKernels.StatefulStateValue}, Nothing;
         initial_effect_state=distinct_effect,
         functional_lowering=ReactiveKernels.total_functional_lowering(
@@ -925,7 +925,7 @@ end
     config_backing = [2]
     alias_config = _RHMC_FUNCTIONAL_REACTANT.AliasConfig(
         config_backing, config_backing)
-    alias_config_port = ReactiveKernels.effect_callable_port(
+    alias_config_port = ReactiveKernels.effect_lowering_port(
         source, Tuple{ReactiveKernels.StatefulStateValue}, Nothing;
         initial_effect_state=0,
         functional_lowering=ReactiveKernels.total_functional_lowering(
@@ -948,7 +948,7 @@ end
 
     sequential_backing = [0.0]
     sequential_effect = (left=sequential_backing, right=sequential_backing)
-    sequential_port = ReactiveKernels.effect_callable_port(
+    sequential_port = ReactiveKernels.effect_lowering_port(
         source, Tuple{ReactiveKernels.StatefulStateValue}, Nothing;
         initial_effect_state=sequential_effect,
         functional_lowering=ReactiveKernels.total_functional_lowering(
@@ -1028,7 +1028,7 @@ end
         else
             compiled(state, replay)
         end
-        actual = _rhmc_hmc_host_values(compiled_result)
+        actual = _rhmc_hmc_host_values(program, compiled_result)
 
         @test actual.init_pos ≈ case["init_pos"] atol=float_atol rtol=0
         @test actual.init_mom ≈ case["init_mom"] atol=float_atol rtol=0
@@ -1214,7 +1214,7 @@ end
             overflow = compiled(state, exhausted)
             @test Bool(overflow.control_overflow)
             @test Bool(overflow.arguments[1].overflow)
-            @test Int(overflow.effects.stats_f.count) == 0
+            @test Int(overflow.outbox.stats_f.count) == 0
             @test Array(overflow.state.init.pos) ==
                   Array(state.init.pos)
             @test Array(overflow.state.fwd.pos) ==
@@ -1229,7 +1229,7 @@ end
                 state, _rhmc_hmc_traced_replay(invalid_exponential_host))
             @test Bool(invalid_exponential.control_overflow)
             @test Bool(invalid_exponential.arguments[1].overflow)
-            @test Int(invalid_exponential.effects.stats_f.count) == 0
+            @test Int(invalid_exponential.outbox.stats_f.count) == 0
             @test Array(invalid_exponential.state.init.pos) ==
                   Array(state.init.pos)
             @test Array(invalid_exponential.state.fwd.pos) ==
@@ -1245,7 +1245,7 @@ end
                 state, _rhmc_hmc_traced_replay(invalid_normal_host))
             @test Bool(invalid_normal.control_overflow)
             @test Bool(invalid_normal.arguments[1].overflow)
-            @test Int(invalid_normal.effects.stats_f.count) == 0
+            @test Int(invalid_normal.outbox.stats_f.count) == 0
             @test Array(invalid_normal.state.init.pos) ==
                   Array(state.init.pos)
             @test Array(invalid_normal.state.fwd.pos) ==

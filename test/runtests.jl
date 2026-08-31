@@ -53,6 +53,7 @@ const _MATRIX_CORE_TESTS = (
 )
 
 const _MATRIX_ACCEPTANCE_TESTS = (
+    "test_effect_boundary.jl",
     "test_reactivehmc_hmc_compiler.jl",
     "test_finite_structural_container.jl",
     "test_compiler_docs.jl",
