@@ -16,7 +16,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      RK_RENDERED_DOCS_REPORT: ${{ runner.temp }}/rendered-docs-advisories.json
+      RK_RENDERED_DOCS_REPORT: rendered-docs-advisories.json
     steps:
       - uses: actions/checkout@v4
       - name: Configure git for private repos
@@ -70,6 +70,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rendered-docs-advisories
-          path: ${{ runner.temp }}/rendered-docs-advisories.json
+          path: rendered-docs-advisories.json
           if-no-files-found: error
           retention-days: 14
