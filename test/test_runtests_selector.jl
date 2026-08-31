@@ -3,6 +3,19 @@
     @test _select_test_files(["core", "acceptance"]) == _TEST_FILE_ORDER
     @test _select_test_files(["acceptance", "core"]) == _TEST_FILE_ORDER
 
+    acceptance_shards = map(
+        selector -> Set(_test_group_files(selector)),
+        _MATRIX_ACCEPTANCE_SHARD_GROUPS,
+    )
+    @test all(
+        isempty(intersect(acceptance_shards[i], acceptance_shards[j]))
+        for i in eachindex(acceptance_shards)
+        for j in (i + 1):length(acceptance_shards)
+    )
+    @test union(acceptance_shards...) == Set(_test_group_files("acceptance"))
+    @test _select_test_files(collect(_MATRIX_ACCEPTANCE_SHARD_GROUPS)) ==
+        _test_group_files("acceptance")
+
     @test _select_test_files(["test_stateful", "test_ad.jl"]) ==
         ("test_ad.jl", "test_stateful.jl")
     @test _select_test_files(["test_ad", "test_ad.jl", "ad"]) ==
@@ -20,7 +33,11 @@
     @test error isa ArgumentError
     message = sprint(showerror, error)
     @test occursin("unknown test selector(s): \"../test_ad.jl\", \"missing\"", message)
-    @test occursin("Known groups: core, acceptance, ad, benchmark", message)
+    @test occursin(
+        "Known groups: core, acceptance, acceptance-compiler, " *
+        "acceptance-runtime, acceptance-samplers, ad, benchmark",
+        message,
+    )
     @test occursin("Known files: test_package_boundary.jl", message)
 end
 
