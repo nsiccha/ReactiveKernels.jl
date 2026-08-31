@@ -4,6 +4,7 @@ using LinearAlgebra
 using Random
 using ReactiveKernels
 using ReactiveKernelsNUTSExamples
+using StableRNGs
 using Statistics
 using Test
 
@@ -267,7 +268,7 @@ end
         potential_gradient!, Diagonal(ones(10)), initial, zeros(10))
     state = nuts_state(
         group;
-        rng = Xoshiro(8008),
+        rng = StableRNG(8008),
         step_f = partial(leapfrog!; stepsize = 0.03),
         max_depth = 6,
     )
