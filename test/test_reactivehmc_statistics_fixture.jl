@@ -6,6 +6,9 @@ include(joinpath(@__DIR__, "..", "benchmark",
 
 const RHMC_STATISTICS = ReactiveHMCStatisticsFixture
 
+_normalize_source_newlines(source) =
+    replace(replace(source, "\r\n" => "\n"), '\r' => '\n')
+
 @testset "ReactiveHMC fixed-capacity statistics kernel source contract" begin
     skeleton = RHMC_STATISTICS.statistics_state
     registration = ReactiveKernels.kernel_registration(skeleton)
@@ -34,14 +37,20 @@ const RHMC_STATISTICS = ReactiveHMCStatisticsFixture
 
     source_path = joinpath(@__DIR__, "..", "benchmark",
                            "reactivehmc_statistics_kernel_fixture.jl")
-    source = read(source_path, String)
+    source = _normalize_source_newlines(read(source_path, String))
     @test occursin("column = go_forward ? first + count : first - 1", source)
     @test occursin("idxs[column] = count", source)
     @test findfirst("idxs[column] = count", source) <
           findfirst("count += 1", source)
     @test occursin("trajectory_overflow && return trajectory_overflow", source)
     @test occursin("reset_first < 1 || reset_first > trajectory_capacity", source)
-    @test occursin("sampling_overflow = true\n            return sampling_overflow", source)
+    sampling_overflow_source =
+        "sampling_overflow = true\n            return sampling_overflow"
+    @test occursin(sampling_overflow_source, source)
+    crlf_source = replace(source, "\n" => "\r\n")
+    @test !occursin(sampling_overflow_source, crlf_source)
+    @test occursin(
+        sampling_overflow_source, _normalize_source_newlines(crlf_source))
     @test occursin("min1exp(x) = x > zero(x) ? one(x) : exp(x)", source)
     @test occursin("acceptance_sum += min1exp(__self__, dhams[column])", source)
     @test occursin("acceptance_count = count > 1 ? count - 1 : 1", source)
