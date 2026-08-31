@@ -51,6 +51,32 @@ end
     @test ch[] == 2                  # now recomputed
 end
 
+@testset "dependent materializations survive collateral HAVE outputs" begin
+    g = Graph()
+    raw = value!(g, :raw, Float64)
+    parameters = value!(g, :parameters, Float64)
+    jacobian = value!(g, :jacobian, Float64)
+    checked = value!(g, :checked, Float64)
+    checked_calls = Ref(0)
+
+    # The first request takes the cheap parameters-only path. A later request
+    # needs `jacobian`, whose multi-output producer also names the already-valid
+    # `parameters` HAVE as a collateral output.
+    add!(g, raw => parameters, x -> x + 1.0; cost=1.0)
+    add!(g, raw => (parameters, jacobian), x -> (x + 1.0, 2x); cost=2.0)
+    add!(g, (parameters, jacobian) => checked,
+         (p, j) -> (checked_calls[] += 1; p + j))
+
+    st = ReactiveState(g; materialize=(parameters, checked))
+    set!(st, raw, 3.0)
+    @test get!(st, parameters) == 4.0
+
+    checked_calls[] = 0
+    first_checked = get!(st, checked)
+    @test get!(st, checked) == first_checked == 10.0
+    @test checked_calls[] == 1
+end
+
 @testset "14. materialization boundary: only nominated intermediates persist" begin
     g = Graph()
     x = value!(g, :x, Float64); a = value!(g, :a, Float64)
