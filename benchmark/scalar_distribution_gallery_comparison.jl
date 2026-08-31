@@ -13,7 +13,7 @@ using Random
 using Reactant
 using ReactiveKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
-    EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE
+    cauchy, laplace, bernoulli, lognormal, exponential, geometric, uniform
 using Statistics
 using TOML
 
@@ -22,27 +22,47 @@ using Reactant: @compile
 const PROBABILITY_MEASURES_SHA = "7cf3a6e112aaae2097b8d401b256d1bce635e03e"
 const DEFAULT_SIZES = (1_000, 100_000)
 const DEFAULT_ROUNDS = 5
-const FAMILIES = ("exponential_logscale", "geometric_logit", "uniform_bounded")
+const FAMILIES = (
+    "cauchy_location_scale",
+    "laplace_location_scale",
+    "bernoulli_logit",
+    "lognormal_logscale",
+    "exponential_logscale",
+    "geometric_logit",
+    "uniform_bounded",
+)
 
-function _evaluate_source(source)
-    sandbox = Module(gensym(:ScalarDistributionGalleryKernel), true, true)
-    Core.eval(sandbox, :(using ReactiveKernels))
-    parsed = Meta.parseall(source; filename = "scalar-distribution-gallery-kernel.jl")
-    expressions = parsed.head === :toplevel ? parsed.args : Any[parsed]
-    for expression in expressions
-        expression isa LineNumberNode && continue
-        Core.eval(sandbox, expression)
-    end
-    Core.eval(sandbox, :docs_example)
-end
+const RK_CAUCHY = plate(cauchy.logpdf;
+    have = (:x, :location, :scale), want = :logpdf, batched = (:x,))
+const RK_LAPLACE = plate(laplace.logpdf;
+    have = (:x, :location, :scale), want = :logpdf, batched = (:x,))
+const RK_BERNOULLI = plate(bernoulli.logpdf;
+    have = (:observed, :logit), want = :logpdf, batched = (:observed,))
+const RK_LOGNORMAL = plate(lognormal.logpdf;
+    have = (:x, :location, :log_scale), want = :logpdf, batched = (:x,))
+const RK_EXPONENTIAL = plate(exponential.logpdf;
+    have = (:x, :log_scale), want = :logpdf, batched = (:x,))
+const RK_GEOMETRIC = plate(geometric.logpdf;
+    have = (:observed, :logitp), want = :logpdf, batched = (:observed,))
+const RK_UNIFORM = plate(uniform.logpdf;
+    have = (:x, :lower, :upper), want = :logpdf, batched = (:x,))
 
-const EXPONENTIAL_EXAMPLE = _evaluate_source(EXPONENTIAL_SOURCE)
-const GEOMETRIC_EXAMPLE = _evaluate_source(GEOMETRIC_SOURCE)
-const UNIFORM_EXAMPLE = _evaluate_source(UNIFORM_SOURCE)
+rk_cauchy(xs, location, scale) = RK_CAUCHY(xs, location, scale)
+rk_laplace(xs, location, scale) = RK_LAPLACE(xs, location, scale)
+rk_bernoulli(observed, logit) = RK_BERNOULLI(observed, logit)
+rk_lognormal(xs, location, log_scale) = RK_LOGNORMAL(xs, location, log_scale)
+rk_exponential(xs, log_scale) = RK_EXPONENTIAL(xs, log_scale)
+rk_geometric(observed, logitp) = RK_GEOMETRIC(observed, logitp)
+rk_uniform(xs, lower, upper) = RK_UNIFORM(xs, lower, upper)
 
-rk_exponential(xs, log_scale) = EXPONENTIAL_EXAMPLE.plated(xs, log_scale)
-rk_geometric(observed, logitp) = GEOMETRIC_EXAMPLE.plated(observed, logitp)
-rk_uniform(xs, lower, upper) = UNIFORM_EXAMPLE.plated(xs, lower, upper)
+distributions_cauchy(xs, location, scale) =
+    sum(Distributions.logpdf.(Distributions.Cauchy(location, scale), xs))
+distributions_laplace(xs, location, scale) =
+    sum(Distributions.logpdf.(Distributions.Laplace(location, scale), xs))
+distributions_bernoulli(observed, logit) =
+    sum(Distributions.logpdf.(Distributions.Bernoulli(logistic(logit)), observed))
+distributions_lognormal(xs, location, log_scale) =
+    sum(Distributions.logpdf.(Distributions.LogNormal(location, exp(log_scale)), xs))
 
 distributions_exponential(xs, log_scale) =
     sum(Distributions.logpdf.(Distributions.Exponential(exp(log_scale)), xs))
@@ -51,6 +71,18 @@ distributions_geometric(observed, logitp) =
 distributions_uniform(xs, lower, upper) =
     sum(Distributions.logpdf.(Distributions.Uniform(lower, upper), xs))
 
+probability_measures_cauchy(xs, location, scale) = sum(
+    ProbabilityMeasures.logdensityof.(
+        ProbabilityMeasures.Cauchy(location, scale), xs))
+probability_measures_laplace(xs, location, scale) = sum(
+    ProbabilityMeasures.logdensityof.(
+        ProbabilityMeasures.Laplace(location, scale), xs))
+probability_measures_bernoulli(observed, logit) = sum(
+    ProbabilityMeasures.logdensityof.(
+        ProbabilityMeasures.Bernoulli(logistic(logit)), observed))
+probability_measures_lognormal(xs, location, log_scale) = sum(
+    ProbabilityMeasures.logdensityof.(
+        ProbabilityMeasures.LogNormal(location, exp(log_scale)), xs))
 probability_measures_exponential(xs, log_scale) = sum(
     ProbabilityMeasures.logdensityof.(
         ProbabilityMeasures.Exponential(exp(log_scale)), xs))
@@ -92,7 +124,62 @@ function _measurement(f, args...; rounds::Int)
 end
 
 function _family_case(family, n)
-    if family == "exponential_logscale"
+    if family == "cauchy_location_scale"
+        location, scale = -0.3, 1.1
+        xs = [location + scale * (0.04i - 2.0) for i in 1:n]
+        return (;
+            native = (xs, location, scale),
+            traced = (
+                Reactant.to_rarray(xs),
+                Reactant.to_rarray(location; track_numbers = true),
+                Reactant.to_rarray(scale; track_numbers = true),
+            ),
+            rk = rk_cauchy,
+            distributions = distributions_cauchy,
+            probability_measures = probability_measures_cauchy,
+        )
+    elseif family == "laplace_location_scale"
+        location, scale = 0.2, 0.8
+        xs = [location + scale * sin(0.019i) for i in 1:n]
+        return (;
+            native = (xs, location, scale),
+            traced = (
+                Reactant.to_rarray(xs),
+                Reactant.to_rarray(location; track_numbers = true),
+                Reactant.to_rarray(scale; track_numbers = true),
+            ),
+            rk = rk_laplace,
+            distributions = distributions_laplace,
+            probability_measures = probability_measures_laplace,
+        )
+    elseif family == "bernoulli_logit"
+        logit = -0.7
+        observed = [isodd(i * 5) for i in 1:n]
+        return (;
+            native = (observed, logit),
+            traced = (
+                Reactant.to_rarray(observed),
+                Reactant.to_rarray(logit; track_numbers = true),
+            ),
+            rk = rk_bernoulli,
+            distributions = distributions_bernoulli,
+            probability_measures = probability_measures_bernoulli,
+        )
+    elseif family == "lognormal_logscale"
+        location, log_scale = 0.2, log(0.9)
+        xs = [exp(location + exp(log_scale) * 0.7sin(0.013i)) for i in 1:n]
+        return (;
+            native = (xs, location, log_scale),
+            traced = (
+                Reactant.to_rarray(xs),
+                Reactant.to_rarray(location; track_numbers = true),
+                Reactant.to_rarray(log_scale; track_numbers = true),
+            ),
+            rk = rk_lognormal,
+            distributions = distributions_lognormal,
+            probability_measures = probability_measures_lognormal,
+        )
+    elseif family == "exponential_logscale"
         log_scale = log(1.3)
         xs = [0.05 + abs(sin(0.017i)) + 0.002(i % 11) for i in 1:n]
         return (;
@@ -268,6 +355,10 @@ function run_benchmark()
             "families" => collect(FAMILIES),
             "sizes" => collect(_sizes()),
             "formulas" => Dict(
+                "cauchy_location_scale" => "Cauchy with location and scale",
+                "laplace_location_scale" => "Laplace with location and scale",
+                "bernoulli_logit" => "Bernoulli from logit probability",
+                "lognormal_logscale" => "LogNormal from location and log scale",
                 "exponential_logscale" => "Exponential from log scale",
                 "geometric_logit" => "Geometric failures before success from logit p",
                 "uniform_bounded" => "Uniform with dynamic lower and upper endpoints",

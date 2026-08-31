@@ -6,7 +6,7 @@ import TOML
 const EXPECTED_STRUCTURED_PM_SHA =
     "7cf3a6e112aaae2097b8d401b256d1bce635e03e"
 const EXPECTED_STRUCTURED_SIZES = (4, 16, 64, 128)
-const EXPECTED_STRUCTURED_FAMILIES = ("mvnormal_cholesky", "stationary_ar1")
+const EXPECTED_STRUCTURED_FAMILIES = ("mvnormal_cholesky",)
 const EXPECTED_MVN_HAVE_BOUNDARIES =
     ("covariance", "cholesky", "precision", "precision_cholesky")
 

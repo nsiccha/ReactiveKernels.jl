@@ -6,7 +6,15 @@ import TOML
 const EXPECTED_SCALAR_GALLERY_PROBABILITY_MEASURES_SHA =
     "7cf3a6e112aaae2097b8d401b256d1bce635e03e"
 const EXPECTED_SCALAR_GALLERY_FAMILIES =
-    ("exponential_logscale", "geometric_logit", "uniform_bounded")
+    (
+        "cauchy_location_scale",
+        "laplace_location_scale",
+        "bernoulli_logit",
+        "lognormal_logscale",
+        "exponential_logscale",
+        "geometric_logit",
+        "uniform_bounded",
+    )
 const EXPECTED_SCALAR_GALLERY_SIZES = (1_000, 100_000)
 
 _scalar_gallery_median(values) = Statistics.median(Float64.(values))
@@ -136,7 +144,7 @@ function main(path)
     errors = validate_scalar_gallery_distribution_receipt(path)
     if isempty(errors)
         println("VALIDATE OK — scalar-distribution-gallery-v1: " *
-                "3 families × 2 sizes, RK+ProbabilityMeasures Reactant accepted")
+                "7 families × 2 sizes, RK+ProbabilityMeasures Reactant accepted")
         return 0
     end
     foreach(println, errors)
