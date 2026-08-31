@@ -150,6 +150,14 @@ end
     return sum(pointwise)
 end
 
+@kernel authored_ref_derived_sum(x, offsets) = begin
+    pointwise = plate(x, Ref(offsets .+ 1.0)) do value, atomic_offsets
+        result::Float64 = value + sum(atomic_offsets)
+        return result
+    end
+    return sum(pointwise)
+end
+
 _authored_plate_normal(x, location, scale) =
     -0.5 * log(2π) - log(scale) - 0.5 * ((x - location) / scale)^2
 _authored_plate_cauchy(x, location, scale) =
@@ -498,4 +506,19 @@ end
                 authored_eachrow_derived_sum.graph.recipes) == 1
     @test _authored_plate_head_count(code_expr(row_total), :for) == 1
     @test !occursin("for ", string(row_total.f.tensorized_ast))
+
+    values = [-1.0, 0.5, 2.0]
+    atomic_offsets = [0.25, 0.75]
+    atomic_reference = [
+        value + sum(atomic_offsets .+ 1.0) for value in values
+    ]
+    atomic_total = prepare(authored_ref_derived_sum)
+    atomic_pointwise = prepare(extract(authored_ref_derived_sum; want = :pointwise))
+    @test atomic_total(values, atomic_offsets) == sum(atomic_reference)
+    @test atomic_pointwise(values, atomic_offsets) == atomic_reference
+    @test count(recipe -> recipe.source == :(offsets .+ 1.0),
+                authored_ref_derived_sum.graph.recipes) == 1
+    @test _authored_plate_head_count(code_expr(atomic_total), :for) == 1
+    @test !occursin("similar", string(code_expr(atomic_total)))
+    @test !occursin("for ", string(atomic_total.f.tensorized_ast))
 end
