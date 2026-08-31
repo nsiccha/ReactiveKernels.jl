@@ -190,9 +190,14 @@ end
     pair = ReactiveKernels._DynamicEmbeddedFunctionPair{
         (1, 2),typeof(native_call),typeof(tensorized_call),Expr}(
             native_call, tensorized_call, Expr(:block))
+    typed_pair = ReactiveKernels._EmbeddedFunctionPair{
+        1,typeof(native_call),typeof(tensorized_call),Expr}(
+            native_call, tensorized_call, Expr(:block))
     backend_locations = _AuthoredPlateBackendArray(locations)
     @test pair((), xs, backend_locations) === :tensorized
     @test pair((), xs, locations) === :native
+    @test typed_pair((), xs, backend_locations) === :tensorized
+    @test typed_pair((), xs, locations) === :native
     zipped_reference = [
         _authored_plate_normal(xs[i], locations[i], scales[i])
         for i in eachindex(xs)

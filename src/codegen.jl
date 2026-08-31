@@ -708,7 +708,9 @@ struct _EmbeddedFunctionPair{I,N,T,A} <: _ArrayFunctionPair
 end
 
 @inline function (f::_EmbeddedFunctionPair{I})(ops, args...) where {I}
-    _batched_call(f, ops, args, getfield(args, I))
+    traced = _dynamic_tensorized_marker(args)
+    marker = traced === nothing ? getfield(args, I) : traced
+    _batched_call(f, ops, args, marker)
 end
 
 # An untyped authored signature still specializes on its concrete call-site
@@ -733,16 +735,16 @@ end
 end
 
 @inline _requires_tensorized_marker(marker) = false
-@inline _dynamic_tensorized_marker(args, ::Val{()}) = nothing
+@inline _dynamic_tensorized_marker(::Tuple{}) = nothing
 
-@inline function _dynamic_tensorized_marker(args, ::Val{I}) where {I}
-    marker = getfield(args, first(I))
+@inline function _dynamic_tensorized_marker(args::Tuple)
+    marker = first(args)
     _requires_tensorized_marker(marker) && return marker
-    _dynamic_tensorized_marker(args, Val(Base.tail(I)))
+    _dynamic_tensorized_marker(Base.tail(args))
 end
 
 @inline function (f::_DynamicEmbeddedFunctionPair{I})(ops, args...) where {I}
-    traced = _dynamic_tensorized_marker(args, Val(I))
+    traced = _dynamic_tensorized_marker(args)
     marker = traced === nothing ?
              _dynamic_embedded_marker(args, Val(I)) : traced
     _batched_call(f, ops, args, marker)
