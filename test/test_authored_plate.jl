@@ -158,6 +158,27 @@ end
     return sum(pointwise)
 end
 
+_authored_logsumexp(values) = log(sum(exp, values))
+
+@kernel authored_categorical_logit(logits::AbstractVector{Float64}) = begin
+    logpdf(observed::Int)::Float64 =
+        logits[observed] - _authored_logsumexp(logits)
+end
+
+@kernel authored_eachcol_categorical(logits, observed) = begin
+    pointwise = plate(eachcol(logits), observed) do column, value
+        authored_categorical_logit(column).logpdf(value)
+    end
+    return sum(pointwise)
+end
+
+@kernel authored_vcat_normal(W, b) = begin
+    pointwise = plate(vcat(vec(W), b)) do coefficient
+        authored_normal(0.0, 1.0).logpdf(coefficient)
+    end
+    return sum(pointwise)
+end
+
 _authored_plate_normal(x, location, scale) =
     -0.5 * log(2π) - log(scale) - 0.5 * ((x - location) / scale)^2
 _authored_plate_cauchy(x, location, scale) =
@@ -521,4 +542,34 @@ end
     @test _authored_plate_head_count(code_expr(atomic_total), :for) == 1
     @test !occursin("similar", string(code_expr(atomic_total)))
     @test !occursin("for ", string(atomic_total.f.tensorized_ast))
+
+    logits = [1.0 -0.5 0.25; 0.0 1.25 -0.75; -1.0 0.5 1.5]
+    observed = [1, 2, 3]
+    categorical_reference = [
+        column[observed[index]] - _authored_logsumexp(column)
+        for (index, column) in enumerate(eachcol(logits))
+    ]
+    categorical_total = prepare(authored_eachcol_categorical)
+    categorical_pointwise = prepare(extract(
+        authored_eachcol_categorical; want = :pointwise))
+    @test categorical_total(logits, observed) ≈ sum(categorical_reference)
+    @test categorical_pointwise(logits, observed) ≈ categorical_reference
+    @test count(recipe -> recipe.source == :(eachcol(logits)),
+                authored_eachcol_categorical.graph.recipes) == 1
+    @test _authored_plate_head_count(code_expr(categorical_total), :for) == 1
+    @test !occursin("similar", string(code_expr(categorical_total)))
+    @test !occursin("for ", string(categorical_total.f.tensorized_ast))
+
+    W = [0.25 -0.5; 0.75 1.0]
+    b = [-0.25, 0.5]
+    coefficients = vcat(vec(W), b)
+    normal_reference = sum(
+        _authored_plate_normal(value, 0.0, 1.0) for value in coefficients)
+    normal_total = prepare(authored_vcat_normal)
+    @test normal_total(W, b) ≈ normal_reference
+    @test count(recipe -> recipe.source == :(vcat(vec(W), b)),
+                authored_vcat_normal.graph.recipes) == 1
+    @test _authored_plate_head_count(code_expr(normal_total), :for) == 1
+    @test !occursin("similar", string(code_expr(normal_total)))
+    @test !occursin("for ", string(normal_total.f.tensorized_ast))
 end
