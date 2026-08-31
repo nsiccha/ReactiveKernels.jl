@@ -1619,12 +1619,14 @@ prepared kernel is invoked.
 
 `@kernel` supports three authoring modes, discriminated by the body. A methodless
 recipe body authors a stateless graph `KernelSpec` — this docstring's primary form,
-byte-identical to earlier releases. A body with nested method definitions authors a
-stateful OBJECT kernel with an IMPLICIT synthesized receiver: nested methods declare
-no `self`/`__self__` formal, bare unshadowed names are the owner's fields, and
-`__self__` appears only as a sibling object-pass actual (`flip!(__self__, depth)`). A
-methodless body that mutates a field of its first positional subject — or ANY `!!`
-name (a strong same-object update) — authors a free METHOD (e.g.
+byte-identical to earlier releases. A body with nested method definitions authors an
+OBJECT kernel with an IMPLICIT synthesized receiver: pure straight-line methods are
+transparent named endpoints, while effectful or control-flow methods remain available
+to the stricter stateful compiler. Nested methods declare no `self`/`__self__` formal,
+bare unshadowed names are the owner's fields, and `__self__` appears only as a sibling
+object-pass actual (`flip!(__self__, depth)`). A methodless body that mutates a field
+of its first positional subject — or ANY `!!` name (a strong same-object update) —
+authors a free METHOD (e.g.
 `leapfrog!(phasepoint; stepsize)`, `nuts!!(state; rng)`). Reactive mutation of a
 compiled stateless kernel remains available through [`prepare_reactive`](@ref),
 [`set!`](@ref), [`mutate!`](@ref), and [`touch!`](@ref).
