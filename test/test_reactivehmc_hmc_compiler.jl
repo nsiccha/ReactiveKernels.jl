@@ -1015,16 +1015,30 @@ end
           only(stats_source.errors)
 end
 
+_hmc_receipt_numeric_matches(actual::Float64, expected) =
+    isapprox(actual, expected; atol=128eps(Float64), rtol=0)
+_hmc_receipt_numeric_matches(actual::AbstractArray{Float64}, expected) =
+    isapprox(actual, expected; atol=128eps(Float64), rtol=0)
+_hmc_receipt_numeric_matches(actual, expected) = actual == expected
+
 function _assert_hmc_receipt(actual, expected)
-    @test collect(actual.init_pos) == expected["init_pos"]
-    @test collect(actual.init_mom) == expected["init_mom"]
-    @test actual.init_ham == expected["init_ham"]
-    @test collect(actual.fwd_pos) == expected["fwd_pos"]
-    @test collect(actual.fwd_mom) == expected["fwd_mom"]
-    @test actual.fwd_ham == expected["fwd_ham"]
-    @test actual.dham == expected["dham"]
+    # The physical receipt was captured on Julia 1.10.11. Preserve exact
+    # mixed-precision bits below, but admit the same narrow Float64 reduction
+    # tolerance as the Reactant HMC corpus across Julia/BLAS platforms.
+    @test _hmc_receipt_numeric_matches(
+        collect(actual.init_pos), expected["init_pos"])
+    @test _hmc_receipt_numeric_matches(
+        collect(actual.init_mom), expected["init_mom"])
+    @test _hmc_receipt_numeric_matches(actual.init_ham, expected["init_ham"])
+    @test _hmc_receipt_numeric_matches(
+        collect(actual.fwd_pos), expected["fwd_pos"])
+    @test _hmc_receipt_numeric_matches(
+        collect(actual.fwd_mom), expected["fwd_mom"])
+    @test _hmc_receipt_numeric_matches(actual.fwd_ham, expected["fwd_ham"])
+    @test _hmc_receipt_numeric_matches(actual.dham, expected["dham"])
     @test actual.diverged == expected["diverged"]
-    @test collect(actual.energy_errors) == expected["energy_errors"]
+    @test _hmc_receipt_numeric_matches(
+        collect(actual.energy_errors), expected["energy_errors"])
     @test actual.normal_calls == expected["normal_calls"]
     @test actual.exponential_calls == expected["exponential_calls"]
     @test actual.rng_event_calls == length(expected["rng_events"])
