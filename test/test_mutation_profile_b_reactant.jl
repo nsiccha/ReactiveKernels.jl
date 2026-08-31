@@ -82,9 +82,9 @@ function _mpbr_nuts_values(pf)
     values
 end
 
-function _mpbr_nuts_frame(pf)
+function _mpbr_nuts_frame(pf, max_depth::Integer)
     frame = ReactiveKernelsNUTSExamples._construct_nuts_frame(
-        pf, _mpbr_nuts_values(pf), 0;
+        pf, _mpbr_nuts_values(pf), max_depth;
         step_f=ReactiveKernels.partial(_MPBR_NUTS.leapfrog!; stepsize=0.1),
         stats_f=_MPBR_NUTS.nuts_stats!, min_dham=-1000.0)
     ReactiveKernels.compile_prepared_initialization(
@@ -125,14 +125,15 @@ end
 
 if _mpbr_enabled("nuts")
 @testset "mutation profile B — specialized NUTS Reactant" begin
+    max_depth = 1
     pf = _mpbr_nuts_factory()
-    frame = _mpbr_nuts_frame(pf)
+    frame = _mpbr_nuts_frame(pf, max_depth)
     compiled = ReactiveKernelsNUTSExamples.compile_nuts_reactant(
         pf, _MPBR_NUTS.nuts_state, _MPBR_NUTS.refresh_momentum!!,
         _MPBR_NUTS.nuts!!, frame)
     momentum = [0.25, -0.5]
     bundle = ReactiveKernelsNUTSExamples.nuts_reactant_bundle(
-        momentum, Bool[], Float64[], 0)
+        momentum, [false], [0.5, 0.75], max_depth)
     state = map(Reactant.to_rarray,
         ReactiveKernelsNUTSExamples.nuts_reactant_state(
             compiled, frame, bundle))
@@ -140,11 +141,28 @@ if _mpbr_enabled("nuts")
         compiled, state; sync=true)
     output = executable(state)
 
-    @test Array(output.pp_pos)[:, 1] == [1.0, 2.0]
-    @test Array(output.pp_mom)[:, 1] ≈ sqrt(2.0) .* momentum
-    @test Array(output.n_steps)[1] == 0
-    @test Array(output.reached_depth)[1] == 0
+    @test Array(output.pp_pos)[:, 1] != [1.0, 2.0]
+    @test Array(output.n_steps)[1] > 0
+    @test Array(output.reached_depth)[1] > 0
+    @test Array(output.kd)[1] > 0
     @test Array(output.csp)[1] == 0
     @test all(iszero, Array(output.overflow))
+    @test count(_ -> true,
+        eachmatch(r"stablehlo\.while", executable.module_string)) == 1
+
+    # The same executable accepts a second fixed-shape bundle and carries the
+    # first transition's state, rather than recompiling or restarting from the
+    # original host frame.
+    second_bundle = ReactiveKernelsNUTSExamples.nuts_reactant_bundle(
+        [0.75, 0.125], [true], [0.25, 0.875], max_depth)
+    second_state = ReactiveKernelsNUTSExamples.nuts_reactant_rebundle(
+        output, map(Reactant.to_rarray, second_bundle))
+    second_output = executable(second_state)
+    @test Array(second_output.pp_pos)[:, 1] == Array(output.pp_pos)[:, 1]
+    @test Array(second_output.pp_pos)[:, 1] != [1.0, 2.0]
+    @test Array(second_output.n_steps)[1] > 0
+    @test Array(second_output.reached_depth)[1] > 0
+    @test Array(second_output.csp)[1] == 0
+    @test all(iszero, Array(second_output.overflow))
 end
 end
