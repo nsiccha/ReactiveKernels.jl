@@ -235,16 +235,26 @@ function get!(st::ReactiveState, want)
         valof[canon_id(g, v.id)] = ewvals[i]
     end
 
-    # persist nominated materializations with actual provenance
+    # Persist nominated materializations in two phases so every provenance
+    # snapshot observes the final versions published by this result batch.
+    installed = Tuple{Int,Set{Int}}[]
     for m in ew
         mid = canon_id(g, m.id)
         (mid in st.materialize) || continue
         (get(st.policy, mid, nothing) in (:source, :frozen)) && continue
+        # A valid materialization can also appear as a collateral output of a
+        # selected multi-output recipe. The planner still treats it as HAVE, so
+        # its returned value is the existing cut point rather than a new
+        # materialization. Reinstalling it would bump its version and
+        # immediately stale both itself and batch siblings that depend on it.
+        (mid in have_set) && continue
         leaves = Set{Int}()
         _have_leaves!(leaves, g, p, mid, have_set)
-        prov = Dict(l => st.versions[l] for l in leaves)
         _install!(st, mid, valof[mid], :reactive)
-        st.provenance[mid] = prov
+        push!(installed, (mid, leaves))
+    end
+    for (mid, leaves) in installed
+        st.provenance[mid] = Dict(l => st.versions[l] for l in leaves)
     end
 
     length(wants) == 1 ? valof[canon_id(g, wants[1].id)] :

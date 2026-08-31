@@ -291,6 +291,7 @@ end
     ]
     @test total(xs, locations, scales) ≈ sum(zipped_reference)
     @test pointwise(xs, locations, scales) ≈ zipped_reference
+    @test _authored_plate_allocated(total, xs, locations, scales) == 0
     @test total(xs, locations, scale) ≈
         sum(_authored_plate_normal(xs[i], locations[i], scale)
             for i in eachindex(xs))
