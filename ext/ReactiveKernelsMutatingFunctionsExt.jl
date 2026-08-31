@@ -14,6 +14,22 @@ end
 @inline reactive_cache_apply(cache, op, args...) =
     MutatingFunctions.apply!!(cache, op, args...)
 
+# An authored plate's pointwise result is one ordinary single-output recipe.
+# Reuse that recipe's borrowed cache after the first call while preserving the
+# exact broadcast/Ref argument semantics used by allocating execution.
+function MutatingFunctions.apply!!(
+        cache::AbstractArray, op::ReactiveKernels._AuthoredPlateOp{K,A},
+        args...) where {K,A}
+    batch = ReactiveKernels._authored_plate_broadcast(Val(A), args...)
+    output = only(ReactiveKernels.outputs(op.kernel))
+    result = axes(cache) == axes(batch) && eltype(cache) == ReactiveKernels.valtype(output) ?
+             cache : similar(cache, ReactiveKernels.valtype(output), axes(batch))
+    for index in CartesianIndices(axes(batch))
+        result[index] = op.kernel(batch[index]...)
+    end
+    result
+end
+
 function ReactiveKernels.prepare_reactive_nonallocating(graph::ReactiveKernels.Graph;
         have = (), want = (),
         is_mutating = ReactiveKernels._default_is_mutating)
