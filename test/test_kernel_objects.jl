@@ -71,6 +71,12 @@ end
     return logdensity
 end
 
+@kernel computed_constructed_logpdf(
+        x::Float64, μ::Float64, log_σ::Float64) = begin
+    logdensity::Float64 = normal(μ + 0.25, exp(log_σ)).logpdf(x)
+    return logdensity
+end
+
 @kernel compatibility_factor_logpdf(
         x::Float64, μ::Float64, σ::Float64, log_σ::Float64) = begin
     logdensity::Float64 = normal_factor(x, μ, σ, log_σ)
@@ -170,6 +176,8 @@ end
         @test positional(1.0, 0.0, 2.0) ≈ expected_normal(1.0, 0.0, 2.0)
         @test named(1.0, 0.0, 2.0, log(2.0)) ≈
               expected_normal(1.0, 0.0, 2.0)
+        @test prepare(F.computed_constructed_logpdf)(
+                  1.0, 0.0, log(2.0)) ≈ expected_normal(1.0, 0.25, 2.0)
         @test compatibility(1.0, 0.0, 2.0, log(2.0)) ≈
               named(1.0, 0.0, 2.0, log(2.0))
 
@@ -213,12 +221,13 @@ end
                 location; scale = scale).logpdf(x)
             return y
         end
-        @test_throws ArgumentError @macroexpand @kernel literal_object_binding(
+        literal_object_binding = @macroexpand @kernel literal_object_binding(
                 x::Float64, scale::Float64) = begin
             y::Float64 = KernelObjectAuthoringFixture.normal(;
                 location = 0.0, scale = scale).logpdf(x)
             return y
         end
+        @test literal_object_binding isa Expr
     end
 
     @testset "shared endpoint provenance and explicit inverse" begin

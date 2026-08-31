@@ -218,8 +218,9 @@ the method argument `x` remains the endpoint's explicit argument. Here both
 `scale` and `log_scale` are authoritative, so neither conversion recipe runs.
 Unknown or duplicate binding names are rejected while the outer graph is
 constructed, and the endpoint is still transparently spliced with no runtime
-`KernelObjectSpec` call. Assign literal or computed values to caller ports
-before using them as named bindings.
+`KernelObjectSpec` call. Literal or computed owner values are introduced as
+hygienic internal recipes, so natural calls such as
+`normal(0.0, 5.0).logpdf(x)` remain transparent too.
 
 Named relations stay available as alternate cuts. Here `scale = exp(log_scale)`
 and `log_scale = log(scale)` are ordinary bidirectional recipes: the natural

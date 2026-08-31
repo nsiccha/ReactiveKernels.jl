@@ -1044,7 +1044,8 @@ end
 function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                                       nested_specs::Dict{Symbol,Any},
                                       local_types::Dict{Symbol,Any};
-                                      context = "inside @kernel")
+                                      context = "inside @kernel",
+                                      materialized = Tuple{Symbol,Any,Any}[])
     ex isa Expr || return ex, nothing
     ex.head in (:quote, :inert) && return ex, nothing
 
@@ -1124,15 +1125,40 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                 length(endpoint_actuals) == length(explicit) || throw(ArgumentError(
                     "endpoint :$endpoint_name expects $(length(explicit)) argument(s), " *
                     "got $(length(endpoint_actuals))"))
-                all(arg -> arg isa Symbol && arg in locals, owner_actuals) ||
-                    throw(ArgumentError(
-                        "kernel object bindings $context must be named caller ports; " *
-                        "assign literal or computed values to ports before binding them"))
                 all(arg -> arg isa Symbol && arg in locals, endpoint_actuals) ||
                     throw(ArgumentError(
                         "constructed endpoint arguments $context must be named caller ports"))
 
-                actuals = Symbol[owner_actuals...; endpoint_actuals...]
+                # Owner bindings are graph inputs, but their source spelling need not
+                # already be a named caller port. Materialize literals and computed
+                # expressions as hygienic caller recipes, typed by the selected child
+                # boundary, then alias those generated ports into the cloned endpoint.
+                # This preserves ordinary Julia-like construction such as
+                # `normal(0.0, 5.0).logpdf(x)` without hiding runtime object calls.
+                endpoint_inputs = inputs(endpoint)
+                owner_ports = Symbol[]
+                for (index, (formal, actual)) in
+                        enumerate(zip(owner_formals, owner_actuals))
+                    if actual isa Symbol && actual in locals
+                        push!(owner_ports, actual)
+                        continue
+                    elseif actual isa Symbol
+                        throw(ArgumentError(
+                            "kernel object binding :$formal $context refers to undeclared " *
+                            "caller port :$actual"))
+                    end
+                    rewritten_actual, _ = _kernel_constructed_endpoint(
+                        actual, mod, locals, nested_specs, local_types;
+                        context = context, materialized = materialized)
+                    generated_port = gensym(Symbol(formal, :_binding))
+                    generated_type = valtype(endpoint_inputs[index])
+                    push!(materialized,
+                          (generated_port, generated_type, rewritten_actual))
+                    push!(locals, generated_port)
+                    push!(owner_ports, generated_port)
+                end
+
+                actuals = Symbol[owner_ports...; endpoint_actuals...]
                 for (actual, formal) in zip(actuals, inputs(endpoint))
                     T = valtype(formal)
                     if haskey(local_types, actual) && local_types[actual] != T
@@ -1145,7 +1171,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
 
                 generated = gensym(Symbol(endpoint_name, :_endpoint))
                 retargeted = _kernel_endpoint_call_signature(
-                    Val(Tuple(Symbol.(owner_actuals))), Val(explicit))
+                    Val(Tuple(owner_ports)), Val(explicit))
                 nested_specs[generated] = KernelSpec(
                     endpoint.graph, endpoint.ports, endpoint.port_order,
                     endpoint.have_names, endpoint.want_names, retargeted)
@@ -1159,7 +1185,8 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
     child_types = Any[]
     for arg in ex.args
         child, child_type = _kernel_constructed_endpoint(
-            arg, mod, locals, nested_specs, local_types; context = context)
+            arg, mod, locals, nested_specs, local_types;
+            context = context, materialized = materialized)
         push!(rewritten, child)
         push!(child_types, child_type)
     end
@@ -1210,13 +1237,26 @@ function _kernel_authored_plate_expr(rhs, mod)
 
     nested_specs = Dict{Symbol,Any}()
     local_types = Dict{Symbol,Any}()
+    materialized = Tuple{Symbol,Any,Any}[]
     rewritten, inferred = _kernel_constructed_endpoint(
         scalar_body, mod, Set(formals), nested_specs, local_types;
-        context = "inside plate")
+        context = "inside plate", materialized = materialized)
     signature = Tuple{Symbol,Any}[
         (name, get(local_types, name, GlobalRef(Core, :Any))) for name in formals]
     scalar_graph_body = _kernel_expression_result_body(
         :__plate_value__, signature, rewritten, true)
+    if !isempty(materialized)
+        lifted = Any[
+            Expr(:(=), Expr(:(::), name, T), rhs)
+            for (name, T, rhs) in materialized
+        ]
+        scalar_graph_body = if scalar_graph_body isa Expr &&
+                               scalar_graph_body.head === :block
+            Expr(:block, lifted..., scalar_graph_body.args...)
+        else
+            Expr(:block, lifted..., scalar_graph_body)
+        end
+    end
     if inferred !== nothing && scalar_graph_body isa Expr &&
        scalar_graph_body.head === :block
         assignment_index = findfirst(scalar_graph_body.args) do statement
@@ -1566,9 +1606,21 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         if entry[1] === :recipe && entry[5] === nothing
             _, outputs, authored_rhs, metadata, plate_expr = entry
             local_types = Dict{Symbol,Any}()
+            materialized = Tuple{Symbol,Any,Any}[]
             rewritten, inferred = _kernel_constructed_endpoint(
-                authored_rhs, mod, known, nested_specs, local_types)
+                authored_rhs, mod, known, nested_specs, local_types;
+                materialized = materialized)
+            materialized_names = Set{Symbol}()
+            for (name, T, rhs) in materialized
+                register!(name, T)
+                push!(known, name)
+                push!(materialized_names, name)
+                push!(rewritten_entries,
+                      (:recipe, Tuple{Symbol,Any}[(name, T)], rhs,
+                       Dict{Symbol,Any}(), nothing))
+            end
             for (name, T) in local_types
+                name in materialized_names && continue
                 push!(annotations[name], T)
             end
             if length(outputs) == 1 && outputs[1][2] === nothing && inferred !== nothing
