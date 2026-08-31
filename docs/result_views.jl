@@ -959,6 +959,8 @@ function render_compiler_capabilities()
         (capability = "Reactive object field methods", supported = "Yes, declared grammar", boundary = "No let, exceptions, comprehensions/generators, closures, do, or nested functions inside rewritten methods"),
         (capability = "Captured method branches/loops/recursion", supported = "Yes, compiler subset", boundary = "Exact source representation, ownership, effects, and overloads required"),
         (capability = "Functional free state transition", supported = "Yes, narrow public subset", boundary = "Direct owned writes; exact map/copy/destructuring; bound numeric controls; captured finite Colon loops are statically unrolled"),
+        (capability = "Fixed-capacity structural container ABI", supported = "Yes, compiler subset", boundary = "Prototype-bound recursive topology, exact primitive leaves, static authorities and owned aliases; validated read/write/copy/swap/select; no resizing or arbitrary elements"),
+        (capability = "Recursive functional state-machine SCC", supported = "No", boundary = "Finite containers and bounded control are admitted first; recursive SCC lowering rejects explicitly at the current frontier"),
         (capability = "Infer effects from arbitrary Julia methods", supported = "No", boundary = "Source capture plus exact registrations only; no Julia IR/inference analysis"),
         (capability = "Generic effectful operation fallback", supported = "No", boundary = "Opaque or specialization-unsafe calls reject before executable lowering"),
         (capability = "Runtime graph mutation after preparation", supported = "No", boundary = "Cached stateless entries version out; compiled reactive programs throw version errors"),

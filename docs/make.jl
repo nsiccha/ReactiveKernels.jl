@@ -28,6 +28,13 @@ import .NutpieDiagonalAdaptationExample
 # GitHub Pages build instead of publishing a stale code listing.
 include(joinpath(@__DIR__, "..", "benchmark", "walnuts_kernel_authoring_fixture.jl"))
 
+# Execute the same depth-10 compiler-frontier construction as the focused test.
+# This support module builds prototype-derived proposal/tree containers and
+# reaches the named recursive-SCC rejection without claiming that `walnuts!!`
+# itself is compiled or executed.
+include(joinpath(@__DIR__, "..", "test", "fixtures",
+                 "walnuts_compiler_support.jl"))
+
 # Load the accepted ReactiveHMC compiler-corpus authorities themselves. The
 # corpus page extracts source from these exact files and inspects their captured
 # MethodIR; malformed or rejected source therefore fails the docs build.

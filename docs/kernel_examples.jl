@@ -887,7 +887,10 @@ function _run_source_locked_interaction(source::AbstractString, expected::Symbol
     interaction.name === expected || error(
         "source-locked docs interaction returned $(interaction.name), expected $expected",
     )
-    interaction.kind in (:native_execution, :fixture_receipt_inspection) ||
+    interaction.kind in (
+        :native_execution, :fixture_receipt_inspection,
+        :compiler_frontier_execution,
+    ) ||
         error("unexpected docs interaction kind: $(interaction.kind)")
     displayed, interaction
 end
@@ -896,7 +899,10 @@ function _render_source_locked_interaction(source::AbstractString, expected::Sym
                                            title::AbstractString)
     displayed, interaction = _run_source_locked_interaction(source, expected)
     boundary = interaction.kind === :native_execution ?
-        "Native execution" : "Fixture / MethodIR / receipt inspection only"
+        "Native execution" :
+        interaction.kind === :compiler_frontier_execution ?
+        "Compiler construction through the named pre-SCC frontier" :
+        "Fixture / MethodIR / receipt inspection only"
     blocks = Any[
         RawHTML("""
 <article class="rk-source-interaction" data-rk-interaction="$(expected)"
@@ -1296,7 +1302,7 @@ render_walnuts_complete_source() =
 render_walnuts_source_interaction() = _render_source_locked_interaction(
     Main.ReactiveHMCDocsInteractions.WALNUTS_INSPECTION,
     :walnuts_entry_inspection,
-    "WALNUTS fixture entry inspection",
+    "WALNUTS depth-10 compiler frontier",
 )
 
 end # module ReactiveKernelsDocs

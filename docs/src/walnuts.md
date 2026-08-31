@@ -46,9 +46,11 @@ candidate is not reversible at a unique critical grid and the leaf is rejected.
 Main.ReactiveKernelsDocs.render_walnuts_source(:macro_step)
 ```
 
-The compiler sees ordinary loops, branches, `copy!!`, broadcasts, `abs`, and
-integer `div`. There is no WALNUTS operation, program-counter table, field list,
-or handler in compiler code.
+The compiler sees ordinary loops, branches, `copy!!`, broadcasts, the captured
+builtin `abs(::Float64)`, and same-type integer `div`. Those calls are admitted
+by the compiler's exact primitive-specialization rules, not by their names
+alone. There is no WALNUTS operation, program-counter table, field list, or
+handler in compiler code.
 
 ## The macro leaf inside depth-10 NUTS
 
@@ -82,14 +84,23 @@ by itself, evidence that either generic compiler path is accepted.
 Main.ReactiveKernelsDocs.render_walnuts_source(:entry)
 ```
 
-## Build inspection — no compiler-execution claim
+## Build-executed depth-10 compiler frontier
 
-The exact interaction below is evaluated during the docs build. It constructs
-the loaded fixture boundary, requires all 15 state methods to remain admitted,
-inspects the explicit entry keywords, and counts the independent C++ receipt
-cases. It intentionally does **not** execute `walnuts!!` and makes no native or
-Reactant compiler-success claim while that generic compiler boundary remains
-held.
+The exact interaction below is evaluated during the docs build from the same
+support fixture as the focused compiler test. With `max_depth = 10`, it captures
+all 15 state methods, constructs the endpoint transition and typed effect
+ports, compiles the stateful boundary, takes its snapshot, and builds the
+prototype-derived proposal and tree containers. Their capacities are 12 and 11
+respectively, and both round-trip through the finite numeric backend ABI while
+preserving their recursive layout, static authorities, and alias topology.
+
+The next compiler step fails closed at the explicitly named recursive control
+boundary: the `step!` / `start!` / `finish!` strongly connected component. The
+current diagnostic names root `step!` and begins `recursive functional
+state-machine SCC lowering is not implemented`. The interaction requires the
+full exact diagnostic. It intentionally does **not** execute `walnuts!!`, does
+not compile a WALNUTS transition with Reactant, and does not claim full
+recursive-SCC or WALNUTS compiler support.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_walnuts_source_interaction()
