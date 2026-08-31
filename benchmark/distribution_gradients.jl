@@ -135,6 +135,8 @@ end
 
 _gradient_error(observed::Number, expected::Number) = abs(observed - expected)
 _gradient_error(observed, expected) = maximum(abs.(observed .- expected); init = 0.0)
+_gradient_scale(expected::Number) = abs(expected)
+_gradient_scale(expected) = maximum(abs, expected; init = 0.0)
 
 function _row(group, family, n, kernel, inputs::NamedTuple, active,
               expected_gradient; rounds)
@@ -170,6 +172,8 @@ function _row(group, family, n, kernel, inputs::NamedTuple, active,
         row["max_value_error"] = abs(value - kernel(args...))
         row["caller_owned_gradient"] = _measurement(caller_owned_call; rounds)
     end
+    row["max_relative_error"] = row["max_abs_error"] /
+        max(_gradient_scale(expected_gradient), eps(Float64))
     row
 end
 

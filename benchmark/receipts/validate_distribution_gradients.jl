@@ -102,8 +102,8 @@ function validate_distribution_gradient_receipt(path::AbstractString)
         n = Int(row["n"])
         kind = String(row["active_kind"])
         label = "$group/$family N=$n"
-        require(Float64(row["max_abs_error"]) <= 1e-8,
-                "$label exceeds analytic-gradient tolerance")
+        require(Float64(get(row, "max_relative_error", Inf)) <= 1e-10,
+                "$label exceeds analytic-gradient relative tolerance")
         if kind == "vector"
             require(haskey(row, "caller_owned_gradient"),
                     "$label lacks caller-owned measurement")
