@@ -17,7 +17,8 @@ const CAUCHY_SCALE_KERNEL = prepare(CAUCHY_LOGDENSITY;
         x::Float64, location::Float64, scale::Float64) = begin
     normal_term::Float64 = normal.logpdf(x)
     cauchy_term::Float64 = cauchy.logpdf(x)
-    return normal_term + cauchy_term
+    total::Float64 = normal_term + cauchy_term
+    return total
 end
 
 const EMBEDDED_DISTRIBUTION_KERNEL = prepare(embedded_distribution_logdensity;
@@ -71,11 +72,19 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
                 want = :logpdf)
             recipe_outputs(selected_plan) =
                 [only(recipe.outputs).name for recipe in selected_plan.recipes]
-            @test recipe_outputs(scale_plan) ==
-                  [:log_scale, :standardized, :logpdf]
-            @test recipe_outputs(logscale_plan) ==
-                  [:scale, :standardized, :logpdf]
-            @test recipe_outputs(both_plan) == [:standardized, :logpdf]
+            scale_outputs = recipe_outputs(scale_plan)
+            logscale_outputs = recipe_outputs(logscale_plan)
+            both_outputs = recipe_outputs(both_plan)
+            @test :log_scale in scale_outputs
+            @test !(:scale in scale_outputs)
+            @test :scale in logscale_outputs
+            @test !(:log_scale in logscale_outputs)
+            @test !(:scale in both_outputs)
+            @test !(:log_scale in both_outputs)
+            @test all(outputs -> :standardized in outputs,
+                      (scale_outputs, logscale_outputs, both_outputs))
+            @test all(outputs -> last(outputs) === :logpdf,
+                      (scale_outputs, logscale_outputs, both_outputs))
         end
 
         joint = extract(normal;

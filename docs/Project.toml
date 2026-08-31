@@ -17,6 +17,7 @@ ReactiveKernelsCompatibilityExamples = "b8c154ef-4cb8-413d-9282-0e653aa014e1"
 ReactiveKernelsDistributionKernels = "4b169cd9-fc12-43fd-ba39-43e54ed8db7a"
 ReactiveKernelsKernelExamples = "c1a917b0-63b1-4b16-afa9-60dbf16f95f3"
 ReactiveKernelsPPLExamples = "a4d4be3d-45c5-49cc-80d7-34e606a16bce"
+SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 Treebars = "e1e568c4-3a56-40a4-95fa-9b9c6c16fccb"
 
 [sources.ReactiveKernels]
