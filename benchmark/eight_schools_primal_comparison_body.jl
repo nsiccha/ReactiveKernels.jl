@@ -122,7 +122,13 @@ _comparable(outcome, value) =
     outcome == "pointwise" ? _pointwise_vector(value) : Float64(value)
 
 function _measurement(f, args...; rounds::Int)
-    benchmark = @benchmarkable $f($(args...))
+    # Capture the already-prepared call once. BenchmarkTools then invokes a
+    # concrete zero-argument closure; Julia inlines the tuple splat, while the
+    # timed region contains neither setup nor dynamic argument construction.
+    invocation = let f = f, args = args
+        () -> f(args...)
+    end
+    benchmark = @benchmarkable $invocation()
     times_ns = Float64[]
     bytes = Int[]
     allocs = Int[]
