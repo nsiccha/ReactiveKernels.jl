@@ -37,11 +37,14 @@ function _interactive_block(node; class = "rk-aov-panel",
     payload = base64encode(_node_html(node))
     stable_id = _html_attribute(artifact_id)
     stable_kind = _html_attribute(artifact_kind)
+    stable_payload = _html_attribute(payload)
     RawHTML("""
-<ClientOnly>
-  <div class="$class" data-rk-artifact-id="$stable_id"
-       data-rk-artifact-kind="$stable_kind" v-exec-scripts="'$payload'"></div>
-</ClientOnly>
+<div class="$class" data-rk-artifact-id="$stable_id"
+     data-rk-artifact-kind="$stable_kind" data-rk-exec-payload="$stable_payload">
+  <ClientOnly>
+    <div v-exec-scripts="'$payload'"></div>
+  </ClientOnly>
+</div>
 """)
 end
 
