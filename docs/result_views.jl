@@ -30,11 +30,20 @@ const _NUTS_REACTANT_RECEIPT_PATH = joinpath(
 
 _node_html(node) = sprint(show, MIME"text/html"(), node; context = :limit => false)
 
-function _interactive_block(node; class = "rk-aov-panel")
+_html_attribute(value) = replace(
+    string(value), '&' => "&amp;", '"' => "&quot;", '<' => "&lt;", '>' => "&gt;",
+)
+
+function _interactive_block(node; class = "rk-aov-panel",
+                            artifact_id::AbstractString,
+                            artifact_kind::AbstractString = "aov-panel")
     payload = base64encode(_node_html(node))
+    stable_id = _html_attribute(artifact_id)
+    stable_kind = _html_attribute(artifact_kind)
     RawHTML("""
 <ClientOnly>
-  <div class="$class" v-exec-scripts="'$payload'"></div>
+  <div class="$class" data-rk-artifact-id="$stable_id"
+       data-rk-artifact-kind="$stable_kind" v-exec-scripts="'$payload'"></div>
 </ClientOnly>
 """)
 end
@@ -43,7 +52,10 @@ _static_block(node) = RawHTML(_node_html(node))
 
 """Install HTMXObjects' sorting runtime once on a page that renders result tables."""
 function render_result_assets()
-    Markdown.MD(Any[_interactive_block(sortable_table_js(); class = "rk-result-assets")])
+    Markdown.MD(Any[_interactive_block(
+        sortable_table_js(); class = "rk-result-assets",
+        artifact_id = "assets:result-assets", artifact_kind = "result-assets",
+    )])
 end
 
 _default_cell(value, _) = string(value)
@@ -69,7 +81,11 @@ function _result_table(rows, columns; id::AbstractString, title = "Exact values"
         [column.label for column in columns], body;
         id = String(id), download = false, class = "rk-result-table",
     )
-    _static_block(h.section(; class = "rk-result-table-section")(
+    _static_block(h.section(;
+        class = "rk-result-table-section",
+        data_rk_artifact_id = "table:" * String(id),
+        data_rk_artifact_kind = "sortable-table",
+    )(
         h.h3(title),
         h.p(note; class = "rk-result-table-note"),
         h.div(table; class = "rk-sortable-table-wrap"),
@@ -84,7 +100,7 @@ function _plot_block(spec; id::AbstractString, title::AbstractString,
         h.figcaption(caption),
         vdraw(spec; id = String(id)),
     )
-    _interactive_block(node)
+    _interactive_block(node; artifact_id = "plot:" * String(id))
 end
 
 const _TIMING_BACKENDS = (
