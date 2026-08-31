@@ -134,6 +134,51 @@ end
     return sum(pointwise)
 end
 
+@kernel authored_eachcol_sum(matrix, offsets) = begin
+    pointwise = plate(eachcol(matrix), offsets) do column, offset
+        value::Float64 = sum(column) + offset
+        return value
+    end
+    return sum(pointwise)
+end
+
+@kernel authored_eachrow_derived_sum(matrix, offsets) = begin
+    pointwise = plate(eachrow(matrix), offsets .+ 1.0) do row, offset
+        value::Float64 = sum(row) + offset
+        return value
+    end
+    return sum(pointwise)
+end
+
+@kernel authored_ref_derived_sum(x, offsets) = begin
+    pointwise = plate(x, Ref(offsets .+ 1.0)) do value, atomic_offsets
+        result::Float64 = value + sum(atomic_offsets)
+        return result
+    end
+    return sum(pointwise)
+end
+
+_authored_logsumexp(values) = log(sum(exp, values))
+
+@kernel authored_categorical_logit(logits::AbstractVector{Float64}) = begin
+    logpdf(observed::Int)::Float64 =
+        logits[observed] - _authored_logsumexp(logits)
+end
+
+@kernel authored_eachcol_categorical(logits, observed) = begin
+    pointwise = plate(eachcol(logits), observed) do column, value
+        authored_categorical_logit(column).logpdf(value)
+    end
+    return sum(pointwise)
+end
+
+@kernel authored_vcat_normal(W, b) = begin
+    pointwise = plate(vcat(vec(W), b)) do coefficient
+        authored_normal(0.0, 1.0).logpdf(coefficient)
+    end
+    return sum(pointwise)
+end
+
 _authored_plate_normal(x, location, scale) =
     -0.5 * log(2π) - log(scale) - 0.5 * ((x - location) / scale)^2
 _authored_plate_cauchy(x, location, scale) =
@@ -446,4 +491,85 @@ end
     @test typeof(untyped_total.f).parameters[1] == (1,)
     @test _authored_plate_head_count(code_expr(total), :for) == 1
     @test !occursin("similar", string(code_expr(total)))
+end
+
+@testset "authored plate block: derived iterable arguments" begin
+    matrix = [1.0 2.0 3.0; 4.0 5.0 6.0]
+    column_offsets = [0.25, 0.5, 0.75]
+    column_reference = [
+        sum(column) + column_offsets[index]
+        for (index, column) in enumerate(eachcol(matrix))
+    ]
+
+    column_total = prepare(authored_eachcol_sum)
+    column_pointwise = prepare(extract(authored_eachcol_sum; want = :pointwise))
+    @test column_total(matrix, column_offsets) == sum(column_reference)
+    @test column_pointwise(matrix, column_offsets) == column_reference
+    @test count(recipe -> recipe.source == :(eachcol(matrix)),
+                authored_eachcol_sum.graph.recipes) == 1
+    @test length(plan(authored_eachcol_sum).recipes) == 3
+    @test _authored_plate_head_count(code_expr(column_total), :for) == 1
+    @test !occursin("similar", string(code_expr(column_total)))
+    @test !occursin("for ", string(column_total.f.tensorized_ast))
+
+    row_offsets = [0.5, 1.5]
+    row_reference = [
+        sum(row) + row_offsets[index] + 1.0
+        for (index, row) in enumerate(eachrow(matrix))
+    ]
+    row_total = prepare(authored_eachrow_derived_sum)
+    row_pointwise = prepare(extract(authored_eachrow_derived_sum; want = :pointwise))
+    @test row_total(matrix, row_offsets) == sum(row_reference)
+    @test row_pointwise(matrix, row_offsets) == row_reference
+    @test count(recipe -> recipe.source == :(eachrow(matrix)),
+                authored_eachrow_derived_sum.graph.recipes) == 1
+    @test count(recipe -> recipe.source == :(offsets .+ 1.0),
+                authored_eachrow_derived_sum.graph.recipes) == 1
+    @test _authored_plate_head_count(code_expr(row_total), :for) == 1
+    @test !occursin("for ", string(row_total.f.tensorized_ast))
+
+    values = [-1.0, 0.5, 2.0]
+    atomic_offsets = [0.25, 0.75]
+    atomic_reference = [
+        value + sum(atomic_offsets .+ 1.0) for value in values
+    ]
+    atomic_total = prepare(authored_ref_derived_sum)
+    atomic_pointwise = prepare(extract(authored_ref_derived_sum; want = :pointwise))
+    @test atomic_total(values, atomic_offsets) == sum(atomic_reference)
+    @test atomic_pointwise(values, atomic_offsets) == atomic_reference
+    @test count(recipe -> recipe.source == :(offsets .+ 1.0),
+                authored_ref_derived_sum.graph.recipes) == 1
+    @test _authored_plate_head_count(code_expr(atomic_total), :for) == 1
+    @test !occursin("similar", string(code_expr(atomic_total)))
+    @test !occursin("for ", string(atomic_total.f.tensorized_ast))
+
+    logits = [1.0 -0.5 0.25; 0.0 1.25 -0.75; -1.0 0.5 1.5]
+    observed = [1, 2, 3]
+    categorical_reference = [
+        column[observed[index]] - _authored_logsumexp(column)
+        for (index, column) in enumerate(eachcol(logits))
+    ]
+    categorical_total = prepare(authored_eachcol_categorical)
+    categorical_pointwise = prepare(extract(
+        authored_eachcol_categorical; want = :pointwise))
+    @test categorical_total(logits, observed) ≈ sum(categorical_reference)
+    @test categorical_pointwise(logits, observed) ≈ categorical_reference
+    @test count(recipe -> recipe.source == :(eachcol(logits)),
+                authored_eachcol_categorical.graph.recipes) == 1
+    @test _authored_plate_head_count(code_expr(categorical_total), :for) == 1
+    @test !occursin("similar", string(code_expr(categorical_total)))
+    @test !occursin("for ", string(categorical_total.f.tensorized_ast))
+
+    W = [0.25 -0.5; 0.75 1.0]
+    b = [-0.25, 0.5]
+    coefficients = vcat(vec(W), b)
+    normal_reference = sum(
+        _authored_plate_normal(value, 0.0, 1.0) for value in coefficients)
+    normal_total = prepare(authored_vcat_normal)
+    @test normal_total(W, b) ≈ normal_reference
+    @test count(recipe -> recipe.source == :(vcat(vec(W), b)),
+                authored_vcat_normal.graph.recipes) == 1
+    @test _authored_plate_head_count(code_expr(normal_total), :for) == 1
+    @test !occursin("similar", string(code_expr(normal_total)))
+    @test !occursin("for ", string(normal_total.f.tensorized_ast))
 end
