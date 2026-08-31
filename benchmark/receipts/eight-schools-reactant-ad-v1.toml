@@ -1,0 +1,202 @@
+generated_at = "2026-08-31T23:53:29.658Z"
+schema = "eight-schools-reactant-ad-v1"
+
+[environment]
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+julia_threads = 1
+os = "Linux"
+reactant_backend = "default CPU"
+
+[[measurements]]
+active_port = "unconstrained"
+ad_preparation_seconds = 0.569289413
+boundary = "packed_unconstrained"
+description = "gradient of the full joint w.r.t. the packed unconstrained vector"
+outcome = "joint"
+reactant_ad_compile_seconds = 6.844268672
+reactant_transfer_seconds = 0.224495644
+rk_native_ad_supported = true
+rk_reactant_ad_error = "Scalar indexing is disallowed."
+rk_reactant_ad_supported = false
+
+    [measurements.rk_native_ad]
+    calls_per_round = 4096
+    median_ns = 3799.7635498046875
+    times_ns = [3748.626220703125, 4463.953857421875, 4416.777099609375, 3553.3740234375, 3796.52197265625, 3981.28857421875, 4314.04248046875, 3814.6767578125, 3695.03173828125, 3867.30322265625, 3580.5185546875, 3734.923095703125, 3722.775146484375, 3771.47021484375, 4007.4794921875, 3803.005126953125, 4043.52294921875, 3703.786376953125, 3693.74853515625, 3865.073486328125]
+[[measurements]]
+active_port = "unconstrained"
+ad_preparation_seconds = 0.36438785
+boundary = "packed_unconstrained"
+description = "gradient of the unconstrained log prior"
+outcome = "prior"
+reactant_ad_compile_seconds = 2.977570901
+reactant_transfer_seconds = 0.005611021
+rk_native_ad_supported = true
+rk_reactant_ad_error = "Scalar indexing is disallowed."
+rk_reactant_ad_supported = false
+
+    [measurements.rk_native_ad]
+    calls_per_round = 8192
+    median_ns = 437.73406982421875
+    times_ns = [923.171875, 2359.5467529296875, 381.3856201171875, 1147.7822265625, 439.42822265625, 436.0399169921875, 628.3021240234375, 397.34375, 580.8123779296875, 385.2139892578125, 397.7752685546875, 579.464111328125, 390.9959716796875, 565.05078125, 372.227294921875, 551.275634765625, 398.0797119140625, 370.9072265625, 584.86328125, 381.254638671875]
+[[measurements]]
+active_port = "unconstrained"
+ad_preparation_seconds = 0.103430253
+boundary = "packed_unconstrained"
+description = "gradient of the summed log likelihood after unpacking"
+max_abs_error = 0.0
+outcome = "likelihood"
+reactant_ad_compile_seconds = 12.053045016
+reactant_first_execution_seconds = 0.21542461
+reactant_transfer_seconds = 8.9063e-5
+rk_native_ad_supported = true
+rk_reactant_ad_supported = true
+value_abs_error = 0.0
+
+    [measurements.rk_native_ad]
+    calls_per_round = 8192
+    median_ns = 2598.7182006835938
+    times_ns = [3310.1893310546875, 1230.7752685546875, 2946.179931640625, 2166.4178466796875, 2588.017333984375, 2911.8419189453125, 1559.1859130859375, 2349.8812255859375, 2683.0313720703125, 1488.5013427734375, 2767.0533447265625, 2609.4190673828125, 2140.29150390625, 2694.498779296875, 1248.6011962890625, 2782.311279296875, 2220.5538330078125, 2722.409423828125, 3316.7938232421875, 1649.9788818359375]
+
+    [measurements.rk_reactant_ad]
+    calls_per_round = 8192
+    median_ns = 5402.145751953125
+    times_ns = [38791.50378417969, 5069.7908935546875, 5422.1885986328125, 5079.3818359375, 5485.8714599609375, 5661.234375, 5949.3564453125, 18825.868530273438, 5468.1064453125, 5382.1029052734375, 5288.5179443359375, 12980.51904296875, 4871.6353759765625, 4889.867431640625, 4880.910888671875, 12318.483764648438, 4554.270263671875, 4946.1351318359375, 4793.274169921875, 12209.131469726562]
+[[measurements]]
+boundary = "packed_unconstrained"
+description = "pointwise is vector-valued; no matched public Jacobian/VJP contract, so it stays unsupported rather than inventing a fused case"
+outcome = "pointwise"
+rk_native_ad_error = "pointwise is vector-valued; no matched public Jacobian/VJP contract, so it stays unsupported rather than inventing a fused case"
+rk_native_ad_supported = false
+rk_reactant_ad_error = "pointwise is vector-valued; no matched public Jacobian/VJP contract, so it stays unsupported rather than inventing a fused case"
+rk_reactant_ad_supported = false
+[[measurements]]
+boundary = "constrained_parameters"
+description = "the public RK AD boundary accepts floating scalar/array/tuple storage, not the primal matrix's constrained NamedTuple"
+outcome = "joint"
+rk_native_ad_error = "the public RK AD boundary accepts floating scalar/array/tuple storage, not the primal matrix's constrained NamedTuple"
+rk_native_ad_supported = false
+rk_reactant_ad_error = "the public RK AD boundary accepts floating scalar/array/tuple storage, not the primal matrix's constrained NamedTuple"
+rk_reactant_ad_supported = false
+[[measurements]]
+boundary = "constrained_parameters"
+description = "the public RK AD boundary accepts floating scalar/array/tuple storage, not the primal matrix's constrained NamedTuple"
+outcome = "prior"
+rk_native_ad_error = "the public RK AD boundary accepts floating scalar/array/tuple storage, not the primal matrix's constrained NamedTuple"
+rk_native_ad_supported = false
+rk_reactant_ad_error = "the public RK AD boundary accepts floating scalar/array/tuple storage, not the primal matrix's constrained NamedTuple"
+rk_reactant_ad_supported = false
+[[measurements]]
+boundary = "constrained_parameters"
+description = "the public RK AD boundary accepts floating scalar/array/tuple storage, not the primal matrix's constrained NamedTuple"
+outcome = "likelihood"
+rk_native_ad_error = "the public RK AD boundary accepts floating scalar/array/tuple storage, not the primal matrix's constrained NamedTuple"
+rk_native_ad_supported = false
+rk_reactant_ad_error = "the public RK AD boundary accepts floating scalar/array/tuple storage, not the primal matrix's constrained NamedTuple"
+rk_reactant_ad_supported = false
+[[measurements]]
+boundary = "constrained_parameters"
+description = "pointwise is vector-valued; no matched public Jacobian/VJP contract, so it stays unsupported rather than inventing a fused case"
+outcome = "pointwise"
+rk_native_ad_error = "pointwise is vector-valued; no matched public Jacobian/VJP contract, so it stays unsupported rather than inventing a fused case"
+rk_native_ad_supported = false
+rk_reactant_ad_error = "pointwise is vector-valued; no matched public Jacobian/VJP contract, so it stays unsupported rather than inventing a fused case"
+rk_reactant_ad_supported = false
+[[measurements]]
+boundary = "minimal_likelihood"
+description = "joint and prior are unavailable from the minimal likelihood HAVE boundary"
+outcome = "joint"
+rk_native_ad_error = "joint and prior are unavailable from the minimal likelihood HAVE boundary"
+rk_native_ad_supported = false
+rk_reactant_ad_error = "joint and prior are unavailable from the minimal likelihood HAVE boundary"
+rk_reactant_ad_supported = false
+[[measurements]]
+boundary = "minimal_likelihood"
+description = "joint and prior are unavailable from the minimal likelihood HAVE boundary"
+outcome = "prior"
+rk_native_ad_error = "joint and prior are unavailable from the minimal likelihood HAVE boundary"
+rk_native_ad_supported = false
+rk_reactant_ad_error = "joint and prior are unavailable from the minimal likelihood HAVE boundary"
+rk_reactant_ad_supported = false
+[[measurements]]
+active_port = "θ"
+ad_preparation_seconds = 0.110030438
+boundary = "minimal_likelihood"
+description = "gradient of the summed likelihood from θ, observations, and scales"
+max_abs_error = 0.0
+outcome = "likelihood"
+reactant_ad_compile_seconds = 2.824062491
+reactant_first_execution_seconds = 0.022256385
+reactant_transfer_seconds = 7.7337e-5
+rk_native_ad_supported = true
+rk_reactant_ad_supported = true
+value_abs_error = 0.0
+
+    [measurements.rk_native_ad]
+    calls_per_round = 32768
+    median_ns = 995.0941467285156
+    times_ns = [1017.0455017089844, 1261.1139526367188, 957.1636962890625, 965.4132995605469, 996.0124816894531, 989.3473815917969, 984.3588562011719, 1114.9081726074219, 1057.9595031738281, 1002.7252502441406, 995.9244384765625, 1069.2522583007812, 979.687744140625, 977.6390380859375, 967.8106994628906, 1001.8844909667969, 994.2638549804688, 977.3490295410156, 987.5049438476562, 1032.7678833007812]
+
+    [measurements.rk_reactant_ad]
+    calls_per_round = 4096
+    median_ns = 5604.68896484375
+    times_ns = [5562.058349609375, 5672.921630859375, 7708.65966796875, 8475.532958984375, 8523.756591796875, 9198.45703125, 31520.12841796875, 5251.380126953125, 5437.10791015625, 5794.581298828125, 5614.40087890625, 5760.2880859375, 5451.810791015625, 5491.357666015625, 27930.134033203125, 5516.264892578125, 5534.001953125, 5494.35009765625, 5533.979736328125, 5594.97705078125]
+[[measurements]]
+boundary = "minimal_likelihood"
+description = "pointwise is vector-valued; no matched public Jacobian/VJP contract, so it stays unsupported rather than inventing a fused case"
+outcome = "pointwise"
+rk_native_ad_error = "pointwise is vector-valued; no matched public Jacobian/VJP contract, so it stays unsupported rather than inventing a fused case"
+rk_native_ad_supported = false
+rk_reactant_ad_error = "pointwise is vector-valued; no matched public Jacobian/VJP contract, so it stays unsupported rather than inventing a fused case"
+rk_reactant_ad_supported = false
+
+[pins]
+ad_receipt_path = "benchmark/receipts/eight-schools-ad-v1.toml"
+ad_receipt_reactivekernels_sha = "8962bf19e8ab4ed78d97d6de742650d7ee957f8d"
+ad_receipt_sha256 = "73ebe7b7161c0436c8f1ccf8f91bc0adb202c2146e60acb8c3c7d4c97e4e8706"
+differentiationinterface_version = "0.7.21"
+enzyme_version = "0.13.199"
+julia_version = "1.10.11"
+reactant_jll_version = "0.0.401+0"
+reactant_version = "0.2.278"
+reactivekernels_dirty = false
+reactivekernels_sha = "522d4e065adf7bbf277c8c18b907195b38cd8524"
+reactivekernels_version = "0.1.0"
+reactivekernelsdistributionkernels_version = "0.1.0"
+reactivekernelspplexamples_version = "0.1.0"
+source_authority_blob = "9f67aad217a698d88f66db2271bfb9d7a3579a61"
+source_authority_path = "packages/ReactiveKernelsPPLExamples/src/eight_schools.jl"
+source_text_sha256 = "79c26e1af246047ed6c4aa81b854a568a08d77a98d12614d0cca9324690046b5"
+
+[protocol]
+ad_preparation_in_timed_region = false
+estimator = "median per-call time from calibrated elapsed batches"
+first_execution_in_steady_state_region = false
+gradient_operation = "value and gradient"
+input_boundaries = ["packed_unconstrained", "constrained_parameters", "minimal_likelihood"]
+matrix_source = "benchmark/receipts/eight-schools-ad-v1.toml"
+model = "centered Eight Schools"
+outcomes = ["joint", "prior", "likelihood", "pointwise"]
+parity_atol = 1.0e-10
+parity_reference = "native RK reverse pass (ad_value_and_gradient!)"
+parity_rtol = 1.0e-11
+pointwise_jacobian_or_vjp_invented = false
+preparation_in_timed_region = false
+reactant_compile_time_in_timed_region = false
+reactant_readback_in_timed_region = false
+reactant_sync = true
+reactant_transfers_in_timed_region = false
+rk_ad_backend = "AutoEnzyme(mode = Enzyme.Reverse)"
+rk_native_ad_surface = "prepare_ad + ad_value_and_gradient!"
+rk_reactant_ad_surface = "prepare_ad + compile_ad_value_and_gradient"
+rounds = 20
+setup_in_timed_region = false
+source_reused = true
+target_seconds_per_round = 0.02
+unsupported_cells_recorded = true
+
+[setup]
+environment_seconds = 20.67358975
+kernel_preparation_seconds = 2.213874564
+package_precompile_seconds = 2.008485569
