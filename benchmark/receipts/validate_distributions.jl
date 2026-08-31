@@ -51,6 +51,12 @@ function validate_distribution_receipt(path::AbstractString)
             "Reactant execution timings must exclude compilation")
     require(get(protocol, "reactant_compile_times_include_first_service_startup", false) == true,
             "receipt must disclose first-service-startup compile timing")
+    require(get(protocol, "rk_authored_native_lowering", "") ==
+            "one reduction traversal with no similar/pointwise output",
+            "receipt must attest the authored native fusion check")
+    require(get(protocol, "rk_authored_reactant_lowering", "") ==
+            "tensorized broadcast chain consumed by Base.sum; no host loop or similar",
+            "receipt must attest the authored Reactant fusion check")
     require(Int(get(protocol, "rounds", 0)) >= 5,
             "published receipt must contain at least five raw rounds")
     require(Tuple(Int.(get(protocol, "reactant_replica_counts", Int[]))) ==
@@ -94,6 +100,10 @@ function validate_distribution_receipt(path::AbstractString)
             for raw_key in ("times_ns", "bytes", "allocs")
                 require(haskey(measurement, raw_key) && !isempty(measurement[raw_key]),
                         "N=$n $name.$raw_key missing")
+                haskey(measurement, raw_key) && require(
+                    length(measurement[raw_key]) == Int(protocol["rounds"]),
+                    "N=$n $name.$raw_key must retain every benchmark round",
+                )
             end
             all(haskey(measurement, key) for key in ("times_ns", "bytes", "allocs")) ||
                 continue
@@ -133,6 +143,14 @@ function validate_distribution_receipt(path::AbstractString)
                              Float64(row["rk_native"]["median_ns"])
             require(authored_ratio <= 1.10,
                     "N=$n authored return exceeds legacy plate by more than 10%")
+        end
+        if haskey(row, "rk_reactant") && haskey(row, "rk_authored_reactant")
+            require(row["rk_authored_reactant"]["median_bytes"] ==
+                    row["rk_reactant"]["median_bytes"],
+                    "N=$n authored and legacy Reactant host bytes differ")
+            require(row["rk_authored_reactant"]["median_allocs"] ==
+                    row["rk_reactant"]["median_allocs"],
+                    "N=$n authored and legacy Reactant host allocations differ")
         end
     end
 
