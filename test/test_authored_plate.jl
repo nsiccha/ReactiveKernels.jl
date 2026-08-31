@@ -36,6 +36,14 @@ end
     return sum(pointwise)
 end
 
+@kernel authored_normal_both_loglik(x, location, scale, log_scale) = begin
+    pointwise = plate(x, location, scale, log_scale) do xi, li, si, log_si
+        authored_normal(;
+            location = li, scale = si, log_scale = log_si).logpdf(xi)
+    end
+    return sum(pointwise)
+end
+
 @kernel untyped_authored_normal_loglik(x, location, scale) = begin
     pointwise = plate(x, location, scale) do xi, li, si
         authored_normal(li, si).logpdf(xi)
@@ -207,6 +215,13 @@ end
     @test total(xs, locations, scale) ≈
         sum(_authored_plate_normal(xs[i], locations[i], scale)
             for i in eachindex(xs))
+
+    both_have = prepare(authored_normal_both_loglik)
+    @test both_have(xs, location, scale, log(scale)) ≈ sum(reference)
+    both_have_scalar = plate_body(first(plan(authored_normal_both_loglik).recipes))
+    @test [only(recipe.outputs).name for recipe in both_have_scalar.recipes] ==
+          [:standardized, Symbol("standard.logpdf"), :logpdf]
+    @test !occursin("KernelObjectSpec", string(code_expr(both_have)))
 
     # Julia broadcast semantics include singleton expansion.
     @test pointwise(xs, locations[1:1], scale) ≈
