@@ -93,6 +93,7 @@ end
           (:location, :scale, :x)
     @test Tuple(v.name for v in outputs(F.normal.logpdf)) == (:logpdf,)
     @test !haskey(F.normal, :standard)
+    @test haskey(F.normal, Symbol("standard.logpdf"))
     @test prepare(F.nested_normal_logpdf)(1.0, 0.0, 2.0) ≈
           prepare(F.normal.logpdf)(0.0, 2.0, 1.0)
     @test !occursin("KernelSpec", sprint(show,
@@ -127,6 +128,9 @@ end
         @test !(:log_scale in outputs_of(logscale_plan))
         @test !(:scale in outputs_of(both_plan))
         @test !(:log_scale in outputs_of(both_plan))
+        @test outputs_of(scale_plan) ==
+              [:log_scale, :standardized, Symbol("standard.logpdf"), :logpdf]
+        @test allunique(outputs_of(scale_plan))
 
         expected_normal(x, location, scale) =
             -0.5 * log(2π) - log(scale) - 0.5 * ((x - location) / scale)^2
@@ -141,8 +145,12 @@ end
             have = (:scale,), want = :log_scale)
         scale_view = extract(F.normal;
             have = (:log_scale,), want = :scale)
+        standard_view = extract(F.normal;
+            have = (:x, :location, :scale), want = Symbol("standard.logpdf"))
         @test prepare(logscale_view)(2.0) ≈ log(2.0)
         @test prepare(scale_view)(log(2.0)) ≈ 2.0
+        @test prepare(standard_view)(1.0, 0.0, 2.0) ≈
+              -0.5 * log(2π) - 0.5 * 0.5^2
     end
 
     @testset "shared endpoint provenance and explicit inverse" begin
