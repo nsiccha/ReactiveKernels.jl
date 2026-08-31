@@ -87,6 +87,16 @@ function _rhmc_reactant_pure_program(source, port)
     (; state, snapshot=ReactiveKernels.stateful_snapshot(state), transition)
 end
 
+function _rhmc_reactant_scalar_abs_div_program()
+    kernel = ReactiveKernels.compile_stateful(
+        _RHMC_FUNCTIONAL_REACTANT.scalar_abs_div, 0.0, 0, 0)
+    state = kernel(0.0, 0, 0)
+    transition = ReactiveKernels.functionalize_stateful(
+        kernel, Val(:step!);
+        argument_types=Tuple{Float64,Int,Int})
+    (; kernel, snapshot=ReactiveKernels.stateful_snapshot(state), transition)
+end
+
 function _rhmc_reactant_structured_replacement_program(compiled, lowering)
     source = _RHMCReactantEffectSource(:structured_replacement)
     point = compiled.snapshot.init
@@ -230,6 +240,44 @@ end
 
 _rhmc_ulp_distance(actual::T, expected::T) where {T<:AbstractFloat} =
     abs(Int128(_rhmc_ulp_key(actual)) - Int128(_rhmc_ulp_key(expected)))
+
+@testset "exact scalar abs/div executes through Reactant" begin
+    program = _rhmc_reactant_scalar_abs_div_program()
+    traced_state = _rhmc_hmc_trace(program.snapshot)
+    compiled = @compile program.transition(
+        traced_state,
+        _rhmc_hmc_trace(-3.5),
+        _rhmc_hmc_trace(-7),
+        _rhmc_hmc_trace(2))
+    cases = (
+        (-3.5, 7, 2),
+        (-3.5, -7, 2),
+        (-3.5, 7, -2),
+        (-3.5, -7, -2),
+    )
+    for (input, numerator, denominator) in cases
+        result = compiled(
+            traced_state,
+            _rhmc_hmc_trace(input),
+            _rhmc_hmc_trace(numerator),
+            _rhmc_hmc_trace(denominator))
+        @test Bool(result.returned) && Bool(result.result)
+        @test Float64(result.state.abs_value) === abs(input)
+        @test Int(result.state.quotient) === div(numerator, denominator)
+    end
+
+    for argument_types in (
+            Tuple{Int,Int,Int},
+            Tuple{ComplexF64,Int,Int},
+            Tuple{Vector{Float64},Int,Int},
+            Tuple{Float64,Bool,Bool},
+            Tuple{Float64,Float64,Float64},
+            Tuple{Float64,Int32,Int64},
+        )
+        @test_throws ReactiveKernels._LLowerReject ReactiveKernels.functionalize_stateful(
+            program.kernel, Val(:step!); argument_types)
+    end
+end
 
 function _rhmc_hmc_host_values(result)
     count = Int(result.effects.stats_f.count)

@@ -58,6 +58,22 @@ end
     end
 end
 
+@kernel zero_argument_branch(take=true, count=0) = begin
+    step!() = begin
+        take && (count += 1)
+        return take
+    end
+end
+
+@kernel scalar_abs_div(abs_value=0.0, quotient=0, count=0) = begin
+    step!(input, numerator, denominator) = begin
+        abs_value = abs(input)
+        quotient = div(numerator, denominator)
+        count += 1
+        return true
+    end
+end
+
 @kernel small_loop(count=0) = begin
     step!(lo::Int8, hi::Int8) = begin
         lo <= hi || return false
@@ -150,6 +166,63 @@ end
     fit!(values) = begin
         @. a = b + values
         count += 1
+    end
+end
+
+captured_alias_items(offset=0.0) = ntuple(3) do index
+    storage = [offset + index, offset + index + 0.5]
+    (left=storage, right=storage)
+end
+
+function captured_index_alias_source_oracle(items_seed, index, value)
+    items = deepcopy(items_seed)
+    initial_alias = items[index].left === items[index].right
+    item = items[index]
+    index += 1
+    item.left[1] = value
+    observed = item.right[1]
+    (
+        items=items,
+        index=index,
+        observed=observed,
+        initial_alias=initial_alias,
+        final_alias=item.left === item.right,
+    )
+end
+
+# This source deliberately changes the dynamic index after binding `item`.
+# The subsequent aliased leaf write must retain the address selected at the
+# local assignment, both in ordinary execution and in functional lowering.
+@kernel captured_index_alias(
+        items_seed, replacement_seed, index=1, count=0, observed=0.0) = begin
+    items = deepcopy(items_seed)
+    replacement = deepcopy(replacement_seed)
+    step!(value, take) = begin
+        take || return false
+        item = items[index]
+        index += 1
+        item.left[1] = value
+        observed = item.right[1]
+        count += 1
+        return true
+    end
+    move_root!(value, take) = begin
+        take || return false
+        item = items[index]
+        index += 1
+        copy!!(items, replacement)
+        item.left[1] = value
+        observed = item.right[1]
+        count += 1
+        return true
+    end
+end
+
+@kernel straight_index_alias(items_seed, index=1) = begin
+    items = deepcopy(items_seed)
+    step!(value) = begin
+        item = items[index]
+        item.left[1] = value
     end
 end
 

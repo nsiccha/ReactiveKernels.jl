@@ -869,8 +869,10 @@ _kernel_primitive_effect(@nospecialize(v)) =
 # `min`/`max`/`clamp`/`ifelse` (return an actual), `convert`/`axes`/`eachindex` (can return/borrow arg),
 # and the whole higher-order family (`map`/`reduce`/`sum`/…, arbitrary callable-arg effects). `eachcol`
 # BORROWS arg 1 → the explicit built-in descriptor in `_kernel_primitive_effect` instead. `dot`/`cholesky`/
-# `logdet`/`log`/`exp`/`sqrt` appear only as TOP-LEVEL GRAPH RECIPES in the fixture (not stateful method
-# calls), so they need no entry here. `oftype` delegates to `convert` and CAN return a mutable arg2 — the
+# `logdet` appears only as a TOP-LEVEL GRAPH RECIPE in the fixture. An authored consumer additionally exercises
+# exact `abs(::builtin AbstractFloat)` and `div(::builtin Integer, ::same Integer)` method-body calls; both are
+# admitted only through the same exact-identity, specialization-gated contract. `oftype` delegates to
+# `convert` and CAN return a mutable arg2 — the
 # final uses are numeric SCALARS (value semantics), so it is retained on the understanding that
 # SPECIALIZATION (poc lowering, where concrete types are known) gates it to scalar/deeply-immutable
 # actuals and rejects a mutable actual (coordinate with poc). Expansion is an explicit later step, never a
@@ -879,7 +881,7 @@ const _KERNEL_PURE_PRIMS = (Base.:+, Base.:-, Base.:*, Base.:/, Base.:\, Base.:^
           Base.:(==), Base.:(!=), Base.:<, Base.:>, Base.:<=, Base.:>=, Base.:!, Base.:&, Base.:|, Base.xor,
           Base.zero, Base.one, Base.oftype, Base.isnothing, Base.length, Base.:(:),
           Base.copy, Base.map,
-          Base.exp, Base.log, Base.sqrt,          # unary Real-domain transcendentals (pure, effect-free)
+          Base.exp, Base.log, Base.sqrt, Base.abs, Base.div,
           LogExpFunctions.logaddexp)
 # EXACT-IDENTITY VALUE test (`===` scan over the immutable tuple) — used at capture (definition-time
 # snapshot) AND in `kernel_rebound` to confirm the current binding is STILL an exact registered pure
@@ -951,6 +953,10 @@ function _kernel_pure_callee_domain_ok(@nospecialize(f), argtypes)
     f === Base.isnothing && return length(argtypes) == 1 && _kernel_dom_isnothing(argtypes[1])
     f === Base.:(:)     && return all(_kernel_dom_int_scalar, argtypes)            # Colon: integer numeric
     f === Base.oftype   && return length(argtypes) == 2 && all(_kernel_dom_num_scalar, argtypes)
+    f === Base.abs      && return length(argtypes) == 1 &&
+        _kernel_dom_num_scalar(argtypes[1]) && argtypes[1] <: AbstractFloat
+    f === Base.div      && return length(argtypes) == 2 && argtypes[1] === argtypes[2] &&
+        _kernel_dom_int_scalar(argtypes[1]) && argtypes[1] !== Bool
     (f === Base.zero || f === Base.one) && return length(argtypes) == 1 && _kernel_dom_num_value(argtypes[1])
     # unary transcendentals (RK 14:35 / POC G3): SCALAR-only Real domain — a single-application `exp/log/sqrt`
     # of a numeric scalar leaf is pure and 0-B; NOT admitted over arrays (matrix `exp` is different semantics).
