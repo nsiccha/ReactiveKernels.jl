@@ -97,13 +97,12 @@ specs and dynamic callees are rejected while the outer graph is constructed,
 so no nested planner, dynamic dispatch, or hidden transform branch reaches the
 prepared hot path.
 
-## Differentiation and allocation behavior
+## Allocation behavior
 
 Every prepared boundary is an ordinary straight-line Julia callable. The test
-suite exercises the constrained and Jacobian wants independently with
-DifferentiationInterface and plain Enzyme reverse mode, including the fused
-model Jacobian. The standalone and fused prepared kernels are inferred and
-allocate zero bytes in steady state after warm-up.
+suite exercises the constrained and Jacobian wants independently, including
+the fused model Jacobian. The standalone and fused prepared kernels are
+inferred and allocate zero bytes in steady state after warm-up.
 
 This page covers transform construction and fusion. See
 [Eight schools](eight-schools.md) for these named outputs inside a complete PPL

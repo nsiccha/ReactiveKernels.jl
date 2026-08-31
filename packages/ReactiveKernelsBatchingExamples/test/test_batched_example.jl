@@ -7,6 +7,7 @@ using ReactiveKernels: code_expr
 @testset "Batched (vectorized) log-density example" begin
     artifact = only(map(BatchedExamples.evaluate_source, BatchedExamples.all_sources()))
     source = only(BatchedExamples.all_sources())
+    primal_source = BatchedExamples.BATCHED_PRIMAL_SOURCE
 
     @testset "one native graph, checked against a Distributions oracle" begin
         # The source composes a @kernel recipe and differentiates through
@@ -21,6 +22,11 @@ using ReactiveKernels: code_expr
         @test occursin("Enzyme.Reverse", source)
         @test !occursin("set_runtime_activity", source)
         @test !occursin("function_annotation", source)
+        # The public batching docs render the primal authority only; the
+        # dedicated AD page renders the complete source above.
+        for marker in ("DifferentiationInterface", "Enzyme", "prepare_ad", "ad_gradient")
+            @test !occursin(marker, primal_source)
+        end
         # The compute path is Distributions.jl-free on both want boundaries.
         @test !occursin("Distributions", string(code_expr(artifact.kernel)))
         @test !occursin("Distributions", string(code_expr(artifact.perobs_kernel)))

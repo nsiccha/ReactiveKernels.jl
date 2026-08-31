@@ -48,8 +48,8 @@ The sealed native compiler (`examples/nuts_runtime/kernel_nuts_native.jl`,
 **on `main` as compiler evidence**. The figures in the G7 panel immediately above
 measure that native acceptance artifact and come from the static receipt, not a CI perf
 run or the external `CompiledNUTSState` comparison path. RK, AdvancedHMC, and
-DynamicHMC used one shared DifferentiationInterface+Enzyme gradient and matched
-target, mass, step size, and RNG schedule; the receipt also checks gradient/work
+DynamicHMC used one shared potential-and-gradient authority and matched target,
+mass, step size, and RNG schedule; the receipt also checks gradient/work
 accounting. It does **not** measure adaptation, retained draws, ESS, or
 time-to-effective-sample.
 

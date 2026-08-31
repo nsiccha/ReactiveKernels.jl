@@ -4,8 +4,7 @@
 # reduction over the same scalar `normal_logpdf`. Passing a `Vector` makes the
 # observation port batched; want-set pruning selects either the per-observation
 # density (`want = :per_obs`) or the allocation-free total (`want =
-# :logdensity`), with a single Enzyme reverse pass over the whole batch. No
-# `Distributions.jl` call runs in the compute or gradient path; it is an
+# :logdensity`). No `Distributions.jl` call runs in the compute path; it is an
 # independent oracle only.
 #
 # This module holds the build-executed, `Distributions.jl`-free source rendered
@@ -15,13 +14,11 @@
 # `test/run_nonallocating_integration.jl`); see also `docs/src/batched.md`.
 module BatchedExamples
 
-export BATCHED_SOURCE
+export BATCHED_SOURCE, BATCHED_PRIMAL_SOURCE, BATCHED_AD_SOURCE
 export all_sources, evaluate_source, run
 
-const BATCHED_SOURCE = raw"""
+const BATCHED_PRIMAL_SOURCE = raw"""
 using Distributions
-using DifferentiationInterface
-import Enzyme
 using Random
 
 # One scalar pointwise log density, written once. Nothing here is
@@ -75,16 +72,6 @@ per_obs = perobs_kernel(normal_logpdf, x, μ, logσ)
 reference        = sum(logpdf.(Normal(μ, σ), x))
 reference_perobs = logpdf.(Normal(μ, σ), x)
 
-# Reverse-mode gradient of the total over the whole N-dimensional batch, in ONE
-# pass. DI marks the shared inputs constant; the fused total has no active
-# temporary container, so plain Enzyme reverse mode is sufficient.
-analytic_gradient = @. -(x - μ) / σ^2
-backend = AutoEnzyme(; mode = Enzyme.Reverse)
-prepared_gradient = prepare_ad(
-    total_kernel, backend, normal_logpdf, x, μ, logσ; active = :x,
-)
-gradient = ad_gradient(prepared_gradient, normal_logpdf, x, μ, logσ)
-
 # want-set pruning is structural, not a runtime branch: neither plan
 # materializes the other output representation.
 total_recipes  = length(total_plan.recipes)
@@ -93,7 +80,6 @@ perobs_recipes = length(perobs_plan.recipes)
 @assert total ≈ reference
 @assert per_obs ≈ reference_perobs
 @assert length(per_obs) == N
-@assert gradient ≈ analytic_gradient
 @assert !occursin("Distributions", string(code_expr(total_kernel)))
 @assert !occursin("Distributions", string(code_expr(perobs_kernel)))
 
@@ -107,12 +93,33 @@ docs_example = (;
     perobs_kernel,
     per_obs,
     reference_perobs,
-    gradient,
-    analytic_gradient,
     total_recipes,
     perobs_recipes,
 )
 """
+
+const BATCHED_AD_SOURCE = BATCHED_PRIMAL_SOURCE * raw"""
+
+using DifferentiationInterface
+import Enzyme
+
+# Reverse-mode gradient of the total over the whole N-dimensional batch, in ONE
+# pass. DI marks the shared inputs constant; the fused total has no active
+# temporary container, so plain Enzyme reverse mode is sufficient.
+analytic_gradient = @. -(x - μ) / σ^2
+backend = AutoEnzyme(; mode = Enzyme.Reverse)
+prepared_gradient = prepare_ad(
+    total_kernel, backend, normal_logpdf, x, μ, logσ; active = :x,
+)
+gradient = ad_gradient(prepared_gradient, normal_logpdf, x, μ, logσ)
+
+@assert gradient ≈ analytic_gradient
+
+docs_example = merge(docs_example, (; gradient, analytic_gradient))
+"""
+
+# Preserve the public executable example as the complete primal + AD source.
+const BATCHED_SOURCE = BATCHED_AD_SOURCE
 
 all_sources() = (BATCHED_SOURCE,)
 

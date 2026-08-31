@@ -243,8 +243,8 @@ statements directly rather than a runtime call through `reduced`.
 Nested plates retain both compiler products: ordinary arrays select the
 native fused loop, while traced arrays select the tensorized broadcast/reduce
 body. This is the static-friendly density boundary used by the PPL examples:
-plain reverse Enzyme sees one flat generated function, and Reactant still sees
-the array-native plate form.
+ordinary Julia consumers see one flat generated function, and Reactant still
+sees the array-native plate form.
 
 ### Replica: lift the entire scalar callable
 
@@ -689,8 +689,8 @@ method lookup.
 That proof is deliberately **not** a general Julia-recursion compiler proof. It
 establishes the captured fixture and the encoder's rejection boundary. It does
 not establish arbitrary recursion, arbitrary containers or numeric subtypes,
-arbitrary integrators, automatic differentiation, PPL semantics, or a stable
-exported constructor for every method-bearing `@kernel`.
+arbitrary integrators, PPL semantics, or a stable exported constructor for
+every method-bearing `@kernel`.
 
 There is also a package-boundary distinction. The sealed `_build_nuts_sampler`
 compiler, fixture entry, certificate accessors, and the compiled-reactive
