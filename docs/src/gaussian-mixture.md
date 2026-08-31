@@ -41,10 +41,7 @@ log prior + log Jacobian + log likelihood ──► unconstrained log density
 
 The likelihood port has two equivalent producers. Asking for pointwise terms
 selects the vector of marginalized `log_mix` values plus `sum`; a density-only
-plan selects a fused scalar loop. The latter avoids an active temporary vector
-and is exercised with plain reverse-mode Enzyme through
-`prepare_ad`/`ad_gradient` (observations are supplied as a DI `Constant`
-automatically), without runtime activity or a function annotation.
+plan selects a fused scalar loop. The latter avoids an active temporary vector.
 
 The panel below shows three views of this model: **Raw input** (the source), a
 readable **Generated kernel** derived from the executed kernel and selected

@@ -30,19 +30,12 @@ a prepared kernel.
 > not blanket accelerator support for mutable state machines. E-graph
 > optimization remains future work.
 
-`DifferentiationInterface` is the package's backend-neutral scalar-gradient
-boundary. Concrete AD engines remain optional: in particular, Enzyme is not a
-ReactiveKernels dependency, just as Reactant is loaded only when requested.
-`prepare_ad` resolves one named active HAVE port once, passes every other
-current HAVE value as a DI `Constant`, and reuses the backend preparation.
-
 The runnable [`ReactiveKernelsPPLExamples` eight-schools source](packages/ReactiveKernelsPPLExamples/src/eight_schools.jl) shows how
 to build PPL semantics manually from ordinary recipes: unconstrained-to-
 constrained transforms, an optional log Jacobian, decomposed prior and
 likelihood terms, pointwise log likelihoods, total log density, and new-group
 prediction. Different `want` sets prune density or generated-quantity work from
-the same graph, and the numeric boundary differentiates cleanly through
-reverse-mode AD (`DifferentiationInterface` with the Enzyme backend).
+the same graph.
 
 ## Pipeline
 
@@ -82,43 +75,6 @@ affine_kernel = prepare(affine)
 affine_kernel(3.0)                  # 7.0
 affine_kernel(3.0; offset = 4.0)    # 10.0
 ```
-
-With an AD backend available, the same authored defaults and keywords carry
-through the reusable gradient boundary:
-
-```julia
-using DifferentiationInterface
-import Enzyme
-
-backend = AutoEnzyme(; mode = Enzyme.Reverse)
-affine_ad = prepare_ad(
-    affine, backend, 3.0; active = :x, want = :y,
-)
-ad_gradient(affine_ad, 3.0; offset = 4.0)  # 2.0
-
-# An array-valued active port can also return the value while filling
-# caller-owned gradient storage in place.
-@kernel quadratic(q::Vector{Float64}; data::Vector{Float64}) = begin
-    objective::Float64 = sum(abs2, q .- data)
-end
-q = [1.0, 2.0]
-data = [0.5, -1.0]
-quadratic_ad = prepare_ad(
-    quadratic, backend, q; data, active = :q, want = :objective,
-)
-gradient_buffer = similar(q)
-value, returned_gradient = ad_value_and_gradient!(
-    quadratic_ad, gradient_buffer, q; data,
-)
-returned_gradient === gradient_buffer  # true; gradient_buffer == [1.0, 6.0]
-```
-
-The backend is an `AbstractADType`; core code does not import Enzyme. Plain
-reverse mode is sufficient—no runtime-activity mode or function annotation is
-part of the RK boundary. `ad_gradient` returns a gradient; the prepared-only
-`ad_value_and_gradient!` returns `(value, gradient)` and mutates the supplied
-gradient destination. Both rebuild DI `Constant` contexts from the current
-inactive arguments on every call.
 
 Like ReactiveObjects.jl's object definitions, the primary `@kernel` form
 is a normal-looking function definition. Its arguments are the kernel's input
