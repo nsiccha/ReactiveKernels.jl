@@ -21,6 +21,7 @@ using ReactiveKernels
 using Test
 
 const _MATRIX_CORE_TESTS = (
+    "test_runtests_selector.jl",
     "test_stateless.jl",
     "test_ad.jl",
     "test_authoring.jl",
@@ -77,41 +78,84 @@ const _MATRIX_ACCEPTANCE_TESTS = (
 
 const _FULL_TESTS = (_MATRIX_CORE_TESTS..., _MATRIX_ACCEPTANCE_TESTS...)
 
-const _TEST_MODE = if isempty(ARGS)
-    :full
-elseif ARGS == ["benchmark"]
-    :benchmark
-elseif ARGS == ["ad"]
-    :ad
-elseif ARGS == ["core"]
-    :core
-elseif ARGS == ["acceptance"]
-    :acceptance
-else
-    throw(ArgumentError(
-        "expected no test argument or one of benchmark, ad, core, acceptance; got $(repr(ARGS))"))
+const _TEST_FILE_ORDER = (
+    "test_package_boundary.jl",
+    "test_ci_compiled_modules.jl",
+    _FULL_TESTS...,
+    "test_handwritten_benchmarks.jl",
+)
+
+const _TEST_GROUPS = ("core", "acceptance", "ad", "benchmark")
+
+function _test_group_files(selector::String)
+    selector == "core" && return (
+        "test_package_boundary.jl", "test_ci_compiled_modules.jl",
+        _MATRIX_CORE_TESTS...,
+    )
+    selector == "acceptance" && return (
+        _MATRIX_ACCEPTANCE_TESTS..., "test_handwritten_benchmarks.jl",
+    )
+    selector == "ad" && return (
+        "test_package_boundary.jl", "test_ci_compiled_modules.jl", "test_ad.jl",
+    )
+    selector == "benchmark" && return (
+        "test_package_boundary.jl", "test_ci_compiled_modules.jl",
+        "test_handwritten_benchmarks.jl",
+    )
+    nothing
+end
+
+function _test_file_selector(selector::String)
+    basename(selector) == selector || return nothing
+    file = endswith(selector, ".jl") ? selector : selector * ".jl"
+    file in _TEST_FILE_ORDER ? file : nothing
+end
+
+function _select_test_files(selectors::AbstractVector{<:AbstractString})
+    isempty(selectors) && return _TEST_FILE_ORDER
+
+    requested = Set{String}()
+    unknown = String[]
+    for raw_selector in selectors
+        selector = String(raw_selector)
+        group = _test_group_files(selector)
+        if group !== nothing
+            union!(requested, group)
+            continue
+        end
+        file = _test_file_selector(selector)
+        if file === nothing
+            push!(unknown, selector)
+        else
+            push!(requested, file)
+        end
+    end
+
+    if !isempty(unknown)
+        unknown = sort!(unique!(unknown))
+        throw(ArgumentError(
+            "unknown test selector(s): $(join(repr.(unknown), ", ")). " *
+            "Known groups: $(join(_TEST_GROUPS, ", ")). " *
+            "Known files: $(join(_TEST_FILE_ORDER, ", "))"))
+    end
+
+    Tuple(file for file in _TEST_FILE_ORDER if file in requested)
 end
 
 @assert isempty(intersect(Set(_MATRIX_CORE_TESTS), Set(_MATRIX_ACCEPTANCE_TESTS)))
 @assert all(isfile(joinpath(@__DIR__, file)) for file in _FULL_TESTS)
+@assert _select_test_files(["core", "acceptance"]) == _TEST_FILE_ORDER
+
+const _SELECTED_TEST_FILES = _select_test_files(ARGS)
 
 # Assert the package loads without sampler/compiler domain code before opting into
 # the external executable exemplar used by the remaining NUTS/HMC acceptance tests.
-# The matrix core shard owns this assertion; an ordinary full/ad/benchmark run keeps
-# the historical behavior unchanged.
-_TEST_MODE == :acceptance || include("test_package_boundary.jl")
+# The matrix core shard and the historical ad/benchmark groups own this assertion.
+"test_package_boundary.jl" in _SELECTED_TEST_FILES &&
+    include("test_package_boundary.jl")
 include(joinpath(@__DIR__, "..", "examples", "nuts_runtime.jl"))
 using .ReactiveKernelsNUTSExample
 
 @testset "ReactiveKernels" begin
-    _TEST_MODE == :acceptance || include("test_ci_compiled_modules.jl")
-    if _TEST_MODE == :ad
-        include("test_ad.jl")
-    elseif _TEST_MODE != :benchmark
-        tests = _TEST_MODE == :core ? _MATRIX_CORE_TESTS :
-            _TEST_MODE == :acceptance ? _MATRIX_ACCEPTANCE_TESTS : _FULL_TESTS
-        foreach(include, tests)
-    end
-    _TEST_MODE in (:full, :benchmark, :acceptance) &&
-        include("test_handwritten_benchmarks.jl")
+    foreach(include, filter(!=("test_package_boundary.jl"), _SELECTED_TEST_FILES))
 end
