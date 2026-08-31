@@ -18,8 +18,14 @@ const _SCALAR_GALLERY_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts",
     "scalar-distribution-gallery-v1.toml",
 )
+const _DISTRIBUTION_GRADIENT_RECEIPT_PATH = joinpath(
+    dirname(@__DIR__), "benchmark", "receipts", "distribution-gradient-v1.toml",
+)
 const _EIGHT_SCHOOLS_PRIMAL_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts", "eight-schools-primal-v1.toml",
+)
+const _EIGHT_SCHOOLS_AD_RECEIPT_PATH = joinpath(
+    dirname(@__DIR__), "benchmark", "receipts", "eight-schools-ad-v1.toml",
 )
 const _NUTS_G7_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts", "nuts-g7-v1.toml",
@@ -345,6 +351,181 @@ function render_distribution_benchmarks()
             title = "Normal log-density allocation"),
         _result_table(allocation_rows, _allocation_columns();
             id = "normal-allocation-table", title = "Exact allocation values"),
+        Markdown.Paragraph(Any[Markdown.Italic(Any[provenance])]),
+    ])
+end
+
+const _DISTRIBUTION_GRADIENT_SURFACES = (
+    ("returned_gradient", "Gradient result — ad_gradient"),
+    ("caller_owned_gradient",
+     "Value + caller-owned gradient — ad_value_and_gradient!"),
+)
+
+const _DISTRIBUTION_GRADIENT_FAMILY_LABELS = Dict(
+    "normal" => "Normal plate",
+    "cauchy_location_scale" => "Cauchy",
+    "laplace_location_scale" => "Laplace",
+    "bernoulli_logit" => "Bernoulli",
+    "lognormal_logscale" => "LogNormal",
+    "exponential_logscale" => "Exponential",
+    "geometric_logit" => "Geometric",
+    "uniform_bounded" => "Uniform",
+    "mvnormal_cholesky" => "MVN (Cholesky)",
+)
+
+const _DISTRIBUTION_GRADIENT_GROUP_LABELS = Dict(
+    "normal_plate" => "Normal plate",
+    "scalar_gallery" => "Scalar gallery",
+    "structured" => "Structured",
+)
+
+function _distribution_gradient_rows(measurements)
+    rows = NamedTuple[]
+    for measurement in measurements
+        family = _DISTRIBUTION_GRADIENT_FAMILY_LABELS[measurement["family"]]
+        for (key, method) in _DISTRIBUTION_GRADIENT_SURFACES
+            haskey(measurement, key) || continue
+            result = measurement[key]
+            push!(rows, (;
+                group_key = String(measurement["group"]),
+                group = _DISTRIBUTION_GRADIENT_GROUP_LABELS[measurement["group"]],
+                family,
+                n = Int(measurement["n"]),
+                active = String(measurement["active"]),
+                method,
+                series = string(family, " / ", method),
+                median_ns = Float64(result["median_ns"]),
+                median_bytes = Int(result["median_bytes"]),
+                median_allocs = Int(result["median_allocs"]),
+            ))
+        end
+    end
+    rows
+end
+
+function _distribution_gradient_plot(rows, group_key, metric;
+                                     id::AbstractString, title::AbstractString)
+    selected = filter(row -> row.group_key == group_key, rows)
+    color_key = group_key == "scalar_gallery" ? :series : :method
+    label = metric === :median_ns ? "Median runtime (ns)" : "Median allocated bytes"
+    scale = metric === :median_ns ? log10 : symlog
+    spec = data(selected) *
+        mapping(:n => "N", metric => label; color = color_key => "Call surface") *
+        visual(ScatterLines) *
+        config(
+            height = group_key == "scalar_gallery" ? 380 : 300,
+            scales = scales(X = (; scale = log10), Y = (; scale)),
+        )
+    description = metric === :median_ns ?
+        "Both axes are logarithmic; preparation is excluded." :
+        "The symlog byte axis preserves genuine zero-allocation measurements."
+    _plot_block(spec; id, title, description)
+end
+
+"""Render prepared distribution-gradient timing and allocation evidence."""
+function render_distribution_gradient_benchmarks()
+    receipt = TOML.parsefile(_DISTRIBUTION_GRADIENT_RECEIPT_PATH)
+    get(receipt, "schema", "") == "distribution-gradient-v1" ||
+        error("unexpected distribution-gradient receipt schema")
+    pins = receipt["pins"]
+    get(pins, "reactivekernels_dirty", true) == false ||
+        error("distribution-gradient receipt was produced from a dirty RK tree")
+    protocol = receipt["protocol"]
+    get(protocol, "preparation_in_timed_region", true) == false ||
+        error("distribution-gradient receipt includes preparation")
+    get(protocol, "returned_surface", "") == "ad_gradient" ||
+        error("distribution-gradient returned surface drifted")
+    get(protocol, "caller_owned_surface", "") == "ad_value_and_gradient!" ||
+        error("distribution-gradient caller-owned surface drifted")
+    Int(get(protocol, "rounds", 0)) >= 5 ||
+        error("distribution-gradient receipt lacks five raw rounds")
+
+    source_receipt_paths = Dict(
+        "normal" => _DISTRIBUTION_RECEIPT_PATH,
+        "scalar_gallery" => _SCALAR_GALLERY_RECEIPT_PATH,
+        "structured" => _STRUCTURED_DISTRIBUTION_RECEIPT_PATH,
+    )
+    for (name, path) in source_receipt_paths
+        source = TOML.parsefile(path)
+        recorded = receipt["source_receipts"][name]
+        get(recorded, "schema", "") == source["schema"] ||
+            error("distribution-gradient $name source schema drifted")
+        get(recorded, "generated_at", "") == source["generated_at"] ||
+            error("distribution-gradient $name source generation drifted")
+        get(recorded, "reactivekernels_sha", "") ==
+            source["pins"]["reactivekernels_sha"] ||
+            error("distribution-gradient $name source pin drifted")
+    end
+
+    measurements = receipt["measurements"]
+    length(measurements) == 24 ||
+        error("distribution-gradient receipt must contain 24 case/size rows")
+    all(row -> Float64(row["max_relative_error"]) <= 1e-10, measurements) ||
+        error("distribution-gradient receipt exceeds analytic parity tolerance")
+    rows = _distribution_gradient_rows(measurements)
+
+    steady_measurement(row) = row[row["active_kind"] == "vector" ?
+        "caller_owned_gradient" : "returned_gradient"]
+    zero_cases = count(measurements) do row
+        measurement = steady_measurement(row)
+        Int(measurement["median_bytes"]) == 0 &&
+            Int(measurement["median_allocs"]) == 0
+    end
+    zero_cases == 20 ||
+        error("distribution-gradient receipt must retain 20 zero-allocation cases")
+    structured_bytes = [
+        Int(row["caller_owned_gradient"]["median_bytes"])
+        for row in measurements if row["group"] == "structured"
+    ]
+    summary = "Across $(length(measurements)) distribution case/size combinations, " *
+        "$zero_cases have a zero-byte steady-state gradient path: every Normal " *
+        "plate and scalar-gallery row. The four Cholesky-MVN rows retain " *
+        "$(minimum(structured_bytes))–$(maximum(structured_bytes)) B of internal " *
+        "work even when the gradient destination is caller-owned."
+    provenance = "Receipt pins: RK `$(first(String(pins["reactivekernels_sha"]), 10))`; " *
+        "DifferentiationInterface $(pins["differentiationinterface_version"]); " *
+        "Enzyme $(pins["enzyme_version"]); Julia $(pins["julia_version"]); " *
+        "$(receipt["environment"]["cpu"])."
+
+    timing_columns = (
+        _column(:group, "Corpus"),
+        _column(:family, "Family"),
+        _column(:n, "N"),
+        _column(:active, "Active port"; format = (value, _) -> h.code(value)),
+        _column(:method, "Call surface"),
+        _column(:median_ns, "Median runtime";
+            format = (value, _) -> _fmt_ns(value)),
+    )
+    allocation_columns = (
+        _column(:group, "Corpus"),
+        _column(:family, "Family"),
+        _column(:n, "N"),
+        _column(:active, "Active port"; format = (value, _) -> h.code(value)),
+        _column(:method, "Call surface"),
+        _column(:median_bytes, "Median bytes";
+            format = (value, _) -> string(value, " B")),
+        _column(:median_allocs, "Median allocations"),
+    )
+
+    Markdown.MD(Any[
+        Markdown.Paragraph(Any[summary]),
+        _distribution_gradient_plot(rows, "normal_plate", :median_ns;
+            id = "ad-normal-runtime", title = "Normal gradient runtime"),
+        _distribution_gradient_plot(rows, "normal_plate", :median_bytes;
+            id = "ad-normal-allocation", title = "Normal gradient allocation"),
+        _distribution_gradient_plot(rows, "scalar_gallery", :median_ns;
+            id = "ad-scalar-runtime", title = "Scalar-gallery gradient runtime"),
+        _distribution_gradient_plot(rows, "scalar_gallery", :median_bytes;
+            id = "ad-scalar-allocation", title = "Scalar-gallery gradient allocation"),
+        _distribution_gradient_plot(rows, "structured", :median_ns;
+            id = "ad-mvn-runtime", title = "MVN gradient runtime"),
+        _distribution_gradient_plot(rows, "structured", :median_bytes;
+            id = "ad-mvn-allocation", title = "MVN gradient allocation"),
+        _result_table(rows, timing_columns; id = "distribution-gradient-runtime-table",
+            title = "Exact distribution-gradient runtimes"),
+        _result_table(rows, allocation_columns;
+            id = "distribution-gradient-allocation-table",
+            title = "Exact distribution-gradient allocations"),
         Markdown.Paragraph(Any[Markdown.Italic(Any[provenance])]),
     ])
 end
@@ -843,6 +1024,211 @@ function render_eight_schools_primal_benchmarks()
             title = "Primal boundary × outcome matrix",
             note = "Each measured cell is median runtime; bytes; allocations. " *
                    "A blank cell means that backend has no matching public boundary."),
+        Markdown.Paragraph(Any[Markdown.Italic(Any[provenance])]),
+    ])
+end
+
+const _EIGHT_SCHOOLS_AD_IMPLEMENTATIONS = (
+    ("rk_native", "ReactiveKernels"),
+    ("manual_enzyme", "Manual Julia control"),
+    ("turing_enzyme", "Turing / DynamicPPL"),
+)
+const _EIGHT_SCHOOLS_AD_SUPPORTED = Set((
+    ("packed_unconstrained", "joint"),
+    ("packed_unconstrained", "prior"),
+    ("packed_unconstrained", "likelihood"),
+    ("minimal_likelihood", "likelihood"),
+))
+
+function _eight_schools_ad_plot(rows, metric;
+                                id::AbstractString, title::AbstractString)
+    label = metric === :median_ns ? "Median value + gradient runtime (ns)" :
+        "Median allocated bytes"
+    scale = metric === :median_ns ? log10 : symlog
+    cell_order = unique(getproperty.(rows, :cell))
+    spec = data(rows) *
+        mapping(
+            :cell => sorter(cell_order) => "Scalar matrix cell",
+            metric => label;
+            color = :implementation => "Implementation",
+        ) *
+        visual(BarPlot) *
+        config(height = 320, scales = scales(Y = (; scale)))
+    description = metric === :median_ns ?
+        "Preparation and first execution are excluded; the runtime axis is logarithmic." :
+        "The symlog byte axis retains the four genuine zero-allocation RK measurements."
+    _plot_block(spec; id, title, description)
+end
+
+function _eight_schools_ad_cell(value, _)
+    value === missing && return ""
+    "$(_fmt_ns(value.median_ns)); $(value.median_bytes) B; " *
+    "$(value.median_allocs) alloc"
+end
+
+_eight_schools_ad_sort(value, _) =
+    value === missing ? nothing : value.median_ns
+
+"""Render the exact Eight Schools AD matrix and separated setup evidence."""
+function render_eight_schools_ad_benchmarks()
+    receipt = TOML.parsefile(_EIGHT_SCHOOLS_AD_RECEIPT_PATH)
+    get(receipt, "schema", "") == "eight-schools-ad-v1" ||
+        error("unexpected Eight Schools AD receipt schema")
+    pins = receipt["pins"]
+    get(pins, "reactivekernels_dirty", true) == false ||
+        error("Eight Schools AD receipt was produced from a dirty tree")
+    occursin(r"^[0-9a-f]{40}$", get(pins, "reactivekernels_sha", "")) ||
+        error("Eight Schools AD receipt lacks an exact candidate SHA")
+    model_source = pins["model_source"]
+    get(model_source, "path", "") ==
+        "packages/ReactiveKernelsPPLExamples/src/eight_schools.jl" ||
+        error("Eight Schools AD model authority drifted")
+    occursin(r"^[0-9a-f]{40}$", get(model_source, "commit", "")) ||
+        error("Eight Schools AD model authority lacks a published SHA")
+
+    protocol = receipt["protocol"]
+    Tuple(String.(protocol["input_boundaries"])) == _EIGHT_SCHOOLS_BOUNDARIES ||
+        error("Eight Schools AD input-boundary inventory changed")
+    Tuple(String.(protocol["outcomes"])) == _EIGHT_SCHOOLS_OUTCOMES ||
+        error("Eight Schools AD outcome inventory changed")
+    get(protocol, "pointwise_jacobian_or_vjp_invented", true) == false ||
+        error("Eight Schools AD receipt invented a pointwise Jacobian/VJP")
+    get(protocol, "preparation_in_timed_region", true) == false ||
+        error("Eight Schools AD steady-state timing includes preparation")
+    get(protocol, "first_execution_in_steady_state_region", true) == false ||
+        error("Eight Schools AD steady-state timing includes first execution")
+    Int(get(protocol, "rounds", 0)) >= 10 ||
+        error("Eight Schools AD receipt lacks ten raw rounds")
+
+    measurements = receipt["measurements"]
+    length(measurements) ==
+        length(_EIGHT_SCHOOLS_BOUNDARIES) * length(_EIGHT_SCHOOLS_OUTCOMES) ||
+        error("Eight Schools AD receipt is not a complete 3×4 matrix")
+    indexed = Dict((String(row["boundary"]), String(row["outcome"])) => row
+                   for row in measurements)
+    length(indexed) == length(measurements) ||
+        error("Eight Schools AD receipt contains duplicate matrix rows")
+
+    boundary_labels = Dict(
+        "packed_unconstrained" => "Packed unconstrained",
+        "constrained_parameters" => "Constrained parameters",
+        "minimal_likelihood" => "Likelihood inputs only",
+    )
+    outcome_labels = Dict(
+        "joint" => "Joint",
+        "prior" => "Prior",
+        "likelihood" => "Likelihood",
+        "pointwise" => "Pointwise likelihood",
+    )
+    matrix_rows = NamedTuple[]
+    plot_rows = NamedTuple[]
+    setup_rows = NamedTuple[]
+    for boundary in _EIGHT_SCHOOLS_BOUNDARIES,
+        outcome in _EIGHT_SCHOOLS_OUTCOMES
+        row = get(indexed, (boundary, outcome), nothing)
+        isnothing(row) && error("missing Eight Schools AD row: $boundary / $outcome")
+        expected_support = (boundary, outcome) in _EIGHT_SCHOOLS_AD_SUPPORTED
+        get(row, "supported", false) == expected_support ||
+            error("Eight Schools AD support drifted for $boundary / $outcome")
+        cell = string(boundary_labels[boundary], " / ", outcome_labels[outcome])
+        values = Dict{String,Any}()
+        for (key, implementation) in _EIGHT_SCHOOLS_AD_IMPLEMENTATIONS
+            values[key] = haskey(row, key) ? _eight_schools_measurement(row, key) : missing
+            haskey(row, key) || continue
+            result = row[key]
+            length(result["times_ns"]) >= 10 ||
+                error("insufficient Eight Schools AD rounds for $cell / $implementation")
+            push!(plot_rows, (;
+                cell,
+                implementation,
+                median_ns = Float64(result["median_ns"]),
+                median_bytes = Int(result["median_bytes"]),
+            ))
+            push!(setup_rows, (;
+                cell,
+                implementation,
+                preparation_seconds = Float64(result["preparation_seconds"]),
+                preparation_bytes = Int(result["preparation_bytes"]),
+                first_execution_seconds =
+                    Float64(result["first_execution_seconds"]),
+                first_execution_bytes = Int(result["first_execution_bytes"]),
+            ))
+        end
+        push!(matrix_rows, (;
+            boundary = boundary_labels[boundary],
+            outcome = outcome_labels[outcome],
+            active = expected_support ? String(row["active_port"]) : "",
+            status = expected_support ? "measured" : String(row["unsupported_reason"]),
+            rk_native = values["rk_native"],
+            manual_enzyme = values["manual_enzyme"],
+            turing_enzyme = values["turing_enzyme"],
+        ))
+    end
+
+    rk_rows = [row["rk_native"] for row in measurements if get(row, "supported", false)]
+    zero_rk = count(row -> Int(row["median_bytes"]) == 0 &&
+                           Int(row["median_allocs"]) == 0, rk_rows)
+    zero_rk == 4 || error("Eight Schools AD receipt lost a zero-allocation RK cell")
+    turing_rows = filter(row -> row.implementation == "Turing / DynamicPPL", plot_rows)
+    turing_bytes = getproperty.(turing_rows, :median_bytes)
+    summary = "All four differentiable scalar cells supported by the public RK " *
+        "boundary have a zero-byte, zero-allocation steady-state value-and-gradient " *
+        "path. The three matched DynamicPPL cells allocate " *
+        "$(minimum(turing_bytes))–$(maximum(turing_bytes)) B. Pointwise remains " *
+        "blank because there is no useful matched public Jacobian/VJP contract; " *
+        "the constrained NamedTuple boundary is likewise reported unsupported."
+
+    matrix_columns = (
+        _column(:boundary, "Starting boundary"),
+        _column(:outcome, "Requested outcome"),
+        _column(:active, "Active port";
+            format = (value, _) -> isempty(value) ? "" : h.code(value)),
+        _column(:rk_native, "RK + Enzyme";
+            format = _eight_schools_ad_cell, sort = _eight_schools_ad_sort),
+        _column(:manual_enzyme, "Manual + Enzyme";
+            format = _eight_schools_ad_cell, sort = _eight_schools_ad_sort),
+        _column(:turing_enzyme, "Turing + Enzyme";
+            format = _eight_schools_ad_cell, sort = _eight_schools_ad_sort),
+        _column(:status, "Status";
+            format = (value, _) -> value == "measured" ? value :
+                h.span(value; class = "rk-result-unsupported")),
+    )
+    setup_columns = (
+        _column(:cell, "Scalar matrix cell"),
+        _column(:implementation, "Implementation"),
+        _column(:preparation_seconds, "Preparation";
+            format = (value, _) -> string(round(value; sigdigits = 4), " s")),
+        _column(:preparation_bytes, "Preparation bytes";
+            format = (value, _) -> string(value, " B")),
+        _column(:first_execution_seconds, "First execution";
+            format = (value, _) -> string(round(value; sigdigits = 4), " s")),
+        _column(:first_execution_bytes, "First-execution bytes";
+            format = (value, _) -> string(value, " B")),
+    )
+    provenance = "Receipt pin: RK `$(pins["reactivekernels_sha"])`; published " *
+        "model authority `$(model_source["commit"])`; " *
+        "DifferentiationInterface $(pins["differentiationinterface_version"]); " *
+        "Enzyme $(pins["enzyme_version"]); Turing $(pins["turing_version"]); " *
+        "Julia $(pins["julia_version"]); $(receipt["environment"]["cpu"])."
+
+    Markdown.MD(Any[
+        Markdown.Paragraph(Any[summary]),
+        _eight_schools_ad_plot(plot_rows, :median_ns;
+            id = "eight-schools-ad-runtime",
+            title = "Eight Schools value-and-gradient runtime"),
+        _eight_schools_ad_plot(plot_rows, :median_bytes;
+            id = "eight-schools-ad-allocation",
+            title = "Eight Schools value-and-gradient allocation"),
+        _result_table(matrix_rows, matrix_columns;
+            id = "eight-schools-ad-matrix",
+            title = "AD boundary × outcome matrix",
+            note = "Measured cells show median value-and-gradient runtime; bytes; " *
+                   "allocations. Unsupported cells retain their exact reason."),
+        _result_table(setup_rows, setup_columns;
+            id = "eight-schools-ad-setup",
+            title = "Preparation, compilation, and first execution",
+            note = "These one-time costs are retained separately and excluded " *
+                   "from the steady-state plots and matrix."),
         Markdown.Paragraph(Any[Markdown.Italic(Any[provenance])]),
     ])
 end
