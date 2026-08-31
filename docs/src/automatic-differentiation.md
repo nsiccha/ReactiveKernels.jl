@@ -125,3 +125,57 @@ core dependency:
 
 For matched primal, gradient, and generated-quantity measurements against
 Turing.jl, continue to [Evaluation latency and batched throughput](eval-throughput.md).
+
+## Reactant/XLA-compiled gradients
+
+When the optional Reactant weak dependency is loaded, the same prepared
+differentiation boundary can be compiled through Reactant/XLA — the automatic
+differentiation analog of compiling the primal kernel with
+`@compile sync = true kernel(traced_args...)`. `compile_ad_gradient` and
+`compile_ad_value_and_gradient` take a [`PreparedADKernel`](@ref) — so all of the
+scalar-`want`, single-active-port validation and the authored-`have`-order reorder
+above are reused unchanged — and return a compiled callable over the traced HAVE
+boundary. The differentiation engine stays the caller's `DifferentiationInterface`
+backend; `AutoEnzyme(mode = Enzyme.Reverse)` traces through Reactant and matches
+the native reverse pass bit-for-bit on the boundaries that compile.
+
+This example is not executed during the docs build (Reactant is not a docs
+dependency); it is the exact shape exercised by
+[`test/test_ad_reactant.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/test/test_ad_reactant.jl):
+
+```julia
+using ReactiveKernels
+using Reactant
+import Enzyme
+using DifferentiationInterface: AutoEnzyme
+
+backend = AutoEnzyme(; mode = Enzyme.Reverse)
+
+# Prepare exactly as on the native path — this owns all the validation.
+prepared = prepare_ad(objective, backend, parameters; data, active = :q, want = :density)
+
+# Trace the selected HAVE boundary (authored order), then compile.
+traced = map(Reactant.to_rarray, (parameters, data))
+compiled_gradient = compile_ad_gradient(prepared, traced...)
+gradient = compiled_gradient(traced...)                     # XLA-compiled gradient
+
+compiled_both = compile_ad_value_and_gradient(prepared, traced...)
+value, gradient = compiled_both(traced...)                  # potential + gradient in one call
+```
+
+The boundary is the same one Reactant already imposes on the primal kernel:
+
+- a Reactant-compiled gradient is only possible where the **primal kernel itself
+  compiles through Reactant**. Where it does not (for example the Eight Schools
+  `packed_unconstrained/{joint,prior}` boundaries, which fail with
+  `"Scalar indexing is disallowed."`), the underlying `@compile` error propagates
+  unchanged — the capability neither degrades silently nor tries to fix the primal
+  lowering; and
+- a host (non-traced) active argument, or an argument count that does not match
+  the selected HAVE boundary, raises a clear `ArgumentError` rather than a bare
+  `MethodError`.
+
+`compile_ad_value_and_gradient` returns the `(value, gradient)` pair — one
+compiled call yields both the potential and its gradient, which is the shape a
+sampler wants — while `compile_ad_gradient` returns the gradient alone, mirroring
+[`ad_gradient`](@ref) and [`ad_value_and_gradient!`](@ref) on the native path.
