@@ -218,6 +218,14 @@ because its expressions look alike.
 and the optional `prepare_nonallocating` path apply without an object-specific
 runtime.
 
+Pure endpoints may call imported or module-qualified pure Julia functions
+directly—for example `erfc(z)` or `SpecialFunctions.erfc(z)`. Those bindings are
+resolved in the kernel's definition module and specialize like ordinary Julia
+calls; no wrapper recipe is needed. The authoring contract is referential
+transparency: syntactic mutation, bang calls (including qualified ones), and
+control flow are not exposed as pure endpoints and remain on the effect-aware
+stateful path.
+
 ## See the selected DAG
 
 ```julia
