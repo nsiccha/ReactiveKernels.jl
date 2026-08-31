@@ -20,13 +20,15 @@ end
 function MutatingFunctions.apply!!(
         cache::AbstractArray, op::ReactiveKernels._AuthoredPlateOp{K,A},
         args...) where {K,A}
-    batch = ReactiveKernels._authored_plate_broadcast(Val(A), args...)
+    wrapped = ReactiveKernels._authored_plate_arguments(Val(A), args...)
+    combined_axes = Base.Broadcast.combine_axes(wrapped...)
+    isempty(combined_axes) && throw(ArgumentError(
+        "an authored plate requires at least one non-Ref batched argument"))
     output = only(ReactiveKernels.outputs(op.kernel))
-    result = axes(cache) == axes(batch) && eltype(cache) == ReactiveKernels.valtype(output) ?
-             cache : similar(cache, ReactiveKernels.valtype(output), axes(batch))
-    for index in CartesianIndices(axes(batch))
-        result[index] = op.kernel(batch[index]...)
-    end
+    result = axes(cache) == combined_axes &&
+             eltype(cache) == ReactiveKernels.valtype(output) ?
+             cache : similar(cache, ReactiveKernels.valtype(output), combined_axes)
+    Base.Broadcast.broadcast!(op.kernel, result, wrapped...)
     result
 end
 

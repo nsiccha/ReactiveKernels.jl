@@ -126,6 +126,13 @@ end
     native_text = string(total_ast)
     @test findfirst("_authored_plate_broadcast", native_text) <
           findfirst("__ops__[", native_text)
+    for materializing_ast in (pointwise_ast, both_ast)
+        materializing_text = string(materializing_ast)
+        @test findfirst("_authored_plate_broadcast", materializing_text) <
+              findfirst("similar", materializing_text)
+        @test findfirst("_authored_plate_broadcast", materializing_text) <
+              findfirst("__ops__[", materializing_text)
+    end
 
     readable = string(ReactiveKernels._readable_expr(total_ast, total))
     @test occursin("standard.logpdf", readable)

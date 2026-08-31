@@ -23,7 +23,7 @@ if !isdefined(@__MODULE__, :ReactiveHMCIntegratorFixture)
 end
 
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
-    NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY,
+    normal, NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY,
     EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE,
     MVNORMAL_SOURCE, AR1_SOURCE
 using ReactiveKernelsPPLExamples.EightSchoolsExample:
@@ -102,6 +102,14 @@ end
     σ::Float64 = exp(logσ)
     z::Float64 = (x - μ) / σ
     ld::Float64 = -log(π) - logσ - log1p(z^2)
+end
+
+@kernel reactant_authored_normal_loglik(
+        x::Vector{Float64}, location, scale) = begin
+    pointwise = plate(x, location, scale) do xi, li, si
+        normal(li, si).logpdf(xi)
+    end
+    return sum(pointwise)
 end
 
 @kernel reactant_laplace_logscale(
@@ -585,6 +593,43 @@ end
             logscale_plan; batched = (:x, :μ), reduce = nothing)
         collected_compiled = @compile collected(x, μ, logσ)
         @test Array(collected_compiled(x, μ, logσ)) ≈ reference
+    end
+
+    @testset "authored distribution plate: total, pointwise, and both" begin
+        x_host = collect(range(-1.0, 1.0; length = 12))
+        location_host = 0.3
+        scale_host = 0.9
+        reference = @. -0.5 * log(2π) - log(scale_host) -
+            0.5 * ((x_host - location_host) / scale_host)^2
+
+        total = prepare(reactant_authored_normal_loglik)
+        pointwise = prepare(extract(
+            reactant_authored_normal_loglik; want = :pointwise))
+        both = prepare(extract(
+            reactant_authored_normal_loglik;
+            want = (:pointwise, :__return__)))
+
+        x = Reactant.to_rarray(x_host)
+        location = Reactant.to_rarray(location_host; track_numbers = true)
+        scale = Reactant.to_rarray(scale_host; track_numbers = true)
+        locations_host = collect(range(-0.2, 0.4; length = length(x_host)))
+        scales_host = collect(range(0.8, 1.1; length = length(x_host)))
+        zipped_reference = @. -0.5 * log(2π) - log(scales_host) -
+            0.5 * ((x_host - locations_host) / scales_host)^2
+        locations = Reactant.to_rarray(locations_host)
+        scales = Reactant.to_rarray(scales_host)
+        compiled_total = @compile total(x, location, scale)
+        compiled_pointwise = @compile pointwise(x, locations, scales)
+        compiled_both = @compile both(x, locations, scales)
+
+        @test compiled_total(x, location, scale) ≈ sum(reference)
+        @test Array(compiled_pointwise(x, locations, scales)) ≈ zipped_reference
+        pointwise_result, total_result = compiled_both(x, locations, scales)
+        @test Array(pointwise_result) ≈ zipped_reference
+        @test total_result ≈ sum(zipped_reference)
+        @test !occursin("for ", string(total.f.tensorized_ast))
+        @test !occursin("for ", string(pointwise.f.tensorized_ast))
+        @test !occursin("for ", string(both.f.tensorized_ast))
     end
 
     @testset "native plate path keeps its allocation contract" begin

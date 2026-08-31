@@ -52,23 +52,35 @@ const DISCRETE_SOURCE = BERNOULLI_SOURCE
 const VECTORIZED_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 
-vectorized = plate(normal.logpdf;
-    have = (:x, :location, :scale),
-    want = :logpdf, batched = (:x,))
+@kernel normal_loglik(x::Vector{Float64}, location, scale) = begin
+    pointwise = plate(x, location, scale) do xi, li, si
+        normal(li, si).logpdf(xi)
+    end
+    return sum(pointwise)
+end
+
+vectorized = prepare(normal_loglik)
+pointwise = prepare(extract(normal_loglik; want = :pointwise))
+both = prepare(extract(
+    normal_loglik; want = (:pointwise, :__return__)))
 
 x = collect(range(-1.5, 1.5; length = 8))
 location = 0.3
 scale = 1.2
 inputs = (; x, location, scale)
 output = vectorized(x, location, scale)
+pointwise_output = pointwise(x, location, scale)
+both_output = both(x, location, scale)
 
 docs_example = (;
     name = :vectorized_normal,
-    origin = "vectorized Gaussian log density via `plate` — invariants hoisted (build executed)",
+    origin = "authored Normal likelihood via one transparent `plate` block (build executed)",
     inputs,
-    spec = normal.logpdf,
+    spec = normal_loglik,
     kernel = vectorized,
     output,
+    pointwise_output,
+    both_output,
 )
 """
 
@@ -155,14 +167,8 @@ function evaluate_source(source::AbstractString)
         reference = reference_call(inputs...)
         reference_allocated_bytes =
             _allocated(reference_call, x, location, scale)
-        per_obs = Core.eval(sandbox, quote
-            per_obs_kernel = plate(
-                normal.logpdf;
-                have = (:x, :location, :scale), want = :logpdf,
-                batched = (:x,), reduce = nothing,
-            )
-            per_obs_kernel(Tuple(docs_example.inputs)...)
-        end)
+        per_obs = artifact.pointwise_output
+        @assert artifact.both_output == (per_obs, artifact.output)
         return merge(artifact, (;
             reference, per_obs, allocated_bytes,
             reference_allocated_bytes, inferred_return,

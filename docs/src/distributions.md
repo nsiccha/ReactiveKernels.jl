@@ -53,12 +53,32 @@ result. For example, `normal[Symbol("standard.logpdf")]` addresses the standard
 family term, while `normal.logpdf` addresses the adjusted location-scale
 result; either can be passed to `extract`.
 
-## Batched: the same endpoint with `plate`
+## One authored likelihood, either result boundary
 
-`plate` lifts `normal.logpdf` over observations and sums the results. Work that
-depends only on the shared location and scale stays outside the observation
-loop. `reduce = nothing` selects the same per-observation values for LOO, WAIC,
-or PSIS.
+The likelihood is ordinary kernel source. Its one `plate` node applies the
+transparent distribution object pointwise, and its ordinary `return` selects
+the summed result:
+
+```julia
+@kernel normal_loglik(x::Vector{Float64}, location, scale) = begin
+    pointwise = plate(x, location, scale) do xi, li, si
+        normal(li, si).logpdf(xi)
+    end
+    return sum(pointwise)
+end
+```
+
+`prepare(normal_loglik)` requests the distinguished return. An alternate cut,
+`extract(normal_loglik; want = :pointwise)`, requests the named pointwise array;
+`want = (:pointwise, :__return__)` requests both. These are three lowerings of
+the same authored plate node, not parallel formulas. Total-only execution fuses
+the sum into the plate loop without materializing `pointwise`; the joint cut
+fills `pointwise` and accumulates the total in that same traversal.
+
+Plate arguments use Julia broadcast semantics: scalars repeat, compatible array
+dimensions zip or expand, and incompatible shapes fail before endpoint
+execution. Wrap an array-valued atom in `Ref(x)` so the complete array is passed
+to each scalar body invocation.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(

@@ -28,6 +28,23 @@ batched_spec = @kernel batched_normal(
     logdensity::Float64 = sum(per_obs)
 end
 
+# The authored spelling has one transparent plate node and one sum consumer.
+# Its pointwise cut is the caller-owned-buffer boundary: the weak extension
+# fills the borrowed array directly with the same Julia broadcast semantics as
+# ordinary execution.
+@kernel authored_batched_pointwise() = begin
+    logpdf(x::Float64, μ::Float64, σ::Float64)::Float64 =
+        batched_normal_logpdf(x, μ, σ)
+end
+
+authored_batched_spec = @kernel authored_batched_normal(
+        x::Vector{Float64}, μ::Float64, σ::Float64) = begin
+    pointwise = plate(x, μ, σ) do xi, mi, si
+        authored_batched_pointwise().logpdf(xi, mi, si)
+    end
+    return sum(pointwise)
+end
+
 # The owned DI Cache gives Enzyme explicit activity at the call boundary, so
 # ordinary reverse mode suffices; no runtime activity or function annotation.
 const BATCHED_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
@@ -75,6 +92,21 @@ const BATCHED_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
         println("BATCHED_ALLOC\tnonalloc_perobs\t", perobs_bytes)
         @test total_bytes == 0
         @test perobs_bytes == 0
+    end
+
+    @testset "authored plate: pointwise cut reuses its broadcast buffer" begin
+        pointwise = prepare_nonallocating(extract(
+            authored_batched_spec; want = :pointwise))
+        expected = broadcast(batched_normal_logpdf, x, μ, σ)
+
+        first_result = pointwise(x, μ, σ)
+        second_result = pointwise(x, μ, σ)
+        @test first_result === second_result
+        @test second_result ≈ expected
+
+        pointwise_bytes = @ballocated $pointwise($x, $μ, $σ)
+        println("BATCHED_ALLOC\tauthored_plate_pointwise\t", pointwise_bytes)
+        @test pointwise_bytes == 0
     end
 
     @testset "gradient: one reverse pass, zero bytes via an owned buffer" begin

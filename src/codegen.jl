@@ -61,10 +61,14 @@ end
 @inline _authored_plate_argument(::Val{A}, index, arg) where {A} =
     index in A ? Ref(arg) : arg
 
-function _authored_plate_broadcast(::Val{A}, args...) where {A}
-    wrapped = ntuple(length(args)) do index
+function _authored_plate_arguments(::Val{A}, args...) where {A}
+    ntuple(length(args)) do index
         _authored_plate_argument(Val(A), index, getfield(args, index))
     end
+end
+
+function _authored_plate_broadcast(::Val{A}, args...) where {A}
+    wrapped = _authored_plate_arguments(Val(A), args...)
     broadcasted = Base.broadcasted(tuple, wrapped...)
     isempty(axes(broadcasted)) && throw(ArgumentError(
         "an authored plate requires at least one non-Ref batched argument"))
