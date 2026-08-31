@@ -1160,17 +1160,15 @@ function render_eight_schools_reactant_benchmark()
         error("Eight Schools Reactant receipt is not synchronous")
     get(protocol, "gradients_included", true) &&
         error("Eight Schools Reactant receipt unexpectedly contains gradients")
-    Tuple(protocol["input_boundaries"]) ==
-        ("packed_unconstrained", "constrained_parameters", "minimal_likelihood") ||
+    Tuple(String.(protocol["input_boundaries"])) == _EIGHT_SCHOOLS_BOUNDARIES ||
         error("unexpected Eight Schools input-boundary matrix")
-    Tuple(protocol["outcomes"]) ==
-        ("joint", "prior", "likelihood", "pointwise") ||
+    Tuple(String.(protocol["outcomes"])) == _EIGHT_SCHOOLS_OUTCOMES ||
         error("unexpected Eight Schools output matrix")
 
     boundary_labels = Dict(
         "packed_unconstrained" => "Packed unconstrained",
         "constrained_parameters" => "Constrained parameters",
-        "minimal_likelihood" => "Minimal likelihood",
+        "minimal_likelihood" => "Likelihood inputs only",
     )
     rows = map(receipt["measurements"]) do measurement
         native_supported = get(measurement, "rk_native_supported", false)
