@@ -57,6 +57,31 @@ end
     return prior
 end
 
+@kernel authored_namedtuple_eight_schools_prior(parameters) = begin
+    μ::Float64 = parameters.μ
+    τ::Float64 = parameters.τ
+    θ::AbstractVector{Float64} = parameters.θ
+    log_τ::Float64 = log(τ)
+    μ_prior::Float64 = authored_normal(0.0, 5.0).logpdf(μ)
+    τ_cauchy::Float64 = authored_cauchy(0.0, 5.0).logpdf(τ)
+    τ_prior::Float64 = log(2.0) + τ_cauchy
+    effects_pointwise = plate(θ, μ, τ, log_τ) do θj, μj, τj, log_τj
+        authored_normal(;
+            location = μj, scale = τj, log_scale = log_τj).logpdf(θj)
+    end
+    prior::Float64 = μ_prior + τ_prior + sum(effects_pointwise)
+    return prior
+end
+
+@kernel authored_namedtuple_observed_loglik(
+        parameters, observations, observation_scales) = begin
+    μ::Float64 = parameters.μ
+    pointwise = plate(μ, observations, observation_scales) do μj, xj, sj
+        authored_normal(μj, sj).logpdf(xj)
+    end
+    return sum(pointwise)
+end
+
 @kernel untyped_authored_normal_loglik(x, location, scale) = begin
     pointwise = plate(x, location, scale) do xi, li, si
         authored_normal(li, si).logpdf(xi)
@@ -161,6 +186,34 @@ end
         untyped_total, xs, location, scale) == 0
     @test !occursin("for ", string(untyped_total.f.tensorized_ast))
 
+    parameters = (; μ = location, τ = scale, θ = xs)
+    constrained_prior = prepare(
+        authored_namedtuple_eight_schools_prior;
+        have = :parameters, want = :prior)
+    constrained_reference =
+        _authored_plate_normal(location, 0.0, 5.0) +
+        log(2.0) + _authored_plate_cauchy(scale, 0.0, 5.0) +
+        sum(_authored_plate_normal(value, location, scale) for value in xs)
+    @test constrained_prior.f isa
+          ReactiveKernels._DynamicEmbeddedFunctionPair
+    @test typeof(constrained_prior.f).parameters[1] == (1,)
+    @test constrained_prior(parameters) ≈ constrained_reference
+
+    scalar_parameters = (; μ = location)
+    observed_scales = fill(scale, length(xs))
+    observed_total = prepare(authored_namedtuple_observed_loglik)
+    observed_pointwise = prepare(extract(
+        authored_namedtuple_observed_loglik; want = :pointwise))
+    @test typeof(observed_total.f).parameters[1] == (1, 2, 3)
+    @test observed_total(scalar_parameters, xs, observed_scales) ≈ sum(
+        _authored_plate_normal(xs[i], location, observed_scales[i])
+        for i in eachindex(xs))
+    observed_pointwise_text = string(code_expr(observed_pointwise))
+    @test findfirst("_authored_plate_broadcast", observed_pointwise_text) <
+          findfirst("similar", observed_pointwise_text)
+    @test_throws DimensionMismatch observed_pointwise(
+        scalar_parameters, xs, observed_scales[1:3])
+
     # Positional KernelSpec application requests the distinguished return.
     @test authored_normal_loglik(xs, location, scale) ≈ sum(reference)
     @test total(xs, location, scale) ≈ sum(reference)
@@ -211,12 +264,25 @@ end
     pair = ReactiveKernels._DynamicEmbeddedFunctionPair{
         (1, 2),typeof(native_call),typeof(tensorized_call),Expr}(
             native_call, tensorized_call, Expr(:block))
+    single_candidate_pair = ReactiveKernels._DynamicEmbeddedFunctionPair{
+        (1,),typeof(native_call),typeof(tensorized_call),Expr}(
+            native_call, tensorized_call, Expr(:block))
     typed_pair = ReactiveKernels._EmbeddedFunctionPair{
         1,typeof(native_call),typeof(tensorized_call),Expr}(
             native_call, tensorized_call, Expr(:block))
     backend_locations = _AuthoredPlateBackendArray(locations)
     @test pair((), xs, backend_locations) === :tensorized
     @test pair((), xs, locations) === :native
+    @test pair((), (; μ = location, τ = scale), locations) === :native
+    @test pair((), Dict(:μ => location, :τ => scale), locations) === :native
+    @test pair((), (; μ = location, τ = scale), backend_locations) ===
+          :tensorized
+    @test pair((), (; θ = xs), locations) === :native
+    @test pair((), (; θ = backend_locations), locations) === :tensorized
+    @test single_candidate_pair((), (; μ = location, τ = scale)) === :native
+    @test single_candidate_pair(
+        (), (; μ = location, τ = scale, θ = backend_locations)) ===
+          :tensorized
     @test typed_pair((), xs, backend_locations) === :tensorized
     @test typed_pair((), xs, locations) === :native
     zipped_reference = [
