@@ -106,25 +106,19 @@ output = evaluation_kernel(μ, log_τ, θ, observations, observation_scales)
 parameters, prior, likelihood = output
 
 # Pointwise likelihoods and their total are alternate cuts through the same
-# authored plate node. Total-only lowering fuses the sum; requesting both fills
-# the pointwise result and accumulates the total in that same traversal.
+# authored plate node. Total-only lowering fuses the sum without materializing
+# the pointwise vector.
 pointwise_extraction = prepare(model;
     have = (:θ, :observations, :observation_scales),
     want = :pointwise)
 likelihood_extraction = prepare(model;
     have = (:θ, :observations, :observation_scales),
     want = :likelihood)
-pointwise_and_likelihood_extraction = prepare(model;
-    have = (:θ, :observations, :observation_scales),
-    want = (:pointwise, :likelihood))
 pointwise = pointwise_extraction(θ, observations, observation_scales)
 extracted_likelihood =
     likelihood_extraction(θ, observations, observation_scales)
-pointwise_and_likelihood =
-    pointwise_and_likelihood_extraction(θ, observations, observation_scales)
 @assert likelihood ≈ sum(pointwise)
 @assert extracted_likelihood ≈ likelihood
-@assert pointwise_and_likelihood == (pointwise, likelihood)
 
 docs_example = (;
     name = :eight_schools_extraction,
@@ -136,9 +130,7 @@ docs_example = (;
     requested_nodes,
     pointwise_extraction,
     likelihood_extraction,
-    pointwise_and_likelihood_extraction,
     pointwise,
-    pointwise_and_likelihood,
     normal_object = normal,
     cauchy_object = cauchy,
 )

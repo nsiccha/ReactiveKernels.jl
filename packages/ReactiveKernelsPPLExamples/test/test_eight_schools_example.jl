@@ -1,12 +1,12 @@
 using ReactiveKernelsPPLExamples.EightSchoolsExample
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauchy
 
-_eight_schools_likelihood_call(kernel, observations, effects, scales) =
-    kernel(observations, effects, scales)
+_eight_schools_likelihood_call(kernel, effects, observations, scales) =
+    kernel(effects, observations, scales)
 
-_eight_schools_likelihood_allocated(kernel, observations, effects, scales) =
+_eight_schools_likelihood_allocated(kernel, effects, observations, scales) =
     @allocated _eight_schools_likelihood_call(
-        kernel, observations, effects, scales,
+        kernel, effects, observations, scales,
     )
 
 _eight_schools_reference_normal(x, location, scale) =
@@ -42,7 +42,6 @@ end
     @test artifact.cauchy_object === cauchy
     @test artifact.pointwise_extraction.plan.graph === model.graph
     @test artifact.likelihood_extraction.plan.graph === model.graph
-    @test artifact.pointwise_and_likelihood_extraction.plan.graph === model.graph
 
     @testset "one named model graph, with only the intentional transform alternative" begin
         # Every model QOI has exactly one producer; constrained parameters alone
@@ -344,32 +343,24 @@ end
         @test artifact.pointwise ≈ expected_pointwise
         @test artifact.pointwise_extraction.plan.graph ===
               artifact.likelihood_extraction.plan.graph
-        @test artifact.pointwise_extraction.plan.graph ===
-              artifact.pointwise_and_likelihood_extraction.plan.graph
         likelihood = _eight_schools_likelihood_call(
             artifact.likelihood_extraction,
-            EIGHT_SCHOOLS_Y, θ, EIGHT_SCHOOLS_SIGMA,
+            θ, EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA,
         )
         @test likelihood ≈ sum(expected_pointwise)
-        combined_pointwise, combined_likelihood =
-            artifact.pointwise_and_likelihood
-        @test combined_pointwise ≈ expected_pointwise
-        @test combined_likelihood ≈ likelihood
 
-        # The one authored plate lowers three ways. Pointwise-only allocates
-        # exactly its requested result; total-only emits a scalar accumulator
-        # with no output buffer; both-wants fills and sums in one traversal.
+        # The one authored plate exposes both useful cuts. Pointwise-only
+        # allocates exactly its requested result; total-only emits a scalar
+        # accumulator with no output buffer.
         @test occursin("similar", string(code_expr(artifact.pointwise_extraction)))
         @test !occursin("similar", string(code_expr(artifact.likelihood_extraction)))
-        @test occursin("similar",
-            string(code_expr(artifact.pointwise_and_likelihood_extraction)))
         _eight_schools_likelihood_call(
             artifact.likelihood_extraction,
-            EIGHT_SCHOOLS_Y, θ, EIGHT_SCHOOLS_SIGMA,
+            θ, EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA,
         )
         @test _eight_schools_likelihood_allocated(
             artifact.likelihood_extraction,
-            EIGHT_SCHOOLS_Y, θ, EIGHT_SCHOOLS_SIGMA,
+            θ, EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA,
         ) == 0
     end
 
