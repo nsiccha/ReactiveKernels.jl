@@ -847,6 +847,119 @@ function render_eight_schools_primal_benchmarks()
     ])
 end
 
+const _MNIST_LOGISTIC_RECEIPT_PATH = joinpath(
+    dirname(@__DIR__), "benchmark", "receipts", "mnist-logistic-v1.toml")
+const _MNIST_LOGISTIC_BOUNDARIES = ("packed_unconstrained", "structured_parameters")
+const _MNIST_LOGISTIC_OUTCOMES = ("joint", "prior", "likelihood", "pointwise")
+const _MNIST_LOGISTIC_BACKENDS = ("rk_native", "manual_julia", "turing_native")
+
+# The model's likelihood is a single `@addlogprob!` term, so Turing exposes no
+# public per-observation pointwise view; that cell is omitted, not synthesized.
+_mnist_logistic_supported(boundary, outcome, backend) =
+    !(backend == "turing_native" && outcome == "pointwise")
+
+"""Render the checked-in MNIST multinomial-logistic boundary/outcome matrix."""
+function render_mnist_logistic_benchmarks()
+    receipt = TOML.parsefile(_MNIST_LOGISTIC_RECEIPT_PATH)
+    get(receipt, "schema", "") == "mnist-logistic-v1" ||
+        error("unexpected MNIST logistic benchmark receipt schema")
+    pins = receipt["pins"]
+    get(pins, "reactivekernels_dirty", true) == false ||
+        error("MNIST logistic receipt was produced from a dirty RK tree")
+    occursin(r"^[0-9a-f]{40}$", get(pins, "reactivekernels_sha", "")) ||
+        error("MNIST logistic receipt lacks an exact ReactiveKernels SHA")
+
+    protocol = receipt["protocol"]
+    Tuple(String.(protocol["input_boundaries"])) == _MNIST_LOGISTIC_BOUNDARIES ||
+        error("MNIST logistic input-boundary inventory changed")
+    Tuple(String.(protocol["outcomes"])) == _MNIST_LOGISTIC_OUTCOMES ||
+        error("MNIST logistic outcome inventory changed")
+    Int(get(protocol, "rounds", 0)) >= 10 ||
+        error("MNIST logistic receipt has fewer than ten timing rounds")
+    Int(get(protocol, "num_features", 0)) == 784 ||
+        error("MNIST logistic receipt must use full-resolution features")
+    get(protocol, "setup_in_timed_region", true) == false ||
+        error("MNIST logistic setup entered the timed region")
+    get(protocol, "preparation_in_timed_region", true) == false ||
+        error("MNIST logistic preparation entered the timed region")
+    get(protocol, "turing_pointwise_supported", true) == false ||
+        error("Turing has no public pointwise view for the @addlogprob! likelihood")
+
+    measurements = receipt["measurements"]
+    length(measurements) ==
+        length(_MNIST_LOGISTIC_BOUNDARIES) * length(_MNIST_LOGISTIC_OUTCOMES) ||
+        error("MNIST logistic receipt is not a complete 2×4 matrix")
+    indexed = Dict((String(row["boundary"]), String(row["outcome"])) => row
+                   for row in measurements)
+
+    boundary_labels = Dict(
+        "packed_unconstrained" => "Packed unconstrained",
+        "structured_parameters" => "Structured (W, b)")
+    outcome_labels = Dict(
+        "joint" => "Joint", "prior" => "Prior",
+        "likelihood" => "Likelihood", "pointwise" => "Pointwise likelihood")
+    rows = NamedTuple[]
+    for boundary in _MNIST_LOGISTIC_BOUNDARIES, outcome in _MNIST_LOGISTIC_OUTCOMES
+        row = get(indexed, (boundary, outcome), nothing)
+        isnothing(row) && error("missing MNIST logistic row: $boundary / $outcome")
+        for backend in _MNIST_LOGISTIC_BACKENDS
+            haskey(row, backend) == _mnist_logistic_supported(boundary, outcome, backend) ||
+                error("unexpected support for $boundary / $outcome / $backend")
+            haskey(row, backend) || continue
+            length(row[backend]["times_ns"]) >= 10 ||
+                error("insufficient timing rounds for $boundary / $outcome / $backend")
+        end
+        push!(rows, (;
+            boundary = boundary_labels[boundary],
+            outcome = outcome_labels[outcome],
+            rk_native = _eight_schools_measurement(row, "rk_native"),
+            manual_julia = _eight_schools_measurement(row, "manual_julia"),
+            turing_native = _eight_schools_measurement(row, "turing_native")))
+    end
+
+    turing_rows = filter(row -> row.turing_native !== missing, rows)
+    rk_faster_than_turing = count(
+        row -> row.rk_native.median_ns < row.turing_native.median_ns, turing_rows)
+    turing_ratios =
+        [row.turing_native.median_ns / row.rk_native.median_ns for row in turing_rows]
+    manual_ratios =
+        [row.manual_julia.median_ns / row.rk_native.median_ns for row in rows]
+    pointwise_only = length(rows) - length(turing_rows)
+    summary = "RK is faster than Turing in $rk_faster_than_turing/" *
+        "$(length(turing_rows)) matched native cells; Turing/RK runtime ranges from " *
+        "$(round(minimum(turing_ratios); digits = 2))× to " *
+        "$(round(maximum(turing_ratios); digits = 2))×. Against the handwritten Julia " *
+        "control, manual/RK ranges from $(round(minimum(manual_ratios); digits = 2))× " *
+        "to $(round(maximum(manual_ratios); digits = 2))× (1× is parity). RK also " *
+        "exposes per-observation pointwise log likelihoods in $pointwise_only cells " *
+        "where Turing's single `@addlogprob!` term has no public view."
+    columns = (
+        _column(:boundary, "Starting boundary"),
+        _column(:outcome, "Requested outcome"),
+        _column(:rk_native, "RK native";
+            format = _eight_schools_cell, sort = _eight_schools_sort),
+        _column(:manual_julia, "Manual Julia";
+            format = _eight_schools_cell, sort = _eight_schools_sort),
+        _column(:turing_native, "Turing native";
+            format = _eight_schools_cell, sort = _eight_schools_sort))
+    provenance = "Receipt pin: ReactiveKernels `$(pins["reactivekernels_sha"])`; " *
+        "Julia $(pins["julia_version"]); Turing $(pins["turing_version"]); " *
+        "DynamicPPL $(pins["dynamicppl_version"]); MLDatasets $(pins["mldatasets_version"]); " *
+        "$(receipt["environment"]["cpu"]). $(protocol["num_observations"]) MNIST images × " *
+        "$(protocol["num_features"]) features × $(protocol["num_classes"]) classes. " *
+        "Raw rounds are retained in benchmark/receipts/mnist-logistic-v1.toml."
+
+    Markdown.MD(Any[
+        Markdown.Paragraph(Any[summary]),
+        _result_table(rows, columns;
+            id = "mnist-logistic-matrix",
+            title = "MNIST logistic boundary × outcome matrix",
+            note = "Each measured cell is median runtime; bytes; allocations. " *
+                   "A blank cell means that backend has no matching public boundary."),
+        Markdown.Paragraph(Any[Markdown.Italic(Any[provenance])]),
+    ])
+end
+
 function _definition_grid(rows; class = "rk-definition-grid")
     children = Any[]
     for row in rows

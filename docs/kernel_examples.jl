@@ -213,6 +213,17 @@ function setup_eight_schools!(mod::Module)
     nothing
 end
 
+function setup_mnist_logistic!(mod::Module)
+    if !isdefined(mod, :MNISTLogisticExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: MNISTLogisticExample))
+    end
+    # Bind only the data. The displayed PPL assembly imports and reuses the
+    # shared `normal` and `categorical_logit` distribution objects directly.
+    Core.eval(mod, :(using .MNISTLogisticExample:
+        MNIST_LOGISTIC_X, MNIST_LOGISTIC_Y, NUM_CLASSES))
+    nothing
+end
+
 function setup_linear_regression!(mod::Module)
     if !isdefined(mod, :LinearRegressionExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: LinearRegressionExample))
@@ -822,6 +833,7 @@ const EXPECTED_PPL_EXAMPLES = (
     :dugongs_density,
     :arma11_density,
     :gaussian_mixture_density,
+    :mnist_logistic_density,
 )
 const _PPL_EXECUTION_COUNTS = Dict(name => 0 for name in EXPECTED_PPL_EXAMPLES)
 
