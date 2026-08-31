@@ -2,6 +2,7 @@ module ReactiveKernelsReactantExt
 
 using ReactiveKernels
 import Reactant
+import DifferentiationInterface
 
 @inline ReactiveKernels._kernel_source_arg_style(
     arg::Reactant.TracedType) = Val(:tensorized)
@@ -438,6 +439,50 @@ function ReactiveKernels._replica_call(
                              output_types[output_index])
     end
     length(results) == 1 ? only(results) : results
+end
+
+# --- Reactant-compiled automatic differentiation -----------------------------
+# Selected by core's `compile_ad_gradient` / `compile_ad_value_and_gradient` when
+# the active argument is a Reactant-traced value. The differentiation engine is
+# the DifferentiationInterface backend stored in the `PreparedADKernel` (verified:
+# `AutoEnzyme(mode = Enzyme.Reverse)` traces through Reactant with exact parity),
+# so no concrete AD engine is imported here.
+#
+# The compiled closure receives the selected HAVE boundary in authored order, uses
+# the same `_ad_arguments` reorder + `Constant`-context construction as the native
+# path, and calls DifferentiationInterface inside the traced region. Only the
+# traced arguments are part of the backend ABI; `prepared.call` (an immutable
+# `_ADKernelCall` wrapping a `PreparedKernel`) and the backend are captured host
+# constants, exactly as the primal Reactant kernel object is.
+_rk_reactant_ad_op(::Val{:gradient}) = DifferentiationInterface.gradient
+_rk_reactant_ad_op(::Val{:value_and_gradient}) =
+    DifferentiationInterface.value_and_gradient
+
+function _rk_reactant_compile_ad(
+        mode::Val, prepared::ReactiveKernels.PreparedADKernel{I}, args::Tuple;
+        sync::Bool) where {I}
+    op = _rk_reactant_ad_op(mode)
+    call = prepared.call
+    backend = prepared.backend
+    fn = let op = op, call = call, backend = backend
+        (traced...) -> begin
+            point, contexts = ReactiveKernels._ad_arguments(Val(I), traced)
+            op(call, backend, point, contexts...)
+        end
+    end
+    Reactant.compile(fn, args; sync = sync)
+end
+
+function ReactiveKernels._reactant_compile_ad(
+        mode::Val, prepared::ReactiveKernels.PreparedADKernel,
+        ::Reactant.RArray, args...; sync::Bool = true)
+    _rk_reactant_compile_ad(mode, prepared, args; sync = sync)
+end
+
+function ReactiveKernels._reactant_compile_ad(
+        mode::Val, prepared::ReactiveKernels.PreparedADKernel,
+        ::Reactant.RNumber, args...; sync::Bool = true)
+    _rk_reactant_compile_ad(mode, prepared, args; sync = sync)
 end
 
 end # module ReactiveKernelsReactantExt

@@ -30,7 +30,9 @@ using Test
     @test !isfile(joinpath(root, "docs", "src", "components", "Banner.vue"))
     @test !occursin("@/Banner.vue", theme)
     @test !occursin("layout-bottom", theme)
-    @test occursin("rendered site must not contain the removed warning banner", rendered_gate)
+    @test occursin("function _check_warning_banner_absent", rendered_gate)
+    @test occursin("(\"warning-banner\", \"You are viewing the dev branch\")", rendered_gate)
+    @test occursin("_check_warning_banner_absent(build_dir, advisories)", rendered_gate)
 
     @test occursin("pathfinder_kernel_authoring_fixture.jl", examples)
     @test occursin("pathfinder_jl_kernel_authoring_fixture.jl", examples)
