@@ -8,6 +8,8 @@ include(joinpath(@__DIR__, "..", "..", "benchmark",
                  "reactivehmc_integrator_kernel_fixture.jl"))
 include(joinpath(@__DIR__, "..", "..", "benchmark",
                  "reactivehmc_hmc_kernel_fixture.jl"))
+include(joinpath(@__DIR__, "..", "..", "benchmark",
+                 "reactivehmc_hmc_kernel_fixture_b.jl"))
 
 const RK = ReactiveKernels
 
@@ -37,7 +39,8 @@ step_lowering(transition) = (effect, point) -> (
 )
 
 function build_case(case; potential_f=potential, gradient_f=gradient,
-                    numeric_type=Float64)
+                    numeric_type=Float64,
+                    hmc_spec=ReactiveHMCHMCFixture.hmc_state)
     T = numeric_type
     stepsize = T(case["stepsize"])
     n_steps = case["n_steps"]
@@ -77,7 +80,7 @@ function build_case(case; potential_f=potential, gradient_f=gradient,
         stats_f=stats_port,
     )
     kernel = RK.compile_stateful(
-        ReactiveHMCHMCFixture.hmc_state, bindings, point;
+        hmc_spec, bindings, point;
         n_steps, min_dham, step_f=step_source, stats_f=stats_source)
     state = kernel(point; n_steps, min_dham,
                    step_f=step_source, stats_f=stats_source)

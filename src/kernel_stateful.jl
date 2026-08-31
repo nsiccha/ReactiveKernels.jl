@@ -1632,7 +1632,8 @@ function _kernel_pure_callee_domain_ok(@nospecialize(f), argtypes)
     f === Base.sqrt && return length(argtypes) == 1 &&
         (_kernel_dom_num_scalar(argtypes[1]) || _kernel_dom_diag(argtypes[1]))
     f === Base.:* && length(argtypes) == 2 &&
-        _kernel_dom_diag(argtypes[1]) && _kernel_dom_num_array(argtypes[2]) &&
+        (_kernel_dom_diag(argtypes[1]) || _kernel_dom_lmul_lhs(argtypes[1])) &&
+        _kernel_dom_num_array(argtypes[2]) &&
         eltype(argtypes[1]) === eltype(argtypes[2]) && return true
     # arithmetic / comparison / logical / logaddexp: numeric leaves OR numeric arrays (broadcast eltype).
     all(_kernel_dom_num_value, argtypes)

@@ -884,8 +884,14 @@ function _kmstmt_assign(ex, ctx::_KMIRCtx, shadow::Set{Symbol})
         style = named ? :named : :tuple
         return (_LocalAssign(Tuple(names), _kmexpr(rhs, ctx, shadow), style), Set{Symbol}(names))
     end
+    # A dotted write through a positional formal mutates the object denoted by
+    # that formal; an ordinary `formal = rhs` remains Julia local rebinding.
+    # Keeping the distinction here lets typed lowering classify `ep .= source`
+    # as an RK structured-state transfer without weakening ordinary `=`.
+    formal_dot = dot && lhs isa Symbol && haskey(ctx.formalpos, lhs) &&
+                 ctx.formalkind[lhs] === :pos
     # a PLACE write (field-rooted / owned-alias / indexed-nested / deferred) — never rejected.
-    if _kmir_is_place_lhs(lhs, ctx, shadow)
+    if _kmir_is_place_lhs(lhs, ctx, shadow) || formal_dot
         return (_kmir_placewrite(lhs, rhs, op, dot, ctx, shadow), Set{Symbol}())
     end
     # a plain method-local (re)bind — maintain SCOPE-LIVE owned aliases. A local bound ONCE to a SINGLE

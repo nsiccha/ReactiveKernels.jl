@@ -65,9 +65,10 @@ end
     owned
 end
 # validate one refresh primitive statement (registered :primitive, not rebound) and resolve its singleton callee
-function _refresh_callable(st, i)
-    (st isa _ExprStmt && st.expr isa _RegisteredCall) || _l_reject("refresh statement $i must be a registered primitive write")
-    rc = st.expr; reg = rc.registration
+function _refresh_registered_callable(rc, i)
+    rc isa _RegisteredCall ||
+        _l_reject("refresh statement $i must contain a registered primitive call")
+    reg = rc.registration
     getfield(reg, :kind) === :primitive || _l_reject("refresh statement $i is not a registered primitive ($(getfield(reg,:kind)))")
     resolved = _kernel_resolve_captured_ref(rc.ref)
     kernel_rebound(reg, resolved) && _l_reject("refresh statement $i authored slot was REBOUND after definition")
@@ -82,23 +83,58 @@ function _refresh_callable(st, i)
         _l_reject("refresh statement $i primitive effect descriptor drifted from the canonical registry")
     (rc, resolved)
 end
+function _refresh_callable(st, i)
+    st isa _ExprStmt ||
+        _l_reject("refresh statement $i must be a registered primitive write")
+    _refresh_registered_callable(st.expr, i)
+end
 _is_selffield(x, path) = x isa _SelfField && x.path == path
 function compile_refresh(pf, ::Type{OW}, ::Type{SH}, refresh_ir::MethodIR) where {OW,SH}
     plan = kernel_prepared_plan(pf); fc = _exec_canon_map(plan)
     mom_c = fc[:mom]; chol_c = fc[:chol_metric]
     mom_slot = kernel_plan_field(plan, mom_c)[2]; chol_slot = kernel_plan_field(plan, chol_c)[2]
     kills = Tuple(sort!(unique(Int[kernel_plan_field(plan, d)[2] for d in _exec_kill_closure(plan, mom_c)])))
-    # EXACT authored shape (drives the concrete call method): [randn!(rng, self.mom), lmul!(self.chol_metric.L,
-    # self.mom), return __self__]. Any drift rejects rather than mis-emitting.
+    # Two source-equivalent authored profiles drive the same allocation-free
+    # backend: the legacy explicit randn!/lmul! effects, and profile B value
+    # assignment (`mom = randn!(...)`; `mom = chol.L * mom`). The latter keeps
+    # the mathematical product visible while ownership proves that the old mom
+    # buffer is dead/exclusive and the triangular factor admits alias-safe
+    # lmul! reuse. Any other drift rejects rather than being mis-emitted.
     b = refresh_ir.body
     (length(b) == 3 && b[3] isa _Return && getfield(b[3], :value) isa _SelfRef) ||
-        _l_reject("refresh_momentum!! must be exactly [randn!, lmul!, return __self__]; got $(length(b)) statements")
-    (rc1, randfn) = _refresh_callable(b[1], 1)
+        _l_reject("refresh_momentum!! must contain exactly two writes and return __self__; got $(length(b)) statements")
+
+    legacy = b[1] isa _ExprStmt && b[2] isa _ExprStmt
+    value_profile = b[1] isa _PlaceWrite && b[2] isa _PlaceWrite
+    legacy || value_profile || _l_reject(
+        "refresh_momentum!! must use either the legacy primitive-effect profile or the profile-B value-assignment form")
+
+    rc1, randfn = if legacy
+        _refresh_callable(b[1], 1)
+    else
+        w = b[1]
+        (!w.dot && _is_selffield(w.target, (:mom,))) || _l_reject(
+            "refresh statement 1 must assign the randn! result to self.mom")
+        _refresh_registered_callable(w.rhs, 1)
+    end
     (length(rc1.args) == 2 && rc1.args[1] isa _FormalRef && _is_selffield(rc1.args[2], (:mom,)) && isempty(rc1.kw) && !rc1.broadcast) ||
         _l_reject("refresh statement 1 must be `randn!(rng, self.mom)` (no kw/broadcast); got args $(rc1.args)")
-    (rc2, lmulfn) = _refresh_callable(b[2], 2)
+    rc2, lmulfn = if legacy
+        _refresh_callable(b[2], 2)
+    else
+        w = b[2]
+        (!w.dot && _is_selffield(w.target, (:mom,)) &&
+         w.rhs isa _RegisteredCall &&
+         getfield(w.rhs.registration, :kind) === :pure_primitive &&
+         getfield(w.rhs.registration, :source) === (*)) || _l_reject(
+            "refresh statement 2 must assign `self.chol_metric.L * self.mom` to self.mom")
+        effect = _kernel_primitive_effect(LinearAlgebra.lmul!)
+        effect === nothing && _l_reject(
+            "refresh profile-B bufferization requires the registered lmul! backend")
+        (w.rhs, LinearAlgebra.lmul!)
+    end
     (length(rc2.args) == 2 && _is_selffield(rc2.args[1], (:chol_metric, :L)) && _is_selffield(rc2.args[2], (:mom,)) && isempty(rc2.kw) && !rc2.broadcast) ||
-        _l_reject("refresh statement 2 must be `lmul!(self.chol_metric.L, self.mom)` (no kw/broadcast); got args $(rc2.args)")
+        _l_reject("refresh statement 2 must be the exact chol.L/mom product (no kw/broadcast); got args $(rc2.args)")
     # the chol slot must hold a sanctioned Cholesky (its L-view is the momentum-refresh factor)
     cholT = fieldtype(SH, chol_slot)
     (cholT <: LinearAlgebra.Cholesky) || _l_reject("refresh: chol_metric slot is not a Cholesky ($cholT)")
@@ -111,14 +147,23 @@ function compile_refresh(pf, ::Type{OW}, ::Type{SH}, refresh_ir::MethodIR) where
     #    canonicalized `LowerTriangular{T,Adjoint{T,facT}}` (uplo='U'); both — and no generic/custom backing —
     #    must pass. uplo is a runtime field, so both forms can occur for the same cholT.
     momT = fieldtype(OW, mom_slot); facT = fieldtype(cholT, :factors); ET = eltype(facT)   # structural, no value/inference
+    backend_registration = if legacy
+        rc2.registration
+    else
+        effect = _kernel_primitive_effect(LinearAlgebra.lmul!)
+        _KernelRegistration(effect.token, :primitive, nothing, (), (), false,
+                            LinearAlgebra.lmul!, effect)
+    end
+    source_registration = rc2.registration
+    domain_ok(types) = kernel_builtin_primitive_domain_ok(backend_registration, types) &&
+                       (legacy || kernel_pure_primitive_domain_ok(source_registration, types))
     if facT <: LinearAlgebra.Diagonal
-        kernel_builtin_primitive_domain_ok(rc2.registration, (facT, momT)) ||
+        domain_ok((facT, momT)) ||
             _l_reject("refresh lmul! domain rejects the Diagonal Cholesky factor $facT with mom $momT")
     else
         Llow = LinearAlgebra.LowerTriangular{ET, facT}                              # uplo='L' emitted type
         Lupp = LinearAlgebra.LowerTriangular{ET, LinearAlgebra.Adjoint{ET, facT}}   # uplo='U' canonicalized type
-        (kernel_builtin_primitive_domain_ok(rc2.registration, (Llow, momT)) &&
-         kernel_builtin_primitive_domain_ok(rc2.registration, (Lupp, momT))) ||
+        (domain_ok((Llow, momT)) && domain_ok((Lupp, momT))) ||
             _l_reject("refresh lmul! domain rejects the emitted Cholesky-L view over $facT with mom $momT")
     end
     _CompiledRefresh{typeof(randfn), typeof(lmulfn), mom_slot, chol_slot, kills}(randfn, lmulfn)
@@ -490,7 +535,8 @@ function _n_endpoint_write(pw::_PlaceWrite, lm, C::NCtx, endpoint_expr, field::S
                          for slot in dependent_slots if slot != target_slot])
     push!(effects,
         :(Base.materialize!($destination, $rhs)),
-        :(_canon_bless!($endpoint, Val($target_slot))))
+        :(_canon_bless!($endpoint, Val($target_slot))),
+        destination)
     body = Expr(:block, effects...)
     Expr(:let, Expr(:(=), endpoint, endpoint_expr),
         Expr(:let, Expr(:(=), rhs, nrhs_dot(pw.rhs, lm, C)), body))
@@ -498,16 +544,27 @@ end
 
 function nwrite(pw::_PlaceWrite, lm, C)
     t = pw.target
+    # Mutation-profile B: a whole endpoint `.=` is the author-visible
+    # identity-preserving structural transfer. Lower it to the established
+    # endpoint copier so owned slots and currentness transfer together while
+    # shared authorities retain identity. Leaf/array `.=` continues through
+    # the ordinary broadcast paths below.
+    if pw.dot && nkind(t, C) === :endpoint && nkind(pw.rhs, C) === :endpoint
+        return :(_canon_copy_endpoint!($(nev(t, lm, C)), $(nev(pw.rhs, lm, C))))
+    end
     if t isa _SelfField && length(t.path) == 1
         f = t.path[1]                                    # frame-direct scalar / diag scalar
         if _is_diag(f)
+            pw.dot && _l_reject("broadcast write to diagnostic `$f` is unsupported")
             # G7: RAW value write (no per-leaf pending OR) — reset's pending=0x0f dominates the epoch.
             set = :(_diag_set_value!($(C.S).diag, Val($(_diag_index(f))), $(nev(pw.rhs, lm, C))))
             # a `dham` write invalidates + PRODUCES the derived `diverged` (RK) via the dedicated frame seam, so
             # the authored `diverged && return ...` guard downstream reads the fresh derived value, not a stale bit.
             return f === :dham ? Expr(:block, set, :(_nuts_produce_diverged!($(C.S)))) : set
         end
-        return Expr(:(=), Expr(:., C.S, QuoteNode(f)), nev(pw.rhs, lm, C))
+        destination = Expr(:., C.S, QuoteNode(f))
+        return pw.dot ? :(Base.materialize!($destination, $(nrhs_dot(pw.rhs, lm, C)))) :
+                        Expr(:(=), destination, nev(pw.rhs, lm, C))
     end
     endpoint = _n_endpoint_write_target(t, lm, C)
     endpoint === nothing || return _n_endpoint_write(pw, lm, C, endpoint...)
