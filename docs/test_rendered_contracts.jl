@@ -18,12 +18,13 @@ include(joinpath(@__DIR__, "check_rendered.jl"))
 | - | - |
 """)
 
+        aov_root = """<div class="rk-aov-panel" data-rk-artifact-id="plot:first" data-rk-artifact-kind="aov-panel" v-exec-scripts="'cGF5bG9hZA=='"></div>"""
         artifact_markup = """
 <div class="rk-example" data-rk-artifact-id="example:first" data-rk-artifact-kind="example-panel"></div>
 <div class="rk-example" data-rk-artifact-id="example:second" data-rk-artifact-kind="example-panel"></div>
 <section class="rk-result-table-section" data-rk-artifact-id="table:first" data-rk-artifact-kind="sortable-table"><htmxo-sortable-table></htmxo-sortable-table></section>
 <section class="rk-result-table-section" data-rk-artifact-id="table:second" data-rk-artifact-kind="sortable-table"><htmxo-sortable-table></htmxo-sortable-table></section>
-<div class="rk-aov-panel" data-rk-artifact-id="plot:first" data-rk-artifact-kind="aov-panel" v-exec-scripts="'cGF5bG9hZA=='"></div>
+$aov_root
 """
         intermediate_path = joinpath(intermediate_dir, "fixture.md")
         rendered_path = joinpath(rendered_dir, "fixture.html")
@@ -72,7 +73,7 @@ include(joinpath(@__DIR__, "check_rendered.jl"))
         @test occursin("::warning file=docs/src/fixture.md", annotation)
 
         duplicate = artifact_markup *
-            "<div data-rk-artifact-id=\"example:first\" data-rk-artifact-kind=\"example-panel\"></div>\n"
+            "<div class=\"rk-example\" data-rk-artifact-id=\"example:first\" data-rk-artifact-kind=\"example-panel\"></div>\n"
         write(intermediate_path, duplicate)
         write(rendered_path, "<!DOCTYPE html><html><body>$duplicate</body></html>")
         @test_throws ErrorException check_rendered_docs(
@@ -122,7 +123,34 @@ include(joinpath(@__DIR__, "check_rendered.jl"))
             build_dir, ["Fixture" => "fixture.md"];
             source_dir, report_path, contracts, github_actions = false,
         )
-        @test occursin("aov-panel roots but 0 stable declarations", read(report_path, String))
+        @test occursin("aov-panel root must declare exactly one stable artifact id", read(report_path, String))
+
+        spoofed_declaration = replace(
+            artifact_markup,
+            aov_root => """
+<div class="rk-aov-panel"></div>
+<span data-rk-artifact-id="plot:first" data-rk-artifact-kind="aov-panel" v-exec-scripts="'cGF5bG9hZA=='"></span>
+""",
+        )
+        write(intermediate_path, spoofed_declaration)
+        write(rendered_path, "<!DOCTYPE html><html><body>$spoofed_declaration</body></html>")
+        @test_throws ErrorException check_rendered_docs(
+            build_dir, ["Fixture" => "fixture.md"];
+            source_dir, report_path, contracts, github_actions = false,
+        )
+
+        duplicate_attributes = replace(
+            artifact_markup,
+            "data-rk-artifact-id=\"plot:first\"" =>
+                "data-rk-artifact-id=\"plot:first\" data-rk-artifact-id=\"plot:second\"",
+        )
+        write(intermediate_path, duplicate_attributes)
+        write(rendered_path, "<!DOCTYPE html><html><body>$duplicate_attributes</body></html>")
+        @test_throws ErrorException check_rendered_docs(
+            build_dir, ["Fixture" => "fixture.md"];
+            source_dir, report_path, contracts, github_actions = false,
+        )
+        @test occursin("must declare exactly one stable artifact id", read(report_path, String))
 
         write(joinpath(source_dir, "fixture.md"), "# Fixture\n")
         write(intermediate_path, artifact_markup)

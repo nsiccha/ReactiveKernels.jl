@@ -131,14 +131,53 @@ function _emit_advisories(advisories; github_actions = get(ENV, "GITHUB_ACTIONS"
     nothing
 end
 
-function _artifact_declarations(body)
+const _ARTIFACT_ROOT_CLASSES = (
+    (kind = "aov-panel", class = "rk-aov-panel"),
+    (kind = "result-assets", class = "rk-result-assets"),
+    (kind = "sortable-table", class = "rk-result-table-section"),
+    (kind = "example-panel", class = "rk-example"),
+    (kind = "source-interaction", class = "rk-source-interaction"),
+    (kind = "source-example", class = "rk-source-example"),
+)
+
+function _attribute_values(tag, name)
+    [match.captures[1] for match in eachmatch(Regex("\\s$name=\"([^\"]*)\""), tag)]
+end
+
+function _artifact_declarations(body, stage, source)
     declarations = NamedTuple[]
-    for tag_match in eachmatch(r"<[^>]*data-rk-artifact-id=\"([^\"]*)\"[^>]*>", body)
+    for tag_match in eachmatch(r"<[^>]+>", body)
         tag = tag_match.match
-        kind_match = match(r"data-rk-artifact-kind=\"([^\"]*)\"", tag)
+        class_attributes = _attribute_values(tag, "class")
+        length(class_attributes) <= 1 ||
+            error("$stage $source page has a tag with duplicate class attributes")
+        classes = isempty(class_attributes) ? String[] : split(only(class_attributes))
+        root_kinds = [root.kind for root in _ARTIFACT_ROOT_CLASSES if root.class in classes]
+        ids = _attribute_values(tag, "data-rk-artifact-id")
+        kinds = _attribute_values(tag, "data-rk-artifact-kind")
+
+        if isempty(root_kinds)
+            isempty(ids) && isempty(kinds) || error(
+                "$stage $source page declares stable artifact attributes on a non-root tag",
+            )
+            continue
+        end
+        length(root_kinds) == 1 || error(
+            "$stage $source page combines multiple semantic artifact root classes on one tag",
+        )
+        length(ids) == 1 || error(
+            "$stage $source $(only(root_kinds)) root must declare exactly one stable artifact id",
+        )
+        length(kinds) == 1 || error(
+            "$stage $source $(only(root_kinds)) root must declare exactly one semantic kind",
+        )
+        isempty(only(ids)) && error("$stage $source page declares an empty stable artifact id")
+        only(kinds) == only(root_kinds) || error(
+            "$stage $source root kind $(only(kinds)) does not match class kind $(only(root_kinds))",
+        )
         push!(declarations, (;
-            id = tag_match.captures[1],
-            kind = isnothing(kind_match) ? "" : kind_match.captures[1],
+            id = only(ids),
+            kind = only(kinds),
             tag,
         ))
     end
@@ -146,11 +185,12 @@ function _artifact_declarations(body)
 end
 
 function _check_artifact_id_contract(source, intermediate, rendered)
-    intermediate_declarations = _artifact_declarations(intermediate)
-    rendered_declarations = _artifact_declarations(rendered)
-    for (stage, body, declarations) in (
-            ("Documenter intermediate", intermediate, intermediate_declarations),
-            ("VitePress output", rendered, rendered_declarations),
+    intermediate_declarations =
+        _artifact_declarations(intermediate, "Documenter intermediate", source)
+    rendered_declarations = _artifact_declarations(rendered, "VitePress output", source)
+    for (stage, declarations) in (
+            ("Documenter intermediate", intermediate_declarations),
+            ("VitePress output", rendered_declarations),
         )
         ids = getproperty.(declarations, :id)
         any(isempty, ids) && error("$stage $source page declares an empty stable artifact id")
@@ -160,20 +200,6 @@ function _check_artifact_id_contract(source, intermediate, rendered)
         isempty(duplicates) || error(
             "$stage $source page duplicates stable artifact ids: $(join(duplicates, ", "))",
         )
-        for (kind, root_marker) in (
-                ("aov-panel", "class=\"rk-aov-panel\""),
-                ("result-assets", "class=\"rk-result-assets\""),
-                ("sortable-table", "class=\"rk-result-table-section\""),
-                ("example-panel", "class=\"rk-example\""),
-                ("source-interaction", "class=\"rk-source-interaction\""),
-                ("source-example", "class=\"rk-source-example\""),
-            )
-            roots = _occurrences(body, root_marker)
-            declared = count(declaration -> declaration.kind == kind, declarations)
-            roots == declared || error(
-                "$stage $source page has $roots $kind roots but $declared stable declarations",
-            )
-        end
         for declaration in declarations
             declaration.kind in ("aov-panel", "result-assets") || continue
             payload = match(r"v-exec-scripts=\"'([^']+)'\"", declaration.tag)
