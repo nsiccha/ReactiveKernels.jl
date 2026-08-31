@@ -63,13 +63,15 @@ _json(::Nothing) = "null"
 _json(values::AbstractVector) = "[" * join(_json.(values), ", ") * "]"
 _json(value) = _json(string(value))
 
-function _write_advisory_report(path, advisories)
+function _write_advisory_report(path, advisories; status, fatal_error = nothing)
     mkpath(dirname(path))
     open(path, "w") do io
         println(io, "{")
         println(io, "  \"schema\": \"reactive-kernels-rendered-docs-advisories-v1\",")
+        println(io, "  \"status\": $(_json(status)),")
         println(io, "  \"source_commit\": $(_json(get(ENV, "GITHUB_SHA", ""))),")
         println(io, "  \"workflow_run_id\": $(_json(get(ENV, "GITHUB_RUN_ID", ""))),")
+        println(io, "  \"fatal_error\": $(_json(fatal_error)),")
         println(io, "  \"advisories\": [")
         for (index, advisory) in enumerate(advisories)
             suffix = index == length(advisories) ? "" : ","
@@ -87,6 +89,13 @@ function _write_advisory_report(path, advisories)
         println(io, "}")
     end
     path
+end
+
+function initialize_rendered_docs_report(path = get(
+        ENV, "RK_RENDERED_DOCS_REPORT",
+        joinpath(@__DIR__, "build", ".reports", "rendered-docs-advisories.json"),
+    ))
+    _write_advisory_report(path, NamedTuple[]; status = "pending")
 end
 
 function _github_escape(value)
@@ -139,8 +148,10 @@ end
 function _check_artifact_id_contract(source, intermediate, rendered)
     intermediate_declarations = _artifact_declarations(intermediate)
     rendered_declarations = _artifact_declarations(rendered)
-    for (stage, declarations) in (("Documenter intermediate", intermediate_declarations),
-                                  ("VitePress output", rendered_declarations))
+    for (stage, body, declarations) in (
+            ("Documenter intermediate", intermediate, intermediate_declarations),
+            ("VitePress output", rendered, rendered_declarations),
+        )
         ids = getproperty.(declarations, :id)
         any(isempty, ids) && error("$stage $source page declares an empty stable artifact id")
         any(declaration -> isempty(declaration.kind), declarations) &&
@@ -149,13 +160,27 @@ function _check_artifact_id_contract(source, intermediate, rendered)
         isempty(duplicates) || error(
             "$stage $source page duplicates stable artifact ids: $(join(duplicates, ", "))",
         )
-    end
-    for declaration in intermediate_declarations
-        declaration.kind in ("aov-panel", "result-assets") || continue
-        payload = match(r"v-exec-scripts=\"'([^']+)'\"", declaration.tag)
-        isnothing(payload) && error(
-            "declared interactive artifact $(declaration.id) on $source has no executable payload",
-        )
+        for (kind, root_marker) in (
+                ("aov-panel", "class=\"rk-aov-panel\""),
+                ("result-assets", "class=\"rk-result-assets\""),
+                ("sortable-table", "class=\"rk-result-table-section\""),
+                ("example-panel", "class=\"rk-example\""),
+                ("source-interaction", "class=\"rk-source-interaction\""),
+                ("source-example", "class=\"rk-source-example\""),
+            )
+            roots = _occurrences(body, root_marker)
+            declared = count(declaration -> declaration.kind == kind, declarations)
+            roots == declared || error(
+                "$stage $source page has $roots $kind roots but $declared stable declarations",
+            )
+        end
+        for declaration in declarations
+            declaration.kind in ("aov-panel", "result-assets") || continue
+            payload = match(r"v-exec-scripts=\"'([^']+)'\"", declaration.tag)
+            isnothing(payload) && error(
+                "$stage interactive artifact $(declaration.id) on $source has no executable payload",
+            )
+        end
     end
     intermediate_ids = getproperty.(intermediate_declarations, :id)
     rendered_ids = getproperty.(rendered_declarations, :id)
@@ -188,17 +213,10 @@ function _check_warning_banner_absent(build_dir, advisories)
     nothing
 end
 
-"""Enforce fatal render integrity and report presentation drift without blocking deploy."""
-function check_rendered_docs(build_dir, page_tree;
-                             source_dir = joinpath(@__DIR__, "src"),
-                             report_path = get(
-                                 ENV, "RK_RENDERED_DOCS_REPORT",
-                                 joinpath(build_dir, ".reports", "rendered-docs-advisories.json"),
-                             ),
-                             contracts = nothing,
-                             github_actions = get(ENV, "GITHUB_ACTIONS", "") == "true")
+function _check_rendered_docs!(advisories, build_dir, page_tree;
+                               source_dir = joinpath(@__DIR__, "src"),
+                               contracts = nothing)
     isdir(build_dir) || error("docs build directory is missing: $build_dir")
-    advisories = NamedTuple[]
 
     root_redirect = joinpath(build_dir, "index.html")
     isfile(root_redirect) && filesize(root_redirect) > 0 ||
@@ -470,8 +488,32 @@ function check_rendered_docs(build_dir, page_tree;
         expected = expected_total, observed = observed_panels, artifact_ids = all_artifact_ids,
     )
     _check_warning_banner_absent(build_dir, advisories)
-    _write_advisory_report(report_path, advisories)
+    return (; advisories, pages = length(sources), executable_panels = observed_panels)
+end
+
+"""Enforce fatal render integrity and report presentation drift without blocking deploy."""
+function check_rendered_docs(build_dir, page_tree;
+                             source_dir = joinpath(@__DIR__, "src"),
+                             report_path = get(
+                                 ENV, "RK_RENDERED_DOCS_REPORT",
+                                 joinpath(build_dir, ".reports", "rendered-docs-advisories.json"),
+                             ),
+                             contracts = nothing,
+                             github_actions = get(ENV, "GITHUB_ACTIONS", "") == "true")
+    advisories = NamedTuple[]
+    result = try
+        _check_rendered_docs!(advisories, build_dir, page_tree; source_dir, contracts)
+    catch exception
+        _write_advisory_report(
+            report_path, advisories;
+            status = "fatal", fatal_error = sprint(showerror, exception),
+        )
+        rethrow()
+    end
+
+    status = isempty(advisories) ? "clean" : "advisory"
+    _write_advisory_report(report_path, advisories; status)
     _emit_advisories(advisories; github_actions)
-    @info "Rendered docs integrity verified" pages=length(sources) executable_panels=observed_panels advisories=length(advisories) report_path
+    @info "Rendered docs integrity verified" pages=result.pages executable_panels=result.executable_panels advisories=length(advisories) report_path
     return advisories
 end

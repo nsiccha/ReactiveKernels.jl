@@ -21,8 +21,8 @@ include(joinpath(@__DIR__, "check_rendered.jl"))
         artifact_markup = """
 <div class="rk-example" data-rk-artifact-id="example:first" data-rk-artifact-kind="example-panel"></div>
 <div class="rk-example" data-rk-artifact-id="example:second" data-rk-artifact-kind="example-panel"></div>
-<section data-rk-artifact-id="table:first" data-rk-artifact-kind="sortable-table"><htmxo-sortable-table></htmxo-sortable-table></section>
-<section data-rk-artifact-id="table:second" data-rk-artifact-kind="sortable-table"><htmxo-sortable-table></htmxo-sortable-table></section>
+<section class="rk-result-table-section" data-rk-artifact-id="table:first" data-rk-artifact-kind="sortable-table"><htmxo-sortable-table></htmxo-sortable-table></section>
+<section class="rk-result-table-section" data-rk-artifact-id="table:second" data-rk-artifact-kind="sortable-table"><htmxo-sortable-table></htmxo-sortable-table></section>
 <div class="rk-aov-panel" data-rk-artifact-id="plot:first" data-rk-artifact-kind="aov-panel" v-exec-scripts="'cGF5bG9hZA=='"></div>
 """
         intermediate_path = joinpath(intermediate_dir, "fixture.md")
@@ -40,6 +40,8 @@ include(joinpath(@__DIR__, "check_rendered.jl"))
             body_markers = Dict("fixture.md" => ("Expected rendered heading",)),
         )
         report_path = joinpath(root, "rendered-docs-advisories.json")
+        initialize_rendered_docs_report(report_path)
+        @test occursin("\"status\": \"pending\"", read(report_path, String))
         advisories = check_rendered_docs(
             build_dir, ["Fixture" => "fixture.md"];
             source_dir, report_path, contracts, github_actions = false,
@@ -60,6 +62,8 @@ include(joinpath(@__DIR__, "check_rendered.jl"))
 
         report = read(report_path, String)
         @test occursin("reactive-kernels-rendered-docs-advisories-v1", report)
+        @test occursin("\"status\": \"advisory\"", report)
+        @test occursin("\"fatal_error\": null", report)
         @test occursin("\"contract_kind\": \"sortable-table-count\"", report)
         @test occursin("\"artifact_ids\": [\"example:first\"", report)
         @test occursin("\"responsible_agent\": \"ReactiveKernels:docs\"", report)
@@ -75,11 +79,25 @@ include(joinpath(@__DIR__, "check_rendered.jl"))
             build_dir, ["Fixture" => "fixture.md"];
             source_dir, report_path, contracts, github_actions = false,
         )
+        fatal_report = read(report_path, String)
+        @test occursin("\"status\": \"fatal\"", fatal_report)
+        @test occursin("duplicates stable artifact ids", fatal_report)
 
         missing_payload = replace(
             artifact_markup,
             " v-exec-scripts=\"'cGF5bG9hZA=='\"" => "",
         )
+        write(intermediate_path, artifact_markup)
+        write(rendered_path, "<!DOCTYPE html><html><body>$missing_payload</body></html>")
+        @test_throws ErrorException check_rendered_docs(
+            build_dir, ["Fixture" => "fixture.md"];
+            source_dir, report_path, contracts, github_actions = false,
+        )
+        @test occursin(
+            "VitePress output interactive artifact plot:first",
+            read(report_path, String),
+        )
+
         write(intermediate_path, missing_payload)
         write(rendered_path, "<!DOCTYPE html><html><body>$missing_payload</body></html>")
         @test_throws ErrorException check_rendered_docs(
@@ -98,7 +116,16 @@ include(joinpath(@__DIR__, "check_rendered.jl"))
             source_dir, report_path, contracts, github_actions = false,
         )
 
+        write(intermediate_path, missing_id)
+        write(rendered_path, "<!DOCTYPE html><html><body>$missing_id</body></html>")
+        @test_throws ErrorException check_rendered_docs(
+            build_dir, ["Fixture" => "fixture.md"];
+            source_dir, report_path, contracts, github_actions = false,
+        )
+        @test occursin("aov-panel roots but 0 stable declarations", read(report_path, String))
+
         write(joinpath(source_dir, "fixture.md"), "# Fixture\n")
+        write(intermediate_path, artifact_markup)
         write(rendered_path, "<!DOCTYPE html><html><body>$artifact_markup</body></html>")
         matching_contracts = (
             panels = Dict("fixture.md" => 2),
@@ -114,7 +141,9 @@ include(joinpath(@__DIR__, "check_rendered.jl"))
             source_dir, report_path, contracts = matching_contracts,
             github_actions = false,
         ))
-        @test occursin("\"advisories\": [\n  ]", read(report_path, String))
+        clean_report = read(report_path, String)
+        @test occursin("\"status\": \"clean\"", clean_report)
+        @test occursin("\"advisories\": [\n  ]", clean_report)
 
         write(rendered_path, "<html><body>$artifact_markup</body></html>")
         @test_throws ErrorException check_rendered_docs(
@@ -122,5 +151,6 @@ include(joinpath(@__DIR__, "check_rendered.jl"))
             source_dir, report_path, contracts = matching_contracts,
             github_actions = false,
         )
+        @test occursin("\"status\": \"fatal\"", read(report_path, String))
     end
 end
