@@ -1,7 +1,9 @@
 using ReactiveKernels, LinearAlgebra, Random
+import ReactiveKernelsNUTSExamples
 const RK = ReactiveKernels
-include(joinpath("/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-hmc","examples","nuts_runtime.jl"))
-module Fix; include(joinpath("/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-hmc","benchmark","nuts_kernel_authoring_fixture.jl")); end
+const ROOT = normpath(joinpath(@__DIR__, "..", ".."))
+include(joinpath(ROOT, "examples", "nuts_runtime.jl"))
+module Fix; include(joinpath(@__DIR__, "..", "nuts_kernel_authoring_fixture.jl")); end
 pf = RK._prepare_factory(Fix.euclidean_phasepoint, RK.kernel_registration(Fix.leapfrog!))
 function vals(pf,T;metric=T[2 0;0 2])
     P=RK.kernel_prepared_plan(pf); d=Dict{Int,Any}()
@@ -12,9 +14,9 @@ function vals(pf,T;metric=T[2 0;0 2])
     end; d
 end
 function frame(pf,T,md;metric=T[2 0;0 2])
-    f=RK._construct_nuts_frame(pf,vals(pf,T;metric),md;step_f=RK.partial(Fix.leapfrog!;stepsize=T(.1)),stats_f=Fix.nuts_stats!,min_dham=-1000.0)
+    f=ReactiveKernelsNUTSExamples._construct_nuts_frame(pf,vals(pf,T;metric),md;step_f=RK.partial(Fix.leapfrog!;stepsize=T(.1)),stats_f=Fix.nuts_stats!,min_dham=-1000.0)
     RK.compile_prepared_initialization(pf,typeof(f.init),typeof(f.shared))(f.init,f.shared,RK.kernel_prepared_handles(pf))
-    RK._seed_nuts_children!(f); f
+    ReactiveKernelsNUTSExamples._seed_nuts_children!(f); f
 end
 fr = frame(pf, Float64, 4)
 println("fr fields: ", fieldnames(typeof(fr)))

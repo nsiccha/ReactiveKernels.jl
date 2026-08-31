@@ -6,9 +6,10 @@ one object owns `n`, `mean`, and `var`; `step!` updates a vector; and the matrix
 overload folds its columns through the same vector method. ReactiveKernels spells
 that object with the one public authoring macro, a method-bearing `@kernel`.
 
-The complete executable authority is
-[`examples/online_stats.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/online_stats.jl).
-The source below is extracted from that file during the documentation build.
+The streaming source authority is
+[`ReactiveKernelsStreamingStats`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsStreamingStats/src/ReactiveKernelsStreamingStats.jl);
+HMC summaries live downstream in `ReactiveKernelsHMCDiagnostics`. The source
+below is extracted from the streaming package during the documentation build.
 
 ## Welford as a method-bearing `@kernel`
 
@@ -136,5 +137,5 @@ diagnostics = OnlineStatsExample.fit_diagnostics(records)
 Run the complete executable example from the repository root:
 
 ```sh
-julia --project=. examples/online_stats.jl
+julia --project=packages examples/online_stats.jl
 ```

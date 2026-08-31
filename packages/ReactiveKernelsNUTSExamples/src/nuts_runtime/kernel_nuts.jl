@@ -670,7 +670,7 @@ function compile_nuts_dispatcher(irs0, PL; typemap, cap::Int, root_mid::Int, sta
         end
         $S
     end
-    fn = compile(Expr(:->, Expr(:tuple, S, SC, A0, CFG), body))
+    fn = _nuts_compile(Expr(:->, Expr(:tuple, S, SC, A0, CFG), body))
     # dense-ordered store column types (for scratch construction) + the ctrl slot
     storeinfo = [(m, coltypes[m]) for m in mids]
     (fn, storeinfo, cap)

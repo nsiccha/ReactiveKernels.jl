@@ -7,6 +7,7 @@ using Printf
 using Random
 using Reactant
 using ReactiveKernels
+using ReactiveKernelsNUTSExamples
 using Statistics
 using TOML
 
@@ -69,7 +70,7 @@ function _values(dimension)
 end
 
 function _frame(dimension, max_depth, stepsize)
-    frame = ReactiveKernels._construct_nuts_frame(
+    frame = ReactiveKernelsNUTSExamples._construct_nuts_frame(
         PF, _values(dimension), max_depth;
         step_f=ReactiveKernels.partial(Fixture.leapfrog!; stepsize),
         stats_f=Fixture.nuts_stats!, min_dham=-1000.0,
@@ -78,7 +79,7 @@ function _frame(dimension, max_depth, stepsize)
         PF, typeof(frame.init), typeof(frame.shared))(
             frame.init, frame.shared,
             ReactiveKernels.kernel_prepared_handles(PF))
-    ReactiveKernels._seed_nuts_children!(frame)
+    ReactiveKernelsNUTSExamples._seed_nuts_children!(frame)
     frame
 end
 
@@ -86,7 +87,7 @@ function _bundle(rng, dimension, max_depth)
     momentum = randn(rng, dimension)
     directions = rand(rng, Bool, max_depth)
     exponentials = randexp(rng, 1 << max_depth)
-    ReactiveKernels.nuts_reactant_bundle(
+    ReactiveKernelsNUTSExamples.nuts_reactant_bundle(
         momentum, directions, exponentials, max_depth)
 end
 
@@ -180,10 +181,10 @@ function run_benchmark()
 
     compile_frame = _frame(dimension, max_depth, stepsize)
     reactant_frame = _frame(dimension, max_depth, stepsize)
-    native_compile_seconds = @elapsed native = ReactiveKernels.compile_nuts(
+    native_compile_seconds = @elapsed native = ReactiveKernelsNUTSExamples.compile_nuts(
         PF, Fixture.nuts_state, Fixture.refresh_momentum!!,
         Fixture.nuts!!, compile_frame)
-    reactant_lower_seconds = @elapsed compiled = ReactiveKernels.compile_nuts_reactant(
+    reactant_lower_seconds = @elapsed compiled = ReactiveKernelsNUTSExamples.compile_nuts_reactant(
         PF, Fixture.nuts_state, Fixture.refresh_momentum!!,
         Fixture.nuts!!, reactant_frame)
 
@@ -194,12 +195,12 @@ function run_benchmark()
         _bundle(rng, dimension, max_depth)
         for _ in 1:max(4transition_count, transition_count + 64)
     ]
-    warm_host_state = ReactiveKernels.nuts_reactant_state(
+    warm_host_state = ReactiveKernelsNUTSExamples.nuts_reactant_state(
         compiled, reactant_frame, warm_bundle)
     warm_transfer_seconds = @elapsed warm_state =
         map(Reactant.to_rarray, warm_host_state)
     reactant_compile_seconds = @elapsed executable =
-        ReactiveKernels.nuts_reactant_compile(compiled, warm_state; sync=true)
+        ReactiveKernelsNUTSExamples.nuts_reactant_compile(compiled, warm_state; sync=true)
     stablehlo_while_count =
         count(_ -> true, eachmatch(r"stablehlo\.while", executable.module_string))
 
@@ -225,7 +226,7 @@ function run_benchmark()
         candidates_examined += 1
         frame = _frame(dimension, max_depth, stepsize)
         replay = _replay(bundle)
-        host_state = ReactiveKernels.nuts_reactant_state(compiled, frame, bundle)
+        host_state = ReactiveKernelsNUTSExamples.nuts_reactant_state(compiled, frame, bundle)
         input_state = map(Reactant.to_rarray, host_state)
         native.root!(frame, native.scratch, replay)
         output = executable(input_state)
@@ -244,7 +245,7 @@ function run_benchmark()
         _frame(dimension, max_depth, stepsize) for _ in 1:transition_count
     ]
     transition_host_states = [
-        ReactiveKernels.nuts_reactant_state(
+        ReactiveKernelsNUTSExamples.nuts_reactant_state(
             compiled, transition_frames[index], selected_bundles[index])
         for index in eachindex(transition_frames)
     ]

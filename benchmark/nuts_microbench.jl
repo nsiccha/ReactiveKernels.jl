@@ -2,7 +2,7 @@
 
 # Reproducible DECOMPOSED microbenchmark of the compiled-reactive NUTS transition.
 #
-#   julia --startup-file=no --project=. benchmark/nuts_microbench.jl
+#   julia --startup-file=no --project=packages benchmark/nuts_microbench.jl
 #
 # Measures allocations + wall time for matched Hamiltonian work across in-repo arms:
 #   :compiled  — public CompiledNUTSState over the reactive_nuts_group program
@@ -26,6 +26,7 @@
 # step! typed/LLVM evidence fails.
 
 using ReactiveKernels
+using ReactiveKernelsNUTSExamples
 using LinearAlgebra
 using Random
 using InteractiveUtils
@@ -149,14 +150,14 @@ end
 function build_arms(D)
     metric = Matrix{Float64}(I, D, D)
     pos = _micro_pos(D); mom = _micro_mom(D)
-    group = RK.reactive_nuts_group(_micro_grad!, metric, copy(pos), copy(mom))
-    compiled = RK.nuts_state(group; rng = Xoshiro(2024),
-                             step_f = RK.partial(RK.leapfrog!; stepsize = 0.1),
+    group = ReactiveKernelsNUTSExamples.reactive_nuts_group(_micro_grad!, metric, copy(pos), copy(mom))
+    compiled = ReactiveKernelsNUTSExamples.nuts_state(group; rng = Xoshiro(2024),
+                             step_f = RK.partial(ReactiveKernelsNUTSExamples.leapfrog!; stepsize = 0.1),
                              max_depth = 6)
-    point = RK.euclidean_phasepoint(_micro_pot, _micro_valgrad, metric,
+    point = ReactiveKernelsNUTSExamples.euclidean_phasepoint(_micro_pot, _micro_valgrad, metric,
                                     copy(pos), copy(mom))
-    oracle = RK._oracle_nuts_state(point; rng = Xoshiro(2024),
-                                   step_f = RK.partial(RK.leapfrog!; stepsize = 0.1),
+    oracle = ReactiveKernelsNUTSExamples._oracle_nuts_state(point; rng = Xoshiro(2024),
+                                   step_f = RK.partial(ReactiveKernelsNUTSExamples.leapfrog!; stepsize = 0.1),
                                    max_depth = 6)
     raw = RawPoint(metric, copy(pos), copy(mom))
     (; group, compiled, oracle, raw)
@@ -190,14 +191,14 @@ end
 
 # Energy error read the SAME way across arms: finite(init_ham - active_fwd_ham).
 _compiled_dham(a) = a.group.dham
-_oracle_dham(a)   = RK._finite_or_neginf(a.oracle.init.ham - a.oracle.fwd.ham)
-_raw_dham(a)      = RK._finite_or_neginf(a.raw.init_ham - a.raw.ham)
+_oracle_dham(a)   = ReactiveKernelsNUTSExamples._finite_or_neginf(a.oracle.init.ham - a.oracle.fwd.ham)
+_raw_dham(a)      = ReactiveKernelsNUTSExamples._finite_or_neginf(a.raw.init_ham - a.raw.ham)
 
 # Advance every arm by ONE leapfrog so getter/dham/source stages read a
 # non-trivial, matched state (fwd endpoint moved off init).
 function _advance_one!(a)
-    RK._group_leapfrog!(a.group, Val(:fwd), 0.1)
-    RK.leapfrog!(a.oracle.fwd; stepsize = 0.1)
+    ReactiveKernelsNUTSExamples._group_leapfrog!(a.group, Val(:fwd), 0.1)
+    ReactiveKernelsNUTSExamples.leapfrog!(a.oracle.fwd; stepsize = 0.1)
     _raw_leapfrog!(a.raw, 0.1)
     a
 end
@@ -224,19 +225,19 @@ _s3_oracle(a)   = _oracle_dham(a)
 _s3_raw(a)      = _raw_dham(a)
 
 # Stage 4: one leapfrog on the active forward endpoint.
-_s4_compiled(a) = (RK._group_leapfrog!(a.group, Val(:fwd), 0.1); a.group.fwd_ham)
-_s4_oracle(a)   = (RK.leapfrog!(a.oracle.fwd; stepsize = 0.1); a.oracle.fwd.ham)
+_s4_compiled(a) = (ReactiveKernelsNUTSExamples._group_leapfrog!(a.group, Val(:fwd), 0.1); a.group.fwd_ham)
+_s4_oracle(a)   = (ReactiveKernelsNUTSExamples.leapfrog!(a.oracle.fwd; stepsize = 0.1); a.oracle.fwd.ham)
 _s4_raw(a)      = (_raw_leapfrog!(a.raw, 0.1); a.raw.ham)
 
 # Stage 5: reset + depth-1 tree unit (guarantees exactly one leaf/leapfrog per rep).
-_s5_compiled(a) = (RK._cn_reset_transition!(a.compiled); RK._cn_start_tree!(a.compiled, 1);
+_s5_compiled(a) = (ReactiveKernelsNUTSExamples._cn_reset_transition!(a.compiled); ReactiveKernelsNUTSExamples._cn_start_tree!(a.compiled, 1);
                    a.compiled.energy_error)
-_s5_oracle(a)   = (RK._reset_transition!(a.oracle); RK._start_tree!(a.oracle, 1);
+_s5_oracle(a)   = (ReactiveKernelsNUTSExamples._reset_transition!(a.oracle); ReactiveKernelsNUTSExamples._start_tree!(a.oracle, 1);
                    a.oracle.energy_error)
 
 # Stage 6: one full transition (reset + tree growth + proposal selection + RNG).
-_s6_compiled(a) = (RK.step!(a.compiled); a.compiled.energy_error)
-_s6_oracle(a)   = (RK.step!(a.oracle); a.oracle.energy_error)
+_s6_compiled(a) = (ReactiveKernelsNUTSExamples.step!(a.compiled); a.compiled.energy_error)
+_s6_oracle(a)   = (ReactiveKernelsNUTSExamples.step!(a.oracle); a.oracle.energy_error)
 
 # --- Parity gates -------------------------------------------------------------
 _approx(x, y) = isapprox(x, y; rtol = 1e-10, atol = 1e-12)
@@ -259,8 +260,8 @@ end
 
 function gate_depth1(D)
     a = build_arms(D)
-    RK._cn_reset_transition!(a.compiled); RK._cn_start_tree!(a.compiled, 1)
-    RK._reset_transition!(a.oracle); RK._start_tree!(a.oracle, 1)
+    ReactiveKernelsNUTSExamples._cn_reset_transition!(a.compiled); ReactiveKernelsNUTSExamples._cn_start_tree!(a.compiled, 1)
+    ReactiveKernelsNUTSExamples._reset_transition!(a.oracle); ReactiveKernelsNUTSExamples._start_tree!(a.oracle, 1)
     @assert a.compiled.n_steps == 1 "compiled depth-1 executed exactly one leaf"
     @assert a.oracle.n_steps == 1 "oracle depth-1 executed exactly one leaf"
     @assert _approx(a.compiled.energy_error, a.oracle.energy_error) "depth-1 energy-error parity"
@@ -273,7 +274,7 @@ end
 function gate_full_transition(D; n = 6)
     a = build_arms(D)
     for t in 1:n
-        dc = RK.step!(a.compiled); do_ = RK.step!(a.oracle)   # returned diagnostics
+        dc = ReactiveKernelsNUTSExamples.step!(a.compiled); do_ = ReactiveKernelsNUTSExamples.step!(a.oracle)   # returned diagnostics
         @assert _approx(a.compiled.group.init_pos, a.oracle.init.pos) "transition $t accepted-position parity"
         @assert dc.depth == do_.depth "transition $t depth parity"
         @assert dc.n_steps == do_.n_steps "transition $t n_steps parity"
@@ -297,9 +298,9 @@ const _LLVM_FORBIDDEN = ("ijl_apply_generic", "jl_apply_generic", "jl_apply",
                          "jl_gc_pool_alloc", "ijl_gc_big_alloc", "jl_gc_big_alloc")
 function assert_step_typed_llvm(compiled)
     T = typeof(compiled)
-    typed = only(code_typed(RK.step!, Tuple{T}; optimize = true))
+    typed = only(code_typed(ReactiveKernelsNUTSExamples.step!, Tuple{T}; optimize = true))
     ci, return_type = typed.first, typed.second
-    llvm = sprint(io -> code_llvm(io, RK.step!, Tuple{T};
+    llvm = sprint(io -> code_llvm(io, ReactiveKernelsNUTSExamples.step!, Tuple{T};
                                   optimize = true, debuginfo = :none))
     return_concrete = isconcretetype(return_type) || return_type === Union{}
     any_slots = count(t -> t === Any, ci.slottypes)
@@ -323,12 +324,12 @@ end
 # --- Construction / setup timing (warm-excluded, per arm) ---------------------
 function timed_setup(D)
     metric = Matrix{Float64}(I, D, D); pos = _micro_pos(D); mom = _micro_mom(D)
-    sf() = RK.partial(RK.leapfrog!; stepsize = 0.1)
-    build_compiled() = (g = RK.reactive_nuts_group(_micro_grad!, metric, copy(pos), copy(mom));
-                        RK.nuts_state(g; rng = Xoshiro(1), step_f = sf(), max_depth = 6))
-    build_oracle() = (p = RK.euclidean_phasepoint(_micro_pot, _micro_valgrad, metric,
+    sf() = RK.partial(ReactiveKernelsNUTSExamples.leapfrog!; stepsize = 0.1)
+    build_compiled() = (g = ReactiveKernelsNUTSExamples.reactive_nuts_group(_micro_grad!, metric, copy(pos), copy(mom));
+                        ReactiveKernelsNUTSExamples.nuts_state(g; rng = Xoshiro(1), step_f = sf(), max_depth = 6))
+    build_oracle() = (p = ReactiveKernelsNUTSExamples.euclidean_phasepoint(_micro_pot, _micro_valgrad, metric,
                                                   copy(pos), copy(mom));
-                      RK._oracle_nuts_state(p; rng = Xoshiro(1), step_f = sf(), max_depth = 6))
+                      ReactiveKernelsNUTSExamples._oracle_nuts_state(p; rng = Xoshiro(1), step_f = sf(), max_depth = 6))
     build_raw() = RawPoint(metric, copy(pos), copy(mom))
     build_compiled(); build_oracle(); build_raw()          # warm: exclude compilation
     tc = @timed build_compiled(); to = @timed build_oracle(); tr = @timed build_raw()

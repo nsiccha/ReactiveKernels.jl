@@ -35,7 +35,10 @@ function _run_pinned()
         Pkg.add(Pkg.PackageSpec(
             url = "https://github.com/nsiccha/ReactiveHMC.jl",
             rev = _REACTIVE_HMC_REV))
-        Pkg.develop(path = root)
+        Pkg.develop([
+            Pkg.PackageSpec(path = root),
+            Pkg.PackageSpec(path = joinpath(root, "packages", "ReactiveKernelsNUTSExamples")),
+        ])
         Pkg.precompile()
         command = addenv(
             `$(Base.julia_cmd()) --startup-file=no --project=$environment $(@__FILE__)`,
@@ -51,6 +54,7 @@ function _inner()
         using Random
         using Pkg
         using ReactiveKernels
+        using ReactiveKernelsNUTSExamples
         import ReactiveHMC
         import ReactiveHMC.ReactiveObjects: @invalidatedependants!
     end

@@ -5,9 +5,9 @@ Verified foundation + proof scripts for lowering the ADAPTIVE NUTS transition (f
 Implementation ownership: `ReactiveKernels:reactant` (decision 19rzxhy). Full spec + all findings:
 `GET /agents/ReactiveKernels:hmc/todos/2026-08-29T01-38-17-594-00w87ln?plain` (many detailed comments).
 
-NOTE: scripts hardcode a dev worktree path (`WT=/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-hmc`)
-and run in a scratch project with `Pkg.develop`ed ReactiveKernels (Julia 1.10, Reactant-FREE — native is the
-parity oracle; the Reactant @compile is your gate). Adjust `WT` for your checkout.
+Run the scripts from the repository's shared `packages` project on Julia 1.10;
+their source and fixture paths are resolved relative to each script. The native
+runtime is the parity oracle, while the Reactant `@compile` remains the gate.
 
 ## Scripts + what each VERIFIES (all green)
 - `oracle.jl` — native oracle: `compile_nuts_native(pf, nuts_state, refresh_momentum!!, nuts!!, frame).root!(fr, scratch, Xoshiro(seed))`. Decodes the phasepoint `_CanonOwned12` SoA: **f4=pos, f5=mom, f7=pot, f8=dpot/dham_dpos, f10=dkin/dham_dmom, f11=kin, f12=ham** (f1/f2/f3/f6/f9=shared placeholders). Ref outputs (md=4, pos0=[1,2] mom0=[3,4] metric=diag(2) step=0.1): Xoshiro(20260829)→pos=[1.3401842630090366,1.3967476576654783], diag n_steps=7/reached_depth=3/acc=0.9996258996668541/dham=0.0031325053049702234.

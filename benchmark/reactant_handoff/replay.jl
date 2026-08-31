@@ -1,7 +1,9 @@
 using ReactiveKernels, LinearAlgebra, Random
+import ReactiveKernelsNUTSExamples
 const RK = ReactiveKernels
-include(joinpath("/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-hmc","examples","nuts_runtime.jl"))
-module Fix; include(joinpath("/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-hmc","benchmark","nuts_kernel_authoring_fixture.jl")); end
+const ROOT = normpath(joinpath(@__DIR__, "..", ".."))
+include(joinpath(ROOT, "examples", "nuts_runtime.jl"))
+module Fix; include(joinpath(@__DIR__, "..", "nuts_kernel_authoring_fixture.jl")); end
 # Recorder + ReplayRNG, both defined in Random so the native domain gate admits them
 Random.eval(quote
     mutable struct RecRNG <: AbstractRNG; inner::Xoshiro; log::Vector{Any}; end
@@ -31,18 +33,18 @@ function vals(pf,T;metric=T[2 0;0 2])
     end; d
 end
 function frame(pf,T,md;metric=T[2 0;0 2])
-    f=RK._construct_nuts_frame(pf,vals(pf,T;metric),md;step_f=RK.partial(Fix.leapfrog!;stepsize=T(.1)),stats_f=Fix.nuts_stats!,min_dham=-1000.0)
+    f=ReactiveKernelsNUTSExamples._construct_nuts_frame(pf,vals(pf,T;metric),md;step_f=RK.partial(Fix.leapfrog!;stepsize=T(.1)),stats_f=Fix.nuts_stats!,min_dham=-1000.0)
     RK.compile_prepared_initialization(pf,typeof(f.init),typeof(f.shared))(f.init,f.shared,RK.kernel_prepared_handles(pf))
-    RK._seed_nuts_children!(f); f
+    ReactiveKernelsNUTSExamples._seed_nuts_children!(f); f
 end
 snap(fr) = (copy(getfield(fr.init,:f4)), fr.diag.n_steps, fr.diag.reached_depth, round(fr.diag.acceptance_rate;digits=12), round(fr.diag.dham;digits=12))
 function verify()
     allok = true
     for (md,seed) in ((2,20260829),(4,20260829),(4,20260830),(6,12345),(8,777),(3,999))
-        f1=frame(pf,Float64,md); C=RK.compile_nuts_native(pf,Fix.nuts_state,Fix.refresh_momentum!!,Fix.nuts!!,f1)
+        f1=frame(pf,Float64,md); C=ReactiveKernelsNUTSExamples.compile_nuts_native(pf,Fix.nuts_state,Fix.refresh_momentum!!,Fix.nuts!!,f1)
         r=mkrec(seed); C.root!(f1,C.scratch,r); out1=snap(f1)
         (mom,dirs,exps)=bundle_from_log(r.log)
-        f2=frame(pf,Float64,md); C2=RK.compile_nuts_native(pf,Fix.nuts_state,Fix.refresh_momentum!!,Fix.nuts!!,f2)
+        f2=frame(pf,Float64,md); C2=ReactiveKernelsNUTSExamples.compile_nuts_native(pf,Fix.nuts_state,Fix.refresh_momentum!!,Fix.nuts!!,f2)
         rep=ReplayRNG(mom,dirs,exps,[0],[0]); C2.root!(f2,C2.scratch,rep); out2=snap(f2)
         ok = out1==out2
         println("md=$md seed=$seed: Xoshiro-run == ReplayRNG(bundle)-run ? $ok  (bundle: $(length(dirs)) dir, $(length(exps)) exp)")
