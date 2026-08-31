@@ -1,6 +1,12 @@
 using ReactiveKernelsBatchingExamples.BatchedExamples
 using ReactiveKernels: code_expr
 
+function _batched_head_count(node, head)
+    node isa Expr || return 0
+    (node.head === head ? 1 : 0) +
+        sum(_batched_head_count(child, head) for child in node.args)
+end
+
 # Reference the module qualified rather than `using .BatchedExamples`: the
 # distributions example module exports the same `all_sources`/`evaluate_source`
 # names, and both are loaded in the same test session.
@@ -9,11 +15,14 @@ using ReactiveKernels: code_expr
     source = only(BatchedExamples.all_sources())
     primal_source = BatchedExamples.BATCHED_PRIMAL_SOURCE
 
-    @testset "one native graph, checked against a Distributions oracle" begin
-        # The source composes a @kernel recipe and differentiates through
-        # DifferentiationInterface with the Enzyme reverse backend.
-        @test occursin(r"@kernel \w+\(", source)
-        @test occursin("broadcast(", source)
+    @testset "one authored graph, checked against a Distributions oracle" begin
+        @test occursin("@kernel normal_loglik", source)
+        @test occursin("pointwise = plate(x, location, scale) do", source)
+        @test occursin("normal(li, si).logpdf(xi)", source)
+        @test occursin("return sum(pointwise)", source)
+        @test !occursin("normal_logpdf", source)
+        @test !occursin("fused_normal_logdensity", source)
+        @test !occursin("pointwise::", source)
         @test occursin("AutoEnzyme", source)
         @test occursin("prepare_ad(", source)
         @test occursin("ad_gradient(", source)
@@ -27,29 +36,45 @@ using ReactiveKernels: code_expr
         for marker in ("DifferentiationInterface", "Enzyme", "prepare_ad", "ad_gradient")
             @test !occursin(marker, primal_source)
         end
-        # The compute path is Distributions.jl-free on both want boundaries.
+        # The compute path is Distributions.jl-free on all want boundaries.
         @test !occursin("Distributions", string(code_expr(artifact.kernel)))
-        @test !occursin("Distributions", string(code_expr(artifact.perobs_kernel)))
+        @test !occursin("Distributions",
+                        string(code_expr(artifact.pointwise_kernel)))
+        @test !occursin("Distributions", string(code_expr(artifact.both_kernel)))
         # Total value matches the independent Distributions.jl oracle.
         @test artifact.output ≈ artifact.reference
+        @test artifact.ordinary_total ≈ artifact.reference
     end
 
-    @testset "want-set pruning gives per-obs and total from one graph" begin
-        # `want = :per_obs` returns the length-N vectorized pointwise density,
-        # matching the elementwise Distributions oracle.
-        @test length(artifact.per_obs) == length(artifact.reference_perobs)
-        @test artifact.per_obs ≈ artifact.reference_perobs
-        # Pruning is structural: the total plan selects the fused reduction and
-        # never materializes `per_obs`; the per-obs plan selects the broadcast
-        # and never computes `logdensity`.
-        @test artifact.total_recipes == 2
-        @test artifact.perobs_recipes == 2
-        total_selected = artifact.kernel.plan.recipes
-        perobs_selected = artifact.perobs_kernel.plan.recipes
-        @test count(r -> any(v -> v.name === :per_obs, r.outputs),
-                    total_selected) == 0
-        @test count(r -> any(v -> v.name === :logdensity, r.outputs),
-                    perobs_selected) == 0
+    @testset "return, pointwise, and both wants share one authored plate" begin
+        @test length(artifact.pointwise) == length(artifact.reference_pointwise)
+        @test artifact.pointwise ≈ artifact.reference_pointwise
+        @test artifact.pointwise_and_total ==
+              (artifact.pointwise, artifact.output)
+
+        @test length(artifact.total_plan.recipes) == 2
+        @test length(artifact.pointwise_plan.recipes) == 1
+        @test length(artifact.both_plan.recipes) == 2
+        @test _batched_head_count(artifact.total_ast, :for) == 1
+        @test _batched_head_count(artifact.pointwise_ast, :for) == 1
+        @test _batched_head_count(artifact.both_ast, :for) == 1
+        @test !occursin("similar", string(artifact.total_ast))
+        @test occursin("similar", string(artifact.pointwise_ast))
+        @test occursin("similar", string(artifact.both_ast))
+    end
+
+    @testset "ordinary Julia broadcast compatibility" begin
+        xs = [-1.0, -0.2, 0.4, 1.3]
+        locations = [0.1, 0.2, 0.3, 0.4]
+        scales = [0.8, 1.0, 1.2, 1.4]
+        zipped = artifact.pointwise_kernel(xs, locations, scales)
+        @test artifact.kernel(xs, locations, scales) ≈ sum(zipped)
+        @test artifact.pointwise_kernel(xs, locations[1:1], 1.2) ≈
+              artifact.pointwise_kernel(xs, only(locations[1:1]), 1.2)
+        @test_throws DimensionMismatch artifact.kernel(
+            xs, locations[1:3], scales)
+        @test_throws DimensionMismatch artifact.kernel(
+            xs, [locations; 0.5], scales)
     end
 
     @testset "one reverse pass over the whole batch matches the analytic gradient" begin

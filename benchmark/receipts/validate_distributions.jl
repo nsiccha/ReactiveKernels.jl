@@ -59,6 +59,8 @@ function validate_distribution_receipt(path::AbstractString)
     support = receipt["support"]
     require(get(support, "rk_reactant", false) == true,
             "RK Reactant compatibility did not pass")
+    require(get(support, "rk_authored_reactant", false) == true,
+            "authored RK Reactant compatibility did not pass")
     require(get(support, "probability_measures_reactant", false) == true,
             "ProbabilityMeasures Reactant compatibility did not pass")
     if !get(support, "distributions_reactant", false)
@@ -67,10 +69,10 @@ function validate_distribution_receipt(path::AbstractString)
     end
 
     required_measurements = (
-        "rk_native", "rk_direct_native",
+        "rk_native", "rk_authored_native", "rk_direct_native",
         "distributions_native", "probability_measures_native",
         "distributions_loop", "probability_measures_loop", "hand_hoisted",
-        "rk_reactant", "probability_measures_reactant",
+        "rk_reactant", "rk_authored_reactant", "probability_measures_reactant",
     )
     observed_sizes = Tuple(Int(row["n"]) for row in receipt["measurements"])
     require(observed_sizes == EXPECTED_SIZES,
@@ -112,7 +114,7 @@ function validate_distribution_receipt(path::AbstractString)
             require(Int(measurement["median_allocs"]) ==
                     round(Int, _median(measurement["allocs"])),
                     "N=$n $name median_allocs mismatch")
-            if name in ("rk_native", "rk_direct_native")
+            if name in ("rk_native", "rk_authored_native", "rk_direct_native")
                 require(measurement["median_bytes"] == 0,
                         "N=$n $name reduction must remain zero-allocation")
                 require(measurement["median_allocs"] == 0,
@@ -124,6 +126,13 @@ function validate_distribution_receipt(path::AbstractString)
                            Float64(row["rk_direct_native"]["median_ns"])
             require(shared_ratio <= 1.10,
                     "N=$n shared RK object exceeds the one-off control by more than 10%")
+        end
+        if n > 1 && haskey(row, "rk_native") &&
+                haskey(row, "rk_authored_native")
+            authored_ratio = Float64(row["rk_authored_native"]["median_ns"]) /
+                             Float64(row["rk_native"]["median_ns"])
+            require(authored_ratio <= 1.10,
+                    "N=$n authored return exceeds legacy plate by more than 10%")
         end
     end
 

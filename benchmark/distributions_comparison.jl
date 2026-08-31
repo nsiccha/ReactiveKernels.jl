@@ -36,6 +36,16 @@ const RK_REDUCE = plate(
     normal.logpdf;
     have = (:x, :location, :scale), want = :logpdf, batched = (:x,),
 )
+
+@kernel benchmark_authored_normal_loglik(
+        x::Vector{Float64}, location, scale) = begin
+    pointwise = plate(x, location, scale) do xi, li, si
+        normal(li, si).logpdf(xi)
+    end
+    return sum(pointwise)
+end
+
+const RK_AUTHORED_RETURN = prepare(benchmark_authored_normal_loglik)
 const RK_SCALAR = prepare(extract(
     normal; have = (:x, :location, :scale), want = :logpdf,
 ))
@@ -68,6 +78,8 @@ function hand_hoisted_reduce(μ, σ, xs)
 end
 
 compile_rk(xs, μ, σ) = @compile sync = true RK_REDUCE(xs, μ, σ)
+compile_rk_authored(xs, μ, σ) =
+    @compile sync = true RK_AUTHORED_RETURN(xs, μ, σ)
 compile_rk_replicated(xs, μ, σ) =
     @compile sync = true RK_REPLICATED(xs, μ, σ)
 compile_pm(μ, σ, xs) = @compile sync = true probability_measures_reduce(μ, σ, xs)
@@ -159,6 +171,17 @@ function run_benchmark()
         "refusing to write a receipt from a dirty tree; commit first or pass --allow-dirty for an exploratory run",
     )
 
+    authored_native_ast = string(code_expr(RK_AUTHORED_RETURN))
+    authored_tensorized_ast = string(RK_AUTHORED_RETURN.f.tensorized_ast)
+    occursin("similar", authored_native_ast) &&
+        error("authored return-only lowering materializes a pointwise output")
+    occursin("for ", authored_tensorized_ast) &&
+        error("authored Reactant lowering retained a host loop")
+    occursin("Base.broadcast", authored_tensorized_ast) ||
+        error("authored Reactant lowering is not tensorized as broadcasts")
+    occursin("Base.sum", authored_tensorized_ast) ||
+        error("authored Reactant lowering is not a fused reduction")
+
     Random.seed!(0x5eed)
     μ, σ = 0.3, 1.2
     rμ = Reactant.ConcreteRNumber(μ)
@@ -176,6 +199,7 @@ function run_benchmark()
 
         native_values = (
             RK_REDUCE(xs, μ, σ),
+            RK_AUTHORED_RETURN(xs, μ, σ),
             RK_DIRECT_REDUCE(xs, μ, σ),
             distributions_reduce(μ, σ, xs),
             probability_measures_reduce(μ, σ, xs),
@@ -186,11 +210,16 @@ function run_benchmark()
             error("native value mismatch at N=$n")
 
         rk_compile_s = @elapsed rk_compiled = compile_rk(rxs, rμ, rσ)
+        rk_authored_compile_s = @elapsed rk_authored_compiled =
+            compile_rk_authored(rxs, rμ, rσ)
         pm_compile_s = @elapsed pm_compiled = compile_pm(rμ, rσ, rxs)
         rk_value = Float64(rk_compiled(rxs, rμ, rσ))
+        rk_authored_value = Float64(rk_authored_compiled(rxs, rμ, rσ))
         pm_value = Float64(pm_compiled(rμ, rσ, rxs))
         isapprox(rk_value, reference; rtol = 1e-11) ||
             error("Reactant RK value mismatch at N=$n")
+        isapprox(rk_authored_value, reference; rtol = 1e-11) ||
+            error("Reactant authored RK value mismatch at N=$n")
         isapprox(pm_value, reference; rtol = 1e-11) ||
             error("Reactant ProbabilityMeasures value mismatch at N=$n")
 
@@ -210,7 +239,9 @@ function run_benchmark()
             end
         end
 
-        observed_values = Any[native_values..., rk_value, pm_value]
+        observed_values = Any[
+            native_values..., rk_value, rk_authored_value, pm_value,
+        ]
         dist_value === nothing || push!(observed_values, dist_value)
 
         row = Dict{String,Any}(
@@ -221,6 +252,8 @@ function run_benchmark()
                 abs(value - reference) / abs(reference) for value in observed_values
             ),
             "rk_native" => _measurement(RK_REDUCE, xs, μ, σ; rounds),
+            "rk_authored_native" =>
+                _measurement(RK_AUTHORED_RETURN, xs, μ, σ; rounds),
             "rk_direct_native" =>
                 _measurement(RK_DIRECT_REDUCE, xs, μ, σ; rounds),
             "distributions_native" =>
@@ -234,9 +267,12 @@ function run_benchmark()
             "hand_hoisted" =>
                 _measurement(hand_hoisted_reduce, μ, σ, xs; rounds),
             "rk_reactant" => _measurement(rk_compiled, rxs, rμ, rσ; rounds),
+            "rk_authored_reactant" =>
+                _measurement(rk_authored_compiled, rxs, rμ, rσ; rounds),
             "probability_measures_reactant" =>
                 _measurement(pm_compiled, rμ, rσ, rxs; rounds),
             "rk_reactant_compile_seconds" => rk_compile_s,
+            "rk_authored_reactant_compile_seconds" => rk_authored_compile_s,
             "probability_measures_reactant_compile_seconds" => pm_compile_s,
         )
         if dist_compiled !== nothing
@@ -281,7 +317,12 @@ function run_benchmark()
             "reactant_transfers_included" => false,
             "reactant_parameters_traced" => true,
             "reactant_compile_time_in_timed_region" => false,
-            "reactant_compile_order" => ["ReactiveKernels", "ProbabilityMeasures", "Distributions"],
+            "reactant_compile_order" => [
+                "ReactiveKernels legacy plate",
+                "ReactiveKernels authored plate return",
+                "ProbabilityMeasures",
+                "Distributions",
+            ],
             "reactant_compile_times_include_first_service_startup" => true,
             "reactant_replica_counts" => collect(_replica_counts()),
             "reactant_replica_axis" =>
@@ -294,11 +335,18 @@ function run_benchmark()
                 "sum(ProbabilityMeasures.logdensityof.(ProbabilityMeasures.Normal(μ, σ), xs))",
             "rk_shared_spelling" =>
                 "plate(normal.logpdf; have=(:x,:location,:scale), want=:logpdf, batched=(:x,))",
+            "rk_authored_return_spelling" =>
+                "@kernel normal_loglik(x, location, scale) = begin; pointwise = plate(x, location, scale) do xi, li, si; normal(li, si).logpdf(xi); end; return sum(pointwise); end",
+            "rk_authored_native_lowering" =>
+                "one reduction traversal with no similar/pointwise output",
+            "rk_authored_reactant_lowering" =>
+                "tensorized broadcast chain consumed by Base.sum; no host loop or similar",
             "rk_direct_control_spelling" =>
                 "one-off benchmark_normal_logpdf lifted with plate",
         ),
         "support" => Dict(
             "rk_reactant" => true,
+            "rk_authored_reactant" => true,
             "probability_measures_reactant" => true,
             "distributions_reactant" => distributions_reactant_supported,
             "distributions_reactant_error" => distributions_reactant_error,
