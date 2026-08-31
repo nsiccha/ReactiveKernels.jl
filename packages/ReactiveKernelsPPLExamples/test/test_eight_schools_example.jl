@@ -52,7 +52,8 @@ end
         end
         @test producer_count(model.parameters) == 2
         for value in (model.log_jacobian, model.effects_pointwise,
-                      model.effects_prior, model.prior, model.likelihood,
+                      model.effects_prior, model.prior,
+                      model.unconstrained_prior, model.likelihood,
                       model.pointwise, model.constrained_logdensity,
                       model.posterior, model.new_group)
             @test producer_count(value) == 1
@@ -157,10 +158,11 @@ end
 
     @testset "constrained and unconstrained joint-density cuts share one graph" begin
         constrained_kernel = prepare(model;
-            have = (:μ, :τ, :θ, :observations, :observation_scales),
+            have = (:parameters, :observations, :observation_scales),
             want = (:prior, :likelihood, :constrained_logdensity))
+        constrained_parameters = (; μ = q[1], τ = exp(q[2]), θ = q[3:end])
         prior, likelihood, constrained_logdensity = constrained_kernel(
-            q[1], exp(q[2]), q[3:end],
+            constrained_parameters,
             EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA,
         )
 
@@ -174,6 +176,10 @@ end
 
         @test constrained_logdensity ≈ prior + likelihood
         @test posterior ≈ constrained_logdensity + log_jacobian
+        unconstrained_prior = prepare(model;
+            have = (:μ, :log_τ, :θ),
+            want = :unconstrained_prior)(q[1], q[2], q[3:end])
+        @test unconstrained_prior ≈ prior + log_jacobian
         @test log_jacobian == q[2]
 
         # Starting from τ computes log_τ once for the normalization terms, but

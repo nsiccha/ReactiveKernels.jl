@@ -42,6 +42,13 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
     parameters = (; μ, τ, θ)
     (parameters, log_jacobian::Float64) = ((; μ, τ, θ), log_τ)
 
+    # The constrained parameter object is also an input boundary. When it is
+    # supplied, these inverse edges expose its named components to the same
+    # prior and likelihood graph; when the components are supplied instead,
+    # HAVE authority cuts the inverse edges.
+    (μ::Float64, τ::Float64, θ::AbstractVector{Float64}) =
+        (parameters.μ, parameters.τ, parameters.θ)
+
     # Log prior: μ ~ Normal(0, 5), τ ~ HalfCauchy(0, 5),
     # and θⱼ ~ Normal(μ, τ). Supplying both τ and log_τ to the nested Cauchy
     # and Normal objects makes both graph values authoritative HAVE inputs:
@@ -65,8 +72,9 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
     end
     likelihood::Float64 = sum(pointwise)
 
-    # The constrained joint excludes transform work. The unconstrained-space
-    # posterior adds the Jacobian, and remains the distinguished return.
+    # The constrained joint excludes transform work. The unconstrained prior
+    # and posterior include the Jacobian, matching sampler-space density APIs.
+    unconstrained_prior::Float64 = prior + log_jacobian
     constrained_logdensity::Float64 = prior + likelihood
     posterior::Float64 = constrained_logdensity + log_jacobian
 
@@ -168,8 +176,9 @@ and predictions are plain NamedTuples, not custom types.
 The reusable Normal and Cauchy kernel objects from the distributions example are
 included directly by ordinary endpoint calls inside the model's authored plate
 blocks; the PPL source does not re-author their formulas or prepare helper paths.
-The constrained log density, transform Jacobian, prior, pointwise likelihood,
-total likelihood, unconstrained posterior, and prediction remain selectable named nodes. A
+The constrained log density, transform Jacobian, constrained and unconstrained
+prior, pointwise likelihood, total likelihood, unconstrained posterior, and
+prediction remain selectable named nodes. A
 Wren-style accumulator tuple is therefore a static `want` selection, not a
 second evaluation framework. Prediction is deterministic for caller-supplied
 standard-normal innovations; sampling those innovations remains outside the

@@ -27,11 +27,11 @@ query is `log_τ`.
 
 The one model graph exposes the packed `unconstrained` input, named latent ports
 `μ`/`log_τ`/`θ`, constrained `parameters`, `log_jacobian`, `prior`,
-`likelihood`, `pointwise`, `constrained_logdensity`, and `posterior`. The
-constrained joint is `prior + likelihood`; the distinguished return is the
-unconstrained joint, which additionally includes `log_jacobian`. Preparing a
-different HAVE/WANT boundary changes only the generated backward slice; it does
-not select a second model implementation.
+`unconstrained_prior`, `likelihood`, `pointwise`, `constrained_logdensity`, and
+`posterior`. The constrained joint is `prior + likelihood`; its unconstrained
+counterpart and `unconstrained_prior` additionally include `log_jacobian`.
+Preparing a different HAVE/WANT boundary changes only the generated backward
+slice; it does not select a second model implementation.
 
 The constrained `parameters` port has **two producers** — this is RK's *multiple
 paths to the same port*. One assignment builds the constrained parameters alone;
@@ -51,7 +51,8 @@ parameters ──► reusable Normal/Cauchy kernels ──► log prior
                                               └─► fused log-likelihood sum
           ──► new-group prediction
 
-log prior + log likelihood ──► constrained log density
+log prior ────────────────────► unconstrained prior (+ log Jacobian)
+     └─ + log likelihood ─────► constrained log density
                                 └─ + log Jacobian ─► unconstrained log posterior
 ```
 
@@ -101,9 +102,9 @@ vector and the named latent ports are alternate HAVE boundaries over that same
 graph, not alternate implementations of the mathematics.
 
 That gives the standard joint-density views without wrapper models. A
-constrained-space call supplies `μ`, `τ`, and `θ` and asks for
-`constrained_logdensity`; an unconstrained-space call supplies `μ`, `log_τ`, and
-`θ` and asks for the distinguished `posterior` return. The former computes
+constrained-space call supplies `parameters = (; μ, τ, θ)` and asks for
+`constrained_logdensity`; an unconstrained-space call supplies the packed
+`unconstrained` vector and asks for the distinguished `posterior` return. The former computes
 `log_τ = log(τ)` once for the distribution normalization terms and prunes the
 transform Jacobian; the latter uses the supplied `log_τ`, computes `τ`, and adds
 the Jacobian. Prior-only, likelihood-only, pointwise-only, and pointwise-plus-
