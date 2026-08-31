@@ -1273,7 +1273,7 @@ end
           Float64
     @test Reactant.unwrapped_eltype(typeof(compiled_result.state.dham)) ===
           Float64
-    actual = _rhmc_hmc_host_values(compiled_result)
+    actual = _rhmc_hmc_host_values(program, compiled_result)
     @test eltype(collect(actual.energy_errors)) === Float64
     @test bitstring.(actual.init_pos) == mixed["init_pos_bits"]
     @test bitstring.(actual.fwd_pos) == mixed["fwd_pos_bits"]
