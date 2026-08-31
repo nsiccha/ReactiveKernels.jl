@@ -19,7 +19,7 @@ a prepared kernel.
 > MutatingFunctions-backed non-allocating preparation path and an optional
 > Reactant extension for traceable mathematical kernels and whole-kernel
 > replicas. The optional external
-> [adaptive-NUTS exemplar](examples/nuts_runtime/kernel_nuts_reactant.jl) compiles
+> [adaptive-NUTS exemplar](packages/ReactiveKernelsNUTSExamples/src/nuts_runtime/kernel_nuts_reactant.jl) compiles
 > one full-depth transition to one data-dependent traced `while`, with
 > pre-generated momentum, direction, and exponential tensors plus explicit
 > counters, so there is no host RNG inside the trace. That acceptance path is
@@ -381,9 +381,17 @@ graph objects on the hot path). See `test/test_stateless.jl` and
 ```julia
 julia --project=. -e 'using Pkg; Pkg.test()'   # full package suite
 julia --project=. -e 'using Pkg; Pkg.test(test_args=["benchmark"])'
+julia --project=. -e 'using Pkg; Pkg.test(test_args=["test_ad"])'
+julia --project=. -e 'using Pkg; Pkg.test(test_args=["test_stateful", "test_hmc.jl"])'
 julia --project=packages packages/setup.jl     # resolve nested local packages
 julia --project=packages packages/test.jl      # all nested package suites
 julia --project=packages packages/ReactiveKernelsKernelExamples/examples/demo.jl
 julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.EightSchoolsExample.demo()'
 julia --project=packages packages/ReactiveKernelsCompatibilityExamples/examples/preexisting.jl
 ```
+
+Test arguments accept one or more known test basenames (with or without `.jl`)
+and run them once in the suite's canonical order after shared setup. The named
+groups are `core`, `acceptance`, `ad`, and `benchmark`; GitHub Actions runs both
+`core` and `acceptance` on every supported Julia/OS cell. Unknown names fail
+before any selected test executes and list the accepted groups and files.

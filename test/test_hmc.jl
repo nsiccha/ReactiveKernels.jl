@@ -3,6 +3,7 @@ import Enzyme
 using LinearAlgebra
 using Random
 using ReactiveKernels
+using ReactiveKernelsNUTSExamples
 using Statistics
 using Test
 
@@ -34,18 +35,18 @@ function _phasepoint_receipt(point)
 end
 
 function _criterion_receipt(left, right, backward_velocity, forward_velocity)
-    criterion = ReactiveKernels._compute_criterion_sum(
+    criterion = ReactiveKernelsNUTSExamples._compute_criterion_sum(
         left, right, backward_velocity, forward_velocity,
     )
-    allocations = @allocated ReactiveKernels._compute_criterion_sum(
+    allocations = @allocated ReactiveKernelsNUTSExamples._compute_criterion_sum(
         left, right, backward_velocity, forward_velocity,
     )
     (; criterion, allocations)
 end
 
 function _trace_product_receipt(left, right)
-    value = ReactiveKernels._tr_prod(left, right)
-    allocations = @allocated ReactiveKernels._tr_prod(left, right)
+    value = ReactiveKernelsNUTSExamples._tr_prod(left, right)
+    allocations = @allocated ReactiveKernelsNUTSExamples._tr_prod(left, right)
     (; value, allocations)
 end
 
@@ -161,7 +162,7 @@ end
     )
     stepper = partial(leapfrog!; stepsize = 0.25)
     @test stepper.stepsize == 0.25
-    state = ReactiveKernels._oracle_nuts_state(
+    state = ReactiveKernelsNUTSExamples._oracle_nuts_state(
         point;
         rng = Xoshiro(42),
         step_f = stepper,

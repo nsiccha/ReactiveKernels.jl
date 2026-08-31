@@ -1,25 +1,42 @@
 using Test
 
-@testset "CI uses ordinary compiled modules" begin
-    workflow = read(joinpath(@__DIR__, "..", ".github", "workflows", "test.yml"), String)
-    package_matrix_match = match(
-        r"(?ms)^  test:\n.*?(?=^  compiled-module-smoke:)", workflow)
-    smoke_match = match(
-        r"(?ms)^  compiled-module-smoke:\n.*?(?=^  nonallocating-integration:)",
-        workflow)
-    reactant_match = match(r"(?ms)^  reactant-integration:\n.*\z", workflow)
+function _ci_workflow_sections(workflow)
+    workflow = replace(workflow, "\r\n" => "\n")
+    workflow = replace(workflow, '\r' => '\n')
+    matches = (
+        match(r"(?ms)^  test:\n.*?(?=^  compiled-module-smoke:)", workflow),
+        match(
+            r"(?ms)^  compiled-module-smoke:\n.*?(?=^  nonallocating-integration:)",
+            workflow),
+        match(r"(?ms)^  reactant-integration:\n.*\z", workflow),
+    )
+    any(isnothing, matches) && return nothing
+    return (
+        workflow = workflow,
+        package_matrix = something(matches[1]).match,
+        smoke = something(matches[2]).match,
+        reactant = something(matches[3]).match,
+    )
+end
 
-    @test package_matrix_match !== nothing
-    @test smoke_match !== nothing
-    @test reactant_match !== nothing
-    package_matrix = something(package_matrix_match).match
-    smoke = something(smoke_match).match
-    reactant = something(reactant_match).match
+@testset "CI uses ordinary compiled modules" begin
+    source = read(joinpath(@__DIR__, "..", ".github", "workflows", "test.yml"), String)
+    sections = _ci_workflow_sections(source)
+    @test sections !== nothing
+    isnothing(sections) && return
+
+    workflow = sections.workflow
+    package_matrix = sections.package_matrix
+    smoke = sections.smoke
+    reactant = sections.reactant
+
+    crlf_sections = _ci_workflow_sections(replace(workflow, "\n" => "\r\n"))
+    @test crlf_sections == sections
 
     @test !occursin("JULIA_PKG_PRECOMPILE_AUTO", package_matrix)
     @test !occursin("JULIA_PKG_PRECOMPILE_AUTO", workflow)
     @test !occursin("JULIA_DEPOT_PATH", workflow)
-    @test occursin("timeout-minutes: 90", package_matrix)
+    @test occursin("timeout-minutes: 180", package_matrix)
     @test occursin("julia-version: ['lts', '1', 'pre']", package_matrix)
     @test occursin("julia-arch: [x64]", package_matrix)
     @test occursin("os: [ubuntu-latest, windows-latest, macOS-latest]", package_matrix)

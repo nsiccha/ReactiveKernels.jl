@@ -1,4 +1,5 @@
 using ReactiveKernels
+using ReactiveKernelsNUTSExamples
 using LinearAlgebra
 using Random
 using DifferentiationInterface
@@ -28,7 +29,7 @@ _det_mom(D) = [cos(0.7i) for i in 1:D]
     metric = Matrix{Float64}(I, D, D)
     q0 = _det_pos(D)
     m0 = _det_mom(D)
-    group = ReactiveKernels.reactive_nuts_group(
+    group = ReactiveKernelsNUTSExamples.reactive_nuts_group(
         _std_pot_grad!, metric, q0, m0; gofwd = true)
 
     # All three endpoints start equal (init == fwd == bwd), so every hamiltonian
@@ -74,7 +75,7 @@ end
     q0 = _det_pos(D)
     m_fwd = _det_mom(D)
     m_bwd = [cos(0.3i) for i in 1:D]
-    group = ReactiveKernels.reactive_nuts_group(_std_pot_grad!, metric, q0, q0)
+    group = ReactiveKernelsNUTSExamples.reactive_nuts_group(_std_pot_grad!, metric, q0, q0)
     group.fwd_mom = m_fwd
     group.bwd_mom = m_bwd
 
@@ -95,7 +96,7 @@ end
     metric = Matrix{Float64}(I, D, D)
     q0 = _det_pos(D)
     m0 = _det_mom(D)
-    group = ReactiveKernels.reactive_nuts_group(_std_pot_grad!, metric, q0, m0)
+    group = ReactiveKernelsNUTSExamples.reactive_nuts_group(_std_pot_grad!, metric, q0, m0)
 
     # Bundle slots are reused in place: the exposed gradient/velocity arrays keep
     # a STABLE identity across an invalidate→recompute, and their values update.
@@ -118,7 +119,7 @@ end
     metric = Matrix{Float64}(I, D, D)
     q0 = _det_pos(D)
     m0 = _det_mom(D)
-    source = ReactiveKernels.reactive_nuts_group(_std_pot_grad!, metric, q0, m0)
+    source = ReactiveKernelsNUTSExamples.reactive_nuts_group(_std_pot_grad!, metric, q0, m0)
     source.fwd_mom = 2.0 .* m0
     source_dham = source.dham
     source_grad = source.fwd_dpot_dpos
@@ -163,7 +164,7 @@ end
     metric = Matrix{Float64}(I, D, D)
     q0 = _det_pos(D)
     m0 = _det_mom(D)
-    source = ReactiveKernels.reactive_nuts_group(_std_pot_grad!, metric, q0, m0)
+    source = ReactiveKernelsNUTSExamples.reactive_nuts_group(_std_pot_grad!, metric, q0, m0)
 
     # Materialize hidden bundles + exposed projections on the source.
     src_grad = source.fwd_dpot_dpos
@@ -204,7 +205,7 @@ end
     metric = Matrix{Float64}(I, D, D)
     q0 = _det_pos(D)
     m0 = _det_mom(D)
-    group = ReactiveKernels.reactive_nuts_group(_std_pot_grad!, metric, q0, m0)
+    group = ReactiveKernelsNUTSExamples.reactive_nuts_group(_std_pot_grad!, metric, q0, m0)
     state = group.state
     handles = group.handles
 
@@ -259,7 +260,7 @@ end
 
     # Distinct-position non-alias regression on the flat group: init/fwd/bwd
     # gradient slots are distinct array objects with distinct, correct values.
-    di_group = ReactiveKernels.reactive_nuts_group(di_potential_gradient!, metric, q0, m0)
+    di_group = ReactiveKernelsNUTSExamples.reactive_nuts_group(di_potential_gradient!, metric, q0, m0)
     di_group.init_pos = _det_pos(D)
     di_group.fwd_pos = [0.5 * sin(i) for i in 1:D]
     di_group.bwd_pos = [-0.3 * cos(i) for i in 1:D]
@@ -280,8 +281,8 @@ end
     @test gb ≈ di_group.bwd_pos                   # bwd slot untouched
 
     # Agreement with the analytic group everywhere.
-    analytic_group = ReactiveKernels.reactive_nuts_group(_std_pot_grad!, metric, q0, m0)
-    di_group2 = ReactiveKernels.reactive_nuts_group(di_potential_gradient!, metric, q0, m0)
+    analytic_group = ReactiveKernelsNUTSExamples.reactive_nuts_group(_std_pot_grad!, metric, q0, m0)
+    di_group2 = ReactiveKernelsNUTSExamples.reactive_nuts_group(di_potential_gradient!, metric, q0, m0)
     di_group2.fwd_mom = 2.0 .* m0
     analytic_group.fwd_mom = 2.0 .* m0
     @test di_group2.dham ≈ analytic_group.dham
@@ -302,7 +303,7 @@ end
         )
         q0 = _det_pos(D)
 
-        oracle = ReactiveKernels._oracle_nuts_state(
+        oracle = ReactiveKernelsNUTSExamples._oracle_nuts_state(
             euclidean_phasepoint(_std_pot,
                                  q -> (_std_pot(q), copy(q)), metric, copy(q0),
                                  zeros(D));
@@ -338,7 +339,7 @@ end
     D = 4
     metric = Matrix{Float64}(I, D, D)
     q0 = _det_pos(D)
-    oracle = ReactiveKernels._oracle_nuts_state(
+    oracle = ReactiveKernelsNUTSExamples._oracle_nuts_state(
         euclidean_phasepoint(_std_pot, q -> (_std_pot(q), copy(q)), metric,
                              copy(q0), zeros(D));
         rng = Xoshiro(77), step_f = partial(leapfrog!; stepsize = 0.3), max_depth = 6)
@@ -387,7 +388,7 @@ end
                              A'A + 6 * I)))
         q0 = _det_pos(D)
         m0 = _det_mom(D)
-        oracle = ReactiveKernels._oracle_nuts_state(
+        oracle = ReactiveKernelsNUTSExamples._oracle_nuts_state(
             euclidean_phasepoint(_std_pot, q -> (_std_pot(q), copy(q)), metric,
                                  copy(q0), copy(m0));
             rng = Xoshiro(9), step_f = partial(leapfrog!; stepsize = 0.2),
@@ -428,9 +429,9 @@ end
     @test !isdefined(ReactiveKernels, :NUTSState)
     @test !(:NUTSState in names(ReactiveKernels; all = false))
     # The oracle type/constructor stay genuinely internal (unexported).
-    @test !(:_OracleNUTSState in names(ReactiveKernels; all = false))
-    @test !(:_oracle_nuts_state in names(ReactiveKernels; all = false))
-    @test isdefined(ReactiveKernels, :_OracleNUTSState)   # exists, just not public
+    @test !(:_OracleNUTSState in names(ReactiveKernelsNUTSExamples; all = false))
+    @test !(:_oracle_nuts_state in names(ReactiveKernelsNUTSExamples; all = false))
+    @test isdefined(ReactiveKernelsNUTSExamples, :_OracleNUTSState)
 
     # The public constructor returns the compiled-reactive state...
     D = 3
@@ -619,7 +620,7 @@ end
     metric = Matrix{Float64}(I, D, D)
     q0 = _det_pos(D)
 
-    oracle = ReactiveKernels._oracle_nuts_state(
+    oracle = ReactiveKernelsNUTSExamples._oracle_nuts_state(
         euclidean_phasepoint(_std_pot, q -> (_std_pot(q), copy(q)), metric,
                              copy(q0), zeros(D));
         rng = Xoshiro(4321), step_f = partial(leapfrog!; stepsize = 0.25),
@@ -697,7 +698,7 @@ end
 @testset "CompiledNUTSState — warmup! adaptation parity with the oracle" begin
     D = 4
     q0 = _det_pos(D)
-    oracle = ReactiveKernels._oracle_nuts_state(
+    oracle = ReactiveKernelsNUTSExamples._oracle_nuts_state(
         euclidean_phasepoint(_std_pot, q -> (_std_pot(q), copy(q)),
                              Matrix{Float64}(I, D, D), copy(q0), zeros(D));
         rng = Xoshiro(123), step_f = partial(leapfrog!; stepsize = 0.5),
@@ -780,7 +781,7 @@ end
     grp = reactive_nuts_group(_std_pot_grad!, metric, _det_pos(D), _det_mom(D))
 
     # The external comparison group is an explicit prepared phase point.
-    @test grp isa ReactiveKernels.ReactivePhasePoint
+    @test grp isa ReactiveKernelsNUTSExamples.ReactivePhasePoint
     @test reactive_program(grp) === grp.state.program
     @test reactive_program(grp) isa ReactiveKernels.ReactiveProgram
     # No hot slot is Ref{Any} (concrete state/getter/slots).
@@ -817,16 +818,17 @@ end
     @test !occursin("Any", string(typeof(g32.state.program.getters)))
 
     # Hot authored-group leapfrog stays inferred and 0 B.
-    @inferred ReactiveKernels._group_leapfrog!(g1, Val(:fwd), 0.1)
+    @inferred ReactiveKernelsNUTSExamples._group_leapfrog!(g1, Val(:fwd), 0.1)
     _lf!(g, n) = (for _ in 1:n
-                      ReactiveKernels._group_leapfrog!(g, Val(:fwd), 0.1)
+                      ReactiveKernelsNUTSExamples._group_leapfrog!(g, Val(:fwd), 0.1)
                   end)
     _lf!(g1, 2)
     @test @allocated(_lf!(g1, 1000)) == 0
 end
 
 @testset "reactive_nuts_group has no second public authoring macro" begin
-    src = read(joinpath(@__DIR__, "..", "examples", "nuts_runtime", "reactive_nuts.jl"), String)
+    src = read(joinpath(pkgdir(ReactiveKernelsNUTSExamples), "src",
+                        "nuts_runtime", "reactive_nuts.jl"), String)
     @test !occursin("@" * "reactive", src)
     # The legacy comparison path is explicit low-level graph construction.
     wrapper = match(r"function reactive_nuts_group\(.*?\n(.*?)\nend"s, src)

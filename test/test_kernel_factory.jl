@@ -1,7 +1,7 @@
 # Inc3 factory/composition substrate tests. Isolated in a module so fixtures cannot
 # shadow package exports in the shared Pkg.test Main.
 module TestKernelFactory
-using ReactiveKernels, Test
+using ReactiveKernels, ReactiveKernelsNUTSExamples, Test
 using LinearAlgebra, Random
 const RKS = ReactiveKernels
 
@@ -137,7 +137,7 @@ end
 # A synthetic compiled `root!(frame, scratch, rng) -> frame` standing in for POC's compiled Mode-2 root
 # (POC's real root isn't on the syntax branch): it bumps a diagnostic in place and returns the SAME frame,
 # so `result === state`. Concretely-typed scratch (a Tuple), rng THREADED (never stored in scratch).
-synroot!(frame, scratch, rng) = (RKS._diag_set!(frame.diag, Val(1), RKS._diag_slot(frame.diag, Val(1)) + 1); frame)
+synroot!(frame, scratch, rng) = (ReactiveKernelsNUTSExamples._diag_set!(frame.diag, Val(1), ReactiveKernelsNUTSExamples._diag_slot(frame.diag, Val(1)) + 1); frame)
 # function barrier for the whole-endpoint mixed scalar+buffer copy 0-B / @inferred gate (RK 07:02)
 _copyep0b(d, s) = RKS._canon_copy_endpoint!(d, s)
 # a buffer that THROWS during copyto! (post-validation mid-copy failure) — proves the epoch contract
@@ -1267,52 +1267,52 @@ end
 
     @testset "nuts_state — compiler-owned DIAGNOSTICS storage (concrete field ABI, F32/F64, pending/committed epoch) (RK 08:42/08:47/08:48)" begin
         # F32/F64 type PRESERVATION — acceptance_rate/dham follow init.ham's type (no Float64 promotion)
-        d32 = RKS._diagnostics_store(Float32); d64 = RKS._diagnostics_store(Float64)
-        @test RKS.diagnostics_ham_type(d32) === Float32 && RKS.diagnostics_ham_type(d64) === Float64
-        @test typeof(RKS._diag_slot(d32, Val(3))) === Float32 && typeof(RKS._diag_slot(d64, Val(4))) === Float64
-        @test (@inferred RKS._diag_slot(d32, Val(3))) isa Float32          # Val accessor type-stable
+        d32 = ReactiveKernelsNUTSExamples._diagnostics_store(Float32); d64 = ReactiveKernelsNUTSExamples._diagnostics_store(Float64)
+        @test ReactiveKernelsNUTSExamples.diagnostics_ham_type(d32) === Float32 && ReactiveKernelsNUTSExamples.diagnostics_ham_type(d64) === Float64
+        @test typeof(ReactiveKernelsNUTSExamples._diag_slot(d32, Val(3))) === Float32 && typeof(ReactiveKernelsNUTSExamples._diag_slot(d64, Val(4))) === Float64
+        @test (@inferred ReactiveKernelsNUTSExamples._diag_slot(d32, Val(3))) isa Float32          # Val accessor type-stable
         # CONCRETE mutable field ABI (NOT the boxing _OwnerState tuple path) — every scalar op exact 0-B
         # AND @inferred for BOTH F32 and F64 (oftype-parameterized value, typed loop)
-        _setn(d) = RKS._diag_set!(d, Val(1), 7)
-        _seta(d::RKS._DiagnosticsStore{T}) where {T} = RKS._diag_set!(d, Val(3), oftype(zero(T), 0.5))
-        _rst(d) = RKS._diagnostics_reset!(d)
-        _cmt(d) = RKS._diagnostics_root_commit!(d)
-        for d in (RKS._diagnostics_store(Float32), RKS._diagnostics_store(Float64))
+        _setn(d) = ReactiveKernelsNUTSExamples._diag_set!(d, Val(1), 7)
+        _seta(d::ReactiveKernelsNUTSExamples._DiagnosticsStore{T}) where {T} = ReactiveKernelsNUTSExamples._diag_set!(d, Val(3), oftype(zero(T), 0.5))
+        _rst(d) = ReactiveKernelsNUTSExamples._diagnostics_reset!(d)
+        _cmt(d) = ReactiveKernelsNUTSExamples._diagnostics_root_commit!(d)
+        for d in (ReactiveKernelsNUTSExamples._diagnostics_store(Float32), ReactiveKernelsNUTSExamples._diagnostics_store(Float64))
             _setn(d); _seta(d); _rst(d); _cmt(d)                            # warm this precision
             @test (@allocated _setn(d)) == 0 && (@allocated _seta(d)) == 0
             @test (@allocated _rst(d)) == 0 && (@allocated _cmt(d)) == 0
             @test (@inferred _seta(d)) === d
-            @test (@inferred RKS._diag_slot(d, Val(3))) isa RKS.diagnostics_ham_type(d)
+            @test (@inferred ReactiveKernelsNUTSExamples._diag_slot(d, Val(3))) isa ReactiveKernelsNUTSExamples.diagnostics_ham_type(d)
         end
         # RESET is the authoritative source write (RK 08:48): zeros COMMITTED (exception safety) + marks all
         # four PENDING-PRODUCED (current within the epoch). A dominated stats_f read is valid mid-epoch.
-        RKS._diagnostics_reset!(d64)
-        @test RKS.diagnostics_committed_mask(d64) == UInt(0)               # nothing committed mid-epoch
-        @test all(RKS._diag_produced(d64, Val(i)) for i in 1:4)           # all four produced within-epoch
-        @test !any(RKS._diag_committed(d64, Val(i)) for i in 1:4)
+        ReactiveKernelsNUTSExamples._diagnostics_reset!(d64)
+        @test ReactiveKernelsNUTSExamples.diagnostics_committed_mask(d64) == UInt(0)               # nothing committed mid-epoch
+        @test all(ReactiveKernelsNUTSExamples._diag_produced(d64, Val(i)) for i in 1:4)           # all four produced within-epoch
+        @test !any(ReactiveKernelsNUTSExamples._diag_committed(d64, Val(i)) for i in 1:4)
         # reset → stats read/update → commit: stats_f reads acceptance_rate (produced, valid) then updates
-        @test RKS._diag_produced(d64, Val(3))                              # acceptance_rate readable mid-epoch
-        RKS._diag_set!(d64, Val(1), 5); RKS._diag_set!(d64, Val(3), 0.8)   # stats writes n_steps + acceptance
-        RKS._diagnostics_root_commit!(d64)                                 # SINGLE root commit
-        @test RKS.diagnostics_committed_mask(d64) == UInt(0x0f)            # all four blessed at commit
-        @test RKS._diag_slot(d64, Val(1)) == 5 && RKS._diag_slot(d64, Val(3)) == 0.8
+        @test ReactiveKernelsNUTSExamples._diag_produced(d64, Val(3))                              # acceptance_rate readable mid-epoch
+        ReactiveKernelsNUTSExamples._diag_set!(d64, Val(1), 5); ReactiveKernelsNUTSExamples._diag_set!(d64, Val(3), 0.8)   # stats writes n_steps + acceptance
+        ReactiveKernelsNUTSExamples._diagnostics_root_commit!(d64)                                 # SINGLE root commit
+        @test ReactiveKernelsNUTSExamples.diagnostics_committed_mask(d64) == UInt(0x0f)            # all four blessed at commit
+        @test ReactiveKernelsNUTSExamples._diag_slot(d64, Val(1)) == 5 && ReactiveKernelsNUTSExamples._diag_slot(d64, Val(3)) == 0.8
         # THROW-before-commit: reset + producer writes but NO root commit → committed stays 0 (nothing
         # falsely current cross-epoch)
-        dth = RKS._diagnostics_store(Float64)
-        RKS._diagnostics_root_commit!(dth)                                 # a prior epoch committed something
-        RKS._diagnostics_reset!(dth); RKS._diag_set!(dth, Val(2), 3)       # new epoch: reset + a write
+        dth = ReactiveKernelsNUTSExamples._diagnostics_store(Float64)
+        ReactiveKernelsNUTSExamples._diagnostics_root_commit!(dth)                                 # a prior epoch committed something
+        ReactiveKernelsNUTSExamples._diagnostics_reset!(dth); ReactiveKernelsNUTSExamples._diag_set!(dth, Val(2), 3)       # new epoch: reset + a write
         # (epoch would throw here, before _diagnostics_root_commit!)
-        @test RKS.diagnostics_committed_mask(dth) == UInt(0)              # committed reset-zeroed, not blessed
+        @test ReactiveKernelsNUTSExamples.diagnostics_committed_mask(dth) == UInt(0)              # committed reset-zeroed, not blessed
     end
 
     @testset "nuts_state — concrete owned tree + full sampler FRAME (one shared authority, isolated endpoints/trees/proposals, F32/F64) (RK 08:55)" begin
         # concrete owned TREE byte-matching the fixture: log_weight (2-vec ham sentinel) + bwd/bwd_fwd (mv) +
         # summed_mom (trajectory), all zeroed buffers; F32/F64 preserved; DISTINCT buffers per tree
         for (T, ham) in ((Float32, -0.5f0), (Float64, -0.5))
-            tr = RKS._nuts_tree(T[1, 2, 3], ham)
+            tr = ReactiveKernelsNUTSExamples._nuts_tree(T[1, 2, 3], ham)
             @test tr.log_weight == fill(oftype(ham, -Inf), 2) && eltype(tr.log_weight) === T
             @test eltype(tr.bwd.mom) === T && tr.bwd.mom == zeros(T, 3) && tr.summed_mom.fwd == zeros(T, 3)
-            trs = RKS._nuts_trees(T[1, 2, 3], ham, 4)
+            trs = ReactiveKernelsNUTSExamples._nuts_trees(T[1, 2, 3], ham, 4)
             @test length(trs) == 4 && trs[1].bwd.mom !== trs[2].bwd.mom   # per-tree isolation (distinct)
         end
         # TWO-PHASE full FRAME over the REAL pot_f-free SIX-recipe euclidean_ep (RK 09:00/09:02): phase 1
@@ -1342,28 +1342,28 @@ end
         end
         # frozen config carried into the frame: a raw step binder (validated internally) + no-effect stats
         stepb = RKS.partial(leapfrog_ep!; stepsize = 0.1)
-        mkframe(T, pg, md) = RKS._construct_nuts_frame(pf, mkvals(T, pg), md;
+        mkframe(T, pg, md) = ReactiveKernelsNUTSExamples._construct_nuts_frame(pf, mkvals(T, pg), md;
                                                        step_f = stepb, stats_f = nothing, min_dham = -1000)
         for T in (Float32, Float64)
             pg = CountingPgrad(0)
             frame = mkframe(T, pg, 10)
-            @test RKS.nuts_frame_shared(frame) isa RKS._CanonShared              # ONE shared authority
-            @test RKS.nuts_frame_ham_type(frame) === T && RKS.diagnostics_ham_type(frame.diag) === T
+            @test ReactiveKernelsNUTSExamples.nuts_frame_shared(frame) isa RKS._CanonShared              # ONE shared authority
+            @test ReactiveKernelsNUTSExamples.nuts_frame_ham_type(frame) === T && ReactiveKernelsNUTSExamples.diagnostics_ham_type(frame.diag) === T
             @test eltype(frame.trees[1].log_weight) === T
             @test length(frame.trees) == 11 && length(frame.proposals) == 12     # max_depth+1 / +2
             # frozen config = a VALIDATED prepared callable record (leapfrog! registration + bound stepsize)
             # + the no-effect stats binding; the derived `diverged` recipe starts DIRTY (RK 09:11/09:25)
-            sc = RKS.nuts_frame_step(frame)
+            sc = ReactiveKernelsNUTSExamples.nuts_frame_step(frame)
             @test RKS.prepared_callable_registration(sc) === RKS.kernel_registration(leapfrog_ep!)
             @test RKS.prepared_callable_token(sc) === RKS.kernel_registration(leapfrog_ep!).token
             @test RKS.prepared_callable_kwargs(sc) == (; stepsize = 0.1)
-            @test RKS.stats_binding_registration(RKS.nuts_frame_stats(frame)) === nothing  # no-effect variant
-            @test RKS.nuts_frame_max_depth(frame) == 10 && RKS.nuts_frame_min_dham(frame) === oftype(zero(T), -1000)
-            @test !RKS.nuts_frame_diverged_pending(frame) && !RKS.nuts_frame_diverged_committed(frame)
+            @test ReactiveKernelsNUTSExamples.stats_binding_registration(ReactiveKernelsNUTSExamples.nuts_frame_stats(frame)) === nothing  # no-effect variant
+            @test ReactiveKernelsNUTSExamples.nuts_frame_max_depth(frame) == 10 && ReactiveKernelsNUTSExamples.nuts_frame_min_dham(frame) === oftype(zero(T), -1000)
+            @test !ReactiveKernelsNUTSExamples.nuts_frame_diverged_pending(frame) && !ReactiveKernelsNUTSExamples.nuts_frame_diverged_committed(frame)
             # phase-1: children are UNSEEDED (dirty) — NOT yet at entry_current, no pgrad ran
             @test ecmask(frame.fwd) != RKS._owner_mask(Ncanon, entry_owned) && pg.n == 0
             # SEEDING an INCOMPLETE init REJECTS (RK 09:10) — init not yet at entry_current before poc runs
-            @test_throws RKS._KernelFactoryReject RKS._seed_nuts_children!(frame)
+            @test_throws RKS._KernelFactoryReject ReactiveKernelsNUTSExamples._seed_nuts_children!(frame)
             # POC executes the FULL six-handle init on init exactly once (the one destination pgrad)
             initfn = RKS.compile_prepared_initialization(pf, typeof(frame.init), typeof(frame.shared))
             initfn(frame.init, frame.shared, RKS.kernel_prepared_handles(pf))
@@ -1372,14 +1372,14 @@ end
             # derived `diverged` epoch validity (RK 09:25): produce→pending; a SUCCESS root commits it;
             # the NEXT root's reset clears BOTH pending AND committed; a produce-without-commit (a later
             # throw) leaves committed=false so the old value is never falsely current
-            RKS._nuts_produce_diverged!(frame); @test RKS.nuts_frame_diverged_pending(frame)
-            RKS._nuts_derived_root_commit!(frame); @test RKS.nuts_frame_diverged_committed(frame)   # success
-            RKS._nuts_frame_reset_control!(frame)                                # next root: reset clears BOTH
-            @test !RKS.nuts_frame_diverged_pending(frame) && !RKS.nuts_frame_diverged_committed(frame)
-            RKS._nuts_produce_diverged!(frame)                                   # produced but NOT committed (throw)
-            @test RKS.nuts_frame_diverged_pending(frame) && !RKS.nuts_frame_diverged_committed(frame)
+            ReactiveKernelsNUTSExamples._nuts_produce_diverged!(frame); @test ReactiveKernelsNUTSExamples.nuts_frame_diverged_pending(frame)
+            ReactiveKernelsNUTSExamples._nuts_derived_root_commit!(frame); @test ReactiveKernelsNUTSExamples.nuts_frame_diverged_committed(frame)   # success
+            ReactiveKernelsNUTSExamples._nuts_frame_reset_control!(frame)                                # next root: reset clears BOTH
+            @test !ReactiveKernelsNUTSExamples.nuts_frame_diverged_pending(frame) && !ReactiveKernelsNUTSExamples.nuts_frame_diverged_committed(frame)
+            ReactiveKernelsNUTSExamples._nuts_produce_diverged!(frame)                                   # produced but NOT committed (throw)
+            @test ReactiveKernelsNUTSExamples.nuts_frame_diverged_pending(frame) && !ReactiveKernelsNUTSExamples.nuts_frame_diverged_committed(frame)
             # phase-2: seed children — complete values+mask copied, ZERO extra pgrad/chol
-            RKS._seed_nuts_children!(frame)
+            ReactiveKernelsNUTSExamples._seed_nuts_children!(frame)
             @test pg.n == 1                                                      # no child recompute
             for ch in (frame.fwd, frame.bwd, frame.proposals[1], frame.proposals[end])
                 @test ecmask(ch) == RKS._owner_mask(Ncanon, entry_owned)         # fwd/bwd/proposals mask==entry_current
@@ -1390,7 +1390,7 @@ end
             end
             @test frame.proposals[1] !== frame.proposals[2]
             # control true; 0-B control+diagnostics reset
-            _rc(fr) = RKS._nuts_frame_reset_control!(fr)
+            _rc(fr) = ReactiveKernelsNUTSExamples._nuts_frame_reset_control!(fr)
             @test frame.gofwd && frame.may_sample && frame.may_continue
             _rc(frame); @test (@allocated _rc(frame)) == 0
         end
@@ -1399,27 +1399,27 @@ end
         badpg(dest, p) = (dest[1] = 99.0; error("grad boom"))
         badfn = RKS.compile_prepared_initialization(pf, typeof(mkframe(Float64, badpg, 3).init),
                                                     typeof(mkframe(Float64, badpg, 3).shared))
-        frx2 = RKS._construct_nuts_frame(pf, mkvals(Float64, badpg), 3;
+        frx2 = ReactiveKernelsNUTSExamples._construct_nuts_frame(pf, mkvals(Float64, badpg), 3;
                                          step_f = stepb, stats_f = nothing, min_dham = -1000)
         @test_throws ErrorException badfn(frx2.init, frx2.shared, RKS.kernel_prepared_handles(pf))  # init throws
         @test RKS._canon_current_mask(frx2.init) != RKS._owner_mask(Ncanon, entry_owned)  # init INCOMPLETE
-        @test_throws RKS._KernelFactoryReject RKS._seed_nuts_children!(frx2)               # seeding rejects
+        @test_throws RKS._KernelFactoryReject ReactiveKernelsNUTSExamples._seed_nuts_children!(frx2)               # seeding rejects
         @test all(RKS._canon_current_mask(ch) != RKS._owner_mask(Ncanon, entry_owned)
                   for ch in (frx2.fwd, frx2.bwd, frx2.proposals[1]))                       # children stay DIRTY
         # negative / incompatible max_depth REJECTS before any partial mutation (RK 09:10)
-        @test_throws RKS._KernelFactoryReject RKS._construct_nuts_frame(pf, mkvals(Float64, CountingPgrad(0)),
+        @test_throws RKS._KernelFactoryReject ReactiveKernelsNUTSExamples._construct_nuts_frame(pf, mkvals(Float64, CountingPgrad(0)),
             -1; step_f = stepb, stats_f = nothing, min_dham = -1000)
         # step_f Token IDENTITY: a DIFFERENT registered integrator than the endpoint Plan's REJECTS (RK 09:27)
-        @test_throws RKS._KernelFactoryReject RKS._construct_nuts_frame(pf, mkvals(Float64, CountingPgrad(0)),
+        @test_throws RKS._KernelFactoryReject ReactiveKernelsNUTSExamples._construct_nuts_frame(pf, mkvals(Float64, CountingPgrad(0)),
             3; step_f = RKS.partial(gradonly_step!; stepsize = 0.1), stats_f = nothing, min_dham = -1000)
         # a bare leapfrog_ep! (matching Token) MISSING the required `stepsize` kwarg REJECTS at construction
-        @test_throws RKS._KernelFactoryReject RKS._construct_nuts_frame(pf, mkvals(Float64, CountingPgrad(0)),
+        @test_throws RKS._KernelFactoryReject ReactiveKernelsNUTSExamples._construct_nuts_frame(pf, mkvals(Float64, CountingPgrad(0)),
             3; step_f = leapfrog_ep!, stats_f = nothing, min_dham = -1000)
         # TWO independent frames: DISTINCT per-sampler mutable shared authority; external grad kept by identity
         shared_pg = CountingPgrad(0)
         f1 = mkframe(Float64, shared_pg, 3)
         f2 = mkframe(Float64, shared_pg, 3)
-        @test RKS.nuts_frame_shared(f1) !== RKS.nuts_frame_shared(f2)          # separate mutable authorities
+        @test ReactiveKernelsNUTSExamples.nuts_frame_shared(f1) !== ReactiveKernelsNUTSExamples.nuts_frame_shared(f2)          # separate mutable authorities
         @test f1.init !== f2.init && f1.trees[1].bwd.mom !== f2.trees[1].bwd.mom  # fully isolated
     end
 
@@ -1442,7 +1442,7 @@ end
             end
             d
         end
-        prep(T, pg, md) = RKS._prepare_nuts_frame(pf, mkvals(T, pg), md;
+        prep(T, pg, md) = ReactiveKernelsNUTSExamples._prepare_nuts_frame(pf, mkvals(T, pg), md;
                                                   step_f = stepb, stats_f = nothing, min_dham = -1000)
         _fire(skel, k, rng) = skel(k; rng = rng)                               # function barrier for the kw call
         # OWNER token = the `nuts_state` authoring owner (here, the endpoint plan token stands in); ROOT token
@@ -1454,18 +1454,18 @@ end
         for T in (Float32, Float64)
             frame = prep(T, CountingPgrad(0), 4)
             scratch = (zero(T), 0)                                              # concretely-typed Tuple scratch
-            k = RKS.nuts_sampler(Val(owner_tok), Val(root_tok), frame, synroot!, scratch)
+            k = ReactiveKernelsNUTSExamples.nuts_sampler(Val(owner_tok), Val(root_tok), frame, synroot!, scratch)
             @test RKS.kernel_token(k) === owner_tok                             # KernelObject keeps OWNER token
-            @test RKS.nuts_handles_root_token(getfield(k, :handles)) === root_tok  # Handles carry ROOT token
+            @test ReactiveKernelsNUTSExamples.nuts_handles_root_token(getfield(k, :handles)) === root_tok  # Handles carry ROOT token
             @test isconcretetype(typeof(k)) && isconcretetype(typeof(getfield(k, :handles)))  # nothing untyped
-            @test RKS.nuts_sampler_frame(k) === frame                          # wraps the SAME frame
+            @test ReactiveKernelsNUTSExamples.nuts_sampler_frame(k) === frame                          # wraps the SAME frame
             # DISPATCH is the Mode-2 skeleton call, gated on RootToken. The transition mutates the frame in
             # place (bumps n_steps) and returns the SAME sampler (result === state).
             rng = Random.MersenneTwister(1)                                    # hoisted: not part of the call cost
-            n0 = RKS._diag_slot(frame.diag, Val(1))
+            n0 = ReactiveKernelsNUTSExamples._diag_slot(frame.diag, Val(1))
             r = nuts_root!!(k; rng = rng)
-            @test r === k && RKS.nuts_sampler_frame(r) === frame               # result === state
-            @test RKS._diag_slot(frame.diag, Val(1)) == n0 + 1                 # root! actually ran in place
+            @test r === k && ReactiveKernelsNUTSExamples.nuts_sampler_frame(r) === frame               # result === state
+            @test ReactiveKernelsNUTSExamples._diag_slot(frame.diag, Val(1)) == n0 + 1                 # root! actually ran in place
             # type-stable dispatch + 0-B (the frame mutation is the only work; the call itself allocates none)
             @test (@inferred _fire(nuts_root!!, k, rng)) === k
             _fire(nuts_root!!, k, rng)                                          # warm the barrier
@@ -1474,7 +1474,7 @@ end
         # WRONG root-token REJECTS: an UNRELATED Mode-2 skeleton (`other_root!!`) has NO matching method for a
         # sampler whose Handles carry `nuts_root!!`'s RootToken — pure-type gate, no name special-case.
         frame = prep(Float64, CountingPgrad(0), 3)
-        k = RKS.nuts_sampler(Val(owner_tok), Val(root_tok), frame, synroot!, (0.0, 0))
+        k = ReactiveKernelsNUTSExamples.nuts_sampler(Val(owner_tok), Val(root_tok), frame, synroot!, (0.0, 0))
         @test_throws MethodError other_root!!(k; rng = Random.MersenneTwister(1))
         # RAW-SIGNATURE keyword gates (RK 12:39): `rng` is a REQUIRED KEYWORD — a MISSING, POSITIONAL, or
         # EXTRA `rng` finds NO method and is rejected (the captured `(state; rng)` contract reused verbatim).
@@ -1482,8 +1482,8 @@ end
         @test_throws MethodError nuts_root!!(k, Random.MersenneTwister(1))       # positional rng
         @test_throws MethodError nuts_root!!(k; rng = Random.MersenneTwister(1), foo = 1)  # extra kw
         # REPEATED same-signature constructions → IDENTICAL concrete object/root/scratch types (typed/0-B)
-        ka = RKS.nuts_sampler(Val(owner_tok), Val(root_tok), prep(Float64, CountingPgrad(0), 3), synroot!, (0.0, 0))
-        kb = RKS.nuts_sampler(Val(owner_tok), Val(root_tok), prep(Float64, CountingPgrad(0), 3), synroot!, (0.0, 0))
+        ka = ReactiveKernelsNUTSExamples.nuts_sampler(Val(owner_tok), Val(root_tok), prep(Float64, CountingPgrad(0), 3), synroot!, (0.0, 0))
+        kb = ReactiveKernelsNUTSExamples.nuts_sampler(Val(owner_tok), Val(root_tok), prep(Float64, CountingPgrad(0), 3), synroot!, (0.0, 0))
         @test typeof(ka) === typeof(kb)                                         # identical concrete sampler type
         @test typeof(getfield(ka, :handles)) === typeof(getfield(kb, :handles))
     end
@@ -1492,25 +1492,25 @@ end
         # the registration is DERIVED INTERNALLY (not a caller-supplied pair) and CARRIED in the binding
         reg = RKS.kernel_registration(synstats!)
         @test Set(reg.write_roots) == Set((:n_steps, :acceptance_rate))
-        b = RKS._stats_binding(synstats!)
-        @test RKS.stats_binding_registration(b) === reg                       # the captured registration
-        @test RKS.stats_binding_source(b) === synstats! && RKS.stats_binding_token(b) === reg.token
-        @test RKS.stats_binding_produced(b) == (1, 3)                          # n_steps→1, acceptance_rate→3
+        b = ReactiveKernelsNUTSExamples._stats_binding(synstats!)
+        @test ReactiveKernelsNUTSExamples.stats_binding_registration(b) === reg                       # the captured registration
+        @test ReactiveKernelsNUTSExamples.stats_binding_source(b) === synstats! && ReactiveKernelsNUTSExamples.stats_binding_token(b) === reg.token
+        @test ReactiveKernelsNUTSExamples.stats_binding_produced(b) == (1, 3)                          # n_steps→1, acceptance_rate→3
         # applying the produced-marking blesses exactly those diagnostic slots pending
-        d = RKS._diagnostics_store(Float64); RKS._stats_produced!(d, b)
-        @test RKS._diag_produced(d, Val(1)) && RKS._diag_produced(d, Val(3))
-        @test !RKS._diag_produced(d, Val(2)) && !RKS._diag_produced(d, Val(4))
+        d = ReactiveKernelsNUTSExamples._diagnostics_store(Float64); ReactiveKernelsNUTSExamples._stats_produced!(d, b)
+        @test ReactiveKernelsNUTSExamples._diag_produced(d, Val(1)) && ReactiveKernelsNUTSExamples._diag_produced(d, Val(3))
+        @test !ReactiveKernelsNUTSExamples._diag_produced(d, Val(2)) && !ReactiveKernelsNUTSExamples._diag_produced(d, Val(4))
         # stats_f = nothing is the EXPLICIT no-effect specialization (collectstats! is a no-op)
-        nb = RKS._stats_binding(nothing)
-        @test RKS.stats_binding_registration(nb) === nothing && RKS.stats_binding_produced(nb) == ()
-        @test RKS._stats_produced!(RKS._diagnostics_store(Float64), nb) isa RKS._DiagnosticsStore  # no-op
+        nb = ReactiveKernelsNUTSExamples._stats_binding(nothing)
+        @test ReactiveKernelsNUTSExamples.stats_binding_registration(nb) === nothing && ReactiveKernelsNUTSExamples.stats_binding_produced(nb) == ()
+        @test ReactiveKernelsNUTSExamples._stats_produced!(ReactiveKernelsNUTSExamples._diagnostics_store(Float64), nb) isa ReactiveKernelsNUTSExamples._DiagnosticsStore  # no-op
         # an OPAQUE / unregistered stats_f REJECTS (a diagnostics callback must be a registered @kernel)
-        @test_throws RKS._KernelFactoryReject RKS._stats_binding(sin)
+        @test_throws RKS._KernelFactoryReject ReactiveKernelsNUTSExamples._stats_binding(sin)
         # an UNMAPPABLE write-root REJECTS (no silent filter — never understate effects)
-        @test_throws RKS._KernelFactoryReject RKS._stats_binding(badstats!)
+        @test_throws RKS._KernelFactoryReject ReactiveKernelsNUTSExamples._stats_binding(badstats!)
         # the SAME complete binder validation applies to stats_f — a partial wrapper cannot silently reduce
-        @test_throws RKS._KernelFactoryReject RKS._stats_binding(RKS.partial(synstats!, 42))   # bound positional
-        @test_throws RKS._KernelFactoryReject RKS._stats_binding(RKS.partial(synstats!; bogus = 1))  # extra kw
+        @test_throws RKS._KernelFactoryReject ReactiveKernelsNUTSExamples._stats_binding(RKS.partial(synstats!, 42))   # bound positional
+        @test_throws RKS._KernelFactoryReject ReactiveKernelsNUTSExamples._stats_binding(RKS.partial(synstats!; bogus = 1))  # extra kw
     end
 
     @testset "nuts_state — COMPLETE binder-contract validation for prepared callables (RK 09:36)" begin
@@ -1596,23 +1596,23 @@ end
         end
         _run(skel, k, rng) = skel(k; rng = rng)                     # function barrier for the kw dispatch
         for T in (Float64, Float32)
-            k = RKS._build_nuts_sampler(pf, ergvals(T), _ErgFix.nuts_state, _ErgFix.refresh_momentum!!, _ErgFix.nuts!!;
+            k = ReactiveKernelsNUTSExamples._build_nuts_sampler(pf, ergvals(T), _ErgFix.nuts_state, _ErgFix.refresh_momentum!!, _ErgFix.nuts!!;
                                         step_f = RKS.partial(_ErgFix.leapfrog!; stepsize = T(0.1)),
                                         max_depth = 4, min_dham = -1000, stats_f = _ErgFix.nuts_stats!)
             # FINAL concrete callable KernelObject: OwnerToken = nuts_state, RootToken = nuts!! — distinct, both kept
             @test k isa RKS.KernelObject && isconcretetype(typeof(k)) && isconcretetype(typeof(getfield(k, :handles)))
             @test RKS.kernel_token(k) === RKS.kernel_token(_ErgFix.nuts_state)            # OwnerToken = nuts_state
-            @test RKS.nuts_handles_root_token(getfield(k, :handles)) === RKS.kernel_token(_ErgFix.nuts!!)  # RootToken = nuts!!
+            @test ReactiveKernelsNUTSExamples.nuts_handles_root_token(getfield(k, :handles)) === RKS.kernel_token(_ErgFix.nuts!!)  # RootToken = nuts!!
             @test RKS.kernel_token(_ErgFix.nuts_state) !== RKS.kernel_token(_ErgFix.nuts!!)  # distinct
-            frame = RKS.nuts_sampler_frame(k)
-            @test RKS.diagnostics_ham_type(frame.diag) === T                              # F32/F64 preserved
+            frame = ReactiveKernelsNUTSExamples.nuts_sampler_frame(k)
+            @test ReactiveKernelsNUTSExamples.diagnostics_ham_type(frame.diag) === T                              # F32/F64 preserved
             # the authored public transition RUNS end-to-end and mutates in place; result === state
             p0 = copy(RKS._canon_slot(frame.init, RKS.kernel_plan_named_slot_val(plan, Val(:pos))))
             rng = Random.Xoshiro(1)
             r = _ErgFix.nuts!!(k; rng = rng)
             @test r === k                                                                # result === state
             @test RKS._canon_slot(frame.init, RKS.kernel_plan_named_slot_val(plan, Val(:pos))) != p0  # real transition
-            @test RKS.diagnostics_committed_mask(frame.diag) == UInt(0x0f)               # one deferred epoch commit
+            @test ReactiveKernelsNUTSExamples.diagnostics_committed_mask(frame.diag) == UInt(0x0f)               # one deferred epoch commit
             # type-stable + 0-B public transition (warmed barrier, hoisted rng)
             @test (@inferred _run(_ErgFix.nuts!!, k, rng)) === k
             _run(_ErgFix.nuts!!, k, rng)
@@ -1620,14 +1620,14 @@ end
         end
         # WRONG-skeleton token gate still holds through the ergonomic core: leapfrog! (a different Mode-2 token)
         # cannot drive a sampler whose Handles carry nuts!!'s RootToken.
-        k = RKS._build_nuts_sampler(pf, ergvals(Float64), _ErgFix.nuts_state, _ErgFix.refresh_momentum!!, _ErgFix.nuts!!;
+        k = ReactiveKernelsNUTSExamples._build_nuts_sampler(pf, ergvals(Float64), _ErgFix.nuts_state, _ErgFix.refresh_momentum!!, _ErgFix.nuts!!;
                                     step_f = RKS.partial(_ErgFix.leapfrog!; stepsize = 0.1),
                                     max_depth = 3, min_dham = -1000, stats_f = _ErgFix.nuts_stats!)
         @test_throws MethodError _ErgFix.leapfrog!(k; rng = Random.Xoshiro(1))
         # repeated same-signature constructions → IDENTICAL concrete sampler type (RK 12:32/13:44 gate).
         # The immutable NativeProgram encoder is deterministic, so `compile_nuts_native` returns a
         # signature-stable sealed root and two compiles of the SAME signature share ONE concrete type.
-        k2 = RKS._build_nuts_sampler(pf, ergvals(Float64), _ErgFix.nuts_state, _ErgFix.refresh_momentum!!, _ErgFix.nuts!!;
+        k2 = ReactiveKernelsNUTSExamples._build_nuts_sampler(pf, ergvals(Float64), _ErgFix.nuts_state, _ErgFix.refresh_momentum!!, _ErgFix.nuts!!;
                                      step_f = RKS.partial(_ErgFix.leapfrog!; stepsize = 0.1),
                                      max_depth = 3, min_dham = -1000, stats_f = _ErgFix.nuts_stats!)
         @test typeof(k) === typeof(k2)
@@ -1657,7 +1657,7 @@ end
             @test cvals[9] isa Cholesky && cvals[10] ≈ dk                      # chol_metric, dkin_dmom
             @test cvals[12] ≈ cvals[7] + cvals[11]                            # ham = pot + kin
             @test eltype(cvals[8]) === T && typeof(cvals[12]) === T           # F32/F64 preserved
-            frame = RKS._construct_nuts_frame_bootstrapped(pf, cvals, 4;
+            frame = ReactiveKernelsNUTSExamples._construct_nuts_frame_bootstrapped(pf, cvals, 4;
                 step_f = RKS.partial(_ErgFix.leapfrog!; stepsize = T(0.1)), stats_f = _ErgFix.nuts_stats!, min_dham = -1000)
             @test cg.n == 1                                                    # frame build does NOT re-run the gradient
             @test RKS._canon_current_mask(frame.init) == frame.entry_mask     # init COMPLETE (no separate POC init/seed)
@@ -1670,10 +1670,10 @@ end
             @test RKS._canon_slot(frame.init, dpotv) === cvals[8]
             @test RKS._canon_slot(frame.fwd, posv) !== RKS._canon_slot(frame.init, posv)  # child ISOLATED
             @test RKS._canon_slot(frame.fwd, posv) == RKS._canon_slot(frame.init, posv)   # ... but complete/seeded
-            @test RKS.diagnostics_ham_type(frame.diag) === T
+            @test ReactiveKernelsNUTSExamples.diagnostics_ham_type(frame.diag) === T
             # end-to-end: compile + attach + run the authored transition
-            Cc = RKS.compile_nuts(pf, _ErgFix.nuts_state, _ErgFix.refresh_momentum!!, _ErgFix.nuts!!, frame)
-            k = RKS.nuts_sampler(Val(RKS.kernel_token(_ErgFix.nuts_state)), Val(Cc.RootToken), frame, Cc.root!, Cc.scratch)
+            Cc = ReactiveKernelsNUTSExamples.compile_nuts(pf, _ErgFix.nuts_state, _ErgFix.refresh_momentum!!, _ErgFix.nuts!!, frame)
+            k = ReactiveKernelsNUTSExamples.nuts_sampler(Val(RKS.kernel_token(_ErgFix.nuts_state)), Val(Cc.RootToken), frame, Cc.root!, Cc.scratch)
             p0 = copy(RKS._canon_slot(frame.init, posv)); cpos0 = copy(cpos); cmom0 = copy(cmom); cmet0 = copy(cmetric)
             for _ in 1:3; _ErgFix.nuts!!(k; rng = Random.Xoshiro(1)); end
             r = _ErgFix.nuts!!(k; rng = Random.Xoshiro(1))
@@ -1684,14 +1684,14 @@ end
         # built from the SAME caller arrays must both be non-aliased from the caller AND from each other.
         spos = [1.0, 2.0]; smom = [3.0, 4.0]; smetric = [2.0 0; 0 2]
         spotf = p -> sum(abs2, p)
-        mkframe() = RKS._construct_nuts_frame_bootstrapped(pf,
+        mkframe() = ReactiveKernelsNUTSExamples._construct_nuts_frame_bootstrapped(pf,
             RKS._bootstrap_canon_values(plan, pf.handles, (spotf, _CG(0), smetric, spos, smom)), 3;
             step_f = RKS.partial(_ErgFix.leapfrog!; stepsize = 0.1), stats_f = _ErgFix.nuts_stats!, min_dham = -1000)
         fa = mkframe(); fb = mkframe()
         @test typeof(fa) === typeof(fb)                                       # deterministic concrete frame type
         @test RKS._canon_slot(fa.init, posv) !== RKS._canon_slot(fb.init, posv)   # independent per-instance buffers
         @test RKS._canon_slot(fa.init, posv) !== spos && RKS._canon_slot(fb.init, posv) !== spos  # neither aliases caller
-        @test RKS.nuts_frame_shared(fa) !== RKS.nuts_frame_shared(fb)         # separate shared authorities
+        @test ReactiveKernelsNUTSExamples.nuts_frame_shared(fa) !== ReactiveKernelsNUTSExamples.nuts_frame_shared(fb)         # separate shared authorities
     end
 end
 

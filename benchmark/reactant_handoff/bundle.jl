@@ -1,7 +1,9 @@
 using ReactiveKernels, LinearAlgebra, Random
+import ReactiveKernelsNUTSExamples
 const RK = ReactiveKernels
-include(joinpath("/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-hmc","examples","nuts_runtime.jl"))
-module Fix; include(joinpath("/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-hmc","benchmark","nuts_kernel_authoring_fixture.jl")); end
+const ROOT = normpath(joinpath(@__DIR__, "..", ".."))
+include(joinpath(ROOT, "examples", "nuts_runtime.jl"))
+module Fix; include(joinpath(@__DIR__, "..", "nuts_kernel_authoring_fixture.jl")); end
 
 # Recorder (defined in Random so the native domain gate admits it)
 Random.eval(quote mutable struct RecRNG <: AbstractRNG; inner::Xoshiro; log::Vector{Any}; end end)
@@ -39,15 +41,15 @@ function vals(pf,T;metric=T[2 0;0 2])
     end; d
 end
 function frame(pf,T,md;metric=T[2 0;0 2])
-    f=RK._construct_nuts_frame(pf,vals(pf,T;metric),md;step_f=RK.partial(Fix.leapfrog!;stepsize=T(.1)),stats_f=Fix.nuts_stats!,min_dham=-1000.0)
+    f=ReactiveKernelsNUTSExamples._construct_nuts_frame(pf,vals(pf,T;metric),md;step_f=RK.partial(Fix.leapfrog!;stepsize=T(.1)),stats_f=Fix.nuts_stats!,min_dham=-1000.0)
     RK.compile_prepared_initialization(pf,typeof(f.init),typeof(f.shared))(f.init,f.shared,RK.kernel_prepared_handles(pf))
-    RK._seed_nuts_children!(f); f
+    ReactiveKernelsNUTSExamples._seed_nuts_children!(f); f
 end
 
 # ---- VERIFY: bundle prefix == native's recorded interleaved consumption ----
 allok = true
 for (md,seed) in ((2,20260829),(4,20260829),(4,20260830),(6,12345),(3,999))
-    fr = frame(pf, Float64, md); C = RK.compile_nuts_native(pf, Fix.nuts_state, Fix.refresh_momentum!!, Fix.nuts!!, fr)
+    fr = frame(pf, Float64, md); C = ReactiveKernelsNUTSExamples.compile_nuts_native(pf, Fix.nuts_state, Fix.refresh_momentum!!, Fix.nuts!!, fr)
     r = mkrec(seed); C.root!(fr, C.scratch, r)
     b = pregen_bundle(seed, 2, md)
     # walk native's recorded log, checking each draw against the bundle by type-counter
