@@ -36,7 +36,7 @@ end
     @test !occursin("JULIA_PKG_PRECOMPILE_AUTO", package_matrix)
     @test !occursin("JULIA_PKG_PRECOMPILE_AUTO", workflow)
     @test !occursin("JULIA_DEPOT_PATH", workflow)
-    @test occursin("timeout-minutes: 90", package_matrix)
+    @test occursin("timeout-minutes: 180", package_matrix)
     @test occursin("julia-version: ['lts', '1', 'pre']", package_matrix)
     @test occursin("julia-arch: [x64]", package_matrix)
     @test occursin("os: [ubuntu-latest, windows-latest, macOS-latest]", package_matrix)
