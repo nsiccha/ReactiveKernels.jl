@@ -18,7 +18,7 @@ include(joinpath(@__DIR__, "check_rendered.jl"))
 | - | - |
 """)
 
-        aov_root = """<div class="rk-aov-panel" data-rk-artifact-id="plot:first" data-rk-artifact-kind="aov-panel" v-exec-scripts="'cGF5bG9hZA=='"></div>"""
+        aov_root = """<div class="rk-aov-panel" data-rk-artifact-id="plot:first" data-rk-artifact-kind="aov-panel" data-rk-exec-payload="cGF5bG9hZA=="><ClientOnly><div v-exec-scripts="'cGF5bG9hZA=='"></div></ClientOnly></div>"""
         artifact_markup = """
 <div class="rk-example" data-rk-artifact-id="example:first" data-rk-artifact-kind="example-panel"></div>
 <div class="rk-example" data-rk-artifact-id="example:second" data-rk-artifact-kind="example-panel"></div>
@@ -86,7 +86,7 @@ $aov_root
 
         missing_payload = replace(
             artifact_markup,
-            " v-exec-scripts=\"'cGF5bG9hZA=='\"" => "",
+            " data-rk-exec-payload=\"cGF5bG9hZA==\"" => "",
         )
         write(intermediate_path, artifact_markup)
         write(rendered_path, "<!DOCTYPE html><html><body>$missing_payload</body></html>")
@@ -99,8 +99,27 @@ $aov_root
             read(report_path, String),
         )
 
-        write(intermediate_path, missing_payload)
-        write(rendered_path, "<!DOCTYPE html><html><body>$missing_payload</body></html>")
+        missing_runtime_binding = replace(
+            artifact_markup,
+            " v-exec-scripts=\"'cGF5bG9hZA=='\"" => "",
+        )
+        write(intermediate_path, missing_runtime_binding)
+        write(rendered_path, "<!DOCTYPE html><html><body>$artifact_markup</body></html>")
+        @test_throws ErrorException check_rendered_docs(
+            build_dir, ["Fixture" => "fixture.md"];
+            source_dir, report_path, contracts, github_actions = false,
+        )
+        @test occursin(
+            "Documenter intermediate interactive artifact plot:first on fixture.md has no matching runtime binding",
+            read(report_path, String),
+        )
+
+        missing_payload_and_binding = replace(
+            missing_payload,
+            " v-exec-scripts=\"'cGF5bG9hZA=='\"" => "",
+        )
+        write(intermediate_path, missing_payload_and_binding)
+        write(rendered_path, "<!DOCTYPE html><html><body>$missing_payload_and_binding</body></html>")
         @test_throws ErrorException check_rendered_docs(
             build_dir, ["Fixture" => "fixture.md"];
             source_dir, report_path, contracts, github_actions = false,
@@ -129,7 +148,7 @@ $aov_root
             artifact_markup,
             aov_root => """
 <div class="rk-aov-panel"></div>
-<span data-rk-artifact-id="plot:first" data-rk-artifact-kind="aov-panel" v-exec-scripts="'cGF5bG9hZA=='"></span>
+<span data-rk-artifact-id="plot:first" data-rk-artifact-kind="aov-panel" data-rk-exec-payload="cGF5bG9hZA==" v-exec-scripts="'cGF5bG9hZA=='"></span>
 """,
         )
         write(intermediate_path, spoofed_declaration)

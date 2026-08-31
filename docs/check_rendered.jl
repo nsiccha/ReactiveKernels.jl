@@ -155,9 +155,10 @@ function _artifact_declarations(body, stage, source)
         root_kinds = [root.kind for root in _ARTIFACT_ROOT_CLASSES if root.class in classes]
         ids = _attribute_values(tag, "data-rk-artifact-id")
         kinds = _attribute_values(tag, "data-rk-artifact-kind")
+        payloads = _attribute_values(tag, "data-rk-exec-payload")
 
         if isempty(root_kinds)
-            isempty(ids) && isempty(kinds) || error(
+            isempty(ids) && isempty(kinds) && isempty(payloads) || error(
                 "$stage $source page declares stable artifact attributes on a non-root tag",
             )
             continue
@@ -175,9 +176,22 @@ function _artifact_declarations(body, stage, source)
         only(kinds) == only(root_kinds) || error(
             "$stage $source root kind $(only(kinds)) does not match class kind $(only(root_kinds))",
         )
+        if only(kinds) in ("aov-panel", "result-assets")
+            length(payloads) == 1 || error(
+                "$stage interactive artifact $(only(ids)) on $source must declare exactly one payload witness",
+            )
+            isempty(only(payloads)) && error(
+                "$stage interactive artifact $(only(ids)) on $source has an empty payload witness",
+            )
+        else
+            isempty(payloads) || error(
+                "$stage non-interactive artifact $(only(ids)) on $source declares an executable payload",
+            )
+        end
         push!(declarations, (;
             id = only(ids),
             kind = only(kinds),
+            payload = isempty(payloads) ? nothing : only(payloads),
             tag,
         ))
     end
@@ -188,9 +202,9 @@ function _check_artifact_id_contract(source, intermediate, rendered)
     intermediate_declarations =
         _artifact_declarations(intermediate, "Documenter intermediate", source)
     rendered_declarations = _artifact_declarations(rendered, "VitePress output", source)
-    for (stage, declarations) in (
-            ("Documenter intermediate", intermediate_declarations),
-            ("VitePress output", rendered_declarations),
+    for (stage, declarations, stage_body) in (
+            ("Documenter intermediate", intermediate_declarations, intermediate),
+            ("VitePress output", rendered_declarations, rendered),
         )
         ids = getproperty.(declarations, :id)
         any(isempty, ids) && error("$stage $source page declares an empty stable artifact id")
@@ -202,10 +216,12 @@ function _check_artifact_id_contract(source, intermediate, rendered)
         )
         for declaration in declarations
             declaration.kind in ("aov-panel", "result-assets") || continue
-            payload = match(r"v-exec-scripts=\"'([^']+)'\"", declaration.tag)
-            isnothing(payload) && error(
-                "$stage interactive artifact $(declaration.id) on $source has no executable payload",
-            )
+            if stage == "Documenter intermediate"
+                binding = "v-exec-scripts=\"'$(declaration.payload)'\""
+                occursin(binding, stage_body) || error(
+                    "$stage interactive artifact $(declaration.id) on $source has no matching runtime binding",
+                )
+            end
         end
     end
     intermediate_ids = getproperty.(intermediate_declarations, :id)
