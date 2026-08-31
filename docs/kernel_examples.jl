@@ -205,11 +205,11 @@ function setup_eight_schools!(mod::Module)
     if !isdefined(mod, :EightSchoolsExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: EightSchoolsExample))
     end
-    # Bind the observations and the shared distribution KernelSpecs consumed by
-    # the displayed PPL assembly; no model-specific evaluator is injected.
+    # Bind only the observations. The displayed PPL assembly imports and uses
+    # the shared distribution objects directly; no helper evaluator, factor,
+    # or separately prepared plate is injected.
     Core.eval(mod, :(using .EightSchoolsExample:
-        EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA,
-        NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY))
+        EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA))
     nothing
 end
 

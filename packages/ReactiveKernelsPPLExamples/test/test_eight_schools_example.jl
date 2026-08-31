@@ -1,11 +1,12 @@
 using ReactiveKernelsPPLExamples.EightSchoolsExample
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauchy
 
-_eight_schools_likelihood_call(kernel, observations, effects, scales) =
-    kernel(observations, effects, scales)
+_eight_schools_likelihood_call(kernel, effects, observations, scales) =
+    kernel(effects, observations, scales)
 
-_eight_schools_likelihood_allocated(kernel, observations, effects, scales) =
+_eight_schools_likelihood_allocated(kernel, effects, observations, scales) =
     @allocated _eight_schools_likelihood_call(
-        kernel, observations, effects, scales,
+        kernel, effects, observations, scales,
     )
 
 _eight_schools_reference_normal(x, location, scale) =
@@ -28,16 +29,19 @@ end
     model = artifact.model
     q = [1.5, log(2.0), (0.25 .* (1:8))...]
 
-    @test occursin("NORMAL_LOGDENSITY", EIGHT_SCHOOLS_SOURCE)
-    @test occursin("CAUCHY_LOGDENSITY", EIGHT_SCHOOLS_SOURCE)
+    @test !occursin("NORMAL_LOGDENSITY", EIGHT_SCHOOLS_SOURCE)
+    @test !occursin("CAUCHY_LOGDENSITY", EIGHT_SCHOOLS_SOURCE)
+    authored_model_source = first(split(
+        EIGHT_SCHOOLS_SOURCE, "\n\nμ = 1.5"; limit = 2))
+    @test !occursin("prepare(", authored_model_source)
+    @test occursin("normal(0.0, 5.0).logpdf(μ)", EIGHT_SCHOOLS_SOURCE)
+    @test occursin("cauchy(0.0, 5.0).logpdf(τ)", EIGHT_SCHOOLS_SOURCE)
+    @test length(split(EIGHT_SCHOOLS_SOURCE, "pointwise = plate(")) - 1 == 2
     @test !occursin("@kernel school_", EIGHT_SCHOOLS_SOURCE)
-    @test artifact.normal_spec === EightSchoolsExample.NORMAL_LOGDENSITY
-    @test artifact.cauchy_spec === EightSchoolsExample.CAUCHY_LOGDENSITY
-    @test artifact.normal_factor.plan.graph === artifact.normal_spec.graph
-    @test artifact.cauchy_factor.plan.graph === artifact.cauchy_spec.graph
-    @test artifact.effects_prior_kernel.plan.graph === artifact.normal_spec.graph
-    @test artifact.pointwise_kernel.plan.graph === artifact.normal_spec.graph
-    @test artifact.likelihood_kernel.plan.graph === artifact.normal_spec.graph
+    @test artifact.normal_object === normal
+    @test artifact.cauchy_object === cauchy
+    @test artifact.pointwise_extraction.plan.graph === model.graph
+    @test artifact.likelihood_extraction.plan.graph === model.graph
 
     @testset "one named model graph, with only the intentional transform alternative" begin
         # Every model QOI has exactly one producer; constrained parameters alone
@@ -48,8 +52,11 @@ end
                           canon_id(model.graph, value.id), recipe.outputs)
         end
         @test producer_count(model.parameters) == 2
-        for value in (model.log_jacobian, model.prior, model.likelihood,
-                      model.pointwise, model.posterior, model.new_group)
+        for value in (model.log_jacobian, model.effects_pointwise,
+                      model.effects_prior, model.prior,
+                      model.unconstrained_prior, model.likelihood,
+                      model.pointwise, model.constrained_logdensity,
+                      model.posterior, model.new_group)
             @test producer_count(value) == 1
         end
     end
@@ -73,16 +80,16 @@ end
         @test likelihood isa Float64
 
         # The Wren-style Params/LogPrior/LogLikelihood selection uses the direct
-        # reducing plate. Unrequested pointwise/Jacobian/posterior nodes are absent
-        # from the compiled plan rather than skipped by runtime branches.
+        # reducing plate. The authored pointwise node remains graph-visible, but
+        # total-only code generation emits no output buffer for it.
         produced = Set(
             canon_id(model.graph, output.id)
             for recipe in artifact.kernel.plan.recipes for output in recipe.outputs
         )
         @test canon_id(model.graph, model.likelihood.id) in produced
-        @test !(canon_id(model.graph, model.pointwise.id) in produced)
         @test !(canon_id(model.graph, model.log_jacobian.id) in produced)
         @test !(canon_id(model.graph, model.posterior.id) in produced)
+        @test !occursin("similar", string(code_expr(artifact.kernel)))
     end
 
     @testset "unconstrained -> constrained; Jacobian is optional" begin
@@ -141,13 +148,51 @@ end
                     model.observation_scales),
             want = (model.posterior,))
         @test length(posterior_only.recipes) > 1
-        @test !any(r -> r.op === sum, posterior_only.recipes)
         posterior_kernel = prepare(posterior_only)
         @test count(line -> occursin("for ", line),
                     split(string(code_expr(posterior_kernel)), '\n')) == 2
         @test !occursin("similar", string(code_expr(posterior_kernel)))
         @test !any(op -> op isa ReactiveKernels.PreparedKernel,
                    posterior_kernel.ops)
+    end
+
+    @testset "constrained and unconstrained joint-density cuts share one graph" begin
+        constrained_kernel = prepare(model;
+            have = (:parameters, :observations, :observation_scales),
+            want = (:prior, :likelihood, :constrained_logdensity))
+        constrained_parameters = (; μ = q[1], τ = exp(q[2]), θ = q[3:end])
+        prior, likelihood, constrained_logdensity = constrained_kernel(
+            constrained_parameters,
+            EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA,
+        )
+
+        unconstrained_kernel = prepare(model;
+            have = (:μ, :log_τ, :θ, :observations, :observation_scales),
+            want = (:log_jacobian, :posterior))
+        log_jacobian, posterior = unconstrained_kernel(
+            q[1], q[2], q[3:end],
+            EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA,
+        )
+
+        @test constrained_logdensity ≈ prior + likelihood
+        @test posterior ≈ constrained_logdensity + log_jacobian
+        unconstrained_prior = prepare(model;
+            have = (:μ, :log_τ, :θ),
+            want = :unconstrained_prior)(q[1], q[2], q[3:end])
+        @test unconstrained_prior ≈ prior + log_jacobian
+        @test log_jacobian == q[2]
+
+        # Starting from τ computes log_τ once for the normalization terms, but
+        # never executes the packed transform, Jacobian, or posterior branch.
+        produced = Set(
+            canon_id(model.graph, output.id)
+            for recipe in constrained_kernel.plan.recipes
+            for output in recipe.outputs
+        )
+        @test canon_id(model.graph, model.log_τ.id) in produced
+        @test !(canon_id(model.graph, model.parameters.id) in produced)
+        @test !(canon_id(model.graph, model.log_jacobian.id) in produced)
+        @test !(canon_id(model.graph, model.posterior.id) in produced)
     end
 
     @testset "corrected core contracts hold on PPL paths" begin
@@ -212,6 +257,7 @@ end
             set!(state, nested.observations, EIGHT_SCHOOLS_Y)
             set!(state, nested.observation_scales, EIGHT_SCHOOLS_SIGMA)
 
+            posterior_calls[] = 0
             get!(state, nested.parameters)
             get!(state, nested.prior)
             get!(state, nested.likelihood)
@@ -295,26 +341,26 @@ end
         ]
 
         @test artifact.pointwise ≈ expected_pointwise
-        @test artifact.pointwise_kernel.plan.graph ===
-              artifact.likelihood_kernel.plan.graph
+        @test artifact.pointwise_extraction.plan.graph ===
+              artifact.likelihood_extraction.plan.graph
         likelihood = _eight_schools_likelihood_call(
-            artifact.likelihood_kernel,
-            EIGHT_SCHOOLS_Y, θ, EIGHT_SCHOOLS_SIGMA,
+            artifact.likelihood_extraction,
+            θ, EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA,
         )
         @test likelihood ≈ sum(expected_pointwise)
 
-        # Collect mode allocates exactly the requested pointwise result. The
-        # reducing plate instead emits a scalar accumulator loop, with no
-        # `similar` output buffer, and executes allocation-free after warmup.
-        @test occursin("similar", string(code_expr(artifact.pointwise_kernel)))
-        @test !occursin("similar", string(code_expr(artifact.likelihood_kernel)))
+        # The one authored plate exposes both useful cuts. Pointwise-only
+        # allocates exactly its requested result; total-only emits a scalar
+        # accumulator with no output buffer.
+        @test occursin("similar", string(code_expr(artifact.pointwise_extraction)))
+        @test !occursin("similar", string(code_expr(artifact.likelihood_extraction)))
         _eight_schools_likelihood_call(
-            artifact.likelihood_kernel,
-            EIGHT_SCHOOLS_Y, θ, EIGHT_SCHOOLS_SIGMA,
+            artifact.likelihood_extraction,
+            θ, EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA,
         )
         @test _eight_schools_likelihood_allocated(
-            artifact.likelihood_kernel,
-            EIGHT_SCHOOLS_Y, θ, EIGHT_SCHOOLS_SIGMA,
+            artifact.likelihood_extraction,
+            θ, EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA,
         ) == 0
     end
 
