@@ -44,6 +44,12 @@ zip; singleton dimensions expand; scalars repeat. `Ref(value)` marks an
 array-valued argument as one atomic value rather than a batch axis. Incompatible
 shapes raise `DimensionMismatch`.
 
+Arguments may be transparent derived expressions, not only named ports. For
+example, `plate(eachcol(logits), y) do column, observed ... end` materializes
+the lazy column iterator as an ordinary outer graph recipe, then runs the
+authored scalar graph once per `(column, observed)` pair. The columns remain
+vector-valued scalar elements; no matrix-sized pointwise buffer is introduced.
+
 There is no separate public axis or scheduling language. The one-axis example
 above is the simplest case of that contract; multidimensional inputs use the
 same broadcast rules.
