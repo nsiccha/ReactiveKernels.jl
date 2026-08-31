@@ -1016,6 +1016,175 @@ function _kernel_return_names(ex)
     names
 end
 
+const _KERNEL_RETURN_PORT = Symbol("__return__")
+
+# `return expr` is graph authoring, not an eager Julia return.  Normalize the
+# expression to one ordinary recipe feeding a stable distinguished port, then
+# let the existing named-boundary machinery do the rest.  A named/tuple return
+# remains byte-for-byte compatible with the established grammar.
+function _kernel_normalize_return_expressions(statements)
+    normalized = Any[]
+    for raw in statements
+        if raw isa Expr && raw.head === :return && length(raw.args) == 1
+            returned = only(raw.args)
+            named = returned isa Symbol ||
+                    (returned isa Expr && returned.head === :tuple &&
+                     all(item -> item isa Symbol, returned.args))
+            if !named
+                push!(normalized, Expr(:(=), _KERNEL_RETURN_PORT, returned))
+                push!(normalized, Expr(:return, _KERNEL_RETURN_PORT))
+                continue
+            end
+        end
+        push!(normalized, raw)
+    end
+    normalized
+end
+
+function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
+                                      nested_specs::Dict{Symbol,Any},
+                                      local_types::Dict{Symbol,Any})
+    ex isa Expr || return ex, nothing
+    ex.head in (:quote, :inert) && return ex, nothing
+
+    # `object(owner_args...).endpoint(endpoint_args...)` is source-level graph
+    # application.  Resolve the object and endpoint while the macro expands,
+    # retarget its implicit owner signature to the do-block locals, and let the
+    # established nested-KernelSpec splicer clone the complete endpoint graph.
+    if ex.head === :call && !isempty(ex.args)
+        callee = ex.args[1]
+        if callee isa Expr && callee.head === :(.) && length(callee.args) == 2 &&
+           callee.args[1] isa Expr && callee.args[1].head === :call &&
+           callee.args[2] isa QuoteNode
+            constructor = callee.args[1]
+            object = _kernel_resolve_binding(mod, constructor.args[1])
+            endpoint_name = callee.args[2].value
+            if object isa Union{_StatefulKernelSkeleton,KernelObjectSpec} &&
+               endpoint_name in kernel_endpoint_names(object)
+                owner_actuals = constructor.args[2:end]
+                endpoint_actuals = ex.args[2:end]
+                all(arg -> arg isa Symbol && arg in locals,
+                    (owner_actuals..., endpoint_actuals...)) || throw(ArgumentError(
+                    "constructed endpoint application inside plate requires bare do-block arguments"))
+                endpoint = extract(object; want = endpoint_name)
+                signature = endpoint.call_signature
+                signature isa _KernelEndpointCallSignature || throw(ArgumentError(
+                    "constructed object endpoint :$endpoint_name has no transparent call signature"))
+                implicit, explicit = typeof(signature).parameters
+                length(owner_actuals) == length(implicit) || throw(ArgumentError(
+                    "kernel object constructor for :$endpoint_name expects $(length(implicit)) " *
+                    "owner argument(s), got $(length(owner_actuals))"))
+                length(endpoint_actuals) == length(explicit) || throw(ArgumentError(
+                    "endpoint :$endpoint_name expects $(length(explicit)) argument(s), " *
+                    "got $(length(endpoint_actuals))"))
+
+                actuals = Symbol[owner_actuals...; endpoint_actuals...]
+                for (actual, formal) in zip(actuals, inputs(endpoint))
+                    T = valtype(formal)
+                    if haskey(local_types, actual) && local_types[actual] != T
+                        throw(ArgumentError(
+                            "plate do-block argument :$actual is used with incompatible " *
+                            "endpoint types $(local_types[actual]) and $T"))
+                    end
+                    local_types[actual] = T
+                end
+
+                generated = gensym(Symbol(endpoint_name, :_endpoint))
+                retargeted = _kernel_endpoint_call_signature(
+                    Val(Tuple(Symbol.(owner_actuals))), Val(explicit))
+                nested_specs[generated] = KernelSpec(
+                    endpoint.graph, endpoint.ports, endpoint.port_order,
+                    endpoint.have_names, endpoint.want_names, retargeted)
+                return Expr(:call, generated, endpoint_actuals...),
+                       valtype(only(outputs(endpoint)))
+            end
+        end
+    end
+
+    rewritten = Any[]
+    child_types = Any[]
+    for arg in ex.args
+        child, child_type = _kernel_constructed_endpoint(
+            arg, mod, locals, nested_specs, local_types)
+        push!(rewritten, child)
+        push!(child_types, child_type)
+    end
+    inferred = if ex.head === :block
+        index = findlast(i -> !_kernel_is_line(ex.args[i]), eachindex(ex.args))
+        index === nothing ? nothing : child_types[index]
+    else
+        nothing
+    end
+    Expr(ex.head, rewritten...), inferred
+end
+
+function _kernel_authored_plate_expr(rhs, mod)
+    rhs isa Expr && rhs.head === :do && length(rhs.args) == 2 || return nothing
+    call, lambda = rhs.args
+    call isa Expr && call.head === :call && !isempty(call.args) || return nothing
+    _kernel_resolve_binding(mod, call.args[1]) === plate || return nothing
+    lambda isa Expr && lambda.head === :(->) && length(lambda.args) == 2 ||
+        throw(ArgumentError("plate do-block requires an ordinary argument list and body"))
+    formals_expr, scalar_body = lambda.args
+    formals = formals_expr isa Symbol ? Symbol[formals_expr] :
+              formals_expr isa Expr && formals_expr.head === :tuple &&
+              all(arg -> arg isa Symbol, formals_expr.args) ?
+              Symbol[formals_expr.args...] : throw(ArgumentError(
+                  "plate do-block arguments must be bare names"))
+    authored_arguments = call.args[2:end]
+    length(authored_arguments) == length(formals) || throw(ArgumentError(
+        "plate received $(length(authored_arguments)) argument(s), but its do-block has " *
+        "$(length(formals)) parameter(s)"))
+    arguments = Symbol[]
+    atomic = Int[]
+    for (index, argument) in enumerate(authored_arguments)
+        if argument isa Symbol
+            push!(arguments, argument)
+        elseif argument isa Expr && argument.head === :call &&
+               length(argument.args) == 2 && argument.args[2] isa Symbol &&
+               _kernel_resolve_binding(mod, argument.args[1]) === Ref
+            push!(arguments, argument.args[2])
+            push!(atomic, index)
+        else
+            throw(ArgumentError(
+                "plate arguments must be named graph ports or Ref(port) for an " *
+                "array-valued atom; assign other expressions before plating"))
+        end
+    end
+    length(unique(formals)) == length(formals) || throw(ArgumentError(
+        "plate do-block argument names must be unique"))
+
+    nested_specs = Dict{Symbol,Any}()
+    local_types = Dict{Symbol,Any}()
+    rewritten, inferred = _kernel_constructed_endpoint(
+        scalar_body, mod, Set(formals), nested_specs, local_types)
+    signature = Tuple{Symbol,Any}[
+        (name, get(local_types, name, GlobalRef(Core, :Any))) for name in formals]
+    scalar_graph_body = _kernel_expression_result_body(
+        :__plate_value__, signature, rewritten, true)
+    if inferred !== nothing && scalar_graph_body isa Expr &&
+       scalar_graph_body.head === :block
+        assignment_index = findfirst(scalar_graph_body.args) do statement
+            statement isa Expr && statement.head === :(=) &&
+                statement.args[1] === :__plate_value__
+        end
+        assignment_index === nothing ||
+            (scalar_graph_body.args[assignment_index].args[1] =
+                Expr(:(::), :__plate_value__, inferred))
+    end
+    scalar_spec = _kernel_expand(
+        scalar_graph_body, signature, nothing, mod; nested_specs = nested_specs)
+    operation = Expr(:call, GlobalRef(@__MODULE__, :_kernel_authored_plate),
+                     scalar_spec,
+                     Expr(:call, GlobalRef(Base, :Val), QuoteNode(Tuple(atomic))))
+    (; arguments, operation, inferred, atomic = Tuple(atomic))
+end
+
+function _kernel_authored_plate(spec::KernelSpec, ::Val{A}) where {A}
+    kernel = prepare(spec)
+    _AuthoredPlateOp{typeof(kernel),A}(kernel)
+end
+
 # A dotted operator such as `.*` is broadcast *syntax*, not a bound function:
 # `a .* b` lowers to `broadcast(*, a, b)` and there is no callable named `.*`.
 # Splicing the bare symbol as a recipe callee errors at construction with
@@ -1215,7 +1384,8 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     # (identity-aware, collision-free, straight-line-only). A no-op — byte-identical —
     # for bodies with no `@node` (or only foreign `@node`).
     block = _kernel_lift_nodes(block, mod)
-    statements = block isa Expr && block.head === :block ? block.args : Any[block]
+    raw_statements = block isa Expr && block.head === :block ? block.args : Any[block]
+    statements = _kernel_normalize_return_expressions(raw_statements)
     graph_var = gensym(:kernel_graph)
     ports_var = gensym(:kernel_ports)
     order_var = gensym(:kernel_port_order)
@@ -1228,6 +1398,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     want_names = Symbol[]
     entries = Any[]
     saw_return = false
+    inferred_port_types = Dict{Symbol,Any}()
 
     declare_ref = GlobalRef(@__MODULE__, :_kernel_declare!)
     push_unique_ref = GlobalRef(@__MODULE__, :_kernel_push_unique!)
@@ -1287,7 +1458,23 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                 register!(name, type_expr)
                 push!(outputs, (name, type_expr))
             end
-            push!(entries, (:recipe, outputs, rhs, metadata))
+            plate_expr = _kernel_authored_plate_expr(rhs, mod)
+            if plate_expr !== nothing
+                length(outputs) == 1 || throw(ArgumentError(
+                    "an authored plate produces exactly one named pointwise port"))
+                if outputs[1][2] === nothing && plate_expr.inferred !== nothing
+                    push!(annotations[outputs[1][1]],
+                          :(Array{$(plate_expr.inferred)}))
+                    inferred_port_types[outputs[1][1]] = plate_expr.inferred
+                end
+            elseif length(outputs) == 1 && outputs[1][2] === nothing &&
+                   outputs[1][1] === _KERNEL_RETURN_PORT &&
+                   rhs isa Expr && rhs.head === :call && length(rhs.args) == 2 &&
+                   (rhs.args[1] === :sum || rhs.args[1] === GlobalRef(Base, :sum)) &&
+                   rhs.args[2] isa Symbol && haskey(inferred_port_types, rhs.args[2])
+                push!(annotations[outputs[1][1]], inferred_port_types[rhs.args[2]])
+            end
+            push!(entries, (:recipe, outputs, rhs, metadata, plate_expr))
             continue
         end
 
@@ -1348,7 +1535,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     produced_names = Symbol[]
     for entry in entries
         entry[1] === :recipe || continue
-        _, outputs, authored_rhs, metadata = entry
+        _, outputs, authored_rhs, metadata, plate_expr = entry
         # ALIAS-AT-EXPANSION (RK 2026-08-27): a bare-identity `b = a` — single output, RHS a bare
         # DECLARED port (`known` is the full predeclared port namespace, forward refs included),
         # not `b` itself, no `@recipe` metadata, and `b` has exactly ONE authored definition — is
@@ -1367,9 +1554,12 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
             continue
         end
         rhs = _kernel_hygienic_catches(authored_rhs, known)
-        deps = _kernel_free_ports(rhs, known)
-        deps = _kernel_nested_endpoint_deps(
-            rhs, deps, known, mod, nested_specs)
+        deps = plate_expr === nothing ? _kernel_free_ports(rhs, known) :
+               plate_expr.arguments
+        deps = plate_expr === nothing ? _kernel_nested_endpoint_deps(
+            rhs, deps, known, mod, nested_specs) : deps
+        all(name -> name in known, deps) || throw(ArgumentError(
+            "authored plate arguments must be declared graph ports"))
         union!(consumed_names, deps)
         for (name, _) in outputs
             _kernel_push_unique!(produced_names, name)
@@ -1379,9 +1569,9 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         cost = get(metadata, :cost, 1.0)
         cse_key = get(metadata, :cse_key, nothing)
         effectful = get(metadata, :effectful, false)
-        op = _kernel_operation(rhs, deps, known;
-                               tensorize = !effectful, mod = mod,
-                               nested_specs = nested_specs)
+        op = plate_expr === nothing ? _kernel_operation(
+            rhs, deps, known; tensorize = !effectful, mod = mod,
+            nested_specs = nested_specs) : plate_expr.operation
         push!(body, :($add_ref($graph_var, $dep_values, $out_values,
                                $op, $cost, $cse_key, $effectful,
                                $(QuoteNode(rhs)))))
@@ -1724,6 +1914,11 @@ end
 (spec::KernelSpec)(; have = _KERNEL_DEFAULT_BOUNDARY,
                    want = _KERNEL_DEFAULT_BOUNDARY) =
     extract(spec; have = have, want = want)
+
+# Positional application requests the distinguished default output.  This is a
+# convenience/compiler-entry surface; performance-sensitive callers should
+# still retain `prepare(spec)` so compilation is paid once.
+(spec::KernelSpec)(arg, args...) = prepare(spec)(arg, args...)
 
 function plan(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
               want = _KERNEL_DEFAULT_BOUNDARY)

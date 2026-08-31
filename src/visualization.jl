@@ -156,7 +156,15 @@ function _viz_model(v::DAGVisualization)
         status = state === :alternative ? "not selected · " :
                  state === :effectful ? "effectful · " :
                  subject isa Plan ? "selected · " : ""
-        detail = status * "cost $(r.cost) · recipe $(r.id)"
+        plate_detail = if r.op isa _AuthoredPlateOp
+            inner = plate_body(r)
+            names = unique(output.name for recipe in inner.recipes
+                           for output in recipe.outputs)
+            " · scalar graph: " * join(string.(names), " → ")
+        else
+            ""
+        end
+        detail = status * "cost $(r.cost) · recipe $(r.id)" * plate_detail
         push!(nodes, _VizNode(_recipe_node_id(r.id), _opname(r.op), detail,
                              :recipe, state))
     end

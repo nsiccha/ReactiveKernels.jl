@@ -350,6 +350,8 @@ end
 # Native Julia arrays keep the fused scalar loop.  Reactant arrays select the
 # separately generated eager broadcast/reduction body, avoiding forbidden
 # scalar indexing while leaving XLA free to fuse the tensor operations.
+@inline ReactiveKernels._requires_tensorized_marker(::Reactant.RArray) = true
+
 @inline function ReactiveKernels._batched_call(
         f::ReactiveKernels._ArrayFunctionPair, ops, args,
         marker::Reactant.RArray)

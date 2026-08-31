@@ -41,6 +41,65 @@ end
 
 _embedded_kernel(op) = nothing
 
+# A first-class authored plate keeps its scalar pointwise kernel as compiler
+# metadata.  The ordinary call method is a semantic fallback (and is useful to
+# low-level consumers); `_lower_with_ops` recognizes the operation and emits
+# the fused native/tensorized loop products directly.
+struct _AuthoredPlateOp{K,A}
+    kernel::K
+end
+
+"The transparent scalar plan captured by an authored `plate(...) do` recipe."
+function plate_body(recipe::Recipe)
+    recipe.op isa _AuthoredPlateOp || throw(ArgumentError(
+        "recipe $(recipe.id) is not an authored plate"))
+    recipe.op.kernel.plan
+end
+
+@inline _authored_plate_is_axis(x) = !isempty(axes(Base.broadcastable(x)))
+
+@inline _authored_plate_argument(::Val{A}, index, arg) where {A} =
+    index in A ? Ref(arg) : arg
+
+function _authored_plate_arguments(::Val{A}, args...) where {A}
+    ntuple(length(args)) do index
+        _authored_plate_argument(Val(A), index, getfield(args, index))
+    end
+end
+
+function _authored_plate_broadcast(::Val{A}, args...) where {A}
+    wrapped = _authored_plate_arguments(Val(A), args...)
+    broadcasted = Base.broadcasted(tuple, wrapped...)
+    isempty(axes(broadcasted)) && throw(ArgumentError(
+        "an authored plate requires at least one non-Ref batched argument"))
+    # Instantiation performs Julia's ordinary broadcast-axis compatibility
+    # check before any scalar endpoint recipe or output mutation executes.
+    Base.Broadcast.instantiate(broadcasted)
+end
+
+function _authored_plate_marker(::Val{A}, args...) where {A}
+    index = findfirst(eachindex(args)) do position
+        !(position in A) && _authored_plate_is_axis(getfield(args, position))
+    end
+    index === nothing && throw(ArgumentError(
+        "an authored plate requires at least one batched argument"))
+    getfield(args, index)
+end
+@inline _authored_plate_zero(::Type{T}, marker) where {T} = zero(T)
+@inline _authored_plate_zero(::Type{Any}, marker) = zero(eltype(marker))
+
+function (op::_AuthoredPlateOp{K,A})(args...) where {K,A}
+    batch = _authored_plate_broadcast(Val(A), args...)
+    marker = _authored_plate_marker(Val(A), args...)
+    output = only(outputs(op.kernel))
+    result = similar(marker, valtype(output), axes(batch))
+    for index in eachindex(batch)
+        scalar_args = batch[index]
+        result[index] = op.kernel(scalar_args...)
+    end
+    result
+end
+
 function _lhs_symbols!(symbols::Set{Symbol}, lhs)
     lhs isa Symbol && return push!(symbols, lhs)
     lhs isa Expr || return symbols
@@ -122,6 +181,193 @@ function _embedded_statements(ast::Expr, callargs, lhs, op_offset::Int)
     statements
 end
 
+function _authored_plate_sum_recipe(p::Plan, plate_recipe::Recipe)
+    pointwise = only(plate_recipe.outputs)
+    pointwise_id = canon_id(p.graph, pointwise.id)
+    matches = Recipe[]
+    for recipe in p.recipes
+        recipe === plate_recipe && continue
+        recipe.effectful && continue
+        length(recipe.inputs) == 1 || continue
+        canon_id(p.graph, only(recipe.inputs).id) == pointwise_id || continue
+        source = recipe.source
+        source isa Expr && source.head === :call && length(source.args) == 2 || continue
+        callee = source.args[1]
+        (callee === :sum || callee === GlobalRef(Base, :sum)) || continue
+        source.args[2] === pointwise.name || continue
+        (recipe.op === sum || recipe.op isa _KernelSourceOp) || continue
+        push!(matches, recipe)
+    end
+    length(matches) <= 1 || throw(ArgumentError(
+        "an authored plate pointwise port has more than one selected sum consumer"))
+    isempty(matches) ? nothing : only(matches)
+end
+
+function _authored_plate_dependencies(inner::Plan)
+    graph = inner.graph
+    dependencies = Dict{Int,Set{Int}}()
+    for (index, input) in enumerate(inner.have)
+        dependencies[canon_id(graph, input.id)] = Set((index,))
+    end
+    for recipe in inner.recipes
+        roots = Set{Int}()
+        for input in recipe.inputs
+            union!(roots, get(dependencies, canon_id(graph, input.id), Set{Int}()))
+        end
+        for output in recipe.outputs
+            dependencies[canon_id(graph, output.id)] = copy(roots)
+        end
+    end
+    dependencies
+end
+
+function _authored_plate_condition(callargs, roots, atomic)
+    tests = Any[Expr(:call, GlobalRef(@__MODULE__, :_authored_plate_is_axis),
+                     callargs[index]) for index in sort!(collect(roots))
+                if !(index in atomic)]
+    isempty(tests) && return false
+    foldl((left, right) -> Expr(:||, left, right), tests)
+end
+
+function _authored_plate_scalar_ref(inner::Plan, locals, callargs,
+                                    input::Value, plate_values, looped::Bool)
+    graph = inner.graph
+    cid = canon_id(graph, input.id)
+    have_index = findfirst(value -> canon_id(graph, value.id) == cid, inner.have)
+    if have_index !== nothing
+        arg = callargs[have_index]
+        return looped ? Expr(:ref, plate_values, have_index) : arg
+    end
+    locals[cid]
+end
+
+function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
+                                       op::_AuthoredPlateOp, callargs,
+                                       pointwise_lhs, total_lhs)
+    inner_kernel = op.kernel
+    inner = inner_kernel.plan
+    length(inner.want) == 1 || throw(ArgumentError(
+        "an authored plate body must have exactly one distinguished result"))
+    length(inner_kernel.ops) == length(inner.recipes) || throw(ArgumentError(
+        "an authored plate body must lower to one operation per transparent scalar recipe"))
+
+    atomic = typeof(op).parameters[2]
+    marker = gensym(:plate_axis)
+    batch = gensym(:plate_broadcast)
+    index = gensym(:plate_index)
+    plate_values = gensym(:plate_values)
+    atomic_val = Expr(:call, GlobalRef(Base, :Val), QuoteNode(atomic))
+    push!(body.args, :($batch = $(GlobalRef(@__MODULE__, :_authored_plate_broadcast))(
+        $atomic_val, $(callargs...))))
+    push!(body.args, :($marker = $(GlobalRef(@__MODULE__, :_authored_plate_marker))(
+        $atomic_val, $(callargs...))))
+
+    dependencies = _authored_plate_dependencies(inner)
+    locals = Dict{Int,Symbol}()
+    for recipe in inner.recipes, output in recipe.outputs
+        cid = canon_id(inner.graph, output.id)
+        get!(locals, cid) do
+            gensym(Symbol(:plate_, output.name))
+        end
+    end
+    op_offset = length(runtime_ops)
+    append!(runtime_ops, inner_kernel.ops)
+    append!(runtime_recipes, inner_kernel.lowered_recipes)
+
+    # Runtime scalar-or-axis roles are specialized by Julia.  Every invariant
+    # scalar recipe is executed once before the loop; the same recipe is
+    # executed per element only when one of its transitive roots is an axis.
+    for (recipe_index, recipe) in enumerate(inner.recipes)
+        length(recipe.outputs) == 1 || throw(ArgumentError(
+            "an authored plate currently requires single-output scalar recipes"))
+        output = only(recipe.outputs)
+        out = locals[canon_id(inner.graph, output.id)]
+        roots = get(dependencies, canon_id(inner.graph, output.id), Set{Int}())
+        condition = _authored_plate_condition(callargs, roots, atomic)
+        args = Any[_authored_plate_scalar_ref(
+            inner, locals, callargs, input, plate_values, false) for input in recipe.inputs]
+        call = Expr(:call, Expr(:ref, _OPS_ARG, op_offset + recipe_index), args...)
+        push!(body.args, Expr(:if,
+            Expr(:call, GlobalRef(Base, :!), condition), Expr(:(=), out, call)))
+    end
+
+    output_type = valtype(only(inner.want))
+    if pointwise_lhs !== nothing
+        push!(body.args,
+            :($pointwise_lhs = similar($marker, $output_type, axes($batch))))
+    end
+    accumulator = total_lhs === nothing ? nothing : gensym(:plate_total)
+    accumulator === nothing || push!(body.args,
+        :($accumulator = $(GlobalRef(@__MODULE__, :_authored_plate_zero))(
+            $output_type, $marker)))
+
+    loopbody = Expr(:block)
+    for (recipe_index, recipe) in enumerate(inner.recipes)
+        output = only(recipe.outputs)
+        out = locals[canon_id(inner.graph, output.id)]
+        roots = get(dependencies, canon_id(inner.graph, output.id), Set{Int}())
+        condition = _authored_plate_condition(callargs, roots, atomic)
+        args = Any[_authored_plate_scalar_ref(
+            inner, locals, callargs, input, plate_values, true) for input in recipe.inputs]
+        call = Expr(:call, Expr(:ref, _OPS_ARG, op_offset + recipe_index), args...)
+        push!(loopbody.args, Expr(:if, condition, Expr(:(=), out, call)))
+    end
+    scalar_result = locals[canon_id(inner.graph, only(inner.want).id)]
+    pointwise_lhs === nothing ||
+        push!(loopbody.args, :($pointwise_lhs[$index] = $scalar_result))
+    accumulator === nothing ||
+        push!(loopbody.args, :($accumulator += $scalar_result))
+    pushfirst!(loopbody.args, :($plate_values = $batch[$index]))
+    iteration = Expr(:call, GlobalRef(Base, :CartesianIndices),
+                     Expr(:call, GlobalRef(Base, :axes), batch))
+    push!(body.args, Expr(:for, Expr(:(=), index, iteration), loopbody))
+    total_lhs === nothing || push!(body.args, :($total_lhs = $accumulator))
+    body
+end
+
+function _lower_authored_plate_tensorized!(body, runtime_ops, runtime_recipes,
+                                           op::_AuthoredPlateOp, callargs,
+                                           pointwise_lhs, total_lhs)
+    inner_kernel = op.kernel
+    inner = inner_kernel.plan
+    length(inner.want) == 1 || throw(ArgumentError(
+        "an authored plate body must have exactly one distinguished result"))
+    length(inner_kernel.ops) == length(inner.recipes) || throw(ArgumentError(
+        "an authored plate body must lower to one operation per transparent scalar recipe"))
+
+    atomic = typeof(op).parameters[2]
+    batch = gensym(:plate_broadcast)
+    atomic_val = Expr(:call, GlobalRef(Base, :Val), QuoteNode(atomic))
+    push!(body.args, :($batch = $(GlobalRef(@__MODULE__, :_authored_plate_broadcast))(
+        $atomic_val, $(callargs...))))
+
+    locals = Dict{Int,Any}()
+    for (index, input) in enumerate(inner.have)
+        arg = callargs[index]
+        locals[canon_id(inner.graph, input.id)] = index in atomic ?
+            Expr(:call, GlobalRef(Base, :Ref), arg) : arg
+    end
+    op_offset = length(runtime_ops)
+    append!(runtime_ops, inner_kernel.ops)
+    append!(runtime_recipes, inner_kernel.lowered_recipes)
+    for (recipe_index, recipe) in enumerate(inner.recipes)
+        length(recipe.outputs) == 1 || throw(ArgumentError(
+            "an authored plate currently requires single-output scalar recipes"))
+        output = only(recipe.outputs)
+        out = gensym(Symbol(:plate_, output.name))
+        args = Any[locals[canon_id(inner.graph, input.id)] for input in recipe.inputs]
+        operation = Expr(:ref, _OPS_ARG, op_offset + recipe_index)
+        call = Expr(:call, GlobalRef(Base, :broadcast), operation, args...)
+        push!(body.args, Expr(:(=), out, call))
+        locals[canon_id(inner.graph, output.id)] = out
+    end
+    scalar_result = locals[canon_id(inner.graph, only(inner.want).id)]
+    pointwise_lhs === nothing || push!(body.args, :($pointwise_lhs = $scalar_result))
+    total_lhs === nothing ||
+        push!(body.args, :($total_lhs = $(GlobalRef(Base, :sum))($scalar_result)))
+    body
+end
+
 function _lower_with_ops(p::Plan; tensorized::Bool = false,
                          inline_embedded::Bool = true)
     g = p.graph
@@ -134,13 +380,45 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
     body = Expr(:block)
     runtime_ops = Any[]
     runtime_recipes = Recipe[]
+    skipped_recipes = Set{Int}()
     # HAVE is authoritative, and the first selected producer of any other
     # logical value owns its binding. Later recipes may emit that value as a
     # collateral multi-output; execute the recipe but discard the duplicate so
     # neither authoritative inputs nor earlier logical values are overwritten.
     assigned = Set(canon_id(g, v.id) for v in p.have)
     for r in p.recipes
+        r.id in skipped_recipes && continue
         callargs = Any[nm(inp) for inp in r.inputs]
+
+        if inline_embedded && r.op isa _AuthoredPlateOp
+            length(r.outputs) == 1 || throw(ArgumentError(
+                "an authored plate recipe must have exactly one pointwise output"))
+            pointwise = only(r.outputs)
+            pointwise_id = canon_id(g, pointwise.id)
+            sum_recipe = _authored_plate_sum_recipe(p, r)
+            pointwise_needed = pointwise_id in Set(canon_id(g, w.id) for w in p.want) ||
+                any(candidate -> candidate !== sum_recipe &&
+                    any(input -> canon_id(g, input.id) == pointwise_id,
+                        candidate.inputs), p.recipes)
+            pointwise_lhs = pointwise_needed ? nm(pointwise) : nothing
+            total_lhs = sum_recipe === nothing ? nothing : nm(only(sum_recipe.outputs))
+            pointwise_lhs === nothing || push!(assigned, pointwise_id)
+            if sum_recipe !== nothing
+                push!(assigned, canon_id(g, only(sum_recipe.outputs).id))
+                push!(skipped_recipes, sum_recipe.id)
+            end
+            if tensorized
+                _lower_authored_plate_tensorized!(
+                    body, runtime_ops, runtime_recipes, r.op, callargs,
+                    pointwise_lhs, total_lhs)
+            else
+                _lower_authored_plate_native!(
+                    body, runtime_ops, runtime_recipes, r.op, callargs,
+                    pointwise_lhs, total_lhs)
+            end
+            continue
+        end
+
         lhsnames = Any[]
         for output in r.outputs
             cid = canon_id(g, output.id)
@@ -430,7 +708,46 @@ struct _EmbeddedFunctionPair{I,N,T,A} <: _ArrayFunctionPair
 end
 
 @inline function (f::_EmbeddedFunctionPair{I})(ops, args...) where {I}
-    _batched_call(f, ops, args, getfield(args, I))
+    traced = _dynamic_tensorized_marker(args)
+    marker = traced === nothing ? getfield(args, I) : traced
+    _batched_call(f, ops, args, marker)
+end
+
+# An untyped authored signature still specializes on its concrete call-site
+# argument types.  Keep every graph-proven candidate axis as type metadata and
+# select the first runtime broadcast axis before choosing native vs. tensorized
+# execution.  Atomic `Ref(port)` inputs are excluded when the candidates are
+# derived, so an array-valued atom cannot accidentally become the batch marker.
+struct _DynamicEmbeddedFunctionPair{I,N,T,A} <: _ArrayFunctionPair
+    native::N
+    tensorized::T
+    tensorized_ast::A
+end
+
+@inline _dynamic_embedded_marker(args, ::Val{()}) = throw(ArgumentError(
+    "an embedded plate requires an array-valued HAVE port at runtime"))
+
+@inline function _dynamic_embedded_marker(args, ::Val{I}) where {I}
+    index = first(I)
+    marker = getfield(args, index)
+    _authored_plate_is_axis(marker) && return marker
+    _dynamic_embedded_marker(args, Val(Base.tail(I)))
+end
+
+@inline _requires_tensorized_marker(marker) = false
+@inline _dynamic_tensorized_marker(::Tuple{}) = nothing
+
+@inline function _dynamic_tensorized_marker(args::Tuple)
+    marker = first(args)
+    _requires_tensorized_marker(marker) && return marker
+    _dynamic_tensorized_marker(Base.tail(args))
+end
+
+@inline function (f::_DynamicEmbeddedFunctionPair{I})(ops, args...) where {I}
+    traced = _dynamic_tensorized_marker(args)
+    marker = traced === nothing ?
+             _dynamic_embedded_marker(args, Val(I)) : traced
+    _batched_call(f, ops, args, marker)
 end
 
 @inline _batched_call(f::_ArrayFunctionPair, ops, args, marker) =
@@ -466,7 +783,8 @@ function _embedded_ast(kernel::PreparedKernel, tensorized::Bool)
         batched, reduce = _batched_options(kernel.f)
         return _lower_batched_tensorized(
             kernel.plan; batched = batched, reduce = reduce)
-    elseif kernel.f isa _EmbeddedFunctionPair
+    elseif kernel.f isa Union{_EmbeddedFunctionPair,
+                              _DynamicEmbeddedFunctionPair}
         # The tensorized product may already contain arbitrarily nested plates
         # and user AST passes. Preserve that exact prepared artifact instead of
         # rebuilding from the native `kernel.ast`, which would silently restore
@@ -478,16 +796,39 @@ end
 
 function _needs_embedded_tensorization(p::Plan)
     any(p.recipes) do recipe
+        recipe.op isa _AuthoredPlateOp && return true
         kernel = _embedded_kernel(recipe.op)
         kernel !== nothing && kernel.f isa _ArrayFunctionPair
     end
 end
 
-function _embedded_marker_index(p::Plan)
-    index = findfirst(value -> valtype(value) <: AbstractArray, p.have)
-    index === nothing && throw(ArgumentError(
-        "an embedded plate requires an array-valued HAVE port in the outer kernel"))
-    index
+_array_marker_positions(::_ArrayFunctionPair) = ()
+_array_marker_positions(::_BatchedFunctionPair{I}) where {I} = (I,)
+_array_marker_positions(::_EmbeddedFunctionPair{I}) where {I} = (I,)
+_array_marker_positions(::_DynamicEmbeddedFunctionPair{I}) where {I} = I
+
+function _embedded_marker_candidates(p::Plan)
+    dependencies = _authored_plate_dependencies(p)
+    candidates = Int[]
+    for recipe in p.recipes
+        positions = if recipe.op isa _AuthoredPlateOp
+            atomic = typeof(recipe.op).parameters[2]
+            Tuple(index for index in eachindex(recipe.inputs)
+                  if !(index in atomic))
+        else
+            kernel = _embedded_kernel(recipe.op)
+            kernel === nothing ? () : _array_marker_positions(kernel.f)
+        end
+        for position in positions
+            input = recipe.inputs[position]
+            roots = sort!(collect(get(
+                dependencies, canon_id(p.graph, input.id), Set{Int}())))
+            for root in roots
+                root in candidates || push!(candidates, root)
+            end
+        end
+    end
+    Tuple(candidates)
 end
 
 """
@@ -735,14 +1076,16 @@ end
     k.f(k.ops, k.caches, k.cache_apply, args...)
 end
 
-function _prepare_nonallocating(p::Plan, ast::Expr, cache_apply)
+function _prepare_nonallocating(
+        p::Plan, ast::Expr, cache_apply;
+        cache_slot = recipe -> _cache_slot(only(recipe.outputs)))
     for r in p.recipes
         length(r.outputs) == 1 || throw(ArgumentError(
             "prepare_nonallocating requires single-output recipes; recipe $(r.id) has $(length(r.outputs)) outputs"))
     end
     f = compile(ast)
     ops = ntuple(i -> p.recipes[i].op, length(p.recipes))
-    caches = ntuple(i -> _cache_slot(only(p.recipes[i].outputs)), length(p.recipes))
+    caches = ntuple(i -> cache_slot(p.recipes[i]), length(p.recipes))
     NonAllocatingKernel(f, ops, caches, cache_apply, Tuple(p.have),
                         Tuple(p.want), p, ast)
 end
@@ -771,10 +1114,21 @@ function prepare(p::Plan; passes = ())
         (tensorized_ast = transform(tensorized_ast, passes...))
     native = compile(native_ast)
     tensorized = compile(tensorized_ast)
-    input_index = _embedded_marker_index(p)
-    f = _EmbeddedFunctionPair{
-        input_index,typeof(native),typeof(tensorized),typeof(tensorized_ast)}(
-            native, tensorized, tensorized_ast)
+    candidates = _embedded_marker_candidates(p)
+    isempty(candidates) && throw(ArgumentError(
+        "an embedded plate requires an array-valued HAVE port in the outer kernel"))
+    typed_candidate = findfirst(
+        index -> valtype(p.have[index]) <: AbstractArray, candidates)
+    f = if typed_candidate === nothing
+        _DynamicEmbeddedFunctionPair{
+            candidates,typeof(native),typeof(tensorized),typeof(tensorized_ast)}(
+                native, tensorized, tensorized_ast)
+    else
+        input_index = candidates[typed_candidate]
+        _EmbeddedFunctionPair{
+            input_index,typeof(native),typeof(tensorized),typeof(tensorized_ast)}(
+                native, tensorized, tensorized_ast)
+    end
     PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast, recipes)
 end
 
@@ -841,6 +1195,7 @@ _opname(op) = try
 catch
     string(op)
 end
+_opname(::_AuthoredPlateOp) = "plate"
 
 function _readable_callee(op)
     name = try
