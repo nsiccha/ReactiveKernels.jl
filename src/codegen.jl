@@ -732,8 +732,19 @@ end
     _dynamic_embedded_marker(args, Val(Base.tail(I)))
 end
 
+@inline _requires_tensorized_marker(marker) = false
+@inline _dynamic_tensorized_marker(args, ::Val{()}) = nothing
+
+@inline function _dynamic_tensorized_marker(args, ::Val{I}) where {I}
+    marker = getfield(args, first(I))
+    _requires_tensorized_marker(marker) && return marker
+    _dynamic_tensorized_marker(args, Val(Base.tail(I)))
+end
+
 @inline function (f::_DynamicEmbeddedFunctionPair{I})(ops, args...) where {I}
-    marker = _dynamic_embedded_marker(args, Val(I))
+    traced = _dynamic_tensorized_marker(args, Val(I))
+    marker = traced === nothing ?
+             _dynamic_embedded_marker(args, Val(I)) : traced
     _batched_call(f, ops, args, marker)
 end
 

@@ -76,6 +76,18 @@ function _authored_plate_allocated(kernel, a, b, c)
     @allocated kernel(a, b, c)
 end
 
+struct _AuthoredPlateBackendArray <: AbstractVector{Float64}
+    values::Vector{Float64}
+end
+Base.size(marker::_AuthoredPlateBackendArray) = size(marker.values)
+Base.getindex(marker::_AuthoredPlateBackendArray, index::Int) =
+    marker.values[index]
+ReactiveKernels._requires_tensorized_marker(
+    ::_AuthoredPlateBackendArray) = true
+ReactiveKernels._batched_call(
+        pair::ReactiveKernels._ArrayFunctionPair, ops, args,
+        ::_AuthoredPlateBackendArray) = pair.tensorized(ops, args...)
+
 function _authored_plate_head_count(node, head)
     node isa Expr || return 0
     (node.head === head ? 1 : 0) +
@@ -170,6 +182,17 @@ end
     scales = [0.8, 1.0, 1.3, 1.5]
     @test untyped_total(0.25, locations, scale) ≈ sum(
         _authored_plate_normal(0.25, item, scale) for item in locations)
+
+    # A native array in an earlier candidate position must not mask a later
+    # backend-traced array (or traced scalar) that requires tensorized lowering.
+    native_call = (ops, args...) -> :native
+    tensorized_call = (ops, args...) -> :tensorized
+    pair = ReactiveKernels._DynamicEmbeddedFunctionPair{
+        (1, 2),typeof(native_call),typeof(tensorized_call),Expr}(
+            native_call, tensorized_call, Expr(:block))
+    backend_locations = _AuthoredPlateBackendArray(locations)
+    @test pair((), xs, backend_locations) === :tensorized
+    @test pair((), xs, locations) === :native
     zipped_reference = [
         _authored_plate_normal(xs[i], locations[i], scales[i])
         for i in eachindex(xs)
