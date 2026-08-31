@@ -351,8 +351,8 @@ end
 #
 # The differentiation engine stays the caller's DifferentiationInterface backend
 # (the one passed to `prepare_ad`), so ReactiveKernels imports no concrete AD
-# engine here: `AutoEnzyme(mode = Enzyme.Reverse)` traces through Reactant with
-# exact parity against the native reverse pass. The real methods live in
+# engine here: a caller-configured reverse-mode backend traces through Reactant
+# with exact parity against the native reverse pass. The real methods live in
 # `ext/ReactiveKernelsReactantExt.jl` and are selected when the active argument is
 # a Reactant-traced value; without the Reactant weak dependency loaded (or with a
 # host-array active argument) these raise a clear, actionable error instead of a
