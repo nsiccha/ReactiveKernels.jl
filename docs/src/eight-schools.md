@@ -20,14 +20,18 @@ y_j &\sim \operatorname{Normal}(\theta_j, \sigma_j).
 ```
 
 The unconstrained vector is `(μ, log_τ, θ₁, …, θ₈)`. Only `τ` needs a support
-transform, so `τ = exp(log_τ)` and the optional log absolute Jacobian determinant
-is `log_τ`.
+transform. The graph declares both `τ = exp(log_τ)` and `log_τ = log(τ)`, so a
+query may start from either representation; an explicit HAVE value cuts the
+opposite recipe. The log absolute Jacobian determinant for an unconstrained
+query is `log_τ`.
 
 The one model graph exposes the packed `unconstrained` input, named latent ports
 `μ`/`log_τ`/`θ`, constrained `parameters`, `log_jacobian`, `prior`,
-`likelihood`, `pointwise`, and `posterior`. Preparing a different HAVE/WANT
-boundary changes only the generated backward slice; it does not select a second
-model implementation.
+`likelihood`, `pointwise`, `constrained_logdensity`, and `posterior`. The
+constrained joint is `prior + likelihood`; the distinguished return is the
+unconstrained joint, which additionally includes `log_jacobian`. Preparing a
+different HAVE/WANT boundary changes only the generated backward slice; it does
+not select a second model implementation.
 
 The constrained `parameters` port has **two producers** — this is RK's *multiple
 paths to the same port*. One assignment builds the constrained parameters alone;
@@ -47,7 +51,8 @@ parameters ──► reusable Normal/Cauchy kernels ──► log prior
                                               └─► fused log-likelihood sum
           ──► new-group prediction
 
-log prior + log Jacobian + log likelihood ──► unconstrained log posterior
+log prior + log likelihood ──► constrained log density
+                                └─ + log Jacobian ─► unconstrained log posterior
 ```
 
 The block below is the authored model, executed verbatim while the documentation
@@ -94,6 +99,15 @@ mapping from PPL results to these named ports; RK handles extraction and Reactan
 sees the resulting mathematical `PreparedKernel`. The packed `unconstrained`
 vector and the named latent ports are alternate HAVE boundaries over that same
 graph, not alternate implementations of the mathematics.
+
+That gives the standard joint-density views without wrapper models. A
+constrained-space call supplies `μ`, `τ`, and `θ` and asks for
+`constrained_logdensity`; an unconstrained-space call supplies `μ`, `log_τ`, and
+`θ` and asks for the distinguished `posterior` return. The former computes
+`log_τ = log(τ)` once for the distribution normalization terms and prunes the
+transform Jacobian; the latter uses the supplied `log_τ`, computes `τ`, and adds
+the Jacobian. Prior-only, likelihood-only, pointwise-only, and pointwise-plus-
+total are further slices of this same graph.
 
 The unconstrained posterior uses that same RK-generated transform, prior, and
 the two authored plate nodes for school effects and observations. Preparation

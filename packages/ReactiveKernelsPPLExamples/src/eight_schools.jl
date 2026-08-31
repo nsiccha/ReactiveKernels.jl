@@ -27,7 +27,10 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
     θ::AbstractVector{Float64} =
         view(unconstrained, 3:length(unconstrained))
 
-    # Support transform for the scale: τ = exp(log_τ).
+    # Bidirectional scale relation. An unconstrained query starts from log_τ;
+    # an already-constrained query starts from τ. Supplying both cuts both
+    # recipes, matching the distribution objects' HAVE-authority policy.
+    log_τ::Float64 = log(τ)
     τ::Float64 = exp(log_τ)
 
     # Two producers for the SAME `parameters` port — RK's "multiple paths to one
@@ -62,8 +65,10 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
     end
     likelihood::Float64 = sum(pointwise)
 
-    # Unconstrained-space log posterior.
-    posterior::Float64 = prior + log_jacobian + likelihood
+    # The constrained joint excludes transform work. The unconstrained-space
+    # posterior adds the Jacobian, and remains the distinguished return.
+    constrained_logdensity::Float64 = prior + likelihood
+    posterior::Float64 = constrained_logdensity + log_jacobian
 
     # Deterministic new-group prediction from standard-normal innovations, read
     # straight off the constrained `parameters` so the query can start there.
@@ -163,8 +168,8 @@ and predictions are plain NamedTuples, not custom types.
 The reusable Normal and Cauchy kernel objects from the distributions example are
 included directly by ordinary endpoint calls inside the model's authored plate
 blocks; the PPL source does not re-author their formulas or prepare helper paths.
-The transform Jacobian, prior, pointwise likelihood, total likelihood,
-posterior, and prediction remain selectable named nodes. A
+The constrained log density, transform Jacobian, prior, pointwise likelihood,
+total likelihood, unconstrained posterior, and prediction remain selectable named nodes. A
 Wren-style accumulator tuple is therefore a static `want` selection, not a
 second evaluation framework. Prediction is deterministic for caller-supplied
 standard-normal innovations; sampling those innovations remains outside the

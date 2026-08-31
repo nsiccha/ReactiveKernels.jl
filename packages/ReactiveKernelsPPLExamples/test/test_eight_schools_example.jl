@@ -53,7 +53,8 @@ end
         @test producer_count(model.parameters) == 2
         for value in (model.log_jacobian, model.effects_pointwise,
                       model.effects_prior, model.prior, model.likelihood,
-                      model.pointwise, model.posterior, model.new_group)
+                      model.pointwise, model.constrained_logdensity,
+                      model.posterior, model.new_group)
             @test producer_count(value) == 1
         end
     end
@@ -152,6 +153,40 @@ end
         @test !occursin("similar", string(code_expr(posterior_kernel)))
         @test !any(op -> op isa ReactiveKernels.PreparedKernel,
                    posterior_kernel.ops)
+    end
+
+    @testset "constrained and unconstrained joint-density cuts share one graph" begin
+        constrained_kernel = prepare(model;
+            have = (:μ, :τ, :θ, :observations, :observation_scales),
+            want = (:prior, :likelihood, :constrained_logdensity))
+        prior, likelihood, constrained_logdensity = constrained_kernel(
+            q[1], exp(q[2]), q[3:end],
+            EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA,
+        )
+
+        unconstrained_kernel = prepare(model;
+            have = (:μ, :log_τ, :θ, :observations, :observation_scales),
+            want = (:log_jacobian, :posterior))
+        log_jacobian, posterior = unconstrained_kernel(
+            q[1], q[2], q[3:end],
+            EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA,
+        )
+
+        @test constrained_logdensity ≈ prior + likelihood
+        @test posterior ≈ constrained_logdensity + log_jacobian
+        @test log_jacobian == q[2]
+
+        # Starting from τ computes log_τ once for the normalization terms, but
+        # never executes the packed transform, Jacobian, or posterior branch.
+        produced = Set(
+            canon_id(model.graph, output.id)
+            for recipe in constrained_kernel.plan.recipes
+            for output in recipe.outputs
+        )
+        @test canon_id(model.graph, model.log_τ.id) in produced
+        @test !(canon_id(model.graph, model.parameters.id) in produced)
+        @test !(canon_id(model.graph, model.log_jacobian.id) in produced)
+        @test !(canon_id(model.graph, model.posterior.id) in produced)
     end
 
     @testset "corrected core contracts hold on PPL paths" begin
