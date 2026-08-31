@@ -1,0 +1,610 @@
+generated_at = "2026-08-31T18:58:31.755Z"
+schema = "distribution-gradient-v1"
+
+[environment]
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+julia_threads = 1
+os = "Linux"
+
+[[measurements]]
+active = "x"
+active_kind = "vector"
+family = "normal"
+group = "normal_plate"
+max_abs_error = 0.0
+max_relative_error = 0.0
+max_value_error = 0.0
+n = 1
+
+    [measurements.caller_owned_gradient]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 40.0
+    times_ns = [40.0, 40.0, 40.0, 40.0, 40.0]
+
+    [measurements.returned_gradient]
+    allocs = [1, 1, 1, 1, 1]
+    bytes = [64, 64, 64, 64, 64]
+    median_allocs = 1
+    median_bytes = 64
+    median_ns = 50.0
+    times_ns = [60.0, 50.0, 50.0, 50.0, 50.0]
+[[measurements]]
+active = "x"
+active_kind = "vector"
+family = "normal"
+group = "normal_plate"
+max_abs_error = 4.440892098500626e-16
+max_relative_error = 1.7492510318243236e-16
+max_value_error = 0.0
+n = 1000
+
+    [measurements.caller_owned_gradient]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 941.0
+    times_ns = [951.0, 961.0, 941.0, 931.0, 941.0]
+
+    [measurements.returned_gradient]
+    allocs = [1, 1, 1, 1, 1]
+    bytes = [8128, 8128, 8128, 8128, 8128]
+    median_allocs = 1
+    median_bytes = 8128
+    median_ns = 631.0
+    times_ns = [631.0, 491.0, 510.0, 701.0, 651.0]
+[[measurements]]
+active = "x"
+active_kind = "vector"
+family = "normal"
+group = "normal_plate"
+max_abs_error = 4.440892098500626e-16
+max_relative_error = 1.5806864767492137e-16
+max_value_error = 0.0
+n = 10000
+
+    [measurements.caller_owned_gradient]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 9253.0
+    times_ns = [9062.0, 9253.0, 9243.0, 9312.0, 9323.0]
+
+    [measurements.returned_gradient]
+    allocs = [2, 2, 2, 2, 2]
+    bytes = [80048, 80048, 80048, 80048, 80048]
+    median_allocs = 2
+    median_bytes = 80048
+    median_ns = 3165.0
+    times_ns = [3145.0, 3165.0, 3925.0, 4116.0, 3164.0]
+[[measurements]]
+active = "x"
+active_kind = "vector"
+family = "normal"
+group = "normal_plate"
+max_abs_error = 4.440892098500626e-16
+max_relative_error = 1.3826983817773671e-16
+max_value_error = 0.0
+n = 30000
+
+    [measurements.caller_owned_gradient]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 27168.0
+    times_ns = [27127.0, 27098.0, 27168.0, 27198.0, 27248.0]
+
+    [measurements.returned_gradient]
+    allocs = [2, 2, 2, 2, 2]
+    bytes = [240048, 240048, 240048, 240048, 240048]
+    median_allocs = 2
+    median_bytes = 240048
+    median_ns = 10044.0
+    times_ns = [10044.0, 8983.0, 9654.0, 10895.0, 11085.0]
+[[measurements]]
+active = "x"
+active_kind = "vector"
+family = "normal"
+group = "normal_plate"
+max_abs_error = 4.440892098500626e-16
+max_relative_error = 1.1726342342360185e-16
+max_value_error = 0.0
+n = 100000
+
+    [measurements.caller_owned_gradient]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 96183.0
+    times_ns = [96183.0, 96353.0, 96013.0, 95733.0, 96262.0]
+
+    [measurements.returned_gradient]
+    allocs = [2, 2, 2, 2, 2]
+    bytes = [800048, 800048, 800048, 800048, 800048]
+    median_allocs = 2
+    median_bytes = 800048
+    median_ns = 34928.0
+    times_ns = [34928.0, 35399.0, 32605.0, 35058.0, 30052.0]
+[[measurements]]
+active = "x"
+active_kind = "vector"
+family = "normal"
+group = "normal_plate"
+max_abs_error = 4.440892098500626e-16
+max_relative_error = 1.214194937847456e-16
+max_value_error = 0.0
+n = 1000000
+
+    [measurements.caller_owned_gradient]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 1.016983e6
+    times_ns = [1.076015e6, 1.053784e6, 1.009333e6, 1.011477e6, 1.016983e6]
+
+    [measurements.returned_gradient]
+    allocs = [2, 2, 2, 2, 2]
+    bytes = [8000048, 8000048, 8000048, 8000048, 8000048]
+    median_allocs = 2
+    median_bytes = 8000048
+    median_ns = 421402.0
+    times_ns = [386734.0, 417106.0, 429463.0, 421402.0, 550340.0]
+[[measurements]]
+active = "x"
+active_kind = "vector"
+family = "cauchy_location_scale"
+group = "scalar_gallery"
+max_abs_error = 2.220446049250313e-16
+max_relative_error = 2.4424906541753446e-16
+max_value_error = 0.0
+n = 1000
+
+    [measurements.caller_owned_gradient]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 6770.0
+    times_ns = [6789.0, 6770.0, 6799.0, 6769.0, 6769.0]
+
+    [measurements.returned_gradient]
+    allocs = [1, 1, 1, 1, 1]
+    bytes = [8128, 8128, 8128, 8128, 8128]
+    median_allocs = 1
+    median_bytes = 8128
+    median_ns = 1022.0
+    times_ns = [1032.0, 1142.0, 981.0, 951.0, 1022.0]
+[[measurements]]
+active = "x"
+active_kind = "vector"
+family = "cauchy_location_scale"
+group = "scalar_gallery"
+max_abs_error = 2.220446049250313e-16
+max_relative_error = 2.4424906541753446e-16
+max_value_error = 0.0
+n = 100000
+
+    [measurements.caller_owned_gradient]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 674611.0
+    times_ns = [667852.0, 674121.0, 680589.0, 676925.0, 674611.0]
+
+    [measurements.returned_gradient]
+    allocs = [2, 2, 2, 2, 2]
+    bytes = [800048, 800048, 800048, 800048, 800048]
+    median_allocs = 2
+    median_bytes = 800048
+    median_ns = 71719.0
+    times_ns = [73993.0, 71569.0, 71719.0, 74612.0, 70718.0]
+[[measurements]]
+active = "x"
+active_kind = "vector"
+family = "laplace_location_scale"
+group = "scalar_gallery"
+max_abs_error = 0.0
+max_relative_error = 0.0
+max_value_error = 0.0
+n = 1000
+
+    [measurements.caller_owned_gradient]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 1170.0
+    times_ns = [1162.0, 1162.0, 1170.0, 1171.0, 1171.0]
+
+    [measurements.returned_gradient]
+    allocs = [1, 1, 1, 1, 1]
+    bytes = [8128, 8128, 8128, 8128, 8128]
+    median_allocs = 1
+    median_bytes = 8128
+    median_ns = 801.0
+    times_ns = [812.0, 721.0, 801.0, 831.0, 801.0]
+[[measurements]]
+active = "x"
+active_kind = "vector"
+family = "laplace_location_scale"
+group = "scalar_gallery"
+max_abs_error = 0.0
+max_relative_error = 0.0
+max_value_error = 0.0
+n = 100000
+
+    [measurements.caller_owned_gradient]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 113787.0
+    times_ns = [112716.0, 113597.0, 113787.0, 114098.0, 117061.0]
+
+    [measurements.returned_gradient]
+    allocs = [2, 2, 2, 2, 2]
+    bytes = [800048, 800048, 800048, 800048, 800048]
+    median_allocs = 2
+    median_bytes = 800048
+    median_ns = 53284.0
+    times_ns = [53584.0, 52082.0, 51331.0, 53284.0, 56669.0]
+[[measurements]]
+active = "logit"
+active_kind = "scalar"
+family = "bernoulli_logit"
+group = "scalar_gallery"
+max_abs_error = 2.842170943040401e-14
+max_relative_error = 1.6898796543892599e-16
+n = 1000
+
+    [measurements.returned_gradient]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 260.0
+    times_ns = [250.0, 260.0, 251.0, 260.0, 260.0]
+[[measurements]]
+active = "logit"
+active_kind = "scalar"
+family = "bernoulli_logit"
+group = "scalar_gallery"
+max_abs_error = 3.637978807091713e-12
+max_relative_error = 2.163045957618252e-16
+n = 100000
+
+    [measurements.returned_gradient]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 19267.0
+    times_ns = [18866.0, 18876.0, 19718.0, 19337.0, 19267.0]
+[[measurements]]
+active = "x"
+active_kind = "vector"
+family = "lognormal_logscale"
+group = "scalar_gallery"
+max_abs_error = 0.0
+max_relative_error = 0.0
+max_value_error = 0.0
+n = 1000
+
+    [measurements.caller_owned_gradient]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 14300.0
+    times_ns = [14299.0, 14260.0, 14300.0, 14380.0, 14440.0]
+
+    [measurements.returned_gradient]
+    allocs = [1, 1, 1, 1, 1]
+    bytes = [8128, 8128, 8128, 8128, 8128]
+    median_allocs = 1
+    median_bytes = 8128
+    median_ns = 10485.0
+    times_ns = [10234.0, 10214.0, 16482.0, 10485.0, 10645.0]
+[[measurements]]
+active = "x"
+active_kind = "vector"
+family = "lognormal_logscale"
+group = "scalar_gallery"
+max_abs_error = 0.0
+max_relative_error = 0.0
+max_value_error = 0.0
+n = 100000
+
+    [measurements.caller_owned_gradient]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 1.571248e6
+    times_ns = [1.591796e6, 1.571248e6, 1.560563e6, 1.576937e6, 1.570257e6]
+
+    [measurements.returned_gradient]
+    allocs = [2, 2, 2, 2, 2]
+    bytes = [800048, 800048, 800048, 800048, 800048]
+    median_allocs = 2
+    median_bytes = 800048
+    median_ns = 965082.0
+    times_ns = [960736.0, 960146.0, 965082.0, 982096.0, 978140.0]
+[[measurements]]
+active = "x"
+active_kind = "vector"
+family = "exponential_logscale"
+group = "scalar_gallery"
+max_abs_error = 1.1102230246251565e-16
+max_relative_error = 1.4432899320127033e-16
+max_value_error = 0.0
+n = 1000
+
+    [measurements.caller_owned_gradient]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 1292.0
+    times_ns = [1292.0, 1292.0, 1292.0, 1292.0, 1301.0]
+
+    [measurements.returned_gradient]
+    allocs = [1, 1, 1, 1, 1]
+    bytes = [8128, 8128, 8128, 8128, 8128]
+    median_allocs = 1
+    median_bytes = 8128
+    median_ns = 641.0
+    times_ns = [811.0, 581.0, 641.0, 631.0, 831.0]
+[[measurements]]
+active = "x"
+active_kind = "vector"
+family = "exponential_logscale"
+group = "scalar_gallery"
+max_abs_error = 1.1102230246251565e-16
+max_relative_error = 1.4432899320127033e-16
+max_value_error = 0.0
+n = 100000
+
+    [measurements.caller_owned_gradient]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 127756.0
+    times_ns = [127246.0, 127917.0, 127756.0, 127677.0, 127846.0]
+
+    [measurements.returned_gradient]
+    allocs = [2, 2, 2, 2, 2]
+    bytes = [800048, 800048, 800048, 800048, 800048]
+    median_allocs = 2
+    median_bytes = 800048
+    median_ns = 45653.0
+    times_ns = [45653.0, 46113.0, 44051.0, 45643.0, 45793.0]
+[[measurements]]
+active = "logitp"
+active_kind = "scalar"
+family = "geometric_logit"
+group = "scalar_gallery"
+max_abs_error = 7.048583938740194e-12
+max_relative_error = 3.540145537759318e-15
+n = 1000
+
+    [measurements.returned_gradient]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 570.0
+    times_ns = [561.0, 570.0, 570.0, 530.0, 570.0]
+[[measurements]]
+active = "logitp"
+active_kind = "scalar"
+family = "geometric_logit"
+group = "scalar_gallery"
+max_abs_error = 2.0809238776564598e-8
+max_relative_error = 1.0438993149950169e-13
+n = 100000
+
+    [measurements.returned_gradient]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 49328.0
+    times_ns = [48156.0, 48276.0, 49328.0, 50519.0, 49768.0]
+[[measurements]]
+active = "x"
+active_kind = "vector"
+family = "uniform_bounded"
+group = "scalar_gallery"
+max_abs_error = 0.0
+max_relative_error = 0.0
+max_value_error = 0.0
+n = 1000
+
+    [measurements.caller_owned_gradient]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 5287.0
+    times_ns = [5277.0, 5277.0, 5287.0, 5287.0, 5287.0]
+
+    [measurements.returned_gradient]
+    allocs = [1, 1, 1, 1, 1]
+    bytes = [8128, 8128, 8128, 8128, 8128]
+    median_allocs = 1
+    median_bytes = 8128
+    median_ns = 2514.0
+    times_ns = [2583.0, 2514.0, 2563.0, 2123.0, 2153.0]
+[[measurements]]
+active = "x"
+active_kind = "vector"
+family = "uniform_bounded"
+group = "scalar_gallery"
+max_abs_error = 0.0
+max_relative_error = 0.0
+max_value_error = 0.0
+n = 100000
+
+    [measurements.caller_owned_gradient]
+    allocs = [0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 506209.0
+    times_ns = [512977.0, 509953.0, 506209.0, 501091.0, 502093.0]
+
+    [measurements.returned_gradient]
+    allocs = [2, 2, 2, 2, 2]
+    bytes = [800048, 800048, 800048, 800048, 800048]
+    median_allocs = 2
+    median_bytes = 800048
+    median_ns = 210821.0
+    times_ns = [215708.0, 210821.0, 211372.0, 208127.0, 207986.0]
+[[measurements]]
+active = "x"
+active_kind = "vector"
+family = "mvnormal_cholesky"
+group = "structured"
+max_abs_error = 0.0
+max_relative_error = 0.0
+max_value_error = 0.0
+n = 4
+
+    [measurements.caller_owned_gradient]
+    allocs = [10, 10, 10, 10, 10]
+    bytes = [688, 688, 688, 688, 688]
+    median_allocs = 10
+    median_bytes = 688
+    median_ns = 891.0
+    times_ns = [881.0, 911.0, 891.0, 891.0, 891.0]
+
+    [measurements.returned_gradient]
+    allocs = [11, 11, 11, 11, 11]
+    bytes = [784, 784, 784, 784, 784]
+    median_allocs = 11
+    median_bytes = 784
+    median_ns = 881.0
+    times_ns = [881.0, 871.0, 911.0, 901.0, 881.0]
+[[measurements]]
+active = "x"
+active_kind = "vector"
+family = "mvnormal_cholesky"
+group = "structured"
+max_abs_error = 0.0
+max_relative_error = 0.0
+max_value_error = 0.0
+n = 16
+
+    [measurements.caller_owned_gradient]
+    allocs = [10, 10, 10, 10, 10]
+    bytes = [1264, 1264, 1264, 1264, 1264]
+    median_allocs = 10
+    median_bytes = 1264
+    median_ns = 1292.0
+    times_ns = [1291.0, 1261.0, 1823.0, 1292.0, 1302.0]
+
+    [measurements.returned_gradient]
+    allocs = [11, 11, 11, 11, 11]
+    bytes = [1456, 1456, 1456, 1456, 1456]
+    median_allocs = 11
+    median_bytes = 1456
+    median_ns = 1272.0
+    times_ns = [1272.0, 1271.0, 1281.0, 1281.0, 1251.0]
+[[measurements]]
+active = "x"
+active_kind = "vector"
+family = "mvnormal_cholesky"
+group = "structured"
+max_abs_error = 0.0
+max_relative_error = 0.0
+max_value_error = 0.0
+n = 64
+
+    [measurements.caller_owned_gradient]
+    allocs = [10, 10, 10, 10, 10]
+    bytes = [3568, 3568, 3568, 3568, 3568]
+    median_allocs = 10
+    median_bytes = 3568
+    median_ns = 3415.0
+    times_ns = [3345.0, 3415.0, 3425.0, 3515.0, 3374.0]
+
+    [measurements.returned_gradient]
+    allocs = [11, 11, 11, 11, 11]
+    bytes = [4144, 4144, 4144, 4144, 4144]
+    median_allocs = 11
+    median_bytes = 4144
+    median_ns = 3555.0
+    times_ns = [3405.0, 3455.0, 3555.0, 3615.0, 3615.0]
+[[measurements]]
+active = "x"
+active_kind = "vector"
+family = "mvnormal_cholesky"
+group = "structured"
+max_abs_error = 0.0
+max_relative_error = 0.0
+max_value_error = 0.0
+n = 128
+
+    [measurements.caller_owned_gradient]
+    allocs = [10, 10, 10, 10, 10]
+    bytes = [6640, 6640, 6640, 6640, 6640]
+    median_allocs = 10
+    median_bytes = 6640
+    median_ns = 7921.0
+    times_ns = [9413.0, 7800.0, 7681.0, 7921.0, 9003.0]
+
+    [measurements.returned_gradient]
+    allocs = [11, 11, 11, 11, 11]
+    bytes = [7728, 7728, 7728, 7728, 7728]
+    median_allocs = 11
+    median_bytes = 7728
+    median_ns = 8011.0
+    times_ns = [8011.0, 7921.0, 9233.0, 7901.0, 8032.0]
+
+[pins]
+differentiationinterface_version = "0.7.21"
+enzyme_version = "0.13.199"
+julia_version = "1.10.11"
+reactivekernels_dirty = false
+reactivekernels_sha = "7a267fd1a69f82864bd5d76d268f70b6aef3711f"
+
+[protocol]
+backend = "AutoEnzyme(mode = Enzyme.Reverse)"
+caller_owned_surface = "ad_value_and_gradient!"
+estimator = "median of per-round BenchmarkTools minimum times"
+normal_sizes = [1, 1000, 10000, 30000, 100000, 1000000]
+preparation_in_timed_region = false
+returned_surface = "ad_gradient"
+rounds = 5
+samples_per_round = 200
+scalar_destination_policy = "scalar gradients use ad_gradient and return an isbits Float64"
+scalar_gallery_families = ["cauchy_location_scale", "laplace_location_scale", "bernoulli_logit", "lognormal_logscale", "exponential_logscale", "geometric_logit", "uniform_bounded"]
+scalar_gallery_sizes = [1000, 100000]
+seconds_per_round = 0.25
+structured_sizes = [4, 16, 64, 128]
+
+[source_receipts.normal]
+generated_at = "2026-08-31T17:45:31.725Z"
+reactivekernels_sha = "5a76b24e9746c82261be0e5c13acb807b14af0ec"
+schema = "distribution-logdensity-v1"
+
+[source_receipts.scalar_gallery]
+generated_at = "2026-08-31T13:53:24.060Z"
+reactivekernels_sha = "410233fac0cb9b9e06cd82fcbcfc37ea8d6ca15d"
+schema = "scalar-distribution-gallery-v1"
+
+[source_receipts.structured]
+generated_at = "2026-08-31T13:48:03.939Z"
+reactivekernels_sha = "d72c7444e7d4a6d7837f8bf2555dae11969019b3"
+schema = "structured-distribution-logdensity-v1"
