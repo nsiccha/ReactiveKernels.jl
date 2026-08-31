@@ -9,6 +9,7 @@ using MCMCDiagnosticTools
 using Pkg
 using Random
 using ReactiveKernels
+using ReactiveKernelsNUTSExamples
 using Statistics
 
 # Every sampler's runtime gradient goes through this shared reverse-mode Enzyme
@@ -252,7 +253,7 @@ function prepare_reactive_target(target)
             -value
         end
         dimension = length(initial_position)
-        ReactiveKernels.reactive_nuts_group(
+        ReactiveKernelsNUTSExamples.reactive_nuts_group(
             potential_gradient!,
             Matrix{Float64}(I, dimension, dimension),
             copy(initial_position),
@@ -271,18 +272,18 @@ function run_reactive(context; seed, n_warmup, n_draws, max_depth,
     reset_counts!(context.target)
     timed = @timed begin
         # nuts_state on the flat reactive_nuts_group returns a CompiledNUTSState.
-        sampler = ReactiveKernels.nuts_state(
+        sampler = ReactiveKernelsNUTSExamples.nuts_state(
             copy(context.point);
             rng = Xoshiro(seed),
             step_f = ReactiveKernels.partial(
-                ReactiveKernels.leapfrog!; stepsize = 0.1,
+                ReactiveKernelsNUTSExamples.leapfrog!; stepsize = 0.1,
             ),
             max_depth,
         )
-        warmup = ReactiveKernels.warmup!(
+        warmup = ReactiveKernelsNUTSExamples.warmup!(
             sampler, n_warmup; target_accept,
         )
-        chain = ReactiveKernels.sample!(sampler, n_draws)
+        chain = ReactiveKernelsNUTSExamples.sample!(sampler, n_draws)
         (; chain, warmup)
     end
     (; chain, warmup) = timed.value

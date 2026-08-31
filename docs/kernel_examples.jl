@@ -5,6 +5,7 @@ using Documenter
 using LinearAlgebra
 using Markdown
 using ReactiveKernels
+using ReactiveKernelsStreamingStats
 using TOML
 
 struct RawHTML
@@ -319,11 +320,12 @@ end
     render_online_stats_welford_source() -> Markdown.MD
 
 Render the exact build-loaded, method-bearing `@kernel welford_var` definition
-from `examples/online_stats.jl`. The page therefore cannot drift from the
+from `ReactiveKernelsStreamingStats`. The page therefore cannot drift from the
 executable ReactiveHMC-shaped source it describes.
 """
 function render_online_stats_welford_source()
-    path = joinpath(pkgdir(ReactiveKernels), "examples", "online_stats.jl")
+    path = joinpath(pkgdir(ReactiveKernelsStreamingStats), "src",
+                    "ReactiveKernelsStreamingStats.jl")
     source = read(path, String)
     Markdown.MD(Any[Markdown.Code(
         "julia", _source_between(
@@ -737,9 +739,9 @@ docs_nuts_potential_gradient!(gradient, position) =
     (gradient .= position; sum(abs2, position) / 2)
 
 dimension = 4
-# reactive_nuts_group is example-owned (loaded via ReactiveKernelsNUTSExample);
+# reactive_nuts_group is owned by the external NUTS examples package;
 # it compiles init/fwd/bwd Hamiltonian + dham + diverged into one ReactiveProgram.
-group = ReactiveKernels.reactive_nuts_group(
+group = ReactiveKernelsNUTSExamples.reactive_nuts_group(
     docs_nuts_potential_gradient!,
     Matrix(1.0 * I, dimension, dimension),
     zeros(dimension),
@@ -769,6 +771,7 @@ representative reactive getter rather than a whole-program listing.
 function render_nuts_compiled_kernel_dag(mod::Module)
     source = strip(NUTS_COMPILED_KERNEL_SOURCE, '\n')
     Core.eval(mod, :(using ReactiveKernels))
+    Core.eval(mod, :(using ReactiveKernelsNUTSExamples))
     _evaluate_source(mod, source)
     program = Core.eval(mod, :program)
     group = Core.eval(mod, :group)
@@ -882,6 +885,7 @@ function _run_source_locked_interaction(source::AbstractString, expected::Symbol
     displayed = strip(source, '\n')
     sandbox = Module(gensym(:SourceLockedKernelInteraction), true, true)
     Core.eval(sandbox, :(using ReactiveKernels))
+    Core.eval(sandbox, :(using ReactiveKernelsNUTSExamples))
     _evaluate_source(sandbox, displayed)
     interaction = Core.eval(sandbox, :docs_interaction)
     interaction.name === expected || error(

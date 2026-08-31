@@ -17,8 +17,8 @@
 #   * RNG effects → the pre-generated (momentum, dirs, exps) bundle consumed by counters.
 #
 # This file is Reactant-FREE (plain Julia); Reactant tracing happens only at the
-# gate's `@compile`. Any Reactant make_tracer/traced_type glue lives in
-# ext/ReactiveKernelsReactantExt.jl.
+# gate's `@compile`. Its optional compiler glue lives in the package's
+# `ReactiveKernelsNUTSExamplesReactantExt` weak extension.
 #
 # BUILD STATE: flat tensor-state SoA + frame round-trip, tensor numerics, and the
 # full masked CFG emitter are implemented below. Reactant owns only the final
@@ -614,7 +614,7 @@ function nuts_reactant_rebundle(st, bundle)
 end
 
 function nuts_reactant_compile(C::_CompiledNutsReactant, state; sync::Bool=false)
-    ext = Base.get_extension(@__MODULE__, :ReactiveKernelsReactantExt)
+    ext = Base.get_extension(@__MODULE__, :ReactiveKernelsNUTSExamplesReactantExt)
     ext === nothing && throw(ArgumentError("nuts_reactant_compile requires loading Reactant"))
     ext.compile_nuts_reactant_executable(C.transition, state; sync)
 end
@@ -655,7 +655,7 @@ function compile_nuts_reactant(pf::_PreparedFactory, skel, refresh_skel, nuts_ro
     plan = _nr_plan(skel)
     cfg = merge(_nr_config(pf, frame), (root_mid=plan.root_mid,
         root_entry=plan.root_entry, root_pos=plan.midpos[plan.root_mid]))
-    ext = Base.get_extension(@__MODULE__, :ReactiveKernelsReactantExt)
+    ext = Base.get_extension(@__MODULE__, :ReactiveKernelsNUTSExamplesReactantExt)
     ext === nothing && throw(ArgumentError("compile_nuts_reactant requires loading Reactant"))
     transition = ext.compile_nuts_reactant_transition(plan, cfg)
     _CompiledNutsReactant(transition, plan, cfg, native.RootToken)

@@ -35,7 +35,10 @@ function _run_pinned_comparison()
         Pkg.activate(environment)
         Pkg.add(Pkg.PackageSpec(name = "Reactant", version = _REACTANT_VERSION))
         Pkg.pin(Pkg.PackageSpec(name = "Reactant"))
-        Pkg.develop(path = root)
+        Pkg.develop([
+            Pkg.PackageSpec(path = root),
+            Pkg.PackageSpec(path = joinpath(root, "packages", "ReactiveKernelsNUTSExamples")),
+        ])
         Pkg.instantiate()
         Pkg.precompile()
         command = addenv(

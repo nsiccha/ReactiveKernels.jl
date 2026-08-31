@@ -1,7 +1,8 @@
 using ReactiveKernels, LinearAlgebra, Random
 const RK = ReactiveKernels
-include(joinpath("/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-hmc","examples","nuts_runtime.jl"))
-module Fix; include(joinpath("/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-hmc","benchmark","nuts_kernel_authoring_fixture.jl")); end
+const ROOT = normpath(joinpath(@__DIR__, "..", ".."))
+include(joinpath(ROOT, "examples", "nuts_runtime.jl"))
+module Fix; include(joinpath(@__DIR__, "..", "nuts_kernel_authoring_fixture.jl")); end
 
 irs = RK.method_irs(Fix.nuts_state)
 rec = RK.defunctionalized_mids(irs)

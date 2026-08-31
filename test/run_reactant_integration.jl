@@ -10,6 +10,7 @@ phasepoint_testfile = joinpath(@__DIR__, "test_reactivehmc_phasepoint_reactant.j
 example_packages = (
     joinpath(root, "packages", "ReactiveKernelsCompatibilityExamples"),
     joinpath(root, "packages", "ReactiveKernelsDistributionKernels"),
+    joinpath(root, "packages", "ReactiveKernelsNUTSExamples"),
     joinpath(root, "packages", "ReactiveKernelsPPLExamples"),
 )
 

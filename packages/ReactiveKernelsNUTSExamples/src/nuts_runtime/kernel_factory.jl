@@ -1,6 +1,6 @@
 # External NUTS compiler-acceptance factory/runtime extension.
 #
-# Loaded only by examples/nuts_runtime.jl. Nothing in this file is package API;
+# Loaded only by ReactiveKernelsNUTSExamples. Nothing in this file is core package API;
 # the generic package owns KernelSpec/MethodIR/planning and this example owns its
 # sampler frame, diagnostics, certificates, and domain-specific attachment seam.
 

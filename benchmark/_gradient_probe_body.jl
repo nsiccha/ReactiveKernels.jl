@@ -31,9 +31,9 @@ function make_group(D)
         gradient .*= -1
         -value
     end
-    RK.reactive_nuts_group(potential_gradient!, Matrix{Float64}(I, D, D), copy(_pos(D)), zeros(D))
+    ReactiveKernelsNUTSExamples.reactive_nuts_group(potential_gradient!, Matrix{Float64}(I, D, D), copy(_pos(D)), zeros(D))
 end
-_sf() = RK.partial(RK.leapfrog!; stepsize = 0.1)
+_sf() = RK.partial(ReactiveKernelsNUTSExamples.leapfrog!; stepsize = 0.1)
 
 const _SINK = Ref(0.0)
 
@@ -58,19 +58,19 @@ function run(; D = 4)
     # compile_paths is meant to cover). Timed as the cold pass.
     coldgroup = make_group(D)
     cold = @timed begin
-        s = RK.nuts_state(coldgroup; rng = Xoshiro(1), step_f = _sf(), max_depth = 6)
-        RK.warmup!(s, 50; target_accept = 0.8)
-        RK.sample!(s, 20)
+        s = ReactiveKernelsNUTSExamples.nuts_state(coldgroup; rng = Xoshiro(1), step_f = _sf(), max_depth = 6)
+        ReactiveKernelsNUTSExamples.warmup!(s, 50; target_accept = 0.8)
+        ReactiveKernelsNUTSExamples.sample!(s, 20)
     end
     println((; stage = :COLD_first_use_incl_compilation,
                seconds = cold.time, bytes = cold.bytes))
 
     # WARM stages: same concrete types, already compiled.
     g2 = make_group(D)
-    tconstruct = @timed RK.nuts_state(g2; rng = Xoshiro(2), step_f = _sf(), max_depth = 6)
+    tconstruct = @timed ReactiveKernelsNUTSExamples.nuts_state(g2; rng = Xoshiro(2), step_f = _sf(), max_depth = 6)
     sampler = tconstruct.value
-    twarmup = @timed RK.warmup!(sampler, 200; target_accept = 0.8)
-    tsample = @timed RK.sample!(sampler, 1000)
+    twarmup = @timed ReactiveKernelsNUTSExamples.warmup!(sampler, 200; target_accept = 0.8)
+    tsample = @timed ReactiveKernelsNUTSExamples.sample!(sampler, 1000)
     chain = tsample.value
     mean_steps = sum(d -> d.n_steps, chain.diagnostics) / length(chain.diagnostics)
     divergences = count(d -> d.diverged, chain.diagnostics)
@@ -89,9 +89,9 @@ function run(; D = 4)
     target = Target(D); prep = target.preparation
     x = _pos(D); grad = similar(x)
     pg!(gr, p) = (v = first(value_and_gradient!(_logp, gr, target.preparation, BACKEND, p)); gr .*= -1; -v)
-    vg = RK._grad_bundle(pg!, copy(x))
+    vg = ReactiveKernelsNUTSExamples._grad_bundle(pg!, copy(x))
     direct() = (value_and_gradient!(_logp, grad, prep, BACKEND, x); grad[1])
-    bundle() = RK._nuts_cache_apply(vg, RK._grad_bundle, pg!, x).value
+    bundle() = ReactiveKernelsNUTSExamples._nuts_cache_apply(vg, ReactiveKernelsNUTSExamples._grad_bundle, pg!, x).value
     println((; barrier = :direct_prepared_DI, ns = round(_warm_ns(direct); digits = 2),
                alloc = _alloc_slope(direct)))
     println((; barrier = :reactive_bundle, ns = round(_warm_ns(bundle); digits = 2),

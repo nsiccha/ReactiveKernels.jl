@@ -1,7 +1,9 @@
 using ReactiveKernels, LinearAlgebra, Random
+import ReactiveKernelsNUTSExamples
 const RK = ReactiveKernels
-include(joinpath("/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-hmc","examples","nuts_runtime.jl"))
-module Fix; include(joinpath("/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-hmc","benchmark","nuts_kernel_authoring_fixture.jl")); end
+const ROOT = normpath(joinpath(@__DIR__, "..", ".."))
+include(joinpath(ROOT, "examples", "nuts_runtime.jl"))
+module Fix; include(joinpath(@__DIR__, "..", "nuts_kernel_authoring_fixture.jl")); end
 # Define recorder INSIDE Random so the parentmodule domain gate admits it (no @generated world-age issue)
 Random.eval(quote
     mutable struct RecRNG <: AbstractRNG
@@ -27,13 +29,13 @@ function vals(pf,T;metric=T[2 0;0 2])
     end; d
 end
 function frame(pf,T,md;metric=T[2 0;0 2])
-    f=RK._construct_nuts_frame(pf,vals(pf,T;metric),md;step_f=RK.partial(Fix.leapfrog!;stepsize=T(.1)),stats_f=Fix.nuts_stats!,min_dham=-1000.0)
+    f=ReactiveKernelsNUTSExamples._construct_nuts_frame(pf,vals(pf,T;metric),md;step_f=RK.partial(Fix.leapfrog!;stepsize=T(.1)),stats_f=Fix.nuts_stats!,min_dham=-1000.0)
     RK.compile_prepared_initialization(pf,typeof(f.init),typeof(f.shared))(f.init,f.shared,RK.kernel_prepared_handles(pf))
-    RK._seed_nuts_children!(f); f
+    ReactiveKernelsNUTSExamples._seed_nuts_children!(f); f
 end
 for (md,seed) in ((2,20260829),(4,20260829),(4,20260830))
     fr = frame(pf, Float64, md)
-    C = RK.compile_nuts_native(pf, Fix.nuts_state, Fix.refresh_momentum!!, Fix.nuts!!, fr)
+    C = ReactiveKernelsNUTSExamples.compile_nuts_native(pf, Fix.nuts_state, Fix.refresh_momentum!!, Fix.nuts!!, fr)
     r = mkrec(seed)
     try
         C.root!(fr, C.scratch, r)

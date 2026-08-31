@@ -67,13 +67,13 @@ _ca9_full(state) = (ReactiveHMC.step!(state); state.init.pos[1])
 # --- RK compiled / oracle stage ops -------------------------------------------
 _c_ham(a) = a.group.fwd_ham
 _c_source(a) = (RK.touch!(a.group.state, a.group.handles.fwd_mom); a.group.fwd_ham)
-_c_leapfrog(a) = (RK._group_leapfrog!(a.group, Val(:fwd), 0.1); a.group.fwd_ham)
-_c_full(a) = (RK.step!(a.compiled); a.compiled.init.pos[1])
+_c_leapfrog(a) = (ReactiveKernelsNUTSExamples._group_leapfrog!(a.group, Val(:fwd), 0.1); a.group.fwd_ham)
+_c_full(a) = (ReactiveKernelsNUTSExamples.step!(a.compiled); a.compiled.init.pos[1])
 
 _o_ham(a) = a.oracle.fwd.ham
 _o_source(a) = (RK.touch!(a.oracle.fwd.state, a.oracle.fwd.handles.mom); a.oracle.fwd.ham)
-_o_leapfrog(a) = (RK.leapfrog!(a.oracle.fwd; stepsize = 0.1); a.oracle.fwd.ham)
-_o_full(a) = (RK.step!(a.oracle); a.oracle.init.pos[1])
+_o_leapfrog(a) = (ReactiveKernelsNUTSExamples.leapfrog!(a.oracle.fwd; stepsize = 0.1); a.oracle.fwd.ham)
+_o_full(a) = (ReactiveKernelsNUTSExamples.step!(a.oracle); a.oracle.init.pos[1])
 
 # --- per-arm builders (setup timed individually) ------------------------------
 function build_ca9(D)
@@ -86,16 +86,16 @@ function build_ca9(D)
 end
 function build_compiled(D)
     metric = Matrix{Float64}(I, D, D)
-    group = RK.reactive_nuts_group(_grad!, metric, _pos(D), _mom(D))
-    compiled = RK.nuts_state(group; rng = Xoshiro(2024),
-                             step_f = RK.partial(RK.leapfrog!; stepsize = 0.1), max_depth = 6)
+    group = ReactiveKernelsNUTSExamples.reactive_nuts_group(_grad!, metric, _pos(D), _mom(D))
+    compiled = ReactiveKernelsNUTSExamples.nuts_state(group; rng = Xoshiro(2024),
+                             step_f = RK.partial(ReactiveKernelsNUTSExamples.leapfrog!; stepsize = 0.1), max_depth = 6)
     (; group, compiled)
 end
 function build_oracle(D)
     metric = Matrix{Float64}(I, D, D)
-    point = RK.euclidean_phasepoint(_pot, _valgrad, metric, _pos(D), _mom(D))
-    oracle = RK._oracle_nuts_state(point; rng = Xoshiro(2024),
-                                   step_f = RK.partial(RK.leapfrog!; stepsize = 0.1), max_depth = 6)
+    point = ReactiveKernelsNUTSExamples.euclidean_phasepoint(_pot, _valgrad, metric, _pos(D), _mom(D))
+    oracle = ReactiveKernelsNUTSExamples._oracle_nuts_state(point; rng = Xoshiro(2024),
+                                   step_f = RK.partial(ReactiveKernelsNUTSExamples.leapfrog!; stepsize = 0.1), max_depth = 6)
     (; point, oracle)
 end
 
@@ -105,8 +105,8 @@ _approx(x, y; rtol = 1e-8, atol = 1e-10) = isapprox(x, y; rtol, atol)
 function gate_leapfrog_parity(D)
     ca9 = build_ca9(D); c = build_compiled(D); o = build_oracle(D)
     ReactiveHMC.leapfrog!(ca9.point; stepsize = 0.1)
-    RK._group_leapfrog!(c.group, Val(:fwd), 0.1)
-    RK.leapfrog!(o.oracle.fwd; stepsize = 0.1)
+    ReactiveKernelsNUTSExamples._group_leapfrog!(c.group, Val(:fwd), 0.1)
+    ReactiveKernelsNUTSExamples.leapfrog!(o.oracle.fwd; stepsize = 0.1)
     @assert _approx(ca9.point.pos, c.group.fwd_pos) "ca9/compiled pos parity"
     @assert _approx(ca9.point.mom, c.group.fwd_mom) "ca9/compiled mom parity"
     @assert _approx(ca9.point.ham, c.group.fwd_ham) "ca9/compiled ham parity"
@@ -121,7 +121,7 @@ end
 function gate_full_parity(D; n = 5)
     ca9 = build_ca9(D); c = build_compiled(D); o = build_oracle(D)
     for t in 1:n
-        ReactiveHMC.step!(ca9.state); RK.step!(c.compiled); RK.step!(o.oracle)
+        ReactiveHMC.step!(ca9.state); ReactiveKernelsNUTSExamples.step!(c.compiled); ReactiveKernelsNUTSExamples.step!(o.oracle)
         @assert _approx(c.compiled.group.init_pos, o.oracle.init.pos) "compiled/oracle pos parity t=$t"
         @assert c.compiled.depth == o.oracle.depth "compiled/oracle depth parity t=$t"
         @assert _approx(ca9.state.init.pos, o.oracle.init.pos; rtol = 1e-6, atol = 1e-8) "ca9/oracle pos parity t=$t"

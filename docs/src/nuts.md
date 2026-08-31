@@ -26,9 +26,9 @@ not an end-to-end sampling, adaptation, wall-time, or ESS benchmark.
 
 Packaging matters: “public” inside the fixture comments means the entry of that
 sealed external artifact, not an RK package API. The NUTS runtime, native emitter,
-compiled-reactive compatibility implementation, and domain types live under
-`examples/nuts_runtime/` and are loaded only through the explicit
-`ReactiveKernelsNUTSExample` module. A bare `using ReactiveKernels` neither loads
+compiled-reactive compatibility implementation, and domain types live in the
+`ReactiveKernelsNUTSExamples` nested package and are also available through the
+thin `ReactiveKernelsNUTSExample` launcher. A bare `using ReactiveKernels` neither loads
 nor exports them. See [Compiler capability and
 limits](compiler.md#what-the-nuts-proof-does-and-does-not-establish) for the exact
 boundary and why the two implementations prove different things.
@@ -43,13 +43,13 @@ Main.ReactiveKernelsDocs.render_nuts_status()
 Main.ReactiveKernelsDocs.render_nuts_g7_benchmark()
 ```
 
-The sealed native compiler (`examples/nuts_runtime/kernel_nuts_native.jl`,
+The sealed native compiler (`packages/ReactiveKernelsNUTSExamples/src/nuts_runtime/kernel_nuts_native.jl`,
 `_build_nuts_sampler`) and the minimal-reset external authoring fixture are
 **on `main` as compiler evidence**. The figures in the G7 panel immediately above
 measure that native acceptance artifact and come from the static receipt, not a CI perf
 run or the external `CompiledNUTSState` comparison path. RK, AdvancedHMC, and
-DynamicHMC used one shared DifferentiationInterface+Enzyme gradient and matched
-target, mass, step size, and RNG schedule; the receipt also checks gradient/work
+DynamicHMC used one shared potential-and-gradient authority and matched target,
+mass, step size, and RNG schedule; the receipt also checks gradient/work
 accounting. It does **not** measure adaptation, retained draws, ESS, or
 time-to-effective-sample.
 
@@ -67,7 +67,7 @@ control-flow graph, and the current diagnostics callback. Overflow and
 unsupported cases reject; the native adaptive API remains CPU execution.
 
 The source authority is
-[`examples/nuts_runtime/kernel_nuts_reactant.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/nuts_runtime/kernel_nuts_reactant.jl),
+[`packages/ReactiveKernelsNUTSExamples/src/nuts_runtime/kernel_nuts_reactant.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsNUTSExamples/src/nuts_runtime/kernel_nuts_reactant.jl),
 and
 [`test/test_kernel_nuts_reactant.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/test/test_kernel_nuts_reactant.jl)
 is the executable acceptance authority. The test requires one `stablehlo.while`

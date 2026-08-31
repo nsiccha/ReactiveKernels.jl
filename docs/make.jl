@@ -3,7 +3,10 @@ using ReactiveKernelsBatchingExamples
 using ReactiveKernelsCompatibilityExamples
 using ReactiveKernelsDistributionKernels
 using ReactiveKernelsKernelExamples
+using ReactiveKernelsHMCDiagnostics
+using ReactiveKernelsNUTSExamples
 using ReactiveKernelsPPLExamples
+using ReactiveKernelsStreamingStats
 
 # Opt into the external NUTS/HMC compiler-acceptance exemplar for the sampling
 # and online-statistics pages. ReactiveKernels itself deliberately does not load it.
@@ -57,6 +60,9 @@ site_pages = [
         "Distribution log densities" => "distributions.md",
         "Batched log densities" => "batched.md",
         "Non-allocating kernels" => "nonallocating.md",
+    ],
+    "Automatic differentiation" => [
+        "Prepared gradients" => "automatic-differentiation.md",
         "Evaluation throughput vs Turing.jl" => "eval-throughput.md",
     ],
     "Probabilistic programming" => [
@@ -91,6 +97,9 @@ makedocs(
         ReactiveKernelsBatchingExamples,
         ReactiveKernelsPPLExamples,
         ReactiveKernelsCompatibilityExamples,
+        ReactiveKernelsNUTSExamples,
+        ReactiveKernelsStreamingStats,
+        ReactiveKernelsHMCDiagnostics,
     ],
     format   = DocumenterVitepress.MarkdownVitepress(
         repo = "github.com/nsiccha/ReactiveKernels.jl",

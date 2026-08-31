@@ -2,7 +2,7 @@
 # effect-root / copy / transition scaffold tests (which consumed fake `_OwnerState`/`_Synth` storage) were
 # retired with that scaffold on the 4c6ed92 seam; the generic schedule-MODEL tests live in
 # test_kernel_lowering.jl (no fake storage). This suite executes the REAL captured six-handle phasepoint.
-using ReactiveKernels, Test, LinearAlgebra, Random
+using ReactiveKernels, ReactiveKernelsNUTSExamples, Test, LinearAlgebra, Random
 const RK = ReactiveKernels
 
 # ============================================================================================
@@ -428,7 +428,7 @@ const _FIXLF = _FixLF.leapfrog!
         ow, sh = _pp_construct(pf, plan, _pp_values(plan, T, d, cp))
         RK.compile_prepared_initialization(pf, typeof(ow), typeof(sh))(ow, sh, hs)   # cold init (one pgrad)
         @test cp.n == 1
-        lf = RK.compile_leapfrog(pf, typeof(ow), typeof(sh), leaf)
+        lf = ReactiveKernelsNUTSExamples.compile_leapfrog(pf, typeof(ow), typeof(sh), leaf)
         pos0 = copy(_pp_rd(plan, ow, sh, _pp_c(plan, :pos))); mom0 = copy(_pp_rd(plan, ow, sh, _pp_c(plan, :mom)))
         h = T(0.1); n0 = cp.n
         @test lf(ow, sh, hs, (stepsize = h,)) === ow             # !!-style: returns owned
@@ -452,7 +452,7 @@ const _FIXLF = _FixLF.leapfrog!
         # function-barrier warmed exact 0-B + @inferred
         cp2 = _PPFix.CountPgrad(0); o2, s2 = _pp_construct(pf, plan, _pp_values(plan, T, d, cp2))
         RK.compile_prepared_initialization(pf, typeof(o2), typeof(s2))(o2, s2, hs)
-        lf2 = RK.compile_leapfrog(pf, typeof(o2), typeof(s2), leaf)
+        lf2 = ReactiveKernelsNUTSExamples.compile_leapfrog(pf, typeof(o2), typeof(s2), leaf)
         kw = (stepsize = h,); lf2(o2, s2, hs, kw); lf2(o2, s2, hs, kw)
         @test (@allocated lf2(o2, s2, hs, kw)) == 0
         Test.@inferred lf2(o2, s2, hs, kw)
@@ -461,7 +461,7 @@ const _FIXLF = _FixLF.leapfrog!
     # stronger epsilon-scaling law). Recompute ham via the full pass each step.
     d = 3; cp = _PPFix.CountPgrad(0); ow, sh = _pp_construct(pf, plan, _pp_values(plan, Float64, d, cp))
     init = RK.compile_prepared_initialization(pf, typeof(ow), typeof(sh)); init(ow, sh, hs)
-    lf = RK.compile_leapfrog(pf, typeof(ow), typeof(sh), leaf)
+    lf = ReactiveKernelsNUTSExamples.compile_leapfrog(pf, typeof(ow), typeof(sh), leaf)
     ham0 = _pp_rd(plan, ow, sh, _pp_c(plan, :ham))
     for _ in 1:20; lf(ow, sh, hs, (stepsize = 0.05,)); init(ow, sh, hs); end
     @test abs(_pp_rd(plan, ow, sh, _pp_c(plan, :ham)) - ham0) < 0.01
@@ -473,7 +473,7 @@ end
     tg = _PPFix.ThrowOnGrad(0, 2)                                # ok at init (call 1); throws on the post-drift grad
     ow, sh = _pp_construct(pf, plan, _pp_values(plan, Float64, d, tg))
     RK.compile_prepared_initialization(pf, typeof(ow), typeof(sh))(ow, sh, hs)     # grad call #1 (init)
-    lf = RK.compile_leapfrog(pf, typeof(ow), typeof(sh), leaf)
+    lf = ReactiveKernelsNUTSExamples.compile_leapfrog(pf, typeof(ow), typeof(sh), leaf)
     @test_throws ErrorException lf(ow, sh, hs, (stepsize = h,))                    # post-drift grad #2 THROWS
     # executed prefix committed (kick-1 mom + drift pos blessed); the throwing grad left dpot DIRTY
     pos_pfx = copy(_pp_rd(plan, ow, sh, _pp_c(plan, :pos))); mom_pfx = copy(_pp_rd(plan, ow, sh, _pp_c(plan, :mom)))
@@ -508,10 +508,10 @@ end
     leafq = RK.method_irs(modx.leapfrog!)[1]
     pf = _pp_pf(); plan = RK.kernel_prepared_plan(pf); d = 3
     ow, sh = _pp_construct(pf, plan, _pp_values(plan, Float64, d, _PPFix.CountPgrad(0)))
-    @test RK.compile_leapfrog(pf, typeof(ow), typeof(sh), leafq) isa Function      # BEFORE rebind: fine
+    @test ReactiveKernelsNUTSExamples.compile_leapfrog(pf, typeof(ow), typeof(sh), leafq) isa Function      # BEFORE rebind: fine
     Core.eval(modx, :(module Evil; oftype(a, b) = error("evil"); end))
     Core.eval(modx, :(Ops = Evil))                                                 # move the authored qualifier
-    @test_throws RK._LLowerReject RK.compile_leapfrog(pf, typeof(ow), typeof(sh), leafq)
+    @test_throws RK._LLowerReject ReactiveKernelsNUTSExamples.compile_leapfrog(pf, typeof(ow), typeof(sh), leafq)
 end
 
 @testset "executable leapfrog — a DIRTY non-producible source is REJECTED before any write/pgrad (RK 09:14)" begin
@@ -519,7 +519,7 @@ end
     leaf = RK.method_irs(_PPFix.leapfrog!)[1]; d = 3
     cp = _PPFix.CountPgrad(0); ow, sh = _pp_construct(pf, plan, _pp_values(plan, Float64, d, cp))
     RK.compile_prepared_initialization(pf, typeof(ow), typeof(sh))(ow, sh, hs)     # VALID init
-    lf = RK.compile_leapfrog(pf, typeof(ow), typeof(sh), leaf)
+    lf = ReactiveKernelsNUTSExamples.compile_leapfrog(pf, typeof(ow), typeof(sh), leaf)
     pos_b = copy(_pp_rd(plan, ow, sh, _pp_c(plan, :pos))); mom_b = copy(_pp_rd(plan, ow, sh, _pp_c(plan, :mom)))
     n_b = cp.n
     # explicitly KILL the owned `mom` non-producible source mask (kick-1 reads it FIRST, authored order)

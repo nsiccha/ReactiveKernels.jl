@@ -10,7 +10,12 @@ ReactiveKernels
 │   ├── ReactiveKernelsKernelExamples
 │   └── ReactiveKernelsPPLExamples
 ├── ReactiveKernelsBatchingExamples
-└── ReactiveKernelsCompatibilityExamples
+├── ReactiveKernelsCompatibilityExamples
+├── ReactiveKernelsNUTSExamples
+├── ReactiveKernelsStreamingStats
+└── ReactiveKernelsHMCDiagnostics
+    ├── ReactiveKernelsNUTSExamples
+    └── ReactiveKernelsStreamingStats
 
 docs → every package above
 ```
@@ -38,12 +43,8 @@ versions; `setup.jl` remains the Julia-1.10-compatible source of local path
 development. CI runs the same path development explicitly rather than assuming
 that root `Pkg.test()` recurses into nested packages.
 
-The NUTS compiler exemplar and its online-diagnostics consumers remain at the
-legacy `examples/nuts_runtime` boundary for the moment. Their current loader
-injects private backend definitions into `ReactiveKernels`; moving those files
-unchanged would create a package that only pretends to own its namespace. The
-active generic-control extraction must first expose the reviewed callable
-backend hook. Once it does, the remaining DAG is:
+The NUTS compiler exemplar and online-statistics consumers are separate nested
+packages with an acyclic dependency graph:
 
 ```text
 ReactiveKernelsNUTSExamples → ReactiveKernels
@@ -55,6 +56,7 @@ ReactiveKernelsHMCDiagnostics → {
 docs → all three
 ```
 
-That staging boundary preserves the byte-locked NUTS source, independent eager
-oracle, native/Reactant parity, and the rule that bare `using ReactiveKernels`
-loads no sampler API.
+The legacy `examples/nuts_runtime.jl` and `examples/online_stats.jl` files are
+thin launchers only. Package-owned source preserves the byte-locked NUTS fixture,
+independent eager oracle, native/Reactant parity, and the rule that bare
+`using ReactiveKernels` loads no sampler API.
