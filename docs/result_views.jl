@@ -290,11 +290,16 @@ function render_distribution_benchmarks()
         if row["rk_reactant"]["median_ns"] < row["rk_native"]["median_ns"])
     largest_n = Int(largest["n"])
     crossover_n = Int(crossover["n"])
+    shared_control_ratio = round(
+        largest["rk_native"]["median_ns"] /
+        largest["rk_direct_native"]["median_ns"];
+        digits = 2,
+    )
     summary = "At N=$largest_n, native RK is " *
         "$(ratio("distributions_native", "rk_native"))× faster than Distributions and " *
         "$(ratio("probability_measures_native", "rk_native"))× faster than " *
-        "ProbabilityMeasures. The shared object is " *
-        "$(ratio("rk_direct_native", "rk_native"))× the speed of the one-off RK control. " *
+        "ProbabilityMeasures. The shared-object/one-off-control runtime ratio is " *
+        "$shared_control_ratio× (1× is identical). " *
         "RK + Reactant is " *
         "$(ratio("rk_native", "rk_reactant"))× faster than native RK and " *
         "$(ratio("probability_measures_reactant", "rk_reactant"))× faster than " *

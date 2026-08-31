@@ -119,6 +119,12 @@ function validate_distribution_receipt(path::AbstractString)
                         "N=$n $name reduction must remain zero-allocation")
             end
         end
+        if haskey(row, "rk_native") && haskey(row, "rk_direct_native")
+            shared_ratio = Float64(row["rk_native"]["median_ns"]) /
+                           Float64(row["rk_direct_native"]["median_ns"])
+            require(shared_ratio <= 1.10,
+                    "N=$n shared RK object exceeds the one-off control by more than 10%")
+        end
     end
 
     amortization = receipt["reactant_amortization"]
