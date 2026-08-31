@@ -6,7 +6,7 @@ Main.ReactiveKernelsDocs.render_result_assets()
 
 This page measures Reactant on the exact executable model documented on the
 [Eight Schools kernel page](eight-schools.md). The benchmark imports
-`EIGHT_SCHOOLS_SOURCE` and `evaluate_eight_schools_source` from
+`EIGHT_SCHOOLS_SOURCE` and `build_eight_schools_graph` from
 `ReactiveKernelsPPLExamples`; it does not copy the model, rewrite a density, or
 introduce a Reactant-only mathematical path.
 

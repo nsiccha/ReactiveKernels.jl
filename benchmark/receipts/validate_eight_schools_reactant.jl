@@ -140,20 +140,24 @@ function validate_eight_schools_reactant_receipt(
             haskey(only(primal_matches), "rk_native")
         require(get(row, "rk_native_supported", false) == native_expected,
                 "$boundary / $outcome native support drifted from primal receipt")
-        require(haskey(row, "rk_native") == native_expected,
+        native_present = haskey(row, "rk_native")
+        require(native_present == native_expected,
                 "$boundary / $outcome native measurement support mismatch")
 
-        if native_expected
+        if native_expected && native_present
             native = row["rk_native"]
             require(length(get(native, "times_ns", Float64[])) >= 20,
                     "$boundary / $outcome native needs twenty timing rounds")
             if haskey(native, "times_ns") && !isempty(native["times_ns"])
                 require(all(>(0), native["times_ns"]),
                         "$boundary / $outcome native has non-positive timing")
-                require(isapprox(Float64(native["median_ns"]),
-                                 _eight_schools_reactant_median(native["times_ns"]);
-                                 rtol = 1e-12),
-                        "$boundary / $outcome native median mismatch")
+                require(haskey(native, "median_ns"),
+                        "$boundary / $outcome native median missing")
+                haskey(native, "median_ns") && require(
+                    isapprox(Float64(native["median_ns"]),
+                             _eight_schools_reactant_median(native["times_ns"]);
+                             rtol = 1e-12),
+                    "$boundary / $outcome native median mismatch")
             end
             require(Int(get(native, "calls_per_round", 0)) > 0,
                     "$boundary / $outcome native calls_per_round missing")
@@ -181,10 +185,13 @@ function validate_eight_schools_reactant_receipt(
                 if haskey(result, "times_ns") && !isempty(result["times_ns"])
                     require(all(>(0), result["times_ns"]),
                             "$boundary / $outcome Reactant has non-positive timing")
-                    require(isapprox(Float64(result["median_ns"]),
-                                     _eight_schools_reactant_median(result["times_ns"]);
-                                     rtol = 1e-12),
-                            "$boundary / $outcome Reactant median mismatch")
+                    require(haskey(result, "median_ns"),
+                            "$boundary / $outcome Reactant median missing")
+                    haskey(result, "median_ns") && require(
+                        isapprox(Float64(result["median_ns"]),
+                                 _eight_schools_reactant_median(result["times_ns"]);
+                                 rtol = 1e-12),
+                        "$boundary / $outcome Reactant median mismatch")
                 end
                 require(Int(get(result, "calls_per_round", 0)) > 0,
                         "$boundary / $outcome Reactant calls_per_round missing")
