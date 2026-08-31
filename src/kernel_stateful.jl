@@ -439,6 +439,12 @@ struct _KernelEndpointTemplates{B,N,A,F}
 end
 
 _kernel_endpoint_is_bang(name::Symbol) = endswith(String(name), "!")
+function _kernel_endpoint_is_bang(name)
+    name isa Expr && name.head === :(.) && length(name.args) == 2 || return false
+    leaf = name.args[2]
+    leaf = leaf isa QuoteNode ? leaf.value : leaf
+    leaf isa Symbol && _kernel_endpoint_is_bang(leaf)
+end
 
 function _kernel_endpoint_has_nonstraight(x)
     x isa Expr || return false
@@ -455,8 +461,7 @@ function _kernel_endpoint_has_mutation(x)
         lhs = x.args[1]
         (lhs isa Expr && lhs.head in (:(.), :ref)) && return true
     elseif x.head === :call && !isempty(x.args)
-        callee = x.args[1]
-        callee isa Symbol && _kernel_endpoint_is_bang(callee) && return true
+        _kernel_endpoint_is_bang(x.args[1]) && return true
     end
     any(_kernel_endpoint_has_mutation, x.args)
 end
@@ -1182,7 +1187,11 @@ function _kernel_stateful_expand(name, signature_inputs, call_signature, block,
                  _kernel_mode1_callee_pairs(signature_inputs, recipe_stmts, methods),
                  __module__),
              Expr(:call, _kernel_capture_type_authorities, __module__, QuoteNode(Tuple(annotation_names))),
-             endpoint_templates)))
+             # Endpoint recipes are authored in the caller's module just like the
+             # owner spec. Escaping the generated builder preserves imported and
+             # module-qualified pure callees (`erfc`, `SpecialFunctions.erfc`) as
+             # ordinary Julia global bindings instead of resolving them in RK.
+             esc(endpoint_templates))))
 end
 
 # --- Mode-2 free-method recognition (V7 implicit-field pivot) ----------------

@@ -56,6 +56,33 @@ end
 
 end
 
+module KernelObjectPureCalleeFixture
+using ReactiveKernels
+
+module PureMath
+export curve
+const SHIFT = 0.25
+curve(x) = x^2 + SHIFT
+end
+
+using .PureMath: curve
+
+@kernel bare_external() = begin
+    endpoint(x::Float64)::Float64 = curve(x)
+end
+
+@kernel qualified_external() = begin
+    endpoint(x::Float64)::Float64 = PureMath.curve(x)
+end
+
+# A qualified bang call is not silently advertised as a pure endpoint. It stays
+# on the stateful/effectful method path, where its effects can be accounted for.
+@kernel qualified_effect() = begin
+    endpoint(xs::Vector{Int})::Vector{Int} = Base.push!(xs, 1)
+end
+
+end
+
 @testset "transparent pure kernel objects and residual endpoints" begin
     F = KernelObjectAuthoringFixture
 
@@ -70,6 +97,11 @@ end
           prepare(F.normal.logpdf)(0.0, 2.0, 1.0)
     @test !occursin("KernelSpec", sprint(show,
         code_expr(plan(F.nested_normal_logpdf))))
+
+    P = KernelObjectPureCalleeFixture
+    @test prepare(P.bare_external.endpoint)(2.0) == 4.25
+    @test prepare(P.qualified_external.endpoint)(2.0) == 4.25
+    @test isempty(ReactiveKernels.kernel_endpoint_names(P.qualified_effect))
 
     @test_throws ArgumentError @macroexpand @kernel duplicate_endpoints() = begin
         endpoint(x::Float64)::Float64 = x
