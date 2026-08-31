@@ -61,15 +61,20 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
             @test !occursin("Distributions", string(code_expr(scale_kernel)))
             @test !occursin("Distributions", string(code_expr(logscale_kernel)))
 
+            scale_plan = plan(spec;
+                have = (:x, :location, :scale), want = :logdensity)
+            logscale_plan = plan(spec;
+                have = (:x, :location, :log_scale), want = :logdensity)
             both_plan = plan(spec;
                 have = (:x, :location, :scale, :log_scale),
                 want = :logdensity)
-            selected_inputs = Dict(
-                only(recipe.outputs).name =>
-                    map(input -> input.name, recipe.inputs)
-                for recipe in both_plan.recipes)
-            @test selected_inputs[:standardized] == (:x, :location, :scale)
-            @test selected_inputs[:negative_log_scale] == (:log_scale,)
+            recipe_outputs(selected_plan) =
+                [only(recipe.outputs).name for recipe in selected_plan.recipes]
+            @test recipe_outputs(scale_plan) ==
+                  [:log_scale, :standardized, :logdensity]
+            @test recipe_outputs(logscale_plan) ==
+                  [:scale, :standardized, :logdensity]
+            @test recipe_outputs(both_plan) == [:standardized, :logdensity]
         end
 
         observations = [28.0, 8.0, -3.0, 7.0]

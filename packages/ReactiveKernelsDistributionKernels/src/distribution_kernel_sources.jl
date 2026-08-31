@@ -11,16 +11,11 @@ const NORMAL_LOGDENSITY_SOURCE = raw"""
 @kernel normal_logdensity(
         x::Float64, location::Float64,
         scale::Float64, log_scale::Float64) = begin
-    # Either parameterization alone has equal total cost. With both in HAVE,
-    # the planner mixes the direct division and direct negative log scale.
-    @recipe (cost = 1.0) standardized::Float64 =
-        (x - location) / scale
-    @recipe (cost = 2.0) standardized::Float64 =
-        (x - location) / exp(log_scale)
-    @recipe (cost = 2.0) negative_log_scale::Float64 = -log(scale)
-    @recipe (cost = 1.0) negative_log_scale::Float64 = -log_scale
+    scale::Float64 = exp(log_scale)
+    log_scale::Float64 = log(scale)
+    standardized::Float64 = (x - location) / scale
     logdensity::Float64 =
-        -0.5 * log(2π) + negative_log_scale - 0.5 * standardized^2
+        -0.5 * log(2π) - log_scale - 0.5 * standardized^2
 end
 """
 
@@ -28,16 +23,11 @@ const CAUCHY_LOGDENSITY_SOURCE = raw"""
 @kernel cauchy_logdensity(
         x::Float64, location::Float64,
         scale::Float64, log_scale::Float64) = begin
-    # Either parameterization alone has equal total cost. With both in HAVE,
-    # the planner mixes the direct division and direct negative log scale.
-    @recipe (cost = 1.0) standardized::Float64 =
-        (x - location) / scale
-    @recipe (cost = 2.0) standardized::Float64 =
-        (x - location) / exp(log_scale)
-    @recipe (cost = 2.0) negative_log_scale::Float64 = -log(scale)
-    @recipe (cost = 1.0) negative_log_scale::Float64 = -log_scale
+    scale::Float64 = exp(log_scale)
+    log_scale::Float64 = log(scale)
+    standardized::Float64 = (x - location) / scale
     logdensity::Float64 =
-        -log(π) + negative_log_scale - log1p(standardized^2)
+        -log(π) - log_scale - log1p(standardized^2)
 end
 """
 
