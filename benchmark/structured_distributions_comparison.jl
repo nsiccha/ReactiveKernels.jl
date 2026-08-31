@@ -38,8 +38,8 @@ _pm_logdensity(d, x) = ProbabilityMeasures.logdensityof(d, x)
 _distributions_logpdf(d, x) = Distributions.logpdf(d, x)
 
 _compile_rk_mvn(k, x, μ, L) = @compile sync = true k(x, μ, L)
-_compile_rk_ar1(k, x, μ, ϕ, logσ) =
-    @compile sync = true k(x, μ, ϕ, logσ)
+_compile_rk_ar1(k, x, μ, ϕ, log_scale) =
+    @compile sync = true k(x, μ, ϕ, log_scale)
 _compile_pm(d, x) = @compile sync = true _pm_logdensity(d, x)
 _compile_distributions(d, x) =
     @compile sync = true _distributions_logpdf(d, x)
@@ -79,12 +79,12 @@ function _mvn_inputs(n)
 end
 
 function _ar1_inputs(n)
-    μ, ϕ, logσ = 0.2, 0.65, log(0.7)
-    σ = exp(logσ)
+    μ, ϕ, log_scale = 0.2, 0.65, log(0.7)
+    σ = exp(log_scale)
     x = μ .+ [0.4sin(0.23i) + 0.15cos(0.41i) for i in 1:n]
     covariance = [σ^2 / (1 - ϕ^2) * ϕ^abs(i - j) for i in 1:n, j in 1:n]
     L = Matrix(cholesky(Symmetric(covariance)).L)
-    (; x, μ, ϕ, logσ, mean = fill(μ, n), L)
+    (; x, μ, ϕ, log_scale, mean = fill(μ, n), L)
 end
 
 function _package_version(name)
@@ -207,7 +207,7 @@ function run_benchmark()
         ar = _ar1_inputs(n)
         pm_ar = ProbabilityMeasures.MvNormal(ar.mean, ar.L)
         dist_ar = Distributions.MvNormal(ar.mean, Symmetric(ar.L * ar.L'))
-        ar_reference = ar1_kernel(ar.x, ar.μ, ar.ϕ, ar.logσ)
+        ar_reference = ar1_kernel(ar.x, ar.μ, ar.ϕ, ar.log_scale)
         ar_values = (
             ar_reference, _distributions_logpdf(dist_ar, ar.x),
             _pm_logdensity(pm_ar, ar.x),
@@ -215,15 +215,15 @@ function run_benchmark()
         all(value -> isapprox(value, ar_reference; rtol = 1e-10),
             (ar_values[2], ar_values[3])) || error("AR(1) parity mismatch at n=$n")
         rax = Reactant.to_rarray(ar.x)
-        raμ, raϕ, ralogσ = Reactant.to_rarray.((ar.μ, ar.ϕ, ar.logσ);
-                                               track_numbers = true)
+        raμ, raϕ, ralog_scale = Reactant.to_rarray.((ar.μ, ar.ϕ, ar.log_scale);
+                                                    track_numbers = true)
         ar_compile_s = @elapsed ar_compiled =
-            _compile_rk_ar1(ar1_kernel, rax, raμ, raϕ, ralogσ)
+            _compile_rk_ar1(ar1_kernel, rax, raμ, raϕ, ralog_scale)
         baselines = _baseline_reactant!(support, errors, "stationary_ar1",
                                         pm_ar, dist_ar, rax, ar_reference)
         row = _row("stationary_ar1", n, ar_reference, ar_values,
-                   ar1_kernel, (ar.x, ar.μ, ar.ϕ, ar.logσ),
-                   ar_compiled, (rax, raμ, raϕ, ralogσ),
+                   ar1_kernel, (ar.x, ar.μ, ar.ϕ, ar.log_scale),
+                   ar_compiled, (rax, raμ, raϕ, ralog_scale),
                    pm_ar, dist_ar, ar.x, rax, baselines, rounds)
         row["rk_reactant_compile_seconds"] = ar_compile_s
         push!(rows, row)
