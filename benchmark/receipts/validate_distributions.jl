@@ -6,6 +6,10 @@ import TOML
 const EXPECTED_PROBABILITY_MEASURES_SHA =
     "7cf3a6e112aaae2097b8d401b256d1bce635e03e"
 const EXPECTED_SIZES = (1, 1_000, 10_000, 30_000, 100_000, 1_000_000)
+const EXPECTED_AUTHORED_RETURN_SPELLING =
+    "@kernel normal_loglik(x, location, scale) = begin; pointwise = " *
+    "plate(x, location, scale) do xi, li, si; normal(li, si).logpdf(xi); " *
+    "end; return sum(pointwise); end"
 
 _median(values) = Statistics.median(Float64.(values))
 
@@ -57,6 +61,9 @@ function validate_distribution_receipt(path::AbstractString)
     require(get(protocol, "rk_authored_reactant_lowering", "") ==
             "tensorized broadcast chain consumed by Base.sum; no host loop or similar",
             "receipt must attest the authored Reactant fusion check")
+    require(get(protocol, "rk_authored_return_spelling", "") ==
+            EXPECTED_AUTHORED_RETURN_SPELLING,
+            "receipt must record the exact untyped authored return spelling")
     require(Int(get(protocol, "rounds", 0)) >= 5,
             "published receipt must contain at least five raw rounds")
     require(Tuple(Int.(get(protocol, "reactant_replica_counts", Int[]))) ==

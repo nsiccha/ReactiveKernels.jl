@@ -25,7 +25,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 # The canonical Normal object supplies the transparent scalar endpoint. The
 # likelihood itself is authored once: `pointwise` remains a queryable graph
 # value and the distinguished return is its sum.
-@kernel normal_loglik(x::Vector{Float64}, location, scale) = begin
+@kernel normal_loglik(x, location, scale) = begin
     pointwise = plate(x, location, scale) do xi, li, si
         normal(li, si).logpdf(xi)
     end

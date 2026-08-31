@@ -16,7 +16,10 @@ end
     primal_source = BatchedExamples.BATCHED_PRIMAL_SOURCE
 
     @testset "one authored graph, checked against a Distributions oracle" begin
-        @test occursin("@kernel normal_loglik", source)
+        @test occursin(
+            "@kernel normal_loglik(x, location, scale) = begin", source,
+        )
+        @test !occursin("normal_loglik(x::", source)
         @test occursin("pointwise = plate(x, location, scale) do", source)
         @test occursin("normal(li, si).logpdf(xi)", source)
         @test occursin("return sum(pointwise)", source)

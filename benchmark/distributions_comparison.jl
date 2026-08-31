@@ -38,7 +38,7 @@ const RK_REDUCE = plate(
 )
 
 @kernel benchmark_authored_normal_loglik(
-        x::Vector{Float64}, location, scale) = begin
+        x, location, scale) = begin
     pointwise = plate(x, location, scale) do xi, li, si
         normal(li, si).logpdf(xi)
     end
