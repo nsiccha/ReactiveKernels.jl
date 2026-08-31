@@ -83,6 +83,7 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
         "## Incremental and compiled reactive execution",
         "## Source-captured method compiler",
         "### Functional stateful methods and nested state contracts",
+        "### Prototype-derived finite structural containers",
         "## What the NUTS proof does and does not establish",
         "## Definitive support matrix",
     )
@@ -120,6 +121,14 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
         "`compile_state_transition(spec, transition, endpoint_args;",
         "Static loops are unrolled during\nlowering",
         "do not add geometry or integrator cases to compiler code",
+        "fixed-capacity\nstructural vectors",
+        "`Diagonal` and `Cholesky` wrappers",
+        "one typed numeric\ncolumn per logical owned leaf group",
+        "topology-aware read, write, copy, swap, and whole-container\nselect",
+        "Output validation\nhappens before reconstruction",
+        "`Base.abs` is admitted here only for one builtin\n`AbstractFloat` scalar",
+        "`Base.div` requires two operands of the identical\nbuiltin non-`Bool` integer type",
+        "not a general exported container API",
     )
         @test occursin(contract, page)
     end

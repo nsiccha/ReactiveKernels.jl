@@ -428,6 +428,8 @@ docs_interaction = (;
 
 const WALNUTS_INSPECTION = raw"""
 fixture = Main.WalnutsKernelAuthoringFixture
+support = Main.WalnutsCompilerSupport
+RK = ReactiveKernels
 state_registration = ReactiveKernels.kernel_registration(fixture.walnuts_state)
 state_methods = ReactiveKernels.method_irs(fixture.walnuts_state)
 entry_registration = ReactiveKernels.kernel_registration(fixture.walnuts!!)
@@ -445,9 +447,49 @@ map(formal -> (formal.name, formal.kind, formal.required), entry.formals) == (
     (:directions, :kw, true),
     (:exponentials, :kw, true),
 ) || error("WALNUTS public entry boundary drifted")
+case = first(support.ORACLE_CASES)
+max_depth = 10
+directions = fill(false, max_depth)
+exponentials = fill(1.0, 2^max_depth)
+setup = support._build_case_setup(
+    case; max_depth, min_dham = -1000.0, directions, exponentials,
+)
+proposal_roundtrip = RK._sm_finite_structural_unpack(
+    setup.proposal_contract, setup.proposal_raw,
+)
+tree_roundtrip = RK._sm_finite_structural_unpack(
+    setup.tree_contract, setup.tree_raw,
+)
+proposal_roundtrip == setup.snapshot.proposals ||
+    error("WALNUTS proposal container no longer round-trips")
+tree_roundtrip == setup.snapshot.trees ||
+    error("WALNUTS tree container no longer round-trips")
+length(proposal_roundtrip) == max_depth + 2 ||
+    error("WALNUTS proposal capacity drifted")
+length(tree_roundtrip) == max_depth + 1 ||
+    error("WALNUTS tree capacity drifted")
+recursive_scc = sort!(unique(method.id.name for method in state_methods
+                             if method.id.decl in
+                                RK.defunctionalized_mids(state_methods)))
+recursive_scc == [:finish!, :start!, :step!] ||
+    error("WALNUTS recursive SCC drifted: $(recursive_scc)")
+frontier = try
+    support._build_case_transition(setup; max_iterations = 1_000_000)
+    nothing
+catch error
+    error
+end
+frontier isa RK._LLowerReject ||
+    error("WALNUTS unexpectedly moved past the reviewed SCC frontier")
+frontier_message = sprint(showerror, frontier)
+expected_frontier = "ReactiveKernels._LLowerReject(" * '"' *
+    "recursive functional state-machine SCC lowering is not implemented " *
+    "for root `step!`" * '"' * ")"
+frontier_message == expected_frontier ||
+    error("WALNUTS compiler frontier drifted: $frontier_message")
 docs_interaction = (;
     name = :walnuts_entry_inspection,
-    kind = :fixture_receipt_inspection,
+    kind = :compiler_frontier_execution,
     input = (;
         fixture = "walnuts_kernel_authoring_fixture.jl",
         receipt = "walnuts-upstream-macro-v1.tsv",
@@ -458,6 +500,13 @@ docs_interaction = (;
         entry_kernel_kind = entry_registration.kind,
         required_entry_keywords = map(formal -> formal.name, entry.formals),
         independent_oracle_cases = length(receipt_rows),
+        configured_max_depth = max_depth,
+        proposal_capacity = length(proposal_roundtrip),
+        tree_capacity = length(tree_roundtrip),
+        structural_container_roundtrip = true,
+        recursive_scc,
+        compiler_frontier_executed = true,
+        rejection = frontier_message,
         compiler_execution_claimed = false,
     ),
 )

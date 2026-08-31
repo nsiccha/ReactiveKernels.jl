@@ -546,6 +546,40 @@ canonical group, so internal aliases remain aliases and external callbacks
 remain identical. None of this lowering dispatches on sampler, geometry,
 method, or field names.
 
+### Prototype-derived finite structural containers
+
+The functional state-machine compiler has a closed ABI for fixed-capacity
+structural vectors. Construction starts from the actual prototype values; it
+does not infer a generic container promise from `Vector{T}` alone. The contract
+freezes the element type and capacity, recursive named-tuple and tuple layout,
+`Diagonal` and `Cholesky` wrappers, array element types and axes, static
+authority identities, within-element owned-array aliases, and the requirement
+that owned storage from different elements remain disjoint.
+
+Dynamic leaves are exactly `Bool`, the signed and unsigned 8-, 16-, 32-, and
+64-bit integers, `Float16`, `Float32`, `Float64`, and dense arrays of those
+types. The backend representation is a structure of arrays: one typed numeric
+column per logical owned leaf group, with capacity as the last array dimension.
+Static authorities never enter that numeric ABI. Unsupported leaves, wrapper
+types, shape changes, merged aliases, separated required aliases, or shared
+owned storage across elements reject during contract validation.
+
+The lowering has topology-aware read, write, copy, swap, and whole-container
+select operations. An active out-of-bounds index sets overflow and commits no
+partial write, copy, or swap. Raw input and output are both validated for exact
+column names and order, numeric types, axes, and capacity. Output validation
+happens before reconstruction, so restoring static identities or canonical
+aliases cannot hide a counterfeit backend result. This is a compiler-internal
+finite ABI, not a general exported container API and not permission for dynamic
+`push!`, `pop!`, resizing, or arbitrary element types.
+
+Primitive emission is closed over exact captured builtins and concrete
+specializations. `Base.abs` is admitted here only for one builtin
+`AbstractFloat` scalar. `Base.div` requires two operands of the identical
+builtin non-`Bool` integer type. Integer `abs`, mixed-integer `div`, `Bool`,
+128-bit integers, numeric wrappers, and user overloads do not widen those rules;
+they reject before executable lowering.
+
 `functionalize_stateful(kernel, Val(:method); max_iterations,
 argument_types)` produces the backend-neutral functional program;
 `stateful_snapshot` supplies its initial value surface. Dynamic structured
