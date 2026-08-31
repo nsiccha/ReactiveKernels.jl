@@ -23,6 +23,8 @@ end
                  "scalar_distribution_gallery_comparison.jl",
                  "structured_distributions_comparison.jl",
                  "distribution_gradients.jl",
+                 "eight_schools_ad_comparison.jl",
+                 "eight_schools_ad_comparison_body.jl",
                  "eight_schools_reactant_comparison.jl",
                  "eight_schools_reactant_comparison_body.jl",
                  "nuts_reactant_comparison.jl",
@@ -35,6 +37,7 @@ end
                  joinpath("receipts", "validate_scalar_gallery_distributions.jl"),
                  joinpath("receipts", "validate_structured_distributions.jl"),
                  joinpath("receipts", "validate_distribution_gradients.jl"),
+                 joinpath("receipts", "validate_eight_schools_ad.jl"),
                  joinpath("receipts", "validate_eight_schools_reactant.jl"))
         path = joinpath(_BENCH_DIR, name)
         @test isfile(path)
