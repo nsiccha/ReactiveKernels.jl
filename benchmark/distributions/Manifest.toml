@@ -763,7 +763,7 @@ version = "0.1.0"
     Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 
 [[deps.ReactiveKernelsDistributionKernels]]
-deps = ["LinearAlgebra", "LogExpFunctions", "ReactiveKernels"]
+deps = ["LinearAlgebra", "LogExpFunctions", "ReactiveKernels", "SpecialFunctions"]
 path = "../../packages/ReactiveKernelsDistributionKernels"
 uuid = "4b169cd9-fc12-43fd-ba39-43e54ed8db7a"
 version = "0.1.0"
