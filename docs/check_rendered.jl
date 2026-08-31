@@ -100,7 +100,7 @@ function check_rendered_docs(build_dir, page_tree)
             "Automatic differentiation",
             "Prepare once, then request gradients or value-and-gradient",
             "returned_gradient === gradient_buffer",
-            "Batched Normal",
+            "Normal Loglik",
         ),
         "compiler.md" => ("class=\"rk-pipeline\"",),
         "nuts.md" => (
