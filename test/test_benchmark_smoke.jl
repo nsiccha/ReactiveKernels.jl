@@ -22,6 +22,8 @@ end
                  "distributions_comparison.jl",
                  "scalar_distribution_gallery_comparison.jl",
                  "structured_distributions_comparison.jl",
+                 "eight_schools_reactant_comparison.jl",
+                 "eight_schools_reactant_comparison_body.jl",
                  "nuts_reactant_comparison.jl",
                  "nuts_reactant_comparison_body.jl",
                  "eval_throughput_comparison.jl",
@@ -30,11 +32,23 @@ end
                  joinpath("receipts", "validate_eval_throughput.jl"),
                  joinpath("receipts", "validate_distributions.jl"),
                  joinpath("receipts", "validate_scalar_gallery_distributions.jl"),
-                 joinpath("receipts", "validate_structured_distributions.jl"))
+                 joinpath("receipts", "validate_structured_distributions.jl"),
+                 joinpath("receipts", "validate_eight_schools_reactant.jl"))
+
         path = joinpath(_BENCH_DIR, name)
         @test isfile(path)
         @test _parses(path)
     end
+end
+
+@testset "Eight Schools Reactant benchmark receipt validates" begin
+    validator = joinpath(
+        _BENCH_DIR, "receipts", "validate_eight_schools_reactant.jl")
+    receipt = joinpath(
+        _BENCH_DIR, "receipts", "eight-schools-reactant-v1.toml")
+    @test isfile(receipt)
+    include(validator)
+    @test isempty(validate_eight_schools_reactant_receipt(receipt))
 end
 
 @testset "adaptive Reactant NUTS benchmark receipt validates" begin
