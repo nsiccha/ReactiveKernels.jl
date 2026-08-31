@@ -100,6 +100,44 @@ end
 @inline _authored_plate_zero(::Type{T}, marker) where {T} = zero(T)
 @inline _authored_plate_zero(::Type{Any}, marker) = zero(eltype(marker))
 
+# A plate is a pure graph map/reduction.  Once Julia has instantiated the
+# broadcast axes, a recipe only needs to run again when a dimension kept by
+# one of its transitive HAVE roots changes in Cartesian iteration order.  The
+# cached value is a scalar local, never an axis-sized intermediate.
+@inline _plate_dependency_changed(index, previous,
+                                  arg::Union{Number,Ref}) = false
+
+@inline function _plate_dependency_changed(
+        index, previous, arg::Base.Broadcast.Extruded)
+    @inbounds for dimension in eachindex(arg.keeps)
+        arg.keeps[dimension] && index[dimension] != previous[dimension] &&
+            return true
+    end
+    false
+end
+
+@inline function _plate_dependency_changed(index, previous, arg)
+    argument_axes = axes(arg)
+    @inbounds for dimension in eachindex(argument_axes)
+        length(argument_axes[dimension]) == 1 && continue
+        index[dimension] != previous[dimension] && return true
+    end
+    false
+end
+
+function _plate_similar(arguments::Tuple, ::Type{T}, output_axes) where {T}
+    style = Base.Broadcast.combine_styles(arguments...)
+    broadcasted = Base.Broadcast.Broadcasted(
+        style, identity, arguments, output_axes)
+    similar(broadcasted, T)
+end
+
+@inline function _plate_require_axes(output_axes)
+    isempty(output_axes) && throw(ArgumentError(
+        "a plate requires at least one batched broadcast axis"))
+    output_axes
+end
+
 function (op::_AuthoredPlateOp{K,A})(args...) where {K,A}
     batch = _authored_plate_broadcast(Val(A), args...)
     marker = _authored_plate_marker(Val(A), args...)
@@ -215,28 +253,43 @@ function _authored_plate_sum_recipe(p::Plan, plate_recipe::Recipe)
     isempty(matches) ? nothing : only(matches)
 end
 
-function _authored_plate_dependencies(inner::Plan)
-    graph = inner.graph
+function _plate_dependencies(plan::Plan, root_ids::Set{Int})
+    graph = plan.graph
     dependencies = Dict{Int,Set{Int}}()
-    for (index, input) in enumerate(inner.have)
-        dependencies[canon_id(graph, input.id)] = Set((index,))
+    for input in plan.have
+        cid = canon_id(graph, input.id)
+        dependencies[cid] = cid in root_ids ? Set((cid,)) : Set{Int}()
     end
-    for recipe in inner.recipes
+    recipe_dependencies = Vector{Set{Int}}(undef, length(plan.recipes))
+    for (recipe_index, recipe) in enumerate(plan.recipes)
         roots = Set{Int}()
         for input in recipe.inputs
             union!(roots, get(dependencies, canon_id(graph, input.id), Set{Int}()))
         end
+        recipe_dependencies[recipe_index] = roots
         for output in recipe.outputs
-            dependencies[canon_id(graph, output.id)] = copy(roots)
+            cid = canon_id(graph, output.id)
+            haskey(dependencies, cid) || (dependencies[cid] = copy(roots))
         end
     end
-    dependencies
+    (; values = dependencies, recipes = recipe_dependencies)
 end
 
-function _authored_plate_condition(callargs, roots, atomic)
+function _authored_plate_condition(callargs, roots, positions, atomic)
     tests = Any[Expr(:call, GlobalRef(@__MODULE__, :_authored_plate_is_axis),
-                     callargs[index]) for index in sort!(collect(roots))
-                if !(index in atomic)]
+                     callargs[positions[root]]) for root in sort!(collect(roots))
+                if !(positions[root] in atomic)]
+    isempty(tests) && return false
+    foldl((left, right) -> Expr(:||, left, right), tests)
+end
+
+function _authored_plate_changed(callargs, roots, positions, atomic,
+                                 index, previous)
+    tests = Any[
+        Expr(:call, GlobalRef(@__MODULE__, :_plate_dependency_changed),
+             index, previous, callargs[positions[root]])
+        for root in sort!(collect(roots)) if !(positions[root] in atomic)
+    ]
     isempty(tests) && return false
     foldl((left, right) -> Expr(:||, left, right), tests)
 end
@@ -267,6 +320,8 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
     marker = gensym(:plate_axis)
     batch = gensym(:plate_broadcast)
     index = gensym(:plate_index)
+    previous = gensym(:plate_previous)
+    first_coordinate = gensym(:plate_first)
     plate_values = gensym(:plate_values)
     atomic_val = Expr(:call, GlobalRef(Base, :Val), QuoteNode(atomic))
     push!(body.args, :($batch = $(GlobalRef(@__MODULE__, :_authored_plate_broadcast))(
@@ -274,7 +329,12 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
     push!(body.args, :($marker = $(GlobalRef(@__MODULE__, :_authored_plate_marker))(
         $atomic_val, $(callargs...))))
 
-    dependencies = _authored_plate_dependencies(inner)
+    root_positions = Dict(
+        canon_id(inner.graph, input.id) => position
+        for (position, input) in enumerate(inner.have)
+    )
+    root_ids = Set(keys(root_positions))
+    dependencies = _plate_dependencies(inner, root_ids).values
     locals = Dict{Int,Symbol}()
     for recipe in inner.recipes, output in recipe.outputs
         cid = canon_id(inner.graph, output.id)
@@ -295,7 +355,8 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
         output = only(recipe.outputs)
         out = locals[canon_id(inner.graph, output.id)]
         roots = get(dependencies, canon_id(inner.graph, output.id), Set{Int}())
-        condition = _authored_plate_condition(callargs, roots, atomic)
+        condition = _authored_plate_condition(
+            callargs, roots, root_positions, atomic)
         args = Any[_authored_plate_scalar_ref(
             inner, locals, callargs, input, plate_values, false) for input in recipe.inputs]
         call = Expr(:call, Expr(:ref, _OPS_ARG, op_offset + recipe_index), args...)
@@ -318,7 +379,12 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
         output = only(recipe.outputs)
         out = locals[canon_id(inner.graph, output.id)]
         roots = get(dependencies, canon_id(inner.graph, output.id), Set{Int}())
-        condition = _authored_plate_condition(callargs, roots, atomic)
+        has_axis = _authored_plate_condition(
+            callargs, roots, root_positions, atomic)
+        changed = _authored_plate_changed(
+            callargs, roots, root_positions, atomic, index, previous)
+        condition = Expr(:&&, has_axis,
+            Expr(:||, first_coordinate, changed))
         args = Any[_authored_plate_scalar_ref(
             inner, locals, callargs, input, plate_values, true) for input in recipe.inputs]
         call = Expr(:call, Expr(:ref, _OPS_ARG, op_offset + recipe_index), args...)
@@ -329,9 +395,13 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
         push!(loopbody.args, :($pointwise_lhs[$index] = $scalar_result))
     accumulator === nothing ||
         push!(loopbody.args, :($accumulator += $scalar_result))
+    push!(loopbody.args, :($previous = $index))
+    push!(loopbody.args, :($first_coordinate = false))
     pushfirst!(loopbody.args, :($plate_values = $batch[$index]))
     iteration = Expr(:call, GlobalRef(Base, :CartesianIndices),
                      Expr(:call, GlobalRef(Base, :axes), batch))
+    push!(body.args, :($previous = nothing))
+    push!(body.args, :($first_coordinate = true))
     push!(body.args, Expr(:for, Expr(:(=), index, iteration), loopbody))
     total_lhs === nothing || push!(body.args, :($total_lhs = $accumulator))
     body
@@ -482,22 +552,55 @@ rewritten (`transform`) before compilation (gist §9).
 lower(p::Plan) = first(_lower_with_ops(p; inline_embedded = false))
 _lower_unembedded(p::Plan) = lower(p)
 
+function _batched_dependency_analysis(p::Plan, batched)
+    graph = p.graph
+    names = Tuple(batched isa Symbol ? (batched,) : batched)
+    isempty(names) && throw(ArgumentError(
+        "lower_batched requires at least one batched HAVE port"))
+    all(name -> name isa Symbol, names) || throw(ArgumentError(
+        "lower_batched batched ports must be Symbols; got $(names)"))
+    length(unique(names)) == length(names) || throw(ArgumentError(
+        "lower_batched batched ports must be unique; got $(names)"))
+
+    have_by_name = Dict(value.name => value for value in p.have)
+    mapped = Value[]
+    for name in names
+        value = get(have_by_name, name, nothing)
+        value === nothing && throw(ArgumentError(
+            "lower_batched port :$name is not in the plan HAVE boundary"))
+        push!(mapped, value)
+    end
+    mapped_ids = Set(canon_id(graph, value.id) for value in mapped)
+    dependencies = _plate_dependencies(p, mapped_ids)
+    want = only(p.want)
+    want_dependencies = get(
+        dependencies.values, canon_id(graph, want.id), Set{Int}())
+    isempty(want_dependencies) && throw(ArgumentError(
+        "lower_batched: want :$(want.name) is loop-invariant (does not depend on a batched port); nothing to vectorize"))
+    (; mapped = Tuple(mapped), mapped_ids,
+       recipe_dependencies = dependencies.recipes, want)
+end
+
 """
     lower_batched(p::Plan; batched, reduce = :+) -> Expr
 
-Lower a plan to a batched, **loop-invariant-hoisting** kernel. The `batched` HAVE
-ports are arrays iterated element-wise; every recipe that does NOT (transitively)
-depend on a batched value is emitted ONCE above the loop (the hoist), and only
-the batch-dependent recipes run per element, their single scalar `want`
-accumulated by `reduce` (default `:+`, i.e. a sum). Pass `reduce=nothing` to
-instead COLLECT the per-element want into a vector (the per-observation density,
-for LOO/WAIC) — invariants are still hoisted, only the output vector is
-materialized. This is how a vectorized log density avoids recomputing shared
-work: e.g. `σ = exp(logσ)` / `log(σ)` is computed once, not per observation. The
-generated function (in the reducing mode) has the same
-`(__ops__, have...)` signature as [`lower`](@ref) — batched ports passed as
-arrays, shared ports as scalars — and the whole batch is one straight-line pass
-that materializes no per-element vector.
+Lower a pure plan to a batched, **dependency-stratified** kernel. The `batched`
+HAVE ports participate in ordinary Julia broadcasting: compatible axes zip,
+singleton dimensions expand, scalars repeat, and `Ref(x)` keeps an array-valued
+input atomic. Broadcast axes are instantiated and checked before any recipe or
+output mutation executes.
+
+Every recipe inherits the transitive set of batched HAVE ports it depends on.
+During Cartesian broadcast traversal, its scalar result is recomputed only when
+a kept broadcast dimension of one of those roots changes. This is equivalent to
+placing the recipe at the narrowest valid nested-loop boundary: an outer-only
+scale transform runs once per scale coordinate and is reused through all inner
+coordinates without an intermediate buffer. Recipes independent of every
+batched port are emitted once above the traversal.
+
+The single scalar `want` is accumulated by `reduce` (default `:+`, a sum).
+Pass `reduce=nothing` to collect the broadcast-shaped pointwise wants instead;
+only that requested output is materialized.
 
 Restricted (this lowering) to single-output recipes and a single scalar `want`
 that is itself batched (the per-element density). `reduce` is spliced as a bare
@@ -511,61 +614,62 @@ function lower_batched(p::Plan; batched, reduce = :+)
         length(r.outputs) == 1 || throw(ArgumentError(
             "lower_batched requires single-output recipes; recipe $(r.id) has $(length(r.outputs)) outputs"))
     end
-    batched_names = Set{Symbol}(batched isa Symbol ? (batched,) : batched)
+    analysis = _batched_dependency_analysis(p, batched)
     names = _varnames(p)
     nm(v) = names[canon_id(g, v.id)]
+    mapped(value) = canon_id(g, value.id) in analysis.mapped_ids
 
-    # Canonical ids of the batched HAVE ports — the arrays we index per element.
-    batched_input_ids = Set{Int}()
-    iter_port = nothing
-    for v in p.have
-        if v.name in batched_names
-            push!(batched_input_ids, canon_id(g, v.id))
-            iter_port === nothing && (iter_port = v)
-        end
-    end
-    iter_port === nothing && throw(ArgumentError(
-        "lower_batched: none of the have ports are batched (batched = $(sort(collect(batched_names))))"))
-
-    # Propagate batch-dependency over produced values in execution (topological)
-    # order: a value is batched iff its producing recipe consumes a batched value.
-    batched_vals = Set{Int}(batched_input_ids)
-    recipe_is_batched = falses(length(p.recipes))
-    for (k, r) in enumerate(p.recipes)
-        b = any(canon_id(g, inp.id) in batched_vals for inp in r.inputs)
-        recipe_is_batched[k] = b
-        b && for o in r.outputs
-            push!(batched_vals, canon_id(g, o.id))
-        end
+    index = gensym(:plate_index)
+    previous = gensym(:plate_previous)
+    first_coordinate = gensym(:plate_first)
+    raw_arguments = Dict{Int,Symbol}()
+    prepared_arguments = Dict{Int,Symbol}()
+    for value in analysis.mapped
+        cid = canon_id(g, value.id)
+        raw_arguments[cid] = gensym(Symbol(:plate_argument_, value.name))
+        prepared_arguments[cid] = gensym(Symbol(:plate_prepared_, value.name))
     end
 
-    want = only(p.want)
-    canon_id(g, want.id) in batched_vals || throw(ArgumentError(
-        "lower_batched: want :$(want.name) is loop-invariant (does not depend on a batched port); nothing to vectorize"))
-
-    idx = gensym(:i)
-    # A batched HAVE port is indexed by the loop var; everything else (an
-    # invariant value computed once, or a batched intermediate that is loop-local)
-    # is referenced by name.
-    argref(inp) = canon_id(g, inp.id) in batched_input_ids ?
-                  Expr(:ref, nm(inp), idx) : nm(inp)
+    # `_broadcast_getindex` implements Julia's scalar, Ref, and singleton
+    # projection at the current Cartesian coordinate.
+    function argref(input)
+        cid = canon_id(g, input.id)
+        haskey(prepared_arguments, cid) || return nm(input)
+        Expr(:call, GlobalRef(Base.Broadcast, :_broadcast_getindex),
+             prepared_arguments[cid], index)
+    end
     callexpr(k, r) = Expr(:call, Expr(:ref, _OPS_ARG, k),
                           (argref(inp) for inp in r.inputs)...)
 
     argexprs = Any[_OPS_ARG]
     for v in p.have
-        # A batched port arrives as an array, so it is left unannotated (Julia
-        # still specializes on the concrete array type); shared ports keep their
-        # declared scalar type.
-        push!(argexprs, canon_id(g, v.id) in batched_input_ids ?
-              nm(v) : :($(nm(v))::$(valtype(v))))
+        push!(argexprs, mapped(v) ? nm(v) : :($(nm(v))::$(valtype(v))))
     end
 
     body = Expr(:block)
+    for value in analysis.mapped
+        cid = canon_id(g, value.id)
+        raw = raw_arguments[cid]
+        prepared = prepared_arguments[cid]
+        push!(body.args, Expr(:(=), raw,
+            Expr(:call, GlobalRef(Base, :broadcastable), nm(value))))
+        push!(body.args, Expr(:(=), prepared,
+            Expr(:call, GlobalRef(Base.Broadcast, :preprocess), nothing, raw)))
+    end
+    broadcast_arguments = Expr(
+        :tuple, (raw_arguments[canon_id(g, value.id)]
+                 for value in analysis.mapped)...)
+    output_axes = gensym(:plate_axes)
+    combined_axes = Expr(:call, GlobalRef(Base.Broadcast, :combine_axes),
+        (raw_arguments[canon_id(g, value.id)]
+         for value in analysis.mapped)...)
+    push!(body.args, Expr(:(=), output_axes,
+        Expr(:call, GlobalRef(@__MODULE__, :_plate_require_axes),
+             combined_axes)))
+
     assigned = Set(canon_id(g, v.id) for v in p.have)
-    # Invariant recipes: emit ONCE, above the loop. This is the hoist.
     for (k, r) in enumerate(p.recipes)
-        recipe_is_batched[k] && continue
+        isempty(analysis.recipe_dependencies[k]) || continue
         out = only(r.outputs)
         cid = canon_id(g, out.id)
         cid in assigned && continue
@@ -573,38 +677,49 @@ function lower_batched(p::Plan; batched, reduce = :+)
         push!(body.args, Expr(:(=), nm(out), callexpr(k, r)))
     end
 
-    # The fused per-element loop: the batched recipes only (invariants are
-    # already hoisted above). Their assignments are common to both modes.
     loopbody = Expr(:block)
     loop_assigned = copy(assigned)
     for (k, r) in enumerate(p.recipes)
-        recipe_is_batched[k] || continue
+        roots = analysis.recipe_dependencies[k]
+        isempty(roots) && continue
         out = only(r.outputs)
         cid = canon_id(g, out.id)
         cid in loop_assigned && continue
         push!(loop_assigned, cid)
-        push!(loopbody.args, Expr(:(=), nm(out), callexpr(k, r)))
+        push!(body.args, Expr(:local, Expr(:(::), nm(out), valtype(out))))
+        changed = foldl((left, right) -> Expr(:||, left, right),
+            (Expr(:call, GlobalRef(@__MODULE__, :_plate_dependency_changed),
+                  index, previous, prepared_arguments[root])
+             for root in sort!(collect(roots))))
+        condition = Expr(:||, first_coordinate, changed)
+        push!(loopbody.args,
+              Expr(:if, condition, Expr(:(=), nm(out), callexpr(k, r))))
     end
 
+    want = analysis.want
+    result = gensym(reduce === nothing ? :collected : :accumulator)
     if reduce === nothing
-        # COLLECT mode: materialize the per-element want as a vector (the
-        # per-observation density, for LOO/WAIC). Invariants are still hoisted;
-        # only the output vector is allocated, per element.
-        result = gensym(:collected)
-        push!(body.args,
-              :($result = similar($(nm(iter_port)), $(valtype(want)))))
-        push!(loopbody.args, :($result[$idx] = $(nm(want))))
-        push!(body.args, Expr(:for, :($idx = eachindex($(nm(iter_port)))), loopbody))
-        push!(body.args, Expr(:return, result))
+        push!(body.args, Expr(:(=), result,
+            Expr(:call, GlobalRef(@__MODULE__, :_plate_similar),
+                 broadcast_arguments, valtype(want), output_axes)))
+        push!(loopbody.args,
+              Expr(:(=), Expr(:ref, result, index), nm(want)))
     else
-        # REDUCE mode: accumulate the per-element want (default a sum), no
-        # per-element vector materialized.
-        acc = gensym(:acc)
-        push!(body.args, :($acc = zero($(valtype(want)))))
-        push!(loopbody.args, :($acc = $reduce($acc, $(nm(want)))))
-        push!(body.args, Expr(:for, :($idx = eachindex($(nm(iter_port)))), loopbody))
-        push!(body.args, Expr(:return, acc))
+        push!(body.args, Expr(:(=), result,
+            Expr(:call, GlobalRef(Base, :zero), valtype(want))))
+        push!(loopbody.args, Expr(:(=), result,
+            Expr(:call, reduce, result, nm(want))))
     end
+
+    push!(loopbody.args, Expr(:(=), previous, index))
+    push!(loopbody.args, Expr(:(=), first_coordinate, false))
+    pushfirst!(loopbody.args, Expr(:if, first_coordinate,
+                                   Expr(:(=), previous, index)))
+    push!(body.args, Expr(:(=), previous, nothing))
+    push!(body.args, Expr(:(=), first_coordinate, true))
+    iteration = Expr(:call, GlobalRef(Base, :CartesianIndices), output_axes)
+    push!(body.args, Expr(:for, Expr(:(=), index, iteration), loopbody))
+    push!(body.args, Expr(:return, result))
     Expr(:function, Expr(:tuple, argexprs...), body)
 end
 
@@ -710,7 +825,9 @@ struct _BatchedFunctionPair{I,B,R,N,T} <: _ArrayFunctionPair
 end
 
 @inline function (f::_BatchedFunctionPair{I})(ops, args...) where {I}
-    _batched_call(f, ops, args, getfield(args, I))
+    traced = _dynamic_tensorized_marker(args)
+    marker = traced === nothing ? getfield(args, I) : traced
+    _batched_call(f, ops, args, marker)
 end
 
 struct _EmbeddedFunctionPair{I,N,T,A} <: _ArrayFunctionPair
@@ -847,7 +964,12 @@ _array_marker_positions(::_EmbeddedFunctionPair{I}) where {I} = (I,)
 _array_marker_positions(::_DynamicEmbeddedFunctionPair{I}) where {I} = I
 
 function _embedded_marker_candidates(p::Plan)
-    dependencies = _authored_plate_dependencies(p)
+    root_positions = Dict(
+        canon_id(p.graph, input.id) => position
+        for (position, input) in enumerate(p.have)
+    )
+    dependencies = _plate_dependencies(
+        p, Set(keys(root_positions))).values
     candidates = Int[]
     for recipe in p.recipes
         positions = if recipe.op isa _AuthoredPlateOp
@@ -863,7 +985,8 @@ function _embedded_marker_candidates(p::Plan)
             roots = sort!(collect(get(
                 dependencies, canon_id(p.graph, input.id), Set{Int}())))
             for root in roots
-                root in candidates || push!(candidates, root)
+                position = root_positions[root]
+                position in candidates || push!(candidates, position)
             end
         end
     end
