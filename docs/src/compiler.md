@@ -535,6 +535,31 @@ argument is `__self__`; the compiler substitutes and validates the concrete
 whole-state NamedTuple type rather than asking an application to reconstruct
 private storage types.
 
+Effect classification is currently an internal conservative compiler rule,
+not new public authoring syntax. A port that can replace any argument or return
+a meaningful value is causal: its state stays in the fixed compiled ABI, and
+host feedback can affect a later transition only after an explicit barrier and
+re-entry as a separately typed input. A source-backed port with no written
+arguments and `Nothing` result has no causal channel, so the compiler generates
+a split kernel automatically. The Reactant region emits source-order records
+into fixed-capacity slots with a logical activity mask and count plus sticky
+overflow; ordinary Julia then calls
+`drain_observations!(transition, result)` after the compiled call returns. No
+`push!`, callback invocation, allocation-driven shape growth, or implicit host
+round trip occurs inside the compiled invocation, and callers may schedule the
+drain on their own Julia task after that synchronization point.
+
+A compiler-only observational authority still runs its reviewed total lowering
+to form one fixed-shape summary. That summary is returned in the same outbox;
+the existing `effects` result also mirrors it for fixed-shape compatibility,
+but every invocation starts from the declared initial value rather than reading
+the prior summary. Consequently observation history cannot become an implicit
+future compiled input. Outbox overflow rejects before partial host replay, and
+a record whose type or axes would change is diagnosed as forbidden outbox
+growth. Runtime reusable-call mismatches report both expected and observed
+type/axes signatures and instruct the caller to explicitly recompile; the host
+guard performs that rejection before entering the backend executable.
+
 `structured_state_port(compiled_transition)` binds a nested state field to the
 canonical alias groups, external authority identities, writable source fields,
 and derived-recipe closure of an ordinary `CompiledStateTransition`. A nested
@@ -620,20 +645,27 @@ exponential for finiteness and nonnegativity, including dynamic traced tapes;
 invalid consumed data sets sticky overflow and atomically rolls state back,
 while unconsumed padding remains irrelevant.
 
-Auxiliary effects are explicit continuation state, not hidden compiler state.
-`initial_transition_effects(transition)` constructs the first value. Ordinary
-Julia may pass it as the `effects` keyword; `transition_with_effects(transition)`
-provides a positional callable for optional compilers, so callers can feed the
-returned `effects` into the next compiled invocation. Compiler program
-metadata is recursively snapshotted from a finite immutable/builtin domain;
-later mutation of authoring configuration cannot change compiled semantics.
+Causal auxiliary effects are explicit continuation state, not hidden compiler
+state. `initial_transition_effects(transition)` constructs the first value.
+Ordinary Julia may pass it as the `effects` keyword;
+`transition_with_effects(transition)` provides a positional callable for
+optional compilers, so callers can feed returned causal effects into the next
+compiled invocation. Compiler-only observational summaries may remain in that
+result carrier for compatibility, but are reset rather than consumed on the
+next invocation and are authoritatively exposed by `drain_observations!`.
+Compiler program metadata is recursively snapshotted from a finite
+immutable/builtin domain; later mutation of authoring configuration cannot
+change compiled semantics.
 
 The fixed-step ReactiveHMC fixture is the first combined acceptance case. Its
 unchanged mathematical source refreshes momentum, executes generalized
 leapfrog, records statistics before divergence exit, conditionally consumes an
-exponential draw, and copies an accepted endpoint. The same generic compiler
-path matches the independent accept, reject, and divergence receipt in ordinary
-Julia and Reactant. A separate pinned physical case locks Float32
+exponential draw, and copies an accepted endpoint. The statistics callback has
+no Reactant implementation: the generic compiler infers it is observational,
+returns its bounded records, and the Julia drain replays the collector after
+the barrier. The same generic compiler path matches the independent accept,
+reject, and divergence receipt in ordinary Julia and Reactant. A separate
+pinned physical case locks Float32
 position/momentum/normal draws together with the authored Float64 `randexp`
 result, exact bits, destination alias, and global RNG event order. That evidence
 admits reusable nested-state currentness, typed effects, ordered RNG, and mixed

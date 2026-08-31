@@ -218,14 +218,16 @@ total_functional_lowering(lowering) = _TotalFunctionalLowering(lowering)
 """
     effect_callable_port(source, Tuple{ArgTypes...}, Result;
                          written_arguments=(), initial_effect_state=nothing,
-                         functional_lowering)
+                         functional_lowering=nothing)
 
 Explicit effect contract for a callable state field. The source callable is
 identity-checked at construction. `written_arguments` declares exactly which
 positional subjects it may mutate; the functional lowering returns a
 NamedTuple `(arguments, result, effect_state)` carrying replacement arguments
 and an explicit auxiliary effect state. This is the effectful counterpart to
-`pure_callable_port`; arbitrary callable fields remain rejected.
+`pure_callable_port`; arbitrary callable fields remain rejected. A no-write,
+`Nothing`-returning source port is inferred observational and needs no lowering:
+its arguments are recorded in a bounded outbox for later Julia replay.
 """
 struct _EffectCallablePort{
         ArgTypes<:Tuple,Result,Written,EffectState,F,L,S,T,Mode}
@@ -457,7 +459,7 @@ _kernel_field_effect_descriptor(::_EffectCallablePort) = true
 function _effect_callable_port(::Val{Mode}, @nospecialize(source),
         ::Type{ArgTypes},
         ::Type{Result}; written_arguments=(), initial_effect_state=nothing,
-        functional_lowering) where {Mode,ArgTypes<:Tuple,Result}
+        functional_lowering=nothing) where {Mode,ArgTypes<:Tuple,Result}
     all(isconcretetype, ArgTypes.parameters) || throw(ArgumentError(
         "effect callable port argument types must all be concrete"))
     isconcretetype(Result) || throw(ArgumentError(
@@ -477,15 +479,35 @@ function _effect_callable_port(::Val{Mode}, @nospecialize(source),
         source, functional_lowering, initial_effect_state, topology)
 end
 
+# Effect classification deliberately remains an internal compiler decision.
+# A call which cannot replace an argument and cannot return a value has no
+# causal channel back into the compiled program. Source-backed calls are
+# therefore replayed from a host outbox; lowering-authority calls retain their
+# reviewed lowering only to form a fixed-shape observational summary.
+_sm_effect_is_observational(
+    ::_EffectCallablePort{ArgTypes,Result,Written}) where
+    {ArgTypes,Result,Written} = isempty(Written) && Result === Nothing
+_sm_effect_is_causal(port::_EffectCallablePort) =
+    !_sm_effect_is_observational(port)
+_sm_effect_mode(::_EffectCallablePort{
+    ArgTypes,Result,Written,EffectState,F,L,S,T,Mode}) where
+    {ArgTypes,Result,Written,EffectState,F,L,S,T,Mode} = Mode
+_sm_effect_has_compiled_carrier(port::_EffectCallablePort) =
+    _sm_effect_is_causal(port) ||
+    (_sm_effect_is_observational(port) &&
+     _sm_effect_mode(port) === :lowering_authority)
+
 """
     effect_callable_port(source, Tuple{ArgTypes...}, Result;
                          written_arguments=(), initial_effect_state=nothing,
-                         functional_lowering)
+                         functional_lowering=nothing)
 
 Declare the exact source callable, positional argument/result contract,
-written argument positions, and auxiliary effect state used by functional
-compiler lowering. The lowering returns `(arguments, result, effect_state)`;
-arbitrary callable fields remain rejected.
+written argument positions, and optional auxiliary effect state used by
+functional compiler lowering. A causal lowering returns
+`(arguments, result, effect_state)`. A source port with no written arguments
+and `Nothing` result is instead host-drained automatically and may omit the
+lowering; arbitrary callable fields remain rejected.
 """
 effect_callable_port(source, argtypes::Type{<:Tuple}, result::Type;
                      kwargs...) =
@@ -3253,7 +3275,7 @@ end
 # the straight-line transition above is; only state and arguments are dynamic.
 struct _FunctionalStateMachineTransition{
         Names,Groups,ArrayNames,StateType,EffectType,Iterations,ArgumentTypes,
-        Declared,Forest,F,P,E,C,T}
+        Declared,Forest,F,P,E,C,T,ObservationNames}
     f::F
     ports::P
     ensures::E
@@ -3374,8 +3396,9 @@ end
 
 Return a positional callable `(state, effects, arguments...)` for a
 functionalized structured state-machine method. This is the optional-compiler
-ABI for explicitly threading the auxiliary value returned as `result.effects`
-into a later invocation.
+ABI for explicitly threading causal auxiliary values returned as
+`result.effects` into a later invocation. Compiler-only observational summaries
+may be present for compatibility but are reset rather than consumed.
 """
 transition_with_effects(transition::_FunctionalStateMachineTransition) =
     _FunctionalTransitionWithEffects(transition)
@@ -3495,6 +3518,15 @@ _sm_shape_contract(value::LinearAlgebra.Diagonal) =
     _sm_shape_contract(value.diag)
 _sm_shape_contract(value::LinearAlgebra.Cholesky) =
     _sm_shape_contract(value.factors)
+
+function _sm_runtime_abi_mismatch(label, expected_type, expected_axes,
+                                  observed)
+    throw(ArgumentError(
+        "$label runtime ABI mismatch: expected " *
+        "(type=$expected_type, axes=$expected_axes), observed " *
+        "(type=$(typeof(observed)), axes=$(_sm_shape_contract(observed))); " *
+        "explicitly recompile for the observed runtime structure/shape"))
+end
 
 function _sm_topology_leaves!(leaves, value, path::Tuple)
     # Supported structural wrappers must expose their logical backing storage
@@ -3913,13 +3945,17 @@ end
 Construct an isolated initial auxiliary-effect carrier for a functionalized
 structured state-machine method. Thread the returned `effects` from each call
 into the next call instead of recreating this value between transitions.
+Source-backed observational ports live only in `result.outbox`; compiler-only
+observational summaries may be mirrored here for fixed-shape compatibility but
+are reset to their declared initial value on every invocation.
 """
 function initial_transition_effects(
         transition::_FunctionalStateMachineTransition)
     pairs = Pair{Symbol,Any}[]
     for name in propertynames(getfield(transition, :ports))
         port = getfield(getfield(transition, :ports), name)
-        port isa _EffectCallablePort || continue
+        port isa _EffectCallablePort &&
+            _sm_effect_has_compiled_carrier(port) || continue
         copied = _sm_structural_copy(getfield(port, :initial_effect_state))
         push!(pairs, name => _sm_canonicalize_topology(
             copied, getfield(port, :topology_contract)))
@@ -3930,7 +3966,8 @@ end
 function _sm_validate_effect_topologies(ports::NamedTuple, effects)
     for name in propertynames(ports)
         port = getfield(ports, name)
-        port isa _EffectCallablePort || continue
+        port isa _EffectCallablePort &&
+            _sm_effect_has_compiled_carrier(port) || continue
         hasproperty(effects, name) || throw(ArgumentError(
             "functional effects are missing port `$name`"))
         _sm_validate_topology_contract(
@@ -3950,6 +3987,264 @@ function _sm_canonicalize_effect_topologies(ports::NamedTuple, effects)
     end
     NamedTuple{names}(values)
 end
+
+_sm_observation_names(
+    ::_FunctionalStateMachineTransition{
+        Names,Groups,ArrayNames,StateType,EffectType,Iterations,ArgumentTypes,
+        Declared,Forest,F,P,E,C,T,ObservationNames}) where
+    {Names,Groups,ArrayNames,StateType,EffectType,Iterations,ArgumentTypes,
+     Declared,Forest,F,P,E,C,T,ObservationNames} = ObservationNames
+
+@inline function _sm_observation_predicated_select(active, new::T, old::T) where {T}
+    new === old && return old
+    _sm_predicated_select(active, new, old)
+end
+@inline _sm_observation_predicated_select(active, new, old) =
+    _sm_predicated_select(active, new, old)
+@inline _sm_observation_predicated_select(
+        active, new::NamedTuple, old::NamedTuple) =
+    map((candidate, prior) ->
+            _sm_observation_predicated_select(active, candidate, prior),
+        new, old)
+@inline _sm_observation_predicated_select(active, new::Tuple, old::Tuple) =
+    map((candidate, prior) ->
+            _sm_observation_predicated_select(active, candidate, prior),
+        new, old)
+
+function _sm_observation_outbox(record, ::Val{Capacity}, index_seed,
+                                predicate_false) where {Capacity}
+    Capacity >= 1 || throw(ArgumentError(
+        "observational outbox capacity must be positive"))
+    (
+        records=ntuple(_ -> record, Val(Capacity)),
+        active=ntuple(_ -> predicate_false, Val(Capacity)),
+        count=zero(index_seed),
+        overflow=predicate_false,
+    )
+end
+
+function _sm_observation_outbox_push(outbox, record, active)
+    records = getfield(outbox, :records)
+    isempty(records) && throw(ArgumentError(
+        "observational outbox has zero capacity"))
+    prototype = first(records)
+    _sm_functional_argument_type_ok(typeof(record), typeof(prototype)) &&
+        _sm_functional_shape_ok(record, prototype) || throw(ArgumentError(
+            "forbidden observational outbox growth: expected " *
+            "$(typeof(prototype)) with axes $(_sm_shape_contract(prototype)); " *
+            "observed $(typeof(record)) with axes $(_sm_shape_contract(record))"))
+    count = getfield(outbox, :count)
+    capacity = length(records)
+    available = count < capacity
+    selected = ntuple(Val(capacity)) do index
+        slot = _sm_predicated_and(active,
+            _sm_predicated_and(available, count == index - 1))
+        _sm_observation_predicated_select(slot, record, records[index])
+    end
+    selected_active = ntuple(Val(capacity)) do index
+        slot = _sm_predicated_and(active,
+            _sm_predicated_and(available, count == index - 1))
+        _sm_predicated_or(getfield(outbox, :active)[index], slot)
+    end
+    increment = _sm_predicated_select(
+        _sm_predicated_and(active, available), one(count), zero(count))
+    overflow = _sm_predicated_or(
+        getfield(outbox, :overflow),
+        _sm_predicated_and(active, _sm_predicated_not(available)))
+    (records=selected, active=selected_active,
+     count=count + increment, overflow)
+end
+
+
+function _sm_observation_slots(records::Tuple, active::Tuple, index_seed,
+                               predicate_false)
+    length(records) == length(active) && !isempty(records) ||
+        throw(ArgumentError(
+            "observational slots require equal nonempty record/activity tuples"))
+    count = zero(index_seed)
+    for flag in active
+        count += _sm_predicated_select(flag, one(count), zero(count))
+    end
+    (records, active, count, overflow=predicate_false)
+end
+
+function _sm_observation_outbox_reset(outbox, control_overflow)
+    zero_count = zero(getfield(outbox, :count))
+    false_overflow = _sm_predicated_not(
+        _sm_predicated_or(getfield(outbox, :overflow), true))
+    (
+        records=getfield(outbox, :records),
+        active=map(flag -> _sm_predicated_select(
+            control_overflow, false_overflow, flag),
+            getfield(outbox, :active)),
+        count=_sm_predicated_select(
+            control_overflow, zero_count, getfield(outbox, :count)),
+        overflow=_sm_predicated_select(
+            control_overflow, false_overflow, getfield(outbox, :overflow)),
+    )
+end
+
+function _sm_restore_observation_state(
+        transition::_FunctionalStateMachineTransition{
+            Names,Groups,ArrayNames,StateType}, value) where
+        {Names,Groups,ArrayNames,StateType}
+    materialized = _sm_materialize_observation(value, StateType)
+    canonical = _sm_canonicalize_topology(
+        materialized, getfield(transition, :topology_contract))
+    _sm_restore_reusable_state_ports(
+        getfield(transition, :ports), canonical, Groups)
+end
+
+_sm_materialize_observation(value, ::Type{Nothing}) = nothing
+_sm_materialize_observation(value, ::Type{T}) where {T<:Number} = T(value)
+_sm_materialize_observation(value, ::Type{T}) where {T<:AbstractArray} =
+    convert(T, Array(value))
+function _sm_materialize_observation(value::NamedTuple, ::Type{T}) where
+        {T<:NamedTuple}
+    names = fieldnames(T)
+    propertynames(value) == names || throw(ArgumentError(
+        "observational outbox record has the wrong NamedTuple layout"))
+    NamedTuple{names}(Tuple(_sm_materialize_observation(
+        getfield(value, name), fieldtype(T, name)) for name in names))
+end
+function _sm_materialize_observation(value::Tuple, ::Type{T}) where {T<:Tuple}
+    length(value) == length(T.parameters) || throw(ArgumentError(
+        "observational outbox record has the wrong tuple arity"))
+    Tuple(_sm_materialize_observation(item, expected)
+          for (item, expected) in zip(value, T.parameters))
+end
+_sm_materialize_observation(value::LinearAlgebra.Diagonal,
+        ::Type{T}) where {T<:LinearAlgebra.Diagonal} =
+    LinearAlgebra.Diagonal(_sm_materialize_observation(
+        value.diag, fieldtype(T, :diag)))
+function _sm_materialize_observation(value::LinearAlgebra.Cholesky,
+        ::Type{T}) where {T<:LinearAlgebra.Cholesky}
+    LinearAlgebra.Cholesky(
+        _sm_materialize_observation(value.factors, fieldtype(T, :factors)),
+        value.uplo, Int(value.info))
+end
+function _sm_materialize_observation(value, ::Type{T}) where {T}
+    value isa T || throw(ArgumentError(
+        "observational outbox record expected `$T`, observed `$(typeof(value))`"))
+    value
+end
+
+function _sm_materialize_observation_arguments(
+        transition, port::_EffectCallablePort{ArgTypes}, arguments::Tuple) where
+        {ArgTypes}
+    declared = ArgTypes.parameters
+    length(arguments) == length(declared) || throw(ArgumentError(
+        "observational outbox record has the wrong argument arity"))
+    Tuple(map(arguments, declared) do value, expected
+        expected === StatefulStateValue ?
+            _sm_restore_observation_state(transition, value) :
+            _sm_materialize_observation(value, expected)
+    end)
+end
+
+function _sm_observation_drain_metadata(name, outbox)
+    outbox isa NamedTuple &&
+        propertynames(outbox) == (:records, :active, :count, :overflow) ||
+        throw(ArgumentError(
+            "observational outbox `$name` has the wrong ABI layout"))
+    records = getfield(outbox, :records)
+    active_values = getfield(outbox, :active)
+    records isa Tuple && active_values isa Tuple &&
+        !isempty(records) && length(records) == length(active_values) ||
+        throw(ArgumentError(
+            "observational outbox `$name` has inconsistent fixed-capacity storage"))
+    overflow = Bool(getfield(outbox, :overflow))
+    capacity = length(records)
+    count = Int(getfield(outbox, :count))
+    0 <= count <= capacity || throw(ArgumentError(
+        "observational outbox `$name` reported invalid count $count for " *
+        "capacity $capacity"))
+    overflow && throw(ArgumentError(
+        "observational outbox `$name` overflowed its fixed capacity " *
+        "$capacity; no partial host drain was performed"))
+    active = map(Bool, active_values)
+    sum(active) == count || throw(ArgumentError(
+        "observational outbox `$name` logical count disagrees with its " *
+        "fixed activity mask"))
+    (; records, active, count, capacity, overflow)
+end
+
+function _sm_drain_source_observation!(transition, name, port, outbox,
+                                       metadata)
+    records = getfield(metadata, :records)
+    active = getfield(metadata, :active)
+    for index in eachindex(active)
+        active[index] || continue
+        record = records[index]
+        arguments = _sm_materialize_observation_arguments(
+            transition, port, getfield(record, :arguments))
+        getfield(port, :source)(arguments...)
+    end
+    count = getfield(metadata, :count)
+    capacity = getfield(metadata, :capacity)
+    overflow = getfield(metadata, :overflow)
+    (; count, capacity, overflow, value=nothing)
+end
+
+function _sm_drain_lowering_observation!(transition, name,
+        port::_EffectCallablePort{ArgTypes,Result,Written,EffectState}, outbox,
+        metadata) where
+        {ArgTypes,Result,Written,EffectState}
+    active = getfield(metadata, :active)
+    count = getfield(metadata, :count)
+    capacity = getfield(metadata, :capacity)
+    overflow = getfield(metadata, :overflow)
+    value = count == 0 ? nothing : begin
+        index = findfirst(identity, active)
+        _sm_materialize_observation(
+            getfield(getfield(outbox, :records)[index], :effect_state),
+            EffectState)
+    end
+    (; count, capacity, overflow, value)
+end
+
+"""
+    drain_observations!(transition, result)
+
+Drain the fixed-capacity observational outbox after a completed compiled
+transition. Source-backed observations replay their ordinary Julia callback;
+compiler-only authorities return their final fixed-shape summary as `value`.
+The returned NamedTuple reports `(count, capacity, overflow, value)` per port.
+This call is the explicit synchronization boundary; callers may schedule it on
+their own Julia task after the compiled invocation returns.
+"""
+function drain_observations!(
+        transition::_FunctionalStateMachineTransition, result)
+    names = _sm_observation_names(transition)
+    isempty(names) && throw(ArgumentError(
+        "causal effects remain in the compiled `effects` carrier; this " *
+        "transition has no host-drained observational outbox"))
+    hasproperty(result, :outbox) || throw(ArgumentError(
+        "compiled result is missing its observational outbox ABI"))
+    outbox = getfield(result, :outbox)
+    propertynames(outbox) == names || throw(ArgumentError(
+        "observational outbox ABI mismatch: expected names $names, " *
+        "observed $(propertynames(outbox))"))
+    # Validate every port, including overflow, before invoking any source
+    # callback.  A multi-port drain is therefore all-or-nothing with respect
+    # to host-visible replay.
+    metadata = map(names) do name
+        _sm_observation_drain_metadata(name, getfield(outbox, name))
+    end
+    values = map(names, metadata) do name, item_metadata
+        port = getfield(getfield(transition, :ports), name)
+        item = getfield(outbox, name)
+        _sm_effect_mode(port) === :source ?
+            _sm_drain_source_observation!(
+                transition, name, port, item, item_metadata) :
+            _sm_drain_lowering_observation!(
+                transition, name, port, item, item_metadata)
+    end
+    NamedTuple{names}(values)
+end
+
+drain_observations!(guarded::ValidatedCompiledTransition, result) =
+    drain_observations!(getfield(guarded, :transition), result)
 
 function _sm_effect_predicated_select(
         port::_EffectCallablePort, active, candidate, prior)
@@ -3981,6 +4276,39 @@ function _sm_functional_machine_call(
         result.state, getfield(transition, :topology_contract))
     _sm_validate_effect_topologies(
         getfield(transition, :ports), result.effects)
+    _sm_validate_observation_result(transition, result)
+    result
+end
+
+function _sm_validate_observation_result(
+        transition::_FunctionalStateMachineTransition, result)
+    names = _sm_observation_names(transition)
+    if isempty(names)
+        hasproperty(result, :outbox) && throw(ArgumentError(
+            "causal-only compiled result unexpectedly contains an " *
+            "observational outbox"))
+        return result
+    end
+    hasproperty(result, :outbox) || throw(ArgumentError(
+        "compiled result is missing its observational outbox ABI"))
+    outbox = getfield(result, :outbox)
+    outbox isa NamedTuple && propertynames(outbox) == names ||
+        throw(ArgumentError(
+            "observational outbox ABI mismatch: expected names $names, " *
+            "observed $(outbox isa NamedTuple ? propertynames(outbox) : typeof(outbox))"))
+    for name in names
+        item = getfield(outbox, name)
+        item isa NamedTuple &&
+            propertynames(item) == (:records, :active, :count, :overflow) ||
+            throw(ArgumentError(
+                "observational outbox `$name` has the wrong ABI layout"))
+        records = getfield(item, :records)
+        active = getfield(item, :active)
+        records isa Tuple && active isa Tuple && !isempty(records) &&
+            length(records) == length(active) || throw(ArgumentError(
+                "observational outbox `$name` has inconsistent " *
+                "fixed-capacity storage"))
+    end
     result
 end
 
@@ -3995,8 +4323,9 @@ function _sm_validate_compiled_arguments_input(
         throw(MethodError(transition, arguments))
     all(_sm_functional_argument_type_ok(A, E)
         for (A, E) in zip(actual, expected)) ||
-        throw(ArgumentError(
-            "functional state-machine arguments do not match their logical contract"))
+        _sm_runtime_abi_mismatch(
+            "functional state-machine arguments", ArgumentTypes, nothing,
+            arguments)
     for argument in arguments
         argument isa OrderedRNGReplay &&
             _sm_validate_ordered_rng_storage(argument)
@@ -4030,11 +4359,14 @@ function _sm_validate_compiled_effects_input(
             Names,Groups,ArrayNames,StateType,EffectType}, effects) where
         {Names,Groups,ArrayNames,StateType,EffectType}
     _sm_functional_argument_type_ok(typeof(effects), EffectType) ||
-        throw(ArgumentError(
-            "functional state-machine effects do not match their logical contract"))
+        _sm_runtime_abi_mismatch(
+            "functional state-machine effects", EffectType,
+            _sm_shape_contract(initial_transition_effects(transition)), effects)
     initial_effects = initial_transition_effects(transition)
-    _sm_functional_shape_ok(effects, initial_effects) || throw(ArgumentError(
-        "functional state-machine effects do not match their compiled axes"))
+    _sm_functional_shape_ok(effects, initial_effects) ||
+        _sm_runtime_abi_mismatch(
+            "functional state-machine effects", EffectType,
+            _sm_shape_contract(initial_effects), effects)
     _sm_validate_effect_topologies(getfield(transition, :ports), effects)
     effects
 end
@@ -4043,10 +4375,13 @@ function _sm_validate_reusable_compiled_effects_input(
         transition::_FunctionalStateMachineTransition, effects)
     initial_effects = initial_transition_effects(transition)
     propertynames(effects) == propertynames(initial_effects) ||
-        throw(ArgumentError(
-            "reusable compiled effects have the wrong layout"))
-    _sm_functional_shape_ok(effects, initial_effects) || throw(ArgumentError(
-        "reusable compiled effects do not match their compiled axes"))
+        _sm_runtime_abi_mismatch(
+            "reusable compiled effects", typeof(initial_effects),
+            _sm_shape_contract(initial_effects), effects)
+    _sm_functional_shape_ok(effects, initial_effects) ||
+        _sm_runtime_abi_mismatch(
+            "reusable compiled effects", typeof(initial_effects),
+            _sm_shape_contract(initial_effects), effects)
     _sm_validate_effect_topologies(getfield(transition, :ports), effects)
     effects
 end
@@ -4057,11 +4392,13 @@ function _sm_validate_compiled_state_input(
         {Names,Groups,ArrayNames,StateType}
     propertynames(state) == Names &&
         _sm_functional_argument_type_ok(typeof(state), StateType) ||
-        throw(ArgumentError(
-            "functional state-machine state does not match its logical contract"))
+        _sm_runtime_abi_mismatch(
+            "functional state-machine state", StateType,
+            getfield(transition, :shape_contract), state)
     _sm_shape_contract_ok(state, getfield(transition, :shape_contract)) ||
-        throw(ArgumentError(
-            "functional state-machine state does not match its compiled axes"))
+        _sm_runtime_abi_mismatch(
+            "functional state-machine state", StateType,
+            getfield(transition, :shape_contract), state)
     _sm_validate_topology_contract(
         state, getfield(transition, :topology_contract))
     _sm_validate_functional_state_ports(getfield(transition, :ports), state)
@@ -4076,11 +4413,13 @@ function _sm_validate_reusable_compiled_state_input(
         transition::_FunctionalStateMachineTransition{
             Names,Groups,ArrayNames,StateType}, state) where
         {Names,Groups,ArrayNames,StateType}
-    propertynames(state) == Names || throw(ArgumentError(
-        "reusable compiled state-machine state has the wrong layout"))
+    propertynames(state) == Names || _sm_runtime_abi_mismatch(
+        "reusable compiled state-machine state", StateType,
+        getfield(transition, :shape_contract), state)
     _sm_shape_contract_ok(state, getfield(transition, :shape_contract)) ||
-        throw(ArgumentError(
-            "reusable compiled state-machine state does not match its compiled axes"))
+        _sm_runtime_abi_mismatch(
+            "reusable compiled state-machine state", StateType,
+            getfield(transition, :shape_contract), state)
     _sm_validate_topology_contract(
         state, getfield(transition, :topology_contract))
     _sm_validate_reusable_state_ports(getfield(transition, :ports), state)
@@ -4211,6 +4550,7 @@ function _sm_validate_reusable_compiled_output(
     hasproperty(result, :effects) &&
         _sm_validate_reusable_compiled_effects_input(
             transition, result.effects)
+    _sm_validate_observation_result(transition, result)
     result
 end
 
@@ -4238,9 +4578,12 @@ function _sm_validate_reusable_compiled_raw_output(
         live_arguments::Tuple) where
         {Names,Groups,ArrayNames,StateType,EffectType,Iterations,
          ArgumentTypes,Declared,Forest}
-    expected_layout = (
-        :state, :arguments, :result, :returned,
-        :control_overflow, :effects)
+    observation_names = _sm_observation_names(transition)
+    expected_layout = isempty(observation_names) ?
+        (:state, :arguments, :result, :returned,
+         :control_overflow, :effects) :
+        (:state, :arguments, :result, :returned,
+         :control_overflow, :effects, :outbox)
     result isa NamedTuple && propertynames(result) == expected_layout ||
         throw(ArgumentError(
             "raw backend state-machine result has the wrong ABI layout"))
@@ -4289,6 +4632,7 @@ function _sm_validate_reusable_compiled_raw_output(
         "raw backend effects have the wrong axes"))
     _sm_validate_effect_topologies(
         getfield(transition, :ports), effects)
+    _sm_validate_observation_result(transition, result)
     result
 end
 
@@ -4817,6 +5161,40 @@ function _sm_functional_machine_sibling_rhs(call::_CallExpr, syms,
     :(_sm_predicated_select($condition, $then_value, $else_value))
 end
 
+function _sm_observation_capacities(ir::MethodIR, field_regs,
+                                    max_iterations::Int)
+    counts = Dict{Symbol,Int}()
+    add!(name, amount) = begin
+        counts[name] = Base.Checked.checked_add(get(counts, name, 0), amount)
+    end
+    function walk!(block, multiplier)
+        for statement in block
+            if statement isa _ExprStmt && statement.expr isa _FieldCall &&
+                    length(statement.expr.path) == 1
+                name = only(statement.expr.path)
+                port = get(field_regs, name, nothing)
+                port isa _EffectCallablePort &&
+                    _sm_effect_is_observational(port) && add!(name, multiplier)
+            elseif statement isa _If
+                walk!(statement.thenb, multiplier)
+                walk!(statement.elseb, multiplier)
+            elseif statement isa _Guard
+                walk!(statement.body, multiplier)
+            elseif statement isa _For
+                walk!(statement.body,
+                      Base.Checked.checked_mul(multiplier, max_iterations))
+            end
+        end
+    end
+    try
+        walk!(ir.body, 1)
+    catch error
+        error isa OverflowError || rethrow()
+        _sm_reject("observational outbox capacity exceeds Int")
+    end
+    counts
+end
+
 function _functional_state_machine_method(
         kernel::_StatefulKernel{S,PF,RT,OW,SH,B,C,T}, ir::MethodIR,
         max_iterations::Int, ::Type{ArgumentTypes}, ::Type{Declared},
@@ -4842,6 +5220,9 @@ function _functional_state_machine_method(
     field_regs = _stateful_field_regs(getfield(kernel, :bindings))
     ports = _sm_freeze_compiler_ports(
         getfield(getfield(kernel, :bindings), :fields))
+    observation_capacities = _sm_observation_capacities(
+        ir, field_regs, max_iterations)
+    observation_names = Tuple(sort!(collect(keys(observation_capacities))))
     methods_by_id = Dict{MethodId,MethodIR}(
         method.id => method for method in captured_methods)
     spec = kernel_spec(skeleton)
@@ -4874,6 +5255,10 @@ function _functional_state_machine_method(
     ensures = Any[]
     base_syms = Dict{Any,Symbol}()
     effect_syms = Dict{Symbol,Symbol}()
+    observation_effect_syms = Dict{Symbol,Symbol}()
+    observation_seen_syms = Dict{Symbol,Symbol}()
+    observation_records = Dict{Symbol,Vector{Any}}()
+    observation_activity = Dict{Symbol,Vector{Any}}()
     formals = Dict{Symbol,Bool}()
     locals = Dict{Symbol,Bool}()
     serial = Ref(0)
@@ -4897,13 +5282,29 @@ function _functional_state_machine_method(
     for name in propertynames(ports)
         port = getfield(ports, name)
         port isa _EffectCallablePort || continue
-        initial = fresh(:__sfm_initial_effect_, name)
-        symbol = fresh(:__sfm_effect_, name)
-        initial_effect_syms[name] = initial
-        effect_syms[name] = symbol
-        push!(statements, :(local $initial = getfield(
-            input_effects, $(QuoteNode(name)))))
-        push!(statements, :(local $symbol = $initial))
+        if _sm_effect_is_causal(port)
+            initial = fresh(:__sfm_initial_effect_, name)
+            symbol = fresh(:__sfm_effect_, name)
+            initial_effect_syms[name] = initial
+            effect_syms[name] = symbol
+            push!(statements, :(local $initial = getfield(
+                input_effects, $(QuoteNode(name)))))
+            push!(statements, :(local $symbol = $initial))
+        elseif _sm_effect_mode(port) === :lowering_authority
+            initial = fresh(:__sfm_initial_observation_effect_, name)
+            symbol = fresh(:__sfm_observation_effect_, name)
+            initial_effect_syms[name] = initial
+            effect_syms[name] = symbol
+            observation_effect_syms[name] = symbol
+            push!(statements, :(local $initial = begin
+                local __port = getfield(ports, $(QuoteNode(name)))
+                _sm_canonicalize_topology(
+                    _sm_structural_copy(
+                        getfield(__port, :initial_effect_state)),
+                    getfield(__port, :topology_contract))
+            end))
+            push!(statements, :(local $symbol = $initial))
+        end
     end
     initial_field_syms = copy(base_syms)
     for (position, formal) in enumerate(ir.formals)
@@ -4950,6 +5351,11 @@ function _functional_state_machine_method(
         :__sfm_predicate_true_)
     predicate_false = bind!(
         :(_sm_predicated_not($predicate_true)), :__sfm_predicate_false_)
+    for name in keys(observation_effect_syms)
+        seen = fresh(:__sfm_observation_seen_, name)
+        observation_seen_syms[name] = seen
+        push!(statements, :(local $seen = $predicate_false))
+    end
     control_overflow = bind!(predicate_false, :__sfm_control_overflow_)
     return_seen = bind!(predicate_false, :__sfm_return_seen_)
     return_value = Ref{Any}(nothing)
@@ -5442,7 +5848,10 @@ function _functional_state_machine_method(
                     "require one typed callable field")
                 name = only(call.path)
                 port = _sm_effect_port(field_regs, name)
-                port.functional_lowering isa _TotalFunctionalLowering ||
+                source_observation = _sm_effect_is_observational(port) &&
+                    _sm_effect_mode(port) === :source
+                source_observation ||
+                    port.functional_lowering isa _TotalFunctionalLowering ||
                     _sm_reject(
                         "control-dependent effect callable `$name` requires " *
                         "an explicit total_functional_lowering contract")
@@ -5467,7 +5876,19 @@ function _functional_state_machine_method(
                     push!(keywords, pair.first =>
                         rhs(pair.second, local_syms, local_types, active))
                 end
-                effect = effect_syms[name]
+                if source_observation
+                    isempty(keywords) || _sm_reject(
+                        "host-drained observational callable `$name` does not " *
+                        "yet support keyword arguments")
+                    record = :((arguments=($(arguments...),),))
+                    captured = bind!(record,
+                        :__sfm_observation_record_, name)
+                    push!(get!(observation_records, name, Any[]), captured)
+                    push!(get!(observation_activity, name, Any[]), active)
+                    continue
+                end
+                effect = haskey(effect_syms, name) ? effect_syms[name] :
+                    observation_effect_syms[name]
                 raw_call = _sm_call_with_keywords(
                     :(getfield(getfield(ports, $(QuoteNode(name))),
                                :functional_lowering)),
@@ -5517,6 +5938,11 @@ function _functional_state_machine_method(
                 effect_port = :(getfield(ports, $(QuoteNode(name))))
                 push!(statements, :($effect = _sm_effect_predicated_select(
                     $effect_port, $active, $replacement_effect, $effect)))
+                if _sm_effect_is_observational(port)
+                    seen = observation_seen_syms[name]
+                    push!(statements, :($seen = _sm_predicated_or(
+                        $seen, $active)))
+                end
                 written = _kernel_field_written_arguments(port)
                 written_roots = Int[]
                 for position in written
@@ -5805,15 +6231,52 @@ function _functional_state_machine_method(
     effects = Any[:(_sm_predicated_select(
         $control_overflow, $(initial_effect_syms[name]), $(effect_syms[name])))
         for name in effect_names]
+    outboxes = Any[]
+    for name in observation_names
+        port = getfield(ports, name)
+        current = if _sm_effect_mode(port) === :source
+            records = observation_records[name]
+            activity = observation_activity[name]
+            length(records) == observation_capacities[name] || _sm_reject(
+                "generated observational slot count disagrees with its " *
+                "fixed capacity for `$name`")
+            bind!(
+                :(_sm_observation_slots(
+                    ($(records...),), ($(activity...),),
+                    $index_source, $predicate_false)),
+                :__sfm_observation_slots_, name)
+        else
+            record = :((effect_state=$(observation_effect_syms[name]),))
+            bind!(
+                :(_sm_observation_slots(
+                    ($record,), ($(observation_seen_syms[name]),),
+                    $index_source, $predicate_false)),
+                :__sfm_observation_summary_, name)
+        end
+        push!(outboxes,
+            :(_sm_observation_outbox_reset($current, $control_overflow)))
+    end
     formal_outputs = Any[base_syms[(:formal, formal.name)] for formal in ir.formals]
-    push!(statements, :(return (
-        state=NamedTuple{$names}(($(outputs...),)),
-        arguments=($(formal_outputs...),),
-        result=$result,
-        returned=$returned,
-        control_overflow=$control_overflow,
-        effects=NamedTuple{$effect_names}(($(effects...),)),
-    )))
+    if isempty(observation_names)
+        push!(statements, :(return (
+            state=NamedTuple{$names}(($(outputs...),)),
+            arguments=($(formal_outputs...),),
+            result=$result,
+            returned=$returned,
+            control_overflow=$control_overflow,
+            effects=NamedTuple{$effect_names}(($(effects...),)),
+        )))
+    else
+        push!(statements, :(return (
+            state=NamedTuple{$names}(($(outputs...),)),
+            arguments=($(formal_outputs...),),
+            result=$result,
+            returned=$returned,
+            control_overflow=$control_overflow,
+            effects=NamedTuple{$effect_names}(($(effects...),)),
+            outbox=NamedTuple{$observation_names}(($(outboxes...),)),
+        )))
+    end
     fn = compile(:((ports, ensures, state, arguments, input_effects) ->
         $(Expr(:block, statements...))))
     state_type = _sm_state_snapshot_type(plan, OW, SH)
@@ -5826,7 +6289,8 @@ function _functional_state_machine_method(
         names,alias_groups,array_names,state_type,effect_type,max_iterations,
         ArgumentTypes,
         Declared,Forest,
-        typeof(fn),typeof(ports),typeof(Tuple(ensures)),C,T}(
+        typeof(fn),typeof(ports),typeof(Tuple(ensures)),C,T,
+        observation_names}(
             fn, ports, Tuple(ensures), getfield(kernel, :shape_contract),
             getfield(kernel, :topology_contract))
 end
