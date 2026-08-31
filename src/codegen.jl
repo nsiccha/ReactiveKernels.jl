@@ -56,7 +56,16 @@ function plate_body(recipe::Recipe)
     recipe.op.kernel.plan
 end
 
-@inline _authored_plate_is_axis(x) = !isempty(axes(Base.broadcastable(x)))
+# Marker discovery must not invoke arbitrary iteration or `broadcastable`
+# machinery: outer HAVE values can be atomic structures whose derived fields
+# eventually feed a plate.  Restrict axis recognition to the collection shapes
+# that the native authored-plate lowering consumes directly.  Backends can
+# extend this internal trait for another array representation when necessary.
+@inline _authored_plate_is_axis(x) = false
+@inline _authored_plate_is_axis(x::AbstractArray) = !isempty(axes(x))
+@inline _authored_plate_is_axis(x::Tuple) = !isempty(axes(x))
+@inline _authored_plate_is_axis(x::Base.Broadcast.Broadcasted) =
+    !isempty(axes(x))
 
 @inline _authored_plate_argument(::Val{A}, index, arg) where {A} =
     index in A ? Ref(arg) : arg
@@ -718,32 +727,59 @@ end
 
 # An untyped authored signature still specializes on its concrete call-site
 # argument types.  Keep every graph-proven candidate axis as type metadata and
-# select the first runtime broadcast axis before choosing native vs. tensorized
-# execution.  Atomic `Ref(port)` inputs are excluded when the candidates are
-# derived, so an array-valued atom cannot accidentally become the batch marker.
+# prefer the first runtime broadcast axis when choosing native vs. tensorized
+# execution.  The native call ignores the marker and may derive its plate axis
+# only after projecting an atomic boundary, so exhausting the candidates falls
+# back to a non-axis sentinel.  Atomic `Ref(port)` inputs are excluded when the
+# candidates are derived, so an array-valued atom cannot accidentally become
+# the batch marker.
 struct _DynamicEmbeddedFunctionPair{I,N,T,A} <: _ArrayFunctionPair
     native::N
     tensorized::T
     tensorized_ast::A
 end
 
-@inline _dynamic_embedded_marker(args, ::Val{()}) = throw(ArgumentError(
-    "an embedded plate requires an array-valued HAVE port at runtime"))
+@inline _dynamic_embedded_marker(args, ::Val{()}) = nothing
+
+# A graph-proven candidate can be an atomic model boundary rather than the
+# array consumed by a downstream plate.  Traverse only deliberately supported
+# structures; generic structs remain atomic instead of being reflected over or
+# passed to `broadcastable`.  Backend extensions may specialize this trait for
+# their own transparent runtime carrier.
+@inline _embedded_marker_values(x) = ()
+@inline _embedded_marker_values(x::NamedTuple) = values(x)
+
+@inline function _embedded_axis_marker(value)
+    _authored_plate_is_axis(value) && return value
+    _embedded_axis_marker_values(_embedded_marker_values(value))
+end
+
+@inline _embedded_axis_marker_values(::Tuple{}) = nothing
+
+@inline function _embedded_axis_marker_values(values::Tuple)
+    marker = _embedded_axis_marker(first(values))
+    marker === nothing ?
+        _embedded_axis_marker_values(Base.tail(values)) : marker
+end
 
 @inline function _dynamic_embedded_marker(args, ::Val{I}) where {I}
     index = first(I)
-    marker = getfield(args, index)
-    _authored_plate_is_axis(marker) && return marker
+    marker = _embedded_axis_marker(getfield(args, index))
+    marker === nothing || return marker
     _dynamic_embedded_marker(args, Val(Base.tail(I)))
 end
 
 @inline _requires_tensorized_marker(marker) = false
 @inline _dynamic_tensorized_marker(::Tuple{}) = nothing
 
+@inline function _dynamic_tensorized_value_marker(value)
+    _requires_tensorized_marker(value) && return value
+    _dynamic_tensorized_marker(_embedded_marker_values(value))
+end
+
 @inline function _dynamic_tensorized_marker(args::Tuple)
-    marker = first(args)
-    _requires_tensorized_marker(marker) && return marker
-    _dynamic_tensorized_marker(Base.tail(args))
+    marker = _dynamic_tensorized_value_marker(first(args))
+    marker === nothing ? _dynamic_tensorized_marker(Base.tail(args)) : marker
 end
 
 @inline function (f::_DynamicEmbeddedFunctionPair{I})(ops, args...) where {I}
