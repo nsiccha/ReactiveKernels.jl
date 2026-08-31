@@ -1,4 +1,5 @@
 using ReactiveKernels
+using ReactiveKernelsNUTSExamples
 using Reactant
 using LinearAlgebra
 using Random
@@ -77,7 +78,7 @@ end
 function _nr_test_frame(::Type{T}, max_depth;
         metric=T[2 0; 0 2], min_dham=T(-1000),
         pot_f=_nr_quadratic_pot, grad_f=_nr_quadratic_grad!) where {T}
-    frame = ReactiveKernels._construct_nuts_frame(
+    frame = ReactiveKernelsNUTSExamples._construct_nuts_frame(
         _NR_PF, _nr_test_values(T; metric, pot_f, grad_f), max_depth;
         step_f=ReactiveKernels.partial(_NR_FIX.leapfrog!; stepsize=T(0.1)),
         stats_f=_NR_FIX.nuts_stats!, min_dham)
@@ -85,7 +86,7 @@ function _nr_test_frame(::Type{T}, max_depth;
         _NR_PF, typeof(frame.init), typeof(frame.shared))(
             frame.init, frame.shared,
             ReactiveKernels.kernel_prepared_handles(_NR_PF))
-    ReactiveKernels._seed_nuts_children!(frame)
+    ReactiveKernelsNUTSExamples._seed_nuts_children!(frame)
     frame
 end
 
@@ -96,7 +97,7 @@ function _nr_test_bundle(log, max_depth)
         item[1] === :direction ? push!(directions, item[2]) :
         push!(exponentials, item[2])
     end
-    bundle = ReactiveKernels.nuts_reactant_bundle(
+    bundle = ReactiveKernelsNUTSExamples.nuts_reactant_bundle(
         momentum, directions, exponentials, max_depth)
     bundle, directions, exponentials
 end
@@ -112,7 +113,7 @@ function _nr_oracle_transition!(oracle, seed)
 end
 
 function _nr_replay_native!(frame, bundle, directions, exponentials)
-    native = ReactiveKernels.compile_nuts(
+    native = ReactiveKernelsNUTSExamples.compile_nuts(
         _NR_PF, _NR_FIX.nuts_state, _NR_FIX.refresh_momentum!!,
         _NR_FIX.nuts!!, frame)
     rng = _NRReplayRNG(copy(bundle.momentum), copy(directions), copy(exponentials), 0, 0)
@@ -189,7 +190,7 @@ end
 
 @testset "kernel-derived adaptive NUTS compiles through Reactant" begin
     seed_frame = _nr_test_frame(Float64, 1)
-    compiled = ReactiveKernels.compile_nuts_reactant(
+    compiled = ReactiveKernelsNUTSExamples.compile_nuts_reactant(
         _NR_PF, _NR_FIX.nuts_state, _NR_FIX.refresh_momentum!!,
         _NR_FIX.nuts!!, seed_frame)
 
@@ -201,8 +202,8 @@ end
         _nr_replay_native!(native_frame, bundle, directions, exponentials)
         traced_frame = _nr_test_frame(Float64, 1)
         state = map(Reactant.to_rarray,
-            ReactiveKernels.nuts_reactant_state(compiled, traced_frame, bundle))
-        executable = ReactiveKernels.nuts_reactant_compile(compiled, state; sync=true)
+            ReactiveKernelsNUTSExamples.nuts_reactant_state(compiled, traced_frame, bundle))
+        executable = ReactiveKernelsNUTSExamples.nuts_reactant_compile(compiled, state; sync=true)
         output = executable(state)
         hlo = executable.module_string
 
@@ -216,7 +217,7 @@ end
         @test !occursin("ConcretePJRT", hlo)
         @test isempty(exponentials)
         written = _nr_test_frame(Float64, 1)
-        @test ReactiveKernels.nuts_reactant_writeback!(written, output) === written
+        @test ReactiveKernelsNUTSExamples.nuts_reactant_writeback!(written, output) === written
         @test _nr_close(getfield(written.init, :f4), getfield(native_frame.init, :f4))
         @test written.diag.n_steps == native_frame.diag.n_steps
     end
@@ -229,8 +230,8 @@ end
         _nr_replay_native!(native_frame, bundle1, directions1, exponentials1)
         traced_frame = _nr_test_frame(Float64, 6)
         state1 = map(Reactant.to_rarray,
-            ReactiveKernels.nuts_reactant_state(compiled, traced_frame, bundle1))
-        executable = ReactiveKernels.nuts_reactant_compile(compiled, state1)
+            ReactiveKernelsNUTSExamples.nuts_reactant_state(compiled, traced_frame, bundle1))
+        executable = ReactiveKernelsNUTSExamples.nuts_reactant_compile(compiled, state1)
         output1 = executable(state1)
         @test _nr_test_match(native_frame, output1, directions1, exponentials1)
         @test _nr_native_matches_oracle(expected1, native_frame)
@@ -241,7 +242,7 @@ end
             _nr_oracle_transition!(oracle, 54321)
         _nr_replay_native!(native_frame, bundle2, directions2, exponentials2)
         device_bundle2 = map(Reactant.to_rarray, bundle2)
-        state2 = ReactiveKernels.nuts_reactant_rebundle(output1, device_bundle2)
+        state2 = ReactiveKernelsNUTSExamples.nuts_reactant_rebundle(output1, device_bundle2)
         output2 = executable(state2)
         @test _nr_test_match(native_frame, output2, directions2, exponentials2)
         @test _nr_native_matches_oracle(expected2, native_frame)
@@ -254,9 +255,9 @@ end
             _nr_oracle_transition!(oracle, 777)
         native_frame = _nr_test_frame(Float64, 8)
         _nr_replay_native!(native_frame, bundle, directions, exponentials)
-        state = map(Reactant.to_rarray, ReactiveKernels.nuts_reactant_state(
+        state = map(Reactant.to_rarray, ReactiveKernelsNUTSExamples.nuts_reactant_state(
             compiled, _nr_test_frame(Float64, 8), bundle))
-        executable = ReactiveKernels.nuts_reactant_compile(compiled, state)
+        executable = ReactiveKernelsNUTSExamples.nuts_reactant_compile(compiled, state)
         output = executable(state)
         @test _nr_test_match(native_frame, output, directions, exponentials)
         @test _nr_native_matches_oracle(expected, native_frame)
@@ -274,9 +275,9 @@ end
         _nr_replay_native!(divergent_native, divergent_bundle,
             divergent_directions, divergent_exponentials)
         divergent_state = map(Reactant.to_rarray,
-            ReactiveKernels.nuts_reactant_state(compiled,
+            ReactiveKernelsNUTSExamples.nuts_reactant_state(compiled,
                 _nr_test_frame(Float64, 1; min_dham=Inf), divergent_bundle))
-        divergent_executable = ReactiveKernels.nuts_reactant_compile(
+        divergent_executable = ReactiveKernelsNUTSExamples.nuts_reactant_compile(
             compiled, divergent_state)
         divergent_output = divergent_executable(divergent_state)
         @test Array(divergent_output.diverged)[1] == 1
@@ -299,9 +300,9 @@ end
 
         native_frame = _nr_test_frame(Float64, 0; min_dham=Inf)
         _nr_replay_native!(native_frame, bundle, directions, exponentials)
-        state = map(Reactant.to_rarray, ReactiveKernels.nuts_reactant_state(
+        state = map(Reactant.to_rarray, ReactiveKernelsNUTSExamples.nuts_reactant_state(
             compiled, _nr_test_frame(Float64, 0; min_dham=Inf), bundle))
-        executable = ReactiveKernels.nuts_reactant_compile(compiled, state)
+        executable = ReactiveKernelsNUTSExamples.nuts_reactant_compile(compiled, state)
         output = executable(state)
         @test _nr_native_matches_oracle(expected, native_frame)
         @test _nr_reactant_matches_oracle(expected, output, directions, exponentials)
@@ -318,7 +319,7 @@ end
     end
 
     @testset "repeated nonfinite leaves retain negative-infinity sentinel" begin
-        bundle = ReactiveKernels.nuts_reactant_bundle(
+        bundle = ReactiveKernelsNUTSExamples.nuts_reactant_bundle(
             [1.0, 0.5], [false, false], [1.0, 1.0, 1.0], 2)
         native_frame = _nr_test_frame(Float64, 2;
             min_dham=-Inf, pot_f=_nr_nan_pot, grad_f=_nr_nan_grad!)
@@ -326,12 +327,12 @@ end
 
         traced_frame = _nr_test_frame(Float64, 2;
             min_dham=-Inf, pot_f=_nr_nan_pot, grad_f=_nr_nan_grad!)
-        nonfinite_compiled = ReactiveKernels.compile_nuts_reactant(
+        nonfinite_compiled = ReactiveKernelsNUTSExamples.compile_nuts_reactant(
             _NR_PF, _NR_FIX.nuts_state, _NR_FIX.refresh_momentum!!,
             _NR_FIX.nuts!!, traced_frame)
-        state = map(Reactant.to_rarray, ReactiveKernels.nuts_reactant_state(
+        state = map(Reactant.to_rarray, ReactiveKernelsNUTSExamples.nuts_reactant_state(
             nonfinite_compiled, traced_frame, bundle))
-        executable = ReactiveKernels.nuts_reactant_compile(nonfinite_compiled, state)
+        executable = ReactiveKernelsNUTSExamples.nuts_reactant_compile(nonfinite_compiled, state)
         output = executable(state)
 
         @test native_frame.diag.dham == -Inf
@@ -349,19 +350,19 @@ end
 
     @testset "unsupported specializations reject" begin
         float32_frame = _nr_test_frame(Float32, 1)
-        @test_throws ArgumentError ReactiveKernels.compile_nuts_reactant(
+        @test_throws ArgumentError ReactiveKernelsNUTSExamples.compile_nuts_reactant(
             _NR_PF, _NR_FIX.nuts_state, _NR_FIX.refresh_momentum!!,
             _NR_FIX.nuts!!, float32_frame)
         nondiagonal = Float64[2 0.1; 0.1 2]
         nondiagonal_frame = _nr_test_frame(Float64, 1; metric=nondiagonal)
-        @test_throws ArgumentError ReactiveKernels.compile_nuts_reactant(
+        @test_throws ArgumentError ReactiveKernelsNUTSExamples.compile_nuts_reactant(
             _NR_PF, _NR_FIX.nuts_state, _NR_FIX.refresh_momentum!!,
             _NR_FIX.nuts!!, nondiagonal_frame)
-        @test_throws DimensionMismatch ReactiveKernels.nuts_reactant_bundle(
+        @test_throws DimensionMismatch ReactiveKernelsNUTSExamples.nuts_reactant_bundle(
             [1.0, 2.0], [true, false], Float64[], 1)
-        @test_throws DimensionMismatch ReactiveKernels.nuts_reactant_bundle(
+        @test_throws DimensionMismatch ReactiveKernelsNUTSExamples.nuts_reactant_bundle(
             [1.0, 2.0], Bool[], [1.0, 2.0, 3.0], 1)
-        @test_throws ArgumentError ReactiveKernels.nuts_reactant_bundle(
+        @test_throws ArgumentError ReactiveKernelsNUTSExamples.nuts_reactant_bundle(
             Float32[1, 2], Bool[], Float64[], 1)
     end
 end

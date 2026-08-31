@@ -13,7 +13,9 @@ jobs:
   test:
     name: test (${{ matrix.julia-version }}, ${{ matrix.julia-arch }}, ${{ matrix.os }}, ${{ matrix.test-shard }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    # Current/pre make sustained progress through the compiler-heavy HMC
+    # acceptance beyond 90 minutes on hosted runners; keep a bounded margin.
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:

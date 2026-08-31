@@ -1,5 +1,7 @@
 module ReactiveHMCDocsInteractions
 
+using ReactiveKernelsNUTSExamples
+
 """Exact build-executed API interaction for one compatibility phase-point panel."""
 function phasepoint_interaction(name::Symbol)
     definitions = Dict(
@@ -399,7 +401,7 @@ for slot in RK.kernel_plan_slots(plan)
         name in ("dpot_dpos", "dham_dpos", "dkin_dmom", "dham_dmom") ?
         [0.0, 0.0] : 0.0
 end
-sampler = RK._build_nuts_sampler(
+sampler = ReactiveKernelsNUTSExamples._build_nuts_sampler(
     prepared, endpoint_values, fixture.nuts_state,
     fixture.refresh_momentum!!, fixture.nuts!!;
     step_f = RK.partial(fixture.leapfrog!; stepsize = 0.1),
@@ -408,9 +410,9 @@ sampler = RK._build_nuts_sampler(
     stats_f = fixture.nuts_stats!,
 )
 result = fixture.nuts!!(sampler; rng = Random.Xoshiro(1))
-frame = RK.nuts_sampler_frame(result)
+frame = ReactiveKernelsNUTSExamples.nuts_sampler_frame(result)
 result === sampler || error("the authored NUTS entry did not return the same sampler")
-RK.diagnostics_committed_mask(frame.diag) == UInt(0x0f) ||
+ReactiveKernelsNUTSExamples.diagnostics_committed_mask(frame.diag) == UInt(0x0f) ||
     error("the authored NUTS entry did not commit its diagnostics")
 docs_interaction = (;
     name = :nuts_sampler_entry,
@@ -418,10 +420,10 @@ docs_interaction = (;
     input = (; max_depth = 3, stepsize = 0.1, rng = "Xoshiro(1)"),
     output = (;
         result_is_sampler = result === sampler,
-        n_steps = RK._diag_slot(frame.diag, Val(1)),
-        reached_depth = RK._diag_slot(frame.diag, Val(2)),
-        acceptance_rate = RK._diag_slot(frame.diag, Val(3)),
-        diagnostics_committed = RK.diagnostics_committed_mask(frame.diag),
+        n_steps = ReactiveKernelsNUTSExamples._diag_slot(frame.diag, Val(1)),
+        reached_depth = ReactiveKernelsNUTSExamples._diag_slot(frame.diag, Val(2)),
+        acceptance_rate = ReactiveKernelsNUTSExamples._diag_slot(frame.diag, Val(3)),
+        diagnostics_committed = ReactiveKernelsNUTSExamples.diagnostics_committed_mask(frame.diag),
     ),
 )
 """

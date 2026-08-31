@@ -6,6 +6,9 @@ const _ROOT_TEST_PACKAGE_PATHS = (
     joinpath(_REPOSITORY_ROOT, "packages", "ReactiveKernelsCompatibilityExamples"),
     joinpath(_REPOSITORY_ROOT, "packages", "ReactiveKernelsDistributionKernels"),
     joinpath(_REPOSITORY_ROOT, "packages", "ReactiveKernelsPPLExamples"),
+    joinpath(_REPOSITORY_ROOT, "packages", "ReactiveKernelsNUTSExamples"),
+    joinpath(_REPOSITORY_ROOT, "packages", "ReactiveKernelsStreamingStats"),
+    joinpath(_REPOSITORY_ROOT, "packages", "ReactiveKernelsHMCDiagnostics"),
 )
 
 # `Pkg.test` evaluates this file in a temporary test environment. Julia 1.10
@@ -18,6 +21,7 @@ if !samefile(Base.active_project(), _ROOT_PROJECT)
 end
 
 using ReactiveKernels
+import ReactiveKernelsNUTSExamples
 using Test
 
 const _MATRIX_CORE_TESTS = (

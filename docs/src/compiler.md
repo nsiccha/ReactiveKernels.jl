@@ -39,7 +39,7 @@ stateful object and one selected method through explicit typed callable,
 nested-state, loop-bound, and argument-domain contracts. NUTS, log-density, and
 PPL artifacts are external compilation examples and acceptance evidence, not
 domain APIs owned by ReactiveKernels. The NUTS runtime and domain surface live
-under `examples/nuts_runtime/`; a bare `using ReactiveKernels` does not load or
+in the `ReactiveKernelsNUTSExamples` nested package; a bare `using ReactiveKernels` does not load or
 export them. See [What the NUTS proof does and does not
 establish](#what-the-nuts-proof-does-and-does-not-establish).
 

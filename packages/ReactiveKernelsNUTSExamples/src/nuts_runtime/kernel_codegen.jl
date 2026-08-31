@@ -1,5 +1,5 @@
 # Domain-specific leapfrog emitter for the external NUTS compiler exemplar.
-# Loaded only by `examples/nuts_runtime.jl`; it is not part of RK's package API.
+# Loaded only by `ReactiveKernelsNUTSExamples`; it is not part of RK's core API.
 
 # ============================================================================================
 # EXECUTABLE LEAPFROG (RK 08:42/08:45/08:51) — compose the REAL captured 3-op leapfrog MethodIR writes with
@@ -103,9 +103,9 @@ function _compile_leapfrog_native(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, 
     ngrad_uncond == 1 || _l_reject(
         "executable leapfrog emitted $ngrad_uncond unconditional destination-grad recomputes; expected exactly one")
     instrumented ?
-        compile(:((owned, shared, handles, $stepkw, __lf_instrumentation) ->
+        _nuts_compile(:((owned, shared, handles, $stepkw, __lf_instrumentation) ->
                   $(Expr(:block, stmts..., :(return owned))))) :
-        compile(:((owned, shared, handles, $stepkw) -> $(Expr(:block, stmts..., :(return owned)))))
+        _nuts_compile(:((owned, shared, handles, $stepkw) -> $(Expr(:block, stmts..., :(return owned)))))
 end
 
 compile_leapfrog(pf::_PreparedFactory, ::Type{OW}, ::Type{SH}, leaf_ir::MethodIR) where {OW,SH} =

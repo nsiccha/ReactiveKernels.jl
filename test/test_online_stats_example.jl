@@ -1,4 +1,6 @@
 using ReactiveKernels
+import ReactiveKernelsHMCDiagnostics
+import ReactiveKernelsStreamingStats
 using Statistics
 using Test
 
@@ -12,9 +14,9 @@ using Main.ReactiveKernelsNUTSExample: NUTSDiagnostics
     @test_throws ArgumentError OSE.MomentsAccumulator{Float64}(-1, 0, 0)
     @test_throws ArgumentError OSE.MomentsAccumulator{Float64}(2, 0, -1)
     @test_throws ArgumentError OSE.MomentsAccumulator{Float64}(2, 0, -Inf)
-    @test_throws DomainError OSE._nonnegative_m2(-Inf, Inf)
-    @test isnan(OSE._nonnegative_m2(NaN, 1.0))
-    @test OSE._nonnegative_m2(Inf, Inf) == Inf
+    @test_throws DomainError ReactiveKernelsStreamingStats._nonnegative_m2(-Inf, Inf)
+    @test isnan(ReactiveKernelsStreamingStats._nonnegative_m2(NaN, 1.0))
+    @test ReactiveKernelsStreamingStats._nonnegative_m2(Inf, Inf) == Inf
     @test isnan(OSE.MomentsAccumulator{Float64}(2, 0, NaN).m2)
     @test OSE.MomentsAccumulator{Float64}(2, 0, Inf).m2 == Inf
 
@@ -395,7 +397,7 @@ using Main.ReactiveKernelsNUTSExample: NUTSDiagnostics
     @testset "metric adaptation uses the method-bearing welford kernel" begin
         report = OSE.metric_adaptation_report()
         @test report.dimension == 3
-        @test report.count == length(OSE.METRIC_ADAPTATION_DRAWS)
+        @test report.count == length(ReactiveKernelsHMCDiagnostics.METRIC_ADAPTATION_DRAWS)
         @test length(report.mean) == 3
         @test length(report.variance) == 3
         @test all(report.variance .>= 0)
@@ -403,7 +405,7 @@ using Main.ReactiveKernelsNUTSExample: NUTSDiagnostics
         # The report matches the page's exact ReactiveHMC-shaped kernel folded
         # the same way (this is the sampler's metric-adaptation statistic).
         reference = OSE.online_moments(3)
-        for value in OSE.METRIC_ADAPTATION_DRAWS
+        for value in ReactiveKernelsHMCDiagnostics.METRIC_ADAPTATION_DRAWS
             OSE.step!(reference, value)
         end
         @test report.mean ≈ reference.mean

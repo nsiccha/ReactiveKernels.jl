@@ -3,6 +3,7 @@
 # concrete _NutsFrame in place under one outer epoch. Uses the faithful ccb authoring fixture as the driver.
 using Test, LinearAlgebra, Random
 using ReactiveKernels
+using ReactiveKernelsNUTSExamples
 const RK = ReactiveKernels
 
 module _NutsFix
@@ -24,25 +25,25 @@ function _nuts_mkvals(pf, T)
     d
 end
 function _nuts_frame(pf, T, md)
-    frame = RK._construct_nuts_frame(pf, _nuts_mkvals(pf, T), md;
+    frame = ReactiveKernelsNUTSExamples._construct_nuts_frame(pf, _nuts_mkvals(pf, T), md;
                                      step_f = RK.partial(_NutsFix.leapfrog!; stepsize = T(0.1)), stats_f = nothing, min_dham = -1000)
     RK.compile_prepared_initialization(pf, typeof(frame.init), typeof(frame.shared))(frame.init, frame.shared, RK.kernel_prepared_handles(pf))
-    RK._seed_nuts_children!(frame)
+    ReactiveKernelsNUTSExamples._seed_nuts_children!(frame)
     frame
 end
 _slot(pf, ep, f) = RK._canon_slot(ep, RK.kernel_plan_named_slot_val(RK.kernel_prepared_plan(pf), Val(f)))
 
 @testset "kernel_nuts — executable public root: real transition, result===state, epoch commit" begin
     pf = _nuts_pf(); frame = _nuts_frame(pf, Float64, 3)
-    C = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame)
+    C = ReactiveKernelsNUTSExamples.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame)
     @test C.RootToken === RK.kernel_token(_NutsFix.nuts!!)
     p0 = copy(_slot(pf, frame.init, :pos)); m0 = copy(_slot(pf, frame.init, :mom))
     r = C.root!(frame, C.scratch, Random.Xoshiro(1))
     @test r === frame                                          # authored return contract (result===state)
     @test _slot(pf, frame.init, :pos) != p0                   # full transition mutated init (terminal copy!! ran)
     @test _slot(pf, frame.init, :mom) != m0                   # refresh_momentum!! ran
-    @test RK.diagnostics_committed_mask(frame.diag) == UInt(0x0f)   # single deferred epoch commit blessed all 4
-    @test RK._diag_slot(frame.diag, Val(4)) != 0.0            # dham is a real (fresh-momentum) energy error, not stale 0
+    @test ReactiveKernelsNUTSExamples.diagnostics_committed_mask(frame.diag) == UInt(0x0f)   # single deferred epoch commit blessed all 4
+    @test ReactiveKernelsNUTSExamples._diag_slot(frame.diag, Val(4)) != 0.0            # dham is a real (fresh-momentum) energy error, not stale 0
 end
 
 @testset "kernel_nuts — source-semantic backward U-turn invalidates endpoint velocity" begin
@@ -53,17 +54,17 @@ end
         if s.path == (:metric,))
     metric = values[metric_canon]
     make_frame() = begin
-        frame = RK._construct_nuts_frame(pf, values, 8;
+        frame = ReactiveKernelsNUTSExamples._construct_nuts_frame(pf, values, 8;
             step_f=RK.partial(_NutsFix.leapfrog!; stepsize=0.1),
             stats_f=_NutsFix.nuts_stats!, min_dham=-1000)
         RK.compile_prepared_initialization(
             pf, typeof(frame.init), typeof(frame.shared))(
                 frame.init, frame.shared, RK.kernel_prepared_handles(pf))
-        RK._seed_nuts_children!(frame)
+        ReactiveKernelsNUTSExamples._seed_nuts_children!(frame)
         frame
     end
     outputs = Any[]
-    for compile_transition in (RK.compile_nuts, RK.compile_nuts_native)
+    for compile_transition in (ReactiveKernelsNUTSExamples.compile_nuts, ReactiveKernelsNUTSExamples.compile_nuts_native)
         frame = make_frame()
         compiled = compile_transition(
             pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!,
@@ -93,10 +94,10 @@ _nuts_batch0b(root, fr, sc, rng, ::Val{N}) where {N} =
 @testset "kernel_nuts — public root @inferred + EXACT 0-B IN A LOOP (typed batch n=64/128/256, both rng, F32+F64)" begin
     for T in (Float64, Float32)
         pf = _nuts_pf(); frame = _nuts_frame(pf, T, 5)
-        C = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame)
+        C = ReactiveKernelsNUTSExamples.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame)
         rt = Base.return_types(C.root!, (typeof(frame), typeof(C.scratch), typeof(Random.Xoshiro(1))))
         @test length(rt) == 1 && isconcretetype(rt[1])       # concrete _NutsFrame return
-        @test RK.diagnostics_ham_type(frame.diag) === T       # diagnostics carry the frame's ham type (F32/F64)
+        @test ReactiveKernelsNUTSExamples.diagnostics_ham_type(frame.diag) === T       # diagnostics carry the frame's ham type (F32/F64)
         @inferred C.root!(frame, C.scratch, Random.Xoshiro(1))
         for rg in (Random.Xoshiro(91), Random.MersenneTwister(2))
             @test _nuts_batch0b(C.root!, frame, C.scratch, rg, Val(64)) == 0
@@ -108,7 +109,7 @@ end
 
 @testset "kernel_nuts — RNG-INDEPENDENT: one sampler accepts two rng types, scratch/root types unchanged" begin
     pf = _nuts_pf(); frame = _nuts_frame(pf, Float64, 3)
-    C = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame)
+    C = ReactiveKernelsNUTSExamples.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame)
     # rng is a threaded RuntimeArg (never spilled), so the SAME root!/scratch run under two distinct rng types
     C.root!(frame, C.scratch, Random.Xoshiro(1))
     C.root!(frame, C.scratch, Random.MersenneTwister(2))
@@ -123,10 +124,10 @@ end
     for sl in RK.kernel_plan_slots(PL)
         nm = String(sl.path[1]); nm == "metric" && (d[sl.canon] = M); nm == "chol_metric" && (d[sl.canon] = cholesky(M))
     end
-    frame = RK._construct_nuts_frame(pf, d, 3; step_f = RK.partial(_NutsFix.leapfrog!; stepsize = 0.1), stats_f = nothing, min_dham = -1000)
+    frame = ReactiveKernelsNUTSExamples._construct_nuts_frame(pf, d, 3; step_f = RK.partial(_NutsFix.leapfrog!; stepsize = 0.1), stats_f = nothing, min_dham = -1000)
     RK.compile_prepared_initialization(pf, typeof(frame.init), typeof(frame.shared))(frame.init, frame.shared, RK.kernel_prepared_handles(pf))
-    RK._seed_nuts_children!(frame)
-    C = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame)
+    ReactiveKernelsNUTSExamples._seed_nuts_children!(frame)
+    C = ReactiveKernelsNUTSExamples.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame)
     z = randn(Random.Xoshiro(7), 2); expected = cholesky(M).L * z    # reference: randn! then chol.L*z
     C.refresh(frame.init, frame.shared, C.cfg.handles, Random.Xoshiro(7))   # same seed
     @test _slot(pf, frame.init, :mom) ≈ expected                    # matches the reference on a DENSE metric
@@ -136,7 +137,7 @@ end
 
 @testset "kernel_nuts — refresh exception safety: chol shape-throw leaves mom+dependents DIRTY (retry repairs)" begin
     pf = _nuts_pf(); frame = _nuts_frame(pf, Float64, 3)
-    C = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame)
+    C = ReactiveKernelsNUTSExamples.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame)
     PL = RK.kernel_prepared_plan(pf)
     momslot = RK.kernel_plan_named_slot_val(PL, Val(:mom)); hamslot = RK.kernel_plan_named_slot_val(PL, Val(:ham))
     RK._canon_set!(frame.shared, RK.kernel_plan_named_slot_val(PL, Val(:chol_metric)), cholesky([2.0 0 0; 0 2 0; 0 0 2]))
@@ -154,36 +155,36 @@ end
     mkroot(body) = RK.MethodIR(good.id, good.self, good.formals, Tuple(body), good.control, good.effects,
                                good.deps, good.kind, good.ok, good.reason, good.signature)
     # POSITIVE: the real authored nuts!! validates
-    @test RK._derive_public_root_ops(good, :step!, :rng, tok) == [:refresh, :step]
+    @test ReactiveKernelsNUTSExamples._derive_public_root_ops(good, :step!, :rng, tok) == [:refresh, :step]
     # wrong refresh Token (statement 1 not the captured refresh)
-    @test_throws Exception RK._derive_public_root_ops(good, :step!, :rng, Symbol("##not_refresh##"))
+    @test_throws Exception ReactiveKernelsNUTSExamples._derive_public_root_ops(good, :step!, :rng, Symbol("##not_refresh##"))
     # wrong rng keyword/formal (validate against a different runtime-arg name)
-    @test_throws Exception RK._derive_public_root_ops(good, :step!, :notrng, tok)
+    @test_throws Exception ReactiveKernelsNUTSExamples._derive_public_root_ops(good, :step!, :notrng, tok)
     # wrong subject method name
-    @test_throws Exception RK._derive_public_root_ops(good, :notstep, :rng, tok)
+    @test_throws Exception ReactiveKernelsNUTSExamples._derive_public_root_ops(good, :notstep, :rng, tok)
     # EXTRA statement (duplicate step) — length != 3
-    @test_throws Exception RK._derive_public_root_ops(mkroot(vcat(b, [b[2]])), :step!, :rng, tok)
+    @test_throws Exception ReactiveKernelsNUTSExamples._derive_public_root_ops(mkroot(vcat(b, [b[2]])), :step!, :rng, tok)
     # REORDERED (step before refresh)
-    @test_throws Exception RK._derive_public_root_ops(mkroot([b[2], b[1], b[3]]), :step!, :rng, tok)
+    @test_throws Exception ReactiveKernelsNUTSExamples._derive_public_root_ops(mkroot([b[2], b[1], b[3]]), :step!, :rng, tok)
     # POST-RETURN statement (return no longer last)
-    @test_throws Exception RK._derive_public_root_ops(mkroot([b[1], b[3], b[2]]), :step!, :rng, tok)
+    @test_throws Exception ReactiveKernelsNUTSExamples._derive_public_root_ops(mkroot([b[1], b[3], b[2]]), :step!, :rng, tok)
 end
 
 @testset "kernel_nuts — END-TO-END callable nuts!!(sampler; rng): Mode-2 dispatch, loop 0-B, token/rng rejects" begin
     OwnerToken = RK.kernel_token(_NutsFix.nuts_state)
     for T in (Float64, Float32)
         pf = _nuts_pf()
-        frame = RK._prepare_nuts_frame(pf, _nuts_mkvals(pf, T), 5;
+        frame = ReactiveKernelsNUTSExamples._prepare_nuts_frame(pf, _nuts_mkvals(pf, T), 5;
                                        step_f = RK.partial(_NutsFix.leapfrog!; stepsize = T(0.1)), stats_f = nothing, min_dham = -1000)
-        C = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame)
+        C = ReactiveKernelsNUTSExamples.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame)
         # OwnerToken (nuts_state subject-methods) and RootToken (the nuts!! Mode-2 skeleton) are DISTINCT tokens,
         # both preserved into the concrete sampler type — the dispatch gate keys on RootToken, OwnerToken is free.
         @test OwnerToken !== C.RootToken
-        sampler = RK.nuts_sampler(Val(OwnerToken), Val(C.RootToken), frame, C.root!, C.scratch)
+        sampler = ReactiveKernelsNUTSExamples.nuts_sampler(Val(OwnerToken), Val(C.RootToken), frame, C.root!, C.scratch)
         @test RK.kernel_token(sampler) === OwnerToken                 # owner token preserved on the KernelObject
         # THE authored public call — the Mode-2 nuts!! skeleton IS the callable
         r = _NutsFix.nuts!!(sampler; rng = Random.Xoshiro(1))
-        @test RK.nuts_sampler_frame(r) === frame                      # result === state
+        @test ReactiveKernelsNUTSExamples.nuts_sampler_frame(r) === frame                      # result === state
         @test RK._canon_slot(frame.init, RK.kernel_plan_named_slot_val(RK.kernel_prepared_plan(pf), Val(:mom))) isa Vector{T}
         # EXACT 0-B in a loop THROUGH THE PUBLIC PATH (hoisted rng), both rng types
         @inline function pub(skel, samp, rg, ::Val{N}) where {N}
@@ -199,7 +200,7 @@ end
         @test_throws Exception _NutsFix.nuts!!(sampler)
         @test_throws Exception _NutsFix.nuts!!(sampler, Random.Xoshiro(1))
         # a sampler whose handle RootToken differs from the nuts!! skeleton token finds NO Mode-2 method
-        wrong = RK.nuts_sampler(Val(OwnerToken), Val(:not_the_root_token), frame, C.root!, C.scratch)
+        wrong = ReactiveKernelsNUTSExamples.nuts_sampler(Val(OwnerToken), Val(:not_the_root_token), frame, C.root!, C.scratch)
         @test_throws MethodError _NutsFix.nuts!!(wrong; rng = Random.Xoshiro(1))
     end
 end
@@ -207,15 +208,15 @@ end
 @testset "kernel_nuts — EFFECTFUL stats_f: nuts_stats! writes inlined on the frame (n_steps advances), 0-B" begin
     pf = _nuts_pf()
     # effectful stats: stats_f = nuts_stats! (writes n_steps + acceptance_rate per leaf)
-    frame = RK._construct_nuts_frame(pf, _nuts_mkvals(pf, Float64), 4;
+    frame = ReactiveKernelsNUTSExamples._construct_nuts_frame(pf, _nuts_mkvals(pf, Float64), 4;
                                      step_f = RK.partial(_NutsFix.leapfrog!; stepsize = 0.1), stats_f = _NutsFix.nuts_stats!, min_dham = -1000)
     RK.compile_prepared_initialization(pf, typeof(frame.init), typeof(frame.shared))(frame.init, frame.shared, RK.kernel_prepared_handles(pf))
-    RK._seed_nuts_children!(frame)
-    @test RK.stats_binding_registration(RK.nuts_frame_stats(frame)) !== nothing   # effectful binding
-    C = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame)
+    ReactiveKernelsNUTSExamples._seed_nuts_children!(frame)
+    @test ReactiveKernelsNUTSExamples.stats_binding_registration(ReactiveKernelsNUTSExamples.nuts_frame_stats(frame)) !== nothing   # effectful binding
+    C = ReactiveKernelsNUTSExamples.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame)
     C.root!(frame, C.scratch, Random.Xoshiro(1))
-    @test RK._diag_slot(frame.diag, Val(1)) > 0                # n_steps advanced (stats_f ran per leaf)
-    @test isfinite(RK._diag_slot(frame.diag, Val(3)))         # acceptance_rate written
+    @test ReactiveKernelsNUTSExamples._diag_slot(frame.diag, Val(1)) > 0                # n_steps advanced (stats_f ran per leaf)
+    @test isfinite(ReactiveKernelsNUTSExamples._diag_slot(frame.diag, Val(3)))         # acceptance_rate written
     # effectful stats stays exact 0-B in a loop
     for rg in (Random.Xoshiro(91), Random.MersenneTwister(2))
         @test _nuts_batch0b(C.root!, frame, C.scratch, rg, Val(64)) == 0
@@ -226,21 +227,21 @@ end
     good = RK.method_irs(_NutsFix.nuts_stats!)[1]; b = collect(good.body)
     mk(body) = RK.MethodIR(good.id, good.self, good.formals, Tuple(body), good.control, good.effects,
                            good.deps, good.kind, good.ok, good.reason, good.signature)
-    @test RK._validate_stats_body(good, (1, 3)) === nothing              # POSITIVE: real nuts_stats! validates
+    @test ReactiveKernelsNUTSExamples._validate_stats_body(good, (1, 3)) === nothing              # POSITIVE: real nuts_stats! validates
     # an EXTRA non-PlaceWrite statement (a stand-in effect) before the return: a filtered census would DROP it;
     # the total validator REJECTS it
-    @test_throws Exception RK._validate_stats_body(mk([b[1], b[2], RK._ExprStmt(RK._SelfRef()), b[3]]), (1, 3))
+    @test_throws Exception ReactiveKernelsNUTSExamples._validate_stats_body(mk([b[1], b[2], RK._ExprStmt(RK._SelfRef()), b[3]]), (1, 3))
     # a POST-RETURN statement rejects
-    @test_throws Exception RK._validate_stats_body(mk([b[1], b[3], b[2]]), (1, 3))
+    @test_throws Exception ReactiveKernelsNUTSExamples._validate_stats_body(mk([b[1], b[3], b[2]]), (1, 3))
     # produced-slot mismatch (declared vs written) rejects
-    @test_throws Exception RK._validate_stats_body(good, (1,))
+    @test_throws Exception ReactiveKernelsNUTSExamples._validate_stats_body(good, (1,))
 end
 
 @testset "kernel_nuts — STABLE type identity: two same-input compiles give identical root/fn/scratch/sampler types" begin
     OwnerToken = RK.kernel_token(_NutsFix.nuts_state)
     pf = _nuts_pf()
-    C1 = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, _nuts_frame(pf, Float64, 5))
-    C2 = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, _nuts_frame(pf, Float64, 5))
+    C1 = ReactiveKernelsNUTSExamples.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, _nuts_frame(pf, Float64, 5))
+    C2 = ReactiveKernelsNUTSExamples.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, _nuts_frame(pf, Float64, 5))
     @test typeof(C1.root!) === typeof(C2.root!)               # deterministic emission -> identical RGF/root type
     @test typeof(C1.fn) === typeof(C2.fn)
     @test typeof(C1.scratch) === typeof(C2.scratch)
@@ -248,17 +249,17 @@ end
     @test C1.RootToken === C2.RootToken
     # so two independently-built samplers share ONE concrete KernelObject type (stable prepared identity)
     f1 = _nuts_frame(pf, Float64, 5); f2 = _nuts_frame(pf, Float64, 5)
-    Ca = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, f1)
-    Cb = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, f2)
-    s1 = RK.nuts_sampler(Val(OwnerToken), Val(Ca.RootToken), f1, Ca.root!, Ca.scratch)
-    s2 = RK.nuts_sampler(Val(OwnerToken), Val(Cb.RootToken), f2, Cb.root!, Cb.scratch)
+    Ca = ReactiveKernelsNUTSExamples.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, f1)
+    Cb = ReactiveKernelsNUTSExamples.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, f2)
+    s1 = ReactiveKernelsNUTSExamples.nuts_sampler(Val(OwnerToken), Val(Ca.RootToken), f1, Ca.root!, Ca.scratch)
+    s2 = ReactiveKernelsNUTSExamples.nuts_sampler(Val(OwnerToken), Val(Cb.RootToken), f2, Cb.root!, Cb.scratch)
     @test typeof(s1) === typeof(s2)                           # RK's repeated same-signature type-identity gate
-    @test s1 !== s2 && RK.nuts_sampler_frame(s1) !== RK.nuts_sampler_frame(s2)   # but values/buffers isolated
+    @test s1 !== s2 && ReactiveKernelsNUTSExamples.nuts_sampler_frame(s1) !== ReactiveKernelsNUTSExamples.nuts_sampler_frame(s2)   # but values/buffers isolated
 end
 
 @testset "kernel_nuts — refresh concrete-domain gate: valid factor/rng pass, custom RNG rejects before exec" begin
     pf = _nuts_pf(); frame = _nuts_frame(pf, Float64, 3)
-    C = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame)
+    C = ReactiveKernelsNUTSExamples.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame)
     H = RK.kernel_prepared_handles(pf)
     # Xoshiro + MersenneTwister pass the per-rng randn! domain (already exercised for loop-0-B elsewhere)
     C.refresh(frame.init, frame.shared, H, Random.Xoshiro(1))
@@ -296,10 +297,10 @@ _rsame(v, s) = v isa LinearAlgebra.Cholesky ? v.factors == s : v isa AbstractArr
         d[sl.canon] = nm=="pot_f" ? (p -> sum(abs2, p)) : nm=="grad_f" ? pg : nm=="metric" ? m : nm=="chol_metric" ? cholesky(m) : startswith(nm,"##node") ? 0.0 :
             nm=="pos" ? [1.0,2.0] : nm=="mom" ? [3.0,4.0] : (nm in ("dpot_dpos","dham_dpos","dkin_dmom","dham_dmom")) ? [0.0,0.0] : 0.0
     end
-    frame = RK._construct_nuts_frame(pf, d, 3; step_f=RK.partial(_NutsFix.leapfrog!;stepsize=0.1), stats_f=nothing, min_dham=-1000)
+    frame = ReactiveKernelsNUTSExamples._construct_nuts_frame(pf, d, 3; step_f=RK.partial(_NutsFix.leapfrog!;stepsize=0.1), stats_f=nothing, min_dham=-1000)
     RK.compile_prepared_initialization(pf, typeof(frame.init), typeof(frame.shared))(frame.init, frame.shared, RK.kernel_prepared_handles(pf))
-    RK._seed_nuts_children!(frame)
-    C = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame); H = RK.kernel_prepared_handles(pf)
+    ReactiveKernelsNUTSExamples._seed_nuts_children!(frame)
+    C = ReactiveKernelsNUTSExamples.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frame); H = RK.kernel_prepared_handles(pf)
     # admitted RNGs pass + stay EXACT 0-B in a typed loop (the generated guard folds away)
     for rg in (Random.Xoshiro(91), Random.MersenneTwister(2))
         @test _refresh_batch0b(C.refresh, frame.init, frame.shared, H, rg, Val(64)) == 0
@@ -331,10 +332,10 @@ end
     # Only a TOP-LEVEL construction (`^[const] Name = Container(` / `[`) is an offender. `_DIAG` (Dict) →
     # `_diag_index` pure dispatch; `_EP_SELF`/`_SCALAR_SELF` (Set) → immutable tuple / removed, this pins it.
     nuts_files = [
-        joinpath("examples", "nuts_runtime", "kernel_nuts.jl"),
-        joinpath("examples", "nuts_runtime", "kernel_nuts_native.jl"),
-        joinpath("examples", "nuts_runtime", "kernel_codegen.jl"),
-        joinpath("src", "kernel_control.jl"),
+        joinpath(pkgdir(ReactiveKernelsNUTSExamples), "src", "nuts_runtime", "kernel_nuts.jl"),
+        joinpath(pkgdir(ReactiveKernelsNUTSExamples), "src", "nuts_runtime", "kernel_nuts_native.jl"),
+        joinpath(pkgdir(ReactiveKernelsNUTSExamples), "src", "nuts_runtime", "kernel_codegen.jl"),
+        joinpath(pkgdir(ReactiveKernels), "src", "kernel_control.jl"),
     ]
     #  ^-anchored (multiline): a leading-whitespace line can't match, so indented locals are excluded.
     #  A CONSTRUCTION is `Name = [Base./Core.]Container[{...}]( / [` — the container (optionally qualified and
@@ -343,7 +344,7 @@ end
     #  `Set{T}()`, `Base.RefValue(0)`; it allows `Dict{K,V}` / `Set{T}` aliases and indented function-local scratch.
     banned = r"^(const[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]*=[ \t]*(Base\.|Core\.)?(Dict|Set|IdDict|WeakKeyDict|Ref|RefValue|ObjectIdDict)(\{[^\n]*\})?[ \t]*[\(\[]"m
     for f in nuts_files
-        src = read(joinpath(@__DIR__, "..", f), String)
+        src = read(f, String)
         offenders = String[strip(m.match) for m in eachmatch(banned, src)]
         isempty(offenders) || @error "module-level mutable-container construction in $f" offenders
         @test isempty(offenders)
@@ -370,16 +371,16 @@ end
     # which the dense uplo-wrapper prediction does not match). Both must be math-faithful to `chol.L*mom` and 0-B.
     for T in (Float64, Float32)
         Md = T[4 0; 0 9]; chd = cholesky(Md); momd = T[1,2]
-        Ld = RK._refresh_lfactor(chd); yd = copy(momd); LinearAlgebra.lmul!(Ld, yd)
+        Ld = ReactiveKernelsNUTSExamples._refresh_lfactor(chd); yd = copy(momd); LinearAlgebra.lmul!(Ld, yd)
         @test yd ≈ chd.L * momd                          # dense: math matches chol.L*mom
         @test Ld isa LinearAlgebra.LowerTriangular       # dense: triangular view, unchanged path
         Mg = LinearAlgebra.Diagonal(T[4,9]); chg = cholesky(Mg); momg = T[1,2]
         @test chg.factors isa LinearAlgebra.Diagonal
-        Lg = RK._refresh_lfactor(chg); yg = copy(momg); LinearAlgebra.lmul!(Lg, yg)
+        Lg = ReactiveKernelsNUTSExamples._refresh_lfactor(chg); yg = copy(momg); LinearAlgebra.lmul!(Lg, yg)
         @test yg ≈ chg.L * momg                          # diagonal: math matches chol.L*mom
         @test Lg isa LinearAlgebra.Diagonal              # diagonal: bare factors, NO uplo wrapper / Adjoint
         @test Lg === chg.factors                         # zero-cost: identity, no view allocation
-        barrier(ch, m) = LinearAlgebra.lmul!(RK._refresh_lfactor(ch), m)
+        barrier(ch, m) = LinearAlgebra.lmul!(ReactiveKernelsNUTSExamples._refresh_lfactor(ch), m)
         barrier(chd, copy(momd)); barrier(chg, copy(momg))                 # warm both specializations
         @test (@allocated barrier(chd, momd)) == 0       # dense exact 0-B
         @test (@allocated barrier(chg, momg)) == 0       # diagonal exact 0-B
@@ -400,27 +401,27 @@ end
         for sl in RK.kernel_plan_slots(PL)
             nm = String(sl.path[1]); nm == "metric" && (d[sl.canon] = metric); nm == "chol_metric" && (d[sl.canon] = cholesky(metric))
         end
-        fr = RK._construct_nuts_frame(pf, d, md; step_f = RK.partial(_NutsFix.leapfrog!; stepsize = T(0.3)), stats_f = _NutsFix.nuts_stats!, min_dham = -1000)
+        fr = ReactiveKernelsNUTSExamples._construct_nuts_frame(pf, d, md; step_f = RK.partial(_NutsFix.leapfrog!; stepsize = T(0.3)), stats_f = _NutsFix.nuts_stats!, min_dham = -1000)
         RK.compile_prepared_initialization(pf, typeof(fr.init), typeof(fr.shared))(fr.init, fr.shared, RK.kernel_prepared_handles(pf))
-        RK._seed_nuts_children!(fr); fr
+        ReactiveKernelsNUTSExamples._seed_nuts_children!(fr); fr
     end
     # full HMC-observable snapshot (not pos only): position + every committed diagnostic + mask + the PHYSICAL
     # derived-`diverged` field and its currentness bits (read directly, NOT inferred from dham — a stale/wrong
     # frame.diverged or derived-currentness bit must be caught).
     _obs(pf, fr) = (pos = copy(_slot(pf, fr.init, :pos)),
-                n_steps = RK._diag_slot(fr.diag, Val(1)), reached_depth = RK._diag_slot(fr.diag, Val(2)),
-                acceptance_rate = RK._diag_slot(fr.diag, Val(3)), dham = RK._diag_slot(fr.diag, Val(4)),
-                committed = RK.diagnostics_committed_mask(fr.diag),
+                n_steps = ReactiveKernelsNUTSExamples._diag_slot(fr.diag, Val(1)), reached_depth = ReactiveKernelsNUTSExamples._diag_slot(fr.diag, Val(2)),
+                acceptance_rate = ReactiveKernelsNUTSExamples._diag_slot(fr.diag, Val(3)), dham = ReactiveKernelsNUTSExamples._diag_slot(fr.diag, Val(4)),
+                committed = ReactiveKernelsNUTSExamples.diagnostics_committed_mask(fr.diag),
                 diverged = getfield(fr, :diverged),
-                diverged_pending = RK.nuts_frame_diverged_pending(fr),
-                diverged_committed = RK.nuts_frame_diverged_committed(fr))
+                diverged_pending = ReactiveKernelsNUTSExamples.nuts_frame_diverged_pending(fr),
+                diverged_committed = ReactiveKernelsNUTSExamples.nuts_frame_diverged_committed(fr))
     for T in (Float64, Float32)
         pf = _nuts_pf()
         # UNIT mass: element-wise solve and dense potrs coincide exactly ⇒ byte-identical full observable set.
         frD = _mkframe(pf, T, 5, LinearAlgebra.Diagonal(T[1, 1]))    # Diagonal identity mass (admitted)
-        CD = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frD)
+        CD = ReactiveKernelsNUTSExamples.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frD)
         frM = _mkframe(pf, T, 5, T[1 0; 0 1])                        # SAME operator, dense representation
-        CM = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frM)
+        CM = ReactiveKernelsNUTSExamples.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frM)
         # FULL-TRAJECTORY equivalence: snapshot the complete observable set after EVERY one of the 200 seeded
         # transitions (not just the terminal frame), so a transient mismatch that later reconverges, or a
         # stale/wrong diverged / derived-currentness bit at any step, is caught.
@@ -428,7 +429,7 @@ end
         rngM = Random.Xoshiro(1); trajM = [(CM.root!(frM, CM.scratch, rngM); _obs(pf, frM)) for _ in 1:200]
         @test trajD == trajM                                        # every observable at every step, byte-identical (unit mass)
         # EXACT 0-B on the Diagonal path (a SCALED Diagonal, the real perf case): F32/F64 × both RNG, typed Val{N}.
-        frS = _mkframe(pf, T, 5, LinearAlgebra.Diagonal(T[2, 2])); CS = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frS)
+        frS = _mkframe(pf, T, 5, LinearAlgebra.Diagonal(T[2, 2])); CS = ReactiveKernelsNUTSExamples.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, frS)
         for rg in (Random.Xoshiro(91), Random.MersenneTwister(2))
             @test _nuts_batch0b(CS.root!, frS, CS.scratch, rg, Val(64)) == 0
             @test _nuts_batch0b(CS.root!, frS, CS.scratch, rg, Val(256)) == 0
@@ -442,9 +443,9 @@ end
     # HIT potrs (same-kind positive control, both eltypes); Diagonal must complete build+50 txn WITHOUT it. The
     # child prints an explicit four-result receipt and exits 0 iff all four facts hold (so an empty child ≠ green).
     fixture = abspath(joinpath(@__DIR__, "..", "benchmark", "nuts_kernel_authoring_fixture.jl"))
-    proj = abspath(joinpath(@__DIR__, ".."))
+    proj = abspath(joinpath(@__DIR__, "..", "packages"))
     childsrc = raw"""
-    using LinearAlgebra, Random, ReactiveKernels
+    using LinearAlgebra, Random, ReactiveKernels, ReactiveKernelsNUTSExamples
     include(ENV["RK_NUTS_RUNTIME"])
     using .ReactiveKernelsNUTSExample
     const RK = ReactiveKernels
@@ -459,14 +460,14 @@ end
             nm = String(sl.path[1])
             d[sl.canon] = nm=="pot_f" ? (p -> sum(abs2, p)) : nm=="grad_f" ? ((dst,p)->(dst.=2 .*p; sum(abs2,p))) : nm=="metric" ? metric : nm=="chol_metric" ? cholesky(metric) : startswith(nm,"##node") ? zero(T) : nm=="pos" ? T[1,2] : nm=="mom" ? T[3,4] : (nm in ("dpot_dpos","dham_dpos","dkin_dmom","dham_dmom")) ? T[0,0] : zero(T)
         end
-        fr = RK._construct_nuts_frame(pf, d, 5; step_f=RK.partial(_CF.leapfrog!; stepsize=T(0.3)), stats_f=_CF.nuts_stats!, min_dham=-1000)
+        fr = ReactiveKernelsNUTSExamples._construct_nuts_frame(pf, d, 5; step_f=RK.partial(_CF.leapfrog!; stepsize=T(0.3)), stats_f=_CF.nuts_stats!, min_dham=-1000)
         RK.compile_prepared_initialization(pf, typeof(fr.init), typeof(fr.shared))(fr.init, fr.shared, RK.kernel_prepared_handles(pf))
-        RK._seed_nuts_children!(fr); (pf, fr)
+        ReactiveKernelsNUTSExamples._seed_nuts_children!(fr); (pf, fr)
     end
     function _outcome(T, metric)
         try
             pf, fr = _mk(T, metric)
-            C = RK.compile_nuts(pf, _CF.nuts_state, _CF.refresh_momentum!!, _CF.nuts!!, fr)
+            C = ReactiveKernelsNUTSExamples.compile_nuts(pf, _CF.nuts_state, _CF.refresh_momentum!!, _CF.nuts!!, fr)
             for _ in 1:50; C.root!(fr, C.scratch, Random.Xoshiro(3)); end
             :completed
         catch e
@@ -501,9 +502,9 @@ end
         for sl in RK.kernel_plan_slots(PL)
             nm = String(sl.path[1]); nm == "metric" && (d[sl.canon] = metric); nm == "chol_metric" && (d[sl.canon] = cholesky(metric))
         end
-        fr = RK._construct_nuts_frame(pf, d, md; step_f = RK.partial(_NutsFix.leapfrog!; stepsize = T(0.3)), stats_f = _NutsFix.nuts_stats!, min_dham = min_dham)
+        fr = ReactiveKernelsNUTSExamples._construct_nuts_frame(pf, d, md; step_f = RK.partial(_NutsFix.leapfrog!; stepsize = T(0.3)), stats_f = _NutsFix.nuts_stats!, min_dham = min_dham)
         RK.compile_prepared_initialization(pf, typeof(fr.init), typeof(fr.shared))(fr.init, fr.shared, RK.kernel_prepared_handles(pf))
-        RK._seed_nuts_children!(fr); fr
+        ReactiveKernelsNUTSExamples._seed_nuts_children!(fr); fr
     end
     # FULL selected-sample payload: all SEVEN physical owned init fields (the sample copied from proposals[end])
     # + init currentness mask + proposals[end] payload/mask, plus every diagnostic/mask and the physical diverged
@@ -512,12 +513,12 @@ end
                   copy(RK._canon_slot(ep, Val(8))), copy(RK._canon_slot(ep, Val(10))), RK._canon_slot(ep, Val(11)),
                   RK._canon_slot(ep, Val(12)), RK._canon_current_mask(ep))
     _obs(fr) = (init = _slots(fr.init), prop_end = _slots(getfield(fr, :proposals)[end]),
-                n_steps = RK._diag_slot(fr.diag, Val(1)), reached_depth = RK._diag_slot(fr.diag, Val(2)),
-                acceptance_rate = RK._diag_slot(fr.diag, Val(3)), dham = RK._diag_slot(fr.diag, Val(4)),
-                committed = RK.diagnostics_committed_mask(fr.diag), pending = RK.diagnostics_pending_mask(fr.diag),
+                n_steps = ReactiveKernelsNUTSExamples._diag_slot(fr.diag, Val(1)), reached_depth = ReactiveKernelsNUTSExamples._diag_slot(fr.diag, Val(2)),
+                acceptance_rate = ReactiveKernelsNUTSExamples._diag_slot(fr.diag, Val(3)), dham = ReactiveKernelsNUTSExamples._diag_slot(fr.diag, Val(4)),
+                committed = ReactiveKernelsNUTSExamples.diagnostics_committed_mask(fr.diag), pending = ReactiveKernelsNUTSExamples.diagnostics_pending_mask(fr.diag),
                 diverged = getfield(fr, :diverged),
-                diverged_pending = RK.nuts_frame_diverged_pending(fr),
-                diverged_committed = RK.nuts_frame_diverged_committed(fr))
+                diverged_pending = ReactiveKernelsNUTSExamples.nuts_frame_diverged_pending(fr),
+                diverged_committed = ReactiveKernelsNUTSExamples.nuts_frame_diverged_committed(fr))
     _NAN(v::AbstractArray) = fill!(v, convert(eltype(v), NaN))
     _poison_ep!(ep) = begin                                   # ALL 7 physical owned fields (vectors + scalars)
         for s in (4, 5, 8, 10); v = RK._canon_slot(ep, Val(s)); v isa AbstractArray && _NAN(v); end
@@ -567,8 +568,8 @@ end
     seeds = (1, 7, 42, 123)
     for T in (Float64, Float32)
         pf = _nuts_pf()
-        CD = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, _mkframe(pf, T, 10, LinearAlgebra.Diagonal(T[1, 1])))
-        CM = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, _mkframe(pf, T, 10, T[1 0; 0 1]))
+        CD = ReactiveKernelsNUTSExamples.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, _mkframe(pf, T, 10, LinearAlgebra.Diagonal(T[1, 1])))
+        CM = ReactiveKernelsNUTSExamples.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, _mkframe(pf, T, 10, T[1 0; 0 1]))
         # stale-poison D1–D5 across the censused seeds — reference vs each poisoned class byte-identical over the
         # FULL per-txn record (payload + net end-identity change + gofwd). Also collect the observed path CENSUS from the SAME
         # reference trajectories, so the "dead" claim is scoped to exactly the paths witnessed here.
@@ -597,7 +598,7 @@ end
         @test allstop[]                          # all 240 normal transitions stopped via U-turn (!may_continue, !diverged)
         # FORCED-DIVERGENCE control: min_dham above any dham forces diverged=true on leaf 1, exercising the
         # early-return path (start! returns before writing proposals[1] / trees[1].log_weight).
-        CX = RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, _mkframe(pf, T, 10, LinearAlgebra.Diagonal(T[1, 1]); min_dham = T(1e6)))
+        CX = ReactiveKernelsNUTSExamples.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, _mkframe(pf, T, 10, LinearAlgebra.Diagonal(T[1, 1]); min_dham = T(1e6)))
         refX = _traj(CX, _mkframe(pf, T, 10, LinearAlgebra.Diagonal(T[1, 1]); min_dham = T(1e6)), 1, 40, _noop!)
         @test all(r -> r.obs.diverged, refX)                   # control genuinely takes the divergence path (non-vacuous)
         @test all(r -> !r.may_sample && !r.may_continue, refX) # forced divergence pins BOTH control bits off
@@ -625,16 +626,16 @@ end
         for sl in RK.kernel_plan_slots(PL)
             nm = String(sl.path[1]); nm == "metric" && (d[sl.canon] = LinearAlgebra.Diagonal(T[1, 1])); nm == "chol_metric" && (d[sl.canon] = cholesky(LinearAlgebra.Diagonal(T[1, 1])))
         end
-        fr = RK._construct_nuts_frame(pf, d, 10; step_f = RK.partial(_NutsFix.leapfrog!; stepsize = T(0.3)), stats_f = _NutsFix.nuts_stats!, min_dham = -1000)
+        fr = ReactiveKernelsNUTSExamples._construct_nuts_frame(pf, d, 10; step_f = RK.partial(_NutsFix.leapfrog!; stepsize = T(0.3)), stats_f = _NutsFix.nuts_stats!, min_dham = -1000)
         RK.compile_prepared_initialization(pf, typeof(fr.init), typeof(fr.shared))(fr.init, fr.shared, RK.kernel_prepared_handles(pf))
-        RK._seed_nuts_children!(fr)
-        (pf, RK.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, fr), fr)
+        ReactiveKernelsNUTSExamples._seed_nuts_children!(fr)
+        (pf, ReactiveKernelsNUTSExamples.compile_nuts(pf, _NutsFix.nuts_state, _NutsFix.refresh_momentum!!, _NutsFix.nuts!!, fr), fr)
     end
     for T in (Float64, Float32)
         pf, C, fr = _mkD(T); PL = RK.kernel_prepared_plan(pf)
         C.root!(fr, C.scratch, Random.Xoshiro(1))                       # a SUCCESSFUL transition first (real diag values)
-        @test RK._diag_slot(fr.diag, Val(1)) > 0                        # n_steps advanced — the reset below is non-vacuous
-        @test RK.diagnostics_committed_mask(fr.diag) == UInt(0x0f)      # previous epoch committed all 4
+        @test ReactiveKernelsNUTSExamples._diag_slot(fr.diag, Val(1)) > 0                        # n_steps advanced — the reset below is non-vacuous
+        @test ReactiveKernelsNUTSExamples.diagnostics_committed_mask(fr.diag) == UInt(0x0f)      # previous epoch committed all 4
         # comprehensive snapshot (mirrors the direct-refresh before-any-kill gate): EVERY owned+shared canon
         # value (contents) + currentness bit + whole masks + shared object identity.
         slots = unique([(RK.kernel_plan_field(PL, sl.canon)[1], RK.kernel_plan_field(PL, sl.canon)[2]) for sl in RK.kernel_plan_slots(PL)])
@@ -650,9 +651,9 @@ end
         @test RK._canon_current_mask(fr.init) == imask0 && RK._canon_current_mask(fr.shared) == smask0   # whole masks unchanged
         @test all(RK._canon_slot(fr.shared, Val(s)) === shared_ids[s] for s in keys(shared_ids))         # shared object identity unchanged
         # BUT the epoch-entry reset/uncommit DID clear diagnostics + derived (executed-prefix, explicitly NOT rollback):
-        @test all(RK._diag_slot(fr.diag, Val(i)) == 0 for i in 1:4)     # diag values reset at epoch entry, never re-committed
-        @test RK.diagnostics_committed_mask(fr.diag) == 0               # committed cleared (NOT the prior 0x0f)
-        @test RK.diagnostics_pending_mask(fr.diag) == 0                # pending cleared by the epoch catch
-        @test !RK.nuts_frame_diverged_committed(fr) && !RK.nuts_frame_diverged_pending(fr)   # derived committed+pending cleared
+        @test all(ReactiveKernelsNUTSExamples._diag_slot(fr.diag, Val(i)) == 0 for i in 1:4)     # diag values reset at epoch entry, never re-committed
+        @test ReactiveKernelsNUTSExamples.diagnostics_committed_mask(fr.diag) == 0               # committed cleared (NOT the prior 0x0f)
+        @test ReactiveKernelsNUTSExamples.diagnostics_pending_mask(fr.diag) == 0                # pending cleared by the epoch catch
+        @test !ReactiveKernelsNUTSExamples.nuts_frame_diverged_committed(fr) && !ReactiveKernelsNUTSExamples.nuts_frame_diverged_pending(fr)   # derived committed+pending cleared
     end
 end
