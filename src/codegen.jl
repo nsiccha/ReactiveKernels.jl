@@ -61,13 +61,16 @@ end
 @inline _authored_plate_argument(::Val{A}, index, arg) where {A} =
     index in A ? Ref(arg) : arg
 
-function _authored_plate_arguments(::Val{A}, args...) where {A}
+# Keep construction of the immutable Broadcasted descriptor inside the lowered
+# plate call.  On Julia 1.10, returning a multi-axis descriptor across either
+# helper boundary defeats scalar replacement and allocates on every reduction.
+@inline function _authored_plate_arguments(::Val{A}, args...) where {A}
     ntuple(length(args)) do index
         _authored_plate_argument(Val(A), index, getfield(args, index))
     end
 end
 
-function _authored_plate_broadcast(::Val{A}, args...) where {A}
+@inline function _authored_plate_broadcast(::Val{A}, args...) where {A}
     wrapped = _authored_plate_arguments(Val(A), args...)
     broadcasted = Base.broadcasted(tuple, wrapped...)
     isempty(axes(broadcasted)) && throw(ArgumentError(
