@@ -177,9 +177,7 @@ pure graph.
 
 The unconstrained posterior is generated from the same RK-authored transform,
 prior, and `plate` reductions as every other graph query. RK splices those
-generated reductions into one flat posterior kernel, so plain reverse Enzyme can
-differentiate only the unconstrained parameters while observations and scales
-cross the consumer-side DI boundary as `Constant`s. There is no bespoke
+generated reductions into one flat posterior kernel; there is no bespoke
 handwritten model evaluator.
 """
 function build_eight_schools_graph()
