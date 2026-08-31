@@ -11,6 +11,146 @@ using ReactiveKernels
 using ReactiveKernels: code_expr
 using Test
 
+_axis_plate_call(f, x, location, scale) = f(x, location, scale)
+_axis_plate_allocated(f, x, location, scale) =
+    @allocated f(x, location, scale)
+const _AXIS_LOG_CALLS = Ref(0)
+const _AXIS_PRODUCT_CALLS = Ref(0)
+const _AXIS_ATOMIC_CALLS = Ref(0)
+_axis_counted_log(value) = (_AXIS_LOG_CALLS[] += 1; log(value))
+_axis_counted_product(left, right) =
+    (_AXIS_PRODUCT_CALLS[] += 1; left * right)
+_axis_counted_sum(values) = (_AXIS_ATOMIC_CALLS[] += 1; sum(values))
+_axis_reference(value, center, width) =
+    -0.5 * log(2π) - log(width) - 0.5 * ((value - center) / width)^2
+
+struct _AxisBackendArray <: AbstractVector{Float64}
+    values::Vector{Float64}
+end
+Base.size(marker::_AxisBackendArray) = size(marker.values)
+Base.getindex(marker::_AxisBackendArray, index::Int) = marker.values[index]
+ReactiveKernels._requires_tensorized_marker(::_AxisBackendArray) = true
+ReactiveKernels._batched_call(
+        pair::ReactiveKernels._ArrayFunctionPair, ops, args,
+        ::_AxisBackendArray) = pair.tensorized(ops, args...)
+
+@testset "plate: graph dependencies determine broadcast-axis frequency" begin
+    graph = Graph()
+    x = value!(graph, :x, Float64)
+    location = value!(graph, :location, Float64)
+    scale = value!(graph, :scale, Float64)
+    log_scale = value!(graph, :log_scale, Float64)
+    residual = value!(graph, :residual, Float64)
+    logpdf = value!(graph, :logpdf, Float64)
+
+    add!(graph, scale => log_scale, _axis_counted_log)
+    add!(graph, (x, location) => residual, (value, center) -> value - center)
+    add!(graph, (residual, scale, log_scale) => logpdf,
+         (difference, width, log_width) ->
+             -0.5 * log(2π) - log_width - 0.5 * (difference / width)^2)
+
+    selected = plan(graph;
+        have = (x, location, scale), want = (logpdf,))
+    reducing = ReactiveKernels._prepare_batched(
+        selected; batched = (:x, :location, :scale))
+    collecting = ReactiveKernels._prepare_batched(
+        selected; batched = (:x, :location, :scale), reduce = nothing)
+
+    observations = collect(range(-1.0, 1.0; length = 7))
+    locations = [-0.4, 0.2, 0.7]
+    scales = [0.8, 1.1, 1.7, 2.2]
+    location_grid = reshape(locations, 1, :)
+    scale_grid = reshape(scales, 1, 1, :)
+    reference = _axis_reference.(observations, location_grid, scale_grid)
+
+    _AXIS_LOG_CALLS[] = 0
+    @test reducing(observations, location_grid, scale_grid) ≈ sum(reference)
+    @test _AXIS_LOG_CALLS[] == length(scales)
+
+    _AXIS_LOG_CALLS[] = 0
+    collected = collecting(observations, location_grid, scale_grid)
+    @test collected ≈ reference
+    @test axes(collected) == axes(reference)
+    @test _AXIS_LOG_CALLS[] == length(scales)
+
+    generated = string(code_expr(reducing))
+    @test occursin("CartesianIndices", generated)
+    @test occursin("_plate_dependency_changed", generated)
+    @test !occursin("similar", generated)
+
+    _axis_plate_call(reducing, observations, location_grid, scale_grid)
+    _AXIS_LOG_CALLS[] = 0
+    @test _axis_plate_allocated(
+        reducing, observations, location_grid, scale_grid) == 0
+    @test _AXIS_LOG_CALLS[] == length(scales)
+
+    @testset "aligned dimensions zip and fail before execution" begin
+        zipped_graph = Graph()
+        left = value!(zipped_graph, :left, Float64)
+        right = value!(zipped_graph, :right, Float64)
+        product = value!(zipped_graph, :product, Float64)
+        add!(zipped_graph, (left, right) => product, _axis_counted_product)
+        zipped_plan = plan(zipped_graph;
+            have = (left, right), want = (product,))
+        zipped = ReactiveKernels._prepare_batched(
+            zipped_plan; batched = (:left, :right))
+
+        _AXIS_PRODUCT_CALLS[] = 0
+        @test zipped([1.0, 2.0], [3.0, 4.0]) == 11.0
+        @test _AXIS_PRODUCT_CALLS[] == 2
+        @test zipped([1.0, 2.0], [3.0]) == 9.0
+        @test _AXIS_PRODUCT_CALLS[] == 4
+        _AXIS_PRODUCT_CALLS[] = 0
+        @test_throws DimensionMismatch zipped(
+            [1.0, 2.0], [3.0, 4.0, 5.0])
+        @test _AXIS_PRODUCT_CALLS[] == 0
+    end
+
+    @testset "HAVE cuts remain authoritative" begin
+        cut = plan(graph;
+            have = (x, location, log_scale, scale), want = (logpdf,))
+        cut_kernel = ReactiveKernels._prepare_batched(
+            cut; batched = (:x, :location, :log_scale, :scale))
+        _AXIS_LOG_CALLS[] = 0
+        @test cut_kernel(
+            observations, location_grid, log.(scale_grid), scale_grid) ≈
+            sum(reference)
+        @test _AXIS_LOG_CALLS[] == 0
+    end
+
+    @testset "Ref keeps an array-valued input atomic" begin
+        atomic_graph = Graph()
+        value = value!(atomic_graph, :value, Float64)
+        offsets = value!(atomic_graph, :offsets, Vector{Float64})
+        offset = value!(atomic_graph, :offset, Float64)
+        shifted = value!(atomic_graph, :shifted, Float64)
+        add!(atomic_graph, offsets => offset, _axis_counted_sum)
+        add!(atomic_graph, (value, offset) => shifted, +)
+        atomic_plan = plan(atomic_graph;
+            have = (value, offsets), want = (shifted,))
+        atomic_kernel = ReactiveKernels._prepare_batched(
+            atomic_plan; batched = (:value, :offsets), reduce = nothing)
+
+        values = [1.0, 2.0, 3.0]
+        shared_offsets = [0.25, 0.75]
+        _AXIS_ATOMIC_CALLS[] = 0
+        @test atomic_kernel(values, Ref(shared_offsets)) == values .+ 1.0
+        @test _AXIS_ATOMIC_CALLS[] == 1
+    end
+
+
+    @testset "a later traced HAVE selects tensorized lowering" begin
+        native = (ops, args...) -> :native
+        tensorized = (ops, args...) -> :tensorized
+        pair = ReactiveKernels._BatchedFunctionPair{
+            1,(:x, :scale),:+,typeof(native),typeof(tensorized)}(
+                native, tensorized)
+        @test pair((), observations, scale_grid) === :native
+        @test pair((), observations, _AxisBackendArray(scales)) ===
+              :tensorized
+    end
+end
+
 # One scalar per-observation Gaussian log density, authored once.
 @kernel plate_nlogpdf(x::Float64, μ::Float64, logσ::Float64) = begin
     σ::Float64 = exp(logσ)

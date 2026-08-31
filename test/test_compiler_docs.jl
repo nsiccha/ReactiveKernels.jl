@@ -9,6 +9,7 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     index_path = joinpath(root, "docs", "src", "index.md")
     readme_path = joinpath(root, "README.md")
     ad_path = joinpath(root, "docs", "src", "automatic-differentiation.md")
+    batched_path = joinpath(root, "docs", "src", "batched.md")
 
     @test isfile(page_path)
     @test isfile(ad_path)
@@ -17,6 +18,16 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     index = _compiler_docs_lf(read(index_path, String))
     readme = _compiler_docs_lf(read(readme_path, String))
     ad_docs = _compiler_docs_lf(read(ad_path, String))
+    batched_docs = _compiler_docs_lf(read(batched_path, String))
+
+    for marker in (
+            "## A plate is a pure RK subgraph",
+            "narrowest valid loop\nboundary",
+            "cannot enter a\nplate",
+            "It is not\n`Distributions.jl.Normal`",
+        )
+        @test occursin(marker, batched_docs)
+    end
 
     # The exported prepared value+in-place-gradient surface has one public
     # prose authority. It shows the kernel, the interaction, caller-owned
@@ -129,6 +140,8 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
         "branch-and-bound",
         "availability-based Kahn ordering",
         "Structural CSE is explicit and conservative",
+        "narrowest valid nested-loop boundary",
+        "Effectful\nrecipes are excluded by the planner and cannot form a plate plan",
         "does not call\n`code_lowered`",
         "Validity changes are exception-safe but values are not transactionally rolled\nback",
         "external compilation examples and acceptance evidence",

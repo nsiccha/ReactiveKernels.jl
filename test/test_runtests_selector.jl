@@ -35,7 +35,8 @@
     @test occursin("unknown test selector(s): \"../test_ad.jl\", \"missing\"", message)
     @test occursin(
         "Known groups: core, acceptance, acceptance-compiler, " *
-        "acceptance-runtime, acceptance-samplers, ad, benchmark",
+        "acceptance-runtime, acceptance-samplers, acceptance-benchmarks, " *
+        "ad, benchmark",
         message,
     )
     @test occursin("Known files: test_package_boundary.jl", message)
