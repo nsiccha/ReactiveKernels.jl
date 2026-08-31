@@ -10,8 +10,9 @@ This page measures Reactant on the exact executable model documented on the
 `ReactiveKernelsPPLExamples`; it does not copy the model, rewrite a density, or
 introduce a Reactant-only mathematical path.
 
-The comparison mirrors the native primal receipt's complete three-by-four
-capability matrix. Its input boundaries are the packed unconstrained vector,
+The comparison mirrors the complete three-by-four capability matrix in the
+[native primal receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/eight-schools-primal-v1.toml).
+Its input boundaries are the packed unconstrained vector,
 the constrained parameter `NamedTuple`, and the minimal likelihood boundary
 (`θ`, observations, scales). Its requested outputs are the joint density,
 prior, summed likelihood, and pointwise likelihood. Two minimal-boundary cells
