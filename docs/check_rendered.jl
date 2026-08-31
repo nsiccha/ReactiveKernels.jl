@@ -84,7 +84,7 @@ function check_rendered_docs(build_dir, page_tree)
         "walnuts.md" => 1,
     )
     expected_sortable_tables = Dict(
-        "batched.md" => 1,
+        "batched.md" => 2,
         "compiler.md" => 1,
         "distributions.md" => 6,
         "eval-throughput.md" => 1,
