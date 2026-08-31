@@ -216,6 +216,22 @@ function Reactant.traced_type_inner(
     T
 end
 
+# A finite structural contract is compiler metadata. Its schema and exact
+# static identities define how numeric SoA inputs are interpreted, but neither
+# is a dynamic backend argument.
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels._SMFiniteStructuralContract,
+        path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where
+        {T<:ReactiveKernels._SMFiniteStructuralContract}
+    T
+end
+
 function Reactant.make_tracer(
         seen, previous::ReactiveKernels._FunctionalTransitionWithEffects,
         path, mode; kwargs...)
@@ -276,6 +292,22 @@ function Reactant.traced_type_inner(
         ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
         ndevices, runtime) where
         {T<:ReactiveKernels._StructuredStatePort}
+    T
+end
+
+# A fixed structural tuple port is immutable compiler metadata derived from
+# the exact source prototype.  Only the bound tuple value is part of the
+# backend ABI; its shape and alias-topology contract remains static.
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels._SMFixedStructuralTuplePort,
+        path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where
+        {T<:ReactiveKernels._SMFixedStructuralTuplePort}
     T
 end
 

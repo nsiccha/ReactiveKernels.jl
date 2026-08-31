@@ -180,6 +180,57 @@ function _independent_scalar_replacement_program()
     (; state, transition)
 end
 
+function _scalar_abs_div_program()
+    kernel = ReactiveKernels.compile_stateful(
+        _SFC.scalar_abs_div, 0.0, 0, 0)
+    state = kernel(0.0, 0, 0)
+    transition = ReactiveKernels.functionalize_stateful(
+        kernel, Val(:step!);
+        argument_types=Tuple{Float64,Int,Int})
+    (; kernel, state,
+       snapshot=ReactiveKernels.stateful_snapshot(state), transition)
+end
+
+@testset "exact scalar abs/div semantics and domains" begin
+    program = _scalar_abs_div_program()
+    cases = (
+        (-3.5, 7, 2),
+        (-3.5, -7, 2),
+        (-3.5, 7, -2),
+        (-3.5, -7, -2),
+    )
+    for (input, numerator, denominator) in cases
+        native = program.kernel(0.0, 0, 0)
+        @test ReactiveKernels.stateful_call(
+            native, Val(:step!), input, numerator, denominator)
+        native_state = ReactiveKernels.stateful_snapshot(native)
+        @test native_state.abs_value === abs(input)
+        @test native_state.quotient === div(numerator, denominator)
+
+        functional = program.transition(
+            program.snapshot, input, numerator, denominator)
+        @test functional.returned && functional.result
+        @test functional.state.abs_value === abs(input)
+        @test functional.state.quotient === div(numerator, denominator)
+    end
+
+    invalid_domains = (
+        Tuple{Int,Int,Int},
+        Tuple{ComplexF64,Int,Int},
+        Tuple{Vector{Float64},Int,Int},
+        Tuple{Float64,Bool,Bool},
+        Tuple{Float64,Float64,Float64},
+        Tuple{Float64,Int32,Int64},
+        Tuple{Float64,Vector{Int},Vector{Int}},
+        Tuple{Float64,Complex{Int},Complex{Int}},
+        Tuple{Float64,Rational{Int},Rational{Int}},
+    )
+    for argument_types in invalid_domains
+        @test_throws ReactiveKernels._LLowerReject ReactiveKernels.functionalize_stateful(
+            program.kernel, Val(:step!); argument_types)
+    end
+end
+
 @testset "functional state domains and source-inactive predication" begin
     dormant_kernel = ReactiveKernels.compile_stateful(_SFC.dormant, -1.0, 0)
     dormant_native = dormant_kernel(-1.0, 0)
@@ -192,6 +243,18 @@ end
     @test dormant_result.returned && dormant_result.result
     @test dormant_result.state == dormant_state
     @test !dormant_result.control_overflow
+
+    zero_kernel = ReactiveKernels.compile_stateful(
+        _SFC.zero_argument_branch, true, 0)
+    zero_native = zero_kernel(true, 0)
+    @test ReactiveKernels.stateful_call(zero_native, Val(:step!))
+    @test ReactiveKernels.stateful_snapshot(zero_native).count == 1
+    zero_transition = ReactiveKernels.functionalize_stateful(
+        zero_kernel, Val(:step!); argument_types=Tuple{})
+    zero_result = zero_transition(
+        ReactiveKernels.stateful_snapshot(zero_kernel(true, 0)))
+    @test zero_result.returned && zero_result.result
+    @test zero_result.state.count == 1
 
     drift_kernel = ReactiveKernels.compile_stateful(_SFC.drift, 4.0, 0)
     drift = ReactiveKernels.functionalize_stateful(
