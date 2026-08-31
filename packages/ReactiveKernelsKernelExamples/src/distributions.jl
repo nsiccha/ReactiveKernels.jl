@@ -30,7 +30,14 @@ _allocated(f, a, b) = @allocated f(a, b)
 _allocated(f, a, b, c) = @allocated f(a, b, c)
 _allocated(f, a, b, c, d) = @allocated f(a, b, c, d)
 
-const CONTINUOUS_SOURCE = NORMAL_LOGDENSITY_SOURCE * raw"""
+const CONTINUOUS_SOURCE = raw"""
+@kernel normal_logdensity(
+        x::Float64, location::Float64, log_scale::Float64) = begin
+    scale::Float64 = exp(log_scale)
+    standardized::Float64 = (x - location) / scale
+    logdensity::Float64 =
+        -0.5 * log(2π) - log_scale - 0.5 * standardized^2
+end
 
 normal_kernel = prepare(normal_logdensity;
     have = (:x, :location, :log_scale),

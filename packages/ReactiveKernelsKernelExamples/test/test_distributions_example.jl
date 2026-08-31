@@ -111,16 +111,21 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
         # kernel with `plate`.
         @test all(source -> !occursin("compose(", source), all_sources())
         @test occursin("plate(", vectorized)
+        # The first example is one direct log-scale kernel, not an artificial
+        # demonstration of alternative planner recipes.
+        @test !occursin("@recipe", continuous)
+        @test !occursin("cost =", continuous)
+        @test !occursin("negative_log_scale", continuous)
         # Regression guard against the exp-then-log round trip: with log_scale
         # in HAVE the density uses it directly in the normalizer. Scan code
-        # only — drop `#` comments so prose
-        # mentioning the anti-pattern doesn't trip the guard.
+        # only — drop `#` comments so prose mentioning the anti-pattern does not
+        # trip the guard.
         code_only(src) = join(
             (first(split(line, "#")) for line in eachsplit(src, "\n")), "\n",
         )
         continuous_code = code_only(continuous)
-        @test occursin("-log_scale", continuous_code)
-        @test occursin("-log(scale)", continuous_code)
+        @test occursin(r"-\s*log_scale", continuous_code)
+        @test occursin("scale::Float64 = exp(log_scale)", continuous_code)
         @test !occursin("log(exp", continuous_code)
         # The compute path is Distributions.jl-free.
         @test all(artifacts) do artifact
