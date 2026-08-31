@@ -392,6 +392,8 @@ julia --project=packages packages/ReactiveKernelsCompatibilityExamples/examples/
 
 Test arguments accept one or more known test basenames (with or without `.jl`)
 and run them once in the suite's canonical order after shared setup. The named
-groups are `core`, `acceptance`, `ad`, and `benchmark`; GitHub Actions runs both
-`core` and `acceptance` on every supported Julia/OS cell. Unknown names fail
-before any selected test executes and list the accepted groups and files.
+groups are `core`, `acceptance`, `acceptance-compiler`, `acceptance-runtime`,
+`acceptance-samplers`, `ad`, and `benchmark`; `acceptance` is the aggregate of
+the three finer acceptance groups. GitHub Actions runs `core` and all three
+acceptance groups on every supported Julia/OS cell. Unknown names fail before
+any selected test executes and list the accepted groups and files.

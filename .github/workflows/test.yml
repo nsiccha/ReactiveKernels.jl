@@ -22,10 +22,10 @@ jobs:
         julia-version: ['lts', '1', 'pre']
         julia-arch: [x64]
         os: [ubuntu-latest, windows-latest, macOS-latest]
-        # Each Julia/OS cell runs both disjoint partitions. Their concatenation
+        # Each Julia/OS cell runs four disjoint partitions. Their concatenation
         # is the ordinary full-suite file order in test/runtests.jl, so the
         # critical path is shorter without dropping cross-platform assertions.
-        test-shard: [core, acceptance]
+        test-shard: [core, acceptance-compiler, acceptance-runtime, acceptance-samplers]
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
