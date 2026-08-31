@@ -48,8 +48,8 @@ export value, value!, add!, plan, prepare, prepare_nonallocating, plate
 export prepare_ad, ad_gradient, ad_value_and_gradient!
 export lower, lower_batched, replica, transform, compile
 export explain, code_expr, inputs, outputs, valtype
-export compose, PreparationCache, prepare!, canon_id
-export KernelSpec, @kernel, @node, kernel_graph, port, copy!!
+export compose, extract, PreparationCache, prepare!, canon_id
+export KernelSpec, KernelObjectSpec, @kernel, @node, kernel_graph, port, copy!!
 export PartialFunction, partial
 export DAGVisualization, visualize, dot_source, save_visualization
 # Reactive layer
