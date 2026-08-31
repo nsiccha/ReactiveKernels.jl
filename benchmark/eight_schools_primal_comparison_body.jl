@@ -8,7 +8,7 @@ using Statistics
 using TOML
 using ReactiveKernels
 using ReactiveKernelsPPLExamples.EightSchoolsExample:
-    EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA, evaluate_eight_schools_source
+    EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA, build_eight_schools_graph
 import DynamicPPL
 import Turing
 using Distributions: Cauchy, MvNormal, Normal, truncated
@@ -170,8 +170,10 @@ function run_comparison()
     unconstrained = [μ, log_τ, θ...]
     parameters = (; μ, τ, θ)
 
-    artifact = evaluate_eight_schools_source()
-    rk_model = artifact.model
+    # This clones the graph evaluated from the exact public Eight Schools
+    # source at module load, so all timed kernels share that source authority
+    # without crossing a fresh Core.eval world-age boundary here.
+    rk_model = build_eight_schools_graph()
     rk_unconstrained_joint = prepare(rk_model;
         have = (:unconstrained, :observations, :observation_scales),
         want = :posterior)
