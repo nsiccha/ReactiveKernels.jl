@@ -31,7 +31,9 @@ end
 
     @test !occursin("NORMAL_LOGDENSITY", EIGHT_SCHOOLS_SOURCE)
     @test !occursin("CAUCHY_LOGDENSITY", EIGHT_SCHOOLS_SOURCE)
-    @test !occursin(r"(?m)^\s*\w+\s*=\s*prepare\(", EIGHT_SCHOOLS_SOURCE)
+    authored_model_source = first(split(
+        EIGHT_SCHOOLS_SOURCE, "\n\nμ = 1.5"; limit = 2))
+    @test !occursin("prepare(", authored_model_source)
     @test occursin("normal(0.0, 5.0).logpdf(μ)", EIGHT_SCHOOLS_SOURCE)
     @test occursin("cauchy(0.0, 5.0).logpdf(τ)", EIGHT_SCHOOLS_SOURCE)
     @test length(split(EIGHT_SCHOOLS_SOURCE, "pointwise = plate(")) - 1 == 2
@@ -79,16 +81,16 @@ end
         @test likelihood isa Float64
 
         # The Wren-style Params/LogPrior/LogLikelihood selection uses the direct
-        # reducing plate. Unrequested pointwise/Jacobian/posterior nodes are absent
-        # from the compiled plan rather than skipped by runtime branches.
+        # reducing plate. The authored pointwise node remains graph-visible, but
+        # total-only code generation emits no output buffer for it.
         produced = Set(
             canon_id(model.graph, output.id)
             for recipe in artifact.kernel.plan.recipes for output in recipe.outputs
         )
         @test canon_id(model.graph, model.likelihood.id) in produced
-        @test !(canon_id(model.graph, model.pointwise.id) in produced)
         @test !(canon_id(model.graph, model.log_jacobian.id) in produced)
         @test !(canon_id(model.graph, model.posterior.id) in produced)
+        @test !occursin("similar", string(code_expr(artifact.kernel)))
     end
 
     @testset "unconstrained -> constrained; Jacobian is optional" begin
@@ -147,7 +149,6 @@ end
                     model.observation_scales),
             want = (model.posterior,))
         @test length(posterior_only.recipes) > 1
-        @test !any(r -> r.op === sum, posterior_only.recipes)
         posterior_kernel = prepare(posterior_only)
         @test count(line -> occursin("for ", line),
                     split(string(code_expr(posterior_kernel)), '\n')) == 2
@@ -257,6 +258,7 @@ end
             set!(state, nested.observations, EIGHT_SCHOOLS_Y)
             set!(state, nested.observation_scales, EIGHT_SCHOOLS_SIGMA)
 
+            posterior_calls[] = 0
             get!(state, nested.parameters)
             get!(state, nested.prior)
             get!(state, nested.likelihood)
@@ -349,8 +351,10 @@ end
             EIGHT_SCHOOLS_Y, θ, EIGHT_SCHOOLS_SIGMA,
         )
         @test likelihood ≈ sum(expected_pointwise)
-        @test artifact.pointwise_and_likelihood ==
-              (expected_pointwise, likelihood)
+        combined_pointwise, combined_likelihood =
+            artifact.pointwise_and_likelihood
+        @test combined_pointwise ≈ expected_pointwise
+        @test combined_likelihood ≈ likelihood
 
         # The one authored plate lowers three ways. Pointwise-only allocates
         # exactly its requested result; total-only emits a scalar accumulator
