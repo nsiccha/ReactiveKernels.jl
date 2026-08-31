@@ -36,6 +36,13 @@ end
     return sum(pointwise)
 end
 
+@kernel untyped_authored_normal_loglik(x, location, scale) = begin
+    pointwise = plate(x, location, scale) do xi, li, si
+        authored_normal(li, si).logpdf(xi)
+    end
+    return sum(pointwise)
+end
+
 @kernel authored_cauchy_loglik(x::Vector{Float64}, location, scale) = begin
     pointwise = plate(x, location, scale) do xi, li, si
         authored_cauchy(li, si).logpdf(xi)
@@ -51,10 +58,23 @@ end
     return sum(pointwise)
 end
 
+
+@kernel untyped_authored_vector_loglik(x, location) = begin
+    pointwise = plate(x, Ref(location)) do xi, li
+        authored_vector_location(li).logpdf(xi)
+    end
+    return sum(pointwise)
+end
+
 _authored_plate_normal(x, location, scale) =
     -0.5 * log(2π) - log(scale) - 0.5 * ((x - location) / scale)^2
 _authored_plate_cauchy(x, location, scale) =
     -log(π) - log(scale) - log1p(((x - location) / scale)^2)
+
+function _authored_plate_allocated(kernel, a, b, c)
+    kernel(a, b, c)
+    @allocated kernel(a, b, c)
+end
 
 function _authored_plate_head_count(node, head)
     node isa Expr || return 0
@@ -100,6 +120,14 @@ end
     both = prepare(both_spec)
     reference = [_authored_plate_normal(x, location, scale) for x in xs]
 
+    untyped_total = prepare(untyped_authored_normal_loglik)
+    @test untyped_total.f isa ReactiveKernels._DynamicEmbeddedFunctionPair
+    @test typeof(untyped_total.f).parameters[1] == (1, 2, 3)
+    @test untyped_total(xs, location, scale) ≈ sum(reference)
+    @test _authored_plate_allocated(
+        untyped_total, xs, location, scale) == 0
+    @test !occursin("for ", string(untyped_total.f.tensorized_ast))
+
     # Positional KernelSpec application requests the distinguished return.
     @test authored_normal_loglik(xs, location, scale) ≈ sum(reference)
     @test total(xs, location, scale) ≈ sum(reference)
@@ -140,6 +168,8 @@ end
 
     locations = [0.1, 0.2, 0.4, 0.5]
     scales = [0.8, 1.0, 1.3, 1.5]
+    @test untyped_total(0.25, locations, scale) ≈ sum(
+        _authored_plate_normal(0.25, item, scale) for item in locations)
     zipped_reference = [
         _authored_plate_normal(xs[i], locations[i], scales[i])
         for i in eachindex(xs)
@@ -182,8 +212,11 @@ end
 
     pointwise = prepare(extract(authored_vector_loglik; want = :pointwise))
     total = prepare(authored_vector_loglik)
+    untyped_total = prepare(untyped_authored_vector_loglik)
     @test pointwise(observations, location) ≈ reference
     @test total(observations, location) ≈ sum(reference)
+    @test untyped_total(observations, location) ≈ sum(reference)
+    @test typeof(untyped_total.f).parameters[1] == (1,)
     @test _authored_plate_head_count(code_expr(total), :for) == 1
     @test !occursin("similar", string(code_expr(total)))
 end

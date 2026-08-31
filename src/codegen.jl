@@ -711,6 +711,32 @@ end
     _batched_call(f, ops, args, getfield(args, I))
 end
 
+# An untyped authored signature still specializes on its concrete call-site
+# argument types.  Keep every graph-proven candidate axis as type metadata and
+# select the first runtime broadcast axis before choosing native vs. tensorized
+# execution.  Atomic `Ref(port)` inputs are excluded when the candidates are
+# derived, so an array-valued atom cannot accidentally become the batch marker.
+struct _DynamicEmbeddedFunctionPair{I,N,T,A} <: _ArrayFunctionPair
+    native::N
+    tensorized::T
+    tensorized_ast::A
+end
+
+@inline _dynamic_embedded_marker(args, ::Val{()}) = throw(ArgumentError(
+    "an embedded plate requires an array-valued HAVE port at runtime"))
+
+@inline function _dynamic_embedded_marker(args, ::Val{I}) where {I}
+    index = first(I)
+    marker = getfield(args, index)
+    _authored_plate_is_axis(marker) && return marker
+    _dynamic_embedded_marker(args, Val(Base.tail(I)))
+end
+
+@inline function (f::_DynamicEmbeddedFunctionPair{I})(ops, args...) where {I}
+    marker = _dynamic_embedded_marker(args, Val(I))
+    _batched_call(f, ops, args, marker)
+end
+
 @inline _batched_call(f::_ArrayFunctionPair, ops, args, marker) =
     f.native(ops, args...)
 
@@ -744,7 +770,8 @@ function _embedded_ast(kernel::PreparedKernel, tensorized::Bool)
         batched, reduce = _batched_options(kernel.f)
         return _lower_batched_tensorized(
             kernel.plan; batched = batched, reduce = reduce)
-    elseif kernel.f isa _EmbeddedFunctionPair
+    elseif kernel.f isa Union{_EmbeddedFunctionPair,
+                              _DynamicEmbeddedFunctionPair}
         # The tensorized product may already contain arbitrarily nested plates
         # and user AST passes. Preserve that exact prepared artifact instead of
         # rebuilding from the native `kernel.ast`, which would silently restore
@@ -762,11 +789,33 @@ function _needs_embedded_tensorization(p::Plan)
     end
 end
 
-function _embedded_marker_index(p::Plan)
-    index = findfirst(value -> valtype(value) <: AbstractArray, p.have)
-    index === nothing && throw(ArgumentError(
-        "an embedded plate requires an array-valued HAVE port in the outer kernel"))
-    index
+_array_marker_positions(::_ArrayFunctionPair) = ()
+_array_marker_positions(::_BatchedFunctionPair{I}) where {I} = (I,)
+_array_marker_positions(::_EmbeddedFunctionPair{I}) where {I} = (I,)
+_array_marker_positions(::_DynamicEmbeddedFunctionPair{I}) where {I} = I
+
+function _embedded_marker_candidates(p::Plan)
+    dependencies = _authored_plate_dependencies(p)
+    candidates = Int[]
+    for recipe in p.recipes
+        positions = if recipe.op isa _AuthoredPlateOp
+            atomic = typeof(recipe.op).parameters[2]
+            Tuple(index for index in eachindex(recipe.inputs)
+                  if !(index in atomic))
+        else
+            kernel = _embedded_kernel(recipe.op)
+            kernel === nothing ? () : _array_marker_positions(kernel.f)
+        end
+        for position in positions
+            input = recipe.inputs[position]
+            roots = sort!(collect(get(
+                dependencies, canon_id(p.graph, input.id), Set{Int}())))
+            for root in roots
+                root in candidates || push!(candidates, root)
+            end
+        end
+    end
+    Tuple(candidates)
 end
 
 """
@@ -1014,14 +1063,16 @@ end
     k.f(k.ops, k.caches, k.cache_apply, args...)
 end
 
-function _prepare_nonallocating(p::Plan, ast::Expr, cache_apply)
+function _prepare_nonallocating(
+        p::Plan, ast::Expr, cache_apply;
+        cache_slot = recipe -> _cache_slot(only(recipe.outputs)))
     for r in p.recipes
         length(r.outputs) == 1 || throw(ArgumentError(
             "prepare_nonallocating requires single-output recipes; recipe $(r.id) has $(length(r.outputs)) outputs"))
     end
     f = compile(ast)
     ops = ntuple(i -> p.recipes[i].op, length(p.recipes))
-    caches = ntuple(i -> _cache_slot(only(p.recipes[i].outputs)), length(p.recipes))
+    caches = ntuple(i -> cache_slot(p.recipes[i]), length(p.recipes))
     NonAllocatingKernel(f, ops, caches, cache_apply, Tuple(p.have),
                         Tuple(p.want), p, ast)
 end
@@ -1050,10 +1101,21 @@ function prepare(p::Plan; passes = ())
         (tensorized_ast = transform(tensorized_ast, passes...))
     native = compile(native_ast)
     tensorized = compile(tensorized_ast)
-    input_index = _embedded_marker_index(p)
-    f = _EmbeddedFunctionPair{
-        input_index,typeof(native),typeof(tensorized),typeof(tensorized_ast)}(
-            native, tensorized, tensorized_ast)
+    candidates = _embedded_marker_candidates(p)
+    isempty(candidates) && throw(ArgumentError(
+        "an embedded plate requires an array-valued HAVE port in the outer kernel"))
+    typed_candidate = findfirst(
+        index -> valtype(p.have[index]) <: AbstractArray, candidates)
+    f = if typed_candidate === nothing
+        _DynamicEmbeddedFunctionPair{
+            candidates,typeof(native),typeof(tensorized),typeof(tensorized_ast)}(
+                native, tensorized, tensorized_ast)
+    else
+        input_index = candidates[typed_candidate]
+        _EmbeddedFunctionPair{
+            input_index,typeof(native),typeof(tensorized),typeof(tensorized_ast)}(
+                native, tensorized, tensorized_ast)
+    end
     PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast, recipes)
 end
 

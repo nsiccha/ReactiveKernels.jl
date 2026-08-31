@@ -38,7 +38,7 @@ end
 end
 
 authored_batched_spec = @kernel authored_batched_normal(
-        x::Vector{Float64}, μ::Float64, σ::Float64) = begin
+        x, μ::Float64, σ::Float64) = begin
     pointwise = plate(x, μ, σ) do xi, mi, si
         authored_batched_pointwise().logpdf(xi, mi, si)
     end

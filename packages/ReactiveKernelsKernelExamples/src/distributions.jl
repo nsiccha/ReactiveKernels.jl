@@ -52,7 +52,7 @@ const DISCRETE_SOURCE = BERNOULLI_SOURCE
 const VECTORIZED_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 
-@kernel normal_loglik(x::Vector{Float64}, location, scale) = begin
+@kernel normal_loglik(x, location, scale) = begin
     pointwise = plate(x, location, scale) do xi, li, si
         normal(li, si).logpdf(xi)
     end

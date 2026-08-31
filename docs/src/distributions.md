@@ -60,7 +60,7 @@ transparent distribution object pointwise, and its ordinary `return` selects
 the summed result:
 
 ```julia
-@kernel normal_loglik(x::Vector{Float64}, location, scale) = begin
+@kernel normal_loglik(x, location, scale) = begin
     pointwise = plate(x, location, scale) do xi, li, si
         normal(li, si).logpdf(xi)
     end

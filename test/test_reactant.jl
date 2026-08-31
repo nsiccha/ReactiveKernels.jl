@@ -104,8 +104,7 @@ end
     ld::Float64 = -log(π) - logσ - log1p(z^2)
 end
 
-@kernel reactant_authored_normal_loglik(
-        x::Vector{Float64}, location, scale) = begin
+@kernel reactant_authored_normal_loglik(x, location, scale) = begin
     pointwise = plate(x, location, scale) do xi, li, si
         normal(li, si).logpdf(xi)
     end
