@@ -20,68 +20,98 @@ end
 using ReactiveKernels
 using Test
 
+const _MATRIX_CORE_TESTS = (
+    "test_stateless.jl",
+    "test_ad.jl",
+    "test_authoring.jl",
+    "test_readable_expr.jl",
+    "test_plate.jl",
+    "test_replica.jl",
+    "test_kernel_stateful.jl",
+    "test_kernel_methodir.jl",
+    "test_kernel_factory.jl",
+    "test_kernel_lowering.jl",
+    "test_kernel_codegen.jl",
+    "test_kernel_control.jl",
+    "test_kernel_control_regressions.jl",
+    "test_kernel_nuts.jl",
+    "test_kernel_nuts_native.jl",
+    "test_nuts_docs_fixture.jl",
+    "test_reactivehmc_algorithm_corpus.jl",
+    "test_reactivehmc_corpus_docs.jl",
+    "test_walnuts_external_corpus.jl",
+    "test_walnuts_docs_fixture.jl",
+    "test_reactivehmc_rke_fixture.jl",
+    "test_reactivehmc_rke_compiler.jl",
+    "test_reactivehmc_hmc_fixture.jl",
+)
+
+const _MATRIX_ACCEPTANCE_TESTS = (
+    "test_reactivehmc_hmc_compiler.jl",
+    "test_finite_structural_container.jl",
+    "test_compiler_docs.jl",
+    "test_kernel_adaptation.jl",
+    "test_nonallocating_core.jl",
+    "test_composition_cse.jl",
+    "test_deterministic_ast.jl",
+    "test_reactive.jl",
+    "test_stateful.jl",
+    "test_visualization.jl",
+    "test_adversarial.jl",
+    "test_hmc.jl",
+    "test_pathfinder.jl",
+    "test_pathfinder_docs.jl",
+    "test_reactive_sampler_baseline.jl",
+    "test_reactive_nuts.jl",
+    "test_reactive_adaptation.jl",
+    "test_benchmark_smoke.jl",
+    "test_online_stats_example.jl",
+    "test_nutpie_diagonal_adaptation.jl",
+    "test_reactivehmc_phasepoint_receipt.jl",
+    "test_reactivehmc_integrator_fixture.jl",
+    "test_reactivehmc_endpoint_specs.jl",
+    "test_reactivehmc_statistics_receipt.jl",
+    "test_reactivehmc_statistics_fixture.jl",
+    "test_reactivehmc_statistics_compiler.jl",
+)
+
+const _FULL_TESTS = (_MATRIX_CORE_TESTS..., _MATRIX_ACCEPTANCE_TESTS...)
+
+const _TEST_MODE = if isempty(ARGS)
+    :full
+elseif ARGS == ["benchmark"]
+    :benchmark
+elseif ARGS == ["ad"]
+    :ad
+elseif ARGS == ["core"]
+    :core
+elseif ARGS == ["acceptance"]
+    :acceptance
+else
+    throw(ArgumentError(
+        "expected no test argument or one of benchmark, ad, core, acceptance; got $(repr(ARGS))"))
+end
+
+@assert isempty(intersect(Set(_MATRIX_CORE_TESTS), Set(_MATRIX_ACCEPTANCE_TESTS)))
+@assert all(isfile(joinpath(@__DIR__, file)) for file in _FULL_TESTS)
+
 # Assert the package loads without sampler/compiler domain code before opting into
 # the external executable exemplar used by the remaining NUTS/HMC acceptance tests.
-include("test_package_boundary.jl")
+# The matrix core shard owns this assertion; an ordinary full/ad/benchmark run keeps
+# the historical behavior unchanged.
+_TEST_MODE == :acceptance || include("test_package_boundary.jl")
 include(joinpath(@__DIR__, "..", "examples", "nuts_runtime.jl"))
 using .ReactiveKernelsNUTSExample
 
 @testset "ReactiveKernels" begin
-    include("test_ci_compiled_modules.jl")
-    benchmark_only = ARGS == ["benchmark"]
-    ad_only = ARGS == ["ad"]
-    if ad_only
+    _TEST_MODE == :acceptance || include("test_ci_compiled_modules.jl")
+    if _TEST_MODE == :ad
         include("test_ad.jl")
-    elseif !benchmark_only
-        include("test_stateless.jl")
-        include("test_ad.jl")
-        include("test_authoring.jl")
-        include("test_readable_expr.jl")
-        include("test_plate.jl")
-        include("test_replica.jl")
-        include("test_kernel_stateful.jl")
-        include("test_kernel_methodir.jl")
-        include("test_kernel_factory.jl")
-        include("test_kernel_lowering.jl")
-        include("test_kernel_codegen.jl")
-        include("test_kernel_control.jl")
-        include("test_kernel_control_regressions.jl")
-        include("test_kernel_nuts.jl")
-        include("test_kernel_nuts_native.jl")
-        include("test_nuts_docs_fixture.jl")
-        include("test_reactivehmc_algorithm_corpus.jl")
-        include("test_reactivehmc_corpus_docs.jl")
-        include("test_walnuts_external_corpus.jl")
-        include("test_walnuts_docs_fixture.jl")
-        include("test_reactivehmc_rke_fixture.jl")
-        include("test_reactivehmc_rke_compiler.jl")
-        include("test_reactivehmc_hmc_fixture.jl")
-        include("test_reactivehmc_hmc_compiler.jl")
-        include("test_finite_structural_container.jl")
-        include("test_compiler_docs.jl")
-        include("test_kernel_adaptation.jl")
-        include("test_nonallocating_core.jl")
-        include("test_composition_cse.jl")
-        include("test_deterministic_ast.jl")
-        include("test_reactive.jl")
-        include("test_stateful.jl")
-        include("test_visualization.jl")
-        include("test_adversarial.jl")
-        include("test_hmc.jl")
-        include("test_pathfinder.jl")
-        include("test_pathfinder_docs.jl")
-        include("test_reactive_sampler_baseline.jl")
-        include("test_reactive_nuts.jl")
-        include("test_reactive_adaptation.jl")
-        include("test_benchmark_smoke.jl")
-        include("test_online_stats_example.jl")
-        include("test_nutpie_diagonal_adaptation.jl")
-        include("test_reactivehmc_phasepoint_receipt.jl")
-        include("test_reactivehmc_integrator_fixture.jl")
-        include("test_reactivehmc_endpoint_specs.jl")
-        include("test_reactivehmc_statistics_receipt.jl")
-        include("test_reactivehmc_statistics_fixture.jl")
-        include("test_reactivehmc_statistics_compiler.jl")
+    elseif _TEST_MODE != :benchmark
+        tests = _TEST_MODE == :core ? _MATRIX_CORE_TESTS :
+            _TEST_MODE == :acceptance ? _MATRIX_ACCEPTANCE_TESTS : _FULL_TESTS
+        foreach(include, tests)
     end
-    ad_only || include("test_handwritten_benchmarks.jl")
+    _TEST_MODE in (:full, :benchmark, :acceptance) &&
+        include("test_handwritten_benchmarks.jl")
 end
