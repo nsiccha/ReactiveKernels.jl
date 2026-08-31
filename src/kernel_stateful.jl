@@ -658,13 +658,50 @@ function _kernel_endpoint_named_output!(st::_KernelEndpointBuildState, base::Sym
     count == 1 ? base : Symbol(st.current_method, "__", base, "__", count)
 end
 
+_kernel_scoped_port(scope::Symbol, name::Symbol) = Symbol(scope, ".", name)
+
+"""
+Clone a bound child endpoint under its authored owner-port name. The scoped
+names are graph metadata only: operations remain the same positional Julia
+callables, while plans and extracted ports can distinguish `standard.logpdf`
+from the enclosing object's public `logpdf`.
+"""
+function _kernel_scope_spec(spec::KernelSpec, scope::Symbol)
+    graph = Graph()
+    mapped = Dict{Int,Value}()
+    for id in sort!(collect(keys(spec.graph.values)))
+        source = spec.graph.values[id]
+        mapped[id] = value!(graph, _kernel_scoped_port(scope, source.name),
+                            valtype(source))
+    end
+    for id in sort!(collect(keys(spec.graph.aliases)))
+        _kernel_inline_alias!(graph, mapped[id],
+            mapped[canon_id(spec.graph, id)], "scoped child alias")
+    end
+    for recipe in spec.graph.recipes
+        add!(graph;
+            inputs = Tuple(mapped[value.id] for value in recipe.inputs),
+            outputs = Tuple(mapped[value.id] for value in recipe.outputs),
+            op = recipe.op, cost = recipe.cost, cse_key = recipe.cse_key,
+            effectful = recipe.effectful, source = recipe.source)
+    end
+    _reindex_producers!(graph)
+    scoped(name) = _kernel_scoped_port(scope, name)
+    ports = Dict{Symbol,Value}(
+        scoped(name) => mapped[value.id] for (name, value) in spec.ports)
+    KernelSpec(graph, ports, scoped.(spec.port_order), scoped.(spec.have_names),
+               scoped.(spec.want_names), spec.call_signature)
+end
+
 function _kernel_endpoint_binding_spec!(st::_KernelEndpointBuildState,
                                         root::Symbol, method::Symbol)
     key = (root, method)
     get!(st.binding_specs, key) do
         var = gensym(Symbol(root, :_, method, :_endpoint))
         bound = Expr(:call, GlobalRef(Core, :getfield), st.bindings_var, QuoteNode(root))
-        rhs = Expr(:call, GlobalRef(Base, :getproperty), bound, QuoteNode(method))
+        endpoint = Expr(:call, GlobalRef(Base, :getproperty), bound, QuoteNode(method))
+        rhs = Expr(:call, GlobalRef(@__MODULE__, :_kernel_scope_spec),
+                   endpoint, QuoteNode(root))
         push!(st.binding_prelude, :($var = $rhs))
         var
     end
@@ -720,7 +757,8 @@ function _kernel_endpoint_lift!(st::_KernelEndpointBuildState, x, lifted::Vector
                 "bound endpoint `$root.$method` in :$(st.current_method) requires named port arguments"))
             placeholder = gensym(Symbol(root, :_, method, :_call))
             st.nested_specs[placeholder] = spec
-            out = _kernel_endpoint_named_output!(st, Symbol(root, "__", method))
+            out = _kernel_endpoint_named_output!(
+                st, _kernel_scoped_port(root, method))
             out_type = Expr(:call, GlobalRef(@__MODULE__, :valtype),
                             Expr(:call, GlobalRef(Base, :only),
                                  Expr(:call, GlobalRef(@__MODULE__, :outputs), spec)))

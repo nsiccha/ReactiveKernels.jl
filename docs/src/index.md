@@ -197,6 +197,9 @@ end
 the same transparent graph path as any other nested kernel call. Its residual
 owner ports, `location` and `scale`, connect by name; `x` is the explicit method
 argument. No object call or graph traversal remains in the prepared function.
+The bound child's endpoint remains visible as the scoped port
+`normal[Symbol("standard.logpdf")]`, distinct from the enclosing public
+`normal.logpdf`; plans and DAGs use those same unambiguous names.
 
 Named relations stay available as alternate cuts. Here `scale = exp(log_scale)`
 and `log_scale = log(scale)` are ordinary bidirectional recipes: the natural
