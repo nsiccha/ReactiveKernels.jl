@@ -1043,13 +1043,15 @@ end
 
 function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                                       nested_specs::Dict{Symbol,Any},
-                                      local_types::Dict{Symbol,Any})
+                                      local_types::Dict{Symbol,Any};
+                                      context = "inside @kernel",
+                                      materialized = Tuple{Symbol,Any,Any}[])
     ex isa Expr || return ex, nothing
     ex.head in (:quote, :inert) && return ex, nothing
 
     # `object(owner_args...).endpoint(endpoint_args...)` is source-level graph
     # application.  Resolve the object and endpoint while the macro expands,
-    # retarget its implicit owner signature to the do-block locals, and let the
+    # retarget its implicit owner signature to the caller ports, and let the
     # established nested-KernelSpec splicer clone the complete endpoint graph.
     if ex.head === :call && !isempty(ex.args)
         callee = ex.args[1]
@@ -1061,24 +1063,102 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
             endpoint_name = callee.args[2].value
             if object isa Union{_StatefulKernelSkeleton,KernelObjectSpec} &&
                endpoint_name in kernel_endpoint_names(object)
-                owner_actuals = constructor.args[2:end]
                 endpoint_actuals = ex.args[2:end]
-                all(arg -> arg isa Symbol && arg in locals,
-                    (owner_actuals..., endpoint_actuals...)) || throw(ArgumentError(
-                    "constructed endpoint application inside plate requires bare do-block arguments"))
-                endpoint = extract(object; want = endpoint_name)
-                signature = endpoint.call_signature
+                default_endpoint = extract(object; want = endpoint_name)
+                signature = default_endpoint.call_signature
                 signature isa _KernelEndpointCallSignature || throw(ArgumentError(
                     "constructed object endpoint :$endpoint_name has no transparent call signature"))
-                implicit, explicit = typeof(signature).parameters
-                length(owner_actuals) == length(implicit) || throw(ArgumentError(
-                    "kernel object constructor for :$endpoint_name expects $(length(implicit)) " *
+                default_implicit, explicit = typeof(signature).parameters
+
+                constructor_args = constructor.args[2:end]
+                parameter_nodes = Any[arg for arg in constructor_args
+                                      if arg isa Expr && arg.head === :parameters]
+                length(parameter_nodes) <= 1 || throw(ArgumentError(
+                    "kernel object constructor for :$endpoint_name has multiple keyword lists"))
+                positional = Any[arg for arg in constructor_args
+                                 if !(arg isa Expr && arg.head === :parameters)]
+
+                owner_formals = Symbol[]
+                owner_actuals = Any[]
+                endpoint = default_endpoint
+                if isempty(parameter_nodes)
+                    append!(owner_formals, default_implicit)
+                    append!(owner_actuals, positional)
+                else
+                    isempty(positional) || throw(ArgumentError(
+                        "kernel object constructor for :$endpoint_name cannot mix positional " *
+                        "and named owner bindings"))
+                    for binding in only(parameter_nodes).args
+                        name, actual = if binding isa Symbol
+                            (binding, binding)
+                        elseif binding isa Expr && binding.head in (:kw, :(=)) &&
+                               length(binding.args) == 2 && binding.args[1] isa Symbol
+                            (binding.args[1], binding.args[2])
+                        else
+                            throw(ArgumentError(
+                                "kernel object constructor for :$endpoint_name requires named " *
+                                "bindings such as `location = caller_port`"))
+                        end
+                        name in owner_formals && throw(ArgumentError(
+                            "duplicate kernel object binding :$name for endpoint :$endpoint_name"))
+                        name in explicit && throw(ArgumentError(
+                            "kernel object binding :$name duplicates an explicit " *
+                            "endpoint argument of :$endpoint_name"))
+                        push!(owner_formals, name)
+                        push!(owner_actuals, actual)
+                    end
+                    full = _kernel_object_full_spec(object)
+                    available = Tuple(keys(full))
+                    for name in owner_formals
+                        haskey(full, name) || throw(ArgumentError(
+                            "unknown kernel object binding :$name for endpoint :$endpoint_name; " *
+                            "available graph ports: $(join(string.(available), ", "))"))
+                    end
+                    endpoint = extract(object;
+                        have = Tuple((owner_formals..., explicit...)),
+                        want = endpoint_name)
+                end
+
+                length(owner_actuals) == length(owner_formals) || throw(ArgumentError(
+                    "kernel object constructor for :$endpoint_name expects $(length(owner_formals)) " *
                     "owner argument(s), got $(length(owner_actuals))"))
                 length(endpoint_actuals) == length(explicit) || throw(ArgumentError(
                     "endpoint :$endpoint_name expects $(length(explicit)) argument(s), " *
                     "got $(length(endpoint_actuals))"))
+                all(arg -> arg isa Symbol && arg in locals, endpoint_actuals) ||
+                    throw(ArgumentError(
+                        "constructed endpoint arguments $context must be named caller ports"))
 
-                actuals = Symbol[owner_actuals...; endpoint_actuals...]
+                # Owner bindings are graph inputs, but their source spelling need not
+                # already be a named caller port. Materialize literals and computed
+                # expressions as hygienic caller recipes, typed by the selected child
+                # boundary, then alias those generated ports into the cloned endpoint.
+                # This preserves ordinary Julia-like construction such as
+                # `normal(0.0, 5.0).logpdf(x)` without hiding runtime object calls.
+                endpoint_inputs = inputs(endpoint)
+                owner_ports = Symbol[]
+                for (index, (formal, actual)) in
+                        enumerate(zip(owner_formals, owner_actuals))
+                    if actual isa Symbol && actual in locals
+                        push!(owner_ports, actual)
+                        continue
+                    elseif actual isa Symbol
+                        throw(ArgumentError(
+                            "kernel object binding :$formal $context refers to undeclared " *
+                            "caller port :$actual"))
+                    end
+                    rewritten_actual, _ = _kernel_constructed_endpoint(
+                        actual, mod, locals, nested_specs, local_types;
+                        context = context, materialized = materialized)
+                    generated_port = gensym(Symbol(formal, :_binding))
+                    generated_type = valtype(endpoint_inputs[index])
+                    push!(materialized,
+                          (generated_port, generated_type, rewritten_actual))
+                    push!(locals, generated_port)
+                    push!(owner_ports, generated_port)
+                end
+
+                actuals = Symbol[owner_ports...; endpoint_actuals...]
                 for (actual, formal) in zip(actuals, inputs(endpoint))
                     T = valtype(formal)
                     if haskey(local_types, actual) && local_types[actual] != T
@@ -1091,7 +1171,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
 
                 generated = gensym(Symbol(endpoint_name, :_endpoint))
                 retargeted = _kernel_endpoint_call_signature(
-                    Val(Tuple(Symbol.(owner_actuals))), Val(explicit))
+                    Val(Tuple(owner_ports)), Val(explicit))
                 nested_specs[generated] = KernelSpec(
                     endpoint.graph, endpoint.ports, endpoint.port_order,
                     endpoint.have_names, endpoint.want_names, retargeted)
@@ -1105,7 +1185,8 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
     child_types = Any[]
     for arg in ex.args
         child, child_type = _kernel_constructed_endpoint(
-            arg, mod, locals, nested_specs, local_types)
+            arg, mod, locals, nested_specs, local_types;
+            context = context, materialized = materialized)
         push!(rewritten, child)
         push!(child_types, child_type)
     end
@@ -1156,12 +1237,26 @@ function _kernel_authored_plate_expr(rhs, mod)
 
     nested_specs = Dict{Symbol,Any}()
     local_types = Dict{Symbol,Any}()
+    materialized = Tuple{Symbol,Any,Any}[]
     rewritten, inferred = _kernel_constructed_endpoint(
-        scalar_body, mod, Set(formals), nested_specs, local_types)
+        scalar_body, mod, Set(formals), nested_specs, local_types;
+        context = "inside plate", materialized = materialized)
     signature = Tuple{Symbol,Any}[
         (name, get(local_types, name, GlobalRef(Core, :Any))) for name in formals]
     scalar_graph_body = _kernel_expression_result_body(
         :__plate_value__, signature, rewritten, true)
+    if !isempty(materialized)
+        lifted = Any[
+            Expr(:(=), Expr(:(::), name, T), rhs)
+            for (name, T, rhs) in materialized
+        ]
+        scalar_graph_body = if scalar_graph_body isa Expr &&
+                               scalar_graph_body.head === :block
+            Expr(:block, lifted..., scalar_graph_body.args...)
+        else
+            Expr(:block, lifted..., scalar_graph_body)
+        end
+    end
     if inferred !== nothing && scalar_graph_body isa Expr &&
        scalar_graph_body.head === :block
         assignment_index = findfirst(scalar_graph_body.args) do statement
@@ -1499,6 +1594,46 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     for name in want_names
         name in known || throw(ArgumentError("@kernel returns undeclared port :$name"))
     end
+
+    # Lower constructed object endpoints in ordinary recipes as well as authored
+    # plate bodies. Named constructor bindings select the exact owner HAVE cut;
+    # endpoint arguments remain the explicit method boundary. The resulting
+    # generated KernelSpec is handled by the same transparent nested splicer as
+    # a bare `object.endpoint(args...)` call, so no KernelObjectSpec survives to
+    # runtime.
+    rewritten_entries = Any[]
+    for entry in entries
+        if entry[1] === :recipe && entry[5] === nothing
+            _, outputs, authored_rhs, metadata, plate_expr = entry
+            local_types = Dict{Symbol,Any}()
+            materialized = Tuple{Symbol,Any,Any}[]
+            rewritten, inferred = _kernel_constructed_endpoint(
+                authored_rhs, mod, known, nested_specs, local_types;
+                materialized = materialized)
+            materialized_names = Set{Symbol}()
+            for (name, T, rhs) in materialized
+                register!(name, T)
+                push!(known, name)
+                push!(materialized_names, name)
+                push!(rewritten_entries,
+                      (:recipe, Tuple{Symbol,Any}[(name, T)], rhs,
+                       Dict{Symbol,Any}(), nothing))
+            end
+            for (name, T) in local_types
+                name in materialized_names && continue
+                push!(annotations[name], T)
+            end
+            if length(outputs) == 1 && outputs[1][2] === nothing && inferred !== nothing
+                push!(annotations[outputs[1][1]], inferred)
+            end
+            push!(rewritten_entries,
+                  (:recipe, outputs, rewritten, metadata, plate_expr))
+        else
+            push!(rewritten_entries, entry)
+        end
+    end
+    entries = rewritten_entries
+
     for name in port_order
         port_vars[name] = gensym(name)
     end

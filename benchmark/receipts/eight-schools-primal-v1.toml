@@ -1,0 +1,311 @@
+generated_at = "2026-08-31T22:19:19.797Z"
+schema = "eight-schools-primal-v1"
+
+[environment]
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+julia_threads = 1
+os = "Linux"
+
+[[measurements]]
+boundary = "packed_unconstrained"
+description = "full joint including the transform Jacobian"
+outcome = "joint"
+
+    [measurements.manual_julia]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 90.0
+    times_ns = [120.0, 90.0, 90.0, 120.0, 90.0, 90.0, 120.0, 120.0, 90.0, 90.0]
+
+    [measurements.rk_native]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 80.0
+    times_ns = [80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0]
+
+    [measurements.turing_native]
+    allocs = [8, 8, 8, 8, 8, 8, 8, 8, 8, 8]
+    bytes = [416, 416, 416, 416, 416, 416, 416, 416, 416, 416]
+    median_allocs = 8
+    median_bytes = 416
+    median_ns = 301.0
+    times_ns = [451.0, 301.0, 310.0, 291.0, 300.0, 301.0, 300.0, 310.0, 300.0, 310.0]
+[[measurements]]
+boundary = "packed_unconstrained"
+description = "log prior including the transform Jacobian"
+outcome = "prior"
+
+    [measurements.manual_julia]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 50.0
+    times_ns = [50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0]
+
+    [measurements.rk_native]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 50.0
+    times_ns = [50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0]
+
+    [measurements.turing_native]
+    allocs = [8, 8, 8, 8, 8, 8, 8, 8, 8, 8]
+    bytes = [400, 400, 400, 400, 400, 400, 400, 400, 400, 400]
+    median_allocs = 8
+    median_bytes = 400
+    median_ns = 235.0
+    times_ns = [230.0, 230.0, 240.0, 230.0, 240.0, 230.0, 240.0, 240.0, 230.0, 240.0]
+[[measurements]]
+boundary = "packed_unconstrained"
+description = "summed log likelihood after unpacking the latent vector"
+outcome = "likelihood"
+
+    [measurements.manual_julia]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 70.0
+    times_ns = [70.0, 70.0, 70.0, 70.0, 70.0, 70.0, 70.0, 70.0, 70.0, 70.0]
+
+    [measurements.rk_native]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 70.0
+    times_ns = [70.0, 70.0, 80.0, 70.0, 90.0, 70.0, 70.0, 70.0, 70.0, 70.0]
+
+    [measurements.turing_native]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 80.0
+    times_ns = [80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0]
+[[measurements]]
+boundary = "packed_unconstrained"
+description = "eight pointwise log likelihoods after unpacking"
+outcome = "pointwise"
+
+    [measurements.manual_julia]
+    allocs = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    bytes = [128, 128, 128, 128, 128, 128, 128, 128, 128, 128]
+    median_allocs = 1
+    median_bytes = 128
+    median_ns = 80.0
+    times_ns = [80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0]
+
+    [measurements.rk_native]
+    allocs = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    bytes = [128, 128, 128, 128, 128, 128, 128, 128, 128, 128]
+    median_allocs = 1
+    median_bytes = 128
+    median_ns = 80.0
+    times_ns = [80.0, 80.0, 80.0, 120.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0]
+
+    [measurements.turing_native]
+    allocs = [11, 11, 11, 11, 11, 11, 11, 11, 11, 11]
+    bytes = [544, 544, 544, 544, 544, 544, 544, 544, 544, 544]
+    median_allocs = 11
+    median_bytes = 544
+    median_ns = 645.5
+    times_ns = [641.0, 621.0, 631.0, 631.0, 640.0, 881.0, 660.0, 650.0, 660.0, 651.0]
+[[measurements]]
+boundary = "constrained_parameters"
+description = "full joint excluding the transform Jacobian"
+outcome = "joint"
+
+    [measurements.manual_julia]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 80.0
+    times_ns = [80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 110.0, 80.0, 79.0]
+
+    [measurements.rk_native]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 80.0
+    times_ns = [80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 110.0, 80.0, 80.0, 80.0]
+
+    [measurements.turing_native]
+    allocs = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    bytes = [128, 128, 128, 128, 128, 128, 128, 128, 128, 128]
+    median_allocs = 1
+    median_bytes = 128
+    median_ns = 110.0
+    times_ns = [110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0]
+[[measurements]]
+boundary = "constrained_parameters"
+description = "constrained-space log prior"
+outcome = "prior"
+
+    [measurements.manual_julia]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 40.0
+    times_ns = [40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0]
+
+    [measurements.rk_native]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 40.0
+    times_ns = [50.0, 40.0, 40.0, 40.0, 40.0, 50.0, 40.0, 40.0, 40.0, 40.0]
+
+    [measurements.turing_native]
+    allocs = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    bytes = [128, 128, 128, 128, 128, 128, 128, 128, 128, 128]
+    median_allocs = 1
+    median_bytes = 128
+    median_ns = 75.0
+    times_ns = [70.0, 70.0, 80.0, 70.0, 70.0, 80.0, 80.0, 80.0, 80.0, 70.0]
+[[measurements]]
+boundary = "constrained_parameters"
+description = "summed log likelihood"
+outcome = "likelihood"
+
+    [measurements.manual_julia]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 70.0
+    times_ns = [70.0, 70.0, 70.0, 70.0, 60.0, 80.0, 70.0, 70.0, 69.0, 70.0]
+
+    [measurements.rk_native]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 60.0
+    times_ns = [60.0, 60.0, 60.0, 60.0, 60.0, 60.0, 60.0, 60.0, 60.0, 80.0]
+
+    [measurements.turing_native]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 70.0
+    times_ns = [70.0, 70.0, 70.0, 70.0, 70.0, 70.0, 70.0, 70.0, 70.0, 70.0]
+[[measurements]]
+boundary = "constrained_parameters"
+description = "eight pointwise log likelihoods"
+outcome = "pointwise"
+
+    [measurements.manual_julia]
+    allocs = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    bytes = [128, 128, 128, 128, 128, 128, 128, 128, 128, 128]
+    median_allocs = 1
+    median_bytes = 128
+    median_ns = 80.0
+    times_ns = [80.0, 80.0, 70.0, 71.0, 110.0, 80.0, 80.0, 70.0, 80.0, 80.0]
+
+    [measurements.rk_native]
+    allocs = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    bytes = [128, 128, 128, 128, 128, 128, 128, 128, 128, 128]
+    median_allocs = 1
+    median_bytes = 128
+    median_ns = 80.0
+    times_ns = [80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0]
+
+    [measurements.turing_native]
+    allocs = [11, 11, 11, 11, 11, 11, 11, 11, 11, 11]
+    bytes = [480, 480, 480, 480, 480, 480, 480, 480, 480, 480]
+    median_allocs = 11
+    median_bytes = 480
+    median_ns = 621.0
+    times_ns = [630.0, 630.0, 621.0, 651.0, 621.0, 620.0, 651.0, 620.0, 621.0, 610.0]
+[[measurements]]
+boundary = "minimal_likelihood"
+description = "unsupported without prior parameters"
+outcome = "joint"
+[[measurements]]
+boundary = "minimal_likelihood"
+description = "unsupported without prior parameters"
+outcome = "prior"
+[[measurements]]
+boundary = "minimal_likelihood"
+description = "summed likelihood from θ, observations, and scales only"
+outcome = "likelihood"
+
+    [measurements.manual_julia]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 70.0
+    times_ns = [70.0, 70.0, 70.0, 70.0, 90.0, 70.0, 70.0, 70.0, 60.0, 70.0]
+
+    [measurements.rk_native]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 60.0
+    times_ns = [60.0, 60.0, 60.0, 60.0, 60.0, 60.0, 60.0, 60.0, 60.0, 60.0]
+[[measurements]]
+boundary = "minimal_likelihood"
+description = "pointwise likelihoods from θ, observations, and scales only"
+outcome = "pointwise"
+
+    [measurements.manual_julia]
+    allocs = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    bytes = [128, 128, 128, 128, 128, 128, 128, 128, 128, 128]
+    median_allocs = 1
+    median_bytes = 128
+    median_ns = 80.0
+    times_ns = [80.0, 80.0, 80.0, 80.0, 80.0, 70.0, 80.0, 70.0, 80.0, 110.0]
+
+    [measurements.rk_native]
+    allocs = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    bytes = [128, 128, 128, 128, 128, 128, 128, 128, 128, 128]
+    median_allocs = 1
+    median_bytes = 128
+    median_ns = 80.0
+    times_ns = [80.0, 80.0, 80.0, 110.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0]
+
+[pins]
+benchmarktools_version = "1.6.3"
+distributions_version = "0.25.131"
+dynamicppl_version = "0.42.6"
+julia_version = "1.10.11"
+reactivekernels_dirty = false
+reactivekernels_sha = "adeed6513bf5062ae5802e9ea9430dd38675826a"
+reactivekernels_version = "0.1.0"
+reactivekernelsdistributionkernels_version = "0.1.0"
+reactivekernelspplexamples_version = "0.1.0"
+turing_version = "0.47.1"
+
+[protocol]
+estimator = "median of per-round BenchmarkTools minimum times"
+generated_predictions_included = false
+gradients_included = false
+input_boundaries = ["packed_unconstrained", "constrained_parameters", "minimal_likelihood"]
+model = "centered Eight Schools"
+outcomes = ["joint", "prior", "likelihood", "pointwise"]
+parity_atol = 1.0e-12
+parity_rtol = 1.0e-11
+preparation_in_timed_region = false
+rounds = 10
+samples_per_round = 200
+seconds_per_round = 0.2
+setup_in_timed_region = false
+turing_pointwise_api = "DynamicPPL.pointwise_loglikelihoods"
+turing_transform_strategy = "fixed transforms"
+unsupported_cells_omitted = true

@@ -981,7 +981,11 @@ end
 A transparent specialization produced by binding kernel-valued ports of a
 method-bearing `@kernel` object. Pure endpoint properties such as
 `normal.logpdf` are ordinary [`KernelSpec`](@ref) views; use [`extract`](@ref)
-to choose any other named HAVE/WANT cut.
+to choose any other named HAVE/WANT cut. Inside another `@kernel`, a constructed
+endpoint may bind owner graph ports by name, for example
+`normal(; location = μ, scale = σ, log_scale = log_σ).logpdf(x)`. Those names
+form an authoritative HAVE cut and the endpoint graph is spliced transparently.
+Literal or computed owner values are materialized as hygienic caller recipes.
 """
 struct KernelObjectSpec{S,B}
     skeleton::S

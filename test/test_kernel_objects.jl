@@ -46,11 +46,40 @@ end
 @kernel normal = location_scale(standard_normal)
 @kernel cauchy = location_scale(standard_cauchy)
 
+const normal_both_have = extract(normal;
+    have = (:x, :location, :scale, :log_scale), want = :logpdf)
+const normal_factor = prepare(normal_both_have)
+
 # Endpoint application spells only the method argument.  Residual owner ports
 # are matched by name and the distinguished endpoint return is spliced into the
 # enclosing graph.
 @kernel nested_normal_logpdf(x::Float64, location::Float64, scale::Float64) = begin
     logdensity::Float64 = normal.logpdf(x)
+    return logdensity
+end
+
+@kernel positional_constructed_logpdf(
+        x::Float64, location::Float64, scale::Float64) = begin
+    logdensity::Float64 = normal(location, scale).logpdf(x)
+    return logdensity
+end
+
+@kernel named_constructed_logpdf(
+        x::Float64, μ::Float64, σ::Float64, log_σ::Float64) = begin
+    logdensity::Float64 = normal(;
+        location = μ, scale = σ, log_scale = log_σ).logpdf(x)
+    return logdensity
+end
+
+@kernel computed_constructed_logpdf(
+        x::Float64, μ::Float64, log_σ::Float64) = begin
+    logdensity::Float64 = normal(μ + 0.25, exp(log_σ)).logpdf(x)
+    return logdensity
+end
+
+@kernel compatibility_factor_logpdf(
+        x::Float64, μ::Float64, σ::Float64, log_σ::Float64) = begin
+    logdensity::Float64 = normal_factor(x, μ, σ, log_σ)
     return logdensity
 end
 
@@ -141,6 +170,26 @@ end
         @test prepare(both_plan)(1.0, 0.0, 2.0, log(2.0)) ≈
               expected_normal(1.0, 0.0, 2.0)
 
+        positional = prepare(F.positional_constructed_logpdf)
+        named = prepare(F.named_constructed_logpdf)
+        compatibility = prepare(F.compatibility_factor_logpdf)
+        @test positional(1.0, 0.0, 2.0) ≈ expected_normal(1.0, 0.0, 2.0)
+        @test named(1.0, 0.0, 2.0, log(2.0)) ≈
+              expected_normal(1.0, 0.0, 2.0)
+        @test prepare(F.computed_constructed_logpdf)(
+                  1.0, 0.0, log(2.0)) ≈ expected_normal(1.0, 0.25, 2.0)
+        @test compatibility(1.0, 0.0, 2.0, log(2.0)) ≈
+              named(1.0, 0.0, 2.0, log(2.0))
+
+        named_outputs = outputs_of(plan(F.named_constructed_logpdf))
+        @test named_outputs ==
+              [:standardized, Symbol("standard.logpdf"), :logpdf]
+        @test length(plan(F.compatibility_factor_logpdf).recipes) == 1
+        @test only(plan(F.compatibility_factor_logpdf).recipes).op isa PreparedKernel
+        @test all(!(recipe.op isa PreparedKernel)
+                  for recipe in plan(F.named_constructed_logpdf).recipes)
+        @test !occursin("KernelObjectSpec", string(code_expr(named)))
+
         logscale_view = extract(F.normal;
             have = (:scale,), want = :log_scale)
         scale_view = extract(F.normal;
@@ -151,6 +200,34 @@ end
         @test prepare(scale_view)(log(2.0)) ≈ 2.0
         @test prepare(standard_view)(1.0, 0.0, 2.0) ≈
               -0.5 * log(2π) - 0.5 * 0.5^2
+    end
+
+    @testset "constructed endpoint diagnostics" begin
+        @test_throws ArgumentError @macroexpand @kernel unknown_object_binding(
+                x::Float64) = begin
+            y::Float64 = KernelObjectAuthoringFixture.normal(;
+                missing = x).logpdf(x)
+            return y
+        end
+        @test_throws ArgumentError @macroexpand @kernel duplicate_object_binding(
+                x::Float64, location::Float64) = begin
+            y::Float64 = KernelObjectAuthoringFixture.normal(;
+                location = location, location = x).logpdf(x)
+            return y
+        end
+        @test_throws ArgumentError @macroexpand @kernel mixed_object_binding(
+                x::Float64, location::Float64, scale::Float64) = begin
+            y::Float64 = KernelObjectAuthoringFixture.normal(
+                location; scale = scale).logpdf(x)
+            return y
+        end
+        literal_object_binding = @macroexpand @kernel literal_object_binding(
+                x::Float64, scale::Float64) = begin
+            y::Float64 = KernelObjectAuthoringFixture.normal(;
+                location = 0.0, scale = scale).logpdf(x)
+            return y
+        end
+        @test literal_object_binding isa Expr
     end
 
     @testset "shared endpoint provenance and explicit inverse" begin
@@ -247,5 +324,6 @@ end
     docs = read(joinpath(@__DIR__, "..", "docs", "src", "index.md"), String)
     @test occursin("@kernel normal = location_scale(standard_normal)", docs)
     @test occursin("logdensity::Float64 = normal.logpdf(x)", docs)
+    @test occursin("location = μ, scale = σ, log_scale = log_σ", docs)
     @test occursin("have = (:x, :location, :log_scale), want = :logpdf", docs)
 end

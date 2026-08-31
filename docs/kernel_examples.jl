@@ -205,11 +205,11 @@ function setup_eight_schools!(mod::Module)
     if !isdefined(mod, :EightSchoolsExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: EightSchoolsExample))
     end
-    # Bind the observations and the shared distribution KernelSpecs consumed by
-    # the displayed PPL assembly; no model-specific evaluator is injected.
+    # Bind only the observations. The displayed PPL assembly imports and uses
+    # the shared distribution objects directly; no helper evaluator, factor,
+    # or separately prepared plate is injected.
     Core.eval(mod, :(using .EightSchoolsExample:
-        EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA,
-        NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY))
+        EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA))
     nothing
 end
 
@@ -453,10 +453,12 @@ end
 # the stateless PreparedKernel path and the ReactiveProgram path emit through this;
 # there is no second renderer. `generated` is a display-only readable copy of the
 # compiled AST; `dag` is the exact `Plan` consumed by `visualize`.
-function _three_pane_blocks!(blocks, title, source, generated, dag::Plan)
+function _three_pane_blocks!(blocks, artifact_id, title, source, generated, dag::Plan)
+    stable_id = _html_escape("example:" * string(artifact_id))
     push!(blocks, RawHTML("""
 <h2>$(title)</h2>
-<div class="rk-example" data-rk-example>
+<div class="rk-example" data-rk-example data-rk-artifact-id="$stable_id"
+     data-rk-artifact-kind="example-panel">
 <div data-rk-pane="source">
 """))
     push!(blocks, Markdown.Code("julia", source))
@@ -506,7 +508,10 @@ function render_examples(artifacts)
         generated = _readable_generated_source(
             artifact.generated, artifact.kernel, artifact.name,
         )
-        _three_pane_blocks!(blocks, _example_title(artifact.name), source, generated, artifact.dag)
+        _three_pane_blocks!(
+            blocks, artifact.name, _example_title(artifact.name),
+            source, generated, artifact.dag,
+        )
     end
     Markdown.MD(blocks)
 end
@@ -784,7 +789,8 @@ function render_nuts_compiled_kernel_dag(mod::Module)
     )
     blocks = Any[]
     _three_pane_blocks!(
-        blocks, "Full compiled NUTS kernel — reactive group program",
+        blocks, "nuts-reactive-group-program",
+        "Full compiled NUTS kernel — reactive group program",
         source, generated, program.plan)
     Markdown.MD(blocks)
 end
@@ -910,6 +916,8 @@ function _render_source_locked_interaction(source::AbstractString, expected::Sym
     blocks = Any[
         RawHTML("""
 <article class="rk-source-interaction" data-rk-interaction="$(expected)"
+         data-rk-artifact-id="$(_html_escape("source-interaction:" * string(expected)))"
+         data-rk-artifact-kind="source-interaction"
          data-rk-interaction-kind="$(interaction.kind)">
 <h3>$(title)</h3>
 <p><strong>Accepted boundary:</strong> $(boundary)</p>
@@ -1091,6 +1099,8 @@ function _captured_source_block!(blocks, name::Symbol, title::AbstractString,
         "Fixture construction / MethodIR / independent-receipt inspection only"
     push!(blocks, RawHTML("""
 <article class="rk-source-example" data-rk-source-authority="$(name)"
+         data-rk-artifact-id="$(_html_escape("source-example:" * string(name)))"
+         data-rk-artifact-kind="source-example"
          data-rk-interaction="$(name)"
          data-rk-interaction-kind="$(interaction.kind)">
 <h3>$(title)</h3>

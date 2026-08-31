@@ -21,21 +21,39 @@ const _SCALAR_GALLERY_RECEIPT_PATH = joinpath(
 const _DISTRIBUTION_GRADIENT_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts", "distribution-gradient-v1.toml",
 )
+const _EIGHT_SCHOOLS_PRIMAL_RECEIPT_PATH = joinpath(
+    dirname(@__DIR__), "benchmark", "receipts", "eight-schools-primal-v1.toml",
+)
 const _NUTS_G7_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts", "nuts-g7-v1.toml",
 )
 const _NUTS_REACTANT_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts", "nuts-reactant-v1.toml",
 )
+const _EIGHT_SCHOOLS_REACTANT_RECEIPT_PATH = joinpath(
+    dirname(@__DIR__), "benchmark", "receipts", "eight-schools-reactant-v1.toml",
+)
 
 _node_html(node) = sprint(show, MIME"text/html"(), node; context = :limit => false)
 
-function _interactive_block(node; class = "rk-aov-panel")
+_html_attribute(value) = replace(
+    string(value), '&' => "&amp;", '"' => "&quot;", '<' => "&lt;", '>' => "&gt;",
+)
+
+function _interactive_block(node; class = "rk-aov-panel",
+                            artifact_id::AbstractString,
+                            artifact_kind::AbstractString = "aov-panel")
     payload = base64encode(_node_html(node))
+    stable_id = _html_attribute(artifact_id)
+    stable_kind = _html_attribute(artifact_kind)
+    stable_payload = _html_attribute(payload)
     RawHTML("""
-<ClientOnly>
-  <div class="$class" v-exec-scripts="'$payload'"></div>
-</ClientOnly>
+<div class="$class" data-rk-artifact-id="$stable_id"
+     data-rk-artifact-kind="$stable_kind" data-rk-exec-payload="$stable_payload">
+  <ClientOnly>
+    <div v-exec-scripts="'$payload'"></div>
+  </ClientOnly>
+</div>
 """)
 end
 
@@ -43,7 +61,10 @@ _static_block(node) = RawHTML(_node_html(node))
 
 """Install HTMXObjects' sorting runtime once on a page that renders result tables."""
 function render_result_assets()
-    Markdown.MD(Any[_interactive_block(sortable_table_js(); class = "rk-result-assets")])
+    Markdown.MD(Any[_interactive_block(
+        sortable_table_js(); class = "rk-result-assets",
+        artifact_id = "assets:result-assets", artifact_kind = "result-assets",
+    )])
 end
 
 _default_cell(value, _) = string(value)
@@ -69,7 +90,11 @@ function _result_table(rows, columns; id::AbstractString, title = "Exact values"
         [column.label for column in columns], body;
         id = String(id), download = false, class = "rk-result-table",
     )
-    _static_block(h.section(; class = "rk-result-table-section")(
+    _static_block(h.section(;
+        class = "rk-result-table-section",
+        data_rk_artifact_id = "table:" * String(id),
+        data_rk_artifact_kind = "sortable-table",
+    )(
         h.h3(title),
         h.p(note; class = "rk-result-table-note"),
         h.div(table; class = "rk-sortable-table-wrap"),
@@ -84,7 +109,7 @@ function _plot_block(spec; id::AbstractString, title::AbstractString,
         h.figcaption(caption),
         vdraw(spec; id = String(id)),
     )
-    _interactive_block(node)
+    _interactive_block(node; artifact_id = "plot:" * String(id))
 end
 
 const _TIMING_BACKENDS = (
@@ -855,6 +880,151 @@ function render_batched_benchmarks()
     ])
 end
 
+const _EIGHT_SCHOOLS_BOUNDARIES = (
+    "packed_unconstrained", "constrained_parameters", "minimal_likelihood",
+)
+const _EIGHT_SCHOOLS_OUTCOMES = ("joint", "prior", "likelihood", "pointwise")
+const _EIGHT_SCHOOLS_BACKENDS = ("rk_native", "manual_julia", "turing_native")
+
+function _eight_schools_supported(boundary, outcome, backend)
+    boundary != "minimal_likelihood" && return true
+    outcome in ("likelihood", "pointwise") && backend in ("rk_native", "manual_julia")
+end
+
+function _eight_schools_measurement(row, backend)
+    haskey(row, backend) || return missing
+    result = row[backend]
+    (;
+        median_ns = Float64(result["median_ns"]),
+        median_bytes = Int(result["median_bytes"]),
+        median_allocs = Int(result["median_allocs"]),
+    )
+end
+
+function _eight_schools_cell(value, _)
+    value === missing && return ""
+    "$(_fmt_ns(value.median_ns)); $(value.median_bytes) B; " *
+    "$(value.median_allocs) alloc"
+end
+
+_eight_schools_sort(value, _) = value === missing ? nothing : value.median_ns
+
+"""Render the checked-in primal Eight Schools boundary/outcome matrix."""
+function render_eight_schools_primal_benchmarks()
+    receipt = TOML.parsefile(_EIGHT_SCHOOLS_PRIMAL_RECEIPT_PATH)
+    get(receipt, "schema", "") == "eight-schools-primal-v1" ||
+        error("unexpected Eight Schools primal benchmark receipt schema")
+    pins = receipt["pins"]
+    get(pins, "reactivekernels_dirty", true) == false ||
+        error("Eight Schools receipt was produced from a dirty RK tree")
+    occursin(r"^[0-9a-f]{40}$", get(pins, "reactivekernels_sha", "")) ||
+        error("Eight Schools receipt lacks an exact ReactiveKernels SHA")
+
+    protocol = receipt["protocol"]
+    Tuple(String.(protocol["input_boundaries"])) == _EIGHT_SCHOOLS_BOUNDARIES ||
+        error("Eight Schools input-boundary inventory changed")
+    Tuple(String.(protocol["outcomes"])) == _EIGHT_SCHOOLS_OUTCOMES ||
+        error("Eight Schools outcome inventory changed")
+    Int(get(protocol, "rounds", 0)) >= 10 ||
+        error("Eight Schools receipt has fewer than ten timing rounds")
+    get(protocol, "setup_in_timed_region", true) == false ||
+        error("Eight Schools setup entered the timed region")
+    get(protocol, "preparation_in_timed_region", true) == false ||
+        error("Eight Schools preparation entered the timed region")
+    get(protocol, "gradients_included", true) == false ||
+        error("gradient measurements do not belong in the primal receipt")
+    get(protocol, "generated_predictions_included", true) == false ||
+        error("generated predictions do not belong in the primal receipt")
+    get(protocol, "unsupported_cells_omitted", false) == true ||
+        error("unsupported Eight Schools cells must remain omitted")
+
+    measurements = receipt["measurements"]
+    length(measurements) ==
+        length(_EIGHT_SCHOOLS_BOUNDARIES) * length(_EIGHT_SCHOOLS_OUTCOMES) ||
+        error("Eight Schools receipt is not a complete 3×4 matrix")
+    indexed = Dict((String(row["boundary"]), String(row["outcome"])) => row
+                   for row in measurements)
+    length(indexed) == length(measurements) ||
+        error("Eight Schools receipt contains duplicate matrix rows")
+
+    boundary_labels = Dict(
+        "packed_unconstrained" => "Packed unconstrained",
+        "constrained_parameters" => "Constrained parameters",
+        "minimal_likelihood" => "Likelihood inputs only",
+    )
+    outcome_labels = Dict(
+        "joint" => "Joint",
+        "prior" => "Prior",
+        "likelihood" => "Likelihood",
+        "pointwise" => "Pointwise likelihood",
+    )
+    rows = NamedTuple[]
+    for boundary in _EIGHT_SCHOOLS_BOUNDARIES, outcome in _EIGHT_SCHOOLS_OUTCOMES
+        row = get(indexed, (boundary, outcome), nothing)
+        isnothing(row) && error("missing Eight Schools row: $boundary / $outcome")
+        for backend in _EIGHT_SCHOOLS_BACKENDS
+            haskey(row, backend) == _eight_schools_supported(boundary, outcome, backend) ||
+                error("unexpected support for $boundary / $outcome / $backend")
+            haskey(row, backend) || continue
+            result = row[backend]
+            length(result["times_ns"]) >= 10 ||
+                error("insufficient timing rounds for $boundary / $outcome / $backend")
+        end
+        push!(rows, (;
+            boundary = boundary_labels[boundary],
+            outcome = outcome_labels[outcome],
+            rk_native = _eight_schools_measurement(row, "rk_native"),
+            manual_julia = _eight_schools_measurement(row, "manual_julia"),
+            turing_native = _eight_schools_measurement(row, "turing_native"),
+        ))
+    end
+
+    turing_rows = filter(row -> row.turing_native !== missing, rows)
+    rk_faster_than_turing = count(
+        row -> row.rk_native.median_ns < row.turing_native.median_ns,
+        turing_rows,
+    )
+    turing_ratios = [
+        row.turing_native.median_ns / row.rk_native.median_ns for row in turing_rows
+    ]
+    manual_rows = filter(row -> row.manual_julia !== missing, rows)
+    manual_ratios = [
+        row.manual_julia.median_ns / row.rk_native.median_ns for row in manual_rows
+    ]
+    summary = "RK is faster than Turing in $rk_faster_than_turing/" *
+        "$(length(turing_rows)) matched native cells; Turing/RK runtime ranges from " *
+        "$(round(minimum(turing_ratios); digits = 2))× to " *
+        "$(round(maximum(turing_ratios); digits = 2))×. Against the handwritten " *
+        "Julia control, manual/RK ranges from " *
+        "$(round(minimum(manual_ratios); digits = 2))× to " *
+        "$(round(maximum(manual_ratios); digits = 2))× (1× is parity)."
+    columns = (
+        _column(:boundary, "Starting boundary"),
+        _column(:outcome, "Requested outcome"),
+        _column(:rk_native, "RK native";
+            format = _eight_schools_cell, sort = _eight_schools_sort),
+        _column(:manual_julia, "Manual Julia";
+            format = _eight_schools_cell, sort = _eight_schools_sort),
+        _column(:turing_native, "Turing native";
+            format = _eight_schools_cell, sort = _eight_schools_sort),
+    )
+    provenance = "Receipt pin: ReactiveKernels `$(pins["reactivekernels_sha"])`; " *
+        "Julia $(pins["julia_version"]); Turing $(pins["turing_version"]); " *
+        "DynamicPPL $(pins["dynamicppl_version"]); " *
+        "$(receipt["environment"]["cpu"]). Raw rounds are retained in " *
+        "benchmark/receipts/eight-schools-primal-v1.toml."
+
+    Markdown.MD(Any[
+        Markdown.Paragraph(Any[summary]),
+        _result_table(rows, columns;
+            id = "eight-schools-primal-matrix",
+            title = "Primal boundary × outcome matrix",
+            note = "Each measured cell is median runtime; bytes; allocations. " *
+                   "A blank cell means that backend has no matching public boundary."),
+        Markdown.Paragraph(Any[Markdown.Italic(Any[provenance])]),
+    ])
+end
+
 function _definition_grid(rows; class = "rk-definition-grid")
     children = Any[]
     for row in rows
@@ -1152,6 +1322,142 @@ function render_nuts_reactant_benchmark()
         _result_table(compile_rows, compile_columns; id = "nuts-reactant-compile-table",
             title = "Compilation and first-call costs",
             note = "Compile order is native source compiler, Reactant lowering, then Reactant XLA. These values are reported separately and are not in steady-state timing."),
+        _static_block(provenance),
+    ])
+end
+
+"""Render the exact Eight Schools native-RK/Reactant primal matrix."""
+function render_eight_schools_reactant_benchmark()
+    receipt = TOML.parsefile(_EIGHT_SCHOOLS_REACTANT_RECEIPT_PATH)
+    get(receipt, "schema", "") == "eight-schools-reactant-v1" ||
+        error("unexpected Eight Schools Reactant benchmark receipt schema")
+    pins = receipt["pins"]
+    get(pins, "reactivekernels_dirty", true) == false ||
+        error("Eight Schools Reactant receipt was produced from a dirty checkout")
+    protocol = receipt["protocol"]
+    get(protocol, "source_reused", false) ||
+        error("Eight Schools Reactant receipt does not reuse the authored source")
+    get(protocol, "reactant_sync", false) ||
+        error("Eight Schools Reactant receipt is not synchronous")
+    get(protocol, "gradients_included", true) &&
+        error("Eight Schools Reactant receipt unexpectedly contains gradients")
+    Tuple(String.(protocol["input_boundaries"])) == _EIGHT_SCHOOLS_BOUNDARIES ||
+        error("unexpected Eight Schools input-boundary matrix")
+    Tuple(String.(protocol["outcomes"])) == _EIGHT_SCHOOLS_OUTCOMES ||
+        error("unexpected Eight Schools output matrix")
+
+    boundary_labels = Dict(
+        "packed_unconstrained" => "Packed unconstrained",
+        "constrained_parameters" => "Constrained parameters",
+        "minimal_likelihood" => "Likelihood inputs only",
+    )
+    rows = map(receipt["measurements"]) do measurement
+        native_supported = get(measurement, "rk_native_supported", false)
+        reactant_supported = get(measurement, "rk_reactant_supported", false)
+        native_ns = native_supported ?
+            Float64(measurement["rk_native"]["median_ns"]) : missing
+        reactant_ns = reactant_supported ?
+            Float64(measurement["rk_reactant"]["median_ns"]) : missing
+        diagnostic = reactant_supported ? "measured" :
+            get(measurement, "rk_reactant_error", "unsupported")
+        (;
+            boundary = boundary_labels[measurement["boundary"]],
+            outcome = measurement["outcome"],
+            native_ns,
+            reactant_ns,
+            relative_time = reactant_supported ? reactant_ns / native_ns : missing,
+            compiler_result = diagnostic,
+        )
+    end
+    measured = filter(row -> row.reactant_ns !== missing, rows)
+    ratios = Float64[row.relative_time for row in measured]
+    unsupported = count(row -> row.native_ns !== missing && row.reactant_ns === missing, rows)
+    summary = isempty(ratios) ?
+        "No Reactant matrix cell compiled in this receipt." :
+        "Reactant compiled $(length(measured)) of the 10 model-defined primal cells; " *
+        "$unsupported retain their compiler diagnostics. Across compiled cells, " *
+        "steady-state Reactant/native time ranges from " *
+        "$(round(minimum(ratios); digits = 2))× to " *
+        "$(round(maximum(ratios); digits = 2))× on this CPU receipt."
+    timing_columns = (
+        _column(:boundary, "Input boundary"),
+        _column(:outcome, "Requested output"),
+        _column(:native_ns, "Native RK";
+            format = (value, _) -> _unsupported(value, _fmt_ns)),
+        _column(:reactant_ns, "Reactant";
+            format = (value, _) -> _unsupported(value, _fmt_ns)),
+        _column(:relative_time, "Reactant ÷ native";
+            format = (value, _) -> _unsupported(
+                value, ratio -> string(round(ratio; digits = 2), "×"))),
+        _column(:compiler_result, "Compiler result";
+            format = (value, _) -> value == "measured" ? value :
+                h.span(value; class = "rk-result-unsupported")),
+    )
+
+    setup_rows = map(filter(
+        measurement -> get(measurement, "rk_native_supported", false),
+        receipt["measurements"],
+    )) do measurement
+        supported = get(measurement, "rk_reactant_supported", false)
+        (;
+            boundary = boundary_labels[measurement["boundary"]],
+            outcome = measurement["outcome"],
+            transfer_seconds = Float64(measurement["reactant_transfer_seconds"]),
+            compile_seconds = Float64(measurement["reactant_compile_seconds"]),
+            first_seconds = supported ?
+                Float64(measurement["reactant_first_execution_seconds"]) : missing,
+            result = supported ? "compiled" : "unsupported",
+        )
+    end
+    seconds(value) = string(round(value; sigdigits = 4), " s")
+    setup_columns = (
+        _column(:boundary, "Input boundary"),
+        _column(:outcome, "Requested output"),
+        _column(:transfer_seconds, "Input transfer";
+            format = (value, _) -> seconds(value)),
+        _column(:compile_seconds, "Compile attempt";
+            format = (value, _) -> seconds(value)),
+        _column(:first_seconds, "First synchronous call";
+            format = (value, _) -> _unsupported(value, seconds)),
+        _column(:result, "Result";
+            format = (value, _) -> value == "compiled" ? value :
+                h.span(value; class = "rk-result-unsupported")),
+    )
+
+    setup = receipt["setup"]
+    setup_summary = "The fresh environment took " *
+        "$(seconds(Float64(setup["environment_seconds"]))) to resolve/install, " *
+        "package precompilation took " *
+        "$(seconds(Float64(setup["package_precompile_seconds"]))), and preparing " *
+        "all native HAVE/WANT kernels took " *
+        "$(seconds(Float64(setup["kernel_preparation_seconds"]))). None of these, " *
+        "the per-cell transfers, compilation, first calls, or result readback is " *
+        "inside the steady-state timings."
+    provenance = h.p(; class = "rk-result-provenance")(
+        "Sources: ",
+        h.a(h.code("benchmark/receipts/eight-schools-reactant-v1.toml");
+            href = "https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/eight-schools-reactant-v1.toml"),
+        " generated by ",
+        h.a(h.code("benchmark/eight_schools_reactant_comparison.jl");
+            href = "https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/eight_schools_reactant_comparison.jl"),
+        ". Exact model authority: ",
+        h.a(h.code(String(pins["source_authority_path"]));
+            href = "https://github.com/nsiccha/ReactiveKernels.jl/blob/main/$(pins["source_authority_path"])"),
+        ". Pins: source blob $(first(String(pins["source_authority_blob"]), 10)), " *
+        "Reactant $(pins["reactant_version"]), Julia $(pins["julia_version"]), " *
+        "RK $(first(String(pins["reactivekernels_sha"]), 10)).",
+    )
+
+    Markdown.MD(Any[
+        Markdown.Paragraph(Any[summary]),
+        _result_table(rows, timing_columns; id = "eight-schools-reactant-matrix",
+            title = "Native RK / Reactant steady-state matrix",
+            note = "Every row is one cell of the matched 3×4 primal matrix. Unsupported cells remain visible with their recorded diagnostic."),
+        Markdown.Paragraph(Any[setup_summary]),
+        _result_table(setup_rows, setup_columns;
+            id = "eight-schools-reactant-setup",
+            title = "Setup, compilation, and first-call costs",
+            note = "These costs are reported separately and excluded from steady-state timing."),
         _static_block(provenance),
     ])
 end

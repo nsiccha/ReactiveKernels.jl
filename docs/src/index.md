@@ -201,6 +201,27 @@ The bound child's endpoint remains visible as the scoped port
 `normal[Symbol("standard.logpdf")]`, distinct from the enclosing public
 `normal.logpdf`; plans and DAGs use those same unambiguous names.
 
+When the caller already has an alternate or broader owner boundary, bind those
+graph ports by name on the constructed object:
+
+```julia
+@kernel model_from_both(
+        x::Float64, μ::Float64, σ::Float64, log_σ::Float64) = begin
+    logdensity::Float64 = normal(;
+        location = μ, scale = σ, log_scale = log_σ).logpdf(x)
+end
+```
+
+The keyword names are ports of the object graph and the values are named ports
+of the caller graph. They select the same explicit HAVE cut as `extract`, while
+the method argument `x` remains the endpoint's explicit argument. Here both
+`scale` and `log_scale` are authoritative, so neither conversion recipe runs.
+Unknown or duplicate binding names are rejected while the outer graph is
+constructed, and the endpoint is still transparently spliced with no runtime
+`KernelObjectSpec` call. Literal or computed owner values are introduced as
+hygienic internal recipes, so natural calls such as
+`normal(0.0, 5.0).logpdf(x)` remain transparent too.
+
 Named relations stay available as alternate cuts. Here `scale = exp(log_scale)`
 and `log_scale = log(scale)` are ordinary bidirectional recipes: the natural
 constructor has `scale`, while this view starts from `log_scale` instead:
