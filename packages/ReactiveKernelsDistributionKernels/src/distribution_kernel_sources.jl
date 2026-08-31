@@ -2,36 +2,64 @@ module DistributionKernelSources
 
 using ReactiveKernels
 
+export LOCATION_SCALE_SOURCE
+export standard_normal, standard_cauchy, standard_laplace, location_scale
+export normal, cauchy, laplace
 export NORMAL_LOGDENSITY_SOURCE, CAUCHY_LOGDENSITY_SOURCE
-export NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY
+export NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY
 export EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE
 export MVNORMAL_SOURCE, AR1_SOURCE
 
-const NORMAL_LOGDENSITY_SOURCE = raw"""
-@kernel normal_logdensity(
-        x::Float64, location::Float64,
-        scale::Float64, log_scale::Float64) = begin
-    scale::Float64 = exp(log_scale)
-    log_scale::Float64 = log(scale)
-    standardized::Float64 = (x - location) / scale
-    logdensity::Float64 =
-        -0.5 * log(2π) - log_scale - 0.5 * standardized^2
+const LOCATION_SCALE_SOURCE = raw"""
+using SpecialFunctions: erfc, erfcinv
+
+@kernel standard_normal() = begin
+    logpdf(z::Float64)::Float64 = -0.5 * log(2π) - 0.5 * z^2
+    cdf(z::Float64)::Float64 = 0.5 * erfc(-z / sqrt(2))
+    quantile(p::Float64)::Float64 = -sqrt(2) * erfcinv(2p)
 end
+
+@kernel standard_cauchy() = begin
+    logpdf(z::Float64)::Float64 = -log(π) - log1p(z^2)
+    cdf(z::Float64)::Float64 = 0.5 + atan(z) / π
+    quantile(p::Float64)::Float64 = tanpi(p - 0.5)
+end
+
+@kernel standard_laplace() = begin
+    logpdf(z::Float64)::Float64 = -log(2) - abs(z)
+    cdf(z::Float64)::Float64 =
+        ifelse(z < 0, 0.5 * exp(z), 1 - 0.5 * exp(-z))
+    quantile(p::Float64)::Float64 =
+        ifelse(p < 0.5, log(2p), -log(2 - 2p))
+end
+
+@kernel location_scale(standard, location::Float64, scale::Float64) = begin
+    log_scale::Float64 = log(scale)
+    scale::Float64 = exp(log_scale)
+
+    standardized(x::Float64)::Float64 = (x - location) / scale
+    inv(standardized, z::Float64)::Float64 = location + scale * z
+
+    logpdf(x::Float64)::Float64 = begin
+        z::Float64 = standardized(x)
+        standard.logpdf(z) - log_scale
+    end
+    cdf(x::Float64)::Float64 = begin
+        z::Float64 = standardized(x)
+        standard.cdf(z)
+    end
+    quantile(p::Float64)::Float64 = begin
+        z::Float64 = standard.quantile(p)
+        inv(standardized, z)
+    end
+end
+
+@kernel normal = location_scale(standard_normal)
+@kernel cauchy = location_scale(standard_cauchy)
+@kernel laplace = location_scale(standard_laplace)
 """
 
-const CAUCHY_LOGDENSITY_SOURCE = raw"""
-@kernel cauchy_logdensity(
-        x::Float64, location::Float64,
-        scale::Float64, log_scale::Float64) = begin
-    scale::Float64 = exp(log_scale)
-    log_scale::Float64 = log(scale)
-    standardized::Float64 = (x - location) / scale
-    logdensity::Float64 =
-        -log(π) - log_scale - log1p(standardized^2)
-end
-"""
-
-function _evaluate_spec_source(source::AbstractString, name::Symbol)
+function _evaluate_source_bindings(source::AbstractString, names::Tuple)
     parsed = Meta.parseall(source; filename = "distribution-kernel-source.jl")
     expressions = parsed.head === :toplevel ? parsed.args : Any[parsed]
     for expression in expressions
@@ -41,13 +69,32 @@ function _evaluate_spec_source(source::AbstractString, name::Symbol)
     # Julia 1.13 enforces the world age of bindings created by `Core.eval`.
     # Read the freshly authored KernelSpec in the latest world; the returned
     # immutable spec remains ordinary data for every subsequent caller.
-    Base.invokelatest(getfield, @__MODULE__, name)
+    map(name -> Base.invokelatest(getfield, @__MODULE__, name), names)
 end
 
-const NORMAL_LOGDENSITY =
-    _evaluate_spec_source(NORMAL_LOGDENSITY_SOURCE, :normal_logdensity)
-const CAUCHY_LOGDENSITY =
-    _evaluate_spec_source(CAUCHY_LOGDENSITY_SOURCE, :cauchy_logdensity)
+const _LOCATION_SCALE_BINDINGS = _evaluate_source_bindings(
+    LOCATION_SCALE_SOURCE,
+    (:standard_normal, :standard_cauchy, :standard_laplace,
+     :location_scale, :normal, :cauchy, :laplace),
+)
+const standard_normal = _LOCATION_SCALE_BINDINGS[1]
+const standard_cauchy = _LOCATION_SCALE_BINDINGS[2]
+const standard_laplace = _LOCATION_SCALE_BINDINGS[3]
+const location_scale = _LOCATION_SCALE_BINDINGS[4]
+const normal = _LOCATION_SCALE_BINDINGS[5]
+const cauchy = _LOCATION_SCALE_BINDINGS[6]
+const laplace = _LOCATION_SCALE_BINDINGS[7]
+
+# Compatibility names for existing consumers.  These are views of the shared
+# object graphs, not separately authored formulas.
+const NORMAL_LOGDENSITY_SOURCE = LOCATION_SCALE_SOURCE
+const CAUCHY_LOGDENSITY_SOURCE = LOCATION_SCALE_SOURCE
+const NORMAL_LOGDENSITY = extract(normal;
+    have = (:x, :location, :scale), want = :logpdf)
+const CAUCHY_LOGDENSITY = extract(cauchy;
+    have = (:x, :location, :scale), want = :logpdf)
+const LAPLACE_LOGDENSITY = extract(laplace;
+    have = (:x, :location, :scale), want = :logpdf)
 
 const EXPONENTIAL_SOURCE = raw"""
 @kernel exponential_logpdf(x::Float64, logθ::Float64) = begin

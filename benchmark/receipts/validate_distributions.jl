@@ -67,7 +67,8 @@ function validate_distribution_receipt(path::AbstractString)
     end
 
     required_measurements = (
-        "rk_native", "distributions_native", "probability_measures_native",
+        "rk_native", "rk_direct_native",
+        "distributions_native", "probability_measures_native",
         "distributions_loop", "probability_measures_loop", "hand_hoisted",
         "rk_reactant", "probability_measures_reactant",
     )
@@ -111,11 +112,11 @@ function validate_distribution_receipt(path::AbstractString)
             require(Int(measurement["median_allocs"]) ==
                     round(Int, _median(measurement["allocs"])),
                     "N=$n $name median_allocs mismatch")
-            if name == "rk_native"
+            if name in ("rk_native", "rk_direct_native")
                 require(measurement["median_bytes"] == 0,
-                        "N=$n RK native reduction must remain zero-allocation")
+                        "N=$n $name reduction must remain zero-allocation")
                 require(measurement["median_allocs"] == 0,
-                        "N=$n RK native reduction must remain zero-allocation")
+                        "N=$n $name reduction must remain zero-allocation")
             end
         end
     end

@@ -5,30 +5,31 @@ using Distributions
 
 using ReactiveKernelsDistributionKernels: DistributionKernelSources
 using ReactiveKernelsKernelExamples.DistributionExamples
-using ReactiveKernels: KernelSpec, @kernel, code_expr, plan, plate, prepare
+using ReactiveKernels: KernelObjectSpec, KernelSpec, @kernel, code_expr,
+    extract, plan, plate, prepare
 
 const NORMAL_LOGSCALE_KERNEL = prepare(NORMAL_LOGDENSITY;
-    have = (:x, :location, :log_scale), want = :logdensity)
+    have = (:x, :location, :log_scale), want = :logpdf)
 const CAUCHY_SCALE_KERNEL = prepare(CAUCHY_LOGDENSITY;
-    have = (:x, :location, :scale), want = :logdensity)
+    have = (:x, :location, :scale), want = :logpdf)
 
 @kernel embedded_distribution_logdensity(
-        x::Float64, location::Float64,
-        scale::Float64, log_scale::Float64) = begin
-    normal_term::Float64 = NORMAL_LOGSCALE_KERNEL(x, location, log_scale)
-    cauchy_term::Float64 = CAUCHY_SCALE_KERNEL(x, location, scale)
-    logdensity::Float64 = normal_term + cauchy_term
+        x::Float64, location::Float64, scale::Float64) = begin
+    normal_term::Float64 = normal.logpdf(x)
+    cauchy_term::Float64 = cauchy.logpdf(x)
+    return normal_term + cauchy_term
 end
 
 const EMBEDDED_DISTRIBUTION_KERNEL = prepare(embedded_distribution_logdensity;
-    have = (:x, :location, :scale, :log_scale), want = :logdensity)
+    have = (:x, :location, :scale))
 
 const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 
 @testset "Native log-density examples" begin
     artifacts = map(evaluate_source, all_sources())
 
-    @testset "reusable distribution KernelSpecs compose without Distributions" begin
+    @testset "reusable distribution objects compose without Distributions" begin
+        @test all(object -> object isa KernelObjectSpec, (normal, cauchy, laplace))
         @test NORMAL_LOGDENSITY isa KernelSpec
         @test CAUCHY_LOGDENSITY isa KernelSpec
         @test !isdefined(DistributionKernelSources, :Distributions)
@@ -41,12 +42,12 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
                 (NORMAL_LOGDENSITY, logpdf(Normal(location, scale), x)),
                 (CAUCHY_LOGDENSITY, logpdf(Cauchy(location, scale), x)))
             scale_kernel = prepare(spec;
-                have = (:x, :location, :scale), want = :logdensity)
+                have = (:x, :location, :scale), want = :logpdf)
             logscale_kernel = prepare(spec;
-                have = (:x, :location, :log_scale), want = :logdensity)
+                have = (:x, :location, :log_scale), want = :logpdf)
             both_kernel = prepare(spec;
                 have = (:x, :location, :scale, :log_scale),
-                want = :logdensity)
+                want = :logpdf)
             @test scale_kernel(x, location, scale) ≈ reference
             @test logscale_kernel(x, location, log_scale) ≈ reference
             @test both_kernel(x, location, scale, log_scale) ≈ reference
@@ -62,27 +63,38 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
             @test !occursin("Distributions", string(code_expr(logscale_kernel)))
 
             scale_plan = plan(spec;
-                have = (:x, :location, :scale), want = :logdensity)
+                have = (:x, :location, :scale), want = :logpdf)
             logscale_plan = plan(spec;
-                have = (:x, :location, :log_scale), want = :logdensity)
+                have = (:x, :location, :log_scale), want = :logpdf)
             both_plan = plan(spec;
                 have = (:x, :location, :scale, :log_scale),
-                want = :logdensity)
+                want = :logpdf)
             recipe_outputs(selected_plan) =
                 [only(recipe.outputs).name for recipe in selected_plan.recipes]
             @test recipe_outputs(scale_plan) ==
-                  [:log_scale, :standardized, :logdensity]
+                  [:log_scale, :standardized, :logpdf]
             @test recipe_outputs(logscale_plan) ==
-                  [:scale, :standardized, :logdensity]
-            @test recipe_outputs(both_plan) == [:standardized, :logdensity]
+                  [:scale, :standardized, :logpdf]
+            @test recipe_outputs(both_plan) == [:standardized, :logpdf]
         end
+
+        joint = extract(normal;
+            have = (:x, :location, :scale), want = (:logpdf, :cdf))
+        joint_plan = plan(joint)
+        @test count(recipe -> only(recipe.outputs).name === :standardized,
+                    joint_plan.recipes) == 1
+        @test all(isapprox.(prepare(joint)(x, location, scale),
+            (logpdf(Normal(location, scale), x),
+             cdf(Normal(location, scale), x))))
+        @test prepare(normal.quantile)(location, scale, 0.73) ≈
+              quantile(Normal(location, scale), 0.73)
 
         observations = [28.0, 8.0, -3.0, 7.0]
         effects = [1.0, 1.5, -0.5, 0.25]
         scales = [15.0, 10.0, 16.0, 11.0]
         likelihood = plate(NORMAL_LOGDENSITY;
             have = (:x, :location, :scale),
-            want = :logdensity, batched = (:x, :location, :scale))
+            want = :logpdf, batched = (:x, :location, :scale))
         @test likelihood(observations, effects, scales) ≈ sum(
             logpdf(Normal(effect, observation_scale), observation)
             for (observation, effect, observation_scale) in
@@ -90,7 +102,7 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 
         effects_prior = plate(NORMAL_LOGDENSITY;
             have = (:x, :location, :log_scale),
-            want = :logdensity, batched = :x)
+            want = :logpdf, batched = :x)
         @test effects_prior(effects, location, log_scale) ≈ sum(
             logpdf(Normal(location, scale), effect) for effect in effects)
 
@@ -99,8 +111,8 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
               logpdf(truncated(Cauchy(0.0, 5.0), 0.0, Inf), scale)
 
         @test EMBEDDED_DISTRIBUTION_KERNEL(
-            x, location, scale, log_scale) ≈
-            NORMAL_LOGSCALE_KERNEL(x, location, log_scale) +
+            x, location, scale) ≈
+            prepare(normal.logpdf)(location, scale, x) +
             CAUCHY_SCALE_KERNEL(x, location, scale)
         @test !occursin("Distributions",
                        string(code_expr(EMBEDDED_DISTRIBUTION_KERNEL)))
@@ -108,30 +120,23 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 
     @testset "sources build native recipes checked against a Distributions oracle" begin
         @test length(artifacts) == 11
-        # Every source declares @kernel recipes.
-        @test all(source -> occursin(r"@kernel \w+\(", source), all_sources())
         continuous, discrete, vectorized = all_sources()
         # No forced API demonstrations: these are plain native densities. Nothing
         # shoehorns a `compose` call; the vectorized source generates its batched
         # kernel with `plate`.
         @test all(source -> !occursin("compose(", source), all_sources())
         @test occursin("plate(", vectorized)
-        # The first example is one direct log-scale kernel, not an artificial
-        # demonstration of alternative planner recipes.
+        # The first example defines the shared family objects once and then
+        # prepares the natural Normal logpdf endpoint.
         @test !occursin("@recipe", continuous)
         @test !occursin("cost =", continuous)
         @test !occursin("negative_log_scale", continuous)
-        # Regression guard against the exp-then-log round trip: with log_scale
-        # in HAVE the density uses it directly in the normalizer. Scan code
-        # only — drop `#` comments so prose mentioning the anti-pattern does not
-        # trip the guard.
-        code_only(src) = join(
-            (first(split(line, "#")) for line in eachsplit(src, "\n")), "\n",
-        )
-        continuous_code = code_only(continuous)
-        @test occursin(r"-\s*log_scale", continuous_code)
-        @test occursin("scale::Float64 = exp(log_scale)", continuous_code)
-        @test !occursin("log(exp", continuous_code)
+        @test occursin("@kernel standard_normal()", continuous)
+        @test occursin("@kernel location_scale(standard", continuous)
+        @test occursin("@kernel normal = location_scale(standard_normal)", continuous)
+        @test occursin("prepare(normal.logpdf)", continuous)
+        @test occursin("plate(normal.logpdf", vectorized)
+        @test !occursin("@kernel normal_logdensity", vectorized)
         # The compute path is Distributions.jl-free.
         @test all(artifacts) do artifact
             !occursin("Distributions", string(code_expr(artifact.kernel)))
@@ -275,7 +280,7 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
             values = Tuple(artifact.inputs)
             active_index = artifact.name in (
                 :discrete_bernoulli_logit, :geometric_logit,
-            ) ? 2 : 1
+            ) ? 2 : findfirst(==(:x), propertynames(artifact.inputs))
             active_name = inputs(artifact.kernel)[active_index].name
             prepared = prepare_ad(
                 artifact.kernel, DISTRIBUTION_ENZYME_BACKEND, values...;
@@ -288,8 +293,8 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
         end
 
         normal = artifacts[1]
-        x, μ, logσ = Tuple(normal.inputs)
-        @test gradients[:continuous_normal] ≈ -(x - μ) / exp(2logσ)
+        μ, σ, x = Tuple(normal.inputs)
+        @test gradients[:continuous_normal] ≈ -(x - μ) / σ^2
 
         bernoulli = artifacts[2]
         observed, logit = Tuple(bernoulli.inputs)
@@ -297,8 +302,8 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
               Int(observed) - 1 / (1 + exp(-logit))
 
         vectorized = artifacts[3]
-        xbatch, μbatch, logσbatch = Tuple(vectorized.inputs)
+        xbatch, μbatch, σbatch = Tuple(vectorized.inputs)
         @test gradients[:vectorized_normal] ≈
-              @. -(xbatch - μbatch) / exp(2logσbatch)
+              @. -(xbatch - μbatch) / σbatch^2
     end
 end

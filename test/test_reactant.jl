@@ -129,7 +129,7 @@ function _normal_reference(x, μ, logσ)
 end
 
 const REACTANT_SOURCE_NORMAL_LOGSCALE = prepare(NORMAL_LOGDENSITY;
-    have = (:x, :location, :log_scale), want = :logdensity)
+    have = (:x, :location, :log_scale), want = :logpdf)
 
 @kernel reactant_embedded_source_normal(
         x::Float64, location::Float64, log_scale::Float64) = begin
@@ -305,12 +305,12 @@ end
 
         for spec in (NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY)
             scale_kernel = prepare(spec;
-                have = (:x, :location, :scale), want = :logdensity)
+                have = (:x, :location, :scale), want = :logpdf)
             logscale_kernel = prepare(spec;
-                have = (:x, :location, :log_scale), want = :logdensity)
+                have = (:x, :location, :log_scale), want = :logpdf)
             both_kernel = prepare(spec;
                 have = (:x, :location, :scale, :log_scale),
-                want = :logdensity)
+                want = :logpdf)
             scale_compiled = @compile scale_kernel(x, location, scale)
             logscale_compiled = @compile logscale_kernel(x, location, log_scale)
             both_compiled = @compile both_kernel(
@@ -326,7 +326,7 @@ end
         scales_host = [15.0, 10.0, 16.0, 11.0]
         likelihood = plate(NORMAL_LOGDENSITY;
             have = (:x, :location, :scale),
-            want = :logdensity, batched = (:x, :location, :scale))
+            want = :logpdf, batched = (:x, :location, :scale))
         observations = Reactant.to_rarray(observations_host)
         effects = Reactant.to_rarray(effects_host)
         scales = Reactant.to_rarray(scales_host)

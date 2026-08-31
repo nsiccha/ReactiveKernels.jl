@@ -11,6 +11,7 @@ using ProbabilityMeasures
 using Random
 using Reactant
 using ReactiveKernels
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 using Statistics
 using TOML
 
@@ -26,13 +27,17 @@ const DEFAULT_ROUNDS = 5
     logdensity::Float64 = -0.5 * log(2π) - logσ - 0.5 * z^2
 end
 
-const RK_REDUCE = plate(
+const RK_DIRECT_REDUCE = plate(
     benchmark_normal_logpdf;
     have = (:x, :μ, :σ), want = :logdensity, batched = (:x,),
 )
-const RK_SCALAR = prepare(
-    benchmark_normal_logpdf; have = (:x, :μ, :σ), want = :logdensity,
+const RK_REDUCE = plate(
+    normal.logpdf;
+    have = (:x, :location, :scale), want = :logpdf, batched = (:x,),
 )
+const RK_SCALAR = prepare(extract(
+    normal; have = (:x, :location, :scale), want = :logpdf,
+))
 const RK_REPLICATED = replica(RK_SCALAR; batched = :x)
 
 distributions_reduce(μ, σ, xs) =
@@ -170,6 +175,7 @@ function run_benchmark()
 
         native_values = (
             RK_REDUCE(xs, μ, σ),
+            RK_DIRECT_REDUCE(xs, μ, σ),
             distributions_reduce(μ, σ, xs),
             probability_measures_reduce(μ, σ, xs),
             distributions_loop(μ, σ, xs),
@@ -214,6 +220,8 @@ function run_benchmark()
                 abs(value - reference) / abs(reference) for value in observed_values
             ),
             "rk_native" => _measurement(RK_REDUCE, xs, μ, σ; rounds),
+            "rk_direct_native" =>
+                _measurement(RK_DIRECT_REDUCE, xs, μ, σ; rounds),
             "distributions_native" =>
                 _measurement(distributions_reduce, μ, σ, xs; rounds),
             "probability_measures_native" =>
@@ -283,6 +291,10 @@ function run_benchmark()
                 "sum(Distributions.logpdf.(Distributions.Normal(μ, σ), xs))",
             "native_probability_measures_spelling" =>
                 "sum(ProbabilityMeasures.logdensityof.(ProbabilityMeasures.Normal(μ, σ), xs))",
+            "rk_shared_spelling" =>
+                "plate(normal.logpdf; have=(:x,:location,:scale), want=:logpdf, batched=(:x,))",
+            "rk_direct_control_spelling" =>
+                "one-off benchmark_normal_logpdf lifted with plate",
         ),
         "support" => Dict(
             "rk_reactant" => true,
