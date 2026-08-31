@@ -160,6 +160,7 @@ const _SELECTED_TEST_FILES = _select_test_files(ARGS)
     include("test_package_boundary.jl")
 include(joinpath(@__DIR__, "..", "examples", "nuts_runtime.jl"))
 using .ReactiveKernelsNUTSExample
+include(joinpath(@__DIR__, "fixtures", "reactivehmc_algorithm_corpus_setup.jl"))
 
 @testset "ReactiveKernels" begin
     foreach(include, filter(!=("test_package_boundary.jl"), _SELECTED_TEST_FILES))

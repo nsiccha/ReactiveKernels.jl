@@ -1,10 +1,5 @@
 using Test
 
-include(joinpath(@__DIR__, "..", "benchmark", "reactivehmc_algorithm_corpus.jl"))
-using .ReactiveHMCAlgorithmCorpus
-
-const RHMC_CORPUS = ReactiveHMCAlgorithmCorpus
-
 @testset "ReactiveHMC all-algorithm semantics corpus" begin
     @test RHMC_CORPUS.UPSTREAM.revision ==
           "ca9ea4ca41924bb0e1fadc01c717e1333916aba6"

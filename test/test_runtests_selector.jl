@@ -23,3 +23,17 @@
     @test occursin("Known groups: core, acceptance, ad, benchmark", message)
     @test occursin("Known files: test_package_boundary.jl", message)
 end
+
+@testset "runtests shared fixture survives fresh named-selector processes" begin
+    project = dirname(Base.active_project())
+    runtests = joinpath(@__DIR__, "runtests.jl")
+    for selector in ("test_reactivehmc_hmc_fixture", "test_reactivehmc_phasepoint_receipt")
+        output = IOBuffer()
+        cmd = `$(Base.julia_cmd()) --startup-file=no --project=$project $runtests $selector`
+        proc = run(pipeline(cmd; stdout = output, stderr = output); wait = false)
+        wait(proc)
+        receipt = String(take!(output))
+        @test !occursin("UndefVarError: ReactiveHMCAlgorithmCorpus", receipt)
+        @test proc.exitcode == 0
+    end
+end
