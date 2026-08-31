@@ -72,11 +72,13 @@ the ReactiveKernels boundary.
 
 ## One reverse pass over a plated objective
 
-The same API applies after `plate` has fused a scalar recipe across a batch.
-The build-executed source below defines the scalar density, the batched
-`@kernel`, its two WANT boundaries, and the prepared reverse pass. One
-`ad_gradient` call differentiates the summed objective with respect to the
-whole observation vector, while the shared parameters are constants.
+The same API applies to an authored likelihood whose `plate` result is summed.
+The build-executed source below extends the exact primal source from
+[Batched log densities](batched.md): the canonical `normal` object, the one
+authored graph, its return/pointwise/both query boundaries, and the prepared
+reverse pass. One `ad_gradient` call differentiates the distinguished return
+with respect to the whole observation vector, while location and scale are
+constants.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
@@ -85,8 +87,9 @@ Main.ReactiveKernelsDocs.execute_example(
 ```
 
 The resulting gradient is checked against the analytic score
-`-(xᵢ - μ)/σ²`. The generated-kernel pane comes from the exact prepared
-plan executed during this docs build; it is not a parallel illustrative copy.
+`-(xᵢ - location)/scale²`. The generated-kernel pane comes from the exact
+prepared plan executed during this docs build; it is not a parallel
+illustrative copy.
 
 ## Owned storage, not borrowed caches
 

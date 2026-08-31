@@ -6,6 +6,10 @@ import TOML
 const EXPECTED_PROBABILITY_MEASURES_SHA =
     "7cf3a6e112aaae2097b8d401b256d1bce635e03e"
 const EXPECTED_SIZES = (1, 1_000, 10_000, 30_000, 100_000, 1_000_000)
+const EXPECTED_AUTHORED_RETURN_SPELLING =
+    "@kernel normal_loglik(x, location, scale) = begin; pointwise = " *
+    "plate(x, location, scale) do xi, li, si; normal(li, si).logpdf(xi); " *
+    "end; return sum(pointwise); end"
 
 _median(values) = Statistics.median(Float64.(values))
 
@@ -51,6 +55,15 @@ function validate_distribution_receipt(path::AbstractString)
             "Reactant execution timings must exclude compilation")
     require(get(protocol, "reactant_compile_times_include_first_service_startup", false) == true,
             "receipt must disclose first-service-startup compile timing")
+    require(get(protocol, "rk_authored_native_lowering", "") ==
+            "one reduction traversal with no similar/pointwise output",
+            "receipt must attest the authored native fusion check")
+    require(get(protocol, "rk_authored_reactant_lowering", "") ==
+            "tensorized broadcast chain consumed by Base.sum; no host loop or similar",
+            "receipt must attest the authored Reactant fusion check")
+    require(get(protocol, "rk_authored_return_spelling", "") ==
+            EXPECTED_AUTHORED_RETURN_SPELLING,
+            "receipt must record the exact untyped authored return spelling")
     require(Int(get(protocol, "rounds", 0)) >= 5,
             "published receipt must contain at least five raw rounds")
     require(Tuple(Int.(get(protocol, "reactant_replica_counts", Int[]))) ==
@@ -59,6 +72,8 @@ function validate_distribution_receipt(path::AbstractString)
     support = receipt["support"]
     require(get(support, "rk_reactant", false) == true,
             "RK Reactant compatibility did not pass")
+    require(get(support, "rk_authored_reactant", false) == true,
+            "authored RK Reactant compatibility did not pass")
     require(get(support, "probability_measures_reactant", false) == true,
             "ProbabilityMeasures Reactant compatibility did not pass")
     if !get(support, "distributions_reactant", false)
@@ -67,10 +82,10 @@ function validate_distribution_receipt(path::AbstractString)
     end
 
     required_measurements = (
-        "rk_native", "rk_direct_native",
+        "rk_native", "rk_authored_native", "rk_direct_native",
         "distributions_native", "probability_measures_native",
         "distributions_loop", "probability_measures_loop", "hand_hoisted",
-        "rk_reactant", "probability_measures_reactant",
+        "rk_reactant", "rk_authored_reactant", "probability_measures_reactant",
     )
     observed_sizes = Tuple(Int(row["n"]) for row in receipt["measurements"])
     require(observed_sizes == EXPECTED_SIZES,
@@ -92,6 +107,10 @@ function validate_distribution_receipt(path::AbstractString)
             for raw_key in ("times_ns", "bytes", "allocs")
                 require(haskey(measurement, raw_key) && !isempty(measurement[raw_key]),
                         "N=$n $name.$raw_key missing")
+                haskey(measurement, raw_key) && require(
+                    length(measurement[raw_key]) == Int(protocol["rounds"]),
+                    "N=$n $name.$raw_key must retain every benchmark round",
+                )
             end
             all(haskey(measurement, key) for key in ("times_ns", "bytes", "allocs")) ||
                 continue
@@ -112,7 +131,7 @@ function validate_distribution_receipt(path::AbstractString)
             require(Int(measurement["median_allocs"]) ==
                     round(Int, _median(measurement["allocs"])),
                     "N=$n $name median_allocs mismatch")
-            if name in ("rk_native", "rk_direct_native")
+            if name in ("rk_native", "rk_authored_native", "rk_direct_native")
                 require(measurement["median_bytes"] == 0,
                         "N=$n $name reduction must remain zero-allocation")
                 require(measurement["median_allocs"] == 0,
@@ -124,6 +143,21 @@ function validate_distribution_receipt(path::AbstractString)
                            Float64(row["rk_direct_native"]["median_ns"])
             require(shared_ratio <= 1.10,
                     "N=$n shared RK object exceeds the one-off control by more than 10%")
+        end
+        if n > 1 && haskey(row, "rk_native") &&
+                haskey(row, "rk_authored_native")
+            authored_ratio = Float64(row["rk_authored_native"]["median_ns"]) /
+                             Float64(row["rk_native"]["median_ns"])
+            require(authored_ratio <= 1.10,
+                    "N=$n authored return exceeds legacy plate by more than 10%")
+        end
+        if haskey(row, "rk_reactant") && haskey(row, "rk_authored_reactant")
+            require(row["rk_authored_reactant"]["median_bytes"] ==
+                    row["rk_reactant"]["median_bytes"],
+                    "N=$n authored and legacy Reactant host bytes differ")
+            require(row["rk_authored_reactant"]["median_allocs"] ==
+                    row["rk_reactant"]["median_allocs"],
+                    "N=$n authored and legacy Reactant host allocations differ")
         end
     end
 

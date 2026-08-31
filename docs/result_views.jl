@@ -579,39 +579,101 @@ function render_structured_distribution_benchmarks()
     Markdown.MD(blocks)
 end
 
-"""Render the batched allocation comparison from one table-shaped source."""
-function render_batched_allocations()
-    rows = [
-        (path = "prepare", want = "logdensity", bytes = 8128,
-         note = "one per-observation vector"),
-        (path = "prepare_nonallocating", want = "logdensity", bytes = 0,
-         note = "reused batch buffer"),
-        (path = "prepare_nonallocating", want = "per_obs", bytes = 0,
-         note = "reused returned buffer"),
-    ]
-    plot_rows = [(;
-        configuration = string(
-            row.path == "prepare_nonallocating" ? "nonallocating" : row.path,
-            " / ", row.want,
-        ),
-        bytes = row.bytes,
-    ) for row in rows]
-    spec = data(plot_rows) *
-        mapping(:configuration => "Execution path / WANT", :bytes => "Bytes (N = 1000)") *
-        visual(Scatter; markersize = 80) * config(height = 280)
-    columns = (
-        _column(:path, "Path"; format = (value, _) -> h.code(value)),
-        _column(:want, "WANT"; format = (value, _) -> h.code(value)),
-        _column(:bytes, "Steady-state bytes (N = 1000)";
-            format = (value, _) -> string(value, " B")),
-        _column(:note, "Meaning"),
+const _BATCHED_TIMING_BACKENDS = (
+    ("rk_native", "Legacy plate / native"),
+    ("rk_authored_native", "Authored return / native"),
+    ("rk_reactant", "Legacy plate / Reactant"),
+    ("rk_authored_reactant", "Authored return / Reactant"),
+)
+
+const _BATCHED_ALLOCATION_BACKENDS = _BATCHED_TIMING_BACKENDS
+
+"""Render authored/legacy plate parity from the checked-in Normal receipt."""
+function render_batched_benchmarks()
+    receipt = TOML.parsefile(_DISTRIBUTION_RECEIPT_PATH)
+    get(receipt, "schema", "") == "distribution-logdensity-v1" ||
+        error("unexpected batched benchmark receipt schema")
+    pins = receipt["pins"]
+    get(pins, "reactivekernels_dirty", true) == false ||
+        error("batched benchmark receipt was produced from a dirty RK tree")
+    support = receipt["support"]
+    get(support, "rk_reactant", false) ||
+        error("batched receipt does not accept the legacy RK Reactant path")
+    get(support, "rk_authored_reactant", false) ||
+        error("batched receipt does not accept the authored RK Reactant path")
+    protocol = receipt["protocol"]
+    get(protocol, "reactant_sync", false) ||
+        error("batched Reactant receipt is not synchronous")
+    get(protocol, "reactant_transfers_included", true) &&
+        error("batched Reactant receipt includes host/device transfers")
+    get(protocol, "rk_authored_native_lowering", "") ==
+        "one reduction traversal with no similar/pointwise output" ||
+        error("batched receipt lacks the authored native fusion check")
+    get(protocol, "rk_authored_reactant_lowering", "") ==
+        "tensorized broadcast chain consumed by Base.sum; no host loop or similar" ||
+        error("batched receipt lacks the authored Reactant fusion check")
+
+    measurements = receipt["measurements"]
+    Tuple(Int(row["n"]) for row in measurements) ==
+        (1, 1_000, 10_000, 30_000, 100_000, 1_000_000) ||
+        error("batched receipt does not use the published six-size series")
+    all(haskey(row, key) for row in measurements
+        for (key, _) in _BATCHED_TIMING_BACKENDS) ||
+        error("batched receipt is missing an authored/legacy measurement")
+    timing_rows = _timing_rows(measurements; backends = _BATCHED_TIMING_BACKENDS)
+    allocation_rows = _allocation_rows(
+        measurements; backends = _BATCHED_ALLOCATION_BACKENDS,
     )
+
+    ratio(row, numerator, denominator) =
+        Float64(row[numerator]["median_ns"]) /
+        Float64(row[denominator]["median_ns"])
+    gated_rows = filter(row -> Int(row["n"]) > 1, measurements)
+    maximum_native_ratio = maximum(
+        ratio(row, "rk_authored_native", "rk_native") for row in gated_rows
+    )
+    largest = last(measurements)
+    largest_n = Int(largest["n"])
+    largest_native_ratio = ratio(largest, "rk_authored_native", "rk_native")
+    largest_reactant_ratio = ratio(largest, "rk_authored_reactant", "rk_reactant")
+    authored_native_bytes = unique(
+        Int(row["rk_authored_native"]["median_bytes"]) for row in measurements
+    )
+    authored_native_allocs = unique(
+        Int(row["rk_authored_native"]["median_allocs"]) for row in measurements
+    )
+    authored_native_bytes == [0] ||
+        error("authored native return is not zero-byte across all sizes")
+    authored_native_allocs == [0] ||
+        error("authored native return is not zero-allocation across all sizes")
+
+    summary = "The authored return-only kernel remains within " *
+        "$(round(maximum_native_ratio; digits = 2))× of the legacy plate across " *
+        "the gated N ≥ 1,000 rows (the validator requires ≤ 1.10×). At " *
+        "N=$largest_n, authored/legacy is " *
+        "$(round(largest_native_ratio; digits = 2))× natively and " *
+        "$(round(largest_reactant_ratio; digits = 2))× under Reactant. " *
+        "The authored native return is zero-byte and zero-allocation at every " *
+        "measured size; Reactant uses the same tensorized broadcast-to-sum " *
+        "shape without a pointwise output or host loop."
+    provenance = "Receipt pin: ReactiveKernels " *
+        "`$(pins["reactivekernels_sha"])`; Julia $(pins["julia_version"]); " *
+        "Reactant $(pins["reactant_version"]); $(receipt["environment"]["cpu"]). " *
+        "Raw per-round timings, bytes, and allocation counts are retained in " *
+        "benchmark/receipts/distribution-logdensity-v1.toml."
+
     Markdown.MD(Any[
-        _plot_block(spec; id = "batched-steady-state-bytes",
-            title = "Steady-state allocation by execution path",
-            description = "Points on the baseline are true zero-byte measurements."),
-        _result_table(rows, columns; id = "batched-allocation-table",
+        Markdown.Paragraph(Any[summary]),
+        _timing_plot(timing_rows; id = "batched-authored-runtime",
+            title = "Authored return versus legacy plate runtime"),
+        _result_table(timing_rows, _timing_columns();
+            id = "batched-authored-runtime-table", title = "Exact runtime values"),
+        _allocation_plot(allocation_rows; id = "batched-authored-allocation",
+            title = "Authored return versus legacy plate allocation"),
+        _result_table(allocation_rows, _allocation_columns();
+            id = "batched-authored-allocation-table",
             title = "Exact allocation values"),
+        Markdown.Paragraph(Any[Markdown.Italic(Any[provenance])]),
     ])
 end
 

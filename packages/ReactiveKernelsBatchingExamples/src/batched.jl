@@ -1,11 +1,11 @@
-# Batched (vectorized) log densities as recipes, for free.
+# Batched (vectorized) log densities as ordinary authored kernels.
 #
-# One graph offers an elementwise pointwise producer and a fused scalar
-# reduction over the same scalar `normal_logpdf`. Passing a `Vector` makes the
-# observation port batched; want-set pruning selects either the per-observation
-# density (`want = :per_obs`) or the allocation-free total (`want =
-# :logdensity`). No `Distributions.jl` call runs in the compute path; it is an
-# independent oracle only.
+# One transparent graph authors the pointwise plate and returns its sum. The
+# planner can request the distinguished return, the named `pointwise` value, or
+# both. Total-only lowering fuses the reduction without materializing the
+# pointwise vector; both-wants lowering fills it and accumulates the return in a
+# single traversal. No `Distributions.jl` call runs in the compute path; it is
+# an independent oracle only.
 #
 # This module holds the build-executed, `Distributions.jl`-free source rendered
 # in the docs. The zero-allocation value and gradient claims require the
@@ -20,81 +20,80 @@ export all_sources, evaluate_source, run
 const BATCHED_PRIMAL_SOURCE = raw"""
 using Distributions
 using Random
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 
-# One scalar pointwise log density, written once. Nothing here is
-# batching-specific: batching is achieved below by passing a `Vector` for `x`.
-normal_logpdf(x, μ, σ) = -0.5 * log(2π) - log(σ) - 0.5 * ((x - μ) / σ)^2
-
-function fused_normal_logdensity(pointwise, x, μ, σ)
-    total = 0.0
-    @inbounds for xi in x
-        total += pointwise(xi, μ, σ)
+# The canonical Normal object supplies the transparent scalar endpoint. The
+# likelihood itself is authored once: `pointwise` remains a queryable graph
+# value and the distinguished return is its sum.
+@kernel normal_loglik(x, location, scale) = begin
+    pointwise = plate(x, location, scale) do xi, li, si
+        normal(li, si).logpdf(xi)
     end
-    total
-end
-
-# One graph, array-typed observation port. The pointwise density is a TYPED
-# port so the elementwise recipe's operation is the bare `broadcast` (the
-# broadcast-lift convention) — that is what lets the non-allocating lowering
-# reuse a batch buffer (see docs/src/nonallocating.md). `σ = exp(logσ)` is a
-# shared subexpression the planner emits once.
-batched = @kernel batched_normal(pointwise::typeof(normal_logpdf),
-                                 x::Vector{Float64}, μ::Float64,
-                                 logσ::Float64) = begin
-    σ::Float64 = exp(logσ)
-    per_obs::Vector{Float64} = broadcast(pointwise, x, μ, σ)
-    logdensity::Float64 = sum(per_obs)
-    # A total-only query takes the fused producer and never materializes the
-    # active per-observation Vector. A query that WANTS `per_obs` retains the
-    # transparent broadcast path above.
-    logdensity::Float64 = fused_normal_logdensity(pointwise, x, μ, σ)
+    return sum(pointwise)
 end
 
 N = 1000
 x = randn(Random.MersenneTwister(1), N)
-μ = 0.3
-logσ = log(1.2)
-σ = exp(logσ)
+location = 0.3
+scale = 1.2
 
-# Two WANT boundaries from the SAME graph. `want = :per_obs` returns the
-# length-N vectorized pointwise log density (LOO/WAIC territory), while
-# `want = :logdensity` selects the fused total producer. Each prepared plan
-# omits the other representation.
-total_plan  = plan(batched; have = (:pointwise, :x, :μ, :logσ), want = :logdensity)
-perobs_plan = plan(batched; have = (:pointwise, :x, :μ, :logσ), want = :per_obs)
-const total_kernel  = prepare(total_plan)
-const perobs_kernel = prepare(perobs_plan)
+# Three WANT boundaries from the SAME authored graph. Positional application
+# and the default plan request the distinguished return. Extraction selects
+# the named pointwise value alone or pointwise plus return.
+pointwise_spec = extract(normal_loglik; want = :pointwise)
+both_spec = extract(normal_loglik; want = (:pointwise, :__return__))
+total_plan = plan(normal_loglik)
+pointwise_plan = plan(pointwise_spec)
+both_plan = plan(both_spec)
+const total_kernel = prepare(normal_loglik)
+const pointwise_kernel = prepare(pointwise_spec)
+const both_kernel = prepare(both_spec)
 
-total  = total_kernel(normal_logpdf, x, μ, logσ)
-per_obs = perobs_kernel(normal_logpdf, x, μ, logσ)
+ordinary_total = normal_loglik(x, location, scale)
+total = total_kernel(x, location, scale)
+pointwise = pointwise_kernel(x, location, scale)
+pointwise_and_total = both_kernel(x, location, scale)
 
 # Distributions.jl is an independent oracle only; it never runs in the kernel.
-reference        = sum(logpdf.(Normal(μ, σ), x))
-reference_perobs = logpdf.(Normal(μ, σ), x)
+reference_pointwise = logpdf.(Normal(location, scale), x)
+reference = sum(reference_pointwise)
 
-# want-set pruning is structural, not a runtime branch: neither plan
-# materializes the other output representation.
-total_recipes  = length(total_plan.recipes)
-perobs_recipes = length(perobs_plan.recipes)
+# The total-only AST has no pointwise allocation. Pointwise-only and both-wants
+# each traverse the plate exactly once; the latter also accumulates the return
+# during that same traversal.
+total_ast = code_expr(total_kernel)
+pointwise_ast = code_expr(pointwise_kernel)
+both_ast = code_expr(both_kernel)
 
+@assert ordinary_total ≈ reference
 @assert total ≈ reference
-@assert per_obs ≈ reference_perobs
-@assert length(per_obs) == N
+@assert pointwise ≈ reference_pointwise
+@assert pointwise_and_total == (pointwise, total)
+@assert length(pointwise) == N
 @assert !occursin("Distributions", string(code_expr(total_kernel)))
-@assert !occursin("Distributions", string(code_expr(perobs_kernel)))
+@assert !occursin("Distributions", string(code_expr(pointwise_kernel)))
+@assert !occursin("Distributions", string(code_expr(both_kernel)))
+@assert !occursin("similar", string(total_ast))
 
 docs_example = (;
-    name = :batched_normal,
-    origin = "native batched (vectorized) Normal log density (build executed)",
-    inputs = (; pointwise = normal_logpdf, x, μ, logσ),
+    name = :normal_loglik,
+    origin = "authored Normal plate with pointwise and return queries (build executed)",
+    inputs = (; x, location, scale),
     kernel = total_kernel,
     output = total,
+    ordinary_total,
     reference,
-    perobs_kernel,
-    per_obs,
-    reference_perobs,
-    total_recipes,
-    perobs_recipes,
+    pointwise_kernel,
+    pointwise,
+    reference_pointwise,
+    both_kernel,
+    pointwise_and_total,
+    total_plan,
+    pointwise_plan,
+    both_plan,
+    total_ast,
+    pointwise_ast,
+    both_ast,
 )
 """
 
@@ -103,15 +102,15 @@ const BATCHED_AD_SOURCE = BATCHED_PRIMAL_SOURCE * raw"""
 using DifferentiationInterface
 import Enzyme
 
-# Reverse-mode gradient of the total over the whole N-dimensional batch, in ONE
-# pass. DI marks the shared inputs constant; the fused total has no active
-# temporary container, so plain Enzyme reverse mode is sufficient.
-analytic_gradient = @. -(x - μ) / σ^2
+# Reverse-mode gradient of the distinguished return over the whole
+# N-dimensional batch in one pass. DI marks location and scale constant; the
+# fused total has no active pointwise container.
+analytic_gradient = @. -(x - location) / scale^2
 backend = AutoEnzyme(; mode = Enzyme.Reverse)
 prepared_gradient = prepare_ad(
-    total_kernel, backend, normal_logpdf, x, μ, logσ; active = :x,
+    total_kernel, backend, x, location, scale; active = :x,
 )
-gradient = ad_gradient(prepared_gradient, normal_logpdf, x, μ, logσ)
+gradient = ad_gradient(prepared_gradient, x, location, scale)
 
 @assert gradient ≈ analytic_gradient
 
@@ -141,11 +140,13 @@ function run(io::IO = stdout)
         println(io, artifact.name)
         println(io, "  total: ", artifact.output)
         println(io, "  reference total: ", artifact.reference)
-        println(io, "  per-obs length: ", length(artifact.per_obs))
+        println(io, "  pointwise length: ", length(artifact.pointwise))
         println(io, "  max |grad - analytic|: ",
                 maximum(abs, artifact.gradient .- artifact.analytic_gradient))
-        println(io, "  recipes (total / per-obs): ",
-                artifact.total_recipes, " / ", artifact.perobs_recipes)
+        println(io, "  recipes (total / pointwise / both): ",
+                length(artifact.total_plan.recipes), " / ",
+                length(artifact.pointwise_plan.recipes), " / ",
+                length(artifact.both_plan.recipes))
     end
     artifacts
 end

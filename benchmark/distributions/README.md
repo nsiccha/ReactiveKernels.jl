@@ -32,6 +32,12 @@ tracked runtime values. Per-shape compilation diagnostics are retained in the
 receipt; the first RK compile includes Reactant service startup and is not used
 as a cross-library compile-time comparison.
 
+The Normal run also measures the authored return-only likelihood against the
+established `plate(normal.logpdf; ...)` path in every native and Reactant row.
+Its validator requires zero native bytes/allocations at every size and no more
+than 10% native slowdown for `N ≥ 1,000`; the harness rejects an authored
+pointwise output allocation or non-tensorized Reactant reduction before timing.
+
 The scalar Normal receipt also records a distinct invocation-amortization
 protocol: the scalar RK kernel is lifted with `replica(...; batched = :x)` and
 one compiled call evaluates 1, 16, or 256 independent observations. Whole-call
