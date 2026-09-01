@@ -25,6 +25,30 @@ using ReactiveKernels
 end
 end
 
+module _NamedTupleFix
+using ReactiveKernels
+
+@kernel currentness(source=4.0) = begin
+    derived = sqrt(source)
+    step!(value) = begin
+        source = value
+        return (; metrics=(; derived))
+    end
+end
+
+@kernel bounded_result(seed, source=4.0, count=0) = begin
+    values = deepcopy(seed)
+    derived = sqrt(source)
+    step!(value, index, take) = begin
+        source = value
+        take || return (; metrics=(; derived, selected=values[index]), count)
+        count += 1
+        return (; metrics=(; derived, selected=values[index]), count)
+    end
+end
+
+end
+
 _sval(pf, ow, sh, nm) = begin
     PL = RK.kernel_prepared_plan(pf); s = RK.kernel_plan_slot(PL, nm)
     role, slot = RK.kernel_plan_field(PL, s.canon)
@@ -128,6 +152,42 @@ end
         @test RK.stateful_call(state, Val(:implicit_energy), x_squared) ≈ expected
         @test RK.stateful_call(state, Val(:explicit_energy), x_squared) ≈ expected
     end
+end
+
+@testset "kernel_adaptation — NamedTuple results preserve currentness" begin
+    state = RK.compile_stateful(_NamedTupleFix.currentness, 4.0)(4.0)
+    result = RK.stateful_call(state, Val(:step!), 9.0)
+    @test result == (metrics=(derived=3.0,),)
+    @test RK.stateful_get(state, Val(:source)) == 9.0
+    @test RK.stateful_get(state, Val(:derived)) == 3.0
+end
+
+@testset "kernel_adaptation — bounded machines lower NamedTuple results" begin
+    seed = [10.0, 20.0]
+    kernel = RK.compile_stateful(
+        _NamedTupleFix.bounded_result, seed, 4.0, 0)
+    initial = RK.stateful_snapshot(kernel(seed, 4.0, 0))
+    transition = RK.functionalize_stateful(
+        kernel, Val(:step!);
+        argument_types=Tuple{Float64,Int,Bool})
+
+    skipped = transition(initial, 9.0, 2, false)
+    @test !skipped.control_overflow
+    @test skipped.result == (
+        metrics=(derived=3.0, selected=20.0), count=0)
+    @test skipped.state.source == 9.0
+    @test skipped.state.derived == 3.0
+    @test skipped.state.count == 0
+
+    taken = transition(initial, 9.0, 1, true)
+    @test !taken.control_overflow
+    @test taken.result == (
+        metrics=(derived=3.0, selected=10.0), count=1)
+    @test taken.state.count == 1
+
+    out_of_bounds = transition(initial, 9.0, 3, false)
+    @test out_of_bounds.control_overflow
+    @test out_of_bounds.state == initial
 end
 
 function _welford_step(n, mean, var, x, dn)
