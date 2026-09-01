@@ -287,5 +287,23 @@ end
             spec, PE_TEST_AD_BACKEND, qv;
             active = :q, want = :density, bound = (; data = dval),
             data = dval)
+
+        # A bound preparation intentionally bypasses authored signature
+        # conveniences. Defaulted ports that remain in HAVE are therefore
+        # explicit positional exemplars and call arguments, as documented.
+        defaults = @kernel bound_defaults(
+                q::Vector{Float64}, scale::Float64 = 1.25;
+                data::Vector{Float64}, offset::Float64 = 0.0) = begin
+            density::Float64 =
+                sum(q .* data) - scale * sum(abs2, q) + offset
+        end
+        default_bound = prepare_ad(
+            defaults, PE_TEST_AD_BACKEND, qv, 1.25, 0.0;
+            active = :q, want = :density, bound = (; data = dval))
+        @test ad_gradient(default_bound, qv, 1.25, 0.0) ≈
+              dval .- 2(1.25) .* qv
+        @test_throws ArgumentError prepare_ad(
+            defaults, PE_TEST_AD_BACKEND, qv;
+            active = :q, want = :density, bound = (; data = dval))
     end
 end

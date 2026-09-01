@@ -80,6 +80,7 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
         "distributions-ad.md",
         "eight-schools-reactant.md",
         "eval-throughput.md",
+        "mnist-reactant.md",
         "ppl-ad.md",
         "reactant-ad.md",
         "reactant.md",
