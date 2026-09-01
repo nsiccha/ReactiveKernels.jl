@@ -11,6 +11,12 @@ structured, and plated kernels; there is no Reactant-specific distribution
 formula or parallel source tree. This page owns the Reactant benchmark panels so
 the native source pages stay focused on authoring and semantics.
 
+Every benchmark below uses focused plots rather than one mixed-scale summary:
+scalar families are separated by distribution, and native, compiled, authored,
+and amortized comparisons use execution-matched baselines. Compact tables keep
+absolute runtime, baseline runtime, `runtime ÷ baseline`, allocations where
+available, and a faster/slower interpretation beside each plot.
+
 ## Scalar families
 
 The matched comparison covers Cauchy, Laplace, Bernoulli, LogNormal,

@@ -10,7 +10,7 @@ This page measures Reactant on the exact executable model documented on the
 `ReactiveKernelsPPLExamples`; it does not copy the model, rewrite a density, or
 introduce a Reactant-only mathematical path.
 
-The comparison mirrors the complete three-by-four capability matrix in the
+The receipt mirrors the complete three-by-four capability matrix in the
 [native primal receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/eight-schools-primal-v2.toml).
 Its input boundaries are the packed unconstrained vector,
 the constrained parameter `NamedTuple`, and the minimal likelihood boundary
@@ -27,11 +27,16 @@ HAVE boundary.
 
 ## Primal performance and support
 
+The headline view separates joint, prior, summed-likelihood, and pointwise
+outcomes at the packed boundary. Runtime-input and bound-input compiled calls
+are each normalized to their embedded, configuration-matched native RK control;
+the complete capability matrix and compiler diagnostics remain in the receipt.
+
 ```@eval
 Main.ReactiveKernelsDocs.render_eight_schools_reactant_benchmark()
 ```
 
-The table contains steady-state synchronous call time only. Host-to-device
+The plots and compact tables contain steady-state synchronous call time only. Host-to-device
 conversion, kernel preparation, Reactant compilation, the first synchronous
 call, and result readback are outside that timing and remain recorded in the
 receipt. This keeps a small CPU kernel's fixed compiler/runtime costs visible
@@ -50,7 +55,7 @@ matrix this page reuses exactly.
 Main.ReactiveKernelsDocs.render_eight_schools_reactant_ad_benchmark()
 ```
 
-This section is the AD analog of the primal table above. It consumes the
+This section is the AD analog of the primal panels above. It consumes the
 first-class RK verb `compile_ad_value_and_gradient` (the AD companion of the
 primal `@compile` path) — no gradient is hand-rolled — and reuses the exact
 differentiable outcome/boundary protocol published on the

@@ -29,6 +29,9 @@ The checked-in receipt compares one synchronous CPU call per full-depth
 transition, with identical pre-generated momentum, direction, and exponential
 bundles. Compilation, transfers, state setup, random generation, and result
 readback are reported outside steady-state timing.
+The focused plot and table show absolute transition latency, native-relative
+latency, a plain faster/slower interpretation, and leapfrog throughput together;
+compilation and first-call costs stay in their own compact table.
 
 The immutable input is
 [`nuts-reactant-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/nuts-reactant-v1.toml).

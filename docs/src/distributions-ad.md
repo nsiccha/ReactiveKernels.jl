@@ -35,11 +35,17 @@ Continuous families differentiate observations; Bernoulli and Geometric
 differentiate their scalar logit ports because integer observations cannot be
 active. Every row is checked against an analytic gradient before timing.
 
+Each distribution family is rendered as its own relative-runtime plot and
+compact table. The baseline is `ad_gradient` for that same family and plate
+size; absolute runtime, allocation evidence, the normalized ratio, and a plain
+faster/slower interpretation stay together.
+
 ```@eval
 Main.ReactiveKernelsDocs.render_distribution_gradient_benchmarks()
 ```
 
-Each cell is the median of five minimum-time measurements after preparation.
+Each displayed value uses three significant digits and comes from the median
+of five minimum-time measurements after preparation.
 `ad_gradient` returns only the derivative;
 `ad_value_and_gradient!` also returns the value while filling caller-owned
 storage. The checked-in

@@ -66,6 +66,8 @@ jobs:
           '
       - name: Test rendered-docs contract
         run: julia --startup-file=no docs/test_rendered_contracts.jl
+      - name: Test focused benchmark renderers
+        run: julia --startup-file=no --project=docs docs/test_benchmark_views.jl
       - name: Build and deploy
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

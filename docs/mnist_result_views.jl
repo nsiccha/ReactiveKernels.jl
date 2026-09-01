@@ -47,7 +47,7 @@ function _mnist_focused_plot(rows; id, title, baseline_note)
             color = :implementation => "Implementation",
         ) *
         visual(Scatter, markersize = 120) *
-        config(height = 280, scales = scales(Y = (; scale = log10, zero = false)))
+        config(height = 280, scales = scales(Y = (; scale = log10)))
     _plot_block(spec; id, title,
         description = "One outcome only. $baseline_note; 1.00× is parity and lower is faster. " *
                       "The ratio axis is logarithmic so large slowdowns do not hide near-parity results.")

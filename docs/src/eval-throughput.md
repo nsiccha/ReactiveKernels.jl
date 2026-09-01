@@ -37,10 +37,13 @@ Reactant-traceable**; those cells are reported unsupported rather than faked.
 
 ## Results
 
-Median single-call time on a **log time axis — lower (shorter) is better**. Each bar
-is read straight from the static receipt
+Primal, value-and-gradient, and pointwise generated-quantity latency are shown
+as separate relative-runtime plots and compact tables. Every row is normalized
+to RK native for the same mode and position size; lower than 1× is faster. The
+absolute and baseline runtimes use three significant digits and are read
+straight from the static receipt
 [`benchmark/receipts/eval-throughput-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/eval-throughput-v1.toml)
-(default CPU backend, `Float64`) while the docs build, so the picture cannot drift
+(default CPU backend, `Float64`) while the docs build, so the plots cannot drift
 from the numbers. `Turing + Reactant` is unsupported for every mode and is
 omitted.
 
@@ -62,8 +65,9 @@ and complete before a synchronous latency timing ends. It *can* be amortized whe
 the application has independent work. `replica(kernel; batched = :x)` keeps one
 position per matrix column and lowers the whole map as one compiled invocation.
 
-The table below keeps the original direct-call timing beside a separate
-256-position throughput protocol. `Batch / position` is the measured whole-batch
+The three operation-specific tables below keep the original direct-call timing
+beside a separate 256-position throughput protocol and report batch/position
+relative to that matched direct call. `Batch / position` is the measured whole-batch
 time divided by 256; it is not a claim about single-call latency. The gradient row
 differentiates the sum of the independent replicated log densities, yielding one
 gradient column per position.
