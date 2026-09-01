@@ -1559,7 +1559,7 @@ function _eight_schools_ad_plot(rows, metric;
     cell_order = unique(getproperty.(rows, :cell))
     spec = data(rows) *
         mapping(
-            :cell => sorter(cell_order) => "Scalar matrix cell",
+            :cell => sorter(cell_order) => "Reverse-AD matrix cell",
             metric => label;
             color = :implementation => "Implementation",
         ) *
@@ -1706,7 +1706,7 @@ function render_eight_schools_ad_benchmarks()
                 h.span(value; class = "rk-result-unsupported")),
     )
     setup_columns = (
-        _column(:cell, "Scalar matrix cell"),
+        _column(:cell, "Reverse-AD matrix cell"),
         _column(:implementation, "Implementation"),
         _column(:preparation_seconds, "Preparation";
             format = (value, _) -> string(round(value; sigdigits = 4), " s")),
