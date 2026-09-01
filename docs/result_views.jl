@@ -2196,8 +2196,13 @@ function render_eight_schools_reactant_ad_benchmark()
         error("Eight Schools Reactant-AD receipt does not reuse the authored source")
     get(protocol, "reactant_sync", false) ||
         error("Eight Schools Reactant-AD receipt is not synchronous")
-    get(protocol, "gradient_operation", "") == "value and gradient" ||
-        error("Eight Schools Reactant-AD receipt is not a value-and-gradient receipt")
+    get(protocol, "gradient_operation", "") ==
+        "value and gradient for scalar WANTs; value and reverse pullback for pointwise WANTs" ||
+        error("Eight Schools Reactant-AD reverse-operation contract drifted")
+    get(protocol, "compiled_pullback_exposed", true) == false ||
+        error("Eight Schools Reactant-AD receipt claims a compiled pullback")
+    get(protocol, "compiled_structured_active_exposed", true) == false ||
+        error("Eight Schools Reactant-AD receipt claims structured tracing")
     Tuple(String.(protocol["input_boundaries"])) == _EIGHT_SCHOOLS_BOUNDARIES ||
         error("unexpected Eight Schools input-boundary matrix")
     Tuple(String.(protocol["outcomes"])) == _EIGHT_SCHOOLS_OUTCOMES ||
@@ -2221,6 +2226,7 @@ function render_eight_schools_reactant_ad_benchmark()
         (;
             boundary = boundary_labels[measurement["boundary"]],
             outcome = measurement["outcome"],
+            operation = get(measurement, "operation", "—"),
             active = get(measurement, "active_port", "—"),
             native_ns,
             reactant_ns,
@@ -2233,24 +2239,30 @@ function render_eight_schools_reactant_ad_benchmark()
     measured = filter(row -> row.reactant_ns !== missing, rows)
     ratios = Float64[row.relative_time for row in measured]
     native_cells = count(row -> row.native_ns !== missing, rows)
+    native_gradients = count(row -> row.native_ns !== missing &&
+        row.operation == "value and gradient", rows)
+    native_pullbacks = count(row -> row.native_ns !== missing &&
+        row.operation == "value and pullback", rows)
     native_only = count(
         row -> row.native_ns !== missing && row.reactant_ns === missing, rows)
     summary = isempty(ratios) ?
         "No Reactant-AD matrix cell compiled in this receipt." :
-        "Native RK AD differentiates $native_cells scalar cells; Reactant " *
-        "compiled the gradient for $(length(measured)) of them at exact parity " *
-        "(gradient and value max-abs-error 0). The remaining $native_only " *
-        "native-AD cell(s) keep their compiler diagnostic — the packed joint " *
-        "and prior fail primal Reactant with \"Scalar indexing is disallowed.\", " *
-        "so their gradients cannot compile either. Across compiled cells, " *
+        "Native RK AD measures $native_cells cells: $native_gradients scalar " *
+        "gradients and $native_pullbacks fixed-cotangent pointwise pullbacks. " *
+        "Reactant compiled $(length(measured)) array-backed scalar gradients at " *
+        "exact parity; $native_only native cells remain compiled-AD unsupported. " *
+        "The receipt does not claim compiled structured gradients or pullbacks, " *
+        "and packed joint/prior retain their real primal compiler diagnostics. " *
+        "Across compiled cells, " *
         "steady-state Reactant/native AD time ranges from " *
         "$(round(minimum(ratios); digits = 2))× to " *
         "$(round(maximum(ratios); digits = 2))× on this CPU receipt."
     timing_columns = (
         _column(:boundary, "Input boundary"),
         _column(:outcome, "Requested output"),
+        _column(:operation, "Native operation"),
         _column(:active, "Active port"),
-        _column(:native_ns, "Native RK AD";
+        _column(:native_ns, "Native RK reverse AD";
             format = (value, _) -> _unsupported(value, _fmt_ns)),
         _column(:reactant_ns, "Reactant AD";
             format = (value, _) -> _unsupported(value, _fmt_ns)),
@@ -2270,15 +2282,19 @@ function render_eight_schools_reactant_ad_benchmark()
         receipt["measurements"],
     )) do measurement
         supported = get(measurement, "rk_reactant_ad_supported", false)
+        attempted = haskey(measurement, "reactant_ad_compile_seconds")
         (;
             boundary = boundary_labels[measurement["boundary"]],
             outcome = measurement["outcome"],
             ad_prep_seconds = Float64(measurement["ad_preparation_seconds"]),
-            transfer_seconds = Float64(measurement["reactant_transfer_seconds"]),
-            compile_seconds = Float64(measurement["reactant_ad_compile_seconds"]),
+            transfer_seconds = attempted ?
+                Float64(measurement["reactant_transfer_seconds"]) : missing,
+            compile_seconds = attempted ?
+                Float64(measurement["reactant_ad_compile_seconds"]) : missing,
             first_seconds = supported ?
                 Float64(measurement["reactant_first_execution_seconds"]) : missing,
-            result = supported ? "compiled" : "unsupported",
+            result = supported ? "compiled" :
+                attempted ? "compile rejected" : "not a public compiled surface",
         )
     end
     seconds(value) = string(round(value; sigdigits = 4), " s")
@@ -2288,9 +2304,9 @@ function render_eight_schools_reactant_ad_benchmark()
         _column(:ad_prep_seconds, "AD preparation";
             format = (value, _) -> seconds(value)),
         _column(:transfer_seconds, "Input transfer";
-            format = (value, _) -> seconds(value)),
+            format = (value, _) -> _unsupported(value, seconds)),
         _column(:compile_seconds, "AD compile attempt";
-            format = (value, _) -> seconds(value)),
+            format = (value, _) -> _unsupported(value, seconds)),
         _column(:first_seconds, "First synchronous call";
             format = (value, _) -> _unsupported(value, seconds)),
         _column(:result, "Result";
@@ -2314,7 +2330,9 @@ function render_eight_schools_reactant_ad_benchmark()
         " generated by ",
         h.a(h.code("benchmark/eight_schools_reactant_ad_comparison.jl");
             href = "https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/eight_schools_reactant_ad_comparison.jl"),
-        ", consuming the first-class RK verb ", h.code("compile_ad_value_and_gradient"),
+        ", consuming native ", h.code("ad_value_and_gradient[!]"), " and ",
+        h.code("ad_value_and_pullback[!]"), " plus the public compiled scalar verb ",
+        h.code("compile_ad_value_and_gradient"),
         ". It reuses the same derivative matrix as the ",
         h.a(h.code("eight-schools-ad-v1.toml");
             href = "https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/eight-schools-ad-v1.toml"),
@@ -2330,7 +2348,7 @@ function render_eight_schools_reactant_ad_benchmark()
         Markdown.Paragraph(Any[summary]),
         _result_table(rows, timing_columns; id = "eight-schools-reactant-ad-matrix",
             title = "Native RK AD / Reactant-compiled AD steady-state matrix",
-            note = "Value-and-gradient per differentiable scalar cell. Non-scalar (pointwise), constrained NamedTuple, and undefined cells stay unsupported with their recorded reason; native-AD cells whose primal cannot compile through Reactant keep their compiler diagnostic."),
+            note = "Scalar cells measure native value-and-gradient; pointwise cells measure native value-and-VJP for the fixed receipt cotangent. Reactant claims only the public compiled scalar value-and-gradient subset; no compiled pullback or structured tracing surface is implied."),
         Markdown.Paragraph(Any[setup_summary]),
         _result_table(setup_rows, setup_columns;
             id = "eight-schools-reactant-ad-setup",

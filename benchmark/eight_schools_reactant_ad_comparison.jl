@@ -7,6 +7,8 @@
 # source is imported from ReactiveKernelsPPLExamples; no density, transform, or
 # AD evaluator is ever copied into this benchmark, and the Reactant-compiled
 # gradient is obtained from the first-class RK verb `compile_ad_value_and_gradient`.
+# Native structured gradients and pointwise pullbacks are measured through their
+# public prepared RK verbs, but are never presented as Reactant-compiled surfaces.
 
 import Pkg
 
