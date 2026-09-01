@@ -332,7 +332,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "eight-schools-reactant.md" => 4,
         "eval-throughput.md" => 1,
         "mnist-logistic.md" => 1,
-        "mnist-reactant.md" => 4,
+        "mnist-reactant.md" => 8,
         "nuts.md" => 1,
         "nuts-reactant.md" => 2,
     )
