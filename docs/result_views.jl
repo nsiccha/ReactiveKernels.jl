@@ -1234,19 +1234,21 @@ function _mnist_logistic_ad_plot(rows, metric;
     label = metric === :min_ns ?
         "Minimum uncontended value + gradient runtime (ns)" :
         "Median allocated bytes"
-    scale = metric === :min_ns ? log10 : symlog
-    cell_order = unique(getproperty.(rows, :cell))
+    scale = metric === :min_ns ? log10 : sqrt
+    zero = metric !== :min_ns
+    cell_order = unique(getproperty.(rows, :plot_cell))
     spec = data(rows) *
         mapping(
-            :cell => sorter(cell_order) => "Packed scalar outcome",
+            :plot_cell => sorter(cell_order) => "Packed scalar outcome",
             metric => label;
             color = :implementation => "Implementation",
+            dodge_x = :implementation,
         ) *
-        visual(BarPlot) *
-        config(height = 320, scales = scales(Y = (; scale)))
+        visual(Scatter, markersize = 100) *
+        config(height = 520, scales = scales(Y = (; scale, zero)))
     description = metric === :min_ns ?
         "Preparation and first execution are excluded; the runtime axis is logarithmic." :
-        "The symlog byte axis preserves the genuine zero-allocation prior paths."
+        "The square-root byte axis preserves the genuine zero-allocation prior paths."
     _plot_block(spec; id, title, description)
 end
 
@@ -1349,7 +1351,7 @@ function render_mnist_logistic_ad_benchmarks()
             Float64(result["min_ns"]) == minimum(Float64.(result["times_ns"])) ||
                 error("MNIST logistic AD minimum drifted for $cell / $implementation")
             push!(plot_rows, (;
-                cell,
+                cell, plot_cell = outcome_labels[outcome],
                 implementation,
                 min_ns = Float64(result["min_ns"]),
                 median_bytes = Int(result["median_bytes"]),
@@ -1555,19 +1557,23 @@ function _eight_schools_ad_plot(rows, metric;
                                 id::AbstractString, title::AbstractString)
     label = metric === :median_ns ? "Median reverse-AD runtime (ns)" :
         "Median allocated bytes"
-    scale = metric === :median_ns ? log10 : symlog
-    cell_order = unique(getproperty.(rows, :cell))
+    scale = metric === :median_ns ? log10 : sqrt
+    zero = metric !== :median_ns
+    cell_order = unique(getproperty.(rows, :plot_cell))
     spec = data(rows) *
         mapping(
-            :cell => sorter(cell_order) => "Reverse-AD matrix cell",
+            :plot_cell => sorter(cell_order) => "Reverse-AD matrix cell",
             metric => label;
             color = :implementation => "Implementation",
+            dodge_x = :implementation,
         ) *
-        visual(BarPlot) *
-        config(height = 320, scales = scales(Y = (; scale)))
-    description = metric === :median_ns ?
+        visual(Scatter, markersize = 100) *
+        config(height = 520, scales = scales(Y = (; scale, zero)))
+    description = (metric === :median_ns ?
         "Preparation and first execution are excluded; the runtime axis is logarithmic." :
-        "The symlog byte axis retains the genuine zero-allocation scalar RK measurements."
+        "The square-root byte axis retains the genuine zero-allocation scalar RK measurements.") *
+        " Cell labels abbreviate packed unconstrained (PU), constrained parameters (CP), " *
+        "and likelihood-only (LO)."
     _plot_block(spec; id, title, description)
 end
 
@@ -1631,6 +1637,17 @@ function render_eight_schools_ad_benchmarks()
         "likelihood" => "Likelihood",
         "pointwise" => "Pointwise likelihood",
     )
+    plot_boundary_labels = Dict(
+        "packed_unconstrained" => "PU",
+        "constrained_parameters" => "CP",
+        "minimal_likelihood" => "LO",
+    )
+    plot_outcome_labels = Dict(
+        "joint" => "Joint",
+        "prior" => "Prior",
+        "likelihood" => "Likelihood",
+        "pointwise" => "Pointwise",
+    )
     matrix_rows = NamedTuple[]
     plot_rows = NamedTuple[]
     setup_rows = NamedTuple[]
@@ -1651,6 +1668,9 @@ function render_eight_schools_ad_benchmarks()
                 error("insufficient Eight Schools AD rounds for $cell / $implementation")
             push!(plot_rows, (;
                 cell,
+                plot_cell = string(
+                    plot_boundary_labels[boundary], " · ", plot_outcome_labels[outcome],
+                ),
                 implementation,
                 median_ns = Float64(result["median_ns"]),
                 median_bytes = Int(result["median_bytes"]),
@@ -1983,8 +2003,8 @@ function render_nuts_reactant_benchmark()
     ]
     spec = data(rows) *
         mapping(:backend => "Backend", :transition_ms => "Median transition time (ms)") *
-        visual(BarPlot) *
-        config(height = 280, scales = scales(Y = (; scale = log10)))
+        visual(Scatter, markersize = 120) *
+        config(height = 280, scales = scales(Y = (; scale = log10, zero = false)))
     columns = (
         _column(:backend, "Backend"),
         _column(:transition_ms, "Median transition";
