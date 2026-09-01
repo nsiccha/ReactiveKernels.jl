@@ -632,6 +632,100 @@ end
         marker::Reactant.TracedType, arg::AbstractArray) =
     Reactant.promote_to(Reactant.TracedRArray, arg)
 
+# A traced scalar index is a deliberate gather at this compiler boundary.
+# Express the bounded vector gather as a traced select/reduction: Reactant
+# 0.2.278's dynamic-slice start index is not lane-varying under Ops.batch, while
+# this predicated form preserves each replica's index and remains differentiable.
+@inline function ReactiveKernels._tensorized_getindex(
+        array::Reactant.TracedRArray{T,1},
+        index::Reactant.TracedRNumber{I}) where {T,I<:Integer}
+    sum(ifelse.(collect(eachindex(array)) .== index, array, zero(T)))
+end
+
+# Batched slice-collection plates preserve eachcol structurally in the core.
+# Move the observation axis to the leading batch dimension and lower the
+# scalar recipe with Reactant's batch primitive; no Base.Slices object or host
+# elementwise iteration reaches tracing.
+struct _AuthoredPlateBatchCall{B,S,N,O,A}
+    operation::O
+    shared::A
+end
+
+@inline _authored_plate_batch_scalar(array) = Reactant.@allowscalar array[]
+
+@generated function (call::_AuthoredPlateBatchCall{B,S,N})(
+        batch_args...) where {B,S,N}
+    lookup = Dict(index => position for (position, index) in enumerate(B))
+    shared_position = 0
+    values = Any[]
+    for index in 1:N
+        if haskey(lookup, index)
+            position = lookup[index]
+            value = :(getfield(batch_args, $position))
+            index in S && (value = :(_authored_plate_batch_scalar($value)))
+            push!(values, value)
+        else
+            shared_position += 1
+            push!(values, :(getfield(getfield(call, :shared), $shared_position)))
+        end
+    end
+    :(getfield(call, :operation)($(values...)))
+end
+
+@inline _authored_plate_batch_length(arg::ReactiveKernels._TensorizedEachcol) =
+    size(arg.parent, 2)
+@inline _authored_plate_batch_length(arg::ReactiveKernels._TensorizedPlateBatch) =
+    size(arg.values, 1)
+@inline _authored_plate_batch_input(arg::ReactiveKernels._TensorizedEachcol) =
+    permutedims(arg.parent, (2, 1))
+@inline _authored_plate_batch_input(arg::ReactiveKernels._TensorizedPlateBatch) =
+    arg.values
+@inline _authored_plate_batch_input(arg::Reactant.TracedRArray) = arg
+@inline _authored_plate_shared(arg) = arg
+@inline _authored_plate_shared(arg::Base.RefValue) = arg[]
+
+@inline _authored_plate_is_explicit_batch(
+    arg::ReactiveKernels._TensorizedEachcol, count) = true
+@inline _authored_plate_is_explicit_batch(
+    arg::ReactiveKernels._TensorizedPlateBatch, count) = true
+@inline _authored_plate_is_explicit_batch(arg::Reactant.TracedRArray, count) =
+    ndims(arg) == 1 && size(arg, 1) == count
+@inline _authored_plate_is_explicit_batch(arg, count) = false
+
+function _reactant_authored_plate_call(marker, operation, args::Tuple)
+    count = _authored_plate_batch_length(marker)
+    batch_positions = Tuple(index for index in eachindex(args)
+        if _authored_plate_is_explicit_batch(getfield(args, index), count))
+    isempty(batch_positions) && throw(ArgumentError(
+        "a tensorized eachcol plate requires at least one batched argument"))
+    scalar_positions = Tuple(index for index in batch_positions
+        if !(getfield(args, index) isa ReactiveKernels._TensorizedEachcol) &&
+           ndims(_authored_plate_batch_input(getfield(args, index))) == 1)
+    batch_inputs = Reactant.TracedRArray[
+        _authored_plate_batch_input(getfield(args, index))
+        for index in batch_positions
+    ]
+    shared = Tuple(_authored_plate_shared(getfield(args, index))
+        for index in eachindex(args) if !(index in batch_positions))
+    call = _AuthoredPlateBatchCall{
+        batch_positions,scalar_positions,length(args),
+        typeof(operation),typeof(shared)}(operation, shared)
+    result = only(Reactant.Ops.batch(call, batch_inputs, Int64[count]))
+    ReactiveKernels._TensorizedPlateBatch(result)
+end
+
+function ReactiveKernels._tensorized_plate_call(
+        marker::ReactiveKernels._TensorizedEachcol{<:Reactant.TracedRArray},
+        operation, args::Tuple)
+    _reactant_authored_plate_call(marker, operation, args)
+end
+
+function ReactiveKernels._tensorized_plate_call(
+        marker::ReactiveKernels._TensorizedPlateBatch{<:Reactant.TracedRArray},
+        operation, args::Tuple)
+    _reactant_authored_plate_call(marker, operation, args)
+end
+
 @inline function ReactiveKernels._batched_call(
         f::ReactiveKernels._ArrayFunctionPair, ops, args,
         marker::Reactant.RArray)

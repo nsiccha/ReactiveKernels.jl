@@ -75,7 +75,8 @@ Recipe(id, inputs, outputs, op, cost, cse_key, effectful) =
 An immutable wrapper marking a recipe operation SYNTHESIZED from captured `@kernel` source as
 COMPILER-OWNED provenance (RK 07:21). Authoring wraps ONLY the anonymous-closure path of
 `_kernel_operation` in this; a bare exact identity (`cholesky`/`+`/…) stays raw and is identity/domain
-validated. `DefToken` is a definition-unique gensym baked in at graph build — NOT a security boundary (an internal
+validated unless it has an explicit compiler-owned tensorized replacement. `DefToken` is a
+definition-unique gensym baked in at graph build — NOT a security boundary (an internal
 constructor/type parameter cannot prevent deliberate internal misuse); it is trusted only because the
 supported authoring path is the ONLY thing that wraps a closure, so an arbitrary public Graph closure is
 never auto-wrapped. It makes each fused op a distinct concrete type (survives the prepared ops-tuple,
@@ -147,6 +148,51 @@ end
 @inline _tensorized_hcat(args...) = hcat(_tensorized_cat_operands(args)...)
 @inline _tensorized_cat(args...; dims) =
     cat(_tensorized_cat_operands(args)...; dims = dims)
+
+# Tensorized authored plates keep slice collections structural instead of
+# materializing Base.Slices.  A backend can consume the parent array as one
+# batched value, while the generic fallback preserves ordinary eachcol
+# broadcast semantics.
+struct _TensorizedEachcol{A}
+    parent::A
+end
+
+struct _TensorizedPlateBatch{A}
+    values::A
+end
+
+@inline _tensorized_eachcol(parent) = _TensorizedEachcol(parent)
+@inline _tensorized_plate_marker(::Tuple{}) = nothing
+@inline function _tensorized_plate_marker(args::Tuple)
+    first_arg = first(args)
+    first_arg isa Union{_TensorizedEachcol,_TensorizedPlateBatch} ?
+        first_arg : _tensorized_plate_marker(Base.tail(args))
+end
+@inline _tensorized_plate_fallback_arg(arg) = arg
+@inline _tensorized_plate_fallback_arg(arg::_TensorizedEachcol) =
+    eachcol(arg.parent)
+@inline _tensorized_plate_fallback_arg(arg::_TensorizedPlateBatch) = arg.values
+@inline _tensorized_plate_materialize(value) = value
+@inline _tensorized_plate_materialize(value::_TensorizedPlateBatch) = value.values
+
+@inline function _tensorized_plate_call(operation, args...)
+    marker = _tensorized_plate_marker(args)
+    marker === nothing ?
+        Base.broadcast(operation, args...) :
+        _tensorized_plate_call(marker, operation, args)
+end
+
+@inline function _tensorized_plate_call(
+        marker::Union{_TensorizedEachcol,_TensorizedPlateBatch},
+        operation, args::Tuple)
+    unwrapped = map(_tensorized_plate_fallback_arg, args)
+    _TensorizedPlateBatch(Base.broadcast(operation, unwrapped...))
+end
+
+# Index syntax in a tensorized fused body routes through this hook.  Native
+# semantics are exactly Base.getindex; tracing extensions may explicitly
+# authorize their backend's scalar gather lowering.
+@inline _tensorized_getindex(args...) = getindex(args...)
 
 """
     Graph()

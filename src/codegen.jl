@@ -527,11 +527,6 @@ function _lower_authored_plate_tensorized!(body, runtime_ops, runtime_recipes,
         "an authored plate body must lower to one operation per transparent scalar recipe"))
 
     atomic = typeof(op).parameters[2]
-    batch = gensym(:plate_broadcast)
-    atomic_val = Expr(:call, GlobalRef(Base, :Val), QuoteNode(atomic))
-    push!(body.args, :($batch = $(GlobalRef(@__MODULE__, :_authored_plate_broadcast))(
-        $atomic_val, $(callargs...))))
-
     locals = Dict{Int,Any}()
     for (index, input) in enumerate(inner.have)
         arg = callargs[index]
@@ -548,14 +543,18 @@ function _lower_authored_plate_tensorized!(body, runtime_ops, runtime_recipes,
         out = gensym(Symbol(:plate_, output.name))
         args = Any[locals[canon_id(inner.graph, input.id)] for input in recipe.inputs]
         operation = Expr(:ref, _OPS_ARG, op_offset + recipe_index)
-        call = Expr(:call, GlobalRef(Base, :broadcast), operation, args...)
+        call = Expr(:call, GlobalRef(@__MODULE__, :_tensorized_plate_call),
+                    operation, args...)
         push!(body.args, Expr(:(=), out, call))
         locals[canon_id(inner.graph, output.id)] = out
     end
     scalar_result = locals[canon_id(inner.graph, only(inner.want).id)]
-    pointwise_lhs === nothing || push!(body.args, :($pointwise_lhs = $scalar_result))
+    materialized = Expr(:call,
+        GlobalRef(@__MODULE__, :_tensorized_plate_materialize), scalar_result)
+    pointwise_lhs === nothing ||
+        push!(body.args, :($pointwise_lhs = $materialized))
     total_lhs === nothing ||
-        push!(body.args, :($total_lhs = $(GlobalRef(Base, :sum))($scalar_result)))
+        push!(body.args, :($total_lhs = $(GlobalRef(Base, :sum))($materialized)))
     body
 end
 

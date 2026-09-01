@@ -1338,13 +1338,26 @@ end
 _tensorized_callee_replacement(callee::Symbol) =
     callee === :vcat ? :_tensorized_vcat :
     callee === :hcat ? :_tensorized_hcat :
-    callee === :cat ? :_tensorized_cat : nothing
+    callee === :cat ? :_tensorized_cat :
+    callee === :eachcol ? :_tensorized_eachcol :
+    callee === :getindex ? :_tensorized_getindex : nothing
+_tensorized_callee_replacement(callee::GlobalRef) =
+    callee.mod === Base && callee.name === :eachcol ? :_tensorized_eachcol :
+    callee.mod === Base && callee.name === :getindex ? :_tensorized_getindex :
+    nothing
 _tensorized_callee_replacement(callee) = nothing
 
 function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}())
     ex isa Expr || return ex
     ex.head in (:quote, :inert) && return ex
-    if ex.head === :if && length(ex.args) == 3
+    if ex.head === :(=) || ex.head === Symbol(".=") ||
+       (ex.head isa Symbol && _kernel_compound_base_op(ex.head) !== nothing)
+        # Mutation targets are syntax, not values: rewriting `a[i] += rhs` as
+        # `_tensorized_getindex(a, i) += rhs` produces an invalid assignment
+        # location. Preserve the target and tensorize only evaluated RHS terms.
+        return Expr(ex.head, ex.args[1],
+                    (_kernel_tensorized_rhs(arg, known) for arg in ex.args[2:end])...)
+    elseif ex.head === :if && length(ex.args) == 3
         # `broadcast(ifelse, ...)` is the common scalar/tensor select.  It is
         # still scalar for scalar branches, while a traced scalar predicate is
         # broadcast across array branches (Reactant deliberately has no
@@ -1362,8 +1375,11 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}())
                     GlobalRef(Base, :ifelse),
                     _kernel_tensorized_rhs(ex.args[1], known), true,
                     _kernel_tensorized_rhs(ex.args[2], known))
+    elseif ex.head === :ref
+        return Expr(:call, GlobalRef(@__MODULE__, :_tensorized_getindex),
+                    (_kernel_tensorized_rhs(arg, known) for arg in ex.args)...)
     elseif ex.head === :call && !isempty(ex.args) &&
-           ex.args[1] isa Symbol && !(ex.args[1] in known)
+           (!(ex.args[1] isa Symbol) || !(ex.args[1] in known))
         replacement = _tensorized_callee_replacement(ex.args[1])
         replacement === nothing || return Expr(:call,
             GlobalRef(@__MODULE__, replacement),
@@ -1400,6 +1416,7 @@ function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
             return generated_spec === nothing ? callee : generated_spec
         end
         if callee isa Symbol && !callee_is_port && !_is_broadcast_operator(callee) &&
+           (!tensorize || _tensorized_callee_replacement(callee) === nothing) &&
            length(args) == length(deps) &&
            all(i -> args[i] === deps[i], eachindex(args))
             return callee                                   # BARE exact identity — stays raw (validated)
