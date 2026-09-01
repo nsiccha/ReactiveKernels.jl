@@ -154,7 +154,7 @@ rk_reactant_ad_supported = false
 [pins]
 ad_receipt_path = "benchmark/receipts/eight-schools-ad-v1.toml"
 ad_receipt_reactivekernels_sha = "95c893a9af4a952fb7af7471a504b791871f9d58"
-ad_receipt_sha256 = "fa720924422523249d70b2a81b9e73064da5f4091be398e0522c546228dfd0e6"
+ad_receipt_sha256 = "1c7297c57ef7c6d93da23da91375445c208d1eeef84c70c5efb70262f39abdb3"
 differentiationinterface_version = "0.7.21"
 enzyme_version = "0.13.199"
 julia_version = "1.10.11"

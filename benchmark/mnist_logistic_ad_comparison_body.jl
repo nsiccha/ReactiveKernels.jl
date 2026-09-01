@@ -162,13 +162,13 @@ function _verified_comparator_source_pin(root, relative_path)
     published, text = published_source_pin(
         root, MNIST_COMPARATOR_PUBLISHED_SHA, relative_path)
     guard = "get(ENV, \"RK_MNIST_DEFINITIONS_ONLY\", \"\") == \"1\" || run_comparison()\n"
-    expected = replace(text, r"run_comparison\(\)\n$" => guard)
-    normalized_read(joinpath(root, relative_path)) == expected || error(
+    current = normalized_read(joinpath(root, relative_path))
+    comparator_source_matches_current_delta(current, text, guard) || error(
         "MNIST comparator differs from its published authority by more than " *
-        "the terminal definition-only guard")
+        COMPARATOR_SOURCE_CURRENT_DELTA)
     merge(published, Dict(
         "current" => source_pin(root, relative_path),
-        "current_delta" => "terminal definition-only include guard only",
+        "current_delta" => COMPARATOR_SOURCE_CURRENT_DELTA,
     ))
 end
 

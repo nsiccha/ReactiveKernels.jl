@@ -83,7 +83,7 @@ function validate_eight_schools_ad_receipt(path::AbstractString;
     end
     comparator = get(pins, "primal_comparator_source", Dict{String,Any}())
     require(get(comparator, "current_delta", "") ==
-            "terminal definition-only include guard only",
+            "documentation-only baseline markers plus terminal definition-only include guard",
             "comparator reuse delta is not narrowly attested")
 
     protocol = receipt["protocol"]
