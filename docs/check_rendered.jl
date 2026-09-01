@@ -394,6 +394,8 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
             "packages/ReactiveKernelsPPLExamples/src/eight_schools.jl",
         ),
         "mnist-reactant.md" => (
+            "Packed full joint:",
+            "Packed full-joint value-and-gradient:",
             "Native RK / Reactant steady-state matrix",
             "Setup, compilation, and first-call costs",
             "Native RK AD / Reactant-compiled AD steady-state matrix",

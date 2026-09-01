@@ -15,11 +15,12 @@ const EXPECTED_MNIST_REACTANT_AD_NATIVE = Set((
     ("packed_unconstrained", "likelihood"),
 ))
 # Cells the published receipt must show compiling through Reactant-compiled AD.
-# A compiled gradient needs the primal kernel to compile, and the joint and
-# likelihood primals currently stop at the plate-over-eachcol + traced-index
-# gather frontier; extend this set when that upstream capability lands.
+# These are exactly the scalar cells supported by the matched native AD receipt;
+# canonical eachcol/gather lowering makes all three mandatory.
 const EXPECTED_MNIST_REACTANT_AD_COMPILED = (
+    ("packed_unconstrained", "joint"),
     ("packed_unconstrained", "prior"),
+    ("packed_unconstrained", "likelihood"),
 )
 
 _mnist_reactant_ad_median(values) = Statistics.median(Float64.(values))
@@ -117,6 +118,15 @@ function validate_mnist_reactant_ad_receipt(
     require(get(protocol, "rk_reactant_ad_surface", "") ==
             "prepare_ad + compile_ad_value_and_gradient",
             "receipt must consume the first-class Reactant-compiled AD verb")
+    require(get(protocol, "partial_evaluation_enabled", false) == true,
+            "benchmark must enable preparation-time partial evaluation")
+    require(Tuple(get(protocol, "bound_ports", String[])) ==
+            ("X", "y", "num_classes"),
+            "benchmark must bind the complete dataset boundary")
+    require(get(protocol, "native_and_reactant_use_same_bound_kernel", false) == true,
+            "native and Reactant AD timings must share one bound kernel")
+    require(get(protocol, "bound_values_in_timed_region", true) == false,
+            "bound data setup must stay outside steady-state timing")
     require(Int(get(protocol, "rounds", 0)) >= 10,
             "published receipt must contain at least ten raw rounds")
     require(Int(get(protocol, "samples_per_round", 0)) >= 1,
@@ -235,10 +245,8 @@ function validate_mnist_reactant_ad_receipt(
                     "$boundary / $outcome unsupported without a diagnostic")
         end
     end
-    for (boundary, outcome) in EXPECTED_MNIST_REACTANT_AD_COMPILED
-        require((boundary, outcome) in supported_reactant,
-                "$boundary / $outcome must compile through Reactant-compiled AD")
-    end
+    require(supported_reactant == Set(EXPECTED_MNIST_REACTANT_AD_COMPILED),
+            "all native scalar AD cells must compile through Reactant")
     errors
 end
 

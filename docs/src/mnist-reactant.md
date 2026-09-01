@@ -18,15 +18,16 @@ pointwise likelihood as requested outputs, on the full 60000-image MNIST
 training split. Every cell is evaluated natively and attempted through
 Reactant.
 
-Unsupported compiler cells stay in the table with their actual diagnostic.
-They are not silently omitted, replaced with a different HAVE boundary, or
-timed through host fallback. That distinction matters: the table describes
-which views of this one graph compile today as well as how the compiled views
-perform. On the current receipt the likelihood-bearing cells do not compile:
-the per-observation likelihood plate over `eachcol(logits)` with the observed
-class index stops at the compiler's scalar-indexing/gather frontier (the
-model's earlier constant reference-row `vcat` blocker is fixed), so their rows
-carry that diagnostic while the capability lands upstream.
+The full dataset is fixed at preparation with
+`bound = (; X, y, num_classes)`. ReactiveKernels runs the data-only prefix once
+and returns kernels whose steady-state calls receive only the packed vector or
+structured `(W, b)` parameters. Native and Reactant measurements use those same
+bound kernels, so the comparison excludes avoidable per-call data setup.
+
+All eight primal cells now compile. In particular, the packed unconstrained
+full joint is no longer a prior-only proxy: the exact authored likelihood plate
+over `eachcol(logits)` and its independently varying observed-class gathers run
+inside Reactant, with no host fallback or Reactant-only model rewrite.
 
 ## Primal performance and support
 
@@ -62,12 +63,12 @@ the value and gradient of each scalar output with respect to the packed
 coefficient vector. Non-scalar `pointwise` outputs and the two-active-port
 structured `(W, b)` boundary stay unsupported, exactly as on the AD receipt.
 
-A Reactant-compiled gradient exists only where the primal kernel itself
-compiles through Reactant, so the compiled cells are a subset of the native-AD
-cells: the packed joint and likelihood — whose primals stop at the
-plate/gather frontier above — keep native AD but no Reactant gradient. As with
-the primal table, AD preparation, host transfers, gradient compilation, the
-first synchronous call, and readback are excluded from the steady-state timing
+All three scalar cells supported by the native AD receipt now compile through
+Reactant: packed joint, prior, and likelihood value-and-gradient. The full
+joint is the headline comparison; the prior remains visible only as the small
+compiler-overhead control. As with the primal table, AD preparation (including
+data binding and partial evaluation), host transfers, gradient compilation,
+the first synchronous call, and readback are excluded from steady-state timing
 and reported separately.
 
 ## Reproduce

@@ -2376,6 +2376,11 @@ function render_mnist_reactant_benchmark()
         error("MNIST Reactant receipt is not synchronous")
     get(protocol, "gradients_included", true) &&
         error("MNIST Reactant receipt unexpectedly contains gradients")
+    get(protocol, "partial_evaluation_enabled", false) ||
+        error("MNIST Reactant receipt does not enable partial evaluation")
+    Tuple(String.(get(protocol, "bound_ports", String[]))) ==
+        ("X", "y", "num_classes") ||
+        error("MNIST Reactant receipt does not bind the dataset boundary")
     Tuple(String.(protocol["input_boundaries"])) == _MNIST_LOGISTIC_BOUNDARIES ||
         error("unexpected MNIST input-boundary matrix")
     Tuple(String.(protocol["outcomes"])) == _MNIST_LOGISTIC_OUTCOMES ||
@@ -2406,10 +2411,22 @@ function render_mnist_reactant_benchmark()
     measured = filter(row -> row.reactant_ns !== missing, rows)
     ratios = Float64[row.relative_time for row in measured]
     unsupported = count(row -> row.reactant_ns === missing, rows)
+    packed_joint = only(filter(rows) do row
+        row.boundary == "Packed unconstrained" && row.outcome == "joint"
+    end)
+    packed_joint.reactant_ns === missing &&
+        error("MNIST packed full joint is not compiled in the receipt")
+    joint_speedup = packed_joint.native_ns / packed_joint.reactant_ns
+    joint_comparison = joint_speedup >= 1 ?
+        "$(round(joint_speedup; digits = 2))× faster" :
+        "$(round(inv(joint_speedup); digits = 2))× native time"
     summary = isempty(ratios) ?
         "No Reactant matrix cell compiled in this receipt." :
-        "Reactant compiled $(length(measured)) of the 8 primal matrix cells; " *
-        "$unsupported retain their compiler diagnostics. Across compiled cells, " *
+        "Packed full joint: Reactant $(_fmt_ns(packed_joint.reactant_ns)) " *
+        "versus native RK $(_fmt_ns(packed_joint.native_ns)) " *
+        "($joint_comparison). Reactant compiled $(length(measured)) of the 8 " *
+        "primal matrix cells; $unsupported retain compiler diagnostics. " *
+        "Across compiled cells, " *
         "steady-state Reactant/native time ranges from " *
         "$(round(minimum(ratios); digits = 2))× to " *
         "$(round(maximum(ratios); digits = 2))× on this CPU receipt."
@@ -2485,7 +2502,7 @@ function render_mnist_reactant_benchmark()
         Markdown.Paragraph(Any[summary]),
         _result_table(rows, timing_columns; id = "mnist-reactant-matrix",
             title = "Native RK / Reactant steady-state matrix",
-            note = "Every row is one cell of the matched 2×4 primal matrix; each measured cell is the minimum of per-round BenchmarkTools minimums. Unsupported cells remain visible with their recorded diagnostic."),
+            note = "Every row is one cell of the matched 2×4 primal matrix, using the same preparation-time-bound dataset; each measured cell is the minimum of per-round BenchmarkTools minimums. Unsupported cells remain visible with their recorded diagnostic."),
         Markdown.Paragraph(Any[setup_summary]),
         _result_table(setup_rows, setup_columns;
             id = "mnist-reactant-setup",
@@ -2514,6 +2531,11 @@ function render_mnist_reactant_ad_benchmark()
     get(protocol, "rk_reactant_ad_surface", "") ==
         "prepare_ad + compile_ad_value_and_gradient" ||
         error("MNIST Reactant-AD receipt does not consume the first-class verb")
+    get(protocol, "partial_evaluation_enabled", false) ||
+        error("MNIST Reactant-AD receipt does not enable partial evaluation")
+    Tuple(String.(get(protocol, "bound_ports", String[]))) ==
+        ("X", "y", "num_classes") ||
+        error("MNIST Reactant-AD receipt does not bind the dataset boundary")
     Tuple(String.(protocol["input_boundaries"])) == _MNIST_LOGISTIC_BOUNDARIES ||
         error("unexpected MNIST AD input-boundary matrix")
     Tuple(String.(protocol["outcomes"])) == _MNIST_LOGISTIC_OUTCOMES ||
@@ -2547,11 +2569,23 @@ function render_mnist_reactant_ad_benchmark()
     ratios = Float64[row.relative_time for row in measured]
     frontier = count(row -> row.native_ns !== missing &&
         row.reactant_ns === missing, rows)
+    packed_joint = only(filter(rows) do row
+        row.boundary == "Packed unconstrained" && row.outcome == "joint"
+    end)
+    packed_joint.reactant_ns === missing &&
+        error("MNIST packed full-joint AD is not compiled in the receipt")
+    joint_speedup = packed_joint.native_ns / packed_joint.reactant_ns
+    joint_comparison = joint_speedup >= 1 ?
+        "$(round(joint_speedup; digits = 2))× faster" :
+        "$(round(inv(joint_speedup); digits = 2))× native time"
     summary = isempty(ratios) ?
         "No Reactant-compiled gradient cell compiled in this receipt." :
+        "Packed full-joint value-and-gradient: Reactant " *
+        "$(_fmt_ns(packed_joint.reactant_ns)) versus native RK AD " *
+        "$(_fmt_ns(packed_joint.native_ns)) ($joint_comparison). " *
         "Reactant-compiled AD covers $(length(measured)) of the 3 native-AD " *
-        "scalar cells; $frontier keep native AD but no compiled gradient " *
-        "(their primals stop at the compiler frontier). Across compiled " *
+        "scalar cells; $frontier keep native AD but no compiled gradient. " *
+        "Across compiled " *
         "cells, steady-state Reactant/native value-and-gradient time ranges " *
         "from $(round(minimum(ratios); digits = 2))× to " *
         "$(round(maximum(ratios); digits = 2))× on this CPU receipt."
@@ -2634,7 +2668,7 @@ function render_mnist_reactant_ad_benchmark()
         Markdown.Paragraph(Any[summary]),
         _result_table(rows, timing_columns; id = "mnist-reactant-ad-matrix",
             title = "Native RK AD / Reactant-compiled AD steady-state matrix",
-            note = "Value-and-gradient per differentiable scalar cell; each measured cell is the minimum of per-round BenchmarkTools minimums. Non-scalar (pointwise) and two-active-port structured cells stay unsupported with their recorded reason; native-AD cells whose primal cannot compile through Reactant keep their compiler diagnostic."),
+            note = "Value-and-gradient per differentiable scalar cell, using the same preparation-time-bound dataset; each measured cell is the minimum of per-round BenchmarkTools minimums. Non-scalar (pointwise) and two-active-port structured cells stay unsupported with their recorded reason."),
         Markdown.Paragraph(Any[setup_summary]),
         _result_table(setup_rows, setup_columns;
             id = "mnist-reactant-ad-setup",
