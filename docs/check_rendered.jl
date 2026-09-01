@@ -285,6 +285,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "dugongs-growth.md" => 1,
         "arma11.md" => 1,
         "gaussian-mixture.md" => 1,
+        "mnist-logistic.md" => 1,
         "online-stats.md" => 1,
     )
     expected_source_examples = Dict(
@@ -302,6 +303,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "eight-schools.md" => 1,
         "eight-schools-reactant.md" => 2,
         "eval-throughput.md" => 1,
+        "mnist-logistic.md" => 1,
         "nuts.md" => 3,
     )
     expected_aov_panels = Dict(
