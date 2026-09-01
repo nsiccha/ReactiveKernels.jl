@@ -36,10 +36,30 @@ end
     @test !occursin("JULIA_PKG_PRECOMPILE_AUTO", package_matrix)
     @test !occursin("JULIA_PKG_PRECOMPILE_AUTO", workflow)
     @test !occursin("JULIA_DEPOT_PATH", workflow)
-    @test occursin("timeout-minutes: 180", package_matrix)
-    @test occursin("julia-version: ['lts', '1', 'pre']", package_matrix)
-    @test occursin("julia-arch: [x64]", package_matrix)
-    @test occursin("os: [ubuntu-latest, windows-latest, macOS-latest]", package_matrix)
+    @test occursin("timeout-minutes: 90", package_matrix)
+
+    matrix_rows = Set(
+        replace(strip(line), r"^- " => "")
+        for line in split(package_matrix, '\n')
+        if occursin("{ julia-version:", line)
+    )
+    expected_rows = Set{String}()
+    for version in ("lts", "1", "pre")
+        for os in ("ubuntu-latest", "windows-latest", "macOS-latest")
+            push!(expected_rows,
+                "{ julia-version: '$version', julia-arch: x64, " *
+                "os: $os, test-shard: core }")
+        end
+    end
+    for shard in (
+            "acceptance-compiler", "acceptance-runtime",
+            "acceptance-samplers", "acceptance-benchmarks")
+        push!(expected_rows,
+            "{ julia-version: 'lts', julia-arch: x64, " *
+            "os: ubuntu-latest, test-shard: $shard }")
+    end
+    @test matrix_rows == expected_rows
+    @test length(matrix_rows) == 13
     @test occursin("uses: julia-actions/cache", package_matrix)
     @test !occursin(r"compiled_modules:\s*no", workflow)
     @test !occursin("cache-compiled: false", workflow)

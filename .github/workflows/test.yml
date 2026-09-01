@@ -13,21 +13,32 @@ jobs:
   test:
     name: test (${{ matrix.julia-version }}, ${{ matrix.julia-arch }}, ${{ matrix.os }}, ${{ matrix.test-shard }})
     runs-on: ${{ matrix.os }}
-    # Current/pre make sustained progress through the compiler-heavy HMC
-    # acceptance beyond 90 minutes on hosted runners; keep a bounded margin.
-    timeout-minutes: 180
+    # Core compatibility tops out near 65 minutes on the slowest current
+    # Windows lane. Keep a bounded margin without letting a silent test consume
+    # a hosted runner for three hours.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        julia-version: ['lts', '1', 'pre']
-        julia-arch: [x64]
-        os: [ubuntu-latest, windows-latest, macOS-latest]
-        # Each Julia/OS cell runs five disjoint partitions. Their concatenation
-        # is the ordinary full-suite file order in test/runtests.jl, so the
-        # critical path is shorter without dropping cross-platform assertions.
-        # Keep the Pkg-loading receipt checks in a fresh process rather than
-        # loading them after the compiler-heavy sampler tail.
-        test-shard: [core, acceptance-compiler, acceptance-runtime, acceptance-samplers, acceptance-benchmarks]
+        include:
+          # Core owns supported Julia/OS compatibility.
+          - { julia-version: 'lts', julia-arch: x64, os: ubuntu-latest, test-shard: core }
+          - { julia-version: 'lts', julia-arch: x64, os: windows-latest, test-shard: core }
+          - { julia-version: 'lts', julia-arch: x64, os: macOS-latest, test-shard: core }
+          - { julia-version: '1', julia-arch: x64, os: ubuntu-latest, test-shard: core }
+          - { julia-version: '1', julia-arch: x64, os: windows-latest, test-shard: core }
+          - { julia-version: '1', julia-arch: x64, os: macOS-latest, test-shard: core }
+          - { julia-version: 'pre', julia-arch: x64, os: ubuntu-latest, test-shard: core }
+          - { julia-version: 'pre', julia-arch: x64, os: windows-latest, test-shard: core }
+          - { julia-version: 'pre', julia-arch: x64, os: macOS-latest, test-shard: core }
+
+          # Acceptance asserts platform-independent semantics once. Repeating
+          # these compiler/runtime/sampler/benchmark suites on every supported
+          # Julia/OS cell spent 36 runners proving the same contract.
+          - { julia-version: 'lts', julia-arch: x64, os: ubuntu-latest, test-shard: acceptance-compiler }
+          - { julia-version: 'lts', julia-arch: x64, os: ubuntu-latest, test-shard: acceptance-runtime }
+          - { julia-version: 'lts', julia-arch: x64, os: ubuntu-latest, test-shard: acceptance-samplers }
+          - { julia-version: 'lts', julia-arch: x64, os: ubuntu-latest, test-shard: acceptance-benchmarks }
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
