@@ -16,6 +16,8 @@ const EXPECTED_EIGHT_SCHOOLS_AD_SUPPORTED = Set((
 ))
 
 _eight_schools_ad_median(values) = Statistics.median(Float64.(values))
+_eight_schools_ad_text_sha256(path) = bytes2hex(SHA.sha256(
+    replace(read(path, String), "\r\n" => "\n", "\r" => "\n")))
 
 function validate_eight_schools_ad_receipt(path::AbstractString;
         root::AbstractString = normpath(joinpath(dirname(path), "..", "..")))
@@ -45,7 +47,7 @@ function validate_eight_schools_ad_receipt(path::AbstractString;
         require(get(primal, "schema", "") == "eight-schools-primal-v1",
                 "matched receipt must be eight-schools-primal-v1")
         require(get(pins, "primal_receipt_sha256", "") ==
-                bytes2hex(SHA.sha256(read(primal_path))),
+                _eight_schools_ad_text_sha256(primal_path),
                 "matched primal receipt digest mismatch")
         haskey(primal, "pins") && require(
             get(pins, "primal_receipt_reactivekernels_sha", "") ==
@@ -76,7 +78,7 @@ function validate_eight_schools_ad_receipt(path::AbstractString;
         require(isfile(absolute_path), "$key current source is missing")
         isfile(absolute_path) && require(
             get(current, "text_sha256", "") ==
-            bytes2hex(SHA.sha256(read(absolute_path))),
+            _eight_schools_ad_text_sha256(absolute_path),
             "$key current text digest mismatch")
     end
     comparator = get(pins, "primal_comparator_source", Dict{String,Any}())

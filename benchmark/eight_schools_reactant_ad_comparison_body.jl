@@ -36,6 +36,9 @@ const EIGHT_SCHOOLS_AD_SCALAR_SUPPORTED = Set((
     ("packed_unconstrained", "likelihood"),
     ("minimal_likelihood", "likelihood"),
 ))
+
+_eight_schools_reactant_ad_generator_sha256(path) = bytes2hex(sha256(
+    replace(read(path, String), "\r\n" => "\n", "\r" => "\n")))
 const AD_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 
 _git(repo, args...) = readchomp(Cmd(["git", "-C", repo, string.(args)...]))
@@ -302,7 +305,8 @@ function run_comparison()
             "source_text_sha256" => bytes2hex(sha256(EIGHT_SCHOOLS_SOURCE)),
             "ad_receipt_path" =>
                 "benchmark/receipts/eight-schools-ad-v1.toml",
-            "ad_receipt_sha256" => bytes2hex(sha256(read(ad_path))),
+            "ad_receipt_sha256" =>
+                _eight_schools_reactant_ad_generator_sha256(ad_path),
             "ad_receipt_reactivekernels_sha" =>
                 ad_receipt["pins"]["reactivekernels_sha"],
         ),
