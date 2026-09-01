@@ -1,6 +1,10 @@
 # Bijectors and constrained parameters
 
 ```@eval
+Main.ReactiveKernelsDocs.render_review_status(:frozen_bijectors)
+```
+
+```@eval
 Main.ReactiveKernelsDocs.render_result_assets()
 ```
 

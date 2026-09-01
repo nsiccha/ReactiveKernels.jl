@@ -1,6 +1,10 @@
 # Adaptive NUTS through Reactant: static receipt
 
 ```@eval
+Main.ReactiveKernelsDocs.render_review_status(:frozen_sampling)
+```
+
+```@eval
 Main.ReactiveKernelsDocs.render_result_assets()
 ```
 

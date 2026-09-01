@@ -1,5 +1,9 @@
 # Declarative PPL kernel: beta-binomial
 
+```@eval
+Main.ReactiveKernelsDocs.render_review_status(:frozen_ppl)
+```
+
 `ReactiveKernels` has no built-in probabilistic-programming semantics. Like the
 [eight-schools example](eight-schools.md), this one assembles those semantics
 manually from ordinary pure Julia recipes, while leaving the graph planner

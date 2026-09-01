@@ -1,5 +1,9 @@
 # Declarative PPL kernel: ARMA(1, 1) time series
 
+```@eval
+Main.ReactiveKernelsDocs.render_review_status(:frozen_ppl)
+```
+
 This example ports the `arma11` model from
 [posteriordb](https://github.com/stan-dev/posteriordb) (posterior `arma-arma11`)
 into the same declarative-`@kernel` style as the

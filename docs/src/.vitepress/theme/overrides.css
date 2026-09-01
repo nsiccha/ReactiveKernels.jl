@@ -5,6 +5,93 @@
   display: none;
 }
 
+.rk-review-state {
+  --rk-review-accent: #3977d4;
+  --rk-review-tint: rgb(57 119 212 / 0.1);
+  display: grid;
+  grid-template-columns: 2.75rem minmax(0, 1fr);
+  gap: 0.9rem;
+  margin: 1.1rem 0 1.6rem;
+  padding: 1rem 1.1rem;
+  border: 1px solid color-mix(in srgb, var(--rk-review-accent) 45%, var(--vp-c-divider));
+  border-left: 4px solid var(--rk-review-accent);
+  border-radius: 10px;
+  background: linear-gradient(135deg, var(--rk-review-tint), var(--vp-c-bg-soft) 72%);
+}
+
+.rk-review-state--review-pending {
+  --rk-review-accent: #b46b00;
+  --rk-review-tint: rgb(180 107 0 / 0.1);
+}
+
+.dark .rk-review-state--frozen {
+  --rk-review-accent: #70a7ff;
+  --rk-review-tint: rgb(112 167 255 / 0.12);
+}
+
+.dark .rk-review-state--review-pending {
+  --rk-review-accent: #e9a83d;
+  --rk-review-tint: rgb(233 168 61 / 0.12);
+}
+
+.rk-review-state__icon {
+  display: grid;
+  width: 2.5rem;
+  height: 2.5rem;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--rk-review-accent) 55%, transparent);
+  border-radius: 999px;
+  background: var(--vp-c-bg);
+  color: var(--rk-review-accent);
+  font-size: 1.25rem;
+  line-height: 1;
+}
+
+.rk-review-state__heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem 0.65rem;
+  margin-bottom: 0.35rem;
+}
+
+.rk-review-state__badge {
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  background: var(--rk-review-accent);
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 750;
+  letter-spacing: 0.035em;
+  line-height: 1.4;
+  text-transform: uppercase;
+}
+
+.rk-review-state__eyebrow {
+  color: var(--vp-c-text-2);
+  font-size: 0.78rem;
+  font-weight: 650;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.rk-review-state__title {
+  display: block;
+  color: var(--vp-c-text-1);
+  font-size: 1rem;
+}
+
+.rk-review-state__content p {
+  margin: 0.35rem 0 0;
+  color: var(--vp-c-text-2);
+}
+
+@media (max-width: 520px) {
+  .rk-review-state {
+    grid-template-columns: 1fr;
+  }
+}
+
 .rk-aov-panel,
 .rk-result-table-section {
   margin: 1.5rem 0;

@@ -1,5 +1,9 @@
 # Nutpie diagonal metric adaptation
 
+```@eval
+Main.ReactiveKernelsDocs.render_review_status(:frozen_sampling)
+```
+
 This page is an external compiler corpus derived from Adrian Seyboldt's
 [`nuts-rs`](https://github.com/pymc-devs/nuts-rs/tree/97be9ab88cfaadfafd9e5f4409a3b1d5af62805a)
 diagonal adaptation at revision

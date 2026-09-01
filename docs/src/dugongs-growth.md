@@ -1,5 +1,9 @@
 # Declarative PPL kernel: dugongs (nonlinear growth)
 
+```@eval
+Main.ReactiveKernelsDocs.render_review_status(:frozen_ppl)
+```
+
 This example ports the `dugongs` model from
 [posteriordb](https://github.com/stan-dev/posteriordb) (posterior
 `dugongs_data-dugongs_model`) into the same declarative-`@kernel` style as the
