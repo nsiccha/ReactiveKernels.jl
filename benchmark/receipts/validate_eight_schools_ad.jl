@@ -12,7 +12,12 @@ const EXPECTED_EIGHT_SCHOOLS_AD_SUPPORTED = Set((
     ("packed_unconstrained", "joint"),
     ("packed_unconstrained", "prior"),
     ("packed_unconstrained", "likelihood"),
+    ("packed_unconstrained", "pointwise"),
+    ("constrained_parameters", "joint"),
+    ("constrained_parameters", "prior"),
+    ("constrained_parameters", "likelihood"),
     ("minimal_likelihood", "likelihood"),
+    ("minimal_likelihood", "pointwise"),
 ))
 
 _eight_schools_ad_median(values) = Statistics.median(Float64.(values))
@@ -99,7 +104,10 @@ function validate_eight_schools_ad_receipt(path::AbstractString;
             "benchmark/receipts/eight-schools-primal-v1.toml",
             "benchmark must name the published primal matrix")
     require(get(protocol, "pointwise_jacobian_or_vjp_invented", true) == false,
-            "pointwise must remain unsupported without a matched public contract")
+            "pointwise VJP must use the public contract, not a benchmark-only surrogate")
+    require(occursin("public prepared reverse pullbacks",
+                     get(protocol, "pointwise_vjp_contract", "")),
+            "pointwise VJP contract is missing")
     require(get(protocol, "preparation_in_timed_region", true) == false,
             "preparation must remain outside steady-state timing")
     require(get(protocol, "first_execution_in_steady_state_region", true) == false,
@@ -140,7 +148,9 @@ function validate_eight_schools_ad_receipt(path::AbstractString;
             continue
         end
         push!(supported, (boundary, outcome))
-        expected_active = boundary == "minimal_likelihood" ? "θ" : "unconstrained"
+        expected_active = boundary == "minimal_likelihood" ? "θ" :
+            boundary == "constrained_parameters" ? "parameters" :
+            "unconstrained"
         expected_length = boundary == "minimal_likelihood" ? 8 : 10
         require(get(row, "active_port", "") == expected_active,
                 "$boundary / $outcome active port mismatch")
@@ -148,7 +158,8 @@ function validate_eight_schools_ad_receipt(path::AbstractString;
                 expected_length,
                 "$boundary / $outcome finite-difference oracle length mismatch")
 
-        implementations = boundary == "packed_unconstrained" ?
+        implementations = boundary == "packed_unconstrained" &&
+                          outcome != "pointwise" ?
             ("rk_native", "manual_enzyme", "turing_enzyme") :
             ("rk_native", "manual_enzyme")
         for implementation in implementations
@@ -194,19 +205,20 @@ function validate_eight_schools_ad_receipt(path::AbstractString;
                     "$boundary / $outcome $implementation exceeds parity tolerance")
             require(Float64(get(result, "value_abs_error", Inf)) <= 1e-11,
                     "$boundary / $outcome $implementation value parity failed")
-            caller_owned = implementation != "turing_enzyme"
+            caller_owned = implementation != "turing_enzyme" &&
+                boundary != "constrained_parameters"
             require(get(result, "caller_owned_gradient", !caller_owned) == caller_owned,
                     "$boundary / $outcome $implementation ownership mismatch")
-            if caller_owned
+            if caller_owned && outcome != "pointwise"
                 require(all(==(0), bytes) && all(==(0), allocs),
                         "$boundary / $outcome $implementation must remain zero-allocation")
             end
         end
-        if boundary == "minimal_likelihood"
+        if boundary != "packed_unconstrained" || outcome == "pointwise"
             require(get(row, "turing_supported", true) == false,
-                    "minimal likelihood must not fabricate a Turing comparison")
+                    "$boundary / $outcome must not fabricate a Turing comparison")
             require(!isempty(get(row, "turing_unsupported_reason", "")),
-                    "minimal likelihood needs a Turing unsupported reason")
+                    "$boundary / $outcome needs a Turing unsupported reason")
         end
     end
     require(supported == EXPECTED_EIGHT_SCHOOLS_AD_SUPPORTED,
@@ -218,7 +230,7 @@ function main(path)
     errors = validate_eight_schools_ad_receipt(path)
     if isempty(errors)
         println("VALIDATE OK — eight-schools-ad-v1: exact 3×4 matrix, " *
-                "four scalar gradients, zero-allocation RK paths")
+                "structured gradients and pointwise reverse pullbacks")
         return 0
     end
     foreach(println, errors)

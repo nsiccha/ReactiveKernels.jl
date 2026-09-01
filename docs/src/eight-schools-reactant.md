@@ -56,20 +56,21 @@ first-class RK verb `compile_ad_value_and_gradient` (the AD companion of the
 primal `@compile` path) — no gradient is hand-rolled — and reuses the exact
 differentiable outcome/boundary protocol published on the
 [automatic-differentiation page](automatic-differentiation.md)
-([`eight-schools-ad-v1`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/eight-schools-ad-v1.toml)):
-the value and gradient of each scalar output with respect to a single active
-port (the packed unconstrained vector, or `θ`). Non-scalar `pointwise` outputs,
-the constrained parameter `NamedTuple`, and the undefined minimal joint/prior
-stay unsupported, exactly as on the AD page.
+([`eight-schools-ad-v1`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/eight-schools-ad-v1.toml)).
+The native side therefore measures seven scalar value-and-gradient cells and
+two fixed-cotangent pointwise value-and-pullback cells, including the supported
+constrained-parameter `NamedTuple` gradients. The constrained-parameter ×
+pointwise cross-product and the undefined minimal joint/prior remain unsupported
+with the same reasons as the native AD page.
 
-A Reactant-compiled gradient exists only where the primal kernel itself compiles
-through Reactant, so the compiled cells are a subset of the native-AD cells: the
-packed joint and prior — which fail the primal Reactant path with "Scalar
-indexing is disallowed." — keep native AD but no Reactant gradient. Every
-compiled cell matches the native RK reverse pass bit-for-bit (gradient and value
-max-abs-error 0). As with the primal table, AD preparation, host transfers,
-gradient compilation, the first synchronous call, and readback are excluded from
-the steady-state timing and reported separately.
+The public Reactant-compiled surface remains deliberately narrower. This receipt
+uses `compile_ad_value_and_gradient` only for array-backed scalar gradients; it
+does not claim a compiled pullback verb or compiled structured-active argument
+contract. Packed joint and prior still retain their real primal compiler
+diagnostics, while every compiled likelihood cell is checked against its native
+RK reverse pass. As with the primal table, AD preparation, host transfers,
+gradient compilation, the first synchronous call, and readback are excluded
+from the steady-state timing and reported separately.
 
 For the exact model graph see the [Eight Schools kernel page](eight-schools.md);
 for native-AD (non-Reactant) timing see the

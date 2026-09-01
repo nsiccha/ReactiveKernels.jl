@@ -151,6 +151,87 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
         ) ≈ 4.0
     end
 
+    @testset "structured active storage and prepared reverse pullbacks" begin
+        parameter_type = NamedTuple{
+            (:location, :effects),Tuple{Float64,Vector{Float64}}}
+        graph = Graph()
+        parameters = value!(graph, :parameters, parameter_type)
+        scale = value!(graph, :scale, Float64)
+        objective = value!(graph, :objective, Float64)
+        add!(graph, (parameters, scale) => objective,
+             (p, s) -> p.location^2 + s * sum(abs2, p.effects))
+        structured = prepare(
+            graph; have = (parameters, scale), want = objective)
+
+        point = (; location = 1.5, effects = [0.25, -0.5, 0.75])
+        gradient = ad_gradient(
+            structured, TEST_AD_BACKEND, point, 2.0;
+            active = :parameters)
+        @test gradient isa NamedTuple
+        @test keys(gradient) == keys(point)
+        @test gradient.location ≈ 3.0
+        @test gradient.effects ≈ 4 .* point.effects
+
+        prepared_gradient = prepare_ad(
+            structured, TEST_AD_BACKEND, point, 2.0;
+            active = :parameters)
+        changed = (; location = -0.75, effects = [1.0, -2.0, 0.5])
+        changed_gradient = ad_gradient(prepared_gradient, changed, 0.25)
+        @test changed_gradient.location ≈ -1.5
+        @test changed_gradient.effects ≈ 0.5 .* changed.effects
+        changed_value, combined_gradient = ad_value_and_gradient(
+            prepared_gradient, changed, 0.25)
+        @test changed_value ≈
+            changed.location^2 + 0.25 * sum(abs2, changed.effects)
+        @test combined_gradient == changed_gradient
+        @test code_expr(prepared_gradient) === code_expr(structured)
+
+        vector_graph = Graph()
+        x = value!(vector_graph, :x, Vector{Float64})
+        data = value!(vector_graph, :data, Vector{Float64})
+        pointwise = value!(vector_graph, :pointwise, Vector{Float64})
+        add!(vector_graph, (x, data) => pointwise,
+             (q, d) -> q .^ 2 .+ q .* d)
+        vector_kernel = prepare(
+            vector_graph; have = (x, data), want = pointwise)
+        q = [0.2, -0.4, 0.7]
+        observed = [1.5, -0.5, 0.25]
+        seed = [1.0, -2.0, 0.5]
+        expected = seed .* (2 .* q .+ observed)
+
+        @test_throws ArgumentError prepare_ad(
+            vector_kernel, TEST_AD_BACKEND, q, observed; active = :x)
+        @test ad_pullback(
+            vector_kernel, TEST_AD_BACKEND, seed, q, observed;
+            active = :x) ≈ expected
+
+        prepared_pullback = prepare_ad_pullback(
+            vector_kernel, TEST_AD_BACKEND, seed, q, observed;
+            active = :x)
+        @test prepared_pullback isa PreparedADPullback
+        @test inputs(prepared_pullback) == inputs(vector_kernel)
+        @test outputs(prepared_pullback) == outputs(vector_kernel)
+        @test code_expr(prepared_pullback) === code_expr(vector_kernel)
+        @test occursin("active=:x", sprint(show, prepared_pullback))
+        @test occursin("want=:pointwise", sprint(show, prepared_pullback))
+        @test ad_pullback(prepared_pullback, seed, q, observed) ≈ expected
+
+        q2 = [-0.1, 0.8, 0.4]
+        observed2 = [0.3, -1.0, 2.0]
+        seed2 = [-0.5, 1.25, 2.0]
+        value2, pullback2 = ad_value_and_pullback(
+            prepared_pullback, seed2, q2, observed2)
+        @test value2 ≈ q2 .^ 2 .+ q2 .* observed2
+        @test pullback2 ≈ seed2 .* (2 .* q2 .+ observed2)
+
+        destination = fill(NaN, length(q2))
+        value3, returned = ad_value_and_pullback!(
+            prepared_pullback, destination, seed2, q2, observed2)
+        @test value3 ≈ value2
+        @test returned === destination
+        @test destination ≈ pullback2
+    end
+
     @testset "invalid and aliased boundaries fail loudly" begin
         graph = Graph()
         x = value!(graph, :x, Float64)

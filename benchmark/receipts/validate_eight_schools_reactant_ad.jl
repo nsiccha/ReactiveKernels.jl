@@ -8,11 +8,23 @@ const EXPECTED_EIGHT_SCHOOLS_REACTANT_AD_BOUNDARIES = (
     "packed_unconstrained", "constrained_parameters", "minimal_likelihood")
 const EXPECTED_EIGHT_SCHOOLS_REACTANT_AD_OUTCOMES =
     ("joint", "prior", "likelihood", "pointwise")
-# Native RK AD supports the differentiable scalar cells (identical inventory to
-# eight-schools-ad-v1). Reactant-compiled AD is a subset: it additionally needs
-# the primal kernel to compile through Reactant, so packed joint/prior (which
-# fail primal Reactant with "Scalar indexing is disallowed.") are native-only.
+# Native RK AD matches all nine cells in eight-schools-ad-v1: seven scalar
+# gradients plus two fixed-cotangent pointwise pullbacks.
 const EXPECTED_EIGHT_SCHOOLS_REACTANT_AD_NATIVE_SUPPORTED = Set((
+    ("packed_unconstrained", "joint"),
+    ("packed_unconstrained", "prior"),
+    ("packed_unconstrained", "likelihood"),
+    ("packed_unconstrained", "pointwise"),
+    ("constrained_parameters", "joint"),
+    ("constrained_parameters", "prior"),
+    ("constrained_parameters", "likelihood"),
+    ("minimal_likelihood", "likelihood"),
+    ("minimal_likelihood", "pointwise"),
+))
+# Reactant compile attempts remain limited to the public array-backed scalar
+# value-and-gradient surface. Structured gradients and pullbacks are native-only
+# here; the receipt must not manufacture compiled APIs for them.
+const EXPECTED_EIGHT_SCHOOLS_REACTANT_AD_COMPILE_CANDIDATES = Set((
     ("packed_unconstrained", "joint"),
     ("packed_unconstrained", "prior"),
     ("packed_unconstrained", "likelihood"),
@@ -82,8 +94,7 @@ function validate_eight_schools_reactant_ad_receipt(path::AbstractString;
                     get(ad_receipt["pins"], "reactivekernels_sha", ""),
                     "matched AD receipt code pin mismatch")
         end
-        # The AD receipt's supported scalar inventory must equal this benchmark's
-        # native cells, so the two pages differentiate the same cells.
+        # The matched receipt owns the full native reverse-AD inventory.
         ad_supported = Set{Tuple{String,String}}()
         for row in get(ad_receipt, "measurements", Any[])
             get(row, "supported", false) &&
@@ -105,8 +116,13 @@ function validate_eight_schools_reactant_ad_receipt(path::AbstractString;
     require(get(protocol, "matrix_source", "") ==
             "benchmark/receipts/eight-schools-ad-v1.toml",
             "benchmark must name the matched AD receipt")
-    require(get(protocol, "gradient_operation", "") == "value and gradient",
-            "gradient operation must be value and gradient")
+    require(get(protocol, "gradient_operation", "") ==
+            "value and gradient for scalar WANTs; value and reverse pullback for pointwise WANTs",
+            "gradient/pullback operation contract mismatch")
+    require(get(protocol, "compiled_pullback_exposed", true) == false,
+            "receipt must not claim a compiled pullback surface")
+    require(get(protocol, "compiled_structured_active_exposed", true) == false,
+            "receipt must not claim compiled structured active arguments")
     require(Int(get(protocol, "rounds", 0)) >= 20,
             "published receipt must contain at least twenty raw rounds")
     require(Float64(get(protocol, "target_seconds_per_round", 0.0)) > 0,
@@ -126,7 +142,10 @@ function validate_eight_schools_reactant_ad_receipt(path::AbstractString;
     require(get(protocol, "unsupported_cells_recorded", false) == true,
             "unsupported cells must retain diagnostics")
     require(get(protocol, "pointwise_jacobian_or_vjp_invented", true) == false,
-            "pointwise must remain unsupported without a matched public contract")
+            "pointwise VJP must use the public native contract")
+    require(occursin("public prepared reverse pullbacks",
+                     get(protocol, "pointwise_vjp_contract", "")),
+            "pointwise VJP contract is missing")
     parity_atol = Float64(get(protocol, "parity_atol", 0.0))
     require(parity_atol > 0, "parity tolerance must be positive")
 
@@ -164,9 +183,25 @@ function validate_eight_schools_reactant_ad_receipt(path::AbstractString;
             continue
         end
 
-        expected_active = boundary == "minimal_likelihood" ? "θ" : "unconstrained"
+        expected_active = boundary == "minimal_likelihood" ? "θ" :
+            boundary == "constrained_parameters" ? "parameters" : "unconstrained"
+        expected_operation = outcome == "pointwise" ?
+            "value and pullback" : "value and gradient"
+        expected_sensitivity_length = boundary == "minimal_likelihood" ? 8 : 10
         require(get(row, "active_port", "") == expected_active,
                 "$boundary / $outcome active port mismatch")
+        require(get(row, "operation", "") == expected_operation,
+                "$boundary / $outcome operation mismatch")
+        require(Int(get(row, "native_sensitivity_length", 0)) ==
+                expected_sensitivity_length,
+                "$boundary / $outcome native sensitivity length mismatch")
+        if outcome == "pointwise"
+            require(length(get(row, "output_cotangent", Float64[])) == 8,
+                    "$boundary / $outcome output cotangent mismatch")
+        else
+            require(!haskey(row, "output_cotangent"),
+                    "$boundary / $outcome scalar cell has an output cotangent")
+        end
         require(Float64(get(row, "ad_preparation_seconds", -1.0)) >= 0,
                 "$boundary / $outcome AD preparation time missing")
         require(haskey(row, "rk_native_ad"),
@@ -190,17 +225,35 @@ function validate_eight_schools_reactant_ad_receipt(path::AbstractString;
                     "$boundary / $outcome native AD calls_per_round missing")
         end
 
+        compile_candidate =
+            (boundary, outcome) in EXPECTED_EIGHT_SCHOOLS_REACTANT_AD_COMPILE_CANDIDATES
         reactant_ok = get(row, "rk_reactant_ad_supported", false)
+        if !compile_candidate
+            require(reactant_ok == false,
+                    "$boundary / $outcome claims an unexposed compiled AD surface")
+            require(!haskey(row, "rk_reactant_ad"),
+                    "$boundary / $outcome unexposed but has Reactant timing")
+            require(!isempty(get(row, "rk_reactant_ad_error", "")),
+                    "$boundary / $outcome unexposed without a diagnostic")
+            for key in ("reactant_transfer_seconds", "reactant_ad_compile_seconds",
+                        "reactant_first_execution_seconds", "max_abs_error",
+                        "value_abs_error")
+                require(!haskey(row, key),
+                        "$boundary / $outcome unexposed but records $key")
+            end
+            continue
+        end
+
+        require(Float64(get(row, "reactant_ad_compile_seconds", -1.0)) >= 0,
+                "$boundary / $outcome Reactant AD compile attempt missing")
+        require(Float64(get(row, "reactant_transfer_seconds", -1.0)) >= 0,
+                "$boundary / $outcome Reactant AD transfer setup missing")
         if reactant_ok
             push!(reactant_supported, (boundary, outcome))
             require(haskey(row, "rk_reactant_ad"),
                     "$boundary / $outcome supported without a Reactant AD measurement")
             require(!haskey(row, "rk_reactant_ad_error"),
                     "$boundary / $outcome supported but retains an error")
-            require(Float64(get(row, "reactant_ad_compile_seconds", -1.0)) >= 0,
-                    "$boundary / $outcome Reactant AD compile attempt missing")
-            require(Float64(get(row, "reactant_transfer_seconds", -1.0)) >= 0,
-                    "$boundary / $outcome Reactant AD transfer setup missing")
             require(Float64(get(row, "reactant_first_execution_seconds", -1.0)) >= 0,
                     "$boundary / $outcome Reactant AD first execution missing")
             require(Float64(get(row, "max_abs_error", Inf)) <= parity_atol,
@@ -242,7 +295,7 @@ end
 function main(path)
     errors = validate_eight_schools_reactant_ad_receipt(path)
     if isempty(errors)
-        println("VALIDATE OK — eight-schools-reactant-ad-v1: matched 3×4 matrix accepted")
+        println("VALIDATE OK — eight-schools-reactant-ad-v1: matched 3×4 native inventory and honest compiled subset")
         return 0
     end
     foreach(println, errors)

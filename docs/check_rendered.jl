@@ -353,7 +353,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "ppl-ad.md" => (
             "Eight Schools model gradient matrix",
             "eight-schools-ad-v1.toml",
-            "All four differentiable scalar cells",
+            "seven scalar gradients",
             "MNIST full-data model gradients",
             "mnist-logistic-ad-v1.toml",
             "7,065 active coefficients",
