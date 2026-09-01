@@ -4,6 +4,8 @@ import SHA
 import Statistics
 import TOML
 
+include(joinpath(@__DIR__, "_validate_mnist_dataset_profile.jl"))
+
 const EXPECTED_MNIST_REACTANT_BOUNDARIES =
     ("packed_unconstrained", "structured_parameters")
 const EXPECTED_MNIST_REACTANT_OUTCOMES =
@@ -95,12 +97,8 @@ function validate_mnist_reactant_receipt(
         require(Tuple(get(primal["protocol"], "outcomes", String[])) ==
                 EXPECTED_MNIST_REACTANT_OUTCOMES,
                 "matched primal receipt outcome matrix mismatch")
-        require(Int(get(protocol, "num_observations", 0)) ==
-                Int(get(primal["protocol"], "num_observations", -1)),
-                "observation count must match the primal receipt")
     end
-    require(Int(get(protocol, "num_features", 0)) == 784,
-            "MNIST Reactant receipt must use full-resolution features")
+    _validate_mnist_dataset_profile!(require, protocol, primal["protocol"])
     require(Int(get(protocol, "num_classes", 0)) == 10,
             "MNIST Reactant receipt must cover ten classes")
     require(get(protocol, "source_reused", false) == true,
@@ -109,7 +107,7 @@ function validate_mnist_reactant_receipt(
             "benchmark/receipts/mnist-logistic-v1.toml",
             "benchmark must name the matched primal receipt")
     require(get(protocol, "partial_evaluation_enabled", true) == false,
-            "full-data Reactant receipt must keep data as runtime inputs")
+            "Reactant receipt must keep data as runtime inputs")
     require(Tuple(get(protocol, "runtime_data_ports", String[])) ==
             ("X", "y", "num_classes"),
             "benchmark must record the complete runtime data boundary")
