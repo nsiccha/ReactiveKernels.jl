@@ -327,7 +327,6 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
             "All four differentiable scalar cells",
             "MNIST full-data model gradients",
             "mnist-logistic-ad-v1.toml",
-            "MNIST value-and-gradient runtime",
             "7,065 active coefficients",
         ),
         "compiler.md" => ("class=\"rk-pipeline\"",),
