@@ -1,0 +1,306 @@
+generated_at = "2026-09-01T14:52:56.539Z"
+schema = "mnist-reactant-v1"
+
+[environment]
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+julia_threads = 1
+os = "Linux"
+reactant_backend = "default CPU"
+
+[[measurements]]
+boundary = "packed_unconstrained"
+description = "full joint over the flattened sampler vector"
+max_abs_error = 2.7284841053187847e-12
+max_rel_error = 1.0312671698056687e-15
+outcome = "joint"
+reactant_compile_seconds = 25.82859999
+reactant_first_execution_seconds = 0.211566717
+reactant_transfer_seconds = 0.264589549
+rk_native_supported = true
+rk_reactant_supported = true
+
+    [measurements.rk_native]
+    allocs = [8, 8, 8, 8, 8, 8, 8, 8, 8, 8]
+    bytes = [232400, 232400, 232400, 232400, 232400, 232400, 232400, 232400, 232400, 232400]
+    median_allocs = 8
+    median_bytes = 232400
+    median_ns = 96188.0
+    min_ns = 94069.0
+    times_ns = [96003.0, 96203.0, 96914.0, 95542.0, 96173.0, 97184.0, 95682.0, 94069.0, 99187.0, 96553.0]
+
+    [measurements.rk_reactant]
+    allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
+    bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
+    median_allocs = 16
+    median_bytes = 704
+    median_ns = 79825.5
+    min_ns = 73001.0
+    times_ns = [77927.0, 77187.0, 78318.0, 93509.0, 73001.0, 93389.0, 80752.0, 78899.0, 90966.0, 102892.0]
+[[measurements]]
+boundary = "packed_unconstrained"
+description = "standard-normal coefficient log prior"
+max_abs_error = 2.8421709430404007e-13
+max_rel_error = 8.381331642636169e-16
+outcome = "prior"
+reactant_compile_seconds = 1.844398916
+reactant_first_execution_seconds = 0.026600038
+reactant_transfer_seconds = 0.006048444
+rk_native_supported = true
+rk_reactant_supported = true
+
+    [measurements.rk_native]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 190.0
+    min_ns = 180.0
+    times_ns = [180.0, 190.0, 190.0, 190.0, 190.0, 180.0, 190.0, 190.0, 181.0, 190.0]
+
+    [measurements.rk_reactant]
+    allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
+    bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
+    median_allocs = 16
+    median_bytes = 704
+    median_ns = 9989.5
+    min_ns = 4226.0
+    times_ns = [5899.0, 12117.0, 4226.0, 9714.0, 9163.0, 8201.0, 10504.0, 11426.0, 11796.0, 10265.0]
+[[measurements]]
+boundary = "packed_unconstrained"
+description = "summed softmax categorical log likelihood"
+max_abs_error = 2.2737367544323206e-12
+max_rel_error = 9.857305529220653e-16
+outcome = "likelihood"
+reactant_compile_seconds = 2.123841867
+reactant_first_execution_seconds = 0.020696653
+reactant_transfer_seconds = 0.000104524
+rk_native_supported = true
+rk_reactant_supported = true
+
+    [measurements.rk_native]
+    allocs = [8, 8, 8, 8, 8, 8, 8, 8, 8, 8]
+    bytes = [232400, 232400, 232400, 232400, 232400, 232400, 232400, 232400, 232400, 232400]
+    median_allocs = 8
+    median_bytes = 232400
+    median_ns = 97454.0
+    min_ns = 95222.0
+    times_ns = [95222.0, 97255.0, 96483.0, 97444.0, 96042.0, 98796.0, 97464.0, 97935.0, 98205.0, 100178.0]
+
+    [measurements.rk_reactant]
+    allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
+    bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
+    median_allocs = 16
+    median_bytes = 704
+    median_ns = 69386.0
+    min_ns = 60253.0
+    times_ns = [60253.0, 63537.0, 84476.0, 70468.0, 74572.0, 65070.0, 68304.0, 64469.0, 100207.0, 92918.0]
+[[measurements]]
+boundary = "packed_unconstrained"
+description = "per-observation softmax categorical log likelihoods"
+max_abs_error = 8.881784197001252e-16
+max_rel_error = 4.064924263513051e-16
+outcome = "pointwise"
+reactant_compile_seconds = 2.20119315
+reactant_first_execution_seconds = 0.028873694
+reactant_transfer_seconds = 9.8405e-5
+rk_native_supported = true
+rk_reactant_supported = true
+
+    [measurements.rk_native]
+    allocs = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9]
+    bytes = [240528, 240528, 240528, 240528, 240528, 240528, 240528, 240528, 240528, 240528]
+    median_allocs = 9
+    median_bytes = 240528
+    median_ns = 97825.5
+    min_ns = 96063.0
+    times_ns = [101550.0, 97375.0, 96063.0, 98064.0, 97125.0, 130179.0, 98036.0, 99397.0, 97615.0, 96673.0]
+
+    [measurements.rk_reactant]
+    allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
+    bytes = [720, 720, 720, 720, 720, 720, 720, 720, 720, 720]
+    median_allocs = 16
+    median_bytes = 720
+    median_ns = 87515.5
+    min_ns = 68565.0
+    times_ns = [111313.0, 76776.0, 88712.0, 101590.0, 86319.0, 68565.0, 76776.0, 89834.0, 77237.0, 117613.0]
+[[measurements]]
+boundary = "structured_parameters"
+description = "full joint over the (W, b) coefficients"
+max_abs_error = 2.7284841053187847e-12
+max_rel_error = 1.0312671698056687e-15
+outcome = "joint"
+reactant_compile_seconds = 2.909901575
+reactant_first_execution_seconds = 0.045537174
+reactant_transfer_seconds = 0.008311487
+rk_native_supported = true
+rk_reactant_supported = true
+
+    [measurements.rk_native]
+    allocs = [10, 10, 10, 10, 10, 10, 10, 10, 10, 10]
+    bytes = [235488, 235488, 235488, 235488, 235488, 235488, 235488, 235488, 235488, 235488]
+    median_allocs = 10
+    median_bytes = 235488
+    median_ns = 99357.5
+    min_ns = 97415.0
+    times_ns = [97565.0, 97415.0, 103753.0, 100619.0, 100038.0, 99046.0, 100839.0, 99568.0, 97994.0, 99147.0]
+
+    [measurements.rk_reactant]
+    allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
+    bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
+    median_allocs = 16
+    median_bytes = 704
+    median_ns = 74883.5
+    min_ns = 62125.0
+    times_ns = [95532.0, 69446.0, 66331.0, 62125.0, 76846.0, 123130.0, 63618.0, 74804.0, 74963.0, 75854.0]
+[[measurements]]
+boundary = "structured_parameters"
+description = "standard-normal coefficient log prior"
+max_abs_error = 2.8421709430404007e-13
+max_rel_error = 8.381331642636169e-16
+outcome = "prior"
+reactant_compile_seconds = 1.949408126
+reactant_first_execution_seconds = 0.040800169
+reactant_transfer_seconds = 0.007055854
+rk_native_supported = true
+rk_reactant_supported = true
+
+    [measurements.rk_native]
+    allocs = [3, 3, 3, 3, 3, 3, 3, 3, 3, 3]
+    bytes = [3216, 3216, 3216, 3216, 3216, 3216, 3216, 3216, 3216, 3216]
+    median_allocs = 3
+    median_bytes = 3216
+    median_ns = 490.0
+    min_ns = 400.0
+    times_ns = [441.0, 631.0, 400.0, 641.0, 491.0, 411.0, 490.0, 480.0, 631.0, 490.0]
+
+    [measurements.rk_reactant]
+    allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
+    bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
+    median_allocs = 16
+    median_bytes = 704
+    median_ns = 9503.5
+    min_ns = 3845.0
+    times_ns = [9664.0, 14069.0, 12407.0, 16092.0, 14881.0, 9343.0, 3845.0, 8712.0, 3845.0, 8802.0]
+[[measurements]]
+boundary = "structured_parameters"
+description = "summed softmax categorical log likelihood"
+max_abs_error = 2.2737367544323206e-12
+max_rel_error = 9.857305529220653e-16
+outcome = "likelihood"
+reactant_compile_seconds = 1.958575775
+reactant_first_execution_seconds = 0.023438175
+reactant_transfer_seconds = 9.9838e-5
+rk_native_supported = true
+rk_reactant_supported = true
+
+    [measurements.rk_native]
+    allocs = [7, 7, 7, 7, 7, 7, 7, 7, 7, 7]
+    bytes = [232272, 232272, 232272, 232272, 232272, 232272, 232272, 232272, 232272, 232272]
+    median_allocs = 7
+    median_bytes = 232272
+    median_ns = 95936.5
+    min_ns = 94931.0
+    times_ns = [95622.0, 96854.0, 95762.0, 96904.0, 94931.0, 97455.0, 133805.0, 96042.0, 95482.0, 95831.0]
+
+    [measurements.rk_reactant]
+    allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
+    bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
+    median_allocs = 16
+    median_bytes = 704
+    median_ns = 68909.5
+    min_ns = 61564.0
+    times_ns = [86550.0, 61564.0, 65280.0, 67061.0, 66362.0, 124001.0, 73592.0, 65530.0, 70758.0, 75524.0]
+[[measurements]]
+boundary = "structured_parameters"
+description = "per-observation softmax categorical log likelihoods"
+max_abs_error = 8.881784197001252e-16
+max_rel_error = 4.064924263513051e-16
+outcome = "pointwise"
+reactant_compile_seconds = 1.919540251
+reactant_first_execution_seconds = 0.027033246
+reactant_transfer_seconds = 0.000132684
+rk_native_supported = true
+rk_reactant_supported = true
+
+    [measurements.rk_native]
+    allocs = [8, 8, 8, 8, 8, 8, 8, 8, 8, 8]
+    bytes = [240400, 240400, 240400, 240400, 240400, 240400, 240400, 240400, 240400, 240400]
+    median_allocs = 8
+    median_bytes = 240400
+    median_ns = 96618.5
+    min_ns = 94500.0
+    times_ns = [97685.0, 96504.0, 95662.0, 98056.0, 97424.0, 97504.0, 96704.0, 94851.0, 96533.0, 94500.0]
+
+    [measurements.rk_reactant]
+    allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
+    bytes = [720, 720, 720, 720, 720, 720, 720, 720, 720, 720]
+    median_allocs = 16
+    median_bytes = 720
+    median_ns = 87961.5
+    min_ns = 66842.0
+    times_ns = [66842.0, 93177.0, 98256.0, 77887.0, 77007.0, 144969.0, 89914.0, 76115.0, 86009.0, 102341.0]
+
+[pins]
+benchmarktools_version = "1.6.3"
+julia_version = "1.10.11"
+mldatasets_version = "0.7.21"
+primal_receipt_reactivekernels_sha = "4f76ae768df25dd22c96a7fa9587c2f370c340b3"
+primal_receipt_sha256 = "62e4c8c5c54e4581a6693478133e6d55af57f3a42048765b64de13c956150efc"
+reactant_jll_version = "0.0.401+0"
+reactant_version = "0.2.278"
+reactivekernels_dirty = false
+reactivekernels_sha = "4f1614827adb2b39ad0a4e23bde24d86b43f2199"
+reactivekernels_version = "0.1.0"
+reactivekernelsdistributionkernels_version = "0.1.0"
+reactivekernelspplexamples_version = "0.1.0"
+source_authority_blob = "cfd5d381c38de21742f564361ef7a7914e5ff8bd"
+source_authority_path = "packages/ReactiveKernelsPPLExamples/src/mnist_logistic.jl"
+source_text_sha256 = "b873db7cef8003d9d3982af93223489a6558f0c733095a3bbcfc16fb8c29ad24"
+
+[protocol]
+data = "Wren-compatible MNIST: first N training images projected onto the top 40 unwhitened PCA components fitted on all 60000 training images"
+dataset_profile = "wren-pca40"
+estimator = "minimum of per-round BenchmarkTools minimum times (uncontended cost; medians and raw rounds retained)"
+generated_predictions_included = false
+gradients_included = false
+input_boundaries = ["packed_unconstrained", "structured_parameters"]
+matrix_source = "benchmark/receipts/mnist-logistic-v1.toml"
+model = "multinomial-logistic MNIST classifier"
+native_and_reactant_use_same_runtime_boundary = true
+num_classes = 10
+num_features = 40
+num_observations = 1000
+outcomes = ["joint", "prior", "likelihood", "pointwise"]
+parity_atol = 1.0e-9
+parity_rtol = 1.0e-9
+partial_evaluation_enabled = false
+pca_centered = true
+pca_components = 40
+pca_explained_variance_fraction = 0.7861077598655903
+pca_fit_observations = 60000
+pca_input_features = 784
+pca_whitened = false
+preparation_in_timed_region = false
+reactant_compile_time_in_timed_region = false
+reactant_readback_in_timed_region = false
+reactant_sync = true
+reactant_transfers_in_timed_region = false
+rounds = 10
+runtime_data_ports = ["X", "y", "num_classes"]
+samples_per_round = 200
+seconds_per_round = 0.2
+setup_in_timed_region = false
+source_reused = true
+unsupported_cells_recorded = true
+wren_reference_checked = true
+wren_reference_csv_sha256 = "4d7543e3fdc89d51554c49c9ba71b0f629d3acf15e1f1a8bcbdc958be7f88af0"
+wren_reference_label_mismatches = 0
+wren_reference_max_abs_error = 1.099120794378905e-13
+wren_reference_rmse = 7.884317617377813e-15
+
+[setup]
+data_load_seconds = 4.443507396
+environment_seconds = 23.320937467
+kernel_preparation_seconds = 4.300941241
+package_precompile_seconds = 21.967521418
