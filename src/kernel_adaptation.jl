@@ -4804,11 +4804,13 @@ function _sm_backend_state_type(::Type{StateType}, ports::NamedTuple) where
 end
 
 function _sm_validate_machine_state(transition, state;
-                                    reusable::Bool=false)
+                                    reusable::Bool=false,
+                                    raw::Bool=false)
     Names, _, ArrayNames, StateType = typeof(transition).parameters[1:4]
     ports = getfield(transition, :ports)
     shapes = getfield(transition, :shape_contract)
-    label = reusable ? "reusable compiled state-machine state" :
+    label = raw ? "raw backend state-machine state" :
+            reusable ? "reusable compiled state-machine state" :
                        "functional state-machine state"
     propertynames(state) == Names ||
         _sm_runtime_abi_mismatch(label, StateType, shapes, state)
@@ -4839,7 +4841,9 @@ function _sm_validate_machine_state(transition, state;
         _sm_validate_topology_contract(
             state, getfield(transition, :topology_contract))
     end
-    if reusable
+    if raw
+        _sm_validate_reusable_raw_state_ports(ports, state)
+    elseif reusable
         _sm_validate_reusable_state_ports(ports, state)
     else
         _sm_validate_functional_state_ports(ports, state)
@@ -5206,7 +5210,7 @@ function _sm_validate_reusable_compiled_raw_output(
         throw(ArgumentError(
             "raw backend state-machine result has the wrong ABI layout"))
     state = result.state
-    _sm_validate_machine_state(transition, state; reusable=true)
+    _sm_validate_machine_state(transition, state; raw=true)
     result.arguments isa Tuple || throw(ArgumentError(
         "raw backend state-machine arguments are not a tuple"))
     _sm_functional_argument_type_ok(
