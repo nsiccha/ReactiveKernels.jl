@@ -77,6 +77,7 @@ site_pages = [
         "Dugongs (nonlinear growth)" => "dugongs-growth.md",
         "ARMA(1,1) time series" => "arma11.md",
         "Gaussian mixture" => "gaussian-mixture.md",
+        "MNIST multinomial logistic" => "mnist-logistic.md",
     ],
     "Sampling" => [
         "Pathfinder approximation" => "pathfinder.md",
