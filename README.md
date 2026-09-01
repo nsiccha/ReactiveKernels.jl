@@ -398,6 +398,7 @@ groups are `core`, `acceptance`, `acceptance-compiler`, `acceptance-runtime`,
 runs `core` on every supported Julia/OS cell, while each platform-independent
 acceptance group runs once on the LTS Ubuntu lane. Test-file begin/finish markers
 keep long compiler work attributable without multiplying identical acceptance
-work across the compatibility matrix.
+work across the compatibility matrix. A newer run on the same branch cancels its
+superseded predecessor before queued jobs consume more runners.
 Unknown names fail before any selected test executes and list the accepted groups
 and files.
