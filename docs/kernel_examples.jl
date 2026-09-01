@@ -66,9 +66,8 @@ function _readable_generated_source(expr::Expr, context, label)
 end
 
 # --- eval-throughput visualization ----------------------------------------
-# A build-executed chart of the static eval-throughput receipt: grouped
-# horizontal bars on a log time axis, faceted by mode, one bar per single-call
-# latency series.
+# A build-executed focused comparison of the static eval-throughput receipt:
+# one relative-runtime plot and compact baseline table per operation.
 # The bars are read straight from the receipt TOML, so the picture cannot drift
 # from the numbers. `RK + Reactant` and `Turing native` share the axis; Turing +
 # Reactant is unsupported and omitted.
@@ -83,6 +82,7 @@ function _fmt_ns(v)
 end
 
 function eval_throughput_chart(; receipt = _eval_throughput_receipt())
+    return _render_eval_throughput_focused(receipt)
     data = TOML.parsefile(receipt)
     measurements = data["measurements"]
     modes = ("primal", "gradient", "gq")

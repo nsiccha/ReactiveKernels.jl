@@ -10,7 +10,7 @@ The reviewed PPL gradient evidence is ordered like the model documentation:
 published primal graph and comparator authorities; there is no AD-specific copy
 of either model.
 
-## Eight Schools model gradient matrix
+## Eight Schools focused value-and-gradient comparisons
 
 `prepare_ad` differentiates the exact generated callable and operation table
 used by primal execution. Scalar value-and-gradient cells cover the packed
@@ -20,6 +20,12 @@ with data unbound or fixed during preparation where applicable. Packed and
 minimal pointwise likelihoods use the public reverse-pullback surface with one
 fixed receipt cotangent. Every supported cell is checked against central finite
 differences before timing.
+
+The page leads with four separate packed-boundary outcome panels. Each compact
+table reports absolute runtime, the matching RK baseline, `runtime ÷ baseline`,
+allocation evidence, and a faster/slower interpretation. The full derivative
+boundary matrix, unsupported reasons, preparation costs, and raw rounds remain
+available in the receipt.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_eight_schools_ad_benchmarks()
