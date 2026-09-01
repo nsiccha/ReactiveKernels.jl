@@ -1,0 +1,104 @@
+generated_at = "2026-09-01T08:11:28.496Z"
+schema = "partial-evaluation-mnist-v1"
+
+[environment]
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+julia_threads = 1
+os = "Linux"
+
+[[measurements]]
+outcome = "density"
+reference_value = -145370.3958500536
+
+    [measurements.rk_bound]
+    allocs = [7, 7, 7, 7, 7, 7, 7, 7, 7, 7]
+    bytes = [13440272, 13440272, 13440272, 13440272, 13440272, 13440272, 13440272, 13440272, 13440272, 13440272]
+    median_allocs = 7
+    median_bytes = 13440272
+    median_ns = 5.7213856e7
+    min_ns = 5.4017632e7
+    times_ns = [5.9286167e7, 5.7033407e7, 5.6492028e7, 5.6009462e7, 6.8819662e7, 5.7513769e7, 5.544198e7, 5.7394305e7, 6.5461546e7, 5.4017632e7]
+
+    [measurements.rk_unbound]
+    allocs = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9]
+    bytes = [13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320]
+    median_allocs = 9
+    median_bytes = 13920320
+    median_ns = 6.5027716e7
+    min_ns = 5.7925219e7
+    times_ns = [6.6873555e7, 6.3181877e7, 6.0794119e7, 6.0733745e7, 6.2230873e7, 5.7925219e7, 6.983977e7, 8.34036e7, 7.067268e7, 7.9708879e7]
+[[measurements]]
+outcome = "likelihood"
+reference_value = -138877.74577704832
+
+    [measurements.rk_bound]
+    allocs = [7, 7, 7, 7, 7, 7, 7, 7, 7, 7]
+    bytes = [13440272, 13440272, 13440272, 13440272, 13440272, 13440272, 13440272, 13440272, 13440272, 13440272]
+    median_allocs = 7
+    median_bytes = 13440272
+    median_ns = 6.0051584e7
+    min_ns = 5.4368617e7
+    times_ns = [7.3174885e7, 5.6359365e7, 5.9898413e7, 7.2270636e7, 6.3622886e7, 6.40176e7, 6.0204755e7, 5.8512109e7, 5.5384561e7, 5.4368617e7]
+
+    [measurements.rk_unbound]
+    allocs = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9]
+    bytes = [13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320]
+    median_allocs = 9
+    median_bytes = 13920320
+    median_ns = 6.05842055e7
+    min_ns = 5.5606365e7
+    times_ns = [6.030186e7, 5.8877373e7, 6.5965171e7, 5.5606365e7, 6.0407036e7, 6.3506044e7, 6.6229746e7, 6.7515892e7, 6.0761375e7, 5.9369392e7]
+[[measurements]]
+outcome = "prior"
+reference_value = -6492.650073005288
+
+    [measurements.rk_bound]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 3354.5
+    min_ns = 3274.0
+    times_ns = [3364.0, 3345.0, 3364.0, 3274.0, 3294.0, 3304.0, 3364.0, 3364.0, 3315.0, 3374.0]
+
+    [measurements.rk_unbound]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 3319.0
+    min_ns = 3294.0
+    times_ns = [3384.0, 3364.0, 3394.0, 3324.0, 3314.0, 3294.0, 3314.0, 3314.0, 3334.0, 3304.0]
+
+[pins]
+benchmarktools_version = "1.6.3"
+julia_version = "1.10.11"
+mldatasets_version = "0.7.21"
+reactivekernels_dirty = false
+reactivekernels_sha = "be89e2189923bec7eeba6872cd09f32207df6ff8"
+reactivekernels_version = "0.1.0"
+reactivekernelsdistributionkernels_version = "0.1.0"
+reactivekernelspplexamples_version = "0.1.0"
+
+[protocol]
+bound_ports = ["X", "y", "num_classes"]
+data = "MLDatasets MNIST train split, first N images"
+estimator = "minimum of per-round BenchmarkTools minimum times (uncontended cost; medians and raw rounds retained)"
+hoisted_constants = 5
+input_boundary = "packed_unconstrained"
+model = "multinomial-logistic MNIST classifier, data-only reference-logits row variant"
+num_classes = 10
+num_features = 784
+num_observations = 60000
+outcomes = ["density", "likelihood", "prior"]
+parity_atol = 1.0e-9
+parity_reference = "landed docs model (build_mnist_logistic_graph)"
+parity_rtol = 1.0e-9
+plan_recipes_total = 14
+preparation_in_timed_region = false
+residual_recipes = 10
+rounds = 10
+samples_per_round = 200
+seconds_per_round = 1.0
+setup_in_timed_region = false

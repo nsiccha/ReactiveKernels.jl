@@ -2139,8 +2139,33 @@ function plan(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
          want = _kernel_selection(spec, want, spec.want_names, :want))
 end
 
+# Resolve the spec-level `bound` NamedTuple (authored port name => data) into
+# the `Value => data` pairs the plan-level partial-evaluation pass consumes.
+function _kernel_bound_pairs(spec::KernelSpec, bound)
+    bound isa NamedTuple || throw(ArgumentError(
+        "spec-level bound must be a NamedTuple of authored port name => data; " *
+        "got $(typeof(bound))"))
+    ports = _kernel_selection(spec, keys(bound), spec.have_names, :have)
+    Tuple(port => data for (port, data) in zip(ports, Base.values(bound)))
+end
+
+"""
+    prepare(spec::KernelSpec; have, want, passes=(), bound=(;)) -> callable
+
+Prepare an authored kernel. With a non-empty `bound` NamedTuple
+(`bound = (; X, y)`), the [`partial_evaluation`](@ref) pre-pass runs first:
+each named HAVE port is fixed to the supplied value, the data-only subgraph
+reachable from only those ports executes once here, and the returned kernel is
+positional over the remaining HAVE ports in their selected order. The authored
+signature convenience layer (positional defaults and keywords) applies only to
+unbound default-boundary preparations.
+"""
 function prepare(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
-                 want = _KERNEL_DEFAULT_BOUNDARY, passes = ())
+                 want = _KERNEL_DEFAULT_BOUNDARY, passes = (),
+                 bound = NamedTuple())
+    isempty(bound) || return prepare(plan(spec; have = have, want = want);
+                                     passes = passes,
+                                     bound = _kernel_bound_pairs(spec, bound))
     prepared = prepare(plan(spec; have = have, want = want); passes = passes)
     have === _KERNEL_DEFAULT_BOUNDARY || return prepared
     _kernel_signature_callable(prepared, spec.call_signature)
@@ -2159,7 +2184,12 @@ end
 
 function prepare_nonallocating(spec::KernelSpec;
                                have = _KERNEL_DEFAULT_BOUNDARY,
-                               want = _KERNEL_DEFAULT_BOUNDARY, passes = ())
+                               want = _KERNEL_DEFAULT_BOUNDARY, passes = (),
+                               bound = NamedTuple())
+    isempty(bound) || return prepare_nonallocating(spec.graph;
+        have = _kernel_selection(spec, have, spec.have_names, :have),
+        want = _kernel_selection(spec, want, spec.want_names, :want),
+        passes = passes, bound = _kernel_bound_pairs(spec, bound))
     prepared = prepare_nonallocating(spec.graph;
         have = _kernel_selection(spec, have, spec.have_names, :have),
         want = _kernel_selection(spec, want, spec.want_names, :want),

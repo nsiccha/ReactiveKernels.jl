@@ -67,8 +67,8 @@ site_pages = [
         "Evaluation throughput vs Turing.jl" => "eval-throughput.md",
         "Adaptive NUTS receipt (static)" => "nuts-reactant.md",
     ],
-    "Kernel execution and tools" => [
-        "Non-allocating kernels" => "nonallocating.md",
+    "Non-allocating kernels" => "nonallocating.md",
+    "Tools and reference" => [
         "DAG visualization" => "visualization.md",
         "API" => "api.md",
     ],

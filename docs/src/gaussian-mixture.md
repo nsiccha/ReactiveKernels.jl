@@ -1,5 +1,9 @@
 # Declarative PPL kernel: Gaussian mixture (marginalization)
 
+```@eval
+Main.ReactiveKernelsDocs.render_review_status(:frozen_ppl)
+```
+
 This example ports the `low_dim_gauss_mix` model from
 [posteriordb](https://github.com/stan-dev/posteriordb) (posterior
 `low_dim_gauss_mix-low_dim_gauss_mix`) into the same declarative-`@kernel` style
