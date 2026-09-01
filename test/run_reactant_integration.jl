@@ -12,6 +12,8 @@ effect_boundary_testfile = joinpath(
     @__DIR__, "test_effect_boundary_reactant.jl")
 mutation_profile_b_testfile = joinpath(
     @__DIR__, "test_mutation_profile_b_reactant.jl")
+mnist_full_joint_testfile = joinpath(
+    @__DIR__, "test_mnist_full_joint_reactant.jl")
 example_packages = (
     joinpath(root, "packages", "ReactiveKernelsCompatibilityExamples"),
     joinpath(root, "packages", "ReactiveKernelsDistributionKernels"),
@@ -54,6 +56,8 @@ mktempdir() do env
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $ad_testfile`)
     elseif selector == "mutation-profile-b"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $mutation_profile_b_testfile`)
+    elseif selector == "mnist-full-joint"
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $mnist_full_joint_testfile`)
     else
         error("unknown RK_REACTANT_TESTSET selector: $selector")
     end
