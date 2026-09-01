@@ -1,3 +1,5 @@
+import Base64
+
 function _documented_sources(entries)
     sources = String[]
     for entry in entries
@@ -198,6 +200,30 @@ function _artifact_declarations(body, stage, source)
     declarations
 end
 
+function _check_aov_log_bar_contract(stage, source, declaration)
+    declaration.kind == "aov-panel" || return nothing
+    payload = try
+        String(Base64.base64decode(declaration.payload))
+    catch exception
+        error(
+            "$stage interactive artifact $(declaration.id) on $source has an invalid base64 payload witness: " *
+            sprint(showerror, exception),
+        )
+    end
+    bar_mark = occursin(r"\"mark\"\s*:\s*\"bar\"", payload) || occursin(
+        r"\"mark\"\s*:\s*\{[^{}]*\"type\"\s*:\s*\"bar\"", payload,
+    )
+    bar_mark || return nothing
+    for scale_match in eachmatch(r"\"scale\"\s*:\s*\{([^{}]*)\}", payload)
+        scale = only(scale_match.captures)
+        occursin(r"\"type\"\s*:\s*\"log\"", scale) || continue
+        error(
+            "$stage interactive artifact $(declaration.id) on $source uses an unsupported logarithmic bar scale",
+        )
+    end
+    nothing
+end
+
 function _check_artifact_id_contract(source, intermediate, rendered)
     intermediate_declarations =
         _artifact_declarations(intermediate, "Documenter intermediate", source)
@@ -216,6 +242,7 @@ function _check_artifact_id_contract(source, intermediate, rendered)
         )
         for declaration in declarations
             declaration.kind in ("aov-panel", "result-assets") || continue
+            _check_aov_log_bar_contract(stage, source, declaration)
             if stage == "Documenter intermediate"
                 binding = "v-exec-scripts=\"'$(declaration.payload)'\""
                 occursin(binding, stage_body) || error(

@@ -2,6 +2,41 @@ using Test
 
 include(joinpath(@__DIR__, "check_rendered.jl"))
 
+@testset "AoV rejects logarithmic bar scales" begin
+    bad_payload = Base64.base64encode(
+        "<script>{\"mark\":\"bar\",\"encoding\":{\"y\":{\"scale\":{\"type\":\"log\"}}}}</script>",
+    )
+    bad_zero_false_payload = Base64.base64encode(
+        "<script>{\"mark\":\"bar\",\"encoding\":{\"y\":{\"scale\":{\"type\":\"log\",\"zero\":false}}}}</script>",
+    )
+    symlog_payload = Base64.base64encode(
+        "<script>{\"mark\":\"bar\",\"encoding\":{\"y\":{\"scale\":{\"type\":\"symlog\"}}}}</script>",
+    )
+    point_payload = Base64.base64encode(
+        "<script>{\"mark\":{\"filled\":true,\"type\":\"point\"},\"encoding\":{\"y\":{\"scale\":{\"type\":\"log\",\"zero\":false}}}}</script>",
+    )
+    line_payload = Base64.base64encode(
+        "<script>{\"mark\":{\"point\":true,\"type\":\"line\"},\"encoding\":{\"y\":{\"scale\":{\"type\":\"log\"}}}}</script>",
+    )
+    declaration(payload) = (id = "plot:first", kind = "aov-panel", payload)
+
+    @test_throws ErrorException _check_aov_log_bar_contract(
+        "VitePress output", "fixture.md", declaration(bad_payload),
+    )
+    @test_throws ErrorException _check_aov_log_bar_contract(
+        "VitePress output", "fixture.md", declaration(bad_zero_false_payload),
+    )
+    @test isnothing(_check_aov_log_bar_contract(
+        "VitePress output", "fixture.md", declaration(point_payload),
+    ))
+    @test isnothing(_check_aov_log_bar_contract(
+        "VitePress output", "fixture.md", declaration(symlog_payload),
+    ))
+    @test isnothing(_check_aov_log_bar_contract(
+        "VitePress output", "fixture.md", declaration(line_payload),
+    ))
+end
+
 @testset "rendered docs fatal/advisory split" begin
     mktempdir() do root
         source_dir = joinpath(root, "src")
