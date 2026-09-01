@@ -25,6 +25,7 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
             "narrowest valid loop\nboundary",
             "cannot enter a\nplate",
             "It is not\n`Distributions.jl.Normal`",
+            "`plate(eachcol(logits), y) do column, observed ... end`",
         )
         @test occursin(marker, batched_docs)
     end
