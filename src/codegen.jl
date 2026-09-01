@@ -1344,21 +1344,38 @@ end
 
 @inline function (k::NonAllocatingKernel)(args...)
     length(args) == length(k.inputs) || throw(MethodError(k, args))
-    k.f(k.ops, k.caches, k.cache_apply, args...)
+    k.f(args...)
 end
 
-function _prepare_nonallocating(
-        p::Plan, ast::Expr, cache_apply;
-        cache_slot = recipe -> _cache_slot(only(recipe.outputs)))
+function _prepare_nonallocating(p::Plan, ast::Expr, cache_apply)
     for r in p.recipes
         length(r.outputs) == 1 || throw(ArgumentError(
             "prepare_nonallocating requires single-output recipes; recipe $(r.id) has $(length(r.outputs)) outputs"))
     end
-    f = compile(ast)
-    ops = ntuple(i -> p.recipes[i].op, length(p.recipes))
-    caches = ntuple(i -> cache_slot(p.recipes[i]), length(p.recipes))
+    rewritten, ops, caches = _nonallocating_program(p, ast)
+    # Compile with the operation and cache tuples bound as constants inside the
+    # body. Passing them as call arguments re-tuples the non-isbits operation
+    # table on every invocation at the runtime-generated call boundary — a
+    # measured fixed per-call heap cost. `k.ast` keeps the unbound, readable
+    # form; the tuples are empty/unseeded at preparation, so embedding them is
+    # cheap and the compiled body sees them as constants.
+    f = compile(_bind_nonallocating_constants(rewritten, ops, caches,
+                                              cache_apply))
     NonAllocatingKernel(f, ops, caches, cache_apply, Tuple(p.have),
-                        Tuple(p.want), p, ast)
+                        Tuple(p.want), p, rewritten)
+end
+
+function _bind_nonallocating_constants(ast::Expr, ops::Tuple, caches::Tuple,
+                                       cache_apply)
+    signature = ast.args[1]
+    runtime_args = signature.args[4:end]
+    body = ast.args[2]
+    Expr(:function, Expr(:tuple, runtime_args...),
+         Expr(:block,
+              Expr(:(=), _OPS_ARG, ops),
+              Expr(:(=), _CACHES_ARG, caches),
+              Expr(:(=), _CACHE_APPLY_ARG, cache_apply),
+              body.args...))
 end
 
 """
@@ -1414,10 +1431,19 @@ end
 
 Optional MutatingFunctions-backed preparation interface. Install and load
 `MutatingFunctions` alongside `ReactiveKernels` to activate the package
-extension that supplies these methods. The extension prepares the same
+extension that supplies these methods (for a `Plan`, a `Graph`, or an
+already-prepared `PreparedKernel`'s plan). The extension prepares the same
 straight-line plan as [`prepare`](@ref), then applies a final AST transform
 that routes every selected operation through `MutatingFunctions.apply!!` and a
-persistent per-recipe cache. User `passes` run before this final transform.
+persistent per-step cache. User `passes` run before this final transform.
+
+Operations synthesized from captured `@kernel` source are decomposed into
+destination-passing steps where the captured expression allows: lazy wrappers
+and isbits-valued calls run inline, broadcast materializations, `vcat`, range
+`getindex`, and `zeros`/`ones` reuse typed destination buffers, and every
+other resolved call becomes its own cache step so registered `apply!!`
+coverage (e.g. `mul!`-backed `*`) applies per step. Source shapes outside
+that grammar keep the whole-recipe cache step.
 
 The first invocation populates the caches and may allocate. Later invocations
 reuse them when the selected operations provide allocation-free `apply!!`
@@ -1435,7 +1461,10 @@ the next call; a prepared instance is not reentrant or thread-safe.
 """
 function prepare_nonallocating(args...; kwargs...)
     throw(ArgumentError(
-        "prepare_nonallocating requires the optional MutatingFunctions extension; install MutatingFunctions and load it with `using MutatingFunctions`"))
+        "prepare_nonallocating requires the optional MutatingFunctions extension; " *
+        "install MutatingFunctions and load it with `using MutatingFunctions`. " *
+        "With the extension loaded it accepts a Plan, a Graph (with have/want), " *
+        "or a PreparedKernel"))
 end
 
 "Graph values in positional call order."

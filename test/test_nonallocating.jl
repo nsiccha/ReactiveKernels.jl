@@ -7,6 +7,48 @@ function kernel_allocations(k, x)
     @allocated k(x)
 end
 
+# Fused captured sources resolve their free symbols in the authoring module.
+# This module deliberately shadows `vcat`; a name-based Base.vcat rewrite would
+# silently change semantics, so parity here pins exact-binding resolution.
+module ShadowedVcatFixture
+using ReactiveKernels
+using MutatingFunctions
+const vcat = (args...) -> Base.vcat(Base.reverse(args)...)
+const SPEC = @kernel shadowed(a::Vector{Float64}, b::Vector{Float64}) = begin
+    stacked = vcat(a, b)
+    total::Float64 = sum(stacked)
+end
+function check_parity()
+    ordinary = prepare(SPEC; have = (:a, :b), want = :total)
+    k = prepare_nonallocating(SPEC; have = (:a, :b), want = :total)
+    a, b = [1.0, 2.0], [10.0, 20.0, 30.0]
+    ordinary(a, b) == k(a, b) == sum(Base.vcat(b, a))
+end
+end # module ShadowedVcatFixture
+
+# A captured source reading a non-const global cannot be decomposed soundly
+# (the binding may change between preparation and call); the whole-recipe
+# fallback keeps the original closure semantics.
+module NonConstGlobalFixture
+using ReactiveKernels
+using MutatingFunctions
+scale = 2.0
+const SPEC = @kernel scaled(x::Vector{Float64}) = begin
+    grown = scale .* x
+    total::Float64 = sum(grown)
+end
+function check_parity()
+    ordinary = prepare(SPEC; have = (:x,), want = :total)
+    k = prepare_nonallocating(SPEC; have = (:x,), want = :total)
+    x = [1.0, 2.0, 3.0]
+    first = ordinary(x) == k(x) == 2.0 * sum(x)
+    global scale = 3.0
+    second = ordinary(x) == k(x) == 3.0 * sum(x)
+    global scale = 2.0
+    first && second
+end
+end # module NonConstGlobalFixture
+
 function nonallocating_op_call_indices(ast)
     indices = Int[]
     function visit(node)
@@ -99,6 +141,98 @@ end
         add!(g, x => y, copy)
         k = prepare_nonallocating(g; have = (x,), want = (y,))
         @test k([1, 2, 3]) == [1, 2, 3]
+    end
+
+    @testset "fused captured sources decompose into destination-passing steps" begin
+        # The four MNIST op classes in one authored kernel: lazy reshape/view
+        # coefficient unpacking, range-slice extraction, matmul + broadcast,
+        # and vcat over a zeros-constructed row.
+        spec = @kernel mnist_shaped(u::Vector{Float64}, X::Matrix{Float64}) = begin
+            d::Int = size(X, 2)
+            r::Int = 3
+            W::Matrix{Float64} = reshape(view(u, 1:(r * d)), r, d)
+            b::Vector{Float64} = u[(r * d + 1):length(u)]
+            scores = W * transpose(X) .+ b
+            padded = vcat(zeros(1, size(scores, 2)), scores)
+            total::Float64 = sum(padded)
+        end
+        steady(k, args...) = (k(args...); k(args...); @allocated k(args...))
+        data(n, d) = (rand(3 * d + 3), rand(n, d))
+
+        ordinary = prepare(spec; have = (:u, :X), want = :total)
+        k = prepare_nonallocating(spec; have = (:u, :X), want = :total)
+        u, X = data(8, 5)
+        @test k(u, X) == ordinary(u, X)
+
+        # Every fused captured source decomposed: no opaque fused closure is
+        # left in the step table, and the destination steps are present.
+        @test !any(op -> op isa ReactiveKernels._KernelSourceOp, k.ops)
+        @test any(op -> op isa ReactiveKernels._MaterializeStep, k.ops)
+        @test any(op -> op isa ReactiveKernels._ConcatenateStep, k.ops)
+        @test any(op -> op isa ReactiveKernels._FillConstructorStep, k.ops)
+        @test any(op -> op isa ReactiveKernels._MatMulStep, k.ops)
+
+        small = steady(k, data(8, 5)...)
+        large = steady(k, data(200, 5)...)
+        println("NONALLOCATING_ALLOC_BYTES\tmnist_shaped_small\t", small)
+        println("NONALLOCATING_ALLOC_BYTES\tmnist_shaped_large\t", large)
+        @test small == large            # zero data-sized reallocation
+        @test small <= 512              # fixed near-zero per-call residue
+
+        # Cache reseeding on batch-size changes preserves exact parity.
+        for n in (8, 32, 8, 200)
+            un, Xn = data(n, 5)
+            @test k(un, Xn) == ordinary(un, Xn)
+        end
+    end
+
+    @testset "authored plates keep exact pointwise semantics" begin
+        # An untyped plate body materializes through an eltype-`Any` cache in
+        # both execution paths, so only value semantics are pinned here; the
+        # zero-allocation plate coverage for typed (Float64-endpoint) bodies
+        # is exercised on the real MNIST graph in test_nonallocating_mnist.jl.
+        spec = @kernel plated(x::Vector{Float64}) = begin
+            terms = plate(x) do value
+                value * value
+            end
+            total::Float64 = sum(terms)
+        end
+        k = prepare_nonallocating(spec; have = (:x,), want = :total)
+        ordinary = prepare(spec; have = (:x,), want = :total)
+        pointwise = prepare(spec; have = (:x,), want = :terms)
+        x = rand(64)
+        # The non-allocating kernel materializes the plate then sums it; the
+        # ordinary kernel fuses the reduction into an accumulator loop. The
+        # materialized total is bit-exactly `sum` of the plain pointwise
+        # values; against the fused accumulation only association differs.
+        @test k(x) == sum(pointwise(x))
+        @test isapprox(k(x), ordinary(x); rtol = 1e-12)
+        for n in (64, 16, 256)
+            xn = rand(n)
+            @test k(xn) == sum(pointwise(xn))
+        end
+    end
+
+    @testset "a PreparedKernel reuses its selected plan" begin
+        g = Graph()
+        x = value!(g, :x, Vector{Float64})
+        copied = value!(g, :copied, Vector{Float64})
+        add!(g, x => copied, copy)
+        prepared = prepare(g; have = (x,), want = (copied,))
+        k = prepare_nonallocating(prepared)
+        @test k isa NonAllocatingKernel
+        @test k([1.0, 2.0]) == [1.0, 2.0]
+        @test [r.id for r in k.plan.recipes] == [r.id for r in prepared.plan.recipes]
+    end
+
+    @testset "decomposition resolves the authoring module's own bindings" begin
+        # A shadowed `vcat`: the decomposed step must call the module's
+        # binding, never a name-based Base.vcat guess.
+        parity = ShadowedVcatFixture.check_parity()
+        @test parity
+        # A non-const global in the captured source keeps the whole-recipe
+        # fallback and stays correct.
+        @test NonConstGlobalFixture.check_parity()
     end
 
     @testset "multi-output recipes fail at preparation" begin
