@@ -21,6 +21,7 @@ const COMPARISON_PACKAGES = (
     "Distributions", "BenchmarkTools",
 )
 
+# DOCS-BASELINE-BEGIN: turing
 Turing.@model function turing_eight_schools(observations, observation_scales)
     μ ~ Normal(0, 5)
     τ ~ truncated(Cauchy(0, 5); lower = 0)
@@ -35,7 +36,9 @@ Turing.@model function turing_eight_schools(observations, observation_scales)
     end
     return nothing
 end
+# DOCS-BASELINE-END: turing
 
+# DOCS-BASELINE-BEGIN: manual
 _normal_logpdf(x, location, scale, log_scale = log(scale)) =
     -0.5 * log(2π) - log_scale - 0.5 * ((x - location) / scale)^2
 
@@ -89,6 +92,7 @@ _manual_constrained_likelihood(parameters, observations, observation_scales) =
     _manual_likelihood(parameters.θ, observations, observation_scales)
 _manual_constrained_pointwise(parameters, observations, observation_scales) =
     _manual_pointwise(parameters.θ, observations, observation_scales)
+# DOCS-BASELINE-END: manual
 
 function _turing_vector(ldf, parameters)
     accumulator = DynamicPPL.OnlyAccsVarInfo(
