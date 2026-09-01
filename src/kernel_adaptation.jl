@@ -553,6 +553,62 @@ effect_lowering_port(authority, argtypes::Type{<:Tuple}, result::Type;
         Val(:lowering_authority), authority, argtypes, result; kwargs...)
 
 """
+    rng_provider(State; normal_fill, bool_draw, exp_draw)
+
+Declare the internal functional lowering for source-authored ordered RNG calls.
+`State` is the concrete, finite provider-state type carried by the authored
+`rng` formal after functionalization. The three compiler-authority callbacks
+have contracts
+
+```julia
+normal_fill(state, destination) -> (state=state2, value=destination2, valid=ok)
+bool_draw(state)                -> (state=state2, value=bit,          valid=ok)
+exp_draw(state)                 -> (state=state2, value=exponential,  valid=ok)
+```
+
+They are compiler metadata, not source-call replacements: authored
+`Random.randn!`, `Random.rand(rng, Bool)`, and `Random.randexp` expressions
+remain unchanged. Ordinary native execution therefore continues to accept
+standard Julia `AbstractRNG` implementations, while a functional backend
+threads `State` explicitly through the transition's `arguments` result. Each
+callback must be an explicitly reviewed `total_functional_lowering`; it may
+return replacement arrays but must not mutate the live state or destination.
+"""
+struct RNGProvider{State,N,B,E}
+    normal_fill::N
+    bool_draw::B
+    exp_draw::E
+end
+
+function rng_provider(::Type{State}; normal_fill, bool_draw, exp_draw) where
+        {State}
+    isconcretetype(State) || throw(ArgumentError(
+        "RNG provider state must be concrete"))
+    State <: Random.AbstractRNG && throw(ArgumentError(
+        "RNG provider state cannot be a host AbstractRNG; pass the " *
+        "AbstractRNG only to ordinary native execution and use finite " *
+        "backend state for functionalization"))
+    _sm_effect_state_domain(State) || throw(ArgumentError(
+        "RNG provider state must use the recursive builtin domain"))
+    all(callback -> callback isa _TotalFunctionalLowering,
+        (normal_fill, bool_draw, exp_draw)) || throw(ArgumentError(
+            "RNG provider callbacks must use total_functional_lowering"))
+    RNGProvider{State,typeof(normal_fill),typeof(bool_draw),typeof(exp_draw)}(
+        normal_fill, bool_draw, exp_draw)
+end
+
+_sm_rng_provider_state_type(::RNGProvider{State}) where {State} = State
+_sm_rng_provider_state_type(::Type{<:RNGProvider{State}}) where {State} = State
+
+function _sm_freeze_rng_provider(provider::RNGProvider{State}) where {State}
+    normal_fill = _sm_compiler_static_snapshot(provider.normal_fill)
+    bool_draw = _sm_compiler_static_snapshot(provider.bool_draw)
+    exp_draw = _sm_compiler_static_snapshot(provider.exp_draw)
+    RNGProvider{State,typeof(normal_fill),typeof(bool_draw),typeof(exp_draw)}(
+        normal_fill, bool_draw, exp_draw)
+end
+
+"""
     OrderedRNGReplay(normals, uniforms, exponentials, events)
 
 Typed, finite replay storage for ordered RNG effects in a functionalized
@@ -671,7 +727,7 @@ end
         replay.normals, replay.uniforms, replay.exponentials,
         replay.event_tokens, next_index, replay.uniform_index,
         replay.exponential_index, next_event, replay.overflow .| .!valid)
-    (value=value, replay=next, valid=valid)
+    (state=next, value=value, valid=valid)
 end
 
 @inline function _sm_ordered_rng_uniform_candidate(replay::OrderedRNGReplay)
@@ -687,7 +743,7 @@ end
         replay.normals, replay.uniforms, replay.exponentials,
         replay.event_tokens, replay.normal_index, next_index,
         replay.exponential_index, next_event, replay.overflow .| .!valid)
-    (value=value, replay=next, valid=valid)
+    (state=next, value=value, valid=valid)
 end
 
 @inline function _sm_ordered_rng_exponential_candidate(replay::OrderedRNGReplay)
@@ -705,7 +761,7 @@ end
         replay.normals, replay.uniforms, replay.exponentials,
         replay.event_tokens, replay.normal_index, replay.uniform_index,
         next_index, next_event, replay.overflow .| .!valid)
-    (value=value, replay=next, valid=valid)
+    (state=next, value=value, valid=valid)
 end
 
 function _sm_validate_ordered_rng_storage(replay::OrderedRNGReplay)
@@ -762,6 +818,81 @@ function _sm_ordered_rng_replay_type(::Type{T}) where {T}
         _kernel_dom_int_scalar(UI) && UI !== Bool &&
         _kernel_dom_int_scalar(EI) && EI !== Bool &&
         _kernel_dom_int_scalar(TI) && TI !== Bool && O === Bool
+end
+
+struct _OrderedRNGReplayNormal end
+struct _OrderedRNGReplayBool end
+struct _OrderedRNGReplayExp end
+
+@inline (::_OrderedRNGReplayNormal)(state, destination) =
+    _sm_ordered_rng_normal_candidate(state, destination)
+@inline (::_OrderedRNGReplayBool)(state) =
+    _sm_ordered_rng_uniform_candidate(state)
+@inline (::_OrderedRNGReplayExp)(state) =
+    _sm_ordered_rng_exponential_candidate(state)
+
+_sm_replay_rng_provider(::Type{State}) where {State<:OrderedRNGReplay} =
+    rng_provider(State;
+        normal_fill=total_functional_lowering(_OrderedRNGReplayNormal()),
+        bool_draw=total_functional_lowering(_OrderedRNGReplayBool()),
+        exp_draw=total_functional_lowering(_OrderedRNGReplayExp()))
+
+function _sm_validate_rng_candidate(provider::RNGProvider, token,
+                                    candidate, live_state,
+                                    live_value=nothing)
+    candidate isa NamedTuple &&
+        propertynames(candidate) == (:state, :value, :valid) ||
+        throw(ArgumentError(
+            "RNG provider draw must return exactly (state, value, valid)"))
+    _sm_functional_argument_type_ok(
+        typeof(candidate.state), typeof(live_state)) || throw(ArgumentError(
+            "RNG provider replacement state changed its logical type"))
+    _sm_functional_shape_ok(candidate.state, live_state) ||
+        throw(ArgumentError(
+            "RNG provider replacement state changed its live axes"))
+    if token === Symbol("__rk_rng_Random_randn!__")
+        _sm_functional_argument_type_ok(
+            typeof(candidate.value), typeof(live_value)) ||
+            throw(ArgumentError(
+                "RNG provider normal value changed the destination logical type"))
+        _sm_functional_shape_ok(candidate.value, live_value) ||
+            throw(ArgumentError(
+                "RNG provider normal value changed the destination axes"))
+    elseif token === Symbol("__rk_rng_Random_rand__")
+        _sm_functional_argument_type_ok(typeof(candidate.value), Bool) ||
+            throw(ArgumentError(
+                "RNG provider Bool draw did not return logical Bool"))
+    elseif token === Symbol("__rk_rng_Random_randexp__")
+        _sm_functional_argument_type_ok(typeof(candidate.value), Float64) ||
+            throw(ArgumentError(
+                "RNG provider exponential draw did not return logical Float64"))
+    else
+        throw(ArgumentError("unknown ordered RNG token `$token`"))
+    end
+    _sm_functional_argument_type_ok(typeof(candidate.valid), Bool) ||
+        throw(ArgumentError(
+            "RNG provider validity flag did not return logical Bool"))
+    candidate
+end
+
+@inline function _sm_rng_normal_candidate(provider::RNGProvider, state,
+                                           destination)
+    candidate = provider.normal_fill(state, destination)
+    _sm_validate_rng_candidate(
+        provider, Symbol("__rk_rng_Random_randn!__"), candidate, state,
+        destination)
+end
+
+@inline function _sm_rng_bool_candidate(provider::RNGProvider, state)
+    candidate = provider.bool_draw(state)
+    _sm_validate_rng_candidate(
+        provider, Symbol("__rk_rng_Random_rand__"), candidate, state)
+end
+
+@inline function _sm_rng_exp_candidate(provider::RNGProvider, state)
+    candidate = provider.exp_draw(state)
+    _sm_validate_rng_candidate(
+        provider, Symbol("__rk_rng_Random_randexp__"), candidate, state)
 end
 
 _kernel_field_registration_noeffect(::_PureCallablePort) = true
@@ -1224,27 +1355,38 @@ function _sm_primitive_result(@nospecialize(f), argts::Tuple)
     _sm_reject("primitive `$f` has no sanctioned stateful-method output rule")
 end
 
-function _sm_ordered_rng_result(token, argts::Tuple)
+function _sm_ordered_rng_result(token, argts::Tuple,
+                                ::Type{Provider}=Nothing) where {Provider}
     isempty(argts) && _sm_reject("ordered RNG effect has no RNG argument")
     replay = first(argts)
     replay_ok = _sm_ordered_rng_replay_type(replay)
+    provider_ok = if Provider === Nothing
+        false
+    else
+        Provider <: RNGProvider || _sm_reject(
+            "ordered RNG compiler port is not an RNGProvider")
+        _sm_rng_provider_state_type(Provider) === replay || _sm_reject(
+            "ordered RNG provider state `$(_sm_rng_provider_state_type(Provider))` " *
+            "does not match logical formal state `$replay`")
+        true
+    end
     if token === Symbol("__rk_rng_Random_randn!__")
         length(argts) == 2 && _kernel_dom_num_array(argts[2]) &&
             argts[2] <: AbstractVector && eltype(argts[2]) <: AbstractFloat ||
             _sm_reject(
-                "randn! replay requires one builtin floating vector destination")
+                "randn! lowering requires one builtin floating vector destination")
         if replay_ok
             normals = fieldtype(replay, :normals)
             _kernel_dom_num_matrix(normals) &&
                 eltype(normals) === eltype(argts[2]) || _sm_reject(
                 "randn! replay tape and destination must share one builtin element type")
-        else
+        elseif !provider_ok
             _kernel_effect_callee_domain_ok(Random.randn!, argts) ||
                 _sm_reject("randn! rejects exact operand types $argts")
         end
         return argts[2]
     elseif token === Symbol("__rk_rng_Random_randexp__")
-        length(argts) == 1 || _sm_reject("randexp replay requires one RNG argument")
+        length(argts) == 1 || _sm_reject("randexp lowering requires one RNG argument")
         if replay_ok
             exponentials = fieldtype(replay, :exponentials)
             _kernel_dom_num_array(exponentials) &&
@@ -1253,19 +1395,21 @@ function _sm_ordered_rng_result(token, argts::Tuple)
                     "randexp replay requires a builtin Float64 exponential tape")
             return Float64
         end
-        _kernel_effect_callee_domain_ok(Random.randexp, argts) ||
-            _sm_reject("randexp rejects exact operand types $argts")
+        if !provider_ok
+            _kernel_effect_callee_domain_ok(Random.randexp, argts) ||
+                _sm_reject("randexp rejects exact operand types $argts")
+        end
         return Float64
     elseif token === Symbol("__rk_rng_Random_rand__")
-        length(argts) == 2 || _sm_reject("rand replay requires RNG and sample spec")
+        length(argts) == 2 || _sm_reject("rand lowering requires RNG and sample spec")
         argts[2] === Type{Bool} || _sm_reject(
-            "ordered Bool replay requires exact sample descriptor `Bool`, got `$(argts[2])`")
+            "ordered Bool draw requires exact sample descriptor `Bool`, got `$(argts[2])`")
         if replay_ok
             uniforms = fieldtype(replay, :uniforms)
             _sm_builtin_array(uniforms) && ndims(uniforms) == 1 &&
                 eltype(uniforms) === Bool || _sm_reject(
                 "rand replay requires a builtin Bool vector tape")
-        else
+        elseif !provider_ok
             _kernel_effect_callee_domain_ok(Random.rand, argts) ||
                 _sm_reject("rand rejects exact operand types $argts")
         end
@@ -1273,6 +1417,24 @@ function _sm_ordered_rng_result(token, argts::Tuple)
     end
     _sm_reject("unknown ordered RNG token `$token`")
 end
+
+struct _SMCompilerTypeContext{KeywordTypes,RNGProviderTypes} end
+
+_sm_keyword_types(::Type{T}) where {T} = T
+_sm_keyword_types(
+    ::Type{_SMCompilerTypeContext{KeywordTypes,RNGProviderTypes}}) where
+    {KeywordTypes,RNGProviderTypes} = KeywordTypes
+
+_sm_rng_provider_type(::Type{T}, position::Int) where {T} = Nothing
+function _sm_rng_provider_type(
+        ::Type{_SMCompilerTypeContext{KeywordTypes,RNGProviderTypes}},
+        position::Int) where {KeywordTypes,RNGProviderTypes}
+    position <= length(RNGProviderTypes.parameters) || return Nothing
+    RNGProviderTypes.parameters[position]
+end
+
+_sm_direct_rng_formal_position(::Type) = nothing
+_sm_direct_rng_formal_position(::Type{<:_DFormal{P}}) where {P} = P
 
 _sm_dtype(::Type{_DSlot{T}}, argtypes, ::Type{KWT}, dot::Bool) where {T,KWT} = dot ? _sm_leaf_type(T) : T
 _sm_dtype(::Type{_DStaticType{T}}, argtypes, ::Type{KWT}, dot::Bool) where {T,KWT} =
@@ -1285,8 +1447,9 @@ function _sm_dtype(::Type{_DFormal{P,V}}, argtypes, ::Type{KWT}, dot::Bool) wher
     dot && V ? _sm_leaf_type(T) : T
 end
 function _sm_dtype(::Type{_DKw{N,D}}, argtypes, ::Type{KWT}, dot::Bool) where {N,D,KWT}
-    if KWT <: NamedTuple && N in KWT.parameters[1]
-        T = fieldtype(KWT, N)
+    keywords = _sm_keyword_types(KWT)
+    if keywords <: NamedTuple && N in keywords.parameters[1]
+        T = fieldtype(keywords, N)
         return dot ? _sm_leaf_type(T) : T
     end
     D === Nothing && _sm_reject("required keyword `$N` is absent")
@@ -1401,7 +1564,10 @@ function _sm_dtype(::Type{_DOrderedRNGCall{Token,Args}}, argtypes,
                    ::Type{KWT}, dot::Bool) where {Token,Args,KWT}
     dot && _sm_reject("ordered RNG effects do not admit broadcasting")
     actual = Tuple(_sm_dtype(A, argtypes, KWT, false) for A in Args.parameters)
-    _sm_ordered_rng_result(Token, actual)
+    position = _sm_direct_rng_formal_position(first(Args.parameters))
+    provider = position === nothing ? Nothing :
+        _sm_rng_provider_type(KWT, position)
+    _sm_ordered_rng_result(Token, actual, provider)
 end
 function _sm_dtype(::Type{_DStructuralCopy{Destination,Source}}, argtypes,
                    ::Type{KWT}, dot::Bool) where {Destination,Source,KWT}
@@ -1525,7 +1691,8 @@ _sm_validate_node(::Type{_DReturn{Nothing}}, argtypes, ::Type{KWT}) where {KWT} 
 _sm_validate_node(::Type{_DReturn{R}}, argtypes, ::Type{KWT}) where {R,KWT} =
     (_sm_dtype(R, argtypes, KWT, false); nothing)
 function _sm_validate_node(::Type{_DDefault{N,R}}, argtypes, ::Type{KWT}) where {N,R,KWT}
-    N in KWT.parameters[1] || _sm_dtype(R, argtypes, KWT, false)
+    N in _sm_keyword_types(KWT).parameters[1] ||
+        _sm_dtype(R, argtypes, KWT, false)
     nothing
 end
 
@@ -3241,6 +3408,7 @@ function _sm_machine_actual_domain_ok(::Type{Actual}, ::Type{Declared}) where
         {Actual,Declared}
     Declared === _SMUnannotated || Actual <: Declared || return false
     _sm_ordered_rng_replay_type(Actual) && return true
+    _kernel_dom_rng(Actual) && return true
     Actual <: AbstractMatrix && return _kernel_dom_num_matrix(Actual)
     Actual <: AbstractArray && return _sm_builtin_array(Actual)
     _kernel_dom_num_scalar(Actual)
@@ -3435,16 +3603,17 @@ end
 # traced while-region.  This wrapper keeps the generated body, compiler ports,
 # and ensure tuple concrete and static while exposing the same one-argument
 # step ABI to the backend-neutral control loop.
-struct _FunctionalStateMachineControlStep{F,P,E}
+struct _FunctionalStateMachineControlStep{F,P,R,E}
     f::F
     ports::P
+    rng_providers::R
     ensures::E
 end
 
 @inline function (step::_FunctionalStateMachineControlStep)(carry)
     RuntimeGeneratedFunctions.generated_callfunc(
         getfield(step, :f), getfield(step, :ports),
-        getfield(step, :ensures), carry)
+        getfield(step, :rng_providers), getfield(step, :ensures), carry)
 end
 
 # Structured MethodIR uses a tuple ABI because authored methods may have any
@@ -3452,7 +3621,8 @@ end
 # the straight-line transition above is; only state and arguments are dynamic.
 struct _FunctionalStateMachineTransition{
         Names,Groups,ArrayNames,StateType,EffectType,Iterations,ArgumentTypes,
-        Declared,Forest,F,P,E,C,T,ObservationNames,Step,Bounds}
+        Declared,Forest,F,P,E,C,T,ObservationNames,Step,Bounds,
+        RNGProviders,TypeContext}
     f::F
     ports::P
     ensures::E
@@ -3460,6 +3630,7 @@ struct _FunctionalStateMachineTransition{
     topology_contract::T
     step::Step
     bounds::Bounds
+    rng_providers::RNGProviders
 end
 
 # Keyword arguments are convenient for ordinary Julia, but optional compiler
@@ -4254,9 +4425,20 @@ end
 _sm_observation_names(
     ::_FunctionalStateMachineTransition{
         Names,Groups,ArrayNames,StateType,EffectType,Iterations,ArgumentTypes,
-        Declared,Forest,F,P,E,C,T,ObservationNames,Step}) where
+        Declared,Forest,F,P,E,C,T,ObservationNames,Step,Bounds,RNGProviders,
+        TypeContext}) where
     {Names,Groups,ArrayNames,StateType,EffectType,Iterations,ArgumentTypes,
-     Declared,Forest,F,P,E,C,T,ObservationNames,Step} = ObservationNames
+     Declared,Forest,F,P,E,C,T,ObservationNames,Step,Bounds,RNGProviders,
+     TypeContext} = ObservationNames
+
+_sm_machine_type_context(
+    ::_FunctionalStateMachineTransition{
+        Names,Groups,ArrayNames,StateType,EffectType,Iterations,ArgumentTypes,
+        Declared,Forest,F,P,E,C,T,ObservationNames,Step,Bounds,RNGProviders,
+        TypeContext}) where
+    {Names,Groups,ArrayNames,StateType,EffectType,Iterations,ArgumentTypes,
+     Declared,Forest,F,P,E,C,T,ObservationNames,Step,Bounds,RNGProviders,
+     TypeContext} = TypeContext
 
 @inline function _sm_observation_predicated_select(active, new::T, old::T) where {T}
     new === old && return old
@@ -4532,6 +4714,7 @@ function _sm_functional_machine_call(
         getfield(transition, :ports), state)
     result = RuntimeGeneratedFunctions.generated_callfunc(
         getfield(transition, :f), getfield(transition, :ports),
+        getfield(transition, :rng_providers),
         getfield(transition, :ensures), getfield(transition, :step),
         backend_state, arguments, effects)
     result = _sm_restore_reusable_compiled_output(transition, result)
@@ -4988,14 +5171,16 @@ function _sm_validate_reusable_compiled_output(
 end
 
 function _sm_machine_result_type(
-        ::Type{Forest}, ::Type{ArgumentTypes}) where {Forest,ArgumentTypes}
+        ::Type{Forest}, ::Type{ArgumentTypes},
+        ::Type{TypeContext}=NamedTuple{}) where
+        {Forest,ArgumentTypes,TypeContext}
     return_types = Type[]
     argtypes = Tuple(ArgumentTypes.parameters)
     for node in Forest.parameters
         node <: _DReturn || continue
         rhs = node.parameters[1]
         push!(return_types,
-            _sm_return_dtype(rhs, argtypes, NamedTuple{}))
+            _sm_return_dtype(rhs, argtypes, TypeContext))
     end
     unique!(return_types)
     isempty(return_types) && return Nothing
@@ -5034,7 +5219,8 @@ function _sm_validate_reusable_compiled_raw_output(
         argument isa OrderedRNGReplay &&
             _sm_validate_ordered_rng_storage(argument)
     end
-    expected_result = _sm_machine_result_type(Forest, ArgumentTypes)
+    expected_result = _sm_machine_result_type(
+        Forest, ArgumentTypes, _sm_machine_type_context(transition))
     _sm_functional_argument_type_ok(
         typeof(result.result), expected_result) || throw(ArgumentError(
             "raw backend state-machine result has the wrong logical type"))
@@ -5863,11 +6049,55 @@ function _sm_observation_capacities(ir::MethodIR, field_regs,
     counts
 end
 
+function _sm_bind_rng_providers(ir::MethodIR, argument_types::Tuple,
+                                supplied)
+    supplied isa NamedTuple || throw(ArgumentError(
+        "rng_providers must be a NamedTuple keyed by authored formal name"))
+    formal_names = Tuple(formal.name for formal in ir.formals)
+    unknown = Tuple(name for name in propertynames(supplied)
+                    if !(name in formal_names))
+    isempty(unknown) || throw(ArgumentError(
+        "rng_providers names unknown authored formals $unknown"))
+
+    names = Symbol[]
+    providers = Any[]
+    provider_types = Type[]
+    for (position, formal) in enumerate(ir.formals)
+        state_type = argument_types[position]
+        provider = if hasproperty(supplied, formal.name)
+            getfield(supplied, formal.name)
+        elseif _sm_ordered_rng_replay_type(state_type)
+            _sm_replay_rng_provider(state_type)
+        else
+            nothing
+        end
+        if provider === nothing
+            push!(provider_types, Nothing)
+            continue
+        end
+        provider isa RNGProvider || throw(ArgumentError(
+            "rng_providers.$(formal.name) is not an RNG provider"))
+        _sm_rng_provider_state_type(provider) === state_type ||
+            throw(ArgumentError(
+                "rng_providers.$(formal.name) expects " *
+                "`$(_sm_rng_provider_state_type(provider))`, got " *
+                "logical argument type `$state_type`"))
+        frozen = _sm_freeze_rng_provider(provider)
+        push!(names, formal.name)
+        push!(providers, frozen)
+        push!(provider_types, typeof(frozen))
+    end
+    bound = NamedTuple{Tuple(names)}(Tuple(providers))
+    context = _SMCompilerTypeContext{
+        NamedTuple{},Tuple{provider_types...}}
+    bound, context
+end
+
 function _functional_state_machine_method(
         kernel::_StatefulKernel{S,PF,RT,OW,SH,B,C,T}, ir::MethodIR,
         max_iterations::Int, max_recursion_depth::Int,
         max_control_steps::Int, ::Type{ArgumentTypes}, ::Type{Declared},
-        ::Type{Forest}, bounds=nothing) where
+        ::Type{Forest}, bounds, supplied_rng_providers) where
         {S,PF,RT,OW,SH,B,C,T,ArgumentTypes,Declared,Forest}
     max_iterations >= 1 || _sm_reject(
         "functional state-machine bound must be positive")
@@ -5888,11 +6118,13 @@ function _functional_state_machine_method(
         max_control_steps >= 1 || _sm_reject(
             "functional recursive state-machine step bound must be positive")
     end
+    rng_providers, type_context = _sm_bind_rng_providers(
+        ir, argument_types, supplied_rng_providers)
     field_regs = _stateful_field_regs(getfield(kernel, :bindings))
     transition_forest = if recursive
         _sm_control_effect_only_root(Forest, ir, field_regs)
     else
-        _sm_validate_forest(Forest, argument_types, NamedTuple{})
+        _sm_validate_forest(Forest, argument_types, type_context)
         Forest
     end
 
@@ -6093,15 +6325,16 @@ function _functional_state_machine_method(
         effect = _sm_exact_ordered_rng(call)
         position = effect.rng_arg
         position isa Int && position <= length(arguments) || _sm_reject(
-            "ordered RNG descriptor has no valid replay argument")
-        replay = arguments[position]
-        logical_position = findfirst(isequal(replay),
+            "ordered RNG descriptor has no valid state argument")
+        rng_state = arguments[position]
+        logical_position = findfirst(isequal(rng_state),
             Any[base_syms[(:formal, formal.name)] for formal in ir.formals])
         logical_position === nothing && _sm_reject(
-            "ordered RNG replay must be threaded from one direct method formal")
-        replay_type = argument_types[logical_position]
-        _sm_ordered_rng_replay_type(replay_type) || _sm_reject(
-            "ordered RNG formal does not carry the typed replay contract")
+            "ordered RNG state must be threaded from one direct method formal")
+        formal_name = ir.formals[logical_position].name
+        hasproperty(rng_providers, formal_name) || _sm_reject(
+            "ordered RNG formal `$formal_name` has no typed provider")
+        provider = :(getfield(rng_providers, $(QuoteNode(formal_name))))
         available = bind!(
             :(_sm_predicated_and($active,
                 _sm_predicated_not($control_overflow))),
@@ -6109,32 +6342,32 @@ function _functional_state_machine_method(
         candidate_expression = if effect.token ===
                 Symbol("__rk_rng_Random_randn!__")
             length(arguments) == 2 || _sm_reject(
-                "ordered normal replay requires one destination")
-            :(_sm_ordered_rng_normal_candidate(
-                $replay, $(arguments[2])))
+                "ordered normal provider requires one destination")
+            :(_sm_rng_normal_candidate(
+                $provider, $rng_state, $(arguments[2])))
         elseif effect.token === Symbol("__rk_rng_Random_rand__")
             length(arguments) == 2 || _sm_reject(
-                "ordered uniform replay requires one sample descriptor")
-            :(_sm_ordered_rng_uniform_candidate($replay))
+                "ordered Bool provider requires one sample descriptor")
+            :(_sm_rng_bool_candidate($provider, $rng_state))
         elseif effect.token === Symbol("__rk_rng_Random_randexp__")
             length(arguments) == 1 || _sm_reject(
-                "ordered exponential replay accepts only its replay")
-            :(_sm_ordered_rng_exponential_candidate($replay))
+                "ordered exponential provider accepts only its state")
+            :(_sm_rng_exp_candidate($provider, $rng_state))
         else
-            _sm_reject("ordered RNG token `$(effect.token)` has no replay lowering")
+            _sm_reject("ordered RNG token `$(effect.token)` has no provider lowering")
         end
         candidate = bind!(candidate_expression, :__sfm_rng_candidate_)
         valid = bind!(:(getfield($candidate, :valid)), :__sfm_rng_valid_)
         mark_invalid!(available, valid)
-        replacement = :(getfield($candidate, :replay))
+        replacement = :(getfield($candidate, :state))
         updated = bind!(
-            :(_sm_predicated_select($available, $replacement, $replay)),
-            :__sfm_rng_replay_)
+            :(_sm_predicated_select($available, $replacement, $rng_state)),
+            :__sfm_rng_state_)
         for (key, value) in collect(syms)
-            isequal(value, replay) && (syms[key] = updated)
+            isequal(value, rng_state) && (syms[key] = updated)
         end
         for (key, value) in collect(base_syms)
-            isequal(value, replay) && (base_syms[key] = updated)
+            isequal(value, rng_state) && (base_syms[key] = updated)
         end
         provider_symbols = provider_argument_syms[]
         provider_symbols === nothing ||
@@ -7429,14 +7662,14 @@ function _functional_state_machine_method(
         end
         formal_alias_key(mid, name) = Symbol(:alias_m_, mid, :__, name)
 
-        # An ordered RNG replay is one typed provider threaded through the
-        # recursive call graph, not a value copied independently into each
-        # suspended frame.  Discover each callee formal's root argument by
+        # A logical RNG state is one typed provider authority threaded through
+        # the recursive call graph, not a value copied independently into each
+        # suspended frame. Discover each callee formal's root argument by
         # following direct MethodIR formal edges; ambiguous or opaque provider
         # flow remains rejected before emission.
         provider_formals = Dict{Tuple{Int,Symbol},Int}()
         for (position, formal) in enumerate(ir.formals)
-            _sm_ordered_rng_replay_type(argument_types[position]) || continue
+            hasproperty(rng_providers, formal.name) || continue
             provider_formals[(program.root_mid, formal.name)] = position
         end
         changed = true
@@ -7446,14 +7679,10 @@ function _functional_state_machine_method(
                 block.term === :call || continue
                 callee = block.callee_mid
                 for (name, position) in program.formal_positions[callee]
-                    _sm_ordered_rng_replay_type(
-                        frame_types[callee][name]) || continue
                     position <= length(block.arguments) || _sm_reject(
                         "typed RNG provider call has a missing argument")
                     actual = block.arguments[position]
-                    actual isa _FormalRef || _sm_reject(
-                        "typed RNG provider must cross recursive calls " *
-                        "through a direct formal")
+                    actual isa _FormalRef || continue
                     source = get(provider_formals,
                         (block.mid, actual.arg), nothing)
                     source === nothing && continue
@@ -8117,7 +8346,7 @@ function _functional_state_machine_method(
         )))
 
         statements = outer_statements
-        control_step_fn = compile(:((ports, ensures, $carry_arg) ->
+        control_step_fn = compile(:((ports, rng_providers, ensures, $carry_arg) ->
             $(Expr(:block, step_statements...))))
         carry = bind!(initial_carry, :__sfm_control_initial_)
         finished = bind!(
@@ -8266,7 +8495,7 @@ function _functional_state_machine_method(
             outbox=NamedTuple{$observation_names}(($(outboxes...),)),
         )))
     end
-    fn = compile(:((ports, ensures, $control_step_arg,
+    fn = compile(:((ports, rng_providers, ensures, $control_step_arg,
                     state, arguments, input_effects) ->
         $(Expr(:block, statements...))))
     state_type = _sm_state_snapshot_type(plan, OW, SH)
@@ -8276,16 +8505,17 @@ function _functional_state_machine_method(
         for name in effect_names]
     effect_type = typeof(NamedTuple{effect_names}((initial_effect_values...,)))
     control_step = recursive ? _FunctionalStateMachineControlStep(
-        control_step_fn, ports, Tuple(ensures)) : nothing
+        control_step_fn, ports, rng_providers, Tuple(ensures)) : nothing
     _FunctionalStateMachineTransition{
         names,alias_groups,array_names,state_type,effect_type,max_iterations,
         ArgumentTypes,
         Declared,transition_forest,
         typeof(fn),typeof(ports),typeof(Tuple(ensures)),C,T,
-        observation_names,
-        typeof(control_step),typeof(bounds)}(
+        observation_names,typeof(control_step),typeof(bounds),
+        typeof(rng_providers),type_context}(
             fn, ports, Tuple(ensures), getfield(kernel, :shape_contract),
-            getfield(kernel, :topology_contract), control_step, bounds)
+            getfield(kernel, :topology_contract), control_step, bounds,
+            rng_providers)
 end
 
 function _sm_straight_return_spec(::Type{Forest}) where {Forest}
@@ -8907,7 +9137,10 @@ function _functionalize_stateful(kernel::_StatefulKernel, ::Val{Name};
                                  max_recursion_depth=nothing,
                                  max_control_steps=nothing,
                                  argument_types=nothing,
-                                 control_bounds=nothing) where {Name}
+                                 control_bounds=nothing,
+                                 rng_providers=NamedTuple()) where {Name}
+    rng_providers isa NamedTuple || _sm_reject(
+        "rng_providers must be a NamedTuple keyed by authored formal name")
     methods = Tuple(ir for ir in method_irs(getfield(kernel, :skeleton))
                     if ir.id.name === Name)
     length(methods) == 1 || _sm_reject(
@@ -8962,13 +9195,15 @@ function _functionalize_stateful(kernel::_StatefulKernel, ::Val{Name};
         forest = runtime_type.parameters[3]
         return _functional_state_machine_method(
             kernel, ir, bound, recursion_depth, control_steps,
-            argument_types, declared, forest, control_bounds)
+            argument_types, declared, forest, control_bounds, rng_providers)
     end
     control_bounds === nothing || _sm_reject(
         "StatefulControlBounds is valid only for a structured state-machine method")
     max_iterations === nothing && max_recursion_depth === nothing &&
         max_control_steps === nothing || _sm_reject(
         "control bounds are only valid for a structured state-machine method")
+    isempty(propertynames(rng_providers)) || _sm_reject(
+        "rng_providers is only valid for a structured state-machine method")
     explicit_return = any(statement -> statement isa _Return, ir.body)
     if explicit_return
         argument_types isa Type && argument_types <: Tuple &&
@@ -8999,7 +9234,9 @@ end
                            max_iterations=nothing,
                            max_recursion_depth=nothing,
                            max_control_steps=nothing,
-                           argument_types=nothing)
+                           argument_types=nothing,
+                           control_bounds=nothing,
+                           rng_providers=NamedTuple())
 
 Compile one captured method of a compiled stateful kernel into a
 backend-neutral functional transition. Structured dynamic control requires an
@@ -9008,8 +9245,11 @@ method additionally requires finite `max_recursion_depth` and
 `max_control_steps` bounds. A straight-line
 method with an explicit source return requires its one-argument logical
 `argument_types` contract so the exact return type can be derived from MethodIR;
-a mutation-only method retains the state-returning ABI. Unsupported domains fail
-closed before backend tracing.
+a mutation-only method retains the state-returning ABI. `rng_providers` is a
+NamedTuple keyed by the authored RNG formal name. Each provider is static
+compiler metadata; its finite state remains in the ordinary positional
+argument and is returned in `result.arguments`. Replay arguments infer their
+provider automatically. Unsupported domains fail closed before backend tracing.
 """
 functionalize_stateful(kernel::_StatefulKernel, method::Val; kwargs...) =
     _functionalize_stateful(kernel, method; kwargs...)

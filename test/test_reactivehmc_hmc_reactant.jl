@@ -736,6 +736,24 @@ end
     @test Bool(mismatch.arguments[1].overflow)
     @test Int(mismatch.arguments[1].event_index) == 1
 
+    native_provider = ReactiveKernels.rng_provider(Val(:reactant))
+    native_transition = ReactiveKernels.functionalize_stateful(
+        uniform_kernel, Val(:step!);
+        argument_types=Tuple{Vector{UInt64},Bool},
+        rng_providers=(rng=native_provider,))
+    seed_host = UInt64[1, 5]
+    seed = _rhmc_hmc_trace(seed_host)
+    compiled_native = @compile native_transition(
+        uniform_state, seed, take)
+    native_active = compiled_native(uniform_state, seed, take)
+    @test Bool(native_active.result) === Bool(native_active.state.value)
+    @test Array(native_active.arguments[1]) != seed_host
+    @test !Bool(native_active.control_overflow)
+    native_inactive = compiled_native(uniform_state, seed, skip)
+    @test !Bool(native_inactive.result)
+    @test Array(native_inactive.arguments[1]) == seed_host
+    @test !Bool(native_inactive.control_overflow)
+
     source = _RHMCReactantEffectSource(:source)
     configuration = [2]
     effect_port = ReactiveKernels.effect_lowering_port(

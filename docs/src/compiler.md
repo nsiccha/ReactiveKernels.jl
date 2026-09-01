@@ -621,7 +621,7 @@ builtin non-`Bool` integer type. Integer `abs`, mixed-integer `div`, `Bool`,
 they reject before executable lowering.
 
 `functionalize_stateful(kernel, Val(:method); max_iterations,
-argument_types)` produces the backend-neutral functional program;
+argument_types, rng_providers)` produces the backend-neutral functional program;
 `stateful_snapshot` supplies its initial value surface. Dynamic structured
 control requires a positive finite loop bound. A bound violation, an active
 out-of-bounds indexed access, or exhausted effect storage sets a control
@@ -647,18 +647,38 @@ integer type. The compiler neither subtracts extreme bounds nor adds host-Int
 offsets, avoiding wraparound and small-integer promotion while preserving an
 explicit overflow/rollback result.
 
-The typed
-`OrderedRNGReplay` value carries independent floating normal, Boolean uniform,
-and exact Float64 exponential tapes, per-kind cursors, one global ordered event
-tape/cursor, and sticky overflow. `randn!` is admitted only for an immediate
-whole-vector state replacement with the declared destination/result alias;
-`rand(rng, Bool)` retains the exact captured type descriptor. Conditional
-source paths consume only the effects they enter, and an event-kind mismatch
-or exhausted tape fails closed while preserving the attempted replay receipt.
-Every consumed normal column is rechecked for finiteness and every consumed
-exponential for finiteness and nonnegativity, including dynamic traced tapes;
-invalid consumed data sets sticky overflow and atomically rolls state back,
-while unconsumed padding remains irrelevant.
+Ordered RNG is one typed internal effect authority. Authored kernels keep the
+ordinary Julia expressions `Random.randn!(rng, destination)`,
+`Random.rand(rng, Bool)`, and `Random.randexp(rng)`, including draws nested in
+guards, short-circuit expressions, and conditional values. Native execution
+therefore uses a standard Julia `AbstractRNG` directly. Functional compilation
+instead binds the same unannotated logical `rng` formal through
+`rng_provider(State; normal_fill, bool_draw, exp_draw)`. The provider is frozen
+compiler metadata; only its finite `State` crosses the dynamic ABI, and the
+updated state is returned at the same position in `result.arguments`. A source
+annotation such as `rng::AbstractRNG` intentionally rejects a tensor-state
+provider rather than capturing a host RNG in a traced executable. Changing
+provider type or backend state shape requires explicit recompilation.
+
+The Reactant extension supplies `rng_provider(Val(:reactant))`, backed by
+Reactant's native RNG operations over a two-word `Vector{UInt64}` logical seed.
+It generates fresh normal, Boolean, and exponential values inside the compiled
+program; it does not pre-generate host tapes and does not promise stream parity
+with a Julia `AbstractRNG`. Split/fold semantics are deliberately deferred
+until replica batching needs them.
+
+`OrderedRNGReplay` remains the exact parity and failure oracle and infers its
+provider automatically. It carries independent floating normal, Boolean
+uniform, and exact Float64 exponential tapes, per-kind cursors, one global
+ordered event tape/cursor, and sticky overflow. `randn!` is admitted only for
+an immediate whole-vector state replacement with the declared
+destination/result alias; `rand(rng, Bool)` retains the exact captured type
+descriptor. Conditional source paths consume only the effects they enter, and
+an event-kind mismatch or exhausted tape fails closed while preserving the
+attempted replay receipt. Every consumed normal column is rechecked for
+finiteness and every consumed exponential for finiteness and nonnegativity,
+including dynamic traced tapes; invalid consumed data sets sticky overflow and
+atomically rolls state back, while unconsumed padding remains irrelevant.
 
 Causal auxiliary effects are explicit continuation state, not hidden compiler
 state. `initial_transition_effects(transition)` constructs the first value.

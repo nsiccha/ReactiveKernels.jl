@@ -1,5 +1,6 @@
 using ReactiveKernels
 using LinearAlgebra
+using Random
 using Test
 import TOML
 
@@ -43,6 +44,19 @@ end
 struct _ArrayEffect end
 (::_ArrayEffect)(effect, state) = (
     arguments=(state,), result=nothing, effect_state=effect .+ 1)
+
+struct _CounterRNGNormal end
+struct _CounterRNGBool end
+struct _CounterRNGExp end
+
+@inline function (::_CounterRNGNormal)(state, destination)
+    value = zero.(destination) .+ convert(eltype(destination), first(state))
+    (state=state .+ one(eltype(state)), value, valid=true)
+end
+@inline (::_CounterRNGBool)(state) = (
+    state=state .+ one(eltype(state)), value=isodd(first(state)), valid=true)
+@inline (::_CounterRNGExp)(state) = (
+    state=state .+ one(eltype(state)), value=Float64(first(state)), valid=true)
 
 function _effect_contract_program(source, port)
     bindings = ReactiveKernels.stateful_compiler_bindings(callback=port)
@@ -496,6 +510,58 @@ end
     @test active.arguments[1].event_index == 2
     @test active.arguments[1].uniform_index == 2
     @test !active.arguments[1].overflow
+
+    @test_throws ArgumentError ReactiveKernels.rng_provider(Vector{UInt64};
+        normal_fill=_CounterRNGNormal(),
+        bool_draw=_CounterRNGBool(),
+        exp_draw=_CounterRNGExp())
+    provider = ReactiveKernels.rng_provider(Vector{UInt64};
+        normal_fill=ReactiveKernels.total_functional_lowering(
+            _CounterRNGNormal()),
+        bool_draw=ReactiveKernels.total_functional_lowering(
+            _CounterRNGBool()),
+        exp_draw=ReactiveKernels.total_functional_lowering(
+            _CounterRNGExp()))
+    provider_transition = ReactiveKernels.functionalize_stateful(
+        kernel, Val(:step!);
+        argument_types=Tuple{Vector{UInt64},Bool},
+        rng_providers=(rng=provider,))
+    provider_state = UInt64[1, 5]
+    provider_active = provider_transition(state, provider_state, true)
+    @test provider_active.result && provider_active.state.value
+    @test provider_active.arguments[1] == UInt64[2, 6]
+    provider_inactive = provider_transition(state, provider_state, false)
+    @test !provider_inactive.result
+    @test provider_inactive.arguments[1] == provider_state
+    @test provider_inactive.state == state
+    @test_throws ReactiveKernels._LLowerReject begin
+        ReactiveKernels.functionalize_stateful(
+            kernel, Val(:step!);
+            argument_types=Tuple{Vector{UInt64},Bool})
+    end
+    @test_throws ArgumentError begin
+        ReactiveKernels.functionalize_stateful(
+            kernel, Val(:step!);
+            argument_types=Tuple{Vector{UInt64},Bool},
+            rng_providers=(unknown=provider,))
+    end
+    @test_throws ArgumentError ReactiveKernels.rng_provider(
+        Random.Xoshiro;
+        normal_fill=ReactiveKernels.total_functional_lowering(
+            _CounterRNGNormal()),
+        bool_draw=ReactiveKernels.total_functional_lowering(
+            _CounterRNGBool()),
+        exp_draw=ReactiveKernels.total_functional_lowering(
+            _CounterRNGExp()))
+
+    native_rng = Random.Xoshiro(91)
+    oracle_rng = Random.Xoshiro(91)
+    expected_native = Random.rand(oracle_rng, Bool)
+    native_state = kernel(false, 0)
+    @test ReactiveKernels.stateful_call(
+        native_state, Val(:step!), native_rng, true)
+    @test ReactiveKernels.stateful_snapshot(native_state).value ===
+          expected_native
 
     exhausted = ReactiveKernels._sm_ordered_rng_with_cursors(
         uniform, 1, 2, 1, 1, false)
