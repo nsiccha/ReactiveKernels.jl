@@ -1,5 +1,9 @@
 # Online statistics: the ReactiveHMC kernel, compiled
 
+```@eval
+Main.ReactiveKernelsDocs.render_review_status(:frozen_sampling)
+```
+
 This page uses the actual stateful shape from
 [ReactiveHMC.jl at `ca9ea4c`](https://github.com/nsiccha/ReactiveHMC.jl/blob/ca9ea4ca41924bb0e1fadc01c717e1333916aba6/src/adaptation.jl#L47-L59):
 one object owns `n`, `mean`, and `var`; `step!` updates a vector; and the matrix

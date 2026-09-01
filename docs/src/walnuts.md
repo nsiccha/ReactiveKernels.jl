@@ -1,5 +1,9 @@
 # WALNUTS-D as mathematical `@kernel` source
 
+```@eval
+Main.ReactiveKernelsDocs.render_review_status(:frozen_sampling)
+```
+
 WALNUTS-D changes the numerical integrator used at each NUTS leaf. Instead of
 committing to one leapfrog step size, it keeps a fixed macro time and tries
 dyadic micro-step grids until the endpoint Hamiltonian error is small enough.

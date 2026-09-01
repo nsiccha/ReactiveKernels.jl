@@ -11,7 +11,8 @@ using Test
         "\"Probabilistic programming\" => [",
         "\"Automatic differentiation\" => [",
         "\"Reactant\" => [",
-        "\"Kernel execution and tools\" => [",
+        "\"Non-allocating kernels\" => \"nonallocating.md\"",
+        "\"Tools and reference\" => [",
         "\"Bijectors\" => \"bijectors.md\"",
         "\"Sampling (experimental)\" => [",
     )
@@ -70,4 +71,40 @@ using Test
     @test occursin("Compiler status: not executed during the docs build", walnuts)
     @test occursin("NUTS source and receipts (not executed)", make)
     @test occursin("WALNUTS-D source (not executed)", make)
+
+    @test !occursin("Building blocks", make)
+    @test !occursin("Kernel execution and tools", make)
+
+    review_states = Dict(
+        :frozen_ppl => (
+            "linear-regression.md", "beta-binomial.md", "poisson-gamma.md",
+            "dugongs-growth.md", "arma11.md", "gaussian-mixture.md",
+        ),
+        :frozen_sampling => (
+            "pathfinder.md", "reactivehmc-corpus.md", "nuts.md",
+            "nutpie-diagonal.md", "walnuts.md", "online-stats.md",
+            "nuts-reactant.md",
+        ),
+        :frozen_bijectors => ("bijectors.md",),
+        :review_pending_nonallocating => ("nonallocating.md",),
+    )
+    for (state, pages) in review_states, page in pages
+        body = read(joinpath(root, "docs", "src", page), String)
+        marker = "render_review_status(:$state)"
+        @test length(split(body, marker)) - 1 == 1
+    end
+    for page in ("eight-schools.md", "mnist-logistic.md")
+        body = read(joinpath(root, "docs", "src", page), String)
+        @test !occursin("render_review_status", body)
+    end
+
+    views = read(joinpath(root, "docs", "result_views.jl"), String)
+    styles = read(
+        joinpath(root, "docs", "src", ".vitepress", "theme", "overrides.css"),
+        String,
+    )
+    @test occursin("data_rk_review_state = status.state", views)
+    @test occursin("review status, not a known runtime failure", views)
+    @test occursin(".rk-review-state--frozen", styles)
+    @test occursin(".rk-review-state--review-pending", styles)
 end

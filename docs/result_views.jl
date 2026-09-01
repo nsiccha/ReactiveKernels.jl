@@ -77,6 +77,62 @@ function render_result_assets()
     )])
 end
 
+const _REVIEW_STATUS_CONTENT = Dict(
+    :frozen_ppl => (
+        state = "frozen",
+        icon = "❄",
+        label = "Frozen model guide",
+        title = "Outside the current PPL review set",
+        body = "This walkthrough is preserved as executable example material, but it has not received the current migration and review pass. Eight Schools and MNIST are the reviewed PPL paths; treat claims on this page as provisional until it is revisited.",
+    ),
+    :frozen_sampling => (
+        state = "frozen",
+        icon = "❄",
+        label = "Frozen sampling guide",
+        title = "Experimental and awaiting re-review",
+        body = "This sampling material is retained as historical or experimental evidence outside the current reviewed set. NUTS and WALNUTS remain source-only in the docs build; do not infer a current supported sampler or compiler capability from this page.",
+    ),
+    :frozen_bijectors => (
+        state = "frozen",
+        icon = "❄",
+        label = "Frozen guide",
+        title = "Preserved, but not recently reviewed",
+        body = "This bijector guide remains available as implementation documentation, but it has not received the current focused review. Treat it as provisional rather than as the front-line supported contract.",
+    ),
+    :review_pending_nonallocating => (
+        state = "review-pending",
+        icon = "◌",
+        label = "Review pending",
+        title = "Implementation retained; guide awaiting review",
+        body = "The non-allocating implementation and its tests remain in place, but this guide has not yet received the current focused review. This label records documentation review status, not a known runtime failure.",
+    ),
+)
+
+"""Render a visible, source-controlled review-state banner for a docs page."""
+function render_review_status(kind::Symbol)
+    haskey(_REVIEW_STATUS_CONTENT, kind) ||
+        error("unknown documentation review status: $(repr(kind))")
+    status = _REVIEW_STATUS_CONTENT[kind]
+    node = h.aside(;
+        class = "rk-review-state rk-review-state--$(status.state)",
+        data_rk_review_state = status.state,
+        aria_label = "Documentation review status",
+    )(
+        h.div(status.icon; class = "rk-review-state__icon", aria_hidden = "true"),
+        h.div(
+            h.div(
+                h.span(status.label; class = "rk-review-state__badge"),
+                h.span("Documentation status"; class = "rk-review-state__eyebrow"),
+                class = "rk-review-state__heading",
+            ),
+            h.strong(status.title; class = "rk-review-state__title"),
+            h.p(status.body),
+            class = "rk-review-state__content",
+        ),
+    )
+    Markdown.MD(Any[_static_block(node)])
+end
+
 _default_cell(value, _) = string(value)
 _default_sort(value, _) = value === missing ? nothing : value
 
