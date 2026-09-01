@@ -44,6 +44,14 @@ jobs:
           - { julia-version: 'lts', julia-arch: x64, os: ubuntu-latest, test-shard: acceptance-benchmarks }
     steps:
       - uses: actions/checkout@v4
+        if: matrix.test-shard != 'acceptance-samplers'
+      # Benchmark source-attestation tests compare current source with exact
+      # historical receipt pins.  Give only that shard the required history;
+      # the other twelve matrix cells retain the ordinary shallow checkout.
+      - uses: actions/checkout@v4
+        if: matrix.test-shard == 'acceptance-samplers'
+        with:
+          fetch-depth: 0
       - uses: julia-actions/setup-julia@v2
         with:
           version: ${{ matrix.julia-version }}
