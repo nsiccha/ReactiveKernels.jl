@@ -530,6 +530,15 @@ end
         ReactiveKernels._sm_backend_storage_value(value.factors),
         value.uplo, value.info)
 
+function ReactiveKernels._sm_materialize_observation(
+        value::_RKBatchedCholesky,
+        ::Type{T}) where {T<:LinearAlgebra.Cholesky}
+    LinearAlgebra.Cholesky(
+        ReactiveKernels._sm_materialize_observation(
+            value.factors, fieldtype(T, :factors)),
+        value.uplo, Int(value.info))
+end
+
 function ReactiveKernels._sm_functional_argument_type_ok(
         ::Type{Actual}, ::Type{Expected}) where
         {Actual<:_RKBatchedCholesky,
