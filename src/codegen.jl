@@ -1379,13 +1379,22 @@ function _bind_nonallocating_constants(ast::Expr, ops::Tuple, caches::Tuple,
 end
 
 """
-    prepare(p::Plan; passes=()) -> PreparedKernel
-    prepare(g::Graph; have, want, passes=()) -> PreparedKernel
+    prepare(p::Plan; passes=(), bound=()) -> PreparedKernel
+    prepare(g::Graph; have, want, passes=(), bound=()) -> PreparedKernel
 
 Ergonomic composition of `plan -> lower -> transform -> compile`. `passes` is a
 tuple of AST passes applied before compilation.
+
+`bound` opts into the [`partial_evaluation`](@ref) pre-pass: pass one
+`Value => data` pair (or an iterable of them) naming HAVE ports whose runtime
+values are fixed for this preparation. The data-only subgraph reachable from
+only those ports runs once, here, and the returned kernel takes just the
+remaining HAVE ports positionally (in their original relative order); the
+hoisted values are baked in as constants. With `bound = ()` (the default)
+behavior is unchanged. `passes` apply to the residual (per-call) kernel.
 """
-function prepare(p::Plan; passes = ())
+function prepare(p::Plan; passes = (), bound = ())
+    p = _partial_apply(p, bound)
     native_ast, ops, recipes = _lower_with_ops(p)
     isempty(passes) || (native_ast = transform(native_ast, passes...))
     if !_needs_embedded_tensorization(p)
@@ -1420,9 +1429,9 @@ function prepare(p::Plan; passes = ())
     PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast, recipes)
 end
 
-function prepare(g::Graph; have = (), want = (), passes = ())
+function prepare(g::Graph; have = (), want = (), passes = (), bound = ())
     p = plan(g; have = have, want = want)
-    prepare(p; passes = passes)
+    prepare(p; passes = passes, bound = bound)
 end
 
 """

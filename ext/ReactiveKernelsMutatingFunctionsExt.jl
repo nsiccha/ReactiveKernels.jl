@@ -151,7 +151,9 @@ function ReactiveKernels.prepare_reactive_nonallocating(spec::ReactiveKernels.Ke
         cache_apply = reactive_cache_apply, is_mutating = is_mutating, kwargs...)
 end
 
-function ReactiveKernels.prepare_nonallocating(p::ReactiveKernels.Plan; passes = ())
+function ReactiveKernels.prepare_nonallocating(p::ReactiveKernels.Plan;
+                                               passes = (), bound = ())
+    p = ReactiveKernels._partial_apply(p, bound)
     # Embedded prepared recipes are already allocation-free executable kernels.
     # Keep them as one cache operation here; ordinary `prepare` is the boundary
     # that splices their generated bodies into a flat operation table.
@@ -161,9 +163,10 @@ function ReactiveKernels.prepare_nonallocating(p::ReactiveKernels.Plan; passes =
 end
 
 function ReactiveKernels.prepare_nonallocating(g::ReactiveKernels.Graph;
-                                                have = (), want = (), passes = ())
+                                                have = (), want = (), passes = (),
+                                                bound = ())
     p = ReactiveKernels.plan(g; have = have, want = want)
-    ReactiveKernels.prepare_nonallocating(p; passes = passes)
+    ReactiveKernels.prepare_nonallocating(p; passes = passes, bound = bound)
 end
 
 # The natural consumer call after benchmarking an ordinary prepared kernel:

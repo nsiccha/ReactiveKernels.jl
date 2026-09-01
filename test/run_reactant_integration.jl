@@ -50,6 +50,8 @@ mktempdir() do env
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $ad_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $phasepoint_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $mutation_profile_b_testfile`)
+    elseif selector == "ad"
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $ad_testfile`)
     elseif selector == "mutation-profile-b"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $mutation_profile_b_testfile`)
     else
