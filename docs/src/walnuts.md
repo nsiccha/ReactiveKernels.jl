@@ -17,11 +17,11 @@ retained as research lineage. The independent acceptance executable compiles
 the pinned C++ header in a separate process; the Julia fixture and compiler do
 not provide their own expected answers.
 
-Every code block below is read at build time from
+Every code block below is read as inert text at build time from
 [`benchmark/walnuts_kernel_authoring_fixture.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/walnuts_kernel_authoring_fixture.jl).
-The docs build also loads that file and requires its 15 captured methods to
-remain valid MethodIR, so GitHub Pages cannot silently publish a stale
-transcription.
+The docs build validates textual source anchors so GitHub Pages cannot silently
+publish a stale transcription, but it does not include the file, load its
+definitions, or request captured MethodIR.
 
 ## State, bounds, and observable replay
 
@@ -86,8 +86,8 @@ Main.ReactiveKernelsDocs.render_walnuts_source(:entry)
 
 ## Compiler status: not executed during the docs build
 
-The docs build does not construct, compile, or execute any part of this fixture
-beyond admitting the displayed `@kernel` source above. The recursive
+The docs build does not include, parse, lower, compile, or execute any part of
+this fixture; it only reads the displayed source bytes above. The recursive
 `step!` / `start!` / `finish!` strongly connected component sits at the active
 compiler frontier: bounded recursive state-machine lowering is under
 development and its contract is still moving, so a build-executed frontier

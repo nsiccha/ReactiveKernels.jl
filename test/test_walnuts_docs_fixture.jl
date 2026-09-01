@@ -31,9 +31,8 @@ using Test
     @test occursin("render_walnuts_source(:nuts_leaf)", page)
     @test occursin("render_walnuts_source(:entry)", page)
     @test occursin("render_walnuts_complete_source()", page)
-    # The docs build stops at source admission for this fixture: the former
-    # build-executed depth-10 compiler-frontier interaction is retired, and
-    # the page must say so honestly instead of claiming compiler execution.
+    # The docs build displays this fixture as inert text: it neither loads the
+    # definitions nor executes the former depth-10 compiler-frontier probe.
     @test !occursin("render_walnuts_source_interaction", page)
     @test !occursin("render_walnuts_source_interaction", helpers)
     @test !occursin("WALNUTS_INSPECTION", interactions)
@@ -41,7 +40,9 @@ using Test
     @test occursin("does not claim full", page)
     @test occursin("recursive-SCC or WALNUTS compiler support", page)
     @test occursin("\"WALNUTS-D mathematical kernel\" => \"walnuts.md\"", make)
-    @test occursin("walnuts_kernel_authoring_fixture.jl", make)
+    @test !occursin("include(joinpath(@__DIR__, \"..\", \"benchmark\", \"walnuts_kernel_authoring_fixture.jl\"))", make)
     @test !occursin("walnuts_compiler_support.jl", make)
+    @test !occursin("WalnutsKernelAuthoringFixture", make)
+    @test !occursin("ReactiveKernels.method_irs(getfield(fixture, :walnuts_state))", helpers)
     @test occursin("\"walnuts.md\" =>", rendered_check)
 end

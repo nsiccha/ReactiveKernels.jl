@@ -308,7 +308,7 @@ function setup_online_stats!(mod::Module)
         Base.include(mod, joinpath(@__DIR__, "..", "examples", "online_stats.jl"))
     end
     Core.eval(mod, :(using Statistics))
-    Core.eval(mod, :(using Main.ReactiveKernelsNUTSExample: NUTSDiagnostics))
+    Core.eval(mod, :(using ReactiveKernelsNUTSExamples: NUTSDiagnostics))
     Core.eval(mod, :(using .OnlineStatsExample:
         MomentsAccumulator, HMCDiagnosticsAccumulator,
         OnlineMoments, OnlineDiagnostics, online_moments, online_diagnostics))
@@ -681,131 +681,6 @@ function render_pathfinder_kernels(::Module)
     rendered
 end
 
-# A docs-scoped stateless extraction of the Euclidean phasepoint recurrence from
-# benchmark/nuts_kernel_authoring_fixture.jl. The complete eight-spec fixture
-# remains byte-locked in nuts.md; this smaller executable authority exists so the
-# selected Hamiltonian work can use the same PreparedKernel three-pane renderer
-# as every other stateless example.
-const NUTS_PHASEPOINT_SOURCE = raw"""
-using LinearAlgebra
-
-docs_nuts_potential(position) = sum(abs2, position) / 2
-docs_nuts_potential_gradient(position) =
-    (docs_nuts_potential(position), copy(position))
-
-@kernel docs_nuts_phasepoint(position, momentum, metric) = begin
-    potential = docs_nuts_potential(position)
-    potential, potential_gradient = docs_nuts_potential_gradient(position)
-    metric_cholesky = cholesky(metric)
-    momentum_gradient = metric_cholesky \ momentum
-    kinetic = oftype(potential, 0.5) *
-        (@node(logdet(metric_cholesky)) + dot(momentum, momentum_gradient))
-    hamiltonian = potential + kinetic
-    hamiltonian_position_gradient = potential_gradient
-    hamiltonian_momentum_gradient = momentum_gradient
-end
-
-inputs = (
-    position = [0.25, -0.5],
-    momentum = [0.4, 0.2],
-    metric = Diagonal([1.0, 2.0]),
-)
-kernel = prepare(
-    docs_nuts_phasepoint;
-    have = (:position, :momentum, :metric),
-    want = (
-        :hamiltonian,
-        :hamiltonian_position_gradient,
-        :hamiltonian_momentum_gradient,
-    ),
-)
-output = kernel(inputs.position, inputs.momentum, inputs.metric)
-
-docs_example = (;
-    name = :NUTS_phasepoint_Hamiltonian,
-    origin = "Euclidean phasepoint recurrence from the sealed NUTS fixture",
-    inputs,
-    kernel,
-    output,
-)
-"""
-
-"""
-    render_nuts_phasepoint(mod) -> Markdown.MD
-
-Build and execute the representative stateless phasepoint Hamiltonian from the
-sealed NUTS fixture, then render its selected plan through the standard shared
-Raw input / Generated kernel / Compute DAG UI.
-"""
-render_nuts_phasepoint(mod::Module) = execute_example(mod, NUTS_PHASEPOINT_SOURCE)
-
-# The FULL compiled NUTS kernel: reactive_nuts_group compiles the per-transition
-# init/fwd/bwd Hamiltonian work into ONE flat ReactiveProgram whose plan is the
-# 67-node Compute DAG. Unlike NUTS_PHASEPOINT_SOURCE (a stateless single-endpoint
-# extraction), this is the reactive three-endpoint group program. A trivial
-# analytic gradient and unit metric only instantiate the graph; its topology is
-# independent of the potential, so no AD backend is needed for the build.
-const NUTS_COMPILED_KERNEL_SOURCE = raw"""
-using LinearAlgebra
-
-# potential_gradient!(g, x) writes g in place and returns the SCALAR potential —
-# the reactive_nuts_group contract (see examples/nuts.jl). A trivial analytic
-# gradient suffices to build the graph; the compiled topology does not depend on it.
-docs_nuts_potential_gradient!(gradient, position) =
-    (gradient .= position; sum(abs2, position) / 2)
-
-dimension = 4
-# reactive_nuts_group is owned by the external NUTS examples package;
-# it compiles init/fwd/bwd Hamiltonian + dham + diverged into one ReactiveProgram.
-group = ReactiveKernelsNUTSExamples.reactive_nuts_group(
-    docs_nuts_potential_gradient!,
-    Matrix(1.0 * I, dimension, dimension),
-    zeros(dimension),
-    zeros(dimension),
-)
-program = reactive_program(group)
-
-# Raw generated artifact: the fused reactive `:dham` (energy-error) getter — one
-# representative compiled getter, NOT a whole-program listing. The renderer
-# turns its positional operation slots into readable recipe expressions.
-generated_dham_getter = code_expr(program, getproperty(group.handles, :dham))
-# Compute DAG pane: the exact reactive_program(group).plan.
-compiled_plan = program.plan
-"""
-
-"""
-    render_nuts_compiled_kernel_dag(mod) -> Markdown.MD
-
-Build the FULL compiled NUTS kernel — the single flat `ReactiveProgram` that
-`reactive_nuts_group` compiles the per-transition Hamiltonian work into — and
-render it through the standard shared Raw input / Generated kernel / Compute DAG
-UI. The source is build-executed: the group and its `ReactiveProgram` are
-constructed while the docs build runs, and the Compute DAG is that exact
-`reactive_program(group).plan`. The Generated pane is the fused `:dham` getter, a
-representative reactive getter rather than a whole-program listing.
-"""
-function render_nuts_compiled_kernel_dag(mod::Module)
-    source = strip(NUTS_COMPILED_KERNEL_SOURCE, '\n')
-    Core.eval(mod, :(using ReactiveKernels))
-    Core.eval(mod, :(using ReactiveKernelsNUTSExamples))
-    _evaluate_source(mod, source)
-    program = Core.eval(mod, :program)
-    group = Core.eval(mod, :group)
-    program isa ReactiveKernels.ReactiveProgram || error(
-        "render_nuts_compiled_kernel_dag: source did not build a ReactiveProgram",
-    )
-    raw_generated = code_expr(program, getproperty(group.handles, :dham))
-    generated = _readable_generated_source(
-        raw_generated, program.plan, "render_nuts_compiled_kernel_dag",
-    )
-    blocks = Any[]
-    _three_pane_blocks!(
-        blocks, "nuts-reactive-group-program",
-        "Full compiled NUTS kernel — reactive group program",
-        source, generated, program.plan)
-    Markdown.MD(blocks)
-end
-
 """
     execute_ppl_example(mod, owner, source; setup) -> Markdown.MD
 
@@ -857,14 +732,10 @@ end
 
 # Benchmark and result rendering lives in result_views.jl.
 
-# The complete NUTS authoring surface is read from its fixture at docs build
-# time. This keeps the public code listing on the same source authority as the
-# compiler tests; `eval_block` failures are fatal in docs/make.jl.
+# The complete NUTS authoring surface is read as inert text at docs build time.
+# The docs build deliberately does not include, parse, lower, compile, or execute
+# this moving compiler/runtime fixture.
 function _nuts_fixture_source()
-    isdefined(Main, :ReactiveKernelsDocsNUTSFixture) || error(
-        "NUTS authoring fixture was not loaded by docs/make.jl",
-    )
-    fixture = Main.ReactiveKernelsDocsNUTSFixture
     path = joinpath(pkgdir(ReactiveKernels), "benchmark",
                     "nuts_kernel_authoring_fixture.jl")
     isfile(path) || error("NUTS authoring fixture is missing: $path")
@@ -880,18 +751,6 @@ function _nuts_fixture_source()
         count == 1 || error(
             "NUTS fixture must contain $marker exactly once; found $count",
         )
-        isdefined(fixture, name) || error(
-            "build-loaded NUTS fixture does not define $name",
-        )
-    end
-    getfield(fixture, :euclidean_phasepoint) isa KernelSpec || error(
-        "build-loaded NUTS Euclidean phase point is not a KernelSpec",
-    )
-    for name in expected[2:end]
-        irs = ReactiveKernels.method_irs(getfield(fixture, name))
-        !isempty(irs) && all(ir -> ir.ok, irs) || error(
-            "build-loaded NUTS fixture has missing or rejected MethodIR for $name",
-        )
     end
     rstrip(source)
 end
@@ -903,7 +762,6 @@ function _run_source_locked_interaction(source::AbstractString, expected::Symbol
     displayed = strip(source, '\n')
     sandbox = Module(gensym(:SourceLockedKernelInteraction), true, true)
     Core.eval(sandbox, :(using ReactiveKernels))
-    Core.eval(sandbox, :(using ReactiveKernelsNUTSExamples))
     _evaluate_source(sandbox, displayed)
     interaction = Core.eval(sandbox, :docs_interaction)
     interaction.name === expected || error(
@@ -1210,19 +1068,11 @@ function render_reactivehmc_inventory()
 end
 
 # WALNUTS-D is a smaller external compiler fixture whose page emphasizes a few
-# mathematical/control slices and still offers its complete source.  Read those
-# bytes directly from the authoritative fixture: the page must never drift into
-# hand-transcribed pseudocode.  docs/make.jl includes the fixture before loading
-# the page, so this display also requires the real @kernel definitions to parse.
+# mathematical/control slices and still offers its complete source. Read those
+# bytes directly from the authoritative fixture as inert text: the page must
+# never drift into hand-transcribed pseudocode, and the docs build must not load
+# or compile the real @kernel definitions.
 function _walnuts_fixture_source()
-    isdefined(Main, :WalnutsKernelAuthoringFixture) || error(
-        "WALNUTS-D authoring fixture was not loaded by docs/make.jl",
-    )
-    fixture = getfield(Main, :WalnutsKernelAuthoringFixture)
-    irs = ReactiveKernels.method_irs(getfield(fixture, :walnuts_state))
-    length(irs) == 15 && all(ir -> ir.ok, irs) || error(
-        "WALNUTS-D docs source no longer has its admitted 15-method MethodIR",
-    )
     path = joinpath(pkgdir(ReactiveKernels), "benchmark",
                     "walnuts_kernel_authoring_fixture.jl")
     isfile(path) || error("WALNUTS-D authoring fixture is missing: $path")

@@ -276,7 +276,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "bijectors.md" => 1,
         "pathfinder.md" => 3,
         "reactivehmc-corpus.md" => 6,
-        "nuts.md" => 2,
+        "nuts.md" => 0,
         "nutpie-diagonal.md" => 2,
         "eight-schools.md" => 1,
         "linear-regression.md" => 1,
@@ -343,7 +343,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         ),
         "nuts.md" => (
             "class=\"rk-status-grid\"",
-            "Full compiled NUTS kernel",
+            "Compiler/runtime execution is disabled in docs",
             "Sampler execution: not part of the docs build",
             "Receipt medians for the matched-control corpus",
             "Compilation and first-call costs",
@@ -397,7 +397,8 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
             ("Eight Schools Extraction", "Raw input", "Generated kernel", "Compute DAG",
              "Primal boundary × outcome matrix"),
         "nuts.md" =>
-            ("NUTS Phasepoint Hamiltonian", "Raw input", "Generated kernel", "Compute DAG"),
+            ("Compiler/runtime execution is disabled in docs",
+             "@kernel nuts!!", "Show the complete authoring fixture"),
         "nutpie-diagonal.md" => (
             "Nutpie Diagonal Initialize", "Nutpie Diagonal Adaptation",
             "Raw input", "Generated kernel", "Compute DAG",

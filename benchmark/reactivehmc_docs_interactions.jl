@@ -1,7 +1,5 @@
 module ReactiveHMCDocsInteractions
 
-using ReactiveKernelsNUTSExamples
-
 """Exact build-executed API interaction for one compatibility phase-point panel."""
 function phasepoint_interaction(name::Symbol)
     definitions = Dict(

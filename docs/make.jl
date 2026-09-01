@@ -8,31 +8,14 @@ using ReactiveKernelsNUTSExamples
 using ReactiveKernelsPPLExamples
 using ReactiveKernelsStreamingStats
 
-# Opt into the external NUTS/HMC compiler-acceptance exemplar for the sampling
-# and online-statistics pages. ReactiveKernels itself deliberately does not load it.
-include(joinpath(@__DIR__, "..", "examples", "nuts_runtime.jl"))
-using .ReactiveKernelsNUTSExample
-
-# Load the exact method-bearing NUTS authoring fixture in an isolated namespace.
-# Its public `nuts!!` entry is executed by a source-locked interaction on nuts.md;
-# keeping it separate avoids rebinding the runtime exemplar's ordinary API.
-module ReactiveKernelsDocsNUTSFixture
-include(joinpath(@__DIR__, "..", "benchmark", "nuts_kernel_authoring_fixture.jl"))
-end
-
 # Opt into the standalone nutpie/nuts-rs diagonal-adaptation compiler corpus.
 # It remains an external mathematical example rather than a package API.
 include(joinpath(@__DIR__, "..", "examples", "nutpie_diagonal_adaptation.jl"))
 import .NutpieDiagonalAdaptationExample
 
-# Parse the external WALNUTS-D mathematical authoring fixture during the docs
-# build.  The docs renderer below reads the exact source file for display, while
-# this include makes malformed or no-longer-admitted @kernel source fail the
-# GitHub Pages build instead of publishing a stale code listing.  The docs build
-# deliberately stops at source admission: it does not construct, compile, or
-# execute the WALNUTS compiler frontier (the recursive-SCC boundary is owned by
-# the focused compiler tests, not by documentation builds).
-include(joinpath(@__DIR__, "..", "benchmark", "walnuts_kernel_authoring_fixture.jl"))
+# NUTS and WALNUTS authoring fixtures are deliberately not included here.
+# Their pages read the source files as inert text; docs builds must not parse,
+# lower, compile, or execute either moving compiler/runtime surface.
 
 # Load the accepted ReactiveHMC compiler-corpus authorities themselves. The
 # corpus page extracts source from these exact files and inspects their captured

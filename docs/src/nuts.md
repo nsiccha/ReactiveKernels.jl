@@ -15,11 +15,10 @@ The fixture's `nuts!!` entry is **landed as executable compiler evidence on `mai
 lowers the NUTS source to a sealed, registry-free **native compiled recursion**
 (`compile_nuts_native` / `_build_nuts_sampler`). That entry mutates compiler-owned
 state in place and returns the **same object** (`result === state`, same concrete
-type) at **exact zero allocations**. The docs build loads the reviewed
-`benchmark/nuts_kernel_authoring_fixture.jl` in an isolated module, reads the
-displayed source from that same file, and admits its captured kernels; it does
-not execute the sampler — executable evidence lives in the test suite, not in
-this page's build. The measured
+type) at **exact zero allocations**. The docs build reads
+`benchmark/nuts_kernel_authoring_fixture.jl` only as inert text: it does not
+include, parse, lower, compile, or execute that fixture. Executable evidence
+lives in the test suite, not in this page's build. The measured
 leapfrog-steps/s comparison against DynamicHMC, AdvancedHMC, and nsiccha/NUTS.jl
 is recorded in the static receipt [`benchmark/receipts/nuts-g7-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/nuts-g7-v1.toml)
 — parsed here, not re-run in CI. It is a work-normalized inner-loop receipt,
@@ -160,64 +159,12 @@ invalidates stale values.
   dual averaging (`m`/`H`/`μ` + `fit!(x)`) and streaming Welford variance
   (`n`/`mean`/`var` + `step!(x)`), each written as its update rule.
 
-## The full compiled kernel graph
+## Compiler/runtime execution is disabled in docs
 
-The graph below is the **full compiled NUTS kernel**: `reactive_nuts_group`
-compiles the entire per-transition Hamiltonian work into ONE flat
-`ReactiveProgram`, and this panel renders `reactive_program(group).plan` directly
-— a 67-node Compute DAG. The three phase-point endpoints `init`, `fwd`, and `bwd`
-each compute potential, gradient, kinetic term, and Hamiltonian; the three
-converge at the active-endpoint selection, the energy error `dham`, and the
-`diverged` flag, while the shared metric Cholesky and the potential/gradient
-authority fan into all three. This is the mathematical heart the sampler
-evaluates on every step.
-
-The tree recursion, leapfrog integration, U-turn criterion, and adaptation are
-ordinary type-stable Julia driver methods **outside** any reactive `Plan` — they
-*drive* this graph but are deliberately not graph recipes, so there is no single
-`Plan` for the whole sampler, only this compiled per-step program driven by
-native compiled recursion.
-
-The panel is build-executed. **Raw input** is the group construction;
-**Generated kernel** is a readable view of the fused `:dham` (energy-error)
-getter — one representative compiled getter, not a whole-program listing; the
-exact getter AST remains available through `code_expr`. **Compute DAG** is that
-exact `reactive_program(group).plan`. **Compare all** opens the side-by-side
-split view. Read the graph as on the [DAG visualization](visualization.md) page:
-green nodes are `HAVE` inputs, orange nodes are `WANT` outputs, and blue nodes are
-the selected recipes that compute them.
-
-```@eval
-Main.ReactiveKernelsDocs.render_nuts_compiled_kernel_dag(@__MODULE__)
-```
-
-## A single Hamiltonian kernel (subordinate example)
-
-The graph above is the full compiled per-step kernel. This smaller panel zooms in
-on a **single Euclidean phasepoint** — one endpoint's Hamiltonian recurrence —
-extracted as an ordinary stateless `Plan`, so the core energy-and-gradient work
-can be read on its own through the same three-pane view used by the distribution
-and batched examples. It is a subordinate teaching extraction, not the full
-compiled sampler kernel: the complete sampler is the method-bearing eight-spec
-artifact below, whose recursive tree growth, ordered RNG effects, and in-place
-updates are sealed by the native method compiler and do not reduce to one plan.
-
-The panel is build-executed. **Raw input** contains the phasepoint math and the
-selected HAVE/WANT boundary; **Generated kernel** is a readable view derived
-from the executed kernel and exact `kernel.plan`, while `code_expr(kernel)`
-remains the compiled AST. **Compute DAG** is that same plan. The potential-only
-recipe is an alternative producer: because the requested outputs include the
-position gradient, planning selects the combined value-and-gradient recipe and
-does not execute the redundant potential path. **Compare all** opens the standard
-side-by-side split view.
-
-```@eval
-Main.ReactiveKernelsDocs.render_nuts_phasepoint(@__MODULE__)
-```
-
-This docs-scoped stateless extraction mirrors the phasepoint recurrence for
-inspection; the full byte-locked eight-spec source later on this page remains the
-authoritative sealed NUTS compiler-acceptance fixture.
+The docs build does not construct the reactive NUTS group, prepare a phasepoint
+kernel, generate a getter, build a `ReactiveProgram`, or run the sealed sampler.
+Those moving compiler/runtime paths are owned by focused tests. This page keeps
+only frozen receipts and the exact authoring source read as text.
 
 ## The locked compiler/lowering contract
 
@@ -251,7 +198,7 @@ fixture entry **satisfies** (see the status table).
 
 The docs build does not construct or run the sealed sampler. The `nuts!!`
 identity, zero-allocation, and diagnostics claims above are established by the
-test suite against the same build-loaded fixture; running the sampler machinery
+test suite against the same source fixture; running the sampler machinery
 during every docs build would couple publication to an execution surface that
 the compiler work is actively moving. This page displays the exact authored
 source and the frozen receipts only.
@@ -260,18 +207,17 @@ source and the frozen receipts only.
 
 The block below is the **exact reviewed authoring source** — the surface that `@kernel`
 lowers to the sealed, registry-free native NUTS sampler now on `main`. The docs build
-reads it directly from the durable fixture
+reads it as inert text directly from the durable fixture
 [`benchmark/nuts_kernel_authoring_fixture.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/nuts_kernel_authoring_fixture.jl);
-loads all eight definitions in an isolated module, and requires the captured
-MethodIR for every method-bearing definition. This page renders live at
+it does not load the definitions or request captured MethodIR. This page renders live at
 <https://nsiccha.github.io/ReactiveKernels.jl/dev/nuts>.
 
-The build-loaded source below is the macro-free executable fixture as it exists today.
+The source below is the macro-free executable fixture as it exists today.
 Its helpers are inline arithmetic/control or captured sibling `@kernel` methods;
 there are no user-authored effect declarations. The fixture's `@node` use is
 unrelated and stays.
 
-::: details Show the complete build-loaded authoring fixture
+::: details Show the complete authoring fixture
 
 ```@eval
 Main.ReactiveKernelsDocs.render_nuts_complete_source()
