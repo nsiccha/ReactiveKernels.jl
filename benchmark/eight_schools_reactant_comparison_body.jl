@@ -19,6 +19,8 @@ const EIGHT_SCHOOLS_BOUNDARIES = (
 const EIGHT_SCHOOLS_OUTCOMES = ("joint", "prior", "likelihood", "pointwise")
 
 _git(repo, args...) = readchomp(Cmd(["git", "-C", repo, string.(args)...]))
+_eight_schools_reactant_generator_sha256(path) = bytes2hex(sha256(
+    replace(read(path, String), "\r\n" => "\n", "\r" => "\n")))
 
 function _package_version(name)
     for info in values(Pkg.dependencies())
@@ -308,7 +310,8 @@ function run_comparison()
             "source_authority_blob" =>
                 _git(repo, "rev-parse", "$candidate_sha:$source_path"),
             "source_text_sha256" => bytes2hex(sha256(EIGHT_SCHOOLS_SOURCE)),
-            "primal_receipt_sha256" => bytes2hex(sha256(read(primal_path))),
+            "primal_receipt_sha256" =>
+                _eight_schools_reactant_generator_sha256(primal_path),
             "primal_receipt_reactivekernels_sha" =>
                 primal_receipt["pins"]["reactivekernels_sha"],
         ),

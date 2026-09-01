@@ -246,17 +246,25 @@ end
 _rounds() = parse(Int, get(
     ENV, "RK_EIGHT_SCHOOLS_AD_ROUNDS", string(DEFAULT_EIGHT_SCHOOLS_AD_ROUNDS)))
 
+_eight_schools_ad_generator_text(text) =
+    replace(String(text), "\r\n" => "\n", "\r" => "\n")
+_eight_schools_ad_generator_read(path) =
+    _eight_schools_ad_generator_text(read(path, String))
+_eight_schools_ad_generator_sha256(path) =
+    bytes2hex(SHA.sha256(_eight_schools_ad_generator_read(path)))
+
 function _source_pin(root, relative_path)
     absolute_path = joinpath(root, relative_path)
     Dict(
         "path" => relative_path,
         "git_blob" => readchomp(`git -C $root hash-object $absolute_path`),
-        "text_sha256" => bytes2hex(SHA.sha256(read(absolute_path))),
+        "text_sha256" => _eight_schools_ad_generator_sha256(absolute_path),
     )
 end
 
 function _published_source_pin(root, commit, relative_path)
-    text = read(`git -C $root show $commit:$relative_path`)
+    text = _eight_schools_ad_generator_text(
+        read(`git -C $root show $commit:$relative_path`))
     Dict(
         "commit" => commit,
         "path" => relative_path,
@@ -268,7 +276,7 @@ end
 function _verified_model_source_pin(root, relative_path)
     published, text = _published_source_pin(
         root, EIGHT_SCHOOLS_MODEL_PUBLISHED_SHA, relative_path)
-    read(joinpath(root, relative_path)) == text || error(
+    _eight_schools_ad_generator_read(joinpath(root, relative_path)) == text || error(
         "Eight Schools model source drifted from published authority " *
         EIGHT_SCHOOLS_MODEL_PUBLISHED_SHA)
     merge(published, Dict("current" => _source_pin(root, relative_path)))
@@ -278,8 +286,8 @@ function _verified_comparator_source_pin(root, relative_path)
     published, text = _published_source_pin(
         root, EIGHT_SCHOOLS_COMPARATOR_PUBLISHED_SHA, relative_path)
     guard = "get(ENV, \"RK_EIGHT_SCHOOLS_DEFINITIONS_ONLY\", \"\") == \"1\" || run_comparison()\n"
-    expected = replace(String(text), r"run_comparison\(\)\n$" => guard)
-    read(joinpath(root, relative_path), String) == expected || error(
+    expected = replace(text, r"run_comparison\(\)\n$" => guard)
+    _eight_schools_ad_generator_read(joinpath(root, relative_path)) == expected || error(
         "Eight Schools comparator differs from its published authority by more " *
         "than the terminal definition-only guard")
     merge(published, Dict(
@@ -415,8 +423,8 @@ function run_eight_schools_ad_comparison()
             "primal_comparator_source" =>
                 _verified_comparator_source_pin(root, comparator_path),
             "primal_receipt_path" => primal_path,
-            "primal_receipt_sha256" => bytes2hex(SHA.sha256(
-                read(joinpath(root, primal_path)))),
+            "primal_receipt_sha256" => _eight_schools_ad_generator_sha256(
+                joinpath(root, primal_path)),
             "primal_receipt_reactivekernels_sha" =>
                 primal_receipt["pins"]["reactivekernels_sha"],
             (string(lowercase(name), "_version") => _package_version(name)
