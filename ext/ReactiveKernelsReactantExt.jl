@@ -5,6 +5,71 @@ import Reactant
 import DifferentiationInterface
 import LinearAlgebra
 
+struct _ReactantRNGNormal{Algorithm} end
+struct _ReactantRNGBool{Algorithm} end
+struct _ReactantRNGExp{Algorithm} end
+
+_rk_rng_algorithm(::Type{<:_ReactantRNGNormal{Algorithm}}) where {Algorithm} =
+    String(Algorithm)
+_rk_rng_algorithm(::Type{<:_ReactantRNGBool{Algorithm}}) where {Algorithm} =
+    String(Algorithm)
+_rk_rng_algorithm(::Type{<:_ReactantRNGExp{Algorithm}}) where {Algorithm} =
+    String(Algorithm)
+
+@inline function (draw::_ReactantRNGNormal)(state, destination)
+    candidate = Reactant.Ops.randn(
+        eltype(destination), state, size(destination);
+        algorithm=_rk_rng_algorithm(typeof(draw)))
+    (state=candidate.output_state, value=candidate.output, valid=true)
+end
+
+@inline function (draw::_ReactantRNGBool)(state)
+    candidate = Reactant.Ops.rng_bit_generator(
+        UInt64, state, (1,); algorithm=_rk_rng_algorithm(typeof(draw)))
+    value = isodd(Reactant.@allowscalar candidate.output[1])
+    (state=candidate.output_state, value, valid=true)
+end
+
+@inline function (draw::_ReactantRNGExp)(state)
+    candidate = Reactant.Ops.randexp(
+        Float64, state, (1,); algorithm=_rk_rng_algorithm(typeof(draw)))
+    value = Reactant.@allowscalar candidate.output[1]
+    (state=candidate.output_state, value, valid=true)
+end
+
+"""
+    rng_provider(Val(:reactant); algorithm=:DEFAULT)
+
+Construct the Reactant-native ordered RNG provider. Its logical state is a
+two-element `Vector{UInt64}` seed that callers tensorize as an ordinary
+Reactant argument. Draws lower to Reactant's RNG operations; a host
+`AbstractRNG` never enters the traced executable.
+"""
+function ReactiveKernels.rng_provider(::Val{:reactant}; algorithm=:DEFAULT)
+    normalized = Symbol(uppercase(String(algorithm)))
+    normalized in (:DEFAULT, :PHILOX, :THREE_FRY) || throw(ArgumentError(
+        "Reactant RNG algorithm must be :DEFAULT, :PHILOX, or :THREE_FRY"))
+    ReactiveKernels.rng_provider(Vector{UInt64};
+        normal_fill=ReactiveKernels.total_functional_lowering(
+            _ReactantRNGNormal{normalized}()),
+        bool_draw=ReactiveKernels.total_functional_lowering(
+            _ReactantRNGBool{normalized}()),
+        exp_draw=ReactiveKernels.total_functional_lowering(
+            _ReactantRNGExp{normalized}()))
+end
+
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels.RNGProvider,
+        path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where {T<:ReactiveKernels.RNGProvider}
+    T
+end
+
 @inline ReactiveKernels._kernel_source_arg_style(
     arg::Reactant.TracedType) = Val(:tensorized)
 
@@ -36,19 +101,19 @@ end
 ReactiveKernels._sm_functional_argument_type_ok(
     ::Type{Actual}, ::Type{Expected}) where
     {Actual<:Reactant.TracedRArray,Expected} =
-        _rk_reactant_logical_argument(Actual, Expected)
+        Actual === Expected || _rk_reactant_logical_argument(Actual, Expected)
 ReactiveKernels._sm_functional_argument_type_ok(
     ::Type{Actual}, ::Type{Expected}) where
     {Actual<:Reactant.TracedRNumber,Expected} =
-        _rk_reactant_logical_argument(Actual, Expected)
+        Actual === Expected || _rk_reactant_logical_argument(Actual, Expected)
 ReactiveKernels._sm_functional_argument_type_ok(
     ::Type{Actual}, ::Type{Expected}) where
     {Actual<:Reactant.AbstractConcreteArray,Expected} =
-        _rk_reactant_logical_argument(Actual, Expected)
+        Actual === Expected || _rk_reactant_logical_argument(Actual, Expected)
 ReactiveKernels._sm_functional_argument_type_ok(
     ::Type{Actual}, ::Type{Expected}) where
     {Actual<:Reactant.AbstractConcreteNumber,Expected} =
-        _rk_reactant_logical_argument(Actual, Expected)
+        Actual === Expected || _rk_reactant_logical_argument(Actual, Expected)
 
 # Reusable finite structural results retain device arrays, but scalar leaves
 # must cross back to the constructor-bound host ABI before the same compiled

@@ -62,7 +62,7 @@ export reactive_program
 export CompiledStateTransition, compile_state_transition, initial_transition_state
 export compile_stateful, stateful_compiler_bindings
 export pure_callable_port, effect_callable_port, effect_lowering_port,
-       structured_state_port
+       structured_state_port, rng_provider
 export StatefulStateValue, OrderedRNGReplay, total_functional_lowering
 export initial_transition_effects, transition_with_effects
 export drain_observations!
