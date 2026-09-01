@@ -1,4 +1,4 @@
-generated_at = "2026-09-01T06:35:15.278Z"
+generated_at = "2026-09-01T08:16:29.136Z"
 schema = "mnist-reactant-v1"
 
 [environment]
@@ -12,10 +12,10 @@ reactant_backend = "default CPU"
 boundary = "packed_unconstrained"
 description = "full joint over the flattened sampler vector"
 outcome = "joint"
-reactant_compile_seconds = 16.459922952
-reactant_transfer_seconds = 0.512690826
+reactant_compile_seconds = 14.967788682
+reactant_transfer_seconds = 0.424536597
 rk_native_supported = true
-rk_reactant_error = "Scalar indexing is disallowed."
+rk_reactant_error = "MethodError: no method matching reindex(::Tuple{Base.Slice{Base.OneTo{Int64}}, Int64}, ::Reactant.TracedRNumber{Int64})"
 rk_reactant_supported = false
 
     [measurements.rk_native]
@@ -23,18 +23,18 @@ rk_reactant_supported = false
     bytes = [13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320]
     median_allocs = 9
     median_bytes = 13920320
-    median_ns = 9.6084665e7
-    min_ns = 8.8531681e7
-    times_ns = [9.5115478e7, 8.8695537e7, 9.061012e7, 1.10769832e8, 1.06273146e8, 9.2586979e7, 8.8531681e7, 1.25031924e8, 1.07021769e8, 9.7053852e7]
+    median_ns = 5.61673765e7
+    min_ns = 5.195509e7
+    times_ns = [5.195509e7, 5.5811004e7, 5.3502277e7, 5.2849626e7, 5.3785838e7, 5.6523749e7, 5.7249951e7, 6.178393e7, 5.9895253e7, 5.7796836e7]
 [[measurements]]
 boundary = "packed_unconstrained"
 description = "standard-normal coefficient log prior"
 max_abs_error = 1.7280399333685637e-11
 max_rel_error = 2.6615325236043355e-15
 outcome = "prior"
-reactant_compile_seconds = 6.793765815
-reactant_first_execution_seconds = 0.171541391
-reactant_transfer_seconds = 0.006290201
+reactant_compile_seconds = 6.709945513
+reactant_first_execution_seconds = 0.161386966
+reactant_transfer_seconds = 0.005987156
 rk_native_supported = true
 rk_reactant_supported = true
 
@@ -43,26 +43,26 @@ rk_reactant_supported = true
     bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     median_allocs = 0
     median_bytes = 0
-    median_ns = 3339.0
-    min_ns = 3304.0
-    times_ns = [3314.0, 3345.0, 3374.0, 3344.0, 3384.0, 3304.0, 3334.0, 3395.0, 3334.0, 3304.0]
+    median_ns = 3304.0
+    min_ns = 3214.0
+    times_ns = [3375.0, 3234.0, 3304.0, 3314.0, 3304.0, 3274.0, 3314.0, 3304.0, 3334.0, 3214.0]
 
     [measurements.rk_reactant]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 9428.0
-    min_ns = 7551.0
-    times_ns = [9413.0, 7551.0, 9443.0, 8492.0, 9373.0, 12607.0, 9783.0, 8111.0, 10485.0, 9894.0]
+    median_ns = 8797.0
+    min_ns = 6209.0
+    times_ns = [7030.0, 6209.0, 8472.0, 11466.0, 7020.0, 11015.0, 10064.0, 10654.0, 8862.0, 8732.0]
 [[measurements]]
 boundary = "packed_unconstrained"
 description = "summed softmax categorical log likelihood"
 outcome = "likelihood"
-reactant_compile_seconds = 2.18462074
-reactant_transfer_seconds = 0.222342541
+reactant_compile_seconds = 1.547858793
+reactant_transfer_seconds = 0.178410759
 rk_native_supported = true
-rk_reactant_error = "Scalar indexing is disallowed."
+rk_reactant_error = "MethodError: no method matching reindex(::Tuple{Base.Slice{Base.OneTo{Int64}}, Int64}, ::Reactant.TracedRNumber{Int64})"
 rk_reactant_supported = false
 
     [measurements.rk_native]
@@ -70,17 +70,17 @@ rk_reactant_supported = false
     bytes = [13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320]
     median_allocs = 9
     median_bytes = 13920320
-    median_ns = 7.0071975e7
-    min_ns = 5.9107644e7
-    times_ns = [7.4371578e7, 1.07418597e8, 6.5772372e7, 6.2572055e7, 6.5540802e7, 5.9107644e7, 6.139455e7, 7.5353055e7, 1.53546857e8, 9.8349351e7]
+    median_ns = 6.3519612e7
+    min_ns = 5.5494868e7
+    times_ns = [6.2510724e7, 5.5494868e7, 7.3350409e7, 6.943243e7, 6.45285e7, 5.9324805e7, 5.5548602e7, 5.8308443e7, 6.4949931e7, 6.8777756e7]
 [[measurements]]
 boundary = "packed_unconstrained"
 description = "per-observation softmax categorical log likelihoods"
 outcome = "pointwise"
-reactant_compile_seconds = 2.192095084
-reactant_transfer_seconds = 0.214330504
+reactant_compile_seconds = 1.463203757
+reactant_transfer_seconds = 0.183369445
 rk_native_supported = true
-rk_reactant_error = "Scalar indexing is disallowed."
+rk_reactant_error = "MethodError: no method matching reindex(::Tuple{Base.Slice{Base.OneTo{Int64}}, Int64}, ::Reactant.TracedRNumber{Int64})"
 rk_reactant_supported = false
 
     [measurements.rk_native]
@@ -88,17 +88,17 @@ rk_reactant_supported = false
     bytes = [14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368]
     median_allocs = 11
     median_bytes = 14400368
-    median_ns = 9.4204976e7
-    min_ns = 5.8701983e7
-    times_ns = [9.8257073e7, 9.0152879e7, 8.1550266e7, 1.85747917e8, 2.28468716e8, 1.01716959e8, 1.26133344e8, 6.7637636e7, 6.8124777e7, 5.8701983e7]
+    median_ns = 5.7754327e7
+    min_ns = 5.3457936e7
+    times_ns = [5.9192893e7, 5.5608926e7, 5.6512082e7, 6.1611032e7, 5.7465269e7, 6.9430638e7, 5.7862166e7, 5.3457936e7, 6.4526836e7, 5.7646488e7]
 [[measurements]]
 boundary = "structured_parameters"
 description = "full joint over the (W, b) coefficients"
 outcome = "joint"
-reactant_compile_seconds = 3.48342656
-reactant_transfer_seconds = 0.21491464
+reactant_compile_seconds = 2.434619387
+reactant_transfer_seconds = 0.2264192
 rk_native_supported = true
-rk_reactant_error = "Scalar indexing is disallowed."
+rk_reactant_error = "MethodError: no method matching reindex(::Tuple{Base.Slice{Base.OneTo{Int64}}, Int64}, ::Reactant.TracedRNumber{Int64})"
 rk_reactant_supported = false
 
     [measurements.rk_native]
@@ -106,18 +106,18 @@ rk_reactant_supported = false
     bytes = [13976896, 13976896, 13976896, 13976896, 13976896, 13976896, 13976896, 13976896, 13976896, 13976896]
     median_allocs = 12
     median_bytes = 13976896
-    median_ns = 5.8847154e7
-    min_ns = 5.5293459e7
-    times_ns = [5.5636082e7, 5.753308e7, 6.4432643e7, 5.5293459e7, 5.822073e7, 6.8607844e7, 6.1451768e7, 5.9204157e7, 8.4468333e7, 5.8490151e7]
+    median_ns = 5.62632435e7
+    min_ns = 5.2320465e7
+    times_ns = [5.7871329e7, 5.5660356e7, 5.2320465e7, 5.6866131e7, 5.2888179e7, 5.4154466e7, 5.7089029e7, 5.4753624e7, 6.1923013e7, 5.7387481e7]
 [[measurements]]
 boundary = "structured_parameters"
 description = "standard-normal coefficient log prior"
 max_abs_error = 1.7280399333685637e-11
 max_rel_error = 2.6615325236043355e-15
 outcome = "prior"
-reactant_compile_seconds = 1.884973973
-reactant_first_execution_seconds = 0.041940921
-reactant_transfer_seconds = 0.006885202
+reactant_compile_seconds = 1.95181071
+reactant_first_execution_seconds = 0.047867507
+reactant_transfer_seconds = 0.006093993
 rk_native_supported = true
 rk_reactant_supported = true
 
@@ -126,26 +126,26 @@ rk_reactant_supported = true
     bytes = [56704, 56704, 56704, 56704, 56704, 56704, 56704, 56704, 56704, 56704]
     median_allocs = 4
     median_bytes = 56704
-    median_ns = 5007.0
-    min_ns = 4817.0
-    times_ns = [4997.0, 5057.0, 5107.0, 5027.0, 5127.0, 4987.0, 4817.0, 5017.0, 4987.0, 4986.0]
+    median_ns = 5127.0
+    min_ns = 5027.0
+    times_ns = [5107.0, 5117.0, 5147.0, 5197.0, 5117.0, 5027.0, 5547.0, 5077.0, 5268.0, 5137.0]
 
     [measurements.rk_reactant]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 9168.0
-    min_ns = 7080.0
-    times_ns = [8172.0, 8282.0, 12538.0, 10304.0, 7951.0, 13689.0, 7080.0, 10054.0, 7801.0, 12708.0]
+    median_ns = 8532.0
+    min_ns = 6939.0
+    times_ns = [7270.0, 6939.0, 8512.0, 8552.0, 7280.0, 8161.0, 13919.0, 13739.0, 10745.0, 10014.0]
 [[measurements]]
 boundary = "structured_parameters"
 description = "summed softmax categorical log likelihood"
 outcome = "likelihood"
-reactant_compile_seconds = 2.02628317
-reactant_transfer_seconds = 0.195702075
+reactant_compile_seconds = 1.427334934
+reactant_transfer_seconds = 0.184178952
 rk_native_supported = true
-rk_reactant_error = "Scalar indexing is disallowed."
+rk_reactant_error = "MethodError: no method matching reindex(::Tuple{Base.Slice{Base.OneTo{Int64}}, Int64}, ::Reactant.TracedRNumber{Int64})"
 rk_reactant_supported = false
 
     [measurements.rk_native]
@@ -153,17 +153,17 @@ rk_reactant_supported = false
     bytes = [13920192, 13920192, 13920192, 13920192, 13920192, 13920192, 13920192, 13920192, 13920192, 13920192]
     median_allocs = 8
     median_bytes = 13920192
-    median_ns = 6.3919154e7
-    min_ns = 5.526513e7
-    times_ns = [6.4041393e7, 5.9365859e7, 6.3796915e7, 5.5930198e7, 8.4858131e7, 5.526513e7, 5.9389562e7, 7.8634553e7, 6.7555192e7, 6.9315482e7]
+    median_ns = 5.89752665e7
+    min_ns = 5.4942701e7
+    times_ns = [6.4314697e7, 6.5088835e7, 5.4942701e7, 5.550059e7, 5.8879114e7, 5.9895347e7, 5.5895457e7, 5.9071419e7, 5.6171047e7, 5.9576257e7]
 [[measurements]]
 boundary = "structured_parameters"
 description = "per-observation softmax categorical log likelihoods"
 outcome = "pointwise"
-reactant_compile_seconds = 1.950940611
-reactant_transfer_seconds = 0.217722686
+reactant_compile_seconds = 1.38428742
+reactant_transfer_seconds = 0.19124103
 rk_native_supported = true
-rk_reactant_error = "Scalar indexing is disallowed."
+rk_reactant_error = "MethodError: no method matching reindex(::Tuple{Base.Slice{Base.OneTo{Int64}}, Int64}, ::Reactant.TracedRNumber{Int64})"
 rk_reactant_supported = false
 
     [measurements.rk_native]
@@ -171,9 +171,9 @@ rk_reactant_supported = false
     bytes = [14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240]
     median_allocs = 10
     median_bytes = 14400240
-    median_ns = 6.4487288e7
-    min_ns = 5.3222221e7
-    times_ns = [1.00184893e8, 7.5765352e7, 7.3501619e7, 6.5620142e7, 5.3222221e7, 5.6763678e7, 5.8487638e7, 6.0610678e7, 6.3354434e7, 8.6369837e7]
+    median_ns = 5.70189825e7
+    min_ns = 5.1201588e7
+    times_ns = [6.2797482e7, 5.8491129e7, 5.5418247e7, 6.2439448e7, 6.2887217e7, 5.5546836e7, 5.5326281e7, 5.4439206e7, 6.5276233e7, 5.1201588e7]
 
 [pins]
 benchmarktools_version = "1.6.3"
@@ -184,7 +184,7 @@ primal_receipt_sha256 = "62e4c8c5c54e4581a6693478133e6d55af57f3a42048765b64de13c
 reactant_jll_version = "0.0.401+0"
 reactant_version = "0.2.278"
 reactivekernels_dirty = false
-reactivekernels_sha = "7ebfb84c3dfc5e5fae5bd09933c9c8e05826106d"
+reactivekernels_sha = "4a9e2a4469f1e4c99d0ecfd5d148d142e6314b05"
 reactivekernels_version = "0.1.0"
 reactivekernelsdistributionkernels_version = "0.1.0"
 reactivekernelspplexamples_version = "0.1.0"
@@ -219,7 +219,7 @@ source_reused = true
 unsupported_cells_recorded = true
 
 [setup]
-data_load_seconds = 1.710474647
-environment_seconds = 28.273388406
-kernel_preparation_seconds = 4.281545131
-package_precompile_seconds = 20.193388526
+data_load_seconds = 1.577905738
+environment_seconds = 26.795012718
+kernel_preparation_seconds = 4.427233522
+package_precompile_seconds = 19.708881167

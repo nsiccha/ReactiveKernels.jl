@@ -1,0 +1,182 @@
+generated_at = "2026-09-01T08:19:59.231Z"
+schema = "mnist-reactant-ad-v1"
+
+[environment]
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+julia_threads = 1
+os = "Linux"
+reactant_backend = "default CPU"
+
+[[measurements]]
+active_port = "unconstrained"
+ad_preparation_seconds = 0.624874446
+boundary = "packed_unconstrained"
+description = "gradient of the full joint w.r.t. the packed coefficient vector"
+outcome = "joint"
+reactant_ad_compile_seconds = 16.878592573
+reactant_transfer_seconds = 0.387896966
+rk_native_ad_supported = true
+rk_reactant_ad_error = "MethodError: no method matching reindex(::Tuple{Base.Slice{Base.OneTo{Int64}}, Int64}, ::Reactant.TracedRNumber{Int64})"
+rk_reactant_ad_supported = false
+
+    [measurements.rk_native_ad]
+    allocs = [27, 27, 27, 27, 27, 27, 27, 27, 27, 27]
+    bytes = [32162496, 32162496, 32162496, 32162496, 32162496, 32162496, 32162496, 32162496, 32162496, 32162496]
+    median_allocs = 27
+    median_bytes = 32162496
+    median_ns = 3.30049052e8
+    min_ns = 3.07395695e8
+    times_ns = [3.38135202e8, 3.45329533e8, 3.45339767e8, 3.26845e8, 3.17606478e8, 3.1239786e8, 3.33253104e8, 3.43591073e8, 3.07395695e8, 3.18591108e8]
+[[measurements]]
+active_port = "unconstrained"
+ad_preparation_seconds = 0.098897711
+boundary = "packed_unconstrained"
+description = "gradient of the standard-normal coefficient log prior"
+max_abs_error = 0.0
+max_rel_error = 0.0
+outcome = "prior"
+reactant_ad_compile_seconds = 8.431353609
+reactant_first_execution_seconds = 0.168378089
+reactant_transfer_seconds = 0.004208629
+rk_native_ad_supported = true
+rk_reactant_ad_supported = true
+value_abs_error = 1.7280399333685637e-11
+value_rel_error = 2.6615325236043355e-15
+
+    [measurements.rk_native_ad]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 5402.0
+    min_ns = 5317.0
+    times_ns = [5347.0, 5397.0, 5317.0, 5407.0, 5507.0, 5407.0, 5407.0, 5347.0, 5378.0, 5417.0]
+
+    [measurements.rk_reactant_ad]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [816, 816, 816, 816, 816, 816, 816, 816, 816, 816]
+    median_allocs = 20
+    median_bytes = 816
+    median_ns = 10359.5
+    min_ns = 8371.0
+    times_ns = [38423.0, 19046.0, 19407.0, 8592.0, 9233.0, 10965.0, 15261.0, 9754.0, 8371.0, 8812.0]
+[[measurements]]
+active_port = "unconstrained"
+ad_preparation_seconds = 0.100079493
+boundary = "packed_unconstrained"
+description = "gradient of the summed softmax categorical log likelihood"
+outcome = "likelihood"
+reactant_ad_compile_seconds = 2.309592525
+reactant_transfer_seconds = 0.206247418
+rk_native_ad_supported = true
+rk_reactant_ad_error = "MethodError: no method matching reindex(::Tuple{Base.Slice{Base.OneTo{Int64}}, Int64}, ::Reactant.TracedRNumber{Int64})"
+rk_reactant_ad_supported = false
+
+    [measurements.rk_native_ad]
+    allocs = [27, 27, 27, 27, 27, 27, 27, 27, 27, 27]
+    bytes = [32162496, 32162496, 32162496, 32162496, 32162496, 32162496, 32162496, 32162496, 32162496, 32162496]
+    median_allocs = 27
+    median_bytes = 32162496
+    median_ns = 3.341956145e8
+    min_ns = 3.15523193e8
+    times_ns = [3.18271547e8, 3.79363807e8, 3.42377357e8, 3.26013872e8, 4.03060403e8, 3.59584647e8, 3.20440569e8, 3.15523193e8, 3.21837928e8, 4.2697402e8]
+[[measurements]]
+boundary = "packed_unconstrained"
+description = "pointwise is vector-valued; no matched public Jacobian/VJP contract, so it stays unsupported rather than inventing a fused case"
+outcome = "pointwise"
+rk_native_ad_error = "pointwise is vector-valued; no matched public Jacobian/VJP contract, so it stays unsupported rather than inventing a fused case"
+rk_native_ad_supported = false
+rk_reactant_ad_error = "pointwise is vector-valued; no matched public Jacobian/VJP contract, so it stays unsupported rather than inventing a fused case"
+rk_reactant_ad_supported = false
+[[measurements]]
+boundary = "structured_parameters"
+description = "the structured (W, b) boundary has two active ports; no public multi-active AD contract is invented for it"
+outcome = "joint"
+rk_native_ad_error = "the structured (W, b) boundary has two active ports; no public multi-active AD contract is invented for it"
+rk_native_ad_supported = false
+rk_reactant_ad_error = "the structured (W, b) boundary has two active ports; no public multi-active AD contract is invented for it"
+rk_reactant_ad_supported = false
+[[measurements]]
+boundary = "structured_parameters"
+description = "the structured (W, b) boundary has two active ports; no public multi-active AD contract is invented for it"
+outcome = "prior"
+rk_native_ad_error = "the structured (W, b) boundary has two active ports; no public multi-active AD contract is invented for it"
+rk_native_ad_supported = false
+rk_reactant_ad_error = "the structured (W, b) boundary has two active ports; no public multi-active AD contract is invented for it"
+rk_reactant_ad_supported = false
+[[measurements]]
+boundary = "structured_parameters"
+description = "the structured (W, b) boundary has two active ports; no public multi-active AD contract is invented for it"
+outcome = "likelihood"
+rk_native_ad_error = "the structured (W, b) boundary has two active ports; no public multi-active AD contract is invented for it"
+rk_native_ad_supported = false
+rk_reactant_ad_error = "the structured (W, b) boundary has two active ports; no public multi-active AD contract is invented for it"
+rk_reactant_ad_supported = false
+[[measurements]]
+boundary = "structured_parameters"
+description = "pointwise is vector-valued; no matched public Jacobian/VJP contract, so it stays unsupported rather than inventing a fused case"
+outcome = "pointwise"
+rk_native_ad_error = "pointwise is vector-valued; no matched public Jacobian/VJP contract, so it stays unsupported rather than inventing a fused case"
+rk_native_ad_supported = false
+rk_reactant_ad_error = "pointwise is vector-valued; no matched public Jacobian/VJP contract, so it stays unsupported rather than inventing a fused case"
+rk_reactant_ad_supported = false
+
+[pins]
+ad_receipt_path = "benchmark/receipts/mnist-logistic-ad-v1.toml"
+ad_receipt_reactivekernels_sha = "6b5b1a54926e84b7137f1a5b5b17a2f6ad9ba790"
+ad_receipt_sha256 = "1bdbbf3108bf68403ee3316265aeb6166c56e49bc606301022fd0a48170cb168"
+benchmarktools_version = "1.6.3"
+differentiationinterface_version = "0.7.21"
+enzyme_version = "0.13.199"
+julia_version = "1.10.11"
+mldatasets_version = "0.7.21"
+reactant_jll_version = "0.0.401+0"
+reactant_version = "0.2.278"
+reactivekernels_dirty = false
+reactivekernels_sha = "4a9e2a4469f1e4c99d0ecfd5d148d142e6314b05"
+reactivekernels_version = "0.1.0"
+reactivekernelsdistributionkernels_version = "0.1.0"
+reactivekernelspplexamples_version = "0.1.0"
+source_authority_blob = "cfd5d381c38de21742f564361ef7a7914e5ff8bd"
+source_authority_path = "packages/ReactiveKernelsPPLExamples/src/mnist_logistic.jl"
+source_text_sha256 = "b873db7cef8003d9d3982af93223489a6558f0c733095a3bbcfc16fb8c29ad24"
+
+[protocol]
+ad_preparation_in_timed_region = false
+data = "MLDatasets MNIST train split, first N images"
+estimator = "minimum of per-round BenchmarkTools minimum times (uncontended cost; medians and raw rounds retained)"
+first_execution_in_steady_state_region = false
+gradient_operation = "value and gradient"
+input_boundaries = ["packed_unconstrained", "structured_parameters"]
+matrix_source = "benchmark/receipts/mnist-logistic-ad-v1.toml"
+model = "multinomial-logistic MNIST classifier"
+num_classes = 10
+num_features = 784
+num_observations = 60000
+outcomes = ["joint", "prior", "likelihood", "pointwise"]
+parity_atol = 1.0e-9
+parity_reference = "native RK reverse pass (ad_value_and_gradient!)"
+parity_rtol = 1.0e-9
+pointwise_jacobian_or_vjp_invented = false
+preparation_in_timed_region = false
+reactant_compile_time_in_timed_region = false
+reactant_readback_in_timed_region = false
+reactant_sync = true
+reactant_transfers_in_timed_region = false
+rk_ad_backend = "AutoEnzyme(mode = Enzyme.Reverse)"
+rk_native_ad_surface = "prepare_ad + ad_value_and_gradient!"
+rk_reactant_ad_surface = "prepare_ad + compile_ad_value_and_gradient"
+rounds = 10
+samples_per_round = 200
+seconds_per_round = 0.2
+setup_in_timed_region = false
+source_reused = true
+structured_multi_active_boundary_invented = false
+unsupported_cells_recorded = true
+
+[setup]
+data_load_seconds = 1.582094362
+environment_seconds = 34.748112967
+kernel_preparation_seconds = 1.529198235
+package_precompile_seconds = 2.966992175
