@@ -297,9 +297,10 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
     )
     expected_sortable_tables = Dict(
         "distributions-ad.md" => 2,
+        "distributions.md" => 1,
         "ppl-ad.md" => 4,
         "compiler.md" => 1,
-        "distributions-reactant.md" => 8,
+        "distributions-reactant.md" => 7,
         "eight-schools.md" => 1,
         "eight-schools-reactant.md" => 4,
         "eval-throughput.md" => 1,
@@ -310,8 +311,9 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
     )
     expected_aov_panels = Dict(
         "distributions-ad.md" => 6,
+        "distributions.md" => 2,
         "ppl-ad.md" => 4,
-        "distributions-reactant.md" => 14,
+        "distributions-reactant.md" => 12,
         "nuts.md" => 1,
         "nuts-reactant.md" => 1,
     )
