@@ -9,6 +9,9 @@ on:
 permissions:
   actions: write       # let julia-actions/cache evict its own caches
   contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   test:
     name: test (${{ matrix.julia-version }}, ${{ matrix.julia-arch }}, ${{ matrix.os }}, ${{ matrix.test-shard }})
