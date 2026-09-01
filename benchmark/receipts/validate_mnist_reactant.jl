@@ -10,9 +10,9 @@ const EXPECTED_MNIST_REACTANT_OUTCOMES =
     ("joint", "prior", "likelihood", "pointwise")
 # Cells the published receipt must show compiling through Reactant; a receipt
 # where one of these regressed to unsupported is rejected, not silently landed.
-# The likelihood-bearing cells currently fail to trace (the constant
-# reference-logits row reaches Base's generic elementwise vcat — scalar
-# indexing); extend this set when that upstream capability lands.
+# The likelihood-bearing cells currently stop at the plate-over-eachcol +
+# traced-index gather frontier (the earlier mixed constant/traced vcat blocker
+# is fixed); extend this set when that upstream capability lands.
 const EXPECTED_MNIST_REACTANT_COMPILED = (
     ("packed_unconstrained", "prior"),
     ("structured_parameters", "prior"),
