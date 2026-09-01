@@ -16,6 +16,13 @@ struct _ReactantObservationAuthority end
 _reactant_observation_lowering(effect, state) = (
     arguments=(state,), result=nothing, effect_state=effect .+ 1)
 
+struct _ReactantTupleWrapperRestore{P}
+    prototype::P
+end
+(restore::_ReactantTupleWrapperRestore)(value) =
+    ReactiveKernels._sm_restore_source_logical_wrappers(
+        restore.prototype, value)
+
 _effects_trace(value::Number) =
     Reactant.to_rarray(value; track_numbers=true)
 _effects_trace(value::AbstractArray) = Reactant.to_rarray(value)
@@ -26,6 +33,14 @@ _effects_trace(value) = value
 @testset "host-drained observations survive Reactant tracing" begin
     @test Base.get_extension(
         ReactiveKernels, :ReactiveKernelsReactantExt) !== nothing
+
+    tuple_prototype = (1.0, [2.0, 3.0])
+    tuple_value = _effects_trace((4.0, [5.0, 6.0]))
+    tuple_restore = _ReactantTupleWrapperRestore(tuple_prototype)
+    compiled_tuple_restore = @compile tuple_restore(tuple_value)
+    restored_tuple = compiled_tuple_restore(tuple_value)
+    @test Float64(first(restored_tuple)) == 4.0
+    @test Array(last(restored_tuple)) == [5.0, 6.0]
 
     collector = _ReactantObservationCollector(Int[])
     port = effect_callable_port(

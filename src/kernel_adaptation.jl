@@ -3697,8 +3697,8 @@ end
     end)
 end
 @inline function _sm_restore_source_logical_wrappers(
-        prototype::Tuple, value)
-    map(eachindex(prototype)) do index
+        prototype::Tuple{Vararg{Any,N}}, value) where {N}
+    ntuple(Val(N)) do index
         _sm_restore_source_logical_wrappers(
             getfield(prototype, index), getfield(value, index))
     end
