@@ -54,6 +54,32 @@ value, returned_gradient = ad_value_and_gradient!(
 storage. Both preserve authored positional defaults and keyword interfaces while
 rebuilding inactive constants from the current call.
 
+## Freeze data-only work during preparation
+
+When data stay fixed across many derivative calls, pass them in the named
+`bound` NamedTuple instead of rebinding them as `Constant` contexts. The
+data-only prefix executes exactly once during preparation; its results become
+constants in the residual kernel, and the prepared derivative boundary accepts
+only the remaining HAVE ports. Rebind by preparing again from the original
+kernel specification.
+
+```@example automatic_differentiation
+bound_prepared = prepare_ad(
+    objective, backend, parameters;
+    active = :q, want = :density,
+    bound = (; data),
+)
+
+bound_gradient = ad_gradient(bound_prepared, parameters)
+@assert bound_gradient ≈ gradient
+
+(; bound_gradient)
+```
+
+`active` and the positional preparation exemplars refer to the remaining
+ports. Authored keyword arguments do not apply to a bound preparation, because
+their values have either been fixed or removed with the hoisted prefix.
+
 ## Accepted boundary
 
 - The requested WANT is scalar and explicit when several outputs are possible.

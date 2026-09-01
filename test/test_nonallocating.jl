@@ -252,3 +252,37 @@ end
         @test occursin("recipe 1", sprint(showerror, err))
     end
 end
+
+@testset "partial evaluation through non-allocating preparation" begin
+    data_calls = Ref(0)
+    g = Graph()
+    x = value!(g, :x, Vector{Float64})
+    d = value!(g, :d, Vector{Float64})
+    a = value!(g, :a, Vector{Float64})
+    r = value!(g, :r, Vector{Float64})
+    add!(g; inputs = (d,), outputs = (a,),
+         op = (d -> (data_calls[] += 1; 2 .* d)))
+    add!(g; inputs = (x, a), outputs = (r,), op = (x, a) -> x .+ a)
+
+    dval = [1.0, 2.0, 3.0]
+    plain = prepare_nonallocating(g; have = (x, d), want = (r,))
+    expected = copy(plain([1.0, 1.0, 1.0], dval))
+
+    data_calls[] = 0
+    bound = prepare_nonallocating(g; have = (x, d), want = (r,),
+                                  bound = (d => dval,))
+    @test bound isa NonAllocatingKernel
+    @test data_calls[] == 1                       # prefix ran at prepare time
+    @test copy(bound([1.0, 1.0, 1.0])) == expected
+    @test copy(bound([2.0, 2.0, 2.0])) == [4.0, 6.0, 8.0]
+    @test data_calls[] == 1                       # and never per call
+    @test Tuple(v.name for v in inputs(bound)) == (:x,)
+
+    # The hoisted constant is fetched, not recomputed: the bound kernel's
+    # steady-state allocation cannot exceed the unbound kernel's, which
+    # re-runs the (generic-fallback, allocating) data operation per call.
+    plain_allocated = (plain([3.0, 3.0, 3.0], dval);
+                       @allocated plain([3.0, 3.0, 3.0], dval))
+    bound_allocated = kernel_allocations(bound, [3.0, 3.0, 3.0])
+    @test bound_allocated <= plain_allocated
+end

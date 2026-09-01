@@ -45,6 +45,9 @@ end
                  "nuts_reactant_comparison_body.jl",
                  "eval_throughput_comparison.jl",
                  "eval_throughput_comparison_body.jl",
+                 "partial_evaluation_comparison.jl",
+                 "partial_evaluation_comparison_body.jl",
+                 joinpath("receipts", "validate_partial_evaluation.jl"),
                  joinpath("receipts", "validate_nuts_reactant.jl"),
                  joinpath("receipts", "validate_eval_throughput.jl"),
                  joinpath("receipts", "validate_distributions.jl"),
@@ -158,6 +161,16 @@ end
     @test isfile(receipt)
     include(validator)
     @test isempty(validate_mnist_reactant_ad_receipt(receipt))
+end
+
+@testset "partial-evaluation benchmark receipt validates" begin
+    validator = joinpath(
+        _BENCH_DIR, "receipts", "validate_partial_evaluation.jl")
+    receipt = joinpath(
+        _BENCH_DIR, "receipts", "partial-evaluation-mnist-v1.toml")
+    @test isfile(receipt)
+    include(validator)
+    @test isempty(validate_partial_evaluation_receipt(receipt))
 end
 
 @testset "Eight Schools receipt text digests are checkout-line-ending invariant" begin
