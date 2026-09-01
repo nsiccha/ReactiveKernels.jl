@@ -1041,6 +1041,37 @@ function _kernel_normalize_return_expressions(statements)
     normalized
 end
 
+# A plate do-block follows ordinary Julia function semantics: its final
+# expression is the scalar result even when the body contains earlier local
+# recipes.  The general stateless graph grammar intentionally treats a bare
+# statement such as `result` as an input declaration, so make the do-block's
+# implicit result explicit before handing it to `_kernel_expand`.
+function _kernel_implicit_plate_result_body(body)
+    body isa Expr && body.head === :block || return body
+    result_index = findlast(
+        index -> !_kernel_is_line(body.args[index]), eachindex(body.args))
+    result_index === nothing && throw(ArgumentError(
+        "plate do-block must produce a scalar result"))
+    result = body.args[result_index]
+    result isa Expr && result.head === :return && return body
+
+    statements = Any[body.args...]
+    assigned_name = if result isa Expr && result.head === :(=)
+        lhs = result.args[1]
+        lhs isa Symbol ? lhs :
+            lhs isa Expr && lhs.head === :(::) && lhs.args[1] isa Symbol ?
+            lhs.args[1] : nothing
+    else
+        nothing
+    end
+    if assigned_name === nothing
+        statements[result_index] = Expr(:return, result)
+    else
+        insert!(statements, result_index + 1, Expr(:return, assigned_name))
+    end
+    Expr(:block, statements...)
+end
+
 function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                                       nested_specs::Dict{Symbol,Any},
                                       local_types::Dict{Symbol,Any};
@@ -1254,6 +1285,7 @@ function _kernel_authored_plate_expr(rhs, mod)
         (name, get(local_types, name, GlobalRef(Core, :Any))) for name in formals]
     scalar_graph_body = _kernel_expression_result_body(
         :__plate_value__, signature, rewritten, true)
+    scalar_graph_body = _kernel_implicit_plate_result_body(scalar_graph_body)
     if !isempty(materialized)
         lifted = Any[
             Expr(:(=), Expr(:(::), name, T), rhs)

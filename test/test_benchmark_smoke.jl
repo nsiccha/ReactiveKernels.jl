@@ -2,6 +2,7 @@ using ReactiveKernels
 using LinearAlgebra
 using Random
 import SHA
+import TOML
 using Test
 
 # Keeps the checked-in benchmark scripts from rotting outside the (external-dep)
@@ -25,6 +26,7 @@ end
                  "structured_distributions_comparison.jl",
                  "distribution_gradients.jl",
                  "_ad_comparison_support.jl",
+                 "_comparison_source_attestation.jl",
                  "eight_schools_ad_comparison.jl",
                  "eight_schools_ad_comparison_body.jl",
                  "mnist_logistic_comparison.jl",
@@ -57,6 +59,42 @@ end
         @test isfile(path)
         @test _parses(path)
     end
+end
+
+include(joinpath(_BENCH_DIR, "_comparison_source_attestation.jl"))
+using .ComparisonSourceAttestation
+
+@testset "AD comparator current-source delta stays narrow" begin
+    for (receipt_name, guard) in (
+            "mnist-logistic-ad-v1.toml" =>
+                "get(ENV, \"RK_MNIST_DEFINITIONS_ONLY\", \"\") == \"1\" || run_comparison()\n",
+            "eight-schools-ad-v1.toml" =>
+                "get(ENV, \"RK_EIGHT_SCHOOLS_DEFINITIONS_ONLY\", \"\") == \"1\" || run_comparison()\n",
+        )
+        receipt = TOML.parsefile(joinpath(_BENCH_DIR, "receipts", receipt_name))
+        pin = receipt["pins"]["primal_comparator_source"]
+        published = read(
+            `git -C $_BENCH_DIR show $(pin["commit"]):$(pin["path"])`, String)
+        current = read(joinpath(dirname(_BENCH_DIR), pin["path"]), String)
+        @test comparator_source_matches_current_delta(current, published, guard)
+    end
+
+    published = "model definition\nrun_comparison()\n"
+    guard = "get(ENV, \"DEFINITIONS_ONLY\", \"\") == \"1\" || run_comparison()\n"
+    current = """
+model definition
+# DOCS-BASELINE-BEGIN: turing
+# DOCS-BASELINE-END: turing
+# DOCS-BASELINE-BEGIN: manual
+# DOCS-BASELINE-END: manual
+$(guard)"""
+    @test comparator_source_matches_current_delta(current, published, guard)
+    @test !comparator_source_matches_current_delta(
+        replace(current, "# DOCS-BASELINE-END: manual\n" => ""),
+        published, guard)
+    @test !comparator_source_matches_current_delta(
+        replace(current, "model definition" => "changed executable source"),
+        published, guard)
 end
 
 @testset "MNIST logistic AD benchmark receipt validates" begin
