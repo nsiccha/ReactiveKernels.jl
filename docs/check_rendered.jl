@@ -428,6 +428,11 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
             "Native RK AD / Reactant-compiled AD steady-state matrix",
             "benchmark/receipts/mnist-reactant-v1.toml",
             "benchmark/receipts/mnist-reactant-ad-v1.toml",
+            "benchmark/receipts/mnist-reactant-wren-pca40-v1.toml",
+            "benchmark/receipts/mnist-reactant-ad-wren-pca40-v1.toml",
+            "Wren-compatible PCA-40 workload",
+            "Wren PCA-40. Packed full joint:",
+            "Wren PCA-40. Packed full-joint value-and-gradient:",
             "packages/ReactiveKernelsPPLExamples/src/mnist_logistic.jl",
         ),
         "nuts.md" => (

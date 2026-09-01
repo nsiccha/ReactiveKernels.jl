@@ -74,6 +74,34 @@ transfers, gradient compilation, the first synchronous call, and readback are
 excluded from steady-state timing
 and reported separately.
 
+## Wren-compatible PCA-40 workload
+
+The additional workload uses the exact data representation in Wren's
+`bench/mnist.csv`, without committing that private file. Starting from the
+same MLDatasets training split, the generator centers all 60000 raw images,
+fits PCA in the 784-pixel space, and projects the first 1000 images onto the
+top 40 components without whitening. The generated labels have zero
+mismatches against Wren, and the generated feature matrix matches the copied
+CSV with maximum absolute error `1.10e-13`. The retained components explain
+78.6108% of full-training-set pixel variance.
+
+This is a separately identified `1000×40` workload, not a replacement for the
+full `60000×784` results above. The two scales differ by 1176× in feature
+elements, so their absolute timings should not be compared without the
+workload label.
+
+### PCA-40 primal performance
+
+```@eval
+Main.ReactiveKernelsDocs.render_mnist_reactant_wren_benchmark()
+```
+
+### PCA-40 Reactant-compiled automatic differentiation
+
+```@eval
+Main.ReactiveKernelsDocs.render_mnist_reactant_ad_wren_benchmark()
+```
+
 ## Reproduce
 
 The receipt generator requires a clean detached candidate so its full commit
@@ -109,3 +137,23 @@ julia --startup-file=no benchmark/receipts/validate_mnist_reactant_ad.jl \
 
 Its quick-smoke knobs are `RK_MNIST_REACTANT_AD_N` and
 `RK_MNIST_REACTANT_AD_ROUNDS`.
+
+Generate the additional Wren-compatible receipts with the same scripts and
+the explicit dataset selector. Supplying the copied CSV performs the
+publication-time equality check recorded in each receipt; the PCA workload
+itself is reconstructed from MLDatasets rather than read from the private
+file.
+
+```sh
+julia --startup-file=no benchmark/mnist_reactant_comparison.jl \
+  --dataset=wren-pca40 --wren-reference=/path/to/mnist.csv \
+  --output=benchmark/receipts/mnist-reactant-wren-pca40-v1.toml
+julia --startup-file=no benchmark/receipts/validate_mnist_reactant.jl \
+  benchmark/receipts/mnist-reactant-wren-pca40-v1.toml
+
+julia --startup-file=no benchmark/mnist_reactant_ad_comparison.jl \
+  --dataset=wren-pca40 --wren-reference=/path/to/mnist.csv \
+  --output=benchmark/receipts/mnist-reactant-ad-wren-pca40-v1.toml
+julia --startup-file=no benchmark/receipts/validate_mnist_reactant_ad.jl \
+  benchmark/receipts/mnist-reactant-ad-wren-pca40-v1.toml
+```
