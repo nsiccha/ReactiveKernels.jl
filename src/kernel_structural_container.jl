@@ -32,7 +32,8 @@ struct _SMFiniteScalarColumnSpec{T} end
 struct _SMFiniteArrayColumnSpec{A,Shape,T} end
 
 struct _SMFiniteStructuralContract{
-        Element,Capacity,Names,Schema,Specs,StaticValues,Paths,OwnedGroups}
+        Element,Capacity,Names,Schema,Specs,StaticValues,Paths,OwnedGroups} <:
+        _SMFiniteStructuralPort
     schema::Schema
     specs::Specs
     static_values::StaticValues
@@ -247,9 +248,18 @@ function _sm_finite_validate_elements(
         "finite structural vector has capacity $(length(values)); expected $Capacity"))
     prior_leaders = Any[]
     for (index, value) in enumerate(values)
-        typeof(value) === Element || throw(ArgumentError(
+        strict = typeof(value) === Element
+        strict || _sm_functional_argument_type_ok(typeof(value), Element) ||
+            throw(ArgumentError(
             "finite structural element $index has type `$(typeof(value))`; expected `$Element`"))
-        leaders = _sm_finite_validate_element(contract, value)
+        # Optional tensor backends recursively replace builtin numeric leaves
+        # with their exact logical tracer types while retaining the authored
+        # aggregate layout.  Validate those leaves through the registered
+        # functional-type bridge; ordinary host values still take the exact
+        # concrete-type path.  Shape, static-identity, and alias-topology
+        # checks remain identical in both modes.
+        leaders = _sm_finite_validate_element(
+            contract, value, Val(strict))
         for leader in leaders, prior in prior_leaders
             leader !== prior || throw(ArgumentError(
                 "finite structural prototype shares owned storage across elements"))
@@ -292,20 +302,28 @@ end
 function _sm_finite_pack_column(
         ::_SMFiniteScalarColumnSpec{T}, values::Vector,
         path::Tuple, capacity::Int) where {T}
-    T[_sm_topology_value(value, path) for value in values]
+    leaves = map(value -> _sm_topology_value(value, path), values)
+    typeof(first(leaves)) === T ? T[leaves...] : stack(leaves)
 end
 
 function _sm_finite_pack_column(
         ::_SMFiniteArrayColumnSpec{A,Shape,T}, values::Vector,
         path::Tuple, capacity::Int) where {A,Shape,T}
+    leaves = map(value -> _sm_topology_value(value, path), values)
+    typeof(first(leaves)) === A || return stack(leaves)
     column = Array{T}(undef, Shape..., capacity)
     dimension = length(Shape) + 1
     for index in 1:capacity
-        selectdim(column, dimension, index) .=
-            _sm_topology_value(values[index], path)
+        selectdim(column, dimension, index) .= leaves[index]
     end
     column
 end
+
+# Optional tensor backends may trace only some leaves of one logical structural
+# value.  Give the backend one chance to promote the completed column tuple so
+# that the fixed loop carry has a single concrete representation from entry
+# through every later read/write.  Native storage remains unchanged.
+@inline _sm_finite_pack_backend(raw) = raw
 
 function _sm_finite_structural_pack(
         contract::_SMFiniteStructuralContract{
@@ -315,8 +333,14 @@ function _sm_finite_structural_pack(
     columns = map(contract.specs, contract.representative_paths) do spec, path
         _sm_finite_pack_column(spec, values, path, Capacity)
     end
-    raw = NamedTuple{Names}(columns)
+    raw = _sm_finite_pack_backend(NamedTuple{Names}(columns))
     _sm_finite_validate_raw(contract, raw)
+end
+
+function _sm_finite_structural_logical_copy(
+        contract::_SMFiniteStructuralContract, values::Vector)
+    _sm_finite_structural_unpack(
+        contract, _sm_finite_structural_pack(contract, values))
 end
 
 function _sm_finite_raw_column_ok(
@@ -351,9 +375,23 @@ function _sm_finite_validate_raw(
     raw
 end
 
-@inline _sm_finite_read_column(
-    column, index, ::_SMFiniteScalarColumnSpec) =
-        _sm_functional_index(column, index)
+_sm_finite_capacity(
+    ::_SMFiniteStructuralContract{Element,Capacity}) where
+    {Element,Capacity} = Capacity
+
+function _sm_finite_raw_type(
+        contract::_SMFiniteStructuralContract{Element,Capacity,Names}) where
+        {Element,Capacity,Names}
+    column_types = map(contract.specs) do spec
+        if spec isa _SMFiniteScalarColumnSpec
+            Vector{typeof(spec).parameters[1]}
+        else
+            _, shape, element = typeof(spec).parameters
+            Array{element,length(shape) + 1}
+        end
+    end
+    NamedTuple{Names,Tuple{column_types...}}
+end
 
 @generated function _sm_finite_read_array_column(
         column, index, ::Val{Rank}) where {Rank}
@@ -361,9 +399,31 @@ end
     :(_sm_functional_index(column, $(indices...), index))
 end
 
-@inline _sm_finite_read_column(
-        column, index, ::_SMFiniteArrayColumnSpec{A,Shape}) where {A,Shape} =
-    _sm_finite_read_array_column(column, index, Val(length(Shape)))
+@inline _sm_finite_read_position(
+        column, ::_SMFiniteScalarColumnSpec, ::Val{Position}) where {Position} =
+    maximum(_sm_functional_index(column, Position:Position))
+
+@inline _sm_finite_read_position(
+        column, ::_SMFiniteArrayColumnSpec{A,Shape},
+        ::Val{Position}) where {A,Shape,Position} =
+    _sm_finite_read_array_column(
+        column, Position, Val(length(Shape)))
+
+# The structural capacity is part of the compiled ABI.  Enumerate it at
+# generation time and select complete leaves rather than applying a traced
+# scalar index to a backend column.  This is the same bounded gather contract
+# used by the functional control-frame store.
+@generated function _sm_finite_read_column(
+        column, index, spec::Spec, ::Val{Capacity}) where {Spec,Capacity}
+    selected = :(_sm_finite_read_position(column, spec, Val(1)))
+    for position in 2:Capacity
+        selected = :(_sm_predicated_select(
+            index .== oftype(index, $position),
+            _sm_finite_read_position(column, spec, Val($position)),
+            $selected))
+    end
+    selected
+end
 
 @inline _sm_finite_reconstruct(
         ::_SMFiniteScalarNode{Index}, leaves, static_values) where {Index} =
@@ -392,9 +452,58 @@ end
 @inline function _sm_finite_reconstruct(
         node::_SMFiniteCholeskyNode{Uplo,Info}, leaves,
         static_values) where {Uplo,Info}
-    LinearAlgebra.Cholesky(
+    _sm_cholesky_reconstruct(
         _sm_finite_reconstruct(node.child, leaves, static_values),
         Uplo, Info)
+end
+
+# Optional backends may need representation-only wrappers while tracing (for
+# example Reactant's BatchedCholesky).  Reusable results cross back to the
+# source-logical ABI before their next invocation: retain the backend arrays,
+# but rebuild every structural wrapper from the frozen source schema.  This is
+# intentionally separate from `_sm_finite_reconstruct`, whose backend-aware
+# wrapper choice is required inside the compiled program.
+@inline _sm_finite_restore_logical(
+        ::_SMFiniteScalarNode, value, static_values) = value
+@inline _sm_finite_restore_logical(
+        ::_SMFiniteArrayNode, value, static_values) = value
+@inline _sm_finite_restore_logical(
+        ::_SMFiniteStaticNode{Index}, value, static_values) where {Index} =
+    getfield(static_values, Index)
+@inline function _sm_finite_restore_logical(
+        node::_SMFiniteNamedTupleNode{Names}, value,
+        static_values) where {Names}
+    NamedTuple{Names}(map(Names, node.children) do name, child
+        _sm_finite_restore_logical(
+            child, getfield(value, name), static_values)
+    end)
+end
+@inline function _sm_finite_restore_logical(
+        node::_SMFiniteTupleNode, value, static_values)
+    map(eachindex(node.children), node.children) do index, child
+        _sm_finite_restore_logical(
+            child, getfield(value, index), static_values)
+    end
+end
+@inline _sm_finite_restore_logical(
+        node::_SMFiniteDiagonalNode, value, static_values) =
+    LinearAlgebra.Diagonal(_sm_finite_restore_logical(
+        node.child, getfield(value, :diag), static_values))
+@inline function _sm_finite_restore_logical(
+        node::_SMFiniteCholeskyNode{Uplo,Info}, value,
+        static_values) where {Uplo,Info}
+    LinearAlgebra.Cholesky(
+        _sm_finite_restore_logical(
+            node.child, getfield(value, :factors), static_values),
+        Uplo, Info)
+end
+
+function _sm_finite_restore_logical_elements(
+        contract::_SMFiniteStructuralContract, values::Vector)
+    _sm_finite_validate_elements(contract, values)
+    restored = [_sm_finite_restore_logical(
+        contract.schema, value, contract.static_values) for value in values]
+    _sm_finite_validate_elements(contract, restored)
 end
 
 @inline function _sm_finite_inbounds(index, ::Val{Capacity}) where {Capacity}
@@ -406,9 +515,12 @@ end
 end
 
 function _sm_finite_column_values(
-        contract::_SMFiniteStructuralContract, raw, index)
-    map(_sm_finite_read_column, values(raw),
-        ntuple(_ -> index, length(contract.specs)), contract.specs)
+        contract::_SMFiniteStructuralContract{Element,Capacity},
+        raw, index) where {Element,Capacity}
+    map(values(raw), contract.specs) do column, spec
+        _sm_finite_read_column(
+            column, index, spec, Val(Capacity))
+    end
 end
 
 function _sm_finite_structural_read(
@@ -432,26 +544,34 @@ function _sm_finite_encode_element(
 end
 
 @inline _sm_finite_scalar_candidate(column, value) =
-    oftype.(column, value)
+    zero.(column) .+ value
+@inline function _sm_finite_bool_candidate(column, active)
+    result = copy(column)
+    result .= active
+    result
+end
 @inline _sm_finite_scalar_candidate(column::Array{Bool}, value::Bool) =
-    fill(value, size(column))
+    _sm_finite_bool_candidate(column, value)
 
 @inline function _sm_finite_array_candidate(
         column, value, ::Val{Rank}) where {Rank}
-    oftype.(column, reshape(value, (size(value)..., 1)))
+    zero.(column) .+ reshape(value, (size(value)..., 1))
 end
 @inline function _sm_finite_array_candidate(
         column::Array{Bool}, value::Array{Bool,Rank},
         ::Val{Rank}) where {Rank}
-    repeat(reshape(value, (size(value)..., 1));
-           outer=(ntuple(_ -> 1, Rank)..., size(column, Rank + 1)))
+    _sm_finite_bool_candidate(
+        column, reshape(value, (size(value)..., 1)))
 end
 
 @inline _sm_finite_select(active, candidate, prior) =
     _sm_predicated_select(active, candidate, prior)
-@inline _sm_finite_select(
-        active, candidate::Array{Bool,N}, prior::Array{Bool,N}) where {N} =
-    Array(_sm_predicated_select(active, candidate, prior))
+@inline function _sm_finite_select(
+        active, candidate::Array{Bool,N}, prior::Array{Bool,N}) where {N}
+    result = copy(prior)
+    result .= _sm_predicated_select(active, candidate, prior)
+    result
+end
 
 @inline function _sm_finite_store_column(
         column, value, index, active,
@@ -515,9 +635,11 @@ function _sm_finite_structural_copy(
 end
 
 function _sm_finite_swap_column(
-        column, left, right, active, spec)
-    left_value = _sm_finite_read_column(column, left, spec)
-    right_value = _sm_finite_read_column(column, right, spec)
+        column, left, right, active, spec, capacity::Val)
+    left_value = _sm_finite_read_column(
+        column, left, spec, capacity)
+    right_value = _sm_finite_read_column(
+        column, right, spec, capacity)
     with_left = _sm_finite_store_column(
         column, right_value, left, active, spec)
     _sm_finite_store_column(
@@ -537,7 +659,8 @@ function _sm_finite_structural_swap(
     commit = _sm_predicated_and(active, valid)
     columns = map(values(raw), contract.specs) do column, spec
         _sm_finite_swap_column(
-            column, safe_left, safe_right, commit, spec)
+            column, safe_left, safe_right, commit, spec,
+            Val(Capacity))
     end
     storage = NamedTuple{Names}(columns)
     overflow = _sm_predicated_and(active, _sm_predicated_not(valid))

@@ -3,6 +3,7 @@ module ReactiveKernelsReactantExt
 using ReactiveKernels
 import Reactant
 import DifferentiationInterface
+import LinearAlgebra
 
 @inline ReactiveKernels._kernel_source_arg_style(
     arg::Reactant.TracedType) = Val(:tensorized)
@@ -49,6 +50,23 @@ ReactiveKernels._sm_functional_argument_type_ok(
     {Actual<:Reactant.AbstractConcreteNumber,Expected} =
         _rk_reactant_logical_argument(Actual, Expected)
 
+# Reusable finite structural results retain device arrays, but scalar leaves
+# must cross back to the constructor-bound host ABI before the same compiled
+# thunk is called again. During tracing a TracedRNumber deliberately falls
+# through to core's identity method; only an executed PJRT scalar transfers.
+@inline function ReactiveKernels._sm_finite_restore_logical(
+        ::ReactiveKernels._SMFiniteScalarNode{Index,T},
+        value::Reactant.ConcretePJRTNumber,
+        static_values) where {Index,T}
+    ReactiveKernels._sm_functional_argument_type_ok(
+        typeof(value), T) || throw(ArgumentError(
+        "finite structural concrete scalar does not match logical type `$T`"))
+    restored = T(value)
+    typeof(restored) === T || throw(ArgumentError(
+        "finite structural concrete scalar did not restore exact logical type `$T`"))
+    restored
+end
+
 function ReactiveKernels._sm_functional_argument_type_ok(
         ::Type{Actual}, ::Type{Expected}) where
         {Actual<:ReactiveKernels.OrderedRNGReplay,
@@ -64,11 +82,44 @@ end
 # extension so core never broadly authorizes arbitrary AbstractArray/Number
 # subtypes (and therefore never invokes user broadcast machinery).
 @inline ReactiveKernels._sm_predicated_select(
+    active::Reactant.TracedRNumber{Bool},
+    new::T, old::T) where {T<:Reactant.TracedRArray} =
+        Reactant.Ops.select(active, new, old)
+@inline ReactiveKernels._sm_predicated_select(
+    active::Reactant.TracedRArray{Bool,N},
+    new::Reactant.TracedRArray{T,N},
+    old::Reactant.TracedRArray{T,N}) where {T,N} = begin
+        predicate = if size(active) == size(new)
+            active
+        else
+            Reactant.Ops.broadcast_in_dim(
+                active, collect(Int64, 1:N), collect(Int64, size(new)))
+        end
+        Reactant.Ops.select(predicate, new, old)
+    end
+@inline ReactiveKernels._sm_predicated_select(
     active, new::T, old::T) where {T<:Reactant.TracedRArray} =
         ifelse.(active, new, old)
 @inline ReactiveKernels._sm_predicated_select(
     active, new::T, old::T) where {T<:Reactant.TracedRNumber} =
         ifelse(active, new, old)
+
+# A nested structural argument can retain host scalar leaves while sibling
+# arrays are traced.  Promote every completed host column as an MLIR constant
+# when any column already follows the traced backend, keeping the fixed while
+# carry type stable across subsequent structural writes.
+function ReactiveKernels._sm_finite_pack_backend(raw::NamedTuple)
+    any(column -> column isa Reactant.TracedRArray, values(raw)) ||
+        return raw
+    names = propertynames(raw)
+    columns = map(values(raw)) do column
+        column isa Array || return column
+        T = eltype(column)
+        N = ndims(column)
+        Reactant.promote_to(Reactant.TracedRArray{T,N}, column)
+    end
+    NamedTuple{names}(columns)
+end
 @inline ReactiveKernels._sm_predicated_select(
     active, new::T, old::T) where {T<:Reactant.AbstractConcreteArray} =
         ifelse.(active, new, old)
@@ -111,6 +162,14 @@ end
         active, host::AbstractArray, traced::T) where
         {T<:Reactant.AbstractConcreteArray} =
     _rk_reactant_mixed_array_select_reverse(active, host, traced)
+
+# Distinct loop-carry slots must not reuse one traced scalar identity when the
+# body can update those slots independently. `copy` is identity for Numbers,
+# so materialize a value-preserving backend operation instead.
+@inline ReactiveKernels._sm_control_carry_isolate(
+    value::Reactant.TracedRNumber) = value + zero(value)
+@inline ReactiveKernels._sm_control_carry_isolate(
+    value::Reactant.AbstractConcreteNumber) = value + zero(value)
 
 # A traced branch can legitimately meet a source literal or compiler-static
 # initial value of the same logical scalar type.  Keep that bridge exact: it
@@ -170,6 +229,36 @@ end
         active, new::A, old::B) where
         {A<:Reactant.TracedRNumber,B<:Reactant.TracedRNumber} =
     _rk_reactant_traced_scalar_select(active, new, old)
+
+function ReactiveKernels._sm_functional_control_loop(
+        step, carry, marker::Reactant.TracedRNumber)
+    Reactant.@trace track_numbers = false while ReactiveKernels._sm_functional_control_continue(carry)
+        carry = step(carry)
+    end
+    carry
+end
+
+function ReactiveKernels._sm_functional_control_loop(
+        step, carry, marker::Reactant.AbstractConcreteNumber)
+    Reactant.@trace track_numbers = false while ReactiveKernels._sm_functional_control_continue(carry)
+        carry = step(carry)
+    end
+    carry
+end
+
+@inline function ReactiveKernels._sm_total_functional_effect_call(
+        marker::Reactant.TracedRNumber,
+        lowering::ReactiveKernels._TotalFunctionalLowering,
+        args...; kwargs...)
+    Reactant.@allowscalar lowering(args...; kwargs...)
+end
+
+@inline function ReactiveKernels._sm_total_functional_effect_call(
+        marker::Reactant.AbstractConcreteNumber,
+        lowering::ReactiveKernels._TotalFunctionalLowering,
+        args...; kwargs...)
+    Reactant.@allowscalar lowering(args...; kwargs...)
+end
 
 @inline function ReactiveKernels._sm_functional_index(
         array::Reactant.TracedRArray, indices...)
@@ -253,6 +342,19 @@ function Reactant.traced_type_inner(
     T
 end
 
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels._FunctionalStateMachineControlStep,
+        path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where
+        {T<:ReactiveKernels._FunctionalStateMachineControlStep}
+    T
+end
+
 # A finite structural contract is compiler metadata. Its schema and exact
 # static identities define how numeric SoA inputs are interpreted, but neither
 # is a dynamic backend argument.
@@ -299,17 +401,118 @@ function Reactant.traced_type_inner(
     T
 end
 
-# Reactant represents a traced Cholesky factorization as BatchedCholesky and
-# may tensorize a logical Diagonal factor directly to its backing array.  The
-# topology contract remains source-logical, so rebuild the traced wrapper while
-# treating the erased `:diag` step as representation-only.  Core still rejects
-# every other array structural path.
+# Reactant represents a traced Cholesky factorization as BatchedCholesky.  A
+# Julia Cholesky cannot carry traced `factors` and `info` consistently because
+# its scalar and metadata field types are not both reflected in type
+# parameters.  Normalize the wrapper at the backend boundary while retaining
+# the source-logical factors/uplo/info contract.
+const _RKBatchedCholesky = Reactant.TracedLinearAlgebra.BatchedCholesky
+const _RKReactantArray = Union{
+    Reactant.TracedRArray,Reactant.AbstractConcreteArray}
+
+# `info` is source-static metadata for a compiled Cholesky value, not a tensor
+# argument.  React only to the numeric factor storage so traced loop carries do
+# not attempt to tensorize the host `Int` metadata field.
+function Reactant.traced_type_inner(
+        ::Type{C}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where {C<:_RKBatchedCholesky}
+    Factors = Reactant.traced_type_inner(
+        fieldtype(C, :factors), seen, mode, track_numbers,
+        ndevices, runtime)
+    _RKBatchedCholesky{
+        eltype(Factors),Factors,fieldtype(C, :info)}
+end
+
+function Reactant.make_tracer(
+        seen, previous::_RKBatchedCholesky, path, mode; kwargs...)
+    factors = Reactant.make_tracer(
+        seen, previous.factors, Reactant.append_path(path, 1), mode;
+        kwargs...)
+    factors === nothing && return nothing
+    _RKBatchedCholesky(factors, previous.uplo, previous.info)
+end
+
+@inline function ReactiveKernels._sm_cholesky_reconstruct(
+        factors::A, uplo, info) where {A<:_RKReactantArray}
+    _RKBatchedCholesky(factors, uplo, info)
+end
+@inline function ReactiveKernels._sm_cholesky_reconstruct(
+        factors::LinearAlgebra.Diagonal{T,V}, uplo, info) where
+        {T,V<:_RKReactantArray}
+    _RKBatchedCholesky(factors, uplo, info)
+end
+
+@inline ReactiveKernels._sm_backend_storage_value(
+        value::_RKBatchedCholesky) =
+    ReactiveKernels._sm_cholesky_reconstruct(
+        ReactiveKernels._sm_backend_storage_value(value.factors),
+        value.uplo, value.info)
+
+function ReactiveKernels._sm_functional_argument_type_ok(
+        ::Type{Actual}, ::Type{Expected}) where
+        {Actual<:_RKBatchedCholesky,
+         Expected<:LinearAlgebra.Cholesky}
+    ReactiveKernels._sm_functional_argument_type_ok(
+        fieldtype(Actual, :factors), fieldtype(Expected, :factors)) &&
+        fieldtype(Actual, :uplo) === fieldtype(Expected, :uplo) &&
+        ReactiveKernels._sm_functional_argument_type_ok(
+            fieldtype(Actual, :info), fieldtype(Expected, :info))
+end
+
+ReactiveKernels._sm_functional_shape_ok(
+        actual::_RKBatchedCholesky,
+        expected::LinearAlgebra.Cholesky) =
+    ReactiveKernels._sm_functional_shape_ok(
+        actual.factors, expected.factors)
+
+ReactiveKernels._sm_shape_contract_ok(
+        value::_RKBatchedCholesky, expected::Tuple) =
+    ReactiveKernels._sm_shape_contract_ok(value.factors, expected)
+
+function ReactiveKernels._sm_topology_leaves!(
+        leaves, value::_RKBatchedCholesky, path::Tuple)
+    ReactiveKernels._sm_topology_leaves!(
+        leaves, value.factors, (path..., :factors))
+end
+
+@inline ReactiveKernels._sm_structural_copy(
+        value::_RKBatchedCholesky) =
+    ReactiveKernels._sm_cholesky_reconstruct(
+        ReactiveKernels._sm_structural_copy(value.factors),
+        value.uplo, value.info)
+
+@inline function ReactiveKernels._sm_predicated_select(
+        active, new::_RKBatchedCholesky, old::_RKBatchedCholesky)
+    new.uplo == old.uplo && new.info === old.info || throw(ArgumentError(
+        "predicated functional state cannot change Cholesky metadata"))
+    ReactiveKernels._sm_cholesky_reconstruct(
+        ReactiveKernels._sm_predicated_select(
+            active, new.factors, old.factors),
+        new.uplo, new.info)
+end
+
+function ReactiveKernels._sm_finite_validate_node(
+        node::ReactiveKernels._SMFiniteCholeskyNode{Uplo,Info},
+        value::_RKBatchedCholesky, static_values, path::Tuple,
+        strict::Val) where {Uplo,Info}
+    value.uplo === Uplo && value.info === Info || throw(ArgumentError(
+        "finite structural Cholesky metadata at $path was replaced"))
+    ReactiveKernels._sm_finite_validate_node(
+        node.child, value.factors, static_values,
+        (path..., :factors), strict)
+    value
+end
+
+# A traced Diagonal factor may be represented directly by its backing array.
+# The topology contract remains source-logical, so treat the erased `:diag`
+# step as representation-only.  Core still rejects every other array
+# structural path.
 @inline function ReactiveKernels._sm_structural_set(
-        value::Reactant.TracedLinearAlgebra.BatchedCholesky,
+        value::_RKBatchedCholesky,
         ::Val{Path}, replacement) where {Path}
     first(Path) === :factors || throw(ArgumentError(
         "traced Cholesky structural path must name `factors`"))
-    Reactant.TracedLinearAlgebra.BatchedCholesky(
+    ReactiveKernels._sm_cholesky_reconstruct(
         ReactiveKernels._sm_structural_set(
             value.factors, Val(Base.tail(Path)), replacement),
         value.uplo, value.info)
