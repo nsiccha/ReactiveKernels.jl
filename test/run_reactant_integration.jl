@@ -6,6 +6,7 @@ const REACTANT_UUID = UUID("3c362404-f566-11ee-1572-e11a4b42c853")
 
 root = normpath(joinpath(@__DIR__, ".."))
 testfile = joinpath(@__DIR__, "test_reactant.jl")
+ad_testfile = joinpath(@__DIR__, "test_ad_reactant.jl")
 phasepoint_testfile = joinpath(@__DIR__, "test_reactivehmc_phasepoint_reactant.jl")
 effect_boundary_testfile = joinpath(
     @__DIR__, "test_effect_boundary_reactant.jl")
@@ -32,6 +33,7 @@ mktempdir() do env
         PackageSpec(name = "Enzyme"),
         PackageSpec(name = "LambertW"),
         PackageSpec(name = "LogExpFunctions"),
+        PackageSpec(name = "DifferentiationInterface"),
     ])
     Pkg.instantiate()
 
@@ -45,6 +47,7 @@ mktempdir() do env
     if selector == "all"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $effect_boundary_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $testfile`)
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $ad_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $phasepoint_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $mutation_profile_b_testfile`)
     elseif selector == "mutation-profile-b"

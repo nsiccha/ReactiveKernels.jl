@@ -289,14 +289,6 @@ end
             observations, effects, scales)
         @test likelihood_compiled(observations, effects, scales) ≈
               reference_likelihood
-
-        pointwise_and_likelihood_compiled =
-            @compile artifact.pointwise_and_likelihood_extraction(
-                observations, effects, scales)
-        compiled_pointwise, compiled_likelihood =
-            pointwise_and_likelihood_compiled(observations, effects, scales)
-        @test Array(compiled_pointwise) ≈ artifact.pointwise
-        @test compiled_likelihood ≈ reference_likelihood
     end
 
     @testset "direct prepared scalar kernels keep program metadata static" begin

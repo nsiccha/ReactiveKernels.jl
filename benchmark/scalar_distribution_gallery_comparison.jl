@@ -2,6 +2,8 @@
 
 module ScalarDistributionGalleryComparison
 
+include("distribution_benchmark_cases.jl")
+
 using BenchmarkTools
 using Dates
 using Distributions
@@ -17,20 +19,15 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
 using Statistics
 using TOML
 
+using .DistributionBenchmarkCases:
+    SCALAR_GALLERY_FAMILIES, SCALAR_GALLERY_SIZES, scalar_family_inputs
+
 using Reactant: @compile
 
 const PROBABILITY_MEASURES_SHA = "7cf3a6e112aaae2097b8d401b256d1bce635e03e"
-const DEFAULT_SIZES = (1_000, 100_000)
+const DEFAULT_SIZES = SCALAR_GALLERY_SIZES
 const DEFAULT_ROUNDS = 5
-const FAMILIES = (
-    "cauchy_location_scale",
-    "laplace_location_scale",
-    "bernoulli_logit",
-    "lognormal_logscale",
-    "exponential_logscale",
-    "geometric_logit",
-    "uniform_bounded",
-)
+const FAMILIES = SCALAR_GALLERY_FAMILIES
 
 const RK_CAUCHY = plate(cauchy.logpdf;
     have = (:x, :location, :scale), want = :logpdf, batched = (:x,))
@@ -123,104 +120,36 @@ function _measurement(f, args...; rounds::Int)
     )
 end
 
+_family_functions(::Val{:cauchy_location_scale}) = (;
+    rk = rk_cauchy, distributions = distributions_cauchy,
+    probability_measures = probability_measures_cauchy)
+_family_functions(::Val{:laplace_location_scale}) = (;
+    rk = rk_laplace, distributions = distributions_laplace,
+    probability_measures = probability_measures_laplace)
+_family_functions(::Val{:bernoulli_logit}) = (;
+    rk = rk_bernoulli, distributions = distributions_bernoulli,
+    probability_measures = probability_measures_bernoulli)
+_family_functions(::Val{:lognormal_logscale}) = (;
+    rk = rk_lognormal, distributions = distributions_lognormal,
+    probability_measures = probability_measures_lognormal)
+_family_functions(::Val{:exponential_logscale}) = (;
+    rk = rk_exponential, distributions = distributions_exponential,
+    probability_measures = probability_measures_exponential)
+_family_functions(::Val{:geometric_logit}) = (;
+    rk = rk_geometric, distributions = distributions_geometric,
+    probability_measures = probability_measures_geometric)
+_family_functions(::Val{:uniform_bounded}) = (;
+    rk = rk_uniform, distributions = distributions_uniform,
+    probability_measures = probability_measures_uniform)
+
 function _family_case(family, n)
-    if family == "cauchy_location_scale"
-        location, scale = -0.3, 1.1
-        xs = [location + scale * (0.04i - 2.0) for i in 1:n]
-        return (;
-            native = (xs, location, scale),
-            traced = (
-                Reactant.to_rarray(xs),
-                Reactant.to_rarray(location; track_numbers = true),
-                Reactant.to_rarray(scale; track_numbers = true),
-            ),
-            rk = rk_cauchy,
-            distributions = distributions_cauchy,
-            probability_measures = probability_measures_cauchy,
-        )
-    elseif family == "laplace_location_scale"
-        location, scale = 0.2, 0.8
-        xs = [location + scale * sin(0.019i) for i in 1:n]
-        return (;
-            native = (xs, location, scale),
-            traced = (
-                Reactant.to_rarray(xs),
-                Reactant.to_rarray(location; track_numbers = true),
-                Reactant.to_rarray(scale; track_numbers = true),
-            ),
-            rk = rk_laplace,
-            distributions = distributions_laplace,
-            probability_measures = probability_measures_laplace,
-        )
-    elseif family == "bernoulli_logit"
-        logit = -0.7
-        observed = [isodd(i * 5) for i in 1:n]
-        return (;
-            native = (observed, logit),
-            traced = (
-                Reactant.to_rarray(observed),
-                Reactant.to_rarray(logit; track_numbers = true),
-            ),
-            rk = rk_bernoulli,
-            distributions = distributions_bernoulli,
-            probability_measures = probability_measures_bernoulli,
-        )
-    elseif family == "lognormal_logscale"
-        location, log_scale = 0.2, log(0.9)
-        xs = [exp(location + exp(log_scale) * 0.7sin(0.013i)) for i in 1:n]
-        return (;
-            native = (xs, location, log_scale),
-            traced = (
-                Reactant.to_rarray(xs),
-                Reactant.to_rarray(location; track_numbers = true),
-                Reactant.to_rarray(log_scale; track_numbers = true),
-            ),
-            rk = rk_lognormal,
-            distributions = distributions_lognormal,
-            probability_measures = probability_measures_lognormal,
-        )
-    elseif family == "exponential_logscale"
-        log_scale = log(1.3)
-        xs = [0.05 + abs(sin(0.017i)) + 0.002(i % 11) for i in 1:n]
-        return (;
-            native = (xs, log_scale),
-            traced = (
-                Reactant.to_rarray(xs),
-                Reactant.to_rarray(log_scale; track_numbers = true),
-            ),
-            rk = rk_exponential,
-            distributions = distributions_exponential,
-            probability_measures = probability_measures_exponential,
-        )
-    elseif family == "geometric_logit"
-        logitp = 0.4
-        observed = [mod(i * 5, 9) for i in 0:(n - 1)]
-        return (;
-            native = (observed, logitp),
-            traced = (
-                Reactant.to_rarray(observed),
-                Reactant.to_rarray(logitp; track_numbers = true),
-            ),
-            rk = rk_geometric,
-            distributions = distributions_geometric,
-            probability_measures = probability_measures_geometric,
-        )
-    elseif family == "uniform_bounded"
-        lower, upper = -1.0, 2.0
-        xs = collect(range(lower + 0.01, upper - 0.01; length = n))
-        return (;
-            native = (xs, lower, upper),
-            traced = (
-                Reactant.to_rarray(xs),
-                Reactant.to_rarray(lower; track_numbers = true),
-                Reactant.to_rarray(upper; track_numbers = true),
-            ),
-            rk = rk_uniform,
-            distributions = distributions_uniform,
-            probability_measures = probability_measures_uniform,
-        )
+    tag = Val(Symbol(family))
+    native = Tuple(scalar_family_inputs(tag, n))
+    traced = map(native) do value
+        value isa Number ? Reactant.to_rarray(value; track_numbers = true) :
+            Reactant.to_rarray(value)
     end
-    error("unknown family $family")
+    (; native, traced, _family_functions(tag)...)
 end
 
 _git(repo, args...) = readchomp(Cmd(["git", "-C", repo, string.(args)...]))

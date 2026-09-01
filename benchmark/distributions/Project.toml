@@ -1,6 +1,8 @@
 [deps]
 BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
+DifferentiationInterface = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"
 Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
+Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
 ProbabilityMeasures = "d96443b0-2461-4412-bb6f-797ac5201ef9"
 Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 ReactiveKernels = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
@@ -8,7 +10,9 @@ ReactiveKernelsDistributionKernels = "4b169cd9-fc12-43fd-ba39-43e54ed8db7a"
 
 [compat]
 BenchmarkTools = "=1.8.0"
+DifferentiationInterface = "=0.7.21"
 Distributions = "=0.25.131"
+Enzyme = "=0.13.199"
 Reactant = "=0.2.278"
 ReactiveKernelsDistributionKernels = "0.1"
 julia = "1.10"

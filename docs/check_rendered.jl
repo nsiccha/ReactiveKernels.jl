@@ -297,6 +297,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "walnuts.md" => 1,
     )
     expected_sortable_tables = Dict(
+        "automatic-differentiation.md" => 4,
         "batched.md" => 2,
         "compiler.md" => 1,
         "distributions.md" => 6,
@@ -307,6 +308,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "nuts.md" => 3,
     )
     expected_aov_panels = Dict(
+        "automatic-differentiation.md" => 8,
         "batched.md" => 2,
         "distributions.md" => 12,
         "nuts.md" => 2,
@@ -317,6 +319,12 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
             "Prepare once, then request gradients or value-and-gradient",
             "returned_gradient === gradient_buffer",
             "Normal Loglik",
+            "Distribution gradient latency and allocation",
+            "distribution-gradient-v1.toml",
+            "20 have a zero-byte steady-state gradient path",
+            "Eight Schools model gradient matrix",
+            "eight-schools-ad-v1.toml",
+            "All four differentiable scalar cells",
         ),
         "compiler.md" => ("class=\"rk-pipeline\"",),
         "eight-schools-reactant.md" => (
