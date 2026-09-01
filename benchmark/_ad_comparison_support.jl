@@ -4,6 +4,7 @@ using BenchmarkTools
 using DifferentiationInterface
 import DynamicPPL
 using Pkg
+import ReactiveKernels
 using SHA
 using Statistics
 
@@ -22,7 +23,7 @@ struct RKValueGradientCall{P,G,A}
     arguments::A
 end
 
-(call::RKValueGradientCall)() = ad_value_and_gradient!(
+(call::RKValueGradientCall)() = ReactiveKernels.ad_value_and_gradient!(
     call.prepared, call.gradient, call.arguments...)
 
 struct DIValueGradientCall{F,G,P,B,X,C}
