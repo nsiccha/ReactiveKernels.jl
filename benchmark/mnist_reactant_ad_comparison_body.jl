@@ -168,6 +168,7 @@ function run_comparison()
     data_load_seconds = @elapsed begin
         X, y, dataset_metadata = _load_mnist_dataset(
             dataset_profile, n; wren_reference = _mnist_wren_reference_path())
+        GC.gc()
     end
     features = size(X, 2)
     nonreference = NUM_CLASSES - 1
