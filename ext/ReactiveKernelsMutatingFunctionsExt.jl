@@ -51,27 +51,91 @@ end
 # The generated nonallocating program loads the plate cache through its slot.
 # Preserve the concrete dimensionality recovered from the broadcast axes before
 # storing it back; routing through the generic Union/Array cache helper boxes
-# this embedded operation even after the cache has been seeded.
+# this embedded operation even after the cache has been seeded. The slot may be
+# rank-concrete (`Ref{Vector{T}}`) when the batched argument types were
+# statically known at preparation, or the unranked `Ref{Array{T}}` fallback.
 @inline function cache_apply!(
-        slot::Base.RefValue{Array{T}},
-        op::ReactiveKernels._AuthoredPlateOp, args...) where {T}
+        slot::Base.RefValue{A},
+        op::ReactiveKernels._AuthoredPlateOp, args...) where {A<:Array}
     result = _apply_authored_plate!(slot[], op, args...)
     slot[] = result
     result
 end
 
-# Seed an authored plate with a concrete empty Array cache instead of the
-# generic `Union{Nothing,T}` slot.  The first call resizes/replaces that empty
-# cache for the broadcast axes; subsequent calls load a concrete Array and the
-# cache-apply path stays allocation-free rather than boxing a Nothing/Array
-# union around the embedded plate operation.
-function authored_plate_cache_slot(recipe::ReactiveKernels.Recipe)
-    if recipe.op isa ReactiveKernels._AuthoredPlateOp
-        T = ReactiveKernels.valtype(only(ReactiveKernels.outputs(recipe.op.kernel)))
-        return Ref{Array{T}}(Vector{T}())
+# --- destination-passing step coverage --------------------------------------
+# The core decomposes fused captured sources into step operations whose
+# CALLABLE form is the exact allocating semantics; these methods add the
+# buffer-reusing halves. Each reuses the cache only when shape and eltype
+# match the allocating result exactly, so value parity is preserved
+# bit-for-bit and a mismatch simply reseeds the cache.
+
+@inline function MutatingFunctions.apply!!(
+        cache::AbstractArray, ::ReactiveKernels._MaterializeStep,
+        bc::Base.Broadcast.Broadcasted)
+    instantiated = Base.Broadcast.instantiate(bc)
+    if Base.axes(cache) == Base.axes(instantiated) &&
+       Base.Broadcast.combine_eltypes(instantiated.f, instantiated.args) ===
+       eltype(cache)
+        return Base.Broadcast.materialize!(cache, instantiated)
     end
-    ReactiveKernels._cache_slot(only(recipe.outputs))
+    Base.Broadcast.materialize(instantiated)
 end
+
+const _LA = ReactiveKernels.LinearAlgebra
+
+@inline _matmul_destination_matches(cache::AbstractVector, A, B::AbstractVector) =
+    size(cache) == (size(A, 1),)
+@inline _matmul_destination_matches(cache::AbstractMatrix, A, B::AbstractMatrix) =
+    size(cache) == (size(A, 1), size(B, 2))
+@inline _matmul_destination_matches(cache, A, B) = false
+
+# Guarded matrix product: `mul!` follows the pre-sized destination convention,
+# so reuse the cache only when it already has the exact result shape and
+# eltype; any mismatch (e.g. a batch-size change) recomputes and reseeds.
+@inline function MutatingFunctions.apply!!(
+        cache::AbstractVecOrMat, op::ReactiveKernels._MatMulStep,
+        A::AbstractVecOrMat, B::AbstractVecOrMat)
+    T = Base.promote_op(_LA.matprod, eltype(A), eltype(B))
+    if eltype(cache) === T && _matmul_destination_matches(cache, A, B)
+        return _LA.mul!(cache, A, B)
+    end
+    A * B
+end
+
+@inline function _vcat_destination_matches(cache::Array{T,N}, args) where {T,N}
+    all(a -> a isa AbstractArray{T,N}, args) || return false
+    trailing = ntuple(d -> size(cache, d + 1), N - 1)
+    rows = 0
+    for a in args
+        ntuple(d -> size(a, d + 1), N - 1) == trailing || return false
+        rows += size(a, 1)
+    end
+    size(cache, 1) == rows
+end
+
+@inline function MutatingFunctions.apply!!(
+        cache::Array{T,N}, op::ReactiveKernels._ConcatenateStep{typeof(vcat)},
+        args...) where {T,N}
+    _vcat_destination_matches(cache, args) || return op.f(args...)
+    offset = 0
+    for a in args
+        rows = size(a, 1)
+        copyto!(view(cache, offset+1:offset+rows,
+                     ntuple(_ -> Colon(), N - 1)...), a)
+        offset += rows
+    end
+    cache
+end
+
+@inline function MutatingFunctions.apply!!(
+        cache::Array{Float64,N}, op::ReactiveKernels._FillConstructorStep,
+        dims::Vararg{Integer,N}) where {N}
+    size(cache) == dims || return op(dims...)
+    fill!(cache, ReactiveKernels._fill_constructor_value(op))
+    cache
+end
+
+# --- public entry points ----------------------------------------------------
 
 function ReactiveKernels.prepare_reactive_nonallocating(graph::ReactiveKernels.Graph;
         have = (), want = (),
@@ -93,15 +157,20 @@ function ReactiveKernels.prepare_nonallocating(p::ReactiveKernels.Plan; passes =
     # that splices their generated bodies into a flat operation table.
     ast = ReactiveKernels._lower_unembedded(p)
     isempty(passes) || (ast = ReactiveKernels.transform(ast, passes...))
-    ReactiveKernels._prepare_nonallocating(
-        p, ReactiveKernels._nonallocating_ast(ast), cache_apply!;
-        cache_slot = authored_plate_cache_slot)
+    ReactiveKernels._prepare_nonallocating(p, ast, cache_apply!)
 end
 
 function ReactiveKernels.prepare_nonallocating(g::ReactiveKernels.Graph;
                                                 have = (), want = (), passes = ())
     p = ReactiveKernels.plan(g; have = have, want = want)
     ReactiveKernels.prepare_nonallocating(p; passes = passes)
+end
+
+# The natural consumer call after benchmarking an ordinary prepared kernel:
+# reuse its already-selected plan.
+function ReactiveKernels.prepare_nonallocating(k::ReactiveKernels.PreparedKernel;
+                                                passes = ())
+    ReactiveKernels.prepare_nonallocating(k.plan; passes = passes)
 end
 
 end # module ReactiveKernelsMutatingFunctionsExt
