@@ -107,4 +107,16 @@ using Test
     @test occursin("review status, not a known runtime failure", views)
     @test occursin(".rk-review-state--frozen", styles)
     @test occursin(".rk-review-state--review-pending", styles)
+
+    rendered_guard = read(joinpath(root, "docs", "check_rendered.jl"), String)
+    sortable_contract = match(
+        r"(?s)expected_sortable_tables = Dict\((.*?)\n    \)", rendered_guard,
+    ).captures[1]
+    aov_contract = match(
+        r"(?s)expected_aov_panels = Dict\((.*?)\n    \)", rendered_guard,
+    ).captures[1]
+    @test occursin("\"distributions.md\" => 1", sortable_contract)
+    @test occursin("\"distributions-reactant.md\" => 7", sortable_contract)
+    @test occursin("\"distributions.md\" => 2", aov_contract)
+    @test occursin("\"distributions-reactant.md\" => 12", aov_contract)
 end
