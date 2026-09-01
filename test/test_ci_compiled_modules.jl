@@ -62,6 +62,13 @@ end
     @test matrix_rows == expected_rows
     @test length(matrix_rows) == 13
     @test occursin("uses: julia-actions/cache", package_matrix)
+    @test occursin(
+        "if: matrix.test-shard != 'acceptance-samplers'", package_matrix)
+    @test occursin(
+        "if: matrix.test-shard == 'acceptance-samplers'", package_matrix)
+    @test occursin("fetch-depth: 0", package_matrix)
+    @test length(collect(eachmatch(
+        r"uses: actions/checkout@v4", package_matrix))) == 2
     @test !occursin(r"compiled_modules:\s*no", workflow)
     @test !occursin("cache-compiled: false", workflow)
     @test length(collect(eachmatch(r"compiled_modules:", workflow))) == 1
