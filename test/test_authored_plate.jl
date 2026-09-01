@@ -179,6 +179,29 @@ end
     return sum(pointwise)
 end
 
+@kernel authored_implicit_typed_plate(x::Vector{Float64}) = begin
+    terms = plate(x) do value
+        squared::Float64 = value * value
+        squared
+    end
+    total::Float64 = sum(terms)
+end
+
+@kernel authored_implicit_untyped_plate(x::Vector{Float64}) = begin
+    terms = plate(x) do value
+        squared = value * value
+        squared
+    end
+    total::Float64 = sum(terms)
+end
+
+@kernel authored_implicit_assignment_plate(x::Vector{Float64}) = begin
+    terms = plate(x) do value
+        squared::Float64 = value * value
+    end
+    total::Float64 = sum(terms)
+end
+
 _authored_plate_normal(x, location, scale) =
     -0.5 * log(2π) - log(scale) - 0.5 * ((x - location) / scale)^2
 _authored_plate_cauchy(x, location, scale) =
@@ -208,6 +231,26 @@ function _authored_plate_head_count(node, head)
     node isa Expr || return 0
     (node.head === head ? 1 : 0) +
         sum(_authored_plate_head_count(child, head) for child in node.args)
+end
+
+@testset "authored plate block: implicit multi-statement result" begin
+    values = [1.0, 2.0, 3.0]
+    expected = values .^ 2
+
+    for spec in (authored_implicit_typed_plate,
+                 authored_implicit_untyped_plate,
+                 authored_implicit_assignment_plate)
+        scalar_plan = plate_body(first(plan(spec).recipes))
+        @test [value.name for value in scalar_plan.have] == [:value]
+        @test [value.name for value in scalar_plan.want] == [:squared]
+        @test [only(recipe.outputs).name for recipe in scalar_plan.recipes] ==
+              [:squared]
+
+        total = prepare(spec; have = (:x,), want = :total)
+        pointwise = prepare(extract(spec; have = (:x,), want = :terms))
+        @test total(values) == sum(expected)
+        @test pointwise(values) == expected
+    end
 end
 
 @testset "authored plate block: transparent distribution log-likelihood" begin
