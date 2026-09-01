@@ -30,6 +30,10 @@ const _EIGHT_SCHOOLS_AD_RECEIPT_PATH = joinpath(
 const _MNIST_LOGISTIC_AD_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts", "mnist-logistic-ad-v2.toml",
 )
+const _MNIST_LOGISTIC_AD_WREN_RECEIPT_PATH = joinpath(
+    dirname(@__DIR__), "benchmark", "receipts",
+    "mnist-logistic-ad-wren-pca40-v1.toml",
+)
 const _NUTS_G7_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts", "nuts-g7-v1.toml",
 )
@@ -1186,15 +1190,18 @@ end
 
 const _MNIST_LOGISTIC_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts", "mnist-logistic-primal-v3.toml")
+const _MNIST_LOGISTIC_WREN_RECEIPT_PATH = joinpath(
+    dirname(@__DIR__), "benchmark", "receipts",
+    "mnist-logistic-wren-pca40-v1.toml")
 const _MNIST_LOGISTIC_BOUNDARIES = ("packed_unconstrained", "structured_parameters")
 const _MNIST_LOGISTIC_OUTCOMES = ("joint", "prior", "likelihood", "pointwise")
-const _MNIST_LOGISTIC_BACKENDS = ("rk_native", "rk_optimized", "rk_nonallocating",
-                                  "manual_julia", "turing_native", "turing_optimized")
+const _MNIST_LOGISTIC_V1_BACKENDS =
+    ("rk_native", "manual_julia", "turing_native")
 
 # The model's likelihood is a single `@addlogprob!` term, so Turing exposes no
 # public per-observation pointwise view; that cell is omitted, not synthesized.
 _mnist_logistic_supported(boundary, outcome, backend) =
-    !(backend in ("turing_native", "turing_optimized") && outcome == "pointwise")
+    !(backend == "turing_native" && outcome == "pointwise")
 
 # Headline estimator for the ms-scale matmul cells: the minimum of per-round
 # minimums (uncontended cost). A shared-host load episode spanning over half
@@ -1209,15 +1216,41 @@ function _mnist_logistic_measurement(row, backend)
     )
 end
 
+function _mnist_logistic_profile(protocol)
+    profile = String(get(protocol, "dataset_profile", "full-raw"))
+    if profile == "full-raw"
+        Int(get(protocol, "num_features", 0)) == 784 ||
+            error("full-raw MNIST receipt must use 784 features")
+        return (; profile, label = "Full raw MNIST", id_suffix = "")
+    end
+    profile == "wren-pca40" || error("unknown MNIST dataset profile: $profile")
+    Int(get(protocol, "num_observations", 0)) == 1000 ||
+        error("Wren-compatible MNIST receipt must use 1000 observations")
+    Int(get(protocol, "num_features", 0)) == 40 ||
+        error("Wren-compatible MNIST receipt must use 40 PCA features")
+    Int(get(protocol, "pca_fit_observations", 0)) == 60000 ||
+        error("Wren-compatible PCA must be fitted on all 60000 training images")
+    get(protocol, "pca_centered", false) == true ||
+        error("Wren-compatible PCA must center the training matrix")
+    get(protocol, "pca_whitened", true) == false ||
+        error("Wren-compatible PCA must remain unwhitened")
+    get(protocol, "wren_reference_checked", false) == true ||
+        error("Wren-compatible receipt must verify the copied reference CSV")
+    (; profile, label = "Wren PCA-40", id_suffix = "-wren-pca40")
+end
+
 """Render the checked-in MNIST multinomial-logistic boundary/outcome matrix."""
 function render_mnist_logistic_benchmarks()
-    return _render_longform_model_receipt(
+    _render_longform_model_receipt(
         _MNIST_LOGISTIC_RECEIPT_PATH, "mnist-logistic-primal-v3";
         id = "mnist-logistic-matrix",
         title = "MNIST primal boundary × outcome × modifier matrix",
         note = "Both RK models and both Turing models are shown; N/A and unsupported cells are never dropped.")
-    receipt = TOML.parsefile(_MNIST_LOGISTIC_RECEIPT_PATH)
-    get(receipt, "schema", "") == "mnist-logistic-v2" ||
+end
+
+function _render_mnist_logistic_v1_benchmarks(receipt_path::AbstractString)
+    receipt = TOML.parsefile(receipt_path)
+    get(receipt, "schema", "") == "mnist-logistic-v1" ||
         error("unexpected MNIST logistic benchmark receipt schema")
     pins = receipt["pins"]
     get(pins, "reactivekernels_dirty", true) == false ||
@@ -1232,8 +1265,7 @@ function render_mnist_logistic_benchmarks()
         error("MNIST logistic outcome inventory changed")
     Int(get(protocol, "rounds", 0)) >= 10 ||
         error("MNIST logistic receipt has fewer than ten timing rounds")
-    Int(get(protocol, "num_features", 0)) == 784 ||
-        error("MNIST logistic receipt must use full-resolution features")
+    profile = _mnist_logistic_profile(protocol)
     get(protocol, "setup_in_timed_region", true) == false ||
         error("MNIST logistic setup entered the timed region")
     get(protocol, "preparation_in_timed_region", true) == false ||
@@ -1258,7 +1290,7 @@ function render_mnist_logistic_benchmarks()
     for boundary in _MNIST_LOGISTIC_BOUNDARIES, outcome in _MNIST_LOGISTIC_OUTCOMES
         row = get(indexed, (boundary, outcome), nothing)
         isnothing(row) && error("missing MNIST logistic row: $boundary / $outcome")
-        for backend in _MNIST_LOGISTIC_BACKENDS
+        for backend in _MNIST_LOGISTIC_V1_BACKENDS
             haskey(row, backend) == _mnist_logistic_supported(boundary, outcome, backend) ||
                 error("unexpected support for $boundary / $outcome / $backend")
             haskey(row, backend) || continue
@@ -1269,11 +1301,8 @@ function render_mnist_logistic_benchmarks()
             boundary = boundary_labels[boundary],
             outcome = outcome_labels[outcome],
             rk_native = _mnist_logistic_measurement(row, "rk_native"),
-            rk_optimized = _mnist_logistic_measurement(row, "rk_optimized"),
-            rk_nonallocating = _mnist_logistic_measurement(row, "rk_nonallocating"),
             manual_julia = _mnist_logistic_measurement(row, "manual_julia"),
-            turing_native = _mnist_logistic_measurement(row, "turing_native"),
-            turing_optimized = _mnist_logistic_measurement(row, "turing_optimized")))
+            turing_native = _mnist_logistic_measurement(row, "turing_native")))
     end
 
     turing_rows = filter(row -> row.turing_native !== missing, rows)
@@ -1284,55 +1313,45 @@ function render_mnist_logistic_benchmarks()
     manual_ratios =
         [row.manual_julia.median_ns / row.rk_native.median_ns for row in rows]
     pointwise_only = length(rows) - length(turing_rows)
-    nonalloc_bytes = maximum(
-        row.rk_nonallocating.median_bytes for row in rows)
-    summary = "RK is faster than Turing in $rk_faster_than_turing/" *
-        "$(length(turing_rows)) matched idiomatic cells; Turing/RK runtime ranges from " *
+    summary = "$(profile.label). RK is faster than Turing in $rk_faster_than_turing/" *
+        "$(length(turing_rows)) matched native cells; Turing/RK runtime ranges from " *
         "$(round(minimum(turing_ratios); digits = 2))× to " *
         "$(round(maximum(turing_ratios); digits = 2))×. Against the handwritten Julia " *
         "control, manual/RK ranges from $(round(minimum(manual_ratios); digits = 2))× " *
         "to $(round(maximum(manual_ratios); digits = 2))× (1× is parity). RK also " *
         "exposes per-observation pointwise log likelihoods in $pointwise_only cells " *
-        "where Turing's single `@addlogprob!` term has no public view. The " *
-        "optimized columns drop the padded-logits materialization on both sides " *
-        "(RK via the reference-coded `categorical_logit_ref` object, Turing via an " *
-        "implicit-reference log-sum-exp likelihood); the non-allocating column runs " *
-        "the SAME idiomatic RK graph through the optional MutatingFunctions pass at " *
-        "a flat ≤$(nonalloc_bytes)-byte steady-state footprint."
+        "where Turing's single `@addlogprob!` term has no public view."
     columns = (
         _column(:boundary, "Starting boundary"),
         _column(:outcome, "Requested outcome"),
         _column(:rk_native, "RK native";
             format = _eight_schools_cell, sort = _eight_schools_sort),
-        _column(:rk_optimized, "RK optimized";
-            format = _eight_schools_cell, sort = _eight_schools_sort),
-        _column(:rk_nonallocating, "RK non-allocating";
-            format = _eight_schools_cell, sort = _eight_schools_sort),
         _column(:manual_julia, "Manual Julia";
             format = _eight_schools_cell, sort = _eight_schools_sort),
         _column(:turing_native, "Turing native";
-            format = _eight_schools_cell, sort = _eight_schools_sort),
-        _column(:turing_optimized, "Turing optimized";
             format = _eight_schools_cell, sort = _eight_schools_sort))
     provenance = "Receipt pin: ReactiveKernels `$(pins["reactivekernels_sha"])`; " *
         "Julia $(pins["julia_version"]); Turing $(pins["turing_version"]); " *
         "DynamicPPL $(pins["dynamicppl_version"]); MLDatasets $(pins["mldatasets_version"]); " *
-        "MutatingFunctions $(pins["mutatingfunctions_version"]) @ `$(pins["mutatingfunctions_rev"])`; " *
         "$(receipt["environment"]["cpu"]). $(protocol["num_observations"]) MNIST images × " *
         "$(protocol["num_features"]) features × $(protocol["num_classes"]) classes. " *
-        "Raw rounds are retained in benchmark/receipts/mnist-logistic-v2.toml."
+        "Raw rounds are retained in benchmark/receipts/$(basename(receipt_path))."
 
     Markdown.MD(Any[
         Markdown.Paragraph(Any[summary]),
         _result_table(rows, columns;
-            id = "mnist-logistic-matrix",
-            title = "MNIST logistic boundary × outcome matrix",
+            id = "mnist-logistic-matrix$(profile.id_suffix)",
+            title = "$(profile.label): MNIST logistic boundary × outcome matrix",
             note = "Each measured cell is minimum (uncontended) runtime; bytes; " *
                    "allocations. " *
                    "A blank cell means that backend has no matching public boundary."),
         Markdown.Paragraph(Any[Markdown.Italic(Any[provenance])]),
     ])
 end
+
+
+render_mnist_logistic_wren_benchmarks() =
+    _render_mnist_logistic_v1_benchmarks(_MNIST_LOGISTIC_WREN_RECEIPT_PATH)
 
 const _MNIST_LOGISTIC_AD_IMPLEMENTATIONS = (
     ("rk_native", "ReactiveKernels"),
@@ -1392,12 +1411,16 @@ end
 
 """Render the exact full-data MNIST value-and-gradient benchmark matrix."""
 function render_mnist_logistic_ad_benchmarks()
-    return _render_longform_model_receipt(
+    _render_longform_model_receipt(
         _MNIST_LOGISTIC_AD_RECEIPT_PATH, "mnist-logistic-ad-v2";
         id = "mnist-logistic-ad-matrix",
         title = "MNIST value-and-gradient matrix",
         note = "Pointwise and multi-active structured cells retain their public-API unsupported reasons.")
-    receipt = TOML.parsefile(_MNIST_LOGISTIC_AD_RECEIPT_PATH)
+end
+
+"""Render a legacy v1 MNIST value-and-gradient benchmark matrix."""
+function _render_mnist_logistic_ad_v1_benchmarks(receipt_path::AbstractString)
+    receipt = TOML.parsefile(receipt_path)
     get(receipt, "schema", "") == "mnist-logistic-ad-v1" ||
         error("unexpected MNIST logistic AD receipt schema")
     pins = receipt["pins"]
@@ -1413,13 +1436,15 @@ function render_mnist_logistic_ad_benchmarks()
         error("MNIST logistic AD model authority lacks a published SHA")
 
     protocol = receipt["protocol"]
+    profile = _mnist_logistic_profile(protocol)
     Tuple(String.(protocol["input_boundaries"])) == _MNIST_LOGISTIC_BOUNDARIES ||
         error("MNIST logistic AD input-boundary inventory changed")
     Tuple(String.(protocol["outcomes"])) == _MNIST_LOGISTIC_OUTCOMES ||
         error("MNIST logistic AD outcome inventory changed")
-    Int(get(protocol, "num_observations", 0)) == 60000 ||
-        error("MNIST logistic AD receipt does not use the full train split")
-    Int(get(protocol, "active_parameter_count", 0)) == 7065 ||
+    expected_active_parameter_count =
+        9 * Int(get(protocol, "num_features", 0)) + 9
+    Int(get(protocol, "active_parameter_count", 0)) ==
+        expected_active_parameter_count ||
         error("MNIST logistic AD active-vector length drifted")
     get(protocol, "pointwise_jacobian_or_vjp_invented", true) == false ||
         error("MNIST logistic AD receipt invented a pointwise Jacobian/VJP")
@@ -1517,7 +1542,7 @@ function render_mnist_logistic_ad_benchmarks()
         Float64(row[key]["gradient_max_abs_error"])
         for row in values(supported_rows)
         for (key, _) in _MNIST_LOGISTIC_AD_IMPLEMENTATIONS)
-    summary = "On the full MNIST train split, the packed joint takes " *
+    summary = "On $(profile.label), the packed joint takes " *
         outcome_summary("joint") * "; likelihood takes " *
         outcome_summary("likelihood") * "; and the pruned prior takes " *
         outcome_summary("prior") * ". RK and the manual control allocate zero " *
@@ -1564,25 +1589,30 @@ function render_mnist_logistic_ad_benchmarks()
     Markdown.MD(Any[
         Markdown.Paragraph(Any[summary]),
         _mnist_logistic_ad_plot(plot_rows, :min_ns;
-            id = "mnist-logistic-ad-runtime",
-            title = "MNIST value-and-gradient runtime"),
+            id = "mnist-logistic-ad-runtime$(profile.id_suffix)",
+            title = "$(profile.label): MNIST value-and-gradient runtime"),
         _mnist_logistic_ad_plot(plot_rows, :median_bytes;
-            id = "mnist-logistic-ad-allocation",
-            title = "MNIST value-and-gradient allocation"),
+            id = "mnist-logistic-ad-allocation$(profile.id_suffix)",
+            title = "$(profile.label): MNIST value-and-gradient allocation"),
         _result_table(matrix_rows, matrix_columns;
-            id = "mnist-logistic-ad-matrix",
-            title = "MNIST AD boundary × outcome matrix",
+            id = "mnist-logistic-ad-matrix$(profile.id_suffix)",
+            title = "$(profile.label): MNIST AD boundary × outcome matrix",
             note = "Measured cells show minimum uncontended value-and-gradient " *
                    "runtime; median bytes; median allocations. Unsupported cells " *
                    "retain their exact public-boundary reason."),
         _result_table(setup_rows, setup_columns;
-            id = "mnist-logistic-ad-setup",
-            title = "Preparation, compilation, and first execution",
+            id = "mnist-logistic-ad-setup$(profile.id_suffix)",
+            title = "$(profile.label): preparation and first execution",
             note = "These one-time costs are retained separately and excluded " *
                    "from the steady-state plots and matrix."),
         Markdown.Paragraph(Any[Markdown.Italic(Any[provenance])]),
     ])
 end
+
+
+render_mnist_logistic_ad_wren_benchmarks() =
+    _render_mnist_logistic_ad_v1_benchmarks(
+        _MNIST_LOGISTIC_AD_WREN_RECEIPT_PATH)
 # ---- benchmark baseline sources ------------------------------------------------
 # The comparison pages must show the exact Turing / handwritten baselines the
 # benchmark harnesses execute. The displayed code is extracted verbatim at

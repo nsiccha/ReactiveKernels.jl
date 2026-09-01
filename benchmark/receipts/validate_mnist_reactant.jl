@@ -32,8 +32,7 @@ _mnist_reactant_text_sha256(path) = bytes2hex(SHA.sha256(
 
 function validate_mnist_reactant_receipt(
     path::AbstractString;
-    primal_path::AbstractString = joinpath(
-        dirname(path), "mnist-logistic-v1.toml"),
+    primal_path::Union{Nothing,AbstractString} = nothing,
 )
     receipt = TOML.parsefile(path)
     errors = String[]
@@ -44,6 +43,12 @@ function validate_mnist_reactant_receipt(
     for section in ("pins", "environment", "setup", "protocol", "measurements")
         require(haskey(receipt, section), "missing $section")
     end
+    protocol = get(receipt, "protocol", Dict{String,Any}())
+    dataset_profile = get(protocol, "dataset_profile", "full-raw")
+    expected_primal_name = dataset_profile == "wren-pca40" ?
+        "mnist-logistic-wren-pca40-v1.toml" : "mnist-logistic-v1.toml"
+    isnothing(primal_path) &&
+        (primal_path = joinpath(dirname(path), expected_primal_name))
     require(isfile(primal_path), "missing matched primal receipt: $primal_path")
     isempty(errors) || return errors
 
@@ -106,7 +111,7 @@ function validate_mnist_reactant_receipt(
     require(get(protocol, "source_reused", false) == true,
             "benchmark must reuse the authored MNIST source")
     require(get(protocol, "matrix_source", "") ==
-            "benchmark/receipts/mnist-logistic-v1.toml",
+            "benchmark/receipts/$expected_primal_name",
             "benchmark must name the matched primal receipt")
     require(get(protocol, "partial_evaluation_enabled", true) == false,
             "Reactant receipt must keep data as runtime inputs")
@@ -454,10 +459,8 @@ function validate_mnist_reactant_receipt(
 )
     schema = get(TOML.parsefile(path), "schema", "")
     if schema == "mnist-reactant-v1"
-        companion = isnothing(primal_path) ?
-            joinpath(dirname(path), "mnist-logistic-v1.toml") : String(primal_path)
         return MNISTReactantV1Validation.validate_mnist_reactant_receipt(
-            path; primal_path = companion)
+            path; primal_path)
     elseif schema == "mnist-reactant-v2"
         companion = isnothing(primal_path) ?
             joinpath(dirname(path), "mnist-logistic-primal-v3.toml") : String(primal_path)
@@ -470,8 +473,7 @@ end
 function main(path)
     errors = validate_mnist_reactant_receipt(path)
     if isempty(errors)
-        println("VALIDATE OK — mnist-reactant-v2: " *
-                "two-model unbound/bound Reactant matrix accepted")
+        println("VALIDATE OK — MNIST Reactant receipt accepted")
         return 0
     end
     foreach(println, errors)

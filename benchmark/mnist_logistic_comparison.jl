@@ -11,6 +11,10 @@ import Pkg
 
 const _MNIST_LOGISTIC_COMPARISON_INNER = "RK_MNIST_LOGISTIC_COMPARISON_INNER"
 
+_mnist_logistic_body() = any(==("--dataset=wren-pca40"), ARGS) ?
+    "mnist_logistic_wren_pca40_comparison_body.jl" :
+    "mnist_logistic_comparison_body.jl"
+
 include(joinpath(@__DIR__, "_repro_guard.jl"))
 
 function _run_pinned_comparison()
@@ -39,8 +43,9 @@ function _run_pinned_comparison()
             Pkg.PackageSpec(path = joinpath(
                 root, "packages", "ReactiveKernelsPPLExamples")),
         ])
+        body = joinpath(@__DIR__, _mnist_logistic_body())
         command = addenv(
-            `$(Base.julia_cmd()) --startup-file=no --project=$environment $(joinpath(@__DIR__, "mnist_logistic_comparison_body.jl")) $(ARGS...)`,
+            `$(Base.julia_cmd()) --startup-file=no --project=$environment $body $ARGS`,
             _MNIST_LOGISTIC_COMPARISON_INNER => "1",
             "REACTIVEKERNELS_CANDIDATE_SHA" => sha,
             "JULIA_PKG_PRECOMPILE_AUTO" => "0",
@@ -51,5 +56,5 @@ function _run_pinned_comparison()
 end
 
 get(ENV, _MNIST_LOGISTIC_COMPARISON_INNER, "") == "1" ?
-    include(joinpath(@__DIR__, "mnist_logistic_comparison_body.jl")) :
+    include(joinpath(@__DIR__, _mnist_logistic_body())) :
     _run_pinned_comparison()

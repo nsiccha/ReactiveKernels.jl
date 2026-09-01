@@ -4,6 +4,8 @@ import SHA
 import Statistics
 import TOML
 
+include(joinpath(@__DIR__, "validate_mnist_logistic_ad_v1.jl"))
+
 isdefined(@__MODULE__, :MNISTLogisticMatrixSpec) ||
     include(joinpath(dirname(@__DIR__), "mnist_logistic_matrix_spec.jl"))
 using .MNISTLogisticMatrixSpec
@@ -18,7 +20,7 @@ _mnist_ad_median(values) = Statistics.median(Float64.(values))
 _mnist_ad_text_sha256(path) = bytes2hex(SHA.sha256(
     replace(read(path, String), "\r\n" => "\n", "\r" => "\n")))
 
-function validate_mnist_logistic_ad_receipt(path::AbstractString;
+function _validate_mnist_logistic_ad_v2_receipt(path::AbstractString;
         root::AbstractString = normpath(joinpath(dirname(path), "..", "..")))
     receipt = TOML.parsefile(path)
     errors = String[]
@@ -246,11 +248,21 @@ function validate_mnist_logistic_ad_receipt(path::AbstractString;
     errors
 end
 
+function validate_mnist_logistic_ad_receipt(path::AbstractString;
+        root::AbstractString = normpath(joinpath(dirname(path), "..", "..")))
+    schema = get(TOML.parsefile(path), "schema", "")
+    schema == "mnist-logistic-ad-v1" &&
+        return MNISTLogisticADV1Validation.validate_mnist_logistic_ad_receipt(
+            path; root)
+    schema == "mnist-logistic-ad-v2" &&
+        return _validate_mnist_logistic_ad_v2_receipt(path; root)
+    ["schema must be mnist-logistic-ad-v1 or mnist-logistic-ad-v2"]
+end
+
 function main(path)
     errors = validate_mnist_logistic_ad_receipt(path)
     if isempty(errors)
-        println("VALIDATE OK — mnist-logistic-ad-v2: " *
-                "two-model native/bound AD matrix accepted")
+        println("VALIDATE OK — MNIST logistic AD receipt accepted")
         return 0
     end
     foreach(println, errors)

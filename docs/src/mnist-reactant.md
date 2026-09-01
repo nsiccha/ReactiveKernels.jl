@@ -80,6 +80,12 @@ full `60000×784` two-model matrix above. Its retained v1 receipt uses the same
 authored model and runtime-data boundary, while the default generator route
 continues to produce the complete v2 matrix.
 
+The PCA-40 primal Reactant receipt cross-pins the standalone
+`mnist-logistic-wren-pca40-v1` RK/manual/Turing matrix, and the compiled-AD
+receipt cross-pins `mnist-logistic-ad-wren-pca40-v1`. Thus the native columns
+on this page and the standalone comparison pages share the same dataset and
+receipt authority rather than borrowing the full-data baseline.
+
 ### PCA-40 primal performance
 
 ```@eval
