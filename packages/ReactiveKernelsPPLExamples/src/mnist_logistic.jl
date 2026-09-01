@@ -68,8 +68,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     # column — exactly as Eight Schools reuses `normal` per observation.
     nonreference_logits = W * transpose(X) .+ b
     logits = vcat(zeros(1, size(nonreference_logits, 2)), nonreference_logits)
-    logit_columns = eachcol(logits)
-    pointwise = plate(logit_columns, y) do observation_logits, observed_class
+    pointwise = plate(eachcol(logits), y) do observation_logits, observed_class
         categorical_logit(observation_logits).logpdf(observed_class)
     end
     likelihood::Float64 = sum(pointwise)
