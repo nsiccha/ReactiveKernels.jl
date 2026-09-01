@@ -297,7 +297,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "walnuts.md" => 1,
     )
     expected_sortable_tables = Dict(
-        "automatic-differentiation.md" => 4,
+        "automatic-differentiation.md" => 6,
         "batched.md" => 2,
         "compiler.md" => 1,
         "distributions.md" => 6,
@@ -309,7 +309,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "nuts.md" => 3,
     )
     expected_aov_panels = Dict(
-        "automatic-differentiation.md" => 8,
+        "automatic-differentiation.md" => 10,
         "batched.md" => 2,
         "distributions.md" => 12,
         "nuts.md" => 2,
@@ -326,6 +326,9 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
             "Eight Schools model gradient matrix",
             "eight-schools-ad-v1.toml",
             "All four differentiable scalar cells",
+            "MNIST full-data model gradients",
+            "mnist-logistic-ad-v1.toml",
+            "7,065 active coefficients",
         ),
         "compiler.md" => ("class=\"rk-pipeline\"",),
         "eight-schools-reactant.md" => (
