@@ -19,17 +19,16 @@ using Test
     interactions = read(interactions_path, String)
 
     @test occursin("render_nuts_complete_source()", page)
-    @test occursin("render_nuts_source_interaction()", page)
+    # The docs build displays and admits the fixture but never runs the
+    # sampler; the former build-executed nuts!! interaction is retired.
+    @test !occursin("render_nuts_source_interaction()", page)
+    @test occursin("Sampler execution: not part of the docs build", page)
+    @test !occursin("render_nuts_source_interaction", helpers)
+    @test !occursin("NUTS_INTERACTION", interactions)
     @test occursin("function _nuts_fixture_source()", helpers)
     @test occursin("Markdown.Code(\"julia\", _nuts_fixture_source())", helpers)
     @test occursin("module ReactiveKernelsDocsNUTSFixture", make)
     @test occursin("nuts_kernel_authoring_fixture.jl", make)
-    @test occursin("NUTS_INTERACTION", interactions)
-    @test occursin("_build_nuts_sampler(", interactions)
-    @test occursin(
-        "result = fixture.nuts!!(sampler; rng = Random.Xoshiro(1))",
-        interactions,
-    )
     @test !occursin("it is not read or executed by the docs build", page)
     @test !occursin("Show the complete byte-synchronized authoring fixture", page)
 

@@ -293,8 +293,6 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
     )
     expected_source_interactions = Dict(
         "reactivehmc-corpus.md" => 5,
-        "nuts.md" => 1,
-        "walnuts.md" => 1,
     )
     expected_sortable_tables = Dict(
         "automatic-differentiation.md" => 6,
@@ -346,8 +344,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "nuts.md" => (
             "class=\"rk-status-grid\"",
             "Full compiled NUTS kernel",
-            "Authored nuts!! native entry",
-            "result = fixture.nuts!!(sampler; rng = Random.Xoshiro(1))",
+            "Sampler execution: not part of the docs build",
             "Receipt medians for the matched-control corpus",
             "Compilation and first-call costs",
         ),
@@ -387,15 +384,9 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
             "step!(directions, exponentials) = begin",
             "accepted = macro_step!(__self__, ep)",
             "@kernel walnuts!!(state; momentum, directions, exponentials)",
-            "WALNUTS depth-10 compiler frontier",
-            "captured_method_count",
-            "configured_max_depth = 10",
-            "proposal_capacity = 12",
-            "tree_capacity = 11",
-            "structural_container_roundtrip = true",
-            "compiler_frontier_executed = true",
-            "recursive functional state-machine SCC lowering is not implemented",
-            "compiler_execution_claimed = false",
+            "Compiler status: not executed during the docs build",
+            "does not claim full",
+            "recursive-SCC or WALNUTS compiler support",
             "Complete authored WALNUTS-D fixture",
         ),
         "visualization.md" =>

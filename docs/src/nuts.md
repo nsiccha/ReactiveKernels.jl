@@ -17,8 +17,9 @@ lowers the NUTS source to a sealed, registry-free **native compiled recursion**
 state in place and returns the **same object** (`result === state`, same concrete
 type) at **exact zero allocations**. The docs build loads the reviewed
 `benchmark/nuts_kernel_authoring_fixture.jl` in an isolated module, reads the
-displayed source from that same file, admits its captured kernels, and executes
-the exact source-locked `nuts!!` interaction shown below. The measured
+displayed source from that same file, and admits its captured kernels; it does
+not execute the sampler — executable evidence lives in the test suite, not in
+this page's build. The measured
 leapfrog-steps/s comparison against DynamicHMC, AdvancedHMC, and nsiccha/NUTS.jl
 is recorded in the static receipt [`benchmark/receipts/nuts-g7-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/nuts-g7-v1.toml)
 — parsed here, not re-run in CI. It is a work-normalized inner-loop receipt,
@@ -246,17 +247,14 @@ fixture entry **satisfies** (see the status table).
 - **No `Ref`.** State is implicit-field; direction is concrete branch calls threading a
   physical endpoint, so there is no aliasing indirection to reason about.
 
-## Build-executed authored sampler entry
+## Sampler execution: not part of the docs build
 
-The following interaction is evaluated verbatim during the docs build. It
-constructs the sealed sampler from the build-loaded fixture, calls that
-fixture's authored `nuts!!` entry with an explicit `Xoshiro(1)`, and displays
-the resulting diagnostics. Publication fails if the returned object identity or
-committed diagnostics drift.
-
-```@eval
-Main.ReactiveKernelsDocs.render_nuts_source_interaction()
-```
+The docs build does not construct or run the sealed sampler. The `nuts!!`
+identity, zero-allocation, and diagnostics claims above are established by the
+test suite against the same build-loaded fixture; running the sampler machinery
+during every docs build would couple publication to an execution surface that
+the compiler work is actively moving. This page displays the exact authored
+source and the frozen receipts only.
 
 ## The authoring source
 
@@ -264,9 +262,8 @@ The block below is the **exact reviewed authoring source** — the surface that 
 lowers to the sealed, registry-free native NUTS sampler now on `main`. The docs build
 reads it directly from the durable fixture
 [`benchmark/nuts_kernel_authoring_fixture.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/nuts_kernel_authoring_fixture.jl);
-loads all eight definitions in an isolated module, requires the captured MethodIR
-for every method-bearing definition, and refuses to publish if the compiled
-sampler interaction above fails. This page renders live at
+loads all eight definitions in an isolated module, and requires the captured
+MethodIR for every method-bearing definition. This page renders live at
 <https://nsiccha.github.io/ReactiveKernels.jl/dev/nuts>.
 
 The build-loaded source below is the macro-free executable fixture as it exists today.

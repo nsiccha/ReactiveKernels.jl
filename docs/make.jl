@@ -28,15 +28,11 @@ import .NutpieDiagonalAdaptationExample
 # Parse the external WALNUTS-D mathematical authoring fixture during the docs
 # build.  The docs renderer below reads the exact source file for display, while
 # this include makes malformed or no-longer-admitted @kernel source fail the
-# GitHub Pages build instead of publishing a stale code listing.
+# GitHub Pages build instead of publishing a stale code listing.  The docs build
+# deliberately stops at source admission: it does not construct, compile, or
+# execute the WALNUTS compiler frontier (the recursive-SCC boundary is owned by
+# the focused compiler tests, not by documentation builds).
 include(joinpath(@__DIR__, "..", "benchmark", "walnuts_kernel_authoring_fixture.jl"))
-
-# Execute the same depth-10 compiler-frontier construction as the focused test.
-# This support module builds prototype-derived proposal/tree containers and
-# reaches the named recursive-SCC rejection without claiming that `walnuts!!`
-# itself is compiled or executed.
-include(joinpath(@__DIR__, "..", "test", "fixtures",
-                 "walnuts_compiler_support.jl"))
 
 # Load the accepted ReactiveHMC compiler-corpus authorities themselves. The
 # corpus page extracts source from these exact files and inspects their captured

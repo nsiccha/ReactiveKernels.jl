@@ -917,39 +917,6 @@ function _run_source_locked_interaction(source::AbstractString, expected::Symbol
     displayed, interaction
 end
 
-function _render_source_locked_interaction(source::AbstractString, expected::Symbol,
-                                           title::AbstractString)
-    displayed, interaction = _run_source_locked_interaction(source, expected)
-    boundary = interaction.kind === :native_execution ?
-        "Native execution" :
-        interaction.kind === :compiler_frontier_execution ?
-        "Compiler construction through the named pre-SCC frontier" :
-        "Fixture / MethodIR / receipt inspection only"
-    blocks = Any[
-        RawHTML("""
-<article class="rk-source-interaction" data-rk-interaction="$(expected)"
-         data-rk-artifact-id="$(_html_escape("source-interaction:" * string(expected)))"
-         data-rk-artifact-kind="source-interaction"
-         data-rk-interaction-kind="$(interaction.kind)">
-<h3>$(title)</h3>
-<p><strong>Accepted boundary:</strong> $(boundary)</p>
-<h4>Exact build-executed interaction</h4>
-"""),
-        Markdown.Code("julia", displayed),
-        RawHTML("<h4>Observed output</h4>"),
-        Markdown.Code("julia", _plain_repr(interaction.output)),
-        RawHTML("</article>"),
-    ]
-    _record_reactivehmc_docs_interaction!(expected)
-    Markdown.MD(blocks)
-end
-
-render_nuts_source_interaction() = _render_source_locked_interaction(
-    Main.ReactiveHMCDocsInteractions.NUTS_INTERACTION,
-    :nuts_sampler_entry,
-    "Authored nuts!! native entry",
-)
-
 # --- ReactiveHMC compiler-corpus transparency ------------------------------
 
 const EXPECTED_REACTIVEHMC_DOC_INTERACTIONS = (
@@ -969,8 +936,6 @@ const EXPECTED_REACTIVEHMC_DOC_INTERACTIONS = (
     :implicit_midpoint,
     :statistics_state,
     :fixed_step_hmc,
-    :nuts_sampler_entry,
-    :walnuts_entry_inspection,
 )
 const _REACTIVEHMC_DOC_INTERACTION_COUNTS =
     Dict(name => 0 for name in EXPECTED_REACTIVEHMC_DOC_INTERACTIONS)
@@ -1324,11 +1289,5 @@ end
 
 render_walnuts_complete_source() =
     Markdown.MD(Any[Markdown.Code("julia", rstrip(_walnuts_fixture_source()))])
-
-render_walnuts_source_interaction() = _render_source_locked_interaction(
-    Main.ReactiveHMCDocsInteractions.WALNUTS_INSPECTION,
-    :walnuts_entry_inspection,
-    "WALNUTS depth-10 compiler frontier",
-)
 
 end # module ReactiveKernelsDocs
