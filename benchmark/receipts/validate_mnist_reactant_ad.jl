@@ -118,15 +118,13 @@ function validate_mnist_reactant_ad_receipt(
     require(get(protocol, "rk_reactant_ad_surface", "") ==
             "prepare_ad + compile_ad_value_and_gradient",
             "receipt must consume the first-class Reactant-compiled AD verb")
-    require(get(protocol, "partial_evaluation_enabled", false) == true,
-            "benchmark must enable preparation-time partial evaluation")
-    require(Tuple(get(protocol, "bound_ports", String[])) ==
+    require(get(protocol, "partial_evaluation_enabled", true) == false,
+            "full-data Reactant-AD receipt must keep data as runtime inputs")
+    require(Tuple(get(protocol, "runtime_data_ports", String[])) ==
             ("X", "y", "num_classes"),
-            "benchmark must bind the complete dataset boundary")
-    require(get(protocol, "native_and_reactant_use_same_bound_kernel", false) == true,
-            "native and Reactant AD timings must share one bound kernel")
-    require(get(protocol, "bound_values_in_timed_region", true) == false,
-            "bound data setup must stay outside steady-state timing")
+            "benchmark must record the complete runtime data boundary")
+    require(get(protocol, "native_and_reactant_use_same_runtime_boundary", false) == true,
+            "native and Reactant AD timings must share one runtime boundary")
     require(Int(get(protocol, "rounds", 0)) >= 10,
             "published receipt must contain at least ten raw rounds")
     require(Int(get(protocol, "samples_per_round", 0)) >= 1,

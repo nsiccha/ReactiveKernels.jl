@@ -113,19 +113,22 @@ end
 # whose two active ports have no public multi-active AD contract).
 function _ad_definition(model, boundary, outcome, unconstrained, X, y)
     boundary == "packed_unconstrained" || return nothing
-    bound_data = (; X, y, num_classes = NUM_CLASSES)
     if outcome == "joint"
-        return (want = :density, bound = bound_data,
-                args = (unconstrained,),
+        return (kernel = prepare(model;
+                    have = (:unconstrained, :X, :y, :num_classes),
+                    want = :density),
+                args = (unconstrained, X, y, NUM_CLASSES),
                 active = :unconstrained,
                 description = "gradient of the full joint w.r.t. the packed coefficient vector")
     elseif outcome == "prior"
-        return (want = :prior, bound = NamedTuple(), args = (unconstrained,),
-                active = :unconstrained,
+        return (kernel = prepare(model; have = :unconstrained, want = :prior),
+                args = (unconstrained,), active = :unconstrained,
                 description = "gradient of the standard-normal coefficient log prior")
     elseif outcome == "likelihood"
-        return (want = :likelihood, bound = bound_data,
-                args = (unconstrained,),
+        return (kernel = prepare(model;
+                    have = (:unconstrained, :X, :y, :num_classes),
+                    want = :likelihood),
+                args = (unconstrained, X, y, NUM_CLASSES),
                 active = :unconstrained,
                 description = "gradient of the summed softmax categorical log likelihood")
     end
@@ -208,12 +211,10 @@ function run_comparison()
         row["rk_native_ad_supported"] = true
 
         # Native RK AD reference (prepare_ad + ad_value_and_gradient!). The
-        # nonempty bound fixes the dataset and runs partial evaluation during
-        # preparation; only the packed parameter vector remains per call.
+        # preparation is outside steady-state timing.
         prepare_seconds = @elapsed prepared = prepare_ad(
-            model, AD_BACKEND, definition.args...;
-            active = definition.active, want = definition.want,
-            bound = definition.bound)
+            definition.kernel, AD_BACKEND, definition.args...;
+            active = definition.active)
         row["ad_preparation_seconds"] = prepare_seconds
         native_gradient = similar(definition.args[1])
         native_value, native_gradient = ad_value_and_gradient!(
@@ -332,10 +333,9 @@ function run_comparison()
                 "prepare_ad + compile_ad_value_and_gradient",
             "rk_ad_backend" => "AutoEnzyme(mode = Enzyme.Reverse)",
             "parity_reference" => "native RK reverse pass (ad_value_and_gradient!)",
-            "partial_evaluation_enabled" => true,
-            "bound_ports" => ["X", "y", "num_classes"],
-            "native_and_reactant_use_same_bound_kernel" => true,
-            "bound_values_in_timed_region" => false,
+            "partial_evaluation_enabled" => false,
+            "runtime_data_ports" => ["X", "y", "num_classes"],
+            "native_and_reactant_use_same_runtime_boundary" => true,
             "rounds" => rounds,
             "samples_per_round" => 200,
             "seconds_per_round" => 0.2,

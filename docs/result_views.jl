@@ -2376,11 +2376,11 @@ function render_mnist_reactant_benchmark()
         error("MNIST Reactant receipt is not synchronous")
     get(protocol, "gradients_included", true) &&
         error("MNIST Reactant receipt unexpectedly contains gradients")
-    get(protocol, "partial_evaluation_enabled", false) ||
-        error("MNIST Reactant receipt does not enable partial evaluation")
-    Tuple(String.(get(protocol, "bound_ports", String[]))) ==
+    get(protocol, "partial_evaluation_enabled", true) &&
+        error("MNIST Reactant receipt unexpectedly binds the full dataset")
+    Tuple(String.(get(protocol, "runtime_data_ports", String[]))) ==
         ("X", "y", "num_classes") ||
-        error("MNIST Reactant receipt does not bind the dataset boundary")
+        error("MNIST Reactant receipt lost the runtime dataset boundary")
     Tuple(String.(protocol["input_boundaries"])) == _MNIST_LOGISTIC_BOUNDARIES ||
         error("unexpected MNIST input-boundary matrix")
     Tuple(String.(protocol["outcomes"])) == _MNIST_LOGISTIC_OUTCOMES ||
@@ -2502,7 +2502,7 @@ function render_mnist_reactant_benchmark()
         Markdown.Paragraph(Any[summary]),
         _result_table(rows, timing_columns; id = "mnist-reactant-matrix",
             title = "Native RK / Reactant steady-state matrix",
-            note = "Every row is one cell of the matched 2×4 primal matrix, using the same preparation-time-bound dataset; each measured cell is the minimum of per-round BenchmarkTools minimums. Unsupported cells remain visible with their recorded diagnostic."),
+            note = "Every row is one cell of the matched 2×4 primal matrix, using the same runtime data boundary; each measured cell is the minimum of per-round BenchmarkTools minimums. Unsupported cells remain visible with their recorded diagnostic."),
         Markdown.Paragraph(Any[setup_summary]),
         _result_table(setup_rows, setup_columns;
             id = "mnist-reactant-setup",
@@ -2531,11 +2531,11 @@ function render_mnist_reactant_ad_benchmark()
     get(protocol, "rk_reactant_ad_surface", "") ==
         "prepare_ad + compile_ad_value_and_gradient" ||
         error("MNIST Reactant-AD receipt does not consume the first-class verb")
-    get(protocol, "partial_evaluation_enabled", false) ||
-        error("MNIST Reactant-AD receipt does not enable partial evaluation")
-    Tuple(String.(get(protocol, "bound_ports", String[]))) ==
+    get(protocol, "partial_evaluation_enabled", true) &&
+        error("MNIST Reactant-AD receipt unexpectedly binds the full dataset")
+    Tuple(String.(get(protocol, "runtime_data_ports", String[]))) ==
         ("X", "y", "num_classes") ||
-        error("MNIST Reactant-AD receipt does not bind the dataset boundary")
+        error("MNIST Reactant-AD receipt lost the runtime dataset boundary")
     Tuple(String.(protocol["input_boundaries"])) == _MNIST_LOGISTIC_BOUNDARIES ||
         error("unexpected MNIST AD input-boundary matrix")
     Tuple(String.(protocol["outcomes"])) == _MNIST_LOGISTIC_OUTCOMES ||
@@ -2668,7 +2668,7 @@ function render_mnist_reactant_ad_benchmark()
         Markdown.Paragraph(Any[summary]),
         _result_table(rows, timing_columns; id = "mnist-reactant-ad-matrix",
             title = "Native RK AD / Reactant-compiled AD steady-state matrix",
-            note = "Value-and-gradient per differentiable scalar cell, using the same preparation-time-bound dataset; each measured cell is the minimum of per-round BenchmarkTools minimums. Non-scalar (pointwise) and two-active-port structured cells stay unsupported with their recorded reason."),
+            note = "Value-and-gradient per differentiable scalar cell, using the same runtime data boundary; each measured cell is the minimum of per-round BenchmarkTools minimums. Non-scalar (pointwise) and two-active-port structured cells stay unsupported with their recorded reason."),
         Markdown.Paragraph(Any[setup_summary]),
         _result_table(setup_rows, setup_columns;
             id = "mnist-reactant-ad-setup",

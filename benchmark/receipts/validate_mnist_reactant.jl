@@ -108,15 +108,13 @@ function validate_mnist_reactant_receipt(
     require(get(protocol, "matrix_source", "") ==
             "benchmark/receipts/mnist-logistic-v1.toml",
             "benchmark must name the matched primal receipt")
-    require(get(protocol, "partial_evaluation_enabled", false) == true,
-            "benchmark must enable preparation-time partial evaluation")
-    require(Tuple(get(protocol, "bound_ports", String[])) ==
+    require(get(protocol, "partial_evaluation_enabled", true) == false,
+            "full-data Reactant receipt must keep data as runtime inputs")
+    require(Tuple(get(protocol, "runtime_data_ports", String[])) ==
             ("X", "y", "num_classes"),
-            "benchmark must bind the complete dataset boundary")
-    require(get(protocol, "native_and_reactant_use_same_bound_kernel", false) == true,
-            "native and Reactant timings must share one bound kernel")
-    require(get(protocol, "bound_values_in_timed_region", true) == false,
-            "bound data setup must stay outside steady-state timing")
+            "benchmark must record the complete runtime data boundary")
+    require(get(protocol, "native_and_reactant_use_same_runtime_boundary", false) == true,
+            "native and Reactant timings must share one runtime boundary")
     require(Int(get(protocol, "rounds", 0)) >= 10,
             "published receipt must contain at least ten raw rounds")
     require(Int(get(protocol, "samples_per_round", 0)) >= 1,

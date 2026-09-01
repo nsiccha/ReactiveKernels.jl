@@ -102,35 +102,26 @@ function _load_mnist(n)
 end
 
 function _definitions(model, unconstrained, W, b, X, y)
-    bound_data = (; X, y, num_classes = NUM_CLASSES)
     packed = (
         joint = prepare(model;
-            have = (:unconstrained, :X, :y, :num_classes), want = :density,
-            bound = bound_data),
+            have = (:unconstrained, :X, :y, :num_classes), want = :density),
         prior = prepare(model; have = :unconstrained, want = :prior),
         likelihood = prepare(model;
-            have = (:unconstrained, :X, :y, :num_classes), want = :likelihood,
-            bound = bound_data),
+            have = (:unconstrained, :X, :y, :num_classes), want = :likelihood),
         pointwise = prepare(model;
-            have = (:unconstrained, :X, :y, :num_classes), want = :pointwise,
-            bound = bound_data),
+            have = (:unconstrained, :X, :y, :num_classes), want = :pointwise),
     )
     structured = (
         joint = prepare(model;
-            have = (:W, :b, :X, :y, :num_classes), want = :density,
-            bound = bound_data),
+            have = (:W, :b, :X, :y, :num_classes), want = :density),
         prior = prepare(model; have = (:W, :b), want = :prior),
         likelihood = prepare(model;
-            have = (:W, :b, :X, :y, :num_classes), want = :likelihood,
-            bound = bound_data),
+            have = (:W, :b, :X, :y, :num_classes), want = :likelihood),
         pointwise = prepare(model;
-            have = (:W, :b, :X, :y, :num_classes), want = :pointwise,
-            bound = bound_data),
+            have = (:W, :b, :X, :y, :num_classes), want = :pointwise),
     )
-    # `bound` fixes the dataset during preparation, so every steady-state
-    # native and Reactant call receives only the parameter boundary.
-    packed_args = (unconstrained,)
-    structured_args = (W, b)
+    packed_args = (unconstrained, X, y, NUM_CLASSES)
+    structured_args = (W, b, X, y, NUM_CLASSES)
     (
         (boundary = "packed_unconstrained", outcome = "joint",
          description = "full joint over the flattened sampler vector",
@@ -317,10 +308,9 @@ function run_comparison()
             "matrix_source" => "benchmark/receipts/mnist-logistic-v1.toml",
             "input_boundaries" => collect(MNIST_REACTANT_BOUNDARIES),
             "outcomes" => collect(MNIST_REACTANT_OUTCOMES),
-            "partial_evaluation_enabled" => true,
-            "bound_ports" => ["X", "y", "num_classes"],
-            "native_and_reactant_use_same_bound_kernel" => true,
-            "bound_values_in_timed_region" => false,
+            "partial_evaluation_enabled" => false,
+            "runtime_data_ports" => ["X", "y", "num_classes"],
+            "native_and_reactant_use_same_runtime_boundary" => true,
             "rounds" => rounds,
             "samples_per_round" => 200,
             "seconds_per_round" => 0.2,

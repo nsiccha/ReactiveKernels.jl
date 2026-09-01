@@ -18,11 +18,14 @@ pointwise likelihood as requested outputs, on the full 60000-image MNIST
 training split. Every cell is evaluated natively and attempted through
 Reactant.
 
-The full dataset is fixed at preparation with
-`bound = (; X, y, num_classes)`. ReactiveKernels runs the data-only prefix once
-and returns kernels whose steady-state calls receive only the packed vector or
-structured `(W, b)` parameters. Native and Reactant measurements use those same
-bound kernels, so the comparison excludes avoidable per-call data setup.
+`X`, `y`, and `num_classes` remain ordinary runtime inputs for both native and
+Reactant calls. A full-data `bound = (; X, y, num_classes)` probe was rejected
+as the publication protocol: binding makes the 60000×784 feature matrix an XLA
+constant, and a clean probe spent 15 minutes compiling without completing its
+first cell. The separate
+[partial-evaluation receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/partial-evaluation-mnist-v1.toml)
+quantifies the native per-call saving; this page keeps the practical compiled
+boundary and reports its compile cost explicitly.
 
 All eight primal cells now compile. In particular, the packed unconstrained
 full joint is no longer a prior-only proxy: the exact authored likelihood plate
@@ -66,9 +69,9 @@ structured `(W, b)` boundary stay unsupported, exactly as on the AD receipt.
 All three scalar cells supported by the native AD receipt now compile through
 Reactant: packed joint, prior, and likelihood value-and-gradient. The full
 joint is the headline comparison; the prior remains visible only as the small
-compiler-overhead control. As with the primal table, AD preparation (including
-data binding and partial evaluation), host transfers, gradient compilation,
-the first synchronous call, and readback are excluded from steady-state timing
+compiler-overhead control. As with the primal table, AD preparation, host
+transfers, gradient compilation, the first synchronous call, and readback are
+excluded from steady-state timing
 and reported separately.
 
 ## Reproduce
