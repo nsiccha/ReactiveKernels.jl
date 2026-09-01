@@ -1,4 +1,4 @@
-generated_at = "2026-09-01T09:21:56.576Z"
+generated_at = "2026-09-01T11:32:43.444Z"
 schema = "mnist-reactant-ad-v1"
 
 [environment]
@@ -10,35 +10,48 @@ reactant_backend = "default CPU"
 
 [[measurements]]
 active_port = "unconstrained"
-ad_preparation_seconds = 0.598063594
+ad_preparation_seconds = 0.538728968
 boundary = "packed_unconstrained"
 description = "gradient of the full joint w.r.t. the packed coefficient vector"
+max_abs_error = 3.296918293926865e-12
+max_rel_error = 2.926210662661952e-14
 outcome = "joint"
-reactant_ad_compile_seconds = 16.352712143
-reactant_transfer_seconds = 0.475370395
+reactant_ad_compile_seconds = 28.577172353
+reactant_first_execution_seconds = 0.230083248
+reactant_transfer_seconds = 0.369327041
 rk_native_ad_supported = true
-rk_reactant_ad_error = "MethodError: no method matching reindex(::Tuple{Base.Slice{Base.OneTo{Int64}}, Int64}, ::Reactant.TracedRNumber{Int64})"
-rk_reactant_ad_supported = false
+rk_reactant_ad_supported = true
+value_abs_error = 1.1059455573558807e-9
+value_rel_error = 7.607777022886003e-15
 
     [measurements.rk_native_ad]
     allocs = [27, 27, 27, 27, 27, 27, 27, 27, 27, 27]
     bytes = [32162496, 32162496, 32162496, 32162496, 32162496, 32162496, 32162496, 32162496, 32162496, 32162496]
     median_allocs = 27
     median_bytes = 32162496
-    median_ns = 3.167178455e8
-    min_ns = 2.98041034e8
-    times_ns = [3.47652275e8, 2.98041034e8, 3.18217215e8, 2.98111431e8, 3.15218476e8, 3.1082445e8, 3.13525689e8, 3.31598797e8, 3.19566517e8, 3.28024973e8]
+    median_ns = 3.342495995e8
+    min_ns = 3.02068577e8
+    times_ns = [3.51377627e8, 3.55187021e8, 3.05918669e8, 3.31963305e8, 3.17983826e8, 3.60083577e8, 3.02068577e8, 3.22661662e8, 3.65140734e8, 3.36535894e8]
+
+    [measurements.rk_reactant_ad]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [816, 816, 816, 816, 816, 816, 816, 816, 816, 816]
+    median_allocs = 20
+    median_bytes = 816
+    median_ns = 2.2613528e7
+    min_ns = 2.1526443e7
+    times_ns = [2.4722912e7, 2.1767997e7, 2.1526443e7, 2.2412545e7, 2.1680825e7, 2.2404094e7, 2.2814511e7, 2.2952611e7, 2.4973049e7, 2.3337983e7]
 [[measurements]]
 active_port = "unconstrained"
-ad_preparation_seconds = 0.103012253
+ad_preparation_seconds = 0.091124126
 boundary = "packed_unconstrained"
 description = "gradient of the standard-normal coefficient log prior"
 max_abs_error = 0.0
 max_rel_error = 0.0
 outcome = "prior"
-reactant_ad_compile_seconds = 9.28449786
-reactant_first_execution_seconds = 0.196292775
-reactant_transfer_seconds = 0.00616574
+reactant_ad_compile_seconds = 2.562551987
+reactant_first_execution_seconds = 0.032848816
+reactant_transfer_seconds = 0.006280947
 rk_native_ad_supported = true
 rk_reactant_ad_supported = true
 value_abs_error = 1.7280399333685637e-11
@@ -49,38 +62,51 @@ value_rel_error = 2.6615325236043355e-15
     bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     median_allocs = 0
     median_bytes = 0
-    median_ns = 5382.0
-    min_ns = 5287.0
-    times_ns = [5287.0, 5647.0, 5397.0, 5347.0, 5337.0, 5408.0, 5437.0, 5367.0, 5467.0, 5297.0]
+    median_ns = 6994.5
+    min_ns = 6849.0
+    times_ns = [7019.0, 7029.0, 6949.0, 7030.0, 6990.0, 6859.0, 6999.0, 6949.0, 6849.0, 7430.0]
 
     [measurements.rk_reactant_ad]
     allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
     bytes = [816, 816, 816, 816, 816, 816, 816, 816, 816, 816]
     median_allocs = 20
     median_bytes = 816
-    median_ns = 10855.0
-    min_ns = 8041.0
-    times_ns = [29861.0, 8682.0, 24945.0, 10945.0, 10765.0, 8041.0, 8652.0, 13478.0, 20658.0, 8131.0]
+    median_ns = 9698.5
+    min_ns = 8932.0
+    times_ns = [10054.0, 8972.0, 8932.0, 9343.0, 19257.0, 9003.0, 13138.0, 9122.0, 20548.0, 10444.0]
 [[measurements]]
 active_port = "unconstrained"
-ad_preparation_seconds = 0.097423821
+ad_preparation_seconds = 0.119792444
 boundary = "packed_unconstrained"
 description = "gradient of the summed softmax categorical log likelihood"
+max_abs_error = 3.296918293926865e-12
+max_rel_error = 2.917487759445943e-14
 outcome = "likelihood"
-reactant_ad_compile_seconds = 2.364965164
-reactant_transfer_seconds = 0.180861245
+reactant_ad_compile_seconds = 2.954910602
+reactant_first_execution_seconds = 0.052603413
+reactant_transfer_seconds = 0.161490967
 rk_native_ad_supported = true
-rk_reactant_ad_error = "MethodError: no method matching reindex(::Tuple{Base.Slice{Base.OneTo{Int64}}, Int64}, ::Reactant.TracedRNumber{Int64})"
-rk_reactant_ad_supported = false
+rk_reactant_ad_supported = true
+value_abs_error = 1.1059455573558807e-9
+value_rel_error = 7.96344692353622e-15
 
     [measurements.rk_native_ad]
     allocs = [27, 27, 27, 27, 27, 27, 27, 27, 27, 27]
     bytes = [32162496, 32162496, 32162496, 32162496, 32162496, 32162496, 32162496, 32162496, 32162496, 32162496]
     median_allocs = 27
     median_bytes = 32162496
-    median_ns = 3.471861595e8
-    min_ns = 3.10989229e8
-    times_ns = [3.54384167e8, 4.65596808e8, 3.32543573e8, 3.48462383e8, 3.13291022e8, 3.10989229e8, 3.45909936e8, 3.72873892e8, 3.59194452e8, 3.26522938e8]
+    median_ns = 3.09575854e8
+    min_ns = 2.96891078e8
+    times_ns = [3.06453107e8, 3.0615049e8, 3.17619558e8, 3.02929897e8, 3.12698601e8, 3.32848803e8, 2.96891078e8, 3.04191517e8, 3.49722575e8, 3.17870433e8]
+
+    [measurements.rk_reactant_ad]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [816, 816, 816, 816, 816, 816, 816, 816, 816, 816]
+    median_allocs = 20
+    median_bytes = 816
+    median_ns = 2.32505235e7
+    min_ns = 2.0024719e7
+    times_ns = [2.2789022e7, 2.0024719e7, 2.0565785e7, 2.6010646e7, 2.3085481e7, 2.3004279e7, 2.5146624e7, 2.3415566e7, 2.6697853e7, 2.6290662e7]
 [[measurements]]
 boundary = "packed_unconstrained"
 description = "pointwise is vector-valued; no matched public Jacobian/VJP contract, so it stays unsupported rather than inventing a fused case"
@@ -134,7 +160,7 @@ mldatasets_version = "0.7.21"
 reactant_jll_version = "0.0.401+0"
 reactant_version = "0.2.278"
 reactivekernels_dirty = false
-reactivekernels_sha = "568864c54d2d0fe32445b3d46994fcf540f1e877"
+reactivekernels_sha = "94a1d9716c2d670e2669ce7dcdff8dc27d20a316"
 reactivekernels_version = "0.1.0"
 reactivekernelsdistributionkernels_version = "0.1.0"
 reactivekernelspplexamples_version = "0.1.0"
@@ -151,6 +177,7 @@ gradient_operation = "value and gradient"
 input_boundaries = ["packed_unconstrained", "structured_parameters"]
 matrix_source = "benchmark/receipts/mnist-logistic-ad-v1.toml"
 model = "multinomial-logistic MNIST classifier"
+native_and_reactant_use_same_runtime_boundary = true
 num_classes = 10
 num_features = 784
 num_observations = 60000
@@ -158,6 +185,7 @@ outcomes = ["joint", "prior", "likelihood", "pointwise"]
 parity_atol = 1.0e-9
 parity_reference = "native RK reverse pass (ad_value_and_gradient!)"
 parity_rtol = 1.0e-9
+partial_evaluation_enabled = false
 pointwise_jacobian_or_vjp_invented = false
 preparation_in_timed_region = false
 reactant_compile_time_in_timed_region = false
@@ -168,6 +196,7 @@ rk_ad_backend = "AutoEnzyme(mode = Enzyme.Reverse)"
 rk_native_ad_surface = "prepare_ad + ad_value_and_gradient!"
 rk_reactant_ad_surface = "prepare_ad + compile_ad_value_and_gradient"
 rounds = 10
+runtime_data_ports = ["X", "y", "num_classes"]
 samples_per_round = 200
 seconds_per_round = 0.2
 setup_in_timed_region = false
@@ -176,7 +205,7 @@ structured_multi_active_boundary_invented = false
 unsupported_cells_recorded = true
 
 [setup]
-data_load_seconds = 1.508936457
-environment_seconds = 33.382940586
-kernel_preparation_seconds = 1.467288009
-package_precompile_seconds = 3.101654153
+data_load_seconds = 1.503938001
+environment_seconds = 32.481442403
+kernel_preparation_seconds = 1.536679603
+package_precompile_seconds = 3.096593966
