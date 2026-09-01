@@ -395,6 +395,9 @@ and run them once in the suite's canonical order after shared setup. The named
 groups are `core`, `acceptance`, `acceptance-compiler`, `acceptance-runtime`,
 `acceptance-samplers`, `acceptance-benchmarks`, `ad`, and `benchmark`;
 `acceptance` is the aggregate of the four finer acceptance groups. GitHub Actions
-runs `core` and all four acceptance groups on every supported Julia/OS cell.
+runs `core` on every supported Julia/OS cell, while each platform-independent
+acceptance group runs once on the LTS Ubuntu lane. Test-file begin/finish markers
+keep long compiler work attributable without multiplying identical acceptance
+work across the compatibility matrix.
 Unknown names fail before any selected test executes and list the accepted groups
 and files.

@@ -206,5 +206,17 @@ using .ReactiveKernelsNUTSExample
 include(joinpath(@__DIR__, "fixtures", "reactivehmc_algorithm_corpus_setup.jl"))
 
 @testset "ReactiveKernels" begin
-    foreach(include, filter(!=("test_package_boundary.jl"), _SELECTED_TEST_FILES))
+    for file in filter(!=("test_package_boundary.jl"), _SELECTED_TEST_FILES)
+        started = time_ns()
+        println(stderr, "[ReactiveKernels tests] begin ", file)
+        flush(stderr)
+        try
+            include(file)
+        finally
+            elapsed = round((time_ns() - started) / 1.0e9; digits=1)
+            println(stderr, "[ReactiveKernels tests] finish ", file,
+                    " (", elapsed, " s)")
+            flush(stderr)
+        end
+    end
 end
