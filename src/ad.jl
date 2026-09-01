@@ -536,7 +536,7 @@ end
 Evaluate the selected WANT and reverse pullback while writing the active-input
 cotangent into caller-owned `cotangent` storage. Returns `(value, cotangent)`.
 The destination must satisfy the differentiation backend's in-place pullback
-contract; in particular, array destinations are supported by Enzyme, while
+contract. Array destinations are the supported ReactiveKernels surface;
 structured destinations should use [`ad_value_and_pullback`](@ref) unless the
 backend explicitly supports mutating that structure.
 """
