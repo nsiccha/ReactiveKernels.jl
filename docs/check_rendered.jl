@@ -301,7 +301,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "compiler.md" => 1,
         "distributions.md" => 6,
         "eight-schools.md" => 1,
-        "eight-schools-reactant.md" => 2,
+        "eight-schools-reactant.md" => 4,
         "eval-throughput.md" => 1,
         "nuts.md" => 3,
     )
