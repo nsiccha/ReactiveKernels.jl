@@ -254,15 +254,15 @@ turing_version = "0.47.1"
 
     [pins.primal_comparator_source]
     commit = "9dbaa1fbfbdb1bb2ff4238a3910754f36635f81e"
-    current_delta = "terminal definition-only include guard only"
+    current_delta = "documentation-only baseline markers plus terminal definition-only include guard"
     git_blob = "c4a0321bf28e14765783ef157f58eb538bab4de9"
     path = "benchmark/mnist_logistic_comparison_body.jl"
     text_sha256 = "0b813401307180582a8105cceca6be541009d56a95d23c8d8cb2249e09813521"
 
         [pins.primal_comparator_source.current]
-        git_blob = "4e1bb70430095eac5e5e68f81695fa788faeefee"
+        git_blob = "b442c527d5dfffc5e25e2c5c56bed409bb02aa87"
         path = "benchmark/mnist_logistic_comparison_body.jl"
-        text_sha256 = "80b26966b88fd06844d352122acaaad43192e168ec4add51e4da60a32a18e69c"
+        text_sha256 = "94ea14572acbfb94e23d8379d2cdee2180ecabd7166e9213ae10e67c3f3be060"
 
 [protocol]
 active_parameter_count = 7065

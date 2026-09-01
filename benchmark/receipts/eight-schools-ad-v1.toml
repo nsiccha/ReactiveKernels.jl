@@ -302,15 +302,15 @@ turing_version = "0.47.1"
 
     [pins.primal_comparator_source]
     commit = "7d9ba71fcafdc588c25c825c2a094a15320cedc5"
-    current_delta = "terminal definition-only include guard only"
+    current_delta = "documentation-only baseline markers plus terminal definition-only include guard"
     git_blob = "5f579c40dbff5479e670e5adcb6a108ca5af29d6"
     path = "benchmark/eight_schools_primal_comparison_body.jl"
     text_sha256 = "b997188320ad6819891614f7a85ff0c51749d2000070e8464edb62815d24c8e1"
 
         [pins.primal_comparator_source.current]
-        git_blob = "d8de508cc1e3991cd71f5e7b31aa636c8cc604d4"
+        git_blob = "24ae3433b0abc0a0b551b3871fd478307a47365e"
         path = "benchmark/eight_schools_primal_comparison_body.jl"
-        text_sha256 = "b94d4d9976403e4a61ab2671143b7f31e3ae85c0cb34a4fedc2b092cab92720d"
+        text_sha256 = "69565f2fa29178bc3b85f2534c0ef14e2443e12e6f1708b0a68a097e04bfed6e"
 
 [protocol]
 estimator = "median of per-round BenchmarkTools minimum times"
