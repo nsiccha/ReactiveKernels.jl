@@ -13,6 +13,9 @@ using DifferentiationInterface
 import DynamicPPL
 import Enzyme
 
+include(joinpath(@__DIR__, "_ad_comparison_support.jl"))
+using .ADComparisonSupport
+
 # Load, rather than copy, the exact Turing model and manual lower-bound density
 # definitions used to produce the published primal matrix. The opt-out affects
 # only the file's terminal run call; the ordinary primal script remains unchanged.
@@ -43,68 +46,19 @@ const EIGHT_SCHOOLS_MODEL_PUBLISHED_SHA =
 const EIGHT_SCHOOLS_COMPARATOR_PUBLISHED_SHA =
     "7d9ba71fcafdc588c25c825c2a094a15320cedc5"
 
-struct _RKValueGradientCall{P,G,A}
-    prepared::P
-    gradient::G
-    arguments::A
-end
-
-(call::_RKValueGradientCall)() = ad_value_and_gradient!(
-    call.prepared, call.gradient, call.arguments...)
-
-struct _DIValueGradientCall{F,G,P,B,X,C}
-    objective::F
-    gradient::G
-    preparation::P
-    backend::B
-    point::X
-    contexts::C
-end
-
-(call::_DIValueGradientCall)() = DifferentiationInterface.value_and_gradient!(
-    call.objective, call.gradient, call.preparation, call.backend,
-    call.point, call.contexts...)
-
-struct _TuringValueGradientCall{F,X}
-    logdensity::F
-    point::X
-end
-
-(call::_TuringValueGradientCall)() =
-    LDP.logdensity_and_gradient(call.logdensity, call.point)
-
-function _measurement(call; rounds::Int)
-    benchmark = @benchmarkable $call()
-    times_ns = Float64[]
-    bytes = Int[]
-    allocs = Int[]
-    for _ in 1:rounds
-        estimate = minimum(run(benchmark; samples = 200, seconds = 0.2))
-        push!(times_ns, estimate.time)
-        push!(bytes, estimate.memory)
-        push!(allocs, estimate.allocs)
-    end
-    Dict(
-        "times_ns" => times_ns,
-        "median_ns" => median(times_ns),
-        "bytes" => bytes,
-        "median_bytes" => Int(median(bytes)),
-        "allocs" => allocs,
-        "median_allocs" => Int(median(allocs)),
-    )
-end
-
-function _build_and_first_call(builder)
-    preparation = @timed builder()
-    call = preparation.value
-    first_execution = @timed call()
-    call, first_execution.value, Dict(
-        "preparation_seconds" => preparation.time,
-        "preparation_bytes" => preparation.bytes,
-        "first_execution_seconds" => first_execution.time,
-        "first_execution_bytes" => first_execution.bytes,
-    )
-end
+const _RKValueGradientCall = RKValueGradientCall
+const _DIValueGradientCall = DIValueGradientCall
+const _TuringValueGradientCall = TuringValueGradientCall
+const _measurement = measurement
+const _build_and_first_call = build_and_first_call
+const _record_implementation = record_implementation
+const _gradient_error = gradient_error
+const _gradient_scale = gradient_scale
+const _package_version = package_version
+const _output_path = output_path
+const _source_pin = source_pin
+const _published_source_pin = published_source_pin
+const _nothing_paths = nothing_paths
 
 function _finite_difference_gradient(objective, point)
     gradient = similar(point, Float64)
@@ -119,24 +73,6 @@ function _finite_difference_gradient(objective, point)
         minus[index] = point[index]
     end
     gradient
-end
-
-_gradient_error(actual, expected) = maximum(abs.(actual .- expected); init = 0.0)
-_gradient_scale(expected) = maximum(abs, expected; init = eps(Float64))
-
-function _record_implementation(call, result, setup, reference_value,
-                                reference_gradient; rounds, caller_owned)
-    value, gradient = result
-    merge(setup, _measurement(call; rounds), Dict(
-        "value" => Float64(value),
-        "value_abs_error" => abs(Float64(value) - reference_value),
-        "gradient_max_abs_error" => _gradient_error(gradient, reference_gradient),
-        "gradient_max_rel_error" =>
-            _gradient_error(gradient, reference_gradient) /
-            max(_gradient_scale(reference_gradient), eps(Float64)),
-        "gradient_length" => length(gradient),
-        "caller_owned_gradient" => caller_owned,
-    ))
 end
 
 function _manual_definition(boundary, outcome, q, θ, observations,
@@ -228,50 +164,12 @@ function _unsupported_reason(boundary, outcome)
     "unsupported matrix cell"
 end
 
-function _package_version(name)
-    for info in values(Pkg.dependencies())
-        info.name == name && return string(info.version)
-    end
-    error("package $name absent from the benchmark environment")
-end
-
-function _output_path()
-    for argument in ARGS
-        startswith(argument, "--output=") &&
-            return split(argument, '='; limit = 2)[2]
-    end
-    nothing
-end
-
 _rounds() = parse(Int, get(
     ENV, "RK_EIGHT_SCHOOLS_AD_ROUNDS", string(DEFAULT_EIGHT_SCHOOLS_AD_ROUNDS)))
 
-_eight_schools_ad_generator_text(text) =
-    replace(String(text), "\r\n" => "\n", "\r" => "\n")
-_eight_schools_ad_generator_read(path) =
-    _eight_schools_ad_generator_text(read(path, String))
-_eight_schools_ad_generator_sha256(path) =
-    bytes2hex(SHA.sha256(_eight_schools_ad_generator_read(path)))
-
-function _source_pin(root, relative_path)
-    absolute_path = joinpath(root, relative_path)
-    Dict(
-        "path" => relative_path,
-        "git_blob" => readchomp(`git -C $root hash-object $absolute_path`),
-        "text_sha256" => _eight_schools_ad_generator_sha256(absolute_path),
-    )
-end
-
-function _published_source_pin(root, commit, relative_path)
-    text = _eight_schools_ad_generator_text(
-        read(`git -C $root show $commit:$relative_path`))
-    Dict(
-        "commit" => commit,
-        "path" => relative_path,
-        "git_blob" => readchomp(`git -C $root rev-parse $commit:$relative_path`),
-        "text_sha256" => bytes2hex(SHA.sha256(text)),
-    ), text
-end
+const _eight_schools_ad_generator_text = normalized_text
+const _eight_schools_ad_generator_read = normalized_read
+const _eight_schools_ad_generator_sha256 = text_sha256
 
 function _verified_model_source_pin(root, relative_path)
     published, text = _published_source_pin(
@@ -294,22 +192,6 @@ function _verified_comparator_source_pin(root, relative_path)
         "current" => _source_pin(root, relative_path),
         "current_delta" => "terminal definition-only include guard only",
     ))
-end
-
-function _nothing_paths(value, path = "receipt")
-    paths = String[]
-    if value === nothing
-        push!(paths, path)
-    elseif value isa AbstractDict
-        for (key, child) in value
-            append!(paths, _nothing_paths(child, "$path.$key"))
-        end
-    elseif value isa AbstractVector
-        for (index, child) in pairs(value)
-            append!(paths, _nothing_paths(child, "$path[$index]"))
-        end
-    end
-    paths
 end
 
 function run_eight_schools_ad_comparison()

@@ -326,4 +326,4 @@ function run_comparison()
     receipt
 end
 
-run_comparison()
+get(ENV, "RK_MNIST_DEFINITIONS_ONLY", "") == "1" || run_comparison()
