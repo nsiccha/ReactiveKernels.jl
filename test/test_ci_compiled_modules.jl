@@ -53,7 +53,7 @@ end
     @test occursin("Pkg.activate(pwd())", smoke)
     @test occursin("Pkg.precompile(; strict=true)", smoke)
     @test occursin("using ReactiveKernels", smoke)
-    @test occursin("timeout-minutes: 60", reactant)
+    @test occursin("timeout-minutes: 90", reactant)
     @test occursin("uses: julia-actions/cache", reactant)
 
 end
