@@ -100,9 +100,9 @@ end
 @inline _authored_plate_zero(::Type{T}, marker) where {T} = zero(T)
 @inline _authored_plate_zero(::Type{Any}, marker) = zero(eltype(marker))
 
-# A plate is a pure graph map/reduction.  Once Julia has instantiated the
+# A plate is a pure graph map/reduction. Once Julia has instantiated the
 # broadcast axes, a recipe only needs to run again when a dimension kept by
-# one of its transitive HAVE roots changes in Cartesian iteration order.  The
+# one of its transitive HAVE roots changes in Cartesian iteration order. The
 # cached value is a scalar local, never an axis-sized intermediate.
 @inline _plate_dependency_changed(index, previous,
                                   arg::Union{Number,Ref}) = false
@@ -294,20 +294,65 @@ function _authored_plate_changed(callargs, roots, positions, atomic,
     foldl((left, right) -> Expr(:||, left, right), tests)
 end
 
+function _authored_plate_recipe_groups(inner::Plan, dependencies,
+                                       positions, atomic, callvalues)
+    groups = Tuple{Set{Int},Vector{Int}}[]
+    for (recipe_index, recipe) in enumerate(inner.recipes)
+        length(recipe.outputs) == 1 || throw(ArgumentError(
+            "an authored plate currently requires single-output scalar recipes"))
+        roots = get(dependencies,
+                    canon_id(inner.graph, only(recipe.outputs).id), Set{Int}())
+        dynamic = Set(root for root in roots
+                      if !(positions[root] in atomic) &&
+                         !(valtype(callvalues[positions[root]]) <: Number))
+        if !isempty(groups) && first(last(groups)) == dynamic
+            push!(last(groups)[2], recipe_index)
+        else
+            push!(groups, (dynamic, [recipe_index]))
+        end
+    end
+    groups
+end
+
+# CartesianIndices advances its first dimension at every coordinate. A recipe
+# with any one-dimensional array/tuple root can therefore be evaluated
+# unconditionally in the scalar loop: even when that root is singleton-expanded,
+# recomputation is semantically identical under the plate's pure-recipe
+# contract. Keeping this decision in generated code removes loop-carried
+# scheduler control from the common vector-plate kernel while retaining the
+# dependency scheduler for higher-dimensional partial-axis broadcasts.
+function _authored_plate_unconditional_group(
+        roots, positions, atomic, callvalues)
+    any(roots) do root
+        position = positions[root]
+        position in atomic && return false
+        type = valtype(callvalues[position])
+        type <: AbstractVector || type <: Tuple
+    end
+end
+
 function _authored_plate_scalar_ref(inner::Plan, locals, callargs,
-                                    input::Value, plate_values, looped::Bool)
+                                    callvalues, prepared_arguments, atomic,
+                                    input::Value, index, looped::Bool)
     graph = inner.graph
     cid = canon_id(graph, input.id)
     have_index = findfirst(value -> canon_id(graph, value.id) == cid, inner.have)
     if have_index !== nothing
         arg = callargs[have_index]
-        return looped ? Expr(:ref, plate_values, have_index) : arg
+        # Numbers and explicit `Ref` arguments are statically scalar. Keep them
+        # as ordinary loop invariants instead of routing them through a
+        # broadcast wrapper and indexed projection on every coordinate.
+        statically_scalar = have_index in atomic ||
+                            valtype(callvalues[have_index]) <: Number
+        return looped && !statically_scalar ?
+            Expr(:call, GlobalRef(Base.Broadcast, :_broadcast_getindex),
+                 prepared_arguments[have_index], index) : arg
     end
     locals[cid]
 end
 
 function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
-                                       op::_AuthoredPlateOp, callargs,
+                                       op::_AuthoredPlateOp, callargs, callvalues,
                                        pointwise_lhs, total_lhs)
     inner_kernel = op.kernel
     inner = inner_kernel.plan
@@ -317,17 +362,49 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
         "an authored plate body must lower to one operation per transparent scalar recipe"))
 
     atomic = typeof(op).parameters[2]
+    output_type = valtype(only(inner.want))
+    needs_marker = pointwise_lhs !== nothing || output_type === Any
     marker = gensym(:plate_axis)
-    batch = gensym(:plate_broadcast)
     index = gensym(:plate_index)
     previous = gensym(:plate_previous)
     first_coordinate = gensym(:plate_first)
-    plate_values = gensym(:plate_values)
     atomic_val = Expr(:call, GlobalRef(Base, :Val), QuoteNode(atomic))
-    push!(body.args, :($batch = $(GlobalRef(@__MODULE__, :_authored_plate_broadcast))(
-        $atomic_val, $(callargs...))))
-    push!(body.args, :($marker = $(GlobalRef(@__MODULE__, :_authored_plate_marker))(
-        $atomic_val, $(callargs...))))
+    if needs_marker
+        push!(body.args,
+            :($marker = $(GlobalRef(@__MODULE__, :_authored_plate_marker))(
+                $atomic_val, $(callargs...))))
+    end
+
+    # Reuse Base's ordinary broadcast preparation one argument at a time. A
+    # composite `Broadcasted(tuple, ...)` is convenient for primal execution,
+    # but carrying that tuple-producing expression through reverse AD leaves a
+    # much larger derivative loop. `broadcastable` + `preprocess` preserves
+    # scalar, Ref, singleton-expansion, and custom-axis semantics while letting
+    # the lowered scalar recipes consume only the projected values they need.
+    raw_arguments = Union{Nothing,Symbol}[]
+    prepared_arguments = Union{Nothing,Symbol}[]
+    for (position, arg) in enumerate(callargs)
+        statically_scalar = position in atomic ||
+                            valtype(callvalues[position]) <: Number
+        if statically_scalar
+            push!(raw_arguments, nothing)
+            push!(prepared_arguments, nothing)
+            continue
+        end
+        raw = gensym(:plate_argument)
+        prepared = gensym(:plate_prepared)
+        wrapped = Expr(:call, GlobalRef(Base, :broadcastable), arg)
+        push!(body.args, Expr(:(=), raw, wrapped))
+        push!(body.args, Expr(:(=), prepared,
+            Expr(:call, GlobalRef(Base.Broadcast, :preprocess), nothing, raw)))
+        push!(raw_arguments, raw)
+        push!(prepared_arguments, prepared)
+    end
+    output_axes = gensym(:plate_axes)
+    combined_axes = Expr(:call, GlobalRef(Base.Broadcast, :combine_axes),
+                         (arg for arg in raw_arguments if arg !== nothing)...)
+    push!(body.args, Expr(:(=), output_axes,
+        Expr(:call, GlobalRef(@__MODULE__, :_plate_require_axes), combined_axes)))
 
     root_positions = Dict(
         canon_id(inner.graph, input.id) => position
@@ -345,63 +422,95 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
     op_offset = length(runtime_ops)
     append!(runtime_ops, inner_kernel.ops)
     append!(runtime_recipes, inner_kernel.lowered_recipes)
+    groups = _authored_plate_recipe_groups(
+        inner, dependencies, root_positions, atomic, callvalues)
+    has_scheduled_groups = any(groups) do (roots, _)
+        !isempty(roots) && !_authored_plate_unconditional_group(
+            roots, root_positions, atomic, callvalues)
+    end
 
-    # Runtime scalar-or-axis roles are specialized by Julia.  Every invariant
-    # scalar recipe is executed once before the loop; the same recipe is
-    # executed per element only when one of its transitive roots is an axis.
-    for (recipe_index, recipe) in enumerate(inner.recipes)
-        length(recipe.outputs) == 1 || throw(ArgumentError(
-            "an authored plate currently requires single-output scalar recipes"))
-        output = only(recipe.outputs)
-        out = locals[canon_id(inner.graph, output.id)]
-        roots = get(dependencies, canon_id(inner.graph, output.id), Set{Int}())
+    # Recipes with the same dynamic root set share one scheduling guard. This
+    # preserves partial-dimension invariant caching. Common vector-plate groups
+    # are known to be safe to recompute at every coordinate and need no guard in
+    # either the primal or differentiated native kernel.
+    for (roots, recipe_indices) in groups
+        _authored_plate_unconditional_group(
+            roots, root_positions, atomic, callvalues) && continue
+        assignments = Expr(:block)
+        for recipe_index in recipe_indices
+            recipe = inner.recipes[recipe_index]
+            length(recipe.outputs) == 1 || throw(ArgumentError(
+                "an authored plate currently requires single-output scalar recipes"))
+            output = only(recipe.outputs)
+            out = locals[canon_id(inner.graph, output.id)]
+            args = Any[_authored_plate_scalar_ref(
+                inner, locals, callargs, callvalues, prepared_arguments, atomic,
+                input, index, false) for input in recipe.inputs]
+            call = Expr(:call, Expr(:ref, _OPS_ARG, op_offset + recipe_index),
+                        args...)
+            push!(assignments.args, Expr(:(=), out, call))
+        end
         condition = _authored_plate_condition(
             callargs, roots, root_positions, atomic)
-        args = Any[_authored_plate_scalar_ref(
-            inner, locals, callargs, input, plate_values, false) for input in recipe.inputs]
-        call = Expr(:call, Expr(:ref, _OPS_ARG, op_offset + recipe_index), args...)
         push!(body.args, Expr(:if,
-            Expr(:call, GlobalRef(Base, :!), condition), Expr(:(=), out, call)))
+            Expr(:call, GlobalRef(Base, :!), condition), assignments))
     end
 
-    output_type = valtype(only(inner.want))
     if pointwise_lhs !== nothing
         push!(body.args,
-            :($pointwise_lhs = similar($marker, $output_type, axes($batch))))
+            :($pointwise_lhs = similar($marker, $output_type, $output_axes)))
     end
     accumulator = total_lhs === nothing ? nothing : gensym(:plate_total)
-    accumulator === nothing || push!(body.args,
-        :($accumulator = $(GlobalRef(@__MODULE__, :_authored_plate_zero))(
-            $output_type, $marker)))
+    if accumulator !== nothing
+        initial = output_type === Any ?
+            Expr(:call, GlobalRef(@__MODULE__, :_authored_plate_zero),
+                 output_type, marker) :
+            Expr(:call, GlobalRef(Base, :zero), output_type)
+        push!(body.args, Expr(:(=), accumulator, initial))
+    end
 
     loopbody = Expr(:block)
-    for (recipe_index, recipe) in enumerate(inner.recipes)
-        output = only(recipe.outputs)
-        out = locals[canon_id(inner.graph, output.id)]
-        roots = get(dependencies, canon_id(inner.graph, output.id), Set{Int}())
-        has_axis = _authored_plate_condition(
-            callargs, roots, root_positions, atomic)
-        changed = _authored_plate_changed(
-            callargs, roots, root_positions, atomic, index, previous)
-        condition = Expr(:&&, has_axis,
-            Expr(:||, first_coordinate, changed))
-        args = Any[_authored_plate_scalar_ref(
-            inner, locals, callargs, input, plate_values, true) for input in recipe.inputs]
-        call = Expr(:call, Expr(:ref, _OPS_ARG, op_offset + recipe_index), args...)
-        push!(loopbody.args, Expr(:if, condition, Expr(:(=), out, call)))
+    for (roots, recipe_indices) in groups
+        isempty(roots) && continue
+        assignments = Expr(:block)
+        for recipe_index in recipe_indices
+            recipe = inner.recipes[recipe_index]
+            output = only(recipe.outputs)
+            out = locals[canon_id(inner.graph, output.id)]
+            args = Any[_authored_plate_scalar_ref(
+                inner, locals, callargs, callvalues, prepared_arguments, atomic,
+                input, index, true) for input in recipe.inputs]
+            call = Expr(:call, Expr(:ref, _OPS_ARG, op_offset + recipe_index),
+                        args...)
+            push!(assignments.args, Expr(:(=), out, call))
+        end
+        if _authored_plate_unconditional_group(
+                roots, root_positions, atomic, callvalues)
+            append!(loopbody.args, assignments.args)
+        else
+            has_axis = _authored_plate_condition(
+                callargs, roots, root_positions, atomic)
+            changed = _authored_plate_changed(
+                callargs, roots, root_positions, atomic, index, previous)
+            condition = Expr(:&&, has_axis,
+                Expr(:||, first_coordinate, changed))
+            push!(loopbody.args, Expr(:if, condition, assignments))
+        end
     end
     scalar_result = locals[canon_id(inner.graph, only(inner.want).id)]
     pointwise_lhs === nothing ||
         push!(loopbody.args, :($pointwise_lhs[$index] = $scalar_result))
     accumulator === nothing ||
         push!(loopbody.args, :($accumulator += $scalar_result))
-    push!(loopbody.args, :($previous = $index))
-    push!(loopbody.args, :($first_coordinate = false))
-    pushfirst!(loopbody.args, :($plate_values = $batch[$index]))
-    iteration = Expr(:call, GlobalRef(Base, :CartesianIndices),
-                     Expr(:call, GlobalRef(Base, :axes), batch))
-    push!(body.args, :($previous = nothing))
-    push!(body.args, :($first_coordinate = true))
+    if has_scheduled_groups
+        push!(loopbody.args, :($previous = $index))
+        push!(loopbody.args, :($first_coordinate = false))
+    end
+    iteration = Expr(:call, GlobalRef(Base, :CartesianIndices), output_axes)
+    if has_scheduled_groups
+        push!(body.args, :($previous = nothing))
+        push!(body.args, :($first_coordinate = true))
+    end
     push!(body.args, Expr(:for, Expr(:(=), index, iteration), loopbody))
     total_lhs === nothing || push!(body.args, :($total_lhs = $accumulator))
     body
@@ -495,7 +604,7 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                     pointwise_lhs, total_lhs)
             else
                 _lower_authored_plate_native!(
-                    body, runtime_ops, runtime_recipes, r.op, callargs,
+                    body, runtime_ops, runtime_recipes, r.op, callargs, r.inputs,
                     pointwise_lhs, total_lhs)
             end
             continue
