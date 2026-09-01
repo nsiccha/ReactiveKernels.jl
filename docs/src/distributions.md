@@ -153,24 +153,9 @@ Main.ReactiveKernelsDocs.execute_example(
 )
 ```
 
-### Scalar-family native and Reactant benchmark
-
-The matched comparison uses native Cauchy, Laplace, Bernoulli, LogNormal,
-Exponential, Geometric, and Uniform measures from both Distributions and
-ProbabilityMeasures and the generic RK `plate` generated from each public
-object above. Normal has its dedicated shared-object/control benchmark below.
-Parameters are traced runtime inputs under Reactant; compilation and
-host↔device transfers are excluded from execution timings.
-
-```@eval
-Main.ReactiveKernelsDocs.render_scalar_gallery_benchmarks()
-```
-
-Each cell is the median of five minimum-time measurements. Unsupported
-Distributions + Reactant cells retain the constructor diagnostic instead of
-silently disappearing. The checked-in
-[gallery benchmark receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/scalar-distribution-gallery-v1.toml)
-contains raw samples, allocations, support results, and exact package pins.
+The scalar-family native/Reactant comparison now lives under
+[Distribution kernels through Reactant](distributions-reactant.md#scalar-families),
+while this page remains the source authority for the objects it measures.
 
 ## Structured families: multivariate Normal and AR(1)
 
@@ -218,72 +203,14 @@ Both examples then apply `replica(...; batched = :x)`: a matrix holds independen
 vectors or independent series, one per column. The inner coordinate/time axis
 stays coupled, while the new trailing axis runs the whole kernel once per column.
 
-### Structured native and Reactant benchmark
+The structured native/Reactant comparison and its unsupported traced-array cells
+now live under
+[Distribution kernels through Reactant](distributions-reactant.md#structured-families).
 
-The matched comparison below uses the covariance-Cholesky HAVE boundary and
-public multivariate-Normal log-density APIs. It compares evaluation cost only,
-not construction-time parametrization APIs. Distribution construction,
-factorization, compilation, and host↔device transfers are excluded from
-execution timings. AR(1) is not benchmarked: neither comparison package exposes
-a native AR(1) distribution, so substituting a dense MVN would not be a matched
-library comparison.
+## Native and Reactant benchmark evidence
 
-```@eval
-Main.ReactiveKernelsDocs.render_structured_distribution_benchmarks()
-```
-
-Each cell is the median of five minimum-time measurements. The
-[structured benchmark receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/structured-distribution-logdensity-v1.toml)
-contains all raw samples, allocation observations, compiler diagnostics, and
-exact package/commit pins; both tests and the docs build validate it.
-
-The unsupported Reactant cells are measured compatibility results. At the
-pinned versions, ProbabilityMeasures' full MVN uses scalar indexing of the
-traced vector, while Distributions has no full-MVN `logpdf` method for a traced
-array. The receipt retains both diagnostics.
-
-## Scalar plate native and Reactant benchmark
-
-The comparison below evaluates the same batched Normal log density with shared
-location and scale parameters. It includes both the shared `normal.logpdf`
-object and a one-off RK formula as a matched control, so reuse overhead is
-measured directly. The other native columns use each library's idiomatic
-vectorized public interface; the Reactant columns compile the corresponding
-whole calculation with traced observations and traced shared parameters.
-
-```@eval
-Main.ReactiveKernelsDocs.render_distribution_benchmarks()
-```
-
-### Amortizing the Reactant call boundary
-
-For a tiny scalar density, most of the compiled-call time is fixed host/runtime
-overhead. When observations are independent, the same scalar `PreparedKernel`
-can be lifted with `replica(...; batched = :x)` and evaluated once over a vector.
-The checked-in receipt measures 1, 16, and 256 independent one-observation
-evaluations per compiled call:
-
-```@eval
-Main.ReactiveKernelsDocs.render_distribution_amortization()
-```
-
-The allocation count and bytes are for the whole host-side invocation, not for
-each observation. Batching therefore avoids paying that wrapper once per logical
-evaluation; it does not change the latency of an isolated one-observation call.
-
-Each cell is the median of five minimum-time measurements, with Reactant work
-synchronized before timing. Compilation and host↔device transfers are excluded
-from execution times. The Reactant allocation cells report only the Julia host
-wrapper observed by `@allocated`, not device memory. Native RK's reduction is
-exactly zero-allocation; the other native public interfaces allocate their
-vector of pointwise densities before summing it.
-
-Distributions + Reactant is marked unsupported because its exact public
-constructor rejects traced `μ` and `σ` values. First-shape compilation is
-recorded in the receipt for diagnostics but is not compared: RK's first sample
-includes Reactant service startup because it ran first.
-
-The machine-readable inputs and all five raw samples are checked in as the
-[benchmark receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/distribution-logdensity-v1.toml). The
-docs build rejects a dirty/unpinned receipt or failed RK/ProbabilityMeasures
-Reactant acceptance, and the test suite independently re-derives every median.
+The scalar-plate comparison, compiled-call amortization, and machine-readable
+receipts now live together under
+[Distribution kernels through Reactant](distributions-reactant.md#scalar-plate-and-call-boundary-amortization).
+This page remains the sole displayed mathematical and executable source
+authority for the `normal.logpdf` object and its generic plate.

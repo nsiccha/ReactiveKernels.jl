@@ -56,65 +56,11 @@ time-to-effective-sample.
 The ReactiveHMC.jl `ca9` structure is an **algorithm-structure reference only** — not
 a bitwise or RNG target; improvements may change arithmetic or ordering.
 
-## Reactant adaptive transition and multiple chains
+## Reactant receipt
 
-The optional external adaptive-NUTS exemplar compiles one full-depth transition
-to one data-dependent traced `while` and uses pre-generated momentum, direction,
-and exponential tensors plus explicit counters, so there is no host RNG inside
-the trace. This is a deliberately narrow compiler-acceptance path: it is
-scoped to `Float64`, a positive diagonal Euclidean metric, the locked authored
-control-flow graph, and the current diagnostics callback. Overflow and
-unsupported cases reject; the native adaptive API remains CPU execution.
-
-The source authority is
-[`packages/ReactiveKernelsNUTSExamples/src/nuts_runtime/kernel_nuts_reactant.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsNUTSExamples/src/nuts_runtime/kernel_nuts_reactant.jl),
-and
-[`test/test_kernel_nuts_reactant.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/test/test_kernel_nuts_reactant.jl)
-is the executable acceptance authority. The test requires one `stablehlo.while`
-and checks the native oracle, random-input counters, divergence/nonfinite paths,
-and fail-closed specialization guards.
-
-### Measured Reactant performance
-
-The matched benchmark below is the Reactant result that was previously missing
-from this page. It executes the **same authored adaptive transition** through the
-source-faithful native compiler and Reactant, starting from the same state and
-using identical pre-generated random bundles at `max_depth = 10`. State is
-independently initialized to the same value for each native/Reactant transition
-pair outside the timed region. This prevents accumulated floating-point branch
-drift in a chaotic carried chain from silently changing the compared work. A
-deterministic candidate stream is screened outside timing, and the receipt
-publishes how many candidates were excluded after backend-sensitive transition
-parity mismatches. Floating phase-point and diagnostic values must match with
-`atol = 128eps(Float64)` and `rtol = 0`; control counters and random consumption
-must match exactly. The frozen receipt reports synchronous CPU execution, full-transition wall time,
-work-normalized leapfrog steps/s, and compilation separately. Compilation,
-host/device transfers, state setup, random-bundle generation, rebundling, and result readback
-are outside steady-state timing.
-
-```@eval
-Main.ReactiveKernelsDocs.render_nuts_reactant_benchmark()
-```
-
-This baseline makes one synchronous compiled call per transition. Batching
-independent chains or compiling an outer loop over several sequential
-transitions could amortize dispatch and state-machine overhead, but neither is
-measured here; the receipt is not evidence that the current single-transition
-ratio is an inherent Reactant limit.
-
-The executable source is
-[`benchmark/nuts_reactant_comparison.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/nuts_reactant_comparison.jl),
-and the immutable input to this panel is
-[`benchmark/receipts/nuts-reactant-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/nuts-reactant-v1.toml).
-This is a matched-control compiler/runtime microbenchmark on a fixed target, not adaptation,
-retained-draw, ESS, accelerator-transfer, or time-to-effective-sample evidence.
-
-The simpler fixed-step HMC kernel in
-[`packages/ReactiveKernelsKernelExamples/src/hmc.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsKernelExamples/src/hmc.jl)
-also keeps momentum and its Metropolis uniform explicit, uses a static leapfrog
-count, and lets `replica` map the scalar kernel across chains. These are scoped
-compatibility statements, not a claim that arbitrary mutable or reactive state
-machines are accelerator compatible.
+The frozen adaptive-NUTS Reactant result now lives on the
+[static Reactant receipt page](nuts-reactant.md). That page is receipt-only: neither it
+nor this sampling page executes NUTS compiler/runtime code during the docs build.
 
 The separate [WALNUTS-D mathematical-kernel page](walnuts.md) keeps the same
 phase-point, leapfrog, and depth-10 multinomial-NUTS mathematics, but replaces

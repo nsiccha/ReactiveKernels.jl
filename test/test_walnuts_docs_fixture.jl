@@ -39,7 +39,7 @@ using Test
     @test occursin("Compiler status: not executed during the docs build", page)
     @test occursin("does not claim full", page)
     @test occursin("recursive-SCC or WALNUTS compiler support", page)
-    @test occursin("\"WALNUTS-D mathematical kernel\" => \"walnuts.md\"", make)
+    @test occursin("\"WALNUTS-D source (not executed)\" => \"walnuts.md\"", make)
     @test !occursin("include(joinpath(@__DIR__, \"..\", \"benchmark\", \"walnuts_kernel_authoring_fixture.jl\"))", make)
     @test !occursin("walnuts_compiler_support.jl", make)
     @test !occursin("WalnutsKernelAuthoringFixture", make)

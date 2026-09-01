@@ -270,7 +270,8 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
     length(rendered) == length(sources) ||
         error("rendered site has $(length(rendered)) content pages; navigation config has $(length(sources))")
     expected_panels = Dict(
-        "automatic-differentiation.md" => 1,
+        "automatic-differentiation.md" => 0,
+        "distributions-ad.md" => 1,
         "distributions.md" => 11,
         "batched.md" => 1,
         "bijectors.md" => 1,
@@ -295,38 +296,76 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "reactivehmc-corpus.md" => 5,
     )
     expected_sortable_tables = Dict(
-        "automatic-differentiation.md" => 6,
-        "batched.md" => 2,
+        "distributions-ad.md" => 2,
+        "ppl-ad.md" => 4,
         "compiler.md" => 1,
-        "distributions.md" => 6,
+        "distributions-reactant.md" => 8,
         "eight-schools.md" => 1,
         "eight-schools-reactant.md" => 4,
         "eval-throughput.md" => 1,
         "mnist-logistic.md" => 1,
         "mnist-reactant.md" => 2,
-        "nuts.md" => 3,
+        "nuts.md" => 1,
+        "nuts-reactant.md" => 2,
     )
     expected_aov_panels = Dict(
-        "automatic-differentiation.md" => 10,
-        "batched.md" => 2,
-        "distributions.md" => 12,
-        "nuts.md" => 2,
+        "distributions-ad.md" => 6,
+        "ppl-ad.md" => 4,
+        "distributions-reactant.md" => 14,
+        "nuts.md" => 1,
+        "nuts-reactant.md" => 1,
     )
     structural_markers = Dict(
         "automatic-differentiation.md" => (
-            "Automatic differentiation",
+            "Prepared automatic differentiation",
             "Prepare once, then request gradients or value-and-gradient",
             "returned_gradient === gradient_buffer",
-            "Normal Loglik",
+            "Accepted boundary",
+            "Ownership and reusable storage",
+            "Distribution AD: scalar and batched",
+            "PPL automatic differentiation",
+            "Automatic differentiation through Reactant",
+        ),
+        "distributions-ad.md" => (
             "Distribution gradient latency and allocation",
             "distribution-gradient-v1.toml",
             "20 have a zero-byte steady-state gradient path",
+        ),
+        "ppl-ad.md" => (
             "Eight Schools model gradient matrix",
             "eight-schools-ad-v1.toml",
             "All four differentiable scalar cells",
             "MNIST full-data model gradients",
             "mnist-logistic-ad-v1.toml",
             "7,065 active coefficients",
+        ),
+        "reactant.md" => (
+            "Reactant integration",
+            "Distribution kernels through Reactant",
+            "Eight Schools through Reactant",
+            "MNIST through Reactant",
+            "AD + Reactant",
+            "NUTS/WALNUTS pages are source- and receipt-only",
+        ),
+        "distributions-reactant.md" => (
+            "Distribution kernels through Reactant",
+            "Scalar families",
+            "Structured families",
+            "Scalar plate and call-boundary amortization",
+            "Batched authored graph parity",
+            "Reactant invocation-cost amortization",
+        ),
+        "reactant-ad.md" => (
+            "Automatic differentiation through Reactant",
+            "compile_ad_gradient",
+            "compile_ad_value_and_gradient",
+            "test/test_ad_reactant.jl",
+        ),
+        "nuts-reactant.md" => (
+            "Adaptive NUTS through Reactant: static receipt",
+            "Frozen matched-control result",
+            "Compilation and first-call costs",
+            "without executing NUTS compiler or runtime code",
         ),
         "compiler.md" => ("class=\"rk-pipeline\"",),
         "eight-schools-reactant.md" => (
@@ -345,8 +384,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
             "class=\"rk-status-grid\"",
             "Compiler/runtime execution is disabled in docs",
             "Sampler execution: not part of the docs build",
-            "Receipt medians for the matched-control corpus",
-            "Compilation and first-call costs",
+            "Exact G7 receipt values",
         ),
         "nutpie-diagonal.md" => (
             "@kernel nutpie_diagonal_initialize",

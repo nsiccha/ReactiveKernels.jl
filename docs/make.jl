@@ -39,36 +39,48 @@ site_pages = [
         "Distribution kernels" => "distributions.md",
         "Batched log densities" => "batched.md",
     ],
-    "Building blocks" => [
-        "Non-allocating kernels" => "nonallocating.md",
+    "Probabilistic programming" => [
+        "Eight schools" => "eight-schools.md",
+        "MNIST multinomial logistic" => "mnist-logistic.md",
+        "Other model walkthroughs" => [
+            "Linear regression" => "linear-regression.md",
+            "Beta-binomial" => "beta-binomial.md",
+            "Poisson-Gamma" => "poisson-gamma.md",
+            "Dugongs (nonlinear growth)" => "dugongs-growth.md",
+            "ARMA(1,1) time series" => "arma11.md",
+            "Gaussian mixture" => "gaussian-mixture.md",
+        ],
     ],
     "Automatic differentiation" => [
         "Prepared gradients" => "automatic-differentiation.md",
+        "Distributions: scalar and batched" => "distributions-ad.md",
+        "PPL: Eight Schools and MNIST" => "ppl-ad.md",
+    ],
+    "Reactant" => [
+        "Overview" => "reactant.md",
+        "Distributions: scalar and batched" => "distributions-reactant.md",
+        "Probabilistic programming" => [
+            "Eight Schools" => "eight-schools-reactant.md",
+            "MNIST multinomial logistic" => "mnist-reactant.md",
+        ],
+        "AD + Reactant" => "reactant-ad.md",
         "Evaluation throughput vs Turing.jl" => "eval-throughput.md",
+        "Adaptive NUTS receipt (static)" => "nuts-reactant.md",
     ],
-    "Probabilistic programming" => [
-        "Bijectors and constrained parameters" => "bijectors.md",
-        "Eight schools" => "eight-schools.md",
-        "Eight schools with Reactant" => "eight-schools-reactant.md",
-        "Linear regression" => "linear-regression.md",
-        "Beta-binomial" => "beta-binomial.md",
-        "Poisson-Gamma" => "poisson-gamma.md",
-        "Dugongs (nonlinear growth)" => "dugongs-growth.md",
-        "ARMA(1,1) time series" => "arma11.md",
-        "Gaussian mixture" => "gaussian-mixture.md",
-        "MNIST multinomial logistic" => "mnist-logistic.md",
-        "MNIST with Reactant" => "mnist-reactant.md",
+    "Kernel execution and tools" => [
+        "Non-allocating kernels" => "nonallocating.md",
+        "DAG visualization" => "visualization.md",
+        "API" => "api.md",
     ],
-    "Sampling" => [
+    "Bijectors" => "bijectors.md",
+    "Sampling (experimental)" => [
         "Pathfinder approximation" => "pathfinder.md",
         "ReactiveHMC kernel corpus" => "reactivehmc-corpus.md",
-        "NUTS sampling" => "nuts.md",
+        "NUTS source and receipts (not executed)" => "nuts.md",
         "Nutpie diagonal adaptation" => "nutpie-diagonal.md",
-        "WALNUTS-D mathematical kernel" => "walnuts.md",
+        "WALNUTS-D source (not executed)" => "walnuts.md",
         "Online statistics" => "online-stats.md",
     ],
-    "Visualization" => "visualization.md",
-    "API" => "api.md",
 ]
 
 makedocs(
