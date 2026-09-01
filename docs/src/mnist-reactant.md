@@ -22,10 +22,11 @@ Unsupported compiler cells stay in the table with their actual diagnostic.
 They are not silently omitted, replaced with a different HAVE boundary, or
 timed through host fallback. That distinction matters: the table describes
 which views of this one graph compile today as well as how the compiled views
-perform. On the current receipt the likelihood-bearing cells do not compile —
-the model's constant reference-logits row reaches Base's generic elementwise
-`vcat` during tracing — so their rows carry that scalar-indexing diagnostic
-while the fixed-capability report tracks the upstream fix.
+perform. On the current receipt the likelihood-bearing cells do not compile:
+the per-observation likelihood plate over `eachcol(logits)` with the observed
+class index stops at the compiler's scalar-indexing/gather frontier (the
+model's earlier constant reference-row `vcat` blocker is fixed), so their rows
+carry that diagnostic while the capability lands upstream.
 
 ## Primal performance and support
 
@@ -40,11 +41,34 @@ preparation, Reactant compilation, the first synchronous call, and result
 readback are outside that timing. The second table and setup summary report
 those costs separately, including failed compile attempts.
 
-This page times primal densities only — no gradients. Native AD for this model
-belongs to the [automatic-differentiation page](automatic-differentiation.md);
-a Reactant-compiled AD column mirroring the
-[Eight Schools one](eight-schools-reactant.md) follows once the native MNIST
-AD matrix is published there.
+The section above times primal densities only. The Reactant-compiled gradient
+column follows below; native AD (RK vs Turing vs manual, no Reactant) lives on
+the [automatic-differentiation page](automatic-differentiation.md), whose
+derivative matrix this page reuses exactly.
+
+## Reactant-compiled automatic differentiation
+
+```@eval
+Main.ReactiveKernelsDocs.render_mnist_reactant_ad_benchmark()
+```
+
+This section is the AD analog of the primal table above. It consumes the
+first-class RK verb `compile_ad_value_and_gradient` (the AD companion of the
+primal `@compile` path) — no gradient is hand-rolled — and reuses the exact
+differentiable outcome/boundary protocol published by the native MNIST AD
+receipt
+([`mnist-logistic-ad-v1`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/mnist-logistic-ad-v1.toml)):
+the value and gradient of each scalar output with respect to the packed
+coefficient vector. Non-scalar `pointwise` outputs and the two-active-port
+structured `(W, b)` boundary stay unsupported, exactly as on the AD receipt.
+
+A Reactant-compiled gradient exists only where the primal kernel itself
+compiles through Reactant, so the compiled cells are a subset of the native-AD
+cells: the packed joint and likelihood — whose primals stop at the
+plate/gather frontier above — keep native AD but no Reactant gradient. As with
+the primal table, AD preparation, host transfers, gradient compilation, the
+first synchronous call, and readback are excluded from the steady-state timing
+and reported separately.
 
 ## Reproduce
 
@@ -67,3 +91,17 @@ and data loading separately. For a quick non-publication smoke run, set
 `RK_MNIST_REACTANT_N=64` and `RK_MNIST_REACTANT_ROUNDS=2`; the checked-in
 receipt keeps the publication protocol of the full training split and at least
 ten rounds.
+
+The Reactant-compiled-AD receipt is generated the same way from the same clean
+detached candidate, and additionally resolves Enzyme and
+DifferentiationInterface into the pinned environment:
+
+```sh
+julia --startup-file=no benchmark/mnist_reactant_ad_comparison.jl \
+  --output=benchmark/receipts/mnist-reactant-ad-v1.toml
+julia --startup-file=no benchmark/receipts/validate_mnist_reactant_ad.jl \
+  benchmark/receipts/mnist-reactant-ad-v1.toml
+```
+
+Its quick-smoke knobs are `RK_MNIST_REACTANT_AD_N` and
+`RK_MNIST_REACTANT_AD_ROUNDS`.

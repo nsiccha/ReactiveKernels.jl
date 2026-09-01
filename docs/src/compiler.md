@@ -175,6 +175,36 @@ HAVE/WANT signatures, and pass identities. Mutating a graph increments its
 version, so a cache entry for the old graph cannot be returned. Cache lookup is
 preparation-time work only.
 
+### Preparation-time partial evaluation
+
+When some HAVE values stay fixed across many calls, `bound` opts into a
+Plan→Plan partial-evaluation pass. For an authored `KernelSpec`, bind them by
+port name with a NamedTuple such as `bound = (; observations)`. The resulting
+kernel accepts only the remaining inputs, for example `kernel(parameters)`.
+
+For a low-level `Plan` or `Graph`, the corresponding form is one
+`Value => data` pair or an iterable of pairs. Bound ports must belong to the
+selected HAVE boundary. They are removed from the returned callable's inputs;
+unbound ports retain their relative order.
+
+Partial evaluation partitions the already selected recipe order. A recipe is
+hoisted only when all of its transitive inputs come from bound ports (or from
+earlier hoisted recipes). That data-only prefix executes exactly once during
+preparation. Values needed by the residual body re-enter it through zero-input
+constant recipes, so downstream lowering sees an ordinary `Plan` and the hot
+path performs no graph traversal or data-only recomputation.
+
+Binding freezes values for that preparation; changing or mutating the data is
+not an invalidation signal. Rebind by preparing again from the original graph
+or plan. The pass does not symbolically inspect recipe bodies, rewrite
+mathematics, or mutate the shared graph. The default `bound = ()`/`bound = (;)`
+path is unchanged.
+
+The same named `bound` contract is available on `prepare_nonallocating`, whose
+lowering rewrites only the residual work. Optional downstream preparation
+surfaces consume that same residual plan rather than implementing another
+partial evaluator.
+
 ### 5. Composition
 
 Low-level `compose` preserves globally stable `Value` identities when graph

@@ -1,5 +1,9 @@
 # Non-allocating kernels
 
+```@eval
+Main.ReactiveKernelsDocs.render_review_status(:review_pending_nonallocating)
+```
+
 `prepare_nonallocating` changes how a kernel runs, not what it computes. It ships
 as an optional extension, so the base ReactiveKernels package keeps no hard
 dependency on MutatingFunctions (which is not registered yet) and still installs

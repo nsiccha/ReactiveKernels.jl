@@ -1,5 +1,9 @@
 # ReactiveHMC kernel corpus
 
+```@eval
+Main.ReactiveKernelsDocs.render_review_status(:frozen_sampling)
+```
+
 This page is the transparent source index for the ReactiveHMC-derived compiler
 corpus. It starts from ReactiveHMC.jl revision
 `ca9ea4ca41924bb0e1fadc01c717e1333916aba6`, whose nine source-file digests are

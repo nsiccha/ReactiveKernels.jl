@@ -77,6 +77,62 @@ function render_result_assets()
     )])
 end
 
+const _REVIEW_STATUS_CONTENT = Dict(
+    :frozen_ppl => (
+        state = "frozen",
+        icon = "❄",
+        label = "Frozen model guide",
+        title = "Outside the current PPL review set",
+        body = "This walkthrough is preserved as executable example material, but it has not received the current migration and review pass. Eight Schools and MNIST are the reviewed PPL paths; treat claims on this page as provisional until it is revisited.",
+    ),
+    :frozen_sampling => (
+        state = "frozen",
+        icon = "❄",
+        label = "Frozen sampling guide",
+        title = "Experimental and awaiting re-review",
+        body = "This sampling material is retained as historical or experimental evidence outside the current reviewed set. NUTS and WALNUTS remain source-only in the docs build; do not infer a current supported sampler or compiler capability from this page.",
+    ),
+    :frozen_bijectors => (
+        state = "frozen",
+        icon = "❄",
+        label = "Frozen guide",
+        title = "Preserved, but not recently reviewed",
+        body = "This bijector guide remains available as implementation documentation, but it has not received the current focused review. Treat it as provisional rather than as the front-line supported contract.",
+    ),
+    :review_pending_nonallocating => (
+        state = "review-pending",
+        icon = "◌",
+        label = "Review pending",
+        title = "Implementation retained; guide awaiting review",
+        body = "The non-allocating implementation and its tests remain in place, but this guide has not yet received the current focused review. This label records documentation review status, not a known runtime failure.",
+    ),
+)
+
+"""Render a visible, source-controlled review-state banner for a docs page."""
+function render_review_status(kind::Symbol)
+    haskey(_REVIEW_STATUS_CONTENT, kind) ||
+        error("unknown documentation review status: $(repr(kind))")
+    status = _REVIEW_STATUS_CONTENT[kind]
+    node = h.aside(;
+        class = "rk-review-state rk-review-state--$(status.state)",
+        data_rk_review_state = status.state,
+        aria_label = "Documentation review status",
+    )(
+        h.div(status.icon; class = "rk-review-state__icon", aria_hidden = "true"),
+        h.div(
+            h.div(
+                h.span(status.label; class = "rk-review-state__badge"),
+                h.span("Documentation status"; class = "rk-review-state__eyebrow"),
+                class = "rk-review-state__heading",
+            ),
+            h.strong(status.title; class = "rk-review-state__title"),
+            h.p(status.body),
+            class = "rk-review-state__content",
+        ),
+    )
+    Markdown.MD(Any[_static_block(node)])
+end
+
 _default_cell(value, _) = string(value)
 _default_sort(value, _) = value === missing ? nothing : value
 
@@ -2416,6 +2472,155 @@ function render_mnist_reactant_benchmark()
         _result_table(setup_rows, setup_columns;
             id = "mnist-reactant-setup",
             title = "Setup, compilation, and first-call costs",
+            note = "These costs are reported separately and excluded from steady-state timing."),
+        _static_block(provenance),
+    ])
+end
+
+const _MNIST_REACTANT_AD_RECEIPT_PATH = joinpath(
+    dirname(@__DIR__), "benchmark", "receipts", "mnist-reactant-ad-v1.toml")
+
+"""Render the checked-in MNIST Reactant-compiled-AD receipt as sortable data."""
+function render_mnist_reactant_ad_benchmark()
+    receipt = TOML.parsefile(_MNIST_REACTANT_AD_RECEIPT_PATH)
+    get(receipt, "schema", "") == "mnist-reactant-ad-v1" ||
+        error("unexpected MNIST Reactant-AD benchmark receipt schema")
+    pins = receipt["pins"]
+    get(pins, "reactivekernels_dirty", true) == false ||
+        error("MNIST Reactant-AD receipt was produced from a dirty checkout")
+    protocol = receipt["protocol"]
+    get(protocol, "source_reused", false) ||
+        error("MNIST Reactant-AD receipt does not reuse the authored source")
+    get(protocol, "reactant_sync", false) ||
+        error("MNIST Reactant-AD receipt is not synchronous")
+    get(protocol, "rk_reactant_ad_surface", "") ==
+        "prepare_ad + compile_ad_value_and_gradient" ||
+        error("MNIST Reactant-AD receipt does not consume the first-class verb")
+    Tuple(String.(protocol["input_boundaries"])) == _MNIST_LOGISTIC_BOUNDARIES ||
+        error("unexpected MNIST AD input-boundary matrix")
+    Tuple(String.(protocol["outcomes"])) == _MNIST_LOGISTIC_OUTCOMES ||
+        error("unexpected MNIST AD output matrix")
+
+    boundary_labels = Dict(
+        "packed_unconstrained" => "Packed unconstrained",
+        "structured_parameters" => "Structured (W, b)",
+    )
+    # Same headline estimator as the matched AD receipt: the minimum of
+    # per-round BenchmarkTools minimums (uncontended cost).
+    rows = map(receipt["measurements"]) do measurement
+        native_supported = get(measurement, "rk_native_ad_supported", false)
+        reactant_supported = get(measurement, "rk_reactant_ad_supported", false)
+        native_ns = native_supported ?
+            Float64(measurement["rk_native_ad"]["min_ns"]) : missing
+        reactant_ns = reactant_supported ?
+            Float64(measurement["rk_reactant_ad"]["min_ns"]) : missing
+        diagnostic = reactant_supported ? "measured" :
+            get(measurement, "rk_reactant_ad_error", "unsupported")
+        (;
+            boundary = boundary_labels[measurement["boundary"]],
+            outcome = measurement["outcome"],
+            native_ns,
+            reactant_ns,
+            relative_time = reactant_supported ? reactant_ns / native_ns : missing,
+            compiler_result = diagnostic,
+        )
+    end
+    measured = filter(row -> row.reactant_ns !== missing, rows)
+    ratios = Float64[row.relative_time for row in measured]
+    frontier = count(row -> row.native_ns !== missing &&
+        row.reactant_ns === missing, rows)
+    summary = isempty(ratios) ?
+        "No Reactant-compiled gradient cell compiled in this receipt." :
+        "Reactant-compiled AD covers $(length(measured)) of the 3 native-AD " *
+        "scalar cells; $frontier keep native AD but no compiled gradient " *
+        "(their primals stop at the compiler frontier). Across compiled " *
+        "cells, steady-state Reactant/native value-and-gradient time ranges " *
+        "from $(round(minimum(ratios); digits = 2))× to " *
+        "$(round(maximum(ratios); digits = 2))× on this CPU receipt."
+    timing_columns = (
+        _column(:boundary, "Input boundary"),
+        _column(:outcome, "Requested output"),
+        _column(:native_ns, "Native RK AD";
+            format = (value, _) -> _unsupported(value, _fmt_ns)),
+        _column(:reactant_ns, "Reactant-compiled AD";
+            format = (value, _) -> _unsupported(value, _fmt_ns)),
+        _column(:relative_time, "Reactant ÷ native";
+            format = (value, _) -> _unsupported(
+                value, ratio -> string(round(ratio; digits = 2), "×"))),
+        _column(:compiler_result, "Compiler result";
+            format = (value, _) -> value == "measured" ? value :
+                h.span(value; class = "rk-result-unsupported")),
+    )
+
+    setup_rows = map(filter(
+        measurement -> get(measurement, "rk_native_ad_supported", false),
+        receipt["measurements"],
+    )) do measurement
+        supported = get(measurement, "rk_reactant_ad_supported", false)
+        (;
+            boundary = boundary_labels[measurement["boundary"]],
+            outcome = measurement["outcome"],
+            prepare_seconds = Float64(measurement["ad_preparation_seconds"]),
+            transfer_seconds = Float64(measurement["reactant_transfer_seconds"]),
+            compile_seconds = Float64(measurement["reactant_ad_compile_seconds"]),
+            first_seconds = supported ?
+                Float64(measurement["reactant_first_execution_seconds"]) : missing,
+            result = supported ? "compiled" : "unsupported",
+        )
+    end
+    seconds(value) = string(round(value; sigdigits = 4), " s")
+    setup_columns = (
+        _column(:boundary, "Input boundary"),
+        _column(:outcome, "Requested output"),
+        _column(:prepare_seconds, "AD preparation";
+            format = (value, _) -> seconds(value)),
+        _column(:transfer_seconds, "Input transfer";
+            format = (value, _) -> seconds(value)),
+        _column(:compile_seconds, "Compile attempt";
+            format = (value, _) -> seconds(value)),
+        _column(:first_seconds, "First synchronous call";
+            format = (value, _) -> _unsupported(value, seconds)),
+        _column(:result, "Result";
+            format = (value, _) -> value == "compiled" ? value :
+                h.span(value; class = "rk-result-unsupported")),
+    )
+
+    setup = receipt["setup"]
+    setup_summary = "The fresh environment took " *
+        "$(seconds(Float64(setup["environment_seconds"]))) to resolve/install, " *
+        "package precompilation took " *
+        "$(seconds(Float64(setup["package_precompile_seconds"]))), loading the " *
+        "$(protocol["num_observations"])-image MNIST training split took " *
+        "$(seconds(Float64(setup["data_load_seconds"]))), and building the " *
+        "model graph took " *
+        "$(seconds(Float64(setup["kernel_preparation_seconds"]))). None of " *
+        "these, per-cell AD preparation, transfers, gradient compilation, " *
+        "first calls, or result readback is inside the steady-state timings."
+    provenance = h.p(; class = "rk-result-provenance")(
+        "Sources: ",
+        h.a(h.code("benchmark/receipts/mnist-reactant-ad-v1.toml");
+            href = "https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/mnist-reactant-ad-v1.toml"),
+        " generated by ",
+        h.a(h.code("benchmark/mnist_reactant_ad_comparison.jl");
+            href = "https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/mnist_reactant_ad_comparison.jl"),
+        ". Exact model authority: ",
+        h.a(h.code(String(pins["source_authority_path"]));
+            href = "https://github.com/nsiccha/ReactiveKernels.jl/blob/main/$(pins["source_authority_path"])"),
+        ". Pins: source blob $(first(String(pins["source_authority_blob"]), 10)), " *
+        "Reactant $(pins["reactant_version"]), Enzyme $(pins["enzyme_version"]), " *
+        "Julia $(pins["julia_version"]), " *
+        "RK $(first(String(pins["reactivekernels_sha"]), 10)).",
+    )
+
+    Markdown.MD(Any[
+        Markdown.Paragraph(Any[summary]),
+        _result_table(rows, timing_columns; id = "mnist-reactant-ad-matrix",
+            title = "Native RK AD / Reactant-compiled AD steady-state matrix",
+            note = "Value-and-gradient per differentiable scalar cell; each measured cell is the minimum of per-round BenchmarkTools minimums. Non-scalar (pointwise) and two-active-port structured cells stay unsupported with their recorded reason; native-AD cells whose primal cannot compile through Reactant keep their compiler diagnostic."),
+        Markdown.Paragraph(Any[setup_summary]),
+        _result_table(setup_rows, setup_columns;
+            id = "mnist-reactant-ad-setup",
+            title = "AD preparation, compilation, and first-call costs",
             note = "These costs are reported separately and excluded from steady-state timing."),
         _static_block(provenance),
     ])

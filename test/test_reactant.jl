@@ -367,6 +367,34 @@ end
               reference_likelihood
     end
 
+    @testset "partially-evaluated kernels compile with hoisted host constants" begin
+        # The `bound` pre-pass runs the data-only subgraph on the host at
+        # preparation time; the hoisted values ride the static ops tuple as
+        # zero-input constants, so Reactant traces an ordinary prepared kernel
+        # over just the remaining (latent) ports and embeds the host values as
+        # program constants.
+        artifact = evaluate_eight_schools_source()
+        q_host = [1.5, log(2.0), (0.25 .* (1:8))...]
+        boundary = (:μ, :log_τ, :θ, :observations, :observation_scales)
+        host_reference = prepare(artifact.model;
+            have = boundary, want = :posterior)(
+            q_host[1], q_host[2], q_host[3:end],
+            EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA)
+
+        bound_posterior = prepare(artifact.model;
+            have = boundary, want = :posterior,
+            bound = (; observations = EIGHT_SCHOOLS_Y,
+                       observation_scales = EIGHT_SCHOOLS_SIGMA))
+        @test bound_posterior(q_host[1], q_host[2], q_host[3:end]) ≈
+              host_reference
+
+        μ = Reactant.to_rarray(q_host[1]; track_numbers = true)
+        log_τ = Reactant.to_rarray(q_host[2]; track_numbers = true)
+        effects = Reactant.to_rarray(q_host[3:end])
+        bound_compiled = @compile bound_posterior(μ, log_τ, effects)
+        @test bound_compiled(μ, log_τ, effects) ≈ host_reference
+    end
+
     @testset "direct prepared scalar kernels keep program metadata static" begin
         # Defaulted named authoring returns the signature wrapper, so this also
         # covers direct compilation of the wrapper and its default providers.

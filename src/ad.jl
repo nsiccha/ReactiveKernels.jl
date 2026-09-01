@@ -261,13 +261,25 @@ function _ad_call(kernel::PreparedKernel, resolved::Tuple, active;
     call, point, contexts, active_index
 end
 
-function _ad_spec_kernel(spec::KernelSpec, want)
+function _ad_spec_kernel(spec::KernelSpec, want, bound = NamedTuple())
     _ad_validate_unique_haves(spec)
     selected_wants = _kernel_selection(spec, want, spec.want_names, :want)
     length(selected_wants) == 1 || throw(ArgumentError(
         "AD preparation requires exactly one explicit WANT port; got " *
         string(Tuple(output.name for output in selected_wants))))
-    prepare(plan(spec; want = only(selected_wants)))
+    isempty(bound) && return prepare(plan(spec; want = only(selected_wants)))
+    prepare(plan(spec; want = only(selected_wants));
+            bound = _kernel_bound_pairs(spec, bound))
+end
+
+# A partially-evaluated kernel is positional over the remaining HAVE ports;
+# the authored keyword/default resolution layer maps the full signature and
+# therefore does not apply.
+function _ad_reject_bound_keywords(kwargs::NamedTuple)
+    isempty(kwargs) || throw(ArgumentError(
+        "a bound AD preparation is positional over the remaining HAVE ports; " *
+        "authored keyword arguments do not apply"))
+    kwargs
 end
 
 function _ad_resolver(spec::KernelSpec)
@@ -302,7 +314,7 @@ function _prepare_ad_pullback(kernel::PreparedKernel, resolver,
 end
 
 """
-    prepare_ad(spec, backend, args...; active, want, kwargs...) -> PreparedADKernel
+    prepare_ad(spec, backend, args...; active, want, bound=(;), kwargs...) -> PreparedADKernel
 
 Prepare a reusable DifferentiationInterface gradient of the explicit scalar
 `want` port in a [`KernelSpec`](@ref). `active` names the one selected HAVE
@@ -312,11 +324,22 @@ on every call and passed as `Constant` contexts.
 The ordinary authored call surface is preserved: positional defaults and
 keyword HAVE ports are resolved exactly as they are by `prepare(spec)`. The
 preparation arguments are type/shape exemplars, not frozen data.
+
+A non-empty `bound` NamedTuple runs the [`partial_evaluation`](@ref) pre-pass
+first: the named ports are fixed to the supplied values, their data-only
+subgraph executes once during preparation, and both the differentiated call
+and its `Constant` contexts cover only the remaining ports. `args` and
+`active` then refer to those remaining ports positionally; authored keyword
+arguments do not apply to a bound preparation.
 """
 function prepare_ad(spec::KernelSpec,
                     backend::DifferentiationInterface.AbstractADType,
-                    args...; active, want, kwargs...)
-    kernel = _ad_spec_kernel(spec, want)
+                    args...; active, want, bound = NamedTuple(), kwargs...)
+    kernel = _ad_spec_kernel(spec, want, bound)
+    if !isempty(bound)
+        _ad_reject_bound_keywords(NamedTuple(kwargs))
+        return _prepare_ad(kernel, tuple, backend, args, NamedTuple(), active)
+    end
     _prepare_ad(kernel, _ad_resolver(spec), backend, args,
                 NamedTuple(kwargs), active)
 end
@@ -381,8 +404,13 @@ positional, single-scalar boundary. The reusable form uses a
 """
 function ad_gradient(spec::KernelSpec,
                      backend::DifferentiationInterface.AbstractADType,
-                     args...; active, want, kwargs...)
-    kernel = _ad_spec_kernel(spec, want)
+                     args...; active, want, bound = NamedTuple(), kwargs...)
+    kernel = _ad_spec_kernel(spec, want, bound)
+    if !isempty(bound)
+        _ad_reject_bound_keywords(NamedTuple(kwargs))
+        call, point, contexts, _ = _ad_call(kernel, args, active)
+        return DifferentiationInterface.gradient(call, backend, point, contexts...)
+    end
     resolver = _ad_resolver(spec)
     resolved = _ad_resolve(resolver, args, NamedTuple(kwargs))
     call, point, contexts, _ = _ad_call(kernel, resolved, active)

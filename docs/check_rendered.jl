@@ -304,7 +304,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "eight-schools-reactant.md" => 4,
         "eval-throughput.md" => 1,
         "mnist-logistic.md" => 1,
-        "mnist-reactant.md" => 2,
+        "mnist-reactant.md" => 4,
         "nuts.md" => 1,
         "nuts-reactant.md" => 2,
     )
@@ -314,6 +314,23 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "distributions-reactant.md" => 14,
         "nuts.md" => 1,
         "nuts-reactant.md" => 1,
+    )
+    expected_review_states = Dict(
+        "linear-regression.md" => "frozen",
+        "beta-binomial.md" => "frozen",
+        "poisson-gamma.md" => "frozen",
+        "dugongs-growth.md" => "frozen",
+        "arma11.md" => "frozen",
+        "gaussian-mixture.md" => "frozen",
+        "pathfinder.md" => "frozen",
+        "reactivehmc-corpus.md" => "frozen",
+        "nuts.md" => "frozen",
+        "nutpie-diagonal.md" => "frozen",
+        "walnuts.md" => "frozen",
+        "online-stats.md" => "frozen",
+        "nuts-reactant.md" => "frozen",
+        "bijectors.md" => "frozen",
+        "nonallocating.md" => "review-pending",
     )
     structural_markers = Dict(
         "automatic-differentiation.md" => (
@@ -377,7 +394,9 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "mnist-reactant.md" => (
             "Native RK / Reactant steady-state matrix",
             "Setup, compilation, and first-call costs",
+            "Native RK AD / Reactant-compiled AD steady-state matrix",
             "benchmark/receipts/mnist-reactant-v1.toml",
+            "benchmark/receipts/mnist-reactant-ad-v1.toml",
             "packages/ReactiveKernelsPPLExamples/src/mnist_logistic.jl",
         ),
         "nuts.md" => (
@@ -493,6 +512,24 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         body = read(rendered_path, String)
         filesize(rendered_path) > 0 || error("rendered $source page is empty")
         occursin("<!DOCTYPE html>", body) || error("rendered $source page is not complete HTML")
+
+        expected_review_state = get(expected_review_states, source, nothing)
+        for (stage, stage_body) in (
+                ("Documenter intermediate", intermediate),
+                ("VitePress output", body),
+            )
+            observed_review_states = [
+                match.captures[1] for match in
+                eachmatch(r"data-rk-review-state=\"([^\"]+)\"", stage_body)
+            ]
+            expected_review_states_for_page = isnothing(expected_review_state) ?
+                String[] : [expected_review_state]
+            observed_review_states == expected_review_states_for_page || error(
+                "$stage $source review-state markers were " *
+                "$(repr(observed_review_states)); expected " *
+                repr(expected_review_states_for_page),
+            )
+        end
 
         artifact_ids = _check_artifact_id_contract(source, intermediate, body)
         append!(all_artifact_ids, ("$source::$id" for id in artifact_ids))

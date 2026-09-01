@@ -26,6 +26,7 @@ RuntimeGeneratedFunctions.init(@__MODULE__)
 include("core.jl")
 include("planner.jl")
 include("codegen.jl")
+include("partial_evaluation.jl")
 include("nonallocating.jl")
 include("graphops.jl")
 include("authoring.jl")
@@ -46,6 +47,7 @@ include("visualization.jl")
 
 export Value, Recipe, Graph, Plan, PreparedKernel, PreparedADKernel, PreparedADPullback, ReplicatedKernel, NonAllocatingKernel, PlanningError
 export value, value!, add!, plan, prepare, prepare_nonallocating, plate
+export partial_evaluation
 export prepare_ad, ad_gradient, ad_value_and_gradient, ad_value_and_gradient!
 export prepare_ad_pullback, ad_pullback
 export ad_value_and_pullback, ad_value_and_pullback!

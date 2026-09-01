@@ -57,6 +57,33 @@ _trace(x) = Reactant.to_rarray(x)
         @test_throws ArgumentError compile_ad_gradient(prepared, _trace(q), _trace(data))
     end
 
+    @testset "partially-evaluated AD kernels compile over the remaining ports" begin
+        @kernel bound_objective(q::Vector{Float64}, data::Vector{Float64}) = begin
+            shifted = data .- 1.0
+            density::Float64 = sum(q .* shifted) - 0.5 * sum(abs2, q)
+        end
+
+        q = [0.3, -0.4, 0.2]
+        data = [2.0, -1.0, 0.5]
+        prepared = prepare_ad(
+            bound_objective, AD_REACTANT_BACKEND, q;
+            active = :q, want = :density, bound = (; data))
+        @test Tuple(input.name for input in inputs(prepared.kernel)) == (:q,)
+
+        gref = similar(q)
+        vref, gref = ad_value_and_gradient!(prepared, gref, q)
+        @test gref ≈ (data .- 1.0) .- q
+
+        traced_q = _trace(q)
+        compiled_gradient = compile_ad_gradient(prepared, traced_q)
+        @test Array(compiled_gradient(traced_q)) ≈ gref
+
+        compiled_both = compile_ad_value_and_gradient(prepared, traced_q)
+        value, both_gradient = compiled_both(traced_q)
+        @test Float64(value) ≈ vref
+        @test Array(both_gradient) ≈ gref
+    end
+
     @testset "Eight Schools supported boundaries match native reverse pass" begin
         model = build_eight_schools_graph()
         observations = Float64.(EIGHT_SCHOOLS_Y)
