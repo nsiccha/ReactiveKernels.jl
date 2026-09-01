@@ -88,6 +88,8 @@ function validate_mnist_logistic_receipt(path::AbstractString)
                     "$boundary / $outcome / $backend needs ten raw timing rounds")
             require(Float64(result["median_ns"]) > 0,
                     "$boundary / $outcome / $backend median_ns must be positive")
+            require(haskey(result, "min_ns") && Float64(result["min_ns"]) > 0,
+                    "$boundary / $outcome / $backend min_ns must be positive")
             require(Int(result["median_bytes"]) >= 0,
                     "$boundary / $outcome / $backend bytes must be nonnegative")
             require(Int(result["median_allocs"]) >= 0,

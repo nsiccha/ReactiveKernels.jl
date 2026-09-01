@@ -123,7 +123,13 @@ function _measurement(f, args...; rounds::Int)
         push!(allocs, estimate.allocs)
     end
     Dict(
-        "times_ns" => times_ns, "median_ns" => median(times_ns),
+        # `min_ns` is the headline estimator: the minimum of per-round
+        # BenchmarkTools minimums estimates the uncontended cost, which a
+        # median cannot on a shared host once a load episode spans more than
+        # half the rounds (ms-scale matmul cells are exposed to exactly that).
+        # The median and every raw round are retained for transparency.
+        "times_ns" => times_ns, "min_ns" => minimum(times_ns),
+        "median_ns" => median(times_ns),
         "bytes" => bytes, "median_bytes" => Int(median(bytes)),
         "allocs" => allocs, "median_allocs" => Int(median(allocs)),
     )
@@ -295,7 +301,7 @@ function run_comparison()
             "input_boundaries" => ["packed_unconstrained", "structured_parameters"],
             "outcomes" => ["joint", "prior", "likelihood", "pointwise"],
             "rounds" => rounds,
-            "estimator" => "median of per-round BenchmarkTools minimum times",
+            "estimator" => "minimum of per-round BenchmarkTools minimum times (uncontended cost; medians and raw rounds retained)",
             "samples_per_round" => 200,
             "seconds_per_round" => 0.2,
             "setup_in_timed_region" => false,

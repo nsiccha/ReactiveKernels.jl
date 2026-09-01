@@ -1043,6 +1043,19 @@ const _MNIST_LOGISTIC_BACKENDS = ("rk_native", "manual_julia", "turing_native")
 _mnist_logistic_supported(boundary, outcome, backend) =
     !(backend == "turing_native" && outcome == "pointwise")
 
+# Headline estimator for the ms-scale matmul cells: the minimum of per-round
+# minimums (uncontended cost). A shared-host load episode spanning over half
+# the rounds corrupts a median; the receipt retains medians and raw rounds.
+function _mnist_logistic_measurement(row, backend)
+    haskey(row, backend) || return missing
+    result = row[backend]
+    (;
+        median_ns = Float64(result["min_ns"]),
+        median_bytes = Int(result["median_bytes"]),
+        median_allocs = Int(result["median_allocs"]),
+    )
+end
+
 """Render the checked-in MNIST multinomial-logistic boundary/outcome matrix."""
 function render_mnist_logistic_benchmarks()
     receipt = TOML.parsefile(_MNIST_LOGISTIC_RECEIPT_PATH)
@@ -1097,9 +1110,9 @@ function render_mnist_logistic_benchmarks()
         push!(rows, (;
             boundary = boundary_labels[boundary],
             outcome = outcome_labels[outcome],
-            rk_native = _eight_schools_measurement(row, "rk_native"),
-            manual_julia = _eight_schools_measurement(row, "manual_julia"),
-            turing_native = _eight_schools_measurement(row, "turing_native")))
+            rk_native = _mnist_logistic_measurement(row, "rk_native"),
+            manual_julia = _mnist_logistic_measurement(row, "manual_julia"),
+            turing_native = _mnist_logistic_measurement(row, "turing_native")))
     end
 
     turing_rows = filter(row -> row.turing_native !== missing, rows)
