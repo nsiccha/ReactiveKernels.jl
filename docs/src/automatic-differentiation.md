@@ -155,6 +155,12 @@ blank because neither compared public surface offers a useful matched
 Jacobian/VJP contract; the benchmark does not invent a fused pointwise-plus-total
 surrogate.
 
+### Baseline implementations
+
+```@eval
+Main.ReactiveKernelsDocs.render_eight_schools_ad_baselines()
+```
+
 The checked-in
 [Eight Schools AD receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/eight-schools-ad-v1.toml)
 retains ten raw rounds, source and primal-receipt pins, parity errors,

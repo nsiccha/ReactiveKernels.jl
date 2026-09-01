@@ -32,6 +32,7 @@ const COMPARISON_PACKAGES = (
     "Distributions", "NNlib", "MLDatasets", "BenchmarkTools",
 )
 
+# DOCS-BASELINE-BEGIN: turing
 Turing.@model function turing_mnist_logistic(X, y, C)
     N, D = size(X)
     W ~ filldist(Normal(), C - 1, D)
@@ -42,8 +43,10 @@ Turing.@model function turing_mnist_logistic(X, y, C)
     linear_indices = y .+ (eachindex(y) .- 1) .* size(probabilities, 1)
     Turing.@addlogprob! sum(log, probabilities[linear_indices])
 end
+# DOCS-BASELINE-END: turing
 
 # ---- handwritten Julia control ------------------------------------------------
+# DOCS-BASELINE-BEGIN: manual
 # Standard-normal log prior over every coefficient (flat [vec(W); b]).
 _manual_prior(coefficients) =
     -0.5 * length(coefficients) * log(2π) - 0.5 * sum(abs2, coefficients)
@@ -91,6 +94,7 @@ _manual_structured_likelihood(W, b, X, y) = _manual_likelihood(W, b, X, y)
 _manual_structured_pointwise(W, b, X, y) = _manual_pointwise(W, b, X, y)
 _manual_structured_joint(W, b, X, y) =
     _manual_structured_prior(W, b) + _manual_structured_likelihood(W, b, X, y)
+# DOCS-BASELINE-END: manual
 
 # ---- Turing native views ------------------------------------------------------
 function _turing_vector(ldf, parameters)

@@ -1155,7 +1155,8 @@ function render_mnist_logistic_benchmarks()
         _result_table(rows, columns;
             id = "mnist-logistic-matrix",
             title = "MNIST logistic boundary × outcome matrix",
-            note = "Each measured cell is median runtime; bytes; allocations. " *
+            note = "Each measured cell is minimum (uncontended) runtime; bytes; " *
+                   "allocations. " *
                    "A blank cell means that backend has no matching public boundary."),
         Markdown.Paragraph(Any[Markdown.Italic(Any[provenance])]),
     ])
@@ -1403,6 +1404,79 @@ function render_mnist_logistic_ad_benchmarks()
         Markdown.Paragraph(Any[Markdown.Italic(Any[provenance])]),
     ])
 end
+# ---- benchmark baseline sources ------------------------------------------------
+# The comparison pages must show the exact Turing / handwritten baselines the
+# benchmark harnesses execute. The displayed code is extracted verbatim at
+# docs-build time from the executed `_body.jl` file, between explicit
+# `# DOCS-BASELINE-BEGIN: <name>` / `# DOCS-BASELINE-END: <name>` markers, so a
+# docs-only copy cannot drift from what actually ran; a missing or empty region
+# fails the warning-fatal build.
+
+const _BENCHMARK_SOURCE_DIR = normpath(joinpath(@__DIR__, "..", "benchmark"))
+
+function _benchmark_baseline_region(file::AbstractString, name::AbstractString)
+    path = joinpath(_BENCHMARK_SOURCE_DIR, file)
+    lines = readlines(path)
+    begin_line = "# DOCS-BASELINE-BEGIN: $(name)"
+    end_line = "# DOCS-BASELINE-END: $(name)"
+    starts = findall(==(begin_line), lines)
+    stops = findall(==(end_line), lines)
+    (length(starts), length(stops)) == (1, 1) || error(
+        "expected exactly one $(begin_line) / $(end_line) pair in $(path)")
+    only(starts) < only(stops) || error(
+        "baseline markers for $(name) are out of order in $(path)")
+    region = strip(join(lines[(only(starts) + 1):(only(stops) - 1)], "\n"))
+    isempty(region) && error("baseline region $(name) in $(path) is empty")
+    region
+end
+
+function _render_benchmark_baselines(intro::AbstractString, file::AbstractString,
+                                     sections::Tuple)
+    blocks = Any[Markdown.Paragraph(Any[intro])]
+    for (title, name) in sections
+        push!(blocks, Markdown.Paragraph(Any[Markdown.Bold(Any[title])]))
+        push!(blocks, Markdown.Code("julia", _benchmark_baseline_region(file, name)))
+    end
+    Markdown.MD(blocks)
+end
+
+"""Render the Turing and handwritten baselines the MNIST benchmark executes."""
+render_mnist_logistic_baselines() = _render_benchmark_baselines(
+    "These are the baseline implementations the comparison cells above " *
+    "execute, shown verbatim from `benchmark/mnist_logistic_comparison_body.jl` " *
+    "(extracted from the executed file at docs-build time).",
+    "mnist_logistic_comparison_body.jl",
+    (("Turing baseline", "turing"),
+     ("Handwritten Julia control", "manual")))
+
+"""Render the Turing and handwritten baselines the primal Eight Schools benchmark executes."""
+render_eight_schools_primal_baselines() = _render_benchmark_baselines(
+    "These are the baseline implementations the comparison cells above " *
+    "execute, shown verbatim from " *
+    "`benchmark/eight_schools_primal_comparison_body.jl` (extracted from the " *
+    "executed file at docs-build time).",
+    "eight_schools_primal_comparison_body.jl",
+    (("Turing baseline", "turing"),
+     ("Handwritten Julia control", "manual")))
+
+"""Render the Turing baseline the evaluation-throughput benchmark executes."""
+render_eval_throughput_baselines() = _render_benchmark_baselines(
+    "This is the Turing baseline the comparison above executes, shown verbatim " *
+    "from `benchmark/eval_throughput_comparison_body.jl` (extracted from the " *
+    "executed file at docs-build time).",
+    "eval_throughput_comparison_body.jl",
+    (("Turing baseline", "turing"),))
+
+"""Render the baselines the Eight Schools AD comparison differentiates."""
+render_eight_schools_ad_baselines() = _render_benchmark_baselines(
+    "The AD comparison differentiates the same baseline implementations the " *
+    "primal Eight Schools benchmark executes (the AD harness includes " *
+    "`eight_schools_primal_comparison_body.jl`), shown verbatim from that file " *
+    "at docs-build time; the AD cells differentiate these definitions with " *
+    "Enzyme through DifferentiationInterface `AutoEnzyme` backends.",
+    "eight_schools_primal_comparison_body.jl",
+    (("Turing baseline", "turing"),
+     ("Handwritten Julia control", "manual")))
 
 const _EIGHT_SCHOOLS_AD_IMPLEMENTATIONS = (
     ("rk_native", "ReactiveKernels"),

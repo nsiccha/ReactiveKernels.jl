@@ -79,9 +79,17 @@ preparation, and transform discovery are outside the timed region.
 Main.ReactiveKernelsDocs.render_mnist_logistic_benchmarks()
 ```
 
-Each cell reports the median of ten independent BenchmarkTools minimum-time
-rounds together with steady-state allocation bytes and counts. Every supported
-cell must agree numerically with the handwritten control before it is timed.
+Each cell reports the minimum of ten independent BenchmarkTools minimum-time
+rounds — the uncontended-cost estimator; medians and every raw round stay in
+the receipt — together with steady-state allocation bytes and counts. Every
+supported cell must agree numerically with the handwritten control before it
+is timed.
+
+### Baseline implementations
+
+```@eval
+Main.ReactiveKernelsDocs.render_mnist_logistic_baselines()
+```
 
 Reproduce the pinned receipt from a clean detached checkout (this loads the full
 MNIST training split via MLDatasets):
