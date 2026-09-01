@@ -362,6 +362,26 @@ for the active argument's gradient and is mutated in place. Like
 [`ad_gradient`](@ref), this prepared object and its DI preparation are not
 thread-safe; use one per concurrent caller.
 """
+@generated function ad_value_and_gradient!(
+        prepared::PreparedADKernel{I,K,typeof(tuple)}, gradient,
+        args::Vararg{Any,N}) where {I,K,N}
+    1 <= I <= N || return :(throw(ArgumentError(
+        "prepared active input index $I is invalid for $N arguments")))
+    contexts = [
+        :(DifferentiationInterface.Constant(getfield(args, $index)))
+        for index in 1:N if index != I
+    ]
+    quote
+        length(inputs(prepared.kernel)) == $N || throw(ArgumentError(
+            "selected HAVE boundary expects " *
+            string(length(inputs(prepared.kernel))) *
+            " values; got $N"))
+        DifferentiationInterface.value_and_gradient!(
+            prepared.call, gradient, prepared.preparation, prepared.backend,
+            getfield(args, $I), $(contexts...))
+    end
+end
+
 function ad_value_and_gradient!(
         prepared::PreparedADKernel, gradient, args...; kwargs...)
     point, contexts = _ad_prepared_arguments(
