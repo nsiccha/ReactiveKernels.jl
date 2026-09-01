@@ -31,13 +31,15 @@ sampler vector is simply `[vec(W); b]`.
 
 The coefficient prior reuses the shared
 [`normal`](distributions.md) object over the flattened coefficient vector, and
-the per-observation likelihood reuses a `categorical_logit` object — a softmax
-categorical over a logits vector — exactly as Eight Schools reuses `normal` per
-observation. The `categorical_logit` object is authored the same transparent
-way as every other distribution kernel (its normalizer is a numerically stable
-log-sum-exp that lives inside the object, not in the model). The model source
-therefore contains only the linear predictor, the reference row, and calls into
-those two objects; there is no hand-written Normal or softmax formula.
+the likelihood reuses a batched `categorical_logit_columns` kernel — one
+softmax categorical per logits column — exactly as Eight Schools reuses
+`normal` per observation. The kernel has two explicitly equivalent recipe
+bodies: native Julia and the nonallocating pass consume the authored scalar
+distribution-object plate, while array compilers consume a direct gather and
+reduction. The numerically stable log-sum-exp normalizer remains in the
+distribution kernel, not in the model. The model source therefore contains
+only the linear predictor, reference coding, and calls into reusable kernels;
+there is no hand-written Normal or softmax formula in the model.
 
 The panel below shows the **Raw input** (the source), the readable **Generated
 kernel** derived from the executed kernel and selected plan, and the **Compute
@@ -62,18 +64,53 @@ likelihood — the dense `W x` linear predictor never runs:
 prior = prepare(model; have = :unconstrained, want = :prior)(unconstrained)
 ```
 
+## Optimized variant (vcat-free)
+
+The idiomatic model above materializes the padded `[0; logits]` matrix on
+every evaluation — exactly like the idiomatic Turing baseline. The optimized
+variant lands **alongside** it rather than replacing the idiomatic comparison:
+the reference class moves inside the reference-coded
+`categorical_logit_ref_columns` distribution kernel (it treats class
+1 as an implicit zero-logit reference with a stable
+`logaddexp(0, logsumexp(·))` normalizer), so the likelihood runs directly over
+the `(C-1) × N` nonreference-logits matrix and the padded matrix is never
+built. The two graphs agree to machine
+precision on every boundary and outcome.
+
+```@eval
+Main.ReactiveKernelsDocs.execute_ppl_example(
+    @__MODULE__, :MNISTLogisticExample, :MNIST_LOGISTIC_OPTIMIZED_SOURCE;
+    setup = Main.ReactiveKernelsDocs.setup_mnist_logistic!,
+)
+```
+
 ## Primal capability and log-density performance
 
-The benchmark below prepares the authored graph from two starting boundaries —
+The complete suite uses the same ten RK configurations as Eight Schools:
+ordinary native primal, nonallocating native primal, Reactant primal, native
+value-and-gradient, and Reactant value-and-gradient, each with data unbound or
+fixed during preparation. Fixed `X`, `y`, and `num_classes` are the public
+partial-evaluation variant. With two model sources, the sampler headline is a
+20-cell matrix from the packed coefficient vector to the full joint; every one
+must be supported. Nonallocating AD and nonallocating Reactant remain explicit
+API exclusions until those public kernel types compose.
+
+The benchmark below prepares the authored graphs from two starting boundaries —
 `Packed unconstrained` (a sampler's flattened `[vec(W); b]` vector) and
-`Structured (W, b)` — and asks for four model outcomes. The RK cells are
-HAVE/WANT cuts of one graph. The manual cells are a direct handwritten Julia
-control. Turing uses its native public interfaces: a fixed-transform
-`LogDensityFunction` for packed parameters and `logjoint` / `logprior` /
-`loglikelihood` for structured parameters. The model's likelihood is a single
-`@addlogprob!` term, so Turing has no public per-observation pointwise view;
-that cell stays blank rather than inventing an equivalent. Data loading, graph
-preparation, and transform discovery are outside the timed region.
+`Structured (W, b)` — and asks for four model outcomes. The long-form primal
+receipt includes ordinary and nonallocating RK, both unbound and partially
+evaluated, for both model sources. `prepare_nonallocating` runs those same
+graphs through the optional MutatingFunctions destination-passing pass with
+caches seeded before timing. The manual cells are a direct handwritten Julia
+control. `Turing idiomatic` uses Turing's public
+interfaces on the idiomatic model — a fixed-transform `LogDensityFunction`
+for packed parameters and `logjoint` / `logprior` / `loglikelihood` for
+structured parameters — and `Turing optimized` uses the same interfaces on
+the heavier-optimized model shown under Baseline implementations below. Both
+Turing likelihoods are single `@addlogprob!` terms, so Turing has no public
+per-observation pointwise view; those cells stay blank rather than inventing
+an equivalent. Data loading, graph preparation, and transform discovery are
+outside the timed region.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_mnist_logistic_benchmarks()
@@ -96,7 +133,7 @@ MNIST training split via MLDatasets):
 
 ```sh
 julia --startup-file=no benchmark/mnist_logistic_comparison.jl \
-  --output=benchmark/receipts/mnist-logistic-v1.toml
+  --output=benchmark/receipts/mnist-logistic-primal-v3.toml
 julia --startup-file=no benchmark/receipts/validate_mnist_logistic.jl \
-  benchmark/receipts/mnist-logistic-v1.toml
+  benchmark/receipts/mnist-logistic-primal-v3.toml
 ```

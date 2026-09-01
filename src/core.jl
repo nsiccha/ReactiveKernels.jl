@@ -92,6 +92,18 @@ struct _KernelSourceOp{DefToken,Form,F,TF}
     f::F
     tensor_f::TF
 end
+
+# A compiler-owned recipe whose native implementation is an authored plate and
+# whose tensorized implementation is an explicitly equivalent array formula.
+# This is used when the plate is the allocation-friendly Julia form but an
+# array compiler needs a direct gather/reduction form. The tracing-style fold
+# below selects one body before either is evaluated.
+struct _KernelTensorizedOp{N,OP,TF,A}
+    native::N
+    native_arity::Val{OP}
+    tensor_f::TF
+    tensorized_ast::A
+end
 _KernelSourceOp(::Val{DefToken}, ::Val{Form}, f::F, tensor_f::TF) where
         {DefToken,Form,F,TF} =
     _KernelSourceOp{DefToken,Form,F,TF}(f, tensor_f)
@@ -122,17 +134,23 @@ end
     _kernel_source_call(_kernel_source_style(args), op, args)
 kernel_sourceop_token(::_KernelSourceOp{DefToken}) where {DefToken} = DefToken
 kernel_sourceop_form(::_KernelSourceOp{DefToken,Form}) where {DefToken,Form} = Form
+@inline _kernel_source_call(::Val{:native}, op::_KernelTensorizedOp{N,OP}, args) where {N,OP} =
+    op.native(ntuple(index -> args[index], Val(OP))...)
+@inline _kernel_source_call(::Val{:tensorized}, op::_KernelTensorizedOp, args) =
+    op.tensor_f(args...)
+@inline (op::_KernelTensorizedOp)(args...) =
+    _kernel_source_call(_kernel_source_style(args), op, args)
+_kernel_tensorized_native_arity(::_KernelTensorizedOp{N,OP}) where {N,OP} = OP
 
-# `vcat`/`hcat`/`cat` inside a tensorized fused body may mix untraced constant
-# arrays (e.g. a `zeros(1, n)` reference row built inside the body) with traced
-# operands.  Base's generic `_typed_vcat` handles that mix by allocating a host
-# `Array{<:TracedRNumber}` and copying elementwise — forbidden scalar indexing
-# on a traced array — so the tensorized body routes cat-family calls through
-# these wrappers.  A tracing extension specializes `_tensorized_cat_operand` to
-# promote untraced array operands against the discovered traced marker, keeping
-# the concatenation inside the backend's native lowering; without a traced
-# operand the wrappers reduce to the plain Base calls.
+# Tensorized fused bodies may mix untraced constant arrays with traced operands.
+# Base's generic concatenation and broadcast paths can then allocate host
+# containers of traced scalars and copy elementwise — forbidden scalar indexing
+# on a traced array — so the tensorized body routes both families through these
+# wrappers.  A tracing extension specializes `_tensorized_cat_operand` to
+# promote untraced array operands against the discovered traced marker; without
+# a traced operand the wrappers reduce to the plain Base operations.
 @inline _tensorized_cat_operand(marker, arg) = arg
+@inline _tensorized_getindex(array, indices...) = getindex(array, indices...)
 @inline _tensorized_cat_marker(::Tuple{}) = nothing
 @inline _tensorized_cat_marker(args::Tuple) = _tensorized_cat_arg_marker(
     _kernel_source_arg_style(first(args)), first(args), Base.tail(args))
@@ -148,6 +166,16 @@ end
 @inline _tensorized_hcat(args...) = hcat(_tensorized_cat_operands(args)...)
 @inline _tensorized_cat(args...; dims) =
     cat(_tensorized_cat_operands(args)...; dims = dims)
+@inline _tensorized_broadcast(f, args...) =
+    broadcast(f, _tensorized_cat_operands(args)...)
+
+# Authoring-only marker for a fused recipe with deliberately different native
+# and tensorized expressions. `@kernel` consumes this call before runtime and
+# stores the native expression as the recipe source (so nonallocating
+# decomposition still sees it). Reaching this fallback means the marker was
+# used outside supported authoring syntax.
+_kernel_tensorized_pair(native, tensorized) = throw(ArgumentError(
+    "_kernel_tensorized_pair is valid only as a complete @kernel recipe RHS"))
 
 # Tensorized authored plates keep slice collections structural instead of
 # materializing Base.Slices.  A backend can consume the parent array as one

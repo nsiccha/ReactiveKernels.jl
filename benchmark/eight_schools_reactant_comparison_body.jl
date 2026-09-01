@@ -12,11 +12,11 @@ using ReactiveKernelsPPLExamples.EightSchoolsExample:
     EIGHT_SCHOOLS_SOURCE, EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA,
     build_eight_schools_graph
 
+include(joinpath(@__DIR__, "eight_schools_matrix_spec.jl"))
+using .EightSchoolsMatrixSpec
+
 const DEFAULT_EIGHT_SCHOOLS_REACTANT_ROUNDS = 20
 const DEFAULT_EIGHT_SCHOOLS_REACTANT_TARGET_SECONDS = 0.02
-const EIGHT_SCHOOLS_BOUNDARIES = (
-    "packed_unconstrained", "constrained_parameters", "minimal_likelihood")
-const EIGHT_SCHOOLS_OUTCOMES = ("joint", "prior", "likelihood", "pointwise")
 
 _git(repo, args...) = readchomp(Cmd(["git", "-C", repo, string.(args)...]))
 _eight_schools_reactant_generator_sha256(path) = bytes2hex(sha256(
@@ -90,111 +90,50 @@ function _diagnostic(err)
     length(line) <= 800 ? line : first(line, 797) * "..."
 end
 
-function _definitions(model, unconstrained, parameters, theta,
-                      observations, observation_scales)
-    packed = (
-        joint = prepare(model;
-            have = (:unconstrained, :observations, :observation_scales),
-            want = :posterior),
-        prior = prepare(model;
-            have = :unconstrained, want = :unconstrained_prior),
-        likelihood = prepare(model;
-            have = (:unconstrained, :observations, :observation_scales),
-            want = :likelihood),
-        pointwise = prepare(model;
-            have = (:unconstrained, :observations, :observation_scales),
-            want = :pointwise),
-    )
-    constrained = (
-        joint = prepare(model;
-            have = (:parameters, :observations, :observation_scales),
-            want = :constrained_logdensity),
-        prior = prepare(model;
-            have = :parameters, want = :prior),
-        likelihood = prepare(model;
-            have = (:parameters, :observations, :observation_scales),
-            want = :likelihood),
-        pointwise = prepare(model;
-            have = (:parameters, :observations, :observation_scales),
-            want = :pointwise),
-    )
-    minimal = (
-        likelihood = prepare(model;
-            have = (:θ, :observations, :observation_scales),
-            want = :likelihood),
-        pointwise = prepare(model;
-            have = (:θ, :observations, :observation_scales),
-            want = :pointwise),
-    )
-    (
-        (boundary = "packed_unconstrained", outcome = "joint",
-         description = "full joint including the transform Jacobian",
-         kernel = packed.joint,
-         args = (unconstrained, observations, observation_scales)),
-        (boundary = "packed_unconstrained", outcome = "prior",
-         description = "log prior including the transform Jacobian",
-         kernel = packed.prior, args = (unconstrained,)),
-        (boundary = "packed_unconstrained", outcome = "likelihood",
-         description = "summed log likelihood after unpacking the latent vector",
-         kernel = packed.likelihood,
-         args = (unconstrained, observations, observation_scales)),
-        (boundary = "packed_unconstrained", outcome = "pointwise",
-         description = "eight pointwise log likelihoods after unpacking",
-         kernel = packed.pointwise,
-         args = (unconstrained, observations, observation_scales)),
-        (boundary = "constrained_parameters", outcome = "joint",
-         description = "full joint excluding the transform Jacobian",
-         kernel = constrained.joint,
-         args = (parameters, observations, observation_scales)),
-        (boundary = "constrained_parameters", outcome = "prior",
-         description = "constrained-space log prior",
-         kernel = constrained.prior, args = (parameters,)),
-        (boundary = "constrained_parameters", outcome = "likelihood",
-         description = "summed log likelihood",
-         kernel = constrained.likelihood,
-         args = (parameters, observations, observation_scales)),
-        (boundary = "constrained_parameters", outcome = "pointwise",
-         description = "eight pointwise log likelihoods",
-         kernel = constrained.pointwise,
-         args = (parameters, observations, observation_scales)),
-        (boundary = "minimal_likelihood", outcome = "joint",
-         description = "unsupported without prior parameters",
-         kernel = nothing, args = ()),
-        (boundary = "minimal_likelihood", outcome = "prior",
-         description = "unsupported without prior parameters",
-         kernel = nothing, args = ()),
-        (boundary = "minimal_likelihood", outcome = "likelihood",
-         description = "summed likelihood from θ, observations, and scales only",
-         kernel = minimal.likelihood,
-         args = (theta, observations, observation_scales)),
-        (boundary = "minimal_likelihood", outcome = "pointwise",
-         description = "pointwise likelihoods from θ, observations, and scales only",
-         kernel = minimal.pointwise,
-         args = (theta, observations, observation_scales)),
-    )
+function _rk_definition(model, configuration, boundary, outcome,
+                        unconstrained, parameters, theta,
+                        observations, observation_scales)
+    state, reason = matrix_support(configuration, boundary, outcome)
+    state == "supported" || return (; state, reason, kernel = nothing, args = ())
+    configuration.compiler == "reactant" || return (
+        state = "unsupported", reason = "not a Reactant configuration",
+        kernel = nothing, args = ())
+    data_dependent = outcome != "prior"
+    have, want, active = if boundary == "packed_unconstrained"
+        (data_dependent ?
+            (:unconstrained, :observations, :observation_scales) :
+            (:unconstrained,),
+         outcome == "joint" ? :posterior :
+            outcome == "prior" ? :unconstrained_prior : Symbol(outcome),
+         unconstrained)
+    elseif boundary == "constrained_parameters"
+        (data_dependent ?
+            (:parameters, :observations, :observation_scales) : (:parameters,),
+         outcome == "joint" ? :constrained_logdensity : Symbol(outcome),
+         parameters)
+    else
+        ((:θ, :observations, :observation_scales), Symbol(outcome), theta)
+    end
+    bound = configuration.data == "bound" ?
+        (; observations, observation_scales) : NamedTuple()
+    kernel = prepare(model; have, want, bound)
+    args = configuration.data == "bound" || outcome == "prior" ?
+        (active,) : (active, observations, observation_scales)
+    (; state, reason, kernel, args)
 end
 
-function _assert_primal_matrix(primal_receipt, definitions)
-    get(primal_receipt, "schema", "") == "eight-schools-primal-v1" ||
+function _assert_primal_matrix(primal_receipt)
+    get(primal_receipt, "schema", "") == "eight-schools-primal-v2" ||
         error("unexpected Eight Schools primal receipt schema")
     protocol = primal_receipt["protocol"]
     Tuple(protocol["input_boundaries"]) == EIGHT_SCHOOLS_BOUNDARIES ||
         error("Reactant benchmark input boundaries drifted from the primal receipt")
     Tuple(protocol["outcomes"]) == EIGHT_SCHOOLS_OUTCOMES ||
         error("Reactant benchmark outcomes drifted from the primal receipt")
-    rows = primal_receipt["measurements"]
-    for definition in definitions
-        matches = filter(rows) do row
-            row["boundary"] == definition.boundary &&
-                row["outcome"] == definition.outcome
-        end
-        length(matches) == 1 || error(
-            "primal receipt does not contain exactly one " *
-            "$(definition.boundary) / $(definition.outcome) row")
-        haskey(only(matches), "rk_native") == (definition.kernel !== nothing) ||
-            error("native support drifted for " *
-                  "$(definition.boundary) / $(definition.outcome)")
-    end
+    Set(protocol["rk_configurations"]) == Set((
+        "primal_native", "primal_native_bound",
+        "primal_nonallocating", "primal_nonallocating_bound")) ||
+        error("unexpected Eight Schools primal configuration inventory")
     nothing
 end
 
@@ -214,50 +153,51 @@ function run_comparison()
     unconstrained = [mu, log_tau, theta...]
     parameters = (; μ = mu, τ = tau, θ = theta)
 
-    model = definitions = nothing
-    preparation_seconds = @elapsed begin
-        # This graph is cloned from the template evaluated from
-        # EIGHT_SCHOOLS_SOURCE during package initialization. Re-evaluating the
-        # source here would create newer-world closures inside this function.
-        model = build_eight_schools_graph()
-        definitions = _definitions(
-            model, unconstrained, parameters, theta,
-            observations, observation_scales)
-    end
+    model = nothing
+    preparation_seconds = @elapsed model = build_eight_schools_graph()
+    configurations = filter(
+        configuration -> configuration.differentiation == "primal" &&
+            configuration.compiler == "reactant",
+        EIGHT_SCHOOLS_RK_CONFIGURATIONS,
+    )
 
-    primal_path = joinpath(
-        @__DIR__, "receipts", "eight-schools-primal-v1.toml")
+    primal_path = get(
+        ENV, "RK_EIGHT_SCHOOLS_PRIMAL_RECEIPT",
+        joinpath(@__DIR__, "receipts", "eight-schools-primal-v2.toml"))
+    isabspath(primal_path) || (primal_path = normpath(joinpath(repo, primal_path)))
     isfile(primal_path) || error(
         "the published primal receipt is required: $primal_path")
     primal_receipt = TOML.parsefile(primal_path)
-    _assert_primal_matrix(primal_receipt, definitions)
+    _assert_primal_matrix(primal_receipt)
 
     measurements = Dict{String,Any}[]
-    for definition in definitions
+    for boundary in EIGHT_SCHOOLS_BOUNDARIES, outcome in EIGHT_SCHOOLS_OUTCOMES,
+        configuration in configurations
+        definition = _rk_definition(
+            model, configuration, boundary, outcome, unconstrained,
+            parameters, theta, observations, observation_scales)
         row = Dict{String,Any}(
-            "boundary" => definition.boundary,
-            "outcome" => definition.outcome,
-            "description" => definition.description,
-            "rk_native_supported" => definition.kernel !== nothing,
+            "provider" => "rk", "model" => "centered",
+            "configuration" => configuration.id,
+            "boundary" => boundary, "outcome" => outcome,
+            "state" => definition.state,
         )
-        if definition.kernel === nothing
-            row["rk_native_error"] = definition.description
-            row["rk_reactant_supported"] = false
-            row["rk_reactant_error"] = definition.description
+        if definition.state != "supported"
+            row["reason"] = definition.reason
             push!(measurements, row)
-            println("boundary=$(definition.boundary) outcome=$(definition.outcome) undefined")
+            println("configuration=$(configuration.id) boundary=$boundary " *
+                    "outcome=$outcome state=$(definition.state)")
             continue
         end
 
         native_value = _comparable(
-            definition.outcome, definition.kernel(definition.args...))
-        row["rk_native"] = _measurement(
-            definition.kernel, definition.args...;
-            rounds, target_seconds)
-
+            outcome, definition.kernel(definition.args...))
+        row["native_control"] = _measurement(
+            definition.kernel, definition.args...; rounds, target_seconds)
         traced_args = nothing
-        transfer_seconds = @elapsed traced_args = _trace_args(definition.args)
-        row["reactant_transfer_seconds"] = transfer_seconds
+        row["reactant_transfer_seconds"] = @elapsed begin
+            traced_args = _trace_args(definition.args)
+        end
         compile_started = time_ns()
         try
             compiled = _compile_call(definition.kernel, traced_args)
@@ -267,33 +207,31 @@ function run_comparison()
             row["reactant_first_execution_seconds"] = @elapsed begin
                 compiled_value = compiled(traced_args...)
             end
-            comparable = _comparable(definition.outcome, compiled_value)
+            comparable = _comparable(outcome, compiled_value)
             isapprox(comparable, native_value; rtol = 1e-11, atol = 1e-12) ||
                 error("native/Reactant value parity failed")
             row["max_abs_error"] = comparable isa Number ?
                 abs(comparable - native_value) :
                 maximum(abs.(comparable .- native_value))
-            row["rk_reactant"] = _measurement(
+            row["result"] = _measurement(
                 compiled, traced_args...; rounds, target_seconds)
-            row["rk_reactant_supported"] = true
         catch err
+            row["state"] = "unsupported_runtime"
+            row["reason"] = _diagnostic(err)
             row["reactant_compile_seconds"] = get(
                 row, "reactant_compile_seconds",
                 Float64(time_ns() - compile_started) / 1e9)
-            row["rk_reactant_supported"] = false
-            row["rk_reactant_error"] = _diagnostic(err)
         end
         push!(measurements, row)
-        reactant_supported = row["rk_reactant_supported"]
-        println("boundary=$(definition.boundary) outcome=$(definition.outcome) " *
-                "reactant=$reactant_supported")
+        println("configuration=$(configuration.id) boundary=$boundary " *
+                "outcome=$outcome state=$(row["state"])")
     end
 
     source_path = joinpath(
         "packages", "ReactiveKernelsPPLExamples", "src", "eight_schools.jl")
     candidate_sha = get(ENV, "REACTIVEKERNELS_CANDIDATE_SHA", "unknown")
     receipt = Dict{String,Any}(
-        "schema" => "eight-schools-reactant-v1",
+        "schema" => "eight-schools-reactant-v2",
         "generated_at" => string(now(UTC), "Z"),
         "pins" => Dict(
             "reactivekernels_sha" => candidate_sha,
@@ -333,9 +271,14 @@ function run_comparison()
             "model" => "centered Eight Schools",
             "source_reused" => true,
             "matrix_source" =>
-                "benchmark/receipts/eight-schools-primal-v1.toml",
+                "benchmark/receipts/eight-schools-primal-v2.toml",
             "input_boundaries" => collect(EIGHT_SCHOOLS_BOUNDARIES),
             "outcomes" => collect(EIGHT_SCHOOLS_OUTCOMES),
+            "models" => collect(EIGHT_SCHOOLS_MODELS),
+            "matrix_layout" =>
+                "long-form provider/model/configuration/boundary/outcome rows",
+            "rk_configurations" => [configuration.id for configuration in configurations],
+            "bound_ports" => ["observations", "observation_scales"],
             "rounds" => rounds,
             "target_seconds_per_round" => target_seconds,
             "estimator" => "median per-call time from calibrated elapsed batches",
@@ -367,4 +310,5 @@ function run_comparison()
     receipt
 end
 
-run_comparison()
+get(ENV, "RK_EIGHT_SCHOOLS_REACTANT_DEFINITIONS_ONLY", "") == "1" ||
+    run_comparison()

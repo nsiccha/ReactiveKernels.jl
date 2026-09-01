@@ -648,6 +648,11 @@ _reactant_compile_ad(::Val, ::PreparedADKernel, marker, args...; kwargs...) =
         "and a Reactant-traced active argument (e.g. `Reactant.to_rarray(active)`); " *
         "the active argument is a $(typeof(marker))"))
 
+# Internal extension point used when a partially-evaluated kernel owns large
+# bound arrays. The Reactant extension compiles the same DI operation after
+# those arrays have been transferred explicitly as hidden compiler operands.
+function _reactant_compile_ad_externalized end
+
 """
     compile_ad_gradient(prepared::PreparedADKernel, traced_args...; sync = true)
 

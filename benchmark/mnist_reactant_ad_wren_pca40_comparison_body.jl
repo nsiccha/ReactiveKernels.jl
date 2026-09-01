@@ -1,8 +1,9 @@
-# Inner body for the pinned MNIST native-RK-AD / Reactant-compiled-AD
-# comparison. This is the AD analog of mnist_reactant_comparison_body.jl
+# Frozen v1 inner body for the separately identified Wren-compatible PCA-40
+# MNIST native-RK-AD / Reactant-compiled-AD
+# comparison. This is the AD analog of the frozen PCA-40 primal body
 # (primal): it reuses the exact authored model source and the SAME derivative
 # outcome/boundary protocol published by the AD-only receipt
-# (benchmark/receipts/mnist-logistic-ad-v2.toml). It never copies a prior,
+# (benchmark/receipts/mnist-logistic-ad-v1.toml). It never copies a prior,
 # likelihood, or AD evaluator: it selects RK graph boundaries with
 # `prepare`/`prepare_ad` and consumes the first-class RK verbs
 # `ad_value_and_gradient!` (native) and `compile_ad_value_and_gradient`
@@ -20,12 +21,10 @@ import Enzyme
 using DifferentiationInterface: AutoEnzyme
 using ReactiveKernels
 using ReactiveKernelsPPLExamples.MNISTLogisticExample:
-    MNIST_LOGISTIC_SOURCE, MNIST_LOGISTIC_OPTIMIZED_SOURCE, NUM_CLASSES,
-    build_mnist_logistic_graph, build_mnist_logistic_optimized_graph
+    MNIST_LOGISTIC_SOURCE, NUM_CLASSES, build_mnist_logistic_graph
 import MLDatasets
 
-include(joinpath(@__DIR__, "mnist_logistic_matrix_spec.jl"))
-using .MNISTLogisticMatrixSpec
+include(joinpath(@__DIR__, "_mnist_dataset_profiles.jl"))
 
 const DEFAULT_MNIST_REACTANT_AD_ROUNDS = 10
 # The published receipt fits the full MNIST training split; RK_MNIST_REACTANT_AD_N
@@ -34,12 +33,17 @@ const DEFAULT_MNIST_REACTANT_AD_N = 60000
 const MNIST_REACTANT_AD_BOUNDARIES =
     ("packed_unconstrained", "structured_parameters")
 const MNIST_REACTANT_AD_OUTCOMES = ("joint", "prior", "likelihood", "pointwise")
-# Native and Reactant AD consume the same declared matrix contract. Compilation
-# is still attempted rather than assumed; any runtime failure remains a receipt
-# row and makes the strict suite validator fail.
+# The differentiable scalar cells published by mnist-logistic-ad-v1 (native RK
+# AD support). Reactant-compiled AD is a subset of these: it additionally needs
+# the primal kernel to compile through Reactant, which is discovered by
+# attempting the compile, never hard-coded.
+const MNIST_REACTANT_AD_SCALAR_SUPPORTED = Set((
+    ("packed_unconstrained", "joint"),
+    ("packed_unconstrained", "prior"),
+    ("packed_unconstrained", "likelihood"),
+))
+
 const AD_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
-const BOUND_AD_BACKEND = AutoEnzyme(
-    ; mode = Enzyme.Reverse, function_annotation = Enzyme.Const)
 
 _git(repo, args...) = readchomp(Cmd(["git", "-C", repo, string.(args)...]))
 _mnist_reactant_ad_generator_sha256(path) = bytes2hex(sha256(
@@ -61,8 +65,8 @@ end
 
 _rounds() = parse(Int, get(
     ENV, "RK_MNIST_REACTANT_AD_ROUNDS", string(DEFAULT_MNIST_REACTANT_AD_ROUNDS)))
-_observations() = parse(Int, get(
-    ENV, "RK_MNIST_REACTANT_AD_N", string(DEFAULT_MNIST_REACTANT_AD_N)))
+_observations(profile) = parse(Int, get(
+    ENV, "RK_MNIST_REACTANT_AD_N", string(_mnist_default_observations(profile))))
 
 # Same headline estimator as the matched native-AD receipt: the minimum of
 # per-round BenchmarkTools minimums (uncontended cost; medians retained).
@@ -95,96 +99,78 @@ function _diagnostic(err)
     length(line) <= 800 ? line : first(line, 797) * "..."
 end
 
-function _load_mnist(n)
-    ENV["DATADEPS_ALWAYS_ACCEPT"] = "true"
-    train = MLDatasets.MNIST(split = :train)
-    total = size(train.features, 3)
-    n <= total || error("requested $n MNIST images but only $total are available")
-    pixels = reshape(train.features[:, :, 1:n], 28 * 28, n)   # 784×n Float32 in [0,1]
-    X = Matrix{Float64}(transpose(pixels))                    # n×784
-    y = Int.(train.targets[1:n]) .+ 1                         # one-based classes
-    X, y
-end
-
-# One Reactant-AD definition over either public graph and either data-binding
-# mode. Unsupported/N-A cells remain rows with reasons.
-function _ad_definition(model, configuration, boundary, outcome,
-                        unconstrained, X, y)
-    state, reason = matrix_support(configuration, boundary, outcome)
-    descriptions = Dict(
-        "joint" => "gradient of the full joint w.r.t. the packed coefficient vector",
-        "prior" => "gradient of the standard-normal coefficient log prior",
-        "likelihood" => "gradient of the summed softmax categorical log likelihood",
-        "pointwise" => "pointwise Jacobian/VJP",
-    )
-    state == "supported" || return (;
-        state, reason, description = descriptions[outcome],
-            kernel = nothing, spec = nothing, want = nothing,
-            bound = NamedTuple(), args = (), active = :unconstrained,
-            data_binding = configuration.data,
-    )
-    want = outcome == "joint" ? :density : Symbol(outcome)
-    if configuration.data == "bound"
-        kernel = prepare(
-            model; have = (:unconstrained, :X, :y, :num_classes),
-            want, bound = (; X, y, num_classes = NUM_CLASSES))
-        return (;
-            state, reason, description = descriptions[outcome],
-            kernel, spec = nothing, want, bound = NamedTuple(),
-            args = (unconstrained,), active = :unconstrained,
-            data_binding = configuration.data,
-        )
+# The differentiable-scalar cell definitions, selecting RK graph boundaries
+# exactly as the published mnist-logistic-ad-v1 receipt does; `nothing` marks a
+# non-differentiable-scalar cell (vector pointwise, or the structured boundary
+# whose two active ports have no public multi-active AD contract).
+function _ad_definition(model, boundary, outcome, unconstrained, X, y)
+    boundary == "packed_unconstrained" || return nothing
+    if outcome == "joint"
+        return (kernel = prepare(model;
+                    have = (:unconstrained, :X, :y, :num_classes),
+                    want = :density),
+                args = (unconstrained, X, y, NUM_CLASSES),
+                active = :unconstrained,
+                description = "gradient of the full joint w.r.t. the packed coefficient vector")
+    elseif outcome == "prior"
+        return (kernel = prepare(model; have = :unconstrained, want = :prior),
+                args = (unconstrained,), active = :unconstrained,
+                description = "gradient of the standard-normal coefficient log prior")
+    elseif outcome == "likelihood"
+        return (kernel = prepare(model;
+                    have = (:unconstrained, :X, :y, :num_classes),
+                    want = :likelihood),
+                args = (unconstrained, X, y, NUM_CLASSES),
+                active = :unconstrained,
+                description = "gradient of the summed softmax categorical log likelihood")
     end
-    kernel = outcome == "prior" ?
-        prepare(model; have = :unconstrained, want) :
-        prepare(model; have = (:unconstrained, :X, :y, :num_classes), want)
-    args = outcome == "prior" ? (unconstrained,) :
-        (unconstrained, X, y, NUM_CLASSES)
-    (; state, reason, description = descriptions[outcome], kernel,
-       spec = nothing, want, bound = NamedTuple(), args,
-       active = :unconstrained, data_binding = configuration.data)
+    nothing
 end
 
-function _prepare_ad_definition(definition)
-    backend = definition.data_binding == "bound" ?
-        BOUND_AD_BACKEND : AD_BACKEND
-    prepare_ad(
-        definition.kernel, backend, definition.args...;
-        active = definition.active)
+# Unsupported-cell diagnostics, mirroring mnist-logistic-ad-v1's reasons.
+function _unsupported_reason(boundary, outcome)
+    outcome == "pointwise" && return (
+        "pointwise is vector-valued; no matched public Jacobian/VJP contract, " *
+        "so it stays unsupported rather than inventing a fused case")
+    boundary == "structured_parameters" && return (
+        "the structured (W, b) boundary has two active ports; no public " *
+        "multi-active AD contract is invented for it")
+    "unsupported matrix cell"
 end
 
-function _assert_ad_matrix(ad_receipt, model, configuration,
-                           boundary, outcome, expected_state)
-    get(ad_receipt, "schema", "") == "mnist-logistic-ad-v2" ||
+function _assert_ad_matrix(ad_receipt)
+    get(ad_receipt, "schema", "") == "mnist-logistic-ad-v1" ||
         error("unexpected MNIST AD receipt schema")
     protocol = ad_receipt["protocol"]
     Tuple(protocol["input_boundaries"]) == MNIST_REACTANT_AD_BOUNDARIES ||
         error("Reactant AD benchmark boundaries drifted from the AD receipt")
     Tuple(protocol["outcomes"]) == MNIST_REACTANT_AD_OUTCOMES ||
         error("Reactant AD benchmark outcomes drifted from the AD receipt")
-    native_configuration = configuration.data == "bound" ?
-        "ad_native_bound" : "ad_native"
-    matches = filter(ad_receipt["measurements"]) do row
-        row["provider"] == "rk" && row["model"] == model &&
-            row["configuration"] == native_configuration &&
-            row["boundary"] == boundary && row["outcome"] == outcome
+    # The AD receipt's supported scalar inventory must equal ours, so this
+    # benchmark differentiates exactly the cells the AD receipt does.
+    supported = Set{Tuple{String,String}}()
+    for row in ad_receipt["measurements"]
+        get(row, "supported", false) &&
+            push!(supported, (row["boundary"], row["outcome"]))
     end
-    length(matches) == 1 || error(
-        "AD receipt does not contain exactly one $model / " *
-        "$native_configuration / $boundary / $outcome row")
-    get(only(matches), "state", "") == expected_state || error(
-        "native AD support drifted for $model / $native_configuration / " *
-        "$boundary / $outcome")
+    supported == MNIST_REACTANT_AD_SCALAR_SUPPORTED || error(
+        "AD receipt supported inventory drifted from this benchmark's cells")
     nothing
 end
 
 function run_comparison()
     repo = normpath(joinpath(@__DIR__, ".."))
     rounds = _rounds()
-    n = _observations()
+    dataset_profile = _mnist_dataset_profile()
+    n = _observations(dataset_profile)
     rounds >= 1 || error("round count must be positive")
 
-    data_load_seconds = @elapsed ((X, y) = _load_mnist(n))
+    dataset_metadata = nothing
+    data_load_seconds = @elapsed begin
+        X, y, dataset_metadata = _load_mnist_dataset(
+            dataset_profile, n; wren_reference = _mnist_wren_reference_path())
+        GC.gc()
+    end
     features = size(X, 2)
     nonreference = NUM_CLASSES - 1
 
@@ -194,56 +180,39 @@ function run_comparison()
     b = 0.01 .* randn(nonreference)
     unconstrained = vcat(vec(W), b)
 
-    rk_models = nothing
-    preparation_seconds = @elapsed rk_models = (
-        (name = "idiomatic", graph = build_mnist_logistic_graph()),
-        (name = "vcat_free", graph = build_mnist_logistic_optimized_graph()),
-    )
-    reactant_ad_configurations = filter(
-        configuration -> configuration.differentiation == "value_and_gradient" &&
-            configuration.compiler == "reactant",
-        MNIST_RK_CONFIGURATIONS,
-    )
+    model = nothing
+    preparation_seconds = @elapsed model = build_mnist_logistic_graph()
 
-    ad_receipt_path =
-        joinpath("benchmark", "receipts", "mnist-logistic-ad-v2.toml")
-    ad_path = get(
-        ENV, "RK_MNIST_AD_RECEIPT",
-        joinpath(repo, ad_receipt_path))
+    ad_path = joinpath(@__DIR__, "receipts", "mnist-logistic-ad-v1.toml")
     isfile(ad_path) || error("the published AD receipt is required: $ad_path")
     ad_receipt = TOML.parsefile(ad_path)
+    _assert_ad_matrix(ad_receipt)
 
     measurements = Dict{String,Any}[]
-    for model_definition in rk_models,
-        configuration in reactant_ad_configurations,
-        boundary in MNIST_REACTANT_AD_BOUNDARIES,
+    for boundary in MNIST_REACTANT_AD_BOUNDARIES,
         outcome in MNIST_REACTANT_AD_OUTCOMES
-        definition = _ad_definition(
-            model_definition.graph, configuration, boundary, outcome,
-            unconstrained, X, y)
-        _assert_ad_matrix(
-            ad_receipt, model_definition.name, configuration,
-            boundary, outcome, definition.state)
-        row = Dict{String,Any}(
-            "provider" => "rk", "model" => model_definition.name,
-            "configuration" => configuration.id,
-            "boundary" => boundary, "outcome" => outcome,
-            "description" => definition.description,
-            "state" => definition.state,
-        )
-        if definition.state != "supported"
-            row["reason"] = definition.reason
+        row = Dict{String,Any}("boundary" => boundary, "outcome" => outcome)
+        definition = _ad_definition(model, boundary, outcome, unconstrained, X, y)
+        if definition === nothing
+            row["description"] = _unsupported_reason(boundary, outcome)
+            row["rk_native_ad_supported"] = false
+            row["rk_native_ad_error"] = _unsupported_reason(boundary, outcome)
+            row["rk_reactant_ad_supported"] = false
+            row["rk_reactant_ad_error"] = _unsupported_reason(boundary, outcome)
             push!(measurements, row)
-            println("model=$(model_definition.name) configuration=$(configuration.id) " *
-                    "boundary=$boundary outcome=$outcome state=$(definition.state)")
+            println("boundary=$boundary outcome=$outcome unsupported")
             continue
         end
 
+        row["description"] = definition.description
         row["active_port"] = String(definition.active)
+        row["rk_native_ad_supported"] = true
 
         # Native RK AD reference (prepare_ad + ad_value_and_gradient!). The
         # preparation is outside steady-state timing.
-        prepare_seconds = @elapsed prepared = _prepare_ad_definition(definition)
+        prepare_seconds = @elapsed prepared = prepare_ad(
+            definition.kernel, AD_BACKEND, definition.args...;
+            active = definition.active)
         row["ad_preparation_seconds"] = prepare_seconds
         native_gradient = similar(definition.args[1])
         native_value, native_gradient = ad_value_and_gradient!(
@@ -253,31 +222,16 @@ function run_comparison()
                           args = definition.args
             () -> ad_value_and_gradient!(prepared, native_gradient, args...)
         end
-        row["native_control"] = _measurement(native_call; rounds)
+        row["rk_native_ad"] = _measurement(native_call; rounds)
 
         # Reactant-compiled AD (compile_ad_value_and_gradient). Tracing, compile,
         # and first execution are all timed separately, outside steady state.
-        # For bound data, array-valued partial-evaluation constants become
-        # hidden inactive device operands rather than dataset-sized compiler
-        # literals. The public/native prepared kernel remains q-only.
-        _, bound_arrays = definition.data_binding == "bound" ?
-            ReactiveKernels._externalize_bound_arrays(definition.kernel) :
-            (definition.kernel, ())
-        row["reactant_externalized_bound_array_count"] = length(bound_arrays)
-        compiler_args = (definition.args..., bound_arrays...)
         traced = nothing
-        transfer_seconds = @elapsed traced = _trace_args(compiler_args)
+        transfer_seconds = @elapsed traced = _trace_args(definition.args)
         row["reactant_transfer_seconds"] = transfer_seconds
         compile_started = time_ns()
         try
-            public_count = length(definition.args)
-            public_traced = traced[1:public_count]
-            bound_traced = traced[(public_count + 1):end]
-            compiled = isempty(bound_arrays) ?
-                compile_ad_value_and_gradient(prepared, public_traced...) :
-                ReactiveKernels._reactant_compile_ad_externalized(
-                    Val(:value_and_gradient), prepared,
-                    public_traced, bound_traced; sync = true)
+            compiled = compile_ad_value_and_gradient(prepared, traced...)
             row["reactant_ad_compile_seconds"] =
                 Float64(time_ns() - compile_started) / 1e9
             compiled_value = compiled_gradient = nothing
@@ -301,24 +255,25 @@ function run_comparison()
             reactant_call = let compiled = compiled, traced = traced
                 () -> compiled(traced...)
             end
-            row["result"] = _measurement(reactant_call; rounds)
+            row["rk_reactant_ad"] = _measurement(reactant_call; rounds)
+            row["rk_reactant_ad_supported"] = true
         catch err
             row["reactant_ad_compile_seconds"] = get(
                 row, "reactant_ad_compile_seconds",
                 Float64(time_ns() - compile_started) / 1e9)
-            row["state"] = "unsupported_runtime"
-            row["reason"] = _diagnostic(err)
+            row["rk_reactant_ad_supported"] = false
+            row["rk_reactant_ad_error"] = _diagnostic(err)
         end
         push!(measurements, row)
-        println("model=$(model_definition.name) configuration=$(configuration.id) " *
-                "boundary=$boundary outcome=$outcome state=$(row["state"])")
+        println("boundary=$boundary outcome=$outcome " *
+                "reactant_ad=$(row["rk_reactant_ad_supported"])")
     end
 
     source_path = joinpath(
         "packages", "ReactiveKernelsPPLExamples", "src", "mnist_logistic.jl")
     candidate_sha = get(ENV, "REACTIVEKERNELS_CANDIDATE_SHA", "unknown")
     receipt = Dict{String,Any}(
-        "schema" => "mnist-reactant-ad-v2",
+        "schema" => "mnist-reactant-ad-v1",
         "generated_at" => string(now(UTC), "Z"),
         "pins" => Dict(
             "reactivekernels_sha" => candidate_sha,
@@ -339,11 +294,8 @@ function run_comparison()
             "source_authority_path" => source_path,
             "source_authority_blob" =>
                 _git(repo, "rev-parse", "$candidate_sha:$source_path"),
-            "idiomatic_source_text_sha256" =>
-                bytes2hex(sha256(MNIST_LOGISTIC_SOURCE)),
-            "vcat_free_source_text_sha256" =>
-                bytes2hex(sha256(MNIST_LOGISTIC_OPTIMIZED_SOURCE)),
-            "ad_receipt_path" => ad_receipt_path,
+            "source_text_sha256" => bytes2hex(sha256(MNIST_LOGISTIC_SOURCE)),
+            "ad_receipt_path" => "benchmark/receipts/mnist-logistic-ad-v1.toml",
             "ad_receipt_sha256" => _mnist_reactant_ad_generator_sha256(ad_path),
             "ad_receipt_reactivekernels_sha" =>
                 ad_receipt["pins"]["reactivekernels_sha"],
@@ -363,30 +315,22 @@ function run_comparison()
             "data_load_seconds" => data_load_seconds,
             "kernel_preparation_seconds" => preparation_seconds,
         ),
-        "protocol" => Dict(
+        "protocol" => merge(Dict(
             "model" => "multinomial-logistic MNIST classifier",
-            "data" => "MLDatasets MNIST train split, first N images",
-            "num_observations" => n,
-            "num_features" => features,
             "num_classes" => NUM_CLASSES,
             "source_reused" => true,
-            "matrix_source" => ad_receipt_path,
+            "matrix_source" => "benchmark/receipts/mnist-logistic-ad-v1.toml",
             "input_boundaries" => collect(MNIST_REACTANT_AD_BOUNDARIES),
             "outcomes" => collect(MNIST_REACTANT_AD_OUTCOMES),
-            "models" => collect(MNIST_MODELS),
-            "matrix_layout" =>
-                "long-form provider/model/configuration/boundary/outcome rows",
-            "rk_configurations" => [
-                configuration.id for configuration in reactant_ad_configurations],
-            "bound_ports" => ["X", "y", "num_classes"],
             "gradient_operation" => "value and gradient",
             "rk_native_ad_surface" => "prepare_ad + ad_value_and_gradient!",
             "rk_reactant_ad_surface" =>
                 "prepare_ad + compile_ad_value_and_gradient",
             "rk_ad_backend" => "AutoEnzyme(mode = Enzyme.Reverse)",
-            "rk_bound_ad_backend" =>
-                "AutoEnzyme(mode = Enzyme.Reverse, function_annotation = Enzyme.Const)",
             "parity_reference" => "native RK reverse pass (ad_value_and_gradient!)",
+            "partial_evaluation_enabled" => false,
+            "runtime_data_ports" => ["X", "y", "num_classes"],
+            "native_and_reactant_use_same_runtime_boundary" => true,
             "rounds" => rounds,
             "samples_per_round" => 200,
             "seconds_per_round" => 0.2,
@@ -399,14 +343,12 @@ function run_comparison()
             "reactant_transfers_in_timed_region" => false,
             "reactant_readback_in_timed_region" => false,
             "first_execution_in_steady_state_region" => false,
-            "bound_array_compiler_abi" =>
-                "public residual AD kernel stays data-bound; array-valued bound constants are inactive trailing device operands for compilation and steady-state calls",
             "unsupported_cells_recorded" => true,
             "pointwise_jacobian_or_vjp_invented" => false,
             "structured_multi_active_boundary_invented" => false,
             "parity_rtol" => 1e-9,
             "parity_atol" => 1e-9,
-        ),
+        ), dataset_metadata),
         "measurements" => measurements,
     )
 
@@ -423,5 +365,4 @@ function run_comparison()
     receipt
 end
 
-get(ENV, "RK_MNIST_REACTANT_AD_DEFINITIONS_ONLY", "") == "1" ||
-    run_comparison()
+run_comparison()

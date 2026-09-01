@@ -6,31 +6,24 @@ Main.ReactiveKernelsDocs.render_result_assets()
 
 This page measures Reactant on the exact executable model documented on the
 [MNIST multinomial-logistic kernel page](mnist-logistic.md). The benchmark
-imports `MNIST_LOGISTIC_SOURCE` and `build_mnist_logistic_graph` from
+imports both MNIST source authorities and graph builders from
 `ReactiveKernelsPPLExamples`; it does not copy the model, rewrite a density, or
 introduce a Reactant-only mathematical path.
 
 The comparison mirrors the complete two-by-four capability matrix in the
-[native primal receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/mnist-logistic-v1.toml):
+[native primal receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/mnist-logistic-primal-v3.toml):
 the packed unconstrained vector and the structured `(W, b)` coefficients as
 input boundaries, and the joint density, prior, summed likelihood, and
 pointwise likelihood as requested outputs, on the full 60000-image MNIST
 training split. Every cell is evaluated natively and attempted through
 Reactant.
 
-`X`, `y`, and `num_classes` remain ordinary runtime inputs for both native and
-Reactant calls. A full-data `bound = (; X, y, num_classes)` probe was rejected
-as the publication protocol: binding makes the 60000×784 feature matrix an XLA
-constant, and a clean probe spent 15 minutes compiling without completing its
-first cell. The separate
-[partial-evaluation receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/partial-evaluation-mnist-v1.toml)
-quantifies the native per-call saving; this page keeps the practical compiled
-boundary and reports its compile cost explicitly.
-
-All eight primal cells now compile. In particular, the packed unconstrained
-full joint is no longer a prior-only proxy: the exact authored likelihood plate
-over `eachcol(logits)` and its independently varying observed-class gathers run
-inside Reactant, with no host fallback or Reactant-only model rewrite.
+All primal outcomes compile for both model sources, both parameter boundaries,
+and both data modes. The native half of each categorical recipe remains the
+allocation-friendly authored scalar-object plate; Reactant receives the
+explicitly equivalent tensor gather/reduction. Bound-data prior rows are N/A
+because their selected graph slice has no data ports. No host fallback or
+Reactant-only model is used.
 
 ## Primal performance and support
 
@@ -38,12 +31,11 @@ inside Reactant, with no host fallback or Reactant-only model rewrite.
 Main.ReactiveKernelsDocs.render_mnist_reactant_benchmark()
 ```
 
-The first table contains steady-state synchronous call time only, reported by
-the same uncontended-cost estimator as the native MNIST receipt (the minimum
-of per-round BenchmarkTools minimums). Host-to-device conversion, kernel
+The table contains steady-state synchronous call time only, reported by the
+same uncontended-cost estimator as the native MNIST receipt (the minimum of
+per-round BenchmarkTools minimums). Host-to-device conversion, kernel
 preparation, Reactant compilation, the first synchronous call, and result
-readback are outside that timing. The second table and setup summary report
-those costs separately, including failed compile attempts.
+readback are outside that timing and remain recorded in the receipt.
 
 The section above times primal densities only. The Reactant-compiled gradient
 column follows below; native AD (RK vs Turing vs manual, no Reactant) lives on
@@ -61,34 +53,32 @@ first-class RK verb `compile_ad_value_and_gradient` (the AD companion of the
 primal `@compile` path) — no gradient is hand-rolled — and reuses the exact
 differentiable outcome/boundary protocol published by the native MNIST AD
 receipt
-([`mnist-logistic-ad-v1`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/mnist-logistic-ad-v1.toml)):
+([`mnist-logistic-ad-v2`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/mnist-logistic-ad-v2.toml)):
 the value and gradient of each scalar output with respect to the packed
 coefficient vector. Non-scalar `pointwise` outputs and the two-active-port
 structured `(W, b)` boundary stay unsupported, exactly as on the AD receipt.
 
-All three scalar cells supported by the native AD receipt now compile through
-Reactant: packed joint, prior, and likelihood value-and-gradient. The full
-joint is the headline comparison; the prior remains visible only as the small
-compiler-overhead control. As with the primal table, AD preparation, host
-transfers, gradient compilation, the first synchronous call, and readback are
-excluded from steady-state timing
-and reported separately.
+The packed joint, prior, and likelihood gradients compile for both model
+sources; packed joint and likelihood also compile with `X`, `y`, and the class
+count fixed during preparation. Pointwise remains vector-valued and the
+structured `(W, b)` boundary has two active ports, so those rows remain explicit
+unsupported cells rather than invented Jacobian/VJP or multi-active APIs.
 
 ## Wren-compatible PCA-40 workload
 
-The additional workload uses the exact data representation in Wren's
-`bench/mnist.csv`, without committing that private file. Starting from the
-same MLDatasets training split, the generator centers all 60000 raw images,
-fits PCA in the 784-pixel space, and projects the first 1000 images onto the
-top 40 components without whitening. The generated labels have zero
-mismatches against Wren, and the generated feature matrix matches the copied
-CSV with maximum absolute error `1.10e-13`. The retained components explain
-78.6108% of full-training-set pixel variance.
+The additional workload preserves the exact data representation used by
+Wren's `bench/mnist.csv` without committing that private file. Starting from
+the same MLDatasets training split, the generator centers all 60000 raw images,
+fits PCA in the 784-pixel space, and projects the first 1000 images onto the top
+40 components without whitening. The publication receipt records zero label
+mismatches against the reference CSV and a maximum feature error of
+`1.10e-13`; the retained components explain 78.6108% of training-set pixel
+variance.
 
-This is a separately identified `1000×40` workload, not a replacement for the
-full `60000×784` results above. The two scales differ by 1176× in feature
-elements, so their absolute timings should not be compared without the
-workload label.
+This separately identified `1000×40` workload is not a replacement for the
+full `60000×784` two-model matrix above. Its retained v1 receipt uses the same
+authored model and runtime-data boundary, while the default generator route
+continues to produce the complete v2 matrix.
 
 ### PCA-40 primal performance
 
@@ -111,9 +101,9 @@ pin and source blob are immutable. From a sibling directory:
 git -C ReactiveKernels.jl worktree add --detach ReactiveKernels-mnist-receipt HEAD
 cd ReactiveKernels-mnist-receipt
 julia --startup-file=no benchmark/mnist_reactant_comparison.jl \
-  --output=benchmark/receipts/mnist-reactant-v1.toml
+  --output=benchmark/receipts/mnist-reactant-v2.toml
 julia --startup-file=no benchmark/receipts/validate_mnist_reactant.jl \
-  benchmark/receipts/mnist-reactant-v1.toml
+  benchmark/receipts/mnist-reactant-v2.toml
 ```
 
 The script provisions a fresh environment with Reactant 0.2.278, develops the
@@ -130,19 +120,17 @@ DifferentiationInterface into the pinned environment:
 
 ```sh
 julia --startup-file=no benchmark/mnist_reactant_ad_comparison.jl \
-  --output=benchmark/receipts/mnist-reactant-ad-v1.toml
+  --output=benchmark/receipts/mnist-reactant-ad-v2.toml
 julia --startup-file=no benchmark/receipts/validate_mnist_reactant_ad.jl \
-  benchmark/receipts/mnist-reactant-ad-v1.toml
+  benchmark/receipts/mnist-reactant-ad-v2.toml
 ```
 
 Its quick-smoke knobs are `RK_MNIST_REACTANT_AD_N` and
 `RK_MNIST_REACTANT_AD_ROUNDS`.
 
-Generate the additional Wren-compatible receipts with the same scripts and
-the explicit dataset selector. Supplying the copied CSV performs the
-publication-time equality check recorded in each receipt; the PCA workload
-itself is reconstructed from MLDatasets rather than read from the private
-file.
+Generate the Wren-compatible receipts through the same wrappers with the
+explicit dataset selector. Supplying the copied CSV performs the
+publication-time equality check; PCA itself is reconstructed from MLDatasets.
 
 ```sh
 julia --startup-file=no benchmark/mnist_reactant_comparison.jl \

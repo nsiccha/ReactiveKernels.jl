@@ -23,6 +23,29 @@ end
 
 steady_bytes(k, args...) = (k(args...); k(args...); @allocated k(args...))
 
+@testset "MNIST optimized graph non-allocating acceptance" begin
+    g = MNIST.build_mnist_logistic_optimized_graph()
+    have = (:unconstrained, :X, :y, :num_classes)
+    fixture = MNIST.mnist_logistic_fixture()
+    fixture_args = (mnist_inputs(8)[1], fixture.X, fixture.y, fixture.num_classes)
+
+    for want in (:density, :likelihood)
+        plain = prepare(g; have, want)
+        kernel = prepare_nonallocating(g; have, want)
+        @test isapprox(kernel(fixture_args...), plain(fixture_args...);
+                       rtol = 1e-12)
+        small = steady_bytes(kernel, fixture_args...)
+        large = steady_bytes(kernel, mnist_inputs(96)...)
+        println("NONALLOCATING_ALLOC_BYTES\tmnist_optimized_$(want)_n8\t", small)
+        println("NONALLOCATING_ALLOC_BYTES\tmnist_optimized_$(want)_n96\t", large)
+        @test small == large
+        @test small <= 512
+    end
+
+    kernel = prepare_nonallocating(g; have, want = :density)
+    @test !any(op -> op isa ReactiveKernels._KernelSourceOp, kernel.ops)
+end
+
 @testset "MNIST graph non-allocating acceptance" begin
     g = MNIST.build_mnist_logistic_graph()
     have = (:unconstrained, :X, :y, :num_classes)

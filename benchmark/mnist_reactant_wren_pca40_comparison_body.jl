@@ -1,4 +1,6 @@
-# Inner body for the pinned MNIST native-RK/Reactant comparison.
+# Frozen v1 inner body for the separately identified Wren-compatible PCA-40
+# MNIST native-RK/Reactant comparison. The default full-data route uses the v2
+# matrix body; this file preserves the published PCA-40 receipt protocol.
 
 using BenchmarkTools
 using Dates
@@ -11,12 +13,10 @@ using Reactant
 using Reactant: @compile
 using ReactiveKernels
 using ReactiveKernelsPPLExamples.MNISTLogisticExample:
-    MNIST_LOGISTIC_SOURCE, MNIST_LOGISTIC_OPTIMIZED_SOURCE, NUM_CLASSES,
-    build_mnist_logistic_graph, build_mnist_logistic_optimized_graph
+    MNIST_LOGISTIC_SOURCE, NUM_CLASSES, build_mnist_logistic_graph
 import MLDatasets
 
-include(joinpath(@__DIR__, "mnist_logistic_matrix_spec.jl"))
-using .MNISTLogisticMatrixSpec
+include(joinpath(@__DIR__, "_mnist_dataset_profiles.jl"))
 
 const DEFAULT_MNIST_REACTANT_ROUNDS = 10
 # The published receipt fits the full MNIST training split; RK_MNIST_REACTANT_N
@@ -45,8 +45,8 @@ end
 
 _rounds() = parse(Int, get(
     ENV, "RK_MNIST_REACTANT_ROUNDS", string(DEFAULT_MNIST_REACTANT_ROUNDS)))
-_observations() = parse(Int, get(
-    ENV, "RK_MNIST_REACTANT_N", string(DEFAULT_MNIST_REACTANT_N)))
+_observations(profile) = parse(Int, get(
+    ENV, "RK_MNIST_REACTANT_N", string(_mnist_default_observations(profile))))
 
 _comparable(outcome, value) = outcome == "pointwise" ?
     collect(Float64, Array(value)) : Float64(value)
@@ -84,8 +84,6 @@ _trace_args(args::Tuple) = map(_trace_value, args)
 _compile_call(kernel, args::Tuple{Any}) = @compile sync = true kernel(args[1])
 _compile_call(kernel, args::Tuple{Any,Any}) =
     @compile sync = true kernel(args[1], args[2])
-_compile_call(kernel, args::NTuple{3,Any}) =
-    @compile sync = true kernel(args[1], args[2], args[3])
 _compile_call(kernel, args::NTuple{4,Any}) =
     @compile sync = true kernel(args[1], args[2], args[3], args[4])
 _compile_call(kernel, args::NTuple{5,Any}) =
@@ -96,84 +94,92 @@ function _diagnostic(err)
     length(line) <= 800 ? line : first(line, 797) * "..."
 end
 
-function _load_mnist(n)
-    ENV["DATADEPS_ALWAYS_ACCEPT"] = "true"
-    train = MLDatasets.MNIST(split = :train)
-    total = size(train.features, 3)
-    n <= total || error("requested $n MNIST images but only $total are available")
-    pixels = reshape(train.features[:, :, 1:n], 28 * 28, n)   # 784×n Float32 in [0,1]
-    X = Matrix{Float64}(transpose(pixels))                    # n×784
-    y = Int.(train.targets[1:n]) .+ 1                         # one-based classes
-    X, y
+function _definitions(model, unconstrained, W, b, X, y)
+    packed = (
+        joint = prepare(model;
+            have = (:unconstrained, :X, :y, :num_classes), want = :density),
+        prior = prepare(model; have = :unconstrained, want = :prior),
+        likelihood = prepare(model;
+            have = (:unconstrained, :X, :y, :num_classes), want = :likelihood),
+        pointwise = prepare(model;
+            have = (:unconstrained, :X, :y, :num_classes), want = :pointwise),
+    )
+    structured = (
+        joint = prepare(model;
+            have = (:W, :b, :X, :y, :num_classes), want = :density),
+        prior = prepare(model; have = (:W, :b), want = :prior),
+        likelihood = prepare(model;
+            have = (:W, :b, :X, :y, :num_classes), want = :likelihood),
+        pointwise = prepare(model;
+            have = (:W, :b, :X, :y, :num_classes), want = :pointwise),
+    )
+    packed_args = (unconstrained, X, y, NUM_CLASSES)
+    structured_args = (W, b, X, y, NUM_CLASSES)
+    (
+        (boundary = "packed_unconstrained", outcome = "joint",
+         description = "full joint over the flattened sampler vector",
+         kernel = packed.joint, args = packed_args),
+        (boundary = "packed_unconstrained", outcome = "prior",
+         description = "standard-normal coefficient log prior",
+         kernel = packed.prior, args = (unconstrained,)),
+        (boundary = "packed_unconstrained", outcome = "likelihood",
+         description = "summed softmax categorical log likelihood",
+         kernel = packed.likelihood, args = packed_args),
+        (boundary = "packed_unconstrained", outcome = "pointwise",
+         description = "per-observation softmax categorical log likelihoods",
+         kernel = packed.pointwise, args = packed_args),
+        (boundary = "structured_parameters", outcome = "joint",
+         description = "full joint over the (W, b) coefficients",
+         kernel = structured.joint, args = structured_args),
+        (boundary = "structured_parameters", outcome = "prior",
+         description = "standard-normal coefficient log prior",
+         kernel = structured.prior, args = (W, b)),
+        (boundary = "structured_parameters", outcome = "likelihood",
+         description = "summed softmax categorical log likelihood",
+         kernel = structured.likelihood, args = structured_args),
+        (boundary = "structured_parameters", outcome = "pointwise",
+         description = "per-observation softmax categorical log likelihoods",
+         kernel = structured.pointwise, args = structured_args),
+    )
 end
 
-_reactant_want(outcome) = outcome == "joint" ? :density : Symbol(outcome)
-
-function _definition(model, configuration, boundary, outcome,
-                     unconstrained, W, b, X, y)
-    state, reason = matrix_support(configuration, boundary, outcome)
-    descriptions = Dict(
-        "joint" => "full joint over the selected parameter boundary",
-        "prior" => "standard-normal coefficient log prior",
-        "likelihood" => "summed softmax categorical log likelihood",
-        "pointwise" => "per-observation softmax categorical log likelihoods",
-    )
-    state == "supported" && configuration.compiler == "reactant" || return (;
-        boundary, outcome, description = descriptions[outcome], state,
-        reason, kernel = nothing, args = (),
-    )
-    packed = boundary == "packed_unconstrained"
-    data_dependent = outcome != "prior"
-    have = packed ?
-        (data_dependent ? (:unconstrained, :X, :y, :num_classes) :
-                          (:unconstrained,)) :
-        (data_dependent ? (:W, :b, :X, :y, :num_classes) : (:W, :b))
-    bound = configuration.data == "bound" ?
-        (; X, y, num_classes = NUM_CLASSES) : NamedTuple()
-    kernel = prepare(model; have, want = _reactant_want(outcome), bound)
-    args = if packed
-        data_dependent && configuration.data == "unbound" ?
-            (unconstrained, X, y, NUM_CLASSES) : (unconstrained,)
-    else
-        data_dependent && configuration.data == "unbound" ?
-            (W, b, X, y, NUM_CLASSES) : (W, b)
-    end
-    (; boundary, outcome, description = descriptions[outcome], state, reason,
-       kernel, args)
-end
-
-function _assert_primal_matrix(primal_receipt, model, configuration,
-                               boundary, outcome, expected_state)
-    get(primal_receipt, "schema", "") == "mnist-logistic-primal-v3" ||
+function _assert_primal_matrix(primal_receipt, definitions)
+    get(primal_receipt, "schema", "") == "mnist-logistic-v1" ||
         error("unexpected MNIST primal receipt schema")
     protocol = primal_receipt["protocol"]
     Tuple(protocol["input_boundaries"]) == MNIST_REACTANT_BOUNDARIES ||
         error("Reactant benchmark input boundaries drifted from the primal receipt")
     Tuple(protocol["outcomes"]) == MNIST_REACTANT_OUTCOMES ||
         error("Reactant benchmark outcomes drifted from the primal receipt")
-    native_configuration = configuration.data == "bound" ?
-        "primal_native_bound" : "primal_native"
-    matches = filter(primal_receipt["measurements"]) do row
-        row["provider"] == "rk" && row["model"] == model &&
-            row["configuration"] == native_configuration &&
-            row["boundary"] == boundary && row["outcome"] == outcome
+    rows = primal_receipt["measurements"]
+    for definition in definitions
+        matches = filter(rows) do row
+            row["boundary"] == definition.boundary &&
+                row["outcome"] == definition.outcome
+        end
+        length(matches) == 1 || error(
+            "primal receipt does not contain exactly one " *
+            "$(definition.boundary) / $(definition.outcome) row")
+        haskey(only(matches), "rk_native") || error(
+            "native support drifted for " *
+            "$(definition.boundary) / $(definition.outcome)")
     end
-    length(matches) == 1 || error(
-        "primal receipt does not contain exactly one $model / " *
-        "$native_configuration / $boundary / $outcome row")
-    get(only(matches), "state", "") == expected_state || error(
-        "native support drifted for $model / $native_configuration / " *
-        "$boundary / $outcome")
     nothing
 end
 
 function run_comparison()
     repo = normpath(joinpath(@__DIR__, ".."))
     rounds = _rounds()
-    n = _observations()
+    dataset_profile = _mnist_dataset_profile()
+    n = _observations(dataset_profile)
     rounds >= 1 || error("round count must be positive")
 
-    data_load_seconds = @elapsed ((X, y) = _load_mnist(n))
+    dataset_metadata = nothing
+    data_load_seconds = @elapsed begin
+        X, y, dataset_metadata = _load_mnist_dataset(
+            dataset_profile, n; wren_reference = _mnist_wren_reference_path())
+        GC.gc()
+    end
     features = size(X, 2)
     nonreference = NUM_CLASSES - 1
 
@@ -185,77 +191,37 @@ function run_comparison()
     b = 0.01 .* randn(nonreference)
     unconstrained = vcat(vec(W), b)
 
-    rk_models = nothing
-    preparation_seconds = @elapsed rk_models = (
-        (name = "idiomatic", graph = build_mnist_logistic_graph()),
-        (name = "vcat_free", graph = build_mnist_logistic_optimized_graph()),
-    )
-    reactant_configurations = filter(
-        configuration -> configuration.differentiation == "primal" &&
-            configuration.compiler == "reactant",
-        MNIST_RK_CONFIGURATIONS,
-    )
+    model = definitions = nothing
+    preparation_seconds = @elapsed begin
+        model = build_mnist_logistic_graph()
+        definitions = _definitions(model, unconstrained, W, b, X, y)
+    end
 
-    primal_receipt_path =
-        joinpath("benchmark", "receipts", "mnist-logistic-primal-v3.toml")
-    primal_path = get(
-        ENV, "RK_MNIST_PRIMAL_RECEIPT",
-        joinpath(repo, primal_receipt_path))
+    primal_path = joinpath(@__DIR__, "receipts", "mnist-logistic-v1.toml")
     isfile(primal_path) || error(
         "the published primal receipt is required: $primal_path")
     primal_receipt = TOML.parsefile(primal_path)
+    _assert_primal_matrix(primal_receipt, definitions)
 
     measurements = Dict{String,Any}[]
-    for model_definition in rk_models,
-        configuration in reactant_configurations,
-        boundary in MNIST_REACTANT_BOUNDARIES,
-        outcome in MNIST_REACTANT_OUTCOMES
-        definition = nothing
-        kernel_preparation_seconds = @elapsed definition = _definition(
-            model_definition.graph, configuration, boundary, outcome,
-            unconstrained, W, b, X, y)
-        _assert_primal_matrix(
-            primal_receipt, model_definition.name, configuration,
-            boundary, outcome, definition.state)
+    for definition in definitions
         row = Dict{String,Any}(
-            "provider" => "rk",
-            "model" => model_definition.name,
-            "configuration" => configuration.id,
-            "boundary" => boundary,
-            "outcome" => outcome,
+            "boundary" => definition.boundary,
+            "outcome" => definition.outcome,
             "description" => definition.description,
-            "state" => definition.state,
-            "kernel_preparation_seconds" => kernel_preparation_seconds,
+            "rk_native_supported" => true,
         )
-        if definition.state != "supported"
-            row["reason"] = definition.reason
-            push!(measurements, row)
-            println("model=$(model_definition.name) configuration=$(configuration.id) " *
-                    "boundary=$boundary outcome=$outcome state=$(definition.state)")
-            continue
-        end
         native_value = _comparable(
             definition.outcome, definition.kernel(definition.args...))
-        row["native_control"] = _measurement(
+        row["rk_native"] = _measurement(
             definition.kernel, definition.args...; rounds)
 
-        # The public partially-evaluated kernel remains q-only (or W,b-only).
-        # Large bound arrays cross the compiler ABI as trailing hidden device
-        # operands so Reactant does not encode the full dataset as program
-        # literals. Passing device handles is included in the compiled call;
-        # host-to-device transfer remains setup outside steady-state timing.
-        compiler_kernel, bound_arrays = configuration.data == "bound" ?
-            ReactiveKernels._externalize_bound_arrays(definition.kernel) :
-            (definition.kernel, ())
-        compiler_args = (definition.args..., bound_arrays...)
-        row["reactant_externalized_bound_array_count"] = length(bound_arrays)
-
         traced_args = nothing
-        transfer_seconds = @elapsed traced_args = _trace_args(compiler_args)
+        transfer_seconds = @elapsed traced_args = _trace_args(definition.args)
         row["reactant_transfer_seconds"] = transfer_seconds
         compile_started = time_ns()
         try
-            compiled = _compile_call(compiler_kernel, traced_args)
+            compiled = _compile_call(definition.kernel, traced_args)
             row["reactant_compile_seconds"] =
                 Float64(time_ns() - compile_started) / 1e9
             compiled_value = nothing
@@ -273,24 +239,26 @@ function run_comparison()
                 absolute / max(1.0, abs(native_value)) :
                 maximum(abs.(comparable .- native_value) ./
                         max.(1.0, abs.(native_value)))
-            row["result"] = _measurement(compiled, traced_args...; rounds)
+            row["rk_reactant"] = _measurement(compiled, traced_args...; rounds)
+            row["rk_reactant_supported"] = true
         catch err
             row["reactant_compile_seconds"] = get(
                 row, "reactant_compile_seconds",
                 Float64(time_ns() - compile_started) / 1e9)
-            row["state"] = "unsupported_runtime"
-            row["reason"] = _diagnostic(err)
+            row["rk_reactant_supported"] = false
+            row["rk_reactant_error"] = _diagnostic(err)
         end
         push!(measurements, row)
-        println("model=$(model_definition.name) configuration=$(configuration.id) " *
-                "boundary=$boundary outcome=$outcome state=$(row["state"])")
+        reactant_supported = row["rk_reactant_supported"]
+        println("boundary=$(definition.boundary) outcome=$(definition.outcome) " *
+                "reactant=$reactant_supported")
     end
 
     source_path = joinpath(
         "packages", "ReactiveKernelsPPLExamples", "src", "mnist_logistic.jl")
     candidate_sha = get(ENV, "REACTIVEKERNELS_CANDIDATE_SHA", "unknown")
     receipt = Dict{String,Any}(
-        "schema" => "mnist-reactant-v2",
+        "schema" => "mnist-reactant-v1",
         "generated_at" => string(now(UTC), "Z"),
         "pins" => Dict(
             "reactivekernels_sha" => candidate_sha,
@@ -308,10 +276,7 @@ function run_comparison()
             "source_authority_path" => source_path,
             "source_authority_blob" =>
                 _git(repo, "rev-parse", "$candidate_sha:$source_path"),
-            "idiomatic_source_text_sha256" =>
-                bytes2hex(sha256(MNIST_LOGISTIC_SOURCE)),
-            "vcat_free_source_text_sha256" =>
-                bytes2hex(sha256(MNIST_LOGISTIC_OPTIMIZED_SOURCE)),
+            "source_text_sha256" => bytes2hex(sha256(MNIST_LOGISTIC_SOURCE)),
             "primal_receipt_sha256" =>
                 _mnist_reactant_generator_sha256(primal_path),
             "primal_receipt_reactivekernels_sha" =>
@@ -332,22 +297,16 @@ function run_comparison()
             "data_load_seconds" => data_load_seconds,
             "kernel_preparation_seconds" => preparation_seconds,
         ),
-        "protocol" => Dict(
+        "protocol" => merge(Dict(
             "model" => "multinomial-logistic MNIST classifier",
-            "data" => "MLDatasets MNIST train split, first N images",
-            "num_observations" => n,
-            "num_features" => features,
             "num_classes" => NUM_CLASSES,
             "source_reused" => true,
-            "matrix_source" => primal_receipt_path,
+            "matrix_source" => "benchmark/receipts/mnist-logistic-v1.toml",
             "input_boundaries" => collect(MNIST_REACTANT_BOUNDARIES),
             "outcomes" => collect(MNIST_REACTANT_OUTCOMES),
-            "models" => collect(MNIST_MODELS),
-            "matrix_layout" =>
-                "long-form provider/model/configuration/boundary/outcome rows",
-            "rk_configurations" => [
-                configuration.id for configuration in reactant_configurations],
-            "bound_ports" => ["X", "y", "num_classes"],
+            "partial_evaluation_enabled" => false,
+            "runtime_data_ports" => ["X", "y", "num_classes"],
+            "native_and_reactant_use_same_runtime_boundary" => true,
             "rounds" => rounds,
             "samples_per_round" => 200,
             "seconds_per_round" => 0.2,
@@ -358,14 +317,12 @@ function run_comparison()
             "reactant_compile_time_in_timed_region" => false,
             "reactant_transfers_in_timed_region" => false,
             "reactant_readback_in_timed_region" => false,
-            "bound_array_compiler_abi" =>
-                "public residual kernel stays data-bound; array-valued bound constants are transferred once and passed as trailing hidden device operands to avoid dataset-sized compiler literals",
             "unsupported_cells_recorded" => true,
             "gradients_included" => false,
             "generated_predictions_included" => false,
             "parity_rtol" => 1e-9,
             "parity_atol" => 1e-9,
-        ),
+        ), dataset_metadata),
         "measurements" => measurements,
     )
 
@@ -382,4 +339,4 @@ function run_comparison()
     receipt
 end
 
-get(ENV, "RK_MNIST_REACTANT_DEFINITIONS_ONLY", "") == "1" || run_comparison()
+run_comparison()

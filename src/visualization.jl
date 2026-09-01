@@ -156,7 +156,7 @@ function _viz_model(v::DAGVisualization)
         status = state === :alternative ? "not selected · " :
                  state === :effectful ? "effectful · " :
                  subject isa Plan ? "selected · " : ""
-        plate_detail = if r.op isa _AuthoredPlateOp
+        plate_detail = if r.op isa Union{_AuthoredPlateOp,_KernelTensorizedOp}
             inner = plate_body(r)
             names = unique(output.name for recipe in inner.recipes
                            for output in recipe.outputs)

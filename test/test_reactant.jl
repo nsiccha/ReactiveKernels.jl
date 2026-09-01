@@ -195,8 +195,28 @@ end
     total::Float64 = sum(padded)
 end
 
+@kernel reactant_bound_dot(
+        q::Vector{Float64}, data::Vector{Float64}) = begin
+    density::Float64 = sum(q .* data)
+end
+
 @testset "Reactant optional compiler integration" begin
     @test Base.get_extension(ReactiveKernels, :ReactiveKernelsReactantExt) !== nothing
+
+    @testset "array-valued partial-evaluation constants are device operands" begin
+        q_host = [0.3, -0.4, 0.2]
+        data_host = [2.0, -1.0, 0.5]
+        kernel = prepare(reactant_bound_dot;
+            have = (:q, :data), want = :density,
+            bound = (; data = data_host))
+        @test Tuple(input.name for input in inputs(kernel)) == (:q,)
+        compiler_call, bound_arrays =
+            ReactiveKernels._externalize_bound_arrays(kernel)
+        @test bound_arrays == (data_host,)
+        traced = map(Reactant.to_rarray, (q_host, bound_arrays...))
+        compiled = Reactant.compile(compiler_call, traced; sync = true)
+        @test Float64(compiled(traced...)) ≈ kernel(q_host)
+    end
 
     @testset "mixed constant and traced cat operands promote to traced constants" begin
         W_host = reshape(collect(0.1:0.1:0.6), 2, 3)

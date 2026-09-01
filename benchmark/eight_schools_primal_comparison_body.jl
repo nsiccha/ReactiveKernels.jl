@@ -13,13 +13,22 @@ import Turing
 using Turing: filldist
 using Distributions: Cauchy, Normal, truncated
 
+include(joinpath(@__DIR__, "eight_schools_matrix_spec.jl"))
+using .EightSchoolsMatrixSpec
+
 const LDP = DynamicPPL.LogDensityProblems
 const DEFAULT_EIGHT_SCHOOLS_ROUNDS = 10
 const COMPARISON_PACKAGES = (
     "ReactiveKernels", "ReactiveKernelsPPLExamples",
     "ReactiveKernelsDistributionKernels", "Turing", "DynamicPPL",
-    "Distributions", "BenchmarkTools",
+    "Distributions", "BenchmarkTools", "MutatingFunctions",
 )
+
+if get(ENV, "RK_EIGHT_SCHOOLS_DEFINITIONS_ONLY", "") != "1"
+    using MutatingFunctions
+    Base.get_extension(ReactiveKernels, :ReactiveKernelsMutatingFunctionsExt) === nothing &&
+        error("the non-allocating column requires ReactiveKernelsMutatingFunctionsExt to load")
+end
 
 # DOCS-BASELINE-BEGIN: turing
 Turing.@model function turing_eight_schools(observations, observation_scales)
@@ -164,6 +173,13 @@ function _package_version(name)
     error("package $name absent from the benchmark environment")
 end
 
+function _package_git_revision(name)
+    for info in values(Pkg.dependencies())
+        info.name == name && return string(something(info.git_revision, "unknown"))
+    end
+    error("package $name absent from the benchmark environment")
+end
+
 function _output_path()
     for arg in ARGS
         startswith(arg, "--output=") && return split(arg, '='; limit = 2)[2]
@@ -173,6 +189,112 @@ end
 
 _rounds() = parse(Int, get(
     ENV, "RK_EIGHT_SCHOOLS_ROUNDS", string(DEFAULT_EIGHT_SCHOOLS_ROUNDS)))
+
+_eight_schools_want(outcome) =
+    outcome == "joint" ? nothing : Symbol(outcome)
+
+function _rk_primal_definition(model, configuration, boundary, outcome,
+                               q, parameters, theta, observations,
+                               observation_scales)
+    state, reason = matrix_support(configuration, boundary, outcome)
+    state == "supported" || return (; state, reason, spec = nothing)
+    configuration.differentiation == "primal" || return (
+        state = "unsupported", reason = "not a primal execution configuration",
+        spec = nothing)
+    configuration.compiler == "native" || return (
+        state = "unsupported",
+        reason = "Reactant configurations are measured by the matched compiler receipt",
+        spec = nothing)
+
+    data_dependent = outcome != "prior"
+    have, want, arguments = if boundary == "packed_unconstrained"
+        h = data_dependent ?
+            (:unconstrained, :observations, :observation_scales) :
+            (:unconstrained,)
+        w = outcome == "joint" ? :posterior : Symbol(outcome == "prior" ?
+            "unconstrained_prior" : outcome)
+        a = data_dependent && configuration.data == "unbound" ?
+            (q, observations, observation_scales) : (q,)
+        (h, w, a)
+    elseif boundary == "constrained_parameters"
+        h = data_dependent ?
+            (:parameters, :observations, :observation_scales) : (:parameters,)
+        w = outcome == "joint" ? :constrained_logdensity : Symbol(outcome)
+        a = data_dependent && configuration.data == "unbound" ?
+            (parameters, observations, observation_scales) : (parameters,)
+        (h, w, a)
+    else
+        h = (:θ, :observations, :observation_scales)
+        a = configuration.data == "unbound" ?
+            (theta, observations, observation_scales) : (theta,)
+        (h, Symbol(outcome), a)
+    end
+    bound = configuration.data == "bound" ?
+        (; observations, observation_scales) : NamedTuple()
+    kernel = configuration.allocation == "ordinary" ?
+        prepare(model; have, want, bound) :
+        prepare_nonallocating(model; have, want, bound)
+    (; state, reason, spec = (kernel, arguments))
+end
+
+function _manual_primal_definition(boundary, outcome, q, parameters, theta,
+                                   observations, observation_scales)
+    if boundary == "packed_unconstrained"
+        outcome == "joint" && return (_manual_unconstrained_joint,
+            (q, observations, observation_scales))
+        outcome == "prior" && return (_manual_unconstrained_prior, (q,))
+        outcome == "likelihood" && return (_manual_unconstrained_likelihood,
+            (q, observations, observation_scales))
+        return (_manual_unconstrained_pointwise,
+                (q, observations, observation_scales))
+    elseif boundary == "constrained_parameters"
+        outcome == "joint" && return (_manual_constrained_joint,
+            (parameters, observations, observation_scales))
+        outcome == "prior" && return (_manual_constrained_prior, (parameters,))
+        outcome == "likelihood" && return (_manual_constrained_likelihood,
+            (parameters, observations, observation_scales))
+        return (_manual_constrained_pointwise,
+                (parameters, observations, observation_scales))
+    end
+    outcome == "joint" || outcome == "prior" ? nothing :
+        outcome == "likelihood" ?
+            (_manual_likelihood, (theta, observations, observation_scales)) :
+            (_manual_pointwise, (theta, observations, observation_scales))
+end
+
+function _turing_primal_definition(turing, boundary, outcome, parameters)
+    boundary == "minimal_likelihood" && return nothing
+    if boundary == "packed_unconstrained"
+        outcome == "pointwise" && return (
+            _turing_pointwise, (turing.model, turing.unconstrained_pointwise_init))
+        view = outcome == "joint" ? turing.joint :
+               outcome == "prior" ? turing.prior : turing.likelihood
+        return (_turing_density, (view, turing.vector))
+    end
+    outcome == "pointwise" && return (
+        _turing_pointwise, (turing.model, turing.constrained_pointwise_init))
+    evaluator = outcome == "joint" ? _turing_constrained_joint :
+                outcome == "prior" ? _turing_constrained_prior :
+                _turing_constrained_likelihood
+    (evaluator, (turing.model, parameters))
+end
+
+function _measurement_row(; provider, configuration, boundary, outcome,
+                          description, state = "supported", reason = "",
+                          result = nothing)
+    row = Dict{String,Any}(
+        "provider" => provider,
+        "model" => "centered",
+        "configuration" => configuration,
+        "boundary" => boundary,
+        "outcome" => outcome,
+        "description" => description,
+        "state" => state,
+    )
+    isempty(reason) || (row["reason"] = reason)
+    result === nothing || (row["result"] = result)
+    row
+end
 
 function run_comparison()
     rounds = _rounds()
@@ -185,40 +307,12 @@ function run_comparison()
     unconstrained = [μ, log_τ, θ...]
     parameters = (; μ, τ, θ)
 
-    # This clones the graph evaluated from the exact public Eight Schools
-    # source at module load, so all timed kernels share that source authority
-    # without crossing a fresh Core.eval world-age boundary here.
     rk_model = build_eight_schools_graph()
-    rk_unconstrained_joint = prepare(rk_model;
-        have = (:unconstrained, :observations, :observation_scales),
-        want = :posterior)
-    rk_unconstrained_prior = prepare(rk_model;
-        have = :unconstrained, want = :unconstrained_prior)
-    rk_unconstrained_likelihood = prepare(rk_model;
-        have = (:unconstrained, :observations, :observation_scales),
-        want = :likelihood)
-    rk_unconstrained_pointwise = prepare(rk_model;
-        have = (:unconstrained, :observations, :observation_scales),
-        want = :pointwise)
-
-    rk_constrained_joint = prepare(rk_model;
-        have = (:parameters, :observations, :observation_scales),
-        want = :constrained_logdensity)
-    rk_constrained_prior = prepare(rk_model;
-        have = :parameters, want = :prior)
-    rk_constrained_likelihood = prepare(rk_model;
-        have = (:parameters, :observations, :observation_scales),
-        want = :likelihood)
-    rk_constrained_pointwise = prepare(rk_model;
-        have = (:parameters, :observations, :observation_scales),
-        want = :pointwise)
-
-    rk_minimal_likelihood = prepare(rk_model;
-        have = (:θ, :observations, :observation_scales),
-        want = :likelihood)
-    rk_minimal_pointwise = prepare(rk_model;
-        have = (:θ, :observations, :observation_scales),
-        want = :pointwise)
+    native_primal_configurations = filter(
+        configuration -> configuration.differentiation == "primal" &&
+            configuration.compiler == "native",
+        EIGHT_SCHOOLS_RK_CONFIGURATIONS,
+    )
 
     turing_model = turing_eight_schools(observations, observation_scales)
     turing_unconstrained_joint = DynamicPPL.LogDensityFunction(
@@ -242,144 +336,85 @@ function run_comparison()
         turing_unconstrained_parameters, turing_unconstrained_joint)
     turing_constrained_pointwise_init = DynamicPPL.InitFromParams(
         parameters, nothing)
-
-    definitions = (
-        (
-            boundary = "packed_unconstrained", outcome = "joint",
-            description = "full joint including the transform Jacobian",
-            rk = (rk_unconstrained_joint,
-                  (unconstrained, observations, observation_scales)),
-            manual = (_manual_unconstrained_joint,
-                      (unconstrained, observations, observation_scales)),
-            turing = (_turing_density,
-                      (turing_unconstrained_joint,
-                       turing_unconstrained_parameters)),
-        ),
-        (
-            boundary = "packed_unconstrained", outcome = "prior",
-            description = "log prior including the transform Jacobian",
-            rk = (rk_unconstrained_prior, (unconstrained,)),
-            manual = (_manual_unconstrained_prior, (unconstrained,)),
-            turing = (_turing_density,
-                      (turing_unconstrained_prior,
-                       turing_unconstrained_parameters)),
-        ),
-        (
-            boundary = "packed_unconstrained", outcome = "likelihood",
-            description = "summed log likelihood after unpacking the latent vector",
-            rk = (rk_unconstrained_likelihood,
-                  (unconstrained, observations, observation_scales)),
-            manual = (_manual_unconstrained_likelihood,
-                      (unconstrained, observations, observation_scales)),
-            turing = (_turing_density,
-                      (turing_unconstrained_likelihood,
-                       turing_unconstrained_parameters)),
-        ),
-        (
-            boundary = "packed_unconstrained", outcome = "pointwise",
-            description = "eight pointwise log likelihoods after unpacking",
-            rk = (rk_unconstrained_pointwise,
-                  (unconstrained, observations, observation_scales)),
-            manual = (_manual_unconstrained_pointwise,
-                      (unconstrained, observations, observation_scales)),
-            turing = (_turing_pointwise,
-                      (turing_model, turing_unconstrained_pointwise_init)),
-        ),
-        (
-            boundary = "constrained_parameters", outcome = "joint",
-            description = "full joint excluding the transform Jacobian",
-            rk = (rk_constrained_joint,
-                  (parameters, observations, observation_scales)),
-            manual = (_manual_constrained_joint,
-                      (parameters, observations, observation_scales)),
-            turing = (_turing_constrained_joint, (turing_model, parameters)),
-        ),
-        (
-            boundary = "constrained_parameters", outcome = "prior",
-            description = "constrained-space log prior",
-            rk = (rk_constrained_prior, (parameters,)),
-            manual = (_manual_constrained_prior, (parameters,)),
-            turing = (_turing_constrained_prior, (turing_model, parameters)),
-        ),
-        (
-            boundary = "constrained_parameters", outcome = "likelihood",
-            description = "summed log likelihood",
-            rk = (rk_constrained_likelihood,
-                  (parameters, observations, observation_scales)),
-            manual = (_manual_constrained_likelihood,
-                      (parameters, observations, observation_scales)),
-            turing = (_turing_constrained_likelihood,
-                      (turing_model, parameters)),
-        ),
-        (
-            boundary = "constrained_parameters", outcome = "pointwise",
-            description = "eight pointwise log likelihoods",
-            rk = (rk_constrained_pointwise,
-                  (parameters, observations, observation_scales)),
-            manual = (_manual_constrained_pointwise,
-                      (parameters, observations, observation_scales)),
-            turing = (_turing_pointwise,
-                      (turing_model, turing_constrained_pointwise_init)),
-        ),
-        (
-            boundary = "minimal_likelihood", outcome = "joint",
-            description = "unsupported without prior parameters",
-            rk = nothing, manual = nothing, turing = nothing,
-        ),
-        (
-            boundary = "minimal_likelihood", outcome = "prior",
-            description = "unsupported without prior parameters",
-            rk = nothing, manual = nothing, turing = nothing,
-        ),
-        (
-            boundary = "minimal_likelihood", outcome = "likelihood",
-            description = "summed likelihood from θ, observations, and scales only",
-            rk = (rk_minimal_likelihood,
-                  (θ, observations, observation_scales)),
-            manual = (_manual_likelihood,
-                      (θ, observations, observation_scales)),
-            turing = nothing,
-        ),
-        (
-            boundary = "minimal_likelihood", outcome = "pointwise",
-            description = "pointwise likelihoods from θ, observations, and scales only",
-            rk = (rk_minimal_pointwise,
-                  (θ, observations, observation_scales)),
-            manual = (_manual_pointwise,
-                      (θ, observations, observation_scales)),
-            turing = nothing,
-        ),
+    turing = (
+        model = turing_model,
+        joint = turing_unconstrained_joint,
+        prior = turing_unconstrained_prior,
+        likelihood = turing_unconstrained_likelihood,
+        vector = turing_unconstrained_parameters,
+        unconstrained_pointwise_init = turing_unconstrained_pointwise_init,
+        constrained_pointwise_init = turing_constrained_pointwise_init,
+    )
+    descriptions = Dict(
+        "joint" => "full joint over the selected parameter boundary",
+        "prior" => "log prior over the selected parameter boundary",
+        "likelihood" => "summed observation log likelihood",
+        "pointwise" => "eight pointwise observation log likelihoods",
     )
 
     measurements = Dict{String,Any}[]
-    for definition in definitions
-        row = Dict{String,Any}(
-            "boundary" => definition.boundary,
-            "outcome" => definition.outcome,
-            "description" => definition.description,
-        )
-        reference = definition.manual === nothing ? nothing :
-            _comparable(definition.outcome, _evaluate(definition.manual))
-        for (key, spec) in (
-            "rk_native" => definition.rk,
-            "manual_julia" => definition.manual,
-            "turing_native" => definition.turing,
-        )
-            spec === nothing && continue
-            actual = _comparable(definition.outcome, _evaluate(spec))
-            isapprox(actual, reference; rtol = 1e-11, atol = 1e-12) || error(
-                "parity failed for $(definition.boundary) / " *
-                "$(definition.outcome) / $key",
-            )
-            function_, arguments = spec
-            row[key] = _measurement(function_, arguments...; rounds)
+    for boundary in EIGHT_SCHOOLS_BOUNDARIES, outcome in EIGHT_SCHOOLS_OUTCOMES
+        description = descriptions[outcome]
+        manual = _manual_primal_definition(
+            boundary, outcome, unconstrained, parameters, θ,
+            observations, observation_scales)
+        reference = manual === nothing ? nothing :
+            _comparable(outcome, _evaluate(manual))
+
+        for configuration in native_primal_configurations
+            definition = _rk_primal_definition(
+                rk_model, configuration, boundary, outcome, unconstrained,
+                parameters, θ, observations, observation_scales)
+            result = nothing
+            if definition.state == "supported"
+                actual = _comparable(outcome, _evaluate(definition.spec))
+                isapprox(actual, reference; rtol = 1e-11, atol = 1e-12) ||
+                    error("RK parity failed for $(configuration.id) / " *
+                          "$boundary / $outcome")
+                function_, arguments = definition.spec
+                result = _measurement(function_, arguments...; rounds)
+            end
+            push!(measurements, _measurement_row(;
+                provider = "rk", configuration = configuration.id,
+                boundary, outcome, description, state = definition.state,
+                reason = definition.reason, result))
         end
-        push!(measurements, row)
-        println("boundary=$(definition.boundary) outcome=$(definition.outcome) complete")
+
+        if manual === nothing
+            push!(measurements, _measurement_row(;
+                provider = "manual_julia", configuration = "manual_primal",
+                boundary, outcome, description, state = "unsupported",
+                reason = "joint and prior are unavailable from the minimal likelihood boundary"))
+        else
+            function_, arguments = manual
+            push!(measurements, _measurement_row(;
+                provider = "manual_julia", configuration = "manual_primal",
+                boundary, outcome, description,
+                result = _measurement(function_, arguments...; rounds)))
+        end
+
+        turing_spec = _turing_primal_definition(
+            turing, boundary, outcome, parameters)
+        if turing_spec === nothing
+            push!(measurements, _measurement_row(;
+                provider = "turing", configuration = "turing_primal",
+                boundary, outcome, description, state = "unsupported",
+                reason = "Turing has no public θ-only minimal-likelihood boundary"))
+        else
+            actual = _comparable(outcome, _evaluate(turing_spec))
+            isapprox(actual, reference; rtol = 1e-11, atol = 1e-12) ||
+                error("Turing parity failed for $boundary / $outcome")
+            function_, arguments = turing_spec
+            push!(measurements, _measurement_row(;
+                provider = "turing", configuration = "turing_primal",
+                boundary, outcome, description,
+                result = _measurement(function_, arguments...; rounds)))
+        end
+        println("boundary=$boundary outcome=$outcome complete")
     end
 
     receipt = Dict{String,Any}(
-        "schema" => "eight-schools-primal-v1",
+        "schema" => "eight-schools-primal-v2",
         "generated_at" => string(now(UTC), "Z"),
         "pins" => Dict(
             "reactivekernels_sha" => get(
@@ -387,6 +422,7 @@ function run_comparison()
             "reactivekernels_dirty" => false,
             (string(lowercase(name), "_version") => _package_version(name)
              for name in COMPARISON_PACKAGES)...,
+            "mutatingfunctions_rev" => _package_git_revision("MutatingFunctions"),
             "julia_version" => string(VERSION),
         ),
         "environment" => Dict(
@@ -397,11 +433,13 @@ function run_comparison()
         ),
         "protocol" => Dict(
             "model" => "centered Eight Schools",
-            "input_boundaries" => [
-                "packed_unconstrained", "constrained_parameters",
-                "minimal_likelihood",
-            ],
-            "outcomes" => ["joint", "prior", "likelihood", "pointwise"],
+            "models" => collect(EIGHT_SCHOOLS_MODELS),
+            "input_boundaries" => collect(EIGHT_SCHOOLS_BOUNDARIES),
+            "outcomes" => collect(EIGHT_SCHOOLS_OUTCOMES),
+            "rk_configurations" => [
+                configuration.id for configuration in native_primal_configurations],
+            "matrix_layout" =>
+                "long-form provider/model/configuration/boundary/outcome rows",
             "rounds" => rounds,
             "estimator" => "median of per-round BenchmarkTools minimum times",
             "samples_per_round" => 200,
@@ -410,7 +448,12 @@ function run_comparison()
             "preparation_in_timed_region" => false,
             "turing_transform_strategy" => "fixed transforms",
             "turing_pointwise_api" => "DynamicPPL.pointwise_loglikelihoods",
-            "unsupported_cells_omitted" => true,
+            "unsupported_cells_recorded" => true,
+            "rk_nonallocating_pass" =>
+                "prepare_nonallocating over the public graph (MutatingFunctions extension; caches seeded before timing)",
+            "bound_ports" => ["observations", "observation_scales"],
+            "bound_prior_state" =>
+                "not_applicable: minimal prior cut has no data ports",
             "gradients_included" => false,
             "generated_predictions_included" => false,
             "parity_rtol" => 1e-11,

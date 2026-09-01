@@ -1,0 +1,634 @@
+generated_at = "2026-09-01T18:38:36.412Z"
+schema = "mnist-reactant-ad-v2"
+
+[environment]
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+julia_threads = 1
+os = "Linux"
+reactant_backend = "default CPU"
+
+[[measurements]]
+active_port = "unconstrained"
+ad_preparation_seconds = 0.278404035
+boundary = "packed_unconstrained"
+configuration = "ad_reactant"
+description = "gradient of the full joint w.r.t. the packed coefficient vector"
+max_abs_error = 3.296918293926865e-12
+max_rel_error = 3.234232837679e-14
+model = "idiomatic"
+outcome = "joint"
+provider = "rk"
+reactant_ad_compile_seconds = 29.300203433
+reactant_externalized_bound_array_count = 0
+reactant_first_execution_seconds = 0.275036374
+reactant_transfer_seconds = 0.375984591
+state = "supported"
+value_abs_error = 3.2014213502407074e-10
+value_rel_error = 2.2022512434669893e-15
+
+    [measurements.native_control]
+    allocs = [31, 31, 31, 31, 31, 31, 31, 31, 31, 31]
+    bytes = [33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592]
+    median_allocs = 31
+    median_bytes = 33122592
+    median_ns = 3.186465035e8
+    min_ns = 3.06286256e8
+    times_ns = [3.56118146e8, 3.06520809e8, 3.20963116e8, 3.53433549e8, 3.27972773e8, 3.1454141e8, 3.27357574e8, 3.06286256e8, 3.16329891e8, 3.07019517e8]
+
+    [measurements.result]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [816, 816, 816, 816, 816, 816, 816, 816, 816, 816]
+    median_allocs = 20
+    median_bytes = 816
+    median_ns = 3.1276919e7
+    min_ns = 2.5827029e7
+    times_ns = [3.4456678e7, 3.2162341e7, 3.488557e7, 3.0269939e7, 3.1861005e7, 3.0692833e7, 3.3257453e7, 2.5827029e7, 2.8982031e7, 3.0107716e7]
+[[measurements]]
+active_port = "unconstrained"
+ad_preparation_seconds = 0.113872471
+boundary = "packed_unconstrained"
+configuration = "ad_reactant"
+description = "gradient of the standard-normal coefficient log prior"
+max_abs_error = 0.0
+max_rel_error = 0.0
+model = "idiomatic"
+outcome = "prior"
+provider = "rk"
+reactant_ad_compile_seconds = 3.059252828
+reactant_externalized_bound_array_count = 0
+reactant_first_execution_seconds = 0.03085115
+reactant_transfer_seconds = 0.00641694
+state = "supported"
+value_abs_error = 1.7280399333685637e-11
+value_rel_error = 2.6615325236043355e-15
+
+    [measurements.native_control]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 5362.5
+    min_ns = 5307.0
+    times_ns = [5428.0, 5367.0, 5307.0, 5308.0, 5327.0, 5358.0, 5377.0, 5437.0, 6839.0, 5347.0]
+
+    [measurements.result]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [816, 816, 816, 816, 816, 816, 816, 816, 816, 816]
+    median_allocs = 20
+    median_bytes = 816
+    median_ns = 19456.5
+    min_ns = 8342.0
+    times_ns = [19697.0, 8342.0, 10855.0, 20078.0, 20899.0, 21399.0, 13719.0, 21430.0, 19046.0, 19216.0]
+[[measurements]]
+active_port = "unconstrained"
+ad_preparation_seconds = 0.095600908
+boundary = "packed_unconstrained"
+configuration = "ad_reactant"
+description = "gradient of the summed softmax categorical log likelihood"
+max_abs_error = 3.296918293926865e-12
+max_rel_error = 3.226216622879376e-14
+model = "idiomatic"
+outcome = "likelihood"
+provider = "rk"
+reactant_ad_compile_seconds = 3.230802667
+reactant_externalized_bound_array_count = 0
+reactant_first_execution_seconds = 0.062349943
+reactant_transfer_seconds = 0.17123892
+state = "supported"
+value_abs_error = 3.2014213502407074e-10
+value_rel_error = 2.305208319970998e-15
+
+    [measurements.native_control]
+    allocs = [31, 31, 31, 31, 31, 31, 31, 31, 31, 31]
+    bytes = [33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592]
+    median_allocs = 31
+    median_bytes = 33122592
+    median_ns = 3.337625335e8
+    min_ns = 3.29469907e8
+    times_ns = [3.29469907e8, 3.35445708e8, 3.31012566e8, 3.39204348e8, 3.53960423e8, 3.55096783e8, 3.31750736e8, 3.32079359e8, 3.50241007e8, 3.31983427e8]
+
+    [measurements.result]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [816, 816, 816, 816, 816, 816, 816, 816, 816, 816]
+    median_allocs = 20
+    median_bytes = 816
+    median_ns = 2.87246185e7
+    min_ns = 2.6486043e7
+    times_ns = [2.6486043e7, 2.8421065e7, 2.8141288e7, 2.8166944e7, 3.4689099e7, 3.0616737e7, 3.1060789e7, 2.9028172e7, 3.0284487e7, 2.720882e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "ad_reactant"
+description = "pointwise Jacobian/VJP"
+model = "idiomatic"
+outcome = "pointwise"
+provider = "rk"
+reason = "pointwise is vector-valued and no matched public Jacobian/VJP contract is invented"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_reactant"
+description = "gradient of the full joint w.r.t. the packed coefficient vector"
+model = "idiomatic"
+outcome = "joint"
+provider = "rk"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_reactant"
+description = "gradient of the standard-normal coefficient log prior"
+model = "idiomatic"
+outcome = "prior"
+provider = "rk"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_reactant"
+description = "gradient of the summed softmax categorical log likelihood"
+model = "idiomatic"
+outcome = "likelihood"
+provider = "rk"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_reactant"
+description = "pointwise Jacobian/VJP"
+model = "idiomatic"
+outcome = "pointwise"
+provider = "rk"
+reason = "pointwise is vector-valued and no matched public Jacobian/VJP contract is invented"
+state = "unsupported"
+[[measurements]]
+active_port = "unconstrained"
+ad_preparation_seconds = 0.112811742
+boundary = "packed_unconstrained"
+configuration = "ad_reactant_bound"
+description = "gradient of the full joint w.r.t. the packed coefficient vector"
+max_abs_error = 3.296918293926865e-12
+max_rel_error = 3.234232837679e-14
+model = "idiomatic"
+outcome = "joint"
+provider = "rk"
+reactant_ad_compile_seconds = 2.757338561
+reactant_externalized_bound_array_count = 2
+reactant_first_execution_seconds = 0.059961977
+reactant_transfer_seconds = 0.170335923
+state = "supported"
+value_abs_error = 3.2014213502407074e-10
+value_rel_error = 2.2022512434669893e-15
+
+    [measurements.native_control]
+    allocs = [31, 31, 31, 31, 31, 31, 31, 31, 31, 31]
+    bytes = [33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592]
+    median_allocs = 31
+    median_bytes = 33122592
+    median_ns = 3.2236825e8
+    min_ns = 3.04388274e8
+    times_ns = [3.04388274e8, 3.14803916e8, 3.1557417e8, 3.40144005e8, 3.31663195e8, 3.22084629e8, 3.24455613e8, 3.33306174e8, 3.15239807e8, 3.22651871e8]
+
+    [measurements.result]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [816, 816, 816, 816, 816, 816, 816, 816, 816, 816]
+    median_allocs = 20
+    median_bytes = 816
+    median_ns = 3.12118835e7
+    min_ns = 2.6746302e7
+    times_ns = [2.6746302e7, 2.9388269e7, 3.1358982e7, 4.2972517e7, 3.1064785e7, 3.1599643e7, 3.0755377e7, 3.7278916e7, 2.9879178e7, 3.2636435e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "ad_reactant_bound"
+description = "gradient of the standard-normal coefficient log prior"
+model = "idiomatic"
+outcome = "prior"
+provider = "rk"
+reason = "the minimal prior cut has no data ports to bind"
+state = "not_applicable"
+[[measurements]]
+active_port = "unconstrained"
+ad_preparation_seconds = 0.079558374
+boundary = "packed_unconstrained"
+configuration = "ad_reactant_bound"
+description = "gradient of the summed softmax categorical log likelihood"
+max_abs_error = 3.296918293926865e-12
+max_rel_error = 3.226216622879376e-14
+model = "idiomatic"
+outcome = "likelihood"
+provider = "rk"
+reactant_ad_compile_seconds = 2.601686014
+reactant_externalized_bound_array_count = 2
+reactant_first_execution_seconds = 0.068149493
+reactant_transfer_seconds = 0.182682721
+state = "supported"
+value_abs_error = 3.2014213502407074e-10
+value_rel_error = 2.305208319970998e-15
+
+    [measurements.native_control]
+    allocs = [31, 31, 31, 31, 31, 31, 31, 31, 31, 31]
+    bytes = [33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592]
+    median_allocs = 31
+    median_bytes = 33122592
+    median_ns = 3.224876905e8
+    min_ns = 3.09233324e8
+    times_ns = [3.13045858e8, 3.09233324e8, 3.22103084e8, 3.14798668e8, 3.24341386e8, 3.20602323e8, 3.27779102e8, 3.23302631e8, 3.30209347e8, 3.22872297e8]
+
+    [measurements.result]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [816, 816, 816, 816, 816, 816, 816, 816, 816, 816]
+    median_allocs = 20
+    median_bytes = 816
+    median_ns = 3.2776092e7
+    min_ns = 2.8814817e7
+    times_ns = [3.2542565e7, 2.8814817e7, 2.8997781e7, 3.8676676e7, 3.4217779e7, 3.4835631e7, 3.1595106e7, 3.0562661e7, 4.1464725e7, 3.3009619e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "ad_reactant_bound"
+description = "pointwise Jacobian/VJP"
+model = "idiomatic"
+outcome = "pointwise"
+provider = "rk"
+reason = "pointwise is vector-valued and no matched public Jacobian/VJP contract is invented"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_reactant_bound"
+description = "gradient of the full joint w.r.t. the packed coefficient vector"
+model = "idiomatic"
+outcome = "joint"
+provider = "rk"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_reactant_bound"
+description = "gradient of the standard-normal coefficient log prior"
+model = "idiomatic"
+outcome = "prior"
+provider = "rk"
+reason = "the minimal prior cut has no data ports to bind"
+state = "not_applicable"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_reactant_bound"
+description = "gradient of the summed softmax categorical log likelihood"
+model = "idiomatic"
+outcome = "likelihood"
+provider = "rk"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_reactant_bound"
+description = "pointwise Jacobian/VJP"
+model = "idiomatic"
+outcome = "pointwise"
+provider = "rk"
+reason = "pointwise is vector-valued and no matched public Jacobian/VJP contract is invented"
+state = "unsupported"
+[[measurements]]
+active_port = "unconstrained"
+ad_preparation_seconds = 0.120886942
+boundary = "packed_unconstrained"
+configuration = "ad_reactant"
+description = "gradient of the full joint w.r.t. the packed coefficient vector"
+max_abs_error = 3.296918293926865e-12
+max_rel_error = 3.657940055425549e-14
+model = "vcat_free"
+outcome = "joint"
+provider = "rk"
+reactant_ad_compile_seconds = 6.188363907
+reactant_externalized_bound_array_count = 0
+reactant_first_execution_seconds = 0.067993848
+reactant_transfer_seconds = 0.168680547
+state = "supported"
+value_abs_error = 3.4924596548080444e-10
+value_rel_error = 2.4024559019639883e-15
+
+    [measurements.native_control]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976]
+    median_allocs = 20
+    median_bytes = 24000976
+    median_ns = 2.93677504e8
+    min_ns = 2.84574946e8
+    times_ns = [2.94443251e8, 2.8959072e8, 2.88544466e8, 2.92494039e8, 2.97257907e8, 3.11570721e8, 2.93180398e8, 3.09383411e8, 2.84574946e8, 2.9417461e8]
+
+    [measurements.result]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [816, 816, 816, 816, 816, 816, 816, 816, 816, 816]
+    median_allocs = 20
+    median_bytes = 816
+    median_ns = 3.1333406e7
+    min_ns = 2.7153895e7
+    times_ns = [3.1600054e7, 3.3309795e7, 3.0439222e7, 3.5817127e7, 3.1066758e7, 2.7153895e7, 2.762158e7, 3.2085834e7, 3.3990694e7, 2.9145284e7]
+[[measurements]]
+active_port = "unconstrained"
+ad_preparation_seconds = 0.07763453
+boundary = "packed_unconstrained"
+configuration = "ad_reactant"
+description = "gradient of the standard-normal coefficient log prior"
+max_abs_error = 0.0
+max_rel_error = 0.0
+model = "vcat_free"
+outcome = "prior"
+provider = "rk"
+reactant_ad_compile_seconds = 2.901049228
+reactant_externalized_bound_array_count = 0
+reactant_first_execution_seconds = 0.027836147
+reactant_transfer_seconds = 9.5962e-5
+state = "supported"
+value_abs_error = 1.7280399333685637e-11
+value_rel_error = 2.6615325236043355e-15
+
+    [measurements.native_control]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 7009.0
+    min_ns = 6829.0
+    times_ns = [6959.0, 6829.0, 6890.0, 7260.0, 7280.0, 6949.0, 7009.0, 7009.0, 7019.0, 7019.0]
+
+    [measurements.result]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [816, 816, 816, 816, 816, 816, 816, 816, 816, 816]
+    median_allocs = 20
+    median_bytes = 816
+    median_ns = 9087.0
+    min_ns = 7310.0
+    times_ns = [7310.0, 8432.0, 9663.0, 8402.0, 11255.0, 8062.0, 10365.0, 8511.0, 12287.0, 13508.0]
+[[measurements]]
+active_port = "unconstrained"
+ad_preparation_seconds = 0.106757202
+boundary = "packed_unconstrained"
+configuration = "ad_reactant"
+description = "gradient of the summed softmax categorical log likelihood"
+max_abs_error = 3.296918293926865e-12
+max_rel_error = 3.6533848236804146e-14
+model = "vcat_free"
+outcome = "likelihood"
+provider = "rk"
+reactant_ad_compile_seconds = 3.379663626
+reactant_externalized_bound_array_count = 0
+reactant_first_execution_seconds = 0.062456971
+reactant_transfer_seconds = 0.168391228
+state = "supported"
+value_abs_error = 3.4924596548080444e-10
+value_rel_error = 2.5147727126956343e-15
+
+    [measurements.native_control]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976]
+    median_allocs = 20
+    median_bytes = 24000976
+    median_ns = 3.0800318e8
+    min_ns = 2.99969301e8
+    times_ns = [3.17157435e8, 3.08170826e8, 3.18707235e8, 3.28292771e8, 3.23916959e8, 2.99969301e8, 3.0665967e8, 3.05963198e8, 3.07835534e8, 3.01030787e8]
+
+    [measurements.result]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [816, 816, 816, 816, 816, 816, 816, 816, 816, 816]
+    median_allocs = 20
+    median_bytes = 816
+    median_ns = 2.625628e7
+    min_ns = 2.4328994e7
+    times_ns = [3.156742e7, 3.2745186e7, 3.2759345e7, 2.9875171e7, 2.6344977e7, 2.5491839e7, 2.5678557e7, 2.4328994e7, 2.4601319e7, 2.6167583e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "ad_reactant"
+description = "pointwise Jacobian/VJP"
+model = "vcat_free"
+outcome = "pointwise"
+provider = "rk"
+reason = "pointwise is vector-valued and no matched public Jacobian/VJP contract is invented"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_reactant"
+description = "gradient of the full joint w.r.t. the packed coefficient vector"
+model = "vcat_free"
+outcome = "joint"
+provider = "rk"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_reactant"
+description = "gradient of the standard-normal coefficient log prior"
+model = "vcat_free"
+outcome = "prior"
+provider = "rk"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_reactant"
+description = "gradient of the summed softmax categorical log likelihood"
+model = "vcat_free"
+outcome = "likelihood"
+provider = "rk"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_reactant"
+description = "pointwise Jacobian/VJP"
+model = "vcat_free"
+outcome = "pointwise"
+provider = "rk"
+reason = "pointwise is vector-valued and no matched public Jacobian/VJP contract is invented"
+state = "unsupported"
+[[measurements]]
+active_port = "unconstrained"
+ad_preparation_seconds = 0.099635709
+boundary = "packed_unconstrained"
+configuration = "ad_reactant_bound"
+description = "gradient of the full joint w.r.t. the packed coefficient vector"
+max_abs_error = 3.296918293926865e-12
+max_rel_error = 3.657940055425549e-14
+model = "vcat_free"
+outcome = "joint"
+provider = "rk"
+reactant_ad_compile_seconds = 2.556914603
+reactant_externalized_bound_array_count = 2
+reactant_first_execution_seconds = 0.075852558
+reactant_transfer_seconds = 0.169790869
+state = "supported"
+value_abs_error = 3.4924596548080444e-10
+value_rel_error = 2.4024559019639883e-15
+
+    [measurements.native_control]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976]
+    median_allocs = 20
+    median_bytes = 24000976
+    median_ns = 3.150334825e8
+    min_ns = 3.05392941e8
+    times_ns = [3.22029684e8, 3.08870943e8, 3.17480642e8, 3.05392941e8, 3.06592938e8, 3.33065612e8, 3.16620714e8, 3.12825834e8, 3.13446251e8, 3.19508641e8]
+
+    [measurements.result]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [816, 816, 816, 816, 816, 816, 816, 816, 816, 816]
+    median_allocs = 20
+    median_bytes = 816
+    median_ns = 3.15858635e7
+    min_ns = 2.800472e7
+    times_ns = [2.800472e7, 3.0979732e7, 3.426729e7, 3.8176297e7, 3.2474286e7, 3.3029991e7, 2.8599005e7, 3.2191995e7, 2.8435439e7, 2.9387374e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "ad_reactant_bound"
+description = "gradient of the standard-normal coefficient log prior"
+model = "vcat_free"
+outcome = "prior"
+provider = "rk"
+reason = "the minimal prior cut has no data ports to bind"
+state = "not_applicable"
+[[measurements]]
+active_port = "unconstrained"
+ad_preparation_seconds = 0.078570694
+boundary = "packed_unconstrained"
+configuration = "ad_reactant_bound"
+description = "gradient of the summed softmax categorical log likelihood"
+max_abs_error = 3.296918293926865e-12
+max_rel_error = 3.6533848236804146e-14
+model = "vcat_free"
+outcome = "likelihood"
+provider = "rk"
+reactant_ad_compile_seconds = 2.675976122
+reactant_externalized_bound_array_count = 2
+reactant_first_execution_seconds = 0.066587823
+reactant_transfer_seconds = 0.175525604
+state = "supported"
+value_abs_error = 3.4924596548080444e-10
+value_rel_error = 2.5147727126956343e-15
+
+    [measurements.native_control]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976]
+    median_allocs = 20
+    median_bytes = 24000976
+    median_ns = 3.074192115e8
+    min_ns = 2.9937704e8
+    times_ns = [3.09197377e8, 3.02801158e8, 3.05641046e8, 2.9937704e8, 3.02009694e8, 3.17025711e8, 3.15809863e8, 3.14771229e8, 3.45307569e8, 3.05221618e8]
+
+    [measurements.result]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [816, 816, 816, 816, 816, 816, 816, 816, 816, 816]
+    median_allocs = 20
+    median_bytes = 816
+    median_ns = 2.8529631e7
+    min_ns = 2.5049248e7
+    times_ns = [2.8376419e7, 2.8044411e7, 3.7624836e7, 3.0259929e7, 2.6677874e7, 3.0457953e7, 2.8682843e7, 3.0112996e7, 2.8206144e7, 2.5049248e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "ad_reactant_bound"
+description = "pointwise Jacobian/VJP"
+model = "vcat_free"
+outcome = "pointwise"
+provider = "rk"
+reason = "pointwise is vector-valued and no matched public Jacobian/VJP contract is invented"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_reactant_bound"
+description = "gradient of the full joint w.r.t. the packed coefficient vector"
+model = "vcat_free"
+outcome = "joint"
+provider = "rk"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_reactant_bound"
+description = "gradient of the standard-normal coefficient log prior"
+model = "vcat_free"
+outcome = "prior"
+provider = "rk"
+reason = "the minimal prior cut has no data ports to bind"
+state = "not_applicable"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_reactant_bound"
+description = "gradient of the summed softmax categorical log likelihood"
+model = "vcat_free"
+outcome = "likelihood"
+provider = "rk"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_reactant_bound"
+description = "pointwise Jacobian/VJP"
+model = "vcat_free"
+outcome = "pointwise"
+provider = "rk"
+reason = "pointwise is vector-valued and no matched public Jacobian/VJP contract is invented"
+state = "unsupported"
+
+[pins]
+ad_receipt_path = "benchmark/receipts/mnist-logistic-ad-v2.toml"
+ad_receipt_reactivekernels_sha = "5fb20e73f74eef33602ed4fbad897a3634f400d6"
+ad_receipt_sha256 = "30c100d5fbda889228656d058fb8fc3308308755fa60082c290c9ad4b6664d37"
+benchmarktools_version = "1.6.3"
+differentiationinterface_version = "0.7.21"
+enzyme_version = "0.13.199"
+idiomatic_source_text_sha256 = "673e72ae2816de7131e275333c8b66248f7d7a0ced2e6f0f769bf2aa17387d0e"
+julia_version = "1.10.11"
+mldatasets_version = "0.7.21"
+reactant_jll_version = "0.0.401+0"
+reactant_version = "0.2.278"
+reactivekernels_dirty = false
+reactivekernels_sha = "5fb20e73f74eef33602ed4fbad897a3634f400d6"
+reactivekernels_version = "0.1.0"
+reactivekernelsdistributionkernels_version = "0.1.0"
+reactivekernelspplexamples_version = "0.1.0"
+source_authority_blob = "a8ce0e88c5f35251fc5af3b22c4f5eea1144029f"
+source_authority_path = "packages/ReactiveKernelsPPLExamples/src/mnist_logistic.jl"
+vcat_free_source_text_sha256 = "2f792708a8d06526eddf5650069f0c496136a6ec1e087fdc63ca9e8d643733a4"
+
+[protocol]
+ad_preparation_in_timed_region = false
+bound_array_compiler_abi = "public residual AD kernel stays data-bound; array-valued bound constants are inactive trailing device operands for compilation and steady-state calls"
+bound_ports = ["X", "y", "num_classes"]
+data = "MLDatasets MNIST train split, first N images"
+estimator = "minimum of per-round BenchmarkTools minimum times (uncontended cost; medians and raw rounds retained)"
+first_execution_in_steady_state_region = false
+gradient_operation = "value and gradient"
+input_boundaries = ["packed_unconstrained", "structured_parameters"]
+matrix_layout = "long-form provider/model/configuration/boundary/outcome rows"
+matrix_source = "benchmark/receipts/mnist-logistic-ad-v2.toml"
+model = "multinomial-logistic MNIST classifier"
+models = ["idiomatic", "vcat_free"]
+num_classes = 10
+num_features = 784
+num_observations = 60000
+outcomes = ["joint", "prior", "likelihood", "pointwise"]
+parity_atol = 1.0e-9
+parity_reference = "native RK reverse pass (ad_value_and_gradient!)"
+parity_rtol = 1.0e-9
+pointwise_jacobian_or_vjp_invented = false
+preparation_in_timed_region = false
+reactant_compile_time_in_timed_region = false
+reactant_readback_in_timed_region = false
+reactant_sync = true
+reactant_transfers_in_timed_region = false
+rk_ad_backend = "AutoEnzyme(mode = Enzyme.Reverse)"
+rk_bound_ad_backend = "AutoEnzyme(mode = Enzyme.Reverse, function_annotation = Enzyme.Const)"
+rk_configurations = ["ad_reactant", "ad_reactant_bound"]
+rk_native_ad_surface = "prepare_ad + ad_value_and_gradient!"
+rk_reactant_ad_surface = "prepare_ad + compile_ad_value_and_gradient"
+rounds = 10
+samples_per_round = 200
+seconds_per_round = 0.2
+setup_in_timed_region = false
+source_reused = true
+structured_multi_active_boundary_invented = false
+unsupported_cells_recorded = true
+
+[setup]
+data_load_seconds = 1.939866892
+environment_seconds = 0.0
+kernel_preparation_seconds = 2.244045949
+package_precompile_seconds = 0.0

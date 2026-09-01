@@ -1,26 +1,25 @@
 #!/usr/bin/env julia
 
+import Statistics
 import TOML
 
-const EXPECTED_BOUNDARIES = ("packed_unconstrained", "structured_parameters")
-const EXPECTED_OUTCOMES = ("joint", "prior", "likelihood", "pointwise")
-const EXPECTED_BACKENDS = ("rk_native", "manual_julia", "turing_native")
+isdefined(@__MODULE__, :MNISTLogisticMatrixSpec) ||
+    include(joinpath(dirname(@__DIR__), "mnist_logistic_matrix_spec.jl"))
+using .MNISTLogisticMatrixSpec
 
-# Turing's public interfaces cover the joint, prior, and summed likelihood, but
-# the model's likelihood is a single `@addlogprob!` term, so there is no public
-# per-observation Turing pointwise view. That cell is omitted, not synthesized.
-function _expected_support(boundary, outcome, backend)
-    backend == "turing_native" && outcome == "pointwise" && return false
-    true
-end
+const EXPECTED_PRIMAL_CONFIGURATIONS = Tuple(
+    configuration for configuration in MNIST_RK_CONFIGURATIONS
+    if configuration.differentiation == "primal" &&
+       configuration.compiler == "native"
+)
 
 function validate_mnist_logistic_receipt(path::AbstractString)
     receipt = TOML.parsefile(path)
     errors = String[]
     require(condition, message) = condition || push!(errors, message)
 
-    require(get(receipt, "schema", "") == "mnist-logistic-v1",
-            "schema must be mnist-logistic-v1")
+    require(get(receipt, "schema", "") == "mnist-logistic-primal-v3",
+            "schema must be mnist-logistic-primal-v3")
     for section in ("pins", "environment", "protocol", "measurements")
         require(haskey(receipt, section), "missing $section")
     end
@@ -32,7 +31,8 @@ function validate_mnist_logistic_receipt(path::AbstractString)
         "reactivekernelspplexamples_version",
         "reactivekernelsdistributionkernels_version", "turing_version",
         "dynamicppl_version", "distributions_version", "nnlib_version",
-        "mldatasets_version", "benchmarktools_version", "julia_version",
+        "mldatasets_version", "benchmarktools_version",
+        "mutatingfunctions_version", "mutatingfunctions_rev", "julia_version",
     )
         require(haskey(pins, key) && !isempty(string(pins[key])),
                 "pins.$key missing")
@@ -43,10 +43,20 @@ function validate_mnist_logistic_receipt(path::AbstractString)
             "receipt must come from a clean detached ReactiveKernels tree")
 
     protocol = receipt["protocol"]
-    require(Tuple(protocol["input_boundaries"]) == EXPECTED_BOUNDARIES,
+    require(Tuple(get(protocol, "input_boundaries", String[])) == MNIST_BOUNDARIES,
             "input-boundary matrix mismatch")
-    require(Tuple(protocol["outcomes"]) == EXPECTED_OUTCOMES,
+    require(Tuple(get(protocol, "outcomes", String[])) == MNIST_OUTCOMES,
             "outcome matrix mismatch")
+    require(Tuple(get(protocol, "models", String[])) == MNIST_MODELS,
+            "model inventory mismatch")
+    require(Tuple(get(protocol, "rk_configurations", String[])) ==
+            Tuple(configuration.id for configuration in EXPECTED_PRIMAL_CONFIGURATIONS),
+            "native primal configuration inventory mismatch")
+    require(get(protocol, "matrix_layout", "") ==
+            "long-form provider/model/configuration/boundary/outcome rows",
+            "receipt must use the long-form capability matrix")
+    require(Tuple(get(protocol, "bound_ports", String[])) ==
+            ("X", "y", "num_classes"), "bound-port inventory mismatch")
     require(Int(get(protocol, "rounds", 0)) >= 10,
             "published receipt must use at least 10 rounds")
     require(Int(get(protocol, "num_observations", 0)) > 0,
@@ -66,34 +76,95 @@ function validate_mnist_logistic_receipt(path::AbstractString)
     require(get(protocol, "gradients_included", true) == false,
             "MNIST logistic primal receipt must not contain gradients")
 
+    function checked_result(row, label)
+        haskey(row, "result") || (require(false, "$label lacks a result"); return)
+        result = row["result"]
+        times = Float64.(get(result, "times_ns", Float64[]))
+        bytes = Int.(get(result, "bytes", Int[]))
+        allocs = Int.(get(result, "allocs", Int[]))
+        require(length(times) >= 10, "$label needs ten raw timing rounds")
+        require(length(bytes) == length(times) && length(allocs) == length(times),
+                "$label raw measurement vector lengths differ")
+        isempty(times) && return
+        require(all(>(0), times), "$label has non-positive timing")
+        require(all(>=(0), bytes), "$label has negative allocated bytes")
+        require(all(>=(0), allocs), "$label has negative allocation counts")
+        require(isapprox(Float64(get(result, "min_ns", NaN)), minimum(times);
+                         rtol = 1e-12), "$label minimum mismatch")
+        require(isapprox(Float64(get(result, "median_ns", NaN)),
+                         Statistics.median(times); rtol = 1e-12),
+                "$label timing median mismatch")
+        require(Int(get(result, "median_bytes", -1)) == Int(Statistics.median(bytes)),
+                "$label byte median mismatch")
+        require(Int(get(result, "median_allocs", -1)) == Int(Statistics.median(allocs)),
+                "$label allocation median mismatch")
+    end
+
     measurements = receipt["measurements"]
-    require(length(measurements) ==
-            length(EXPECTED_BOUNDARIES) * length(EXPECTED_OUTCOMES),
-            "matrix must contain exactly one row per boundary/outcome pair")
-    for boundary in EXPECTED_BOUNDARIES, outcome in EXPECTED_OUTCOMES
-        matching = filter(measurements) do row
-            row["boundary"] == boundary && row["outcome"] == outcome
+    expected_count =
+        length(MNIST_MODELS) * length(EXPECTED_PRIMAL_CONFIGURATIONS) *
+            length(MNIST_BOUNDARIES) * length(MNIST_OUTCOMES) +
+        length(MNIST_BOUNDARIES) * length(MNIST_OUTCOMES) +
+        2 * length(MNIST_BOUNDARIES) * length(MNIST_OUTCOMES)
+    require(length(measurements) == expected_count,
+            "long-form primal matrix must contain $expected_count rows")
+    keys = [
+        (row["provider"], row["model"], row["configuration"],
+         row["boundary"], row["outcome"]) for row in measurements
+    ]
+    require(length(Set(keys)) == length(keys), "matrix contains duplicate cells")
+
+    function only_cell(provider, model, configuration, boundary, outcome)
+        matches = filter(measurements) do row
+            row["provider"] == provider && row["model"] == model &&
+                row["configuration"] == configuration &&
+                row["boundary"] == boundary && row["outcome"] == outcome
         end
-        require(length(matching) == 1,
-                "expected one row for $boundary / $outcome")
-        length(matching) == 1 || continue
-        row = only(matching)
-        for backend in EXPECTED_BACKENDS
-            supported = _expected_support(boundary, outcome, backend)
-            require(haskey(row, backend) == supported,
-                    "$boundary / $outcome / $backend support mismatch")
-            supported || continue
-            result = row[backend]
-            require(length(result["times_ns"]) >= 10,
-                    "$boundary / $outcome / $backend needs ten raw timing rounds")
-            require(Float64(result["median_ns"]) > 0,
-                    "$boundary / $outcome / $backend median_ns must be positive")
-            require(haskey(result, "min_ns") && Float64(result["min_ns"]) > 0,
-                    "$boundary / $outcome / $backend min_ns must be positive")
-            require(Int(result["median_bytes"]) >= 0,
-                    "$boundary / $outcome / $backend bytes must be nonnegative")
-            require(Int(result["median_allocs"]) >= 0,
-                    "$boundary / $outcome / $backend allocs must be nonnegative")
+        require(length(matches) == 1,
+                "expected one $provider / $model / $configuration / " *
+                "$boundary / $outcome row")
+        length(matches) == 1 ? only(matches) : nothing
+    end
+
+    for model in MNIST_MODELS, configuration in EXPECTED_PRIMAL_CONFIGURATIONS,
+        boundary in MNIST_BOUNDARIES, outcome in MNIST_OUTCOMES
+        row = only_cell("rk", model, configuration.id, boundary, outcome)
+        row === nothing && continue
+        expected_state, _ = matrix_support(configuration, boundary, outcome)
+        state = get(row, "state", "")
+        require(state == expected_state,
+                "RK support drift for $model / $(configuration.id) / $boundary / $outcome")
+        if state == "supported"
+            checked_result(row,
+                "RK $model / $(configuration.id) / $boundary / $outcome")
+        else
+            require(!haskey(row, "result"), "non-measured RK cell contains a result")
+            require(!isempty(get(row, "reason", "")),
+                    "non-measured RK cell lacks a reason")
+        end
+    end
+
+    for boundary in MNIST_BOUNDARIES, outcome in MNIST_OUTCOMES
+        manual = only_cell(
+            "manual_julia", "implicit_reference", "manual_primal",
+            boundary, outcome)
+        manual === nothing || checked_result(
+            manual, "manual / $boundary / $outcome")
+        for model in MNIST_MODELS
+            configuration = "turing_$(model)_primal"
+            row = only_cell("turing", model, configuration, boundary, outcome)
+            row === nothing && continue
+            expected_state = outcome == "pointwise" ? "unsupported" : "supported"
+            require(get(row, "state", "") == expected_state,
+                    "Turing support drift for $model / $boundary / $outcome")
+            if expected_state == "supported"
+                checked_result(row, "Turing $model / $boundary / $outcome")
+            else
+                require(!haskey(row, "result"),
+                        "unsupported Turing pointwise cell contains a result")
+                require(!isempty(get(row, "reason", "")),
+                        "unsupported Turing pointwise cell lacks a reason")
+            end
         end
     end
 
@@ -103,7 +174,8 @@ end
 function main(path)
     errors = validate_mnist_logistic_receipt(path)
     if isempty(errors)
-        println("VALIDATE OK — mnist-logistic-v1: 2×4 capability/timing matrix accepted")
+        println("VALIDATE OK — mnist-logistic-primal-v3: " *
+                "two-model native/bound/nonallocating matrix accepted")
         return 0
     end
     foreach(println, errors)

@@ -1,27 +1,25 @@
 #!/usr/bin/env julia
 
+import Statistics
 import TOML
 
-const EXPECTED_BOUNDARIES = (
-    "packed_unconstrained", "constrained_parameters", "minimal_likelihood")
-const EXPECTED_OUTCOMES = ("joint", "prior", "likelihood", "pointwise")
-const EXPECTED_BACKENDS = ("rk_native", "manual_julia", "turing_native")
+isdefined(@__MODULE__, :EightSchoolsMatrixSpec) ||
+    include(joinpath(dirname(@__DIR__), "eight_schools_matrix_spec.jl"))
+using .EightSchoolsMatrixSpec
 
-function _expected_support(boundary, outcome, backend)
-    if boundary == "minimal_likelihood"
-        return outcome in ("likelihood", "pointwise") &&
-               backend in ("rk_native", "manual_julia")
-    end
-    true
-end
+const EXPECTED_EIGHT_SCHOOLS_PRIMAL_CONFIGURATIONS = Tuple(
+    configuration for configuration in EIGHT_SCHOOLS_RK_CONFIGURATIONS
+    if configuration.differentiation == "primal" &&
+       configuration.compiler == "native"
+)
 
 function validate_eight_schools_primal_receipt(path::AbstractString)
     receipt = TOML.parsefile(path)
     errors = String[]
     require(condition, message) = condition || push!(errors, message)
 
-    require(get(receipt, "schema", "") == "eight-schools-primal-v1",
-            "schema must be eight-schools-primal-v1")
+    require(get(receipt, "schema", "") == "eight-schools-primal-v2",
+            "schema must be eight-schools-primal-v2")
     for section in ("pins", "environment", "protocol", "measurements")
         require(haskey(receipt, section), "missing $section")
     end
@@ -33,7 +31,7 @@ function validate_eight_schools_primal_receipt(path::AbstractString)
         "reactivekernelspplexamples_version",
         "reactivekernelsdistributionkernels_version", "turing_version",
         "dynamicppl_version", "distributions_version", "benchmarktools_version",
-        "julia_version",
+        "mutatingfunctions_version", "mutatingfunctions_rev", "julia_version",
     )
         require(haskey(pins, key) && !isempty(string(pins[key])),
                 "pins.$key missing")
@@ -41,69 +39,121 @@ function validate_eight_schools_primal_receipt(path::AbstractString)
     require(occursin(r"^[0-9a-f]{40}$", get(pins, "reactivekernels_sha", "")),
             "ReactiveKernels receipt pin must be a full commit SHA")
     require(get(pins, "reactivekernels_dirty", true) == false,
-            "receipt must come from a clean detached ReactiveKernels tree")
+            "receipt must come from a clean ReactiveKernels tree")
 
     protocol = receipt["protocol"]
-    require(Tuple(protocol["input_boundaries"]) == EXPECTED_BOUNDARIES,
-            "input-boundary matrix mismatch")
-    require(Tuple(protocol["outcomes"]) == EXPECTED_OUTCOMES,
+    require(Tuple(get(protocol, "models", String[])) == EIGHT_SCHOOLS_MODELS,
+            "model inventory mismatch")
+    require(Tuple(get(protocol, "input_boundaries", String[])) ==
+            EIGHT_SCHOOLS_BOUNDARIES, "input-boundary matrix mismatch")
+    require(Tuple(get(protocol, "outcomes", String[])) == EIGHT_SCHOOLS_OUTCOMES,
             "outcome matrix mismatch")
+    require(Tuple(get(protocol, "rk_configurations", String[])) == Tuple(
+            configuration.id for configuration in
+            EXPECTED_EIGHT_SCHOOLS_PRIMAL_CONFIGURATIONS),
+            "native primal configuration inventory mismatch")
+    require(get(protocol, "matrix_layout", "") ==
+            "long-form provider/model/configuration/boundary/outcome rows",
+            "receipt must use the long-form capability matrix")
+    require(Tuple(get(protocol, "bound_ports", String[])) ==
+            ("observations", "observation_scales"),
+            "bound-port inventory mismatch")
     require(Int(get(protocol, "rounds", 0)) >= 10,
-            "published receipt must use at least 10 rounds")
-    require(get(protocol, "setup_in_timed_region", true) == false,
-            "setup must be outside timing")
-    require(get(protocol, "preparation_in_timed_region", true) == false,
-            "kernel/LDF preparation must be outside timing")
-    require(get(protocol, "turing_transform_strategy", "") == "fixed transforms",
-            "Turing sampler-space rows must use fixed transforms")
-    require(get(protocol, "turing_pointwise_api", "") ==
-            "DynamicPPL.pointwise_loglikelihoods",
-            "Turing pointwise row must use its public pointwise API")
+            "published receipt must use at least ten rounds")
+    for key in ("setup_in_timed_region", "preparation_in_timed_region")
+        require(get(protocol, key, true) == false, "$key must be false")
+    end
+    require(get(protocol, "unsupported_cells_recorded", false) == true,
+            "unsupported cells must be recorded")
     require(get(protocol, "gradients_included", true) == false,
-            "Eight Schools primal receipt must not contain gradients")
-    require(get(protocol, "generated_predictions_included", true) == false,
-            "predictive generated quantities must not enter this comparison")
-    require(get(protocol, "unsupported_cells_omitted", false) == true,
-            "unsupported cells must be omitted rather than synthesized")
+            "primal receipt must not contain gradients")
 
-    measurements = receipt["measurements"]
-    require(length(measurements) ==
-            length(EXPECTED_BOUNDARIES) * length(EXPECTED_OUTCOMES),
-            "matrix must contain exactly one row per boundary/outcome pair")
-    for boundary in EXPECTED_BOUNDARIES, outcome in EXPECTED_OUTCOMES
-        matching = filter(measurements) do row
-            row["boundary"] == boundary && row["outcome"] == outcome
+    function checked_result(row, label)
+        haskey(row, "result") || (require(false, "$label lacks a result"); return)
+        result = row["result"]
+        times = Float64.(get(result, "times_ns", Float64[]))
+        bytes = Int.(get(result, "bytes", Int[]))
+        allocs = Int.(get(result, "allocs", Int[]))
+        require(length(times) >= 10, "$label needs ten timing rounds")
+        require(length(bytes) == length(times) && length(allocs) == length(times),
+                "$label raw measurement lengths differ")
+        isempty(times) && return
+        require(all(>(0), times), "$label has non-positive timing")
+        require(isapprox(Float64(get(result, "median_ns", NaN)),
+                         Statistics.median(times); rtol = 1e-12),
+                "$label timing median mismatch")
+        require(Int(get(result, "median_bytes", -1)) ==
+                Int(Statistics.median(bytes)), "$label byte median mismatch")
+        require(Int(get(result, "median_allocs", -1)) ==
+                Int(Statistics.median(allocs)), "$label allocation median mismatch")
+    end
+
+    rows = receipt["measurements"]
+    expected_count =
+        length(EXPECTED_EIGHT_SCHOOLS_PRIMAL_CONFIGURATIONS) *
+            length(EIGHT_SCHOOLS_BOUNDARIES) * length(EIGHT_SCHOOLS_OUTCOMES) +
+        2 * length(EIGHT_SCHOOLS_BOUNDARIES) * length(EIGHT_SCHOOLS_OUTCOMES)
+    require(length(rows) == expected_count,
+            "long-form primal matrix must contain $expected_count rows")
+    keys = [(row["provider"], row["model"], row["configuration"],
+             row["boundary"], row["outcome"]) for row in rows]
+    require(length(Set(keys)) == length(keys), "matrix contains duplicate cells")
+
+    function only_cell(provider, configuration, boundary, outcome)
+        matches = filter(rows) do row
+            row["provider"] == provider && row["model"] == "centered" &&
+                row["configuration"] == configuration &&
+                row["boundary"] == boundary && row["outcome"] == outcome
         end
-        require(length(matching) == 1,
-                "expected one row for $boundary / $outcome")
-        length(matching) == 1 || continue
-        row = only(matching)
-        for backend in EXPECTED_BACKENDS
-            supported = _expected_support(boundary, outcome, backend)
-            require(haskey(row, backend) == supported,
-                    "$boundary / $outcome / $backend support mismatch")
-            supported || continue
-            result = row[backend]
-            require(length(result["times_ns"]) >= 10,
-                    "$boundary / $outcome / $backend needs ten raw timing rounds")
-            require(Float64(result["median_ns"]) > 0,
-                    "$boundary / $outcome / $backend median_ns must be positive")
-            require(Int(result["median_bytes"]) >= 0,
-                    "$boundary / $outcome / $backend bytes must be nonnegative")
-            require(Int(result["median_allocs"]) >= 0,
-                    "$boundary / $outcome / $backend allocs must be nonnegative")
+        require(length(matches) == 1,
+                "expected one $provider / $configuration / $boundary / $outcome row")
+        length(matches) == 1 ? only(matches) : nothing
+    end
+
+    for configuration in EXPECTED_EIGHT_SCHOOLS_PRIMAL_CONFIGURATIONS,
+        boundary in EIGHT_SCHOOLS_BOUNDARIES, outcome in EIGHT_SCHOOLS_OUTCOMES
+        row = only_cell("rk", configuration.id, boundary, outcome)
+        row === nothing && continue
+        expected_state, _ = matrix_support(configuration, boundary, outcome)
+        require(get(row, "state", "") == expected_state,
+                "RK support drift for $(configuration.id) / $boundary / $outcome")
+        if expected_state == "supported"
+            checked_result(row, "RK $(configuration.id) / $boundary / $outcome")
+        else
+            require(!haskey(row, "result"), "non-measured RK cell has a result")
+            require(!isempty(get(row, "reason", "")),
+                    "non-measured RK cell lacks a reason")
         end
     end
 
+    for boundary in EIGHT_SCHOOLS_BOUNDARIES, outcome in EIGHT_SCHOOLS_OUTCOMES
+        manual = only_cell("manual_julia", "manual_primal", boundary, outcome)
+        manual_state = boundary == "minimal_likelihood" &&
+            outcome in ("joint", "prior") ? "unsupported" : "supported"
+        manual === nothing || require(get(manual, "state", "") == manual_state,
+            "manual support drift for $boundary / $outcome")
+        manual === nothing || (manual_state == "supported" ?
+            checked_result(manual, "manual / $boundary / $outcome") :
+            require(!haskey(manual, "result"),
+                    "unsupported manual cell has a result"))
+
+        turing = only_cell("turing", "turing_primal", boundary, outcome)
+        turing_state = boundary == "minimal_likelihood" ?
+            "unsupported" : "supported"
+        turing === nothing || require(get(turing, "state", "") == turing_state,
+            "Turing support drift for $boundary / $outcome")
+        turing === nothing || (turing_state == "supported" ?
+            checked_result(turing, "Turing / $boundary / $outcome") :
+            require(!haskey(turing, "result"),
+                    "unsupported Turing cell has a result"))
+    end
     errors
 end
 
 function main(path)
     errors = validate_eight_schools_primal_receipt(path)
-    if isempty(errors)
-        println("VALIDATE OK — eight-schools-primal-v1: 3×4 capability/timing matrix accepted")
-        return 0
-    end
+    isempty(errors) &&
+        (println("VALIDATE OK — eight-schools-primal-v2 matrix accepted"); return 0)
     foreach(println, errors)
     1
 end

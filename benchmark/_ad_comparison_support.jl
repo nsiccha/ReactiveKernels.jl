@@ -10,7 +10,11 @@ using Statistics
 
 include(joinpath(@__DIR__, "_comparison_source_attestation.jl"))
 using .ComparisonSourceAttestation:
-    comparator_source_matches_current_delta, COMPARATOR_SOURCE_CURRENT_DELTA
+    comparator_source_matches_current_delta, COMPARATOR_SOURCE_CURRENT_DELTA,
+    eight_schools_model_source_preserves_published_authority,
+    EIGHT_SCHOOLS_MODEL_SOURCE_CURRENT_DELTA,
+    mnist_model_source_preserves_published_authority,
+    MNIST_COMPARATOR_SOURCE_CURRENT_DELTA, MNIST_MODEL_SOURCE_CURRENT_DELTA
 
 export RKValueGradientCall, DIValueGradientCall, TuringValueGradientCall
 export RKAllocatingValueGradientCall, DIAllocatingValueGradientCall
@@ -22,6 +26,10 @@ export package_version, output_path
 export normalized_text, normalized_read, text_sha256
 export source_pin, published_source_pin, nothing_paths
 export comparator_source_matches_current_delta, COMPARATOR_SOURCE_CURRENT_DELTA
+export eight_schools_model_source_preserves_published_authority
+export EIGHT_SCHOOLS_MODEL_SOURCE_CURRENT_DELTA
+export mnist_model_source_preserves_published_authority
+export MNIST_COMPARATOR_SOURCE_CURRENT_DELTA, MNIST_MODEL_SOURCE_CURRENT_DELTA
 
 const LDP = DynamicPPL.LogDensityProblems
 

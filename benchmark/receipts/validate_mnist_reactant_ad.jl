@@ -1,5 +1,7 @@
 #!/usr/bin/env julia
 
+module MNISTReactantADV1Validation
+
 import SHA
 import Statistics
 import TOML
@@ -245,11 +247,263 @@ function validate_mnist_reactant_ad_receipt(
             "all native scalar AD cells must compile through Reactant")
     errors
 end
+end # module MNISTReactantADV1Validation
+
+import SHA
+import Statistics
+import TOML
+
+include(joinpath(@__DIR__, "_validate_mnist_dataset_profile.jl"))
+
+isdefined(@__MODULE__, :MNISTLogisticMatrixSpec) ||
+    include(joinpath(dirname(@__DIR__), "mnist_logistic_matrix_spec.jl"))
+using .MNISTLogisticMatrixSpec
+
+const EXPECTED_MNIST_REACTANT_AD_CONFIGURATIONS = Tuple(
+    configuration for configuration in MNIST_RK_CONFIGURATIONS
+    if configuration.differentiation == "value_and_gradient" &&
+       configuration.compiler == "reactant"
+)
+
+_mnist_reactant_ad_median(values) = Statistics.median(Float64.(values))
+_mnist_reactant_ad_text_sha256(path) = bytes2hex(SHA.sha256(
+    replace(read(path, String), "\r\n" => "\n", "\r" => "\n")))
+
+function _validate_mnist_reactant_ad_v2_receipt(
+    path::AbstractString;
+    ad_path::AbstractString = joinpath(dirname(path), "mnist-logistic-ad-v2.toml"),
+)
+    receipt = TOML.parsefile(path)
+    errors = String[]
+    require(condition, message) = condition || push!(errors, message)
+
+    require(get(receipt, "schema", "") == "mnist-reactant-ad-v2",
+            "schema must be mnist-reactant-ad-v2")
+    for section in ("pins", "environment", "setup", "protocol", "measurements")
+        require(haskey(receipt, section), "missing $section")
+    end
+    require(isfile(ad_path), "missing matched native-AD receipt: $ad_path")
+    isempty(errors) || return errors
+
+    native_ad = TOML.parsefile(ad_path)
+    require(get(native_ad, "schema", "") == "mnist-logistic-ad-v2",
+            "matched receipt must use schema mnist-logistic-ad-v2")
+    pins = receipt["pins"]
+    require(get(pins, "reactivekernels_dirty", true) == false,
+            "receipt must come from a clean ReactiveKernels tree")
+    for key in (
+        "reactivekernels_sha", "reactivekernels_version",
+        "reactivekernelspplexamples_version",
+        "reactivekernelsdistributionkernels_version", "reactant_version",
+        "reactant_jll_version", "enzyme_version",
+        "differentiationinterface_version", "benchmarktools_version",
+        "mldatasets_version", "julia_version", "source_authority_path",
+        "source_authority_blob", "idiomatic_source_text_sha256",
+        "vcat_free_source_text_sha256", "ad_receipt_path",
+        "ad_receipt_sha256", "ad_receipt_reactivekernels_sha",
+    )
+        require(haskey(pins, key) && !isempty(string(pins[key])), "pins.$key missing")
+    end
+    require(occursin(r"^[0-9a-f]{40}$", get(pins, "reactivekernels_sha", "")),
+            "ReactiveKernels receipt pin must be a full commit SHA")
+    require(occursin(r"^[0-9a-f]{40}$", get(pins, "source_authority_blob", "")),
+            "source authority must be a full Git blob SHA")
+    for key in ("idiomatic_source_text_sha256", "vcat_free_source_text_sha256")
+        require(occursin(r"^[0-9a-f]{64}$", get(pins, key, "")),
+                "$key must be a SHA-256 digest")
+    end
+    require(get(pins, "source_authority_path", "") ==
+            "packages/ReactiveKernelsPPLExamples/src/mnist_logistic.jl",
+            "unexpected MNIST source-authority path")
+    require(get(pins, "ad_receipt_path", "") ==
+            "benchmark/receipts/mnist-logistic-ad-v2.toml",
+            "matched native-AD path mismatch")
+    require(get(pins, "ad_receipt_sha256", "") ==
+            _mnist_reactant_ad_text_sha256(ad_path),
+            "matched native-AD receipt digest mismatch")
+    require(get(pins, "ad_receipt_reactivekernels_sha", "") ==
+            get(native_ad["pins"], "reactivekernels_sha", ""),
+            "matched native-AD receipt code pin mismatch")
+
+    protocol = receipt["protocol"]
+    require(Tuple(get(protocol, "input_boundaries", String[])) == MNIST_BOUNDARIES,
+            "input-boundary matrix mismatch")
+    require(Tuple(get(protocol, "outcomes", String[])) == MNIST_OUTCOMES,
+            "outcome matrix mismatch")
+    require(Tuple(get(protocol, "models", String[])) == MNIST_MODELS,
+            "model inventory mismatch")
+    require(Tuple(get(protocol, "rk_configurations", String[])) ==
+            Tuple(configuration.id for configuration in
+                  EXPECTED_MNIST_REACTANT_AD_CONFIGURATIONS),
+            "Reactant-AD configuration inventory mismatch")
+    require(get(protocol, "matrix_layout", "") ==
+            "long-form provider/model/configuration/boundary/outcome rows",
+            "Reactant-AD receipt must use the long-form capability matrix")
+    require(Tuple(get(protocol, "bound_ports", String[])) ==
+            ("X", "y", "num_classes"), "bound-port inventory mismatch")
+    require(Int(get(protocol, "num_observations", 0)) ==
+            Int(get(native_ad["protocol"], "num_observations", -1)),
+            "observation count must match native AD")
+    require(Int(get(protocol, "num_features", 0)) == 784,
+            "MNIST Reactant-AD receipt must use all 784 pixels")
+    _validate_mnist_dataset_profile!(require, protocol, native_ad["protocol"])
+    require(Int(get(protocol, "num_classes", 0)) == 10,
+            "MNIST Reactant-AD receipt must cover ten classes")
+    require(get(protocol, "matrix_source", "") ==
+            "benchmark/receipts/mnist-logistic-ad-v2.toml",
+            "benchmark must name the matched native-AD receipt")
+    require(Int(get(protocol, "rounds", 0)) >= 10,
+            "published receipt must contain at least ten rounds")
+    require(get(protocol, "reactant_sync", false) == true,
+            "Reactant timings must use sync=true")
+    for key in ("setup_in_timed_region", "preparation_in_timed_region",
+                "ad_preparation_in_timed_region",
+                "reactant_compile_time_in_timed_region",
+                "reactant_transfers_in_timed_region",
+                "reactant_readback_in_timed_region",
+                "first_execution_in_steady_state_region")
+        require(get(protocol, key, true) == false, "$key must be false")
+    end
+    require(get(protocol, "pointwise_jacobian_or_vjp_invented", true) == false,
+            "pointwise Jacobian/VJP must not be invented")
+    require(get(protocol, "structured_multi_active_boundary_invented", true) == false,
+            "structured multi-active AD must not be invented")
+
+    setup = receipt["setup"]
+    for key in ("environment_seconds", "package_precompile_seconds",
+                "data_load_seconds", "kernel_preparation_seconds")
+        require(Float64(get(setup, key, -1)) >= 0, "setup.$key must be nonnegative")
+    end
+
+    function checked_measurement(result, label)
+        times = Float64.(get(result, "times_ns", Float64[]))
+        require(length(times) >= 10, "$label needs ten timing rounds")
+        isempty(times) && return
+        require(all(>(0), times), "$label has non-positive timing")
+        require(isapprox(Float64(get(result, "min_ns", NaN)), minimum(times);
+                         rtol = 1e-12), "$label minimum mismatch")
+        require(isapprox(Float64(get(result, "median_ns", NaN)),
+                         _mnist_reactant_ad_median(times); rtol = 1e-12),
+                "$label median mismatch")
+    end
+
+    rows = receipt["measurements"]
+    expected_count = length(MNIST_MODELS) *
+        length(EXPECTED_MNIST_REACTANT_AD_CONFIGURATIONS) *
+        length(MNIST_BOUNDARIES) * length(MNIST_OUTCOMES)
+    require(length(rows) == expected_count,
+            "long-form Reactant-AD matrix must contain $expected_count rows")
+    keys = [(row["model"], row["configuration"], row["boundary"], row["outcome"])
+            for row in rows]
+    require(length(Set(keys)) == length(keys),
+            "Reactant-AD matrix contains duplicate cells")
+
+    compiled_prior_models = Set{String}()
+    for model in MNIST_MODELS,
+        configuration in EXPECTED_MNIST_REACTANT_AD_CONFIGURATIONS,
+        boundary in MNIST_BOUNDARIES, outcome in MNIST_OUTCOMES
+        matches = filter(rows) do row
+            row["provider"] == "rk" && row["model"] == model &&
+                row["configuration"] == configuration.id &&
+                row["boundary"] == boundary && row["outcome"] == outcome
+        end
+        require(length(matches) == 1,
+                "expected one RK / $model / $(configuration.id) / " *
+                "$boundary / $outcome row")
+        length(matches) == 1 || continue
+        row = only(matches)
+        expected_state, _ = matrix_support(configuration, boundary, outcome)
+
+        native_configuration = configuration.data == "bound" ?
+            "ad_native_bound" : "ad_native"
+        native_matches = filter(native_ad["measurements"]) do candidate
+            candidate["provider"] == "rk" && candidate["model"] == model &&
+                candidate["configuration"] == native_configuration &&
+                candidate["boundary"] == boundary && candidate["outcome"] == outcome
+        end
+        require(length(native_matches) == 1,
+                "matched native-AD row missing for $model / " *
+                "$native_configuration / $boundary / $outcome")
+        length(native_matches) == 1 && require(
+            get(only(native_matches), "state", "") == expected_state,
+            "matched native-AD support drift")
+
+        if expected_state != "supported"
+            require(get(row, "state", "") == expected_state,
+                    "deliberate Reactant-AD support state drift")
+            require(!haskey(row, "result"),
+                    "non-measured Reactant-AD cell has data")
+            require(!isempty(get(row, "reason", "")),
+                    "non-measured Reactant-AD cell lacks a reason")
+            continue
+        end
+
+        require(get(row, "active_port", "") == "unconstrained",
+                "Reactant-AD active port mismatch")
+        require(Float64(get(row, "ad_preparation_seconds", -1.0)) >= 0,
+                "native AD preparation time missing")
+        require(haskey(row, "native_control"),
+                "supported Reactant-AD cell lacks native control")
+        haskey(row, "native_control") && checked_measurement(
+            row["native_control"], "$model / $(configuration.id) / " *
+            "$boundary / $outcome native AD")
+        require(Float64(get(row, "reactant_transfer_seconds", -1.0)) >= 0,
+                "Reactant-AD transfer setup missing")
+        require(Float64(get(row, "reactant_ad_compile_seconds", -1.0)) >= 0,
+                "Reactant-AD compile attempt missing")
+        state = get(row, "state", "")
+        require(state in ("supported", "unsupported_runtime"),
+                "runtime Reactant-AD state is invalid")
+        if state == "supported"
+            require(haskey(row, "result"),
+                    "supported Reactant-AD cell lacks a measurement")
+            haskey(row, "result") && checked_measurement(
+                row["result"], "$model / $(configuration.id) / " *
+                "$boundary / $outcome Reactant AD")
+            require(Float64(get(row, "reactant_first_execution_seconds", -1.0)) >= 0,
+                    "Reactant-AD first execution missing")
+            require(Float64(get(row, "max_rel_error", Inf)) <= 1e-9,
+                    "native/Reactant gradient parity tolerance exceeded")
+            require(Float64(get(row, "value_rel_error", Inf)) <= 1e-9,
+                    "native/Reactant value parity tolerance exceeded")
+            configuration.data == "unbound" && outcome == "prior" &&
+                push!(compiled_prior_models, model)
+        else
+            require(!haskey(row, "result"),
+                    "runtime-unsupported Reactant-AD cell contains data")
+            require(!isempty(get(row, "reason", "")),
+                    "runtime-unsupported Reactant-AD cell lacks a diagnostic")
+        end
+    end
+    require(compiled_prior_models == Set(MNIST_MODELS),
+            "both public models must retain unbound prior Reactant-AD support")
+    errors
+end
+
+function validate_mnist_reactant_ad_receipt(
+    path::AbstractString;
+    ad_path::Union{Nothing,AbstractString} = nothing,
+)
+    schema = get(TOML.parsefile(path), "schema", "")
+    if schema == "mnist-reactant-ad-v1"
+        companion = isnothing(ad_path) ?
+            joinpath(dirname(path), "mnist-logistic-ad-v1.toml") : String(ad_path)
+        return MNISTReactantADV1Validation.validate_mnist_reactant_ad_receipt(
+            path; ad_path = companion)
+    elseif schema == "mnist-reactant-ad-v2"
+        companion = isnothing(ad_path) ?
+            joinpath(dirname(path), "mnist-logistic-ad-v2.toml") : String(ad_path)
+        return _validate_mnist_reactant_ad_v2_receipt(
+            path; ad_path = companion)
+    end
+    ["schema must be mnist-reactant-ad-v1 or mnist-reactant-ad-v2"]
+end
 
 function main(path)
     errors = validate_mnist_reactant_ad_receipt(path)
     if isempty(errors)
-        println("VALIDATE OK — mnist-reactant-ad-v1: matched 2×4 matrix accepted")
+        println("VALIDATE OK — mnist-reactant-ad-v2: " *
+                "two-model unbound/bound Reactant-AD matrix accepted")
         return 0
     end
     foreach(println, errors)

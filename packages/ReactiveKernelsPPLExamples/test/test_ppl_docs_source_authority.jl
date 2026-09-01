@@ -19,7 +19,17 @@ const PPL_SOURCE_CASES = (
      :GAUSSIAN_MIXTURE_SOURCE, :evaluate_gaussian_mixture_source),
     ("mnist-logistic.md", "mnist_logistic.jl", MNISTLogisticExample,
      :MNIST_LOGISTIC_SOURCE, :evaluate_mnist_logistic_source),
+    ("mnist-logistic.md", "mnist_logistic.jl", MNISTLogisticExample,
+     :MNIST_LOGISTIC_OPTIMIZED_SOURCE, :evaluate_mnist_logistic_optimized_source),
 )
+
+# One displayed/executed authority kernel per registered case: a file carrying
+# two cases (the idiomatic and optimized MNIST models) declares exactly two.
+const _KERNELS_PER_EXAMPLE_FILE = Dict{String,Int}()
+for case in PPL_SOURCE_CASES
+    _KERNELS_PER_EXAMPLE_FILE[case[2]] =
+        get(_KERNELS_PER_EXAMPLE_FILE, case[2], 0) + 1
+end
 
 @testset "PPL docs and tests share one source authority" begin
     for (page_name, example_name, owner, source_name, evaluator_name) in
@@ -33,7 +43,8 @@ const PPL_SOURCE_CASES = (
         @test occursin(":$(nameof(owner)), :$source_name", page)
         @test !occursin("raw\"\"\"", page)
         @test occursin("packages/ReactiveKernelsPPLExamples/src/$example_name", page)
-        @test length(findall("@kernel model(", example)) == 1
+        @test length(findall("@kernel model(", example)) ==
+              _KERNELS_PER_EXAMPLE_FILE[example_name]
         @test occursin("@kernel model(", source)
         @test occursin(r"\w+_kernel = prepare\(model;", source)
         @test occursin(r"inputs = \(;[\s\S]*?\),\n    model,\n    kernel", source)
@@ -78,6 +89,7 @@ const PPL_SOURCE_CASES = (
         :arma11_density,
         :gaussian_mixture_density,
         :mnist_logistic_density,
+        :mnist_logistic_optimized_density,
     )
         @test occursin(":" * string(name), helper_source)
     end

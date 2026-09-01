@@ -51,9 +51,10 @@ end
 
 "The transparent scalar plan captured by an authored `plate(...) do` recipe."
 function plate_body(recipe::Recipe)
-    recipe.op isa _AuthoredPlateOp || throw(ArgumentError(
+    native = recipe.op isa _KernelTensorizedOp ? recipe.op.native : recipe.op
+    native isa _AuthoredPlateOp || throw(ArgumentError(
         "recipe $(recipe.id) is not an authored plate"))
-    recipe.op.kernel.plan
+    native.kernel.plan
 end
 
 # Marker discovery must not invoke arbitrary iteration or `broadcastable`
@@ -558,6 +559,35 @@ function _lower_authored_plate_tensorized!(body, runtime_ops, runtime_recipes,
     body
 end
 
+function _kernel_tensorized_substitute(node, mapping::Dict{Symbol,Any})
+    node isa Symbol && return get(mapping, node, node)
+    node isa Expr || return node
+    node.head in (:quote, :inert) && return node
+    Expr(node.head,
+         (_kernel_tensorized_substitute(arg, mapping) for arg in node.args)...)
+end
+
+function _lower_explicit_tensorized!(body, runtime_ops, runtime_recipes,
+                                     op::_KernelTensorizedOp, callargs,
+                                     callvalues, pointwise_lhs, total_lhs)
+    inner_kernel = op.native.kernel
+    append!(runtime_ops, inner_kernel.ops)
+    append!(runtime_recipes, inner_kernel.lowered_recipes)
+    mapping = Dict{Symbol,Any}(
+        input.name => argument for (input, argument) in zip(callvalues, callargs))
+    value = _kernel_tensorized_substitute(op.tensorized_ast, mapping)
+    if pointwise_lhs !== nothing
+        push!(body.args, Expr(:(=), pointwise_lhs, value))
+        total_lhs === nothing || push!(body.args,
+            Expr(:(=), total_lhs,
+                 Expr(:call, GlobalRef(Base, :sum), pointwise_lhs)))
+    elseif total_lhs !== nothing
+        push!(body.args, Expr(:(=), total_lhs,
+            Expr(:call, GlobalRef(Base, :sum), value)))
+    end
+    body
+end
+
 function _lower_with_ops(p::Plan; tensorized::Bool = false,
                          inline_embedded::Bool = true)
     g = p.graph
@@ -580,7 +610,9 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
         r.id in skipped_recipes && continue
         callargs = Any[nm(inp) for inp in r.inputs]
 
-        if inline_embedded && r.op isa _AuthoredPlateOp
+        if inline_embedded &&
+           (r.op isa _AuthoredPlateOp ||
+            r.op isa _KernelTensorizedOp && r.op.native isa _AuthoredPlateOp)
             length(r.outputs) == 1 || throw(ArgumentError(
                 "an authored plate recipe must have exactly one pointwise output"))
             pointwise = only(r.outputs)
@@ -597,7 +629,19 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                 push!(assigned, canon_id(g, only(sum_recipe.outputs).id))
                 push!(skipped_recipes, sum_recipe.id)
             end
-            if tensorized
+            if r.op isa _KernelTensorizedOp
+                native_arity = _kernel_tensorized_native_arity(r.op)
+                if tensorized
+                    _lower_explicit_tensorized!(
+                        body, runtime_ops, runtime_recipes, r.op, callargs,
+                        r.inputs, pointwise_lhs, total_lhs)
+                else
+                    _lower_authored_plate_native!(
+                        body, runtime_ops, runtime_recipes, r.op.native,
+                        callargs[1:native_arity], r.inputs[1:native_arity],
+                        pointwise_lhs, total_lhs)
+                end
+            elseif tensorized
                 _lower_authored_plate_tensorized!(
                     body, runtime_ops, runtime_recipes, r.op, callargs,
                     pointwise_lhs, total_lhs)
@@ -1034,6 +1078,72 @@ struct PreparedKernel{F,O,IN,OUT,RR}
     lowered_recipes::RR
 end
 
+# Partial evaluation deliberately stores hoisted values in the prepared
+# operation tuple so the public residual kernel has only its unbound HAVE
+# ports. Large array compiler backends must nevertheless receive array-valued
+# constants as device operands: capturing them in the compiled program turns
+# the whole dataset into source-level literals and makes compilation scale with
+# data size. This compact call boundary replaces only array-valued
+# `_BoundConstant`s with trailing hidden operands. The public PreparedKernel is
+# unchanged; native execution and inspection retain the q-only residual ABI.
+struct _ExternalBoundArraySlot{I} end
+
+struct _ExternalizedBoundArrayCall{F,O,I}
+    f::F
+    ops::O
+end
+
+@generated function (call::_ExternalizedBoundArrayCall{F,O,I})(
+        args::Vararg{Any,N}) where {F,O,I,N}
+    external_count = length(I)
+    public_count = N - external_count
+    public_count >= 0 || return :(throw(ArgumentError(
+        "externalized bound-array call is missing hidden operands")))
+    replacements = Dict(index => slot for (slot, index) in enumerate(I))
+    operations = Any[]
+    for index in 1:fieldcount(O)
+        if haskey(replacements, index)
+            argument = public_count + replacements[index]
+            push!(operations,
+                  :(_BoundConstant(getfield(args, $argument))))
+        else
+            push!(operations,
+                  :(getfield(getfield(call, :ops), $index)))
+        end
+    end
+    public_args = Any[
+        :(getfield(args, $index)) for index in 1:public_count]
+    :(getfield(call, :f)(($(operations...),), $(public_args...)))
+end
+
+"""
+    _externalize_bound_arrays(kernel) -> (call, values)
+
+Return an internal compiler call plus the array-valued partial-evaluation
+constants it expects as trailing hidden operands. If the kernel contains no
+such constants, return the kernel itself and an empty tuple. Scalar and other
+small static constants remain in the operation table.
+
+This is a compiler ABI adapter, not a different model boundary: `kernel` keeps
+its original public inputs, and `call(public_args..., values...)` is exactly
+equivalent to `kernel(public_args...)`.
+"""
+function _externalize_bound_arrays(kernel::PreparedKernel)
+    positions = Tuple(
+        index for (index, op) in pairs(kernel.ops)
+        if op isa _BoundConstant && op.value isa AbstractArray)
+    isempty(positions) && return kernel, ()
+    values = Tuple(kernel.ops[index].value for index in positions)
+    stripped = ntuple(length(kernel.ops)) do index
+        slot = findfirst(==(index), positions)
+        slot === nothing ? kernel.ops[index] :
+            _ExternalBoundArraySlot{slot}()
+    end
+    call = _ExternalizedBoundArrayCall{
+        typeof(kernel.f),typeof(stripped),positions}(kernel.f, stripped)
+    call, values
+end
+
 # Prepared RK kernels are compiler-owned program structure when used as recipe
 # operations. Flatten them automatically so ordinary composition of `plate`
 # and scalar prepared kernels produces one generated outer program rather than
@@ -1061,6 +1171,7 @@ end
 function _needs_embedded_tensorization(p::Plan)
     any(p.recipes) do recipe
         recipe.op isa _AuthoredPlateOp && return true
+        recipe.op isa _KernelTensorizedOp && return true
         kernel = _embedded_kernel(recipe.op)
         kernel !== nothing && kernel.f isa _ArrayFunctionPair
     end
@@ -1080,10 +1191,16 @@ function _embedded_marker_candidates(p::Plan)
         p, Set(keys(root_positions))).values
     candidates = Int[]
     for recipe in p.recipes
-        positions = if recipe.op isa _AuthoredPlateOp
-            atomic = typeof(recipe.op).parameters[2]
+        positions = if recipe.op isa Union{_AuthoredPlateOp,_KernelTensorizedOp}
+            native = recipe.op isa _KernelTensorizedOp ?
+                recipe.op.native : recipe.op
+            native_arity = recipe.op isa _KernelTensorizedOp ?
+                _kernel_tensorized_native_arity(recipe.op) :
+                length(recipe.inputs)
+            atomic = typeof(native).parameters[2]
             Tuple(index for index in eachindex(recipe.inputs)
-                  if !(index in atomic))
+                  if index > native_arity ||
+                     !(index in atomic))
         else
             kernel = _embedded_kernel(recipe.op)
             kernel === nothing ? () : _array_marker_positions(kernel.f)
@@ -1504,6 +1621,7 @@ catch
     string(op)
 end
 _opname(::_AuthoredPlateOp) = "plate"
+_opname(::_KernelTensorizedOp) = "plate"
 
 function _readable_callee(op)
     name = try

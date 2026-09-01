@@ -709,6 +709,7 @@ const EXPECTED_PPL_EXAMPLES = (
     :arma11_density,
     :gaussian_mixture_density,
     :mnist_logistic_density,
+    :mnist_logistic_optimized_density,
 )
 const _PPL_EXECUTION_COUNTS = Dict(name => 0 for name in EXPECTED_PPL_EXAMPLES)
 

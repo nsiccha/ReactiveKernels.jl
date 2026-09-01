@@ -313,7 +313,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "dugongs-growth.md" => 1,
         "arma11.md" => 1,
         "gaussian-mixture.md" => 1,
-        "mnist-logistic.md" => 1,
+        "mnist-logistic.md" => 2,
         "online-stats.md" => 1,
     )
     expected_source_examples = Dict(
@@ -325,21 +325,20 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
     expected_sortable_tables = Dict(
         "distributions-ad.md" => 2,
         "distributions.md" => 1,
-        "ppl-ad.md" => 4,
+        "ppl-ad.md" => 2,
         "compiler.md" => 1,
         "distributions-reactant.md" => 7,
         "eight-schools.md" => 1,
-        "eight-schools-reactant.md" => 4,
+        "eight-schools-reactant.md" => 2,
         "eval-throughput.md" => 1,
         "mnist-logistic.md" => 1,
-        "mnist-reactant.md" => 8,
+        "mnist-reactant.md" => 6,
         "nuts.md" => 1,
         "nuts-reactant.md" => 2,
     )
     expected_aov_panels = Dict(
         "distributions-ad.md" => 6,
         "distributions.md" => 2,
-        "ppl-ad.md" => 4,
         "distributions-reactant.md" => 12,
         "nuts.md" => 1,
         "nuts-reactant.md" => 1,
@@ -379,10 +378,10 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         ),
         "ppl-ad.md" => (
             "Eight Schools model gradient matrix",
-            "eight-schools-ad-v1.toml",
-            "seven scalar gradients",
+            "eight-schools-ad-v2.toml",
+            "Every supported cell",
             "MNIST full-data model gradients",
-            "mnist-logistic-ad-v1.toml",
+            "mnist-logistic-ad-v2.toml",
             "7,065 active coefficients",
         ),
         "reactant.md" => (
@@ -415,25 +414,20 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         ),
         "compiler.md" => ("class=\"rk-pipeline\"",),
         "eight-schools-reactant.md" => (
-            "Native RK / Reactant steady-state matrix",
-            "Setup, compilation, and first-call costs",
-            "benchmark/receipts/eight-schools-reactant-v1.toml",
-            "packages/ReactiveKernelsPPLExamples/src/eight_schools.jl",
+            "Eight Schools Reactant primal matrix",
+            "Eight Schools Reactant value-and-gradient matrix",
+            "benchmark/receipts/eight-schools-reactant-v2.toml",
         ),
         "mnist-reactant.md" => (
-            "Packed full joint:",
-            "Packed full-joint value-and-gradient:",
-            "Native RK / Reactant steady-state matrix",
-            "Setup, compilation, and first-call costs",
-            "Native RK AD / Reactant-compiled AD steady-state matrix",
-            "benchmark/receipts/mnist-reactant-v1.toml",
-            "benchmark/receipts/mnist-reactant-ad-v1.toml",
+            "MNIST Reactant primal matrix",
+            "MNIST Reactant value-and-gradient matrix",
+            "Wren-compatible PCA-40 workload",
+            "mnist-reactant-matrix-wren-pca40",
+            "mnist-reactant-ad-matrix-wren-pca40",
+            "benchmark/receipts/mnist-reactant-v2.toml",
+            "benchmark/receipts/mnist-reactant-ad-v2.toml",
             "benchmark/receipts/mnist-reactant-wren-pca40-v1.toml",
             "benchmark/receipts/mnist-reactant-ad-wren-pca40-v1.toml",
-            "Wren-compatible PCA-40 workload",
-            "Wren PCA-40. Packed full joint:",
-            "Wren PCA-40. Packed full-joint value-and-gradient:",
-            "packages/ReactiveKernelsPPLExamples/src/mnist_logistic.jl",
         ),
         "nuts.md" => (
             "class=\"rk-status-grid\"",
@@ -488,7 +482,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
     body_markers = Dict(
         "eight-schools.md" =>
             ("Eight Schools Extraction", "Raw input", "Generated kernel", "Compute DAG",
-             "Primal boundary × outcome matrix"),
+             "Primal boundary × outcome × modifier matrix"),
         "nuts.md" =>
             ("Compiler/runtime execution is disabled in docs",
              "@kernel nuts!!", "Show the complete authoring fixture"),

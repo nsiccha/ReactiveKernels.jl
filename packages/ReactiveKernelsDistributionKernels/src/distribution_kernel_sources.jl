@@ -8,9 +8,11 @@ export normal, cauchy, laplace
 export BERNOULLI_KERNEL_SOURCE, LOGNORMAL_KERNEL_SOURCE
 export EXPONENTIAL_KERNEL_SOURCE, GEOMETRIC_KERNEL_SOURCE, UNIFORM_KERNEL_SOURCE
 export MVNORMAL_KERNEL_SOURCE, AR1_KERNEL_SOURCE
-export CATEGORICAL_LOGIT_KERNEL_SOURCE
+export CATEGORICAL_LOGIT_KERNEL_SOURCE, CATEGORICAL_LOGIT_REF_KERNEL_SOURCE
+export CATEGORICAL_LOGIT_COLUMNS_KERNEL_SOURCE
+export CATEGORICAL_LOGIT_REF_COLUMNS_KERNEL_SOURCE
 export bernoulli, lognormal, exponential, geometric, uniform, mvnormal, ar1
-export categorical_logit
+export categorical_logit, categorical_logit_ref
 export NORMAL_LOGDENSITY_SOURCE, CAUCHY_LOGDENSITY_SOURCE
 export NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY
 export BERNOULLI_SOURCE, LOGNORMAL_SOURCE
@@ -266,13 +268,79 @@ using LogExpFunctions: logsumexp
 end
 """
 
+# Reference-coded softmax categorical: takes only the C-1 NONREFERENCE logits
+# and treats class 1 as the implicit zero-logit reference, so a consumer never
+# materializes the padded [0; logits] column. `ifelse`/`max` keep the observed
+# lookup straight-line (class 1 reads a safe dummy index and selects 0.0), and
+# `logaddexp(0, logsumexp(x))` is the stable normalizer over the implicit
+# reference — the reference coding lives inside the object, not in the model.
+const CATEGORICAL_LOGIT_REF_KERNEL_SOURCE = raw"""
+using LogExpFunctions: logaddexp, logsumexp
+
+@kernel categorical_logit_ref(nonreference_logits::AbstractVector{Float64}) = begin
+    logpdf(observed::Int)::Float64 =
+        ifelse(observed == 1, 0.0,
+               nonreference_logits[max(observed - 1, 1)]) -
+        logaddexp(0.0, logsumexp(nonreference_logits))
+end
+"""
+
+# Batched column forms of the same two categorical objects. Their vector-index
+# gather is friendly to array compilers while the scalar objects above remain
+# the natural per-observation endpoints. Both expose pointwise log densities;
+# consumers choose whether to sum them.
+const CATEGORICAL_LOGIT_COLUMNS_KERNEL_SOURCE = raw"""
+using LogExpFunctions: logsumexp
+using ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    categorical_logit
+
+@kernel _categorical_logit_columns_kernel(
+        logits::Matrix{Float64}, observed::Vector{Int}) = begin
+    logpdf::Vector{Float64} =
+        ReactiveKernels._kernel_tensorized_pair(
+            (plate(eachcol(logits), observed) do column, label
+                categorical_logit(column).logpdf(label)
+            end),
+            logits[observed .+
+                   size(logits, 1) .* collect(0:(length(observed) - 1))] .-
+            vec(logsumexp(logits; dims = 1)))
+    return logpdf
+end
+"""
+
+const CATEGORICAL_LOGIT_REF_COLUMNS_KERNEL_SOURCE = raw"""
+using LogExpFunctions: logaddexp, logsumexp
+using ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    categorical_logit_ref
+
+@inline _zero_reference_class_logit(observed, selected) =
+    ifelse(observed == 1, zero(selected), selected)
+
+@kernel _categorical_logit_ref_columns_kernel(
+        nonreference_logits::Matrix{Float64}, observed::Vector{Int}) = begin
+    logpdf::Vector{Float64} =
+        ReactiveKernels._kernel_tensorized_pair(
+            (plate(eachcol(nonreference_logits), observed) do column, label
+                categorical_logit_ref(column).logpdf(label)
+            end),
+            _zero_reference_class_logit.(observed, nonreference_logits[
+                    max.(observed .- 1, 1) .+
+                    size(nonreference_logits, 1) .*
+                        collect(0:(length(observed) - 1))]) .-
+            vec(logaddexp.(0.0,
+                logsumexp(nonreference_logits; dims = 1))))
+    return logpdf
+end
+"""
+
 const _OTHER_DISTRIBUTION_BINDINGS = _evaluate_source_bindings(
     join((BERNOULLI_KERNEL_SOURCE, LOGNORMAL_KERNEL_SOURCE,
           EXPONENTIAL_KERNEL_SOURCE, GEOMETRIC_KERNEL_SOURCE,
           UNIFORM_KERNEL_SOURCE, MVNORMAL_KERNEL_SOURCE,
-          AR1_KERNEL_SOURCE, CATEGORICAL_LOGIT_KERNEL_SOURCE), "\n"),
+          AR1_KERNEL_SOURCE, CATEGORICAL_LOGIT_KERNEL_SOURCE,
+          CATEGORICAL_LOGIT_REF_KERNEL_SOURCE), "\n"),
     (:bernoulli, :lognormal, :exponential, :geometric, :uniform, :mvnormal, :ar1,
-     :categorical_logit),
+     :categorical_logit, :categorical_logit_ref),
 )
 const bernoulli = _OTHER_DISTRIBUTION_BINDINGS[1]
 const lognormal = _OTHER_DISTRIBUTION_BINDINGS[2]
@@ -282,6 +350,7 @@ const uniform = _OTHER_DISTRIBUTION_BINDINGS[5]
 const mvnormal = _OTHER_DISTRIBUTION_BINDINGS[6]
 const ar1 = _OTHER_DISTRIBUTION_BINDINGS[7]
 const categorical_logit = _OTHER_DISTRIBUTION_BINDINGS[8]
+const categorical_logit_ref = _OTHER_DISTRIBUTION_BINDINGS[9]
 
 const BERNOULLI_SOURCE = BERNOULLI_KERNEL_SOURCE * raw"""
 

@@ -1,0 +1,1061 @@
+generated_at = "2026-09-01T20:06:31.840Z"
+schema = "eight-schools-ad-v2"
+
+[environment]
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+julia_threads = 1
+os = "Linux"
+
+[[measurements]]
+active_port = "unconstrained"
+boundary = "packed_unconstrained"
+configuration = "ad_native"
+finite_difference_gradient = [-0.810000000130551, -6.3383620689921605, 0.43583333255009193, 0.32500000069702334, 0.17285156235453247, 0.17458677697210667, 0.03472222226459773, -0.004132231444653978, 0.09999999977605818, -0.09413580251752825]
+model = "centered"
+operation = "value and gradient"
+outcome = "joint"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    caller_owned_gradient = true
+    first_execution_bytes = 683789212
+    first_execution_seconds = 8.707466932
+    gradient_length = 10
+    gradient_max_abs_error = 7.832414161690338e-10
+    gradient_max_rel_error = 1.235715801091139e-10
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 130.0
+    min_ns = 121.0
+    preparation_bytes = 7460568
+    preparation_seconds = 0.439074547
+    times_ns = [130.0, 130.0, 121.0, 130.0, 130.0, 130.0, 130.0, 130.0, 170.0, 160.0]
+    value = -48.45145255023076
+    value_abs_error = 7.105427357601002e-15
+[[measurements]]
+active_port = "unconstrained"
+boundary = "packed_unconstrained"
+configuration = "ad_native_bound"
+finite_difference_gradient = [-0.810000000130551, -6.3383620689921605, 0.43583333255009193, 0.32500000069702334, 0.17285156235453247, 0.17458677697210667, 0.03472222226459773, -0.004132231444653978, 0.09999999977605818, -0.09413580251752825]
+model = "centered"
+operation = "value and gradient"
+outcome = "joint"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    caller_owned_gradient = true
+    first_execution_bytes = 20953792
+    first_execution_seconds = 0.314129432
+    gradient_length = 10
+    gradient_max_abs_error = 7.832414161690338e-10
+    gradient_max_rel_error = 1.235715801091139e-10
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 130.0
+    min_ns = 130.0
+    preparation_bytes = 770336
+    preparation_seconds = 0.256679251
+    times_ns = [130.0, 130.0, 130.0, 130.0, 130.0, 130.0, 130.0, 130.0, 130.0, 180.0]
+    value = -48.45145255023076
+    value_abs_error = 7.105427357601002e-15
+[[measurements]]
+active_port = "unconstrained"
+boundary = "packed_unconstrained"
+configuration = "manual_ad"
+finite_difference_gradient = [-0.810000000130551, -6.3383620689921605, 0.43583333255009193, 0.32500000069702334, 0.17285156235453247, 0.17458677697210667, 0.03472222226459773, -0.004132231444653978, 0.09999999977605818, -0.09413580251752825]
+model = "centered"
+operation = "value and gradient"
+outcome = "joint"
+provider = "manual_julia"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    caller_owned_gradient = true
+    first_execution_bytes = 0
+    first_execution_seconds = 2.273e-6
+    gradient_length = 10
+    gradient_max_abs_error = 7.832414161690338e-10
+    gradient_max_rel_error = 1.235715801091139e-10
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 130.0
+    min_ns = 130.0
+    preparation_bytes = 192
+    preparation_seconds = 3.074e-6
+    times_ns = [130.0, 130.0, 130.0, 140.0, 130.0, 130.0, 130.0, 130.0, 130.0, 170.0]
+    value = -48.451452550230755
+    value_abs_error = 0.0
+[[measurements]]
+active_port = "unconstrained"
+boundary = "packed_unconstrained"
+configuration = "turing_ad"
+finite_difference_gradient = [-0.810000000130551, -6.3383620689921605, 0.43583333255009193, 0.32500000069702334, 0.17285156235453247, 0.17458677697210667, 0.03472222226459773, -0.004132231444653978, 0.09999999977605818, -0.09413580251752825]
+model = "centered"
+outcome = "joint"
+provider = "turing"
+state = "supported"
+
+    [measurements.result]
+    allocs = [31, 31, 31, 31, 31, 31, 31, 31, 31, 31]
+    bytes = [2144, 2144, 2144, 2144, 2144, 2144, 2144, 2144, 2144, 2144]
+    caller_owned_gradient = false
+    first_execution_bytes = 249822800
+    first_execution_seconds = 6.56544652
+    gradient_length = 10
+    gradient_max_abs_error = 7.832414161690338e-10
+    gradient_max_rel_error = 1.235715801091139e-10
+    median_allocs = 31
+    median_bytes = 2144
+    median_ns = 1356.5
+    min_ns = 1312.0
+    preparation_bytes = 335034408
+    preparation_seconds = 0.965666905
+    times_ns = [1352.0, 1351.0, 1341.0, 1312.0, 1361.0, 1371.0, 1382.0, 1351.0, 1362.0, 1972.0]
+    value = -48.45145255023076
+    value_abs_error = 7.105427357601002e-15
+[[measurements]]
+active_port = "unconstrained"
+boundary = "packed_unconstrained"
+configuration = "ad_native"
+finite_difference_gradient = [-0.810000000130551, -6.3383620689921605, 0.31249999997069206, 0.2500000001525626, 0.18749999974773665, 0.12499999992960717, 0.062499999935468765, 0.0, -0.06250000006957082, -0.1250000000762813]
+model = "centered"
+operation = "value and gradient"
+outcome = "prior"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    caller_owned_gradient = true
+    first_execution_bytes = 11927912
+    first_execution_seconds = 0.135891423
+    gradient_length = 10
+    gradient_max_abs_error = 2.522633490986692e-10
+    gradient_max_rel_error = 3.979945392087402e-11
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 60.0
+    min_ns = 60.0
+    preparation_bytes = 618488
+    preparation_seconds = 0.146527122
+    times_ns = [60.0, 60.0, 60.0, 60.0, 60.0, 60.0, 60.0, 70.0, 60.0, 70.0]
+    value = -17.4551055980376
+    value_abs_error = 3.552713678800501e-15
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "ad_native_bound"
+model = "centered"
+outcome = "prior"
+provider = "rk"
+reason = "the minimal prior cut has no data ports to bind"
+state = "not_applicable"
+[[measurements]]
+active_port = "unconstrained"
+boundary = "packed_unconstrained"
+configuration = "manual_ad"
+finite_difference_gradient = [-0.810000000130551, -6.3383620689921605, 0.31249999997069206, 0.2500000001525626, 0.18749999974773665, 0.12499999992960717, 0.062499999935468765, 0.0, -0.06250000006957082, -0.1250000000762813]
+model = "centered"
+operation = "value and gradient"
+outcome = "prior"
+provider = "manual_julia"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    caller_owned_gradient = true
+    first_execution_bytes = 0
+    first_execution_seconds = 1.692e-6
+    gradient_length = 10
+    gradient_max_abs_error = 2.522633490986692e-10
+    gradient_max_rel_error = 3.979945392087402e-11
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 70.0
+    min_ns = 60.0
+    preparation_bytes = 176
+    preparation_seconds = 2.964e-6
+    times_ns = [70.0, 70.0, 70.0, 70.0, 60.0, 70.0, 70.0, 70.0, 70.0, 70.0]
+    value = -17.455105598037598
+    value_abs_error = 0.0
+[[measurements]]
+active_port = "unconstrained"
+boundary = "packed_unconstrained"
+configuration = "turing_ad"
+finite_difference_gradient = [-0.810000000130551, -6.3383620689921605, 0.31249999997069206, 0.2500000001525626, 0.18749999974773665, 0.12499999992960717, 0.062499999935468765, 0.0, -0.06250000006957082, -0.1250000000762813]
+model = "centered"
+outcome = "prior"
+provider = "turing"
+state = "supported"
+
+    [measurements.result]
+    allocs = [30, 30, 30, 30, 30, 30, 30, 30, 30, 30]
+    bytes = [2128, 2128, 2128, 2128, 2128, 2128, 2128, 2128, 2128, 2128]
+    caller_owned_gradient = false
+    first_execution_bytes = 78186872
+    first_execution_seconds = 4.514311952
+    gradient_length = 10
+    gradient_max_abs_error = 2.522633490986692e-10
+    gradient_max_rel_error = 3.979945392087402e-11
+    median_allocs = 30
+    median_bytes = 2128
+    median_ns = 1232.0
+    min_ns = 1212.0
+    preparation_bytes = 154383400
+    preparation_seconds = 0.457724518
+    times_ns = [1271.0, 1212.0, 1241.0, 1271.0, 1222.0, 1232.0, 1231.0, 1232.0, 1231.0, 1282.0]
+    value = -17.4551055980376
+    value_abs_error = 3.552713678800501e-15
+[[measurements]]
+active_port = "unconstrained"
+boundary = "packed_unconstrained"
+configuration = "ad_native"
+finite_difference_gradient = [0.0, 0.0, 0.12333333287274811, 0.07500000025111253, -0.014648437686552399, 0.049586776749151275, -0.027777777436192454, -0.004132231444653978, 0.16250000001325657, 0.030864197558753043]
+model = "centered"
+operation = "value and gradient"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    caller_owned_gradient = true
+    first_execution_bytes = 13013608
+    first_execution_seconds = 0.160797858
+    gradient_length = 10
+    gradient_max_abs_error = 4.6058522273906277e-10
+    gradient_max_rel_error = 2.8343706012399307e-9
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 90.0
+    min_ns = 80.0
+    preparation_bytes = 555528
+    preparation_seconds = 0.073110736
+    times_ns = [90.0, 90.0, 90.0, 90.0, 90.0, 120.0, 90.0, 110.0, 80.0, 90.0]
+    value = -30.996346952193164
+    value_abs_error = 0.0
+[[measurements]]
+active_port = "unconstrained"
+boundary = "packed_unconstrained"
+configuration = "ad_native_bound"
+finite_difference_gradient = [0.0, 0.0, 0.12333333287274811, 0.07500000025111253, -0.014648437686552399, 0.049586776749151275, -0.027777777436192454, -0.004132231444653978, 0.16250000001325657, 0.030864197558753043]
+model = "centered"
+operation = "value and gradient"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    caller_owned_gradient = true
+    first_execution_bytes = 12954184
+    first_execution_seconds = 0.159010962
+    gradient_length = 10
+    gradient_max_abs_error = 4.6058522273906277e-10
+    gradient_max_rel_error = 2.8343706012399307e-9
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 90.0
+    min_ns = 90.0
+    preparation_bytes = 554472
+    preparation_seconds = 0.067902386
+    times_ns = [90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0]
+    value = -30.996346952193164
+    value_abs_error = 0.0
+[[measurements]]
+active_port = "unconstrained"
+boundary = "packed_unconstrained"
+configuration = "manual_ad"
+finite_difference_gradient = [0.0, 0.0, 0.12333333287274811, 0.07500000025111253, -0.014648437686552399, 0.049586776749151275, -0.027777777436192454, -0.004132231444653978, 0.16250000001325657, 0.030864197558753043]
+model = "centered"
+operation = "value and gradient"
+outcome = "likelihood"
+provider = "manual_julia"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    caller_owned_gradient = true
+    first_execution_bytes = 0
+    first_execution_seconds = 1.953e-6
+    gradient_length = 10
+    gradient_max_abs_error = 4.6058522273906277e-10
+    gradient_max_rel_error = 2.8343706012399307e-9
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 70.0
+    min_ns = 70.0
+    preparation_bytes = 192
+    preparation_seconds = 2.494e-6
+    times_ns = [70.0, 70.0, 70.0, 70.0, 70.0, 80.0, 70.0, 70.0, 70.0, 70.0]
+    value = -30.996346952193164
+    value_abs_error = 0.0
+[[measurements]]
+active_port = "unconstrained"
+boundary = "packed_unconstrained"
+configuration = "turing_ad"
+finite_difference_gradient = [0.0, 0.0, 0.12333333287274811, 0.07500000025111253, -0.014648437686552399, 0.049586776749151275, -0.027777777436192454, -0.004132231444653978, 0.16250000001325657, 0.030864197558753043]
+model = "centered"
+outcome = "likelihood"
+provider = "turing"
+state = "supported"
+
+    [measurements.result]
+    allocs = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+    bytes = [288, 288, 288, 288, 288, 288, 288, 288, 288, 288]
+    caller_owned_gradient = false
+    first_execution_bytes = 31874008
+    first_execution_seconds = 0.305663037
+    gradient_length = 10
+    gradient_max_abs_error = 4.6058522273906277e-10
+    gradient_max_rel_error = 2.8343706012399307e-9
+    median_allocs = 2
+    median_bytes = 288
+    median_ns = 140.0
+    min_ns = 140.0
+    preparation_bytes = 150529488
+    preparation_seconds = 0.413408103
+    times_ns = [140.0, 140.0, 140.0, 150.0, 140.0, 150.0, 140.0, 140.0, 150.0, 230.0]
+    value = -30.996346952193164
+    value_abs_error = 0.0
+[[measurements]]
+active_port = "unconstrained"
+boundary = "packed_unconstrained"
+configuration = "ad_native"
+finite_difference_gradient = [0.0, 0.0, 0.07400000004633192, -0.052499999970435016, -0.011718750002567805, -0.044628099250245086, -0.02777777772954068, 0.004545454520671456, 0.19500000001590787, -0.040123456789710424]
+model = "centered"
+operation = "value and pullback"
+outcome = "pointwise"
+output_cotangent = [0.6, -0.7, 0.8, -0.9, 1.0, -1.1, 1.2000000000000002, -1.3]
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+    bytes = [256, 256, 256, 256, 256, 256, 256, 256, 256, 256]
+    caller_owned_gradient = true
+    first_execution_bytes = 29881856
+    first_execution_seconds = 0.477816839
+    gradient_length = 10
+    gradient_max_abs_error = 7.669136853349912e-11
+    gradient_max_rel_error = 3.932890693704755e-10
+    median_allocs = 2
+    median_bytes = 256
+    median_ns = 130.0
+    min_ns = 130.0
+    preparation_bytes = 856904
+    preparation_seconds = 0.120045053
+    times_ns = [130.0, 130.0, 130.0, 130.0, 130.0, 130.0, 130.0, 130.0, 130.0, 130.0]
+    value = [-5.3382387343068824, -3.5027736261987186, -3.718993075756954, -3.4655941365815557, -3.1474131105408922, -3.3178668638542828, -4.541836126198719, -3.963631278755158]
+    value_abs_error = 4.440892098500626e-16
+[[measurements]]
+active_port = "unconstrained"
+boundary = "packed_unconstrained"
+configuration = "ad_native_bound"
+finite_difference_gradient = [0.0, 0.0, 0.07400000004633192, -0.052499999970435016, -0.011718750002567805, -0.044628099250245086, -0.02777777772954068, 0.004545454520671456, 0.19500000001590787, -0.040123456789710424]
+model = "centered"
+operation = "value and pullback"
+outcome = "pointwise"
+output_cotangent = [0.6, -0.7, 0.8, -0.9, 1.0, -1.1, 1.2000000000000002, -1.3]
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+    bytes = [256, 256, 256, 256, 256, 256, 256, 256, 256, 256]
+    caller_owned_gradient = true
+    first_execution_bytes = 14841672
+    first_execution_seconds = 0.239176965
+    gradient_length = 10
+    gradient_max_abs_error = 7.669136853349912e-11
+    gradient_max_rel_error = 3.932890693704755e-10
+    median_allocs = 2
+    median_bytes = 256
+    median_ns = 140.0
+    min_ns = 130.0
+    preparation_bytes = 935048
+    preparation_seconds = 0.117727574
+    times_ns = [140.0, 130.0, 140.0, 140.0, 140.0, 130.0, 130.0, 140.0, 140.0, 130.0]
+    value = [-5.3382387343068824, -3.5027736261987186, -3.718993075756954, -3.4655941365815557, -3.1474131105408922, -3.3178668638542828, -4.541836126198719, -3.963631278755158]
+    value_abs_error = 4.440892098500626e-16
+[[measurements]]
+active_port = "unconstrained"
+boundary = "packed_unconstrained"
+configuration = "manual_ad"
+finite_difference_gradient = [0.0, 0.0, 0.07400000004633192, -0.052499999970435016, -0.011718750002567805, -0.044628099250245086, -0.02777777772954068, 0.004545454520671456, 0.19500000001590787, -0.040123456789710424]
+model = "centered"
+operation = "value and pullback"
+outcome = "pointwise"
+output_cotangent = [0.6, -0.7, 0.8, -0.9, 1.0, -1.1, 1.2000000000000002, -1.3]
+provider = "manual_julia"
+state = "supported"
+
+    [measurements.result]
+    allocs = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+    bytes = [256, 256, 256, 256, 256, 256, 256, 256, 256, 256]
+    caller_owned_gradient = true
+    first_execution_bytes = 256
+    first_execution_seconds = 2.303e-6
+    gradient_length = 10
+    gradient_max_abs_error = 7.669136853349912e-11
+    gradient_max_rel_error = 3.932890693704755e-10
+    median_allocs = 2
+    median_bytes = 256
+    median_ns = 130.0
+    min_ns = 120.0
+    preparation_bytes = 336
+    preparation_seconds = 5.257e-6
+    times_ns = [120.0, 120.0, 120.0, 130.0, 130.0, 130.0, 120.0, 200.0, 130.0, 130.0]
+    value = [-5.3382387343068824, -3.5027736261987186, -3.718993075756954, -3.4655941365815557, -3.1474131105408922, -3.317866863854283, -4.541836126198719, -3.963631278755158]
+    value_abs_error = 0.0
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "turing_ad"
+model = "centered"
+outcome = "pointwise"
+provider = "turing"
+reason = "the compared Turing density has no matched public pointwise VJP surface"
+state = "unsupported"
+[[measurements]]
+active_port = "parameters"
+boundary = "constrained_parameters"
+configuration = "ad_native"
+finite_difference_gradient = [-0.810000000130551, -3.669181034507857, 0.43583333255009193, 0.32500000069702334, 0.17285156235453247, 0.17458677697210667, 0.03472222226459773, -0.004132231444653978, 0.09999999977605818, -0.09413580251752825]
+model = "centered"
+operation = "value and gradient"
+outcome = "joint"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5]
+    bytes = [528, 528, 528, 528, 528, 528, 528, 528, 528, 528]
+    caller_owned_gradient = false
+    first_execution_bytes = 22581416
+    first_execution_seconds = 0.252421605
+    gradient_length = 10
+    gradient_max_abs_error = 7.832414161690338e-10
+    gradient_max_rel_error = 2.134649145961502e-10
+    median_allocs = 5
+    median_bytes = 528
+    median_ns = 190.0
+    min_ns = 180.0
+    preparation_bytes = 1165936
+    preparation_seconds = 0.205968371
+    times_ns = [190.0, 190.0, 190.0, 190.0, 190.0, 190.0, 180.0, 190.0, 180.0, 190.0]
+    value = -49.14459973079071
+    value_abs_error = 7.105427357601002e-15
+[[measurements]]
+active_port = "parameters"
+boundary = "constrained_parameters"
+configuration = "ad_native_bound"
+finite_difference_gradient = [-0.810000000130551, -3.669181034507857, 0.43583333255009193, 0.32500000069702334, 0.17285156235453247, 0.17458677697210667, 0.03472222226459773, -0.004132231444653978, 0.09999999977605818, -0.09413580251752825]
+model = "centered"
+operation = "value and gradient"
+outcome = "joint"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5]
+    bytes = [528, 528, 528, 528, 528, 528, 528, 528, 528, 528]
+    caller_owned_gradient = false
+    first_execution_bytes = 15397672
+    first_execution_seconds = 0.192910639
+    gradient_length = 10
+    gradient_max_abs_error = 7.832414161690338e-10
+    gradient_max_rel_error = 2.134649145961502e-10
+    median_allocs = 5
+    median_bytes = 528
+    median_ns = 190.0
+    min_ns = 180.0
+    preparation_bytes = 712704
+    preparation_seconds = 0.205460761
+    times_ns = [190.0, 200.0, 190.0, 180.0, 190.0, 190.0, 190.0, 181.0, 190.0, 180.0]
+    value = -49.14459973079071
+    value_abs_error = 7.105427357601002e-15
+[[measurements]]
+active_port = "parameters"
+boundary = "constrained_parameters"
+configuration = "manual_ad"
+finite_difference_gradient = [-0.810000000130551, -3.669181034507857, 0.43583333255009193, 0.32500000069702334, 0.17285156235453247, 0.17458677697210667, 0.03472222226459773, -0.004132231444653978, 0.09999999977605818, -0.09413580251752825]
+model = "centered"
+operation = "value and gradient"
+outcome = "joint"
+provider = "manual_julia"
+state = "supported"
+
+    [measurements.result]
+    allocs = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5]
+    bytes = [528, 528, 528, 528, 528, 528, 528, 528, 528, 528]
+    caller_owned_gradient = false
+    first_execution_bytes = 528
+    first_execution_seconds = 8.992e-6
+    gradient_length = 10
+    gradient_max_abs_error = 7.832414161690338e-10
+    gradient_max_rel_error = 2.134649145961502e-10
+    median_allocs = 5
+    median_bytes = 528
+    median_ns = 205.0
+    min_ns = 200.0
+    preparation_bytes = 0
+    preparation_seconds = 1.9e-7
+    times_ns = [200.0, 210.0, 210.0, 210.0, 300.0, 210.0, 200.0, 200.0, 200.0, 200.0]
+    value = -49.1445997307907
+    value_abs_error = 0.0
+[[measurements]]
+boundary = "constrained_parameters"
+configuration = "turing_ad"
+model = "centered"
+outcome = "joint"
+provider = "turing"
+reason = "Turing has no public constrained or θ-only AD boundary"
+state = "unsupported"
+[[measurements]]
+active_port = "parameters"
+boundary = "constrained_parameters"
+configuration = "ad_native"
+finite_difference_gradient = [-0.810000000130551, -3.6691810346545313, 0.31249999997069206, 0.2500000001525626, 0.18749999974773665, 0.12499999992960717, 0.062499999935468765, 0.0, -0.06250000006957082, -0.1250000000762813]
+model = "centered"
+operation = "value and gradient"
+outcome = "prior"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5]
+    bytes = [528, 528, 528, 528, 528, 528, 528, 528, 528, 528]
+    caller_owned_gradient = false
+    first_execution_bytes = 11913656
+    first_execution_seconds = 0.137215931
+    gradient_length = 10
+    gradient_max_abs_error = 2.522633490986692e-10
+    gradient_max_rel_error = 6.875194947213088e-11
+    median_allocs = 5
+    median_bytes = 528
+    median_ns = 120.0
+    min_ns = 120.0
+    preparation_bytes = 561888
+    preparation_seconds = 0.117899982
+    times_ns = [120.0, 120.0, 130.0, 120.0, 130.0, 120.0, 120.0, 120.0, 120.0, 120.0]
+    value = -18.148252778597545
+    value_abs_error = 3.552713678800501e-15
+[[measurements]]
+boundary = "constrained_parameters"
+configuration = "ad_native_bound"
+model = "centered"
+outcome = "prior"
+provider = "rk"
+reason = "the minimal prior cut has no data ports to bind"
+state = "not_applicable"
+[[measurements]]
+active_port = "parameters"
+boundary = "constrained_parameters"
+configuration = "manual_ad"
+finite_difference_gradient = [-0.810000000130551, -3.6691810346545313, 0.31249999997069206, 0.2500000001525626, 0.18749999974773665, 0.12499999992960717, 0.062499999935468765, 0.0, -0.06250000006957082, -0.1250000000762813]
+model = "centered"
+operation = "value and gradient"
+outcome = "prior"
+provider = "manual_julia"
+state = "supported"
+
+    [measurements.result]
+    allocs = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5]
+    bytes = [528, 528, 528, 528, 528, 528, 528, 528, 528, 528]
+    caller_owned_gradient = false
+    first_execution_bytes = 528
+    first_execution_seconds = 4.696e-6
+    gradient_length = 10
+    gradient_max_abs_error = 2.522633490986692e-10
+    gradient_max_rel_error = 6.875194947213088e-11
+    median_allocs = 5
+    median_bytes = 528
+    median_ns = 130.0
+    min_ns = 130.0
+    preparation_bytes = 0
+    preparation_seconds = 4.11e-7
+    times_ns = [140.0, 130.0, 130.0, 130.0, 130.0, 130.0, 130.0, 130.0, 170.0, 130.0]
+    value = -18.14825277859754
+    value_abs_error = 0.0
+[[measurements]]
+boundary = "constrained_parameters"
+configuration = "turing_ad"
+model = "centered"
+outcome = "prior"
+provider = "turing"
+reason = "Turing has no public constrained or θ-only AD boundary"
+state = "unsupported"
+[[measurements]]
+active_port = "parameters"
+boundary = "constrained_parameters"
+configuration = "ad_native"
+finite_difference_gradient = [0.0, 0.0, 0.12333333287274811, 0.07500000025111253, -0.014648437686552399, 0.049586776749151275, -0.027777777436192454, -0.004132231444653978, 0.16250000001325657, 0.030864197558753043]
+model = "centered"
+operation = "value and gradient"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5]
+    bytes = [528, 528, 528, 528, 528, 528, 528, 528, 528, 528]
+    caller_owned_gradient = false
+    first_execution_bytes = 11452272
+    first_execution_seconds = 0.155916662
+    gradient_length = 10
+    gradient_max_abs_error = 4.6058522273906277e-10
+    gradient_max_rel_error = 2.8343706012399307e-9
+    median_allocs = 5
+    median_bytes = 528
+    median_ns = 150.0
+    min_ns = 150.0
+    preparation_bytes = 561216
+    preparation_seconds = 0.070098228
+    times_ns = [150.0, 150.0, 150.0, 150.0, 150.0, 150.0, 150.0, 150.0, 150.0, 150.0]
+    value = -30.996346952193164
+    value_abs_error = 0.0
+[[measurements]]
+active_port = "parameters"
+boundary = "constrained_parameters"
+configuration = "ad_native_bound"
+finite_difference_gradient = [0.0, 0.0, 0.12333333287274811, 0.07500000025111253, -0.014648437686552399, 0.049586776749151275, -0.027777777436192454, -0.004132231444653978, 0.16250000001325657, 0.030864197558753043]
+model = "centered"
+operation = "value and gradient"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5]
+    bytes = [528, 528, 528, 528, 528, 528, 528, 528, 528, 528]
+    caller_owned_gradient = false
+    first_execution_bytes = 11275240
+    first_execution_seconds = 0.148340906
+    gradient_length = 10
+    gradient_max_abs_error = 4.6058522273906277e-10
+    gradient_max_rel_error = 2.8343706012399307e-9
+    median_allocs = 5
+    median_bytes = 528
+    median_ns = 150.0
+    min_ns = 150.0
+    preparation_bytes = 557840
+    preparation_seconds = 0.067219414
+    times_ns = [150.0, 150.0, 220.0, 150.0, 160.0, 150.0, 150.0, 150.0, 150.0, 150.0]
+    value = -30.996346952193164
+    value_abs_error = 0.0
+[[measurements]]
+active_port = "parameters"
+boundary = "constrained_parameters"
+configuration = "manual_ad"
+finite_difference_gradient = [0.0, 0.0, 0.12333333287274811, 0.07500000025111253, -0.014648437686552399, 0.049586776749151275, -0.027777777436192454, -0.004132231444653978, 0.16250000001325657, 0.030864197558753043]
+model = "centered"
+operation = "value and gradient"
+outcome = "likelihood"
+provider = "manual_julia"
+state = "supported"
+
+    [measurements.result]
+    allocs = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5]
+    bytes = [528, 528, 528, 528, 528, 528, 528, 528, 528, 528]
+    caller_owned_gradient = false
+    first_execution_bytes = 528
+    first_execution_seconds = 6.058e-6
+    gradient_length = 10
+    gradient_max_abs_error = 4.6058522273906277e-10
+    gradient_max_rel_error = 2.8343706012399307e-9
+    median_allocs = 5
+    median_bytes = 528
+    median_ns = 140.0
+    min_ns = 140.0
+    preparation_bytes = 0
+    preparation_seconds = 2.1e-7
+    times_ns = [140.0, 150.0, 140.0, 140.0, 140.0, 140.0, 140.0, 140.0, 140.0, 140.0]
+    value = -30.996346952193164
+    value_abs_error = 0.0
+[[measurements]]
+boundary = "constrained_parameters"
+configuration = "turing_ad"
+model = "centered"
+outcome = "likelihood"
+provider = "turing"
+reason = "Turing has no public constrained or θ-only AD boundary"
+state = "unsupported"
+[[measurements]]
+boundary = "constrained_parameters"
+configuration = "ad_native"
+model = "centered"
+outcome = "pointwise"
+provider = "rk"
+reason = "DifferentiationInterface/Enzyme cannot annotate the constrained NamedTuple/pointwise MixedDuplicated cross-product"
+state = "unsupported"
+[[measurements]]
+boundary = "constrained_parameters"
+configuration = "ad_native_bound"
+model = "centered"
+outcome = "pointwise"
+provider = "rk"
+reason = "DifferentiationInterface/Enzyme cannot annotate the constrained NamedTuple/pointwise MixedDuplicated cross-product"
+state = "unsupported"
+[[measurements]]
+boundary = "constrained_parameters"
+configuration = "manual_ad"
+model = "centered"
+outcome = "pointwise"
+provider = "manual_julia"
+reason = "DifferentiationInterface/Enzyme cannot annotate the constrained NamedTuple/pointwise MixedDuplicated cross-product"
+state = "unsupported"
+[[measurements]]
+boundary = "constrained_parameters"
+configuration = "turing_ad"
+model = "centered"
+outcome = "pointwise"
+provider = "turing"
+reason = "DifferentiationInterface/Enzyme cannot annotate the constrained NamedTuple/pointwise MixedDuplicated cross-product"
+state = "unsupported"
+[[measurements]]
+boundary = "minimal_likelihood"
+configuration = "ad_native"
+model = "centered"
+outcome = "joint"
+provider = "rk"
+reason = "joint and prior are unavailable from the minimal likelihood boundary"
+state = "unsupported"
+[[measurements]]
+boundary = "minimal_likelihood"
+configuration = "ad_native_bound"
+model = "centered"
+outcome = "joint"
+provider = "rk"
+reason = "joint and prior are unavailable from the minimal likelihood boundary"
+state = "unsupported"
+[[measurements]]
+boundary = "minimal_likelihood"
+configuration = "manual_ad"
+model = "centered"
+outcome = "joint"
+provider = "manual_julia"
+reason = "joint and prior are unavailable from the minimal likelihood boundary"
+state = "unsupported"
+[[measurements]]
+boundary = "minimal_likelihood"
+configuration = "turing_ad"
+model = "centered"
+outcome = "joint"
+provider = "turing"
+reason = "joint and prior are unavailable from the minimal likelihood boundary"
+state = "unsupported"
+[[measurements]]
+boundary = "minimal_likelihood"
+configuration = "ad_native"
+model = "centered"
+outcome = "prior"
+provider = "rk"
+reason = "joint and prior are unavailable from the minimal likelihood boundary"
+state = "unsupported"
+[[measurements]]
+boundary = "minimal_likelihood"
+configuration = "ad_native_bound"
+model = "centered"
+outcome = "prior"
+provider = "rk"
+reason = "joint and prior are unavailable from the minimal likelihood boundary"
+state = "unsupported"
+[[measurements]]
+boundary = "minimal_likelihood"
+configuration = "manual_ad"
+model = "centered"
+outcome = "prior"
+provider = "manual_julia"
+reason = "joint and prior are unavailable from the minimal likelihood boundary"
+state = "unsupported"
+[[measurements]]
+boundary = "minimal_likelihood"
+configuration = "turing_ad"
+model = "centered"
+outcome = "prior"
+provider = "turing"
+reason = "joint and prior are unavailable from the minimal likelihood boundary"
+state = "unsupported"
+[[measurements]]
+active_port = "θ"
+boundary = "minimal_likelihood"
+configuration = "ad_native"
+finite_difference_gradient = [0.12333333287274811, 0.07500000025111253, -0.014648437686552399, 0.049586776749151275, -0.027777777436192454, -0.004132231444653978, 0.16250000001325657, 0.030864197558753043]
+model = "centered"
+operation = "value and gradient"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    caller_owned_gradient = true
+    first_execution_bytes = 10616960
+    first_execution_seconds = 0.129253422
+    gradient_length = 8
+    gradient_max_abs_error = 4.6058522273906277e-10
+    gradient_max_rel_error = 2.8343706012399307e-9
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 80.0
+    min_ns = 80.0
+    preparation_bytes = 595976
+    preparation_seconds = 0.072221358
+    times_ns = [80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0]
+    value = -30.996346952193164
+    value_abs_error = 0.0
+[[measurements]]
+active_port = "θ"
+boundary = "minimal_likelihood"
+configuration = "ad_native_bound"
+finite_difference_gradient = [0.12333333287274811, 0.07500000025111253, -0.014648437686552399, 0.049586776749151275, -0.027777777436192454, -0.004132231444653978, 0.16250000001325657, 0.030864197558753043]
+model = "centered"
+operation = "value and gradient"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    caller_owned_gradient = true
+    first_execution_bytes = 10510560
+    first_execution_seconds = 0.130929145
+    gradient_length = 8
+    gradient_max_abs_error = 4.6058522273906277e-10
+    gradient_max_rel_error = 2.8343706012399307e-9
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 80.0
+    min_ns = 80.0
+    preparation_bytes = 593640
+    preparation_seconds = 0.066433329
+    times_ns = [80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0]
+    value = -30.996346952193164
+    value_abs_error = 0.0
+[[measurements]]
+active_port = "θ"
+boundary = "minimal_likelihood"
+configuration = "manual_ad"
+finite_difference_gradient = [0.12333333287274811, 0.07500000025111253, -0.014648437686552399, 0.049586776749151275, -0.027777777436192454, -0.004132231444653978, 0.16250000001325657, 0.030864197558753043]
+model = "centered"
+operation = "value and gradient"
+outcome = "likelihood"
+provider = "manual_julia"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    caller_owned_gradient = true
+    first_execution_bytes = 0
+    first_execution_seconds = 1.382e-6
+    gradient_length = 8
+    gradient_max_abs_error = 4.6058522273906277e-10
+    gradient_max_rel_error = 2.8343706012399307e-9
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 80.0
+    min_ns = 80.0
+    preparation_bytes = 176
+    preparation_seconds = 2.834e-6
+    times_ns = [80.0, 80.0, 80.0, 80.0, 80.0, 110.0, 100.0, 100.0, 80.0, 80.0]
+    value = -30.996346952193164
+    value_abs_error = 0.0
+[[measurements]]
+boundary = "minimal_likelihood"
+configuration = "turing_ad"
+model = "centered"
+outcome = "likelihood"
+provider = "turing"
+reason = "Turing has no public constrained or θ-only AD boundary"
+state = "unsupported"
+[[measurements]]
+active_port = "θ"
+boundary = "minimal_likelihood"
+configuration = "ad_native"
+finite_difference_gradient = [0.07400000004633192, -0.052499999970435016, -0.011718750002567805, -0.044628099250245086, -0.02777777772954068, 0.004545454520671456, 0.19500000001590787, -0.040123456789710424]
+model = "centered"
+operation = "value and pullback"
+outcome = "pointwise"
+output_cotangent = [0.6, -0.7, 0.8, -0.9, 1.0, -1.1, 1.2000000000000002, -1.3]
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+    bytes = [256, 256, 256, 256, 256, 256, 256, 256, 256, 256]
+    caller_owned_gradient = true
+    first_execution_bytes = 12471152
+    first_execution_seconds = 0.202166705
+    gradient_length = 8
+    gradient_max_abs_error = 7.669136853349912e-11
+    gradient_max_rel_error = 3.932890693704755e-10
+    median_allocs = 2
+    median_bytes = 256
+    median_ns = 140.0
+    min_ns = 130.0
+    preparation_bytes = 836744
+    preparation_seconds = 0.114752638
+    times_ns = [130.0, 140.0, 130.0, 140.0, 140.0, 140.0, 140.0, 180.0, 130.0, 140.0]
+    value = [-5.3382387343068824, -3.5027736261987186, -3.718993075756954, -3.4655941365815557, -3.1474131105408922, -3.3178668638542828, -4.541836126198719, -3.963631278755158]
+    value_abs_error = 4.440892098500626e-16
+[[measurements]]
+active_port = "θ"
+boundary = "minimal_likelihood"
+configuration = "ad_native_bound"
+finite_difference_gradient = [0.07400000004633192, -0.052499999970435016, -0.011718750002567805, -0.044628099250245086, -0.02777777772954068, 0.004545454520671456, 0.19500000001590787, -0.040123456789710424]
+model = "centered"
+operation = "value and pullback"
+outcome = "pointwise"
+output_cotangent = [0.6, -0.7, 0.8, -0.9, 1.0, -1.1, 1.2000000000000002, -1.3]
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+    bytes = [256, 256, 256, 256, 256, 256, 256, 256, 256, 256]
+    caller_owned_gradient = true
+    first_execution_bytes = 11813728
+    first_execution_seconds = 0.220249923
+    gradient_length = 8
+    gradient_max_abs_error = 7.669136853349912e-11
+    gradient_max_rel_error = 3.932890693704755e-10
+    median_allocs = 2
+    median_bytes = 256
+    median_ns = 130.0
+    min_ns = 130.0
+    preparation_bytes = 795096
+    preparation_seconds = 0.112259087
+    times_ns = [140.0, 130.0, 130.0, 130.0, 130.0, 130.0, 180.0, 130.0, 130.0, 190.0]
+    value = [-5.3382387343068824, -3.5027736261987186, -3.718993075756954, -3.4655941365815557, -3.1474131105408922, -3.3178668638542828, -4.541836126198719, -3.963631278755158]
+    value_abs_error = 4.440892098500626e-16
+[[measurements]]
+active_port = "θ"
+boundary = "minimal_likelihood"
+configuration = "manual_ad"
+finite_difference_gradient = [0.07400000004633192, -0.052499999970435016, -0.011718750002567805, -0.044628099250245086, -0.02777777772954068, 0.004545454520671456, 0.19500000001590787, -0.040123456789710424]
+model = "centered"
+operation = "value and pullback"
+outcome = "pointwise"
+output_cotangent = [0.6, -0.7, 0.8, -0.9, 1.0, -1.1, 1.2000000000000002, -1.3]
+provider = "manual_julia"
+state = "supported"
+
+    [measurements.result]
+    allocs = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+    bytes = [256, 256, 256, 256, 256, 256, 256, 256, 256, 256]
+    caller_owned_gradient = true
+    first_execution_bytes = 256
+    first_execution_seconds = 2.944e-6
+    gradient_length = 8
+    gradient_max_abs_error = 7.669136853349912e-11
+    gradient_max_rel_error = 3.932890693704755e-10
+    median_allocs = 2
+    median_bytes = 256
+    median_ns = 120.0
+    min_ns = 110.0
+    preparation_bytes = 320
+    preparation_seconds = 5.688e-6
+    times_ns = [160.0, 110.0, 110.0, 120.0, 120.0, 120.0, 120.0, 120.0, 120.0, 120.0]
+    value = [-5.3382387343068824, -3.5027736261987186, -3.718993075756954, -3.4655941365815557, -3.1474131105408922, -3.317866863854283, -4.541836126198719, -3.963631278755158]
+    value_abs_error = 0.0
+[[measurements]]
+boundary = "minimal_likelihood"
+configuration = "turing_ad"
+model = "centered"
+outcome = "pointwise"
+provider = "turing"
+reason = "the compared Turing density has no matched public pointwise VJP surface"
+state = "unsupported"
+
+[pins]
+benchmarktools_version = "1.6.3"
+differentiationinterface_version = "0.7.21"
+distributions_version = "0.25.131"
+dynamicppl_version = "0.42.6"
+enzyme_version = "0.13.199"
+julia_version = "1.10.11"
+primal_receipt_path = "benchmark/receipts/eight-schools-primal-v2.toml"
+primal_receipt_reactivekernels_sha = "52079608a44e81d2c0c23b40deedb3bebc8b5a93"
+primal_receipt_sha256 = "13873076781230afc053b827ef516cf9750a1c0c805c9c1f1fb23d78a60c25a7"
+reactivekernels_dirty = false
+reactivekernels_sha = "52079608a44e81d2c0c23b40deedb3bebc8b5a93"
+reactivekernels_version = "0.1.0"
+reactivekernelsdistributionkernels_version = "0.1.0"
+reactivekernelspplexamples_version = "0.1.0"
+turing_version = "0.47.1"
+
+    [pins.model_source]
+    commit = "0412b756a068dc495c1352b2d3595d0eceee4af0"
+    current_delta = "published centered hierarchy and every public boundary are preserved; additive scalar-index-free packed extraction and a single-output Jacobian recipe enable Reactant and nonallocating configurations"
+    git_blob = "9f67aad217a698d88f66db2271bfb9d7a3579a61"
+    path = "packages/ReactiveKernelsPPLExamples/src/eight_schools.jl"
+    text_sha256 = "c3dafc83cf921f7dd2bf443b6353841ba8114886f799b12d86c4dfff4f7701c1"
+
+        [pins.model_source.current]
+        git_blob = "959c351284c140295d0fd84caaf24cbc8335e122"
+        path = "packages/ReactiveKernelsPPLExamples/src/eight_schools.jl"
+        text_sha256 = "d84e361eab6b5f6eeb04472d60276bf5556d3a05df803343af9f2b343f42cce4"
+
+    [pins.primal_comparator_source]
+    commit = "7d9ba71fcafdc588c25c825c2a094a15320cedc5"
+    current_delta = "long-form native/bound/nonallocating matrix around byte-preserved Turing/manual baselines plus terminal definition-only guard"
+    git_blob = "5f579c40dbff5479e670e5adcb6a108ca5af29d6"
+    path = "benchmark/eight_schools_primal_comparison_body.jl"
+    text_sha256 = "b997188320ad6819891614f7a85ff0c51749d2000070e8464edb62815d24c8e1"
+
+        [pins.primal_comparator_source.current]
+        git_blob = "7d8e32e38104dea3e3a743c3a6eb0d29d6c4f674"
+        path = "benchmark/eight_schools_primal_comparison_body.jl"
+        text_sha256 = "af2e40498c3a24fc7a2ee0ec82ae616cd13fd1a189648f0820e1cea7cff64bb6"
+
+[protocol]
+bound_ports = ["observations", "observation_scales"]
+estimator = "median of per-round BenchmarkTools minimum times"
+first_execution_in_steady_state_region = false
+gradient_operation = "value and gradient for scalar WANTs; value and reverse pullback for pointwise WANTs"
+input_boundaries = ["packed_unconstrained", "constrained_parameters", "minimal_likelihood"]
+manual_control = "the primal receipt's manual Julia density differentiated through the same prepared DI+Enzyme boundary"
+matrix_layout = "long-form provider/model/configuration/boundary/outcome rows"
+matrix_source = "benchmark/receipts/eight-schools-primal-v2.toml"
+model = "centered Eight Schools"
+models = ["centered"]
+outcomes = ["joint", "prior", "likelihood", "pointwise"]
+parity_absolute_tolerance = 5.0e-8
+parity_oracle = "central finite differences of the manual Julia density"
+parity_relative_tolerance = 5.0e-6
+pointwise_jacobian_or_vjp_invented = false
+pointwise_vjp_contract = "one deterministic output cotangent through public prepared reverse pullbacks; no full Jacobian"
+preparation_in_timed_region = false
+rk_backend = "AutoEnzyme(mode = Enzyme.Reverse)"
+rk_bound_backend = "AutoEnzyme(mode = Enzyme.Reverse, function_annotation = Enzyme.Const)"
+rk_configurations = ["ad_native", "ad_native_bound"]
+rk_surface = "prepare_ad + ad_value_and_gradient[!]; prepare_ad_pullback + ad_value_and_pullback[!]"
+rounds = 10
+samples_per_round = 200
+seconds_per_round = 0.2
+source_reused = true
+structured_cotangent_ownership = "NamedTuple sensitivities use public allocating DI/RK gradients; array sensitivities use caller-owned destinations"
+turing_backend = "AutoEnzyme(runtime activity, Const function annotation)"
+turing_surface = "LogDensityProblems.logdensity_and_gradient on DynamicPPL.LogDensityFunction"
+
+[setup]
+rk_model_build_bytes = 140176720
+rk_model_build_seconds = 1.750331026
+turing_model_build_bytes = 0
+turing_model_build_seconds = 2.0e-8

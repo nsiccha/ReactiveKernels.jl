@@ -1,4 +1,5 @@
 using Test
+using Base64
 
 include(joinpath(@__DIR__, "check_rendered.jl"))
 

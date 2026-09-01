@@ -1,0 +1,393 @@
+generated_at = "2026-09-01T20:10:38.740Z"
+schema = "eight-schools-reactant-ad-v2"
+
+[environment]
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+julia_threads = 1
+os = "Linux"
+reactant_backend = "default CPU"
+
+[[measurements]]
+active_port = "unconstrained"
+ad_preparation_seconds = 0.366810865
+boundary = "packed_unconstrained"
+configuration = "ad_reactant"
+description = "gradient of the full joint w.r.t. the packed unconstrained vector"
+max_abs_error = 0.0
+model = "centered"
+outcome = "joint"
+provider = "rk"
+reactant_ad_compile_seconds = 18.294505295
+reactant_first_execution_seconds = 0.217054265
+reactant_transfer_seconds = 0.154504352
+state = "supported"
+value_abs_error = 0.0
+
+    [measurements.native_control]
+    calls_per_round = 32768
+    median_ns = 512.8071441650391
+    times_ns = [590.1182556152344, 600.7952575683594, 602.9371643066406, 483.000244140625, 481.73199462890625, 482.4734191894531, 529.8391723632812, 568.1155700683594, 665.9336547851562, 515.966552734375, 496.9315490722656, 498.161865234375, 509.6477355957031, 499.7341613769531, 564.7548828125, 574.2436828613281, 583.6842651367188, 494.1175537109375, 496.9996337890625, 507.63812255859375]
+
+    [measurements.result]
+    calls_per_round = 4096
+    median_ns = 6896.9229736328125
+    times_ns = [6565.723876953125, 6559.049072265625, 24736.904296875, 7268.749267578125, 6738.650390625, 6908.46240234375, 6974.749755859375, 7873.29931640625, 8042.776611328125, 29585.917724609375, 7433.539794921875, 7152.3681640625, 6529.3720703125, 6176.53173828125, 6172.984375, 6885.383544921875, 6856.378662109375, 28151.931884765625, 6252.97021484375, 6136.344482421875]
+[[measurements]]
+active_port = "unconstrained"
+ad_preparation_seconds = 0.191692624
+boundary = "packed_unconstrained"
+configuration = "ad_reactant_bound"
+description = "gradient of the full joint w.r.t. the packed unconstrained vector"
+max_abs_error = 0.0
+model = "centered"
+outcome = "joint"
+provider = "rk"
+reactant_ad_compile_seconds = 3.284185608
+reactant_first_execution_seconds = 0.027148586
+reactant_transfer_seconds = 8.1573e-5
+state = "supported"
+value_abs_error = 0.0
+
+    [measurements.native_control]
+    calls_per_round = 16384
+    median_ns = 332.68963623046875
+    times_ns = [346.5482177734375, 312.8377685546875, 1190.203369140625, 330.0838623046875, 741.7921752929688, 316.02874755859375, 330.7530517578125, 499.62200927734375, 328.67681884765625, 494.50750732421875, 323.646728515625, 485.698974609375, 328.68719482421875, 297.5560302734375, 497.991943359375, 314.913330078125, 521.2882690429688, 320.25396728515625, 485.5963134765625, 334.626220703125]
+
+    [measurements.result]
+    calls_per_round = 4096
+    median_ns = 6522.1514892578125
+    times_ns = [6125.482177734375, 6478.528076171875, 6411.25244140625, 25140.314697265625, 5849.226806640625, 5966.493408203125, 6223.05322265625, 6353.056884765625, 6085.87939453125, 5875.606201171875, 6660.9697265625, 6229.4755859375, 6589.183837890625, 7545.070556640625, 6759.67041015625, 6821.94384765625, 6565.77490234375, 6630.896484375, 6960.083984375, 6690.57373046875]
+[[measurements]]
+active_port = "unconstrained"
+ad_preparation_seconds = 0.133001337
+boundary = "packed_unconstrained"
+configuration = "ad_reactant"
+description = "gradient of the unconstrained log prior"
+max_abs_error = 0.0
+model = "centered"
+outcome = "prior"
+provider = "rk"
+reactant_ad_compile_seconds = 4.139188768
+reactant_first_execution_seconds = 0.033778647
+reactant_transfer_seconds = 8.1252e-5
+state = "supported"
+value_abs_error = 0.0
+
+    [measurements.native_control]
+    calls_per_round = 32768
+    median_ns = 593.5365600585938
+    times_ns = [404.3284606933594, 863.8279113769531, 520.5765075683594, 702.9054565429688, 648.3403930664062, 512.0787963867188, 834.8991394042969, 378.88775634765625, 730.0187072753906, 511.1815490722656, 582.8771667480469, 653.5157165527344, 557.0453186035156, 883.88671875, 382.5234375, 766.7291564941406, 515.4935302734375, 604.1959533691406, 636.7298583984375, 523.0875854492188]
+
+    [measurements.result]
+    calls_per_round = 4096
+    median_ns = 6558.5665283203125
+    times_ns = [5820.904052734375, 5780.638671875, 27371.482177734375, 6315.492919921875, 6439.636474609375, 6262.499755859375, 6063.064697265625, 5718.504638671875, 7254.552734375, 6746.331787109375, 6677.49658203125, 6754.181884765625, 35198.51416015625, 8172.804443359375, 7867.048583984375, 6124.990966796875, 5690.82470703125, 6024.458984375, 6798.06591796875, 6684.28564453125]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "ad_reactant_bound"
+description = "the minimal prior cut has no data ports to bind"
+model = "centered"
+outcome = "prior"
+provider = "rk"
+reason = "the minimal prior cut has no data ports to bind"
+state = "not_applicable"
+[[measurements]]
+active_port = "unconstrained"
+ad_preparation_seconds = 0.08781634
+boundary = "packed_unconstrained"
+configuration = "ad_reactant"
+description = "gradient of the summed log likelihood after unpacking"
+max_abs_error = 0.0
+model = "centered"
+outcome = "likelihood"
+provider = "rk"
+reactant_ad_compile_seconds = 3.653016289
+reactant_first_execution_seconds = 0.024439518
+reactant_transfer_seconds = 8.9934e-5
+state = "supported"
+value_abs_error = 0.0
+
+    [measurements.native_control]
+    calls_per_round = 131072
+    median_ns = 253.67355728149414
+    times_ns = [483.4026336669922, 197.15021514892578, 294.13294982910156, 369.1403350830078, 201.07598876953125, 254.19105529785156, 330.8594284057617, 208.15523529052734, 252.70362091064453, 338.13257598876953, 221.57332611083984, 252.95101928710938, 313.953857421875, 227.8684844970703, 255.35194396972656, 311.91253662109375, 228.63890075683594, 253.15605926513672, 300.0089111328125, 231.8839569091797]
+
+    [measurements.result]
+    calls_per_round = 4096
+    median_ns = 7779.2354736328125
+    times_ns = [5551.382080078125, 7601.52099609375, 7943.0244140625, 6303.67236328125, 7744.33740234375, 8416.791259765625, 6254.965087890625, 5981.557861328125, 84717.86157226562, 5711.647216796875, 7996.29638671875, 8176.41552734375, 7957.118896484375, 8201.721435546875, 8367.198974609375, 7814.133544921875, 39652.7939453125, 6731.154541015625, 7401.107421875, 7291.6103515625]
+[[measurements]]
+active_port = "unconstrained"
+ad_preparation_seconds = 0.084389251
+boundary = "packed_unconstrained"
+configuration = "ad_reactant_bound"
+description = "gradient of the summed log likelihood after unpacking"
+max_abs_error = 0.0
+model = "centered"
+outcome = "likelihood"
+provider = "rk"
+reactant_ad_compile_seconds = 2.750237576
+reactant_first_execution_seconds = 0.025308106
+reactant_transfer_seconds = 8.5708e-5
+state = "supported"
+value_abs_error = 0.0
+
+    [measurements.native_control]
+    calls_per_round = 4096
+    median_ns = 161.5596923828125
+    times_ns = [120.199951171875, 172.11474609375, 169.271728515625, 149.35400390625, 159.14794921875, 179.952880859375, 169.450439453125, 133.25, 147.4228515625, 127.4462890625, 133.235595703125, 156.367919921875, 139.983154296875, 183.253173828125, 189.658935546875, 379.943359375, 2844.557861328125, 147.674560546875, 163.971435546875, 166.824462890625]
+
+    [measurements.result]
+    calls_per_round = 4096
+    median_ns = 5805.8248291015625
+    times_ns = [5494.274169921875, 5979.59716796875, 5693.02978515625, 5752.753662109375, 5659.064453125, 5636.328125, 5630.64892578125, 5952.90283203125, 6305.178466796875, 6017.559814453125, 5534.31005859375, 39072.664306640625, 6137.246826171875, 5653.096923828125, 6028.135986328125, 5869.208251953125, 5786.833740234375, 5824.81591796875, 5408.10791015625, 6516.46630859375]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "ad_reactant"
+description = "the public compiled-AD surface has no compiled reverse-pullback verb; no pointwise VJP is claimed"
+model = "centered"
+outcome = "pointwise"
+provider = "rk"
+reason = "the public compiled-AD surface has no compiled reverse-pullback verb; no pointwise VJP is claimed"
+state = "unsupported"
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "ad_reactant_bound"
+description = "the public compiled-AD surface has no compiled reverse-pullback verb; no pointwise VJP is claimed"
+model = "centered"
+outcome = "pointwise"
+provider = "rk"
+reason = "the public compiled-AD surface has no compiled reverse-pullback verb; no pointwise VJP is claimed"
+state = "unsupported"
+[[measurements]]
+boundary = "constrained_parameters"
+configuration = "ad_reactant"
+description = "native structured gradients are public, but compiled AD has no structured active-argument/result contract"
+model = "centered"
+outcome = "joint"
+provider = "rk"
+reason = "native structured gradients are public, but compiled AD has no structured active-argument/result contract"
+state = "unsupported"
+[[measurements]]
+boundary = "constrained_parameters"
+configuration = "ad_reactant_bound"
+description = "native structured gradients are public, but compiled AD has no structured active-argument/result contract"
+model = "centered"
+outcome = "joint"
+provider = "rk"
+reason = "native structured gradients are public, but compiled AD has no structured active-argument/result contract"
+state = "unsupported"
+[[measurements]]
+boundary = "constrained_parameters"
+configuration = "ad_reactant"
+description = "native structured gradients are public, but compiled AD has no structured active-argument/result contract"
+model = "centered"
+outcome = "prior"
+provider = "rk"
+reason = "native structured gradients are public, but compiled AD has no structured active-argument/result contract"
+state = "unsupported"
+[[measurements]]
+boundary = "constrained_parameters"
+configuration = "ad_reactant_bound"
+description = "the minimal prior cut has no data ports to bind"
+model = "centered"
+outcome = "prior"
+provider = "rk"
+reason = "the minimal prior cut has no data ports to bind"
+state = "not_applicable"
+[[measurements]]
+boundary = "constrained_parameters"
+configuration = "ad_reactant"
+description = "native structured gradients are public, but compiled AD has no structured active-argument/result contract"
+model = "centered"
+outcome = "likelihood"
+provider = "rk"
+reason = "native structured gradients are public, but compiled AD has no structured active-argument/result contract"
+state = "unsupported"
+[[measurements]]
+boundary = "constrained_parameters"
+configuration = "ad_reactant_bound"
+description = "native structured gradients are public, but compiled AD has no structured active-argument/result contract"
+model = "centered"
+outcome = "likelihood"
+provider = "rk"
+reason = "native structured gradients are public, but compiled AD has no structured active-argument/result contract"
+state = "unsupported"
+[[measurements]]
+boundary = "constrained_parameters"
+configuration = "ad_reactant"
+description = "the public compiled-AD surface has no compiled reverse-pullback verb; no pointwise VJP is claimed"
+model = "centered"
+outcome = "pointwise"
+provider = "rk"
+reason = "the public compiled-AD surface has no compiled reverse-pullback verb; no pointwise VJP is claimed"
+state = "unsupported"
+[[measurements]]
+boundary = "constrained_parameters"
+configuration = "ad_reactant_bound"
+description = "the public compiled-AD surface has no compiled reverse-pullback verb; no pointwise VJP is claimed"
+model = "centered"
+outcome = "pointwise"
+provider = "rk"
+reason = "the public compiled-AD surface has no compiled reverse-pullback verb; no pointwise VJP is claimed"
+state = "unsupported"
+[[measurements]]
+boundary = "minimal_likelihood"
+configuration = "ad_reactant"
+description = "joint and prior are unavailable from the minimal likelihood boundary"
+model = "centered"
+outcome = "joint"
+provider = "rk"
+reason = "joint and prior are unavailable from the minimal likelihood boundary"
+state = "unsupported"
+[[measurements]]
+boundary = "minimal_likelihood"
+configuration = "ad_reactant_bound"
+description = "joint and prior are unavailable from the minimal likelihood boundary"
+model = "centered"
+outcome = "joint"
+provider = "rk"
+reason = "joint and prior are unavailable from the minimal likelihood boundary"
+state = "unsupported"
+[[measurements]]
+boundary = "minimal_likelihood"
+configuration = "ad_reactant"
+description = "joint and prior are unavailable from the minimal likelihood boundary"
+model = "centered"
+outcome = "prior"
+provider = "rk"
+reason = "joint and prior are unavailable from the minimal likelihood boundary"
+state = "unsupported"
+[[measurements]]
+boundary = "minimal_likelihood"
+configuration = "ad_reactant_bound"
+description = "joint and prior are unavailable from the minimal likelihood boundary"
+model = "centered"
+outcome = "prior"
+provider = "rk"
+reason = "joint and prior are unavailable from the minimal likelihood boundary"
+state = "unsupported"
+[[measurements]]
+active_port = "θ"
+ad_preparation_seconds = 0.108462343
+boundary = "minimal_likelihood"
+configuration = "ad_reactant"
+description = "gradient of the summed likelihood from θ, observations, and scales"
+max_abs_error = 0.0
+model = "centered"
+outcome = "likelihood"
+provider = "rk"
+reactant_ad_compile_seconds = 3.197778822
+reactant_first_execution_seconds = 0.023178458
+reactant_transfer_seconds = 8.9754e-5
+state = "supported"
+value_abs_error = 0.0
+
+    [measurements.native_control]
+    calls_per_round = 131072
+    median_ns = 115.6034164428711
+    times_ns = [121.4391098022461, 141.0929946899414, 136.51690673828125, 119.13848876953125, 108.23377227783203, 110.29137420654297, 118.7305908203125, 108.97332000732422, 107.81365966796875, 128.73326110839844, 117.13965606689453, 109.91143035888672, 128.17569732666016, 109.76252746582031, 109.47588348388672, 117.95193481445312, 114.06717681884766, 113.08161926269531, 127.03658294677734, 113.79618835449219]
+
+    [measurements.result]
+    calls_per_round = 4096
+    median_ns = 5502.11962890625
+    times_ns = [5626.984130859375, 6012.900146484375, 5879.5791015625, 25560.951416015625, 5930.80908203125, 5468.650390625, 5485.688232421875, 5451.6494140625, 5518.551025390625, 5316.14501953125, 5253.18212890625, 5300.237060546875, 5247.564208984375, 5390.180419921875, 35288.350341796875, 5799.7177734375, 5617.825927734375, 5542.59033203125, 5484.21875, 5448.2734375]
+[[measurements]]
+active_port = "θ"
+ad_preparation_seconds = 0.08341817
+boundary = "minimal_likelihood"
+configuration = "ad_reactant_bound"
+description = "gradient of the summed likelihood from θ, observations, and scales"
+max_abs_error = 0.0
+model = "centered"
+outcome = "likelihood"
+provider = "rk"
+reactant_ad_compile_seconds = 2.503424944
+reactant_first_execution_seconds = 0.025685747
+reactant_transfer_seconds = 7.979e-5
+state = "supported"
+value_abs_error = 0.0
+
+    [measurements.native_control]
+    calls_per_round = 8192
+    median_ns = 124.5609130859375
+    times_ns = [132.19287109375, 125.0394287109375, 119.0167236328125, 126.2655029296875, 124.0823974609375, 110.6396484375, 117.3310546875, 128.1260986328125, 231.3714599609375, 352.6253662109375, 339.739990234375, 1612.3973388671875, 121.05078125, 126.456298828125, 112.4573974609375, 109.843994140625, 116.992431640625, 125.38671875, 121.5850830078125, 117.875]
+
+    [measurements.result]
+    calls_per_round = 4096
+    median_ns = 5273.808837890625
+    times_ns = [5259.631591796875, 5343.77099609375, 5187.248779296875, 5062.396484375, 5077.013916015625, 5007.8828125, 5022.421875, 5054.30908203125, 5052.10888671875, 4973.959228515625, 5287.986083984375, 5823.5322265625, 43352.3427734375, 5016.163330078125, 5431.39453125, 5737.414794921875, 5708.7890625, 5447.339599609375, 5511.85205078125, 5400.3603515625]
+[[measurements]]
+boundary = "minimal_likelihood"
+configuration = "ad_reactant"
+description = "the public compiled-AD surface has no compiled reverse-pullback verb; no pointwise VJP is claimed"
+model = "centered"
+outcome = "pointwise"
+provider = "rk"
+reason = "the public compiled-AD surface has no compiled reverse-pullback verb; no pointwise VJP is claimed"
+state = "unsupported"
+[[measurements]]
+boundary = "minimal_likelihood"
+configuration = "ad_reactant_bound"
+description = "the public compiled-AD surface has no compiled reverse-pullback verb; no pointwise VJP is claimed"
+model = "centered"
+outcome = "pointwise"
+provider = "rk"
+reason = "the public compiled-AD surface has no compiled reverse-pullback verb; no pointwise VJP is claimed"
+state = "unsupported"
+
+[pins]
+ad_receipt_path = "benchmark/receipts/eight-schools-ad-v2.toml"
+ad_receipt_reactivekernels_sha = "52079608a44e81d2c0c23b40deedb3bebc8b5a93"
+ad_receipt_sha256 = "764e0d5ea3c72283e3f14e336665ace16a3e99a66602f02e2313d93ec5dbaf90"
+differentiationinterface_version = "0.7.21"
+enzyme_version = "0.13.199"
+julia_version = "1.10.11"
+reactant_jll_version = "0.0.401+0"
+reactant_version = "0.2.278"
+reactivekernels_dirty = false
+reactivekernels_sha = "52079608a44e81d2c0c23b40deedb3bebc8b5a93"
+reactivekernels_version = "0.1.0"
+reactivekernelsdistributionkernels_version = "0.1.0"
+reactivekernelspplexamples_version = "0.1.0"
+source_authority_blob = "959c351284c140295d0fd84caaf24cbc8335e122"
+source_authority_path = "packages/ReactiveKernelsPPLExamples/src/eight_schools.jl"
+source_text_sha256 = "46da0bba75374c931b131d14cdb35df98027662c2e2e89021224a91a7a030038"
+
+[protocol]
+ad_preparation_in_timed_region = false
+bound_ports = ["observations", "observation_scales"]
+estimator = "median per-call time from calibrated elapsed batches"
+first_execution_in_steady_state_region = false
+gradient_operation = "value and gradient"
+input_boundaries = ["packed_unconstrained", "constrained_parameters", "minimal_likelihood"]
+matrix_layout = "long-form provider/model/configuration/boundary/outcome rows"
+matrix_source = "benchmark/receipts/eight-schools-ad-v2.toml"
+model = "centered Eight Schools"
+models = ["centered"]
+outcomes = ["joint", "prior", "likelihood", "pointwise"]
+parity_atol = 1.0e-10
+parity_reference = "native RK reverse pass (ad_value_and_gradient!)"
+parity_rtol = 1.0e-11
+pointwise_jacobian_or_vjp_invented = false
+preparation_in_timed_region = false
+reactant_compile_time_in_timed_region = false
+reactant_readback_in_timed_region = false
+reactant_sync = true
+reactant_transfers_in_timed_region = false
+rk_ad_backend = "AutoEnzyme(mode = Enzyme.Reverse)"
+rk_bound_ad_backend = "AutoEnzyme(mode = Enzyme.Reverse, function_annotation = Enzyme.Const)"
+rk_configurations = ["ad_reactant", "ad_reactant_bound"]
+rk_native_ad_surface = "prepare_ad + ad_value_and_gradient!"
+rk_reactant_ad_surface = "prepare_ad + compile_ad_value_and_gradient"
+rounds = 20
+setup_in_timed_region = false
+source_reused = true
+target_seconds_per_round = 0.02
+unsupported_cells_recorded = true
+
+[setup]
+environment_seconds = 0.0
+kernel_preparation_seconds = 2.191970574
+package_precompile_seconds = 0.0

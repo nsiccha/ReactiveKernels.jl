@@ -10,8 +10,12 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     BERNOULLI_KERNEL_SOURCE, LOGNORMAL_KERNEL_SOURCE,
     EXPONENTIAL_KERNEL_SOURCE, GEOMETRIC_KERNEL_SOURCE, UNIFORM_KERNEL_SOURCE,
     MVNORMAL_KERNEL_SOURCE, AR1_KERNEL_SOURCE,
+    CATEGORICAL_LOGIT_KERNEL_SOURCE, CATEGORICAL_LOGIT_REF_KERNEL_SOURCE,
+    CATEGORICAL_LOGIT_COLUMNS_KERNEL_SOURCE,
+    CATEGORICAL_LOGIT_REF_COLUMNS_KERNEL_SOURCE,
     normal, cauchy, laplace, bernoulli, lognormal,
     exponential, geometric, uniform, mvnormal, ar1,
+    categorical_logit, categorical_logit_ref,
     NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY
 using Test
 
@@ -32,7 +36,8 @@ end
 @testset "distribution kernel foundation" begin
     @test all(object -> hasproperty(object, :logpdf),
         (normal, cauchy, laplace, bernoulli, lognormal,
-         exponential, geometric, uniform, mvnormal, ar1))
+         exponential, geometric, uniform, mvnormal, ar1,
+         categorical_logit, categorical_logit_ref))
     @test all(object -> object isa KernelObjectSpec, (normal, cauchy, laplace))
     @test all(template -> !isnothing(template),
         (standard_normal, standard_cauchy, standard_laplace, location_scale))
@@ -46,7 +51,11 @@ end
         (LOCATION_SCALE_SOURCE, BERNOULLI_KERNEL_SOURCE,
          LOGNORMAL_KERNEL_SOURCE, EXPONENTIAL_KERNEL_SOURCE,
          GEOMETRIC_KERNEL_SOURCE, UNIFORM_KERNEL_SOURCE,
-         MVNORMAL_KERNEL_SOURCE, AR1_KERNEL_SOURCE))
+         MVNORMAL_KERNEL_SOURCE, AR1_KERNEL_SOURCE,
+         CATEGORICAL_LOGIT_KERNEL_SOURCE,
+         CATEGORICAL_LOGIT_REF_KERNEL_SOURCE,
+         CATEGORICAL_LOGIT_COLUMNS_KERNEL_SOURCE,
+         CATEGORICAL_LOGIT_REF_COLUMNS_KERNEL_SOURCE))
 
     @testset "public location-scale plate is allocation-free" begin
         xs = [-1.2, -0.1, 0.7, 1.8]
@@ -142,6 +151,11 @@ end
 
         @test hasproperty(ar1, :logpdf)
         @test occursin("@kernel ar1", AR1_KERNEL_SOURCE)
+
+        @test occursin("categorical_logit(column).logpdf(label)",
+                       CATEGORICAL_LOGIT_COLUMNS_KERNEL_SOURCE)
+        @test occursin("categorical_logit_ref(column).logpdf(label)",
+                       CATEGORICAL_LOGIT_REF_COLUMNS_KERNEL_SOURCE)
     end
 
     @testset "transparent cuts and shared work" begin
