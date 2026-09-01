@@ -12,6 +12,11 @@ permissions:
   id-token: write
   statuses: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Keep main/tag deploys atomic, but retain only the newest pending run per ref.
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+
 jobs:
   build:
     runs-on: ubuntu-latest
