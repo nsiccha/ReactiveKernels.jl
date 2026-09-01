@@ -52,6 +52,108 @@ _fscr_trace_value(value::Tuple, seen) =
     map(child -> _fscr_trace_value(child, seen), value)
 _fscr_trace_value(value, seen) = value
 
+struct _FSCRPackReadWrite{C}
+    contract::C
+end
+function (_fscr_pack::_FSCRPackReadWrite)(
+        values, index, replacement)
+    raw = _FSCR_RK._sm_finite_structural_pack(
+        _fscr_pack.contract, values)
+    read = _FSCR_RK._sm_finite_structural_read(
+        _fscr_pack.contract, raw, index)
+    written = _FSCR_RK._sm_finite_structural_write(
+        _fscr_pack.contract, raw, index, replacement)
+    (; read, written)
+end
+
+struct _FSCRMixedPackCarry{C}
+    contract::C
+end
+function (operation::_FSCRMixedPackCarry)(
+        values, index, replacement, iterations)
+    raw = _FSCR_RK._sm_finite_structural_pack(
+        operation.contract, values)
+    count = zero(iterations)
+    Reactant.@trace while count < iterations
+        raw = _FSCR_RK._sm_finite_structural_write(
+            operation.contract, raw, index, replacement).storage
+        count += one(count)
+    end
+    raw
+end
+
+@testset "finite structural logical traced elements retain their host contract" begin
+    prototype = [(;
+        scalar=Float64(index),
+        flag=isodd(index),
+        vector=Float64[index, index + 1],
+        mask=Bool[isodd(index), iseven(index)],
+    ) for index in 1:3]
+    contract = _FSCR_RK._sm_finite_structural_contract(prototype)
+    traced = [_fscr_trace_value(value) for value in prototype]
+
+    @test _FSCR_RK._sm_finite_validate_elements(contract, traced) === traced
+    traced_index = _fscr_traced(2)
+    replacement = _fscr_trace_value(prototype[3])
+    compiled_pack_read_write = @compile _FSCRPackReadWrite(contract)(
+        traced, traced_index, replacement)
+    packed = compiled_pack_read_write(
+        traced, traced_index, replacement)
+    @test map(Array, values(packed.read.storage)) ==
+          values(_FSCR_RK._sm_finite_structural_pack(contract, prototype))
+    @test Float64(packed.read.value.scalar) == prototype[2].scalar
+    @test Bool(packed.read.value.flag) == prototype[2].flag
+    @test Array(packed.read.value.vector) == prototype[2].vector
+    @test Array(packed.read.value.mask) == prototype[2].mask
+    @test !Bool(packed.read.overflow)
+    written = _fscr_host_raw(packed.written.storage)
+    written_values = _FSCR_RK._sm_finite_structural_unpack(
+        contract, written)
+    @test written_values == [prototype[1], prototype[3], prototype[3]]
+    @test !Bool(packed.written.overflow)
+
+    wrong_axes = copy(traced)
+    wrong_axes[1] = merge(
+        traced[1], (mask=Reactant.to_rarray(Bool[true]),))
+    @test_throws ArgumentError _FSCR_RK._sm_finite_validate_elements(
+        contract, wrong_axes)
+
+    wrong_type = Any[traced...]
+    wrong_type[1] = merge(
+        traced[1],
+        (flag=Reactant.to_rarray(Int32(1); track_numbers=true),))
+    @test_throws ArgumentError _FSCR_RK._sm_finite_validate_elements(
+        contract, wrong_type)
+end
+
+
+@testset "mixed structural leaves retain one traced carry type" begin
+    prototype = [(;
+        scalar=Float64(index),
+        vector=Float64[index, index + 1],
+    ) for index in 1:3]
+    contract = _FSCR_RK._sm_finite_structural_contract(prototype)
+    mixed = [(;
+        scalar=value.scalar,
+        vector=Reactant.to_rarray(value.vector),
+    ) for value in prototype]
+    replacement = (;
+        scalar=prototype[3].scalar,
+        vector=Reactant.to_rarray(prototype[3].vector),
+    )
+    operation = _FSCRMixedPackCarry(contract)
+    traced_index = _fscr_traced(2)
+    traced_iterations = _fscr_traced(2)
+    compiled = @compile operation(
+        mixed, traced_index, replacement, traced_iterations)
+    raw = compiled(mixed, traced_index, replacement, traced_iterations)
+    @test all(column -> column isa Reactant.AbstractConcreteArray,
+              values(raw))
+    host = _fscr_host_raw(raw)
+    values_after = _FSCR_RK._sm_finite_structural_unpack(contract, host)
+    @test values_after == [prototype[1], prototype[3], prototype[3]]
+end
+
 struct _FSCRRead{C}
     contract::C
 end

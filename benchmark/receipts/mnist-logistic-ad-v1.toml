@@ -1,0 +1,305 @@
+generated_at = "2026-09-01T06:52:06.821Z"
+schema = "mnist-logistic-ad-v1"
+
+[environment]
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+julia_threads = 1
+os = "Linux"
+
+[[measurements]]
+active_port = "unconstrained"
+analytic_gradient_length = 7065
+boundary = "packed_unconstrained"
+outcome = "joint"
+supported = true
+
+    [measurements.manual_enzyme]
+    allocs = [22, 22, 22, 22, 22, 22, 22, 22, 22, 22]
+    bytes = [41761072, 41761072, 41761072, 41761072, 41761072, 41761072, 41761072, 41761072, 41761072, 41761072]
+    caller_owned_gradient = true
+    first_execution_bytes = 41761136
+    first_execution_seconds = 0.45825617
+    gradient_length = 7065
+    gradient_max_abs_error = 5.286437954055145e-12
+    gradient_max_rel_error = 1.3894922835560327e-15
+    median_allocs = 22
+    median_bytes = 41761072
+    median_ns = 6.049436125e8
+    min_ns = 4.21637853e8
+    preparation_bytes = 56624
+    preparation_seconds = 8.592e-6
+    times_ns = [4.21637853e8, 6.49766555e8, 5.5108814e8, 5.12628311e8, 1.203447141e9, 6.45500318e8, 6.00107526e8, 5.47485139e8, 6.09779699e8, 1.102914558e9]
+    value = -145370.39585005437
+    value_abs_error = 3.7834979593753815e-10
+
+    [measurements.rk_native]
+    allocs = [27, 27, 27, 27, 27, 27, 27, 27, 27, 27]
+    bytes = [32162496, 32162496, 32162496, 32162496, 32162496, 32162496, 32162496, 32162496, 32162496, 32162496]
+    caller_owned_gradient = true
+    first_execution_bytes = 359509152
+    first_execution_seconds = 7.185367834
+    gradient_length = 7065
+    gradient_max_abs_error = 5.002220859751105e-12
+    gradient_max_rel_error = 1.3147883973433428e-15
+    median_allocs = 27
+    median_bytes = 32162496
+    median_ns = 4.02895756e8
+    min_ns = 3.24357488e8
+    preparation_bytes = 6732288
+    preparation_seconds = 0.324205758
+    times_ns = [4.32909583e8, 4.87389201e8, 4.30852625e8, 3.73205637e8, 5.14897813e8, 8.22792387e8, 3.58108018e8, 3.74938887e8, 3.24357488e8, 3.67828428e8]
+    value = -145370.3958500536
+    value_abs_error = 1.1350493878126144e-9
+
+    [measurements.turing_enzyme]
+    allocs = [67, 67, 67, 67, 67, 67, 67, 67, 67, 67]
+    bytes = [49557168, 49557168, 49557168, 49557168, 49557168, 49557168, 49557168, 49557168, 49557168, 49557168]
+    caller_owned_gradient = false
+    first_execution_bytes = 476297888
+    first_execution_seconds = 51.485311674
+    gradient_length = 7065
+    gradient_max_abs_error = 5.002220859751105e-12
+    gradient_max_rel_error = 1.3147883973433428e-15
+    median_allocs = 67
+    median_bytes = 49557168
+    median_ns = 5.546107895e8
+    min_ns = 4.42518069e8
+    preparation_bytes = 184174200
+    preparation_seconds = 1.974283129
+    times_ns = [5.23748593e8, 6.91753729e8, 7.0718646e8, 5.85472986e8, 4.96254041e8, 4.43190477e8, 4.91235529e8, 4.42518069e8, 6.86533097e8, 8.72045345e8]
+    value = -145370.3958500536
+    value_abs_error = 1.1350493878126144e-9
+[[measurements]]
+active_port = "unconstrained"
+analytic_gradient_length = 7065
+boundary = "packed_unconstrained"
+outcome = "prior"
+supported = true
+
+    [measurements.manual_enzyme]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    caller_owned_gradient = true
+    first_execution_bytes = 0
+    first_execution_seconds = 1.7214e-5
+    gradient_length = 7065
+    gradient_max_abs_error = 0.0
+    gradient_max_rel_error = 0.0
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 2854.0
+    min_ns = 2773.0
+    preparation_bytes = 56624
+    preparation_seconds = 3.1032e-5
+    times_ns = [2864.0, 2844.0, 2773.0, 2874.0, 2934.0, 3114.0, 2824.0, 2844.0, 2834.0, 2964.0]
+    value = -6492.650073005305
+    value_abs_error = 0.0
+
+    [measurements.rk_native]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    caller_owned_gradient = true
+    first_execution_bytes = 8168088
+    first_execution_seconds = 0.137312262
+    gradient_length = 7065
+    gradient_max_abs_error = 0.0
+    gradient_max_rel_error = 0.0
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 5522.0
+    min_ns = 5346.0
+    preparation_bytes = 811136
+    preparation_seconds = 0.116378995
+    times_ns = [5658.0, 5547.0, 5748.0, 5497.0, 5497.0, 5547.0, 5667.0, 5387.0, 5346.0, 5457.0]
+    value = -6492.650073005288
+    value_abs_error = 1.7280399333685637e-11
+
+    [measurements.turing_enzyme]
+    allocs = [67, 67, 67, 67, 67, 67, 67, 67, 67, 67]
+    bytes = [49557168, 49557168, 49557168, 49557168, 49557168, 49557168, 49557168, 49557168, 49557168, 49557168]
+    caller_owned_gradient = false
+    first_execution_bytes = 467363960
+    first_execution_seconds = 47.013439322
+    gradient_length = 7065
+    gradient_max_abs_error = 0.0
+    gradient_max_rel_error = 0.0
+    median_allocs = 67
+    median_bytes = 49557168
+    median_ns = 5.874211445e8
+    min_ns = 4.49797462e8
+    preparation_bytes = 190875256
+    preparation_seconds = 0.943173514
+    times_ns = [5.4394828e8, 4.66681284e8, 6.52972848e8, 6.6435507e8, 5.03692513e8, 4.49797462e8, 6.30894009e8, 6.98013544e8, 4.54105915e8, 7.80590236e8]
+    value = -6492.650073005305
+    value_abs_error = 0.0
+[[measurements]]
+active_port = "unconstrained"
+analytic_gradient_length = 7065
+boundary = "packed_unconstrained"
+outcome = "likelihood"
+supported = true
+
+    [measurements.manual_enzyme]
+    allocs = [22, 22, 22, 22, 22, 22, 22, 22, 22, 22]
+    bytes = [41761072, 41761072, 41761072, 41761072, 41761072, 41761072, 41761072, 41761072, 41761072, 41761072]
+    caller_owned_gradient = true
+    first_execution_bytes = 41761072
+    first_execution_seconds = 0.555834215
+    gradient_length = 7065
+    gradient_max_abs_error = 5.286437954055145e-12
+    gradient_max_rel_error = 1.3894944745283917e-15
+    median_allocs = 22
+    median_bytes = 41761072
+    median_ns = 7.66531485e8
+    min_ns = 5.60911907e8
+    preparation_bytes = 56624
+    preparation_seconds = 6.068e-6
+    times_ns = [6.52736365e8, 8.3194959e8, 5.60911907e8, 7.38780529e8, 8.28344398e8, 7.4624107e8, 7.868219e8, 9.91709192e8, 8.87227833e8, 6.75171624e8]
+    value = -138877.74577704907
+    value_abs_error = 3.7834979593753815e-10
+
+    [measurements.rk_native]
+    allocs = [27, 27, 27, 27, 27, 27, 27, 27, 27, 27]
+    bytes = [32162496, 32162496, 32162496, 32162496, 32162496, 32162496, 32162496, 32162496, 32162496, 32162496]
+    caller_owned_gradient = true
+    first_execution_bytes = 237360152
+    first_execution_seconds = 6.442290555
+    gradient_length = 7065
+    gradient_max_abs_error = 5.002220859751105e-12
+    gradient_max_rel_error = 1.314790470521489e-15
+    median_allocs = 27
+    median_bytes = 32162496
+    median_ns = 5.624607145e8
+    min_ns = 4.53225761e8
+    preparation_bytes = 611928
+    preparation_seconds = 0.16835633
+    times_ns = [7.39699206e8, 7.98464389e8, 5.75362903e8, 5.07620756e8, 5.09982915e8, 4.53225761e8, 5.74050943e8, 6.244671e8, 5.32100524e8, 5.50870486e8]
+    value = -138877.74577704832
+    value_abs_error = 1.1350493878126144e-9
+
+    [measurements.turing_enzyme]
+    allocs = [47, 47, 47, 47, 47, 47, 47, 47, 47, 47]
+    bytes = [49555632, 49555632, 49555632, 49555632, 49555632, 49555632, 49555632, 49555632, 49555632, 49555632]
+    caller_owned_gradient = false
+    first_execution_bytes = 424487744
+    first_execution_seconds = 48.934660883
+    gradient_length = 7065
+    gradient_max_abs_error = 5.002220859751105e-12
+    gradient_max_rel_error = 1.314790470521489e-15
+    median_allocs = 47
+    median_bytes = 49555632
+    median_ns = 6.29628784e8
+    min_ns = 4.63334084e8
+    preparation_bytes = 179413592
+    preparation_seconds = 1.678652122
+    times_ns = [4.63334084e8, 5.85028565e8, 6.74229003e8, 9.4324027e8, 5.19200039e8, 8.38283777e8, 5.48361375e8, 4.8507111e8, 9.47961733e8, 6.98169689e8]
+    value = -138877.74577704832
+    value_abs_error = 1.1350493878126144e-9
+[[measurements]]
+boundary = "packed_unconstrained"
+outcome = "pointwise"
+supported = false
+unsupported_reason = "pointwise is vector-valued and the compared public surfaces do not share a matched Jacobian/VJP contract"
+[[measurements]]
+boundary = "structured_parameters"
+outcome = "joint"
+supported = false
+unsupported_reason = "the structured (W, b) boundary has two active HAVE ports while the public RK AD boundary deliberately accepts exactly one active port"
+[[measurements]]
+boundary = "structured_parameters"
+outcome = "prior"
+supported = false
+unsupported_reason = "the structured (W, b) boundary has two active HAVE ports while the public RK AD boundary deliberately accepts exactly one active port"
+[[measurements]]
+boundary = "structured_parameters"
+outcome = "likelihood"
+supported = false
+unsupported_reason = "the structured (W, b) boundary has two active HAVE ports while the public RK AD boundary deliberately accepts exactly one active port"
+[[measurements]]
+boundary = "structured_parameters"
+outcome = "pointwise"
+supported = false
+unsupported_reason = "pointwise is vector-valued and the compared public surfaces do not share a matched Jacobian/VJP contract"
+
+[pins]
+benchmarktools_version = "1.6.3"
+differentiationinterface_version = "0.7.21"
+distributions_version = "0.25.131"
+dynamicppl_version = "0.42.6"
+enzyme_version = "0.13.199"
+julia_version = "1.10.11"
+mldatasets_version = "0.7.21"
+nnlib_version = "0.9.45"
+primal_receipt_path = "benchmark/receipts/mnist-logistic-v1.toml"
+primal_receipt_reactivekernels_sha = "4f76ae768df25dd22c96a7fa9587c2f370c340b3"
+primal_receipt_sha256 = "62e4c8c5c54e4581a6693478133e6d55af57f3a42048765b64de13c956150efc"
+reactivekernels_dirty = false
+reactivekernels_sha = "6b5b1a54926e84b7137f1a5b5b17a2f6ad9ba790"
+reactivekernels_version = "0.1.0"
+reactivekernelsdistributionkernels_version = "0.1.0"
+reactivekernelspplexamples_version = "0.1.0"
+turing_version = "0.47.1"
+
+    [pins.model_source]
+    commit = "9dbaa1fbfbdb1bb2ff4238a3910754f36635f81e"
+    git_blob = "cfd5d381c38de21742f564361ef7a7914e5ff8bd"
+    path = "packages/ReactiveKernelsPPLExamples/src/mnist_logistic.jl"
+    text_sha256 = "e51b876024fe2bc60ca0c27f59df1c74ef3c5c97165b400fa4d483e24e2509d2"
+
+        [pins.model_source.current]
+        git_blob = "cfd5d381c38de21742f564361ef7a7914e5ff8bd"
+        path = "packages/ReactiveKernelsPPLExamples/src/mnist_logistic.jl"
+        text_sha256 = "e51b876024fe2bc60ca0c27f59df1c74ef3c5c97165b400fa4d483e24e2509d2"
+
+    [pins.primal_comparator_source]
+    commit = "9dbaa1fbfbdb1bb2ff4238a3910754f36635f81e"
+    current_delta = "terminal definition-only include guard only"
+    git_blob = "c4a0321bf28e14765783ef157f58eb538bab4de9"
+    path = "benchmark/mnist_logistic_comparison_body.jl"
+    text_sha256 = "0b813401307180582a8105cceca6be541009d56a95d23c8d8cb2249e09813521"
+
+        [pins.primal_comparator_source.current]
+        git_blob = "4e1bb70430095eac5e5e68f81695fa788faeefee"
+        path = "benchmark/mnist_logistic_comparison_body.jl"
+        text_sha256 = "80b26966b88fd06844d352122acaaad43192e168ec4add51e4da60a32a18e69c"
+
+[protocol]
+active_parameter_count = 7065
+data = "MLDatasets MNIST train split, first N images"
+estimator = "minimum of per-round BenchmarkTools minimum times (uncontended cost; medians and raw rounds retained)"
+first_execution_in_steady_state_region = false
+gradient_operation = "value and gradient"
+input_boundaries = ["packed_unconstrained", "structured_parameters"]
+manual_control = "the primal receipt's manual Julia density differentiated through the same prepared DI+Enzyme boundary"
+matrix_source = "benchmark/receipts/mnist-logistic-v1.toml"
+model = "multinomial-logistic MNIST classifier"
+num_classes = 10
+num_features = 784
+num_observations = 60000
+outcomes = ["joint", "prior", "likelihood", "pointwise"]
+parity_absolute_tolerance = 1.0e-7
+parity_oracle = "independent analytic reference-class softmax and standard-normal score"
+parity_relative_tolerance = 1.0e-7
+pointwise_jacobian_or_vjp_invented = false
+preparation_in_timed_region = false
+rk_backend = "AutoEnzyme(mode = Enzyme.Reverse)"
+rk_surface = "prepare_ad + ad_value_and_gradient!"
+rounds = 10
+samples_per_round = 200
+seconds_per_round = 0.2
+setup_in_timed_region = false
+source_reused = true
+structured_multi_active_boundary_invented = false
+turing_backend = "AutoEnzyme(runtime activity, Const function annotation)"
+turing_surface = "LogDensityProblems.logdensity_and_gradient on DynamicPPL.LogDensityFunction"
+
+[setup]
+analytic_oracle_bytes = 13187520
+analytic_oracle_seconds = 0.208421815
+data_load_bytes = 804455328
+data_load_seconds = 1.749334696
+rk_model_build_bytes = 127501624
+rk_model_build_seconds = 1.87928282
+turing_model_build_bytes = 0
+turing_model_build_seconds = 3.0e-8

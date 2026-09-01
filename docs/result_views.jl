@@ -27,6 +27,9 @@ const _EIGHT_SCHOOLS_PRIMAL_RECEIPT_PATH = joinpath(
 const _EIGHT_SCHOOLS_AD_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts", "eight-schools-ad-v1.toml",
 )
+const _MNIST_LOGISTIC_AD_RECEIPT_PATH = joinpath(
+    dirname(@__DIR__), "benchmark", "receipts", "mnist-logistic-ad-v1.toml",
+)
 const _NUTS_G7_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts", "nuts-g7-v1.toml",
 )
@@ -1152,11 +1155,328 @@ function render_mnist_logistic_benchmarks()
         _result_table(rows, columns;
             id = "mnist-logistic-matrix",
             title = "MNIST logistic boundary × outcome matrix",
-            note = "Each measured cell is median runtime; bytes; allocations. " *
+            note = "Each measured cell is minimum (uncontended) runtime; bytes; " *
+                   "allocations. " *
                    "A blank cell means that backend has no matching public boundary."),
         Markdown.Paragraph(Any[Markdown.Italic(Any[provenance])]),
     ])
 end
+
+const _MNIST_LOGISTIC_AD_IMPLEMENTATIONS = (
+    ("rk_native", "ReactiveKernels"),
+    ("manual_enzyme", "Manual Julia control"),
+    ("turing_enzyme", "Turing / DynamicPPL"),
+)
+const _MNIST_LOGISTIC_AD_SUPPORTED = Set((
+    ("packed_unconstrained", "joint"),
+    ("packed_unconstrained", "prior"),
+    ("packed_unconstrained", "likelihood"),
+))
+
+function _mnist_logistic_ad_plot(rows, metric;
+                                 id::AbstractString, title::AbstractString)
+    label = metric === :min_ns ?
+        "Minimum uncontended value + gradient runtime (ns)" :
+        "Median allocated bytes"
+    scale = metric === :min_ns ? log10 : symlog
+    cell_order = unique(getproperty.(rows, :cell))
+    spec = data(rows) *
+        mapping(
+            :cell => sorter(cell_order) => "Packed scalar outcome",
+            metric => label;
+            color = :implementation => "Implementation",
+        ) *
+        visual(BarPlot) *
+        config(height = 320, scales = scales(Y = (; scale)))
+    description = metric === :min_ns ?
+        "Preparation and first execution are excluded; the runtime axis is logarithmic." :
+        "The symlog byte axis preserves the genuine zero-allocation prior paths."
+    _plot_block(spec; id, title, description)
+end
+
+function _mnist_logistic_ad_cell(value, _)
+    value === missing && return ""
+    "$(_mnist_logistic_ad_time(value.min_ns)); $(value.median_bytes) B; " *
+    "$(value.median_allocs) alloc"
+end
+
+_mnist_logistic_ad_sort(value, _) =
+    value === missing ? nothing : value.min_ns
+
+_mnist_logistic_ad_time(value) = value >= 1e6 ?
+    string(round(value / 1e6; digits = 2), " ms") : _fmt_ns(value)
+
+function _mnist_logistic_ad_measurement(row, backend)
+    haskey(row, backend) || return missing
+    result = row[backend]
+    (;
+        min_ns = Float64(result["min_ns"]),
+        median_bytes = Int(result["median_bytes"]),
+        median_allocs = Int(result["median_allocs"]),
+    )
+end
+
+"""Render the exact full-data MNIST value-and-gradient benchmark matrix."""
+function render_mnist_logistic_ad_benchmarks()
+    receipt = TOML.parsefile(_MNIST_LOGISTIC_AD_RECEIPT_PATH)
+    get(receipt, "schema", "") == "mnist-logistic-ad-v1" ||
+        error("unexpected MNIST logistic AD receipt schema")
+    pins = receipt["pins"]
+    get(pins, "reactivekernels_dirty", true) == false ||
+        error("MNIST logistic AD receipt was produced from a dirty tree")
+    occursin(r"^[0-9a-f]{40}$", get(pins, "reactivekernels_sha", "")) ||
+        error("MNIST logistic AD receipt lacks an exact candidate SHA")
+    model_source = pins["model_source"]
+    get(model_source, "path", "") ==
+        "packages/ReactiveKernelsPPLExamples/src/mnist_logistic.jl" ||
+        error("MNIST logistic AD model authority drifted")
+    occursin(r"^[0-9a-f]{40}$", get(model_source, "commit", "")) ||
+        error("MNIST logistic AD model authority lacks a published SHA")
+
+    protocol = receipt["protocol"]
+    Tuple(String.(protocol["input_boundaries"])) == _MNIST_LOGISTIC_BOUNDARIES ||
+        error("MNIST logistic AD input-boundary inventory changed")
+    Tuple(String.(protocol["outcomes"])) == _MNIST_LOGISTIC_OUTCOMES ||
+        error("MNIST logistic AD outcome inventory changed")
+    Int(get(protocol, "num_observations", 0)) == 60000 ||
+        error("MNIST logistic AD receipt does not use the full train split")
+    Int(get(protocol, "active_parameter_count", 0)) == 7065 ||
+        error("MNIST logistic AD active-vector length drifted")
+    get(protocol, "pointwise_jacobian_or_vjp_invented", true) == false ||
+        error("MNIST logistic AD receipt invented a pointwise Jacobian/VJP")
+    get(protocol, "structured_multi_active_boundary_invented", true) == false ||
+        error("MNIST logistic AD receipt invented a two-active-port boundary")
+    get(protocol, "preparation_in_timed_region", true) == false ||
+        error("MNIST logistic AD steady-state timing includes preparation")
+    get(protocol, "first_execution_in_steady_state_region", true) == false ||
+        error("MNIST logistic AD steady-state timing includes first execution")
+    Int(get(protocol, "rounds", 0)) >= 10 ||
+        error("MNIST logistic AD receipt lacks ten raw rounds")
+
+    measurements = receipt["measurements"]
+    length(measurements) ==
+        length(_MNIST_LOGISTIC_BOUNDARIES) * length(_MNIST_LOGISTIC_OUTCOMES) ||
+        error("MNIST logistic AD receipt is not a complete 2×4 matrix")
+    indexed = Dict((String(row["boundary"]), String(row["outcome"])) => row
+                   for row in measurements)
+    length(indexed) == length(measurements) ||
+        error("MNIST logistic AD receipt contains duplicate matrix rows")
+
+    boundary_labels = Dict(
+        "packed_unconstrained" => "Packed unconstrained",
+        "structured_parameters" => "Structured (W, b)",
+    )
+    outcome_labels = Dict(
+        "joint" => "Joint",
+        "prior" => "Prior",
+        "likelihood" => "Likelihood",
+        "pointwise" => "Pointwise likelihood",
+    )
+    matrix_rows = NamedTuple[]
+    plot_rows = NamedTuple[]
+    setup_rows = NamedTuple[]
+    for boundary in _MNIST_LOGISTIC_BOUNDARIES,
+        outcome in _MNIST_LOGISTIC_OUTCOMES
+        row = get(indexed, (boundary, outcome), nothing)
+        isnothing(row) && error("missing MNIST logistic AD row: $boundary / $outcome")
+        expected_support = (boundary, outcome) in _MNIST_LOGISTIC_AD_SUPPORTED
+        get(row, "supported", false) == expected_support ||
+            error("MNIST logistic AD support drifted for $boundary / $outcome")
+        cell = string(boundary_labels[boundary], " / ", outcome_labels[outcome])
+        cell_values = Dict{String,Any}()
+        for (key, implementation) in _MNIST_LOGISTIC_AD_IMPLEMENTATIONS
+            cell_values[key] = _mnist_logistic_ad_measurement(row, key)
+            haskey(row, key) || continue
+            result = row[key]
+            length(result["times_ns"]) >= 10 ||
+                error("insufficient MNIST logistic AD rounds for $cell / $implementation")
+            Float64(result["min_ns"]) == minimum(Float64.(result["times_ns"])) ||
+                error("MNIST logistic AD minimum drifted for $cell / $implementation")
+            push!(plot_rows, (;
+                cell,
+                implementation,
+                min_ns = Float64(result["min_ns"]),
+                median_bytes = Int(result["median_bytes"]),
+            ))
+            push!(setup_rows, (;
+                cell,
+                implementation,
+                preparation_seconds = Float64(result["preparation_seconds"]),
+                preparation_bytes = Int(result["preparation_bytes"]),
+                first_execution_seconds = Float64(result["first_execution_seconds"]),
+                first_execution_bytes = Int(result["first_execution_bytes"]),
+            ))
+        end
+        push!(matrix_rows, (;
+            boundary = boundary_labels[boundary],
+            outcome = outcome_labels[outcome],
+            active = expected_support ? String(row["active_port"]) : "",
+            status = expected_support ? "measured" : String(row["unsupported_reason"]),
+            rk_native = cell_values["rk_native"],
+            manual_enzyme = cell_values["manual_enzyme"],
+            turing_enzyme = cell_values["turing_enzyme"],
+        ))
+    end
+
+    supported_rows = Dict(String(row["outcome"]) => row for row in measurements
+                          if get(row, "supported", false))
+    function outcome_summary(outcome)
+        row = supported_rows[outcome]
+        rk = row["rk_native"]
+        manual = row["manual_enzyme"]
+        turing = row["turing_enzyme"]
+        "$(_mnist_logistic_ad_time(rk["min_ns"])) RK, " *
+        "$(_mnist_logistic_ad_time(manual["min_ns"])) manual, " *
+        "$(_mnist_logistic_ad_time(turing["min_ns"])) Turing"
+    end
+    prior = supported_rows["prior"]
+    Int(prior["rk_native"]["median_bytes"]) == 0 ||
+        error("MNIST logistic RK prior lost its zero-allocation path")
+    Int(prior["manual_enzyme"]["median_bytes"]) == 0 ||
+        error("MNIST logistic manual prior lost its zero-allocation path")
+    maximum_error = maximum(
+        Float64(row[key]["gradient_max_abs_error"])
+        for row in values(supported_rows)
+        for (key, _) in _MNIST_LOGISTIC_AD_IMPLEMENTATIONS)
+    summary = "On the full MNIST train split, the packed joint takes " *
+        outcome_summary("joint") * "; likelihood takes " *
+        outcome_summary("likelihood") * "; and the pruned prior takes " *
+        outcome_summary("prior") * ". RK and the manual control allocate zero " *
+        "bytes for the prior; joint and likelihood honestly retain their dense " *
+        "linear-predictor/reverse-pass storage. All nine measured gradients match " *
+        "the independent analytic score (maximum absolute error " *
+        "$(round(maximum_error; sigdigits = 3)))."
+
+    matrix_columns = (
+        _column(:boundary, "Starting boundary"),
+        _column(:outcome, "Requested outcome"),
+        _column(:active, "Active port";
+            format = (value, _) -> isempty(value) ? "" : h.code(value)),
+        _column(:rk_native, "RK + Enzyme";
+            format = _mnist_logistic_ad_cell, sort = _mnist_logistic_ad_sort),
+        _column(:manual_enzyme, "Manual + Enzyme";
+            format = _mnist_logistic_ad_cell, sort = _mnist_logistic_ad_sort),
+        _column(:turing_enzyme, "Turing + Enzyme";
+            format = _mnist_logistic_ad_cell, sort = _mnist_logistic_ad_sort),
+        _column(:status, "Status";
+            format = (value, _) -> value == "measured" ? value :
+                h.span(value; class = "rk-result-unsupported")),
+    )
+    setup_columns = (
+        _column(:cell, "Packed scalar outcome"),
+        _column(:implementation, "Implementation"),
+        _column(:preparation_seconds, "Preparation";
+            format = (value, _) -> string(round(value; sigdigits = 4), " s")),
+        _column(:preparation_bytes, "Preparation bytes";
+            format = (value, _) -> string(value, " B")),
+        _column(:first_execution_seconds, "First execution";
+            format = (value, _) -> string(round(value; sigdigits = 4), " s")),
+        _column(:first_execution_bytes, "First-execution bytes";
+            format = (value, _) -> string(value, " B")),
+    )
+    provenance = "Receipt pin: RK `$(pins["reactivekernels_sha"])`; published " *
+        "model authority `$(model_source["commit"])`; " *
+        "DifferentiationInterface $(pins["differentiationinterface_version"]); " *
+        "Enzyme $(pins["enzyme_version"]); Turing $(pins["turing_version"]); " *
+        "Julia $(pins["julia_version"]); $(receipt["environment"]["cpu"]). " *
+        "$(protocol["num_observations"]) images × $(protocol["num_features"]) " *
+        "features; $(protocol["active_parameter_count"]) active coefficients."
+
+    Markdown.MD(Any[
+        Markdown.Paragraph(Any[summary]),
+        _mnist_logistic_ad_plot(plot_rows, :min_ns;
+            id = "mnist-logistic-ad-runtime",
+            title = "MNIST value-and-gradient runtime"),
+        _mnist_logistic_ad_plot(plot_rows, :median_bytes;
+            id = "mnist-logistic-ad-allocation",
+            title = "MNIST value-and-gradient allocation"),
+        _result_table(matrix_rows, matrix_columns;
+            id = "mnist-logistic-ad-matrix",
+            title = "MNIST AD boundary × outcome matrix",
+            note = "Measured cells show minimum uncontended value-and-gradient " *
+                   "runtime; median bytes; median allocations. Unsupported cells " *
+                   "retain their exact public-boundary reason."),
+        _result_table(setup_rows, setup_columns;
+            id = "mnist-logistic-ad-setup",
+            title = "Preparation, compilation, and first execution",
+            note = "These one-time costs are retained separately and excluded " *
+                   "from the steady-state plots and matrix."),
+        Markdown.Paragraph(Any[Markdown.Italic(Any[provenance])]),
+    ])
+end
+# ---- benchmark baseline sources ------------------------------------------------
+# The comparison pages must show the exact Turing / handwritten baselines the
+# benchmark harnesses execute. The displayed code is extracted verbatim at
+# docs-build time from the executed `_body.jl` file, between explicit
+# `# DOCS-BASELINE-BEGIN: <name>` / `# DOCS-BASELINE-END: <name>` markers, so a
+# docs-only copy cannot drift from what actually ran; a missing or empty region
+# fails the warning-fatal build.
+
+const _BENCHMARK_SOURCE_DIR = normpath(joinpath(@__DIR__, "..", "benchmark"))
+
+function _benchmark_baseline_region(file::AbstractString, name::AbstractString)
+    path = joinpath(_BENCHMARK_SOURCE_DIR, file)
+    lines = readlines(path)
+    begin_line = "# DOCS-BASELINE-BEGIN: $(name)"
+    end_line = "# DOCS-BASELINE-END: $(name)"
+    starts = findall(==(begin_line), lines)
+    stops = findall(==(end_line), lines)
+    (length(starts), length(stops)) == (1, 1) || error(
+        "expected exactly one $(begin_line) / $(end_line) pair in $(path)")
+    only(starts) < only(stops) || error(
+        "baseline markers for $(name) are out of order in $(path)")
+    region = strip(join(lines[(only(starts) + 1):(only(stops) - 1)], "\n"))
+    isempty(region) && error("baseline region $(name) in $(path) is empty")
+    region
+end
+
+function _render_benchmark_baselines(intro::AbstractString, file::AbstractString,
+                                     sections::Tuple)
+    blocks = Any[Markdown.Paragraph(Any[intro])]
+    for (title, name) in sections
+        push!(blocks, Markdown.Paragraph(Any[Markdown.Bold(Any[title])]))
+        push!(blocks, Markdown.Code("julia", _benchmark_baseline_region(file, name)))
+    end
+    Markdown.MD(blocks)
+end
+
+"""Render the Turing and handwritten baselines the MNIST benchmark executes."""
+render_mnist_logistic_baselines() = _render_benchmark_baselines(
+    "These are the baseline implementations the comparison cells above " *
+    "execute, shown verbatim from `benchmark/mnist_logistic_comparison_body.jl` " *
+    "(extracted from the executed file at docs-build time).",
+    "mnist_logistic_comparison_body.jl",
+    (("Turing baseline", "turing"),
+     ("Handwritten Julia control", "manual")))
+
+"""Render the Turing and handwritten baselines the primal Eight Schools benchmark executes."""
+render_eight_schools_primal_baselines() = _render_benchmark_baselines(
+    "These are the baseline implementations the comparison cells above " *
+    "execute, shown verbatim from " *
+    "`benchmark/eight_schools_primal_comparison_body.jl` (extracted from the " *
+    "executed file at docs-build time).",
+    "eight_schools_primal_comparison_body.jl",
+    (("Turing baseline", "turing"),
+     ("Handwritten Julia control", "manual")))
+
+"""Render the Turing baseline the evaluation-throughput benchmark executes."""
+render_eval_throughput_baselines() = _render_benchmark_baselines(
+    "This is the Turing baseline the comparison above executes, shown verbatim " *
+    "from `benchmark/eval_throughput_comparison_body.jl` (extracted from the " *
+    "executed file at docs-build time).",
+    "eval_throughput_comparison_body.jl",
+    (("Turing baseline", "turing"),))
+
+"""Render the baselines the Eight Schools AD comparison differentiates."""
+render_eight_schools_ad_baselines() = _render_benchmark_baselines(
+    "The AD comparison differentiates the same baseline implementations the " *
+    "primal Eight Schools benchmark executes (the AD harness includes " *
+    "`eight_schools_primal_comparison_body.jl`), shown verbatim from that file " *
+    "at docs-build time; the AD cells differentiate these definitions with " *
+    "Enzyme through DifferentiationInterface `AutoEnzyme` backends.",
+    "eight_schools_primal_comparison_body.jl",
+    (("Turing baseline", "turing"),
+     ("Handwritten Julia control", "manual")))
 
 const _EIGHT_SCHOOLS_AD_IMPLEMENTATIONS = (
     ("rk_native", "ReactiveKernels"),
@@ -1952,6 +2272,143 @@ function render_eight_schools_reactant_ad_benchmark()
         _result_table(setup_rows, setup_columns;
             id = "eight-schools-reactant-ad-setup",
             title = "AD preparation, compilation, and first-call costs",
+            note = "These costs are reported separately and excluded from steady-state timing."),
+        _static_block(provenance),
+    ])
+end
+
+const _MNIST_REACTANT_RECEIPT_PATH = joinpath(
+    dirname(@__DIR__), "benchmark", "receipts", "mnist-reactant-v1.toml")
+
+"""Render the checked-in MNIST native-RK/Reactant receipt as sortable data."""
+function render_mnist_reactant_benchmark()
+    receipt = TOML.parsefile(_MNIST_REACTANT_RECEIPT_PATH)
+    get(receipt, "schema", "") == "mnist-reactant-v1" ||
+        error("unexpected MNIST Reactant benchmark receipt schema")
+    pins = receipt["pins"]
+    get(pins, "reactivekernels_dirty", true) == false ||
+        error("MNIST Reactant receipt was produced from a dirty checkout")
+    protocol = receipt["protocol"]
+    get(protocol, "source_reused", false) ||
+        error("MNIST Reactant receipt does not reuse the authored source")
+    get(protocol, "reactant_sync", false) ||
+        error("MNIST Reactant receipt is not synchronous")
+    get(protocol, "gradients_included", true) &&
+        error("MNIST Reactant receipt unexpectedly contains gradients")
+    Tuple(String.(protocol["input_boundaries"])) == _MNIST_LOGISTIC_BOUNDARIES ||
+        error("unexpected MNIST input-boundary matrix")
+    Tuple(String.(protocol["outcomes"])) == _MNIST_LOGISTIC_OUTCOMES ||
+        error("unexpected MNIST output matrix")
+
+    boundary_labels = Dict(
+        "packed_unconstrained" => "Packed unconstrained",
+        "structured_parameters" => "Structured (W, b)",
+    )
+    # Same headline estimator as the matched primal receipt: the minimum of
+    # per-round BenchmarkTools minimums (uncontended cost).
+    rows = map(receipt["measurements"]) do measurement
+        reactant_supported = get(measurement, "rk_reactant_supported", false)
+        native_ns = Float64(measurement["rk_native"]["min_ns"])
+        reactant_ns = reactant_supported ?
+            Float64(measurement["rk_reactant"]["min_ns"]) : missing
+        diagnostic = reactant_supported ? "measured" :
+            get(measurement, "rk_reactant_error", "unsupported")
+        (;
+            boundary = boundary_labels[measurement["boundary"]],
+            outcome = measurement["outcome"],
+            native_ns,
+            reactant_ns,
+            relative_time = reactant_supported ? reactant_ns / native_ns : missing,
+            compiler_result = diagnostic,
+        )
+    end
+    measured = filter(row -> row.reactant_ns !== missing, rows)
+    ratios = Float64[row.relative_time for row in measured]
+    unsupported = count(row -> row.reactant_ns === missing, rows)
+    summary = isempty(ratios) ?
+        "No Reactant matrix cell compiled in this receipt." :
+        "Reactant compiled $(length(measured)) of the 8 primal matrix cells; " *
+        "$unsupported retain their compiler diagnostics. Across compiled cells, " *
+        "steady-state Reactant/native time ranges from " *
+        "$(round(minimum(ratios); digits = 2))× to " *
+        "$(round(maximum(ratios); digits = 2))× on this CPU receipt."
+    timing_columns = (
+        _column(:boundary, "Input boundary"),
+        _column(:outcome, "Requested output"),
+        _column(:native_ns, "Native RK";
+            format = (value, _) -> _unsupported(value, _fmt_ns)),
+        _column(:reactant_ns, "Reactant";
+            format = (value, _) -> _unsupported(value, _fmt_ns)),
+        _column(:relative_time, "Reactant ÷ native";
+            format = (value, _) -> _unsupported(
+                value, ratio -> string(round(ratio; digits = 2), "×"))),
+        _column(:compiler_result, "Compiler result";
+            format = (value, _) -> value == "measured" ? value :
+                h.span(value; class = "rk-result-unsupported")),
+    )
+
+    setup_rows = map(receipt["measurements"]) do measurement
+        supported = get(measurement, "rk_reactant_supported", false)
+        (;
+            boundary = boundary_labels[measurement["boundary"]],
+            outcome = measurement["outcome"],
+            transfer_seconds = Float64(measurement["reactant_transfer_seconds"]),
+            compile_seconds = Float64(measurement["reactant_compile_seconds"]),
+            first_seconds = supported ?
+                Float64(measurement["reactant_first_execution_seconds"]) : missing,
+            result = supported ? "compiled" : "unsupported",
+        )
+    end
+    seconds(value) = string(round(value; sigdigits = 4), " s")
+    setup_columns = (
+        _column(:boundary, "Input boundary"),
+        _column(:outcome, "Requested output"),
+        _column(:transfer_seconds, "Input transfer";
+            format = (value, _) -> seconds(value)),
+        _column(:compile_seconds, "Compile attempt";
+            format = (value, _) -> seconds(value)),
+        _column(:first_seconds, "First synchronous call";
+            format = (value, _) -> _unsupported(value, seconds)),
+        _column(:result, "Result";
+            format = (value, _) -> value == "compiled" ? value :
+                h.span(value; class = "rk-result-unsupported")),
+    )
+
+    setup = receipt["setup"]
+    setup_summary = "The fresh environment took " *
+        "$(seconds(Float64(setup["environment_seconds"]))) to resolve/install, " *
+        "package precompilation took " *
+        "$(seconds(Float64(setup["package_precompile_seconds"]))), loading the " *
+        "$(protocol["num_observations"])-image MNIST training split took " *
+        "$(seconds(Float64(setup["data_load_seconds"]))), and preparing all " *
+        "native HAVE/WANT kernels took " *
+        "$(seconds(Float64(setup["kernel_preparation_seconds"]))). None of " *
+        "these, the per-cell transfers, compilation, first calls, or result " *
+        "readback is inside the steady-state timings."
+    provenance = h.p(; class = "rk-result-provenance")(
+        "Sources: ",
+        h.a(h.code("benchmark/receipts/mnist-reactant-v1.toml");
+            href = "https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/mnist-reactant-v1.toml"),
+        " generated by ",
+        h.a(h.code("benchmark/mnist_reactant_comparison.jl");
+            href = "https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/mnist_reactant_comparison.jl"),
+        ". Exact model authority: ",
+        h.a(h.code(String(pins["source_authority_path"]));
+            href = "https://github.com/nsiccha/ReactiveKernels.jl/blob/main/$(pins["source_authority_path"])"),
+        ". Pins: source blob $(first(String(pins["source_authority_blob"]), 10)), " *
+        "Reactant $(pins["reactant_version"]), Julia $(pins["julia_version"]), " *
+        "RK $(first(String(pins["reactivekernels_sha"]), 10)).",
+    )
+
+    Markdown.MD(Any[
+        Markdown.Paragraph(Any[summary]),
+        _result_table(rows, timing_columns; id = "mnist-reactant-matrix",
+            title = "Native RK / Reactant steady-state matrix",
+            note = "Every row is one cell of the matched 2×4 primal matrix; each measured cell is the minimum of per-round BenchmarkTools minimums. Unsupported cells remain visible with their recorded diagnostic."),
+        Markdown.Paragraph(Any[setup_summary]),
+        _result_table(setup_rows, setup_columns;
+            id = "mnist-reactant-setup",
+            title = "Setup, compilation, and first-call costs",
             note = "These costs are reported separately and excluded from steady-state timing."),
         _static_block(provenance),
     ])

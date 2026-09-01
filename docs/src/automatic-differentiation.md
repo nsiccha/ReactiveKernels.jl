@@ -155,6 +155,12 @@ blank because neither compared public surface offers a useful matched
 Jacobian/VJP contract; the benchmark does not invent a fused pointwise-plus-total
 surrogate.
 
+### Baseline implementations
+
+```@eval
+Main.ReactiveKernelsDocs.render_eight_schools_ad_baselines()
+```
+
 The checked-in
 [Eight Schools AD receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/eight-schools-ad-v1.toml)
 retains ten raw rounds, source and primal-receipt pins, parity errors,
@@ -166,6 +172,50 @@ julia --startup-file=no benchmark/eight_schools_ad_comparison.jl \
   --output=benchmark/receipts/eight-schools-ad-v1.toml
 julia --startup-file=no benchmark/receipts/validate_eight_schools_ad.jl \
   benchmark/receipts/eight-schools-ad-v1.toml
+```
+
+## MNIST full-data model gradients
+
+The same AD-only boundary now covers the
+[MNIST multinomial-logistic model](mnist-logistic.md). The benchmark imports the
+exact published `MNIST_LOGISTIC_SOURCE` graph and loads the exact manual Julia
+and Turing comparator definitions from its primal benchmark; no model,
+distribution, or comparator formula is copied into an AD-specific evaluator.
+All graph-independent data (`X`, `y`, and the class count) are rebound as
+`Constant`s, while the sampler-relevant packed `[vec(W); b]` vector is the one
+active port.
+
+The complete primal 2×4 inventory remains visible. Joint, prior, and likelihood
+are scalar packed-vector gradients. The structured `(W, b)` boundary remains
+unsupported because it consists of two active HAVE ports and the public RK AD
+contract deliberately selects exactly one. Pointwise remains unsupported
+because the compared public surfaces do not share a matched Jacobian/VJP
+contract. Neither blank region is replaced by a benchmark-only API.
+
+```@eval
+Main.ReactiveKernelsDocs.render_mnist_logistic_ad_benchmarks()
+```
+
+The authoritative receipt uses all 60,000 training images, 784 features, ten
+classes, and 7,065 active coefficients. An independent analytic
+reference-class softmax score checks all nine RK/manual/Turing gradients before
+timing. The dense joint and likelihood paths retain their real
+linear-predictor and reverse-pass storage; only the pruned RK and manual prior
+paths are zero-allocation. This keeps the allocation plot a measurement rather
+than extending the zero-allocation claim beyond what the generated callable
+currently does.
+
+The checked-in
+[MNIST AD receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/mnist-logistic-ad-v1.toml)
+retains ten raw rounds, source and primal-receipt pins, analytic parity errors,
+preparation/first-execution costs, and steady-state timing and allocations.
+Reproduce and validate it with:
+
+```sh
+julia --startup-file=no benchmark/mnist_logistic_ad_comparison.jl \
+  --output=benchmark/receipts/mnist-logistic-ad-v1.toml
+julia --startup-file=no benchmark/receipts/validate_mnist_logistic_ad.jl \
+  benchmark/receipts/mnist-logistic-ad-v1.toml
 ```
 
 ## Owned storage, not borrowed caches
