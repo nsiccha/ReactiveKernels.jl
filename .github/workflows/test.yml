@@ -96,7 +96,10 @@ jobs:
 
   reactant-integration:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # The complete optional compiler suite is about 44 minutes on the pinned
+    # local acceptance host and can cross 60 minutes under hosted contention.
+    # Keep a bounded margin so a healthy suite is not reported as cancelled.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
