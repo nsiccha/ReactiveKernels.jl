@@ -323,10 +323,19 @@ function _nonalloc_rewrite_recipe!(newbody, prog::_StepProgram, r::Recipe,
     record!(T) = lhs isa Symbol && (types[lhs] = T)
     op = r.op
     if !r.effectful
-        if op isa _AuthoredPlateOp
-            j = _step!(prog, op, _plate_cache_slot(op, argtypes))
-            push!(newbody.args, Expr(:(=), lhs, _step_call(j, callargs...)))
-            record!(_plate_result_type(op, argtypes))
+        native_plate = op isa _AuthoredPlateOp ? op :
+            op isa _KernelTensorizedOp && op.native isa _AuthoredPlateOp ?
+                op.native : nothing
+        if native_plate !== nothing
+            native_arity = op isa _KernelTensorizedOp ?
+                _kernel_tensorized_native_arity(op) : length(callargs)
+            native_argtypes = argtypes[1:native_arity]
+            native_callargs = callargs[1:native_arity]
+            j = _step!(prog, native_plate,
+                       _plate_cache_slot(native_plate, native_argtypes))
+            push!(newbody.args,
+                  Expr(:(=), lhs, _step_call(j, native_callargs...)))
+            record!(_plate_result_type(native_plate, native_argtypes))
             return
         end
         if op isa _KernelSourceOp

@@ -90,6 +90,23 @@ function Reactant.traced_type_inner(
     T
 end
 
+# The externalized call owns only generated code, the stripped operation
+# table, and static slot indices. Hidden bound arrays are separate traced
+# operands, so traversing this compiler structure would be both unnecessary
+# and recursive for RuntimeGeneratedFunction internals.
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels._ExternalizedBoundArrayCall,
+        path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where
+        {T<:ReactiveKernels._ExternalizedBoundArrayCall}
+    T
+end
+
 function _rk_reactant_logical_argument(::Type{Actual}, ::Type{Expected}) where
         {Actual,Expected}
     expected_rank = Expected <: AbstractArray ? ndims(Expected) : 0
@@ -834,12 +851,11 @@ _rk_reactant_ad_op(::Val{:gradient}) = DifferentiationInterface.gradient
 _rk_reactant_ad_op(::Val{:value_and_gradient}) =
     DifferentiationInterface.value_and_gradient
 
-function _rk_reactant_compile_ad(
-        mode::Val, prepared::ReactiveKernels.PreparedADKernel{I}, args::Tuple;
-        sync::Bool) where {I}
+function _rk_reactant_compile_ad_call(
+        mode::Val, prepared::ReactiveKernels.PreparedADKernel{I}, kernel,
+        args::Tuple; sync::Bool) where {I}
     op = _rk_reactant_ad_op(mode)
-    call = ReactiveKernels._ADKernelCall{I,typeof(prepared.kernel)}(
-        prepared.kernel)
+    call = ReactiveKernels._ADKernelCall{I,typeof(kernel)}(kernel)
     backend = prepared.backend
     fn = let op = op, call = call, backend = backend
         (traced...) -> begin
@@ -848,6 +864,37 @@ function _rk_reactant_compile_ad(
         end
     end
     Reactant.compile(fn, args; sync = sync)
+end
+
+function _rk_reactant_compile_ad(
+        mode::Val, prepared::ReactiveKernels.PreparedADKernel, args::Tuple;
+        sync::Bool)
+    kernel, values = ReactiveKernels._externalize_bound_arrays(prepared.kernel)
+    isempty(values) && return _rk_reactant_compile_ad_call(
+        mode, prepared, kernel, args; sync)
+    external_args = map(Reactant.to_rarray, values)
+    compiled = _rk_reactant_compile_ad_call(
+        mode, prepared, kernel, (args..., external_args...); sync)
+    _ExternalizedADExecutable(compiled, external_args)
+end
+
+struct _ExternalizedADExecutable{F,A}
+    compiled::F
+    external_args::A
+end
+
+@inline (call::_ExternalizedADExecutable)(args...) =
+    call.compiled(args..., call.external_args...)
+
+function ReactiveKernels._reactant_compile_ad_externalized(
+        mode::Val, prepared::ReactiveKernels.PreparedADKernel,
+        public_args::Tuple, external_args::Tuple; sync::Bool = true)
+    kernel, values = ReactiveKernels._externalize_bound_arrays(prepared.kernel)
+    length(values) == length(external_args) || throw(ArgumentError(
+        "externalized Reactant AD expected $(length(values)) bound array " *
+        "operand(s); got $(length(external_args))"))
+    _rk_reactant_compile_ad_call(
+        mode, prepared, kernel, (public_args..., external_args...); sync)
 end
 
 function ReactiveKernels._reactant_compile_ad(

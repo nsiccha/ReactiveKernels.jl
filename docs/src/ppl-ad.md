@@ -12,13 +12,14 @@ of either model.
 
 ## Eight Schools model gradient matrix
 
-`prepare_ad` and `prepare_ad_pullback` differentiate the exact generated
-callable and operation table used by primal execution. The matrix now covers
-seven scalar gradients: packed unconstrained and constrained-parameter joint,
-prior, and likelihood, plus the minimal θ-only likelihood. Packed and minimal
-pointwise likelihoods use a prepared reverse pullback: one output cotangent
-computes the VJP `J'v` without constructing a full Jacobian. Every sensitivity
-is checked against central finite differences before timing.
+`prepare_ad` differentiates the exact generated callable and operation table
+used by primal execution. Scalar value-and-gradient cells cover the packed
+unconstrained joint, prior, and likelihood; the constrained parameter
+`NamedTuple` joint, prior, and likelihood; and the minimal θ-only likelihood,
+with data unbound or fixed during preparation where applicable. Packed and
+minimal pointwise likelihoods use the public reverse-pullback surface with one
+fixed receipt cotangent. Every supported cell is checked against central finite
+differences before timing.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_eight_schools_ad_benchmarks()
@@ -30,20 +31,21 @@ Main.ReactiveKernelsDocs.render_eight_schools_ad_benchmarks()
 Main.ReactiveKernelsDocs.render_eight_schools_ad_baselines()
 ```
 
-NamedTuple sensitivities preserve the active parameter structure through DI's
-nonmutating gradient result. Array sensitivities use caller-owned destinations.
-The one deliberately blank cross-product is constrained NamedTuple input with a
-pointwise output: Enzyme 0.13.199 currently selects a `MixedDuplicated` activity
-that DifferentiationInterface cannot annotate. That backend limitation is kept
-explicit rather than replaced by a benchmark-only flattening wrapper. The
-[receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/eight-schools-ad-v1.toml)
+Structured native sensitivities preserve the constrained `NamedTuple`; array
+sensitivities use caller-owned destinations. Pointwise rows report one VJP
+(`J' * output_cotangent`), not a full Jacobian. The constrained/pointwise
+cross-product remains explicitly unsupported because the current Enzyme backend
+cannot represent that `MixedDuplicated` combination. Turing stays visible only
+where its public density boundary supplies a genuinely matched comparison. The
+[receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/eight-schools-ad-v2.toml)
 retains raw rounds, source and primal pins, parity errors, preparation costs,
 timings, and allocations.
 
 ## MNIST full-data model gradients
 
-The sampler-relevant packed `[vec(W); b]` vector is the one active port; the
-60,000 training images, labels, and class count are rebound as constants. An
+The sampler-relevant packed `[vec(W); b]` vector is the one active port. Both
+model sources are measured with the 60,000 training images, labels, and class
+count either ordinary HAVE arguments or fixed during preparation. An
 independent analytic reference-class softmax score checks all RK, manual Julia,
 and Turing gradients before timing.
 
@@ -51,10 +53,16 @@ and Turing gradients before timing.
 Main.ReactiveKernelsDocs.render_mnist_logistic_ad_benchmarks()
 ```
 
+### Baseline implementations
+
+```@eval
+Main.ReactiveKernelsDocs.render_mnist_logistic_ad_baselines()
+```
+
 The structured `(W, b)` boundary remains unsupported because public
 ReactiveKernels AD selects exactly one active HAVE port. Pointwise output is not
 replaced by a benchmark-only surrogate. The
-[receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/mnist-logistic-ad-v1.toml)
+[receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/mnist-logistic-ad-v2.toml)
 retains the complete data shape, 7,065 active coefficients, analytic parity,
 preparation costs, timings, and allocations.
 

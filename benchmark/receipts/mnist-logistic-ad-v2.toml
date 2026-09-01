@@ -1,0 +1,925 @@
+generated_at = "2026-09-01T18:16:18.548Z"
+schema = "mnist-logistic-ad-v2"
+
+[environment]
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+julia_threads = 1
+os = "Linux"
+
+[[measurements]]
+active_port = "unconstrained"
+analytic_gradient_length = 7065
+boundary = "packed_unconstrained"
+configuration = "ad_native"
+model = "idiomatic"
+outcome = "joint"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [31, 31, 31, 31, 31, 31, 31, 31, 31, 31]
+    bytes = [33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592]
+    caller_owned_gradient = true
+    first_execution_bytes = 2121148328
+    first_execution_seconds = 22.929646868
+    gradient_length = 7065
+    gradient_max_abs_error = 5.002220859751105e-12
+    gradient_max_rel_error = 1.3147883973433428e-15
+    median_allocs = 31
+    median_bytes = 33122592
+    median_ns = 3.183037785e8
+    min_ns = 3.05961359e8
+    preparation_bytes = 6539584
+    preparation_seconds = 0.298200258
+    times_ns = [3.17205397e8, 3.05961359e8, 3.08021773e8, 3.27709365e8, 3.15524958e8, 3.28277148e8, 3.49095191e8, 3.15971856e8, 3.1940216e8, 3.35532572e8]
+    value = -145370.3958500544
+    value_abs_error = 3.4924596548080444e-10
+[[measurements]]
+active_port = "unconstrained"
+analytic_gradient_length = 7065
+boundary = "packed_unconstrained"
+configuration = "ad_native_bound"
+model = "idiomatic"
+outcome = "joint"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [31, 31, 31, 31, 31, 31, 31, 31, 31, 31]
+    bytes = [33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592]
+    caller_owned_gradient = true
+    first_execution_bytes = 364126336
+    first_execution_seconds = 7.357134178
+    gradient_length = 7065
+    gradient_max_abs_error = 5.002220859751105e-12
+    gradient_max_rel_error = 1.3147883973433428e-15
+    median_allocs = 31
+    median_bytes = 33122592
+    median_ns = 3.186606605e8
+    min_ns = 3.09885525e8
+    preparation_bytes = 816528
+    preparation_seconds = 0.175030071
+    times_ns = [3.09885525e8, 3.10741705e8, 3.21599071e8, 3.10731172e8, 3.1572225e8, 3.44570937e8, 3.36777871e8, 3.48281828e8, 3.13036813e8, 3.3058295e8]
+    value = -145370.3958500544
+    value_abs_error = 3.4924596548080444e-10
+[[measurements]]
+active_port = "unconstrained"
+analytic_gradient_length = 7065
+boundary = "packed_unconstrained"
+configuration = "ad_native"
+model = "vcat_free"
+outcome = "joint"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976]
+    caller_owned_gradient = true
+    first_execution_bytes = 194849616
+    first_execution_seconds = 4.784924521
+    gradient_length = 7065
+    gradient_max_abs_error = 5.229594535194337e-12
+    gradient_max_rel_error = 1.3745515063134946e-15
+    median_allocs = 20
+    median_bytes = 24000976
+    median_ns = 3.144779135e8
+    min_ns = 3.08510827e8
+    preparation_bytes = 612808
+    preparation_seconds = 0.124662224
+    times_ns = [3.23881291e8, 3.08510827e8, 3.13021093e8, 3.16670159e8, 3.1163514e8, 3.10663919e8, 3.08916567e8, 3.18881321e8, 3.19725004e8, 3.15934734e8]
+    value = -145370.3958500544
+    value_abs_error = 3.4924596548080444e-10
+[[measurements]]
+active_port = "unconstrained"
+analytic_gradient_length = 7065
+boundary = "packed_unconstrained"
+configuration = "ad_native_bound"
+model = "vcat_free"
+outcome = "joint"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976]
+    caller_owned_gradient = true
+    first_execution_bytes = 189835784
+    first_execution_seconds = 4.849031799
+    gradient_length = 7065
+    gradient_max_abs_error = 5.229594535194337e-12
+    gradient_max_rel_error = 1.3745515063134946e-15
+    median_allocs = 20
+    median_bytes = 24000976
+    median_ns = 3.12361778e8
+    min_ns = 2.94456079e8
+    preparation_bytes = 604312
+    preparation_seconds = 0.127167963
+    times_ns = [3.14213949e8, 3.00781499e8, 2.98427821e8, 3.36117941e8, 3.28884336e8, 3.09463703e8, 2.94456079e8, 3.18063231e8, 3.2348956e8, 3.10509607e8]
+    value = -145370.3958500544
+    value_abs_error = 3.4924596548080444e-10
+[[measurements]]
+active_port = "unconstrained"
+analytic_gradient_length = 7065
+boundary = "packed_unconstrained"
+configuration = "manual_ad"
+model = "implicit_reference"
+outcome = "joint"
+provider = "manual_julia"
+state = "supported"
+
+    [measurements.result]
+    allocs = [22, 22, 22, 22, 22, 22, 22, 22, 22, 22]
+    bytes = [41761072, 41761072, 41761072, 41761072, 41761072, 41761072, 41761072, 41761072, 41761072, 41761072]
+    caller_owned_gradient = true
+    first_execution_bytes = 41761136
+    first_execution_seconds = 0.338331134
+    gradient_length = 7065
+    gradient_max_abs_error = 5.286437954055145e-12
+    gradient_max_rel_error = 1.3894922835560327e-15
+    median_allocs = 22
+    median_bytes = 41761072
+    median_ns = 3.18288262e8
+    min_ns = 3.0197037e8
+    preparation_bytes = 56624
+    preparation_seconds = 6.689e-6
+    times_ns = [3.0197037e8, 3.11577239e8, 3.25249279e8, 3.49546152e8, 3.08987065e8, 3.15066005e8, 3.34522348e8, 3.21510519e8, 3.23261777e8, 3.11817962e8]
+    value = -145370.39585005437
+    value_abs_error = 3.7834979593753815e-10
+[[measurements]]
+active_port = "unconstrained"
+analytic_gradient_length = 7065
+boundary = "packed_unconstrained"
+configuration = "turing_idiomatic_ad"
+model = "idiomatic"
+outcome = "joint"
+provider = "turing"
+state = "supported"
+
+    [measurements.result]
+    allocs = [67, 67, 67, 67, 67, 67, 67, 67, 67, 67]
+    bytes = [49557168, 49557168, 49557168, 49557168, 49557168, 49557168, 49557168, 49557168, 49557168, 49557168]
+    caller_owned_gradient = false
+    first_execution_bytes = 2780710096
+    first_execution_seconds = 60.21226617
+    gradient_length = 7065
+    gradient_max_abs_error = 5.002220859751105e-12
+    gradient_max_rel_error = 1.3147883973433428e-15
+    median_allocs = 67
+    median_bytes = 49557168
+    median_ns = 3.308021285e8
+    min_ns = 3.11633898e8
+    preparation_bytes = 317882880
+    preparation_seconds = 1.11775366
+    times_ns = [3.47721184e8, 3.20636393e8, 3.25660827e8, 3.1375062e8, 3.11633898e8, 3.30433795e8, 3.5696315e8, 3.5148553e8, 3.31170462e8, 3.60966735e8]
+    value = -145370.3958500536
+    value_abs_error = 1.1350493878126144e-9
+[[measurements]]
+active_port = "unconstrained"
+analytic_gradient_length = 7065
+boundary = "packed_unconstrained"
+configuration = "turing_vcat_free_ad"
+model = "vcat_free"
+outcome = "joint"
+provider = "turing"
+state = "supported"
+
+    [measurements.result]
+    allocs = [38, 38, 38, 38, 38, 38, 38, 38, 38, 38]
+    bytes = [42355408, 42355408, 42355408, 42355408, 42355408, 42355408, 42355408, 42355408, 42355408, 42355408]
+    caller_owned_gradient = false
+    first_execution_bytes = 258152728
+    first_execution_seconds = 12.576647455
+    gradient_length = 7065
+    gradient_max_abs_error = 5.286437954055145e-12
+    gradient_max_rel_error = 1.3894922835560327e-15
+    median_allocs = 38
+    median_bytes = 42355408
+    median_ns = 3.153820565e8
+    min_ns = 3.08790534e8
+    preparation_bytes = 231153816
+    preparation_seconds = 0.938796699
+    times_ns = [3.09900855e8, 3.23598691e8, 3.21968832e8, 3.08790534e8, 3.23753866e8, 3.1575044e8, 3.39061263e8, 3.15013673e8, 3.14693511e8, 3.13593432e8]
+    value = -145370.39585005358
+    value_abs_error = 1.1641532182693481e-9
+[[measurements]]
+active_port = "unconstrained"
+analytic_gradient_length = 7065
+boundary = "packed_unconstrained"
+configuration = "ad_native"
+model = "idiomatic"
+outcome = "prior"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    caller_owned_gradient = true
+    first_execution_bytes = 7289208
+    first_execution_seconds = 0.095583863
+    gradient_length = 7065
+    gradient_max_abs_error = 0.0
+    gradient_max_rel_error = 0.0
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 5392.0
+    min_ns = 5317.0
+    preparation_bytes = 663648
+    preparation_seconds = 0.067885693
+    times_ns = [5387.0, 5317.0, 5337.0, 5387.0, 5347.0, 5397.0, 5447.0, 5477.0, 5517.0, 5467.0]
+    value = -6492.650073005288
+    value_abs_error = 1.7280399333685637e-11
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "ad_native_bound"
+model = "idiomatic"
+outcome = "prior"
+provider = "rk"
+reason = "the minimal prior cut has no data ports to bind"
+state = "not_applicable"
+[[measurements]]
+active_port = "unconstrained"
+analytic_gradient_length = 7065
+boundary = "packed_unconstrained"
+configuration = "ad_native"
+model = "vcat_free"
+outcome = "prior"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    caller_owned_gradient = true
+    first_execution_bytes = 4547816
+    first_execution_seconds = 0.067874768
+    gradient_length = 7065
+    gradient_max_abs_error = 0.0
+    gradient_max_rel_error = 0.0
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 5367.0
+    min_ns = 5298.0
+    preparation_bytes = 602192
+    preparation_seconds = 0.064864916
+    times_ns = [5298.0, 5378.0, 5367.0, 5377.0, 5397.0, 5317.0, 5457.0, 5347.0, 5367.0, 5327.0]
+    value = -6492.650073005288
+    value_abs_error = 1.7280399333685637e-11
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "ad_native_bound"
+model = "vcat_free"
+outcome = "prior"
+provider = "rk"
+reason = "the minimal prior cut has no data ports to bind"
+state = "not_applicable"
+[[measurements]]
+active_port = "unconstrained"
+analytic_gradient_length = 7065
+boundary = "packed_unconstrained"
+configuration = "manual_ad"
+model = "implicit_reference"
+outcome = "prior"
+provider = "manual_julia"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    caller_owned_gradient = true
+    first_execution_bytes = 0
+    first_execution_seconds = 2.3192e-5
+    gradient_length = 7065
+    gradient_max_abs_error = 0.0
+    gradient_max_rel_error = 0.0
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 2829.0
+    min_ns = 2714.0
+    preparation_bytes = 56624
+    preparation_seconds = 4.6985e-5
+    times_ns = [2784.0, 2894.0, 3134.0, 2884.0, 2824.0, 2744.0, 2804.0, 2834.0, 2714.0, 2924.0]
+    value = -6492.650073005305
+    value_abs_error = 0.0
+[[measurements]]
+active_port = "unconstrained"
+analytic_gradient_length = 7065
+boundary = "packed_unconstrained"
+configuration = "turing_idiomatic_ad"
+model = "idiomatic"
+outcome = "prior"
+provider = "turing"
+state = "supported"
+
+    [measurements.result]
+    allocs = [67, 67, 67, 67, 67, 67, 67, 67, 67, 67]
+    bytes = [49557168, 49557168, 49557168, 49557168, 49557168, 49557168, 49557168, 49557168, 49557168, 49557168]
+    caller_owned_gradient = false
+    first_execution_bytes = 466682224
+    first_execution_seconds = 38.696582553
+    gradient_length = 7065
+    gradient_max_abs_error = 0.0
+    gradient_max_rel_error = 0.0
+    median_allocs = 67
+    median_bytes = 49557168
+    median_ns = 3.186422405e8
+    min_ns = 3.1178036e8
+    preparation_bytes = 190904712
+    preparation_seconds = 0.833444675
+    times_ns = [3.29506625e8, 3.18545227e8, 3.15655018e8, 3.21233457e8, 3.12189455e8, 3.1178036e8, 3.35407469e8, 3.17476121e8, 3.27448595e8, 3.18739254e8]
+    value = -6492.650073005305
+    value_abs_error = 0.0
+[[measurements]]
+active_port = "unconstrained"
+analytic_gradient_length = 7065
+boundary = "packed_unconstrained"
+configuration = "turing_vcat_free_ad"
+model = "vcat_free"
+outcome = "prior"
+provider = "turing"
+state = "supported"
+
+    [measurements.result]
+    allocs = [32, 32, 32, 32, 32, 32, 32, 32, 32, 32]
+    bytes = [17394976, 17394976, 17394976, 17394976, 17394976, 17394976, 17394976, 17394976, 17394976, 17394976]
+    caller_owned_gradient = false
+    first_execution_bytes = 223785448
+    first_execution_seconds = 12.46785352
+    gradient_length = 7065
+    gradient_max_abs_error = 0.0
+    gradient_max_rel_error = 0.0
+    median_allocs = 32
+    median_bytes = 17394976
+    median_ns = 2.961005735e8
+    min_ns = 2.81561392e8
+    preparation_bytes = 127884856
+    preparation_seconds = 0.669097689
+    times_ns = [3.05365256e8, 3.06840372e8, 2.81561392e8, 2.95524343e8, 2.91238889e8, 2.96676804e8, 2.8826175e8, 3.04421484e8, 2.86040374e8, 2.99585849e8]
+    value = -6492.650073005305
+    value_abs_error = 0.0
+[[measurements]]
+active_port = "unconstrained"
+analytic_gradient_length = 7065
+boundary = "packed_unconstrained"
+configuration = "ad_native"
+model = "idiomatic"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [31, 31, 31, 31, 31, 31, 31, 31, 31, 31]
+    bytes = [33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592]
+    caller_owned_gradient = true
+    first_execution_bytes = 241607304
+    first_execution_seconds = 5.581805632
+    gradient_length = 7065
+    gradient_max_abs_error = 5.002220859751105e-12
+    gradient_max_rel_error = 1.314790470521489e-15
+    median_allocs = 31
+    median_bytes = 33122592
+    median_ns = 3.191907925e8
+    min_ns = 3.16466197e8
+    preparation_bytes = 612376
+    preparation_seconds = 0.096556444
+    times_ns = [3.17689465e8, 3.30929989e8, 3.2069212e8, 3.16614071e8, 3.17072374e8, 3.17079904e8, 3.2120642e8, 3.21556873e8, 3.31554121e8, 3.16466197e8]
+    value = -138877.7457770491
+    value_abs_error = 3.4924596548080444e-10
+[[measurements]]
+active_port = "unconstrained"
+analytic_gradient_length = 7065
+boundary = "packed_unconstrained"
+configuration = "ad_native_bound"
+model = "idiomatic"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [31, 31, 31, 31, 31, 31, 31, 31, 31, 31]
+    bytes = [33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592, 33122592]
+    caller_owned_gradient = true
+    first_execution_bytes = 242182520
+    first_execution_seconds = 5.341285684
+    gradient_length = 7065
+    gradient_max_abs_error = 5.002220859751105e-12
+    gradient_max_rel_error = 1.314790470521489e-15
+    median_allocs = 31
+    median_bytes = 33122592
+    median_ns = 3.281975385e8
+    min_ns = 3.0993259e8
+    preparation_bytes = 604072
+    preparation_seconds = 0.090249029
+    times_ns = [3.36410865e8, 3.73477503e8, 3.14232215e8, 3.0993259e8, 3.39868787e8, 3.16130934e8, 3.28051546e8, 3.28343531e8, 3.18175446e8, 3.30031589e8]
+    value = -138877.7457770491
+    value_abs_error = 3.4924596548080444e-10
+[[measurements]]
+active_port = "unconstrained"
+analytic_gradient_length = 7065
+boundary = "packed_unconstrained"
+configuration = "ad_native"
+model = "vcat_free"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976]
+    caller_owned_gradient = true
+    first_execution_bytes = 189105272
+    first_execution_seconds = 5.05771658
+    gradient_length = 7065
+    gradient_max_abs_error = 5.229594535194337e-12
+    gradient_max_rel_error = 1.3745536737270114e-15
+    median_allocs = 20
+    median_bytes = 24000976
+    median_ns = 3.135382755e8
+    min_ns = 3.04935432e8
+    preparation_bytes = 611560
+    preparation_seconds = 0.10327757
+    times_ns = [3.38847648e8, 3.1617898e8, 3.3560341e8, 3.16499503e8, 3.04935432e8, 3.10897571e8, 3.29028735e8, 3.0536022e8, 3.0940399e8, 3.05127618e8]
+    value = -138877.7457770491
+    value_abs_error = 3.4924596548080444e-10
+[[measurements]]
+active_port = "unconstrained"
+analytic_gradient_length = 7065
+boundary = "packed_unconstrained"
+configuration = "ad_native_bound"
+model = "vcat_free"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976, 24000976]
+    caller_owned_gradient = true
+    first_execution_bytes = 188824432
+    first_execution_seconds = 4.945258769
+    gradient_length = 7065
+    gradient_max_abs_error = 5.229594535194337e-12
+    gradient_max_rel_error = 1.3745536737270114e-15
+    median_allocs = 20
+    median_bytes = 24000976
+    median_ns = 3.063479975e8
+    min_ns = 2.91144109e8
+    preparation_bytes = 602120
+    preparation_seconds = 0.089563372
+    times_ns = [2.97293315e8, 3.1946743e8, 3.14189786e8, 3.12912632e8, 2.96537612e8, 2.99343485e8, 3.1673655e8, 3.08775423e8, 3.03920572e8, 2.91144109e8]
+    value = -138877.7457770491
+    value_abs_error = 3.4924596548080444e-10
+[[measurements]]
+active_port = "unconstrained"
+analytic_gradient_length = 7065
+boundary = "packed_unconstrained"
+configuration = "manual_ad"
+model = "implicit_reference"
+outcome = "likelihood"
+provider = "manual_julia"
+state = "supported"
+
+    [measurements.result]
+    allocs = [22, 22, 22, 22, 22, 22, 22, 22, 22, 22]
+    bytes = [41761072, 41761072, 41761072, 41761072, 41761072, 41761072, 41761072, 41761072, 41761072, 41761072]
+    caller_owned_gradient = true
+    first_execution_bytes = 41761072
+    first_execution_seconds = 0.301805433
+    gradient_length = 7065
+    gradient_max_abs_error = 5.286437954055145e-12
+    gradient_max_rel_error = 1.3894944745283917e-15
+    median_allocs = 22
+    median_bytes = 41761072
+    median_ns = 3.116342435e8
+    min_ns = 2.98610043e8
+    preparation_bytes = 56624
+    preparation_seconds = 4.656e-6
+    times_ns = [3.09129712e8, 3.17629493e8, 3.28631747e8, 3.14138775e8, 3.00556079e8, 3.05246503e8, 3.07642719e8, 2.98610043e8, 3.36723386e8, 3.36814462e8]
+    value = -138877.74577704907
+    value_abs_error = 3.7834979593753815e-10
+[[measurements]]
+active_port = "unconstrained"
+analytic_gradient_length = 7065
+boundary = "packed_unconstrained"
+configuration = "turing_idiomatic_ad"
+model = "idiomatic"
+outcome = "likelihood"
+provider = "turing"
+state = "supported"
+
+    [measurements.result]
+    allocs = [47, 47, 47, 47, 47, 47, 47, 47, 47, 47]
+    bytes = [49555632, 49555632, 49555632, 49555632, 49555632, 49555632, 49555632, 49555632, 49555632, 49555632]
+    caller_owned_gradient = false
+    first_execution_bytes = 423891752
+    first_execution_seconds = 32.161828269
+    gradient_length = 7065
+    gradient_max_abs_error = 5.002220859751105e-12
+    gradient_max_rel_error = 1.314790470521489e-15
+    median_allocs = 47
+    median_bytes = 49555632
+    median_ns = 3.23074353e8
+    min_ns = 3.06502996e8
+    preparation_bytes = 179435184
+    preparation_seconds = 0.837944506
+    times_ns = [3.06625536e8, 3.190986e8, 3.28746316e8, 3.26799078e8, 3.3360442e8, 3.35988152e8, 3.06502996e8, 3.19349628e8, 3.08494097e8, 3.31996405e8]
+    value = -138877.74577704832
+    value_abs_error = 1.1350493878126144e-9
+[[measurements]]
+active_port = "unconstrained"
+analytic_gradient_length = 7065
+boundary = "packed_unconstrained"
+configuration = "turing_vcat_free_ad"
+model = "vcat_free"
+outcome = "likelihood"
+provider = "turing"
+state = "supported"
+
+    [measurements.result]
+    allocs = [18, 18, 18, 18, 18, 18, 18, 18, 18, 18]
+    bytes = [42353872, 42353872, 42353872, 42353872, 42353872, 42353872, 42353872, 42353872, 42353872, 42353872]
+    caller_owned_gradient = false
+    first_execution_bytes = 221699864
+    first_execution_seconds = 8.014538201
+    gradient_length = 7065
+    gradient_max_abs_error = 5.286437954055145e-12
+    gradient_max_rel_error = 1.3894944745283917e-15
+    median_allocs = 18
+    median_bytes = 42353872
+    median_ns = 3.14113545e8
+    min_ns = 3.05384223e8
+    preparation_bytes = 122931176
+    preparation_seconds = 0.739590623
+    times_ns = [3.10848648e8, 3.09086654e8, 3.25468523e8, 3.09279962e8, 3.23925071e8, 3.33613078e8, 3.05384223e8, 3.14180237e8, 3.18529533e8, 3.14046853e8]
+    value = -138877.7457770483
+    value_abs_error = 1.1641532182693481e-9
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "ad_native"
+model = "idiomatic"
+outcome = "pointwise"
+provider = "rk"
+reason = "pointwise is vector-valued and no matched public Jacobian/VJP contract is invented"
+state = "unsupported"
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "ad_native_bound"
+model = "idiomatic"
+outcome = "pointwise"
+provider = "rk"
+reason = "pointwise is vector-valued and no matched public Jacobian/VJP contract is invented"
+state = "unsupported"
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "ad_native"
+model = "vcat_free"
+outcome = "pointwise"
+provider = "rk"
+reason = "pointwise is vector-valued and no matched public Jacobian/VJP contract is invented"
+state = "unsupported"
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "ad_native_bound"
+model = "vcat_free"
+outcome = "pointwise"
+provider = "rk"
+reason = "pointwise is vector-valued and no matched public Jacobian/VJP contract is invented"
+state = "unsupported"
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "manual_ad"
+model = "implicit_reference"
+outcome = "pointwise"
+provider = "manual_julia"
+reason = "pointwise is vector-valued and no matched public Jacobian/VJP contract is invented"
+state = "unsupported"
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "turing_idiomatic_ad"
+model = "idiomatic"
+outcome = "pointwise"
+provider = "turing"
+reason = "pointwise is vector-valued and no matched public Jacobian/VJP contract is invented"
+state = "unsupported"
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "turing_vcat_free_ad"
+model = "vcat_free"
+outcome = "pointwise"
+provider = "turing"
+reason = "pointwise is vector-valued and no matched public Jacobian/VJP contract is invented"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_native"
+model = "idiomatic"
+outcome = "joint"
+provider = "rk"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_native_bound"
+model = "idiomatic"
+outcome = "joint"
+provider = "rk"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_native"
+model = "vcat_free"
+outcome = "joint"
+provider = "rk"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_native_bound"
+model = "vcat_free"
+outcome = "joint"
+provider = "rk"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "manual_ad"
+model = "implicit_reference"
+outcome = "joint"
+provider = "manual_julia"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "turing_idiomatic_ad"
+model = "idiomatic"
+outcome = "joint"
+provider = "turing"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "turing_vcat_free_ad"
+model = "vcat_free"
+outcome = "joint"
+provider = "turing"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_native"
+model = "idiomatic"
+outcome = "prior"
+provider = "rk"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_native_bound"
+model = "idiomatic"
+outcome = "prior"
+provider = "rk"
+reason = "the minimal prior cut has no data ports to bind"
+state = "not_applicable"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_native"
+model = "vcat_free"
+outcome = "prior"
+provider = "rk"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_native_bound"
+model = "vcat_free"
+outcome = "prior"
+provider = "rk"
+reason = "the minimal prior cut has no data ports to bind"
+state = "not_applicable"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "manual_ad"
+model = "implicit_reference"
+outcome = "prior"
+provider = "manual_julia"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "turing_idiomatic_ad"
+model = "idiomatic"
+outcome = "prior"
+provider = "turing"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "turing_vcat_free_ad"
+model = "vcat_free"
+outcome = "prior"
+provider = "turing"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_native"
+model = "idiomatic"
+outcome = "likelihood"
+provider = "rk"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_native_bound"
+model = "idiomatic"
+outcome = "likelihood"
+provider = "rk"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_native"
+model = "vcat_free"
+outcome = "likelihood"
+provider = "rk"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_native_bound"
+model = "vcat_free"
+outcome = "likelihood"
+provider = "rk"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "manual_ad"
+model = "implicit_reference"
+outcome = "likelihood"
+provider = "manual_julia"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "turing_idiomatic_ad"
+model = "idiomatic"
+outcome = "likelihood"
+provider = "turing"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "turing_vcat_free_ad"
+model = "vcat_free"
+outcome = "likelihood"
+provider = "turing"
+reason = "the structured (W, b) boundary has two active ports and RK exposes one active AD port"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_native"
+model = "idiomatic"
+outcome = "pointwise"
+provider = "rk"
+reason = "pointwise is vector-valued and no matched public Jacobian/VJP contract is invented"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_native_bound"
+model = "idiomatic"
+outcome = "pointwise"
+provider = "rk"
+reason = "pointwise is vector-valued and no matched public Jacobian/VJP contract is invented"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_native"
+model = "vcat_free"
+outcome = "pointwise"
+provider = "rk"
+reason = "pointwise is vector-valued and no matched public Jacobian/VJP contract is invented"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "ad_native_bound"
+model = "vcat_free"
+outcome = "pointwise"
+provider = "rk"
+reason = "pointwise is vector-valued and no matched public Jacobian/VJP contract is invented"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "manual_ad"
+model = "implicit_reference"
+outcome = "pointwise"
+provider = "manual_julia"
+reason = "pointwise is vector-valued and no matched public Jacobian/VJP contract is invented"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "turing_idiomatic_ad"
+model = "idiomatic"
+outcome = "pointwise"
+provider = "turing"
+reason = "pointwise is vector-valued and no matched public Jacobian/VJP contract is invented"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "turing_vcat_free_ad"
+model = "vcat_free"
+outcome = "pointwise"
+provider = "turing"
+reason = "pointwise is vector-valued and no matched public Jacobian/VJP contract is invented"
+state = "unsupported"
+
+[pins]
+benchmarktools_version = "1.6.3"
+differentiationinterface_version = "0.7.21"
+distributions_version = "0.25.131"
+dynamicppl_version = "0.42.6"
+enzyme_version = "0.13.199"
+julia_version = "1.10.11"
+mldatasets_version = "0.7.21"
+nnlib_version = "0.9.45"
+primal_receipt_path = "benchmark/receipts/mnist-logistic-primal-v3.toml"
+primal_receipt_reactivekernels_sha = "5fb20e73f74eef33602ed4fbad897a3634f400d6"
+primal_receipt_sha256 = "9e78d18e1085c7f55e661e5e74fe1c05a99b787e8ea26be0985ee296b1ebf119"
+reactivekernels_dirty = false
+reactivekernels_sha = "5fb20e73f74eef33602ed4fbad897a3634f400d6"
+reactivekernels_version = "0.1.0"
+reactivekernelsdistributionkernels_version = "0.1.0"
+reactivekernelspplexamples_version = "0.1.0"
+turing_version = "0.47.1"
+
+    [pins.model_source]
+    commit = "9dbaa1fbfbdb1bb2ff4238a3910754f36635f81e"
+    current_delta = "published idiomatic and optimized models retain their math and boundaries; each categorical recipe keeps the exact authored scalar plate for native/nonallocating execution and adds an equivalent explicit tensor body for array compilers"
+    git_blob = "cfd5d381c38de21742f564361ef7a7914e5ff8bd"
+    path = "packages/ReactiveKernelsPPLExamples/src/mnist_logistic.jl"
+    text_sha256 = "e51b876024fe2bc60ca0c27f59df1c74ef3c5c97165b400fa4d483e24e2509d2"
+
+        [pins.model_source.current]
+        git_blob = "a8ce0e88c5f35251fc5af3b22c4f5eea1144029f"
+        path = "packages/ReactiveKernelsPPLExamples/src/mnist_logistic.jl"
+        text_sha256 = "79e5a6c7ed95a2f6348f2d152d7a6701c523cd82276a67755ad70166f7d3c719"
+
+    [pins.primal_comparator_source]
+    commit = "9dbaa1fbfbdb1bb2ff4238a3910754f36635f81e"
+    current_delta = "additive two-model native/bound/nonallocating matrix; published Turing/manual AD baselines unchanged; documentation markers plus terminal definition-only include guard"
+    git_blob = "c4a0321bf28e14765783ef157f58eb538bab4de9"
+    path = "benchmark/mnist_logistic_comparison_body.jl"
+    text_sha256 = "0b813401307180582a8105cceca6be541009d56a95d23c8d8cb2249e09813521"
+
+        [pins.primal_comparator_source.current]
+        git_blob = "362a7e264d4187e7f129d638a9ba53f83f069241"
+        path = "benchmark/mnist_logistic_comparison_body.jl"
+        text_sha256 = "bf698d3320515e4c81bcaf45c38867cc7b3876f8e05cdbde6a336a8a9cab54ff"
+
+[protocol]
+active_parameter_count = 7065
+bound_ports = ["X", "y", "num_classes"]
+data = "MLDatasets MNIST train split, first N images"
+estimator = "minimum of per-round BenchmarkTools minimum times (uncontended cost; medians and raw rounds retained)"
+first_execution_in_steady_state_region = false
+gradient_operation = "value and gradient"
+input_boundaries = ["packed_unconstrained", "structured_parameters"]
+manual_control = "the primal receipt's manual Julia density differentiated through the same prepared DI+Enzyme boundary"
+matrix_layout = "long-form provider/model/configuration/boundary/outcome rows"
+matrix_source = "benchmark/receipts/mnist-logistic-primal-v3.toml"
+model = "multinomial-logistic MNIST classifier"
+models = ["idiomatic", "vcat_free"]
+num_classes = 10
+num_features = 784
+num_observations = 60000
+outcomes = ["joint", "prior", "likelihood", "pointwise"]
+parity_absolute_tolerance = 1.0e-7
+parity_oracle = "independent analytic reference-class softmax and standard-normal score"
+parity_relative_tolerance = 1.0e-7
+pointwise_jacobian_or_vjp_invented = false
+preparation_in_timed_region = false
+rk_backend = "AutoEnzyme(mode = Enzyme.Reverse)"
+rk_bound_backend = "AutoEnzyme(mode = Enzyme.Reverse, function_annotation = Enzyme.Const)"
+rk_configurations = ["ad_native", "ad_native_bound"]
+rk_surface = "prepare_ad + ad_value_and_gradient!"
+rounds = 10
+samples_per_round = 200
+seconds_per_round = 0.2
+setup_in_timed_region = false
+source_reused = true
+structured_multi_active_boundary_invented = false
+turing_backend = "AutoEnzyme(runtime activity, Const function annotation)"
+turing_surface = "LogDensityProblems.logdensity_and_gradient on DynamicPPL.LogDensityFunction"
+
+[setup]
+analytic_oracle_bytes = 13187520
+analytic_oracle_seconds = 0.11606559
+data_load_bytes = 804455328
+data_load_seconds = 1.602826544
+rk_model_build_bytes = 132775392
+rk_model_build_seconds = 1.808837403
+turing_model_build_bytes = 0
+turing_model_build_seconds = 2.0e-8

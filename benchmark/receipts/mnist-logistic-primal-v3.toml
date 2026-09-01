@@ -1,0 +1,1453 @@
+generated_at = "2026-09-01T18:05:55.437Z"
+schema = "mnist-logistic-primal-v3"
+
+[environment]
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+julia_threads = 1
+os = "Linux"
+
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_native"
+description = "full joint over the selected parameter boundary"
+model = "idiomatic"
+outcome = "joint"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [11, 11, 11, 11, 11, 11, 11, 11, 11, 11]
+    bytes = [14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368]
+    median_allocs = 11
+    median_bytes = 14400368
+    median_ns = 6.1301694e7
+    min_ns = 5.9360455e7
+    times_ns = [6.2009152e7, 6.0519074e7, 6.1614326e7, 6.1136267e7, 6.1848909e7, 5.9360455e7, 6.162522e7, 6.0419827e7, 6.1312199e7, 6.1291189e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_native_bound"
+description = "full joint over the selected parameter boundary"
+model = "idiomatic"
+outcome = "joint"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [11, 11, 11, 11, 11, 11, 11, 11, 11, 11]
+    bytes = [14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368]
+    median_allocs = 11
+    median_bytes = 14400368
+    median_ns = 6.0509696e7
+    min_ns = 5.8962166e7
+    times_ns = [5.9916522e7, 6.0760677e7, 6.0801203e7, 5.8962166e7, 6.0258715e7, 6.1437581e7, 6.0765955e7, 6.1039533e7, 5.9347075e7, 5.8981261e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_nonallocating"
+description = "full joint over the selected parameter boundary"
+model = "idiomatic"
+outcome = "joint"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    bytes = [240, 240, 240, 240, 240, 240, 240, 240, 240, 240]
+    median_allocs = 1
+    median_bytes = 240
+    median_ns = 6.09826785e7
+    min_ns = 5.9789317e7
+    times_ns = [6.0834369e7, 6.2797349e7, 6.3333268e7, 6.1838516e7, 6.0666307e7, 6.0359484e7, 5.9789317e7, 6.1130988e7, 6.4559221e7, 6.0171123e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_nonallocating_bound"
+description = "full joint over the selected parameter boundary"
+model = "idiomatic"
+outcome = "joint"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 5.98707695e7
+    min_ns = 5.7906527e7
+    times_ns = [6.0025883e7, 6.0295034e7, 6.1210018e7, 5.9765635e7, 5.9531401e7, 5.8815933e7, 5.9005115e7, 5.7906527e7, 6.0938833e7, 5.9975904e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_native"
+description = "full joint over the selected parameter boundary"
+model = "vcat_free"
+outcome = "joint"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [7, 7, 7, 7, 7, 7, 7, 7, 7, 7]
+    bytes = [9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272]
+    median_allocs = 7
+    median_bytes = 9120272
+    median_ns = 6.115033e7
+    min_ns = 5.9942058e7
+    times_ns = [6.0927287e7, 6.1018312e7, 5.9942058e7, 6.0892981e7, 6.1282348e7, 6.1306421e7, 6.0904294e7, 6.4225159e7, 6.1448577e7, 6.1848509e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_native_bound"
+description = "full joint over the selected parameter boundary"
+model = "vcat_free"
+outcome = "joint"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [7, 7, 7, 7, 7, 7, 7, 7, 7, 7]
+    bytes = [9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272]
+    median_allocs = 7
+    median_bytes = 9120272
+    median_ns = 6.1441152e7
+    min_ns = 6.0307062e7
+    times_ns = [6.0778503e7, 6.2076124e7, 6.1437312e7, 6.1278462e7, 6.1444992e7, 6.2701586e7, 6.0582672e7, 6.1575111e7, 6.2820912e7, 6.0307062e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_nonallocating"
+description = "full joint over the selected parameter boundary"
+model = "vcat_free"
+outcome = "joint"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    bytes = [240, 240, 240, 240, 240, 240, 240, 240, 240, 240]
+    median_allocs = 1
+    median_bytes = 240
+    median_ns = 6.0180376e7
+    min_ns = 5.7906578e7
+    times_ns = [6.4109518e7, 6.1845755e7, 6.6013357e7, 5.9848749e7, 6.0507408e7, 5.9853344e7, 6.1261659e7, 5.9840828e7, 5.9580769e7, 5.7906578e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_nonallocating_bound"
+description = "full joint over the selected parameter boundary"
+model = "vcat_free"
+outcome = "joint"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 6.0393541e7
+    min_ns = 5.9173257e7
+    times_ns = [6.0284941e7, 6.0329972e7, 5.9930181e7, 6.0272083e7, 6.0853306e7, 5.9173257e7, 6.1937742e7, 6.090058e7, 6.045711e7, 6.1626562e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "manual_primal"
+description = "full joint over the selected parameter boundary"
+model = "implicit_reference"
+outcome = "joint"
+provider = "manual_julia"
+state = "supported"
+
+    [measurements.result]
+    allocs = [7, 7, 7, 7, 7, 7, 7, 7, 7, 7]
+    bytes = [9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272]
+    median_allocs = 7
+    median_bytes = 9120272
+    median_ns = 6.06932145e7
+    min_ns = 5.9077975e7
+    times_ns = [6.0598314e7, 6.0746979e7, 5.9077975e7, 6.068992e7, 6.0696509e7, 6.11326e7, 6.0045852e7, 5.9593446e7, 6.0948055e7, 6.0759346e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "turing_idiomatic_primal"
+description = "full joint over the selected parameter boundary"
+model = "idiomatic"
+outcome = "joint"
+provider = "turing"
+state = "supported"
+
+    [measurements.result]
+    allocs = [17, 17, 17, 17, 17, 17, 17, 17, 17, 17]
+    bytes = [20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512]
+    median_allocs = 17
+    median_bytes = 20160512
+    median_ns = 6.15740905e7
+    min_ns = 5.9714745e7
+    times_ns = [6.5745387e7, 6.3565949e7, 6.009521e7, 6.2207796e7, 6.0940385e7, 6.0267547e7, 6.4043197e7, 6.543622e7, 5.9714745e7, 6.0224497e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "turing_vcat_free_primal"
+description = "full joint over the selected parameter boundary"
+model = "vcat_free"
+outcome = "joint"
+provider = "turing"
+state = "supported"
+
+    [measurements.result]
+    allocs = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5]
+    bytes = [8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224]
+    median_allocs = 5
+    median_bytes = 8640224
+    median_ns = 6.10578025e7
+    min_ns = 5.8893801e7
+    times_ns = [6.1473391e7, 5.8893801e7, 6.0587839e7, 6.4904496e7, 6.1192624e7, 6.0780064e7, 5.9524652e7, 6.0970097e7, 6.1145508e7, 6.150221e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_native"
+description = "standard-normal coefficient log prior"
+model = "idiomatic"
+outcome = "prior"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 3319.5
+    min_ns = 3284.0
+    times_ns = [3294.0, 3334.0, 3314.0, 3384.0, 3354.0, 3355.0, 3284.0, 3315.0, 3324.0, 3304.0]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_native_bound"
+description = "standard-normal coefficient log prior"
+model = "idiomatic"
+outcome = "prior"
+provider = "rk"
+reason = "the minimal prior cut has no data ports to bind"
+state = "not_applicable"
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_nonallocating"
+description = "standard-normal coefficient log prior"
+model = "idiomatic"
+outcome = "prior"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 881.0
+    min_ns = 881.0
+    times_ns = [881.0, 881.0, 881.0, 891.0, 881.0, 881.0, 901.0, 911.0, 881.0, 881.0]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_nonallocating_bound"
+description = "standard-normal coefficient log prior"
+model = "idiomatic"
+outcome = "prior"
+provider = "rk"
+reason = "the minimal prior cut has no data ports to bind"
+state = "not_applicable"
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_native"
+description = "standard-normal coefficient log prior"
+model = "vcat_free"
+outcome = "prior"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 3309.5
+    min_ns = 3284.0
+    times_ns = [3324.0, 3294.0, 3334.0, 3344.0, 3314.0, 3305.0, 3294.0, 3294.0, 3424.0, 3284.0]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_native_bound"
+description = "standard-normal coefficient log prior"
+model = "vcat_free"
+outcome = "prior"
+provider = "rk"
+reason = "the minimal prior cut has no data ports to bind"
+state = "not_applicable"
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_nonallocating"
+description = "standard-normal coefficient log prior"
+model = "vcat_free"
+outcome = "prior"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 886.0
+    min_ns = 861.0
+    times_ns = [902.0, 861.0, 1011.0, 881.0, 911.0, 921.0, 891.0, 881.0, 881.0, 881.0]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_nonallocating_bound"
+description = "standard-normal coefficient log prior"
+model = "vcat_free"
+outcome = "prior"
+provider = "rk"
+reason = "the minimal prior cut has no data ports to bind"
+state = "not_applicable"
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "manual_primal"
+description = "standard-normal coefficient log prior"
+model = "implicit_reference"
+outcome = "prior"
+provider = "manual_julia"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 421.0
+    min_ns = 420.0
+    times_ns = [420.0, 420.0, 430.0, 421.0, 421.0, 421.0, 430.0, 430.0, 420.0, 430.0]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "turing_idiomatic_primal"
+description = "standard-normal coefficient log prior"
+model = "idiomatic"
+outcome = "prior"
+provider = "turing"
+state = "supported"
+
+    [measurements.result]
+    allocs = [17, 17, 17, 17, 17, 17, 17, 17, 17, 17]
+    bytes = [20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512]
+    median_allocs = 17
+    median_bytes = 20160512
+    median_ns = 6.1315743e7
+    min_ns = 6.0042966e7
+    times_ns = [6.0466821e7, 6.1637617e7, 6.111045e7, 6.0042966e7, 6.4365223e7, 6.1521036e7, 6.3714975e7, 6.2409143e7, 6.0954976e7, 6.0651206e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "turing_vcat_free_primal"
+description = "standard-normal coefficient log prior"
+model = "vcat_free"
+outcome = "prior"
+provider = "turing"
+state = "supported"
+
+    [measurements.result]
+    allocs = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5]
+    bytes = [8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224]
+    median_allocs = 5
+    median_bytes = 8640224
+    median_ns = 6.1136912e7
+    min_ns = 5.9163653e7
+    times_ns = [6.0359734e7, 6.0766265e7, 6.0483004e7, 6.0559409e7, 6.2788777e7, 6.4466772e7, 6.1632099e7, 6.1507559e7, 5.9163653e7, 6.4502523e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_native"
+description = "summed softmax categorical log likelihood"
+model = "idiomatic"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [11, 11, 11, 11, 11, 11, 11, 11, 11, 11]
+    bytes = [14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368]
+    median_allocs = 11
+    median_bytes = 14400368
+    median_ns = 6.166492e7
+    min_ns = 6.0070615e7
+    times_ns = [6.1672976e7, 6.0971098e7, 6.108916e7, 7.2624252e7, 6.6790789e7, 6.0070615e7, 6.2688078e7, 6.7170614e7, 6.1656864e7, 6.0125922e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_native_bound"
+description = "summed softmax categorical log likelihood"
+model = "idiomatic"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [11, 11, 11, 11, 11, 11, 11, 11, 11, 11]
+    bytes = [14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368]
+    median_allocs = 11
+    median_bytes = 14400368
+    median_ns = 6.1552225e7
+    min_ns = 6.004521e7
+    times_ns = [6.1041014e7, 6.3647261e7, 6.238586e7, 6.4219882e7, 6.1040353e7, 6.4047204e7, 6.004521e7, 6.0720552e7, 6.0863649e7, 6.2063436e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_nonallocating"
+description = "summed softmax categorical log likelihood"
+model = "idiomatic"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 6.07201865e7
+    min_ns = 5.9407038e7
+    times_ns = [6.0885179e7, 5.9407038e7, 6.0512054e7, 6.0769179e7, 6.2454346e7, 6.0671194e7, 6.1959693e7, 5.9839476e7, 6.0416762e7, 6.703744e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_nonallocating_bound"
+description = "summed softmax categorical log likelihood"
+model = "idiomatic"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 6.5570465e7
+    min_ns = 6.0779013e7
+    times_ns = [6.4440265e7, 7.281949e7, 6.2490615e7, 6.0779013e7, 7.5045693e7, 6.0810065e7, 6.1237666e7, 6.6700665e7, 7.018183e7, 7.3679257e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_native"
+description = "summed softmax categorical log likelihood"
+model = "vcat_free"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [7, 7, 7, 7, 7, 7, 7, 7, 7, 7]
+    bytes = [9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272]
+    median_allocs = 7
+    median_bytes = 9120272
+    median_ns = 6.61642405e7
+    min_ns = 6.186411e7
+    times_ns = [6.7297039e7, 6.186411e7, 6.4965712e7, 6.4293113e7, 6.2778382e7, 8.4822565e7, 7.7322755e7, 7.9548337e7, 6.5031442e7, 8.1728046e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_native_bound"
+description = "summed softmax categorical log likelihood"
+model = "vcat_free"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [7, 7, 7, 7, 7, 7, 7, 7, 7, 7]
+    bytes = [9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272]
+    median_allocs = 7
+    median_bytes = 9120272
+    median_ns = 6.3281492e7
+    min_ns = 6.1195488e7
+    times_ns = [6.1195488e7, 7.1297781e7, 6.4238988e7, 7.2973242e7, 7.1039163e7, 6.2323996e7, 6.6344173e7, 6.1249441e7, 6.1414069e7, 6.2140111e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_nonallocating"
+description = "summed softmax categorical log likelihood"
+model = "vcat_free"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 6.44459895e7
+    min_ns = 6.0916893e7
+    times_ns = [6.1078156e7, 6.5438904e7, 6.7921711e7, 7.0224278e7, 6.4567192e7, 6.7574831e7, 6.3205431e7, 6.4324787e7, 6.0916893e7, 6.2873924e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_nonallocating_bound"
+description = "summed softmax categorical log likelihood"
+model = "vcat_free"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 6.1451726e7
+    min_ns = 6.0810095e7
+    times_ns = [6.318287e7, 6.0972239e7, 6.0810095e7, 6.1129366e7, 6.1774086e7, 6.2822272e7, 6.2597101e7, 6.3236043e7, 6.0995171e7, 6.1063716e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "manual_primal"
+description = "summed softmax categorical log likelihood"
+model = "implicit_reference"
+outcome = "likelihood"
+provider = "manual_julia"
+state = "supported"
+
+    [measurements.result]
+    allocs = [7, 7, 7, 7, 7, 7, 7, 7, 7, 7]
+    bytes = [9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272]
+    median_allocs = 7
+    median_bytes = 9120272
+    median_ns = 6.1255826e7
+    min_ns = 5.9327329e7
+    times_ns = [6.2069884e7, 5.9327329e7, 6.0441768e7, 6.621118e7, 6.4056746e7, 6.3485848e7, 6.0077534e7, 5.989995e7, 6.9392631e7, 6.0234301e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "turing_idiomatic_primal"
+description = "summed softmax categorical log likelihood"
+model = "idiomatic"
+outcome = "likelihood"
+provider = "turing"
+state = "supported"
+
+    [measurements.result]
+    allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
+    bytes = [20160384, 20160384, 20160384, 20160384, 20160384, 20160384, 20160384, 20160384, 20160384, 20160384]
+    median_allocs = 16
+    median_bytes = 20160384
+    median_ns = 6.27009105e7
+    min_ns = 5.9777861e7
+    times_ns = [6.8808555e7, 6.1289117e7, 6.0462846e7, 6.0438293e7, 5.9777861e7, 6.0843621e7, 6.5082732e7, 7.9598045e7, 6.4112704e7, 8.2961947e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "turing_vcat_free_primal"
+description = "summed softmax categorical log likelihood"
+model = "vcat_free"
+outcome = "likelihood"
+provider = "turing"
+state = "supported"
+
+    [measurements.result]
+    allocs = [4, 4, 4, 4, 4, 4, 4, 4, 4, 4]
+    bytes = [8640096, 8640096, 8640096, 8640096, 8640096, 8640096, 8640096, 8640096, 8640096, 8640096]
+    median_allocs = 4
+    median_bytes = 8640096
+    median_ns = 6.3861577e7
+    min_ns = 6.106649e7
+    times_ns = [6.3045922e7, 8.0018926e7, 7.3390218e7, 6.2996994e7, 6.2226931e7, 6.106649e7, 6.4367746e7, 6.3355408e7, 6.8589021e7, 7.6145059e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_native"
+description = "per-observation softmax categorical log likelihoods"
+model = "idiomatic"
+outcome = "pointwise"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [11, 11, 11, 11, 11, 11, 11, 11, 11, 11]
+    bytes = [14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368]
+    median_allocs = 11
+    median_bytes = 14400368
+    median_ns = 6.34119965e7
+    min_ns = 6.0111361e7
+    times_ns = [6.6678704e7, 6.4792561e7, 6.5707485e7, 6.3531091e7, 6.0787374e7, 6.0481662e7, 6.3292902e7, 6.1416252e7, 6.0111361e7, 6.382751e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_native_bound"
+description = "per-observation softmax categorical log likelihoods"
+model = "idiomatic"
+outcome = "pointwise"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [11, 11, 11, 11, 11, 11, 11, 11, 11, 11]
+    bytes = [14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368]
+    median_allocs = 11
+    median_bytes = 14400368
+    median_ns = 7.2274047e7
+    min_ns = 6.4916703e7
+    times_ns = [8.2604975e7, 6.7294925e7, 7.4634785e7, 7.5911006e7, 6.7523952e7, 8.979663e7, 9.1983658e7, 6.4916703e7, 6.8381956e7, 6.9913309e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_nonallocating"
+description = "per-observation softmax categorical log likelihoods"
+model = "idiomatic"
+outcome = "pointwise"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 6.63816795e7
+    min_ns = 6.2908491e7
+    times_ns = [6.2908491e7, 6.6070014e7, 6.4437383e7, 6.6693345e7, 6.3786002e7, 1.40264954e8, 8.0309677e7, 7.0201719e7, 6.4272464e7, 6.9671386e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_nonallocating_bound"
+description = "per-observation softmax categorical log likelihoods"
+model = "idiomatic"
+outcome = "pointwise"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 6.82077455e7
+    min_ns = 6.0470867e7
+    times_ns = [1.08803793e8, 7.1700035e7, 6.902988e7, 6.3077025e7, 7.6727274e7, 6.5929422e7, 6.7385611e7, 7.7397849e7, 6.0470867e7, 6.3674519e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_native"
+description = "per-observation softmax categorical log likelihoods"
+model = "vcat_free"
+outcome = "pointwise"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [7, 7, 7, 7, 7, 7, 7, 7, 7, 7]
+    bytes = [9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272]
+    median_allocs = 7
+    median_bytes = 9120272
+    median_ns = 6.3155779e7
+    min_ns = 6.1730627e7
+    times_ns = [6.427005e7, 6.7665767e7, 9.2796531e7, 6.2010332e7, 6.1730627e7, 6.2264654e7, 6.2137538e7, 6.1937993e7, 6.4046904e7, 6.4426948e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_native_bound"
+description = "per-observation softmax categorical log likelihoods"
+model = "vcat_free"
+outcome = "pointwise"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [7, 7, 7, 7, 7, 7, 7, 7, 7, 7]
+    bytes = [9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272]
+    median_allocs = 7
+    median_bytes = 9120272
+    median_ns = 6.4356541e7
+    min_ns = 6.073269e7
+    times_ns = [7.1393233e7, 6.9066422e7, 6.6419469e7, 6.3128646e7, 6.1557399e7, 6.1555986e7, 6.073269e7, 6.6897589e7, 6.2516491e7, 6.5584436e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_nonallocating"
+description = "per-observation softmax categorical log likelihoods"
+model = "vcat_free"
+outcome = "pointwise"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 6.13092105e7
+    min_ns = 6.0449098e7
+    times_ns = [6.0884289e7, 6.0449098e7, 6.7693657e7, 6.0712182e7, 6.0523491e7, 6.1734132e7, 6.0751946e7, 6.2016752e7, 6.7595341e7, 6.1987181e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "primal_nonallocating_bound"
+description = "per-observation softmax categorical log likelihoods"
+model = "vcat_free"
+outcome = "pointwise"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 6.1455026e7
+    min_ns = 6.0145009e7
+    times_ns = [6.9598867e7, 6.3447196e7, 6.05736e7, 6.0145009e7, 6.1253158e7, 6.1389526e7, 6.8922563e7, 6.1836013e7, 6.0547764e7, 6.1520526e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "manual_primal"
+description = "per-observation softmax categorical log likelihoods"
+model = "implicit_reference"
+outcome = "pointwise"
+provider = "manual_julia"
+state = "supported"
+
+    [measurements.result]
+    allocs = [7, 7, 7, 7, 7, 7, 7, 7, 7, 7]
+    bytes = [9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272]
+    median_allocs = 7
+    median_bytes = 9120272
+    median_ns = 6.1107357e7
+    min_ns = 5.9403214e7
+    times_ns = [6.1207956e7, 6.1729086e7, 6.2610451e7, 6.0564257e7, 5.9403214e7, 6.0294044e7, 6.0264032e7, 6.1287526e7, 6.1385531e7, 6.1006758e7]
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "turing_idiomatic_primal"
+description = "per-observation softmax categorical log likelihoods"
+model = "idiomatic"
+outcome = "pointwise"
+provider = "turing"
+reason = "the @addlogprob! likelihood has no public pointwise view"
+state = "unsupported"
+[[measurements]]
+boundary = "packed_unconstrained"
+configuration = "turing_vcat_free_primal"
+description = "per-observation softmax categorical log likelihoods"
+model = "vcat_free"
+outcome = "pointwise"
+provider = "turing"
+reason = "the @addlogprob! likelihood has no public pointwise view"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_native"
+description = "full joint over the selected parameter boundary"
+model = "idiomatic"
+outcome = "joint"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [14, 14, 14, 14, 14, 14, 14, 14, 14, 14]
+    bytes = [14456944, 14456944, 14456944, 14456944, 14456944, 14456944, 14456944, 14456944, 14456944, 14456944]
+    median_allocs = 14
+    median_bytes = 14456944
+    median_ns = 6.1704621e7
+    min_ns = 5.9519596e7
+    times_ns = [6.0270792e7, 5.9930342e7, 5.9519596e7, 6.0279324e7, 6.1333759e7, 6.2075483e7, 6.3405318e7, 6.255199e7, 6.2726182e7, 6.2792802e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_native_bound"
+description = "full joint over the selected parameter boundary"
+model = "idiomatic"
+outcome = "joint"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [14, 14, 14, 14, 14, 14, 14, 14, 14, 14]
+    bytes = [14456944, 14456944, 14456944, 14456944, 14456944, 14456944, 14456944, 14456944, 14456944, 14456944]
+    median_allocs = 14
+    median_bytes = 14456944
+    median_ns = 6.16952985e7
+    min_ns = 6.039987e7
+    times_ns = [6.1751126e7, 6.1371272e7, 6.242087e7, 6.2692004e7, 6.3079748e7, 6.1999748e7, 6.1091084e7, 6.1639471e7, 6.1587771e7, 6.039987e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_nonallocating"
+description = "full joint over the selected parameter boundary"
+model = "idiomatic"
+outcome = "joint"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+    bytes = [80, 80, 80, 80, 80, 80, 80, 80, 80, 80]
+    median_allocs = 2
+    median_bytes = 80
+    median_ns = 6.14411725e7
+    min_ns = 6.0200435e7
+    times_ns = [6.0200435e7, 6.1387684e7, 6.1351133e7, 6.8407592e7, 6.2090764e7, 6.1255541e7, 6.8098315e7, 6.1129207e7, 6.2243005e7, 6.1494661e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_nonallocating_bound"
+description = "full joint over the selected parameter boundary"
+model = "idiomatic"
+outcome = "joint"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+    bytes = [80, 80, 80, 80, 80, 80, 80, 80, 80, 80]
+    median_allocs = 2
+    median_bytes = 80
+    median_ns = 6.42058435e7
+    min_ns = 6.1548125e7
+    times_ns = [6.5974704e7, 6.1996084e7, 6.4952925e7, 6.7226913e7, 7.1656537e7, 6.8583595e7, 6.3458762e7, 6.1684144e7, 6.2966301e7, 6.1548125e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_native"
+description = "full joint over the selected parameter boundary"
+model = "vcat_free"
+outcome = "joint"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [10, 10, 10, 10, 10, 10, 10, 10, 10, 10]
+    bytes = [9176848, 9176848, 9176848, 9176848, 9176848, 9176848, 9176848, 9176848, 9176848, 9176848]
+    median_allocs = 10
+    median_bytes = 9176848
+    median_ns = 6.2667299e7
+    min_ns = 6.1098685e7
+    times_ns = [6.3266106e7, 6.2352766e7, 6.4299513e7, 6.2919849e7, 6.2691573e7, 6.2384099e7, 6.264586e7, 6.1098685e7, 6.2688738e7, 6.2129067e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_native_bound"
+description = "full joint over the selected parameter boundary"
+model = "vcat_free"
+outcome = "joint"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [10, 10, 10, 10, 10, 10, 10, 10, 10, 10]
+    bytes = [9176848, 9176848, 9176848, 9176848, 9176848, 9176848, 9176848, 9176848, 9176848, 9176848]
+    median_allocs = 10
+    median_bytes = 9176848
+    median_ns = 6.24093485e7
+    min_ns = 6.1878192e7
+    times_ns = [6.2491287e7, 6.2349991e7, 6.1878192e7, 6.2468706e7, 6.4243735e7, 6.3912348e7, 6.1941479e7, 6.1904947e7, 6.1939876e7, 6.3941549e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_nonallocating"
+description = "full joint over the selected parameter boundary"
+model = "vcat_free"
+outcome = "joint"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+    bytes = [80, 80, 80, 80, 80, 80, 80, 80, 80, 80]
+    median_allocs = 2
+    median_bytes = 80
+    median_ns = 6.27874195e7
+    min_ns = 6.0623309e7
+    times_ns = [6.3374525e7, 6.2117411e7, 6.6346427e7, 6.2843562e7, 6.2357333e7, 6.291406e7, 6.2953796e7, 6.0623309e7, 6.2215014e7, 6.2731277e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_nonallocating_bound"
+description = "full joint over the selected parameter boundary"
+model = "vcat_free"
+outcome = "joint"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+    bytes = [80, 80, 80, 80, 80, 80, 80, 80, 80, 80]
+    median_allocs = 2
+    median_bytes = 80
+    median_ns = 6.25513495e7
+    min_ns = 6.1094139e7
+    times_ns = [6.1094139e7, 6.1773576e7, 6.1300633e7, 6.2724538e7, 6.3431575e7, 6.3199295e7, 6.2663044e7, 6.3104985e7, 6.2439655e7, 6.121149e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "manual_primal"
+description = "full joint over the selected parameter boundary"
+model = "implicit_reference"
+outcome = "joint"
+provider = "manual_julia"
+state = "supported"
+
+    [measurements.result]
+    allocs = [10, 10, 10, 10, 10, 10, 10, 10, 10, 10]
+    bytes = [9176848, 9176848, 9176848, 9176848, 9176848, 9176848, 9176848, 9176848, 9176848, 9176848]
+    median_allocs = 10
+    median_bytes = 9176848
+    median_ns = 6.18709355e7
+    min_ns = 5.9724007e7
+    times_ns = [5.9724007e7, 6.0286544e7, 6.263117e7, 6.0278422e7, 6.2084425e7, 6.2559912e7, 6.0431404e7, 6.3294847e7, 6.1657446e7, 6.2712543e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "turing_idiomatic_primal"
+description = "full joint over the selected parameter boundary"
+model = "idiomatic"
+outcome = "joint"
+provider = "turing"
+state = "supported"
+
+    [measurements.result]
+    allocs = [17, 17, 17, 17, 17, 17, 17, 17, 17, 17]
+    bytes = [20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512]
+    median_allocs = 17
+    median_bytes = 20160512
+    median_ns = 6.15558355e7
+    min_ns = 6.0193677e7
+    times_ns = [6.0938032e7, 6.0286145e7, 6.2484508e7, 6.2146431e7, 6.1587569e7, 6.1960344e7, 6.1524102e7, 6.0193677e7, 6.2698111e7, 6.1066e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "turing_vcat_free_primal"
+description = "full joint over the selected parameter boundary"
+model = "vcat_free"
+outcome = "joint"
+provider = "turing"
+state = "supported"
+
+    [measurements.result]
+    allocs = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5]
+    bytes = [8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224]
+    median_allocs = 5
+    median_bytes = 8640224
+    median_ns = 6.03625235e7
+    min_ns = 5.9738547e7
+    times_ns = [6.047946e7, 6.1220873e7, 6.0017553e7, 6.0409854e7, 6.0610591e7, 5.9738547e7, 6.0270001e7, 6.0315193e7, 6.0767007e7, 5.9941348e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_native"
+description = "standard-normal coefficient log prior"
+model = "idiomatic"
+outcome = "prior"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [4, 4, 4, 4, 4, 4, 4, 4, 4, 4]
+    bytes = [56704, 56704, 56704, 56704, 56704, 56704, 56704, 56704, 56704, 56704]
+    median_allocs = 4
+    median_bytes = 56704
+    median_ns = 5087.0
+    min_ns = 4847.0
+    times_ns = [6209.0, 5047.0, 5107.0, 5187.0, 5037.0, 5047.0, 4847.0, 6139.0, 5067.0, 5187.0]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_native_bound"
+description = "standard-normal coefficient log prior"
+model = "idiomatic"
+outcome = "prior"
+provider = "rk"
+reason = "the minimal prior cut has no data ports to bind"
+state = "not_applicable"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_nonallocating"
+description = "standard-normal coefficient log prior"
+model = "idiomatic"
+outcome = "prior"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+    bytes = [80, 80, 80, 80, 80, 80, 80, 80, 80, 80]
+    median_allocs = 2
+    median_bytes = 80
+    median_ns = 1387.0
+    min_ns = 1332.0
+    times_ns = [1332.0, 1392.0, 1382.0, 1352.0, 1422.0, 1412.0, 1332.0, 1472.0, 1352.0, 1462.0]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_nonallocating_bound"
+description = "standard-normal coefficient log prior"
+model = "idiomatic"
+outcome = "prior"
+provider = "rk"
+reason = "the minimal prior cut has no data ports to bind"
+state = "not_applicable"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_native"
+description = "standard-normal coefficient log prior"
+model = "vcat_free"
+outcome = "prior"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [4, 4, 4, 4, 4, 4, 4, 4, 4, 4]
+    bytes = [56704, 56704, 56704, 56704, 56704, 56704, 56704, 56704, 56704, 56704]
+    median_allocs = 4
+    median_bytes = 56704
+    median_ns = 5132.0
+    min_ns = 5027.0
+    times_ns = [5137.0, 5097.0, 5127.0, 5197.0, 5097.0, 5227.0, 5107.0, 5177.0, 5177.0, 5027.0]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_native_bound"
+description = "standard-normal coefficient log prior"
+model = "vcat_free"
+outcome = "prior"
+provider = "rk"
+reason = "the minimal prior cut has no data ports to bind"
+state = "not_applicable"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_nonallocating"
+description = "standard-normal coefficient log prior"
+model = "vcat_free"
+outcome = "prior"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+    bytes = [80, 80, 80, 80, 80, 80, 80, 80, 80, 80]
+    median_allocs = 2
+    median_bytes = 80
+    median_ns = 1341.0
+    min_ns = 1322.0
+    times_ns = [1583.0, 1341.0, 1362.0, 1322.0, 1332.0, 1331.0, 1342.0, 1332.0, 1341.0, 1362.0]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_nonallocating_bound"
+description = "standard-normal coefficient log prior"
+model = "vcat_free"
+outcome = "prior"
+provider = "rk"
+reason = "the minimal prior cut has no data ports to bind"
+state = "not_applicable"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "manual_primal"
+description = "standard-normal coefficient log prior"
+model = "implicit_reference"
+outcome = "prior"
+provider = "manual_julia"
+state = "supported"
+
+    [measurements.result]
+    allocs = [4, 4, 4, 4, 4, 4, 4, 4, 4, 4]
+    bytes = [56704, 56704, 56704, 56704, 56704, 56704, 56704, 56704, 56704, 56704]
+    median_allocs = 4
+    median_bytes = 56704
+    median_ns = 2303.0
+    min_ns = 2173.0
+    times_ns = [2323.0, 2233.0, 2293.0, 2243.0, 2413.0, 2313.0, 2173.0, 2203.0, 2404.0, 2473.0]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "turing_idiomatic_primal"
+description = "standard-normal coefficient log prior"
+model = "idiomatic"
+outcome = "prior"
+provider = "turing"
+state = "supported"
+
+    [measurements.result]
+    allocs = [17, 17, 17, 17, 17, 17, 17, 17, 17, 17]
+    bytes = [20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512, 20160512]
+    median_allocs = 17
+    median_bytes = 20160512
+    median_ns = 6.0597358e7
+    min_ns = 5.8538583e7
+    times_ns = [6.0759837e7, 6.1044961e7, 6.0778143e7, 6.0148914e7, 5.8538583e7, 6.1107266e7, 5.9841379e7, 5.9211449e7, 6.0434879e7, 6.1006278e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "turing_vcat_free_primal"
+description = "standard-normal coefficient log prior"
+model = "vcat_free"
+outcome = "prior"
+provider = "turing"
+state = "supported"
+
+    [measurements.result]
+    allocs = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5]
+    bytes = [8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224]
+    median_allocs = 5
+    median_bytes = 8640224
+    median_ns = 6.0656785e7
+    min_ns = 5.912388e7
+    times_ns = [6.1335e7, 6.2930323e7, 6.0137338e7, 6.0355679e7, 5.912388e7, 5.9534907e7, 6.0352935e7, 6.0957891e7, 6.4922632e7, 6.5872133e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_native"
+description = "summed softmax categorical log likelihood"
+model = "idiomatic"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [10, 10, 10, 10, 10, 10, 10, 10, 10, 10]
+    bytes = [14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240]
+    median_allocs = 10
+    median_bytes = 14400240
+    median_ns = 6.1241993e7
+    min_ns = 5.9555725e7
+    times_ns = [6.0628125e7, 5.9555725e7, 6.2299893e7, 6.1897519e7, 5.9590533e7, 6.0858543e7, 6.1884248e7, 6.1963658e7, 6.1136257e7, 6.1347729e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_native_bound"
+description = "summed softmax categorical log likelihood"
+model = "idiomatic"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [10, 10, 10, 10, 10, 10, 10, 10, 10, 10]
+    bytes = [14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240]
+    median_allocs = 10
+    median_bytes = 14400240
+    median_ns = 6.09514615e7
+    min_ns = 5.954538e7
+    times_ns = [5.9609669e7, 5.954538e7, 6.0589422e7, 6.1313501e7, 5.9878361e7, 6.0173688e7, 6.6473413e7, 6.4150767e7, 6.2328943e7, 6.7402585e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_nonallocating"
+description = "summed softmax categorical log likelihood"
+model = "idiomatic"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 6.0561999e7
+    min_ns = 5.9797459e7
+    times_ns = [6.0212982e7, 5.9861799e7, 6.112347e7, 5.9797459e7, 6.0911016e7, 5.9930072e7, 6.1608287e7, 6.1225419e7, 6.0033394e7, 6.1041746e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_nonallocating_bound"
+description = "summed softmax categorical log likelihood"
+model = "idiomatic"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 6.13845235e7
+    min_ns = 6.0635475e7
+    times_ns = [6.1335671e7, 6.0635475e7, 6.1433376e7, 6.1944302e7, 6.1266206e7, 6.3020348e7, 6.1862109e7, 6.1085346e7, 6.1806732e7, 6.1285172e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_native"
+description = "summed softmax categorical log likelihood"
+model = "vcat_free"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6]
+    bytes = [9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144]
+    median_allocs = 6
+    median_bytes = 9120144
+    median_ns = 6.24828255e7
+    min_ns = 6.0930133e7
+    times_ns = [6.0930133e7, 6.2656235e7, 6.31671e7, 6.4458672e7, 6.2357212e7, 6.2490526e7, 6.2475125e7, 6.2403616e7, 6.1752398e7, 6.2668871e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_native_bound"
+description = "summed softmax categorical log likelihood"
+model = "vcat_free"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6]
+    bytes = [9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144]
+    median_allocs = 6
+    median_bytes = 9120144
+    median_ns = 6.06750655e7
+    min_ns = 5.9651187e7
+    times_ns = [6.3681159e7, 6.0819109e7, 6.0574812e7, 6.015339e7, 6.14727e7, 6.0775319e7, 5.9893031e7, 5.9651187e7, 6.1514018e7, 6.0454866e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_nonallocating"
+description = "summed softmax categorical log likelihood"
+model = "vcat_free"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 6.13062555e7
+    min_ns = 5.9914941e7
+    times_ns = [6.1170473e7, 6.0147483e7, 6.1821904e7, 6.1443631e7, 6.1442038e7, 6.2151968e7, 5.9923112e7, 5.9914941e7, 6.0459374e7, 6.1533636e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_nonallocating_bound"
+description = "summed softmax categorical log likelihood"
+model = "vcat_free"
+outcome = "likelihood"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 6.1120455e7
+    min_ns = 6.0405328e7
+    times_ns = [6.1770592e7, 6.1068573e7, 6.1051601e7, 6.2411957e7, 6.1268108e7, 6.0985218e7, 6.0405328e7, 6.106587e7, 6.1172337e7, 6.1531191e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "manual_primal"
+description = "summed softmax categorical log likelihood"
+model = "implicit_reference"
+outcome = "likelihood"
+provider = "manual_julia"
+state = "supported"
+
+    [measurements.result]
+    allocs = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6]
+    bytes = [9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144]
+    median_allocs = 6
+    median_bytes = 9120144
+    median_ns = 6.04109405e7
+    min_ns = 5.9504404e7
+    times_ns = [6.0398448e7, 6.3341299e7, 5.9504404e7, 5.9770473e7, 6.0967784e7, 6.0554003e7, 6.1168962e7, 6.0128796e7, 6.0423433e7, 6.0224708e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "turing_idiomatic_primal"
+description = "summed softmax categorical log likelihood"
+model = "idiomatic"
+outcome = "likelihood"
+provider = "turing"
+state = "supported"
+
+    [measurements.result]
+    allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
+    bytes = [20160384, 20160384, 20160384, 20160384, 20160384, 20160384, 20160384, 20160384, 20160384, 20160384]
+    median_allocs = 16
+    median_bytes = 20160384
+    median_ns = 6.1131921e7
+    min_ns = 5.9570395e7
+    times_ns = [5.9570395e7, 6.1220944e7, 6.1692796e7, 6.292049e7, 6.1042898e7, 6.1277851e7, 6.0279985e7, 6.0148054e7, 5.9864171e7, 6.158813e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "turing_vcat_free_primal"
+description = "summed softmax categorical log likelihood"
+model = "vcat_free"
+outcome = "likelihood"
+provider = "turing"
+state = "supported"
+
+    [measurements.result]
+    allocs = [4, 4, 4, 4, 4, 4, 4, 4, 4, 4]
+    bytes = [8640096, 8640096, 8640096, 8640096, 8640096, 8640096, 8640096, 8640096, 8640096, 8640096]
+    median_allocs = 4
+    median_bytes = 8640096
+    median_ns = 6.0368502e7
+    min_ns = 5.9032633e7
+    times_ns = [6.1549017e7, 6.0092476e7, 6.1274458e7, 6.0709938e7, 5.9065128e7, 6.0644528e7, 5.9974114e7, 5.9032633e7, 5.9354418e7, 6.0807333e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_native"
+description = "per-observation softmax categorical log likelihoods"
+model = "idiomatic"
+outcome = "pointwise"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [10, 10, 10, 10, 10, 10, 10, 10, 10, 10]
+    bytes = [14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240]
+    median_allocs = 10
+    median_bytes = 14400240
+    median_ns = 6.034529e7
+    min_ns = 5.9034105e7
+    times_ns = [5.9996593e7, 6.0328081e7, 5.9836894e7, 5.9034105e7, 6.0850602e7, 6.1457349e7, 6.0362499e7, 6.0760288e7, 6.0629827e7, 6.0083493e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_native_bound"
+description = "per-observation softmax categorical log likelihoods"
+model = "idiomatic"
+outcome = "pointwise"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [10, 10, 10, 10, 10, 10, 10, 10, 10, 10]
+    bytes = [14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240]
+    median_allocs = 10
+    median_bytes = 14400240
+    median_ns = 6.0754225e7
+    min_ns = 5.9829353e7
+    times_ns = [6.2614097e7, 6.0816196e7, 6.0416764e7, 6.0820751e7, 6.0690821e7, 6.1834692e7, 6.0692254e7, 6.2191273e7, 5.9829353e7, 6.0151318e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_nonallocating"
+description = "per-observation softmax categorical log likelihoods"
+model = "idiomatic"
+outcome = "pointwise"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 6.11344095e7
+    min_ns = 5.9175611e7
+    times_ns = [5.9961766e7, 5.9376148e7, 6.0946585e7, 5.9388145e7, 6.3263143e7, 5.9175611e7, 6.2159218e7, 6.1422062e7, 6.1322234e7, 6.2360186e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_nonallocating_bound"
+description = "per-observation softmax categorical log likelihoods"
+model = "idiomatic"
+outcome = "pointwise"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 6.0796433e7
+    min_ns = 5.9735834e7
+    times_ns = [6.0874696e7, 6.153678e7, 6.0858414e7, 6.0654582e7, 6.0734452e7, 5.9735834e7, 6.0719171e7, 6.0529349e7, 6.5923954e7, 6.2568554e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_native"
+description = "per-observation softmax categorical log likelihoods"
+model = "vcat_free"
+outcome = "pointwise"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6]
+    bytes = [9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144]
+    median_allocs = 6
+    median_bytes = 9120144
+    median_ns = 6.19855385e7
+    min_ns = 6.0446895e7
+    times_ns = [6.5475105e7, 6.2064437e7, 6.1843793e7, 6.2312099e7, 6.0446895e7, 6.2178695e7, 6.1767918e7, 6.190664e7, 6.2207776e7, 6.1026966e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_native_bound"
+description = "per-observation softmax categorical log likelihoods"
+model = "vcat_free"
+outcome = "pointwise"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6]
+    bytes = [9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144]
+    median_allocs = 6
+    median_bytes = 9120144
+    median_ns = 6.25161215e7
+    min_ns = 6.1112404e7
+    times_ns = [6.1112404e7, 6.1425757e7, 6.2739831e7, 6.3407952e7, 6.1415001e7, 6.3871331e7, 6.2292412e7, 6.2865663e7, 6.3962507e7, 6.2259838e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_nonallocating"
+description = "per-observation softmax categorical log likelihoods"
+model = "vcat_free"
+outcome = "pointwise"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 6.15931325e7
+    min_ns = 6.1161712e7
+    times_ns = [6.1233131e7, 6.1710019e7, 6.1552972e7, 6.1161712e7, 6.1736114e7, 6.1649235e7, 6.1633293e7, 6.2045371e7, 6.135531e7, 6.1390327e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "primal_nonallocating_bound"
+description = "per-observation softmax categorical log likelihoods"
+model = "vcat_free"
+outcome = "pointwise"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 6.2066676e7
+    min_ns = 6.0966313e7
+    times_ns = [6.2367917e7, 6.1928931e7, 6.2293233e7, 6.2277462e7, 6.2403887e7, 6.0966313e7, 6.1930833e7, 6.1876298e7, 6.1126503e7, 6.2202519e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "manual_primal"
+description = "per-observation softmax categorical log likelihoods"
+model = "implicit_reference"
+outcome = "pointwise"
+provider = "manual_julia"
+state = "supported"
+
+    [measurements.result]
+    allocs = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6]
+    bytes = [9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144]
+    median_allocs = 6
+    median_bytes = 9120144
+    median_ns = 6.0597418e7
+    min_ns = 5.9502532e7
+    times_ns = [6.0436731e7, 6.1322394e7, 5.9502532e7, 5.9577626e7, 6.0643266e7, 6.2817627e7, 6.0320732e7, 6.1295206e7, 6.055157e7, 6.1126864e7]
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "turing_idiomatic_primal"
+description = "per-observation softmax categorical log likelihoods"
+model = "idiomatic"
+outcome = "pointwise"
+provider = "turing"
+reason = "the @addlogprob! likelihood has no public pointwise view"
+state = "unsupported"
+[[measurements]]
+boundary = "structured_parameters"
+configuration = "turing_vcat_free_primal"
+description = "per-observation softmax categorical log likelihoods"
+model = "vcat_free"
+outcome = "pointwise"
+provider = "turing"
+reason = "the @addlogprob! likelihood has no public pointwise view"
+state = "unsupported"
+
+[pins]
+benchmarktools_version = "1.6.3"
+distributions_version = "0.25.131"
+dynamicppl_version = "0.42.6"
+julia_version = "1.10.11"
+mldatasets_version = "0.7.21"
+mutatingfunctions_rev = "b353559ef3e391ae2e2d98256b6967903fdfa410"
+mutatingfunctions_version = "0.1.0"
+nnlib_version = "0.9.45"
+reactivekernels_dirty = false
+reactivekernels_sha = "5fb20e73f74eef33602ed4fbad897a3634f400d6"
+reactivekernels_version = "0.1.0"
+reactivekernelsdistributionkernels_version = "0.1.0"
+reactivekernelspplexamples_version = "0.1.0"
+turing_version = "0.47.1"
+
+[protocol]
+bound_ports = ["X", "y", "num_classes"]
+bound_prior_state = "not_applicable: minimal prior cut has no data ports"
+data = "MLDatasets MNIST train split, first N images"
+estimator = "minimum of per-round BenchmarkTools minimum times (uncontended cost; medians and raw rounds retained)"
+gradients_included = false
+input_boundaries = ["packed_unconstrained", "structured_parameters"]
+matrix_layout = "long-form provider/model/configuration/boundary/outcome rows"
+model = "multinomial-logistic MNIST classifier"
+models = ["idiomatic", "vcat_free"]
+num_classes = 10
+num_features = 784
+num_observations = 60000
+outcomes = ["joint", "prior", "likelihood", "pointwise"]
+parity_atol = 1.0e-9
+parity_rtol = 1.0e-9
+preparation_in_timed_region = false
+rk_configurations = ["primal_native", "primal_native_bound", "primal_nonallocating", "primal_nonallocating_bound"]
+rk_nonallocating_pass = "prepare_nonallocating over both public graphs (MutatingFunctions extension; caches seeded before timing)"
+rk_optimized_model = "vcat-free: reference class inside categorical_logit_ref"
+rounds = 10
+samples_per_round = 200
+seconds_per_round = 0.2
+setup_in_timed_region = false
+turing_optimized_model = "implicit-reference stable log-sum-exp likelihood accumulated into one @addlogprob! term"
+turing_pointwise_supported = false
+turing_transform_strategy = "fixed transforms"

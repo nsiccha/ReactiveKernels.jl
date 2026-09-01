@@ -102,6 +102,25 @@ end
                                bound = (d => dval,))
         @test bound_kernel([1.0, 1.0]) == 5.0
         @test Tuple(v.name for v in inputs(bound_kernel)) == (:x,)
+
+        # Array compiler backends can keep the q-only public kernel while
+        # passing the large bound array as a hidden device operand. The
+        # stripped call captures no array-valued bound constant and is exactly
+        # equivalent when supplied the extracted value.
+        external_call, external_values =
+            ReactiveKernels._externalize_bound_arrays(bound_kernel)
+        @test external_values == (dval,)
+        @test external_call([1.0, 1.0], external_values...) == 5.0
+        @test all(external_call.ops) do op
+            !(op isa ReactiveKernels._BoundConstant &&
+              op.value isa AbstractArray)
+        end
+
+        plain = prepare(g; have = (x, d), want = (r,))
+        unchanged, no_values =
+            ReactiveKernels._externalize_bound_arrays(plain)
+        @test unchanged === plain
+        @test isempty(no_values)
     end
 
     @testset "data-only WANTs become constants" begin

@@ -6,10 +6,13 @@ using Random
 using TOML
 using ReactiveKernels
 using ReactiveKernelsPPLExamples.MNISTLogisticExample:
-    build_mnist_logistic_graph, NUM_CLASSES
+    build_mnist_logistic_graph, build_mnist_logistic_optimized_graph, NUM_CLASSES
 using DifferentiationInterface
 import DynamicPPL
 import Enzyme
+
+include(joinpath(@__DIR__, "mnist_logistic_matrix_spec.jl"))
+using .MNISTLogisticMatrixSpec
 
 include(joinpath(@__DIR__, "_ad_comparison_support.jl"))
 using .ADComparisonSupport
@@ -25,6 +28,8 @@ delete!(ENV, "RK_MNIST_DEFINITIONS_ONLY")
 
 const Primal = PublishedMNISTLogisticPrimal
 const RK_AD_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
+const RK_BOUND_AD_BACKEND = AutoEnzyme(
+    ; mode = Enzyme.Reverse, function_annotation = Enzyme.Const)
 const TURING_AD_BACKEND = AutoEnzyme(;
     mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
     function_annotation = Enzyme.Const,
@@ -39,11 +44,6 @@ const MNIST_AD_PACKAGES = (
 )
 const MNIST_AD_BOUNDARIES = ("packed_unconstrained", "structured_parameters")
 const MNIST_AD_OUTCOMES = ("joint", "prior", "likelihood", "pointwise")
-const MNIST_AD_SUPPORTED = Set((
-    ("packed_unconstrained", "joint"),
-    ("packed_unconstrained", "prior"),
-    ("packed_unconstrained", "likelihood"),
-))
 const MNIST_MODEL_PUBLISHED_SHA =
     "9dbaa1fbfbdb1bb2ff4238a3910754f36635f81e"
 const MNIST_COMPARATOR_PUBLISHED_SHA =
@@ -75,7 +75,17 @@ function _manual_definition(outcome, q, X, y, nonreference, features)
     (; objective, contexts, raw, point = q)
 end
 
-function _rk_definition(model, outcome, q, X, y)
+function _rk_definition(model, outcome, q, X, y, data_binding)
+    want = outcome == "joint" ? :density : Symbol(outcome)
+    if data_binding == "bound"
+        kernel = prepare(
+            model; have = (:unconstrained, :X, :y, :num_classes),
+            want, bound = (; X, y, num_classes = NUM_CLASSES))
+        return (;
+            kernel, spec = nothing, want, bound = NamedTuple(),
+            arguments = (q,), active = :unconstrained, data_binding,
+        )
+    end
     if outcome == "joint"
         kernel = prepare(model;
             have = (:unconstrained, :X, :y, :num_classes), want = :density)
@@ -90,7 +100,16 @@ function _rk_definition(model, outcome, q, X, y)
     else
         return nothing
     end
-    (; kernel, arguments, active = :unconstrained)
+    (; kernel, spec = nothing, want, bound = NamedTuple(), arguments,
+       active = :unconstrained, data_binding)
+end
+
+function _prepare_rk_ad(definition)
+    backend = definition.data_binding == "bound" ?
+        RK_BOUND_AD_BACKEND : RK_AD_BACKEND
+    prepare_ad(
+        definition.kernel, backend, definition.arguments...;
+        active = definition.active)
 end
 
 function _turing_logdensity(model, outcome)
@@ -152,10 +171,14 @@ end
 function _verified_model_source_pin(root, relative_path)
     published, text = published_source_pin(
         root, MNIST_MODEL_PUBLISHED_SHA, relative_path)
-    normalized_read(joinpath(root, relative_path)) == text || error(
-        "MNIST model source drifted from published authority " *
+    current = normalized_read(joinpath(root, relative_path))
+    mnist_model_source_preserves_published_authority(current, text) || error(
+        "MNIST model source no longer preserves published idiomatic authority " *
         MNIST_MODEL_PUBLISHED_SHA)
-    merge(published, Dict("current" => source_pin(root, relative_path)))
+    merge(published, Dict(
+        "current" => source_pin(root, relative_path),
+        "current_delta" => MNIST_MODEL_SOURCE_CURRENT_DELTA,
+    ))
 end
 
 function _verified_comparator_source_pin(root, relative_path)
@@ -165,10 +188,10 @@ function _verified_comparator_source_pin(root, relative_path)
     current = normalized_read(joinpath(root, relative_path))
     comparator_source_matches_current_delta(current, text, guard) || error(
         "MNIST comparator differs from its published authority by more than " *
-        COMPARATOR_SOURCE_CURRENT_DELTA)
+        MNIST_COMPARATOR_SOURCE_CURRENT_DELTA)
     merge(published, Dict(
         "current" => source_pin(root, relative_path),
-        "current_delta" => COMPARATOR_SOURCE_CURRENT_DELTA,
+        "current_delta" => MNIST_COMPARATOR_SOURCE_CURRENT_DELTA,
     ))
 end
 
@@ -176,6 +199,18 @@ function run_mnist_logistic_ad_comparison()
     rounds = _rounds()
     n = _observations()
     root = normpath(joinpath(@__DIR__, ".."))
+    source_path = joinpath(
+        "packages", "ReactiveKernelsPPLExamples", "src", "mnist_logistic.jl")
+    comparator_path = joinpath("benchmark", "mnist_logistic_comparison_body.jl")
+    primal_receipt_path =
+        joinpath("benchmark", "receipts", "mnist-logistic-primal-v3.toml")
+    primal_path = get(ENV, "RK_MNIST_PRIMAL_RECEIPT", primal_receipt_path)
+    primal_absolute = isabspath(primal_path) ? primal_path : joinpath(root, primal_path)
+
+    # Fail authority/prerequisite gates before loading MNIST or measuring.
+    model_source_pin = _verified_model_source_pin(root, source_path)
+    comparator_source_pin = _verified_comparator_source_pin(root, comparator_path)
+    primal_receipt = TOML.parsefile(primal_absolute)
 
     data_setup = @timed Primal._load_mnist(n)
     X, y = data_setup.value
@@ -187,94 +222,141 @@ function run_mnist_logistic_ad_comparison()
     q = vcat(vec(W), b)
     parameters = (; W, b)
 
-    model_setup = @timed build_mnist_logistic_graph()
-    model = model_setup.value
-    turing_setup = @timed Primal.turing_mnist_logistic(X, y, NUM_CLASSES)
-    turing_model = turing_setup.value
-    turing_joint = DynamicPPL.LogDensityFunction(
-        turing_model, DynamicPPL.getlogjoint_internal, DynamicPPL.LinkAll();
-        fix_transforms = true)
-    turing_q = Primal._turing_vector(turing_joint, parameters)
-    isapprox(turing_q, q; rtol = 1e-12, atol = 1e-12) ||
-        error("Turing's linked parameter vector does not match the RK boundary")
+    model_setup = @timed (
+        (name = "idiomatic", graph = build_mnist_logistic_graph()),
+        (name = "vcat_free", graph = build_mnist_logistic_optimized_graph()),
+    )
+    rk_models = model_setup.value
+    turing_setup = @timed (
+        (name = "idiomatic",
+         model = Primal.turing_mnist_logistic(X, y, NUM_CLASSES)),
+        (name = "vcat_free",
+         model = Primal.turing_mnist_logistic_optimized(X, y, NUM_CLASSES)),
+    )
+    turing_models = map(turing_setup.value) do definition
+        joint = DynamicPPL.LogDensityFunction(
+            definition.model, DynamicPPL.getlogjoint_internal,
+            DynamicPPL.LinkAll(); fix_transforms = true)
+        vector = Primal._turing_vector(joint, parameters)
+        isapprox(vector, q; rtol = 1e-12, atol = 1e-12) || error(
+            "Turing $(definition.name) linked parameter vector does not " *
+            "match the RK boundary")
+        (; definition..., vector)
+    end
 
     oracle_setup = @timed _analytic_gradients(q, X, y, nonreference, features)
     analytic_gradients = oracle_setup.value
+    native_ad_configurations = filter(
+        configuration -> configuration.differentiation == "value_and_gradient" &&
+            configuration.compiler == "native",
+        MNIST_RK_CONFIGURATIONS,
+    )
     measurements = Dict{String,Any}[]
     for boundary in MNIST_AD_BOUNDARIES, outcome in MNIST_AD_OUTCOMES
-        row = Dict{String,Any}("boundary" => boundary, "outcome" => outcome)
-        if !((boundary, outcome) in MNIST_AD_SUPPORTED)
-            row["supported"] = false
-            row["unsupported_reason"] = _unsupported_reason(boundary, outcome)
+        matrix_state, matrix_reason = matrix_support(
+            first(native_ad_configurations), boundary, outcome)
+        manual_definition = matrix_state == "supported" ? _manual_definition(
+            outcome, q, X, y, nonreference, features) : nothing
+        reference_value = matrix_state == "supported" ?
+            Float64(manual_definition.raw(q)) : nothing
+        reference_gradient = matrix_state == "supported" ?
+            analytic_gradients[outcome] : nothing
+
+        for model_definition in rk_models,
+            configuration in native_ad_configurations
+            state, reason = matrix_support(configuration, boundary, outcome)
+            row = Dict{String,Any}(
+                "provider" => "rk", "model" => model_definition.name,
+                "configuration" => configuration.id,
+                "boundary" => boundary, "outcome" => outcome,
+                "state" => state,
+            )
+            if state == "supported"
+                definition = _rk_definition(
+                    model_definition.graph, outcome, q, X, y,
+                    configuration.data)
+                rk_call, rk_result, rk_setup = build_and_first_call() do
+                    prepared = _prepare_rk_ad(definition)
+                    RKValueGradientCall(
+                        prepared, similar(q), definition.arguments)
+                end
+                row["active_port"] = String(definition.active)
+                row["analytic_gradient_length"] = length(reference_gradient)
+                row["result"] = record_implementation(
+                    rk_call, rk_result, rk_setup,
+                    reference_value, reference_gradient;
+                    rounds, caller_owned = true)
+            else
+                row["reason"] = reason
+            end
             push!(measurements, row)
-            println("boundary=$boundary outcome=$outcome unsupported")
-            continue
         end
 
-        manual_definition = _manual_definition(
-            outcome, q, X, y, nonreference, features)
-        rk_definition = _rk_definition(model, outcome, q, X, y)
-        row["supported"] = true
-        row["active_port"] = String(rk_definition.active)
-        reference_value = Float64(manual_definition.raw(q))
-        reference_gradient = analytic_gradients[outcome]
-        row["analytic_gradient_length"] = length(reference_gradient)
-
-        rk_call, rk_result, rk_setup = build_and_first_call() do
-            prepared = prepare_ad(
-                rk_definition.kernel, RK_AD_BACKEND,
-                rk_definition.arguments...; active = rk_definition.active)
-            RKValueGradientCall(
-                prepared, similar(q), rk_definition.arguments)
+        manual_row = Dict{String,Any}(
+            "provider" => "manual_julia", "model" => "implicit_reference",
+            "configuration" => "manual_ad", "boundary" => boundary,
+            "outcome" => outcome, "state" => matrix_state,
+        )
+        if matrix_state == "supported"
+            manual_call, manual_result, manual_setup = build_and_first_call() do
+                preparation = DifferentiationInterface.prepare_gradient(
+                    manual_definition.objective, RK_AD_BACKEND,
+                    q, manual_definition.contexts...)
+                DIValueGradientCall(
+                    manual_definition.objective, similar(q), preparation,
+                    RK_AD_BACKEND, q, manual_definition.contexts)
+            end
+            manual_row["active_port"] = "unconstrained"
+            manual_row["analytic_gradient_length"] = length(reference_gradient)
+            manual_row["result"] = record_implementation(
+                manual_call, manual_result, manual_setup,
+                reference_value, reference_gradient;
+                rounds, caller_owned = true)
+        else
+            manual_row["reason"] = matrix_reason
         end
-        row["rk_native"] = record_implementation(
-            rk_call, rk_result, rk_setup, reference_value, reference_gradient;
-            rounds, caller_owned = true)
+        push!(measurements, manual_row)
 
-        manual_call, manual_result, manual_setup = build_and_first_call() do
-            preparation = DifferentiationInterface.prepare_gradient(
-                manual_definition.objective, RK_AD_BACKEND,
-                q, manual_definition.contexts...)
-            DIValueGradientCall(
-                manual_definition.objective, similar(q), preparation,
-                RK_AD_BACKEND, q, manual_definition.contexts)
+        for definition in turing_models
+            row = Dict{String,Any}(
+                "provider" => "turing", "model" => definition.name,
+                "configuration" => "turing_$(definition.name)_ad",
+                "boundary" => boundary, "outcome" => outcome,
+                "state" => matrix_state,
+            )
+            if matrix_state == "supported"
+                turing_call, turing_result, turing_ad_setup =
+                    build_and_first_call() do
+                        TuringValueGradientCall(
+                            _turing_logdensity(definition.model, outcome),
+                            definition.vector)
+                    end
+                row["active_port"] = "unconstrained"
+                row["analytic_gradient_length"] = length(reference_gradient)
+                row["result"] = record_implementation(
+                    turing_call, turing_result, turing_ad_setup,
+                    reference_value, reference_gradient;
+                    rounds, caller_owned = false)
+            else
+                row["reason"] = matrix_reason
+            end
+            push!(measurements, row)
         end
-        row["manual_enzyme"] = record_implementation(
-            manual_call, manual_result, manual_setup,
-            reference_value, reference_gradient;
-            rounds, caller_owned = true)
-
-        turing_call, turing_result, turing_ad_setup = build_and_first_call() do
-            TuringValueGradientCall(
-                _turing_logdensity(turing_model, outcome), turing_q)
-        end
-        row["turing_enzyme"] = record_implementation(
-            turing_call, turing_result, turing_ad_setup,
-            reference_value, reference_gradient;
-            rounds, caller_owned = false)
-
-        push!(measurements, row)
         println("boundary=$boundary outcome=$outcome complete")
     end
 
-    source_path = joinpath(
-        "packages", "ReactiveKernelsPPLExamples", "src", "mnist_logistic.jl")
-    primal_path = joinpath("benchmark", "receipts", "mnist-logistic-v1.toml")
-    comparator_path = joinpath("benchmark", "mnist_logistic_comparison_body.jl")
-    primal_receipt = TOML.parsefile(joinpath(root, primal_path))
     receipt = Dict{String,Any}(
-        "schema" => "mnist-logistic-ad-v1",
+        "schema" => "mnist-logistic-ad-v2",
         "generated_at" => string(now(UTC), "Z"),
         "pins" => Dict(
             "reactivekernels_sha" => get(
                 ENV, "REACTIVEKERNELS_CANDIDATE_SHA", "unknown"),
             "reactivekernels_dirty" => false,
             "julia_version" => string(VERSION),
-            "model_source" => _verified_model_source_pin(root, source_path),
-            "primal_comparator_source" =>
-                _verified_comparator_source_pin(root, comparator_path),
-            "primal_receipt_path" => primal_path,
-            "primal_receipt_sha256" => text_sha256(joinpath(root, primal_path)),
+            "model_source" => model_source_pin,
+            "primal_comparator_source" => comparator_source_pin,
+            "primal_receipt_path" => primal_receipt_path,
+            "primal_receipt_sha256" => text_sha256(primal_absolute),
             "primal_receipt_reactivekernels_sha" =>
                 primal_receipt["pins"]["reactivekernels_sha"],
             (string(lowercase(name), "_version") => package_version(name)
@@ -305,11 +387,19 @@ function run_mnist_logistic_ad_comparison()
             "active_parameter_count" => length(q),
             "input_boundaries" => collect(MNIST_AD_BOUNDARIES),
             "outcomes" => collect(MNIST_AD_OUTCOMES),
+            "models" => collect(MNIST_MODELS),
+            "matrix_layout" =>
+                "long-form provider/model/configuration/boundary/outcome rows",
+            "rk_configurations" => [
+                configuration.id for configuration in native_ad_configurations],
+            "bound_ports" => ["X", "y", "num_classes"],
             "source_reused" => true,
-            "matrix_source" => primal_path,
+            "matrix_source" => primal_receipt_path,
             "gradient_operation" => "value and gradient",
             "rk_surface" => "prepare_ad + ad_value_and_gradient!",
             "rk_backend" => "AutoEnzyme(mode = Enzyme.Reverse)",
+            "rk_bound_backend" =>
+                "AutoEnzyme(mode = Enzyme.Reverse, function_annotation = Enzyme.Const)",
             "manual_control" =>
                 "the primal receipt's manual Julia density differentiated through the same prepared DI+Enzyme boundary",
             "turing_surface" =>
@@ -351,4 +441,5 @@ function run_mnist_logistic_ad_comparison()
     receipt
 end
 
-run_mnist_logistic_ad_comparison()
+get(ENV, "RK_MNIST_AD_DEFINITIONS_ONLY", "") == "1" ||
+    run_mnist_logistic_ad_comparison()

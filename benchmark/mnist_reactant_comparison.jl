@@ -10,11 +10,17 @@ import Pkg
 const _MNIST_REACTANT_INNER = "RK_MNIST_REACTANT_INNER"
 const _MNIST_REACTANT_VERSION = v"0.2.278"
 
+_mnist_reactant_body() = any(
+    ==("--dataset=wren-pca40"), ARGS) ?
+    "mnist_reactant_wren_pca40_comparison_body.jl" :
+    "mnist_reactant_comparison_body.jl"
+
 include(joinpath(@__DIR__, "_repro_guard.jl"))
 
 function _run_pinned_comparison()
     root = normpath(joinpath(@__DIR__, ".."))
     sha = _require_clean_detached_candidate(root)
+    body = joinpath(@__DIR__, _mnist_reactant_body())
     mktempdir(prefix = "reactivekernels-mnist-reactant-") do environment
         setup_seconds = precompile_seconds = 0.0
         withenv("JULIA_PKG_PRECOMPILE_AUTO" => "0") do
@@ -39,7 +45,7 @@ function _run_pinned_comparison()
             precompile_seconds = @elapsed Pkg.precompile()
         end
         command = addenv(
-            `$(Base.julia_cmd()) --startup-file=no --project=$environment $(joinpath(@__DIR__, "mnist_reactant_comparison_body.jl")) $ARGS`,
+            `$(Base.julia_cmd()) --startup-file=no --project=$environment $body $ARGS`,
             _MNIST_REACTANT_INNER => "1",
             "REACTIVEKERNELS_CANDIDATE_SHA" => sha,
             "RK_MNIST_REACTANT_ENV_SETUP_SECONDS" => string(setup_seconds),
@@ -52,5 +58,5 @@ function _run_pinned_comparison()
 end
 
 get(ENV, _MNIST_REACTANT_INNER, "") == "1" ?
-    include(joinpath(@__DIR__, "mnist_reactant_comparison_body.jl")) :
+    include(joinpath(@__DIR__, _mnist_reactant_body())) :
     _run_pinned_comparison()

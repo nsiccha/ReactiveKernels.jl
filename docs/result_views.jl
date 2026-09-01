@@ -22,13 +22,13 @@ const _DISTRIBUTION_GRADIENT_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts", "distribution-gradient-v1.toml",
 )
 const _EIGHT_SCHOOLS_PRIMAL_RECEIPT_PATH = joinpath(
-    dirname(@__DIR__), "benchmark", "receipts", "eight-schools-primal-v1.toml",
+    dirname(@__DIR__), "benchmark", "receipts", "eight-schools-primal-v2.toml",
 )
 const _EIGHT_SCHOOLS_AD_RECEIPT_PATH = joinpath(
-    dirname(@__DIR__), "benchmark", "receipts", "eight-schools-ad-v1.toml",
+    dirname(@__DIR__), "benchmark", "receipts", "eight-schools-ad-v2.toml",
 )
 const _MNIST_LOGISTIC_AD_RECEIPT_PATH = joinpath(
-    dirname(@__DIR__), "benchmark", "receipts", "mnist-logistic-ad-v1.toml",
+    dirname(@__DIR__), "benchmark", "receipts", "mnist-logistic-ad-v2.toml",
 )
 const _NUTS_G7_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts", "nuts-g7-v1.toml",
@@ -37,11 +37,11 @@ const _NUTS_REACTANT_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts", "nuts-reactant-v1.toml",
 )
 const _EIGHT_SCHOOLS_REACTANT_RECEIPT_PATH = joinpath(
-    dirname(@__DIR__), "benchmark", "receipts", "eight-schools-reactant-v1.toml",
+    dirname(@__DIR__), "benchmark", "receipts", "eight-schools-reactant-v2.toml",
 )
 const _EIGHT_SCHOOLS_REACTANT_AD_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts",
-    "eight-schools-reactant-ad-v1.toml",
+    "eight-schools-reactant-ad-v2.toml",
 )
 
 _node_html(node) = sprint(show, MIME"text/html"(), node; context = :limit => false)
@@ -973,10 +973,103 @@ function _eight_schools_cell(value, _)
     "$(value.median_allocs) alloc"
 end
 
+function _longform_result(row)
+    get(row, "state", "") == "supported" || return nothing
+    result = get(row, "result", nothing)
+    result isa AbstractDict || error(
+        "supported long-form benchmark row lacks a result: " *
+        "$(get(row, "configuration", "unknown")) / " *
+        "$(get(row, "boundary", "unknown")) / $(get(row, "outcome", "unknown"))")
+    result
+end
+
+function _longform_optional_metric(result, key, convert)
+    result === nothing && return missing
+    haskey(result, key) || return missing
+    convert(result[key])
+end
+
+function _longform_metric(value, row, formatter)
+    value !== missing && return formatter(value)
+    label = row.status == "measured" ? "not recorded" : "—"
+    h.span(label; class = "rk-result-unsupported")
+end
+
+function _render_longform_model_receipt(path, expected_schema;
+                                        id, title, note)
+    receipt = TOML.parsefile(path)
+    get(receipt, "schema", "") == expected_schema ||
+        error("unexpected benchmark receipt schema at $path")
+    pins = receipt["pins"]
+    get(pins, "reactivekernels_dirty", true) == false ||
+        error("benchmark receipt was produced from a dirty checkout")
+    sha = String(get(pins, "reactivekernels_sha", ""))
+    occursin(r"^[0-9a-f]{40}$", sha) ||
+        error("benchmark receipt lacks an exact ReactiveKernels SHA")
+
+    measurements = receipt["measurements"]
+    rows = map(measurements) do row
+        result = _longform_result(row)
+        runtime = result === nothing ? missing : Float64(
+            haskey(result, "min_ns") ? result["min_ns"] : result["median_ns"])
+        bytes = _longform_optional_metric(result, "median_bytes", Int)
+        allocations = _longform_optional_metric(result, "median_allocs", Int)
+        state = String(get(row, "state", "unsupported"))
+        status = state == "supported" ? "measured" :
+            state * ": " * String(get(row, "reason", "no public cell"))
+        (;
+            provider = String(row["provider"]),
+            model = String(row["model"]),
+            configuration = String(row["configuration"]),
+            boundary = String(row["boundary"]),
+            outcome = String(row["outcome"]),
+            runtime,
+            bytes,
+            allocations,
+            status,
+        )
+    end
+    measured = count(row -> row.runtime !== missing, rows)
+    count(row -> row.status == "measured", rows) == measured || error(
+        "long-form receipt contains a supported row without timing evidence")
+    summary = "The receipt accounts for $(length(rows)) long-form matrix rows; " *
+        "$measured are measured and $(length(rows) - measured) are explicit " *
+        "N/A or unsupported public-API cells."
+    columns = (
+        _column(:provider, "Provider"),
+        _column(:model, "Model"),
+        _column(:configuration, "Configuration"),
+        _column(:boundary, "Input boundary"),
+        _column(:outcome, "Requested output"),
+        _column(:runtime, "Steady-state runtime";
+            format = (value, row) -> _longform_metric(value, row, _fmt_ns)),
+        _column(:bytes, "Allocated bytes";
+            format = (value, row) -> _longform_metric(
+                value, row, bytes -> string(bytes, " B"))),
+        _column(:allocations, "Allocations";
+            format = (value, row) -> _longform_metric(value, row, string)),
+        _column(:status, "State";
+            format = (value, _) -> value == "measured" ? value :
+                h.span(value; class = "rk-result-unsupported")),
+    )
+    provenance = "Receipt `$(basename(path))`; RK `$sha`; " *
+        "Julia $(pins["julia_version"]); $(receipt["environment"]["cpu"])."
+    Markdown.MD(Any[
+        Markdown.Paragraph(Any[summary]),
+        _result_table(rows, columns; id, title, note),
+        Markdown.Paragraph(Any[Markdown.Italic(Any[provenance])]),
+    ])
+end
+
 _eight_schools_sort(value, _) = value === missing ? nothing : value.median_ns
 
-"""Render the checked-in primal Eight Schools boundary/outcome matrix."""
+"""Render the checked-in primal Eight Schools boundary/outcome/modifier matrix."""
 function render_eight_schools_primal_benchmarks()
+    return _render_longform_model_receipt(
+        _EIGHT_SCHOOLS_PRIMAL_RECEIPT_PATH, "eight-schools-primal-v2";
+        id = "eight-schools-primal-matrix",
+        title = "Primal boundary × outcome × modifier matrix",
+        note = "All provider/model/configuration rows remain explicit; timings exclude setup and preparation.")
     receipt = TOML.parsefile(_EIGHT_SCHOOLS_PRIMAL_RECEIPT_PATH)
     get(receipt, "schema", "") == "eight-schools-primal-v1" ||
         error("unexpected Eight Schools primal benchmark receipt schema")
@@ -1092,15 +1185,16 @@ function render_eight_schools_primal_benchmarks()
 end
 
 const _MNIST_LOGISTIC_RECEIPT_PATH = joinpath(
-    dirname(@__DIR__), "benchmark", "receipts", "mnist-logistic-v1.toml")
+    dirname(@__DIR__), "benchmark", "receipts", "mnist-logistic-primal-v3.toml")
 const _MNIST_LOGISTIC_BOUNDARIES = ("packed_unconstrained", "structured_parameters")
 const _MNIST_LOGISTIC_OUTCOMES = ("joint", "prior", "likelihood", "pointwise")
-const _MNIST_LOGISTIC_BACKENDS = ("rk_native", "manual_julia", "turing_native")
+const _MNIST_LOGISTIC_BACKENDS = ("rk_native", "rk_optimized", "rk_nonallocating",
+                                  "manual_julia", "turing_native", "turing_optimized")
 
 # The model's likelihood is a single `@addlogprob!` term, so Turing exposes no
 # public per-observation pointwise view; that cell is omitted, not synthesized.
 _mnist_logistic_supported(boundary, outcome, backend) =
-    !(backend == "turing_native" && outcome == "pointwise")
+    !(backend in ("turing_native", "turing_optimized") && outcome == "pointwise")
 
 # Headline estimator for the ms-scale matmul cells: the minimum of per-round
 # minimums (uncontended cost). A shared-host load episode spanning over half
@@ -1117,8 +1211,13 @@ end
 
 """Render the checked-in MNIST multinomial-logistic boundary/outcome matrix."""
 function render_mnist_logistic_benchmarks()
+    return _render_longform_model_receipt(
+        _MNIST_LOGISTIC_RECEIPT_PATH, "mnist-logistic-primal-v3";
+        id = "mnist-logistic-matrix",
+        title = "MNIST primal boundary × outcome × modifier matrix",
+        note = "Both RK models and both Turing models are shown; N/A and unsupported cells are never dropped.")
     receipt = TOML.parsefile(_MNIST_LOGISTIC_RECEIPT_PATH)
-    get(receipt, "schema", "") == "mnist-logistic-v1" ||
+    get(receipt, "schema", "") == "mnist-logistic-v2" ||
         error("unexpected MNIST logistic benchmark receipt schema")
     pins = receipt["pins"]
     get(pins, "reactivekernels_dirty", true) == false ||
@@ -1170,8 +1269,11 @@ function render_mnist_logistic_benchmarks()
             boundary = boundary_labels[boundary],
             outcome = outcome_labels[outcome],
             rk_native = _mnist_logistic_measurement(row, "rk_native"),
+            rk_optimized = _mnist_logistic_measurement(row, "rk_optimized"),
+            rk_nonallocating = _mnist_logistic_measurement(row, "rk_nonallocating"),
             manual_julia = _mnist_logistic_measurement(row, "manual_julia"),
-            turing_native = _mnist_logistic_measurement(row, "turing_native")))
+            turing_native = _mnist_logistic_measurement(row, "turing_native"),
+            turing_optimized = _mnist_logistic_measurement(row, "turing_optimized")))
     end
 
     turing_rows = filter(row -> row.turing_native !== missing, rows)
@@ -1182,29 +1284,43 @@ function render_mnist_logistic_benchmarks()
     manual_ratios =
         [row.manual_julia.median_ns / row.rk_native.median_ns for row in rows]
     pointwise_only = length(rows) - length(turing_rows)
+    nonalloc_bytes = maximum(
+        row.rk_nonallocating.median_bytes for row in rows)
     summary = "RK is faster than Turing in $rk_faster_than_turing/" *
-        "$(length(turing_rows)) matched native cells; Turing/RK runtime ranges from " *
+        "$(length(turing_rows)) matched idiomatic cells; Turing/RK runtime ranges from " *
         "$(round(minimum(turing_ratios); digits = 2))× to " *
         "$(round(maximum(turing_ratios); digits = 2))×. Against the handwritten Julia " *
         "control, manual/RK ranges from $(round(minimum(manual_ratios); digits = 2))× " *
         "to $(round(maximum(manual_ratios); digits = 2))× (1× is parity). RK also " *
         "exposes per-observation pointwise log likelihoods in $pointwise_only cells " *
-        "where Turing's single `@addlogprob!` term has no public view."
+        "where Turing's single `@addlogprob!` term has no public view. The " *
+        "optimized columns drop the padded-logits materialization on both sides " *
+        "(RK via the reference-coded `categorical_logit_ref` object, Turing via an " *
+        "implicit-reference log-sum-exp likelihood); the non-allocating column runs " *
+        "the SAME idiomatic RK graph through the optional MutatingFunctions pass at " *
+        "a flat ≤$(nonalloc_bytes)-byte steady-state footprint."
     columns = (
         _column(:boundary, "Starting boundary"),
         _column(:outcome, "Requested outcome"),
         _column(:rk_native, "RK native";
             format = _eight_schools_cell, sort = _eight_schools_sort),
+        _column(:rk_optimized, "RK optimized";
+            format = _eight_schools_cell, sort = _eight_schools_sort),
+        _column(:rk_nonallocating, "RK non-allocating";
+            format = _eight_schools_cell, sort = _eight_schools_sort),
         _column(:manual_julia, "Manual Julia";
             format = _eight_schools_cell, sort = _eight_schools_sort),
         _column(:turing_native, "Turing native";
+            format = _eight_schools_cell, sort = _eight_schools_sort),
+        _column(:turing_optimized, "Turing optimized";
             format = _eight_schools_cell, sort = _eight_schools_sort))
     provenance = "Receipt pin: ReactiveKernels `$(pins["reactivekernels_sha"])`; " *
         "Julia $(pins["julia_version"]); Turing $(pins["turing_version"]); " *
         "DynamicPPL $(pins["dynamicppl_version"]); MLDatasets $(pins["mldatasets_version"]); " *
+        "MutatingFunctions $(pins["mutatingfunctions_version"]) @ `$(pins["mutatingfunctions_rev"])`; " *
         "$(receipt["environment"]["cpu"]). $(protocol["num_observations"]) MNIST images × " *
         "$(protocol["num_features"]) features × $(protocol["num_classes"]) classes. " *
-        "Raw rounds are retained in benchmark/receipts/mnist-logistic-v1.toml."
+        "Raw rounds are retained in benchmark/receipts/mnist-logistic-v2.toml."
 
     Markdown.MD(Any[
         Markdown.Paragraph(Any[summary]),
@@ -1276,6 +1392,11 @@ end
 
 """Render the exact full-data MNIST value-and-gradient benchmark matrix."""
 function render_mnist_logistic_ad_benchmarks()
+    return _render_longform_model_receipt(
+        _MNIST_LOGISTIC_AD_RECEIPT_PATH, "mnist-logistic-ad-v2";
+        id = "mnist-logistic-ad-matrix",
+        title = "MNIST value-and-gradient matrix",
+        note = "Pointwise and multi-active structured cells retain their public-API unsupported reasons.")
     receipt = TOML.parsefile(_MNIST_LOGISTIC_AD_RECEIPT_PATH)
     get(receipt, "schema", "") == "mnist-logistic-ad-v1" ||
         error("unexpected MNIST logistic AD receipt schema")
@@ -1505,6 +1626,7 @@ render_mnist_logistic_baselines() = _render_benchmark_baselines(
     "(extracted from the executed file at docs-build time).",
     "mnist_logistic_comparison_body.jl",
     (("Turing baseline", "turing"),
+     ("Turing optimized baseline", "turing-optimized"),
      ("Handwritten Julia control", "manual")))
 
 """Render the Turing and handwritten baselines the primal Eight Schools benchmark executes."""
@@ -1524,6 +1646,18 @@ render_eval_throughput_baselines() = _render_benchmark_baselines(
     "executed file at docs-build time).",
     "eval_throughput_comparison_body.jl",
     (("Turing baseline", "turing"),))
+
+"""Render the baselines the MNIST AD comparison differentiates."""
+render_mnist_logistic_ad_baselines() = _render_benchmark_baselines(
+    "The AD comparison differentiates the same baseline implementations the " *
+    "primal MNIST benchmark executes (the AD harness includes " *
+    "`mnist_logistic_comparison_body.jl` for the exact definitions), shown " *
+    "verbatim from that file at docs-build time; the AD cells differentiate " *
+    "these definitions with Enzyme through DifferentiationInterface " *
+    "`AutoEnzyme` backends.",
+    "mnist_logistic_comparison_body.jl",
+    (("Turing baseline", "turing"),
+     ("Handwritten Julia control", "manual")))
 
 """Render the baselines the Eight Schools AD comparison differentiates."""
 render_eight_schools_ad_baselines() = _render_benchmark_baselines(
@@ -1588,6 +1722,11 @@ _eight_schools_ad_sort(value, _) =
 
 """Render the exact Eight Schools AD matrix and separated setup evidence."""
 function render_eight_schools_ad_benchmarks()
+    return _render_longform_model_receipt(
+        _EIGHT_SCHOOLS_AD_RECEIPT_PATH, "eight-schools-ad-v2";
+        id = "eight-schools-ad-matrix",
+        title = "Eight Schools value-and-gradient matrix",
+        note = "Every scalar single-active-port cell is measured; other cells keep their exact state.")
     receipt = TOML.parsefile(_EIGHT_SCHOOLS_AD_RECEIPT_PATH)
     get(receipt, "schema", "") == "eight-schools-ad-v1" ||
         error("unexpected Eight Schools AD receipt schema")
@@ -2069,6 +2208,11 @@ end
 
 """Render the exact Eight Schools native-RK/Reactant primal matrix."""
 function render_eight_schools_reactant_benchmark()
+    return _render_longform_model_receipt(
+        _EIGHT_SCHOOLS_REACTANT_RECEIPT_PATH, "eight-schools-reactant-v2";
+        id = "eight-schools-reactant-matrix",
+        title = "Eight Schools Reactant primal matrix",
+        note = "Bound and unbound compiler rows are measured separately against native controls.")
     receipt = TOML.parsefile(_EIGHT_SCHOOLS_REACTANT_RECEIPT_PATH)
     get(receipt, "schema", "") == "eight-schools-reactant-v1" ||
         error("unexpected Eight Schools Reactant benchmark receipt schema")
@@ -2205,6 +2349,11 @@ end
 
 """Render the checked-in Eight Schools Reactant-compiled-AD receipt as sortable data."""
 function render_eight_schools_reactant_ad_benchmark()
+    return _render_longform_model_receipt(
+        _EIGHT_SCHOOLS_REACTANT_AD_RECEIPT_PATH, "eight-schools-reactant-ad-v2";
+        id = "eight-schools-reactant-ad-matrix",
+        title = "Eight Schools Reactant value-and-gradient matrix",
+        note = "Compilation and first calls are excluded; unsupported API shapes remain rows.")
     receipt = TOML.parsefile(_EIGHT_SCHOOLS_REACTANT_AD_RECEIPT_PATH)
     get(receipt, "schema", "") == "eight-schools-reactant-ad-v1" ||
         error("unexpected Eight Schools Reactant-AD benchmark receipt schema")
@@ -2379,7 +2528,7 @@ function render_eight_schools_reactant_ad_benchmark()
 end
 
 const _MNIST_REACTANT_RECEIPT_PATH = joinpath(
-    dirname(@__DIR__), "benchmark", "receipts", "mnist-reactant-v1.toml")
+    dirname(@__DIR__), "benchmark", "receipts", "mnist-reactant-v2.toml")
 const _MNIST_REACTANT_WREN_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts",
     "mnist-reactant-wren-pca40-v1.toml")
@@ -2389,6 +2538,13 @@ function render_mnist_reactant_benchmark(
     receipt_path::AbstractString = _MNIST_REACTANT_RECEIPT_PATH,
 )
     receipt = TOML.parsefile(receipt_path)
+    if get(receipt, "schema", "") == "mnist-reactant-v2"
+        return _render_longform_model_receipt(
+            receipt_path, "mnist-reactant-v2";
+            id = "mnist-reactant-matrix",
+            title = "MNIST Reactant primal matrix",
+            note = "Both model sources, both boundaries, and bound/unbound data modes remain visible.")
+    end
     get(receipt, "schema", "") == "mnist-reactant-v1" ||
         error("unexpected MNIST Reactant benchmark receipt schema")
     pins = receipt["pins"]
@@ -2549,7 +2705,7 @@ render_mnist_reactant_wren_benchmark() =
     render_mnist_reactant_benchmark(_MNIST_REACTANT_WREN_RECEIPT_PATH)
 
 const _MNIST_REACTANT_AD_RECEIPT_PATH = joinpath(
-    dirname(@__DIR__), "benchmark", "receipts", "mnist-reactant-ad-v1.toml")
+    dirname(@__DIR__), "benchmark", "receipts", "mnist-reactant-ad-v2.toml")
 const _MNIST_REACTANT_AD_WREN_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts",
     "mnist-reactant-ad-wren-pca40-v1.toml")
@@ -2559,6 +2715,13 @@ function render_mnist_reactant_ad_benchmark(
     receipt_path::AbstractString = _MNIST_REACTANT_AD_RECEIPT_PATH,
 )
     receipt = TOML.parsefile(receipt_path)
+    if get(receipt, "schema", "") == "mnist-reactant-ad-v2"
+        return _render_longform_model_receipt(
+            receipt_path, "mnist-reactant-ad-v2";
+            id = "mnist-reactant-ad-matrix",
+            title = "MNIST Reactant value-and-gradient matrix",
+            note = "The packed scalar headline is measured for both models and both data modes.")
+    end
     get(receipt, "schema", "") == "mnist-reactant-ad-v1" ||
         error("unexpected MNIST Reactant-AD benchmark receipt schema")
     pins = receipt["pins"]

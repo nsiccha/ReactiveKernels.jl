@@ -41,15 +41,17 @@ slice; it does not select a second model implementation.
 The constrained `parameters` port has **two producers** — this is RK's *multiple
 paths to the same port*. One assignment builds the constrained parameters alone;
 a second builds them together with the log Jacobian, sharing the one transform.
-The planner selects between them per query: a constrain-only query takes the
-parameters-only path (the Jacobian is never computed), while any query that needs
-the unconstrained posterior takes the joint path. No macro is involved — two
-ordinary assignments to the same name declare the two producers.
+The Jacobian also has a standalone producer. The planner therefore takes the
+parameters-only path for a constrain-only query, the joint producer when both
+outputs are requested, and the single-output Jacobian path for a packed posterior
+query. The latter keeps that sampler-facing plan compatible with RK's public
+single-output-recipe nonallocating pass. No macro is involved: ordinary
+assignments declare all three alternatives.
 
 ```text
-                              ┌─ parameters                    (chosen: constrain-only)
-unconstrained ─ split ─ τ ────┤
-                              └─ (parameters, log_jacobian)     (chosen: posterior)
+                              ┌─ parameters                     (constrain-only)
+unconstrained ─ split ─ τ ────┼─ log_jacobian                  (posterior)
+                              └─ (parameters, log_jacobian)     (both requested)
 
 parameters ──► reusable Normal/Cauchy kernels ──► log prior
           ──► reusable Normal kernel ─ plate ─┬─► pointwise log likelihoods
@@ -133,6 +135,16 @@ Main.ReactiveKernelsDocs.execute_ppl_example(
 
 ## Primal capability and log-density performance
 
+The cross-receipt contract has ten RK configurations: ordinary native primal,
+nonallocating native primal, Reactant primal, native value-and-gradient, and
+Reactant value-and-gradient, each with data unbound or fixed at preparation.
+The fixed-data form is the public partial-evaluation path (`bound =
+(; observations, observation_scales)`). The sampler headline is the packed
+unconstrained vector to the full joint, and all ten headline cells must work.
+Nonallocating AD and nonallocating Reactant are deliberately absent because
+those public kernel types do not compose yet; the suite validators reject any
+receipt that silently invents such a surface.
+
 The benchmark below prepares the exact authored graph above from three useful
 starting boundaries and asks for four model outcomes. `Packed unconstrained`
 matches a sampler's linked parameter vector. `Constrained parameters` starts
@@ -147,6 +159,12 @@ interfaces: a fixed-transform `LogDensityFunction` for packed parameters,
 matching public Turing boundary exists; the benchmark does not invent an
 equivalent helper. Setup, graph preparation, parameter linking, and transform
 discovery are outside the timed region.
+
+The centered Turing baseline uses `filldist(Normal(μ, τ), J)` for the school
+effects. That is the same independent-normal model as
+`MvNormal(fill(μ, J), τ^2 * I)`, while avoiding construction of a mean vector
+and dense multivariate-normal machinery; it is the reasonable optimized Turing
+form rather than an intentionally slow comparator.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_eight_schools_primal_benchmarks()
@@ -166,9 +184,9 @@ Reproduce the pinned receipt from a clean detached checkout:
 
 ```sh
 julia --startup-file=no benchmark/eight_schools_primal_comparison.jl \
-  --output=benchmark/receipts/eight-schools-primal-v1.toml
+  --output=benchmark/receipts/eight-schools-primal-v2.toml
 julia --startup-file=no benchmark/receipts/validate_eight_schools_primal.jl \
-  benchmark/receipts/eight-schools-primal-v1.toml
+  benchmark/receipts/eight-schools-primal-v2.toml
 ```
 
 Asking only for constrained parameters selects the parameters-only producer, so

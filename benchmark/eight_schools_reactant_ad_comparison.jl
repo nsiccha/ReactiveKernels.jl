@@ -2,7 +2,7 @@
 
 # Reproducible native-RK-AD versus Reactant-compiled-AD comparison for the exact
 # centered Eight Schools model, reusing the SAME derivative outcome/boundary
-# protocol published by the AD-only receipt (eight-schools-ad-v1.toml). This is
+# protocol published by the AD-only receipt (eight-schools-ad-v2.toml). This is
 # the AD analog of eight_schools_reactant_comparison.jl. The authored model
 # source is imported from ReactiveKernelsPPLExamples; no density, transform, or
 # AD evaluator is ever copied into this benchmark, and the Reactant-compiled

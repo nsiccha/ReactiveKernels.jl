@@ -1347,43 +1347,88 @@ _tensorized_callee_replacement(callee::GlobalRef) =
     nothing
 _tensorized_callee_replacement(callee) = nothing
 
-function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}())
+function _kernel_tensorized_pair_arguments(rhs)
+    rhs isa Expr && rhs.head === :call && length(rhs.args) == 3 || return nothing
+    callee = rhs.args[1]
+    matches = callee === :_kernel_tensorized_pair ||
+        (callee isa GlobalRef && callee.mod === (@__MODULE__) &&
+         callee.name === :_kernel_tensorized_pair) ||
+        (callee isa Expr && callee.head === :. && length(callee.args) == 2 &&
+         callee.args[1] === :ReactiveKernels &&
+         (callee.args[2] === :_kernel_tensorized_pair ||
+          callee.args[2] === QuoteNode(:_kernel_tensorized_pair)))
+    matches ? (rhs.args[2], rhs.args[3]) : nothing
+end
+
+function _kernel_tensorized_callee(callee, known::Set{Symbol}, mod)
+    callee isa Symbol && !(callee in known) && mod isa Module &&
+        isdefined(mod, callee) && return GlobalRef(mod, callee)
+    callee
+end
+
+function _kernel_tensorized_assignment_head(head)
+    head === :(=) && return true
+    head isa Symbol || return false
+    spelling = String(head)
+    endswith(spelling, "=") || return false
+    !(spelling in ("==", "!=", "<=", ">=", "=>"))
+end
+
+function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
+                                mod::Union{Module,Nothing} = nothing)
     ex isa Expr || return ex
     ex.head in (:quote, :inert) && return ex
-    if ex.head === :(=) || ex.head === Symbol(".=") ||
-       (ex.head isa Symbol && _kernel_compound_base_op(ex.head) !== nothing)
-        # Mutation targets are syntax, not values: rewriting `a[i] += rhs` as
-        # `_tensorized_getindex(a, i) += rhs` produces an invalid assignment
-        # location. Preserve the target and tensorize only evaluated RHS terms.
+    if _kernel_tensorized_assignment_head(ex.head) && length(ex.args) == 2
+        # An indexed/property/destructuring assignment target is syntax, not a
+        # value read. Rewriting an l-value such as `calls[:b][]` into
+        # `_tensorized_getindex(...)` produces an invalid assignment location
+        # even when this optional tensorized companion is never selected.
+        # Preserve the authored target exactly and tensorize only the RHS.
         return Expr(ex.head, ex.args[1],
-                    (_kernel_tensorized_rhs(arg, known) for arg in ex.args[2:end])...)
+                    _kernel_tensorized_rhs(ex.args[2], known, mod))
+    elseif ex.head === :ref
+        return Expr(:call, GlobalRef(@__MODULE__, :_tensorized_getindex),
+                    (_kernel_tensorized_rhs(arg, known, mod) for arg in ex.args)...)
+    elseif ex.head === :call && !isempty(ex.args) &&
+           ex.args[1] isa Symbol && _is_broadcast_operator(ex.args[1])
+        operator = Symbol(String(ex.args[1])[2:end])
+        return Expr(:call, GlobalRef(@__MODULE__, :_tensorized_broadcast),
+                    GlobalRef(Base, operator),
+                    (_kernel_tensorized_rhs(arg, known, mod)
+                     for arg in ex.args[2:end])...)
+    elseif ex.head === :. && length(ex.args) == 2 &&
+           ex.args[2] isa Expr && ex.args[2].head === :tuple
+        return Expr(:call, GlobalRef(@__MODULE__, :_tensorized_broadcast),
+                    _kernel_tensorized_callee(ex.args[1], known, mod),
+                    (_kernel_tensorized_rhs(arg, known, mod)
+                     for arg in ex.args[2].args)...)
     elseif ex.head === :if && length(ex.args) == 3
         # `broadcast(ifelse, ...)` is the common scalar/tensor select.  It is
         # still scalar for scalar branches, while a traced scalar predicate is
         # broadcast across array branches (Reactant deliberately has no
         # `ifelse(::TracedBool, ::TracedArray, ::TracedArray)` method).
-        return Expr(:call, GlobalRef(Base, :broadcast),
+        return Expr(:call, GlobalRef(@__MODULE__, :_tensorized_broadcast),
                     GlobalRef(Base, :ifelse),
-                    (_kernel_tensorized_rhs(arg, known) for arg in ex.args)...)
+                    (_kernel_tensorized_rhs(arg, known, mod) for arg in ex.args)...)
     elseif ex.head === :&& && length(ex.args) == 2
-        return Expr(:call, GlobalRef(Base, :broadcast),
+        return Expr(:call, GlobalRef(@__MODULE__, :_tensorized_broadcast),
                     GlobalRef(Base, :ifelse),
-                    _kernel_tensorized_rhs(ex.args[1], known),
-                    _kernel_tensorized_rhs(ex.args[2], known), false)
+                    _kernel_tensorized_rhs(ex.args[1], known, mod),
+                    _kernel_tensorized_rhs(ex.args[2], known, mod), false)
     elseif ex.head === :|| && length(ex.args) == 2
-        return Expr(:call, GlobalRef(Base, :broadcast),
+        return Expr(:call, GlobalRef(@__MODULE__, :_tensorized_broadcast),
                     GlobalRef(Base, :ifelse),
-                    _kernel_tensorized_rhs(ex.args[1], known), true,
-                    _kernel_tensorized_rhs(ex.args[2], known))
-    elseif ex.head === :ref
-        return Expr(:call, GlobalRef(@__MODULE__, :_tensorized_getindex),
-                    (_kernel_tensorized_rhs(arg, known) for arg in ex.args)...)
+                    _kernel_tensorized_rhs(ex.args[1], known, mod), true,
+                    _kernel_tensorized_rhs(ex.args[2], known, mod))
     elseif ex.head === :call && !isempty(ex.args) &&
            (!(ex.args[1] isa Symbol) || !(ex.args[1] in known))
         replacement = _tensorized_callee_replacement(ex.args[1])
-        replacement === nothing || return Expr(:call,
-            GlobalRef(@__MODULE__, replacement),
-            (_kernel_tensorized_rhs(arg, known) for arg in ex.args[2:end])...)
+        callee = replacement === nothing ?
+            _kernel_tensorized_callee(ex.args[1], known, mod) :
+            GlobalRef(@__MODULE__, replacement)
+        return Expr(:call, callee,
+            (_kernel_tensorized_rhs(arg, known, mod)
+             for arg in ex.args[2:end])...)
     elseif ex.head in (:vcat, :hcat) &&
            !any(arg -> arg isa Expr && arg.head === :row, ex.args)
         # `[a; b]` / `[a b]` concatenation syntax; `:row`-bearing forms are
@@ -1391,15 +1436,34 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}())
         return Expr(:call,
             GlobalRef(@__MODULE__, ex.head === :vcat ?
                 :_tensorized_vcat : :_tensorized_hcat),
-            (_kernel_tensorized_rhs(arg, known) for arg in ex.args)...)
+            (_kernel_tensorized_rhs(arg, known, mod) for arg in ex.args)...)
+    elseif ex.head === :call && !isempty(ex.args)
+        return Expr(:call,
+            _kernel_tensorized_callee(ex.args[1], known, mod),
+            (_kernel_tensorized_rhs(arg, known, mod)
+             for arg in ex.args[2:end])...)
     end
-    Expr(ex.head, (_kernel_tensorized_rhs(arg, known) for arg in ex.args)...)
+    Expr(ex.head,
+         (_kernel_tensorized_rhs(arg, known, mod) for arg in ex.args)...)
 end
 
 function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
                            tensorize::Bool = true,
                            mod::Union{Module,Nothing} = nothing,
                            nested_specs = Dict{Symbol,Any}())
+    explicit_pair = _kernel_tensorized_pair_arguments(rhs)
+    if explicit_pair !== nothing
+        tensorize || throw(ArgumentError(
+            "explicit tensorized recipe bodies are incompatible with effectful recipes"))
+        native_rhs, tensorized_rhs = explicit_pair
+        deftoken = gensym(:rk_srcop)
+        return Expr(:call, GlobalRef(@__MODULE__, :_KernelSourceOp),
+            Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
+            Expr(:call, GlobalRef(Base, :Val), QuoteNode(:fused)),
+            Expr(:->, Expr(:tuple, deps...), native_rhs),
+            Expr(:->, Expr(:tuple, deps...),
+                 _kernel_tensorized_rhs(tensorized_rhs, known, mod)))
+    end
     form = :fused
     if rhs isa Expr && rhs.head === :call && !isempty(rhs.args)
         callee = rhs.args[1]
@@ -1636,7 +1700,15 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                 register!(name, type_expr)
                 push!(outputs, (name, type_expr))
             end
-            plate_expr = _kernel_authored_plate_expr(rhs, mod)
+            explicit_pair = _kernel_tensorized_pair_arguments(rhs)
+            native_rhs = explicit_pair === nothing ? rhs : explicit_pair[1]
+            plate_expr = _kernel_authored_plate_expr(native_rhs, mod)
+            if plate_expr !== nothing && explicit_pair !== nothing
+                plate_expr = (;
+                    plate_expr...,
+                    explicit_tensorized_rhs = explicit_pair[2],
+                )
+            end
             if plate_expr !== nothing
                 length(outputs) == 1 || throw(ArgumentError(
                     "an authored plate produces exactly one named pointwise port"))
@@ -1784,9 +1856,16 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         end
         rhs = _kernel_hygienic_catches(authored_rhs, known)
         deps = plate_expr === nothing ? _kernel_free_ports(rhs, known) :
-               plate_expr.arguments
+               collect(plate_expr.arguments)
         deps = plate_expr === nothing ? _kernel_nested_endpoint_deps(
             rhs, deps, known, mod, nested_specs) : deps
+        if plate_expr !== nothing &&
+           hasproperty(plate_expr, :explicit_tensorized_rhs)
+            for name in _kernel_free_ports(
+                    plate_expr.explicit_tensorized_rhs, known)
+                name in deps || push!(deps, name)
+            end
+        end
         all(name -> name in known, deps) || throw(ArgumentError(
             "authored plate arguments must be declared graph ports"))
         union!(consumed_names, deps)
@@ -1798,12 +1877,30 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         cost = get(metadata, :cost, 1.0)
         cse_key = get(metadata, :cse_key, nothing)
         effectful = get(metadata, :effectful, false)
-        op = plate_expr === nothing ? _kernel_operation(
-            rhs, deps, known; tensorize = !effectful, mod = mod,
-            nested_specs = nested_specs) : plate_expr.operation
+        op = if plate_expr === nothing
+            _kernel_operation(
+                rhs, deps, known; tensorize = !effectful, mod = mod,
+                nested_specs = nested_specs)
+        elseif hasproperty(plate_expr, :explicit_tensorized_rhs)
+            effectful && throw(ArgumentError(
+                "explicit tensorized recipe bodies are incompatible with effectful recipes"))
+            tensorized_body = _kernel_tensorized_rhs(
+                plate_expr.explicit_tensorized_rhs, known, mod)
+            Expr(:call, GlobalRef(@__MODULE__, :_KernelTensorizedOp),
+                plate_expr.operation,
+                Expr(:call, GlobalRef(Base, :Val),
+                     length(plate_expr.arguments)),
+                Expr(:->, Expr(:tuple, deps...),
+                    tensorized_body),
+                QuoteNode(tensorized_body))
+        else
+            plate_expr.operation
+        end
+        source_rhs = something(
+            _kernel_tensorized_pair_arguments(rhs), (rhs, rhs))[1]
         push!(body, :($add_ref($graph_var, $dep_values, $out_values,
                                $op, $cost, $cse_key, $effectful,
-                               $(QuoteNode(rhs)))))
+                               $(QuoteNode(source_rhs)))))
     end
     if !saw_return
         for name in produced_names

@@ -22,8 +22,11 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
               prediction_innovations::Vector{Float64}) = begin
     # Split the unconstrained vector into (μ, log_τ, θ). The view keeps the
     # generated evaluator from allocating a second effects vector.
-    μ::Float64 = unconstrained[1]
-    log_τ::Float64 = unconstrained[2]
+    # One-element reductions retain the ordinary packed-vector boundary while
+    # avoiding scalar indexing when the same prepared kernel is traced as a
+    # Reactant tensor program. Native Julia specializes these constant slices.
+    μ::Float64 = sum(view(unconstrained, 1:1))
+    log_τ::Float64 = sum(view(unconstrained, 2:2))
     θ::AbstractVector{Float64} =
         view(unconstrained, 3:length(unconstrained))
 
@@ -33,12 +36,18 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
     log_τ::Float64 = log(τ)
     τ::Float64 = exp(log_τ)
 
+    # The Jacobian is also available alone. That single-output path lets scalar
+    # packed-density queries use the public nonallocating preparation pass,
+    # whose recipes are deliberately single-output. Asking for BOTH parameters
+    # and the Jacobian can still select the joint producer below.
+    log_jacobian::Float64 = log_τ
+
     # Two producers for the SAME `parameters` port — RK's "multiple paths to one
     # port". The first builds the constrained parameters (a plain NamedTuple)
     # alone; the second builds them together with the log Jacobian
     # log|dτ/dlog_τ| = log_τ, sharing the one transform. The planner takes the
-    # first for a constrain-only query and the second whenever the Jacobian —
-    # hence the unconstrained posterior — is wanted.
+    # first for a constrain-only query and the joint producer when both outputs
+    # are requested together.
     parameters = (; μ, τ, θ)
     (parameters, log_jacobian::Float64) = ((; μ, τ, θ), log_τ)
 

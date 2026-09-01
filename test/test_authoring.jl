@@ -184,6 +184,17 @@ end
         @test Tuple(v.name for v in outputs(compact_assignment)) == (:compact_out,)
         @test @inferred(prepare(compact_assignment)(2)) == 3
 
+        # The optional tensorized companion must preserve mutation l-values.
+        # Rewriting the indexed target itself into a getindex call makes the
+        # generated closure syntactically invalid during package precompile.
+        calls = Dict(:out => Ref(0))
+        @kernel indexed_counter(x::Float64) = begin
+            out::Float64 = (calls[:out][] += 1; x + 1)
+        end
+        indexed_counter_kernel = prepare(indexed_counter)
+        @test indexed_counter_kernel(2.0) == 3.0
+        @test calls[:out][] == 1
+
         @test_throws ArgumentError macroexpand(@__MODULE__, quote
             @kernel same_name(same_name) = same_name
         end)

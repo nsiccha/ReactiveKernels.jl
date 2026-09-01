@@ -26,6 +26,12 @@ function _run_pinned_comparison()
             Pkg.PackageSpec(name = "NNlib", version = v"0.9.45"),
             Pkg.PackageSpec(name = "MLDatasets", version = v"0.7.21"),
         ])
+        # The non-allocating RK column needs the optional MutatingFunctions
+        # extension, at the same reviewed pin the integration suite uses
+        # (test/run_nonallocating_integration.jl).
+        Pkg.add(Pkg.PackageSpec(
+            url = "https://github.com/nsiccha/MutatingFunctions.jl",
+            rev = "b353559ef3e391ae2e2d98256b6967903fdfa410"))
         Pkg.develop([
             Pkg.PackageSpec(path = root),
             Pkg.PackageSpec(path = joinpath(

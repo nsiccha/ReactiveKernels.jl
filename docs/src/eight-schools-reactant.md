@@ -11,7 +11,7 @@ This page measures Reactant on the exact executable model documented on the
 introduce a Reactant-only mathematical path.
 
 The comparison mirrors the complete three-by-four capability matrix in the
-[native primal receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/eight-schools-primal-v1.toml).
+[native primal receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/eight-schools-primal-v2.toml).
 Its input boundaries are the packed unconstrained vector,
 the constrained parameter `NamedTuple`, and the minimal likelihood boundary
 (`θ`, observations, scales). Its requested outputs are the joint density,
@@ -19,11 +19,11 @@ prior, summed likelihood, and pointwise likelihood. Two minimal-boundary cells
 are mathematically undefined because the prior parameters are absent. Every
 other cell is evaluated natively and attempted through Reactant.
 
-Unsupported compiler cells stay in the table with their actual diagnostic.
-They are not silently omitted, replaced with a different HAVE boundary, or
-timed through host fallback. That distinction matters: the table describes
-which views of this one graph compile today as well as how the compiled views
-perform.
+Every mathematically defined primal cell compiles in both data modes. The two
+minimal-boundary joint/prior cells remain unsupported by definition, and a
+bound-data prior is N/A because its backward slice has no data ports. Those
+states stay in the table rather than being omitted or replaced with a different
+HAVE boundary.
 
 ## Primal performance and support
 
@@ -31,12 +31,11 @@ perform.
 Main.ReactiveKernelsDocs.render_eight_schools_reactant_benchmark()
 ```
 
-The first table contains steady-state synchronous call time only. Host-to-device
+The table contains steady-state synchronous call time only. Host-to-device
 conversion, kernel preparation, Reactant compilation, the first synchronous
-call, and result readback are outside that timing. The second table and setup
-summary report those costs separately, including failed compile attempts. This
-keeps a small CPU kernel's fixed compiler/runtime costs visible without mixing
-them into repeated-call performance.
+call, and result readback are outside that timing and remain recorded in the
+receipt. This keeps a small CPU kernel's fixed compiler/runtime costs visible
+without mixing them into repeated-call performance.
 
 The section above times primal densities only — no gradients, and nothing about
 sampler throughput, adaptation, draws, ESS, accelerators, or
@@ -56,21 +55,20 @@ first-class RK verb `compile_ad_value_and_gradient` (the AD companion of the
 primal `@compile` path) — no gradient is hand-rolled — and reuses the exact
 differentiable outcome/boundary protocol published on the
 [automatic-differentiation page](automatic-differentiation.md)
-([`eight-schools-ad-v1`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/eight-schools-ad-v1.toml)).
-The native side therefore measures seven scalar value-and-gradient cells and
-two fixed-cotangent pointwise value-and-pullback cells, including the supported
-constrained-parameter `NamedTuple` gradients. The constrained-parameter ×
-pointwise cross-product and the undefined minimal joint/prior remain unsupported
-with the same reasons as the native AD page.
+([`eight-schools-ad-v2`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/eight-schools-ad-v2.toml)).
+Native RK supports scalar gradients for packed, constrained-`NamedTuple`, and
+minimal boundaries, plus packed/minimal pointwise VJPs. The compiled public
+surface is deliberately narrower: it exposes scalar value-and-gradient for one
+array active port, but no compiled reverse-pullback verb and no structured
+active-argument/result ABI.
 
-The public Reactant-compiled surface remains deliberately narrower. This receipt
-uses `compile_ad_value_and_gradient` only for array-backed scalar gradients; it
-does not claim a compiled pullback verb or compiled structured-active argument
-contract. Packed joint and prior still retain their real primal compiler
-diagnostics, while every compiled likelihood cell is checked against its native
-RK reverse pass. As with the primal table, AD preparation, host transfers,
-gradient compilation, the first synchronous call, and readback are excluded
-from the steady-state timing and reported separately.
+Every declared scalar array-active AD cell now compiles through Reactant in both
+unbound and partially evaluated data modes, including the packed full joint.
+Pointwise VJPs and constrained structured gradients remain explicit compiled-API
+unsupported cells even though their native counterparts are public and measured;
+the undefined minimal joint/prior remain unsupported by definition. As with the
+primal table, AD preparation, host transfers, gradient compilation, the first
+synchronous call, and readback are excluded from steady-state timing.
 
 For the exact model graph see the [Eight Schools kernel page](eight-schools.md);
 for native-AD (non-Reactant) timing see the
@@ -85,9 +83,9 @@ pin and source blob are immutable. From a sibling directory:
 git -C ReactiveKernels.jl worktree add --detach ReactiveKernels-eight-schools-receipt HEAD
 cd ReactiveKernels-eight-schools-receipt
 julia --startup-file=no benchmark/eight_schools_reactant_comparison.jl \
-  --output=benchmark/receipts/eight-schools-reactant-v1.toml
+  --output=benchmark/receipts/eight-schools-reactant-v2.toml
 julia --startup-file=no benchmark/receipts/validate_eight_schools_reactant.jl \
-  benchmark/receipts/eight-schools-reactant-v1.toml
+  benchmark/receipts/eight-schools-reactant-v2.toml
 ```
 
 The script provisions a fresh environment with Reactant 0.2.278, develops the
@@ -103,9 +101,9 @@ into the pinned environment:
 
 ```sh
 julia --startup-file=no benchmark/eight_schools_reactant_ad_comparison.jl \
-  --output=benchmark/receipts/eight-schools-reactant-ad-v1.toml
+  --output=benchmark/receipts/eight-schools-reactant-ad-v2.toml
 julia --startup-file=no benchmark/receipts/validate_eight_schools_reactant_ad.jl \
-  benchmark/receipts/eight-schools-reactant-ad-v1.toml
+  benchmark/receipts/eight-schools-reactant-ad-v2.toml
 ```
 
 Its quick-smoke knobs are `RK_EIGHT_SCHOOLS_REACTANT_AD_ROUNDS` and

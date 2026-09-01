@@ -82,6 +82,21 @@ _trace(x) = Reactant.to_rarray(x)
         value, both_gradient = compiled_both(traced_q)
         @test Float64(value) ≈ vref
         @test Array(both_gradient) ≈ gref
+
+        # The benchmark-facing compiler ABI exposes the same bound array as an
+        # explicitly transferred inactive operand, avoiding a compiler literal
+        # while retaining the q-only public PreparedADKernel above.
+        _, bound_arrays =
+            ReactiveKernels._externalize_bound_arrays(prepared.kernel)
+        traced_bound = map(_trace, bound_arrays)
+        compiled_externalized =
+            ReactiveKernels._reactant_compile_ad_externalized(
+                Val(:value_and_gradient), prepared,
+                (traced_q,), traced_bound; sync = true)
+        external_value, external_gradient =
+            compiled_externalized(traced_q, traced_bound...)
+        @test Float64(external_value) ≈ vref
+        @test Array(external_gradient) ≈ gref
     end
 
     @testset "Eight Schools supported boundaries match native reverse pass" begin
@@ -92,6 +107,10 @@ _trace(x) = Reactant.to_rarray(x)
         unconstrained = [1.5, log(2.0), theta...]
 
         boundaries = (
+            (name = "packed_unconstrained/joint",
+             have = (:unconstrained, :observations, :observation_scales),
+             want = :posterior, active = :unconstrained,
+             args = (unconstrained, observations, observation_scales)),
             (name = "minimal_likelihood/likelihood",
              have = (:θ, :observations, :observation_scales),
              want = :likelihood, active = :θ,
@@ -127,25 +146,5 @@ _trace(x) = Reactant.to_rarray(x)
             @test Float64(compiled_value) ≈ value
             @test Array(compiled_gradient) ≈ reference
         end
-    end
-
-    @testset "primal-uncompilable boundary propagates the @compile error" begin
-        # packed_unconstrained/{joint,prior} fail primal Reactant compilation with
-        # "Scalar indexing is disallowed." (see the eight-schools-reactant receipt);
-        # the gradient must surface that error unchanged rather than degrade or hide.
-        model = build_eight_schools_graph()
-        observations = Float64.(EIGHT_SCHOOLS_Y)
-        observation_scales = Float64.(EIGHT_SCHOOLS_SIGMA)
-        theta = 0.25 .* collect(1.0:8.0)
-        unconstrained = [1.5, log(2.0), theta...]
-
-        kernel = prepare(model;
-            have = (:unconstrained, :observations, :observation_scales),
-            want = :posterior)
-        prepared = prepare_ad(kernel, AD_REACTANT_BACKEND,
-            unconstrained, observations, observation_scales;
-            active = :unconstrained)
-        traced = map(_trace, (unconstrained, observations, observation_scales))
-        @test_throws Exception compile_ad_gradient(prepared, traced...)
     end
 end

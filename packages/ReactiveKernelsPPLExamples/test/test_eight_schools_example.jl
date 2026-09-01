@@ -44,16 +44,16 @@ end
     @test artifact.likelihood_extraction.plan.graph === model.graph
 
     @testset "one named model graph, with only the intentional transform alternative" begin
-        # Every model QOI has exactly one producer; constrained parameters alone
-        # intentionally have the two documented constrain-only vs
-        # constrain-plus-Jacobian producers.
+        # Parameters and the Jacobian intentionally have standalone producers
+        # plus the joint parameters-and-Jacobian producer. Every other model
+        # QOI has exactly one producer.
         producer_count(value) = count(model.graph.recipes) do recipe
             any(output -> canon_id(model.graph, output.id) ==
                           canon_id(model.graph, value.id), recipe.outputs)
         end
         @test producer_count(model.parameters) == 2
-        for value in (model.log_jacobian, model.effects_pointwise,
-                      model.effects_prior, model.prior,
+        @test producer_count(model.log_jacobian) == 2
+        for value in (model.effects_pointwise, model.effects_prior, model.prior,
                       model.unconstrained_prior, model.likelihood,
                       model.pointwise, model.constrained_logdensity,
                       model.posterior, model.new_group)
@@ -116,6 +116,15 @@ end
         parameters2, log_jacobian = with_jacobian(q)
         @test parameters2 == parameters
         @test log_jacobian == q[2]
+
+        # The packed posterior selects the standalone Jacobian path, so every
+        # recipe is single-output and the optional nonallocating pass can
+        # prepare the sampler-facing full-joint boundary.
+        posterior_plan = plan(model.graph;
+            have = (model.unconstrained, model.observations,
+                    model.observation_scales),
+            want = (model.posterior,))
+        @test all(length(recipe.outputs) == 1 for recipe in posterior_plan.recipes)
     end
 
     @testset "posterior decomposition; likelihood is the summed pointwise density" begin
