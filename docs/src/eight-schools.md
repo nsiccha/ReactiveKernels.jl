@@ -156,6 +156,12 @@ Each cell reports the median of ten independent BenchmarkTools minimum-time
 rounds together with steady-state allocation bytes and counts. Every supported
 cell must agree numerically with the handwritten control before it is timed.
 
+### Baseline implementations
+
+```@eval
+Main.ReactiveKernelsDocs.render_eight_schools_primal_baselines()
+```
+
 Reproduce the pinned receipt from a clean detached checkout:
 
 ```sh

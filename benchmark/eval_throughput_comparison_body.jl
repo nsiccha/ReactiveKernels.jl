@@ -66,12 +66,14 @@ end
 _rk_primal() = prepare(normal_model; have = (:x, :μ, :logσ), want = :logdensity)
 _rk_gq() = prepare(normal_model; have = (:x, :μ, :logσ), want = :pointwise)
 
+# DOCS-BASELINE-BEGIN: turing
 # The same model in Turing; its `return` is the generated-quantity vector so
 # DynamicPPL.generated_quantities measures the comparable computation.
 Turing.@model function turing_model(μ, logσ, n)
     x ~ MvNormal(fill(μ, n), exp(logσ)^2 * I)
     return -0.5 .* ((x .- μ) ./ exp(logσ)) .^ 2 .- (logσ + 0.5 * log(2π))
 end
+# DOCS-BASELINE-END: turing
 
 # Reactant differentiates x (active); mu and log-sigma are Const. Wrapping the
 # Enzyme.gradient call lets @compile return a plain callable.

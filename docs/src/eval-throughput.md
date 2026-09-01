@@ -48,6 +48,12 @@ omitted.
 Main.ReactiveKernelsDocs.eval_throughput_chart()
 ```
 
+## Baseline implementations
+
+```@eval
+Main.ReactiveKernelsDocs.render_eval_throughput_baselines()
+```
+
 ## Avoiding the Reactant invocation cost
 
 The fixed cost cannot be removed from an isolated compiled call without changing
