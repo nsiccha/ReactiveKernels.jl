@@ -1218,18 +1218,27 @@ function _kernel_authored_plate_expr(rhs, mod)
         "$(length(formals)) parameter(s)"))
     arguments = Symbol[]
     atomic = Int[]
+    materialized_arguments = Tuple{Symbol,Any}[]
     for (index, argument) in enumerate(authored_arguments)
         if argument isa Symbol
             push!(arguments, argument)
         elseif argument isa Expr && argument.head === :call &&
-               length(argument.args) == 2 && argument.args[2] isa Symbol &&
+               length(argument.args) == 2 &&
                _kernel_resolve_binding(mod, argument.args[1]) === Ref
-            push!(arguments, argument.args[2])
+            value = argument.args[2]
+            name = if value isa Symbol
+                value
+            else
+                generated = gensym(:plate_argument)
+                push!(materialized_arguments, (generated, value))
+                generated
+            end
+            push!(arguments, name)
             push!(atomic, index)
         else
-            throw(ArgumentError(
-                "plate arguments must be named graph ports or Ref(port) for an " *
-                "array-valued atom; assign other expressions before plating"))
+            generated = gensym(:plate_argument)
+            push!(materialized_arguments, (generated, argument))
+            push!(arguments, generated)
         end
     end
     length(unique(formals)) == length(formals) || throw(ArgumentError(
@@ -1272,7 +1281,8 @@ function _kernel_authored_plate_expr(rhs, mod)
     operation = Expr(:call, GlobalRef(@__MODULE__, :_kernel_authored_plate),
                      scalar_spec,
                      Expr(:call, GlobalRef(Base, :Val), QuoteNode(Tuple(atomic))))
-    (; arguments, operation, inferred, atomic = Tuple(atomic))
+    (; arguments, operation, inferred, atomic = Tuple(atomic),
+       materialized_arguments)
 end
 
 function _kernel_authored_plate(spec::KernelSpec, ::Val{A}) where {A}
@@ -1557,6 +1567,17 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
             if plate_expr !== nothing
                 length(outputs) == 1 || throw(ArgumentError(
                     "an authored plate produces exactly one named pointwise port"))
+                # A derived iterable is ordinary graph work outside the plate.
+                # Materialize it as a hygienic named recipe, then feed that port
+                # through the same broadcast/Ref boundary as explicit authoring.
+                # This is source sugar for `columns = eachcol(matrix); plate(columns)`;
+                # the native/tensorized plate lowerers still own the sole traversal.
+                for (name, expression) in plate_expr.materialized_arguments
+                    register!(name, nothing)
+                    push!(entries,
+                          (:recipe, Tuple{Symbol,Any}[(name, nothing)], expression,
+                           Dict{Symbol,Any}(), nothing))
+                end
                 if outputs[1][2] === nothing && plate_expr.inferred !== nothing
                     push!(annotations[outputs[1][1]],
                           :(Array{$(plate_expr.inferred)}))

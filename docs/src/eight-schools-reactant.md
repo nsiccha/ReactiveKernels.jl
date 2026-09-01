@@ -1,4 +1,4 @@
-# Eight Schools primal kernels through Reactant
+# Eight Schools kernels through Reactant
 
 ```@eval
 Main.ReactiveKernelsDocs.render_result_assets()
@@ -38,11 +38,42 @@ summary report those costs separately, including failed compile attempts. This
 keeps a small CPU kernel's fixed compiler/runtime costs visible without mixing
 them into repeated-call performance.
 
-This page is primal-only. It does not time gradients or claim anything about
+The section above times primal densities only — no gradients, and nothing about
 sampler throughput, adaptation, draws, ESS, accelerators, or
-time-to-effective-sample. The separate
-[automatic-differentiation page](automatic-differentiation.md) owns AD
-comparisons and their backend contract.
+time-to-effective-sample. The Reactant-compiled gradient column follows below;
+native AD (RK vs Turing vs manual, no Reactant) lives on the separate
+[automatic-differentiation page](automatic-differentiation.md), whose derivative
+matrix this page reuses exactly.
+
+## Reactant-compiled automatic differentiation
+
+```@eval
+Main.ReactiveKernelsDocs.render_eight_schools_reactant_ad_benchmark()
+```
+
+This section is the AD analog of the primal table above. It consumes the
+first-class RK verb `compile_ad_value_and_gradient` (the AD companion of the
+primal `@compile` path) — no gradient is hand-rolled — and reuses the exact
+differentiable outcome/boundary protocol published on the
+[automatic-differentiation page](automatic-differentiation.md)
+([`eight-schools-ad-v1`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/eight-schools-ad-v1.toml)):
+the value and gradient of each scalar output with respect to a single active
+port (the packed unconstrained vector, or `θ`). Non-scalar `pointwise` outputs,
+the constrained parameter `NamedTuple`, and the undefined minimal joint/prior
+stay unsupported, exactly as on the AD page.
+
+A Reactant-compiled gradient exists only where the primal kernel itself compiles
+through Reactant, so the compiled cells are a subset of the native-AD cells: the
+packed joint and prior — which fail the primal Reactant path with "Scalar
+indexing is disallowed." — keep native AD but no Reactant gradient. Every
+compiled cell matches the native RK reverse pass bit-for-bit (gradient and value
+max-abs-error 0). As with the primal table, AD preparation, host transfers,
+gradient compilation, the first synchronous call, and readback are excluded from
+the steady-state timing and reported separately.
+
+For the exact model graph see the [Eight Schools kernel page](eight-schools.md);
+for native-AD (non-Reactant) timing see the
+[automatic-differentiation page](automatic-differentiation.md).
 
 ## Reproduce
 
@@ -64,3 +95,17 @@ and package precompilation separately. For a quick non-publication smoke run,
 set `RK_EIGHT_SCHOOLS_REACTANT_ROUNDS=2` and
 `RK_EIGHT_SCHOOLS_REACTANT_TARGET_SECONDS=0.002`; the checked-in receipt keeps
 the publication protocol of at least 20 rounds.
+
+The Reactant-compiled-AD receipt is generated the same way from the same clean
+detached candidate, and additionally resolves Enzyme and DifferentiationInterface
+into the pinned environment:
+
+```sh
+julia --startup-file=no benchmark/eight_schools_reactant_ad_comparison.jl \
+  --output=benchmark/receipts/eight-schools-reactant-ad-v1.toml
+julia --startup-file=no benchmark/receipts/validate_eight_schools_reactant_ad.jl \
+  benchmark/receipts/eight-schools-reactant-ad-v1.toml
+```
+
+Its quick-smoke knobs are `RK_EIGHT_SCHOOLS_REACTANT_AD_ROUNDS` and
+`RK_EIGHT_SCHOOLS_REACTANT_AD_TARGET_SECONDS`.
