@@ -65,20 +65,21 @@ kernel specification.
 
 ```@example automatic_differentiation
 bound_prepared = prepare_ad(
-    objective, backend, parameters;
+    objective, backend, parameters, 1.25, 0.0;
     active = :q, want = :density,
     bound = (; data),
 )
 
-bound_gradient = ad_gradient(bound_prepared, parameters)
+bound_gradient = ad_gradient(bound_prepared, parameters, 1.25, 0.0)
 @assert bound_gradient ≈ gradient
 
 (; bound_gradient)
 ```
 
 `active` and the positional preparation exemplars refer to the remaining
-ports. Authored keyword arguments do not apply to a bound preparation, because
-their values have either been fixed or removed with the hoisted prefix.
+ports. Authored signature defaults and keyword arguments do not apply to a
+bound preparation; the example therefore supplies the remaining `scale` and
+`offset` values positionally.
 
 ## Accepted boundary
 
