@@ -5583,6 +5583,12 @@ function _sm_functional_machine_rhs(x, syms, plan::_KernelPlan, fields,
             OW, SH, formals, locals, false, field_regs, methods_by_id, stack,
             active, rng_effect)
             for arg in x.elts)...)
+    elseif x isa _NamedTuple
+        values = Any[_sm_functional_machine_rhs(
+            arg, syms, plan, fields, OW, SH, formals, locals, false,
+            field_regs, methods_by_id, stack, active, rng_effect)
+            for arg in x.vals]
+        :(NamedTuple{$(x.names)}(($(values...),)))
     elseif x isa _Getfield
         base = _sm_functional_machine_rhs(x.base, syms, plan, fields,
             OW, SH, formals, locals, false, field_regs, methods_by_id, stack,
@@ -6449,6 +6455,7 @@ function _functional_state_machine_method(
 
         children = expression isa _RegisteredCall ? expression.args :
             expression isa _TupleExpr ? expression.elts :
+            expression isa _NamedTuple ? expression.vals :
             expression isa _CallExpr ?
                 (expression.pos..., (pair.second for pair in expression.kw)...) :
             expression isa _FieldCall ?
