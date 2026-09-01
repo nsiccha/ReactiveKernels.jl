@@ -305,7 +305,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "eight-schools-reactant.md" => 4,
         "eval-throughput.md" => 1,
         "mnist-logistic.md" => 1,
-        "mnist-reactant.md" => 2,
+        "mnist-reactant.md" => 4,
         "nuts.md" => 3,
     )
     expected_aov_panels = Dict(
@@ -340,7 +340,9 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "mnist-reactant.md" => (
             "Native RK / Reactant steady-state matrix",
             "Setup, compilation, and first-call costs",
+            "Native RK AD / Reactant-compiled AD steady-state matrix",
             "benchmark/receipts/mnist-reactant-v1.toml",
+            "benchmark/receipts/mnist-reactant-ad-v1.toml",
             "packages/ReactiveKernelsPPLExamples/src/mnist_logistic.jl",
         ),
         "nuts.md" => (
