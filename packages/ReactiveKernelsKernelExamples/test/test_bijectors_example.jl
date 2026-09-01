@@ -19,7 +19,7 @@ end
         index = read(joinpath(root, "docs", "src", "index.md"), String)
 
         @test occursin(
-            "\"Bijectors and constrained parameters\" => \"bijectors.md\"",
+            "\"Bijectors\" => \"bijectors.md\"",
             make,
         )
         @test occursin("BIJECTOR_DOCS_SOURCE", page)
