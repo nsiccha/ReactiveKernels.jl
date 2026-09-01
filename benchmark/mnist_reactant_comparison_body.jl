@@ -14,6 +14,8 @@ using ReactiveKernelsPPLExamples.MNISTLogisticExample:
     MNIST_LOGISTIC_SOURCE, NUM_CLASSES, build_mnist_logistic_graph
 import MLDatasets
 
+include(joinpath(@__DIR__, "_mnist_dataset_profiles.jl"))
+
 const DEFAULT_MNIST_REACTANT_ROUNDS = 10
 # The published receipt fits the full MNIST training split; RK_MNIST_REACTANT_N
 # overrides it for a quicker local reproduction.
@@ -41,8 +43,8 @@ end
 
 _rounds() = parse(Int, get(
     ENV, "RK_MNIST_REACTANT_ROUNDS", string(DEFAULT_MNIST_REACTANT_ROUNDS)))
-_observations() = parse(Int, get(
-    ENV, "RK_MNIST_REACTANT_N", string(DEFAULT_MNIST_REACTANT_N)))
+_observations(profile) = parse(Int, get(
+    ENV, "RK_MNIST_REACTANT_N", string(_mnist_default_observations(profile))))
 
 _comparable(outcome, value) = outcome == "pointwise" ?
     collect(Float64, Array(value)) : Float64(value)
@@ -88,17 +90,6 @@ _compile_call(kernel, args::NTuple{5,Any}) =
 function _diagnostic(err)
     line = first(split(sprint(showerror, err), '\n'))
     length(line) <= 800 ? line : first(line, 797) * "..."
-end
-
-function _load_mnist(n)
-    ENV["DATADEPS_ALWAYS_ACCEPT"] = "true"
-    train = MLDatasets.MNIST(split = :train)
-    total = size(train.features, 3)
-    n <= total || error("requested $n MNIST images but only $total are available")
-    pixels = reshape(train.features[:, :, 1:n], 28 * 28, n)   # 784×n Float32 in [0,1]
-    X = Matrix{Float64}(transpose(pixels))                    # n×784
-    y = Int.(train.targets[1:n]) .+ 1                         # one-based classes
-    X, y
 end
 
 function _definitions(model, unconstrained, W, b, X, y)
@@ -177,10 +168,16 @@ end
 function run_comparison()
     repo = normpath(joinpath(@__DIR__, ".."))
     rounds = _rounds()
-    n = _observations()
+    dataset_profile = _mnist_dataset_profile()
+    n = _observations(dataset_profile)
     rounds >= 1 || error("round count must be positive")
 
-    data_load_seconds = @elapsed ((X, y) = _load_mnist(n))
+    dataset_metadata = nothing
+    data_load_seconds = @elapsed begin
+        X, y, dataset_metadata = _load_mnist_dataset(
+            dataset_profile, n; wren_reference = _mnist_wren_reference_path())
+        GC.gc()
+    end
     features = size(X, 2)
     nonreference = NUM_CLASSES - 1
 
@@ -298,11 +295,8 @@ function run_comparison()
             "data_load_seconds" => data_load_seconds,
             "kernel_preparation_seconds" => preparation_seconds,
         ),
-        "protocol" => Dict(
+        "protocol" => merge(Dict(
             "model" => "multinomial-logistic MNIST classifier",
-            "data" => "MLDatasets MNIST train split, first N images",
-            "num_observations" => n,
-            "num_features" => features,
             "num_classes" => NUM_CLASSES,
             "source_reused" => true,
             "matrix_source" => "benchmark/receipts/mnist-logistic-v1.toml",
@@ -326,7 +320,7 @@ function run_comparison()
             "generated_predictions_included" => false,
             "parity_rtol" => 1e-9,
             "parity_atol" => 1e-9,
-        ),
+        ), dataset_metadata),
         "measurements" => measurements,
     )
 

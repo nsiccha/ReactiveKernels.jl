@@ -1,0 +1,223 @@
+generated_at = "2026-09-01T16:48:34.252Z"
+schema = "mnist-reactant-ad-v1"
+
+[environment]
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+julia_threads = 1
+os = "Linux"
+reactant_backend = "default CPU"
+
+[[measurements]]
+active_port = "unconstrained"
+ad_preparation_seconds = 0.297781317
+boundary = "packed_unconstrained"
+description = "gradient of the full joint w.r.t. the packed coefficient vector"
+max_abs_error = 6.821210263296962e-13
+max_rel_error = 2.754183022437623e-14
+outcome = "joint"
+reactant_ad_compile_seconds = 32.680497133
+reactant_first_execution_seconds = 0.212186353
+reactant_transfer_seconds = 0.285868226
+rk_native_ad_supported = true
+rk_reactant_ad_supported = true
+value_abs_error = 2.7284841053187847e-12
+value_rel_error = 1.0312671698056687e-15
+
+    [measurements.rk_native_ad]
+    allocs = [25, 25, 25, 25, 25, 25, 25, 25, 25, 25]
+    bytes = [538656, 538656, 538656, 538656, 538656, 538656, 538656, 538656, 538656, 538656]
+    median_allocs = 25
+    median_bytes = 538656
+    median_ns = 544151.5
+    min_ns = 536840.0
+    times_ns = [543600.0, 540286.0, 538443.0, 556008.0, 544642.0, 551371.0, 543661.0, 536840.0, 552281.0, 563447.0]
+
+    [measurements.rk_reactant_ad]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [816, 816, 816, 816, 816, 816, 816, 816, 816, 816]
+    median_allocs = 20
+    median_bytes = 816
+    median_ns = 124361.5
+    min_ns = 103934.0
+    times_ns = [120447.0, 128276.0, 136148.0, 137320.0, 133344.0, 108029.0, 117732.0, 103934.0, 131291.0, 119525.0]
+[[measurements]]
+active_port = "unconstrained"
+ad_preparation_seconds = 0.099088078
+boundary = "packed_unconstrained"
+description = "gradient of the standard-normal coefficient log prior"
+max_abs_error = 0.0
+max_rel_error = 0.0
+outcome = "prior"
+reactant_ad_compile_seconds = 2.951361194
+reactant_first_execution_seconds = 0.03078635
+reactant_transfer_seconds = 0.006248483
+rk_native_ad_supported = true
+rk_reactant_ad_supported = true
+value_abs_error = 2.8421709430404007e-13
+value_rel_error = 8.381331642636169e-16
+
+    [measurements.rk_native_ad]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 305.0
+    min_ns = 300.0
+    times_ns = [310.0, 300.0, 310.0, 300.0, 310.0, 310.0, 310.0, 300.0, 300.0, 300.0]
+
+    [measurements.rk_reactant_ad]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [816, 816, 816, 816, 816, 816, 816, 816, 816, 816]
+    median_allocs = 20
+    median_bytes = 816
+    median_ns = 6298.5
+    min_ns = 4176.0
+    times_ns = [9453.0, 5507.0, 4877.0, 4176.0, 9743.0, 4947.0, 4917.0, 7090.0, 10585.0, 10955.0]
+[[measurements]]
+active_port = "unconstrained"
+ad_preparation_seconds = 0.122684495
+boundary = "packed_unconstrained"
+description = "gradient of the summed softmax categorical log likelihood"
+max_abs_error = 6.821210263296962e-13
+max_rel_error = 2.7030067795437433e-14
+outcome = "likelihood"
+reactant_ad_compile_seconds = 3.08626947
+reactant_first_execution_seconds = 0.029214892
+reactant_transfer_seconds = 9.403e-5
+rk_native_ad_supported = true
+rk_reactant_ad_supported = true
+value_abs_error = 2.2737367544323206e-12
+value_rel_error = 9.857305529220653e-16
+
+    [measurements.rk_native_ad]
+    allocs = [25, 25, 25, 25, 25, 25, 25, 25, 25, 25]
+    bytes = [538656, 538656, 538656, 538656, 538656, 538656, 538656, 538656, 538656, 538656]
+    median_allocs = 25
+    median_bytes = 538656
+    median_ns = 559697.0
+    min_ns = 550140.0
+    times_ns = [554956.0, 567382.0, 554885.0, 552092.0, 550140.0, 564369.0, 592178.0, 555025.0, 567493.0, 567653.0]
+
+    [measurements.rk_reactant_ad]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [816, 816, 816, 816, 816, 816, 816, 816, 816, 816]
+    median_allocs = 20
+    median_bytes = 816
+    median_ns = 115719.5
+    min_ns = 103142.0
+    times_ns = [130210.0, 115729.0, 115710.0, 103142.0, 114538.0, 106957.0, 145311.0, 126024.0, 113927.0, 120366.0]
+[[measurements]]
+boundary = "packed_unconstrained"
+description = "pointwise is vector-valued; no matched public Jacobian/VJP contract, so it stays unsupported rather than inventing a fused case"
+outcome = "pointwise"
+rk_native_ad_error = "pointwise is vector-valued; no matched public Jacobian/VJP contract, so it stays unsupported rather than inventing a fused case"
+rk_native_ad_supported = false
+rk_reactant_ad_error = "pointwise is vector-valued; no matched public Jacobian/VJP contract, so it stays unsupported rather than inventing a fused case"
+rk_reactant_ad_supported = false
+[[measurements]]
+boundary = "structured_parameters"
+description = "the structured (W, b) boundary has two active ports; no public multi-active AD contract is invented for it"
+outcome = "joint"
+rk_native_ad_error = "the structured (W, b) boundary has two active ports; no public multi-active AD contract is invented for it"
+rk_native_ad_supported = false
+rk_reactant_ad_error = "the structured (W, b) boundary has two active ports; no public multi-active AD contract is invented for it"
+rk_reactant_ad_supported = false
+[[measurements]]
+boundary = "structured_parameters"
+description = "the structured (W, b) boundary has two active ports; no public multi-active AD contract is invented for it"
+outcome = "prior"
+rk_native_ad_error = "the structured (W, b) boundary has two active ports; no public multi-active AD contract is invented for it"
+rk_native_ad_supported = false
+rk_reactant_ad_error = "the structured (W, b) boundary has two active ports; no public multi-active AD contract is invented for it"
+rk_reactant_ad_supported = false
+[[measurements]]
+boundary = "structured_parameters"
+description = "the structured (W, b) boundary has two active ports; no public multi-active AD contract is invented for it"
+outcome = "likelihood"
+rk_native_ad_error = "the structured (W, b) boundary has two active ports; no public multi-active AD contract is invented for it"
+rk_native_ad_supported = false
+rk_reactant_ad_error = "the structured (W, b) boundary has two active ports; no public multi-active AD contract is invented for it"
+rk_reactant_ad_supported = false
+[[measurements]]
+boundary = "structured_parameters"
+description = "pointwise is vector-valued; no matched public Jacobian/VJP contract, so it stays unsupported rather than inventing a fused case"
+outcome = "pointwise"
+rk_native_ad_error = "pointwise is vector-valued; no matched public Jacobian/VJP contract, so it stays unsupported rather than inventing a fused case"
+rk_native_ad_supported = false
+rk_reactant_ad_error = "pointwise is vector-valued; no matched public Jacobian/VJP contract, so it stays unsupported rather than inventing a fused case"
+rk_reactant_ad_supported = false
+
+[pins]
+ad_receipt_path = "benchmark/receipts/mnist-logistic-ad-v1.toml"
+ad_receipt_reactivekernels_sha = "6b5b1a54926e84b7137f1a5b5b17a2f6ad9ba790"
+ad_receipt_sha256 = "af9ecc66ad6137861dc0c97c30af8c280ae702e50ea8bd27bd20ced1d1a0e099"
+benchmarktools_version = "1.6.3"
+differentiationinterface_version = "0.7.21"
+enzyme_version = "0.13.199"
+julia_version = "1.10.11"
+mldatasets_version = "0.7.21"
+reactant_jll_version = "0.0.401+0"
+reactant_version = "0.2.278"
+reactivekernels_dirty = false
+reactivekernels_sha = "54b6f688e03c3b4c2b82559ca38c0ea3cc0c5f22"
+reactivekernels_version = "0.1.0"
+reactivekernelsdistributionkernels_version = "0.1.0"
+reactivekernelspplexamples_version = "0.1.0"
+source_authority_blob = "cfd5d381c38de21742f564361ef7a7914e5ff8bd"
+source_authority_path = "packages/ReactiveKernelsPPLExamples/src/mnist_logistic.jl"
+source_text_sha256 = "b873db7cef8003d9d3982af93223489a6558f0c733095a3bbcfc16fb8c29ad24"
+
+[protocol]
+ad_preparation_in_timed_region = false
+data = "Wren-compatible MNIST: first N training images projected onto the top 40 unwhitened PCA components fitted on all 60000 training images"
+dataset_profile = "wren-pca40"
+estimator = "minimum of per-round BenchmarkTools minimum times (uncontended cost; medians and raw rounds retained)"
+first_execution_in_steady_state_region = false
+gradient_operation = "value and gradient"
+input_boundaries = ["packed_unconstrained", "structured_parameters"]
+matrix_source = "benchmark/receipts/mnist-logistic-ad-v1.toml"
+model = "multinomial-logistic MNIST classifier"
+native_and_reactant_use_same_runtime_boundary = true
+num_classes = 10
+num_features = 40
+num_observations = 1000
+outcomes = ["joint", "prior", "likelihood", "pointwise"]
+parity_atol = 1.0e-9
+parity_reference = "native RK reverse pass (ad_value_and_gradient!)"
+parity_rtol = 1.0e-9
+partial_evaluation_enabled = false
+pca_centered = true
+pca_components = 40
+pca_explained_variance_fraction = 0.7861077598655903
+pca_fit_observations = 60000
+pca_input_features = 784
+pca_whitened = false
+pointwise_jacobian_or_vjp_invented = false
+preparation_in_timed_region = false
+reactant_compile_time_in_timed_region = false
+reactant_readback_in_timed_region = false
+reactant_sync = true
+reactant_transfers_in_timed_region = false
+rk_ad_backend = "AutoEnzyme(mode = Enzyme.Reverse)"
+rk_native_ad_surface = "prepare_ad + ad_value_and_gradient!"
+rk_reactant_ad_surface = "prepare_ad + compile_ad_value_and_gradient"
+rounds = 10
+runtime_data_ports = ["X", "y", "num_classes"]
+samples_per_round = 200
+seconds_per_round = 0.2
+setup_in_timed_region = false
+source_reused = true
+structured_multi_active_boundary_invented = false
+unsupported_cells_recorded = true
+wren_reference_checked = true
+wren_reference_csv_sha256 = "4d7543e3fdc89d51554c49c9ba71b0f629d3acf15e1f1a8bcbdc958be7f88af0"
+wren_reference_label_mismatches = 0
+wren_reference_max_abs_error = 1.099120794378905e-13
+wren_reference_rmse = 7.884317617377813e-15
+
+[setup]
+data_load_seconds = 4.917601866
+environment_seconds = 34.259464739
+kernel_preparation_seconds = 1.813410842
+package_precompile_seconds = 22.4968819

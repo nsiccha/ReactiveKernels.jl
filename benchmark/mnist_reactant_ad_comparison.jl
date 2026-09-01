@@ -44,7 +44,7 @@ function _run_pinned_comparison()
             precompile_seconds = @elapsed Pkg.precompile()
         end
         command = addenv(
-            `$(Base.julia_cmd()) --startup-file=no --project=$environment $(joinpath(@__DIR__, "mnist_reactant_ad_comparison_body.jl")) $(ARGS...)`,
+            `$(Base.julia_cmd()) --startup-file=no --project=$environment $(joinpath(@__DIR__, "mnist_reactant_ad_comparison_body.jl")) $ARGS`,
             _MNIST_REACTANT_AD_INNER => "1",
             "REACTIVEKERNELS_CANDIDATE_SHA" => sha,
             "RK_MNIST_REACTANT_AD_ENV_SETUP_SECONDS" => string(setup_seconds),

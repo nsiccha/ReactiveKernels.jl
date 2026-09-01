@@ -41,6 +41,7 @@ end
                  "mnist_reactant_comparison_body.jl",
                  "mnist_reactant_ad_comparison.jl",
                  "mnist_reactant_ad_comparison_body.jl",
+                 "_mnist_dataset_profiles.jl",
                  "nuts_reactant_comparison.jl",
                  "nuts_reactant_comparison_body.jl",
                  "eval_throughput_comparison.jl",
@@ -59,6 +60,7 @@ end
                  joinpath("receipts", "validate_mnist_logistic_ad.jl"),
                  joinpath("receipts", "validate_eight_schools_reactant.jl"),
                  joinpath("receipts", "validate_eight_schools_reactant_ad.jl"),
+                 joinpath("receipts", "_validate_mnist_dataset_profile.jl"),
                  joinpath("receipts", "validate_mnist_reactant.jl"),
                  joinpath("receipts", "validate_mnist_reactant_ad.jl"))
         path = joinpath(_BENCH_DIR, name)
@@ -151,6 +153,10 @@ end
     @test isfile(receipt)
     include(validator)
     @test isempty(validate_mnist_reactant_receipt(receipt))
+    wren_receipt = joinpath(
+        _BENCH_DIR, "receipts", "mnist-reactant-wren-pca40-v1.toml")
+    @test isfile(wren_receipt)
+    @test isempty(validate_mnist_reactant_receipt(wren_receipt))
 end
 
 @testset "MNIST Reactant-compiled-AD benchmark receipt validates" begin
@@ -161,6 +167,10 @@ end
     @test isfile(receipt)
     include(validator)
     @test isempty(validate_mnist_reactant_ad_receipt(receipt))
+    wren_receipt = joinpath(
+        _BENCH_DIR, "receipts", "mnist-reactant-ad-wren-pca40-v1.toml")
+    @test isfile(wren_receipt)
+    @test isempty(validate_mnist_reactant_ad_receipt(wren_receipt))
 end
 
 @testset "partial-evaluation benchmark receipt validates" begin
