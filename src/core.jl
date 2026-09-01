@@ -122,6 +122,32 @@ end
 kernel_sourceop_token(::_KernelSourceOp{DefToken}) where {DefToken} = DefToken
 kernel_sourceop_form(::_KernelSourceOp{DefToken,Form}) where {DefToken,Form} = Form
 
+# `vcat`/`hcat`/`cat` inside a tensorized fused body may mix untraced constant
+# arrays (e.g. a `zeros(1, n)` reference row built inside the body) with traced
+# operands.  Base's generic `_typed_vcat` handles that mix by allocating a host
+# `Array{<:TracedRNumber}` and copying elementwise — forbidden scalar indexing
+# on a traced array — so the tensorized body routes cat-family calls through
+# these wrappers.  A tracing extension specializes `_tensorized_cat_operand` to
+# promote untraced array operands against the discovered traced marker, keeping
+# the concatenation inside the backend's native lowering; without a traced
+# operand the wrappers reduce to the plain Base calls.
+@inline _tensorized_cat_operand(marker, arg) = arg
+@inline _tensorized_cat_marker(::Tuple{}) = nothing
+@inline _tensorized_cat_marker(args::Tuple) = _tensorized_cat_arg_marker(
+    _kernel_source_arg_style(first(args)), first(args), Base.tail(args))
+@inline _tensorized_cat_arg_marker(::Val{:tensorized}, arg, rest) = arg
+@inline _tensorized_cat_arg_marker(::Val{:native}, arg, rest) =
+    _tensorized_cat_marker(rest)
+@inline function _tensorized_cat_operands(args::Tuple)
+    marker = _tensorized_cat_marker(args)
+    marker === nothing ? args :
+        map(arg -> _tensorized_cat_operand(marker, arg), args)
+end
+@inline _tensorized_vcat(args...) = vcat(_tensorized_cat_operands(args)...)
+@inline _tensorized_hcat(args...) = hcat(_tensorized_cat_operands(args)...)
+@inline _tensorized_cat(args...; dims) =
+    cat(_tensorized_cat_operands(args)...; dims = dims)
+
 """
     Graph()
 

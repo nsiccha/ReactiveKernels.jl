@@ -1299,7 +1299,17 @@ function _is_broadcast_operator(sym::Symbol)
     length(s) >= 2 && s[1] === '.' && Base.isoperator(Symbol(s[2:end]))
 end
 
-function _kernel_tensorized_rhs(ex)
+# Cat-family callees rewritten in the tensorized body only.  The wrappers
+# (core.jl) let a tracing backend promote untraced constant-array operands to
+# traced constants before concatenating; a callee shadowed by a graph port
+# keeps its port meaning and is never rewritten.
+_tensorized_callee_replacement(callee::Symbol) =
+    callee === :vcat ? :_tensorized_vcat :
+    callee === :hcat ? :_tensorized_hcat :
+    callee === :cat ? :_tensorized_cat : nothing
+_tensorized_callee_replacement(callee) = nothing
+
+function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}())
     ex isa Expr || return ex
     ex.head in (:quote, :inert) && return ex
     if ex.head === :if && length(ex.args) == 3
@@ -1309,19 +1319,33 @@ function _kernel_tensorized_rhs(ex)
         # `ifelse(::TracedBool, ::TracedArray, ::TracedArray)` method).
         return Expr(:call, GlobalRef(Base, :broadcast),
                     GlobalRef(Base, :ifelse),
-                    (_kernel_tensorized_rhs(arg) for arg in ex.args)...)
+                    (_kernel_tensorized_rhs(arg, known) for arg in ex.args)...)
     elseif ex.head === :&& && length(ex.args) == 2
         return Expr(:call, GlobalRef(Base, :broadcast),
                     GlobalRef(Base, :ifelse),
-                    _kernel_tensorized_rhs(ex.args[1]),
-                    _kernel_tensorized_rhs(ex.args[2]), false)
+                    _kernel_tensorized_rhs(ex.args[1], known),
+                    _kernel_tensorized_rhs(ex.args[2], known), false)
     elseif ex.head === :|| && length(ex.args) == 2
         return Expr(:call, GlobalRef(Base, :broadcast),
                     GlobalRef(Base, :ifelse),
-                    _kernel_tensorized_rhs(ex.args[1]), true,
-                    _kernel_tensorized_rhs(ex.args[2]))
+                    _kernel_tensorized_rhs(ex.args[1], known), true,
+                    _kernel_tensorized_rhs(ex.args[2], known))
+    elseif ex.head === :call && !isempty(ex.args) &&
+           ex.args[1] isa Symbol && !(ex.args[1] in known)
+        replacement = _tensorized_callee_replacement(ex.args[1])
+        replacement === nothing || return Expr(:call,
+            GlobalRef(@__MODULE__, replacement),
+            (_kernel_tensorized_rhs(arg, known) for arg in ex.args[2:end])...)
+    elseif ex.head in (:vcat, :hcat) &&
+           !any(arg -> arg isa Expr && arg.head === :row, ex.args)
+        # `[a; b]` / `[a b]` concatenation syntax; `:row`-bearing forms are
+        # `hvcat` semantics and keep their native lowering.
+        return Expr(:call,
+            GlobalRef(@__MODULE__, ex.head === :vcat ?
+                :_tensorized_vcat : :_tensorized_hcat),
+            (_kernel_tensorized_rhs(arg, known) for arg in ex.args)...)
     end
-    Expr(ex.head, (_kernel_tensorized_rhs(arg) for arg in ex.args)...)
+    Expr(ex.head, (_kernel_tensorized_rhs(arg, known) for arg in ex.args)...)
 end
 
 function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
@@ -1362,7 +1386,7 @@ function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
          Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)),
          Expr(:->, Expr(:tuple, deps...), rhs),
          Expr(:->, Expr(:tuple, deps...),
-              tensorize ? _kernel_tensorized_rhs(rhs) : rhs))
+              tensorize ? _kernel_tensorized_rhs(rhs, known) : rhs))
 end
 
 function _kernel_nested_endpoint_deps(rhs, deps::Vector{Symbol}, known::Set{Symbol},

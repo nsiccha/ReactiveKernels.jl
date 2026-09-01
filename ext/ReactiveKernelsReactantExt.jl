@@ -621,6 +621,17 @@ end
 # scalar indexing while leaving XLA free to fuse the tensor operations.
 @inline ReactiveKernels._requires_tensorized_marker(::Reactant.RArray) = true
 
+# Cat-family calls in a tensorized fused body may mix untraced constant arrays
+# (e.g. a `zeros(1, n)` reference row built inside the body) with traced
+# operands; Base's generic `_typed_vcat` then copies elementwise into a host
+# `Array{<:TracedRNumber}` — forbidden scalar indexing on a traced array.
+# `promote_to` is an identity on already-traced operands, materializes wrapped
+# traced arrays, and lifts a host constant array into the traced program, so
+# the concatenation stays inside Reactant's native lowering.
+@inline ReactiveKernels._tensorized_cat_operand(
+        marker::Reactant.TracedType, arg::AbstractArray) =
+    Reactant.promote_to(Reactant.TracedRArray, arg)
+
 @inline function ReactiveKernels._batched_call(
         f::ReactiveKernels._ArrayFunctionPair, ops, args,
         marker::Reactant.RArray)

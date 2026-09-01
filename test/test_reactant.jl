@@ -160,8 +160,84 @@ const REACTANT_NESTED_MIDDLE = prepare(reactant_nested_plate_middle;
     total::Float64 = REACTANT_NESTED_MIDDLE(x, μ, logσ)
 end
 
+# Mixed untraced-constant + traced cat operands (snag `reactant-mixed-c`): a
+# constant array built inside a fused tensorized body (`zeros(1, n)` reference
+# row) must be promoted to a traced constant instead of falling into Base's
+# generic elementwise `_typed_vcat`, which scalar-indexes the traced operand.
+@kernel reactant_mixed_vcat(W::Matrix{Float64}, X::Matrix{Float64}) = begin
+    scores = W * X
+    padded = vcat(zeros(1, size(scores, 2)), scores)
+    total::Float64 = sum(padded)
+end
+
+# Non-splat constants below deliberately avoid the separate upstream Reactant
+# 0.2.278 miscompile pinned in the testset (a splat constant lowers the concat
+# to `stablehlo.pad`, and EnzymeXLA's reduce-of-pad rewrite adds the pad value
+# once instead of once per padded element).
+@kernel reactant_mixed_hcat(scores::Matrix{Float64}) = begin
+    wide = hcat(reshape(collect(1.0:size(scores, 1)), size(scores, 1), 1), scores)
+    total::Float64 = sum(wide)
+end
+
+@kernel reactant_mixed_cat_dims(scores::Matrix{Float64}) = begin
+    stacked = cat(reshape(collect(1.0:size(scores, 1)), size(scores, 1), 1),
+                  scores; dims = 2)
+    total::Float64 = sum(stacked)
+end
+
+@kernel reactant_mixed_concat_syntax(scores::Matrix{Float64}) = begin
+    padded = [zeros(1, size(scores, 2)); scores]
+    total::Float64 = sum(padded)
+end
+
+@kernel reactant_mixed_vcat_splat(scores::Matrix{Float64}) = begin
+    padded = vcat(ones(1, size(scores, 2)), scores)
+    total::Float64 = sum(padded)
+end
+
 @testset "Reactant optional compiler integration" begin
     @test Base.get_extension(ReactiveKernels, :ReactiveKernelsReactantExt) !== nothing
+
+    @testset "mixed constant and traced cat operands promote to traced constants" begin
+        W_host = reshape(collect(0.1:0.1:0.6), 2, 3)
+        X_host = reshape(collect(1.0:12.0), 3, 4)
+        kernel = prepare(reactant_mixed_vcat;
+            have = (:W, :X), want = (:padded, :total))
+        native_padded, native_total = kernel(W_host, X_host)
+        W_traced = Reactant.to_rarray(W_host)
+        X_traced = Reactant.to_rarray(X_host)
+        compiled = @compile kernel(W_traced, X_traced)
+        padded, total = compiled(W_traced, X_traced)
+        @test Array(padded) ≈ native_padded
+        @test total ≈ native_total
+
+        scores_host = reshape(collect(-1.0:1.0:4.0), 2, 3)
+        scores_traced = Reactant.to_rarray(scores_host)
+        for (spec, want) in ((reactant_mixed_hcat, :wide),
+                             (reactant_mixed_cat_dims, :stacked),
+                             (reactant_mixed_concat_syntax, :padded))
+            variant = prepare(spec; have = (:scores,), want = (want, :total))
+            native_array, native_sum = variant(scores_host)
+            compiled_variant = @compile variant(scores_traced)
+            traced_array, traced_sum = compiled_variant(scores_traced)
+            @test Array(traced_array) ≈ native_array
+            @test traced_sum ≈ native_sum
+        end
+
+        # Upstream Reactant 0.2.278 miscompile, orthogonal to the promotion
+        # above: a nonzero SPLAT constant row lowers the concat to
+        # `stablehlo.pad`, and EnzymeXLA's reduce-of-pad rewrite adds the pad
+        # value once instead of once per padded element, so the concatenated
+        # array is exact while its sum is wrong. Pinned broken so a Reactant
+        # bump that fixes the rewrite is noticed here.
+        splat = prepare(reactant_mixed_vcat_splat;
+            have = (:scores,), want = (:padded, :total))
+        native_splat_padded, native_splat_total = splat(scores_host)
+        compiled_splat = @compile splat(scores_traced)
+        splat_padded, splat_total = compiled_splat(scores_traced)
+        @test Array(splat_padded) ≈ native_splat_padded
+        @test_broken splat_total ≈ native_splat_total
+    end
 
     @testset "source-derived functional state transition" begin
         kernel = ReactiveKernels.compile_stateful(
