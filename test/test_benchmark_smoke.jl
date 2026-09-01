@@ -30,6 +30,8 @@ end
                  "eight_schools_reactant_comparison_body.jl",
                  "eight_schools_reactant_ad_comparison.jl",
                  "eight_schools_reactant_ad_comparison_body.jl",
+                 "mnist_reactant_comparison.jl",
+                 "mnist_reactant_comparison_body.jl",
                  "nuts_reactant_comparison.jl",
                  "nuts_reactant_comparison_body.jl",
                  "eval_throughput_comparison.jl",
@@ -42,7 +44,8 @@ end
                  joinpath("receipts", "validate_distribution_gradients.jl"),
                  joinpath("receipts", "validate_eight_schools_ad.jl"),
                  joinpath("receipts", "validate_eight_schools_reactant.jl"),
-                 joinpath("receipts", "validate_eight_schools_reactant_ad.jl"))
+                 joinpath("receipts", "validate_eight_schools_reactant_ad.jl"),
+                 joinpath("receipts", "validate_mnist_reactant.jl"))
         path = joinpath(_BENCH_DIR, name)
         @test isfile(path)
         @test _parses(path)
@@ -79,6 +82,16 @@ end
     @test isempty(validate_eight_schools_reactant_ad_receipt(receipt))
 end
 
+@testset "MNIST Reactant benchmark receipt validates" begin
+    validator = joinpath(
+        _BENCH_DIR, "receipts", "validate_mnist_reactant.jl")
+    receipt = joinpath(
+        _BENCH_DIR, "receipts", "mnist-reactant-v1.toml")
+    @test isfile(receipt)
+    include(validator)
+    @test isempty(validate_mnist_reactant_receipt(receipt))
+end
+
 @testset "Eight Schools receipt text digests are checkout-line-ending invariant" begin
     mktempdir() do dir
         lf_path = joinpath(dir, "lf.txt")
@@ -91,6 +104,7 @@ end
                 _eight_schools_ad_text_sha256,
                 _eight_schools_reactant_text_sha256,
                 _eight_schools_reactant_ad_text_sha256,
+                _mnist_reactant_text_sha256,
             )
             @test digest(lf_path) == expected
             @test digest(crlf_path) == expected
