@@ -133,6 +133,15 @@ graph; no prior, likelihood, transform, or distribution formula is copied into
 an AD-specific RK evaluator. The optimized Turing model and manual Julia control
 are loaded from the primal benchmark authority as well.
 
+For a native prepared plate, `prepare_ad` differentiates the exact generated
+callable and operation table used by primal execution; it does not re-lower an
+AD-specific kernel. The one native lowering emits an unconditional scalar loop
+for common vector plates and retains dependency scheduling only where a
+higher-dimensional broadcast can reuse a partial-axis invariant.
+`code_expr(prepared_ad_kernel) === code_expr(prepared_ad_kernel.kernel)`, so the
+publicly inspectable AST is the exact body differentiated by Enzyme. It
+materializes no pointwise buffer for a summed WANT.
+
 ```@eval
 Main.ReactiveKernelsDocs.render_eight_schools_ad_benchmarks()
 ```

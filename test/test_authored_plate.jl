@@ -279,7 +279,7 @@ end
         _authored_plate_normal(xs[i], location, observed_scales[i])
         for i in eachindex(xs))
     observed_pointwise_text = string(code_expr(observed_pointwise))
-    @test findfirst("_authored_plate_broadcast", observed_pointwise_text) <
+    @test findfirst("Base.broadcastable", observed_pointwise_text) <
           findfirst("similar", observed_pointwise_text)
     @test_throws DimensionMismatch observed_pointwise(
         scalar_parameters, xs, observed_scales[1:3])
@@ -308,13 +308,13 @@ end
     @test !occursin("for ", string(total.f.tensorized_ast))
     @test occursin("broadcast", string(total.f.tensorized_ast))
     native_text = string(total_ast)
-    @test findfirst("_authored_plate_broadcast", native_text) <
+    @test findfirst("Base.broadcastable", native_text) <
           findfirst("__ops__[", native_text)
     for materializing_ast in (pointwise_ast, both_ast)
         materializing_text = string(materializing_ast)
-        @test findfirst("_authored_plate_broadcast", materializing_text) <
+        @test findfirst("Base.broadcastable", materializing_text) <
               findfirst("similar", materializing_text)
-        @test findfirst("_authored_plate_broadcast", materializing_text) <
+        @test findfirst("Base.broadcastable", materializing_text) <
               findfirst("__ops__[", materializing_text)
     end
 

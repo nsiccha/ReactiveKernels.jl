@@ -26,6 +26,44 @@ struct _ADKernelCall{I,K}
     kernel::K
 end
 
+# Plated PreparedKernels carry their already-generated native and tensorized
+# bodies behind a runtime function-pair selector. Native AD preparation has
+# concrete exemplars, so it can bypass only that selector and differentiate the
+# exact native callable/operation table used by primal execution. No AD-specific
+# kernel or AST is generated.
+struct _ADNativeKernelCall{I,F,O}
+    native::F
+    ops::O
+end
+
+@generated function (call::_ADNativeKernelCall{I})(
+        active, contexts::Vararg{Any,N}) where {I,N}
+    1 <= I <= N + 1 || return :(throw(ArgumentError(
+        "invalid active input index $I for an RK AD call with $(N + 1) inputs")))
+    positional = Any[]
+    context_index = 1
+    for input_index in 1:(N + 1)
+        if input_index == I
+            push!(positional, :active)
+        else
+            push!(positional, :(getfield(contexts, $context_index)))
+            context_index += 1
+        end
+    end
+    :(call.native(call.ops, $(positional...)))
+end
+
+function _ad_kernel_call(kernel::PreparedKernel, args::Tuple, ::Val{I}) where {I}
+    native_exemplars = _dynamic_tensorized_marker(args) === nothing
+    if kernel.f isa Union{
+            _ArrayFunctionPair,_EmbeddedFunctionPair,
+            _DynamicEmbeddedFunctionPair} && native_exemplars
+        return _ADNativeKernelCall{I,typeof(kernel.f.native),typeof(kernel.ops)}(
+            kernel.f.native, kernel.ops)
+    end
+    _ADKernelCall{I,typeof(kernel)}(kernel)
+end
+
 @generated function (call::_ADKernelCall{I})(
         active, contexts::Vararg{Any,N}) where {I,N}
     1 <= I <= N + 1 || return :(throw(ArgumentError(
@@ -194,7 +232,7 @@ end
 function _ad_call(kernel::PreparedKernel, resolved::Tuple, active)
     active_index = _ad_active_index(kernel, active)
     _ad_validate_kernel(kernel, active_index, resolved)
-    call = _ADKernelCall{active_index,typeof(kernel)}(kernel)
+    call = _ad_kernel_call(kernel, resolved, Val(active_index))
     point, contexts = _ad_arguments(Val(active_index), resolved)
     call, point, contexts, active_index
 end
@@ -216,7 +254,8 @@ function _prepare_ad(kernel::PreparedKernel, resolver,
                      backend::DifferentiationInterface.AbstractADType,
                      args::Tuple, kwargs::NamedTuple, active)
     resolved = _ad_resolve(resolver, args, kwargs)
-    call, point, contexts, active_index = _ad_call(kernel, resolved, active)
+    call, point, contexts, active_index =
+        _ad_call(kernel, resolved, active)
     preparation = DifferentiationInterface.prepare_gradient(
         call, backend, point, contexts...)
     PreparedADKernel{active_index,typeof(kernel),typeof(resolver),typeof(call),

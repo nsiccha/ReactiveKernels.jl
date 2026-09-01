@@ -3,6 +3,9 @@ import Enzyme
 
 const TEST_AD_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 
+_test_ad_value_gradient_allocated(prepared, gradient, q, data) =
+    @allocated ad_value_and_gradient!(prepared, gradient, q, data)
+
 @testset "Prepared AD kernels" begin
     @testset "authored boundary, defaults, keywords, and fresh Constants" begin
         @kernel objective(q::Vector{Float64}, scale::Float64 = 1.25;
@@ -207,5 +210,44 @@ const TEST_AD_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
             untyped_square, TEST_AD_BACKEND, 3.0;
             active = :q, want = :untyped_square,
         ) ≈ 6.0
+    end
+
+    @testset "authored plate AD reuses the inspectable primal body" begin
+        @kernel plate_objective(q::Vector{Float64},
+                                data::Vector{Float64}) = begin
+            pointwise = plate(q, data) do qi, di
+                score::Float64 = qi * di - 0.5 * qi^2
+                return score
+            end
+            objective::Float64 = sum(pointwise)
+        end
+
+        q = [0.2, -0.4, 0.7, 0.1]
+        data = [1.5, -0.5, 0.25, 2.0]
+        kernel = prepare(plate_objective;
+            have = (:q, :data), want = :objective)
+        primal_ast = code_expr(kernel)
+        @test occursin("Base.Broadcast.preprocess", string(primal_ast))
+        @test !occursin("_plate_dependency_changed", string(primal_ast))
+
+        prepared = prepare_ad(
+            kernel, TEST_AD_BACKEND, q, data; active = :q)
+        ad_text = string(code_expr(prepared))
+        @test prepared.call isa ReactiveKernels._ADNativeKernelCall
+        @test prepared.call.native === kernel.f.native
+        @test prepared.call.ops === kernel.ops
+        @test code_expr(prepared) === primal_ast
+        @test occursin("Base.Broadcast.preprocess", ad_text)
+        @test !occursin("_plate_dependency_changed", ad_text)
+
+        gradient = similar(q)
+        value, returned = ad_value_and_gradient!(
+            prepared, gradient, q, data)
+        @test value ≈ sum(q .* data .- 0.5 .* q .^ 2)
+        @test returned === gradient
+        @test gradient ≈ data .- q
+        _test_ad_value_gradient_allocated(prepared, gradient, q, data)
+        @test _test_ad_value_gradient_allocated(
+            prepared, gradient, q, data) == 0
     end
 end
