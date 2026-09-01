@@ -3,6 +3,8 @@
 import Statistics
 import TOML
 
+include(joinpath(@__DIR__, "validate_mnist_logistic_v1.jl"))
+
 isdefined(@__MODULE__, :MNISTLogisticMatrixSpec) ||
     include(joinpath(dirname(@__DIR__), "mnist_logistic_matrix_spec.jl"))
 using .MNISTLogisticMatrixSpec
@@ -13,7 +15,7 @@ const EXPECTED_PRIMAL_CONFIGURATIONS = Tuple(
        configuration.compiler == "native"
 )
 
-function validate_mnist_logistic_receipt(path::AbstractString)
+function _validate_mnist_logistic_v3_receipt(path::AbstractString)
     receipt = TOML.parsefile(path)
     errors = String[]
     require(condition, message) = condition || push!(errors, message)
@@ -171,11 +173,19 @@ function validate_mnist_logistic_receipt(path::AbstractString)
     errors
 end
 
+function validate_mnist_logistic_receipt(path::AbstractString)
+    schema = get(TOML.parsefile(path), "schema", "")
+    schema == "mnist-logistic-v1" &&
+        return MNISTLogisticV1Validation.validate_mnist_logistic_receipt(path)
+    schema == "mnist-logistic-primal-v3" &&
+        return _validate_mnist_logistic_v3_receipt(path)
+    ["schema must be mnist-logistic-v1 or mnist-logistic-primal-v3"]
+end
+
 function main(path)
     errors = validate_mnist_logistic_receipt(path)
     if isempty(errors)
-        println("VALIDATE OK — mnist-logistic-primal-v3: " *
-                "two-model native/bound/nonallocating matrix accepted")
+        println("VALIDATE OK — MNIST logistic primal receipt accepted")
         return 0
     end
     foreach(println, errors)

@@ -122,6 +122,22 @@ the receipt — together with steady-state allocation bytes and counts. Every
 supported cell must agree numerically with the handwritten control before it
 is timed.
 
+## Wren-compatible PCA-40 primal comparison
+
+The second matrix runs the same RK, handwritten Julia, and Turing public
+interfaces on Wren's workload shape: the first 1,000 standard MNIST training
+images projected onto the top 40 unwhitened principal components fitted on the
+complete 60,000-image training split. The generated matrix is checked against
+the private Wren reference CSV to roundoff; the CSV itself is not committed.
+
+```@eval
+Main.ReactiveKernelsDocs.render_mnist_logistic_wren_benchmarks()
+```
+
+This is a separate receipt, not a replacement for the full 60,000×784 result,
+so both workload scales retain the identical 2×4 capability matrix and parity
+gates.
+
 ### Baseline implementations
 
 ```@eval
@@ -136,4 +152,10 @@ julia --startup-file=no benchmark/mnist_logistic_comparison.jl \
   --output=benchmark/receipts/mnist-logistic-primal-v3.toml
 julia --startup-file=no benchmark/receipts/validate_mnist_logistic.jl \
   benchmark/receipts/mnist-logistic-primal-v3.toml
+
+julia --startup-file=no benchmark/mnist_logistic_comparison.jl \
+  --dataset=wren-pca40 --wren-reference=/path/to/mnist.csv \
+  --output=benchmark/receipts/mnist-logistic-wren-pca40-v1.toml
+julia --startup-file=no benchmark/receipts/validate_mnist_logistic.jl \
+  benchmark/receipts/mnist-logistic-wren-pca40-v1.toml
 ```

@@ -36,6 +36,11 @@ end
 _mnist_default_observations(profile) =
     profile == MNIST_DATASET_WREN_PCA40 ? MNIST_WREN_OBSERVATIONS : 60000
 
+_mnist_primal_receipt_name(profile) = profile == MNIST_DATASET_WREN_PCA40 ?
+    "mnist-logistic-wren-pca40-v1.toml" : "mnist-logistic-v1.toml"
+_mnist_ad_receipt_name(profile) = profile == MNIST_DATASET_WREN_PCA40 ?
+    "mnist-logistic-ad-wren-pca40-v1.toml" : "mnist-logistic-ad-v1.toml"
+
 function _mnist_wren_reference!(metadata, path, X, y)
     isfile(path) || error("Wren reference CSV does not exist: $path")
     reference, header = readdlm(path, ',', Float64; header = true)

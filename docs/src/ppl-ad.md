@@ -66,6 +66,33 @@ replaced by a benchmark-only surrogate. The
 retains the complete data shape, 7,065 active coefficients, analytic parity,
 preparation costs, timings, and allocations.
 
+## MNIST Wren-compatible PCA-40 gradients
+
+The same RK/Enzyme, handwritten/Enzyme, and Turing/Enzyme value-and-gradient
+comparison is repeated on the first 1,000 MNIST observations projected onto
+Wren's 40-component unwhitened PCA basis. The supported-cell inventory is
+unchanged; only the shared data profile and resulting 369-element packed
+coefficient vector differ.
+
+```@eval
+Main.ReactiveKernelsDocs.render_mnist_logistic_ad_wren_benchmarks()
+```
+
+The separate
+[PCA-40 receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/mnist-logistic-ad-wren-pca40-v1.toml)
+cross-pins the matching standalone PCA-40 primal receipt and retains the same
+analytic parity, preparation, timing, and allocation evidence.
+
+Reproduce it from the same clean detached checkout used for the primal receipt:
+
+```sh
+julia --startup-file=no benchmark/mnist_logistic_ad_comparison.jl \
+  --dataset=wren-pca40 --wren-reference=/path/to/mnist.csv \
+  --output=benchmark/receipts/mnist-logistic-ad-wren-pca40-v1.toml
+julia --startup-file=no benchmark/receipts/validate_mnist_logistic_ad.jl \
+  benchmark/receipts/mnist-logistic-ad-wren-pca40-v1.toml
+```
+
 ## Other model coverage
 
 The remaining declarative walkthroughs are correctness-tested through the same

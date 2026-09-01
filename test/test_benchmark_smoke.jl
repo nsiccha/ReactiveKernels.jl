@@ -156,8 +156,14 @@ using .ComparisonSourceAttestation
         pin = receipt["pins"]["primal_comparator_source"]
         published = read(
             `git -C $_BENCH_DIR show $(pin["commit"]):$(pin["path"])`, String)
-        current = read(joinpath(dirname(_BENCH_DIR), pin["path"]), String)
-        @test comparator_source_matches_current_delta(current, published, guard)
+        current = read(
+            `git -C $_BENCH_DIR cat-file blob $(pin["current"]["git_blob"])`,
+            String)
+        if get(pin, "current_delta", "") == "none"
+            @test current == published
+        else
+            @test comparator_source_matches_current_delta(current, published, guard)
+        end
     end
 
     model_pin = TOML.parsefile(joinpath(
@@ -215,11 +221,15 @@ end
 @testset "MNIST logistic primal benchmark receipt validates" begin
     validator = joinpath(
         _BENCH_DIR, "receipts", "validate_mnist_logistic.jl")
-    receipt = joinpath(
-        _BENCH_DIR, "receipts", "mnist-logistic-primal-v3.toml")
-    @test isfile(receipt)
     validation = _load_benchmark_validator(validator)
-    @test isempty(validation.validate_mnist_logistic_receipt(receipt))
+    for receipt_name in (
+            "mnist-logistic-primal-v3.toml",
+            "mnist-logistic-wren-pca40-v1.toml",
+        )
+        receipt = joinpath(_BENCH_DIR, "receipts", receipt_name)
+        @test isfile(receipt)
+        @test isempty(validation.validate_mnist_logistic_receipt(receipt))
+    end
 end
 
 @testset "MNIST logistic AD benchmark receipt validates" begin
@@ -230,6 +240,10 @@ end
     @test isfile(receipt)
     validation = _load_benchmark_validator(validator)
     @test isempty(validation.validate_mnist_logistic_ad_receipt(receipt))
+    wren_receipt = joinpath(
+        _BENCH_DIR, "receipts", "mnist-logistic-ad-wren-pca40-v1.toml")
+    @test isfile(wren_receipt)
+    @test isempty(validation.validate_mnist_logistic_ad_receipt(wren_receipt))
 end
 
 @testset "Eight Schools primal benchmark receipt validates" begin

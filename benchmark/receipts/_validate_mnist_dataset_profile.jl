@@ -8,6 +8,9 @@ if !isdefined(@__MODULE__, :EXPECTED_MNIST_WREN_REFERENCE_SHA256)
         matched_protocol,
     )
         profile = get(protocol, "dataset_profile", "full-raw")
+        matched_profile = get(matched_protocol, "dataset_profile", "full-raw")
+        require(profile == matched_profile,
+                "dataset profile must match the comparison receipt")
         if profile == "full-raw"
             require(Int(get(protocol, "num_observations", 0)) ==
                     Int(get(matched_protocol, "num_observations", -1)),
@@ -24,6 +27,12 @@ if !isdefined(@__MODULE__, :EXPECTED_MNIST_WREN_REFERENCE_SHA256)
                 "Wren-compatible receipts must contain 1000 observations")
         require(Int(get(protocol, "num_features", 0)) == 40,
                 "Wren-compatible receipts must contain 40 PCA features")
+        require(Int(get(protocol, "num_observations", 0)) ==
+                Int(get(matched_protocol, "num_observations", -1)),
+                "Wren-compatible observation count must match the comparison receipt")
+        require(Int(get(protocol, "num_features", 0)) ==
+                Int(get(matched_protocol, "num_features", -1)),
+                "Wren-compatible feature count must match the comparison receipt")
         require(Int(get(protocol, "pca_fit_observations", 0)) == 60000,
                 "Wren-compatible PCA must be fitted on all 60000 training images")
         require(Int(get(protocol, "pca_input_features", 0)) == 784,

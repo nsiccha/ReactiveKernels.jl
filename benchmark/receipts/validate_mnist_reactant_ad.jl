@@ -33,8 +33,7 @@ _mnist_reactant_ad_text_sha256(path) = bytes2hex(SHA.sha256(
 
 function validate_mnist_reactant_ad_receipt(
     path::AbstractString;
-    ad_path::AbstractString = joinpath(
-        dirname(path), "mnist-logistic-ad-v1.toml"),
+    ad_path::Union{Nothing,AbstractString} = nothing,
 )
     receipt = TOML.parsefile(path)
     errors = String[]
@@ -45,6 +44,11 @@ function validate_mnist_reactant_ad_receipt(
     for section in ("pins", "environment", "setup", "protocol", "measurements")
         require(haskey(receipt, section), "missing $section")
     end
+    protocol = get(receipt, "protocol", Dict{String,Any}())
+    dataset_profile = get(protocol, "dataset_profile", "full-raw")
+    expected_ad_name = dataset_profile == "wren-pca40" ?
+        "mnist-logistic-ad-wren-pca40-v1.toml" : "mnist-logistic-ad-v1.toml"
+    isnothing(ad_path) && (ad_path = joinpath(dirname(path), expected_ad_name))
     require(isfile(ad_path), "missing matched AD receipt: $ad_path")
     isempty(errors) || return errors
 
@@ -79,7 +83,7 @@ function validate_mnist_reactant_ad_receipt(
             "packages/ReactiveKernelsPPLExamples/src/mnist_logistic.jl",
             "unexpected MNIST source-authority path")
     require(get(pins, "ad_receipt_path", "") ==
-            "benchmark/receipts/mnist-logistic-ad-v1.toml",
+            "benchmark/receipts/$expected_ad_name",
             "benchmark must name the matched AD receipt")
     require(get(pins, "ad_receipt_sha256", "") ==
             _mnist_reactant_ad_text_sha256(ad_path),
@@ -111,7 +115,7 @@ function validate_mnist_reactant_ad_receipt(
     require(get(protocol, "source_reused", false) == true,
             "benchmark must reuse the authored MNIST source")
     require(get(protocol, "matrix_source", "") ==
-            "benchmark/receipts/mnist-logistic-ad-v1.toml",
+            "benchmark/receipts/$expected_ad_name",
             "benchmark must name the matched AD receipt as its matrix source")
     require(get(protocol, "gradient_operation", "") == "value and gradient",
             "receipt must record the value-and-gradient operation")
@@ -486,10 +490,8 @@ function validate_mnist_reactant_ad_receipt(
 )
     schema = get(TOML.parsefile(path), "schema", "")
     if schema == "mnist-reactant-ad-v1"
-        companion = isnothing(ad_path) ?
-            joinpath(dirname(path), "mnist-logistic-ad-v1.toml") : String(ad_path)
         return MNISTReactantADV1Validation.validate_mnist_reactant_ad_receipt(
-            path; ad_path = companion)
+            path; ad_path)
     elseif schema == "mnist-reactant-ad-v2"
         companion = isnothing(ad_path) ?
             joinpath(dirname(path), "mnist-logistic-ad-v2.toml") : String(ad_path)
@@ -502,8 +504,7 @@ end
 function main(path)
     errors = validate_mnist_reactant_ad_receipt(path)
     if isempty(errors)
-        println("VALIDATE OK — mnist-reactant-ad-v2: " *
-                "two-model unbound/bound Reactant-AD matrix accepted")
+        println("VALIDATE OK — MNIST Reactant-AD receipt accepted")
         return 0
     end
     foreach(println, errors)
