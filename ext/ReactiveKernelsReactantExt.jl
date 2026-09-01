@@ -451,9 +451,12 @@ end
 # The compiled closure receives the selected HAVE boundary in authored order, uses
 # the same `_ad_arguments` reorder + `Constant`-context construction as the native
 # path, and calls DifferentiationInterface inside the traced region. Only the
-# traced arguments are part of the backend ABI; `prepared.call` (an immutable
-# `_ADKernelCall` wrapping a `PreparedKernel`) and the backend are captured host
-# constants, exactly as the primal Reactant kernel object is.
+# traced arguments are part of the backend ABI; an immutable `_ADKernelCall`
+# selector and the backend are captured host constants, exactly as the primal
+# Reactant kernel object is. Reconstruct the selector from `prepared.kernel`:
+# native preparation may wrap the existing native callable directly in
+# `prepared.call`, whereas this path must select the existing tensorized callable
+# once Reactant supplies traced arguments.
 _rk_reactant_ad_op(::Val{:gradient}) = DifferentiationInterface.gradient
 _rk_reactant_ad_op(::Val{:value_and_gradient}) =
     DifferentiationInterface.value_and_gradient
@@ -462,7 +465,8 @@ function _rk_reactant_compile_ad(
         mode::Val, prepared::ReactiveKernels.PreparedADKernel{I}, args::Tuple;
         sync::Bool) where {I}
     op = _rk_reactant_ad_op(mode)
-    call = prepared.call
+    call = ReactiveKernels._ADKernelCall{I,typeof(prepared.kernel)}(
+        prepared.kernel)
     backend = prepared.backend
     fn = let op = op, call = call, backend = backend
         (traced...) -> begin

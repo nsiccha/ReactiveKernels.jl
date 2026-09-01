@@ -26,6 +26,44 @@ struct _ADKernelCall{I,K}
     kernel::K
 end
 
+# Plated PreparedKernels carry their already-generated native and tensorized
+# bodies behind a runtime function-pair selector. Native AD preparation has
+# concrete exemplars, so it can bypass only that selector and differentiate the
+# exact native callable/operation table used by primal execution. No AD-specific
+# kernel or AST is generated.
+struct _ADNativeKernelCall{I,F,O}
+    native::F
+    ops::O
+end
+
+@generated function (call::_ADNativeKernelCall{I})(
+        active, contexts::Vararg{Any,N}) where {I,N}
+    1 <= I <= N + 1 || return :(throw(ArgumentError(
+        "invalid active input index $I for an RK AD call with $(N + 1) inputs")))
+    positional = Any[]
+    context_index = 1
+    for input_index in 1:(N + 1)
+        if input_index == I
+            push!(positional, :active)
+        else
+            push!(positional, :(getfield(contexts, $context_index)))
+            context_index += 1
+        end
+    end
+    :(call.native(call.ops, $(positional...)))
+end
+
+function _ad_kernel_call(kernel::PreparedKernel, args::Tuple, ::Val{I}) where {I}
+    native_exemplars = _dynamic_tensorized_marker(args) === nothing
+    if kernel.f isa Union{
+            _ArrayFunctionPair,_EmbeddedFunctionPair,
+            _DynamicEmbeddedFunctionPair} && native_exemplars
+        return _ADNativeKernelCall{I,typeof(kernel.f.native),typeof(kernel.ops)}(
+            kernel.f.native, kernel.ops)
+    end
+    _ADKernelCall{I,typeof(kernel)}(kernel)
+end
+
 @generated function (call::_ADKernelCall{I})(
         active, contexts::Vararg{Any,N}) where {I,N}
     1 <= I <= N + 1 || return :(throw(ArgumentError(
@@ -194,7 +232,7 @@ end
 function _ad_call(kernel::PreparedKernel, resolved::Tuple, active)
     active_index = _ad_active_index(kernel, active)
     _ad_validate_kernel(kernel, active_index, resolved)
-    call = _ADKernelCall{active_index,typeof(kernel)}(kernel)
+    call = _ad_kernel_call(kernel, resolved, Val(active_index))
     point, contexts = _ad_arguments(Val(active_index), resolved)
     call, point, contexts, active_index
 end
@@ -216,7 +254,8 @@ function _prepare_ad(kernel::PreparedKernel, resolver,
                      backend::DifferentiationInterface.AbstractADType,
                      args::Tuple, kwargs::NamedTuple, active)
     resolved = _ad_resolve(resolver, args, kwargs)
-    call, point, contexts, active_index = _ad_call(kernel, resolved, active)
+    call, point, contexts, active_index =
+        _ad_call(kernel, resolved, active)
     preparation = DifferentiationInterface.prepare_gradient(
         call, backend, point, contexts...)
     PreparedADKernel{active_index,typeof(kernel),typeof(resolver),typeof(call),
@@ -323,6 +362,26 @@ for the active argument's gradient and is mutated in place. Like
 [`ad_gradient`](@ref), this prepared object and its DI preparation are not
 thread-safe; use one per concurrent caller.
 """
+@generated function ad_value_and_gradient!(
+        prepared::PreparedADKernel{I,K,typeof(tuple)}, gradient,
+        args::Vararg{Any,N}) where {I,K,N}
+    1 <= I <= N || return :(throw(ArgumentError(
+        "prepared active input index $I is invalid for $N arguments")))
+    contexts = [
+        :(DifferentiationInterface.Constant(getfield(args, $index)))
+        for index in 1:N if index != I
+    ]
+    quote
+        length(inputs(prepared.kernel)) == $N || throw(ArgumentError(
+            "selected HAVE boundary expects " *
+            string(length(inputs(prepared.kernel))) *
+            " values; got $N"))
+        DifferentiationInterface.value_and_gradient!(
+            prepared.call, gradient, prepared.preparation, prepared.backend,
+            getfield(args, $I), $(contexts...))
+    end
+end
+
 function ad_value_and_gradient!(
         prepared::PreparedADKernel, gradient, args...; kwargs...)
     point, contexts = _ad_prepared_arguments(
@@ -351,8 +410,8 @@ end
 #
 # The differentiation engine stays the caller's DifferentiationInterface backend
 # (the one passed to `prepare_ad`), so ReactiveKernels imports no concrete AD
-# engine here: `AutoEnzyme(mode = Enzyme.Reverse)` traces through Reactant with
-# exact parity against the native reverse pass. The real methods live in
+# engine here: a caller-configured reverse-mode backend traces through Reactant
+# with exact parity against the native reverse pass. The real methods live in
 # `ext/ReactiveKernelsReactantExt.jl` and are selected when the active argument is
 # a Reactant-traced value; without the Reactant weak dependency loaded (or with a
 # host-array active argument) these raise a clear, actionable error instead of a

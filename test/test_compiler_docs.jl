@@ -48,8 +48,13 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
 
     # No other public prose page carries backend/API guidance. Algorithmic
     # uses of the word "gradient" in sampler pages remain domain terminology,
-    # while the evaluation-throughput page belongs to the top-level AD group.
-    ad_pages = Set(("automatic-differentiation.md", "eval-throughput.md"))
+    # while the evaluation-throughput page belongs to the top-level AD group
+    # and the dedicated Eight Schools Reactant page owns its compiled-AD receipt.
+    ad_pages = Set((
+        "automatic-differentiation.md",
+        "eight-schools-reactant.md",
+        "eval-throughput.md",
+    ))
     forbidden_ad_prose = (
         "DifferentiationInterface",
         "AutoEnzyme",

@@ -81,6 +81,12 @@ _trace(x) = Reactant.to_rarray(x)
                 kernel, AD_REACTANT_BACKEND, boundary.args...;
                 active = boundary.active)
 
+            # Host preparation deliberately freezes the fast native-only AD
+            # body. Reactant compilation must reconstruct the full kernel
+            # selector instead of tracing this call, so the tensorized body is
+            # selected once the arguments below become Reactant values.
+            @test prepared.call isa ReactiveKernels._ADNativeKernelCall
+
             reference = similar(boundary.args[1])
             value, reference =
                 ad_value_and_gradient!(prepared, reference, boundary.args...)

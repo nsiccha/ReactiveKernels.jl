@@ -10,6 +10,8 @@ const EXPECTED_EIGHT_SCHOOLS_REACTANT_OUTCOMES =
     ("joint", "prior", "likelihood", "pointwise")
 
 _eight_schools_reactant_median(values) = Statistics.median(Float64.(values))
+_eight_schools_reactant_text_sha256(path) = bytes2hex(SHA.sha256(
+    replace(read(path, String), "\r\n" => "\n", "\r" => "\n")))
 
 function validate_eight_schools_reactant_receipt(
     path::AbstractString;
@@ -57,7 +59,7 @@ function validate_eight_schools_reactant_receipt(
             "packages/ReactiveKernelsPPLExamples/src/eight_schools.jl",
             "unexpected Eight Schools source-authority path")
     require(get(pins, "primal_receipt_sha256", "") ==
-            bytes2hex(SHA.sha256(read(primal_path))),
+            _eight_schools_reactant_text_sha256(primal_path),
             "matched primal receipt digest mismatch")
     if haskey(primal, "pins")
         require(get(pins, "primal_receipt_reactivekernels_sha", "") ==

@@ -24,6 +24,8 @@ const EXPECTED_EIGHT_SCHOOLS_REACTANT_AD_REACTANT_REQUIRED = Set((
 ))
 
 _eight_schools_reactant_ad_median(values) = Statistics.median(Float64.(values))
+_eight_schools_reactant_ad_text_sha256(path) = bytes2hex(SHA.sha256(
+    replace(read(path, String), "\r\n" => "\n", "\r" => "\n")))
 
 function validate_eight_schools_reactant_ad_receipt(path::AbstractString;
         root::AbstractString = normpath(joinpath(dirname(path), "..", "..")))
@@ -73,7 +75,7 @@ function validate_eight_schools_reactant_ad_receipt(path::AbstractString;
         require(get(ad_receipt, "schema", "") == "eight-schools-ad-v1",
                 "matched receipt must use schema eight-schools-ad-v1")
         require(get(pins, "ad_receipt_sha256", "") ==
-                bytes2hex(SHA.sha256(read(ad_path))),
+                _eight_schools_reactant_ad_text_sha256(ad_path),
                 "matched AD receipt digest mismatch")
         if haskey(ad_receipt, "pins")
             require(get(pins, "ad_receipt_reactivekernels_sha", "") ==
