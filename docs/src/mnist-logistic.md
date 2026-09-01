@@ -95,7 +95,7 @@ partial-evaluation variant. With two model sources, the sampler headline is a
 must be supported. Nonallocating AD and nonallocating Reactant remain explicit
 API exclusions until those public kernel types compose.
 
-The benchmark below prepares the authored graphs from two starting boundaries —
+The receipt prepares the authored graphs from two starting boundaries —
 `Packed unconstrained` (a sampler's flattened `[vec(W); b]` vector) and
 `Structured (W, b)` — and asks for four model outcomes. The long-form primal
 receipt includes ordinary and nonallocating RK, both unbound and partially
@@ -110,17 +110,21 @@ the heavier-optimized model shown under Baseline implementations below. Both
 Turing likelihoods are single `@addlogprob!` terms, so Turing has no public
 per-observation pointwise view; those cells stay blank rather than inventing
 an equivalent. Data loading, graph preparation, and transform discovery are
-outside the timed region.
+outside the timed region. The presentation leads with the sampler-relevant
+packed boundary and splits joint, prior, likelihood, and pointwise results into
+separate plots and tables. Every table includes runtime relative to RK
+idiomatic; the complete modifier × boundary inventory remains in the linked
+receipt.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_mnist_logistic_benchmarks()
 ```
 
-Each cell reports the minimum of ten independent BenchmarkTools minimum-time
-rounds — the uncontended-cost estimator; medians and every raw round stay in
-the receipt — together with steady-state allocation bytes and counts. Every
-supported cell must agree numerically with the handwritten control before it
-is timed.
+Displayed runtimes use three significant digits and report the minimum of ten
+independent BenchmarkTools minimum-time rounds — the uncontended-cost
+estimator. Exact values, medians, every raw round, and the complete capability
+matrix stay in the receipt. Every supported cell must agree numerically with
+the handwritten control before it is timed.
 
 ## Wren-compatible PCA-40 primal comparison
 

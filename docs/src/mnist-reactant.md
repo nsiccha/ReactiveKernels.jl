@@ -31,9 +31,11 @@ Reactant-only model is used.
 Main.ReactiveKernelsDocs.render_mnist_reactant_benchmark()
 ```
 
-The table contains steady-state synchronous call time only, reported by the
-same uncontended-cost estimator as the native MNIST receipt (the minimum of
-per-round BenchmarkTools minimums). Host-to-device conversion, kernel
+The outcome-specific plots and tables contain steady-state synchronous call
+time only, reported by the same uncontended-cost estimator as the native MNIST
+receipt (the minimum of per-round BenchmarkTools minimums). Each row uses its
+matched native RK twin as the 1.00× baseline, reports `Reactant ÷ native`, and
+states the faster/slower interpretation. Host-to-device conversion, kernel
 preparation, Reactant compilation, the first synchronous call, and result
 readback are outside that timing and remain recorded in the receipt.
 
