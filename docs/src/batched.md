@@ -78,15 +78,10 @@ plate. Work with observable effects belongs outside `plate`.
 ## Measured parity with the established plate path
 
 The checked-in Normal receipt compares the authored return-only kernel with the
-established `plate(normal.logpdf; ...)` reduction in the **same process, same
-rounds, and same data** at
-`N = 1, 1,000, 10,000, 30,000, 100,000, 1,000,000`. Each cell retains raw
-per-round timings, allocation bytes, and allocation counts. The benchmark also
-compiles both paths with Reactant and checks numerical parity.
-
-```@eval
-Main.ReactiveKernelsDocs.render_batched_benchmarks()
-```
+established `plate(normal.logpdf; ...)` reduction in the same process, rounds,
+and data. Its native and Reactant panels now live under
+[Distribution kernels through Reactant](distributions-reactant.md#batched-authored-graph-parity),
+keeping this page as the one executable source authority for the authored graph.
 
 The native hard gate requires the authored path to stay within 10% of the
 established plate path for every `N ≥ 1,000`; `N = 1` is reported but excluded

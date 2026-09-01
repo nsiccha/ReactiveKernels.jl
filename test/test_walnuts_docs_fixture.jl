@@ -30,26 +30,19 @@ using Test
     @test occursin("render_walnuts_source(:nuts_step)", page)
     @test occursin("render_walnuts_source(:nuts_leaf)", page)
     @test occursin("render_walnuts_source(:entry)", page)
-    @test occursin("render_walnuts_source_interaction()", page)
     @test occursin("render_walnuts_complete_source()", page)
-    @test occursin("WALNUTS_INSPECTION", interactions)
-    @test occursin("captured_method_count", interactions)
-    @test occursin("max_depth = 10", interactions)
-    @test occursin("proposal_capacity", interactions)
-    @test occursin("tree_capacity", interactions)
-    @test occursin("structural_container_roundtrip = true", interactions)
-    @test occursin("recursive_scc", interactions)
-    @test occursin("compiler_frontier_executed = true", interactions)
-    @test occursin(
-        "recursive functional state-machine SCC lowering is not implemented",
-        interactions,
-    )
-    @test occursin("for root `step!`", interactions)
-    @test occursin("compiler_execution_claimed = false", interactions)
+    # The docs build displays this fixture as inert text: it neither loads the
+    # definitions nor executes the former depth-10 compiler-frontier probe.
+    @test !occursin("render_walnuts_source_interaction", page)
+    @test !occursin("render_walnuts_source_interaction", helpers)
+    @test !occursin("WALNUTS_INSPECTION", interactions)
+    @test occursin("Compiler status: not executed during the docs build", page)
     @test occursin("does not claim full", page)
     @test occursin("recursive-SCC or WALNUTS compiler support", page)
-    @test occursin("\"WALNUTS-D mathematical kernel\" => \"walnuts.md\"", make)
-    @test occursin("walnuts_kernel_authoring_fixture.jl", make)
-    @test occursin("walnuts_compiler_support.jl", make)
+    @test occursin("\"WALNUTS-D source (not executed)\" => \"walnuts.md\"", make)
+    @test !occursin("include(joinpath(@__DIR__, \"..\", \"benchmark\", \"walnuts_kernel_authoring_fixture.jl\"))", make)
+    @test !occursin("walnuts_compiler_support.jl", make)
+    @test !occursin("WalnutsKernelAuthoringFixture", make)
+    @test !occursin("ReactiveKernels.method_irs(getfield(fixture, :walnuts_state))", helpers)
     @test occursin("\"walnuts.md\" =>", rendered_check)
 end

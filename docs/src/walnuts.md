@@ -17,11 +17,11 @@ retained as research lineage. The independent acceptance executable compiles
 the pinned C++ header in a separate process; the Julia fixture and compiler do
 not provide their own expected answers.
 
-Every code block below is read at build time from
+Every code block below is read as inert text at build time from
 [`benchmark/walnuts_kernel_authoring_fixture.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/walnuts_kernel_authoring_fixture.jl).
-The docs build also loads that file and requires its 15 captured methods to
-remain valid MethodIR, so GitHub Pages cannot silently publish a stale
-transcription.
+The docs build validates textual source anchors so GitHub Pages cannot silently
+publish a stale transcription, but it does not include the file, load its
+definitions, or request captured MethodIR.
 
 ## State, bounds, and observable replay
 
@@ -84,27 +84,18 @@ by itself, evidence that either generic compiler path is accepted.
 Main.ReactiveKernelsDocs.render_walnuts_source(:entry)
 ```
 
-## Build-executed depth-10 compiler frontier
+## Compiler status: not executed during the docs build
 
-The exact interaction below is evaluated during the docs build from the same
-support fixture as the focused compiler test. With `max_depth = 10`, it captures
-all 15 state methods, constructs the endpoint transition and typed effect
-ports, compiles the stateful boundary, takes its snapshot, and builds the
-prototype-derived proposal and tree containers. Their capacities are 12 and 11
-respectively, and both round-trip through the finite numeric backend ABI while
-preserving their recursive layout, static authorities, and alias topology.
-
-The next compiler step fails closed at the explicitly named recursive control
-boundary: the `step!` / `start!` / `finish!` strongly connected component. The
-current diagnostic names root `step!` and begins `recursive functional
-state-machine SCC lowering is not implemented`. The interaction requires the
-full exact diagnostic. It intentionally does **not** execute `walnuts!!`, does
-not compile a WALNUTS transition with Reactant, and does not claim full
-recursive-SCC or WALNUTS compiler support.
-
-```@eval
-Main.ReactiveKernelsDocs.render_walnuts_source_interaction()
-```
+The docs build does not include, parse, lower, compile, or execute any part of
+this fixture; it only reads the displayed source bytes above. The recursive
+`step!` / `start!` / `finish!` strongly connected component sits at the active
+compiler frontier: bounded recursive state-machine lowering is under
+development and its contract is still moving, so a build-executed frontier
+probe would pin the docs to a boundary that changes underneath them. This page
+therefore intentionally does **not** execute `walnuts!!`, does not compile a
+WALNUTS transition natively or with Reactant, and does not claim full
+recursive-SCC or WALNUTS compiler support. The compiler-side boundary is owned
+by the focused compiler tests, not by this page.
 
 ## Independent control receipt
 
