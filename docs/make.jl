@@ -8,35 +8,14 @@ using ReactiveKernelsNUTSExamples
 using ReactiveKernelsPPLExamples
 using ReactiveKernelsStreamingStats
 
-# Opt into the external NUTS/HMC compiler-acceptance exemplar for the sampling
-# and online-statistics pages. ReactiveKernels itself deliberately does not load it.
-include(joinpath(@__DIR__, "..", "examples", "nuts_runtime.jl"))
-using .ReactiveKernelsNUTSExample
-
-# Load the exact method-bearing NUTS authoring fixture in an isolated namespace.
-# Its public `nuts!!` entry is executed by a source-locked interaction on nuts.md;
-# keeping it separate avoids rebinding the runtime exemplar's ordinary API.
-module ReactiveKernelsDocsNUTSFixture
-include(joinpath(@__DIR__, "..", "benchmark", "nuts_kernel_authoring_fixture.jl"))
-end
-
 # Opt into the standalone nutpie/nuts-rs diagonal-adaptation compiler corpus.
 # It remains an external mathematical example rather than a package API.
 include(joinpath(@__DIR__, "..", "examples", "nutpie_diagonal_adaptation.jl"))
 import .NutpieDiagonalAdaptationExample
 
-# Parse the external WALNUTS-D mathematical authoring fixture during the docs
-# build.  The docs renderer below reads the exact source file for display, while
-# this include makes malformed or no-longer-admitted @kernel source fail the
-# GitHub Pages build instead of publishing a stale code listing.
-include(joinpath(@__DIR__, "..", "benchmark", "walnuts_kernel_authoring_fixture.jl"))
-
-# Execute the same depth-10 compiler-frontier construction as the focused test.
-# This support module builds prototype-derived proposal/tree containers and
-# reaches the named recursive-SCC rejection without claiming that `walnuts!!`
-# itself is compiled or executed.
-include(joinpath(@__DIR__, "..", "test", "fixtures",
-                 "walnuts_compiler_support.jl"))
+# NUTS and WALNUTS authoring fixtures are deliberately not included here.
+# Their pages read the source files as inert text; docs builds must not parse,
+# lower, compile, or execute either moving compiler/runtime surface.
 
 # Load the accepted ReactiveHMC compiler-corpus authorities themselves. The
 # corpus page extracts source from these exact files and inspects their captured
@@ -60,36 +39,48 @@ site_pages = [
         "Distribution kernels" => "distributions.md",
         "Batched log densities" => "batched.md",
     ],
-    "Building blocks" => [
-        "Non-allocating kernels" => "nonallocating.md",
+    "Probabilistic programming" => [
+        "Eight schools" => "eight-schools.md",
+        "MNIST multinomial logistic" => "mnist-logistic.md",
+        "Other model walkthroughs" => [
+            "Linear regression" => "linear-regression.md",
+            "Beta-binomial" => "beta-binomial.md",
+            "Poisson-Gamma" => "poisson-gamma.md",
+            "Dugongs (nonlinear growth)" => "dugongs-growth.md",
+            "ARMA(1,1) time series" => "arma11.md",
+            "Gaussian mixture" => "gaussian-mixture.md",
+        ],
     ],
     "Automatic differentiation" => [
         "Prepared gradients" => "automatic-differentiation.md",
+        "Distributions: scalar and batched" => "distributions-ad.md",
+        "PPL: Eight Schools and MNIST" => "ppl-ad.md",
+    ],
+    "Reactant" => [
+        "Overview" => "reactant.md",
+        "Distributions: scalar and batched" => "distributions-reactant.md",
+        "Probabilistic programming" => [
+            "Eight Schools" => "eight-schools-reactant.md",
+            "MNIST multinomial logistic" => "mnist-reactant.md",
+        ],
+        "AD + Reactant" => "reactant-ad.md",
         "Evaluation throughput vs Turing.jl" => "eval-throughput.md",
+        "Adaptive NUTS receipt (static)" => "nuts-reactant.md",
     ],
-    "Probabilistic programming" => [
-        "Bijectors and constrained parameters" => "bijectors.md",
-        "Eight schools" => "eight-schools.md",
-        "Eight schools with Reactant" => "eight-schools-reactant.md",
-        "Linear regression" => "linear-regression.md",
-        "Beta-binomial" => "beta-binomial.md",
-        "Poisson-Gamma" => "poisson-gamma.md",
-        "Dugongs (nonlinear growth)" => "dugongs-growth.md",
-        "ARMA(1,1) time series" => "arma11.md",
-        "Gaussian mixture" => "gaussian-mixture.md",
-        "MNIST multinomial logistic" => "mnist-logistic.md",
-        "MNIST with Reactant" => "mnist-reactant.md",
+    "Kernel execution and tools" => [
+        "Non-allocating kernels" => "nonallocating.md",
+        "DAG visualization" => "visualization.md",
+        "API" => "api.md",
     ],
-    "Sampling" => [
+    "Bijectors" => "bijectors.md",
+    "Sampling (experimental)" => [
         "Pathfinder approximation" => "pathfinder.md",
         "ReactiveHMC kernel corpus" => "reactivehmc-corpus.md",
-        "NUTS sampling" => "nuts.md",
+        "NUTS source and receipts (not executed)" => "nuts.md",
         "Nutpie diagonal adaptation" => "nutpie-diagonal.md",
-        "WALNUTS-D mathematical kernel" => "walnuts.md",
+        "WALNUTS-D source (not executed)" => "walnuts.md",
         "Online statistics" => "online-stats.md",
     ],
-    "Visualization" => "visualization.md",
-    "API" => "api.md",
 ]
 
 makedocs(

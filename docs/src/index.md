@@ -9,8 +9,11 @@ hero:
   tagline: Lower a dataflow graph and a have/want query into a specialized, straight-line Julia kernel — no traversal, no scheduling, no interpretation on the hot path.
   actions:
     - theme: brand
-      text: API Reference
-      link: /api
+      text: Compiler capability
+      link: /compiler
+    - theme: alt
+      text: Eight Schools
+      link: /eight-schools
     - theme: alt
       text: View on GitHub
       link: https://github.com/nsiccha/ReactiveKernels.jl
@@ -274,18 +277,12 @@ invalidates only the cached results that actually depended on it, and the
 planner reruns just the missing part — with all of that cache bookkeeping
 staying outside the generated kernel.
 
-Mathematical `PreparedKernel`s that Reactant can trace can also run on a GPU or
-TPU through the optional Reactant extension, and `replica` runs a whole scalar
-kernel across an extra batch axis (for example one column per chain). This is
-narrower than “run any reactive state on an accelerator.” The optional external
-[adaptive-NUTS exemplar](nuts.md#reactant-adaptive-transition-and-multiple-chains)
-compiles one full-depth transition to one data-dependent traced `while`, with
-pre-generated momentum, direction, and exponential tensors plus explicit
-counters, so there is no host RNG inside the trace. It is scoped to `Float64`, a
-positive diagonal Euclidean metric, the locked authored control-flow graph, and
-the current diagnostics callback. Overflow and unsupported cases reject; the
-native adaptive API remains CPU execution. Its example source and executable
-acceptance test are linked from the focused NUTS page.
+Mathematical `PreparedKernel`s that Reactant can trace can also run through the
+optional compiler extension, and `replica` lifts a whole scalar kernel across an
+extra batch axis. The reviewed distribution, PPL, and compiled-AD evidence now
+lives under the top-level [Reactant integration](reactant.md) section. Sampling
+receipts are kept last and static; NUTS and WALNUTS compiler/runtime code is not
+executed during documentation builds.
 
 > **Status:** early development — the public API is still being shaped.
 
