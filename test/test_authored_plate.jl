@@ -349,7 +349,7 @@ end
     @test occursin("similar", string(pointwise_ast))
     @test occursin("similar", string(both_ast))
     @test !occursin("for ", string(total.f.tensorized_ast))
-    @test occursin("broadcast", string(total.f.tensorized_ast))
+    @test occursin("_tensorized_plate_call", string(total.f.tensorized_ast))
     native_text = string(total_ast)
     @test findfirst("Base.broadcastable", native_text) <
           findfirst("__ops__[", native_text)

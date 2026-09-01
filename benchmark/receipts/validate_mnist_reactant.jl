@@ -10,12 +10,16 @@ const EXPECTED_MNIST_REACTANT_OUTCOMES =
     ("joint", "prior", "likelihood", "pointwise")
 # Cells the published receipt must show compiling through Reactant; a receipt
 # where one of these regressed to unsupported is rejected, not silently landed.
-# The likelihood-bearing cells currently stop at the plate-over-eachcol +
-# traced-index gather frontier (the earlier mixed constant/traced vcat blocker
-# is fixed); extend this set when that upstream capability lands.
+# Canonical eachcol/gather lowering makes the complete primal matrix mandatory.
 const EXPECTED_MNIST_REACTANT_COMPILED = (
+    ("packed_unconstrained", "joint"),
     ("packed_unconstrained", "prior"),
+    ("packed_unconstrained", "likelihood"),
+    ("packed_unconstrained", "pointwise"),
+    ("structured_parameters", "joint"),
     ("structured_parameters", "prior"),
+    ("structured_parameters", "likelihood"),
+    ("structured_parameters", "pointwise"),
 )
 
 _mnist_reactant_median(values) = Statistics.median(Float64.(values))
@@ -104,6 +108,13 @@ function validate_mnist_reactant_receipt(
     require(get(protocol, "matrix_source", "") ==
             "benchmark/receipts/mnist-logistic-v1.toml",
             "benchmark must name the matched primal receipt")
+    require(get(protocol, "partial_evaluation_enabled", true) == false,
+            "full-data Reactant receipt must keep data as runtime inputs")
+    require(Tuple(get(protocol, "runtime_data_ports", String[])) ==
+            ("X", "y", "num_classes"),
+            "benchmark must record the complete runtime data boundary")
+    require(get(protocol, "native_and_reactant_use_same_runtime_boundary", false) == true,
+            "native and Reactant timings must share one runtime boundary")
     require(Int(get(protocol, "rounds", 0)) >= 10,
             "published receipt must contain at least ten raw rounds")
     require(Int(get(protocol, "samples_per_round", 0)) >= 1,
@@ -209,10 +220,8 @@ function validate_mnist_reactant_receipt(
                     "$boundary / $outcome unsupported without a diagnostic")
         end
     end
-    for (boundary, outcome) in EXPECTED_MNIST_REACTANT_COMPILED
-        require((boundary, outcome) in supported_reactant,
-                "$boundary / $outcome must compile through Reactant")
-    end
+    require(supported_reactant == Set(EXPECTED_MNIST_REACTANT_COMPILED),
+            "the complete 2×4 primal matrix must compile through Reactant")
     errors
 end
 
