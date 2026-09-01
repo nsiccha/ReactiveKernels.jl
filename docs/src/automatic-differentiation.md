@@ -5,10 +5,13 @@ ReactiveKernels exposes automatic differentiation through
 a concrete differentiation engine: Enzyme is an optional test and example
 dependency, and core package source never imports it.
 
-`prepare_ad` resolves one active HAVE port and one scalar WANT once. Every
-other selected HAVE is supplied to the backend as a freshly rebound `Constant`,
-so preparation fixes types and shapes without freezing values used by later
-calls.
+`prepare_ad` resolves one active HAVE port and one scalar WANT once.
+`prepare_ad_pullback` applies the same boundary to a scalar or non-scalar WANT
+and prepares one reverse output-cotangent direction. Every other selected HAVE
+is supplied to the backend as a freshly rebound `Constant`, so preparation
+fixes types and shapes without freezing values used by later calls. Both paths
+differentiate the exact primal callable, operation table, and inspectable AST;
+RK does not generate an AD-specific kernel.
 
 ## Prepare once, then request gradients or value-and-gradient
 
@@ -50,13 +53,41 @@ value, returned_gradient = ad_value_and_gradient!(
 ```
 
 `ad_gradient` returns only the derivative. The prepared-only
-`ad_value_and_gradient!` returns `(value, gradient)` and fills caller-owned
-storage. Both preserve authored positional defaults and keyword interfaces while
-rebuilding inactive constants from the current call.
+`ad_value_and_gradient` preserves structured results such as a `NamedTuple`,
+while `ad_value_and_gradient!` returns `(value, gradient)` and fills
+caller-owned array storage. All preserve authored positional defaults and
+keyword interfaces while rebuilding inactive constants from the current call.
+
+## Structured gradients and reverse pullbacks
+
+One active HAVE may be a recursively differentiable `NamedTuple` of floating
+scalars, arrays, tuples, and nested NamedTuples. `ad_gradient` and
+`ad_value_and_gradient` preserve that structure in the returned sensitivity.
+DI's Enzyme backend does not currently provide a caller-owned mutation contract
+for such structured destinations, so RK does not pretend that
+`ad_value_and_gradient!` supports them.
+
+For a vector-valued WANT, prepare a reverse pullback with an exemplar output
+cotangent and reuse it with current arguments and cotangents:
+
+```julia
+prepared_vjp = prepare_ad_pullback(
+    pointwise_kernel, backend, output_cotangent, parameters, data;
+    active = :parameters,
+)
+value, vjp = ad_value_and_pullback(
+    prepared_vjp, output_cotangent, parameters, data,
+)
+```
+
+The returned sensitivity is `J' * output_cotangent`, computed in one reverse
+pass. It is not a full Jacobian. `ad_value_and_pullback!` accepts caller-owned
+array cotangent storage when the backend supports it.
 
 ## Accepted boundary
 
-- The requested WANT is scalar and explicit when several outputs are possible.
+- Gradient preparation requires a scalar WANT. Pullback preparation accepts one
+  scalar or non-scalar WANT and an output-cotangent exemplar.
 - Exactly one HAVE port is active.
 - Integer active ports and aliased active boundaries reject.
 - An inactive HAVE downstream of the active port rejects rather than cutting a

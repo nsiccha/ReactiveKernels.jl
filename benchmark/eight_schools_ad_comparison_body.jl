@@ -48,12 +48,19 @@ const EIGHT_SCHOOLS_COMPARATOR_PUBLISHED_SHA =
 
 const _RKValueGradientCall = RKValueGradientCall
 const _DIValueGradientCall = DIValueGradientCall
+const _RKAllocatingValueGradientCall = RKAllocatingValueGradientCall
+const _DIAllocatingValueGradientCall = DIAllocatingValueGradientCall
+const _RKValuePullbackCall = RKValuePullbackCall
+const _RKAllocatingValuePullbackCall = RKAllocatingValuePullbackCall
+const _DIValuePullbackCall = DIValuePullbackCall
+const _DIAllocatingValuePullbackCall = DIAllocatingValuePullbackCall
 const _TuringValueGradientCall = TuringValueGradientCall
 const _measurement = measurement
 const _build_and_first_call = build_and_first_call
 const _record_implementation = record_implementation
 const _gradient_error = gradient_error
 const _gradient_scale = gradient_scale
+const _flatten_sensitivity = flatten_sensitivity
 const _package_version = package_version
 const _output_path = output_path
 const _source_pin = source_pin
@@ -75,7 +82,41 @@ function _finite_difference_gradient(objective, point)
     gradient
 end
 
-function _manual_definition(boundary, outcome, q, θ, observations,
+function _finite_difference_gradient(objective, point::NamedTuple)
+    names = keys(point)
+    gradients = map(names, values(point)) do name, value
+        if value isa AbstractFloat
+            step = cbrt(eps(Float64)) * max(1.0, abs(value))
+            plus = merge(point, NamedTuple{(name,)}((value + step,)))
+            minus = merge(point, NamedTuple{(name,)}((value - step,)))
+            (objective(plus) - objective(minus)) / (2step)
+        elseif value isa AbstractArray{<:AbstractFloat}
+            gradient = similar(value, Float64)
+            plus_value = copy(value)
+            minus_value = copy(value)
+            for index in eachindex(value)
+                step = cbrt(eps(Float64)) * max(1.0, abs(value[index]))
+                plus_value[index] = value[index] + step
+                minus_value[index] = value[index] - step
+                plus = merge(point, NamedTuple{(name,)}((plus_value,)))
+                minus = merge(point, NamedTuple{(name,)}((minus_value,)))
+                gradient[index] = (objective(plus) - objective(minus)) / (2step)
+                plus_value[index] = value[index]
+                minus_value[index] = value[index]
+            end
+            gradient
+        else
+            error("unsupported finite-difference field $name::$(typeof(value))")
+        end
+    end
+    NamedTuple{names}(gradients)
+end
+
+_pointwise_seed(observations) =
+    [isodd(index) ? 0.5 + 0.1index : -(0.5 + 0.1index)
+     for index in eachindex(observations)]
+
+function _manual_definition(boundary, outcome, q, θ, parameters, observations,
                             observation_scales)
     if boundary == "packed_unconstrained"
         if outcome == "joint"
@@ -96,12 +137,51 @@ function _manual_definition(boundary, outcome, q, θ, observations,
                 DifferentiationInterface.Constant(observation_scales),
             )
             raw = x -> objective(x, observations, observation_scales)
+        elseif outcome == "pointwise"
+            objective = Primal._manual_unconstrained_pointwise
+            contexts = (
+                DifferentiationInterface.Constant(observations),
+                DifferentiationInterface.Constant(observation_scales),
+            )
+            raw = x -> objective(x, observations, observation_scales)
         else
             return nothing
         end
         return (; objective, contexts, raw, point = q)
-    elseif boundary == "minimal_likelihood" && outcome == "likelihood"
-        objective = Primal._manual_likelihood
+    elseif boundary == "constrained_parameters"
+        if outcome == "joint"
+            objective = Primal._manual_constrained_joint
+            contexts = (
+                DifferentiationInterface.Constant(observations),
+                DifferentiationInterface.Constant(observation_scales),
+            )
+            raw = x -> objective(x, observations, observation_scales)
+        elseif outcome == "prior"
+            objective = Primal._manual_constrained_prior
+            contexts = ()
+            raw = objective
+        elseif outcome == "likelihood"
+            objective = Primal._manual_constrained_likelihood
+            contexts = (
+                DifferentiationInterface.Constant(observations),
+                DifferentiationInterface.Constant(observation_scales),
+            )
+            raw = x -> objective(x, observations, observation_scales)
+        elseif outcome == "pointwise"
+            objective = Primal._manual_constrained_pointwise
+            contexts = (
+                DifferentiationInterface.Constant(observations),
+                DifferentiationInterface.Constant(observation_scales),
+            )
+            raw = x -> objective(x, observations, observation_scales)
+        else
+            return nothing
+        end
+        return (; objective, contexts, raw, point = parameters)
+    elseif boundary == "minimal_likelihood" &&
+           outcome in ("likelihood", "pointwise")
+        objective = outcome == "likelihood" ?
+            Primal._manual_likelihood : Primal._manual_pointwise
         contexts = (
             DifferentiationInterface.Constant(observations),
             DifferentiationInterface.Constant(observation_scales),
@@ -112,7 +192,7 @@ function _manual_definition(boundary, outcome, q, θ, observations,
     nothing
 end
 
-function _rk_definition(model, boundary, outcome, q, θ, observations,
+function _rk_definition(model, boundary, outcome, q, θ, parameters, observations,
                         observation_scales)
     if boundary == "packed_unconstrained"
         if outcome == "joint"
@@ -129,13 +209,34 @@ function _rk_definition(model, boundary, outcome, q, θ, observations,
                 have = (:unconstrained, :observations, :observation_scales),
                 want = :likelihood)
             arguments = (q, observations, observation_scales)
+        elseif outcome == "pointwise"
+            kernel = prepare(model;
+                have = (:unconstrained, :observations, :observation_scales),
+                want = :pointwise)
+            arguments = (q, observations, observation_scales)
         else
             return nothing
         end
         return (; kernel, arguments, active = :unconstrained)
-    elseif boundary == "minimal_likelihood" && outcome == "likelihood"
+    elseif boundary == "constrained_parameters"
+        outcome == "pointwise" && return nothing
+        want = outcome == "joint" ? :constrained_logdensity : Symbol(outcome)
+        kernel = if outcome == "prior"
+            prepare(model; have = :parameters, want)
+        elseif outcome in ("joint", "likelihood", "pointwise")
+            prepare(model;
+                have = (:parameters, :observations, :observation_scales), want)
+        else
+            return nothing
+        end
+        arguments = outcome == "prior" ? (parameters,) :
+            (parameters, observations, observation_scales)
+        return (; kernel, arguments, active = :parameters)
+    elseif boundary == "minimal_likelihood" &&
+           outcome in ("likelihood", "pointwise")
         kernel = prepare(model;
-            have = (:θ, :observations, :observation_scales), want = :likelihood)
+            have = (:θ, :observations, :observation_scales),
+            want = Symbol(outcome))
         return (; kernel, arguments = (θ, observations, observation_scales),
                 active = :θ)
     end
@@ -153,12 +254,11 @@ function _turing_logdensity(model, outcome)
 end
 
 function _unsupported_reason(boundary, outcome)
-    outcome == "pointwise" && return (
-        "pointwise is vector-valued and neither compared public surface exposes " *
-        "a useful matched Jacobian/VJP contract")
-    boundary == "constrained_parameters" && return (
-        "the public RK AD boundary accepts floating scalar/array/tuple storage, " *
-        "not the primal matrix's constrained NamedTuple")
+    boundary == "constrained_parameters" && outcome == "pointwise" && return (
+        "the public reverse-pullback surface supports the pointwise WANT, and " *
+        "the public gradient surface supports the constrained NamedTuple, but " *
+        "DifferentiationInterface/Enzyme cannot currently annotate their " *
+        "MixedDuplicated cross-product")
     boundary == "minimal_likelihood" && return (
         "joint and prior are unavailable from the minimal likelihood HAVE boundary")
     "unsupported matrix cell"
@@ -222,9 +322,11 @@ function run_eight_schools_ad_comparison()
     for boundary in EIGHT_SCHOOLS_AD_BOUNDARIES,
         outcome in EIGHT_SCHOOLS_AD_OUTCOMES
         manual_definition = _manual_definition(
-            boundary, outcome, q, θ, observations, observation_scales)
+            boundary, outcome, q, θ, parameters,
+            observations, observation_scales)
         rk_definition = _rk_definition(
-            model, boundary, outcome, q, θ, observations, observation_scales)
+            model, boundary, outcome, q, θ, parameters,
+            observations, observation_scales)
         row = Dict{String,Any}(
             "boundary" => boundary,
             "outcome" => outcome,
@@ -239,37 +341,97 @@ function run_eight_schools_ad_comparison()
 
         row["supported"] = true
         row["active_port"] = String(rk_definition.active)
-        reference_value = Float64(manual_definition.raw(manual_definition.point))
+        pointwise = outcome == "pointwise"
+        seed = pointwise ? _pointwise_seed(observations) : 1.0
+        reference_value = manual_definition.raw(manual_definition.point)
+        scalar_reference = pointwise ?
+            x -> sum(seed .* manual_definition.raw(x)) :
+            manual_definition.raw
         reference_gradient = _finite_difference_gradient(
-            manual_definition.raw, manual_definition.point)
-        row["finite_difference_gradient"] = collect(reference_gradient)
+            scalar_reference, manual_definition.point)
+        row["finite_difference_gradient"] =
+            _flatten_sensitivity(reference_gradient)
+        row["operation"] = pointwise ? "value and pullback" :
+            "value and gradient"
+        pointwise && (row["output_cotangent"] = seed)
+
+        structured = manual_definition.point isa NamedTuple
+        caller_owned = !structured
 
         rk_call, rk_result, rk_setup = _build_and_first_call() do
-            prepared = prepare_ad(
-                rk_definition.kernel, RK_AD_BACKEND,
-                rk_definition.arguments...; active = rk_definition.active)
-            _RKValueGradientCall(
-                prepared, similar(manual_definition.point), rk_definition.arguments)
+            if pointwise
+                prepared = prepare_ad_pullback(
+                    rk_definition.kernel, RK_AD_BACKEND, seed,
+                    rk_definition.arguments...; active = rk_definition.active)
+                if caller_owned
+                    _RKValuePullbackCall(
+                        prepared, similar(manual_definition.point), seed,
+                        rk_definition.arguments)
+                else
+                    _RKAllocatingValuePullbackCall(
+                        prepared, seed, rk_definition.arguments)
+                end
+            elseif structured
+                prepared = prepare_ad(
+                    rk_definition.kernel, RK_AD_BACKEND,
+                    rk_definition.arguments...; active = rk_definition.active)
+                _RKAllocatingValueGradientCall(
+                    prepared, rk_definition.arguments)
+            else
+                prepared = prepare_ad(
+                    rk_definition.kernel, RK_AD_BACKEND,
+                    rk_definition.arguments...; active = rk_definition.active)
+                _RKValueGradientCall(
+                    prepared, similar(manual_definition.point),
+                    rk_definition.arguments)
+            end
         end
         row["rk_native"] = _record_implementation(
             rk_call, rk_result, rk_setup, reference_value, reference_gradient;
-            rounds, caller_owned = true)
+            rounds, caller_owned)
 
         manual_call, manual_result, manual_setup = _build_and_first_call() do
-            preparation = DifferentiationInterface.prepare_gradient(
-                manual_definition.objective, RK_AD_BACKEND,
-                manual_definition.point, manual_definition.contexts...)
-            _DIValueGradientCall(
-                manual_definition.objective, similar(manual_definition.point),
-                preparation, RK_AD_BACKEND, manual_definition.point,
-                manual_definition.contexts)
+            if pointwise
+                preparation = DifferentiationInterface.prepare_pullback(
+                    manual_definition.objective, RK_AD_BACKEND,
+                    manual_definition.point, (seed,),
+                    manual_definition.contexts...)
+                if caller_owned
+                    _DIValuePullbackCall(
+                        manual_definition.objective,
+                        similar(manual_definition.point), seed, preparation,
+                        RK_AD_BACKEND, manual_definition.point,
+                        manual_definition.contexts)
+                else
+                    _DIAllocatingValuePullbackCall(
+                        manual_definition.objective, seed, preparation,
+                        RK_AD_BACKEND, manual_definition.point,
+                        manual_definition.contexts)
+                end
+            elseif structured
+                preparation = DifferentiationInterface.prepare_gradient(
+                    manual_definition.objective, RK_AD_BACKEND,
+                    manual_definition.point, manual_definition.contexts...)
+                _DIAllocatingValueGradientCall(
+                    manual_definition.objective, preparation, RK_AD_BACKEND,
+                    manual_definition.point, manual_definition.contexts)
+            else
+                preparation = DifferentiationInterface.prepare_gradient(
+                    manual_definition.objective, RK_AD_BACKEND,
+                    manual_definition.point, manual_definition.contexts...)
+                _DIValueGradientCall(
+                    manual_definition.objective,
+                    similar(manual_definition.point), preparation,
+                    RK_AD_BACKEND, manual_definition.point,
+                    manual_definition.contexts)
+            end
         end
         row["manual_enzyme"] = _record_implementation(
             manual_call, manual_result, manual_setup,
             reference_value, reference_gradient;
-            rounds, caller_owned = true)
+            rounds, caller_owned)
 
-        if boundary == "packed_unconstrained"
+        if boundary == "packed_unconstrained" && !pointwise
             turing_call, turing_result, turing_ad_setup = _build_and_first_call() do
                 _TuringValueGradientCall(
                     _turing_logdensity(turing_model, outcome), turing_q)
@@ -280,8 +442,9 @@ function run_eight_schools_ad_comparison()
                 rounds, caller_owned = false)
         else
             row["turing_supported"] = false
-            row["turing_unsupported_reason"] =
-                "the published primal matrix has no Turing minimal-likelihood boundary"
+            row["turing_unsupported_reason"] = pointwise ?
+                "the compared Turing density has no matched public pointwise VJP surface" :
+                "the published primal matrix has no Turing constrained or minimal-likelihood AD boundary"
         end
 
         push!(measurements, row)
@@ -330,8 +493,10 @@ function run_eight_schools_ad_comparison()
             "outcomes" => collect(EIGHT_SCHOOLS_AD_OUTCOMES),
             "source_reused" => true,
             "matrix_source" => primal_path,
-            "gradient_operation" => "value and gradient",
-            "rk_surface" => "prepare_ad + ad_value_and_gradient!",
+            "gradient_operation" =>
+                "value and gradient for scalar WANTs; value and reverse pullback for pointwise WANTs",
+            "rk_surface" =>
+                "prepare_ad + ad_value_and_gradient!; prepare_ad_pullback + ad_value_and_pullback[!]",
             "rk_backend" => "AutoEnzyme(mode = Enzyme.Reverse)",
             "manual_control" =>
                 "the primal receipt's manual Julia density differentiated through the same prepared DI+Enzyme boundary",
@@ -341,6 +506,10 @@ function run_eight_schools_ad_comparison()
                 "AutoEnzyme(runtime activity, Const function annotation)",
             "parity_oracle" => "central finite differences of the manual Julia density",
             "pointwise_jacobian_or_vjp_invented" => false,
+            "pointwise_vjp_contract" =>
+                "one deterministic output cotangent through public prepared reverse pullbacks; no full Jacobian",
+            "structured_cotangent_ownership" =>
+                "NamedTuple sensitivities use the public nonmutating DI/RK pullback; array sensitivities use caller-owned destinations",
             "preparation_in_timed_region" => false,
             "first_execution_in_steady_state_region" => false,
             "rounds" => rounds,

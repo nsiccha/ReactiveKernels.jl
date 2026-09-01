@@ -12,10 +12,13 @@ of either model.
 
 ## Eight Schools model gradient matrix
 
-`prepare_ad` differentiates the exact generated callable and operation table
-used by primal execution. The four scalar cells are the packed unconstrained
-joint, prior, and likelihood plus the minimal θ-only likelihood. Each is checked
-against central finite differences before timing.
+`prepare_ad` and `prepare_ad_pullback` differentiate the exact generated
+callable and operation table used by primal execution. The matrix now covers
+seven scalar gradients: packed unconstrained and constrained-parameter joint,
+prior, and likelihood, plus the minimal θ-only likelihood. Packed and minimal
+pointwise likelihoods use a prepared reverse pullback: one output cotangent
+computes the VJP `J'v` without constructing a full Jacobian. Every sensitivity
+is checked against central finite differences before timing.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_eight_schools_ad_benchmarks()
@@ -27,9 +30,12 @@ Main.ReactiveKernelsDocs.render_eight_schools_ad_benchmarks()
 Main.ReactiveKernelsDocs.render_eight_schools_ad_baselines()
 ```
 
-The constrained parameter object is not a supported active storage type, and
-pointwise output remains blank because the compared public surfaces do not share
-a matched Jacobian/VJP contract. The
+NamedTuple sensitivities preserve the active parameter structure through DI's
+nonmutating gradient result. Array sensitivities use caller-owned destinations.
+The one deliberately blank cross-product is constrained NamedTuple input with a
+pointwise output: Enzyme 0.13.199 currently selects a `MixedDuplicated` activity
+that DifferentiationInterface cannot annotate. That backend limitation is kept
+explicit rather than replaced by a benchmark-only flattening wrapper. The
 [receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/eight-schools-ad-v1.toml)
 retains raw rounds, source and primal pins, parity errors, preparation costs,
 timings, and allocations.

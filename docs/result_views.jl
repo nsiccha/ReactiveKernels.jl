@@ -1487,12 +1487,17 @@ const _EIGHT_SCHOOLS_AD_SUPPORTED = Set((
     ("packed_unconstrained", "joint"),
     ("packed_unconstrained", "prior"),
     ("packed_unconstrained", "likelihood"),
+    ("packed_unconstrained", "pointwise"),
+    ("constrained_parameters", "joint"),
+    ("constrained_parameters", "prior"),
+    ("constrained_parameters", "likelihood"),
     ("minimal_likelihood", "likelihood"),
+    ("minimal_likelihood", "pointwise"),
 ))
 
 function _eight_schools_ad_plot(rows, metric;
                                 id::AbstractString, title::AbstractString)
-    label = metric === :median_ns ? "Median value + gradient runtime (ns)" :
+    label = metric === :median_ns ? "Median reverse-AD runtime (ns)" :
         "Median allocated bytes"
     scale = metric === :median_ns ? log10 : symlog
     cell_order = unique(getproperty.(rows, :cell))
@@ -1506,7 +1511,7 @@ function _eight_schools_ad_plot(rows, metric;
         config(height = 320, scales = scales(Y = (; scale)))
     description = metric === :median_ns ?
         "Preparation and first execution are excluded; the runtime axis is logarithmic." :
-        "The symlog byte axis retains the four genuine zero-allocation RK measurements."
+        "The symlog byte axis retains the genuine zero-allocation scalar RK measurements."
     _plot_block(spec; id, title, description)
 end
 
@@ -1621,12 +1626,13 @@ function render_eight_schools_ad_benchmarks()
     zero_rk == 4 || error("Eight Schools AD receipt lost a zero-allocation RK cell")
     turing_rows = filter(row -> row.implementation == "Turing / DynamicPPL", plot_rows)
     turing_bytes = getproperty.(turing_rows, :median_bytes)
-    summary = "All four differentiable scalar cells supported by the public RK " *
-        "boundary have a zero-byte, zero-allocation steady-state value-and-gradient " *
-        "path. The three matched DynamicPPL cells allocate " *
-        "$(minimum(turing_bytes))–$(maximum(turing_bytes)) B. Pointwise remains " *
-        "blank because there is no useful matched public Jacobian/VJP contract; " *
-        "the constrained NamedTuple boundary is likewise reported unsupported."
+    summary = "The public RK boundary now measures seven scalar gradients and " *
+        "two pointwise reverse pullbacks. Four array-backed scalar cells retain " *
+        "a zero-byte, zero-allocation steady-state path; structured NamedTuple " *
+        "sensitivities use DI's honest nonmutating result. The three matched " *
+        "DynamicPPL scalar cells allocate $(minimum(turing_bytes))–" *
+        "$(maximum(turing_bytes)) B. Only the structured-input × pointwise-output " *
+        "cross-product remains an Enzyme MixedDuplicated limitation."
 
     matrix_columns = (
         _column(:boundary, "Starting boundary"),
@@ -1665,15 +1671,16 @@ function render_eight_schools_ad_benchmarks()
         Markdown.Paragraph(Any[summary]),
         _eight_schools_ad_plot(plot_rows, :median_ns;
             id = "eight-schools-ad-runtime",
-            title = "Eight Schools value-and-gradient runtime"),
+            title = "Eight Schools reverse-AD runtime"),
         _eight_schools_ad_plot(plot_rows, :median_bytes;
             id = "eight-schools-ad-allocation",
-            title = "Eight Schools value-and-gradient allocation"),
+            title = "Eight Schools reverse-AD allocation"),
         _result_table(matrix_rows, matrix_columns;
             id = "eight-schools-ad-matrix",
             title = "AD boundary × outcome matrix",
-            note = "Measured cells show median value-and-gradient runtime; bytes; " *
-                   "allocations. Unsupported cells retain their exact reason."),
+            note = "Scalar cells measure value-and-gradient; pointwise cells " *
+                   "measure value-and-VJP for the receipt's fixed output " *
+                   "cotangent. Unsupported cells retain their exact reason."),
         _result_table(setup_rows, setup_columns;
             id = "eight-schools-ad-setup",
             title = "Preparation, compilation, and first execution",

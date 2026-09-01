@@ -13,8 +13,11 @@ using .ComparisonSourceAttestation:
     comparator_source_matches_current_delta, COMPARATOR_SOURCE_CURRENT_DELTA
 
 export RKValueGradientCall, DIValueGradientCall, TuringValueGradientCall
+export RKAllocatingValueGradientCall, DIAllocatingValueGradientCall
+export RKValuePullbackCall, RKAllocatingValuePullbackCall
+export DIValuePullbackCall, DIAllocatingValuePullbackCall
 export measurement, build_and_first_call, record_implementation
-export gradient_error, gradient_scale
+export gradient_error, gradient_scale, flatten_sensitivity
 export package_version, output_path
 export normalized_text, normalized_read, text_sha256
 export source_pin, published_source_pin, nothing_paths
@@ -31,6 +34,36 @@ end
 (call::RKValueGradientCall)() = ReactiveKernels.ad_value_and_gradient!(
     call.prepared, call.gradient, call.arguments...)
 
+struct RKAllocatingValueGradientCall{P,A}
+    prepared::P
+    arguments::A
+end
+
+(call::RKAllocatingValueGradientCall)() =
+    ReactiveKernels.ad_value_and_gradient(
+        call.prepared, call.arguments...)
+
+struct RKValuePullbackCall{P,G,S,A}
+    prepared::P
+    cotangent::G
+    seed::S
+    arguments::A
+end
+
+(call::RKValuePullbackCall)() = ReactiveKernels.ad_value_and_pullback!(
+    call.prepared, call.cotangent, call.seed, call.arguments...)
+
+struct RKAllocatingValuePullbackCall{P,S,A}
+    prepared::P
+    seed::S
+    arguments::A
+end
+
+
+(call::RKAllocatingValuePullbackCall)() =
+    ReactiveKernels.ad_value_and_pullback(
+        call.prepared, call.seed, call.arguments...)
+
 struct DIValueGradientCall{F,G,P,B,X,C}
     objective::F
     gradient::G
@@ -43,6 +76,54 @@ end
 (call::DIValueGradientCall)() = DifferentiationInterface.value_and_gradient!(
     call.objective, call.gradient, call.preparation, call.backend,
     call.point, call.contexts...)
+
+struct DIAllocatingValueGradientCall{F,P,B,X,C}
+    objective::F
+    preparation::P
+    backend::B
+    point::X
+    contexts::C
+end
+
+(call::DIAllocatingValueGradientCall)() =
+    DifferentiationInterface.value_and_gradient(
+        call.objective, call.preparation, call.backend,
+        call.point, call.contexts...)
+
+struct DIValuePullbackCall{F,G,S,P,B,X,C}
+    objective::F
+    cotangent::G
+    seed::S
+    preparation::P
+    backend::B
+    point::X
+    contexts::C
+end
+
+
+function (call::DIValuePullbackCall)()
+    value, pullbacks = DifferentiationInterface.value_and_pullback!(
+        call.objective, (call.cotangent,), call.preparation, call.backend,
+        call.point, (call.seed,), call.contexts...)
+    value, only(pullbacks)
+end
+
+struct DIAllocatingValuePullbackCall{F,S,P,B,X,C}
+    objective::F
+    seed::S
+    preparation::P
+    backend::B
+    point::X
+    contexts::C
+end
+
+
+function (call::DIAllocatingValuePullbackCall)()
+    value, pullbacks = DifferentiationInterface.value_and_pullback(
+        call.objective, call.preparation, call.backend,
+        call.point, (call.seed,), call.contexts...)
+    value, only(pullbacks)
+end
 
 struct TuringValueGradientCall{F,X}
     logdensity::F
@@ -86,22 +167,40 @@ function build_and_first_call(builder)
     )
 end
 
-gradient_error(actual, expected) =
-    maximum(abs.(actual .- expected); init = 0.0)
+_sensitivity_values(value::Number) = (Float64(value),)
+_sensitivity_values(value::AbstractArray) = Float64.(vec(value))
+_sensitivity_values(value::Tuple) =
+    Iterators.flatten(_sensitivity_values(child) for child in value)
+_sensitivity_values(value::NamedTuple) =
+    Iterators.flatten(_sensitivity_values(child) for child in values(value))
+
+flatten_sensitivity(value) = collect(_sensitivity_values(value))
+
+gradient_error(actual, expected) = maximum(
+    abs.(flatten_sensitivity(actual) .- flatten_sensitivity(expected));
+    init = 0.0)
 gradient_scale(expected) =
-    maximum(abs, expected; init = eps(Float64))
+    maximum(abs, flatten_sensitivity(expected); init = eps(Float64))
+
+value_error(actual::Number, expected::Number) =
+    abs(Float64(actual) - Float64(expected))
+value_error(actual, expected) =
+    maximum(abs.(actual .- expected); init = 0.0)
+
+receipt_value(value::Number) = Float64(value)
+receipt_value(value::AbstractArray) = Float64.(vec(value))
 
 function record_implementation(call, result, setup, reference_value,
                                reference_gradient; rounds, caller_owned)
     value, gradient = result
     merge(setup, measurement(call; rounds), Dict(
-        "value" => Float64(value),
-        "value_abs_error" => abs(Float64(value) - reference_value),
+        "value" => receipt_value(value),
+        "value_abs_error" => value_error(value, reference_value),
         "gradient_max_abs_error" => gradient_error(gradient, reference_gradient),
         "gradient_max_rel_error" =>
             gradient_error(gradient, reference_gradient) /
             max(gradient_scale(reference_gradient), eps(Float64)),
-        "gradient_length" => length(gradient),
+        "gradient_length" => length(flatten_sensitivity(gradient)),
         "caller_owned_gradient" => caller_owned,
     ))
 end
