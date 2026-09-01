@@ -68,6 +68,38 @@ reversed = __cache_apply__(__caches__[2], __ops__[2], copied)
 recipes, inputs, and outputs are all unchanged. Custom `passes` see the ordinary
 function first; the cache rewrite always runs last.
 
+## Fused authored sources decompose into destination-passing steps
+
+An operation captured from `@kernel` source (for example
+`W * transpose(X) .+ b` or `vcat(zeros(1, n), m)`) is a single fused callable,
+and no in-place method can exist for an arbitrary closure. Instead of caching
+such a recipe as one opaque operation, the rewrite decomposes its captured
+expression into primitive steps at preparation time:
+
+- identity-preserving wrappers (`view`, `reshape`, `transpose`, `eachcol`,
+  ranges, scalar arithmetic) run inline — they never owned a buffer worth
+  caching;
+- broadcast materializations (dotted calls, and array `getindex` with range
+  indices), `vcat`, `zeros`/`ones`, and matrix products each become their own
+  destination-passing step with a typed persistent cache, guarded by exact
+  shape and eltype checks so a batch-size change reseeds instead of corrupting
+  a stale buffer;
+- every other call becomes its own cache step, so registered `apply!!`
+  coverage applies per step.
+
+Free symbols in the captured expression resolve against the authoring module's
+own `const` bindings — the exact functions the fused closure would call, never
+name-based guesses. Any source shape outside this grammar (control flow, a
+non-`const` global, a call through a port) keeps the whole-recipe cache step,
+which preserves the original closure semantics unchanged.
+
+One observable difference: a plate reduction such as `sum` over an authored
+plate is fused into an accumulator loop by ordinary `prepare`, while the
+non-allocating kernel materializes the pointwise plate into its cache and then
+sums it. The materialized total is bit-exactly `sum` of the pointwise values;
+against the fused accumulation, only floating-point summation association
+differs.
+
 ## Allocation contract
 
 The first call has no cache yet, so it runs the ordinary allocating operation and
@@ -98,8 +130,10 @@ This first version is deliberately narrow:
   with no recipes returns its inputs directly;
 - a prepared kernel holds this mutable state, so it is not safe to call from two
   tasks at once; prepare one kernel per independent caller;
-- resizing and shape changes are supported only as far as the chosen `apply!!`
-  methods support them.
+- for a generic cache step, resizing and shape changes are supported only as far
+  as the chosen `apply!!` methods support them; the decomposed destination steps
+  (broadcast, `vcat`, `zeros`/`ones`, matrix product) always guard shape and
+  eltype and reseed on a mismatch.
 
 These are limits on how the kernel *runs*, not on what it computes: the graph is
 unchanged, and the same `Plan` can always be given to ordinary `prepare`
