@@ -10,6 +10,7 @@ include("poisson_gamma.jl")
 include("dugongs_growth.jl")
 include("arma11.jl")
 include("gaussian_mixture.jl")
+include("mnist_logistic.jl")
 
 export EightSchoolsExample
 export LinearRegressionExample
@@ -18,5 +19,6 @@ export PoissonGammaExample
 export DugongsGrowthExample
 export ARMA11Example
 export GaussianMixtureExample
+export MNISTLogisticExample
 
 end # module ReactiveKernelsPPLExamples

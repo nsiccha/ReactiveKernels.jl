@@ -8,7 +8,9 @@ export normal, cauchy, laplace
 export BERNOULLI_KERNEL_SOURCE, LOGNORMAL_KERNEL_SOURCE
 export EXPONENTIAL_KERNEL_SOURCE, GEOMETRIC_KERNEL_SOURCE, UNIFORM_KERNEL_SOURCE
 export MVNORMAL_KERNEL_SOURCE, AR1_KERNEL_SOURCE
+export CATEGORICAL_LOGIT_KERNEL_SOURCE
 export bernoulli, lognormal, exponential, geometric, uniform, mvnormal, ar1
+export categorical_logit
 export NORMAL_LOGDENSITY_SOURCE, CAUCHY_LOGDENSITY_SOURCE
 export NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY
 export BERNOULLI_SOURCE, LOGNORMAL_SOURCE
@@ -256,12 +258,21 @@ const AR1_KERNEL_SOURCE = raw"""
 end
 """
 
+const CATEGORICAL_LOGIT_KERNEL_SOURCE = raw"""
+using LogExpFunctions: logsumexp
+
+@kernel categorical_logit(logits::AbstractVector{Float64}) = begin
+    logpdf(observed::Int)::Float64 = logits[observed] - logsumexp(logits)
+end
+"""
+
 const _OTHER_DISTRIBUTION_BINDINGS = _evaluate_source_bindings(
     join((BERNOULLI_KERNEL_SOURCE, LOGNORMAL_KERNEL_SOURCE,
           EXPONENTIAL_KERNEL_SOURCE, GEOMETRIC_KERNEL_SOURCE,
           UNIFORM_KERNEL_SOURCE, MVNORMAL_KERNEL_SOURCE,
-          AR1_KERNEL_SOURCE), "\n"),
-    (:bernoulli, :lognormal, :exponential, :geometric, :uniform, :mvnormal, :ar1),
+          AR1_KERNEL_SOURCE, CATEGORICAL_LOGIT_KERNEL_SOURCE), "\n"),
+    (:bernoulli, :lognormal, :exponential, :geometric, :uniform, :mvnormal, :ar1,
+     :categorical_logit),
 )
 const bernoulli = _OTHER_DISTRIBUTION_BINDINGS[1]
 const lognormal = _OTHER_DISTRIBUTION_BINDINGS[2]
@@ -270,6 +281,7 @@ const geometric = _OTHER_DISTRIBUTION_BINDINGS[4]
 const uniform = _OTHER_DISTRIBUTION_BINDINGS[5]
 const mvnormal = _OTHER_DISTRIBUTION_BINDINGS[6]
 const ar1 = _OTHER_DISTRIBUTION_BINDINGS[7]
+const categorical_logit = _OTHER_DISTRIBUTION_BINDINGS[8]
 
 const BERNOULLI_SOURCE = BERNOULLI_KERNEL_SOURCE * raw"""
 

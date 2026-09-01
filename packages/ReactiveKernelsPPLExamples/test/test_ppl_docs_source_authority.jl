@@ -17,6 +17,8 @@ const PPL_SOURCE_CASES = (
      :ARMA11_SOURCE, :evaluate_arma11_source),
     ("gaussian-mixture.md", "gaussian_mixture.jl", GaussianMixtureExample,
      :GAUSSIAN_MIXTURE_SOURCE, :evaluate_gaussian_mixture_source),
+    ("mnist-logistic.md", "mnist_logistic.jl", MNISTLogisticExample,
+     :MNIST_LOGISTIC_SOURCE, :evaluate_mnist_logistic_source),
 )
 
 @testset "PPL docs and tests share one source authority" begin
@@ -75,6 +77,7 @@ const PPL_SOURCE_CASES = (
         :dugongs_density,
         :arma11_density,
         :gaussian_mixture_density,
+        :mnist_logistic_density,
     )
         @test occursin(":" * string(name), helper_source)
     end
