@@ -1,6 +1,7 @@
 using ReactiveKernels
 using LinearAlgebra
 using Random
+import SHA
 using Test
 
 # Keeps the checked-in benchmark scripts from rotting outside the (external-dep)
@@ -76,6 +77,25 @@ end
     @test isfile(receipt)
     include(validator)
     @test isempty(validate_eight_schools_reactant_ad_receipt(receipt))
+end
+
+@testset "Eight Schools receipt text digests are checkout-line-ending invariant" begin
+    mktempdir() do dir
+        lf_path = joinpath(dir, "lf.txt")
+        crlf_path = joinpath(dir, "crlf.txt")
+        text = "alpha\nβeta\n"
+        write(lf_path, text)
+        write(crlf_path, replace(text, "\n" => "\r\n"))
+        expected = bytes2hex(SHA.sha256(text))
+        for digest in (
+                _eight_schools_ad_text_sha256,
+                _eight_schools_reactant_text_sha256,
+                _eight_schools_reactant_ad_text_sha256,
+            )
+            @test digest(lf_path) == expected
+            @test digest(crlf_path) == expected
+        end
+    end
 end
 
 @testset "adaptive Reactant NUTS benchmark receipt validates" begin
