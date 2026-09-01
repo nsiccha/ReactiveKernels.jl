@@ -67,6 +67,7 @@ export StatefulStateValue, OrderedRNGReplay, total_functional_lowering
 export initial_transition_effects, transition_with_effects
 export drain_observations!
 export ValidatedCompiledTransition, validated_compiled_transition
+export StatefulControlBounds, stateful_control_bounds
 export functionalize_stateful, stateful_snapshot
 
 end # module ReactiveKernels

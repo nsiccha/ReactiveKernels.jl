@@ -34,7 +34,12 @@ end
 _l_ctrl_reject(msg) = error("design-B control-compiler: " * msg)
 _call_args(x) = collect(x.pos)
 
-mutable struct BB; blks::Vector{Blk}; next::Int; end
+mutable struct BB
+    blks::Vector{Blk}
+    next::Int
+    lower_all_loops::Bool
+end
+BB(blks::Vector{Blk}, next::Int) = BB(blks, next, false)
 _newpc!(bb) = (p = bb.next; bb.next += 1; p)
 
 # Compile `stmts`; on fall-through, control continues at `cont_pc` (0 == return).
@@ -51,9 +56,44 @@ function build_region!(bb::BB, stmts, cont_pc::Int, ret_pc::Int, ret_val, by_mid
     if st isa _LocalAssign && _acyclic_call(st.rhs, rec) !== nothing
         m = _acyclic_call(st.rhs, rec); callee = by_mid[m]; fmap = _argmap(callee, st.rhs)
         resume = build_region!(bb, rest, cont_pc, ret_pc, ret_val, by_mid, rec, brk, lcont)
-        vloc = Symbol("__lf_", st.lhs)                       # native local holding the helper result
-        # NOTE: subsequent reads of `st.lhs` are emitted as this native local via emit machinery.
+        # Bind the inlined helper's terminal value to the authored caller
+        # local.  The continuation reads that exact normalized name; using a
+        # private spelling here leaves cross-block liveness/type analysis with
+        # an unassigned authored local.
+        vloc = _lasym(st.lhs)
         return build_region!(bb, [_subst(x, fmap) for x in callee.body], resume, resume, vloc, by_mid, rec, brk, lcont)
+    elseif st isa _ExprStmt && st.expr isa _IfExpr
+        # A discarded ternary may still contain sibling calls. Make the source
+        # branch
+        # explicit before effect grouping so recursive branch calls become
+        # ordinary TCall suspension points with one shared continuation.
+        expression = st.expr
+        after = build_region!(bb, rest, cont_pc, ret_pc, ret_val,
+                              by_mid, rec, brk, lcont)
+        thenpc = build_region!(bb, Any[_ExprStmt(expression.thenv)], after,
+                               ret_pc, ret_val, by_mid, rec, brk, lcont)
+        elsepc = build_region!(bb, Any[_ExprStmt(expression.elsev)], after,
+                               ret_pc, ret_val, by_mid, rec, brk, lcont)
+        pc = _newpc!(bb)
+        push!(bb.blks, Blk(pc, Any[],
+            TBranch(expression.cond, thenpc, elsepc)))
+        return pc
+    elseif st isa _ExprStmt && st.expr isa _Short
+        # Preserve effect-position short-circuit semantics while exposing a
+        # nested callable effect/call to the same CFG machinery.
+        expression = st.expr
+        after = build_region!(bb, rest, cont_pc, ret_pc, ret_val,
+                              by_mid, rec, brk, lcont)
+        bodypc = build_region!(bb, Any[_ExprStmt(expression.rhs)], after,
+                               ret_pc, ret_val, by_mid, rec, brk, lcont)
+        pc = _newpc!(bb)
+        term = expression.op === :&& ?
+            TBranch(expression.lhs, bodypc, after) :
+            expression.op === :|| ?
+                TBranch(expression.lhs, after, bodypc) :
+                error("unsupported effect-position short circuit $(expression.op)")
+        push!(bb.blks, Blk(pc, Any[], term))
+        return pc
     elseif st isa _PlaceWrite || st isa _PlaceSwap || (st isa _ExprStmt && !_is_call(st.expr)) || (st isa _LocalAssign && !_is_call(st.rhs))
         eff = Any[st]; i = 1
         while i < length(stmts)
@@ -85,10 +125,9 @@ function build_region!(bb::BB, stmts, cont_pc::Int, ret_pc::Int, ret_val, by_mid
                 return build_region!(bb, [_subst(x, fmap) for x in callee.body], ret_pc, ret_pc, ret_val, by_mid, rec, brk, lcont)
             end
         else                                                 # plain return: evaluate the value, then goto ret_pc
-            # PRESERVE the return expression's evaluation (RK real-fixture fix): a discarded non-call return
-            # value (a registered/intrinsic effect or throw — e.g. step!'s tail `return copy!!(init,
-            # proposals[end])`) must still RUN. When value-bound, assign it; when discarded, emit it as an
-            # effect statement. Dropping it silently lost the terminal init<-proposals[end] copy.
+            # Preserve a discarded non-call return expression's evaluation: a
+            # registered/intrinsic effect or throw must still run. When
+            # value-bound, assign it; when discarded, emit it as an effect.
             eff = Any[]
             if v !== nothing
                 push!(eff, ret_val !== nothing ? _LocalAssign((_retvalsym(ret_val),), v) : _ExprStmt(v))
@@ -102,7 +141,27 @@ function build_region!(bb::BB, stmts, cont_pc::Int, ret_pc::Int, ret_val, by_mid
         after = build_region!(bb, rest, cont_pc, ret_pc, ret_val, by_mid, rec, brk, lcont)
         thenpc = build_region!(bb, collect(st.body), after, ret_pc, ret_val, by_mid, rec, brk, lcont)
         pc = _newpc!(bb)
-        push!(bb.blks, Blk(pc, Any[], st.op == :&& ? TBranch(st.cond, thenpc, after) : TBranch(st.cond, after, thenpc)))
+        condition = st.cond
+        if _acyclic_call(condition, rec) !== nothing
+            # An effectful acyclic helper may supply the guard value. Inline
+            # the helper
+            # before the branch and bind its return exactly once; sending the
+            # call through value lowering would incorrectly classify it as a
+            # pure sibling.
+            value = Symbol("__rk_guard_value_", pc)
+            push!(bb.blks, Blk(pc, Any[], st.op == :&& ?
+                TBranch(_LocalRef(value), thenpc, after) :
+                TBranch(_LocalRef(value), after, thenpc)))
+            m = _acyclic_call(condition, rec)
+            callee = by_mid[m]
+            fmap = _argmap(callee, condition)
+            return build_region!(
+                bb, [_subst(x, fmap) for x in callee.body],
+                pc, pc, value, by_mid, rec, brk, lcont)
+        end
+        push!(bb.blks, Blk(pc, Any[], st.op == :&& ?
+            TBranch(condition, thenpc, after) :
+            TBranch(condition, after, thenpc)))
         return pc
     elseif st isa _If
         after = build_region!(bb, rest, cont_pc, ret_pc, ret_val, by_mid, rec, brk, lcont)
@@ -112,7 +171,7 @@ function build_region!(bb::BB, stmts, cont_pc::Int, ret_pc::Int, ret_val, by_mid
     elseif st isa _For
         var = st.var[1]
         after = build_region!(bb, rest, cont_pc, ret_pc, ret_val, by_mid, rec, brk, lcont)
-        if !_loop_suspends(collect(st.body), rec)
+        if !bb.lower_all_loops && !_loop_suspends(collect(st.body), rec)
             # NON-suspending loop -> ONE native Julia for-block over ANY iterable (RK: preserve native
             # inlining; collection loops like `for p in proposals` need no lo:hi range).
             pc = _newpc!(bb); push!(bb.blks, Blk(pc, Any[_RawStmt((:for_native, st))], TGoto(after))); return pc
@@ -120,19 +179,44 @@ function build_region!(bb::BB, stmts, cont_pc::Int, ret_pc::Int, ret_val, by_mid
         # SUSPENDING loop -> PC machine; `var` is a cross-suspension spilled local (needs a lo:hi range).
         lo, hi = _range_bounds(st.iter)
         header = _newpc!(bb); incr = _newpc!(bb)
+        counter = Symbol("__rk_loop_count_", header)
         body = build_region!(bb, collect(st.body), incr, ret_pc, ret_val, by_mid, rec, after, incr)  # brk=after, continue=incr
-        push!(bb.blks, Blk(header, Any[], TBranch(_RawCond((var, hi)), body, after)))                # if var <= hi
-        push!(bb.blks, Blk(incr, Any[_RawStmt((:incr, var))], TGoto(header)))                        # var += 1
-        init = _newpc!(bb); push!(bb.blks, Blk(init, Any[_RawStmt((:init, var, lo))], TGoto(header)))  # var = lo
+        condition = bb.lower_all_loops ?
+            _RawCond((:bounded_for, var, hi, counter)) : _RawCond((var, hi))
+        push!(bb.blks, Blk(header, Any[], TBranch(condition, body, after)))                           # if var <= hi
+        increments = bb.lower_all_loops ?
+            Any[_RawStmt((:incr, var)), _RawStmt((:incr, counter))] :
+            Any[_RawStmt((:incr, var))]
+        push!(bb.blks, Blk(incr, increments, TGoto(header)))                                         # var += 1
+        init_effects = bb.lower_all_loops ?
+            Any[_RawStmt((:init, var, lo)),
+                _RawStmt((:init, counter, _Lit(0)))] :
+            Any[_RawStmt((:init, var, lo))]
+        init = _newpc!(bb); push!(bb.blks, Blk(init, init_effects, TGoto(header)))                    # var = lo
         return init
     elseif st isa _While
         after = build_region!(bb, rest, cont_pc, ret_pc, ret_val, by_mid, rec, brk, lcont)
-        if !_loop_suspends(collect(st.body), rec)
+        if !bb.lower_all_loops && !_loop_suspends(collect(st.body), rec)
             pc = _newpc!(bb); push!(bb.blks, Blk(pc, Any[_RawStmt((:while_native, st))], TGoto(after))); return pc
         end
         # SUSPENDING while -> PC machine; continue re-tests the header cond (no increment block)
         header = _newpc!(bb)
-        body = build_region!(bb, collect(st.body), header, ret_pc, ret_val, by_mid, rec, after, header)  # brk=after, continue=header
+        if bb.lower_all_loops
+            counter = Symbol("__rk_loop_count_", header)
+            incr = _newpc!(bb)
+            body = build_region!(bb, collect(st.body), incr, ret_pc, ret_val,
+                                 by_mid, rec, after, incr)
+            condition = _RawCond((:bounded_while, st.cond, counter))
+            push!(bb.blks, Blk(header, Any[], TBranch(condition, body, after)))
+            push!(bb.blks, Blk(incr,
+                Any[_RawStmt((:incr, counter))], TGoto(header)))
+            init = _newpc!(bb)
+            push!(bb.blks, Blk(init,
+                Any[_RawStmt((:init, counter, _Lit(0)))], TGoto(header)))
+            return init
+        end
+        body = build_region!(bb, collect(st.body), header, ret_pc, ret_val,
+                             by_mid, rec, after, header)
         push!(bb.blks, Blk(header, Any[], TBranch(st.cond, body, after)))
         return header
     elseif st isa _Break
@@ -148,8 +232,8 @@ end
 _retvalsym(v) = v  # ret_val is already the native local Symbol
 _lasym(lhs) = lhs isa Tuple ? Symbol(lhs[end]) : Symbol(lhs)   # _LocalAssign.lhs path -> local Symbol
 
-function build_method(ir, by_mid, rec)
-    bb = BB(Blk[], 1)
+function build_method(ir, by_mid, rec; lower_all_loops::Bool=false)
+    bb = BB(Blk[], 1, lower_all_loops)
     entry = build_region!(bb, collect(Any, ir.body), 0, 0, nothing, by_mid, rec)
     sort!(bb.blks, by = b -> b.pc)
     (entry = entry, blks = bb.blks)
@@ -281,6 +365,17 @@ function _block_writes(effects, spilled)
             # live in the following block.  Spill every loop-body LocalAssign exactly as for a top-level
             # block effect; otherwise the PC machine silently reloads the pre-loop value on resume.
             append!(w, _block_writes(collect(e.expr[2].body), spilled))
+        elseif e isa _PlaceWrite && e.root === :alias &&
+                e.alias !== nothing && e.alias in spilled
+            # An owned-alias place write replaces the local structured value
+            # as well as its enclosing state root.  Spill that replacement
+            # before suspension; otherwise the resume block can reload the
+            # pre-write alias and overwrite the newer root on its next write.
+            push!(w, e.alias)
+        elseif e isa _PlaceSwap
+            append!(w, _block_writes(collect(e.targets), spilled))
+        elseif e isa _SetReturn
+            append!(w, _block_writes((e.write,), spilled))
         elseif e isa _LocalAssign && _lasym(e.lhs) in spilled; push!(w, _lasym(e.lhs)) end
     end
     unique(w)
@@ -465,7 +560,8 @@ end
 # The root is framed even when it is acyclic.  That gives a backend one uniform
 # entry/return protocol for a plain data-dependent loop as well as recursive
 # control.  Truly acyclic sibling callees remain inlined by `build_method`.
-function _control_program_from_irs(irs0; root_mid::Int)
+function _control_program_from_irs(irs0; root_mid::Int,
+                                   lower_all_loops::Bool=false)
     irs = Tuple(irs0)
     by_mid = Dict{Int,Any}(ir.id.decl => ir for ir in irs)
     haskey(by_mid, root_mid) || throw(ArgumentError(
@@ -482,10 +578,22 @@ function _control_program_from_irs(irs0; root_mid::Int)
     stored = Dict{Int,Tuple{Vararg{Symbol}}}()
     formal_positions = Dict{Int,Dict{Symbol,Int}}()
     for mid in methods
-        cfg = build_method(by_mid[mid], by_mid, framed)
+        cfg = build_method(by_mid[mid], by_mid, framed; lower_all_loops)
         built[mid] = cfg
         entries[mid] = cfg.entry
-        spilled[mid] = Tuple(spilled_locals(by_mid[mid], framed))
+        cfg_locals = Symbol[]
+        for block in cfg.blks, effect in block.effects
+            if effect isa _LocalAssign
+                append!(cfg_locals, Symbol.((effect.lhs...,)))
+            elseif effect isa _RawStmt
+                expression = effect.expr
+                expression isa Tuple &&
+                    expression[1] in (:init, :incr) || continue
+                push!(cfg_locals, expression[2])
+            end
+        end
+        spilled[mid] = Tuple(unique(vcat(
+            spilled_locals(by_mid[mid], framed), cfg_locals)))
         stored[mid] = Tuple(unique(vcat(live_formals(by_mid[mid], cfg.blks),
                                           collect(spilled[mid]))))
         position = Dict{Symbol,Int}()
@@ -541,13 +649,15 @@ function _control_program_from_irs(irs0; root_mid::Int)
        blocks=Tuple(blocks), root_mid, root_entry=entries[root_mid])
 end
 
-function _control_program(skel; root_name::Symbol)
+function _control_program(skel; root_name::Symbol,
+                          lower_all_loops::Bool=false)
     irs = method_irs(skel)
     roots = [ir.id.decl for ir in irs if ir.id.name === root_name]
     length(roots) == 1 || throw(ArgumentError(
         "control-program root `$root_name` must resolve to exactly one captured method; " *
         "found $(length(roots))"))
-    _control_program_from_irs(irs; root_mid=only(roots))
+    _control_program_from_irs(
+        irs; root_mid=only(roots), lower_all_loops)
 end
 
 # substitute positional formals with the call's actual arg expressions throughout a node tree.
@@ -610,8 +720,8 @@ end
 # read. The admitted subset (defined by `_is_pure_read` below) is deliberately minimal: structural reads
 # (formal/local/self/self-field) and captured `:pure_primitive` registered calls — NOT raw operators or raw
 # field/index access (see the predicate's rationale). Anything else is rejected rather than silently
-# mis-ordered. NUTS actuals are all in that subset (`__self__`, `depth`, `depth±1`, captured `length(proposals)`),
-# so this never fires on the root; it guards a future effectful actual from corrupting evaluation order.
+# mis-ordered. This guards a future effectful actual from corrupting
+# evaluation order.
 _pure_kw(kw) = all(kv -> _is_pure_read(kv.second), kw)                     # recurse through keyword Pair values
 # The PROVABLY-pure inlinable subset — deliberately minimal, and NEVER inferred from spelling (RK):
 #   * structural reads: a formal/local/self reference and a self-field path (no accessor dispatch);
@@ -619,7 +729,7 @@ _pure_kw(kw) = all(kv -> _is_pure_read(kv.second), kw)                     # rec
 #     form that approved operators — `depth±1`, `length(proposals)` — already lower to).
 # Everything else is rejected: an `_OpCall`'s `:operator_candidate` is a syntactic HINT, not proof (and an
 # `:opaque` call may carry effects); a raw `_Getfield`/`_Index` can invoke an OVERLOADED getproperty/getindex,
-# so it is not pure without the later concrete-domain proof. NUTS actuals never need those raw accessor forms.
+# so it is not pure without the later concrete-domain proof.
 function _is_pure_read(x)
     if x isa _FormalRef || x isa _LocalRef || x isa _Lit || x isa _SelfRef || x isa _SelfField; true
     elseif x isa _RegisteredCall; getfield(x.registration, :kind) === :pure_primitive && all(_is_pure_read, x.args) && _pure_kw(x.kw)

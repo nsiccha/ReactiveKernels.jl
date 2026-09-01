@@ -78,6 +78,7 @@ site_pages = [
         "ARMA(1,1) time series" => "arma11.md",
         "Gaussian mixture" => "gaussian-mixture.md",
         "MNIST multinomial logistic" => "mnist-logistic.md",
+        "MNIST with Reactant" => "mnist-reactant.md",
     ],
     "Sampling" => [
         "Pathfinder approximation" => "pathfinder.md",

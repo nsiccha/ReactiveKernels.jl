@@ -336,6 +336,7 @@ mutable struct _OwnState
     owned::Set{Symbol}
     formalw::Dict{MethodId,Set{Int}}
     field_regs::Any
+    state_fields::Set{Symbol}
     require_fields::Bool          # authoritative: an unresolved required field-call REJECTS
     byid::Dict{MethodId,MethodIR}
     changed::Bool
@@ -466,7 +467,15 @@ function _own_expr_effects!(st::_OwnState, cur::MethodId, x, env::Dict{Symbol,_P
             for position in _kernel_field_written_arguments(reg)
                 position <= length(x.pos) || throw(_KernelFactoryReject(
                     "callable field `$field` effect descriptor writes absent argument $position"))
-                _own_record!(st, cur, _kernel_place_of(x.pos[position], env))
+                actual = x.pos[position]
+                if actual isa _SelfRef
+                    for state_field in st.state_fields
+                        _own_record!(st, cur,
+                            _Places([(:self, state_field)]))
+                    end
+                else
+                    _own_record!(st, cur, _kernel_place_of(actual, env))
+                end
             end
         elseif !(reg isa _KernelRegistration) && !_kernel_field_registration_noeffect(reg)
             throw(_KernelFactoryReject(
@@ -660,7 +669,8 @@ function _kernel_factory_owned_closure(skel, field_regs, require_fields::Bool)
             "method `$(ir.id.name)` is not compilable ($(ir.reason)); authoritative ownership " *
             "cannot be closed over it"))
     end
-    st = _OwnState(Set{Symbol}(), Dict{MethodId,Set{Int}}(), field_regs, require_fields,
+    st = _OwnState(Set{Symbol}(), Dict{MethodId,Set{Int}}(), field_regs,
+                   Set{Symbol}(kernel_port_names(skel)), require_fields,
                    Dict{MethodId,MethodIR}(ir.id => ir for ir in irs), true)
     while st.changed
         st.changed = false

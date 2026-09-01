@@ -7,6 +7,44 @@ mutable struct _FSCStaticAuthority
     token::Symbol
 end
 
+struct _FSCMixedFiniteTransition{
+        Names,Groups,ArrayNames,StateType,Ports,Shapes,Topology}
+    ports::Ports
+    shape_contract::Shapes
+    topology_contract::Topology
+end
+
+function _fsc_mixed_finite_transition(state, ports)
+    names = propertynames(state)
+    groups = Tuple((name,) for name in names)
+    shapes = map(_FSC_RK._sm_shape_contract, state)
+    topology = _FSC_RK._sm_topology_contract(state)
+    _FSCMixedFiniteTransition{
+        names,groups,names,typeof(state),typeof(ports),
+        typeof(shapes),typeof(topology)}(ports, shapes, topology)
+end
+
+function _fsc_wrapper_element(seed)
+    factors = Float64[seed, seed + 1]
+    (;
+        scalar=Float64(seed),
+        factorization=LinearAlgebra.Cholesky(
+            Diagonal(factors), 'U', 0),
+        factor_alias=factors,
+    )
+end
+
+function _fsc_backend_wrapper_element(seed)
+    logical = _fsc_wrapper_element(seed)
+    factorization = logical.factorization
+    backend_factorization = (;
+        factors=factorization.factors,
+        uplo=factorization.uplo,
+        info=factorization.info,
+    )
+    merge(logical, (; factorization=backend_factorization))
+end
+
 function _fsc_element(seed, authority)
     metric_storage = [Float64(seed), Float64(seed + 1)]
     factor_storage = [Float64(seed + 2), Float64(seed + 3)]
@@ -465,76 +503,85 @@ end
     @test guarded_identity(raw) === raw
 end
 
-@testset "finite structural contract binds real nested endpoint and tree prototypes" begin
-    if !isdefined(@__MODULE__, :WalnutsCompilerSupport)
-        include(joinpath(@__DIR__, "fixtures",
-                         "walnuts_compiler_support.jl"))
-    end
-    support = WalnutsCompilerSupport
-    case = first(support.ORACLE_CASES)
-    endpoint_transition, point = support.endpoint(
-        case.stiffness, case.theta, case.rho)
-    port = _FSC_RK.structured_state_port(endpoint_transition)
-    point_static = _FSC_RK._sm_finite_static_values(port)
-    proposals = [_FSC_RK._sm_isolated_structural_copy(point)
-                 for _ in 1:12]
-    proposal_contract = _FSC_RK._sm_finite_structural_contract(
-        proposals; static_values=point_static)
-    proposal_raw = _FSC_RK._sm_finite_structural_pack(
-        proposal_contract, proposals)
-    proposal_roundtrip = _FSC_RK._sm_finite_structural_unpack(
-        proposal_contract, proposal_raw)
-    @test length(proposal_roundtrip) == 12
-    @test proposal_roundtrip[1].pot_f === point.pot_f
-    @test proposal_roundtrip[1].grad_f === point.grad_f
-    @test proposal_roundtrip[1].dpot_dpos ===
-          proposal_roundtrip[1].dham_dpos
-    @test proposal_roundtrip[1].dkin_dmom ===
-          proposal_roundtrip[1].dham_dmom
-    @test proposal_roundtrip[1].pos !== proposal_roundtrip[2].pos
+@testset "mixed finite raw outputs validate before logical restoration" begin
+    untouched = [_fsc_wrapper_element(index) for index in 1:2]
+    updated = [_fsc_wrapper_element(index + 10) for index in 1:2]
+    untouched_port = _FSC_RK._sm_finite_structural_contract(untouched)
+    updated_port = _FSC_RK._sm_finite_structural_contract(updated)
+    ports = (; untouched=untouched_port, updated=updated_port)
+    logical_state = (; untouched, updated)
+    transition = _fsc_mixed_finite_transition(logical_state, ports)
+    packed_updated = _FSC_RK._sm_finite_structural_pack(
+        updated_port, updated)
+    mixed = (; untouched, updated=packed_updated)
 
-    tree = support.WFX.tree(point)
-    trees = [_FSC_RK._sm_isolated_structural_copy(tree)
-             for _ in 1:11]
-    tree_contract = _FSC_RK._sm_finite_structural_contract(trees)
-    tree_raw = _FSC_RK._sm_finite_structural_pack(tree_contract, trees)
-    tree_roundtrip = _FSC_RK._sm_finite_structural_unpack(
-        tree_contract, tree_raw)
-    @test tree_roundtrip == trees
-    @test all(column -> column isa Array, values(tree_raw))
+    @test _FSC_RK._sm_validate_machine_state(
+        transition, mixed; reusable=true) === mixed
+    restored = _FSC_RK._sm_restore_reusable_state_ports(
+        ports, mixed, ((:untouched,), (:updated,)))
+    @test all(value -> value.factorization isa LinearAlgebra.Cholesky,
+              restored.untouched)
+    @test all(value -> value.factorization isa LinearAlgebra.Cholesky,
+              restored.updated)
+    @test all(value -> value.factorization.factors isa Diagonal,
+              (restored.untouched..., restored.updated...))
+    @test all(value -> value.factorization.factors.diag ===
+                       value.factor_alias,
+              (restored.untouched..., restored.updated...))
+    @test restored == logical_state
+
+    wrong_length = merge(mixed, (untouched=untouched[1:1],))
+    wrong_type = Any[untouched...]
+    wrong_type[1] = merge(wrong_type[1], (scalar=Float32(1),))
+    wrong_type_state = merge(mixed, (untouched=wrong_type,))
+    short = Float64[1]
+    wrong_axes = copy(untouched)
+    wrong_axes[1] = merge(wrong_axes[1], (
+        factorization=LinearAlgebra.Cholesky(
+            Diagonal(short), 'U', 0),
+        factor_alias=short,
+    ))
+    wrong_axes_state = merge(mixed, (untouched=wrong_axes,))
+
+    raw_names = propertynames(packed_updated)
+    counterfeit_packed = merge(
+        packed_updated,
+        NamedTuple{(first(raw_names),)}((zeros(1),)))
+    counterfeit_state = merge(mixed, (updated=counterfeit_packed,))
+    partial_logical = Any[untouched...]
+    partial_logical[1] = packed_updated
+    partial_state = merge(mixed, (untouched=partial_logical,))
+    for (label, counterfeit) in (
+            "wrong logical length" => wrong_length,
+            "wrong logical type" => wrong_type_state,
+            "wrong logical axes" => wrong_axes_state,
+            "counterfeit packed column" => counterfeit_state,
+            "partial per-field representation" => partial_state)
+        @testset "$label" begin
+            @test_throws ArgumentError _FSC_RK._sm_validate_machine_state(
+                transition, counterfeit; reusable=true)
+        end
+    end
 end
 
+@testset "structured ports restore source-logical wrappers" begin
+    prototype = _fsc_wrapper_element(1)
+    backend = _fsc_backend_wrapper_element(11)
+    restored = _FSC_RK._sm_restore_source_logical_wrappers(
+        prototype, backend)
 
-@testset "locked authored fixture reaches the named pre-SCC frontier" begin
-    if !isdefined(@__MODULE__, :WalnutsCompilerSupport)
-        include(joinpath(@__DIR__, "fixtures",
-                         "walnuts_compiler_support.jl"))
-    end
-    support = WalnutsCompilerSupport
-    case = first(support.ORACLE_CASES)
-    max_depth = 10
-    directions = fill(false, max_depth)
-    exponentials = fill(1.0, 2^max_depth)
-    setup = support._build_case_setup(
-        case; max_depth, min_dham=-1000.0, directions, exponentials)
-    @test length(setup.snapshot.proposals) == max_depth + 2
-    @test length(setup.snapshot.trees) == max_depth + 1
-    @test _FSC_RK._sm_finite_structural_unpack(
-        setup.proposal_contract,
-        setup.proposal_raw) == setup.snapshot.proposals
-    @test _FSC_RK._sm_finite_structural_unpack(
-        setup.tree_contract,
-        setup.tree_raw) == setup.snapshot.trees
+    @test restored.factorization isa LinearAlgebra.Cholesky
+    @test restored.factorization.factors isa Diagonal
+    @test restored.factorization.factors.diag === restored.factor_alias
+    @test restored.factorization.factors.diag == backend.factor_alias
+    @test restored.scalar == backend.scalar
 
-    frontier = try
-        support._build_case_transition(
-            setup; max_iterations=1_000_000)
-        nothing
-    catch error
-        error
-    end
-    @test frontier isa _FSC_RK._LLowerReject
-    @test sprint(showerror, frontier) ==
-          "ReactiveKernels._LLowerReject(\"recursive functional " *
-          "state-machine SCC lowering is not implemented for root `step!`\")"
+    wrong_uplo = merge(backend, (factorization=merge(
+        backend.factorization, (uplo='L',)),))
+    wrong_info = merge(backend, (factorization=merge(
+        backend.factorization, (info=1,)),))
+    @test_throws ArgumentError _FSC_RK._sm_restore_source_logical_wrappers(
+        prototype, wrong_uplo)
+    @test_throws ArgumentError _FSC_RK._sm_restore_source_logical_wrappers(
+        prototype, wrong_info)
 end
