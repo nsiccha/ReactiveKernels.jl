@@ -184,13 +184,13 @@ function _verified_comparator_source_pin(root, relative_path)
     published, text = _published_source_pin(
         root, EIGHT_SCHOOLS_COMPARATOR_PUBLISHED_SHA, relative_path)
     guard = "get(ENV, \"RK_EIGHT_SCHOOLS_DEFINITIONS_ONLY\", \"\") == \"1\" || run_comparison()\n"
-    expected = replace(text, r"run_comparison\(\)\n$" => guard)
-    _eight_schools_ad_generator_read(joinpath(root, relative_path)) == expected || error(
+    current = _eight_schools_ad_generator_read(joinpath(root, relative_path))
+    comparator_source_matches_current_delta(current, text, guard) || error(
         "Eight Schools comparator differs from its published authority by more " *
-        "than the terminal definition-only guard")
+        COMPARATOR_SOURCE_CURRENT_DELTA)
     merge(published, Dict(
         "current" => _source_pin(root, relative_path),
-        "current_delta" => "terminal definition-only include guard only",
+        "current_delta" => COMPARATOR_SOURCE_CURRENT_DELTA,
     ))
 end
 

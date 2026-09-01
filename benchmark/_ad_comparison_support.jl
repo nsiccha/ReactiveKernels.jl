@@ -8,12 +8,17 @@ import ReactiveKernels
 using SHA
 using Statistics
 
+include(joinpath(@__DIR__, "_comparison_source_attestation.jl"))
+using .ComparisonSourceAttestation:
+    comparator_source_matches_current_delta, COMPARATOR_SOURCE_CURRENT_DELTA
+
 export RKValueGradientCall, DIValueGradientCall, TuringValueGradientCall
 export measurement, build_and_first_call, record_implementation
 export gradient_error, gradient_scale
 export package_version, output_path
 export normalized_text, normalized_read, text_sha256
 export source_pin, published_source_pin, nothing_paths
+export comparator_source_matches_current_delta, COMPARATOR_SOURCE_CURRENT_DELTA
 
 const LDP = DynamicPPL.LogDensityProblems
 
