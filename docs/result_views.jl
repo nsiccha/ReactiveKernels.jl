@@ -1065,6 +1065,8 @@ function _render_longform_model_receipt(path, expected_schema;
     ])
 end
 
+include(joinpath(@__DIR__, "mnist_result_views.jl"))
+
 _eight_schools_sort(value, _) = value === missing ? nothing : value.median_ns
 
 """Render the checked-in primal Eight Schools boundary/outcome/modifier matrix."""
@@ -1241,14 +1243,18 @@ end
 
 """Render the checked-in MNIST multinomial-logistic boundary/outcome matrix."""
 function render_mnist_logistic_benchmarks()
-    _render_longform_model_receipt(
+    _render_mnist_longform_focused(
         _MNIST_LOGISTIC_RECEIPT_PATH, "mnist-logistic-primal-v3";
-        id = "mnist-logistic-matrix",
-        title = "MNIST primal boundary × outcome × modifier matrix",
-        note = "Both RK models and both Turing models are shown; N/A and unsupported cells are never dropped.")
+        mode = :primal,
+        id_prefix = "mnist-logistic-full",
+        profile_label = "Full raw MNIST primal")
 end
 
 function _render_mnist_logistic_v1_benchmarks(receipt_path::AbstractString)
+    return _render_mnist_v1_focused(receipt_path;
+        mode = :primal,
+        id_prefix = "mnist-logistic-wren-pca40",
+        profile_label = "Wren PCA-40 primal")
     receipt = TOML.parsefile(receipt_path)
     get(receipt, "schema", "") == "mnist-logistic-v1" ||
         error("unexpected MNIST logistic benchmark receipt schema")
@@ -1411,15 +1417,19 @@ end
 
 """Render the exact full-data MNIST value-and-gradient benchmark matrix."""
 function render_mnist_logistic_ad_benchmarks()
-    _render_longform_model_receipt(
+    _render_mnist_longform_focused(
         _MNIST_LOGISTIC_AD_RECEIPT_PATH, "mnist-logistic-ad-v2";
-        id = "mnist-logistic-ad-matrix",
-        title = "MNIST value-and-gradient matrix",
-        note = "Pointwise and multi-active structured cells retain their public-API unsupported reasons.")
+        mode = :ad,
+        id_prefix = "mnist-logistic-ad-full",
+        profile_label = "Full raw MNIST value + gradient")
 end
 
 """Render a legacy v1 MNIST value-and-gradient benchmark matrix."""
 function _render_mnist_logistic_ad_v1_benchmarks(receipt_path::AbstractString)
+    return _render_mnist_v1_focused(receipt_path;
+        mode = :ad,
+        id_prefix = "mnist-logistic-ad-wren-pca40",
+        profile_label = "Wren PCA-40 value + gradient")
     receipt = TOML.parsefile(receipt_path)
     get(receipt, "schema", "") == "mnist-logistic-ad-v1" ||
         error("unexpected MNIST logistic AD receipt schema")
@@ -2569,14 +2579,18 @@ function render_mnist_reactant_benchmark(
 )
     receipt = TOML.parsefile(receipt_path)
     if get(receipt, "schema", "") == "mnist-reactant-v2"
-        return _render_longform_model_receipt(
+        return _render_mnist_reactant_longform_focused(
             receipt_path, "mnist-reactant-v2";
-            id = "mnist-reactant-matrix",
-            title = "MNIST Reactant primal matrix",
-            note = "Both model sources, both boundaries, and bound/unbound data modes remain visible.")
+            mode = :primal,
+            id_prefix = "mnist-reactant-full",
+            profile_label = "Full raw MNIST Reactant primal")
     end
     get(receipt, "schema", "") == "mnist-reactant-v1" ||
         error("unexpected MNIST Reactant benchmark receipt schema")
+    return _render_mnist_reactant_v1_focused(receipt_path;
+        mode = :primal,
+        id_prefix = "mnist-reactant-matrix-wren-pca40",
+        profile_label = "Wren PCA-40 Reactant primal")
     pins = receipt["pins"]
     get(pins, "reactivekernels_dirty", true) == false ||
         error("MNIST Reactant receipt was produced from a dirty checkout")
@@ -2746,14 +2760,18 @@ function render_mnist_reactant_ad_benchmark(
 )
     receipt = TOML.parsefile(receipt_path)
     if get(receipt, "schema", "") == "mnist-reactant-ad-v2"
-        return _render_longform_model_receipt(
+        return _render_mnist_reactant_longform_focused(
             receipt_path, "mnist-reactant-ad-v2";
-            id = "mnist-reactant-ad-matrix",
-            title = "MNIST Reactant value-and-gradient matrix",
-            note = "The packed scalar headline is measured for both models and both data modes.")
+            mode = :ad,
+            id_prefix = "mnist-reactant-ad-full",
+            profile_label = "Full raw MNIST Reactant value + gradient")
     end
     get(receipt, "schema", "") == "mnist-reactant-ad-v1" ||
         error("unexpected MNIST Reactant-AD benchmark receipt schema")
+    return _render_mnist_reactant_v1_focused(receipt_path;
+        mode = :ad,
+        id_prefix = "mnist-reactant-ad-matrix-wren-pca40",
+        profile_label = "Wren PCA-40 Reactant value + gradient")
     pins = receipt["pins"]
     get(pins, "reactivekernels_dirty", true) == false ||
         error("MNIST Reactant-AD receipt was produced from a dirty checkout")

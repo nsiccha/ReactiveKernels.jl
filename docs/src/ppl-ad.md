@@ -49,6 +49,12 @@ count either ordinary HAVE arguments or fixed during preparation. An
 independent analytic reference-class softmax score checks all RK, manual Julia,
 and Turing gradients before timing.
 
+Joint, prior, and likelihood each have their own relative-runtime plot and
+compact comparison table. RK + Enzyme is the explicit 1.00× baseline; tables
+also state the faster/slower interpretation and use three-significant-digit
+runtime and allocation units. Unsupported pointwise and structured cells remain
+in the receipt rather than sharing a misleading scale with scalar timings.
+
 ```@eval
 Main.ReactiveKernelsDocs.render_mnist_logistic_ad_benchmarks()
 ```
