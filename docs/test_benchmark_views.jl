@@ -39,6 +39,7 @@ const FOCUSED_BENCHMARK_VIEWS = (
     :render_mnist_reactant_wren_benchmark => (4, 4),
     :render_mnist_reactant_ad_benchmark => (3, 3),
     :render_mnist_reactant_ad_wren_benchmark => (3, 3),
+    :render_probprog_mcmc_benchmark => (1, 3),
 )
 
 @testset "focused benchmark renderer inventory" begin

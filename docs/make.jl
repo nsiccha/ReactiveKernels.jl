@@ -62,6 +62,7 @@ site_pages = [
         "Probabilistic programming" => [
             "Eight Schools" => "eight-schools-reactant.md",
             "MNIST multinomial logistic" => "mnist-reactant.md",
+            "ProbProg MCMC (NUTS sampling)" => "probprog-mcmc.md",
         ],
         "AD + Reactant" => "reactant-ad.md",
         "Evaluation throughput vs Turing.jl" => "eval-throughput.md",

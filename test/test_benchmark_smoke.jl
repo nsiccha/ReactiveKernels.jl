@@ -59,6 +59,9 @@ end
                  "mnist_reactant_ad_comparison_body.jl",
                  "mnist_reactant_ad_wren_pca40_comparison_body.jl",
                  "_mnist_dataset_profiles.jl",
+                 "probprog_mcmc_comparison.jl",
+                 "probprog_mcmc_comparison_body.jl",
+                 joinpath("receipts", "validate_probprog_mcmc.jl"),
                  "nuts_reactant_comparison.jl",
                  "nuts_reactant_comparison_body.jl",
                  "eval_throughput_comparison.jl",
@@ -397,6 +400,15 @@ end
             @test Base.invokelatest(digest, crlf_path) == expected
         end
     end
+end
+
+@testset "ProbProg MCMC sampling receipt validates" begin
+    validator = joinpath(_BENCH_DIR, "receipts", "validate_probprog_mcmc.jl")
+    receipt = joinpath(_BENCH_DIR, "receipts", "probprog-mcmc-v1.toml")
+    @test isfile(receipt)
+    validation = _load_benchmark_validator(validator)
+    @test isempty(Base.invokelatest(
+        validation.validate_probprog_mcmc_receipt, receipt))
 end
 
 @testset "adaptive Reactant NUTS benchmark receipt validates" begin
