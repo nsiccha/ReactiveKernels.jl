@@ -389,7 +389,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "distributions-ad.md" => (
             "Distribution gradient latency and allocation",
             "distribution-gradient-v1.toml",
-            "20 have a zero-byte steady-state gradient path",
+            "Normal plate — comparison",
             "Runtime ÷ baseline",
             "plot:distribution-gradient-normal-plate-relative",
             "plot:distribution-gradient-mvn-cholesky-relative",
@@ -425,7 +425,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
             "Structured families",
             "Scalar plate and call-boundary amortization",
             "Batched authored graph parity",
-            "Reactant invocation-cost amortization",
+            "Reactant replica amortization",
             "Runtime ÷ baseline",
             "plot:scalar-distributions-cauchy-relative",
             "plot:structured-distributions-mvn-cholesky-relative",
