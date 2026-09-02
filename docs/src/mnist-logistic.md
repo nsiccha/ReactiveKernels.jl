@@ -31,15 +31,14 @@ sampler vector is simply `[vec(W); b]`.
 
 The coefficient prior reuses the shared
 [`normal`](distributions.md) object over the flattened coefficient vector, and
-the likelihood reuses a batched `categorical_logit_columns` kernel — one
-softmax categorical per logits column — exactly as Eight Schools reuses
-`normal` per observation. The kernel has two explicitly equivalent recipe
-bodies: native Julia and the nonallocating pass consume the authored scalar
-distribution-object plate, while array compilers consume a direct gather and
-reduction. The numerically stable log-sum-exp normalizer remains in the
-distribution kernel, not in the model. The model source therefore contains
-only the linear predictor, reference coding, and calls into reusable kernels;
-there is no hand-written Normal or softmax formula in the model.
+the per-observation likelihood reuses a [`categorical_logit`](distributions.md)
+object — a softmax categorical over one logits vector — exactly as Eight
+Schools reuses `normal` per observation. The model says this directly as
+`plate(eachcol(logits), y)`: ordinary Julia executes the scalar plate, while
+Reactant lowers the same authored plate generically as batched column slices
+and traced gathers. The numerically stable log-sum-exp normalizer remains in
+the distribution object, not in the model. There is one likelihood expression,
+with no compiler-specific alternate body or private MNIST adapter.
 
 The panel below shows the **Raw input** (the source), the readable **Generated
 kernel** derived from the executed kernel and selected plan, and the **Compute
@@ -70,7 +69,7 @@ The idiomatic model above materializes the padded `[0; logits]` matrix on
 every evaluation — exactly like the idiomatic Turing baseline. The optimized
 variant lands **alongside** it rather than replacing the idiomatic comparison:
 the reference class moves inside the reference-coded
-`categorical_logit_ref_columns` distribution kernel (it treats class
+[`categorical_logit_ref`](distributions.md) distribution object (it treats class
 1 as an implicit zero-logit reference with a stable
 `logaddexp(0, logsumexp(·))` normalizer), so the likelihood runs directly over
 the `(C-1) × N` nonreference-logits matrix and the padded matrix is never

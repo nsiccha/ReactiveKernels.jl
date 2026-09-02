@@ -570,7 +570,7 @@ state = "unsupported"
 [pins]
 ad_receipt_path = "benchmark/receipts/mnist-logistic-ad-v2.toml"
 ad_receipt_reactivekernels_sha = "5fb20e73f74eef33602ed4fbad897a3634f400d6"
-ad_receipt_sha256 = "30c100d5fbda889228656d058fb8fc3308308755fa60082c290c9ad4b6664d37"
+ad_receipt_sha256 = "9d8ad740710a3622d49fca27c9d931531748272f92af482e5bb7bbe422e8e184"
 benchmarktools_version = "1.6.3"
 differentiationinterface_version = "0.7.21"
 enzyme_version = "0.13.199"

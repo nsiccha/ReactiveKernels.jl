@@ -51,10 +51,9 @@ end
 
 "The transparent scalar plan captured by an authored `plate(...) do` recipe."
 function plate_body(recipe::Recipe)
-    native = recipe.op isa _KernelTensorizedOp ? recipe.op.native : recipe.op
-    native isa _AuthoredPlateOp || throw(ArgumentError(
+    recipe.op isa _AuthoredPlateOp || throw(ArgumentError(
         "recipe $(recipe.id) is not an authored plate"))
-    native.kernel.plan
+    recipe.op.kernel.plan
 end
 
 # Marker discovery must not invoke arbitrary iteration or `broadcastable`
@@ -559,35 +558,6 @@ function _lower_authored_plate_tensorized!(body, runtime_ops, runtime_recipes,
     body
 end
 
-function _kernel_tensorized_substitute(node, mapping::Dict{Symbol,Any})
-    node isa Symbol && return get(mapping, node, node)
-    node isa Expr || return node
-    node.head in (:quote, :inert) && return node
-    Expr(node.head,
-         (_kernel_tensorized_substitute(arg, mapping) for arg in node.args)...)
-end
-
-function _lower_explicit_tensorized!(body, runtime_ops, runtime_recipes,
-                                     op::_KernelTensorizedOp, callargs,
-                                     callvalues, pointwise_lhs, total_lhs)
-    inner_kernel = op.native.kernel
-    append!(runtime_ops, inner_kernel.ops)
-    append!(runtime_recipes, inner_kernel.lowered_recipes)
-    mapping = Dict{Symbol,Any}(
-        input.name => argument for (input, argument) in zip(callvalues, callargs))
-    value = _kernel_tensorized_substitute(op.tensorized_ast, mapping)
-    if pointwise_lhs !== nothing
-        push!(body.args, Expr(:(=), pointwise_lhs, value))
-        total_lhs === nothing || push!(body.args,
-            Expr(:(=), total_lhs,
-                 Expr(:call, GlobalRef(Base, :sum), pointwise_lhs)))
-    elseif total_lhs !== nothing
-        push!(body.args, Expr(:(=), total_lhs,
-            Expr(:call, GlobalRef(Base, :sum), value)))
-    end
-    body
-end
-
 function _lower_with_ops(p::Plan; tensorized::Bool = false,
                          inline_embedded::Bool = true)
     g = p.graph
@@ -610,9 +580,7 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
         r.id in skipped_recipes && continue
         callargs = Any[nm(inp) for inp in r.inputs]
 
-        if inline_embedded &&
-           (r.op isa _AuthoredPlateOp ||
-            r.op isa _KernelTensorizedOp && r.op.native isa _AuthoredPlateOp)
+        if inline_embedded && r.op isa _AuthoredPlateOp
             length(r.outputs) == 1 || throw(ArgumentError(
                 "an authored plate recipe must have exactly one pointwise output"))
             pointwise = only(r.outputs)
@@ -629,19 +597,7 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                 push!(assigned, canon_id(g, only(sum_recipe.outputs).id))
                 push!(skipped_recipes, sum_recipe.id)
             end
-            if r.op isa _KernelTensorizedOp
-                native_arity = _kernel_tensorized_native_arity(r.op)
-                if tensorized
-                    _lower_explicit_tensorized!(
-                        body, runtime_ops, runtime_recipes, r.op, callargs,
-                        r.inputs, pointwise_lhs, total_lhs)
-                else
-                    _lower_authored_plate_native!(
-                        body, runtime_ops, runtime_recipes, r.op.native,
-                        callargs[1:native_arity], r.inputs[1:native_arity],
-                        pointwise_lhs, total_lhs)
-                end
-            elseif tensorized
+            if tensorized
                 _lower_authored_plate_tensorized!(
                     body, runtime_ops, runtime_recipes, r.op, callargs,
                     pointwise_lhs, total_lhs)
@@ -1171,7 +1127,6 @@ end
 function _needs_embedded_tensorization(p::Plan)
     any(p.recipes) do recipe
         recipe.op isa _AuthoredPlateOp && return true
-        recipe.op isa _KernelTensorizedOp && return true
         kernel = _embedded_kernel(recipe.op)
         kernel !== nothing && kernel.f isa _ArrayFunctionPair
     end
@@ -1191,16 +1146,10 @@ function _embedded_marker_candidates(p::Plan)
         p, Set(keys(root_positions))).values
     candidates = Int[]
     for recipe in p.recipes
-        positions = if recipe.op isa Union{_AuthoredPlateOp,_KernelTensorizedOp}
-            native = recipe.op isa _KernelTensorizedOp ?
-                recipe.op.native : recipe.op
-            native_arity = recipe.op isa _KernelTensorizedOp ?
-                _kernel_tensorized_native_arity(recipe.op) :
-                length(recipe.inputs)
-            atomic = typeof(native).parameters[2]
+        positions = if recipe.op isa _AuthoredPlateOp
+            atomic = typeof(recipe.op).parameters[2]
             Tuple(index for index in eachindex(recipe.inputs)
-                  if index > native_arity ||
-                     !(index in atomic))
+                  if !(index in atomic))
         else
             kernel = _embedded_kernel(recipe.op)
             kernel === nothing ? () : _array_marker_positions(kernel.f)
@@ -1621,7 +1570,6 @@ catch
     string(op)
 end
 _opname(::_AuthoredPlateOp) = "plate"
-_opname(::_KernelTensorizedOp) = "plate"
 
 function _readable_callee(op)
     name = try

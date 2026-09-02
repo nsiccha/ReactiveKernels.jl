@@ -1,6 +1,6 @@
 using ReactiveKernelsPPLExamples.MNISTLogisticExample
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
-    normal
+    normal, categorical_logit, categorical_logit_ref
 
 _mnist_logsumexp(v) = (m = maximum(v); m + log(sum(x -> exp(x - m), v)))
 
@@ -13,10 +13,13 @@ _mnist_logsumexp(v) = (m = maximum(v); m + log(sum(x -> exp(x - m), v)))
     # Transparent authoring: the density is composed from reusable distribution
     # objects; the model source carries no hand-written density math.
     @test occursin("normal(0.0, 1.0).logpdf", MNIST_LOGISTIC_SOURCE)
-    @test occursin("_categorical_logit_columns_kernel(logits, y)",
+    @test occursin("plate(eachcol(logits), y)", MNIST_LOGISTIC_SOURCE)
+    @test occursin("categorical_logit(observation_logits).logpdf",
                    MNIST_LOGISTIC_SOURCE)
+    @test !occursin("_kernel_tensorized_pair", MNIST_LOGISTIC_SOURCE)
     @test !occursin("log(2π)", MNIST_LOGISTIC_SOURCE)     # no hand-written Normal
     @test artifact.normal_object === normal
+    @test artifact.categorical_logit_object === categorical_logit
     @test length(findall("@kernel model(", MNIST_LOGISTIC_SOURCE)) == 1
     authored = "@kernel model" * first(split(
         split(MNIST_LOGISTIC_SOURCE, "@kernel model"; limit = 2)[2],
@@ -70,8 +73,11 @@ end
     # reference-coded object; the model source still carries no density math
     # and, deliberately, no padded-logits vcat and no zeros row.
     @test occursin("normal(0.0, 1.0).logpdf", MNIST_LOGISTIC_OPTIMIZED_SOURCE)
-    @test occursin("_categorical_logit_ref_columns_kernel(",
+    @test occursin("plate(eachcol(nonreference_logits), y)",
                    MNIST_LOGISTIC_OPTIMIZED_SOURCE)
+    @test occursin("categorical_logit_ref(observation_logits).logpdf",
+                   MNIST_LOGISTIC_OPTIMIZED_SOURCE)
+    @test !occursin("_kernel_tensorized_pair", MNIST_LOGISTIC_OPTIMIZED_SOURCE)
     @test !occursin("log(2π)", MNIST_LOGISTIC_OPTIMIZED_SOURCE)
     @test !occursin("zeros(", MNIST_LOGISTIC_OPTIMIZED_SOURCE)
     authored_optimized = "@kernel model" * first(split(
@@ -79,10 +85,10 @@ end
         "\n\nX = MNIST_LOGISTIC_X"; limit = 2))
     @test !occursin("logsumexp", authored_optimized)
     @test length(findall("vcat(", authored_optimized)) == 1   # packed producer only
-    @test occursin(
-        "_categorical_logit_ref_columns_kernel(nonreference_logits, y)",
-        authored_optimized)
+    @test occursin("categorical_logit_ref(observation_logits).logpdf",
+                   authored_optimized)
     @test artifact.normal_object === normal
+    @test artifact.categorical_logit_ref_object === categorical_logit_ref
     @test !occursin("prepare(", authored_optimized)
 
     # Exact parity with the idiomatic graph on every boundary and outcome,

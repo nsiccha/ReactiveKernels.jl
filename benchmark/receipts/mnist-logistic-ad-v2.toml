@@ -857,15 +857,15 @@ turing_version = "0.47.1"
 
     [pins.model_source]
     commit = "9dbaa1fbfbdb1bb2ff4238a3910754f36635f81e"
-    current_delta = "published idiomatic and optimized models retain their math and boundaries; each categorical recipe keeps the exact authored scalar plate for native/nonallocating execution and adds an equivalent explicit tensor body for array compilers"
+    current_delta = "published idiomatic model source is byte-preserved; the additive optimized model uses the same natural each-column plate with the reference-coded categorical object"
     git_blob = "cfd5d381c38de21742f564361ef7a7914e5ff8bd"
     path = "packages/ReactiveKernelsPPLExamples/src/mnist_logistic.jl"
     text_sha256 = "e51b876024fe2bc60ca0c27f59df1c74ef3c5c97165b400fa4d483e24e2509d2"
 
         [pins.model_source.current]
-        git_blob = "a8ce0e88c5f35251fc5af3b22c4f5eea1144029f"
+        git_blob = "e6827ac4cd9a9ac18a15a9404712dcf757156083"
         path = "packages/ReactiveKernelsPPLExamples/src/mnist_logistic.jl"
-        text_sha256 = "79e5a6c7ed95a2f6348f2d152d7a6701c523cd82276a67755ad70166f7d3c719"
+        text_sha256 = "9b1e372127739dd9e8437135fe10965f2280e9a7dcf5fff392481c6b3c02ac62"
 
     [pins.primal_comparator_source]
     commit = "9dbaa1fbfbdb1bb2ff4238a3910754f36635f81e"

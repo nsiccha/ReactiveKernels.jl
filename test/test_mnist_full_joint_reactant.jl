@@ -6,6 +6,8 @@ import Enzyme
 using DifferentiationInterface: AutoEnzyme
 using ReactiveKernelsPPLExamples.MNISTLogisticExample:
     NUM_CLASSES, build_mnist_logistic_graph, mnist_logistic_fixture
+using ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    categorical_logit, categorical_logit_ref
 
 const _MNIST_FULL_JOINT_AD_BACKEND =
     AutoEnzyme(; mode = Enzyme.Reverse)
@@ -20,6 +22,22 @@ end
     selected = plate(eachcol(values), indices) do column, index
         column[index]
     end
+end
+
+@kernel _reactant_natural_categorical_columns(
+        logits::Matrix{Float64}, observed::Vector{Int}) = begin
+    pointwise = plate(eachcol(logits), observed) do column, label
+        categorical_logit(column).logpdf(label)
+    end
+    return sum(pointwise)
+end
+
+@kernel _reactant_natural_categorical_ref_columns(
+        nonreference_logits::Matrix{Float64}, observed::Vector{Int}) = begin
+    pointwise = plate(eachcol(nonreference_logits), observed) do column, label
+        categorical_logit_ref(column).logpdf(label)
+    end
+    return sum(pointwise)
 end
 
 _trace_mnist(value::AbstractArray) = Reactant.to_rarray(value)
@@ -48,6 +66,23 @@ _trace_mnist(value::Integer) = value
         indices = Reactant.to_rarray(indices_host)
         compiled = @compile sync = true kernel(values, indices)
         @test Array(compiled(values, indices)) == expected
+    end
+
+    @testset "natural categorical eachcol plates" begin
+        observed_host = [5, 1, 4, 2]
+        for (spec, logits_host) in (
+                (_reactant_natural_categorical_columns,
+                 reshape(collect(0.1:0.1:2.0), 5, 4)),
+                (_reactant_natural_categorical_ref_columns,
+                 reshape(collect(0.1:0.1:1.6), 4, 4)),
+            )
+            kernel = prepare(spec)
+            expected = kernel(logits_host, observed_host)
+            logits = Reactant.to_rarray(logits_host)
+            observed = Reactant.to_rarray(observed_host)
+            compiled = @compile sync = true kernel(logits, observed)
+            @test Float64(compiled(logits, observed)) ≈ expected rtol = 1e-9 atol = 1e-9
+        end
     end
 
     fixture = mnist_logistic_fixture()

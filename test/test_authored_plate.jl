@@ -227,37 +227,10 @@ ReactiveKernels._batched_call(
         pair::ReactiveKernels._ArrayFunctionPair, ops, args,
         ::_AuthoredPlateBackendArray) = pair.tensorized(ops, args...)
 
-_authored_explicit_tensorized_square(value) = value * value
-
-@kernel authored_explicit_tensorized_plate(x) = begin
-    pointwise = ReactiveKernels._kernel_tensorized_pair(
-        (plate(x) do value
-            value * value
-        end),
-        _authored_explicit_tensorized_square.(x))
-    total = sum(pointwise)
-    return total
-end
-
 function _authored_plate_head_count(node, head)
     node isa Expr || return 0
     (node.head === head ? 1 : 0) +
         sum(_authored_plate_head_count(child, head) for child in node.args)
-end
-
-@testset "authored plate block: explicit tensorized equivalent" begin
-    values = [1.0, -2.0, 3.0]
-    kernel = prepare(authored_explicit_tensorized_plate;
-                     have = :x, want = :total)
-    recipe = first(plan(authored_explicit_tensorized_plate;
-                        have = :x, want = :pointwise).recipes)
-
-    @test kernel(values) == sum(abs2, values)
-    @test kernel(_AuthoredPlateBackendArray(values)) == sum(abs2, values)
-    @test [value.name for value in plate_body(recipe).have] == [:value]
-    @test occursin("plate", explain(
-        plan(authored_explicit_tensorized_plate;
-             have = :x, want = :pointwise)))
 end
 
 @testset "authored plate block: implicit multi-statement result" begin

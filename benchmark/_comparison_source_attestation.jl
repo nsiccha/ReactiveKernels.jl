@@ -13,7 +13,7 @@ const EIGHT_SCHOOLS_MODEL_SOURCE_CURRENT_DELTA =
 const MNIST_COMPARATOR_SOURCE_CURRENT_DELTA =
     "additive two-model native/bound/nonallocating matrix; published Turing/manual AD baselines unchanged; documentation markers plus terminal definition-only include guard"
 const MNIST_MODEL_SOURCE_CURRENT_DELTA =
-    "published idiomatic and optimized models retain their math and boundaries; each categorical recipe keeps the exact authored scalar plate for native/nonallocating execution and adds an equivalent explicit tensor body for array compilers"
+    "published idiomatic model source is byte-preserved; the additive optimized model uses the same natural each-column plate with the reference-coded categorical object"
 const _DOCS_BASELINE_MARKERS = (
     "# DOCS-BASELINE-BEGIN: turing",
     "# DOCS-BASELINE-END: turing",
@@ -97,65 +97,26 @@ function mnist_model_source_preserves_published_authority(current, published)
     current = _normalized_text(current)
     published = _normalized_text(published)
     current_source = _single_raw_body(
-        current,
-        "const MNIST_LOGISTIC_SOURCE = " *
-        "CATEGORICAL_LOGIT_COLUMNS_KERNEL_SOURCE * raw\"\"\"\n",
-    )
+        current, "const MNIST_LOGISTIC_SOURCE = raw\"\"\"\n")
     published_source = _single_raw_body(
         published, "const MNIST_LOGISTIC_SOURCE = raw\"\"\"\n")
     current_source !== nothing && published_source !== nothing || return false
-
-    replacements = (
-        ("    normal\n",
-         "    normal, categorical_logit\n"),
-        ("    # prepended as the first row. The batched `categorical_logit_columns`\n" *
-         "    # distribution kernel returns the pointwise log densities in one\n" *
-         "    # tensor-friendly gather.\n" *
-         "    nonreference_logits::Matrix{Float64} = W * transpose(X) .+ b\n" *
-         "    logits::Matrix{Float64} =\n" *
-         "        vcat(zeros(1, size(nonreference_logits, 2)), nonreference_logits)\n" *
-         "    pointwise::Vector{Float64} =\n" *
-         "        _categorical_logit_columns_kernel(logits, y)\n",
-         "    # prepended as the first row. Each observation's likelihood then reuses the\n" *
-         "    # `categorical_logit` distribution object over that observation's logits\n" *
-         "    # column — exactly as Eight Schools reuses `normal` per observation.\n" *
-         "    nonreference_logits = W * transpose(X) .+ b\n" *
-         "    logits = vcat(zeros(1, size(nonreference_logits, 2)), nonreference_logits)\n" *
-         "    pointwise = plate(eachcol(logits), y) do observation_logits, observed_class\n" *
-         "        categorical_logit(observation_logits).logpdf(observed_class)\n" *
-         "    end\n"),
-        ("# Pointwise likelihoods and their total are alternate cuts through the same\n" *
-         "# batched distribution-object result.\n",
-         "# Pointwise likelihoods and their total are alternate cuts through the same\n" *
-         "# authored plate; a total-only query fuses the sum without materializing the\n" *
-         "# per-observation vector.\n"),
-        ("    normal_object = normal,\n)",
-         "    normal_object = normal,\n" *
-         "    categorical_logit_object = categorical_logit,\n)"),
-    )
-    transformed = current_source
-    for (new, old) in replacements
-        length(findall(new, transformed)) == 1 || return false
-        transformed = replace(transformed, new => old; count = 1)
-    end
-    transformed == published_source || return false
+    current_source == published_source || return false
 
     for optimized_anchor in (
-            "const MNIST_LOGISTIC_OPTIMIZED_SOURCE =\n" *
-            "    CATEGORICAL_LOGIT_REF_COLUMNS_KERNEL_SOURCE * raw\"\"\"",
-            "_categorical_logit_ref_columns_kernel(nonreference_logits, y)",
+            "const MNIST_LOGISTIC_OPTIMIZED_SOURCE = raw\"\"\"",
+            "plate(eachcol(nonreference_logits), y)",
+            "categorical_logit_ref(observation_logits).logpdf(observed_class)",
             "build_mnist_logistic_optimized_graph() =",
         )
         length(findall(optimized_anchor, current)) == 1 || return false
     end
-
-    for (kernel_source_anchor, count) in (
-            "CATEGORICAL_LOGIT_COLUMNS_KERNEL_SOURCE," => 1,
-            "const MNIST_LOGISTIC_SOURCE = " *
-                "CATEGORICAL_LOGIT_COLUMNS_KERNEL_SOURCE * raw\"\"\"" => 1,
-            "CATEGORICAL_LOGIT_REF_COLUMNS_KERNEL_SOURCE" => 2,
+    for removed_anchor in (
+            "_kernel_tensorized_pair",
+            "_categorical_logit_columns_kernel",
+            "_categorical_logit_ref_columns_kernel",
         )
-        length(findall(kernel_source_anchor, current)) == count || return false
+        isempty(findall(removed_anchor, current)) || return false
     end
 
     for authority in (

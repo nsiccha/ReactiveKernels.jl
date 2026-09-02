@@ -2,9 +2,6 @@ module MNISTLogisticExample
 
 using ReactiveKernels
 using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
-using ReactiveKernelsDistributionKernels.DistributionKernelSources:
-    CATEGORICAL_LOGIT_COLUMNS_KERNEL_SOURCE,
-    CATEGORICAL_LOGIT_REF_COLUMNS_KERNEL_SOURCE
 
 export NUM_CLASSES
 export MNIST_LOGISTIC_X, MNIST_LOGISTIC_Y
@@ -38,9 +35,9 @@ test inputs; the benchmark loads full MNIST via MLDatasets instead.
 mnist_logistic_fixture() =
     (; X = MNIST_LOGISTIC_X, y = MNIST_LOGISTIC_Y, num_classes = NUM_CLASSES)
 
-const MNIST_LOGISTIC_SOURCE = CATEGORICAL_LOGIT_COLUMNS_KERNEL_SOURCE * raw"""
+const MNIST_LOGISTIC_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
-    normal
+    normal, categorical_logit
 
 @kernel model(unconstrained::Vector{Float64},
               W::Matrix{Float64}, b::Vector{Float64},
@@ -68,14 +65,14 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
 
     # Softmax categorical likelihood. The linear predictor gives the C-1
     # non-reference logits per observation; class 0 is the reference (logit 0),
-    # prepended as the first row. The batched `categorical_logit_columns`
-    # distribution kernel returns the pointwise log densities in one
-    # tensor-friendly gather.
-    nonreference_logits::Matrix{Float64} = W * transpose(X) .+ b
-    logits::Matrix{Float64} =
-        vcat(zeros(1, size(nonreference_logits, 2)), nonreference_logits)
-    pointwise::Vector{Float64} =
-        _categorical_logit_columns_kernel(logits, y)
+    # prepended as the first row. Each observation's likelihood then reuses the
+    # `categorical_logit` distribution object over that observation's logits
+    # column — exactly as Eight Schools reuses `normal` per observation.
+    nonreference_logits = W * transpose(X) .+ b
+    logits = vcat(zeros(1, size(nonreference_logits, 2)), nonreference_logits)
+    pointwise = plate(eachcol(logits), y) do observation_logits, observed_class
+        categorical_logit(observation_logits).logpdf(observed_class)
+    end
     likelihood::Float64 = sum(pointwise)
 
     density::Float64 = prior + likelihood
@@ -102,7 +99,8 @@ output = evaluation_kernel(unconstrained, X, y, num_classes)
 prior, likelihood, density = output
 
 # Pointwise likelihoods and their total are alternate cuts through the same
-# batched distribution-object result.
+# authored plate; a total-only query fuses the sum without materializing the
+# per-observation vector.
 pointwise_extraction = prepare(model;
     have = (:W, :b, :X, :y, :num_classes),
     want = :pointwise)
@@ -120,13 +118,14 @@ docs_example = (;
     pointwise_extraction,
     pointwise,
     normal_object = normal,
+    categorical_logit_object = categorical_logit,
 )
 """
 
 function evaluate_mnist_logistic_source()
     # Bind only the data. The authored source imports the reusable `normal` and
-    # batched categorical distribution kernel itself; the density is entirely
-    # composed from reusable objects and RK plate/array primitives.
+    # `categorical_logit` distribution objects itself; the density is entirely
+    # composed from those objects and RK plate/array primitives.
     _evaluate_ppl_source(MNIST_LOGISTIC_SOURCE, @__MODULE__; bindings = (
         :MNIST_LOGISTIC_X, :MNIST_LOGISTIC_Y, :NUM_CLASSES,
     ))
@@ -155,9 +154,8 @@ softmax categorical over its logits column.
 
 The density is composed entirely from reusable, transparently-authored
 distribution objects: the shared `normal` object for the coefficient prior and
-the batched categorical kernel for the pointwise likelihood. Its native body
-is the authored scalar-object plate; its compiler body is an equivalent tensor
-gather/reduction. There is no hand-written density formula in the model. Packed
+the `categorical_logit` object for each pointwise likelihood. There is no
+hand-written density formula in the model. Packed
 unconstrained (`unconstrained`), structured (`W`, `b`), and likelihood-only
 boundaries are HAVE cuts of the same graph; prior, pointwise likelihood, summed
 likelihood, and the joint density are selectable named nodes.
@@ -168,12 +166,11 @@ build_mnist_logistic_graph() = compose(_MNIST_LOGISTIC_GRAPH_TEMPLATE[])
 # decision: keep the idiomatic comparison; add heavier-optimized variants as
 # additional benchmark columns). It never materializes the padded [0; logits]
 # matrix: the reference class is handled inside the reference-coded
-# `categorical_logit_ref_columns` object, so the likelihood runs directly over
+# `categorical_logit_ref` object, so the likelihood runs directly over
 # the (C-1) × N nonreference logits columns.
-const MNIST_LOGISTIC_OPTIMIZED_SOURCE =
-    CATEGORICAL_LOGIT_REF_COLUMNS_KERNEL_SOURCE * raw"""
+const MNIST_LOGISTIC_OPTIMIZED_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
-    normal
+    normal, categorical_logit_ref
 
 @kernel model(unconstrained::Vector{Float64},
               W::Matrix{Float64}, b::Vector{Float64},
@@ -198,11 +195,12 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
 
     # Optimized softmax categorical likelihood: no padded logits matrix. The
     # reference class (class 1, logit 0) lives inside the reference-coded
-    # batched `categorical_logit_ref_columns` kernel over the (C-1)×N
-    # nonreference logits directly.
-    nonreference_logits::Matrix{Float64} = W * transpose(X) .+ b
-    pointwise::Vector{Float64} =
-        _categorical_logit_ref_columns_kernel(nonreference_logits, y)
+    # `categorical_logit_ref` object, so each observation reuses that object
+    # over its (C-1)-vector of nonreference logits directly.
+    nonreference_logits = W * transpose(X) .+ b
+    pointwise = plate(eachcol(nonreference_logits), y) do observation_logits, observed_class
+        categorical_logit_ref(observation_logits).logpdf(observed_class)
+    end
     likelihood::Float64 = sum(pointwise)
 
     density::Float64 = prior + likelihood
@@ -219,7 +217,7 @@ b = 0.01 .* collect(1.0:nonreference)
 unconstrained = vcat(vec(W), b)
 
 # The same extraction pattern as the idiomatic model: one plan for the packed
-# sampler boundary, one pointwise cut through the same distribution object.
+# sampler boundary, one pointwise cut through the same authored plate.
 requested_nodes = (:prior, :likelihood, :density)
 evaluation_kernel = prepare(model;
     have = (:unconstrained, :X, :y, :num_classes),
@@ -244,6 +242,7 @@ docs_example = (;
     pointwise_extraction,
     pointwise,
     normal_object = normal,
+    categorical_logit_ref_object = categorical_logit_ref,
 )
 """
 
@@ -261,7 +260,7 @@ const _MNIST_LOGISTIC_OPTIMIZED_GRAPH_TEMPLATE = Ref{KernelSpec}()
 Build the optimized (vcat-free) MNIST multinomial-logistic classifier as a
 declarative `ReactiveKernels.KernelSpec`. Identical priors and boundaries to
 [`build_mnist_logistic_graph`](@ref); the likelihood handles the reference
-class inside the reference-coded batched categorical distribution kernel,
+class inside the reference-coded `categorical_logit_ref` distribution object,
 so the padded `[0; logits]` matrix is never materialized.
 """
 build_mnist_logistic_optimized_graph() =
