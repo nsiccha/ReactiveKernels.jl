@@ -492,26 +492,52 @@ const _RKBatchedCholesky = Reactant.TracedLinearAlgebra.BatchedCholesky
 const _RKReactantArray = Union{
     Reactant.TracedRArray,Reactant.AbstractConcreteArray}
 
-# `info` is source-static metadata for a compiled Cholesky value, not a tensor
-# argument.  React only to the numeric factor storage so traced loop carries do
-# not attempt to tensorize the host `Int` metadata field.
+# A Cholesky supplied as compiled state carries source-static `info` metadata,
+# while a Cholesky computed inside a compiled call carries Reactant's traced
+# success flag.  Preserve the former, but let Reactant concretize the latter
+# when it crosses the compiled result boundary.
 function Reactant.traced_type_inner(
         ::Type{C}, seen, mode::Reactant.TraceMode, track_numbers::Type,
         ndevices, runtime) where {C<:_RKBatchedCholesky}
     Factors = Reactant.traced_type_inner(
         fieldtype(C, :factors), seen, mode, track_numbers,
         ndevices, runtime)
+    Info = fieldtype(C, :info)
+    if mode == Reactant.TracedToConcrete &&
+            Info <: Union{Reactant.TracedRArray,Reactant.TracedRNumber}
+        Info = Reactant.traced_type_inner(
+            Info, seen, mode, track_numbers, ndevices, runtime)
+    end
     _RKBatchedCholesky{
-        eltype(Factors),Factors,fieldtype(C, :info)}
+        eltype(Factors),Factors,Info}
 end
 
 function Reactant.make_tracer(
         seen, previous::_RKBatchedCholesky, path, mode; kwargs...)
+    if mode == Reactant.TracedToTypes
+        Reactant.make_tracer(
+            seen, previous.factors, Reactant.append_path(path, 1), mode;
+            kwargs...)
+        if previous.info isa Union{Reactant.TracedRArray,Reactant.TracedRNumber}
+            Reactant.make_tracer(
+                seen, previous.info, Reactant.append_path(path, 3), mode;
+                kwargs...)
+        end
+        return nothing
+    end
     factors = Reactant.make_tracer(
         seen, previous.factors, Reactant.append_path(path, 1), mode;
         kwargs...)
     factors === nothing && return nothing
-    _RKBatchedCholesky(factors, previous.uplo, previous.info)
+    info = if previous.info isa
+            Union{Reactant.TracedRArray,Reactant.TracedRNumber}
+        Reactant.make_tracer(
+            seen, previous.info, Reactant.append_path(path, 3), mode;
+            kwargs...)
+    else
+        previous.info
+    end
+    _RKBatchedCholesky(factors, previous.uplo, info)
 end
 
 @inline function ReactiveKernels._sm_cholesky_reconstruct(
