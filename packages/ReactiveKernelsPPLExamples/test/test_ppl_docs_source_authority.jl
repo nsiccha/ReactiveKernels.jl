@@ -51,6 +51,8 @@ end
 
         artifact = evaluator()
         @test artifact.source == strip(source, '\n')
+        @test parentmodule(artifact.sandbox) === owner
+        @test Base.PkgId(artifact.sandbox) == Base.PkgId(owner)
         # `evaluator()` defines the authored recipe closures in a fresh sandbox.
         # Cross that dynamic-evaluation boundary in the latest world, exactly as
         # the docs renderer does, so inlined source operations remain reusable on
