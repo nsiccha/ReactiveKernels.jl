@@ -1,0 +1,125 @@
+generated_at = "2026-09-02T01:05:38.096Z"
+schema = "probprog-mcmc-v1"
+
+[datasets.eight_schools]
+data = "canonical Eight Schools effects and standard errors"
+num_observations = 8
+
+[datasets.mnist_logistic_wren_pca40]
+data = "Wren-compatible MNIST: first N training images projected onto the top 40 unwhitened PCA components fitted on all 60000 training images"
+dataset_profile = "wren-pca40"
+num_features = 40
+num_observations = 1000
+pca_centered = true
+pca_components = 40
+pca_explained_variance_fraction = 0.7861077598655901
+pca_fit_observations = 60000
+pca_input_features = 784
+pca_whitened = false
+wren_reference_checked = false
+
+[environment]
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+julia_threads = 1
+os = "Linux"
+reactant_backend = "default CPU"
+
+[[measurements]]
+compile_or_warm_start_seconds = 36.374502989
+density_parity_max_abs = 1.4210854715202004e-14
+divergences = 20
+harness = "probprog_nuts"
+median_ess = 179.51196100423516
+min_ess = 60.11936570287065
+model = "eight_schools"
+posterior_mean_mu = 4.622262477831921
+posterior_mean_tau = 4.032061066637174
+posterior_sd_mu = 3.3790992051445463
+sampling_seconds = 0.492833547
+state = "measured"
+[[measurements]]
+compile_or_warm_start_seconds = 6.054913938
+divergences = 7
+harness = "advancedhmc_nuts"
+median_ess = 377.3259231643028
+min_ess = 86.21007492840218
+model = "eight_schools"
+posterior_mean_mu = 4.687811879741119
+posterior_mean_tau = 3.545057893445295
+posterior_sd_mu = 3.181636574506212
+sampling_seconds = 0.073951928
+state = "measured"
+[[measurements]]
+compile_or_warm_start_seconds = 8.772308603
+divergences = 17
+harness = "turing_nuts"
+median_ess = 238.51018039514977
+min_ess = 38.7660905802589
+model = "eight_schools"
+posterior_mean_mu = 4.438561761262135
+posterior_mean_tau = 4.290722992005281
+posterior_sd_mu = 3.390282245490558
+sampling_seconds = 0.15337776
+state = "measured"
+[[measurements]]
+harness = "probprog_nuts"
+model = "mnist_logistic_wren_pca40"
+reason = "ProbProg compile/sampling did not complete within the 600s wall-clock budget"
+state = "unsupported_runtime"
+[[measurements]]
+compile_or_warm_start_seconds = 3.065936033
+divergences = 0
+harness = "advancedhmc_nuts"
+median_ess = 848.7300546637982
+min_ess = 331.02605169111257
+model = "mnist_logistic_wren_pca40"
+posterior_mean_first_coefficient = -2.9133478396787913
+posterior_sd_first_coefficient = 0.34300282145544103
+sampling_seconds = 69.456198653
+state = "measured"
+[[measurements]]
+compile_or_warm_start_seconds = 37.422288798
+divergences = 0
+harness = "turing_nuts"
+median_ess = 978.5030806063253
+min_ess = 425.52368081552
+model = "mnist_logistic_wren_pca40"
+posterior_mean_first_coefficient = -2.9247038755902315
+posterior_sd_first_coefficient = 0.33410877010647955
+sampling_seconds = 57.412782095
+state = "measured"
+
+[pins]
+advancedhmc_version = "0.8.6"
+dynamicppl_version = "0.42.7"
+enzyme_version = "0.13.199"
+julia_version = "1.10.11"
+mcmcdiagnostictools_version = "0.3.19"
+reactant_version = "0.2.278"
+reactivekernels_dirty = false
+reactivekernels_sha = "958d9344234784a2380a84cea05e779364d43607"
+reactivekernels_version = "0.1.0"
+reactivekernelspplexamples_version = "0.1.0"
+turing_version = "0.47.2"
+
+    [pins.source_text_sha256]
+    eight_schools = "46da0bba75374c931b131d14cdb35df98027662c2e2e89021224a91a7a030038"
+    mnist_logistic_wren_pca40 = "673e72ae2816de7131e275333c8b66248f7d7a0ced2e6f0f769bf2aa17387d0e"
+
+[protocol]
+density_parity_gate = "RK vs linked Turing joint at deterministic points (rtol 1e-8); ProbProg per-draw log densities vs the native RK kernel (atol 1e-8)"
+divergence_threshold = "energy error 1000 for all three harnesses"
+ess = "MCMCDiagnosticTools.ess (bulk) on the packed draws, uniformly across harnesses"
+harnesses = ["probprog_nuts", "advancedhmc_nuts", "turing_nuts"]
+matched_initial_position = true
+max_tree_depth = 10
+metric = "diagonal (adapted) for all three harnesses"
+models = ["eight_schools", "mnist_logistic_wren_pca40"]
+moment_gate = "pairwise max |Δ| of packed posterior means within a coarse per-model tolerance; sampler trajectories are never compared exactly"
+num_samples = 1000
+num_warmup = 1000
+probprog_budget_seconds = 600
+seed = 20260901
+target_accept = "0.8 for AdvancedHMC and Turing; ProbProg uses its library-default dual-averaging target"
+timing = "one wall-clock run per harness covering warmup plus retained draws; compilation/JIT warm-start is a separate recorded column"
