@@ -1,5 +1,6 @@
 using ReactiveKernels
 using Reactant
+using LinearAlgebra
 using Test
 import Reactant: @compile
 
@@ -41,6 +42,17 @@ _effects_trace(value) = value
     restored_tuple = compiled_tuple_restore(tuple_value)
     @test Float64(first(restored_tuple)) == 4.0
     @test Array(last(restored_tuple)) == [5.0, 6.0]
+
+    host_cholesky = LinearAlgebra.Cholesky(
+        Diagonal([2.0, 3.0]), 'U', 0)
+    backend_cholesky = ReactiveKernels._sm_cholesky_reconstruct(
+        Diagonal(Reactant.to_rarray([2.0, 3.0])), 'U', 0)
+    materialized_cholesky = ReactiveKernels._sm_materialize_observation(
+        backend_cholesky, typeof(host_cholesky))
+    @test typeof(materialized_cholesky) === typeof(host_cholesky)
+    @test materialized_cholesky.factors.diag == [2.0, 3.0]
+    @test materialized_cholesky.uplo == 'U'
+    @test materialized_cholesky.info == 0
 
     collector = _ReactantObservationCollector(Int[])
     port = effect_callable_port(
