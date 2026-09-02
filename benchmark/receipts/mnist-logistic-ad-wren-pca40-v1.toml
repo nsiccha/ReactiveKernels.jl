@@ -253,15 +253,15 @@ turing_version = "0.47.1"
         text_sha256 = "e51b876024fe2bc60ca0c27f59df1c74ef3c5c97165b400fa4d483e24e2509d2"
 
     [pins.primal_comparator_source]
-    commit = "5b5f0897f48576ff079fecb5fc5252b6cb5d2b8a"
+    commit = "0f00b699b588218b4307c193dcde42be66f9ca6b"
     current_delta = "none"
     git_blob = "e97b6b0993457b657b99771fd809fb4999d2af0e"
-    path = "benchmark/mnist_logistic_comparison_body.jl"
+    path = "benchmark/mnist_logistic_wren_pca40_comparison_body.jl"
     text_sha256 = "78a32950d4e0c10af3881da55cdf38237fcb3b25119c98fbc68da4b6634123cf"
 
         [pins.primal_comparator_source.current]
         git_blob = "e97b6b0993457b657b99771fd809fb4999d2af0e"
-        path = "benchmark/mnist_logistic_comparison_body.jl"
+        path = "benchmark/mnist_logistic_wren_pca40_comparison_body.jl"
         text_sha256 = "78a32950d4e0c10af3881da55cdf38237fcb3b25119c98fbc68da4b6634123cf"
 
 [protocol]
