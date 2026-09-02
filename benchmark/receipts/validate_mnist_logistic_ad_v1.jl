@@ -83,17 +83,32 @@ function validate_mnist_logistic_ad_receipt(path::AbstractString;
                 "$key published text digest missing")
         published_commit = get(pin, "commit", "")
         if occursin(r"^[0-9a-f]{40}$", published_commit)
-            published_text = try
-                read(`git -C $root show $published_commit:$published_path`, String)
+            published_source = string(published_commit, ":", published_path)
+            published_blob = try
+                readchomp(pipeline(
+                    `git -C $root rev-parse --verify $published_source`;
+                    stderr = devnull))
             catch
                 nothing
             end
-            require(published_text !== nothing,
+            require(published_blob !== nothing,
                     "$key published source commit is unavailable")
-            published_text === nothing || require(
-                get(pin, "text_sha256", "") ==
-                _mnist_ad_text_sha256_value(published_text),
-                "$key published text digest mismatch")
+            if published_blob !== nothing
+                require(get(pin, "git_blob", "") == published_blob,
+                        "$key published blob mismatch")
+                published_text = try
+                    read(pipeline(`git -C $root cat-file blob $published_blob`;
+                                  stderr = devnull), String)
+                catch
+                    nothing
+                end
+                require(published_text !== nothing,
+                        "$key published source blob is unavailable")
+                published_text === nothing || require(
+                    get(pin, "text_sha256", "") ==
+                    _mnist_ad_text_sha256_value(published_text),
+                    "$key published text digest mismatch")
+            end
         end
         current = get(pin, "current", Dict{String,Any}())
         require(get(current, "path", "") == published_path,
@@ -121,8 +136,9 @@ function validate_mnist_logistic_ad_receipt(path::AbstractString;
             ),
             "comparator reuse delta is not narrowly attested")
     comparator_delta == "none" && require(
-        get(comparator, "commit", "") == get(pins, "reactivekernels_sha", ""),
-        "an exact comparator pin must name the receipt candidate commit")
+        get(comparator, "git_blob", "") ==
+            get(get(comparator, "current", Dict{String,Any}()), "git_blob", ""),
+        "an exact comparator pin must reuse the published source blob")
 
     protocol = receipt["protocol"]
     require(Tuple(get(protocol, "input_boundaries", String[])) ==

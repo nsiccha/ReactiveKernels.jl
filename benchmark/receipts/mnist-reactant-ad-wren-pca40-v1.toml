@@ -151,7 +151,7 @@ rk_reactant_ad_supported = false
 [pins]
 ad_receipt_path = "benchmark/receipts/mnist-logistic-ad-wren-pca40-v1.toml"
 ad_receipt_reactivekernels_sha = "5b5f0897f48576ff079fecb5fc5252b6cb5d2b8a"
-ad_receipt_sha256 = "4a74072e63937fd0059947a430e0948afec8e500fac0ebc59778c866e161ac98"
+ad_receipt_sha256 = "a82ee5020e4467846986bf05cc6d22238ebc2de6f0a23cc50add0cc2187e9b1a"
 benchmarktools_version = "1.6.3"
 differentiationinterface_version = "0.7.21"
 enzyme_version = "0.13.199"
