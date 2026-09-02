@@ -358,6 +358,7 @@ end
 
 """Render the checked-in Normal benchmark receipt as AoV plots plus sortable data."""
 function render_distribution_benchmarks()
+    return _render_distribution_benchmarks_focused()
     receipt = TOML.parsefile(_DISTRIBUTION_RECEIPT_PATH)
     get(receipt, "schema", "") == "distribution-logdensity-v1" ||
         error("unexpected distribution benchmark receipt schema")
@@ -491,6 +492,7 @@ end
 
 """Render prepared distribution-gradient timing and allocation evidence."""
 function render_distribution_gradient_benchmarks()
+    return _render_distribution_gradient_benchmarks_focused()
     receipt = TOML.parsefile(_DISTRIBUTION_GRADIENT_RECEIPT_PATH)
     get(receipt, "schema", "") == "distribution-gradient-v1" ||
         error("unexpected distribution-gradient receipt schema")
@@ -599,6 +601,7 @@ end
 
 """Render the replicated Reactant call boundary as total and per-evaluation time."""
 function render_distribution_amortization()
+    return _render_distribution_amortization_focused()
     receipt = TOML.parsefile(_DISTRIBUTION_RECEIPT_PATH)
     get(receipt, "schema", "") == "distribution-logdensity-v1" ||
         error("unexpected distribution benchmark receipt schema")
@@ -644,6 +647,7 @@ end
 
 """Render PPL replica throughput separately from the single-call latency chart."""
 function render_eval_throughput_amortization()
+    return _render_eval_throughput_amortization_focused()
     receipt = TOML.parsefile(_eval_throughput_receipt())
     replicas = Int(receipt["protocol"]["replicas"])
     measurements = receipt["measurements"]
@@ -693,6 +697,7 @@ end
 
 """Render the scalar distribution gallery receipt as per-family plots and one table."""
 function render_scalar_gallery_benchmarks()
+    return _render_scalar_gallery_benchmarks_focused()
     receipt = TOML.parsefile(_SCALAR_GALLERY_RECEIPT_PATH)
     get(receipt, "schema", "") == "scalar-distribution-gallery-v1" ||
         error("unexpected scalar gallery benchmark receipt schema")
@@ -783,6 +788,7 @@ end
 
 """Render the structured distribution receipt as per-family plots and one table."""
 function render_structured_distribution_benchmarks()
+    return _render_structured_distribution_benchmarks_focused()
     receipt = TOML.parsefile(_STRUCTURED_DISTRIBUTION_RECEIPT_PATH)
     get(receipt, "schema", "") == "structured-distribution-logdensity-v1" ||
         error("unexpected structured distribution benchmark receipt schema")
@@ -863,6 +869,7 @@ const _BATCHED_ALLOCATION_BACKENDS = _BATCHED_TIMING_BACKENDS
 
 """Render authored/legacy plate parity from the checked-in Normal receipt."""
 function render_batched_benchmarks()
+    return _render_batched_benchmarks_focused()
     receipt = TOML.parsefile(_DISTRIBUTION_RECEIPT_PATH)
     get(receipt, "schema", "") == "distribution-logdensity-v1" ||
         error("unexpected batched benchmark receipt schema")
@@ -1065,15 +1072,17 @@ function _render_longform_model_receipt(path, expected_schema;
     ])
 end
 
+include(joinpath(@__DIR__, "mnist_result_views.jl"))
+include(joinpath(@__DIR__, "all_benchmark_views.jl"))
+
 _eight_schools_sort(value, _) = value === missing ? nothing : value.median_ns
 
-"""Render the checked-in primal Eight Schools boundary/outcome/modifier matrix."""
+"""Render focused primal Eight Schools comparisons from the complete receipt."""
 function render_eight_schools_primal_benchmarks()
-    return _render_longform_model_receipt(
+    return _render_eight_schools_longform_focused(
         _EIGHT_SCHOOLS_PRIMAL_RECEIPT_PATH, "eight-schools-primal-v2";
-        id = "eight-schools-primal-matrix",
-        title = "Primal boundary × outcome × modifier matrix",
-        note = "All provider/model/configuration rows remain explicit; timings exclude setup and preparation.")
+        mode = :primal, id_prefix = "eight-schools-primal",
+        profile_label = "Eight Schools primal")
     receipt = TOML.parsefile(_EIGHT_SCHOOLS_PRIMAL_RECEIPT_PATH)
     get(receipt, "schema", "") == "eight-schools-primal-v1" ||
         error("unexpected Eight Schools primal benchmark receipt schema")
@@ -1241,14 +1250,18 @@ end
 
 """Render the checked-in MNIST multinomial-logistic boundary/outcome matrix."""
 function render_mnist_logistic_benchmarks()
-    _render_longform_model_receipt(
+    _render_mnist_longform_focused(
         _MNIST_LOGISTIC_RECEIPT_PATH, "mnist-logistic-primal-v3";
-        id = "mnist-logistic-matrix",
-        title = "MNIST primal boundary × outcome × modifier matrix",
-        note = "Both RK models and both Turing models are shown; N/A and unsupported cells are never dropped.")
+        mode = :primal,
+        id_prefix = "mnist-logistic-full",
+        profile_label = "Full raw MNIST primal")
 end
 
 function _render_mnist_logistic_v1_benchmarks(receipt_path::AbstractString)
+    return _render_mnist_v1_focused(receipt_path;
+        mode = :primal,
+        id_prefix = "mnist-logistic-wren-pca40",
+        profile_label = "Wren PCA-40 primal")
     receipt = TOML.parsefile(receipt_path)
     get(receipt, "schema", "") == "mnist-logistic-v1" ||
         error("unexpected MNIST logistic benchmark receipt schema")
@@ -1411,15 +1424,19 @@ end
 
 """Render the exact full-data MNIST value-and-gradient benchmark matrix."""
 function render_mnist_logistic_ad_benchmarks()
-    _render_longform_model_receipt(
+    _render_mnist_longform_focused(
         _MNIST_LOGISTIC_AD_RECEIPT_PATH, "mnist-logistic-ad-v2";
-        id = "mnist-logistic-ad-matrix",
-        title = "MNIST value-and-gradient matrix",
-        note = "Pointwise and multi-active structured cells retain their public-API unsupported reasons.")
+        mode = :ad,
+        id_prefix = "mnist-logistic-ad-full",
+        profile_label = "Full raw MNIST value + gradient")
 end
 
 """Render a legacy v1 MNIST value-and-gradient benchmark matrix."""
 function _render_mnist_logistic_ad_v1_benchmarks(receipt_path::AbstractString)
+    return _render_mnist_v1_focused(receipt_path;
+        mode = :ad,
+        id_prefix = "mnist-logistic-ad-wren-pca40",
+        profile_label = "Wren PCA-40 value + gradient")
     receipt = TOML.parsefile(receipt_path)
     get(receipt, "schema", "") == "mnist-logistic-ad-v1" ||
         error("unexpected MNIST logistic AD receipt schema")
@@ -1750,13 +1767,12 @@ end
 _eight_schools_ad_sort(value, _) =
     value === missing ? nothing : value.median_ns
 
-"""Render the exact Eight Schools AD matrix and separated setup evidence."""
+"""Render focused Eight Schools AD comparisons from the complete receipt."""
 function render_eight_schools_ad_benchmarks()
-    return _render_longform_model_receipt(
+    return _render_eight_schools_longform_focused(
         _EIGHT_SCHOOLS_AD_RECEIPT_PATH, "eight-schools-ad-v2";
-        id = "eight-schools-ad-matrix",
-        title = "Eight Schools value-and-gradient matrix",
-        note = "Every scalar single-active-port cell is measured; other cells keep their exact state.")
+        mode = :ad, id_prefix = "eight-schools-ad",
+        profile_label = "Eight Schools value + gradient")
     receipt = TOML.parsefile(_EIGHT_SCHOOLS_AD_RECEIPT_PATH)
     get(receipt, "schema", "") == "eight-schools-ad-v1" ||
         error("unexpected Eight Schools AD receipt schema")
@@ -2064,6 +2080,7 @@ end
 
 """Render the frozen G7 work-normalized NUTS receipt as one plot/table source."""
 function render_nuts_g7_benchmark()
+    return _render_nuts_g7_benchmark_focused()
     receipt = TOML.parsefile(_NUTS_G7_RECEIPT_PATH)
     get(receipt, "schema", "") == "nuts-g7-v1" ||
         error("unexpected NUTS G7 benchmark receipt schema")
@@ -2131,6 +2148,7 @@ end
 
 """Render the frozen matched native/Reactant adaptive-NUTS receipt."""
 function render_nuts_reactant_benchmark()
+    return _render_nuts_reactant_benchmark_focused()
     receipt = TOML.parsefile(_NUTS_REACTANT_RECEIPT_PATH)
     get(receipt, "schema", "") == "nuts-reactant-v1" ||
         error("unexpected Reactant NUTS benchmark receipt schema")
@@ -2236,13 +2254,12 @@ function render_nuts_reactant_benchmark()
     ])
 end
 
-"""Render the exact Eight Schools native-RK/Reactant primal matrix."""
+"""Render focused native-RK/Reactant primal comparisons from the full receipt."""
 function render_eight_schools_reactant_benchmark()
-    return _render_longform_model_receipt(
+    return _render_eight_schools_reactant_longform_focused(
         _EIGHT_SCHOOLS_REACTANT_RECEIPT_PATH, "eight-schools-reactant-v2";
-        id = "eight-schools-reactant-matrix",
-        title = "Eight Schools Reactant primal matrix",
-        note = "Bound and unbound compiler rows are measured separately against native controls.")
+        mode = :primal, id_prefix = "eight-schools-reactant",
+        profile_label = "Eight Schools Reactant primal")
     receipt = TOML.parsefile(_EIGHT_SCHOOLS_REACTANT_RECEIPT_PATH)
     get(receipt, "schema", "") == "eight-schools-reactant-v1" ||
         error("unexpected Eight Schools Reactant benchmark receipt schema")
@@ -2377,13 +2394,13 @@ function render_eight_schools_reactant_benchmark()
     ])
 end
 
-"""Render the checked-in Eight Schools Reactant-compiled-AD receipt as sortable data."""
+"""Render focused Reactant-compiled-AD comparisons from the full receipt."""
 function render_eight_schools_reactant_ad_benchmark()
-    return _render_longform_model_receipt(
-        _EIGHT_SCHOOLS_REACTANT_AD_RECEIPT_PATH, "eight-schools-reactant-ad-v2";
-        id = "eight-schools-reactant-ad-matrix",
-        title = "Eight Schools Reactant value-and-gradient matrix",
-        note = "Compilation and first calls are excluded; unsupported API shapes remain rows.")
+    return _render_eight_schools_reactant_longform_focused(
+        _EIGHT_SCHOOLS_REACTANT_AD_RECEIPT_PATH,
+        "eight-schools-reactant-ad-v2";
+        mode = :ad, id_prefix = "eight-schools-reactant-ad",
+        profile_label = "Eight Schools Reactant value + gradient")
     receipt = TOML.parsefile(_EIGHT_SCHOOLS_REACTANT_AD_RECEIPT_PATH)
     get(receipt, "schema", "") == "eight-schools-reactant-ad-v1" ||
         error("unexpected Eight Schools Reactant-AD benchmark receipt schema")
@@ -2569,14 +2586,18 @@ function render_mnist_reactant_benchmark(
 )
     receipt = TOML.parsefile(receipt_path)
     if get(receipt, "schema", "") == "mnist-reactant-v2"
-        return _render_longform_model_receipt(
+        return _render_mnist_reactant_longform_focused(
             receipt_path, "mnist-reactant-v2";
-            id = "mnist-reactant-matrix",
-            title = "MNIST Reactant primal matrix",
-            note = "Both model sources, both boundaries, and bound/unbound data modes remain visible.")
+            mode = :primal,
+            id_prefix = "mnist-reactant-full",
+            profile_label = "Full raw MNIST Reactant primal")
     end
     get(receipt, "schema", "") == "mnist-reactant-v1" ||
         error("unexpected MNIST Reactant benchmark receipt schema")
+    return _render_mnist_reactant_v1_focused(receipt_path;
+        mode = :primal,
+        id_prefix = "mnist-reactant-matrix-wren-pca40",
+        profile_label = "Wren PCA-40 Reactant primal")
     pins = receipt["pins"]
     get(pins, "reactivekernels_dirty", true) == false ||
         error("MNIST Reactant receipt was produced from a dirty checkout")
@@ -2746,14 +2767,18 @@ function render_mnist_reactant_ad_benchmark(
 )
     receipt = TOML.parsefile(receipt_path)
     if get(receipt, "schema", "") == "mnist-reactant-ad-v2"
-        return _render_longform_model_receipt(
+        return _render_mnist_reactant_longform_focused(
             receipt_path, "mnist-reactant-ad-v2";
-            id = "mnist-reactant-ad-matrix",
-            title = "MNIST Reactant value-and-gradient matrix",
-            note = "The packed scalar headline is measured for both models and both data modes.")
+            mode = :ad,
+            id_prefix = "mnist-reactant-ad-full",
+            profile_label = "Full raw MNIST Reactant value + gradient")
     end
     get(receipt, "schema", "") == "mnist-reactant-ad-v1" ||
         error("unexpected MNIST Reactant-AD benchmark receipt schema")
+    return _render_mnist_reactant_v1_focused(receipt_path;
+        mode = :ad,
+        id_prefix = "mnist-reactant-ad-matrix-wren-pca40",
+        profile_label = "Wren PCA-40 Reactant value + gradient")
     pins = receipt["pins"]
     get(pins, "reactivekernels_dirty", true) == false ||
         error("MNIST Reactant-AD receipt was produced from a dirty checkout")
@@ -3165,8 +3190,30 @@ function render_probprog_mcmc_benchmark()
         "RK $(first(String(pins["reactivekernels_sha"]), 10)).",
     )
 
+    plot_rows = [(;
+        harness = row.harness,
+        model = row.model,
+        min_ess_rate = row.min_ess_rate,
+    ) for row in rows if row.min_ess_rate !== missing]
+    harness_order = unique(getproperty.(plot_rows, :harness))
+    ess_rate_plot = _plot_block(
+        data(plot_rows) *
+        mapping(
+            :harness => sorter(harness_order) => "Sampler harness",
+            :min_ess_rate => "Min ESS / s";
+            color = :model => "Model",
+        ) *
+        visual(Scatter, markersize = 120) *
+        config(height = 280, scales = scales(Y = (; scale = log10)));
+        id = "probprog-mcmc-ess-rate",
+        title = "Minimum effective samples per second",
+        description = "Per measured harness and model; the rate axis is " *
+            "logarithmic. The rejected ProbProg MNIST cell has no rate and " *
+            "appears only in the table.")
+
     Markdown.MD(Any[
         Markdown.Paragraph(Any[summary]),
+        ess_rate_plot,
         _result_table(rows, columns; id = "probprog-mcmc-performance",
             title = "NUTS sampling performance and diagnostics",
             note = "One wall-clock run per harness covering warmup plus " *

@@ -47,6 +47,11 @@ Main.ReactiveKernelsDocs.render_nuts_status()
 Main.ReactiveKernelsDocs.render_nuts_g7_benchmark()
 ```
 
+The plot and compact table normalize time per completed leapfrog step to RK,
+while retaining absolute median leapfrog steps/s and exact work counts. A ratio
+below 1× means the comparator executes each leapfrog step faster; this remains
+an inner-loop comparison rather than an ESS or end-to-end sampling claim.
+
 The sealed native compiler (`packages/ReactiveKernelsNUTSExamples/src/nuts_runtime/kernel_nuts_native.jl`,
 `_build_nuts_sampler`) and the minimal-reset external authoring fixture are
 **on `main` as compiler evidence**. The figures in the G7 panel immediately above

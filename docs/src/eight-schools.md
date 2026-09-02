@@ -145,7 +145,7 @@ Nonallocating AD and nonallocating Reactant are deliberately absent because
 those public kernel types do not compose yet; the suite validators reject any
 receipt that silently invents such a surface.
 
-The benchmark below prepares the exact authored graph above from three useful
+The receipt prepares the exact authored graph above from three useful
 starting boundaries and asks for four model outcomes. `Packed unconstrained`
 matches a sampler's linked parameter vector. `Constrained parameters` starts
 after support transforms. `Likelihood inputs only` supplies just `θ`, the
@@ -158,7 +158,11 @@ interfaces: a fixed-transform `LogDensityFunction` for packed parameters,
 `pointwise_loglikelihoods` for pointwise values. Blank cells stay blank when no
 matching public Turing boundary exists; the benchmark does not invent an
 equivalent helper. Setup, graph preparation, parameter linking, and transform
-discovery are outside the timed region.
+discovery are outside the timed region. The page leads with the sampler-relevant
+packed boundary, split into separate joint, prior, summed-likelihood, and
+pointwise plots and compact baseline-relative tables. The complete boundary ×
+configuration matrix, unsupported cells, setup costs, and raw rounds remain in
+the receipt rather than dominating the comparison view.
 
 The centered Turing baseline uses `filldist(Normal(μ, τ), J)` for the school
 effects. That is the same independent-normal model as
@@ -170,9 +174,9 @@ form rather than an intentionally slow comparator.
 Main.ReactiveKernelsDocs.render_eight_schools_primal_benchmarks()
 ```
 
-Each cell reports the median of ten independent BenchmarkTools minimum-time
-rounds together with steady-state allocation bytes and counts. Every supported
-cell must agree numerically with the handwritten control before it is timed.
+Displayed runtimes and allocation units use three significant digits. Every
+supported receipt cell comes from ten independent BenchmarkTools minimum-time
+rounds and must agree numerically with the handwritten control before timing.
 
 ### Baseline implementations
 
