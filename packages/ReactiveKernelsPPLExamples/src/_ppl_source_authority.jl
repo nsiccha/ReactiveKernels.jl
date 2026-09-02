@@ -11,7 +11,12 @@ function _evaluate_ppl_source(source::AbstractString, owner::Module;
     # Match the docs renderer's framing rule exactly: triple-quoted authorities
     # carry a terminal newline, while the displayed/executed panel bytes do not.
     displayed = strip(String(source), '\n')
-    sandbox = Module(gensym(Symbol(nameof(owner), :Source)), true, true)
+    # Keep package loading in the source owner's dependency context. A top-level
+    # anonymous module instead resolves `using` against the caller's active
+    # project, forcing runners to repeat dependencies named by the source.
+    sandbox_name = gensym(Symbol(nameof(owner), :Source))
+    Core.eval(owner, Expr(:module, true, sandbox_name, Expr(:block)))
+    sandbox = getfield(owner, sandbox_name)
     Core.eval(sandbox, :(using ReactiveKernels))
     owner_name = nameof(owner)
     Core.eval(sandbox, :(const $(owner_name) = $owner))
