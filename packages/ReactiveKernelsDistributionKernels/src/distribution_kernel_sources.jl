@@ -9,8 +9,6 @@ export BERNOULLI_KERNEL_SOURCE, LOGNORMAL_KERNEL_SOURCE
 export EXPONENTIAL_KERNEL_SOURCE, GEOMETRIC_KERNEL_SOURCE, UNIFORM_KERNEL_SOURCE
 export MVNORMAL_KERNEL_SOURCE, AR1_KERNEL_SOURCE
 export CATEGORICAL_LOGIT_KERNEL_SOURCE, CATEGORICAL_LOGIT_REF_KERNEL_SOURCE
-export CATEGORICAL_LOGIT_COLUMNS_KERNEL_SOURCE
-export CATEGORICAL_LOGIT_REF_COLUMNS_KERNEL_SOURCE
 export bernoulli, lognormal, exponential, geometric, uniform, mvnormal, ar1
 export categorical_logit, categorical_logit_ref
 export NORMAL_LOGDENSITY_SOURCE, CAUCHY_LOGDENSITY_SOURCE
@@ -282,54 +280,6 @@ using LogExpFunctions: logaddexp, logsumexp
         ifelse(observed == 1, 0.0,
                nonreference_logits[max(observed - 1, 1)]) -
         logaddexp(0.0, logsumexp(nonreference_logits))
-end
-"""
-
-# Batched column forms of the same two categorical objects. Their vector-index
-# gather is friendly to array compilers while the scalar objects above remain
-# the natural per-observation endpoints. Both expose pointwise log densities;
-# consumers choose whether to sum them.
-const CATEGORICAL_LOGIT_COLUMNS_KERNEL_SOURCE = raw"""
-using LogExpFunctions: logsumexp
-using ReactiveKernelsDistributionKernels.DistributionKernelSources:
-    categorical_logit
-
-@kernel _categorical_logit_columns_kernel(
-        logits::Matrix{Float64}, observed::Vector{Int}) = begin
-    logpdf::Vector{Float64} =
-        ReactiveKernels._kernel_tensorized_pair(
-            (plate(eachcol(logits), observed) do column, label
-                categorical_logit(column).logpdf(label)
-            end),
-            logits[observed .+
-                   size(logits, 1) .* collect(0:(length(observed) - 1))] .-
-            vec(logsumexp(logits; dims = 1)))
-    return logpdf
-end
-"""
-
-const CATEGORICAL_LOGIT_REF_COLUMNS_KERNEL_SOURCE = raw"""
-using LogExpFunctions: logaddexp, logsumexp
-using ReactiveKernelsDistributionKernels.DistributionKernelSources:
-    categorical_logit_ref
-
-@inline _zero_reference_class_logit(observed, selected) =
-    ifelse(observed == 1, zero(selected), selected)
-
-@kernel _categorical_logit_ref_columns_kernel(
-        nonreference_logits::Matrix{Float64}, observed::Vector{Int}) = begin
-    logpdf::Vector{Float64} =
-        ReactiveKernels._kernel_tensorized_pair(
-            (plate(eachcol(nonreference_logits), observed) do column, label
-                categorical_logit_ref(column).logpdf(label)
-            end),
-            _zero_reference_class_logit.(observed, nonreference_logits[
-                    max.(observed .- 1, 1) .+
-                    size(nonreference_logits, 1) .*
-                        collect(0:(length(observed) - 1))]) .-
-            vec(logaddexp.(0.0,
-                logsumexp(nonreference_logits; dims = 1))))
-    return logpdf
 end
 """
 

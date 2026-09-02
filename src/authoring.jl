@@ -1347,19 +1347,6 @@ _tensorized_callee_replacement(callee::GlobalRef) =
     nothing
 _tensorized_callee_replacement(callee) = nothing
 
-function _kernel_tensorized_pair_arguments(rhs)
-    rhs isa Expr && rhs.head === :call && length(rhs.args) == 3 || return nothing
-    callee = rhs.args[1]
-    matches = callee === :_kernel_tensorized_pair ||
-        (callee isa GlobalRef && callee.mod === (@__MODULE__) &&
-         callee.name === :_kernel_tensorized_pair) ||
-        (callee isa Expr && callee.head === :. && length(callee.args) == 2 &&
-         callee.args[1] === :ReactiveKernels &&
-         (callee.args[2] === :_kernel_tensorized_pair ||
-          callee.args[2] === QuoteNode(:_kernel_tensorized_pair)))
-    matches ? (rhs.args[2], rhs.args[3]) : nothing
-end
-
 function _kernel_tensorized_callee(callee, known::Set{Symbol}, mod)
     callee isa Symbol && !(callee in known) && mod isa Module &&
         isdefined(mod, callee) && return GlobalRef(mod, callee)
@@ -1451,19 +1438,6 @@ function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
                            tensorize::Bool = true,
                            mod::Union{Module,Nothing} = nothing,
                            nested_specs = Dict{Symbol,Any}())
-    explicit_pair = _kernel_tensorized_pair_arguments(rhs)
-    if explicit_pair !== nothing
-        tensorize || throw(ArgumentError(
-            "explicit tensorized recipe bodies are incompatible with effectful recipes"))
-        native_rhs, tensorized_rhs = explicit_pair
-        deftoken = gensym(:rk_srcop)
-        return Expr(:call, GlobalRef(@__MODULE__, :_KernelSourceOp),
-            Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
-            Expr(:call, GlobalRef(Base, :Val), QuoteNode(:fused)),
-            Expr(:->, Expr(:tuple, deps...), native_rhs),
-            Expr(:->, Expr(:tuple, deps...),
-                 _kernel_tensorized_rhs(tensorized_rhs, known, mod)))
-    end
     form = :fused
     if rhs isa Expr && rhs.head === :call && !isempty(rhs.args)
         callee = rhs.args[1]
@@ -1700,15 +1674,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                 register!(name, type_expr)
                 push!(outputs, (name, type_expr))
             end
-            explicit_pair = _kernel_tensorized_pair_arguments(rhs)
-            native_rhs = explicit_pair === nothing ? rhs : explicit_pair[1]
-            plate_expr = _kernel_authored_plate_expr(native_rhs, mod)
-            if plate_expr !== nothing && explicit_pair !== nothing
-                plate_expr = (;
-                    plate_expr...,
-                    explicit_tensorized_rhs = explicit_pair[2],
-                )
-            end
+            plate_expr = _kernel_authored_plate_expr(rhs, mod)
             if plate_expr !== nothing
                 length(outputs) == 1 || throw(ArgumentError(
                     "an authored plate produces exactly one named pointwise port"))
@@ -1859,13 +1825,6 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                collect(plate_expr.arguments)
         deps = plate_expr === nothing ? _kernel_nested_endpoint_deps(
             rhs, deps, known, mod, nested_specs) : deps
-        if plate_expr !== nothing &&
-           hasproperty(plate_expr, :explicit_tensorized_rhs)
-            for name in _kernel_free_ports(
-                    plate_expr.explicit_tensorized_rhs, known)
-                name in deps || push!(deps, name)
-            end
-        end
         all(name -> name in known, deps) || throw(ArgumentError(
             "authored plate arguments must be declared graph ports"))
         union!(consumed_names, deps)
@@ -1877,30 +1836,12 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         cost = get(metadata, :cost, 1.0)
         cse_key = get(metadata, :cse_key, nothing)
         effectful = get(metadata, :effectful, false)
-        op = if plate_expr === nothing
-            _kernel_operation(
-                rhs, deps, known; tensorize = !effectful, mod = mod,
-                nested_specs = nested_specs)
-        elseif hasproperty(plate_expr, :explicit_tensorized_rhs)
-            effectful && throw(ArgumentError(
-                "explicit tensorized recipe bodies are incompatible with effectful recipes"))
-            tensorized_body = _kernel_tensorized_rhs(
-                plate_expr.explicit_tensorized_rhs, known, mod)
-            Expr(:call, GlobalRef(@__MODULE__, :_KernelTensorizedOp),
-                plate_expr.operation,
-                Expr(:call, GlobalRef(Base, :Val),
-                     length(plate_expr.arguments)),
-                Expr(:->, Expr(:tuple, deps...),
-                    tensorized_body),
-                QuoteNode(tensorized_body))
-        else
-            plate_expr.operation
-        end
-        source_rhs = something(
-            _kernel_tensorized_pair_arguments(rhs), (rhs, rhs))[1]
+        op = plate_expr === nothing ? _kernel_operation(
+            rhs, deps, known; tensorize = !effectful, mod = mod,
+            nested_specs = nested_specs) : plate_expr.operation
         push!(body, :($add_ref($graph_var, $dep_values, $out_values,
                                $op, $cost, $cse_key, $effectful,
-                               $(QuoteNode(source_rhs)))))
+                               $(QuoteNode(rhs)))))
     end
     if !saw_return
         for name in produced_names

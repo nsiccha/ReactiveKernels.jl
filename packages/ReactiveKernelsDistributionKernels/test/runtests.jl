@@ -11,8 +11,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     EXPONENTIAL_KERNEL_SOURCE, GEOMETRIC_KERNEL_SOURCE, UNIFORM_KERNEL_SOURCE,
     MVNORMAL_KERNEL_SOURCE, AR1_KERNEL_SOURCE,
     CATEGORICAL_LOGIT_KERNEL_SOURCE, CATEGORICAL_LOGIT_REF_KERNEL_SOURCE,
-    CATEGORICAL_LOGIT_COLUMNS_KERNEL_SOURCE,
-    CATEGORICAL_LOGIT_REF_COLUMNS_KERNEL_SOURCE,
     normal, cauchy, laplace, bernoulli, lognormal,
     exponential, geometric, uniform, mvnormal, ar1,
     categorical_logit, categorical_logit_ref,
@@ -53,9 +51,7 @@ end
          GEOMETRIC_KERNEL_SOURCE, UNIFORM_KERNEL_SOURCE,
          MVNORMAL_KERNEL_SOURCE, AR1_KERNEL_SOURCE,
          CATEGORICAL_LOGIT_KERNEL_SOURCE,
-         CATEGORICAL_LOGIT_REF_KERNEL_SOURCE,
-         CATEGORICAL_LOGIT_COLUMNS_KERNEL_SOURCE,
-         CATEGORICAL_LOGIT_REF_COLUMNS_KERNEL_SOURCE))
+         CATEGORICAL_LOGIT_REF_KERNEL_SOURCE))
 
     @testset "public location-scale plate is allocation-free" begin
         xs = [-1.2, -0.1, 0.7, 1.8]
@@ -152,10 +148,6 @@ end
         @test hasproperty(ar1, :logpdf)
         @test occursin("@kernel ar1", AR1_KERNEL_SOURCE)
 
-        @test occursin("categorical_logit(column).logpdf(label)",
-                       CATEGORICAL_LOGIT_COLUMNS_KERNEL_SOURCE)
-        @test occursin("categorical_logit_ref(column).logpdf(label)",
-                       CATEGORICAL_LOGIT_REF_COLUMNS_KERNEL_SOURCE)
     end
 
     @testset "transparent cuts and shared work" begin

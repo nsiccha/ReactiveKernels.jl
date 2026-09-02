@@ -19,11 +19,12 @@ training split. Every cell is evaluated natively and attempted through
 Reactant.
 
 All primal outcomes compile for both model sources, both parameter boundaries,
-and both data modes. The native half of each categorical recipe remains the
-allocation-friendly authored scalar-object plate; Reactant receives the
-explicitly equivalent tensor gather/reduction. Bound-data prior rows are N/A
-because their selected graph slice has no data ports. No host fallback or
-Reactant-only model is used.
+and both data modes. Native execution and Reactant consume the same natural
+`plate(eachcol(logits), y)` likelihood source. Reactant's generic authored-plate
+lowering preserves the column structure and lowers the scalar endpoints to
+batched operations with traced gathers; there is no alternate recipe body or
+private MNIST adapter. Bound-data prior rows are N/A because their selected
+graph slice has no data ports. No host fallback or Reactant-only model is used.
 
 ## Primal performance and support
 
