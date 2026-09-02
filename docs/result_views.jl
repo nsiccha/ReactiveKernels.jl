@@ -3006,3 +3006,196 @@ function render_compiler_capabilities()
     Markdown.MD(Any[_result_table(rows, columns;
         id = "compiler-capability-table", title = "Definitive support matrix")])
 end
+
+const _PROBPROG_MCMC_RECEIPT_PATH = joinpath(
+    @__DIR__, "..", "benchmark", "receipts", "probprog-mcmc-v1.toml")
+
+const _PROBPROG_MCMC_HARNESS_LABELS = (
+    ("probprog_nuts", "ProbProg compiled NUTS (Reactant)"),
+    ("advancedhmc_nuts", "AdvancedHMC NUTS over the RK density"),
+    ("turing_nuts", "Turing NUTS (attested twin model)"),
+)
+
+const _PROBPROG_MCMC_MODEL_LABELS = Dict(
+    "eight_schools" => "Eight Schools (10-dim packed posterior)",
+    "mnist_logistic_wren_pca40" =>
+        "MNIST logistic, Wren PCA-40 (369-dim packed joint)",
+)
+
+function _probprog_mcmc_receipt()
+    receipt = TOML.parsefile(_PROBPROG_MCMC_RECEIPT_PATH)
+    get(receipt, "schema", "") == "probprog-mcmc-v1" ||
+        error("unexpected ProbProg MCMC receipt schema")
+    pins = receipt["pins"]
+    get(pins, "reactivekernels_dirty", true) == false ||
+        error("ProbProg MCMC receipt was produced from a dirty checkout")
+    receipt
+end
+
+_probprog_mcmc_row(receipt, model, harness) = only(filter(
+    row -> row["model"] == model && row["harness"] == harness,
+    receipt["measurements"]))
+
+"""Render the checked-in ProbProg/AdvancedHMC/Turing NUTS sampling receipt."""
+function render_probprog_mcmc_benchmark()
+    receipt = _probprog_mcmc_receipt()
+    pins = receipt["pins"]
+    protocol = receipt["protocol"]
+    num_warmup = Int(protocol["num_warmup"])
+    num_samples = Int(protocol["num_samples"])
+    transitions = num_warmup + num_samples
+
+    seconds(value) = string(round(Float64(value); sigdigits = 4), " s")
+    per_second(value) = string(round(Float64(value); sigdigits = 4), " /s")
+    ess(value) = string(round(Float64(value); digits = 1))
+
+    rows = NamedTuple[]
+    for (model, model_label) in sort!(collect(_PROBPROG_MCMC_MODEL_LABELS))
+        for (harness, harness_label) in _PROBPROG_MCMC_HARNESS_LABELS
+            row = _probprog_mcmc_row(receipt, model, harness)
+            measured = get(row, "state", "") == "measured"
+            sampling_seconds = measured ?
+                Float64(row["sampling_seconds"]) : missing
+            push!(rows, (;
+                model = model_label,
+                harness = harness_label,
+                warm = measured ?
+                    Float64(row["compile_or_warm_start_seconds"]) : missing,
+                sampling = sampling_seconds,
+                rate = measured ? transitions / sampling_seconds : missing,
+                divergences = measured ? Int(row["divergences"]) : missing,
+                min_ess = measured ? Float64(row["min_ess"]) : missing,
+                median_ess = measured ? Float64(row["median_ess"]) : missing,
+                min_ess_rate = measured ?
+                    Float64(row["min_ess"]) / sampling_seconds : missing,
+                status = measured ? "measured" :
+                    get(row, "reason", "unsupported"),
+            ))
+        end
+    end
+
+    columns = (
+        _column(:model, "Model"),
+        _column(:harness, "Sampler harness"),
+        _column(:warm, "Compile / JIT warm start";
+            format = (value, _) -> _unsupported(value, seconds)),
+        _column(:sampling, "Warmup + sampling";
+            format = (value, _) -> _unsupported(value, seconds)),
+        _column(:rate, "Transitions / s";
+            format = (value, _) -> _unsupported(value, per_second)),
+        _column(:divergences, "Divergences";
+            format = (value, _) -> _unsupported(value, string)),
+        _column(:min_ess, "Min ESS";
+            format = (value, _) -> _unsupported(value, ess)),
+        _column(:median_ess, "Median ESS";
+            format = (value, _) -> _unsupported(value, ess)),
+        _column(:min_ess_rate, "Min ESS / s";
+            format = (value, _) -> _unsupported(value, per_second)),
+        _column(:status, "Compiler result";
+            format = (value, _) -> value == "measured" ? value :
+                h.span(value; class = "rk-result-unsupported")),
+    )
+
+    moment(value) = string(round(Float64(value); sigdigits = 4))
+    measured_row(model, harness) = begin
+        row = _probprog_mcmc_row(receipt, model, harness)
+        get(row, "state", "") == "measured" ? row : nothing
+    end
+    eight_schools_rows = [(;
+        harness = harness_label,
+        mean_mu = Float64(row["posterior_mean_mu"]),
+        sd_mu = Float64(row["posterior_sd_mu"]),
+        mean_tau = Float64(row["posterior_mean_tau"]),
+    ) for (harness, harness_label) in _PROBPROG_MCMC_HARNESS_LABELS
+      for row in (measured_row("eight_schools", harness),) if row !== nothing]
+    eight_schools_columns = (
+        _column(:harness, "Sampler harness"),
+        _column(:mean_mu, "E[μ]"; format = (value, _) -> moment(value)),
+        _column(:sd_mu, "sd[μ]"; format = (value, _) -> moment(value)),
+        _column(:mean_tau, "E[τ]"; format = (value, _) -> moment(value)),
+    )
+    mnist_rows = [(;
+        harness = harness_label,
+        mean_w = Float64(row["posterior_mean_first_coefficient"]),
+        sd_w = Float64(row["posterior_sd_first_coefficient"]),
+    ) for (harness, harness_label) in _PROBPROG_MCMC_HARNESS_LABELS
+      for row in (measured_row("mnist_logistic_wren_pca40", harness),)
+      if row !== nothing]
+    mnist_columns = (
+        _column(:harness, "Sampler harness"),
+        _column(:mean_w, "E[W[1,1]]"; format = (value, _) -> moment(value)),
+        _column(:sd_w, "sd[W[1,1]]"; format = (value, _) -> moment(value)),
+    )
+
+    parity_gaps = Float64[]
+    rejected_probprog = String[]
+    for (model, model_label) in sort!(collect(_PROBPROG_MCMC_MODEL_LABELS))
+        row = _probprog_mcmc_row(receipt, model, "probprog_nuts")
+        if get(row, "state", "") == "measured"
+            push!(parity_gaps, Float64(row["density_parity_max_abs"]))
+        else
+            push!(rejected_probprog, model_label)
+        end
+    end
+    isempty(parity_gaps) &&
+        error("no measured ProbProg cell in the receipt; the page premise is gone")
+    summary = "Every measured harness ran $num_warmup warmup plus " *
+        "$num_samples retained adaptive NUTS transitions from one matched " *
+        "initial position per model (seed $(protocol["seed"])). ProbProg's " *
+        "per-draw log densities matched the native RK kernel to at most " *
+        "$(round(maximum(parity_gaps); sigdigits = 3)) across every retained " *
+        "draw of every measured cell; sampler trajectories are compared " *
+        "statistically, never exactly." *
+        (isempty(rejected_probprog) ? "" :
+         " The ProbProg compile is a recorded rejection for: " *
+         join(rejected_probprog, "; ") *
+         " — its diagnostic stays visible in the table.")
+
+    provenance = h.p(; class = "rk-result-provenance")(
+        "Sources: ",
+        h.a(h.code("benchmark/receipts/probprog-mcmc-v1.toml");
+            href = "https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/probprog-mcmc-v1.toml"),
+        " generated by ",
+        h.a(h.code("benchmark/probprog_mcmc_comparison.jl");
+            href = "https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/probprog_mcmc_comparison.jl"),
+        ". Pins: Reactant $(pins["reactant_version"]), " *
+        "AdvancedHMC $(pins["advancedhmc_version"]), " *
+        "Turing $(pins["turing_version"]), Enzyme $(pins["enzyme_version"]), " *
+        "Julia $(pins["julia_version"]), " *
+        "RK $(first(String(pins["reactivekernels_sha"]), 10)).",
+    )
+
+    Markdown.MD(Any[
+        Markdown.Paragraph(Any[summary]),
+        _result_table(rows, columns; id = "probprog-mcmc-performance",
+            title = "NUTS sampling performance and diagnostics",
+            note = "One wall-clock run per harness covering warmup plus " *
+                "retained draws. Compilation (ProbProg: XLA; native harnesses: " *
+                "Julia JIT warm start) is the separate first column and is " *
+                "outside the sampling time."),
+        _result_table(eight_schools_rows, eight_schools_columns;
+            id = "probprog-mcmc-eight-schools-moments",
+            title = "Eight Schools posterior agreement",
+            note = "Constrained-scale posterior summaries computed from each " *
+                "harness's packed draws."),
+        _result_table(mnist_rows, mnist_columns;
+            id = "probprog-mcmc-mnist-moments",
+            title = "MNIST posterior agreement",
+            note = "The first coefficient of the packed coefficient vector, " *
+                "per harness."),
+        _static_block(provenance),
+    ])
+end
+
+"""Render the sampling harnesses and Turing twins the ProbProg comparison executes."""
+render_probprog_mcmc_baselines() = _render_benchmark_baselines(
+    "These are the exact sampling harnesses and Turing twin models the " *
+    "comparison executes, shown verbatim from " *
+    "`benchmark/probprog_mcmc_comparison_body.jl` (extracted from the " *
+    "executed file at docs-build time).",
+    "probprog_mcmc_comparison_body.jl",
+    (("ProbProg compiled NUTS harness", "probprog"),
+     ("AdvancedHMC harness over the RK density", "advancedhmc"),
+     ("Turing NUTS harness", "turing-sampling"),
+     ("Turing Eight Schools twin", "turing-eight-schools"),
+     ("Turing MNIST twin", "turing-mnist")))

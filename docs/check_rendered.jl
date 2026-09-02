@@ -323,6 +323,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "reactivehmc-corpus.md" => 5,
     )
     expected_sortable_tables = Dict(
+        "probprog-mcmc.md" => 3,
         "distributions-ad.md" => 2,
         "distributions.md" => 1,
         "ppl-ad.md" => 4,
@@ -362,6 +363,13 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "nonallocating.md" => "review-pending",
     )
     structural_markers = Dict(
+        "probprog-mcmc.md" => (
+            "NUTS sampling performance and diagnostics",
+            "Eight Schools posterior agreement",
+            "MNIST posterior agreement",
+            "benchmark/receipts/probprog-mcmc-v1.toml",
+            "probprog_mcmc_comparison_body.jl",
+        ),
         "automatic-differentiation.md" => (
             "Prepared automatic differentiation",
             "Prepare once, then request gradients or value-and-gradient",
