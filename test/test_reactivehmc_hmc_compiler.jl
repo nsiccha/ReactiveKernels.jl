@@ -4,10 +4,14 @@ using Random
 using Test
 import TOML
 
-include(joinpath(@__DIR__, "fixtures",
-                 "reactivehmc_hmc_compiler_support.jl"))
-include(joinpath(@__DIR__, "fixtures",
-                 "stateful_functional_contracts.jl"))
+if !isdefined(@__MODULE__, :ReactiveHMCHMCCompilerSupport)
+    include(joinpath(@__DIR__, "fixtures",
+                     "reactivehmc_hmc_compiler_support.jl"))
+end
+if !isdefined(@__MODULE__, :StatefulFunctionalContractsFixture)
+    include(joinpath(@__DIR__, "fixtures",
+                     "stateful_functional_contracts.jl"))
+end
 const _RHMC_HMC_COMPILER = ReactiveHMCHMCCompilerSupport
 const _SFC = StatefulFunctionalContractsFixture
 
