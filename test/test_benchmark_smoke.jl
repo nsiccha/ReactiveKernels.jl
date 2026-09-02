@@ -247,6 +247,16 @@ end
         _BENCH_DIR, "receipts", "mnist-logistic-ad-wren-pca40-v1.toml")
     @test isfile(wren_receipt)
     @test isempty(validation.validate_mnist_logistic_ad_receipt(wren_receipt))
+
+    impossible_receipt = TOML.parsefile(wren_receipt)
+    impossible_receipt["pins"]["primal_comparator_source"]["commit"] = "0"^40
+    mktemp() do impossible_path, io
+        TOML.print(io, impossible_receipt)
+        flush(io)
+        errors = validation.validate_mnist_logistic_ad_receipt(
+            impossible_path; root = normpath(joinpath(_BENCH_DIR, "..")))
+        @test "primal_comparator_source published source commit is unavailable" in errors
+    end
 end
 
 @testset "Eight Schools primal benchmark receipt validates" begin
