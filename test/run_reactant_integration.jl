@@ -14,6 +14,8 @@ mutation_profile_b_testfile = joinpath(
     @__DIR__, "test_mutation_profile_b_reactant.jl")
 mnist_full_joint_testfile = joinpath(
     @__DIR__, "test_mnist_full_joint_reactant.jl")
+sum_to_zero_testfile = joinpath(
+    @__DIR__, "test_sum_to_zero_reactant.jl")
 example_packages = (
     joinpath(root, "packages", "ReactiveKernelsCompatibilityExamples"),
     joinpath(root, "packages", "ReactiveKernelsDistributionKernels"),
@@ -52,12 +54,15 @@ mktempdir() do env
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $ad_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $phasepoint_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $mutation_profile_b_testfile`)
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $sum_to_zero_testfile`)
     elseif selector == "ad"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $ad_testfile`)
     elseif selector == "mutation-profile-b"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $mutation_profile_b_testfile`)
     elseif selector == "mnist-full-joint"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $mnist_full_joint_testfile`)
+    elseif selector == "sum-to-zero"
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $sum_to_zero_testfile`)
     else
         error("unknown RK_REACTANT_TESTSET selector: $selector")
     end

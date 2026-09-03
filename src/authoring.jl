@@ -1361,11 +1361,44 @@ function _kernel_tensorized_assignment_head(head)
     !(spelling in ("==", "!=", "<=", ">=", "=>"))
 end
 
+function _kernel_tensorized_undef_vector(ex)
+    ex isa Expr && ex.head === :call && length(ex.args) == 3 || return nothing
+    callee = ex.args[1]
+    callee isa Expr && callee.head === :curly && length(callee.args) == 2 ||
+        return nothing
+    callee.args[1] === :Vector && ex.args[2] === :undef || return nothing
+    callee.args[2], ex.args[3]
+end
+
 function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
                                 mod::Union{Module,Nothing} = nothing)
     ex isa Expr || return ex
     ex.head in (:quote, :inert) && return ex
-    if _kernel_tensorized_assignment_head(ex.head) && length(ex.args) == 2
+    undef_vector = _kernel_tensorized_undef_vector(ex)
+    if undef_vector !== nothing
+        # A tracing backend cannot place traced scalars into a host
+        # `Vector{T}(undef, n)`.  Initialize the tensorized companion with a
+        # defined host constant; the first traced indexed write promotes it to
+        # backend storage.  The ordinary Julia body keeps the authored undef
+        # allocation unchanged.
+        element_type, length_expr = undef_vector
+        return Expr(:call, GlobalRef(Base, :zeros), element_type,
+                    _kernel_tensorized_rhs(length_expr, known, mod))
+    elseif ex.head === :(=) && length(ex.args) == 2 &&
+           ex.args[1] isa Expr && ex.args[1].head === :ref &&
+           ex.args[1].args[1] isa Symbol
+        # Express a local indexed update functionally in the tensorized body.
+        # This lets tracing backends replace scalar mutation with copy/update
+        # while native execution retains the authored in-place loop.
+        target = ex.args[1]
+        array = target.args[1]
+        indices = target.args[2:end]
+        return Expr(:(=), array,
+            Expr(:call, GlobalRef(@__MODULE__, :_tensorized_setindex), array,
+                 _kernel_tensorized_rhs(ex.args[2], known, mod),
+                 (_kernel_tensorized_rhs(index, known, mod)
+                  for index in indices)...))
+    elseif _kernel_tensorized_assignment_head(ex.head) && length(ex.args) == 2
         # An indexed/property/destructuring assignment target is syntax, not a
         # value read. Rewriting an l-value such as `calls[:b][]` into
         # `_tensorized_getindex(...)` produces an invalid assignment location
