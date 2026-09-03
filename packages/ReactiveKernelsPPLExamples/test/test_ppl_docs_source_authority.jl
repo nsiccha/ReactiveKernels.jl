@@ -5,6 +5,8 @@ const REPOSITORY_ROOT = normpath(joinpath(@__DIR__, "..", "..", ".."))
 const PPL_SOURCE_CASES = (
     ("eight-schools.md", "eight_schools.jl", EightSchoolsExample,
      :EIGHT_SCHOOLS_SOURCE, :evaluate_eight_schools_source),
+    ("sum-to-zero.md", "sum_to_zero.jl", SumToZeroExample,
+     :SUM_TO_ZERO_SOURCE, :evaluate_sum_to_zero_source),
     ("linear-regression.md", "linear_regression.jl", LinearRegressionExample,
      :LINEAR_REGRESSION_SOURCE, :evaluate_linear_regression_source),
     ("beta-binomial.md", "beta_binomial.jl", BetaBinomialExample,
@@ -84,6 +86,7 @@ end
                    helper_source)
     for name in (
         :eight_schools_extraction,
+        :sum_to_zero_logdensity,
         :linear_regression_density,
         :beta_binomial_density,
         :poisson_gamma_density,

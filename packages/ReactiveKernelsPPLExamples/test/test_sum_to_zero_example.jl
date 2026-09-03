@@ -26,6 +26,36 @@ _sum_to_zero_reference_cauchy(x, location, scale) =
     effects_free = 0.25 .* collect(1:(K - 1))
     q = [α_s2z, log_τ, effects_free...]
 
+    @testset "docs hot cut and requested-only recovery" begin
+        @test artifact.requested_nodes == (:parameters, :prior, :likelihood)
+        @test keys(artifact.inputs) == (
+            :unconstrained, :observations, :observation_scales, :α_prior_sd,
+        )
+        @test keys(artifact.recovery_inputs) == (
+            :parameters, :α_prior_sd, :reconstruction_innovation,
+        )
+        @test Base.invokelatest(
+            artifact.recovery_kernel, Tuple(artifact.recovery_inputs)...,
+        ) == artifact.recovered
+
+        hot_produced = Set(
+            canon_id(model.graph, output.id)
+            for recipe in artifact.kernel.plan.recipes
+            for output in recipe.outputs
+        )
+        for recovery_only in (
+            model.mean_effect_variance,
+            model.reconstruction_weight,
+            model.reconstruction_sd,
+            model.mean_effect_bayes,
+            model.α_bayes,
+            model.effects_bayes,
+            model.superpopulation,
+        )
+            @test !(canon_id(model.graph, recovery_only.id) in hot_produced)
+        end
+    end
+
     @testset "orthonormal constrain and distinct density adjustments" begin
         kernel = prepare(model;
             have = :unconstrained,
@@ -97,6 +127,22 @@ _sum_to_zero_reference_cauchy(x, location, scale) =
         @test !occursin("similar", posterior_code)
         @test !any(op -> op isa ReactiveKernels.PreparedKernel,
                    posterior_kernel.ops)
+        posterior_produced = Set(
+            canon_id(model.graph, output.id)
+            for recipe in posterior_kernel.plan.recipes
+            for output in recipe.outputs
+        )
+        for recovery_only in (
+            model.mean_effect_variance,
+            model.reconstruction_weight,
+            model.reconstruction_sd,
+            model.mean_effect_bayes,
+            model.α_bayes,
+            model.effects_bayes,
+            model.superpopulation,
+        )
+            @test !(canon_id(model.graph, recovery_only.id) in posterior_produced)
+        end
     end
 
     @testset "stochastic common-shift recovery is an independent graph cut" begin
