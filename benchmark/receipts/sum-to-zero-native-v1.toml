@@ -1,0 +1,190 @@
+generated_at = "2026-09-03T09:30:44.840Z"
+schema = "sum-to-zero-hotloop-v1"
+
+[environment]
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+julia_threads = 1
+os = "Linux"
+
+[[measurements]]
+compiler = "native"
+configuration = "rk_primal_native"
+differentiation = "primal"
+operation = "posterior"
+provider = "rk"
+state = "supported"
+value = -48.596781288369016
+
+    [measurements.result]
+    allocs = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    bytes = [128, 128, 128, 128, 128, 128, 128, 128, 128, 128]
+    median_allocs = 1
+    median_bytes = 128
+    median_ns = 130.0
+    min_ns = 120.0
+    times_ns = [130.0, 130.0, 130.0, 130.0, 130.0, 120.0, 130.0, 130.0, 130.0, 130.0]
+[[measurements]]
+compiler = "native"
+configuration = "manual_primal"
+differentiation = "primal"
+operation = "posterior"
+provider = "manual_julia"
+state = "supported"
+value = -48.596781288369016
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 140.0
+    min_ns = 130.0
+    times_ns = [140.0, 130.0, 140.0, 140.0, 140.0, 140.0, 140.0, 140.0, 140.0, 140.0]
+[[measurements]]
+compiler = "native"
+configuration = "turing_primal"
+differentiation = "primal"
+operation = "posterior"
+provider = "turing"
+state = "supported"
+value = -48.59678128836901
+
+    [measurements.result]
+    allocs = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9]
+    bytes = [528, 528, 528, 528, 528, 528, 528, 528, 528, 528]
+    median_allocs = 9
+    median_bytes = 528
+    median_ns = 330.0
+    min_ns = 320.0
+    times_ns = [330.0, 330.0, 330.0, 320.0, 340.0, 330.0, 330.0, 330.0, 330.0, 341.0]
+[[measurements]]
+compiler = "native"
+configuration = "manual_ad"
+differentiation = "value_and_gradient"
+operation = "posterior value and gradient"
+provider = "manual_julia"
+state = "supported"
+
+    [measurements.result]
+    allocs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    caller_owned_gradient = true
+    first_execution_bytes = 0
+    first_execution_seconds = 3.375e-6
+    gradient_length = 9
+    gradient_max_abs_error = 8.20819745506185e-10
+    gradient_max_rel_error = 1.9982087877724565e-10
+    median_allocs = 0
+    median_bytes = 0
+    median_ns = 155.0
+    min_ns = 150.0
+    preparation_bytes = 128
+    preparation_seconds = 1.0e-7
+    times_ns = [150.0, 160.0, 150.0, 160.0, 160.0, 150.0, 160.0, 150.0, 160.0, 150.0]
+    value = -48.596781288369016
+    value_abs_error = 0.0
+[[measurements]]
+compiler = "native"
+configuration = "rk_ad_native"
+differentiation = "value_and_gradient"
+operation = "posterior value and gradient"
+provider = "rk"
+state = "supported"
+
+    [measurements.result]
+    allocs = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+    bytes = [256, 256, 256, 256, 256, 256, 256, 256, 256, 256]
+    caller_owned_gradient = true
+    first_execution_bytes = 69735792
+    first_execution_seconds = 1.044496606
+    gradient_length = 9
+    gradient_max_abs_error = 8.20819745506185e-10
+    gradient_max_rel_error = 1.9982087877724565e-10
+    median_allocs = 2
+    median_bytes = 256
+    median_ns = 225.0
+    min_ns = 220.0
+    preparation_bytes = 7979048
+    preparation_seconds = 0.529730226
+    times_ns = [220.0, 300.0, 230.0, 220.0, 220.0, 300.0, 220.0, 300.0, 301.0, 220.0]
+    value = -48.596781288369016
+    value_abs_error = 0.0
+[[measurements]]
+compiler = "native"
+configuration = "turing_ad"
+differentiation = "value_and_gradient"
+operation = "posterior value and gradient"
+provider = "turing"
+state = "supported"
+
+    [measurements.result]
+    allocs = [33, 33, 33, 33, 33, 33, 33, 33, 33, 33]
+    bytes = [2304, 2304, 2304, 2304, 2304, 2304, 2304, 2304, 2304, 2304]
+    caller_owned_gradient = false
+    first_execution_bytes = 109689520
+    first_execution_seconds = 5.52392892
+    gradient_length = 9
+    gradient_max_abs_error = 8.208196344838825e-10
+    gradient_max_rel_error = 1.9982085174990601e-10
+    median_allocs = 33
+    median_bytes = 2304
+    median_ns = 1527.0
+    min_ns = 1492.0
+    preparation_bytes = 10140664
+    preparation_seconds = 0.063839676
+    times_ns = [1512.0, 1533.0, 1532.0, 1542.0, 1592.0, 1542.0, 1502.0, 1492.0, 1492.0, 1522.0]
+    value = -48.59678128836901
+    value_abs_error = 7.105427357601002e-15
+
+[pins]
+benchmarktools_version = "1.6.3"
+differentiationinterface_version = "0.7.21"
+distributions_version = "0.25.131"
+dynamicppl_version = "0.42.6"
+enzyme_version = "0.13.199"
+julia_version = "1.10.11"
+model_source_text_sha256 = "eeb3f908493f265b475ed6ec28d2ad1302a8d9a1486530c4a04ecfe4e87d6e6f"
+reactivekernels_dirty = false
+reactivekernels_sha = "658cb3d2b79c11edc4354c6655aa70c82d2de41a"
+reactivekernels_version = "0.1.0"
+reactivekernelsdistributionkernels_version = "0.1.0"
+reactivekernelspplexamples_version = "0.1.0"
+turing_version = "0.47.1"
+
+    [pins.comparator_source]
+    git_blob = "7ed51c42c304840c6821e4dadacab2e143a291f7"
+    path = "benchmark/sum_to_zero_comparison_body.jl"
+    text_sha256 = "04f1adb23e8e3bd41023c6e1c4f92848fe4a9ecac5186d01b7da1232db62a3d1"
+
+    [pins.model_source]
+    git_blob = "5b13e47d0dac5b2898914792e1a4b85295cf1721"
+    path = "packages/ReactiveKernelsPPLExamples/src/sum_to_zero.jl"
+    text_sha256 = "1a7a15c8b8e805c99ad34ec42de799c8f9ada0eaaefd4a0508ad89c7d4e25433"
+
+[protocol]
+bound_ports = ["observations", "observation_scales", "α_prior_sd"]
+boundary = "packed unconstrained parameters"
+estimator = "median of per-round BenchmarkTools minimum times"
+finite_difference_gradient = [0.4150490208954958, -4.1077776783336555, -0.025659170177333674, -0.038495480860846795, -0.18523284241245339, -0.18782926230706498, -0.2852492077844779, -0.5156831043789634, -0.4227622654203774]
+first_execution_in_steady_state_region = false
+hot_loop_excludes_recovery = true
+manual_ad_surface = "DifferentiationInterface + Enzyme reverse mode"
+manual_control = "allocation-free fused O(K) transform, prior, and likelihood"
+model = "sum-to-zero hierarchical Eight Schools"
+outcome = "full unconstrained posterior"
+parity_atol = 1.0e-12
+parity_rtol = 1.0e-11
+preparation_in_timed_region = false
+rk_native_ad_surface = "prepare_ad + ad_value_and_gradient!"
+rounds = 10
+samples_per_round = 200
+seconds_per_round = 0.2
+setup_in_timed_region = false
+turing_ad_surface = "LogDensityProblems.logdensity_and_gradient + Enzyme reverse mode"
+turing_interface = "DynamicPPL.LogDensityFunction with fixed transforms"
+
+[setup]
+model_seconds = 2.264826349
+rk_kernel_seconds = 1.451068979
+turing_model_seconds = 8.0e-8
