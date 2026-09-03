@@ -331,6 +331,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "compiler.md" => 1,
         "distributions-reactant.md" => 13,
         "eight-schools.md" => 4,
+        "sum-to-zero.md" => 4,
         "eight-schools-reactant.md" => 7,
         "eval-throughput.md" => 6,
         "mnist-logistic.md" => 8,
@@ -345,6 +346,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "ppl-ad.md" => 10,
         "distributions-reactant.md" => 13,
         "eight-schools.md" => 4,
+        "sum-to-zero.md" => 4,
         "eight-schools-reactant.md" => 7,
         "eval-throughput.md" => 6,
         "mnist-logistic.md" => 8,
@@ -468,7 +470,12 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
             "sum_to_zero_log_jacobian",
             "subspace_normalization",
             "reconstruction_innovation",
-            "No benchmark is run or rendered on this page",
+            "Sampler hot-loop benchmarks",
+            "sum-to-zero-native-v1.toml",
+            "sum-to-zero-reactant-v1.toml",
+            "Runtime ÷ baseline",
+            "plot:sum-to-zero-hotloop-native-primal-relative",
+            "plot:sum-to-zero-hotloop-reactant-value-gradient-relative",
         ),
         "eval-throughput.md" => (
             "Runtime ÷ baseline",
@@ -561,7 +568,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
              "Eight Schools primal — Joint density"),
         "sum-to-zero.md" =>
             ("Sum To Zero Logdensity", "Raw input", "Generated kernel", "Compute DAG",
-             "No benchmark is run or rendered on this page"),
+             "Sum-to-zero hot loop — Native primal"),
         "nuts.md" =>
             ("Compiler/runtime execution is disabled in docs",
              "@kernel nuts!!", "Show the complete authoring fixture"),
