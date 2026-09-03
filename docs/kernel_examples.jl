@@ -213,6 +213,17 @@ function setup_eight_schools!(mod::Module)
     nothing
 end
 
+function setup_sum_to_zero!(mod::Module)
+    if !isdefined(mod, :SumToZeroExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: SumToZeroExample))
+    end
+    # The authored source reuses the Eight Schools observations while keeping
+    # every new transform and reconstruction equation inline in its one model.
+    Core.eval(mod, :(using ReactiveKernelsPPLExamples.EightSchoolsExample:
+        EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA))
+    nothing
+end
+
 function setup_mnist_logistic!(mod::Module)
     if !isdefined(mod, :MNISTLogisticExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: MNISTLogisticExample))
@@ -702,6 +713,7 @@ end
 
 const EXPECTED_PPL_EXAMPLES = (
     :eight_schools_extraction,
+    :sum_to_zero_logdensity,
     :linear_regression_density,
     :beta_binomial_density,
     :poisson_gamma_density,

@@ -307,6 +307,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "nuts.md" => 0,
         "nutpie-diagonal.md" => 2,
         "eight-schools.md" => 1,
+        "sum-to-zero.md" => 1,
         "linear-regression.md" => 1,
         "beta-binomial.md" => 1,
         "poisson-gamma.md" => 1,
@@ -462,6 +463,13 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
             "plot:eight-schools-primal-joint-density-relative",
             "plot:eight-schools-primal-pointwise-likelihood-relative",
         ),
+        "sum-to-zero.md" => (
+            "Sum-to-zero effects and superpopulation recovery",
+            "sum_to_zero_log_jacobian",
+            "subspace_normalization",
+            "reconstruction_innovation",
+            "No benchmark is run or rendered on this page",
+        ),
         "eval-throughput.md" => (
             "Runtime ÷ baseline",
             "plot:eval-throughput-primal-log-density-relative",
@@ -551,6 +559,9 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "eight-schools.md" =>
             ("Eight Schools Extraction", "Raw input", "Generated kernel", "Compute DAG",
              "Eight Schools primal — Joint density"),
+        "sum-to-zero.md" =>
+            ("Sum To Zero Logdensity", "Raw input", "Generated kernel", "Compute DAG",
+             "No benchmark is run or rendered on this page"),
         "nuts.md" =>
             ("Compiler/runtime execution is disabled in docs",
              "@kernel nuts!!", "Show the complete authoring fixture"),

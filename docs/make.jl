@@ -41,6 +41,7 @@ site_pages = [
     ],
     "Probabilistic programming" => [
         "Eight schools" => "eight-schools.md",
+        "Sum-to-zero recovery" => "sum-to-zero.md",
         "MNIST multinomial logistic" => "mnist-logistic.md",
         "Other model walkthroughs" => [
             "Linear regression" => "linear-regression.md",

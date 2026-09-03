@@ -131,28 +131,49 @@ observation_scales = EIGHT_SCHOOLS_SIGMA
 α_prior_sd = 5.0
 reconstruction_innovation = -0.25
 
-requested_nodes = (:parameters, :prior, :likelihood, :superpopulation)
+requested_nodes = (:parameters, :prior, :likelihood)
 evaluation_kernel = prepare(model;
-    have = (:unconstrained, :observations, :observation_scales,
-            :α_prior_sd, :reconstruction_innovation),
+    have = (:unconstrained, :observations, :observation_scales, :α_prior_sd),
     want = requested_nodes)
-inputs = (;
-    unconstrained,
-    observations,
-    observation_scales,
-    α_prior_sd,
-    reconstruction_innovation,
+output = evaluation_kernel(
+    unconstrained, observations, observation_scales, α_prior_sd,
 )
-output = evaluation_kernel(Tuple(inputs)...)
+parameters, prior, likelihood = output
+
+# Reconstruction is a second cut through the same model graph. It starts from
+# the constrained parameters produced above, so none of the transform or
+# probability calculations enter this prepared function.
+recovery_kernel = prepare(model;
+    have = (:parameters, :α_prior_sd, :reconstruction_innovation),
+    want = :superpopulation)
+recovered = recovery_kernel(
+    parameters, α_prior_sd, reconstruction_innovation,
+)
+@assert sum(recovered.effects_bayes) / length(recovered.effects_bayes) ≈
+        recovered.realized_effect_mean
+@assert recovered.α_bayes .+ recovered.effects_bayes ≈
+        parameters.α_s2z .+ parameters.effects_s2z
 
 docs_example = (;
-    name = :sum_to_zero_recovery,
-    origin = "Inline sum-to-zero model and super-population recovery",
-    inputs,
+    name = :sum_to_zero_logdensity,
+    origin = "Inline sum-to-zero model with requested-only recovery",
+    inputs = (;
+        unconstrained,
+        observations,
+        observation_scales,
+        α_prior_sd,
+    ),
     model,
     kernel = evaluation_kernel,
     output,
     requested_nodes,
+    recovery_inputs = (;
+        parameters,
+        α_prior_sd,
+        reconstruction_innovation,
+    ),
+    recovery_kernel,
+    recovered,
     normal_object = normal,
     cauchy_object = cauchy,
 )
