@@ -1686,6 +1686,16 @@ render_eight_schools_primal_baselines() = _render_benchmark_baselines(
     (("Turing baseline", "turing"),
      ("Handwritten Julia control", "manual")))
 
+"""Render the exact Turing and handwritten sum-to-zero benchmark controls."""
+render_sum_to_zero_baselines() = _render_benchmark_baselines(
+    "These are the model implementations used by the sum-to-zero comparison, " *
+    "shown verbatim from `benchmark/sum_to_zero_comparison_body.jl`. The " *
+    "native AD cells differentiate these same definitions; recovery remains " *
+    "outside every timed sampler hot loop.",
+    "sum_to_zero_comparison_body.jl",
+    (("Turing baseline", "turing"),
+     ("Optimized handwritten Julia control", "manual")))
+
 """Render the Turing baseline the evaluation-throughput benchmark executes."""
 render_eval_throughput_baselines() = _render_benchmark_baselines(
     "This is the Turing baseline the comparison above executes, shown verbatim " *
