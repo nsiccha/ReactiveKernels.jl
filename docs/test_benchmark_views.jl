@@ -27,6 +27,7 @@ const FOCUSED_BENCHMARK_VIEWS = (
     :render_batched_benchmarks => (2, 2),
     :render_eight_schools_primal_benchmarks => (4, 4),
     :render_eight_schools_ad_benchmarks => (4, 4),
+    :render_sum_to_zero_benchmarks => (4, 4),
     :render_nuts_g7_benchmark => (1, 1),
     :render_nuts_reactant_benchmark => (1, 2),
     :render_eight_schools_reactant_benchmark => (4, 4),

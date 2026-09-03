@@ -72,6 +72,8 @@ end
 
 @inline ReactiveKernels._kernel_source_arg_style(
     arg::Reactant.TracedType) = Val(:tensorized)
+@inline ReactiveKernels._kernel_source_arg_style(
+    arg::SubArray{T,N,P}) where {T,N,P<:Reactant.TracedType} = Val(:tensorized)
 
 # Prepared kernels are immutable compiled programs.  Their graph/plan/AST
 # fields are inspection metadata, not runtime arguments.  Leaving Reactant's
@@ -692,6 +694,27 @@ end
         array::Reactant.TracedRArray{T,1},
         index::Reactant.TracedRNumber{I}) where {T,I<:Integer}
     sum(ifelse.(collect(eachindex(array)) .== index, array, zero(T)))
+end
+
+@inline function ReactiveKernels._tensorized_getindex(
+        array::SubArray{T,N,P}, indices...) where
+        {T,N,P<:Reactant.TracedRArray}
+    Reactant.@allowscalar getindex(array, indices...)
+end
+
+@inline function ReactiveKernels._tensorized_setindex(
+        array::Reactant.TracedRArray, value, indices...)
+    Reactant.@allowscalar begin
+        result = copy(array)
+        setindex!(result, value, indices...)
+        result
+    end
+end
+
+@inline function ReactiveKernels._tensorized_setindex(
+        array::Array, value::Reactant.TracedRNumber, indices...)
+    traced = Reactant.promote_to(Reactant.TracedRArray, array)
+    ReactiveKernels._tensorized_setindex(traced, value, indices...)
 end
 
 # Batched slice-collection plates preserve eachcol structurally in the core.

@@ -27,6 +27,12 @@ const _EIGHT_SCHOOLS_PRIMAL_RECEIPT_PATH = joinpath(
 const _EIGHT_SCHOOLS_AD_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts", "eight-schools-ad-v2.toml",
 )
+const _SUM_TO_ZERO_NATIVE_RECEIPT_PATH = joinpath(
+    dirname(@__DIR__), "benchmark", "receipts", "sum-to-zero-native-v1.toml",
+)
+const _SUM_TO_ZERO_REACTANT_RECEIPT_PATH = joinpath(
+    dirname(@__DIR__), "benchmark", "receipts", "sum-to-zero-reactant-v1.toml",
+)
 const _MNIST_LOGISTIC_AD_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts", "mnist-logistic-ad-v2.toml",
 )
@@ -1075,6 +1081,101 @@ end
 include(joinpath(@__DIR__, "mnist_result_views.jl"))
 include(joinpath(@__DIR__, "all_benchmark_views.jl"))
 
+"""Render the pinned native and Reactant sum-to-zero hot-loop comparisons."""
+function render_sum_to_zero_benchmarks()
+    native = _allbench_checked_receipt(
+        _SUM_TO_ZERO_NATIVE_RECEIPT_PATH, "sum-to-zero-hotloop-v1")
+    reactant = _allbench_checked_receipt(
+        _SUM_TO_ZERO_REACTANT_RECEIPT_PATH, "sum-to-zero-reactant-v1")
+    for receipt in (native, reactant)
+        protocol = receipt["protocol"]
+        get(protocol, "hot_loop_excludes_recovery", false) ||
+            error("sum-to-zero benchmark allowed recovery into the hot loop")
+        get(protocol, "setup_in_timed_region", false) == false ||
+            error("sum-to-zero setup entered steady-state timing")
+        get(protocol, "preparation_in_timed_region", false) == false ||
+            error("sum-to-zero preparation entered steady-state timing")
+    end
+    reactant_protocol = reactant["protocol"]
+    get(reactant_protocol, "reactant_sync", false) ||
+        error("sum-to-zero Reactant receipt is not synchronous")
+    get(reactant_protocol, "reactant_transfers_in_timed_region", true) == false ||
+        error("sum-to-zero Reactant timing includes transfers")
+    get(reactant_protocol, "reactant_compile_time_in_timed_region", true) == false ||
+        error("sum-to-zero Reactant timing includes compilation")
+    get(reactant_protocol, "reactant_readback_in_timed_region", true) == false ||
+        error("sum-to-zero Reactant timing includes readback")
+
+    panels = (
+        ("Native primal", native, (
+            ("manual_primal", "Manual Julia", "Manual Julia"),
+            ("rk_primal_native", "ReactiveKernels", "ReactiveKernels"),
+            ("turing_primal", "Turing", "Turing"),
+        ), "manual_primal", "Manual Julia"),
+        ("Native value + gradient", native, (
+            ("manual_ad", "Manual Julia + Enzyme", "Manual Julia"),
+            ("rk_ad_native", "ReactiveKernels + Enzyme", "ReactiveKernels"),
+            ("turing_ad", "Turing + Enzyme", "Turing"),
+        ), "manual_ad", "Manual Julia + Enzyme"),
+        ("Reactant primal", reactant, (
+            ("manual_primal_reactant", "Manual Julia + Reactant", "Manual Julia"),
+            ("rk_primal_reactant", "ReactiveKernels + Reactant", "ReactiveKernels"),
+        ), "manual_primal_reactant", "Manual Julia + Reactant"),
+        ("Reactant value + gradient", reactant, (
+            ("manual_ad_reactant", "Manual Julia + Reactant AD", "Manual Julia"),
+            ("rk_ad_reactant", "ReactiveKernels + Reactant AD", "ReactiveKernels"),
+        ), "manual_ad_reactant", "Manual Julia + Reactant AD"),
+    )
+
+    rows = NamedTuple[]
+    for (panel, receipt, entries, baseline_configuration, baseline_label) in panels
+        supported = Dict(
+            String(row["configuration"]) => row
+            for row in receipt["measurements"] if row["state"] == "supported")
+        baseline = supported[baseline_configuration]["result"]
+        baseline_ns = Float64(baseline["median_ns"])
+        for (configuration, label, implementation) in entries
+            result = supported[configuration]["result"]
+            runtime_ns = Float64(result["median_ns"])
+            push!(rows, (;
+                panel,
+                series = label,
+                implementation,
+                runtime_ns,
+                baseline_ns,
+                baseline_label,
+                relative_time = runtime_ns / baseline_ns,
+                median_bytes = haskey(result, "median_bytes") ?
+                    Int(result["median_bytes"]) : missing,
+                median_allocs = haskey(result, "median_allocs") ?
+                    Int(result["median_allocs"]) : missing,
+            ))
+        end
+    end
+
+    native_pins = native["pins"]
+    reactant_pins = reactant["pins"]
+    summary = "The sampler hot loop uses the packed unconstrained posterior " *
+        "with observations, observation scales, and the intercept prior scale " *
+        "bound before timing. Each panel is normalized to its optimized manual " *
+        "Julia control. Recovery is a separate prepared cut and is absent from " *
+        "every timed operation."
+    provenance = "Receipts `$(basename(_SUM_TO_ZERO_NATIVE_RECEIPT_PATH))` and " *
+        "`$(basename(_SUM_TO_ZERO_REACTANT_RECEIPT_PATH))`; native RK " *
+        "`$(native_pins["reactivekernels_sha"])`; Reactant RK " *
+        "`$(reactant_pins["reactivekernels_sha"])`; Reactant " *
+        "$(reactant_pins["reactant_version"]); Turing " *
+        "$(native_pins["turing_version"]); Julia " *
+        "$(native_pins["julia_version"]); $(native["environment"]["cpu"])."
+    _allbench_snapshot_sections(rows;
+        id_prefix = "sum-to-zero-hotloop",
+        profile_label = "Sum-to-zero hot loop",
+        summary,
+        provenance,
+        panel_order = first.(panels),
+    )
+end
+
 _eight_schools_sort(value, _) = value === missing ? nothing : value.median_ns
 
 """Render focused primal Eight Schools comparisons from the complete receipt."""
@@ -1685,6 +1786,16 @@ render_eight_schools_primal_baselines() = _render_benchmark_baselines(
     "eight_schools_primal_comparison_body.jl",
     (("Turing baseline", "turing"),
      ("Handwritten Julia control", "manual")))
+
+"""Render the exact Turing and handwritten sum-to-zero benchmark controls."""
+render_sum_to_zero_baselines() = _render_benchmark_baselines(
+    "These are the model implementations used by the sum-to-zero comparison, " *
+    "shown verbatim from `benchmark/sum_to_zero_comparison_body.jl`. The " *
+    "native AD cells differentiate these same definitions; recovery remains " *
+    "outside every timed sampler hot loop.",
+    "sum_to_zero_comparison_body.jl",
+    (("Turing baseline", "turing"),
+     ("Optimized handwritten Julia control", "manual")))
 
 """Render the Turing baseline the evaluation-throughput benchmark executes."""
 render_eval_throughput_baselines() = _render_benchmark_baselines(

@@ -132,6 +132,10 @@ kernel_sourceop_form(::_KernelSourceOp{DefToken,Form}) where {DefToken,Form} = F
 # a traced operand the wrappers reduce to the plain Base operations.
 @inline _tensorized_cat_operand(marker, arg) = arg
 @inline _tensorized_getindex(array, indices...) = getindex(array, indices...)
+@inline function _tensorized_setindex(array, value, indices...)
+    setindex!(array, value, indices...)
+    array
+end
 @inline _tensorized_cat_marker(::Tuple{}) = nothing
 @inline _tensorized_cat_marker(args::Tuple) = _tensorized_cat_arg_marker(
     _kernel_source_arg_style(first(args)), first(args), Base.tail(args))

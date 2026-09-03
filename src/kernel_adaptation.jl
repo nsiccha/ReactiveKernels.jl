@@ -4361,7 +4361,10 @@ function _sm_validate_reusable_raw_state_ports(ports::NamedTuple, state)
         elseif port isa _SMFixedStructuralTuplePort
             _sm_fixed_tuple_validate(port, getfield(state, name))
         elseif port isa _SMFiniteStructuralPort
-            _sm_finite_validate_raw(port, getfield(state, name))
+            value = getfield(state, name)
+            value isa Vector ?
+                _sm_finite_validate_elements(port, value) :
+                _sm_finite_validate_raw(port, value)
         end
     end
     state

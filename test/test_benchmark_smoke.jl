@@ -52,6 +52,10 @@ end
                  "eight_schools_reactant_comparison_body.jl",
                  "eight_schools_reactant_ad_comparison.jl",
                  "eight_schools_reactant_ad_comparison_body.jl",
+                 "sum_to_zero_comparison.jl",
+                 "sum_to_zero_comparison_body.jl",
+                 "sum_to_zero_reactant_comparison.jl",
+                 "sum_to_zero_reactant_comparison_body.jl",
                  "mnist_reactant_comparison.jl",
                  "mnist_reactant_comparison_body.jl",
                  "mnist_reactant_wren_pca40_comparison_body.jl",
@@ -84,6 +88,8 @@ end
                  joinpath("receipts", "validate_ppl_model_suites.jl"),
                  joinpath("receipts", "validate_eight_schools_reactant.jl"),
                  joinpath("receipts", "validate_eight_schools_reactant_ad.jl"),
+                 joinpath("receipts", "validate_sum_to_zero_native.jl"),
+                 joinpath("receipts", "validate_sum_to_zero_reactant.jl"),
                  joinpath("receipts", "_validate_mnist_dataset_profile.jl"),
                  joinpath("receipts", "validate_mnist_reactant.jl"),
                  joinpath("receipts", "validate_mnist_reactant_ad.jl"))
@@ -91,6 +97,16 @@ end
         @test isfile(path)
         @test _parses(path)
     end
+end
+
+@testset "sum-to-zero benchmark receipts validate" begin
+    for name in (
+        "validate_sum_to_zero_native.jl",
+        "validate_sum_to_zero_reactant.jl",
+    )
+        _load_benchmark_validator(joinpath(_BENCH_DIR, "receipts", name))
+    end
+    @test true
 end
 
 @testset "MNIST Reactant dataset routes stay reproducible" begin

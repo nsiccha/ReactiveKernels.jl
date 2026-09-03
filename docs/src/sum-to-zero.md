@@ -127,9 +127,41 @@ The generated recovery cut contains only these scalar equations and one vector
 broadcast for `a_bayes`. The transform, observations, priors, likelihood, and
 both Jacobian terms are absent from that prepared function.
 
-No benchmark is run or rendered on this page. Its executable contract is the
-kernel source, the requested graph cuts, their numerical invariants, and the
-generated native structure.
+## Sampler hot-loop benchmarks
+
+The comparison below measures only the packed unconstrained posterior used by
+a sampler. Observations, observation scales, and `α_prior_sd` are bound before
+timing. Planning, AD preparation, Reactant transfers and compilation, first
+execution, and result readback are all outside the steady-state region.
+
+```@eval
+Main.ReactiveKernelsDocs.render_sum_to_zero_benchmarks()
+```
+
+Native RK is competitive with the optimized handwritten control and materially
+faster than Turing for both primal evaluation and reverse AD. Reactant executes
+the exact authored RK graph, but its current vectorized plate and reduction
+structure remains slower than the scalar-unrolled `K = 8` manual control,
+especially for value-plus-gradient. The receipt records this gap rather than
+special-casing one model shape in the compiler. Turing is absent from the
+Reactant panels because DynamicPPL does not expose a public Reactant-traceable
+model-evaluation interface.
+
+Recovery is not benchmarked as part of the density. The receipt and generated
+kernel both assert that every recovery-only node is pruned from the timed cut;
+reconstruction remains a separate call made only when requested.
+
+### Executed manual and Turing controls
+
+```@eval
+Main.ReactiveKernelsDocs.render_sum_to_zero_baselines()
+```
+
+The full raw rounds, allocation counts, setup/compile/first-call costs, package
+pins, and parity tolerances are checked into
+[`benchmark/receipts/sum-to-zero-native-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/sum-to-zero-native-v1.toml)
+and
+[`benchmark/receipts/sum-to-zero-reactant-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/sum-to-zero-reactant-v1.toml).
 
 The transform follows the
 [Stan sum-to-zero transform](https://mc-stan.org/docs/reference-manual/transforms.html#sum-to-zero-transforms),

@@ -1,0 +1,150 @@
+generated_at = "2026-09-03T09:33:22.503Z"
+schema = "sum-to-zero-reactant-v1"
+
+[environment]
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+julia_threads = 1
+os = "Linux"
+reactant_backend = "default CPU"
+
+[[measurements]]
+compiler = "reactant"
+configuration = "rk_primal_reactant"
+differentiation = "primal"
+operation = "posterior"
+provider = "rk"
+reactant_compile_seconds = 17.383419474
+reactant_first_execution_seconds = 0.198642429
+state = "supported"
+value_abs_error = 0.0
+
+    [measurements.result]
+    calls_per_round = 16384
+    median_ns = 4603.070617675781
+    min_ns = 4220.761657714844
+    times_ns = [4977.318603515625, 4935.086975097656, 5138.273376464844, 12879.987915039062, 4281.597961425781, 4361.2757568359375, 4368.406494140625, 4460.1112060546875, 4565.7799072265625, 12534.882202148438, 4296.000244140625, 4541.8626708984375, 4604.393859863281, 4601.747375488281, 4565.71142578125, 13673.639953613281, 4220.761657714844, 4614.718811035156, 4627.7420654296875, 4680.558349609375]
+[[measurements]]
+compiler = "reactant"
+configuration = "manual_primal_reactant"
+differentiation = "primal"
+operation = "posterior"
+provider = "manual_julia"
+reactant_compile_seconds = 1.476800838
+reactant_first_execution_seconds = 0.015989661
+state = "supported"
+value_abs_error = 0.0
+
+    [measurements.result]
+    calls_per_round = 16384
+    median_ns = 3229.2472229003906
+    min_ns = 3017.3194580078125
+    times_ns = [3182.1920166015625, 3255.8549194335938, 3358.6766357421875, 25182.1875, 3030.0726318359375, 3017.3194580078125, 3109.25341796875, 7616.105041503906, 3122.6031494140625, 3106.9523315429688, 7183.734436035156, 3494.40869140625, 3101.7069702148438, 3107.0347290039062, 7194.812316894531, 3498.9877319335938, 3202.6395263671875, 3070.156005859375, 7508.267822265625, 3438.133056640625]
+[[measurements]]
+compiler = "reactant"
+configuration = "turing_reactant"
+differentiation = "primal"
+operation = "posterior"
+provider = "turing"
+reason = "DynamicPPL's model evaluator is not a public Reactant-traceable interface"
+state = "unsupported"
+[[measurements]]
+compiler = "reactant"
+configuration = "rk_ad_reactant"
+differentiation = "value_and_gradient"
+gradient_max_abs_error = 5.551115123125783e-17
+operation = "posterior value and gradient"
+provider = "rk"
+reactant_compile_seconds = 6.134392699
+reactant_first_execution_seconds = 0.045406711
+state = "supported"
+value_abs_error = 0.0
+
+    [measurements.result]
+    calls_per_round = 8192
+    median_ns = 8520.905822753906
+    min_ns = 7945.868408203125
+    times_ns = [8272.873046875, 8222.278442382812, 23384.703491210938, 8359.944946289062, 8307.900390625, 8532.756225585938, 8323.439453125, 8868.787963867188, 8509.055419921875, 26853.082153320312, 7945.868408203125, 8765.695556640625, 8679.28369140625, 9007.813842773438, 8421.499389648438, 8261.113647460938, 27047.03466796875, 9088.525634765625, 8656.752685546875, 8332.381225585938]
+[[measurements]]
+compiler = "reactant"
+configuration = "manual_ad_reactant"
+differentiation = "value_and_gradient"
+gradient_max_abs_error = 0.0
+operation = "posterior value and gradient"
+provider = "manual_julia"
+reactant_compile_seconds = 1.275469353
+reactant_first_execution_seconds = 0.02049613
+state = "supported"
+value_abs_error = 0.0
+
+    [measurements.result]
+    calls_per_round = 16384
+    median_ns = 4189.576416015625
+    min_ns = 4057.18115234375
+    times_ns = [4170.2049560546875, 4244.867736816406, 10026.175537109375, 4190.4464111328125, 4101.789733886719, 4281.3236083984375, 10461.168212890625, 4057.18115234375, 4315.6910400390625, 10056.503540039062, 4176.507629394531, 4166.953369140625, 4126.239929199219, 10758.505310058594, 4107.4537353515625, 4091.33349609375, 9781.75732421875, 4188.7064208984375, 4132.485778808594, 9590.831420898438]
+[[measurements]]
+compiler = "reactant"
+configuration = "turing_reactant_ad"
+differentiation = "value_and_gradient"
+operation = "posterior value and gradient"
+provider = "turing"
+reason = "DynamicPPL's model evaluator is not a public Reactant-traceable interface"
+state = "unsupported"
+
+[pins]
+differentiationinterface_version = "0.7.21"
+enzyme_version = "0.13.199"
+julia_version = "1.10.11"
+model_source_text_sha256 = "eeb3f908493f265b475ed6ec28d2ad1302a8d9a1486530c4a04ecfe4e87d6e6f"
+native_receipt_path = "benchmark/receipts/sum-to-zero-native-v1.toml"
+native_receipt_reactivekernels_sha = "658cb3d2b79c11edc4354c6655aa70c82d2de41a"
+native_receipt_sha256 = "70b272916a60f5802e95079a62689dac9ee97ee915bfb728c599b001675ca88a"
+reactant_jll_version = "0.0.401+0"
+reactant_version = "0.2.278"
+reactivekernels_dirty = false
+reactivekernels_sha = "bff7aee05cbc34bbecd7287afd349dff128e0dd5"
+reactivekernels_version = "0.1.0"
+reactivekernelsdistributionkernels_version = "0.1.0"
+reactivekernelspplexamples_version = "0.1.0"
+
+    [pins.model_source]
+    git_blob = "5b13e47d0dac5b2898914792e1a4b85295cf1721"
+    path = "packages/ReactiveKernelsPPLExamples/src/sum_to_zero.jl"
+    text_sha256 = "1a7a15c8b8e805c99ad34ec42de799c8f9ada0eaaefd4a0508ad89c7d4e25433"
+
+    [pins.native_comparator_source]
+    git_blob = "7ed51c42c304840c6821e4dadacab2e143a291f7"
+    path = "benchmark/sum_to_zero_comparison_body.jl"
+    text_sha256 = "04f1adb23e8e3bd41023c6e1c4f92848fe4a9ecac5186d01b7da1232db62a3d1"
+
+    [pins.reactant_comparator_source]
+    git_blob = "0845cb9d26335d60731e34d4c6e52ff5dccf6d9f"
+    path = "benchmark/sum_to_zero_reactant_comparison_body.jl"
+    text_sha256 = "fde28d0a0d582bad111bd07e0eac831de35ee4bfbcc91250f86ca053f15cd50d"
+
+[protocol]
+bound_ports = ["observations", "observation_scales", "α_prior_sd"]
+boundary = "packed unconstrained parameters"
+estimator = "median per-call time from calibrated elapsed batches"
+first_execution_in_steady_state_region = false
+hot_loop_excludes_recovery = true
+manual_control = "exact native receipt control compiled through Reactant"
+model = "sum-to-zero hierarchical Eight Schools"
+outcome = "full unconstrained posterior"
+parity_atol = 1.0e-10
+parity_rtol = 1.0e-11
+reactant_compile_time_in_timed_region = false
+reactant_readback_in_timed_region = false
+reactant_sync = true
+reactant_transfers_in_timed_region = false
+rounds = 20
+source_reused = true
+target_seconds_per_round = 0.05
+turing_reactant_state = "unsupported"
+
+[setup]
+environment_seconds = 12.600635756
+model_seconds = 3.084200112
+package_precompile_seconds = 17.059665955
+rk_kernel_seconds = 1.408058596
+transfer_seconds = 0.183140331
