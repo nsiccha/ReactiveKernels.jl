@@ -629,6 +629,105 @@ function _control_block_bindings(block, alias_sources)
     needed
 end
 
+# A read-only dense numeric argument can be read from the root call instead of
+# copied into every suspended frame. Prove the entire forwarding component:
+# every incoming edge must carry that same root, and every use must be an
+# ordinary array read/length or a direct forward within the component. Any
+# write, rebinding, escape, or ambiguous incoming argument keeps frame storage.
+function _control_readonly_array_formals(program, argument_types)
+    result = Dict{Tuple{Int,Symbol},Int}()
+    calls = filter(block -> block.term === :call, program.blocks)
+    for (root_name, position) in program.formal_positions[program.root_mid]
+        T = argument_types[position]
+        T <: Array && isbitstype(eltype(T)) && eltype(T) <: Number || continue
+        aliases = Set([(program.root_mid, root_name)])
+        changed = true
+        while changed
+            changed = false
+            for block in calls
+                for (name, index) in program.formal_positions[block.callee_mid]
+                    index <= length(block.arguments) || continue
+                    actual = block.arguments[index]
+                    actual isa _FormalRef || continue
+                    (block.mid, actual.arg) in aliases || continue
+                    key = (block.callee_mid, name)
+                    if !(key in aliases)
+                        push!(aliases, key)
+                        changed = true
+                    end
+                end
+            end
+        end
+        # The root's initial arguments are incoming edges too. Recursion may
+        # swap two root formals; those remain distinct even if their forwarding
+        # edges form one connected component.
+        any(key -> first(key) == program.root_mid && last(key) != root_name,
+            aliases) && continue
+        valid = all(calls) do block
+            all(program.formal_positions[block.callee_mid]) do (name, index)
+                (block.callee_mid, name) in aliases || return true
+                index <= length(block.arguments) || return false
+                actual = block.arguments[index]
+                actual isa _FormalRef && (block.mid, actual.arg) in aliases
+            end
+        end
+        valid || continue
+        function safe_use(x, mid)
+            if x isa _FormalRef
+                return !((mid, x.arg) in aliases)
+            elseif x isa _Lit
+                return true
+            elseif x isa _PlaceWrite
+                any(key -> first(key) == mid &&
+                    _reads_formal(x.target, last(key)), aliases) && return false
+                return safe_use(x.rhs, mid)
+            elseif x isa _LocalAssign
+                any(name -> (mid, name) in aliases, x.lhs) && return false
+                return safe_use(x.rhs, mid)
+            elseif x isa _Index && x.base isa _FormalRef &&
+                    (mid, x.base.arg) in aliases
+                return all(index -> safe_use(index, mid), x.idxs)
+            elseif x isa _RegisteredCall &&
+                    getfield(x.registration, :source) === Base.length &&
+                    !x.broadcast && isempty(x.kw) && length(x.args) == 1 &&
+                    only(x.args) isa _FormalRef &&
+                    (mid, only(x.args).arg) in aliases
+                return true
+            elseif x isa Tuple || x isa AbstractVector
+                return all(child -> safe_use(child, mid), x)
+            elseif x isa Pair
+                return safe_use(last(x), mid)
+            elseif x isa Expr
+                return all(child -> safe_use(child, mid), x.args)
+            elseif x isa Union{_MExpr,_MStmt,_RawStmt,_RawCond}
+                return all(field -> safe_use(getfield(x, field), mid),
+                           fieldnames(typeof(x)))
+            end
+            true
+        end
+        valid = all(program.blocks) do block
+            any(name -> (block.mid, name) in aliases, block.writes) && return false
+            safe_use(block.effects, block.mid) || return false
+            hasproperty(block, :condition) &&
+                !safe_use(block.condition, block.mid) && return false
+            block.term === :call || return true
+            all(enumerate(block.arguments)) do (index, actual)
+                if actual isa _FormalRef && (block.mid, actual.arg) in aliases
+                    return any(program.formal_positions[block.callee_mid]) do (name, pos)
+                        pos == index && (block.callee_mid, name) in aliases
+                    end
+                end
+                safe_use(actual, block.mid)
+            end
+        end
+        valid || continue
+        for key in aliases
+            result[key] = position
+        end
+    end
+    result
+end
+
 #
 # `compile_dispatcher` above emits one native implementation of the captured
 # control machine.  Optional backends need the same source-derived topology,

@@ -3,6 +3,115 @@ module MutationProfileBGenericControl
 using ReactiveKernels
 using Random
 
+@kernel recursive_array_reader(total, ceiling) = begin
+    calls = 0
+    descend!(level, data) = begin
+        calls += 1
+        if level == 0
+            total += data[1]
+        else
+            descend!(__self__, level - 1, data)
+            total += data[length(data)]
+        end
+        total += 0
+    end
+    drive!(data) = begin
+        for level in 0:ceiling
+            descend!(__self__, level, data)
+        end
+        total += 0
+    end
+end
+
+@kernel recursive_mixed_reader(total, ceiling) = begin
+    calls = 0
+    descend!(level, data) = begin
+        calls += 1
+        if level == 0
+            total += data[1]
+        else
+            descend!(__self__, level - 1, data)
+            total += data[length(data)]
+        end
+        total += 0
+    end
+    mixed!(left, right) = begin
+        descend!(__self__, 0, left)
+        descend!(__self__, 1, right)
+        total += 0
+    end
+end
+
+@kernel recursive_array_writer(saved, ceiling) = begin
+    calls = 0
+    descend!(level, data) = begin
+        calls += 1
+        if level == 0
+            data[1] += 1
+        else
+            descend!(__self__, level - 1, data)
+        end
+        calls += 0
+    end
+    drive!(data) = begin
+        descend!(__self__, ceiling, data)
+        calls += 0
+    end
+end
+
+@kernel recursive_array_escape(saved, ceiling) = begin
+    calls = 0
+    descend!(level, data) = begin
+        calls += 1
+        if level == 0
+            saved = data
+        else
+            descend!(__self__, level - 1, data)
+        end
+        calls += 0
+    end
+    drive!(data) = begin
+        descend!(__self__, ceiling, data)
+        calls += 0
+    end
+end
+
+@kernel recursive_array_swap(total, ceiling) = begin
+    calls = 0
+    drive!(level, left, right) = begin
+        calls += 1
+        total += left[1]
+        if level > 0
+            drive!(__self__, level - 1, right, left)
+        end
+        calls += 0
+    end
+end
+
+function array_swap_case()
+    kernel = ReactiveKernels.compile_stateful(recursive_array_swap, 0.0, 2)
+    state = ReactiveKernels.stateful_snapshot(kernel(0.0, 2))
+    bounds = ReactiveKernels.stateful_control_bounds(
+        kernel, Val(:drive!), state;
+        argument_types=Tuple{Int,Vector{Float64},Vector{Float64}},
+        recursion_bound=:ceiling)
+    transition = ReactiveKernels.functionalize_stateful(kernel, Val(:drive!), bounds)
+    (; state, transition)
+end
+
+function array_reader_case(method=Val(:drive!))
+    factory = method === Val(:drive!) ? recursive_array_reader : recursive_mixed_reader
+    kernel = ReactiveKernels.compile_stateful(factory, 0.0, 2)
+    state = ReactiveKernels.stateful_snapshot(kernel(0.0, 2))
+    arguments = method === Val(:drive!) ? Tuple{Vector{Float64}} :
+                Tuple{Vector{Float64},Vector{Float64}}
+    bounds = ReactiveKernels.stateful_control_bounds(
+        kernel, method, state; argument_types=arguments,
+        recursion_bound=:ceiling, max_iterations=128)
+    transition = ReactiveKernels.functionalize_stateful(kernel, method, bounds)
+    (; kernel, state, bounds, transition)
+end
+
 # Include a gap, reordered methods, a duplicate and a very large isolated PC.
 # Index selection must honor the original case order without dense allocation.
 const ADDRESS_PROBE = ((11, 2), (11, 3), (11, 7), (-4, 0),

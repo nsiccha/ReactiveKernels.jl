@@ -30,6 +30,30 @@ const _MPB_GENERIC_CONTROL = MutationProfileBGenericControl
 const _MPB_TESTSET = get(ENV, "RK_MPB_TESTSET", "all")
 _mpb_enabled(name) = _MPB_TESTSET == "all" || _MPB_TESTSET == name
 
+if _mpb_enabled("readonly-array")
+@testset "recursive array arguments retain values across suspension" begin
+    case = _MPB_GENERIC_CONTROL.array_reader_case()
+    input = [2.0, 5.0]
+    result = case.transition(case.state, input)
+    @test result.state.total == 21
+    @test !result.control_overflow
+    @test input == [2, 5]
+    @test case.state.total == 0
+    @test case.transition(result.state, [4.0, 1.0]).state.total == 36
+    mixed = _MPB_GENERIC_CONTROL.array_reader_case(Val(:mixed!))
+    @test mixed.transition(mixed.state, [2.0, 5.0], [7.0, 11.0]).state.total == 20
+    swapped = _MPB_GENERIC_CONTROL.array_swap_case()
+    @test swapped.transition(swapped.state, 2, [2.0], [7.0]).state.total == 11
+    for factory in (_MPB_GENERIC_CONTROL.recursive_array_writer,
+                    _MPB_GENERIC_CONTROL.recursive_array_escape)
+        program = RK._control_program(factory;
+            root_name=:drive!, lower_all_loops=true)
+        @test isempty(RK._control_readonly_array_formals(
+            program, (Vector{Float64},)))
+    end
+end
+end
+
 if _mpb_enabled("control-dispatch")
 @testset "control address ranges and native dispatch" begin
     fixture = _MPB_GENERIC_CONTROL

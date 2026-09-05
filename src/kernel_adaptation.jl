@@ -8118,6 +8118,8 @@ function _functional_state_machine_method(
             haskey(provider_formals, (mid, name)) || _sm_reject(
                 "typed RNG formal has no root provider argument")
         end
+        root_argument_formals = merge(provider_formals,
+            _control_readonly_array_formals(program, argument_types))
         alias_sources = Dict{Int,Dict{Symbol,Any}}(
             mid => Dict{Symbol,Any}() for mid in program.methods)
         for block in program.blocks, effect in block.effects
@@ -8158,8 +8160,8 @@ function _functional_state_machine_method(
             push!(container_alias_only, key)
         end
 
-        # Provider formals always resolve to the one authoritative root replay
-        # in `carry.arguments`.  They are not suspended value locals and must
+        # Provider formals and proven read-only array formals resolve to their
+        # root argument in `carry.arguments`. They are not suspended locals and must
         # not also appear as redundant per-method frame columns: that duplicate
         # representation can lose traced identity across a backend while carry.
         # Internal structured formals are proven aliases of owned state roots:
@@ -8191,7 +8193,7 @@ function _functional_state_machine_method(
         root_alias_only = Set(key for key in keys(formal_alias_roots)
                               if !(key in value_fallback_formals))
         frame_order = Tuple(key for key in candidate_frame_order
-            if !haskey(provider_formals, key) && !(key in root_alias_only) &&
+            if !haskey(root_argument_formals, key) && !(key in root_alias_only) &&
                !(key in container_alias_only))
         formal_alias_order = Tuple(key for key in candidate_frame_order
                                    if haskey(formal_alias_roots, key))
@@ -8265,7 +8267,7 @@ function _functional_state_machine_method(
             root_position += 1
             formal.name in program.stored[program.root_mid] || continue
             key = (program.root_mid, formal.name)
-            haskey(provider_formals, key) && continue
+            haskey(root_argument_formals, key) && continue
             argument = base_syms[(:formal, formal.name)]
             frame_columns[key] = if haskey(formal_alias_roots, key)
                 root = first(formal_alias_roots[key]).name
@@ -8546,9 +8548,9 @@ function _functional_state_machine_method(
                     name in needed_bindings || continue
                     key = (mid, name)
                     Tlocal = frame_types[mid][name]
-                    if name in formal_names && haskey(provider_formals, key)
+                    if name in formal_names && haskey(root_argument_formals, key)
                         base_syms[(:formal, name)] = step_argument_syms[
-                            provider_formals[key]]
+                            root_argument_formals[key]]
                         formals[name] = Tlocal <: AbstractArray
                         continue
                     end
@@ -8649,7 +8651,7 @@ function _functional_state_machine_method(
                     local_origins)
                 for name in block.writes
                     key = (mid, name)
-                    haskey(provider_formals, key) && continue
+                    haskey(root_argument_formals, key) && continue
                     key in container_alias_only && continue
                     haskey(local_syms, name) || _sm_reject(
                         "functional control block writes unavailable local `$name`")
@@ -8771,7 +8773,7 @@ function _functional_state_machine_method(
                     for name in program.stored[callee]
                         haskey(callee_positions, name) || continue
                         key = (callee, name)
-                        haskey(provider_formals, key) && continue
+                        haskey(root_argument_formals, key) && continue
                         position = callee_positions[name]
                         position <= length(block.arguments) || _sm_reject(
                             "functional control call has missing argument")

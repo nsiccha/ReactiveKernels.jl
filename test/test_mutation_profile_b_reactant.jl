@@ -27,6 +27,21 @@ const _MPBR_GENERIC_NUTS = MutationProfileBGenericNUTSSupport
 const _MPBR_TESTSET = get(ENV, "RK_MPB_REACTANT_TESTSET", "all")
 _mpbr_enabled(name) = _MPBR_TESTSET == "all" || _MPBR_TESTSET == name
 
+if _mpbr_enabled("readonly-array")
+@testset "recursive array argument forwarding through Reactant" begin
+    case = _MPBR_GENERIC_CONTROL.array_reader_case()
+    state = Reactant.to_rarray(case.state; track_numbers=true)
+    input = Reactant.to_rarray([2.0, 5.0])
+    compiled = @compile sync=true donated_args=:none case.transition(state, input)
+    result = compiled(state, input)
+    @test Float64(result.state.total) == 21
+    @test !Bool(result.control_overflow)
+    @test Array(input) == [2, 5]
+    @test Float64(state.total) == 0
+    next = compiled(result.state, Reactant.to_rarray([4.0, 1.0]))
+    @test Float64(next.state.total) == 36
+end
+end
 
 module _MPBRTraceBlockOverlay
 using ReactiveKernels, Reactant
