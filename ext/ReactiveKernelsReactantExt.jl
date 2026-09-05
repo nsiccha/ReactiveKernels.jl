@@ -687,13 +687,13 @@ end
     Reactant.promote_to(Reactant.TracedRArray, arg)
 
 # A traced scalar index is a deliberate gather at this compiler boundary.
-# Express the bounded vector gather as a traced select/reduction: Reactant
-# 0.2.278's dynamic-slice start index is not lane-varying under Ops.batch, while
-# this predicated form preserves each replica's index and remains differentiable.
+# Reactant 0.2.284 preserves lane-varying dynamic-slice indices under
+# `Ops.batch`, so lower the authored index directly rather than materializing an
+# O(K) select/reduction workaround.
 @inline function ReactiveKernels._tensorized_getindex(
         array::Reactant.TracedRArray{T,1},
         index::Reactant.TracedRNumber{I}) where {T,I<:Integer}
-    sum(ifelse.(collect(eachindex(array)) .== index, array, zero(T)))
+    Reactant.@allowscalar array[index[]]
 end
 
 @inline function ReactiveKernels._tensorized_getindex(

@@ -93,7 +93,7 @@ julia --startup-file=no benchmark/receipts/validate_eight_schools_reactant.jl \
   benchmark/receipts/eight-schools-reactant-v2.toml
 ```
 
-The script provisions a fresh environment with Reactant 0.2.278, develops the
+The script provisions a fresh environment with Reactant 0.2.284, develops the
 exact candidate plus its two example packages, and records environment setup
 and package precompilation separately. For a quick non-publication smoke run,
 set `RK_EIGHT_SCHOOLS_REACTANT_ROUNDS=2` and
