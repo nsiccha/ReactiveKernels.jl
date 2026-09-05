@@ -7400,10 +7400,11 @@ function _functional_state_machine_method(
         for (mapping, key_list) in zip(mappings, keys_by_map), key in key_list
             port = slot_port(mapping, key)
             value = port === nothing ? mapping[key] :
-                :(_sm_structured_carry_store($port, $(mapping[key])))
+                :(_sm_structured_carry_store($port, $(mapping[key]), Val(true)))
             symbol = input!(value; structured=port !== nothing)
             mapping[key] = port === nothing ? symbol : bind!(
-                :(_sm_structured_carry_load($port, $symbol)), :__sfm_loop_logical_)
+                :(_sm_structured_carry_load($port, $symbol, Val(true))),
+                :__sfm_loop_logical_)
         end
         before_overflow, before_return_seen = control_overflow, return_seen
         before_return_value = return_value[]
@@ -7424,7 +7425,7 @@ function _functional_state_machine_method(
         for (mapping, key_list) in zip(mappings, keys_by_map), key in key_list
             port = slot_port(mapping, key)
             push!(outputs, port === nothing ? mapping[key] :
-                :(_sm_structured_carry_store($port, $(mapping[key]))))
+                :(_sm_structured_carry_store($port, $(mapping[key]), Val(true))))
         end
         append!(outputs, (control_overflow, return_seen, return_value[]))
         successor = bind!(:($candidate < $upper), :__sfm_loop_successor_)
@@ -7478,7 +7479,8 @@ function _functional_state_machine_method(
             position += 1
             output = :(getfield(getfield($finished, :values), $position))
             port = slot_port(mapping, key)
-            port === nothing || (output = :(_sm_structured_carry_load($port, $output)))
+            port === nothing || (output =
+                :(_sm_structured_carry_load($port, $output, Val(true))))
             if mapping === local_syms
                 # Outer lexical locals retain their binding after the loop.
                 push!(statements, :($(mapping[key]) = $output))
@@ -10347,15 +10349,34 @@ end
 # A backend carry stores one path per canonical group. Logical alias names are
 # reconstructed on load, so they never duplicate tensors in a while-region ABI.
 # Independent canonical groups still receive isolated traced values.
+_sm_structured_carry_store(port::_StructuredStatePort, value) =
+    _sm_structured_carry_store(port, value, Val(false))
+
+# An external callable is validated against its compiled identity at entry and
+# every store. Retained loops can restore that authority from the port instead
+# of copying its entire program metadata through their dynamic carry. Numeric
+# external values and arrays remain ordinary operands.
+function _sm_structured_static_callable_groups(::Type{T}, omit) where {T}
+    omit || return ()
+    Groups, ExternalGroups = T.parameters[2:3]
+    Initial = fieldtype(T, :initial)
+    Tuple(index for index in ExternalGroups
+          if fieldtype(Initial, first(Groups[index])) <: Function)
+end
+
 @generated function _sm_structured_carry_store(
-        port::_StructuredStatePort{T}, value) where {T}
+        port::_StructuredStatePort{T}, value, ::Val{OmitStatic}) where {T,OmitStatic}
     Names, Groups, ExternalGroups = T.parameters[1:3]
+    static_groups = _sm_structured_static_callable_groups(T, OmitStatic)
     statements = Any[
         :(_sm_validate_functional_structured_state_port(port, value)),
     ]
-    leaders = Tuple(first(group) for group in Groups)
+    leaders = Tuple(first(group) for (index, group) in enumerate(Groups)
+                    if !(index in static_groups))
     stored_values = Any[]
-    for (group_index, leader) in enumerate(leaders)
+    for (group_index, group) in enumerate(Groups)
+        group_index in static_groups && continue
+        leader = first(group)
         source = :(getfield(value, $(QuoteNode(leader))))
         push!(stored_values, group_index in ExternalGroups ? source :
             :(_sm_control_carry_isolate($source)))
@@ -10365,12 +10386,18 @@ end
     Expr(:block, statements...)
 end
 
+_sm_structured_carry_load(port::_StructuredStatePort, value) =
+    _sm_structured_carry_load(port, value, Val(false))
+
 @generated function _sm_structured_carry_load(
-        port::_StructuredStatePort{T}, value) where {T}
+        port::_StructuredStatePort{T}, value, ::Val{OmitStatic}) where {T,OmitStatic}
     Names, Groups, ExternalGroups = T.parameters[1:3]
+    static_groups = _sm_structured_static_callable_groups(T, OmitStatic)
     aliases = Dict{Symbol,Any}()
-    for group in Groups
-        source = :(getfield(value, $(QuoteNode(first(group)))))
+    for (index, group) in enumerate(Groups)
+        authority = index in static_groups ?
+            :(getfield(getfield(port, :transition), :initial)) : :value
+        source = :(getfield($authority, $(QuoteNode(first(group)))))
         for name in group
             aliases[name] = source
         end

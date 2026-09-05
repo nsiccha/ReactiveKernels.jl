@@ -677,7 +677,9 @@ body when their observational effects have functional lowerings. Native executio
 uses an ordinary loop; Reactant receives a traced while-region. Compilation does
 not duplicate that body for each permitted iteration. Lexical locals, early
 returns, structured aliases, and effect state travel through the generated loop
-operands. Methods with value returns or host-drained observational records retain
+operands. Validated external callable identities are recovered from compiler
+bindings rather than copied through those operands; numeric and array external
+values remain operands. Methods with value returns or host-drained observational records retain
 the existing bounded unrolling path.
 
 The retained loop checks its finite allowance with an unsigned distance, which
