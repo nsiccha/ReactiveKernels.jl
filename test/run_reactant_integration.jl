@@ -1,7 +1,7 @@
 using Pkg
 using UUIDs
 
-const REACTANT_VERSION = v"0.2.278"
+const REACTANT_VERSION = v"0.2.284"
 const REACTANT_UUID = UUID("3c362404-f566-11ee-1572-e11a4b42c853")
 
 root = normpath(joinpath(@__DIR__, ".."))

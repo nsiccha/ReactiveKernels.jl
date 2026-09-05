@@ -553,8 +553,9 @@ function _lower_authored_plate_tensorized!(body, runtime_ops, runtime_recipes,
         GlobalRef(@__MODULE__, :_tensorized_plate_materialize), scalar_result)
     pointwise_lhs === nothing ||
         push!(body.args, :($pointwise_lhs = $materialized))
-    total_lhs === nothing ||
-        push!(body.args, :($total_lhs = $(GlobalRef(Base, :sum))($materialized)))
+    total = Expr(:call,
+        GlobalRef(@__MODULE__, :_tensorized_plate_sum), scalar_result)
+    total_lhs === nothing || push!(body.args, :($total_lhs = $total))
     body
 end
 
@@ -1073,21 +1074,26 @@ end
 end
 
 """
-    _externalize_bound_arrays(kernel) -> (call, values)
+    _externalize_bound_arrays(kernel; min_elements = 0) -> (call, values)
 
 Return an internal compiler call plus the array-valued partial-evaluation
 constants it expects as trailing hidden operands. If the kernel contains no
 such constants, return the kernel itself and an empty tuple. Scalar and other
-small static constants remain in the operation table.
+small static constants remain in the operation table; `min_elements` lets a
+backend keep arrays below that element count in the table as well, so a small
+static dataset stays a compiler literal it can fold rather than a runtime
+operand it must read. By default every array is externalized.
 
 This is a compiler ABI adapter, not a different model boundary: `kernel` keeps
 its original public inputs, and `call(public_args..., values...)` is exactly
 equivalent to `kernel(public_args...)`.
 """
-function _externalize_bound_arrays(kernel::PreparedKernel)
+function _externalize_bound_arrays(kernel::PreparedKernel;
+                                   min_elements::Integer = 0)
     positions = Tuple(
         index for (index, op) in pairs(kernel.ops)
-        if op isa _BoundConstant && op.value isa AbstractArray)
+        if op isa _BoundConstant && op.value isa AbstractArray &&
+           length(op.value) >= min_elements)
     isempty(positions) && return kernel, ()
     values = Tuple(kernel.ops[index].value for index in positions)
     stripped = ntuple(length(kernel.ops)) do index

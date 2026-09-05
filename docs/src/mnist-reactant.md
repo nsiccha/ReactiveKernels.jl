@@ -115,7 +115,7 @@ julia --startup-file=no benchmark/receipts/validate_mnist_reactant.jl \
   benchmark/receipts/mnist-reactant-v2.toml
 ```
 
-The script provisions a fresh environment with Reactant 0.2.278, develops the
+The script provisions a fresh environment with Reactant 0.2.284, develops the
 exact candidate plus its two example packages, loads the full MNIST training
 split via MLDatasets, and records environment setup, package precompilation,
 and data loading separately. For a quick non-publication smoke run, set

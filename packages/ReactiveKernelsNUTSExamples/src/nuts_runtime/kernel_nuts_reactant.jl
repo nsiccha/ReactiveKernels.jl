@@ -7,7 +7,8 @@
 # (`@kernel nuts_state`) stays BYTE-IDENTICAL — this is compiler/lowering/runtime
 # emission only, a sibling to compile_nuts / compile_nuts_native.
 #
-# Strategy (proven feasible at Reactant 0.2.278, ReactiveKernels:reactant probes):
+# Strategy (supported from Reactant 0.2.284; initially proven by
+# ReactiveKernels:reactant probes):
 #   * the SoA control-stack dispatcher (compile_nuts_dispatcher) lowers to a single
 #     bounded `@trace while sum(csp)>=1` — depth-independent graph, no unroll, no cap;
 #   * the full mutable NUTS state becomes fixed-capacity traced-tensor SoA (below);

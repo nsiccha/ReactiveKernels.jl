@@ -111,6 +111,15 @@ end
     return sum(pointwise)
 end
 
+@kernel reactant_small_eachcol_plate(
+        scores::Matrix{Float64}, weights::Vector{Float64}) = begin
+    pointwise = plate(eachcol(scores), weights) do column, weight
+        value::Float64 = weight * sum(column)
+        return value
+    end
+    return sum(pointwise)
+end
+
 @kernel reactant_laplace_logscale(
         x::Float64, μ::Float64, logb::Float64) = begin
     b::Float64 = exp(logb)
@@ -171,9 +180,9 @@ end
 end
 
 # Non-splat constants below deliberately avoid the separate upstream Reactant
-# 0.2.278 miscompile pinned in the testset (a splat constant lowers the concat
-# to `stablehlo.pad`, and EnzymeXLA's reduce-of-pad rewrite adds the pad value
-# once instead of once per padded element).
+# 0.2.278–0.2.284 miscompile pinned in the testset (a splat constant lowers the
+# concat to `stablehlo.pad`, and EnzymeXLA's reduce-of-pad rewrite adds the pad
+# value once instead of once per padded element).
 @kernel reactant_mixed_hcat(scores::Matrix{Float64}) = begin
     wide = hcat(reshape(collect(1.0:size(scores, 1)), size(scores, 1), 1), scores)
     total::Float64 = sum(wide)
@@ -244,8 +253,8 @@ end
             @test traced_sum ≈ native_sum
         end
 
-        # Upstream Reactant 0.2.278 miscompile, orthogonal to the promotion
-        # above: a nonzero SPLAT constant row lowers the concat to
+        # Upstream Reactant 0.2.278–0.2.284 miscompile, orthogonal to the
+        # promotion above: a nonzero SPLAT constant row lowers the concat to
         # `stablehlo.pad`, and EnzymeXLA's reduce-of-pad rewrite adds the pad
         # value once instead of once per padded element, so the concatenated
         # array is exact while its sum is wrong. Pinned broken so a Reactant
@@ -753,6 +762,65 @@ end
         @test !occursin("for ", string(total.f.tensorized_ast))
         @test !occursin("for ", string(pointwise.f.tensorized_ast))
         @test !occursin("for ", string(both.f.tensorized_ast))
+    end
+
+    @testset "small static plates lower as scalar lanes" begin
+        ext = Base.get_extension(ReactiveKernels, :ReactiveKernelsReactantExt)
+        lane_limit = ext._REACTANT_SMALL_STATIC_PLATE_LANES
+        optimized_hlo(kernel, args...) =
+            repr(Reactant.@code_hlo optimize = true kernel(args...))
+
+        x_host = collect(range(-1.0, 1.0; length = 12))
+        locations_host = collect(range(-0.2, 0.4; length = 12))
+        scales_host = collect(range(0.8, 1.1; length = 12))
+        reference = @. -0.5 * log(2π) - log(scales_host) -
+            0.5 * ((x_host - locations_host) / scales_host)^2
+        total = prepare(reactant_authored_normal_loglik)
+        both = prepare(extract(
+            reactant_authored_normal_loglik;
+            want = (:pointwise, :__return__)))
+        x = Reactant.to_rarray(x_host)
+        locations = Reactant.to_rarray(locations_host)
+        scales = Reactant.to_rarray(scales_host)
+        @test length(x_host) <= lane_limit[]
+
+        # A total-only cut of a small plate is a scalar program: no batched
+        # region, no vector reduction, and no lane vector materialized.
+        lane_hlo = optimized_hlo(total, x, locations, scales)
+        @test !occursin("enzyme.batch", lane_hlo)
+        @test !occursin("stablehlo.reduce", lane_hlo)
+        @test !occursin("stablehlo.concatenate", lane_hlo)
+        lane_total = @compile total(x, locations, scales)
+        @test lane_total(x, locations, scales) ≈ sum(reference)
+        lane_both = @compile both(x, locations, scales)
+        lane_pointwise, lane_sum = lane_both(x, locations, scales)
+        @test Array(lane_pointwise) ≈ reference
+        @test lane_sum ≈ sum(reference)
+
+        # Above the lane limit the same plate keeps the batched lowering.
+        previous_limit = lane_limit[]
+        try
+            lane_limit[] = length(x_host) - 1
+            batched_hlo = optimized_hlo(total, x, locations, scales)
+            @test occursin("stablehlo.reduce", batched_hlo)
+            batched_total = @compile total(x, locations, scales)
+            @test batched_total(x, locations, scales) ≈ sum(reference)
+        finally
+            lane_limit[] = previous_limit
+        end
+
+        # Column lanes of a small eachcol plate take the same scalar path.
+        scores_host = reshape(collect(1.0:15.0) ./ 7, 3, 5)
+        weights_host = collect(range(0.5, 1.5; length = 5))
+        eachcol_kernel = prepare(reactant_small_eachcol_plate)
+        eachcol_reference = sum(
+            weights_host[j] * sum(scores_host[:, j]) for j in 1:5)
+        @test eachcol_kernel(scores_host, weights_host) ≈ eachcol_reference
+        scores = Reactant.to_rarray(scores_host)
+        weights = Reactant.to_rarray(weights_host)
+        @test !occursin("enzyme.batch", optimized_hlo(eachcol_kernel, scores, weights))
+        compiled_eachcol = @compile eachcol_kernel(scores, weights)
+        @test compiled_eachcol(scores, weights) ≈ eachcol_reference
     end
 
     @testset "native plate path keeps its allocation contract" begin

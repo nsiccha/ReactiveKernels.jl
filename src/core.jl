@@ -167,10 +167,17 @@ struct _TensorizedPlateBatch{A}
 end
 
 @inline _tensorized_eachcol(parent) = _TensorizedEachcol(parent)
+# A backend may represent an in-flight plate value with its own marker type
+# (for example per-lane scalars).  It declares that marker here so the recipe
+# chain inside one plate body keeps routing through the backend, and it
+# specializes the materialize/sum hooks below for that representation.
+@inline _tensorized_plate_is_marker(arg) = false
+@inline _tensorized_plate_is_marker(
+    ::Union{_TensorizedEachcol,_TensorizedPlateBatch}) = true
 @inline _tensorized_plate_marker(::Tuple{}) = nothing
 @inline function _tensorized_plate_marker(args::Tuple)
     first_arg = first(args)
-    first_arg isa Union{_TensorizedEachcol,_TensorizedPlateBatch} ?
+    _tensorized_plate_is_marker(first_arg) ?
         first_arg : _tensorized_plate_marker(Base.tail(args))
 end
 @inline _tensorized_plate_fallback_arg(arg) = arg
@@ -179,6 +186,11 @@ end
 @inline _tensorized_plate_fallback_arg(arg::_TensorizedPlateBatch) = arg.values
 @inline _tensorized_plate_materialize(value) = value
 @inline _tensorized_plate_materialize(value::_TensorizedPlateBatch) = value.values
+# The authored `sum(pointwise)` consumer of a plate.  Native semantics are
+# exactly `sum` over the materialized pointwise vector; a backend that keeps
+# the plate as per-lane values may reduce those lanes directly instead of
+# first materializing a vector it would immediately reduce.
+@inline _tensorized_plate_sum(value) = sum(_tensorized_plate_materialize(value))
 
 @inline function _tensorized_plate_call(operation, args...)
     marker = _tensorized_plate_marker(args)

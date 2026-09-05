@@ -134,6 +134,8 @@ function _render_mnist_longform_focused(path, expected_schema;
         String(row["boundary"]) == "packed_unconstrained" &&
             _mnist_longform_primary_label(row, mode) !== nothing
     end
+    practicalbayes = _practicalbayes_receipt()
+    practicalbayes_measurements = practicalbayes["model_measurements"]
     rows = NamedTuple[]
     for outcome in _MNIST_FOCUSED_OUTCOMES
         candidates = filter(row -> String(row["outcome"]) == outcome, primary)
@@ -161,16 +163,50 @@ function _render_mnist_longform_focused(path, expected_schema;
                 median_allocs = Int(result["median_allocs"]),
             ))
         end
+        differentiation = mode == :primal ? "primal" : "value_and_gradient"
+        for model in ("idiomatic", "vcat_free")
+            practicalbayes_rows = filter(row ->
+                row["workload"] == "mnist_logistic" && row["model"] == model &&
+                row["boundary"] == "packed_unconstrained" &&
+                row["outcome"] == outcome &&
+                row["differentiation"] == differentiation &&
+                row["state"] == "supported", practicalbayes_measurements)
+            isempty(practicalbayes_rows) && continue
+            result = only(practicalbayes_rows)["result"]
+            runtime_ns = _mnist_focused_runtime(result)
+            model_label = replace(model, '_' => '-')
+            push!(rows, (;
+                outcome,
+                series = "PracticalBayes $model_label",
+                implementation = "PracticalBayes",
+                runtime_ns,
+                baseline_ns,
+                baseline_label = "RK idiomatic on the packed sampler boundary",
+                relative_time = runtime_ns / baseline_ns,
+                median_bytes = Int(result["median_bytes"]),
+                median_allocs = Int(result["median_allocs"]),
+            ))
+        end
     end
     measured_total = count(
         row -> get(row, "state", "") == "supported", receipt["measurements"])
+    practicalbayes_measured = count(row ->
+        get(row, "state", "") == "supported",
+        practicalbayes_measurements)
     summary = "$profile_label. The plots and tables below isolate one outcome " *
         "at a time on the packed sampler boundary. They show the five directly " *
-        "comparable RK/manual/Turing implementations against RK idiomatic; " *
+        "comparable RK/manual/Turing implementations plus every supported " *
+        "PracticalBayes model adapter against RK idiomatic; " *
         "the receipt retains all $measured_total measured modifier/boundary cells " *
-        "plus every explicit N/A or unsupported row."
+        "plus every explicit N/A or unsupported row. The separately resolved " *
+        "PracticalBayes receipt retains $practicalbayes_measured supported cells " *
+        "and its explicit public-API limitations."
+    practicalbayes_pins = practicalbayes["pins"]
     provenance = "Receipt `$(basename(path))`; RK `$(pins["reactivekernels_sha"])`; " *
-        "Julia $(pins["julia_version"]); $(receipt["environment"]["cpu"])."
+        "Julia $(pins["julia_version"]); $(receipt["environment"]["cpu"]). " *
+        "PracticalBayes $(practicalbayes_pins["practicalbayes_version"]) rows " *
+        "come from `$(basename(_PRACTICALBAYES_RECEIPT_PATH))`, resolved " *
+        "separately because of its incompatible Bijectors pin."
     _render_mnist_focused_rows(rows; id_prefix, profile_label, summary, provenance)
 end
 

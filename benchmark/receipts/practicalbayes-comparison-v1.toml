@@ -1,0 +1,1038 @@
+generated_at = "2026-09-05T13:47:41.216Z"
+schema = "practicalbayes-comparison-v1"
+
+[compatibility]
+coexists_with_pinned_turing_environment = false
+reproduction = "add PracticalBayes c6b340ba, then add Turing 0.47.1 and DynamicPPL 0.42.6 in the same Julia 1.10 environment"
+separate_environment = true
+solver_diagnostic = "DynamicPPL 0.42.6 is incompatible with PracticalBayes' Bijectors 0.15.24 pin"
+source_policy = "public API calls only; no PracticalBayes source copied or vendored"
+upstream_license_file_at_pin = "absent"
+
+[datasets.mnist_logistic_full_raw]
+data = "MLDatasets MNIST train split, first N images; 784 raw Float64 pixels in [0,1]"
+dataset_profile = "full-raw"
+num_features = 784
+num_observations = 60000
+
+[environment]
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+env_setup_seconds = 17.705492294
+julia_threads = 1
+os = "Linux"
+precompile_seconds = 18.846703786
+
+[[eval_measurements]]
+implementation = "practical_bayes"
+mode = "primal"
+parity_max_abs = 3.552713678800501e-15
+size = 16
+state = "supported"
+variant = "native"
+
+    [eval_measurements.result]
+    allocs = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5]
+    bytes = [592, 592, 592, 592, 592, 592, 592, 592, 592, 592]
+    median_allocs = 5
+    median_bytes = 592
+    median_ns = 120.0
+    min_ns = 120.0
+    times_ns = [180.0, 120.0, 120.0, 120.0, 120.0, 120.0, 120.0, 120.0, 120.0, 120.0]
+[[eval_measurements]]
+implementation = "practical_bayes"
+mode = "primal"
+reason = "the pinned public API exposes no Reactant compilation boundary; no compiled comparator is invented"
+size = 16
+state = "unsupported"
+variant = "reactant"
+[[eval_measurements]]
+implementation = "practical_bayes"
+mode = "gradient"
+parity_max_abs = 5.551115123125783e-17
+size = 16
+state = "supported"
+variant = "native"
+
+    [eval_measurements.result]
+    allocs = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9]
+    bytes = [1728, 1728, 1728, 1728, 1728, 1728, 1728, 1728, 1728, 1728]
+    median_allocs = 9
+    median_bytes = 1728
+    median_ns = 425.5
+    min_ns = 420.0
+    times_ns = [431.0, 470.0, 421.0, 420.0, 421.0, 430.0, 421.0, 421.0, 431.0, 430.0]
+[[eval_measurements]]
+implementation = "practical_bayes"
+mode = "gradient"
+reason = "the pinned public API exposes no Reactant compilation boundary; no compiled comparator is invented"
+size = 16
+state = "unsupported"
+variant = "reactant"
+[[eval_measurements]]
+implementation = "practical_bayes"
+mode = "gq"
+parity_max_abs = 0.0
+size = 16
+state = "supported"
+variant = "native"
+
+    [eval_measurements.result]
+    allocs = [11, 11, 11, 11, 11, 11, 11, 11, 11, 11]
+    bytes = [752, 752, 752, 752, 752, 752, 752, 752, 752, 752]
+    median_allocs = 11
+    median_bytes = 752
+    median_ns = 200.0
+    min_ns = 190.0
+    times_ns = [351.0, 190.0, 200.0, 200.0, 191.0, 200.0, 200.0, 200.0, 190.0, 200.0]
+[[eval_measurements]]
+implementation = "practical_bayes"
+mode = "gq"
+reason = "the pinned public API exposes no Reactant compilation boundary; no compiled comparator is invented"
+size = 16
+state = "unsupported"
+variant = "reactant"
+[[eval_measurements]]
+implementation = "practical_bayes"
+mode = "primal"
+parity_max_abs = 1.7053025658242404e-13
+size = 256
+state = "supported"
+variant = "native"
+
+    [eval_measurements.result]
+    allocs = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5]
+    bytes = [6544, 6544, 6544, 6544, 6544, 6544, 6544, 6544, 6544, 6544]
+    median_allocs = 5
+    median_bytes = 6544
+    median_ns = 1006.0
+    min_ns = 871.0
+    times_ns = [1022.0, 1052.0, 951.0, 871.0, 1201.0, 971.0, 941.0, 1051.0, 1021.0, 991.0]
+[[eval_measurements]]
+implementation = "practical_bayes"
+mode = "primal"
+reason = "the pinned public API exposes no Reactant compilation boundary; no compiled comparator is invented"
+size = 256
+state = "unsupported"
+variant = "reactant"
+[[eval_measurements]]
+implementation = "practical_bayes"
+mode = "gradient"
+parity_max_abs = 1.1102230246251565e-16
+size = 256
+state = "supported"
+variant = "native"
+
+    [eval_measurements.result]
+    allocs = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9]
+    bytes = [19584, 19584, 19584, 19584, 19584, 19584, 19584, 19584, 19584, 19584]
+    median_allocs = 9
+    median_bytes = 19584
+    median_ns = 18080.0
+    min_ns = 16873.0
+    times_ns = [18165.0, 16873.0, 18085.0, 18155.0, 17394.0, 17755.0, 18075.0, 18656.0, 17645.0, 18796.0]
+[[eval_measurements]]
+implementation = "practical_bayes"
+mode = "gradient"
+reason = "the pinned public API exposes no Reactant compilation boundary; no compiled comparator is invented"
+size = 256
+state = "unsupported"
+variant = "reactant"
+[[eval_measurements]]
+implementation = "practical_bayes"
+mode = "gq"
+parity_max_abs = 0.0
+size = 256
+state = "supported"
+variant = "native"
+
+    [eval_measurements.result]
+    allocs = [11, 11, 11, 11, 11, 11, 11, 11, 11, 11]
+    bytes = [6704, 6704, 6704, 6704, 6704, 6704, 6704, 6704, 6704, 6704]
+    median_allocs = 11
+    median_bytes = 6704
+    median_ns = 1171.5
+    min_ns = 991.0
+    times_ns = [991.0, 1201.0, 1181.0, 1222.0, 1052.0, 1021.0, 1151.0, 1762.0, 1172.0, 1171.0]
+[[eval_measurements]]
+implementation = "practical_bayes"
+mode = "gq"
+reason = "the pinned public API exposes no Reactant compilation boundary; no compiled comparator is invented"
+size = 256
+state = "unsupported"
+variant = "reactant"
+[[eval_measurements]]
+implementation = "practical_bayes"
+mode = "primal"
+parity_max_abs = 1.8189894035458565e-12
+size = 4096
+state = "supported"
+variant = "native"
+
+    [eval_measurements.result]
+    allocs = [8, 8, 8, 8, 8, 8, 8, 8, 8, 8]
+    bytes = [98464, 98464, 98464, 98464, 98464, 98464, 98464, 98464, 98464, 98464]
+    median_allocs = 8
+    median_bytes = 98464
+    median_ns = 4757.0
+    min_ns = 4396.0
+    times_ns = [5638.0, 4726.0, 4597.0, 4747.0, 4807.0, 4396.0, 6829.0, 6369.0, 4526.0, 4767.0]
+[[eval_measurements]]
+implementation = "practical_bayes"
+mode = "primal"
+reason = "the pinned public API exposes no Reactant compilation boundary; no compiled comparator is invented"
+size = 4096
+state = "unsupported"
+variant = "reactant"
+[[eval_measurements]]
+implementation = "practical_bayes"
+mode = "gradient"
+parity_max_abs = 1.1102230246251565e-16
+size = 4096
+state = "supported"
+variant = "native"
+
+    [eval_measurements.result]
+    allocs = [18, 18, 18, 18, 18, 18, 18, 18, 18, 18]
+    bytes = [295344, 295344, 295344, 295344, 295344, 295344, 295344, 295344, 295344, 295344]
+    median_allocs = 18
+    median_bytes = 295344
+    median_ns = 30006.5
+    min_ns = 28299.0
+    times_ns = [31594.0, 29611.0, 28299.0, 30612.0, 30312.0, 29631.0, 34358.0, 29741.0, 30272.0, 29461.0]
+[[eval_measurements]]
+implementation = "practical_bayes"
+mode = "gradient"
+reason = "the pinned public API exposes no Reactant compilation boundary; no compiled comparator is invented"
+size = 4096
+state = "unsupported"
+variant = "reactant"
+[[eval_measurements]]
+implementation = "practical_bayes"
+mode = "gq"
+parity_max_abs = 0.0
+size = 4096
+state = "supported"
+variant = "native"
+
+    [eval_measurements.result]
+    allocs = [14, 14, 14, 14, 14, 14, 14, 14, 14, 14]
+    bytes = [98624, 98624, 98624, 98624, 98624, 98624, 98624, 98624, 98624, 98624]
+    median_allocs = 14
+    median_bytes = 98624
+    median_ns = 4956.5
+    min_ns = 4786.0
+    times_ns = [4896.0, 4787.0, 5016.0, 4997.0, 4786.0, 4916.0, 4896.0, 5077.0, 5047.0, 5177.0]
+[[eval_measurements]]
+implementation = "practical_bayes"
+mode = "gq"
+reason = "the pinned public API exposes no Reactant compilation boundary; no compiled comparator is invented"
+size = 4096
+state = "unsupported"
+variant = "reactant"
+
+[[model_measurements]]
+boundary = "packed_unconstrained"
+configuration = "practicalbayes_primal"
+differentiation = "primal"
+model = "centered"
+outcome = "joint"
+parity_max_abs = 7.105427357601002e-15
+provider = "practical_bayes"
+state = "supported"
+workload = "eight_schools"
+
+    [model_measurements.result]
+    allocs = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6]
+    bytes = [896, 896, 896, 896, 896, 896, 896, 896, 896, 896]
+    median_allocs = 6
+    median_bytes = 896
+    median_ns = 250.0
+    min_ns = 240.0
+    times_ns = [250.0, 400.0, 251.0, 250.0, 251.0, 250.0, 260.0, 240.0, 250.0, 250.0]
+[[model_measurements]]
+boundary = "packed_unconstrained"
+configuration = "practicalbayes_ad"
+differentiation = "value_and_gradient"
+model = "centered"
+outcome = "joint"
+parity_max_abs = 7.105427357601002e-15
+provider = "practical_bayes"
+state = "supported"
+workload = "eight_schools"
+
+    [model_measurements.result]
+    allocs = [21, 21, 21, 21, 21, 21, 21, 21, 21, 21]
+    bytes = [2336, 2336, 2336, 2336, 2336, 2336, 2336, 2336, 2336, 2336]
+    median_allocs = 21
+    median_bytes = 2336
+    median_ns = 2012.0
+    min_ns = 1922.0
+    times_ns = [1973.0, 2022.0, 2714.0, 1952.0, 2534.0, 2052.0, 1922.0, 1983.0, 2564.0, 2002.0]
+[[model_measurements]]
+boundary = "packed_unconstrained"
+configuration = "practicalbayes_primal"
+differentiation = "primal"
+model = "centered"
+outcome = "prior"
+provider = "practical_bayes"
+reason = "LogDensityFunction exposes the transformed full joint only; no public linked prior, likelihood, or pointwise view is exposed"
+state = "unsupported"
+workload = "eight_schools"
+[[model_measurements]]
+boundary = "packed_unconstrained"
+configuration = "practicalbayes_ad"
+differentiation = "value_and_gradient"
+model = "centered"
+outcome = "prior"
+provider = "practical_bayes"
+reason = "LogDensityFunction exposes the transformed full joint only; no public linked prior, likelihood, or pointwise view is exposed"
+state = "unsupported"
+workload = "eight_schools"
+[[model_measurements]]
+boundary = "packed_unconstrained"
+configuration = "practicalbayes_primal"
+differentiation = "primal"
+model = "centered"
+outcome = "likelihood"
+provider = "practical_bayes"
+reason = "LogDensityFunction exposes the transformed full joint only; no public linked prior, likelihood, or pointwise view is exposed"
+state = "unsupported"
+workload = "eight_schools"
+[[model_measurements]]
+boundary = "packed_unconstrained"
+configuration = "practicalbayes_ad"
+differentiation = "value_and_gradient"
+model = "centered"
+outcome = "likelihood"
+provider = "practical_bayes"
+reason = "LogDensityFunction exposes the transformed full joint only; no public linked prior, likelihood, or pointwise view is exposed"
+state = "unsupported"
+workload = "eight_schools"
+[[model_measurements]]
+boundary = "packed_unconstrained"
+configuration = "practicalbayes_primal"
+differentiation = "primal"
+model = "centered"
+outcome = "pointwise"
+provider = "practical_bayes"
+reason = "LogDensityFunction exposes the transformed full joint only; no public linked prior, likelihood, or pointwise view is exposed"
+state = "unsupported"
+workload = "eight_schools"
+[[model_measurements]]
+boundary = "packed_unconstrained"
+configuration = "practicalbayes_ad"
+differentiation = "value_and_gradient"
+model = "centered"
+outcome = "pointwise"
+provider = "practical_bayes"
+reason = "LogDensityFunction exposes the transformed full joint only; no public linked prior, likelihood, or pointwise view is exposed"
+state = "unsupported"
+workload = "eight_schools"
+[[model_measurements]]
+boundary = "constrained_parameters"
+configuration = "practicalbayes_primal"
+differentiation = "primal"
+model = "centered"
+outcome = "joint"
+parity_max_abs = 0.0
+provider = "practical_bayes"
+state = "supported"
+workload = "eight_schools"
+
+    [model_measurements.result]
+    allocs = [19, 19, 19, 19, 19, 19, 19, 19, 19, 19]
+    bytes = [1264, 1264, 1264, 1264, 1264, 1264, 1264, 1264, 1264, 1264]
+    median_allocs = 19
+    median_bytes = 1264
+    median_ns = 405.5
+    min_ns = 380.0
+    times_ns = [380.0, 410.0, 390.0, 401.0, 400.0, 410.0, 410.0, 651.0, 390.0, 440.0]
+[[model_measurements]]
+boundary = "constrained_parameters"
+configuration = "practicalbayes_ad"
+differentiation = "value_and_gradient"
+model = "centered"
+outcome = "joint"
+provider = "practical_bayes"
+reason = "the public prepared AD surface accepts the linked vector only; no constrained NamedTuple AD boundary is exposed"
+state = "unsupported"
+workload = "eight_schools"
+[[model_measurements]]
+boundary = "constrained_parameters"
+configuration = "practicalbayes_primal"
+differentiation = "primal"
+model = "centered"
+outcome = "prior"
+parity_max_abs = 0.0
+provider = "practical_bayes"
+state = "supported"
+workload = "eight_schools"
+
+    [model_measurements.result]
+    allocs = [19, 19, 19, 19, 19, 19, 19, 19, 19, 19]
+    bytes = [1264, 1264, 1264, 1264, 1264, 1264, 1264, 1264, 1264, 1264]
+    median_allocs = 19
+    median_bytes = 1264
+    median_ns = 400.5
+    min_ns = 400.0
+    times_ns = [400.0, 400.0, 401.0, 400.0, 410.0, 640.0, 591.0, 401.0, 400.0, 400.0]
+[[model_measurements]]
+boundary = "constrained_parameters"
+configuration = "practicalbayes_ad"
+differentiation = "value_and_gradient"
+model = "centered"
+outcome = "prior"
+provider = "practical_bayes"
+reason = "the public prepared AD surface accepts the linked vector only; no constrained NamedTuple AD boundary is exposed"
+state = "unsupported"
+workload = "eight_schools"
+[[model_measurements]]
+boundary = "constrained_parameters"
+configuration = "practicalbayes_primal"
+differentiation = "primal"
+model = "centered"
+outcome = "likelihood"
+parity_max_abs = 0.0
+provider = "practical_bayes"
+state = "supported"
+workload = "eight_schools"
+
+    [model_measurements.result]
+    allocs = [19, 19, 19, 19, 19, 19, 19, 19, 19, 19]
+    bytes = [1264, 1264, 1264, 1264, 1264, 1264, 1264, 1264, 1264, 1264]
+    median_allocs = 19
+    median_bytes = 1264
+    median_ns = 410.0
+    min_ns = 400.0
+    times_ns = [410.0, 401.0, 410.0, 410.0, 911.0, 411.0, 400.0, 671.0, 401.0, 401.0]
+[[model_measurements]]
+boundary = "constrained_parameters"
+configuration = "practicalbayes_ad"
+differentiation = "value_and_gradient"
+model = "centered"
+outcome = "likelihood"
+provider = "practical_bayes"
+reason = "the public prepared AD surface accepts the linked vector only; no constrained NamedTuple AD boundary is exposed"
+state = "unsupported"
+workload = "eight_schools"
+[[model_measurements]]
+boundary = "constrained_parameters"
+configuration = "practicalbayes_primal"
+differentiation = "primal"
+model = "centered"
+outcome = "pointwise"
+parity_max_abs = 4.440892098500626e-16
+provider = "practical_bayes"
+state = "supported"
+workload = "eight_schools"
+
+    [model_measurements.result]
+    allocs = [12, 12, 12, 12, 12, 12, 12, 12, 12, 12]
+    bytes = [1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024]
+    median_allocs = 12
+    median_bytes = 1024
+    median_ns = 350.0
+    min_ns = 340.0
+    times_ns = [540.0, 541.0, 340.0, 531.0, 341.0, 350.0, 350.0, 350.0, 341.0, 350.0]
+[[model_measurements]]
+boundary = "constrained_parameters"
+configuration = "practicalbayes_ad"
+differentiation = "value_and_gradient"
+model = "centered"
+outcome = "pointwise"
+provider = "practical_bayes"
+reason = "the public prepared AD surface accepts the linked vector only; no constrained NamedTuple AD boundary is exposed"
+state = "unsupported"
+workload = "eight_schools"
+[[model_measurements]]
+boundary = "minimal_likelihood"
+configuration = "practicalbayes_primal"
+differentiation = "primal"
+model = "centered"
+outcome = "joint"
+provider = "practical_bayes"
+reason = "the public model evaluator requires the complete named parameter set; no theta-only likelihood boundary is exposed"
+state = "unsupported"
+workload = "eight_schools"
+[[model_measurements]]
+boundary = "minimal_likelihood"
+configuration = "practicalbayes_ad"
+differentiation = "value_and_gradient"
+model = "centered"
+outcome = "joint"
+provider = "practical_bayes"
+reason = "the public model evaluator requires the complete named parameter set; no theta-only likelihood boundary is exposed"
+state = "unsupported"
+workload = "eight_schools"
+[[model_measurements]]
+boundary = "minimal_likelihood"
+configuration = "practicalbayes_primal"
+differentiation = "primal"
+model = "centered"
+outcome = "prior"
+provider = "practical_bayes"
+reason = "the public model evaluator requires the complete named parameter set; no theta-only likelihood boundary is exposed"
+state = "unsupported"
+workload = "eight_schools"
+[[model_measurements]]
+boundary = "minimal_likelihood"
+configuration = "practicalbayes_ad"
+differentiation = "value_and_gradient"
+model = "centered"
+outcome = "prior"
+provider = "practical_bayes"
+reason = "the public model evaluator requires the complete named parameter set; no theta-only likelihood boundary is exposed"
+state = "unsupported"
+workload = "eight_schools"
+[[model_measurements]]
+boundary = "minimal_likelihood"
+configuration = "practicalbayes_primal"
+differentiation = "primal"
+model = "centered"
+outcome = "likelihood"
+provider = "practical_bayes"
+reason = "the public model evaluator requires the complete named parameter set; no theta-only likelihood boundary is exposed"
+state = "unsupported"
+workload = "eight_schools"
+[[model_measurements]]
+boundary = "minimal_likelihood"
+configuration = "practicalbayes_ad"
+differentiation = "value_and_gradient"
+model = "centered"
+outcome = "likelihood"
+provider = "practical_bayes"
+reason = "the public model evaluator requires the complete named parameter set; no theta-only likelihood boundary is exposed"
+state = "unsupported"
+workload = "eight_schools"
+[[model_measurements]]
+boundary = "minimal_likelihood"
+configuration = "practicalbayes_primal"
+differentiation = "primal"
+model = "centered"
+outcome = "pointwise"
+provider = "practical_bayes"
+reason = "the public model evaluator requires the complete named parameter set; no theta-only likelihood boundary is exposed"
+state = "unsupported"
+workload = "eight_schools"
+[[model_measurements]]
+boundary = "minimal_likelihood"
+configuration = "practicalbayes_ad"
+differentiation = "value_and_gradient"
+model = "centered"
+outcome = "pointwise"
+provider = "practical_bayes"
+reason = "the public model evaluator requires the complete named parameter set; no theta-only likelihood boundary is exposed"
+state = "unsupported"
+workload = "eight_schools"
+[[model_measurements]]
+boundary = "packed_unconstrained"
+configuration = "practicalbayes_idiomatic_primal"
+differentiation = "primal"
+model = "idiomatic"
+outcome = "joint"
+parity_max_abs = 0.0
+provider = "practical_bayes"
+state = "supported"
+workload = "mnist_logistic"
+
+    [model_measurements.result]
+    allocs = [120022, 120022, 120022, 120022, 120022, 120022, 120022, 120022, 120022, 120022]
+    bytes = [38033920, 38033920, 38033920, 38033920, 38033920, 38033920, 38033920, 38033920, 38033920, 38033920]
+    median_allocs = 120022
+    median_bytes = 38033920
+    median_ns = 6.586579e7
+    min_ns = 5.7930396e7
+    times_ns = [5.7930396e7, 6.7028619e7, 6.5734354e7, 6.2671096e7, 6.0915474e7, 6.7680219e7, 6.3493812e7, 6.8381637e7, 6.5997226e7, 6.7179337e7]
+[[model_measurements]]
+boundary = "packed_unconstrained"
+configuration = "practicalbayes_idiomatic_ad"
+differentiation = "value_and_gradient"
+model = "idiomatic"
+outcome = "joint"
+parity_max_abs = 3.4924596548080444e-10
+provider = "practical_bayes"
+state = "supported"
+workload = "mnist_logistic"
+
+    [model_measurements.result]
+    allocs = [240109, 240109, 240109, 240109, 240109, 240109, 240109, 240109, 240109, 240109]
+    bytes = [113569840, 113569840, 113569840, 113569840, 113569840, 113569840, 113569840, 113569840, 113569840, 113569840]
+    median_allocs = 240109
+    median_bytes = 113569840
+    median_ns = 3.420602535e8
+    min_ns = 3.29510688e8
+    times_ns = [3.37093511e8, 3.53902234e8, 3.56708266e8, 3.33434021e8, 3.44212603e8, 3.43546264e8, 3.29510688e8, 3.40574243e8, 3.38335074e8, 3.64411946e8]
+[[model_measurements]]
+boundary = "packed_unconstrained"
+configuration = "practicalbayes_idiomatic_primal"
+differentiation = "primal"
+model = "idiomatic"
+outcome = "prior"
+provider = "practical_bayes"
+reason = "LogDensityFunction exposes the full joint only; no public packed prior, likelihood, or pointwise view is exposed"
+state = "unsupported"
+workload = "mnist_logistic"
+[[model_measurements]]
+boundary = "packed_unconstrained"
+configuration = "practicalbayes_idiomatic_ad"
+differentiation = "value_and_gradient"
+model = "idiomatic"
+outcome = "prior"
+provider = "practical_bayes"
+reason = "LogDensityFunction exposes the full joint only; no public packed prior, likelihood, or pointwise view is exposed"
+state = "unsupported"
+workload = "mnist_logistic"
+[[model_measurements]]
+boundary = "packed_unconstrained"
+configuration = "practicalbayes_idiomatic_primal"
+differentiation = "primal"
+model = "idiomatic"
+outcome = "likelihood"
+provider = "practical_bayes"
+reason = "LogDensityFunction exposes the full joint only; no public packed prior, likelihood, or pointwise view is exposed"
+state = "unsupported"
+workload = "mnist_logistic"
+[[model_measurements]]
+boundary = "packed_unconstrained"
+configuration = "practicalbayes_idiomatic_ad"
+differentiation = "value_and_gradient"
+model = "idiomatic"
+outcome = "likelihood"
+provider = "practical_bayes"
+reason = "LogDensityFunction exposes the full joint only; no public packed prior, likelihood, or pointwise view is exposed"
+state = "unsupported"
+workload = "mnist_logistic"
+[[model_measurements]]
+boundary = "packed_unconstrained"
+configuration = "practicalbayes_idiomatic_primal"
+differentiation = "primal"
+model = "idiomatic"
+outcome = "pointwise"
+provider = "practical_bayes"
+reason = "LogDensityFunction exposes the full joint only; no public packed prior, likelihood, or pointwise view is exposed"
+state = "unsupported"
+workload = "mnist_logistic"
+[[model_measurements]]
+boundary = "packed_unconstrained"
+configuration = "practicalbayes_idiomatic_ad"
+differentiation = "value_and_gradient"
+model = "idiomatic"
+outcome = "pointwise"
+provider = "practical_bayes"
+reason = "LogDensityFunction exposes the full joint only; no public packed prior, likelihood, or pointwise view is exposed"
+state = "unsupported"
+workload = "mnist_logistic"
+[[model_measurements]]
+boundary = "structured_parameters"
+configuration = "practicalbayes_idiomatic_primal"
+differentiation = "primal"
+model = "idiomatic"
+outcome = "joint"
+parity_max_abs = 0.0
+provider = "practical_bayes"
+state = "supported"
+workload = "mnist_logistic"
+
+    [model_measurements.result]
+    allocs = [120032, 120032, 120032, 120032, 120032, 120032, 120032, 120032, 120032, 120032]
+    bytes = [38034208, 38034208, 38034208, 38034208, 38034208, 38034208, 38034208, 38034208, 38034208, 38034208]
+    median_allocs = 120032
+    median_bytes = 38034208
+    median_ns = 6.8257024e7
+    min_ns = 6.1873246e7
+    times_ns = [6.1873246e7, 6.7013059e7, 6.8209458e7, 6.3482727e7, 6.9973854e7, 6.3550741e7, 7.1947657e7, 6.9842072e7, 6.830459e7, 6.9037132e7]
+[[model_measurements]]
+boundary = "structured_parameters"
+configuration = "practicalbayes_idiomatic_ad"
+differentiation = "value_and_gradient"
+model = "idiomatic"
+outcome = "joint"
+provider = "practical_bayes"
+reason = "the public prepared AD surface accepts the packed vector only; no structured (W, b) AD boundary is exposed"
+state = "unsupported"
+workload = "mnist_logistic"
+[[model_measurements]]
+boundary = "structured_parameters"
+configuration = "practicalbayes_idiomatic_primal"
+differentiation = "primal"
+model = "idiomatic"
+outcome = "prior"
+parity_max_abs = 1.4551915228366852e-11
+provider = "practical_bayes"
+state = "supported"
+workload = "mnist_logistic"
+
+    [model_measurements.result]
+    allocs = [120032, 120032, 120032, 120032, 120032, 120032, 120032, 120032, 120032, 120032]
+    bytes = [38034208, 38034208, 38034208, 38034208, 38034208, 38034208, 38034208, 38034208, 38034208, 38034208]
+    median_allocs = 120032
+    median_bytes = 38034208
+    median_ns = 6.7118379e7
+    min_ns = 6.4037112e7
+    times_ns = [7.1031093e7, 7.1291051e7, 6.7960526e7, 6.5667592e7, 6.736878e7, 6.8376619e7, 6.4037112e7, 6.5231661e7, 6.6443463e7, 6.6867978e7]
+[[model_measurements]]
+boundary = "structured_parameters"
+configuration = "practicalbayes_idiomatic_ad"
+differentiation = "value_and_gradient"
+model = "idiomatic"
+outcome = "prior"
+provider = "practical_bayes"
+reason = "the public prepared AD surface accepts the packed vector only; no structured (W, b) AD boundary is exposed"
+state = "unsupported"
+workload = "mnist_logistic"
+[[model_measurements]]
+boundary = "structured_parameters"
+configuration = "practicalbayes_idiomatic_primal"
+differentiation = "primal"
+model = "idiomatic"
+outcome = "likelihood"
+parity_max_abs = 0.0
+provider = "practical_bayes"
+state = "supported"
+workload = "mnist_logistic"
+
+    [model_measurements.result]
+    allocs = [120032, 120032, 120032, 120032, 120032, 120032, 120032, 120032, 120032, 120032]
+    bytes = [38034208, 38034208, 38034208, 38034208, 38034208, 38034208, 38034208, 38034208, 38034208, 38034208]
+    median_allocs = 120032
+    median_bytes = 38034208
+    median_ns = 6.5862501e7
+    min_ns = 6.1333712e7
+    times_ns = [6.653646e7, 6.5682212e7, 6.1333712e7, 6.8824297e7, 6.8493692e7, 6.3595072e7, 6.604279e7, 6.7144691e7, 6.4999421e7, 6.4340931e7]
+[[model_measurements]]
+boundary = "structured_parameters"
+configuration = "practicalbayes_idiomatic_ad"
+differentiation = "value_and_gradient"
+model = "idiomatic"
+outcome = "likelihood"
+provider = "practical_bayes"
+reason = "the public prepared AD surface accepts the packed vector only; no structured (W, b) AD boundary is exposed"
+state = "unsupported"
+workload = "mnist_logistic"
+[[model_measurements]]
+boundary = "structured_parameters"
+configuration = "practicalbayes_idiomatic_primal"
+differentiation = "primal"
+model = "idiomatic"
+outcome = "pointwise"
+parity_max_abs = 8.881784197001252e-16
+provider = "practical_bayes"
+state = "supported"
+workload = "mnist_logistic"
+
+    [model_measurements.result]
+    allocs = [120028, 120028, 120028, 120028, 120028, 120028, 120028, 120028, 120028, 120028]
+    bytes = [38034032, 38034032, 38034032, 38034032, 38034032, 38034032, 38034032, 38034032, 38034032, 38034032]
+    median_allocs = 120028
+    median_bytes = 38034032
+    median_ns = 6.97668875e7
+    min_ns = 6.2240483e7
+    times_ns = [6.2240483e7, 7.5538963e7, 7.7388795e7, 6.8666489e7, 6.8803239e7, 6.9013919e7, 7.0519856e7, 7.7729886e7, 6.8970459e7, 7.1175763e7]
+[[model_measurements]]
+boundary = "structured_parameters"
+configuration = "practicalbayes_idiomatic_ad"
+differentiation = "value_and_gradient"
+model = "idiomatic"
+outcome = "pointwise"
+provider = "practical_bayes"
+reason = "the public prepared AD surface accepts the packed vector only; no structured (W, b) AD boundary is exposed"
+state = "unsupported"
+workload = "mnist_logistic"
+[[model_measurements]]
+boundary = "packed_unconstrained"
+configuration = "practicalbayes_vcat_free_primal"
+differentiation = "primal"
+model = "vcat_free"
+outcome = "joint"
+parity_max_abs = 1.1641532182693481e-9
+provider = "practical_bayes"
+state = "supported"
+workload = "mnist_logistic"
+
+    [model_measurements.result]
+    allocs = [10, 10, 10, 10, 10, 10, 10, 10, 10, 10]
+    bytes = [8753632, 8753632, 8753632, 8753632, 8753632, 8753632, 8753632, 8753632, 8753632, 8753632]
+    median_allocs = 10
+    median_bytes = 8753632
+    median_ns = 5.3017802e7
+    min_ns = 5.0550592e7
+    times_ns = [5.727394e7, 5.3721578e7, 5.373712e7, 5.1524036e7, 5.0550592e7, 5.3247364e7, 5.278824e7, 5.1767572e7, 5.2209603e7, 5.3714228e7]
+[[model_measurements]]
+boundary = "packed_unconstrained"
+configuration = "practicalbayes_vcat_free_ad"
+differentiation = "value_and_gradient"
+model = "vcat_free"
+outcome = "joint"
+parity_max_abs = 1.1641532182693481e-9
+provider = "practical_bayes"
+state = "supported"
+workload = "mnist_logistic"
+
+    [model_measurements.result]
+    allocs = [36, 36, 36, 36, 36, 36, 36, 36, 36, 36]
+    bytes = [42524720, 42524720, 42524720, 42524720, 42524720, 42524720, 42524720, 42524720, 42524720, 42524720]
+    median_allocs = 36
+    median_bytes = 42524720
+    median_ns = 2.98094127e8
+    min_ns = 2.82640854e8
+    times_ns = [2.95624599e8, 3.45616421e8, 3.50218751e8, 3.00563655e8, 2.82640854e8, 2.94888483e8, 2.89112144e8, 2.94322783e8, 3.10934606e8, 3.09311656e8]
+[[model_measurements]]
+boundary = "packed_unconstrained"
+configuration = "practicalbayes_vcat_free_primal"
+differentiation = "primal"
+model = "vcat_free"
+outcome = "prior"
+provider = "practical_bayes"
+reason = "LogDensityFunction exposes the full joint only; no public packed prior, likelihood, or pointwise view is exposed"
+state = "unsupported"
+workload = "mnist_logistic"
+[[model_measurements]]
+boundary = "packed_unconstrained"
+configuration = "practicalbayes_vcat_free_ad"
+differentiation = "value_and_gradient"
+model = "vcat_free"
+outcome = "prior"
+provider = "practical_bayes"
+reason = "LogDensityFunction exposes the full joint only; no public packed prior, likelihood, or pointwise view is exposed"
+state = "unsupported"
+workload = "mnist_logistic"
+[[model_measurements]]
+boundary = "packed_unconstrained"
+configuration = "practicalbayes_vcat_free_primal"
+differentiation = "primal"
+model = "vcat_free"
+outcome = "likelihood"
+provider = "practical_bayes"
+reason = "LogDensityFunction exposes the full joint only; no public packed prior, likelihood, or pointwise view is exposed"
+state = "unsupported"
+workload = "mnist_logistic"
+[[model_measurements]]
+boundary = "packed_unconstrained"
+configuration = "practicalbayes_vcat_free_ad"
+differentiation = "value_and_gradient"
+model = "vcat_free"
+outcome = "likelihood"
+provider = "practical_bayes"
+reason = "LogDensityFunction exposes the full joint only; no public packed prior, likelihood, or pointwise view is exposed"
+state = "unsupported"
+workload = "mnist_logistic"
+[[model_measurements]]
+boundary = "packed_unconstrained"
+configuration = "practicalbayes_vcat_free_primal"
+differentiation = "primal"
+model = "vcat_free"
+outcome = "pointwise"
+provider = "practical_bayes"
+reason = "LogDensityFunction exposes the full joint only; no public packed prior, likelihood, or pointwise view is exposed"
+state = "unsupported"
+workload = "mnist_logistic"
+[[model_measurements]]
+boundary = "packed_unconstrained"
+configuration = "practicalbayes_vcat_free_ad"
+differentiation = "value_and_gradient"
+model = "vcat_free"
+outcome = "pointwise"
+provider = "practical_bayes"
+reason = "LogDensityFunction exposes the full joint only; no public packed prior, likelihood, or pointwise view is exposed"
+state = "unsupported"
+workload = "mnist_logistic"
+[[model_measurements]]
+boundary = "structured_parameters"
+configuration = "practicalbayes_vcat_free_primal"
+differentiation = "primal"
+model = "vcat_free"
+outcome = "joint"
+parity_max_abs = 1.1641532182693481e-9
+provider = "practical_bayes"
+state = "supported"
+workload = "mnist_logistic"
+
+    [model_measurements.result]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [8753920, 8753920, 8753920, 8753920, 8753920, 8753920, 8753920, 8753920, 8753920, 8753920]
+    median_allocs = 20
+    median_bytes = 8753920
+    median_ns = 5.56735065e7
+    min_ns = 5.3561437e7
+    times_ns = [5.3748115e7, 5.4923236e7, 5.5665821e7, 5.8371204e7, 5.3561437e7, 5.9254093e7, 6.2770414e7, 5.7738171e7, 5.5681192e7, 5.5154586e7]
+[[model_measurements]]
+boundary = "structured_parameters"
+configuration = "practicalbayes_vcat_free_ad"
+differentiation = "value_and_gradient"
+model = "vcat_free"
+outcome = "joint"
+provider = "practical_bayes"
+reason = "the public prepared AD surface accepts the packed vector only; no structured (W, b) AD boundary is exposed"
+state = "unsupported"
+workload = "mnist_logistic"
+[[model_measurements]]
+boundary = "structured_parameters"
+configuration = "practicalbayes_vcat_free_primal"
+differentiation = "primal"
+model = "vcat_free"
+outcome = "prior"
+parity_max_abs = 1.4551915228366852e-11
+provider = "practical_bayes"
+state = "supported"
+workload = "mnist_logistic"
+
+    [model_measurements.result]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [8753920, 8753920, 8753920, 8753920, 8753920, 8753920, 8753920, 8753920, 8753920, 8753920]
+    median_allocs = 20
+    median_bytes = 8753920
+    median_ns = 5.593745e7
+    min_ns = 5.1830239e7
+    times_ns = [5.6353459e7, 5.5521441e7, 5.7827884e7, 5.4536312e7, 5.7118826e7, 5.1830239e7, 5.9221277e7, 7.0742113e7, 5.3238141e7, 5.4952737e7]
+[[model_measurements]]
+boundary = "structured_parameters"
+configuration = "practicalbayes_vcat_free_ad"
+differentiation = "value_and_gradient"
+model = "vcat_free"
+outcome = "prior"
+provider = "practical_bayes"
+reason = "the public prepared AD surface accepts the packed vector only; no structured (W, b) AD boundary is exposed"
+state = "unsupported"
+workload = "mnist_logistic"
+[[model_measurements]]
+boundary = "structured_parameters"
+configuration = "practicalbayes_vcat_free_primal"
+differentiation = "primal"
+model = "vcat_free"
+outcome = "likelihood"
+parity_max_abs = 1.1641532182693481e-9
+provider = "practical_bayes"
+state = "supported"
+workload = "mnist_logistic"
+
+    [model_measurements.result]
+    allocs = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+    bytes = [8753920, 8753920, 8753920, 8753920, 8753920, 8753920, 8753920, 8753920, 8753920, 8753920]
+    median_allocs = 20
+    median_bytes = 8753920
+    median_ns = 5.40397675e7
+    min_ns = 5.1451786e7
+    times_ns = [5.6209041e7, 5.4111898e7, 5.1681793e7, 6.1896669e7, 5.4980706e7, 5.3967637e7, 5.9843535e7, 5.2213777e7, 5.1634328e7, 5.1451786e7]
+[[model_measurements]]
+boundary = "structured_parameters"
+configuration = "practicalbayes_vcat_free_ad"
+differentiation = "value_and_gradient"
+model = "vcat_free"
+outcome = "likelihood"
+provider = "practical_bayes"
+reason = "the public prepared AD surface accepts the packed vector only; no structured (W, b) AD boundary is exposed"
+state = "unsupported"
+workload = "mnist_logistic"
+[[model_measurements]]
+boundary = "structured_parameters"
+configuration = "practicalbayes_vcat_free_primal"
+diagnostic = "MethodError: reducing over an empty collection is not allowed; consider supplying `init` to the reducer"
+differentiation = "primal"
+model = "vcat_free"
+outcome = "pointwise"
+provider = "practical_bayes"
+reason = "the optimized model accumulates one scalar @addlogprob! likelihood, so the public pointwise accessor has no observation-site vector"
+state = "unsupported"
+workload = "mnist_logistic"
+[[model_measurements]]
+boundary = "structured_parameters"
+configuration = "practicalbayes_vcat_free_ad"
+differentiation = "value_and_gradient"
+model = "vcat_free"
+outcome = "pointwise"
+provider = "practical_bayes"
+reason = "the public prepared AD surface accepts the packed vector only; no structured (W, b) AD boundary is exposed"
+state = "unsupported"
+workload = "mnist_logistic"
+
+[pins]
+adtypes_version = "1.24.0"
+benchmark_body_sha256 = "d68eeb47946d88c253c13c95129053bd2439035f67036f690657d7589c4e7182"
+benchmarktools_version = "1.6.3"
+distributions_version = "0.25.131"
+enzyme_version = "0.13.199"
+julia_version = "1.10.11"
+logdensityproblems_version = "2.2.0"
+mldatasets_version = "0.7.21"
+nnlib_version = "0.9.45"
+practicalbayes_git_revision = "c6b340baef4f4a9e3d26cd0ea5082a2baf26dcf9"
+practicalbayes_repository = "https://github.com/EvoArt/PracticalBayes.git"
+practicalbayes_revision = "c6b340baef4f4a9e3d26cd0ea5082a2baf26dcf9"
+practicalbayes_version = "0.1.0"
+reactivekernels_dirty = false
+reactivekernels_sha = "d059429300ddecb5623a6ee92604c051a0091f77"
+
+[[preparations]]
+ad_first_call_seconds = 26.665526002
+ad_prepare_seconds = 0.006426209
+layout_seconds = 0.061296676
+model = "centered"
+primal_first_call_seconds = 0.153499993
+primal_prepare_seconds = 0.007337355
+workload = "eight_schools"
+[[preparations]]
+ad_first_call_seconds = 76.556533215
+ad_prepare_seconds = 0.009800193
+layout_seconds = 0.080259457
+model = "idiomatic"
+primal_first_call_seconds = 0.369747739
+primal_prepare_seconds = 0.007001801
+workload = "mnist_logistic"
+[[preparations]]
+ad_first_call_seconds = 21.008733994
+ad_prepare_seconds = 0.007805611
+layout_seconds = 0.054784635
+model = "vcat_free"
+primal_first_call_seconds = 0.295133642
+primal_prepare_seconds = 0.009757403
+workload = "mnist_logistic"
+[[preparations]]
+ad_first_call_seconds = 6.950724922
+ad_prepare_seconds = 0.0061023
+layout_seconds = 0.00534091
+model = "iid_normal_n_16"
+primal_first_call_seconds = 0.17054638
+primal_prepare_seconds = 0.007262491
+workload = "eval_throughput"
+[[preparations]]
+ad_first_call_seconds = 3.9774e-5
+ad_prepare_seconds = 3.065e-6
+layout_seconds = 4.4281e-5
+model = "iid_normal_n_256"
+primal_first_call_seconds = 5.057e-6
+primal_prepare_seconds = 4.756e-6
+workload = "eval_throughput"
+[[preparations]]
+ad_first_call_seconds = 7.1338e-5
+ad_prepare_seconds = 3.464e-6
+layout_seconds = 5.3595e-5
+model = "iid_normal_n_4096"
+primal_first_call_seconds = 8.212e-6
+primal_prepare_seconds = 5.477e-6
+workload = "eval_throughput"
+
+[protocol]
+deterministic_seeds = true
+differentiation = ["primal", "value_and_gradient"]
+estimator = "minimum of each BenchmarkTools round; min, median, raw times, bytes, and allocations retained"
+eval_modes = ["primal", "gradient", "gq"]
+eval_sizes = [16, 256, 4096]
+gradient_backend = "ADTypes.AutoEnzyme with Enzyme reverse runtime activity"
+julia_threads = 1
+mnist_full_observations = 60000
+model_matrix = ["eight_schools", "mnist_logistic"]
+model_outcomes = ["joint", "prior", "likelihood", "pointwise"]
+parity_gate = "closed-form/manual value and analytic gradient before timing; rtol/atol 1e-8 or tighter"
+precision = "Float64 parameters and data"
+preparation_in_timed_region = false
+rounds = 10
+samples_per_round = 20
+sections = ["models", "eval"]
+setup_in_timed_region = false
+unsupported_cells_recorded = true
+warmup_in_timed_region = false
+
+    [protocol.model_boundaries]
+    eight_schools = ["packed_unconstrained", "constrained_parameters", "minimal_likelihood"]
+    mnist_logistic = ["packed_unconstrained", "structured_parameters"]

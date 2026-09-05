@@ -32,6 +32,14 @@ const MNIST_COMPARATORS = (
      model = "vcat_free", differentiation = "primal"),
     (id = "turing_vcat_free_ad", provider = "turing",
      model = "vcat_free", differentiation = "value_and_gradient"),
+    (id = "practicalbayes_idiomatic_primal", provider = "practical_bayes",
+     model = "idiomatic", differentiation = "primal"),
+    (id = "practicalbayes_idiomatic_ad", provider = "practical_bayes",
+     model = "idiomatic", differentiation = "value_and_gradient"),
+    (id = "practicalbayes_vcat_free_primal", provider = "practical_bayes",
+     model = "vcat_free", differentiation = "primal"),
+    (id = "practicalbayes_vcat_free_ad", provider = "practical_bayes",
+     model = "vcat_free", differentiation = "value_and_gradient"),
 )
 
 """

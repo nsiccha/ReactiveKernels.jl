@@ -27,6 +27,10 @@ code is not executed by the docs build.
 ## Current boundary
 
 - Prepared scalar kernels and tensorized distribution plates are accepted.
+- A plate with at most 16 static lanes lowers as per-lane scalar recipes with
+  a scalar reduction, so a small posterior fuses into one CPU kernel; larger
+  plates keep the batched lowering. The automatic AD compile keeps bound
+  arrays of at most 4096 elements embedded as compiler literals.
 - Whole-kernel `replica` preserves the scalar kernel as its source authority.
 - Compiled AD reuses the native single-active-port, scalar-WANT validation.
 - Unsupported scalar indexing, unbounded control, or structural state rejects;

@@ -1,4 +1,4 @@
-generated_at = "2026-09-02T10:58:41.731Z"
+generated_at = "2026-09-05T11:29:51.675Z"
 schema = "mnist-reactant-v2"
 
 [environment]
@@ -12,16 +12,16 @@ reactant_backend = "default CPU"
 boundary = "packed_unconstrained"
 configuration = "primal_reactant"
 description = "full joint over the selected parameter boundary"
-kernel_preparation_seconds = 1.329091402
+kernel_preparation_seconds = 1.094193467
 max_abs_error = 1.1059455573558807e-9
 max_rel_error = 7.607777022886003e-15
 model = "idiomatic"
 outcome = "joint"
 provider = "rk"
-reactant_compile_seconds = 26.976918169
+reactant_compile_seconds = 28.29635369
 reactant_externalized_bound_array_count = 0
-reactant_first_execution_seconds = 0.268783522
-reactant_transfer_seconds = 0.419371553
+reactant_first_execution_seconds = 0.283830477
+reactant_transfer_seconds = 0.504421086
 state = "supported"
 
     [measurements.native_control]
@@ -29,32 +29,32 @@ state = "supported"
     bytes = [13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320]
     median_allocs = 9
     median_bytes = 13920320
-    median_ns = 6.3255458e7
-    min_ns = 5.3287735e7
-    times_ns = [7.0000586e7, 7.468104e7, 6.2468448e7, 6.4042468e7, 6.7590212e7, 6.1348843e7, 6.5662473e7, 6.162222e7, 5.3287735e7, 5.6251243e7]
+    median_ns = 1.205774705e8
+    min_ns = 8.671031e7
+    times_ns = [1.26186111e8, 2.0273794e8, 2.02414816e8, 8.671031e7, 1.47246515e8, 1.02878213e8, 1.0069502e8, 1.08215469e8, 1.1496883e8, 1.26376674e8]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 1.60377775e7
-    min_ns = 1.2907615e7
-    times_ns = [1.7592378e7, 1.7338868e7, 1.8986841e7, 2.2130717e7, 1.5889879e7, 1.6185676e7, 1.4980846e7, 1.2907615e7, 1.4720986e7, 1.4271887e7]
+    median_ns = 3.26143805e7
+    min_ns = 2.120898e7
+    times_ns = [3.0814947e7, 3.4050072e7, 4.8883255e7, 6.2114945e7, 4.1560168e7, 4.9365459e7, 2.9443375e7, 2.140497e7, 2.120898e7, 3.1178689e7]
 [[measurements]]
 boundary = "packed_unconstrained"
 configuration = "primal_reactant"
 description = "standard-normal coefficient log prior"
-kernel_preparation_seconds = 0.126470975
+kernel_preparation_seconds = 0.137558896
 max_abs_error = 1.7280399333685637e-11
 max_rel_error = 2.6615325236043355e-15
 model = "idiomatic"
 outcome = "prior"
 provider = "rk"
-reactant_compile_seconds = 2.016273672
+reactant_compile_seconds = 2.146209235
 reactant_externalized_bound_array_count = 0
-reactant_first_execution_seconds = 0.039498354
-reactant_transfer_seconds = 0.006284808
+reactant_first_execution_seconds = 0.04504047
+reactant_transfer_seconds = 0.006396849
 state = "supported"
 
     [measurements.native_control]
@@ -62,32 +62,32 @@ state = "supported"
     bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     median_allocs = 0
     median_bytes = 0
-    median_ns = 3284.5
-    min_ns = 3254.0
-    times_ns = [3284.0, 3364.0, 3304.0, 3274.0, 3324.0, 3254.0, 3264.0, 3324.0, 3284.0, 3285.0]
+    median_ns = 3379.0
+    min_ns = 3334.0
+    times_ns = [3394.0, 3434.0, 3354.0, 3334.0, 3364.0, 3355.0, 3384.0, 3445.0, 3484.0, 3374.0]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 8487.0
-    min_ns = 6289.0
-    times_ns = [6289.0, 8572.0, 9313.0, 9823.0, 8692.0, 7330.0, 6850.0, 8402.0, 6349.0, 9062.0]
+    median_ns = 11301.0
+    min_ns = 9283.0
+    times_ns = [12117.0, 10275.0, 9873.0, 14310.0, 10946.0, 10574.0, 11656.0, 12247.0, 9283.0, 11796.0]
 [[measurements]]
 boundary = "packed_unconstrained"
 configuration = "primal_reactant"
 description = "summed softmax categorical log likelihood"
-kernel_preparation_seconds = 0.092341026
+kernel_preparation_seconds = 0.089264214
 max_abs_error = 1.1059455573558807e-9
 max_rel_error = 7.96344692353622e-15
 model = "idiomatic"
 outcome = "likelihood"
 provider = "rk"
-reactant_compile_seconds = 1.96701201
+reactant_compile_seconds = 2.208721659
 reactant_externalized_bound_array_count = 0
-reactant_first_execution_seconds = 0.037993829
-reactant_transfer_seconds = 0.189410373
+reactant_first_execution_seconds = 0.047398064
+reactant_transfer_seconds = 0.229181967
 state = "supported"
 
     [measurements.native_control]
@@ -95,32 +95,32 @@ state = "supported"
     bytes = [13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320]
     median_allocs = 9
     median_bytes = 13920320
-    median_ns = 5.71971185e7
-    min_ns = 5.2078408e7
-    times_ns = [6.5277534e7, 6.2501786e7, 7.3043768e7, 5.6874834e7, 5.5122517e7, 5.5760707e7, 5.9034312e7, 5.7519403e7, 5.2078408e7, 5.6077964e7]
+    median_ns = 7.56032255e7
+    min_ns = 5.2890014e7
+    times_ns = [8.1140452e7, 7.7050478e7, 9.3077437e7, 9.4523362e7, 6.5750342e7, 7.4155973e7, 9.2718261e7, 5.2890014e7, 5.6960601e7, 5.9190369e7]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 1.59636455e7
-    min_ns = 1.3507351e7
-    times_ns = [1.3507351e7, 1.512933e7, 1.6490127e7, 1.6821844e7, 1.4800807e7, 1.7027168e7, 1.5437164e7, 1.679017e7, 1.6903827e7, 1.5022322e7]
+    median_ns = 2.56414985e7
+    min_ns = 2.023093e7
+    times_ns = [2.445411e7, 2.6828887e7, 3.0358669e7, 2.7063952e7, 3.1492463e7, 2.9191969e7, 2.2633516e7, 2.023093e7, 2.1356924e7, 2.2639134e7]
 [[measurements]]
 boundary = "packed_unconstrained"
 configuration = "primal_reactant"
 description = "per-observation softmax categorical log likelihoods"
-kernel_preparation_seconds = 0.2410964
+kernel_preparation_seconds = 0.096211712
 max_abs_error = 1.3322676295501878e-15
 max_rel_error = 6.004612810565379e-16
 model = "idiomatic"
 outcome = "pointwise"
 provider = "rk"
-reactant_compile_seconds = 2.093246028
+reactant_compile_seconds = 2.812185615
 reactant_externalized_bound_array_count = 0
-reactant_first_execution_seconds = 0.039681106
-reactant_transfer_seconds = 0.174425073
+reactant_first_execution_seconds = 0.076049176
+reactant_transfer_seconds = 0.310256088
 state = "supported"
 
     [measurements.native_control]
@@ -128,32 +128,32 @@ state = "supported"
     bytes = [14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368]
     median_allocs = 11
     median_bytes = 14400368
-    median_ns = 5.28114385e7
-    min_ns = 5.1037622e7
-    times_ns = [5.6442617e7, 5.2995081e7, 5.1938053e7, 5.6017781e7, 5.1037622e7, 5.2736065e7, 5.1253459e7, 5.2880293e7, 5.2742584e7, 5.7115166e7]
+    median_ns = 7.31413835e7
+    min_ns = 6.0405165e7
+    times_ns = [7.4623389e7, 6.2921799e7, 6.0405165e7, 6.1071025e7, 8.8441439e7, 6.2171093e7, 8.5730157e7, 7.8511524e7, 7.1659378e7, 1.36058836e8]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [720, 720, 720, 720, 720, 720, 720, 720, 720, 720]
     median_allocs = 16
     median_bytes = 720
-    median_ns = 1.4693944e7
-    min_ns = 1.3401216e7
-    times_ns = [1.4428572e7, 1.476019e7, 1.4627698e7, 1.3413332e7, 1.5828614e7, 1.3401216e7, 1.4132724e7, 1.5944295e7, 2.2999536e7, 1.6053063e7]
+    median_ns = 2.3291525e7
+    min_ns = 1.8850765e7
+    times_ns = [3.354063e7, 2.2646084e7, 2.0546265e7, 2.0815918e7, 2.2298514e7, 1.8850765e7, 2.9992042e7, 2.5761924e7, 2.3936966e7, 2.5513352e7]
 [[measurements]]
 boundary = "structured_parameters"
 configuration = "primal_reactant"
 description = "full joint over the selected parameter boundary"
-kernel_preparation_seconds = 0.188368287
+kernel_preparation_seconds = 0.246593055
 max_abs_error = 1.1059455573558807e-9
 max_rel_error = 7.607777022886003e-15
 model = "idiomatic"
 outcome = "joint"
 provider = "rk"
-reactant_compile_seconds = 2.666033344
+reactant_compile_seconds = 2.866174937
 reactant_externalized_bound_array_count = 0
-reactant_first_execution_seconds = 0.051005868
-reactant_transfer_seconds = 0.18331795
+reactant_first_execution_seconds = 0.187032015
+reactant_transfer_seconds = 0.213019712
 state = "supported"
 
     [measurements.native_control]
@@ -161,32 +161,32 @@ state = "supported"
     bytes = [13976896, 13976896, 13976896, 13976896, 13976896, 13976896, 13976896, 13976896, 13976896, 13976896]
     median_allocs = 12
     median_bytes = 13976896
-    median_ns = 5.7790162e7
-    min_ns = 5.226817e7
-    times_ns = [5.7119852e7, 5.5935949e7, 5.8479468e7, 5.226817e7, 6.0334255e7, 5.8460472e7, 6.0701321e7, 5.6501629e7, 6.860195e7, 5.2371793e7]
+    median_ns = 9.5280067e7
+    min_ns = 5.9097762e7
+    times_ns = [3.24238695e8, 8.0916464e7, 1.34521765e8, 9.6334612e7, 8.3444002e7, 8.5375188e7, 9.4225522e7, 1.09308959e8, 1.35880469e8, 5.9097762e7]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 1.73780515e7
-    min_ns = 1.5284523e7
-    times_ns = [1.6866436e7, 1.5284523e7, 2.0297148e7, 1.8571228e7, 1.7889667e7, 1.5912611e7, 1.8835973e7, 1.6225341e7, 1.935677e7, 1.611576e7]
+    median_ns = 2.782386e7
+    min_ns = 2.210719e7
+    times_ns = [2.7851478e7, 2.7499431e7, 2.7152243e7, 2.7796242e7, 6.6353845e7, 3.7599201e7, 2.210719e7, 3.9270197e7, 3.7811004e7, 2.3073935e7]
 [[measurements]]
 boundary = "structured_parameters"
 configuration = "primal_reactant"
 description = "standard-normal coefficient log prior"
-kernel_preparation_seconds = 0.148734787
+kernel_preparation_seconds = 0.155501789
 max_abs_error = 1.7280399333685637e-11
 max_rel_error = 2.6615325236043355e-15
 model = "idiomatic"
 outcome = "prior"
 provider = "rk"
-reactant_compile_seconds = 1.819193378
+reactant_compile_seconds = 2.211063471
 reactant_externalized_bound_array_count = 0
-reactant_first_execution_seconds = 0.029332842
-reactant_transfer_seconds = 0.007195155
+reactant_first_execution_seconds = 0.044731764
+reactant_transfer_seconds = 0.006880876
 state = "supported"
 
     [measurements.native_control]
@@ -194,32 +194,32 @@ state = "supported"
     bytes = [56704, 56704, 56704, 56704, 56704, 56704, 56704, 56704, 56704, 56704]
     median_allocs = 4
     median_bytes = 56704
-    median_ns = 5047.0
-    min_ns = 4796.0
-    times_ns = [4876.0, 4867.0, 5017.0, 4796.0, 5077.0, 5407.0, 5077.0, 5017.0, 5127.0, 5097.0]
+    median_ns = 5107.0
+    min_ns = 4987.0
+    times_ns = [5337.0, 5037.0, 5097.0, 5117.0, 4987.0, 5377.0, 5718.0, 5097.0, 5998.0, 5027.0]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 12127.0
-    min_ns = 6840.0
-    times_ns = [6840.0, 10024.0, 15601.0, 10625.0, 7890.0, 12767.0, 12638.0, 19147.0, 11616.0, 17864.0]
+    median_ns = 11411.0
+    min_ns = 6479.0
+    times_ns = [14320.0, 11246.0, 6669.0, 7771.0, 6479.0, 15662.0, 11165.0, 14069.0, 11576.0, 11796.0]
 [[measurements]]
 boundary = "structured_parameters"
 configuration = "primal_reactant"
 description = "summed softmax categorical log likelihood"
-kernel_preparation_seconds = 0.022041935
+kernel_preparation_seconds = 0.031725505
 max_abs_error = 1.1059455573558807e-9
 max_rel_error = 7.96344692353622e-15
 model = "idiomatic"
 outcome = "likelihood"
 provider = "rk"
-reactant_compile_seconds = 1.659683779
+reactant_compile_seconds = 2.072968585
 reactant_externalized_bound_array_count = 0
-reactant_first_execution_seconds = 0.045857908
-reactant_transfer_seconds = 0.172395593
+reactant_first_execution_seconds = 0.073716336
+reactant_transfer_seconds = 0.198376191
 state = "supported"
 
     [measurements.native_control]
@@ -227,32 +227,32 @@ state = "supported"
     bytes = [13920192, 13920192, 13920192, 13920192, 13920192, 13920192, 13920192, 13920192, 13920192, 13920192]
     median_allocs = 8
     median_bytes = 13920192
-    median_ns = 5.99364165e7
-    min_ns = 5.1549567e7
-    times_ns = [6.9248032e7, 6.6106839e7, 5.6888071e7, 6.986301e7, 5.7653467e7, 5.3231148e7, 6.7219253e7, 5.3775148e7, 6.2219366e7, 5.1549567e7]
+    median_ns = 7.91430845e7
+    min_ns = 5.8116618e7
+    times_ns = [1.12163778e8, 8.2267807e7, 6.3245116e7, 6.7425734e7, 7.6018362e7, 6.0700122e7, 8.6172718e7, 1.09950865e8, 9.7262373e7, 5.8116618e7]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 1.9527997e7
-    min_ns = 1.7388185e7
-    times_ns = [1.8881946e7, 1.7406791e7, 2.2320909e7, 1.8540575e7, 1.7606767e7, 2.0174048e7, 2.2460762e7, 2.106055e7, 2.0744985e7, 1.7388185e7]
+    median_ns = 1.9210278e7
+    min_ns = 1.5485162e7
+    times_ns = [2.4152002e7, 1.9671079e7, 2.0585039e7, 2.3046135e7, 1.8749477e7, 1.9938858e7, 1.6521041e7, 1.5485162e7, 1.6162436e7, 1.7008364e7]
 [[measurements]]
 boundary = "structured_parameters"
 configuration = "primal_reactant"
 description = "per-observation softmax categorical log likelihoods"
-kernel_preparation_seconds = 0.023012503
+kernel_preparation_seconds = 0.026194101
 max_abs_error = 1.3322676295501878e-15
 max_rel_error = 6.004612810565379e-16
 model = "idiomatic"
 outcome = "pointwise"
 provider = "rk"
-reactant_compile_seconds = 1.801659842
+reactant_compile_seconds = 1.823026928
 reactant_externalized_bound_array_count = 0
-reactant_first_execution_seconds = 0.041610488
-reactant_transfer_seconds = 0.180095685
+reactant_first_execution_seconds = 0.040074647
+reactant_transfer_seconds = 0.188389508
 state = "supported"
 
     [measurements.native_control]
@@ -260,32 +260,32 @@ state = "supported"
     bytes = [14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240]
     median_allocs = 10
     median_bytes = 14400240
-    median_ns = 6.1509782e7
-    min_ns = 5.1346498e7
-    times_ns = [6.0211897e7, 5.7681296e7, 8.0072743e7, 6.4159852e7, 5.9497461e7, 6.6559492e7, 5.7017139e7, 7.0693746e7, 6.2807667e7, 5.1346498e7]
+    median_ns = 5.7769433e7
+    min_ns = 5.2106583e7
+    times_ns = [6.0805699e7, 8.65003e7, 5.2106583e7, 5.4079596e7, 6.0186665e7, 5.9880532e7, 5.3821068e7, 6.1562052e7, 5.5658334e7, 5.4499455e7]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [720, 720, 720, 720, 720, 720, 720, 720, 720, 720]
     median_allocs = 16
     median_bytes = 720
-    median_ns = 1.5224166e7
-    min_ns = 1.4912601e7
-    times_ns = [1.5181852e7, 1.4987124e7, 1.8586389e7, 1.5163327e7, 1.8518494e7, 1.7369729e7, 1.5612397e7, 1.526648e7, 1.504237e7, 1.4912601e7]
+    median_ns = 1.69329845e7
+    min_ns = 1.5747673e7
+    times_ns = [1.5768882e7, 1.6758539e7, 1.5747673e7, 1.8434993e7, 2.0025877e7, 1.6946107e7, 1.6261213e7, 1.8511278e7, 1.6919862e7, 1.7137162e7]
 [[measurements]]
 boundary = "packed_unconstrained"
 configuration = "primal_reactant_bound"
 description = "full joint over the selected parameter boundary"
-kernel_preparation_seconds = 0.700921486
+kernel_preparation_seconds = 0.791355908
 max_abs_error = 1.1059455573558807e-9
 max_rel_error = 7.607777022886003e-15
 model = "idiomatic"
 outcome = "joint"
 provider = "rk"
-reactant_compile_seconds = 1.745110207
+reactant_compile_seconds = 1.680841165
 reactant_externalized_bound_array_count = 2
-reactant_first_execution_seconds = 0.04177923
-reactant_transfer_seconds = 0.178108624
+reactant_first_execution_seconds = 0.051125396
+reactant_transfer_seconds = 0.193309115
 state = "supported"
 
     [measurements.native_control]
@@ -293,23 +293,23 @@ state = "supported"
     bytes = [13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320]
     median_allocs = 9
     median_bytes = 13920320
-    median_ns = 6.0883619e7
-    min_ns = 5.1092788e7
-    times_ns = [6.1580805e7, 5.3616069e7, 5.8948414e7, 6.2703555e7, 7.476426e7, 5.1092788e7, 6.051812e7, 5.3850101e7, 6.1249118e7, 6.2311132e7]
+    median_ns = 5.9053528e7
+    min_ns = 5.3964594e7
+    times_ns = [5.9224256e7, 7.1571576e7, 6.8393961e7, 5.4782026e7, 7.0750153e7, 5.40272e7, 5.6280378e7, 5.88828e7, 6.6461185e7, 5.3964594e7]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 1.61990945e7
-    min_ns = 1.4253642e7
-    times_ns = [1.6758417e7, 1.6095892e7, 1.6302297e7, 1.4808057e7, 1.6022041e7, 1.4253642e7, 1.5494603e7, 1.9851924e7, 1.7069266e7, 1.6615009e7]
+    median_ns = 1.6572114e7
+    min_ns = 1.3397564e7
+    times_ns = [1.5338962e7, 1.7336258e7, 1.6800479e7, 1.8575949e7, 2.1776474e7, 1.6343749e7, 1.9507303e7, 1.5991744e7, 1.3397564e7, 1.5794662e7]
 [[measurements]]
 boundary = "packed_unconstrained"
 configuration = "primal_reactant_bound"
 description = "standard-normal coefficient log prior"
-kernel_preparation_seconds = 7.2e-6
+kernel_preparation_seconds = 1.0855e-5
 model = "idiomatic"
 outcome = "prior"
 provider = "rk"
@@ -319,16 +319,16 @@ state = "not_applicable"
 boundary = "packed_unconstrained"
 configuration = "primal_reactant_bound"
 description = "summed softmax categorical log likelihood"
-kernel_preparation_seconds = 0.117883649
+kernel_preparation_seconds = 0.108600543
 max_abs_error = 1.1059455573558807e-9
 max_rel_error = 7.96344692353622e-15
 model = "idiomatic"
 outcome = "likelihood"
 provider = "rk"
-reactant_compile_seconds = 1.633330858
+reactant_compile_seconds = 1.81210717
 reactant_externalized_bound_array_count = 2
-reactant_first_execution_seconds = 0.038822461
-reactant_transfer_seconds = 0.184103874
+reactant_first_execution_seconds = 0.066473552
+reactant_transfer_seconds = 0.180498701
 state = "supported"
 
     [measurements.native_control]
@@ -336,32 +336,32 @@ state = "supported"
     bytes = [13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320, 13920320]
     median_allocs = 9
     median_bytes = 13920320
-    median_ns = 6.26266425e7
-    min_ns = 5.6751184e7
-    times_ns = [5.9830881e7, 6.5026579e7, 6.1060087e7, 7.1691652e7, 6.9891439e7, 7.020391e7, 5.6751184e7, 6.402011e7, 5.7252885e7, 6.1233175e7]
+    median_ns = 6.19696035e7
+    min_ns = 5.0992504e7
+    times_ns = [7.4467542e7, 6.0280338e7, 5.7270976e7, 5.0992504e7, 6.3629719e7, 6.6291812e7, 9.8735995e7, 6.0309488e7, 7.0505206e7, 5.7758429e7]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 1.63770165e7
-    min_ns = 1.4031045e7
-    times_ns = [1.4031045e7, 1.6385163e7, 1.6126074e7, 1.6595152e7, 1.8291922e7, 1.636887e7, 1.4572281e7, 1.5487574e7, 1.7375928e7, 1.7183142e7]
+    median_ns = 1.6017955e7
+    min_ns = 1.4559367e7
+    times_ns = [1.732335e7, 1.5352913e7, 1.6148881e7, 1.5887029e7, 1.5329239e7, 1.5419354e7, 1.4559367e7, 1.7310063e7, 1.7783936e7, 1.8668497e7]
 [[measurements]]
 boundary = "packed_unconstrained"
 configuration = "primal_reactant_bound"
 description = "per-observation softmax categorical log likelihoods"
-kernel_preparation_seconds = 0.032896678
+kernel_preparation_seconds = 0.033283
 max_abs_error = 1.3322676295501878e-15
 max_rel_error = 6.004612810565379e-16
 model = "idiomatic"
 outcome = "pointwise"
 provider = "rk"
-reactant_compile_seconds = 1.668538293
+reactant_compile_seconds = 1.612645697
 reactant_externalized_bound_array_count = 2
-reactant_first_execution_seconds = 0.049487372
-reactant_transfer_seconds = 0.174012053
+reactant_first_execution_seconds = 0.042078625
+reactant_transfer_seconds = 0.1924867
 state = "supported"
 
     [measurements.native_control]
@@ -369,32 +369,32 @@ state = "supported"
     bytes = [14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368, 14400368]
     median_allocs = 11
     median_bytes = 14400368
-    median_ns = 5.95918365e7
-    min_ns = 5.5555884e7
-    times_ns = [5.9616816e7, 5.9108534e7, 5.9566857e7, 6.0447091e7, 6.1043655e7, 6.8274228e7, 5.8638586e7, 5.9500044e7, 7.4097791e7, 5.5555884e7]
+    median_ns = 5.8411014e7
+    min_ns = 5.1358348e7
+    times_ns = [5.9191636e7, 5.9254431e7, 6.8622939e7, 5.514372e7, 5.1358348e7, 5.8123222e7, 5.5849214e7, 5.9260872e7, 5.5727455e7, 5.8698806e7]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [720, 720, 720, 720, 720, 720, 720, 720, 720, 720]
     median_allocs = 16
     median_bytes = 720
-    median_ns = 1.60809965e7
-    min_ns = 1.323008e7
-    times_ns = [1.8376799e7, 1.8767739e7, 1.8197032e7, 1.5986031e7, 1.8721044e7, 1.4815627e7, 1.323008e7, 1.5003777e7, 1.6175962e7, 1.5720344e7]
+    median_ns = 1.41533125e7
+    min_ns = 1.2862566e7
+    times_ns = [1.5185732e7, 1.3026242e7, 1.5783806e7, 1.2862566e7, 1.4556394e7, 1.3750231e7, 1.3631548e7, 1.4970675e7, 1.6637986e7, 1.3306469e7]
 [[measurements]]
 boundary = "structured_parameters"
 configuration = "primal_reactant_bound"
 description = "full joint over the selected parameter boundary"
-kernel_preparation_seconds = 0.10954772
+kernel_preparation_seconds = 0.100669421
 max_abs_error = 1.1059455573558807e-9
 max_rel_error = 7.607777022886003e-15
 model = "idiomatic"
 outcome = "joint"
 provider = "rk"
-reactant_compile_seconds = 1.616328454
+reactant_compile_seconds = 1.581186343
 reactant_externalized_bound_array_count = 2
-reactant_first_execution_seconds = 0.038706952
-reactant_transfer_seconds = 0.17632186
+reactant_first_execution_seconds = 0.040190009
+reactant_transfer_seconds = 0.179174484
 state = "supported"
 
     [measurements.native_control]
@@ -402,23 +402,23 @@ state = "supported"
     bytes = [13976896, 13976896, 13976896, 13976896, 13976896, 13976896, 13976896, 13976896, 13976896, 13976896]
     median_allocs = 12
     median_bytes = 13976896
-    median_ns = 6.22472845e7
-    min_ns = 5.545192e7
-    times_ns = [6.5830597e7, 6.2329238e7, 6.0718575e7, 6.0210335e7, 5.545192e7, 6.9595801e7, 6.8774298e7, 6.7215688e7, 6.2165331e7, 5.766917e7]
+    median_ns = 5.4388569e7
+    min_ns = 5.1352129e7
+    times_ns = [5.2925682e7, 5.6043933e7, 5.4455291e7, 5.4885975e7, 5.2448322e7, 6.5061414e7, 5.1352129e7, 5.2189395e7, 5.4321847e7, 5.6535532e7]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 1.6086685e7
-    min_ns = 1.4180431e7
-    times_ns = [1.5111985e7, 1.4180431e7, 1.5720625e7, 1.6714016e7, 1.7509633e7, 1.5524245e7, 1.6132373e7, 1.6040997e7, 1.7145982e7, 1.9272205e7]
+    median_ns = 1.443148e7
+    min_ns = 1.3715002e7
+    times_ns = [1.3947403e7, 1.4725466e7, 1.426347e7, 1.4359841e7, 1.4035905e7, 1.4503119e7, 1.4521415e7, 1.4893889e7, 1.5399147e7, 1.3715002e7]
 [[measurements]]
 boundary = "structured_parameters"
 configuration = "primal_reactant_bound"
 description = "standard-normal coefficient log prior"
-kernel_preparation_seconds = 6.088e-6
+kernel_preparation_seconds = 7.561e-6
 model = "idiomatic"
 outcome = "prior"
 provider = "rk"
@@ -428,16 +428,16 @@ state = "not_applicable"
 boundary = "structured_parameters"
 configuration = "primal_reactant_bound"
 description = "summed softmax categorical log likelihood"
-kernel_preparation_seconds = 0.03357996
+kernel_preparation_seconds = 0.029324067
 max_abs_error = 1.1059455573558807e-9
 max_rel_error = 7.96344692353622e-15
 model = "idiomatic"
 outcome = "likelihood"
 provider = "rk"
-reactant_compile_seconds = 1.665827163
+reactant_compile_seconds = 1.669590973
 reactant_externalized_bound_array_count = 2
-reactant_first_execution_seconds = 0.053653961
-reactant_transfer_seconds = 0.170056807
+reactant_first_execution_seconds = 0.042376366
+reactant_transfer_seconds = 0.171566336
 state = "supported"
 
     [measurements.native_control]
@@ -445,32 +445,32 @@ state = "supported"
     bytes = [13920192, 13920192, 13920192, 13920192, 13920192, 13920192, 13920192, 13920192, 13920192, 13920192]
     median_allocs = 8
     median_bytes = 13920192
-    median_ns = 6.7200366e7
-    min_ns = 5.2238337e7
-    times_ns = [7.4693433e7, 6.9863451e7, 6.8132882e7, 5.7781455e7, 5.3497095e7, 5.2238337e7, 5.9717055e7, 7.219837e7, 6.626785e7, 7.6967269e7]
+    median_ns = 6.01803395e7
+    min_ns = 5.3984342e7
+    times_ns = [6.0119376e7, 5.888275e7, 5.6075887e7, 6.0241303e7, 5.3984342e7, 6.185475e7, 5.9385662e7, 6.7633692e7, 6.4954777e7, 6.275372e7]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 1.75093475e7
-    min_ns = 1.3351648e7
-    times_ns = [1.3351648e7, 1.6850344e7, 1.6742555e7, 1.497711e7, 1.5951904e7, 1.8168351e7, 1.9194987e7, 1.9463367e7, 2.0153249e7, 1.8423643e7]
+    median_ns = 2.1674404e7
+    min_ns = 1.5729082e7
+    times_ns = [1.9669928e7, 1.9853611e7, 2.5959036e7, 2.446985e7, 2.2712035e7, 2.1344689e7, 2.2004119e7, 2.2215009e7, 2.1241857e7, 1.5729082e7]
 [[measurements]]
 boundary = "structured_parameters"
 configuration = "primal_reactant_bound"
 description = "per-observation softmax categorical log likelihoods"
-kernel_preparation_seconds = 0.026881009
+kernel_preparation_seconds = 0.036191393
 max_abs_error = 1.3322676295501878e-15
 max_rel_error = 6.004612810565379e-16
 model = "idiomatic"
 outcome = "pointwise"
 provider = "rk"
-reactant_compile_seconds = 1.502167981
+reactant_compile_seconds = 1.760827671
 reactant_externalized_bound_array_count = 2
-reactant_first_execution_seconds = 0.05083291
-reactant_transfer_seconds = 0.18083159
+reactant_first_execution_seconds = 0.059081303
+reactant_transfer_seconds = 0.205378607
 state = "supported"
 
     [measurements.native_control]
@@ -478,32 +478,32 @@ state = "supported"
     bytes = [14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240, 14400240]
     median_allocs = 10
     median_bytes = 14400240
-    median_ns = 5.9836058e7
-    min_ns = 5.3027937e7
-    times_ns = [5.614678e7, 6.1392905e7, 6.456381e7, 6.8555375e7, 6.6373185e7, 5.6073498e7, 5.3027937e7, 5.7164343e7, 5.8279211e7, 6.3385293e7]
+    median_ns = 5.5673912e7
+    min_ns = 5.4313175e7
+    times_ns = [5.5696884e7, 5.565094e7, 5.4461479e7, 6.8683191e7, 5.4313175e7, 5.4489148e7, 5.5242457e7, 5.9703512e7, 5.5917459e7, 7.3304056e7]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [720, 720, 720, 720, 720, 720, 720, 720, 720, 720]
     median_allocs = 16
     median_bytes = 720
-    median_ns = 1.8804844e7
-    min_ns = 1.7025766e7
-    times_ns = [1.89284e7, 1.783295e7, 1.9554393e7, 1.9982875e7, 1.8815674e7, 1.8794014e7, 1.8619764e7, 1.7025766e7, 1.8061885e7, 2.1451661e7]
+    median_ns = 2.43020035e7
+    min_ns = 1.9831952e7
+    times_ns = [1.9831952e7, 2.2126427e7, 2.2674874e7, 2.2153505e7, 2.7580412e7, 2.2804633e7, 2.5799374e7, 2.9095412e7, 5.2414065e7, 3.1603162e7]
 [[measurements]]
 boundary = "packed_unconstrained"
 configuration = "primal_reactant"
 description = "full joint over the selected parameter boundary"
-kernel_preparation_seconds = 0.366132927
+kernel_preparation_seconds = 0.046002129
 max_abs_error = 1.1350493878126144e-9
 max_rel_error = 7.807981681383003e-15
 model = "vcat_free"
 outcome = "joint"
 provider = "rk"
-reactant_compile_seconds = 4.033243823
+reactant_compile_seconds = 4.635547317
 reactant_externalized_bound_array_count = 0
-reactant_first_execution_seconds = 0.053115078
-reactant_transfer_seconds = 0.193513133
+reactant_first_execution_seconds = 0.081993635
+reactant_transfer_seconds = 0.269133669
 state = "supported"
 
     [measurements.native_control]
@@ -511,32 +511,32 @@ state = "supported"
     bytes = [8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224]
     median_allocs = 5
     median_bytes = 8640224
-    median_ns = 5.82760765e7
-    min_ns = 5.4688718e7
-    times_ns = [5.4688718e7, 6.0043786e7, 5.7137256e7, 5.9327186e7, 5.6514346e7, 5.972768e7, 5.605358e7, 6.1423869e7, 5.7224967e7, 6.2089847e7]
+    median_ns = 1.18459977e8
+    min_ns = 9.2560744e7
+    times_ns = [1.32524051e8, 1.26772165e8, 1.04493638e8, 1.20747363e8, 9.2560744e7, 1.5066649e8, 2.47681652e8, 1.03401962e8, 1.16172591e8, 1.11258801e8]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 1.77136845e7
-    min_ns = 1.3776784e7
-    times_ns = [1.8021569e7, 2.0138049e7, 1.8322554e7, 1.8296378e7, 1.7613406e7, 1.7813963e7, 1.7416115e7, 1.7401484e7, 1.6023062e7, 1.3776784e7]
+    median_ns = 6.03946605e7
+    min_ns = 3.3827502e7
+    times_ns = [3.3827502e7, 6.1458793e7, 9.9875707e7, 5.5388838e7, 6.746531e7, 6.7055295e7, 5.9330528e7, 4.7427544e7, 5.3239074e7, 9.6215166e7]
 [[measurements]]
 boundary = "packed_unconstrained"
 configuration = "primal_reactant"
 description = "standard-normal coefficient log prior"
-kernel_preparation_seconds = 0.031030474
+kernel_preparation_seconds = 0.086203474
 max_abs_error = 1.7280399333685637e-11
 max_rel_error = 2.6615325236043355e-15
 model = "vcat_free"
 outcome = "prior"
 provider = "rk"
-reactant_compile_seconds = 1.630054397
+reactant_compile_seconds = 1.999793567
 reactant_externalized_bound_array_count = 0
-reactant_first_execution_seconds = 0.017617231
-reactant_transfer_seconds = 7.4833e-5
+reactant_first_execution_seconds = 0.022018148
+reactant_transfer_seconds = 7.3992e-5
 state = "supported"
 
     [measurements.native_control]
@@ -544,32 +544,32 @@ state = "supported"
     bytes = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     median_allocs = 0
     median_bytes = 0
-    median_ns = 3319.0
-    min_ns = 3265.0
-    times_ns = [3284.0, 3294.0, 3265.0, 3284.0, 3364.0, 3304.0, 3394.0, 3334.0, 3404.0, 3334.0]
+    median_ns = 3389.5
+    min_ns = 3315.0
+    times_ns = [3414.0, 3435.0, 3385.0, 4096.0, 3344.0, 3354.0, 3315.0, 3405.0, 3394.0, 3335.0]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 8306.5
-    min_ns = 7029.0
-    times_ns = [7220.0, 7029.0, 7921.0, 8692.0, 7791.0, 7200.0, 10024.0, 10344.0, 8883.0, 10945.0]
+    median_ns = 11585.5
+    min_ns = 8672.0
+    times_ns = [11435.0, 13268.0, 8672.0, 9624.0, 10605.0, 11736.0, 12738.0, 10455.0, 12046.0, 12838.0]
 [[measurements]]
 boundary = "packed_unconstrained"
 configuration = "primal_reactant"
 description = "summed softmax categorical log likelihood"
-kernel_preparation_seconds = 0.031099779
+kernel_preparation_seconds = 0.040891097
 max_abs_error = 1.1350493878126144e-9
 max_rel_error = 8.173011316260858e-15
 model = "vcat_free"
 outcome = "likelihood"
 provider = "rk"
-reactant_compile_seconds = 1.987505087
+reactant_compile_seconds = 2.540727585
 reactant_externalized_bound_array_count = 0
-reactant_first_execution_seconds = 0.048154886
-reactant_transfer_seconds = 0.174427247
+reactant_first_execution_seconds = 0.073506616
+reactant_transfer_seconds = 0.200673625
 state = "supported"
 
     [measurements.native_control]
@@ -577,32 +577,32 @@ state = "supported"
     bytes = [8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224]
     median_allocs = 5
     median_bytes = 8640224
-    median_ns = 5.72921895e7
-    min_ns = 5.2416623e7
-    times_ns = [5.2416623e7, 5.6856279e7, 5.9450636e7, 6.5931076e7, 7.0650846e7, 5.5478908e7, 5.77281e7, 5.8154197e7, 5.4375376e7, 5.3867025e7]
+    median_ns = 1.383266365e8
+    min_ns = 1.14270015e8
+    times_ns = [1.86590005e8, 1.62054043e8, 2.56418526e8, 1.27296148e8, 1.23821543e8, 1.26223088e8, 1.65473611e8, 1.14270015e8, 1.42492774e8, 1.34160499e8]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 1.60441465e7
-    min_ns = 1.2921944e7
-    times_ns = [1.5204043e7, 1.567355e7, 1.7597604e7, 1.5433128e7, 1.2921944e7, 1.6476307e7, 1.6708539e7, 1.9662252e7, 1.6157648e7, 1.5930645e7]
+    median_ns = 5.82829675e7
+    min_ns = 3.6833589e7
+    times_ns = [5.3039799e7, 8.9644572e7, 1.02207674e8, 7.8769837e7, 3.6833589e7, 4.2707894e7, 1.0029071e8, 4.9914256e7, 4.1180347e7, 6.3526136e7]
 [[measurements]]
 boundary = "packed_unconstrained"
 configuration = "primal_reactant"
 description = "per-observation softmax categorical log likelihoods"
-kernel_preparation_seconds = 0.202193648
+kernel_preparation_seconds = 0.059653603
 max_abs_error = 1.3322676295501878e-15
 max_rel_error = 5.855900972034608e-16
 model = "vcat_free"
 outcome = "pointwise"
 provider = "rk"
-reactant_compile_seconds = 1.878386349
+reactant_compile_seconds = 2.923781198
 reactant_externalized_bound_array_count = 0
-reactant_first_execution_seconds = 0.043237873
-reactant_transfer_seconds = 0.172564347
+reactant_first_execution_seconds = 0.092926158
+reactant_transfer_seconds = 0.224569769
 state = "supported"
 
     [measurements.native_control]
@@ -610,32 +610,32 @@ state = "supported"
     bytes = [9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272]
     median_allocs = 7
     median_bytes = 9120272
-    median_ns = 5.71409715e7
-    min_ns = 5.3006336e7
-    times_ns = [6.7518235e7, 5.3129688e7, 5.8351369e7, 5.7090102e7, 5.9865688e7, 5.7191841e7, 5.9609076e7, 5.5335841e7, 5.3006336e7, 5.6302735e7]
+    median_ns = 1.944917065e8
+    min_ns = 1.1386518e8
+    times_ns = [1.60263081e8, 1.20151712e8, 1.9344334e8, 2.25380844e8, 1.87930145e8, 1.1386518e8, 2.1028668e8, 3.79727562e8, 1.95540073e8, 2.3845073e8]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [720, 720, 720, 720, 720, 720, 720, 720, 720, 720]
     median_allocs = 16
     median_bytes = 720
-    median_ns = 1.60011125e7
-    min_ns = 1.4453787e7
-    times_ns = [1.5179018e7, 1.7518294e7, 1.7728044e7, 1.6668211e7, 1.6423996e7, 1.5578229e7, 1.6684915e7, 1.5516804e7, 1.4453787e7, 1.4454338e7]
+    median_ns = 7.2279701e7
+    min_ns = 4.5502624e7
+    times_ns = [7.6993675e7, 9.6306512e7, 1.27291465e8, 8.1305755e7, 8.9373847e7, 4.5502624e7, 6.0079687e7, 6.3539892e7, 6.706804e7, 6.7565727e7]
 [[measurements]]
 boundary = "structured_parameters"
 configuration = "primal_reactant"
 description = "full joint over the selected parameter boundary"
-kernel_preparation_seconds = 0.121041445
+kernel_preparation_seconds = 0.128200519
 max_abs_error = 1.1350493878126144e-9
 max_rel_error = 7.807981681383003e-15
 model = "vcat_free"
 outcome = "joint"
 provider = "rk"
-reactant_compile_seconds = 2.093932996
+reactant_compile_seconds = 3.362512793
 reactant_externalized_bound_array_count = 0
-reactant_first_execution_seconds = 0.047660493
-reactant_transfer_seconds = 0.186619544
+reactant_first_execution_seconds = 0.188065519
+reactant_transfer_seconds = 0.250585054
 state = "supported"
 
     [measurements.native_control]
@@ -643,32 +643,32 @@ state = "supported"
     bytes = [8696800, 8696800, 8696800, 8696800, 8696800, 8696800, 8696800, 8696800, 8696800, 8696800]
     median_allocs = 8
     median_bytes = 8696800
-    median_ns = 5.795298e7
-    min_ns = 5.1635156e7
-    times_ns = [5.6609317e7, 5.1635156e7, 5.6187826e7, 5.9629894e7, 5.9470784e7, 5.7555021e7, 5.3506518e7, 5.8350939e7, 5.9542634e7, 6.1064013e7]
+    median_ns = 1.974165175e8
+    min_ns = 1.38918227e8
+    times_ns = [2.28472773e8, 1.75655487e8, 1.38918227e8, 2.20868893e8, 1.78689994e8, 1.97640602e8, 1.79901335e8, 2.36188419e8, 2.63234357e8, 1.97192433e8]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 1.6211047e7
-    min_ns = 1.2967968e7
-    times_ns = [1.6574593e7, 1.6103854e7, 1.6799033e7, 1.9375667e7, 1.5552554e7, 1.631824e7, 1.6788007e7, 1.5047486e7, 1.5654204e7, 1.2967968e7]
+    median_ns = 7.18197905e7
+    min_ns = 4.1204873e7
+    times_ns = [8.4220436e7, 7.694707e7, 7.2488998e7, 8.2627819e7, 4.1204873e7, 8.9464992e7, 5.4694266e7, 4.7816567e7, 7.1150583e7, 5.7129797e7]
 [[measurements]]
 boundary = "structured_parameters"
 configuration = "primal_reactant"
 description = "standard-normal coefficient log prior"
-kernel_preparation_seconds = 0.032733553
+kernel_preparation_seconds = 0.030755094
 max_abs_error = 1.7280399333685637e-11
 max_rel_error = 2.6615325236043355e-15
 model = "vcat_free"
 outcome = "prior"
 provider = "rk"
-reactant_compile_seconds = 1.928702255
+reactant_compile_seconds = 2.303471946
 reactant_externalized_bound_array_count = 0
-reactant_first_execution_seconds = 0.019220854
-reactant_transfer_seconds = 8.5288e-5
+reactant_first_execution_seconds = 0.019103859
+reactant_transfer_seconds = 7.7837e-5
 state = "supported"
 
     [measurements.native_control]
@@ -676,32 +676,32 @@ state = "supported"
     bytes = [56704, 56704, 56704, 56704, 56704, 56704, 56704, 56704, 56704, 56704]
     median_allocs = 4
     median_bytes = 56704
-    median_ns = 5192.0
+    median_ns = 5122.0
     min_ns = 5007.0
-    times_ns = [5007.0, 5167.0, 5137.0, 5087.0, 5257.0, 5207.0, 5508.0, 5197.0, 5197.0, 5187.0]
+    times_ns = [5007.0, 5137.0, 5217.0, 5117.0, 5167.0, 5097.0, 5688.0, 5127.0, 5087.0, 5087.0]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 8682.0
-    min_ns = 6809.0
-    times_ns = [9133.0, 8171.0, 6990.0, 8231.0, 6809.0, 7771.0, 12297.0, 11736.0, 18866.0, 18987.0]
+    median_ns = 13885.0
+    min_ns = 12998.0
+    times_ns = [13339.0, 13088.0, 14460.0, 12998.0, 13168.0, 13980.0, 13790.0, 14270.0, 18065.0, 15362.0]
 [[measurements]]
 boundary = "structured_parameters"
 configuration = "primal_reactant"
 description = "summed softmax categorical log likelihood"
-kernel_preparation_seconds = 0.021811457
+kernel_preparation_seconds = 0.069312817
 max_abs_error = 1.1350493878126144e-9
 max_rel_error = 8.173011316260858e-15
 model = "vcat_free"
 outcome = "likelihood"
 provider = "rk"
-reactant_compile_seconds = 1.670721264
+reactant_compile_seconds = 2.945201833
 reactant_externalized_bound_array_count = 0
-reactant_first_execution_seconds = 0.048259599
-reactant_transfer_seconds = 0.175629915
+reactant_first_execution_seconds = 0.106687987
+reactant_transfer_seconds = 0.286898839
 state = "supported"
 
     [measurements.native_control]
@@ -709,32 +709,32 @@ state = "supported"
     bytes = [8640096, 8640096, 8640096, 8640096, 8640096, 8640096, 8640096, 8640096, 8640096, 8640096]
     median_allocs = 4
     median_bytes = 8640096
-    median_ns = 6.54334835e7
-    min_ns = 5.5940744e7
-    times_ns = [6.6359896e7, 7.1910114e7, 6.1145926e7, 6.6448359e7, 7.343813e7, 5.768414e7, 6.4507071e7, 5.5940744e7, 7.5011662e7, 6.2173181e7]
+    median_ns = 1.33295379e8
+    min_ns = 1.06561592e8
+    times_ns = [1.29396059e8, 2.19661876e8, 1.36766258e8, 1.66941214e8, 1.06959761e8, 2.25489938e8, 2.41568593e8, 1.298245e8, 1.06561592e8, 1.13462113e8]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 1.8585332e7
-    min_ns = 1.5606668e7
-    times_ns = [1.6863622e7, 1.7617081e7, 1.6679337e7, 1.5606668e7, 2.151607e7, 1.9902614e7, 2.1280554e7, 1.8052151e7, 1.924058e7, 1.9118513e7]
+    median_ns = 3.77461415e7
+    min_ns = 2.7807079e7
+    times_ns = [8.7416717e7, 3.6129742e7, 4.2168223e7, 3.1522133e7, 2.7807079e7, 3.74332e7, 3.9128178e7, 3.8059083e7, 3.1876843e7, 4.1718522e7]
 [[measurements]]
 boundary = "structured_parameters"
 configuration = "primal_reactant"
 description = "per-observation softmax categorical log likelihoods"
-kernel_preparation_seconds = 0.026914375
+kernel_preparation_seconds = 0.023322089
 max_abs_error = 1.3322676295501878e-15
 max_rel_error = 5.855900972034608e-16
 model = "vcat_free"
 outcome = "pointwise"
 provider = "rk"
-reactant_compile_seconds = 1.689670596
+reactant_compile_seconds = 2.120180662
 reactant_externalized_bound_array_count = 0
-reactant_first_execution_seconds = 0.038643127
-reactant_transfer_seconds = 0.18831893
+reactant_first_execution_seconds = 0.086061957
+reactant_transfer_seconds = 0.22259192
 state = "supported"
 
     [measurements.native_control]
@@ -742,32 +742,32 @@ state = "supported"
     bytes = [9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144]
     median_allocs = 6
     median_bytes = 9120144
-    median_ns = 6.49997865e7
-    min_ns = 5.3939057e7
-    times_ns = [8.0941872e7, 7.9191627e7, 6.5376947e7, 8.5035373e7, 7.7684143e7, 6.4622626e7, 6.1650014e7, 5.4542621e7, 5.3939057e7, 5.5057019e7]
+    median_ns = 1.55067836e8
+    min_ns = 9.7570245e7
+    times_ns = [9.7570245e7, 1.76577279e8, 1.95136347e8, 2.16054959e8, 1.33558393e8, 1.30787248e8, 1.02901772e8, 2.52581227e8, 2.93257953e8, 1.06804947e8]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [720, 720, 720, 720, 720, 720, 720, 720, 720, 720]
     median_allocs = 16
     median_bytes = 720
-    median_ns = 1.9401704e7
-    min_ns = 1.623073e7
-    times_ns = [1.623073e7, 1.7748284e7, 1.8750155e7, 1.8025656e7, 2.0925637e7, 1.8652451e7, 2.245024e7, 2.2678485e7, 2.1309726e7, 2.0053253e7]
+    median_ns = 4.77967295e7
+    min_ns = 2.748867e7
+    times_ns = [6.832169e7, 9.6655424e7, 4.6842082e7, 7.8532518e7, 4.8751377e7, 4.8954147e7, 4.157272e7, 4.0613969e7, 2.748867e7, 4.2220835e7]
 [[measurements]]
 boundary = "packed_unconstrained"
 configuration = "primal_reactant_bound"
 description = "full joint over the selected parameter boundary"
-kernel_preparation_seconds = 0.304753149
+kernel_preparation_seconds = 0.348969904
 max_abs_error = 1.1350493878126144e-9
 max_rel_error = 7.807981681383003e-15
 model = "vcat_free"
 outcome = "joint"
 provider = "rk"
-reactant_compile_seconds = 1.66725845
+reactant_compile_seconds = 2.107913747
 reactant_externalized_bound_array_count = 2
-reactant_first_execution_seconds = 0.047813197
-reactant_transfer_seconds = 0.193586277
+reactant_first_execution_seconds = 0.123724834
+reactant_transfer_seconds = 0.217899605
 state = "supported"
 
     [measurements.native_control]
@@ -775,23 +775,23 @@ state = "supported"
     bytes = [8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224]
     median_allocs = 5
     median_bytes = 8640224
-    median_ns = 6.02319035e7
-    min_ns = 5.5202561e7
-    times_ns = [7.4429984e7, 6.3518422e7, 7.2596935e7, 5.6945385e7, 5.6505028e7, 5.59421e7, 6.7258502e7, 5.5202561e7, 5.5783672e7, 6.6347825e7]
+    median_ns = 1.45387443e8
+    min_ns = 6.3479278e7
+    times_ns = [1.1831573e8, 6.3479278e7, 1.28224692e8, 1.41845416e8, 1.37462059e8, 1.51301694e8, 1.4892947e8, 1.5347341e8, 1.57815873e8, 2.15695013e8]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 1.8050135e7
-    min_ns = 1.6726994e7
-    times_ns = [1.8074954e7, 1.8794527e7, 1.8517845e7, 1.8012428e7, 1.7536791e7, 1.9849834e7, 1.8025316e7, 1.8515892e7, 1.6726994e7, 1.7951192e7]
+    median_ns = 4.9915899e7
+    min_ns = 3.5207729e7
+    times_ns = [4.5874126e7, 5.6693034e7, 4.6893774e7, 3.5207729e7, 4.4295408e7, 4.5315155e7, 8.7588683e7, 9.5619525e7, 5.2938024e7, 9.1719162e7]
 [[measurements]]
 boundary = "packed_unconstrained"
 configuration = "primal_reactant_bound"
 description = "standard-normal coefficient log prior"
-kernel_preparation_seconds = 6.609e-6
+kernel_preparation_seconds = 8.151e-6
 model = "vcat_free"
 outcome = "prior"
 provider = "rk"
@@ -801,16 +801,16 @@ state = "not_applicable"
 boundary = "packed_unconstrained"
 configuration = "primal_reactant_bound"
 description = "summed softmax categorical log likelihood"
-kernel_preparation_seconds = 0.102561081
+kernel_preparation_seconds = 0.262650039
 max_abs_error = 1.1350493878126144e-9
 max_rel_error = 8.173011316260858e-15
 model = "vcat_free"
 outcome = "likelihood"
 provider = "rk"
-reactant_compile_seconds = 1.561616629
+reactant_compile_seconds = 2.332755751
 reactant_externalized_bound_array_count = 2
-reactant_first_execution_seconds = 0.041487601
-reactant_transfer_seconds = 0.173247601
+reactant_first_execution_seconds = 0.059300101
+reactant_transfer_seconds = 0.307841094
 state = "supported"
 
     [measurements.native_control]
@@ -818,32 +818,32 @@ state = "supported"
     bytes = [8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224, 8640224]
     median_allocs = 5
     median_bytes = 8640224
-    median_ns = 5.88299045e7
-    min_ns = 5.1493734e7
-    times_ns = [7.5290711e7, 6.3238886e7, 5.8925446e7, 5.9326209e7, 5.6944944e7, 5.1493734e7, 5.5655175e7, 5.6865795e7, 6.2285351e7, 5.8734363e7]
+    median_ns = 1.485043395e8
+    min_ns = 1.12971647e8
+    times_ns = [1.30172309e8, 2.26510025e8, 1.87689211e8, 1.47255181e8, 2.01266595e8, 1.12971647e8, 1.34728837e8, 1.49753498e8, 1.32403809e8, 1.515824e8]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 1.46925885e7
-    min_ns = 1.3493945e7
-    times_ns = [1.42086e7, 1.3493945e7, 1.5184967e7, 1.3689985e7, 1.7268923e7, 1.4397561e7, 1.4987616e7, 1.3794799e7, 1.5673952e7, 1.6722307e7]
+    median_ns = 5.11786e7
+    min_ns = 3.594794e7
+    times_ns = [3.594794e7, 5.1478218e7, 5.7886141e7, 5.6373372e7, 3.9471813e7, 6.7172203e7, 5.0878982e7, 4.4113387e7, 6.1794924e7, 4.2556599e7]
 [[measurements]]
 boundary = "packed_unconstrained"
 configuration = "primal_reactant_bound"
 description = "per-observation softmax categorical log likelihoods"
-kernel_preparation_seconds = 0.032284746
+kernel_preparation_seconds = 0.058503402
 max_abs_error = 1.3322676295501878e-15
 max_rel_error = 5.855900972034608e-16
 model = "vcat_free"
 outcome = "pointwise"
 provider = "rk"
-reactant_compile_seconds = 1.618372713
+reactant_compile_seconds = 2.734701734
 reactant_externalized_bound_array_count = 2
-reactant_first_execution_seconds = 0.038106868
-reactant_transfer_seconds = 0.17410243
+reactant_first_execution_seconds = 0.172720735
+reactant_transfer_seconds = 0.28891464
 state = "supported"
 
     [measurements.native_control]
@@ -851,32 +851,32 @@ state = "supported"
     bytes = [9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272, 9120272]
     median_allocs = 7
     median_bytes = 9120272
-    median_ns = 5.71865025e7
-    min_ns = 5.3146364e7
-    times_ns = [6.00806e7, 5.7759889e7, 6.0333639e7, 5.3476309e7, 5.7262102e7, 5.3146364e7, 5.3978061e7, 5.7265816e7, 5.7110903e7, 5.5916616e7]
+    median_ns = 1.906422105e8
+    min_ns = 1.31503417e8
+    times_ns = [1.79630812e8, 1.60358611e8, 2.12804504e8, 2.01653609e8, 1.31503417e8, 2.59366559e8, 3.1253403e8, 1.51943909e8, 2.56080205e8, 1.56748709e8]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [720, 720, 720, 720, 720, 720, 720, 720, 720, 720]
     median_allocs = 16
     median_bytes = 720
-    median_ns = 1.65698875e7
-    min_ns = 1.5197335e7
-    times_ns = [1.6640065e7, 1.5374759e7, 1.5197335e7, 1.7239952e7, 1.6443894e7, 1.649971e7, 1.5990248e7, 1.7391292e7, 1.8820723e7, 1.7473124e7]
+    median_ns = 6.2994688e7
+    min_ns = 3.3260106e7
+    times_ns = [5.4996532e7, 3.3260106e7, 5.4811889e7, 6.8021923e7, 7.3707988e7, 9.3803432e7, 4.4900264e7, 5.9069583e7, 7.5573802e7, 6.6919793e7]
 [[measurements]]
 boundary = "structured_parameters"
 configuration = "primal_reactant_bound"
 description = "full joint over the selected parameter boundary"
-kernel_preparation_seconds = 0.188468638
+kernel_preparation_seconds = 0.333415751
 max_abs_error = 1.1350493878126144e-9
 max_rel_error = 7.807981681383003e-15
 model = "vcat_free"
 outcome = "joint"
 provider = "rk"
-reactant_compile_seconds = 1.542816225
+reactant_compile_seconds = 2.429949961
 reactant_externalized_bound_array_count = 2
-reactant_first_execution_seconds = 0.038711432
-reactant_transfer_seconds = 0.165818032
+reactant_first_execution_seconds = 0.122581403
+reactant_transfer_seconds = 0.2142001
 state = "supported"
 
     [measurements.native_control]
@@ -884,23 +884,23 @@ state = "supported"
     bytes = [8696800, 8696800, 8696800, 8696800, 8696800, 8696800, 8696800, 8696800, 8696800, 8696800]
     median_allocs = 8
     median_bytes = 8696800
-    median_ns = 5.6790055e7
-    min_ns = 5.2895849e7
-    times_ns = [5.8168602e7, 5.7409224e7, 5.2895849e7, 5.3013871e7, 5.8824226e7, 5.6284303e7, 5.8083344e7, 5.7295807e7, 5.4040007e7, 5.4299475e7]
+    median_ns = 2.047172785e8
+    min_ns = 1.11728731e8
+    times_ns = [2.47826421e8, 2.77541177e8, 1.66223672e8, 2.42140278e8, 2.28666258e8, 1.48728597e8, 2.30883847e8, 1.72371514e8, 1.80768299e8, 1.11728731e8]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 1.5320374e7
-    min_ns = 1.4409277e7
-    times_ns = [1.4409277e7, 1.459912e7, 1.6038534e7, 1.6547307e7, 1.589042e7, 1.9662093e7, 1.462883e7, 1.5007461e7, 1.5446558e7, 1.519419e7]
+    median_ns = 6.63682565e7
+    min_ns = 4.9285494e7
+    times_ns = [1.01286094e8, 6.0535014e7, 6.0057015e7, 7.2560013e7, 7.6235786e7, 9.0573316e7, 4.9285494e7, 5.3533014e7, 7.0181452e7, 6.2555061e7]
 [[measurements]]
 boundary = "structured_parameters"
 configuration = "primal_reactant_bound"
 description = "standard-normal coefficient log prior"
-kernel_preparation_seconds = 6.399e-6
+kernel_preparation_seconds = 7.4e-6
 model = "vcat_free"
 outcome = "prior"
 provider = "rk"
@@ -910,16 +910,16 @@ state = "not_applicable"
 boundary = "structured_parameters"
 configuration = "primal_reactant_bound"
 description = "summed softmax categorical log likelihood"
-kernel_preparation_seconds = 0.061434218
+kernel_preparation_seconds = 0.084613894
 max_abs_error = 1.1350493878126144e-9
 max_rel_error = 8.173011316260858e-15
 model = "vcat_free"
 outcome = "likelihood"
 provider = "rk"
-reactant_compile_seconds = 1.740416378
+reactant_compile_seconds = 2.167267474
 reactant_externalized_bound_array_count = 2
-reactant_first_execution_seconds = 0.041200255
-reactant_transfer_seconds = 0.172509452
+reactant_first_execution_seconds = 0.156171514
+reactant_transfer_seconds = 0.258579967
 state = "supported"
 
     [measurements.native_control]
@@ -927,32 +927,32 @@ state = "supported"
     bytes = [8640096, 8640096, 8640096, 8640096, 8640096, 8640096, 8640096, 8640096, 8640096, 8640096]
     median_allocs = 4
     median_bytes = 8640096
-    median_ns = 5.61022615e7
-    min_ns = 5.2495856e7
-    times_ns = [5.5177686e7, 5.4104576e7, 5.2495856e7, 5.8403356e7, 5.5921812e7, 5.2589636e7, 5.6282711e7, 5.9018263e7, 6.0676671e7, 6.1679545e7]
+    median_ns = 1.62340585e8
+    min_ns = 1.45702893e8
+    times_ns = [2.77132582e8, 4.80496083e8, 1.57135694e8, 1.61756499e8, 1.52581181e8, 1.62924671e8, 1.6954893e8, 3.46586752e8, 1.54509883e8, 1.45702893e8]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [704, 704, 704, 704, 704, 704, 704, 704, 704, 704]
     median_allocs = 16
     median_bytes = 704
-    median_ns = 1.5662697e7
-    min_ns = 1.5295551e7
-    times_ns = [2.0530651e7, 1.6414744e7, 1.5303992e7, 1.5993362e7, 1.5677187e7, 1.5726505e7, 1.5330738e7, 1.5295551e7, 1.5648207e7, 1.5510255e7]
+    median_ns = 6.36247675e7
+    min_ns = 3.9872789e7
+    times_ns = [8.9738743e7, 8.3384728e7, 3.9872789e7, 7.2108101e7, 7.286851e7, 4.5218874e7, 5.5141434e7, 5.460262e7, 5.2186046e7, 8.8326305e7]
 [[measurements]]
 boundary = "structured_parameters"
 configuration = "primal_reactant_bound"
 description = "per-observation softmax categorical log likelihoods"
-kernel_preparation_seconds = 0.034240663
+kernel_preparation_seconds = 0.03092294
 max_abs_error = 1.3322676295501878e-15
 max_rel_error = 5.855900972034608e-16
 model = "vcat_free"
 outcome = "pointwise"
 provider = "rk"
-reactant_compile_seconds = 1.670176303
+reactant_compile_seconds = 2.228471039
 reactant_externalized_bound_array_count = 2
-reactant_first_execution_seconds = 0.043365983
-reactant_transfer_seconds = 0.172218882
+reactant_first_execution_seconds = 0.143043762
+reactant_transfer_seconds = 0.268980607
 state = "supported"
 
     [measurements.native_control]
@@ -960,30 +960,30 @@ state = "supported"
     bytes = [9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144, 9120144]
     median_allocs = 6
     median_bytes = 9120144
-    median_ns = 5.79747945e7
-    min_ns = 5.5489595e7
-    times_ns = [5.6295678e7, 6.3758173e7, 5.8072879e7, 6.0057128e7, 5.6650849e7, 5.787671e7, 6.2691321e7, 5.6766557e7, 6.6430279e7, 5.5489595e7]
+    median_ns = 1.643553295e8
+    min_ns = 1.06363459e8
+    times_ns = [2.02983065e8, 1.84368254e8, 2.25168954e8, 1.44342405e8, 1.97662515e8, 1.14225785e8, 3.1075711e8, 1.32281145e8, 1.38811284e8, 1.06363459e8]
 
     [measurements.result]
     allocs = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
     bytes = [720, 720, 720, 720, 720, 720, 720, 720, 720, 720]
     median_allocs = 16
     median_bytes = 720
-    median_ns = 1.7381943e7
-    min_ns = 1.6602323e7
-    times_ns = [1.7164909e7, 1.817387e7, 1.812222e7, 1.756437e7, 1.6602323e7, 1.8313342e7, 1.6648977e7, 1.6871684e7, 1.7199516e7, 2.3324466e7]
+    median_ns = 6.3955984e7
+    min_ns = 4.0393676e7
+    times_ns = [5.2055376e7, 4.0941763e7, 9.7224292e7, 6.3710645e7, 8.1230736e7, 8.2280824e7, 4.0393676e7, 6.169981e7, 6.4201323e7, 7.3624493e7]
 
 [pins]
 benchmarktools_version = "1.6.3"
 idiomatic_source_text_sha256 = "b873db7cef8003d9d3982af93223489a6558f0c733095a3bbcfc16fb8c29ad24"
 julia_version = "1.10.11"
 mldatasets_version = "0.7.21"
-primal_receipt_reactivekernels_sha = "71ef1a5da8f37b7e7f82c05a44e95814e8831752"
-primal_receipt_sha256 = "5d517980223b157bab30b0daf417917867e0cf54fcaa55ebaf63e342a771e8b4"
-reactant_jll_version = "0.0.401+0"
-reactant_version = "0.2.278"
+primal_receipt_reactivekernels_sha = "a1264a7bddb2adeca317bfb0884b531cd3d68111"
+primal_receipt_sha256 = "b98cf09308d8e427a08b56ab1bef4cf3236b0570b2e67c3c80eb9c8ef32602db"
+reactant_jll_version = "0.0.407+0"
+reactant_version = "0.2.284"
 reactivekernels_dirty = false
-reactivekernels_sha = "71ef1a5da8f37b7e7f82c05a44e95814e8831752"
+reactivekernels_sha = "a1264a7bddb2adeca317bfb0884b531cd3d68111"
 reactivekernels_version = "0.1.0"
 reactivekernelsdistributionkernels_version = "0.1.0"
 reactivekernelspplexamples_version = "0.1.0"
@@ -1023,7 +1023,7 @@ source_reused = true
 unsupported_cells_recorded = true
 
 [setup]
-data_load_seconds = 1.978073788
-environment_seconds = 23.687636748
-kernel_preparation_seconds = 2.338467326
-package_precompile_seconds = 7.458805138
+data_load_seconds = 2.419370162
+environment_seconds = 29.868888896
+kernel_preparation_seconds = 3.419394241
+package_precompile_seconds = 26.603837863

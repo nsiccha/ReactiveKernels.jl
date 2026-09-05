@@ -400,6 +400,8 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "ppl-ad.md" => (
             "Eight Schools focused value-and-gradient comparisons",
             "eight-schools-ad-v2.toml",
+            "PracticalBayes",
+            "practicalbayes-comparison-v1.toml",
             "Every supported cell",
             "plot:eight-schools-ad-joint-density-relative",
             "plot:eight-schools-ad-pointwise-likelihood-relative",
@@ -461,6 +463,8 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
             "plot:eight-schools-reactant-ad-joint-density-relative",
         ),
         "eight-schools.md" => (
+            "PracticalBayes",
+            "practicalbayes-comparison-v1.toml",
             "Runtime ÷ baseline",
             "plot:eight-schools-primal-joint-density-relative",
             "plot:eight-schools-primal-pointwise-likelihood-relative",
@@ -478,12 +482,16 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
             "plot:sum-to-zero-hotloop-reactant-value-gradient-relative",
         ),
         "eval-throughput.md" => (
+            "PracticalBayes",
+            "practicalbayes-comparison-v1.toml",
             "Runtime ÷ baseline",
             "plot:eval-throughput-primal-log-density-relative",
             "plot:eval-throughput-value-gradient-relative",
             "plot:eval-throughput-amortization-primal-log-density-relative",
         ),
         "mnist-logistic.md" => (
+            "PracticalBayes",
+            "practicalbayes-comparison-v1.toml",
             "Wren-compatible PCA-40 primal comparison",
             "mnist-logistic-wren-pca40-v1.toml",
             "handwritten Julia, and Turing public interfaces",

@@ -22,6 +22,10 @@ const EIGHT_SCHOOLS_COMPARATORS = (
      differentiation = "primal"),
     (id = "turing_ad", provider = "turing",
      differentiation = "value_and_gradient"),
+    (id = "practicalbayes_primal", provider = "practical_bayes",
+     differentiation = "primal"),
+    (id = "practicalbayes_ad", provider = "practical_bayes",
+     differentiation = "value_and_gradient"),
 )
 
 "Return the deliberate public-API state of one Eight Schools RK matrix cell."

@@ -99,6 +99,39 @@ _trace(x) = Reactant.to_rarray(x)
         @test Array(external_gradient) ≈ gref
     end
 
+    @testset "small bound arrays stay compiler literals on the automatic path" begin
+        ext = Base.get_extension(ReactiveKernels, :ReactiveKernelsReactantExt)
+        @kernel small_bound_objective(
+                q::Vector{Float64}, data::Vector{Float64}) = begin
+            density::Float64 = sum(q .* data)
+        end
+
+        q = [0.3, -0.4, 0.2]
+        data = [2.0, -1.0, 0.5]
+        prepared = prepare_ad(
+            small_bound_objective, AD_REACTANT_BACKEND, q;
+            active = :q, want = :density, bound = (; data))
+        traced_q = _trace(q)
+
+        # A small dataset is embedded so the compiler can fold data-only
+        # terms; the compiled callable takes no hidden operands.
+        embedded = compile_ad_gradient(prepared, traced_q)
+        @test !(embedded isa ext._ExternalizedADExecutable)
+        @test Array(embedded(traced_q)) ≈ data
+
+        # Above the embedding limit the same kernel externalizes the array.
+        limit = ext._REACTANT_EMBEDDED_BOUND_ARRAY_ELEMENTS
+        previous_limit = limit[]
+        try
+            limit[] = length(data) - 1
+            externalized = compile_ad_gradient(prepared, traced_q)
+            @test externalized isa ext._ExternalizedADExecutable
+            @test Array(externalized(traced_q)) ≈ data
+        finally
+            limit[] = previous_limit
+        end
+    end
+
     @testset "Eight Schools supported boundaries match native reverse pass" begin
         model = build_eight_schools_graph()
         observations = Float64.(EIGHT_SCHOOLS_Y)

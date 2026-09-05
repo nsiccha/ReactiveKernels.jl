@@ -16,3 +16,12 @@ function _require_clean_detached_candidate(root)
         "revert these changes first:\n$(dirty)")
     sha
 end
+
+# Keep pinned-environment setup separate from the explicit Pkg.precompile()
+# receipt. Julia 1.10's parallel precompile can deadlock while sibling Reactant
+# extensions wait on locks held by their own driver; one task avoids that cycle.
+# Scope both settings to setup so the benchmark child keeps the caller's env.
+function _with_serial_pkg_precompile(f)
+    withenv(f, "JULIA_PKG_PRECOMPILE_AUTO" => "0",
+            "JULIA_NUM_PRECOMPILE_TASKS" => "1")
+end

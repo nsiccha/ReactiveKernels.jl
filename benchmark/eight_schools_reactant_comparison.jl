@@ -8,7 +8,7 @@
 import Pkg
 
 const _EIGHT_SCHOOLS_REACTANT_INNER = "RK_EIGHT_SCHOOLS_REACTANT_INNER"
-const _EIGHT_SCHOOLS_REACTANT_VERSION = v"0.2.278"
+const _EIGHT_SCHOOLS_REACTANT_VERSION = v"0.2.284"
 
 include(joinpath(@__DIR__, "_repro_guard.jl"))
 
@@ -17,7 +17,7 @@ function _run_pinned_comparison()
     sha = _require_clean_detached_candidate(root)
     mktempdir(prefix = "reactivekernels-eight-schools-reactant-") do environment
         setup_seconds = precompile_seconds = 0.0
-        withenv("JULIA_PKG_PRECOMPILE_AUTO" => "0") do
+        _with_serial_pkg_precompile() do
             setup_seconds = @elapsed begin
                 Pkg.activate(environment)
                 Pkg.add(Pkg.PackageSpec(

@@ -53,6 +53,10 @@ const _EIGHT_SCHOOLS_REACTANT_AD_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts",
     "eight-schools-reactant-ad-v2.toml",
 )
+const _PRACTICALBAYES_RECEIPT_PATH = joinpath(
+    dirname(@__DIR__), "benchmark", "receipts",
+    "practicalbayes-comparison-v1.toml",
+)
 
 _node_html(node) = sprint(show, MIME"text/html"(), node; context = :limit => false)
 
@@ -3357,3 +3361,41 @@ render_probprog_mcmc_baselines() = _render_benchmark_baselines(
      ("Turing NUTS harness", "turing-sampling"),
      ("Turing Eight Schools twin", "turing-eight-schools"),
      ("Turing MNIST twin", "turing-mnist")))
+
+# --- PracticalBayes external comparator ---------------------------------------
+
+function _practicalbayes_receipt()
+    receipt = TOML.parsefile(_PRACTICALBAYES_RECEIPT_PATH)
+    get(receipt, "schema", "") == "practicalbayes-comparison-v1" ||
+        error("unexpected PracticalBayes receipt schema")
+    pins = receipt["pins"]
+    get(pins, "reactivekernels_dirty", true) == false ||
+        error("PracticalBayes receipt was produced from a dirty checkout")
+    occursin(r"^[0-9a-f]{40}$", get(pins, "reactivekernels_sha", "")) ||
+        error("PracticalBayes receipt lacks an exact ReactiveKernels SHA")
+    get(pins, "practicalbayes_revision", "") ==
+        "c6b340baef4f4a9e3d26cd0ea5082a2baf26dcf9" ||
+        error("PracticalBayes receipt uses an unexpected upstream revision")
+    get(receipt["compatibility"], "separate_environment", false) == true ||
+        error("PracticalBayes receipt must retain its separate environment")
+    receipt
+end
+
+render_practicalbayes_eight_schools_baseline() = _render_benchmark_baselines(
+    "This is the exact public PracticalBayes model executed by the external " *
+    "comparator, read verbatim from its benchmark body.",
+    "practicalbayes_comparison_body.jl",
+    (("PracticalBayes Eight Schools model", "practicalbayes-eight-schools"),))
+
+render_practicalbayes_mnist_baselines() = _render_benchmark_baselines(
+    "These are the exact public PracticalBayes MNIST models executed by the " *
+    "external comparator, read verbatim from its benchmark body.",
+    "practicalbayes_comparison_body.jl",
+    (("PracticalBayes idiomatic MNIST model", "practicalbayes-mnist-idiomatic"),
+     ("PracticalBayes vcat-free MNIST model", "practicalbayes-mnist-optimized")))
+
+render_practicalbayes_eval_baseline() = _render_benchmark_baselines(
+    "This is the exact public PracticalBayes model executed by the external " *
+    "evaluation-throughput comparator, read verbatim from its benchmark body.",
+    "practicalbayes_comparison_body.jl",
+    (("PracticalBayes iid-Normal model", "practicalbayes-eval-throughput"),))

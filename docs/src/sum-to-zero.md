@@ -140,12 +140,18 @@ Main.ReactiveKernelsDocs.render_sum_to_zero_benchmarks()
 
 Native RK is competitive with the optimized handwritten control and materially
 faster than Turing for both primal evaluation and reverse AD. Reactant executes
-the exact authored RK graph, but its current vectorized plate and reduction
-structure remains slower than the scalar-unrolled `K = 8` manual control,
-especially for value-plus-gradient. The receipt records this gap rather than
-special-casing one model shape in the compiler. Turing is absent from the
-Reactant panels because DynamicPPL does not expose a public Reactant-traceable
-model-evaluation interface.
+the exact authored RK graph and lands within a few percent of the
+scalar-unrolled `K = 8` manual control for both primal evaluation and
+value-plus-gradient. Nothing in the compiler recognizes this model: a plate
+with a small static lane count lowers as per-lane scalar recipes with a scalar
+reduction, and the automatic AD compile keeps small bound arrays embedded as
+compiler literals, so XLA fuses the whole posterior into one CPU kernel exactly
+as it does for the hand-unrolled loop. The earlier vectorized lowering compiled
+the same graph into several kernels (a materialized effect vector reused by
+two plates, scalars broadcast across lanes, and two reductions) and measured
+between 1.4× and 2× slower; large plates keep that batched lowering. Turing is
+absent from the Reactant panels because DynamicPPL does not expose a public
+Reactant-traceable model-evaluation interface.
 
 Recovery is not benchmarked as part of the density. The receipt and generated
 kernel both assert that every recovery-only node is pruned from the timed cut;

@@ -8,7 +8,7 @@
 import Pkg
 
 const _MNIST_REACTANT_INNER = "RK_MNIST_REACTANT_INNER"
-const _MNIST_REACTANT_VERSION = v"0.2.278"
+const _MNIST_REACTANT_VERSION = v"0.2.284"
 
 _mnist_reactant_body() = any(
     ==("--dataset=wren-pca40"), ARGS) ?
@@ -23,7 +23,7 @@ function _run_pinned_comparison()
     body = joinpath(@__DIR__, _mnist_reactant_body())
     mktempdir(prefix = "reactivekernels-mnist-reactant-") do environment
         setup_seconds = precompile_seconds = 0.0
-        withenv("JULIA_PKG_PRECOMPILE_AUTO" => "0") do
+        _with_serial_pkg_precompile() do
             setup_seconds = @elapsed begin
                 Pkg.activate(environment)
                 Pkg.add([
