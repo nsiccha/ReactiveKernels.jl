@@ -1,4 +1,4 @@
-generated_at = "2026-09-05T09:03:52.250Z"
+generated_at = "2026-09-05T13:47:41.216Z"
 schema = "practicalbayes-comparison-v1"
 
 [compatibility]
@@ -9,36 +9,19 @@ solver_diagnostic = "DynamicPPL 0.42.6 is incompatible with PracticalBayes' Bije
 source_policy = "public API calls only; no PracticalBayes source copied or vendored"
 upstream_license_file_at_pin = "absent"
 
-[datasets.eight_schools]
-data = "canonical Eight Schools effects and standard errors"
-num_observations = 8
-
 [datasets.mnist_logistic_full_raw]
 data = "MLDatasets MNIST train split, first N images; 784 raw Float64 pixels in [0,1]"
 dataset_profile = "full-raw"
 num_features = 784
 num_observations = 60000
 
-[datasets.mnist_logistic_wren_pca40]
-data = "Wren-compatible MNIST: first N training images projected onto the top 40 unwhitened PCA components fitted on all 60000 training images"
-dataset_profile = "wren-pca40"
-num_features = 40
-num_observations = 1000
-pca_centered = true
-pca_components = 40
-pca_explained_variance_fraction = 0.7861077598655901
-pca_fit_observations = 60000
-pca_input_features = 784
-pca_whitened = false
-wren_reference_checked = false
-
 [environment]
 arch = "x86_64"
 cpu = "AMD EPYC-Milan Processor"
-env_setup_seconds = 18.859980089
+env_setup_seconds = 17.705492294
 julia_threads = 1
 os = "Linux"
-precompile_seconds = 19.84208905
+precompile_seconds = 18.846703786
 
 [[eval_measurements]]
 implementation = "practical_bayes"
@@ -53,9 +36,9 @@ variant = "native"
     bytes = [592, 592, 592, 592, 592, 592, 592, 592, 592, 592]
     median_allocs = 5
     median_bytes = 592
-    median_ns = 130.0
-    min_ns = 121.0
-    times_ns = [130.0, 130.0, 201.0, 190.0, 130.0, 130.0, 180.0, 121.0, 130.0, 130.0]
+    median_ns = 120.0
+    min_ns = 120.0
+    times_ns = [180.0, 120.0, 120.0, 120.0, 120.0, 120.0, 120.0, 120.0, 120.0, 120.0]
 [[eval_measurements]]
 implementation = "practical_bayes"
 mode = "primal"
@@ -76,9 +59,9 @@ variant = "native"
     bytes = [1728, 1728, 1728, 1728, 1728, 1728, 1728, 1728, 1728, 1728]
     median_allocs = 9
     median_bytes = 1728
-    median_ns = 441.0
-    min_ns = 430.0
-    times_ns = [441.0, 430.0, 450.0, 440.0, 561.0, 581.0, 441.0, 450.0, 441.0, 440.0]
+    median_ns = 425.5
+    min_ns = 420.0
+    times_ns = [431.0, 470.0, 421.0, 420.0, 421.0, 430.0, 421.0, 421.0, 431.0, 430.0]
 [[eval_measurements]]
 implementation = "practical_bayes"
 mode = "gradient"
@@ -99,9 +82,9 @@ variant = "native"
     bytes = [752, 752, 752, 752, 752, 752, 752, 752, 752, 752]
     median_allocs = 11
     median_bytes = 752
-    median_ns = 190.0
+    median_ns = 200.0
     min_ns = 190.0
-    times_ns = [190.0, 190.0, 200.0, 190.0, 190.0, 321.0, 190.0, 190.0, 190.0, 200.0]
+    times_ns = [351.0, 190.0, 200.0, 200.0, 191.0, 200.0, 200.0, 200.0, 190.0, 200.0]
 [[eval_measurements]]
 implementation = "practical_bayes"
 mode = "gq"
@@ -122,9 +105,9 @@ variant = "native"
     bytes = [6544, 6544, 6544, 6544, 6544, 6544, 6544, 6544, 6544, 6544]
     median_allocs = 5
     median_bytes = 6544
-    median_ns = 941.0
-    min_ns = 882.0
-    times_ns = [941.0, 941.0, 882.0, 952.0, 1031.0, 1021.0, 901.0, 891.0, 911.0, 1052.0]
+    median_ns = 1006.0
+    min_ns = 871.0
+    times_ns = [1022.0, 1052.0, 951.0, 871.0, 1201.0, 971.0, 941.0, 1051.0, 1021.0, 991.0]
 [[eval_measurements]]
 implementation = "practical_bayes"
 mode = "primal"
@@ -145,9 +128,9 @@ variant = "native"
     bytes = [19584, 19584, 19584, 19584, 19584, 19584, 19584, 19584, 19584, 19584]
     median_allocs = 9
     median_bytes = 19584
-    median_ns = 19482.0
-    min_ns = 17885.0
-    times_ns = [19707.0, 18786.0, 19607.0, 22200.0, 19627.0, 18165.0, 18105.0, 17885.0, 20509.0, 19357.0]
+    median_ns = 18080.0
+    min_ns = 16873.0
+    times_ns = [18165.0, 16873.0, 18085.0, 18155.0, 17394.0, 17755.0, 18075.0, 18656.0, 17645.0, 18796.0]
 [[eval_measurements]]
 implementation = "practical_bayes"
 mode = "gradient"
@@ -168,9 +151,9 @@ variant = "native"
     bytes = [6704, 6704, 6704, 6704, 6704, 6704, 6704, 6704, 6704, 6704]
     median_allocs = 11
     median_bytes = 6704
-    median_ns = 1187.0
-    min_ns = 1111.0
-    times_ns = [1111.0, 1492.0, 1201.0, 1171.0, 1252.0, 1182.0, 1182.0, 1222.0, 1162.0, 1192.0]
+    median_ns = 1171.5
+    min_ns = 991.0
+    times_ns = [991.0, 1201.0, 1181.0, 1222.0, 1052.0, 1021.0, 1151.0, 1762.0, 1172.0, 1171.0]
 [[eval_measurements]]
 implementation = "practical_bayes"
 mode = "gq"
@@ -191,9 +174,9 @@ variant = "native"
     bytes = [98464, 98464, 98464, 98464, 98464, 98464, 98464, 98464, 98464, 98464]
     median_allocs = 8
     median_bytes = 98464
-    median_ns = 4666.5
-    min_ns = 4486.0
-    times_ns = [6319.0, 4576.0, 6429.0, 4677.0, 4656.0, 4596.0, 4516.0, 4486.0, 5117.0, 5698.0]
+    median_ns = 4757.0
+    min_ns = 4396.0
+    times_ns = [5638.0, 4726.0, 4597.0, 4747.0, 4807.0, 4396.0, 6829.0, 6369.0, 4526.0, 4767.0]
 [[eval_measurements]]
 implementation = "practical_bayes"
 mode = "primal"
@@ -214,9 +197,9 @@ variant = "native"
     bytes = [295344, 295344, 295344, 295344, 295344, 295344, 295344, 295344, 295344, 295344]
     median_allocs = 18
     median_bytes = 295344
-    median_ns = 29751.0
-    min_ns = 28549.0
-    times_ns = [29671.0, 30192.0, 35479.0, 31083.0, 30452.0, 28960.0, 28579.0, 29571.0, 29831.0, 28549.0]
+    median_ns = 30006.5
+    min_ns = 28299.0
+    times_ns = [31594.0, 29611.0, 28299.0, 30612.0, 30312.0, 29631.0, 34358.0, 29741.0, 30272.0, 29461.0]
 [[eval_measurements]]
 implementation = "practical_bayes"
 mode = "gradient"
@@ -237,9 +220,9 @@ variant = "native"
     bytes = [98624, 98624, 98624, 98624, 98624, 98624, 98624, 98624, 98624, 98624]
     median_allocs = 14
     median_bytes = 98624
-    median_ns = 4957.0
-    min_ns = 4657.0
-    times_ns = [4967.0, 5167.0, 5087.0, 4657.0, 4947.0, 6579.0, 4686.0, 4817.0, 4917.0, 5037.0]
+    median_ns = 4956.5
+    min_ns = 4786.0
+    times_ns = [4896.0, 4787.0, 5016.0, 4997.0, 4786.0, 4916.0, 4896.0, 5077.0, 5047.0, 5177.0]
 [[eval_measurements]]
 implementation = "practical_bayes"
 mode = "gq"
@@ -264,9 +247,9 @@ workload = "eight_schools"
     bytes = [896, 896, 896, 896, 896, 896, 896, 896, 896, 896]
     median_allocs = 6
     median_bytes = 896
-    median_ns = 260.0
-    min_ns = 250.0
-    times_ns = [250.0, 260.0, 260.0, 260.0, 270.0, 270.0, 260.0, 260.0, 260.0, 261.0]
+    median_ns = 250.0
+    min_ns = 240.0
+    times_ns = [250.0, 400.0, 251.0, 250.0, 251.0, 250.0, 260.0, 240.0, 250.0, 250.0]
 [[model_measurements]]
 boundary = "packed_unconstrained"
 configuration = "practicalbayes_ad"
@@ -283,9 +266,9 @@ workload = "eight_schools"
     bytes = [2336, 2336, 2336, 2336, 2336, 2336, 2336, 2336, 2336, 2336]
     median_allocs = 21
     median_bytes = 2336
-    median_ns = 2038.0
-    min_ns = 1973.0
-    times_ns = [2414.0, 1973.0, 2043.0, 2013.0, 2082.0, 2033.0, 2003.0, 3004.0, 2023.0, 2073.0]
+    median_ns = 2012.0
+    min_ns = 1922.0
+    times_ns = [1973.0, 2022.0, 2714.0, 1952.0, 2534.0, 2052.0, 1922.0, 1983.0, 2564.0, 2002.0]
 [[model_measurements]]
 boundary = "packed_unconstrained"
 configuration = "practicalbayes_primal"
@@ -362,9 +345,9 @@ workload = "eight_schools"
     bytes = [1264, 1264, 1264, 1264, 1264, 1264, 1264, 1264, 1264, 1264]
     median_allocs = 19
     median_bytes = 1264
-    median_ns = 420.5
-    min_ns = 410.0
-    times_ns = [671.0, 421.0, 420.0, 420.0, 421.0, 410.0, 410.0, 420.0, 431.0, 431.0]
+    median_ns = 405.5
+    min_ns = 380.0
+    times_ns = [380.0, 410.0, 390.0, 401.0, 400.0, 410.0, 410.0, 651.0, 390.0, 440.0]
 [[model_measurements]]
 boundary = "constrained_parameters"
 configuration = "practicalbayes_ad"
@@ -391,9 +374,9 @@ workload = "eight_schools"
     bytes = [1264, 1264, 1264, 1264, 1264, 1264, 1264, 1264, 1264, 1264]
     median_allocs = 19
     median_bytes = 1264
-    median_ns = 420.5
-    min_ns = 410.0
-    times_ns = [410.0, 551.0, 420.0, 421.0, 420.0, 421.0, 420.0, 430.0, 420.0, 671.0]
+    median_ns = 400.5
+    min_ns = 400.0
+    times_ns = [400.0, 400.0, 401.0, 400.0, 410.0, 640.0, 591.0, 401.0, 400.0, 400.0]
 [[model_measurements]]
 boundary = "constrained_parameters"
 configuration = "practicalbayes_ad"
@@ -420,9 +403,9 @@ workload = "eight_schools"
     bytes = [1264, 1264, 1264, 1264, 1264, 1264, 1264, 1264, 1264, 1264]
     median_allocs = 19
     median_bytes = 1264
-    median_ns = 420.0
-    min_ns = 390.0
-    times_ns = [420.0, 420.0, 420.0, 420.0, 421.0, 390.0, 420.0, 671.0, 410.0, 420.0]
+    median_ns = 410.0
+    min_ns = 400.0
+    times_ns = [410.0, 401.0, 410.0, 410.0, 911.0, 411.0, 400.0, 671.0, 401.0, 401.0]
 [[model_measurements]]
 boundary = "constrained_parameters"
 configuration = "practicalbayes_ad"
@@ -449,9 +432,9 @@ workload = "eight_schools"
     bytes = [1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024]
     median_allocs = 12
     median_bytes = 1024
-    median_ns = 355.0
+    median_ns = 350.0
     min_ns = 340.0
-    times_ns = [360.0, 360.0, 360.0, 350.0, 340.0, 360.0, 350.0, 350.0, 350.0, 361.0]
+    times_ns = [540.0, 541.0, 340.0, 531.0, 341.0, 350.0, 350.0, 350.0, 341.0, 350.0]
 [[model_measurements]]
 boundary = "constrained_parameters"
 configuration = "practicalbayes_ad"
@@ -558,9 +541,9 @@ workload = "mnist_logistic"
     bytes = [38033920, 38033920, 38033920, 38033920, 38033920, 38033920, 38033920, 38033920, 38033920, 38033920]
     median_allocs = 120022
     median_bytes = 38033920
-    median_ns = 1.02221506e8
-    min_ns = 6.5327348e7
-    times_ns = [6.9002868e7, 6.5458079e7, 1.41074408e8, 2.05751629e8, 1.17236701e8, 1.15324142e8, 1.3943033e8, 8.911887e7, 6.6500897e7, 6.5327348e7]
+    median_ns = 6.586579e7
+    min_ns = 5.7930396e7
+    times_ns = [5.7930396e7, 6.7028619e7, 6.5734354e7, 6.2671096e7, 6.0915474e7, 6.7680219e7, 6.3493812e7, 6.8381637e7, 6.5997226e7, 6.7179337e7]
 [[model_measurements]]
 boundary = "packed_unconstrained"
 configuration = "practicalbayes_idiomatic_ad"
@@ -577,9 +560,9 @@ workload = "mnist_logistic"
     bytes = [113569840, 113569840, 113569840, 113569840, 113569840, 113569840, 113569840, 113569840, 113569840, 113569840]
     median_allocs = 240109
     median_bytes = 113569840
-    median_ns = 4.086189395e8
-    min_ns = 3.71978525e8
-    times_ns = [4.14645852e8, 3.76169437e8, 4.22620331e8, 4.02592027e8, 4.24300476e8, 3.71978525e8, 3.94970586e8, 4.34058636e8, 3.84214892e8, 5.09331931e8]
+    median_ns = 3.420602535e8
+    min_ns = 3.29510688e8
+    times_ns = [3.37093511e8, 3.53902234e8, 3.56708266e8, 3.33434021e8, 3.44212603e8, 3.43546264e8, 3.29510688e8, 3.40574243e8, 3.38335074e8, 3.64411946e8]
 [[model_measurements]]
 boundary = "packed_unconstrained"
 configuration = "practicalbayes_idiomatic_primal"
@@ -656,9 +639,9 @@ workload = "mnist_logistic"
     bytes = [38034208, 38034208, 38034208, 38034208, 38034208, 38034208, 38034208, 38034208, 38034208, 38034208]
     median_allocs = 120032
     median_bytes = 38034208
-    median_ns = 7.02785315e7
-    min_ns = 6.1776291e7
-    times_ns = [6.8009908e7, 6.1776291e7, 7.9219718e7, 7.1816879e7, 6.8542542e7, 7.0307497e7, 7.5567482e7, 6.6363407e7, 7.0249566e7, 7.7005775e7]
+    median_ns = 6.8257024e7
+    min_ns = 6.1873246e7
+    times_ns = [6.1873246e7, 6.7013059e7, 6.8209458e7, 6.3482727e7, 6.9973854e7, 6.3550741e7, 7.1947657e7, 6.9842072e7, 6.830459e7, 6.9037132e7]
 [[model_measurements]]
 boundary = "structured_parameters"
 configuration = "practicalbayes_idiomatic_ad"
@@ -685,9 +668,9 @@ workload = "mnist_logistic"
     bytes = [38034208, 38034208, 38034208, 38034208, 38034208, 38034208, 38034208, 38034208, 38034208, 38034208]
     median_allocs = 120032
     median_bytes = 38034208
-    median_ns = 7.038624e7
-    min_ns = 6.4848418e7
-    times_ns = [6.9348855e7, 7.091214e7, 6.986034e7, 6.9438378e7, 6.8955301e7, 7.5266577e7, 6.4848418e7, 7.6201646e7, 7.2527158e7, 7.5304819e7]
+    median_ns = 6.7118379e7
+    min_ns = 6.4037112e7
+    times_ns = [7.1031093e7, 7.1291051e7, 6.7960526e7, 6.5667592e7, 6.736878e7, 6.8376619e7, 6.4037112e7, 6.5231661e7, 6.6443463e7, 6.6867978e7]
 [[model_measurements]]
 boundary = "structured_parameters"
 configuration = "practicalbayes_idiomatic_ad"
@@ -714,9 +697,9 @@ workload = "mnist_logistic"
     bytes = [38034208, 38034208, 38034208, 38034208, 38034208, 38034208, 38034208, 38034208, 38034208, 38034208]
     median_allocs = 120032
     median_bytes = 38034208
-    median_ns = 7.12941175e7
-    min_ns = 6.891039e7
-    times_ns = [6.891039e7, 6.9466937e7, 7.202842e7, 7.1664309e7, 6.9032398e7, 6.9476391e7, 7.6827198e7, 7.0923926e7, 7.3675832e7, 7.3897118e7]
+    median_ns = 6.5862501e7
+    min_ns = 6.1333712e7
+    times_ns = [6.653646e7, 6.5682212e7, 6.1333712e7, 6.8824297e7, 6.8493692e7, 6.3595072e7, 6.604279e7, 6.7144691e7, 6.4999421e7, 6.4340931e7]
 [[model_measurements]]
 boundary = "structured_parameters"
 configuration = "practicalbayes_idiomatic_ad"
@@ -743,9 +726,9 @@ workload = "mnist_logistic"
     bytes = [38034032, 38034032, 38034032, 38034032, 38034032, 38034032, 38034032, 38034032, 38034032, 38034032]
     median_allocs = 120028
     median_bytes = 38034032
-    median_ns = 6.8770086e7
-    min_ns = 6.4447204e7
-    times_ns = [6.4447204e7, 6.8829267e7, 7.1744239e7, 6.8710905e7, 6.5048344e7, 7.231817e7, 6.9768383e7, 6.753377e7, 6.8191279e7, 7.1574313e7]
+    median_ns = 6.97668875e7
+    min_ns = 6.2240483e7
+    times_ns = [6.2240483e7, 7.5538963e7, 7.7388795e7, 6.8666489e7, 6.8803239e7, 6.9013919e7, 7.0519856e7, 7.7729886e7, 6.8970459e7, 7.1175763e7]
 [[model_measurements]]
 boundary = "structured_parameters"
 configuration = "practicalbayes_idiomatic_ad"
@@ -772,9 +755,9 @@ workload = "mnist_logistic"
     bytes = [8753632, 8753632, 8753632, 8753632, 8753632, 8753632, 8753632, 8753632, 8753632, 8753632]
     median_allocs = 10
     median_bytes = 8753632
-    median_ns = 5.8385234e7
-    min_ns = 5.6181866e7
-    times_ns = [5.8611626e7, 5.6486375e7, 5.9407203e7, 5.6996599e7, 6.2674699e7, 5.759182e7, 5.8158842e7, 6.9478052e7, 5.6181866e7, 6.2032394e7]
+    median_ns = 5.3017802e7
+    min_ns = 5.0550592e7
+    times_ns = [5.727394e7, 5.3721578e7, 5.373712e7, 5.1524036e7, 5.0550592e7, 5.3247364e7, 5.278824e7, 5.1767572e7, 5.2209603e7, 5.3714228e7]
 [[model_measurements]]
 boundary = "packed_unconstrained"
 configuration = "practicalbayes_vcat_free_ad"
@@ -791,9 +774,9 @@ workload = "mnist_logistic"
     bytes = [42524720, 42524720, 42524720, 42524720, 42524720, 42524720, 42524720, 42524720, 42524720, 42524720]
     median_allocs = 36
     median_bytes = 42524720
-    median_ns = 3.512792775e8
-    min_ns = 3.0684144e8
-    times_ns = [3.56778391e8, 3.11172022e8, 3.18813462e8, 3.45780164e8, 4.19769278e8, 3.0684144e8, 3.21816424e8, 4.06659918e8, 4.80750623e8, 4.31290748e8]
+    median_ns = 2.98094127e8
+    min_ns = 2.82640854e8
+    times_ns = [2.95624599e8, 3.45616421e8, 3.50218751e8, 3.00563655e8, 2.82640854e8, 2.94888483e8, 2.89112144e8, 2.94322783e8, 3.10934606e8, 3.09311656e8]
 [[model_measurements]]
 boundary = "packed_unconstrained"
 configuration = "practicalbayes_vcat_free_primal"
@@ -870,9 +853,9 @@ workload = "mnist_logistic"
     bytes = [8753920, 8753920, 8753920, 8753920, 8753920, 8753920, 8753920, 8753920, 8753920, 8753920]
     median_allocs = 20
     median_bytes = 8753920
-    median_ns = 6.03373415e7
-    min_ns = 5.326388e7
-    times_ns = [6.3640111e7, 5.6541341e7, 5.9270325e7, 6.3439384e7, 5.326388e7, 6.1404358e7, 5.7607252e7, 8.5555436e7, 5.6236571e7, 6.1774618e7]
+    median_ns = 5.56735065e7
+    min_ns = 5.3561437e7
+    times_ns = [5.3748115e7, 5.4923236e7, 5.5665821e7, 5.8371204e7, 5.3561437e7, 5.9254093e7, 6.2770414e7, 5.7738171e7, 5.5681192e7, 5.5154586e7]
 [[model_measurements]]
 boundary = "structured_parameters"
 configuration = "practicalbayes_vcat_free_ad"
@@ -899,9 +882,9 @@ workload = "mnist_logistic"
     bytes = [8753920, 8753920, 8753920, 8753920, 8753920, 8753920, 8753920, 8753920, 8753920, 8753920]
     median_allocs = 20
     median_bytes = 8753920
-    median_ns = 6.0132709e7
-    min_ns = 5.4499013e7
-    times_ns = [5.7619968e7, 5.4863477e7, 5.4499013e7, 7.7795514e7, 6.1941488e7, 6.1639232e7, 6.495197e7, 5.6702323e7, 5.8626186e7, 3.11610447e8]
+    median_ns = 5.593745e7
+    min_ns = 5.1830239e7
+    times_ns = [5.6353459e7, 5.5521441e7, 5.7827884e7, 5.4536312e7, 5.7118826e7, 5.1830239e7, 5.9221277e7, 7.0742113e7, 5.3238141e7, 5.4952737e7]
 [[model_measurements]]
 boundary = "structured_parameters"
 configuration = "practicalbayes_vcat_free_ad"
@@ -928,9 +911,9 @@ workload = "mnist_logistic"
     bytes = [8753920, 8753920, 8753920, 8753920, 8753920, 8753920, 8753920, 8753920, 8753920, 8753920]
     median_allocs = 20
     median_bytes = 8753920
-    median_ns = 6.1799548e7
-    min_ns = 5.4756088e7
-    times_ns = [7.692264e7, 1.24698692e8, 6.8728359e7, 7.1851987e7, 6.3110441e7, 5.7044174e7, 5.5498813e7, 5.562734e7, 6.0488655e7, 5.4756088e7]
+    median_ns = 5.40397675e7
+    min_ns = 5.1451786e7
+    times_ns = [5.6209041e7, 5.4111898e7, 5.1681793e7, 6.1896669e7, 5.4980706e7, 5.3967637e7, 5.9843535e7, 5.2213777e7, 5.1634328e7, 5.1451786e7]
 [[model_measurements]]
 boundary = "structured_parameters"
 configuration = "practicalbayes_vcat_free_ad"
@@ -965,14 +948,12 @@ workload = "mnist_logistic"
 
 [pins]
 adtypes_version = "1.24.0"
-advancedhmc_version = "0.8.7"
-benchmark_body_sha256 = "4863f7ba353c3d20e588829a15ddc6387f2d8fd8901e7cdd4e188be941c88d60"
+benchmark_body_sha256 = "d68eeb47946d88c253c13c95129053bd2439035f67036f690657d7589c4e7182"
 benchmarktools_version = "1.6.3"
 distributions_version = "0.25.131"
 enzyme_version = "0.13.199"
 julia_version = "1.10.11"
 logdensityproblems_version = "2.2.0"
-mcmcdiagnostictools_version = "0.3.19"
 mldatasets_version = "0.7.21"
 nnlib_version = "0.9.45"
 practicalbayes_git_revision = "c6b340baef4f4a9e3d26cd0ea5082a2baf26dcf9"
@@ -980,55 +961,55 @@ practicalbayes_repository = "https://github.com/EvoArt/PracticalBayes.git"
 practicalbayes_revision = "c6b340baef4f4a9e3d26cd0ea5082a2baf26dcf9"
 practicalbayes_version = "0.1.0"
 reactivekernels_dirty = false
-reactivekernels_sha = "9587ee6b77bf1bcdf7b34c00a3c970506042616d"
+reactivekernels_sha = "d059429300ddecb5623a6ee92604c051a0091f77"
 
 [[preparations]]
-ad_first_call_seconds = 29.98750354
-ad_prepare_seconds = 0.065908487
-layout_seconds = 0.060354937
+ad_first_call_seconds = 26.665526002
+ad_prepare_seconds = 0.006426209
+layout_seconds = 0.061296676
 model = "centered"
-primal_first_call_seconds = 0.173452344
-primal_prepare_seconds = 0.006704566
+primal_first_call_seconds = 0.153499993
+primal_prepare_seconds = 0.007337355
 workload = "eight_schools"
 [[preparations]]
-ad_first_call_seconds = 86.576081044
-ad_prepare_seconds = 0.006756569
-layout_seconds = 0.082396689
+ad_first_call_seconds = 76.556533215
+ad_prepare_seconds = 0.009800193
+layout_seconds = 0.080259457
 model = "idiomatic"
-primal_first_call_seconds = 0.35622574
-primal_prepare_seconds = 0.006254306
+primal_first_call_seconds = 0.369747739
+primal_prepare_seconds = 0.007001801
 workload = "mnist_logistic"
 [[preparations]]
-ad_first_call_seconds = 21.336831801
-ad_prepare_seconds = 0.010087553
-layout_seconds = 0.057158482
+ad_first_call_seconds = 21.008733994
+ad_prepare_seconds = 0.007805611
+layout_seconds = 0.054784635
 model = "vcat_free"
-primal_first_call_seconds = 0.314576037
-primal_prepare_seconds = 0.009641497
+primal_first_call_seconds = 0.295133642
+primal_prepare_seconds = 0.009757403
 workload = "mnist_logistic"
 [[preparations]]
-ad_first_call_seconds = 7.432487051
-ad_prepare_seconds = 0.006589529
-layout_seconds = 0.003948116
+ad_first_call_seconds = 6.950724922
+ad_prepare_seconds = 0.0061023
+layout_seconds = 0.00534091
 model = "iid_normal_n_16"
-primal_first_call_seconds = 0.159871231
-primal_prepare_seconds = 0.005996591
+primal_first_call_seconds = 0.17054638
+primal_prepare_seconds = 0.007262491
 workload = "eval_throughput"
 [[preparations]]
-ad_first_call_seconds = 4.2427e-5
-ad_prepare_seconds = 2.724e-6
-layout_seconds = 4.7576e-5
+ad_first_call_seconds = 3.9774e-5
+ad_prepare_seconds = 3.065e-6
+layout_seconds = 4.4281e-5
 model = "iid_normal_n_256"
-primal_first_call_seconds = 4.717e-6
-primal_prepare_seconds = 5.718e-6
+primal_first_call_seconds = 5.057e-6
+primal_prepare_seconds = 4.756e-6
 workload = "eval_throughput"
 [[preparations]]
-ad_first_call_seconds = 7.3421e-5
-ad_prepare_seconds = 3.405e-6
-layout_seconds = 7.2901e-5
+ad_first_call_seconds = 7.1338e-5
+ad_prepare_seconds = 3.464e-6
+layout_seconds = 5.3595e-5
 model = "iid_normal_n_4096"
-primal_first_call_seconds = 9.483e-6
-primal_prepare_seconds = 6.93e-6
+primal_first_call_seconds = 8.212e-6
+primal_prepare_seconds = 5.477e-6
 workload = "eval_throughput"
 
 [protocol]
@@ -1039,16 +1020,6 @@ eval_modes = ["primal", "gradient", "gq"]
 eval_sizes = [16, 256, 4096]
 gradient_backend = "ADTypes.AutoEnzyme with Enzyme reverse runtime activity"
 julia_threads = 1
-mcmc_divergence_threshold = 1000.0
-mcmc_harness = "PracticalBayes.sample with AdvancedHMC.NUTS"
-mcmc_max_tree_depth = 10
-mcmc_metric = "diagonal"
-mcmc_models = ["eight_schools", "mnist_logistic_wren_pca40"]
-mcmc_num_samples = 1000
-mcmc_num_warmup = 1000
-mcmc_seed = 20260901
-mcmc_target_accept = 0.8
-mcmc_timing = "public sample call covering internal layout/AD preparation, adaptation, and retained draws; a separate five-warmup/five-draw JIT warm-start is recorded"
 mnist_full_observations = 60000
 model_matrix = ["eight_schools", "mnist_logistic"]
 model_outcomes = ["joint", "prior", "likelihood", "pointwise"]
@@ -1057,7 +1028,7 @@ precision = "Float64 parameters and data"
 preparation_in_timed_region = false
 rounds = 10
 samples_per_round = 20
-sections = ["models", "eval", "sampling"]
+sections = ["models", "eval"]
 setup_in_timed_region = false
 unsupported_cells_recorded = true
 warmup_in_timed_region = false
@@ -1065,29 +1036,3 @@ warmup_in_timed_region = false
     [protocol.model_boundaries]
     eight_schools = ["packed_unconstrained", "constrained_parameters", "minimal_likelihood"]
     mnist_logistic = ["packed_unconstrained", "structured_parameters"]
-
-[[sampling_measurements]]
-compile_or_warm_start_seconds = 0.001301736
-density_parity_max_abs = 0.0
-divergences = 19
-harness = "practicalbayes_nuts"
-median_ess = 151.25972500622277
-min_ess = 58.16728081218719
-model = "eight_schools"
-posterior_mean_mu = 4.741612512692779
-posterior_mean_tau = 3.8992673066431762
-posterior_sd_mu = 3.8531277360084113
-sampling_seconds = 0.234204641
-state = "measured"
-[[sampling_measurements]]
-compile_or_warm_start_seconds = 0.180600611
-density_parity_max_abs = 2.864908310584724e-11
-divergences = 0
-harness = "practicalbayes_nuts"
-median_ess = 993.4883662127486
-min_ess = 311.86699730371834
-model = "mnist_logistic_wren_pca40"
-posterior_mean_first_coefficient = -2.9209794247638885
-posterior_sd_first_coefficient = 0.3383497954864719
-sampling_seconds = 64.403024581
-state = "measured"
