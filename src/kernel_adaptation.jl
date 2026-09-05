@@ -3698,6 +3698,34 @@ struct _SMControlTraceReturn
     value::Any
 end
 
+# Keep the outer generated control wrapper available to a tracing backend too.
+# Its expression is static compiler metadata, assembled once during lowering.
+# Evaluating it directly avoids first compiling the same large wrapper through
+# a second Julia interpreter. Native execution still calls the generated body.
+struct _SMControlTraceBody
+    body::Expr
+    parameters::Tuple
+end
+
+function _SMControlTraceBody(f)
+    expression = RuntimeGeneratedFunctions.get_expression(f)
+    expression.head === :-> && expression.args[1] isa Expr &&
+        expression.args[1].head === :tuple ||
+        _sm_reject("control trace body requires a generated tuple-argument body")
+    parameters = Tuple(expression.args[1].args)
+    length(parameters) == 7 && all(name -> name isa Symbol, parameters) ||
+        _sm_reject("control trace body has an invalid generated parameter ABI")
+    _SMControlTraceBody(expression.args[2], parameters)
+end
+
+function (body::_SMControlTraceBody)(values::Tuple)
+    length(values) == length(body.parameters) ||
+        _sm_reject("control trace body received the wrong argument count")
+    environment = Dict{Symbol,Any}(zip(body.parameters, values))
+    result = _sm_control_trace_value(body.body, environment)
+    result isa _SMControlTraceReturn ? result.value : result
+end
+
 _sm_control_trace_value(value, environment) = value
 _sm_control_trace_value(value::QuoteNode, environment) = value.value
 _sm_control_trace_value(value::GlobalRef, environment) =
@@ -3901,6 +3929,7 @@ struct _FunctionalStateMachineTransition{
     step::Step
     bounds::Bounds
     rng_providers::RNGProviders
+    trace_body::Union{Nothing,_SMControlTraceBody}
 end
 
 # Keyword arguments are convenient for ordinary Julia, but optional compiler
@@ -5029,6 +5058,17 @@ function _sm_effect_predicated_select(
     _sm_validate_topology_contract(normalized, topology)
 end
 
+function _sm_generated_machine_body(transition, state, arguments, effects)
+    RuntimeGeneratedFunctions.generated_callfunc(
+        getfield(transition, :f), getfield(transition, :ports),
+        getfield(transition, :rng_providers),
+        getfield(transition, :ensures), getfield(transition, :step),
+        state, arguments, effects)
+end
+
+_sm_functional_machine_body(transition, state, arguments, effects) =
+    _sm_generated_machine_body(transition, state, arguments, effects)
+
 function _sm_functional_machine_call(
         transition::_FunctionalStateMachineTransition{
             Names,Groups,ArrayNames,StateType,EffectType,Iterations,ArgumentTypes,
@@ -5040,11 +5080,8 @@ function _sm_functional_machine_call(
     _sm_validate_compiled_effects_input(transition, effects)
     backend_state = _sm_functional_machine_storage(
         getfield(transition, :ports), state)
-    result = RuntimeGeneratedFunctions.generated_callfunc(
-        getfield(transition, :f), getfield(transition, :ports),
-        getfield(transition, :rng_providers),
-        getfield(transition, :ensures), getfield(transition, :step),
-        backend_state, arguments, effects)
+    result = _sm_functional_machine_body(
+        transition, backend_state, arguments, effects)
     result = _sm_restore_reusable_compiled_output(transition, result)
     restored_effects = _sm_canonicalize_effect_topologies(
         getfield(transition, :ports), result.effects)
@@ -9068,7 +9105,7 @@ function _functional_state_machine_method(
         typeof(rng_providers),type_context}(
             fn, ports, Tuple(ensures), getfield(kernel, :shape_contract),
             getfield(kernel, :topology_contract), control_step, bounds,
-            rng_providers)
+            rng_providers, recursive ? _SMControlTraceBody(fn) : nothing)
 end
 
 function _sm_straight_return_spec(::Type{Forest}) where {Forest}
