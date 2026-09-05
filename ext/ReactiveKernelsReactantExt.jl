@@ -1028,6 +1028,33 @@ _rk_reactant_ad_op(::Val{:gradient}) = DifferentiationInterface.gradient
 _rk_reactant_ad_op(::Val{:value_and_gradient}) =
     DifferentiationInterface.value_and_gradient
 
+# Program metadata and the native-only DI cache are not dynamic inputs or
+# mutated outputs of a trace. The traced call below does not use that cache.
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels.PreparedADKernel,
+        path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where {T<:ReactiveKernels.PreparedADKernel}
+    T
+end
+
+# A native DI preparation is tied to native input types. Inside a larger
+# compiled algorithm, select the same kernel's tensorized body and let DI
+# stage its derivative in that enclosing trace instead of launching a
+# separately compiled gradient executable.
+function ReactiveKernels._ad_prepared_value_and_gradient(
+        prepared::ReactiveKernels.PreparedADKernel{I},
+        point::Union{Reactant.TracedRArray,Reactant.TracedRNumber},
+        contexts) where {I}
+    call = ReactiveKernels._ADKernelCall{I,typeof(prepared.kernel)}(prepared.kernel)
+    DifferentiationInterface.value_and_gradient(
+        call, prepared.backend, point, contexts...)
+end
+
 function _rk_reactant_compile_ad_call(
         mode::Val, prepared::ReactiveKernels.PreparedADKernel{I}, kernel,
         args::Tuple; sync::Bool) where {I}

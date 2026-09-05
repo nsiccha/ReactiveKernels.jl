@@ -451,11 +451,19 @@ Compute a scalar value and gradient without requiring caller-owned gradient
 storage. This is the structured counterpart to [`ad_value_and_gradient!`](@ref):
 it preserves DifferentiationInterface's returned cotangent structure, including
 `NamedTuple` active inputs supported by the backend.
+
+With Reactant loaded, a traced scalar or array active input stages this
+operation inside the enclosing compiled program, using the same primal kernel
+and DI backend. It does not reuse the native-input DI preparation in that trace.
 """
 function ad_value_and_gradient(
         prepared::PreparedADKernel, args...; kwargs...)
     point, contexts = _ad_prepared_arguments(
         prepared, args, NamedTuple(kwargs))
+    _ad_prepared_value_and_gradient(prepared, point, contexts)
+end
+
+function _ad_prepared_value_and_gradient(prepared, point, contexts)
     DifferentiationInterface.value_and_gradient(
         prepared.call, prepared.preparation, prepared.backend,
         point, contexts...)
