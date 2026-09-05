@@ -248,12 +248,12 @@ end
     _rk_reactant_mixed_array_select_reverse(active, host, traced)
 
 # Distinct loop-carry slots must not reuse one traced scalar identity when the
-# body can update those slots independently. `copy` is identity for Numbers,
-# so materialize a value-preserving backend operation instead.
+# body can update those slots independently. Reactant's `copy` creates a new
+# number wrapper without arithmetic, preserving signed zero and exact bits.
 @inline ReactiveKernels._sm_control_carry_isolate(
-    value::Reactant.TracedRNumber) = value + zero(value)
+    value::Reactant.TracedRNumber) = copy(value)
 @inline ReactiveKernels._sm_control_carry_isolate(
-    value::Reactant.AbstractConcreteNumber) = value + zero(value)
+    value::Reactant.AbstractConcreteNumber) = copy(value)
 
 # A traced branch can legitimately meet a source literal or compiler-static
 # initial value of the same logical scalar type.  Keep that bridge exact: it
@@ -320,6 +320,37 @@ function ReactiveKernels._sm_functional_control_loop(
         carry = step(carry)
     end
     carry
+end
+
+function ReactiveKernels._sm_control_dispatch(
+        dispatch::ReactiveKernels._SMControlBlockDispatch, ports,
+        rng_providers, ensures, carry, index::Reactant.TracedRNumber)
+    Reactant.Ops.case(index, dispatch.branches, carry; track_numbers=Union{})
+end
+
+ReactiveKernels._sm_frame_fill(
+        value::Reactant.TracedRNumber, ::Val{Capacity}) where {Capacity} =
+    Reactant.Ops.fill(value, (Capacity,))
+
+function ReactiveKernels._sm_frame_read(
+        values::Reactant.TracedRArray{T,1}, index::Reactant.TracedRNumber) where {T}
+    isempty(values) && throw(ArgumentError(
+        "functional control frame store cannot be empty"))
+    valid = (index >= one(index)) & (index <= length(values))
+    safe = ifelse(valid, index, one(index))
+    Reactant.@allowscalar values[safe]
+end
+
+function ReactiveKernels._sm_frame_write(
+        values::Reactant.TracedRArray{T,1}, index::Reactant.TracedRNumber,
+        replacement, active) where {T}
+    valid = (index >= one(index)) & (index <= length(values))
+    safe = ifelse(valid, index, one(index))
+    Reactant.@allowscalar begin
+        result = copy(values)
+        result[safe] = ifelse(active & valid, replacement, values[safe])
+        result
+    end
 end
 
 function ReactiveKernels._sm_functional_control_loop(

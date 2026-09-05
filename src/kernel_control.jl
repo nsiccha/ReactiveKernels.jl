@@ -42,6 +42,42 @@ end
 BB(blks::Vector{Blk}, next::Int) = BB(blks, next, false)
 _newpc!(bb) = (p = bb.next; bb.next += 1; p)
 
+# A lowered loop needs its own induction binding. Acyclic callees are inlined
+# into the caller's CFG, so retaining an authored name (especially `_`) lets
+# an inner loop overwrite the caller's index. Respect nested loop scopes while
+# renaming reads and writes; their iterator still evaluates in the outer scope.
+function _control_rename_loop_binding(x, old::Symbol, new::Symbol)
+    rename(value) = _control_rename_loop_binding(value, old, new)
+    if x isa _LocalRef
+        return x.name === old ? _LocalRef(new) : x
+    elseif x isa _LocalAssign
+        names = Tuple(name === old ? new : name for name in x.lhs)
+        if x.style === :named && names != x.lhs
+            x.rhs isa _SelfRef || _l_ctrl_reject(
+                "renamed named destructuring requires the state receiver")
+            return _LocalAssign(names,
+                _TupleExpr(Tuple(_SelfField((name,)) for name in x.lhs)), :tuple)
+        end
+        return _LocalAssign(names, rename(x.rhs), x.style)
+    elseif x isa _For
+        return _For(x.var, rename(x.iter),
+            old in x.var ? x.body : rename(x.body))
+    elseif x isa _PlaceWrite
+        return _PlaceWrite(rename(x.target), x.root, x.owner,
+            x.alias === old ? new : x.alias, rename(x.rhs), x.dot)
+    elseif x isa Tuple
+        return Tuple(rename(value) for value in x)
+    elseif x isa AbstractVector
+        return Any[rename(value) for value in x]
+    elseif x isa Pair
+        return rename(first(x)) => rename(last(x))
+    elseif x isa _MExpr || x isa _MStmt
+        T = typeof(x)
+        return T((rename(getfield(x, field)) for field in fieldnames(T))...)
+    end
+    x
+end
+
 # Compile `stmts`; on fall-through, control continues at `cont_pc` (0 == return).
 # Returns the entry pc (== cont_pc when stmts is empty, allocating no block).
 # CFG builder with proper INLINING (RK 09:43): a callee _Return becomes a jump to the call-site
@@ -180,7 +216,12 @@ function build_region!(bb::BB, stmts, cont_pc::Int, ret_pc::Int, ret_val, by_mid
         lo, hi = _range_bounds(st.iter)
         header = _newpc!(bb); incr = _newpc!(bb)
         counter = Symbol("__rk_loop_count_", header)
-        body = build_region!(bb, collect(st.body), incr, ret_pc, ret_val, by_mid, rec, after, incr)  # brk=after, continue=incr
+        loop_body = st.body
+        if bb.lower_all_loops
+            var = gensym(:control_loop_index)
+            loop_body = _control_rename_loop_binding(st.body, only(st.var), var)
+        end
+        body = build_region!(bb, collect(loop_body), incr, ret_pc, ret_val, by_mid, rec, after, incr)  # brk=after, continue=incr
         condition = bb.lower_all_loops ?
             _RawCond((:bounded_for, var, hi, counter)) : _RawCond((var, hi))
         push!(bb.blks, Blk(header, Any[], TBranch(condition, body, after)))                           # if var <= hi
@@ -593,7 +634,8 @@ function _control_program_from_irs(irs0; root_mid::Int,
             end
         end
         spilled[mid] = Tuple(unique(vcat(
-            spilled_locals(by_mid[mid], framed), cfg_locals)))
+            lower_all_loops ? Symbol[] : spilled_locals(by_mid[mid], framed),
+            cfg_locals)))
         stored[mid] = Tuple(unique(vcat(live_formals(by_mid[mid], cfg.blks),
                                           collect(spilled[mid]))))
         position = Dict{Symbol,Int}()

@@ -1199,6 +1199,18 @@ end
 # seed each slot with an isolated structural value. Optional scalar backends
 # specialize this hook because immutable host Numbers have no identity to copy.
 @inline _sm_control_carry_isolate(value) = _sm_structural_copy(value)
+@inline _sm_control_argument_isolate(value) = value
+@inline _sm_control_argument_isolate(value::Number) =
+    _sm_control_carry_isolate(value)
+@inline _sm_control_argument_isolate(replay::OrderedRNGReplay) =
+    _sm_ordered_rng_reconstruct(
+        replay.normals, replay.uniforms, replay.exponentials,
+        replay.event_tokens,
+        _sm_control_carry_isolate(replay.normal_index),
+        _sm_control_carry_isolate(replay.uniform_index),
+        _sm_control_carry_isolate(replay.exponential_index),
+        _sm_control_carry_isolate(replay.event_index),
+        _sm_control_carry_isolate(replay.overflow))
 @inline _sm_sanctioned_sqrt(value) = sqrt(value)
 @inline _sm_sanctioned_sqrt(value::LinearAlgebra.Diagonal) =
     LinearAlgebra.Diagonal(sqrt.(value.diag))
@@ -2412,6 +2424,16 @@ function _sm_machine_domain_forest(ir::MethodIR, plan::_KernelPlan, fields,
                 # structural transfer, not NamedTuple/leaf broadcasting.
                 # Keep the source general enough for proposal indexing; exact
                 # source/destination type is checked by the copy domain.
+                if statement.dot && statement.target isa _FormalRef
+                    destination = _sm_dtree(statement.target, plan, fields,
+                        OW, SH, finfo, ltrees, false, field_regs,
+                        methods_by_id, MethodId[ir.id])
+                    source = _sm_dtree(statement.rhs, plan, fields, OW, SH,
+                        finfo, ltrees, false, field_regs, methods_by_id,
+                        MethodId[ir.id])
+                    push!(nodes, _DValue{_DStructuredStateCopy{destination,source}})
+                    continue
+                end
                 if statement.dot && statement.target isa _SelfField &&
                         length(statement.target.path) == 1 &&
                         get(field_regs, only(statement.target.path), nothing) isa
@@ -2867,6 +2889,14 @@ function compile_state_machine_method(pf::_PreparedFactory, ::Type{OW},
 
     emit_write! = function (statement::_PlaceWrite, destination,
                             block_syms, block_locals)
+        if statement.dot && statement.target isa _FormalRef
+            # As with copy!! through a positional state alias, immutable
+            # snapshot replacement requires the functional carry ABI.
+            push!(destination, :(throw(ArgumentError(
+                "native structural copy through a positional " *
+                "state alias requires functional lowering"))))
+            return nothing
+        end
         statement.root in (:self, :alias) && statement.owner !== nothing &&
             length(statement.owner) == 1 || _sm_reject(
                 "state-machine write root `$(statement.root)` / owner " *
@@ -2919,8 +2949,15 @@ function compile_state_machine_method(pf::_PreparedFactory, ::Type{OW},
         elseif statement.target isa _SelfField
             path = Base.tail(statement.target.path)
             field_type = _sm_structural_path_type(root_type, Val(path))
-            field_type <: AbstractArray && isempty(path) && _sm_reject(
-                "state-machine root-array writes must name explicit indices")
+            if field_type <: AbstractArray && isempty(path)
+                statement.dot || _sm_reject(
+                    "state-machine root-array writes must name explicit indices")
+                target = _pp_read(plan, canon)
+                push!(destination, :(Base.materialize!($target,
+                    Base.Broadcast.broadcasted(identity, $rhs_symbol))))
+                repair!(destination, (canon,), dependents)
+                return nothing
+            end
             replacement = statement.dot ? :(Base.materialize($rhs_symbol)) : rhs_symbol
             value = if isempty(path)
                 descriptor = get(field_regs, name, nothing)
@@ -3499,6 +3536,15 @@ function compile_stateful_methods(skel, pf::_PreparedFactory, ::Type{OW},
             positional = count(formal -> formal.kind === :pos, ir.formals)
             structured = _sm_nested_statement(
                 ir.body, statement -> statement isa Union{_If,_Guard,_While})
+            # The legacy one-argument adapter reserves only exact eachcol
+            # orchestration. A scalar runtime range is ordinary machine
+            # control, including when its method has one positional formal.
+            has_for = _sm_nested_statement(
+                ir.body, statement -> statement isa _For)
+            eachcol_only = length(ir.body) == 1 && ir.body[1] isa _For &&
+                ir.body[1].iter isa _RegisteredCall &&
+                getfield(ir.body[1].iter.registration, :source) === eachcol
+            structured |= has_for && !eachcol_only
             if positional != 1 || structured
                 fn, forest = compile_state_machine_method(
                     pf, OW, SH, ir, global_written, typeauth, field_regs,
@@ -3603,15 +3649,224 @@ end
 # traced while-region.  This wrapper keeps the generated body, compiler ports,
 # and ensure tuple concrete and static while exposing the same one-argument
 # step ABI to the backend-neutral control loop.
-struct _FunctionalStateMachineControlStep{F,P,R,E}
-    f::F
-    ports::P
-    rng_providers::R
-    ensures::E
+struct _FunctionalStateMachineControlStep
+    # These are static program resources, shared by every control block.
+    # Keep the wrapper layout independent of generated-function identities
+    # and nested port metadata; individual block calls specialize behind
+    # their execution barrier instead of copying that type graph into every
+    # callable constructor and backend branch-list operation.
+    f::Any
+    ports::Any
+    rng_providers::Any
+    ensures::Any
+end
+
+# Trace the compiler-emitted block statements directly. Compiling every large
+# RGF through an accelerator's Julia interpreter first duplicates expensive
+# host inference. This evaluator handles only our generated expression domain;
+# registered calls remain ordinary Julia calls so backend overlays still apply.
+# Native execution continues to use the generated block behind its call barrier.
+struct _SMControlTraceBlock
+    body::Expr
+    parameters::Tuple
+    ports::Any
+    rng_providers::Any
+    ensures::Any
+end
+
+function _SMControlTraceBlock(f, ports, rng_providers, ensures)
+    expression = RuntimeGeneratedFunctions.get_expression(f)
+    expression.head === :-> && expression.args[1] isa Expr &&
+        expression.args[1].head === :tuple ||
+        _sm_reject("control trace block requires a generated tuple-argument body")
+    parameters = Tuple(expression.args[1].args)
+    length(parameters) == 4 && all(name -> name isa Symbol, parameters) ||
+        _sm_reject("control trace block has an invalid generated parameter ABI")
+    _SMControlTraceBlock(expression.args[2], parameters,
+                         ports, rng_providers, ensures)
+end
+
+Base.show(io::IO, ::_SMControlTraceBlock) =
+    print(io, "ReactiveKernels.StateMachineTraceBlock")
+
+struct _SMControlTraceReturn
+    value::Any
+end
+
+_sm_control_trace_value(value, environment) = value
+_sm_control_trace_value(value::QuoteNode, environment) = value.value
+_sm_control_trace_value(value::GlobalRef, environment) =
+    getfield(value.mod, value.name)
+_sm_control_trace_value(value::Symbol, environment) =
+    haskey(environment, value) ? environment[value] : getfield(@__MODULE__, value)
+_sm_control_trace_value(::LineNumberNode, environment) = nothing
+
+function _sm_control_trace_items(expressions, environment)
+    values = Any[]
+    for expression in expressions
+        if expression isa Expr && expression.head === :...
+            append!(values, _sm_control_trace_value(only(expression.args), environment))
+        else
+            push!(values, _sm_control_trace_value(expression, environment))
+        end
+    end
+    values
+end
+
+function _sm_control_trace_value(expression::Expr, environment)
+    head, arguments = expression.head, expression.args
+    if head === :block
+        result = nothing
+        for statement in arguments
+            result = _sm_control_trace_value(statement, environment)
+            result isa _SMControlTraceReturn && return result
+        end
+        return result
+    elseif head === :local
+        result = nothing
+        for statement in arguments
+            result = statement isa Symbol ? (environment[statement] = nothing) :
+                _sm_control_trace_value(statement, environment)
+        end
+        return result
+    elseif head === :(=)
+        arguments[1] isa Symbol ||
+            _sm_reject("control trace block requires symbolic local assignments")
+        return environment[arguments[1]] =
+            _sm_control_trace_value(arguments[2], environment)
+    elseif head === :call
+        callable = _sm_control_trace_value(arguments[1], environment)
+        positional = arguments[2:end]
+        if !isempty(positional) && positional[1] isa Expr &&
+                positional[1].head === :parameters
+            keywords = positional[1].args
+            names = Tuple(keyword.args[1] for keyword in keywords)
+            values = Tuple(_sm_control_trace_value(keyword.args[2], environment)
+                           for keyword in keywords)
+            return callable(_sm_control_trace_items(positional[2:end], environment)...;
+                            NamedTuple{names}(values)...)
+        end
+        return callable(_sm_control_trace_items(positional, environment)...)
+    elseif head === :tuple
+        if !isempty(arguments) && all(value -> value isa Expr &&
+                value.head in (:(=), :kw), arguments)
+            names = Tuple(value.args[1] for value in arguments)
+            return NamedTuple{names}(Tuple(
+                _sm_control_trace_value(value.args[2], environment) for value in arguments))
+        end
+        return Tuple(_sm_control_trace_items(arguments, environment))
+    elseif head === :curly
+        return Core.apply_type(_sm_control_trace_value(arguments[1], environment),
+            _sm_control_trace_items(arguments[2:end], environment)...)
+    elseif head === :return
+        return _SMControlTraceReturn(isempty(arguments) ? nothing :
+            _sm_control_trace_value(only(arguments), environment))
+    elseif head === :if
+        predicate = _sm_control_trace_value(arguments[1], environment)
+        predicate isa Bool ||
+            _sm_reject("control trace block contains a non-host branch")
+        return predicate ? _sm_control_trace_value(arguments[2], environment) :
+            length(arguments) == 3 ?
+                _sm_control_trace_value(arguments[3], environment) : nothing
+    elseif head === :&&
+        return _sm_control_trace_value(arguments[1], environment) &&
+               _sm_control_trace_value(arguments[2], environment)
+    elseif head === :||
+        return _sm_control_trace_value(arguments[1], environment) ||
+               _sm_control_trace_value(arguments[2], environment)
+    elseif head === :.
+        return getproperty(_sm_control_trace_value(arguments[1], environment),
+                           _sm_control_trace_value(arguments[2], environment))
+    elseif head === :ref
+        return getindex(_sm_control_trace_value(arguments[1], environment),
+            _sm_control_trace_items(arguments[2:end], environment)...)
+    elseif head === :quote
+        return only(arguments)
+    end
+    _sm_reject("unsupported generated control trace expression `$head`")
+end
+
+function (block::_SMControlTraceBlock)(carry)
+    environment = Dict{Symbol,Any}(zip(block.parameters,
+        (block.ports, block.rng_providers, block.ensures, carry)))
+    result = _sm_control_trace_value(block.body, environment)
+    result isa _SMControlTraceReturn ? result.value : result
+end
+
+# One generated function per CFG block keeps Julia inference bounded and lets
+# backends execute only the selected source block. Addresses are compiler
+# metadata; the selected address and complete carry remain runtime values.
+struct _SMControlBlockDispatch{Addresses}
+    # Erase block identities here. A heterogeneous tuple makes constructing
+    # a backend case specialize on every generated body simultaneously,
+    # producing very large host functions before tracing any source block.
+    # Each selected block still specializes independently behind the call
+    # barrier below; block order is frozen by the lowering constructor.
+    blocks::Vector{Any}
+    branches::Vector{Any}
+end
+
+# Backend tracing uses `string(callable)` for IR symbols. The default struct
+# display recursively expands ports, captured plans, and generated programs;
+# keep these program labels bounded independently of graph size and capacity.
+Base.show(io::IO, ::_FunctionalStateMachineControlStep) =
+    print(io, "ReactiveKernels.StateMachineControlStep")
+
+@inline _sm_control_step_call(f, ports, rng_providers, ensures, carry) =
+    RuntimeGeneratedFunctions.generated_callfunc(
+        f, ports, rng_providers, ensures, carry)
+
+@noinline Base.@nospecializeinfer function _sm_control_block_call(
+        @nospecialize(f), @nospecialize(ports), @nospecialize(rng_providers),
+        @nospecialize(ensures), carry::C)::C where {C}
+    RuntimeGeneratedFunctions.generated_callfunc(
+        f, ports, rng_providers, ensures, carry)
+end
+
+@generated function _sm_control_block_index(
+        ::_SMControlBlockDispatch{Addresses}, carry) where {Addresses}
+    choices = Any[]
+    for (i, (mid, pc)) in enumerate(Addresses)
+        push!(choices, :(index = _sm_predicated_select(
+            _sm_predicated_and(method == oftype(method, $mid),
+                address == oftype(address, $pc)),
+            oftype(index, $(i - 1)), index)))
+    end
+    quote
+        method = _sm_frame_read(carry.ctrl_mid, carry.csp)
+        address = _sm_frame_read(carry.ctrl_pc, carry.csp)
+        index = oftype(address, $(length(Addresses)))
+        $(choices...)
+        index
+    end
+end
+
+@generated function _sm_control_dispatch(
+        dispatch::_SMControlBlockDispatch{Addresses}, ports, rng_providers,
+        ensures, carry, index::Integer) where {Addresses}
+    branches = Any[]
+    for i in 1:length(Addresses)
+        push!(branches, :(if index == $(i - 1)
+            return _sm_control_block_call(dispatch.blocks[$i],
+                ports, rng_providers, ensures, carry)
+        end))
+    end
+    quote
+        $(branches...)
+        _sm_control_block_call(
+            dispatch.blocks[$(length(Addresses) + 1)],
+            ports, rng_providers, ensures, carry)
+    end
+end
+
+@inline function _sm_control_step_call(
+        dispatch::_SMControlBlockDispatch, ports, rng_providers, ensures, carry)
+    _sm_control_dispatch(dispatch, ports, rng_providers, ensures, carry,
+        _sm_control_block_index(dispatch, carry))
 end
 
 @inline function (step::_FunctionalStateMachineControlStep)(carry)
-    RuntimeGeneratedFunctions.generated_callfunc(
+    _sm_control_step_call(
         getfield(step, :f), getfield(step, :ports),
         getfield(step, :rng_providers), getfield(step, :ensures), carry)
 end
@@ -3637,6 +3892,9 @@ end
 # thunks do not necessarily retain a dynamic keyword ABI.  This callable view
 # makes the auxiliary effect carrier an ordinary validated positional input so
 # repeated compiled invocations can thread it without baking it into a trace.
+Base.show(io::IO, ::_FunctionalStateMachineTransition{Names}) where {Names} =
+    print(io, "ReactiveKernels.StateMachineTransition(", length(Names), " fields)")
+
 struct _FunctionalTransitionWithEffects{T}
     transition::T
 end
@@ -4088,6 +4346,12 @@ function _sm_isolated_structural_copy(value)
     contract = _sm_topology_contract(value)
     _sm_canonicalize_topology(_sm_structural_copy(value), contract)
 end
+
+# An ordinary array is one topology leaf; Diagonal exposes exactly its one
+# backing array. Their copy methods already isolate that leaf. Rediscovering
+# its topology would allocate identity dictionaries and then copy it twice.
+_sm_isolated_structural_copy(value::Array) = copy(value)
+_sm_isolated_structural_copy(value::LinearAlgebra.Diagonal) = copy(value)
 
 function _sm_isolate_canonical_groups(
         value, names::Tuple, groups::Tuple, external_groups::Tuple)
@@ -5020,10 +5284,26 @@ end
 @inline _sm_predicated_or(lhs, rhs) = lhs .| rhs
 @inline _sm_predicated_not(value) = .!value
 
-# Fixed-capacity control frames remain tuples so the core ABI contains no
-# backend-specific array wrapper.  A traced index is lowered as a complete,
-# predicated gather/scatter over the statically known tuple arity; native
-# execution uses the identical value path.
+# Scalar frame columns use dense vectors, keeping capacity out of the Julia
+# tuple type and allowing backend dynamic gathers/scatters. Composite value
+# columns retain tuples. Native indices select one slot directly; both paths
+# use the same out-of-range rules.
+_sm_frame_fill(value, ::Val{Capacity}) where {Capacity} = fill(value, Capacity)
+
+@inline function _sm_frame_read(values::AbstractVector, index::Integer)
+    isempty(values) && throw(ArgumentError(
+        "functional control frame store cannot be empty"))
+    1 <= index <= length(values) ? values[index] : first(values)
+end
+
+@inline function _sm_frame_write(
+        values::AbstractVector, index::Integer, replacement, active::Bool)
+    active && 1 <= index <= length(values) || return values
+    result = copy(values)
+    result[index] = replacement
+    result
+end
+
 function _sm_frame_read(values::Tuple, index)
     isempty(values) && throw(ArgumentError(
         "functional control frame store cannot be empty"))
@@ -5033,6 +5313,18 @@ function _sm_frame_read(values::Tuple, index)
             index == position, values[position], selected)
     end
     selected
+end
+
+@inline function _sm_frame_read(values::Tuple, index::Integer)
+    isempty(values) && throw(ArgumentError(
+        "functional control frame store cannot be empty"))
+    1 <= index <= length(values) ? values[index] : first(values)
+end
+
+@inline function _sm_frame_write(
+        values::Tuple, index::Integer, replacement, active::Bool)
+    active && 1 <= index <= length(values) || return values
+    Base.setindex(values, replacement, index)
 end
 
 @inline _sm_frame_write(values::Tuple, index, replacement, active) =
@@ -5059,6 +5351,17 @@ function _sm_structured_frame_read(port::_StructuredStatePort,
             _sm_structured_carry_load(port, values[position]), selected)
     end
     selected
+end
+
+@inline _sm_structured_frame_read(
+        port::_StructuredStatePort, values::Tuple, index::Integer) =
+    _sm_structured_carry_load(port, _sm_frame_read(values, index))
+
+@inline function _sm_structured_frame_write(
+        port::_StructuredStatePort, values::Tuple, index::Integer,
+        replacement, active::Bool)
+    active && 1 <= index <= length(values) || return values
+    Base.setindex(values, _sm_structured_carry_store(port, replacement), index)
 end
 
 @inline _sm_structured_frame_write(
@@ -5118,6 +5421,11 @@ end
 @inline function _sm_functional_fill(array, value)
     result = copy(array)
     fill!(result, value)
+    result
+end
+@inline function _sm_functional_broadcast_copy(array, value)
+    result = copy(array)
+    result .= value
     result
 end
 
@@ -6561,8 +6869,53 @@ function _functional_state_machine_method(
         repaired
     end
 
+    emit_formal_copy! = function (dest, source_value, active)
+        alias = get(formal_root_aliases, dest.arg, nothing)
+        alias === nothing && _sm_reject(
+            "functional structural copy through formal " *
+            "`$(dest.arg)` has no state-root provenance")
+        isempty(alias.roots) && _sm_reject(
+            "functional structural formal alias has no " *
+            "compatible state roots")
+        formal_old = base_syms[(:formal, dest.arg)]
+        first_root = first(alias.roots).name
+        first_port = :(getfield(
+            ports, $(QuoteNode(first_root))))
+        formal_candidate = :(_sm_structured_copy(
+            $first_port, $source_value))
+        base_syms[(:formal, dest.arg)] = bind!(
+            :(_sm_structured_predicated_select(
+                $first_port, $active,
+                $formal_candidate, $formal_old)),
+            :__sfm_formal_structural_copy_, dest.arg)
+        for root in alias.roots
+            root_active = bind!(
+                :(_sm_predicated_and(
+                    $active,
+                    $(alias.owner) == oftype(
+                        $(alias.owner), $(root.tag)))),
+                :__sfm_formal_root_active_, root.name)
+            canon = fields[root.name]
+            old = base_syms[(:field, root.name)]
+            port = :(getfield(
+                ports, $(QuoteNode(root.name))))
+            candidate = :(_sm_structured_copy(
+                $port, $source_value))
+            set_field!(root.name,
+                :(_sm_structured_predicated_select(
+                    $port, $root_active, $candidate, $old)))
+            repair_after!((canon,), root_active)
+        end
+        nothing
+    end
+
     emit_write! = function (statement::_PlaceWrite, active,
                             local_syms, local_types, local_origins)
+        if statement.dot && statement.target isa _FormalRef
+            source = rhs(statement.rhs, local_syms, local_types, active, false)
+            emit_formal_copy!(statement.target, source, active)
+            return nothing
+        end
         statement.root in (:self, :alias) && statement.owner !== nothing &&
             length(statement.owner) == 1 || _sm_reject(
             "functional state-machine write must target one owned state root")
@@ -6714,8 +7067,14 @@ function _functional_state_machine_method(
             nested_path = path
             target_type = _sm_structural_path_type(
                 _pp_fieldtype(plan, canon, OW, SH), Val(path))
-            target_type <: AbstractArray && isempty(path) && _sm_reject(
-                "functional state-machine root-array writes require explicit indices")
+            if target_type <: AbstractArray && isempty(path)
+                statement.dot || _sm_reject(
+                    "functional state-machine root-array writes require explicit indices")
+                replacement = :(_sm_functional_broadcast_copy($old, $value))
+                set_field!(name, select_field(name, active, replacement, old))
+                repair_after!((canon,), active)
+                return nothing
+            end
             replacement = statement.dot ? :(Base.materialize($value)) : value
             if isempty(path)
                 set_field!(name,
@@ -6953,42 +7312,7 @@ function _functional_state_machine_method(
                         local_syms, local_types)
                     source_value = rhs(src, local_syms, local_types, active)
                     if dest isa _FormalRef
-                        alias = get(formal_root_aliases, dest.arg, nothing)
-                        alias === nothing && _sm_reject(
-                            "functional structural copy through formal " *
-                            "`$(dest.arg)` has no state-root provenance")
-                        isempty(alias.roots) && _sm_reject(
-                            "functional structural formal alias has no " *
-                            "compatible state roots")
-                        formal_old = base_syms[(:formal, dest.arg)]
-                        first_root = first(alias.roots).name
-                        first_port = :(getfield(
-                            ports, $(QuoteNode(first_root))))
-                        formal_candidate = :(_sm_structured_copy(
-                            $first_port, $source_value))
-                        base_syms[(:formal, dest.arg)] = bind!(
-                            :(_sm_structured_predicated_select(
-                                $first_port, $active,
-                                $formal_candidate, $formal_old)),
-                            :__sfm_formal_structural_copy_, dest.arg)
-                        for root in alias.roots
-                            root_active = bind!(
-                                :(_sm_predicated_and(
-                                    $active,
-                                    $(alias.owner) == oftype(
-                                        $(alias.owner), $(root.tag)))),
-                                :__sfm_formal_root_active_, root.name)
-                            canon = fields[root.name]
-                            old = base_syms[(:field, root.name)]
-                            port = :(getfield(
-                                ports, $(QuoteNode(root.name))))
-                            candidate = :(_sm_structured_copy(
-                                $port, $source_value))
-                            set_field!(root.name,
-                                :(_sm_structured_predicated_select(
-                                    $port, $root_active, $candidate, $old)))
-                            repair_after!((canon,), root_active)
-                        end
+                        emit_formal_copy!(dest, source_value, active)
                         continue
                     end
                     destination_name = if dest isa _SelfField &&
@@ -7716,13 +8040,82 @@ function _functional_state_machine_method(
             haskey(provider_formals, (mid, name)) || _sm_reject(
                 "typed RNG formal has no root provider argument")
         end
+        alias_sources = Dict{Int,Dict{Symbol,Any}}(
+            mid => Dict{Symbol,Any}() for mid in program.methods)
+        for block in program.blocks, effect in block.effects
+            effect isa _LocalAssign && effect.style === :single || continue
+            source = effect.rhs
+            source isa _Index && source.base isa _SelfField &&
+                length(source.base.path) == 1 || continue
+            alias_sources[block.mid][only(effect.lhs)] = source
+        end
+        # A single-definition local alias with frame-invariant indices is
+        # recoverable from its current owning container on every resume. Its
+        # suspended value is already represented by the index formals; retain
+        # ordinary frame storage for every unproved case.
+        local_assignments = Dict{Tuple{Int,Symbol},Int}()
+        for block in program.blocks, effect in block.effects
+            effect isa _LocalAssign || continue
+            for name in effect.lhs
+                key = (block.mid, name)
+                local_assignments[key] = get(local_assignments, key, 0) + 1
+            end
+        end
+        invariant_index = function (x, mid)
+            x isa _Lit && return true
+            x isa _FormalRef && return all(block ->
+                block.mid != mid || !(x.arg in block.writes), program.blocks)
+            x isa _RegisteredCall && return isempty(x.kw) &&
+                all(arg -> invariant_index(arg, mid), x.args)
+            false
+        end
+        container_alias_only = Set{Tuple{Int,Symbol}}()
+        for (mid, sources) in alias_sources, (name, source) in sources
+            key = (mid, name)
+            get(local_assignments, key, 0) == 1 || continue
+            descriptor = get(field_regs, only(source.base.path), nothing)
+            descriptor isa Union{_SMFixedStructuralTuplePort,
+                                 _SMFiniteStructuralPort} || continue
+            all(index -> invariant_index(index, mid), source.idxs) || continue
+            push!(container_alias_only, key)
+        end
+
         # Provider formals always resolve to the one authoritative root replay
         # in `carry.arguments`.  They are not suspended value locals and must
         # not also appear as redundant per-method frame columns: that duplicate
         # representation can lose traced identity across a backend while carry.
+        # Internal structured formals are proven aliases of owned state roots:
+        # every call below must pass a direct root or forward a proven alias.
+        # Their owner tag is the entire suspended value. Saving an endpoint in
+        # every frame duplicates storage which is always replaced by that root
+        # on resume. Root-entry formals retain their value fallback because
+        # their caller may supply a distinct compatible endpoint.
+        value_fallback_formals = Set(key for key in keys(formal_alias_roots)
+                                    if first(key) == program.root_mid)
+        changed = true
+        while changed
+            changed = false
+            for block in program.blocks
+                block.term === :call || continue
+                for (name, position) in program.formal_positions[block.callee_mid]
+                    key = (block.callee_mid, name)
+                    haskey(formal_alias_roots, key) || continue
+                    actual = block.arguments[position]
+                    actual isa _FormalRef || continue
+                    (block.mid, actual.arg) in value_fallback_formals || continue
+                    if !(key in value_fallback_formals)
+                        push!(value_fallback_formals, key)
+                        changed = true
+                    end
+                end
+            end
+        end
+        root_alias_only = Set(key for key in keys(formal_alias_roots)
+                              if !(key in value_fallback_formals))
         frame_order = Tuple(key for key in candidate_frame_order
-            if !haskey(provider_formals, key))
-        formal_alias_order = Tuple(key for key in frame_order
+            if !haskey(provider_formals, key) && !(key in root_alias_only) &&
+               !(key in container_alias_only))
+        formal_alias_order = Tuple(key for key in candidate_frame_order
                                    if haskey(formal_alias_roots, key))
         frame_keys = Tuple((
             (frame_key(mid, name) for (mid, name) in frame_order)...,
@@ -7781,6 +8174,8 @@ function _functional_state_machine_method(
                 stored = :(_sm_structured_carry_store($port, $structured))
                 static_tuple(
                     stored, frame_capacity; isolate=false)
+            elseif frame_types[mid][name] <: Number
+                :(_sm_frame_fill($seed, Val($frame_capacity)))
             else
                 static_tuple(seed, frame_capacity)
             end
@@ -7807,8 +8202,8 @@ function _functional_state_machine_method(
             end
         end
         frame_values = Any[frame_columns[key] for key in frame_order]
-        formal_alias_columns = Dict(key => static_tuple(
-            :(zero($index_source)), frame_capacity)
+        formal_alias_columns = Dict(key => :(_sm_frame_fill(
+            zero($index_source), Val($frame_capacity)))
             for key in formal_alias_order)
         formal_alias_values = Any[
             formal_alias_columns[key] for key in formal_alias_order]
@@ -7816,8 +8211,8 @@ function _functional_state_machine_method(
             mid == program.root_mid ? :(one($index_source)) :
                                       :(zero($index_source))
             for mid in program.methods]
-        control_zero = static_tuple(
-            :(zero($index_source)), control_capacity)
+        control_zero = :(_sm_frame_fill(
+            zero($index_source), Val($control_capacity)))
         control_mid = :(_sm_frame_write(
             $control_zero, one($index_source),
             oftype($index_source, $(program.root_mid)), $predicate_true))
@@ -7827,7 +8222,12 @@ function _functional_state_machine_method(
         control_pc = :(_sm_frame_write(
             $control_zero, one($index_source),
             oftype($index_source, $(program.root_entry)), $predicate_true))
-        root_arguments = Any[base_syms[(:formal, formal.name)]
+        # Replay tapes are read-only resources; their cursors and scalar
+        # arguments are independent loop values, never the caller's mutable
+        # traced-number wrappers. Structured arguments retain their reviewed
+        # port/owner handling through frame storage.
+        root_arguments = Any[:(_sm_control_argument_isolate(
+                                 $(base_syms[(:formal, formal.name)])))
                              for formal in ir.formals]
         state_values = Any[
             haskey(field_regs, name) &&
@@ -7835,7 +8235,7 @@ function _functional_state_machine_method(
                 :(_sm_structured_carry_store(
                     getfield(ports, $(QuoteNode(name))),
                     $(base_syms[(:field, name)]))) :
-                base_syms[(:field, name)]
+                :(_sm_control_carry_isolate($(base_syms[(:field, name)])))
             for name in names]
         effect_names = Tuple(sort!(collect(keys(effect_syms))))
         # The nested backend loop must see dynamic auxiliary effect leaves on
@@ -8017,351 +8417,407 @@ function _functional_state_machine_method(
             csp = bind!(:($csp - $delta), :__sfm_control_sp_)
         end
 
-        alias_sources = Dict{Int,Dict{Symbol,Any}}(
-            mid => Dict{Symbol,Any}() for mid in program.methods)
-        for block in program.blocks, effect in block.effects
-            effect isa _LocalAssign && effect.style === :single || continue
-            source = effect.rhs
-            source isa _Index && source.base isa _SelfField &&
-                length(source.base.path) == 1 || continue
-            alias_sources[block.mid][only(effect.lhs)] = source
-        end
 
-        for block in program.blocks
-            mid = block.mid
-            method_ir = by_mid[mid]
-            block_active = bind!(
-                :(_sm_predicated_and($dispatch_active,
-                    _sm_predicated_and(
-                        $dispatch_mid == oftype($dispatch_mid, $mid),
-                        $dispatch_pc == oftype($dispatch_pc, $(block.pc))))),
-                :__sfm_control_block_active_)
-            local_syms = Dict{Symbol,Symbol}()
-            local_types = Dict{Symbol,Bool}()
-            empty!(formal_root_aliases)
-            formal_names = Set(keys(program.formal_positions[mid]))
-            for name in program.stored[mid]
-                key = (mid, name)
-                Tlocal = frame_types[mid][name]
-                if name in formal_names && haskey(provider_formals, key)
-                    base_syms[(:formal, name)] = step_argument_syms[
-                        provider_formals[key]]
-                    formals[name] = Tlocal <: AbstractArray
-                    continue
-                end
-                column = step_frame_syms[key]
-                read_expression = if haskey(formal_alias_roots, key)
-                    root = first(formal_alias_roots[key]).name
-                    port = :(getfield(ports, $(QuoteNode(root))))
-                    :(_sm_structured_frame_read(
-                        $port, $column, $dispatch_fidx))
-                else
-                    :(_sm_frame_read($column, $dispatch_fidx))
-                end
-                symbol = bind!(read_expression,
-                    :__sfm_control_local_, name)
-                if name in formal_names
-                    if haskey(formal_alias_roots, key)
-                        owner = bind!(:(_sm_frame_read(
-                            $(step_formal_alias_syms[key]), $dispatch_fidx)),
-                            :__sfm_control_formal_owner_, name)
-                        roots = formal_alias_roots[key]
-                        current = symbol
-                        for root in roots
-                            port = :(getfield(
-                                ports, $(QuoteNode(root.name))))
-                            root_value = base_syms[(:field, root.name)]
-                            selected = :($owner == oftype(
-                                $owner, $(root.tag)))
-                            current = bind!(
-                                :(_sm_structured_predicated_select(
-                                    $port, $selected,
-                                    $root_value, $current)),
-                                :__sfm_control_formal_value_, name)
-                        end
-                        base_syms[(:formal, name)] = current
-                        formal_root_aliases[name] = (; owner, roots)
-                    else
-                        base_syms[(:formal, name)] = symbol
-                    end
-                    formals[name] = Tlocal <: AbstractArray
-                else
-                    local_syms[name] = symbol
-                    local_types[name] = Tlocal <: AbstractArray
-                end
-            end
-            local_origins = Dict{Symbol,Any}()
-            for (name, source) in alias_sources[mid]
-                haskey(local_syms, name) || continue
-                root_name = only(source.base.path)
-                descriptor = get(field_regs, root_name, nothing)
-                root_value = base_syms[(:field, root_name)]
-                index_storage = descriptor isa _SMFiniteStructuralPort ?
-                    :(getfield(ports, $(QuoteNode(root_name)))) : root_value
-                captured = Any[]
-                for (dimension, index) in enumerate(source.idxs)
-                    raw = index_rhs(index, index_storage, dimension,
-                        local_syms, local_types, block_active)
-                    traced = :($raw + zero($index_source))
-                    push!(captured, :(_sm_safe_index(
-                        $traced, $index_storage, Val($dimension))))
-                end
-                current_alias = if descriptor isa _SMFixedStructuralTuplePort
-                    length(captured) == 1 || _sm_reject(
-                        "fixed structural tuple alias requires one index")
-                    port = :(getfield(ports, $(QuoteNode(root_name))))
-                    :(_sm_fixed_tuple_read(
-                        $port, $root_value, $(only(captured))))
-                elseif descriptor isa _SMFiniteStructuralPort
-                    length(captured) == 1 || _sm_reject(
-                        "finite structural alias requires one index")
-                    port = :(getfield(ports, $(QuoteNode(root_name))))
-                    :(getfield(_sm_finite_structural_read(
-                        $port, $root_value, $(only(captured)),
-                        $block_active), :value))
-                else
-                    :(_sm_functional_index(
-                        $root_value, $(captured...)))
-                end
-                # A suspended callee may update the enclosing state root.  The
-                # saved local records which element was aliased, but that old
-                # element value is no longer authoritative after resume.
-                local_syms[name] = bind!(current_alias,
-                    :__sfm_control_alias_refresh_, name)
-                local_origins[name] = (
-                    source=source,
-                    root_value=root_value,
-                    indices=Tuple(captured),
-                )
-            end
-            remaining = emit_block!(
-                block.effects, block_active, local_syms, local_types,
-                local_origins)
-            for name in block.writes
-                key = (mid, name)
-                haskey(provider_formals, key) && continue
-                haskey(local_syms, name) || _sm_reject(
-                    "functional control block writes unavailable local `$name`")
-                column = step_frame_syms[key]
-                step_frame_syms[key] = bind!(
-                    :(_sm_frame_write($column, $dispatch_fidx,
-                        $(local_syms[name]), $remaining)),
-                    :__sfm_control_frame_write_, name)
-            end
 
-            if block.term === :goto
-                ctrl_pc = bind!(:(_sm_frame_write(
-                    $ctrl_pc, $dispatch_csp,
-                    oftype($dispatch_pc, $(block.then_pc)), $remaining)),
-                    :__sfm_control_pc_stack_)
-            elseif block.term === :return
-                delta = bind!(:(_sm_predicated_select(
-                    $remaining, one($dispatch_fidx),
-                    zero($dispatch_fidx))), :__sfm_control_delta_)
-                step_fsp_syms[mid] = bind!(
-                    :($(step_fsp_syms[mid]) - $delta),
-                    :__sfm_control_fsp_)
-                root_return = bind!(
-                    :(_sm_predicated_and($remaining,
+        block_prelude = copy(step_statements)
+        block_environment = (
+            base=copy(base_syms), effects=copy(effect_syms),
+            seen=copy(observation_seen_syms), arguments=copy(step_argument_syms),
+            frames=copy(step_frame_syms), aliases=copy(step_formal_alias_syms),
+            fsps=copy(step_fsp_syms), formals=copy(formals),
+            ctrl_mid, ctrl_fidx, ctrl_pc, csp, steps, control_overflow,
+            return_seen)
+        control_blocks = Any[]
+        for block in (program.blocks..., nothing)
+            # Every branch begins at the same dispatch snapshot. Previously
+            # these environments were threaded through all masked blocks,
+            # creating one very large straight-line program per loop step.
+            step_statements = copy(block_prelude)
+            statements = step_statements
+            base_syms = copy(block_environment.base)
+            effect_syms = copy(block_environment.effects)
+            observation_seen_syms = copy(block_environment.seen)
+            step_argument_syms = copy(block_environment.arguments)
+            provider_argument_syms[] = step_argument_syms
+            step_frame_syms = copy(block_environment.frames)
+            step_formal_alias_syms = copy(block_environment.aliases)
+            step_fsp_syms = copy(block_environment.fsps)
+            formals = copy(block_environment.formals)
+            ctrl_mid = block_environment.ctrl_mid
+            ctrl_fidx = block_environment.ctrl_fidx
+            ctrl_pc = block_environment.ctrl_pc
+            csp = block_environment.csp
+            steps = block_environment.steps
+            control_overflow = block_environment.control_overflow
+            return_seen = block_environment.return_seen
+            if block !== nothing
+                mid = block.mid
+                method_ir = by_mid[mid]
+                block_active = bind!(
+                    :(_sm_predicated_and($dispatch_active,
                         _sm_predicated_and(
-                            $dispatch_mid == oftype(
-                                $dispatch_mid, $(program.root_mid)),
-                            $dispatch_csp == one($dispatch_csp)))),
-                    :__sfm_control_root_return_)
-                return_seen = bind!(
-                    :(_sm_predicated_or($return_seen, $root_return)),
-                    :__sfm_return_seen_)
-                csp = bind!(:($csp - $delta), :__sfm_control_sp_)
-            elseif block.term === :branch
-                condition = block.condition
-                branch_condition = nothing
-                if condition isa _RawCond
-                    expression = condition.expr
-                    if expression isa Tuple &&
-                            first(expression) === :bounded_for
-                        _, variable, upper, counter = expression
-                        lhs = haskey(local_syms, variable) ?
-                            local_syms[variable] :
-                            base_syms[(:formal, variable)]
-                        rhs_upper = rhs(
-                            upper, local_syms, local_types, remaining)
-                        authored = bind!(:($lhs <= $rhs_upper),
-                                         :__sfm_control_condition_)
-                        count = local_syms[counter]
-                        within = bind!(:($count < oftype(
-                            $count, $max_iterations)),
-                            :__sfm_control_loop_bound_)
-                        valid = bind!(:(_sm_predicated_or(
-                            _sm_predicated_not($authored), $within)),
-                            :__sfm_control_loop_valid_)
-                        remaining = mark_invalid!(remaining, valid)
-                        branch_condition = bind!(
-                            :(_sm_predicated_and($authored, $within)),
-                            :__sfm_control_condition_)
-                    elseif expression isa Tuple &&
-                            first(expression) === :bounded_while
-                        _, authored_expression, counter = expression
-                        authored = bind!(rhs(
-                            authored_expression, local_syms, local_types,
-                            remaining), :__sfm_control_condition_)
-                        count = local_syms[counter]
-                        within = bind!(:($count < oftype(
-                            $count, $max_iterations)),
-                            :__sfm_control_loop_bound_)
-                        valid = bind!(:(_sm_predicated_or(
-                            _sm_predicated_not($authored), $within)),
-                            :__sfm_control_loop_valid_)
-                        remaining = mark_invalid!(remaining, valid)
-                        branch_condition = bind!(
-                            :(_sm_predicated_and($authored, $within)),
-                            :__sfm_control_condition_)
-                    else
-                        _sm_reject("unsupported bounded control condition")
+                            $dispatch_mid == oftype($dispatch_mid, $mid),
+                            $dispatch_pc == oftype($dispatch_pc, $(block.pc))))),
+                    :__sfm_control_block_active_)
+                local_syms = Dict{Symbol,Symbol}()
+                local_types = Dict{Symbol,Bool}()
+                empty!(formal_root_aliases)
+                formal_names = Set(keys(program.formal_positions[mid]))
+                for name in program.stored[mid]
+                    key = (mid, name)
+                    Tlocal = frame_types[mid][name]
+                    if name in formal_names && haskey(provider_formals, key)
+                        base_syms[(:formal, name)] = step_argument_syms[
+                            provider_formals[key]]
+                        formals[name] = Tlocal <: AbstractArray
+                        continue
                     end
-                else
-                    remaining = walk_bounds!(
-                        condition, remaining, local_syms, local_types)
-                    branch_condition = bind!(rhs(
-                        condition, local_syms, local_types, remaining),
-                        :__sfm_control_condition_)
-                end
-                destination = bind!(
-                    :(_sm_predicated_select($branch_condition,
-                        oftype($dispatch_pc, $(block.then_pc)),
-                        oftype($dispatch_pc, $(block.else_pc)))),
-                    :__sfm_control_destination_)
-                ctrl_pc = bind!(:(_sm_frame_write(
-                    $ctrl_pc, $dispatch_csp, $destination, $remaining)),
-                    :__sfm_control_pc_stack_)
-            elseif block.term === :call
-                callee = block.callee_mid
-                callee_fsp = step_fsp_syms[callee]
-                candidate_fsp = bind!(:($callee_fsp + one($callee_fsp)),
-                                      :__sfm_control_fsp_candidate_)
-                candidate_csp = bind!(:($csp + one($csp)),
-                                      :__sfm_control_sp_candidate_)
-                frame_valid = bind!(:($candidate_fsp <= oftype(
-                    $candidate_fsp, $frame_capacity)),
-                    :__sfm_control_frame_valid_)
-                stack_valid = bind!(:($candidate_csp <= oftype(
-                    $candidate_csp, $control_capacity)),
-                    :__sfm_control_stack_valid_)
-                call_valid = bind!(:(_sm_predicated_and(
-                    $frame_valid, $stack_valid)),
-                    :__sfm_control_call_valid_)
-                call_active = mark_invalid!(remaining, call_valid)
-                delta = bind!(:(_sm_predicated_select(
-                    $call_active, one($callee_fsp), zero($callee_fsp))),
-                    :__sfm_control_delta_)
-                next_fsp = bind!(:($callee_fsp + $delta),
-                                 :__sfm_control_fsp_)
-                step_fsp_syms[callee] = next_fsp
-                callee_positions = program.formal_positions[callee]
-                for name in program.stored[callee]
-                    haskey(callee_positions, name) || continue
-                    key = (callee, name)
-                    haskey(provider_formals, key) && continue
-                    position = callee_positions[name]
-                    position <= length(block.arguments) || _sm_reject(
-                        "functional control call has missing argument")
-                    value = rhs(block.arguments[position], local_syms,
-                                local_types, call_active)
-                    column = step_frame_syms[key]
-                    write_expression = if haskey(formal_alias_roots, key)
+                    key in container_alias_only && continue
+                    read_expression = if key in root_alias_only
+                        base_syms[(:field, first(formal_alias_roots[key]).name)]
+                    elseif haskey(formal_alias_roots, key)
                         root = first(formal_alias_roots[key]).name
                         port = :(getfield(ports, $(QuoteNode(root))))
-                        :(_sm_structured_frame_write(
-                            $port, $column, $next_fsp,
-                            $value, $call_active))
+                        column = step_frame_syms[key]
+                        :(_sm_structured_frame_read(
+                            $port, $column, $dispatch_fidx))
                     else
-                        :(_sm_frame_write($column, $next_fsp,
-                            $value, $call_active))
+                        column = step_frame_syms[key]
+                        :(_sm_frame_read($column, $dispatch_fidx))
                     end
-                    step_frame_syms[key] = bind!(write_expression,
-                        :__sfm_control_frame_write_, name)
-                    if haskey(formal_alias_roots, key)
-                        actual = block.arguments[position]
-                        owner = if actual isa _SelfField &&
-                                length(actual.path) == 1 &&
-                                haskey(state_alias_tags, only(actual.path))
-                            tag = state_alias_tags[only(actual.path)]
-                            :(oftype($index_source, $tag))
-                        elseif actual isa _FormalRef &&
-                                haskey(formal_root_aliases, actual.arg)
-                            formal_root_aliases[actual.arg].owner
+                    symbol = bind!(read_expression,
+                        :__sfm_control_local_, name)
+                    if name in formal_names
+                        if haskey(formal_alias_roots, key)
+                            owner = bind!(:(_sm_frame_read(
+                                $(step_formal_alias_syms[key]), $dispatch_fidx)),
+                                :__sfm_control_formal_owner_, name)
+                            roots = formal_alias_roots[key]
+                            current = symbol
+                            for root in roots
+                                port = :(getfield(
+                                    ports, $(QuoteNode(root.name))))
+                                root_value = base_syms[(:field, root.name)]
+                                selected = :($owner == oftype(
+                                    $owner, $(root.tag)))
+                                current = bind!(
+                                    :(_sm_structured_predicated_select(
+                                        $port, $selected,
+                                        $root_value, $current)),
+                                    :__sfm_control_formal_value_, name)
+                            end
+                            base_syms[(:formal, name)] = current
+                            formal_root_aliases[name] = (; owner, roots)
                         else
-                            _sm_reject("functional control call to state " *
-                                "formal `$name` requires a direct state root " *
-                                "or a proven state-root formal alias")
+                            base_syms[(:formal, name)] = symbol
                         end
-                        alias_column = step_formal_alias_syms[key]
-                        step_formal_alias_syms[key] = bind!(
-                            :(_sm_frame_write(
-                                $alias_column, $next_fsp,
-                                $owner, $call_active)),
-                            :__sfm_control_formal_alias_write_, name)
+                        formals[name] = Tlocal <: AbstractArray
+                    else
+                        local_syms[name] = symbol
+                        local_types[name] = Tlocal <: AbstractArray
                     end
                 end
-                ctrl_pc = bind!(:(_sm_frame_write(
-                    $ctrl_pc, $dispatch_csp,
-                    oftype($dispatch_pc, $(block.resume_pc)),
-                    $call_active)), :__sfm_control_pc_stack_)
-                csp = bind!(:($csp + $delta), :__sfm_control_sp_)
-                ctrl_mid = bind!(:(_sm_frame_write(
-                    $ctrl_mid, $csp,
-                    oftype($dispatch_mid, $callee), $call_active)),
-                    :__sfm_control_mid_stack_)
-                ctrl_fidx = bind!(:(_sm_frame_write(
-                    $ctrl_fidx, $csp, $next_fsp, $call_active)),
-                    :__sfm_control_fidx_stack_)
-                ctrl_pc = bind!(:(_sm_frame_write(
-                    $ctrl_pc, $csp,
-                    oftype($dispatch_pc, $(block.callee_entry)),
-                    $call_active)), :__sfm_control_pc_stack_)
-            else
-                _sm_reject("unsupported functional control terminator " *
-                    "`$(block.term)`")
+                local_origins = Dict{Symbol,Any}()
+                for (name, source) in alias_sources[mid]
+                    (haskey(local_syms, name) ||
+                     (mid, name) in container_alias_only) || continue
+                    local_types[name] = frame_types[mid][name] <: AbstractArray
+                    root_name = only(source.base.path)
+                    descriptor = get(field_regs, root_name, nothing)
+                    root_value = base_syms[(:field, root_name)]
+                    index_storage = descriptor isa _SMFiniteStructuralPort ?
+                        :(getfield(ports, $(QuoteNode(root_name)))) : root_value
+                    captured = Any[]
+                    for (dimension, index) in enumerate(source.idxs)
+                        raw = index_rhs(index, index_storage, dimension,
+                            local_syms, local_types, block_active)
+                        traced = :($raw + zero($index_source))
+                        push!(captured, :(_sm_safe_index(
+                            $traced, $index_storage, Val($dimension))))
+                    end
+                    current_alias = if descriptor isa _SMFixedStructuralTuplePort
+                        length(captured) == 1 || _sm_reject(
+                            "fixed structural tuple alias requires one index")
+                        port = :(getfield(ports, $(QuoteNode(root_name))))
+                        :(_sm_fixed_tuple_read(
+                            $port, $root_value, $(only(captured))))
+                    elseif descriptor isa _SMFiniteStructuralPort
+                        length(captured) == 1 || _sm_reject(
+                            "finite structural alias requires one index")
+                        port = :(getfield(ports, $(QuoteNode(root_name))))
+                        :(getfield(_sm_finite_structural_read(
+                            $port, $root_value, $(only(captured)),
+                            $block_active), :value))
+                    else
+                        :(_sm_functional_index(
+                            $root_value, $(captured...)))
+                    end
+                    # A suspended callee may update the enclosing state root.  The
+                    # saved local records which element was aliased, but that old
+                    # element value is no longer authoritative after resume.
+                    local_syms[name] = bind!(current_alias,
+                        :__sfm_control_alias_refresh_, name)
+                    local_origins[name] = (
+                        source=source,
+                        root_value=root_value,
+                        indices=Tuple(captured),
+                    )
+                end
+                remaining = emit_block!(
+                    block.effects, block_active, local_syms, local_types,
+                    local_origins)
+                for name in block.writes
+                    key = (mid, name)
+                    haskey(provider_formals, key) && continue
+                    key in container_alias_only && continue
+                    haskey(local_syms, name) || _sm_reject(
+                        "functional control block writes unavailable local `$name`")
+                    column = step_frame_syms[key]
+                    step_frame_syms[key] = bind!(
+                        :(_sm_frame_write($column, $dispatch_fidx,
+                            $(local_syms[name]), $remaining)),
+                        :__sfm_control_frame_write_, name)
+                end
+
+                if block.term === :goto
+                    ctrl_pc = bind!(:(_sm_frame_write(
+                        $ctrl_pc, $dispatch_csp,
+                        oftype($dispatch_pc, $(block.then_pc)), $remaining)),
+                        :__sfm_control_pc_stack_)
+                elseif block.term === :return
+                    delta = bind!(:(_sm_predicated_select(
+                        $remaining, one($dispatch_fidx),
+                        zero($dispatch_fidx))), :__sfm_control_delta_)
+                    step_fsp_syms[mid] = bind!(
+                        :($(step_fsp_syms[mid]) - $delta),
+                        :__sfm_control_fsp_)
+                    root_return = bind!(
+                        :(_sm_predicated_and($remaining,
+                            _sm_predicated_and(
+                                $dispatch_mid == oftype(
+                                    $dispatch_mid, $(program.root_mid)),
+                                $dispatch_csp == one($dispatch_csp)))),
+                        :__sfm_control_root_return_)
+                    return_seen = bind!(
+                        :(_sm_predicated_or($return_seen, $root_return)),
+                        :__sfm_return_seen_)
+                    csp = bind!(:($csp - $delta), :__sfm_control_sp_)
+                elseif block.term === :branch
+                    condition = block.condition
+                    branch_condition = nothing
+                    if condition isa _RawCond
+                        expression = condition.expr
+                        if expression isa Tuple &&
+                                first(expression) === :bounded_for
+                            _, variable, upper, counter = expression
+                            lhs = haskey(local_syms, variable) ?
+                                local_syms[variable] :
+                                base_syms[(:formal, variable)]
+                            rhs_upper = rhs(
+                                upper, local_syms, local_types, remaining)
+                            authored = bind!(:($lhs <= $rhs_upper),
+                                             :__sfm_control_condition_)
+                            count = local_syms[counter]
+                            within = bind!(:($count < oftype(
+                                $count, $max_iterations)),
+                                :__sfm_control_loop_bound_)
+                            valid = bind!(:(_sm_predicated_or(
+                                _sm_predicated_not($authored), $within)),
+                                :__sfm_control_loop_valid_)
+                            remaining = mark_invalid!(remaining, valid)
+                            branch_condition = bind!(
+                                :(_sm_predicated_and($authored, $within)),
+                                :__sfm_control_condition_)
+                        elseif expression isa Tuple &&
+                                first(expression) === :bounded_while
+                            _, authored_expression, counter = expression
+                            authored = bind!(rhs(
+                                authored_expression, local_syms, local_types,
+                                remaining), :__sfm_control_condition_)
+                            count = local_syms[counter]
+                            within = bind!(:($count < oftype(
+                                $count, $max_iterations)),
+                                :__sfm_control_loop_bound_)
+                            valid = bind!(:(_sm_predicated_or(
+                                _sm_predicated_not($authored), $within)),
+                                :__sfm_control_loop_valid_)
+                            remaining = mark_invalid!(remaining, valid)
+                            branch_condition = bind!(
+                                :(_sm_predicated_and($authored, $within)),
+                                :__sfm_control_condition_)
+                        else
+                            _sm_reject("unsupported bounded control condition")
+                        end
+                    else
+                        remaining = walk_bounds!(
+                            condition, remaining, local_syms, local_types)
+                        branch_condition = bind!(rhs(
+                            condition, local_syms, local_types, remaining),
+                            :__sfm_control_condition_)
+                    end
+                    destination = bind!(
+                        :(_sm_predicated_select($branch_condition,
+                            oftype($dispatch_pc, $(block.then_pc)),
+                            oftype($dispatch_pc, $(block.else_pc)))),
+                        :__sfm_control_destination_)
+                    ctrl_pc = bind!(:(_sm_frame_write(
+                        $ctrl_pc, $dispatch_csp, $destination, $remaining)),
+                        :__sfm_control_pc_stack_)
+                elseif block.term === :call
+                    callee = block.callee_mid
+                    callee_fsp = step_fsp_syms[callee]
+                    candidate_fsp = bind!(:($callee_fsp + one($callee_fsp)),
+                                          :__sfm_control_fsp_candidate_)
+                    candidate_csp = bind!(:($csp + one($csp)),
+                                          :__sfm_control_sp_candidate_)
+                    frame_valid = bind!(:($candidate_fsp <= oftype(
+                        $candidate_fsp, $frame_capacity)),
+                        :__sfm_control_frame_valid_)
+                    stack_valid = bind!(:($candidate_csp <= oftype(
+                        $candidate_csp, $control_capacity)),
+                        :__sfm_control_stack_valid_)
+                    call_valid = bind!(:(_sm_predicated_and(
+                        $frame_valid, $stack_valid)),
+                        :__sfm_control_call_valid_)
+                    call_active = mark_invalid!(remaining, call_valid)
+                    delta = bind!(:(_sm_predicated_select(
+                        $call_active, one($callee_fsp), zero($callee_fsp))),
+                        :__sfm_control_delta_)
+                    next_fsp = bind!(:($callee_fsp + $delta),
+                                     :__sfm_control_fsp_)
+                    step_fsp_syms[callee] = next_fsp
+                    callee_positions = program.formal_positions[callee]
+                    for name in program.stored[callee]
+                        haskey(callee_positions, name) || continue
+                        key = (callee, name)
+                        haskey(provider_formals, key) && continue
+                        position = callee_positions[name]
+                        position <= length(block.arguments) || _sm_reject(
+                            "functional control call has missing argument")
+                        if !(key in root_alias_only)
+                            value = rhs(block.arguments[position], local_syms,
+                                        local_types, call_active)
+                            column = step_frame_syms[key]
+                            write_expression = if haskey(formal_alias_roots, key)
+                                root = first(formal_alias_roots[key]).name
+                                port = :(getfield(ports, $(QuoteNode(root))))
+                                :(_sm_structured_frame_write(
+                                    $port, $column, $next_fsp,
+                                    $value, $call_active))
+                            else
+                                :(_sm_frame_write($column, $next_fsp,
+                                    $value, $call_active))
+                            end
+                            step_frame_syms[key] = bind!(write_expression,
+                                :__sfm_control_frame_write_, name)
+                        end
+                        if haskey(formal_alias_roots, key)
+                            actual = block.arguments[position]
+                            owner = if actual isa _SelfField &&
+                                    length(actual.path) == 1 &&
+                                    haskey(state_alias_tags, only(actual.path))
+                                tag = state_alias_tags[only(actual.path)]
+                                :(oftype($index_source, $tag))
+                            elseif actual isa _FormalRef &&
+                                    haskey(formal_root_aliases, actual.arg)
+                                formal_root_aliases[actual.arg].owner
+                            else
+                                _sm_reject("functional control call to state " *
+                                    "formal `$name` requires a direct state root " *
+                                    "or a proven state-root formal alias")
+                            end
+                            alias_column = step_formal_alias_syms[key]
+                            step_formal_alias_syms[key] = bind!(
+                                :(_sm_frame_write(
+                                    $alias_column, $next_fsp,
+                                    $owner, $call_active)),
+                                :__sfm_control_formal_alias_write_, name)
+                        end
+                    end
+                    ctrl_pc = bind!(:(_sm_frame_write(
+                        $ctrl_pc, $dispatch_csp,
+                        oftype($dispatch_pc, $(block.resume_pc)),
+                        $call_active)), :__sfm_control_pc_stack_)
+                    csp = bind!(:($csp + $delta), :__sfm_control_sp_)
+                    ctrl_mid = bind!(:(_sm_frame_write(
+                        $ctrl_mid, $csp,
+                        oftype($dispatch_mid, $callee), $call_active)),
+                        :__sfm_control_mid_stack_)
+                    ctrl_fidx = bind!(:(_sm_frame_write(
+                        $ctrl_fidx, $csp, $next_fsp, $call_active)),
+                        :__sfm_control_fidx_stack_)
+                    ctrl_pc = bind!(:(_sm_frame_write(
+                        $ctrl_pc, $csp,
+                        oftype($dispatch_pc, $(block.callee_entry)),
+                        $call_active)), :__sfm_control_pc_stack_)
+                else
+                    _sm_reject("unsupported functional control terminator " *
+                        "`$(block.term)`")
+                end
             end
+
+            steps = bind!(:($steps + one($steps)), :__sfm_control_steps_)
+            step_state_values = Any[]
+            for name in names
+                key = (:field, name)
+                current = base_syms[key]
+                stored = if haskey(field_regs, name) &&
+                            field_regs[name] isa _StructuredStatePort
+                    if current === block_environment.base[key]
+                        # This block emitted no write or derived-field repair
+                        # for the root. Its existing canonical carry already
+                        # has the required isolation and alias topology.
+                        :(getfield(getfield($carry_arg, :state),
+                                   $(QuoteNode(name))))
+                    else
+                        :(_sm_structured_carry_store(
+                            getfield(ports, $(QuoteNode(name))), $current))
+                    end
+                else
+                    current
+                end
+                push!(step_state_values, stored)
+            end
+            step_effect_values = Any[effect_syms[name] for name in effect_names]
+            step_observation_seen_values = Any[
+                observation_seen_syms[name] for name in observation_seen_names]
+            step_frame_values = Any[step_frame_syms[key] for key in frame_order]
+            step_formal_alias_values = Any[
+                step_formal_alias_syms[key] for key in formal_alias_order]
+            step_fsp_values = Any[step_fsp_syms[mid] for mid in program.methods]
+            push!(step_statements, :(return (
+                state=NamedTuple{$names}(($(step_state_values...),)),
+                arguments=($(step_argument_syms...),),
+                effects=NamedTuple{$effect_names}(($(step_effect_values...),)),
+                observation_seen=NamedTuple{$observation_seen_names}((
+                    $(step_observation_seen_values...),)),
+                frames=NamedTuple{$frame_keys}((
+                    $(step_frame_values...), $(step_formal_alias_values...))),
+                fsps=NamedTuple{$fsp_keys}(($(step_fsp_values...),)),
+                ctrl_mid=$ctrl_mid,
+                ctrl_fidx=$ctrl_fidx,
+                ctrl_pc=$ctrl_pc,
+                csp=$csp,
+                steps=$steps,
+                max_steps=$max_steps_symbol,
+                control_overflow=$control_overflow,
+                return_seen=$return_seen,
+            )))
+            push!(control_blocks, compile(
+                :((ports, rng_providers, ensures, $carry_arg) ->
+                    $(Expr(:block, step_statements...)))))
         end
 
-        steps = bind!(:($steps + one($steps)), :__sfm_control_steps_)
-        step_state_values = Any[
-            haskey(field_regs, name) &&
-                    field_regs[name] isa _StructuredStatePort ?
-                :(_sm_structured_carry_store(
-                    getfield(ports, $(QuoteNode(name))),
-                    $(base_syms[(:field, name)]))) :
-                base_syms[(:field, name)]
-            for name in names]
-        step_effect_values = Any[effect_syms[name] for name in effect_names]
-        step_observation_seen_values = Any[
-            observation_seen_syms[name] for name in observation_seen_names]
-        step_frame_values = Any[step_frame_syms[key] for key in frame_order]
-        step_formal_alias_values = Any[
-            step_formal_alias_syms[key] for key in formal_alias_order]
-        step_fsp_values = Any[step_fsp_syms[mid] for mid in program.methods]
-        push!(step_statements, :(return (
-            state=NamedTuple{$names}(($(step_state_values...),)),
-            arguments=($(step_argument_syms...),),
-            effects=NamedTuple{$effect_names}(($(step_effect_values...),)),
-            observation_seen=NamedTuple{$observation_seen_names}((
-                $(step_observation_seen_values...),)),
-            frames=NamedTuple{$frame_keys}((
-                $(step_frame_values...), $(step_formal_alias_values...))),
-            fsps=NamedTuple{$fsp_keys}(($(step_fsp_values...),)),
-            ctrl_mid=$ctrl_mid,
-            ctrl_fidx=$ctrl_fidx,
-            ctrl_pc=$ctrl_pc,
-            csp=$csp,
-            steps=$steps,
-            max_steps=$max_steps_symbol,
-            control_overflow=$control_overflow,
-            return_seen=$return_seen,
-        )))
-
         statements = outer_statements
-        control_step_fn = compile(:((ports, rng_providers, ensures, $carry_arg) ->
-            $(Expr(:block, step_statements...))))
+        addresses = Tuple((block.mid, block.pc) for block in program.blocks)
+        # Build callable branch metadata once on the host. Backend tracing
+        # receives this ready list instead of compiling metadata construction
+        # through its alternate interpreter for every generated body.
+        branches = Any[_SMControlTraceBlock(
+            block, ports, rng_providers, Tuple(ensures))
+            for block in control_blocks]
+        control_step_fn = _SMControlBlockDispatch{addresses}(
+            control_blocks, branches)
         carry = bind!(initial_carry, :__sfm_control_initial_)
         finished = bind!(
             :(_sm_functional_control_loop(
@@ -8819,6 +9275,11 @@ function _sm_control_bound_unknown_index(expression, bindings)
     unknown[]
 end
 
+# A runtime loop extent is admissible with an explicit checked iteration
+# budget. Keep it distinct from malformed/unsupported bound expressions:
+# those must still fail even when the caller supplies a budget.
+struct _SMRuntimeControlBound <: Exception end
+
 function _sm_control_bound_values(expression, state, bindings, resolving)
     if expression isa _Lit
         return Any[expression.value]
@@ -8826,8 +9287,8 @@ function _sm_control_bound_values(expression, state, bindings, resolving)
         return Any[_sm_control_bound_path_value(state, expression.path)]
     elseif expression isa _LocalRef
         haskey(bindings, expression.name) &&
-            bindings[expression.name] !== nothing || _sm_reject(
-            "control-bound local `$(expression.name)` has no unique structural binding")
+            bindings[expression.name] !== nothing ||
+            throw(_SMRuntimeControlBound())
         expression.name in resolving && _sm_reject(
             "control-bound local `$(expression.name)` has a cyclic binding")
         next_resolving = copy(resolving)
@@ -8871,6 +9332,8 @@ function _sm_control_bound_value(expression, state,
         bindings=Dict{Symbol,Any}(), resolving=Set{Symbol}())
     if expression isa _Lit
         return expression.value
+    elseif expression isa _FormalRef
+        throw(_SMRuntimeControlBound())
     elseif expression isa _SelfField
         return _sm_control_bound_path_value(state, expression.path)
     elseif expression isa _LocalRef
@@ -8928,13 +9391,19 @@ function _sm_control_loop_contract(methods, state)
     lengths = Int[]
     paths = Tuple{Vararg{Symbol}}[]
     has_while = Ref(false)
+    has_runtime_for = Ref(false)
     for ir in methods
         bindings = _sm_control_bound_local_bindings(ir)
         for statement in ir.body
         _kmir_walk(statement) do node
             if node isa _For
-                values = _sm_control_bound_value(
-                    node.iter, state, bindings)
+                values = try
+                    _sm_control_bound_value(node.iter, state, bindings)
+                catch error
+                    error isa _SMRuntimeControlBound || rethrow()
+                    has_runtime_for[] = true
+                    return
+                end
                 length_value = try
                     length(values)
                 catch
@@ -8952,7 +9421,7 @@ function _sm_control_loop_contract(methods, state)
         end
     end
     (lengths=Tuple(lengths), paths=Tuple(unique(paths)),
-     has_while=has_while[])
+     has_while=has_while[], has_runtime_for=has_runtime_for[])
 end
 
 _sm_control_bound_path(path::Symbol) = (path,)
@@ -9028,8 +9497,10 @@ _sm_control_state_snapshot(::_StatefulKernel, state) = _sm_reject(
 Construct the finite capacity certificate for a structured state-machine
 method from captured MethodIR and one concrete constructed state. Finite `for`
 trip counts are derived from literals, fixed axes, and closed pure state reads.
-An explicit `max_iterations` is required only when a `while` loop prevents that
-derivation, and may not be smaller than any inferred `for` trip count.
+An explicit `max_iterations` is required for `while` loops and for `for` loops
+whose extent depends on runtime arguments or reassigned locals. It may not be
+smaller than any inferred `for` trip count. Exceeding the budget sets control
+overflow and rolls the transition back to its input state.
 
 For recursive control, `recursion_bound` may name a scalar integer state-field
 path. When omitted, the constructor accepts the unique positive integer state
@@ -9071,6 +9542,9 @@ function stateful_control_bounds(
     inferred_iterations = isempty(loop_contract.lengths) ? 1 :
         max(maximum(loop_contract.lengths), 1)
     iterations = if max_iterations === nothing
+        loop_contract.has_runtime_for && _sm_reject(
+            "a runtime for-loop extent requires an explicit max_iterations " *
+            "when constructing StatefulControlBounds")
         loop_contract.has_while && _sm_reject(
             "a structured while loop requires an explicit max_iterations " *
             "when constructing StatefulControlBounds")
@@ -9397,19 +9871,23 @@ function _sm_validate_compiled_external_groups(
     value
 end
 
-function _sm_restore_compiled_external_groups(
+@generated function _sm_restore_compiled_external_groups(
         transition::CompiledStateTransition{Names,Groups,ExternalGroups},
         value) where {Names,Groups,ExternalGroups}
-    initial = getfield(transition, :initial)
+    # Names and ownership groups are frozen compiler metadata. Resolve that
+    # mapping once; normalization must not rebuild a dictionary on every leaf
+    # update merely to restore the same fixed alias and external-authority ABI.
     replacements = Dict{Symbol,Any}()
     for (group_index, group) in enumerate(Groups)
-        selected = group_index in ExternalGroups ?
-            getfield(initial, first(group)) : getfield(value, first(group))
+        source = group_index in ExternalGroups ?
+            :(getfield(transition, :initial)) : :value
+        selected = :(getfield($source, $(QuoteNode(first(group)))))
         for name in group
             replacements[name] = selected
         end
     end
-    NamedTuple{Names}(Tuple(replacements[name] for name in Names))
+    values = Any[replacements[name] for name in Names]
+    :(NamedTuple{$Names}(($(values...),)))
 end
 
 function _sm_normalize_compiled_state(
@@ -9561,28 +10039,23 @@ end
     Expr(:block, statements...)
 end
 
-# Reactant requires every loop-carried tensor path to remain one-to-one across
-# the while region, whereas a logical structured state may intentionally expose
-# one tensor through several alias paths.  Store a backend carry with every
-# dynamic path isolated, then restore the compiler-proven topology only while a
-# step reads or returns the logical value.  The public state contract never sees
-# this projected representation.
+# A backend carry stores one path per canonical group. Logical alias names are
+# reconstructed on load, so they never duplicate tensors in a while-region ABI.
+# Independent canonical groups still receive isolated traced values.
 @generated function _sm_structured_carry_store(
         port::_StructuredStatePort{T}, value) where {T}
     Names, Groups, ExternalGroups = T.parameters[1:3]
     statements = Any[
         :(_sm_validate_functional_structured_state_port(port, value)),
     ]
-    values = Dict{Symbol,Any}()
-    for (group_index, group) in enumerate(Groups)
-        source = :(getfield(value, $(QuoteNode(first(group)))))
-        for name in group
-            values[name] = group_index in ExternalGroups ? source :
-                :(_sm_control_carry_isolate($source))
-        end
+    leaders = Tuple(first(group) for group in Groups)
+    stored_values = Any[]
+    for (group_index, leader) in enumerate(leaders)
+        source = :(getfield(value, $(QuoteNode(leader))))
+        push!(stored_values, group_index in ExternalGroups ? source :
+            :(_sm_control_carry_isolate($source)))
     end
-    constructor = NamedTuple{Names}
-    stored_values = Any[values[name] for name in Names]
+    constructor = NamedTuple{leaders}
     push!(statements, :($constructor(($(stored_values...),))))
     Expr(:block, statements...)
 end
@@ -9599,13 +10072,12 @@ end
     end
     constructor = NamedTuple{Names}
     values = Any[aliases[name] for name in Names]
-    quote
-        local __structured_carry_logical = $constructor(($(values...),))
-        local __structured_carry_normalized = _sm_normalize_compiled_state(
-            getfield(port, :transition), __structured_carry_logical)
-        _sm_validate_functional_structured_state_port(
-            port, __structured_carry_normalized)
-    end
+    # Only _sm_structured_carry_store creates this private representation.
+    # It validates and isolates the canonical groups, including frame writes.
+    # Loading restores their logical names without copying every array and
+    # rebuilding topology dictionaries on every resumed control block. Public
+    # entry/results and every replacement retain their existing validation.
+    :($constructor(($(values...),)))
 end
 
 function _sm_structured_set(

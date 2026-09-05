@@ -24,6 +24,19 @@ const _MPBR_GENERIC_CONTROL = MutationProfileBGenericControl
 const _MPBR_TESTSET = get(ENV, "RK_MPB_REACTANT_TESTSET", "all")
 _mpbr_enabled(name) = _MPBR_TESTSET == "all" || _MPBR_TESTSET == name
 
+module _MPBRTraceBlockOverlay
+using ReactiveKernels, Reactant
+leaf(value) = value + one(value)
+Reactant.@reactant_overlay leaf(value) = value + oftype(value, 2)
+function operation(carry)
+    Reactant.Ops.case(zero(carry.value), Any[block], carry; track_numbers=Union{})
+end
+const generated = ReactiveKernels.compile(:((ports, rng, ensures, carry) ->
+    (value=$(GlobalRef(@__MODULE__, :leaf))(carry.value),)))
+const block = ReactiveKernels._SMControlTraceBlock(
+    generated, nothing, nothing, nothing)
+end
+
 struct _MPBRCallable{F}
     f::F
 end
@@ -250,6 +263,82 @@ if _mpbr_enabled("generic")
 end
 end
 
+if _mpbr_enabled("runtime-controls")
+@testset "generated endpoint runtime numeric controls through Reactant" begin
+    endpoint = ReactiveKernels.compile_state_transition(
+        _MPBR_GENERIC_CONTROL.owned_point, _MPBR_GENERIC_CONTROL.bump_point!,
+        ([1, 2],); runtime_controls=(delta=1,))
+    state = _mpbr_trace(ReactiveKernels.initial_transition_state(endpoint))
+    controls = _mpbr_trace((delta=1,))
+    compiled = @compile endpoint(state, controls)
+    guarded = ReactiveKernels.validated_compiled_transition(compiled, endpoint)
+    for delta in (0, 1, -2, 4)
+        result = guarded(state, _mpbr_trace((; delta)))
+        @test Array(result.values) == [1 + delta, 2 + delta]
+        @test Int(result.total) == 3 + 2delta
+        @test result.values === result.mirror
+    end
+    @test Array(state.values) == [1, 2]
+    @test_throws ArgumentError guarded(state, _mpbr_trace((delta=1.0,)))
+end
+end
+
+if _mpbr_enabled("loop-scope")
+@testset "compiled loop bindings preserve lexical scopes" begin
+    for (method, expected) in ((Val(:grids!), 15), (Val(:nested!), 22))
+        case = _MPBR_GENERIC_CONTROL.loop_scope_case(method)
+        state = _mpbr_trace(case.state)
+        compiled = @compile sync=true donated_args=:none case.transition(state)
+        guarded = ReactiveKernels.validated_compiled_transition(compiled, case.transition)
+        result = guarded(state)
+        @test !Bool(result.control_overflow)
+        @test Int(result.state.total) == expected
+        @test Int(state.total) == 0
+        again = guarded(result.state)
+        @test Int(again.state.total) == 2expected
+    end
+    short = _MPBR_GENERIC_CONTROL.loop_scope_case(Val(:grids!); max_iterations=4)
+    state = _mpbr_trace(short.state)
+    compiled = @compile sync=true donated_args=:none short.transition(state)
+    guarded = ReactiveKernels.validated_compiled_transition(compiled, short.transition)
+    exhausted = guarded(state)
+    @test Bool(exhausted.control_overflow)
+    @test Int(exhausted.state.total) == 0
+end
+end
+
+if _mpbr_enabled("generic-owned")
+@testset "owned aliases survive compiled recursive suspension" begin
+    owned = _MPBR_GENERIC_CONTROL.owned_alias_case()
+    state = _mpbr_trace(owned.state)
+    compiled = @compile owned.transition(state)
+    guarded = ReactiveKernels.validated_compiled_transition(compiled, owned.transition)
+    result = guarded(state)
+    @test !Bool(result.control_overflow)
+    @test Array(result.state.left.values) == [7, 8]
+    @test Array(result.state.right.values) == [4, 5]
+    @test Int(result.state.counter) == 81
+    @test result.state.left.values === result.state.left.mirror
+    @test result.state.right.values === result.state.right.mirror
+    @test result.state.left.values !== result.state.right.values
+    again = guarded(result.state)
+    @test Array(again.state.left.values) == [13, 14]
+    @test Array(again.state.right.values) == [7, 8]
+    @test again.state.left.values === again.state.left.mirror
+    @test again.state.right.values === again.state.right.mirror
+    @test Array(state.left.values) == [1, 2]
+end
+end
+
+if _mpbr_enabled("trace-block")
+@testset "generated control tracing preserves backend call overlays" begin
+    @test _MPBRTraceBlockOverlay.block((value=3,)).value == 4
+    state = (value=Reactant.to_rarray(3; track_numbers=true),)
+    compiled = @compile _MPBRTraceBlockOverlay.operation(state)
+    @test Int(compiled(state).value) == 5
+end
+end
+
 if _mpbr_enabled("generic-rng")
 @testset "generic recursive RNG provider remains one traced carry" begin
     replay = ReactiveKernels.OrderedRNGReplay(
@@ -277,7 +366,7 @@ if _mpbr_enabled("generic-rng")
 
     state = _mpbr_trace(host_state)
     traced_replay = _mpbr_trace_replay(replay)
-    compiled = @compile transition(state, traced_replay)
+    compiled = @compile sync=true donated_args=:none transition(state, traced_replay)
     result = compiled(state, traced_replay)
     actual = only(result.arguments)
 
@@ -290,6 +379,16 @@ if _mpbr_enabled("generic-rng")
     @test Int(actual.event_index) == 4
     @test Array(actual.uniforms) == replay.uniforms
     @test Array(actual.event_tokens) == replay.event_tokens
+    # Functional control must preserve the caller's scalar state and replay
+    # cursors, even though Reactant represents traced numbers by mutable boxes.
+    @test Int(state.total) == host_state.total
+    @test (Int(traced_replay.normal_index), Int(traced_replay.uniform_index),
+           Int(traced_replay.exponential_index), Int(traced_replay.event_index)) ==
+          (1, 1, 1, 1)
+    repeated = compiled(state, traced_replay)
+    @test Int(repeated.state.total) == native_result.state.total
+    @test Int(only(repeated.arguments).event_index) == native_actual.event_index
+    @test Int(result.state.total) == native_result.state.total
 end
 end
 

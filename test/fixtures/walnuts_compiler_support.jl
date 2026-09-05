@@ -4,10 +4,11 @@ using LinearAlgebra
 using ReactiveKernels
 
 include(joinpath(@__DIR__, "..", "..", "benchmark",
-                 "walnuts_kernel_authoring_fixture.jl"))
+                 "walnuts_kernel_authoring_fixture_b.jl"))
 
 const RK = ReactiveKernels
-const WFX = WalnutsKernelAuthoringFixture
+const WFX = WALNUTSBMutationAuthoringFixture
+const NFX = WFX.NUTSBMutationAuthoringFixture
 
 const ORACLE_CASES = (
     (name="base_grid_accept", stiffness=1.0, theta=1.0, rho=0.3,
@@ -43,9 +44,17 @@ const ORACLE_CASES = (
 potential(stiffness) = position ->
     oftype(first(position), 0.5) * stiffness * sum(abs2, position)
 
-gradient(stiffness) = (destination, position) -> begin
-    value = oftype(first(position), 0.5) * stiffness * sum(abs2, position)
-    destination .= stiffness .* position
+struct GaussianGradient{T} <: Function
+    stiffness::T
+end
+gradient(stiffness) = GaussianGradient(stiffness)
+function (gradient::GaussianGradient)(position)
+    value = oftype(first(position), 0.5) * gradient.stiffness * sum(abs2, position)
+    (value, gradient.stiffness .* position)
+end
+function (gradient::GaussianGradient)(destination, position)
+    value = oftype(first(position), 0.5) * gradient.stiffness * sum(abs2, position)
+    destination .= gradient.stiffness .* position
     value
 end
 
@@ -57,42 +66,34 @@ struct StatisticsEffectAuthority <: Function end
 (::StatisticsEffectAuthority)(args...; kwargs...) = throw(ArgumentError(
     "statistics effect authority is functional-only"))
 
-struct GaussianLeapfrogLowering{T}
-    stiffness::T
+struct EndpointLowering{T}
+    transition::T
 end
 
-function (lowering::GaussianLeapfrogLowering)(effect, point; stepsize)
-    half = oftype(stepsize, 0.5)
-    first_mom = point.mom .- half .* stepsize .* point.dham_dpos
-    pos = point.pos .+ stepsize .* first_mom
-    dpot_dpos = lowering.stiffness .* pos
-    mom = first_mom .- half .* stepsize .* dpot_dpos
-    dkin_dmom = copy(mom)
-    pot = oftype(first(pos), 0.5) * lowering.stiffness * sum(abs2, pos)
-    kin = oftype(first(mom), 0.5) * sum(abs2, mom)
-    updated = merge(point, (;
-        pos, mom, pot, dpot_dpos, dkin_dmom, kin, ham=pot + kin,
-        dham_dpos=dpot_dpos, dham_dmom=dkin_dmom))
-    (arguments=(updated,), result=nothing, effect_state=effect)
+function (lowering::EndpointLowering)(effect, point; stepsize)
+    (arguments=(lowering.transition(point, (; stepsize)),),
+     result=nothing, effect_state=effect)
 end
 
 function statistics_lowering(effect, state)
-    n_steps = effect.n_steps + one(effect.n_steps)
+    n_steps = state.n_steps + one(state.n_steps)
     unit = one(state.dham)
-    rate = (unit - unit / n_steps) * effect.acceptance_rate +
+    rate = (unit - unit / n_steps) * state.acceptance_rate +
         (unit / n_steps) *
         ifelse(state.dham >= zero(state.dham), unit, exp(state.dham))
-    (arguments=(state,), result=nothing,
+    updated = merge(state, (; n_steps, acceptance_rate=rate))
+    (arguments=(updated,), result=nothing,
      effect_state=(; n_steps, acceptance_rate=rate))
 end
 
 function endpoint(stiffness, theta, rho)
     pot_f = potential(stiffness)
     grad_f = gradient(stiffness)
-    spec = WFX.euclidean_phasepoint
+    spec = NFX.euclidean_phasepoint
     transition = RK.compile_state_transition(
-        spec, RK.partial(WFX.leapfrog!; stepsize=0.1),
-        (pot_f, grad_f, Diagonal([1.0]), [theta], [rho]))
+        spec, WFX.leapfrog!,
+        (pot_f, grad_f, Diagonal([1.0]), [theta], [rho]);
+        runtime_controls=(stepsize=0.1,))
     transition, RK.initial_transition_state(transition)
 end
 
@@ -107,20 +108,27 @@ function _build_case_setup(case; max_depth=1, min_dham=-1000.0,
         step_source, Tuple{typeof(point)}, Nothing;
         written_arguments=(1,), initial_effect_state=nothing,
         functional_lowering=RK.total_functional_lowering(
-            GaussianLeapfrogLowering(case.stiffness)))
+            EndpointLowering(endpoint_transition)))
     stats_source = StatisticsEffectAuthority()
     stats_port = RK.effect_lowering_port(
         stats_source, Tuple{RK.StatefulStateValue}, Nothing;
-        written_arguments=(),
+        written_arguments=(1,),
         initial_effect_state=(n_steps=0, acceptance_rate=zero(case.theta)),
         functional_lowering=RK.total_functional_lowering(
             statistics_lowering))
+    static_values = RK._sm_finite_static_values(structured)
+    proposal_contract = RK._sm_finite_structural_contract(
+        WFX.fillf(deepcopy, point, max_depth + 2); static_values)
+    tree_contract = RK._sm_finite_structural_contract(
+        WFX.fillf(WFX.tree, point, max_depth + 1))
     bindings = RK.stateful_compiler_bindings(
         init=structured,
         fwd=structured,
         bwd=structured,
         candidate=structured,
         reverse_candidate=structured,
+        proposals=proposal_contract,
+        trees=tree_contract,
         step_f=step_port,
         stats_f=stats_port,
     )
@@ -136,12 +144,8 @@ function _build_case_setup(case; max_depth=1, min_dham=-1000.0,
         min_micro_steps=case.min_micro_steps, max_error=case.max_error,
         min_dham, stats_f=stats_source)
     snapshot = RK.stateful_snapshot(state)
-    static_values = RK._sm_finite_static_values(structured)
-    proposal_contract = RK._sm_finite_structural_contract(
-        snapshot.proposals; static_values)
     proposal_raw = RK._sm_finite_structural_pack(
         proposal_contract, snapshot.proposals)
-    tree_contract = RK._sm_finite_structural_contract(snapshot.trees)
     tree_raw = RK._sm_finite_structural_pack(
         tree_contract, snapshot.trees)
     (; endpoint_transition, structured, kernel, snapshot,
@@ -150,17 +154,28 @@ function _build_case_setup(case; max_depth=1, min_dham=-1000.0,
        tree_contract, tree_raw)
 end
 
-function _build_case_transition(setup; max_iterations=1_000_000)
-    RK.functionalize_stateful(
-        setup.kernel, Val(:step!); max_iterations,
+function _build_case_transition(setup; max_iterations=nothing)
+    state = setup.snapshot
+    # The finest dyadic grid bounds integrate!'s runtime trip count. The
+    # same limit covers the coarser reverse grids and the retry loop.
+    iterations = isnothing(max_iterations) ? max(
+        state.max_depth, state.max_step_halvings,
+        foldl((steps, _) -> Base.Checked.checked_mul(steps, 2),
+            1:(state.max_step_halvings - 1); init=state.min_micro_steps)) :
+        max_iterations
+    bounds = RK.stateful_control_bounds(
+        setup.kernel, Val(:step!), state;
+        recursion_bound=:max_depth, max_iterations=iterations,
         argument_types=Tuple{
             typeof(setup.directions),typeof(setup.exponentials)})
+    RK.functionalize_stateful(
+        setup.kernel, Val(:step!), bounds)
 end
 
 function build_case(case; max_depth=1, min_dham=-1000.0,
                     directions=fill(false, max_depth),
                     exponentials=fill(1.0, max(2^max_depth, 1)),
-                    max_iterations=1_000_000)
+                    max_iterations=nothing)
     setup = _build_case_setup(
         case; max_depth, min_dham, directions, exponentials)
     transition = _build_case_transition(setup; max_iterations)
