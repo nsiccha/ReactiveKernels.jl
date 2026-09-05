@@ -13,7 +13,7 @@
 import Pkg
 
 const _EIGHT_SCHOOLS_REACTANT_AD_INNER = "RK_EIGHT_SCHOOLS_REACTANT_AD_INNER"
-const _EIGHT_SCHOOLS_REACTANT_AD_VERSION = v"0.2.278"
+const _EIGHT_SCHOOLS_REACTANT_AD_VERSION = v"0.2.284"
 
 include(joinpath(@__DIR__, "_repro_guard.jl"))
 

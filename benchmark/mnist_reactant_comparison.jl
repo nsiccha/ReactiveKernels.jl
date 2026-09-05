@@ -8,7 +8,7 @@
 import Pkg
 
 const _MNIST_REACTANT_INNER = "RK_MNIST_REACTANT_INNER"
-const _MNIST_REACTANT_VERSION = v"0.2.278"
+const _MNIST_REACTANT_VERSION = v"0.2.284"
 
 _mnist_reactant_body() = any(
     ==("--dataset=wren-pca40"), ARGS) ?
