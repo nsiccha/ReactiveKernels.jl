@@ -3820,7 +3820,10 @@ end
 
 function _sm_native_for_loop(f::F, ports, rng_providers, ensures, carry) where {F}
     while carry.live
-        carry = f(ports, rng_providers, ensures, carry)
+        # Keep the generated entry visible to inference across the loop edge;
+        # the callable's vararg wrapper can widen a large structured carry.
+        carry = RuntimeGeneratedFunctions.generated_callfunc(
+            f, ports, rng_providers, ensures, carry)
     end
     carry
 end
