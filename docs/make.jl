@@ -43,7 +43,6 @@ site_pages = [
         "Eight schools" => "eight-schools.md",
         "Sum-to-zero recovery" => "sum-to-zero.md",
         "MNIST multinomial logistic" => "mnist-logistic.md",
-        "PracticalBayes comparator" => "practicalbayes.md",
         "Other model walkthroughs" => [
             "Linear regression" => "linear-regression.md",
             "Beta-binomial" => "beta-binomial.md",

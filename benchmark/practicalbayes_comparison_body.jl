@@ -1,15 +1,13 @@
 # Inner body for the exact-pin PracticalBayes PPL comparator. The benchmark
 # exercises only documented public APIs: @model, build_layout,
-# LogDensityFunction, fixed-parameter density views, returned, and sample with
-# NUTS. No source from the unlicensed upstream repository is copied here.
+# LogDensityFunction, fixed-parameter density views, and returned. No source
+# from the unlicensed upstream repository is copied here.
 
 using ADTypes: AutoEnzyme
-using AdvancedHMC: NUTS
 using BenchmarkTools
 using Dates
 using Distributions: Categorical, Cauchy, MvNormal, Normal, logpdf, truncated
 using LinearAlgebra: I
-using MCMCDiagnosticTools
 using NNlib: softmax
 using Random
 using SHA
@@ -30,17 +28,11 @@ const PB_BACKEND = AutoEnzyme(;
 const PB_DEFAULT_ROUNDS = 10
 const PB_DEFAULT_SAMPLES_PER_ROUND = 20
 const PB_DEFAULT_MNIST_N = 60000
-const PB_DEFAULT_MCMC_WARMUP = 1000
-const PB_DEFAULT_MCMC_SAMPLES = 1000
 const PB_SEED = 20260901
-const PB_TARGET_ACCEPT = 0.8
-const PB_MAX_TREE_DEPTH = 10
-const PB_DIVERGENCE_THRESHOLD = 1000.0
 
 const PB_PACKAGES = (
-    "PracticalBayes", "ADTypes", "AdvancedHMC", "BenchmarkTools",
-    "Distributions", "Enzyme", "LogDensityProblems", "MCMCDiagnosticTools",
-    "MLDatasets", "NNlib",
+    "PracticalBayes", "ADTypes", "BenchmarkTools", "Distributions", "Enzyme",
+    "LogDensityProblems", "MLDatasets", "NNlib",
 )
 
 # DOCS-BASELINE-BEGIN: practicalbayes-eight-schools
@@ -108,12 +100,8 @@ _samples_per_round() = parse(Int, get(
     string(PB_DEFAULT_SAMPLES_PER_ROUND)))
 _mnist_observations() = parse(Int, get(
     ENV, "RK_PRACTICALBAYES_MNIST_N", string(PB_DEFAULT_MNIST_N)))
-_mcmc_warmup() = parse(Int, get(
-    ENV, "RK_PRACTICALBAYES_MCMC_WARMUP", string(PB_DEFAULT_MCMC_WARMUP)))
-_mcmc_samples() = parse(Int, get(
-    ENV, "RK_PRACTICALBAYES_MCMC_SAMPLES", string(PB_DEFAULT_MCMC_SAMPLES)))
 _sections() = Tuple(filter(!isempty, split(get(
-    ENV, "RK_PRACTICALBAYES_SECTIONS", "models,eval,sampling"), ',')))
+    ENV, "RK_PRACTICALBAYES_SECTIONS", "models,eval"), ',')))
 
 function _output_path()
     matches = [split(arg, '='; limit = 2)[2] for arg in ARGS
@@ -539,125 +527,15 @@ function _eval_rows!(measurements, preparations; rounds, samples_per_round)
     end
 end
 
-function _draw_matrix(transitions)
-    reduce(vcat, (permutedims(collect(transition.z.θ))
-                  for transition in transitions))
-end
-
-function _ess_summary(draws)
-    ess = MCMCDiagnosticTools.ess(reshape(
-        draws, size(draws, 1), 1, size(draws, 2)))
-    (; min_ess = Float64(minimum(ess)), median_ess = Float64(median(ess)))
-end
-
-function _sample_practicalbayes(model, init; seed, num_warmup, num_samples)
-    sampler = NUTS(PB_TARGET_ACCEPT)
-    sampler.max_depth == PB_MAX_TREE_DEPTH || error("NUTS depth default changed")
-    sampler.Δ_max == PB_DIVERGENCE_THRESHOLD ||
-        error("NUTS divergence threshold changed")
-    sampler.metric == :diagonal || error("NUTS metric default changed")
-    PracticalBayes.sample(
-        Random.Xoshiro(seed + 1), model, sampler, 5;
-        adtype = PB_BACKEND, init, chain_type = nothing,
-        n_adapts = 5, discard_initial = 5, progress = false)
-    warm_start_seconds = @elapsed PracticalBayes.sample(
-        Random.Xoshiro(seed + 2), model, sampler, 5;
-        adtype = PB_BACKEND, init, chain_type = nothing,
-        n_adapts = 5, discard_initial = 5, progress = false)
-    sampling_seconds = @elapsed transitions = PracticalBayes.sample(
-        Random.Xoshiro(seed), model, sampler, num_samples;
-        adtype = PB_BACKEND, init, chain_type = nothing,
-        n_adapts = num_warmup, discard_initial = num_warmup, progress = false)
-    (; transitions, warm_start_seconds, sampling_seconds)
-end
-
-function _sampling_row(model_name, model, init, density_reference;
-                       seed, num_warmup, num_samples)
-    prepared = _prepared_model("sampling", model_name, model, init)
-    gate_rng = Random.Xoshiro(seed + 17)
-    points = [copy(prepared.q),
-              prepared.q .+ 0.05 .* randn(gate_rng, length(prepared.q)),
-              prepared.q .+ 0.05 .* randn(gate_rng, length(prepared.q))]
-    density_gap = maximum(abs(
-        LDP.logdensity(prepared.primal, point) - density_reference(point))
-        for point in points)
-    density_gap <= 1e-8 || error(
-        "PracticalBayes $model_name linked-density parity failed: $density_gap")
-    sampled = _sample_practicalbayes(model, init;
-        seed, num_warmup, num_samples)
-    draws = _draw_matrix(sampled.transitions)
-    size(draws) == (num_samples, length(prepared.q)) ||
-        error("PracticalBayes $model_name returned unexpected draw shape")
-    all(isfinite, (density_reference(collect(view(draws, i, :)))
-                   for i in axes(draws, 1))) ||
-        error("PracticalBayes $model_name draws left the finite-density region")
-    ess = _ess_summary(draws)
-    row = Dict{String,Any}(
-        "model" => model_name,
-        "harness" => "practicalbayes_nuts",
-        "state" => "measured",
-        "compile_or_warm_start_seconds" => sampled.warm_start_seconds,
-        "sampling_seconds" => sampled.sampling_seconds,
-        "divergences" => count(transition -> transition.stat.numerical_error,
-                               sampled.transitions),
-        "density_parity_max_abs" => density_gap,
-        "min_ess" => ess.min_ess,
-        "median_ess" => ess.median_ess,
-    )
-    row, draws
-end
-
-function _sampling_rows!(measurements, datasets; num_warmup, num_samples)
-    observations = Float64.(EIGHT_SCHOOLS_Y)
-    observation_scales = Float64.(EIGHT_SCHOOLS_SIGMA)
-    eight_init = (; μ = 0.0, τ = 1.0, θ = zeros(length(observations)))
-    eight_model = practicalbayes_eight_schools(
-        observations, observation_scales)
-    eight_reference = q -> _eight_joint_unconstrained(
-        q, observations, observation_scales)
-    eight_row, eight_draws = _sampling_row(
-        "eight_schools", eight_model, eight_init, eight_reference;
-        seed = PB_SEED, num_warmup, num_samples)
-    eight_row["posterior_mean_mu"] = mean(@view eight_draws[:, 1])
-    eight_row["posterior_sd_mu"] = std(@view eight_draws[:, 1])
-    eight_row["posterior_mean_tau"] = mean(exp.(@view eight_draws[:, 2]))
-    push!(measurements, eight_row)
-    datasets["eight_schools"] = Dict{String,Any}(
-        "data" => "canonical Eight Schools effects and standard errors",
-        "num_observations" => length(observations))
-
-    X, y, metadata = _load_mnist_dataset(
-        MNIST_DATASET_WREN_PCA40, MNIST_WREN_OBSERVATIONS)
-    datasets["mnist_logistic_wren_pca40"] = metadata
-    nonreference = 9
-    mnist_init = (;
-        W = zeros(nonreference, size(X, 2)),
-        b = zeros(nonreference),
-    )
-    mnist_model = practicalbayes_mnist_optimized(X, y, 10)
-    mnist_reference = q -> _mnist_joint(q, X, y, 10)
-    mnist_row, mnist_draws = _sampling_row(
-        "mnist_logistic_wren_pca40", mnist_model, mnist_init,
-        mnist_reference; seed = PB_SEED, num_warmup, num_samples)
-    mnist_row["posterior_mean_first_coefficient"] =
-        mean(@view mnist_draws[:, 1])
-    mnist_row["posterior_sd_first_coefficient"] =
-        std(@view mnist_draws[:, 1])
-    push!(measurements, mnist_row)
-end
-
 function run_comparison()
     rounds = _rounds()
     samples_per_round = _samples_per_round()
-    num_warmup = _mcmc_warmup()
-    num_samples = _mcmc_samples()
     sections = _sections()
-    all(section -> section in ("models", "eval", "sampling"), sections) ||
-        error("RK_PRACTICALBAYES_SECTIONS accepts models,eval,sampling")
+    all(section -> section in ("models", "eval"), sections) ||
+        error("RK_PRACTICALBAYES_SECTIONS accepts models,eval")
 
     model_measurements = Dict{String,Any}[]
     eval_measurements = Dict{String,Any}[]
-    sampling_measurements = Dict{String,Any}[]
     preparations = Dict{String,Any}[]
     datasets = Dict{String,Any}()
     "models" in sections && begin
@@ -668,8 +546,6 @@ function run_comparison()
     end
     "eval" in sections && _eval_rows!(
         eval_measurements, preparations; rounds, samples_per_round)
-    "sampling" in sections && _sampling_rows!(
-        sampling_measurements, datasets; num_warmup, num_samples)
 
     receipt = Dict{String,Any}(
         "schema" => "practicalbayes-comparison-v1",
@@ -726,16 +602,6 @@ function run_comparison()
             "setup_in_timed_region" => false,
             "preparation_in_timed_region" => false,
             "warmup_in_timed_region" => false,
-            "mcmc_models" => ["eight_schools", "mnist_logistic_wren_pca40"],
-            "mcmc_harness" => "PracticalBayes.sample with AdvancedHMC.NUTS",
-            "mcmc_num_warmup" => num_warmup,
-            "mcmc_num_samples" => num_samples,
-            "mcmc_seed" => PB_SEED,
-            "mcmc_target_accept" => PB_TARGET_ACCEPT,
-            "mcmc_max_tree_depth" => PB_MAX_TREE_DEPTH,
-            "mcmc_metric" => "diagonal",
-            "mcmc_divergence_threshold" => PB_DIVERGENCE_THRESHOLD,
-            "mcmc_timing" => "public sample call covering internal layout/AD preparation, adaptation, and retained draws; a separate five-warmup/five-draw JIT warm-start is recorded",
             "precision" => "Float64 parameters and data",
             "julia_threads" => Threads.nthreads(),
             "deterministic_seeds" => true,
@@ -746,7 +612,6 @@ function run_comparison()
         "datasets" => datasets,
         "model_measurements" => model_measurements,
         "eval_measurements" => eval_measurements,
-        "sampling_measurements" => sampling_measurements,
     )
 
     output = _output_path()

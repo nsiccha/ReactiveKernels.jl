@@ -25,8 +25,9 @@ using Test
 
     @test first(findfirst("\"Eight schools\" => \"eight-schools.md\"", make)) <
           first(findfirst("\"MNIST multinomial logistic\" => \"mnist-logistic.md\"", make)) <
-          first(findfirst("\"PracticalBayes comparator\" => \"practicalbayes.md\"", make)) <
           first(findfirst("\"Other model walkthroughs\" => [", make))
+    @test !occursin("practicalbayes.md", make)
+    @test !isfile(joinpath(root, "docs", "src", "practicalbayes.md"))
 
     for page in (
         "reactant.md", "distributions-reactant.md",

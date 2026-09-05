@@ -408,6 +408,8 @@ function _render_eval_throughput_focused(path)
     get(protocol, "reactant_transfers_included", true) &&
         error("evaluation-throughput timing includes transfers")
     measurements = receipt["measurements"]
+    practicalbayes = _practicalbayes_receipt()
+    practicalbayes_measurements = practicalbayes["eval_measurements"]
     mode_label = Dict(
         "primal" => "Primal log density",
         "gradient" => "Value + gradient",
@@ -446,15 +448,41 @@ function _render_eval_throughput_focused(path)
                 median_allocs = missing,
             ))
         end
+        candidates = filter(row ->
+            row["implementation"] == "practical_bayes" &&
+            row["variant"] == "native" && row["mode"] == mode &&
+            Int(row["size"]) == n && row["state"] == "supported",
+            practicalbayes_measurements)
+        if !isempty(candidates)
+            result = only(candidates)["result"]
+            runtime_ns = Float64(result["min_ns"])
+            push!(rows, (;
+                panel = mode_label[mode],
+                n,
+                series = "PracticalBayes native",
+                implementation = "PracticalBayes",
+                runtime_ns,
+                baseline_ns,
+                baseline_label = "RK native at the same mode and N",
+                relative_time = runtime_ns / baseline_ns,
+                median_bytes = missing,
+                median_allocs = missing,
+            ))
+        end
     end
     pins = receipt["pins"]
     summary = "Primal, value+gradient, and generated-quantity latency are " *
         "separate comparisons. Every point is normalized to RK native at the " *
-        "same mode and position size; unsupported Turing+Reactant cells remain omitted."
+        "same mode and position size; unsupported Turing+Reactant and " *
+        "PracticalBayes+Reactant cells remain omitted."
+    practicalbayes_pins = practicalbayes["pins"]
     provenance = "Receipt `$(basename(path))`; RK " *
         "`$(pins["reactivekernels_sha"])`; Turing $(pins["turing_version"]); " *
         "Reactant $(pins["reactant_version"]); Julia $(pins["julia_version"]); " *
-        "$(receipt["environment"]["cpu"])."
+        "$(receipt["environment"]["cpu"]). PracticalBayes " *
+        "$(practicalbayes_pins["practicalbayes_version"]) rows come from " *
+        "`$(basename(_PRACTICALBAYES_RECEIPT_PATH))`, resolved separately " *
+        "because of its incompatible Bijectors pin."
     _allbench_series_sections(rows;
         id_prefix = "eval-throughput", summary, provenance,
         panel_order = ("Primal log density", "Value + gradient",
@@ -542,6 +570,8 @@ function _render_eight_schools_longform_focused(path, schema;
         ("turing", "turing_ad", "Turing + Enzyme", "Turing"),
     )
     measurements = receipt["measurements"]
+    practicalbayes = _practicalbayes_receipt()
+    practicalbayes_measurements = practicalbayes["model_measurements"]
     models = unique(String(row["model"]) for row in measurements)
     rows = NamedTuple[]
     for model in models, outcome in _ALLBENCH_EIGHT_SCHOOLS_OUTCOMES
@@ -575,6 +605,31 @@ function _render_eight_schools_longform_focused(path, schema;
                 median_allocs = Int(result["median_allocs"]),
             ))
         end
+        practicalbayes_configuration =
+            mode == :primal ? "practicalbayes_primal" : "practicalbayes_ad"
+        candidates = filter(row ->
+            row["workload"] == "eight_schools" && row["model"] == model &&
+            row["boundary"] == "packed_unconstrained" &&
+            row["outcome"] == outcome &&
+            row["configuration"] == practicalbayes_configuration &&
+            row["state"] == "supported", practicalbayes_measurements)
+        if !isempty(candidates)
+            result = only(candidates)["result"]
+            runtime_ns = Float64(result["median_ns"])
+            model_label = titlecase(replace(model, '_' => ' '))
+            push!(rows, (;
+                panel = _ALLBENCH_OUTCOME_LABELS[outcome],
+                model = model_label,
+                series = "PracticalBayes — $model_label",
+                implementation = "PracticalBayes",
+                runtime_ns,
+                baseline_ns,
+                baseline_label = "ReactiveKernels / $model_label",
+                relative_time = runtime_ns / baseline_ns,
+                median_bytes = Int(result["median_bytes"]),
+                median_allocs = Int(result["median_allocs"]),
+            ))
+        end
     end
 
     pins = receipt["pins"]
@@ -584,9 +639,13 @@ function _render_eight_schools_longform_focused(path, schema;
         "outcomes. Each model is normalized to its matching ReactiveKernels " *
         "$operation baseline. The complete boundary/configuration matrix, " *
         "unsupported cells, setup costs, and raw rounds remain in the receipt."
+    practicalbayes_pins = practicalbayes["pins"]
     provenance = "Receipt `$(basename(path))`; RK `$(pins["reactivekernels_sha"])`; " *
         "Turing $(get(pins, "turing_version", "not applicable")); Julia " *
-        "$(pins["julia_version"]); $(receipt["environment"]["cpu"])."
+        "$(pins["julia_version"]); $(receipt["environment"]["cpu"]). " *
+        "PracticalBayes $(practicalbayes_pins["practicalbayes_version"]) " *
+        "rows come from `$(basename(_PRACTICALBAYES_RECEIPT_PATH))`, resolved " *
+        "separately because of its incompatible Bijectors pin."
     _allbench_snapshot_sections(rows;
         id_prefix, profile_label, summary, provenance,
         panel_order = Tuple(_ALLBENCH_OUTCOME_LABELS[key]

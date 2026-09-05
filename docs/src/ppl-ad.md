@@ -65,6 +65,12 @@ in the receipt rather than sharing a misleading scale with scalar timings.
 Main.ReactiveKernelsDocs.render_mnist_logistic_ad_benchmarks()
 ```
 
+The PracticalBayes value-and-gradient rows in both comparisons come from its
+separately resolved exact-pin harness and use the same packed-parameter boundary
+and Enzyme backend contract. Its complete public-API matrix and provenance are
+retained in
+[`practicalbayes-comparison-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/practicalbayes-comparison-v1.toml).
+
 ### Baseline implementations
 
 ```@eval

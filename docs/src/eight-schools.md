@@ -174,9 +174,11 @@ form rather than an intentionally slow comparator.
 Main.ReactiveKernelsDocs.render_eight_schools_primal_benchmarks()
 ```
 
-The exact-pin [PracticalBayes external comparator](practicalbayes.md) adds its
-public packed/constrained capability rows without changing the Turing receipt's
-dependency environment.
+PracticalBayes is included above as an ordinary comparator series. Its
+exact-pin harness runs in a separately resolved environment and maps its public
+packed-joint rows onto this same comparison schema. The complete public-API
+matrix and provenance remain in
+[`practicalbayes-comparison-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/practicalbayes-comparison-v1.toml).
 
 Displayed runtimes and allocation units use three significant digits. Every
 supported receipt cell comes from ten independent BenchmarkTools minimum-time
@@ -186,6 +188,10 @@ rounds and must agree numerically with the handwritten control before timing.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_eight_schools_primal_baselines()
+```
+
+```@eval
+Main.ReactiveKernelsDocs.render_practicalbayes_eight_schools_baseline()
 ```
 
 Reproduce the pinned receipt from a clean detached checkout:

@@ -1,7 +1,7 @@
 #!/usr/bin/env julia
 
-# Reproducible PracticalBayes comparator for the PPL model, evaluation-
-# throughput, and NUTS matrices. PracticalBayes is installed at an exact Git
+# Reproducible PracticalBayes comparator for the PPL model and evaluation-
+# throughput matrices. PracticalBayes is installed at an exact Git
 # revision in a fresh environment; it never enters ReactiveKernels' dependency
 # graph. Its Bijectors pin is incompatible with the Turing/DynamicPPL benchmark
 # environment, so the results live in a separate receipt by construction.
@@ -29,12 +29,10 @@ function _run_pinned_comparison()
                     rev = PRACTICALBAYES_REVISION))
                 Pkg.add([
                     Pkg.PackageSpec(name = "ADTypes", version = v"1.24.0"),
-                    Pkg.PackageSpec(name = "AdvancedHMC", version = v"0.8.7"),
                     Pkg.PackageSpec(name = "BenchmarkTools", version = v"1.6.3"),
                     Pkg.PackageSpec(name = "Distributions", version = v"0.25.131"),
                     Pkg.PackageSpec(name = "Enzyme", version = v"0.13.199"),
                     Pkg.PackageSpec(name = "LogDensityProblems", version = v"2.2.0"),
-                    Pkg.PackageSpec(name = "MCMCDiagnosticTools", version = v"0.3.19"),
                     Pkg.PackageSpec(name = "MLDatasets", version = v"0.7.21"),
                     Pkg.PackageSpec(name = "NNlib", version = v"0.9.45"),
                 ])
