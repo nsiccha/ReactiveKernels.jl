@@ -1,0 +1,17 @@
+[deps]
+AdvancedHMC = "0bf59076-c3b1-5ca4-86bd-e02cd72cde3d"
+DifferentiationInterface = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"
+Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+ReactiveKernels = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
+ReactiveKernelsDistributionKernels = "4b169cd9-fc12-43fd-ba39-43e54ed8db7a"
+ReactiveKernelsPPLExamples = "a4d4be3d-45c5-49cc-80d7-34e606a16bce"
+
+[compat]
+AdvancedHMC = "=0.8.6"
+DifferentiationInterface = "0.7"
+Enzyme = "=0.13.199"
+Reactant = "=0.2.284"
+julia = "1.10"

@@ -585,6 +585,18 @@ const _RKBatchedCholesky = Reactant.TracedLinearAlgebra.BatchedCholesky
 const _RKReactantArray = Union{
     Reactant.TracedRArray,Reactant.AbstractConcreteArray}
 
+# Preserve the diagonal structure of a prepared factorization. Reactant's
+# generic BatchedCholesky solve wraps its factors in triangular matrices,
+# which turns this elementwise operation into two dense triangular solves.
+for RHS in (AbstractVector, AbstractMatrix)
+    @eval function LinearAlgebra.ldiv!(
+            factor::_RKBatchedCholesky{T,<:LinearAlgebra.Diagonal{T}},
+            rhs::$RHS{T}) where {T}
+        rhs .= rhs ./ abs2.(factor.factors.diag)
+        rhs
+    end
+end
+
 # A Cholesky supplied as compiled state carries source-static `info` metadata,
 # while a Cholesky computed inside a compiled call carries Reactant's traced
 # success flag.  Preserve the former, but let Reactant concretize the latter

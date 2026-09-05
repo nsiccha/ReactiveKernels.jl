@@ -1860,6 +1860,13 @@ function _sm_rhs(x, syms, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH},
         haskey(field_regs, name) || _sm_reject(
             "callable field `$name` has no compiler binding")
         port = field_regs[name]
+        if port === nothing
+            # The factory's explicit no-effect binding has no callee. Only
+            # direct state observations can be discarded without evaluation.
+            isempty(x.kw) && all(a -> a isa Union{_SelfRef,_SelfField}, x.pos) ||
+                _sm_reject("no-effect callable `$name` requires direct state arguments")
+            return nothing
+        end
         port isa Union{_PureCallablePort,_EffectCallablePort} || _sm_reject(
             "callable field `$name` has no typed callable-port contract")
         canon = get(fields, name, 0)
@@ -2013,6 +2020,15 @@ function _sm_dtree(x, plan::_KernelPlan, fields, ::Type{OW}, ::Type{SH},
         haskey(field_regs, x.path[1]) || _sm_reject(
             "callable field `$(x.path[1])` has no compiler binding")
         port = field_regs[x.path[1]]
+        if port === nothing
+            isempty(x.kw) && all(a -> a isa Union{_SelfRef,_SelfField}, x.pos) ||
+                _sm_reject("no-effect callable requires direct state arguments")
+            for argument in x.pos
+                _sm_dtree(argument, plan, fields, OW, SH, finfo, ltrees,
+                    false, field_regs, methods_by_id, stack)
+            end
+            return _DLit{Nothing}
+        end
         P = typeof(port)
         children = Tuple{(_sm_dtree(a, plan, fields, OW, SH, finfo, ltrees,
             false, field_regs, methods_by_id, stack) for a in x.pos)...}
@@ -4239,21 +4255,25 @@ transition_with_effects(transition::_FunctionalStateMachineTransition) =
 _sm_functional_argument_type_ok(::Type{Actual}, ::Type{Expected}) where
     {Actual,Expected} = Actual === Expected
 
-function _sm_functional_argument_type_ok(
+@generated function _sm_functional_argument_type_ok(
         ::Type{Actual}, ::Type{Expected}) where
         {Actual<:NamedTuple,Expected<:NamedTuple}
-    fieldnames(Actual) == fieldnames(Expected) &&
-        all(_sm_functional_argument_type_ok(
-                fieldtype(Actual, name), fieldtype(Expected, name))
-            for name in fieldnames(Expected))
+    Actual === Expected && return true
+    fieldnames(Actual) == fieldnames(Expected) || return false
+    checks = [:(_sm_functional_argument_type_ok(
+        $(fieldtype(Actual, name)), $(fieldtype(Expected, name))))
+        for name in fieldnames(Expected)]
+    foldr((check, rest) -> Expr(:&&, check, rest), checks; init=true)
 end
 
-function _sm_functional_argument_type_ok(
+@generated function _sm_functional_argument_type_ok(
         ::Type{Actual}, ::Type{Expected}) where
         {Actual<:Tuple,Expected<:Tuple}
-    length(Actual.parameters) == length(Expected.parameters) &&
-        all(_sm_functional_argument_type_ok(A, E)
-            for (A, E) in zip(Actual.parameters, Expected.parameters))
+    Actual === Expected && return true
+    length(Actual.parameters) == length(Expected.parameters) || return false
+    checks = [:(_sm_functional_argument_type_ok($A, $E))
+        for (A, E) in zip(Actual.parameters, Expected.parameters)]
+    foldr((check, rest) -> Expr(:&&, check, rest), checks; init=true)
 end
 
 function _sm_functional_argument_type_ok(
@@ -5259,6 +5279,7 @@ function _sm_functional_machine_call(
         getfield(transition, :rng_providers),
         getfield(transition, :ensures), getfield(transition, :step),
         backend_state, arguments, effects)
+    _sm_validate_machine_state(transition, result.state)
     result = _sm_restore_reusable_compiled_output(transition, result)
     restored_effects = _sm_canonicalize_effect_topologies(
         getfield(transition, :ports), result.effects)
@@ -6732,7 +6753,8 @@ function _functional_state_machine_method(
         kernel::_StatefulKernel{S,PF,RT,OW,SH,B,C,T}, ir::MethodIR,
         max_iterations::Int, max_recursion_depth::Int,
         max_control_steps::Int, ::Type{ArgumentTypes}, ::Type{Declared},
-        ::Type{Forest}, bounds, supplied_rng_providers) where
+        ::Type{Forest}, bounds, supplied_rng_providers;
+        native_state_types::Bool=false) where
         {S,PF,RT,OW,SH,B,C,T,ArgumentTypes,Declared,Forest}
     max_iterations >= 1 || _sm_reject(
         "functional state-machine bound must be positive")
@@ -6756,6 +6778,13 @@ function _functional_state_machine_method(
     rng_providers, type_context = _sm_bind_rng_providers(
         ir, argument_types, supplied_rng_providers)
     field_regs = _stateful_field_regs(getfield(kernel, :bindings))
+    native_state_types && recursive && _sm_reject(
+        "native state-type specialization currently requires nonrecursive control")
+    if native_state_types
+        any(port -> port isa Union{_SMFiniteStructuralPort,_SMFixedStructuralTuplePort},
+            values(field_regs)) && _sm_reject(
+            "native state-type specialization does not yet cover packed structural ports")
+    end
     transition_forest = if recursive
         _sm_control_effect_only_root(Forest, ir, field_regs)
     else
@@ -7118,6 +7147,10 @@ function _functional_state_machine_method(
         canon = get(fields, name, 0)
         canon == 0 && _sm_reject(
             "functional state-machine write has no canonical slot for `$name`")
+        if native_state_types
+            logical_type = _pp_fieldtype(plan, canon, OW, SH)
+            value = :($value::$logical_type)
+        end
         symbol = bind!(value, :__sfm_field_write_, name)
         for alias in get(aliases, canon, Symbol[name])
             base_syms[(:field, alias)] = symbol
@@ -7128,7 +7161,7 @@ function _functional_state_machine_method(
         descriptor = get(field_regs, name, nothing)
         if descriptor isa _StructuredStatePort
             port = :(getfield(ports, $(QuoteNode(name))))
-            return :(_sm_structured_predicated_select(
+            return :(_sm_owned_structured_predicated_select(
                 $port, $active, $candidate, $prior))
         elseif descriptor isa _SMFixedStructuralTuplePort
             port = :(getfield(ports, $(QuoteNode(name))))
@@ -7215,10 +7248,10 @@ function _functional_state_machine_method(
         first_root = first(alias.roots).name
         first_port = :(getfield(
             ports, $(QuoteNode(first_root))))
-        formal_candidate = :(_sm_structured_copy(
+        formal_candidate = :(_sm_owned_structured_copy(
             $first_port, $source_value))
         base_syms[(:formal, dest.arg)] = bind!(
-            :(_sm_structured_predicated_select(
+            :(_sm_owned_structured_predicated_select(
                 $first_port, $active,
                 $formal_candidate, $formal_old)),
             :__sfm_formal_structural_copy_, dest.arg)
@@ -7233,10 +7266,10 @@ function _functional_state_machine_method(
             old = base_syms[(:field, root.name)]
             port = :(getfield(
                 ports, $(QuoteNode(root.name))))
-            candidate = :(_sm_structured_copy(
+            candidate = :(_sm_owned_structured_copy(
                 $port, $source_value))
             set_field!(root.name,
-                :(_sm_structured_predicated_select(
+                :(_sm_owned_structured_predicated_select(
                     $port, $root_active, $candidate, $old)))
             repair_after!((canon,), root_active)
         end
@@ -7266,8 +7299,8 @@ function _functional_state_machine_method(
             source = rhs(statement.rhs, local_syms, local_types, active, false)
             old = base_syms[(:field, name)]
             port = :(getfield(ports, $(QuoteNode(name))))
-            candidate = :(_sm_structured_copy($port, $source))
-            set_field!(name, :(_sm_structured_predicated_select(
+            candidate = :(_sm_owned_structured_copy($port, $source))
+            set_field!(name, :(_sm_owned_structured_predicated_select(
                 $port, $active, $candidate, $old)))
             repair_after!((canon,), active)
             return nothing
@@ -7427,7 +7460,7 @@ function _functional_state_machine_method(
                     $old, Val($(QuoteNode(path)))))
                 selected = :(_sm_predicated_select(
                     $active, $replacement, $old_leaf))
-                set_field!(name, :(_sm_structured_set(
+                set_field!(name, :(_sm_owned_structured_set(
                     $port, $old, Val($(QuoteNode(path))), $selected)))
             end
         elseif statement.target isa _Index
@@ -7529,9 +7562,14 @@ function _functional_state_machine_method(
             repair = :(getfield(getfield($port, :repairs),
                                 $(QuoteNode(repair_name))))
             changed = base_syms[(:field, name)]
-            candidate = bind!(:($repair($changed)),
+            repaired = :($repair($changed))
+            if native_state_types
+                logical_type = _pp_fieldtype(plan, canon, OW, SH)
+                repaired = :($repaired::$logical_type)
+            end
+            candidate = bind!(repaired,
                               :__sfm_nested_repair_, name)
-            set_field!(name, :(_sm_structured_predicated_select(
+            set_field!(name, :(_sm_owned_structured_predicated_select(
                 $port, $active, $candidate, $changed)))
         end
         repair_after!((canon,), active)
@@ -7572,7 +7610,7 @@ function _functional_state_machine_method(
         for (mapping, key_list) in zip(mappings, keys_by_map), key in key_list
             port = slot_port(mapping, key)
             value = port === nothing ? mapping[key] :
-                :(_sm_structured_carry_store($port, $(mapping[key]), Val(true)))
+                :(_sm_owned_structured_carry_store($port, $(mapping[key]), Val(true)))
             symbol = input!(value; structured=port !== nothing)
             mapping[key] = port === nothing ? symbol : bind!(
                 :(_sm_structured_carry_load($port, $symbol, Val(true))),
@@ -7597,7 +7635,7 @@ function _functional_state_machine_method(
         for (mapping, key_list) in zip(mappings, keys_by_map), key in key_list
             port = slot_port(mapping, key)
             push!(outputs, port === nothing ? mapping[key] :
-                :(_sm_structured_carry_store($port, $(mapping[key]), Val(true))))
+                :(_sm_owned_structured_carry_store($port, $(mapping[key]), Val(true))))
         end
         append!(outputs, (control_overflow, return_seen, return_value[]))
         successor = bind!(:($candidate < $upper), :__sfm_loop_successor_)
@@ -7838,10 +7876,10 @@ function _functional_state_machine_method(
                     elseif descriptor isa _StructuredStatePort
                         port = :(getfield(ports,
                                           $(QuoteNode(destination_name))))
-                        candidate = :(_sm_structured_copy(
+                        candidate = :(_sm_owned_structured_copy(
                             $port, $source_value))
                         set_field!(destination_name,
-                            :(_sm_structured_predicated_select(
+                            :(_sm_owned_structured_predicated_select(
                                 $port, $active, $candidate, $old)))
                     elseif descriptor isa _SMFixedStructuralTuplePort
                         port = :(getfield(ports,
@@ -7946,6 +7984,21 @@ function _functional_state_machine_method(
                                    :functional_lowering)),
                         effect, arguments...], keywords)
                 raw_candidate = bind!(raw_call, :__sfm_effect_raw_, name)
+                compiler_owned_effect = getfield(port.functional_lowering, :lowering) isa
+                    _SMCompiledTransitionEffect
+                if compiler_owned_effect
+                    endpoint = getfield(getfield(port.functional_lowering, :lowering),
+                        :transition)
+                    actual = length(call.pos) == 1 ? only(call.pos) : nothing
+                    descriptor = actual isa _SelfField && length(actual.path) == 1 ?
+                        get(field_regs, only(actual.path), nothing) : nothing
+                    compiler_owned_effect = descriptor isa _StructuredStatePort &&
+                        _sm_same_compiled_transition(
+                            endpoint, getfield(descriptor, :transition))
+                end
+                structured_effect_select = compiler_owned_effect ?
+                    :_sm_owned_structured_predicated_select :
+                    :_sm_structured_predicated_select
                 declared_types = typeof(port).parameters[1].parameters
                 snapshot_type = _sm_state_snapshot_type(plan, OW, SH)
                 backend_snapshot_type = _sm_backend_state_type(
@@ -8000,7 +8053,7 @@ function _functional_state_machine_method(
                 # groups so accidental cross-canon sharing still rejects.
                 argument_topology = Tuple(unique(
                     Tuple(group) for group in argument_topology_buffer))
-                candidate = bind!(
+                candidate = compiler_owned_effect ? raw_candidate : bind!(
                     :(_sm_validate_functional_effect_candidate(
                         getfield(ports, $(QuoteNode(name))), $raw_candidate,
                         $expected_arguments, ($(arguments...),),
@@ -8033,7 +8086,7 @@ function _functional_state_machine_method(
                             structured = :(getfield(ports,
                                              $(QuoteNode(field))))
                             set_field!(field,
-                                :(_sm_structured_predicated_select(
+                                :($structured_effect_select(
                                     $structured, $active, $replacement, $old)))
                         elseif haskey(field_regs, field) &&
                                 field_regs[field] isa _SMFixedStructuralTuplePort
@@ -8057,7 +8110,7 @@ function _functional_state_machine_method(
                         first_port = :(getfield(
                             ports, $(QuoteNode(first_root))))
                         base_syms[(:formal, actual.arg)] = bind!(
-                            :(_sm_structured_predicated_select(
+                            :($structured_effect_select(
                                 $first_port, $active,
                                 $replacement, $formal_old)),
                             :__sfm_formal_effect_write_, actual.arg)
@@ -8074,7 +8127,7 @@ function _functional_state_machine_method(
                             port = :(getfield(
                                 ports, $(QuoteNode(root.name))))
                             set_field!(root.name,
-                                :(_sm_structured_predicated_select(
+                                :($structured_effect_select(
                                     $port, $root_active,
                                     $replacement, $old)))
                         end
@@ -8089,7 +8142,7 @@ function _functional_state_machine_method(
                                 structured = :(getfield(ports,
                                                  $(QuoteNode(field))))
                                 set_field!(field,
-                                    :(_sm_structured_predicated_select(
+                                    :($structured_effect_select(
                                         $structured, $active, $value, $old)))
                             elseif haskey(field_regs, field) &&
                                     field_regs[field] isa _SMFixedStructuralTuplePort
@@ -8646,8 +8699,8 @@ function _functional_state_machine_method(
                 port = :(getfield(ports, $(QuoteNode(root))))
                 # Each frame slot is distinct storage, but every structured
                 # value must retain its own recursive alias topology.
-                structured = :(_sm_structured_copy($port, $seed))
-                stored = :(_sm_structured_carry_store($port, $structured))
+                structured = :(_sm_owned_structured_copy($port, $seed))
+                stored = :(_sm_owned_structured_carry_store($port, $structured))
                 static_tuple(
                     stored, frame_capacity; isolate=false)
             elseif frame_types[mid][name] <: Number
@@ -8708,7 +8761,7 @@ function _functional_state_machine_method(
         state_values = Any[
             haskey(field_regs, name) &&
                     field_regs[name] isa _StructuredStatePort ?
-                :(_sm_structured_carry_store(
+                :(_sm_owned_structured_carry_store(
                     getfield(ports, $(QuoteNode(name))),
                     $(base_syms[(:field, name)]))) :
                 :(_sm_control_carry_isolate($(base_syms[(:field, name)])))
@@ -8979,7 +9032,7 @@ function _functional_state_machine_method(
                                 selected = :($owner == oftype(
                                     $owner, $(root.tag)))
                                 current = bind!(
-                                    :(_sm_structured_predicated_select(
+                                    :(_sm_owned_structured_predicated_select(
                                         $port, $selected,
                                         $root_value, $current)),
                                     :__sfm_control_formal_value_, name)
@@ -9249,7 +9302,7 @@ function _functional_state_machine_method(
                         :(getfield(getfield($carry_arg, :state),
                                    $(QuoteNode(name))))
                     else
-                        :(_sm_structured_carry_store(
+                        :(_sm_owned_structured_carry_store(
                             getfield(ports, $(QuoteNode(name))), $current))
                     end
                 else
@@ -9366,7 +9419,7 @@ function _functional_state_machine_method(
         selected = if haskey(field_regs, descriptor_name) &&
                 field_regs[descriptor_name] isa _StructuredStatePort
             port = :(getfield(ports, $(QuoteNode(descriptor_name))))
-            :(_sm_structured_predicated_select(
+            :(_sm_owned_structured_predicated_select(
                 $port, $control_overflow, $initial, $current))
         elseif haskey(field_regs, descriptor_name) &&
                 field_regs[descriptor_name] isa _SMFixedStructuralTuplePort
@@ -9444,10 +9497,15 @@ function _functional_state_machine_method(
             outbox=NamedTuple{$observation_names}(($(outboxes...),)),
         )))
     end
+    state_type = _sm_state_snapshot_type(plan, OW, SH)
+    if native_state_types
+        pushfirst!(statements, :(state isa $state_type &&
+            arguments isa $ArgumentTypes || throw(ArgumentError(
+                "native state-type specialization requires its prepared native argument types"))))
+    end
     fn = compile(:((ports, rng_providers, ensures, $control_step_arg,
                     state, arguments, input_effects) ->
         $(Expr(:block, statements...))))
-    state_type = _sm_state_snapshot_type(plan, OW, SH)
     initial_effect_values = Any[
         _sm_structural_copy(getfield(getfield(ports, name),
                                      :initial_effect_state))
@@ -10105,7 +10163,8 @@ function _functionalize_stateful(kernel::_StatefulKernel, ::Val{Name};
                                  max_control_steps=nothing,
                                  argument_types=nothing,
                                  control_bounds=nothing,
-                                 rng_providers=NamedTuple()) where {Name}
+                                 rng_providers=NamedTuple(),
+                                 native_state_types::Bool=false) where {Name}
     rng_providers isa NamedTuple || _sm_reject(
         "rng_providers must be a NamedTuple keyed by authored formal name")
     methods = Tuple(ir for ir in method_irs(getfield(kernel, :skeleton))
@@ -10162,10 +10221,13 @@ function _functionalize_stateful(kernel::_StatefulKernel, ::Val{Name};
         forest = runtime_type.parameters[3]
         return _functional_state_machine_method(
             kernel, ir, bound, recursion_depth, control_steps,
-            argument_types, declared, forest, control_bounds, rng_providers)
+            argument_types, declared, forest, control_bounds, rng_providers;
+            native_state_types)
     end
     control_bounds === nothing || _sm_reject(
         "StatefulControlBounds is valid only for a structured state-machine method")
+    native_state_types && _sm_reject(
+        "native state-type specialization requires a structured state-machine method")
     max_iterations === nothing && max_recursion_depth === nothing &&
         max_control_steps === nothing || _sm_reject(
         "control bounds are only valid for a structured state-machine method")
@@ -10286,6 +10348,32 @@ struct CompiledStateTransition{
     initial::I
     structured_repairs::R
     topology_contract::T
+end
+
+# Internal effect adapter for a transition produced by this compiler. Its
+# input contract was checked at the containing transition's external boundary;
+# the emitted endpoint program preserves its declared writes and authorities.
+# Foreign effect lowerings keep their separate replacement validation.
+struct _SMCompiledTransitionEffect{T<:CompiledStateTransition}
+    transition::T
+end
+
+function _sm_same_compiled_transition(left::CompiledStateTransition,
+                                      right::CompiledStateTransition)
+    typeof(left) === typeof(right) || return false
+    getfield(left, :f) === getfield(right, :f) || return false
+    getfield(left, :ensures) === getfield(right, :ensures) || return false
+    groups = typeof(left).parameters[2]
+    external = typeof(left).parameters[3]
+    all(index -> getfield(getfield(left, :initial), first(groups[index])) ===
+                 getfield(getfield(right, :initial), first(groups[index])), external)
+end
+function (lowering::_SMCompiledTransitionEffect)(effect, state)
+    transition = getfield(lowering, :transition)
+    value = _sm_transition_body_call(getfield(transition, :f),
+        getfield(transition, :ensures), state, NamedTuple())
+    value = _sm_normalize_compiled_state(transition, value)
+    (arguments=(value,), result=nothing, effect_state=effect)
 end
 
 # Preserve the existing constructor while freezing its source-derived paths
@@ -10488,10 +10576,13 @@ function _sm_validate_structured_state_port(port::_StructuredStatePort, value)
     value
 end
 
+_sm_structured_copy(port::_StructuredStatePort, value) =
+    _sm_structured_copy(port, value, Val(false))
+
 @generated function _sm_structured_copy(
-        port::_StructuredStatePort{T}, value) where {T}
+        port::_StructuredStatePort{T}, value, ::Val{Owned}) where {T,Owned}
     Names, Groups, ExternalGroups = T.parameters[1:3]
-    statements = Any[
+    statements = Owned ? Any[] : Any[
         :(_sm_validate_functional_structured_state_port(port, value)),
     ]
     aliases = Dict{Symbol,Symbol}()
@@ -10511,8 +10602,9 @@ end
         local __structured_copy = $constructor(($(values...),))
         local __structured_copy_normalized = _sm_normalize_structured_state(
             port, __structured_copy)
-        _sm_validate_functional_structured_state_port(
-            port, __structured_copy_normalized)
+        $(Owned ? :__structured_copy_normalized :
+            :(_sm_validate_functional_structured_state_port(
+                port, __structured_copy_normalized)))
     end)
     Expr(:block, statements...)
 end
@@ -10535,11 +10627,15 @@ function _sm_structured_static_callable_groups(::Type{T}, omit) where {T}
           if fieldtype(Initial, first(Groups[index])) <: Function)
 end
 
+_sm_structured_carry_store(port::_StructuredStatePort, value, omit::Val) =
+    _sm_structured_carry_store(port, value, omit, Val(false))
+
 @generated function _sm_structured_carry_store(
-        port::_StructuredStatePort{T}, value, ::Val{OmitStatic}) where {T,OmitStatic}
+        port::_StructuredStatePort{T}, value, ::Val{OmitStatic},
+        ::Val{Owned}) where {T,OmitStatic,Owned}
     Names, Groups, ExternalGroups = T.parameters[1:3]
     static_groups = _sm_structured_static_callable_groups(T, OmitStatic)
-    statements = Any[
+    statements = Owned ? Any[] : Any[
         :(_sm_validate_functional_structured_state_port(port, value)),
     ]
     leaders = Tuple(first(group) for (index, group) in enumerate(Groups)
@@ -10583,28 +10679,35 @@ _sm_structured_carry_load(port::_StructuredStatePort, value) =
     :($constructor(($(values...),)))
 end
 
+_sm_structured_set(port::_StructuredStatePort, value, path::Val, replacement) =
+    _sm_structured_set(port, value, path, replacement, Val(false))
+
 function _sm_structured_set(
-        port::_StructuredStatePort, value, ::Val{Path}, replacement) where
-        {Path}
-    _sm_validate_functional_structured_state_port(port, value)
+        port::_StructuredStatePort, value, ::Val{Path}, replacement,
+        ::Val{Owned}) where {Path,Owned}
+    Owned || _sm_validate_functional_structured_state_port(port, value)
     transition = getfield(port, :transition)
     candidate = if isempty(Path)
-        _sm_validate_functional_structured_candidate(port, replacement)
+        Owned || _sm_validate_functional_structured_candidate(port, replacement)
         _sm_normalize_structured_state(port, replacement)
     else
         written = _sm_apply_topology_write(
             value, Val(Path), replacement,
             _sm_static_topology_contract(port))
-        _sm_validate_compiled_external_groups(transition, written)
+        Owned || _sm_validate_compiled_external_groups(transition, written)
         _sm_restore_compiled_external_groups(transition, written)
     end
-    _sm_validate_functional_structured_state_port(port, candidate)
+    Owned ? candidate : _sm_validate_functional_structured_state_port(port, candidate)
 end
 
+_sm_structured_predicated_select(port::_StructuredStatePort, active, candidate, prior) =
+    _sm_structured_predicated_select(port, active, candidate, prior, Val(false))
+
 @generated function _sm_structured_predicated_select(
-        port::_StructuredStatePort{T}, active, candidate, prior) where {T}
+        port::_StructuredStatePort{T}, active, candidate, prior,
+        ::Val{Owned}) where {T,Owned}
     Names, Groups, ExternalGroups = T.parameters[1:3]
-    statements = Any[
+    statements = Owned ? Any[] : Any[
         :(_sm_validate_functional_structured_state_port(port, prior)),
         :(_sm_validate_functional_structured_candidate(port, candidate)),
     ]
@@ -10614,12 +10717,10 @@ end
         new = :(getfield(candidate, $(QuoteNode(first(group)))))
         old = :(getfield(prior, $(QuoteNode(first(group)))))
         if group_index in ExternalGroups
-            push!(statements, quote
-                $new === $old || throw(ArgumentError(
+            Owned || push!(statements, :($new === $old || throw(ArgumentError(
                     "structured state external authority `$(first(group))` " *
-                    "cannot be replaced by predicated selection"))
-                local $symbol = $old
-            end)
+                    "cannot be replaced by predicated selection"))))
+            push!(statements, :(local $symbol = $old))
         else
             push!(statements,
                 :(local $symbol = _sm_predicated_select(active, $new, $old)))
@@ -10634,11 +10735,28 @@ end
         local __structured_selected = $constructor(($(values...),))
         local __structured_selected_normalized = _sm_normalize_structured_state(
             port, __structured_selected)
-        _sm_validate_functional_structured_state_port(
-            port, __structured_selected_normalized)
+        $(Owned ? :__structured_selected_normalized :
+            :(_sm_validate_functional_structured_state_port(
+                port, __structured_selected_normalized)))
     end)
     Expr(:block, statements...)
 end
+
+# These entries are emitted only for compiler-owned intermediate state. The
+# external transition boundary validates the incoming contract, and effect
+# ports validate foreign replacements before they enter this representation.
+# Alias reconstruction and isolation remain part of the operation itself.
+@inline _sm_owned_structured_copy(port, value) =
+    _sm_normalize_structured_state(port, value)
+@inline _sm_owned_structured_set(port, value, path, replacement) =
+    _sm_structured_set(port, value, path, replacement, Val(true))
+@inline _sm_owned_structured_predicated_select(port, active, candidate, prior) =
+    _sm_structured_predicated_select(port, active, candidate, prior, Val(true))
+@inline _sm_owned_structured_predicated_select(
+        port, active::Bool, candidate, prior) =
+    _sm_normalize_structured_state(port, ifelse(active, candidate, prior))
+@inline _sm_owned_structured_carry_store(port, value, omit=Val(false)) =
+    _sm_structured_carry_store(port, value, omit, Val(true))
 
 function _compile_structured_state_repair(
         spec::KernelSpec, pf::_PreparedFactory, names::Tuple,
