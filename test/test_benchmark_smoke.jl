@@ -66,6 +66,9 @@ end
                  "probprog_mcmc_comparison.jl",
                  "probprog_mcmc_comparison_body.jl",
                  joinpath("receipts", "validate_probprog_mcmc.jl"),
+                 "practicalbayes_comparison.jl",
+                 "practicalbayes_comparison_body.jl",
+                 joinpath("receipts", "validate_practicalbayes.jl"),
                  "nuts_reactant_comparison.jl",
                  "nuts_reactant_comparison_body.jl",
                  "eval_throughput_comparison.jl",
@@ -396,6 +399,8 @@ end
         "manual_primal", "manual_ad",
         "turing_idiomatic_primal", "turing_idiomatic_ad",
         "turing_vcat_free_primal", "turing_vcat_free_ad",
+        "practicalbayes_idiomatic_primal", "practicalbayes_idiomatic_ad",
+        "practicalbayes_vcat_free_primal", "practicalbayes_vcat_free_ad",
     ))
 end
 
@@ -435,6 +440,17 @@ end
     validation = _load_benchmark_validator(validator)
     @test isempty(Base.invokelatest(
         validation.validate_probprog_mcmc_receipt, receipt))
+end
+
+@testset "PracticalBayes PPL comparator receipt validates" begin
+    validator = joinpath(
+        _BENCH_DIR, "receipts", "validate_practicalbayes.jl")
+    receipt = joinpath(
+        _BENCH_DIR, "receipts", "practicalbayes-comparison-v1.toml")
+    @test isfile(receipt)
+    validation = _load_benchmark_validator(validator)
+    @test isempty(Base.invokelatest(
+        validation.validate_practicalbayes_receipt, receipt))
 end
 
 @testset "adaptive Reactant NUTS benchmark receipt validates" begin

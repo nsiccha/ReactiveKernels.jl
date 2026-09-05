@@ -25,6 +25,7 @@ using Test
 
     @test first(findfirst("\"Eight schools\" => \"eight-schools.md\"", make)) <
           first(findfirst("\"MNIST multinomial logistic\" => \"mnist-logistic.md\"", make)) <
+          first(findfirst("\"PracticalBayes comparator\" => \"practicalbayes.md\"", make)) <
           first(findfirst("\"Other model walkthroughs\" => [", make))
 
     for page in (

@@ -119,6 +119,10 @@ receipt.
 Main.ReactiveKernelsDocs.render_mnist_logistic_benchmarks()
 ```
 
+The exact-pin [PracticalBayes external comparator](practicalbayes.md) adds both
+public PracticalBayes model styles, explicit unsupported boundaries, and the
+same full raw-MNIST protocol in its separately resolved receipt.
+
 Displayed runtimes use three significant digits and report the minimum of ten
 independent BenchmarkTools minimum-time rounds — the uncontended-cost
 estimator. Exact values, medians, every raw round, and the complete capability
