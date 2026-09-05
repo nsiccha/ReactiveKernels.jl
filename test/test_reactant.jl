@@ -114,7 +114,8 @@ end
 @kernel reactant_small_eachcol_plate(
         scores::Matrix{Float64}, weights::Vector{Float64}) = begin
     pointwise = plate(eachcol(scores), weights) do column, weight
-        weight * sum(column)
+        value::Float64 = weight * sum(column)
+        return value
     end
     return sum(pointwise)
 end
