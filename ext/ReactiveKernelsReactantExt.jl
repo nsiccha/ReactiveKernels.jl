@@ -188,6 +188,15 @@ end
     active, new::T, old::T) where {T<:Reactant.TracedRNumber} =
         ifelse(active, new, old)
 
+# A fixed host index still needs a tensor mask when the destination is traced.
+# Otherwise the host comparison creates a BitVector inside the alternate
+# interpreter, whose packed broadcast implementation cannot be traced.
+@inline function ReactiveKernels._sm_finite_column_positions(
+        column::Reactant.TracedRArray, ::Val{Dimension}) where {Dimension}
+    Reactant.promote_to(Reactant.TracedRArray{Int,1},
+                       collect(axes(column, Dimension)))
+end
+
 # A nested structural argument can retain host scalar leaves while sibling
 # arrays are traced.  Promote every completed host column as an MLIR constant
 # when any column already follows the traced backend, keeping the fixed while

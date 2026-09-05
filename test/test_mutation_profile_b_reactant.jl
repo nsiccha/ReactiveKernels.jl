@@ -31,6 +31,10 @@ if _mpbr_enabled("structured-loop")
     include(joinpath(@__DIR__, "test_structured_loop_reactant.jl"))
 end
 
+if _mpbr_enabled("finite-static-index")
+    include(joinpath(@__DIR__, "test_finite_static_index_reactant.jl"))
+end
+
 if _mpbr_enabled("readonly-index")
 @testset "readonly integer controls seed traced loop indices" begin
     case = _MPBR_GENERIC_CONTROL.readonly_index_case()
