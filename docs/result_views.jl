@@ -3392,6 +3392,24 @@ function _practicalbayes_result_metric(row, key, conversion)
     conversion(result[key])
 end
 
+function _practicalbayes_model_plot(rows; id, title)
+    measured = filter(row -> row.runtime !== missing, rows)
+    isempty(measured) && error("PracticalBayes model receipt has no measured cells")
+    cell_order = unique(getproperty.(measured, :cell))
+    spec = data(measured) *
+        mapping(
+            :runtime => "Steady-state runtime (ns)",
+            :cell => sorter(cell_order) => "Measured matrix cell";
+            color = :differentiation => "Mode",
+        ) *
+        visual(Scatter, markersize = 120) *
+        config(height = 300, scales = scales(X = (; scale = log10)))
+    _plot_block(spec; id, title,
+        description = "Measured public-API cells only; the runtime axis is " *
+            "logarithmic. Unsupported matrix cells remain explicit in the " *
+            "paired table.")
+end
+
 function _render_practicalbayes_model_benchmark(workload::AbstractString;
                                                 id::AbstractString,
                                                 title::AbstractString)
@@ -3400,11 +3418,18 @@ function _render_practicalbayes_model_benchmark(workload::AbstractString;
         row -> row["workload"] == workload,
         receipt["model_measurements"])
     rows = map(selected) do row
+        model = String(row["model"])
+        differentiation = String(row["differentiation"])
+        boundary = String(row["boundary"])
+        outcome = String(row["outcome"])
         (;
-            model = String(row["model"]),
-            differentiation = String(row["differentiation"]),
-            boundary = String(row["boundary"]),
-            outcome = String(row["outcome"]),
+            model,
+            differentiation,
+            boundary,
+            outcome,
+            cell = "$(titlecase(replace(model, '_' => ' '))) · " *
+                "$(replace(boundary, '_' => ' ')) · " *
+                titlecase(replace(outcome, '_' => ' ')),
             runtime = _practicalbayes_result_metric(row, "min_ns", Float64),
             bytes = _practicalbayes_result_metric(row, "median_bytes", Int),
             allocations = _practicalbayes_result_metric(
@@ -3439,6 +3464,9 @@ function _render_practicalbayes_model_benchmark(workload::AbstractString;
             "$measured are measured and $(length(rows) - measured) retain " *
             "an explicit public-API limitation.",
         ]),
+        _practicalbayes_model_plot(rows;
+            id = "$id-runtime",
+            title = "$title — measured runtimes"),
         _result_table(rows, columns; id, title,
             note = "Setup, layout construction, AD preparation, and first " *
                 "execution are outside these timings and retained separately " *
@@ -3488,12 +3516,31 @@ function render_practicalbayes_eval_benchmark()
             format = (value, _) -> value == "measured" ? value :
                 h.span(value; class = "rk-result-unsupported")),
     )
+    measured = filter(row -> row.runtime !== missing, rows)
+    plot = _plot_block(
+        data(measured) *
+        mapping(
+            :size => "Position length",
+            :runtime => "Steady-state runtime (ns)";
+            color = :mode => "Requested output",
+        ) *
+        visual(ScatterLines) *
+        config(
+            height = 300,
+            scales = scales(X = (; scale = log10), Y = (; scale = log10)),
+        );
+        id = "practicalbayes-eval-throughput-runtime",
+        title = "PracticalBayes native evaluation runtime",
+        description = "Both axes are logarithmic and points are checked-in " *
+            "receipt minima. Unsupported Reactant cells remain explicit in " *
+            "the paired table.")
     Markdown.MD(Any[
         Markdown.Paragraph(Any[
             "All nine native PracticalBayes cells pass value/analytic-gradient " *
             "parity. The nine Reactant cells remain explicit unsupported rows " *
             "because the pinned public API exposes no compiler boundary.",
         ]),
+        plot,
         _result_table(rows, columns;
             id = "practicalbayes-eval-throughput",
             title = "PracticalBayes native evaluation and compiler support",

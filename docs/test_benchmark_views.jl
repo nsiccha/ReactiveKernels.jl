@@ -41,9 +41,9 @@ const FOCUSED_BENCHMARK_VIEWS = (
     :render_mnist_reactant_ad_benchmark => (3, 3),
     :render_mnist_reactant_ad_wren_benchmark => (3, 3),
     :render_probprog_mcmc_benchmark => (1, 3),
-    :render_practicalbayes_eight_schools_benchmark => (0, 1),
-    :render_practicalbayes_mnist_benchmark => (0, 1),
-    :render_practicalbayes_eval_benchmark => (0, 1),
+    :render_practicalbayes_eight_schools_benchmark => (1, 1),
+    :render_practicalbayes_mnist_benchmark => (1, 1),
+    :render_practicalbayes_eval_benchmark => (1, 1),
     :render_practicalbayes_mcmc_benchmark => (0, 1),
 )
 

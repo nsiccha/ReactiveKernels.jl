@@ -28,7 +28,7 @@
 import Pkg
 
 const _COMPARISON_INNER = "RK_EVAL_COMPARISON_INNER"
-const _REACTANT_VERSION = v"0.2.278"
+const _REACTANT_VERSION = v"0.2.284"
 
 include(joinpath(@__DIR__, "_repro_guard.jl"))
 

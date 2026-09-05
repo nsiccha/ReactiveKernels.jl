@@ -180,9 +180,9 @@ end
 end
 
 # Non-splat constants below deliberately avoid the separate upstream Reactant
-# 0.2.278 miscompile pinned in the testset (a splat constant lowers the concat
-# to `stablehlo.pad`, and EnzymeXLA's reduce-of-pad rewrite adds the pad value
-# once instead of once per padded element).
+# 0.2.278–0.2.284 miscompile pinned in the testset (a splat constant lowers the
+# concat to `stablehlo.pad`, and EnzymeXLA's reduce-of-pad rewrite adds the pad
+# value once instead of once per padded element).
 @kernel reactant_mixed_hcat(scores::Matrix{Float64}) = begin
     wide = hcat(reshape(collect(1.0:size(scores, 1)), size(scores, 1), 1), scores)
     total::Float64 = sum(wide)
@@ -253,8 +253,8 @@ end
             @test traced_sum ≈ native_sum
         end
 
-        # Upstream Reactant 0.2.278 miscompile, orthogonal to the promotion
-        # above: a nonzero SPLAT constant row lowers the concat to
+        # Upstream Reactant 0.2.278–0.2.284 miscompile, orthogonal to the
+        # promotion above: a nonzero SPLAT constant row lowers the concat to
         # `stablehlo.pad`, and EnzymeXLA's reduce-of-pad rewrite adds the pad
         # value once instead of once per padded element, so the concatenated
         # array is exact while its sum is wrong. Pinned broken so a Reactant

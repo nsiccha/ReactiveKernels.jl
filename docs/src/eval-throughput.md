@@ -115,7 +115,7 @@ julia --startup-file=no benchmark/receipts/validate_eval_throughput.jl \
   benchmark/receipts/eval-throughput-v1.toml
 ```
 
-The script provisions a fresh, pinned environment (Reactant 0.2.278, Turing
+The script provisions a fresh, pinned environment (Reactant 0.2.284, Turing
 0.47.1, DynamicPPL 0.42.6, Enzyme 0.13.199, DifferentiationInterface 0.7.21) that
 never enters ReactiveKernels' root dependencies. A quick smoke run:
 `RK_EVAL_SIZES=16,64 RK_EVAL_ROUNDS=20 RK_EVAL_REPLICAS=8 julia --startup-file=no benchmark/eval_throughput_comparison.jl`.
