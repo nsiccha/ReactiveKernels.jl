@@ -328,19 +328,6 @@ function ReactiveKernels._sm_control_dispatch(
     Reactant.Ops.case(index, dispatch.branches, carry; track_numbers=Union{})
 end
 
-# Only the generated body is backend-specific. Input/output validation,
-# topology restoration, and the public effect ABI stay in the shared caller.
-Reactant.@reactant_overlay function ReactiveKernels._sm_functional_machine_body(
-        transition, state, arguments, effects)
-    body = getfield(transition, :trace_body)
-    body === nothing && return ReactiveKernels._sm_generated_machine_body(
-        transition, state, arguments, effects)
-    body((getfield(transition, :ports),
-          getfield(transition, :rng_providers),
-          getfield(transition, :ensures), getfield(transition, :step),
-          state, arguments, effects))
-end
-
 ReactiveKernels._sm_frame_fill(
         value::Reactant.TracedRNumber, ::Val{Capacity}) where {Capacity} =
     Reactant.Ops.fill(value, (Capacity,))

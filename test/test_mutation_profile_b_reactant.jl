@@ -54,12 +54,6 @@ const generated = ReactiveKernels.compile(:((ports, rng, ensures, carry) ->
     (value=$(GlobalRef(@__MODULE__, :leaf))(carry.value),)))
 const block = ReactiveKernels._SMControlTraceBlock(
     generated, nothing, nothing, nothing)
-const outer_generated = ReactiveKernels.compile(
-    :((ports, rng, ensures, step, state, arguments, effects) ->
-        (value=$(GlobalRef(@__MODULE__, :leaf))(state.value),)))
-const outer_body = ReactiveKernels._SMControlTraceBody(outer_generated)
-outer_operation(state) = outer_body((nothing, nothing, nothing, nothing,
-                                    state, (), NamedTuple()))
 end
 
 struct _MPBRCallable{F}
@@ -431,9 +425,6 @@ if _mpbr_enabled("trace-block")
     state = (value=Reactant.to_rarray(3; track_numbers=true),)
     compiled = @compile _MPBRTraceBlockOverlay.operation(state)
     @test Int(compiled(state).value) == 5
-    @test _MPBRTraceBlockOverlay.outer_operation((value=3,)).value == 4
-    compiled_outer = @compile _MPBRTraceBlockOverlay.outer_operation(state)
-    @test Int(compiled_outer(state).value) == 5
 end
 end
 
