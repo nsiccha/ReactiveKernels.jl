@@ -279,10 +279,15 @@ end
         getfield(repair, :f), getfield(repair, :ensures), state)
 end
 
-struct _StructuredStatePort{T,R}
+struct _StructuredStatePort{T,R,Topology}
     transition::T
     repairs::R
 end
+_StructuredStatePort(transition::T, repairs::R) where {T,R} =
+    _StructuredStatePort{T,R,getfield(transition, :topology_contract)}(
+        transition, repairs)
+_sm_static_topology_contract(::_StructuredStatePort{T,R,Topology}) where {T,R,Topology} =
+    Val(Topology)
 
 struct _SMFixedStructuralTuplePort{
         T,Element,Capacity,Shape,ElementTopology,Topology}
@@ -4311,6 +4316,47 @@ function _sm_validate_required_aliases(value, contract::Tuple)
     value
 end
 
+# Structured ports freeze their recursive alias paths at preparation. Emit
+# those paths once instead of dynamically walking heterogeneous fields and
+# allocating a leader vector at every internal select/store. This is the same
+# identity contract as the tuple form, including separation of distinct groups.
+function _sm_topology_checks(contract; distinct)
+    statements = Any[]
+    leaders = Symbol[]
+    path_value(path) = foldl((source, step) ->
+        :(_sm_topology_step($source, Val($(QuoteNode(step))))),
+        path; init=:value)
+    for (index, group) in enumerate(contract)
+        leader = Symbol(:__topology_leader_, index)
+        push!(leaders, leader)
+        push!(statements, :(local $leader = $(path_value(first(group)))))
+        message = distinct ?
+            "functional state does not preserve recursive alias group $group" :
+            "functional replacement does not preserve recursive alias group $group"
+        for path in Base.tail(group)
+            push!(statements, :($(path_value(path)) === $leader ||
+                throw(ArgumentError($message))))
+        end
+    end
+    if distinct
+        for left in eachindex(leaders), right in (left + 1):length(leaders)
+            message = "functional state merges distinct recursive alias groups " *
+                "$(contract[left]) and $(contract[right])"
+            push!(statements, :($(leaders[left]) !== $(leaders[right]) ||
+                throw(ArgumentError($message))))
+        end
+    end
+    push!(statements, :value)
+    Expr(:block, statements...)
+end
+
+@generated function _sm_validate_topology_contract(value, ::Val{Contract}) where {Contract}
+    _sm_topology_checks(Contract; distinct=true)
+end
+@generated function _sm_validate_required_aliases(value, ::Val{Contract}) where {Contract}
+    _sm_topology_checks(Contract; distinct=false)
+end
+
 function _sm_canonicalize_topology(value, contract::Tuple)
     result = value
     for group in contract
@@ -4512,8 +4558,7 @@ function _sm_validate_functional_structured_state_port(
     names, groups, external_groups = typeof(transition).parameters[1:3]
     propertynames(value) == names || throw(ArgumentError(
         "functional structured state has the wrong field layout"))
-    _sm_validate_topology_contract(
-        value, getfield(transition, :topology_contract))
+    _sm_validate_topology_contract(value, _sm_static_topology_contract(port))
     for (group_index, group) in enumerate(groups)
         leader = getfield(value, first(group))
         if group_index in external_groups
@@ -4538,8 +4583,7 @@ function _sm_validate_functional_structured_candidate(
             "functional structured replacement has the wrong logical type"))
     _sm_functional_shape_ok(value, initial) || throw(ArgumentError(
         "functional structured replacement has the wrong axes"))
-    _sm_validate_required_aliases(
-        value, getfield(transition, :topology_contract))
+    _sm_validate_required_aliases(value, _sm_static_topology_contract(port))
     for group_index in external_groups
         group = groups[group_index]
         getfield(value, first(group)) === getfield(initial, first(group)) ||
@@ -10253,8 +10297,7 @@ fields must be repaired.  External authorities remain identity-bound.
 """
 function structured_state_port(transition::CompiledStateTransition)
     repairs = getfield(transition, :structured_repairs)
-    _StructuredStatePort{typeof(transition),typeof(repairs)}(
-        transition, repairs)
+    _StructuredStatePort(transition, repairs)
 end
 
 function _transition_sources(spec::KernelSpec, pf, args::Tuple,
