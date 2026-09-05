@@ -54,6 +54,13 @@ end
         left .= right
     end
 end
+@kernel nested_write_loop(point, limit) = begin
+    step!() = begin
+        for _ in 1:limit
+            point.values .= point.values .+ 1
+        end
+    end
+end
 struct EndpointAuthority <: Function end
 (::EndpointAuthority)(args...) = error("functional compiler authority")
 struct EndpointLowering{T}
@@ -122,6 +129,43 @@ end
     @test !Bool(result.control_overflow)
     @test Int(result.effects.operation.calls) == 2
     @test Float64(result.effects.operation.last_energy) == 25
+end
+
+@testset "captured nested writes retain aliases and inferred state" begin
+    shared, other = [1.0, 2.0], [3.0, 4.0]
+    state = (left=(a=shared, b=shared), right=(a=other, b=other))
+    contract = Val(RK._sm_topology_contract(state))
+    replacement = [5.0, 6.0]
+    result = @inferred RK._sm_apply_topology_write(
+        state, Val((:left, :a)), replacement, contract)
+    @test result.left.a == replacement
+    @test result.left.a === result.left.b
+    @test result.left.a !== replacement
+    @test result.right.a === other
+    @test state.left.a == [1, 2]
+    @test_throws ArgumentError RK._sm_apply_topology_write(
+        state, Val((:left,)), (a=[5.0, 6.0], b=[7.0, 8.0]), contract)
+
+    endpoint = RK.compile_state_transition(
+        loop_endpoint, increment_endpoint!, (energy, [1.0, 2.0]))
+    point = RK.initial_transition_state(endpoint)
+    bindings = RK.stateful_compiler_bindings(point=RK.structured_state_port(endpoint))
+    kernel = RK.compile_stateful(nested_write_loop, bindings, point, 2)
+    initial = RK.stateful_snapshot(kernel(point, 2))
+    transition = RK.functionalize_stateful(kernel, Val(:step!);
+        max_iterations=2, argument_types=Tuple{})
+    native = transition(initial)
+    @test native.state.point.values == [3, 4]
+    @test native.state.point.values === native.state.point.mirror
+    @test native.state.point.energy == 25
+    input = Reactant.to_rarray(initial; track_numbers=true)
+    fn = Reactant.compile(transition, (input,); sync=true, donated_args=:none)
+    traced = fn(input)
+    @test Array(traced.state.point.values) == [3, 4]
+    @test traced.state.point.values === traced.state.point.mirror
+    @test Float64(traced.state.point.energy) == 25
+    @test Array(input.point.values) == [1, 2]
+    @test !Bool(traced.control_overflow)
 end
 
 @testset "retained unit ranges and integer boundaries" begin

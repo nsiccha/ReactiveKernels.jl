@@ -474,17 +474,20 @@ function Reactant.traced_type_inner(
 end
 
 # Functional stateful transitions are immutable compiled programs. Their
-# PreparedKernel ensure tuple and RGF body are static metadata; only the
-# materialized state snapshot and method argument are traced.
+# PreparedKernel ensure tuple and RGF/AST bodies are static metadata; only the
+# materialized state snapshot and method argument are traced. A trace block
+# must not recursively trace its emitted Expr and captured repair programs.
 function Reactant.make_tracer(
-        seen, previous::ReactiveKernels._SMFunctionalForBody,
+        seen, previous::Union{ReactiveKernels._SMFunctionalForBody,
+                              ReactiveKernels._SMControlTraceBlock},
         path, mode; kwargs...)
     previous
 end
 
 function Reactant.traced_type_inner(
         ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
-        ndevices, runtime) where {T<:ReactiveKernels._SMFunctionalForBody}
+        ndevices, runtime) where {T<:Union{ReactiveKernels._SMFunctionalForBody,
+                                          ReactiveKernels._SMControlTraceBlock}}
     T
 end
 

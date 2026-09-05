@@ -1151,6 +1151,10 @@ end
 end
 
 @inline _sm_structural_set(value, ::Val{()}, replacement) = replacement
+@inline _sm_structural_set(value::NamedTuple, ::Val{()}, replacement) = replacement
+@inline _sm_structural_set(value::Tuple, ::Val{()}, replacement) = replacement
+@inline _sm_structural_set(value::LinearAlgebra.Diagonal, ::Val{()}, replacement) = replacement
+@inline _sm_structural_set(value::LinearAlgebra.Cholesky, ::Val{()}, replacement) = replacement
 @inline _sm_structural_set(
         value::AbstractArray, ::Val{()}, replacement) = replacement
 @inline function _sm_structural_set(
@@ -4557,6 +4561,38 @@ function _sm_apply_topology_write(
     result
 end
 
+# A captured write has a fixed path and fixed alias groups. Retain that
+# information through reconstruction so the surrounding loop can infer its
+# state; the runtime tuple walker remains available to preparation callers.
+@generated function _sm_apply_topology_write(
+        value, ::Val{Path}, replacement, ::Val{Contract}) where {Path,Contract}
+    statements = Any[:(local result = _sm_structural_set(
+        value, Val($(QuoteNode(Path))), replacement))]
+    path_value(path) = foldl((source, step) ->
+        :(_sm_topology_step($source, Val($(QuoteNode(step))))),
+        path; init=:result)
+    for (index, group) in enumerate(Contract)
+        written = Tuple(path for path in group
+                        if _sm_topology_path_is_within(path, Path))
+        isempty(written) && continue
+        leader = Symbol(:__written_leader_, index)
+        isolated = Symbol(:__written_group_, index)
+        push!(statements, :(local $leader = $(path_value(first(written)))))
+        message = "structured state write gives conflicting replacements for " *
+                  "recursive alias group $group"
+        for path in Base.tail(written)
+            push!(statements, :($(path_value(path)) === $leader ||
+                throw(ArgumentError($message))))
+        end
+        push!(statements, :(local $isolated = _sm_structural_copy($leader)))
+        for path in group
+            push!(statements, :(result = _sm_structural_set(
+                result, Val($(QuoteNode(path))), $isolated)))
+        end
+    end
+    Expr(:block, statements..., :result)
+end
+
 function _sm_isolated_structural_copy(value)
     contract = _sm_topology_contract(value)
     _sm_canonicalize_topology(_sm_structural_copy(value), contract)
@@ -6852,8 +6888,17 @@ function _functional_state_machine_method(
         field_type = _pp_fieldtype(plan, canon, OW, SH)
         role === :owned && _kernel_dom_num_scalar(field_type)
     end
+    if predicate_index === nothing
+        # Predicate seeds derive zero from a scalar without writing it. A
+        # read-only bound is sufficient when all owned fields are structured.
+        predicate_index = findfirst(names) do name
+            canon = get(fields, name, 0)
+            canon == 0 && return false
+            _kernel_dom_num_scalar(_pp_fieldtype(plan, canon, OW, SH))
+        end
+    end
     predicate_index === nothing && _sm_reject(
-        "functional state-machine requires one owned builtin scalar predicate carrier")
+        "functional state-machine requires one builtin scalar predicate carrier")
     predicate_name = names[predicate_index]
     predicate_source = base_syms[(:field, predicate_name)]
     index_index = findfirst(names) do name
@@ -10545,8 +10590,8 @@ function _sm_structured_set(
         _sm_normalize_structured_state(port, replacement)
     else
         written = _sm_apply_topology_write(
-            value, Path, replacement,
-            getfield(transition, :topology_contract))
+            value, Val(Path), replacement,
+            _sm_static_topology_contract(port))
         _sm_validate_compiled_external_groups(transition, written)
         _sm_restore_compiled_external_groups(transition, written)
     end
