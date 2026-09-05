@@ -589,6 +589,46 @@ function defunctionalized_mids(irs)
 end
 
 # ======================= backend-neutral control program =======================
+
+# A resumed block needs its own inputs and predicated write targets, not every
+# local used anywhere in its method. Keep an intentionally conservative symbol
+# census: extra metadata names can retain a load but cannot remove a required
+# one. Reconstructing an indexed alias also needs the bindings in its source
+# indices, even when that definition lives in a different block.
+function _control_block_bindings(block, alias_sources)
+    needed = Set{Symbol}()
+    function visit(x)
+        if x isa Symbol
+            push!(needed, x)
+        elseif x isa _Lit
+            return
+        elseif x isa Tuple || x isa AbstractVector
+            foreach(visit, x)
+        elseif x isa Pair
+            visit(first(x)); visit(last(x))
+        elseif x isa Expr
+            foreach(visit, x.args)
+        elseif x isa Union{_MExpr,_MStmt,_RawStmt,_RawCond}
+            for field in fieldnames(typeof(x))
+                visit(getfield(x, field))
+            end
+        end
+        nothing
+    end
+    visit(block.effects)
+    visit(block.writes)
+    hasproperty(block, :condition) && visit(block.condition)
+    hasproperty(block, :arguments) && visit(block.arguments)
+    previous = -1
+    while previous != length(needed)
+        previous = length(needed)
+        for name in collect(needed)
+            haskey(alias_sources, name) && visit(alias_sources[name])
+        end
+    end
+    needed
+end
+
 #
 # `compile_dispatcher` above emits one native implementation of the captured
 # control machine.  Optional backends need the same source-derived topology,

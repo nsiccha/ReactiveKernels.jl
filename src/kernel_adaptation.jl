@@ -4192,9 +4192,16 @@ _sm_functional_shape_ok(actual::NamedTuple, expected::NamedTuple) =
     all(_sm_functional_shape_ok(
             getfield(actual, name), getfield(expected, name))
         for name in propertynames(expected))
+@generated function _sm_functional_shape_ok(actual::NamedTuple{Names},
+                                           expected::NamedTuple{Names}) where {Names}
+    checks = [:(_sm_functional_shape_ok(getfield(actual, $(QuoteNode(name))),
+                                      getfield(expected, $(QuoteNode(name)))))
+              for name in Names]
+    foldr((check, rest) -> Expr(:&&, check, rest), checks; init=true)
+end
 _sm_functional_shape_ok(actual::Tuple, expected::Tuple) =
     length(actual) == length(expected) &&
-    all(_sm_functional_shape_ok(a, e) for (a, e) in zip(actual, expected))
+    all(map(_sm_functional_shape_ok, actual, expected))
 _sm_functional_shape_ok(
         actual::LinearAlgebra.Diagonal, expected::LinearAlgebra.Diagonal) =
     _sm_functional_shape_ok(actual.diag, expected.diag)
@@ -8490,7 +8497,9 @@ function _functional_state_machine_method(
                 local_types = Dict{Symbol,Bool}()
                 empty!(formal_root_aliases)
                 formal_names = Set(keys(program.formal_positions[mid]))
+                needed_bindings = _control_block_bindings(block, alias_sources[mid])
                 for name in program.stored[mid]
+                    name in needed_bindings || continue
                     key = (mid, name)
                     Tlocal = frame_types[mid][name]
                     if name in formal_names && haskey(provider_formals, key)
@@ -8546,6 +8555,7 @@ function _functional_state_machine_method(
                 end
                 local_origins = Dict{Symbol,Any}()
                 for (name, source) in alias_sources[mid]
+                    name in needed_bindings || continue
                     (haskey(local_syms, name) ||
                      (mid, name) in container_alias_only) || continue
                     local_types[name] = frame_types[mid][name] <: AbstractArray
