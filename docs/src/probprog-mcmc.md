@@ -115,7 +115,7 @@ julia --startup-file=no benchmark/receipts/validate_probprog_mcmc.jl \
   benchmark/receipts/probprog-mcmc-v1.toml
 ```
 
-The script provisions a fresh environment with Reactant pinned at 0.2.278 plus
+The script provisions a fresh environment with Reactant pinned at 0.2.284 plus
 AdvancedHMC, Turing, and MCMCDiagnosticTools, and develops the exact candidate
 with its example packages. For a quick non-publication smoke run, set
 `RK_PROBPROG_MCMC_WARMUP=150` and `RK_PROBPROG_MCMC_SAMPLES=100`; the

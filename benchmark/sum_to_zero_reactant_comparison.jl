@@ -6,7 +6,7 @@
 import Pkg
 
 const _SUM_TO_ZERO_REACTANT_INNER = "RK_SUM_TO_ZERO_REACTANT_INNER"
-const _SUM_TO_ZERO_REACTANT_VERSION = v"0.2.278"
+const _SUM_TO_ZERO_REACTANT_VERSION = v"0.2.284"
 
 include(joinpath(@__DIR__, "_repro_guard.jl"))
 

@@ -9,7 +9,7 @@
 import Pkg
 
 const _PROBPROG_MCMC_INNER = "RK_PROBPROG_MCMC_INNER"
-const _PROBPROG_MCMC_REACTANT_VERSION = v"0.2.278"
+const _PROBPROG_MCMC_REACTANT_VERSION = v"0.2.284"
 
 include(joinpath(@__DIR__, "_repro_guard.jl"))
 
