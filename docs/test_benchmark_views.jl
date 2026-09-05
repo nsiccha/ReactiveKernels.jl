@@ -41,10 +41,6 @@ const FOCUSED_BENCHMARK_VIEWS = (
     :render_mnist_reactant_ad_benchmark => (3, 3),
     :render_mnist_reactant_ad_wren_benchmark => (3, 3),
     :render_probprog_mcmc_benchmark => (1, 3),
-    :render_practicalbayes_eight_schools_benchmark => (1, 1),
-    :render_practicalbayes_mnist_benchmark => (1, 1),
-    :render_practicalbayes_eval_benchmark => (1, 1),
-    :render_practicalbayes_mcmc_benchmark => (0, 1),
 )
 
 @testset "focused benchmark renderer inventory" begin
@@ -69,4 +65,26 @@ const FOCUSED_BENCHMARK_VIEWS = (
               artifact_contract(
                   ReactiveKernelsDocs.render_eight_schools_ad_benchmarks()).tables)
     @test all(html -> occursin("Runtime ÷ baseline", html), throughput.tables)
+    for name in (
+            :render_eight_schools_primal_benchmarks,
+            :render_eight_schools_ad_benchmarks,
+            :render_mnist_logistic_benchmarks,
+            :render_mnist_logistic_ad_benchmarks)
+        @test occursin("PracticalBayes", first(artifact_contract(
+            getfield(ReactiveKernelsDocs, name)()).tables))
+    end
+    @test all(html -> occursin("PracticalBayes", html), throughput.tables)
+
+    for name in (
+            :render_practicalbayes_eight_schools_benchmark,
+            :render_practicalbayes_mnist_benchmark,
+            :render_practicalbayes_eval_benchmark,
+            :render_practicalbayes_mcmc_benchmark)
+        @test !isdefined(ReactiveKernelsDocs, name)
+    end
+    practicalbayes_body = read(joinpath(
+        @__DIR__, "..", "benchmark", "practicalbayes_comparison_body.jl"), String)
+    @test !occursin("NUTS", practicalbayes_body)
+    @test !occursin("sampling_measurements", practicalbayes_body)
+    @test !occursin("mcmc_", lowercase(practicalbayes_body))
 end

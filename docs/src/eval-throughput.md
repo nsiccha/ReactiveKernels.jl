@@ -51,14 +51,19 @@ omitted.
 Main.ReactiveKernelsDocs.eval_throughput_chart()
 ```
 
-The [PracticalBayes external comparator](practicalbayes.md) measures the same
-native primal, gradient, and returned pointwise quantities and records the
-absence of a public Reactant boundary explicitly.
+PracticalBayes native measurements are included above as another comparator
+series. Its separately resolved exact-pin harness emits the same three modes;
+the absence of a public Reactant boundary remains explicit in
+[`practicalbayes-comparison-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/practicalbayes-comparison-v1.toml).
 
 ## Baseline implementations
 
 ```@eval
 Main.ReactiveKernelsDocs.render_eval_throughput_baselines()
+```
+
+```@eval
+Main.ReactiveKernelsDocs.render_practicalbayes_eval_baseline()
 ```
 
 ## Avoiding the Reactant invocation cost

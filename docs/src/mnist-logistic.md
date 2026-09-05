@@ -119,9 +119,10 @@ receipt.
 Main.ReactiveKernelsDocs.render_mnist_logistic_benchmarks()
 ```
 
-The exact-pin [PracticalBayes external comparator](practicalbayes.md) adds both
-public PracticalBayes model styles, explicit unsupported boundaries, and the
-same full raw-MNIST protocol in its separately resolved receipt.
+PracticalBayes is included above as ordinary idiomatic and vcat-free comparator
+series. Its separately resolved exact-pin harness runs the same full raw-MNIST
+protocol, with the complete public-API matrix and provenance retained in
+[`practicalbayes-comparison-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/practicalbayes-comparison-v1.toml).
 
 Displayed runtimes use three significant digits and report the minimum of ten
 independent BenchmarkTools minimum-time rounds — the uncontended-cost
@@ -149,6 +150,10 @@ gates.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_mnist_logistic_baselines()
+```
+
+```@eval
+Main.ReactiveKernelsDocs.render_practicalbayes_mnist_baselines()
 ```
 
 Reproduce the pinned receipt from a clean detached checkout (this loads the full

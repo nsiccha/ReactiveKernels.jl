@@ -8,8 +8,6 @@ const PRACTICALBAYES_REVISION =
     "c6b340baef4f4a9e3d26cd0ea5082a2baf26dcf9"
 const PRACTICALBAYES_EVAL_SIZES = (16, 256, 4096)
 const PRACTICALBAYES_EVAL_MODES = ("primal", "gradient", "gq")
-const PRACTICALBAYES_MCMC_MODELS =
-    ("eight_schools", "mnist_logistic_wren_pca40")
 
 function _body_sha256(root)
     bytes2hex(SHA.sha256(read(joinpath(
@@ -40,9 +38,11 @@ function validate_practicalbayes_receipt(path::AbstractString;
     for section in (
             "pins", "environment", "compatibility", "protocol",
             "preparations", "datasets", "model_measurements",
-            "eval_measurements", "sampling_measurements")
+            "eval_measurements")
         require(haskey(receipt, section), "missing $section")
     end
+    require(!haskey(receipt, "sampling_measurements"),
+            "sampling measurements are outside the PracticalBayes comparator scope")
     isempty(errors) || return errors
 
     pins = receipt["pins"]
@@ -62,10 +62,9 @@ function validate_practicalbayes_receipt(path::AbstractString;
     require(get(pins, "benchmark_body_sha256", "") == _body_sha256(root),
             "benchmark body digest does not match the executed source")
     for pin in (
-            "adtypes_version", "advancedhmc_version", "benchmarktools_version",
-            "distributions_version", "enzyme_version",
-            "logdensityproblems_version", "mcmcdiagnostictools_version",
-            "mldatasets_version", "nnlib_version", "julia_version")
+            "adtypes_version", "benchmarktools_version", "distributions_version",
+            "enzyme_version", "logdensityproblems_version", "mldatasets_version",
+            "nnlib_version", "julia_version")
         require(!isempty(get(pins, pin, "")), "missing pin $pin")
     end
 
@@ -83,8 +82,10 @@ function validate_practicalbayes_receipt(path::AbstractString;
 
     protocol = receipt["protocol"]
     require(Tuple(get(protocol, "sections", String[])) ==
-            ("models", "eval", "sampling"),
-            "publication receipt must contain all three sections")
+            ("models", "eval"),
+            "publication receipt must contain the model and evaluation sections")
+    require(all(key -> !startswith(String(key), "mcmc_"), keys(protocol)),
+            "MCMC protocol fields are outside the PracticalBayes comparator scope")
     require(get(protocol, "setup_in_timed_region", true) == false,
             "setup entered steady-state timings")
     require(get(protocol, "preparation_in_timed_region", true) == false,
@@ -101,18 +102,6 @@ function validate_practicalbayes_receipt(path::AbstractString;
             "publication receipt requires at least ten timing rounds")
     require(Int(get(protocol, "samples_per_round", 0)) >= 20,
             "publication receipt requires at least 20 samples per round")
-    require(Int(get(protocol, "mcmc_num_warmup", 0)) >= 1000,
-            "publication receipt requires at least 1000 warmup transitions")
-    require(Int(get(protocol, "mcmc_num_samples", 0)) >= 1000,
-            "publication receipt requires at least 1000 retained draws")
-    require(Int(get(protocol, "mcmc_max_tree_depth", 0)) == 10,
-            "PracticalBayes NUTS depth must be 10")
-    require(get(protocol, "mcmc_metric", "") == "diagonal",
-            "PracticalBayes NUTS metric must be diagonal")
-    require(Float64(get(protocol, "mcmc_target_accept", 0.0)) == 0.8,
-            "PracticalBayes NUTS target acceptance must be 0.8")
-    require(Float64(get(protocol, "mcmc_divergence_threshold", 0.0)) == 1000.0,
-            "PracticalBayes NUTS divergence threshold must be 1000")
 
     model_rows = receipt["model_measurements"]
     expected_model_keys = Tuple{String,String,String,String,String}[]
@@ -214,48 +203,19 @@ function validate_practicalbayes_receipt(path::AbstractString;
         end
     end
 
-    sampling_rows = receipt["sampling_measurements"]
-    require(length(sampling_rows) == length(PRACTICALBAYES_MCMC_MODELS),
-            "sampling matrix must contain two rows")
-    seen_sampling = Set{String}()
-    for row in sampling_rows
-        model = String(get(row, "model", ""))
-        require(model in PRACTICALBAYES_MCMC_MODELS,
-                "unknown sampling model $model")
-        require(!(model in seen_sampling), "duplicate sampling row $model")
-        push!(seen_sampling, model)
-        require(get(row, "harness", "") == "practicalbayes_nuts",
-                "$model uses the wrong harness")
-        require(get(row, "state", "") == "measured",
-                "$model sampling row must be measured")
-        for key in ("compile_or_warm_start_seconds", "sampling_seconds",
-                    "min_ess", "median_ess")
-            require(Float64(get(row, key, 0.0)) > 0,
-                    "$model lacks positive $key")
-        end
-        require(Int(get(row, "divergences", -1)) >= 0,
-                "$model lacks a divergence count")
-        require(Float64(get(row, "density_parity_max_abs", Inf)) <= 1e-8,
-                "$model sampling density parity failed")
-    end
-
     datasets = receipt["datasets"]
     require(get(get(datasets, "mnist_logistic_full_raw", Dict()),
                 "num_observations", 0) == 60000,
             "full-raw MNIST dataset record must contain 60000 observations")
-    wren = get(datasets, "mnist_logistic_wren_pca40", Dict())
-    require(get(wren, "dataset_profile", "") == "wren-pca40",
-            "sampling dataset must be Wren PCA-40")
-    require(get(wren, "num_observations", 0) == 1000 &&
-            get(wren, "num_features", 0) == 40,
-            "sampling dataset must be 1000 × 40")
+    require(!haskey(datasets, "mnist_logistic_wren_pca40"),
+            "the sampling-only Wren PCA-40 dataset is outside comparator scope")
     errors
 end
 
 function main(path)
     errors = validate_practicalbayes_receipt(path)
     isempty(errors) && begin
-        println("VALIDATE OK — PracticalBayes model, evaluation, and NUTS matrices accepted")
+        println("VALIDATE OK — PracticalBayes model and evaluation matrices accepted")
         return 0
     end
     foreach(println, errors)
