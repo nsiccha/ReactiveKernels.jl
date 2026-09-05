@@ -15,7 +15,7 @@ function _run_pinned_sum_to_zero_reactant_comparison()
     sha = _require_clean_detached_candidate(root)
     mktempdir(prefix = "reactivekernels-sum-to-zero-reactant-") do environment
         setup_seconds = precompile_seconds = 0.0
-        withenv("JULIA_PKG_PRECOMPILE_AUTO" => "0") do
+        _with_serial_pkg_precompile() do
             setup_seconds = @elapsed begin
                 Pkg.activate(environment)
                 Pkg.add([

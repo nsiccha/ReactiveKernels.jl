@@ -32,15 +32,17 @@ function _run_pinned_comparison()
     candidate_sha = allow_dirty ? readchomp(`git -C $root rev-parse HEAD`) :
         _require_clean_detached_candidate(root)
     mktempdir(prefix = "reactivekernels-nuts-reactant-comparison-") do environment
-        Pkg.activate(environment)
-        Pkg.add(Pkg.PackageSpec(name = "Reactant", version = _REACTANT_VERSION))
-        Pkg.pin(Pkg.PackageSpec(name = "Reactant"))
-        Pkg.develop([
-            Pkg.PackageSpec(path = root),
-            Pkg.PackageSpec(path = joinpath(root, "packages", "ReactiveKernelsNUTSExamples")),
-        ])
-        Pkg.instantiate()
-        Pkg.precompile()
+        _with_serial_pkg_precompile() do
+            Pkg.activate(environment)
+            Pkg.add(Pkg.PackageSpec(name = "Reactant", version = _REACTANT_VERSION))
+            Pkg.pin(Pkg.PackageSpec(name = "Reactant"))
+            Pkg.develop([
+                Pkg.PackageSpec(path = root),
+                Pkg.PackageSpec(path = joinpath(root, "packages", "ReactiveKernelsNUTSExamples")),
+            ])
+            Pkg.instantiate()
+            Pkg.precompile()
+        end
         command = addenv(
             `$(Base.julia_cmd()) --startup-file=no --project=$environment $(@__FILE__) $(ARGS...)`,
             _COMPARISON_INNER => "1",

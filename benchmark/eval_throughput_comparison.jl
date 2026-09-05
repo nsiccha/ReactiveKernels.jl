@@ -36,18 +36,20 @@ function _run_pinned_comparison()
     root = normpath(joinpath(@__DIR__, ".."))
     sha = readchomp(`git -C $root rev-parse HEAD`)
     mktempdir(prefix = "reactivekernels-eval-comparison-") do environment
-        Pkg.activate(environment)
-        Pkg.add(Pkg.PackageSpec(name = "Reactant", version = _REACTANT_VERSION))
-        Pkg.pin(Pkg.PackageSpec(name = "Reactant"))
-        Pkg.develop(path = root)
-        Pkg.add([
-            Pkg.PackageSpec(name = "Turing", version = v"0.47.1"),
-            Pkg.PackageSpec(name = "DynamicPPL", version = v"0.42.6"),
-            Pkg.PackageSpec(name = "Distributions", version = v"0.25.131"),
-            Pkg.PackageSpec(name = "DifferentiationInterface", version = v"0.7.21"),
-            Pkg.PackageSpec(name = "Enzyme", version = v"0.13.199"),
-        ])
-        Pkg.precompile()
+        _with_serial_pkg_precompile() do
+            Pkg.activate(environment)
+            Pkg.add(Pkg.PackageSpec(name = "Reactant", version = _REACTANT_VERSION))
+            Pkg.pin(Pkg.PackageSpec(name = "Reactant"))
+            Pkg.develop(path = root)
+            Pkg.add([
+                Pkg.PackageSpec(name = "Turing", version = v"0.47.1"),
+                Pkg.PackageSpec(name = "DynamicPPL", version = v"0.42.6"),
+                Pkg.PackageSpec(name = "Distributions", version = v"0.25.131"),
+                Pkg.PackageSpec(name = "DifferentiationInterface", version = v"0.7.21"),
+                Pkg.PackageSpec(name = "Enzyme", version = v"0.13.199"),
+            ])
+            Pkg.precompile()
+        end
         command = addenv(
             `$(Base.julia_cmd()) --startup-file=no --project=$environment $(@__FILE__) $(ARGS...)`,
             _COMPARISON_INNER => "1",
