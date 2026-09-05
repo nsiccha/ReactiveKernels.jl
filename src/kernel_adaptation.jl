@@ -3965,7 +3965,7 @@ end
 struct _FunctionalStateMachineTransition{
         Names,Groups,ArrayNames,StateType,EffectType,Iterations,ArgumentTypes,
         Declared,Forest,F,P,E,C,T,ObservationNames,Step,Bounds,
-        RNGProviders,TypeContext}
+        RNGProviders,TypeContext,Topology}
     f::F
     ports::P
     ensures::E
@@ -3974,6 +3974,12 @@ struct _FunctionalStateMachineTransition{
     step::Step
     bounds::Bounds
     rng_providers::RNGProviders
+end
+
+_sm_compiled_topology(transition) = getfield(transition, :topology_contract)
+@generated function _sm_compiled_topology(transition::T) where
+        {T<:_FunctionalStateMachineTransition}
+    :($(QuoteNode(Val(T.parameters[end]))))
 end
 
 # Keyword arguments are convenient for ordinary Julia, but optional compiler
@@ -4725,7 +4731,7 @@ function _sm_validate_reusable_structured_state_port(
     _sm_functional_shape_ok(value, initial) || throw(ArgumentError(
         "reusable compiled structured state does not match its compiled shapes"))
     _sm_validate_topology_contract(
-        value, getfield(transition, :topology_contract))
+        value, _sm_compiled_topology(transition))
     for (group_index, group) in enumerate(groups)
         leader = getfield(value, first(group))
         if group_index in external_groups
@@ -4770,7 +4776,7 @@ function _sm_validate_reusable_raw_structured_state_port(
     _sm_functional_shape_ok(value, initial) || throw(ArgumentError(
         "raw backend structured state does not match its compiled shapes"))
     _sm_validate_topology_contract(
-        value, getfield(transition, :topology_contract))
+        value, _sm_compiled_topology(transition))
     value
 end
 
@@ -4962,7 +4968,7 @@ function _sm_restore_observation_state(
         {Names,Groups,ArrayNames,StateType}
     materialized = _sm_materialize_observation(value, StateType)
     canonical = _sm_canonicalize_topology(
-        materialized, getfield(transition, :topology_contract))
+        materialized, _sm_compiled_topology(transition))
     _sm_restore_reusable_state_ports(
         getfield(transition, :ports), canonical, Groups)
 end
@@ -5149,7 +5155,7 @@ function _sm_functional_machine_call(
         getfield(transition, :ports), result.effects)
     result = merge(result, (effects=restored_effects,))
     _sm_validate_topology_contract(
-        result.state, getfield(transition, :topology_contract))
+        result.state, _sm_compiled_topology(transition))
     _sm_validate_effect_topologies(
         getfield(transition, :ports), result.effects)
     _sm_validate_observation_result(transition, result)
@@ -5283,7 +5289,7 @@ function _sm_validate_machine_state(transition, state;
     all_logical = _sm_validate_machine_fields(transition, state, label)
     if all_logical
         _sm_validate_topology_contract(
-            state, getfield(transition, :topology_contract))
+            state, _sm_compiled_topology(transition))
     end
     if raw
         _sm_validate_reusable_raw_state_ports(ports, state)
@@ -5631,7 +5637,7 @@ function _sm_validate_compiled_state_input(
         throw(ArgumentError(
             "functional stateful state does not match its compiled axes"))
     _sm_validate_topology_contract(
-        state, getfield(transition, :topology_contract))
+        state, _sm_compiled_topology(transition))
     _sm_validate_functional_state_ports(getfield(transition, :ports), state)
     state
 end
@@ -5645,7 +5651,7 @@ function _sm_validate_reusable_compiled_state_input(
         throw(ArgumentError(
             "reusable compiled stateful state does not match its compiled axes"))
     _sm_validate_topology_contract(
-        state, getfield(transition, :topology_contract))
+        state, _sm_compiled_topology(transition))
     _sm_validate_reusable_state_ports(getfield(transition, :ports), state)
     state
 end
@@ -5752,7 +5758,7 @@ function _sm_restore_reusable_compiled_output(
     restored_ports = _sm_restore_reusable_state_ports(
         ports, result.state, Groups)
     canonical = _sm_canonicalize_topology(
-        restored_ports, getfield(transition, :topology_contract))
+        restored_ports, _sm_compiled_topology(transition))
     restored = _sm_restore_reusable_structured_wrappers(
         ports, canonical, Groups)
     restored_result = merge(result, (state=restored,))
@@ -5782,7 +5788,7 @@ function _sm_validate_reusable_compiled_raw_output(
         throw(ArgumentError(
             "raw backend stateful state has the wrong axes"))
     _sm_validate_topology_contract(
-        result, getfield(transition, :topology_contract))
+        result, _sm_compiled_topology(transition))
     _sm_validate_reusable_raw_state_ports(
         getfield(transition, :ports), result)
     result
@@ -5793,7 +5799,7 @@ function _sm_restore_reusable_compiled_output(
             Names,Groups,StateType,true}, result) where
         {Names,Groups,StateType}
     canonical = _sm_canonicalize_topology(
-        result, getfield(transition, :topology_contract))
+        result, _sm_compiled_topology(transition))
     _sm_restore_reusable_state_ports(
         getfield(transition, :ports), canonical, Groups)
 end
@@ -9315,7 +9321,7 @@ function _functional_state_machine_method(
         Declared,transition_forest,
         typeof(fn),typeof(ports),typeof(Tuple(ensures)),C,T,
         observation_names,typeof(control_step),typeof(bounds),
-        typeof(rng_providers),type_context}(
+        typeof(rng_providers),type_context,getfield(kernel, :topology_contract)}(
             fn, ports, Tuple(ensures), getfield(kernel, :shape_contract),
             getfield(kernel, :topology_contract), control_step, bounds,
             rng_providers)
@@ -10134,12 +10140,29 @@ returned by [`initial_transition_state`](@ref). The transition's bound controls,
 derived-field repairs, and generated program are immutable compiler metadata.
 """
 struct CompiledStateTransition{
-        Names,Groups,ExternalGroups,WritableNames,F,E,I,R,T}
+        Names,Groups,ExternalGroups,WritableNames,F,E,I,R,T,Topology}
     f::F
     ensures::E
     initial::I
     structured_repairs::R
     topology_contract::T
+end
+
+# Preserve the existing constructor while freezing its source-derived paths
+# for generated checks and reconstruction. The field remains available for
+# inspection and for operations that still consume a runtime contract.
+function CompiledStateTransition{
+        Names,Groups,ExternalGroups,WritableNames,F,E,I,R,T}(
+        f, ensures, initial, repairs, topology::T) where
+        {Names,Groups,ExternalGroups,WritableNames,F,E,I,R,T}
+    CompiledStateTransition{
+        Names,Groups,ExternalGroups,WritableNames,F,E,I,R,T,topology}(
+            f, ensures, initial, repairs, topology)
+end
+
+@generated function _sm_compiled_topology(transition::T) where
+        {T<:CompiledStateTransition}
+    :($(QuoteNode(Val(T.parameters[end]))))
 end
 
 Base.show(io::IO, ::CompiledStateTransition{Names}) where {Names} =
@@ -10159,7 +10182,7 @@ function _sm_validate_reusable_compiled_state_input(
     _sm_functional_shape_ok(state, initial) || throw(ArgumentError(
         "reusable compiled transition state does not match its compiled axes"))
     _sm_validate_topology_contract(
-        state, getfield(transition, :topology_contract))
+        state, _sm_compiled_topology(transition))
     _sm_validate_external_group_identities(state, initial,
         Val(Groups), Val(ExternalGroups), "reusable compiled transition")
 end
@@ -10180,7 +10203,7 @@ function _sm_validate_reusable_compiled_raw_output(
     _sm_functional_shape_ok(result, initial) || throw(ArgumentError(
         "raw backend compiled transition state has the wrong axes"))
     _sm_validate_topology_contract(
-        result, getfield(transition, :topology_contract))
+        result, _sm_compiled_topology(transition))
     result
 end
 
@@ -10214,7 +10237,7 @@ end
 function _sm_normalize_compiled_state(
         transition::CompiledStateTransition, value)
     canonical = _sm_canonicalize_topology(
-        value, getfield(transition, :topology_contract))
+        value, _sm_compiled_topology(transition))
     _sm_restore_compiled_external_groups(transition, canonical)
 end
 
@@ -10266,13 +10289,13 @@ function (transition::CompiledStateTransition{Names,Groups,ExternalGroups})(
     _sm_functional_shape_ok(state, initial) || throw(ArgumentError(
         "compiled state transition input does not match its compiled axes"))
     _sm_validate_topology_contract(
-        state, getfield(transition, :topology_contract))
+        state, _sm_compiled_topology(transition))
     _sm_validate_compiled_external_groups(transition, state)
     result = _sm_transition_body_call(
         getfield(transition, :f), getfield(transition, :ensures), state, controls)
     result = _sm_restore_reusable_compiled_output(transition, result)
     _sm_validate_topology_contract(
-        result, getfield(transition, :topology_contract))
+        result, _sm_compiled_topology(transition))
     result
 end
 
@@ -10311,7 +10334,7 @@ function _sm_validate_structured_state_port(port::_StructuredStatePort, value)
     transition_type = typeof(transition)
     names, groups, external_groups = transition_type.parameters[1:3]
     _sm_validate_topology_contract(
-        value, getfield(transition, :topology_contract))
+        value, _sm_compiled_topology(transition))
     for (group_index, group) in enumerate(groups)
         leader = getfield(value, first(group))
         if group_index in external_groups
