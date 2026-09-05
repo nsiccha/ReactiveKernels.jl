@@ -51,6 +51,10 @@ omitted.
 Main.ReactiveKernelsDocs.eval_throughput_chart()
 ```
 
+The [PracticalBayes external comparator](practicalbayes.md) measures the same
+native primal, gradient, and returned pointwise quantities and records the
+absence of a public Reactant boundary explicitly.
+
 ## Baseline implementations
 
 ```@eval

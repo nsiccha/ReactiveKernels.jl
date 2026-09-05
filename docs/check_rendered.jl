@@ -325,6 +325,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
     )
     expected_sortable_tables = Dict(
         "probprog-mcmc.md" => 3,
+        "practicalbayes.md" => 4,
         "distributions-ad.md" => 9,
         "distributions.md" => 1,
         "ppl-ad.md" => 10,
@@ -372,6 +373,14 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "nonallocating.md" => "review-pending",
     )
     structural_markers = Dict(
+        "practicalbayes.md" => (
+            "PracticalBayes external comparator",
+            "PracticalBayes Eight Schools capability matrix",
+            "PracticalBayes MNIST capability matrix",
+            "PracticalBayes native evaluation and compiler support",
+            "PracticalBayes NUTS performance and diagnostics",
+            "practicalbayes-comparison-v1.toml",
+        ),
         "probprog-mcmc.md" => (
             "NUTS sampling performance and diagnostics",
             "Eight Schools posterior agreement",

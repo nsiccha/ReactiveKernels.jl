@@ -142,6 +142,17 @@ function validate_practicalbayes_receipt(path::AbstractString;
         require(key in expected_model_keys, "unknown model row $key")
         require(!(key in seen_model), "duplicate model row $key")
         push!(seen_model, key)
+        require(get(row, "provider", "") == "practical_bayes",
+                "$key has the wrong provider")
+        expected_configuration = if key[1] == "eight_schools"
+            key[5] == "primal" ?
+                "practicalbayes_primal" : "practicalbayes_ad"
+        else
+            "practicalbayes_$(key[2])_" *
+                (key[5] == "primal" ? "primal" : "ad")
+        end
+        require(get(row, "configuration", "") == expected_configuration,
+                "$key has the wrong configuration")
         supported = _model_supported(key...)
         state = get(row, "state", "")
         require(state == (supported ? "supported" : "unsupported"),

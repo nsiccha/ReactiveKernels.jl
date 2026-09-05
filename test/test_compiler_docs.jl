@@ -83,6 +83,7 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
         "mnist-reactant.md",
         "ppl-ad.md",
         "probprog-mcmc.md",
+        "practicalbayes.md",
         "reactant-ad.md",
         "reactant.md",
     ))
