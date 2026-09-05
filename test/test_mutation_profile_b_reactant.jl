@@ -27,6 +27,10 @@ const _MPBR_GENERIC_NUTS = MutationProfileBGenericNUTSSupport
 const _MPBR_TESTSET = get(ENV, "RK_MPB_REACTANT_TESTSET", "all")
 _mpbr_enabled(name) = _MPBR_TESTSET == "all" || _MPBR_TESTSET == name
 
+if _mpbr_enabled("structured-loop")
+    include(joinpath(@__DIR__, "test_structured_loop_reactant.jl"))
+end
+
 if _mpbr_enabled("readonly-index")
 @testset "readonly integer controls seed traced loop indices" begin
     case = _MPBR_GENERIC_CONTROL.readonly_index_case()

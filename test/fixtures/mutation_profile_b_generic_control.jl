@@ -19,6 +19,22 @@ function readonly_index_case(; max_iterations=4)
     (; kernel, state, transition)
 end
 
+@kernel unit_range_counter(visits) = begin
+    step!(lower, upper) = begin
+        for _ in lower:upper
+            visits += 1
+        end
+    end
+end
+
+function unit_range_case(::Type{T}=Int; max_iterations=4) where {T}
+    kernel = ReactiveKernels.compile_stateful(unit_range_counter, 0)
+    state = ReactiveKernels.stateful_snapshot(kernel(0))
+    transition = ReactiveKernels.functionalize_stateful(kernel, Val(:step!);
+        max_iterations, argument_types=Tuple{T,T})
+    (; state, transition)
+end
+
 @kernel recursive_array_reader(total, ceiling) = begin
     calls = 0
     descend!(level, data) = begin

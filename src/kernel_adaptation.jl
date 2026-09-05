@@ -3798,6 +3798,79 @@ function (block::_SMControlTraceBlock)(carry)
     result isa _SMControlTraceReturn ? result.value : result
 end
 
+# A structured loop retains one generated body. Its values are runtime loop
+# operands, while this object is immutable compiler metadata.
+struct _SMFunctionalForBody
+    f::Any
+    body::Expr
+    parameters::Tuple
+end
+function _SMFunctionalForBody(f)
+    expression = RuntimeGeneratedFunctions.get_expression(f)
+    _SMFunctionalForBody(f, expression.args[2], Tuple(expression.args[1].args))
+end
+
+function _sm_functional_for_loop(loop, ports, rng_providers, ensures, carry, marker)
+    _sm_native_for_loop(loop.f, ports, rng_providers, ensures, carry)
+end
+
+function _sm_native_for_loop(f::F, ports, rng_providers, ensures, carry) where {F}
+    while carry.live
+        carry = f(ports, rng_providers, ensures, carry)
+    end
+    carry
+end
+
+@inline _sm_loop_isolate(value) = _sm_control_carry_isolate(value)
+@inline _sm_loop_isolate(value::Tuple) = map(_sm_loop_isolate, value)
+@inline _sm_loop_isolate(value::NamedTuple) = map(_sm_loop_isolate, value)
+@inline _sm_loop_backend_seed(value, marker) = value
+@inline _sm_loop_backend_seed(value::Tuple, marker) =
+    map(child -> _sm_loop_backend_seed(child, marker), value)
+@inline _sm_loop_backend_seed(value::NamedTuple, marker) =
+    map(child -> _sm_loop_backend_seed(child, marker), value)
+
+# For an ordered range, modular subtraction interpreted as unsigned is the
+# mathematical distance even when signed subtraction wraps. Compare distance
+# rather than length so the full integer range never needs a wrapping +1.
+@inline _sm_unit_range_within_bound(lower::T, upper::T, bound::Int) where {T<:Integer} =
+    (lower > upper) | (unsigned(upper - lower) < bound)
+@inline _sm_unit_range_within_bound(lower::Integer, upper::Integer, bound::Int) =
+    _sm_unit_range_within_bound(promote(lower, upper)..., bound)
+
+function _sm_void_returns(body)
+    all(body) do statement
+        if statement isa _Return
+            statement.value === nothing ||
+                (statement.value isa _Lit && statement.value.value === nothing)
+        elseif statement isa _If
+            _sm_void_returns(statement.thenb) && _sm_void_returns(statement.elseb)
+        elseif statement isa Union{_For,_While,_Guard}
+            _sm_void_returns(statement.body)
+        else
+            true
+        end
+    end
+end
+
+function _sm_emitted_symbols!(symbols, expression)
+    expression isa Symbol && push!(symbols, expression)
+    expression isa Expr || return symbols
+    expression.head === :quote && return symbols
+    foreach(child -> _sm_emitted_symbols!(symbols, child), expression.args)
+    symbols
+end
+
+function _sm_emitted_definitions!(symbols, expression)
+    expression isa Expr || return symbols
+    expression.head === :quote && return symbols
+    if expression.head === :(=) && expression.args[1] isa Symbol
+        push!(symbols, expression.args[1])
+    end
+    foreach(child -> _sm_emitted_definitions!(symbols, child), expression.args)
+    symbols
+end
+
 # One generated function per CFG block keeps Julia inference bounded and lets
 # backends execute only the selected source block. Addresses are compiler
 # metadata; the selected address and complete carry remain runtime values.
@@ -7294,6 +7367,136 @@ function _functional_state_machine_method(
     end
 
     emit_block! = nothing
+    compact_for! = nothing
+    compact_loops = !recursive && _sm_void_returns(ir.body) &&
+        all(name -> _sm_effect_mode(getfield(ports, name)) !== :source,
+            observation_names)
+    compact_for! = function (statement, alive, lower, upper, loop_zero, loop_one,
+                            local_syms, local_types, local_origins)
+        outer_statements = statements
+        statements = Any[]
+        carry = fresh(:__sfm_loop_carry_)
+        inputs = Any[]
+        outputs = Any[]
+        structured_slots = Bool[]
+        mappings = (base_syms, effect_syms, observation_seen_syms, local_syms)
+        saved = map(copy, mappings)
+        keys_by_map = map(mapping -> collect(keys(mapping)), mappings)
+        slot_port = function (mapping, key)
+            mapping === base_syms && key[1] === :field || return nothing
+            descriptor = get(field_regs, key[2], nothing)
+            descriptor isa _StructuredStatePort || return nothing
+            :(getfield(ports, $(QuoteNode(key[2]))))
+        end
+        # Distinct logical slots may initially share one SSA name. Give each
+        # carried slot its own binding so writes remain associated with the
+        # source field/formal, rather than with an incidental initial value.
+        input! = function (value; structured=false)
+            push!(inputs, value)
+            push!(structured_slots, structured)
+            bind!(:(getfield(getfield($carry, :values), $(length(inputs)))),
+                :__sfm_loop_input_)
+        end
+        for (mapping, key_list) in zip(mappings, keys_by_map), key in key_list
+            port = slot_port(mapping, key)
+            value = port === nothing ? mapping[key] :
+                :(_sm_structured_carry_store($port, $(mapping[key])))
+            symbol = input!(value; structured=port !== nothing)
+            mapping[key] = port === nothing ? symbol : bind!(
+                :(_sm_structured_carry_load($port, $symbol)), :__sfm_loop_logical_)
+        end
+        before_overflow, before_return_seen = control_overflow, return_seen
+        before_return_value = return_value[]
+        control_overflow = input!(before_overflow)
+        return_seen = input!(before_return_seen)
+        return_value[] = input!(before_return_value)
+        loop_active = bind!(:(getfield($carry, :active)), :__sfm_loop_active_)
+        candidate = bind!(:(getfield($carry, :candidate)), :__sfm_loop_candidate_)
+        loop_syms = copy(local_syms)
+        loop_types = copy(local_types)
+        loop_origins = copy(local_origins)
+        name = only(statement.var)
+        loop_syms[name] = candidate
+        loop_types[name] = false
+        pop!(loop_origins, name, nothing)
+        remaining = emit_block!(statement.body, loop_active,
+            loop_syms, loop_types, loop_origins)
+        for (mapping, key_list) in zip(mappings, keys_by_map), key in key_list
+            port = slot_port(mapping, key)
+            push!(outputs, port === nothing ? mapping[key] :
+                :(_sm_structured_carry_store($port, $(mapping[key]))))
+        end
+        append!(outputs, (control_overflow, return_seen, return_value[]))
+        successor = bind!(:($candidate < $upper), :__sfm_loop_successor_)
+        next_live = bind!(:(_sm_predicated_and($remaining, $successor)),
+            :__sfm_loop_live_)
+        increment = bind!(:(_sm_predicated_select(
+            $successor, $loop_one, $loop_zero)), :__sfm_loop_increment_)
+        next_candidate = bind!(:($candidate + $increment), :__sfm_loop_candidate_)
+        # Capture only outer generated values actually referenced by the body.
+        # Ports, providers and repair programs remain static metadata arguments.
+        outer_definitions = _sm_emitted_definitions!(Set{Symbol}(),
+            Expr(:block, outer_statements...))
+        body_symbols = _sm_emitted_symbols!(Set{Symbol}(), Expr(:block, statements...))
+        constants = sort!(collect(intersect(outer_definitions, body_symbols)); by=String)
+        prelude = Any[]
+        for symbol in constants
+            push!(inputs, symbol)
+            push!(outputs, symbol)
+            push!(structured_slots, false)
+            push!(prelude, :(local $symbol = getfield(
+                getfield($carry, :values), $(length(inputs)))))
+        end
+        isolated_outputs = Any[structured ? value : :(_sm_loop_isolate($value))
+            for (value, structured) in zip(outputs, structured_slots)]
+        push!(statements, :(return (values=($(isolated_outputs...),),
+            candidate=_sm_control_carry_isolate($next_candidate),
+            active=_sm_control_carry_isolate($remaining),
+            live=_sm_control_carry_isolate($next_live))))
+        body = compile(:((ports, rng_providers, ensures, $carry) ->
+            $(Expr(:block, prelude..., statements...))))
+        push!(ensures, _SMFunctionalForBody(body))
+        body_index = length(ensures)
+        statements = outer_statements
+        for (mapping, prior) in zip(mappings, saved)
+            empty!(mapping)
+            merge!(mapping, prior)
+        end
+        control_overflow, return_seen = before_overflow, before_return_seen
+        return_value[] = before_return_value
+        isolated_inputs = Any[structured ? value : :(_sm_loop_isolate($value))
+            for (value, structured) in zip(inputs, structured_slots)]
+        initial = bind!(:((values=($(isolated_inputs...),), candidate=$lower + $loop_zero,
+            active=_sm_control_carry_isolate($alive),
+            live=_sm_predicated_and($alive, $lower <= $upper))),
+            :__sfm_loop_initial_)
+        finished = bind!(:(_sm_functional_for_loop(getfield(ensures, $body_index),
+            ports, rng_providers, ensures, $initial, $index_source)),
+            :__sfm_loop_finished_)
+        position = 0
+        for (mapping, key_list) in zip(mappings, keys_by_map), key in key_list
+            position += 1
+            output = :(getfield(getfield($finished, :values), $position))
+            port = slot_port(mapping, key)
+            port === nothing || (output = :(_sm_structured_carry_load($port, $output)))
+            if mapping === local_syms
+                # Outer lexical locals retain their binding after the loop.
+                push!(statements, :($(mapping[key]) = $output))
+            else
+                mapping[key] = bind!(output, :__sfm_loop_output_)
+            end
+        end
+        control_overflow = bind!(:(getfield(getfield($finished, :values),
+            $(position + 1))), :__sfm_loop_overflow_)
+        return_seen = bind!(:(getfield(getfield($finished, :values),
+            $(position + 2))), :__sfm_loop_return_seen_)
+        return_value[] = bind!(:(getfield(getfield($finished, :values),
+            $(position + 3))), :__sfm_loop_return_value_)
+        for name in keys(observation_effect_syms)
+            observation_effect_syms[name] = effect_syms[name]
+        end
+        bind!(:(getfield($finished, :active)), :__sfm_loop_active_)
+    end
     emit_block! = function (body, initial_active, local_syms, local_types,
                             local_origins)
         active = initial_active
@@ -7909,6 +8112,14 @@ function _functional_state_machine_method(
                     :(_sm_predicated_select(
                         $predicate_true, one($lower), one($lower))),
                     :__sfm_loop_one_, name)
+                if compact_loops
+                    within_bound = bind!(:(_sm_unit_range_within_bound(
+                        $lower, $upper, $max_iterations)), :__sfm_loop_bound_, name)
+                    alive = mark_invalid!(active, within_bound)
+                    active = compact_for!(statement, alive, lower, upper,
+                        loop_zero, loop_one, local_syms, local_types, local_origins)
+                    continue
+                end
                 # Establish the finite unroll bound using only ordered,
                 # guarded successor steps.  Computing `upper-lower+1` wraps
                 # for ranges such as typemin(Int):typemax(Int); computing

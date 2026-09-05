@@ -322,6 +322,42 @@ function ReactiveKernels._sm_functional_control_loop(
     carry
 end
 
+function ReactiveKernels._sm_functional_for_loop(
+        loop, ports, rng_providers, ensures, carry, marker::Reactant.TracedRNumber)
+    carry = ReactiveKernels._sm_loop_backend_seed(carry, marker)
+    step = ReactiveKernels._SMControlTraceBlock(
+        loop.body, loop.parameters, ports, rng_providers, ensures)
+    Reactant.@trace track_numbers = false while carry.live
+        carry = step(carry)
+    end
+    carry
+end
+
+@inline ReactiveKernels._sm_loop_backend_seed(
+        value::Reactant.TracedRNumber, marker::Reactant.TracedRNumber) = value
+@inline function ReactiveKernels._sm_loop_backend_seed(
+        value::T, marker::Reactant.TracedRNumber) where {T<:Number}
+    ReactiveKernels._kernel_dom_num_scalar(T) || return value
+    Reactant.promote_to(Reactant.TracedRNumber{T}, value)
+end
+@inline ReactiveKernels._sm_loop_backend_seed(
+        value::Array{T,N}, marker::Reactant.TracedRNumber) where {T,N} =
+    Reactant.promote_to(Reactant.TracedRArray{T,N}, value)
+
+const _RKIntegerValue = Union{Integer,Reactant.TracedRNumber{<:Integer}}
+_rk_integer_type(value::Integer) = typeof(value)
+_rk_integer_type(value::Reactant.TracedRNumber{T}) where {T} = T
+function ReactiveKernels._sm_unit_range_within_bound(
+        lower::_RKIntegerValue, upper::_RKIntegerValue, bound::Int)
+    T = promote_type(_rk_integer_type(lower), _rk_integer_type(upper))
+    U = unsigned(T)
+    left = Reactant.promote_to(Reactant.TracedRNumber{T}, lower)
+    right = Reactant.promote_to(Reactant.TracedRNumber{T}, upper)
+    bound > typemax(U) && return left == left
+    distance = Reactant.promote_to(Reactant.TracedRNumber{U}, right - left)
+    (left > right) | (distance < U(bound))
+end
+
 function ReactiveKernels._sm_control_dispatch(
         dispatch::ReactiveKernels._SMControlBlockDispatch, ports,
         rng_providers, ensures, carry, index::Reactant.TracedRNumber)
@@ -431,6 +467,18 @@ end
 # Functional stateful transitions are immutable compiled programs. Their
 # PreparedKernel ensure tuple and RGF body are static metadata; only the
 # materialized state snapshot and method argument are traced.
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels._SMFunctionalForBody,
+        path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where {T<:ReactiveKernels._SMFunctionalForBody}
+    T
+end
+
 function Reactant.make_tracer(
         seen, previous::ReactiveKernels._FunctionalStatefulTransition,
         path, mode; kwargs...)

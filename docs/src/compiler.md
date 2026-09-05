@@ -672,10 +672,19 @@ flattened buffer ABI cannot represent Julia object identity. Straight-line and
 state-machine gates both prove valid repeated execution, identity-preserving
 outputs, and rejection of an independently converted counterfeit alias.
 
-Dynamic unit ranges are bounded with guarded successor steps in the authored
-integer type. The compiler neither subtracts extreme bounds nor adds host-Int
-offsets, avoiding wraparound and small-integer promotion while preserving an
-explicit overflow/rollback result.
+Nonrecursive unit-range loops in methods with void returns retain one generated
+body when their observational effects have functional lowerings. Native execution
+uses an ordinary loop; Reactant receives a traced while-region. Compilation does
+not duplicate that body for each permitted iteration. Lexical locals, early
+returns, structured aliases, and effect state travel through the generated loop
+operands. Methods with value returns or host-drained observational records retain
+the existing bounded unrolling path.
+
+The retained loop checks its finite allowance with an unsigned distance, which
+represents the mathematical distance even when signed subtraction wraps. Its
+successor step stays in the authored integer type and runs only below the upper
+bound. The unrolled path uses guarded successor probes. Both preserve the
+explicit overflow/rollback result at extreme bounds and with small integers.
 
 Ordered RNG is one typed internal effect authority. Authored kernels keep the
 ordinary Julia expressions `Random.randn!(rng, destination)`,
