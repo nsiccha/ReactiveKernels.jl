@@ -1681,7 +1681,7 @@ end
 # ZERO bound POSITIONAL actuals (a subject callable binds only keywords — poc would silently drop
 # positionals), every REQUIRED keyword bound, and NO extra keyword the signature does not accept (unless it
 # declares `; kwargs...`). A `partial(...)` wrapper can therefore never silently reduce to target semantics.
-function _validate_binder!(name::Symbol, v, source)
+function _validate_binder!(name::Symbol, v, source; runtime_keywords=())
     # REJECT a NESTED binder (RK 09:38): the binder's IMMEDIATE target must be the registered kernel, not
     # another binder — registration resolution recurses through the target, so an inner binder's bound
     # actuals (kwargs/positionals) would be silently dropped from the prepared record.
@@ -1696,6 +1696,7 @@ function _validate_binder!(name::Symbol, v, source)
     req, allkw, kwsplat = _kernel_signature_kwargs(source)
     kw = _kernel_binder_kwargs(v)
     bound = kw === nothing ? Symbol[] : collect(keys(kw))
+    append!(bound, runtime_keywords)
     for r in req
         r in bound || throw(_KernelFactoryReject(
             "callable `$name` is missing the REQUIRED keyword `$r` — bind it with `partial(...; $r = …)`; " *

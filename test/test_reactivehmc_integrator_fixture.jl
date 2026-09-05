@@ -68,6 +68,33 @@ end
         @test mom == [0.4, 0.1]
     end
 
+    runtime = compile_state_transition(
+        _IntegratorCompilerEndpoint.endpoint,
+        partial(RHMC_INTEGRATORS.generalized_leapfrog!; n_fi_steps),
+        (pos, mom); runtime_controls=(; stepsize))
+    runtime_state = initial_transition_state(runtime)
+    for h in (0.0, stepsize, -stepsize, stepsize / 2)
+        actual = runtime(runtime_state, (stepsize=h,))
+        expected = ReactiveHMCExamples.generalized_leapfrog!(
+            copy(pos), copy(mom), kernels; stepsize=h, n_fi_steps)
+        @test actual.pos ≈ expected.pos atol=2e-15 rtol=2e-13
+        @test actual.mom ≈ expected.mom atol=2e-15 rtol=2e-13
+        @test actual.ham ≈ expected.ham atol=2e-15 rtol=2e-13
+    end
+    @test runtime_state.pos == pos
+    @test runtime_state.mom == mom
+    @test_throws ArgumentError runtime(runtime_state)
+    @test_throws ArgumentError runtime(runtime_state, (stepsize=Float32(stepsize),))
+    @test_throws ArgumentError runtime(runtime_state, (wrong=stepsize,))
+    @test_throws ReactiveKernels._LLowerReject compile_state_transition(
+        _IntegratorCompilerEndpoint.endpoint,
+        partial(RHMC_INTEGRATORS.generalized_leapfrog!; stepsize, n_fi_steps),
+        (pos, mom); runtime_controls=(; stepsize))
+    @test_throws ReactiveKernels._LLowerReject compile_state_transition(
+        _IntegratorCompilerEndpoint.endpoint,
+        partial(RHMC_INTEGRATORS.generalized_leapfrog!; stepsize),
+        (pos, mom); runtime_controls=(; n_fi_steps))
+
     @test_throws ReactiveKernels._KernelFactoryReject compile_state_transition(
         _IntegratorCompilerEndpoint.endpoint,
         RHMC_INTEGRATORS.generalized_leapfrog!,

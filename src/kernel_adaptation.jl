@@ -9295,6 +9295,29 @@ stateful_snapshot(state::_StatefulState) = _stateful_snapshot(state)
 # lowering so currentness is propagated separately through every authored iteration.
 # ============================================================================================
 
+# Optional numeric controls remain explicit runtime operands of the generated
+# endpoint program. Their prototype supplies types, never an unrolling value.
+struct _RuntimeStateTransitionBody{Controls,F}
+    f::F
+end
+
+function _sm_transition_controls(f, controls::NamedTuple)
+    isempty(controls) || throw(ArgumentError(
+        "this compiled state transition has no runtime controls"))
+    controls
+end
+function _sm_transition_controls(
+        ::_RuntimeStateTransitionBody{Controls}, controls::NamedTuple) where {Controls}
+    _sm_functional_argument_type_ok(typeof(controls), Controls) ||
+        throw(ArgumentError("compiled state transition runtime controls " *
+                            "do not match their named scalar types"))
+    controls
+end
+_sm_transition_body_call(f, ensures, state, controls) =
+    RuntimeGeneratedFunctions.generated_callfunc(f, ensures, state)
+_sm_transition_body_call(f::_RuntimeStateTransitionBody, ensures, state, controls) =
+    RuntimeGeneratedFunctions.generated_callfunc(f.f, ensures, state, controls)
+
 """
     CompiledStateTransition
 
@@ -9311,6 +9334,9 @@ struct CompiledStateTransition{
     structured_repairs::R
     topology_contract::T
 end
+
+Base.show(io::IO, ::CompiledStateTransition{Names}) where {Names} =
+    print(io, "ReactiveKernels.CompiledStateTransition(", length(Names), " fields)")
 
 validated_compiled_transition(compiled,
         transition::CompiledStateTransition) =
@@ -9401,7 +9427,10 @@ end
 
 function _sm_validate_compiled_arguments_input(
         transition::CompiledStateTransition, arguments::Tuple)
-    isempty(arguments) || throw(MethodError(transition, arguments))
+    controls = isempty(arguments) ? NamedTuple() :
+        length(arguments) == 1 && only(arguments) isa NamedTuple ?
+            only(arguments) : throw(MethodError(transition, arguments))
+    _sm_transition_controls(getfield(transition, :f), controls)
     arguments
 end
 
@@ -9428,7 +9457,8 @@ function _sm_compiler_static_snapshot(
 end
 
 function (transition::CompiledStateTransition{Names,Groups,ExternalGroups})(
-        state) where {Names,Groups,ExternalGroups}
+        state, controls::NamedTuple=NamedTuple()) where {Names,Groups,ExternalGroups}
+    _sm_transition_controls(getfield(transition, :f), controls)
     initial = getfield(transition, :initial)
     propertynames(state) == Names &&
         _sm_functional_argument_type_ok(typeof(state), typeof(initial)) ||
@@ -9447,8 +9477,8 @@ function (transition::CompiledStateTransition{Names,Groups,ExternalGroups})(
                     "`$(first(group))` was replaced"))
         end
     end
-    result = RuntimeGeneratedFunctions.generated_callfunc(
-        getfield(transition, :f), getfield(transition, :ensures), state)
+    result = _sm_transition_body_call(
+        getfield(transition, :f), getfield(transition, :ensures), state, controls)
     result = _sm_restore_reusable_compiled_output(transition, result)
     _sm_validate_topology_contract(
         result, getfield(transition, :topology_contract))
@@ -9730,9 +9760,14 @@ function _transition_sources(spec::KernelSpec, pf, args::Tuple,
     plan = kernel_prepared_plan(pf)
     canon_name = Dict{Int,Symbol}(
         slot.canon => slot.path[end] for slot in kernel_plan_slots(plan))
-    have_names = Tuple(canon_name[canon]
-        for canon in _plan_have_from_key(kernel_plan_key(plan)))
-    names === have_names || throw(_KernelFactoryReject(
+    have_canons = _plan_have_from_key(kernel_plan_key(plan))
+    have_names = Tuple(canon_name[canon] for canon in have_canons)
+    name_canon = Dict(slot.path[end] => slot.canon for slot in kernel_plan_slots(plan))
+    # An input may acquire additional logical alias names in the endpoint.
+    # Compare canonical identities in order, rather than whichever alias name
+    # happened to be visited last while constructing the plan.
+    Tuple(get(name_canon, name, 0) for name in names) == Tuple(have_canons) ||
+        throw(_KernelFactoryReject(
         "transition endpoint signature order $names ≠ plan HAVE-canon order " *
         "$have_names — reorder unsupported"))
     resolved
@@ -9754,7 +9789,8 @@ end
     :(NamedTuple{$names_tuple}(($(reads...),)))
 end
 
-function _transition_bound_formals(callable::_PreparedCallable, ir::MethodIR)
+function _transition_bound_formals(callable::_PreparedCallable, ir::MethodIR,
+                                   runtime_controls::NamedTuple=NamedTuple())
     source = prepared_callable_source(callable)
     source isa _Mode2KernelSkeleton || _sm_reject(
         "state transition must be a free mutating @kernel")
@@ -9766,6 +9802,9 @@ function _transition_bound_formals(callable::_PreparedCallable, ir::MethodIR)
         _sm_reject("state transition must have only its subject positional formal")
     kwargs = prepared_callable_kwargs(callable)
     kwargs === nothing && (kwargs = NamedTuple())
+    isempty(intersect(propertynames(kwargs), propertynames(runtime_controls))) ||
+        _sm_reject("a transition control cannot be both bound and runtime")
+    kwargs = merge(kwargs, runtime_controls)
     resolved = _kernel_signature_invoke(
         _KernelSignatureCallable(tuple, sig), (nothing,), kwargs)
     expected = Tuple(formal.name for formal in ir.formals)
@@ -9799,13 +9838,14 @@ end
 
 function _compile_state_transition(spec::KernelSpec, pf::_PreparedFactory,
         callable::_PreparedCallable, ir::MethodIR, ::Type{OW},
-        ::Type{SH}, initial) where {OW,SH}
+        ::Type{SH}, initial, runtime_controls::NamedTuple=NamedTuple()) where {OW,SH}
     ir.control in (:straight, :loop) || _sm_reject(
         "functional state transition admits straight-line and static-loop control, " *
         "got `$(ir.control)`")
     ir.ok || _sm_reject("functional state transition MethodIR is invalid: $(ir.reason)")
 
-    bound = _transition_bound_formals(callable, ir)
+    bound = _transition_bound_formals(callable, ir, runtime_controls)
+    static_bound = Base.structdiff(bound, runtime_controls)
     plan = kernel_prepared_plan(pf)
     fields = _exec_canon_map(plan)
     names = propertynames(initial)
@@ -9857,7 +9897,8 @@ function _compile_state_transition(spec::KernelSpec, pf::_PreparedFactory,
                 "bound transition control `$(formal.name)` has type " *
                 "`$(typeof(value))`, expected `$annotation`")
         end
-        syms[(:formal, formal.name)] = value
+        syms[(:formal, formal.name)] = hasproperty(runtime_controls, formal.name) ?
+            :(getfield(controls, $(QuoteNode(formal.name)))) : value
         formals[formal.name] = false
         finfo[formal.name] = _DLit{typeof(value)}
     end
@@ -10000,7 +10041,7 @@ function _compile_state_transition(spec::KernelSpec, pf::_PreparedFactory,
             elseif statement isa _For
                 length(statement.var) == 1 || _sm_reject(
                     "static transition loop must bind one local")
-                values = _transition_static_value(statement.iter, bound)
+                values = _transition_static_value(statement.iter, static_bound)
                 values isa AbstractUnitRange || _sm_reject(
                     "static transition loop iterator must be an integer unit range")
                 length(values) <= 1024 || _sm_reject(
@@ -10048,7 +10089,13 @@ function _compile_state_transition(spec::KernelSpec, pf::_PreparedFactory,
     end
     outputs = Any[isolated[name] for name in names]
     push!(statements, :(return NamedTuple{$names}(($(outputs...),))))
-    fn = compile(:((ensures, state) -> $(Expr(:block, statements...))))
+    fn = if isempty(runtime_controls)
+        compile(:((ensures, state) -> $(Expr(:block, statements...))))
+    else
+        body = compile(:((ensures, state, controls) ->
+            $(Expr(:block, statements...))))
+        _RuntimeStateTransitionBody{typeof(runtime_controls),typeof(body)}(body)
+    end
     writable_names = Tuple(sort!(collect(
         prepared_callable_write_roots(callable))))
     structured_repairs = NamedTuple{writable_names}(Tuple(
@@ -10066,18 +10113,31 @@ function _compile_state_transition(spec::KernelSpec, pf::_PreparedFactory,
 end
 
 """
-    compile_state_transition(spec, transition, endpoint_args=(); endpoint_kwargs=(;))
+    compile_state_transition(spec, transition, endpoint_args=();
+                             endpoint_kwargs=(;), runtime_controls=(;))
 
-Compile a bound free mutating `@kernel` into a functional state transition over
-the endpoint described by `spec`. `transition` must be the registered kernel or
-a `partial` that binds every required transition keyword. Endpoint constructor
-arguments are resolved with the original `@kernel` signature. Data-dependent
-control is rejected; captured integer `Base.Colon` loops are statically
-unrolled with derived-field currentness propagated through every iteration.
+Compile a free mutating `@kernel` into a functional state transition over the
+endpoint described by `spec`. `transition` is the registered kernel or a
+`partial`. Bind required keywords in the partial, or supply numeric prototypes
+with `runtime_controls=(stepsize=0.1,)` and call the result as
+`compiled(state, (stepsize=runtime_value,))`. Runtime controls retain their exact
+named scalar types and cannot also be bound or determine an unrolled loop.
+Endpoint constructor arguments use the original `@kernel` signature.
+Data-dependent control is rejected; captured integer `Base.Colon` loops are
+statically unrolled with derived-field currentness propagated through every
+iteration.
 """
 function compile_state_transition(spec::KernelSpec, transition,
-        endpoint_args::Tuple=(); endpoint_kwargs::NamedTuple=NamedTuple())
-    callable = _prepare_callable(:transition, transition)
+        endpoint_args::Tuple=(); endpoint_kwargs::NamedTuple=NamedTuple(),
+        runtime_controls::NamedTuple=NamedTuple())
+    callable = if isempty(runtime_controls)
+        _prepare_callable(:transition, transition)
+    else
+        registration = _kernel_resolve_callable_or_reject(:transition, transition)
+        _validate_binder!(:transition, transition, registration.source;
+                          runtime_keywords=propertynames(runtime_controls))
+        _PreparedCallable(registration, _kernel_binder_kwargs(transition))
+    end
     registration = prepared_callable_registration(callable)
     registration.kind === :free_method || throw(ArgumentError(
         "state transition must resolve to a free mutating @kernel"))
@@ -10090,7 +10150,7 @@ function compile_state_transition(spec::KernelSpec, transition,
     owned, shared = _construct_endpoint_from_values(plan, handles, values)
     initial = _transition_snapshot(plan, owned, shared)
     _compile_state_transition(spec, pf, callable, ir,
-        typeof(owned), typeof(shared), initial)
+        typeof(owned), typeof(shared), initial, runtime_controls)
 end
 
 _stateful_field_regs(bindings::_StatefulCompilerBindings) =
