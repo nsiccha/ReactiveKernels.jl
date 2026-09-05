@@ -3800,8 +3800,8 @@ end
 
 # A structured loop retains one generated body. Its values are runtime loop
 # operands, while this object is immutable compiler metadata.
-struct _SMFunctionalForBody
-    f::Any
+struct _SMFunctionalForBody{F}
+    f::F
     body::Expr
     parameters::Tuple
 end
