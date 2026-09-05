@@ -63,6 +63,11 @@ kept explicitly distinct, as on the MNIST pages.
 Main.ReactiveKernelsDocs.render_probprog_mcmc_benchmark()
 ```
 
+The separately resolved [PracticalBayes external comparator](practicalbayes.md)
+adds a fourth public NUTS harness on both model workloads with the same target
+acceptance, metric, depth, energy-error threshold, seed, warmup, and retained
+draw counts.
+
 The MNIST × ProbProg cell is a **recorded compiler rejection at this pin**,
 not an omission: `optimize = :probprog` tracing of the 369-dimensional packed
 joint fails in the Enzyme-interpreter inference pass — a stack overflow, or an

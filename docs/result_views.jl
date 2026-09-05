@@ -53,6 +53,10 @@ const _EIGHT_SCHOOLS_REACTANT_AD_RECEIPT_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts",
     "eight-schools-reactant-ad-v2.toml",
 )
+const _PRACTICALBAYES_RECEIPT_PATH = joinpath(
+    dirname(@__DIR__), "benchmark", "receipts",
+    "practicalbayes-comparison-v1.toml",
+)
 
 _node_html(node) = sprint(show, MIME"text/html"(), node; context = :limit => false)
 
@@ -3357,3 +3361,206 @@ render_probprog_mcmc_baselines() = _render_benchmark_baselines(
      ("Turing NUTS harness", "turing-sampling"),
      ("Turing Eight Schools twin", "turing-eight-schools"),
      ("Turing MNIST twin", "turing-mnist")))
+
+# --- PracticalBayes external comparator ---------------------------------------
+
+function _practicalbayes_receipt()
+    receipt = TOML.parsefile(_PRACTICALBAYES_RECEIPT_PATH)
+    get(receipt, "schema", "") == "practicalbayes-comparison-v1" ||
+        error("unexpected PracticalBayes receipt schema")
+    pins = receipt["pins"]
+    get(pins, "reactivekernels_dirty", true) == false ||
+        error("PracticalBayes receipt was produced from a dirty checkout")
+    occursin(r"^[0-9a-f]{40}$", get(pins, "reactivekernels_sha", "")) ||
+        error("PracticalBayes receipt lacks an exact ReactiveKernels SHA")
+    get(pins, "practicalbayes_revision", "") ==
+        "c6b340baef4f4a9e3d26cd0ea5082a2baf26dcf9" ||
+        error("PracticalBayes receipt uses an unexpected upstream revision")
+    get(receipt["compatibility"], "separate_environment", false) == true ||
+        error("PracticalBayes receipt must retain its separate environment")
+    receipt
+end
+
+function _practicalbayes_state(row)
+    get(row, "state", "unsupported") == "supported" && return "measured"
+    "unsupported: " * String(get(row, "reason", "no public cell"))
+end
+
+function _practicalbayes_result_metric(row, key, conversion)
+    get(row, "state", "") == "supported" || return missing
+    result = row["result"]
+    conversion(result[key])
+end
+
+function _render_practicalbayes_model_benchmark(workload::AbstractString;
+                                                id::AbstractString,
+                                                title::AbstractString)
+    receipt = _practicalbayes_receipt()
+    selected = filter(
+        row -> row["workload"] == workload,
+        receipt["model_measurements"])
+    rows = map(selected) do row
+        (;
+            model = String(row["model"]),
+            differentiation = String(row["differentiation"]),
+            boundary = String(row["boundary"]),
+            outcome = String(row["outcome"]),
+            runtime = _practicalbayes_result_metric(row, "min_ns", Float64),
+            bytes = _practicalbayes_result_metric(row, "median_bytes", Int),
+            allocations = _practicalbayes_result_metric(
+                row, "median_allocs", Int),
+            status = _practicalbayes_state(row),
+        )
+    end
+    measured = count(row -> row.runtime !== missing, rows)
+    columns = (
+        _column(:model, "Model"),
+        _column(:differentiation, "Mode"),
+        _column(:boundary, "Input boundary"),
+        _column(:outcome, "Requested output"),
+        _column(:runtime, "Steady-state runtime";
+            format = (value, row) -> _longform_metric(value, row, _fmt_ns)),
+        _column(:bytes, "Allocated bytes";
+            format = (value, row) -> _longform_metric(
+                value, row, bytes -> string(bytes, " B"))),
+        _column(:allocations, "Allocations";
+            format = (value, row) -> _longform_metric(value, row, string)),
+        _column(:status, "State";
+            format = (value, _) -> value == "measured" ? value :
+                h.span(value; class = "rk-result-unsupported")),
+    )
+    pins = receipt["pins"]
+    provenance = "PracticalBayes `$(pins["practicalbayes_revision"])`; " *
+        "RK benchmark source `$(pins["reactivekernels_sha"])`; Julia " *
+        "$(pins["julia_version"]); $(receipt["environment"]["cpu"])."
+    Markdown.MD(Any[
+        Markdown.Paragraph(Any[
+            "The external comparator accounts for $(length(rows)) cells; " *
+            "$measured are measured and $(length(rows) - measured) retain " *
+            "an explicit public-API limitation.",
+        ]),
+        _result_table(rows, columns; id, title,
+            note = "Setup, layout construction, AD preparation, and first " *
+                "execution are outside these timings and retained separately " *
+                "in the receipt."),
+        Markdown.Paragraph(Any[Markdown.Italic(Any[provenance])]),
+    ])
+end
+
+render_practicalbayes_eight_schools_benchmark() =
+    _render_practicalbayes_model_benchmark(
+        "eight_schools";
+        id = "practicalbayes-eight-schools-matrix",
+        title = "PracticalBayes Eight Schools capability matrix")
+
+render_practicalbayes_mnist_benchmark() =
+    _render_practicalbayes_model_benchmark(
+        "mnist_logistic";
+        id = "practicalbayes-mnist-matrix",
+        title = "PracticalBayes MNIST capability matrix")
+
+function render_practicalbayes_eval_benchmark()
+    receipt = _practicalbayes_receipt()
+    rows = map(receipt["eval_measurements"]) do row
+        (;
+            size = Int(row["size"]),
+            mode = String(row["mode"]),
+            variant = String(row["variant"]),
+            runtime = _practicalbayes_result_metric(row, "min_ns", Float64),
+            bytes = _practicalbayes_result_metric(row, "median_bytes", Int),
+            allocations = _practicalbayes_result_metric(
+                row, "median_allocs", Int),
+            status = _practicalbayes_state(row),
+        )
+    end
+    columns = (
+        _column(:size, "Position length"),
+        _column(:mode, "Operation"),
+        _column(:variant, "Execution"),
+        _column(:runtime, "Steady-state runtime";
+            format = (value, row) -> _longform_metric(value, row, _fmt_ns)),
+        _column(:bytes, "Allocated bytes";
+            format = (value, row) -> _longform_metric(
+                value, row, bytes -> string(bytes, " B"))),
+        _column(:allocations, "Allocations";
+            format = (value, row) -> _longform_metric(value, row, string)),
+        _column(:status, "State";
+            format = (value, _) -> value == "measured" ? value :
+                h.span(value; class = "rk-result-unsupported")),
+    )
+    Markdown.MD(Any[
+        Markdown.Paragraph(Any[
+            "All nine native PracticalBayes cells pass value/analytic-gradient " *
+            "parity. The nine Reactant cells remain explicit unsupported rows " *
+            "because the pinned public API exposes no compiler boundary.",
+        ]),
+        _result_table(rows, columns;
+            id = "practicalbayes-eval-throughput",
+            title = "PracticalBayes native evaluation and compiler support",
+            note = "The model, sizes, Float64 precision, and requested outputs " *
+                "match the evaluation-throughput receipt above."),
+    ])
+end
+
+function render_practicalbayes_mcmc_benchmark()
+    receipt = _practicalbayes_receipt()
+    rows = map(receipt["sampling_measurements"]) do row
+        (;
+            model = String(row["model"]),
+            warm_start_seconds = Float64(row["compile_or_warm_start_seconds"]),
+            sampling_seconds = Float64(row["sampling_seconds"]),
+            min_ess = Float64(row["min_ess"]),
+            min_ess_rate = Float64(row["min_ess"]) /
+                Float64(row["sampling_seconds"]),
+            divergences = Int(row["divergences"]),
+            density_gap = Float64(row["density_parity_max_abs"]),
+        )
+    end
+    seconds(value) = string(round(value; sigdigits = 3), " s")
+    columns = (
+        _column(:model, "Model"),
+        _column(:warm_start_seconds, "JIT warm start";
+            format = (value, _) -> seconds(value)),
+        _column(:sampling_seconds, "Warmup + 1,000 draws";
+            format = (value, _) -> seconds(value)),
+        _column(:min_ess, "Minimum ESS";
+            format = (value, _) -> string(round(value; sigdigits = 3))),
+        _column(:min_ess_rate, "Minimum ESS / s";
+            format = (value, _) -> string(round(value; sigdigits = 3))),
+        _column(:divergences, "Divergences"),
+        _column(:density_gap, "Max density gap";
+            format = (value, _) -> string(round(value; sigdigits = 3))),
+    )
+    Markdown.MD(Any[
+        Markdown.Paragraph(Any[
+            "Both PracticalBayes public NUTS cells completed with the matched " *
+            "diagonal metric, target acceptance 0.8, depth 10, energy-error " *
+            "threshold 1000, seed, warmup, and retained-draw counts.",
+        ]),
+        _result_table(rows, columns;
+            id = "practicalbayes-mcmc-performance",
+            title = "PracticalBayes NUTS performance and diagnostics",
+            note = "Sampling time is the public sample call: internal layout/AD " *
+                "preparation, adaptation, and retained draws. A separate short " *
+                "JIT warm-start is reported in the first column."),
+    ])
+end
+
+render_practicalbayes_eight_schools_baseline() = _render_benchmark_baselines(
+    "This is the exact public PracticalBayes model executed by the external " *
+    "comparator, read verbatim from its benchmark body.",
+    "practicalbayes_comparison_body.jl",
+    (("PracticalBayes Eight Schools model", "practicalbayes-eight-schools"),))
+
+render_practicalbayes_mnist_baselines() = _render_benchmark_baselines(
+    "These are the exact public PracticalBayes MNIST models executed by the " *
+    "external comparator, read verbatim from its benchmark body.",
+    "practicalbayes_comparison_body.jl",
+    (("PracticalBayes idiomatic MNIST model", "practicalbayes-mnist-idiomatic"),
+     ("PracticalBayes vcat-free MNIST model", "practicalbayes-mnist-optimized")))
+
+render_practicalbayes_eval_baseline() = _render_benchmark_baselines(
+    "This is the exact public PracticalBayes model executed by the external " *
+    "evaluation-throughput comparator, read verbatim from its benchmark body.",
+    "practicalbayes_comparison_body.jl",
+    (("PracticalBayes iid-Normal model", "practicalbayes-eval-throughput"),))
