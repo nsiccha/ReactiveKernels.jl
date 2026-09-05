@@ -4084,6 +4084,57 @@ function _sm_restore_reusable_finite_port(
     _sm_finite_restore_logical_elements(port, values)
 end
 
+function _sm_restore_state_ports_expr(::Type{P}, names, groups, wrappers_only) where {P}
+    statements = Any[]
+    aliases = Dict{Symbol,Symbol}()
+    for (index, group) in enumerate(groups)
+        descriptor = findfirst(name -> name in fieldnames(P), group)
+        selected = Symbol(:__restored_group_, index)
+        fallback = :(getfield(state, $(QuoteNode(first(group)))))
+        if descriptor === nothing
+            push!(statements, :(local $selected = $fallback))
+        else
+            name = group[descriptor]
+            port = Symbol(:__restore_port_, index)
+            value = Symbol(:__restore_value_, index)
+            push!(statements, :(local $port = getfield(ports, $(QuoteNode(name)))))
+            push!(statements, :(local $value = getfield(state, $(QuoteNode(name)))))
+            restored = wrappers_only ? quote
+                $port isa _StructuredStatePort ?
+                    _sm_restore_reusable_structured_state_port($port, $value) : $fallback
+            end : quote
+                if $port isa _StructuredStatePort
+                    _sm_restore_reusable_structured_state_port($port, $value)
+                elseif $port isa _SMFixedStructuralTuplePort
+                    _sm_restore_reusable_fixed_tuple_port($port, $value)
+                elseif $port isa _SMFiniteStructuralPort
+                    _sm_restore_reusable_finite_port($port, $value)
+                elseif $port isa Union{_PureCallablePort,_EffectCallablePort}
+                    getfield($port, :source)
+                else
+                    $value
+                end
+            end
+            push!(statements, :(local $selected = $restored))
+        end
+        for name in group
+            aliases[name] = selected
+        end
+    end
+    values = Any[aliases[name] for name in names]
+    push!(statements, :(NamedTuple{$names}(($(values...),))))
+    Expr(:block, statements...)
+end
+
+@generated function _sm_restore_reusable_state_ports(
+        ports::P, state::NamedTuple{Names}, ::Val{Groups}) where {P<:NamedTuple,Names,Groups}
+    _sm_restore_state_ports_expr(P, Names, Groups, false)
+end
+@generated function _sm_restore_reusable_structured_wrappers(
+        ports::P, state::NamedTuple{Names}, ::Val{Groups}) where {P<:NamedTuple,Names,Groups}
+    _sm_restore_state_ports_expr(P, Names, Groups, true)
+end
+
 function _sm_restore_reusable_state_ports(
         ports::NamedTuple, state, groups::Tuple)
     names = propertynames(state)
@@ -4217,7 +4268,7 @@ end
 function _sm_validate_functional_effect_candidate(
         port::_EffectCallablePort{ArgTypes,Result,Written,EffectState}, candidate,
         ::Type{ExpectedArguments}, live_arguments::Tuple,
-        argument_topology::Tuple) where
+        argument_topology::Union{Tuple,Val}) where
         {ArgTypes,Result,Written,EffectState,ExpectedArguments<:Tuple}
     candidate isa NamedTuple &&
         propertynames(candidate) == (:arguments, :result, :effect_state) ||
@@ -4534,10 +4585,13 @@ end
 _sm_shape_contract_ok(value, ::Nothing) = true
 _sm_shape_contract_ok(value::AbstractArray, expected::Tuple) =
     size(value) == expected
-_sm_shape_contract_ok(value::NamedTuple, expected::NamedTuple) =
-    propertynames(value) == propertynames(expected) &&
-    all(_sm_shape_contract_ok(getfield(value, name), getfield(expected, name))
-        for name in propertynames(expected))
+@generated function _sm_shape_contract_ok(
+        value::NamedTuple{Names}, expected::NamedTuple{Expected}) where {Names,Expected}
+    Names == Expected || return false
+    checks = Any[:(_sm_shape_contract_ok(getfield(value, $(QuoteNode(name))),
+        getfield(expected, $(QuoteNode(name))))) for name in Names]
+    foldr((check, rest) -> Expr(:&&, check, rest), checks; init=true)
+end
 _sm_shape_contract_ok(value::Tuple, expected::Tuple) =
     length(value) == length(expected) &&
     all(_sm_shape_contract_ok(actual, contract)
@@ -4699,26 +4753,30 @@ function _sm_validate_functional_structured_candidate(
         Val(groups), Val(external_groups), "functional structured replacement")
 end
 
-function _sm_validate_functional_state_ports(ports::NamedTuple, state)
-    for name in propertynames(ports)
-        port = getfield(ports, name)
-        hasproperty(state, name) || throw(ArgumentError(
-            "functional state is missing compiler-bound field `$name`"))
-        value = getfield(state, name)
-        if port isa _StructuredStatePort
-            _sm_validate_functional_structured_state_port(port, value)
-        elseif port isa _SMFixedStructuralTuplePort
-            _sm_fixed_tuple_validate(port, value)
-        elseif port isa _SMFiniteStructuralPort
-            value isa Vector ?
-                _sm_finite_validate_elements(port, value) :
-                _sm_finite_validate_raw(port, value)
-        elseif port isa Union{_PureCallablePort,_EffectCallablePort}
-            value === getfield(port, :source) || throw(ArgumentError(
-                "functional state callable authority `$name` was replaced"))
-        end
+@generated function _sm_validate_functional_state_ports(ports::P, state) where
+        {P<:NamedTuple}
+    checks = Any[]
+    for name in fieldnames(P)
+        field = QuoteNode(name)
+        missing = "functional state is missing compiler-bound field `$name`"
+        replaced = "functional state callable authority `$name` was replaced"
+        push!(checks, quote
+            hasproperty(state, $field) || throw(ArgumentError($missing))
+            port = getfield(ports, $field)
+            value = getfield(state, $field)
+            if port isa _StructuredStatePort
+                _sm_validate_functional_structured_state_port(port, value)
+            elseif port isa _SMFixedStructuralTuplePort
+                _sm_fixed_tuple_validate(port, value)
+            elseif port isa _SMFiniteStructuralPort
+                value isa Vector ? _sm_finite_validate_elements(port, value) :
+                    _sm_finite_validate_raw(port, value)
+            elseif port isa Union{_PureCallablePort,_EffectCallablePort}
+                value === getfield(port, :source) || throw(ArgumentError($replaced))
+            end
+        end)
     end
-    state
+    Expr(:block, checks..., :state)
 end
 
 function _sm_validate_reusable_structured_state_port(
@@ -4816,31 +4874,35 @@ Source-backed observational ports live only in `result.outbox`; compiler-only
 observational summaries may be mirrored here for fixed-shape compatibility but
 are reset to their declared initial value on every invocation.
 """
-function initial_transition_effects(
-        transition::_FunctionalStateMachineTransition)
-    pairs = Pair{Symbol,Any}[]
-    for name in propertynames(getfield(transition, :ports))
-        port = getfield(getfield(transition, :ports), name)
-        port isa _EffectCallablePort &&
-            _sm_effect_has_compiled_carrier(port) || continue
-        copied = _sm_structural_copy(getfield(port, :initial_effect_state))
-        push!(pairs, name => _sm_canonicalize_topology(
-            copied, getfield(port, :topology_contract)))
+@generated function initial_transition_effects(transition::T) where
+        {T<:_FunctionalStateMachineTransition}
+    names = fieldnames(T.parameters[5])
+    values = Any[]
+    for name in names
+        port = :(getfield(getfield(transition, :ports), $(QuoteNode(name))))
+        push!(values, :(_sm_canonicalize_topology(
+            _sm_structural_copy(getfield($port, :initial_effect_state)),
+            getfield($port, :topology_contract))))
     end
-    NamedTuple(sort!(pairs; by=first))
+    :(NamedTuple{$names}(($(values...),)))
 end
 
-function _sm_validate_effect_topologies(ports::NamedTuple, effects)
-    for name in propertynames(ports)
-        port = getfield(ports, name)
-        port isa _EffectCallablePort &&
-            _sm_effect_has_compiled_carrier(port) || continue
-        hasproperty(effects, name) || throw(ArgumentError(
-            "functional effects are missing port `$name`"))
-        _sm_validate_topology_contract(
-            getfield(effects, name), getfield(port, :topology_contract))
+@generated function _sm_validate_effect_topologies(ports::P, effects) where
+        {P<:NamedTuple}
+    checks = Any[]
+    for name in fieldnames(P)
+        field = QuoteNode(name)
+        message = "functional effects are missing port `$name`"
+        push!(checks, quote
+            port = getfield(ports, $field)
+            if port isa _EffectCallablePort && _sm_effect_has_compiled_carrier(port)
+                hasproperty(effects, $field) || throw(ArgumentError($message))
+                _sm_validate_topology_contract(
+                    getfield(effects, $field), getfield(port, :topology_contract))
+            end
+        end)
     end
-    effects
+    Expr(:block, checks..., :effects)
 end
 
 function _sm_canonicalize_effect_topologies(ports::NamedTuple, effects)
@@ -4970,7 +5032,7 @@ function _sm_restore_observation_state(
     canonical = _sm_canonicalize_topology(
         materialized, _sm_compiled_topology(transition))
     _sm_restore_reusable_state_ports(
-        getfield(transition, :ports), canonical, Groups)
+        getfield(transition, :ports), canonical, Val(Groups))
 end
 
 _sm_materialize_observation(value, ::Type{Nothing}) = nothing
@@ -5204,6 +5266,26 @@ end
 @inline _sm_backend_storage_value(value::LinearAlgebra.Cholesky) =
     _sm_cholesky_reconstruct(
         _sm_backend_storage_value(value.factors), value.uplo, value.info)
+
+@generated function _sm_functional_machine_storage(
+        ports::P, state::NamedTuple{Names}) where {P<:NamedTuple,Names}
+    values = Any[]
+    for name in Names
+        field = QuoteNode(name)
+        push!(values, quote
+            value = getfield(state, $field)
+            if hasproperty(ports, $field) &&
+                    getfield(ports, $field) isa _SMFiniteStructuralPort
+                port = getfield(ports, $field)
+                value isa Vector ? _sm_finite_structural_pack(port, value) :
+                    _sm_finite_validate_raw(port, value)
+            else
+                _sm_backend_storage_value(value)
+            end
+        end)
+    end
+    :(NamedTuple{$Names}(($(values...),)))
+end
 
 function _sm_functional_machine_storage(ports::NamedTuple, state)
     names = propertynames(state)
@@ -5756,11 +5838,11 @@ function _sm_restore_reusable_compiled_output(
     # optional-backend wrapper around structured numeric leaves.  Restore only
     # those source-logical structured wrappers once more as the final host step.
     restored_ports = _sm_restore_reusable_state_ports(
-        ports, result.state, Groups)
+        ports, result.state, Val(Groups))
     canonical = _sm_canonicalize_topology(
         restored_ports, _sm_compiled_topology(transition))
     restored = _sm_restore_reusable_structured_wrappers(
-        ports, canonical, Groups)
+        ports, canonical, Val(Groups))
     restored_result = merge(result, (state=restored,))
     hasproperty(result, :effects) || return restored_result
     restored_effects = _sm_canonicalize_effect_topologies(
@@ -5801,7 +5883,7 @@ function _sm_restore_reusable_compiled_output(
     canonical = _sm_canonicalize_topology(
         result, _sm_compiled_topology(transition))
     _sm_restore_reusable_state_ports(
-        getfield(transition, :ports), canonical, Groups)
+        getfield(transition, :ports), canonical, Val(Groups))
 end
 
 function _sm_validate_straight_result(
@@ -7864,7 +7946,7 @@ function _functional_state_machine_method(
                     :(_sm_validate_functional_effect_candidate(
                         getfield(ports, $(QuoteNode(name))), $raw_candidate,
                         $expected_arguments, ($(arguments...),),
-                        $argument_topology)),
+                        Val($(QuoteNode(argument_topology))))),
                     :__sfm_effect_call_, name)
                 replacement_effect = :(getfield($candidate, :effect_state))
                 effect_port = :(getfield(ports, $(QuoteNode(name))))
