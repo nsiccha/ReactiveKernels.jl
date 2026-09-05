@@ -6667,12 +6667,23 @@ function _functional_state_machine_method(
         role === :owned && _kernel_dom_int_scalar(field_type) &&
             field_type !== Bool
     end
+    if index_index === nothing
+        # The seed only supplies the scalar representation for compiler
+        # indices; generating zero/one from it does not mutate its source.
+        # A read-only integer such as an authored loop bound is sufficient.
+        index_index = findfirst(names) do name
+            canon = get(fields, name, 0)
+            canon == 0 && return false
+            field_type = _pp_fieldtype(plan, canon, OW, SH)
+            _kernel_dom_int_scalar(field_type) && field_type !== Bool
+        end
+    end
     index_source = if index_index !== nothing
         base_syms[(:field, names[index_index])]
     else
         replay_position = findfirst(_sm_ordered_rng_replay_type, argument_types)
         replay_position === nothing && _sm_reject(
-            "functional state-machine requires an owned integer or ordered-RNG cursor for dynamic indexing")
+            "functional state-machine requires an integer state field or ordered-RNG cursor for dynamic indexing")
         replay_formal = ir.formals[replay_position].name
         replay_symbol = base_syms[(:formal, replay_formal)]
         bind!(:(getfield($replay_symbol, :normal_index)),

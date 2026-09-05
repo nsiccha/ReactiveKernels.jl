@@ -3,6 +3,22 @@ module MutationProfileBGenericControl
 using ReactiveKernels
 using Random
 
+@kernel scalar_accumulator(limit, total) = begin
+    step!() = begin
+        for k in 1:limit
+            total += k / 2
+        end
+    end
+end
+
+function readonly_index_case(; max_iterations=4)
+    kernel = ReactiveKernels.compile_stateful(scalar_accumulator, 4, 0.0)
+    state = ReactiveKernels.stateful_snapshot(kernel(4, 0.0))
+    transition = ReactiveKernels.functionalize_stateful(
+        kernel, Val(:step!); max_iterations, argument_types=Tuple{})
+    (; kernel, state, transition)
+end
+
 @kernel recursive_array_reader(total, ceiling) = begin
     calls = 0
     descend!(level, data) = begin

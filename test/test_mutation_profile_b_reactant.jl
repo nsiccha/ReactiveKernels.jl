@@ -27,6 +27,25 @@ const _MPBR_GENERIC_NUTS = MutationProfileBGenericNUTSSupport
 const _MPBR_TESTSET = get(ENV, "RK_MPB_REACTANT_TESTSET", "all")
 _mpbr_enabled(name) = _MPBR_TESTSET == "all" || _MPBR_TESTSET == name
 
+if _mpbr_enabled("readonly-index")
+@testset "readonly integer controls seed traced loop indices" begin
+    case = _MPBR_GENERIC_CONTROL.readonly_index_case()
+    state = Reactant.to_rarray(case.state; track_numbers=true)
+    compiled = @compile sync=true donated_args=:none case.transition(state)
+    result = compiled(state)
+    @test Float64(result.state.total) == 5
+    @test Int(result.state.limit) == 4
+    @test !Bool(result.control_overflow)
+    @test Float64(state.total) == 0
+    @test Float64(compiled(result.state).state.total) == 10
+    short = _MPBR_GENERIC_CONTROL.readonly_index_case(; max_iterations=3)
+    guarded = @compile sync=true donated_args=:none short.transition(state)
+    exhausted = guarded(state)
+    @test Bool(exhausted.control_overflow)
+    @test Float64(exhausted.state.total) == 0
+end
+end
+
 if _mpbr_enabled("readonly-array")
 @testset "recursive array argument forwarding through Reactant" begin
     case = _MPBR_GENERIC_CONTROL.array_reader_case()

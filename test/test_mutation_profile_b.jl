@@ -30,6 +30,22 @@ const _MPB_GENERIC_CONTROL = MutationProfileBGenericControl
 const _MPB_TESTSET = get(ENV, "RK_MPB_TESTSET", "all")
 _mpb_enabled(name) = _MPB_TESTSET == "all" || _MPB_TESTSET == name
 
+if _mpb_enabled("readonly-index")
+@testset "readonly integer controls seed functional loop indices" begin
+    case = _MPB_GENERIC_CONTROL.readonly_index_case()
+    result = case.transition(case.state)
+    @test result.state.total == 5
+    @test result.state.limit == 4
+    @test !result.control_overflow
+    @test case.state.total == 0
+    @test case.transition(result.state).state.total == 10
+    short = _MPB_GENERIC_CONTROL.readonly_index_case(; max_iterations=3)
+    exhausted = short.transition(short.state)
+    @test exhausted.control_overflow
+    @test exhausted.state == short.state
+end
+end
+
 if _mpb_enabled("readonly-array")
 @testset "recursive array arguments retain values across suspension" begin
     case = _MPB_GENERIC_CONTROL.array_reader_case()
