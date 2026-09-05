@@ -325,7 +325,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
     )
     expected_sortable_tables = Dict(
         "probprog-mcmc.md" => 3,
-        "practicalbayes.md" => 4,
+        "practicalbayes.md" => 3,
         "distributions-ad.md" => 9,
         "distributions.md" => 1,
         "ppl-ad.md" => 10,
@@ -341,6 +341,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "nuts-reactant.md" => 2,
     )
     expected_aov_panels = Dict(
+        "practicalbayes.md" => 4,
         "probprog-mcmc.md" => 1,
         "distributions-ad.md" => 9,
         "distributions.md" => 2,
