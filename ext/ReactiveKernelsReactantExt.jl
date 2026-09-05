@@ -769,6 +769,8 @@ end
 
 function _reactant_authored_plate_call(marker, operation, args::Tuple)
     count = _authored_plate_batch_length(marker)
+    lanes = _reactant_plate_lanes(count, operation, args)
+    lanes === nothing || return lanes
     batch_positions = Tuple(index for index in eachindex(args)
         if _authored_plate_is_explicit_batch(getfield(args, index), count))
     isempty(batch_positions) && throw(ArgumentError(
@@ -799,6 +801,92 @@ function ReactiveKernels._tensorized_plate_call(
         marker::ReactiveKernels._TensorizedPlateBatch{<:Reactant.TracedRArray},
         operation, args::Tuple)
     _reactant_authored_plate_call(marker, operation, args)
+end
+
+# --- Small static plates lower as scalar lane programs -----------------------
+# A plate over a small, statically sized axis is evaluated once per lane with
+# scalar (or column) operands, the lane results stay scalars, and the authored
+# `sum(pointwise)` reduces them with a scalar add chain.  The vectorized
+# lowering is correct but structurally slower on XLA's CPU backend: computed
+# scalars broadcast across lanes and a lane vector reused by several plates
+# are producers XLA refuses to fuse into their consumers, and each
+# `stablehlo.reduce` is another kernel boundary, so one small posterior
+# becomes several kernel launches where a hand-unrolled loop is one.  Keeping
+# small plates scalar restores that single-kernel shape without any
+# model-specific recognition; larger plates keep the batched/broadcast
+# lowering, so accelerator-scale plates are unchanged.  The lane vector is
+# materialized only when a pointwise result is actually demanded.
+const _REACTANT_SMALL_STATIC_PLATE_LANES = Ref(16)
+
+struct _PlateLanes{L<:Tuple}
+    lanes::L
+end
+
+ReactiveKernels._tensorized_plate_is_marker(::_PlateLanes) = true
+ReactiveKernels._tensorized_plate_materialize(value::_PlateLanes) =
+    vcat(value.lanes...)
+ReactiveKernels._tensorized_plate_sum(value::_PlateLanes) =
+    foldl(+, value.lanes)
+function ReactiveKernels._tensorized_plate_call(
+        marker::_PlateLanes, operation, args::Tuple)
+    _reactant_authored_plate_call(marker, operation, args)
+end
+
+# Plain traced vectors carry no structural marker in the core, so without this
+# claim a vector plate lowers through Reactant's generic broadcast.  Claiming
+# them routes the plate here, where a large plate still takes exactly that
+# broadcast.
+ReactiveKernels._tensorized_plate_is_marker(::Reactant.TracedRArray{<:Any,1}) =
+    true
+function ReactiveKernels._tensorized_plate_call(
+        marker::Reactant.TracedRArray{<:Any,1}, operation, args::Tuple)
+    lanes = _reactant_plate_lanes(size(marker, 1), operation, args)
+    lanes === nothing ? Base.broadcast(operation, args...) : lanes
+end
+
+@inline _authored_plate_batch_length(arg::_PlateLanes) = length(arg.lanes)
+@inline _authored_plate_batch_input(arg::_PlateLanes) = Reactant.promote_to(
+    Reactant.TracedRArray, ReactiveKernels._tensorized_plate_materialize(arg))
+@inline _authored_plate_is_explicit_batch(arg::_PlateLanes, count) = true
+
+# How one plate operand participates in per-lane evaluation: `:lane` operands
+# contribute one value per lane, `:shared` operands are passed to every lane,
+# and `nothing` means the operand shape is outside this lowering, in which
+# case the whole plate keeps its batched or broadcast lowering.
+@inline _plate_lane_kind(arg::ReactiveKernels._TensorizedEachcol, count) =
+    size(arg.parent, 2) == count ? :lane : nothing
+@inline _plate_lane_kind(arg::ReactiveKernels._TensorizedPlateBatch, count) =
+    _plate_lane_kind(arg.values, count)
+@inline _plate_lane_kind(arg::_PlateLanes, count) =
+    length(arg.lanes) == count ? :lane : nothing
+@inline _plate_lane_kind(arg::AbstractArray, count) =
+    ndims(arg) == 1 && length(arg) == count ? :lane : nothing
+@inline _plate_lane_kind(arg::Base.RefValue, count) = :shared
+@inline _plate_lane_kind(arg::Number, count) = :shared
+@inline _plate_lane_kind(arg, count) = nothing
+
+@inline _plate_lane(arg::ReactiveKernels._TensorizedEachcol, lane) =
+    arg.parent[:, lane]
+@inline _plate_lane(arg::ReactiveKernels._TensorizedPlateBatch, lane) =
+    _plate_lane(arg.values, lane)
+@inline _plate_lane(arg::_PlateLanes, lane) = getfield(arg.lanes, lane)
+@inline _plate_lane(arg::AbstractVector, lane) = Reactant.@allowscalar arg[lane]
+
+function _reactant_plate_lanes(count, operation, args::Tuple)
+    1 <= count <= _REACTANT_SMALL_STATIC_PLATE_LANES[] || return nothing
+    kinds = map(arg -> _plate_lane_kind(arg, count), args)
+    any(kind -> kind === nothing, kinds) && return nothing
+    any(kind -> kind === :lane, kinds) || return nothing
+    shared = map(_authored_plate_shared, args)
+    lanes = ntuple(count) do lane
+        lane_args = ntuple(length(args)) do index
+            getfield(kinds, index) === :lane ?
+                _plate_lane(getfield(args, index), lane) :
+                getfield(shared, index)
+        end
+        operation(lane_args...)
+    end
+    _PlateLanes(lanes)
 end
 
 @inline function ReactiveKernels._batched_call(
@@ -924,10 +1012,22 @@ function _rk_reactant_compile_ad_call(
     Reactant.compile(fn, args; sync = sync)
 end
 
+# Bound arrays become hidden device operands so a dataset never turns into a
+# program literal, but that boundary is worth crossing only when the array is
+# large: as a runtime operand every data-only term inside a plate lane, such
+# as an observation scale's `log`, is recomputed per call and blocks fusion,
+# whereas the primal compile path already embeds the same array as a constant
+# that XLA folds.  Arrays up to this many elements therefore stay embedded on
+# the automatic AD compile path too; the explicit externalized ABI below is
+# unchanged and still externalizes exactly what its caller extracted.
+const _REACTANT_EMBEDDED_BOUND_ARRAY_ELEMENTS = Ref(4096)
+
 function _rk_reactant_compile_ad(
         mode::Val, prepared::ReactiveKernels.PreparedADKernel, args::Tuple;
         sync::Bool)
-    kernel, values = ReactiveKernels._externalize_bound_arrays(prepared.kernel)
+    kernel, values = ReactiveKernels._externalize_bound_arrays(
+        prepared.kernel;
+        min_elements = _REACTANT_EMBEDDED_BOUND_ARRAY_ELEMENTS[] + 1)
     isempty(values) && return _rk_reactant_compile_ad_call(
         mode, prepared, kernel, args; sync)
     external_args = map(Reactant.to_rarray, values)
