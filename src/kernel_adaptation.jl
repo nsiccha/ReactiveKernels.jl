@@ -4728,7 +4728,11 @@ function _sm_validate_functional_structured_state_port(
             "functional structured state does not match its logical layout"))
     _sm_functional_shape_ok(value, initial) || throw(ArgumentError(
         "functional structured state does not match its compiled shapes"))
-    names, groups, external_groups = typeof(transition).parameters[1:3]
+    # Slicing DataType.parameters creates an untyped container and erases the
+    # constants needed by the generated identity checks. Keep these reads scalar.
+    names = typeof(transition).parameters[1]
+    groups = typeof(transition).parameters[2]
+    external_groups = typeof(transition).parameters[3]
     propertynames(value) == names || throw(ArgumentError(
         "functional structured state has the wrong field layout"))
     _sm_validate_topology_contract(value, _sm_static_topology_contract(port))
@@ -4740,7 +4744,9 @@ function _sm_validate_functional_structured_candidate(
         port::_StructuredStatePort, value)
     transition = getfield(port, :transition)
     initial = getfield(transition, :initial)
-    names, groups, external_groups = typeof(transition).parameters[1:3]
+    names = typeof(transition).parameters[1]
+    groups = typeof(transition).parameters[2]
+    external_groups = typeof(transition).parameters[3]
     propertynames(value) == names || throw(ArgumentError(
         "functional structured replacement has the wrong field layout"))
     _sm_functional_argument_type_ok(typeof(value), typeof(initial)) ||
@@ -4783,7 +4789,9 @@ function _sm_validate_reusable_structured_state_port(
         port::_StructuredStatePort, value)
     transition = getfield(port, :transition)
     initial = getfield(transition, :initial)
-    names, groups, external_groups = typeof(transition).parameters[1:3]
+    names = typeof(transition).parameters[1]
+    groups = typeof(transition).parameters[2]
+    external_groups = typeof(transition).parameters[3]
     propertynames(value) == names || throw(ArgumentError(
         "reusable compiled structured state has the wrong field layout"))
     _sm_functional_shape_ok(value, initial) || throw(ArgumentError(
@@ -5360,7 +5368,9 @@ end
 function _sm_validate_machine_state(transition, state;
                                     reusable::Bool=false,
                                     raw::Bool=false)
-    Names, _, ArrayNames, StateType = typeof(transition).parameters[1:4]
+    Names = typeof(transition).parameters[1]
+    ArrayNames = typeof(transition).parameters[3]
+    StateType = typeof(transition).parameters[4]
     ports = getfield(transition, :ports)
     shapes = getfield(transition, :shape_contract)
     label = raw ? "raw backend state-machine state" :
@@ -10414,7 +10424,9 @@ function _sm_validate_structured_state_port(port::_StructuredStatePort, value)
         "structured state value has type `$(typeof(value))`, expected " *
         "`$(typeof(initial))`"))
     transition_type = typeof(transition)
-    names, groups, external_groups = transition_type.parameters[1:3]
+    names = transition_type.parameters[1]
+    groups = transition_type.parameters[2]
+    external_groups = transition_type.parameters[3]
     _sm_validate_topology_contract(
         value, _sm_compiled_topology(transition))
     for (group_index, group) in enumerate(groups)
