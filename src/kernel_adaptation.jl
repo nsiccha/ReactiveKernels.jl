@@ -3825,12 +3825,32 @@ end
 
 @generated function _sm_control_block_index(
         ::_SMControlBlockDispatch{Addresses}, carry) where {Addresses}
-    choices = Any[]
+    # CFG addresses are usually consecutive within a method. Coalesce only
+    # adjacent entries whose PCs and case indices both advance together; this
+    # preserves arbitrary sparse/reordered address metadata without allocating
+    # a table proportional to the largest PC. A dense method needs one range
+    # check regardless of how many source blocks it contains.
+    ranges = Tuple{Int,Int,Int,Int}[]
     for (i, (mid, pc)) in enumerate(Addresses)
+        if !isempty(ranges) && ranges[end][1] == mid &&
+                ranges[end][3] < typemax(Int) && ranges[end][3] + 1 == pc
+            method, first_pc, _, first_index = pop!(ranges)
+            push!(ranges, (method, first_pc, pc, first_index))
+        else
+            push!(ranges, (mid, pc, pc, i - 1))
+        end
+    end
+    choices = Any[]
+    for (mid, first_pc, last_pc, first_index) in ranges
+        in_range = first_pc == last_pc ?
+            :(address == oftype(address, $first_pc)) :
+            :(_sm_predicated_and(address >= oftype(address, $first_pc),
+                                 address <= oftype(address, $last_pc)))
         push!(choices, :(index = _sm_predicated_select(
             _sm_predicated_and(method == oftype(method, $mid),
-                address == oftype(address, $pc)),
-            oftype(index, $(i - 1)), index)))
+                $in_range),
+            address - oftype(address, $first_pc) +
+                oftype(address, $first_index), index)))
     end
     quote
         method = _sm_frame_read(carry.ctrl_mid, carry.csp)
@@ -3841,22 +3861,12 @@ end
     end
 end
 
-@generated function _sm_control_dispatch(
+function _sm_control_dispatch(
         dispatch::_SMControlBlockDispatch{Addresses}, ports, rng_providers,
         ensures, carry, index::Integer) where {Addresses}
-    branches = Any[]
-    for i in 1:length(Addresses)
-        push!(branches, :(if index == $(i - 1)
-            return _sm_control_block_call(dispatch.blocks[$i],
-                ports, rng_providers, ensures, carry)
-        end))
-    end
-    quote
-        $(branches...)
-        _sm_control_block_call(
-            dispatch.blocks[$(length(Addresses) + 1)],
-            ports, rng_providers, ensures, carry)
-    end
+    chosen = 0 <= index < length(Addresses) ? index + 1 : length(Addresses) + 1
+    _sm_control_block_call(dispatch.blocks[chosen],
+        ports, rng_providers, ensures, carry)
 end
 
 @inline function _sm_control_step_call(
@@ -5070,6 +5080,45 @@ function _sm_backend_state_type(::Type{StateType}, ports::NamedTuple) where
     NamedTuple{names,Tuple{types...}}
 end
 
+@generated function _sm_validate_machine_fields(transition::T, state, label) where {T}
+    Names, _, _, StateType = T.parameters[1:4]
+    checks = Any[]
+    for name in Names
+        field = QuoteNode(name)
+        expected = fieldtype(StateType, name)
+        push!(checks, quote
+            value = getfield(state, $field)
+            port = hasproperty(ports, $field) ? getfield(ports, $field) : nothing
+            if port isa _SMFiniteStructuralPort
+                # Untouched finite fields may remain logical vectors while
+                # updated fields arrive as packed columns. Check either form
+                # before the guarded boundary restores logical wrappers.
+                if value isa Vector
+                    _sm_finite_validate_elements(port, value)
+                else
+                    _sm_finite_validate_raw(port, value)
+                    all_logical = false
+                end
+            else
+                _sm_functional_argument_type_ok(typeof(value), $expected) ||
+                    _sm_runtime_abi_mismatch(label, $StateType, shapes, state)
+                _sm_shape_contract_ok(value, getfield(shapes, $field)) ||
+                    _sm_runtime_abi_mismatch(label, $StateType, shapes, state)
+            end
+        end)
+    end
+    # Field names and expected types belong to the frozen compiler ABI. Emit
+    # literal field accesses so validation does not box large heterogeneous
+    # port descriptors on each invocation. The checks themselves stay live.
+    quote
+        ports = getfield(transition, :ports)
+        shapes = getfield(transition, :shape_contract)
+        all_logical = true
+        $(checks...)
+        all_logical
+    end
+end
+
 function _sm_validate_machine_state(transition, state;
                                     reusable::Bool=false,
                                     raw::Bool=false)
@@ -5081,29 +5130,7 @@ function _sm_validate_machine_state(transition, state;
                        "functional state-machine state"
     propertynames(state) == Names ||
         _sm_runtime_abi_mismatch(label, StateType, shapes, state)
-    all_logical = true
-    for name in Names
-        value = getfield(state, name)
-        port = hasproperty(ports, name) ? getfield(ports, name) : nothing
-        if port isa _SMFiniteStructuralPort
-            if value isa Vector
-                # A backend result can be representation-mixed: an untouched
-                # finite field may retain its logical vector while a field
-                # updated by the lowered program is returned as packed columns.
-                # Validate either form before host-side logical restoration.
-                _sm_finite_validate_elements(port, value)
-            else
-                _sm_finite_validate_raw(port, value)
-                all_logical = false
-            end
-        else
-            _sm_functional_argument_type_ok(
-                typeof(value), fieldtype(StateType, name)) ||
-                _sm_runtime_abi_mismatch(label, StateType, shapes, state)
-            _sm_shape_contract_ok(value, getfield(shapes, name)) ||
-                _sm_runtime_abi_mismatch(label, StateType, shapes, state)
-        end
-    end
+    all_logical = _sm_validate_machine_fields(transition, state, label)
     if all_logical
         _sm_validate_topology_contract(
             state, getfield(transition, :topology_contract))

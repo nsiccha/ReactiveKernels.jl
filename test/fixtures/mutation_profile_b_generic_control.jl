@@ -3,6 +3,18 @@ module MutationProfileBGenericControl
 using ReactiveKernels
 using Random
 
+# Include a gap, reordered methods, a duplicate and a very large isolated PC.
+# Index selection must honor the original case order without dense allocation.
+const ADDRESS_PROBE = ((11, 2), (11, 3), (11, 7), (-4, 0),
+                       (-4, 1), (11, 2), (91, typemax(Int)))
+const ADDRESS_INPUTS = ((11, 2), (11, 3), (11, 7), (-4, 0), (-4, 1),
+                        (91, typemax(Int)), (11, 4), (11, 1), (0, 2),
+                        (91, typemax(Int) - 1), (11, typemin(Int)))
+const ADDRESS_EXPECTED = (5, 1, 2, 3, 4, 6, 7, 7, 7, 7, 7)
+const address_dispatch = ReactiveKernels._SMControlBlockDispatch{ADDRESS_PROBE}(
+    Any[], Any[])
+address_probe(carry) = ReactiveKernels._sm_control_block_index(address_dispatch, carry)
+
 macro define_recursive_probe(kernel_name, field_name, bound_name,
         emit_name, lower_name, upper_name, drive_name)
     field = field_name

@@ -330,6 +330,19 @@ if _mpbr_enabled("generic-owned")
 end
 end
 
+if _mpbr_enabled("control-dispatch")
+@testset "traced control address ranges preserve sparse cases" begin
+    fixture = _MPBR_GENERIC_CONTROL
+    state = _mpbr_trace((ctrl_mid=[0, 11], ctrl_pc=[0, 2], csp=2))
+    compiled = @compile sync=true donated_args=:none fixture.address_probe(state)
+    for ((method, pc), expected) in zip(fixture.ADDRESS_INPUTS,
+                                       fixture.ADDRESS_EXPECTED)
+        input = _mpbr_trace((ctrl_mid=[0, method], ctrl_pc=[0, pc], csp=2))
+        @test Int(compiled(input)) == expected
+    end
+end
+end
+
 if _mpbr_enabled("trace-block")
 @testset "generated control tracing preserves backend call overlays" begin
     @test _MPBRTraceBlockOverlay.block((value=3,)).value == 4

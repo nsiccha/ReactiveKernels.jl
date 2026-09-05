@@ -30,6 +30,25 @@ const _MPB_GENERIC_CONTROL = MutationProfileBGenericControl
 const _MPB_TESTSET = get(ENV, "RK_MPB_TESTSET", "all")
 _mpb_enabled(name) = _MPB_TESTSET == "all" || _MPB_TESTSET == name
 
+if _mpb_enabled("control-dispatch")
+@testset "control address ranges and native dispatch" begin
+    fixture = _MPB_GENERIC_CONTROL
+    for ((method, pc), expected) in zip(fixture.ADDRESS_INPUTS,
+                                       fixture.ADDRESS_EXPECTED)
+        carry = (ctrl_mid=[0, method], ctrl_pc=[0, pc], csp=2)
+        @test fixture.address_probe(carry) == expected
+    end
+    blocks = Any[RK.compile(:((ports, rng, ensures, carry) ->
+        (value=carry.value + $amount,))) for amount in (3, 5, 7)]
+    dispatch = RK._SMControlBlockDispatch{((1, 1), (1, 2))}(blocks, Any[])
+    for (index, expected) in ((0, 13), (1, 15), (-1, 17), (2, 17),
+                               (typemax(Int), 17))
+        @test RK._sm_control_dispatch(dispatch, nothing, nothing, nothing,
+            (value=10,), index).value == expected
+    end
+end
+end
+
 if _mpb_enabled("loop-scope")
 @testset "lowered loop bindings preserve lexical scopes" begin
     for (method, expected) in ((Val(:grids!), 15), (Val(:nested!), 22))
