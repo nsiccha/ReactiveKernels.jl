@@ -697,7 +697,7 @@ program; it does not pre-generate host tapes and does not promise stream parity
 with a Julia `AbstractRNG`. Split/fold semantics are deliberately deferred
 until replica batching needs them.
 
-`OrderedRNGReplay` remains the exact parity and failure oracle and infers its
+`OrderedRNGReplay` supplies deterministic draws for behavior and failure tests and infers its
 provider automatically. It carries independent floating normal, Boolean
 uniform, and exact Float64 exponential tapes, per-kind cursors, one global
 ordered event tape/cursor, and sticky overflow. `randn!` is admitted only for
@@ -732,29 +732,19 @@ the barrier. The same generic compiler path matches the independent accept,
 reject, and divergence receipt in ordinary Julia and Reactant. A separate
 pinned physical case locks Float32
 position/momentum/normal draws together with the authored Float64 `randexp`
-result, exact bits, destination alias, and global RNG event order. That evidence
+result, destination alias, and global RNG event order. That evidence
 admits reusable nested-state currentness, typed effects, ordered RNG, and mixed
 floating assignment capabilities; it is not an HMC case in compiler code.
 
-The mixed-precision gate separates source semantics from backend floating
-rounding. Raw tape bits, tape and destination types, the `randn!` result alias,
-event order, cursors, shapes, overflow/rollback, and every control decision are
-exact. Ordinary Julia execution of the generic lowering is also bit-identical
-to the independent physical receipt. The backend-neutral emitter preserves the
-authored operator tree: it introduces no `@fastmath`, `muladd`, `fma`, or
-arithmetic reassociation, and contains no HMC/field-name case. Reactant keeps
-the exact Float32/Float64
-field types and is checked against the physical result with explicit ULP
-distances, not an `isapprox` tolerance: positions `[0, 0]`; initial/final
-momenta `[1, 0]` Float32 ULPs; initial/final Hamiltonians `67_108_864` Float64
-ULPs; the three energy diagnostics `[68_719_476_736, 0, 8_589_934_592]`
-Float64 ULPs; and final `dham` `8_589_934_592` Float64 ULPs. The apparently
-large Float64 counts reflect diagnostics stored as Float64 after cancellation
-along a Float32 trajectory; they are the exact pinned distances, not a broad
-error allowance. Its divergence and acceptance margins remain greater than
-`900` and `0.49`, respectively, so the recorded rounding cannot approach a
-control threshold. A widened Float64 normal tape is rejected by both native
-and Reactant entry contracts.
+Floating-point results may differ between native and compiled execution.
+Sampler acceptance does not require bit matching or a fixed numerical distance
+between backends, and does not restrict compiler optimization to reproduce a
+reference rounding pattern. Tests check useful sampler behavior, including
+valid trajectories, termination, divergence handling, RNG consumption, and
+repeated execution. The mixed-precision case also checks Float32/Float64 field
+types, the `randn!` result alias, tape and destination shapes, and rollback.
+A widened Float64 normal tape is rejected by both native and Reactant entry
+contracts.
 
 ## What the NUTS proof does and does not establish
 
