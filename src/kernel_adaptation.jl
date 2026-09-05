@@ -4022,7 +4022,7 @@ end
 function _sm_restore_reusable_structured_state_port(
         port::_StructuredStatePort, value)
     transition = getfield(port, :transition)
-    normalized = _sm_normalize_compiled_state(transition, value)
+    normalized = _sm_normalize_structured_state(port, value)
     _sm_restore_source_logical_wrappers(
         getfield(transition, :initial), normalized)
 end
@@ -4035,12 +4035,12 @@ end
 # and restored explicitly.  This is deliberately independent of any backend or
 # algorithm type.
 @inline _sm_restore_source_logical_wrappers(prototype, value) = value
-@inline function _sm_restore_source_logical_wrappers(
+@generated function _sm_restore_source_logical_wrappers(
         prototype::NamedTuple{Names}, value) where {Names}
-    NamedTuple{Names}(map(Names) do name
-        _sm_restore_source_logical_wrappers(
-            getfield(prototype, name), getfield(value, name))
-    end)
+    children = Any[:(_sm_restore_source_logical_wrappers(
+        getfield(prototype, $(QuoteNode(name))),
+        getfield(value, $(QuoteNode(name))))) for name in Names]
+    :(NamedTuple{$Names}(($(children...),)))
 end
 @inline function _sm_restore_source_logical_wrappers(
         prototype::Tuple{Vararg{Any,N}}, value) where {N}
@@ -4446,6 +4446,28 @@ function _sm_canonicalize_topology(value, contract::Tuple)
     result
 end
 
+@generated function _sm_canonicalize_topology(value, ::Val{Contract}) where {Contract}
+    statements = Any[]
+    for (index, group) in enumerate(Contract)
+        source = foldl((parent, step) ->
+            :(_sm_topology_step($parent, Val($(QuoteNode(step))))),
+            first(group); init=:value)
+        isolated = Symbol(:__canonical_group_, index)
+        push!(statements, :(local $isolated = _sm_structural_copy($source)))
+        for path in group
+            push!(statements, :(value = _sm_structural_set(
+                value, Val($(QuoteNode(path))), $isolated)))
+        end
+    end
+    push!(statements, :value)
+    Expr(:block, statements...)
+end
+
+function _sm_normalize_structured_state(port::_StructuredStatePort, value)
+    canonical = _sm_canonicalize_topology(value, _sm_static_topology_contract(port))
+    _sm_restore_compiled_external_groups(getfield(port, :transition), canonical)
+end
+
 function _sm_topology_path_is_within(path::Tuple, root::Tuple)
     length(root) <= length(path) || return false
     all(path[index] === root[index] for index in eachindex(root))
@@ -4619,6 +4641,24 @@ function _sm_fixed_tuple_select(
     _sm_fixed_tuple_validate(port, normalized)
 end
 
+# Ownership groups are compiler metadata. Looking up heterogeneous state fields
+# through a runtime group iterator boxes large callable values during every
+# check; emit only the required external-identity comparisons instead.
+@generated function _sm_validate_external_group_identities(
+        value, initial, ::Val{Groups}, ::Val{ExternalGroups}, label) where
+        {Groups,ExternalGroups}
+    statements = Any[]
+    for index in ExternalGroups
+        name = first(Groups[index])
+        suffix = " external authority `$name` was replaced"
+        push!(statements, :(getfield(value, $(QuoteNode(name))) ===
+            getfield(initial, $(QuoteNode(name))) ||
+            throw(ArgumentError(label * $suffix))))
+    end
+    push!(statements, :value)
+    Expr(:block, statements...)
+end
+
 function _sm_validate_functional_structured_state_port(
         port::_StructuredStatePort, value)
     transition = getfield(port, :transition)
@@ -4632,16 +4672,8 @@ function _sm_validate_functional_structured_state_port(
     propertynames(value) == names || throw(ArgumentError(
         "functional structured state has the wrong field layout"))
     _sm_validate_topology_contract(value, _sm_static_topology_contract(port))
-    for (group_index, group) in enumerate(groups)
-        leader = getfield(value, first(group))
-        if group_index in external_groups
-            leader === getfield(initial, first(group)) ||
-                throw(ArgumentError(
-                    "functional structured state external authority " *
-                    "`$(first(group))` was replaced"))
-        end
-    end
-    value
+    _sm_validate_external_group_identities(value, initial,
+        Val(groups), Val(external_groups), "functional structured state")
 end
 
 function _sm_validate_functional_structured_candidate(
@@ -4657,14 +4689,8 @@ function _sm_validate_functional_structured_candidate(
     _sm_functional_shape_ok(value, initial) || throw(ArgumentError(
         "functional structured replacement has the wrong axes"))
     _sm_validate_required_aliases(value, _sm_static_topology_contract(port))
-    for group_index in external_groups
-        group = groups[group_index]
-        getfield(value, first(group)) === getfield(initial, first(group)) ||
-            throw(ArgumentError(
-                "functional structured replacement external authority " *
-                "`$(first(group))` was replaced"))
-    end
-    value
+    _sm_validate_external_group_identities(value, initial,
+        Val(groups), Val(external_groups), "functional structured replacement")
 end
 
 function _sm_validate_functional_state_ports(ports::NamedTuple, state)
@@ -10134,14 +10160,8 @@ function _sm_validate_reusable_compiled_state_input(
         "reusable compiled transition state does not match its compiled axes"))
     _sm_validate_topology_contract(
         state, getfield(transition, :topology_contract))
-    for group_index in ExternalGroups
-        group = Groups[group_index]
-        getfield(state, first(group)) ===
-            getfield(initial, first(group)) || throw(ArgumentError(
-                "reusable compiled transition external authority " *
-                "`$(first(group))` was replaced"))
-    end
-    state
+    _sm_validate_external_group_identities(state, initial,
+        Val(Groups), Val(ExternalGroups), "reusable compiled transition")
 end
 
 function _sm_validate_reusable_compiled_output(
@@ -10168,14 +10188,8 @@ function _sm_validate_compiled_external_groups(
         transition::CompiledStateTransition{Names,Groups,ExternalGroups},
         value) where {Names,Groups,ExternalGroups}
     initial = getfield(transition, :initial)
-    for group_index in ExternalGroups
-        group = Groups[group_index]
-        getfield(value, first(group)) ===
-            getfield(initial, first(group)) || throw(ArgumentError(
-                "compiled state transition external authority " *
-                "`$(first(group))` was replaced"))
-    end
-    value
+    _sm_validate_external_group_identities(value, initial,
+        Val(Groups), Val(ExternalGroups), "compiled state transition")
 end
 
 @generated function _sm_restore_compiled_external_groups(
@@ -10253,15 +10267,7 @@ function (transition::CompiledStateTransition{Names,Groups,ExternalGroups})(
         "compiled state transition input does not match its compiled axes"))
     _sm_validate_topology_contract(
         state, getfield(transition, :topology_contract))
-    for (group_index, group) in enumerate(Groups)
-        leader = getfield(state, first(group))
-        if group_index in ExternalGroups
-            leader === getfield(initial, first(group)) ||
-                throw(ArgumentError(
-                    "compiled state transition external authority " *
-                    "`$(first(group))` was replaced"))
-        end
-    end
+    _sm_validate_compiled_external_groups(transition, state)
     result = _sm_transition_body_call(
         getfield(transition, :f), getfield(transition, :ensures), state, controls)
     result = _sm_restore_reusable_compiled_output(transition, result)
@@ -10338,8 +10344,8 @@ end
     constructor = NamedTuple{Names}
     push!(statements, quote
         local __structured_copy = $constructor(($(values...),))
-        local __structured_copy_normalized = _sm_normalize_compiled_state(
-            getfield(port, :transition), __structured_copy)
+        local __structured_copy_normalized = _sm_normalize_structured_state(
+            port, __structured_copy)
         _sm_validate_functional_structured_state_port(
             port, __structured_copy_normalized)
     end)
@@ -10419,7 +10425,7 @@ function _sm_structured_set(
     transition = getfield(port, :transition)
     candidate = if isempty(Path)
         _sm_validate_functional_structured_candidate(port, replacement)
-        _sm_normalize_compiled_state(transition, replacement)
+        _sm_normalize_structured_state(port, replacement)
     else
         written = _sm_apply_topology_write(
             value, Path, replacement,
@@ -10461,8 +10467,8 @@ end
     constructor = NamedTuple{Names}
     push!(statements, quote
         local __structured_selected = $constructor(($(values...),))
-        local __structured_selected_normalized = _sm_normalize_compiled_state(
-            getfield(port, :transition), __structured_selected)
+        local __structured_selected_normalized = _sm_normalize_structured_state(
+            port, __structured_selected)
         _sm_validate_functional_structured_state_port(
             port, __structured_selected_normalized)
     end)

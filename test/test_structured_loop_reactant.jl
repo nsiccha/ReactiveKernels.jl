@@ -65,6 +65,28 @@ function (op::EndpointLowering)(effect, point)
      effect_state=(calls=effect.calls + 1, last_energy=updated.energy))
 end
 
+struct ConfiguredEnergy <: Function
+    offset::Float64
+end
+(energy::ConfiguredEnergy)(values) = sum(abs2, values) + energy.offset
+
+@testset "compiled endpoints reject replaced same-type authorities" begin
+    authority = ConfiguredEnergy(0.0)
+    endpoint = RK.compile_state_transition(
+        loop_endpoint, increment_endpoint!, (authority, [1.0, 2.0]))
+    state = RK.initial_transition_state(endpoint)
+    replaced = merge(state, (authority=ConfiguredEnergy(1.0),))
+    @test typeof(replaced) === typeof(state)
+    @test_throws ArgumentError endpoint(replaced)
+    guarded = RK.validated_compiled_transition(identity, endpoint)
+    @test_throws ArgumentError guarded(replaced)
+    result = endpoint(state)
+    @test result.authority === authority
+    @test result.energy == 13
+    @test result.values === result.mirror
+    @test state.values == [1, 2]
+end
+
 @testset "retained loops preserve structured aliases and static authorities" begin
     endpoint = RK.compile_state_transition(
         loop_endpoint, increment_endpoint!, (energy, [1.0, 2.0]))
