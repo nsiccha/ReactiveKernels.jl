@@ -14,10 +14,12 @@ export LOCATION_SCALE_SOURCE
 export normal, cauchy, laplace, bernoulli, lognormal
 export exponential, geometric, uniform, mvnormal, ar1
 export poisson, gamma, beta, binomial
+export inverse_gamma, dirichlet
 export NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY
 export EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE
 export MVNORMAL_SOURCE, AR1_SOURCE
 export POISSON_SOURCE, GAMMA_SOURCE, BETA_SOURCE, BINOMIAL_SOURCE
+export INVERSE_GAMMA_SOURCE, DIRICHLET_SOURCE
 export all_sources, evaluate_source, run
 
 using Distributions
@@ -28,10 +30,12 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     BERNOULLI_SOURCE, LOGNORMAL_SOURCE,
     bernoulli, lognormal, exponential, geometric, uniform, mvnormal, ar1,
     poisson, gamma, beta, binomial,
+    inverse_gamma, dirichlet,
     NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY,
     EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE,
     MVNORMAL_SOURCE, AR1_SOURCE,
-    POISSON_SOURCE, GAMMA_SOURCE, BETA_SOURCE, BINOMIAL_SOURCE
+    POISSON_SOURCE, GAMMA_SOURCE, BETA_SOURCE, BINOMIAL_SOURCE,
+    INVERSE_GAMMA_SOURCE, DIRICHLET_SOURCE
 
 _allocated(f, a, b) = @allocated f(a, b)
 _allocated(f, a, b, c) = @allocated f(a, b, c)
@@ -260,6 +264,7 @@ all_sources() = (
     EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE,
     MVNORMAL_SOURCE, AR1_SOURCE,
     POISSON_SOURCE, GAMMA_SOURCE, BETA_SOURCE, BINOMIAL_SOURCE,
+    INVERSE_GAMMA_SOURCE, DIRICHLET_SOURCE,
 )
 
 function evaluate_source(source::AbstractString)
@@ -375,6 +380,17 @@ function evaluate_source(source::AbstractString)
             logpdf(Binomial(n, logistic(logit)), observed)
         reference = reference_call(inputs...)
         reference_allocated_bytes = _allocated(reference_call, observed, n, logit)
+    elseif artifact.name === :inverse_gamma_scale
+        x, shape, log_scale = inputs
+        reference_call = (x, shape, log_scale) ->
+            logpdf(InverseGamma(shape, exp(log_scale)), x)
+        reference = reference_call(inputs...)
+        reference_allocated_bytes = _allocated(reference_call, x, shape, log_scale)
+    elseif artifact.name === :dirichlet_simplex
+        x, alpha = inputs
+        reference_call = (x, alpha) -> logpdf(Dirichlet(alpha), x)
+        reference = reference_call(inputs...)
+        reference_allocated_bytes = _allocated(reference_call, x, alpha)
     elseif artifact.name === :stationary_ar1
         x, μ, ϕ, log_scale = inputs
         reference_call = function (x, μ, ϕ, log_scale)
