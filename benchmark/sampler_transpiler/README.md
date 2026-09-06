@@ -78,6 +78,11 @@ ranges remain outside this backend's support. The batch driver also uses a
 traced loop. The optional `unroll_limit` compiler keyword permits bounded loop
 expansion for ablation; the default retains every nonempty loop.
 
+Repeated uses of a fixed authority share one metadata entry, using identity
+to preserve distinct mutable objects. Cache flags proved constant at every
+transition entry and exit stay out of the traced state interface. Temporarily
+varying values inside control flow still follow the ordinary liveness analysis.
+
 This command interleaves synchronized Reactant execution with AdvancedHMC.
 Every sample constructs fresh device inputs outside timing. The batch takes
 private working copies once at entry and returns the final chain-phasepoint
@@ -118,6 +123,27 @@ The same receipt includes a fresh sixteen-step run: Reactant takes 5.19–5.86 m
 per 1,000 transitions versus AdvancedHMC's strongest 7.49 ms. All batches
 execute 16,000 steps. Compilation takes 41.8 seconds and the IR grows by one
 byte, to 38,561 bytes.
+
+`compilation-profile-v1.toml` records the subsequent representation cleanup
+and compilation-cost investigation. Fixed metadata shrinks from 32 entries to
+9, and 16 proved cache flags leave the traced state interface. Compilation
+still takes about 40 seconds. Its allocations fall from about 3.95 to 3.79 GB,
+and synchronized execution allocates 2,160 host bytes per batch instead of
+2,608. These measurements do not establish a compilation-time speedup.
+
+CPU sampling of the preceding checkpoint points mainly to Julia compiling
+and running the tracing functions; XLA compilation accounts for a smaller
+share. Sample counts overlap along call stacks and are not stage wall times.
+The reusable attribution driver is:
+
+```sh
+julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/profile_compile.jl /tmp/sampler-compile-profile
+```
+
+It writes a serialized profile and text views after compilation, then checks
+the actual integration count and preservation of caller inputs. Profiling
+substantially slows JIT compilation: use the ordinary `reactant-slots` command
+for elapsed-time measurements. No backend optimization settings are changed.
 
 All modes use centered Eight Schools, ten Float64 parameters, a unit diagonal
 metric, and step size 0.03. Four leapfrog steps are the default. This is endpoint-Metropolis HMC;

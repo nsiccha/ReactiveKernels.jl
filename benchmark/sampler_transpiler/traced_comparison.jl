@@ -28,7 +28,9 @@ function run_traced_comparison(prototype; n=1000, compiler_options=NamedTuple(),
     program=measured("lower_traced_slots") do
         compile_traced_slots(prototype.prepared.program;compiler_options...)
     end
-    println("proven_currentness_facts=",length(program.entry_facts))
+    println("proven_currentness_facts=",length(program.entry_facts),
+        " runtime_currentness_flags=",length(program.state.current),
+        " metadata_entries=",length(program.metadata.values))
     # This experimental backend emits ordinary Julia functions containing
     # branch closures. Cross their construction world once, outside timing.
     prefix=Symbol(prototype.prepared.program.contexts[2].prefix,:_owned)

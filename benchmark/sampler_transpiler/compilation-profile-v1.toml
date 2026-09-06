@@ -1,0 +1,165 @@
+"schema_version" = 1
+"status" = "experimental_tracing_representation_cleanup"
+"parent_commit" = "2d7c164799fed3f92a927f75eaa53155646fb04d"
+"host" = "strato2"
+"julia" = "1.10.11"
+"reactant" = "0.2.284"
+"enzyme" = "0.13.199"
+"ahmc" = "0.8.6"
+"model" = "centered_eight_schools"
+"dimensions" = 10
+"stepsize" = 0.03
+"metric" = "unit_diagonal"
+"transitions_per_batch" = 1000
+"note" = "Fresh processes in the ordinary shared depot. Endpoint-Metropolis HMC from the same captured mathematical source. No changes to numerical arithmetic, source control, or backend optimization options. Compilation remains around40s; allocations and state representation are smaller. This is not a compilation-time speedup claim. No native compiler changes or new native timing. All AHMC samples, including slow/GC-affected samples, are retained."
+
+["profile"]
+"source_commit" = "2d7c164799fed3f92a927f75eaa53155646fb04d"
+"exit_code" = 0
+"process_elapsed_seconds" = 215
+"instrumented_compile_seconds" = 96.946327651
+"instrumented_compile_allocated_bytes" = 3824207316
+"sampling_delay_seconds" = 0.005
+"total_snapshots" = 9306
+"make_mlir_fn_snapshots" = 7319
+"julia_jit_snapshots" = 5524
+"julia_type_inference_snapshots" = 3064
+"xla_compile_callsite_snapshots" = 225
+"xla_compile_options_callsite_snapshots" = 516
+"integration_steps" = 4000
+"mlir_bytes" = 38560
+"caller_inputs_preserved" = true
+"interpretation" = "Stack counts overlap. Most samples are in host tracing/JIT; few are under XLA.compile. Sampling adds substantial JIT overhead; its elapsed time is attribution-only, not a baseline."
+"driver_source" = "include(\"/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-sampling/benchmark/sampler_transpiler/hmc_eight_schools.jl\")\nusing Profile, Serialization\nconst PROFILE_DIR=\"/home/n/scratch/kb-agent-tmp/ReactiveKernels-sampling\"\nfunction profile_sampler_compile(program,projection)\n    call=TracedSlotCall(program.f,program.metadata)\n    driver=(state,seed,counts)->traced_owned_batch(call,projection,state,seed,counts,1000)\n    inputs=traced_slot_inputs(program.state)\n    Profile.init(n=10_000_000,delay=0.005)\n    Profile.clear()\n    compiled=measured(\"profiled_compile\") do\n        Profile.@profile Reactant.compile(driver,inputs;sync=true,donated_args=:none,serializable=true)\n    end\n    data,lidict=Profile.retrieve()\n    serialize(joinpath(PROFILE_DIR,\"sampler_compile.profile\"),(data,lidict))\n    open(joinpath(PROFILE_DIR,\"sampler_compile.flat.txt\"),\"w\") do io\n        Profile.print(io,data,lidict;format=:flat,sortedby=:count,mincount=20,C=true)\n    end\n    open(joinpath(PROFILE_DIR,\"sampler_compile.tree.txt\"),\"w\") do io\n        Profile.print(io,data,lidict;format=:tree,maxdepth=28,mincount=30,C=true)\n    end\n    println(\"profile_entries=\",length(data))\n    result=compiled(inputs...)\n    println(\"integration_steps=\",Int(result.counts[1]),\" mlir_bytes=\",sizeof(compiled.module_string))\n    Int(result.counts[1])==4000 || error(\"unexpected profile workload\")\n    check_traced_inputs_unchanged(inputs,program.state)\nend\nconst PROTOTYPE=build_fast_prototype(compiler_options=(peel_loops=true,))\nreset_native_slots!(PROTOTYPE.prepared)\nconst PROGRAM=compile_traced_slots(PROTOTYPE.prepared.program)\nconst PREFIX=Symbol(PROTOTYPE.prepared.program.contexts[2].prefix,:_owned)\nconst INDICES=Tuple(i for (i,pair) in enumerate(PROGRAM.ordered) if first(first(pair))===PREFIX)\nBase.invokelatest(profile_sampler_compile,PROGRAM,SlotStatic(INDICES))\n"
+
+["metadata_only_ablation"]
+"generated_seconds" = [0.00215471, 0.00218322, 0.002164535, 0.002082001, 0.002124279, 0.002036908, 0.002106754]
+"generated_allocated_bytes" = [2400, 2400, 2400, 2400, 2400, 2400, 2400]
+"ahmc_seconds" = [0.002358453, 0.029375432, 0.002579486, 0.002332237, 0.002181208, 0.003092333, 0.005160695]
+"ahmc_allocated_bytes" = [7200000, 7203632, 7200000, 7200000, 7200000, 7200000, 7200000]
+"integration_steps" = [4000, 4000, 4000, 4000, 4000, 4000, 4000]
+"source_commit" = "2d7c164799fed3f92a927f75eaa53155646fb04d"
+"exit_code" = 0
+"process_elapsed_seconds" = 107
+"original_metadata_entries" = 32
+"deduplicated_metadata_entries" = 9
+"original_metadata_bytes" = 280
+"deduplicated_metadata_bytes" = 72
+"mlir_bytes" = 38560
+"caller_inputs_preserved" = true
+"driver_source" = "include(\"/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-sampling/benchmark/sampler_transpiler/hmc_eight_schools.jl\")\n\nfunction dedup_metadata(program)\n    values=Any[]\n    indices=map(program.metadata.values) do value\n        index=findfirst(v->v===value,values)\n        if index===nothing\n            push!(values,value)\n            index=length(values)\n        end\n        index\n    end\n    function rewrite(x)\n        x isa Expr || return x\n        if x.head===:call && x.args[1]===:getfield &&\n            x.args[2]==:(metadata.values) && x.args[3] isa Int\n            return :(getfield(metadata.values,$(indices[x.args[3]])))\n        end\n        Expr(x.head,(rewrite(a) for a in x.args)...)\n    end\n    expression=rewrite(program.expression)\n    println(\"metadata_entries=\",length(indices),\" unique=\",length(values),\n        \" original_bytes=\",sizeof(program.metadata),\n        \" unique_bytes=\",sizeof(SlotStatic(Tuple(values))))\n    merge(program,(;f=Core.eval(@__MODULE__,expression),expression,\n        metadata=SlotStatic(Tuple(values))))\nend\n\nconst PROTOTYPE=build_fast_prototype(compiler_options=(peel_loops=true,))\nreset_native_slots!(PROTOTYPE.prepared)\nconst PROGRAM=dedup_metadata(compile_traced_slots(PROTOTYPE.prepared.program))\nconst PREFIX=Symbol(PROTOTYPE.prepared.program.contexts[2].prefix,:_owned)\nconst INDICES=Tuple(i for (i,pair) in enumerate(PROGRAM.ordered) if first(first(pair))===PREFIX)\nBase.invokelatest(run_traced_prepared,PROGRAM,PROTOTYPE.comparator,1000,PROTOTYPE.L,SlotStatic(INDICES))\n"
+
+["metadata_only_ablation"."stages"]
+"prepare_model_seconds" = 4.195434539
+"prepare_model_bytes" = 233108784
+"prepare_native_endpoint_seconds" = 7.363426272
+"prepare_native_endpoint_bytes" = 859928008
+"prepare_native_factory_seconds" = 4.930902791
+"prepare_native_factory_bytes" = 431685408
+"lower_fast_native_seconds" = 4.299690656
+"lower_fast_native_bytes" = 333109040
+"compile_traced_slots_seconds" = 41.159883014
+"compile_traced_slots_bytes" = 3833854951
+"traced_slots_first_chain_seconds" = 0.281457789
+"traced_slots_first_chain_bytes" = 43195448
+
+["reactant_4"]
+"generated_seconds" = [0.00229909, 0.002011163, 0.001906508, 0.001869889, 0.00193708, 0.002116899, 0.002029808]
+"generated_allocated_bytes" = [2160, 2160, 2160, 2160, 2160, 2160, 2160]
+"ahmc_seconds" = [0.002840296, 0.002239208, 0.0021687, 0.003037768, 0.004958147, 0.004757318, 0.004838171]
+"ahmc_allocated_bytes" = [7200000, 7200000, 7200000, 7200000, 7200000, 7200000, 7200000]
+"integration_steps" = [4000, 4000, 4000, 4000, 4000, 4000, 4000]
+"exit_code" = 0
+"command" = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/hmc_eight_schools.jl reactant-slots 1000 4"
+"leapfrog_steps" = 4
+"mlir_bytes" = 38032
+"while_regions" = 2
+"if_regions" = 3
+"proven_currentness_facts" = 16
+"caller_inputs_preserved" = true
+"process_elapsed_seconds" = 112
+"executed_source_note" = "Preceded a comment-only backend edit and addition of metadata-count printing in the comparison driver; hashes below identify those executed versions."
+
+["reactant_4"."stages"]
+"prepare_model_seconds" = 4.279839516
+"prepare_model_bytes" = 233181264
+"prepare_native_endpoint_seconds" = 7.80324744
+"prepare_native_endpoint_bytes" = 851142056
+"prepare_native_factory_seconds" = 5.167903413
+"prepare_native_factory_bytes" = 423279144
+"lower_fast_native_seconds" = 4.11459477
+"lower_fast_native_bytes" = 304834968
+"lower_traced_slots_seconds" = 2.304488898
+"lower_traced_slots_bytes" = 288567720
+"compile_traced_slots_seconds" = 39.932541788
+"compile_traced_slots_bytes" = 3793899643
+"traced_slots_first_chain_seconds" = 0.284199589
+"traced_slots_first_chain_bytes" = 37150984
+
+["reactant_4"."source_sha256"]
+"benchmark/sampler_transpiler/traced_slots.jl" = "2e41d7fdc4b1937100bd3b19341b38842dd09516d861f6cad499bc0199baeccb"
+"benchmark/sampler_transpiler/traced_comparison.jl" = "cea2c52e289d0a938d32e771370d5ec072012438d9b2e0ab016243ad8760885e"
+
+["reactant_16"]
+"generated_seconds" = [0.006226756, 0.005152023, 0.006200019, 0.005280832, 0.006049861, 0.005868522, 0.005567706]
+"generated_allocated_bytes" = [2160, 2160, 2160, 2160, 2160, 2160, 2160]
+"ahmc_seconds" = [0.010304056, 0.018450158, 0.038979754, 0.008065, 0.018076393, 0.021740595, 0.007715177]
+"ahmc_allocated_bytes" = [26208000, 26208000, 26211632, 26208000, 26208000, 26208000, 26208000]
+"integration_steps" = [16000, 16000, 16000, 16000, 16000, 16000, 16000]
+"exit_code" = 0
+"command" = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/hmc_eight_schools.jl reactant-slots 1000 16"
+"leapfrog_steps" = 16
+"mlir_bytes" = 38033
+"while_regions" = 2
+"if_regions" = 3
+"proven_currentness_facts" = 16
+"caller_inputs_preserved" = true
+"process_elapsed_seconds" = 110
+"runtime_currentness_flags" = 0
+"metadata_entries" = 9
+
+["reactant_16"."stages"]
+"prepare_model_seconds" = 4.097385732
+"prepare_model_bytes" = 233176336
+"prepare_native_endpoint_seconds" = 7.255240836
+"prepare_native_endpoint_bytes" = 850517144
+"prepare_native_factory_seconds" = 5.234167217
+"prepare_native_factory_bytes" = 423551144
+"lower_fast_native_seconds" = 4.04372804
+"lower_fast_native_bytes" = 304850712
+"lower_traced_slots_seconds" = 2.051616423
+"lower_traced_slots_bytes" = 288568392
+"compile_traced_slots_seconds" = 39.165217157
+"compile_traced_slots_bytes" = 3793785595
+"traced_slots_first_chain_seconds" = 0.294046015
+"traced_slots_first_chain_bytes" = 37150984
+
+["control_probe"]
+"exit_code" = 0
+"process_elapsed_seconds" = 120
+"command" = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/loop_control_probe.jl"
+"transitions_per_case" = 3
+"zero_trip_native_steps" = 0
+"zero_trip_traced_steps" = 0
+"forced_divergence_native_steps" = 3
+"forced_divergence_traced_steps" = 3
+"positions_unchanged_independently" = true
+"traced_caller_inputs_preserved" = true
+"zero_trip_compile_seconds" = 21.395232946
+"forced_divergence_compile_seconds" = 23.876508585
+"backend_source_sha256" = "2e41d7fdc4b1937100bd3b19341b38842dd09516d861f6cad499bc0199baeccb"
+
+["source_sha256"]
+"src/ad.jl" = "37c8258f5ffa67fbab9b4240fb972858c3e05a01f1d99b73fd3a1790afd4b568"
+"ext/ReactiveKernelsReactantExt.jl" = "984f0492928a98cb7b65b1b31a550e5b5356893795156f02b405e2e9809e022c"
+"src/kernel_adaptation.jl" = "d655baa036d4e5770b769ab644b8c56ca0567c167d3643011352131e9928a5c4"
+"benchmark/reactivehmc_hmc_kernel_fixture_b.jl" = "9ffa4e8e2990992cd92303e55a6d005cff2c6e1698de6bca7941ad2907f8a4da"
+"benchmark/nuts_kernel_authoring_fixture_b.jl" = "7a9a9d6e1fa122e3d846def760933b0ba14e62e567d92cffab9d9d638f9404f4"
+"benchmark/sampler_transpiler/hmc_eight_schools.jl" = "c18b800fc013d8007d1d1b23d7c7330b89304bc8ff92767562b26a788d2d5996"
+"benchmark/sampler_transpiler/native_slots.jl" = "fc40ad0588ee075d32a10d8191168afee81efd52b8b658c602791a21b4b0ef7b"
+"benchmark/sampler_transpiler/native_slots_factory.jl" = "25cb2567c2a932d6a7418584dff9d00032e917ab0365350dfb908d67d1206a17"
+"benchmark/sampler_transpiler/native_comparison.jl" = "5e2612234a93c4d126a7c9550520ba468b266c790709e1602a1b1dccae183598"
+"benchmark/sampler_transpiler/traced_slots.jl" = "005da5c6a803b0a2e21d044c37ccfb5a4d09b8768117bef9c0de33be097b680a"
+"benchmark/sampler_transpiler/traced_comparison.jl" = "ff891cd14f9ae1933a3b3813246b1d242b056b3b8c271425c3545e1bb78732c0"
+"benchmark/sampler_transpiler/loop_control_probe.jl" = "45bc979f7bdfbbc91918f4aa3300f794d7b263dd788b4707b7e621e4b1970881"
+"benchmark/sampler_transpiler/profile_compile.jl" = "ba92a50afae1fdd86667fc00f16197a0479214e714eb2237e10b2cdf7332dbc8"

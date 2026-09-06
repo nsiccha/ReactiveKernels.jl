@@ -31,8 +31,14 @@ function compile_traced_slots(program; static_currentness=true, unroll_limit=0)
     fresh_index = Ref(0)
     fresh(label) = Symbol(:_ts_,label,:_,fresh_index[]+=1)
     function fixed(value)
-        push!(statics,value)
-        :(getfield(metadata.values,$(length(statics))))
+        # Repeated uses share the same fixed authority. Keep distinct mutable
+        # objects distinct; equality of their current contents is insufficient.
+        i=findfirst(v->v===value,statics)
+        if i===nothing
+            push!(statics,value)
+            i=length(statics)
+        end
+        :(getfield(metadata.values,$i))
     end
     function slot(object,index)
         haskey(sharedmap,object) && return fixed(RK._canon_slot(sharedmap[object],Val(index)))
@@ -305,8 +311,9 @@ function compile_traced_slots(program; static_currentness=true, unroll_limit=0)
     # Backward liveness keeps branch-local temporaries out of the control ABI.
     # Inputs/outputs are explicit tuples; mutable numerical arguments retain
     # their identities through Reactant's ordinary branch mutation handling.
+    runtime_validity=Dict(k=>v for (k,v) in validity if !haskey(entry_facts,v))
     persistent=Set{Symbol}([collect(Base.values(slots))...,
-        collect(Base.values(validity))...,:_ts_counter_1,:_ts_counter_2,live])
+        collect(Base.values(runtime_validity))...,:_ts_counter_1,:_ts_counter_2,live])
     variables=union(persistent,Set([:argument,:metadata]))
     function assignments(x)
         found=Set{Symbol}()
@@ -395,10 +402,13 @@ function compile_traced_slots(program; static_currentness=true, unroll_limit=0)
         x,union(live_after,references(x))
     end
     ordered=sort!(collect(slots);by=p->string(first(p)))
-    valid_ordered=sort!(collect(validity);by=p->string(first(p)))
+    # Construction and every transition exit agree on these removed flags.
+    # They need no traced input or persistent transition output. Inner control
+    # still derives any temporarily varying values through ordinary liveness.
+    valid_ordered=sort!(collect(runtime_validity);by=p->string(first(p)))
     setup=Any[:($(last(p))=getfield(state.values,$i)) for (i,p) in enumerate(ordered)]
-    append!(setup,[:($(last(p))=$(get(entry_facts,last(p),:(getfield(state.current,$i)))))
-        for (i,p) in enumerate(valid_ordered)])
+    append!(setup,[:($name=$known) for (name,known) in sort!(collect(entry_facts);by=first)])
+    append!(setup,[:($(last(p))=getfield(state.current,$i)) for (i,p) in enumerate(valid_ordered)])
     values=Tuple(RK._canon_slot(contextmap[obj].owned,Val(i)) for ((obj,i),_) in ordered)
     masks=Tuple(RK._canon_current(contextmap[obj].owned,Val(i)) for ((obj,i),_) in valid_ordered)
     result=:( (values=$(Expr(:tuple,last.(ordered)...)),current=$(Expr(:tuple,last.(valid_ordered)...))) )
