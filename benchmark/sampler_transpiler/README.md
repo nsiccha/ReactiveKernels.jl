@@ -66,6 +66,10 @@ turns numerical slots into local variables, derives explicit branch inputs and
 outputs by backward liveness, and proves cache-validity facts across construction
 and every possible transition exit. Only proven facts replace runtime checks.
 Prepared gradient calls stage AD inside the enclosing Reactant compilation.
+For this backend, the native emitter's `peel_loops=true` option emits the first
+iteration separately, in source order. The remaining loop inherits established
+cache facts. This adds at most one body, independent of the trip count. Native
+execution keeps this option off because its measurements did not improve.
 Fixed compiler metadata stays outside the numerical state. Preparation-fixed
 integer ranges retain one traced loop body, with explicit live values carried
 between iterations and an authored early return terminating the loop. Cache
@@ -75,15 +79,20 @@ traced loop. The optional `unroll_limit` compiler keyword permits bounded loop
 expansion for ablation; the default retains every nonempty loop.
 
 This command interleaves synchronized Reactant execution with AdvancedHMC.
-Every sample constructs fresh device inputs outside timing, because this
-generated program mutates its owned buffers. The state ABI is private: callers
-must preserve its cached values and compiler-proven currentness contract.
+Every sample constructs fresh device inputs outside timing. The batch takes
+private working copies once at entry and returns the final chain-phasepoint
+fields, RNG seed, and counts. This keeps scratch mutations inside the compiled
+batch and preserves its input state. Copies are outside the transition loop.
+The underlying state ABI is private: callers must preserve its cached values
+and compiler-proven currentness contract. `phasepoint_output=false` on
+`run_traced_comparison` retains the earlier full-state mutation interface for
+ablation.
 
 `reactant-slots-v1.toml` records the fresh-process checkpoint: 41.9 seconds
 of Reactant compilation and 2.43–2.84 ms per 1,000 transitions, with every batch
 executing 4,000 leapfrog steps. AdvancedHMC's strongest batch in that run takes
 2.13 ms. This establishes working execution of the simplified program; a clear
-Reactant throughput win remains open. The receipt separates model preparation,
+Reactant throughput win was still open at that checkpoint. The receipt separates model preparation,
 native preparation, backend lowering, compilation, and first execution.
 
 `reactant-slots-v2.toml` records retained-loop runs in two fresh processes.
@@ -93,16 +102,33 @@ transitions, and sixteen-step batches take 6.94–9.46 ms. Every batch executes
 the requested number of integrator calls. AdvancedHMC's strongest samples are
 2.05 and 7.31 ms, respectively. This removes the previous small-loop limit
 without code growth proportional to the trip count; a clear Reactant
-throughput win remains open.
+throughput win was still open at that checkpoint.
+
+`reactant-slots-v3.toml` records the first local throughput checkpoint in both
+backends. Native batches take 1.46–1.55 ms per 1,000 transitions (median 1.52 ms),
+and Reactant batches take 1.84–2.07 ms (median 1.92 ms). The strongest AdvancedHMC
+batches in the respective fresh processes take 2.00 and 2.04 ms. Reactant is
+faster in each of its seven paired samples; its margin is modest. Its compile
+stage remains 40.2 seconds. Each batch executes 4,000 actual integration steps.
+The updated zero-trip, divergence-return, and caller-input preservation probes
+pass. This remains an experimental compiler checkpoint, without adaptation or
+public sampler integration.
+
+The same receipt includes a fresh sixteen-step run: Reactant takes 5.19–5.86 ms
+per 1,000 transitions versus AdvancedHMC's strongest 7.49 ms. All batches
+execute 16,000 steps. Compilation takes 41.8 seconds and the IR grows by one
+byte, to 38,561 bytes.
 
 All modes use centered Eight Schools, ten Float64 parameters, a unit diagonal
 metric, and step size 0.03. Four leapfrog steps are the default. This is endpoint-Metropolis HMC;
 multinomial HMC and NUTS remain subsequent work.
 
 `loop_control_probe.jl` checks the same authored HMC source with zero steps and
-with a divergence threshold that forces its early return. Each backend must
+with a divergence threshold that forces its early return. It exercises the
+peeled loop and the batch's private state. Each backend must
 execute the expected number of integrator calls and leave the initial position
-unchanged. These are source-control invariants, without comparing random
+unchanged. The traced batch must also preserve its caller inputs. These are
+source-control invariants, without comparing random
 trajectories or floating-point computations between implementations.
 
 `compare` interleaves the new native program with AdvancedHMC using the same
@@ -131,6 +157,8 @@ These are execution probes without adaptation or ESS measurement. They do not
 establish tuned sampling performance.
 
 The first milestone is higher HMC throughput than AdvancedHMC in both backends.
+The third receipt reaches this local execution checkpoint; reducing preparation
+and compilation cost and integrating the generic lowering remain work.
 The `ahmc` mode uses AdvancedHMC 0.8.6 endpoint HMC with the same bound RK density,
 prepared gradient, initial position, metric, step size, and leapfrog count.
 Initialization is outside its warm timing. Compilation is reported separately.

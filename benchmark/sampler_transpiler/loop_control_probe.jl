@@ -4,7 +4,8 @@ include(joinpath(@__DIR__,"hmc_eight_schools.jl"))
 
 function check_traced_loop_control(program,position_slot,expected_steps,n)
     call=TracedSlotCall(program.f,program.metadata)
-    driver=(state,seed,counts)->traced_slot_batch(call,state,seed,counts,n)
+    projection=SlotStatic((position_slot,))
+    driver=(state,seed,counts)->traced_owned_batch(call,projection,state,seed,counts,n)
     initial=copy(getfield(program.state.values,position_slot))
     inputs=traced_slot_inputs(program.state)
     compiled=measured("compile_control_probe") do
@@ -12,8 +13,9 @@ function check_traced_loop_control(program,position_slot,expected_steps,n)
     end
     result=compiled(inputs...)
     Int(result.counts[1])==expected_steps || error("incorrect traced loop trip count")
-    Array(getfield(result.state.values,position_slot))==initial ||
+    Array(only(result.values))==initial ||
         error("source control should leave the initial position unchanged")
+    check_traced_inputs_unchanged(inputs,program.state)
     println("traced_control_steps=",Int(result.counts[1]))
 end
 
@@ -38,8 +40,10 @@ end
 function run_loop_control_probes()
     # A zero-trip loop must not execute the integrator. An unreachable energy
     # threshold makes the authored divergence return fire after its first step.
-    check_loop_control(build_fast_prototype(L=0),0)
-    check_loop_control(build_fast_prototype(L=16,source_options=(min_dham=Inf,)),3)
+    options=(peel_loops=true,)
+    check_loop_control(build_fast_prototype(L=0,compiler_options=options),0)
+    check_loop_control(build_fast_prototype(L=16,compiler_options=options,
+        source_options=(min_dham=Inf,)),3)
 end
 
 if abspath(PROGRAM_FILE)==@__FILE__

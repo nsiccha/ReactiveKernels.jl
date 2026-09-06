@@ -113,7 +113,7 @@ function coalesced_slot_transfer(body,start,context,mainctx,children,borrowed)
 end
 
 function compile_native_slots(kernel, state, name; endpoints, effects, hoist=true,
-        bufferize=true, coalesce_transfers=true, count_gradients=false)
+        bufferize=true, coalesce_transfers=true, count_gradients=false, peel_loops=false)
     pf = getfield(kernel,:prepared)
     skel = getfield(kernel,:skeleton)
     irs = RK.method_irs(skel)
@@ -301,8 +301,22 @@ function compile_native_slots(kernel, state, name; endpoints, effects, hoist=tru
             elseif s isa RK._For
                 var = fresh(only(s.var))
                 nested = copy(locals); nested[only(s.var)] = var
-                push!(out,Expr(:for,Expr(:(=),var,rhs(s.iter,context,locals,formals)),
-                    emit(s.body,context,nested,formals)))
+                fixed,iterator = peel_loops ? static_value(s.iter,context) : (false,nothing)
+                if fixed && iterator isa AbstractRange{<:Integer} && length(iterator)>1
+                    # Execute the first source iteration in place. Subsequent
+                    # iterations can then inherit its established cache facts.
+                    # This preserves effect/return order and adds at most one
+                    # body, independent of the preparation-fixed trip count.
+                    push!(out,:($var=$(first(iterator))))
+                    push!(out,emit(s.body,context,copy(nested),formals))
+                    push!(constants,iterator[2:end])
+                    rest=:(getfield(constant_values,$(length(constants))))
+                    push!(out,Expr(:for,Expr(:(=),var,rest),
+                        emit(s.body,context,nested,formals)))
+                else
+                    push!(out,Expr(:for,Expr(:(=),var,rhs(s.iter,context,locals,formals)),
+                        emit(s.body,context,nested,formals)))
+                end
             elseif s isa RK._If
                 push!(out,Expr(:if,rhs(s.cond,context,locals,formals),
                     emit(s.thenb,context,copy(locals),formals),

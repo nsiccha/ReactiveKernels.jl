@@ -1,0 +1,150 @@
+schema_version = 1
+status = "experimental_native_and_reactant_throughput_checkpoint"
+parent_commit = "e81ee939ecf7f10845bc1160ff9306cebcc1902e"
+host = "strato2"
+julia = "1.10.11"
+reactant_version = "0.2.284"
+enzyme = "0.13.199"
+ahmc = "0.8.6"
+model = "centered_eight_schools"
+dimensions = 10
+metric = "unit_diagonal"
+stepsize = 0.03
+leapfrog_steps = 4
+transitions_per_batch = 1000
+integration_steps_per_batch = 4000
+note = "Separate fresh Julia processes. Captured endpoint-Metropolis HMC and leapfrog source, same RK model/gradient and callback handles for AdvancedHMC. Native keeps its fastest unpeeled program; Reactant consumes the native emitter with generic first-iteration peeling and owns working state once per batch. Reactant returns the final chain phasepoint, RNG seed and counts, preserving caller inputs. All seven samples, including slower AHMC samples, are retained. This is a local throughput checkpoint; the Reactant margin is modest and compilation remains about40s. No adaptation, ESS, or numerical-agreement release gate."
+
+[reactant]
+exit_code = 0
+process_elapsed_seconds = 110
+command = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/hmc_eight_schools.jl reactant-slots 1000 4"
+peel_loops = true
+caller_inputs_preserved = true
+mlir_bytes = 38560
+while_regions = 2
+if_regions = 3
+proven_currentness_facts = 16
+
+[reactant.generated]
+batch_seconds = [0.001996323, 0.002070245, 0.00191513, 0.001866093, 0.001845094, 0.001843631, 0.00192251]
+batch_allocated_bytes = [2608, 2608, 2608, 2608, 2608, 2608, 2608]
+
+[reactant.ahmc]
+batch_seconds = [0.035573347, 0.002084735, 0.002071477, 0.002042026, 0.002655182, 0.004902399, 0.004938619]
+batch_allocated_bytes = [7203632, 7200000, 7200000, 7200000, 7200000, 7200000, 7200000]
+
+[reactant.stages]
+prepare_model_seconds = 3.964539996
+prepare_model_bytes = 233162352
+prepare_native_endpoint_seconds = 6.878000891
+prepare_native_endpoint_bytes = 851116560
+prepare_native_factory_seconds = 5.076519005
+prepare_native_factory_bytes = 423287448
+lower_fast_native_seconds = 3.938539156
+lower_fast_native_bytes = 305227944
+lower_traced_slots_seconds = 1.847236891
+lower_traced_slots_bytes = 276273896
+compile_traced_slots_seconds = 40.189747195
+compile_traced_slots_bytes = 3948834831
+traced_slots_first_chain_seconds = 0.305213804
+traced_slots_first_chain_bytes = 43227912
+
+[native]
+exit_code = 0
+process_elapsed_seconds = 64
+peel_loops = false
+initial_positions_share_storage = false
+equivalent_cli_command = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/hmc_eight_schools.jl compare 1000 4"
+driver_source = "include(\"/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-sampling/benchmark/sampler_transpiler/hmc_eight_schools.jl\")\nconst PROTOTYPE=build_fast_prototype()\nprintln(\"initial_position_alias=\",Base.mightalias(native_position(PROTOTYPE.prepared.program),PROTOTYPE.comparator.initial.\u03b8))\nBase.mightalias(native_position(PROTOTYPE.prepared.program),PROTOTYPE.comparator.initial.\u03b8) && error(\"benchmark initial positions share writable storage\")\nrun_prepared_comparison(PROTOTYPE.prepared,PROTOTYPE.comparator,4,1000)\n"
+
+[native.generated]
+batch_seconds = [0.001522889, 0.001520987, 0.001465551, 0.001495522, 0.001549206, 0.001523872, 0.001460224]
+batch_allocated_bytes = [752, 752, 752, 752, 752, 752, 752]
+
+[native.ahmc]
+batch_seconds = [0.009729074, 0.002013275, 0.002013887, 0.002212229, 0.011262738, 0.002004925, 0.002061873]
+batch_allocated_bytes = [7207472, 7200224, 7200224, 7200224, 7200224, 7200224, 7200224]
+
+[native.stages]
+prepare_model_seconds = 3.910210798
+prepare_model_bytes = 233112512
+prepare_native_endpoint_seconds = 7.458895768
+prepare_native_endpoint_bytes = 859921336
+prepare_native_factory_seconds = 5.12913394
+prepare_native_factory_bytes = 431683584
+lower_fast_native_seconds = 4.054652031
+lower_fast_native_bytes = 331869136
+native_slots_first_chain_seconds = 0.912860007
+native_slots_first_chain_bytes = 42911296
+ahmc_first_chain_seconds = 4.2018e-05
+ahmc_first_chain_bytes = 16336
+
+[control_probe]
+command = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/loop_control_probe.jl"
+exit_code = 0
+process_elapsed_seconds = 119
+peel_loops = true
+transitions_per_case = 3
+zero_trip_native_steps = 0
+zero_trip_traced_steps = 0
+forced_divergence_native_steps = 3
+forced_divergence_traced_steps = 3
+position_unchanged_in_each_backend = true
+traced_caller_inputs_preserved = true
+
+[long_chain_diagnostic]
+transitions = 10000
+integration_steps = 39989
+note = "A warm exploratory run exercised authored early returns. Its full-trajectory comparison guard rejected this as unequal work to40000steps; no AHMC/native10k timing followed. This is not a sampler implementation failure or a numerical-agreement check."
+
+[source_sha256]
+"src/ad.jl" = "37c8258f5ffa67fbab9b4240fb972858c3e05a01f1d99b73fd3a1790afd4b568"
+"ext/ReactiveKernelsReactantExt.jl" = "984f0492928a98cb7b65b1b31a550e5b5356893795156f02b405e2e9809e022c"
+"src/kernel_adaptation.jl" = "d655baa036d4e5770b769ab644b8c56ca0567c167d3643011352131e9928a5c4"
+"benchmark/reactivehmc_hmc_kernel_fixture_b.jl" = "9ffa4e8e2990992cd92303e55a6d005cff2c6e1698de6bca7941ad2907f8a4da"
+"benchmark/nuts_kernel_authoring_fixture_b.jl" = "7a9a9d6e1fa122e3d846def760933b0ba14e62e567d92cffab9d9d638f9404f4"
+"benchmark/sampler_transpiler/hmc_eight_schools.jl" = "c18b800fc013d8007d1d1b23d7c7330b89304bc8ff92767562b26a788d2d5996"
+"benchmark/sampler_transpiler/native_slots.jl" = "fc40ad0588ee075d32a10d8191168afee81efd52b8b658c602791a21b4b0ef7b"
+"benchmark/sampler_transpiler/native_slots_factory.jl" = "25cb2567c2a932d6a7418584dff9d00032e917ab0365350dfb908d67d1206a17"
+"benchmark/sampler_transpiler/native_comparison.jl" = "5e2612234a93c4d126a7c9550520ba468b266c790709e1602a1b1dccae183598"
+"benchmark/sampler_transpiler/traced_slots.jl" = "8652e8ced1251644526f1a50e0025e5e02ebe8ef3b36e6794f8db1d3e98e0f73"
+"benchmark/sampler_transpiler/traced_comparison.jl" = "cea2c52e289d0a938d32e771370d5ec072012438d9b2e0ab016243ad8760885e"
+"benchmark/sampler_transpiler/loop_control_probe.jl" = "45bc979f7bdfbbc91918f4aa3300f794d7b263dd788b4707b7e621e4b1970881"
+
+[reactant_sixteen]
+command = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/hmc_eight_schools.jl reactant-slots 1000 16"
+exit_code = 0
+process_elapsed_seconds = 113
+leapfrog_steps = 16
+integration_steps_per_batch = 16000
+peel_loops = true
+caller_inputs_preserved = true
+mlir_bytes = 38561
+while_regions = 2
+if_regions = 3
+proven_currentness_facts = 16
+
+[reactant_sixteen.generated]
+batch_seconds = [0.005509116, 0.005527311, 0.005326375, 0.005857936, 0.005356486, 0.00519275, 0.0053167]
+batch_allocated_bytes = [2608, 2608, 2608, 2608, 2608, 2608, 2608]
+
+[reactant_sixteen.ahmc]
+batch_seconds = [0.00767294, 0.010114165, 0.01816842, 0.046798966, 0.007492461, 0.016723758, 0.017637028]
+batch_allocated_bytes = [26208000, 26208000, 26208000, 26211632, 26208000, 26208000, 26208000]
+
+[reactant_sixteen.stages]
+prepare_model_seconds = 3.935102843
+prepare_model_bytes = 233179232
+prepare_native_endpoint_seconds = 7.064691445
+prepare_native_endpoint_bytes = 851065560
+prepare_native_factory_seconds = 5.179087482
+prepare_native_factory_bytes = 423269720
+lower_fast_native_seconds = 4.163697687
+lower_fast_native_bytes = 305210488
+lower_traced_slots_seconds = 1.877066903
+lower_traced_slots_bytes = 276274776
+compile_traced_slots_seconds = 41.829673663
+compile_traced_slots_bytes = 3948933887
+traced_slots_first_chain_seconds = 0.305919418
+traced_slots_first_chain_bytes = 43229000

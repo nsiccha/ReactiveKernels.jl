@@ -266,7 +266,8 @@ function main(args=ARGS)
     length(args)==3 && !(backend in (:native_slots,:compare,:reactant_slots)) &&
         error("leapfrog count is configurable in the slot-based modes")
     backend === :ahmc && return run_ahmc(; n)
-    backend === :reactant_slots && return run_traced_comparison(build_fast_prototype(;L);n)
+    backend === :reactant_slots && return run_traced_comparison(
+        build_fast_prototype(;L,compiler_options=(peel_loops=true,));n)
     if backend in (:native_slots,:compare)
         prototype=build_fast_prototype(;L)
         return run_prepared_comparison(prototype.prepared,
