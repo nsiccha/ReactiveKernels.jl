@@ -1,7 +1,8 @@
 using ReactiveKernelsPPLExamples.PPLMacro: @ppl
+import ReactiveKernelsPPLExamples.PPLMacro
 using ReactiveKernelsPPLExamples.PPLGibbs: gibbs
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
-    normal, exponential, beta, binomial
+    normal, exponential, beta, binomial, bernoulli, poisson, gamma
 using Random
 
 # Experimental PPL-style Gibbs layer over `@ppl` models: single-site random-walk
@@ -108,8 +109,10 @@ _nlp(x, mu, sig) = -0.5 * log(2π) - log(sig) - 0.5 * ((x - mu) / sig)^2
         post_mean = a / (a + b)
         post_sd = sqrt(a * b / ((a + b)^2 * (a + b + 1)))
 
+        # conjugate = false: exercise the logit-space RW path specifically.
         res = gibbs(bb; blocks = [:rate], data = (; successes, trials),
                     init = (; rate = 0.5), support = (; rate = :unit),
+                    conjugate = false,
                     iters = 40000, warmup = 10000, step = 0.3,
                     rng = MersenneTwister(5))
         r = Float64.(res.draws[:rate])
@@ -118,5 +121,91 @@ _nlp(x, mu, sig) = -0.5 * log(2π) - log(sig) - 0.5 * ((x - mu) / sig)^2
         @test isapprox(_mean(r), post_mean; atol = 0.01)
         @test isapprox(_std(r), post_sd; rtol = 0.15)
         @test 0.1 < res.accept_rate[:rate] < 0.9
+    end
+
+    @testset "automatic conjugacy — exact closed-form draws" begin
+        @testset "@ppl exposes a structure descriptor" begin
+            @ppl bb(successes::Vector{Int}, trials::Vector{Int}) = begin
+                rate ~ beta(2.0, 2.0)
+                successes ~ binomial(trials, rate)
+            end
+            info = PPLMacro.model_info(bb)
+            @test length(info.params) == 1
+            @test info.params[1].name == :rate
+            @test info.params[1].prior_family == :beta
+            @test info.params[1].prior_args == Any[2.0, 2.0]
+            @test info.params[1].support == :unit
+            @test length(info.obs) == 1
+            @test info.obs[1].data == :successes
+            @test info.obs[1].family == :binomial
+            @test info.obs[1].args == Any[:trials, :rate]
+        end
+
+        @testset "Beta-Binomial conjugate draw vs exact Beta posterior" begin
+            @ppl bb(successes::Vector{Int}, trials::Vector{Int}) = begin
+                rate ~ beta(2.0, 2.0)
+                successes ~ binomial(trials, rate)
+            end
+            rng = MersenneTwister(11)
+            m = 30
+            trials = fill(20, m)
+            successes = [sum(rand(rng, 20) .< 0.35) for _ in 1:m]
+            a = 2.0 + sum(successes)
+            b = 2.0 + sum(trials .- successes)
+            post_mean = a / (a + b)
+            post_sd = sqrt(a * b / ((a + b)^2 * (a + b + 1)))
+
+            res = gibbs(bb; blocks = [:rate], data = (; successes, trials),
+                        init = (; rate = 0.5), iters = 20000, warmup = 0,
+                        rng = MersenneTwister(9))
+            r = Float64.(res.draws[:rate])
+            @test all(x -> 0.0 < x < 1.0, r)
+            @test res.accept_rate[:rate] == 1.0            # exact draw, never rejected
+            @test isapprox(_mean(r), post_mean; atol = 0.005)  # i.i.d. ⇒ tight
+            @test isapprox(_std(r), post_sd; rtol = 0.06)
+        end
+
+        @testset "Beta-Bernoulli conjugate draw vs exact Beta posterior" begin
+            @ppl bern(y::Vector{Int}) = begin
+                p ~ beta(1.0, 1.0)
+                y ~ bernoulli(p)
+            end
+            rng = MersenneTwister(4)
+            y = Int.(rand(rng, 200) .< 0.3)
+            a = 1.0 + sum(y)
+            b = 1.0 + (length(y) - sum(y))
+            post_mean = a / (a + b)
+            post_sd = sqrt(a * b / ((a + b)^2 * (a + b + 1)))
+
+            res = gibbs(bern; blocks = [:p], data = (; y),
+                        init = (; p = 0.5), iters = 20000, warmup = 0,
+                        rng = MersenneTwister(2))
+            pd = Float64.(res.draws[:p])
+            @test res.accept_rate[:p] == 1.0
+            @test isapprox(_mean(pd), post_mean; atol = 0.005)
+            @test isapprox(_std(pd), post_sd; rtol = 0.06)
+        end
+
+        @testset "Gamma-Poisson conjugate draw vs exact Gamma posterior" begin
+            @ppl pg(counts::Vector{Int}) = begin
+                rate ~ gamma(2.0, 1.0)               # (shape, RATE)
+                counts ~ poisson(rate)
+            end
+            rng = MersenneTwister(8)
+            counts = rand(rng, 0:6, 80)
+            shape_post = 2.0 + sum(counts)
+            rate_post = 1.0 + length(counts)
+            post_mean = shape_post / rate_post
+            post_sd = sqrt(shape_post) / rate_post
+
+            res = gibbs(pg; blocks = [:rate], data = (; counts),
+                        init = (; rate = 1.0), iters = 20000, warmup = 0,
+                        rng = MersenneTwister(6))
+            rd = Float64.(res.draws[:rate])
+            @test all(>(0.0), rd)
+            @test res.accept_rate[:rate] == 1.0
+            @test isapprox(_mean(rd), post_mean; atol = 0.03)
+            @test isapprox(_std(rd), post_sd; rtol = 0.06)
+        end
     end
 end

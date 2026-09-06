@@ -30,21 +30,117 @@ on it (verified against the `ReactiveKernels:sampling:gibbs` PoC on
   density directly. Validated against an analytic Gaussian posterior (real), a
   1-D numerical grid posterior (positive), and the conjugate Beta posterior
   (unit).
+- **Automatic conjugacy** (`conjugate` kwarg, on by default): reading the
+  `@ppl` structure descriptor (`PPLMacro.model_info`), a block whose full
+  conditional is a supported data-only conjugate pair is drawn in closed form
+  (exact, always accepted): **Beta-Bernoulli, Beta-Binomial, Gamma-Poisson**.
+  Closed-form draws use `Random`-only samplers (Marsaglia–Tsang gamma, beta via
+  two gammas). Validated against the exact Beta and Gamma posteriors.
 
-Follow-up increments (design settled: decisions `0hvlzvd` conjugacy scope and
-`1nwitne` blocking API both resolved "no preference" → my recommendations, a
-small fixed conjugate set + explicit user-declared blocks): closed-form conjugate
-draws (Normal / Inverse-Gamma / Beta-Bernoulli/Binomial / Dirichlet), the
-explicit block/sampler API (`Gibbs(:z => …, (:a,:b) => …)`), and reproducing the
-SSVS spike-and-slab example on an `@ppl` model as the acceptance case. Conjugacy
-detection will read a structure descriptor exposed by `@ppl`, at which point the
-`support` kwarg can default from the model rather than the caller.
+Feasible-conjugacy note (decision `0hvlzvd` resolved "no preference" → my
+recommendation): the recommended set also named Inverse-Gamma-Normal and
+Dirichlet, but `inverse_gamma`/`dirichlet` are absent from
+`ReactiveKernelsDistributionKernels`, so those pairs cannot be authored in `@ppl`
+without the dist-kernels owner adding them (primer finding, not a local
+workaround). Normal-Normal (mean) is dist-feasible but needs linear-predictor
+analysis. Both are deferred.
+
+Follow-up increments: those deferred conjugate pairs, the explicit block/sampler
+API (`1nwitne`: `Gibbs(:z => …, (:a,:b) => …)`), and reproducing the SSVS
+spike-and-slab example on an `@ppl` model as the acceptance case.
 """
 module PPLGibbs
 
 using ReactiveKernels
+import ..PPLMacro   # experimental structure descriptor for conjugacy detection
 
 export gibbs
+
+# --- Conjugate posterior sampling (Random-only; no Distributions.jl) ---------
+# Marsaglia–Tsang draw from Gamma(shape, rate) (`rate` is β, matching the
+# `gamma(shape, rate)` distribution object). Shape ≥ 1 uses the squeeze method;
+# shape < 1 boosts with the standard `U^(1/shape)` correction (the 1/rate scale
+# commutes with that multiply, so applying it to the boosted draw is exact).
+function _rand_gamma(rng, shape::Real, rate::Real)
+    shape < 1 && return _rand_gamma(rng, shape + 1, rate) * rand(rng)^(1 / shape)
+    d = shape - 1 / 3
+    c = 1 / sqrt(9d)
+    while true
+        x = randn(rng)
+        v = (1 + c * x)^3
+        v <= 0 && continue
+        u = rand(rng)
+        log(u) < 0.5 * x^2 + d - d * v + d * log(v) && return d * v / rate
+    end
+end
+
+# Beta(a, b) via two Gamma(·, 1) draws.
+function _rand_beta(rng, a::Real, b::Real)
+    x = _rand_gamma(rng, a, 1.0)
+    y = _rand_gamma(rng, b, 1.0)
+    x / (x + y)
+end
+
+# A detected conjugate full conditional whose posterior parameters are data-only
+# (constant across sweeps): `:beta` → Beta(p1, p2), `:gamma` → Gamma(p1, p2).
+struct _Conjugate
+    family::Symbol
+    p1::Float64
+    p2::Float64
+end
+_draw_conjugate(rng, c::_Conjugate) = c.family === :beta ?
+    _rand_beta(rng, c.p1, c.p2) : _rand_gamma(rng, c.p1, c.p2)
+
+# Detect whether `block`'s full conditional is a supported data-only conjugate
+# pair, using the `@ppl` structure descriptor. Returns a `_Conjugate` with the
+# closed-form posterior parameters, or `nothing` (→ fall back to RW-MH). First
+# cut — the three feasible "direct" pairs (block is the sole latent appearing as
+# a bare likelihood argument, prior hyperparameters literal): Beta-Bernoulli,
+# Beta-Binomial, Gamma-Poisson. Inverse-Gamma-Normal / Dirichlet need
+# distributions absent from the distribution-kernels package; Normal-Normal needs
+# linear-predictor analysis. Both are deferred (see the module docstring).
+function _detect_conjugate(info::PPLMacro.PPLModelInfo, data, block::Symbol)
+    p = nothing
+    for pi in info.params
+        pi.name === block && (p = pi; break)
+    end
+    (p === nothing || p.is_vector) && return nothing
+    all(a -> a isa Real, p.prior_args) || return nothing
+    refs = [o for o in info.obs if any(a -> a === block, o.args)]
+    isempty(refs) && return nothing
+
+    if p.prior_family === :beta && all(o -> o.family in (:binomial, :bernoulli), refs)
+        s = 0.0
+        f = 0.0
+        for o in refs
+            obsv = data[o.data]
+            if o.family === :bernoulli
+                o.args == Any[block] || return nothing
+                s += sum(obsv)
+                f += length(obsv) - sum(obsv)
+            else                                   # binomial(n, block)
+                (length(o.args) == 2 && o.args[2] === block &&
+                    o.args[1] isa Symbol && haskey(data, o.args[1])) || return nothing
+                n = data[o.args[1]]
+                s += sum(obsv)
+                f += sum(n) - sum(obsv)
+            end
+        end
+        return _Conjugate(:beta, Float64(p.prior_args[1]) + s,
+                          Float64(p.prior_args[2]) + f)
+    elseif p.prior_family === :gamma && all(o -> o.family === :poisson, refs)
+        c = 0.0
+        n = 0
+        for o in refs
+            o.args == Any[block] || return nothing
+            c += sum(data[o.data])
+            n += length(data[o.data])
+        end
+        return _Conjugate(:gamma, Float64(p.prior_args[1]) + c,
+                          Float64(p.prior_args[2]) + n)
+    end
+    return nothing
+end
 
 # Random-walk proposal in a block's UNCONSTRAINING space, returning the proposal
 # together with the log Metropolis-Hastings correction `log q(cur|prop) -
@@ -92,12 +188,19 @@ _support_of(support, b::Symbol) = get(support, b, :real)
 
 """
     gibbs(model; blocks, data, init, iters, rng, step = 0.5, warmup = 0,
-          support = nothing, target = :constrained_logdensity)
+          support = nothing, conjugate = true, target = :constrained_logdensity)
 
-Single-site random-walk Metropolis-within-Gibbs over the named latents of an
-`@ppl` `model`. `blocks` is a vector of latent-name `Symbol`s; `data` and `init`
-are NamedTuples of port name → value. Returns `(; draws, accept_rate, iters)`
-where `draws[block]` is the retained chain for that block.
+Single-site Metropolis-within-Gibbs over the named latents of an `@ppl` `model`.
+`blocks` is a vector of latent-name `Symbol`s; `data` and `init` are NamedTuples
+of port name → value. Returns `(; draws, accept_rate, iters)` where
+`draws[block]` is the retained chain for that block.
+
+When `conjugate` is on (default) and the model carries an `@ppl` structure
+descriptor, each block whose full conditional is a supported data-only conjugate
+pair (Beta-Bernoulli, Beta-Binomial, Gamma-Poisson) is drawn in closed form
+(exact, always accepted — `accept_rate` 1.0); every other block uses the
+support-aware random-walk step below. Pass `conjugate = false` to force RW-MH for
+all blocks.
 
 `support` gives each block's support as a NamedTuple / Dict of block-name =>
 `:real` (default) | `:positive` | `:unit`. A `:positive`/`:unit` block walks in
@@ -115,6 +218,7 @@ rejected `set!` invalidates only the block's Markov blanket, so the next
 """
 function gibbs(model; blocks::Vector{Symbol}, data, init, iters::Int, rng,
                step = 0.5, warmup::Int = 0, support = nothing,
+               conjugate::Bool = true,
                target::Symbol = :constrained_logdensity)
     tgt = getproperty(model, target)
     st = ReactiveState(model.graph; materialize = (tgt,))
@@ -123,6 +227,15 @@ function gibbs(model; blocks::Vector{Symbol}, data, init, iters::Int, rng,
     end
     ports = Dict(b => getproperty(model, b) for b in blocks)
     supports = Dict(b => _support_of(support, b) for b in blocks)
+    # Per-block conjugate full conditional (or `nothing` → RW-MH). Automatic
+    # when `conjugate` is on and the model carries an `@ppl` structure descriptor.
+    conj = Dict{Symbol,Union{Nothing,_Conjugate}}(b => nothing for b in blocks)
+    if conjugate && PPLMacro.has_model_info(model)
+        info = PPLMacro.model_info(model)
+        for b in blocks
+            conj[b] = _detect_conjugate(info, data, b)
+        end
+    end
     cur = Dict{Symbol,Any}(b => init[b] for b in blocks)
     for b in blocks
         set!(st, ports[b], cur[b])
@@ -134,16 +247,25 @@ function gibbs(model; blocks::Vector{Symbol}, data, init, iters::Int, rng,
     for it in 1:(warmup + iters)
         counted = it > warmup
         for b in blocks
-            lp_cur = logtarget()
-            cur_val = cur[b]
-            prop, hastings = _propose(rng, cur_val, step, supports[b])
-            set!(st, ports[b], prop)
-            lp_prop = logtarget()
-            if isfinite(lp_prop) && log(rand(rng)) < (lp_prop - lp_cur) + hastings
+            c = conj[b]
+            if c !== nothing
+                # Exact conjugate draw from the full conditional — always accepted.
+                prop = _draw_conjugate(rng, c)
+                set!(st, ports[b], prop)
                 cur[b] = prop
                 counted && (accepts[b] += 1)
             else
-                set!(st, ports[b], cur_val)          # reject: restore the block
+                lp_cur = logtarget()
+                cur_val = cur[b]
+                prop, hastings = _propose(rng, cur_val, step, supports[b])
+                set!(st, ports[b], prop)
+                lp_prop = logtarget()
+                if isfinite(lp_prop) && log(rand(rng)) < (lp_prop - lp_cur) + hastings
+                    cur[b] = prop
+                    counted && (accepts[b] += 1)
+                else
+                    set!(st, ports[b], cur_val)      # reject: restore the block
+                end
             end
         end
         if counted
