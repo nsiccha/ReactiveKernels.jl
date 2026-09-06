@@ -1,0 +1,96 @@
+source = "benchmark/fair_posteriordb_glm.jl (+ _body.jl) — the executed model authority for all sides"
+rk_source_commit = "59dd8bbcf8c19f46a9288cfcb13875bf70d0fc4a"
+note = "weak-normal unbounded priors replace posteriordb bounded uniforms; N=100 synthetic data of representative shape; timing is native primal+gradient (Reactant is a separate HMC-loop workload)"
+schema = "fair-posteriordb-glm-v1"
+generated_at = "2026-09-06T14:20:41.662"
+methodology = "median over 12 rounds of BenchmarkTools minimum(200 samples); setup/compile/first-call excluded; RK vs optimized Stan (naive/vectorized/glm) vs optimized Turing; weak-normal priors; parity vs FD oracle"
+
+[[models]]
+model = "GLM_Poisson"
+dim = 4
+
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 2263.0
+    median_bytes = 16
+    impl = "stan_naive"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 2143.0
+    median_bytes = 16
+    impl = "stan_vec"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 2138.0
+    median_bytes = 16
+    impl = "stan_glm"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 1737.5
+    median_bytes = 2848
+    impl = "turing"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 670.0
+    median_bytes = 1792
+    impl = "rk"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 2338.0
+    median_bytes = 112
+    impl = "stan"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 5598.0
+    median_bytes = 12064
+    impl = "turing"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 2473.5
+    median_bytes = 4160
+    impl = "rk"
+[[models]]
+model = "GLM_Binomial"
+dim = 3
+
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 5537.0
+    median_bytes = 16
+    impl = "stan_naive"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 5292.0
+    median_bytes = 16
+    impl = "stan_vec"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 5032.0
+    median_bytes = 4512
+    impl = "turing"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 1081.0
+    median_bytes = 2688
+    impl = "rk"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 6654.0
+    median_bytes = 96
+    impl = "stan"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 28634.5
+    median_bytes = 58896
+    impl = "turing"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 2774.0
+    median_bytes = 5840
+    impl = "rk"
+
+[environment]
+julia = "1.10.11"
+arch = "x86_64"
+stan = "2.39.0 (BridgeStan 2.9.0)"
+cpu = "AMD EPYC-Milan Processor"

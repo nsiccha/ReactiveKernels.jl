@@ -1,5 +1,7 @@
 using DifferentiationInterface
 import Enzyme
+using LinearAlgebra
+using SpecialFunctions: loggamma, logbeta
 using ReactiveKernelsPPLExamples.EightSchoolsExample
 using ReactiveKernelsPPLExamples.LinearRegressionExample
 using ReactiveKernelsPPLExamples.BetaBinomialExample
@@ -7,6 +9,8 @@ using ReactiveKernelsPPLExamples.PoissonGammaExample
 using ReactiveKernelsPPLExamples.DugongsGrowthExample
 using ReactiveKernelsPPLExamples.ARMA11Example
 using ReactiveKernelsPPLExamples.GaussianMixtureExample
+using ReactiveKernelsPPLExamples.MVNormalRegressionExample
+using ReactiveKernelsPPLExamples.BoundRegressionExample
 
 # This is deliberately the plain reverse backend: no runtime activity and no
 # function annotation. Non-active model data travel through DI as `Constant`s.
@@ -31,81 +35,167 @@ function eight_schools_reference_density(q)
 end
 
 function linear_regression_reference_density(q)
-    α, β, log_σ = q
-    parameters = LinearRegressionParameters(α, β, exp(log_σ))
-    prior = LinearRegressionExample.log_prior(parameters)
-    likelihood = LinearRegressionExample.sum_log_likelihood(
-        LinearRegressionExample.pointwise_log_likelihood(
-            parameters, LINREG_X, LINREG_Y))
-    LinearRegressionExample.total_log_density(prior, log_σ, likelihood)
+    α, β, log_σ = q[1], q[2], q[3]
+    σ = exp(log_σ)
+    normal(x, location, scale) =
+        -0.5 * log(2π) - log(scale) - 0.5 * ((x - location) / scale)^2
+    # α, β ~ Normal(0, 10); σ ~ HalfNormal(5); log Jacobian log|dσ/dlog_σ| = log_σ.
+    prior = normal(α, 0.0, 10.0) + normal(β, 0.0, 10.0) +
+            log(2.0) + normal(σ, 0.0, 5.0)
+    likelihood = zero(α)
+    @inbounds for i in eachindex(LINREG_Y)
+        likelihood += normal(LINREG_Y[i], α + β * LINREG_X[i], σ)
+    end
+    prior + log_σ + likelihood
 end
+
+# Binomial log-choose and log B(2, 2) are data-only, so precompute them and keep
+# the differentiated reference free of loggamma/logbeta (as the RK kernel treats
+# the counts as inactive data).
+const _BB_LOG_CHOOSE = [
+    loggamma(n + 1.0) - loggamma(k + 1.0) - loggamma(n - k + 1.0)
+    for (n, k) in zip(BETA_BINOMIAL_TRIALS, BETA_BINOMIAL_SUCCESSES)]
+const _BB_LOGBETA22 = logbeta(2.0, 2.0)
 
 function beta_binomial_reference_density(logit_rate)
-    rate = BetaBinomialExample.logistic(logit_rate)
-    parameters = BetaBinomialParameters(rate)
-    prior = BetaBinomialExample.log_prior(parameters)
-    likelihood = BetaBinomialExample.sum_log_likelihood(
-        BetaBinomialExample.pointwise_log_likelihood(
-            parameters, BETA_BINOMIAL_TRIALS, BETA_BINOMIAL_SUCCESSES))
-    BetaBinomialExample.total_log_density(
-        prior, BetaBinomialExample.log_abs_det_jacobian(rate), likelihood)
+    rate = 1 / (1 + exp(-logit_rate))
+    log_jacobian = log(rate) + log1p(-rate)
+    prior = log(rate) + log1p(-rate) - _BB_LOGBETA22
+    likelihood = zero(rate)
+    @inbounds for i in eachindex(BETA_BINOMIAL_TRIALS)
+        n = BETA_BINOMIAL_TRIALS[i]
+        k = BETA_BINOMIAL_SUCCESSES[i]
+        likelihood += _BB_LOG_CHOOSE[i] + k * log(rate) + (n - k) * log1p(-rate)
+    end
+    prior + log_jacobian + likelihood
 end
+
+const _PG_LOG_FACTORIALS = [loggamma(c + 1.0) for c in POISSON_COUNTS]
+const _PG_LOG_GAMMA2 = loggamma(2.0)
 
 function poisson_gamma_reference_density(log_rate)
-    parameters = PoissonGammaParameters(exp(log_rate))
-    prior = PoissonGammaExample.log_prior(parameters)
-    likelihood = PoissonGammaExample.sum_log_likelihood(
-        PoissonGammaExample.pointwise_log_likelihood(
-            parameters, POISSON_COUNTS))
-    PoissonGammaExample.total_log_density(prior, log_rate, likelihood)
+    rate = exp(log_rate)
+    prior = -_PG_LOG_GAMMA2 + log(rate) - rate
+    likelihood = zero(rate)
+    @inbounds for i in eachindex(POISSON_COUNTS)
+        likelihood += POISSON_COUNTS[i] * log(rate) - rate - _PG_LOG_FACTORIALS[i]
+    end
+    prior + log_rate + likelihood
 end
 
+const _DUGONGS_LOG_GAMMA_SHAPE = loggamma(1e-4)
+
 function dugongs_reference_density(q)
-    α, β, u_λ, log_τ = q
-    parameters = DugongsParameters(
-        α, β, DugongsGrowthExample.bounded_lambda(u_λ),
-        DugongsGrowthExample.sd_from_log_precision(log_τ))
+    α, β, u_λ, log_τ = q[1], q[2], q[3], q[4]
+    s = 1 / (1 + exp(-u_λ))
+    λ = 0.5 + 0.5 * s
+    τ = exp(log_τ)
+    σ = exp(-log_τ / 2)
+    log_jacobian = log(0.5) + log(s) + log1p(-s) + log_τ
+    nld(x, loc, sc) = -0.5 * log(2π) - log(sc) - 0.5 * ((x - loc) / sc)^2
+    gamma_ld = 1e-4 * log(1e-4) - _DUGONGS_LOG_GAMMA_SHAPE +
+               (1e-4 - 1) * log(τ) - 1e-4 * τ
+    prior = nld(α, 0.0, 1000.0) + nld(β, 0.0, 1000.0) + log(2.0) + gamma_ld
     likelihood = zero(α)
     @inbounds for i in eachindex(DUGONGS_AGE)
-        likelihood += DugongsGrowthExample.normal_logpdf(
-            DUGONGS_LENGTH[i],
-            DugongsGrowthExample.growth_mean(parameters, DUGONGS_AGE[i]),
-            parameters.σ)
+        likelihood += nld(DUGONGS_LENGTH[i], α - β * λ^DUGONGS_AGE[i], σ)
     end
-    DugongsGrowthExample.total_log_density(
-        DugongsGrowthExample.log_prior(parameters),
-        DugongsGrowthExample.log_abs_det_jacobian(u_λ, log_τ), likelihood)
+    prior + log_jacobian + likelihood
 end
 
 function arma11_reference_density(q)
-    μ, φ, θ, log_σ = q
-    parameters = ARMAParameters(μ, φ, θ, exp(log_σ))
-    errors = ARMA11Example.arma_errors(parameters, ARMA_SERIES)
-    likelihood = ARMA11Example.sum_log_likelihood(
-        ARMA11Example.pointwise_log_likelihood(errors, parameters))
-    ARMA11Example.total_log_density(
-        ARMA11Example.log_prior(parameters), log_σ, likelihood)
+    μ, φ, θ, log_σ = q[1], q[2], q[3], q[4]
+    σ = exp(log_σ)
+    normal(x, location, scale) =
+        -0.5 * log(2π) - log(scale) - 0.5 * ((x - location) / scale)^2
+    # The same sequential one-step error recursion, computed independently.
+    T = length(ARMA_SERIES)
+    err = Vector{typeof(μ)}(undef, T)
+    ν = μ + φ * μ
+    err[1] = ARMA_SERIES[1] - ν
+    @inbounds for t in 2:T
+        ν = μ + φ * ARMA_SERIES[t - 1] + θ * err[t - 1]
+        err[t] = ARMA_SERIES[t] - ν
+    end
+    # μ ~ Normal(0,10); φ, θ ~ Normal(0,2); σ ~ HalfCauchy(2.5); log Jac = log_σ.
+    prior = normal(μ, 0.0, 10.0) + normal(φ, 0.0, 2.0) + normal(θ, 0.0, 2.0) +
+            log(2.0) - log(π) - log(2.5) - log1p((σ / 2.5)^2)
+    likelihood = zero(μ)
+    @inbounds for e in err
+        likelihood += normal(e, 0.0, σ)
+    end
+    prior + log_σ + likelihood
 end
 
+const _GM_LOGBETA55 = logbeta(5.0, 5.0)
+
 function gaussian_mixture_reference_density(q)
-    μ₁, δ, log_σ₁, log_σ₂, logit_θ = q
-    _, μ₂ = GaussianMixtureExample.ordered_means(μ₁, δ)
-    θ = GaussianMixtureExample.logistic(logit_θ)
-    parameters = MixtureParameters(
-        μ₁, μ₂, exp(log_σ₁), exp(log_σ₂), θ)
+    μ₁, δ, log_σ₁, log_σ₂, logit_θ = q[1], q[2], q[3], q[4], q[5]
+    μ₂ = μ₁ + exp(δ)
+    σ₁ = exp(log_σ₁)
+    σ₂ = exp(log_σ₂)
+    θ = 1 / (1 + exp(-logit_θ))
+    log_θ = log(θ)
+    log_1mθ = log1p(-θ)
+    log_jacobian = δ + log_σ₁ + log_σ₂ + log_θ + log_1mθ
+    nld(x, loc, sc) = -0.5 * log(2π) - log(sc) - 0.5 * ((x - loc) / sc)^2
+    prior = nld(μ₁, 0.0, 2.0) + nld(μ₂, 0.0, 2.0) +
+            log(2.0) + nld(σ₁, 0.0, 2.0) + log(2.0) + nld(σ₂, 0.0, 2.0) +
+            (4 * log(θ) + 4 * log1p(-θ) - _GM_LOGBETA55)
     likelihood = zero(μ₁)
-    @inbounds for observation in MIXTURE_OBSERVATIONS
-        la = GaussianMixtureExample.normal_logpdf(
-            observation, parameters.μ₁, parameters.σ₁)
-        lb = GaussianMixtureExample.normal_logpdf(
-            observation, parameters.μ₂, parameters.σ₂)
-        likelihood += GaussianMixtureExample.log_mix(parameters.θ, la, lb)
+    @inbounds for y in MIXTURE_OBSERVATIONS
+        la = log_θ + nld(y, μ₁, σ₁)
+        lb = log_1mθ + nld(y, μ₂, σ₂)
+        m = max(la, lb)
+        likelihood += m + log(exp(la - m) + exp(lb - m))
     end
-    GaussianMixtureExample.total_log_density(
-        GaussianMixtureExample.log_prior(parameters),
-        GaussianMixtureExample.log_abs_det_jacobian(
-            δ, log_σ₁, log_σ₂, θ),
-        likelihood)
+    prior + log_jacobian + likelihood
+end
+
+# The covariance factorizations are data, so precompute the log-determinant and
+# reuse the exported precision (Σ⁻¹) matrix. This keeps the differentiated
+# reference a plain const-matrix quadratic form — Enzyme's reverse mode rejects a
+# `Symmetric \` / `logdet(Symmetric)` inside the differentiated call (the
+# Bunch-Kaufman factorization introduces a Union type), exactly as the RK kernel
+# avoids by treating the covariance as a DI Constant.
+const _MVREG_REFERENCE_LOGDET_COV = logdet(Symmetric(MVREG_COVARIANCE))
+
+function mvnormal_regression_reference_density(q)
+    β = q
+    centered = MVREG_Y .- MVREG_X * β
+    N = length(MVREG_Y)
+    quadratic = dot(centered, MVREG_PRECISION * centered)
+    likelihood = -0.5 * N * log(2π) - 0.5 * _MVREG_REFERENCE_LOGDET_COV -
+                 0.5 * quadratic
+    prior = sum(-0.5 * log(2π) - log(10.0) - 0.5 * (b / 10.0)^2 for b in β)
+    prior + likelihood
+end
+
+# The predictor standardization is data-only, so precompute it once and keep the
+# differentiated reference a plain const-matrix linear predictor.
+const _BOUND_REFERENCE_STANDARDIZED = let
+    n = size(BOUND_RAW_X, 1)
+    means = sum(BOUND_RAW_X; dims = 1) ./ n
+    sds = sqrt.(sum(abs2, BOUND_RAW_X .- means; dims = 1) ./ n)
+    (BOUND_RAW_X .- means) ./ sds
+end
+
+function bound_regression_reference_density(q)
+    α = q[1]
+    β = q[2:3]
+    log_σ = q[4]
+    σ = exp(log_σ)
+    mean = α .+ _BOUND_REFERENCE_STANDARDIZED * β
+    normal_ld(x, location, scale) =
+        -0.5 * log(2π) - log(scale) - 0.5 * ((x - location) / scale)^2
+    prior = normal_ld(α, 0.0, 10.0) +
+            sum(normal_ld(b, 0.0, 5.0) for b in β) +
+            log(2.0) + normal_ld(σ, 0.0, 5.0)
+    likelihood = zero(α)
+    @inbounds for i in eachindex(BOUND_Y)
+        likelihood += normal_ld(BOUND_Y[i], mean[i], σ)
+    end
+    prior + log_σ + likelihood
 end
 
 # Independent analytic score for the unconstrained Gaussian-mixture reference.
@@ -212,6 +302,12 @@ end
          (:unconstrained, :observations),
          gaussian_mixture_reference_density,
          gaussian_mixture_reference_gradient),
+        (evaluate_mvnormal_regression_source(),
+         (:unconstrained, :predictors, :responses, :covariance),
+         mvnormal_regression_reference_density, nothing),
+        (evaluate_bound_regression_source(),
+         (:unconstrained, :raw_predictors, :responses),
+         bound_regression_reference_density, nothing),
     )
     for (artifact, have, reference_density, reference_gradient) in cases
         @testset "$(artifact.name)" begin

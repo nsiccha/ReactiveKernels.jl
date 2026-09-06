@@ -354,13 +354,14 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "nuts.md" => 1,
         "nuts-reactant.md" => 1,
     )
+    # The linear-regression, beta-binomial, poisson-gamma, dugongs-growth,
+    # arma11, and gaussian-mixture PPL example pages were migrated into the
+    # authored-baseline review set (commits 1190968, a1fd1a7, b7e3d13, 4f7cc64,
+    # 1e16f85, 2026-09-06), which deliberately removed their
+    # `render_review_status(:frozen_ppl)` banners. They therefore emit no
+    # review-state marker and must NOT be listed here — only pages that still
+    # render a banner belong in this dict.
     expected_review_states = Dict(
-        "linear-regression.md" => "frozen",
-        "beta-binomial.md" => "frozen",
-        "poisson-gamma.md" => "frozen",
-        "dugongs-growth.md" => "frozen",
-        "arma11.md" => "frozen",
-        "gaussian-mixture.md" => "frozen",
         "pathfinder.md" => "frozen",
         "reactivehmc-corpus.md" => "frozen",
         "nuts.md" => "frozen",
