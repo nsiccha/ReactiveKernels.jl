@@ -4,7 +4,7 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     SumToZeroExample,
     LinearRegressionExample, BetaBinomialExample, PoissonGammaExample,
     DugongsGrowthExample, ARMA11Example, GaussianMixtureExample,
-    MNISTLogisticExample
+    MNISTLogisticExample, MVNormalRegressionExample, BoundRegressionExample
 using Test
 
 include("test_ppl_workflow.jl")
@@ -17,6 +17,8 @@ include("test_poisson_gamma_example.jl")
 include("test_dugongs_example.jl")
 include("test_arma11_example.jl")
 include("test_gaussian_mixture_example.jl")
+include("test_mvnormal_regression_example.jl")
+include("test_bound_regression_example.jl")
 include("test_ppl_macro.jl")
 include("test_ppl_gibbs.jl")
 include("test_ppl_enzyme.jl")
