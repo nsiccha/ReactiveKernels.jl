@@ -8,9 +8,10 @@
 # `@ppl` is EXPERIMENTAL and deliberately NOT exported; reach it through the
 # qualified submodule path.
 using ReactiveKernelsPPLExamples.PPLMacro: @ppl
-using ReactiveKernelsPPLExamples: EightSchoolsExample
+using ReactiveKernelsPPLExamples: EightSchoolsExample, PPLEightSchoolsExample
 using ReactiveKernelsPPLExamples.EightSchoolsExample:
     EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA, build_eight_schools_graph
+using ReactiveKernelsPPLExamples.PPLEightSchoolsExample: build_ppl_eight_schools
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauchy
 
 @testset "@ppl posteriordb-model parity (experimental)" begin
@@ -61,6 +62,32 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
             @test ppl_post ≈ hand_post rtol = 1e-12
             @test ppl_prior ≈ hand_prior rtol = 1e-12
             @test ppl_lik ≈ hand_lik rtol = 1e-12
+        end
+    end
+
+    @testset "importable builder — build_ppl_eight_schools()" begin
+        # The benchmark 4th side consumes this builder (not test-local code). It
+        # returns a KernelSpec with the IDENTICAL query surface as
+        # build_eight_schools_graph() — same have/want, same q packing, and NO
+        # size port (the effects vector uses the literal size 8).
+        y = EIGHT_SCHOOLS_Y
+        sigma = EIGHT_SCHOOLS_SIGMA
+        builder = build_ppl_eight_schools()
+        @test builder isa KernelSpec
+        # A fresh, independent graph per call.
+        @test build_ppl_eight_schools() !== builder
+
+        for q in ([1.5, log(2.0), (0.25 .* (1:8))...],
+                  [-2.3, log(0.7), collect(range(-1.0, 1.0; length = 8))...])
+            hand = build_eight_schools_graph()
+            hand_post = prepare(hand;
+                have = (:unconstrained, :observations, :observation_scales),
+                want = :posterior)(q, y, sigma)
+            # Note: identical `have` tuple to the hand kernel — no :J.
+            ppl_post = prepare(build_ppl_eight_schools();
+                have = (:unconstrained, :observations, :observation_scales),
+                want = :posterior)(q, y, sigma)
+            @test ppl_post ≈ hand_post rtol = 1e-12
         end
     end
 end
