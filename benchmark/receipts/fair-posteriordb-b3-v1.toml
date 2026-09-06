@@ -1,0 +1,81 @@
+source = "benchmark/fair_posteriordb_b3.jl (+ _body.jl) — executed model authority"
+rk_source_commit = "36ec86b8b0cad87f6bc53c656f72f5f5356e9738"
+note = "batch 3: Rate_1 (beta-binomial, dim1, bounded-theta constraint transform), eight_schools_centered (hier normal, dim10). RK wins big at both (0 alloc); eight_schools RK backend uses Enzyme.set_runtime_activity for the reduce-over-theta closure."
+schema = "fair-posteriordb-b3-v1"
+generated_at = "2026-09-06T16:03:55.216"
+methodology = "median over 12 rounds of BenchmarkTools minimum(200 samples); RK vs optimized Stan vs optimized Turing; parity vs FD oracle"
+
+[[models]]
+model = "Rate_1 (beta-binomial)"
+dim = 1
+
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 230.0
+    median_bytes = 16
+    impl = "stan"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 135.0
+    median_bytes = 0
+    impl = "turing"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 50.0
+    median_bytes = 0
+    impl = "rk"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 300.0
+    median_bytes = 80
+    impl = "stan"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 660.0
+    median_bytes = 1280
+    impl = "turing"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 60.0
+    median_bytes = 0
+    impl = "rk"
+[[models]]
+model = "eight_schools_centered"
+dim = 10
+
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 300.0
+    median_bytes = 16
+    impl = "stan"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 370.0
+    median_bytes = 800
+    impl = "turing"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 110.0
+    median_bytes = 0
+    impl = "rk"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 530.5
+    median_bytes = 160
+    impl = "stan"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 4371.0
+    median_bytes = 7904
+    impl = "turing"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 155.0
+    median_bytes = 0
+    impl = "rk"
+
+[environment]
+julia = "1.10.11"
+arch = "x86_64"
+stan = "2.39.0 (BridgeStan 2.9.0)"
+cpu = "AMD EPYC-Milan Processor"

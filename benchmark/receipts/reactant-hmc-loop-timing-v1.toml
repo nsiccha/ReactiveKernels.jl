@@ -1,0 +1,19 @@
+source = "benchmark/reactant_hmc_loop_timing.jl (consumes benchmark/sampler_transpiler/prepared_hmc.jl)"
+rk_source_commit = "07cb9e5c7f2206185c38c0064d192eef083e5f9a"
+note = "same authored @kernel lowered to native AND Reactant via the merged transpiler (no hand-written reactant kernel). Reactant WINS ~2.4x in the compiled whole-loop program — opposite of the single-eval small-dim regime where Reactant loses."
+schema = "reactant-hmc-loop-timing-v1"
+generated_at = "2026-09-06T16:09:43.921"
+methodology = "same authored @kernel lowered to native + Reactant via the merged transpiler (no hand-written reactant kernel); multinomial HMC on the bound Eight Schools density; compile+first-exec warmup excluded; whole batch synchronized; median of 8 batches of 1000 transitions × L16"
+
+[result]
+reactant_over_native = 0.416554397174409
+transitions_per_batch = 1000
+reactant_us_per_transition = 2.638029
+leapfrog_steps = 16
+native_us_per_transition = 6.3329759999999995
+
+[environment]
+julia = "1.10.11"
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+reactant_backend = "default CPU"
