@@ -3,7 +3,7 @@
 All **10 named posteriordb models**, each measured *all the relevant ways*: native
 steady-state **primal** and **gradient**, RK vs **optimized** Stan and **optimized**
 Turing, plus the **Reactant** compiled-HMC-loop regime. Every number below is copied
-from a committed receipt under [`benchmark/receipts/`](receipts/) — no hand-entered or
+from a committed receipt under [`benchmark/receipts/`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/) — no hand-entered or
 remembered values.
 
 > **Why "fair" and why this page exists.** The widely-cited
@@ -121,8 +121,8 @@ the compiled HMC loop for every one of the 9** (1.1×–14.5× faster). The lone
 `gp_regr` — fails with a specific, actionable error, not a silent skip.
 
 Multinomial HMC, L=16 leapfrog steps, 1000 transitions/batch, median of 6 batches
-([`reactant_hmc_loop_table.jl`](reactant_hmc_loop_table.jl),
-receipt [`reactant-hmc-loop-table-v2.toml`](receipts/reactant-hmc-loop-table-v2.toml)):
+([`reactant_hmc_loop_table.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/reactant_hmc_loop_table.jl),
+receipt [`reactant-hmc-loop-table-v2.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/reactant-hmc-loop-table-v2.toml)):
 
 | Model | dim | native µs/txn | Reactant µs/txn | Reactant ÷ native | speedup |
 |---|---:|---:|---:|---:|---:|
@@ -165,7 +165,7 @@ a **loud error** for anything outside the safe set, never a silent mis-lowering.
 
 Not one of the 10 named models, but it shows *why* the RK gradient lead narrows as the
 problem grows (conjugate `normal_id_glm`, N=5000;
-[`all-sides-gaussian-regression-v1.toml`](receipts/all-sides-gaussian-regression-v1.toml)):
+[`all-sides-gaussian-regression-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/all-sides-gaussian-regression-v1.toml)):
 
 | dim (K) | RK / Stan primal | RK / Stan gradient |
 |---|---:|---:|
@@ -202,14 +202,14 @@ Each script builds its own pinned comparison environment and re-execs the model 
 
 | Models | Script | Receipt |
 |---|---|---|
-| GLM_Poisson, GLM_Binomial | [`fair_posteriordb_glm.jl`](fair_posteriordb_glm.jl) | [`fair-posteriordb-glm-v1.toml`](receipts/fair-posteriordb-glm-v1.toml) |
-| arK, GLMM_Poisson | [`fair_posteriordb_more.jl`](fair_posteriordb_more.jl) | [`fair-posteriordb-more-v1.toml`](receipts/fair-posteriordb-more-v1.toml) |
-| Rate_1, eight_schools_centered | [`fair_posteriordb_b3.jl`](fair_posteriordb_b3.jl) | [`fair-posteriordb-b3-v1.toml`](receipts/fair-posteriordb-b3-v1.toml) |
-| gp_regr | [`fair_posteriordb_gp.jl`](fair_posteriordb_gp.jl) | [`fair-posteriordb-gp-v1.toml`](receipts/fair-posteriordb-gp-v1.toml) |
-| Mh | [`fair_posteriordb_mh.jl`](fair_posteriordb_mh.jl) | [`fair-posteriordb-mh-v1.toml`](receipts/fair-posteriordb-mh-v1.toml) |
-| kidscore_interaction, sblri-blr | [`fair_posteriordb_linear.jl`](fair_posteriordb_linear.jl) | [`fair-posteriordb-linear-v1.toml`](receipts/fair-posteriordb-linear-v1.toml) |
-| Reactant HMC loop (all 10) | [`reactant_hmc_loop_table.jl`](reactant_hmc_loop_table.jl) | [`reactant-hmc-loop-table-v2.toml`](receipts/reactant-hmc-loop-table-v2.toml) |
-| Gaussian K-scaling | [`all_sides_gaussian_regression.jl`](all_sides_gaussian_regression.jl) | [`all-sides-gaussian-regression-v1.toml`](receipts/all-sides-gaussian-regression-v1.toml) |
+| GLM_Poisson, GLM_Binomial | [`fair_posteriordb_glm.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/fair_posteriordb_glm.jl) | [`fair-posteriordb-glm-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/fair-posteriordb-glm-v1.toml) |
+| arK, GLMM_Poisson | [`fair_posteriordb_more.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/fair_posteriordb_more.jl) | [`fair-posteriordb-more-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/fair-posteriordb-more-v1.toml) |
+| Rate_1, eight_schools_centered | [`fair_posteriordb_b3.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/fair_posteriordb_b3.jl) | [`fair-posteriordb-b3-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/fair-posteriordb-b3-v1.toml) |
+| gp_regr | [`fair_posteriordb_gp.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/fair_posteriordb_gp.jl) | [`fair-posteriordb-gp-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/fair-posteriordb-gp-v1.toml) |
+| Mh | [`fair_posteriordb_mh.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/fair_posteriordb_mh.jl) | [`fair-posteriordb-mh-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/fair-posteriordb-mh-v1.toml) |
+| kidscore_interaction, sblri-blr | [`fair_posteriordb_linear.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/fair_posteriordb_linear.jl) | [`fair-posteriordb-linear-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/fair-posteriordb-linear-v1.toml) |
+| Reactant HMC loop (all 10) | [`reactant_hmc_loop_table.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/reactant_hmc_loop_table.jl) | [`reactant-hmc-loop-table-v2.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/reactant-hmc-loop-table-v2.toml) |
+| Gaussian K-scaling | [`all_sides_gaussian_regression.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/all_sides_gaussian_regression.jl) | [`all-sides-gaussian-regression-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/all-sides-gaussian-regression-v1.toml) |
 
 Every receipt carries its `source`, `rk_source_commit`, `methodology`, and `environment`.
 The Reactant loop scripts run under the sampling lane's `benchmark/sampler_transpiler/`
