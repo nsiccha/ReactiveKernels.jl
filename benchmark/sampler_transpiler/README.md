@@ -245,6 +245,23 @@ julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/multin
 The Julia expressions are inspection artifacts whose stores, resources, and
 metadata belong to their preparation; they are not standalone programs.
 
+`multinomial_scaling.jl /absolute/output.csv` produces long-form measurements
+for 100, 1,000 and 10,000 transitions at four and sixteen steps. The recorded
+`multinomial-scaling-v1.csv` contains all 168 execution samples and six separate
+compilation rows. Map `gradient_evaluations` to x, `seconds` to y, `backend` to
+colour, and `steps_per_transition` to row facets. Filter `phase=execute` for
+throughput; compilation rows run in one process and benefit from code reuse
+after the first compilation. `paired_with` preserves both AdvancedHMC comparator
+groups. The adjacent TOML records source/data hashes and measurement limits.
+
+`multinomial-optimization-v1.toml` preserves two rejected experiments. Choosing
+DEFAULT, THREE_FRY or PHILOX RNG algorithms gives similar sixteen-step
+throughput. Fully expanding the sixteen-step inner loop raises compilation from
+about 44 to 107 seconds, expands MLIR from 79 to 545 kB, and slows execution from
+about 15 to 35 microseconds per transition. The retained-loop and RNG defaults
+therefore remain unchanged. The same receipt measures native sixteen-step
+throughput at about 6.2 microseconds versus AdvancedHMC's fastest 12.6.
+
 The compiler now accepts captured constant builtin scalar values/types in
 method bodies. Preparation rejects nonconstant bindings and mutable global
 objects. `constant_binding_probe.jl` exercises that boundary with actual captured

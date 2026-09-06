@@ -1,0 +1,21 @@
+"schema_version" = 1
+"source_commit" = "27b600e71aa8d7fa4a433b6890090253521f5577"
+"scaling_driver_sha256" = "833fb38bcf425d094c1339a4c3f0cc6d221a98ac1f5bede098783917b6871e75"
+"data_sha256" = "277a6071d22f740a3ff28d45d3e8ce74a8ee9b5fc5c672903fce0bd074418af7"
+"host" = "strato2"
+"julia" = "1.10.11"
+"reactant" = "0.2.284"
+"enzyme" = "0.13.199"
+"ahmc" = "0.8.6"
+"exit_code" = 0
+"process_elapsed_seconds" = 154
+"model" = "centered_eight_schools"
+"dimensions" = 10
+"stepsize" = 0.03
+"steps_per_transition" = [4, 16]
+"transitions" = [100, 1000, 10000]
+"replicates" = 7
+"execute_rows" = 168
+"compile_rows" = 6
+"command" = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/multinomial_scaling.jl /absolute/output.csv"
+"notes" = "Final state only, fixed unit diagonal metric, no adaptation/history. Same density and gradient callbacks. AdvancedHMC includes trajectory materialization and its acceptance statistics; generated source uses streaming selection without statistics. Timing resets outside the timed batch. Reactant sync=true, donated_args=:none. Each generated batch verifies L*n integration steps; gradient_evaluations is that count from the one-gradient-per-step source, validated separately at L4. No cross-backend numerical agreement. Compiles are in one process in CSV order: first is cold, later rows benefit from process-local code reuse. Never pool compile rows with execution. paired_with identifies the generated backend immediately preceding an AdvancedHMC sample; preserve both comparator groups."
