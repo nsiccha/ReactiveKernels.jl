@@ -2,6 +2,7 @@ using Test
 using DifferentiationInterface
 import Enzyme
 using Distributions
+using LogExpFunctions: logistic
 
 using ReactiveKernelsDistributionKernels: DistributionKernelSources
 using ReactiveKernelsKernelExamples.DistributionExamples
@@ -134,7 +135,7 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
     end
 
     @testset "sources build native recipes checked against a Distributions oracle" begin
-        @test length(artifacts) == 11
+        @test length(artifacts) == 15
         continuous, discrete, vectorized = all_sources()
         # No forced API demonstrations: these are plain native densities. Nothing
         # shoehorns a `compose` call; the vectorized source generates its batched
@@ -193,6 +194,51 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
             plated_code = string(code_expr(artifact.plated))
             @test occursin("logpdf", plated_code)
             @test !occursin("Distributions", plated_code)
+        end
+
+        # The four added scalar families (Poisson, Gamma, Beta, Binomial) lift
+        # through the same generic `plate` path, guard their observation domains
+        # to -Inf without control flow, and expose authoritative HAVE routes.
+        poisson_a, gamma_a, beta_a, binomial_a = artifacts[12:15]
+        for artifact in (poisson_a, gamma_a, beta_a, binomial_a)
+            plated_inputs = Tuple(artifact.plate_inputs)
+            observations = first(plated_inputs)
+            shared = Base.tail(plated_inputs)
+            expected = sum(artifact.kernel(observation, shared...)
+                           for observation in observations)
+            @test artifact.plate_output ≈ expected
+            @test artifact.plated(plated_inputs...) ≈ expected
+            plated_code = string(code_expr(artifact.plated))
+            @test occursin("logpdf", plated_code)
+            @test !occursin("Distributions", plated_code)
+        end
+        @test poisson_a.kernel(-1, poisson_a.inputs.log_rate) == -Inf
+        @test gamma_a.kernel(-1.0, gamma_a.inputs.shape, gamma_a.inputs.log_rate) == -Inf
+        @test beta_a.kernel(0.0, beta_a.inputs.a, beta_a.inputs.b) == -Inf
+        @test beta_a.kernel(1.0, beta_a.inputs.a, beta_a.inputs.b) == -Inf
+        @test binomial_a.kernel(binomial_a.inputs.n + 1, binomial_a.inputs.n,
+                                binomial_a.inputs.logit) == -Inf
+        # Gamma accepts rate, scale, or log rate; Binomial accepts probability or
+        # logit. One authored graph, several authoritative HAVE entries.
+        let gx = 1.4, gshape = 2.0, grate = 1.5
+            gref = logpdf(Gamma(gshape, 1 / grate), gx)
+            @test prepare(gamma.logpdf; have = (:x, :shape, :rate),
+                          want = :logpdf)(gx, gshape, grate) ≈ gref
+            @test prepare(gamma.logpdf; have = (:x, :shape, :scale),
+                          want = :logpdf)(gx, gshape, 1 / grate) ≈ gref
+            @test prepare(gamma.logpdf; have = (:x, :shape, :log_rate),
+                          want = :logpdf)(gx, gshape, log(grate)) ≈ gref
+        end
+        let bobs = 3, bn = 10, blogit = 0.2
+            bref = logpdf(Binomial(bn, logistic(blogit)), bobs)
+            # `binomial` shadows `Base.binomial`, so a consumer must qualify it
+            # (or import it explicitly); bare `binomial` is ambiguous here.
+            @test prepare(DistributionKernelSources.binomial.logpdf;
+                          have = (:observed, :n, :logit),
+                          want = :logpdf)(bobs, bn, blogit) ≈ bref
+            @test prepare(DistributionKernelSources.binomial.logpdf;
+                          have = (:observed, :n, :p),
+                          want = :logpdf)(bobs, bn, logistic(blogit)) ≈ bref
         end
 
         mvnormal, ar1 = artifacts[10:11]
@@ -282,15 +328,17 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
         @test all(artifact -> artifact.allocated_bytes >= 0, artifacts)
         @test all(artifact -> artifact.reference_allocated_bytes >= 0, artifacts)
         # Scalar native kernels are fully non-allocating, including the added
-        # Exponential/Geometric/Uniform formulas, and so are their oracles.
-        scalar_artifacts = artifacts[[1, 2, 4, 5, 6, 7, 8, 9]]
+        # Exponential/Geometric/Uniform and Poisson/Gamma/Beta/Binomial formulas.
+        # (Their Distributions oracles are only required to be non-negative:
+        # Poisson/Gamma/Beta/Binomial constructors allocate, unlike the RK graph.)
+        scalar_artifacts = artifacts[[1, 2, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15]]
         @test all(artifact -> artifact.allocated_bytes == 0, scalar_artifacts)
         @test all(artifact -> artifact.reference_allocated_bytes == 0,
-                  scalar_artifacts)
+                  artifacts[[1, 2, 4, 5, 6, 7, 8, 9]])
     end
 
     @testset "concrete inference evidence matches exact result types" begin
-        expected_returns = ntuple(_ -> Float64, 11)
+        expected_returns = ntuple(_ -> Float64, 15)
         for (artifact, expected_return) in zip(artifacts, expected_returns)
             observed = artifact.kernel(Tuple(artifact.inputs)...)
             @test isconcretetype(artifact.inferred_return)
@@ -304,10 +352,14 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
         gradients = Dict{Symbol,Any}()
         for artifact in artifacts
             values = Tuple(artifact.inputs)
-            active_index = artifact.name in (
-                :discrete_bernoulli_logit, :geometric_logit,
-            ) ? 2 : findfirst(==(:x), propertynames(artifact.inputs))
-            active_name = inputs(artifact.kernel)[active_index].name
+            # Integer-observation families differentiate their continuous scalar
+            # parameter; everything else differentiates the observation `x`.
+            active_name =
+                artifact.name === :discrete_bernoulli_logit ? :logit :
+                artifact.name === :geometric_logit ? :logitp :
+                artifact.name === :poisson_lograte ? :log_rate :
+                artifact.name === :binomial_logit ? :logit :
+                :x
             prepared = prepare_ad(
                 artifact.kernel, DISTRIBUTION_ENZYME_BACKEND, values...;
                 active = active_name,
@@ -331,5 +383,20 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
         xbatch, μbatch, σbatch = Tuple(vectorized.inputs)
         @test gradients[:vectorized_normal] ≈
               @. -(xbatch - μbatch) / σbatch^2
+
+        # Analytic scores for the four added families, checked against the same
+        # reverse pass. Poisson/Binomial differentiate their continuous
+        # parameter; Gamma/Beta differentiate the observation.
+        po_obs, po_log_rate = Tuple(artifacts[12].inputs)
+        @test gradients[:poisson_lograte] ≈ po_obs - exp(po_log_rate)
+
+        g_x, g_shape, g_log_rate = Tuple(artifacts[13].inputs)
+        @test gradients[:gamma_shape_rate] ≈ (g_shape - 1) / g_x - exp(g_log_rate)
+
+        b_x, b_a, b_b = Tuple(artifacts[14].inputs)
+        @test gradients[:beta_unit_interval] ≈ (b_a - 1) / b_x - (b_b - 1) / (1 - b_x)
+
+        bi_obs, bi_n, bi_logit = Tuple(artifacts[15].inputs)
+        @test gradients[:binomial_logit] ≈ bi_obs - bi_n * logistic(bi_logit)
     end
 end

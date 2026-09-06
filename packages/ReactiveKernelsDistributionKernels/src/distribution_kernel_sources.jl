@@ -9,13 +9,17 @@ export BERNOULLI_KERNEL_SOURCE, LOGNORMAL_KERNEL_SOURCE
 export EXPONENTIAL_KERNEL_SOURCE, GEOMETRIC_KERNEL_SOURCE, UNIFORM_KERNEL_SOURCE
 export MVNORMAL_KERNEL_SOURCE, AR1_KERNEL_SOURCE
 export CATEGORICAL_LOGIT_KERNEL_SOURCE, CATEGORICAL_LOGIT_REF_KERNEL_SOURCE
+export POISSON_KERNEL_SOURCE, GAMMA_KERNEL_SOURCE
+export BETA_KERNEL_SOURCE, BINOMIAL_KERNEL_SOURCE
 export bernoulli, lognormal, exponential, geometric, uniform, mvnormal, ar1
 export categorical_logit, categorical_logit_ref
+export poisson, gamma, beta, binomial
 export NORMAL_LOGDENSITY_SOURCE, CAUCHY_LOGDENSITY_SOURCE
 export NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY
 export BERNOULLI_SOURCE, LOGNORMAL_SOURCE
 export EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE
 export MVNORMAL_SOURCE, AR1_SOURCE
+export POISSON_SOURCE, GAMMA_SOURCE, BETA_SOURCE, BINOMIAL_SOURCE
 
 const LOCATION_SCALE_SOURCE = raw"""
 using SpecialFunctions: erfc, erfcinv
@@ -283,14 +287,115 @@ using LogExpFunctions: logaddexp, logsumexp
 end
 """
 
+# Discrete count family. `log_rate` is the canonical GLM/log-link HAVE route;
+# `rate` is the equivalent linear representation. Poisson has no closed-form
+# quantile (discrete inversion needs an iterative search, which is not a pure
+# straight-line endpoint), so only `logpdf` and `cdf` are exposed. `cdf` is the
+# regularized upper incomplete gamma Q(k+1, λ).
+const POISSON_KERNEL_SOURCE = raw"""
+using SpecialFunctions: loggamma, gamma_inc
+
+@kernel poisson(rate::Float64) = begin
+    log_rate::Float64 = log(rate)
+    rate::Float64 = exp(log_rate)
+
+    logpdf(observed::Int)::Float64 =
+        ifelse(observed >= 0,
+               observed * log_rate - rate - loggamma(observed + 1.0),
+               -Inf)
+    cdf(observed::Int)::Float64 =
+        ifelse(observed >= 0, last(gamma_inc(observed + 1.0, rate)), 0.0)
+end
+"""
+
+# Continuous positive family with the conjugate shape/rate boundary. The rate is
+# authoritative via `rate`/`log_rate`/`scale`: supplying any one selects that
+# route while the others become derived views. `logpdf` uses `log_rate` directly
+# for the normalization so no `log(exp(log_rate))` round trip enters the plan.
+const GAMMA_KERNEL_SOURCE = raw"""
+using SpecialFunctions: loggamma, gamma_inc, gamma_inc_inv
+
+@kernel gamma(shape::Float64, rate::Float64) = begin
+    log_rate::Float64 = log(rate)
+    rate::Float64 = exp(log_rate)
+    scale::Float64 = 1 / rate
+    rate::Float64 = 1 / scale
+
+    logpdf(x::Float64)::Float64 = begin
+        valid::Bool = x > 0
+        safe_x::Float64 = ifelse(valid, x, 1.0)
+        value::Float64 =
+            shape * log_rate - loggamma(shape) +
+            (shape - 1) * log(safe_x) - rate * safe_x
+        ifelse(valid, value, -Inf)
+    end
+    cdf(x::Float64)::Float64 =
+        ifelse(x > 0, first(gamma_inc(shape, rate * x)), 0.0)
+    quantile(p::Float64)::Float64 = gamma_inc_inv(shape, p, 1 - p) / rate
+end
+"""
+
+# Continuous unit-interval family with two positive shapes. `cdf` is the
+# regularized incomplete beta I_x(a, b); `quantile` its inverse.
+const BETA_KERNEL_SOURCE = raw"""
+using SpecialFunctions: logbeta, beta_inc, beta_inc_inv
+
+@kernel beta(a::Float64, b::Float64) = begin
+    logpdf(x::Float64)::Float64 = begin
+        valid::Bool = (x > 0) & (x < 1)
+        safe_x::Float64 = ifelse(valid, x, 0.5)
+        value::Float64 =
+            (a - 1) * log(safe_x) + (b - 1) * log1p(-safe_x) - logbeta(a, b)
+        ifelse(valid, value, -Inf)
+    end
+    cdf(x::Float64)::Float64 =
+        ifelse(x <= 0, 0.0, ifelse(x >= 1, 1.0, first(beta_inc(a, b, x))))
+    quantile(p::Float64)::Float64 = first(beta_inc_inv(a, b, p, 1 - p))
+end
+"""
+
+# Discrete family over 0..n trials. `logit` is the canonical logit-link HAVE
+# route (matching `bernoulli`); `p` is the equivalent probability. No
+# closed-form quantile (discrete inversion), so only `logpdf` and `cdf` are
+# exposed. `cdf` is the regularized incomplete beta I_{1-p}(n-k, k+1).
+const BINOMIAL_KERNEL_SOURCE = raw"""
+using LogExpFunctions: logistic, log1pexp
+using SpecialFunctions: loggamma, beta_inc
+
+@kernel binomial(n::Int, p::Float64) = begin
+    logit::Float64 = log(p) - log1p(-p)
+    p::Float64 = logistic(logit)
+    logp::Float64 = -log1pexp(-logit)
+    log1mp::Float64 = -log1pexp(logit)
+
+    logpdf(observed::Int)::Float64 = begin
+        valid::Bool = (observed >= 0) & (observed <= n)
+        log_choose::Float64 =
+            loggamma(n + 1.0) - loggamma(observed + 1.0) -
+            loggamma(n - observed + 1.0)
+        value::Float64 =
+            log_choose + observed * logp + (n - observed) * log1mp
+        ifelse(valid, value, -Inf)
+    end
+    cdf(observed::Int)::Float64 =
+        ifelse(observed < 0, 0.0,
+               ifelse(observed >= n, 1.0,
+                      first(beta_inc(float(n - observed),
+                                     observed + 1.0, 1 - p))))
+end
+"""
+
 const _OTHER_DISTRIBUTION_BINDINGS = _evaluate_source_bindings(
     join((BERNOULLI_KERNEL_SOURCE, LOGNORMAL_KERNEL_SOURCE,
           EXPONENTIAL_KERNEL_SOURCE, GEOMETRIC_KERNEL_SOURCE,
           UNIFORM_KERNEL_SOURCE, MVNORMAL_KERNEL_SOURCE,
           AR1_KERNEL_SOURCE, CATEGORICAL_LOGIT_KERNEL_SOURCE,
-          CATEGORICAL_LOGIT_REF_KERNEL_SOURCE), "\n"),
+          CATEGORICAL_LOGIT_REF_KERNEL_SOURCE,
+          POISSON_KERNEL_SOURCE, GAMMA_KERNEL_SOURCE,
+          BETA_KERNEL_SOURCE, BINOMIAL_KERNEL_SOURCE), "\n"),
     (:bernoulli, :lognormal, :exponential, :geometric, :uniform, :mvnormal, :ar1,
-     :categorical_logit, :categorical_logit_ref),
+     :categorical_logit, :categorical_logit_ref,
+     :poisson, :gamma, :beta, :binomial),
 )
 const bernoulli = _OTHER_DISTRIBUTION_BINDINGS[1]
 const lognormal = _OTHER_DISTRIBUTION_BINDINGS[2]
@@ -301,6 +406,10 @@ const mvnormal = _OTHER_DISTRIBUTION_BINDINGS[6]
 const ar1 = _OTHER_DISTRIBUTION_BINDINGS[7]
 const categorical_logit = _OTHER_DISTRIBUTION_BINDINGS[8]
 const categorical_logit_ref = _OTHER_DISTRIBUTION_BINDINGS[9]
+const poisson = _OTHER_DISTRIBUTION_BINDINGS[10]
+const gamma = _OTHER_DISTRIBUTION_BINDINGS[11]
+const beta = _OTHER_DISTRIBUTION_BINDINGS[12]
+const binomial = _OTHER_DISTRIBUTION_BINDINGS[13]
 
 const BERNOULLI_SOURCE = BERNOULLI_KERNEL_SOURCE * raw"""
 
@@ -525,6 +634,125 @@ docs_example = (;
     replicated = ar1_replicated,
     replica_inputs,
     replica_output,
+)
+"""
+
+const POISSON_SOURCE = POISSON_KERNEL_SOURCE * raw"""
+
+poisson_kernel = prepare(poisson.logpdf;
+    have = (:observed, :log_rate), want = :logpdf)
+poisson_plated = plate(poisson.logpdf;
+    have = (:observed, :log_rate), want = :logpdf, batched = (:observed,))
+
+observed = 3
+log_rate = log(2.5)
+inputs = (; observed, log_rate)
+output = poisson_kernel(Tuple(inputs)...)
+
+plate_observed = [0, 1, 3, 2, 5]
+plate_inputs = (; observed = plate_observed, log_rate)
+plate_output = poisson_plated(Tuple(plate_inputs)...)
+
+docs_example = (;
+    name = :poisson_lograte,
+    origin = "Poisson distribution object from rate or log rate (build executed)",
+    inputs,
+    spec = poisson.logpdf,
+    kernel = poisson_kernel,
+    output,
+    plated = poisson_plated,
+    plate_inputs,
+    plate_output,
+)
+"""
+
+const GAMMA_SOURCE = GAMMA_KERNEL_SOURCE * raw"""
+
+gamma_kernel = prepare(gamma.logpdf;
+    have = (:x, :shape, :log_rate), want = :logpdf)
+gamma_plated = plate(gamma.logpdf;
+    have = (:x, :shape, :log_rate), want = :logpdf, batched = (:x,))
+
+x = 1.4
+shape = 2.0
+log_rate = log(1.5)
+inputs = (; x, shape, log_rate)
+output = gamma_kernel(Tuple(inputs)...)
+
+plate_x = [0.3, 1.4, 2.2, 0.9]
+plate_inputs = (; x = plate_x, shape, log_rate)
+plate_output = gamma_plated(Tuple(plate_inputs)...)
+
+docs_example = (;
+    name = :gamma_shape_rate,
+    origin = "Gamma distribution object from shape with rate, scale, or log rate (build executed)",
+    inputs,
+    spec = gamma.logpdf,
+    kernel = gamma_kernel,
+    output,
+    plated = gamma_plated,
+    plate_inputs,
+    plate_output,
+)
+"""
+
+const BETA_SOURCE = BETA_KERNEL_SOURCE * raw"""
+
+beta_kernel = prepare(beta.logpdf;
+    have = (:x, :a, :b), want = :logpdf)
+beta_plated = plate(beta.logpdf;
+    have = (:x, :a, :b), want = :logpdf, batched = (:x,))
+
+x = 0.3
+a = 2.0
+b = 5.0
+inputs = (; x, a, b)
+output = beta_kernel(Tuple(inputs)...)
+
+plate_x = [0.1, 0.3, 0.6, 0.85]
+plate_inputs = (; x = plate_x, a, b)
+plate_output = beta_plated(Tuple(plate_inputs)...)
+
+docs_example = (;
+    name = :beta_unit_interval,
+    origin = "Beta distribution object on the unit interval (build executed)",
+    inputs,
+    spec = beta.logpdf,
+    kernel = beta_kernel,
+    output,
+    plated = beta_plated,
+    plate_inputs,
+    plate_output,
+)
+"""
+
+const BINOMIAL_SOURCE = BINOMIAL_KERNEL_SOURCE * raw"""
+
+binomial_kernel = prepare(binomial.logpdf;
+    have = (:observed, :n, :logit), want = :logpdf)
+binomial_plated = plate(binomial.logpdf;
+    have = (:observed, :n, :logit), want = :logpdf, batched = (:observed,))
+
+observed = 3
+n = 10
+logit = 0.2
+inputs = (; observed, n, logit)
+output = binomial_kernel(Tuple(inputs)...)
+
+plate_observed = [0, 3, 7, 10]
+plate_inputs = (; observed = plate_observed, n, logit)
+plate_output = binomial_plated(Tuple(plate_inputs)...)
+
+docs_example = (;
+    name = :binomial_logit,
+    origin = "Binomial distribution object from probability or logit with fixed trials (build executed)",
+    inputs,
+    spec = binomial.logpdf,
+    kernel = binomial_kernel,
+    output,
+    plated = binomial_plated,
+    plate_inputs,
+    plate_output,
 )
 """
 
