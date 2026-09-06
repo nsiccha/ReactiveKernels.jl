@@ -1084,7 +1084,7 @@ end
 # Selected by core's `compile_ad_gradient` / `compile_ad_value_and_gradient` when
 # the active argument is a Reactant-traced value. The differentiation engine is
 # the DifferentiationInterface backend stored in the `PreparedADKernel` (verified:
-# `AutoEnzyme(mode = Enzyme.Reverse)` traces through Reactant with exact parity),
+# `AutoEnzyme(mode = Enzyme.Reverse)` traces through Reactant),
 # so no concrete AD engine is imported here.
 #
 # The compiled closure receives the selected HAVE boundary in authored order, uses
@@ -1125,6 +1125,15 @@ function ReactiveKernels._ad_prepared_value_and_gradient(
     call = ReactiveKernels._ADKernelCall{I,typeof(prepared.kernel)}(prepared.kernel)
     DifferentiationInterface.value_and_gradient(
         call, prepared.backend, point, contexts...)
+end
+
+function ReactiveKernels._ad_prepared_value_and_gradient!(
+        prepared::ReactiveKernels.PreparedADKernel, gradient,
+        point::Union{Reactant.TracedRArray,Reactant.TracedRNumber}, contexts)
+    value, derivative = ReactiveKernels._ad_prepared_value_and_gradient(
+        prepared, point, contexts)
+    copyto!(gradient, derivative)
+    value, gradient
 end
 
 function _rk_reactant_compile_ad_call(

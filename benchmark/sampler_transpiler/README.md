@@ -12,6 +12,7 @@ From the repository root:
 julia benchmark/sampler_transpiler/setup.jl
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/hmc_eight_schools.jl compare 1000
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/hmc_eight_schools.jl native-slots 1000
+julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/hmc_eight_schools.jl reactant-slots 1000
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/hmc_eight_schools.jl reactant
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/hmc_eight_schools.jl ahmc
 ```
@@ -54,6 +55,27 @@ The program owns its stores and fixed compiler metadata for its entire lifetime.
 Its private stores and constants are not an API for external mutation. The
 source's known aliases and destination-preserving copies remain part of the
 lowering contract.
+
+`reactant-slots` consumes the same emitted native program. Its backend pass
+turns numerical slots into local variables, derives explicit branch inputs and
+outputs by backward liveness, and proves cache-validity facts across construction
+and every possible transition exit. Only proven facts replace runtime checks.
+Prepared gradient calls stage AD inside the enclosing Reactant compilation.
+Fixed compiler metadata stays outside the numerical state. The pilot expands
+fixed integer loops of at most eight iterations; larger or dynamic loops are
+outside this backend's current support. The batch driver uses a traced loop.
+
+This command interleaves synchronized Reactant execution with AdvancedHMC.
+Every sample constructs fresh device inputs outside timing, because this
+generated program mutates its owned buffers. The state ABI is private: callers
+must preserve its cached values and compiler-proven currentness contract.
+
+`reactant-slots-v1.toml` records the fresh-process checkpoint: 41.9 seconds
+of Reactant compilation and 2.43–2.84 ms per 1,000 transitions, with every batch
+executing 4,000 leapfrog steps. AdvancedHMC's strongest batch in that run takes
+2.13 ms. This establishes working execution of the simplified program; a clear
+Reactant throughput win remains open. The receipt separates model preparation,
+native preparation, backend lowering, compilation, and first execution.
 
 All modes use centered Eight Schools, ten Float64 parameters, a unit diagonal
 metric, step size 0.03, and four leapfrog steps. This is endpoint-Metropolis HMC;

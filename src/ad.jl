@@ -572,6 +572,10 @@ Returns the `(value, gradient)` pair from
 for the active argument's gradient and is mutated in place. Like
 [`ad_gradient`](@ref), this prepared object and its DI preparation are not
 thread-safe; use one per concurrent caller.
+
+A Reactant-traced active input stages the derivative in the enclosing compiled
+program and writes it into the traced destination, without using the native DI
+preparation there.
 """
 @generated function ad_value_and_gradient!(
         prepared::PreparedADKernel{I,K,typeof(tuple)}, gradient,
@@ -587,9 +591,8 @@ thread-safe; use one per concurrent caller.
             "selected HAVE boundary expects " *
             string(length(inputs(prepared.kernel))) *
             " values; got $N"))
-        DifferentiationInterface.value_and_gradient!(
-            prepared.call, gradient, prepared.preparation, prepared.backend,
-            getfield(args, $I), $(contexts...))
+        _ad_prepared_value_and_gradient!(
+            prepared, gradient, getfield(args, $I), ($(contexts...),))
     end
 end
 
@@ -597,6 +600,10 @@ function ad_value_and_gradient!(
         prepared::PreparedADKernel, gradient, args...; kwargs...)
     point, contexts = _ad_prepared_arguments(
         prepared, args, NamedTuple(kwargs))
+    _ad_prepared_value_and_gradient!(prepared, gradient, point, contexts)
+end
+
+function _ad_prepared_value_and_gradient!(prepared, gradient, point, contexts)
     DifferentiationInterface.value_and_gradient!(
         prepared.call, gradient, prepared.preparation, prepared.backend,
         point, contexts...)

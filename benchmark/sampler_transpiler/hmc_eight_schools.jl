@@ -252,14 +252,17 @@ end
 include("native_slots.jl")
 include("native_slots_factory.jl")
 include("native_comparison.jl")
+include("traced_slots.jl")
+include("traced_comparison.jl")
 
 function main(args=ARGS)
     length(args) <= 2 || error("usage: hmc_eight_schools.jl [native|native-slots|compare|reactant|ahmc] [batch_length]")
     backend = isempty(args) ? :native_slots : Symbol(replace(first(args), '-' => '_'))
     n = length(args) == 2 ? parse(Int, args[2]) : 100
     n > 0 || error("batch length must be positive")
-    backend in (:native, :native_slots, :compare, :reactant, :ahmc) || error("unknown backend")
+    backend in (:native, :native_slots, :compare, :reactant, :reactant_slots, :ahmc) || error("unknown backend")
     backend === :ahmc && return run_ahmc(; n)
+    backend === :reactant_slots && return run_traced_comparison(build_fast_prototype();n)
     if backend in (:native_slots,:compare)
         prototype=build_fast_prototype()
         return run_prepared_comparison(prototype.prepared,
