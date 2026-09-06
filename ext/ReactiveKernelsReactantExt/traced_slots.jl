@@ -22,7 +22,8 @@ slot_lmul!(factor,destination)=lmul!(factor,destination)
 @inline slot_scalar_getindex(array,indices...) =
     Reactant.@allowscalar @inbounds getindex(array,indices...)
 
-function compile_traced_slots(program; static_currentness=true, unroll_limit=0, reuse_code=true)
+function compile_traced_slots(program; static_currentness=true, unroll_limit=0,
+        reuse_code=true, projection=nothing)
     contextmap = Dict(Symbol(c.prefix, :_owned)=>c for c in program.contexts)
     sharedmap = Dict(Symbol(c.prefix, :_shared)=>c.shared for c in program.contexts)
     handlemap = Dict(Symbol(c.prefix, :_handles)=>program.resources[i]
@@ -133,6 +134,15 @@ function compile_traced_slots(program; static_currentness=true, unroll_limit=0, 
     nativebody=filter(x->!(x isa LineNumberNode),program.expression.args[2].args)
     body=lower(nativebody[end-1])
     body isa Expr && body.head===:block || error("traced slots: expected emitted source body")
+    # Register requested output reads in the same numerical state layout.
+    # Their recipe work runs only at the final observation boundary, outside
+    # the repeated transition loop.
+    projected = if projection === nothing
+        nothing
+    else
+        parts = filter(x -> !(x isa LineNumberNode), projection.args[2].args)
+        lower(last(parts))
+    end
 
     # Put nested expression effects in evaluation order before tracing control.
     # Immediate zero-argument sibling lambdas have their own terminal return.
@@ -247,6 +257,10 @@ function compile_traced_slots(program; static_currentness=true, unroll_limit=0, 
     live=fresh(:live)
     compiled_statements=Any[:($live=true)]
     blockstatements(body,compiled_statements,live)
+    projection_live=fresh(:projection_live)
+    projection_statements=Any[:($projection_live=true)]
+    projection_value=projection === nothing ? nothing :
+        value(projected,projection_statements,projection_live)
 
     # Prove entry facts for every transition of this privately owned program.
     # Joining construction with every possible exit loses a fact whenever an
@@ -355,6 +369,7 @@ function compile_traced_slots(program; static_currentness=true, unroll_limit=0, 
         found
     end
     union!(variables,assignments(Expr(:block,compiled_statements...)))
+    union!(variables,assignments(Expr(:block,projection_statements...)))
     function references(x)
         x isa Symbol && return x in variables ? Set([x]) : Set{Symbol}()
         found=Set{Symbol}()
@@ -451,8 +466,23 @@ function compile_traced_slots(program; static_currentness=true, unroll_limit=0, 
         (; state=$result,argument,counts=(_ts_counter_1,_ts_counter_2))
     end)
     expanded=macroexpand(@__MODULE__,slot_code_copy(expression))
+    projector = if projection === nothing
+        nothing
+    else
+        needed=union(setdiff(persistent,Set([live])),references(projection_value))
+        project_body,_=control_block(Expr(:block,projection_statements...),needed)
+        project_expression=:((state,argument,counts,metadata)->begin
+            $(setup...)
+            _ts_counter_1=counts[1]
+            _ts_counter_2=counts[2]
+            $project_body
+            (; state=$result,argument,counts=(_ts_counter_1,_ts_counter_2),
+               outputs=$projection_value)
+        end)
+        compile_slot_code(macroexpand(@__MODULE__,slot_code_copy(project_expression));reuse_code)
+    end
     (;f=compile_slot_code(expanded;reuse_code),expression,expanded,metadata=SlotStatic(Tuple(statics)),
-      state=(;values,current=masks),ordered,entry_facts,valid_ordered)
+      state=(;values,current=masks),ordered,entry_facts,valid_ordered,projector)
 end
 
 struct SlotLoop{F,R,S}
