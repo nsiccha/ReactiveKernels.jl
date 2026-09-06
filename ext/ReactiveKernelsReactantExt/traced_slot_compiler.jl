@@ -11,4 +11,5 @@ include("traced_code_cache.jl")
 include("traced_compile_options.jl")
 include("traced_slots.jl")
 include("traced_random.jl")
+include("transpiled_program.jl")
 end

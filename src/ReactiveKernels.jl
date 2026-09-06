@@ -42,6 +42,7 @@ include("kernel_control.jl")
 include("kernel_adaptation.jl")
 include("kernel_structural_container.jl")
 include("native_slot_compiler.jl")
+using .NativeSlotCompiler: prepare_transpiled, initial_transpiled_state, transpiled_endpoint
 include("reactive.jl")
 include("stateful.jl")
 include("visualization.jl")
@@ -58,6 +59,8 @@ export explain, code_expr, inputs, outputs, valtype
 export compose, extract, PreparationCache, prepare!, canon_id
 export KernelSpec, KernelObjectSpec, @kernel, @node, kernel_graph, port, copy!!
 export PartialFunction, partial
+# Experimental captured-control consumer interface.
+export prepare_transpiled, initial_transpiled_state, transpiled_endpoint
 export DAGVisualization, visualize, dot_source, save_visualization
 # Reactive layer
 export ReactiveState, set!, get!, freeze!, unfreeze!, checkpoint, materialize!
