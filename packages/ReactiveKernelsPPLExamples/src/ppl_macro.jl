@@ -16,11 +16,15 @@ Decisions: build GO `2026-09-06T14-20-02-559-1r5p4j1`; scope MINIMAL
 
 # First-cut scope
 
-- Parameters: **scalar**, each taking one packed-unconstrained coordinate, with
-  support inferred from the sampling distribution and the matching transform +
+- Scalar parameters take one packed-unconstrained coordinate, with support
+  inferred from the sampling distribution and the matching transform +
   log-Jacobian authored in both directions — real (`normal` / `cauchy` /
   `laplace`, identity), positive (`exponential` / `gamma` / `lognormal`,
   log/exp), unit (`beta`, logit/logistic).
+- **Vector parameters** — `name[size] ~ dist(…)` (real support) — take a packed
+  slice of `size` coordinates (`size` a data argument or literal; the packed
+  layout tracks a running offset), and their prior is the summed per-element
+  authored `plate`.
 - `parameters` has two producers (constrain-only, and joint with `log_jacobian`
   so a params+Jacobian query shares the transform) plus named-latent inverse
   edges, so a packed, named-latent, or `parameters` HAVE boundary all route
@@ -34,11 +38,11 @@ Decisions: build GO `2026-09-06T14-20-02-559-1r5p4j1`; scope MINIMAL
   `posterior`. Queried the usual way, e.g.
   `prepare(model; have = (:unconstrained, data...), want = :posterior)`.
 
-Vector parameters (prior `plate`), explicit constraint overrides / half /
-bounded / truncated families, transforms via the `ReactiveKernels:ppl:bijectors`
-objects (currently authored inline, matching the hand-written examples), and
-user PPL-AST transformations are follow-up increments (todo
-`2026-09-06T15-02-44-929-0mw9lhd`).
+Constrained (positive/unit) vector parameters, explicit constraint overrides /
+half / bounded / truncated families (e.g. eight-schools' half-Cauchy), transforms
+via the `ReactiveKernels:ppl:bijectors` objects (currently authored inline,
+matching the hand-written examples), and user PPL-AST transformations are
+follow-up increments (todo `2026-09-06T15-02-44-929-0mw9lhd`).
 """
 module PPLMacro
 
@@ -67,8 +71,15 @@ const _SUPPORT = Dict{Symbol,Symbol}(
 struct _Param
     name::Symbol
     dist::Any        # the dist-call Expr, e.g. :(normal(0.0, 5.0))
-    support::Symbol  # :real (first cut)
+    support::Symbol  # :real / :positive / :unit
+    size::Any        # `nothing` for a scalar; a size expression for a vector
 end
+
+# Running packed-offset arithmetic that stays a literal while every preceding
+# parameter is scalar and becomes an expression once a runtime-sized vector
+# parameter shifts the layout.
+_offset_add(off::Int, n::Int) = off + n
+_offset_add(off, n) = :( $(off) + $(n) )
 
 struct _Obs
     data::Symbol     # the observed (data) argument name
@@ -115,22 +126,36 @@ function _parse(def)
         if stmt isa Expr && stmt.head === :call && stmt.args[1] === :~
             lhs = stmt.args[2]
             rhs = stmt.args[3]
-            lhs isa Symbol ||
-                error("@ppl: `~` left-hand side must be a name, got $(lhs)")
+            # LHS is a bare name (scalar) or `name[size]` (vector parameter).
+            if lhs isa Symbol
+                lname, lsize = lhs, nothing
+            elseif lhs isa Expr && lhs.head === :ref && length(lhs.args) == 2 &&
+                    lhs.args[1] isa Symbol
+                lname, lsize = lhs.args[1], lhs.args[2]
+            else
+                error("@ppl: `~` left-hand side must be a name or `name[size]`, got $(lhs)")
+            end
             (_call_head(rhs) isa Symbol) ||
                 error("@ppl: `~` right-hand side must be a distribution call, got $(rhs)")
-            if lhs in datanames
-                push!(obs, _Obs(lhs, rhs))
+            if lname in datanames
+                lsize === nothing ||
+                    error("@ppl: observation `$(lname)` cannot carry a `[size]` annotation")
+                push!(obs, _Obs(lname, rhs))
             else
-                lhs in seen && error("@ppl: parameter $(lhs) declared twice")
-                push!(seen, lhs)
+                lname in seen && error("@ppl: parameter $(lname) declared twice")
+                push!(seen, lname)
                 dist = _call_head(rhs)
                 haskey(_SUPPORT, dist) || error(
-                    "@ppl (first cut): parameter $(lhs) ~ $(dist)(…) — supported " *
+                    "@ppl (first cut): parameter $(lname) ~ $(dist)(…) — supported " *
                     "parameter distributions are $(sort(collect(keys(_SUPPORT)))); " *
                     "explicit constraint overrides and other families are a " *
                     "follow-up increment.")
-                push!(params, _Param(lhs, rhs, _SUPPORT[dist]))
+                support = _SUPPORT[dist]
+                (lsize === nothing || support === :real) || error(
+                    "@ppl (first cut): vector parameter $(lname)[$(lsize)] ~ $(dist)(…) — " *
+                    "only real-support vector parameters are supported yet; " *
+                    "constrained (positive/unit) vector parameters are a follow-up increment.")
+                push!(params, _Param(lname, rhs, support, lsize))
             end
         elseif stmt isa Expr && stmt.head === :(=)
             push!(passthrough, stmt)
@@ -223,8 +248,19 @@ function _lower(name, dataargs, params, obs, passthrough)
     #    a packed, a named-latent, or a `parameters` query without recomputation
     #    or a `log(exp(x))` round trip.
     jac_terms = Any[]
-    for (i, p) in enumerate(params)
-        coord = :( sum(view(unconstrained, $i:$i)) )
+    off = 0  # running packed offset BEFORE the current parameter
+    for p in params
+        lo = _offset_add(off, 1)
+        if p.size !== nothing
+            # Real-support vector parameter (identity transform): one packed
+            # slice of `size` coordinates.
+            hi = _offset_add(off, p.size)
+            push!(stmts, :( $(p.name)::AbstractVector{Float64} =
+                view(unconstrained, $(lo):$(hi)) ))
+            off = hi
+            continue
+        end
+        coord = :( sum(view(unconstrained, $(lo):$(lo))) )
         if p.support === :real
             push!(stmts, :( $(p.name)::Float64 = $(coord) ))
         elseif p.support === :positive
@@ -242,6 +278,7 @@ function _lower(name, dataargs, params, obs, passthrough)
         else
             error("@ppl: unhandled parameter support $(p.support)")
         end
+        off = _offset_add(off, 1)
     end
 
     # 2. Deterministic pass-through assignments (transforms/covariate prep).
@@ -258,12 +295,28 @@ function _lower(name, dataargs, params, obs, passthrough)
     push!(stmts, Expr(:(=),
         Expr(:tuple, :parameters, :( log_jacobian::Float64 )),
         Expr(:tuple, :( (; $(pnames...)) ), jac_expr)))
-    inv_lhs = Expr(:tuple, (:( $(n)::Float64 ) for n in pnames)...)
-    inv_rhs = Expr(:tuple, (:( parameters.$(n) ) for n in pnames)...)
+    _pann(p) = p.size === nothing ? :( $(p.name)::Float64 ) :
+               :( $(p.name)::AbstractVector{Float64} )
+    inv_lhs = Expr(:tuple, (_pann(p) for p in params)...)
+    inv_rhs = Expr(:tuple, (:( parameters.$(p.name) ) for p in params)...)
     push!(stmts, Expr(:(=), inv_lhs, inv_rhs))
 
     # 4. Prior: sum of each parameter's log density on its constrained value.
-    prior_terms = [ :( $(p.dist).logpdf($(p.name)) ) for p in params ]
+    #    A scalar contributes `dist.logpdf(p)`; a vector contributes the summed
+    #    per-element prior over an authored `plate` (same cell lowering as an
+    #    observation, with the parameter itself in the sliced position). The plate
+    #    is bound to its own variable first — a constructed-endpoint plate must be
+    #    a whole recipe RHS, not a sub-expression of `sum(…)`.
+    prior_terms = Any[]
+    for p in params
+        if p.size === nothing
+            push!(prior_terms, :( $(p.dist).logpdf($(p.name)) ))
+        else
+            pv = Symbol(:_ppl_prior_, p.name)
+            push!(stmts, :( $(pv) = $(_obs_plate(_Obs(p.name, p.dist), modelsyms)) ))
+            push!(prior_terms, :( sum($(pv)) ))
+        end
+    end
     prior_expr = length(prior_terms) == 1 ? prior_terms[1] :
                  foldl((a, b) -> :( $a + $b ), prior_terms)
     push!(stmts, :( prior::Float64 = $(prior_expr) ))

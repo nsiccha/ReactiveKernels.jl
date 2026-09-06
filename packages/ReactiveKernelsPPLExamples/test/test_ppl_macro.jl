@@ -129,6 +129,39 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
         @test got ≈ ref_density
     end
 
+    @testset "vector parameter (hierarchical model, prior plate)" begin
+        @ppl hier(y::Vector{Float64}, sigma::Vector{Float64}, J::Int) = begin
+            mu ~ normal(0.0, 10.0)
+            theta[J] ~ normal(mu, 1.0)
+            y ~ normal(theta, sigma)
+        end
+        q = [0.5, 1.0, -0.5, 2.0]     # mu, theta[1..3]
+        J = 3
+        yh = [1.2, -0.3, 1.8]
+        sig = [1.0, 1.0, 1.0]
+        muv = q[1]
+        th = q[2:4]
+        ref_prior = nlp(muv, 0.0, 10.0) + sum(nlp(th[i], muv, 1.0) for i in 1:3)
+        ref_ll = sum(nlp(yh[i], th[i], sig[i]) for i in 1:3)
+
+        post = prepare(hier; have = (:unconstrained, :y, :sigma, :J),
+                       want = :posterior)(q, yh, sig, J)
+        @test post ≈ ref_prior + ref_ll
+
+        params, prior, likelihood = prepare(hier;
+            have = (:unconstrained, :y, :sigma, :J),
+            want = (:parameters, :prior, :likelihood))(q, yh, sig, J)
+        @test params.mu == 0.5
+        @test collect(params.theta) == th
+        @test prior ≈ ref_prior
+        @test likelihood ≈ ref_ll
+
+        # constrain-only prunes the density work.
+        pars = prepare(hier; have = (:unconstrained, :J), want = :parameters)(q, J)
+        @test pars.mu == 0.5
+        @test collect(pars.theta) == th
+    end
+
     @testset "out-of-scope constructs fail loudly" begin
         # a discrete family is not a supported continuous parameter prior.
         @test_throws Exception macroexpand(@__MODULE__, :(@ppl bad(
