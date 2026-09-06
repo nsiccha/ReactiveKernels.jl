@@ -73,6 +73,7 @@ site_pages = [
         "Adaptive NUTS receipt (static)" => "nuts-reactant.md",
     ],
     "Non-allocating kernels" => "nonallocating.md",
+    "posteriordb benchmark (RK vs Stan vs Turing)" => "posteriordb-comparison.md",
     "Tools and reference" => [
         "DAG visualization" => "visualization.md",
         "API" => "api.md",
