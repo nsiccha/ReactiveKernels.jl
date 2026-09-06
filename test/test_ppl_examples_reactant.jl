@@ -1,0 +1,109 @@
+using ReactiveKernels
+using Reactant
+using Reactant: @compile
+using Test
+using ReactiveKernelsPPLExamples.LinearRegressionExample:
+    evaluate_linear_regression_source
+using ReactiveKernelsPPLExamples.ARMA11Example: evaluate_arma11_source
+using ReactiveKernelsPPLExamples.PoissonGammaExample: evaluate_poisson_gamma_source
+using ReactiveKernelsPPLExamples.BetaBinomialExample: evaluate_beta_binomial_source
+using ReactiveKernelsPPLExamples.DugongsGrowthExample: evaluate_dugongs_source
+using ReactiveKernelsPPLExamples.GaussianMixtureExample: evaluate_gaussian_mixture_source
+using ReactiveKernelsPPLExamples.MVNormalRegressionExample:
+    build_mvnormal_regression_graph, MVREG_X, MVREG_Y,
+    MVREG_COVARIANCE, MVREG_CHOL, MVREG_PRECISION, MVREG_PRECISION_CHOL
+using ReactiveKernelsPPLExamples.BoundRegressionExample:
+    build_bound_regression_graph, BOUND_RAW_X, BOUND_Y
+
+_host(v::Reactant.AbstractConcreteArray) = Array(v)
+_host(v::Reactant.AbstractConcreteNumber) = Reactant.to_number(v)
+_host(v::NamedTuple) = NamedTuple{keys(v)}(map(_host, values(v)))
+_host(v::Tuple) = map(_host, v)
+_host(v) = v
+
+_rapprox(a::Number, b::Number) = isapprox(a, b; rtol = 1e-6, atol = 1e-7)
+_rapprox(a::AbstractArray, b::AbstractArray) =
+    length(a) == length(b) && all(_rapprox(x, y) for (x, y) in zip(a, b))
+_rapprox(a::Tuple, b::Tuple) =
+    length(a) == length(b) && all(_rapprox(x, y) for (x, y) in zip(a, b))
+_rapprox(a::NamedTuple, b::NamedTuple) = _rapprox(values(a), values(b))
+_rapprox(a, b) = false
+
+_trace(v) = v isa AbstractArray ? Reactant.to_rarray(v) :
+            Reactant.to_rarray(v; track_numbers = true)
+
+function _compile_run(kernel, inputs)
+    traced = map(_trace, inputs)
+    compiled = @compile sync = true kernel(traced...)
+    _host(compiled(traced...))
+end
+
+# Each migrated / new PPL example compiles and executes through the public
+# Reactant boundary and reproduces its native output. Object-splice densities
+# (normal/cauchy/gamma/poisson/beta/binomial), authored plates, the sequential
+# ARMA recursion, the MvNormal parametrizations, and bound partial evaluation are
+# all exercised on the exact same authored graph the native path uses.
+@testset "PPL examples compile through Reactant" begin
+    @testset "linear_regression" begin
+        a = evaluate_linear_regression_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "arma11 (vectorized closed form lowers; raw recursion stays native-only)" begin
+        # Side-by-side: the model's likelihood/density reduce the vectorized
+        # `errors_closed` (a Toeplitz matvec), which LOWERS and reproduces native.
+        # The natural sequential `errors` node reads err[t-1]/series[t-1] element
+        # by element, so it still does NOT lower (XLA disallows scalar indexing of
+        # a traced array) — kept as an explicit tested diagnostic. The clean path
+        # is the phase-2 stablehlo.while scan lowering (RK core, decision 0b4m77q);
+        # the closed form dodges two Reactant tracing bugs (snag
+        # reactant-trace-s-9ca8b54f) — see docs/src/arma11.md.
+        a = evaluate_arma11_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+        seq_errors_kernel = prepare(a.model;
+            have = (:unconstrained, :series), want = :errors)
+        @test_throws Exception _compile_run(seq_errors_kernel, Tuple(a.inputs))
+    end
+    @testset "poisson_gamma" begin
+        a = evaluate_poisson_gamma_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "beta_binomial" begin
+        a = evaluate_beta_binomial_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "dugongs" begin
+        a = evaluate_dugongs_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "gaussian_mixture" begin
+        a = evaluate_gaussian_mixture_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "mvnormal_regression (per parametrization)" begin
+        g = build_mvnormal_regression_graph()
+        q = [0.5, 2.0, -1.0]
+        for (port, value) in ((:covariance, MVREG_COVARIANCE),
+                              (:chol, MVREG_CHOL),
+                              (:precision, MVREG_PRECISION),
+                              (:precision_chol, MVREG_PRECISION_CHOL))
+            k = prepare(g;
+                have = (:unconstrained, :predictors, :responses, port), want = :density)
+            native = k(q, MVREG_X, MVREG_Y, value)
+            @testset "$port" begin
+                @test _rapprox(_compile_run(k, (q, MVREG_X, MVREG_Y, value)), native)
+            end
+        end
+    end
+    @testset "bound_regression" begin
+        g = build_bound_regression_graph()
+        q = [1.0, 2.0, -1.0, log(0.5)]
+        unbound = prepare(g;
+            have = (:unconstrained, :raw_predictors, :responses), want = :density)
+        @test _rapprox(_compile_run(unbound, (q, BOUND_RAW_X, BOUND_Y)),
+                       unbound(q, BOUND_RAW_X, BOUND_Y))
+        bound = prepare(g;
+            have = (:unconstrained, :raw_predictors, :responses), want = :density,
+            bound = (; raw_predictors = BOUND_RAW_X))
+        @test _rapprox(_compile_run(bound, (q, BOUND_Y)), bound(q, BOUND_Y))
+    end
+end

@@ -1,0 +1,25 @@
+source = "benchmark/fair_posteriordb_gp.jl (+ _body.jl) — executed model authority"
+rk_source_commit = "71dbccfb36a38c0a4ca469b80f4afa2dd1559e06"
+schema = "fair-posteriordb-gp-v1"
+methodology = "median over 10 rounds of BenchmarkTools minimum(200 samples); RK vs optimized Stan (multi_normal_cholesky) vs optimized Turing; parity vs FD oracle (max grad rel err 3.6e-10)"
+note = "gp_regr N=30 dim3. HONEST RK LOSS on dense-linalg: RK builds the covariance + cholesky in-graph and allocates (31KB primal / 68KB gradient), while Stan's cholesky_decompose + multi_normal_cholesky is fused C++ with analytic gradient."
+
+[environment]
+julia = "1.10.11"
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+stan = "2.39.0 (BridgeStan 2.9.0)"
+
+[[models.measurements]]
+model = "gp_regr"
+dim = 3
+[models.measurements.primal]
+stan_ns = 6180.0
+turing_ns = 6280.0
+rk_ns = 9280.0
+rk_vs_stan = 1.5
+[models.measurements.gradient]
+stan_ns = 22210.0
+turing_ns = 58860.0
+rk_ns = 57250.0
+rk_vs_stan = 2.58

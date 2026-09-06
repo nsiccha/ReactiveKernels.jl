@@ -1,0 +1,81 @@
+source = "benchmark/fair_posteriordb_linear.jl (+ _body.jl) — executed model authority"
+rk_source_commit = "ca5ec96807c4d09cbdebd40e55069d605640e3ec"
+note = "kidscore_interaction (dim5) + sblri-blr (dim7); linear family, conjugate sufficient-stat form. RK wins 3-5x (like Gaussian). Completes all 10 named posteriordb models."
+schema = "fair-posteriordb-linear-v1"
+generated_at = "2026-09-06T16:29:30.561"
+methodology = "median over 12 rounds; RK conjugate vs optimized Stan (normal_id_glm) vs optimized Turing; parity vs FD oracle"
+
+[[models]]
+model = "kidscore_interaction"
+dim = 5
+
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 706.0
+    median_bytes = 16
+    impl = "stan_glm"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 220.0
+    median_bytes = 240
+    impl = "turing"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 130.0
+    median_bytes = 80
+    impl = "rk"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 1301.0
+    median_bytes = 112
+    impl = "stan"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 1802.5
+    median_bytes = 5056
+    impl = "turing"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 300.0
+    median_bytes = 160
+    impl = "rk"
+[[models]]
+model = "sblri_blr"
+dim = 7
+
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 510.0
+    median_bytes = 16
+    impl = "stan_glm"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 230.0
+    median_bytes = 288
+    impl = "turing"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 150.0
+    median_bytes = 96
+    impl = "rk"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 901.0
+    median_bytes = 128
+    impl = "stan"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 1953.0
+    median_bytes = 5312
+    impl = "turing"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 350.5
+    median_bytes = 192
+    impl = "rk"
+
+[environment]
+julia = "1.10.11"
+arch = "x86_64"
+stan = "2.39.0 (BridgeStan 2.9.0)"
+cpu = "AMD EPYC-Milan Processor"

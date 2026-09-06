@@ -11,15 +11,18 @@ export MVNORMAL_KERNEL_SOURCE, AR1_KERNEL_SOURCE
 export CATEGORICAL_LOGIT_KERNEL_SOURCE, CATEGORICAL_LOGIT_REF_KERNEL_SOURCE
 export POISSON_KERNEL_SOURCE, GAMMA_KERNEL_SOURCE
 export BETA_KERNEL_SOURCE, BINOMIAL_KERNEL_SOURCE
+export INVERSE_GAMMA_KERNEL_SOURCE, DIRICHLET_KERNEL_SOURCE
 export bernoulli, lognormal, exponential, geometric, uniform, mvnormal, ar1
 export categorical_logit, categorical_logit_ref
 export poisson, gamma, beta, binomial
+export inverse_gamma, dirichlet
 export NORMAL_LOGDENSITY_SOURCE, CAUCHY_LOGDENSITY_SOURCE
 export NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY
 export BERNOULLI_SOURCE, LOGNORMAL_SOURCE
 export EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE
 export MVNORMAL_SOURCE, AR1_SOURCE
 export POISSON_SOURCE, GAMMA_SOURCE, BETA_SOURCE, BINOMIAL_SOURCE
+export INVERSE_GAMMA_SOURCE, DIRICHLET_SOURCE
 
 const LOCATION_SCALE_SOURCE = raw"""
 using SpecialFunctions: erfc, erfcinv
@@ -385,6 +388,56 @@ using SpecialFunctions: loggamma, beta_inc
 end
 """
 
+# Continuous positive family; the conjugate prior for a Normal variance
+# (Inverse-Gamma-Normal). Shape α and scale θ; `log_scale` is the authoritative
+# log-scale HAVE route (θ = exp(log_scale)), so the normalization uses
+# `log_scale` directly without a log(exp) round trip. `cdf` is the upper
+# regularized incomplete gamma Q(α, θ/x) — since 1/X ~ Gamma(α, rate = θ) — and
+# `quantile` inverts it through `gamma_inc_inv`.
+const INVERSE_GAMMA_KERNEL_SOURCE = raw"""
+using SpecialFunctions: loggamma, gamma_inc, gamma_inc_inv
+
+@kernel inverse_gamma(shape::Float64, scale::Float64) = begin
+    log_scale::Float64 = log(scale)
+    scale::Float64 = exp(log_scale)
+
+    logpdf(x::Float64)::Float64 = begin
+        valid::Bool = x > 0
+        safe_x::Float64 = ifelse(valid, x, 1.0)
+        value::Float64 =
+            shape * log_scale - loggamma(shape) -
+            (shape + 1) * log(safe_x) - scale / safe_x
+        ifelse(valid, value, -Inf)
+    end
+    cdf(x::Float64)::Float64 =
+        ifelse(x > 0, last(gamma_inc(shape, scale / ifelse(x > 0, x, 1.0))), 0.0)
+    quantile(p::Float64)::Float64 = scale / gamma_inc_inv(shape, 1 - p, p)
+end
+"""
+
+# Simplex family; the conjugate prior for Categorical/Multinomial (Dirichlet).
+# `alpha` is the concentration vector. One whole-vector graph (like `mvnormal`),
+# not a scalar plate: the observation is a single point on the probability
+# simplex. `logpdf` normalizes with the log multivariate Beta,
+# B(alpha) = Σ loggamma(αᵢ) − loggamma(Σ αᵢ). Only `logpdf` is exposed (a
+# vector-valued family has no scalar cdf/quantile). The `max` keeps `log`
+# straight-line; the domain guard returns -Inf without control flow.
+const DIRICHLET_KERNEL_SOURCE = raw"""
+using SpecialFunctions: loggamma
+
+@kernel dirichlet(alpha::Vector{Float64}) = begin
+    log_normalizer::Float64 = loggamma(sum(alpha)) - sum(loggamma, alpha)
+
+    logpdf(x::Vector{Float64})::Float64 = begin
+        valid::Bool = minimum(x) > 0
+        value::Float64 =
+            log_normalizer +
+            sum((alpha .- 1) .* log.(max.(x, floatmin(Float64))))
+        ifelse(valid, value, -Inf)
+    end
+end
+"""
+
 const _OTHER_DISTRIBUTION_BINDINGS = _evaluate_source_bindings(
     join((BERNOULLI_KERNEL_SOURCE, LOGNORMAL_KERNEL_SOURCE,
           EXPONENTIAL_KERNEL_SOURCE, GEOMETRIC_KERNEL_SOURCE,
@@ -392,10 +445,12 @@ const _OTHER_DISTRIBUTION_BINDINGS = _evaluate_source_bindings(
           AR1_KERNEL_SOURCE, CATEGORICAL_LOGIT_KERNEL_SOURCE,
           CATEGORICAL_LOGIT_REF_KERNEL_SOURCE,
           POISSON_KERNEL_SOURCE, GAMMA_KERNEL_SOURCE,
-          BETA_KERNEL_SOURCE, BINOMIAL_KERNEL_SOURCE), "\n"),
+          BETA_KERNEL_SOURCE, BINOMIAL_KERNEL_SOURCE,
+          INVERSE_GAMMA_KERNEL_SOURCE, DIRICHLET_KERNEL_SOURCE), "\n"),
     (:bernoulli, :lognormal, :exponential, :geometric, :uniform, :mvnormal, :ar1,
      :categorical_logit, :categorical_logit_ref,
-     :poisson, :gamma, :beta, :binomial),
+     :poisson, :gamma, :beta, :binomial,
+     :inverse_gamma, :dirichlet),
 )
 const bernoulli = _OTHER_DISTRIBUTION_BINDINGS[1]
 const lognormal = _OTHER_DISTRIBUTION_BINDINGS[2]
@@ -410,6 +465,8 @@ const poisson = _OTHER_DISTRIBUTION_BINDINGS[10]
 const gamma = _OTHER_DISTRIBUTION_BINDINGS[11]
 const beta = _OTHER_DISTRIBUTION_BINDINGS[12]
 const binomial = _OTHER_DISTRIBUTION_BINDINGS[13]
+const inverse_gamma = _OTHER_DISTRIBUTION_BINDINGS[14]
+const dirichlet = _OTHER_DISTRIBUTION_BINDINGS[15]
 
 const BERNOULLI_SOURCE = BERNOULLI_KERNEL_SOURCE * raw"""
 
@@ -753,6 +810,56 @@ docs_example = (;
     plated = binomial_plated,
     plate_inputs,
     plate_output,
+)
+"""
+
+const INVERSE_GAMMA_SOURCE = INVERSE_GAMMA_KERNEL_SOURCE * raw"""
+
+inverse_gamma_kernel = prepare(inverse_gamma.logpdf;
+    have = (:x, :shape, :log_scale), want = :logpdf)
+inverse_gamma_plated = plate(inverse_gamma.logpdf;
+    have = (:x, :shape, :log_scale), want = :logpdf, batched = (:x,))
+
+x = 1.4
+shape = 3.0
+log_scale = log(2.0)
+inputs = (; x, shape, log_scale)
+output = inverse_gamma_kernel(Tuple(inputs)...)
+
+plate_x = [0.6, 1.4, 2.2, 3.1]
+plate_inputs = (; x = plate_x, shape, log_scale)
+plate_output = inverse_gamma_plated(Tuple(plate_inputs)...)
+
+docs_example = (;
+    name = :inverse_gamma_scale,
+    origin = "Inverse-Gamma distribution object from shape with scale or log scale (build executed)",
+    inputs,
+    spec = inverse_gamma.logpdf,
+    kernel = inverse_gamma_kernel,
+    output,
+    plated = inverse_gamma_plated,
+    plate_inputs,
+    plate_output,
+)
+"""
+
+const DIRICHLET_SOURCE = DIRICHLET_KERNEL_SOURCE * raw"""
+
+dirichlet_kernel = prepare(dirichlet.logpdf;
+    have = (:x, :alpha), want = :logpdf)
+
+alpha = [2.0, 3.0, 1.5]
+x = [0.2, 0.5, 0.3]
+inputs = (; x, alpha)
+output = dirichlet_kernel(Tuple(inputs)...)
+
+docs_example = (;
+    name = :dirichlet_simplex,
+    origin = "Dirichlet distribution object on the probability simplex (build executed)",
+    inputs,
+    spec = dirichlet.logpdf,
+    kernel = dirichlet_kernel,
+    output,
 )
 """
 
