@@ -277,6 +277,23 @@ exercises signed/full-width output, a range with frequent rejection, and caller
 seed/output preservation. Its local scalar-indexing annotation only stores the
 probe's draws; sampler execution does not use that annotation.
 
+The source compiler also records `randexp!(rng, destination)` as an ordered RNG
+effect that writes and returns its destination, with a builtin floating-array
+domain. Scalar array reads accept builtin integer literals and direct indices
+of preparation-fixed builtin integer loops. Preparation proves their bounds
+against the private fixed-shape array state; emitted native reads omit repeated
+bounds checks, and the Reactant backend lowers the same reads through scalar
+indexing. Custom ranges, unknown indices, and out-of-bounds ranges reject.
+`indexed_array_probe.jl` exercises forward/reverse/strided/empty loops and those
+rejections, plus a traced read from fixed shared data and caller preservation.
+`indexed-array-v1.toml` records that verification and an experimental source
+that fills a fixed random-draw buffer once per transition. That source works
+in both backends but did not improve throughput, so the default mathematical
+kernel keeps scalar draws. The benchmark's `source=` keyword admits another
+captured constructor for these experiments; it does not select a backend
+replacement. The exponential-race selection experiment and its exact source
+are recorded in `multinomial-optimization-v1.toml` without changing the default.
+
 `loop_control_probe.jl` checks the same authored HMC source with zero steps and
 with a divergence threshold that forces its early return. It exercises the
 peeled loop and the batch's private state. Each backend must

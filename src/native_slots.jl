@@ -10,6 +10,7 @@ struct SlotContext
 end
 slotplan(c) = RK.kernel_prepared_plan(c.pf)
 slotfields(c) = RK._exec_canon_map(slotplan(c))
+@inline slot_scalar_getindex(array,indices...) = @inbounds getindex(array,indices...)
 
 function slot_external_constant(x::RK._ExtRef)
     value=x.captured
@@ -126,6 +127,7 @@ end
 
 function compile_native_slots(kernel, state, name; endpoints, effects, hoist=true,
         bufferize=true, coalesce_transfers=true, count_gradients=false, peel_loops=false)
+    integer_indices=Dict{Symbol,Any}()
     pf = getfield(kernel,:prepared)
     skel = getfield(kernel,:skeleton)
     irs = RK.method_irs(skel)
@@ -213,6 +215,29 @@ function compile_native_slots(kernel, state, name; endpoints, effects, hoist=tru
             return formals[x.arg]
         elseif x isa RK._LocalRef
             return locals[x.name]
+        elseif x isa RK._Index
+            x.base isa RK._SelfField || error("native slots: indexing requires a prepared array field")
+            c,n=place(x.base,context)
+            role,i=RK.kernel_plan_field(slotplan(c),slotfields(c)[n])
+            array=RK._canon_slot(role===:owned ? c.owned : c.shared,Val(i))
+            RK._kernel_dom_num_array(typeof(array)) ||
+                error("native slots: indexing requires a builtin numeric Array")
+            length(x.idxs) in (1,ndims(array)) || error("native slots: unsupported index arity")
+            for (dimension,idx) in enumerate(x.idxs)
+                values=if idx isa RK._Lit && RK._kernel_dom_int_scalar(typeof(idx.value))
+                    (idx.value,)
+                elseif idx isa RK._LocalRef && haskey(integer_indices,locals[idx.name])
+                    integer_indices[locals[idx.name]]
+                else
+                    error("native slots: indices must be builtin integer literals or fixed-loop indices")
+                end
+                isempty(values) && continue
+                lower,upper=minmax(first(values),last(values))
+                bound=length(x.idxs)==1 ? length(array) : size(array,dimension)
+                1<=lower<=upper<=bound || error("native slots: fixed index range exceeds prepared array bounds")
+            end
+            return Expr(:call,slot_scalar_getindex,rhs(x.base,context,locals,formals),
+                (rhs(idx,context,locals,formals) for idx in x.idxs)...)
         elseif x isa RK._RegisteredCall
             f = RK._exec_captured_callee(x)
             args = Any[rhs(a,context,locals,formals,dot) for a in x.args]
@@ -317,8 +342,13 @@ function compile_native_slots(kernel, state, name; endpoints, effects, hoist=tru
             elseif s isa RK._For
                 var = fresh(only(s.var))
                 nested = copy(locals); nested[only(s.var)] = var
-                fixed,iterator = peel_loops ? static_value(s.iter,context) : (false,nothing)
-                if fixed && iterator isa AbstractRange{<:Integer} && length(iterator)>1
+                fixed,iterator = static_value(s.iter,context)
+                if fixed && iterator isa Union{UnitRange,StepRange,Base.OneTo} &&
+                        RK._kernel_dom_int_scalar(eltype(iterator)) &&
+                        RK._kernel_dom_int_scalar(typeof(step(iterator)))
+                    integer_indices[var]=iterator
+                end
+                if peel_loops && fixed && iterator isa AbstractRange{<:Integer} && length(iterator)>1
                     # Execute the first source iteration in place. Subsequent
                     # iterations can then inherit its established cache facts.
                     # This preserves effect/return order and adds at most one

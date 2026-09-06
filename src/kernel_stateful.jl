@@ -1494,6 +1494,8 @@ _kernel_primitive_effect(@nospecialize(v)) =
     #   randn!(rng, dest): ordered RNG (arg 1 is the RNG), writes dest (arg 2), result aliases dest.
     v === Random.randn! ?
         _PrimitiveEffect(Symbol("__rk_rng_Random_randn!__"), 2, (2,), (1,), 2, :rng, :ordered, (), 1) :
+    v === Random.randexp! ?
+        _PrimitiveEffect(Symbol("__rk_rng_Random_randexp!__"), 2, (2,), (1,), 2, :rng, :ordered, (), 1) :
     #   lmul!(A, dest): reads matrix A (arg 1) + dest (arg 2), writes dest (arg 2), result aliases dest.
     v === LinearAlgebra.lmul! ?
         _PrimitiveEffect(Symbol("__rk_effect_LinearAlgebra_lmul!__"), 2, (2,), (1, 2), 2, :effect, :none, (), nothing) :
@@ -1729,6 +1731,8 @@ function _kernel_effect_callee_domain_ok(@nospecialize(f), argtypes)
                                    _kernel_dom_num_array(argtypes[2])
     f === Random.randn!  && return length(argtypes) == 2 && _kernel_dom_rng(argtypes[1]) &&
                                    _kernel_dom_num_array(argtypes[2])
+    f === Random.randexp! && return length(argtypes) == 2 && _kernel_dom_rng(argtypes[1]) &&
+                                   _kernel_dom_num_array(argtypes[2]) && eltype(argtypes[2]) <: AbstractFloat
     f === LinearAlgebra.lmul! && return length(argtypes) == 2 && _kernel_dom_lmul_lhs(argtypes[1]) &&
                                    _kernel_dom_num_array(argtypes[2])
     f === Random.rand    && return length(argtypes) == 2 && _kernel_dom_rng(argtypes[1]) &&
@@ -1743,7 +1747,8 @@ end
 
 Per-callee/arity SPECIALIZATION admission for a captured RK-core built-in EFFECT primitive (`reg.kind ===
 :primitive`, RK 06:37): dispatches on the exact identity — `fill!`(Base Array dest + numeric scalar),
-`copyto!`(Base Array dest+src), `randn!`(builtin RNG + numeric Array), `lmul!`(sanctioned LinearAlgebra/
+`copyto!`(Base Array dest+src), `randn!`(builtin RNG + numeric Array),
+`randexp!`(builtin RNG + builtin floating Array), `lmul!`(sanctioned LinearAlgebra/
 dense matrix + numeric Array), `rand`(builtin RNG + sample `Type`), `randexp`(builtin RNG),
 `eachcol`(Base numeric Matrix). A
 custom overload over an unsupported domain REJECTS.

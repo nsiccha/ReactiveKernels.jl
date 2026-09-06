@@ -694,6 +694,12 @@ end
     @test eok(mkeff(Random.rand), (rng, Type{Bool}))               # step!: rand(rng, Bool)
     @test eok(mkeff(Random.randexp), (rng,))                       # inner accept/reject: randexp(rng)
     @test !eok(mkeff(Random.randexp), (rng, Float64))              # exact arity 1 only
+    @test eok(mkeff(Random.randexp!), (rng, Vector{Float64}))
+    @test eok(mkeff(Random.randexp!), (rng, Matrix{Float32}))
+    @test !eok(mkeff(Random.randexp!), (rng,))
+    @test !eok(mkeff(Random.randexp!), (rng, Vector{Int}))
+    @test !eok(mkeff(Random.randexp!), (rng, _DomEvil.EvilArr))
+    @test !eok(mkeff(Random.randexp!), (Int, Vector{Float64}))
     @test eok(mkeff(Base.eachcol), (Matrix{Float64},))             # Welford: eachcol(x)
     @test eok(mkeff(Base.fill!), (Vector{Float64}, Float64))
     # NEGATIVES: custom rng/matrix/dest under the SAME generic REJECT

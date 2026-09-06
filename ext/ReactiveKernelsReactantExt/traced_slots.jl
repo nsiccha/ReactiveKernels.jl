@@ -19,6 +19,8 @@ end
     destination
 end
 slot_lmul!(factor,destination)=lmul!(factor,destination)
+@inline slot_scalar_getindex(array,indices...) =
+    Reactant.@allowscalar @inbounds getindex(array,indices...)
 
 function compile_traced_slots(program; static_currentness=true, unroll_limit=0, reuse_code=true)
     contextmap = Dict(Symbol(c.prefix, :_owned)=>c for c in program.contexts)
@@ -108,6 +110,8 @@ function compile_traced_slots(program; static_currentness=true, unroll_limit=0, 
                 return Expr(:call,slot_diagonal_solve!,(lower(a) for a in x.args[2:end])...)
             elseif callee(f,:lmul!)
                 return Expr(:call,slot_lmul!,(lower(a) for a in x.args[2:end])...)
+            elseif f===RK.NativeSlotCompiler.slot_scalar_getindex
+                return Expr(:call,slot_scalar_getindex,(lower(a) for a in x.args[2:end])...)
             elseif callee(f,:recipe_handle_op)
                 ref=x.args[2]
                 ref.head===:ref || error("traced slots: dynamic handle")
