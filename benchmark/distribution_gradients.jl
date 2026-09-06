@@ -20,7 +20,7 @@ using Statistics
 using TOML
 
 using .DistributionBenchmarkCases:
-    NORMAL_SIZES, SCALAR_GALLERY_FAMILIES, SCALAR_GALLERY_SIZES,
+    DISTRIBUTION_GRADIENT_FAMILIES, NORMAL_SIZES, SCALAR_GALLERY_SIZES,
     STRUCTURED_SIZES, mvn_inputs, normal_observations, normal_parameters,
     scalar_family_inputs
 
@@ -203,7 +203,10 @@ function _source_receipts()
 
     Tuple(Int(row["n"]) for row in normal_receipt["measurements"]) == NORMAL_SIZES ||
         error("Normal gradient sizes drifted from the distribution receipt")
-    Tuple(gallery_receipt["protocol"]["families"]) == SCALAR_GALLERY_FAMILIES ||
+    gallery_families = Tuple(gallery_receipt["protocol"]["families"])
+    Tuple(family for family in gallery_families
+          if family in DISTRIBUTION_GRADIENT_FAMILIES) ==
+        DISTRIBUTION_GRADIENT_FAMILIES ||
         error("scalar gradient families drifted from the distribution receipt")
     Tuple(Int.(gallery_receipt["protocol"]["sizes"])) == SCALAR_GALLERY_SIZES ||
         error("scalar gradient sizes drifted from the distribution receipt")
@@ -259,7 +262,7 @@ function run_benchmark()
 
     gallery_sizes = _sizes(
         "RK_DISTRIBUTION_GRADIENT_GALLERY_SIZES", SCALAR_GALLERY_SIZES)
-    for family in SCALAR_GALLERY_FAMILIES, n in gallery_sizes
+    for family in DISTRIBUTION_GRADIENT_FAMILIES, n in gallery_sizes
         tag = Val(Symbol(family))
         inputs = scalar_family_inputs(tag, n)
         push!(rows, _row(
@@ -307,7 +310,7 @@ function run_benchmark()
             "scalar_destination_policy" =>
                 "scalar gradients use ad_gradient and return an isbits Float64",
             "normal_sizes" => collect(NORMAL_SIZES),
-            "scalar_gallery_families" => collect(SCALAR_GALLERY_FAMILIES),
+            "scalar_gallery_families" => collect(DISTRIBUTION_GRADIENT_FAMILIES),
             "scalar_gallery_sizes" => collect(SCALAR_GALLERY_SIZES),
             "structured_sizes" => collect(STRUCTURED_SIZES),
         ),
