@@ -241,18 +241,25 @@ function _render_scalar_gallery_benchmarks_focused()
         "exponential_logscale" => "Exponential",
         "geometric_logit" => "Geometric",
         "uniform_bounded" => "Uniform",
+        "poisson_lograte" => "Poisson",
+        "gamma_shape_rate" => "Gamma",
+        "beta_shapes" => "Beta",
+        "binomial_logit" => "Binomial",
     )
     rows = _allbench_distribution_family_rows(receipt, family_label)
     pins = receipt["pins"]
     summary = "Each scalar family now has its own plot and compact table. " *
-        "Native rows use RK native as baseline; compiled rows use RK + Reactant."
+        "Native rows use RK native as baseline; compiled rows use RK + Reactant. " *
+        "Gamma and Beta have no ProbabilityMeasures comparator, so those cells " *
+        "stay blank rather than showing a substitute."
     provenance = "Receipt `$(basename(_SCALAR_GALLERY_RECEIPT_PATH))`; RK " *
         "`$(pins["reactivekernels_sha"])`; Reactant $(pins["reactant_version"]); " *
         "Julia $(pins["julia_version"]); $(receipt["environment"]["cpu"])."
     panel_order = Tuple(family_label[key] for key in (
         "cauchy_location_scale", "laplace_location_scale", "bernoulli_logit",
         "lognormal_logscale", "exponential_logscale", "geometric_logit",
-        "uniform_bounded"))
+        "uniform_bounded", "poisson_lograte", "gamma_shape_rate", "beta_shapes",
+        "binomial_logit"))
     _allbench_series_sections(rows;
         id_prefix = "scalar-distributions", summary, provenance, panel_order,
         leading_columns = (_column(:n, "N"),))

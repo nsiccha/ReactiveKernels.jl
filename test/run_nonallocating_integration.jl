@@ -2,7 +2,7 @@ using Pkg
 using UUIDs
 
 const MUTATING_FUNCTIONS_URL = "https://github.com/nsiccha/MutatingFunctions.jl"
-const MUTATING_FUNCTIONS_REV = "b353559ef3e391ae2e2d98256b6967903fdfa410"
+const MUTATING_FUNCTIONS_REV = "4fc41b1c7b774133ceaacc4ff3c34c67b15b87b2"
 const MUTATING_FUNCTIONS_UUID = UUID("8a4c2d94-4b3b-4f9e-be63-a3c0cd816e3a")
 
 root = normpath(joinpath(@__DIR__, ".."))

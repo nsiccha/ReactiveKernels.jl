@@ -15,7 +15,8 @@ using Random
 using Reactant
 using ReactiveKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
-    cauchy, laplace, bernoulli, lognormal, exponential, geometric, uniform
+    cauchy, laplace, bernoulli, lognormal, exponential, geometric, uniform,
+    poisson, gamma, beta, binomial
 using Statistics
 using TOML
 
@@ -43,6 +44,14 @@ const RK_GEOMETRIC = plate(geometric.logpdf;
     have = (:observed, :logitp), want = :logpdf, batched = (:observed,))
 const RK_UNIFORM = plate(uniform.logpdf;
     have = (:x, :lower, :upper), want = :logpdf, batched = (:x,))
+const RK_POISSON = plate(poisson.logpdf;
+    have = (:observed, :log_rate), want = :logpdf, batched = (:observed,))
+const RK_GAMMA = plate(gamma.logpdf;
+    have = (:x, :shape, :log_rate), want = :logpdf, batched = (:x,))
+const RK_BETA = plate(beta.logpdf;
+    have = (:x, :a, :b), want = :logpdf, batched = (:x,))
+const RK_BINOMIAL = plate(binomial.logpdf;
+    have = (:observed, :n, :logit), want = :logpdf, batched = (:observed,))
 
 rk_cauchy(xs, location, scale) = RK_CAUCHY(xs, location, scale)
 rk_laplace(xs, location, scale) = RK_LAPLACE(xs, location, scale)
@@ -51,6 +60,10 @@ rk_lognormal(xs, location, log_scale) = RK_LOGNORMAL(xs, location, log_scale)
 rk_exponential(xs, log_scale) = RK_EXPONENTIAL(xs, log_scale)
 rk_geometric(observed, logitp) = RK_GEOMETRIC(observed, logitp)
 rk_uniform(xs, lower, upper) = RK_UNIFORM(xs, lower, upper)
+rk_poisson(observed, log_rate) = RK_POISSON(observed, log_rate)
+rk_gamma(xs, shape, log_rate) = RK_GAMMA(xs, shape, log_rate)
+rk_beta(xs, a, b) = RK_BETA(xs, a, b)
+rk_binomial(observed, n, logit) = RK_BINOMIAL(observed, n, logit)
 
 distributions_cauchy(xs, location, scale) =
     sum(Distributions.logpdf.(Distributions.Cauchy(location, scale), xs))
@@ -67,6 +80,14 @@ distributions_geometric(observed, logitp) =
     sum(Distributions.logpdf.(Distributions.Geometric(logistic(logitp)), observed))
 distributions_uniform(xs, lower, upper) =
     sum(Distributions.logpdf.(Distributions.Uniform(lower, upper), xs))
+distributions_poisson(observed, log_rate) =
+    sum(Distributions.logpdf.(Distributions.Poisson(exp(log_rate)), observed))
+distributions_gamma(xs, shape, log_rate) =
+    sum(Distributions.logpdf.(Distributions.Gamma(shape, 1 / exp(log_rate)), xs))
+distributions_beta(xs, a, b) =
+    sum(Distributions.logpdf.(Distributions.Beta(a, b), xs))
+distributions_binomial(observed, n, logit) =
+    sum(Distributions.logpdf.(Distributions.Binomial(n, logistic(logit)), observed))
 
 probability_measures_cauchy(xs, location, scale) = sum(
     ProbabilityMeasures.logdensityof.(
@@ -89,6 +110,14 @@ probability_measures_geometric(observed, logitp) = sum(
 probability_measures_uniform(xs, lower, upper) = sum(
     ProbabilityMeasures.logdensityof.(
         ProbabilityMeasures.Uniform(lower, upper), xs))
+probability_measures_poisson(observed, log_rate) = sum(
+    ProbabilityMeasures.logdensityof.(
+        ProbabilityMeasures.Poisson(exp(log_rate)), observed))
+probability_measures_binomial(observed, n, logit) = sum(
+    ProbabilityMeasures.logdensityof.(
+        ProbabilityMeasures.Binomial(n, logistic(logit)), observed))
+# ProbabilityMeasures exposes no Gamma or Beta measure, so those comparator
+# cells stay blank rather than inventing a substitute implementation.
 
 _compile2(f, a, b) = @compile sync = true f(a, b)
 _compile3(f, a, b, c) = @compile sync = true f(a, b, c)
@@ -141,6 +170,18 @@ _family_functions(::Val{:geometric_logit}) = (;
 _family_functions(::Val{:uniform_bounded}) = (;
     rk = rk_uniform, distributions = distributions_uniform,
     probability_measures = probability_measures_uniform)
+_family_functions(::Val{:poisson_lograte}) = (;
+    rk = rk_poisson, distributions = distributions_poisson,
+    probability_measures = probability_measures_poisson)
+_family_functions(::Val{:gamma_shape_rate}) = (;
+    rk = rk_gamma, distributions = distributions_gamma,
+    probability_measures = nothing)
+_family_functions(::Val{:beta_shapes}) = (;
+    rk = rk_beta, distributions = distributions_beta,
+    probability_measures = nothing)
+_family_functions(::Val{:binomial_logit}) = (;
+    rk = rk_binomial, distributions = distributions_binomial,
+    probability_measures = probability_measures_binomial)
 
 function _family_case(family, n)
     tag = Val(Symbol(family))
@@ -196,24 +237,46 @@ function run_benchmark()
     for family in FAMILIES, n in _sizes()
         case = _family_case(family, n)
         reference = case.rk(case.native...)
-        native_values = (
-            reference,
-            case.distributions(case.native...),
-            case.probability_measures(case.native...),
-        )
-        all(value -> isapprox(value, reference; rtol = 1e-11), native_values) ||
-            error("native value mismatch for $family at N=$n")
+        has_pm = case.probability_measures !== nothing
+        isapprox(case.distributions(case.native...), reference; rtol = 1e-11) ||
+            error("native Distributions mismatch for $family at N=$n")
+        if has_pm
+            isapprox(case.probability_measures(case.native...), reference; rtol = 1e-11) ||
+                error("native ProbabilityMeasures mismatch for $family at N=$n")
+        else
+            # ProbabilityMeasures exposes no measure for this family; the cell
+            # stays blank rather than inventing a substitute.
+            support[family]["probability_measures_reactant"] = false
+            support_errors[family]["probability_measures_reactant"] =
+                "not exposed by ProbabilityMeasures"
+        end
 
         rk_compile_s = @elapsed rk_compiled = _compile(case.rk, case.traced)
         rk_value = Float64(rk_compiled(case.traced...))
         isapprox(rk_value, reference; rtol = 1e-11) ||
             error("RK + Reactant value mismatch for $family at N=$n")
 
-        pm_compile_s = @elapsed pm_compiled =
-            _compile(case.probability_measures, case.traced)
-        pm_value = Float64(pm_compiled(case.traced...))
-        isapprox(pm_value, reference; rtol = 1e-11) ||
-            error("ProbabilityMeasures + Reactant value mismatch for $family at N=$n")
+        pm_compiled = nothing
+        pm_compile_s = nothing
+        pm_value = nothing
+        if has_pm
+            # ProbabilityMeasures native works, but some measures reject traced
+            # inputs (e.g. Binomial's Int trial count under Reactant). Treat a
+            # failed Reactant compile as an honest unsupported cell.
+            try
+                pm_compile_s = @elapsed pm_compiled =
+                    _compile(case.probability_measures, case.traced)
+                pm_value = Float64(pm_compiled(case.traced...))
+                isapprox(pm_value, reference; rtol = 1e-11) ||
+                    error("ProbabilityMeasures + Reactant value mismatch")
+            catch err
+                support[family]["probability_measures_reactant"] = false
+                support_errors[family]["probability_measures_reactant"] = _diagnostic(err)
+                pm_compiled = nothing
+                pm_compile_s = nothing
+                pm_value = nothing
+            end
+        end
 
         dist_compiled = nothing
         dist_compile_s = nothing
@@ -230,7 +293,9 @@ function run_benchmark()
             end
         end
 
-        observed = Any[native_values..., rk_value, pm_value]
+        observed = Any[reference, case.distributions(case.native...), rk_value]
+        has_pm && push!(observed, case.probability_measures(case.native...))
+        pm_value === nothing || push!(observed, pm_value)
         dist_compiled === nothing || push!(observed,
             Float64(dist_compiled(case.traced...)))
         denominator = max(abs(reference), eps(Float64))
@@ -243,14 +308,18 @@ function run_benchmark()
             "rk_native" => _measurement(case.rk, case.native...; rounds),
             "distributions_native" =>
                 _measurement(case.distributions, case.native...; rounds),
-            "probability_measures_native" =>
-                _measurement(case.probability_measures, case.native...; rounds),
             "rk_reactant" => _measurement(rk_compiled, case.traced...; rounds),
-            "probability_measures_reactant" =>
-                _measurement(pm_compiled, case.traced...; rounds),
             "rk_reactant_compile_seconds" => rk_compile_s,
-            "probability_measures_reactant_compile_seconds" => pm_compile_s,
         )
+        if has_pm
+            row["probability_measures_native"] =
+                _measurement(case.probability_measures, case.native...; rounds)
+        end
+        if pm_compiled !== nothing
+            row["probability_measures_reactant"] =
+                _measurement(pm_compiled, case.traced...; rounds)
+            row["probability_measures_reactant_compile_seconds"] = pm_compile_s
+        end
         if dist_compiled !== nothing
             row["distributions_reactant"] =
                 _measurement(dist_compiled, case.traced...; rounds)
@@ -291,6 +360,10 @@ function run_benchmark()
                 "exponential_logscale" => "Exponential from log scale",
                 "geometric_logit" => "Geometric failures before success from logit p",
                 "uniform_bounded" => "Uniform with dynamic lower and upper endpoints",
+                "poisson_lograte" => "Poisson counts from the log rate",
+                "gamma_shape_rate" => "Gamma from shape and log rate",
+                "beta_shapes" => "Beta from two positive shapes on the unit interval",
+                "binomial_logit" => "Binomial counts from fixed trials and logit p",
             ),
             "element_types" => Dict(
                 "continuous_observations" => "Float64",
