@@ -1,0 +1,40 @@
+version = 2
+base_commit = "44ddcdc9a6dc78ece9fbec991111f1771b778501"
+host = "strato2"
+julia = "1.10.11"
+reactant = "0.2.284"
+enzyme = "0.13.199"
+replicates = 7
+transitions = 10000
+execute_rows = 56
+exit_status = 0
+elapsed_seconds = 172
+data_sha256 = "c55dcd9a2f71b372ce54c4ce20c078769053477b1d55ab527bcf6990eb01e9f7"
+contract = "Seven alternating execution samples of the same emitted multinomial HMC program, L=4/16. Prepared calls preserve input state/RNG and return reusable state plus independent named output snapshots. Native direct calls mutate caller-owned prepared stores, with reset excluded; Reactant direct calls return output/RNG and discard reusable state. All Reactant calls synchronize. Prepared timings include boundary copies and projection. No adaptation/history. Preparation rows include model preparation and lowering; direct compile rows run later in the same warm process. Four-step samples vary substantially, so median ratios are not stable overhead estimates."
+
+evidence_archive = "/home/niko/.local/state/kb-agents/uploads/c9dfd0d672d74f1a.targz"
+
+[sources]
+"src/transpiled_program.jl" = "a829df0bc8865a605368699eb7bba1a353eac3a9b2338079e1bf14682ea0e581"
+"src/native_slots.jl" = "9c6857d54dbd5471a62017a0cbfa6764442a98476f9f680ccee94991d12186c1"
+"src/native_slots_factory.jl" = "9f0f47fc081de7b54950fe4e87ec488b6dfb0e6b84fa3119af1a07ff96d0928a"
+"ext/ReactiveKernelsReactantExt/transpiled_program.jl" = "eac09b529032633cfcb421c6f819c99409c13cfa11fecb468c06933f2ce3536c"
+"ext/ReactiveKernelsReactantExt/traced_slots.jl" = "7b4a4f02c1aa92d350852b1ec6258ba711b7a44796cb54b3118bc6e67bc120aa"
+"benchmark/sampler_transpiler/prepared_hmc.jl" = "83460a2e9066166470592671ad49ab90cea07f22b1a4278257ea89c2ae334454"
+"benchmark/sampler_transpiler/eight_schools_density.jl" = "fd9272341bbd01d32b1032f64c9091fdda12184a755295a68966d0de7119764e"
+"benchmark/sampler_transpiler/position_multinomial_hmc_kernel.jl" = "25c1328145e517c7b53dfc0b0e4d51aa5fc8f08e984e429da36412da5d06d0fe"
+"benchmark/sampler_transpiler/prepared_interface_benchmark.jl" = "948f4e05ad56618bb2eabc26125fdda33feafbf66ada23de1c9d543abf3b9ab7"
+"benchmark/nuts_kernel_authoring_fixture_b.jl" = "7a9a9d6e1fa122e3d846def760933b0ba14e62e567d92cffab9d9d638f9404f4"
+"packages/ReactiveKernelsPPLExamples/src/eight_schools.jl" = "d84e361eab6b5f6eeb04472d60276bf5556d3a05df803343af9f2b343f42cce4"
+"packages/ReactiveKernelsDistributionKernels/src/distribution_kernel_sources.jl" = "5ee6c5b73e1ca5aa0f8619e1448212c779759d1752a515fdc82b0746d00e1115"
+
+[validation]
+exit_status = 0
+elapsed_seconds = 222
+native_interface_assertions = 16
+reactant_interface_assertions = 15
+native_hmc_assertions = 5
+reactant_hmc_assertions = 7
+compiler_docs_assertions = 326
+existing_probes = ["loop_control_probe.jl", "runtime_keyword_probe.jl", "partial_transfer_probe.jl"]
+executable_docs = true

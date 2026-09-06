@@ -33,20 +33,30 @@ result of that endpoint. Inside another `@kernel`, `normal.logpdf(x)` splices th
 same transparent graph into the caller; it does not insert an opaque runtime
 call.
 
-Every named boundary remains selectable. For example, one plan can request both
-the density and CDF:
+Every named boundary remains selectable. One plan can request both the density
+and the CDF from the one object, and both endpoints reuse the single
+`standardized(x)` node (structural CSE). The build-executed panel below asserts
+that exactly one `standardized` recipe appears in the joint plan:
 
-```julia
-joint = extract(normal;
-    have = (:x, :location, :scale),
-    want = (:logpdf, :cdf))
+```@eval
+Main.ReactiveKernelsDocs.execute_example(
+    @__MODULE__, Main.DistributionExamples.EXTRACT_JOINT_SOURCE,
+)
 ```
 
-Both endpoints reuse the same `standardized(x)` node. `quantile(p)` follows the
-explicit inverse edge `inv(standardized, z)`. The graph also contains both
-`log_scale = log(scale)` and `scale = exp(log_scale)`, so callers may start from
-either representation. When a caller supplies both, RK respects both HAVE
-values: it neither recomputes nor validates either one.
+`quantile(p)` follows the explicit inverse edge `inv(standardized, z)`. The graph
+also contains both `log_scale = log(scale)` and `scale = exp(log_scale)`, so a
+caller may start from either representation. Explicit HAVE is authoritative:
+supplying `scale` derives `log_scale`, supplying `log_scale` derives `scale`, and
+supplying both recomputes and validates neither. The next panel prepares all
+three routes into the same `normal.logpdf` and asserts, during the build, that
+their plans differ only by the derived port:
+
+```@eval
+Main.ReactiveKernelsDocs.execute_example(
+    @__MODULE__, Main.DistributionExamples.HAVE_ROUTES_SOURCE,
+)
+```
 
 Included child ports retain scoped names rather than colliding with the outer
 result. For example, `normal[Symbol("standard.logpdf")]` addresses the standard
@@ -86,6 +96,31 @@ Main.ReactiveKernelsDocs.execute_example(
 )
 ```
 
+The broadcast rules are worth making concrete. In the panel below one plate zips
+the observation vector with a per-observation location, repeats the scalar scale,
+and receives a whole vector atomically through `Ref`. The build checks the result
+against the equivalent hand-written broadcast:
+
+```@eval
+Main.ReactiveKernelsDocs.execute_example(
+    @__MODULE__, Main.DistributionExamples.BROADCAST_REF_SOURCE,
+)
+```
+
+Dependency-aware lowering also hoists complete invariants out of the broadcast
+loop. When `location` and `scale` are shared across the batch, the scale-only
+`log_scale` term is emitted once in the loop preamble, while the
+observation-dependent standardization stays in the loop at the shallowest
+boundary that binds it. The generated-kernel pane below is the exact plan built
+during this docs build; the source asserts the hoisted `log_scale` op precedes
+the loop:
+
+```@eval
+Main.ReactiveKernelsDocs.execute_example(
+    @__MODULE__, Main.DistributionExamples.INVARIANT_HOISTING_SOURCE,
+)
+```
+
 ## Other standard location-scale families
 
 Cauchy and Laplace use exactly the same `location_scale` graph. Their examples
@@ -114,6 +149,26 @@ the log-density endpoint keeps the stable `-log1pexp(∓logit)` expression.
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
     @__MODULE__, Main.DistributionExamples.DISCRETE_SOURCE,
+)
+```
+
+`poisson` and `binomial` are the count families. `poisson.logpdf` accepts the
+rate or its log—the canonical log link—and `binomial.logpdf` accepts a fixed
+trial count `n` with either the success probability or its logit. Both guard the
+observation domain to `-Inf` with a branch-free `ifelse` and expose `logpdf` and
+`cdf`; neither exposes a `quantile`, because a discrete quantile needs an
+iterative search rather than a pure straight-line endpoint. The generic `plate`
+API lifts each `.logpdf` over independent counts without family-specific code.
+
+```@eval
+Main.ReactiveKernelsDocs.execute_example(
+    @__MODULE__, Main.DistributionExamples.POISSON_SOURCE,
+)
+```
+
+```@eval
+Main.ReactiveKernelsDocs.execute_example(
+    @__MODULE__, Main.DistributionExamples.BINOMIAL_SOURCE,
 )
 ```
 
@@ -150,6 +205,25 @@ Main.ReactiveKernelsDocs.execute_example(
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
     @__MODULE__, Main.DistributionExamples.UNIFORM_SOURCE,
+)
+```
+
+`gamma` and `beta` complete the continuous gallery. `gamma.logpdf` takes a shape
+with the rate, its reciprocal scale, or the log rate as equivalent authoritative
+HAVE routes—supplying one derives the others; `beta.logpdf` takes two positive
+shapes on the unit interval. Both expose `logpdf`, `cdf`, and `quantile`; the
+continuous inverse routes through the regularized incomplete-gamma / incomplete-
+beta inverse directly.
+
+```@eval
+Main.ReactiveKernelsDocs.execute_example(
+    @__MODULE__, Main.DistributionExamples.GAMMA_SOURCE,
+)
+```
+
+```@eval
+Main.ReactiveKernelsDocs.execute_example(
+    @__MODULE__, Main.DistributionExamples.BETA_SOURCE,
 )
 ```
 
