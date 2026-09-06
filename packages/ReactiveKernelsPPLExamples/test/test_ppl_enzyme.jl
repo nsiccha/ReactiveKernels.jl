@@ -9,6 +9,7 @@ using ReactiveKernelsPPLExamples.DugongsGrowthExample
 using ReactiveKernelsPPLExamples.ARMA11Example
 using ReactiveKernelsPPLExamples.GaussianMixtureExample
 using ReactiveKernelsPPLExamples.MVNormalRegressionExample
+using ReactiveKernelsPPLExamples.BoundRegressionExample
 
 # This is deliberately the plain reverse backend: no runtime activity and no
 # function annotation. Non-active model data travel through DI as `Constant`s.
@@ -148,6 +149,33 @@ function mvnormal_regression_reference_density(q)
     prior + likelihood
 end
 
+# The predictor standardization is data-only, so precompute it once and keep the
+# differentiated reference a plain const-matrix linear predictor.
+const _BOUND_REFERENCE_STANDARDIZED = let
+    n = size(BOUND_RAW_X, 1)
+    means = sum(BOUND_RAW_X; dims = 1) ./ n
+    sds = sqrt.(sum(abs2, BOUND_RAW_X .- means; dims = 1) ./ n)
+    (BOUND_RAW_X .- means) ./ sds
+end
+
+function bound_regression_reference_density(q)
+    α = q[1]
+    β = q[2:3]
+    log_σ = q[4]
+    σ = exp(log_σ)
+    mean = α .+ _BOUND_REFERENCE_STANDARDIZED * β
+    normal_ld(x, location, scale) =
+        -0.5 * log(2π) - log(scale) - 0.5 * ((x - location) / scale)^2
+    prior = normal_ld(α, 0.0, 10.0) +
+            sum(normal_ld(b, 0.0, 5.0) for b in β) +
+            log(2.0) + normal_ld(σ, 0.0, 5.0)
+    likelihood = zero(α)
+    @inbounds for i in eachindex(BOUND_Y)
+        likelihood += normal_ld(BOUND_Y[i], mean[i], σ)
+    end
+    prior + log_σ + likelihood
+end
+
 # Independent analytic score for the unconstrained Gaussian-mixture reference.
 # This is deliberately not differentiated with the backend under test: the RK
 # path below retains plain reverse-mode Enzyme, while the oracle follows the
@@ -255,6 +283,9 @@ end
         (evaluate_mvnormal_regression_source(),
          (:unconstrained, :predictors, :responses, :covariance),
          mvnormal_regression_reference_density, nothing),
+        (evaluate_bound_regression_source(),
+         (:unconstrained, :raw_predictors, :responses),
+         bound_regression_reference_density, nothing),
     )
     for (artifact, have, reference_density, reference_gradient) in cases
         @testset "$(artifact.name)" begin

@@ -13,6 +13,7 @@ include("arma11.jl")
 include("gaussian_mixture.jl")
 include("mnist_logistic.jl")
 include("mvnormal_regression.jl")
+include("bound_regression.jl")
 
 export EightSchoolsExample
 export SumToZeroExample
@@ -24,5 +25,6 @@ export ARMA11Example
 export GaussianMixtureExample
 export MNISTLogisticExample
 export MVNormalRegressionExample
+export BoundRegressionExample
 
 end # module ReactiveKernelsPPLExamples

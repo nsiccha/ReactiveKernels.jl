@@ -322,6 +322,17 @@ function setup_mvnormal_regression!(mod::Module)
     nothing
 end
 
+function setup_bound_regression!(mod::Module)
+    if !isdefined(mod, :BoundRegressionExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: BoundRegressionExample))
+    end
+    # Bind only the data. The displayed PPL assembly imports and reuses the
+    # shared `normal` distribution object directly and authors the
+    # standardization prefix inline.
+    Core.eval(mod, :(using .BoundRegressionExample: BOUND_RAW_X, BOUND_Y))
+    nothing
+end
+
 function setup_online_stats!(mod::Module)
     if !isdefined(mod, :OnlineStatsExample)
         Base.include(mod, joinpath(@__DIR__, "..", "examples", "online_stats.jl"))
@@ -731,6 +742,7 @@ const EXPECTED_PPL_EXAMPLES = (
     :mnist_logistic_density,
     :mnist_logistic_optimized_density,
     :mvnormal_regression_density,
+    :bound_regression_density,
 )
 const _PPL_EXECUTION_COUNTS = Dict(name => 0 for name in EXPECTED_PPL_EXAMPLES)
 

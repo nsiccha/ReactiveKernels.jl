@@ -52,6 +52,7 @@ site_pages = [
             "ARMA(1,1) time series" => "arma11.md",
             "Gaussian mixture" => "gaussian-mixture.md",
             "Correlated (MvNormal) regression" => "mvnormal-regression.md",
+            "Partial evaluation (bound data)" => "bound-regression.md",
         ],
     ],
     "Automatic differentiation" => [
