@@ -98,6 +98,27 @@ end
         @test density ≈ reference.density
     end
 
+    @testset "vectorized closed form is a first-class port, parity-exact with the recursion" begin
+        # `errors_closed` is exposed like `errors`; querying it does NOT pull the
+        # sequential recursion node (the two are independent producers).
+        p = plan(model.graph;
+                 have = (model.unconstrained, model.series),
+                 want = (model.errors_closed,))
+        produced = Set(canon_id(model.graph, o.id)
+                       for r in p.recipes for o in r.outputs)
+        @test !(canon_id(model.graph, model.errors.id) in produced)
+
+        errors_closed = prepare(p)(q, ARMA_SERIES)
+        reference = _arma11_reference_errors(q[1], q[2], q[3], ARMA_SERIES)
+        @test length(errors_closed) == length(ARMA_SERIES)
+        @test errors_closed ≈ reference
+
+        # both forms coexist on one graph and agree to machine precision.
+        seq_errors, closed_errors = prepare(model; have = (:unconstrained, :series),
+                       want = (:errors, :errors_closed))(q, ARMA_SERIES)
+        @test seq_errors ≈ closed_errors
+    end
+
     @testset "one-step forecast from a constrained boundary reruns the recursion" begin
         parameters = (; μ = 0.0, φ = 0.9, θ = -0.2, σ = 0.15)
         p = plan(model.graph;
