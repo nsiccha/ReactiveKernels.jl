@@ -10,6 +10,7 @@ using ReactiveKernelsPPLExamples.GLMPoissonExample: evaluate_glm_poisson_source
 using ReactiveKernelsPPLExamples.GLMBinomialExample: evaluate_glm_binomial_source
 using ReactiveKernelsPPLExamples.EightSchoolsNoncenteredExample:
     evaluate_eight_schools_noncentered_source
+using ReactiveKernelsPPLExamples.GLMMPoissonExample: evaluate_glmm_poisson_source
 using ReactiveKernelsPPLExamples.BetaBinomialExample: evaluate_beta_binomial_source
 using ReactiveKernelsPPLExamples.DugongsGrowthExample: evaluate_dugongs_source
 using ReactiveKernelsPPLExamples.GaussianMixtureExample: evaluate_gaussian_mixture_source
@@ -80,6 +81,10 @@ end
     end
     @testset "eight_schools_noncentered (posteriordb; non-centered + half-cauchy)" begin
         a = evaluate_eight_schools_noncentered_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "glmm_poisson (posteriordb; hierarchical Poisson-log + random effects)" begin
+        a = evaluate_glmm_poisson_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
     @testset "beta_binomial" begin
