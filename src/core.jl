@@ -175,6 +175,32 @@ end
         collect(bc) : Base.materialize(bc)
 end
 
+# `LinearAlgebra.dot(a, b)` does not lower under a tracing backend when an operand
+# is a host array — it routes through `conj` on the host vector (`MethodError: no
+# method matching conj(::Vector)`), and a mixed host/traced dot never reaches the
+# traced program.  For REAL operands `dot(a,b) == sum(a .* b)`, so normalize the
+# `@kernel` tensorized body to that single reduction over the promoted broadcast
+# (RK-macro-only per decision `17bnc6t`; the friendly form the Reactant benchmark
+# authored by hand).  This is value-exact for real operands, so it never silently
+# mis-lowers.  COMPLEX operands are a LOUD error, never rewritten: `dot` conjugates
+# its FIRST argument, so `sum(a.*b)` would silently corrupt a complex-valued
+# result/gradient — keep such a dot on the native path instead.
+# Whether a tensorized-dot operand carries a REAL scalar type.  The default reads
+# the element type directly (host arrays/scalars); a tracing backend specializes
+# it to see through its traced scalar wrapper — a `TracedRArray{Float64}`'s
+# `eltype` is `TracedRNumber{Float64}`, not `Float64`, so a bare `eltype <: Real`
+# would misclassify a real traced operand as complex.
+@inline _tensorized_real_operand(x) = eltype(x) <: Real
+@inline function _tensorized_dot(a, b)
+    (_tensorized_real_operand(a) && _tensorized_real_operand(b)) ||
+        throw(ArgumentError(
+            "dot(a, b) over complex operands is not lowerable to a tensorized " *
+            "reduction: `dot` conjugates its first argument, so `sum(a .* b)` " *
+            "would silently corrupt the result. Evaluate this dot on the native " *
+            "path, or supply real operands."))
+    sum(_tensorized_broadcast(*, a, b))
+end
+
 # Tensorized authored plates keep slice collections structural instead of
 # materializing Base.Slices.  A backend can consume the parent array as one
 # batched value, while the generic fallback preserves ordinary eachcol

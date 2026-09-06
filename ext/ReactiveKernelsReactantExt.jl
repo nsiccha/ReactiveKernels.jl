@@ -868,6 +868,16 @@ end
     ReactiveKernels._tensorized_setindex(traced, value, indices...)
 end
 
+# A traced array/scalar's `eltype` is the traced number wrapper
+# (`TracedRArray{Float64}` -> `TracedRNumber{Float64}`), so the core
+# `eltype <: Real` default cannot see the underlying real/complex kind.  Read the
+# wrapped scalar type parameter directly so `_tensorized_dot` classifies traced
+# real operands correctly (and still LOUD-errors genuine complex ones).
+@inline ReactiveKernels._tensorized_real_operand(
+    ::Reactant.TracedRArray{T}) where {T} = T <: Real
+@inline ReactiveKernels._tensorized_real_operand(
+    ::Reactant.TracedRNumber{T}) where {T} = T <: Real
+
 # Batched slice-collection plates preserve eachcol structurally in the core.
 # Move the observation axis to the leading batch dimension and lower the
 # scalar recipe with Reactant's batch primitive; no Base.Slices object or host
