@@ -24,6 +24,13 @@ export PPLWorkflow
 # `ReactiveKernelsPPLExamples.PPLMacro.@ppl`. See the `PPLMacro` module docstring.
 include("ppl_macro.jl")
 
+# EXPERIMENTAL, NOT REVIEWED / NOT APPROVED — do NOT build on this. `PPLGibbs`
+# is an in-progress PPL-style Gibbs layer over `@ppl` models (user decision C,
+# handed off from ReactiveKernels:sampling:gibbs). Also NOT exported and NOT in
+# the consumer API; reach it via `ReactiveKernelsPPLExamples.PPLGibbs`. Never in
+# rk core. See the `PPLGibbs` module docstring.
+include("ppl_gibbs.jl")
+
 export EightSchoolsExample
 export SumToZeroExample
 export LinearRegressionExample
