@@ -34,8 +34,13 @@ Decisions: build GO `2026-09-06T14-20-02-559-1r5p4j1`; scope MINIMAL
 - Scalar parameters take one packed-unconstrained coordinate, with support
   inferred from the sampling distribution and the matching transform +
   log-Jacobian authored in both directions — real (`normal` / `cauchy` /
-  `laplace`, identity), positive (`exponential` / `gamma` / `lognormal`,
-  log/exp), unit (`beta`, logit/logistic).
+  `laplace`, identity), positive (`exponential` / `gamma` / `lognormal` /
+  `inverse_gamma`, log/exp), unit (`beta`, logit/logistic).
+- **Discrete latents** (`bernoulli`): a `~`-declared parameter with a discrete
+  family is a Gibbs-only latent — it takes NO unconstrained coordinate and NO
+  transform, is carried as its own typed HAVE port (Bernoulli → `Bool`, used
+  Bool-naturally as e.g. `ifelse(z, …)`), and its prior contributes
+  `dist.logpdf(z)`. Sampled by enumeration (`PPLGibbs`). First cut: scalar.
 - **Vector parameters** — StanBlocks typed-LHS `name::vector[size] ~ dist(…)`
   (real support) — take a packed slice of `size` coordinates (`size` a data
   argument or literal; the packed layout tracks a running offset), and their
@@ -94,16 +99,30 @@ const PPL_NODE_NAMES = (:parameters, :log_jacobian, :prior, :pointwise,
 const _SUPPORT = Dict{Symbol,Symbol}(
     :normal => :real, :cauchy => :real, :laplace => :real,
     :exponential => :positive, :gamma => :positive, :lognormal => :positive,
-    :beta => :unit,
+    :beta => :unit, :inverse_gamma => :positive,
 )
+
+# Discrete latent families — a `~`-declared parameter whose family is discrete is
+# a Gibbs-only latent: it takes NO unconstrained coordinate and NO transform, is
+# carried as its own Int-valued HAVE port (like data, but a latent), and is
+# sampled by enumeration (PPLGibbs). Its prior contributes `dist.logpdf(z)`.
+const _DISCRETE = Set{Symbol}((:bernoulli,))
+
+# The Julia type a discrete latent's HAVE port takes — it must match the family's
+# `logpdf` argument type, and is the type the latent is used at in the model body
+# (Bernoulli's `observed` is `Bool`, natural for `ifelse(z, …)` selection).
+const _DISCRETE_TYPE = Dict{Symbol,Symbol}(:bernoulli => :Bool)
 
 struct _Param
     name::Symbol
     dist::Any        # the dist-call Expr, e.g. :(normal(0.0, 5.0))
-    support::Symbol  # EFFECTIVE support (transform): :real / :positive / :unit
+    support::Symbol  # EFFECTIVE support: :real / :positive / :unit (continuous),
+                     # or :discrete for a Gibbs-only discrete latent
     size::Any        # `nothing` for a scalar; a size expression for a vector
     truncate::Bool   # a constraint restricting the family's natural support (a
                      # half distribution): add -log(1 - cdf(0)) to the prior
+    discrete::Bool   # a discrete latent: no unconstrained coordinate/transform,
+                     # carried as an Int-valued HAVE port, sampled by enumeration
 end
 
 # Running packed-offset arithmetic that stays a literal while every preceding
@@ -257,10 +276,23 @@ function _parse(def)
             else
                 lname in seen && error("@ppl: parameter $(lname) declared twice")
                 push!(seen, lname)
+                if dist in _DISCRETE
+                    # Discrete latent (Gibbs-only; no unconstrained coordinate).
+                    constraint === nothing || error(
+                        "@ppl: discrete latent `$(lname) ~ $(dist)(…)` cannot carry a " *
+                        "support constraint.")
+                    kind === :scalar || error(
+                        "@ppl (first cut): only scalar discrete latents are supported " *
+                        "yet (`$(lname) ~ $(dist)(…)`); vector discrete latents are a " *
+                        "follow-up increment.")
+                    push!(params, _Param(lname, dist_call, :discrete, nothing, false, true))
+                    continue
+                end
                 haskey(_SUPPORT, dist) || error(
                     "@ppl (first cut): parameter $(lname) ~ $(dist)(…) — supported " *
-                    "parameter distributions are $(sort(collect(keys(_SUPPORT)))); " *
-                    "other families are a follow-up increment.")
+                    "continuous parameter distributions are " *
+                    "$(sort(collect(keys(_SUPPORT)))); discrete latents are " *
+                    "$(sort(collect(_DISCRETE))); other families are a follow-up increment.")
                 natural = _SUPPORT[dist]
                 effective = constraint === nothing ? natural : constraint
                 truncate = false
@@ -278,7 +310,7 @@ function _parse(def)
                 (size === nothing || effective === :real) || error(
                     "@ppl (first cut): only real-support vector parameters are " *
                     "supported yet (`$(lname)::vector[…]`).")
-                push!(params, _Param(lname, dist_call, effective, size, truncate))
+                push!(params, _Param(lname, dist_call, effective, size, truncate, false))
             end
         elseif stmt isa Expr && stmt.head === :(=)
             push!(passthrough, stmt)
@@ -373,6 +405,7 @@ function _lower(name, dataargs, params, obs, passthrough)
     jac_terms = Any[]
     off = 0  # running packed offset BEFORE the current parameter
     for p in params
+        p.discrete && continue      # discrete latent: no coordinate / transform
         lo = _offset_add(off, 1)
         if p.size !== nothing
             # Real-support vector parameter (identity transform): one packed
@@ -418,11 +451,18 @@ function _lower(name, dataargs, params, obs, passthrough)
     push!(stmts, Expr(:(=),
         Expr(:tuple, :parameters, :( log_jacobian::Float64 )),
         Expr(:tuple, :( (; $(pnames...)) ), jac_expr)))
+    # Named-latent inverse edges reconstruct each CONTINUOUS parameter from the
+    # `parameters` NamedTuple (so a named-latent HAVE boundary routes without the
+    # unconstrained coordinate). Discrete latents are direct HAVE ports (signature
+    # args), so they need no inverse edge.
     _pann(p) = p.size === nothing ? :( $(p.name)::Float64 ) :
                :( $(p.name)::AbstractVector{Float64} )
-    inv_lhs = Expr(:tuple, (_pann(p) for p in params)...)
-    inv_rhs = Expr(:tuple, (:( parameters.$(p.name) ) for p in params)...)
-    push!(stmts, Expr(:(=), inv_lhs, inv_rhs))
+    cont_params = [p for p in params if !p.discrete]
+    if !isempty(cont_params)
+        inv_lhs = Expr(:tuple, (_pann(p) for p in cont_params)...)
+        inv_rhs = Expr(:tuple, (:( parameters.$(p.name) ) for p in cont_params)...)
+        push!(stmts, Expr(:(=), inv_lhs, inv_rhs))
+    end
 
     # 4. Prior: sum of each parameter's log density on its constrained value.
     #    A scalar contributes `dist.logpdf(p)`; a vector contributes the summed
@@ -483,7 +523,13 @@ function _lower(name, dataargs, params, obs, passthrough)
     push!(stmts, :( posterior::Float64 = prior + likelihood + log_jacobian ))
     push!(stmts, :( return posterior ))
 
-    sig = Expr(:call, name, :( unconstrained::Vector{Float64} ), dataargs...)
+    # Discrete latents are their own HAVE ports (Int-valued), appended to the
+    # signature after the data arguments — provided directly by the Gibbs sampler,
+    # never derived from `unconstrained`.
+    discreteargs = Any[:( $(p.name)::$(_DISCRETE_TYPE[_call_head(p.dist)]) )
+                       for p in params if p.discrete]
+    sig = Expr(:call, name, :( unconstrained::Vector{Float64} ), dataargs...,
+               discreteargs...)
     Expr(:(=), sig, Expr(:block, stmts...))
 end
 
