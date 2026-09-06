@@ -117,6 +117,45 @@ struct _Obs
     dist::Any        # the dist-call Expr referencing parameters / data
 end
 
+# --- Experimental structure descriptor (for the PPL Gibbs conjugacy layer) ---
+# `@ppl` lowers to an opaque `KernelSpec` that no longer carries the PPL-level
+# structure — which family each latent has, how it enters each likelihood. The
+# Gibbs layer's automatic conjugacy detection needs exactly that, so `@ppl` ALSO
+# registers a lightweight descriptor keyed by the produced model. This is an
+# INTERNAL introspection surface (NOT the model-authoring syntax the user is
+# particular about); reach it via `PPLMacro.model_info(model)`. Experimental —
+# may change alongside the rest of the front-end.
+struct ParamInfo
+    name::Symbol
+    prior_family::Symbol
+    prior_args::Vector{Any}   # each prior argument as source AST (Symbol / literal / Expr)
+    support::Symbol           # :real / :positive / :unit
+    is_vector::Bool
+end
+struct ObsInfo
+    data::Symbol
+    family::Symbol
+    args::Vector{Any}         # each likelihood argument as source AST
+end
+struct PPLModelInfo
+    params::Vector{ParamInfo}
+    obs::Vector{ObsInfo}
+end
+
+const _MODEL_INFO = Base.IdDict{Any,PPLModelInfo}()
+_register_model_info!(model, info::PPLModelInfo) = (_MODEL_INFO[model] = info; model)
+
+"""
+    PPLMacro.model_info(model) -> PPLModelInfo
+
+The experimental structure descriptor for an `@ppl` `model`: its parameters and
+observation streams, each carrying the distribution family and the source ASTs
+of its arguments. Used by the PPL Gibbs layer for automatic conjugacy detection.
+Throws (`KeyError`) if `model` was not produced by `@ppl`.
+"""
+model_info(model) = _MODEL_INFO[model]
+has_model_info(model) = haskey(_MODEL_INFO, model)
+
 _is_line(x) = x isa LineNumberNode
 
 # `arg` may be a bare Symbol or `name::Type`; return the bound name.
@@ -448,6 +487,31 @@ function _lower(name, dataargs, params, obs, passthrough)
     Expr(:(=), sig, Expr(:block, stmts...))
 end
 
+# Build the expression that constructs the runtime `PPLModelInfo` descriptor.
+# Distribution arguments are embedded as their SOURCE AST via `QuoteNode` (so a
+# literal `2.0` evaluates to `2.0`, a `:mu` to the symbol, an `alpha + beta * x`
+# to the Expr) — the Gibbs conjugacy detector inspects that AST. The struct
+# types are spliced as VALUES so they resolve to `PPLMacro`'s types regardless
+# of the escaped use-site scope.
+function _descriptor_expr(params, obs)
+    pexprs = Any[]
+    for p in params
+        args = Expr(:ref, :Any, (QuoteNode(a) for a in _call_args(p.dist))...)
+        push!(pexprs, Expr(:call, ParamInfo, QuoteNode(p.name),
+                           QuoteNode(_call_head(p.dist)), args,
+                           QuoteNode(p.support), p.size !== nothing))
+    end
+    oexprs = Any[]
+    for o in obs
+        args = Expr(:ref, :Any, (QuoteNode(a) for a in _call_args(o.dist))...)
+        push!(oexprs, Expr(:call, ObsInfo, QuoteNode(o.data),
+                           QuoteNode(_call_head(o.dist)), args))
+    end
+    Expr(:call, PPLModelInfo,
+         Expr(:vect, pexprs...),
+         Expr(:vect, oexprs...))
+end
+
 """
     @ppl name(data...) = begin … end
 
@@ -456,11 +520,21 @@ exposing the canonical PPL workflow nodes. See the module docstring for the
 first-cut scope. The distribution objects used in the body (`normal`, …) and
 `ReactiveKernels` must be in scope at the use site, exactly as the hand-authored
 PPL examples require.
+
+Besides binding `name` to the model, `@ppl` registers an experimental structure
+descriptor (`PPLMacro.model_info(name)`) the PPL Gibbs layer reads for automatic
+conjugacy detection — an internal introspection surface, not part of the model
+syntax.
 """
 macro ppl(def)
     (name, dataargs, params, obs, passthrough) = _parse(def)
     kernel_def = _lower(name, dataargs, params, obs, passthrough)
-    esc(Expr(:macrocall, Symbol("@kernel"), __source__, kernel_def))
+    kexpr = Expr(:macrocall, Symbol("@kernel"), __source__, kernel_def)
+    info_expr = _descriptor_expr(params, obs)
+    esc(quote
+        $(kexpr)
+        $(_register_model_info!)($(name), $(info_expr))
+    end)
 end
 
 end # module PPLMacro
