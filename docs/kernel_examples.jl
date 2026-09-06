@@ -290,12 +290,10 @@ function setup_arma11!(mod::Module)
     if !isdefined(mod, :ARMA11Example)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: ARMA11Example))
     end
-    Core.eval(mod, :(using .ARMA11Example:
-        ARMAParameters, UnconstrainedParameters, RealVector, ARMA_SERIES,
-        split_unconstrained, positive_scale, assemble_parameters,
-        log_abs_det_jacobian, arma_errors, log_prior,
-        pointwise_log_likelihood, sum_log_likelihood,
-        total_log_density, one_step_forecast))
+    # Bind only the data. The displayed PPL assembly imports and reuses the
+    # shared `normal` and `cauchy` distribution objects directly and authors the
+    # error recursion inline; no helper evaluator is injected.
+    Core.eval(mod, :(using .ARMA11Example: ARMA_SERIES))
     nothing
 end
 

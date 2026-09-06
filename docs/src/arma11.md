@@ -1,16 +1,16 @@
 # Declarative PPL kernel: ARMA(1, 1) time series
 
-```@eval
-Main.ReactiveKernelsDocs.render_review_status(:frozen_ppl)
-```
-
 This example ports the `arma11` model from
 [posteriordb](https://github.com/stan-dev/posteriordb) (posterior `arma-arma11`)
 into the same declarative-`@kernel` style as the
-[eight-schools example](eight-schools.md). Its distinctive structure is a
-**sequential recursion**: the latent one-step-ahead errors are computed by
-walking the series in order, and that stateful computation lives inside the log
-density.
+[eight-schools example](eight-schools.md): the model is authored inline in one
+source string, the Normal and Cauchy endpoints are reused from the shared
+distribution objects (the `HalfCauchy(2.5)` prior on `σ` folds the Cauchy
+endpoint with the `log(2)` truncation constant), and the constrained parameters
+are a plain NamedTuple. Its distinctive structure is a **sequential recursion**:
+the latent one-step-ahead errors are computed by walking the series in order, and
+that stateful computation is authored inline in the log density as one named
+graph node — irreducibly sequential, so it is not a plate.
 
 The complete runnable source is
 [`packages/ReactiveKernelsPPLExamples/src/arma11.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsPPLExamples/src/arma11.jl).
@@ -29,7 +29,7 @@ transform, so `σ = exp(log_σ)` and the optional log absolute Jacobian
 determinant is `log_σ`.
 
 ```text
-unconstrained ──► split ──► μ, φ, θ, log_σ ──► σ ──► constrained parameters
+unconstrained ──► μ, φ, θ, log_σ ──► σ ──► constrained parameters
    │                                    │              │
 series ─────────────────────────────────┴─► errors (recursion) ──► pointwise ─► likelihood
    │                                                   │

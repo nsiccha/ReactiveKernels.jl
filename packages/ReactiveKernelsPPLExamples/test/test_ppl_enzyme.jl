@@ -83,13 +83,27 @@ function dugongs_reference_density(q)
 end
 
 function arma11_reference_density(q)
-    μ, φ, θ, log_σ = q
-    parameters = ARMAParameters(μ, φ, θ, exp(log_σ))
-    errors = ARMA11Example.arma_errors(parameters, ARMA_SERIES)
-    likelihood = ARMA11Example.sum_log_likelihood(
-        ARMA11Example.pointwise_log_likelihood(errors, parameters))
-    ARMA11Example.total_log_density(
-        ARMA11Example.log_prior(parameters), log_σ, likelihood)
+    μ, φ, θ, log_σ = q[1], q[2], q[3], q[4]
+    σ = exp(log_σ)
+    normal(x, location, scale) =
+        -0.5 * log(2π) - log(scale) - 0.5 * ((x - location) / scale)^2
+    # The same sequential one-step error recursion, computed independently.
+    T = length(ARMA_SERIES)
+    err = Vector{typeof(μ)}(undef, T)
+    ν = μ + φ * μ
+    err[1] = ARMA_SERIES[1] - ν
+    @inbounds for t in 2:T
+        ν = μ + φ * ARMA_SERIES[t - 1] + θ * err[t - 1]
+        err[t] = ARMA_SERIES[t] - ν
+    end
+    # μ ~ Normal(0,10); φ, θ ~ Normal(0,2); σ ~ HalfCauchy(2.5); log Jac = log_σ.
+    prior = normal(μ, 0.0, 10.0) + normal(φ, 0.0, 2.0) + normal(θ, 0.0, 2.0) +
+            log(2.0) - log(π) - log(2.5) - log1p((σ / 2.5)^2)
+    likelihood = zero(μ)
+    @inbounds for e in err
+        likelihood += normal(e, 0.0, σ)
+    end
+    prior + log_σ + likelihood
 end
 
 function gaussian_mixture_reference_density(q)

@@ -3,7 +3,6 @@ module ARMA11Example
 using ReactiveKernels
 using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
 
-export ARMAParameters
 export ARMA_SERIES
 export build_arma11_graph, demo
 export ARMA11_SOURCE, evaluate_arma11_source
@@ -12,11 +11,6 @@ export ARMA11_SOURCE, evaluate_arma11_source
 # (posterior `arma-arma11`): a scalar ARMA(1, 1) time series. The interesting
 # structure is the *sequential* one-step-ahead error recursion carried inside
 # the log density — a stateful computation, unlike the pointwise GLM examples.
-
-# Unconstrained vector layout: (μ, φ, θ, log_σ). Only σ is transformed.
-const UnconstrainedParameters = NTuple{4,Real}
-const RealVector = AbstractVector{<:Real}
-const _LOG2PI = log(2π)
 
 # The real 200-point series from posteriordb (`arma` data).
 const ARMA_SERIES = [0.731977, 0.662415, 0.945948, 0.901509, 1.006875, 0.946637,
@@ -49,105 +43,85 @@ const ARMA_SERIES = [0.731977, 0.662415, 0.945948, 0.901509, 1.006875, 0.946637,
     -0.26258, -0.32625, -0.431907, -0.315292, -0.125547, 0.122771, 0.167974,
     0.367001, 0.618939, 0.636397, 0.633471, 0.78147]
 
-"Constrained parameters for the ARMA(1, 1) model."
-struct ARMAParameters{T<:Real}
-    μ::T
-    φ::T
-    θ::T
-    σ::T
-end
-
-# --- Pure operations used as graph recipes ---------------------------------
-
-function split_unconstrained(q::UnconstrainedParameters)
-    q[1], q[2], q[3], q[4]
-end
-
-positive_scale(log_σ::Real) = exp(log_σ)
-
-assemble_parameters(μ::Real, φ::Real, θ::Real, σ::Real) =
-    ARMAParameters(μ, φ, θ, σ)
-
-# Only σ is transformed: σ = exp(log_σ), so log |dσ / dlog_σ| = log_σ.
-log_abs_det_jacobian(log_σ::Real) = log_σ
-
-function normal_logpdf(x::Real, location::Real, scale::Real)
-    scale > 0 || throw(DomainError(scale, "normal scale must be positive"))
-    z = (x - location) / scale
-    -0.5 * _LOG2PI - log(scale) - 0.5 * z^2
-end
-
-function half_cauchy_logpdf(x::Real, scale::Real)
-    x > 0 || throw(DomainError(x, "half-Cauchy variate must be positive"))
-    scale > 0 || throw(DomainError(scale, "half-Cauchy scale must be positive"))
-    log(2) - log(π) - log(scale) - log1p((x / scale)^2)
-end
-
-function log_prior(parameters::ARMAParameters)
-    lp = normal_logpdf(parameters.μ, 0.0, 10.0)
-    lp += normal_logpdf(parameters.φ, 0.0, 2.0)
-    lp += normal_logpdf(parameters.θ, 0.0, 2.0)
-    lp += half_cauchy_logpdf(parameters.σ, 2.5)
-    lp
-end
-
-# The latent one-step-ahead errors, computed by the ARMA recursion:
-#   ν₁ = μ + φ·μ (err₀ ≡ 0), errₜ = yₜ − νₜ,
-#   νₜ = μ + φ·y_{t-1} + θ·err_{t-1}   (t ≥ 2).
-# This is the stateful heart of the model, exposed as its own named port.
-function arma_errors(parameters::ARMAParameters, series::RealVector)
-    T = length(series)
-    El = typeof(parameters.μ + parameters.φ + parameters.θ + zero(eltype(series)))
-    err = Vector{El}(undef, T)
-    ν = parameters.μ + parameters.φ * parameters.μ
-    err[1] = series[1] - ν
-    for t in 2:T
-        ν = parameters.μ + parameters.φ * series[t - 1] +
-            parameters.θ * err[t - 1]
-        err[t] = series[t] - ν
-    end
-    err
-end
-
-pointwise_log_likelihood(errors::RealVector, parameters::ARMAParameters) =
-    map(e -> normal_logpdf(e, 0.0, parameters.σ), errors)
-
-sum_log_likelihood(log_likelihoods::RealVector) = sum(log_likelihoods)
-
-total_log_density(log_prior::Real, log_jacobian::Real,
-                  log_likelihood::Real) =
-    log_prior + log_jacobian + log_likelihood
-
-# Deterministic generated quantity: the one-step-ahead point forecast for the
-# next observation, ν_{T+1} = μ + φ·y_T + θ·err_T.
-one_step_forecast(parameters::ARMAParameters, series::RealVector,
-                  errors::RealVector) =
-    parameters.μ + parameters.φ * series[end] + parameters.θ * errors[end]
-
 const ARMA11_SOURCE = raw"""
-@kernel model(unconstrained::UnconstrainedParameters,
-              series::RealVector) = begin
-    (μ::Real, φ::Real, θ::Real, log_σ::Real) =
-        split_unconstrained(unconstrained)
-    σ::Real = positive_scale(log_σ)
-    parameters::ARMAParameters = assemble_parameters(μ, φ, θ, σ)
-    log_jacobian::Real = log_abs_det_jacobian(log_σ)
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauchy
 
-    errors::RealVector = arma_errors(parameters, series)
-    prior::Real = log_prior(parameters)
-    pointwise::RealVector = pointwise_log_likelihood(errors, parameters)
-    likelihood::Real = sum_log_likelihood(pointwise)
-    density::Real = total_log_density(prior, log_jacobian, likelihood)
-    forecast::Real = one_step_forecast(parameters, series, errors)
+@kernel model(unconstrained::Vector{Float64},
+              series::Vector{Float64}) = begin
+    # q = (μ, φ, θ, log_σ). One-element reductions extract the packed scalars
+    # without scalar indexing, keeping the kernel Reactant-traceable.
+    μ::Float64 = sum(view(unconstrained, 1:1))
+    φ::Float64 = sum(view(unconstrained, 2:2))
+    θ::Float64 = sum(view(unconstrained, 3:3))
+    log_σ::Float64 = sum(view(unconstrained, 4:4))
+
+    # Only σ has a support transform. Either σ or log_σ may be the authoritative
+    # HAVE value; supplying both cuts both edges.
+    log_σ::Float64 = log(σ)
+    σ::Float64 = exp(log_σ)
+    log_jacobian::Float64 = log_σ
+
+    # Two producers for `parameters`, and inverse edges so the constrained
+    # NamedTuple is also an authoritative input boundary.
+    parameters = (; μ, φ, θ, σ)
+    (parameters, log_jacobian::Float64) = ((; μ, φ, θ, σ), log_σ)
+    (μ::Float64, φ::Float64, θ::Float64, σ::Float64) =
+        (parameters.μ, parameters.φ, parameters.θ, parameters.σ)
+
+    # The latent one-step-ahead errors are the sequential heart of the model:
+    #   ν₁ = μ + φ·μ (err₀ ≡ 0), errₜ = yₜ − νₜ,
+    #   νₜ = μ + φ·y_{t-1} + θ·err_{t-1}   (t ≥ 2).
+    # The recursion is irreducibly sequential, so it is authored inline as one
+    # named graph node rather than a plate. A query can still ask for just the
+    # errors, the full density, or the forecast.
+    errors::Vector{Float64} = let
+        T = length(series)
+        err = Vector{Float64}(undef, T)
+        ν = μ + φ * μ
+        err[1] = series[1] - ν
+        for t in 2:T
+            ν = μ + φ * series[t - 1] + θ * err[t - 1]
+            err[t] = series[t] - ν
+        end
+        err
+    end
+
+    # Log prior: μ ~ Normal(0, 10), φ, θ ~ Normal(0, 2), σ ~ HalfCauchy(2.5).
+    # The half-Cauchy folds the reusable Cauchy endpoint with the log(2)
+    # truncation constant.
+    μ_prior::Float64 = normal(0.0, 10.0).logpdf(μ)
+    φ_prior::Float64 = normal(0.0, 2.0).logpdf(φ)
+    θ_prior::Float64 = normal(0.0, 2.0).logpdf(θ)
+    σ_cauchy::Float64 = cauchy(0.0, 2.5).logpdf(σ)
+    σ_prior::Float64 = log(2.0) + σ_cauchy
+    prior::Float64 = μ_prior + φ_prior + θ_prior + σ_prior
+
+    # One authored likelihood plate over the latent errors: errₜ ~ Normal(0, σ).
+    # The scalar σ broadcasts across the error vector.
+    pointwise = plate(errors, σ) do e, s
+        normal(0.0, s).logpdf(e)
+    end
+    likelihood::Float64 = sum(pointwise)
+
+    constrained_logdensity::Float64 = prior + likelihood
+    unconstrained_prior::Float64 = prior + log_jacobian
+    density::Float64 = constrained_logdensity + log_jacobian
+
+    # Deterministic one-step-ahead point forecast ν_{T+1} = μ + φ·y_T + θ·err_T,
+    # read off the constrained parameters and the last recursion error.
+    forecast::Float64 =
+        parameters.μ + parameters.φ * series[end] + parameters.θ * errors[end]
+
     return density
 end
 
-q = (0.0, 0.9, -0.2, log(0.15))
+q = [0.0, 0.9, -0.2, log(0.15)]
 series = ARMA_SERIES
 
+requested_nodes = (:prior, :log_jacobian, :pointwise, :likelihood, :density)
 density_kernel = prepare(model;
     have = (:unconstrained, :series),
-    want = (:prior, :log_jacobian, :pointwise, :likelihood, :density))
+    want = requested_nodes)
 
 output = density_kernel(q, series)
 prior, logjac, pointwise, likelihood, density = output
@@ -156,22 +130,35 @@ prior, logjac, pointwise, likelihood, density = output
 
 docs_example = (;
     name = :arma11_density,
-    origin = "compact @kernel model (build executed) — posteriordb arma11",
+    origin = "Inline ARMA(1,1) with a sequential error recursion — posteriordb arma11",
     inputs = (; q, series),
     model,
     kernel = density_kernel,
     output,
+    requested_nodes,
+    normal_object = normal,
+    cauchy_object = cauchy,
 )
 """
 
 function evaluate_arma11_source()
+    # Bind only the data. The authored source imports the reusable Normal and
+    # Cauchy distribution objects itself and contains the complete PPL assembly,
+    # including the inline error recursion, with no helper evaluator.
     _evaluate_ppl_source(ARMA11_SOURCE, @__MODULE__; bindings = (
-        :ARMAParameters, :UnconstrainedParameters, :RealVector, :ARMA_SERIES,
-        :split_unconstrained, :positive_scale, :assemble_parameters,
-        :log_abs_det_jacobian, :arma_errors, :log_prior,
-        :pointwise_log_likelihood, :sum_log_likelihood,
-        :total_log_density, :one_step_forecast,
+        :ARMA_SERIES,
     ))
+end
+
+# Evaluate the authored source from `__init__`, after package precompilation has
+# closed the module. `build_arma11_graph` clones this runtime template so every
+# caller gets an independent mutable graph without crossing a fresh `Core.eval`
+# world-age boundary inside its own compiled function.
+const _ARMA11_GRAPH_TEMPLATE = Ref{KernelSpec}()
+
+function __init__()
+    _ARMA11_GRAPH_TEMPLATE[] = evaluate_arma11_source().model
+    nothing
 end
 
 """
@@ -179,18 +166,21 @@ end
 
 Build the posteriordb ARMA(1, 1) model as a declarative
 `ReactiveKernels.KernelSpec`. The latent one-step errors are computed by a
-sequential recursion and exposed as their own port, so a query can ask for just
-the errors, the full density, or the one-step forecast. The support transform +
+sequential recursion authored inline in the model source and exposed as their
+own port, so a query can ask for just the errors, the full density, or the
+one-step forecast. The Normal and Cauchy endpoints are reused from
+`ReactiveKernelsDistributionKernels`; the half-Cauchy prior on `σ` folds the
+Cauchy endpoint with the `log(2)` truncation constant. The support transform +
 Jacobian, prior, pointwise log-likelihood, likelihood reduction, and total
-density remain separate nodes.
+density remain separate nodes, and constrained parameters are a plain NamedTuple.
 """
 function build_arma11_graph()
-    evaluate_arma11_source().model
+    compose(_ARMA11_GRAPH_TEMPLATE[])
 end
 
 function demo()
     model = build_arma11_graph()
-    q = (0.0, 0.9, -0.2, log(0.15))
+    q = [0.0, 0.9, -0.2, log(0.15)]
 
     println("Latent one-step errors only (density branches pruned):")
     errors_plan = plan(model; have = (:unconstrained, :series), want = :errors)
