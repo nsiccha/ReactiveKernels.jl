@@ -446,7 +446,7 @@ function compile_traced_slots(program; static_currentness=true, unroll_limit=0, 
     end)
     expanded=macroexpand(@__MODULE__,slot_code_copy(expression))
     (;f=compile_slot_code(expanded;reuse_code),expression,expanded,metadata=SlotStatic(Tuple(statics)),
-      state=(;values,current=masks),ordered,entry_facts)
+      state=(;values,current=masks),ordered,entry_facts,valid_ordered)
 end
 
 struct SlotLoop{F,R,S}

@@ -126,7 +126,8 @@ function coalesced_slot_transfer(body,start,context,mainctx,children,borrowed)
 end
 
 function compile_native_slots(kernel, state, name; endpoints, effects, hoist=true,
-        bufferize=true, coalesce_transfers=true, count_gradients=false, peel_loops=false)
+        bufferize=true, coalesce_transfers=true, count_gradients=false, peel_loops=false,
+        count_steps::Bool=true)
     integer_indices=Dict{Symbol,Any}()
     pf = getfield(kernel,:prepared)
     skel = getfield(kernel,:skeleton)
@@ -403,7 +404,7 @@ function compile_native_slots(kernel, state, name; endpoints, effects, hoist=tru
                     Set(keys(controls))==Set(formal.name for formal in ir.formals) ||
                         error("native slots: supply every captured helper keyword explicitly")
                     push!(out,emit(effect_body,child,Dict{Symbol,Any}(),controls))
-                    push!(out,:(counts[1] += 1))
+                    count_steps && push!(out,:(counts[1] += 1))
                 elseif get(fields,field,:unknown) === nothing
                     # Authored optional observer has the captured no-effect binding.
                     nothing
@@ -447,7 +448,7 @@ function compile_native_slots(kernel, state, name; endpoints, effects, hoist=tru
     expression=qualify(expression)
     (; f=RK.compile(expression), stores=Tuple((c.owned,c.shared) for c in contexts),
        resources=Tuple(RK.kernel_prepared_handles(c.pf) for c in contexts),
-       constants=Ref(Tuple(constants)), counts=[0,0], expression,contexts)
+       constants=Ref(Tuple(constants)), counts=[0,0], expression,contexts,count_steps)
 end
 
 function slot_chain(program,rng,n)

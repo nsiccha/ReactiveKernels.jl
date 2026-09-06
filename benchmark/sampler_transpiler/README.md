@@ -224,6 +224,18 @@ each helper keyword explicitly, either through its binder or at the call site.
 `runtime_keyword_probe.jl` checks evaluation order, per-site rejection and
 native/Reactant execution independently of the sampler.
 
+The internal native emitter accepts `count_steps=false` to omit its diagnostic
+integration counter. Existing drivers keep counting by default. The
+[`counter_ablation.jl`](counter_ablation.jl) experiment alternates counted and
+uncounted execution of the same captured multinomial source, with 1,000 and
+10,000 transitions per batch. It checks integration work in the counted
+executable outside the timing comparison. `counter-ablation-v1.toml` retains
+all samples: native improves about 5%; Reactant's smaller batch improves but
+its larger batch does not. This is not a general Reactant speedup claim.
+The traced program also exposes `valid_ordered` for inspecting which canonical
+fields still carry runtime currentness flags. In this workload those flags
+belong to momentum/energy fields, not the gradient cache.
+
 [`multinomial_eight_schools.jl`](multinomial_eight_schools.jl) measures 1,000
 consecutive transitions, seven interleaved samples, using the same model,
 callbacks, metric, step size and leapfrog count as `AdvancedHMC.MultinomialTS`.

@@ -1,0 +1,156 @@
+"schema_version" = 1
+"parent_commit" = "87163374b07b59ea3b92eb70ee4968da13942604"
+"host" = "strato2"
+"julia" = "1.10.11"
+"enzyme" = "0.13.199"
+"ahmc" = "0.8.6"
+"status" = "optional_integration_counter_measured"
+"note" = "Paired counter ablation of the unchanged captured multinomial source; no AHMC comparator in this isolation experiment. count_steps=true remains the compatibility default; count_steps=false emits no helper-count increment. Captured source and numerical work unchanged. No cross-backend numerical/trajectory agreement gate."
+
+["reactant"]
+
+["reactant"."1000"]
+
+["reactant"."1000"."counted"]
+"seconds" = [0.017332089, 0.017857304, 0.01785486, 0.0181815, 0.016934541, 0.017542449, 0.017548017]
+"allocated_bytes" = [2096, 2096, 2096, 2096, 2096, 2096, 2096]
+"median_us" = 17.548017
+
+["reactant"."1000"."uncounted"]
+"seconds" = [0.016611605, 0.01657058, 0.017980133, 0.016445517, 0.015848564, 0.016118476, 0.015981177]
+"allocated_bytes" = [2032, 2032, 2032, 2032, 2032, 2032, 2032]
+"median_us" = 16.445517
+
+["reactant"."10000"]
+
+["reactant"."10000"."counted"]
+"seconds" = [0.153308103, 0.159235637, 0.153194647, 0.158062299, 0.155725978, 0.152998628, 0.160946997]
+"allocated_bytes" = [2096, 2096, 2096, 2096, 2096, 2096, 2096]
+"median_us" = 15.572597799999997
+
+["reactant"."10000"."uncounted"]
+"seconds" = [0.158429125, 0.157139106, 0.153368567, 0.154397847, 0.156556242, 0.156666764, 0.158828125]
+"allocated_bytes" = [2032, 2032, 2032, 2032, 2032, 2032, 2032]
+"median_us" = 15.6666764
+
+["counter"]
+"exit_code" = 0
+"elapsed_seconds" = 175
+"command" = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/counter_ablation.jl"
+"recorded_output" = "BEGIN prepare_model\nprepare_model seconds=4.434037168 bytes=233091904\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=8.314074126 bytes=859627936\nBEGIN prepare_multinomial_factory\nprepare_multinomial_factory seconds=4.878622969 bytes=358704960\nBEGIN lower_multinomial_native\nlower_multinomial_native seconds=3.493380416 bytes=282157448\nchildren=(:init, :fwd, :bwd)\nBEGIN prepare_model\nprepare_model seconds=0.327465096 bytes=14636400\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=0.465423714 bytes=25805808\nBEGIN prepare_multinomial_factory\nprepare_multinomial_factory seconds=0.920152901 bytes=5914200\nBEGIN lower_multinomial_native\nlower_multinomial_native seconds=0.479624816 bytes=24780744\nchildren=(:init, :fwd, :bwd)\ncounter_sample backend=native variant=counted transitions=1000 seconds=0.006601452 bytes=0\ncounter_sample backend=native variant=uncounted transitions=1000 seconds=0.006349065 bytes=0\ncounter_sample backend=native variant=uncounted transitions=1000 seconds=0.006584639 bytes=0\ncounter_sample backend=native variant=counted transitions=1000 seconds=0.006697105 bytes=0\ncounter_sample backend=native variant=counted transitions=1000 seconds=0.006719867 bytes=0\ncounter_sample backend=native variant=uncounted transitions=1000 seconds=0.006669266 bytes=0\ncounter_sample backend=native variant=uncounted transitions=1000 seconds=0.006424459 bytes=0\ncounter_sample backend=native variant=counted transitions=1000 seconds=0.006658351 bytes=0\ncounter_sample backend=native variant=counted transitions=1000 seconds=0.006810661 bytes=0\ncounter_sample backend=native variant=uncounted transitions=1000 seconds=0.006225364 bytes=0\ncounter_sample backend=native variant=uncounted transitions=1000 seconds=0.006152324 bytes=0\ncounter_sample backend=native variant=counted transitions=1000 seconds=0.006572783 bytes=0\ncounter_sample backend=native variant=counted transitions=1000 seconds=0.006615191 bytes=0\ncounter_sample backend=native variant=uncounted transitions=1000 seconds=0.006291775 bytes=0\ncounter_sample backend=native variant=counted transitions=10000 seconds=0.067788762 bytes=0\ncounter_sample backend=native variant=uncounted transitions=10000 seconds=0.06324035 bytes=0\ncounter_sample backend=native variant=uncounted transitions=10000 seconds=0.063980572 bytes=0\ncounter_sample backend=native variant=counted transitions=10000 seconds=0.067913213 bytes=0\ncounter_sample backend=native variant=counted transitions=10000 seconds=0.066740487 bytes=0\ncounter_sample backend=native variant=uncounted transitions=10000 seconds=0.062445515 bytes=0\ncounter_sample backend=native variant=uncounted transitions=10000 seconds=0.065435228 bytes=0\ncounter_sample backend=native variant=counted transitions=10000 seconds=0.070681482 bytes=0\ncounter_sample backend=native variant=counted transitions=10000 seconds=0.069725944 bytes=0\ncounter_sample backend=native variant=uncounted transitions=10000 seconds=0.072805551 bytes=0\ncounter_sample backend=native variant=uncounted transitions=10000 seconds=0.064233891 bytes=0\ncounter_sample backend=native variant=counted transitions=10000 seconds=0.067260354 bytes=0\ncounter_sample backend=native variant=counted transitions=10000 seconds=0.06755511 bytes=0\ncounter_sample backend=native variant=uncounted transitions=10000 seconds=0.065062764 bytes=0\nBEGIN prepare_model\nprepare_model seconds=0.30088114 bytes=14644496\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=0.425278618 bytes=25709640\nBEGIN prepare_multinomial_factory\nprepare_multinomial_factory seconds=0.878217667 bytes=5915912\nBEGIN lower_multinomial_native\nlower_multinomial_native seconds=0.505585713 bytes=26857064\nchildren=(:init, :fwd, :bwd)\nBEGIN prepare_model\nprepare_model seconds=0.356574194 bytes=14641712\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=0.455589713 bytes=25708920\nBEGIN prepare_multinomial_factory\nprepare_multinomial_factory seconds=0.806255911 bytes=5913192\nBEGIN lower_multinomial_native\nlower_multinomial_native seconds=0.468622345 bytes=26707840\nchildren=(:init, :fwd, :bwd)\nruntime_validity object=__slot_child_2_owned fields=[:dham_dmom, :dkin_dmom] symbol=_ts_current_22\nruntime_validity object=__slot_child_2_owned fields=[:kin] symbol=_ts_current_25\nruntime_validity object=__slot_child_2_owned fields=[:ham] symbol=_ts_current_28\nruntime_validity object=__slot_child_3_owned fields=[:dham_dmom, :dkin_dmom] symbol=_ts_current_38\nruntime_validity object=__slot_child_3_owned fields=[:kin] symbol=_ts_current_40\nruntime_validity object=__slot_child_3_owned fields=[:ham] symbol=_ts_current_42\nBEGIN compile_counter_counted_1000\ncompile_counter_counted_1000 seconds=48.813285105 bytes=4176550173\ncounter_mlir variant=counted transitions=1000 bytes=78826\nruntime_validity object=__slot_child_2_owned fields=[:dham_dmom, :dkin_dmom] symbol=_ts_current_22\nruntime_validity object=__slot_child_2_owned fields=[:kin] symbol=_ts_current_25\nruntime_validity object=__slot_child_2_owned fields=[:ham] symbol=_ts_current_28\nruntime_validity object=__slot_child_3_owned fields=[:dham_dmom, :dkin_dmom] symbol=_ts_current_38\nruntime_validity object=__slot_child_3_owned fields=[:kin] symbol=_ts_current_40\nruntime_validity object=__slot_child_3_owned fields=[:ham] symbol=_ts_current_42\nBEGIN compile_counter_uncounted_1000\ncompile_counter_uncounted_1000 seconds=15.306598763 bytes=1077675285\ncounter_mlir variant=uncounted transitions=1000 bytes=78657\ncounter_sample backend=reactant variant=counted transitions=1000 seconds=0.017332089 bytes=2096\ncounter_sample backend=reactant variant=uncounted transitions=1000 seconds=0.016611605 bytes=2032\ncounter_sample backend=reactant variant=uncounted transitions=1000 seconds=0.01657058 bytes=2032\ncounter_sample backend=reactant variant=counted transitions=1000 seconds=0.017857304 bytes=2096\ncounter_sample backend=reactant variant=counted transitions=1000 seconds=0.01785486 bytes=2096\ncounter_sample backend=reactant variant=uncounted transitions=1000 seconds=0.017980133 bytes=2032\ncounter_sample backend=reactant variant=uncounted transitions=1000 seconds=0.016445517 bytes=2032\ncounter_sample backend=reactant variant=counted transitions=1000 seconds=0.0181815 bytes=2096\ncounter_sample backend=reactant variant=counted transitions=1000 seconds=0.016934541 bytes=2096\ncounter_sample backend=reactant variant=uncounted transitions=1000 seconds=0.015848564 bytes=2032\ncounter_sample backend=reactant variant=uncounted transitions=1000 seconds=0.016118476 bytes=2032\ncounter_sample backend=reactant variant=counted transitions=1000 seconds=0.017542449 bytes=2096\ncounter_sample backend=reactant variant=counted transitions=1000 seconds=0.017548017 bytes=2096\ncounter_sample backend=reactant variant=uncounted transitions=1000 seconds=0.015981177 bytes=2032\nruntime_validity object=__slot_child_2_owned fields=[:dham_dmom, :dkin_dmom] symbol=_ts_current_22\nruntime_validity object=__slot_child_2_owned fields=[:kin] symbol=_ts_current_25\nruntime_validity object=__slot_child_2_owned fields=[:ham] symbol=_ts_current_28\nruntime_validity object=__slot_child_3_owned fields=[:dham_dmom, :dkin_dmom] symbol=_ts_current_38\nruntime_validity object=__slot_child_3_owned fields=[:kin] symbol=_ts_current_40\nruntime_validity object=__slot_child_3_owned fields=[:ham] symbol=_ts_current_42\nBEGIN compile_counter_counted_10000\ncompile_counter_counted_10000 seconds=1.160152712 bytes=27291392\ncounter_mlir variant=counted transitions=10000 bytes=78828\nruntime_validity object=__slot_child_2_owned fields=[:dham_dmom, :dkin_dmom] symbol=_ts_current_22\nruntime_validity object=__slot_child_2_owned fields=[:kin] symbol=_ts_current_25\nruntime_validity object=__slot_child_2_owned fields=[:ham] symbol=_ts_current_28\nruntime_validity object=__slot_child_3_owned fields=[:dham_dmom, :dkin_dmom] symbol=_ts_current_38\nruntime_validity object=__slot_child_3_owned fields=[:kin] symbol=_ts_current_40\nruntime_validity object=__slot_child_3_owned fields=[:ham] symbol=_ts_current_42\nBEGIN compile_counter_uncounted_10000\ncompile_counter_uncounted_10000 seconds=1.178097266 bytes=26653208\ncounter_mlir variant=uncounted transitions=10000 bytes=78658\ncounter_sample backend=reactant variant=counted transitions=10000 seconds=0.153308103 bytes=2096\ncounter_sample backend=reactant variant=uncounted transitions=10000 seconds=0.158429125 bytes=2032\ncounter_sample backend=reactant variant=uncounted transitions=10000 seconds=0.157139106 bytes=2032\ncounter_sample backend=reactant variant=counted transitions=10000 seconds=0.159235637 bytes=2096\ncounter_sample backend=reactant variant=counted transitions=10000 seconds=0.153194647 bytes=2096\ncounter_sample backend=reactant variant=uncounted transitions=10000 seconds=0.153368567 bytes=2032\ncounter_sample backend=reactant variant=uncounted transitions=10000 seconds=0.154397847 bytes=2032\ncounter_sample backend=reactant variant=counted transitions=10000 seconds=0.158062299 bytes=2096\ncounter_sample backend=reactant variant=counted transitions=10000 seconds=0.155725978 bytes=2096\ncounter_sample backend=reactant variant=uncounted transitions=10000 seconds=0.156556242 bytes=2032\ncounter_sample backend=reactant variant=uncounted transitions=10000 seconds=0.156666764 bytes=2032\ncounter_sample backend=reactant variant=counted transitions=10000 seconds=0.152998628 bytes=2096\ncounter_sample backend=reactant variant=counted transitions=10000 seconds=0.160946997 bytes=2096\ncounter_sample backend=reactant variant=uncounted transitions=10000 seconds=0.158828125 bytes=2032\n"
+"interpretation" = "Native median improves4.65%/5.24% for1000/10000-transition batches. Reactant improves6.28% at1000 but worsens0.60% at10000; no general Reactant speedup claim. Compilation rows include first compilation and later code reuse; never pool them as cold compilation samples. All counted workloads and zero disabled counters checked; finite numerical vectors and caller preservation checked."
+
+["native"]
+
+["native"."1000"]
+
+["native"."1000"."counted"]
+"seconds" = [0.006601452, 0.006697105, 0.006719867, 0.006658351, 0.006810661, 0.006572783, 0.006615191]
+"allocated_bytes" = [0, 0, 0, 0, 0, 0, 0]
+"median_us" = 6.658351
+
+["native"."1000"."uncounted"]
+"seconds" = [0.006349065, 0.006584639, 0.006669266, 0.006424459, 0.006225364, 0.006152324, 0.006291775]
+"allocated_bytes" = [0, 0, 0, 0, 0, 0, 0]
+"median_us" = 6.349065
+
+["native"."10000"]
+
+["native"."10000"."counted"]
+"seconds" = [0.067788762, 0.067913213, 0.066740487, 0.070681482, 0.069725944, 0.067260354, 0.06755511]
+"allocated_bytes" = [0, 0, 0, 0, 0, 0, 0]
+"median_us" = 6.7788762
+
+["native"."10000"."uncounted"]
+"seconds" = [0.06324035, 0.063980572, 0.062445515, 0.065435228, 0.072805551, 0.064233891, 0.065062764]
+"allocated_bytes" = [0, 0, 0, 0, 0, 0, 0]
+"median_us" = 6.4233891000000005
+
+["warm_gradient_diagnostic"]
+"source" = "module WarmAnchorHMCAuthoring\nusing ReactiveKernels, Random, LinearAlgebra, LogExpFunctions\n\n@kernel multinomial_hmc_state(init; n_steps=4, step_f=nothing, stepsize=0.03) = begin\n    anchor = deepcopy(init)\n    work = deepcopy(init)\n    step!(rng) = begin\n        init.mom = Random.randn!(rng, init.mom)\n        init.mom = sqrt(anchor.metric) * init.mom\n        init.dpot_dpos\n        anchor.pos .= init.pos\n        anchor.mom .= init.mom\n        work.pos .= init.pos\n        work.mom .= init.mom\n        initial_ham = init.ham\n        log_weight = zero(initial_ham)\n        n_fwd = Random.rand(rng, 0:n_steps)\n        for i in 1:n_steps\n            if i == n_fwd + 1\n                work .= anchor\n            end\n            direction = i <= n_fwd ? stepsize : -stepsize\n            step_f(work; stepsize=direction)\n            raw_weight = initial_ham - work.ham\n            weight = (raw_weight - raw_weight == zero(raw_weight)) ? raw_weight : oftype(raw_weight, -Inf)\n            log_weight = logaddexp(log_weight, weight)\n            if -Random.randexp(rng) < weight - log_weight\n                init .= work\n            end\n        end\n    end\nend\nend\n"
+"driver" = "include(\"/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-sampling/benchmark/sampler_transpiler/multinomial_eight_schools.jl\")\ninclude(\"/home/n/scratch/kb-agent-tmp/ReactiveKernels-sampling/warm_anchor_hmc_kernel.jl\")\nconst MODE=ARGS[1]\nconst L=length(ARGS)>1 ? parse(Int,ARGS[2]) : 16\nconst PROTOTYPE=build_multinomial_prototype(;L,\n    source=WarmAnchorHMCAuthoring.multinomial_hmc_state,\n    source_controls=(step_f=F.leapfrog!,stepsize=0.03),\n    compiler_options=(peel_loops=MODE==\"reactant\",count_gradients=MODE==\"diagnostics\"))\nif MODE==\"reactant\"\n    run_traced_comparison(PROTOTYPE;n=1000)\nelseif MODE==\"native\"\n    run_prepared_comparison(PROTOTYPE.prepared,PROTOTYPE.comparator,L,1000)\nelseif MODE==\"diagnostics\"\n    check_multinomial_native(PROTOTYPE;n=1000)\nelse\n    error(\"native, reactant, or diagnostics\")\nend\n"
+"interpretation" = "Eager init.dpot_dpos read before endpoint copies. Native executes16000 gradients for16000 steps; Reactant IR remains44554B with3runtime flags, runtime19.631us median/best15.265us gives no gain. Not adopted. Flags identified separately in the counter experiment are momentum derivatives,kinetic energy,Hamiltonian caches, not gradients."
+
+["warm_gradient_diagnostic"."native"]
+"exit_code" = 0
+"elapsed_seconds" = 64
+"recorded_output" = "BEGIN prepare_model\nprepare_model seconds=4.531643422 bytes=233314528\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=7.890650261 bytes=859852152\nBEGIN prepare_multinomial_factory\nprepare_multinomial_factory seconds=4.9466821 bytes=361695888\nBEGIN lower_multinomial_native\nlower_multinomial_native seconds=3.695371803 bytes=320997552\nchildren=(:init, :anchor, :work)\ndiagnostic_integration_steps=16000 diagnostic_gradient_calls=16000\n"
+
+["warm_gradient_diagnostic"."reactant"]
+"exit_code" = 0
+"elapsed_seconds" = 110
+"recorded_output" = "BEGIN prepare_model\nprepare_model seconds=4.016964969 bytes=233317984\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=7.356363511 bytes=859511576\nBEGIN prepare_multinomial_factory\nprepare_multinomial_factory seconds=4.732643311 bytes=361958160\nBEGIN lower_multinomial_native\nlower_multinomial_native seconds=3.808298188 bytes=309777264\nchildren=(:init, :anchor, :work)\nBEGIN lower_traced_slots\nlower_traced_slots seconds=2.254451292 bytes=309067888\nproven_currentness_facts=18 runtime_currentness_flags=3 metadata_entries=11\nBEGIN compile_traced_slots\ncompile_traced_slots seconds=42.582629792 bytes=4204283853\nmlir_bytes=44554 while_regions=3 if_regions=0\nBEGIN traced_slots_first_chain\ntraced_slots_first_chain seconds=0.342747406 bytes=40213200\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.019311779 bytes=2352\nintegration_steps=16000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.01596979 bytes=33274416\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.019631359 bytes=2352\nintegration_steps=16000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.041996599 bytes=33278048\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.018031173 bytes=2352\nintegration_steps=16000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.017172348 bytes=33274416\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.020149264 bytes=2352\nintegration_steps=16000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.035102051 bytes=33274416\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.015265159 bytes=2352\nintegration_steps=16000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.014184709 bytes=33274416\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.023016537 bytes=2352\nintegration_steps=16000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.037969064 bytes=33274416\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.022411863 bytes=2352\nintegration_steps=16000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.017961607 bytes=33274416\n"
+
+["warm_gradient_diagnostic"."first_typo_failure"]
+"exit_code" = 1
+"elapsed_seconds" = 61
+"reason" = "Probe read nonexistent init.grad; corrected to the authored dpot_dpos field."
+
+["warm_gradient_diagnostic"."executed_source_sha256"]
+"src/ad.jl" = "37c8258f5ffa67fbab9b4240fb972858c3e05a01f1d99b73fd3a1790afd4b568"
+"ext/ReactiveKernelsReactantExt.jl" = "6557fdb95b8115a375ca99d73496a30e2fddddff2c2eab09a92da8663819ff34"
+"src/kernel_adaptation.jl" = "d655baa036d4e5770b769ab644b8c56ca0567c167d3643011352131e9928a5c4"
+"benchmark/reactivehmc_hmc_kernel_fixture_b.jl" = "9ffa4e8e2990992cd92303e55a6d005cff2c6e1698de6bca7941ad2907f8a4da"
+"benchmark/nuts_kernel_authoring_fixture_b.jl" = "7a9a9d6e1fa122e3d846def760933b0ba14e62e567d92cffab9d9d638f9404f4"
+"benchmark/sampler_transpiler/hmc_eight_schools.jl" = "c18b800fc013d8007d1d1b23d7c7330b89304bc8ff92767562b26a788d2d5996"
+"benchmark/sampler_transpiler/native_slots.jl" = "c0f03d31c96be0c6282608c93779cd6c92c00e3741e40bdf62bc365e3f8d3e25"
+"benchmark/sampler_transpiler/native_slots_factory.jl" = "36468f4da6321631c0eba1a8fc1baa5dee305220b0e1572d6966b509365f8235"
+"benchmark/sampler_transpiler/native_comparison.jl" = "5e2612234a93c4d126a7c9550520ba468b266c790709e1602a1b1dccae183598"
+"benchmark/sampler_transpiler/traced_slots.jl" = "1145f10c16fb282f15615d8450e57b0e947af0b44c7a42ae99d16adfe9a18fd1"
+"benchmark/sampler_transpiler/traced_comparison.jl" = "ff891cd14f9ae1933a3b3813246b1d242b056b3b8c271425c3545e1bb78732c0"
+"benchmark/sampler_transpiler/loop_control_probe.jl" = "45bc979f7bdfbbc91918f4aa3300f794d7b263dd788b4707b7e621e4b1970881"
+"benchmark/sampler_transpiler/profile_compile.jl" = "ba92a50afae1fdd86667fc00f16197a0479214e714eb2237e10b2cdf7332dbc8"
+"src/ReactiveKernels.jl" = "5dadbc59cd45725b1b00350cc5156e4b8a403c766b90ca24985f5bc958d3ce01"
+"src/native_slot_compiler.jl" = "206f475697d27bbc230f5eca0631378ee22e13951ab5929d94158ae6802ebea9"
+"src/native_slots.jl" = "e535c88da354a235a39f426bdbff9f2a83697ba8bf2d6efca680aa04114bbc7a"
+"src/native_slots_factory.jl" = "9f0f47fc081de7b54950fe4e87ec488b6dfb0e6b84fa3119af1a07ff96d0928a"
+"ext/ReactiveKernelsReactantExt/traced_slot_compiler.jl" = "7f5bc7f5148912b1d7355ad55181e847911984199c6fbccb53b3a49ede4a83a7"
+"ext/ReactiveKernelsReactantExt/traced_slots.jl" = "f5cedc4bd7f65b5239ac19073d3c5d2656e59b5e888f84e89e8bcc4f5035ee03"
+"benchmark/sampler_transpiler/scalar_argument_probe.jl" = "277492fefac36afa9dce6b96f1510137dcd3eda1eb0ef97e44874a5300b0b47b"
+"ext/ReactiveKernelsReactantExt/traced_code_cache.jl" = "1e1b87256021628044b47b5c2c3e0f8d14d0e298d58e156c82b0f8958c0d46fb"
+"benchmark/sampler_transpiler/code_reuse_probe.jl" = "2ce50d054e810c354e4561ff1ce8067bcb02010560eb319edac73e05fb0c0ec0"
+"benchmark/sampler_transpiler/multinomial_hmc_kernel.jl" = "a854b0a9cf5ec660e64d622b9442804a564ffc0657ed3089331aa9e5fcb97218"
+"benchmark/sampler_transpiler/multinomial_eight_schools.jl" = "0080849f5e4cd1d5ac933aba28d941e747d99669fb9cf14b38efd201a29ce9df"
+"benchmark/sampler_transpiler/constant_binding_probe.jl" = "a510b08850dc0e07779ff80750c26bdddac93552c2d8b7ea400148973bcf95c8"
+"benchmark/sampler_transpiler/range_draw_probe.jl" = "e9d82d844fbed32de615ee8dde49876cf488a102d6d6938c8c2742f4692cbe5f"
+"ext/ReactiveKernelsReactantExt/traced_random.jl" = "33e50ef2a1f7eda06a4a01bb66892565d609e2d28aa418f391db445f468e0e93"
+"src/kernel_stateful.jl" = "2cff19f87a39d124a462d4f79cd99cb94c9908c16f5b1c2d3946db7af89a6776"
+"test/test_kernel_methodir.jl" = "1aa1a6a9501d4525031f7ea8166bf3e6bf29ce8bd85b23a18e101b2d929961f7"
+"benchmark/sampler_transpiler/indexed_array_probe.jl" = "a746173df251cb14f6b628a3142337ca15458fc486e1afe6e2caf1d7ba4f06bd"
+"src/kernel_factory.jl" = "6cd1cc5e3715d420a4d06983d361a2597c3a2f243f88e21fbcd5eb2fda4e65b1"
+"benchmark/sampler_transpiler/runtime_keyword_probe.jl" = "fcdff23cfaabf5616dbc339653b660117ed4e96ae8c844382196631bc3bf6f08"
+
+["source_sha256"]
+"src/ad.jl" = "37c8258f5ffa67fbab9b4240fb972858c3e05a01f1d99b73fd3a1790afd4b568"
+"ext/ReactiveKernelsReactantExt.jl" = "6557fdb95b8115a375ca99d73496a30e2fddddff2c2eab09a92da8663819ff34"
+"src/kernel_adaptation.jl" = "d655baa036d4e5770b769ab644b8c56ca0567c167d3643011352131e9928a5c4"
+"benchmark/reactivehmc_hmc_kernel_fixture_b.jl" = "9ffa4e8e2990992cd92303e55a6d005cff2c6e1698de6bca7941ad2907f8a4da"
+"benchmark/nuts_kernel_authoring_fixture_b.jl" = "7a9a9d6e1fa122e3d846def760933b0ba14e62e567d92cffab9d9d638f9404f4"
+"benchmark/sampler_transpiler/hmc_eight_schools.jl" = "c18b800fc013d8007d1d1b23d7c7330b89304bc8ff92767562b26a788d2d5996"
+"benchmark/sampler_transpiler/native_slots.jl" = "c0f03d31c96be0c6282608c93779cd6c92c00e3741e40bdf62bc365e3f8d3e25"
+"benchmark/sampler_transpiler/native_slots_factory.jl" = "36468f4da6321631c0eba1a8fc1baa5dee305220b0e1572d6966b509365f8235"
+"benchmark/sampler_transpiler/native_comparison.jl" = "5e2612234a93c4d126a7c9550520ba468b266c790709e1602a1b1dccae183598"
+"benchmark/sampler_transpiler/traced_slots.jl" = "1145f10c16fb282f15615d8450e57b0e947af0b44c7a42ae99d16adfe9a18fd1"
+"benchmark/sampler_transpiler/traced_comparison.jl" = "ff891cd14f9ae1933a3b3813246b1d242b056b3b8c271425c3545e1bb78732c0"
+"benchmark/sampler_transpiler/loop_control_probe.jl" = "45bc979f7bdfbbc91918f4aa3300f794d7b263dd788b4707b7e621e4b1970881"
+"benchmark/sampler_transpiler/profile_compile.jl" = "ba92a50afae1fdd86667fc00f16197a0479214e714eb2237e10b2cdf7332dbc8"
+"src/ReactiveKernels.jl" = "5dadbc59cd45725b1b00350cc5156e4b8a403c766b90ca24985f5bc958d3ce01"
+"src/native_slot_compiler.jl" = "206f475697d27bbc230f5eca0631378ee22e13951ab5929d94158ae6802ebea9"
+"src/native_slots.jl" = "b6d57e68ad3a56f5b19b0dc1b62b6249985727fa290053a1c557afe0419f9e3e"
+"src/native_slots_factory.jl" = "9f0f47fc081de7b54950fe4e87ec488b6dfb0e6b84fa3119af1a07ff96d0928a"
+"ext/ReactiveKernelsReactantExt/traced_slot_compiler.jl" = "7f5bc7f5148912b1d7355ad55181e847911984199c6fbccb53b3a49ede4a83a7"
+"ext/ReactiveKernelsReactantExt/traced_slots.jl" = "07c49800fe61e6172f48d9a84297120bb485cbad7e220c2bd9aa7ea8101a3a3c"
+"benchmark/sampler_transpiler/scalar_argument_probe.jl" = "277492fefac36afa9dce6b96f1510137dcd3eda1eb0ef97e44874a5300b0b47b"
+"ext/ReactiveKernelsReactantExt/traced_code_cache.jl" = "1e1b87256021628044b47b5c2c3e0f8d14d0e298d58e156c82b0f8958c0d46fb"
+"benchmark/sampler_transpiler/code_reuse_probe.jl" = "2ce50d054e810c354e4561ff1ce8067bcb02010560eb319edac73e05fb0c0ec0"
+"benchmark/sampler_transpiler/multinomial_hmc_kernel.jl" = "a854b0a9cf5ec660e64d622b9442804a564ffc0657ed3089331aa9e5fcb97218"
+"benchmark/sampler_transpiler/multinomial_eight_schools.jl" = "0080849f5e4cd1d5ac933aba28d941e747d99669fb9cf14b38efd201a29ce9df"
+"benchmark/sampler_transpiler/constant_binding_probe.jl" = "a510b08850dc0e07779ff80750c26bdddac93552c2d8b7ea400148973bcf95c8"
+"benchmark/sampler_transpiler/range_draw_probe.jl" = "e9d82d844fbed32de615ee8dde49876cf488a102d6d6938c8c2742f4692cbe5f"
+"ext/ReactiveKernelsReactantExt/traced_random.jl" = "33e50ef2a1f7eda06a4a01bb66892565d609e2d28aa418f391db445f468e0e93"
+"src/kernel_stateful.jl" = "2cff19f87a39d124a462d4f79cd99cb94c9908c16f5b1c2d3946db7af89a6776"
+"test/test_kernel_methodir.jl" = "1aa1a6a9501d4525031f7ea8166bf3e6bf29ce8bd85b23a18e101b2d929961f7"
+"benchmark/sampler_transpiler/indexed_array_probe.jl" = "a746173df251cb14f6b628a3142337ca15458fc486e1afe6e2caf1d7ba4f06bd"
+"src/kernel_factory.jl" = "6cd1cc5e3715d420a4d06983d361a2597c3a2f243f88e21fbcd5eb2fda4e65b1"
+"benchmark/sampler_transpiler/runtime_keyword_probe.jl" = "fcdff23cfaabf5616dbc339653b660117ed4e96ae8c844382196631bc3bf6f08"
+"benchmark/sampler_transpiler/counter_ablation.jl" = "1d459d0f9ee8c3741d13659be69724d3a924698c6bdf036b7f825b66a952a0f5"
