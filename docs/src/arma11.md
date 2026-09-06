@@ -10,7 +10,10 @@ endpoint with the `log(2)` truncation constant), and the constrained parameters
 are a plain NamedTuple. Its distinctive structure is a **sequential recursion**:
 the latent one-step-ahead errors are computed by walking the series in order, and
 that stateful computation is authored inline in the log density as one named
-graph node — irreducibly sequential, so it is not a plate.
+graph node — irreducibly sequential, so it is not a plate. The example also
+carries the *vectorized closed form* of that recursion (`errors_closed`) as a
+second node, which the density reduces so the model lowers through Reactant (see
+the Reactant section below).
 
 The complete runnable source is
 [`packages/ReactiveKernelsPPLExamples/src/arma11.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsPPLExamples/src/arma11.jl).
@@ -30,17 +33,20 @@ determinant is `log_σ`.
 
 ```text
 unconstrained ──► μ, φ, θ, log_σ ──► σ ──► constrained parameters
-   │                                    │              │
-series ─────────────────────────────────┴─► errors (recursion) ──► pointwise ─► likelihood
-   │                                                   │
-   └───────────────────────────────► one-step-ahead forecast
+   │                                              │
+series ──┬─► errors (sequential recursion) ──────► one-step-ahead forecast
+         │        (native reference; parity-checked against errors_closed)
+         └─► errors_closed (vectorized Toeplitz) ─► pointwise ─► likelihood
+                   (lowers through Reactant)
 
 log prior + log Jacobian + log likelihood ──► unconstrained log density
 ```
 
-The latent errors are a **first-class named port**: a query can ask for just the
-`errors`, the full `density`, or the one-step-ahead `forecast`, and the planner
-computes the recursion once and shares it.
+The latent errors are a **first-class named port** in two forms: the sequential
+`errors` (native reference; the forecast reruns it) and the vectorized
+`errors_closed` (the density's error source, which lowers). A query can ask for
+either, the full `density`, or the one-step-ahead `forecast`; a test asserts
+`errors_closed ≈ errors`.
 
 The panel below shows three views of this model: **Raw input** (the source), a
 readable **Generated kernel** derived from the executed kernel and selected
@@ -75,18 +81,34 @@ forecast_kernel = prepare(model;
 forecast = forecast_kernel(parameters, series)
 ```
 
-## Reactant — native only
+## Reactant
 
-Unlike the other PPL examples, this model does **not** lower through Reactant.
-The one-step error recursion reads `series[t-1]` and `err[t-1]` element by
-element, and XLA disallows scalar indexing of a traced array, so the density
-compiles and runs natively but its `@compile` through Reactant fails on that
-scalar indexing. This is inherent to the sequential scan — lowering it would
-require an explicit `while_loop`/scan rather than per-step scalar indexing — not
-a defect in the authored graph. `test/test_ppl_examples_reactant.jl` records this
-as an explicit tested diagnostic (the compile is asserted to throw) rather than
-silently skipping it; the pointwise/likelihood plate and the priors are ordinary
-lowerable graph nodes, only the recursion is not.
+This model shows a **side-by-side**: the natural sequential recursion and its
+vectorized closed-form equivalent. The recursion (`errors`) reads `series[t-1]`
+and `err[t-1]` element by element, and XLA disallows scalar indexing of a traced
+array, so that node does **not** lower — `@compile` of the raw `errors` throws.
+
+`errors_closed` is the exact vectorized equivalent (a test asserts
+`errors_closed ≈ errors`): the linear recurrence `εₜ = aₜ − θ·ε_{t-1}` has the
+closed form `ε = L·a` with `L` a lower-triangular Toeplitz of powers of `−θ`,
+built from only vectorized ops (slice, `vcat`, broadcast, `matmul`). The
+likelihood and density reduce `errors_closed`, so the **whole density compiles
+and executes through the public Reactant boundary with value parity** —
+`test/test_ppl_examples_reactant.jl` `@compile`s it and asserts the compiled
+result matches native, and separately asserts the raw sequential node still
+throws.
+
+One Reactant caveat shapes the closed-form authoring: the natural `Δ .>= 0`
+comparison that zeros the Toeplitz upper triangle currently StackOverflows in
+Reactant tracing (snag `ReactiveKernels/reactant-trace-s-9ca8b54f`), so the mask
+is built arithmetically with `clamp` instead. That is a temporary dodge — the fix
+normalizes comparison masks in the `@kernel` lowering, after which the natural
+spelling lowers directly.
+
+The cleaner long-term path is a sequential-scan (`stablehlo.while`) lowering, so
+the *natural* recursion lowers with no reformulation at all (RK core, decision
+`0b4m77q`); once it lands, `errors` itself lowers and the closed-form
+reformulation becomes optional.
 
 Run the walkthrough from the repository root:
 

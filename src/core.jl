@@ -152,7 +152,28 @@ end
 @inline _tensorized_cat(args...; dims) =
     cat(_tensorized_cat_operands(args)...; dims = dims)
 @inline _tensorized_broadcast(f, args...) =
-    broadcast(f, _tensorized_cat_operands(args)...)
+    _tensorized_materialize(
+        Base.broadcasted(f, _tensorized_cat_operands(args)...))
+
+# `broadcast(f, ...)` materializes a `Bool`-eltype result into a `BitArray`, and
+# a tracing backend's `call_with_reactant` recurses without termination on
+# `copyto!(::BitArray, ::Broadcasted)` — Reactant 0.2.284 turns a comparison
+# mask such as `Δ .>= 0` into a `StackOverflowError` with no actionable signal
+# (it bisects to the wrong op and reads like a broken kernel).  A comparison or
+# boolean broadcast over host operands carries no traced value, so its result is
+# a compile-time constant: materialize it into a dense `Array{Bool}` instead of a
+# `BitArray` — identical values, no `BitArray` copyto!.  Non-`Bool` results and
+# any broadcast a backend has already promoted to a traced style keep Base's (and
+# Reactant's) own materialize, so this is a container-type normalization only and
+# leaves value/shape semantics unchanged.  Per user decision `17bnc6t` this is
+# normalized in the `@kernel` lowering rather than in Reactant.
+@inline _tensorized_materialize(bc) = Base.materialize(bc)
+@inline function _tensorized_materialize(
+        bc::Base.Broadcast.Broadcasted{<:Base.Broadcast.DefaultArrayStyle{N}}
+    ) where {N}
+    (N >= 1 && Base.Broadcast.combine_eltypes(bc.f, bc.args) === Bool) ?
+        collect(bc) : Base.materialize(bc)
+end
 
 # Tensorized authored plates keep slice collections structural instead of
 # materializing Base.Slices.  A backend can consume the parent array as one
