@@ -1,0 +1,25 @@
+source = "benchmark/fair_posteriordb_mh.jl (+ _body.jl) — executed model authority"
+rk_source_commit = "fb15907c79642ee7d1d72fc29b0060cd52661a62"
+schema = "fair-posteriordb-mh-v1"
+methodology = "median over 10 rounds of BenchmarkTools minimum(200 samples); RK vs Stan (posteriordb reference; augmentation loop is inherent, no fused primitive) vs optimized Turing; parity vs FD oracle (max grad rel err 2.9e-9)"
+note = "Mh capture-recapture, M=300 dim 303 — the LARGE-DIM scaling test. RK WINS decisively even at dim 303 (primal 0.29x, gradient 0.38x): no fused Stan primitive for the augmented random-effects binomial-logit, so Stan does a per-individual log_sum_exp loop. Confirms RK's advantage holds at large dim; the arK/gp_regr losses were about fused-primitive dense-linalg, not dimension."
+
+[environment]
+julia = "1.10.11"
+arch = "x86_64"
+cpu = "AMD EPYC-Milan Processor"
+stan = "2.39.0 (BridgeStan 2.9.0)"
+
+[[models.measurements]]
+model = "Mh"
+dim = 303
+[models.measurements.primal]
+stan_ns = 19100.0
+turing_ns = 12460.0
+rk_ns = 5450.0
+rk_vs_stan = 0.29
+[models.measurements.gradient]
+stan_ns = 31750.0
+turing_ns = 36430.0
+rk_ns = 11960.0
+rk_vs_stan = 0.38

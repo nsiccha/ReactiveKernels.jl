@@ -3,92 +3,42 @@ module BetaBinomialExample
 using ReactiveKernels
 using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
 
-export BetaBinomialParameters
 export BETA_BINOMIAL_TRIALS, BETA_BINOMIAL_SUCCESSES
 export build_beta_binomial_graph, demo
 export BETA_BINOMIAL_SOURCE, evaluate_beta_binomial_source
 
-const NEXPERIMENTS = 5
-const CountVector = NTuple{NEXPERIMENTS,Int}
-
-# A Beta(2, 2) prior. Its log normalizing constant is
-# log B(2, 2) = log(Γ(2)Γ(2) / Γ(4)) = log(1 / 6) = -log(6), a constant in `rate`.
-const _PRIOR_A = 2
-const _PRIOR_B = 2
-const _LOG_BETA_2_2 = -log(6.0)
-
-# Five coin-flip experiments sharing one success rate.
-const BETA_BINOMIAL_TRIALS = (10, 12, 8, 15, 9)
-const BETA_BINOMIAL_SUCCESSES = (6, 8, 5, 9, 4)
-
-"Constrained parameters for the shared-rate beta-binomial model."
-struct BetaBinomialParameters{T<:Real}
-    rate::T
-end
-
-# --- Pure operations used as graph recipes ---------------------------------
-
-logistic(x::Real) = 1 / (1 + exp(-x))
-
-assemble_parameters(rate::Real) = BetaBinomialParameters(rate)
-
-# rate = logistic(logit_rate), so log |drate / dlogit_rate| = log(rate) + log(1 - rate).
-function log_abs_det_jacobian(rate::Real)
-    0 < rate < 1 || throw(DomainError(rate, "rate must lie in (0, 1)"))
-    log(rate) + log1p(-rate)
-end
-
-function beta22_logpdf(rate::Real)
-    0 < rate < 1 || throw(DomainError(rate, "rate must lie in (0, 1)"))
-    (_PRIOR_A - 1) * log(rate) + (_PRIOR_B - 1) * log1p(-rate) - _LOG_BETA_2_2
-end
-
-log_prior(parameters::BetaBinomialParameters) = beta22_logpdf(parameters.rate)
-
-function binomial_logpmf(successes::Int, trials::Int, rate::Real)
-    0 <= successes <= trials || throw(DomainError(successes,
-        "successes must satisfy 0 ≤ k ≤ n"))
-    0 < rate < 1 || throw(DomainError(rate, "rate must lie in (0, 1)"))
-    log(binomial(trials, successes)) +
-        successes * log(rate) + (trials - successes) * log1p(-rate)
-end
-
-function pointwise_log_likelihood(parameters::BetaBinomialParameters,
-                                  trials::CountVector,
-                                  successes::CountVector)
-    ntuple(NEXPERIMENTS) do i
-        binomial_logpmf(successes[i], trials[i], parameters.rate)
-    end
-end
-
-sum_log_likelihood(log_likelihoods::NTuple{NEXPERIMENTS,Real}) =
-    sum(log_likelihoods)
-
-total_log_density(log_prior::Real, log_jacobian::Real,
-                  log_likelihood::Real) =
-    log_prior + log_jacobian + log_likelihood
-
-# Deterministic generated quantity: the expected success count in a new
-# experiment of `new_trials` trials, given the constrained rate.
-expected_successes(parameters::BetaBinomialParameters, new_trials::Int) =
-    parameters.rate * new_trials
+# Five coin-flip experiments sharing one success rate, with a Beta(2, 2) prior.
+const BETA_BINOMIAL_TRIALS = [10, 12, 8, 15, 9]
+const BETA_BINOMIAL_SUCCESSES = [6, 8, 5, 9, 4]
 
 const BETA_BINOMIAL_SOURCE = raw"""
-@kernel model(logit_rate::Real,
-              trials::CountVector,
-              successes::CountVector,
-              new_trials::Int) = begin
-    rate::Real = logistic(logit_rate)
-    parameters::BetaBinomialParameters = assemble_parameters(rate)
-    log_jacobian::Real = log_abs_det_jacobian(rate)
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: beta, binomial
 
-    prior::Real = log_prior(parameters)
-    pointwise::NTuple{5,Real} = pointwise_log_likelihood(
-        parameters, trials, successes,
-    )
-    likelihood::Real = sum_log_likelihood(pointwise)
-    density::Real = total_log_density(prior, log_jacobian, likelihood)
-    expected::Real = expected_successes(parameters, new_trials)
+@kernel model(logit_rate::Float64,
+              trials::Vector{Int},
+              successes::Vector{Int},
+              new_trials::Int) = begin
+    # rate = logistic(logit_rate); log|drate/dlogit_rate| = log(rate)+log(1-rate).
+    rate::Float64 = 1 / (1 + exp(-logit_rate))
+    log_jacobian::Float64 = log(rate) + log1p(-rate)
+
+    parameters = (; rate)
+    rate::Float64 = parameters.rate
+
+    # rate ~ Beta(2, 2), reusing the shared Beta object.
+    prior::Float64 = beta(2.0, 2.0).logpdf(rate)
+
+    # successesⱼ ~ Binomial(trialsⱼ, rate): one authored plate over the shared
+    # rate. The per-experiment trial count is the other plate axis.
+    pointwise = plate(successes, trials, rate) do observed, trial_count, p
+        binomial(trial_count, p).logpdf(observed)
+    end
+    likelihood::Float64 = sum(pointwise)
+
+    density::Float64 = prior + log_jacobian + likelihood
+
+    # Deterministic generated quantity: expected successes in a new experiment.
+    expected::Float64 = parameters.rate * new_trials
     return density
 end
 
@@ -96,9 +46,10 @@ logit_rate = 0.2
 trials = BETA_BINOMIAL_TRIALS
 successes = BETA_BINOMIAL_SUCCESSES
 
+requested_nodes = (:prior, :log_jacobian, :pointwise, :likelihood, :density)
 density_kernel = prepare(model;
     have = (:logit_rate, :trials, :successes),
-    want = (:prior, :log_jacobian, :pointwise, :likelihood, :density))
+    want = requested_nodes)
 
 output = density_kernel(logit_rate, trials, successes)
 prior, logjac, pointwise, likelihood, density = output
@@ -107,39 +58,46 @@ prior, logjac, pointwise, likelihood, density = output
 
 docs_example = (;
     name = :beta_binomial_density,
-    origin = "compact @kernel model (build executed)",
+    origin = "Inline beta-binomial reusing the shared beta/binomial objects",
     inputs = (; logit_rate, trials, successes),
     model,
     kernel = density_kernel,
     output,
+    requested_nodes,
+    beta_object = beta,
+    binomial_object = binomial,
 )
 """
 
 function evaluate_beta_binomial_source()
+    # Bind only the data. The authored source imports and reuses the shared Beta
+    # and Binomial objects directly (Binomial is imported explicitly so the bare
+    # name shadows Base.binomial inside the kernel body).
     _evaluate_ppl_source(BETA_BINOMIAL_SOURCE, @__MODULE__; bindings = (
-        :BetaBinomialParameters, :CountVector,
         :BETA_BINOMIAL_TRIALS, :BETA_BINOMIAL_SUCCESSES,
-        :logistic, :assemble_parameters, :log_abs_det_jacobian,
-        :log_prior, :pointwise_log_likelihood, :sum_log_likelihood,
-        :total_log_density, :expected_successes,
     ))
+end
+
+const _BETA_BINOMIAL_GRAPH_TEMPLATE = Ref{KernelSpec}()
+
+function __init__()
+    _BETA_BINOMIAL_GRAPH_TEMPLATE[] = evaluate_beta_binomial_source().model
+    nothing
 end
 
 """
     build_beta_binomial_graph()
 
 Build the shared-rate beta-binomial model as a declarative
-`ReactiveKernels.KernelSpec`. Named ports remain available as properties, making
-different PPL queries explicit `have`/`want` boundaries.
-
-The single unconstrained coordinate is `logit_rate`; the support transform is
-`rate = logistic(logit_rate)`, with optional log absolute Jacobian determinant
-`log(rate) + log(1 - rate)`. The prior, pointwise log-likelihood, likelihood
-reduction, total density, and an expected-count generated quantity are separate
-nodes.
+`ReactiveKernels.KernelSpec`. The Beta prior and Binomial likelihood are reused
+from `ReactiveKernelsDistributionKernels`. The single unconstrained coordinate is
+`logit_rate` with support transform `rate = logistic(logit_rate)`; the prior, one
+authored likelihood plate, likelihood reduction, total density, and an
+expected-count generated quantity are separate named nodes, and the constrained
+parameters are a plain NamedTuple.
 """
 function build_beta_binomial_graph()
-    evaluate_beta_binomial_source().model
+    compose(_BETA_BINOMIAL_GRAPH_TEMPLATE[])
 end
 
 function demo()
@@ -150,6 +108,7 @@ function demo()
     constrained_plan = plan(model; have = :logit_rate, want = :parameters)
     println(explain(constrained_plan))
     parameters = prepare(constrained_plan)(logit_rate)
+    println("constrained rate = ", parameters.rate)
 
     println("\nFull unconstrained-space log density and pointwise terms:")
     density_plan = plan(model;
@@ -166,9 +125,7 @@ function demo()
     println("pointwise log likelihood = ", pointwise)
 
     println("\nGenerated quantity from an already-constrained HAVE boundary:")
-    generated_plan = plan(model;
-                          have = (:parameters, :new_trials),
-                          want = :expected)
+    generated_plan = plan(model; have = (:parameters, :new_trials), want = :expected)
     println(explain(generated_plan))
     expected = prepare(generated_plan)(parameters, 20)
     println("expected successes in 20 new trials = ", expected)

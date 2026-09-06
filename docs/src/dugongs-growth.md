@@ -1,14 +1,12 @@
 # Declarative PPL kernel: dugongs (nonlinear growth)
 
-```@eval
-Main.ReactiveKernelsDocs.render_review_status(:frozen_ppl)
-```
-
 This example ports the `dugongs` model from
 [posteriordb](https://github.com/stan-dev/posteriordb) (posterior
 `dugongs_data-dugongs_model`) into the same declarative-`@kernel` style as the
-[eight-schools example](eight-schools.md). Unlike the GLM-shaped examples, the
-mean is a **nonlinear** function of the parameters — an asymptotic growth curve.
+[eight-schools example](eight-schools.md): the model is authored inline, reusing
+the shared `normal`, `uniform`, and `gamma` distribution objects and one authored
+likelihood `plate`. Unlike the GLM-shaped examples, the mean is a **nonlinear**
+function of the parameters — an asymptotic growth curve.
 
 The complete runnable source is
 [`packages/ReactiveKernelsPPLExamples/src/dugongs_growth.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsPPLExamples/src/dugongs_growth.jl).
@@ -79,6 +77,14 @@ generated_kernel = prepare(model;
 
 predicted = generated_kernel(parameters, 20.0)
 ```
+
+## Reactant
+
+The exact authored graph compiles and executes through the public Reactant
+boundary with value parity — `test/test_ppl_examples_reactant.jl` `@compile`s the
+density kernel and asserts the compiled result matches the native evaluation. The
+nonlinear mean `α − β·λ^age`, the authored likelihood plate, and the reused
+`normal`/`uniform`/`gamma` endpoints all lower cleanly.
 
 Run the walkthrough from the repository root:
 
