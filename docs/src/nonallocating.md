@@ -15,7 +15,7 @@ activate the extension:
 ```julia
 using Pkg
 Pkg.add(url = "https://github.com/nsiccha/MutatingFunctions.jl",
-        rev = "b353559ef3e391ae2e2d98256b6967903fdfa410")
+        rev = "4fc41b1c7b774133ceaacc4ff3c34c67b15b87b2")
 
 using ReactiveKernels, MutatingFunctions
 ```

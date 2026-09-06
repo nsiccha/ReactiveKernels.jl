@@ -15,7 +15,7 @@ import Pkg
 
 const _COMPARISON_INNER = "RK_NUTS_COMPARISON_INNER"
 const _MUTATING_FUNCTIONS_REVISION =
-    "b353559ef3e391ae2e2d98256b6967903fdfa410"
+    "4fc41b1c7b774133ceaacc4ff3c34c67b15b87b2"
 
 include(joinpath(@__DIR__, "_repro_guard.jl"))
 
