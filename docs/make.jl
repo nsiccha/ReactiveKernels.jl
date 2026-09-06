@@ -31,6 +31,7 @@ include(joinpath(@__DIR__, "..", "benchmark", "reactivehmc_docs_interactions.jl"
 include("kernel_examples.jl")
 Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "result_views.jl"))
 include("check_rendered.jl")
+include("hmc_transpiler.jl")
 
 site_pages = [
     "Home" => "index.md",
@@ -76,6 +77,7 @@ site_pages = [
     ],
     "Bijectors" => "bijectors.md",
     "Sampling (experimental)" => [
+        "Multinomial HMC transpiler" => "hmc-transpiler.md",
         "Pathfinder approximation" => "pathfinder.md",
         "ReactiveHMC kernel corpus" => "reactivehmc-corpus.md",
         "NUTS source and receipts (not executed)" => "nuts.md",
