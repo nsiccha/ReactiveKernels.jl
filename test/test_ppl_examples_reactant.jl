@@ -48,16 +48,19 @@ end
         a = evaluate_linear_regression_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
-    @testset "arma11 (native-only — sequential recursion is not XLA-lowerable)" begin
-        # The one-step error recursion reads err[t-1]/series[t-1] element by
-        # element; Reactant/XLA disallows scalar indexing of a traced array, so
-        # this authored model compiles and runs NATIVELY but its density does not
-        # lower through Reactant. This is an inherent property of the sequential
-        # scan (it would need an explicit scan/while-loop lowering), not a wrong
-        # authored shape — documented here as an explicit tested diagnostic rather
-        # than silently skipped. (Reported upstream: reactant-lane snag.)
+    @testset "arma11 (vectorized closed form lowers; raw recursion stays native-only)" begin
+        # Side-by-side: the model's likelihood/density reduce the vectorized
+        # `errors_closed` (a Toeplitz matvec), which LOWERS and reproduces native.
+        # The natural sequential `errors` node reads err[t-1]/series[t-1] element
+        # by element, so it still does NOT lower (XLA disallows scalar indexing of
+        # a traced array) — kept as an explicit tested diagnostic. A sequential-scan
+        # (stablehlo.while) lowering would let the natural recursion lower directly;
+        # see docs/src/arma11.md.
         a = evaluate_arma11_source()
-        @test_throws Exception _compile_run(a.kernel, Tuple(a.inputs))
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+        seq_errors_kernel = prepare(a.model;
+            have = (:unconstrained, :series), want = :errors)
+        @test_throws Exception _compile_run(seq_errors_kernel, Tuple(a.inputs))
     end
     @testset "poisson_gamma" begin
         a = evaluate_poisson_gamma_source()
