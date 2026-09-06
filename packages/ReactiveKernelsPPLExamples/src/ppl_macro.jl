@@ -16,20 +16,29 @@ Decisions: build GO `2026-09-06T14-20-02-559-1r5p4j1`; scope MINIMAL
 
 # First-cut scope
 
-- Parameters: **scalar, real-support** (`normal` / `cauchy` / `laplace`), one
-  packed-unconstrained coordinate each, identity transform (`log_jacobian = 0`).
+- Parameters: **scalar**, each taking one packed-unconstrained coordinate, with
+  support inferred from the sampling distribution and the matching transform +
+  log-Jacobian authored in both directions — real (`normal` / `cauchy` /
+  `laplace`, identity), positive (`exponential` / `gamma` / `lognormal`,
+  log/exp), unit (`beta`, logit/logistic).
+- `parameters` has two producers (constrain-only, and joint with `log_jacobian`
+  so a params+Jacobian query shares the transform) plus named-latent inverse
+  edges, so a packed, named-latent, or `parameters` HAVE boundary all route
+  without recomputation or a `log(exp(x))` round trip.
 - One or more **observation** streams: a `~` whose LHS is a signature (data)
-  argument, lowered to an authored `plate` (Julia broadcast semantics handle
-  scalar-vs-array arguments), summed to the buffer-free `likelihood`.
+  argument, lowered to an authored `plate` — the atomic referenced values are
+  threaded in and the argument expressions rebuilt per cell, so a linear
+  predictor is computed element-wise — summed to the buffer-free `likelihood`.
 - Emits exactly the canonical nodes: `parameters`, `log_jacobian`, `prior`,
   `pointwise`, `likelihood`, `unconstrained_prior`, `constrained_logdensity`,
   `posterior`. Queried the usual way, e.g.
   `prepare(model; have = (:unconstrained, data...), want = :posterior)`.
 
-Positive-scale / unit-interval constraints (transform + Jacobian via the
-bijector objects), vector parameters (prior `plate`), the two-producer
-`parameters` boundary for real transforms, and user AST transformations are
-follow-up increments (todo `2026-09-06T15-02-44-929-0mw9lhd`).
+Vector parameters (prior `plate`), explicit constraint overrides / half /
+bounded / truncated families, transforms via the `ReactiveKernels:ppl:bijectors`
+objects (currently authored inline, matching the hand-written examples), and
+user PPL-AST transformations are follow-up increments (todo
+`2026-09-06T15-02-44-929-0mw9lhd`).
 """
 module PPLMacro
 
@@ -42,9 +51,18 @@ const PPL_NODE_NAMES = (:parameters, :log_jacobian, :prior, :pointwise,
                         :likelihood, :unconstrained_prior,
                         :constrained_logdensity, :posterior)
 
-# Distribution objects whose *parameter* support is the whole real line, so the
-# unconstrained coordinate IS the constrained value (identity transform).
-const _REAL_SUPPORT_DISTS = (:normal, :cauchy, :laplace)
+# Parameter-support inferred from the sampling distribution, driving the
+# unconstrained↔constrained transform + log-Jacobian:
+#   :real     — identity (the packed coordinate IS the value), Jacobian 0
+#   :positive — log/exp,   Jacobian = log_x
+#   :unit     — logit/logistic, Jacobian = log(x) + log1p(-x)
+# Explicit constraint overrides (e.g. a half-Cauchy: Cauchy prior on positive
+# support) and bounded/other families are a follow-up increment.
+const _SUPPORT = Dict{Symbol,Symbol}(
+    :normal => :real, :cauchy => :real, :laplace => :real,
+    :exponential => :positive, :gamma => :positive, :lognormal => :positive,
+    :beta => :unit,
+)
 
 struct _Param
     name::Symbol
@@ -107,11 +125,12 @@ function _parse(def)
                 lhs in seen && error("@ppl: parameter $(lhs) declared twice")
                 push!(seen, lhs)
                 dist = _call_head(rhs)
-                dist in _REAL_SUPPORT_DISTS || error(
-                    "@ppl (first cut): parameter $(lhs) ~ $(dist)(…) — only " *
-                    "real-support parameters $(_REAL_SUPPORT_DISTS) are supported yet; " *
-                    "positive/unit constraints are a follow-up increment.")
-                push!(params, _Param(lhs, rhs, :real))
+                haskey(_SUPPORT, dist) || error(
+                    "@ppl (first cut): parameter $(lhs) ~ $(dist)(…) — supported " *
+                    "parameter distributions are $(sort(collect(keys(_SUPPORT)))); " *
+                    "explicit constraint overrides and other families are a " *
+                    "follow-up increment.")
+                push!(params, _Param(lhs, rhs, _SUPPORT[dist]))
             end
         elseif stmt isa Expr && stmt.head === :(=)
             push!(passthrough, stmt)
@@ -195,25 +214,55 @@ function _lower(name, dataargs, params, obs, passthrough)
             push!(modelsyms, s.args[1])
     end
 
-    # 1. Packed-unconstrained split (scalar real → identity). `sum(view(…))`
-    #    keeps the generated evaluator allocation-free and Reactant-friendly.
+    # 1. Packed-unconstrained split + per-parameter constrained transform.
+    #    Each parameter takes ONE packed coordinate: its UNCONSTRAINED value.
+    #    `sum(view(…))` keeps the evaluator allocation-free / Reactant-friendly.
+    #    Real → identity; positive → log/exp; unit → logit/logistic. BOTH
+    #    transform directions are authored (forward from the unconstrained
+    #    coordinate, inverse from the constrained value) so HAVE authority routes
+    #    a packed, a named-latent, or a `parameters` query without recomputation
+    #    or a `log(exp(x))` round trip.
+    jac_terms = Any[]
     for (i, p) in enumerate(params)
-        push!(stmts, :( $(p.name)::Float64 = sum(view(unconstrained, $i:$i)) ))
+        coord = :( sum(view(unconstrained, $i:$i)) )
+        if p.support === :real
+            push!(stmts, :( $(p.name)::Float64 = $(coord) ))
+        elseif p.support === :positive
+            u = Symbol(:_ppl_log_, p.name)
+            push!(stmts, :( $(u)::Float64 = $(coord) ))
+            push!(stmts, :( $(p.name)::Float64 = exp($(u)) ))
+            push!(stmts, :( $(u)::Float64 = log($(p.name)) ))
+            push!(jac_terms, u)
+        elseif p.support === :unit
+            u = Symbol(:_ppl_logit_, p.name)
+            push!(stmts, :( $(u)::Float64 = $(coord) ))
+            push!(stmts, :( $(p.name)::Float64 = 1 / (1 + exp(-$(u))) ))
+            push!(stmts, :( $(u)::Float64 = log($(p.name)) - log1p(-$(p.name)) ))
+            push!(jac_terms, :( log($(p.name)) + log1p(-$(p.name)) ))
+        else
+            error("@ppl: unhandled parameter support $(p.support)")
+        end
     end
 
     # 2. Deterministic pass-through assignments (transforms/covariate prep).
     append!(stmts, passthrough)
 
-    # 3. Constrained parameters + Jacobian (identity → 0), plus named-latent
-    #    inverse edges so a components/`parameters` HAVE boundary also works.
+    # 3. Constrained parameters (two producers: constrain-only, and joint with
+    #    the log-Jacobian so a params+Jacobian query shares the transform), the
+    #    log-Jacobian, and the named-latent inverse edges.
     pnames = [p.name for p in params]
+    jac_expr = isempty(jac_terms) ? :(0.0) :
+               foldl((a, b) -> :( $a + $b ), jac_terms)
     push!(stmts, :( parameters = (; $(pnames...)) ))
-    push!(stmts, :( log_jacobian::Float64 = 0.0 ))
+    push!(stmts, :( log_jacobian::Float64 = $(jac_expr) ))
+    push!(stmts, Expr(:(=),
+        Expr(:tuple, :parameters, :( log_jacobian::Float64 )),
+        Expr(:tuple, :( (; $(pnames...)) ), jac_expr)))
     inv_lhs = Expr(:tuple, (:( $(n)::Float64 ) for n in pnames)...)
     inv_rhs = Expr(:tuple, (:( parameters.$(n) ) for n in pnames)...)
     push!(stmts, Expr(:(=), inv_lhs, inv_rhs))
 
-    # 4. Prior: sum of each parameter's log density.
+    # 4. Prior: sum of each parameter's log density on its constrained value.
     prior_terms = [ :( $(p.dist).logpdf($(p.name)) ) for p in params ]
     prior_expr = length(prior_terms) == 1 ? prior_terms[1] :
                  foldl((a, b) -> :( $a + $b ), prior_terms)

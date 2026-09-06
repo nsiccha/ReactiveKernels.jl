@@ -1,5 +1,6 @@
-using ReactiveKernelsPPLExamples: @ppl
-using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
+using ReactiveKernelsPPLExamples: @ppl, BetaBinomialExample
+using ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    normal, exponential, beta, binomial
 
 # First cut of the RK-native sb-like `@ppl` macro: scalar real-support
 # parameters + plate observation likelihoods, lowered to the canonical PPL
@@ -70,12 +71,53 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
         @test post_lin ≈ ref_prior2 + ref_ll2
     end
 
+    @testset "positive-support parameter (log/exp transform + Jacobian)" begin
+        @ppl pos(y::Vector{Float64}) = begin
+            sigma ~ exponential(1.0)
+            y ~ normal(0.0, sigma)
+        end
+        q = [0.3]
+        yp = [1.0, -0.5, 2.0]
+        s = exp(0.3)
+        # exponential(1) logpdf = -sigma; Jacobian for the log transform = log_sigma.
+        ref_prior = -s
+        ref_ll = sum(nlp(yi, 0.0, s) for yi in yp)
+        post = prepare(pos; have = (:unconstrained, :y),
+                       want = :posterior)(q, yp)
+        @test post ≈ ref_prior + ref_ll + 0.3
+        params = prepare(pos; have = :unconstrained, want = :parameters)(q)
+        @test params.sigma ≈ s
+        # the constrained density excludes the transform Jacobian.
+        cld = prepare(pos; have = (:unconstrained, :y),
+                      want = :constrained_logdensity)(q, yp)
+        @test cld ≈ ref_prior + ref_ll
+    end
+
+    @testset "unit-support parameter — exact parity with hand-written beta_binomial" begin
+        bb_ref = BetaBinomialExample.build_beta_binomial_graph()
+        logit_rate = 0.2
+        ref_density = prepare(bb_ref;
+            have = (:logit_rate, :trials, :successes), want = :density)(
+                logit_rate, BetaBinomialExample.BETA_BINOMIAL_TRIALS,
+                BetaBinomialExample.BETA_BINOMIAL_SUCCESSES)
+
+        @ppl bb(successes::Vector{Int}, trials::Vector{Int}) = begin
+            rate ~ beta(2.0, 2.0)
+            successes ~ binomial(trials, rate)
+        end
+        got = prepare(bb; have = (:unconstrained, :successes, :trials),
+                      want = :posterior)([logit_rate],
+                collect(BetaBinomialExample.BETA_BINOMIAL_SUCCESSES),
+                collect(BetaBinomialExample.BETA_BINOMIAL_TRIALS))
+        @test got ≈ ref_density
+    end
+
     @testset "out-of-scope constructs fail loudly" begin
-        # positive-support parameter (constraint inference) is a follow-up cut.
+        # a discrete family is not a supported continuous parameter prior.
         @test_throws Exception macroexpand(@__MODULE__, :(@ppl bad(
-                y::Vector{Float64}) = begin
-            scale ~ exponential(1.0)
-            y ~ normal(0.0, scale)
+                y::Vector{Int}) = begin
+            lambda ~ poisson(3.0)
+            y ~ poisson(lambda)
         end))
         # a posterior-mode model needs at least one observation.
         @test_throws Exception macroexpand(@__MODULE__, :(@ppl prioronly(
