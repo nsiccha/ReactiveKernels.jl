@@ -20,10 +20,16 @@ on it (verified against the `ReactiveKernels:sampling:gibbs` PoC on
 
 # Scope
 
-- **Single-site blocks**, generic **random-walk Metropolis-within-Gibbs**,
-  incremental through `ReactiveState`. Because only one block changes per step,
-  the full `constrained_logdensity` is a correct Metropolis target (the other
-  blocks' terms cancel in the ratio) and is recomputed incrementally.
+- **Blocks**, generic **Metropolis-within-Gibbs**, incremental through
+  `ReactiveState`. Because only the current block changes per step, the full
+  `constrained_logdensity` is a correct Metropolis target (the other blocks'
+  terms cancel in the ratio) and is recomputed incrementally.
+- **Explicit blocking / sampler plan** (`1nwitne`): `blocks` is a
+  `Vector{Symbol}` (single-site default, one block per latent) or a `Gibbs`
+  spec — `Gibbs(:z, (:a, :b))` groups `(a, b)` into one jointly-updated block;
+  `Gibbs(:z => :rw)` forces the random-walk sampler on a block that would
+  otherwise draw conjugately. A group updates all its members jointly (one
+  accept/reject on the joint conditional).
 - **Real / positive / unit support** (`support` kwarg): a `:positive`/`:unit`
   block walks in log/logit space with the Metropolis-Hastings correction, so
   the proposal respects the support and the chain targets the constrained
@@ -45,8 +51,7 @@ without the dist-kernels owner adding them (primer finding, not a local
 workaround). Normal-Normal (mean) is dist-feasible but needs linear-predictor
 analysis. Both are deferred.
 
-Follow-up increments: those deferred conjugate pairs, the explicit block/sampler
-API (`1nwitne`: `Gibbs(:z => …, (:a,:b) => …)`), and reproducing the SSVS
+Follow-up increments: those deferred conjugate pairs, and reproducing the SSVS
 spike-and-slab example on an `@ppl` model as the acceptance case.
 """
 module PPLGibbs
@@ -54,7 +59,7 @@ module PPLGibbs
 using ReactiveKernels
 import ..PPLMacro   # experimental structure descriptor for conjugacy detection
 
-export gibbs
+export gibbs, Gibbs
 
 # --- Conjugate posterior sampling (Random-only; no Distributions.jl) ---------
 # Marsaglia–Tsang draw from Gamma(shape, rate) (`rate` is β, matching the
@@ -186,14 +191,62 @@ end
 _support_of(::Nothing, ::Symbol) = :real
 _support_of(support, b::Symbol) = get(support, b, :real)
 
+# --- Block/sampler specification (explicit user-declared blocks) -------------
+# Decision `1nwitne` (resolved "no preference" → my recommendation): the default
+# is single-site (one latent per block); a `Gibbs` spec lets the user GROUP
+# latents into a jointly-updated block and/or FORCE a sampler. Each entry is a
+# latent `:z`, a group `(:a, :b)`, or `<block> => sampler`.
+struct _Block
+    members::Vector{Symbol}
+    sampler::Symbol            # :auto (conjugate-if-possible else RW) | :rw
+end
+
+"""
+    Gibbs(entries...)
+
+An explicit blocking / sampler plan for [`gibbs`](@ref). Each entry is a single
+latent `:z`, a group of latents `(:a, :b)` updated jointly (one accept/reject on
+the joint conditional), or a `block => sampler` pair. `sampler` is `:auto`
+(closed-form conjugate draw when the block is a single latent with a detected
+conjugate conditional, else a support-aware random-walk step — the default) or
+`:rw` (force the random-walk step). A plain `Vector{Symbol}` passed to `gibbs` is
+shorthand for one single-site `:auto` block per latent.
+"""
+struct Gibbs
+    blocks::Vector{_Block}
+    # Explicit inner constructor suppresses the auto-generated converting default
+    # `Gibbs(blocks)`, which would otherwise shadow the varargs form below for a
+    # single non-`Vector{_Block}` argument (e.g. `Gibbs((:a, :b))`).
+    Gibbs(blocks::Vector{_Block}) = new(blocks)
+end
+Gibbs(entries...) = Gibbs(_Block[_parse_block(e) for e in entries])
+
+_members(s::Symbol) = [s]
+_members(t::Tuple) = collect(Symbol, t)
+_members(v::AbstractVector) = collect(Symbol, v)
+_parse_block(e::Pair) = _Block(_members(e.first), Symbol(e.second))
+_parse_block(e) = _Block(_members(e), :auto)
+
+_normalize_blocks(g::Gibbs) = g
+_normalize_blocks(v::AbstractVector{Symbol}) =
+    Gibbs(_Block[_Block([s], :auto) for s in v])
+_normalize_blocks(v::AbstractVector) = Gibbs(_Block[_parse_block(e) for e in v])
+
+# accept_rate key: a single-latent block keys by its symbol (back-compatible with
+# the `blocks = [:a, :b]` form); a group keys by the tuple of its members.
+_block_key(b::_Block) = length(b.members) == 1 ? b.members[1] : Tuple(b.members)
+
 """
     gibbs(model; blocks, data, init, iters, rng, step = 0.5, warmup = 0,
           support = nothing, conjugate = true, target = :constrained_logdensity)
 
-Single-site Metropolis-within-Gibbs over the named latents of an `@ppl` `model`.
-`blocks` is a vector of latent-name `Symbol`s; `data` and `init` are NamedTuples
-of port name → value. Returns `(; draws, accept_rate, iters)` where
-`draws[block]` is the retained chain for that block.
+Metropolis-within-Gibbs over the named latents of an `@ppl` `model`. `blocks` is
+either a `Vector{Symbol}` (one single-site block per latent) or a [`Gibbs`](@ref)
+spec that groups latents into jointly-updated blocks and/or forces a sampler.
+`data` and `init` are NamedTuples of port name → value. Returns
+`(; draws, accept_rate, iters)`, where `draws[latent]` is the retained chain for
+each latent and `accept_rate[key]` is per block (`key` is the latent symbol for a
+single-site block, the tuple of members for a group).
 
 When `conjugate` is on (default) and the model carries an `@ppl` structure
 descriptor, each block whose full conditional is a supported data-only conjugate
@@ -216,65 +269,86 @@ The sweep is driven incrementally through a `ReactiveState`: each accepted or
 rejected `set!` invalidates only the block's Markov blanket, so the next
 `constrained_logdensity` read recomputes only the affected terms.
 """
-function gibbs(model; blocks::Vector{Symbol}, data, init, iters::Int, rng,
+function gibbs(model; blocks, data, init, iters::Int, rng,
                step = 0.5, warmup::Int = 0, support = nothing,
                conjugate::Bool = true,
                target::Symbol = :constrained_logdensity)
+    spec = _normalize_blocks(blocks)
+    members = Symbol[]                        # every latent, flattened, in order
+    for b in spec.blocks, m in b.members
+        m in members || push!(members, m)
+    end
     tgt = getproperty(model, target)
     st = ReactiveState(model.graph; materialize = (tgt,))
     for (k, v) in pairs(data)
         set!(st, getproperty(model, k), v)
     end
-    ports = Dict(b => getproperty(model, b) for b in blocks)
-    supports = Dict(b => _support_of(support, b) for b in blocks)
-    # Per-block conjugate full conditional (or `nothing` → RW-MH). Automatic
-    # when `conjugate` is on and the model carries an `@ppl` structure descriptor.
-    conj = Dict{Symbol,Union{Nothing,_Conjugate}}(b => nothing for b in blocks)
+    ports = Dict(m => getproperty(model, m) for m in members)
+    supports = Dict(m => _support_of(support, m) for m in members)
+    # Conjugate detection is per SINGLE-latent `:auto` block (a group is not
+    # jointly conjugate in general). Automatic when `conjugate` is on and the
+    # model carries an `@ppl` structure descriptor.
+    conj = Dict{Symbol,Union{Nothing,_Conjugate}}(m => nothing for m in members)
     if conjugate && PPLMacro.has_model_info(model)
         info = PPLMacro.model_info(model)
-        for b in blocks
-            conj[b] = _detect_conjugate(info, data, b)
+        for b in spec.blocks
+            if b.sampler === :auto && length(b.members) == 1
+                conj[b.members[1]] = _detect_conjugate(info, data, b.members[1])
+            end
         end
     end
-    cur = Dict{Symbol,Any}(b => init[b] for b in blocks)
-    for b in blocks
-        set!(st, ports[b], cur[b])
+    cur = Dict{Symbol,Any}(m => init[m] for m in members)
+    for m in members
+        set!(st, ports[m], cur[m])
     end
     logtarget() = get!(st, tgt)
 
-    draws = Dict{Symbol,Vector{Any}}(b => Any[] for b in blocks)
-    accepts = Dict{Symbol,Int}(b => 0 for b in blocks)
+    draws = Dict{Symbol,Vector{Any}}(m => Any[] for m in members)
+    blockkeys = [_block_key(b) for b in spec.blocks]
+    accepts = Dict{Any,Int}(k => 0 for k in blockkeys)
     for it in 1:(warmup + iters)
         counted = it > warmup
-        for b in blocks
-            c = conj[b]
+        for b in spec.blocks
+            k = _block_key(b)
+            c = length(b.members) == 1 ? conj[b.members[1]] : nothing
             if c !== nothing
-                # Exact conjugate draw from the full conditional — always accepted.
+                # Exact conjugate draw (single-latent block) — always accepted.
+                m = b.members[1]
                 prop = _draw_conjugate(rng, c)
-                set!(st, ports[b], prop)
-                cur[b] = prop
-                counted && (accepts[b] += 1)
+                set!(st, ports[m], prop)
+                cur[m] = prop
+                counted && (accepts[k] += 1)
             else
+                # Joint random-walk over the block's members (single-site when
+                # one member): propose all, one accept/reject on the joint
+                # conditional, restore all on reject.
                 lp_cur = logtarget()
-                cur_val = cur[b]
-                prop, hastings = _propose(rng, cur_val, step, supports[b])
-                set!(st, ports[b], prop)
+                saved = Any[cur[m] for m in b.members]
+                hastings = 0.0
+                for m in b.members
+                    prop, h = _propose(rng, cur[m], step, supports[m])
+                    set!(st, ports[m], prop)
+                    cur[m] = prop
+                    hastings += h
+                end
                 lp_prop = logtarget()
                 if isfinite(lp_prop) && log(rand(rng)) < (lp_prop - lp_cur) + hastings
-                    cur[b] = prop
-                    counted && (accepts[b] += 1)
+                    counted && (accepts[k] += 1)
                 else
-                    set!(st, ports[b], cur_val)      # reject: restore the block
+                    for (i, m) in enumerate(b.members)
+                        set!(st, ports[m], saved[i])
+                        cur[m] = saved[i]
+                    end
                 end
             end
         end
         if counted
-            for b in blocks
-                push!(draws[b], copy(cur[b]))
+            for m in members
+                push!(draws[m], copy(cur[m]))
             end
         end
     end
-    accept_rate = Dict(b => accepts[b] / iters for b in blocks)
+    accept_rate = Dict(k => accepts[k] / iters for k in blockkeys)
     (; draws, accept_rate, iters)
 end
 
