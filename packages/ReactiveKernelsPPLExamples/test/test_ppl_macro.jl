@@ -1,14 +1,17 @@
-using ReactiveKernelsPPLExamples: @ppl, PPLWorkflow, BetaBinomialExample,
+# `@ppl` is EXPERIMENTAL and deliberately NOT exported (see the module banner),
+# so reach it through the qualified submodule path.
+using ReactiveKernelsPPLExamples.PPLMacro: @ppl
+using ReactiveKernelsPPLExamples: PPLWorkflow, BetaBinomialExample,
     PoissonGammaExample, EightSchoolsExample, LinearRegressionExample
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal, cauchy, exponential, beta, binomial, gamma, poisson
 
-# First cut of the RK-native sb-like `@ppl` macro: scalar real-support
-# parameters + plate observation likelihoods, lowered to the canonical PPL
-# workflow node set. Validated by density parity against a direct-formula
-# reference (the existing hand-written PPL examples all carry a positive-scale
-# or unit-interval parameter, which is a follow-up increment).
-@testset "RK-native @ppl macro (first cut)" begin
+# RK-native, StanBlocks-faithful `@ppl` front-end (experimental, first cut):
+# typed-LHS `name` / `name::real` / `name::vector[size]`; support constraints are
+# spelled as distribution keywords (`~ dist(…; lower=0)`) — PROVISIONAL, pending
+# the constraint-spelling decision. Validated by density parity, against direct
+# formulas and against the hand-written example graphs.
+@testset "RK-native @ppl macro (experimental, first cut)" begin
     nlp(x, mu, sig) = -0.5 * log(2π) - log(sig) - 0.5 * ((x - mu) / sig)^2
 
     @ppl mm(y::Vector{Float64}, sigma::Vector{Float64}) = begin
@@ -138,7 +141,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     @testset "vector parameter (hierarchical model, prior plate)" begin
         @ppl hier(y::Vector{Float64}, sigma::Vector{Float64}, J::Int) = begin
             mu ~ normal(0.0, 10.0)
-            theta[J] ~ normal(mu, 1.0)
+            theta::vector[J] ~ normal(mu, 1.0)
             y ~ normal(theta, sigma)
         end
         q = [0.5, 1.0, -0.5, 2.0]     # mu, theta[1..3]
@@ -180,8 +183,8 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
         @ppl es(observations::Vector{Float64}, observation_scales::Vector{Float64},
                 J::Int) = begin
             mu ~ normal(0.0, 5.0)
-            tau::positive ~ cauchy(0.0, 5.0)       # half-Cauchy(0, 5)
-            theta[J] ~ normal(mu, tau)
+            tau ~ cauchy(0.0, 5.0; lower = 0.0)    # half-Cauchy(0, 5)
+            theta::vector[J] ~ normal(mu, tau)
             observations ~ normal(theta, observation_scales)
         end
         got = prepare(es;
@@ -201,7 +204,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
         @ppl lr(predictors::Vector{Float64}, responses::Vector{Float64}) = begin
             alpha ~ normal(0.0, 10.0)
             beta ~ normal(0.0, 10.0)
-            sigma::positive ~ normal(0.0, 5.0)     # half-Normal(5)
+            sigma ~ normal(0.0, 5.0; lower = 0.0)  # half-Normal(5)
             responses ~ normal(alpha + beta * predictors, sigma)
         end
         got = prepare(lr; have = (:unconstrained, :predictors, :responses),

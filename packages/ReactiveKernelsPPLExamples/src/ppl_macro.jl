@@ -1,7 +1,15 @@
 """
     PPLMacro
 
-An RK-native, StanBlocks-*like* declarative PPL front-end (first cut).
+**⚠️ EXPERIMENTAL — NOT REVIEWED / NOT APPROVED. Do NOT build on this.**
+
+An in-progress, RK-native, StanBlocks-*like* declarative PPL front-end (first
+cut). It is deliberately **not exported** from `ReactiveKernelsPPLExamples` and
+is **not part of the consumer API** — the `reactivekernels-use` skill does not
+mention it — so no consuming agent picks it up and it introduces no churn while
+unreviewed. Reach it only via the fully qualified
+`ReactiveKernelsPPLExamples.PPLMacro.@ppl`. The surface may still change; do not
+depend on it until it has been reviewed and approved.
 
 `@ppl` owns a small PPL AST plus a posterior-mode parameter/observation analysis
 and lowers a declarative `~` model into an ordinary `ReactiveKernels.@kernel`
@@ -11,6 +19,10 @@ hand-authored one — e.g. `prepare(model; have, want = PPLWorkflow.workflow_wan
 It is built entirely on ReactiveKernels' PUBLIC surface (`@kernel` / `prepare` /
 `plan` / `plate`) plus the reusable distribution-kernel objects — nothing lives
 in ReactiveKernels core.
+
+The surface mirrors StanBlocks (`@slic`): typed-LHS `name` / `name::real` /
+`name::vector[size]`, and support constraints spelled as distribution keywords
+(`~ dist(…; lower=0)`) — no invented `::positive` / `name[size]` forms.
 
 Decisions: build GO `2026-09-06T14-20-02-559-1r5p4j1`; scope MINIMAL
 `2026-09-06T14-20-27-206-0wqzaq4`.
@@ -22,15 +34,16 @@ Decisions: build GO `2026-09-06T14-20-02-559-1r5p4j1`; scope MINIMAL
   log-Jacobian authored in both directions — real (`normal` / `cauchy` /
   `laplace`, identity), positive (`exponential` / `gamma` / `lognormal`,
   log/exp), unit (`beta`, logit/logistic).
-- **Vector parameters** — `name[size] ~ dist(…)` (real support) — take a packed
-  slice of `size` coordinates (`size` a data argument or literal; the packed
-  layout tracks a running offset), and their prior is the summed per-element
-  authored `plate`.
-- An explicit `name::constraint` override (`positive` / `unit` / `real`). A
-  positive constraint on a real-support family is a **half distribution**
-  (lower-truncated at 0) whose prior adds `-log(1 - cdf(0))` via the family's own
-  `.cdf` — e.g. `sigma::positive ~ normal(0, 5)` (half-Normal),
-  `tau::positive ~ cauchy(0, 5)` (half-Cauchy).
+- **Vector parameters** — StanBlocks typed-LHS `name::vector[size] ~ dist(…)`
+  (real support) — take a packed slice of `size` coordinates (`size` a data
+  argument or literal; the packed layout tracks a running offset), and their
+  prior is the summed per-element authored `plate`.
+- **Support constraints are distribution keywords** (as in `@slic`): a
+  naturally-positive family (`exponential`/`gamma`/`lognormal`) already implies
+  positive support, and a `lower=0` keyword on a real family is a **half
+  distribution** whose prior adds `-log(1 - cdf(0))` via the family's own `.cdf`
+  — e.g. `sigma ~ normal(0, 5; lower=0)` (half-Normal),
+  `tau ~ cauchy(0, 5; lower=0)` (half-Cauchy).
 - `parameters` has two producers (constrain-only, and joint with `log_jacobian`
   so a params+Jacobian query shares the transform) plus named-latent inverse
   edges, so a packed, named-latent, or `parameters` HAVE boundary all route
@@ -113,6 +126,71 @@ end
 _call_head(rhs) = (rhs isa Expr && rhs.head === :call) ? rhs.args[1] : nothing
 _call_args(rhs) = rhs.args[2:end]
 
+# StanBlocks-faithful `~` left-hand side: `name`, `name::real`, or
+# `name::vector[size]` (typed-LHS, as in `@slic`). Returns (name, kind, size).
+function _parse_lhs(lhs)
+    if lhs isa Symbol
+        return (lhs, :scalar, nothing)
+    elseif lhs isa Expr && lhs.head === :(::) && length(lhs.args) == 2 &&
+            lhs.args[1] isa Symbol
+        name, typ = lhs.args[1], lhs.args[2]
+        if typ === :real
+            return (name, :scalar, nothing)
+        elseif typ isa Expr && typ.head === :ref && length(typ.args) == 2 &&
+                typ.args[1] === :vector
+            return (name, :vector, typ.args[2])
+        else
+            error("@ppl (first cut): unsupported typed-LHS `$(lhs)`; use `name`, " *
+                  "`name::real`, or `name::vector[size]` (StanBlocks typed-LHS).")
+        end
+    else
+        error("@ppl: `~` left-hand side must be `name`, `name::real`, or " *
+              "`name::vector[size]`, got `$(lhs)`.")
+    end
+end
+
+# Split a distribution call into its positional RK dist call and any `lower=` /
+# `upper=` support-constraint kwargs — StanBlocks spells parameter-support
+# constraints as distribution keywords (`~ cauchy(0, 5; lower=0)`).
+function _parse_dist(rhs)
+    (rhs isa Expr && rhs.head === :call && rhs.args[1] isa Symbol) ||
+        error("@ppl: `~` right-hand side must be a distribution call, got `$(rhs)`.")
+    head = rhs.args[1]
+    lower = nothing
+    upper = nothing
+    pos = Any[]
+    for a in rhs.args[2:end]
+        kws = a isa Expr && a.head === :parameters ? a.args :
+              a isa Expr && a.head === :kw ? (a,) : nothing
+        if kws === nothing
+            push!(pos, a)
+            continue
+        end
+        for kw in kws
+            (kw isa Expr && kw.head === :kw && kw.args[1] isa Symbol) ||
+                error("@ppl: malformed distribution keyword `$(kw)`.")
+            k, v = kw.args[1], kw.args[2]
+            k === :lower ? (lower = v) :
+            k === :upper ? (upper = v) :
+            error("@ppl (first cut): unsupported distribution keyword `$(k)`; only " *
+                  "`lower` / `upper` (support constraints) are handled.")
+        end
+    end
+    (head, Expr(:call, head, pos...), lower, upper)
+end
+
+_is_zero(x) = x === 0 || x === 0.0
+
+# The support constraint implied by `lower=` / `upper=` kwargs (first cut: only
+# `lower=0`, i.e. a lower-truncation at 0 — a half / positive family).
+function _constraint_from_bounds(name, lower, upper)
+    (lower === nothing && upper === nothing) && return nothing
+    (upper === nothing && _is_zero(lower)) && return :positive
+    error("@ppl (first cut): parameter `$(name)` — only `lower=0` (a half " *
+          "distribution) is a supported support constraint yet; general " *
+          "`lower` / `upper` bounds are a follow-up increment.")
+end
+
 """
     _parse(def) -> (name, dataargs, params, obs, passthrough)
 
@@ -139,62 +217,39 @@ function _parse(def)
     for stmt in body.args
         _is_line(stmt) && continue
         if stmt isa Expr && stmt.head === :call && stmt.args[1] === :~
-            lhs = stmt.args[2]
-            rhs = stmt.args[3]
-            # LHS is a bare name (scalar), `name[size]` (vector parameter), or
-            # `name::constraint` (an explicit support override, e.g. a half dist).
-            lname, lsize, loverride = nothing, nothing, nothing
-            if lhs isa Symbol
-                lname = lhs
-            elseif lhs isa Expr && lhs.head === :ref && length(lhs.args) == 2 &&
-                    lhs.args[1] isa Symbol
-                lname, lsize = lhs.args[1], lhs.args[2]
-            elseif lhs isa Expr && lhs.head === :(::) && length(lhs.args) == 2 &&
-                    lhs.args[1] isa Symbol && lhs.args[2] isa Symbol
-                lname, loverride = lhs.args[1], lhs.args[2]
-            else
-                error("@ppl: `~` left-hand side must be `name`, `name[size]`, or " *
-                      "`name::constraint`, got $(lhs)")
-            end
-            (_call_head(rhs) isa Symbol) ||
-                error("@ppl: `~` right-hand side must be a distribution call, got $(rhs)")
+            (lname, kind, lsize) = _parse_lhs(stmt.args[2])
+            (dist, dist_call, lower, upper) = _parse_dist(stmt.args[3])
             if lname in datanames
-                (lsize === nothing && loverride === nothing) ||
-                    error("@ppl: observation `$(lname)` cannot carry a size or constraint annotation")
-                push!(obs, _Obs(lname, rhs))
+                (kind === :scalar && lower === nothing && upper === nothing) ||
+                    error("@ppl: observation `$(lname)` cannot carry a type/size/" *
+                          "constraint annotation")
+                push!(obs, _Obs(lname, dist_call))
             else
                 lname in seen && error("@ppl: parameter $(lname) declared twice")
                 push!(seen, lname)
-                dist = _call_head(rhs)
                 haskey(_SUPPORT, dist) || error(
                     "@ppl (first cut): parameter $(lname) ~ $(dist)(…) — supported " *
                     "parameter distributions are $(sort(collect(keys(_SUPPORT)))); " *
                     "other families are a follow-up increment.")
                 natural = _SUPPORT[dist]
-                effective = loverride === nothing ? natural : loverride
+                constraint = _constraint_from_bounds(lname, lower, upper)
+                effective = constraint === nothing ? natural : constraint
                 truncate = false
-                if loverride !== nothing
-                    loverride in (:real, :positive, :unit) || error(
-                        "@ppl: unknown constraint `$(loverride)` on $(lname); use " *
-                        "real / positive / unit")
+                if constraint !== nothing
                     if effective === natural
-                        # redundant, explicit — no truncation.
+                        # redundant (e.g. `lower=0` on a naturally-positive family)
                     elseif effective === :positive && natural === :real
-                        truncate = true   # a half distribution (lower-truncated at 0)
+                        truncate = true   # half distribution (lower-truncated at 0)
                     else
-                        error("@ppl (first cut): constraint `$(effective)` on a " *
-                              "$(natural)-support `$(dist)` is not supported yet — only a " *
-                              "positive constraint on a real-support family (a half " *
-                              "distribution) or a redundant matching constraint.")
+                        error("@ppl (first cut): a `$(constraint)` constraint on a " *
+                              "$(natural)-support `$(dist)` is not supported yet.")
                     end
-                    lsize === nothing || error(
-                        "@ppl (first cut): a constrained vector parameter " *
-                        "($(lname)) is a follow-up increment.")
                 end
-                (lsize === nothing || effective === :real) || error(
-                    "@ppl (first cut): vector parameter $(lname)[$(lsize)] ~ $(dist)(…) — " *
-                    "only real-support vector parameters are supported yet.")
-                push!(params, _Param(lname, rhs, effective, lsize, truncate))
+                size = kind === :vector ? lsize : nothing
+                (size === nothing || effective === :real) || error(
+                    "@ppl (first cut): only real-support vector parameters are " *
+                    "supported yet (`$(lname)::vector[…]`).")
+                push!(params, _Param(lname, dist_call, effective, size, truncate))
             end
         elseif stmt isa Expr && stmt.head === :(=)
             push!(passthrough, stmt)
