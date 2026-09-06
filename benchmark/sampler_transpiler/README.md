@@ -277,6 +277,46 @@ run by roughly 23 times, so its nested event durations must not be treated as
 ordinary execution costs. The receipt retains the exact experimental drivers,
 trace counts, source hashes and durable artifact paths.
 
+The subsequent CPU policy addresses that repeated dispatch. The internal
+`TracedSlotCompiler.cpu_compile_options()` supplies per-compilation options
+that raise XLA's small-loop byte threshold from 1 KiB to 64 KiB. XLA's
+[small-loop pass](https://github.com/openxla/xla/blob/main/xla/service/cpu/small_while_loop_hoisting_pass.h)
+then compiles the eligible leapfrog and chain loops as single CPU kernels.
+It retains loops; it does not expand all iterations. XLA still decides which
+operations are eligible. Larger or unsupported loops retain its ordinary
+execution path. The helper preserves existing user settings and changes no
+global options. `small_loop_bytes=nothing` leaves this policy disabled.
+
+The position-chain scaling driver now uses this policy. Its optional second
+CLI argument selects a byte threshold, or `default` to keep XLA's defaults:
+
+```sh
+julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/position_multinomial_scaling.jl /absolute/output.csv
+julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/position_multinomial_scaling.jl /absolute/default-output.csv default
+julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/cpu_loop_packing.jl /absolute/inspection-directory
+```
+
+`cpu-loop-packing-v1.toml` records two alternating comparisons of the unchanged
+mathematical source. Sixteen-step execution improves from 11.93 to 2.59 μs per
+transition in the first run, and from 13.64 to 2.75 μs in the second. A 1 MiB
+threshold gives the same loop structure and similar timing. Compiling the
+64 KiB variant first in a fresh process takes 43.70 seconds: the execution
+gain does not solve cold compilation.
+
+`position-multinomial-scaling-v2.csv` and its adjacent TOML record all 168
+execution samples and six separate compilation rows. At 10,000 transitions:
+
+| Steps per transition | Native median | Reactant median | Fastest AdvancedHMC sample across both paired groups |
+| --- | ---: | ---: | ---: |
+| 4 | 1.68 μs | 1.28 μs | 7.54 μs |
+| 16 | 5.79 μs | 2.51 μs | 12.91 μs |
+
+Both generated backends beat their strongest paired AdvancedHMC samples at
+all six workloads. At only 100 four-step transitions, Reactant still takes
+2.32 μs versus native's 1.70 μs. The position-only output contract and
+AdvancedHMC trajectory/statistics differences described below still apply.
+The original full-phasepoint producer keeps its previous compilation defaults.
+
 The internal native emitter accepts `count_steps=false` to omit its diagnostic
 integration counter. Existing drivers keep counting by default. The
 [`counter_ablation.jl`](counter_ablation.jl) experiment alternates counted and

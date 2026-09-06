@@ -26,12 +26,14 @@ function native_scaling(io,prototype,batches)
     end
 end
 
-function traced_scaling(io,program,projection,comparator,L,batches)
+function traced_scaling(io,program,projection,comparator,L,batches;
+        reactant_compile_options=NamedTuple())
     call=TracedSlotCall(program.f,program.metadata)
     for n in batches
         driver=(state,seed,counts)->traced_owned_batch(call,projection,state,seed,counts,n)
         inputs=traced_slot_inputs(program.state)
-        timing=@timed Reactant.compile(driver,inputs;sync=true,donated_args=:none,serializable=true)
+        timing=@timed Reactant.compile(driver,inputs;sync=true,donated_args=:none,
+            serializable=true,reactant_compile_options...)
         scaling_row(io,"Reactant",L,n,0,timing;phase="compile")
         compiled=timing.value
         result=compiled(inputs...)
@@ -60,7 +62,7 @@ function traced_scaling(io,program,projection,comparator,L,batches)
 end
 
 function multinomial_scaling(path;batches=(100,1000,10000),steps=(4,16),
-        prototype_options=NamedTuple())
+        prototype_options=NamedTuple(),reactant_compile_options=NamedTuple())
     open(path,"w") do io
         println(io,"backend,paired_with,steps_per_transition,transitions,gradient_evaluations,sample,phase,seconds,allocated_bytes")
         for L in steps
@@ -73,7 +75,8 @@ function multinomial_scaling(path;batches=(100,1000,10000),steps=(4,16),
             prefix=Symbol(traced.prepared.program.contexts[2].prefix,:_owned)
             projection=SlotStatic(Tuple(i for (i,pair) in enumerate(program.ordered)
                 if first(first(pair))===prefix))
-            Base.invokelatest(traced_scaling,io,program,projection,traced.comparator,L,batches)
+            Base.invokelatest(traced_scaling,io,program,projection,traced.comparator,L,batches;
+                reactant_compile_options)
         end
     end
     println("scaling_csv=",abspath(path))

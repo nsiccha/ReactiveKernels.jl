@@ -1,0 +1,185 @@
+"schema_version" = 2
+"parent_commit" = "37915b757498e3599dd202cb08659af3ddafbd71"
+"host" = "strato2"
+"platform" = "cpu"
+"julia" = "1.10.11"
+"reactant" = "0.2.284"
+"enzyme" = "0.13.199"
+"ahmc" = "0.8.6"
+"exit_code" = 0
+"elapsed_seconds" = 155
+"execute_rows" = 168
+"compile_rows" = 6
+"replicates" = 7
+"steps_per_transition" = [4, 16]
+"transitions" = [100, 1000, 10000]
+"cpu_small_loop_bytes" = 65536
+"data_sha256" = "e25cd21356fa75945b105885de489910993238eaf19ba6c16bf77bd10284edbc"
+"command" = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/position_multinomial_scaling.jl /absolute/output.csv"
+"benchmark_contract" = "Centered Eight Schools, ten Float64 parameters, unit diagonal metric, stepsize0.03. Retains selected position and reusable position caches; momentum is refreshed next transition and is NOT the selected joint phasepoint. Fixed integration work, no adaptation/history/ESS. AdvancedHMC uses the same density/gradient/metric/steps and additionally materializes trajectories and computes acceptance statistics. Resets outside timing; Reactant sync=true,donated_args=:none; no host call per gradient. Counters enabled. No cross-backend numerical or trajectory agreement requirement."
+"compile_order" = "Sixcompilesinoneprocess inCSVorder, firstL4cold43.348s;laterrowsreuse. SeparateL16cold43.699s in cpu-loop-packing-v1.toml. Neverpoolcompilewithexecute."
+"interpretation" = "BothgeneratedbackendsbeatstrongestpairedAHMCinall6groups. At10000transitions nativeL4/L16=1.678/5.786us,Reactant=1.279/2.512us. ReactantL4atn100stilllosestonative2.324vs1.696us; do notclaimReactantalwaysfaster. PairedWithkeepsbothAHMCgroupsseparate."
+"recorded_output" = "BEGIN prepare_model\nprepare_model seconds=4.046423987 bytes=233003920\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=7.586070329 bytes=859917600\nBEGIN prepare_multinomial_factory\nprepare_multinomial_factory seconds=5.02277681 bytes=361846760\nBEGIN lower_multinomial_native\nlower_multinomial_native seconds=4.263701749 bytes=413404184\nchildren=(:init, :anchor, :work)\nBEGIN prepare_model\nprepare_model seconds=0.302609229 bytes=14633968\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=0.441214313 bytes=25728472\nBEGIN prepare_multinomial_factory\nprepare_multinomial_factory seconds=0.745530848 bytes=5468768\nBEGIN lower_multinomial_native\nlower_multinomial_native seconds=0.58698733 bytes=28956328\nchildren=(:init, :anchor, :work)\nscaling_complete backend=Reactant L=4 transitions=100 mlir_bytes=74771\nscaling_complete backend=Reactant L=4 transitions=1000 mlir_bytes=74773\nscaling_complete backend=Reactant L=4 transitions=10000 mlir_bytes=74775\nBEGIN prepare_model\nprepare_model seconds=0.331842878 bytes=14643440\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=0.508566531 bytes=25630664\nBEGIN prepare_multinomial_factory\nprepare_multinomial_factory seconds=0.769455816 bytes=5472584\nBEGIN lower_multinomial_native\nlower_multinomial_native seconds=0.620692005 bytes=27643840\nchildren=(:init, :anchor, :work)\nBEGIN prepare_model\nprepare_model seconds=0.344794166 bytes=14642880\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=0.439260629 bytes=25637432\nBEGIN prepare_multinomial_factory\nprepare_multinomial_factory seconds=0.771948582 bytes=5470088\nBEGIN lower_multinomial_native\nlower_multinomial_native seconds=0.554335498 bytes=28799936\nchildren=(:init, :anchor, :work)\nscaling_complete backend=Reactant L=16 transitions=100 mlir_bytes=43760\nscaling_complete backend=Reactant L=16 transitions=1000 mlir_bytes=43762\nscaling_complete backend=Reactant L=16 transitions=10000 mlir_bytes=43764\nscaling_csv=/home/n/scratch/kb-agent-tmp/ReactiveKernels-sampling/position-multinomial-scaling-v2.csv\n"
+
+["source_sha256"]
+"src/ad.jl" = "c130633ebe82bd8105f3d1b6e7647df77f5395744dcbc6ac8cfc36739974b162"
+"ext/ReactiveKernelsReactantExt.jl" = "6557fdb95b8115a375ca99d73496a30e2fddddff2c2eab09a92da8663819ff34"
+"src/kernel_adaptation.jl" = "d655baa036d4e5770b769ab644b8c56ca0567c167d3643011352131e9928a5c4"
+"benchmark/reactivehmc_hmc_kernel_fixture_b.jl" = "9ffa4e8e2990992cd92303e55a6d005cff2c6e1698de6bca7941ad2907f8a4da"
+"benchmark/nuts_kernel_authoring_fixture_b.jl" = "7a9a9d6e1fa122e3d846def760933b0ba14e62e567d92cffab9d9d638f9404f4"
+"benchmark/sampler_transpiler/hmc_eight_schools.jl" = "c18b800fc013d8007d1d1b23d7c7330b89304bc8ff92767562b26a788d2d5996"
+"benchmark/sampler_transpiler/native_slots.jl" = "c0f03d31c96be0c6282608c93779cd6c92c00e3741e40bdf62bc365e3f8d3e25"
+"benchmark/sampler_transpiler/native_slots_factory.jl" = "36468f4da6321631c0eba1a8fc1baa5dee305220b0e1572d6966b509365f8235"
+"benchmark/sampler_transpiler/native_comparison.jl" = "5e2612234a93c4d126a7c9550520ba468b266c790709e1602a1b1dccae183598"
+"benchmark/sampler_transpiler/traced_slots.jl" = "1145f10c16fb282f15615d8450e57b0e947af0b44c7a42ae99d16adfe9a18fd1"
+"benchmark/sampler_transpiler/traced_comparison.jl" = "ff891cd14f9ae1933a3b3813246b1d242b056b3b8c271425c3545e1bb78732c0"
+"benchmark/sampler_transpiler/loop_control_probe.jl" = "45bc979f7bdfbbc91918f4aa3300f794d7b263dd788b4707b7e621e4b1970881"
+"benchmark/sampler_transpiler/profile_compile.jl" = "ba92a50afae1fdd86667fc00f16197a0479214e714eb2237e10b2cdf7332dbc8"
+"src/ReactiveKernels.jl" = "5dadbc59cd45725b1b00350cc5156e4b8a403c766b90ca24985f5bc958d3ce01"
+"src/native_slot_compiler.jl" = "206f475697d27bbc230f5eca0631378ee22e13951ab5929d94158ae6802ebea9"
+"src/native_slots.jl" = "9c6857d54dbd5471a62017a0cbfa6764442a98476f9f680ccee94991d12186c1"
+"src/native_slots_factory.jl" = "9f0f47fc081de7b54950fe4e87ec488b6dfb0e6b84fa3119af1a07ff96d0928a"
+"ext/ReactiveKernelsReactantExt/traced_slot_compiler.jl" = "41043e9bdc9be09e9a40a21849fe3ffff99e8114fa2d5697e918e12aedc2445e"
+"ext/ReactiveKernelsReactantExt/traced_slots.jl" = "470236c0fde74933d3f39147418984221ef27ca77440fd04c4ff350bad948f86"
+"benchmark/sampler_transpiler/scalar_argument_probe.jl" = "277492fefac36afa9dce6b96f1510137dcd3eda1eb0ef97e44874a5300b0b47b"
+"ext/ReactiveKernelsReactantExt/traced_code_cache.jl" = "1e1b87256021628044b47b5c2c3e0f8d14d0e298d58e156c82b0f8958c0d46fb"
+"benchmark/sampler_transpiler/code_reuse_probe.jl" = "2ce50d054e810c354e4561ff1ce8067bcb02010560eb319edac73e05fb0c0ec0"
+"benchmark/sampler_transpiler/multinomial_hmc_kernel.jl" = "a854b0a9cf5ec660e64d622b9442804a564ffc0657ed3089331aa9e5fcb97218"
+"benchmark/sampler_transpiler/multinomial_eight_schools.jl" = "0080849f5e4cd1d5ac933aba28d941e747d99669fb9cf14b38efd201a29ce9df"
+"benchmark/sampler_transpiler/constant_binding_probe.jl" = "a510b08850dc0e07779ff80750c26bdddac93552c2d8b7ea400148973bcf95c8"
+"benchmark/sampler_transpiler/range_draw_probe.jl" = "e9d82d844fbed32de615ee8dde49876cf488a102d6d6938c8c2742f4692cbe5f"
+"ext/ReactiveKernelsReactantExt/traced_random.jl" = "33e50ef2a1f7eda06a4a01bb66892565d609e2d28aa418f391db445f468e0e93"
+"src/kernel_stateful.jl" = "2cff19f87a39d124a462d4f79cd99cb94c9908c16f5b1c2d3946db7af89a6776"
+"test/test_kernel_methodir.jl" = "1aa1a6a9501d4525031f7ea8166bf3e6bf29ce8bd85b23a18e101b2d929961f7"
+"benchmark/sampler_transpiler/indexed_array_probe.jl" = "a746173df251cb14f6b628a3142337ca15458fc486e1afe6e2caf1d7ba4f06bd"
+"src/kernel_factory.jl" = "6cd1cc5e3715d420a4d06983d361a2597c3a2f243f88e21fbcd5eb2fda4e65b1"
+"benchmark/sampler_transpiler/runtime_keyword_probe.jl" = "fcdff23cfaabf5616dbc339653b660117ed4e96ae8c844382196631bc3bf6f08"
+"benchmark/sampler_transpiler/counter_ablation.jl" = "1d459d0f9ee8c3741d13659be69724d3a924698c6bdf036b7f825b66a952a0f5"
+"benchmark/sampler_transpiler/partial_transfer_probe.jl" = "190c2a9d23a7b438a03ad41fb3c8fca5e116a89cc49273153bdbf25028da1552"
+"benchmark/sampler_transpiler/position_multinomial_hmc_kernel.jl" = "25c1328145e517c7b53dfc0b0e4d51aa5fc8f08e984e429da36412da5d06d0fe"
+"benchmark/sampler_transpiler/multinomial_scaling.jl" = "eefe6b222e9327f09ebc11aab9fe7551f04276f545ff22ccfa492a72718f86da"
+"benchmark/sampler_transpiler/position_multinomial_scaling.jl" = "27955460892188a89d71bec0efe6c5e06f5e822d45b66ebb788a41f47ea25bf3"
+"ext/ReactiveKernelsReactantExt/traced_compile_options.jl" = "19b055a5cb2579857a7b76423c6d677dfee52cb02d82e09d3632b9496752a82a"
+"benchmark/sampler_transpiler/cpu_loop_packing.jl" = "0fc63923111bcb8e037d2ecdc01d9a7a88dfde26d86d5d59e3bac5bbee7b5a8b"
+
+["medians"]
+
+["medians"."native_native_L4_n100"]
+"seconds" = 0.000169553
+"us_per_transition" = 1.69553
+"best_seconds" = 0.000166851
+
+["medians"."AdvancedHMC_native_L4_n100"]
+"seconds" = 0.000685095
+"us_per_transition" = 6.85095
+"best_seconds" = 0.000633444
+
+["medians"."native_native_L4_n1000"]
+"seconds" = 0.001684231
+"us_per_transition" = 1.684231
+"best_seconds" = 0.001635855
+
+["medians"."AdvancedHMC_native_L4_n1000"]
+"seconds" = 0.006952557
+"us_per_transition" = 6.952557
+"best_seconds" = 0.006741043
+
+["medians"."native_native_L4_n10000"]
+"seconds" = 0.01678301
+"us_per_transition" = 1.6783010000000003
+"best_seconds" = 0.0164776
+
+["medians"."AdvancedHMC_native_L4_n10000"]
+"seconds" = 0.088210649
+"us_per_transition" = 8.8210649
+"best_seconds" = 0.080670311
+
+["medians"."Reactant_Reactant_L4_n100"]
+"seconds" = 0.000232441
+"us_per_transition" = 2.32441
+"best_seconds" = 0.000186668
+
+["medians"."AdvancedHMC_Reactant_L4_n100"]
+"seconds" = 0.00079121
+"us_per_transition" = 7.912100000000001
+"best_seconds" = 0.000683413
+
+["medians"."Reactant_Reactant_L4_n1000"]
+"seconds" = 0.001410364
+"us_per_transition" = 1.410364
+"best_seconds" = 0.001380013
+
+["medians"."AdvancedHMC_Reactant_L4_n1000"]
+"seconds" = 0.010450089
+"us_per_transition" = 10.450089
+"best_seconds" = 0.007396608
+
+["medians"."Reactant_Reactant_L4_n10000"]
+"seconds" = 0.012784619
+"us_per_transition" = 1.2784619000000002
+"best_seconds" = 0.011940854
+
+["medians"."AdvancedHMC_Reactant_L4_n10000"]
+"seconds" = 0.080887111
+"us_per_transition" = 8.088711100000001
+"best_seconds" = 0.075374569
+
+["medians"."native_native_L16_n100"]
+"seconds" = 0.000547764
+"us_per_transition" = 5.47764
+"best_seconds" = 0.000539965
+
+["medians"."AdvancedHMC_native_L16_n100"]
+"seconds" = 0.001278494
+"us_per_transition" = 12.784939999999999
+"best_seconds" = 0.001230407
+
+["medians"."native_native_L16_n1000"]
+"seconds" = 0.005549572
+"us_per_transition" = 5.549572
+"best_seconds" = 0.005490541
+
+["medians"."AdvancedHMC_native_L16_n1000"]
+"seconds" = 0.013482731
+"us_per_transition" = 13.482731
+"best_seconds" = 0.012074749
+
+["medians"."native_native_L16_n10000"]
+"seconds" = 0.057862183
+"us_per_transition" = 5.7862183
+"best_seconds" = 0.055094886
+
+["medians"."AdvancedHMC_native_L16_n10000"]
+"seconds" = 0.135670788
+"us_per_transition" = 13.5670788
+"best_seconds" = 0.129148544
+
+["medians"."Reactant_Reactant_L16_n100"]
+"seconds" = 0.000434719
+"us_per_transition" = 4.34719
+"best_seconds" = 0.000365053
+
+["medians"."AdvancedHMC_Reactant_L16_n100"]
+"seconds" = 0.001716567
+"us_per_transition" = 17.16567
+"best_seconds" = 0.001264093
+
+["medians"."Reactant_Reactant_L16_n1000"]
+"seconds" = 0.002693394
+"us_per_transition" = 2.6933939999999996
+"best_seconds" = 0.002613533
+
+["medians"."AdvancedHMC_Reactant_L16_n1000"]
+"seconds" = 0.014044205
+"us_per_transition" = 14.044205
+"best_seconds" = 0.012354815
+
+["medians"."Reactant_Reactant_L16_n10000"]
+"seconds" = 0.025118565
+"us_per_transition" = 2.5118565
+"best_seconds" = 0.024544773
+
+["medians"."AdvancedHMC_Reactant_L16_n10000"]
+"seconds" = 0.144216721
+"us_per_transition" = 14.421672099999999
+"best_seconds" = 0.132182218

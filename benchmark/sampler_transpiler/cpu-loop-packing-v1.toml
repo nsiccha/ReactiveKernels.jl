@@ -1,0 +1,172 @@
+"schema_version" = 1
+"parent_commit" = "37915b757498e3599dd202cb08659af3ddafbd71"
+"host" = "strato2"
+"platform" = "cpu"
+"julia" = "1.10.11"
+"reactant" = "0.2.284"
+"enzyme" = "0.13.199"
+"ahmc" = "0.8.6"
+"status" = "verified_cpu_loop_packing_policy"
+"mechanism" = "XLA small-while-loop-hoisting compiles eligible small loops into computation kernels. The default1024-byte threshold packs only the RNG rejection loop here;65536 also packs the retained leapfrog and outer chain loops.1048576 produces the same three marked call sites. This retains loops rather than unrolling them."
+"policy" = "TracedSlotCompiler.cpu_compile_options returns scoped Reactant compilation options with a65536-byte CPU loop threshold. It merges existing backend extras into a fresh map and preserves explicit/global user values. small_loop_bytes=nothing opts out. No global settings, sampler arithmetic, or numerical-matching machinery changed. Internal experimental compiler helper, not a stable public sampler API."
+"benchmark_contract" = "Same captured position-chain multinomial source, centered Eight Schools,10Float64parameters,16leapfrogsteps,stepsize0.03,unitdiagonalmetric,1000chainedtransitions,7alternatingreplicates perthreshold. Every batch checks16000steps,finite vectors andcaller preservation outside timing. Inputresetandcompilationexcluded. Selectedposition retained, notselectedjointmomentum. Noadaptation/history/ESS."
+"compilation_interpretation" = "Initialbaselinecold42.556s thenpackedwarm0.736s is NOT a cold speedup. The separate finalpolicy run compiles65536first in43.699s. Executionimproves about4.6–5.0x; cold compilation remainsabout44s."
+
+["initial_ablation"]
+"exit_code" = 0
+"elapsed_seconds" = 137
+"compilation_order" = [1024, 65536, 1048576]
+"recorded_output" = "BEGIN prepare_model\nprepare_model seconds=4.467704585 bytes=233008128\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=7.565308713 bytes=859533280\nBEGIN prepare_multinomial_factory\nprepare_multinomial_factory seconds=4.805024535 bytes=362207576\nBEGIN lower_multinomial_native\nlower_multinomial_native seconds=4.703961725 bytes=431503880\nchildren=(:init, :anchor, :work)\npacked_compile threshold=1024 seconds=42.555743439 bytes=4266838485 small_calls=1\npacked_compile threshold=65536 seconds=0.735956705 bytes=15680656 small_calls=3\npacked_compile threshold=1048576 seconds=0.729299105 bytes=15119240 small_calls=3\npacked_sample threshold=1024 sample=1 seconds=0.012477455\npacked_sample threshold=65536 sample=1 seconds=0.002641282\npacked_sample threshold=1048576 sample=1 seconds=0.0026254\npacked_sample threshold=1048576 sample=2 seconds=0.00250918\npacked_sample threshold=65536 sample=2 seconds=0.002534464\npacked_sample threshold=1024 sample=2 seconds=0.011928037\npacked_sample threshold=1024 sample=3 seconds=0.011636555\npacked_sample threshold=65536 sample=3 seconds=0.002606214\npacked_sample threshold=1048576 sample=3 seconds=0.00262551\npacked_sample threshold=1048576 sample=4 seconds=0.002555975\npacked_sample threshold=65536 sample=4 seconds=0.002555184\npacked_sample threshold=1024 sample=4 seconds=0.011989642\npacked_sample threshold=1024 sample=5 seconds=0.011987418\npacked_sample threshold=65536 sample=5 seconds=0.00258957\npacked_sample threshold=1048576 sample=5 seconds=0.00263239\npacked_sample threshold=1048576 sample=6 seconds=0.002611811\npacked_sample threshold=65536 sample=6 seconds=0.002539381\npacked_sample threshold=1024 sample=6 seconds=0.01153134\npacked_sample threshold=1024 sample=7 seconds=0.011661119\npacked_sample threshold=65536 sample=7 seconds=0.002597502\npacked_sample threshold=1048576 sample=7 seconds=0.002577544\n"
+"driver_source" = "include(\"/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-sampling/benchmark/sampler_transpiler/multinomial_eight_schools.jl\")\ninclude(\"/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-sampling/benchmark/sampler_transpiler/position_multinomial_hmc_kernel.jl\")\nusing TOML\nfunction compare_packing(program,projection,output_dir)\n    mkpath(output_dir)\n    call=TracedSlotCall(program.f,program.metadata)\n    driver=(state,seed,counts)->traced_owned_batch(call,projection,state,seed,counts,1000)\n    inputs=traced_slot_inputs(program.state)\n    results=Dict{String,Any}()\n    compiled=Any[]\n    for threshold in (1024,65536,1048576)\n        extras=copy(Reactant.XLA.get_default_debug_options().xla_backend_extra_options)\n        extras[\"xla_cpu_small_while_loop_byte_threshold\"]=string(threshold)\n        timing=@timed Reactant.compile(driver,inputs;sync=true,donated_args=:none,\n            serializable=true,xla_debug_options=(xla_backend_extra_options=extras,))\n        push!(compiled,timing.value)\n        hlo=sprint(show,only(Reactant.XLA.get_hlo_modules(timing.value.exec)))\n        write(joinpath(output_dir,\"threshold-$(threshold).hlo\"),hlo)\n        results[string(threshold)]=Dict(\"compile_seconds\"=>timing.time,\n            \"compile_bytes\"=>timing.bytes,\"optimized_hlo_bytes\"=>sizeof(hlo),\n            \"small_calls\"=>count(\"xla_cpu_small_call\",hlo),\"samples_seconds\"=>Float64[])\n        println(\"packed_compile threshold=\",threshold,\" seconds=\",timing.time,\n            \" bytes=\",timing.bytes,\" small_calls=\",count(\"xla_cpu_small_call\",hlo))\n        output=timing.value(inputs...)\n        Int(output.counts[1])==16000 || error(\"shortened warmup\")\n        check_traced_inputs_unchanged(inputs,program.state)\n    end\n    for sample in 1:7\n        order=isodd(sample) ? (1,2,3) : (3,2,1)\n        for i in order\n            threshold=(1024,65536,1048576)[i]\n            inputs=traced_slot_inputs(program.state)\n            timing=@timed compiled[i](inputs...)\n            Int(timing.value.counts[1])==16000 || error(\"shortened execution\")\n            for v in timing.value.values\n                v isa Reactant.AbstractConcreteArray || continue\n                all(isfinite,Array(v)) || error(\"nonfinite position/state\")\n            end\n            check_traced_inputs_unchanged(inputs,program.state)\n            push!(results[string(threshold)][\"samples_seconds\"],timing.time)\n            println(\"packed_sample threshold=\",threshold,\" sample=\",sample,\" seconds=\",timing.time)\n        end\n    end\n    open(joinpath(output_dir,\"results.toml\"),\"w\") do io\n        TOML.print(io,results)\n    end\nend\nprototype=build_multinomial_prototype(;L=16,\n    source=PositionMultinomialHMCAuthoring.multinomial_hmc_state,\n    source_controls=(step_f=F.leapfrog!,stepsize=0.03),\n    compiler_options=(peel_loops=true,))\nreset_native_slots!(prototype.prepared)\nprogram=compile_traced_slots(prototype.prepared.program)\nprefix=Symbol(prototype.prepared.program.contexts[2].prefix,:_owned)\nprojection=SlotStatic(Tuple(i for (i,pair) in enumerate(program.ordered)\n    if first(first(pair))===prefix))\nBase.invokelatest(compare_packing,program,projection,\n    \"/home/n/scratch/kb-agent-tmp/ReactiveKernels-sampling/loop-packing\")\n"
+
+["initial_ablation"."results"]
+
+["initial_ablation"."results"."65536"]
+"optimized_hlo_bytes" = 212682
+"small_calls" = 3
+"compile_bytes" = 15680656
+"compile_seconds" = 0.735956705
+"samples_seconds" = [0.002641282, 0.002534464, 0.002606214, 0.002555184, 0.00258957, 0.002539381, 0.002597502]
+"median_us_per_transition" = 2.5895699999999997
+"optimized_hlo_sha256" = "55453dc8a28723bf5a9ad8fd3c50e1160e847edac09b798932640389787fc894"
+
+["initial_ablation"."results"."1048576"]
+"optimized_hlo_bytes" = 212682
+"small_calls" = 3
+"compile_bytes" = 15119240
+"compile_seconds" = 0.729299105
+"samples_seconds" = [0.0026254, 0.00250918, 0.00262551, 0.002555975, 0.00263239, 0.002611811, 0.002577544]
+"median_us_per_transition" = 2.611811
+"optimized_hlo_sha256" = "55453dc8a28723bf5a9ad8fd3c50e1160e847edac09b798932640389787fc894"
+
+["initial_ablation"."results"."1024"]
+"optimized_hlo_bytes" = 211161
+"small_calls" = 1
+"compile_bytes" = 4266838485
+"compile_seconds" = 42.555743439
+"samples_seconds" = [0.012477455, 0.011928037, 0.011636555, 0.011989642, 0.011987418, 0.01153134, 0.011661119]
+"median_us_per_transition" = 11.928037000000002
+"optimized_hlo_sha256" = "36e81e7aba35c1c027d38ed014cc6cd81c21940e51e71580623298e245328f78"
+
+["initial_ablation"."source_sha256"]
+"src/ad.jl" = "c130633ebe82bd8105f3d1b6e7647df77f5395744dcbc6ac8cfc36739974b162"
+"ext/ReactiveKernelsReactantExt.jl" = "6557fdb95b8115a375ca99d73496a30e2fddddff2c2eab09a92da8663819ff34"
+"src/kernel_adaptation.jl" = "d655baa036d4e5770b769ab644b8c56ca0567c167d3643011352131e9928a5c4"
+"benchmark/reactivehmc_hmc_kernel_fixture_b.jl" = "9ffa4e8e2990992cd92303e55a6d005cff2c6e1698de6bca7941ad2907f8a4da"
+"benchmark/nuts_kernel_authoring_fixture_b.jl" = "7a9a9d6e1fa122e3d846def760933b0ba14e62e567d92cffab9d9d638f9404f4"
+"benchmark/sampler_transpiler/hmc_eight_schools.jl" = "c18b800fc013d8007d1d1b23d7c7330b89304bc8ff92767562b26a788d2d5996"
+"benchmark/sampler_transpiler/native_slots.jl" = "c0f03d31c96be0c6282608c93779cd6c92c00e3741e40bdf62bc365e3f8d3e25"
+"benchmark/sampler_transpiler/native_slots_factory.jl" = "36468f4da6321631c0eba1a8fc1baa5dee305220b0e1572d6966b509365f8235"
+"benchmark/sampler_transpiler/native_comparison.jl" = "5e2612234a93c4d126a7c9550520ba468b266c790709e1602a1b1dccae183598"
+"benchmark/sampler_transpiler/traced_slots.jl" = "1145f10c16fb282f15615d8450e57b0e947af0b44c7a42ae99d16adfe9a18fd1"
+"benchmark/sampler_transpiler/traced_comparison.jl" = "ff891cd14f9ae1933a3b3813246b1d242b056b3b8c271425c3545e1bb78732c0"
+"benchmark/sampler_transpiler/loop_control_probe.jl" = "45bc979f7bdfbbc91918f4aa3300f794d7b263dd788b4707b7e621e4b1970881"
+"benchmark/sampler_transpiler/profile_compile.jl" = "ba92a50afae1fdd86667fc00f16197a0479214e714eb2237e10b2cdf7332dbc8"
+"src/ReactiveKernels.jl" = "5dadbc59cd45725b1b00350cc5156e4b8a403c766b90ca24985f5bc958d3ce01"
+"src/native_slot_compiler.jl" = "206f475697d27bbc230f5eca0631378ee22e13951ab5929d94158ae6802ebea9"
+"src/native_slots.jl" = "9c6857d54dbd5471a62017a0cbfa6764442a98476f9f680ccee94991d12186c1"
+"src/native_slots_factory.jl" = "9f0f47fc081de7b54950fe4e87ec488b6dfb0e6b84fa3119af1a07ff96d0928a"
+"ext/ReactiveKernelsReactantExt/traced_slot_compiler.jl" = "7f5bc7f5148912b1d7355ad55181e847911984199c6fbccb53b3a49ede4a83a7"
+"ext/ReactiveKernelsReactantExt/traced_slots.jl" = "470236c0fde74933d3f39147418984221ef27ca77440fd04c4ff350bad948f86"
+"benchmark/sampler_transpiler/scalar_argument_probe.jl" = "277492fefac36afa9dce6b96f1510137dcd3eda1eb0ef97e44874a5300b0b47b"
+"ext/ReactiveKernelsReactantExt/traced_code_cache.jl" = "1e1b87256021628044b47b5c2c3e0f8d14d0e298d58e156c82b0f8958c0d46fb"
+"benchmark/sampler_transpiler/code_reuse_probe.jl" = "2ce50d054e810c354e4561ff1ce8067bcb02010560eb319edac73e05fb0c0ec0"
+"benchmark/sampler_transpiler/multinomial_hmc_kernel.jl" = "a854b0a9cf5ec660e64d622b9442804a564ffc0657ed3089331aa9e5fcb97218"
+"benchmark/sampler_transpiler/multinomial_eight_schools.jl" = "0080849f5e4cd1d5ac933aba28d941e747d99669fb9cf14b38efd201a29ce9df"
+"benchmark/sampler_transpiler/constant_binding_probe.jl" = "a510b08850dc0e07779ff80750c26bdddac93552c2d8b7ea400148973bcf95c8"
+"benchmark/sampler_transpiler/range_draw_probe.jl" = "e9d82d844fbed32de615ee8dde49876cf488a102d6d6938c8c2742f4692cbe5f"
+"ext/ReactiveKernelsReactantExt/traced_random.jl" = "33e50ef2a1f7eda06a4a01bb66892565d609e2d28aa418f391db445f468e0e93"
+"src/kernel_stateful.jl" = "2cff19f87a39d124a462d4f79cd99cb94c9908c16f5b1c2d3946db7af89a6776"
+"test/test_kernel_methodir.jl" = "1aa1a6a9501d4525031f7ea8166bf3e6bf29ce8bd85b23a18e101b2d929961f7"
+"benchmark/sampler_transpiler/indexed_array_probe.jl" = "a746173df251cb14f6b628a3142337ca15458fc486e1afe6e2caf1d7ba4f06bd"
+"src/kernel_factory.jl" = "6cd1cc5e3715d420a4d06983d361a2597c3a2f243f88e21fbcd5eb2fda4e65b1"
+"benchmark/sampler_transpiler/runtime_keyword_probe.jl" = "fcdff23cfaabf5616dbc339653b660117ed4e96ae8c844382196631bc3bf6f08"
+"benchmark/sampler_transpiler/counter_ablation.jl" = "1d459d0f9ee8c3741d13659be69724d3a924698c6bdf036b7f825b66a952a0f5"
+"benchmark/sampler_transpiler/partial_transfer_probe.jl" = "190c2a9d23a7b438a03ad41fb3c8fca5e116a89cc49273153bdbf25028da1552"
+"benchmark/sampler_transpiler/position_multinomial_hmc_kernel.jl" = "25c1328145e517c7b53dfc0b0e4d51aa5fc8f08e984e429da36412da5d06d0fe"
+"benchmark/sampler_transpiler/multinomial_scaling.jl" = "8d520daa2fe01ab0822beb1e58f75a4b022bc5364472d3dc867fd68a18674e88"
+"benchmark/sampler_transpiler/position_multinomial_scaling.jl" = "c4a3a2293afd40a06899e20f0f4ff69593c42f77a327654df3896b51b947139f"
+
+["cold_policy_run"]
+"exit_code" = 0
+"elapsed_seconds" = 116
+"compilation_order" = [65536, 1024, 1048576]
+"recorded_output" = "BEGIN prepare_model\nprepare_model seconds=4.74309195 bytes=233027616\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=7.272496652 bytes=860029560\nBEGIN prepare_multinomial_factory\nprepare_multinomial_factory seconds=4.65002075 bytes=361949160\nBEGIN lower_multinomial_native\nlower_multinomial_native seconds=4.369413919 bytes=430287552\nchildren=(:init, :anchor, :work)\npacked_compile threshold=65536 seconds=43.699331421 bytes=4266840645 small_calls=3\npacked_compile threshold=1024 seconds=0.749172288 bytes=15685416 small_calls=1\npacked_compile threshold=1048576 seconds=0.708691901 bytes=15121456 small_calls=3\npacked_sample threshold=65536 sample=1 seconds=0.002696678\npacked_sample threshold=1024 sample=1 seconds=0.012475452\npacked_sample threshold=1048576 sample=1 seconds=0.002648683\npacked_sample threshold=1048576 sample=2 seconds=0.002772843\npacked_sample threshold=1024 sample=2 seconds=0.013716523\npacked_sample threshold=65536 sample=2 seconds=0.002735382\npacked_sample threshold=65536 sample=3 seconds=0.003083882\npacked_sample threshold=1024 sample=3 seconds=0.013919172\npacked_sample threshold=1048576 sample=3 seconds=0.002820199\npacked_sample threshold=1048576 sample=4 seconds=0.00281331\npacked_sample threshold=1024 sample=4 seconds=0.013523137\npacked_sample threshold=65536 sample=4 seconds=0.002746487\npacked_sample threshold=65536 sample=5 seconds=0.002743273\npacked_sample threshold=1024 sample=5 seconds=0.012514716\npacked_sample threshold=1048576 sample=5 seconds=0.002736563\npacked_sample threshold=1048576 sample=6 seconds=0.002738276\npacked_sample threshold=1024 sample=6 seconds=0.013795131\npacked_sample threshold=65536 sample=6 seconds=0.002768438\npacked_sample threshold=65536 sample=7 seconds=0.00279974\npacked_sample threshold=1024 sample=7 seconds=0.01364235\npacked_sample threshold=1048576 sample=7 seconds=0.002810475\n"
+"command" = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/cpu_loop_packing.jl /absolute/output-directory"
+
+["cold_policy_run"."results"]
+
+["cold_policy_run"."results"."65536"]
+"optimized_hlo_bytes" = 212682
+"small_calls" = 3
+"compile_bytes" = 4266840645
+"compile_seconds" = 43.699331421
+"samples_seconds" = [0.002696678, 0.002735382, 0.003083882, 0.002746487, 0.002743273, 0.002768438, 0.00279974]
+"median_us_per_transition" = 2.746487
+"optimized_hlo_sha256" = "0857b23c34966e6b9fd01063d13a4de910a5ea7be4101638ce2bf0286347dfab"
+
+["cold_policy_run"."results"."1048576"]
+"optimized_hlo_bytes" = 212682
+"small_calls" = 3
+"compile_bytes" = 15121456
+"compile_seconds" = 0.708691901
+"samples_seconds" = [0.002648683, 0.002772843, 0.002820199, 0.00281331, 0.002736563, 0.002738276, 0.002810475]
+"median_us_per_transition" = 2.772843
+"optimized_hlo_sha256" = "0857b23c34966e6b9fd01063d13a4de910a5ea7be4101638ce2bf0286347dfab"
+
+["cold_policy_run"."results"."1024"]
+"optimized_hlo_bytes" = 211161
+"small_calls" = 1
+"compile_bytes" = 15685416
+"compile_seconds" = 0.749172288
+"samples_seconds" = [0.012475452, 0.013716523, 0.013919172, 0.013523137, 0.012514716, 0.013795131, 0.01364235]
+"median_us_per_transition" = 13.642349999999999
+"optimized_hlo_sha256" = "f4e8475e9170227ccde5aabe0de0efcaa95be4fef5d194a40c5128002a0ec65b"
+
+["investigation_reference"]
+"cpu_options_url" = "https://raw.githubusercontent.com/openxla/xla/main/xla/service/cpu/cpu_options.cc"
+"cpu_options_sha256" = "e42c2cc8d3d85134a3833c6dd6f333c812493e6d77209b11b287057fb63ee8f0"
+"cpu_options_header_url" = "https://raw.githubusercontent.com/openxla/xla/main/xla/service/cpu/cpu_options.h"
+"cpu_options_header_sha256" = "910c66471d608528fbd934f5ac052f2f0549203bce6991d3ae6d084a4ce51853"
+"note" = "Upstreammain snapshots read2026-09-06 explain the option. InstalledReactantartifact contains the option key and actualcompiledHLO validates behavior; these references are not asserted to be the exact installedXLAcommit."
+
+["source_sha256"]
+"src/ad.jl" = "c130633ebe82bd8105f3d1b6e7647df77f5395744dcbc6ac8cfc36739974b162"
+"ext/ReactiveKernelsReactantExt.jl" = "6557fdb95b8115a375ca99d73496a30e2fddddff2c2eab09a92da8663819ff34"
+"src/kernel_adaptation.jl" = "d655baa036d4e5770b769ab644b8c56ca0567c167d3643011352131e9928a5c4"
+"benchmark/reactivehmc_hmc_kernel_fixture_b.jl" = "9ffa4e8e2990992cd92303e55a6d005cff2c6e1698de6bca7941ad2907f8a4da"
+"benchmark/nuts_kernel_authoring_fixture_b.jl" = "7a9a9d6e1fa122e3d846def760933b0ba14e62e567d92cffab9d9d638f9404f4"
+"benchmark/sampler_transpiler/hmc_eight_schools.jl" = "c18b800fc013d8007d1d1b23d7c7330b89304bc8ff92767562b26a788d2d5996"
+"benchmark/sampler_transpiler/native_slots.jl" = "c0f03d31c96be0c6282608c93779cd6c92c00e3741e40bdf62bc365e3f8d3e25"
+"benchmark/sampler_transpiler/native_slots_factory.jl" = "36468f4da6321631c0eba1a8fc1baa5dee305220b0e1572d6966b509365f8235"
+"benchmark/sampler_transpiler/native_comparison.jl" = "5e2612234a93c4d126a7c9550520ba468b266c790709e1602a1b1dccae183598"
+"benchmark/sampler_transpiler/traced_slots.jl" = "1145f10c16fb282f15615d8450e57b0e947af0b44c7a42ae99d16adfe9a18fd1"
+"benchmark/sampler_transpiler/traced_comparison.jl" = "ff891cd14f9ae1933a3b3813246b1d242b056b3b8c271425c3545e1bb78732c0"
+"benchmark/sampler_transpiler/loop_control_probe.jl" = "45bc979f7bdfbbc91918f4aa3300f794d7b263dd788b4707b7e621e4b1970881"
+"benchmark/sampler_transpiler/profile_compile.jl" = "ba92a50afae1fdd86667fc00f16197a0479214e714eb2237e10b2cdf7332dbc8"
+"src/ReactiveKernels.jl" = "5dadbc59cd45725b1b00350cc5156e4b8a403c766b90ca24985f5bc958d3ce01"
+"src/native_slot_compiler.jl" = "206f475697d27bbc230f5eca0631378ee22e13951ab5929d94158ae6802ebea9"
+"src/native_slots.jl" = "9c6857d54dbd5471a62017a0cbfa6764442a98476f9f680ccee94991d12186c1"
+"src/native_slots_factory.jl" = "9f0f47fc081de7b54950fe4e87ec488b6dfb0e6b84fa3119af1a07ff96d0928a"
+"ext/ReactiveKernelsReactantExt/traced_slot_compiler.jl" = "41043e9bdc9be09e9a40a21849fe3ffff99e8114fa2d5697e918e12aedc2445e"
+"ext/ReactiveKernelsReactantExt/traced_slots.jl" = "470236c0fde74933d3f39147418984221ef27ca77440fd04c4ff350bad948f86"
+"benchmark/sampler_transpiler/scalar_argument_probe.jl" = "277492fefac36afa9dce6b96f1510137dcd3eda1eb0ef97e44874a5300b0b47b"
+"ext/ReactiveKernelsReactantExt/traced_code_cache.jl" = "1e1b87256021628044b47b5c2c3e0f8d14d0e298d58e156c82b0f8958c0d46fb"
+"benchmark/sampler_transpiler/code_reuse_probe.jl" = "2ce50d054e810c354e4561ff1ce8067bcb02010560eb319edac73e05fb0c0ec0"
+"benchmark/sampler_transpiler/multinomial_hmc_kernel.jl" = "a854b0a9cf5ec660e64d622b9442804a564ffc0657ed3089331aa9e5fcb97218"
+"benchmark/sampler_transpiler/multinomial_eight_schools.jl" = "0080849f5e4cd1d5ac933aba28d941e747d99669fb9cf14b38efd201a29ce9df"
+"benchmark/sampler_transpiler/constant_binding_probe.jl" = "a510b08850dc0e07779ff80750c26bdddac93552c2d8b7ea400148973bcf95c8"
+"benchmark/sampler_transpiler/range_draw_probe.jl" = "e9d82d844fbed32de615ee8dde49876cf488a102d6d6938c8c2742f4692cbe5f"
+"ext/ReactiveKernelsReactantExt/traced_random.jl" = "33e50ef2a1f7eda06a4a01bb66892565d609e2d28aa418f391db445f468e0e93"
+"src/kernel_stateful.jl" = "2cff19f87a39d124a462d4f79cd99cb94c9908c16f5b1c2d3946db7af89a6776"
+"test/test_kernel_methodir.jl" = "1aa1a6a9501d4525031f7ea8166bf3e6bf29ce8bd85b23a18e101b2d929961f7"
+"benchmark/sampler_transpiler/indexed_array_probe.jl" = "a746173df251cb14f6b628a3142337ca15458fc486e1afe6e2caf1d7ba4f06bd"
+"src/kernel_factory.jl" = "6cd1cc5e3715d420a4d06983d361a2597c3a2f243f88e21fbcd5eb2fda4e65b1"
+"benchmark/sampler_transpiler/runtime_keyword_probe.jl" = "fcdff23cfaabf5616dbc339653b660117ed4e96ae8c844382196631bc3bf6f08"
+"benchmark/sampler_transpiler/counter_ablation.jl" = "1d459d0f9ee8c3741d13659be69724d3a924698c6bdf036b7f825b66a952a0f5"
+"benchmark/sampler_transpiler/partial_transfer_probe.jl" = "190c2a9d23a7b438a03ad41fb3c8fca5e116a89cc49273153bdbf25028da1552"
+"benchmark/sampler_transpiler/position_multinomial_hmc_kernel.jl" = "25c1328145e517c7b53dfc0b0e4d51aa5fc8f08e984e429da36412da5d06d0fe"
+"benchmark/sampler_transpiler/multinomial_scaling.jl" = "eefe6b222e9327f09ebc11aab9fe7551f04276f545ff22ccfa492a72718f86da"
+"benchmark/sampler_transpiler/position_multinomial_scaling.jl" = "27955460892188a89d71bec0efe6c5e06f5e822d45b66ebb788a41f47ea25bf3"
+"ext/ReactiveKernelsReactantExt/traced_compile_options.jl" = "19b055a5cb2579857a7b76423c6d677dfee52cb02d82e09d3632b9496752a82a"
+"benchmark/sampler_transpiler/cpu_loop_packing.jl" = "0fc63923111bcb8e037d2ecdc01d9a7a88dfde26d86d5d59e3bac5bbee7b5a8b"
