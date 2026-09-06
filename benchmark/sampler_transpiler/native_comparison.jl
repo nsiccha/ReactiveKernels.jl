@@ -87,7 +87,7 @@ function run_prepared_comparison(prepared,comparator,L,n)
     (; prepared,comparator)
 end
 
-function build_fast_prototype(; compiler_options=NamedTuple())
+function build_fast_prototype(; compiler_options=NamedTuple(), source_options=NamedTuple(), L=4)
     density,ad,q=measured(build_density,"prepare_model")
     potential,gradient=CallbackHandle(Potential(density)),CallbackHandle(Gradient(ad))
     endpoint_inputs=(potential,gradient,Diagonal(ones(length(q))),q,zeros(length(q)))
@@ -96,7 +96,8 @@ function build_fast_prototype(; compiler_options=NamedTuple())
     end
     parent=measured("prepare_native_factory") do
         fast_native_factory(H.hmc_state,NativePoint(endpoint);
-            n_steps=4,step_f=RK.partial(F.leapfrog!;stepsize=0.03),stats_f=nothing)
+            n_steps=L,step_f=RK.partial(F.leapfrog!;stepsize=0.03),stats_f=nothing,
+            source_options...)
     end
     program=measured("lower_fast_native") do
         compile_native_slots(parent.kernel,parent.state,:step!;
@@ -106,6 +107,6 @@ function build_fast_prototype(; compiler_options=NamedTuple())
     println("children=",names)
     names==(:init,:fwd) || error("benchmark expects init then fwd")
     seed=deepcopy(program.contexts[2].owned)
-    comparator=build_ahmc_comparator((;density,ad,q,L=4))
-    (; prepared=(;program,seed),comparator)
+    comparator=build_ahmc_comparator((;density,ad,q,L))
+    (; prepared=(;program,seed),comparator,L)
 end

@@ -256,17 +256,21 @@ include("traced_slots.jl")
 include("traced_comparison.jl")
 
 function main(args=ARGS)
-    length(args) <= 2 || error("usage: hmc_eight_schools.jl [native|native-slots|compare|reactant|ahmc] [batch_length]")
+    length(args) <= 3 || error("usage: hmc_eight_schools.jl [native|native-slots|compare|reactant|reactant-slots|ahmc] [batch_length] [leapfrog_steps]")
     backend = isempty(args) ? :native_slots : Symbol(replace(first(args), '-' => '_'))
-    n = length(args) == 2 ? parse(Int, args[2]) : 100
+    n = length(args) >= 2 ? parse(Int, args[2]) : 100
+    L = length(args) == 3 ? parse(Int,args[3]) : 4
     n > 0 || error("batch length must be positive")
+    L > 0 || error("leapfrog count must be positive")
     backend in (:native, :native_slots, :compare, :reactant, :reactant_slots, :ahmc) || error("unknown backend")
+    length(args)==3 && !(backend in (:native_slots,:compare,:reactant_slots)) &&
+        error("leapfrog count is configurable in the slot-based modes")
     backend === :ahmc && return run_ahmc(; n)
-    backend === :reactant_slots && return run_traced_comparison(build_fast_prototype();n)
+    backend === :reactant_slots && return run_traced_comparison(build_fast_prototype(;L);n)
     if backend in (:native_slots,:compare)
-        prototype=build_fast_prototype()
+        prototype=build_fast_prototype(;L)
         return run_prepared_comparison(prototype.prepared,
-            backend===:compare ? prototype.comparator : nothing,4,n)
+            backend===:compare ? prototype.comparator : nothing,L,n)
     end
     prototype = build_prototype(backend)
     backend === :native ? run_native(prototype; n) : run_reactant(prototype; n)

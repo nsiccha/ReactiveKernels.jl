@@ -13,12 +13,17 @@ julia benchmark/sampler_transpiler/setup.jl
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/hmc_eight_schools.jl compare 1000
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/hmc_eight_schools.jl native-slots 1000
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/hmc_eight_schools.jl reactant-slots 1000
+julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/hmc_eight_schools.jl reactant-slots 1000 16
+julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/loop_control_probe.jl
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/hmc_eight_schools.jl reactant
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/hmc_eight_schools.jl ahmc
 ```
 
 Append a positive batch length to any command, for example `reactant 1000`
-and `ahmc 1000`, to compare the same number of chained transitions.
+and `ahmc 1000`, to compare the same number of chained transitions. The
+`compare`, `native-slots`, and `reactant-slots` commands also accept a final
+positive leapfrog count; the default is four. The comparison always uses that
+same count for AdvancedHMC.
 
 The environment pins Reactant 0.2.284 and Enzyme 0.13.199 and develops the local
 compiler, distribution kernels, and PPL example packages. Setup creates a local
@@ -61,9 +66,13 @@ turns numerical slots into local variables, derives explicit branch inputs and
 outputs by backward liveness, and proves cache-validity facts across construction
 and every possible transition exit. Only proven facts replace runtime checks.
 Prepared gradient calls stage AD inside the enclosing Reactant compilation.
-Fixed compiler metadata stays outside the numerical state. The pilot expands
-fixed integer loops of at most eight iterations; larger or dynamic loops are
-outside this backend's current support. The batch driver uses a traced loop.
+Fixed compiler metadata stays outside the numerical state. Preparation-fixed
+integer ranges retain one traced loop body, with explicit live values carried
+between iterations and an authored early return terminating the loop. Cache
+facts account for loop entry, the backedge, and zero-trip execution. Dynamic
+ranges remain outside this backend's support. The batch driver also uses a
+traced loop. The optional `unroll_limit` compiler keyword permits bounded loop
+expansion for ablation; the default retains every nonempty loop.
 
 This command interleaves synchronized Reactant execution with AdvancedHMC.
 Every sample constructs fresh device inputs outside timing, because this
@@ -77,9 +86,24 @@ executing 4,000 leapfrog steps. AdvancedHMC's strongest batch in that run takes
 Reactant throughput win remains open. The receipt separates model preparation,
 native preparation, backend lowering, compilation, and first execution.
 
+`reactant-slots-v2.toml` records retained-loop runs in two fresh processes.
+Four and sixteen steps both compile in about 40 seconds; their IR sizes are
+29,126 and 29,127 bytes. Four-step batches take 2.59–3.35 ms per 1,000
+transitions, and sixteen-step batches take 6.94–9.46 ms. Every batch executes
+the requested number of integrator calls. AdvancedHMC's strongest samples are
+2.05 and 7.31 ms, respectively. This removes the previous small-loop limit
+without code growth proportional to the trip count; a clear Reactant
+throughput win remains open.
+
 All modes use centered Eight Schools, ten Float64 parameters, a unit diagonal
-metric, step size 0.03, and four leapfrog steps. This is endpoint-Metropolis HMC;
+metric, and step size 0.03. Four leapfrog steps are the default. This is endpoint-Metropolis HMC;
 multinomial HMC and NUTS remain subsequent work.
+
+`loop_control_probe.jl` checks the same authored HMC source with zero steps and
+with a divergence threshold that forces its early return. Each backend must
+execute the expected number of integrator calls and leave the initial position
+unchanged. These are source-control invariants, without comparing random
+trajectories or floating-point computations between implementations.
 
 `compare` interleaves the new native program with AdvancedHMC using the same
 prepared RK model and gradient, initial point, and integration settings.

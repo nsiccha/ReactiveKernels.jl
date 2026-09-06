@@ -20,7 +20,7 @@ end
 end
 slot_lmul!(factor,destination)=lmul!(factor,destination)
 
-function compile_traced_slots(program; static_currentness=true)
+function compile_traced_slots(program; static_currentness=true, unroll_limit=0)
     contextmap = Dict(Symbol(c.prefix, :_owned)=>c for c in program.contexts)
     sharedmap = Dict(Symbol(c.prefix, :_shared)=>c.shared for c in program.contexts)
     handlemap = Dict(Symbol(c.prefix, :_handles)=>program.resources[i]
@@ -184,7 +184,9 @@ function compile_traced_slots(program; static_currentness=true)
             static_range = iterator isa Expr && iterator.head===:call &&
                 iterator.args[1]===:getfield && iterator.args[2]==:(metadata.values) ?
                 statics[iterator.args[3]] : nothing
-            if static_range isa AbstractRange{<:Integer} && length(static_range)<=8
+            static_range isa AbstractRange{<:Integer} ||
+                error("traced slots: expected a preparation-fixed integer range")
+            if length(static_range)<=unroll_limit
                 returns=false
                 for item in static_range
                     unrolled=Any[:($(binding.args[1])=$item)]
@@ -195,9 +197,8 @@ function compile_traced_slots(program; static_currentness=true)
             end
             nested=Any[]
             returns=blockstatements(x.args[2],nested,live)
-            loop_body=Expr(:block,nested...)
-            returns && (loop_body=Expr(:block,Expr(:if,live,loop_body)))
-            push!(out,Expr(:for,Expr(:(=),binding.args[1],iterator),loop_body))
+            push!(out,Expr(:for,Expr(:(=),binding.args[1],QuoteNode(static_range)),
+                Expr(:block,nested...),returns ? live : nothing))
             return returns
         elseif x.head===:(=)
             rhs=value(x.args[2],out,live)
@@ -228,6 +229,14 @@ function compile_traced_slots(program; static_currentness=true)
     function join_facts(a,b)
         Dict(k=>v for (k,v) in a if haskey(b,k) && b[k]===v)
     end
+    function assume_bool!(facts,condition,truth)
+        if condition isa Symbol
+            facts[condition]=truth
+        elseif condition isa Expr && condition.head===:call && callee(condition.args[1],:!)
+            assume_bool!(facts,condition.args[2],!truth)
+        end
+        facts
+    end
     function specialize_bools(x,facts)
         x isa Symbol && return get(facts,x,x)
         x isa Expr || return x
@@ -240,11 +249,31 @@ function compile_traced_slots(program; static_currentness=true)
                 return specialize_bools(selected,facts)
             end
             yes_facts,no_facts=copy(facts),copy(facts)
+            assume_bool!(yes_facts,x.args[1],true)
+            assume_bool!(no_facts,x.args[1],false)
             yes=specialize_bools(x.args[2],yes_facts)
             no=specialize_bools(length(x.args)==3 ? x.args[3] : Expr(:block),no_facts)
             merged=join_facts(yes_facts,no_facts)
             empty!(facts);merge!(facts,merged)
             return Expr(:if,x.args[1],yes,no)
+        elseif x.head===:for
+            incoming=copy(facts)
+            invariant=copy(incoming)
+            while true
+                after=copy(invariant)
+                delete!(after,x.args[1].args[1])
+                specialize_bools(x.args[2],after)
+                next=join_facts(incoming,after)
+                next==invariant && break
+                invariant=next
+            end
+            after=copy(invariant)
+            loop_body=specialize_bools(x.args[2],after)
+            # Include zero-trip and early-exit paths. Losing a fact keeps its
+            # runtime validity bit; it never authorizes a stale cache read.
+            merged=join_facts(incoming,after)
+            empty!(facts);merge!(facts,merged)
+            return Expr(:for,x.args[1],loop_body,x.args[3])
         elseif x.head===:(=) && x.args[1] isa Symbol
             original=x.args[2]
             known=boolvalue(original,facts)
@@ -337,7 +366,31 @@ function compile_traced_slots(program; static_currentness=true)
             needed=union(setdiff(live_after,Set([x.args[1]])),references(x.args[2]))
             return x,needed
         elseif x.head===:for
-            error("traced slots: this pilot supports only small fixed loops")
+            induction=x.args[1].args[1]
+            range=x.args[1].args[2].value
+            stop=x.args[3]
+            carried=copy(live_after)
+            stop===nothing || push!(carried,stop)
+            loop_code=nothing
+            while true
+                loop_code,read_before=control_block(x.args[2],carried)
+                next=union(carried,setdiff(read_before,Set([induction])))
+                next==carried && break
+                carried=next
+            end
+            names=sort!(collect(carried))
+            tuple_argument=fresh(:loop_args)
+            index_argument=fresh(:loop_index)
+            locals=sort!(collect(union(carried,assignments(loop_code),Set([induction]))))
+            bindings=Any[Expr(:local,name) for name in locals]
+            append!(bindings,[:($name=getfield($tuple_argument,$i)) for (i,name) in enumerate(names)])
+            push!(bindings,:($induction=$index_argument))
+            fn=Expr(:->,Expr(:tuple,tuple_argument,index_argument),
+                Expr(:block,bindings...,loop_code,Expr(:tuple,names...)))
+            stop_index=stop===nothing ? 0 : findfirst(==(stop),names)
+            descriptor=Expr(:call,SlotLoop,fn,QuoteNode(range),:(Val($stop_index)))
+            invocation=Expr(:call,run_slot_loop,descriptor,Expr(:tuple,names...))
+            return Expr(:(=),Expr(:tuple,names...),invocation),carried
         end
         x,union(live_after,references(x))
     end
@@ -361,6 +414,34 @@ function compile_traced_slots(program; static_currentness=true)
     expanded=macroexpand(@__MODULE__,clone_ast(expression))
     (;f=Core.eval(@__MODULE__,expanded),expression,expanded,metadata=SlotStatic(Tuple(statics)),
       state=(;values,current=masks),ordered,entry_facts)
+end
+
+struct SlotLoop{F,R,S}
+    body::F
+    range::R
+end
+SlotLoop(body,range,::Val{S}) where {S}=SlotLoop{typeof(body),typeof(range),S}(body,range)
+Reactant.make_tracer(seen, previous::SlotLoop, path, mode; kwargs...) = previous
+Reactant.traced_type_inner(::Type{T}, seen, mode::Reactant.TraceMode,
+    track_numbers::Type, ndevices, runtime) where {T<:SlotLoop} = T
+slot_loop_live(::SlotLoop{F,R,0},state) where {F,R}=true
+slot_loop_live(::SlotLoop{F,R,S},state) where {F,R,S}=getfield(state,S)
+slot_loop_scalar(value)=value
+# Julia scalar assignment copies a value. Reactant numbers are mutable trace
+# wrappers, so separate logical slots need independent wrappers at a while
+# boundary even when their current SSA value is identical. copy emits no
+# arithmetic or array copy; mutable array aliases remain unchanged.
+slot_loop_scalar(value::Reactant.TracedRNumber)=copy(value)
+slot_loop_scalar(value::T) where {T<:Number}=
+    Reactant.promote_to(Reactant.TracedRNumber{T},value)
+function run_slot_loop(loop,state)
+    state=map(slot_loop_scalar,state)
+    counter=0
+    Reactant.@trace while (counter<length(loop.range)) & slot_loop_live(loop,state)
+        state=map(slot_loop_scalar,loop.body(state,first(loop.range)+counter*step(loop.range)))
+        counter+=1
+    end
+    state
 end
 
 function traced_slot_batch(program,state,seed,counts,n)

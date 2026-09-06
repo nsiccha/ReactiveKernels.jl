@@ -4,18 +4,18 @@ function traced_slot_inputs(template)
      Reactant.to_rarray((0,0);track_numbers=true))
 end
 
-function run_traced_comparison(prototype; n=1000)
+function run_traced_comparison(prototype; n=1000, compiler_options=NamedTuple())
     reset_native_slots!(prototype.prepared)
     program=measured("lower_traced_slots") do
-        compile_traced_slots(prototype.prepared.program)
+        compile_traced_slots(prototype.prepared.program;compiler_options...)
     end
     println("proven_currentness_facts=",length(program.entry_facts))
     # This experimental backend emits ordinary Julia functions containing
     # branch closures. Cross their construction world once, outside timing.
-    Base.invokelatest(run_traced_prepared,program,prototype.comparator,n)
+    Base.invokelatest(run_traced_prepared,program,prototype.comparator,n,prototype.L)
 end
 
-function run_traced_prepared(program,comparator,n)
+function run_traced_prepared(program,comparator,n,L)
     call=TracedSlotCall(program.f,program.metadata)
     driver=(state,seed,counts)->traced_slot_batch(call,state,seed,counts,n)
     inputs=traced_slot_inputs(program.state)
@@ -37,7 +37,7 @@ function run_traced_prepared(program,comparator,n)
         end
         steps=Int(result.counts[1])
         println("integration_steps=",steps)
-        steps==4*n || error("shortened traced workload")
+        steps==L*n || error("shortened traced workload")
         for value in result.state.values
             value isa Reactant.AbstractConcreteArray || continue
             all(isfinite,Array(value)) || error("nonfinite traced vector")
