@@ -20,10 +20,12 @@ available, and a faster/slower interpretation beside each plot.
 ## Scalar families
 
 The matched comparison covers Cauchy, Laplace, Bernoulli, LogNormal,
-Exponential, Geometric, and Uniform measures from Distributions,
-ProbabilityMeasures, and the generic ReactiveKernels `plate` generated from the
-public objects. Parameters are traced runtime inputs; compilation and transfers
-are excluded from execution timings.
+Exponential, Geometric, Uniform, Poisson, Gamma, Beta, and Binomial measures
+against the generic ReactiveKernels `plate` generated from the public objects.
+Distributions covers every family; ProbabilityMeasures covers all but Gamma and
+Beta, whose comparator cells stay blank rather than showing a substitute.
+Parameters are traced runtime inputs; compilation and transfers are excluded
+from execution timings.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_scalar_gallery_benchmarks()
