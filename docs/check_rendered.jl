@@ -309,6 +309,8 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "eight-schools.md" => 1,
         "sum-to-zero.md" => 1,
         "linear-regression.md" => 1,
+        "mvnormal-regression.md" => 1,
+        "bound-regression.md" => 1,
         "beta-binomial.md" => 1,
         "poisson-gamma.md" => 1,
         "dugongs-growth.md" => 1,
