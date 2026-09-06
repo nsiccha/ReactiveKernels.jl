@@ -78,6 +78,14 @@ generated_kernel = prepare(model;
 predicted = generated_kernel(parameters, 20.0)
 ```
 
+## Reactant
+
+The exact authored graph compiles and executes through the public Reactant
+boundary with value parity — `test/test_ppl_examples_reactant.jl` `@compile`s the
+density kernel and asserts the compiled result matches the native evaluation. The
+nonlinear mean `α − β·λ^age`, the authored likelihood plate, and the reused
+`normal`/`uniform`/`gamma` endpoints all lower cleanly.
+
 Run the walkthrough from the repository root:
 
 ```sh

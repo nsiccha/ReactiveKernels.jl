@@ -84,6 +84,14 @@ generated_kernel = prepare(model;
 responsibility = generated_kernel(parameters, 2.5)
 ```
 
+## Reactant
+
+The exact authored graph compiles and executes through the public Reactant
+boundary with value parity — `test/test_ppl_examples_reactant.jl` `@compile`s the
+density kernel and asserts the compiled result matches the native evaluation. The
+marginalized `logaddexp` mixture plate over the two reused `normal` component
+endpoints, and the `beta` mixing prior, lower cleanly with no opaque operation.
+
 Run the walkthrough from the repository root:
 
 ```sh

@@ -69,6 +69,15 @@ precision_kernel = prepare(model;
 Supplying a covariance that is not positive definite fails the internal Cholesky
 with a `PosDefException` rather than returning a silently wrong density.
 
+## Reactant
+
+The exact authored graph compiles and executes through the public Reactant
+boundary with value parity, for **every** parametrization —
+`test/test_ppl_examples_reactant.jl` `@compile`s the density kernel through the
+covariance, Cholesky, precision, and precision-Cholesky HAVE routes and asserts
+each compiled result matches its native evaluation. The `mvnormal` object's
+Cholesky factorizations and triangular solves lower through XLA.
+
 Run the walkthrough — it prints the density through three parametrizations — from
 the repository root:
 

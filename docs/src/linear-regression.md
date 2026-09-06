@@ -86,7 +86,7 @@ same prepared kernel without hiding an effect from the planner.
 ## Reactant
 
 The exact authored graph compiles and executes through the public Reactant
-boundary with no model-specific lowering path. `test/test_linear_regression_reactant.jl`
+boundary with no model-specific lowering path. `test/test_ppl_examples_reactant.jl`
 converts the packed unconstrained boundary to Reactant arrays, `@compile`s the
 prepared density kernel, and asserts the compiled result matches the native
 evaluation. The small static likelihood plate lowers as per-lane scalar recipes

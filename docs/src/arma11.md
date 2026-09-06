@@ -75,6 +75,19 @@ forecast_kernel = prepare(model;
 forecast = forecast_kernel(parameters, series)
 ```
 
+## Reactant — native only
+
+Unlike the other PPL examples, this model does **not** lower through Reactant.
+The one-step error recursion reads `series[t-1]` and `err[t-1]` element by
+element, and XLA disallows scalar indexing of a traced array, so the density
+compiles and runs natively but its `@compile` through Reactant fails on that
+scalar indexing. This is inherent to the sequential scan — lowering it would
+require an explicit `while_loop`/scan rather than per-step scalar indexing — not
+a defect in the authored graph. `test/test_ppl_examples_reactant.jl` records this
+as an explicit tested diagnostic (the compile is asserted to throw) rather than
+silently skipping it; the pointwise/likelihood plate and the priors are ordinary
+lowerable graph nodes, only the recursion is not.
+
 Run the walkthrough from the repository root:
 
 ```sh

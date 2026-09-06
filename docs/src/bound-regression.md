@@ -57,6 +57,14 @@ pre-pass — the same mechanism `prepare`, `prepare_ad`, and the Reactant bounda
 all consume — not a regression-specific shortcut: any subgraph that reads only
 bound ports is hoisted, whatever the model.
 
+## Reactant
+
+Both the plain and the `bound` kernels compile and execute through the public
+Reactant boundary with value parity — `test/test_ppl_examples_reactant.jl`
+`@compile`s each and asserts the compiled result matches native. The bound
+kernel's hoisted standardized design matrix re-enters the compiled program as a
+constant, exactly as it does natively.
+
 Run the walkthrough — it prints the plain and bound kernels' input signatures and
 densities — from the repository root:
 

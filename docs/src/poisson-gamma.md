@@ -75,6 +75,15 @@ generated_kernel = prepare(model;
 expected = generated_kernel(parameters, 4.0)
 ```
 
+## Reactant
+
+The exact authored graph compiles and executes through the public Reactant
+boundary with value parity — `test/test_ppl_examples_reactant.jl` `@compile`s the
+density kernel and asserts the compiled result matches the native evaluation. The
+reused `gamma` and `poisson` `.logpdf` endpoints lower cleanly; their
+`SpecialFunctions` log-normalizers are data-only constants folded at compile
+time.
+
 Run the walkthrough from the repository root:
 
 ```sh
