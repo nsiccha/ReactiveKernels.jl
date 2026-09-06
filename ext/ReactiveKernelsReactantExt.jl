@@ -829,6 +829,24 @@ end
     Reactant.@allowscalar array[index[]]
 end
 
+# A CONCRETE-integer scalar index `q[i]` on a traced vector cannot lower:
+# `getindex(::TracedRArray, ::Int)` hits Reactant's scalar-indexing ban (the
+# unrolled/authored scalar read the arma11 snag documented).  When it feeds
+# arithmetic/a reduction — the parameter-access case — normalize it in the
+# `@kernel` tensorized lowering to the value-identical 1-element reduction
+# `sum(view(v, i:i))`, which lowers cleanly (this is exactly the friendly form
+# the Reactant benchmark authored by hand).  RK-macro-only per decision
+# `17bnc6t`; Reactant untouched.  This is value-exact for a real vector, so it
+# never silently mis-lowers; a genuine scalar readback that must drive control
+# flow (or index another array) then surfaces as Reactant's own loud traced
+# error on the returned `TracedRNumber`, never a silent paper-over.  Scoped to a
+# 1-D traced vector with a single concrete integer index; every other shape
+# keeps the core fallback.
+@inline function ReactiveKernels._tensorized_getindex(
+        array::Reactant.TracedRArray{T,1}, index::Integer) where {T}
+    sum(view(array, index:index))
+end
+
 @inline function ReactiveKernels._tensorized_getindex(
         array::SubArray{T,N,P}, indices...) where
         {T,N,P<:Reactant.TracedRArray}
