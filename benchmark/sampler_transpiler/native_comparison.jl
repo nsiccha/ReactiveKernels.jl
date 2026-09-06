@@ -19,15 +19,20 @@ end
 function reset_native_slots!(prepared)
     RK._canon_copy_endpoint!(prepared.program.contexts[2].owned,prepared.seed)
     RK._canon_copy_endpoint!(prepared.program.contexts[3].owned,prepared.seed)
-    prepared.program.counts[1]=0
+    fill!(prepared.program.counts,0)
     Xoshiro(91)
 end
 
-function build_ahmc_comparator(prototype)
+function build_ahmc_comparator(prototype; callback_handles=true)
     density,ad=prototype.density,prototype.ad
+    potential=q->density(q)
+    gradient=q->RK.ad_value_and_gradient(ad,q)
+    if callback_handles
+        potential,gradient=CallbackHandle(potential),CallbackHandle(gradient)
+    end
     hamiltonian=AdvancedHMC.Hamiltonian(
         AdvancedHMC.DiagEuclideanMetric(length(prototype.q)),
-        q->density(q),q->RK.ad_value_and_gradient(ad,q))
+        potential,gradient)
     kernel=AdvancedHMC.HMCKernel(AdvancedHMC.Trajectory{AdvancedHMC.EndPointTS}(
         AdvancedHMC.Leapfrog(0.03),AdvancedHMC.FixedNSteps(prototype.L)))
     hamiltonian,initial=AdvancedHMC.sample_init(Xoshiro(91),hamiltonian,prototype.q)
@@ -80,4 +85,27 @@ function run_prepared_comparison(prepared,comparator,L,n)
     end
     println("native_position=",native_position(program));flush(stdout)
     (; prepared,comparator)
+end
+
+function build_fast_prototype(; compiler_options=NamedTuple())
+    density,ad,q=measured(build_density,"prepare_model")
+    potential,gradient=CallbackHandle(Potential(density)),CallbackHandle(Gradient(ad))
+    endpoint_inputs=(potential,gradient,Diagonal(ones(length(q))),q,zeros(length(q)))
+    endpoint=measured("prepare_native_endpoint") do
+        native_endpoint(F.euclidean_phasepoint,F.leapfrog!,endpoint_inputs)
+    end
+    parent=measured("prepare_native_factory") do
+        fast_native_factory(H.hmc_state,NativePoint(endpoint);
+            n_steps=4,step_f=RK.partial(F.leapfrog!;stepsize=0.03),stats_f=nothing)
+    end
+    program=measured("lower_fast_native") do
+        compile_native_slots(parent.kernel,parent.state,:step!;
+            endpoints=parent.endpoints,effects=parent.effects,compiler_options...)
+    end
+    names=keys(parent.endpoints)
+    println("children=",names)
+    names==(:init,:fwd) || error("benchmark expects init then fwd")
+    seed=deepcopy(program.contexts[2].owned)
+    comparator=build_ahmc_comparator((;density,ad,q,L=4))
+    (; prepared=(;program,seed),comparator)
 end

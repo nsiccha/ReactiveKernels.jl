@@ -965,7 +965,7 @@ end
                 port = :(getfield(getfield(bindings, :fields), $(QuoteNode(name))))
                 return :(_sm_finite_structural_logical_copy(
                     $port, cvals[$index]))
-            elseif descriptor_type <: Union{_PureCallablePort,_EffectCallablePort}
+            elseif descriptor_type <: Union{_PureCallablePort,_EffectCallablePort,_KernelRegistration}
                 return :(cvals[$index])
             end
         end

@@ -43,6 +43,13 @@ do not retain that vector. This prototype emitter is in `native_slots.jl`; it
 contains no sampler-name or model-name cases. Unsupported expression/control
 forms fail during preparation.
 
+The native factory constructs these stores directly from the captured constructor
+and bound callable sources. Consecutive transfers of all authoritative fields
+between matching endpoint layouts also transfer valid derived caches. This
+removes an unnecessary gradient evaluation at the start of each HMC transition:
+the diagnostic run performs 4,000 gradients for 4,000 leapfrog steps across 1,000
+transitions. Disabling this generic transfer optimization takes 5,000 gradients.
+
 The program owns its stores and fixed compiler metadata for its entire lifetime.
 Its private stores and constants are not an API for external mutation. The
 source's known aliases and destination-preserving copies remain part of the
@@ -54,8 +61,18 @@ multinomial HMC and NUTS remain subsequent work.
 
 `compare` interleaves the new native program with AdvancedHMC using the same
 prepared RK model and gradient, initial point, and integration settings.
+Both implementations use the same small callback-handle representation.
 Construction and resets occur outside warm timing. It reports actual integrator
 calls to make a shortened trajectory visible in the benchmark.
+
+The second native checkpoint (`native-first-v2.toml`) records all seven samples:
+native execution takes 1.44–1.50 ms per 1,000 transitions, with 752 allocated
+bytes per batch. AdvancedHMC's strongest batches take about 2.04–2.07 ms; slower
+and GC-affected batches are retained in the receipt. Native endpoint preparation,
+factory construction, and source emission together take about 16.7 seconds in
+that fresh process, plus model preparation and first-call compilation. These
+stage timings are measurements of this prototype, not an isolated comparison
+of Julia compilation costs.
 
 The earlier functional native path remains available as `native`. `reactant`
 currently compiles a driver around that functional path; it has not yet adopted

@@ -250,6 +250,7 @@ function run_ahmc(; n=100)
 end
 
 include("native_slots.jl")
+include("native_slots_factory.jl")
 include("native_comparison.jl")
 
 function main(args=ARGS)
@@ -260,8 +261,9 @@ function main(args=ARGS)
     backend in (:native, :native_slots, :compare, :reactant, :ahmc) || error("unknown backend")
     backend === :ahmc && return run_ahmc(; n)
     if backend in (:native_slots,:compare)
-        prototype=build_prototype(:native_slots)
-        return run_native_comparison(prototype; n, compare=backend===:compare)
+        prototype=build_fast_prototype()
+        return run_prepared_comparison(prototype.prepared,
+            backend===:compare ? prototype.comparator : nothing,4,n)
     end
     prototype = build_prototype(backend)
     backend === :native ? run_native(prototype; n) : run_reactant(prototype; n)

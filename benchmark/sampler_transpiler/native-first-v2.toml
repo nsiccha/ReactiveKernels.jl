@@ -1,0 +1,53 @@
+schema_version = 2
+status = "experimental_native_checkpoint"
+parent_commit = "3e64a3ca2ea8446263d66b2c395e160168df5be9"
+host = "strato2"
+julia = "1.10.11"
+ahmc = "0.8.6"
+command = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/hmc_eight_schools.jl compare 1000"
+exit_code = 0
+process_elapsed_seconds = 68
+model = "centered_eight_schools"
+dimensions = 10
+metric = "unit_diagonal"
+stepsize = 0.03
+leapfrog_steps = 4
+transitions_per_batch = 1000
+native_integration_steps_per_batch = 4000
+note = "Same prepared RK density and gradient, callback handles on both implementations, resets outside timing. AHMC samples vary substantially; retain all samples and use its strongest roughly 2 us/transition batches when assessing the native result. Reactant has not adopted this slot-based program. Preparation stages are not a complete isolated compilation comparison."
+
+[native_slots]
+batch_seconds = [0.001498557, 0.001467043, 0.001452653, 0.001448829, 0.001458391, 0.00143571, 0.001453835]
+batch_allocated_bytes = [752, 752, 752, 752, 752, 752, 752]
+
+[ahmc]
+batch_seconds = [0.010573971, 0.002068824, 0.002042396, 0.00218911, 0.002568651, 0.004988659, 0.010497225]
+batch_allocated_bytes = [7207472, 7200224, 7200224, 7200224, 7200224, 7200224, 7200224]
+
+[preparation]
+prepare_model_seconds = 4.048245714
+prepare_model_bytes = 233025488
+prepare_native_endpoint_seconds = 7.728430691
+prepare_native_endpoint_bytes = 851089512
+prepare_native_factory_seconds = 5.080270374
+prepare_native_factory_bytes = 421212648
+lower_fast_native_seconds = 3.89112842
+lower_fast_native_bytes = 301706096
+native_slots_first_chain_seconds = 0.838682462
+native_slots_first_chain_bytes = 42930056
+
+[diagnostic_ablation]
+note = "Separate instrumented warm-process executions; gradient counter disabled in the main timing above."
+transitions = 1000
+integration_steps = 4000
+gradient_calls_coalescing_enabled = 4000
+gradient_calls_coalescing_disabled = 5000
+
+[source_sha256]
+"src/kernel_adaptation.jl" = "d655baa036d4e5770b769ab644b8c56ca0567c167d3643011352131e9928a5c4"
+"benchmark/sampler_transpiler/hmc_eight_schools.jl" = "62902f4e3cd1c0e8ea4198ae8195f285043a87770e4ec1ae77007226312cdf6b"
+"benchmark/sampler_transpiler/native_slots.jl" = "53ea0ef2c304c1d299dac3570ba4ac8e14a4322a5b5fc5ddad9d2581516f1020"
+"benchmark/sampler_transpiler/native_slots_factory.jl" = "25cb2567c2a932d6a7418584dff9d00032e917ab0365350dfb908d67d1206a17"
+"benchmark/sampler_transpiler/native_comparison.jl" = "3a762acfacf99a1d105ef0770cf85c4c9c041399801786dc3496622a1a9768f7"
+"benchmark/reactivehmc_hmc_kernel_fixture_b.jl" = "9ffa4e8e2990992cd92303e55a6d005cff2c6e1698de6bca7941ad2907f8a4da"
+"benchmark/nuts_kernel_authoring_fixture_b.jl" = "7a9a9d6e1fa122e3d846def760933b0ba14e62e567d92cffab9d9d638f9404f4"
