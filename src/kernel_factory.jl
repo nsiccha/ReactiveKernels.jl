@@ -1708,9 +1708,9 @@ function _validate_binder!(name::Symbol, v, source; runtime_keywords=())
     end
     nothing
 end
-function _prepare_callable(name::Symbol, v)
+function _prepare_callable(name::Symbol, v; runtime_keywords=())
     reg = _kernel_resolve_callable_or_reject(name, v)   # rejects opaque; the resolved registration is the
-    _validate_binder!(name, v, reg.source)               #   detached identity poc consumes (no reread)
+    _validate_binder!(name, v, reg.source; runtime_keywords) # detached identity, no reread
     _PreparedCallable(reg, _kernel_binder_kwargs(v))
 end
 

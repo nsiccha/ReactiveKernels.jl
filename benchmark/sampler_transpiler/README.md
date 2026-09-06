@@ -214,6 +214,16 @@ that point, and uses streaming Hamiltonian-weighted selection. Its two bound
 integrator calls use the existing captured `leapfrog!` with opposite step sizes.
 No sampler logic is implemented in a backend replacement.
 
+Captured helper calls can also pass runtime keyword controls, such as
+`step_f(work; stepsize=direction)`, to an unbound captured `leapfrog!`.
+Preparation validates every call site independently. Keyword expressions are
+evaluated once in caller order before the helper body is inlined. A control
+cannot be both bound and supplied at runtime; keyword splats and implicitly
+omitted helper defaults are not admitted by this internal compiler. Supply
+each helper keyword explicitly, either through its binder or at the call site.
+`runtime_keyword_probe.jl` checks evaluation order, per-site rejection and
+native/Reactant execution independently of the sampler.
+
 [`multinomial_eight_schools.jl`](multinomial_eight_schools.jl) measures 1,000
 consecutive transitions, seven interleaved samples, using the same model,
 callbacks, metric, step size and leapfrog count as `AdvancedHMC.MultinomialTS`.

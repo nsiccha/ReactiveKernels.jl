@@ -2,7 +2,9 @@ include(joinpath(@__DIR__,"hmc_eight_schools.jl"))
 include(joinpath(@__DIR__,"multinomial_hmc_kernel.jl"))
 
 function build_multinomial_prototype(; L=4, compiler_options=NamedTuple(),
-        source=MultinomialHMCAuthoring.multinomial_hmc_state)
+        source=MultinomialHMCAuthoring.multinomial_hmc_state,
+        source_controls=(step_fwd=RK.partial(F.leapfrog!;stepsize=0.03),
+                         step_bwd=RK.partial(F.leapfrog!;stepsize=-0.03)))
     density,ad,q=measured(build_density,"prepare_model")
     potential,gradient=CallbackHandle(Potential(density)),CallbackHandle(Gradient(ad))
     endpoint_inputs=(potential,gradient,Diagonal(ones(length(q))),q,zeros(length(q)))
@@ -11,8 +13,7 @@ function build_multinomial_prototype(; L=4, compiler_options=NamedTuple(),
     end
     parent=measured("prepare_multinomial_factory") do
         fast_native_factory(source,NativePoint(endpoint);
-            n_steps=L,step_fwd=RK.partial(F.leapfrog!;stepsize=0.03),
-            step_bwd=RK.partial(F.leapfrog!;stepsize=-0.03))
+            n_steps=L,source_controls...)
     end
     program=measured("lower_multinomial_native") do
         compile_native_slots(parent.kernel,parent.state,:step!;

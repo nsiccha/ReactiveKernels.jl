@@ -390,7 +390,19 @@ function compile_native_slots(kernel, state, name; endpoints, effects, hoist=tru
                             node isa RK._Return && error("native slots: nonterminal free-method return needs call-local control")
                         end
                     end
-                    push!(out,emit(effect_body,child,Dict{Symbol,Any}(),Dict{Symbol,Any}(pairs(binding.controls))))
+                    controls=Dict{Symbol,Any}(pairs(binding.controls))
+                    # Evaluate keyword actuals once, in caller order, before
+                    # entering the inlined captured helper body.
+                    for (key,actual) in call.kw
+                        key === RK._KMIR_KWSPLAT && error("native slots: callable keyword splat")
+                        haskey(controls,key) && error("native slots: duplicate or bound runtime control")
+                        symbol=fresh(key)
+                        push!(out,:(local $symbol = $(rhs(actual,context,locals,formals))))
+                        controls[key]=symbol
+                    end
+                    Set(keys(controls))==Set(formal.name for formal in ir.formals) ||
+                        error("native slots: supply every captured helper keyword explicitly")
+                    push!(out,emit(effect_body,child,Dict{Symbol,Any}(),controls))
                     push!(out,:(counts[1] += 1))
                 elseif get(fields,field,:unknown) === nothing
                     # Authored optional observer has the captured no-effect binding.

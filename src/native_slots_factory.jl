@@ -31,13 +31,35 @@ function fast_native_factory(skeleton,args...;kwargs...)
     values=RK._kernel_signature_invoke(RK._KernelSignatureCallable(tuple,signature),
         args,NamedTuple(kwargs))
     sources=NamedTuple{(P...,K...)}(values)
+    calls=Dict{Symbol,Vector{Any}}()
+    for ir in RK.method_irs(skeleton), statement in ir.body
+        RK._kmir_walk_calls_and_assigns(statement) do node
+            if node isa RK._FieldCall
+                length(node.path)==1 || error("native slots: nested callable field")
+                push!(get!(calls,only(node.path),Any[]),node)
+            end
+        end
+    end
     descriptors=Pair{Symbol,Any}[];effects=Pair{Symbol,Any}[]
-    for name in sort!(collect(RK._kernel_factory_called_fields(skeleton)))
+    for name in sort!(collect(keys(calls)))
         source=getproperty(sources,name)
         if source === nothing
             push!(descriptors,name=>nothing)
         else
-            callable=RK._prepare_callable(name,source)
+            callable=nothing
+            # Validate each call separately: a keyword at one site cannot
+            # supply a required argument missing at another site.
+            for call in calls[name]
+                names=Tuple(first.(call.kw))
+                RK._KMIR_KWSPLAT in names && error("native slots: callable keyword splat")
+                length(unique(names))==length(names) || error("native slots: duplicate callable keyword")
+                callable=RK._prepare_callable(name,source;runtime_keywords=names)
+                bound=RK.prepared_callable_kwargs(callable)
+                if bound !== nothing
+                    isempty(intersect(keys(bound),names)) ||
+                        error("native slots: a transition control cannot be both bound and runtime")
+                end
+            end
             push!(descriptors,name=>RK.prepared_callable_registration(callable))
             controls=RK.prepared_callable_kwargs(callable)
             push!(effects,name=>(source=RK.prepared_callable_source(callable),
