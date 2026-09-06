@@ -23,6 +23,7 @@ using StableRNGs
 # ---- the coordinate-conditional log-density, authored as an rk kernel ---------
 # want = logpost(θ_j) given the cached "minus-j" predictor rmj = η − x_j·θ_j.
 #   logpost = −θ_j²/(2 s0²) + Σ_i [ y_i·(rmj_i + x_ij θ_j) − softplus(rmj_i + x_ij θ_j) ]
+# BEGIN CGGIBBS_CONDITIONAL
 function build_coord_conditional()
     g = Graph()
     tj   = value!(g, :theta_j, Float64)
@@ -39,6 +40,7 @@ function build_coord_conditional()
     kern = prepare(g; have = (tj, rmj, xj, y, s0sq), want = lp)
     (t, rmjv, xjv, yv, s2) -> kern(t, rmjv, xjv, yv, s2)
 end
+# END CGGIBBS_CONDITIONAL
 
 # ---- Neal (2003) 1-D slice sampler (stepping-out + shrinkage) ------------------
 function slice_sample(rng, glog, x0; w = 1.0, m = 32)
