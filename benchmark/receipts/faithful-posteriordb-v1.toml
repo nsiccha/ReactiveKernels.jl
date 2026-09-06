@@ -1,0 +1,50 @@
+schema = "faithful-posteriordb-v1"
+generated_at = "2026-09-06T22:27:34.518"
+methodology = "RK BUILTIN graphs (ReactiveKernelsPPLExamples, idiomatic distribution-kernel authoring) vs optimized Stan vs optimized Turing, all three on the SAME faithful model; native primal+gradient; median over 12 rounds; parity vs FD oracle"
+
+[[models]]
+rk_builtin = true
+model = "eight_schools"
+dim = 10
+optbase = "stan"
+
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 295.0
+    median_bytes = 16
+    impl = "stan"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 385.5
+    median_bytes = 800
+    impl = "turing"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 80.0
+    median_bytes = 0
+    impl = "rk"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 520.0
+    median_bytes = 160
+    impl = "stan"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 4336.0
+    median_bytes = 7904
+    impl = "turing"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 140.0
+    median_bytes = 0
+    impl = "rk"
+
+    [models.parity_relerr]
+    turing = 3.922764336778102e-10
+    rk = 3.922764336778102e-10
+
+[environment]
+julia = "1.10.11"
+arch = "x86_64"
+stan = "2.39.0 (BridgeStan 2.9.0)"
+cpu = "AMD EPYC-Milan Processor"
