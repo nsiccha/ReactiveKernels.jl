@@ -1,6 +1,6 @@
-using ReactiveKernelsPPLExamples: @ppl, BetaBinomialExample
+using ReactiveKernelsPPLExamples: @ppl, BetaBinomialExample, PoissonGammaExample
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
-    normal, exponential, beta, binomial
+    normal, exponential, beta, binomial, gamma, poisson
 
 # First cut of the RK-native sb-like `@ppl` macro: scalar real-support
 # parameters + plate observation likelihoods, lowered to the canonical PPL
@@ -109,6 +109,23 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
                       want = :posterior)([logit_rate],
                 collect(BetaBinomialExample.BETA_BINOMIAL_SUCCESSES),
                 collect(BetaBinomialExample.BETA_BINOMIAL_TRIALS))
+        @test got ≈ ref_density
+    end
+
+    @testset "positive-support parameter — exact parity with hand-written poisson_gamma" begin
+        pg_ref = PoissonGammaExample.build_poisson_gamma_graph()
+        log_rate = log(3.5)
+        ref_density = prepare(pg_ref; have = (:log_rate, :counts),
+                              want = :density)(
+                log_rate, PoissonGammaExample.POISSON_COUNTS)
+
+        @ppl pg(counts::Vector{Int}) = begin
+            rate ~ gamma(2.0, 1.0)
+            counts ~ poisson(rate)
+        end
+        got = prepare(pg; have = (:unconstrained, :counts),
+                      want = :posterior)([log_rate],
+                collect(PoissonGammaExample.POISSON_COUNTS))
         @test got ≈ ref_density
     end
 
