@@ -278,14 +278,15 @@ function _parse(def)
                 push!(seen, lname)
                 if dist in _DISCRETE
                     # Discrete latent (Gibbs-only; no unconstrained coordinate).
+                    # Scalar (`z ~ bernoulli(…)`) or vector
+                    # (`z::vector[p] ~ bernoulli(…)`, an SSVS inclusion-indicator
+                    # block); the prior is `dist.logpdf` (scalar) or its summed
+                    # per-element `plate` (vector).
                     constraint === nothing || error(
                         "@ppl: discrete latent `$(lname) ~ $(dist)(…)` cannot carry a " *
                         "support constraint.")
-                    kind === :scalar || error(
-                        "@ppl (first cut): only scalar discrete latents are supported " *
-                        "yet (`$(lname) ~ $(dist)(…)`); vector discrete latents are a " *
-                        "follow-up increment.")
-                    push!(params, _Param(lname, dist_call, :discrete, nothing, false, true))
+                    dsize = kind === :vector ? lsize : nothing
+                    push!(params, _Param(lname, dist_call, :discrete, dsize, false, true))
                     continue
                 end
                 haskey(_SUPPORT, dist) || error(
@@ -526,8 +527,13 @@ function _lower(name, dataargs, params, obs, passthrough)
     # Discrete latents are their own HAVE ports (Int-valued), appended to the
     # signature after the data arguments — provided directly by the Gibbs sampler,
     # never derived from `unconstrained`.
-    discreteargs = Any[:( $(p.name)::$(_DISCRETE_TYPE[_call_head(p.dist)]) )
-                       for p in params if p.discrete]
+    discreteargs = Any[]
+    for p in params
+        p.discrete || continue
+        elty = _DISCRETE_TYPE[_call_head(p.dist)]
+        ty = p.size === nothing ? elty : :( AbstractVector{$(elty)} )
+        push!(discreteargs, :( $(p.name)::$(ty) ))
+    end
     sig = Expr(:call, name, :( unconstrained::Vector{Float64} ), dataargs...,
                discreteargs...)
     Expr(:(=), sig, Expr(:block, stmts...))

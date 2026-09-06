@@ -299,4 +299,33 @@ _nlp(x, mu, sig) = -0.5 * log(2π) - log(sig) - 0.5 * ((x - mu) / sig)^2
         @test res.accept_rate[:z] == 1.0                  # exact enumeration draw
         @test isapprox(_mean(zs), p1; atol = 0.02)        # matches the analytic P(z=1|y)
     end
+
+    @testset "vector discrete latent (Bernoulli block) — per-element enumeration" begin
+        # A vector of independent Bernoulli inclusion indicators, each informed by
+        # its own observation — the SSVS `z_j` shape. Single-site enumeration.
+        @ppl vm(y::Vector{Float64}, p::Int) = begin
+            z::vector[p] ~ bernoulli(0.4)
+            y ~ normal(ifelse(z, 1.0, 0.0), 1.0)
+        end
+        info = PPLMacro.model_info(vm)
+        @test info.params[1].name == :z
+        @test info.params[1].support == :discrete
+        @test info.params[1].is_vector
+
+        p = 4
+        y = [1.5, 0.9, -0.3, 0.6]
+        # each z_j | y is Bernoulli: log-odds = logit(0.4) + (y_j - 0.5).
+        p1 = [1 / (1 + exp(-(log(0.4) - log(0.6) + (yj - 0.5)))) for yj in y]
+
+        res = gibbs(vm; blocks = [:z], data = (; y, p),
+                    init = (; z = fill(false, p)), iters = 20000, warmup = 0,
+                    rng = MersenneTwister(7))
+        Z = res.draws[:z]                                  # Vector of Vector{Bool}
+        @test res.accept_rate[:z] == 1.0
+        @test all(zi -> length(zi) == p && all(v -> v isa Bool, zi), Z)
+        for j in 1:p
+            frac = _mean([Float64(zi[j]) for zi in Z])
+            @test isapprox(frac, p1[j]; atol = 0.03)
+        end
+    end
 end
