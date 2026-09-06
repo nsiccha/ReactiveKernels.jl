@@ -1037,12 +1037,13 @@ end
 
 # Partial evaluation deliberately stores hoisted values in the prepared
 # operation tuple so the public residual kernel has only its unbound HAVE
-# ports. Large array compiler backends must nevertheless receive array-valued
-# constants as device operands: capturing them in the compiled program turns
-# the whole dataset into source-level literals and makes compilation scale with
-# data size. This compact call boundary replaces only array-valued
-# `_BoundConstant`s with trailing hidden operands. The public PreparedKernel is
-# unchanged; native execution and inspection retain the q-only residual ABI.
+# ports. Compiler and differentiation backends must nevertheless be able to
+# receive array-valued constants as explicit inactive operands: capturing them
+# in the callable can either turn a whole dataset into source-level literals or
+# obscure its read-only activity. This compact call boundary replaces only
+# array-valued `_BoundConstant`s with trailing hidden operands. The public
+# PreparedKernel is unchanged; ordinary execution and inspection retain the
+# residual ABI.
 struct _ExternalBoundArraySlot{I} end
 
 struct _ExternalizedBoundArrayCall{F,O,I}
@@ -1076,7 +1077,7 @@ end
 """
     _externalize_bound_arrays(kernel; min_elements = 0) -> (call, values)
 
-Return an internal compiler call plus the array-valued partial-evaluation
+Return an internal backend call plus the array-valued partial-evaluation
 constants it expects as trailing hidden operands. If the kernel contains no
 such constants, return the kernel itself and an empty tuple. Scalar and other
 small static constants remain in the operation table; `min_elements` lets a
@@ -1084,26 +1085,33 @@ backend keep arrays below that element count in the table as well, so a small
 static dataset stays a compiler literal it can fold rather than a runtime
 operand it must read. By default every array is externalized.
 
-This is a compiler ABI adapter, not a different model boundary: `kernel` keeps
+This is a backend ABI adapter, not a different model boundary: `kernel` keeps
 its original public inputs, and `call(public_args..., values...)` is exactly
 equivalent to `kernel(public_args...)`.
 """
-function _externalize_bound_arrays(kernel::PreparedKernel;
-                                   min_elements::Integer = 0)
+function _externalize_bound_array_call(f, ops;
+                                       min_elements::Integer = 0)
     positions = Tuple(
-        index for (index, op) in pairs(kernel.ops)
+        index for (index, op) in pairs(ops)
         if op isa _BoundConstant && op.value isa AbstractArray &&
            length(op.value) >= min_elements)
-    isempty(positions) && return kernel, ()
-    values = Tuple(kernel.ops[index].value for index in positions)
-    stripped = ntuple(length(kernel.ops)) do index
+    isempty(positions) && return nothing, ()
+    values = Tuple(ops[index].value for index in positions)
+    stripped = ntuple(length(ops)) do index
         slot = findfirst(==(index), positions)
-        slot === nothing ? kernel.ops[index] :
+        slot === nothing ? ops[index] :
             _ExternalBoundArraySlot{slot}()
     end
     call = _ExternalizedBoundArrayCall{
-        typeof(kernel.f),typeof(stripped),positions}(kernel.f, stripped)
+        typeof(f),typeof(stripped),positions}(f, stripped)
     call, values
+end
+
+function _externalize_bound_arrays(kernel::PreparedKernel;
+                                   min_elements::Integer = 0)
+    call, values = _externalize_bound_array_call(
+        kernel.f, kernel.ops; min_elements)
+    call === nothing ? (kernel, ()) : (call, values)
 end
 
 # Prepared RK kernels are compiler-owned program structure when used as recipe
