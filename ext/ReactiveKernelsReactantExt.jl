@@ -1122,7 +1122,8 @@ function ReactiveKernels._ad_prepared_value_and_gradient(
         prepared::ReactiveKernels.PreparedADKernel{I},
         point::Union{Reactant.TracedRArray,Reactant.TracedRNumber},
         contexts) where {I}
-    call = ReactiveKernels._ADKernelCall{I,typeof(prepared.kernel)}(prepared.kernel)
+    kernel, _ = ReactiveKernels._externalize_bound_arrays(prepared.kernel)
+    call = ReactiveKernels._ADKernelCall{I,typeof(kernel)}(kernel)
     DifferentiationInterface.value_and_gradient(
         call, prepared.backend, point, contexts...)
 end

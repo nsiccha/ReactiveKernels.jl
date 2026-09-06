@@ -294,6 +294,14 @@ end
                               bound = (; data = dval))
         @test prepared isa PreparedADKernel
         @test Tuple(v.name for v in inputs(prepared.kernel)) == (:q,)
+        @test prepared.external_values == (dval .- 1.0,)
+        @test prepared.call isa ReactiveKernels._ADKernelCall
+        @test prepared.call.kernel isa
+              ReactiveKernels._ExternalizedBoundArrayCall
+        @test all(prepared.call.kernel.ops) do op
+            !(op isa ReactiveKernels._BoundConstant &&
+              op.value isa AbstractArray)
+        end
         q2 = [1.0, 2.0, -3.0]
         @test ad_gradient(prepared, q2) ≈ (dval .- 1.0) .- q2
 
@@ -301,6 +309,24 @@ end
             prepared, similar(q2), q2)
         @test gradient ≈ (dval .- 1.0) .- q2
         @test value ≈ sum(q2 .* (dval .- 1.0)) - 0.5 * sum(abs2, q2)
+
+        plated = @kernel plated_ad_model(
+                q::Vector{Float64}, data::Vector{Float64}) = begin
+            pointwise = plate(q, data) do qi, di
+                score::Float64 = qi * di - 0.5 * qi^2
+                return score
+            end
+            density::Float64 = sum(pointwise)
+        end
+        plated_prepared = prepare_ad(
+            plated, PE_TEST_AD_BACKEND, qv;
+            active = :q, want = :density, bound = (; data = dval))
+        @test plated_prepared.call isa ReactiveKernels._ADKernelCall
+        @test plated_prepared.call.kernel isa
+              ReactiveKernels._ExternalizedBoundArrayCall
+        @test plated_prepared.call.kernel.f === plated_prepared.kernel.f.native
+        @test plated_prepared.external_values == (dval,)
+        @test ad_gradient(plated_prepared, q2) ≈ dval .- q2
 
         @test_throws ArgumentError prepare_ad(
             spec, PE_TEST_AD_BACKEND, qv;
