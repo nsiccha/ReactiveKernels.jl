@@ -3,6 +3,7 @@ module ReactiveKernelsPPLExamples
 using ReactiveKernels: KernelSpec, PreparedKernel
 
 include("_ppl_source_authority.jl")
+include("ppl_workflow.jl")
 include("eight_schools.jl")
 include("sum_to_zero.jl")
 include("linear_regression.jl")
@@ -13,6 +14,7 @@ include("arma11.jl")
 include("gaussian_mixture.jl")
 include("mnist_logistic.jl")
 
+export PPLWorkflow
 export EightSchoolsExample
 export SumToZeroExample
 export LinearRegressionExample
