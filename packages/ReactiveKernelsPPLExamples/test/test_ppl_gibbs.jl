@@ -352,6 +352,41 @@ _nlp(x, mu, sig) = -0.5 * log(2π) - log(sig) - 0.5 * ((x - mu) / sig)^2
         @test isapprox(_mean(om), 7 / 13; atol = 0.03)    # Beta(7,6) mean
     end
 
+    @testset "current-state conjugacy: Inverse-Gamma-Normal variance" begin
+        # sigma2 ~ InvGamma(a,b) as the VARIANCE of a Normal likelihood
+        # (`normal(mu, sqrt(sigma2))`). sigma2 | y ~ InvGamma(a + n/2, b + SSR/2),
+        # SSR = Σ(y-mu)². The engine recovers SSR from the current likelihood each
+        # sweep and draws exactly (a current-state conjugate).
+        @ppl varm(y::Vector{Float64}, mu::Float64, a::Float64, b::Float64) = begin
+            sigma2 ~ inverse_gamma(a, b)
+            y ~ normal(mu, sqrt(sigma2))
+        end
+        info = PPLMacro.model_info(varm)
+        @test info.params[1].name == :sigma2
+        @test info.params[1].prior_family == :inverse_gamma
+
+        rng = MersenneTwister(9)
+        n = 50
+        mu = 0.0
+        y = mu .+ 1.5 .* randn(rng, n)
+        a = 2.0
+        b = 1.0
+        ssr = sum((y .- mu) .^ 2)
+        apost = a + n / 2
+        bpost = b + ssr / 2
+        post_mean = bpost / (apost - 1)                         # InvGamma mean
+        post_sd = bpost / ((apost - 1) * sqrt(apost - 2))       # InvGamma sd
+
+        res = gibbs(varm; blocks = [:sigma2], data = (; y, mu, a, b),
+                    init = (; sigma2 = 1.0), support = (; sigma2 = :positive),
+                    iters = 20000, warmup = 2000, rng = MersenneTwister(4))
+        s2 = Float64.(res.draws[:sigma2])
+        @test res.accept_rate[:sigma2] == 1.0             # exact conjugate draw
+        @test all(>(0.0), s2)
+        @test isapprox(_mean(s2), post_mean; rtol = 0.03)
+        @test isapprox(_std(s2), post_sd; rtol = 0.10)
+    end
+
     @testset "SSVS spike-and-slab acceptance (George & McCulloch) on an @ppl model" begin
         # The full classic SSVS, authored end-to-end in @ppl: a Beta inclusion
         # probability, a vector of Bernoulli inclusion indicators, a conditional
