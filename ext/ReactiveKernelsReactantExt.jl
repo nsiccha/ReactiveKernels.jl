@@ -889,6 +889,42 @@ end
         a::Reactant.TracedRArray, b::Array) =
     ReactiveKernels._tensorized_normalized_dot(a, b)
 
+# A traced `scan` lowers its sequential recurrence to a `stablehlo.while` carry
+# loop instead of unrolling into per-step scalar indexing.  `step` is the
+# prepared two-`want` step kernel `(carry, x, shared...) -> (new_carry, output)`.
+# The threaded `carry` is an ordinary loop-carried variable — reassigned each
+# iteration, exactly like the transpiler's `state` (`transpiled_program.jl:17`) —
+# so a compound carry rides through as a loop-carried `NamedTuple`.  The per-step
+# outputs are written into a preallocated traced buffer with an in-place
+# `buffer[i] = …` dynamic-update-slice, the same idiom the range-draw probe uses
+# under `@trace for` (`range_draw_probe.jl:17`).  The first step runs eagerly to
+# seed the carry and fix the output element type; the `@trace for` then runs the
+# remaining steps as one `stablehlo.while`.  RK-macro-only per decision
+# `17bnc6t`; Reactant untouched.  A non-scalar per-step output is a loud,
+# reported limitation, never a silent mis-lowering.
+@inline _scan_output_buffer(::Reactant.TracedRNumber{T}, n::Integer) where {T} =
+    Reactant.promote_to(Reactant.TracedRArray, zeros(T, n))
+_scan_output_buffer(out, ::Integer) = throw(ArgumentError(
+    "the Reactant scan lowering supports a scalar per-step output; got a " *
+    "$(typeof(out)). Author the per-step output as a scalar, or report this " *
+    "shape as an unimplemented scan lowering."))
+
+function ReactiveKernels._tensorized_scan(
+        step, xs::Reactant.TracedRArray{<:Any,1}, init, shared...)
+    n = length(xs)
+    n == 0 && throw(ArgumentError("scan requires a non-empty sequence"))
+    x1 = Reactant.@allowscalar xs[1]
+    carry, out1 = step(init, x1, shared...)
+    buffer = _scan_output_buffer(out1, n)
+    Reactant.@allowscalar buffer[1] = out1
+    Reactant.@trace for i in 2:n
+        x = Reactant.@allowscalar xs[i]
+        carry, out = step(carry, x, shared...)
+        Reactant.@allowscalar buffer[i] = out
+    end
+    buffer
+end
+
 # Batched slice-collection plates preserve eachcol structurally in the core.
 # Move the observation axis to the leading batch dimension and lower the
 # scalar recipe with Reactant's batch primitive; no Base.Slices object or host
