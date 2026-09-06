@@ -1,0 +1,64 @@
+note = "Reactant-friendly authoring required to transpile: 1-element reductions sum(view(q,i:i)) vs scalar q[i]; sum(a.*b) vs dot; vectorized data-masks vs per-element `if`. Models that still fail are reported honestly (in-graph dense cholesky)."
+schema = "reactant-hmc-loop-table-v2"
+generated_at = "2026-09-06T19:46:05.809"
+methodology = "all 10 named posteriordb models, native vs Reactant HMC loop (multinomial HMC, L16, 1000 transitions/batch) via the merged transpiler; same authored @kernel lowered to both backends; compile+warmup excluded; median of 6 batches"
+
+[results.sblri_blr_d7_]
+reactant_us = 2.5
+ratio = 0.069
+dim = 7
+native_us = 36.15
+
+[results.eight_schools_d10_]
+reactant_us = 2.73
+ratio = 0.464
+dim = 10
+native_us = 5.89
+
+[results.GLM_Binomial_d3_]
+reactant_us = 12.28
+ratio = 0.096
+dim = 3
+native_us = 127.41
+
+[results.Mh_d303_]
+reactant_us = 119.49
+ratio = 0.248
+dim = 303
+native_us = 482.68
+
+[results.GLMM_Poisson_d45_]
+reactant_us = 8.63
+ratio = 0.139
+dim = 45
+native_us = 62.31
+
+[results.Rate_1_d1_]
+reactant_us = 2.05
+ratio = 0.893
+dim = 1
+native_us = 2.3
+
+[results.gp_regr_d3_]
+error = "type BatchedCholesky has no field L"
+reactant = "FAILED"
+dim = 3
+native_us = 849.27
+
+[results.GLM_Poisson_d4_]
+reactant_us = 11.03
+ratio = 0.08
+dim = 4
+native_us = 137.11
+
+[results.kidscore_d5_]
+reactant_us = 2.47
+ratio = 0.113
+dim = 5
+native_us = 21.85
+
+[results.arK_d7_]
+reactant_us = 2.35
+ratio = 0.084
+dim = 7
+native_us = 28.1

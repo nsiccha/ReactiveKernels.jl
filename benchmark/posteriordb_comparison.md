@@ -108,7 +108,7 @@ Note the **allocation** column: RK's generated straight-line native kernel alloc
 0–6 KB and often **0 bytes**, versus Turing's 1–59 KB per gradient. That low overhead is
 exactly why RK wins the overhead-bound models.
 
-## Reactant compiled-HMC-loop regime
+## Reactant compiled-HMC-loop regime — all 10 attempted
 
 Reactant (XLA) **loses badly per single evaluation** — the launch/sync overhead dwarfs
 the ns–µs of work (measured elsewhere at 4–385× slower for one log-density/gradient). But
@@ -116,33 +116,50 @@ when the **whole sampler loop** is captured as one compiled program, that cost a
 once and XLA fuses the entire leapfrog + multinomial batch. The **same authored `@kernel`**
 is lowered to both backends — no hand-written Reactant kernel.
 
+**All 10 models were run through the same transpiler. 9 of 10 transpile, and Reactant wins
+the compiled HMC loop for every one of the 9** (1.1×–14.5× faster). The lone failure —
+`gp_regr` — fails with a specific, actionable error, not a silent skip.
+
 Multinomial HMC, L=16 leapfrog steps, 1000 transitions/batch, median of 6 batches
 ([`reactant_hmc_loop_table.jl`](reactant_hmc_loop_table.jl),
-receipt [`reactant-hmc-loop-table-v1.toml`](receipts/reactant-hmc-loop-table-v1.toml)):
+receipt [`reactant-hmc-loop-table-v2.toml`](receipts/reactant-hmc-loop-table-v2.toml)):
 
-| Model | dim | native µs/transition | Reactant µs/transition | Reactant / native |
-|---|---:|---:|---:|---:|
-| eight_schools | 10 | 6.15 | 2.74 | **0.45×** (~2.2× faster) |
-| GLMM_Poisson | 45 | 61.18 | 8.15 | **0.13×** (~7.5× faster) |
-| GLM_Poisson | 4 | 150.76 | 10.66 | **0.07×** (~14× faster) |
+| Model | dim | native µs/txn | Reactant µs/txn | Reactant ÷ native | speedup |
+|---|---:|---:|---:|---:|---:|
+| Rate_1 | 1 | 2.30 | 2.05 | 0.89× | 1.1× |
+| GLM_Binomial | 3 | 127.41 | 12.28 | 0.10× | 10.4× |
+| gp_regr | 3 | 849.27 | — | **did NOT transpile** | — |
+| GLM_Poisson | 4 | 137.11 | 11.03 | 0.08× | 12.4× |
+| kidscore_interaction | 5 | 21.85 | 2.47 | 0.11× | 8.8× |
+| arK | 7 | 28.10 | 2.35 | 0.08× | 12.0× |
+| sblri-blr | 7 | 36.15 | 2.50 | 0.07× | 14.5× |
+| eight_schools | 10 | 5.89 | 2.73 | 0.46× | 2.2× |
+| GLMM_Poisson | 45 | 62.31 | 8.63 | 0.14× | 7.2× |
+| Mh | 303 | 482.68 | 119.49 | 0.25× | 4.0× |
 
-**Reactant wins the compiled HMC loop for every model** — by *more* where the per-leapfrog
-native AD is expensive (Poisson `exp`, larger dim). Practitioner rule for RK: **compile the
-whole sampler loop with Reactant; never call Reactant per gradient/leapfrog.**
+**Reactant wins the compiled loop for all 9 that transpile** — by more where the per-leapfrog
+native AD is expensive (Poisson/binomial `exp`, larger dim). Even **Mh at dim 303** — whose
+observed/unobserved likelihood branch is data-dependent — transpiles once the branch is
+vectorized to a data mask, and wins **4×**. Practitioner rule for RK: **compile the whole
+sampler loop with Reactant; never call it per gradient/leapfrog.**
 
-### A generic RK Reactant-lowering friction (tracked)
+### The one failure, and the lowering frictions (all tracked)
 
-A *naturally authored* `@kernel` does not transpile to Reactant unchanged; it currently
-needs Reactant-friendly forms:
+**`gp_regr` does not transpile:** `type BatchedCholesky has no field L`. Under Reactant,
+`cholesky(Symmetric(K))` returns a `BatchedCholesky` that does not expose the `.L` factor
+the density reads (`C.L \ y`, `diag(C.L)`). A real Reactant-lowering gap in RK's cholesky
+path — reported, not worked around. (Its native side runs fine: 849 µs/transition.)
 
-- scalar `q[i]` → `sum(view(q, i:i))` (scalar indexing is disallowed on a `TracedRArray`);
-- `dot(data::Vector, traced)` → `sum(a .* b)` (`dot` calls `conj`, unsupported on a plain
-  data `Vector` under Reactant).
+Three frictions surfaced, all now RK-`@kernel`-normalization work on the ReactiveKernels
+lane (todo `ReactiveKernels/2026-09-06T19-35-20-773-0cgmepj`):
 
-Per user decision, the fix is **RK-macro-only** (normalize inside `@kernel` lowering; the
-rewrite must be **type-aware** — `dot` conjugates, so `sum(a.*b)` is only valid for real
-inputs — with a **loud error** for anything outside the safe set, never a silent
-mis-lowering). Tracked as todo `ReactiveKernels/2026-09-06T19-35-20-773-0cgmepj`.
+1. scalar `q[i]` → `sum(view(q, i:i))` (scalar indexing disallowed on a `TracedRArray`);
+2. `dot(data::Vector, traced)` → `sum(a .* b)` (`dot` calls `conj`, unsupported on a data `Vector`);
+3. `cholesky(…).L` → unsupported on Reactant's `BatchedCholesky` (the `gp_regr` failure).
+
+Per user decision the fix is **RK-macro-only** — normalize inside `@kernel` lowering,
+**type-aware** (e.g. `dot` conjugates, so `sum(a.*b)` is valid only for real inputs), with
+a **loud error** for anything outside the safe set, never a silent mis-lowering.
 
 ## Supplementary — Gaussian regression K-scaling
 
@@ -191,7 +208,7 @@ Each script builds its own pinned comparison environment and re-execs the model 
 | gp_regr | [`fair_posteriordb_gp.jl`](fair_posteriordb_gp.jl) | [`fair-posteriordb-gp-v1.toml`](receipts/fair-posteriordb-gp-v1.toml) |
 | Mh | [`fair_posteriordb_mh.jl`](fair_posteriordb_mh.jl) | [`fair-posteriordb-mh-v1.toml`](receipts/fair-posteriordb-mh-v1.toml) |
 | kidscore_interaction, sblri-blr | [`fair_posteriordb_linear.jl`](fair_posteriordb_linear.jl) | [`fair-posteriordb-linear-v1.toml`](receipts/fair-posteriordb-linear-v1.toml) |
-| Reactant HMC loop (3 models) | [`reactant_hmc_loop_table.jl`](reactant_hmc_loop_table.jl) | [`reactant-hmc-loop-table-v1.toml`](receipts/reactant-hmc-loop-table-v1.toml) |
+| Reactant HMC loop (all 10) | [`reactant_hmc_loop_table.jl`](reactant_hmc_loop_table.jl) | [`reactant-hmc-loop-table-v2.toml`](receipts/reactant-hmc-loop-table-v2.toml) |
 | Gaussian K-scaling | [`all_sides_gaussian_regression.jl`](all_sides_gaussian_regression.jl) | [`all-sides-gaussian-regression-v1.toml`](receipts/all-sides-gaussian-regression-v1.toml) |
 
 Every receipt carries its `source`, `rk_source_commit`, `methodology`, and `environment`.
