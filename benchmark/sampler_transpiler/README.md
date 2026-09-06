@@ -36,6 +36,11 @@ julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/loop_c
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/scalar_argument_probe.jl
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/code_reuse_probe.jl checks
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/code_reuse_probe.jl timings
+julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/multinomial_eight_schools.jl native 1000 4
+julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/multinomial_eight_schools.jl reactant 1000 4
+julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/multinomial_eight_schools.jl diagnostics 1000 4
+julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/constant_binding_probe.jl
+julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/range_draw_probe.jl
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/hmc_eight_schools.jl reactant
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/hmc_eight_schools.jl ahmc
 ```
@@ -198,7 +203,62 @@ commits, before this move.
 
 All modes use centered Eight Schools, ten Float64 parameters, a unit diagonal
 metric, and step size 0.03. Four leapfrog steps are the default. This is endpoint-Metropolis HMC;
-multinomial HMC and NUTS remain subsequent work.
+the separate multinomial case is described below. NUTS remains subsequent work.
+
+## Captured multinomial HMC
+
+[`multinomial_hmc_kernel.jl`](multinomial_hmc_kernel.jl) is a second mathematical
+source for the same compiler. It places the initial point uniformly among the
+`L+1` positions on a fixed trajectory, integrates forwards and backwards from
+that point, and uses streaming Hamiltonian-weighted selection. Its two bound
+integrator calls use the existing captured `leapfrog!` with opposite step sizes.
+No sampler logic is implemented in a backend replacement.
+
+[`multinomial_eight_schools.jl`](multinomial_eight_schools.jl) measures 1,000
+consecutive transitions, seven interleaved samples, using the same model,
+callbacks, metric, step size and leapfrog count as `AdvancedHMC.MultinomialTS`.
+State/seed resets are outside timing; Reactant compiles the entire chained batch
+and synchronizes its calls. Only final state is retained. Compilation, adaptation
+and full chain storage are outside the timed workload. AdvancedHMC materializes
+each trajectory and computes its usual acceptance statistics; the authored
+streaming source currently omits those statistics. This is an execution
+comparison with matched integration work, not complete sampler feature parity
+or tuned posterior-sampling efficiency.
+
+`multinomial-v1.toml` retains all seven samples from each initial comparison.
+At four steps, native takes a median 1.83 ms per 1,000 transitions; the fastest
+AdvancedHMC sample in that process takes 7.20 ms. At sixteen steps, Reactant
+takes a median 15.18 ms versus AdvancedHMC's fastest 12.15 ms, so this longer
+trajectory remains an optimization target. First Reactant compilation takes
+44.49 seconds separately. An earlier four-step Reactant run takes a median
+4.39 ms versus AdvancedHMC's fastest 6.64 ms; its recorded provenance predates
+the final generalization of bound-range recognition. These are fixed-work
+throughput observations, not effective-sample-size comparisons.
+
+An optional fourth command-line argument writes the actual emitted `native.jl`
+expression and, in Reactant mode, `traced.jl` and the final `kernel.mlir`:
+
+```sh
+julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/multinomial_eight_schools.jl reactant 1000 16 /absolute/scratch/emissions
+```
+
+The Julia expressions are inspection artifacts whose stores, resources, and
+metadata belong to their preparation; they are not standalone programs.
+
+The compiler now accepts captured constant builtin scalar values/types in
+method bodies. Preparation rejects nonconstant bindings and mutable global
+objects. `constant_binding_probe.jl` exercises that boundary with actual captured
+consumers; data and mutable state still belong in explicit prepared inputs.
+
+The Reactant backend lowers preparation-fixed integer-range draws to unsigned
+64-bit draws with rejection before reduction. This preserves a uniform result
+without Julia's widened integer range-sampler intermediate, which this Reactant
+version cannot trace. Signed/unsigned builtin ranges up to 64 bits are supported,
+including full-width ranges; empty ranges and wider/custom integer types reject
+at preparation. No RNG sequence matching is required. `range_draw_probe.jl`
+exercises signed/full-width output, a range with frequent rejection, and caller
+seed/output preservation. Its local scalar-indexing annotation only stores the
+probe's draws; sampler execution does not use that annotation.
 
 `loop_control_probe.jl` checks the same authored HMC source with zero steps and
 with a divergence threshold that forces its early return. It exercises the

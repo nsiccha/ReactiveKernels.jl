@@ -53,6 +53,20 @@ function compile_traced_slots(program; static_currentness=true, unroll_limit=0, 
     callee(x,name) = x isa GlobalRef ? x.name===name :
         x isa Expr && x.head===:. ? x.args[2]===QuoteNode(name) : x===name
     index(x) = only(x.args[2:end])
+    function fixed_sample(x)
+        x isa Expr || return x
+        if x.head===:block
+            parts=filter(a->a!==nothing && !(a isa LineNumberNode),x.args)
+            length(parts)==1 && return fixed_sample(only(parts))
+        elseif x.head===:call
+            if callee(x.args[1],:getfield) && x.args[2]===:constant_values
+                return getfield(program.constants[],x.args[3])
+            elseif callee(x.args[1],:_canon_slot) && haskey(sharedmap,x.args[2])
+                return RK._canon_slot(sharedmap[x.args[2]],Val(index(x.args[3])))
+            end
+        end
+        nothing
+    end
     function lower(x)
         x isa LineNumberNode && return nothing
         x isa Expr || return x
@@ -62,6 +76,12 @@ function compile_traced_slots(program; static_currentness=true, unroll_limit=0, 
             return Symbol(:_ts_counter_,x.args[2])
         elseif x.head===:call
             f=x.args[1]
+            if f===Random.rand && length(x.args)==3
+                range=fixed_sample(x.args[3])
+                if range isa UnitRange
+                    return Expr(:call,slot_rand_range,lower(x.args[2]),fixed(SlotRangeSampler(range)))
+                end
+            end
             if callee(f,:_canon_slot)
                 return slot(x.args[2],index(x.args[3]))
             elseif callee(f,:_canon_current)

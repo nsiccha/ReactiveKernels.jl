@@ -4,8 +4,10 @@ module TracedSlotCompiler
 import ReactiveKernels
 import Reactant
 using LinearAlgebra
+import Random
 const RK = ReactiveKernels
 
 include("traced_code_cache.jl")
 include("traced_slots.jl")
+include("traced_random.jl")
 end

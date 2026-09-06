@@ -10,6 +10,18 @@ struct SlotContext
 end
 slotplan(c) = RK.kernel_prepared_plan(c.pf)
 slotfields(c) = RK._exec_canon_map(slotplan(c))
+
+function slot_external_constant(x::RK._ExtRef)
+    value=x.captured
+    admitted=RK._kernel_dom_num_scalar(typeof(value)) ||
+        (value isa DataType && RK._kernel_dom_num_scalar(value))
+    admitted || error("native slots: external value must be a builtin scalar or scalar type")
+    isdefined(x.ref.mod,x.ref.name) && isconst(x.ref.mod,x.ref.name) &&
+        getglobal(x.ref.mod,x.ref.name)===value ||
+        error("native slots: external scalar must retain its captured constant binding")
+    value
+end
+
 function scope_slots(x, c)
     x isa Symbol && return x === :owned ? Symbol(c.prefix, :_owned) :
         x === :shared ? Symbol(c.prefix, :_shared) :
@@ -164,6 +176,8 @@ function compile_native_slots(kernel, state, name; endpoints, effects, hoist=tru
     function static_value(x, context)
         if x isa RK._Lit
             return true,x.value
+        elseif x isa RK._ExtRef
+            return true,slot_external_constant(x)
         elseif x isa RK._SelfField
             c,n = place(x,context)
             role,slot = RK.kernel_plan_field(slotplan(c),slotfields(c)[n])
@@ -193,6 +207,8 @@ function compile_native_slots(kernel, state, name; endpoints, effects, hoist=tru
             return slot_read(c,n;count_gradients)
         elseif x isa RK._Lit
             return x.value
+        elseif x isa RK._ExtRef
+            return slot_external_constant(x)
         elseif x isa RK._FormalRef
             return formals[x.arg]
         elseif x isa RK._LocalRef
