@@ -272,13 +272,9 @@ function setup_dugongs!(mod::Module)
     if !isdefined(mod, :DugongsGrowthExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: DugongsGrowthExample))
     end
-    Core.eval(mod, :(using .DugongsGrowthExample:
-        DugongsParameters, UnconstrainedParameters, RealVector,
-        DUGONGS_AGE, DUGONGS_LENGTH,
-        split_unconstrained, bounded_lambda, sd_from_log_precision,
-        assemble_parameters, log_abs_det_jacobian, log_prior,
-        pointwise_log_likelihood, sum_log_likelihood,
-        fused_log_likelihood, total_log_density, predicted_length))
+    # Bind only the data. The displayed PPL assembly imports and reuses the
+    # shared `normal`, `uniform`, and `gamma` distribution objects directly.
+    Core.eval(mod, :(using .DugongsGrowthExample: DUGONGS_AGE, DUGONGS_LENGTH))
     nothing
 end
 

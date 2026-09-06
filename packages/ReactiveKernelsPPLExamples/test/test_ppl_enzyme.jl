@@ -83,21 +83,24 @@ function poisson_gamma_reference_density(log_rate)
     prior + log_rate + likelihood
 end
 
+const _DUGONGS_LOG_GAMMA_SHAPE = loggamma(1e-4)
+
 function dugongs_reference_density(q)
-    α, β, u_λ, log_τ = q
-    parameters = DugongsParameters(
-        α, β, DugongsGrowthExample.bounded_lambda(u_λ),
-        DugongsGrowthExample.sd_from_log_precision(log_τ))
+    α, β, u_λ, log_τ = q[1], q[2], q[3], q[4]
+    s = 1 / (1 + exp(-u_λ))
+    λ = 0.5 + 0.5 * s
+    τ = exp(log_τ)
+    σ = exp(-log_τ / 2)
+    log_jacobian = log(0.5) + log(s) + log1p(-s) + log_τ
+    nld(x, loc, sc) = -0.5 * log(2π) - log(sc) - 0.5 * ((x - loc) / sc)^2
+    gamma_ld = 1e-4 * log(1e-4) - _DUGONGS_LOG_GAMMA_SHAPE +
+               (1e-4 - 1) * log(τ) - 1e-4 * τ
+    prior = nld(α, 0.0, 1000.0) + nld(β, 0.0, 1000.0) + log(2.0) + gamma_ld
     likelihood = zero(α)
     @inbounds for i in eachindex(DUGONGS_AGE)
-        likelihood += DugongsGrowthExample.normal_logpdf(
-            DUGONGS_LENGTH[i],
-            DugongsGrowthExample.growth_mean(parameters, DUGONGS_AGE[i]),
-            parameters.σ)
+        likelihood += nld(DUGONGS_LENGTH[i], α - β * λ^DUGONGS_AGE[i], σ)
     end
-    DugongsGrowthExample.total_log_density(
-        DugongsGrowthExample.log_prior(parameters),
-        DugongsGrowthExample.log_abs_det_jacobian(u_λ, log_τ), likelihood)
+    prior + log_jacobian + likelihood
 end
 
 function arma11_reference_density(q)

@@ -1,14 +1,12 @@
 # Declarative PPL kernel: dugongs (nonlinear growth)
 
-```@eval
-Main.ReactiveKernelsDocs.render_review_status(:frozen_ppl)
-```
-
 This example ports the `dugongs` model from
 [posteriordb](https://github.com/stan-dev/posteriordb) (posterior
 `dugongs_data-dugongs_model`) into the same declarative-`@kernel` style as the
-[eight-schools example](eight-schools.md). Unlike the GLM-shaped examples, the
-mean is a **nonlinear** function of the parameters — an asymptotic growth curve.
+[eight-schools example](eight-schools.md): the model is authored inline, reusing
+the shared `normal`, `uniform`, and `gamma` distribution objects and one authored
+likelihood `plate`. Unlike the GLM-shaped examples, the mean is a **nonlinear**
+function of the parameters — an asymptotic growth curve.
 
 The complete runnable source is
 [`packages/ReactiveKernelsPPLExamples/src/dugongs_growth.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsPPLExamples/src/dugongs_growth.jl).
