@@ -53,10 +53,9 @@ end
         # `errors_closed` (a Toeplitz matvec), which LOWERS and reproduces native.
         # The natural sequential `errors` node reads err[t-1]/series[t-1] element
         # by element, so it still does NOT lower (XLA disallows scalar indexing of
-        # a traced array) — kept as an explicit tested diagnostic. The clean path
-        # is the phase-2 stablehlo.while scan lowering (RK core, decision 0b4m77q);
-        # the closed form dodges two Reactant tracing bugs (snag
-        # reactant-trace-s-9ca8b54f) — see docs/src/arma11.md.
+        # a traced array) — kept as an explicit tested diagnostic. A sequential-scan
+        # (stablehlo.while) lowering would let the natural recursion lower directly;
+        # see docs/src/arma11.md.
         a = evaluate_arma11_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
         seq_errors_kernel = prepare(a.model;

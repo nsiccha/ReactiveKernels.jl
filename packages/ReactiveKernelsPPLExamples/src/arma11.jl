@@ -91,19 +91,16 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
     # The SAME errors as a vectorized closed form that lowers through Reactant.
     # The recurrence errₜ = aₜ − θ·err_{t-1} (with aₜ = yₜ − μ − φ·y_{t-1}) is
     # linear, so errₜ = Σ_{k≤t} (−θ)^{t−k} aₖ — a lower-triangular Toeplitz matvec
-    # err = L·a. It uses only vectorized ops (slice, vcat, broadcast, matmul), so
-    # unlike the sequential form it has no concrete-int getindex. One caveat: the
-    # natural `Δ .>= 0` comparison that zeros the upper triangle currently
-    # StackOverflows in Reactant tracing (snag
-    # ReactiveKernels/reactant-trace-s-9ca8b54f, fix pending in @kernel lowering),
-    # so the lower-triangular mask is built arithmetically with `clamp` instead.
-    # The likelihood/density reduce this form; a test asserts `errors_closed ≈ errors`.
+    # err = L·a. It uses only vectorized ops (slice, vcat, broadcast, a `.>=`
+    # comparison mask, matmul), so unlike the sequential form it has no
+    # concrete-int getindex and lowers through Reactant. The likelihood/density
+    # reduce this form; a test asserts `errors_closed ≈ errors`.
     errors_closed::Vector{Float64} = let
         T = length(series)
         y_lag = vcat(μ, series[1:(T - 1)])                  # y_{t-1}, with y₀ ≡ μ
         a = series .- μ .- φ .* y_lag
         Δ = (0:(T - 1)) .- (0:(T - 1))'                     # Δ[t, k] = t − k
-        L = clamp.(Δ .+ 1, 0, 1) .* ((-θ) .^ max.(Δ, 0))    # lower-tri Toeplitz
+        L = (Δ .>= 0) .* ((-θ) .^ max.(Δ, 0))               # lower-tri Toeplitz
         L * a
     end
 

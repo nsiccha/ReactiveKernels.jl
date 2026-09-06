@@ -98,17 +98,10 @@ and executes through the public Reactant boundary with value parity** —
 result matches native, and separately asserts the raw sequential node still
 throws.
 
-One Reactant caveat shapes the closed-form authoring: the natural `Δ .>= 0`
-comparison that zeros the Toeplitz upper triangle currently StackOverflows in
-Reactant tracing (snag `ReactiveKernels/reactant-trace-s-9ca8b54f`), so the mask
-is built arithmetically with `clamp` instead. That is a temporary dodge — the fix
-normalizes comparison masks in the `@kernel` lowering, after which the natural
-spelling lowers directly.
-
-The cleaner long-term path is a sequential-scan (`stablehlo.while`) lowering, so
-the *natural* recursion lowers with no reformulation at all (RK core, decision
-`0b4m77q`); once it lands, `errors` itself lowers and the closed-form
-reformulation becomes optional.
+A sequential-scan (`stablehlo.while`) lowering would let the *natural* recursion
+lower directly, with no reformulation; until such a lowering exists on the
+declarative `@kernel` surface, the vectorized closed form is arma11's Reactant
+path.
 
 Run the walkthrough from the repository root:
 
