@@ -20,7 +20,7 @@ end
 end
 slot_lmul!(factor,destination)=lmul!(factor,destination)
 
-function compile_traced_slots(program; static_currentness=true, unroll_limit=0)
+function compile_traced_slots(program; static_currentness=true, unroll_limit=0, reuse_code=true)
     contextmap = Dict(Symbol(c.prefix, :_owned)=>c for c in program.contexts)
     sharedmap = Dict(Symbol(c.prefix, :_shared)=>c.shared for c in program.contexts)
     handlemap = Dict(Symbol(c.prefix, :_handles)=>program.resources[i]
@@ -420,9 +420,8 @@ function compile_traced_slots(program; static_currentness=true, unroll_limit=0)
         $loop
         (; state=$result,argument,counts=(_ts_counter_1,_ts_counter_2))
     end)
-    clone_ast(x)=x isa Expr ? Expr(x.head,(clone_ast(a) for a in x.args)...) : x
-    expanded=macroexpand(@__MODULE__,clone_ast(expression))
-    (;f=Core.eval(@__MODULE__,expanded),expression,expanded,metadata=SlotStatic(Tuple(statics)),
+    expanded=macroexpand(@__MODULE__,slot_code_copy(expression))
+    (;f=compile_slot_code(expanded;reuse_code),expression,expanded,metadata=SlotStatic(Tuple(statics)),
       state=(;values,current=masks),ordered,entry_facts)
 end
 

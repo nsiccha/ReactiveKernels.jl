@@ -6,5 +6,6 @@ import Reactant
 using LinearAlgebra
 const RK = ReactiveKernels
 
+include("traced_code_cache.jl")
 include("traced_slots.jl")
 end

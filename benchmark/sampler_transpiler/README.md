@@ -34,6 +34,8 @@ julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/hmc_ei
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/hmc_eight_schools.jl reactant-slots 1000 16
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/loop_control_probe.jl
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/scalar_argument_probe.jl
+julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/code_reuse_probe.jl checks
+julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/code_reuse_probe.jl timings
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/hmc_eight_schools.jl reactant
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/hmc_eight_schools.jl ahmc
 ```
@@ -104,7 +106,29 @@ to preserve distinct mutable objects. Cache flags proved constant at every
 transition entry and exit stay out of the traced state interface. Temporarily
 varying values inside control flow still follow the ordinary liveness analysis.
 
-This command interleaves synchronized Reactant execution with AdvancedHMC.
+Repeated preparation of the same emitted syntax reuses its Julia function
+within the process. The cache retains code only: every preparation still owns
+its state and fixed metadata, and every Reactant compilation constructs a new
+executable. Literal objects compare by exact identity, so equal contents do
+not merge distinct mutable authorities. Inspection ASTs are separate from
+cached keys. `reuse_code=false` on `compile_traced_slots` retains fresh function
+emission for ablation. The cache does not change first-compilation cost or
+persist across Julia processes.
+
+`code_reuse_probe.jl checks` exercises independent initial states/bound gains,
+changed loop bounds, distinct mutable literals, and inspection-tree edits.
+The `timings` mode alternates code reuse with fresh emission for HMC in one
+process and checks actual integration counts and caller inputs. Its first
+compilation and subsequent warm compilations are reported separately.
+
+`code-reuse-v1.toml` records a fresh process whose first Reactant compilation
+takes 38.49 seconds. Repeated compilation with cached emitted code takes
+0.619 and 0.625 seconds; interleaved fresh emissions of the same code take
+8.06 and 8.73 seconds. Each case constructs a new executable, executes 4,000
+integration steps, and preserves its caller inputs. This reduces repeated
+compilation within one process; the first-compilation cost remains open.
+
+The `reactant-slots` command interleaves synchronized execution with AdvancedHMC.
 Every sample constructs fresh device inputs outside timing. The batch takes
 private working copies once at entry and returns the final chain-phasepoint
 fields, RNG seed, and counts. This keeps scratch mutations inside the compiled
