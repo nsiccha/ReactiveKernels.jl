@@ -1,0 +1,141 @@
+"schema_version" = 1
+"base_commit" = "d53183df6c53fbc501dc24fbdbf6ac2070276190"
+"host" = "strato2"
+"julia" = "1.10.11"
+"reactant" = "0.2.284"
+"enzyme" = "0.13.199"
+"advancedhmc" = "0.8.6"
+"platform" = "cpu"
+"cpu_small_loop_bytes" = 65536
+"replicates" = 7
+"execute_rows" = 168
+"compile_rows" = 12
+"exit_code" = 0
+"elapsed_seconds" = 236
+"data_sha256" = "1e0ee663e763cd162d94d502da937d1eab722a189ab98c500b6f0b3ee343b1de"
+"artifact_archive_sha256" = "4a023cae0e6a1b4a4a81a5635edd32a86dbfe711481917d21ba9836f51d71db3"
+"command" = "timeout --signal=TERM --kill-after=15s 600s julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/matched_endpoint_comparison.jl /absolute/output-directory scaling"
+"contract" = "Matched fixed-length endpoint HMC: centered Eight Schools,10 Float64 parameters,unit diagonal metric,step0.03,L4/16,n100/1000/10000. Same captured minimal mathematical HMC source lowered natively and with Reactant; AHMC EndPointTS and ProbProg :HMC. One final Metropolis decision, no per-step divergence cutoff, no adaptation/history. Outputs final position/RNG. Counters disabled. Each workload compares four implementations in one process using seven alternating timing replicates; input resets/model preparation/compilation excluded. Reactant sync=true,donated_args=:none,64KiB small-loop policy for both. Backend RNG streams independent; no numerical/trajectory agreement gate. AHMC internal unused statistics are an implementation distinction. These are throughput observations, not ESS/s."
+"work_accounting" = "RK integration counts follow fixed captured source bounds (no early return), corroborated by retained emitted loops; no runtime counter. ProbProg emitted fixed loop bound is ceil(.03*L/.03), exactly L for4/16; initial potential/gradient supplied before timing. AHMC FixedNSteps(L). The CSV integration_steps column is n*L from these bounds."
+"compile_order" = "One fresh process: n100 L4,L16; n1000 L4,L16; n10000 L4,L16. Twelve measured Reactant compile rows in this order; native/AHMC compilation not timed or assigned zero. RK first and ProbProg later share a warmed Julia process, so their compilation times are not a cold compiler comparison. Native first-call JIT is warmed outside execution intervals."
+"recorded_output" = "BEGIN prepare_model\nprepare_model seconds=3.840976518 bytes=233027616\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=7.444332444 bytes=859745328\nBEGIN prepare_native_factory\nprepare_native_factory seconds=4.278817043 bytes=317444600\nBEGIN lower_fast_native\nlower_fast_native seconds=3.89030913 bytes=353606600\nchildren=(:init, :fwd)\nBEGIN prepare_model\nprepare_model seconds=0.298933037 bytes=14637104\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=0.479782345 bytes=25804888\nBEGIN prepare_native_factory\nprepare_native_factory seconds=0.562879066 bytes=4079752\nBEGIN lower_fast_native\nlower_fast_native seconds=0.47929321 bytes=23479016\nchildren=(:init, :fwd)\nWARNING: All log messages before absl::InitializeLog() is called are written to STDERR\nI0000 00:00:1788690132.049333     115 rsqrt.cc:179] Falling back to 1 / sqrt(x) for f64 false\nablation_steps L=4 case=rk_native_endpoint steps=400 nominal=400 basis=fixed_source_loop\nablation_steps L=4 case=ahmc_endpoint steps=400 nominal=400 basis=FixedNSteps\nablation_compile L=4 case=rk_reactant_endpoint seconds=36.99117834\nablation_steps L=4 case=rk_reactant_endpoint steps=400 nominal=400 basis=fixed_source_loop\nablation_compile L=4 case=probprog_endpoint seconds=9.030243648\nablation_steps L=4 case=probprog_endpoint steps=400 nominal=400 basis=emitted_fixed_loop\nablation_result L=4 case=rk_native_endpoint median_us=2.01637\nablation_result L=4 case=ahmc_endpoint median_us=2.67469\nablation_result L=4 case=rk_reactant_endpoint median_us=1.3523600000000002\nablation_result L=4 case=probprog_endpoint median_us=0.9795599999999999\nBEGIN prepare_model\nprepare_model seconds=0.315169791 bytes=14637856\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=0.416925209 bytes=25707320\nBEGIN prepare_native_factory\nprepare_native_factory seconds=0.570693145 bytes=4080272\nBEGIN lower_fast_native\nlower_fast_native seconds=0.49904267 bytes=22750488\nchildren=(:init, :fwd)\nBEGIN prepare_model\nprepare_model seconds=0.312215818 bytes=14640544\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=0.408232399 bytes=25712536\nBEGIN prepare_native_factory\nprepare_native_factory seconds=0.831954501 bytes=4078736\nBEGIN lower_fast_native\nlower_fast_native seconds=0.485184616 bytes=23441560\nchildren=(:init, :fwd)\nablation_steps L=16 case=rk_native_endpoint steps=1600 nominal=1600 basis=fixed_source_loop\nablation_steps L=16 case=ahmc_endpoint steps=1600 nominal=1600 basis=FixedNSteps\nablation_compile L=16 case=rk_reactant_endpoint seconds=7.558576394\nablation_steps L=16 case=rk_reactant_endpoint steps=1600 nominal=1600 basis=fixed_source_loop\nablation_compile L=16 case=probprog_endpoint seconds=5.715871615\nablation_steps L=16 case=probprog_endpoint steps=1600 nominal=1600 basis=emitted_fixed_loop\nablation_result L=16 case=rk_native_endpoint median_us=4.87633\nablation_result L=16 case=ahmc_endpoint median_us=7.642429999999999\nablation_result L=16 case=rk_reactant_endpoint median_us=2.00387\nablation_result L=16 case=probprog_endpoint median_us=1.65899\nBEGIN prepare_model\nprepare_model seconds=0.317752364 bytes=14641648\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=0.444552443 bytes=25711720\nBEGIN prepare_native_factory\nprepare_native_factory seconds=0.577641748 bytes=4075312\nBEGIN lower_fast_native\nlower_fast_native seconds=0.492345182 bytes=22752824\nchildren=(:init, :fwd)\nBEGIN prepare_model\nprepare_model seconds=0.323358906 bytes=14642912\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=0.462846065 bytes=25714328\nBEGIN prepare_native_factory\nprepare_native_factory seconds=0.564316388 bytes=4079904\nBEGIN lower_fast_native\nlower_fast_native seconds=0.464875935 bytes=23436056\nchildren=(:init, :fwd)\nablation_steps L=4 case=rk_native_endpoint steps=4000 nominal=4000 basis=fixed_source_loop\nablation_steps L=4 case=ahmc_endpoint steps=4000 nominal=4000 basis=FixedNSteps\nablation_compile L=4 case=rk_reactant_endpoint seconds=6.942827938\nablation_steps L=4 case=rk_reactant_endpoint steps=4000 nominal=4000 basis=fixed_source_loop\nablation_compile L=4 case=probprog_endpoint seconds=5.671325555\nablation_steps L=4 case=probprog_endpoint steps=4000 nominal=4000 basis=emitted_fixed_loop\nablation_result L=4 case=rk_native_endpoint median_us=1.682561\nablation_result L=4 case=ahmc_endpoint median_us=2.385882\nablation_result L=4 case=rk_reactant_endpoint median_us=0.9026550000000001\nablation_result L=4 case=probprog_endpoint median_us=0.857943\nBEGIN prepare_model\nprepare_model seconds=0.328720932 bytes=14640048\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=0.42387981 bytes=25711192\nBEGIN prepare_native_factory\nprepare_native_factory seconds=0.534216633 bytes=4144416\nBEGIN lower_fast_native\nlower_fast_native seconds=0.465361995 bytes=22783128\nchildren=(:init, :fwd)\nBEGIN prepare_model\nprepare_model seconds=0.339371381 bytes=14639248\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=0.429505479 bytes=25713328\nBEGIN prepare_native_factory\nprepare_native_factory seconds=0.554836975 bytes=4077312\nBEGIN lower_fast_native\nlower_fast_native seconds=0.459649405 bytes=23440392\nchildren=(:init, :fwd)\nablation_steps L=16 case=rk_native_endpoint steps=16000 nominal=16000 basis=fixed_source_loop\nablation_steps L=16 case=ahmc_endpoint steps=16000 nominal=16000 basis=FixedNSteps\nablation_compile L=16 case=rk_reactant_endpoint seconds=7.266765863\nablation_steps L=16 case=rk_reactant_endpoint steps=16000 nominal=16000 basis=fixed_source_loop\nablation_compile L=16 case=probprog_endpoint seconds=5.658744182\nablation_steps L=16 case=probprog_endpoint steps=16000 nominal=16000 basis=emitted_fixed_loop\nablation_result L=16 case=rk_native_endpoint median_us=5.074749\nablation_result L=16 case=ahmc_endpoint median_us=8.312865\nablation_result L=16 case=rk_reactant_endpoint median_us=1.316055\nablation_result L=16 case=probprog_endpoint median_us=1.26122\nBEGIN prepare_model\nprepare_model seconds=0.359425221 bytes=14643120\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=0.474164725 bytes=25716696\nBEGIN prepare_native_factory\nprepare_native_factory seconds=0.616647757 bytes=4081200\nBEGIN lower_fast_native\nlower_fast_native seconds=0.482076049 bytes=22771000\nchildren=(:init, :fwd)\nBEGIN prepare_model\nprepare_model seconds=0.285767949 bytes=14634000\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=0.46482194 bytes=25709528\nBEGIN prepare_native_factory\nprepare_native_factory seconds=0.563105659 bytes=4077376\nBEGIN lower_fast_native\nlower_fast_native seconds=0.458533737 bytes=23459320\nchildren=(:init, :fwd)\nablation_steps L=4 case=rk_native_endpoint steps=40000 nominal=40000 basis=fixed_source_loop\nablation_steps L=4 case=ahmc_endpoint steps=40000 nominal=40000 basis=FixedNSteps\nablation_compile L=4 case=rk_reactant_endpoint seconds=7.06464003\nablation_steps L=4 case=rk_reactant_endpoint steps=40000 nominal=40000 basis=fixed_source_loop\nablation_compile L=4 case=probprog_endpoint seconds=5.557653201\nablation_steps L=4 case=probprog_endpoint steps=40000 nominal=40000 basis=emitted_fixed_loop\nablation_result L=4 case=rk_native_endpoint median_us=1.3295378\nablation_result L=4 case=ahmc_endpoint median_us=3.6550833\nablation_result L=4 case=rk_reactant_endpoint median_us=0.5503861\nablation_result L=4 case=probprog_endpoint median_us=0.6313557\nBEGIN prepare_model\nprepare_model seconds=0.320316101 bytes=14640352\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=0.410368935 bytes=25709752\nBEGIN prepare_native_factory\nprepare_native_factory seconds=0.524368181 bytes=4077888\nBEGIN lower_fast_native\nlower_fast_native seconds=0.434896215 bytes=22756120\nchildren=(:init, :fwd)\nBEGIN prepare_model\nprepare_model seconds=0.286252868 bytes=14647648\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=0.401881459 bytes=25711848\nBEGIN prepare_native_factory\nprepare_native_factory seconds=0.568842292 bytes=4078000\nBEGIN lower_fast_native\nlower_fast_native seconds=0.439371839 bytes=23442472\nchildren=(:init, :fwd)\nablation_steps L=16 case=rk_native_endpoint steps=160000 nominal=160000 basis=fixed_source_loop\nablation_steps L=16 case=ahmc_endpoint steps=160000 nominal=160000 basis=FixedNSteps\nablation_compile L=16 case=rk_reactant_endpoint seconds=6.497247406\nablation_steps L=16 case=rk_reactant_endpoint steps=160000 nominal=160000 basis=fixed_source_loop\nablation_compile L=16 case=probprog_endpoint seconds=5.515627226\nablation_steps L=16 case=probprog_endpoint steps=160000 nominal=160000 basis=emitted_fixed_loop\nablation_result L=16 case=rk_native_endpoint median_us=5.8422991\nablation_result L=16 case=ahmc_endpoint median_us=13.295463900000003\nablation_result L=16 case=rk_reactant_endpoint median_us=1.1647976\nablation_result L=16 case=probprog_endpoint median_us=1.1792775\n"
+"artifact_archive" = "/home/niko/.local/state/kb-agents/uploads/bac5ecf4d0b4e1b0.targz"
+
+["source_sha256"]
+"src/ad.jl" = "c130633ebe82bd8105f3d1b6e7647df77f5395744dcbc6ac8cfc36739974b162"
+"ext/ReactiveKernelsReactantExt.jl" = "6557fdb95b8115a375ca99d73496a30e2fddddff2c2eab09a92da8663819ff34"
+"src/kernel_adaptation.jl" = "d655baa036d4e5770b769ab644b8c56ca0567c167d3643011352131e9928a5c4"
+"benchmark/reactivehmc_hmc_kernel_fixture_b.jl" = "9ffa4e8e2990992cd92303e55a6d005cff2c6e1698de6bca7941ad2907f8a4da"
+"benchmark/nuts_kernel_authoring_fixture_b.jl" = "7a9a9d6e1fa122e3d846def760933b0ba14e62e567d92cffab9d9d638f9404f4"
+"benchmark/sampler_transpiler/hmc_eight_schools.jl" = "c18b800fc013d8007d1d1b23d7c7330b89304bc8ff92767562b26a788d2d5996"
+"benchmark/sampler_transpiler/native_slots.jl" = "c0f03d31c96be0c6282608c93779cd6c92c00e3741e40bdf62bc365e3f8d3e25"
+"benchmark/sampler_transpiler/native_slots_factory.jl" = "36468f4da6321631c0eba1a8fc1baa5dee305220b0e1572d6966b509365f8235"
+"benchmark/sampler_transpiler/native_comparison.jl" = "4d33ff1cdff0575f58a952799cd648bbd18e7830358e7d866512979e9aff2b23"
+"benchmark/sampler_transpiler/traced_slots.jl" = "1145f10c16fb282f15615d8450e57b0e947af0b44c7a42ae99d16adfe9a18fd1"
+"benchmark/sampler_transpiler/traced_comparison.jl" = "ff891cd14f9ae1933a3b3813246b1d242b056b3b8c271425c3545e1bb78732c0"
+"benchmark/sampler_transpiler/loop_control_probe.jl" = "45bc979f7bdfbbc91918f4aa3300f794d7b263dd788b4707b7e621e4b1970881"
+"benchmark/sampler_transpiler/profile_compile.jl" = "ba92a50afae1fdd86667fc00f16197a0479214e714eb2237e10b2cdf7332dbc8"
+"src/ReactiveKernels.jl" = "5dadbc59cd45725b1b00350cc5156e4b8a403c766b90ca24985f5bc958d3ce01"
+"src/native_slot_compiler.jl" = "206f475697d27bbc230f5eca0631378ee22e13951ab5929d94158ae6802ebea9"
+"src/native_slots.jl" = "9c6857d54dbd5471a62017a0cbfa6764442a98476f9f680ccee94991d12186c1"
+"src/native_slots_factory.jl" = "9f0f47fc081de7b54950fe4e87ec488b6dfb0e6b84fa3119af1a07ff96d0928a"
+"ext/ReactiveKernelsReactantExt/traced_slot_compiler.jl" = "41043e9bdc9be09e9a40a21849fe3ffff99e8114fa2d5697e918e12aedc2445e"
+"ext/ReactiveKernelsReactantExt/traced_slots.jl" = "470236c0fde74933d3f39147418984221ef27ca77440fd04c4ff350bad948f86"
+"benchmark/sampler_transpiler/scalar_argument_probe.jl" = "277492fefac36afa9dce6b96f1510137dcd3eda1eb0ef97e44874a5300b0b47b"
+"ext/ReactiveKernelsReactantExt/traced_code_cache.jl" = "1e1b87256021628044b47b5c2c3e0f8d14d0e298d58e156c82b0f8958c0d46fb"
+"benchmark/sampler_transpiler/code_reuse_probe.jl" = "2ce50d054e810c354e4561ff1ce8067bcb02010560eb319edac73e05fb0c0ec0"
+"benchmark/sampler_transpiler/multinomial_hmc_kernel.jl" = "a854b0a9cf5ec660e64d622b9442804a564ffc0657ed3089331aa9e5fcb97218"
+"benchmark/sampler_transpiler/multinomial_eight_schools.jl" = "0080849f5e4cd1d5ac933aba28d941e747d99669fb9cf14b38efd201a29ce9df"
+"benchmark/sampler_transpiler/constant_binding_probe.jl" = "a510b08850dc0e07779ff80750c26bdddac93552c2d8b7ea400148973bcf95c8"
+"benchmark/sampler_transpiler/range_draw_probe.jl" = "e9d82d844fbed32de615ee8dde49876cf488a102d6d6938c8c2742f4692cbe5f"
+"ext/ReactiveKernelsReactantExt/traced_random.jl" = "33e50ef2a1f7eda06a4a01bb66892565d609e2d28aa418f391db445f468e0e93"
+"src/kernel_stateful.jl" = "2cff19f87a39d124a462d4f79cd99cb94c9908c16f5b1c2d3946db7af89a6776"
+"test/test_kernel_methodir.jl" = "1aa1a6a9501d4525031f7ea8166bf3e6bf29ce8bd85b23a18e101b2d929961f7"
+"benchmark/sampler_transpiler/indexed_array_probe.jl" = "a746173df251cb14f6b628a3142337ca15458fc486e1afe6e2caf1d7ba4f06bd"
+"src/kernel_factory.jl" = "6cd1cc5e3715d420a4d06983d361a2597c3a2f243f88e21fbcd5eb2fda4e65b1"
+"benchmark/sampler_transpiler/runtime_keyword_probe.jl" = "fcdff23cfaabf5616dbc339653b660117ed4e96ae8c844382196631bc3bf6f08"
+"benchmark/sampler_transpiler/counter_ablation.jl" = "1d459d0f9ee8c3741d13659be69724d3a924698c6bdf036b7f825b66a952a0f5"
+"benchmark/sampler_transpiler/partial_transfer_probe.jl" = "190c2a9d23a7b438a03ad41fb3c8fca5e116a89cc49273153bdbf25028da1552"
+"benchmark/sampler_transpiler/position_multinomial_hmc_kernel.jl" = "25c1328145e517c7b53dfc0b0e4d51aa5fc8f08e984e429da36412da5d06d0fe"
+"benchmark/sampler_transpiler/multinomial_scaling.jl" = "eefe6b222e9327f09ebc11aab9fe7551f04276f545ff22ccfa492a72718f86da"
+"benchmark/sampler_transpiler/position_multinomial_scaling.jl" = "27955460892188a89d71bec0efe6c5e06f5e822d45b66ebb788a41f47ea25bf3"
+"ext/ReactiveKernelsReactantExt/traced_compile_options.jl" = "19b055a5cb2579857a7b76423c6d677dfee52cb02d82e09d3632b9496752a82a"
+"benchmark/sampler_transpiler/cpu_loop_packing.jl" = "0fc63923111bcb8e037d2ecdc01d9a7a88dfde26d86d5d59e3bac5bbee7b5a8b"
+"benchmark/sampler_transpiler/probprog_hmc_scaling.jl" = "d0f555387f2b7b1bc882eb92683ff1b3b9324769451ef65d50fad2932355d361"
+"benchmark/sampler_transpiler/endpoint_ablation.jl" = "e8dd95e5f163055dbc33cae7743724aef962164d894ac5282d283bfc082a0567"
+"benchmark/sampler_transpiler/endpoint_hmc_kernel.jl" = "8d6fc3ed4fc7ebf44cb2062287e58cc60164b8ae00b1e5d791f7a4267cf9c8ac"
+"benchmark/sampler_transpiler/matched_endpoint_comparison.jl" = "6e0dbc732712deb1463c2ecd83e63fb97a6ef1a7d7a57fdb4219f6797418570e"
+
+["emissions"]
+
+["emissions"."n100-L16/probprog_endpoint.mlir"]
+"sha256" = "dee500027af47a2608ba38ebc7641ce1a3ea1f4879bf1b2cdfcf685173bd305e"
+"bytes" = 41576
+"while_regions" = 2
+"if_regions" = 0
+
+["emissions"."n100-L16/rk_reactant_endpoint.mlir"]
+"sha256" = "d56b9e18ae0a83075d1491e1dc47a2514ddf5c43aa9f36ba3b0167b65fe3d247"
+"bytes" = 32967
+"while_regions" = 2
+"if_regions" = 0
+
+["emissions"."n100-L4/probprog_endpoint.mlir"]
+"sha256" = "ac5963cab3491fedb74c5aa98f0ee5ffffd3cd6ddcd0789844c3cd783fedaca1"
+"bytes" = 41576
+"while_regions" = 2
+"if_regions" = 0
+
+["emissions"."n100-L4/rk_reactant_endpoint.mlir"]
+"sha256" = "99bc9f7f485ed9804b5a54886c8e3c573f1671fd84019527eaa624785fac7c33"
+"bytes" = 28617
+"while_regions" = 1
+"if_regions" = 0
+
+["emissions"."n1000-L16/probprog_endpoint.mlir"]
+"sha256" = "94f9748fac1d043f44e884a455f8f0ec146681324080862eb1ffb1296a4287bb"
+"bytes" = 41577
+"while_regions" = 2
+"if_regions" = 0
+
+["emissions"."n1000-L16/rk_reactant_endpoint.mlir"]
+"sha256" = "caf16deb8e86769b753859098c8211c4092bf4dfefd11d0c50fce418d0ca1e8a"
+"bytes" = 32968
+"while_regions" = 2
+"if_regions" = 0
+
+["emissions"."n1000-L4/probprog_endpoint.mlir"]
+"sha256" = "dce28ed65934556101ea680f14e34ec84f62442b7aaf3086fccc17234144650e"
+"bytes" = 41577
+"while_regions" = 2
+"if_regions" = 0
+
+["emissions"."n1000-L4/rk_reactant_endpoint.mlir"]
+"sha256" = "77db275b6b95aa3cc01748f79802443f0248d5e608f82383643c2ce74a804e4b"
+"bytes" = 28618
+"while_regions" = 1
+"if_regions" = 0
+
+["emissions"."n10000-L16/probprog_endpoint.mlir"]
+"sha256" = "7c2b8280572d5beae54642ecc2540f3a2ca98b97cc273b7aa61b591fc96310d2"
+"bytes" = 41578
+"while_regions" = 2
+"if_regions" = 0
+
+["emissions"."n10000-L16/rk_reactant_endpoint.mlir"]
+"sha256" = "4f555e6741a847044e1d5f2c5d6e57e0bd6057daf7fa615bb54a94aafb2a108a"
+"bytes" = 32969
+"while_regions" = 2
+"if_regions" = 0
+
+["emissions"."n10000-L4/probprog_endpoint.mlir"]
+"sha256" = "d3b81d82471a632c7729aa77d4ce0e527f2a6f099bc250e3d2236e201dffd0f6"
+"bytes" = 41578
+"while_regions" = 2
+"if_regions" = 0
+
+["emissions"."n10000-L4/rk_reactant_endpoint.mlir"]
+"sha256" = "583be84520f49f0afab9772638016a2b419f344030c6a8ad6c694b4ec0ec2bf1"
+"bytes" = 28619
+"while_regions" = 1
+"if_regions" = 0

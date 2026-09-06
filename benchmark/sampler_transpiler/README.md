@@ -463,3 +463,37 @@ and compilation cost and integrating the generic lowering remain work.
 The `ahmc` mode uses AdvancedHMC 0.8.6 endpoint HMC with the same bound RK density,
 prepared gradient, initial position, metric, step size, and leapfrog count.
 Initialization is outside its warm timing. Compilation is reported separately.
+
+
+### Compare the same sampler variant
+
+`matched_endpoint_comparison.jl /absolute/output-directory scaling` compares
+fixed-length endpoint HMC across generated native Julia, AdvancedHMC `EndPointTS`,
+generated Reactant, and Reactant ProbProg `:HMC`. The source is
+`endpoint_hmc_kernel.jl`: the existing captured phasepoint/leapfrog, exactly L
+steps, and one final Metropolis decision. There is no per-step divergence
+observation or early return. Both generated backends use the generic compiler;
+`build_fast_prototype` now accepts an explicit mathematical `source`.
+
+All cases use the same centered Eight Schools density, unit metric, step size
+0.03, final-position/RNG output and no adaptation/history. The two Reactant
+cases use synchronized calls and the same 64 KiB CPU loop policy. Seven timing
+replicates alternate across all four implementations within each workload.
+Model preparation, input resets and compilation are outside execution timing.
+RK integration counters are off; counts follow fixed source/emitted loop bounds,
+not runtime measurements. Native/AHMC first-call compilation is not timed.
+
+`matched-endpoint-scaling-v1.csv` contains 168 execution samples and 12 separate
+Reactant compilation measurements. The TOML receipt includes source hashes and
+a durable archive of the complete run and emitted programs. At 10,000
+transitions, generated Reactant and ProbProg are competitive; short runs still
+favor ProbProg. The margins vary between runs. This comparison does not measure
+sampling efficiency or require matching numerical results or random streams.
+
+Keep multinomial comparisons separate: generated multinomial HMC is compared
+with AdvancedHMC `MultinomialTS`. The earlier ProbProg-only scaling receipt is
+valid endpoint data, but placing it beside multinomial timings does not isolate
+compiler overhead. `endpoint_ablation.jl` retains the legacy per-step-divergence
+endpoint comparison as a diagnostic. Its actual integration counters can be
+short of n*L. `endpoint-comparison-v1.toml` preserves that diagnostic, the first
+matched checkpoint, and the initial harness assertion failure.
