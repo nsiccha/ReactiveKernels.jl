@@ -373,6 +373,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "nuts-reactant.md" => "frozen",
         "bijectors.md" => "frozen",
         "nonallocating.md" => "review-pending",
+        "ppl-front-end.md" => "review-pending",
     )
     structural_markers = Dict(
         "probprog-mcmc.md" => (

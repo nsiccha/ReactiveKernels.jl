@@ -55,6 +55,7 @@ site_pages = [
             "Correlated (MvNormal) regression" => "mvnormal-regression.md",
             "Partial evaluation (bound data)" => "bound-regression.md",
         ],
+        "Declarative @ppl front-end + Gibbs (experimental)" => "ppl-front-end.md",
     ],
     "Automatic differentiation" => [
         "Prepared gradients" => "automatic-differentiation.md",

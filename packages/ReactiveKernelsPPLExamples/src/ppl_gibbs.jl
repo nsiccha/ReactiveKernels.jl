@@ -152,18 +152,30 @@ function _detect_conjugate(info::PPLMacro.PPLModelInfo, data, block::Symbol)
 end
 
 # A discrete latent (support `:discrete`) is sampled by ENUMERATION of its full
-# conditional — never a random walk. Returns the tuple of support values to
-# enumerate, or `nothing` when `block` is not an enumerable discrete latent.
-# First cut: scalar Bernoulli latents ({0, 1}).
+# conditional — never a random walk. Returns `(; kind, vals)` — `kind` is
+# `:scalar` or `:vector` (a vector latent is updated element-wise), `vals` the
+# support values to enumerate — or `nothing` when `block` is not an enumerable
+# discrete latent. Bernoulli's port is `Bool`, so `vals = (false, true)`.
 function _detect_discrete(info::PPLMacro.PPLModelInfo, block::Symbol)
     for pi in info.params
         pi.name === block || continue
         pi.support === :discrete || return nothing
-        pi.is_vector && return nothing                 # scalar discrete only (first cut)
-        pi.prior_family === :bernoulli && return (false, true)   # Bernoulli port is Bool
-        return nothing                                 # other discrete families: later
+        pi.prior_family === :bernoulli || return nothing   # other discrete families: later
+        return (; kind = pi.is_vector ? :vector : :scalar, vals = (false, true))
     end
     nothing
+end
+
+# Sample a category from unnormalized log-weights `logps` over `vals`.
+function _sample_categorical(rng, vals, logps)
+    w = exp.(logps .- maximum(logps))
+    r = rand(rng) * sum(w)
+    acc = 0.0
+    @inbounds for i in eachindex(vals)
+        acc += w[i]
+        r <= acc && return vals[i]
+    end
+    vals[end]
 end
 
 # Random-walk proposal in a block's UNCONSTRAINING space, returning the proposal
@@ -340,26 +352,32 @@ function gibbs(model; blocks, data, init, iters::Int, rng,
             d = m1 === nothing ? nothing : disc[m1]
             c = m1 === nothing ? nothing : conj[m1]
             if d !== nothing
-                # Exact discrete Gibbs draw: enumerate the full conditional over
-                # the support values and sample the normalized categorical.
-                logps = Float64[]
-                for v in d
-                    set!(st, ports[m1], v)
-                    push!(logps, logtarget())
-                end
-                w = exp.(logps .- maximum(logps))
-                r = rand(rng) * sum(w)
-                acc = 0.0
-                chosen = d[end]
-                for i in eachindex(d)
-                    acc += w[i]
-                    if r <= acc
-                        chosen = d[i]
-                        break
+                # Exact discrete Gibbs draw by enumerating the full conditional.
+                if d.kind === :scalar
+                    logps = Float64[]
+                    for v in d.vals
+                        set!(st, ports[m1], v)
+                        push!(logps, logtarget())
                     end
+                    chosen = _sample_categorical(rng, d.vals, logps)
+                    set!(st, ports[m1], chosen)
+                    cur[m1] = chosen
+                else
+                    # Vector latent: single-site enumeration per element, each
+                    # conditioned on the current values of the others.
+                    zv = collect(cur[m1])
+                    for j in eachindex(zv)
+                        logps = Float64[]
+                        for v in d.vals
+                            zv[j] = v
+                            set!(st, ports[m1], zv)
+                            push!(logps, logtarget())
+                        end
+                        zv[j] = _sample_categorical(rng, d.vals, logps)
+                    end
+                    set!(st, ports[m1], zv)
+                    cur[m1] = zv
                 end
-                set!(st, ports[m1], chosen)
-                cur[m1] = chosen
                 counted && (accepts[k] += 1)
             elseif c !== nothing
                 # Exact conjugate draw (single-latent block) — always accepted.
