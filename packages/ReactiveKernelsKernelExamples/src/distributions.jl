@@ -10,9 +10,11 @@ export CAUCHY_SOURCE, LAPLACE_SOURCE, LOGNORMAL_SOURCE
 export LOCATION_SCALE_SOURCE
 export normal, cauchy, laplace, bernoulli, lognormal
 export exponential, geometric, uniform, mvnormal, ar1
+export poisson, gamma, beta, binomial
 export NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY
 export EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE
 export MVNORMAL_SOURCE, AR1_SOURCE
+export POISSON_SOURCE, GAMMA_SOURCE, BETA_SOURCE, BINOMIAL_SOURCE
 export all_sources, evaluate_source, run
 
 using Distributions
@@ -22,9 +24,11 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     LOCATION_SCALE_SOURCE, normal, cauchy, laplace,
     BERNOULLI_SOURCE, LOGNORMAL_SOURCE,
     bernoulli, lognormal, exponential, geometric, uniform, mvnormal, ar1,
+    poisson, gamma, beta, binomial,
     NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY,
     EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE,
-    MVNORMAL_SOURCE, AR1_SOURCE
+    MVNORMAL_SOURCE, AR1_SOURCE,
+    POISSON_SOURCE, GAMMA_SOURCE, BETA_SOURCE, BINOMIAL_SOURCE
 
 _allocated(f, a, b) = @allocated f(a, b)
 _allocated(f, a, b, c) = @allocated f(a, b, c)
@@ -124,6 +128,7 @@ all_sources() = (
     CAUCHY_SOURCE, LAPLACE_SOURCE, LOGNORMAL_SOURCE,
     EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE,
     MVNORMAL_SOURCE, AR1_SOURCE,
+    POISSON_SOURCE, GAMMA_SOURCE, BETA_SOURCE, BINOMIAL_SOURCE,
 )
 
 function evaluate_source(source::AbstractString)
@@ -216,6 +221,29 @@ function evaluate_source(source::AbstractString)
         reference_call = (x, μ, chol) -> logpdf(MvNormal(μ, chol * chol'), x)
         reference = reference_call(inputs...)
         reference_allocated_bytes = _allocated(reference_call, x, μ, chol)
+    elseif artifact.name === :poisson_lograte
+        observed, log_rate = inputs
+        reference_call = (observed, log_rate) ->
+            logpdf(Poisson(exp(log_rate)), observed)
+        reference = reference_call(inputs...)
+        reference_allocated_bytes = _allocated(reference_call, observed, log_rate)
+    elseif artifact.name === :gamma_shape_rate
+        x, shape, log_rate = inputs
+        reference_call = (x, shape, log_rate) ->
+            logpdf(Gamma(shape, 1 / exp(log_rate)), x)
+        reference = reference_call(inputs...)
+        reference_allocated_bytes = _allocated(reference_call, x, shape, log_rate)
+    elseif artifact.name === :beta_unit_interval
+        x, a, b = inputs
+        reference_call = (x, a, b) -> logpdf(Beta(a, b), x)
+        reference = reference_call(inputs...)
+        reference_allocated_bytes = _allocated(reference_call, x, a, b)
+    elseif artifact.name === :binomial_logit
+        observed, n, logit = inputs
+        reference_call = (observed, n, logit) ->
+            logpdf(Binomial(n, logistic(logit)), observed)
+        reference = reference_call(inputs...)
+        reference_allocated_bytes = _allocated(reference_call, observed, n, logit)
     elseif artifact.name === :stationary_ar1
         x, μ, ϕ, log_scale = inputs
         reference_call = function (x, μ, ϕ, log_scale)
