@@ -5,9 +5,10 @@ An RK-native, StanBlocks-*like* declarative PPL front-end (first cut).
 
 `@ppl` owns a small PPL AST plus a posterior-mode parameter/observation analysis
 and lowers a declarative `~` model into an ordinary `ReactiveKernels.@kernel`
-have→want graph that exposes the canonical PPL workflow node set (see
-`PPLWorkflow` on `kb-impl/ReactiveKernels-ppl-benchmark`, commit `59dd8bb`). It
-is built entirely on ReactiveKernels' PUBLIC surface (`@kernel` / `prepare` /
+have→want graph that exposes the canonical `PPLWorkflow.PPL_NODES` node set
+(`ppl_workflow.jl`), so a macro-produced model is queried exactly like a
+hand-authored one — e.g. `prepare(model; have, want = PPLWorkflow.workflow_wants(:sampler))`.
+It is built entirely on ReactiveKernels' PUBLIC surface (`@kernel` / `prepare` /
 `plan` / `plate`) plus the reusable distribution-kernel objects — nothing lives
 in ReactiveKernels core.
 
@@ -54,14 +55,18 @@ and `eight_schools` example densities exactly (density parity).
 """
 module PPLMacro
 
+import ..PPLWorkflow
+
 export @ppl
 
-# Canonical node names — mirror of `PPLWorkflow.PPL_NODES`
-# (`packages/ReactiveKernelsPPLExamples/src/ppl_workflow.jl` @ `59dd8bb`, not yet
-# on main). Once it lands, `import ..PPLWorkflow` and assert equality here.
+# The canonical node names `@ppl` emits. Kept in lockstep with the committed
+# `PPLWorkflow.PPL_NODES` contract (`ppl_workflow.jl`) by the guard below — a
+# drift in the contract fails loudly at load rather than silently emitting a
+# graph that a `PPLWorkflow.workflow_wants` cut can no longer address.
 const PPL_NODE_NAMES = (:parameters, :log_jacobian, :prior, :pointwise,
                         :likelihood, :unconstrained_prior,
                         :constrained_logdensity, :posterior)
+@assert Tuple(values(PPLWorkflow.PPL_NODES)) == PPL_NODE_NAMES
 
 # Parameter-support inferred from the sampling distribution, driving the
 # unconstrained↔constrained transform + log-Jacobian:

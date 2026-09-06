@@ -1,5 +1,5 @@
-using ReactiveKernelsPPLExamples: @ppl, BetaBinomialExample, PoissonGammaExample,
-    EightSchoolsExample, LinearRegressionExample
+using ReactiveKernelsPPLExamples: @ppl, PPLWorkflow, BetaBinomialExample,
+    PoissonGammaExample, EightSchoolsExample, LinearRegressionExample
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal, cauchy, exponential, beta, binomial, gamma, poisson
 
@@ -45,6 +45,11 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
                      want = :unconstrained_prior)(q)
         @test cld ≈ ref_prior + ref_ll
         @test up ≈ ref_prior
+
+        # queried exactly like a hand-authored model via the committed contract.
+        via_workflow = prepare(mm; have = (:unconstrained, :y, :sigma),
+            want = PPLWorkflow.workflow_wants(:sampler))(q, y, sigma)
+        @test via_workflow ≈ ref_prior + ref_ll
     end
 
     @testset "named-latent HAVE boundary" begin
