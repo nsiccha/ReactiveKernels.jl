@@ -1,6 +1,7 @@
 using DifferentiationInterface
 import Enzyme
 using LinearAlgebra
+using SpecialFunctions: loggamma, logbeta
 using ReactiveKernelsPPLExamples.EightSchoolsExample
 using ReactiveKernelsPPLExamples.LinearRegressionExample
 using ReactiveKernelsPPLExamples.BetaBinomialExample
@@ -48,24 +49,38 @@ function linear_regression_reference_density(q)
     prior + log_σ + likelihood
 end
 
+# Binomial log-choose and log B(2, 2) are data-only, so precompute them and keep
+# the differentiated reference free of loggamma/logbeta (as the RK kernel treats
+# the counts as inactive data).
+const _BB_LOG_CHOOSE = [
+    loggamma(n + 1.0) - loggamma(k + 1.0) - loggamma(n - k + 1.0)
+    for (n, k) in zip(BETA_BINOMIAL_TRIALS, BETA_BINOMIAL_SUCCESSES)]
+const _BB_LOGBETA22 = logbeta(2.0, 2.0)
+
 function beta_binomial_reference_density(logit_rate)
-    rate = BetaBinomialExample.logistic(logit_rate)
-    parameters = BetaBinomialParameters(rate)
-    prior = BetaBinomialExample.log_prior(parameters)
-    likelihood = BetaBinomialExample.sum_log_likelihood(
-        BetaBinomialExample.pointwise_log_likelihood(
-            parameters, BETA_BINOMIAL_TRIALS, BETA_BINOMIAL_SUCCESSES))
-    BetaBinomialExample.total_log_density(
-        prior, BetaBinomialExample.log_abs_det_jacobian(rate), likelihood)
+    rate = 1 / (1 + exp(-logit_rate))
+    log_jacobian = log(rate) + log1p(-rate)
+    prior = log(rate) + log1p(-rate) - _BB_LOGBETA22
+    likelihood = zero(rate)
+    @inbounds for i in eachindex(BETA_BINOMIAL_TRIALS)
+        n = BETA_BINOMIAL_TRIALS[i]
+        k = BETA_BINOMIAL_SUCCESSES[i]
+        likelihood += _BB_LOG_CHOOSE[i] + k * log(rate) + (n - k) * log1p(-rate)
+    end
+    prior + log_jacobian + likelihood
 end
 
+const _PG_LOG_FACTORIALS = [loggamma(c + 1.0) for c in POISSON_COUNTS]
+const _PG_LOG_GAMMA2 = loggamma(2.0)
+
 function poisson_gamma_reference_density(log_rate)
-    parameters = PoissonGammaParameters(exp(log_rate))
-    prior = PoissonGammaExample.log_prior(parameters)
-    likelihood = PoissonGammaExample.sum_log_likelihood(
-        PoissonGammaExample.pointwise_log_likelihood(
-            parameters, POISSON_COUNTS))
-    PoissonGammaExample.total_log_density(prior, log_rate, likelihood)
+    rate = exp(log_rate)
+    prior = -_PG_LOG_GAMMA2 + log(rate) - rate
+    likelihood = zero(rate)
+    @inbounds for i in eachindex(POISSON_COUNTS)
+        likelihood += POISSON_COUNTS[i] * log(rate) - rate - _PG_LOG_FACTORIALS[i]
+    end
+    prior + log_rate + likelihood
 end
 
 function dugongs_reference_density(q)

@@ -1,14 +1,11 @@
 # Declarative PPL kernel: beta-binomial
 
-```@eval
-Main.ReactiveKernelsDocs.render_review_status(:frozen_ppl)
-```
-
 `ReactiveKernels` has no built-in probabilistic-programming semantics. Like the
 [eight-schools example](eight-schools.md), this one assembles those semantics
-manually from ordinary pure Julia recipes, while leaving the graph planner
-responsible only for selecting the computation required by a particular
-`have`/`want` query.
+inline in one authored model kernel: the Beta prior and Binomial likelihood are
+reused from the shared distribution objects, the likelihood is one authored
+`plate`, and the graph planner is left responsible only for selecting the
+computation a particular `have`/`want` query needs.
 
 The complete runnable source is
 [`packages/ReactiveKernelsPPLExamples/src/beta_binomial.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsPPLExamples/src/beta_binomial.jl).

@@ -251,12 +251,10 @@ function setup_beta_binomial!(mod::Module)
     if !isdefined(mod, :BetaBinomialExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: BetaBinomialExample))
     end
+    # Bind only the data. The displayed PPL assembly imports and reuses the
+    # shared `beta` and `binomial` distribution objects directly.
     Core.eval(mod, :(using .BetaBinomialExample:
-        BetaBinomialParameters, CountVector,
-        BETA_BINOMIAL_TRIALS, BETA_BINOMIAL_SUCCESSES,
-        logistic, assemble_parameters, log_abs_det_jacobian,
-        log_prior, pointwise_log_likelihood, sum_log_likelihood,
-        total_log_density, expected_successes))
+        BETA_BINOMIAL_TRIALS, BETA_BINOMIAL_SUCCESSES))
     nothing
 end
 
@@ -264,11 +262,9 @@ function setup_poisson_gamma!(mod::Module)
     if !isdefined(mod, :PoissonGammaExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: PoissonGammaExample))
     end
-    Core.eval(mod, :(using .PoissonGammaExample:
-        PoissonGammaParameters, CountVector, POISSON_COUNTS,
-        positive_rate, assemble_parameters, log_abs_det_jacobian,
-        log_prior, pointwise_log_likelihood, sum_log_likelihood,
-        total_log_density, expected_count))
+    # Bind only the data. The displayed PPL assembly imports and reuses the
+    # shared `gamma` and `poisson` distribution objects directly.
+    Core.eval(mod, :(using .PoissonGammaExample: POISSON_COUNTS))
     nothing
 end
 
