@@ -1,0 +1,132 @@
+schema = "all-sides-gaussian-regression-v1"
+generated_at = "2026-09-06T12:11:54.541"
+methodology = "median over 12 rounds of BenchmarkTools minimum(200 samples); setup/compile/first-call excluded; sufficient statistics precomputed once for all conjugate sides"
+
+source = "benchmark/all_sides_gaussian_regression.jl (+ _body.jl) — the executed model authority for all three sides"
+rk_source_commit = "0c82f027cd6f325247b2795c3f55f2e598be1008"
+
+[environment]
+julia = "1.10.11"
+arch = "x86_64"
+stan = "2.39.0 (BridgeStan 2.9.0)"
+cpu = "AMD EPYC-Milan Processor"
+packages = "Turing 0.47.1, DynamicPPL 0.42.6, Distributions 0.25.131, Enzyme 0.13.201, Mooncake 0.5.53, DifferentiationInterface 0.7.21"
+
+[[sizes]]
+N = 5000
+dim = 22
+K = 20
+
+    [[sizes.measurements]]
+    kind = "primal"
+    median_ns = 38303.0
+    min_ns = 37261.0
+    median_bytes = 16
+    impl = "stan_naive"
+    [[sizes.measurements]]
+    kind = "primal"
+    median_ns = 12022.0
+    min_ns = 10915.0
+    median_bytes = 16
+    impl = "stan_glm"
+    [[sizes.measurements]]
+    kind = "primal"
+    median_ns = 310.0
+    min_ns = 290.0
+    median_bytes = 16
+    impl = "stan_conj"
+    [[sizes.measurements]]
+    kind = "primal"
+    median_ns = 305.5
+    min_ns = 290.0
+    median_bytes = 672
+    impl = "turing_conj"
+    [[sizes.measurements]]
+    kind = "primal"
+    median_ns = 160.0
+    min_ns = 150.0
+    median_bytes = 224
+    impl = "rk_conj_native"
+    [[sizes.measurements]]
+    kind = "primal"
+    median_ns = 150.0
+    min_ns = 150.0
+    median_bytes = 224
+    impl = "rk_conj_bound"
+    [[sizes.measurements]]
+    kind = "gradient"
+    median_ns = 1036.0
+    min_ns = 1002.0
+    median_bytes = 256
+    impl = "stan_conj"
+    [[sizes.measurements]]
+    kind = "gradient"
+    median_ns = 2854.0
+    min_ns = 2694.0
+    median_bytes = 9376
+    impl = "turing_conj"
+    [[sizes.measurements]]
+    kind = "gradient"
+    median_ns = 560.0
+    min_ns = 550.0
+    median_bytes = 848
+    impl = "rk_conj_bound"
+[[sizes]]
+N = 5000
+dim = 102
+K = 100
+
+    [[sizes.measurements]]
+    kind = "primal"
+    median_ns = 76170.0
+    min_ns = 73441.0
+    median_bytes = 16
+    impl = "stan_naive"
+    [[sizes.measurements]]
+    kind = "primal"
+    median_ns = 51801.5
+    min_ns = 51141.0
+    median_bytes = 16
+    impl = "stan_glm"
+    [[sizes.measurements]]
+    kind = "primal"
+    median_ns = 1171.0
+    min_ns = 1141.0
+    median_bytes = 16
+    impl = "stan_conj"
+    [[sizes.measurements]]
+    kind = "primal"
+    median_ns = 921.5
+    min_ns = 871.0
+    median_bytes = 2688
+    impl = "turing_conj"
+    [[sizes.measurements]]
+    kind = "primal"
+    median_ns = 681.0
+    min_ns = 651.0
+    median_bytes = 896
+    impl = "rk_conj_native"
+    [[sizes.measurements]]
+    kind = "primal"
+    median_ns = 665.5
+    min_ns = 640.0
+    median_bytes = 896
+    impl = "rk_conj_bound"
+    [[sizes.measurements]]
+    kind = "gradient"
+    median_ns = 5828.0
+    min_ns = 5647.0
+    median_bytes = 912
+    impl = "stan_conj"
+    [[sizes.measurements]]
+    kind = "gradient"
+    median_ns = 12597.0
+    min_ns = 11757.0
+    median_bytes = 91456
+    impl = "turing_conj"
+    [[sizes.measurements]]
+    kind = "gradient"
+    median_ns = 5297.5
+    min_ns = 4336.0
+    median_bytes = 2192
+    impl = "rk_conj_bound"
