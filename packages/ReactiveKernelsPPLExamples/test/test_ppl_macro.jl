@@ -7,10 +7,10 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal, cauchy, exponential, beta, binomial, gamma, poisson
 
 # RK-native, StanBlocks-faithful `@ppl` front-end (experimental, first cut):
-# typed-LHS `name` / `name::real` / `name::vector[size]`; support constraints are
-# spelled as distribution keywords (`~ dist(…; lower=0)`) — PROVISIONAL, pending
-# the constraint-spelling decision. Validated by density parity, against direct
-# formulas and against the hand-written example graphs.
+# typed-LHS `name` / `name::real` / `name::vector[size]`; support constraints use
+# the rk-native `positive(dist(…))` combinator (PROVISIONAL, decision 1uczi8y).
+# Validated by density parity, against direct formulas and against the
+# hand-written example graphs.
 @testset "RK-native @ppl macro (experimental, first cut)" begin
     nlp(x, mu, sig) = -0.5 * log(2π) - log(sig) - 0.5 * ((x - mu) / sig)^2
 
@@ -183,7 +183,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
         @ppl es(observations::Vector{Float64}, observation_scales::Vector{Float64},
                 J::Int) = begin
             mu ~ normal(0.0, 5.0)
-            tau ~ cauchy(0.0, 5.0; lower = 0.0)    # half-Cauchy(0, 5)
+            tau ~ positive(cauchy(0.0, 5.0))       # half-Cauchy(0, 5)
             theta::vector[J] ~ normal(mu, tau)
             observations ~ normal(theta, observation_scales)
         end
@@ -204,7 +204,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
         @ppl lr(predictors::Vector{Float64}, responses::Vector{Float64}) = begin
             alpha ~ normal(0.0, 10.0)
             beta ~ normal(0.0, 10.0)
-            sigma ~ normal(0.0, 5.0; lower = 0.0)  # half-Normal(5)
+            sigma ~ positive(normal(0.0, 5.0))     # half-Normal(5)
             responses ~ normal(alpha + beta * predictors, sigma)
         end
         got = prepare(lr; have = (:unconstrained, :predictors, :responses),
