@@ -20,9 +20,11 @@ It is built entirely on ReactiveKernels' PUBLIC surface (`@kernel` / `prepare` /
 `plan` / `plate`) plus the reusable distribution-kernel objects — nothing lives
 in ReactiveKernels core.
 
-The surface mirrors StanBlocks (`@slic`): typed-LHS `name` / `name::real` /
-`name::vector[size]`, and support constraints spelled as distribution keywords
-(`~ dist(…; lower=0)`) — no invented `::positive` / `name[size]` forms.
+The surface mirrors StanBlocks (`@slic`) for typed-LHS `name` / `name::real` /
+`name::vector[size]`; support constraints use the rk-native `positive(dist(…))`
+combinator (PROVISIONAL — decision `1uczi8y` resolved "no preference; do whatever
+for now, mark provisional"). No invented `::positive` / `name[size]` forms, and
+(per user review) no `lower=` distribution keyword.
 
 Decisions: build GO `2026-09-06T14-20-02-559-1r5p4j1`; scope MINIMAL
 `2026-09-06T14-20-27-206-0wqzaq4`.
@@ -38,12 +40,13 @@ Decisions: build GO `2026-09-06T14-20-02-559-1r5p4j1`; scope MINIMAL
   (real support) — take a packed slice of `size` coordinates (`size` a data
   argument or literal; the packed layout tracks a running offset), and their
   prior is the summed per-element authored `plate`.
-- **Support constraints are distribution keywords** (as in `@slic`): a
-  naturally-positive family (`exponential`/`gamma`/`lognormal`) already implies
-  positive support, and a `lower=0` keyword on a real family is a **half
-  distribution** whose prior adds `-log(1 - cdf(0))` via the family's own `.cdf`
-  — e.g. `sigma ~ normal(0, 5; lower=0)` (half-Normal),
-  `tau ~ cauchy(0, 5; lower=0)` (half-Cauchy).
+- **Support constraints use the rk-native `positive(dist(…))` combinator**
+  (PROVISIONAL, decision `1uczi8y`): a naturally-positive family
+  (`exponential`/`gamma`/`lognormal`) already implies positive support, and
+  `positive(<real family>)` is a **half distribution** whose prior adds
+  `-log(1 - cdf(0))` via the family's own `.cdf` — e.g.
+  `sigma ~ positive(normal(0, 5))` (half-Normal),
+  `tau ~ positive(cauchy(0, 5))` (half-Cauchy).
 - `parameters` has two producers (constrain-only, and joint with `log_jacobian`
   so a params+Jacobian query shares the transform) plus named-latent inverse
   edges, so a packed, named-latent, or `parameters` HAVE boundary all route
@@ -149,46 +152,34 @@ function _parse_lhs(lhs)
     end
 end
 
-# Split a distribution call into its positional RK dist call and any `lower=` /
-# `upper=` support-constraint kwargs — StanBlocks spells parameter-support
-# constraints as distribution keywords (`~ cauchy(0, 5; lower=0)`).
+# Parse the `~` right-hand side. A bare `dist(args...)` uses the family's natural
+# support; the rk-native `positive(dist(args...))` combinator constrains it to
+# positive support (a half distribution when the family's natural support is the
+# whole line). Returns (dist-head, positional RK dist call, constraint).
+#
+# PROVISIONAL constraint spelling — decision `1uczi8y` resolved "(no preference);
+# do whatever for now, mark it provisional". The `positive(…)` combinator is the
+# recommended rk-native form (it composes transparent kernel objects rather than
+# bolting a keyword onto the dist call); the final spelling may still change.
 function _parse_dist(rhs)
-    (rhs isa Expr && rhs.head === :call && rhs.args[1] isa Symbol) ||
-        error("@ppl: `~` right-hand side must be a distribution call, got `$(rhs)`.")
-    head = rhs.args[1]
-    lower = nothing
-    upper = nothing
-    pos = Any[]
-    for a in rhs.args[2:end]
-        kws = a isa Expr && a.head === :parameters ? a.args :
-              a isa Expr && a.head === :kw ? (a,) : nothing
-        if kws === nothing
-            push!(pos, a)
-            continue
-        end
-        for kw in kws
-            (kw isa Expr && kw.head === :kw && kw.args[1] isa Symbol) ||
-                error("@ppl: malformed distribution keyword `$(kw)`.")
-            k, v = kw.args[1], kw.args[2]
-            k === :lower ? (lower = v) :
-            k === :upper ? (upper = v) :
-            error("@ppl (first cut): unsupported distribution keyword `$(k)`; only " *
-                  "`lower` / `upper` (support constraints) are handled.")
-        end
+    if rhs isa Expr && rhs.head === :call && rhs.args[1] === :positive
+        length(rhs.args) == 2 || error(
+            "@ppl: `positive(dist(…))` takes exactly one distribution argument, " *
+            "got `$(rhs)`.")
+        (head, call) = _dist_call(rhs.args[2])
+        return (head, call, :positive)
     end
-    (head, Expr(:call, head, pos...), lower, upper)
+    (head, call) = _dist_call(rhs)
+    (head, call, nothing)
 end
 
-_is_zero(x) = x === 0 || x === 0.0
-
-# The support constraint implied by `lower=` / `upper=` kwargs (first cut: only
-# `lower=0`, i.e. a lower-truncation at 0 — a half / positive family).
-function _constraint_from_bounds(name, lower, upper)
-    (lower === nothing && upper === nothing) && return nothing
-    (upper === nothing && _is_zero(lower)) && return :positive
-    error("@ppl (first cut): parameter `$(name)` — only `lower=0` (a half " *
-          "distribution) is a supported support constraint yet; general " *
-          "`lower` / `upper` bounds are a follow-up increment.")
+function _dist_call(rhs)
+    (rhs isa Expr && rhs.head === :call && rhs.args[1] isa Symbol) ||
+        error("@ppl: expected a distribution call, got `$(rhs)`.")
+    any(a -> a isa Expr && a.head in (:parameters, :kw), @view rhs.args[2:end]) &&
+        error("@ppl: distribution keywords are not supported; constrain support " *
+              "with the `positive(dist(…))` combinator.")
+    (rhs.args[1], rhs)
 end
 
 """
@@ -218,9 +209,9 @@ function _parse(def)
         _is_line(stmt) && continue
         if stmt isa Expr && stmt.head === :call && stmt.args[1] === :~
             (lname, kind, lsize) = _parse_lhs(stmt.args[2])
-            (dist, dist_call, lower, upper) = _parse_dist(stmt.args[3])
+            (dist, dist_call, constraint) = _parse_dist(stmt.args[3])
             if lname in datanames
-                (kind === :scalar && lower === nothing && upper === nothing) ||
+                (kind === :scalar && constraint === nothing) ||
                     error("@ppl: observation `$(lname)` cannot carry a type/size/" *
                           "constraint annotation")
                 push!(obs, _Obs(lname, dist_call))
@@ -232,7 +223,6 @@ function _parse(def)
                     "parameter distributions are $(sort(collect(keys(_SUPPORT)))); " *
                     "other families are a follow-up increment.")
                 natural = _SUPPORT[dist]
-                constraint = _constraint_from_bounds(lname, lower, upper)
                 effective = constraint === nothing ? natural : constraint
                 truncate = false
                 if constraint !== nothing
