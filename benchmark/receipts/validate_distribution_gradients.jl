@@ -5,7 +5,8 @@ import TOML
 
 include(joinpath(@__DIR__, "..", "distribution_benchmark_cases.jl"))
 using .DistributionBenchmarkCases:
-    NORMAL_SIZES, SCALAR_GALLERY_FAMILIES, SCALAR_GALLERY_SIZES, STRUCTURED_SIZES
+    DISTRIBUTION_GRADIENT_FAMILIES, NORMAL_SIZES, SCALAR_GALLERY_SIZES,
+    STRUCTURED_SIZES
 
 _distribution_gradient_median(values) = Statistics.median(Float64.(values))
 
@@ -17,10 +18,6 @@ const _DISTRIBUTION_GRADIENT_ACTIVE = Dict(
     "exponential_logscale" => ("x", "vector"),
     "geometric_logit" => ("logitp", "scalar"),
     "uniform_bounded" => ("x", "vector"),
-    "poisson_lograte" => ("log_rate", "scalar"),
-    "gamma_shape_rate" => ("x", "vector"),
-    "beta_shapes" => ("x", "vector"),
-    "binomial_logit" => ("logit", "scalar"),
 )
 
 function _expected_distribution_gradient_rows()
@@ -28,7 +25,7 @@ function _expected_distribution_gradient_rows()
     append!(rows, [
         ("normal_plate", "normal", n, "x", "vector") for n in NORMAL_SIZES
     ])
-    for family in SCALAR_GALLERY_FAMILIES, n in SCALAR_GALLERY_SIZES
+    for family in DISTRIBUTION_GRADIENT_FAMILIES, n in SCALAR_GALLERY_SIZES
         active, kind = _DISTRIBUTION_GRADIENT_ACTIVE[family]
         push!(rows, ("scalar_gallery", family, n, active, kind))
     end
@@ -73,7 +70,8 @@ function validate_distribution_gradient_receipt(path::AbstractString)
     require(Tuple(Int.(get(protocol, "normal_sizes", Int[]))) == NORMAL_SIZES,
             "Normal size inventory mismatch")
     require(Tuple(get(protocol, "scalar_gallery_families", String[])) ==
-            SCALAR_GALLERY_FAMILIES, "scalar-gallery family inventory mismatch")
+            DISTRIBUTION_GRADIENT_FAMILIES,
+            "scalar-gallery family inventory mismatch")
     require(Tuple(Int.(get(protocol, "scalar_gallery_sizes", Int[]))) ==
             SCALAR_GALLERY_SIZES, "scalar-gallery size inventory mismatch")
     require(Tuple(Int.(get(protocol, "structured_sizes", Int[]))) ==
