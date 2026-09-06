@@ -127,25 +127,29 @@ function arma11_reference_density(q)
     prior + log_σ + likelihood
 end
 
+const _GM_LOGBETA55 = logbeta(5.0, 5.0)
+
 function gaussian_mixture_reference_density(q)
-    μ₁, δ, log_σ₁, log_σ₂, logit_θ = q
-    _, μ₂ = GaussianMixtureExample.ordered_means(μ₁, δ)
-    θ = GaussianMixtureExample.logistic(logit_θ)
-    parameters = MixtureParameters(
-        μ₁, μ₂, exp(log_σ₁), exp(log_σ₂), θ)
+    μ₁, δ, log_σ₁, log_σ₂, logit_θ = q[1], q[2], q[3], q[4], q[5]
+    μ₂ = μ₁ + exp(δ)
+    σ₁ = exp(log_σ₁)
+    σ₂ = exp(log_σ₂)
+    θ = 1 / (1 + exp(-logit_θ))
+    log_θ = log(θ)
+    log_1mθ = log1p(-θ)
+    log_jacobian = δ + log_σ₁ + log_σ₂ + log_θ + log_1mθ
+    nld(x, loc, sc) = -0.5 * log(2π) - log(sc) - 0.5 * ((x - loc) / sc)^2
+    prior = nld(μ₁, 0.0, 2.0) + nld(μ₂, 0.0, 2.0) +
+            log(2.0) + nld(σ₁, 0.0, 2.0) + log(2.0) + nld(σ₂, 0.0, 2.0) +
+            (4 * log(θ) + 4 * log1p(-θ) - _GM_LOGBETA55)
     likelihood = zero(μ₁)
-    @inbounds for observation in MIXTURE_OBSERVATIONS
-        la = GaussianMixtureExample.normal_logpdf(
-            observation, parameters.μ₁, parameters.σ₁)
-        lb = GaussianMixtureExample.normal_logpdf(
-            observation, parameters.μ₂, parameters.σ₂)
-        likelihood += GaussianMixtureExample.log_mix(parameters.θ, la, lb)
+    @inbounds for y in MIXTURE_OBSERVATIONS
+        la = log_θ + nld(y, μ₁, σ₁)
+        lb = log_1mθ + nld(y, μ₂, σ₂)
+        m = max(la, lb)
+        likelihood += m + log(exp(la - m) + exp(lb - m))
     end
-    GaussianMixtureExample.total_log_density(
-        GaussianMixtureExample.log_prior(parameters),
-        GaussianMixtureExample.log_abs_det_jacobian(
-            δ, log_σ₁, log_σ₂, θ),
-        likelihood)
+    prior + log_jacobian + likelihood
 end
 
 # The covariance factorizations are data, so precompute the log-determinant and

@@ -1,16 +1,15 @@
 # Declarative PPL kernel: Gaussian mixture (marginalization)
 
-```@eval
-Main.ReactiveKernelsDocs.render_review_status(:frozen_ppl)
-```
-
 This example ports the `low_dim_gauss_mix` model from
 [posteriordb](https://github.com/stan-dev/posteriordb) (posterior
 `low_dim_gauss_mix-low_dim_gauss_mix`) into the same declarative-`@kernel` style
-as the [eight-schools example](eight-schools.md). Its distinctive structure is
-**marginalization**: each observation's discrete component label is integrated
-out analytically, exactly as Stan does with `log_mix` (a numerically stable
-two-term `log_sum_exp`). No discrete parameter ever appears in the graph.
+as the [eight-schools example](eight-schools.md): the model is authored inline,
+reusing the shared `normal` components and `beta` mixing prior with one authored
+likelihood `plate` whose closure combines the two component densities through
+`LogExpFunctions.logaddexp`. Its distinctive structure is **marginalization**:
+each observation's discrete component label is integrated out analytically,
+exactly as Stan does with `log_mix` (a numerically stable two-term
+`log_sum_exp`). No discrete parameter ever appears in the graph.
 
 The complete runnable source is
 [`packages/ReactiveKernelsPPLExamples/src/gaussian_mixture.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsPPLExamples/src/gaussian_mixture.jl).
@@ -31,21 +30,22 @@ contributions. (As in Stan's `~`, the `Beta` prior's variate-independent constan
 is dropped.)
 
 ```text
-unconstrained ──► split ──► μ₁, δ, log_σ₁, log_σ₂, logit_θ
-                              │
-                              ├─► ordered means μ₁,μ₂ ; σ₁,σ₂ ; θ ──► constrained parameters
-                              │            │
-                              │            ├─► log prior
-observations ─────────────────┴───────────►│ pointwise log_mix ─► log likelihood
-                                           └─► component responsibility (generated)
+unconstrained ──► μ₁, δ, log_σ₁, log_σ₂, logit_θ
+                    │
+                    ├─► ordered means μ₁,μ₂ ; σ₁,σ₂ ; θ ──► constrained parameters
+                    │            │
+                    │            ├─► log prior (Normal, Normal, HalfNormal, HalfNormal, Beta)
+observations ────────┴──────────►│ pointwise plate (logaddexp) ─► log likelihood
+                                 └─► component responsibility (generated)
 (δ, log_σ₁, log_σ₂, θ) ──► log Jacobian
 
 log prior + log Jacobian + log likelihood ──► unconstrained log density
 ```
 
-The likelihood port has two equivalent producers. Asking for pointwise terms
-selects the vector of marginalized `log_mix` values plus `sum`; a density-only
-plan selects a fused scalar loop. The latter avoids an active temporary vector.
+The likelihood is one authored `plate`: each observation's marginalized density
+is a two-term `logaddexp` over the reused `normal` component endpoints. A query
+for `pointwise` materializes that vector; a query for `likelihood` alone fuses
+the sum into the traversal with no temporary buffer.
 
 The panel below shows three views of this model: **Raw input** (the source), a
 readable **Generated kernel** derived from the executed kernel and selected

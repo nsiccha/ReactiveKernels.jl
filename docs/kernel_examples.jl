@@ -293,12 +293,10 @@ function setup_gaussian_mixture!(mod::Module)
     if !isdefined(mod, :GaussianMixtureExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: GaussianMixtureExample))
     end
-    Core.eval(mod, :(using .GaussianMixtureExample:
-        MixtureParameters, UnconstrainedParameters, RealVector,
-        MIXTURE_OBSERVATIONS, split_unconstrained, ordered_means,
-        exp_scale, logistic, assemble_parameters, log_abs_det_jacobian,
-        log_prior, pointwise_log_likelihood, sum_log_likelihood,
-        fused_log_likelihood, total_log_density, component1_responsibility))
+    # Bind only the data. The displayed PPL assembly imports and reuses the
+    # shared `normal` and `beta` objects and the LogExpFunctions log-sum-exp
+    # directly.
+    Core.eval(mod, :(using .GaussianMixtureExample: MIXTURE_OBSERVATIONS))
     nothing
 end
 
