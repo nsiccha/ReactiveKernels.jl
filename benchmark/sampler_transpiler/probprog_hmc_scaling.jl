@@ -1,6 +1,6 @@
 # Fixed-length endpoint HMC comparator supplied by Reactant.ProbProg.
 # The generated RK kernel uses multinomial selection; preserve that distinction.
-include(joinpath(@__DIR__, "hmc_eight_schools.jl"))
+isdefined(@__MODULE__, :build_density) || include(joinpath(@__DIR__, "hmc_eight_schools.jl"))
 using Statistics, TOML, SHA
 using Reactant: ProbProg, ReactantRNG
 

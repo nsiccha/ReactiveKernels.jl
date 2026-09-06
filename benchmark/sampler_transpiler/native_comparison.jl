@@ -87,7 +87,8 @@ function run_prepared_comparison(prepared,comparator,L,n)
     (; prepared,comparator)
 end
 
-function build_fast_prototype(; compiler_options=NamedTuple(), source_options=NamedTuple(), L=4)
+function build_fast_prototype(; compiler_options=NamedTuple(), source_options=NamedTuple(),
+        source=H.hmc_state, L=4)
     density,ad,q=measured(build_density,"prepare_model")
     potential,gradient=CallbackHandle(Potential(density)),CallbackHandle(Gradient(ad))
     endpoint_inputs=(potential,gradient,Diagonal(ones(length(q))),q,zeros(length(q)))
@@ -95,7 +96,7 @@ function build_fast_prototype(; compiler_options=NamedTuple(), source_options=Na
         native_endpoint(F.euclidean_phasepoint,F.leapfrog!,endpoint_inputs)
     end
     parent=measured("prepare_native_factory") do
-        fast_native_factory(H.hmc_state,NativePoint(endpoint);
+        fast_native_factory(source,NativePoint(endpoint);
             n_steps=L,step_f=RK.partial(F.leapfrog!;stepsize=0.03),stats_f=nothing,
             source_options...)
     end

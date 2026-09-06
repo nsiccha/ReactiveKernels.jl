@@ -1,7 +1,7 @@
-# Multinomial HMC from reactive mathematical source
+# HMC from reactive mathematical source
 
 This experimental compiler lowers the same captured HMC source to native Julia
-and Reactant. The measured workload chains multinomial HMC transitions over the
+and Reactant. The measured workloads chain endpoint or multinomial HMC transitions over the
 [centered Eight Schools model](eight-schools.md). The compiler owns state,
 cache reuse, control flow and backend lowering; the sampler remains mathematical
 `@kernel` source.
@@ -23,7 +23,7 @@ source does not return the selected joint phasepoint. The original full-phasepoi
 variant remains in the
 [benchmark family](https://github.com/nsiccha/ReactiveKernels.jl/tree/main/benchmark/sampler_transpiler).
 
-## Measured CPU throughput
+## Multinomial HMC throughput
 
 These are microseconds per transition at **10,000 chained transitions**. Native
 and Reactant columns are medians of seven execution samples. AdvancedHMC uses
@@ -42,17 +42,6 @@ acceptance statistics; this minimal kernel streams selection and omits those
 statistics. The measurements cover fixed integration work, without adaptation,
 chain history or effective-sample-size estimates.
 
-The ProbProg column uses Reactant's own `mcmc_logpdf(...; algorithm=:HMC)` with
-**endpoint Metropolis acceptance**, rather than multinomial selection. It uses
-the same density, metric, step size and leapfrog counts, with adaptation off,
-initial potential/gradient supplied outside timing, and only the final position
-and RNG returned. Its seven timing replicates were measured in a later process
-on the same host, separately from the RK/AdvancedHMC pairs. This supplies a
-native Reactant implementation reference; it is not an identical sampler.
-The [ProbProg receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/sampler_transpiler/probprog-hmc-scaling-v1.toml)
-and [42 raw execution samples](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/sampler_transpiler/probprog-hmc-scaling-v1.csv)
-retain the algorithm distinction, emitted-loop work accounting and source hashes.
-
 The complete chain executes in **one synchronized Reactant call**, including
 gradients and random draws. Preparation, input resets and compilation are outside
 execution timing. Both generated backends beat the strongest paired AdvancedHMC
@@ -64,6 +53,43 @@ and sixteen steps. Reactant still loses to native for 100 four-step transitions:
 retain all 168 execution observations and six separate compilation rows. The
 [receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/sampler_transpiler/position-multinomial-scaling-v2.toml)
 pins source files and records the environment and measurement contract.
+
+## Matched endpoint HMC throughput
+
+Endpoint HMC is compared separately with **endpoint HMC**. This minimal source
+uses the same captured phasepoint/leapfrog and the same generic compiler. It
+performs exactly the requested number of steps and one final Metropolis
+acceptance decision, without per-step divergence observations or early returns.
+The older endpoint source with those observations remains a diagnostic fixture.
+
+```@eval
+Main.HMCTranspilerDocs.render_source("endpoint_hmc_kernel.jl")
+```
+
+The following values are medians of seven alternating execution samples at
+**10,000 transitions**. All four cases run in the same process, with the same
+model, metric, step size, fixed step count and final-position/RNG output.
+Reactant calls are synchronized. Preparation, reset and compilation are outside
+timing; adaptation and chain history are absent. RK step counters are disabled.
+Work counts follow the fixed source/emitted loops and AdvancedHMC's `FixedNSteps`.
+
+```@eval
+Main.HMCTranspilerDocs.render_endpoint_results()
+```
+
+ProbProg uses `mcmc_logpdf(...; algorithm=:HMC)`, supplying the initial potential
+and gradient outside timing. Both Reactant cases use the same 64 KiB CPU loop
+policy. Native RK uses the same mathematical source with native lowering;
+AdvancedHMC uses `EndPointTS`. Implementations use their own random streams and
+may differ in internal handling of unused statistics. These are execution-time
+comparisons, not claims of equal sampling efficiency.
+
+The [endpoint scaling data](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/sampler_transpiler/matched-endpoint-scaling-v1.csv)
+retain every execution replicate at 100, 1,000 and 10,000 transitions. The
+[receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/sampler_transpiler/matched-endpoint-scaling-v1.toml)
+records source hashes, compilation order and emitted loops. The earlier chart
+placed ProbProg endpoint timings beside RK multinomial timings; that comparison
+did not isolate compiler overhead. The sampler families are now separate.
 
 ## Generated execution and compilation cost
 
@@ -94,7 +120,7 @@ its five subsequent compilations take 0.52–0.61 seconds.
 julia benchmark/sampler_transpiler/setup.jl
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/position_multinomial_scaling.jl /absolute/output.csv
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/cpu_loop_packing.jl /absolute/ablation-directory
-timeout --signal=TERM --kill-after=15s 600s julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/probprog_hmc_scaling.jl /absolute/probprog.csv
+timeout --signal=TERM --kill-after=15s 600s julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/matched_endpoint_comparison.jl /absolute/endpoint-scaling scaling
 ```
 
 The compiler assumes fixed types, array shapes, call graph and compiler-known
