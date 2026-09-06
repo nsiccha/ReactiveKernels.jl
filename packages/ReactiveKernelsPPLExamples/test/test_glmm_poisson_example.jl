@@ -18,7 +18,11 @@ function _glmm_poisson_reference(q, year, counts)
     log_jacobian = jc(q[1], -20.0, 20.0) + jc(q[2], -10.0, 10.0) +
                    jc(q[3], -10.0, 20.0) + jc(q[4], -10.0, 10.0) +
                    jc(q[5 + n], 0.0, 5.0)
-    prior = sum(nlp(e, 0.0, sigma) for e in eps)
+    # Explicit uniform model-block priors: -log(b-a) inside, -Inf outside.
+    # beta2 is declared [-10,20] but prior is uniform(-10,10) → support cut at 10.
+    fixed_prior = -log(40.0) - log(20.0) +
+                  (beta2 <= 10.0 ? -log(20.0) : -Inf) - log(20.0) - log(5.0)
+    prior = fixed_prior + sum(nlp(e, 0.0, sigma) for e in eps)
     log_lambda = alpha .+ beta1 .* year .+ beta2 .* year .^ 2 .+
                  beta3 .* year .^ 3 .+ eps
     likelihood = sum(c * ll - exp(ll) - loggamma(c + 1.0)
@@ -56,6 +60,17 @@ end
         @test log_jacobian ≈ reference.log_jacobian
         @test likelihood ≈ reference.likelihood
         @test posterior ≈ reference.posterior
+    end
+
+    @testset "beta2 uniform(-10,10) support restriction (declared [-10,20])" begin
+        # beta2's transform admits (-10, 20), but the prior uniform(-10,10) makes
+        # beta2 > 10 impossible: the posterior must be -Inf there (Stan parity).
+        posterior_kernel = prepare(model;
+            have = (:unconstrained, :year, :counts), want = :posterior)
+        qs = zeros(length(q)); qs[3] = 6.0    # beta2 = -10 + 30*logistic(6) ≈ 19.9 > 10
+        @test posterior_kernel(qs, GLMM_POISSON_YEAR, GLMM_POISSON_C) == -Inf
+        qint = zeros(length(q)); qint[3] = -1.0  # beta2 ≈ 3.4 ≤ 10 → finite
+        @test isfinite(posterior_kernel(qint, GLMM_POISSON_YEAR, GLMM_POISSON_C))
     end
 
     @testset "generated quantity λ from a constrained HAVE" begin

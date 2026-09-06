@@ -69,11 +69,27 @@ using LogExpFunctions: logistic, log1pexp
         (parameters.alpha, parameters.beta1, parameters.beta2, parameters.beta3,
          parameters.eps, parameters.sigma)
 
+    # Explicit uniform priors from the model block. `x ~ uniform(a,b)` adds
+    # uniform_lpdf = -log(b-a) inside [a,b] and -Inf outside (kept with
+    # propto=false). alpha/beta1/beta3/sigma have prior bounds equal to their
+    # declared bounds, so they contribute constants. beta2 is DECLARED on
+    # [-10,20] (width-30 transform) but the prior is uniform(-10,10): it is
+    # -log(20) for beta2 ≤ 10 and -Inf for beta2 ∈ (10,20] — a genuine support
+    # restriction the transform alone does not impose.
+    alpha_prior::Float64 = -log(40.0)
+    beta1_prior::Float64 = -log(20.0)
+    beta2_prior::Float64 = ifelse(beta2 <= 10.0, -log(20.0), -Inf)
+    beta3_prior::Float64 = -log(20.0)
+    sigma_prior::Float64 = -log(5.0)
+    fixed_prior::Float64 =
+        alpha_prior + beta1_prior + beta2_prior + beta3_prior + sigma_prior
+
     # Random-effect prior: epsⱼ ~ Normal(0, σ). σ rides the plate as a shared arg.
     eps_pointwise = plate(eps, sigma) do e, s
         normal(0.0, s).logpdf(e)
     end
-    prior::Float64 = sum(eps_pointwise)
+    eps_prior::Float64 = sum(eps_pointwise)
+    prior::Float64 = fixed_prior + eps_prior
 
     # Transformed parameter: log_lambda = α + β·year_powers + eps (named + GQ).
     log_lambda = plate(year, eps, alpha, beta1, beta2, beta3) do y, e, a, b1, b2, b3
