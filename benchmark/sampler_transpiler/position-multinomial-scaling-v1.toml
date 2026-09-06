@@ -1,0 +1,186 @@
+"schema_version" = 1
+"parent_commit" = "9307624a1a003f0f4b62f9a0eca12b7a20a0e43e"
+"host" = "strato2"
+"julia" = "1.10.11"
+"reactant" = "0.2.284"
+"enzyme" = "0.13.199"
+"ahmc" = "0.8.6"
+"exit_code" = 0
+"elapsed_seconds" = 149
+"execute_rows" = 168
+"compile_rows" = 6
+"replicates" = 7
+"steps_per_transition" = [4, 16]
+"transitions" = [100, 1000, 10000]
+"data_sha256" = "3cd0a7bc45790aaca784d78d8226fa4e2d54d1f0c314cd060c30bb76513a324f"
+"command" = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/position_multinomial_scaling.jl /absolute/output.csv"
+"benchmark_contract" = "Centered Eight Schools, ten Float64 parameters, unit diagonal metric, stepsize0.03. Retains selected position and reusable position caches; momentum is refreshed next transition and is NOT the selected joint phasepoint. Fixed integration work, no adaptation/history/ESS. AdvancedHMC uses the same density/gradient/metric/steps and additionally materializes trajectories and computes acceptance statistics. Resets outside timing; Reactant sync=true,donated_args=:none; no host call per gradient. Counters enabled. No cross-backend numerical or trajectory agreement requirement."
+"compile_order" = "Six compiles in one Julia process, in CSV order. First cold; later rows benefit from process-local compiler/code reuse. Never pool with execute rows or treat all as cold."
+"recorded_output" = "BEGIN prepare_model\nprepare_model seconds=4.147418545 bytes=232993312\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=7.419848575 bytes=860005048\nBEGIN prepare_multinomial_factory\nprepare_multinomial_factory seconds=4.930698077 bytes=361406056\nBEGIN lower_multinomial_native\nlower_multinomial_native seconds=4.346493425 bytes=413339368\nchildren=(:init, :anchor, :work)\nBEGIN prepare_model\nprepare_model seconds=0.355959519 bytes=14634096\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=0.448317335 bytes=25805984\nBEGIN prepare_multinomial_factory\nprepare_multinomial_factory seconds=0.72930404 bytes=5534688\nBEGIN lower_multinomial_native\nlower_multinomial_native seconds=0.602293402 bytes=28956328\nchildren=(:init, :anchor, :work)\nscaling_complete backend=Reactant L=4 transitions=100 mlir_bytes=74771\nscaling_complete backend=Reactant L=4 transitions=1000 mlir_bytes=74773\nscaling_complete backend=Reactant L=4 transitions=10000 mlir_bytes=74775\nBEGIN prepare_model\nprepare_model seconds=0.316357085 bytes=14641136\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=0.439112984 bytes=25708120\nBEGIN prepare_multinomial_factory\nprepare_multinomial_factory seconds=0.732033954 bytes=5471368\nBEGIN lower_multinomial_native\nlower_multinomial_native seconds=0.57855354 bytes=27642000\nchildren=(:init, :anchor, :work)\nBEGIN prepare_model\nprepare_model seconds=0.310521197 bytes=14643008\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=0.430372122 bytes=25708360\nBEGIN prepare_multinomial_factory\nprepare_multinomial_factory seconds=0.692236369 bytes=5469000\nBEGIN lower_multinomial_native\nlower_multinomial_native seconds=0.558423294 bytes=28798016\nchildren=(:init, :anchor, :work)\nscaling_complete backend=Reactant L=16 transitions=100 mlir_bytes=43760\nscaling_complete backend=Reactant L=16 transitions=1000 mlir_bytes=43762\nscaling_complete backend=Reactant L=16 transitions=10000 mlir_bytes=43764\nscaling_csv=/home/n/scratch/kb-agent-tmp/ReactiveKernels-sampling/position-multinomial-scaling-v1.csv\n"
+
+["backend_check"]
+"note" = "Separate default-environment check immediately after these runs; not instrumented inside the original scaling process."
+"exit_code" = 0
+"elapsed_seconds" = 2
+"recorded_output" = "platform=cpu\ndevices=[\"CPU:0 cpu\"]\njulia_threads=1\ncpu=znver3\n"
+
+["source_sha256"]
+"src/ad.jl" = "37c8258f5ffa67fbab9b4240fb972858c3e05a01f1d99b73fd3a1790afd4b568"
+"ext/ReactiveKernelsReactantExt.jl" = "6557fdb95b8115a375ca99d73496a30e2fddddff2c2eab09a92da8663819ff34"
+"src/kernel_adaptation.jl" = "d655baa036d4e5770b769ab644b8c56ca0567c167d3643011352131e9928a5c4"
+"benchmark/reactivehmc_hmc_kernel_fixture_b.jl" = "9ffa4e8e2990992cd92303e55a6d005cff2c6e1698de6bca7941ad2907f8a4da"
+"benchmark/nuts_kernel_authoring_fixture_b.jl" = "7a9a9d6e1fa122e3d846def760933b0ba14e62e567d92cffab9d9d638f9404f4"
+"benchmark/sampler_transpiler/hmc_eight_schools.jl" = "c18b800fc013d8007d1d1b23d7c7330b89304bc8ff92767562b26a788d2d5996"
+"benchmark/sampler_transpiler/native_slots.jl" = "c0f03d31c96be0c6282608c93779cd6c92c00e3741e40bdf62bc365e3f8d3e25"
+"benchmark/sampler_transpiler/native_slots_factory.jl" = "36468f4da6321631c0eba1a8fc1baa5dee305220b0e1572d6966b509365f8235"
+"benchmark/sampler_transpiler/native_comparison.jl" = "5e2612234a93c4d126a7c9550520ba468b266c790709e1602a1b1dccae183598"
+"benchmark/sampler_transpiler/traced_slots.jl" = "1145f10c16fb282f15615d8450e57b0e947af0b44c7a42ae99d16adfe9a18fd1"
+"benchmark/sampler_transpiler/traced_comparison.jl" = "ff891cd14f9ae1933a3b3813246b1d242b056b3b8c271425c3545e1bb78732c0"
+"benchmark/sampler_transpiler/loop_control_probe.jl" = "45bc979f7bdfbbc91918f4aa3300f794d7b263dd788b4707b7e621e4b1970881"
+"benchmark/sampler_transpiler/profile_compile.jl" = "ba92a50afae1fdd86667fc00f16197a0479214e714eb2237e10b2cdf7332dbc8"
+"src/ReactiveKernels.jl" = "5dadbc59cd45725b1b00350cc5156e4b8a403c766b90ca24985f5bc958d3ce01"
+"src/native_slot_compiler.jl" = "206f475697d27bbc230f5eca0631378ee22e13951ab5929d94158ae6802ebea9"
+"src/native_slots.jl" = "9c6857d54dbd5471a62017a0cbfa6764442a98476f9f680ccee94991d12186c1"
+"src/native_slots_factory.jl" = "9f0f47fc081de7b54950fe4e87ec488b6dfb0e6b84fa3119af1a07ff96d0928a"
+"ext/ReactiveKernelsReactantExt/traced_slot_compiler.jl" = "7f5bc7f5148912b1d7355ad55181e847911984199c6fbccb53b3a49ede4a83a7"
+"ext/ReactiveKernelsReactantExt/traced_slots.jl" = "470236c0fde74933d3f39147418984221ef27ca77440fd04c4ff350bad948f86"
+"benchmark/sampler_transpiler/scalar_argument_probe.jl" = "277492fefac36afa9dce6b96f1510137dcd3eda1eb0ef97e44874a5300b0b47b"
+"ext/ReactiveKernelsReactantExt/traced_code_cache.jl" = "1e1b87256021628044b47b5c2c3e0f8d14d0e298d58e156c82b0f8958c0d46fb"
+"benchmark/sampler_transpiler/code_reuse_probe.jl" = "2ce50d054e810c354e4561ff1ce8067bcb02010560eb319edac73e05fb0c0ec0"
+"benchmark/sampler_transpiler/multinomial_hmc_kernel.jl" = "a854b0a9cf5ec660e64d622b9442804a564ffc0657ed3089331aa9e5fcb97218"
+"benchmark/sampler_transpiler/multinomial_eight_schools.jl" = "0080849f5e4cd1d5ac933aba28d941e747d99669fb9cf14b38efd201a29ce9df"
+"benchmark/sampler_transpiler/constant_binding_probe.jl" = "a510b08850dc0e07779ff80750c26bdddac93552c2d8b7ea400148973bcf95c8"
+"benchmark/sampler_transpiler/range_draw_probe.jl" = "e9d82d844fbed32de615ee8dde49876cf488a102d6d6938c8c2742f4692cbe5f"
+"ext/ReactiveKernelsReactantExt/traced_random.jl" = "33e50ef2a1f7eda06a4a01bb66892565d609e2d28aa418f391db445f468e0e93"
+"src/kernel_stateful.jl" = "2cff19f87a39d124a462d4f79cd99cb94c9908c16f5b1c2d3946db7af89a6776"
+"test/test_kernel_methodir.jl" = "1aa1a6a9501d4525031f7ea8166bf3e6bf29ce8bd85b23a18e101b2d929961f7"
+"benchmark/sampler_transpiler/indexed_array_probe.jl" = "a746173df251cb14f6b628a3142337ca15458fc486e1afe6e2caf1d7ba4f06bd"
+"src/kernel_factory.jl" = "6cd1cc5e3715d420a4d06983d361a2597c3a2f243f88e21fbcd5eb2fda4e65b1"
+"benchmark/sampler_transpiler/runtime_keyword_probe.jl" = "fcdff23cfaabf5616dbc339653b660117ed4e96ae8c844382196631bc3bf6f08"
+"benchmark/sampler_transpiler/counter_ablation.jl" = "1d459d0f9ee8c3741d13659be69724d3a924698c6bdf036b7f825b66a952a0f5"
+"benchmark/sampler_transpiler/partial_transfer_probe.jl" = "190c2a9d23a7b438a03ad41fb3c8fca5e116a89cc49273153bdbf25028da1552"
+"benchmark/sampler_transpiler/position_multinomial_hmc_kernel.jl" = "25c1328145e517c7b53dfc0b0e4d51aa5fc8f08e984e429da36412da5d06d0fe"
+"benchmark/sampler_transpiler/multinomial_scaling.jl" = "8d520daa2fe01ab0822beb1e58f75a4b022bc5364472d3dc867fd68a18674e88"
+"benchmark/sampler_transpiler/position_multinomial_scaling.jl" = "c4a3a2293afd40a06899e20f0f4ff69593c42f77a327654df3896b51b947139f"
+
+["medians"]
+
+["medians"."native_native_L4_n100"]
+"seconds" = 0.000169564
+"us_per_transition" = 1.69564
+"best_seconds" = 0.000163286
+
+["medians"."AdvancedHMC_native_L4_n100"]
+"seconds" = 0.000954616
+"us_per_transition" = 9.54616
+"best_seconds" = 0.000829503
+
+["medians"."native_native_L4_n1000"]
+"seconds" = 0.00171865
+"us_per_transition" = 1.7186499999999998
+"best_seconds" = 0.001622297
+
+["medians"."AdvancedHMC_native_L4_n1000"]
+"seconds" = 0.01103084
+"us_per_transition" = 11.03084
+"best_seconds" = 0.007544553
+
+["medians"."native_native_L4_n10000"]
+"seconds" = 0.016922393
+"us_per_transition" = 1.6922393
+"best_seconds" = 0.016743837
+
+["medians"."AdvancedHMC_native_L4_n10000"]
+"seconds" = 0.096597041
+"us_per_transition" = 9.659704099999999
+"best_seconds" = 0.085334763
+
+["medians"."Reactant_Reactant_L4_n100"]
+"seconds" = 0.000350022
+"us_per_transition" = 3.50022
+"best_seconds" = 0.000308635
+
+["medians"."AdvancedHMC_Reactant_L4_n100"]
+"seconds" = 0.000712933
+"us_per_transition" = 7.1293299999999995
+"best_seconds" = 0.000686106
+
+["medians"."Reactant_Reactant_L4_n1000"]
+"seconds" = 0.002209427
+"us_per_transition" = 2.2094270000000003
+"best_seconds" = 0.002194756
+
+["medians"."AdvancedHMC_Reactant_L4_n1000"]
+"seconds" = 0.00990752
+"us_per_transition" = 9.907519999999998
+"best_seconds" = 0.006638683
+
+["medians"."Reactant_Reactant_L4_n10000"]
+"seconds" = 0.021894238
+"us_per_transition" = 2.1894238
+"best_seconds" = 0.021443087
+
+["medians"."AdvancedHMC_Reactant_L4_n10000"]
+"seconds" = 0.076790643
+"us_per_transition" = 7.679064300000001
+"best_seconds" = 0.073996428
+
+["medians"."native_native_L16_n100"]
+"seconds" = 0.000605025
+"us_per_transition" = 6.05025
+"best_seconds" = 0.000588312
+
+["medians"."AdvancedHMC_native_L16_n100"]
+"seconds" = 0.001342832
+"us_per_transition" = 13.42832
+"best_seconds" = 0.001286293
+
+["medians"."native_native_L16_n1000"]
+"seconds" = 0.006109744
+"us_per_transition" = 6.109744000000001
+"best_seconds" = 0.006028042
+
+["medians"."AdvancedHMC_native_L16_n1000"]
+"seconds" = 0.016316308
+"us_per_transition" = 16.316308
+"best_seconds" = 0.012658494
+
+["medians"."native_native_L16_n10000"]
+"seconds" = 0.060697603
+"us_per_transition" = 6.0697603
+"best_seconds" = 0.060423544
+
+["medians"."AdvancedHMC_native_L16_n10000"]
+"seconds" = 0.146788788
+"us_per_transition" = 14.6788788
+"best_seconds" = 0.144007033
+
+["medians"."Reactant_Reactant_L16_n100"]
+"seconds" = 0.001417045
+"us_per_transition" = 14.17045
+"best_seconds" = 0.001317448
+
+["medians"."AdvancedHMC_Reactant_L16_n100"]
+"seconds" = 0.001438584
+"us_per_transition" = 14.385839999999998
+"best_seconds" = 0.0013699
+
+["medians"."Reactant_Reactant_L16_n1000"]
+"seconds" = 0.012624177
+"us_per_transition" = 12.624177
+"best_seconds" = 0.012458088
+
+["medians"."AdvancedHMC_Reactant_L16_n1000"]
+"seconds" = 0.019732278
+"us_per_transition" = 19.732277999999997
+"best_seconds" = 0.012731484
+
+["medians"."Reactant_Reactant_L16_n10000"]
+"seconds" = 0.125820616
+"us_per_transition" = 12.5820616
+"best_seconds" = 0.120348711
+
+["medians"."AdvancedHMC_Reactant_L16_n10000"]
+"seconds" = 0.158340825
+"us_per_transition" = 15.834082499999997
+"best_seconds" = 0.156612652

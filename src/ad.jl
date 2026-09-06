@@ -451,11 +451,19 @@ Compute a scalar value and gradient without requiring caller-owned gradient
 storage. This is the structured counterpart to [`ad_value_and_gradient!`](@ref):
 it preserves DifferentiationInterface's returned cotangent structure, including
 `NamedTuple` active inputs supported by the backend.
+
+With Reactant loaded, a traced scalar or array active input stages this
+operation inside the enclosing compiled program, using the same primal kernel
+and DI backend. It does not reuse the native-input DI preparation in that trace.
 """
 function ad_value_and_gradient(
         prepared::PreparedADKernel, args...; kwargs...)
     point, contexts = _ad_prepared_arguments(
         prepared, args, NamedTuple(kwargs))
+    _ad_prepared_value_and_gradient(prepared, point, contexts)
+end
+
+function _ad_prepared_value_and_gradient(prepared, point, contexts)
     DifferentiationInterface.value_and_gradient(
         prepared.call, prepared.preparation, prepared.backend,
         point, contexts...)
@@ -564,6 +572,10 @@ Returns the `(value, gradient)` pair from
 for the active argument's gradient and is mutated in place. Like
 [`ad_gradient`](@ref), this prepared object and its DI preparation are not
 thread-safe; use one per concurrent caller.
+
+A Reactant-traced active input stages the derivative in the enclosing compiled
+program and writes it into the traced destination, without using the native DI
+preparation there.
 """
 @generated function ad_value_and_gradient!(
         prepared::PreparedADKernel{I,K,typeof(tuple)}, gradient,
@@ -579,9 +591,8 @@ thread-safe; use one per concurrent caller.
             "selected HAVE boundary expects " *
             string(length(inputs(prepared.kernel))) *
             " values; got $N"))
-        DifferentiationInterface.value_and_gradient!(
-            prepared.call, gradient, prepared.preparation, prepared.backend,
-            getfield(args, $I), $(contexts...))
+        _ad_prepared_value_and_gradient!(
+            prepared, gradient, getfield(args, $I), ($(contexts...),))
     end
 end
 
@@ -589,6 +600,10 @@ function ad_value_and_gradient!(
         prepared::PreparedADKernel, gradient, args...; kwargs...)
     point, contexts = _ad_prepared_arguments(
         prepared, args, NamedTuple(kwargs))
+    _ad_prepared_value_and_gradient!(prepared, gradient, point, contexts)
+end
+
+function _ad_prepared_value_and_gradient!(prepared, gradient, point, contexts)
     DifferentiationInterface.value_and_gradient!(
         prepared.call, gradient, prepared.preparation, prepared.backend,
         point, contexts...)
@@ -624,8 +639,8 @@ end
 #
 # The differentiation engine stays the caller's DifferentiationInterface backend
 # (the one passed to `prepare_ad`), so ReactiveKernels imports no concrete AD
-# engine here: a caller-configured reverse-mode backend traces through Reactant
-# with exact parity against the native reverse pass. The real methods live in
+# engine here: a caller-configured reverse-mode backend stages differentiation
+# inside the Reactant program. The real methods live in
 # `ext/ReactiveKernelsReactantExt.jl` and are selected when the active argument is
 # a Reactant-traced value; without the Reactant weak dependency loaded (or with a
 # host-array active argument) these raise a clear, actionable error instead of a

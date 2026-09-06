@@ -188,6 +188,15 @@ end
     active, new::T, old::T) where {T<:Reactant.TracedRNumber} =
         ifelse(active, new, old)
 
+# A fixed host index still needs a tensor mask when the destination is traced.
+# Otherwise the host comparison creates a BitVector inside the alternate
+# interpreter, whose packed broadcast implementation cannot be traced.
+@inline function ReactiveKernels._sm_finite_column_positions(
+        column::Reactant.TracedRArray, ::Val{Dimension}) where {Dimension}
+    Reactant.promote_to(Reactant.TracedRArray{Int,1},
+                       collect(axes(column, Dimension)))
+end
+
 # A nested structural argument can retain host scalar leaves while sibling
 # arrays are traced.  Promote every completed host column as an MLIR constant
 # when any column already follows the traced backend, keeping the fixed while
@@ -248,12 +257,12 @@ end
     _rk_reactant_mixed_array_select_reverse(active, host, traced)
 
 # Distinct loop-carry slots must not reuse one traced scalar identity when the
-# body can update those slots independently. `copy` is identity for Numbers,
-# so materialize a value-preserving backend operation instead.
+# body can update those slots independently. Reactant's `copy` creates a new
+# number wrapper without arithmetic, preserving signed zero and exact bits.
 @inline ReactiveKernels._sm_control_carry_isolate(
-    value::Reactant.TracedRNumber) = value + zero(value)
+    value::Reactant.TracedRNumber) = copy(value)
 @inline ReactiveKernels._sm_control_carry_isolate(
-    value::Reactant.AbstractConcreteNumber) = value + zero(value)
+    value::Reactant.AbstractConcreteNumber) = copy(value)
 
 # A traced branch can legitimately meet a source literal or compiler-static
 # initial value of the same logical scalar type.  Keep that bridge exact: it
@@ -320,6 +329,73 @@ function ReactiveKernels._sm_functional_control_loop(
         carry = step(carry)
     end
     carry
+end
+
+function ReactiveKernels._sm_functional_for_loop(
+        loop, ports, rng_providers, ensures, carry, marker::Reactant.TracedRNumber)
+    carry = ReactiveKernels._sm_loop_backend_seed(carry, marker)
+    step = ReactiveKernels._SMControlTraceBlock(
+        loop.body, loop.parameters, ports, rng_providers, ensures)
+    Reactant.@trace track_numbers = false while carry.live
+        carry = step(carry)
+    end
+    carry
+end
+
+@inline ReactiveKernels._sm_loop_backend_seed(
+        value::Reactant.TracedRNumber, marker::Reactant.TracedRNumber) = value
+@inline function ReactiveKernels._sm_loop_backend_seed(
+        value::T, marker::Reactant.TracedRNumber) where {T<:Number}
+    ReactiveKernels._kernel_dom_num_scalar(T) || return value
+    Reactant.promote_to(Reactant.TracedRNumber{T}, value)
+end
+@inline ReactiveKernels._sm_loop_backend_seed(
+        value::Array{T,N}, marker::Reactant.TracedRNumber) where {T,N} =
+    Reactant.promote_to(Reactant.TracedRArray{T,N}, value)
+
+const _RKIntegerValue = Union{Integer,Reactant.TracedRNumber{<:Integer}}
+_rk_integer_type(value::Integer) = typeof(value)
+_rk_integer_type(value::Reactant.TracedRNumber{T}) where {T} = T
+function ReactiveKernels._sm_unit_range_within_bound(
+        lower::_RKIntegerValue, upper::_RKIntegerValue, bound::Int)
+    T = promote_type(_rk_integer_type(lower), _rk_integer_type(upper))
+    U = unsigned(T)
+    left = Reactant.promote_to(Reactant.TracedRNumber{T}, lower)
+    right = Reactant.promote_to(Reactant.TracedRNumber{T}, upper)
+    bound > typemax(U) && return left == left
+    distance = Reactant.promote_to(Reactant.TracedRNumber{U}, right - left)
+    (left > right) | (distance < U(bound))
+end
+
+function ReactiveKernels._sm_control_dispatch(
+        dispatch::ReactiveKernels._SMControlBlockDispatch, ports,
+        rng_providers, ensures, carry, index::Reactant.TracedRNumber)
+    Reactant.Ops.case(index, dispatch.branches, carry; track_numbers=Union{})
+end
+
+ReactiveKernels._sm_frame_fill(
+        value::Reactant.TracedRNumber, ::Val{Capacity}) where {Capacity} =
+    Reactant.Ops.fill(value, (Capacity,))
+
+function ReactiveKernels._sm_frame_read(
+        values::Reactant.TracedRArray{T,1}, index::Reactant.TracedRNumber) where {T}
+    isempty(values) && throw(ArgumentError(
+        "functional control frame store cannot be empty"))
+    valid = (index >= one(index)) & (index <= length(values))
+    safe = ifelse(valid, index, one(index))
+    Reactant.@allowscalar values[safe]
+end
+
+function ReactiveKernels._sm_frame_write(
+        values::Reactant.TracedRArray{T,1}, index::Reactant.TracedRNumber,
+        replacement, active) where {T}
+    valid = (index >= one(index)) & (index <= length(values))
+    safe = ifelse(valid, index, one(index))
+    Reactant.@allowscalar begin
+        result = copy(values)
+        result[safe] = ifelse(active & valid, replacement, values[safe])
+        result
+    end
 end
 
 function ReactiveKernels._sm_functional_control_loop(
@@ -398,8 +474,23 @@ function Reactant.traced_type_inner(
 end
 
 # Functional stateful transitions are immutable compiled programs. Their
-# PreparedKernel ensure tuple and RGF body are static metadata; only the
-# materialized state snapshot and method argument are traced.
+# PreparedKernel ensure tuple and RGF/AST bodies are static metadata; only the
+# materialized state snapshot and method argument are traced. A trace block
+# must not recursively trace its emitted Expr and captured repair programs.
+function Reactant.make_tracer(
+        seen, previous::Union{ReactiveKernels._SMFunctionalForBody,
+                              ReactiveKernels._SMControlTraceBlock},
+        path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where {T<:Union{ReactiveKernels._SMFunctionalForBody,
+                                          ReactiveKernels._SMControlTraceBlock}}
+    T
+end
+
 function Reactant.make_tracer(
         seen, previous::ReactiveKernels._FunctionalStatefulTransition,
         path, mode; kwargs...)
@@ -493,6 +584,18 @@ end
 const _RKBatchedCholesky = Reactant.TracedLinearAlgebra.BatchedCholesky
 const _RKReactantArray = Union{
     Reactant.TracedRArray,Reactant.AbstractConcreteArray}
+
+# Preserve the diagonal structure of a prepared factorization. Reactant's
+# generic BatchedCholesky solve wraps its factors in triangular matrices,
+# which turns this elementwise operation into two dense triangular solves.
+for RHS in (AbstractVector, AbstractMatrix)
+    @eval function LinearAlgebra.ldiv!(
+            factor::_RKBatchedCholesky{T,<:LinearAlgebra.Diagonal{T}},
+            rhs::$RHS{T}) where {T}
+        rhs .= rhs ./ abs2.(factor.factors.diag)
+        rhs
+    end
+end
 
 # A Cholesky supplied as compiled state carries source-static `info` metadata,
 # while a Cholesky computed inside a compiled call carries Reactant's traced
@@ -981,7 +1084,7 @@ end
 # Selected by core's `compile_ad_gradient` / `compile_ad_value_and_gradient` when
 # the active argument is a Reactant-traced value. The differentiation engine is
 # the DifferentiationInterface backend stored in the `PreparedADKernel` (verified:
-# `AutoEnzyme(mode = Enzyme.Reverse)` traces through Reactant with exact parity),
+# `AutoEnzyme(mode = Enzyme.Reverse)` traces through Reactant),
 # so no concrete AD engine is imported here.
 #
 # The compiled closure receives the selected HAVE boundary in authored order, uses
@@ -996,6 +1099,42 @@ end
 _rk_reactant_ad_op(::Val{:gradient}) = DifferentiationInterface.gradient
 _rk_reactant_ad_op(::Val{:value_and_gradient}) =
     DifferentiationInterface.value_and_gradient
+
+# Program metadata and the native-only DI cache are not dynamic inputs or
+# mutated outputs of a trace. The traced call below does not use that cache.
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels.PreparedADKernel,
+        path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where {T<:ReactiveKernels.PreparedADKernel}
+    T
+end
+
+# A native DI preparation is tied to native input types. Inside a larger
+# compiled algorithm, select the same kernel's tensorized body and let DI
+# stage its derivative in that enclosing trace instead of launching a
+# separately compiled gradient executable.
+function ReactiveKernels._ad_prepared_value_and_gradient(
+        prepared::ReactiveKernels.PreparedADKernel{I},
+        point::Union{Reactant.TracedRArray,Reactant.TracedRNumber},
+        contexts) where {I}
+    call = ReactiveKernels._ADKernelCall{I,typeof(prepared.kernel)}(prepared.kernel)
+    DifferentiationInterface.value_and_gradient(
+        call, prepared.backend, point, contexts...)
+end
+
+function ReactiveKernels._ad_prepared_value_and_gradient!(
+        prepared::ReactiveKernels.PreparedADKernel, gradient,
+        point::Union{Reactant.TracedRArray,Reactant.TracedRNumber}, contexts)
+    value, derivative = ReactiveKernels._ad_prepared_value_and_gradient(
+        prepared, point, contexts)
+    copyto!(gradient, derivative)
+    value, gradient
+end
 
 function _rk_reactant_compile_ad_call(
         mode::Val, prepared::ReactiveKernels.PreparedADKernel{I}, kernel,
@@ -1066,5 +1205,7 @@ function ReactiveKernels._reactant_compile_ad(
         ::Reactant.RNumber, args...; sync::Bool = true)
     _rk_reactant_compile_ad(mode, prepared, args; sync = sync)
 end
+
+include("ReactiveKernelsReactantExt/traced_slot_compiler.jl")
 
 end # module ReactiveKernelsReactantExt

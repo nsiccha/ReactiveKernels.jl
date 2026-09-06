@@ -573,10 +573,13 @@ end
     result
 end
 
+@inline _sm_finite_column_positions(column, ::Val{Dimension}) where {Dimension} =
+    collect(axes(column, Dimension))
+
 @inline function _sm_finite_store_column(
         column, value, index, active,
         spec::_SMFiniteScalarColumnSpec)
-    positions = collect(axes(column, 1))
+    positions = _sm_finite_column_positions(column, Val(1))
     selected = _sm_predicated_and(active, positions .== index)
     candidate = _sm_finite_scalar_candidate(column, value)
     _sm_finite_select(selected, candidate, column)
@@ -586,7 +589,7 @@ end
         column, value, index, active,
         spec::_SMFiniteArrayColumnSpec{A,Shape}) where {A,Shape}
     rank = length(Shape)
-    positions = collect(axes(column, rank + 1))
+    positions = _sm_finite_column_positions(column, Val(rank + 1))
     selector_shape = (ntuple(_ -> 1, rank)..., length(positions))
     selected = _sm_predicated_and(
         active, reshape(positions .== index, selector_shape))

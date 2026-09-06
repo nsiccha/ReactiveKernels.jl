@@ -1,0 +1,60 @@
+schema_version = 1
+status = "experimental_reactant_slot_checkpoint"
+parent_commit = "f3c17a4c3b175ee26f787198ce6d2f3374a65033"
+host = "strato2"
+julia = "1.10.11"
+reactant = "0.2.284"
+enzyme = "0.13.199"
+ahmc = "0.8.6"
+command = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/hmc_eight_schools.jl reactant-slots 1000"
+exit_code = 0
+process_elapsed_seconds = 133
+model = "centered_eight_schools"
+dimensions = 10
+metric = "unit_diagonal"
+stepsize = 0.03
+leapfrog_steps = 4
+transitions_per_batch = 1000
+integration_steps_per_batch = 4000
+mlir_bytes = 67176
+while_regions = 1
+if_regions = 5
+proven_currentness_facts = 16
+note = "Interleaved, synchronized Reactant and AHMC batches use the same RK model/AD object and callback handles. Fresh device inputs and AHMC state resets are outside timing. All native/traced numerical agreement gates are absent. This is an endpoint-Metropolis HMC compiler prototype without adaptation or ESS measurement. Stronger roughly 2 us AHMC samples exist; do not claim a Reactant win from GC-affected medians. Small fixed loops are expanded; larger/dynamic loops remain unsupported by this experimental backend."
+
+[traced_slots]
+batch_seconds = [0.002433345, 0.002758043, 0.002665886, 0.002564806, 0.002524832, 0.002472971, 0.002836811]
+batch_allocated_bytes = [5424, 5424, 5424, 5424, 5424, 5424, 5424]
+
+[ahmc]
+batch_seconds = [0.002260566, 0.002832075, 0.002796115, 0.002129787, 0.002320469, 0.041744609, 0.002866313]
+batch_allocated_bytes = [7200000, 7200000, 7200000, 7200000, 7200000, 7203632, 7200000]
+
+[stages]
+prepare_model_seconds = 4.201180863
+prepare_model_bytes = 233183904
+prepare_native_endpoint_seconds = 7.417961259
+prepare_native_endpoint_bytes = 851409096
+prepare_native_factory_seconds = 5.088286138
+prepare_native_factory_bytes = 423251064
+lower_fast_native_seconds = 3.896504268
+lower_fast_native_bytes = 300691480
+lower_traced_slots_seconds = 1.725676039
+lower_traced_slots_bytes = 162018960
+compile_traced_slots_seconds = 41.878331453
+compile_traced_slots_bytes = 3730427320
+traced_slots_first_chain_seconds = 0.488673997
+traced_slots_first_chain_bytes = 57377968
+
+[source_sha256]
+"src/ad.jl" = "37c8258f5ffa67fbab9b4240fb972858c3e05a01f1d99b73fd3a1790afd4b568"
+"ext/ReactiveKernelsReactantExt.jl" = "984f0492928a98cb7b65b1b31a550e5b5356893795156f02b405e2e9809e022c"
+"src/kernel_adaptation.jl" = "d655baa036d4e5770b769ab644b8c56ca0567c167d3643011352131e9928a5c4"
+"benchmark/sampler_transpiler/hmc_eight_schools.jl" = "ff31961a41340c863db3ff947dde20e538d44ae2a0be235afc211b8c141ebebe"
+"benchmark/sampler_transpiler/native_slots.jl" = "53ea0ef2c304c1d299dac3570ba4ac8e14a4322a5b5fc5ddad9d2581516f1020"
+"benchmark/sampler_transpiler/native_slots_factory.jl" = "25cb2567c2a932d6a7418584dff9d00032e917ab0365350dfb908d67d1206a17"
+"benchmark/sampler_transpiler/native_comparison.jl" = "3a762acfacf99a1d105ef0770cf85c4c9c041399801786dc3496622a1a9768f7"
+"benchmark/sampler_transpiler/traced_slots.jl" = "2cb163c882f055ee30488f8b6dd0823cdd5f944d04c1332ed8a1ad9610e814b4"
+"benchmark/sampler_transpiler/traced_comparison.jl" = "704c3f1ce23cdcb2eee847067766365f4277997007d04498e80a6991a51c5762"
+"benchmark/reactivehmc_hmc_kernel_fixture_b.jl" = "9ffa4e8e2990992cd92303e55a6d005cff2c6e1698de6bca7941ad2907f8a4da"
+"benchmark/nuts_kernel_authoring_fixture_b.jl" = "7a9a9d6e1fa122e3d846def760933b0ba14e62e567d92cffab9d9d638f9404f4"

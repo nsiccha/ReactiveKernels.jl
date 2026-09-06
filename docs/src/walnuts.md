@@ -80,9 +80,9 @@ Main.ReactiveKernelsDocs.render_walnuts_source(:nuts_leaf)
 ## Public fixture entry: stochastic values are explicit
 
 The fixture entry receives momentum, directions, and exponentials as typed
-runtime arguments. This makes identical pre-generated streams and exact counter
-comparison part of the intended native/Reactant acceptance contract; it is not,
-by itself, evidence that either generic compiler path is accepted.
+runtime arguments. Explicit streams make source-control paths reproducible for
+diagnosis. Sampler acceptance evaluates mathematical behavior and useful
+performance; it does not require cross-backend stream or trajectory agreement.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_walnuts_source(:entry)

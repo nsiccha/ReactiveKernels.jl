@@ -1,0 +1,166 @@
+"schema_version" = 1
+"status" = "experimental_process_local_emitted_code_reuse"
+"parent_commit" = "bbf7b44ca958edf93a335d8f9e3360bb6ccaee0d"
+"host" = "strato2"
+"julia" = "1.10.11"
+"reactant" = "0.2.284"
+"enzyme" = "0.13.199"
+"ahmc" = "0.8.6"
+"note" = "Only emitted Julia code is reused. Prepared state, fixed metadata, and XLA executables remain independent. Timings alternate reuse and fresh emission after the same initial compilation in one process. This does not establish a cold-first or cross-process compilation speedup. No sampler arithmetic, numerical agreement requirement, or backend optimization setting changes."
+
+["checks"]
+"command" = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/code_reuse_probe.jl checks"
+"exit_code" = 0
+"process_elapsed_seconds" = 67
+"independent_initial_states_and_bound_metadata" = true
+"shared_code_initial_values" = [1.0, 10.0]
+"shared_code_gains" = [2.0, 5.0]
+"shared_code_rounds" = 4
+"shared_code_results" = [9.0, 30.0]
+"changed_rounds" = 5
+"changed_rounds_result" = 35.0
+"mutable_literal_identities_preserved" = true
+"inspection_ast_independence" = true
+"caller_inputs_preserved" = true
+
+["hmc"]
+"command" = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/code_reuse_probe.jl timings"
+"exit_code" = 0
+"process_elapsed_seconds" = 125
+"model" = "centered_eight_schools"
+"dimensions" = 10
+"metric" = "unit_diagonal"
+"stepsize" = 0.03
+"leapfrog_steps" = 4
+"transitions_per_batch" = 1000
+"sampler" = "endpoint_metropolis_hmc"
+"order" = ["first_compile", "reuse_existing_code_1", "new_equal_code_1", "reuse_existing_code_2", "new_equal_code_2"]
+"equal_emissions" = true
+"distinct_function_types" = 3
+"caller_inputs_preserved" = true
+"new_xla_executable_per_case" = true
+
+["hmc"."prepare_model"]
+"seconds" = 4.251882191
+"allocated_bytes" = 233123936
+
+["hmc"."prepare_native_endpoint"]
+"seconds" = 7.051041446
+"allocated_bytes" = 860089368
+
+["hmc"."prepare_native_factory"]
+"seconds" = 5.104501267
+"allocated_bytes" = 429397176
+
+["hmc"."lower_fast_native"]
+"seconds" = 4.014449479
+"allocated_bytes" = 331997640
+
+["hmc"."first_compile"]
+"seconds" = 38.491010009
+"allocated_bytes" = 3654601531
+"integration_steps" = 4000
+"mlir_bytes" = 38031
+
+["hmc"."reuse_existing_code_1"]
+"seconds" = 0.618952997
+"allocated_bytes" = 14835400
+"integration_steps" = 4000
+"mlir_bytes" = 38031
+
+["hmc"."new_equal_code_1"]
+"seconds" = 8.055440409
+"allocated_bytes" = 784008976
+"integration_steps" = 4000
+"mlir_bytes" = 38031
+
+["hmc"."reuse_existing_code_2"]
+"seconds" = 0.62533076
+"allocated_bytes" = 13551624
+"integration_steps" = 4000
+"mlir_bytes" = 38031
+
+["hmc"."new_equal_code_2"]
+"seconds" = 8.729423332
+"allocated_bytes" = 767452960
+"integration_steps" = 4000
+"mlir_bytes" = 38031
+
+["preimplementation_experiment"]
+"commit" = "bbf7b44ca958edf93a335d8f9e3360bb6ccaee0d"
+"exit_code" = 0
+"process_elapsed_seconds" = 128
+"note" = "Scratch experiment manually substitutes the first emitted function into later equal programs while retaining their state and metadata. The exact executed source is embedded below."
+"order" = ["first_compile", "reuse_existing_code_1", "new_equal_code_1", "reuse_existing_code_2", "new_equal_code_2"]
+"caller_inputs_preserved" = true
+"source" = "include(\"/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-sampling/benchmark/sampler_transpiler/hmc_eight_schools.jl\")\n\nfunction compile_reuse_case(program,projection,label)\n    call=TracedSlotCall(program.f,program.metadata)\n    driver=(state,seed,counts)->traced_owned_batch(call,projection,state,seed,counts,1000)\n    inputs=traced_slot_inputs(program.state)\n    compiled=measured(label) do\n        Reactant.compile(driver,inputs;sync=true,donated_args=:none,serializable=true)\n    end\n    result=compiled(inputs...)\n    Int(result.counts[1])==4000 || error(\"shortened workload\")\n    check_traced_inputs_unchanged(inputs,program.state)\n    println(label,\" integration_steps=\",Int(result.counts[1]),\n        \" mlir_bytes=\",sizeof(compiled.module_string))\nend\n\nconst PROTOTYPE=build_fast_prototype(compiler_options=(peel_loops=true,))\nreset_native_slots!(PROTOTYPE.prepared)\nconst PROGRAMS=ntuple(_->compile_traced_slots(PROTOTYPE.prepared.program),3)\nall(p->isequal(p.expression,PROGRAMS[1].expression),PROGRAMS) || error(\"emissions differ\")\nprintln(\"equal_emissions=true distinct_function_types=\",length(unique(typeof(p.f) for p in PROGRAMS)))\nconst PREFIX=Symbol(PROTOTYPE.prepared.program.contexts[2].prefix,:_owned)\nconst PROJECTION=SlotStatic(Tuple(i for (i,pair) in enumerate(PROGRAMS[1].ordered)\n    if first(first(pair))===PREFIX))\nfor (program,label) in (\n    (PROGRAMS[1],\"first_compile\"),\n    (merge(PROGRAMS[2],(;f=PROGRAMS[1].f)),\"reuse_existing_code_1\"),\n    (PROGRAMS[2],\"new_equal_code_1\"),\n    (merge(PROGRAMS[3],(;f=PROGRAMS[1].f)),\"reuse_existing_code_2\"),\n    (PROGRAMS[3],\"new_equal_code_2\"),\n)\n    Base.invokelatest(compile_reuse_case,program,PROJECTION,label)\nend\n"
+
+["preimplementation_experiment"."prepare_model"]
+"seconds" = 4.080528101
+"allocated_bytes" = 233340288
+
+["preimplementation_experiment"."prepare_native_endpoint"]
+"seconds" = 7.509063659
+"allocated_bytes" = 860233928
+
+["preimplementation_experiment"."prepare_native_factory"]
+"seconds" = 5.569218195
+"allocated_bytes" = 429381416
+
+["preimplementation_experiment"."lower_fast_native"]
+"seconds" = 4.076723156
+"allocated_bytes" = 333189456
+
+["preimplementation_experiment"."first_compile"]
+"seconds" = 39.716294444
+"allocated_bytes" = 3670889611
+"integration_steps" = 4000
+"mlir_bytes" = 38031
+
+["preimplementation_experiment"."reuse_existing_code_1"]
+"seconds" = 0.663349292
+"allocated_bytes" = 14866424
+"integration_steps" = 4000
+"mlir_bytes" = 38031
+
+["preimplementation_experiment"."new_equal_code_1"]
+"seconds" = 9.574265455
+"allocated_bytes" = 767430240
+"integration_steps" = 4000
+"mlir_bytes" = 38031
+
+["preimplementation_experiment"."reuse_existing_code_2"]
+"seconds" = 0.612242342
+"allocated_bytes" = 13707240
+"integration_steps" = 4000
+"mlir_bytes" = 38031
+
+["preimplementation_experiment"."new_equal_code_2"]
+"seconds" = 8.165306693
+"allocated_bytes" = 767458064
+"integration_steps" = 4000
+"mlir_bytes" = 38031
+
+["source_sha256"]
+"src/ad.jl" = "37c8258f5ffa67fbab9b4240fb972858c3e05a01f1d99b73fd3a1790afd4b568"
+"ext/ReactiveKernelsReactantExt.jl" = "6557fdb95b8115a375ca99d73496a30e2fddddff2c2eab09a92da8663819ff34"
+"src/kernel_adaptation.jl" = "d655baa036d4e5770b769ab644b8c56ca0567c167d3643011352131e9928a5c4"
+"benchmark/reactivehmc_hmc_kernel_fixture_b.jl" = "9ffa4e8e2990992cd92303e55a6d005cff2c6e1698de6bca7941ad2907f8a4da"
+"benchmark/nuts_kernel_authoring_fixture_b.jl" = "7a9a9d6e1fa122e3d846def760933b0ba14e62e567d92cffab9d9d638f9404f4"
+"benchmark/sampler_transpiler/hmc_eight_schools.jl" = "c18b800fc013d8007d1d1b23d7c7330b89304bc8ff92767562b26a788d2d5996"
+"benchmark/sampler_transpiler/native_slots.jl" = "c0f03d31c96be0c6282608c93779cd6c92c00e3741e40bdf62bc365e3f8d3e25"
+"benchmark/sampler_transpiler/native_slots_factory.jl" = "36468f4da6321631c0eba1a8fc1baa5dee305220b0e1572d6966b509365f8235"
+"benchmark/sampler_transpiler/native_comparison.jl" = "5e2612234a93c4d126a7c9550520ba468b266c790709e1602a1b1dccae183598"
+"benchmark/sampler_transpiler/traced_slots.jl" = "1145f10c16fb282f15615d8450e57b0e947af0b44c7a42ae99d16adfe9a18fd1"
+"benchmark/sampler_transpiler/traced_comparison.jl" = "ff891cd14f9ae1933a3b3813246b1d242b056b3b8c271425c3545e1bb78732c0"
+"benchmark/sampler_transpiler/loop_control_probe.jl" = "45bc979f7bdfbbc91918f4aa3300f794d7b263dd788b4707b7e621e4b1970881"
+"benchmark/sampler_transpiler/profile_compile.jl" = "ba92a50afae1fdd86667fc00f16197a0479214e714eb2237e10b2cdf7332dbc8"
+"src/ReactiveKernels.jl" = "5dadbc59cd45725b1b00350cc5156e4b8a403c766b90ca24985f5bc958d3ce01"
+"src/native_slot_compiler.jl" = "206f475697d27bbc230f5eca0631378ee22e13951ab5929d94158ae6802ebea9"
+"src/native_slots.jl" = "9df70ffbff74c2e5d5eb4271ed29dbc2c4350d8a130b7857a41c386e3b5c0e21"
+"src/native_slots_factory.jl" = "58208f07e6c86a3478e1c6f217f48c7cb25789198ecedbea27d8ea60580ca532"
+"ext/ReactiveKernelsReactantExt/traced_slot_compiler.jl" = "8041f82e4a3bf997b9676a6bbafea11130c6ce01fb3f3090c5eadfbcf37151c6"
+"ext/ReactiveKernelsReactantExt/traced_slots.jl" = "3761e01387b71c1ec69f4e956141b9aba6afb50097a412a5c509ad4dc0ec2449"
+"benchmark/sampler_transpiler/scalar_argument_probe.jl" = "277492fefac36afa9dce6b96f1510137dcd3eda1eb0ef97e44874a5300b0b47b"
+"ext/ReactiveKernelsReactantExt/traced_code_cache.jl" = "1e1b87256021628044b47b5c2c3e0f8d14d0e298d58e156c82b0f8958c0d46fb"
+"benchmark/sampler_transpiler/code_reuse_probe.jl" = "2ce50d054e810c354e4561ff1ce8067bcb02010560eb319edac73e05fb0c0ec0"

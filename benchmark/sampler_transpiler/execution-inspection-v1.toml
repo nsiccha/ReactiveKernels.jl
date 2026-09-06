@@ -1,0 +1,804 @@
+"schema_version" = 1
+"source_commit" = "81fc0c7d666df0fa96ce5ac040fb070a87c9b476"
+"host" = "strato2"
+"platform" = "cpu"
+"julia" = "1.10.11"
+"reactant" = "0.2.284"
+"status" = "optimized_executable_and_worker_trace_inspected"
+"interpretation" = "The entire chain is one synchronized compiled call. A6us fixed call overhead amortized over10000 transitions is0.0006us/transition and cannot explain the observed6.5us gap. Optimized HLO retains20 fusion nodes,1rng call,2explicit copies per retained leapfrog iteration. Worker tracing confirms repeated dispatch. Instrumentation materially perturbs these tiny operations, so trace durations are not ordinary runtime attribution percentages. No performance flags or algorithm defaults changed."
+"followup" = "Reduce fragmentation of the generated small CPU loop and duplicated gradient assembly; the measured share of each residual cost remains unresolved. Small step-size tensor materialization is another IR lead. Preserve the generic source-to-native-to-Reactant compiler path."
+"primary_runtime_reference" = "https://openxla.org/xla/hlo_to_thunks"
+"documentation_cleanup" = "A remaining exact-parity claim in a src/ad.jl comment was replaced after these executable sources were loaded. The source hash map above retains the recorded81fc0c7 version; this comment edit changes no behavior."
+
+["source_sha256"]
+"src/ad.jl" = "37c8258f5ffa67fbab9b4240fb972858c3e05a01f1d99b73fd3a1790afd4b568"
+"ext/ReactiveKernelsReactantExt.jl" = "6557fdb95b8115a375ca99d73496a30e2fddddff2c2eab09a92da8663819ff34"
+"src/kernel_adaptation.jl" = "d655baa036d4e5770b769ab644b8c56ca0567c167d3643011352131e9928a5c4"
+"benchmark/reactivehmc_hmc_kernel_fixture_b.jl" = "9ffa4e8e2990992cd92303e55a6d005cff2c6e1698de6bca7941ad2907f8a4da"
+"benchmark/nuts_kernel_authoring_fixture_b.jl" = "7a9a9d6e1fa122e3d846def760933b0ba14e62e567d92cffab9d9d638f9404f4"
+"benchmark/sampler_transpiler/hmc_eight_schools.jl" = "c18b800fc013d8007d1d1b23d7c7330b89304bc8ff92767562b26a788d2d5996"
+"benchmark/sampler_transpiler/native_slots.jl" = "c0f03d31c96be0c6282608c93779cd6c92c00e3741e40bdf62bc365e3f8d3e25"
+"benchmark/sampler_transpiler/native_slots_factory.jl" = "36468f4da6321631c0eba1a8fc1baa5dee305220b0e1572d6966b509365f8235"
+"benchmark/sampler_transpiler/native_comparison.jl" = "5e2612234a93c4d126a7c9550520ba468b266c790709e1602a1b1dccae183598"
+"benchmark/sampler_transpiler/traced_slots.jl" = "1145f10c16fb282f15615d8450e57b0e947af0b44c7a42ae99d16adfe9a18fd1"
+"benchmark/sampler_transpiler/traced_comparison.jl" = "ff891cd14f9ae1933a3b3813246b1d242b056b3b8c271425c3545e1bb78732c0"
+"benchmark/sampler_transpiler/loop_control_probe.jl" = "45bc979f7bdfbbc91918f4aa3300f794d7b263dd788b4707b7e621e4b1970881"
+"benchmark/sampler_transpiler/profile_compile.jl" = "ba92a50afae1fdd86667fc00f16197a0479214e714eb2237e10b2cdf7332dbc8"
+"src/ReactiveKernels.jl" = "5dadbc59cd45725b1b00350cc5156e4b8a403c766b90ca24985f5bc958d3ce01"
+"src/native_slot_compiler.jl" = "206f475697d27bbc230f5eca0631378ee22e13951ab5929d94158ae6802ebea9"
+"src/native_slots.jl" = "9c6857d54dbd5471a62017a0cbfa6764442a98476f9f680ccee94991d12186c1"
+"src/native_slots_factory.jl" = "9f0f47fc081de7b54950fe4e87ec488b6dfb0e6b84fa3119af1a07ff96d0928a"
+"ext/ReactiveKernelsReactantExt/traced_slot_compiler.jl" = "7f5bc7f5148912b1d7355ad55181e847911984199c6fbccb53b3a49ede4a83a7"
+"ext/ReactiveKernelsReactantExt/traced_slots.jl" = "470236c0fde74933d3f39147418984221ef27ca77440fd04c4ff350bad948f86"
+"benchmark/sampler_transpiler/scalar_argument_probe.jl" = "277492fefac36afa9dce6b96f1510137dcd3eda1eb0ef97e44874a5300b0b47b"
+"ext/ReactiveKernelsReactantExt/traced_code_cache.jl" = "1e1b87256021628044b47b5c2c3e0f8d14d0e298d58e156c82b0f8958c0d46fb"
+"benchmark/sampler_transpiler/code_reuse_probe.jl" = "2ce50d054e810c354e4561ff1ce8067bcb02010560eb319edac73e05fb0c0ec0"
+"benchmark/sampler_transpiler/multinomial_hmc_kernel.jl" = "a854b0a9cf5ec660e64d622b9442804a564ffc0657ed3089331aa9e5fcb97218"
+"benchmark/sampler_transpiler/multinomial_eight_schools.jl" = "0080849f5e4cd1d5ac933aba28d941e747d99669fb9cf14b38efd201a29ce9df"
+"benchmark/sampler_transpiler/constant_binding_probe.jl" = "a510b08850dc0e07779ff80750c26bdddac93552c2d8b7ea400148973bcf95c8"
+"benchmark/sampler_transpiler/range_draw_probe.jl" = "e9d82d844fbed32de615ee8dde49876cf488a102d6d6938c8c2742f4692cbe5f"
+"ext/ReactiveKernelsReactantExt/traced_random.jl" = "33e50ef2a1f7eda06a4a01bb66892565d609e2d28aa418f391db445f468e0e93"
+"src/kernel_stateful.jl" = "2cff19f87a39d124a462d4f79cd99cb94c9908c16f5b1c2d3946db7af89a6776"
+"test/test_kernel_methodir.jl" = "1aa1a6a9501d4525031f7ea8166bf3e6bf29ce8bd85b23a18e101b2d929961f7"
+"benchmark/sampler_transpiler/indexed_array_probe.jl" = "a746173df251cb14f6b628a3142337ca15458fc486e1afe6e2caf1d7ba4f06bd"
+"src/kernel_factory.jl" = "6cd1cc5e3715d420a4d06983d361a2597c3a2f243f88e21fbcd5eb2fda4e65b1"
+"benchmark/sampler_transpiler/runtime_keyword_probe.jl" = "fcdff23cfaabf5616dbc339653b660117ed4e96ae8c844382196631bc3bf6f08"
+"benchmark/sampler_transpiler/counter_ablation.jl" = "1d459d0f9ee8c3741d13659be69724d3a924698c6bdf036b7f825b66a952a0f5"
+"benchmark/sampler_transpiler/partial_transfer_probe.jl" = "190c2a9d23a7b438a03ad41fb3c8fca5e116a89cc49273153bdbf25028da1552"
+"benchmark/sampler_transpiler/position_multinomial_hmc_kernel.jl" = "25c1328145e517c7b53dfc0b0e4d51aa5fc8f08e984e429da36412da5d06d0fe"
+"benchmark/sampler_transpiler/multinomial_scaling.jl" = "8d520daa2fe01ab0822beb1e58f75a4b022bc5364472d3dc867fd68a18674e88"
+"benchmark/sampler_transpiler/position_multinomial_scaling.jl" = "c4a3a2293afd40a06899e20f0f4ff69593c42f77a327654df3896b51b947139f"
+
+["optimized_hlo"]
+"exit_code" = 0
+"elapsed_seconds" = 113
+"recorded_output" = "BEGIN prepare_model\nprepare_model seconds=4.576170134 bytes=233020496\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=7.55811677 bytes=859785544\nBEGIN prepare_multinomial_factory\nprepare_multinomial_factory seconds=4.691104427 bytes=361801848\nBEGIN lower_multinomial_native\nlower_multinomial_native seconds=4.800875281 bytes=431464024\nchildren=(:init, :anchor, :work)\nBEGIN lower_traced_slots\nlower_traced_slots seconds=2.177764635 bytes=232238832\nproven_currentness_facts=16 runtime_currentness_flags=5 metadata_entries=11\nBEGIN compile_traced_slots\ncompile_traced_slots seconds=42.322021375 bytes=4225021333\nmlir_bytes=43762 while_regions=3 if_regions=0\nBEGIN traced_slots_first_chain\ntraced_slots_first_chain seconds=0.300843348 bytes=40967168\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.01165504 bytes=2368\nintegration_steps=16000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.046682196 bytes=33278048\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.011853314 bytes=2368\nintegration_steps=16000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.014008196 bytes=33274416\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.012071345 bytes=2368\nintegration_steps=16000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.027009892 bytes=33274416\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.012213752 bytes=2368\nintegration_steps=16000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.015647205 bytes=33274416\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.012389573 bytes=2368\nintegration_steps=16000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.014263066 bytes=33274416\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.012492565 bytes=2368\nintegration_steps=16000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.015874879 bytes=33274416\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.01207547 bytes=2368\nintegration_steps=16000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.013002859 bytes=33274416\nemissions_directory=/home/n/scratch/kb-agent-tmp/ReactiveKernels-sampling/position-emissions\nplatform=cpu\noptimized_hlo_bytes=211161\n"
+"inspector_source" = "include(\"/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-sampling/benchmark/sampler_transpiler/multinomial_eight_schools.jl\")\ninclude(\"/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-sampling/benchmark/sampler_transpiler/position_multinomial_hmc_kernel.jl\")\nconst PROTOTYPE=build_multinomial_prototype(;L=16,\n    source=PositionMultinomialHMCAuthoring.multinomial_hmc_state,\n    source_controls=(step_f=F.leapfrog!,stepsize=0.03),\n    compiler_options=(peel_loops=true,))\nconst RESULT=run_traced_comparison(PROTOTYPE;n=1000)\nconst OUTDIR=\"/home/n/scratch/kb-agent-tmp/ReactiveKernels-sampling/position-emissions\"\nwrite_multinomial_emissions(OUTDIR,PROTOTYPE.prepared.program,RESULT)\nprintln(\"platform=\",Reactant.XLA.platform_name(RESULT.compiled.client))\nmodules=Reactant.XLA.get_hlo_modules(RESULT.compiled.exec)\nfor (i,mod) in enumerate(modules)\n    text=sprint(show,mod)\n    write(joinpath(OUTDIR,\"optimized-$(i).hlo\"),text)\n    println(\"optimized_hlo_bytes=\",sizeof(text))\nend\n"
+"artifact_sha256" = "67ee4f34feb7e62b3c982845d216d3a25665939157b6b7d7b193ebcc0788a1fd"
+"artifact_bytes" = 211161
+"kb_artifact_path" = "/home/niko/.local/state/kb-agents/uploads/3096f28badf6feaf.txt"
+"artifact_note" = "Artifact extracted again by the subsequent Julia sampling run on the same source; original inspector and later run each report211161B."
+"inner_fusion_nodes" = 20
+"inner_rng_calls" = 1
+"inner_explicit_copies" = 2
+"stepsize_tensor_shapes" = ["15x10", "15x10"]
+"gradient_assembly" = "fused_computation.15 and.16 assemble the same gradient with opposite final sign. Shared reductions are reused; this is not two complete gradient evaluations."
+
+["julia_sampling"]
+"exit_code" = 0
+"elapsed_seconds" = 130
+"recorded_output" = "BEGIN prepare_model\nprepare_model seconds=4.459286993 bytes=232937760\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=8.34092453 bytes=860135400\nBEGIN prepare_multinomial_factory\nprepare_multinomial_factory seconds=4.855293854 bytes=361543464\nBEGIN lower_multinomial_native\nlower_multinomial_native seconds=4.422531653 bytes=431464728\nchildren=(:init, :anchor, :work)\nBEGIN lower_traced_slots\nlower_traced_slots seconds=2.153812419 bytes=232242480\nproven_currentness_facts=16 runtime_currentness_flags=5 metadata_entries=11\nBEGIN compile_traced_slots\ncompile_traced_slots seconds=43.685954852 bytes=4225058757\nmlir_bytes=43762 while_regions=3 if_regions=0\nBEGIN traced_slots_first_chain\ntraced_slots_first_chain seconds=0.299254205 bytes=40967296\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.012483221 bytes=2368\nintegration_steps=16000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.013551365 bytes=33274416\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.014609503 bytes=2368\nintegration_steps=16000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.029499154 bytes=33274416\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.0121988 bytes=2368\nintegration_steps=16000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.025460115 bytes=33274416\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.012682267 bytes=2368\nintegration_steps=16000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.012947543 bytes=33274416\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.012719318 bytes=2368\nintegration_steps=16000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.015667684 bytes=33274416\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.013018891 bytes=2368\nintegration_steps=16000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.013773321 bytes=33274416\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.015621119 bytes=2368\nintegration_steps=16000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.015120228 bytes=33274416\nemissions_directory=/home/n/scratch/kb-agent-tmp/ReactiveKernels-sampling/position-emissions\nplatform=cpu\noptimized_hlo_bytes=211161\nexecution_profile_entries=248971\n"
+"driver_source" = "include(\"/home/n/scratch/kb-agent-tmp/ReactiveKernels-sampling/inspect_position_xla.jl\")\nusing Profile, Serialization\nfunction profile_position_execution(result,output_dir)\n    inputs=traced_slot_inputs(result.program.state)\n    compiled=result.compiled\n    function repeated()\n        for _ in 1:400\n            output=compiled(inputs...)\n        end\n    end\n    repeated()\n    Profile.init(n=10_000_000,delay=0.001)\n    Profile.clear()\n    Profile.@profile repeated()\n    data,lidict=Profile.retrieve()\n    serialize(joinpath(output_dir,\"execution.profile\"),(data,lidict))\n    open(joinpath(output_dir,\"execution.flat.txt\"),\"w\") do io\n        Profile.print(IOContext(io,:displaysize=>(100000,300)),data,lidict;\n            format=:flat,sortedby=:count,mincount=15,C=true)\n    end\n    open(joinpath(output_dir,\"execution.tree.txt\"),\"w\") do io\n        Profile.print(IOContext(io,:displaysize=>(100000,300)),data,lidict;\n            format=:tree,maxdepth=65,mincount=100,C=true)\n    end\n    println(\"execution_profile_entries=\",length(data))\n    check_traced_inputs_unchanged(inputs,result.program.state)\nend\nBase.invokelatest(profile_position_execution,RESULT,OUTDIR)\n"
+"snapshots" = 4529
+"future_wait_snapshots" = 4500
+"flat_profile" = " Count  Overhead File                                                                                                            Line Function\n =====  ======== ====                                                                                                            ==== ========\n    16         0 /home/n/.julia/artifacts/2fc028f4b498deffe5b8aabe4b9c66e892d96aa3/lib/libReactantExtra.so                          ? _ZNK3xla23PjRtCpuLoadedExecutable14ExecuteShardedEN4absl12lts_202605264SpanIKPNS_10PjRtBufferEEEPNS_10PjRtDeviceERKNS_14ExecuteOptionsERSt8optionalIN3tsl6FutureIvEEEb\n    16         0 /home/n/.julia/artifacts/2fc028f4b498deffe5b8aabe4b9c66e892d96aa3/lib/libReactantExtra.so                          ? _ZNK3xla26CommonPjRtLoadedExecutable14ExecuteShardedEN4absl12lts_202605264SpanIKPNS_10PjRtBufferEEEPNS_10PjRtDeviceERKNS_14ExecuteOptionsERSt8optionalIN3tsl6FutureIv…\n    16         0 /home/n/.julia/artifacts/2fc028f4b498deffe5b8aabe4b9c66e892d96aa3/lib/libReactantExtra.so                          ? _ZNK3xla26CommonPjRtLoadedExecutable27ExecuteHelperOnSingleDeviceEN4absl12lts_202605264SpanIKPNS_10PjRtBufferEEENS_5RunIdEiiRKNS_14ExecuteOptionsEbPNS_10PjRtDeviceE\n    17         0 /home/n/.julia/artifacts/2fc028f4b498deffe5b8aabe4b9c66e892d96aa3/lib/libReactantExtra.so                          ? XLAExecuteSharded\n    18         0 @Reactant/src/xla/PJRT/LoadedExecutable.jl                                                                       206 macro expansion\n    19         0 @Reactant/src/xla/PJRT/LoadedExecutable.jl                                                                       175 execute_sharded\n    28         0 @Reactant/src/compiler/Compiler.jl                                                                              1478 macro expansion\n    28         0 @Reactant/src/compiler/Codegen.jl                                                                               1374 macro expansion\n  4500         0 @Reactant/src/compiler/Compiler.jl                                                                              1479 macro expansion\n  4500         0 @Reactant/src/xla/Buffer.jl                                                                                       24 synced_buffer\n  4500         0 @Base/tuple.jl                                                                                                   291 map\n  4500         0 @Reactant/src/xla/Buffer.jl                                                                                       37 synced_buffer\n  4500         0 @Reactant/src/xla/Buffer.jl                                                                                       45 wait(buffer::Reactant.XLA.PJRT.AsyncBuffer)\n  4500         0 @Reactant/src/xla/PJRT/Future.jl                                                                                  25 wait\n  4500         0 @Reactant/src/mlir/libMLIR_h.jl                                                                                15727 FutureAwait\n  4500         0 /home/n/.julia/artifacts/2fc028f4b498deffe5b8aabe4b9c66e892d96aa3/lib/libReactantExtra.so                          ? FutureAwait\n  4500         0 /home/n/.julia/artifacts/2fc028f4b498deffe5b8aabe4b9c66e892d96aa3/lib/libReactantExtra.so                          ? _ZNK3tsl8internal10FutureBaseIN4absl12lts_202605266StatusELb0EE15BlockUntilReadyITpTnRiJEPFvPNS_10AsyncValueEEEEvOT0_\n  4500         0 /home/n/.julia/artifacts/2fc028f4b498deffe5b8aabe4b9c66e892d96aa3/lib/libReactantExtra.so                          ? _ZN3tsl15BlockUntilReadyEPNS_10AsyncValueE\n  4500         0 /home/n/.julia/artifacts/2fc028f4b498deffe5b8aabe4b9c66e892d96aa3/lib/libReactantExtra.so                          ? _ZNK4absl12lts_2026052612Notification19WaitForNotificationEv\n  4500         0 /home/n/.julia/artifacts/2fc028f4b498deffe5b8aabe4b9c66e892d96aa3/lib/libReactantExtra.so                          ? _ZN4absl12lts_202605265Mutex20LockSlowWithDeadlineEPKNS0_6MuHowSEPKNS0_9ConditionENS0_24synchronization_internal13KernelTimeoutEi\n  4500         0 /home/n/.julia/artifacts/2fc028f4b498deffe5b8aabe4b9c66e892d96aa3/lib/libReactantExtra.so                          ? _ZN4absl12lts_202605265Mutex5BlockEPNS0_13base_internal14PerThreadSynchE\n  4500         0 /home/n/.julia/artifacts/2fc028f4b498deffe5b8aabe4b9c66e892d96aa3/lib/libReactantExtra.so                          ? AbslInternalPerThreadSemWait_lts_20260526\n  4500         0 /home/n/.julia/artifacts/2fc028f4b498deffe5b8aabe4b9c66e892d96aa3/lib/libReactantExtra.so                          ? _ZN4absl12lts_2026052624synchronization_internal11FutexWaiter4WaitENS1_13KernelTimeoutE\n  4500         0 /home/n/.julia/artifacts/2fc028f4b498deffe5b8aabe4b9c66e892d96aa3/lib/libReactantExtra.so                          ? _ZN4absl12lts_2026052624synchronization_internal11FutexWaiter9WaitUntilEPSt6atomicIiEiNS1_13KernelTimeoutE\n  4500      4499 /usr/lib/x86_64-linux-gnu/libc.so.6                                                                                ? syscall\n  4529         0 /workspace/srcdir/glibc-2.17/csu/../sysdeps/x86_64/start.S                                                       123 [unknown function]\n  4529         0 /usr/lib/x86_64-linux-gnu/libc.so.6                                                                                ? __libc_start_main\n  4529         3 /usr/lib/x86_64-linux-gnu/libc.so.6                                                                                ? [unknown function]\n  4529         0 /cache/build/builder-amdci4-2/julialang/julia-release-1-dot-10/cli/loader_exe.c                                   58 main\n  4529         0 /cache/build/builder-amdci4-2/julialang/julia-release-1-dot-10/src/jlapi.c                                       731 jl_repl_entrypoint\n  4529         0 /cache/build/builder-amdci4-2/julialang/julia-release-1-dot-10/src/jlapi.c                                       582 true_main\n  4529         0 /cache/build/builder-amdci4-2/julialang/julia-release-1-dot-10/src/julia.h                                      1982 jl_apply\n  4529         0 /cache/build/builder-amdci4-2/julialang/julia-release-1-dot-10/src/gf.c                                         3079 ijl_apply_generic\n  4529         0 /cache/build/builder-amdci4-2/julialang/julia-release-1-dot-10/src/gf.c                                         2897 _jl_invoke\n  4529         0 /home/n/.julia/juliaup/julia-1.10.11+0.x64.linux.gnu/lib/julia/sys.so                                              ? jfptr__start_83197.1\n  4529         0 @Base/client.jl                                                                                                  550 _start()\n  4529         0 @Base/client.jl                                                                                                  316 exec_options(opts::Base.JLOptions)\n  4529         0 /home/n/.julia/juliaup/julia-1.10.11+0.x64.linux.gnu/lib/julia/sys.so                                              ? jfptr_include_46591.1\n  4529         0 @Base/Base.jl                                                                                                    495 include(mod::Module, _path::String)\n  4529         0 @Base/loading.jl                                                                                                2220 _include(mapexpr::Function, mod::Module, _path::String)\n  4529         0 @Base/loading.jl                                                                                                2160 include_string(mapexpr::typeof(identity), mod::Module, code::String, filename::String)\n  4529         0 @Base/boot.jl                                                                                                    385 eval\n  4529         0 /cache/build/builder-amdci4-2/julialang/julia-release-1-dot-10/src/toplevel.c                                    985 ijl_toplevel_eval_in\n  4529         0 /cache/build/builder-amdci4-2/julialang/julia-release-1-dot-10/src/toplevel.c                                    877 jl_toplevel_eval_flex\n  4529         0 /cache/build/builder-amdci4-2/julialang/julia-release-1-dot-10/src/toplevel.c                                    934 jl_toplevel_eval_flex\n  4529         0 /cache/build/builder-amdci4-2/julialang/julia-release-1-dot-10/src/interpreter.c                                 775 jl_interpret_toplevel_thunk\n  4529         0 /cache/build/builder-amdci4-2/julialang/julia-release-1-dot-10/src/interpreter.c                                 617 eval_body\n  4529         0 /cache/build/builder-amdci4-2/julialang/julia-release-1-dot-10/src/interpreter.c                                 174 eval_stmt_value\n  4529         0 /cache/build/builder-amdci4-2/julialang/julia-release-1-dot-10/src/interpreter.c                                 223 eval_value\n  4529         0 /cache/build/builder-amdci4-2/julialang/julia-release-1-dot-10/src/interpreter.c                                 126 do_call\n  4529         0 @Base/essentials.jl                                                                                              889 invokelatest(::Any, ::Any, ::Vararg{Any})\n  4529         0 /cache/build/builder-amdci4-2/julialang/julia-release-1-dot-10/src/builtins.c                                    768 do_apply\n  4529         0 @Base/essentials.jl                                                                                              892 invokelatest(::Any, ::Any, ::Vararg{Any}; kwargs::Base.Pairs{Symbol, Union{}, Tuple{}, @NamedTuple{}})\n  4529         0 /cache/build/builder-amdci4-2/julialang/julia-release-1-dot-10/src/builtins.c                                    812 jl_f__call_latest\n  4529         1 [any unknown stackframes]\n  4529         0 /home/n/scratch/kb-agent-tmp/ReactiveKernels-sampling/profile_position_execution.jl                               14 profile_position_execution(result::@NamedTuple{program::@NamedTuple{f::ReactiveKernelsReactantExt.TracedSlotCompiler.var\"#110#128\", expression::Expr, expanded::Expr,…\n  4529         0 @Profile/src/Profile.jl                                                                                           43 macro expansion\n  4529         0 /home/n/scratch/kb-agent-tmp/ReactiveKernels-sampling/profile_position_execution.jl                                8 (::var\"#repeated#93\"{Reactant.Compiler.Thunk{var\"#68#74\"{Int64, SlotStatic{NTuple{7, Int64}}, TracedSlotCall{ReactiveKernelsReactantExt.TracedSlotCompiler.var\"#110#1…\n  4529         0 @Reactant/src/compiler/Thunk.jl                                                                                   72 (::Reactant.Compiler.Thunk{var\"#68#74\"{Int64, SlotStatic{NTuple{7, Int64}}, TracedSlotCall{ReactiveKernelsReactantExt.TracedSlotCompiler.var\"#110#128\", SlotStatic{Tu…\n  4529         0 @Reactant/src/compiler/Thunk.jl                                                                                   81 macro expansion\nTotal snapshots: 4529. Utilization: 100% across all threads and tasks. Use the `groupby` kwarg to break down by thread and/or task.\n"
+"interpretation" = "Julia thread waits for the XLA worker. This samples waiting, not worker execution; it does NOT establish synchronization overhead as the cause."
+
+["xla_worker_trace"]
+"exit_code" = 0
+"elapsed_seconds" = 114
+"recorded_output" = "BEGIN prepare_model\nprepare_model seconds=3.974270677 bytes=232997968\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=7.514013305 bytes=860056208\nBEGIN prepare_multinomial_factory\nprepare_multinomial_factory seconds=4.686820618 bytes=361539240\nBEGIN lower_multinomial_native\nlower_multinomial_native seconds=4.546220386 bytes=431533480\nchildren=(:init, :anchor, :work)\nBEGIN compile_xprof_instrumented\ncompile_xprof_instrumented seconds=42.91623893 bytes=4139563141\nWARNING: All log messages before absl::InitializeLog() is called are written to STDERR\nI0000 00:00:1788684890.923644       7 profiler_session.cc:171] Profiler session initializing.\nI0000 00:00:1788684890.923687       7 profiler_session.cc:186] Profiler session started.\nI0000 00:00:1788684890.957438       7 profiler_session.cc:134] Profiler session collecting data.\nI0000 00:00:1788684891.120379       7 save_profile.cc:205] Collecting XSpace to repository: /home/n/scratch/kb-agent-tmp/ReactiveKernels-sampling/position-xprof/plugins/profile/2026_09_06_08_54_51/ubuntu.xplane.pb\nI0000 00:00:1788684891.282905       7 save_profile.cc:178] Creating directory: /home/n/scratch/kb-agent-tmp/ReactiveKernels-sampling/position-xprof/plugins/profile/2026_09_06_08_54_51\n\nI0000 00:00:1788684891.375215       7 save_profile.cc:184] Dumped gzipped tool data for trace.json.gz to /home/n/scratch/kb-agent-tmp/ReactiveKernels-sampling/position-xprof/plugins/profile/2026_09_06_08_54_51/ubuntu.trace.json.gz\nI0000 00:00:1788684891.410676       7 profiler_session.cc:217] Profiler session tear down.\nprofiled_steps=1600 output_dir=/home/n/scratch/kb-agent-tmp/ReactiveKernels-sampling/position-xprof\n"
+"driver_source" = "include(\"/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-sampling/benchmark/sampler_transpiler/multinomial_eight_schools.jl\")\ninclude(\"/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-sampling/benchmark/sampler_transpiler/position_multinomial_hmc_kernel.jl\")\nfunction profile_worker(program,projection,output_dir)\n    call=TracedSlotCall(program.f,program.metadata)\n    driver=(state,seed,counts)->traced_owned_batch(call,projection,state,seed,counts,100)\n    inputs=traced_slot_inputs(program.state)\n    compiled=measured(\"compile_xprof_instrumented\") do\n        Reactant.compile(driver,inputs;sync=true,donated_args=:none,\n            xla_debug_options=(xla_cpu_enable_xprof_traceme=true,))\n    end\n    compiled(inputs...)\n    result=Reactant.Profiler.with_profiler(output_dir;trace_host=3,trace_device=false) do\n        compiled(inputs...)\n    end\n    Int(result.counts[1])==1600 || error(\"incorrect profiled work\")\n    check_traced_inputs_unchanged(inputs,program.state)\n    println(\"profiled_steps=\",Int(result.counts[1]),\" output_dir=\",output_dir)\nend\nprototype=build_multinomial_prototype(;L=16,\n    source=PositionMultinomialHMCAuthoring.multinomial_hmc_state,\n    source_controls=(step_f=F.leapfrog!,stepsize=0.03),\n    compiler_options=(peel_loops=true,))\nreset_native_slots!(prototype.prepared)\nprogram=compile_traced_slots(prototype.prepared.program)\nprefix=Symbol(prototype.prepared.program.contexts[2].prefix,:_owned)\nprojection=SlotStatic(Tuple(i for (i,pair) in enumerate(program.ordered)\n    if first(first(pair))===prefix))\nBase.invokelatest(profile_worker,program,projection,\n    \"/home/n/scratch/kb-agent-tmp/ReactiveKernels-sampling/position-xprof\")\n"
+"debug_option" = "xla_cpu_enable_xprof_traceme=true for this diagnostic compilation only"
+"transitions" = 100
+"steps" = 1600
+"complete_events" = 86038
+"compressed_trace_sha256" = "1d5e4c1ac3789597efefae96160923f63794725bf341ad7fae7cc6adaa999137"
+"compressed_trace_bytes" = 969939
+"kb_artifact_path" = "/home/niko/.local/state/kb-agents/uploads/b3be2b3c18b694a3.gz"
+"instrumented_outer_loop_us" = 33266.888
+"interpretation" = "Instrumented outer loop33.267ms, versus ordinary~1.4ms for100transitions in the scaling receipt. Roughly23x instrumentation perturbation; durations include nested events and must not be summed as independent runtime costs."
+
+["xla_worker_trace"."events"]
+
+["xla_worker_trace"."events"."AllocateOutputBuffersWithInputReuse"]
+"count" = 1
+"inclusive_us" = 17.324
+
+["xla_worker_trace"."events"."CommonPjRtClient::CreateOutputs"]
+"count" = 1
+"inclusive_us" = 4.516
+
+["xla_worker_trace"."events"."CommonPjRtLoadedExecutable::ExecuteHelperOnSingleDevice"]
+"count" = 1
+"inclusive_us" = 136.349
+
+["xla_worker_trace"."events"."CommonPjRtLoadedExecutable::ExecutePrepare"]
+"count" = 1
+"inclusive_us" = 81.893
+
+["xla_worker_trace"."events"."CommonPjRtLoadedExecutable::ExecuteSharded (reactant__91)"]
+"count" = 1
+"inclusive_us" = 138.341
+
+["xla_worker_trace"."events"."Handle input event recording"]
+"count" = 1
+"inclusive_us" = 3.515
+
+["xla_worker_trace"."events"."Handle inputs"]
+"count" = 1
+"inclusive_us" = 29.08
+
+["xla_worker_trace"."events"."ThreadpoolListener::Record"]
+"count" = 2
+"inclusive_us" = 2e-06
+
+["xla_worker_trace"."events"."ThreadpoolListener::StartRegion"]
+"count" = 2
+"inclusive_us" = 2e-06
+
+["xla_worker_trace"."events"."ThreadpoolListener::StopRegion"]
+"count" = 2
+"inclusive_us" = 2e-06
+
+["xla_worker_trace"."events"."ThunkExecutor::Execute"]
+"count" = 1602
+"inclusive_us" = 93739.328
+
+["xla_worker_trace"."events"."ThunkExecutor::Execute (wait for completion)"]
+"count" = 1
+"inclusive_us" = 33348.14
+
+["xla_worker_trace"."events"."add_concatenate_fusion.1"]
+"count" = 100
+"inclusive_us" = 54.63199999999998
+
+["xla_worker_trace"."events"."add_concatenate_fusion.2"]
+"count" = 100
+"inclusive_us" = 89.38799999999998
+
+["xla_worker_trace"."events"."add_concatenate_fusion.3"]
+"count" = 1500
+"inclusive_us" = 728.7689999999955
+
+["xla_worker_trace"."events"."add_concatenate_fusion.4"]
+"count" = 1500
+"inclusive_us" = 1063.876999999982
+
+["xla_worker_trace"."events"."add_concatenate_fusion.5"]
+"count" = 100
+"inclusive_us" = 65.63600000000001
+
+["xla_worker_trace"."events"."add_divide_fusion"]
+"count" = 1500
+"inclusive_us" = 992.8689999999882
+
+["xla_worker_trace"."events"."add_divide_fusion.1"]
+"count" = 100
+"inclusive_us" = 73.86600000000001
+
+["xla_worker_trace"."events"."add_exponential_fusion"]
+"count" = 1500
+"inclusive_us" = 1089.8159999999834
+
+["xla_worker_trace"."events"."add_exponential_fusion.1"]
+"count" = 100
+"inclusive_us" = 84.88200000000005
+
+["xla_worker_trace"."events"."bitcast_concatenate_fusion"]
+"count" = 100
+"inclusive_us" = 36.344000000000015
+
+["xla_worker_trace"."events"."bitcast_concatenate_fusion.1"]
+"count" = 100
+"inclusive_us" = 76.52799999999998
+
+["xla_worker_trace"."events"."bitcast_exponential_fusion"]
+"count" = 1500
+"inclusive_us" = 976.9639999999911
+
+["xla_worker_trace"."events"."bitcast_exponential_fusion.1"]
+"count" = 100
+"inclusive_us" = 67.62699999999998
+
+["xla_worker_trace"."events"."broadcast_compare_fusion"]
+"count" = 100
+"inclusive_us" = 91.30799999999999
+
+["xla_worker_trace"."events"."broadcast_divide_fusion"]
+"count" = 1500
+"inclusive_us" = 1013.156999999984
+
+["xla_worker_trace"."events"."broadcast_divide_fusion.1"]
+"count" = 100
+"inclusive_us" = 63.382000000000026
+
+["xla_worker_trace"."events"."broadcast_multiply_fusion"]
+"count" = 100
+"inclusive_us" = 62.42800000000002
+
+["xla_worker_trace"."events"."broadcast_select_fusion"]
+"count" = 1500
+"inclusive_us" = 1014.986999999985
+
+["xla_worker_trace"."events"."broadcast_select_fusion.1"]
+"count" = 1500
+"inclusive_us" = 1002.9139999999958
+
+["xla_worker_trace"."events"."broadcast_select_fusion.2"]
+"count" = 100
+"inclusive_us" = 54.080999999999996
+
+["xla_worker_trace"."events"."broadcast_select_fusion.3"]
+"count" = 100
+"inclusive_us" = 59.07900000000001
+
+["xla_worker_trace"."events"."call.22"]
+"count" = 1500
+"inclusive_us" = 1956.599000000026
+
+["xla_worker_trace"."events"."call.23"]
+"count" = 100
+"inclusive_us" = 80.25599999999999
+
+["xla_worker_trace"."events"."call.3"]
+"count" = 100
+"inclusive_us" = 186.25099999999995
+
+["xla_worker_trace"."events"."call.4"]
+"count" = 100
+"inclusive_us" = 232.44200000000006
+
+["xla_worker_trace"."events"."compare_select_fusion"]
+"count" = 1500
+"inclusive_us" = 1039.088999999982
+
+["xla_worker_trace"."events"."compare_select_fusion.1"]
+"count" = 1500
+"inclusive_us" = 1030.686999999984
+
+["xla_worker_trace"."events"."compare_select_fusion.2"]
+"count" = 100
+"inclusive_us" = 71.91900000000001
+
+["xla_worker_trace"."events"."compare_select_fusion.3"]
+"count" = 100
+"inclusive_us" = 65.925
+
+["xla_worker_trace"."events"."concatenate_negate_fusion"]
+"count" = 1500
+"inclusive_us" = 1077.3619999999914
+
+["xla_worker_trace"."events"."concatenate_negate_fusion.1"]
+"count" = 100
+"inclusive_us" = 68.656
+
+["xla_worker_trace"."events"."convert_bitcast_fusion"]
+"count" = 100
+"inclusive_us" = 26.07999999999999
+
+["xla_worker_trace"."events"."convert_bitcast_fusion.1"]
+"count" = 100
+"inclusive_us" = 25.105999999999995
+
+["xla_worker_trace"."events"."copy.23"]
+"count" = 1500
+"inclusive_us" = 486.1659999999989
+
+["xla_worker_trace"."events"."copy.31"]
+"count" = 1500
+"inclusive_us" = 852.695
+
+["xla_worker_trace"."events"."copy.55"]
+"count" = 100
+"inclusive_us" = 25.92499999999999
+
+["xla_worker_trace"."events"."copy.56"]
+"count" = 100
+"inclusive_us" = 58.62100000000002
+
+["xla_worker_trace"."events"."copy.58"]
+"count" = 100
+"inclusive_us" = 23.611999999999995
+
+["xla_worker_trace"."events"."copy.59"]
+"count" = 100
+"inclusive_us" = 22.73
+
+["xla_worker_trace"."events"."copy.60"]
+"count" = 100
+"inclusive_us" = 30.442999999999994
+
+["xla_worker_trace"."events"."copy.61"]
+"count" = 1
+"inclusive_us" = 4.336
+
+["xla_worker_trace"."events"."copy.62"]
+"count" = 1
+"inclusive_us" = 0.731
+
+["xla_worker_trace"."events"."copy.63"]
+"count" = 1
+"inclusive_us" = 2.463
+
+["xla_worker_trace"."events"."copy.64"]
+"count" = 1
+"inclusive_us" = 0.361
+
+["xla_worker_trace"."events"."copy.65"]
+"count" = 1
+"inclusive_us" = 0.571
+
+["xla_worker_trace"."events"."copy.66"]
+"count" = 1
+"inclusive_us" = 3.065
+
+["xla_worker_trace"."events"."copy.67"]
+"count" = 1
+"inclusive_us" = 0.861
+
+["xla_worker_trace"."events"."copy.68"]
+"count" = 1
+"inclusive_us" = 0.591
+
+["xla_worker_trace"."events"."copy.69"]
+"count" = 1
+"inclusive_us" = 0.671
+
+["xla_worker_trace"."events"."end: add_concatenate_fusion.1"]
+"count" = 100
+"inclusive_us" = 9.726999999999999
+
+["xla_worker_trace"."events"."end: add_concatenate_fusion.2"]
+"count" = 100
+"inclusive_us" = 11.299000000000005
+
+["xla_worker_trace"."events"."end: add_concatenate_fusion.3"]
+"count" = 1500
+"inclusive_us" = 159.21300000000244
+
+["xla_worker_trace"."events"."end: add_concatenate_fusion.4"]
+"count" = 1500
+"inclusive_us" = 300.59300000000263
+
+["xla_worker_trace"."events"."end: add_concatenate_fusion.5"]
+"count" = 100
+"inclusive_us" = 22.932999999999957
+
+["xla_worker_trace"."events"."end: add_divide_fusion"]
+"count" = 1500
+"inclusive_us" = 288.1270000000019
+
+["xla_worker_trace"."events"."end: add_divide_fusion.1"]
+"count" = 100
+"inclusive_us" = 23.652999999999956
+
+["xla_worker_trace"."events"."end: add_exponential_fusion"]
+"count" = 1500
+"inclusive_us" = 266.6580000000039
+
+["xla_worker_trace"."events"."end: add_exponential_fusion.1"]
+"count" = 100
+"inclusive_us" = 27.94099999999999
+
+["xla_worker_trace"."events"."end: bitcast_concatenate_fusion"]
+"count" = 100
+"inclusive_us" = 8.594000000000003
+
+["xla_worker_trace"."events"."end: bitcast_concatenate_fusion.1"]
+"count" = 100
+"inclusive_us" = 24.352999999999945
+
+["xla_worker_trace"."events"."end: bitcast_exponential_fusion"]
+"count" = 1500
+"inclusive_us" = 279.73400000000345
+
+["xla_worker_trace"."events"."end: bitcast_exponential_fusion.1"]
+"count" = 100
+"inclusive_us" = 17.128999999999984
+
+["xla_worker_trace"."events"."end: broadcast_compare_fusion"]
+"count" = 100
+"inclusive_us" = 14.265999999999996
+
+["xla_worker_trace"."events"."end: broadcast_divide_fusion"]
+"count" = 1500
+"inclusive_us" = 265.66900000000504
+
+["xla_worker_trace"."events"."end: broadcast_divide_fusion.1"]
+"count" = 100
+"inclusive_us" = 11.334000000000003
+
+["xla_worker_trace"."events"."end: broadcast_multiply_fusion"]
+"count" = 100
+"inclusive_us" = 11.914
+
+["xla_worker_trace"."events"."end: broadcast_select_fusion"]
+"count" = 1500
+"inclusive_us" = 294.7400000000022
+
+["xla_worker_trace"."events"."end: broadcast_select_fusion.1"]
+"count" = 1500
+"inclusive_us" = 292.9440000000014
+
+["xla_worker_trace"."events"."end: broadcast_select_fusion.2"]
+"count" = 100
+"inclusive_us" = 17.18199999999999
+
+["xla_worker_trace"."events"."end: broadcast_select_fusion.3"]
+"count" = 100
+"inclusive_us" = 25.107999999999958
+
+["xla_worker_trace"."events"."end: call.22"]
+"count" = 1500
+"inclusive_us" = 140.61199999999977
+
+["xla_worker_trace"."events"."end: call.23"]
+"count" = 100
+"inclusive_us" = 22.861999999999952
+
+["xla_worker_trace"."events"."end: call.3"]
+"count" = 100
+"inclusive_us" = 13.010999999999994
+
+["xla_worker_trace"."events"."end: call.4"]
+"count" = 100
+"inclusive_us" = 17.633999999999975
+
+["xla_worker_trace"."events"."end: compare_select_fusion"]
+"count" = 1500
+"inclusive_us" = 263.96100000000456
+
+["xla_worker_trace"."events"."end: compare_select_fusion.1"]
+"count" = 1500
+"inclusive_us" = 302.8330000000017
+
+["xla_worker_trace"."events"."end: compare_select_fusion.2"]
+"count" = 100
+"inclusive_us" = 14.256000000000002
+
+["xla_worker_trace"."events"."end: compare_select_fusion.3"]
+"count" = 100
+"inclusive_us" = 17.059999999999988
+
+["xla_worker_trace"."events"."end: concatenate_negate_fusion"]
+"count" = 1500
+"inclusive_us" = 281.9590000000021
+
+["xla_worker_trace"."events"."end: concatenate_negate_fusion.1"]
+"count" = 100
+"inclusive_us" = 14.155
+
+["xla_worker_trace"."events"."end: convert_bitcast_fusion"]
+"count" = 100
+"inclusive_us" = 8.425000000000002
+
+["xla_worker_trace"."events"."end: convert_bitcast_fusion.1"]
+"count" = 100
+"inclusive_us" = 8.362000000000004
+
+["xla_worker_trace"."events"."end: copy.23"]
+"count" = 1500
+"inclusive_us" = 142.71500000000125
+
+["xla_worker_trace"."events"."end: copy.31"]
+"count" = 1500
+"inclusive_us" = 301.222000000001
+
+["xla_worker_trace"."events"."end: copy.55"]
+"count" = 100
+"inclusive_us" = 8.392000000000005
+
+["xla_worker_trace"."events"."end: copy.56"]
+"count" = 100
+"inclusive_us" = 19.650999999999982
+
+["xla_worker_trace"."events"."end: copy.58"]
+"count" = 100
+"inclusive_us" = 8.297000000000002
+
+["xla_worker_trace"."events"."end: copy.59"]
+"count" = 100
+"inclusive_us" = 8.229000000000005
+
+["xla_worker_trace"."events"."end: copy.60"]
+"count" = 100
+"inclusive_us" = 8.758999999999999
+
+["xla_worker_trace"."events"."end: copy.61"]
+"count" = 1
+"inclusive_us" = 0.641
+
+["xla_worker_trace"."events"."end: copy.62"]
+"count" = 1
+"inclusive_us" = 0.12
+
+["xla_worker_trace"."events"."end: copy.63"]
+"count" = 1
+"inclusive_us" = 0.1
+
+["xla_worker_trace"."events"."end: copy.64"]
+"count" = 1
+"inclusive_us" = 0.06
+
+["xla_worker_trace"."events"."end: copy.65"]
+"count" = 1
+"inclusive_us" = 0.07
+
+["xla_worker_trace"."events"."end: copy.66"]
+"count" = 1
+"inclusive_us" = 0.64
+
+["xla_worker_trace"."events"."end: copy.67"]
+"count" = 1
+"inclusive_us" = 0.13
+
+["xla_worker_trace"."events"."end: copy.68"]
+"count" = 1
+"inclusive_us" = 0.091
+
+["xla_worker_trace"."events"."end: copy.69"]
+"count" = 1
+"inclusive_us" = 0.08
+
+["xla_worker_trace"."events"."end: multiply_add_fusion"]
+"count" = 1500
+"inclusive_us" = 287.7480000000017
+
+["xla_worker_trace"."events"."end: multiply_add_fusion.1"]
+"count" = 100
+"inclusive_us" = 11.328000000000001
+
+["xla_worker_trace"."events"."end: multiply_add_fusion.2"]
+"count" = 100
+"inclusive_us" = 17.10299999999999
+
+["xla_worker_trace"."events"."end: multiply_broadcast_fusion"]
+"count" = 100
+"inclusive_us" = 26.93199999999992
+
+["xla_worker_trace"."events"."end: multiply_log-plus-one_fusion"]
+"count" = 1500
+"inclusive_us" = 278.275000000003
+
+["xla_worker_trace"."events"."end: multiply_log-plus-one_fusion.1"]
+"count" = 100
+"inclusive_us" = 12.713
+
+["xla_worker_trace"."events"."end: multiply_log-plus-one_fusion.2"]
+"count" = 100
+"inclusive_us" = 17.249999999999982
+
+["xla_worker_trace"."events"."end: multiply_reduce_fusion"]
+"count" = 1500
+"inclusive_us" = 290.18500000000216
+
+["xla_worker_trace"."events"."end: multiply_reduce_fusion.1"]
+"count" = 100
+"inclusive_us" = 15.670000000000002
+
+["xla_worker_trace"."events"."end: multiply_reduce_fusion.2"]
+"count" = 100
+"inclusive_us" = 16.095
+
+["xla_worker_trace"."events"."end: multiply_subtract_fusion"]
+"count" = 1500
+"inclusive_us" = 272.83300000000344
+
+["xla_worker_trace"."events"."end: multiply_subtract_fusion.1"]
+"count" = 1500
+"inclusive_us" = 368.13999999999527
+
+["xla_worker_trace"."events"."end: multiply_subtract_fusion.2"]
+"count" = 100
+"inclusive_us" = 9.864
+
+["xla_worker_trace"."events"."end: multiply_subtract_fusion.3"]
+"count" = 100
+"inclusive_us" = 23.219999999999967
+
+["xla_worker_trace"."events"."end: negate_divide_fusion"]
+"count" = 1500
+"inclusive_us" = 266.15400000000386
+
+["xla_worker_trace"."events"."end: negate_divide_fusion.1"]
+"count" = 100
+"inclusive_us" = 17.168999999999983
+
+["xla_worker_trace"."events"."end: negate_log-plus-one_fusion"]
+"count" = 1500
+"inclusive_us" = 285.6700000000028
+
+["xla_worker_trace"."events"."end: negate_log-plus-one_fusion.1"]
+"count" = 100
+"inclusive_us" = 8.279000000000003
+
+["xla_worker_trace"."events"."end: negate_sqrt_fusion"]
+"count" = 100
+"inclusive_us" = 19.94999999999999
+
+["xla_worker_trace"."events"."end: select_add_fusion"]
+"count" = 1500
+"inclusive_us" = 259.18700000000507
+
+["xla_worker_trace"."events"."end: select_add_fusion.1"]
+"count" = 100
+"inclusive_us" = 24.44599999999997
+
+["xla_worker_trace"."events"."end: select_broadcast_fusion"]
+"count" = 100
+"inclusive_us" = 27.38699999999994
+
+["xla_worker_trace"."events"."end: slice_bitcast_fusion.1"]
+"count" = 100
+"inclusive_us" = 9.727999999999994
+
+["xla_worker_trace"."events"."end: slice_bitcast_fusion.2"]
+"count" = 100
+"inclusive_us" = 18.596999999999973
+
+["xla_worker_trace"."events"."end: slice_bitcast_fusion.3"]
+"count" = 1500
+"inclusive_us" = 139.48499999999999
+
+["xla_worker_trace"."events"."end: while.10"]
+"count" = 100
+"inclusive_us" = 10.213999999999992
+
+["xla_worker_trace"."events"."end: while.5"]
+"count" = 1
+"inclusive_us" = 0.17
+
+["xla_worker_trace"."events"."end: wrapped_add"]
+"count" = 100
+"inclusive_us" = 8.249000000000002
+
+["xla_worker_trace"."events"."end: wrapped_add.1"]
+"count" = 1500
+"inclusive_us" = 263.68000000000455
+
+["xla_worker_trace"."events"."end: wrapped_add.2"]
+"count" = 1
+"inclusive_us" = 0.12
+
+["xla_worker_trace"."events"."end: wrapped_multiply"]
+"count" = 100
+"inclusive_us" = 17.129
+
+["xla_worker_trace"."events"."end: wrapped_reduce"]
+"count" = 100
+"inclusive_us" = 16.50699999999999
+
+["xla_worker_trace"."events"."end: wrapped_reduce.1"]
+"count" = 1500
+"inclusive_us" = 267.9650000000039
+
+["xla_worker_trace"."events"."end: wrapped_remainder"]
+"count" = 100
+"inclusive_us" = 14.280000000000001
+
+["xla_worker_trace"."events"."multiply_add_fusion"]
+"count" = 1500
+"inclusive_us" = 965.4339999999896
+
+["xla_worker_trace"."events"."multiply_add_fusion.1"]
+"count" = 100
+"inclusive_us" = 60.22000000000001
+
+["xla_worker_trace"."events"."multiply_add_fusion.2"]
+"count" = 100
+"inclusive_us" = 50.087
+
+["xla_worker_trace"."events"."multiply_broadcast_fusion"]
+"count" = 100
+"inclusive_us" = 77.327
+
+["xla_worker_trace"."events"."multiply_log-plus-one_fusion"]
+"count" = 1500
+"inclusive_us" = 1016.8389999999885
+
+["xla_worker_trace"."events"."multiply_log-plus-one_fusion.1"]
+"count" = 100
+"inclusive_us" = 49.86699999999998
+
+["xla_worker_trace"."events"."multiply_log-plus-one_fusion.2"]
+"count" = 100
+"inclusive_us" = 79.577
+
+["xla_worker_trace"."events"."multiply_reduce_fusion"]
+"count" = 1500
+"inclusive_us" = 985.6909999999942
+
+["xla_worker_trace"."events"."multiply_reduce_fusion.1"]
+"count" = 100
+"inclusive_us" = 81.01899999999999
+
+["xla_worker_trace"."events"."multiply_reduce_fusion.2"]
+"count" = 100
+"inclusive_us" = 75.63799999999998
+
+["xla_worker_trace"."events"."multiply_subtract_fusion"]
+"count" = 1500
+"inclusive_us" = 978.6419999999889
+
+["xla_worker_trace"."events"."multiply_subtract_fusion.1"]
+"count" = 1500
+"inclusive_us" = 1226.5579999999788
+
+["xla_worker_trace"."events"."multiply_subtract_fusion.2"]
+"count" = 100
+"inclusive_us" = 64.03900000000002
+
+["xla_worker_trace"."events"."multiply_subtract_fusion.3"]
+"count" = 100
+"inclusive_us" = 142.69299999999998
+
+["xla_worker_trace"."events"."negate_divide_fusion"]
+"count" = 1500
+"inclusive_us" = 997.9619999999856
+
+["xla_worker_trace"."events"."negate_divide_fusion.1"]
+"count" = 100
+"inclusive_us" = 65.288
+
+["xla_worker_trace"."events"."negate_log-plus-one_fusion"]
+"count" = 1500
+"inclusive_us" = 1074.2319999999877
+
+["xla_worker_trace"."events"."negate_log-plus-one_fusion.1"]
+"count" = 100
+"inclusive_us" = 61.85300000000001
+
+["xla_worker_trace"."events"."negate_sqrt_fusion"]
+"count" = 100
+"inclusive_us" = 56.353999999999985
+
+["xla_worker_trace"."events"."select_add_fusion"]
+"count" = 1500
+"inclusive_us" = 1003.4409999999913
+
+["xla_worker_trace"."events"."select_add_fusion.1"]
+"count" = 100
+"inclusive_us" = 60.91500000000005
+
+["xla_worker_trace"."events"."select_broadcast_fusion"]
+"count" = 100
+"inclusive_us" = 58.80400000000002
+
+["xla_worker_trace"."events"."slice_bitcast_fusion.1"]
+"count" = 100
+"inclusive_us" = 63.36999999999996
+
+["xla_worker_trace"."events"."slice_bitcast_fusion.2"]
+"count" = 100
+"inclusive_us" = 62.527
+
+["xla_worker_trace"."events"."slice_bitcast_fusion.3"]
+"count" = 1500
+"inclusive_us" = 486.7029999999978
+
+["xla_worker_trace"."events"."while.10"]
+"count" = 100
+"inclusive_us" = 29721.803
+
+["xla_worker_trace"."events"."while.5"]
+"count" = 1
+"inclusive_us" = 33266.888
+
+["xla_worker_trace"."events"."wrapped_add"]
+"count" = 100
+"inclusive_us" = 25.840999999999987
+
+["xla_worker_trace"."events"."wrapped_add.1"]
+"count" = 1500
+"inclusive_us" = 935.0899999999858
+
+["xla_worker_trace"."events"."wrapped_add.2"]
+"count" = 1
+"inclusive_us" = 1.683
+
+["xla_worker_trace"."events"."wrapped_multiply"]
+"count" = 100
+"inclusive_us" = 54.559999999999995
+
+["xla_worker_trace"."events"."wrapped_reduce"]
+"count" = 100
+"inclusive_us" = 51.75399999999999
+
+["xla_worker_trace"."events"."wrapped_reduce.1"]
+"count" = 1500
+"inclusive_us" = 961.235999999997
+
+["xla_worker_trace"."events"."wrapped_remainder"]
+"count" = 100
+"inclusive_us" = 48.585

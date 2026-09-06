@@ -1,0 +1,186 @@
+"schema_version" = 1
+"status" = "experimental_captured_multinomial_hmc"
+"parent_commit" = "42d43e6556056734d5d5ffbd9d34a4bdbc835a7c"
+"host" = "strato2"
+"julia" = "1.10.11"
+"reactant" = "0.2.284"
+"enzyme" = "0.13.199"
+"ahmc" = "0.8.6"
+"model" = "centered_eight_schools"
+"dimensions" = 10
+"metric" = "unit_diagonal"
+"stepsize" = 0.03
+"transitions_per_batch" = 1000
+"note" = "Captured mathematical source, same generic compiler and prepared density/gradient. Whole chained batches; setup, reset and compilation separate. Streaming multinomial selection omits acceptance summaries and trajectory storage that AdvancedHMC computes. Matched integration work, not feature parity or effective-sample-size comparison. No cross-backend numerical or trajectory agreement requirement. Sixteen-step Reactant does not yet beat the fastest AdvancedHMC samples."
+
+["native_l4"]
+"exit_code" = 0
+"process_elapsed_seconds" = 65
+"leapfrog_steps" = 4
+"generated_seconds" = [0.001810756, 0.001845735, 0.001782418, 0.001834199, 0.00192198, 0.001807902, 0.001852033]
+"generated_allocated_bytes" = [1024, 1024, 1024, 1024, 1024, 1024, 1024]
+"ahmc_seconds" = [0.016906049, 0.0072027, 0.042540834, 0.010213442, 0.010014197, 0.010033444, 0.010406338]
+"ahmc_allocated_bytes" = [11348496, 11341248, 11341248, 11341248, 11341248, 11341248, 11341248]
+"integration_steps" = [4000, 4000, 4000, 4000, 4000, 4000, 4000]
+"command" = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/multinomial_eight_schools.jl native 1000 4"
+"executed_sources_match_current_hashes" = true
+
+["native_l4"."stages"]
+"prepare_model_seconds" = 4.099764318
+"prepare_model_bytes" = 232995440
+"prepare_native_endpoint_seconds" = 7.354927921
+"prepare_native_endpoint_bytes" = 860059528
+"prepare_multinomial_factory_seconds" = 4.461348346
+"prepare_multinomial_factory_bytes" = 350983760
+"lower_multinomial_native_seconds" = 3.103430108
+"lower_multinomial_native_bytes" = 275125408
+"native_slots_first_chain_seconds" = 1.342343585
+"native_slots_first_chain_bytes" = 58160336
+"ahmc_first_chain_seconds" = 0.151743328
+"ahmc_first_chain_bytes" = 21325184
+
+["reactant_l16"]
+"exit_code" = 0
+"process_elapsed_seconds" = 118
+"leapfrog_steps" = 16
+"generated_seconds" = [0.014471062, 0.014960447, 0.015176284, 0.015638753, 0.016302768, 0.015989264, 0.015025907]
+"generated_allocated_bytes" = [2352, 2352, 2352, 2352, 2352, 2352, 2352]
+"ahmc_seconds" = [0.033939875, 0.017317878, 0.024450672, 0.014587623, 0.012960999, 0.0147376, 0.012150523]
+"ahmc_allocated_bytes" = [33278048, 33274416, 33274416, 33274416, 33274416, 33274416, 33274416]
+"integration_steps" = [16000, 16000, 16000, 16000, 16000, 16000, 16000]
+"mlir_bytes" = 78826
+"while_regions" = 3
+"if_regions" = 2
+"caller_inputs_preserved" = true
+"command" = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/multinomial_eight_schools.jl reactant 1000 16"
+"executed_sources_match_current_hashes" = true
+
+["reactant_l16"."stages"]
+"prepare_model_seconds" = 4.163967179
+"prepare_model_bytes" = 232995392
+"prepare_native_endpoint_seconds" = 7.020513543
+"prepare_native_endpoint_bytes" = 859869816
+"prepare_multinomial_factory_seconds" = 4.522035401
+"prepare_multinomial_factory_bytes" = 351246784
+"lower_multinomial_native_seconds" = 3.287702526
+"lower_multinomial_native_bytes" = 277084904
+"lower_traced_slots_seconds" = 2.462449056
+"lower_traced_slots_bytes" = 315120456
+"compile_traced_slots_seconds" = 44.492557604
+"compile_traced_slots_bytes" = 4301946773
+"traced_slots_first_chain_seconds" = 0.283262161
+"traced_slots_first_chain_bytes" = 41341392
+
+["earlier_reactant_l4"]
+"exit_code" = 0
+"process_elapsed_seconds" = 117
+"leapfrog_steps" = 4
+"generated_seconds" = [0.004379848, 0.004317052, 0.004169117, 0.004432821, 0.005298916, 0.005226055, 0.004392445]
+"generated_allocated_bytes" = [2352, 2352, 2352, 2352, 2352, 2352, 2352]
+"ahmc_seconds" = [0.007305912, 0.006639933, 0.039805407, 0.006839499, 0.007273988, 0.007062716, 0.006926789]
+"ahmc_allocated_bytes" = [11341024, 11341024, 11344656, 11341024, 11341024, 11341024, 11341024]
+"integration_steps" = [4000, 4000, 4000, 4000, 4000, 4000, 4000]
+"mlir_bytes" = 141364
+"while_regions" = 2
+"if_regions" = 4
+"caller_inputs_preserved" = true
+"command" = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/multinomial_eight_schools.jl reactant 1000 4"
+"executed_sources_match_current_hashes" = false
+"source_note" = "Earlier same-source sampler measurement before the driver gained emission output and before fixed-range recognition expanded from hoisted constants to bound shared ranges. The final hash map does not attest this earlier executed compiler/driver. Full recorded timing output retained below."
+"recorded_output" = "BEGIN prepare_model\nprepare_model seconds=3.846546882 bytes=233009776\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=7.778637929 bytes=859872688\nBEGIN prepare_multinomial_factory\nprepare_multinomial_factory seconds=4.694950624 bytes=350703184\nBEGIN lower_multinomial_native\nlower_multinomial_native seconds=3.410042826 bytes=277110344\nchildren=(:init, :fwd, :bwd)\nBEGIN lower_traced_slots\nlower_traced_slots seconds=2.422702272 bytes=313145600\nproven_currentness_facts=15 runtime_currentness_flags=6 metadata_entries=9\nBEGIN compile_traced_slots\ncompile_traced_slots seconds=44.266573765 bytes=4304159365\nmlir_bytes=141364 while_regions=2 if_regions=4\nBEGIN traced_slots_first_chain\ntraced_slots_first_chain seconds=0.271094017 bytes=41357568\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.004379848 bytes=2352\nintegration_steps=4000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.007305912 bytes=11341024\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.004317052 bytes=2352\nintegration_steps=4000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.006639933 bytes=11341024\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.004169117 bytes=2352\nintegration_steps=4000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.039805407 bytes=11344656\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.004432821 bytes=2352\nintegration_steps=4000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.006839499 bytes=11341024\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.005298916 bytes=2352\nintegration_steps=4000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.007273988 bytes=11341024\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.005226055 bytes=2352\nintegration_steps=4000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.007062716 bytes=11341024\nBEGIN traced_slots_1000_transitions\ntraced_slots_1000_transitions seconds=0.004392445 bytes=2352\nintegration_steps=4000\nBEGIN ahmc_1000_transitions\nahmc_1000_transitions seconds=0.006926789 bytes=11341024\n"
+
+["earlier_reactant_l4"."stages"]
+"prepare_model_seconds" = 3.846546882
+"prepare_model_bytes" = 233009776
+"prepare_native_endpoint_seconds" = 7.778637929
+"prepare_native_endpoint_bytes" = 859872688
+"prepare_multinomial_factory_seconds" = 4.694950624
+"prepare_multinomial_factory_bytes" = 350703184
+"lower_multinomial_native_seconds" = 3.410042826
+"lower_multinomial_native_bytes" = 277110344
+"lower_traced_slots_seconds" = 2.422702272
+"lower_traced_slots_bytes" = 313145600
+"compile_traced_slots_seconds" = 44.266573765
+"compile_traced_slots_bytes" = 4304159365
+"traced_slots_first_chain_seconds" = 0.271094017
+"traced_slots_first_chain_bytes" = 41357568
+
+["checks"]
+
+["checks"."constant_binding"]
+"exit_code" = 0
+"process_elapsed_seconds" = 9
+"recorded_output" = "fixed_scalar_source=true mutable_or_nonconstant_globals_rejected=true\n"
+
+["checks"."range_draw"]
+"exit_code" = 0
+"process_elapsed_seconds" = 49
+"recorded_output" = "range=0:4 span=5 threshold=1 distinct_values=5 caller_inputs_preserved=true\nrange=-3:3 span=7 threshold=2 distinct_values=7 caller_inputs_preserved=true\nrange=-9223372036854775808:9223372036854775807 span=0 threshold=0 distinct_values=128 caller_inputs_preserved=true\nrange=0x0000000000000000:0xffffffffffffffff span=0 threshold=0 distinct_values=128 caller_inputs_preserved=true\nrange=-128:127 span=256 threshold=0 distinct_values=97 caller_inputs_preserved=true\nrange=-1:9223372036854775807 span=9223372036854775809 threshold=9223372036854775807 distinct_values=128 caller_inputs_preserved=true\nsigned_integer_boundary=true\ncaptured_bound_range=true\n"
+
+["checks"."gradient_count"]
+"exit_code" = 0
+"process_elapsed_seconds" = 60
+"recorded_output" = "BEGIN prepare_model\nprepare_model seconds=3.909748741 bytes=232992752\nBEGIN prepare_native_endpoint\nprepare_native_endpoint seconds=7.728271085 bytes=859857488\nBEGIN prepare_multinomial_factory\nprepare_multinomial_factory seconds=4.422083175 bytes=350976784\nBEGIN lower_multinomial_native\nlower_multinomial_native seconds=3.221332692 bytes=283801360\nchildren=(:init, :fwd, :bwd)\ndiagnostic_integration_steps=4000 diagnostic_gradient_calls=4000\n"
+
+["historical_failures"]
+
+["historical_failures"."native_constant_capture"]
+"exit_code" = 1
+"process_elapsed_seconds" = 61
+"error" = "Unsupported _ExtRef for Inf; fixed by builtin constant-binding admission."
+
+["historical_failures"."reactant_integer_range"]
+"exit_code" = 1
+"process_elapsed_seconds" = 81
+"error" = "widen(::Type{Reactant.TracedRNumber{UInt64}}) in Random.SamplerRangeNDL; fixed by generic rejection/modulo lowering."
+
+["historical_failures"."probe_array_storage"]
+"exit_code" = 1
+"process_elapsed_seconds" = 16
+"error" = "Probe-only scalar indexing needed its local Reactant.@allowscalar annotation. Production sampler does not use that annotation."
+
+["emissions"]
+
+["emissions"."native_l4"]
+"kb_host_path" = "/home/niko/.local/state/kb-agents/uploads/5c5ce6dbfd9f5e4b.jl"
+"sha256" = "08f7c8912cbf614c75be643b1d554eec27222a86b1267e64df8eb2b045db49ba"
+"bytes" = 25655
+
+["emissions"."traced_l16"]
+"kb_host_path" = "/home/niko/.local/state/kb-agents/uploads/0ca4a67bfeb1de99.jl"
+"sha256" = "221bd398f086ce4b42a903123877afed06bb51dfbac0dd0f7188b6cdb5c8f643"
+"bytes" = 110402
+
+["emissions"."mlir_l16"]
+"kb_host_path" = "/home/niko/.local/state/kb-agents/uploads/e74776456550dbc3.mlir"
+"sha256" = "9755326b39991a5b9faa18ac61a31d4f0b9704570dd2f2845ae7740591ab4174"
+"bytes" = 78826
+
+["source_sha256"]
+"src/ad.jl" = "37c8258f5ffa67fbab9b4240fb972858c3e05a01f1d99b73fd3a1790afd4b568"
+"ext/ReactiveKernelsReactantExt.jl" = "6557fdb95b8115a375ca99d73496a30e2fddddff2c2eab09a92da8663819ff34"
+"src/kernel_adaptation.jl" = "d655baa036d4e5770b769ab644b8c56ca0567c167d3643011352131e9928a5c4"
+"benchmark/reactivehmc_hmc_kernel_fixture_b.jl" = "9ffa4e8e2990992cd92303e55a6d005cff2c6e1698de6bca7941ad2907f8a4da"
+"benchmark/nuts_kernel_authoring_fixture_b.jl" = "7a9a9d6e1fa122e3d846def760933b0ba14e62e567d92cffab9d9d638f9404f4"
+"benchmark/sampler_transpiler/hmc_eight_schools.jl" = "c18b800fc013d8007d1d1b23d7c7330b89304bc8ff92767562b26a788d2d5996"
+"benchmark/sampler_transpiler/native_slots.jl" = "c0f03d31c96be0c6282608c93779cd6c92c00e3741e40bdf62bc365e3f8d3e25"
+"benchmark/sampler_transpiler/native_slots_factory.jl" = "36468f4da6321631c0eba1a8fc1baa5dee305220b0e1572d6966b509365f8235"
+"benchmark/sampler_transpiler/native_comparison.jl" = "5e2612234a93c4d126a7c9550520ba468b266c790709e1602a1b1dccae183598"
+"benchmark/sampler_transpiler/traced_slots.jl" = "1145f10c16fb282f15615d8450e57b0e947af0b44c7a42ae99d16adfe9a18fd1"
+"benchmark/sampler_transpiler/traced_comparison.jl" = "ff891cd14f9ae1933a3b3813246b1d242b056b3b8c271425c3545e1bb78732c0"
+"benchmark/sampler_transpiler/loop_control_probe.jl" = "45bc979f7bdfbbc91918f4aa3300f794d7b263dd788b4707b7e621e4b1970881"
+"benchmark/sampler_transpiler/profile_compile.jl" = "ba92a50afae1fdd86667fc00f16197a0479214e714eb2237e10b2cdf7332dbc8"
+"src/ReactiveKernels.jl" = "5dadbc59cd45725b1b00350cc5156e4b8a403c766b90ca24985f5bc958d3ce01"
+"src/native_slot_compiler.jl" = "206f475697d27bbc230f5eca0631378ee22e13951ab5929d94158ae6802ebea9"
+"src/native_slots.jl" = "9a50cfa3988efd9409b9bf11f88d8ea217b16604f8c9da9bd8797cdf7bde1df2"
+"src/native_slots_factory.jl" = "58208f07e6c86a3478e1c6f217f48c7cb25789198ecedbea27d8ea60580ca532"
+"ext/ReactiveKernelsReactantExt/traced_slot_compiler.jl" = "7f5bc7f5148912b1d7355ad55181e847911984199c6fbccb53b3a49ede4a83a7"
+"ext/ReactiveKernelsReactantExt/traced_slots.jl" = "0ddd5218ae79fa171c21790505b9e6a89d0a914da402780699cdc9d2eada48d5"
+"benchmark/sampler_transpiler/scalar_argument_probe.jl" = "277492fefac36afa9dce6b96f1510137dcd3eda1eb0ef97e44874a5300b0b47b"
+"ext/ReactiveKernelsReactantExt/traced_code_cache.jl" = "1e1b87256021628044b47b5c2c3e0f8d14d0e298d58e156c82b0f8958c0d46fb"
+"benchmark/sampler_transpiler/code_reuse_probe.jl" = "2ce50d054e810c354e4561ff1ce8067bcb02010560eb319edac73e05fb0c0ec0"
+"benchmark/sampler_transpiler/multinomial_hmc_kernel.jl" = "a854b0a9cf5ec660e64d622b9442804a564ffc0657ed3089331aa9e5fcb97218"
+"benchmark/sampler_transpiler/multinomial_eight_schools.jl" = "e660525b1f44c79813af0f672485506f035f4fb72c07fdba9f51b70916b5e286"
+"benchmark/sampler_transpiler/constant_binding_probe.jl" = "a510b08850dc0e07779ff80750c26bdddac93552c2d8b7ea400148973bcf95c8"
+"benchmark/sampler_transpiler/range_draw_probe.jl" = "e9d82d844fbed32de615ee8dde49876cf488a102d6d6938c8c2742f4692cbe5f"
+"ext/ReactiveKernelsReactantExt/traced_random.jl" = "33e50ef2a1f7eda06a4a01bb66892565d609e2d28aa418f391db445f468e0e93"

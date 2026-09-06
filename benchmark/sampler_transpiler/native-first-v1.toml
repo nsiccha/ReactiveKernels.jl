@@ -1,0 +1,41 @@
+schema_version = 1
+status = "experimental_native_checkpoint"
+parent_commit = "8541f76718dc4db09eff7ed28dc3a1ea31eb9487"
+host = "strato2"
+julia = "1.10.11"
+ahmc = "0.8.6"
+command = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/hmc_eight_schools.jl compare 1000"
+exit_code = 0
+process_elapsed_seconds = 125
+model = "centered_eight_schools"
+dimensions = 10
+metric = "unit_diagonal"
+stepsize = 0.03
+leapfrog_steps = 4
+transitions_per_batch = 1000
+native_integration_steps_per_batch = 4000
+note = "Interleaved batches reset the same initial point and RNG outside timing. Both use the same prepared RK density and AD object. Stage timings do not form a complete isolated compilation comparison. Reactant has not adopted this slot-based program."
+
+[native_slots]
+batch_seconds = [0.001841339, 0.001859224, 0.001882827, 0.00181297, 0.001905197, 0.002155202, 0.001812729]
+batch_allocated_bytes = [7184, 7184, 7184, 7184, 7184, 7184, 7184]
+
+[ahmc]
+batch_seconds = [0.010196162, 0.002056105, 0.00214703, 0.013836033, 0.002126483, 0.002049357, 0.002067272]
+batch_allocated_bytes = [7211840, 7204592, 7204592, 7204592, 7204592, 7204592, 7204592]
+
+[preparation]
+prepare_endpoint_seconds = 12.42581153
+prepare_endpoint_bytes = 1361731928
+prepare_hmc_seconds = 30.696105602
+prepare_hmc_bytes = 685093232
+lower_native_slots_seconds = 7.059588431
+lower_native_slots_bytes = 228144632
+
+[source_sha256]
+"src/kernel_adaptation.jl" = "b4617bf693ea4c26603ccd5476763db5f0fa7a2de344c3e33b7054d273f2bda5"
+"benchmark/sampler_transpiler/hmc_eight_schools.jl" = "70ea2e8c456fa4e891672477ebac3a709b2706e3b8b00e7b17b14a643d8ae80e"
+"benchmark/sampler_transpiler/native_slots.jl" = "fb471c279b33b540d0ed01a30e4b2b5f72adf8f085d160ffa44cfa4914659281"
+"benchmark/sampler_transpiler/native_comparison.jl" = "3bde80bb12981218c03f3b4fa17b3ec7b26b66e69aba85605eed4300870f1510"
+"benchmark/reactivehmc_hmc_kernel_fixture_b.jl" = "9ffa4e8e2990992cd92303e55a6d005cff2c6e1698de6bca7941ad2907f8a4da"
+"benchmark/nuts_kernel_authoring_fixture_b.jl" = "7a9a9d6e1fa122e3d846def760933b0ba14e62e567d92cffab9d9d638f9404f4"

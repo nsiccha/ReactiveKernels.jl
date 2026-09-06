@@ -42,6 +42,42 @@ end
 BB(blks::Vector{Blk}, next::Int) = BB(blks, next, false)
 _newpc!(bb) = (p = bb.next; bb.next += 1; p)
 
+# A lowered loop needs its own induction binding. Acyclic callees are inlined
+# into the caller's CFG, so retaining an authored name (especially `_`) lets
+# an inner loop overwrite the caller's index. Respect nested loop scopes while
+# renaming reads and writes; their iterator still evaluates in the outer scope.
+function _control_rename_loop_binding(x, old::Symbol, new::Symbol)
+    rename(value) = _control_rename_loop_binding(value, old, new)
+    if x isa _LocalRef
+        return x.name === old ? _LocalRef(new) : x
+    elseif x isa _LocalAssign
+        names = Tuple(name === old ? new : name for name in x.lhs)
+        if x.style === :named && names != x.lhs
+            x.rhs isa _SelfRef || _l_ctrl_reject(
+                "renamed named destructuring requires the state receiver")
+            return _LocalAssign(names,
+                _TupleExpr(Tuple(_SelfField((name,)) for name in x.lhs)), :tuple)
+        end
+        return _LocalAssign(names, rename(x.rhs), x.style)
+    elseif x isa _For
+        return _For(x.var, rename(x.iter),
+            old in x.var ? x.body : rename(x.body))
+    elseif x isa _PlaceWrite
+        return _PlaceWrite(rename(x.target), x.root, x.owner,
+            x.alias === old ? new : x.alias, rename(x.rhs), x.dot)
+    elseif x isa Tuple
+        return Tuple(rename(value) for value in x)
+    elseif x isa AbstractVector
+        return Any[rename(value) for value in x]
+    elseif x isa Pair
+        return rename(first(x)) => rename(last(x))
+    elseif x isa _MExpr || x isa _MStmt
+        T = typeof(x)
+        return T((rename(getfield(x, field)) for field in fieldnames(T))...)
+    end
+    x
+end
+
 # Compile `stmts`; on fall-through, control continues at `cont_pc` (0 == return).
 # Returns the entry pc (== cont_pc when stmts is empty, allocating no block).
 # CFG builder with proper INLINING (RK 09:43): a callee _Return becomes a jump to the call-site
@@ -180,7 +216,12 @@ function build_region!(bb::BB, stmts, cont_pc::Int, ret_pc::Int, ret_val, by_mid
         lo, hi = _range_bounds(st.iter)
         header = _newpc!(bb); incr = _newpc!(bb)
         counter = Symbol("__rk_loop_count_", header)
-        body = build_region!(bb, collect(st.body), incr, ret_pc, ret_val, by_mid, rec, after, incr)  # brk=after, continue=incr
+        loop_body = st.body
+        if bb.lower_all_loops
+            var = gensym(:control_loop_index)
+            loop_body = _control_rename_loop_binding(st.body, only(st.var), var)
+        end
+        body = build_region!(bb, collect(loop_body), incr, ret_pc, ret_val, by_mid, rec, after, incr)  # brk=after, continue=incr
         condition = bb.lower_all_loops ?
             _RawCond((:bounded_for, var, hi, counter)) : _RawCond((var, hi))
         push!(bb.blks, Blk(header, Any[], TBranch(condition, body, after)))                           # if var <= hi
@@ -548,6 +589,145 @@ function defunctionalized_mids(irs)
 end
 
 # ======================= backend-neutral control program =======================
+
+# A resumed block needs its own inputs and predicated write targets, not every
+# local used anywhere in its method. Keep an intentionally conservative symbol
+# census: extra metadata names can retain a load but cannot remove a required
+# one. Reconstructing an indexed alias also needs the bindings in its source
+# indices, even when that definition lives in a different block.
+function _control_block_bindings(block, alias_sources)
+    needed = Set{Symbol}()
+    function visit(x)
+        if x isa Symbol
+            push!(needed, x)
+        elseif x isa _Lit
+            return
+        elseif x isa Tuple || x isa AbstractVector
+            foreach(visit, x)
+        elseif x isa Pair
+            visit(first(x)); visit(last(x))
+        elseif x isa Expr
+            foreach(visit, x.args)
+        elseif x isa Union{_MExpr,_MStmt,_RawStmt,_RawCond}
+            for field in fieldnames(typeof(x))
+                visit(getfield(x, field))
+            end
+        end
+        nothing
+    end
+    visit(block.effects)
+    visit(block.writes)
+    hasproperty(block, :condition) && visit(block.condition)
+    hasproperty(block, :arguments) && visit(block.arguments)
+    previous = -1
+    while previous != length(needed)
+        previous = length(needed)
+        for name in collect(needed)
+            haskey(alias_sources, name) && visit(alias_sources[name])
+        end
+    end
+    needed
+end
+
+# A read-only dense numeric argument can be read from the root call instead of
+# copied into every suspended frame. Prove the entire forwarding component:
+# every incoming edge must carry that same root, and every use must be an
+# ordinary array read/length or a direct forward within the component. Any
+# write, rebinding, escape, or ambiguous incoming argument keeps frame storage.
+function _control_readonly_array_formals(program, argument_types)
+    result = Dict{Tuple{Int,Symbol},Int}()
+    calls = filter(block -> block.term === :call, program.blocks)
+    for (root_name, position) in program.formal_positions[program.root_mid]
+        T = argument_types[position]
+        T <: Array && isbitstype(eltype(T)) && eltype(T) <: Number || continue
+        aliases = Set([(program.root_mid, root_name)])
+        changed = true
+        while changed
+            changed = false
+            for block in calls
+                for (name, index) in program.formal_positions[block.callee_mid]
+                    index <= length(block.arguments) || continue
+                    actual = block.arguments[index]
+                    actual isa _FormalRef || continue
+                    (block.mid, actual.arg) in aliases || continue
+                    key = (block.callee_mid, name)
+                    if !(key in aliases)
+                        push!(aliases, key)
+                        changed = true
+                    end
+                end
+            end
+        end
+        # The root's initial arguments are incoming edges too. Recursion may
+        # swap two root formals; those remain distinct even if their forwarding
+        # edges form one connected component.
+        any(key -> first(key) == program.root_mid && last(key) != root_name,
+            aliases) && continue
+        valid = all(calls) do block
+            all(program.formal_positions[block.callee_mid]) do (name, index)
+                (block.callee_mid, name) in aliases || return true
+                index <= length(block.arguments) || return false
+                actual = block.arguments[index]
+                actual isa _FormalRef && (block.mid, actual.arg) in aliases
+            end
+        end
+        valid || continue
+        function safe_use(x, mid)
+            if x isa _FormalRef
+                return !((mid, x.arg) in aliases)
+            elseif x isa _Lit
+                return true
+            elseif x isa _PlaceWrite
+                any(key -> first(key) == mid &&
+                    _reads_formal(x.target, last(key)), aliases) && return false
+                return safe_use(x.rhs, mid)
+            elseif x isa _LocalAssign
+                any(name -> (mid, name) in aliases, x.lhs) && return false
+                return safe_use(x.rhs, mid)
+            elseif x isa _Index && x.base isa _FormalRef &&
+                    (mid, x.base.arg) in aliases
+                return all(index -> safe_use(index, mid), x.idxs)
+            elseif x isa _RegisteredCall &&
+                    getfield(x.registration, :source) === Base.length &&
+                    !x.broadcast && isempty(x.kw) && length(x.args) == 1 &&
+                    only(x.args) isa _FormalRef &&
+                    (mid, only(x.args).arg) in aliases
+                return true
+            elseif x isa Tuple || x isa AbstractVector
+                return all(child -> safe_use(child, mid), x)
+            elseif x isa Pair
+                return safe_use(last(x), mid)
+            elseif x isa Expr
+                return all(child -> safe_use(child, mid), x.args)
+            elseif x isa Union{_MExpr,_MStmt,_RawStmt,_RawCond}
+                return all(field -> safe_use(getfield(x, field), mid),
+                           fieldnames(typeof(x)))
+            end
+            true
+        end
+        valid = all(program.blocks) do block
+            any(name -> (block.mid, name) in aliases, block.writes) && return false
+            safe_use(block.effects, block.mid) || return false
+            hasproperty(block, :condition) &&
+                !safe_use(block.condition, block.mid) && return false
+            block.term === :call || return true
+            all(enumerate(block.arguments)) do (index, actual)
+                if actual isa _FormalRef && (block.mid, actual.arg) in aliases
+                    return any(program.formal_positions[block.callee_mid]) do (name, pos)
+                        pos == index && (block.callee_mid, name) in aliases
+                    end
+                end
+                safe_use(actual, block.mid)
+            end
+        end
+        valid || continue
+        for key in aliases
+            result[key] = position
+        end
+    end
+    result
+end
+
 #
 # `compile_dispatcher` above emits one native implementation of the captured
 # control machine.  Optional backends need the same source-derived topology,
@@ -593,7 +773,8 @@ function _control_program_from_irs(irs0; root_mid::Int,
             end
         end
         spilled[mid] = Tuple(unique(vcat(
-            spilled_locals(by_mid[mid], framed), cfg_locals)))
+            lower_all_loops ? Symbol[] : spilled_locals(by_mid[mid], framed),
+            cfg_locals)))
         stored[mid] = Tuple(unique(vcat(live_formals(by_mid[mid], cfg.blks),
                                           collect(spilled[mid]))))
         position = Dict{Symbol,Int}()

@@ -30,6 +30,83 @@ const _MPB_GENERIC_CONTROL = MutationProfileBGenericControl
 const _MPB_TESTSET = get(ENV, "RK_MPB_TESTSET", "all")
 _mpb_enabled(name) = _MPB_TESTSET == "all" || _MPB_TESTSET == name
 
+if _mpb_enabled("readonly-index")
+@testset "readonly integer controls seed functional loop indices" begin
+    case = _MPB_GENERIC_CONTROL.readonly_index_case()
+    result = case.transition(case.state)
+    @test result.state.total == 5
+    @test result.state.limit == 4
+    @test !result.control_overflow
+    @test case.state.total == 0
+    @test case.transition(result.state).state.total == 10
+    short = _MPB_GENERIC_CONTROL.readonly_index_case(; max_iterations=3)
+    exhausted = short.transition(short.state)
+    @test exhausted.control_overflow
+    @test exhausted.state == short.state
+end
+end
+
+if _mpb_enabled("readonly-array")
+@testset "recursive array arguments retain values across suspension" begin
+    case = _MPB_GENERIC_CONTROL.array_reader_case()
+    input = [2.0, 5.0]
+    result = case.transition(case.state, input)
+    @test result.state.total == 21
+    @test !result.control_overflow
+    @test input == [2, 5]
+    @test case.state.total == 0
+    @test case.transition(result.state, [4.0, 1.0]).state.total == 36
+    mixed = _MPB_GENERIC_CONTROL.array_reader_case(Val(:mixed!))
+    @test mixed.transition(mixed.state, [2.0, 5.0], [7.0, 11.0]).state.total == 20
+    swapped = _MPB_GENERIC_CONTROL.array_swap_case()
+    @test swapped.transition(swapped.state, 2, [2.0], [7.0]).state.total == 11
+    for factory in (_MPB_GENERIC_CONTROL.recursive_array_writer,
+                    _MPB_GENERIC_CONTROL.recursive_array_escape)
+        program = RK._control_program(factory;
+            root_name=:drive!, lower_all_loops=true)
+        @test isempty(RK._control_readonly_array_formals(
+            program, (Vector{Float64},)))
+    end
+end
+end
+
+if _mpb_enabled("control-dispatch")
+@testset "control address ranges and native dispatch" begin
+    fixture = _MPB_GENERIC_CONTROL
+    for ((method, pc), expected) in zip(fixture.ADDRESS_INPUTS,
+                                       fixture.ADDRESS_EXPECTED)
+        carry = (ctrl_mid=[0, method], ctrl_pc=[0, pc], csp=2)
+        @test fixture.address_probe(carry) == expected
+    end
+    blocks = Any[RK.compile(:((ports, rng, ensures, carry) ->
+        (value=carry.value + $amount,))) for amount in (3, 5, 7)]
+    dispatch = RK._SMControlBlockDispatch{((1, 1), (1, 2))}(blocks, Any[])
+    for (index, expected) in ((0, 13), (1, 15), (-1, 17), (2, 17),
+                               (typemax(Int), 17))
+        @test RK._sm_control_dispatch(dispatch, nothing, nothing, nothing,
+            (value=10,), index).value == expected
+    end
+end
+end
+
+if _mpb_enabled("loop-scope")
+@testset "lowered loop bindings preserve lexical scopes" begin
+    for (method, expected) in ((Val(:grids!), 15), (Val(:nested!), 22))
+        case = _MPB_GENERIC_CONTROL.loop_scope_case(method)
+        result = case.transition(case.state)
+        @test !result.control_overflow
+        @test result.state.total == expected
+        @test case.state.total == 0
+        again = case.transition(result.state)
+        @test again.state.total == 2expected
+    end
+    short = _MPB_GENERIC_CONTROL.loop_scope_case(Val(:grids!); max_iterations=4)
+    exhausted = short.transition(short.state)
+    @test exhausted.control_overflow
+    @test exhausted.state == short.state
+end
+end
+
 module _MutationProfileBFormalProbe
 using ReactiveKernels
 
@@ -341,6 +418,44 @@ if _mpb_enabled("bounds")
     @test !while_result.control_overflow
     @test while_result.state.total == 3
 
+    runtime_kernel = RK.compile_stateful(
+        _MPB_GENERIC_CONTROL.runtime_for_counter, 0)
+    runtime_state = RK.stateful_snapshot(runtime_kernel(0))
+    for method in (Val(:step!), Val(:local_step!))
+        @test _mpb_rejection_reason(() -> RK.stateful_control_bounds(
+            runtime_kernel, method, runtime_state;
+            argument_types=Tuple{Int})) ==
+            "a runtime for-loop extent requires an explicit max_iterations " *
+            "when constructing StatefulControlBounds"
+        runtime_bounds = RK.stateful_control_bounds(
+            runtime_kernel, method, runtime_state;
+            argument_types=Tuple{Int}, max_iterations=3)
+        runtime_transition = RK.functionalize_stateful(
+            runtime_kernel, method, runtime_bounds)
+        for extent in (0, 2, 3)
+            result = runtime_transition(runtime_state, extent)
+            @test !result.control_overflow
+            @test result.state.total == extent
+        end
+        exhausted = runtime_transition(runtime_state, 4)
+        @test exhausted.control_overflow
+        @test exhausted.state == runtime_state
+    end
+
+    reset_kernel = RK.compile_stateful(
+        _MPB_GENERIC_CONTROL.broadcast_reset, [9, 8, 7], 0)
+    reset_state = reset_kernel([9, 8, 7], 0)
+    reset_snapshot = RK.stateful_snapshot(reset_state)
+    reset_bounds = RK.stateful_control_bounds(
+        reset_kernel, Val(:reset!), reset_snapshot; argument_types=Tuple{})
+    reset_result = RK.functionalize_stateful(
+        reset_kernel, Val(:reset!), reset_bounds)(reset_snapshot)
+    @test reset_result.state.values == [5, 5, 5]
+    @test reset_snapshot.values == [9, 8, 7]
+    @test !reset_result.control_overflow
+    RK.stateful_call!(reset_state, Val(:reset!))
+    @test reset_state.values == reset_result.state.values
+
     backing = [0]
     payload = (values=backing, mirror=backing)
     structured_kernel = RK.compile_stateful(
@@ -361,6 +476,19 @@ if _mpb_enabled("bounds")
     @test structured_result.state.total == 3
 
     wrong_backing = [0, 0]
+    owned = _MPB_GENERIC_CONTROL.owned_alias_case()
+    owned_result = owned.transition(owned.state)
+    @test !owned_result.control_overflow
+    @test owned_result.state.left.values == [7, 8]
+    @test owned_result.state.right.values == [4, 5]
+    @test owned_result.state.left.total == 15
+    @test owned_result.state.right.total == 9
+    @test owned_result.state.counter == 81
+    @test owned_result.state.left.values !== owned_result.state.right.values
+    @test owned_result.state.left.values === owned_result.state.left.mirror
+    @test owned_result.state.right.values === owned_result.state.right.mirror
+    @test owned.state.left.values == owned.state.right.values == [1, 2]
+
     wrong_shape = merge(structured_state,
         (payload=(values=wrong_backing, mirror=wrong_backing),))
     @test_throws ArgumentError structured_transition(wrong_shape)

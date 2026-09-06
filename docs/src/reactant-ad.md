@@ -30,6 +30,16 @@ compiled_both = compile_ad_value_and_gradient(prepared, traced...)
 value, gradient = compiled_both(traced...)
 ```
 
+`ad_value_and_gradient(prepared, args...)` can also appear inside an enclosing
+RK kernel or a function compiled by Reactant. With a traced scalar or array as
+the active input, it stages the value and derivative into that enclosing
+program. This lets a generated integrator use the model gradient without a
+separate compiled-gradient call. The compiler selects the tensorized primal
+body and the caller's DI backend; the native DI preparation remains available
+for native calls. Bound data and the authored argument order are preserved.
+Focused executable examples are in
+[`test/test_ad_fused_reactant.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/test/test_ad_fused_reactant.jl).
+
 ## Boundary
 
 - A compiled gradient is available only where the primal kernel itself compiles
@@ -38,8 +48,8 @@ value, gradient = compiled_both(traced...)
   silently changing the differentiated boundary.
 - `compile_ad_value_and_gradient` returns `(value, gradient)` in one compiled
   call; `compile_ad_gradient` returns only the gradient.
-- Packed Eight Schools joint/prior paths remain outside the accepted boundary
-  where their primal form hits Reactant's scalar-indexing rejection.
+- The packed Eight Schools model is covered by the
+  [model-level Reactant AD measurements](eight-schools-reactant.md).
 
 For native preparation and ownership rules, start with
 [Prepared gradients](automatic-differentiation.md). For reviewed model-level

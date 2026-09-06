@@ -16,6 +16,8 @@ module WALNUTSBMutationAuthoringFixture
 # the ordinary @kernel source below; no WALNUTS name or layout is compiler input.
 include(joinpath(@__DIR__, "nuts_kernel_authoring_fixture_b.jl"))
 using ReactiveKernels
+using LinearAlgebra: dot
+using LogExpFunctions: logaddexp
 using .NUTSBMutationAuthoringFixture: fillf, tree, leapfrog!, nuts_stats!
 
 """Construct the external WALNUTS-D fixture with a fixed depth-10 default."""

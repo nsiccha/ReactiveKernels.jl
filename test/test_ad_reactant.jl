@@ -11,11 +11,13 @@ using ReactiveKernelsPPLExamples.EightSchoolsExample:
 # validation and the authored-order reorder) and compiles a
 # DifferentiationInterface gradient / value-and-gradient through Reactant. The
 # differentiation engine stays the caller's DI backend — `AutoEnzyme` here —
-# exactly as on the native reverse pass, and the compiled result must match the
-# native gradient bit-for-bit.
+# exactly as on the native reverse pass. Analytic derivative checks and model
+# comparisons exercise the AD boundary under ordinary compiler optimization.
 
 const AD_REACTANT_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 _trace(x) = Reactant.to_rarray(x)
+
+include("test_ad_fused_reactant.jl")
 
 @testset "Reactant-compiled AD" begin
     @testset "standalone objective: authored defaults, keywords, parity" begin
