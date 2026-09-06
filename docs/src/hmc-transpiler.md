@@ -34,7 +34,7 @@ is computed from the committed data during the docs build.
 Main.HMCTranspilerDocs.render_results()
 ```
 
-The run used strato2 CPU, Julia 1.10.11, Reactant 0.2.284, Enzyme 0.13.199,
+The run used strato2 CPU, Julia 1.10.11, Reactant 0.2.284,
 AdvancedHMC 0.8.6, ten Float64 parameters, a unit diagonal metric and step size
 0.03. Each backend uses the same RK density and gradient, with the indicated
 leapfrog count. AdvancedHMC additionally materializes trajectories and computes
