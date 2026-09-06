@@ -1,0 +1,107 @@
+"schema_version" = 1
+"status" = "experimental_package_owned_lowering"
+"parent_commit" = "e67e027dce1298aca35f1e8fcbf8fd2e96ed5da7"
+"host" = "strato2"
+"julia" = "1.10.11"
+"enzyme" = "0.13.199"
+"ahmc" = "0.8.6"
+"model" = "centered_eight_schools"
+"dimensions" = 10
+"metric" = "unit_diagonal"
+"stepsize" = 0.03
+"leapfrog_steps" = 4
+"transitions_per_batch" = 1000
+"note" = "The same captured endpoint-Metropolis HMC and leapfrog source now consumes package-owned native lowering and the optional Reactant extension. The three implementation files differ from the parent only in their first comment line and trailing whitespace; benchmark files are import shims. No new public API, numerical-agreement gate, or sampler-specific rewrite. Fresh separate processes; include all measured samples. Compilation time remains a limitation; no speedup is claimed from moving files."
+
+["reactant"]
+"exit_code" = 0
+"process_elapsed_seconds" = 113
+"generated_seconds" = [0.001954585, 0.00193604, 0.001860606, 0.001866022, 0.001894051, 0.001915561, 0.001876737]
+"generated_allocated_bytes" = [2160, 2160, 2160, 2160, 2160, 2160, 2160]
+"ahmc_seconds" = [0.002166106, 0.003447804, 0.004789793, 0.004757999, 0.004829379, 0.004715231, 0.004811523]
+"ahmc_allocated_bytes" = [7200000, 7200000, 7200000, 7200000, 7200000, 7200000, 7200000]
+"integration_steps" = [4000, 4000, 4000, 4000, 4000, 4000, 4000]
+"mlir_bytes" = 38031
+"while_regions" = 2
+"if_regions" = 3
+"caller_inputs_preserved" = true
+"command" = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/hmc_eight_schools.jl reactant-slots 1000 4"
+
+["reactant"."stages"]
+"prepare_model_seconds" = 4.495355564
+"prepare_model_bytes" = 233112704
+"prepare_native_endpoint_seconds" = 7.231074055
+"prepare_native_endpoint_bytes" = 850865696
+"prepare_native_factory_seconds" = 5.045595945
+"prepare_native_factory_bytes" = 421237856
+"lower_fast_native_seconds" = 3.935159897
+"lower_fast_native_bytes" = 304927912
+"lower_traced_slots_seconds" = 2.047223568
+"lower_traced_slots_bytes" = 288710784
+"compile_traced_slots_seconds" = 42.134234795
+"compile_traced_slots_bytes" = 3795544043
+"traced_slots_first_chain_seconds" = 0.291309658
+"traced_slots_first_chain_bytes" = 37167032
+
+["native"]
+"exit_code" = 0
+"process_elapsed_seconds" = 84
+"generated_seconds" = [0.001532093, 0.00152318, 0.001455607, 0.001474062, 0.00161756, 0.001507899, 0.001475374]
+"generated_allocated_bytes" = [752, 752, 752, 752, 752, 752, 752]
+"ahmc_seconds" = [0.009183612, 0.002060772, 0.002065198, 0.002047203, 0.012592682, 0.001977507, 0.002056175]
+"ahmc_allocated_bytes" = [7207472, 7200224, 7200224, 7200224, 7200224, 7200224, 7200224]
+"integration_steps" = [4000, 4000, 4000, 4000, 4000, 4000, 4000]
+"command" = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/hmc_eight_schools.jl compare 1000 4"
+
+["native"."stages"]
+"prepare_model_seconds" = 4.176277721
+"prepare_model_bytes" = 233111104
+"prepare_native_endpoint_seconds" = 7.20398124
+"prepare_native_endpoint_bytes" = 851156488
+"prepare_native_factory_seconds" = 4.574688365
+"prepare_native_factory_bytes" = 421221072
+"lower_fast_native_seconds" = 3.866045504
+"lower_fast_native_bytes" = 303689864
+"native_slots_first_chain_seconds" = 0.783765769
+"native_slots_first_chain_bytes" = 42941440
+"ahmc_first_chain_seconds" = 5.1591e-05
+"ahmc_first_chain_bytes" = 16336
+
+["control_probe"]
+"exit_code" = 0
+"process_elapsed_seconds" = 118
+"command" = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/loop_control_probe.jl"
+"transitions_per_case" = 3
+"zero_trip_native_steps" = 0
+"zero_trip_traced_steps" = 0
+"forced_divergence_native_steps" = 3
+"forced_divergence_traced_steps" = 3
+"positions_unchanged_independently" = true
+"traced_caller_inputs_preserved" = true
+
+["optional_dependency_load"]
+"exit_code" = 0
+"native_compiler_loaded" = true
+"reactant_extension_loaded" = false
+"command" = "julia --project=. --startup-file=no -e 'using ReactiveKernels; @assert Base.get_extension(ReactiveKernels,:ReactiveKernelsReactantExt) === nothing; @assert isdefined(ReactiveKernels,:NativeSlotCompiler); println(\"native compiler loads without Reactant\")'"
+
+["source_sha256"]
+"src/ad.jl" = "37c8258f5ffa67fbab9b4240fb972858c3e05a01f1d99b73fd3a1790afd4b568"
+"ext/ReactiveKernelsReactantExt.jl" = "6557fdb95b8115a375ca99d73496a30e2fddddff2c2eab09a92da8663819ff34"
+"src/kernel_adaptation.jl" = "d655baa036d4e5770b769ab644b8c56ca0567c167d3643011352131e9928a5c4"
+"benchmark/reactivehmc_hmc_kernel_fixture_b.jl" = "9ffa4e8e2990992cd92303e55a6d005cff2c6e1698de6bca7941ad2907f8a4da"
+"benchmark/nuts_kernel_authoring_fixture_b.jl" = "7a9a9d6e1fa122e3d846def760933b0ba14e62e567d92cffab9d9d638f9404f4"
+"benchmark/sampler_transpiler/hmc_eight_schools.jl" = "c18b800fc013d8007d1d1b23d7c7330b89304bc8ff92767562b26a788d2d5996"
+"benchmark/sampler_transpiler/native_slots.jl" = "c0f03d31c96be0c6282608c93779cd6c92c00e3741e40bdf62bc365e3f8d3e25"
+"benchmark/sampler_transpiler/native_slots_factory.jl" = "36468f4da6321631c0eba1a8fc1baa5dee305220b0e1572d6966b509365f8235"
+"benchmark/sampler_transpiler/native_comparison.jl" = "5e2612234a93c4d126a7c9550520ba468b266c790709e1602a1b1dccae183598"
+"benchmark/sampler_transpiler/traced_slots.jl" = "1145f10c16fb282f15615d8450e57b0e947af0b44c7a42ae99d16adfe9a18fd1"
+"benchmark/sampler_transpiler/traced_comparison.jl" = "ff891cd14f9ae1933a3b3813246b1d242b056b3b8c271425c3545e1bb78732c0"
+"benchmark/sampler_transpiler/loop_control_probe.jl" = "45bc979f7bdfbbc91918f4aa3300f794d7b263dd788b4707b7e621e4b1970881"
+"benchmark/sampler_transpiler/profile_compile.jl" = "ba92a50afae1fdd86667fc00f16197a0479214e714eb2237e10b2cdf7332dbc8"
+"src/ReactiveKernels.jl" = "5dadbc59cd45725b1b00350cc5156e4b8a403c766b90ca24985f5bc958d3ce01"
+"src/native_slot_compiler.jl" = "206f475697d27bbc230f5eca0631378ee22e13951ab5929d94158ae6802ebea9"
+"src/native_slots.jl" = "9df70ffbff74c2e5d5eb4271ed29dbc2c4350d8a130b7857a41c386e3b5c0e21"
+"src/native_slots_factory.jl" = "58208f07e6c86a3478e1c6f217f48c7cb25789198ecedbea27d8ea60580ca532"
+"ext/ReactiveKernelsReactantExt/traced_slot_compiler.jl" = "3411dd0de1a9da07f9dddf185f8a48a6a8145a9203aeb141cbafe98f822a7b26"
+"ext/ReactiveKernelsReactantExt/traced_slots.jl" = "453d7520629f5914231308f149479525ea60d1ec2e4536876aa3f7f08f66903a"

@@ -6,6 +6,14 @@ It reports preparation, compilation, and warm execution separately. The current
 priority is efficient native lowering, followed by Reactant consuming that
 simplified program. This remains an experimental compiler prototype.
 
+The reusable compiler is owned by the package: the internal
+`ReactiveKernels.NativeSlotCompiler` module prepares and emits native programs,
+and the existing optional Reactant extension owns the traced backend. The
+benchmark files `native_slots.jl`, `native_slots_factory.jl`, and
+`traced_slots.jl` are import shims. Loading the core compiler does not load
+Reactant. These internal entry points retain the prototype's finite support
+limits; this move does not declare a stable public sampler or compiler API.
+
 From the repository root:
 
 ```sh
@@ -45,11 +53,12 @@ are computed on demand, gradients use their destination form, and captured
 integrator writes become in-place broadcasts inside the generated loop.
 Preparation hoists pure expressions whose operands are fixed shared values.
 A diagonal product can reuse its dying owned vector when earlier local reads
-do not retain that vector. This prototype emitter is in `native_slots.jl`; it
+do not retain that vector. The emitter is in
+[`src/native_slots.jl`](../../src/native_slots.jl); it
 contains no sampler-name or model-name cases. Unsupported expression/control
 forms fail during preparation.
 
-The native factory constructs these stores directly from the captured constructor
+The [native factory](../../src/native_slots_factory.jl) constructs these stores directly from the captured constructor
 and bound callable sources. Consecutive transfers of all authoritative fields
 between matching endpoint layouts also transfer valid derived caches. This
 removes an unnecessary gradient evaluation at the start of each HMC transition:
@@ -61,7 +70,8 @@ Its private stores and constants are not an API for external mutation. The
 source's known aliases and destination-preserving copies remain part of the
 lowering contract.
 
-`reactant-slots` consumes the same emitted native program. Its backend pass
+`reactant-slots` consumes the same emitted native program. Its
+[extension backend](../../ext/ReactiveKernelsReactantExt/traced_slots.jl)
 turns numerical slots into local variables, derives explicit branch inputs and
 outputs by backward liveness, and proves cache-validity facts across construction
 and every possible transition exit. Only proven facts replace runtime checks.
@@ -144,6 +154,12 @@ It writes a serialized profile and text views after compilation, then checks
 the actual integration count and preservation of caller inputs. Profiling
 substantially slows JIT compilation: use the ordinary `reactant-slots` command
 for elapsed-time measurements. No backend optimization settings are changed.
+
+`package-owned-v1.toml` records execution after moving these lowering passes
+into the package and optional extension. The mathematical source and compiler
+transformations are unchanged; the benchmark imports the package-owned code.
+Historical receipts retain the source paths and hashes from their recorded
+commits, before this move.
 
 All modes use centered Eight Schools, ten Float64 parameters, a unit diagonal
 metric, and step size 0.03. Four leapfrog steps are the default. This is endpoint-Metropolis HMC;

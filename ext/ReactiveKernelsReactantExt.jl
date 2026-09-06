@@ -1206,4 +1206,6 @@ function ReactiveKernels._reactant_compile_ad(
     _rk_reactant_compile_ad(mode, prepared, args; sync = sync)
 end
 
+include("ReactiveKernelsReactantExt/traced_slot_compiler.jl")
+
 end # module ReactiveKernelsReactantExt
