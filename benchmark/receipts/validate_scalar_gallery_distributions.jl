@@ -14,6 +14,10 @@ const EXPECTED_SCALAR_GALLERY_FAMILIES =
         "exponential_logscale",
         "geometric_logit",
         "uniform_bounded",
+        "poisson_lograte",
+        "gamma_shape_rate",
+        "beta_shapes",
+        "binomial_logit",
     )
 const EXPECTED_SCALAR_GALLERY_SIZES = (1_000, 100_000)
 
@@ -71,8 +75,12 @@ function validate_scalar_gallery_distribution_receipt(path::AbstractString)
         family_support = support[family]
         require(get(family_support, "rk_reactant", false),
                 "$family RK Reactant path did not pass")
-        require(get(family_support, "probability_measures_reactant", false),
-                "$family ProbabilityMeasures Reactant path did not pass")
+        if !get(family_support, "probability_measures_reactant", false)
+            diagnostic = get(get(support_errors, family, Dict()),
+                             "probability_measures_reactant", "")
+            require(!isempty(diagnostic),
+                    "$family absent/unsupported ProbabilityMeasures path needs a diagnostic")
+        end
         if !get(family_support, "distributions_reactant", false)
             diagnostic = get(get(support_errors, family, Dict()),
                              "distributions_reactant", "")
@@ -91,18 +99,18 @@ function validate_scalar_gallery_distribution_receipt(path::AbstractString)
     ]
     require(observed_rows == expected_rows, "measurement family/size inventory mismatch")
 
-    required_measurements = (
-        "rk_native", "distributions_native", "probability_measures_native",
-        "rk_reactant", "probability_measures_reactant",
-    )
+    required_measurements = ("rk_native", "distributions_native", "rk_reactant")
     for row in receipt["measurements"]
         family = String(row["family"])
         n = Int(row["n"])
         require(Float64(row["max_relative_error"]) <= 1e-10,
                 "$family N=$n exceeds relative value-parity tolerance")
-        names = get(support[family], "distributions_reactant", false) ?
-            (required_measurements..., "distributions_reactant") :
-            required_measurements
+        names = String[required_measurements...]
+        if get(support[family], "probability_measures_reactant", false)
+            push!(names, "probability_measures_native", "probability_measures_reactant")
+        end
+        get(support[family], "distributions_reactant", false) &&
+            push!(names, "distributions_reactant")
         for name in names
             require(haskey(row, name), "$family N=$n missing $name") || continue
             measurement = row[name]
@@ -144,7 +152,8 @@ function main(path)
     errors = validate_scalar_gallery_distribution_receipt(path)
     if isempty(errors)
         println("VALIDATE OK — scalar-distribution-gallery-v1: " *
-                "7 families × 2 sizes, RK+ProbabilityMeasures Reactant accepted")
+                "11 families × 2 sizes, RK Reactant accepted " *
+                "(ProbabilityMeasures where the measure exists)")
         return 0
     end
     foreach(println, errors)

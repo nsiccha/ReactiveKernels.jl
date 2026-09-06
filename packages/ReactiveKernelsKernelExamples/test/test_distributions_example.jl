@@ -6,8 +6,8 @@ using LogExpFunctions: logistic
 
 using ReactiveKernelsDistributionKernels: DistributionKernelSources
 using ReactiveKernelsKernelExamples.DistributionExamples
-using ReactiveKernels: KernelObjectSpec, KernelSpec, @kernel, code_expr,
-    ad_gradient, extract, inputs, plan, plate, prepare, prepare_ad
+using ReactiveKernels: KernelObjectSpec, KernelSpec, PreparedKernel, @kernel,
+    code_expr, ad_gradient, extract, inputs, plan, plate, prepare, prepare_ad
 
 const NORMAL_LOGSCALE_KERNEL = prepare(NORMAL_LOGDENSITY;
     have = (:x, :location, :log_scale), want = :logpdf)
@@ -398,5 +398,19 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 
         bi_obs, bi_n, bi_logit = Tuple(artifacts[15].inputs)
         @test gradients[:binomial_logit] ≈ bi_obs - bi_n * logistic(bi_logit)
+    end
+
+    @testset "interactive lowering panels build and self-assert" begin
+        # Each panel carries build-executed `@assert`s proving its lowering
+        # property (HAVE-route recipes, shared-standardized CSE, Ref broadcast,
+        # hoisted scale-only invariant). Running it fails closed on regression.
+        panels = DistributionExamples.lowering_sources()
+        @test length(panels) == 4
+        for source in panels
+            artifact = DistributionExamples.run_lowering_source(source)
+            @test artifact.kernel isa PreparedKernel
+            observed = Base.invokelatest(artifact.kernel, Tuple(artifact.inputs)...)
+            @test isequal(observed, artifact.output)
+        end
     end
 end
