@@ -71,9 +71,11 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
     # The latent one-step-ahead errors are the sequential heart of the model:
     #   ν₁ = μ + φ·μ (err₀ ≡ 0), errₜ = yₜ − νₜ,
     #   νₜ = μ + φ·y_{t-1} + θ·err_{t-1}   (t ≥ 2).
-    # The recursion is irreducibly sequential, so it is authored inline as one
-    # named graph node rather than a plate. A query can still ask for just the
-    # errors, the full density, or the forecast.
+    # This is the NATURAL authoring, and it evaluates natively — but its
+    # element-wise `err[t-1]` reads do not lower through Reactant (XLA forbids
+    # scalar indexing of a traced array). `errors_closed` below is its exact
+    # vectorized equivalent that DOES lower; `errors` stays a first-class
+    # reference port (the forecast reruns it, and a test asserts the two equal).
     errors::Vector{Float64} = let
         T = length(series)
         err = Vector{Float64}(undef, T)
@@ -84,6 +86,22 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
             err[t] = series[t] - ν
         end
         err
+    end
+
+    # The SAME errors as a vectorized closed form that lowers through Reactant.
+    # The recurrence errₜ = aₜ − θ·err_{t-1} (with aₜ = yₜ − μ − φ·y_{t-1}) is
+    # linear, so errₜ = Σ_{k≤t} (−θ)^{t−k} aₖ — a lower-triangular Toeplitz matvec
+    # err = L·a. It uses only vectorized ops (slice, vcat, broadcast, a `.>=`
+    # comparison mask, matmul), so unlike the sequential form it has no
+    # concrete-int getindex and lowers through Reactant. The likelihood/density
+    # reduce this form; a test asserts `errors_closed ≈ errors`.
+    errors_closed::Vector{Float64} = let
+        T = length(series)
+        y_lag = vcat(μ, series[1:(T - 1)])                  # y_{t-1}, with y₀ ≡ μ
+        a = series .- μ .- φ .* y_lag
+        Δ = (0:(T - 1)) .- (0:(T - 1))'                     # Δ[t, k] = t − k
+        L = (Δ .>= 0) .* ((-θ) .^ max.(Δ, 0))               # lower-tri Toeplitz
+        L * a
     end
 
     # Log prior: μ ~ Normal(0, 10), φ, θ ~ Normal(0, 2), σ ~ HalfCauchy(2.5).
@@ -97,8 +115,9 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
     prior::Float64 = μ_prior + φ_prior + θ_prior + σ_prior
 
     # One authored likelihood plate over the latent errors: errₜ ~ Normal(0, σ).
-    # The scalar σ broadcasts across the error vector.
-    pointwise = plate(errors, σ) do e, s
+    # It reduces the lowering `errors_closed` form, so the whole density compiles
+    # through Reactant; the scalar σ broadcasts across the error vector.
+    pointwise = plate(errors_closed, σ) do e, s
         normal(0.0, s).logpdf(e)
     end
     likelihood::Float64 = sum(pointwise)
@@ -168,7 +187,9 @@ Build the posteriordb ARMA(1, 1) model as a declarative
 `ReactiveKernels.KernelSpec`. The latent one-step errors are computed by a
 sequential recursion authored inline in the model source and exposed as their
 own port, so a query can ask for just the errors, the full density, or the
-one-step forecast. The Normal and Cauchy endpoints are reused from
+one-step forecast. The model also carries a vectorized closed-form equivalent
+(`errors_closed`) that the likelihood/density reduce so the whole density lowers
+through Reactant; the sequential `errors` remain a native reference port. The Normal and Cauchy endpoints are reused from
 `ReactiveKernelsDistributionKernels`; the half-Cauchy prior on `σ` folds the
 Cauchy endpoint with the `log(2)` truncation constant. The support transform +
 Jacobian, prior, pointwise log-likelihood, likelihood reduction, and total

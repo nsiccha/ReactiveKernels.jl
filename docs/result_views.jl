@@ -120,6 +120,13 @@ const _REVIEW_STATUS_CONTENT = Dict(
         title = "Implementation retained; guide awaiting review",
         body = "The non-allocating implementation and its tests remain in place, but this guide has not yet received the current focused review. This label records documentation review status, not a known runtime failure.",
     ),
+    :review_pending_ppl => (
+        state = "review-pending",
+        icon = "◌",
+        label = "Experimental — not reviewed",
+        title = "Experimental PPL front-end; not approved or reviewed",
+        body = "The `@ppl` declarative front-end and the `PPLGibbs` sampling layer are an in-progress experiment in the PPL examples satellite. They are deliberately unexported and are NOT part of the supported ReactiveKernels API — do not build on them. This page documents the current shape for review; treat everything on it as provisional.",
+    ),
 )
 
 """Render a visible, source-controlled review-state banner for a docs page."""

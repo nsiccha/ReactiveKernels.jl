@@ -135,7 +135,7 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
     end
 
     @testset "sources build native recipes checked against a Distributions oracle" begin
-        @test length(artifacts) == 15
+        @test length(artifacts) == 17
         continuous, discrete, vectorized = all_sources()
         # No forced API demonstrations: these are plain native densities. Nothing
         # shoehorns a `compose` call; the vectorized source generates its batched
@@ -241,6 +241,36 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
                           want = :logpdf)(bobs, bn, logistic(blogit)) ≈ bref
         end
 
+        # The two conjugate-prior families added for the PPL Gibbs layer. Inverse
+        # Gamma is a scalar variance prior that lifts through the generic plate
+        # path and guards its positive support; Dirichlet is a whole-vector
+        # simplex prior like mvnormal. Both compile Distributions.jl-free.
+        inverse_gamma_a, dirichlet_a = artifacts[16:17]
+        let plated_inputs = Tuple(inverse_gamma_a.plate_inputs)
+            observations = first(plated_inputs)
+            shared = Base.tail(plated_inputs)
+            expected = sum(inverse_gamma_a.kernel(observation, shared...)
+                           for observation in observations)
+            @test inverse_gamma_a.plate_output ≈ expected
+            @test inverse_gamma_a.plated(plated_inputs...) ≈ expected
+            @test !occursin("Distributions",
+                            string(code_expr(inverse_gamma_a.plated)))
+        end
+        @test inverse_gamma_a.kernel(-1.0, inverse_gamma_a.inputs.shape,
+                                     inverse_gamma_a.inputs.log_scale) == -Inf
+        # Inverse-Gamma accepts scale or log scale; one authored graph.
+        let igx = 1.4, igshape = 3.0, igscale = 2.0
+            igref = logpdf(InverseGamma(igshape, igscale), igx)
+            @test prepare(inverse_gamma.logpdf; have = (:x, :shape, :scale),
+                          want = :logpdf)(igx, igshape, igscale) ≈ igref
+            @test prepare(inverse_gamma.logpdf; have = (:x, :shape, :log_scale),
+                          want = :logpdf)(igx, igshape, log(igscale)) ≈ igref
+        end
+        @test dirichlet_a.output ≈
+              logpdf(Dirichlet(dirichlet_a.inputs.alpha), dirichlet_a.inputs.x)
+        @test dirichlet_a.kernel([-0.1, 0.6, 0.5], dirichlet_a.inputs.alpha) == -Inf
+        @test !occursin("Distributions", string(code_expr(dirichlet_a.kernel)))
+
         mvnormal, ar1 = artifacts[10:11]
         mvn_code = string(code_expr(mvnormal.kernel))
         ar1_code = string(code_expr(ar1.kernel))
@@ -331,14 +361,14 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
         # Exponential/Geometric/Uniform and Poisson/Gamma/Beta/Binomial formulas.
         # (Their Distributions oracles are only required to be non-negative:
         # Poisson/Gamma/Beta/Binomial constructors allocate, unlike the RK graph.)
-        scalar_artifacts = artifacts[[1, 2, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15]]
+        scalar_artifacts = artifacts[[1, 2, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15, 16]]
         @test all(artifact -> artifact.allocated_bytes == 0, scalar_artifacts)
         @test all(artifact -> artifact.reference_allocated_bytes == 0,
                   artifacts[[1, 2, 4, 5, 6, 7, 8, 9]])
     end
 
     @testset "concrete inference evidence matches exact result types" begin
-        expected_returns = ntuple(_ -> Float64, 15)
+        expected_returns = ntuple(_ -> Float64, 17)
         for (artifact, expected_return) in zip(artifacts, expected_returns)
             observed = artifact.kernel(Tuple(artifact.inputs)...)
             @test isconcretetype(artifact.inferred_return)
@@ -398,6 +428,15 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 
         bi_obs, bi_n, bi_logit = Tuple(artifacts[15].inputs)
         @test gradients[:binomial_logit] ≈ bi_obs - bi_n * logistic(bi_logit)
+
+        # Inverse Gamma differentiates its observation; Dirichlet differentiates
+        # its whole simplex vector (one gradient component per coordinate).
+        ig_x, ig_shape, ig_log_scale = Tuple(artifacts[16].inputs)
+        @test gradients[:inverse_gamma_scale] ≈
+              -(ig_shape + 1) / ig_x + exp(ig_log_scale) / ig_x^2
+
+        dir_x, dir_alpha = Tuple(artifacts[17].inputs)
+        @test gradients[:dirichlet_simplex] ≈ (dir_alpha .- 1) ./ dir_x
     end
 
     @testset "interactive lowering panels build and self-assert" begin
