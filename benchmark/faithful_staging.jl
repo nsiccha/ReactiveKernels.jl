@@ -18,7 +18,15 @@ const _BODY = joinpath(@__DIR__, "faithful_staging_body.jl")
 function _run()
     mktempdir(prefix = "reactivekernels-faithful-staging-") do env
         Pkg.activate(env)
-        Pkg.add([Pkg.PackageSpec(name = "BridgeStan")])
+        Pkg.add([
+            Pkg.PackageSpec(name = "BridgeStan"),
+            Pkg.PackageSpec(name = "Turing", version = v"0.47.1"),
+            Pkg.PackageSpec(name = "DynamicPPL", version = v"0.42.6"),
+            Pkg.PackageSpec(name = "Distributions", version = v"0.25.131"),
+            Pkg.PackageSpec(name = "DifferentiationInterface"),
+            Pkg.PackageSpec(name = "Mooncake"),
+            Pkg.PackageSpec(name = "ADTypes"),
+        ])
         run(addenv(`$(Base.julia_cmd()) --startup-file=no --project=$env $(_BODY) $(ARGS...)`, _INNER => "1"))
     end
 end
