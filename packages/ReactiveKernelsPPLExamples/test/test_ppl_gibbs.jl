@@ -1,6 +1,6 @@
 using ReactiveKernelsPPLExamples.PPLMacro: @ppl
 import ReactiveKernelsPPLExamples.PPLMacro
-using ReactiveKernelsPPLExamples.PPLGibbs: gibbs
+using ReactiveKernelsPPLExamples.PPLGibbs: gibbs, Gibbs
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal, exponential, beta, binomial, bernoulli, poisson, gamma
 using Random
@@ -206,6 +206,68 @@ _nlp(x, mu, sig) = -0.5 * log(2π) - log(sig) - 0.5 * ((x - mu) / sig)^2
             @test res.accept_rate[:rate] == 1.0
             @test isapprox(_mean(rd), post_mean; atol = 0.03)
             @test isapprox(_std(rd), post_sd; rtol = 0.06)
+        end
+    end
+
+    @testset "explicit blocking / sampler plan (1nwitne)" begin
+        @testset "joint block Gibbs((:alpha,:beta)) vs analytic Gaussian" begin
+            @ppl reg(y::Vector{Float64}, x::Vector{Float64}) = begin
+                alpha ~ normal(0.0, 10.0)
+                beta ~ normal(0.0, 10.0)
+                y ~ normal(alpha + beta * x, 1.0)
+            end
+            rng = MersenneTwister(20260906)
+            n = 60
+            x = collect(range(-2.0, 2.0; length = n))
+            y = (1.0 .+ 2.0 .* x) .+ randn(rng, n)
+            s0 = n + 1 / 100
+            s1 = sum(x)
+            s2 = sum(abs2, x) + 1 / 100
+            d = s0 * s2 - s1^2
+            μα = (s2 * sum(y) - s1 * sum(x .* y)) / d
+            μβ = (s0 * sum(x .* y) - s1 * sum(y)) / d
+            sdα = sqrt(s2 / d)
+            sdβ = sqrt(s0 / d)
+
+            # one jointly-updated block of both coefficients (correlated posterior)
+            res = gibbs(reg; blocks = Gibbs((:alpha, :beta)), data = (; y, x),
+                        init = (; alpha = 0.0, beta = 0.0),
+                        iters = 40000, warmup = 10000, step = 0.15,
+                        rng = MersenneTwister(1))
+            a = Float64.(res.draws[:alpha])
+            b = Float64.(res.draws[:beta])
+            @test haskey(res.accept_rate, (:alpha, :beta))    # one rate for the group
+            @test 0.1 < res.accept_rate[(:alpha, :beta)] < 0.9
+            @test isapprox(_mean(a), μα; atol = 0.05)
+            @test isapprox(_mean(b), μβ; atol = 0.05)
+            @test isapprox(_std(a), sdα; rtol = 0.15)
+            @test isapprox(_std(b), sdβ; rtol = 0.15)
+        end
+
+        @testset "per-block sampler override Gibbs(:rate => :rw)" begin
+            @ppl bb(successes::Vector{Int}, trials::Vector{Int}) = begin
+                rate ~ beta(2.0, 2.0)
+                successes ~ binomial(trials, rate)
+            end
+            rng = MersenneTwister(11)
+            m = 30
+            trials = fill(20, m)
+            successes = [sum(rand(rng, 20) .< 0.35) for _ in 1:m]
+            a = 2.0 + sum(successes)
+            b = 2.0 + sum(trials .- successes)
+            post_mean = a / (a + b)
+            post_sd = sqrt(a * b / ((a + b)^2 * (a + b + 1)))
+
+            # :rw forces the random-walk sampler on a conjugate-detectable block.
+            res = gibbs(bb; blocks = Gibbs(:rate => :rw),
+                        data = (; successes, trials),
+                        init = (; rate = 0.5), support = (; rate = :unit),
+                        iters = 40000, warmup = 10000, step = 0.3,
+                        rng = MersenneTwister(5))
+            r = Float64.(res.draws[:rate])
+            @test 0.1 < res.accept_rate[:rate] < 0.9          # RW, not the 1.0 conjugate rate
+            @test isapprox(_mean(r), post_mean; atol = 0.01)
+            @test isapprox(_std(r), post_sd; rtol = 0.15)
         end
     end
 end
