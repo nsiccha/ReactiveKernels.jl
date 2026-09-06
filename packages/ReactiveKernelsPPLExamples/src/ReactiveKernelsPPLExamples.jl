@@ -9,6 +9,7 @@ include("sum_to_zero.jl")
 include("linear_regression.jl")
 include("beta_binomial.jl")
 include("poisson_gamma.jl")
+include("glm_poisson.jl")
 include("dugongs_growth.jl")
 include("arma11.jl")
 include("gaussian_mixture.jl")
@@ -38,6 +39,7 @@ export SumToZeroExample
 export LinearRegressionExample
 export BetaBinomialExample
 export PoissonGammaExample
+export GLMPoissonExample
 export DugongsGrowthExample
 export ARMA11Example
 export GaussianMixtureExample
