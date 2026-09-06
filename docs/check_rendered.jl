@@ -309,6 +309,8 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "eight-schools.md" => 1,
         "sum-to-zero.md" => 1,
         "linear-regression.md" => 1,
+        "mvnormal-regression.md" => 1,
+        "bound-regression.md" => 1,
         "beta-binomial.md" => 1,
         "poisson-gamma.md" => 1,
         "dugongs-growth.md" => 1,
@@ -354,13 +356,14 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "nuts.md" => 1,
         "nuts-reactant.md" => 1,
     )
+    # The linear-regression, beta-binomial, poisson-gamma, dugongs-growth,
+    # arma11, and gaussian-mixture PPL example pages were migrated into the
+    # authored-baseline review set (commits 1190968, a1fd1a7, b7e3d13, 4f7cc64,
+    # 1e16f85, 2026-09-06), which deliberately removed their
+    # `render_review_status(:frozen_ppl)` banners. They therefore emit no
+    # review-state marker and must NOT be listed here — only pages that still
+    # render a banner belong in this dict.
     expected_review_states = Dict(
-        "linear-regression.md" => "frozen",
-        "beta-binomial.md" => "frozen",
-        "poisson-gamma.md" => "frozen",
-        "dugongs-growth.md" => "frozen",
-        "arma11.md" => "frozen",
-        "gaussian-mixture.md" => "frozen",
         "pathfinder.md" => "frozen",
         "reactivehmc-corpus.md" => "frozen",
         "nuts.md" => "frozen",
@@ -370,6 +373,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "nuts-reactant.md" => "frozen",
         "bijectors.md" => "frozen",
         "nonallocating.md" => "review-pending",
+        "ppl-front-end.md" => "review-pending",
     )
     structural_markers = Dict(
         "probprog-mcmc.md" => (
