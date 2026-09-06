@@ -14,6 +14,16 @@ benchmark files `native_slots.jl`, `native_slots_factory.jl`, and
 Reactant. These internal entry points retain the prototype's finite support
 limits; this move does not declare a stable public sampler or compiler API.
 
+The emitted traced function accepts its ordinary runtime argument and returns
+that argument alongside the updated state and counters. RNG packing is a
+caller adapter, outside source lowering. The standalone
+[`scalar_argument_probe.jl`](scalar_argument_probe.jl) uses the same native and
+traced compiler on a scalar accumulation kernel, then reuses one traced
+executable with two different runtime increments. It checks the source's
+closed-form result and preservation of caller inputs independently in each
+backend. `runtime-argument-v1.toml` records that probe and the HMC/control
+rechecks after separating the RNG adapter from emitted code.
+
 From the repository root:
 
 ```sh
@@ -23,6 +33,7 @@ julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/hmc_ei
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/hmc_eight_schools.jl reactant-slots 1000
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/hmc_eight_schools.jl reactant-slots 1000 16
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/loop_control_probe.jl
+julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/scalar_argument_probe.jl
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/hmc_eight_schools.jl reactant
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/hmc_eight_schools.jl ahmc
 ```

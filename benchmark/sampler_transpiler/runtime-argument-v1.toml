@@ -1,0 +1,94 @@
+"schema_version" = 1
+"status" = "experimental_generic_runtime_argument"
+"parent_commit" = "0c89a20578c10976b53e56c4ae2c0880c6437359"
+"host" = "strato2"
+"julia" = "1.10.11"
+"reactant" = "0.2.284"
+"enzyme" = "0.13.199"
+"ahmc" = "0.8.6"
+"note" = "The finite MethodIR emitter returns its ordinary runtime argument rather than assuming argument.seed. RNG packing is confined to the existing sampler caller adapter. No sampler arithmetic or source-control changes, numerical-agreement requirement, or new stable public API. The scalar probe checks each backend against a closed-form source result, never against one another. HMC measurements retain all samples; one paired sample is slower than AHMC, and the local margin remains modest."
+
+["scalar_consumer"]
+"exit_code" = 0
+"process_elapsed_seconds" = 33
+"command" = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/scalar_argument_probe.jl"
+"initial_value" = 1.0
+"rounds" = 4
+"native_increment" = 2.0
+"native_value" = 9.0
+"traced_runtime_increments" = [2.0, 3.0]
+"traced_values" = [9.0, 13.0]
+"one_traced_executable" = true
+"track_numbers" = true
+"caller_inputs_preserved" = true
+"native_runs_before_reactant_load" = true
+
+["reactant_hmc"]
+"exit_code" = 0
+"process_elapsed_seconds" = 114
+"command" = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/hmc_eight_schools.jl reactant-slots 1000 4"
+"model" = "centered_eight_schools"
+"dimensions" = 10
+"metric" = "unit_diagonal"
+"stepsize" = 0.03
+"leapfrog_steps" = 4
+"transitions_per_batch" = 1000
+"caller_inputs_preserved" = true
+"generated_seconds" = [0.002134824, 0.002051729, 0.00226284, 0.002025723, 0.001995271, 0.001964238, 0.002519855]
+"generated_allocated_bytes" = [2160, 2160, 2160, 2160, 2160, 2160, 2160]
+"ahmc_seconds" = [0.002702886, 0.002209496, 0.002218889, 0.002259986, 0.004732535, 0.005216222, 0.005148259]
+"ahmc_allocated_bytes" = [7200000, 7200000, 7200000, 7200000, 7200000, 7200000, 7200000]
+"integration_steps" = [4000, 4000, 4000, 4000, 4000, 4000, 4000]
+"mlir_bytes" = 38031
+"while_regions" = 2
+"if_regions" = 3
+
+["reactant_hmc"."stages"]
+"prepare_model_seconds" = 4.275949589
+"prepare_model_bytes" = 233093760
+"prepare_native_endpoint_seconds" = 7.312388702
+"prepare_native_endpoint_bytes" = 850860160
+"prepare_native_factory_seconds" = 4.993968675
+"prepare_native_factory_bytes" = 421240576
+"lower_fast_native_seconds" = 4.055068992
+"lower_fast_native_bytes" = 304944600
+"lower_traced_slots_seconds" = 2.154879187
+"lower_traced_slots_bytes" = 288707744
+"compile_traced_slots_seconds" = 41.775031211
+"compile_traced_slots_bytes" = 3795631723
+"traced_slots_first_chain_seconds" = 0.319299071
+"traced_slots_first_chain_bytes" = 37167032
+
+["control_probe"]
+"exit_code" = 0
+"process_elapsed_seconds" = 120
+"command" = "julia --project=benchmark/sampler_transpiler --startup-file=no benchmark/sampler_transpiler/loop_control_probe.jl"
+"transitions_per_case" = 3
+"zero_trip_native_steps" = 0
+"zero_trip_traced_steps" = 0
+"forced_divergence_native_steps" = 3
+"forced_divergence_traced_steps" = 3
+"positions_unchanged_independently" = true
+"traced_caller_inputs_preserved" = true
+
+["source_sha256"]
+"src/ad.jl" = "37c8258f5ffa67fbab9b4240fb972858c3e05a01f1d99b73fd3a1790afd4b568"
+"ext/ReactiveKernelsReactantExt.jl" = "6557fdb95b8115a375ca99d73496a30e2fddddff2c2eab09a92da8663819ff34"
+"src/kernel_adaptation.jl" = "d655baa036d4e5770b769ab644b8c56ca0567c167d3643011352131e9928a5c4"
+"benchmark/reactivehmc_hmc_kernel_fixture_b.jl" = "9ffa4e8e2990992cd92303e55a6d005cff2c6e1698de6bca7941ad2907f8a4da"
+"benchmark/nuts_kernel_authoring_fixture_b.jl" = "7a9a9d6e1fa122e3d846def760933b0ba14e62e567d92cffab9d9d638f9404f4"
+"benchmark/sampler_transpiler/hmc_eight_schools.jl" = "c18b800fc013d8007d1d1b23d7c7330b89304bc8ff92767562b26a788d2d5996"
+"benchmark/sampler_transpiler/native_slots.jl" = "c0f03d31c96be0c6282608c93779cd6c92c00e3741e40bdf62bc365e3f8d3e25"
+"benchmark/sampler_transpiler/native_slots_factory.jl" = "36468f4da6321631c0eba1a8fc1baa5dee305220b0e1572d6966b509365f8235"
+"benchmark/sampler_transpiler/native_comparison.jl" = "5e2612234a93c4d126a7c9550520ba468b266c790709e1602a1b1dccae183598"
+"benchmark/sampler_transpiler/traced_slots.jl" = "1145f10c16fb282f15615d8450e57b0e947af0b44c7a42ae99d16adfe9a18fd1"
+"benchmark/sampler_transpiler/traced_comparison.jl" = "ff891cd14f9ae1933a3b3813246b1d242b056b3b8c271425c3545e1bb78732c0"
+"benchmark/sampler_transpiler/loop_control_probe.jl" = "45bc979f7bdfbbc91918f4aa3300f794d7b263dd788b4707b7e621e4b1970881"
+"benchmark/sampler_transpiler/profile_compile.jl" = "ba92a50afae1fdd86667fc00f16197a0479214e714eb2237e10b2cdf7332dbc8"
+"src/ReactiveKernels.jl" = "5dadbc59cd45725b1b00350cc5156e4b8a403c766b90ca24985f5bc958d3ce01"
+"src/native_slot_compiler.jl" = "206f475697d27bbc230f5eca0631378ee22e13951ab5929d94158ae6802ebea9"
+"src/native_slots.jl" = "9df70ffbff74c2e5d5eb4271ed29dbc2c4350d8a130b7857a41c386e3b5c0e21"
+"src/native_slots_factory.jl" = "58208f07e6c86a3478e1c6f217f48c7cb25789198ecedbea27d8ea60580ca532"
+"ext/ReactiveKernelsReactantExt/traced_slot_compiler.jl" = "3411dd0de1a9da07f9dddf185f8a48a6a8145a9203aeb141cbafe98f822a7b26"
+"ext/ReactiveKernelsReactantExt/traced_slots.jl" = "104236be06db0b673db3ffc9e8aa44e1eef84187db4431da32253a1bdcdb8ee7"
+"benchmark/sampler_transpiler/scalar_argument_probe.jl" = "277492fefac36afa9dce6b96f1510137dcd3eda1eb0ef97e44874a5300b0b47b"

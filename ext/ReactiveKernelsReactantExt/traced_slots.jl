@@ -418,7 +418,7 @@ function compile_traced_slots(program; static_currentness=true, unroll_limit=0)
         _ts_counter_1=counts[1]
         _ts_counter_2=counts[2]
         $loop
-        (; state=$result,seed=argument.seed,counts=(_ts_counter_1,_ts_counter_2))
+        (; state=$result,argument,counts=(_ts_counter_1,_ts_counter_2))
     end)
     clone_ast(x)=x isa Expr ? Expr(x.head,(clone_ast(a) for a in x.args)...) : x
     expanded=macroexpand(@__MODULE__,clone_ast(expression))
@@ -472,5 +472,9 @@ Reactant.make_tracer(seen, previous::TracedSlotCall, path, mode; kwargs...) = pr
 Reactant.traced_type_inner(::Type{T}, seen, mode::Reactant.TraceMode,
     track_numbers::Type, ndevices, runtime) where {T<:TracedSlotCall} = T
 function (program::TracedSlotCall)(state,seed,counts)
-    program.f(state,Reactant.ReactantRNG(seed),counts,program.metadata)
+    # RNG packing belongs to this caller adapter. The emitted finite MethodIR
+    # function accepts and returns its ordinary runtime argument unchanged in
+    # representation, including any source-visible effects on that argument.
+    result=program.f(state,Reactant.ReactantRNG(seed),counts,program.metadata)
+    (;state=result.state,seed=result.argument.seed,counts=result.counts)
 end
