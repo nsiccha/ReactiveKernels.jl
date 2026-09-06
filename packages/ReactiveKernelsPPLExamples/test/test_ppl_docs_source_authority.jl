@@ -23,6 +23,10 @@ const PPL_SOURCE_CASES = (
      :MNIST_LOGISTIC_SOURCE, :evaluate_mnist_logistic_source),
     ("mnist-logistic.md", "mnist_logistic.jl", MNISTLogisticExample,
      :MNIST_LOGISTIC_OPTIMIZED_SOURCE, :evaluate_mnist_logistic_optimized_source),
+    ("mvnormal-regression.md", "mvnormal_regression.jl", MVNormalRegressionExample,
+     :MVNORMAL_REGRESSION_SOURCE, :evaluate_mvnormal_regression_source),
+    ("bound-regression.md", "bound_regression.jl", BoundRegressionExample,
+     :BOUND_REGRESSION_SOURCE, :evaluate_bound_regression_source),
 )
 
 # One displayed/executed authority kernel per registered case: a file carrying
@@ -95,6 +99,8 @@ end
         :gaussian_mixture_density,
         :mnist_logistic_density,
         :mnist_logistic_optimized_density,
+        :mvnormal_regression_density,
+        :bound_regression_density,
     )
         @test occursin(":" * string(name), helper_source)
     end
