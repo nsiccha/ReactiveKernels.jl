@@ -1,5 +1,20 @@
 # HMC / Eight Schools transpiler prototype
 
+The current public source-and-results walkthrough is
+[Multinomial HMC from reactive mathematical source](https://nsiccha.github.io/ReactiveKernels.jl/dev/hmc-transpiler).
+It includes the native/Reactant throughput checkpoint and the separately measured
+Reactant.ProbProg endpoint-HMC reference. `probprog_hmc_scaling.jl` uses the same
+RK density and fixed integration workload, disables adaptation, supplies initial
+potential/gradient outside timing, and returns only final position/RNG. ProbProg
+uses endpoint Metropolis acceptance; the current RK source uses multinomial
+selection. The `probprog-hmc-scaling-v1.csv`/TOML keep all 42 execution replicates,
+six process-ordered compilation rows, and the emitted-loop count evidence.
+The ProbProg run is a later process on the same host, not interleaved with the
+earlier RK/AdvancedHMC samples. Its first compile takes 21.86 seconds; the five
+later compilations take 0.52–0.61 seconds. At 10,000 transitions the median is
+0.79 μs (four steps) and 1.54 μs (sixteen steps). Run it with a 600-second
+subprocess budget, as shown on the public page.
+
 This executable prototype connects the existing reactive mathematical HMC and
 leapfrog sources to the generic compiler and the bound Eight Schools density.
 It reports preparation, compilation, and warm execution separately. The current

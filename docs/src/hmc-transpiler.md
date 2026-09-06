@@ -42,6 +42,17 @@ acceptance statistics; this minimal kernel streams selection and omits those
 statistics. The measurements cover fixed integration work, without adaptation,
 chain history or effective-sample-size estimates.
 
+The ProbProg column uses Reactant's own `mcmc_logpdf(...; algorithm=:HMC)` with
+**endpoint Metropolis acceptance**, rather than multinomial selection. It uses
+the same density, metric, step size and leapfrog counts, with adaptation off,
+initial potential/gradient supplied outside timing, and only the final position
+and RNG returned. Its seven timing replicates were measured in a later process
+on the same host, separately from the RK/AdvancedHMC pairs. This supplies a
+native Reactant implementation reference; it is not an identical sampler.
+The [ProbProg receipt](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/sampler_transpiler/probprog-hmc-scaling-v1.toml)
+and [42 raw execution samples](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/sampler_transpiler/probprog-hmc-scaling-v1.csv)
+retain the algorithm distinction, emitted-loop work accounting and source hashes.
+
 The complete chain executes in **one synchronized Reactant call**, including
 gradients and random draws. Preparation, input resets and compilation are outside
 execution timing. Both generated backends beat the strongest paired AdvancedHMC
@@ -74,6 +85,8 @@ records both measurements and emitted-HLO evidence.
 
 **Cold Reactant compilation still takes about 44 seconds.** Later compilations
 in the same process reuse emitted Julia code and are measured separately.
+ProbProg's first compilation in its measurement process takes 21.86 seconds;
+its five subsequent compilations take 0.52–0.61 seconds.
 
 ## Reproduce and current limits
 
@@ -81,6 +94,7 @@ in the same process reuse emitted Julia code and are measured separately.
 julia benchmark/sampler_transpiler/setup.jl
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/position_multinomial_scaling.jl /absolute/output.csv
 julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/cpu_loop_packing.jl /absolute/ablation-directory
+timeout --signal=TERM --kill-after=15s 600s julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/probprog_hmc_scaling.jl /absolute/probprog.csv
 ```
 
 The compiler assumes fixed types, array shapes, call graph and compiler-known
