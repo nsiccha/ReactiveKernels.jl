@@ -13,6 +13,10 @@ include("glm_poisson.jl")
 include("glm_binomial.jl")
 include("eight_schools_noncentered.jl")
 include("glmm_poisson.jl")
+include("kidscore_momhs.jl")
+include("kidscore_momiq.jl")
+include("kidscore_momhsiq.jl")
+include("kidscore_interaction.jl")
 include("dugongs_growth.jl")
 include("arma11.jl")
 include("gaussian_mixture.jl")
@@ -46,6 +50,10 @@ export GLMPoissonExample
 export GLMBinomialExample
 export EightSchoolsNoncenteredExample
 export GLMMPoissonExample
+export KidscoreMomhsExample
+export KidscoreMomiqExample
+export KidscoreMomhsiqExample
+export KidscoreInteractionExample
 export DugongsGrowthExample
 export ARMA11Example
 export GaussianMixtureExample

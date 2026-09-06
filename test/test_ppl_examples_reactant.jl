@@ -11,6 +11,10 @@ using ReactiveKernelsPPLExamples.GLMBinomialExample: evaluate_glm_binomial_sourc
 using ReactiveKernelsPPLExamples.EightSchoolsNoncenteredExample:
     evaluate_eight_schools_noncentered_source
 using ReactiveKernelsPPLExamples.GLMMPoissonExample: evaluate_glmm_poisson_source
+using ReactiveKernelsPPLExamples.KidscoreMomhsExample: evaluate_kidscore_momhs_source
+using ReactiveKernelsPPLExamples.KidscoreMomiqExample: evaluate_kidscore_momiq_source
+using ReactiveKernelsPPLExamples.KidscoreMomhsiqExample: evaluate_kidscore_momhsiq_source
+using ReactiveKernelsPPLExamples.KidscoreInteractionExample: evaluate_kidscore_interaction_source
 using ReactiveKernelsPPLExamples.BetaBinomialExample: evaluate_beta_binomial_source
 using ReactiveKernelsPPLExamples.DugongsGrowthExample: evaluate_dugongs_source
 using ReactiveKernelsPPLExamples.GaussianMixtureExample: evaluate_gaussian_mixture_source
@@ -85,6 +89,22 @@ end
     end
     @testset "glmm_poisson (posteriordb; hierarchical Poisson-log + random effects)" begin
         a = evaluate_glmm_poisson_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "kidscore_momhs (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_kidscore_momhs_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "kidscore_momiq (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_kidscore_momiq_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "kidscore_momhsiq (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_kidscore_momhsiq_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "kidscore_interaction (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_kidscore_interaction_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
     @testset "beta_binomial" begin

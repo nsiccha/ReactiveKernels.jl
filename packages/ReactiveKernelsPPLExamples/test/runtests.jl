@@ -5,6 +5,7 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     LinearRegressionExample, BetaBinomialExample, PoissonGammaExample,
     GLMPoissonExample, GLMBinomialExample, EightSchoolsNoncenteredExample,
     GLMMPoissonExample,
+    KidscoreMomhsExample, KidscoreMomiqExample, KidscoreMomhsiqExample, KidscoreInteractionExample,
     DugongsGrowthExample, ARMA11Example, GaussianMixtureExample,
     MNISTLogisticExample, MVNormalRegressionExample, BoundRegressionExample
 using Test
@@ -20,6 +21,10 @@ include("test_glm_poisson_example.jl")
 include("test_glm_binomial_example.jl")
 include("test_eight_schools_noncentered_example.jl")
 include("test_glmm_poisson_example.jl")
+include("test_kidscore_momhs_example.jl")
+include("test_kidscore_momiq_example.jl")
+include("test_kidscore_momhsiq_example.jl")
+include("test_kidscore_interaction_example.jl")
 include("test_dugongs_example.jl")
 include("test_arma11_example.jl")
 include("test_gaussian_mixture_example.jl")
