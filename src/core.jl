@@ -175,23 +175,31 @@ end
         collect(bc) : Base.materialize(bc)
 end
 
-# `LinearAlgebra.dot(a, b)` does not lower under a tracing backend when an operand
-# is a host array — it routes through `conj` on the host vector (`MethodError: no
-# method matching conj(::Vector)`), and a mixed host/traced dot never reaches the
-# traced program.  For REAL operands `dot(a,b) == sum(a .* b)`, so normalize the
-# `@kernel` tensorized body to that single reduction over the promoted broadcast
-# (RK-macro-only per decision `17bnc6t`; the friendly form the Reactant benchmark
-# authored by hand).  This is value-exact for real operands, so it never silently
-# mis-lowers.  COMPLEX operands are a LOUD error, never rewritten: `dot` conjugates
-# its FIRST argument, so `sum(a.*b)` would silently corrupt a complex-valued
-# result/gradient — keep such a dot on the native path instead.
+# `LinearAlgebra.dot(a, b)` with a MIXED host-array × traced operand does not lower
+# under a tracing backend: it routes through `conj` on the host vector
+# (`MethodError: no method matching conj(::Vector)`).  ONLY that mix is a problem —
+# a pure-host dot is ordinary Base, and a pure-traced `dot(q, q)` has the backend's
+# own (replica-aware, see `replica`) lowering that existing Reactant kernels rely
+# on.  So `_tensorized_dot` DEFAULTS to the native `dot` for every case, and a
+# tracing extension specializes ONLY the host-array × traced mix onto
+# `_tensorized_normalized_dot` below.  Per user decision `17bnc6t` this normalizes
+# in the `@kernel` lowering, not in Reactant.
+@inline _tensorized_dot(a, b) = LinearAlgebra.dot(a, b)
+
 # Whether a tensorized-dot operand carries a REAL scalar type.  The default reads
 # the element type directly (host arrays/scalars); a tracing backend specializes
 # it to see through its traced scalar wrapper — a `TracedRArray{Float64}`'s
 # `eltype` is `TracedRNumber{Float64}`, not `Float64`, so a bare `eltype <: Real`
 # would misclassify a real traced operand as complex.
 @inline _tensorized_real_operand(x) = eltype(x) <: Real
-@inline function _tensorized_dot(a, b)
+
+# Normalize the mixed host/traced dot to the value-identical `sum(a .* b)`
+# reduction over the promoted broadcast (the friendly form the Reactant benchmark
+# authored by hand), so authors can write `dot(data, q)` in the kernel body.
+# Value-exact for REAL operands, so it never silently mis-lowers.  COMPLEX
+# operands are a LOUD error, never rewritten: `dot` conjugates its FIRST argument,
+# so `sum(a .* b)` would silently corrupt a complex-valued result/gradient.
+@inline function _tensorized_normalized_dot(a, b)
     (_tensorized_real_operand(a) && _tensorized_real_operand(b)) ||
         throw(ArgumentError(
             "dot(a, b) over complex operands is not lowerable to a tensorized " *

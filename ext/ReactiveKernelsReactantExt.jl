@@ -871,12 +871,23 @@ end
 # A traced array/scalar's `eltype` is the traced number wrapper
 # (`TracedRArray{Float64}` -> `TracedRNumber{Float64}`), so the core
 # `eltype <: Real` default cannot see the underlying real/complex kind.  Read the
-# wrapped scalar type parameter directly so `_tensorized_dot` classifies traced
-# real operands correctly (and still LOUD-errors genuine complex ones).
+# wrapped scalar type parameter directly so the dot normalization classifies
+# traced real operands correctly (and still LOUD-errors genuine complex ones).
 @inline ReactiveKernels._tensorized_real_operand(
     ::Reactant.TracedRArray{T}) where {T} = T <: Real
 @inline ReactiveKernels._tensorized_real_operand(
     ::Reactant.TracedRNumber{T}) where {T} = T <: Real
+
+# ONLY the mixed host-array × traced `dot` fails to lower (conj on the host
+# vector); normalize exactly that mix to `sum(a .* b)`.  A pure-traced
+# `dot(q, q)` keeps the core default (native `LinearAlgebra.dot`, replica-aware),
+# so existing Reactant kernels are unaffected.
+@inline ReactiveKernels._tensorized_dot(
+        a::Array, b::Reactant.TracedRArray) =
+    ReactiveKernels._tensorized_normalized_dot(a, b)
+@inline ReactiveKernels._tensorized_dot(
+        a::Reactant.TracedRArray, b::Array) =
+    ReactiveKernels._tensorized_normalized_dot(a, b)
 
 # Batched slice-collection plates preserve eachcol structurally in the core.
 # Move the observation axis to the leading batch dimension and lower the
