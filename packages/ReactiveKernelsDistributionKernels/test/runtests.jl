@@ -1,5 +1,6 @@
-using Distributions: Bernoulli, Cauchy, Exponential, Geometric, Laplace,
-    LogNormal, MvNormal, Normal, Uniform, cdf, logpdf, quantile
+using Distributions: Bernoulli, Cauchy, Dirichlet, Exponential, Geometric,
+    InverseGamma, Laplace, LogNormal, MvNormal, Normal, Uniform,
+    cdf, logpdf, quantile
 using LinearAlgebra: Symmetric, cholesky
 using ReactiveKernels: @kernel, KernelObjectSpec, KernelSpec, code_expr, extract,
     plan, plate, prepare
@@ -11,9 +12,11 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     EXPONENTIAL_KERNEL_SOURCE, GEOMETRIC_KERNEL_SOURCE, UNIFORM_KERNEL_SOURCE,
     MVNORMAL_KERNEL_SOURCE, AR1_KERNEL_SOURCE,
     CATEGORICAL_LOGIT_KERNEL_SOURCE, CATEGORICAL_LOGIT_REF_KERNEL_SOURCE,
+    INVERSE_GAMMA_KERNEL_SOURCE, DIRICHLET_KERNEL_SOURCE,
     normal, cauchy, laplace, bernoulli, lognormal,
     exponential, geometric, uniform, mvnormal, ar1,
     categorical_logit, categorical_logit_ref,
+    inverse_gamma, dirichlet,
     NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY
 using Test
 
@@ -198,5 +201,57 @@ end
         quantile_plan = plan(normal.quantile)
         @test :x in outputs_of(quantile_plan)
         @test !(:standardized in outputs_of(quantile_plan))
+    end
+end
+
+@testset "inverse_gamma and dirichlet conjugate-prior objects" begin
+    @test hasproperty(inverse_gamma, :logpdf)
+    @test hasproperty(dirichlet, :logpdf)
+    @test occursin("@kernel inverse_gamma(", INVERSE_GAMMA_KERNEL_SOURCE)
+    @test occursin("@kernel dirichlet(", DIRICHLET_KERNEL_SOURCE)
+    @test all(source -> !occursin("@recipe", source),
+        (INVERSE_GAMMA_KERNEL_SOURCE, DIRICHLET_KERNEL_SOURCE))
+
+    @testset "Inverse-Gamma-Normal variance prior" begin
+        shape, scale, x, p = 3.0, 2.0, 1.4, 0.6
+        reference = InverseGamma(shape, scale)
+        # Scale and log-scale are authoritative HAVE routes for one graph.
+        @test prepare(inverse_gamma.logpdf;
+            have = (:x, :shape, :scale), want = :logpdf)(x, shape, scale) ≈
+            logpdf(reference, x)
+        @test prepare(inverse_gamma.logpdf;
+            have = (:x, :shape, :log_scale), want = :logpdf)(
+                x, shape, log(scale)) ≈ logpdf(reference, x)
+        @test prepare(inverse_gamma.cdf;
+            have = (:x, :shape, :scale), want = :cdf)(x, shape, scale) ≈
+            cdf(reference, x)
+        @test prepare(inverse_gamma.quantile;
+            have = (:p, :shape, :scale), want = :quantile)(p, shape, scale) ≈
+            quantile(reference, p)
+        # Domain guard: non-positive support is -Inf without control flow.
+        @test prepare(inverse_gamma.logpdf;
+            have = (:x, :shape, :scale), want = :logpdf)(-1.0, shape, scale) ==
+            -Inf
+        # Lifts through the generic plate path; the compiled kernel is
+        # Distributions.jl-free.
+        plated = plate(inverse_gamma.logpdf;
+            have = (:x, :shape, :log_scale), want = :logpdf, batched = (:x,))
+        observations = [0.6, 1.4, 2.2, 3.1]
+        @test plated(observations, shape, log(scale)) ≈
+            sum(logpdf(reference, xi) for xi in observations)
+        @test !occursin("Distributions", string(code_expr(plated)))
+    end
+
+    @testset "Dirichlet-Categorical/Multinomial simplex prior" begin
+        alpha = [2.0, 3.0, 1.5]
+        x = [0.2, 0.5, 0.3]
+        reference = Dirichlet(alpha)
+        # One whole-vector graph (like mvnormal), not a scalar plate.
+        kernel = prepare(dirichlet.logpdf; have = (:x, :alpha), want = :logpdf)
+        @test kernel(x, alpha) ≈ logpdf(reference, x)
+        # Off the positive orthant the density guard returns -Inf.
+        @test kernel([-0.1, 0.6, 0.5], alpha) == -Inf
+        @test occursin("@kernel dirichlet", DIRICHLET_KERNEL_SOURCE)
+        @test !occursin("Distributions", string(code_expr(kernel)))
     end
 end
