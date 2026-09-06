@@ -41,6 +41,7 @@ count!(n, x) = (hit!(n); x)   # tick a counter, return the value
 # Data sufficient statistics + hyperparameters + parameter blocks are SOURCE
 # values; every conditional-input quantity is a recipe with an explicit,
 # instrumented op. `:E` = data-touching O(p²) op, `:c` = cheap O(p) op.
+# BEGIN GIBBS_SSVS_GRAPH
 function build_ssvs_graph()
     g = Graph()
     # data suff-stats (never change)
@@ -89,6 +90,7 @@ function build_ssvs_graph()
     (; g, XtX, Xty, yty, t2spk, t2slb, bsig, beta, zind, omega, sig2,
        dprec, beta_prec, beta_rhs, ssr, sumz, zlo)
 end
+# END GIBBS_SSVS_GRAPH
 
 # ---- the Gibbs sampler, driven by the reactive graph ------------------------
 function rk_gibbs(X, y; iters, rng, a0, b0, a_sig, b_sig, t2_spike, t2_slab,
