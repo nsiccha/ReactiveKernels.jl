@@ -199,7 +199,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
         Yr = LinearRegressionExample.LINREG_Y
         ref_density = prepare(lr_ref;
             have = (:unconstrained, :predictors, :responses),
-            want = :density)((1.0, 2.0, log(0.5)), X, Yr)
+            want = :density)([1.0, 2.0, log(0.5)], X, Yr)
 
         @ppl lr(predictors::Vector{Float64}, responses::Vector{Float64}) = begin
             alpha ~ normal(0.0, 10.0)

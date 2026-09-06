@@ -239,13 +239,11 @@ function setup_linear_regression!(mod::Module)
     if !isdefined(mod, :LinearRegressionExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: LinearRegressionExample))
     end
+    # Bind only the data. The displayed PPL assembly imports and reuses the
+    # shared `normal` distribution object directly; no helper evaluator, factor,
+    # or separately prepared density/plate is injected.
     Core.eval(mod, :(using .LinearRegressionExample:
-        LinearRegressionParameters, LinearPrediction,
-        DataVector, UnconstrainedParameters,
-        LINREG_X, LINREG_Y,
-        split_unconstrained, positive_scale, assemble_parameters,
-        log_abs_det_jacobian, log_prior, pointwise_log_likelihood,
-        sum_log_likelihood, total_log_density, predict_new))
+        LINREG_X, LINREG_Y))
     nothing
 end
 
@@ -253,12 +251,10 @@ function setup_beta_binomial!(mod::Module)
     if !isdefined(mod, :BetaBinomialExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: BetaBinomialExample))
     end
+    # Bind only the data. The displayed PPL assembly imports and reuses the
+    # shared `beta` and `binomial` distribution objects directly.
     Core.eval(mod, :(using .BetaBinomialExample:
-        BetaBinomialParameters, CountVector,
-        BETA_BINOMIAL_TRIALS, BETA_BINOMIAL_SUCCESSES,
-        logistic, assemble_parameters, log_abs_det_jacobian,
-        log_prior, pointwise_log_likelihood, sum_log_likelihood,
-        total_log_density, expected_successes))
+        BETA_BINOMIAL_TRIALS, BETA_BINOMIAL_SUCCESSES))
     nothing
 end
 
@@ -266,11 +262,9 @@ function setup_poisson_gamma!(mod::Module)
     if !isdefined(mod, :PoissonGammaExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: PoissonGammaExample))
     end
-    Core.eval(mod, :(using .PoissonGammaExample:
-        PoissonGammaParameters, CountVector, POISSON_COUNTS,
-        positive_rate, assemble_parameters, log_abs_det_jacobian,
-        log_prior, pointwise_log_likelihood, sum_log_likelihood,
-        total_log_density, expected_count))
+    # Bind only the data. The displayed PPL assembly imports and reuses the
+    # shared `gamma` and `poisson` distribution objects directly.
+    Core.eval(mod, :(using .PoissonGammaExample: POISSON_COUNTS))
     nothing
 end
 
@@ -278,13 +272,9 @@ function setup_dugongs!(mod::Module)
     if !isdefined(mod, :DugongsGrowthExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: DugongsGrowthExample))
     end
-    Core.eval(mod, :(using .DugongsGrowthExample:
-        DugongsParameters, UnconstrainedParameters, RealVector,
-        DUGONGS_AGE, DUGONGS_LENGTH,
-        split_unconstrained, bounded_lambda, sd_from_log_precision,
-        assemble_parameters, log_abs_det_jacobian, log_prior,
-        pointwise_log_likelihood, sum_log_likelihood,
-        fused_log_likelihood, total_log_density, predicted_length))
+    # Bind only the data. The displayed PPL assembly imports and reuses the
+    # shared `normal`, `uniform`, and `gamma` distribution objects directly.
+    Core.eval(mod, :(using .DugongsGrowthExample: DUGONGS_AGE, DUGONGS_LENGTH))
     nothing
 end
 
@@ -292,12 +282,10 @@ function setup_arma11!(mod::Module)
     if !isdefined(mod, :ARMA11Example)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: ARMA11Example))
     end
-    Core.eval(mod, :(using .ARMA11Example:
-        ARMAParameters, UnconstrainedParameters, RealVector, ARMA_SERIES,
-        split_unconstrained, positive_scale, assemble_parameters,
-        log_abs_det_jacobian, arma_errors, log_prior,
-        pointwise_log_likelihood, sum_log_likelihood,
-        total_log_density, one_step_forecast))
+    # Bind only the data. The displayed PPL assembly imports and reuses the
+    # shared `normal` and `cauchy` distribution objects directly and authors the
+    # error recursion inline; no helper evaluator is injected.
+    Core.eval(mod, :(using .ARMA11Example: ARMA_SERIES))
     nothing
 end
 
@@ -305,12 +293,33 @@ function setup_gaussian_mixture!(mod::Module)
     if !isdefined(mod, :GaussianMixtureExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: GaussianMixtureExample))
     end
-    Core.eval(mod, :(using .GaussianMixtureExample:
-        MixtureParameters, UnconstrainedParameters, RealVector,
-        MIXTURE_OBSERVATIONS, split_unconstrained, ordered_means,
-        exp_scale, logistic, assemble_parameters, log_abs_det_jacobian,
-        log_prior, pointwise_log_likelihood, sum_log_likelihood,
-        fused_log_likelihood, total_log_density, component1_responsibility))
+    # Bind only the data. The displayed PPL assembly imports and reuses the
+    # shared `normal` and `beta` objects and the LogExpFunctions log-sum-exp
+    # directly.
+    Core.eval(mod, :(using .GaussianMixtureExample: MIXTURE_OBSERVATIONS))
+    nothing
+end
+
+function setup_mvnormal_regression!(mod::Module)
+    if !isdefined(mod, :MVNormalRegressionExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: MVNormalRegressionExample))
+    end
+    # Bind only the data referenced by the displayed covariance-path query. The
+    # displayed PPL assembly imports and reuses the shared `normal` and
+    # `mvnormal` distribution objects directly.
+    Core.eval(mod, :(using .MVNormalRegressionExample:
+        MVREG_X, MVREG_Y, MVREG_COVARIANCE))
+    nothing
+end
+
+function setup_bound_regression!(mod::Module)
+    if !isdefined(mod, :BoundRegressionExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: BoundRegressionExample))
+    end
+    # Bind only the data. The displayed PPL assembly imports and reuses the
+    # shared `normal` distribution object directly and authors the
+    # standardization prefix inline.
+    Core.eval(mod, :(using .BoundRegressionExample: BOUND_RAW_X, BOUND_Y))
     nothing
 end
 
@@ -722,6 +731,8 @@ const EXPECTED_PPL_EXAMPLES = (
     :gaussian_mixture_density,
     :mnist_logistic_density,
     :mnist_logistic_optimized_density,
+    :mvnormal_regression_density,
+    :bound_regression_density,
 )
 const _PPL_EXECUTION_COUNTS = Dict(name => 0 for name in EXPECTED_PPL_EXAMPLES)
 
