@@ -35,7 +35,7 @@ function _run_pinned_comparison()
         # (test/run_nonallocating_integration.jl).
         Pkg.add(Pkg.PackageSpec(
             url = "https://github.com/nsiccha/MutatingFunctions.jl",
-            rev = "b353559ef3e391ae2e2d98256b6967903fdfa410"))
+            rev = "4fc41b1c7b774133ceaacc4ff3c34c67b15b87b2"))
         Pkg.develop([
             Pkg.PackageSpec(path = root),
             Pkg.PackageSpec(path = joinpath(
