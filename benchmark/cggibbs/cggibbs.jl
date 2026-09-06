@@ -156,4 +156,7 @@ function main()
     println("="^70)
 end
 
-main()
+# Run standalone; stay quiet when included (e.g. by cggibbs_vs_nuts.jl).
+if abspath(PROGRAM_FILE) == @__FILE__
+    main()
+end

@@ -15,17 +15,23 @@ Per the user's steer, the rk kernels here are **authored directly** (not via the
 
 ## Status
 
-**Increment 1 (this commit):** correct CGGibbs coordinate slice sampler with the
-cached linear predictor, on synthetic logistic data. The per-coordinate
-conditional log-density is authored as an rk graph/kernel (prepared once,
-evaluated by the slice sampler). Not yet: the reusable-package extraction, the
-real datasets, and the Stan-NUTS comparison (see **Next**).
+- **Increment 1** (`cggibbs.jl`): correct CGGibbs coordinate slice sampler with the
+  cached linear predictor, on synthetic logistic data. The per-coordinate
+  conditional log-density is authored as an rk graph/kernel.
+- **Increment 2** (`cggibbs_vs_nuts.jl`): the paper's headline head-to-head —
+  CGGibbs vs **NUTS** (AdvancedHMC, repo-faithful setup) on bulk-ESS/second. See
+  **Head-to-head** below — the honest result is that single-site CGGibbs *loses*
+  to NUTS in this synthetic regime.
+
+Not yet: an optimized (non-allocating) conditional eval + blocking, the reusable
+`ReactiveKernelsSamplers` extraction, and the paper's real datasets (see **Next**).
 
 ## Run
 
 ```sh
 julia --startup-file=no benchmark/cggibbs/setup.jl
 julia --startup-file=no --project=benchmark/cggibbs benchmark/cggibbs/cggibbs.jl
+julia --startup-file=no --project=benchmark/cggibbs benchmark/cggibbs/cggibbs_vs_nuts.jl
 ```
 
 ## Measured (this environment)
@@ -49,6 +55,40 @@ julia --startup-file=no --project=benchmark/cggibbs benchmark/cggibbs/cggibbs.jl
   The win is modest at small `d` because the shared per-coordinate conditional
   evaluation (an allocating rk kernel call, O(n)) dominates the cache saving;
   it grows as the O(nd²) predictor recompute takes over.
+
+## Head-to-head vs NUTS — bulk-ESS/second (`cggibbs_vs_nuts.jl`)
+
+The paper's actual question. NUTS is AdvancedHMC 0.8.6 with the repo's setup
+(`MultinomialTS` + `GeneralisedNoUTurn` + `StanHMCAdaptor`); ESS is
+`MCMCDiagnosticTools` bulk ESS; both sample the same logistic posterior
+(2000 draws, 1000 warmup, weakly-correlated synthetic X).
+
+| n | d | sampler | min ESS | sec | min-ESS/s | vs NUTS |
+|--:|--:|--|--:|--:|--:|--:|
+| 500 | 20 | NUTS | 2494 | 0.6 | 4172 | — |
+| 500 | 20 | CGGibbs | 822 | 1.8 | 465 | 0.11× |
+| 500 | 100 | NUTS | 917 | 1.2 | 776 | — |
+| 500 | 100 | CGGibbs | 196 | 7.4 | 26 | 0.03× |
+| 400 | 300 | NUTS | 1669 | 46 | 36 | — |
+| 400 | 300 | CGGibbs | 6 | 10 | 0.6 | ⚠ not converged |
+
+**Honest reading — single-site CGGibbs loses to NUTS here.** Two distinct causes,
+one algorithmic and one implementational:
+
+- **Mixing (algorithmic).** Coordinate-at-a-time Gibbs mixes worse than NUTS on
+  correlated logistic posteriors (≈3× fewer ESS at d=20), and at d=300 it
+  collapses (ESS 6, posterior means disagree with NUTS by ~4 → not converged).
+  The remedy is **blocking** (update correlated groups jointly), which the paper's
+  winning regimes rely on.
+- **Speed (implementational).** CGGibbs is also ~3× slower per unit here because
+  the conditional eval is an allocating rk kernel. An optimized (non-allocating)
+  eval would roughly close the *speed* gap at low d — at d=20, 822 ESS in ~0.18 s
+  would be ≈NUTS — but not the mixing gap.
+
+So this is **not** "RK makes Gibbs beat HMC". It shows RK can run a faithful
+head-to-head, and that a naive single-site CGGibbs on weakly-correlated data is
+the wrong end of the paper's story. Whether CGGibbs wins requires the paper's
+regime (real GLM datasets), an optimized eval, and blocking — the next steps.
 
 ## Honest note on "RK gives CGGibbs for free"
 
@@ -77,11 +117,15 @@ kernel** is the model-coupling (here logistic; from the PPL layer in general).
 
 ## Next
 
-1. Sharpen the conditional eval (rk non-allocating / prepared path) and show the
-   stateful `mutate!` rank-1 `η` cache.
-2. Extract the generic Gibbs kernel (sweep + slice-within-Gibbs + conjugate-draw)
-   into `packages/ReactiveKernelsSamplers`.
-3. The paper's 8 public datasets (newsgroups, gene-expression, colon cancer,
-   Guyon).
-4. Benchmark vs **Stan NUTS** (provisioned BridgeStan): ESS/sec, time-to-median-
-   ESS-100.
+Reordered by what the head-to-head showed matters most:
+
+1. **Blocking** — the algorithmic gap. Update correlated coefficient groups
+   jointly (a block conditional handle, HMC/slice within each block) so mixing is
+   competitive at higher d. This is the model-agnostic kernel work.
+2. **Optimize the conditional eval** — rk non-allocating / prepared path, and the
+   stateful `mutate!` rank-1 `η` cache; closes the *speed* gap.
+3. **The paper's real datasets** (gene-expression, colon cancer 62×2000, Guyon) —
+   the regimes where CGGibbs is reported to win; re-run the head-to-head there.
+4. Extract the generic Gibbs kernel (sweep + within-block transitions +
+   conjugate-draw) into `packages/ReactiveKernelsSamplers` (decision `1n5b20l`).
+5. Optionally add **Stan NUTS** via BridgeStan as a further baseline.
