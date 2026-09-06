@@ -78,8 +78,14 @@ function naive_sweep!(rng, theta, X, y, s0sq, cond)
 end
 
 # ---- synthetic logistic data --------------------------------------------------
-function make_logistic(rng; n, d, k, snr = 3.0)
+# `rho` adds a shared latent factor to every predictor → pairwise correlation ≈ rho
+# (a proxy for the paper's collinear gene-expression regime).
+function make_logistic(rng; n, d, k, snr = 3.0, rho = 0.0)
     X = randn(rng, n, d)
+    if rho > 0
+        f = randn(rng, n)
+        X .= sqrt(rho) .* f .+ sqrt(1 - rho) .* X
+    end
     for jj in 1:d; X[:, jj] .-= mean(X[:, jj]); X[:, jj] ./= std(X[:, jj]); end
     active = sort!(randperm(rng, d)[1:k])
     btrue = zeros(d); btrue[active] .= snr .* sign.(randn(rng, k))

@@ -128,4 +128,6 @@ function main_vs()
     println("="^76)
 end
 
-main_vs()
+if abspath(PROGRAM_FILE) == @__FILE__
+    main_vs()
+end

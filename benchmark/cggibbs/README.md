@@ -87,8 +87,36 @@ one algorithmic and one implementational:
 
 So this is **not** "RK makes Gibbs beat HMC". It shows RK can run a faithful
 head-to-head, and that a naive single-site CGGibbs on weakly-correlated data is
-the wrong end of the paper's story. Whether CGGibbs wins requires the paper's
-regime (real GLM datasets), an optimized eval, and blocking — the next steps.
+the wrong end of the paper's story.
+
+### Fair long-chain check (`regime_fairness.jl`)
+
+Does CGGibbs win once it exploits its cheap-sweep advantage (long chains) and in a
+correlated / n<d regime (closer to the paper's gene-expression setting)? Given
+CGGibbs warmup 5k→20k and 10k→40k draws:
+
+| case | NUTS ESS/s | CGGibbs ESS/s (long chain) | still winning? |
+|--|--:|--:|--|
+| n=60, d=200, ρ=0.6 | 275 | ~41 | NUTS 6.7× |
+| n=200, d=100, ρ=0.6 | 114 | ~4 | NUTS 25× |
+
+Two robust facts fall out: **CGGibbs's ESS/second is a stable rate** (≈41 and ≈4
+regardless of chain length — running longer buys proportional ESS *and* time, so
+the rate doesn't improve), and **it converges very slowly** on these correlated
+posteriors (posterior means still ~0.6 off NUTS after 60k sweeps). So the cheap
+O(d) sweeps do **not** compensate for poor single-site mixing.
+
+### Bottom line (honest)
+
+For a **faithful single-site slice-within-Gibbs**, the answer to the paper's title
+on these logistic problems is **no — NUTS wins on ESS/second by ~6–25×**, robustly
+and even with every fair advantage. The CGGibbs O(d) caching is real (2.6–3.1×
+per-sweep vs naive) but per-sweep *mixing* is the binding constraint. This does
+**not refute the paper** — its reported wins likely rely on techniques this
+increment does not yet include (adaptation, blocking, or specific dataset
+structure) — but it does refute the easy story that rk's reactive graph makes
+Gibbs beat HMC for free. What RK unambiguously delivered: an easy, faithful,
+rigorous way to *measure* this.
 
 ## Honest note on "RK gives CGGibbs for free"
 
