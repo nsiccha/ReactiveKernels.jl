@@ -265,6 +265,18 @@ against native at large batch sizes. A check of this benchmark environment
 reports Reactant's CPU backend. These timings exclude compilation and input
 preparation and do not establish the cause of the remaining execution gap.
 
+`execution-inspection-v1.toml` records a subsequent optimized-HLO inspection
+and XLA worker trace. Each retained leapfrog iteration has twenty fusion nodes,
+one RNG call and two explicit copies; the trace confirms these operations recur
+inside the compiled loop. The gradient's opposite signs are assembled into two
+vectors, and XLA materializes two small step-size tensors outside that loop.
+These are optimization leads, not measured shares of the execution gap.
+Julia's sampling profiler sees the caller waiting for XLA's worker and cannot
+attribute that worker's cost. XLA tracing sees the worker but slows this small
+run by roughly 23 times, so its nested event durations must not be treated as
+ordinary execution costs. The receipt retains the exact experimental drivers,
+trace counts, source hashes and durable artifact paths.
+
 The internal native emitter accepts `count_steps=false` to omit its diagnostic
 integration counter. Existing drivers keep counting by default. The
 [`counter_ablation.jl`](counter_ablation.jl) experiment alternates counted and
