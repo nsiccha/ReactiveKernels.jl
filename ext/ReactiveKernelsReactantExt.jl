@@ -597,6 +597,36 @@ for RHS in (AbstractVector, AbstractMatrix)
     end
 end
 
+# Reactant's BatchedCholesky (unlike its BatchedSVD) defines no `getproperty`, so a
+# naturally authored `C.L` / `C.U` throws `type BatchedCholesky has no field L`
+# under `@compile`.  Fill that gap in RK's ext (RK-macro-only per decision
+# `17bnc6t` — normalize the factor accessor here, Reactant untouched), mirroring
+# Julia's `LinearAlgebra.Cholesky` `getproperty` semantics and respecting `uplo`.
+# The real fields (`:factors`/`:uplo`/`:info`) fall through to `getfield`, so RK's
+# own accesses and Reactant's internal use are unchanged.  A batched (ndims>2)
+# factor or an unexpected `uplo` is a LOUD error, never a silent mis-lower.
+function Base.getproperty(F::_RKBatchedCholesky, name::Symbol)
+    if name === :U || name === :L || name === :UL
+        factors = getfield(F, :factors)
+        uplo = getfield(F, :uplo)
+        (uplo === 'U' || uplo === 'L') || throw(ArgumentError(
+            "BatchedCholesky.$name: unexpected uplo=$(repr(uplo)); expected 'U' or 'L'."))
+        ndims(factors) == 2 || throw(ArgumentError(
+            "BatchedCholesky.$name: factor access is not lowerable for a batched " *
+            "factor (ndims(factors)=$(ndims(factors))); only a single 2-D " *
+            "factorization is supported — index a single batch element first."))
+        if name === :U
+            return LinearAlgebra.UpperTriangular(uplo === 'U' ? factors : copy(factors'))
+        elseif name === :L
+            return LinearAlgebra.LowerTriangular(uplo === 'L' ? factors : copy(factors'))
+        else # :UL
+            return uplo === 'U' ? LinearAlgebra.UpperTriangular(factors) :
+                                  LinearAlgebra.LowerTriangular(factors)
+        end
+    end
+    return getfield(F, name)
+end
+
 # A Cholesky supplied as compiled state carries source-static `info` metadata,
 # while a Cholesky computed inside a compiled call carries Reactant's traced
 # success flag.  Preserve the former, but let Reactant concretize the latter
