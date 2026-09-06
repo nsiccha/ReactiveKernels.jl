@@ -42,17 +42,21 @@ on it (verified against the `ReactiveKernels:sampling:gibbs` PoC on
   (exact, always accepted): **Beta-Bernoulli, Beta-Binomial, Gamma-Poisson**.
   Closed-form draws use `Random`-only samplers (Marsaglia–Tsang gamma, beta via
   two gammas). Validated against the exact Beta and Gamma posteriors.
+- **Discrete latents** (Gibbs-only): an `@ppl` parameter with a discrete family
+  (`bernoulli`) is a latent carried OUTSIDE the continuous `unconstrained`
+  vector — its own `Bool` HAVE port, no transform/gradient — and sampled by
+  **enumeration** of its full conditional (exact, always accepted). First cut:
+  scalar Bernoulli. Validated against the analytic Bernoulli conditional.
 
-Feasible-conjugacy note (decision `0hvlzvd` resolved "no preference" → my
-recommendation): the recommended set also named Inverse-Gamma-Normal and
-Dirichlet, but `inverse_gamma`/`dirichlet` are absent from
-`ReactiveKernelsDistributionKernels`, so those pairs cannot be authored in `@ppl`
-without the dist-kernels owner adding them (primer finding, not a local
-workaround). Normal-Normal (mean) is dist-feasible but needs linear-predictor
-analysis. Both are deferred.
+`inverse_gamma` and `dirichlet` are now available in
+`ReactiveKernelsDistributionKernels` (added by the distributions lane at the
+authoring lane's request), so `@ppl` accepts an `inverse_gamma` (positive)
+parameter and the Inverse-Gamma-Normal / Dirichlet conjugate pairs are now
+buildable. Normal-Normal (mean) needs linear-predictor analysis (deferred).
 
-Follow-up increments: those deferred conjugate pairs, and reproducing the SSVS
-spike-and-slab example on an `@ppl` model as the acceptance case.
+Follow-up increments toward SSVS (decisions `0hvlzvd` / `0f8thsz`): vector
+discrete latents + conditional priors (`β_j | z_j`), the spike-and-slab
+acceptance model, and the deferred conjugate pairs above.
 """
 module PPLGibbs
 
@@ -145,6 +149,21 @@ function _detect_conjugate(info::PPLMacro.PPLModelInfo, data, block::Symbol)
                           Float64(p.prior_args[2]) + n)
     end
     return nothing
+end
+
+# A discrete latent (support `:discrete`) is sampled by ENUMERATION of its full
+# conditional — never a random walk. Returns the tuple of support values to
+# enumerate, or `nothing` when `block` is not an enumerable discrete latent.
+# First cut: scalar Bernoulli latents ({0, 1}).
+function _detect_discrete(info::PPLMacro.PPLModelInfo, block::Symbol)
+    for pi in info.params
+        pi.name === block || continue
+        pi.support === :discrete || return nothing
+        pi.is_vector && return nothing                 # scalar discrete only (first cut)
+        pi.prior_family === :bernoulli && return (false, true)   # Bernoulli port is Bool
+        return nothing                                 # other discrete families: later
+    end
+    nothing
 end
 
 # Random-walk proposal in a block's UNCONSTRAINING space, returning the proposal
@@ -289,11 +308,18 @@ function gibbs(model; blocks, data, init, iters::Int, rng,
     # jointly conjugate in general). Automatic when `conjugate` is on and the
     # model carries an `@ppl` structure descriptor.
     conj = Dict{Symbol,Union{Nothing,_Conjugate}}(m => nothing for m in members)
-    if conjugate && PPLMacro.has_model_info(model)
+    disc = Dict{Symbol,Any}(m => nothing for m in members)
+    if PPLMacro.has_model_info(model)
         info = PPLMacro.model_info(model)
         for b in spec.blocks
-            if b.sampler === :auto && length(b.members) == 1
-                conj[b.members[1]] = _detect_conjugate(info, data, b.members[1])
+            length(b.members) == 1 || continue
+            m = b.members[1]
+            # A discrete latent MUST be enumerated (never RW), regardless of the
+            # `conjugate` kwarg or a `:rw` override.
+            disc[m] = _detect_discrete(info, m)
+            # Closed-form conjugate draw for a continuous `:auto` block.
+            if disc[m] === nothing && conjugate && b.sampler === :auto
+                conj[m] = _detect_conjugate(info, data, m)
             end
         end
     end
@@ -310,10 +336,34 @@ function gibbs(model; blocks, data, init, iters::Int, rng,
         counted = it > warmup
         for b in spec.blocks
             k = _block_key(b)
-            c = length(b.members) == 1 ? conj[b.members[1]] : nothing
-            if c !== nothing
+            m1 = length(b.members) == 1 ? b.members[1] : nothing
+            d = m1 === nothing ? nothing : disc[m1]
+            c = m1 === nothing ? nothing : conj[m1]
+            if d !== nothing
+                # Exact discrete Gibbs draw: enumerate the full conditional over
+                # the support values and sample the normalized categorical.
+                logps = Float64[]
+                for v in d
+                    set!(st, ports[m1], v)
+                    push!(logps, logtarget())
+                end
+                w = exp.(logps .- maximum(logps))
+                r = rand(rng) * sum(w)
+                acc = 0.0
+                chosen = d[end]
+                for i in eachindex(d)
+                    acc += w[i]
+                    if r <= acc
+                        chosen = d[i]
+                        break
+                    end
+                end
+                set!(st, ports[m1], chosen)
+                cur[m1] = chosen
+                counted && (accepts[k] += 1)
+            elseif c !== nothing
                 # Exact conjugate draw (single-latent block) — always accepted.
-                m = b.members[1]
+                m = m1
                 prop = _draw_conjugate(rng, c)
                 set!(st, ports[m], prop)
                 cur[m] = prop
