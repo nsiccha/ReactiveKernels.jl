@@ -18,6 +18,14 @@ include("kidscore_momiq.jl")
 include("kidscore_momhsiq.jl")
 include("kidscore_interaction.jl")
 include("blr.jl")
+include("mesquite.jl")
+include("logmesquite.jl")
+include("logmesquite_logvolume.jl")
+include("kilpisjarvi.jl")
+include("earn_height.jl")
+include("logearn_height.jl")
+include("log10earn_height.jl")
+include("logearn_interaction.jl")
 include("dugongs_growth.jl")
 include("arma11.jl")
 include("gaussian_mixture.jl")
@@ -56,6 +64,14 @@ export KidscoreMomiqExample
 export KidscoreMomhsiqExample
 export KidscoreInteractionExample
 export BLRExample
+export MesquiteExample
+export LogmesquiteExample
+export LogmesquiteLogvolumeExample
+export KilpisjarviExample
+export EarnHeightExample
+export LogearnHeightExample
+export Log10earnHeightExample
+export LogearnInteractionExample
 export DugongsGrowthExample
 export ARMA11Example
 export GaussianMixtureExample

@@ -12,6 +12,14 @@ using ReactiveKernelsPPLExamples.EightSchoolsNoncenteredExample:
     evaluate_eight_schools_noncentered_source
 using ReactiveKernelsPPLExamples.GLMMPoissonExample: evaluate_glmm_poisson_source
 using ReactiveKernelsPPLExamples.BLRExample: evaluate_blr_source
+using ReactiveKernelsPPLExamples.MesquiteExample: evaluate_mesquite_source
+using ReactiveKernelsPPLExamples.LogmesquiteExample: evaluate_logmesquite_source
+using ReactiveKernelsPPLExamples.LogmesquiteLogvolumeExample: evaluate_logmesquite_logvolume_source
+using ReactiveKernelsPPLExamples.KilpisjarviExample: evaluate_kilpisjarvi_source
+using ReactiveKernelsPPLExamples.EarnHeightExample: evaluate_earn_height_source
+using ReactiveKernelsPPLExamples.LogearnHeightExample: evaluate_logearn_height_source
+using ReactiveKernelsPPLExamples.Log10earnHeightExample: evaluate_log10earn_height_source
+using ReactiveKernelsPPLExamples.LogearnInteractionExample: evaluate_logearn_interaction_source
 using ReactiveKernelsPPLExamples.KidscoreMomhsExample: evaluate_kidscore_momhs_source
 using ReactiveKernelsPPLExamples.KidscoreMomiqExample: evaluate_kidscore_momiq_source
 using ReactiveKernelsPPLExamples.KidscoreMomhsiqExample: evaluate_kidscore_momhsiq_source
@@ -94,6 +102,38 @@ end
     end
     @testset "blr (posteriordb; Bayesian linear regression, matvec)" begin
         a = evaluate_blr_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "mesquite (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_mesquite_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "logmesquite (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_logmesquite_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "logmesquite_logvolume (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_logmesquite_logvolume_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "kilpisjarvi (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_kilpisjarvi_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "earn_height (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_earn_height_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "logearn_height (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_logearn_height_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "log10earn_height (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_log10earn_height_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "logearn_interaction (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_logearn_interaction_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
     @testset "kidscore_momhs (posteriordb; Gaussian linear regression)" begin

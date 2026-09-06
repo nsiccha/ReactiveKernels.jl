@@ -5,6 +5,7 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     LinearRegressionExample, BetaBinomialExample, PoissonGammaExample,
     GLMPoissonExample, GLMBinomialExample, EightSchoolsNoncenteredExample,
     GLMMPoissonExample, BLRExample,
+    MesquiteExample, LogmesquiteExample, LogmesquiteLogvolumeExample, KilpisjarviExample, EarnHeightExample, LogearnHeightExample, Log10earnHeightExample, LogearnInteractionExample,
     KidscoreMomhsExample, KidscoreMomiqExample, KidscoreMomhsiqExample, KidscoreInteractionExample,
     DugongsGrowthExample, ARMA11Example, GaussianMixtureExample,
     MNISTLogisticExample, MVNormalRegressionExample, BoundRegressionExample
@@ -22,6 +23,14 @@ include("test_glm_binomial_example.jl")
 include("test_eight_schools_noncentered_example.jl")
 include("test_glmm_poisson_example.jl")
 include("test_blr_example.jl")
+include("test_mesquite_example.jl")
+include("test_logmesquite_example.jl")
+include("test_logmesquite_logvolume_example.jl")
+include("test_kilpisjarvi_example.jl")
+include("test_earn_height_example.jl")
+include("test_logearn_height_example.jl")
+include("test_log10earn_height_example.jl")
+include("test_logearn_interaction_example.jl")
 include("test_kidscore_momhs_example.jl")
 include("test_kidscore_momiq_example.jl")
 include("test_kidscore_momhsiq_example.jl")
