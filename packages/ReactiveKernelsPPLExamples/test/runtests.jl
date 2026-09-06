@@ -3,7 +3,7 @@ using ReactiveKernelsPPLExamples
 using ReactiveKernelsPPLExamples: EightSchoolsExample,
     SumToZeroExample,
     LinearRegressionExample, BetaBinomialExample, PoissonGammaExample,
-    GLMPoissonExample,
+    GLMPoissonExample, GLMBinomialExample,
     DugongsGrowthExample, ARMA11Example, GaussianMixtureExample,
     MNISTLogisticExample, MVNormalRegressionExample, BoundRegressionExample
 using Test
@@ -16,6 +16,7 @@ include("test_linear_regression_example.jl")
 include("test_beta_binomial_example.jl")
 include("test_poisson_gamma_example.jl")
 include("test_glm_poisson_example.jl")
+include("test_glm_binomial_example.jl")
 include("test_dugongs_example.jl")
 include("test_arma11_example.jl")
 include("test_gaussian_mixture_example.jl")

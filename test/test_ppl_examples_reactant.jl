@@ -7,6 +7,7 @@ using ReactiveKernelsPPLExamples.LinearRegressionExample:
 using ReactiveKernelsPPLExamples.ARMA11Example: evaluate_arma11_source
 using ReactiveKernelsPPLExamples.PoissonGammaExample: evaluate_poisson_gamma_source
 using ReactiveKernelsPPLExamples.GLMPoissonExample: evaluate_glm_poisson_source
+using ReactiveKernelsPPLExamples.GLMBinomialExample: evaluate_glm_binomial_source
 using ReactiveKernelsPPLExamples.BetaBinomialExample: evaluate_beta_binomial_source
 using ReactiveKernelsPPLExamples.DugongsGrowthExample: evaluate_dugongs_source
 using ReactiveKernelsPPLExamples.GaussianMixtureExample: evaluate_gaussian_mixture_source
@@ -69,6 +70,10 @@ end
     end
     @testset "glm_poisson (posteriordb; bounded-uniform transforms + poisson-log)" begin
         a = evaluate_glm_poisson_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "glm_binomial (posteriordb; binomial-logit GLM)" begin
+        a = evaluate_glm_binomial_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
     @testset "beta_binomial" begin
