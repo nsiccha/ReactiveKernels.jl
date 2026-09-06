@@ -270,4 +270,33 @@ _nlp(x, mu, sig) = -0.5 * log(2π) - log(sig) - 0.5 * ((x - mu) / sig)^2
             @test isapprox(_std(r), post_sd; rtol = 0.15)
         end
     end
+
+    @testset "discrete latent (scalar Bernoulli) — enumeration Gibbs" begin
+        # A Bernoulli latent's port is `Bool` (matching `bernoulli.logpdf`), used
+        # Bool-naturally in the body — exactly how an SSVS inclusion indicator
+        # selects a value.
+        @ppl dm(y::Vector{Float64}) = begin
+            z ~ bernoulli(0.4)
+            y ~ normal(ifelse(z, 1.0, 0.0), 1.0)
+        end
+        # @ppl marks z a discrete latent in the structure descriptor.
+        info = PPLMacro.model_info(dm)
+        @test info.params[1].name == :z
+        @test info.params[1].support == :discrete
+        @test info.params[1].prior_family == :bernoulli
+
+        y = [1.2, 0.9, 1.1]
+        # z | y is Bernoulli: log-odds = logit(0.4) + Σ(y_i - 0.5), since
+        # logN(y;1,1) - logN(y;0,1) = y - 0.5.
+        lo = log(0.4) - log(0.6) + sum(y .- 0.5)
+        p1 = 1 / (1 + exp(-lo))
+
+        res = gibbs(dm; blocks = [:z], data = (; y),
+                    init = (; z = false), iters = 20000, warmup = 0,
+                    rng = MersenneTwister(42))
+        zs = Int.(res.draws[:z])
+        @test all(v -> v == 0 || v == 1, zs)              # support respected
+        @test res.accept_rate[:z] == 1.0                  # exact enumeration draw
+        @test isapprox(_mean(zs), p1; atol = 0.02)        # matches the analytic P(z=1|y)
+    end
 end
