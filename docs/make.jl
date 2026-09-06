@@ -51,6 +51,7 @@ site_pages = [
             "Dugongs (nonlinear growth)" => "dugongs-growth.md",
             "ARMA(1,1) time series" => "arma11.md",
             "Gaussian mixture" => "gaussian-mixture.md",
+            "Correlated (MvNormal) regression" => "mvnormal-regression.md",
         ],
     ],
     "Automatic differentiation" => [

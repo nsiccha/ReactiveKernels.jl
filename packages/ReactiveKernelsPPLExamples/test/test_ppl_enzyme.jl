@@ -1,5 +1,6 @@
 using DifferentiationInterface
 import Enzyme
+using LinearAlgebra
 using ReactiveKernelsPPLExamples.EightSchoolsExample
 using ReactiveKernelsPPLExamples.LinearRegressionExample
 using ReactiveKernelsPPLExamples.BetaBinomialExample
@@ -7,6 +8,7 @@ using ReactiveKernelsPPLExamples.PoissonGammaExample
 using ReactiveKernelsPPLExamples.DugongsGrowthExample
 using ReactiveKernelsPPLExamples.ARMA11Example
 using ReactiveKernelsPPLExamples.GaussianMixtureExample
+using ReactiveKernelsPPLExamples.MVNormalRegressionExample
 
 # This is deliberately the plain reverse backend: no runtime activity and no
 # function annotation. Non-active model data travel through DI as `Constant`s.
@@ -127,6 +129,25 @@ function gaussian_mixture_reference_density(q)
         likelihood)
 end
 
+# The covariance factorizations are data, so precompute the log-determinant and
+# reuse the exported precision (Σ⁻¹) matrix. This keeps the differentiated
+# reference a plain const-matrix quadratic form — Enzyme's reverse mode rejects a
+# `Symmetric \` / `logdet(Symmetric)` inside the differentiated call (the
+# Bunch-Kaufman factorization introduces a Union type), exactly as the RK kernel
+# avoids by treating the covariance as a DI Constant.
+const _MVREG_REFERENCE_LOGDET_COV = logdet(Symmetric(MVREG_COVARIANCE))
+
+function mvnormal_regression_reference_density(q)
+    β = q
+    centered = MVREG_Y .- MVREG_X * β
+    N = length(MVREG_Y)
+    quadratic = dot(centered, MVREG_PRECISION * centered)
+    likelihood = -0.5 * N * log(2π) - 0.5 * _MVREG_REFERENCE_LOGDET_COV -
+                 0.5 * quadratic
+    prior = sum(-0.5 * log(2π) - log(10.0) - 0.5 * (b / 10.0)^2 for b in β)
+    prior + likelihood
+end
+
 # Independent analytic score for the unconstrained Gaussian-mixture reference.
 # This is deliberately not differentiated with the backend under test: the RK
 # path below retains plain reverse-mode Enzyme, while the oracle follows the
@@ -231,6 +252,9 @@ end
          (:unconstrained, :observations),
          gaussian_mixture_reference_density,
          gaussian_mixture_reference_gradient),
+        (evaluate_mvnormal_regression_source(),
+         (:unconstrained, :predictors, :responses, :covariance),
+         mvnormal_regression_reference_density, nothing),
     )
     for (artifact, have, reference_density, reference_gradient) in cases
         @testset "$(artifact.name)" begin

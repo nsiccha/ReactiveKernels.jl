@@ -12,6 +12,7 @@ include("dugongs_growth.jl")
 include("arma11.jl")
 include("gaussian_mixture.jl")
 include("mnist_logistic.jl")
+include("mvnormal_regression.jl")
 
 export EightSchoolsExample
 export SumToZeroExample
@@ -22,5 +23,6 @@ export DugongsGrowthExample
 export ARMA11Example
 export GaussianMixtureExample
 export MNISTLogisticExample
+export MVNormalRegressionExample
 
 end # module ReactiveKernelsPPLExamples
