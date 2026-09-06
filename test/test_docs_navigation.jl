@@ -118,7 +118,7 @@ using Test
         r"(?s)expected_aov_panels = Dict\((.*?)\n    \)", rendered_guard,
     ).captures[1]
     @test occursin("\"distributions.md\" => 1", sortable_contract)
-    @test occursin("\"distributions-reactant.md\" => 13", sortable_contract)
+    @test occursin("\"distributions-reactant.md\" => 17", sortable_contract)
     @test occursin("\"distributions.md\" => 2", aov_contract)
-    @test occursin("\"distributions-reactant.md\" => 13", aov_contract)
+    @test occursin("\"distributions-reactant.md\" => 17", aov_contract)
 end

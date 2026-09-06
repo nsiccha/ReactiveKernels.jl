@@ -1218,6 +1218,23 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
         child, child_type = _kernel_constructed_endpoint(
             arg, mod, locals, nested_specs, local_types;
             context = context, materialized = materialized)
+        # A constructed object endpoint lowers to a call whose head is a generated
+        # `nested_specs` key. `_kernel_operation` splices such a call ONLY when it is
+        # the WHOLE recipe RHS. A splice used as a SUB-EXPRESSION of a value-combining
+        # call — `normal(0,2).logpdf(a) + normal(0,2).logpdf(b)`, or a `logaddexp(...)`
+        # inside a plate — would otherwise be swept into the fused `_KernelSourceOp`
+        # closure as a bare gensym call with no method definition, failing at call time
+        # with `UndefVarError: ##…_endpoint#N`. Lift each such sub-expression splice into
+        # its own hygienic caller recipe, typed by the endpoint output, so the same
+        # whole-RHS splice path lowers it, and reference the generated port here.
+        if ex.head === :call && child isa Expr && child.head === :call &&
+           !isempty(child.args) && child.args[1] isa Symbol &&
+           haskey(nested_specs, child.args[1])
+            endpoint_port = gensym(:endpoint_value)
+            push!(materialized, (endpoint_port, child_type, child))
+            push!(locals, endpoint_port)
+            child = endpoint_port
+        end
         push!(rewritten, child)
         push!(child_types, child_type)
     end

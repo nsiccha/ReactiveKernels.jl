@@ -52,11 +52,11 @@ evaluation. Override the exploratory counts with `RK_DENSITY_REPLICAS=1,4`;
 published receipts use `1,16,256`.
 
 The scalar-gallery benchmark compares the public Cauchy, Laplace, Bernoulli,
-LogNormal, Exponential, Geometric, and Uniform objects after their generic
-`plate` lift. Normal has its separate shared-object/control benchmark. The
-gallery records two vector sizes per family, traces every model parameter under
-Reactant, and keeps an explicit diagnostic for any public comparison path that
-does not compile.
+LogNormal, Exponential, Geometric, Uniform, Poisson, Gamma, Beta, and Binomial
+objects after their generic `plate` lift. Normal has its separate
+shared-object/control benchmark. The gallery records two vector sizes per
+family, traces every model parameter under Reactant, and keeps an explicit
+diagnostic for any public comparison path that does not compile.
 
 The structured benchmark compares the exact build-executed MVN source against
 the public multivariate-Normal interfaces in Distributions and
@@ -68,12 +68,15 @@ comparison package exposes a native AR(1) distribution. Unsupported full-MVN
 Reactant paths are retained with their compiler diagnostics rather than silently
 omitted.
 
-The distribution-gradient run reuses the exact native case generator and size
-inventories above. It measures prepared Enzyme reverse mode twice for vector
-active ports: `ad_gradient` owns its returned vector, while
-`ad_value_and_gradient!` writes into caller-owned storage. Bernoulli and
-Geometric differentiate their scalar logit ports because integer observations
-cannot be active; their isbits scalar gradients need no mutable destination.
-Preparation is excluded from every timed region, analytic gradients gate every
-row, and the receipt retains timing plus allocation bytes/counts for all five
-raw rounds.
+The distribution-gradient run preserves its original seven-family corpus
+(Cauchy through Uniform) and reuses the shared inputs and size inventory for
+those families. The four newer families have analytic Enzyme coverage in the
+package tests and native/Reactant coverage in the scalar gallery; they are not
+retroactively added to this historical zero-allocation receipt. The gradient
+run measures prepared Enzyme reverse mode twice for vector active ports:
+`ad_gradient` owns its returned vector, while `ad_value_and_gradient!` writes
+into caller-owned storage. Bernoulli and Geometric differentiate their scalar
+logit ports because integer observations cannot be active; their isbits scalar
+gradients need no mutable destination. Preparation is excluded from every timed
+region, analytic gradients gate every row, and the receipt retains timing plus
+allocation bytes/counts for all five raw rounds.
