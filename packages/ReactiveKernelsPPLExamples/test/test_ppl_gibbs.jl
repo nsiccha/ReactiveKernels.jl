@@ -2,8 +2,9 @@ using ReactiveKernelsPPLExamples.PPLMacro: @ppl
 import ReactiveKernelsPPLExamples.PPLMacro
 using ReactiveKernelsPPLExamples.PPLGibbs: gibbs, Gibbs
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
-    normal, exponential, beta, binomial, bernoulli, poisson, gamma
+    normal, exponential, beta, binomial, bernoulli, poisson, gamma, inverse_gamma
 using Random
+using LinearAlgebra
 
 # Experimental PPL-style Gibbs layer over `@ppl` models: single-site random-walk
 # Metropolis-within-Gibbs driven incrementally through `ReactiveState`, with
@@ -326,6 +327,55 @@ _nlp(x, mu, sig) = -0.5 * log(2π) - log(sig) - 0.5 * ((x - mu) / sig)^2
         for j in 1:p
             frac = _mean([Float64(zi[j]) for zi in Z])
             @test isapprox(frac, p1[j]; atol = 0.03)
+        end
+    end
+
+    @testset "SSVS spike-and-slab acceptance (George & McCulloch) on an @ppl model" begin
+        # The full classic SSVS, authored end-to-end in @ppl: a Beta inclusion
+        # probability, a vector of Bernoulli inclusion indicators, a conditional
+        # spike-and-slab prior on the coefficients (`ifelse(z_j, slab, spike)`),
+        # an inverse-gamma noise variance, and a Normal regression likelihood.
+        # Sampled by the mixed Gibbs engine — enumeration for z, support-aware RW
+        # for the rest — recovering the sparse coefficient set.
+        @ppl ssvs(y::Vector{Float64}, X::Matrix{Float64}, spike::Float64,
+                  slab::Float64, a0::Float64, b0::Float64, a_sig::Float64,
+                  b_sig::Float64, p::Int) = begin
+            omega ~ beta(a0, b0)
+            z::vector[p] ~ bernoulli(omega)
+            beta::vector[p] ~ normal(0.0, ifelse(z, slab, spike))
+            sigma2 ~ inverse_gamma(a_sig, b_sig)
+            mu = X * beta
+            y ~ normal(mu, sqrt(sigma2))
+        end
+        @test ssvs isa KernelSpec
+
+        rng = MersenneTwister(1)
+        n, p = 100, 6
+        X = randn(rng, n, p)
+        btrue = [2.0, -1.5, 0.0, 0.0, 0.0, 1.0]        # 3 included, 3 excluded
+        y = X * btrue .+ randn(rng, n)
+
+        res = gibbs(ssvs;
+            blocks = [:omega, :z, :beta, :sigma2],
+            data = (; y, X, spike = 0.05, slab = 3.0, a0 = 1.0, b0 = 1.0,
+                    a_sig = 2.0, b_sig = 1.0, p),
+            init = (; omega = 0.5, z = fill(true, p), beta = zeros(p), sigma2 = 1.0),
+            support = (; omega = :unit, sigma2 = :positive),
+            iters = 5000, warmup = 2000, step = 0.15, rng = MersenneTwister(2))
+
+        incl = [_mean([Float64(zi[j]) for zi in res.draws[:z]]) for j in 1:p]
+        bhat = [_mean([bi[j] for bi in res.draws[:beta]]) for j in 1:p]
+
+        @test res.accept_rate[:z] == 1.0                  # exact enumeration for z
+        # variable selection: the true-nonzero coefficients are selected and
+        # recovered; the true-zero coefficients are excluded and shrunk.
+        for j in (1, 2, 6)
+            @test incl[j] > 0.8
+            @test isapprox(bhat[j], btrue[j]; atol = 0.35)
+        end
+        for j in (3, 4, 5)
+            @test incl[j] < 0.5
+            @test abs(bhat[j]) < 0.35
         end
     end
 end
