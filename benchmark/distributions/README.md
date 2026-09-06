@@ -68,12 +68,15 @@ comparison package exposes a native AR(1) distribution. Unsupported full-MVN
 Reactant paths are retained with their compiler diagnostics rather than silently
 omitted.
 
-The distribution-gradient run reuses the exact native case generator and size
-inventories above. It measures prepared Enzyme reverse mode twice for vector
-active ports: `ad_gradient` owns its returned vector, while
-`ad_value_and_gradient!` writes into caller-owned storage. Bernoulli and
-Geometric differentiate their scalar logit ports because integer observations
-cannot be active; their isbits scalar gradients need no mutable destination.
-Preparation is excluded from every timed region, analytic gradients gate every
-row, and the receipt retains timing plus allocation bytes/counts for all five
-raw rounds.
+The distribution-gradient run preserves its original seven-family corpus
+(Cauchy through Uniform) and reuses the shared inputs and size inventory for
+those families. The four newer families have analytic Enzyme coverage in the
+package tests and native/Reactant coverage in the scalar gallery; they are not
+retroactively added to this historical zero-allocation receipt. The gradient
+run measures prepared Enzyme reverse mode twice for vector active ports:
+`ad_gradient` owns its returned vector, while `ad_value_and_gradient!` writes
+into caller-owned storage. Bernoulli and Geometric differentiate their scalar
+logit ports because integer observations cannot be active; their isbits scalar
+gradients need no mutable destination. Preparation is excluded from every timed
+region, analytic gradients gate every row, and the receipt retains timing plus
+allocation bytes/counts for all five raw rounds.

@@ -20,7 +20,15 @@ const SCALAR_GALLERY_FAMILIES = (
     "beta_shapes",
     "binomial_logit",
 )
-const DISTRIBUTION_GRADIENT_FAMILIES = SCALAR_GALLERY_FAMILIES[1:7]
+const DISTRIBUTION_GRADIENT_FAMILIES = (
+    "cauchy_location_scale",
+    "laplace_location_scale",
+    "bernoulli_logit",
+    "lognormal_logscale",
+    "exponential_logscale",
+    "geometric_logit",
+    "uniform_bounded",
+)
 const SCALAR_GALLERY_SIZES = (1_000, 100_000)
 const STRUCTURED_SIZES = (4, 16, 64, 128)
 
