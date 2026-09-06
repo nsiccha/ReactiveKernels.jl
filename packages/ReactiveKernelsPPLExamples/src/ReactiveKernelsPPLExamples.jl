@@ -11,6 +11,7 @@ include("beta_binomial.jl")
 include("poisson_gamma.jl")
 include("glm_poisson.jl")
 include("glm_binomial.jl")
+include("eight_schools_noncentered.jl")
 include("dugongs_growth.jl")
 include("arma11.jl")
 include("gaussian_mixture.jl")
@@ -42,6 +43,7 @@ export BetaBinomialExample
 export PoissonGammaExample
 export GLMPoissonExample
 export GLMBinomialExample
+export EightSchoolsNoncenteredExample
 export DugongsGrowthExample
 export ARMA11Example
 export GaussianMixtureExample
