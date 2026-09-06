@@ -20,9 +20,11 @@ It is built entirely on ReactiveKernels' PUBLIC surface (`@kernel` / `prepare` /
 `plan` / `plate`) plus the reusable distribution-kernel objects — nothing lives
 in ReactiveKernels core.
 
-The surface mirrors StanBlocks (`@slic`): typed-LHS `name` / `name::real` /
-`name::vector[size]`, and support constraints spelled as distribution keywords
-(`~ dist(…; lower=0)`) — no invented `::positive` / `name[size]` forms.
+The surface mirrors StanBlocks (`@slic`) for typed-LHS `name` / `name::real` /
+`name::vector[size]`; support constraints use the rk-native `positive(dist(…))`
+combinator (PROVISIONAL — decision `1uczi8y` resolved "no preference; do whatever
+for now, mark provisional"). No invented `::positive` / `name[size]` forms, and
+(per user review) no `lower=` distribution keyword.
 
 Decisions: build GO `2026-09-06T14-20-02-559-1r5p4j1`; scope MINIMAL
 `2026-09-06T14-20-27-206-0wqzaq4`.
@@ -32,18 +34,24 @@ Decisions: build GO `2026-09-06T14-20-02-559-1r5p4j1`; scope MINIMAL
 - Scalar parameters take one packed-unconstrained coordinate, with support
   inferred from the sampling distribution and the matching transform +
   log-Jacobian authored in both directions — real (`normal` / `cauchy` /
-  `laplace`, identity), positive (`exponential` / `gamma` / `lognormal`,
-  log/exp), unit (`beta`, logit/logistic).
+  `laplace`, identity), positive (`exponential` / `gamma` / `lognormal` /
+  `inverse_gamma`, log/exp), unit (`beta`, logit/logistic).
+- **Discrete latents** (`bernoulli`): a `~`-declared parameter with a discrete
+  family is a Gibbs-only latent — it takes NO unconstrained coordinate and NO
+  transform, is carried as its own typed HAVE port (Bernoulli → `Bool`, used
+  Bool-naturally as e.g. `ifelse(z, …)`), and its prior contributes
+  `dist.logpdf(z)`. Sampled by enumeration (`PPLGibbs`). First cut: scalar.
 - **Vector parameters** — StanBlocks typed-LHS `name::vector[size] ~ dist(…)`
   (real support) — take a packed slice of `size` coordinates (`size` a data
   argument or literal; the packed layout tracks a running offset), and their
   prior is the summed per-element authored `plate`.
-- **Support constraints are distribution keywords** (as in `@slic`): a
-  naturally-positive family (`exponential`/`gamma`/`lognormal`) already implies
-  positive support, and a `lower=0` keyword on a real family is a **half
-  distribution** whose prior adds `-log(1 - cdf(0))` via the family's own `.cdf`
-  — e.g. `sigma ~ normal(0, 5; lower=0)` (half-Normal),
-  `tau ~ cauchy(0, 5; lower=0)` (half-Cauchy).
+- **Support constraints use the rk-native `positive(dist(…))` combinator**
+  (PROVISIONAL, decision `1uczi8y`): a naturally-positive family
+  (`exponential`/`gamma`/`lognormal`) already implies positive support, and
+  `positive(<real family>)` is a **half distribution** whose prior adds
+  `-log(1 - cdf(0))` via the family's own `.cdf` — e.g.
+  `sigma ~ positive(normal(0, 5))` (half-Normal),
+  `tau ~ positive(cauchy(0, 5))` (half-Cauchy).
 - `parameters` has two producers (constrain-only, and joint with `log_jacobian`
   so a params+Jacobian query shares the transform) plus named-latent inverse
   edges, so a packed, named-latent, or `parameters` HAVE boundary all route
@@ -91,16 +99,30 @@ const PPL_NODE_NAMES = (:parameters, :log_jacobian, :prior, :pointwise,
 const _SUPPORT = Dict{Symbol,Symbol}(
     :normal => :real, :cauchy => :real, :laplace => :real,
     :exponential => :positive, :gamma => :positive, :lognormal => :positive,
-    :beta => :unit,
+    :beta => :unit, :inverse_gamma => :positive,
 )
+
+# Discrete latent families — a `~`-declared parameter whose family is discrete is
+# a Gibbs-only latent: it takes NO unconstrained coordinate and NO transform, is
+# carried as its own Int-valued HAVE port (like data, but a latent), and is
+# sampled by enumeration (PPLGibbs). Its prior contributes `dist.logpdf(z)`.
+const _DISCRETE = Set{Symbol}((:bernoulli,))
+
+# The Julia type a discrete latent's HAVE port takes — it must match the family's
+# `logpdf` argument type, and is the type the latent is used at in the model body
+# (Bernoulli's `observed` is `Bool`, natural for `ifelse(z, …)` selection).
+const _DISCRETE_TYPE = Dict{Symbol,Symbol}(:bernoulli => :Bool)
 
 struct _Param
     name::Symbol
     dist::Any        # the dist-call Expr, e.g. :(normal(0.0, 5.0))
-    support::Symbol  # EFFECTIVE support (transform): :real / :positive / :unit
+    support::Symbol  # EFFECTIVE support: :real / :positive / :unit (continuous),
+                     # or :discrete for a Gibbs-only discrete latent
     size::Any        # `nothing` for a scalar; a size expression for a vector
     truncate::Bool   # a constraint restricting the family's natural support (a
                      # half distribution): add -log(1 - cdf(0)) to the prior
+    discrete::Bool   # a discrete latent: no unconstrained coordinate/transform,
+                     # carried as an Int-valued HAVE port, sampled by enumeration
 end
 
 # Running packed-offset arithmetic that stays a literal while every preceding
@@ -113,6 +135,45 @@ struct _Obs
     data::Symbol     # the observed (data) argument name
     dist::Any        # the dist-call Expr referencing parameters / data
 end
+
+# --- Experimental structure descriptor (for the PPL Gibbs conjugacy layer) ---
+# `@ppl` lowers to an opaque `KernelSpec` that no longer carries the PPL-level
+# structure — which family each latent has, how it enters each likelihood. The
+# Gibbs layer's automatic conjugacy detection needs exactly that, so `@ppl` ALSO
+# registers a lightweight descriptor keyed by the produced model. This is an
+# INTERNAL introspection surface (NOT the model-authoring syntax the user is
+# particular about); reach it via `PPLMacro.model_info(model)`. Experimental —
+# may change alongside the rest of the front-end.
+struct ParamInfo
+    name::Symbol
+    prior_family::Symbol
+    prior_args::Vector{Any}   # each prior argument as source AST (Symbol / literal / Expr)
+    support::Symbol           # :real / :positive / :unit
+    is_vector::Bool
+end
+struct ObsInfo
+    data::Symbol
+    family::Symbol
+    args::Vector{Any}         # each likelihood argument as source AST
+end
+struct PPLModelInfo
+    params::Vector{ParamInfo}
+    obs::Vector{ObsInfo}
+end
+
+const _MODEL_INFO = Base.IdDict{Any,PPLModelInfo}()
+_register_model_info!(model, info::PPLModelInfo) = (_MODEL_INFO[model] = info; model)
+
+"""
+    PPLMacro.model_info(model) -> PPLModelInfo
+
+The experimental structure descriptor for an `@ppl` `model`: its parameters and
+observation streams, each carrying the distribution family and the source ASTs
+of its arguments. Used by the PPL Gibbs layer for automatic conjugacy detection.
+Throws (`KeyError`) if `model` was not produced by `@ppl`.
+"""
+model_info(model) = _MODEL_INFO[model]
+has_model_info(model) = haskey(_MODEL_INFO, model)
 
 _is_line(x) = x isa LineNumberNode
 
@@ -149,46 +210,34 @@ function _parse_lhs(lhs)
     end
 end
 
-# Split a distribution call into its positional RK dist call and any `lower=` /
-# `upper=` support-constraint kwargs — StanBlocks spells parameter-support
-# constraints as distribution keywords (`~ cauchy(0, 5; lower=0)`).
+# Parse the `~` right-hand side. A bare `dist(args...)` uses the family's natural
+# support; the rk-native `positive(dist(args...))` combinator constrains it to
+# positive support (a half distribution when the family's natural support is the
+# whole line). Returns (dist-head, positional RK dist call, constraint).
+#
+# PROVISIONAL constraint spelling — decision `1uczi8y` resolved "(no preference);
+# do whatever for now, mark it provisional". The `positive(…)` combinator is the
+# recommended rk-native form (it composes transparent kernel objects rather than
+# bolting a keyword onto the dist call); the final spelling may still change.
 function _parse_dist(rhs)
-    (rhs isa Expr && rhs.head === :call && rhs.args[1] isa Symbol) ||
-        error("@ppl: `~` right-hand side must be a distribution call, got `$(rhs)`.")
-    head = rhs.args[1]
-    lower = nothing
-    upper = nothing
-    pos = Any[]
-    for a in rhs.args[2:end]
-        kws = a isa Expr && a.head === :parameters ? a.args :
-              a isa Expr && a.head === :kw ? (a,) : nothing
-        if kws === nothing
-            push!(pos, a)
-            continue
-        end
-        for kw in kws
-            (kw isa Expr && kw.head === :kw && kw.args[1] isa Symbol) ||
-                error("@ppl: malformed distribution keyword `$(kw)`.")
-            k, v = kw.args[1], kw.args[2]
-            k === :lower ? (lower = v) :
-            k === :upper ? (upper = v) :
-            error("@ppl (first cut): unsupported distribution keyword `$(k)`; only " *
-                  "`lower` / `upper` (support constraints) are handled.")
-        end
+    if rhs isa Expr && rhs.head === :call && rhs.args[1] === :positive
+        length(rhs.args) == 2 || error(
+            "@ppl: `positive(dist(…))` takes exactly one distribution argument, " *
+            "got `$(rhs)`.")
+        (head, call) = _dist_call(rhs.args[2])
+        return (head, call, :positive)
     end
-    (head, Expr(:call, head, pos...), lower, upper)
+    (head, call) = _dist_call(rhs)
+    (head, call, nothing)
 end
 
-_is_zero(x) = x === 0 || x === 0.0
-
-# The support constraint implied by `lower=` / `upper=` kwargs (first cut: only
-# `lower=0`, i.e. a lower-truncation at 0 — a half / positive family).
-function _constraint_from_bounds(name, lower, upper)
-    (lower === nothing && upper === nothing) && return nothing
-    (upper === nothing && _is_zero(lower)) && return :positive
-    error("@ppl (first cut): parameter `$(name)` — only `lower=0` (a half " *
-          "distribution) is a supported support constraint yet; general " *
-          "`lower` / `upper` bounds are a follow-up increment.")
+function _dist_call(rhs)
+    (rhs isa Expr && rhs.head === :call && rhs.args[1] isa Symbol) ||
+        error("@ppl: expected a distribution call, got `$(rhs)`.")
+    any(a -> a isa Expr && a.head in (:parameters, :kw), @view rhs.args[2:end]) &&
+        error("@ppl: distribution keywords are not supported; constrain support " *
+              "with the `positive(dist(…))` combinator.")
+    (rhs.args[1], rhs)
 end
 
 """
@@ -218,21 +267,34 @@ function _parse(def)
         _is_line(stmt) && continue
         if stmt isa Expr && stmt.head === :call && stmt.args[1] === :~
             (lname, kind, lsize) = _parse_lhs(stmt.args[2])
-            (dist, dist_call, lower, upper) = _parse_dist(stmt.args[3])
+            (dist, dist_call, constraint) = _parse_dist(stmt.args[3])
             if lname in datanames
-                (kind === :scalar && lower === nothing && upper === nothing) ||
+                (kind === :scalar && constraint === nothing) ||
                     error("@ppl: observation `$(lname)` cannot carry a type/size/" *
                           "constraint annotation")
                 push!(obs, _Obs(lname, dist_call))
             else
                 lname in seen && error("@ppl: parameter $(lname) declared twice")
                 push!(seen, lname)
+                if dist in _DISCRETE
+                    # Discrete latent (Gibbs-only; no unconstrained coordinate).
+                    # Scalar (`z ~ bernoulli(…)`) or vector
+                    # (`z::vector[p] ~ bernoulli(…)`, an SSVS inclusion-indicator
+                    # block); the prior is `dist.logpdf` (scalar) or its summed
+                    # per-element `plate` (vector).
+                    constraint === nothing || error(
+                        "@ppl: discrete latent `$(lname) ~ $(dist)(…)` cannot carry a " *
+                        "support constraint.")
+                    dsize = kind === :vector ? lsize : nothing
+                    push!(params, _Param(lname, dist_call, :discrete, dsize, false, true))
+                    continue
+                end
                 haskey(_SUPPORT, dist) || error(
                     "@ppl (first cut): parameter $(lname) ~ $(dist)(…) — supported " *
-                    "parameter distributions are $(sort(collect(keys(_SUPPORT)))); " *
-                    "other families are a follow-up increment.")
+                    "continuous parameter distributions are " *
+                    "$(sort(collect(keys(_SUPPORT)))); discrete latents are " *
+                    "$(sort(collect(_DISCRETE))); other families are a follow-up increment.")
                 natural = _SUPPORT[dist]
-                constraint = _constraint_from_bounds(lname, lower, upper)
                 effective = constraint === nothing ? natural : constraint
                 truncate = false
                 if constraint !== nothing
@@ -249,7 +311,7 @@ function _parse(def)
                 (size === nothing || effective === :real) || error(
                     "@ppl (first cut): only real-support vector parameters are " *
                     "supported yet (`$(lname)::vector[…]`).")
-                push!(params, _Param(lname, dist_call, effective, size, truncate))
+                push!(params, _Param(lname, dist_call, effective, size, truncate, false))
             end
         elseif stmt isa Expr && stmt.head === :(=)
             push!(passthrough, stmt)
@@ -344,6 +406,7 @@ function _lower(name, dataargs, params, obs, passthrough)
     jac_terms = Any[]
     off = 0  # running packed offset BEFORE the current parameter
     for p in params
+        p.discrete && continue      # discrete latent: no coordinate / transform
         lo = _offset_add(off, 1)
         if p.size !== nothing
             # Real-support vector parameter (identity transform): one packed
@@ -389,11 +452,18 @@ function _lower(name, dataargs, params, obs, passthrough)
     push!(stmts, Expr(:(=),
         Expr(:tuple, :parameters, :( log_jacobian::Float64 )),
         Expr(:tuple, :( (; $(pnames...)) ), jac_expr)))
+    # Named-latent inverse edges reconstruct each CONTINUOUS parameter from the
+    # `parameters` NamedTuple (so a named-latent HAVE boundary routes without the
+    # unconstrained coordinate). Discrete latents are direct HAVE ports (signature
+    # args), so they need no inverse edge.
     _pann(p) = p.size === nothing ? :( $(p.name)::Float64 ) :
                :( $(p.name)::AbstractVector{Float64} )
-    inv_lhs = Expr(:tuple, (_pann(p) for p in params)...)
-    inv_rhs = Expr(:tuple, (:( parameters.$(p.name) ) for p in params)...)
-    push!(stmts, Expr(:(=), inv_lhs, inv_rhs))
+    cont_params = [p for p in params if !p.discrete]
+    if !isempty(cont_params)
+        inv_lhs = Expr(:tuple, (_pann(p) for p in cont_params)...)
+        inv_rhs = Expr(:tuple, (:( parameters.$(p.name) ) for p in cont_params)...)
+        push!(stmts, Expr(:(=), inv_lhs, inv_rhs))
+    end
 
     # 4. Prior: sum of each parameter's log density on its constrained value.
     #    A scalar contributes `dist.logpdf(p)`; a vector contributes the summed
@@ -454,8 +524,44 @@ function _lower(name, dataargs, params, obs, passthrough)
     push!(stmts, :( posterior::Float64 = prior + likelihood + log_jacobian ))
     push!(stmts, :( return posterior ))
 
-    sig = Expr(:call, name, :( unconstrained::Vector{Float64} ), dataargs...)
+    # Discrete latents are their own HAVE ports (Int-valued), appended to the
+    # signature after the data arguments — provided directly by the Gibbs sampler,
+    # never derived from `unconstrained`.
+    discreteargs = Any[]
+    for p in params
+        p.discrete || continue
+        elty = _DISCRETE_TYPE[_call_head(p.dist)]
+        ty = p.size === nothing ? elty : :( AbstractVector{$(elty)} )
+        push!(discreteargs, :( $(p.name)::$(ty) ))
+    end
+    sig = Expr(:call, name, :( unconstrained::Vector{Float64} ), dataargs...,
+               discreteargs...)
     Expr(:(=), sig, Expr(:block, stmts...))
+end
+
+# Build the expression that constructs the runtime `PPLModelInfo` descriptor.
+# Distribution arguments are embedded as their SOURCE AST via `QuoteNode` (so a
+# literal `2.0` evaluates to `2.0`, a `:mu` to the symbol, an `alpha + beta * x`
+# to the Expr) — the Gibbs conjugacy detector inspects that AST. The struct
+# types are spliced as VALUES so they resolve to `PPLMacro`'s types regardless
+# of the escaped use-site scope.
+function _descriptor_expr(params, obs)
+    pexprs = Any[]
+    for p in params
+        args = Expr(:ref, :Any, (QuoteNode(a) for a in _call_args(p.dist))...)
+        push!(pexprs, Expr(:call, ParamInfo, QuoteNode(p.name),
+                           QuoteNode(_call_head(p.dist)), args,
+                           QuoteNode(p.support), p.size !== nothing))
+    end
+    oexprs = Any[]
+    for o in obs
+        args = Expr(:ref, :Any, (QuoteNode(a) for a in _call_args(o.dist))...)
+        push!(oexprs, Expr(:call, ObsInfo, QuoteNode(o.data),
+                           QuoteNode(_call_head(o.dist)), args))
+    end
+    Expr(:call, PPLModelInfo,
+         Expr(:vect, pexprs...),
+         Expr(:vect, oexprs...))
 end
 
 """
@@ -466,11 +572,21 @@ exposing the canonical PPL workflow nodes. See the module docstring for the
 first-cut scope. The distribution objects used in the body (`normal`, …) and
 `ReactiveKernels` must be in scope at the use site, exactly as the hand-authored
 PPL examples require.
+
+Besides binding `name` to the model, `@ppl` registers an experimental structure
+descriptor (`PPLMacro.model_info(name)`) the PPL Gibbs layer reads for automatic
+conjugacy detection — an internal introspection surface, not part of the model
+syntax.
 """
 macro ppl(def)
     (name, dataargs, params, obs, passthrough) = _parse(def)
     kernel_def = _lower(name, dataargs, params, obs, passthrough)
-    esc(Expr(:macrocall, Symbol("@kernel"), __source__, kernel_def))
+    kexpr = Expr(:macrocall, Symbol("@kernel"), __source__, kernel_def)
+    info_expr = _descriptor_expr(params, obs)
+    esc(quote
+        $(kexpr)
+        $(_register_model_info!)($(name), $(info_expr))
+    end)
 end
 
 end # module PPLMacro
