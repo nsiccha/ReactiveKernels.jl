@@ -1,6 +1,7 @@
-using ReactiveKernelsPPLExamples: @ppl, BetaBinomialExample, PoissonGammaExample
+using ReactiveKernelsPPLExamples: @ppl, BetaBinomialExample, PoissonGammaExample,
+    EightSchoolsExample, LinearRegressionExample
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
-    normal, exponential, beta, binomial, gamma, poisson
+    normal, cauchy, exponential, beta, binomial, gamma, poisson
 
 # First cut of the RK-native sb-like `@ppl` macro: scalar real-support
 # parameters + plate observation likelihoods, lowered to the canonical PPL
@@ -160,6 +161,48 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
         pars = prepare(hier; have = (:unconstrained, :J), want = :parameters)(q, J)
         @test pars.mu == 0.5
         @test collect(pars.theta) == th
+    end
+
+    @testset "half distribution — exact parity with hand-written eight_schools" begin
+        es_ref = EightSchoolsExample.build_eight_schools_graph()
+        Y = EightSchoolsExample.EIGHT_SCHOOLS_Y
+        S = EightSchoolsExample.EIGHT_SCHOOLS_SIGMA
+        q = Float64[1.5, log(2.0), (0.25 .* (1:8))...]
+        ref_post = prepare(es_ref;
+            have = (:unconstrained, :observations, :observation_scales),
+            want = :posterior)(q, Y, S)
+
+        @ppl es(observations::Vector{Float64}, observation_scales::Vector{Float64},
+                J::Int) = begin
+            mu ~ normal(0.0, 5.0)
+            tau::positive ~ cauchy(0.0, 5.0)       # half-Cauchy(0, 5)
+            theta[J] ~ normal(mu, tau)
+            observations ~ normal(theta, observation_scales)
+        end
+        got = prepare(es;
+            have = (:unconstrained, :observations, :observation_scales, :J),
+            want = :posterior)(q, Y, S, 8)
+        @test got ≈ ref_post
+    end
+
+    @testset "half distribution — exact parity with hand-written linear_regression" begin
+        lr_ref = LinearRegressionExample.build_linear_regression_graph()
+        X = LinearRegressionExample.LINREG_X
+        Yr = LinearRegressionExample.LINREG_Y
+        ref_density = prepare(lr_ref;
+            have = (:unconstrained, :predictors, :responses),
+            want = :density)((1.0, 2.0, log(0.5)), X, Yr)
+
+        @ppl lr(predictors::Vector{Float64}, responses::Vector{Float64}) = begin
+            alpha ~ normal(0.0, 10.0)
+            beta ~ normal(0.0, 10.0)
+            sigma::positive ~ normal(0.0, 5.0)     # half-Normal(5)
+            responses ~ normal(alpha + beta * predictors, sigma)
+        end
+        got = prepare(lr; have = (:unconstrained, :predictors, :responses),
+                      want = :posterior)(Float64[1.0, 2.0, log(0.5)],
+                collect(X), collect(Yr))
+        @test got ≈ ref_density
     end
 
     @testset "out-of-scope constructs fail loudly" begin

@@ -25,6 +25,11 @@ Decisions: build GO `2026-09-06T14-20-02-559-1r5p4j1`; scope MINIMAL
   slice of `size` coordinates (`size` a data argument or literal; the packed
   layout tracks a running offset), and their prior is the summed per-element
   authored `plate`.
+- An explicit `name::constraint` override (`positive` / `unit` / `real`). A
+  positive constraint on a real-support family is a **half distribution**
+  (lower-truncated at 0) whose prior adds `-log(1 - cdf(0))` via the family's own
+  `.cdf` — e.g. `sigma::positive ~ normal(0, 5)` (half-Normal),
+  `tau::positive ~ cauchy(0, 5)` (half-Cauchy).
 - `parameters` has two producers (constrain-only, and joint with `log_jacobian`
   so a params+Jacobian query shares the transform) plus named-latent inverse
   edges, so a packed, named-latent, or `parameters` HAVE boundary all route
@@ -38,11 +43,14 @@ Decisions: build GO `2026-09-06T14-20-02-559-1r5p4j1`; scope MINIMAL
   `posterior`. Queried the usual way, e.g.
   `prepare(model; have = (:unconstrained, data...), want = :posterior)`.
 
-Constrained (positive/unit) vector parameters, explicit constraint overrides /
-half / bounded / truncated families (e.g. eight-schools' half-Cauchy), transforms
-via the `ReactiveKernels:ppl:bijectors` objects (currently authored inline,
-matching the hand-written examples), and user PPL-AST transformations are
-follow-up increments (todo `2026-09-06T15-02-44-929-0mw9lhd`).
+Constrained (positive/unit) vector parameters, general bounded/interval
+truncation, transforms via the `ReactiveKernels:ppl:bijectors` objects (currently
+authored inline, matching the hand-written examples), and user PPL-AST
+transformations are follow-up increments (todo
+`2026-09-06T15-02-44-929-0mw9lhd`).
+
+Reproduces the hand-written `beta_binomial`, `poisson_gamma`, `linear_regression`,
+and `eight_schools` example densities exactly (density parity).
 """
 module PPLMacro
 
@@ -71,8 +79,10 @@ const _SUPPORT = Dict{Symbol,Symbol}(
 struct _Param
     name::Symbol
     dist::Any        # the dist-call Expr, e.g. :(normal(0.0, 5.0))
-    support::Symbol  # :real / :positive / :unit
+    support::Symbol  # EFFECTIVE support (transform): :real / :positive / :unit
     size::Any        # `nothing` for a scalar; a size expression for a vector
+    truncate::Bool   # a constraint restricting the family's natural support (a
+                     # half distribution): add -log(1 - cdf(0)) to the prior
 end
 
 # Running packed-offset arithmetic that stays a literal while every preceding
@@ -126,20 +136,26 @@ function _parse(def)
         if stmt isa Expr && stmt.head === :call && stmt.args[1] === :~
             lhs = stmt.args[2]
             rhs = stmt.args[3]
-            # LHS is a bare name (scalar) or `name[size]` (vector parameter).
+            # LHS is a bare name (scalar), `name[size]` (vector parameter), or
+            # `name::constraint` (an explicit support override, e.g. a half dist).
+            lname, lsize, loverride = nothing, nothing, nothing
             if lhs isa Symbol
-                lname, lsize = lhs, nothing
+                lname = lhs
             elseif lhs isa Expr && lhs.head === :ref && length(lhs.args) == 2 &&
                     lhs.args[1] isa Symbol
                 lname, lsize = lhs.args[1], lhs.args[2]
+            elseif lhs isa Expr && lhs.head === :(::) && length(lhs.args) == 2 &&
+                    lhs.args[1] isa Symbol && lhs.args[2] isa Symbol
+                lname, loverride = lhs.args[1], lhs.args[2]
             else
-                error("@ppl: `~` left-hand side must be a name or `name[size]`, got $(lhs)")
+                error("@ppl: `~` left-hand side must be `name`, `name[size]`, or " *
+                      "`name::constraint`, got $(lhs)")
             end
             (_call_head(rhs) isa Symbol) ||
                 error("@ppl: `~` right-hand side must be a distribution call, got $(rhs)")
             if lname in datanames
-                lsize === nothing ||
-                    error("@ppl: observation `$(lname)` cannot carry a `[size]` annotation")
+                (lsize === nothing && loverride === nothing) ||
+                    error("@ppl: observation `$(lname)` cannot carry a size or constraint annotation")
                 push!(obs, _Obs(lname, rhs))
             else
                 lname in seen && error("@ppl: parameter $(lname) declared twice")
@@ -148,14 +164,32 @@ function _parse(def)
                 haskey(_SUPPORT, dist) || error(
                     "@ppl (first cut): parameter $(lname) ~ $(dist)(…) — supported " *
                     "parameter distributions are $(sort(collect(keys(_SUPPORT)))); " *
-                    "explicit constraint overrides and other families are a " *
-                    "follow-up increment.")
-                support = _SUPPORT[dist]
-                (lsize === nothing || support === :real) || error(
+                    "other families are a follow-up increment.")
+                natural = _SUPPORT[dist]
+                effective = loverride === nothing ? natural : loverride
+                truncate = false
+                if loverride !== nothing
+                    loverride in (:real, :positive, :unit) || error(
+                        "@ppl: unknown constraint `$(loverride)` on $(lname); use " *
+                        "real / positive / unit")
+                    if effective === natural
+                        # redundant, explicit — no truncation.
+                    elseif effective === :positive && natural === :real
+                        truncate = true   # a half distribution (lower-truncated at 0)
+                    else
+                        error("@ppl (first cut): constraint `$(effective)` on a " *
+                              "$(natural)-support `$(dist)` is not supported yet — only a " *
+                              "positive constraint on a real-support family (a half " *
+                              "distribution) or a redundant matching constraint.")
+                    end
+                    lsize === nothing || error(
+                        "@ppl (first cut): a constrained vector parameter " *
+                        "($(lname)) is a follow-up increment.")
+                end
+                (lsize === nothing || effective === :real) || error(
                     "@ppl (first cut): vector parameter $(lname)[$(lsize)] ~ $(dist)(…) — " *
-                    "only real-support vector parameters are supported yet; " *
-                    "constrained (positive/unit) vector parameters are a follow-up increment.")
-                push!(params, _Param(lname, rhs, support, lsize))
+                    "only real-support vector parameters are supported yet.")
+                push!(params, _Param(lname, rhs, effective, lsize, truncate))
             end
         elseif stmt isa Expr && stmt.head === :(=)
             push!(passthrough, stmt)
@@ -307,10 +341,25 @@ function _lower(name, dataargs, params, obs, passthrough)
     #    observation, with the parameter itself in the sliced position). The plate
     #    is bound to its own variable first — a constructed-endpoint plate must be
     #    a whole recipe RHS, not a sub-expression of `sum(…)`.
+    # A truncated (half) prior renormalizes by -log(1 - cdf(0)). The truncation
+    # point 0 must reach the `.cdf` endpoint as a NAMED caller port (an endpoint's
+    # explicit argument cannot be a bare literal), so bind it once.
+    if any(p -> p.truncate, params)
+        push!(stmts, :( _ppl_zero::Float64 = 0.0 ))
+    end
     prior_terms = Any[]
     for p in params
         if p.size === nothing
-            push!(prior_terms, :( $(p.dist).logpdf($(p.name)) ))
+            term = :( $(p.dist).logpdf($(p.name)) )
+            if p.truncate
+                # Half distribution (lower-truncated at 0): renormalize by
+                # -log P(X > 0) = -log(1 - cdf(0)). For a symmetric-at-0 family
+                # this is +log(2), matching the hand-written half-Normal /
+                # half-Cauchy examples; the cdf form also covers non-symmetric
+                # lower-truncation.
+                term = :( $(term) - log(1 - $(p.dist).cdf(_ppl_zero)) )
+            end
+            push!(prior_terms, term)
         else
             pv = Symbol(:_ppl_prior_, p.name)
             push!(stmts, :( $(pv) = $(_obs_plate(_Obs(p.name, p.dist), modelsyms)) ))
