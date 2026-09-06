@@ -9,12 +9,13 @@ DifferentiationInterface as a `DifferentiationInterface.Constant` context.
 The stored differentiation preparation is mutable and not thread-safe. Prepare
 one `PreparedADKernel` per concurrent caller.
 """
-struct PreparedADKernel{I,K,R,F,B,P}
+struct PreparedADKernel{I,K,R,F,B,P,E}
     kernel::K
     resolver::R
     call::F
     backend::B
     preparation::P
+    external_values::E
 end
 
 """
@@ -28,12 +29,13 @@ products with [`ad_pullback`](@ref) or [`ad_value_and_pullback`](@ref).
 Like [`PreparedADKernel`](@ref), the stored differentiation preparation is
 mutable and not thread-safe. Prepare one object per concurrent caller.
 """
-struct PreparedADPullback{I,K,R,F,B,P}
+struct PreparedADPullback{I,K,R,F,B,P,E}
     kernel::K
     resolver::R
     call::F
     backend::B
     preparation::P
+    external_values::E
 end
 
 # DifferentiationInterface differentiates its first argument and requires every
@@ -77,10 +79,17 @@ function _ad_kernel_call(kernel::PreparedKernel, args::Tuple, ::Val{I}) where {I
     if kernel.f isa Union{
             _ArrayFunctionPair,_EmbeddedFunctionPair,
             _DynamicEmbeddedFunctionPair} && native_exemplars
-        return _ADNativeKernelCall{I,typeof(kernel.f.native),typeof(kernel.ops)}(
+        externalized, values = _externalize_bound_array_call(
             kernel.f.native, kernel.ops)
+        isempty(values) && return (
+            _ADNativeKernelCall{I,typeof(kernel.f.native),typeof(kernel.ops)}(
+                kernel.f.native, kernel.ops),
+            (),
+        )
+        return _ADKernelCall{I,typeof(externalized)}(externalized), values
     end
-    _ADKernelCall{I,typeof(kernel)}(kernel)
+    externalized, values = _externalize_bound_arrays(kernel)
+    _ADKernelCall{I,typeof(externalized)}(externalized), values
 end
 
 @generated function (call::_ADKernelCall{I})(
@@ -256,9 +265,11 @@ function _ad_call(kernel::PreparedKernel, resolved::Tuple, active;
                   scalar_output::Bool = true)
     active_index = _ad_active_index(kernel, active)
     _ad_validate_kernel(kernel, active_index, resolved; scalar_output)
-    call = _ad_kernel_call(kernel, resolved, Val(active_index))
-    point, contexts = _ad_arguments(Val(active_index), resolved)
-    call, point, contexts, active_index
+    call, external_values =
+        _ad_kernel_call(kernel, resolved, Val(active_index))
+    point, contexts = _ad_arguments(
+        Val(active_index), (resolved..., external_values...))
+    call, point, contexts, active_index, external_values
 end
 
 function _ad_spec_kernel(spec::KernelSpec, want, bound = NamedTuple())
@@ -290,27 +301,28 @@ function _prepare_ad(kernel::PreparedKernel, resolver,
                      backend::DifferentiationInterface.AbstractADType,
                      args::Tuple, kwargs::NamedTuple, active)
     resolved = _ad_resolve(resolver, args, kwargs)
-    call, point, contexts, active_index =
+    call, point, contexts, active_index, external_values =
         _ad_call(kernel, resolved, active)
     preparation = DifferentiationInterface.prepare_gradient(
         call, backend, point, contexts...)
     PreparedADKernel{active_index,typeof(kernel),typeof(resolver),typeof(call),
-                     typeof(backend),typeof(preparation)}(
-        kernel, resolver, call, backend, preparation)
+                     typeof(backend),typeof(preparation),
+                     typeof(external_values)}(
+        kernel, resolver, call, backend, preparation, external_values)
 end
 
 function _prepare_ad_pullback(kernel::PreparedKernel, resolver,
                               backend::DifferentiationInterface.AbstractADType,
                               seed, args::Tuple, kwargs::NamedTuple, active)
     resolved = _ad_resolve(resolver, args, kwargs)
-    call, point, contexts, active_index =
+    call, point, contexts, active_index, external_values =
         _ad_call(kernel, resolved, active; scalar_output = false)
     preparation = DifferentiationInterface.prepare_pullback(
         call, backend, point, (seed,), contexts...)
     PreparedADPullback{
         active_index,typeof(kernel),typeof(resolver),typeof(call),
-        typeof(backend),typeof(preparation),
-    }(kernel, resolver, call, backend, preparation)
+        typeof(backend),typeof(preparation),typeof(external_values),
+    }(kernel, resolver, call, backend, preparation, external_values)
 end
 
 """
@@ -330,7 +342,9 @@ first: the named ports are fixed to the supplied values, their data-only
 subgraph executes once during preparation, and both the differentiated call
 and its `Constant` contexts cover only the remaining ports. `args` and
 `active` then refer to those remaining ports positionally; authored keyword
-arguments do not apply to a bound preparation.
+arguments do not apply to a bound preparation. Array-valued residual constants
+are passed to the backend as hidden `Constant` contexts rather than captured in
+the differentiated callable; this does not change the public HAVE boundary.
 """
 function prepare_ad(spec::KernelSpec,
                     backend::DifferentiationInterface.AbstractADType,
@@ -408,12 +422,12 @@ function ad_gradient(spec::KernelSpec,
     kernel = _ad_spec_kernel(spec, want, bound)
     if !isempty(bound)
         _ad_reject_bound_keywords(NamedTuple(kwargs))
-        call, point, contexts, _ = _ad_call(kernel, args, active)
+        call, point, contexts, _, _ = _ad_call(kernel, args, active)
         return DifferentiationInterface.gradient(call, backend, point, contexts...)
     end
     resolver = _ad_resolver(spec)
     resolved = _ad_resolve(resolver, args, NamedTuple(kwargs))
-    call, point, contexts, _ = _ad_call(kernel, resolved, active)
+    call, point, contexts, _, _ = _ad_call(kernel, resolved, active)
     DifferentiationInterface.gradient(call, backend, point, contexts...)
 end
 
@@ -423,7 +437,7 @@ function ad_gradient(kernel::PreparedKernel,
     isempty(kwargs) || throw(ArgumentError(
         "a low-level PreparedKernel has a positional HAVE boundary and does " *
         "not accept keywords; use a KernelSpec to preserve authored keywords"))
-    call, point, contexts, _ = _ad_call(kernel, args, active)
+    call, point, contexts, _, _ = _ad_call(kernel, args, active)
     DifferentiationInterface.gradient(call, backend, point, contexts...)
 end
 
@@ -433,7 +447,7 @@ function _ad_prepared_arguments(
     length(resolved) == length(inputs(prepared.kernel)) || throw(ArgumentError(
         "selected HAVE boundary expects $(length(inputs(prepared.kernel))) " *
         "values; got $(length(resolved))"))
-    _ad_arguments(Val(I), resolved)
+    _ad_arguments(Val(I), (resolved..., prepared.external_values...))
 end
 
 function ad_gradient(prepared::PreparedADKernel, args...; kwargs...)
@@ -485,7 +499,7 @@ function ad_pullback(spec::KernelSpec,
     kernel = _ad_spec_kernel(spec, want)
     resolver = _ad_resolver(spec)
     resolved = _ad_resolve(resolver, args, NamedTuple(kwargs))
-    call, point, contexts, _ =
+    call, point, contexts, _, _ =
         _ad_call(kernel, resolved, active; scalar_output = false)
     only(DifferentiationInterface.pullback(
         call, backend, point, (seed,), contexts...))
@@ -497,7 +511,7 @@ function ad_pullback(kernel::PreparedKernel,
     isempty(kwargs) || throw(ArgumentError(
         "a low-level PreparedKernel has a positional HAVE boundary and does " *
         "not accept keywords; use a KernelSpec to preserve authored keywords"))
-    call, point, contexts, _ =
+    call, point, contexts, _, _ =
         _ad_call(kernel, args, active; scalar_output = false)
     only(DifferentiationInterface.pullback(
         call, backend, point, (seed,), contexts...))
@@ -509,7 +523,7 @@ function _ad_prepared_arguments(
     length(resolved) == length(inputs(prepared.kernel)) || throw(ArgumentError(
         "selected HAVE boundary expects $(length(inputs(prepared.kernel))) " *
         "values; got $(length(resolved))"))
-    _ad_arguments(Val(I), resolved)
+    _ad_arguments(Val(I), (resolved..., prepared.external_values...))
 end
 
 function ad_pullback(prepared::PreparedADPullback, seed, args...; kwargs...)
@@ -578,14 +592,19 @@ program and writes it into the traced destination, without using the native DI
 preparation there.
 """
 @generated function ad_value_and_gradient!(
-        prepared::PreparedADKernel{I,K,typeof(tuple)}, gradient,
-        args::Vararg{Any,N}) where {I,K,N}
+        prepared::PreparedADKernel{I,K,typeof(tuple),F,B,P,E}, gradient,
+        args::Vararg{Any,N}) where {I,K,F,B,P,E,N}
     1 <= I <= N || return :(throw(ArgumentError(
         "prepared active input index $I is invalid for $N arguments")))
     contexts = [
         :(DifferentiationInterface.Constant(getfield(args, $index)))
         for index in 1:N if index != I
     ]
+    append!(contexts, [
+        :(DifferentiationInterface.Constant(
+            getfield(prepared.external_values, $index)))
+        for index in 1:fieldcount(E)
+    ])
     quote
         length(inputs(prepared.kernel)) == $N || throw(ArgumentError(
             "selected HAVE boundary expects " *

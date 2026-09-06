@@ -17,7 +17,7 @@
 import Pkg
 
 const _PROBE_INNER = "RK_GRADIENT_PROBE_INNER"
-const _MF_REV = "b353559ef3e391ae2e2d98256b6967903fdfa410"
+const _MF_REV = "4fc41b1c7b774133ceaacc4ff3c34c67b15b87b2"
 
 function _run()
     root = normpath(joinpath(@__DIR__, ".."))

@@ -7,6 +7,7 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     MNISTLogisticExample, MVNormalRegressionExample, BoundRegressionExample
 using Test
 
+include("test_ppl_workflow.jl")
 include("test_eight_schools_example.jl")
 include("test_sum_to_zero_example.jl")
 include("test_mnist_logistic_example.jl")

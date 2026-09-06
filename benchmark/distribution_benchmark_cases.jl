@@ -15,6 +15,10 @@ const SCALAR_GALLERY_FAMILIES = (
     "exponential_logscale",
     "geometric_logit",
     "uniform_bounded",
+    "poisson_lograte",
+    "gamma_shape_rate",
+    "beta_shapes",
+    "binomial_logit",
 )
 const SCALAR_GALLERY_SIZES = (1_000, 100_000)
 const STRUCTURED_SIZES = (4, 16, 64, 128)
@@ -65,6 +69,30 @@ function scalar_family_inputs(::Val{:uniform_bounded}, n::Integer)
     lower, upper = -1.0, 2.0
     x = collect(range(lower + 0.01, upper - 0.01; length = n))
     (; x, lower, upper)
+end
+
+function scalar_family_inputs(::Val{:poisson_lograte}, n::Integer)
+    log_rate = log(2.5)
+    observed = [mod(i * 7, 9) for i in 0:(n - 1)]
+    (; observed, log_rate)
+end
+
+function scalar_family_inputs(::Val{:gamma_shape_rate}, n::Integer)
+    shape, log_rate = 2.0, log(1.5)
+    x = [0.05 + 2.5abs(sin(0.021i)) + 0.001(i % 13) for i in 1:n]
+    (; x, shape, log_rate)
+end
+
+function scalar_family_inputs(::Val{:beta_shapes}, n::Integer)
+    a, b = 2.0, 5.0
+    x = [0.01 + 0.98 * (0.5 + 0.5sin(0.017i)) for i in 1:n]
+    (; x, a, b)
+end
+
+function scalar_family_inputs(::Val{:binomial_logit}, count::Integer)
+    trials, logit = 10, 0.2
+    observed = [mod(i * 3, trials + 1) for i in 0:(count - 1)]
+    (; observed, n = trials, logit)
 end
 
 function mvn_inputs(n::Integer)
