@@ -17,6 +17,10 @@ const _DISTRIBUTION_GRADIENT_ACTIVE = Dict(
     "exponential_logscale" => ("x", "vector"),
     "geometric_logit" => ("logitp", "scalar"),
     "uniform_bounded" => ("x", "vector"),
+    "poisson_lograte" => ("log_rate", "scalar"),
+    "gamma_shape_rate" => ("x", "vector"),
+    "beta_shapes" => ("x", "vector"),
+    "binomial_logit" => ("logit", "scalar"),
 )
 
 function _expected_distribution_gradient_rows()

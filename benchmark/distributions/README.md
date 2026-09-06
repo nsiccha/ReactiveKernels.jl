@@ -52,11 +52,11 @@ evaluation. Override the exploratory counts with `RK_DENSITY_REPLICAS=1,4`;
 published receipts use `1,16,256`.
 
 The scalar-gallery benchmark compares the public Cauchy, Laplace, Bernoulli,
-LogNormal, Exponential, Geometric, and Uniform objects after their generic
-`plate` lift. Normal has its separate shared-object/control benchmark. The
-gallery records two vector sizes per family, traces every model parameter under
-Reactant, and keeps an explicit diagnostic for any public comparison path that
-does not compile.
+LogNormal, Exponential, Geometric, Uniform, Poisson, Gamma, Beta, and Binomial
+objects after their generic `plate` lift. Normal has its separate
+shared-object/control benchmark. The gallery records two vector sizes per
+family, traces every model parameter under Reactant, and keeps an explicit
+diagnostic for any public comparison path that does not compile.
 
 The structured benchmark compares the exact build-executed MVN source against
 the public multivariate-Normal interfaces in Distributions and

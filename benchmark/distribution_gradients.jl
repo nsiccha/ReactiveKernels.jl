@@ -15,7 +15,7 @@ using Random
 using ReactiveKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal, cauchy, laplace, bernoulli, lognormal, exponential, geometric,
-    uniform, mvnormal
+    uniform, mvnormal, poisson, gamma, beta, binomial
 using Statistics
 using TOML
 
@@ -43,6 +43,14 @@ const GEOMETRIC_KERNEL = plate(geometric.logpdf;
     have = (:observed, :logitp), want = :logpdf, batched = (:observed,))
 const UNIFORM_KERNEL = plate(uniform.logpdf;
     have = (:x, :lower, :upper), want = :logpdf, batched = (:x,))
+const POISSON_KERNEL = plate(poisson.logpdf;
+    have = (:observed, :log_rate), want = :logpdf, batched = (:observed,))
+const GAMMA_KERNEL = plate(gamma.logpdf;
+    have = (:x, :shape, :log_rate), want = :logpdf, batched = (:x,))
+const BETA_KERNEL = plate(beta.logpdf;
+    have = (:x, :a, :b), want = :logpdf, batched = (:x,))
+const BINOMIAL_KERNEL = plate(binomial.logpdf;
+    have = (:observed, :n, :logit), want = :logpdf, batched = (:observed,))
 const MVNORMAL_KERNEL = prepare(mvnormal.logpdf;
     have = (:x, :μ, :chol), want = :logpdf)
 
@@ -53,6 +61,10 @@ _family_kernel(::Val{:lognormal_logscale}) = LOGNORMAL_KERNEL
 _family_kernel(::Val{:exponential_logscale}) = EXPONENTIAL_KERNEL
 _family_kernel(::Val{:geometric_logit}) = GEOMETRIC_KERNEL
 _family_kernel(::Val{:uniform_bounded}) = UNIFORM_KERNEL
+_family_kernel(::Val{:poisson_lograte}) = POISSON_KERNEL
+_family_kernel(::Val{:gamma_shape_rate}) = GAMMA_KERNEL
+_family_kernel(::Val{:beta_shapes}) = BETA_KERNEL
+_family_kernel(::Val{:binomial_logit}) = BINOMIAL_KERNEL
 
 _active_port(::Val{:cauchy_location_scale}) = :x
 _active_port(::Val{:laplace_location_scale}) = :x
@@ -61,6 +73,10 @@ _active_port(::Val{:lognormal_logscale}) = :x
 _active_port(::Val{:exponential_logscale}) = :x
 _active_port(::Val{:geometric_logit}) = :logitp
 _active_port(::Val{:uniform_bounded}) = :x
+_active_port(::Val{:poisson_lograte}) = :log_rate
+_active_port(::Val{:gamma_shape_rate}) = :x
+_active_port(::Val{:beta_shapes}) = :x
+_active_port(::Val{:binomial_logit}) = :logit
 
 function _expected_gradient(::Val{:cauchy_location_scale}, inputs)
     (; x, location, scale) = inputs
@@ -98,6 +114,27 @@ end
 
 function _expected_gradient(::Val{:uniform_bounded}, inputs)
     zeros(length(inputs.x))
+end
+
+function _expected_gradient(::Val{:poisson_lograte}, inputs)
+    (; observed, log_rate) = inputs
+    sum(observed) - length(observed) * exp(log_rate)
+end
+
+function _expected_gradient(::Val{:gamma_shape_rate}, inputs)
+    (; x, shape, log_rate) = inputs
+    @. (shape - 1) / x - exp(log_rate)
+end
+
+function _expected_gradient(::Val{:beta_shapes}, inputs)
+    (; x, a, b) = inputs
+    @. (a - 1) / x - (b - 1) / (1 - x)
+end
+
+function _expected_gradient(::Val{:binomial_logit}, inputs)
+    (; observed, n, logit) = inputs
+    probability = inv(1 + exp(-logit))
+    sum(observed) - length(observed) * n * probability
 end
 
 function _normal_expected_gradient(inputs)
