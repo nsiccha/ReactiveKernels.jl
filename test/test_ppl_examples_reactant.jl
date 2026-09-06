@@ -11,6 +11,7 @@ using ReactiveKernelsPPLExamples.GLMBinomialExample: evaluate_glm_binomial_sourc
 using ReactiveKernelsPPLExamples.EightSchoolsNoncenteredExample:
     evaluate_eight_schools_noncentered_source
 using ReactiveKernelsPPLExamples.GLMMPoissonExample: evaluate_glmm_poisson_source
+using ReactiveKernelsPPLExamples.BLRExample: evaluate_blr_source
 using ReactiveKernelsPPLExamples.KidscoreMomhsExample: evaluate_kidscore_momhs_source
 using ReactiveKernelsPPLExamples.KidscoreMomiqExample: evaluate_kidscore_momiq_source
 using ReactiveKernelsPPLExamples.KidscoreMomhsiqExample: evaluate_kidscore_momhsiq_source
@@ -89,6 +90,10 @@ end
     end
     @testset "glmm_poisson (posteriordb; hierarchical Poisson-log + random effects)" begin
         a = evaluate_glmm_poisson_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "blr (posteriordb; Bayesian linear regression, matvec)" begin
+        a = evaluate_blr_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
     @testset "kidscore_momhs (posteriordb; Gaussian linear regression)" begin

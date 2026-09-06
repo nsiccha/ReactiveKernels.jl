@@ -17,6 +17,7 @@ include("kidscore_momhs.jl")
 include("kidscore_momiq.jl")
 include("kidscore_momhsiq.jl")
 include("kidscore_interaction.jl")
+include("blr.jl")
 include("dugongs_growth.jl")
 include("arma11.jl")
 include("gaussian_mixture.jl")
@@ -54,6 +55,7 @@ export KidscoreMomhsExample
 export KidscoreMomiqExample
 export KidscoreMomhsiqExample
 export KidscoreInteractionExample
+export BLRExample
 export DugongsGrowthExample
 export ARMA11Example
 export GaussianMixtureExample
