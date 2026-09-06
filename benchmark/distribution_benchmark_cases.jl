@@ -3,8 +3,8 @@ module DistributionBenchmarkCases
 using Random
 
 export NORMAL_SIZES, SCALAR_GALLERY_FAMILIES, SCALAR_GALLERY_SIZES,
-    STRUCTURED_SIZES, normal_parameters, normal_observations,
-    scalar_family_inputs, mvn_inputs
+    DISTRIBUTION_GRADIENT_FAMILIES, STRUCTURED_SIZES, normal_parameters,
+    normal_observations, scalar_family_inputs, mvn_inputs
 
 const NORMAL_SIZES = (1, 1_000, 10_000, 30_000, 100_000, 1_000_000)
 const SCALAR_GALLERY_FAMILIES = (
@@ -19,6 +19,15 @@ const SCALAR_GALLERY_FAMILIES = (
     "gamma_shape_rate",
     "beta_shapes",
     "binomial_logit",
+)
+const DISTRIBUTION_GRADIENT_FAMILIES = (
+    "cauchy_location_scale",
+    "laplace_location_scale",
+    "bernoulli_logit",
+    "lognormal_logscale",
+    "exponential_logscale",
+    "geometric_logit",
+    "uniform_bounded",
 )
 const SCALAR_GALLERY_SIZES = (1_000, 100_000)
 const STRUCTURED_SIZES = (4, 16, 64, 128)

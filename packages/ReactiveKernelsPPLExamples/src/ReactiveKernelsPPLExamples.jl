@@ -17,6 +17,15 @@ include("mvnormal_regression.jl")
 include("bound_regression.jl")
 
 export PPLWorkflow
+
+# EXPERIMENTAL, NOT REVIEWED / NOT APPROVED — do NOT build on this.
+# `PPLMacro.@ppl` is an in-progress sb-like PPL front-end (first cut). It is
+# deliberately NOT exported and NOT part of the consumer API (`reactivekernels-use`
+# does not mention it), so no consuming agent picks it up and it introduces no
+# churn while it is unreviewed. Reach it only via the fully qualified
+# `ReactiveKernelsPPLExamples.PPLMacro.@ppl`. See the `PPLMacro` module docstring.
+include("ppl_macro.jl")
+
 export EightSchoolsExample
 export SumToZeroExample
 export LinearRegressionExample
