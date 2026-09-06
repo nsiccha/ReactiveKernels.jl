@@ -239,13 +239,11 @@ function setup_linear_regression!(mod::Module)
     if !isdefined(mod, :LinearRegressionExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: LinearRegressionExample))
     end
+    # Bind only the data. The displayed PPL assembly imports and reuses the
+    # shared `normal` distribution object directly; no helper evaluator, factor,
+    # or separately prepared density/plate is injected.
     Core.eval(mod, :(using .LinearRegressionExample:
-        LinearRegressionParameters, LinearPrediction,
-        DataVector, UnconstrainedParameters,
-        LINREG_X, LINREG_Y,
-        split_unconstrained, positive_scale, assemble_parameters,
-        log_abs_det_jacobian, log_prior, pointwise_log_likelihood,
-        sum_log_likelihood, total_log_density, predict_new))
+        LINREG_X, LINREG_Y))
     nothing
 end
 

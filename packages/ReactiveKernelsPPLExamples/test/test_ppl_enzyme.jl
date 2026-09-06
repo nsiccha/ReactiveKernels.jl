@@ -31,13 +31,18 @@ function eight_schools_reference_density(q)
 end
 
 function linear_regression_reference_density(q)
-    α, β, log_σ = q
-    parameters = LinearRegressionParameters(α, β, exp(log_σ))
-    prior = LinearRegressionExample.log_prior(parameters)
-    likelihood = LinearRegressionExample.sum_log_likelihood(
-        LinearRegressionExample.pointwise_log_likelihood(
-            parameters, LINREG_X, LINREG_Y))
-    LinearRegressionExample.total_log_density(prior, log_σ, likelihood)
+    α, β, log_σ = q[1], q[2], q[3]
+    σ = exp(log_σ)
+    normal(x, location, scale) =
+        -0.5 * log(2π) - log(scale) - 0.5 * ((x - location) / scale)^2
+    # α, β ~ Normal(0, 10); σ ~ HalfNormal(5); log Jacobian log|dσ/dlog_σ| = log_σ.
+    prior = normal(α, 0.0, 10.0) + normal(β, 0.0, 10.0) +
+            log(2.0) + normal(σ, 0.0, 5.0)
+    likelihood = zero(α)
+    @inbounds for i in eachindex(LINREG_Y)
+        likelihood += normal(LINREG_Y[i], α + β * LINREG_X[i], σ)
+    end
+    prior + log_σ + likelihood
 end
 
 function beta_binomial_reference_density(logit_rate)
