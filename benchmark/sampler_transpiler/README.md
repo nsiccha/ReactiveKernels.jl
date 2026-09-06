@@ -224,6 +224,47 @@ each helper keyword explicitly, either through its binder or at the call site.
 `runtime_keyword_probe.jl` checks evaluation order, per-site rejection and
 native/Reactant execution independently of the sampler.
 
+[`position_multinomial_hmc_kernel.jl`](position_multinomial_hmc_kernel.jl)
+uses a fixed anchor and one working point, passing the direction as a runtime
+keyword to the captured integrator. Selection retains only the chosen position;
+momentum is refreshed on the next transition. This source therefore does not
+return the selected joint phasepoint. The original full-phasepoint source above
+remains available unchanged.
+
+Partial authoritative-field copies can now preserve derived caches too. The
+compiler proves that every input of a selected recipe is either copied or shared
+by identity, then copies its affected numeric cache and currentness flag. It
+preserves destination buffers and excludes caches depending on any uncopied
+owned input. Borrowed destination arrays prevent hidden cache transfers.
+`partial_transfers=false` disables this pass independently of complete endpoint
+coalescing. The nonsampler [`partial_transfer_probe.jl`](partial_transfer_probe.jl)
+checks valid/invalid vector and scalar caches, uncopied dependencies, borrowed
+arrays, runtime branches and caller preservation in native and Reactant runs.
+
+`partial-transfer-v1.toml` records the pass and its position-chain application:
+the native diagnostic falls from 18,695 gradient evaluations to 16,000 for
+16,000 leapfrog steps. The same position-chain source runs through both backends.
+Its new scaling producer is:
+
+```sh
+julia --project=benchmark/sampler_transpiler benchmark/sampler_transpiler/position_multinomial_scaling.jl /absolute/output.csv
+```
+
+`position-multinomial-scaling-v1.csv` retains 168 execution samples and six
+process-ordered compile rows; the adjacent TOML records source hashes and the
+output contract. At 10,000 transitions, native medians are 1.69 and 6.07 μs per
+transition for four and sixteen steps; Reactant medians are 2.19 and 12.58 μs.
+The sixteen-step Reactant result is competitive with AdvancedHMC in the longer
+batches in this run, but loses against its strongest sample at 100 transitions.
+These experiments still count integration steps. The previous full-phasepoint
+CSV remains a separate historical dataset.
+
+The whole Reactant chain executes in one synchronized compiled call. Its fixed
+call cost amortizes across transitions; it cannot explain the remaining gap
+against native at large batch sizes. A check of this benchmark environment
+reports Reactant's CPU backend. These timings exclude compilation and input
+preparation and do not establish the cause of the remaining execution gap.
+
 The internal native emitter accepts `count_steps=false` to omit its diagnostic
 integration counter. Existing drivers keep counting by default. The
 [`counter_ablation.jl`](counter_ablation.jl) experiment alternates counted and

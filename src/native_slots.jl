@@ -81,7 +81,8 @@ function native_endpoint(spec, method, arguments)
     (; pf, owned, shared)
 end
 
-function coalesced_slot_transfer(body,start,context,mainctx,children,borrowed)
+function coalesced_slot_transfer(body,start,context,mainctx,children,borrowed,fresh;
+        allow_partial=true)
     context===mainctx || return nothing
     first_write=body[start]
     first_write isa RK._PlaceWrite || return nothing
@@ -98,19 +99,20 @@ function coalesced_slot_transfer(body,start,context,mainctx,children,borrowed)
     any(c->(destination.prefix,c) in borrowed,owned) && return nothing
     sources=setdiff(owned,keys(destination.producer))
     isempty(sources) && return nothing
-    transferred=Set{Int}()
+    transferred=Set{Int}(); writes=Any[]
     for index in start:length(body)
         write=body[index]
-        write isa RK._PlaceWrite || return nothing
+        write isa RK._PlaceWrite || break
         lhs,rhs=write.target,write.rhs
         lhs isa RK._SelfField && rhs isa RK._SelfField &&
             length(lhs.path)==2 && length(rhs.path)==2 &&
-            first(lhs.path)===first(target.path) && first(rhs.path)===first(source.path) || return nothing
+            first(lhs.path)===first(target.path) && first(rhs.path)===first(source.path) || break
         canon=fields[last(lhs.path)]
-        canon==fields[last(rhs.path)] && canon in sources || return nothing
+        canon==fields[last(rhs.path)] && canon in sources || break
         T=RK._pp_fieldtype(slotplan(destination),canon,typeof(destination.owned),typeof(destination.shared))
-        write.dot==(T <: AbstractArray) || return nothing
+        write.dot==(T <: AbstractArray) || break
         push!(transferred,canon)
+        push!(writes,write)
         if transferred==sources
             # Equal authoritative inputs and shared recipe authorities imply
             # equal derived values. Transfer the cache and its validity bits,
@@ -122,12 +124,55 @@ function coalesced_slot_transfer(body,start,context,mainctx,children,borrowed)
             return index-start,value
         end
     end
-    nothing
+    allow_partial && !isempty(transferred) || return nothing
+    plan=slotplan(destination)
+    # A partial source copy establishes equality only for those inputs and
+    # the shared authorities. Close that fact over the selected recipe DAG;
+    # a recipe depending on any other owned input cannot reuse the source cache.
+    equal=union(transferred,setdiff(Set(values(fields)),owned))
+    inputs=Dict(RK.kernel_plan_recipe_inputs(plan))
+    while true
+        before=length(equal)
+        for (canon,recipe) in destination.producer
+            all(in(equal),inputs[recipe]) && push!(equal,canon)
+        end
+        length(equal)==before && break
+    end
+    affected=Set{Int}()
+    for canon in transferred
+        union!(affected,RK._exec_kill_closure(plan,canon,destination.producer))
+    end
+    reusable=intersect(equal,affected,Set(keys(destination.producer)))
+    # Hidden cache writes may use only the compiler's builtin numeric storage
+    # contract; an arbitrary array's copyto! could have additional effects.
+    filter!(reusable) do canon
+        T=RK._pp_fieldtype(plan,canon,typeof(destination.owned),typeof(destination.shared))
+        RK._kernel_dom_num_scalar(T) || RK._kernel_dom_num_array(T)
+    end
+    isempty(reusable) && return nothing
+    statements=Any[]
+    for write in writes
+        name=last(write.target.path)
+        push!(statements,slot_write(destination,name,slot_read(origin,name;ensure=false),
+            write.dot,fresh(:transfer)))
+    end
+    dest,src=Symbol(destination.prefix,:_owned),Symbol(origin.prefix,:_owned)
+    for canon in sort!(collect(reusable))
+        role,i=RK.kernel_plan_field(plan,canon)
+        role===:owned || continue
+        push!(statements,:(RK._canon_copy_slot!($dest,$src,Val($i))))
+        push!(statements,:(if RK._canon_current($src,Val($i))
+            RK._canon_bless!($dest,Val($i))
+        else
+            RK._canon_kill!($dest,Val($i))
+        end))
+    end
+    length(writes)-1,Expr(:block,statements...)
 end
 
 function compile_native_slots(kernel, state, name; endpoints, effects, hoist=true,
         bufferize=true, coalesce_transfers=true, count_gradients=false, peel_loops=false,
-        count_steps::Bool=true)
+        count_steps::Bool=true, partial_transfers::Bool=true)
     integer_indices=Dict{Symbol,Any}()
     pf = getfield(kernel,:prepared)
     skel = getfield(kernel,:skeleton)
@@ -275,7 +320,8 @@ function compile_native_slots(kernel, state, name; endpoints, effects, hoist=tru
                 continue
             end
             if coalesce_transfers
-                transfer=coalesced_slot_transfer(body,index,context,mainctx,children,borrowed)
+                transfer=coalesced_slot_transfer(body,index,context,mainctx,children,borrowed,fresh;
+                    allow_partial=partial_transfers)
                 if transfer!==nothing
                     skip,value=transfer
                     push!(out,value)

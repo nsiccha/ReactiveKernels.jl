@@ -94,6 +94,12 @@ function compile_traced_slots(program; static_currentness=true, unroll_limit=0, 
                 return :($(current(x.args[2],index(x.args[3]))) = $(callee(f,:_canon_bless!)))
             elseif callee(f,:_canon_bless2!)
                 return Expr(:block,(:($(current(x.args[2],index(i))) = true) for i in x.args[3:4])...)
+            elseif callee(f,:_canon_copy_slot!)
+                dest,source=x.args[2:3]
+                i=index(x.args[4])
+                value=RK._canon_slot(contextmap[dest].owned,Val(i))
+                d,s=slot(dest,i),slot(source,i)
+                return value isa AbstractArray ? :(copyto!($d,$s)) : :($d=$s)
             elseif callee(f,:_canon_copy_endpoint!)
                 dest,source=x.args[2:3]
                 native=contextmap[dest].owned

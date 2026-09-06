@@ -59,13 +59,15 @@ function traced_scaling(io,program,projection,comparator,L,batches)
     end
 end
 
-function multinomial_scaling(path;batches=(100,1000,10000),steps=(4,16))
+function multinomial_scaling(path;batches=(100,1000,10000),steps=(4,16),
+        prototype_options=NamedTuple())
     open(path,"w") do io
         println(io,"backend,paired_with,steps_per_transition,transitions,gradient_evaluations,sample,phase,seconds,allocated_bytes")
         for L in steps
-            native=build_multinomial_prototype(;L)
+            native=build_multinomial_prototype(;L,prototype_options...)
             native_scaling(io,native,batches)
-            traced=build_multinomial_prototype(;L,compiler_options=(peel_loops=true,))
+            traced=build_multinomial_prototype(;L,compiler_options=(peel_loops=true,),
+                prototype_options...)
             reset_native_slots!(traced.prepared)
             program=compile_traced_slots(traced.prepared.program)
             prefix=Symbol(traced.prepared.program.contexts[2].prefix,:_owned)
