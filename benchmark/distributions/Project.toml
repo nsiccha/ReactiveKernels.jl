@@ -7,6 +7,7 @@ ProbabilityMeasures = "d96443b0-2461-4412-bb6f-797ac5201ef9"
 Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 ReactiveKernels = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
 ReactiveKernelsDistributionKernels = "4b169cd9-fc12-43fd-ba39-43e54ed8db7a"
+SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 
 [compat]
 BenchmarkTools = "=1.8.0"

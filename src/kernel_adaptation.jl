@@ -5279,13 +5279,13 @@ function _sm_functional_machine_call(
         getfield(transition, :rng_providers),
         getfield(transition, :ensures), getfield(transition, :step),
         backend_state, arguments, effects)
-    _sm_validate_machine_state(transition, result.state)
+    # Backend value storage may duplicate logical alias paths. Restore the
+    # source topology before checking the public result contract.
     result = _sm_restore_reusable_compiled_output(transition, result)
     restored_effects = _sm_canonicalize_effect_topologies(
         getfield(transition, :ports), result.effects)
     result = merge(result, (effects=restored_effects,))
-    _sm_validate_topology_contract(
-        result.state, _sm_compiled_topology(transition))
+    _sm_validate_machine_state(transition, result.state)
     _sm_validate_effect_topologies(
         getfield(transition, :ports), result.effects)
     _sm_validate_observation_result(transition, result)
