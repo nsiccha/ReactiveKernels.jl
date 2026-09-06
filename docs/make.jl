@@ -32,6 +32,7 @@ include("kernel_examples.jl")
 Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "result_views.jl"))
 include("check_rendered.jl")
 include("hmc_transpiler.jl")
+include("gibbs_page.jl")
 
 site_pages = [
     "Home" => "index.md",
@@ -74,6 +75,7 @@ site_pages = [
         "Adaptive NUTS receipt (static)" => "nuts-reactant.md",
     ],
     "Non-allocating kernels" => "nonallocating.md",
+    "posteriordb benchmark (RK vs Stan vs Turing)" => "posteriordb-comparison.md",
     "Tools and reference" => [
         "DAG visualization" => "visualization.md",
         "API" => "api.md",
@@ -81,6 +83,7 @@ site_pages = [
     "Bijectors" => "bijectors.md",
     "Sampling (experimental)" => [
         "Multinomial HMC transpiler" => "hmc-transpiler.md",
+        "Gibbs on reactive kernels" => "gibbs.md",
         "Pathfinder approximation" => "pathfinder.md",
         "ReactiveHMC kernel corpus" => "reactivehmc-corpus.md",
         "NUTS source and receipts (not executed)" => "nuts.md",
