@@ -330,6 +330,28 @@ _nlp(x, mu, sig) = -0.5 * log(2π) - log(sig) - 0.5 * ((x - mu) / sig)^2
         end
     end
 
+    @testset "current-state conjugacy: Beta inclusion prob given a Bernoulli latent" begin
+        # omega ~ Beta(a0,b0); z_j ~ Bernoulli(omega); y informs z strongly. Then
+        # omega | z is Beta(a0 + Σz, b0 + Σ(1-z)), recomputed from the CURRENT z
+        # each sweep — an exact current-state conjugate draw (SSVS's omega block).
+        @ppl incl(y::Vector{Float64}, p::Int) = begin
+            omega ~ beta(2.0, 3.0)
+            z::vector[p] ~ bernoulli(omega)
+            y ~ normal(ifelse(z, 5.0, -5.0), 0.5)
+        end
+        p = 8
+        y = [5.2, 4.7, 5.1, 4.9, 5.3, -4.8, -5.1, -4.6]   # 5 "on", 3 "off"
+        res = gibbs(incl; blocks = [:omega, :z], data = (; y, p),
+                    init = (; omega = 0.5, z = fill(true, p)),
+                    support = (; omega = :unit), iters = 20000, warmup = 2000,
+                    rng = MersenneTwister(3))
+        om = Float64.(res.draws[:omega])
+        @test res.accept_rate[:omega] == 1.0              # exact conjugate draw
+        @test all(x -> 0.0 < x < 1.0, om)
+        # z is essentially determined by y (Σz ≈ 5), so omega | z ≈ Beta(7, 6).
+        @test isapprox(_mean(om), 7 / 13; atol = 0.03)    # Beta(7,6) mean
+    end
+
     @testset "SSVS spike-and-slab acceptance (George & McCulloch) on an @ppl model" begin
         # The full classic SSVS, authored end-to-end in @ppl: a Beta inclusion
         # probability, a vector of Bernoulli inclusion indicators, a conditional
@@ -367,6 +389,7 @@ _nlp(x, mu, sig) = -0.5 * log(2π) - log(sig) - 0.5 * ((x - mu) / sig)^2
         bhat = [_mean([bi[j] for bi in res.draws[:beta]]) for j in 1:p]
 
         @test res.accept_rate[:z] == 1.0                  # exact enumeration for z
+        @test res.accept_rate[:omega] == 1.0              # current-state Beta conjugate
         # variable selection: the true-nonzero coefficients are selected and
         # recovered; the true-zero coefficients are excluded and shrunk.
         for j in (1, 2, 6)
