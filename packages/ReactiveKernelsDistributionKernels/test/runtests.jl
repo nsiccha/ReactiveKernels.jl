@@ -1,5 +1,5 @@
 using Distributions: Bernoulli, Cauchy, Dirichlet, Exponential, Geometric,
-    InverseGamma, Laplace, LogNormal, MvNormal, Normal, Uniform,
+    InverseGamma, Laplace, LogNormal, MvNormal, Normal, TDist, Uniform,
     cdf, logpdf, quantile
 using LinearAlgebra: Symmetric, cholesky
 using ReactiveKernels: @kernel, KernelObjectSpec, KernelSpec, code_expr, extract,
@@ -7,7 +7,8 @@ using ReactiveKernels: @kernel, KernelObjectSpec, KernelSpec, code_expr, extract
 using ReactiveKernelsDistributionKernels: DistributionKernelSources
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     LOCATION_SCALE_SOURCE,
-    standard_normal, standard_cauchy, standard_laplace, location_scale,
+    standard_normal, standard_cauchy, standard_laplace, standard_student_t,
+    location_scale, student_t,
     BERNOULLI_KERNEL_SOURCE, LOGNORMAL_KERNEL_SOURCE,
     EXPONENTIAL_KERNEL_SOURCE, GEOMETRIC_KERNEL_SOURCE, UNIFORM_KERNEL_SOURCE,
     MVNORMAL_KERNEL_SOURCE, AR1_KERNEL_SOURCE,
@@ -202,6 +203,68 @@ end
         @test :x in outputs_of(quantile_plan)
         @test !(:standardized in outputs_of(quantile_plan))
     end
+end
+
+@testset "student_t location-scale family" begin
+    @test hasproperty(standard_student_t, :logpdf)
+    @test hasproperty(student_t, :logpdf)
+    @test occursin("@kernel standard_student_t(nu", LOCATION_SCALE_SOURCE)
+    @test occursin("@kernel student_t(nu", LOCATION_SCALE_SOURCE)
+
+    # Standardized t against Distributions.TDist across degrees of freedom.
+    for nu in (1.0, 2.5, 3.0, 8.0, 30.0)
+        reference = TDist(nu)
+        for z in (-2.3, -0.4, 0.0, 0.7, 1.9)
+            @test prepare(standard_student_t.logpdf;
+                have = (:z, :nu), want = :logpdf)(z, nu) ≈ logpdf(reference, z)
+            @test prepare(standard_student_t.cdf;
+                have = (:z, :nu), want = :cdf)(z, nu) ≈ cdf(reference, z)
+        end
+        for p in (0.05, 0.27, 0.5, 0.73, 0.95)
+            @test prepare(standard_student_t.quantile;
+                have = (:p, :nu), want = :quantile)(p, nu) ≈ quantile(reference, p)
+        end
+    end
+
+    # df=1 recovers the standard Cauchy.
+    @test prepare(standard_student_t.logpdf; have = (:z, :nu), want = :logpdf)(
+        0.7, 1.0) ≈ prepare(standard_cauchy.logpdf)(0.7)
+
+    # Location-scale t: nu is lifted alongside location/scale, and scale and
+    # log_scale are equivalent HAVE routes for the one graph.
+    for (nu, location, scale) in ((3.0, 8.0, 10.0), (2.5, -1.0, 0.7), (30.0, 0.2, 2.0))
+        for x in (-3.0, 0.4, 8.0, 12.0)
+            reference = logpdf(TDist(nu), (x - location) / scale) - log(scale)
+            @test prepare(student_t.logpdf;
+                have = (:x, :location, :scale, :nu), want = :logpdf)(
+                    x, location, scale, nu) ≈ reference
+            @test prepare(student_t.logpdf;
+                have = (:x, :location, :log_scale, :nu), want = :logpdf)(
+                    x, location, log(scale), nu) ≈ reference
+            @test prepare(student_t.cdf;
+                have = (:x, :location, :scale, :nu), want = :cdf)(
+                    x, location, scale, nu) ≈ cdf(TDist(nu), (x - location) / scale)
+        end
+        for p in (0.1, 0.4, 0.6, 0.9)
+            @test prepare(student_t.quantile;
+                have = (:p, :location, :scale, :nu), want = :quantile)(
+                    p, location, scale, nu) ≈ location + scale * quantile(TDist(nu), p)
+        end
+    end
+
+    # brms half-t truncation constant: student_t_lccdf(0 | nu, 0, scale) = log(0.5)
+    # by symmetry, so cdf(0) = 0.5 for any nu/scale.
+    @test prepare(student_t.cdf; have = (:x, :location, :scale, :nu), want = :cdf)(
+        0.0, 0.0, 10.0, 3.0) ≈ 0.5
+
+    # Lifts through the generic plate path; the compiled kernel is
+    # Distributions.jl-free.
+    plated = plate(student_t.logpdf;
+        have = (:x, :location, :scale, :nu), want = :logpdf, batched = (:x,))
+    observations = [0.4, 8.0, 12.0, -2.0]
+    @test plated(observations, 0.0, 10.0, 3.0) ≈
+        sum(logpdf(TDist(3.0), xi / 10.0) - log(10.0) for xi in observations)
+    @test !occursin("Distributions", string(code_expr(plated)))
 end
 
 @testset "inverse_gamma and dirichlet conjugate-prior objects" begin
