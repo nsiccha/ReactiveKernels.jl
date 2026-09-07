@@ -65,6 +65,17 @@ end
     @testset "transformed data: log10_earn = log10(earn)" begin
         log10_earn = prepare(model; have = (:earn,), want = :log10_earn)(LOG10EARN_HEIGHT_EARN)
         @test log10_earn ≈ reference.log10_earn
+        # The untyped `log10(e)` cell must materialize a concrete `Vector{Float64}`
+        # (not a boxed `Vector{Any}`), both as a live node and as a bound
+        # transformed-data node, so the all-data-bound posterior stays promotable
+        # at the Reactant host-operand boundary (snag untyped-plate-ce).
+        @test log10_earn isa Vector{Float64}
+        bound_log10_earn = prepare(model;
+            have = (:unconstrained, :height, :earn), want = :log10_earn,
+            bound = (; height = LOG10EARN_HEIGHT_HEIGHT,
+                       earn = LOG10EARN_HEIGHT_EARN))(q)
+        @test bound_log10_earn ≈ reference.log10_earn
+        @test bound_log10_earn isa Vector{Float64}
     end
 
     @testset "posterior decomposition vs the independent reference oracle" begin
