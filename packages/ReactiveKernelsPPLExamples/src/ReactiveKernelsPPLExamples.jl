@@ -49,6 +49,9 @@ include("seeds.jl")
 include("pilots.jl")
 include("lsat.jl")
 include("surgical.jl")
+include("m0.jl")
+include("mb.jl")
+include("mt.jl")
 include("wells_dae_model.jl")
 include("wells_dae_c_model.jl")
 include("wells_interaction_model.jl")
@@ -122,6 +125,9 @@ export SeedsExample
 export PilotsExample
 export LsatExample
 export SurgicalExample
+export M0Example
+export MbExample
+export MtExample
 export WellsDaeExample
 export WellsDaeCExample
 export WellsInteractionExample

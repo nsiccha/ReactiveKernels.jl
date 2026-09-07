@@ -11,7 +11,7 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     Rate2Example, Rate3Example, Rate4Example, Rate5Example,
     DogsExample, DogsHierarchicalExample,
     SeedsExample, PilotsExample, LsatExample, SurgicalExample,
-    WellsDaeExample, WellsDaeCExample, WellsInteractionExample, WellsDaaeCExample,
+    M0Example, MbExample, MtExample, WellsDaeExample, WellsDaeCExample, WellsInteractionExample, WellsDaaeCExample,
     KidscoreMomhsExample, KidscoreMomiqExample, KidscoreMomhsiqExample, KidscoreInteractionExample,
     DugongsGrowthExample, ARMA11Example, GaussianMixtureExample,
     MNISTLogisticExample, MVNormalRegressionExample, BoundRegressionExample
@@ -60,6 +60,9 @@ include("test_seeds_example.jl")
 include("test_pilots_example.jl")
 include("test_lsat_example.jl")
 include("test_surgical_example.jl")
+include("test_m0_example.jl")
+include("test_mb_example.jl")
+include("test_mt_example.jl")
 include("test_wells_dae_example.jl")
 include("test_wells_dae_c_example.jl")
 include("test_wells_interaction_example.jl")
