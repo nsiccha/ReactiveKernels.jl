@@ -120,6 +120,45 @@ end
     return sum(pointwise)
 end
 
+# A count-data cell with the discrete-family validity guard: on a HOST count
+# beside a traced rate, `ifelse(::Bool, ::TracedRNumber, ::Float64)` infers the
+# abstract `Number`, which is what breaks Reactant's broadcast eltype deduction
+# unless the host operand is promoted first.
+@kernel reactant_guarded_count_plate(
+        counts::Vector{Int}, rates::Vector{Float64}) = begin
+    pointwise = plate(counts, rates) do count, rate
+        value::Float64 = ifelse(count >= 0, count * log(rate) - rate, -Inf)
+        return value
+    end
+    return sum(pointwise)
+end
+
+# A `Bool`-typed cell local over host count data becomes its own plate recipe
+# (the binomial family's `valid::Bool = (observed >= 0) & (observed <= n)`), so
+# with the data bound it is a `Bool`-valued broadcast over two host vectors.
+@kernel reactant_bool_local_count_plate(
+        counts::Vector{Int}, totals::Vector{Int}, rates::Vector{Float64}) = begin
+    pointwise = plate(counts, totals, rates) do count, total, rate
+        valid::Bool = (count >= 0) & (count <= total)
+        value::Float64 = count * log(rate) - total * rate
+        result::Float64 = ifelse(valid, value, -Inf)
+        return result
+    end
+    return sum(pointwise)
+end
+
+# An `eachcol` regression plate whose density recipe lists the response vector
+# before the column batch, so a plain traced response vector is the first
+# marker-bearing operand of that recipe.
+@kernel reactant_eachcol_regression_plate(
+        coefficients::Vector{Float64}, predictors::Matrix{Float64},
+        responses::Vector{Float64}) = begin
+    pointwise = plate(eachcol(predictors), responses, Ref(coefficients)) do x, y, b
+        normal(dot(x, b), 1.0).logpdf(y)
+    end
+    return sum(pointwise)
+end
+
 @kernel reactant_laplace_logscale(
         x::Float64, μ::Float64, logb::Float64) = begin
     b::Float64 = exp(logb)
@@ -821,6 +860,85 @@ end
         @test !occursin("enzyme.batch", optimized_hlo(eachcol_kernel, scores, weights))
         compiled_eachcol = @compile eachcol_kernel(scores, weights)
         @test compiled_eachcol(scores, weights) ≈ eachcol_reference
+    end
+
+    @testset "bound host data arrays in plates above the lane limit" begin
+        # `bound=` data stays a host array inside the traced program.  Above
+        # the scalar-lanes limit both large-plate lowerings must promote it:
+        # the broadcast lowering deduces its eltype from the RAW host element
+        # type (a guarded count cell then infers `Number`, which has no traced
+        # `similar`), and the batched lowering only recognizes traced arrays as
+        # explicit batch inputs (a host lane vector was captured as a SHARED
+        # closure value, handing the whole vector to every lane's cell).
+        ext = Base.get_extension(ReactiveKernels, :ReactiveKernelsReactantExt)
+        n = ext._REACTANT_SMALL_STATIC_PLATE_LANES[] + 4
+
+        counts_host = collect(0:(n - 1))
+        rates_host = collect(range(0.5, 4.0; length = n))
+        guarded = prepare(reactant_guarded_count_plate;
+            have = (:counts, :rates), want = :__return__,
+            bound = (; counts = counts_host))
+        guarded_reference = sum(
+            c * log(r) - r for (c, r) in zip(counts_host, rates_host))
+        @test guarded(rates_host) ≈ guarded_reference
+        rates = Reactant.to_rarray(rates_host)
+        compiled_guarded = @compile guarded(rates)
+        @test compiled_guarded(rates) ≈ guarded_reference
+
+        # The Bool validity local is its own recipe over two bound host count
+        # vectors: a marker-less host broadcast that must materialize an
+        # `Array{Bool}`, never the `BitArray` Reactant cannot `copyto!`.
+        totals_host = counts_host .+ 3
+        bool_local = prepare(reactant_bool_local_count_plate;
+            have = (:counts, :totals, :rates), want = :__return__,
+            bound = (; counts = counts_host, totals = totals_host))
+        bool_reference = sum(
+            c * log(r) - t * r for (c, t, r) in zip(counts_host, totals_host, rates_host))
+        @test bool_local(rates_host) ≈ bool_reference
+        compiled_bool_local = @compile bool_local(rates)
+        @test compiled_bool_local(rates) ≈ bool_reference
+
+        scores_host = reshape(collect(1.0:(3n)) ./ 7, 3, n)
+        weights_host = collect(range(0.5, 1.5; length = n))
+        weighted = prepare(reactant_small_eachcol_plate;
+            have = (:scores, :weights), want = :__return__,
+            bound = (; weights = weights_host))
+        weighted_reference = sum(
+            weights_host[j] * sum(scores_host[:, j]) for j in 1:n)
+        @test weighted(scores_host) ≈ weighted_reference
+        scores = Reactant.to_rarray(scores_host)
+        compiled_weighted = @compile weighted(scores)
+        @test compiled_weighted(scores) ≈ weighted_reference
+
+        # A traced response vector ahead of the column batch in the density
+        # recipe routes to the batched lowering through the structural marker
+        # (the plain-vector fallback cannot broadcast a plate batch); the same
+        # plate with the responses bound exercises the host-lane promotion.
+        coefficients_host = [0.1, -0.2, 0.3]
+        predictors_host = reshape(collect(range(-1.0, 1.0; length = 3n)), 3, n)
+        responses_host = collect(range(-0.5, 0.5; length = n))
+        regression_reference = sum(
+            -0.5 * log(2π) -
+            0.5 * (responses_host[j] - dot(predictors_host[:, j], coefficients_host))^2
+            for j in 1:n)
+        have = (:coefficients, :predictors, :responses)
+        regression = prepare(reactant_eachcol_regression_plate;
+            have, want = :__return__)
+        @test regression(coefficients_host, predictors_host, responses_host) ≈
+            regression_reference
+        coefficients = Reactant.to_rarray(coefficients_host)
+        predictors = Reactant.to_rarray(predictors_host)
+        responses = Reactant.to_rarray(responses_host)
+        compiled_regression = @compile regression(coefficients, predictors, responses)
+        @test compiled_regression(coefficients, predictors, responses) ≈
+            regression_reference
+        regression_bound = prepare(reactant_eachcol_regression_plate;
+            have, want = :__return__, bound = (; responses = responses_host))
+        @test regression_bound(coefficients_host, predictors_host) ≈
+            regression_reference
+        compiled_regression_bound = @compile regression_bound(coefficients, predictors)
+        @test compiled_regression_bound(coefficients, predictors) ≈
+            regression_reference
     end
 
     @testset "native plate path keeps its allocation contract" begin

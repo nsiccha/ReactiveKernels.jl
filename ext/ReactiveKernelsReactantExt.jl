@@ -975,10 +975,28 @@ end
     ndims(arg) == 1 && size(arg, 1) == count
 @inline _authored_plate_is_explicit_batch(arg, count) = false
 
+# A host-resident array operand of a plate that lowers through Reactant —
+# typically `bound=` data — is a compile-time constant of the traced program,
+# and both large-plate lowerings below need it promoted before they classify
+# or broadcast operands (see `_reactant_plate_operand` for the two failures).
+# Already-traced operands and `Ref`-wrapped shared scalars pass through
+# untouched, so an all-traced plate lowers exactly as before; the <= 16-lane
+# scalar-lanes path never reaches this promotion.
+@inline _reactant_plate_operand(arg) = arg
+@inline _reactant_plate_operand(arg::Reactant.TracedRArray) = arg
+@inline _reactant_plate_operand(arg::AbstractArray) =
+    Reactant.promote_to(Reactant.TracedRArray, arg)
+
 function _reactant_authored_plate_call(marker, operation, args::Tuple)
     count = _authored_plate_batch_length(marker)
     lanes = _reactant_plate_lanes(count, operation, args)
     lanes === nothing || return lanes
+    # Only traced arrays and the structural markers count as explicit batch
+    # inputs below, so a host lane vector (a `bound=` data vector beside a
+    # traced `eachcol` matrix) would otherwise be captured as a SHARED closure
+    # value and the whole vector would reach every lane's scalar cell
+    # (`-(::Vector{Float64}, ::TracedRNumber{Float64})`).
+    args = map(_reactant_plate_operand, args)
     batch_positions = Tuple(index for index in eachindex(args)
         if _authored_plate_is_explicit_batch(getfield(args, index), count))
     isempty(batch_positions) && throw(ArgumentError(
@@ -1046,10 +1064,49 @@ end
 # broadcast.
 ReactiveKernels._tensorized_plate_is_marker(::Reactant.TracedRArray{<:Any,1}) =
     true
+# Reactant's broadcast promotes every operand to a traced constant before
+# applying the cell body, but it deduces the RESULT eltype first, from the RAW
+# host element type (`Int64`, not `TracedRNumber{Int64}`).  A fused cell body
+# whose result type depends on how a host scalar combines with a traced one —
+# the discrete-family validity guard `ifelse(observed >= 0, <traced>, -Inf)`
+# infers `Union{Float64,TracedRNumber{Float64}}` on a host `Bool` condition —
+# then deduces the abstract typejoin `Number`, for which Reactant defines no
+# traced `similar`, and the plate dies in
+# `similar(::Broadcasted{AbstractReactantArrayStyle}, ::Type{Number})`.
+# Promoting the host operands first (the same `promote_to` the cat/broadcast
+# wrappers of a fused body use) types the cell body on traced scalars exactly
+# as Reactant's element application evaluates it, so the deduced eltype is
+# concrete.
+# The core routes a recipe to the FIRST marker-bearing operand, and this
+# extension claims plain traced vectors (above) so a vector plate lowers here.
+# Inside an `eachcol`/batched plate a traced data vector can therefore precede
+# the structural marker in a cell's operand order, and the generic broadcast
+# below would then receive the structural operand itself
+# (`length(::_TensorizedPlateBatch)` has no method).  The batched lowering
+# handles both operand kinds, so a structural marker among the operands takes
+# precedence over the plain-vector one.
+@inline _reactant_is_structural_marker(arg) = false
+@inline _reactant_is_structural_marker(
+    ::ReactiveKernels._TensorizedEachcol{<:Reactant.TracedRArray}) = true
+@inline _reactant_is_structural_marker(
+    ::ReactiveKernels._TensorizedPlateBatch{<:Reactant.TracedRArray}) = true
+@inline _reactant_is_structural_marker(::_PlateLanes) = true
+@inline _reactant_structural_marker(::Tuple{}) = nothing
+@inline function _reactant_structural_marker(args::Tuple)
+    arg = first(args)
+    _reactant_is_structural_marker(arg) ? arg :
+        _reactant_structural_marker(Base.tail(args))
+end
+
 function ReactiveKernels._tensorized_plate_call(
         marker::Reactant.TracedRArray{<:Any,1}, operation, args::Tuple)
+    structural = _reactant_structural_marker(args)
+    structural === nothing ||
+        return _reactant_authored_plate_call(structural, operation, args)
     lanes = _reactant_plate_lanes(size(marker, 1), operation, args)
-    lanes === nothing ? Base.broadcast(operation, args...) : lanes
+    lanes === nothing ?
+        Base.broadcast(operation, map(_reactant_plate_operand, args)...) :
+        lanes
 end
 
 @inline _authored_plate_batch_length(arg::_PlateLanes) = length(arg.lanes)

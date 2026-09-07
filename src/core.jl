@@ -270,10 +270,20 @@ end
 # first materializing a vector it would immediately reduce.
 @inline _tensorized_plate_sum(value) = sum(_tensorized_plate_materialize(value))
 
+# A recipe whose operands carry no plate marker — every operand a host array
+# (`bound=` data) or a shared scalar — broadcasts on the host.  Route it
+# through `_tensorized_materialize` so a `Bool`-valued recipe materializes a
+# dense `Array{Bool}` rather than a `BitArray`: a typed validity local such as
+# the binomial family's `valid::Bool = (observed >= 0) & (observed <= n)`
+# becomes its own plate recipe over two bound count vectors, and a tracing
+# backend cannot `copyto!` a `BitArray` (Reactant 0.2.284 recurses without
+# termination, a `StackOverflowError` with no actionable signal).  This is the
+# same container normalization the fused-body broadcasts already receive;
+# values and shapes are unchanged.
 @inline function _tensorized_plate_call(operation, args...)
     marker = _tensorized_plate_marker(args)
     marker === nothing ?
-        Base.broadcast(operation, args...) :
+        _tensorized_materialize(Base.broadcasted(operation, args...)) :
         _tensorized_plate_call(marker, operation, args)
 end
 
