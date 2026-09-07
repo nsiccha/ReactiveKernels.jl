@@ -30,7 +30,9 @@ include(joinpath(@__DIR__, "..", "benchmark", "reactivehmc_docs_interactions.jl"
 
 include("kernel_examples.jl")
 Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "result_views.jl"))
+Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "all80_comparison_tables.jl"))
 include("check_rendered.jl")
+include("test_all80_contracts.jl")
 include("hmc_transpiler.jl")
 include("gibbs_page.jl")
 

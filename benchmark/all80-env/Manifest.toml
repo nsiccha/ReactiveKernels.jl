@@ -1757,7 +1757,7 @@ version = "0.0.407+0"
 
 [[deps.ReactiveKernels]]
 deps = ["DifferentiationInterface", "LinearAlgebra", "LogExpFunctions", "Random", "RuntimeGeneratedFunctions"]
-path = "/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-ppl-benchmark/"
+path = "../.."
 uuid = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
 version = "0.1.0"
 
@@ -1771,13 +1771,13 @@ version = "0.1.0"
 
 [[deps.ReactiveKernelsDistributionKernels]]
 deps = ["LinearAlgebra", "LogExpFunctions", "ReactiveKernels", "SpecialFunctions"]
-path = "/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-ppl-benchmark/packages/ReactiveKernelsDistributionKernels"
+path = "../../packages/ReactiveKernelsDistributionKernels"
 uuid = "4b169cd9-fc12-43fd-ba39-43e54ed8db7a"
 version = "0.1.0"
 
 [[deps.ReactiveKernelsPPLExamples]]
 deps = ["LinearAlgebra", "LogExpFunctions", "ReactiveKernels", "ReactiveKernelsDistributionKernels"]
-path = "/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-ppl-benchmark/packages/ReactiveKernelsPPLExamples"
+path = "../../packages/ReactiveKernelsPPLExamples"
 uuid = "a4d4be3d-45c5-49cc-80d7-34e606a16bce"
 version = "0.1.0"
 

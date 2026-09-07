@@ -25,7 +25,16 @@ const SCHEMA = "all80-benchmark-v1"
 const NATIVE_CELLS = ("primal_rk", "primal_turing", "primal_stan",
     "gradient_rk", "gradient_turing", "gradient_stan",
     "hmc_rk_native", "hmc_ahmc_turing")
-const MANDATORY_CELLS = NATIVE_CELLS
+# STRICTLY-MANDATORY: a finite real number for ALL 82 — the primal on every side, the
+# Turing/Stan reverse gradient, and the AdvancedHMC-Turing throughput. None of these depend
+# on the RK reverse, so none are affected by the authored-plate core defect.
+const MANDATORY_CELLS = ("primal_rk", "primal_turing", "primal_stan",
+    "gradient_turing", "gradient_stan", "hmc_ahmc_turing")
+# RK-REVERSE cells: numeric where the RK graph differentiates (the ~75 unaffected models),
+# else a NONEMPTY diagnostic string carrying the exact Enzyme failure for a model that hits
+# the known authored-plate core defect (snag authored-plate-i-4556ee01). Present-and-typed,
+# NEVER absent; republished as finite numbers once the core fix lands (user decision 0fmcsb6).
+const RK_REVERSE_CELLS = ("gradient_rk", "hmc_rk_native")
 # CONDITIONAL cells: a finite NUMBER where it applies, else a NONEMPTY string carrying the
 # exact reason. REACTANT cells = numeric where the model lowers through Reactant, else the
 # exact Reactant-lowering error. OPTIONAL optimized-Stan/further-Turing = number if a distinct
@@ -93,6 +102,11 @@ function validate(path::AbstractString; expected_models = nothing)
             v = get(cells, c, nothing)
             (v isa Real && isfinite(v)) ||
                 push!(issues, "$k: mandatory cell $c is not a finite number ($(repr(v)))")
+        end
+        for c in RK_REVERSE_CELLS
+            v = get(cells, c, nothing)
+            ok = (v isa Real && isfinite(v)) || (v isa AbstractString && !isempty(v))
+            ok || push!(issues, "$k: RK-reverse cell $c must be a finite number or a nonempty core-defect diagnostic string ($(repr(v)))")
         end
         for c in CONDITIONAL_CELLS
             v = get(cells, c, nothing)

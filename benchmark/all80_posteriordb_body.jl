@@ -7,6 +7,7 @@
 # kb/prep. AHMC-Turing uses AdvancedHMC on the Turing LDF. All timings via Chairmarks/@elapsed;
 # every side parity-gated against reference Stan (propto=false, jacobian=true) before timing.
 using Random, LinearAlgebra, Statistics
+import TOML
 using Chairmarks: @be
 import BridgeStan, PosteriorDB, DynamicPPL
 using ReactiveKernels, ReactiveKernelsPPLExamples
@@ -16,6 +17,11 @@ using DifferentiationInterface
 const UP = ENV["RK_ALL80_UPSTREAM"]
 const PHASE = get(ENV, "RK_ALL80_PHASE", "native")
 const RECEIPT = get(ENV, "RK_ALL80_RECEIPT", "")
+# DISCOVER: measurement/offset-discovery mode — RECORD parity_pass + the observed offset per
+# model and CATCH per-model, instead of erroring on the first undeclared offset. DEFAULT (unset)
+# is the HARD gate (the publication contract). The observed offsets guide SOURCE derivation of
+# each off_rk/off_tu; the final hard-gated run then verifies measured == source-derived.
+const DISCOVER = get(ENV, "RK_ALL80_DISCOVER", "") == "1"
 include(joinpath(UP, "posteriordb.jl"))            # main-guarded; helpers + make_model + models + PDB
 include(joinpath(@__DIR__, "all80_registry.jl"))   # All80Registry.REGISTRY (82 executable-gated entries)
 include(joinpath(@__DIR__, "all80_receipt.jl"))    # All80Receipt.write_phase
@@ -49,7 +55,11 @@ _reactant_loaded() = any(m -> String(nameof(m)) == "Reactant", values(Base.loade
 PHASE == "native" && _reactant_loaded() &&
     error("native-phase isolation violated: Reactant is loaded before measurements")
 
-const AE = AutoEnzyme(mode = Enzyme.set_runtime_activity(Enzyme.Reverse), function_annotation = Enzyme.Const)
+# Standing RK policy (user, 2026-09-07): RK does NOT use Enzyme runtime activity.
+# A correct RK graph has statically-resolvable activity (data ports are DI.Constant
+# contexts; the active port is the unconstrained vector), so plain reverse is right;
+# needing set_runtime_activity would itself signal an activity defect to fix, not mask.
+const AE = AutoEnzyme(mode = Enzyme.Reverse, function_annotation = Enzyme.Const)
 med(b) = median(b).time * 1e9   # Chairmarks `.time` is SECONDS; receipt/fmt use NANOSECONDS
 fmt(ns) = ns < 1e3 ? "$(round(ns; digits=1)) ns" : ns < 1e6 ? "$(round(ns/1e3; digits=2)) µs" : "$(round(ns/1e6; digits=3)) ms"
 
@@ -126,51 +136,95 @@ function run_one(name; seed = 468, scale = 0.2, draws = 3)
     points = random_valid_points(sm, rng, draws, scale; center = draw_center(name, dim))
     map_ldf = stable_ldf(model; logdensity = DynamicPPL.getlogjoint)   # transforms only
     tldf = stable_ldf(model; adtype = AutoMooncake())                  # getlogjoint_internal (unconstrained)
+    e = RK[name]
+    # Artifact-Stan parameter order need not match the RK unconstrained packing
+    # (registry `stan_perm`; eight_schools_centered declares theta[8],mu,tau). The Stan
+    # oracle (value AND gradient) is always contacted in Stan order; gradients map back.
+    # The Turing CoordinateMap also consumes Stan order — every cmap/groups contact below
+    # uses sq(q), never raw RK-order q.
+    sq = q -> e.stan_perm === nothing ? q : q[e.stan_perm]
+    _back = e.stan_perm === nothing ? nothing : sortperm(e.stan_perm)
+    bs = g -> _back === nothing ? g : g[_back]
     cmap = CoordinateMap(sm, BridgeStan.param_names(sm; include_tp = false, include_gq = false),
                          model_name, DynamicPPL.get_all_ranges_and_transforms(map_ldf))
-    groups = classify_coordinate_groups(cmap, points)
-
-    e = RK[name]
+    groups = classify_coordinate_groups(cmap, sq.(points))
     graph = getproperty(getproperty(ReactiveKernelsPPLExamples, e.mod), e.build)()
     kb = prepare(graph; have = e.have, want = :posterior, bound = e.bind(data))
     prep = prepare_ad(kb, AE, points[1]; active = :unconstrained)
 
     # ---- HARD GATE vs reference Stan (propto=false jacobian=true): declared offset + stability + gradient ----
-    svj = [stan_val(sm, q) for q in points]
+    svj = [stan_val(sm, sq(q)) for q in points]
     rk_c = svj .- [kb(q) for q in points]
-    tu_c = svj .- [DynamicPPL.LogDensityProblems.logdensity(tldf, cmap(q)) for q in points]
+    tu_c = svj .- [DynamicPPL.LogDensityProblems.logdensity(tldf, cmap(sq(q))) for q in points]
     rk_off = mean(rk_c); tu_off = mean(tu_c)
     rk_off_err = abs(rk_off - e.off_rk); tu_off_err = abs(tu_off - e.off_tu)
     rk_stab = maximum(abs, rk_c .- rk_off); tu_stab = maximum(abs, tu_c .- tu_off)
-    rk_grad_err = maximum(relerr(ReactiveKernels.ad_value_and_gradient!(prep, similar(q), q)[2], stan_grad(sm, q)) for q in points)
+    # RK reverse gradient parity — resilient to the KNOWN authored-plate core defect
+    # (snag authored-plate-i-4556ee01: Int-axis accumulator / Any-materialization Enzyme
+    # failure). On THAT failure record the exact diagnostic; under DISCOVER the row keeps
+    # every unaffected cell and only gradient_rk + hmc_rk_native carry the string (to be
+    # republished as numbers once the core fix lands). Any OTHER error still throws.
+    rk_grad_diag = nothing
+    rk_grad_err = try
+        maximum(relerr(ReactiveKernels.ad_value_and_gradient!(prep, similar(q), q)[2], bs(stan_grad(sm, sq(q)))) for q in points)
+    catch err
+        rk_grad_diag = string("gradient_rk: ", first(replace(sprint(showerror, err), "\n" => " "), 200))
+        NaN
+    end
     tu_grad_err = maximum(relerr(gradient_in_stan_coordinates(cmap, groups, q,
-                   DynamicPPL.LogDensityProblems.logdensity_and_gradient(tldf, cmap(q))[2]), stan_grad(sm, q)) for q in points)
-    (rk_off_err < 1e-4 && rk_stab < 1e-6 && rk_grad_err < 2e-3) ||
-        error("RK parity FAIL $name: off $(rk_off) (declared $(e.off_rk)) stab $rk_stab grad $rk_grad_err")
-    (tu_off_err < 1e-4 && tu_stab < 1e-6 && tu_grad_err < 2e-3) ||
-        error("Turing parity FAIL $name: off $(tu_off) (declared $(e.off_tu)) stab $tu_stab grad $tu_grad_err")
-    println("  parity: RK off=$(round(rk_off;sigdigits=3))(want $(e.off_rk)) grad=$(round(rk_grad_err;sigdigits=2)) | Turing off=$(round(tu_off;sigdigits=3))(want $(e.off_tu)) grad=$(round(tu_grad_err;sigdigits=2))")
-    if e.boundary !== nothing
+                   DynamicPPL.LogDensityProblems.logdensity_and_gradient(tldf, cmap(sq(q)))[2]), stan_grad(sm, sq(q))) for q in points)
+    # STRUCTURAL checks are HARD in BOTH modes (DISCOVER only softens the constant OFFSET):
+    # stability-across-draws + gradient parity. A non-constant residual or a gradient mismatch
+    # is a real structural failure, not an expected constant — it errors (the driver's DISCOVER
+    # catch records it per-model and continues; it is never silently logged as a soft offset).
+    if rk_grad_diag === nothing
+        rk_stab < 1e-6 && rk_grad_err < 2e-3 ||
+            error("RK STRUCTURAL parity FAIL $name: stab $rk_stab grad $rk_grad_err (not a constant offset)")
+    else
+        # RK reverse unavailable (known core defect). The PRIMAL structural check (offset
+        # stability across draws) is independent of AD and stays HARD; a non-DISCOVER run
+        # still fails closed because the gradient MUST work to PUBLISH numbers.
+        DISCOVER || error("RK gradient FAIL $name: $rk_grad_diag")
+        rk_stab < 1e-6 ||
+            error("RK PRIMAL STRUCTURAL parity FAIL $name: stab $rk_stab (not a constant offset)")
+    end
+    tu_stab < 1e-6 && tu_grad_err < 2e-3 ||
+        error("Turing STRUCTURAL parity FAIL $name: stab $tu_stab grad $tu_grad_err (not a constant offset)")
+    # The value-offset-vs-declared is the ONLY soft check under DISCOVER.
+    rk_off_ok = rk_off_err < 1e-4; tu_off_ok = tu_off_err < 1e-4
+    parity_pass = rk_off_ok && tu_off_ok
+    if !DISCOVER
+        rk_off_ok || error("RK offset FAIL $name: measured $(rk_off) != declared $(e.off_rk)")
+        tu_off_ok || error("Turing offset FAIL $name: measured $(tu_off) != declared $(e.off_tu)")
+    end
+    println("  parity: RK off=$(round(rk_off;sigdigits=4))(want $(e.off_rk)) grad=$(round(rk_grad_err;sigdigits=2)) $(rk_off_ok ? "OK" : "OFFSET") | Turing off=$(round(tu_off;sigdigits=6))(want $(e.off_tu)) grad=$(round(tu_grad_err;sigdigits=2)) $(tu_off_ok ? "OK" : "OFFSET")")
+    if e.boundary !== nothing   # SUPPORT probe is HARD in both modes (structural)
         qb = e.boundary(points[1])
-        vb_r = kb(qb); vb_s = stan_val(sm, qb); vb_t = DynamicPPL.LogDensityProblems.logdensity(tldf, cmap(qb))
+        vb_r = kb(qb); vb_s = stan_val(sm, sq(qb)); vb_t = DynamicPPL.LogDensityProblems.logdensity(tldf, cmap(sq(qb)))
         (vb_r == -Inf && vb_s == -Inf && vb_t == -Inf) || error("boundary probe FAIL $name rk=$vb_r stan=$vb_s turing=$vb_t")
         println("  support-boundary probe: OK (RK, Stan, Turing all -Inf)")
     end
 
-    q = points[1]; qt = cmap(q); gbuf = similar(q)
+    q = points[1]; qt = cmap(sq(q)); gbuf = similar(q)
     md = All80Metadata.meta(name)
     ctx = (; dim = dim, family = md.family, note = md.note,
-        parity_pass = true, rk_off = rk_off, tu_off = tu_off, off_reason = e.off_reason,
+        parity_pass = parity_pass, rk_off = rk_off, tu_off = tu_off, off_reason = e.off_reason,
         rk_grad_relerr = rk_grad_err, tu_grad_relerr = tu_grad_err,
+        rk_grad_diag = rk_grad_diag,   # nothing where RK reverse works; else the exact core-defect diagnostic
         # native single-eval closures (timed by All80Axes); HMC returns µs/transition directly
         rk_primal = () -> kb(q),
         tu_primal = () -> DynamicPPL.LogDensityProblems.logdensity(tldf, qt),
-        stan_primal = () -> stan_val(sm, q),
+        stan_primal = () -> stan_val(sm, sq(q)),
         rk_grad = () -> ReactiveKernels.ad_value_and_gradient!(prep, gbuf, q),
         tu_grad = () -> DynamicPPL.LogDensityProblems.logdensity_and_gradient(tldf, qt),
-        stan_grad = () -> BridgeStan.log_density_gradient(sm, q; propto = false, jacobian = true),
-        hmc_time_loop = backend -> hmc_loop(kb, prep, q, backend, _native_rng),  # native phase
-        ahmc_time_loop = () -> ahmc_loop(tldf, qt))
+        stan_grad = () -> BridgeStan.log_density_gradient(sm, sq(q); propto = false, jacobian = true),
+        hmc_time_loop = (backend, transitions) ->
+            hmc_loop(kb, prep, q, backend, _native_rng;
+                T = transitions, steps = All80Axes.HMC_STEPS,
+                rounds = All80Axes.HMC_ROUNDS),
+        ahmc_time_loop = transitions ->
+            ahmc_loop(tldf, qt; T = transitions, steps = All80Axes.HMC_STEPS,
+                rounds = All80Axes.HMC_ROUNDS))
 
     row = if PHASE == "native"
         r = All80Axes.measure_native(ctx)
@@ -187,6 +241,7 @@ function run_one(name; seed = 468, scale = 0.2, draws = 3)
         v isa Real && startswith(k, "hmc_") && println("  $(rpad(k,24)) $(round(v;sigdigits=3)) µs/it")
         (v isa AbstractString && occursin("reactant", k)) && println("  $(rpad(k,24)) N/A → $(first(v,90))")
     end
+    PHASE == "native" && println("  HMC protocol: $(row["hmc_transitions"]) transitions × $(row["hmc_steps"]) steps × $(row["hmc_rounds"]) rounds")
     PHASE == "native" && _reactant_loaded() &&
         error("native-phase isolation violated: Reactant loaded DURING $name (transpiler :native must not pull it)")
     println("MODEL_OK [$PHASE] $name")
@@ -199,12 +254,39 @@ _req = [n for n in ARGS if !startswith(n, "-")]
 _unknown = [k for k in _req if !haskey(RK, k)]
 isempty(_unknown) || error("all80: unknown registry key(s) requested: $(join(_unknown, ", "))")
 targets = isempty(_req) ? sort(collect(keys(RK))) : _req
+retry_requested = get(ENV, "RK_ALL80_RETRY", "") == "1"
+retry_requested && isempty(_req) &&
+    error("RK_ALL80_RETRY=1 requires explicit model keys; refusing to replay all 82 implicitly")
 rows = Dict{String,Any}()
-for name in targets
-    rows[name] = run_one(name)
+if get(ENV, "RK_ALL80_RESUME", "") == "1" && RECEIPT != "" && isfile(RECEIPT)
+    prior = TOML.parsefile(RECEIPT)
+    get(prior, "schema", "") == All80Receipt.SCHEMA ||
+        error("all80 resume: schema mismatch in $RECEIPT")
+    get(prior, "phase", "") == PHASE ||
+        error("all80 resume: phase mismatch in $RECEIPT")
+    for (name, cells) in get(prior, "models", Dict())
+        rows[String(name)] = Dict{String,Any}(String(k) => v for (k, v) in cells)
+    end
+    println("resumed $PHASE receipt with $(length(rows)) existing rows: $RECEIPT")
 end
-if RECEIPT != ""
-    All80Receipt.write_phase(RECEIPT, PHASE, rows)
-    println("wrote phase receipt ($PHASE): $RECEIPT")
+pending = [name for name in targets if retry_requested || !haskey(rows, name)]
+for (i, name) in enumerate(pending)
+    if DISCOVER
+        try
+            rows[name] = run_one(name)
+        catch err
+            msg = first(replace(sprint(showerror, err), "\n" => " "), 220)
+            println("  DISCOVER-CATCH $name → $msg")
+            rows[name] = Dict{String,Any}("error" => msg, "parity_pass" => false)
+        end
+    else
+        rows[name] = run_one(name)
+    end
+    # INCREMENTAL: rewrite the phase receipt after EACH model so a late crash/OOM cannot erase
+    # earlier completed rows or exact errors (parent-mandated failure isolation).
+    RECEIPT != "" && All80Receipt.write_phase(RECEIPT, PHASE, rows)
+    println("  [$(length(rows))/$(length(targets)) complete; $i/$(length(pending)) this run] $(name) recorded" *
+            (RECEIPT != "" ? " → $RECEIPT" : ""))
 end
+RECEIPT != "" && println("wrote phase receipt ($PHASE, $(length(rows)) rows): $RECEIPT")
 println("\nALL80_PHASE_DONE $PHASE")

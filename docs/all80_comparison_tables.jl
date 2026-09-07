@@ -7,6 +7,9 @@
 # provenance string and sort to the bottom.
 import TOML
 
+const _ALL80_NATIVE_CHECKPOINT_PATH = joinpath(
+    dirname(@__DIR__), "benchmark", "receipts", "all80-native-checkpoint-v1.toml")
+
 # ~2-sig-fig timing formatter (nanoseconds in the receipt). Non-Real = N/A provenance.
 function _all80_ns(value, _)
     value isa Real || return string(value)
@@ -24,8 +27,13 @@ function _all80_rows(models, cellkeys)
     ks = sort(collect(keys(models)))
     map(ks) do k
         m = models[k]
-        base = (; model = k, note = get(m, "note", ""))
-        cells = NamedTuple{Tuple(Symbol.(cellkeys))}(Tuple(get(m, c, missing) for c in cellkeys))
+        diagnostic = get(m, "error", "")
+        fallback(c) = !isempty(diagnostic) ? "unavailable — " * first(diagnostic, 180) :
+            occursin("reactant", c) ? "not run in this native checkpoint" : "not measured"
+        base = (; model = k,
+            note = isempty(diagnostic) ? get(m, "note", "") : "Benchmark gate failure: " * diagnostic)
+        cells = NamedTuple{Tuple(Symbol.(cellkeys))}(
+            Tuple(haskey(m, c) ? m[c] : fallback(c) for c in cellkeys))
         merge(base, cells)
     end
 end
@@ -80,4 +88,31 @@ end
 function all80_comparison_sections(receipt)
     models = receipt isa AbstractDict ? receipt : get(TOML.parsefile(receipt), "models", Dict())
     (all80_primal_table(models), all80_gradient_table(models), all80_hmc_table(models))
+end
+
+"""Render the published native checkpoint summary. This deliberately accepts gate-error
+rows: an exact diagnostic is a benchmark result, whereas an invented timing is not."""
+function render_all80_native_checkpoint_summary(path = _ALL80_NATIVE_CHECKPOINT_PATH)
+    receipt = TOML.parsefile(path)
+    models = get(receipt, "models", Dict())
+    failures = count(m -> haskey(m, "error"), values(models))
+    passing = count(m -> get(m, "parity_pass", false) === true, values(models))
+    pending_offsets = length(models) - failures - passing
+    Markdown.parse("""
+    **Checkpoint receipt:** $(length(models)) of 82 models recorded; **$passing** pass the
+    complete declared-offset/value/gradient/support gate, **$pending_offsets** have complete
+    measurements awaiting a source-declared constant replay, and **$failures** retain an
+    exact structural or AD diagnostic instead of a fabricated timing.
+    """)
+end
+
+"""Render the three sortable tables from the committed native-checkpoint receipt."""
+function render_all80_native_checkpoint(path = _ALL80_NATIVE_CHECKPOINT_PATH)
+    receipt = TOML.parsefile(path)
+    models = get(receipt, "models", Dict())
+    Markdown.MD(Any[
+        all80_primal_table(models),
+        all80_gradient_table(models),
+        all80_hmc_table(models),
+    ])
 end

@@ -23,6 +23,7 @@ import Pkg, SHA
 
 const _INNER = "RK_ALL80_INNER"
 const _BODY = joinpath(@__DIR__, "all80_posteriordb_body.jl")
+const _REACTANT_BODY = joinpath(@__DIR__, "all80_reactant_body.jl")
 const DPPL_SHA = "6378673b0029518c8a698096eb4f8ab662333083"
 const UPSTREAM_DIGESTS = Dict(
     "posteriordb_models.jl" => "a7ef985b93df973dd0598f0c772f3f002afa25be80829fc38a9e8cb7232413ad",
@@ -76,8 +77,9 @@ const RECEIPT_DIR = joinpath(@__DIR__, "receipts")
 # receipt; the reactant phase additionally pins JULIA_NUM_PRECOMPILE_TASKS=1 (the primer's
 # ReactiveKernelsReactantExt precompile-wedge mitigation).
 function _phase_cmd(phase, up, receipt)
+    body = phase == "reactant" ? _REACTANT_BODY : _BODY
     cmd = addenv(
-        `$(Base.julia_cmd()) --startup-file=no --project=$ENV_DIR $(_BODY) $(ARGS...)`,
+        `$(Base.julia_cmd()) --startup-file=no --project=$ENV_DIR $(body) $(ARGS...)`,
         _INNER => "1", "RK_ALL80_UPSTREAM" => up, "RK_ALL80_DPPL_SHA" => DPPL_SHA,
         "RK_ALL80_PHASE" => phase, "RK_ALL80_RECEIPT" => receipt,
     )

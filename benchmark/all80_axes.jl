@@ -31,12 +31,18 @@ med_ns(b) = median(b).time * 1e9
 
 # ---- native single-eval timings (VALIDATED path — mirrors the committed body) ----
 # stan_primal/stan_grad/turing/rk closures are supplied by the body (it owns the imports).
-"""populate the native primal+gradient cells (median ns) from the body-supplied closures."""
+"""populate the native primal+gradient cells (median ns) from the body-supplied closures.
+`gradient_rk` is numeric where the RK reverse works; where the graph hits a KNOWN core
+defect the body pre-computes `c.rk_grad_diag` (a nonempty diagnostic string, e.g. the
+authored-plate Int-axis/Any-materialization Enzyme failure) and we record THAT instead of
+re-attempting the slow failing compile. Every OTHER native cell (primal rk/turing/stan,
+gradient turing/stan) is unaffected and stays a hard number for all 82."""
 function native_single_eval!(row, c)
     row["primal_rk"]       = med_ns(Chairmarks.@be c.rk_primal())
     row["primal_turing"]   = med_ns(Chairmarks.@be c.tu_primal())
     row["primal_stan"]     = med_ns(Chairmarks.@be c.stan_primal())
-    row["gradient_rk"]     = med_ns(Chairmarks.@be c.rk_grad())
+    row["gradient_rk"]     = c.rk_grad_diag === nothing ?
+        med_ns(Chairmarks.@be c.rk_grad()) : c.rk_grad_diag
     row["gradient_turing"] = med_ns(Chairmarks.@be c.tu_grad())
     row["gradient_stan"]   = med_ns(Chairmarks.@be c.stan_grad())
     row
@@ -47,13 +53,52 @@ end
 # machinery and passes `hmc_time_loop` (a closure capturing transpiled_endpoint /
 # prepare_transpiled / F.leapfrog! bound to ctx.kb + ctx.prep), so this module stays free of
 # the Reactant/transpiler imports until the phase that needs them.
-"""native HMC: RK density+grad driven through the transpiler :native backend."""
-hmc_rk_native!(row, c) = (row["hmc_rk_native"] = c.hmc_time_loop(:native); row)
+"""native HMC: RK density+grad driven through the transpiler :native backend. The RK-native
+HMC loop needs the RK reverse gradient, so a model whose gradient hits the known core defect
+(`c.rk_grad_diag` set) records the SAME diagnostic here (HMC is blocked BY the gradient), never
+a fabricated number. hmc_ahmc_turing is unaffected (Turing side)."""
+hmc_rk_native!(row, c) = (row["hmc_rk_native"] =
+    c.rk_grad_diag === nothing ? c.hmc_time_loop(:native, row["hmc_transitions"]) :
+    "hmc_rk_native blocked by RK gradient: " * c.rk_grad_diag; row)
 """reactant HMC: SAME transpiled program lowered through Reactant."""
 hmc_rk_reactant!(row, c) = (row["hmc_rk_reactant"] = c.hmc_time_loop(:reactant); row)
 """AHMC+Turing HMC: AdvancedHMC over the Turing LDF (value+gradient); µs/transition.
 Body supplies `c.ahmc_time_loop` (AdvancedHMC.HMC, fixed L, warmup excluded)."""
-hmc_ahmc_turing!(row, c) = (row["hmc_ahmc_turing"] = c.ahmc_time_loop(); row)
+hmc_ahmc_turing!(row, c) =
+    (row["hmc_ahmc_turing"] = c.ahmc_time_loop(row["hmc_transitions"]); row)
+
+# Keep leapfrog work fixed while adapting repetitions to a bounded timing budget. The
+# slower available gradient determines ONE transition count shared by RK and AHMC, so a
+# row never compares different HMC workloads. Six median rounds remain fixed; only the
+# number of transitions in each round changes. The 1.25 factor leaves headroom for the
+# integrator and sampler bookkeeping beyond the 16 gradient evaluations.
+const HMC_STEPS = 16
+const HMC_ROUNDS = 6
+const HMC_MIN_TRANSITIONS = 4
+const HMC_MAX_TRANSITIONS = 1000
+const HMC_TARGET_ROUND_SECONDS = 0.5
+
+function hmc_transitions(row)
+    gradients = Float64[]
+    for cell in ("gradient_rk", "gradient_turing")
+        v = get(row, cell, nothing)
+        v isa Real && isfinite(v) && push!(gradients, Float64(v))
+    end
+    isempty(gradients) && error("adaptive HMC needs at least one finite gradient timing")
+    estimated_transition_ns = 1.25 * HMC_STEPS * maximum(gradients)
+    clamp(floor(Int, HMC_TARGET_ROUND_SECONDS * 1e9 / estimated_transition_ns),
+        HMC_MIN_TRANSITIONS, HMC_MAX_TRANSITIONS)
+end
+
+function hmc_protocol!(row, c)
+    row["hmc_steps"] = HMC_STEPS
+    row["hmc_rounds"] = HMC_ROUNDS
+    row["hmc_target_round_seconds"] = HMC_TARGET_ROUND_SECONDS
+    row["hmc_transitions"] = hmc_transitions(row)
+    hmc_rk_native!(row, c)
+    hmc_ahmc_turing!(row, c)
+    row
+end
 
 # ---- Reactant single-eval (primal+gradient of the compiled RK kernel) ----------------
 # Body supplies `c.rk_reactant_primal` / `c.rk_reactant_grad` closures (Reactant-compiled
@@ -73,8 +118,7 @@ function measure_native(c)
         "off_reason" => c.off_reason, "rk_grad_relerr" => c.rk_grad_relerr,
         "tu_grad_relerr" => c.tu_grad_relerr)
     native_single_eval!(row, c)
-    hmc_rk_native!(row, c)
-    hmc_ahmc_turing!(row, c)
+    hmc_protocol!(row, c)
     row
 end
 

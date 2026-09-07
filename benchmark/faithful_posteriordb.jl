@@ -37,6 +37,7 @@ function _run_pinned_comparison()
             Pkg.PackageSpec(name = "BridgeStan"),
             Pkg.PackageSpec(name = "SpecialFunctions"),
             Pkg.PackageSpec(name = "LogExpFunctions"),
+            Pkg.PackageSpec(name = "JSON"),
         ])
         Pkg.develop([
             Pkg.PackageSpec(path = root),

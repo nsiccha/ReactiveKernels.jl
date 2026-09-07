@@ -1,36 +1,59 @@
+stan_artifact_dir = "/home/n/.julia/artifacts/f45397e9120c2d7e26bf6aff8c7aa810779a7e1b/posteriordb-1.0.0/posterior_database/models/stan"
+posteriordb_source_main = "3399636c47ef2721a7f5ddca2a5cab7a54ff13b4"
+status = "canonical (RK consumes canonical ReactiveKernelsPPLExamples modules; FULL real posteriordb data)"
 schema = "faithful-posteriordb-v1"
-generated_at = "2026-09-06T22:27:34.518"
-methodology = "RK BUILTIN graphs (ReactiveKernelsPPLExamples, idiomatic distribution-kernel authoring) vs optimized Stan vs optimized Turing, all three on the SAME faithful model; native primal+gradient; median over 12 rounds; parity vs FD oracle"
+generated_at = "2026-09-07T08:30:59.491"
+methodology = "Idiomatic RK-builtin distribution-kernel graphs vs Stan (posteriordb REFERENCE .stan verbatim from the artifact, AND a hand-written OPTIMIZED .stan — fused poisson_log_glm/normal_id_glm, vectorized — where a faster idiom exists and computes the identical density) vs optimized Turing. ALL sides the SAME faithful model, SAME real priors/support/Jacobians (improper flat where the .stan is flat), and the SAME FULL real posteriordb data (loaded from the artifact). Native primal+gradient at the fair boundary; median over 12 rounds of minimum(run(@benchmarkable;samples=200,seconds=0.2)); every side parity-gated vs an independent central FD oracle before timing (mismatch = hard failure). eight_schools carries a 4th 'rk_ppl' side (experimental @ppl front-end, documentation-only migration evidence)."
+
+[stan_shas]
+"optimized:kidscore_opt" = "e3c8660af3a7fc8d5691c1fc3cef8bcfcd065007232f589a8d3af255b8f07277"
+"optimized:GLM_Poisson_opt" = "514c3bc0cf31cf698b606912df08225e3552457b73dc363208ec00e2b02d2f16"
+"reference:kidscore_interaction" = "da69847f12b07ca3e1e77a7e9aa349497dbbe2f0251b94b46c24c51b5309ad91"
+"reference:eight_schools_centered" = "ccaf2d7beed22602f62f276cd4096194ab5de5b5c1d6bb2bae9a3655a3845c05"
+"reference:GLM_Binomial_model" = "1cd08265b53a2faea2087055fd5c24eff965c6581c6ce78479a0925ddd3a1144"
+"reference:GLM_Poisson_model" = "84186ad779e2add1b934a00e211d9e642ae29cba0e02caf3fedb5c1b29e54f85"
+"reference:Rate_1_model" = "ae95dcc6c2e2953e202fb257181ee24e1cb1f7780819e95d94663dde4fddc795"
+"optimized:blr_opt" = "9e5247534795e17656bef5731b96a265a56739d56886b46903b91f22edfab8bc"
+"reference:GLMM_Poisson_model" = "c3bac72e682232921daf6b47285c8102bc37279e696a3c466b500461b9ce9576"
+"reference:arK" = "fd5c71a891f648de3b9b65e2a65885c974fd9478b0a137b6b229f76ff4e01de6"
+"optimized:arK_opt" = "b9a61657de50aee3243b64efa981cb197024ff920181e78cf39541b1e0e88e46"
+"reference:Mh_model" = "69dda71b0ec6857c4c5a0e81c014979f57da97c5260b6e3456305a13050b7ad5"
+"reference:blr" = "e6407c4391ab11c0b59f17f3a04132df87aa69b7dae459e173036f16f9e8b161"
 
 [[models]]
 rk_builtin = true
 model = "eight_schools"
+data_note = "full J=8"
 dim = 10
-optbase = "stan"
 
     [[models.measurements]]
     kind = "primal"
-    median_ns = 295.0
+    median_ns = 220.0
     median_bytes = 16
-    impl = "stan"
+    impl = "stan_stan"
     [[models.measurements]]
     kind = "primal"
-    median_ns = 385.5
+    median_ns = 340.0
     median_bytes = 800
     impl = "turing"
     [[models.measurements]]
     kind = "primal"
-    median_ns = 80.0
+    median_ns = 90.0
     median_bytes = 0
     impl = "rk"
     [[models.measurements]]
-    kind = "gradient"
-    median_ns = 520.0
-    median_bytes = 160
-    impl = "stan"
+    kind = "primal"
+    median_ns = 110.0
+    median_bytes = 128
+    impl = "rk_ppl"
     [[models.measurements]]
     kind = "gradient"
-    median_ns = 4336.0
+    median_ns = 430.0
+    median_bytes = 160
+    impl = "stan_stan"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 4366.0
     median_bytes = 7904
     impl = "turing"
     [[models.measurements]]
@@ -38,10 +61,341 @@ optbase = "stan"
     median_ns = 140.0
     median_bytes = 0
     impl = "rk"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 160.0
+    median_bytes = 256
+    impl = "rk_ppl"
+[[models]]
+rk_builtin = true
+model = "GLM_Poisson"
+data_note = "full n=40"
+dim = 4
 
-    [models.parity_relerr]
-    turing = 3.922764336778102e-10
-    rk = 3.922764336778102e-10
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 1281.0
+    median_bytes = 16
+    impl = "stan_reference"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 1206.5
+    median_bytes = 16
+    impl = "stan_optimized"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 360.0
+    median_bytes = 832
+    impl = "turing"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 931.0
+    median_bytes = 0
+    impl = "rk"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 2097.0
+    median_bytes = 112
+    impl = "stan_reference"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 1427.0
+    median_bytes = 112
+    impl = "stan_optimized"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 2593.5
+    median_bytes = 6368
+    impl = "turing"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 1902.0
+    median_bytes = 0
+    impl = "rk"
+[[models]]
+rk_builtin = true
+model = "GLM_Binomial"
+data_note = "full n=40"
+dim = 3
+
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 2353.0
+    median_bytes = 16
+    impl = "stan_stan"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 1101.0
+    median_bytes = 816
+    impl = "turing"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 3414.0
+    median_bytes = 0
+    impl = "rk"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 3269.0
+    median_bytes = 96
+    impl = "stan_stan"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 3394.5
+    median_bytes = 3760
+    impl = "turing"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 6514.0
+    median_bytes = 0
+    impl = "rk"
+[[models]]
+rk_builtin = true
+model = "kidscore_interaction"
+data_note = "full N=434"
+dim = 5
+
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 680.5
+    median_bytes = 16
+    impl = "stan_reference"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 550.5
+    median_bytes = 16
+    impl = "stan_optimized"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 1307.0
+    median_bytes = 8000
+    impl = "turing"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 540.5
+    median_bytes = 0
+    impl = "rk"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 7881.0
+    median_bytes = 112
+    impl = "stan_reference"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 1031.5
+    median_bytes = 112
+    impl = "stan_optimized"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 38543.0
+    median_bytes = 64864
+    impl = "turing"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 1432.0
+    median_bytes = 0
+    impl = "rk"
+[[models]]
+rk_builtin = true
+model = "blr_sblri"
+data_note = "full N=100 D=5"
+dim = 6
+
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 300.0
+    median_bytes = 16
+    impl = "stan_reference"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 260.0
+    median_bytes = 16
+    impl = "stan_optimized"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 310.5
+    median_bytes = 2096
+    impl = "turing"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 200.0
+    median_bytes = 896
+    impl = "rk"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 1001.0
+    median_bytes = 128
+    impl = "stan_reference"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 560.0
+    median_bytes = 128
+    impl = "stan_optimized"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 3690.0
+    median_bytes = 13216
+    impl = "turing"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 615.5
+    median_bytes = 1792
+    impl = "rk"
+[[models]]
+value_reldiff_rk_stan = 1.1548399925231934e-7
+rk_builtin = true
+model = "GLMM_Poisson"
+data_note = "full n=40"
+dim = 45
+beta2_boundary_both_neginf = true
+
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 1412.0
+    median_bytes = 16
+    impl = "stan_stan"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 490.5
+    median_bytes = 1632
+    impl = "turing"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 1241.0
+    median_bytes = 0
+    impl = "rk"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 2754.0
+    median_bytes = 464
+    impl = "stan_stan"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 3855.5
+    median_bytes = 9216
+    impl = "turing"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 1401.5
+    median_bytes = 0
+    impl = "rk"
+[[models]]
+rk_builtin = true
+model = "arK"
+data_note = "full T=200 K=5"
+dim = 7
+
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 1777.0
+    median_bytes = 16
+    impl = "stan_reference"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 410.0
+    median_bytes = 16
+    impl = "stan_optimized"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 1362.0
+    median_bytes = 576
+    impl = "turing"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 350.0
+    median_bytes = 1632
+    impl = "rk"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 12252.0
+    median_bytes = 128
+    impl = "stan_reference"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 851.0
+    median_bytes = 128
+    impl = "stan_optimized"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 14250.0
+    median_bytes = 7760
+    impl = "turing"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 1026.0
+    median_bytes = 3264
+    impl = "rk"
+[[models]]
+rk_builtin = true
+model = "Mh"
+data_note = "full M=385 T=5"
+dim = 388
+
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 19176.0
+    median_bytes = 16
+    impl = "stan_stan"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 11596.0
+    median_bytes = 6528
+    impl = "turing"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 23352.0
+    median_bytes = 0
+    impl = "rk"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 34948.0
+    median_bytes = 3280
+    impl = "stan_stan"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 29861.0
+    median_bytes = 13104
+    impl = "turing"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 347689.5
+    median_bytes = 109504
+    impl = "rk"
+[[models]]
+rk_builtin = true
+model = "Rate_1"
+data_note = "full n=10 k=5"
+dim = 1
+
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 210.0
+    median_bytes = 16
+    impl = "stan_stan"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 120.0
+    median_bytes = 0
+    impl = "turing"
+    [[models.measurements]]
+    kind = "primal"
+    median_ns = 130.0
+    median_bytes = 0
+    impl = "rk"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 280.0
+    median_bytes = 80
+    impl = "stan_stan"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 660.0
+    median_bytes = 1280
+    impl = "turing"
+    [[models.measurements]]
+    kind = "gradient"
+    median_ns = 180.0
+    median_bytes = 0
+    impl = "rk"
 
 [environment]
 julia = "1.10.11"

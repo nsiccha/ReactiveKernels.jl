@@ -10,6 +10,10 @@
 #   off_tu     :: Float64  — EXPECTED (Stan - upstream-Turing) offset
 #   off_reason :: String
 #   boundary   :: nothing | q::Vector -> q_boundary  — probe OUTSIDE a restricted prior support
+#   stan_perm  :: nothing | Vector{Int} — RK-order q -> artifact-Stan-order q. The reference
+#     .stan declares its own parameter order, which need NOT match the RK unconstrained
+#     packing (eight_schools_centered declares theta[8],mu,tau). Without this the Stan
+#     oracle is evaluated at a scrambled point and every gate fails (harness bug, not RK).
 #
 # The graph is reached with getproperty(getproperty(ReactiveKernelsPPLExamples, mod), build)().
 # Data field names are the upstream make_model's data["..."] keys (same PosteriorDB Dict).
@@ -24,7 +28,7 @@ module All80Registry
 
 using ReactiveKernelsPPLExamples
 
-F(d, k) = Float64.(d[k]); Iv(d, k) = Int.(d[k]); Is(d, k) = Int(d[k])
+F(d, k) = Float64.(d[k]); Iv(d, k) = Int.(d[k]); Bv(d, k) = Bool.(d[k]); Is(d, k) = Int(d[k])
 
 # arK lag design (mirrors ARKExample._ark_lag): ylag[i,k]=y[K+i-k], yt[i]=y[K+i].
 function _ark_lag(y, K)
@@ -42,7 +46,7 @@ const REGISTRY = Dict{String,NamedTuple}()
 # GLM_Poisson: off_tu = log(40)+3·log(20). The driver GATES measured == declared.
 reg!(key; kw...) = (REGISTRY[key] = (; off_rk = 0.0, off_tu = 0.0,
     off_reason = "faithful same density; propto=false jacobian=true; no dropped constants",
-    boundary = nothing, kw...); nothing)
+    boundary = nothing, stan_perm = nothing, kw...); nothing)
 
 # ---------------- Poisson / binomial GLM ----------------
 reg!("GLM_Poisson_Data-GLM_Poisson_model"; mod = :GLMPoissonExample, build = :build_glm_poisson_graph,
@@ -143,15 +147,25 @@ reg!("nes1972-nes"; mod = :NESExample, build = :build_nes_graph, have = (:uncons
 
 # eight_schools
 reg!("eight_schools-eight_schools_centered"; mod = :EightSchoolsExample, build = :build_eight_schools_graph,
-    have = (:unconstrained, :observations, :observation_scales), bind = d -> (observations = F(d, "y"), observation_scales = F(d, "sigma")))
+    have = (:unconstrained, :observations, :observation_scales), bind = d -> (observations = F(d, "y"), observation_scales = F(d, "sigma")),
+    stan_perm = [3, 4, 5, 6, 7, 8, 9, 10, 1, 2],
+    off_rk = -log(2.0),
+    off_tu = -log(2.0),
+    off_reason = "artifact .stan declares (theta[8],mu,tau), RK packs (mu,logtau,theta[8]) — stan_perm reorders (verified by probe). The centered RK graph uses the PROPER HalfCauchy(0,5) (+log2 normalizer) while the reference .stan drops the truncation normalizer: Stan−RK = −log2, stable, grads 1e-16 (same class as arK/arma11; upstream Turing is also proper, Stan−Turing = −log2). NOTE: the noncentered RK module matches Stan with off 0 — the two RK modules differ by log2 in the tau prior; flagged to the posteriordb lane, each side gated against its own .stan here.")
 reg!("eight_schools-eight_schools_noncentered"; mod = :EightSchoolsNoncenteredExample, build = :build_eight_schools_noncentered_graph,
-    have = (:unconstrained, :observations, :observation_scales), bind = d -> (observations = F(d, "y"), observation_scales = F(d, "sigma")))
+    have = (:unconstrained, :observations, :observation_scales), bind = d -> (observations = F(d, "y"), observation_scales = F(d, "sigma")),
+    off_tu = -log(2.0),
+    off_reason = "faithful same density; upstream Turing's truncated Cauchy on tau includes the +log2 half-line normalizer the reference .stan drops: Stan−Turing = −log2 (measured −0.6931471805599401, grads 1e-16).")
 
 # time series
 reg!("arK-arK"; mod = :ARKExample, build = :build_ark_graph, have = (:unconstrained, :ylag, :yt),
-    bind = d -> (ylag = _ark_lag(F(d, "y"), Is(d, "K")), yt = F(d, "y")[(Is(d, "K") + 1):end]))
+    bind = d -> (ylag = _ark_lag(F(d, "y"), Is(d, "K")), yt = F(d, "y")[(Is(d, "K") + 1):end]),
+    off_tu = -log(2.0),
+    off_reason = "upstream Turing's truncated/half-Cauchy on σ includes the +log2 half-line normalizer that reference .stan (implicit lower=0 + cauchy_lpdf) drops. Stan−Turing = −log2 ≈ −0.693 (source-derived, observed-confirmed).")
 reg!("arma-arma11"; mod = :ARMA11Example, build = :build_arma11_graph, have = (:unconstrained, :series),
-    bind = d -> (series = F(d, "y"),))
+    bind = d -> (series = F(d, "y"),),
+    off_tu = -log(2.0),
+    off_reason = "upstream Turing's truncated/half-Cauchy on σ includes the +log2 half-line normalizer that reference .stan (implicit lower=0 + cauchy_lpdf) drops. Stan−Turing = −log2 ≈ −0.693 (source-derived, observed-confirmed).")
 
 # growth
 reg!("dugongs_data-dugongs_model"; mod = :DugongsGrowthExample, build = :build_dugongs_graph, have = (:unconstrained, :ages, :lengths),
@@ -171,23 +185,23 @@ reg!("Rate_5_data-Rate_5_model"; mod = :Rate5Example, build = :build_rate_5_grap
 
 # ---------------- Bernoulli-logit GLM (wells / dogs / nes_logit / sesame) ----------------
 reg!("wells_data-wells_dist"; mod = :WellsDistExample, build = :build_wells_dist_graph, have = (:unconstrained, :dist, :switched),
-    bind = d -> (dist = F(d, "dist"), switched = Iv(d, "switched")))
+    bind = d -> (dist = F(d, "dist"), switched = Bv(d, "switched")))
 reg!("wells_data-wells_dist100_model"; mod = :WellsDist100Example, build = :build_wells_dist100_graph, have = (:unconstrained, :dist, :switched),
-    bind = d -> (dist = F(d, "dist"), switched = Iv(d, "switched")))
+    bind = d -> (dist = F(d, "dist"), switched = Bv(d, "switched")))
 reg!("wells_data-wells_dist100ars_model"; mod = :WellsDist100arsExample, build = :build_wells_dist100ars_graph, have = (:unconstrained, :dist, :arsenic, :switched),
-    bind = d -> (dist = F(d, "dist"), arsenic = F(d, "arsenic"), switched = Iv(d, "switched")))
+    bind = d -> (dist = F(d, "dist"), arsenic = F(d, "arsenic"), switched = Bv(d, "switched")))
 reg!("wells_data-wells_interaction_model"; mod = :WellsInteractionExample, build = :build_wells_interaction_graph, have = (:unconstrained, :dist, :arsenic, :switched),
-    bind = d -> (dist = F(d, "dist"), arsenic = F(d, "arsenic"), switched = Iv(d, "switched")))
+    bind = d -> (dist = F(d, "dist"), arsenic = F(d, "arsenic"), switched = Bv(d, "switched")))
 reg!("wells_data-wells_interaction_c_model"; mod = :WellsInteractionCExample, build = :build_wells_interaction_c_graph, have = (:unconstrained, :dist, :arsenic, :switched),
-    bind = d -> (dist = F(d, "dist"), arsenic = F(d, "arsenic"), switched = Iv(d, "switched")))
+    bind = d -> (dist = F(d, "dist"), arsenic = F(d, "arsenic"), switched = Bv(d, "switched")))
 reg!("wells_data-wells_dae_model"; mod = :WellsDaeExample, build = :build_wells_dae_graph, have = (:unconstrained, :dist, :arsenic, :educ, :switched),
-    bind = d -> (dist = F(d, "dist"), arsenic = F(d, "arsenic"), educ = F(d, "educ"), switched = Iv(d, "switched")))
+    bind = d -> (dist = F(d, "dist"), arsenic = F(d, "arsenic"), educ = F(d, "educ"), switched = Bv(d, "switched")))
 reg!("wells_data-wells_dae_c_model"; mod = :WellsDaeCExample, build = :build_wells_dae_c_graph, have = (:unconstrained, :dist, :arsenic, :educ, :switched),
-    bind = d -> (dist = F(d, "dist"), arsenic = F(d, "arsenic"), educ = F(d, "educ"), switched = Iv(d, "switched")))
+    bind = d -> (dist = F(d, "dist"), arsenic = F(d, "arsenic"), educ = F(d, "educ"), switched = Bv(d, "switched")))
 reg!("wells_data-wells_dae_inter_model"; mod = :WellsDaeInterExample, build = :build_wells_dae_inter_graph, have = (:unconstrained, :dist, :arsenic, :educ, :switched),
-    bind = d -> (dist = F(d, "dist"), arsenic = F(d, "arsenic"), educ = F(d, "educ"), switched = Iv(d, "switched")))
+    bind = d -> (dist = F(d, "dist"), arsenic = F(d, "arsenic"), educ = F(d, "educ"), switched = Bv(d, "switched")))
 reg!("wells_data-wells_daae_c_model"; mod = :WellsDaaeCExample, build = :build_wells_daae_c_graph, have = (:unconstrained, :dist, :arsenic, :assoc, :educ, :switched),
-    bind = d -> (dist = F(d, "dist"), arsenic = F(d, "arsenic"), assoc = F(d, "assoc"), educ = F(d, "educ"), switched = Iv(d, "switched")))
+    bind = d -> (dist = F(d, "dist"), arsenic = F(d, "arsenic"), assoc = F(d, "assoc"), educ = F(d, "educ"), switched = Bv(d, "switched")))
 reg!("dogs-dogs"; mod = :DogsExample, build = :build_dogs_graph, have = (:unconstrained, :n_avoid, :n_shock, :y),
     bind = d -> (let (na, ns, yf) = _dogs_ports(d); (n_avoid = na, n_shock = ns, y = yf) end))
 reg!("dogs-dogs_log"; mod = :DogsLogExample, build = :build_dogs_log_graph, have = (:unconstrained, :n_avoid, :n_shock, :y),
@@ -195,7 +209,7 @@ reg!("dogs-dogs_log"; mod = :DogsLogExample, build = :build_dogs_log_graph, have
 reg!("dogs-dogs_hierarchical"; mod = :DogsHierarchicalExample, build = :build_dogs_hierarchical_graph, have = (:unconstrained, :prev_avoid, :prev_shock, :y),
     bind = d -> (let (na, ns, yf) = _dogs_ports(d); (prev_avoid = na, prev_shock = ns, y = yf) end))
 reg!("nes_logit_data-nes_logit_model"; mod = :NesLogitExample, build = :build_nes_logit_graph, have = (:unconstrained, :income, :vote),
-    bind = d -> (income = F(d, "income"), vote = Iv(d, "vote")))
+    bind = d -> (income = F(d, "income"), vote = Bv(d, "vote")))
 reg!("sesame_data-sesame_one_pred_a"; mod = :SesameOnePredAExample, build = :build_sesame_one_pred_a_graph, have = (:unconstrained, :encouraged, :watched),
     bind = d -> (encouraged = F(d, "encouraged"), watched = F(d, "watched")))
 
@@ -247,7 +261,9 @@ reg!("low_dim_gauss_mix_collapse-low_dim_gauss_mix_collapse"; mod = :LowDimGauss
 reg!("M0_data-M0_model"; mod = :M0Example, build = :build_m0_graph, have = (:unconstrained, :s, :lchoose, :T, :M), bind = d -> _cr_bind_m0(d))
 reg!("Mb_data-Mb_model"; mod = :MbExample, build = :build_mb_graph, have = (:unconstrained, :a, :b, :e, :f, :s, :T, :M), bind = d -> _cr_bind_mb(d))
 reg!("Mt_data-Mt_model"; mod = :MtExample, build = :build_mt_graph, have = (:unconstrained, :Y, :s, :T, :M), bind = d -> _cr_bind_mt(d))
-reg!("Mh_data-Mh_model"; mod = :MhExample, build = :build_mh_graph, have = (:unconstrained, :y, :lchoose, :T, :M), bind = d -> _cr_bind_mh(d))
+reg!("Mh_data-Mh_model"; mod = :MhExample, build = :build_mh_graph, have = (:unconstrained, :y, :lchoose, :T, :M), bind = d -> _cr_bind_mh(d),
+    off_tu = log(5.0),
+    off_reason = "upstream Turing writes sigma~Uniform(0,5) (omega,mean_p~U(0,1) contribute 0); reference .stan uses implicit uniform on the same bounds. Stan−Turing = log(5) ≈ 1.609 (source-derived, observed-confirmed).")
 reg!("Mth_data-Mth_model"; mod = :MthModelExample, build = :build_mth_model_graph, have = (:unconstrained, :Y, :s, :T, :M), bind = d -> _cr_bind_mt(d))
 reg!("Mtbh_data-Mtbh_model"; mod = :MtbhModelExample, build = :build_mtbh_model_graph, have = (:unconstrained, :Y, :Yprev, :s, :T, :M), bind = d -> _cr_bind_mtbh(d))
 
