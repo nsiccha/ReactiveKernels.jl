@@ -20,6 +20,7 @@ using ReactiveKernelsPPLExamples.EarnHeightExample: evaluate_earn_height_source
 using ReactiveKernelsPPLExamples.LogearnHeightExample: evaluate_logearn_height_source
 using ReactiveKernelsPPLExamples.Log10earnHeightExample: evaluate_log10earn_height_source
 using ReactiveKernelsPPLExamples.LogearnInteractionExample: evaluate_logearn_interaction_source
+using ReactiveKernelsPPLExamples.ARKExample: evaluate_ark_source
 using ReactiveKernelsPPLExamples.KidscoreMomhsExample: evaluate_kidscore_momhs_source
 using ReactiveKernelsPPLExamples.KidscoreMomiqExample: evaluate_kidscore_momiq_source
 using ReactiveKernelsPPLExamples.KidscoreMomhsiqExample: evaluate_kidscore_momhsiq_source
@@ -134,6 +135,10 @@ end
     end
     @testset "logearn_interaction (posteriordb; Gaussian linear regression)" begin
         a = evaluate_logearn_interaction_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "arK (posteriordb; AR(K) lag-matrix regression)" begin
+        a = evaluate_ark_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
     @testset "kidscore_momhs (posteriordb; Gaussian linear regression)" begin
