@@ -48,6 +48,11 @@ include("radon_pooled.jl")
 include("radon_partially_pooled_centered.jl")
 include("radon_partially_pooled_noncentered.jl")
 include("radon_variable_intercept_centered.jl")
+include("radon_county.jl")
+include("radon_county_intercept.jl")
+include("radon_variable_intercept_noncentered.jl")
+include("radon_variable_slope_centered.jl")
+include("radon_variable_slope_noncentered.jl")
 include("rate_2.jl")
 include("rate_3.jl")
 include("rate_4.jl")
@@ -137,6 +142,11 @@ export RadonPooledExample
 export RadonPartiallyPooledCenteredExample
 export RadonPartiallyPooledNoncenteredExample
 export RadonVariableInterceptCenteredExample
+export RadonCountyExample
+export RadonCountyInterceptExample
+export RadonVariableInterceptNoncenteredExample
+export RadonVariableSlopeCenteredExample
+export RadonVariableSlopeNoncenteredExample
 export Rate2Example
 export Rate3Example
 export Rate4Example

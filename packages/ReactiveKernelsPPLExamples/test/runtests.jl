@@ -8,6 +8,7 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     MesquiteExample, LogmesquiteExample, LogmesquiteLogvolumeExample, LogmesquiteLogvaExample, LogmesquiteLogvasExample, LogmesquiteLogvashExample, KilpisjarviExample, EarnHeightExample, LogearnHeightExample, Log10earnHeightExample, LogearnInteractionExample, LogearnHeightMaleExample, LogearnLogheightMaleExample, LogearnInteractionZExample, ARKExample, MhExample,
     NesLogitExample, WellsDistExample, WellsDist100Example, DogsLogExample, NESExample, KidscoreMomWorkExample, Rate1Example,
     RadonPooledExample, RadonPartiallyPooledCenteredExample, RadonPartiallyPooledNoncenteredExample, RadonVariableInterceptCenteredExample,
+    RadonCountyExample, RadonCountyInterceptExample, RadonVariableInterceptNoncenteredExample, RadonVariableSlopeCenteredExample, RadonVariableSlopeNoncenteredExample,
     Rate2Example, Rate3Example, Rate4Example, Rate5Example,
     DogsExample, DogsHierarchicalExample,
     SeedsExample, PilotsExample, LsatExample, SurgicalExample,
@@ -58,6 +59,11 @@ include("test_radon_pooled_example.jl")
 include("test_radon_partially_pooled_centered_example.jl")
 include("test_radon_partially_pooled_noncentered_example.jl")
 include("test_radon_variable_intercept_centered_example.jl")
+include("test_radon_county_example.jl")
+include("test_radon_county_intercept_example.jl")
+include("test_radon_variable_intercept_noncentered_example.jl")
+include("test_radon_variable_slope_centered_example.jl")
+include("test_radon_variable_slope_noncentered_example.jl")
 include("test_rate_2_example.jl")
 include("test_rate_3_example.jl")
 include("test_rate_4_example.jl")

@@ -39,6 +39,11 @@ using ReactiveKernelsPPLExamples.RadonPooledExample: evaluate_radon_pooled_sourc
 using ReactiveKernelsPPLExamples.RadonPartiallyPooledCenteredExample: evaluate_radon_partially_pooled_centered_source
 using ReactiveKernelsPPLExamples.RadonPartiallyPooledNoncenteredExample: evaluate_radon_partially_pooled_noncentered_source
 using ReactiveKernelsPPLExamples.RadonVariableInterceptCenteredExample: evaluate_radon_variable_intercept_centered_source
+using ReactiveKernelsPPLExamples.RadonCountyExample: evaluate_radon_county_source
+using ReactiveKernelsPPLExamples.RadonCountyInterceptExample: evaluate_radon_county_intercept_source
+using ReactiveKernelsPPLExamples.RadonVariableInterceptNoncenteredExample: evaluate_radon_variable_intercept_noncentered_source
+using ReactiveKernelsPPLExamples.RadonVariableSlopeCenteredExample: evaluate_radon_variable_slope_centered_source
+using ReactiveKernelsPPLExamples.RadonVariableSlopeNoncenteredExample: evaluate_radon_variable_slope_noncentered_source
 using ReactiveKernelsPPLExamples.Rate2Example: evaluate_rate_2_source
 using ReactiveKernelsPPLExamples.Rate3Example: evaluate_rate_3_source
 using ReactiveKernelsPPLExamples.Rate4Example: evaluate_rate_4_source
@@ -253,6 +258,26 @@ end
     end
     @testset "radon_variable_intercept_centered (posteriordb; hierarchical normal)" begin
         a = evaluate_radon_variable_intercept_centered_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "radon_county (posteriordb; hierarchical normal)" begin
+        a = evaluate_radon_county_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "radon_county_intercept (posteriordb; hierarchical normal)" begin
+        a = evaluate_radon_county_intercept_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "radon_variable_intercept_noncentered (posteriordb; hierarchical normal)" begin
+        a = evaluate_radon_variable_intercept_noncentered_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "radon_variable_slope_centered (posteriordb; hierarchical normal)" begin
+        a = evaluate_radon_variable_slope_centered_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "radon_variable_slope_noncentered (posteriordb; hierarchical normal)" begin
+        a = evaluate_radon_variable_slope_noncentered_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
     @testset "rate_2 (posteriordb; binomial rate)" begin
