@@ -1173,10 +1173,6 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                 length(endpoint_actuals) == length(explicit) || throw(ArgumentError(
                     "endpoint :$endpoint_name expects $(length(explicit)) argument(s), " *
                     "got $(length(endpoint_actuals))"))
-                all(arg -> arg isa Symbol && arg in locals, endpoint_actuals) ||
-                    throw(ArgumentError(
-                        "constructed endpoint arguments $context must be named caller ports"))
-
                 # Owner bindings are graph inputs, but their source spelling need not
                 # already be a named caller port. Materialize literals and computed
                 # expressions as hygienic caller recipes, typed by the selected child
@@ -1213,7 +1209,37 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                     push!(owner_ports, generated_port)
                 end
 
-                actuals = Symbol[owner_ports...; endpoint_actuals...]
+                # Endpoint method arguments (the observed value in `.logpdf(x)`) are
+                # graph inputs too, and — exactly like the owner bindings above —
+                # their source spelling need not already be a named caller port.
+                # Materialize a literal or computed method argument such as
+                # `normal(location, scale).logpdf(log(w))` as a hygienic caller
+                # recipe, typed by the endpoint's explicit boundary, so it lowers
+                # identically to the constructor-argument case rather than being
+                # rejected. A bare name still must resolve to a declared caller port.
+                endpoint_ports = Symbol[]
+                for (index, actual) in enumerate(endpoint_actuals)
+                    if actual isa Symbol && actual in locals
+                        push!(endpoint_ports, actual)
+                        continue
+                    elseif actual isa Symbol
+                        throw(ArgumentError(
+                            "endpoint :$endpoint_name argument $context refers to " *
+                            "undeclared caller port :$actual"))
+                    end
+                    rewritten_actual, _ = _kernel_constructed_endpoint(
+                        actual, mod, locals, nested_specs, local_types;
+                        context = context, materialized = materialized)
+                    generated_port = gensym(Symbol(explicit[index], :_argument))
+                    generated_type = valtype(
+                        endpoint_inputs[length(owner_formals) + index])
+                    push!(materialized,
+                          (generated_port, generated_type, rewritten_actual))
+                    push!(locals, generated_port)
+                    push!(endpoint_ports, generated_port)
+                end
+
+                actuals = Symbol[owner_ports...; endpoint_ports...]
                 for (actual, formal) in zip(actuals, inputs(endpoint))
                     T = valtype(formal)
                     if haskey(local_types, actual) && local_types[actual] != T
@@ -1230,7 +1256,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                 nested_specs[generated] = KernelSpec(
                     endpoint.graph, endpoint.ports, endpoint.port_order,
                     endpoint.have_names, endpoint.want_names, retargeted)
-                return Expr(:call, generated, endpoint_actuals...),
+                return Expr(:call, generated, endpoint_ports...),
                        valtype(only(outputs(endpoint)))
             end
         end
