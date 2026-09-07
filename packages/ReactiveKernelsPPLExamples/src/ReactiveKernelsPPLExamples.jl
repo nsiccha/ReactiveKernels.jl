@@ -64,6 +64,10 @@ include("rate_5.jl")
 include("dogs.jl")
 include("dogs_hierarchical.jl")
 include("seeds.jl")
+include("seeds_centered_model.jl")
+include("seeds_stanified_model.jl")
+include("rats_model.jl")
+include("sesame_one_pred_a.jl")
 include("pilots.jl")
 include("lsat.jl")
 include("surgical.jl")
@@ -165,6 +169,10 @@ export Rate5Example
 export DogsExample
 export DogsHierarchicalExample
 export SeedsExample
+export SeedsCenteredExample
+export SeedsStanifiedExample
+export RatsModelExample
+export SesameOnePredAExample
 export PilotsExample
 export LsatExample
 export SurgicalExample

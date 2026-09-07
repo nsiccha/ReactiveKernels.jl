@@ -55,6 +55,10 @@ using ReactiveKernelsPPLExamples.Rate5Example: evaluate_rate_5_source
 using ReactiveKernelsPPLExamples.DogsExample: evaluate_dogs_source
 using ReactiveKernelsPPLExamples.DogsHierarchicalExample: evaluate_dogs_hierarchical_source
 using ReactiveKernelsPPLExamples.SeedsExample: evaluate_seeds_source
+using ReactiveKernelsPPLExamples.SeedsCenteredExample: evaluate_seeds_centered_model_source
+using ReactiveKernelsPPLExamples.SeedsStanifiedExample: evaluate_seeds_stanified_model_source
+using ReactiveKernelsPPLExamples.RatsModelExample: evaluate_rats_model_source
+using ReactiveKernelsPPLExamples.SesameOnePredAExample: evaluate_sesame_one_pred_a_source
 using ReactiveKernelsPPLExamples.PilotsExample: evaluate_pilots_source
 using ReactiveKernelsPPLExamples.LsatExample: evaluate_lsat_source
 using ReactiveKernelsPPLExamples.SurgicalExample: evaluate_surgical_source
@@ -329,6 +333,22 @@ end
     end
     @testset "seeds (posteriordb)" begin
         a = evaluate_seeds_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "seeds_centered_model (posteriordb)" begin
+        a = evaluate_seeds_centered_model_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "seeds_stanified_model (posteriordb)" begin
+        a = evaluate_seeds_stanified_model_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "rats_model (posteriordb; hierarchical growth)" begin
+        a = evaluate_rats_model_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "sesame_one_pred_a (posteriordb; linear regression)" begin
+        a = evaluate_sesame_one_pred_a_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
     @testset "pilots (posteriordb)" begin
