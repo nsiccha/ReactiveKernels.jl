@@ -289,17 +289,6 @@ function setup_arma11!(mod::Module)
     nothing
 end
 
-function setup_gaussian_mixture!(mod::Module)
-    if !isdefined(mod, :GaussianMixtureExample)
-        Core.eval(mod, :(using ReactiveKernelsPPLExamples: GaussianMixtureExample))
-    end
-    # Bind only the data. The displayed PPL assembly imports and reuses the
-    # shared `normal` and `beta` objects and the LogExpFunctions log-sum-exp
-    # directly.
-    Core.eval(mod, :(using .GaussianMixtureExample: MIXTURE_OBSERVATIONS))
-    nothing
-end
-
 function setup_mvnormal_regression!(mod::Module)
     if !isdefined(mod, :MVNormalRegressionExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: MVNormalRegressionExample))
@@ -728,7 +717,6 @@ const EXPECTED_PPL_EXAMPLES = (
     :poisson_gamma_density,
     :dugongs_density,
     :arma11_density,
-    :gaussian_mixture_density,
     :mnist_logistic_density,
     :mnist_logistic_optimized_density,
     :mvnormal_regression_density,

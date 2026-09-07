@@ -8,7 +8,6 @@ using ReactiveKernelsPPLExamples.BetaBinomialExample
 using ReactiveKernelsPPLExamples.PoissonGammaExample
 using ReactiveKernelsPPLExamples.DugongsGrowthExample
 using ReactiveKernelsPPLExamples.ARMA11Example
-using ReactiveKernelsPPLExamples.GaussianMixtureExample
 using ReactiveKernelsPPLExamples.MVNormalRegressionExample
 using ReactiveKernelsPPLExamples.BoundRegressionExample
 
@@ -127,31 +126,6 @@ function arma11_reference_density(q)
     prior + log_σ + likelihood
 end
 
-const _GM_LOGBETA55 = logbeta(5.0, 5.0)
-
-function gaussian_mixture_reference_density(q)
-    μ₁, δ, log_σ₁, log_σ₂, logit_θ = q[1], q[2], q[3], q[4], q[5]
-    μ₂ = μ₁ + exp(δ)
-    σ₁ = exp(log_σ₁)
-    σ₂ = exp(log_σ₂)
-    θ = 1 / (1 + exp(-logit_θ))
-    log_θ = log(θ)
-    log_1mθ = log1p(-θ)
-    log_jacobian = δ + log_σ₁ + log_σ₂ + log_θ + log_1mθ
-    nld(x, loc, sc) = -0.5 * log(2π) - log(sc) - 0.5 * ((x - loc) / sc)^2
-    prior = nld(μ₁, 0.0, 2.0) + nld(μ₂, 0.0, 2.0) +
-            log(2.0) + nld(σ₁, 0.0, 2.0) + log(2.0) + nld(σ₂, 0.0, 2.0) +
-            (4 * log(θ) + 4 * log1p(-θ) - _GM_LOGBETA55)
-    likelihood = zero(μ₁)
-    @inbounds for y in MIXTURE_OBSERVATIONS
-        la = log_θ + nld(y, μ₁, σ₁)
-        lb = log_1mθ + nld(y, μ₂, σ₂)
-        m = max(la, lb)
-        likelihood += m + log(exp(la - m) + exp(lb - m))
-    end
-    prior + log_jacobian + likelihood
-end
-
 # The covariance factorizations are data, so precompute the log-determinant and
 # reuse the exported precision (Σ⁻¹) matrix. This keeps the differentiated
 # reference a plain const-matrix quadratic form — Enzyme's reverse mode rejects a
@@ -196,52 +170,6 @@ function bound_regression_reference_density(q)
         likelihood += normal_ld(BOUND_Y[i], mean[i], σ)
     end
     prior + log_σ + likelihood
-end
-
-# Independent analytic score for the unconstrained Gaussian-mixture reference.
-# This is deliberately not differentiated with the backend under test: the RK
-# path below retains plain reverse-mode Enzyme, while the oracle follows the
-# closed-form responsibility-weighted derivatives of the marginalized mixture.
-function gaussian_mixture_reference_gradient(q)
-    μ₁, δ, log_σ₁, log_σ₂, logit_θ = q
-    mean_gap = exp(δ)
-    μ₂ = μ₁ + mean_gap
-    σ₁ = exp(log_σ₁)
-    σ₂ = exp(log_σ₂)
-    θ = inv(1 + exp(-logit_θ))
-
-    # Prior plus unconstraining-Jacobian score.
-    dμ₁ = -(μ₁ + μ₂) / 4
-    dδ = 1 - mean_gap * μ₂ / 4
-    dlog_σ₁ = 1 - σ₁^2 / 4
-    dlog_σ₂ = 1 - σ₂^2 / 4
-    dlogit_θ = 5 * (1 - 2θ)
-
-    log_weight₁ = log(θ)
-    log_weight₂ = log1p(-θ)
-    for observation in MIXTURE_OBSERVATIONS
-        z₁ = (observation - μ₁) / σ₁
-        z₂ = (observation - μ₂) / σ₂
-        log_odds = (log_weight₁ - log_σ₁ - 0.5z₁^2) -
-                   (log_weight₂ - log_σ₂ - 0.5z₂^2)
-        responsibility = if log_odds >= 0
-            inv(1 + exp(-log_odds))
-        else
-            odds = exp(log_odds)
-            odds / (1 + odds)
-        end
-        complement = 1 - responsibility
-
-        score_mean₁ = (observation - μ₁) / σ₁^2
-        score_mean₂ = (observation - μ₂) / σ₂^2
-        dμ₁ += responsibility * score_mean₁ + complement * score_mean₂
-        dδ += mean_gap * complement * score_mean₂
-        dlog_σ₁ += responsibility * (z₁^2 - 1)
-        dlog_σ₂ += complement * (z₂^2 - 1)
-        dlogit_θ += responsibility - θ
-    end
-
-    (dμ₁, dδ, dlog_σ₁, dlog_σ₂, dlogit_θ)
 end
 
 _gradient_vector(x::Number) = [x]
@@ -298,10 +226,6 @@ end
         (evaluate_arma11_source(),
          (:unconstrained, :series),
          arma11_reference_density, nothing),
-        (evaluate_gaussian_mixture_source(),
-         (:unconstrained, :observations),
-         gaussian_mixture_reference_density,
-         gaussian_mixture_reference_gradient),
         (evaluate_mvnormal_regression_source(),
          (:unconstrained, :predictors, :responses, :covariance),
          mvnormal_regression_reference_density, nothing),
