@@ -111,6 +111,18 @@ end
     return sum(pointwise)
 end
 
+# The endpoint METHOD argument accepts a computed expression, exactly as the
+# constructor arguments (mean/scale) already do. `.logpdf(log(wi))` lowers to
+# the same graph as precomputing `log_w` in a transformed-data node and passing
+# the bare port, so a log-response likelihood need not be split off the plate.
+@kernel authored_transformed_response_loglik(
+        w::Vector{Float64}, location, scale) = begin
+    pointwise = plate(w, location, scale) do wi, li, si
+        authored_normal(li, si).logpdf(log(wi))
+    end
+    return sum(pointwise)
+end
+
 @kernel authored_cauchy_loglik(x::Vector{Float64}, location, scale) = begin
     pointwise = plate(x, location, scale) do xi, li, si
         authored_cauchy(li, si).logpdf(xi)
@@ -444,6 +456,35 @@ end
 
     @test_throws DimensionMismatch total(xs, locations[1:3], scales)
     @test_throws DimensionMismatch total(xs, [locations; 0.6], scales)
+end
+
+@testset "authored plate block: computed endpoint method argument" begin
+    w = [0.5, 1.5, 2.0, 3.0]
+    location = 0.1
+    scale = 1.3
+
+    # A computed method argument `log(wi)` produces the SAME graph, and the same
+    # numbers, as precomputing the transformed response in a transformed-data
+    # node (`workaround_loglik`) and passing the bare port.
+    transformed = prepare(authored_transformed_response_loglik)
+    precomputed = prepare(untyped_authored_normal_loglik)
+    reference = sum(_authored_plate_normal(log(wi), location, scale) for wi in w)
+
+    @test transformed(w, location, scale) ≈ reference
+    @test transformed(w, location, scale) ≈ precomputed(log.(w), location, scale)
+    @test _authored_plate_allocated(
+        transformed, w, location, scale) == 0
+
+    # A bare name that is not a declared caller port is still rejected — the
+    # method argument path only gained expression materialization, not the
+    # ability to reference an undeclared local.
+    @test_throws ArgumentError @macroexpand @kernel _authored_undeclared_arg(
+            w::Vector{Float64}, location, scale) = begin
+        pointwise = plate(w, location, scale) do wi, li, si
+            authored_normal(li, si).logpdf(missing_port)
+        end
+        return sum(pointwise)
+    end
 end
 
 @testset "authored plate block: graph-derived broadcast scheduling" begin
