@@ -64,6 +64,9 @@ using ReactiveKernelsPPLExamples.KidscoreMomhsExample: evaluate_kidscore_momhs_s
 using ReactiveKernelsPPLExamples.KidscoreMomiqExample: evaluate_kidscore_momiq_source
 using ReactiveKernelsPPLExamples.KidscoreMomhsiqExample: evaluate_kidscore_momhsiq_source
 using ReactiveKernelsPPLExamples.KidscoreInteractionExample: evaluate_kidscore_interaction_source
+using ReactiveKernelsPPLExamples.KidscoreInteractionCExample: evaluate_kidscore_interaction_c_source
+using ReactiveKernelsPPLExamples.KidscoreInteractionC2Example: evaluate_kidscore_interaction_c2_source
+using ReactiveKernelsPPLExamples.KidscoreInteractionZExample: evaluate_kidscore_interaction_z_source
 using ReactiveKernelsPPLExamples.BetaBinomialExample: evaluate_beta_binomial_source
 using ReactiveKernelsPPLExamples.DugongsGrowthExample: evaluate_dugongs_source
 using ReactiveKernelsPPLExamples.GaussianMixtureExample: evaluate_gaussian_mixture_source
@@ -350,6 +353,18 @@ end
     end
     @testset "kidscore_interaction (posteriordb; Gaussian linear regression)" begin
         a = evaluate_kidscore_interaction_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "kidscore_interaction_c (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_kidscore_interaction_c_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "kidscore_interaction_c2 (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_kidscore_interaction_c2_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "kidscore_interaction_z (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_kidscore_interaction_z_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
     @testset "beta_binomial" begin

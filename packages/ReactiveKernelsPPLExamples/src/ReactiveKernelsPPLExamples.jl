@@ -17,6 +17,9 @@ include("kidscore_momhs.jl")
 include("kidscore_momiq.jl")
 include("kidscore_momhsiq.jl")
 include("kidscore_interaction.jl")
+include("kidscore_interaction_c.jl")
+include("kidscore_interaction_c2.jl")
+include("kidscore_interaction_z.jl")
 include("blr.jl")
 include("mesquite.jl")
 include("logmesquite.jl")
@@ -103,6 +106,9 @@ export KidscoreMomhsExample
 export KidscoreMomiqExample
 export KidscoreMomhsiqExample
 export KidscoreInteractionExample
+export KidscoreInteractionCExample
+export KidscoreInteractionC2Example
+export KidscoreInteractionZExample
 export BLRExample
 export MesquiteExample
 export LogmesquiteExample
