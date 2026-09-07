@@ -100,6 +100,29 @@ end
 @inline _authored_plate_zero(::Type{T}, marker) where {T} = zero(T)
 @inline _authored_plate_zero(::Type{Any}, marker) = zero(eltype(marker))
 
+# An untyped plate cell exposes its result through a metadata-`Any` boundary
+# port (type annotations are optional metadata in an authored kernel), so the
+# native lowering allocates its pointwise container as a boxed `Vector{Any}` —
+# even when every cell yields the same concrete type. That boxed container is
+# not promotable at the Reactant host-operand boundary
+# (`unwrapped_eltype(::Type{Any})` has no method), so a transformed-data plate
+# over BOUND data (evaluated natively, then handed to a traced likelihood)
+# breaks an otherwise-tracing posterior. Narrow the filled container once to its
+# concrete element type, mirroring `map(identity, ·)`: a homogeneous cell
+# collapses to `Vector{Float64}`, while a genuinely heterogeneous cell keeps its
+# wide container. Reached only when the boundary type is `Any`; a typed cell
+# keeps the original single-allocation fast path untouched.
+@inline _narrow_plate_output(x::AbstractArray) = _narrow_plate_output(x, eltype(x))
+@inline _narrow_plate_output(x::AbstractArray, ::Type) = x
+function _narrow_plate_output(x::AbstractArray, ::Type{Any})
+    isempty(x) && return x
+    narrowed = mapreduce(typeof, Base.promote_typejoin, x)
+    narrowed === Any && return x
+    result = similar(x, narrowed)
+    copyto!(result, x)
+    result
+end
+
 # A plate is a pure graph map/reduction. Once Julia has instantiated the
 # broadcast axes, a recipe only needs to run again when a dimension kept by
 # one of its transitive HAVE roots changes in Cartesian iteration order. The
@@ -147,7 +170,10 @@ function (op::_AuthoredPlateOp{K,A})(args...) where {K,A}
         scalar_args = batch[index]
         result[index] = op.kernel(scalar_args...)
     end
-    result
+    # An untyped cell (`valtype(output) === Any`) fills a boxed `Vector{Any}`;
+    # narrow it to the concrete element type so it stays promotable at the
+    # Reactant host-operand boundary. No-op for a typed cell.
+    _narrow_plate_output(result)
 end
 
 # A first-class authored SEQUENTIAL scan.  Unlike `plate` (a pure broadcast map),
@@ -544,6 +570,15 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
         push!(body.args, :($first_coordinate = true))
     end
     push!(body.args, Expr(:for, Expr(:(=), index, iteration), loopbody))
+    # A materialized untyped cell fills a boxed `Vector{Any}` container
+    # (`output_type === Any`); narrow it to its concrete element type after the
+    # loop so a transformed-data plate over bound data stays promotable at the
+    # Reactant host-operand boundary. The total accumulator is already typed via
+    # `_authored_plate_zero`, so this touches only the pointwise materialization.
+    if pointwise_lhs !== nothing && output_type === Any
+        push!(body.args, :($pointwise_lhs =
+            $(GlobalRef(@__MODULE__, :_narrow_plate_output))($pointwise_lhs)))
+    end
     total_lhs === nothing || push!(body.args, :($total_lhs = $accumulator))
     body
 end
