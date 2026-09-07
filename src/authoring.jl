@@ -1382,6 +1382,134 @@ function _kernel_authored_plate(spec::KernelSpec, ::Val{A}) where {A}
     _AuthoredPlateOp{typeof(kernel),A}(kernel)
 end
 
+# `scan(xs, Ref(shared)...; init = c0) do carry, x, shared...  …; (new_carry, output)  end`
+# authors a bounded SEQUENTIAL recurrence.  Unlike `plate` (a pure per-element
+# broadcast map), `scan` threads a `carry` value: the do-block's FIRST formal is
+# the carry (seeded by `init`, never a positional argument), the SECOND is the
+# per-step element drawn from the single non-`Ref` positional `xs`, and any
+# further formals are `Ref`-wrapped shared/atomic operands (broadcast-invariant,
+# exactly like plate's atomic args).  The do-block returns the 2-tuple
+# `(new_carry, output)`; `scan` returns the vector `[output…]`.  The step is an
+# ordinary TWO-`want` KernelSpec (`want = (:new_carry, :output)`); the native
+# path runs the plain ordered loop (already Reactant-unsafe only via scalar
+# indexing, which the tensorized lowering avoids by emitting a `stablehlo.while`).
+function _kernel_authored_scan_expr(rhs, mod)
+    rhs isa Expr && rhs.head === :do && length(rhs.args) == 2 || return nothing
+    call, lambda = rhs.args
+    call isa Expr && call.head === :call && !isempty(call.args) || return nothing
+    _kernel_resolve_binding(mod, call.args[1]) === scan || return nothing
+    lambda isa Expr && lambda.head === :(->) && length(lambda.args) == 2 ||
+        throw(ArgumentError("scan do-block requires an ordinary argument list and body"))
+    formals_expr, scalar_body = lambda.args
+    formals = formals_expr isa Expr && formals_expr.head === :tuple &&
+              all(arg -> arg isa Symbol, formals_expr.args) ?
+              Symbol[formals_expr.args...] : throw(ArgumentError(
+                  "scan do-block arguments must be bare names: (carry, x, shared...)"))
+    length(formals) >= 2 || throw(ArgumentError(
+        "scan do-block needs at least (carry, x): the threaded carry and the per-step element"))
+    length(unique(formals)) == length(formals) || throw(ArgumentError(
+        "scan do-block argument names must be unique"))
+
+    # Split the call into positional operands and the required `init =` carry seed.
+    positional = Any[]
+    init_expr = nothing
+    for arg in call.args[2:end]
+        if arg isa Expr && arg.head === :parameters
+            for kw in arg.args
+                (kw isa Expr && kw.head === :kw && kw.args[1] === :init) ||
+                    throw(ArgumentError("scan accepts only an `init =` keyword"))
+                init_expr = kw.args[2]
+            end
+        elseif arg isa Expr && arg.head === :kw && arg.args[1] === :init
+            init_expr = arg.args[2]
+        else
+            push!(positional, arg)
+        end
+    end
+    init_expr === nothing && throw(ArgumentError("scan requires an `init =` carry seed"))
+    length(positional) == length(formals) - 1 || throw(ArgumentError(
+        "scan received $(length(positional)) positional argument(s), but its do-block has " *
+        "$(length(formals) - 1) non-carry parameter(s) (x, shared...)"))
+
+    # The scan op's outer arguments are (carry-seed, xs, shared...); the carry
+    # seed and every `Ref`-wrapped shared operand are atomic (broadcast-invariant),
+    # while the single bare positional is the iterated sequence.  Atomic indices
+    # are 1-based over the op's argument tuple, with the carry seed at index 1.
+    arguments = Symbol[]
+    atomic = Int[]
+    materialized_arguments = Tuple{Symbol,Any}[]
+    _push_operand!(value, is_atomic) = begin
+        name = if value isa Symbol
+            value
+        else
+            generated = gensym(:scan_argument)
+            push!(materialized_arguments, (generated, value))
+            generated
+        end
+        push!(arguments, name)
+        is_atomic && push!(atomic, length(arguments))
+        name
+    end
+    _is_ref(a) = a isa Expr && a.head === :call && length(a.args) == 2 &&
+                 _kernel_resolve_binding(mod, a.args[1]) === Ref
+    _push_operand!(init_expr, true)                     # index 1: the carry seed (atomic)
+    isempty(positional) && throw(ArgumentError(
+        "scan needs a sequence positional as its first argument"))
+    _is_ref(positional[1]) && throw(ArgumentError(
+        "scan's first positional must be the sequence to scan over, not Ref-wrapped"))
+    _push_operand!(positional[1], false)                # index 2: the iterated sequence xs
+    for shared in positional[2:end]                     # index 3+: shared (atomic)
+        _is_ref(shared) || throw(ArgumentError(
+            "scan operands after the sequence must be Ref(x) broadcast-invariant scalars"))
+        _push_operand!(shared.args[2], true)
+    end
+
+    # Build the step body's 2-want spec. Its HAVE boundary is the do-block formals
+    # (carry, x, shared...); an enclosing port used but not passed is out of scope
+    # (never auto-captured) — same rule as plate.
+    nested_specs = Dict{Symbol,Any}()
+    local_types = Dict{Symbol,Any}()
+    materialized = Tuple{Symbol,Any,Any}[]
+    rewritten, _ = _kernel_constructed_endpoint(
+        scalar_body, mod, Set(formals), nested_specs, local_types;
+        context = "inside scan", materialized = materialized)
+    signature = Tuple{Symbol,Any}[
+        (name, get(local_types, name, GlobalRef(Core, :Any))) for name in formals]
+    # The do-block ends with a 2-tuple `(new_carry, output)`.  `@kernel` return
+    # values must be PORT names, so bind the two components to synthetic result
+    # ports and return those, yielding a 2-`want` step spec.
+    stmts = rewritten isa Expr && rewritten.head === :block ?
+        filter(s -> !_kernel_is_line(s), rewritten.args) : Any[rewritten]
+    isempty(stmts) && throw(ArgumentError("scan do-block body is empty"))
+    result = last(stmts)
+    result isa Expr && result.head === :return && (result = result.args[1])
+    (result isa Expr && result.head === :tuple && length(result.args) == 2) ||
+        throw(ArgumentError(
+            "scan do-block must end with a 2-tuple `(new_carry, output)`"))
+    carry_expr, output_expr = result.args
+    step_stmts = Any[]
+    for (name, T, mrhs) in materialized
+        push!(step_stmts, Expr(:(=), Expr(:(::), name, T), mrhs))
+    end
+    append!(step_stmts, stmts[1:(end - 1)])
+    push!(step_stmts, Expr(:(=), :__scan_carry__, carry_expr))
+    push!(step_stmts, Expr(:(=), :__scan_output__, output_expr))
+    push!(step_stmts, Expr(:return, Expr(:tuple, :__scan_carry__, :__scan_output__)))
+    step_body = Expr(:block, step_stmts...)
+    step_spec = _kernel_expand(
+        step_body, signature, nothing, mod; nested_specs = nested_specs)
+    operation = Expr(:call, GlobalRef(@__MODULE__, :_kernel_authored_scan),
+                     step_spec,
+                     Expr(:call, GlobalRef(Base, :Val), QuoteNode(Tuple(atomic))))
+    (; arguments, operation, inferred = nothing, atomic = Tuple(atomic),
+       materialized_arguments)
+end
+
+function _kernel_authored_scan(spec::KernelSpec, ::Val{A}) where {A}
+    kernel = prepare(spec)
+    _AuthoredScanOp{typeof(kernel),A}(kernel)
+end
+
 # A dotted operator such as `.*` is broadcast *syntax*, not a bound function:
 # `a .* b` lowers to `broadcast(*, a, b)` and there is no callable named `.*`.
 # Splicing the bare symbol as a recipe callee errors at construction with
@@ -1771,9 +1899,11 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                 push!(outputs, (name, type_expr))
             end
             plate_expr = _kernel_authored_plate_expr(rhs, mod)
+            plate_expr === nothing &&
+                (plate_expr = _kernel_authored_scan_expr(rhs, mod))
             if plate_expr !== nothing
                 length(outputs) == 1 || throw(ArgumentError(
-                    "an authored plate produces exactly one named pointwise port"))
+                    "an authored plate/scan produces exactly one named output port"))
                 # A derived iterable is ordinary graph work outside the plate.
                 # Materialize it as a hygienic named recipe, then feed that port
                 # through the same broadcast/Ref boundary as explicit authoring.
@@ -2387,6 +2517,31 @@ execution and traceable by array compilers such as Reactant. See
 function plate(spec::KernelSpec; have, want, batched, reduce = :+)
     p = plan(spec; have = have, want = want)
     _prepare_batched(p; batched = batched, reduce = reduce)
+end
+
+"""
+    scan(xs, Ref(shared)...; init) do carry, x, shared...
+        …
+        (new_carry, output)
+    end
+
+Author a bounded SEQUENTIAL recurrence inside a `@kernel` / `@ppl` body. `xs` is
+the sequence to scan over (the sole non-`Ref` positional); `init` seeds the
+threaded `carry`; any `Ref(shared)` operands are broadcast-invariant scalars.
+The do-block receives `(carry, x, shared...)` and must end with the 2-tuple
+`(new_carry, output)`; `scan` returns the vector `[output…]`. A compound carry
+may be carried as a `NamedTuple` (`init = (; a, b)`, read `carry.a`).
+
+It lowers to an ordinary ordered loop natively, and to a `stablehlo.while` carry
+loop under Reactant — so a natural sequential recurrence lowers without unrolling
+into forbidden scalar indexing. This is `@kernel` authoring sugar recognized by
+the macro; it is not a callable runtime function outside a kernel body.
+"""
+function scan(args...; kwargs...)
+    throw(ArgumentError(
+        "`scan(...) do carry, x … end` is @kernel authoring sugar, recognized " *
+        "inside a @kernel/@ppl body; it is not a runtime function. Author it in a " *
+        "kernel body."))
 end
 
 inputs(spec::KernelSpec) = _kernel_selection(
