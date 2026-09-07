@@ -1,0 +1,183 @@
+module RadonPartiallyPooledNoncenteredExample
+
+using ReactiveKernels
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+
+export RADON_PP_COUNTY, RADON_PP_LOG
+export build_radon_partially_pooled_noncentered_graph, demo
+export RADON_PARTIALLY_POOLED_NONCENTERED_SOURCE,
+       evaluate_radon_partially_pooled_noncentered_source
+
+# posteriordb `radon_mn-radon_partially_pooled_noncentered` — the partial-pooling
+# Gaussian model with a per-county random intercept in the NON-CENTERED
+# parametrization (alpha_raw ~ Normal(0, 1); alpha = mu_alpha + sigma_alpha *
+# alpha_raw). Full data is N = 919 across 85 counties; embedded here is the same
+# faithful REPRESENTATIVE subset as the centered variant — N = 60 across J = 8
+# counties, group sizes {4, 16, 7, 14, 10, 6, 2, 1}, county index re-indexed
+# 1..8 — so the two parametrizations are directly comparable.
+const RADON_PP_COUNTY = [
+    1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 7, 7, 8,
+]
+const RADON_PP_LOG = [
+    0.0953101798043249, 0.832909122935104, 1.09861228866811, 0.832909122935104, 0.0953101798043249, 1.09861228866811,
+    1.22377543162212, 0.182321556793955, 0.955511445027436, 0.262364264467491, 0.693147180559945, 0.832909122935104,
+    0.336472236621213, 0.182321556793955, 0.470003629245736, 1.52605630349505, 0.641853886172395, 1.16315080980568,
+    1.85629799036563, 1.22377543162212, 1.50407739677627, 1.54756250871601, -0.693147180559945, 1.75785791755237,
+    1.54756250871601, 1.85629799036563, 0.832909122935104, 1.62924053973028, 0.641853886172395, 2.26176309847379,
+    1.56861591791385, 1.3609765531356, 2.55722731136763, 1.98787434815435, 1.94591014905531, 2.57261223020711,
+    1.77495235091167, 2.66722820658195, 1.80828877117927, 2.26176309847379, 1.93152141160321, 1.7404661748405,
+    1.48160454092422, 0.336472236621213, 0.641853886172395, 1.45861502269952, 0.741937344729377, 1.38629436111989,
+    -0.105360515657826, 1.25276296849537, 0.832909122935104, 2.27212588550934, -2.30258509299405, 1.56861591791385,
+    0.53062825106217, 2.69462718077007, 2.56494935746154, 0.405465108108164, 1.02961941718116, 1.38629436111989,
+]
+
+const RADON_PARTIALLY_POOLED_NONCENTERED_SOURCE = raw"""
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
+using LogExpFunctions: logistic, log1pexp
+
+@kernel model(unconstrained::Vector{Float64},
+              county_idx::Vector{Int},
+              log_radon::Vector{Float64}) = begin
+    # Stan's declared unconstrained order: (alpha_raw[1..J], mu_alpha,
+    # log_sigma_alpha, log_sigma_y); dim = J + 3. `alpha_raw` and `mu_alpha` are
+    # unconstrained; the two sigmas use the exp support transform. Slice without
+    # scalar indexing so the same kernel stays traceable as a Reactant program.
+    n_counties::Int = length(unconstrained) - 3
+    alpha_raw::AbstractVector{Float64} = view(unconstrained, 1:n_counties)
+    mu_alpha::Float64 = sum(view(unconstrained, n_counties + 1:n_counties + 1))
+    log_sigma_alpha::Float64 = sum(view(unconstrained, n_counties + 2:n_counties + 2))
+    log_sigma_y::Float64 = sum(view(unconstrained, n_counties + 3:n_counties + 3))
+
+    # sigma = exp(log_sigma); log|dsigma/dlog_sigma| = log_sigma. Bidirectional
+    # edges so either sigma or log_sigma may be authoritative.
+    log_sigma_alpha::Float64 = log(sigma_alpha)
+    sigma_alpha::Float64 = exp(log_sigma_alpha)
+    log_sigma_y::Float64 = log(sigma_y)
+    sigma_y::Float64 = exp(log_sigma_y)
+    log_jacobian::Float64 = log_sigma_alpha + log_sigma_y
+
+    parameters = (; alpha_raw, mu_alpha, sigma_alpha, sigma_y)
+    (parameters, log_jacobian::Float64) =
+        ((; alpha_raw, mu_alpha, sigma_alpha, sigma_y), log_sigma_alpha + log_sigma_y)
+    (alpha_raw::AbstractVector{Float64}, mu_alpha::Float64,
+     sigma_alpha::Float64, sigma_y::Float64) =
+        (parameters.alpha_raw, parameters.mu_alpha, parameters.sigma_alpha,
+         parameters.sigma_y)
+
+    # Priors (all proper): mu_alpha ~ Normal(0, 10), sigma_alpha ~ Normal(0, 1),
+    # sigma_y ~ Normal(0, 1) (half-normal = plain normal_lpdf), and the standard
+    # non-centered prior alpha_raw ~ Normal(0, 1).
+    mu_alpha_prior::Float64 = normal(0.0, 10.0).logpdf(mu_alpha)
+    sigma_alpha_prior::Float64 = normal(0.0, 1.0).logpdf(sigma_alpha)
+    sigma_y_prior::Float64 = normal(0.0, 1.0).logpdf(sigma_y)
+    raw_pointwise = plate(alpha_raw) do ar
+        normal(0.0, 1.0).logpdf(ar)
+    end
+    raw_prior::Float64 = sum(raw_pointwise)
+    prior::Float64 = mu_alpha_prior + sigma_alpha_prior + sigma_y_prior + raw_prior
+
+    # Transformed parameter: alpha = mu_alpha + sigma_alpha * alpha_raw. Shared
+    # scalars ride the plate as broadcast args. This is a named node.
+    alpha = plate(alpha_raw, mu_alpha, sigma_alpha) do ar, m, s
+        m + s * ar
+    end
+
+    # Hierarchical integer-array GATHER, done OUTSIDE any plate: the per-county
+    # intercept is gathered by the concrete data index (`mu_n = alpha[county_idx[n]]`).
+    # The docs_example binds `county_idx` at preparation so the Reactant path
+    # traces only the float inputs + the parameter vector. Named node.
+    mu = alpha[county_idx]
+
+    # Likelihood: log_radon[n] ~ Normal(mu[n], sigma_y). sigma_y rides the plate
+    # as a shared scalar arg.
+    pointwise = plate(log_radon, mu, sigma_y) do y, m, s
+        normal(m, s).logpdf(y)
+    end
+    likelihood::Float64 = sum(pointwise)
+
+    constrained_logdensity::Float64 = prior + likelihood
+    unconstrained_prior::Float64 = prior + log_jacobian
+    posterior::Float64 = constrained_logdensity + log_jacobian
+
+    return posterior
+end
+
+q = vcat(0.15 .* collect(1:8) ./ 8 .- 0.05, [0.9, log(0.6), log(0.7)])
+county_idx = RADON_PP_COUNTY
+log_radon = RADON_PP_LOG
+
+requested_nodes = (:parameters, :log_jacobian, :prior, :likelihood, :posterior)
+# Bind the integer gather index (spec addendum): the Reactant path then traces
+# only the float inputs + the parameter vector.
+density_kernel = prepare(model;
+    have = (:unconstrained, :county_idx, :log_radon),
+    want = requested_nodes,
+    bound = (; county_idx))
+
+output = density_kernel(q, log_radon)
+parameters, log_jacobian, prior, likelihood, posterior = output
+@assert posterior ≈ prior + likelihood + log_jacobian
+
+docs_example = (;
+    name = :radon_partially_pooled_noncentered_posterior,
+    origin = "posteriordb radon_mn-radon_partially_pooled_noncentered — non-centered partial pooling",
+    inputs = (; q, log_radon),
+    model,
+    kernel = density_kernel,
+    output,
+    requested_nodes,
+    normal_object = normal,
+)
+"""
+
+function evaluate_radon_partially_pooled_noncentered_source()
+    _evaluate_ppl_source(RADON_PARTIALLY_POOLED_NONCENTERED_SOURCE, @__MODULE__;
+        bindings = (:RADON_PP_COUNTY, :RADON_PP_LOG))
+end
+
+const _RADON_PP_NONCENTERED_GRAPH_TEMPLATE = Ref{KernelSpec}()
+
+function __init__()
+    _RADON_PP_NONCENTERED_GRAPH_TEMPLATE[] =
+        evaluate_radon_partially_pooled_noncentered_source().model
+    nothing
+end
+
+"""
+    build_radon_partially_pooled_noncentered_graph()
+
+Build the posteriordb `radon_mn-radon_partially_pooled_noncentered` model
+(non-centered per-county random intercept) as a declarative
+`ReactiveKernels.KernelSpec`. `alpha_raw ~ Normal(0, 1)` and the transformed
+`alpha = mu_alpha + sigma_alpha * alpha_raw` keep the non-centered geometry; the
+two sigmas use the exact `exp` Jacobian, and the per-county intercept is gathered
+by the concrete `county_idx` outside any plate. The transform Jacobian, prior,
+transformed `alpha`, gathered mean `mu`, pointwise/summed likelihood, densities
+and posterior are named nodes.
+"""
+function build_radon_partially_pooled_noncentered_graph()
+    compose(_RADON_PP_NONCENTERED_GRAPH_TEMPLATE[])
+end
+
+function demo()
+    model = build_radon_partially_pooled_noncentered_graph()
+    q = vcat(0.15 .* collect(1:8) ./ 8 .- 0.05, [0.9, log(0.6), log(0.7)])
+    posterior_plan = plan(model;
+                          have = (:unconstrained, :county_idx, :log_radon),
+                          want = (:prior, :log_jacobian, :likelihood, :posterior))
+    println(explain(posterior_plan))
+    prior, log_jacobian, likelihood, posterior =
+        prepare(posterior_plan)(q, RADON_PP_COUNTY, RADON_PP_LOG)
+    println("prior + logJ + likelihood = ", prior, " + ", log_jacobian,
+            " + ", likelihood, " = ", posterior)
+    nothing
+end
+
+end # module RadonPartiallyPooledNoncenteredExample
+
+if abspath(PROGRAM_FILE) == @__FILE__
+    RadonPartiallyPooledNoncenteredExample.demo()
+end

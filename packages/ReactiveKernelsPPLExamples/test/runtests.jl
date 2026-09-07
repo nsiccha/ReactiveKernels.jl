@@ -6,7 +6,8 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     GLMPoissonExample, GLMBinomialExample, EightSchoolsNoncenteredExample,
     GLMMPoissonExample, BLRExample,
     MesquiteExample, LogmesquiteExample, LogmesquiteLogvolumeExample, KilpisjarviExample, EarnHeightExample, LogearnHeightExample, Log10earnHeightExample, LogearnInteractionExample, ARKExample, MhExample,
-    NesLogitExample, WellsDistExample, WellsDist100Example, DogsLogExample, NESExample, KidscoreMomWorkExample,
+    NesLogitExample, WellsDistExample, WellsDist100Example, DogsLogExample, NESExample, KidscoreMomWorkExample, Rate1Example,
+    RadonPooledExample, RadonPartiallyPooledCenteredExample, RadonPartiallyPooledNoncenteredExample, RadonVariableInterceptCenteredExample,
     KidscoreMomhsExample, KidscoreMomiqExample, KidscoreMomhsiqExample, KidscoreInteractionExample,
     DugongsGrowthExample, ARMA11Example, GaussianMixtureExample,
     MNISTLogisticExample, MVNormalRegressionExample, BoundRegressionExample
@@ -40,6 +41,11 @@ include("test_wells_dist100_example.jl")
 include("test_dogs_log_example.jl")
 include("test_nes_example.jl")
 include("test_kidscore_mom_work_example.jl")
+include("test_rate_1_example.jl")
+include("test_radon_pooled_example.jl")
+include("test_radon_partially_pooled_centered_example.jl")
+include("test_radon_partially_pooled_noncentered_example.jl")
+include("test_radon_variable_intercept_centered_example.jl")
 include("test_kidscore_momhs_example.jl")
 include("test_kidscore_momiq_example.jl")
 include("test_kidscore_momhsiq_example.jl")

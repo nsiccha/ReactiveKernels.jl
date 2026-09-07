@@ -28,6 +28,11 @@ using ReactiveKernelsPPLExamples.WellsDist100Example: evaluate_wells_dist100_sou
 using ReactiveKernelsPPLExamples.DogsLogExample: evaluate_dogs_log_source
 using ReactiveKernelsPPLExamples.NESExample: evaluate_nes_source
 using ReactiveKernelsPPLExamples.KidscoreMomWorkExample: evaluate_kidscore_mom_work_source
+using ReactiveKernelsPPLExamples.Rate1Example: evaluate_rate_1_source
+using ReactiveKernelsPPLExamples.RadonPooledExample: evaluate_radon_pooled_source
+using ReactiveKernelsPPLExamples.RadonPartiallyPooledCenteredExample: evaluate_radon_partially_pooled_centered_source
+using ReactiveKernelsPPLExamples.RadonPartiallyPooledNoncenteredExample: evaluate_radon_partially_pooled_noncentered_source
+using ReactiveKernelsPPLExamples.RadonVariableInterceptCenteredExample: evaluate_radon_variable_intercept_centered_source
 using ReactiveKernelsPPLExamples.KidscoreMomhsExample: evaluate_kidscore_momhs_source
 using ReactiveKernelsPPLExamples.KidscoreMomiqExample: evaluate_kidscore_momiq_source
 using ReactiveKernelsPPLExamples.KidscoreMomhsiqExample: evaluate_kidscore_momhsiq_source
@@ -174,6 +179,26 @@ end
     end
     @testset "kidscore_mom_work (posteriordb)" begin
         a = evaluate_kidscore_mom_work_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "Rate_1 (posteriordb; binomial rate)" begin
+        a = evaluate_rate_1_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "radon_pooled (posteriordb; hierarchical normal)" begin
+        a = evaluate_radon_pooled_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "radon_partially_pooled_centered (posteriordb; hierarchical normal)" begin
+        a = evaluate_radon_partially_pooled_centered_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "radon_partially_pooled_noncentered (posteriordb; hierarchical normal)" begin
+        a = evaluate_radon_partially_pooled_noncentered_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "radon_variable_intercept_centered (posteriordb; hierarchical normal)" begin
+        a = evaluate_radon_variable_intercept_centered_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
     @testset "kidscore_momhs (posteriordb; Gaussian linear regression)" begin

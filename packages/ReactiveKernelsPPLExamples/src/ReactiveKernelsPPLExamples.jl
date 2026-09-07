@@ -34,6 +34,11 @@ include("wells_dist100_model.jl")
 include("dogs_log.jl")
 include("nes.jl")
 include("kidscore_mom_work.jl")
+include("rate_1.jl")
+include("radon_pooled.jl")
+include("radon_partially_pooled_centered.jl")
+include("radon_partially_pooled_noncentered.jl")
+include("radon_variable_intercept_centered.jl")
 include("dugongs_growth.jl")
 include("arma11.jl")
 include("gaussian_mixture.jl")
@@ -88,6 +93,11 @@ export WellsDist100Example
 export DogsLogExample
 export NESExample
 export KidscoreMomWorkExample
+export Rate1Example
+export RadonPooledExample
+export RadonPartiallyPooledCenteredExample
+export RadonPartiallyPooledNoncenteredExample
+export RadonVariableInterceptCenteredExample
 export DugongsGrowthExample
 export ARMA11Example
 export GaussianMixtureExample
