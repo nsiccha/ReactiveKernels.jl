@@ -1,0 +1,100 @@
+# Versioned receipt schema + deterministic aggregator for the all-82 posteriordb
+# benchmark. Process-isolation contract (parent-mandated): native and Reactant timings
+# are produced in SEPARATE Julia subprocesses (loading Reactant must not perturb native
+# compiler state), each writing a PHASE receipt; the single entrypoint aggregates them
+# by model key into ONE final receipt. Pure Julia + stdlib TOML (no heavy deps), so it
+# is usable from the measurement body, the orchestrator, and a standalone check.
+module All80Receipt
+
+import TOML, Dates
+
+const SCHEMA = "all80-benchmark-v1"
+
+# The MANDATORY numeric cells — real numbers required for ALL 82 rows (publication gate).
+# primal_*/gradient_* are MEDIAN NANOSECONDS; hmc_* are MEDIAN MICROSECONDS/transition
+# (lower = faster). Which PHASE (isolated subprocess) produces which cell (LOCKED split —
+# the native phase must NOT `using Reactant`, so loading Reactant cannot perturb native
+# timings; cross-process fairness comes from identical q/integrator/steps/warmup/procedure):
+#   native (NO Reactant loaded): primal_{rk,turing,stan}, gradient_{rk,turing,stan},
+#       hmc_rk_native (RK-native multinomial-HMC loop), hmc_ahmc_turing (AdvancedHMC)
+#   reactant (Reactant + transpiler loaded): primal_rk_reactant, gradient_rk_reactant,
+#       hmc_rk_reactant (SAME multinomial HMC, Reactant-compiled)
+const NATIVE_CELLS = ("primal_rk", "primal_turing", "primal_stan",
+    "gradient_rk", "gradient_turing", "gradient_stan",
+    "hmc_rk_native", "hmc_ahmc_turing")
+const REACTANT_CELLS = ("primal_rk_reactant", "gradient_rk_reactant", "hmc_rk_reactant")
+const MANDATORY_CELLS = (NATIVE_CELLS..., REACTANT_CELLS...)
+# OPTIONAL cells: a distinct VERIFIED-FASTER implementation, else an N/A-with-provenance
+# STRING (never merely-unwired). Provenance strings are allowed here; numbers when present.
+const OPTIONAL_CELLS = ("primal_opt_stan", "primal_further_turing",
+    "gradient_opt_stan", "gradient_further_turing")
+# Descriptive per-model fields carried alongside the cells (native phase authors them).
+const DESCRIPTIVE = ("dim", "family", "note", "parity_pass", "rk_off", "tu_off",
+    "off_reason", "rk_grad_relerr", "tu_grad_relerr")
+
+"""Write ONE phase's receipt. `rows` maps model-key => Dict{String,Any} of that phase's cells."""
+function write_phase(path::AbstractString, phase, rows::AbstractDict)
+    doc = Dict("schema" => SCHEMA, "phase" => String(phase),
+               "generated_at" => string(Dates.now()),
+               "models" => Dict(String(k) => v for (k, v) in rows))
+    mkpath(dirname(path))
+    open(path, "w") do io; TOML.print(io, doc; sorted = true); end
+    path
+end
+
+"""Merge phase receipts (native ∪ reactant, per model key) into the final receipt.
+Phases carry disjoint cell sets by construction; a cell that appears in two phases must
+AGREE — a conflicting duplicate is a HARD ERROR, never a silent overwrite. Model ordering
+and cell content are deterministic (TOML-sorted); the only non-reproducible field is the
+`generated_at` timestamp, so the doc is content-stable, not byte-stable."""
+function aggregate(phase_paths, out_path::AbstractString; meta = Dict{String,Any}())
+    merged = Dict{String,Dict{String,Any}}()
+    for p in phase_paths
+        isfile(p) || error("All80Receipt.aggregate: missing phase receipt $p")
+        d = TOML.parsefile(p)
+        get(d, "schema", "") == SCHEMA || error("schema mismatch in $p: $(get(d,"schema",""))")
+        for (k, cells) in get(d, "models", Dict())
+            dst = get!(merged, k, Dict{String,Any}())
+            for (ck, cv) in cells
+                if haskey(dst, ck) && dst[ck] != cv
+                    error("All80Receipt.aggregate: conflicting duplicate cell $k.$ck across phases: $(repr(dst[ck])) vs $(repr(cv)) (from $p)")
+                end
+                dst[ck] = cv
+            end
+        end
+    end
+    doc = Dict("schema" => SCHEMA, "generated_at" => string(Dates.now()),
+               "meta" => meta, "models" => merged)
+    mkpath(dirname(out_path))
+    open(out_path, "w") do io; TOML.print(io, doc; sorted = true); end
+    out_path
+end
+
+"""Publication-gate check: every model carries all MANDATORY cells as finite REAL
+NUMBERS, AND every OPTIONAL cell is PRESENT as either a finite number or a NONEMPTY
+provenance string (N/A-with-provenance is required — a merely-absent optional cell is a
+gate failure, not an implicit N/A). Returns a list of issues (empty == passes)."""
+function validate(path::AbstractString; expected_models = nothing)
+    d = TOML.parsefile(path)
+    models = get(d, "models", Dict())
+    issues = String[]
+    if expected_models !== nothing && length(models) != expected_models
+        push!(issues, "row count $(length(models)) != expected $expected_models")
+    end
+    for k in sort(collect(keys(models)))
+        cells = models[k]
+        for c in MANDATORY_CELLS
+            v = get(cells, c, nothing)
+            (v isa Real && isfinite(v)) ||
+                push!(issues, "$k: mandatory cell $c is not a finite number ($(repr(v)))")
+        end
+        for c in OPTIONAL_CELLS
+            v = get(cells, c, nothing)
+            ok = (v isa Real && isfinite(v)) || (v isa AbstractString && !isempty(v))
+            ok || push!(issues, "$k: optional cell $c must be a finite number or a nonempty provenance string ($(repr(v)))")
+        end
+    end
+    issues
+end
+
+end # module All80Receipt

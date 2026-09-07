@@ -16,7 +16,7 @@ const UP = ENV["RK_ALL80_UPSTREAM"]
 include(joinpath(UP, "posteriordb.jl"))   # main-guarded; defines helpers + make_model + models
 include(joinpath(@__DIR__, "all80_registry.jl"))   # All80Registry.REGISTRY (82 executable-gated entries)
 const AE = AutoEnzyme(mode=Enzyme.set_runtime_activity(Enzyme.Reverse), function_annotation=Enzyme.Const)
-med(b) = median(b).time
+med(b) = median(b).time * 1e9   # Chairmarks `.time` is SECONDS; the receipt/fmt use NANOSECONDS
 fmt(ns) = ns < 1e3 ? "$(round(ns; digits=1)) ns" : ns < 1e6 ? "$(round(ns/1e3; digits=2)) µs" : "$(round(ns/1e6; digits=3)) ms"
 
 # RK-binding registry (per posterior name) — the 82 executable-gated entries from
@@ -96,13 +96,30 @@ function run_one(name; seed = 468, scale = 0.2, draws = 3)
     println("  primal   : reference-Stan $(fmt(sp))  upstream-Turing $(fmt(tp))  RK $(fmt(rp))")
     println("  gradient : reference-Stan $(fmt(sgd))  upstream-Turing $(fmt(tgd))  RK $(fmt(rgd))")
     println("SMOKE_MODEL_OK $name")
+    # native-phase receipt row — MEDIAN NANOSECONDS (via the fixed `med`). The HMC
+    # (hmc_ahmc_turing) and Reactant/HMC-transpiler cells are populated by All80Axes in
+    # their phases once the coexistence env is expanded; `family`/`note` are filled later.
+    Dict{String,Any}("dim" => dim, "family" => "", "note" => "",
+        "parity_pass" => true, "rk_off" => rk_off, "tu_off" => tu_off, "off_reason" => e.off_reason,
+        "rk_grad_relerr" => rk_grad_err, "tu_grad_relerr" => tu_grad_err,
+        "primal_rk" => rp, "primal_turing" => tp, "primal_stan" => sp,
+        "gradient_rk" => rgd, "gradient_turing" => tgd, "gradient_stan" => sgd)
 end
 
-for name in ARGS
-    startswith(name, "-") && continue
-    haskey(RK, name) || continue
-    run_one(name)
+const PHASE = get(ENV, "RK_ALL80_PHASE", "native")
+const RECEIPT = get(ENV, "RK_ALL80_RECEIPT", "")
+PHASE == "native" || error("all80 body phase '$PHASE' not implemented yet — native single-eval + " *
+    "parity only; RK+Reactant single-eval and the HMC transpiler/AHMC axes land with the " *
+    "coexistence-env expansion (see benchmark/all80_axes.jl for the contract).")
+targets = [n for n in ARGS if !startswith(n, "-") && haskey(RK, n)]
+isempty(targets) && (targets = ["GLM_Poisson_Data-GLM_Poisson_model"])
+rows = Dict{String,Any}()
+for name in targets
+    rows[name] = run_one(name)
 end
-# default smoke target when no name given
-any(a -> haskey(RK, a), ARGS) || run_one("GLM_Poisson_Data-GLM_Poisson_model")
+if RECEIPT != ""
+    include(joinpath(@__DIR__, "all80_receipt.jl"))
+    All80Receipt.write_phase(RECEIPT, PHASE, rows)
+    println("wrote phase receipt ($PHASE): $RECEIPT")
+end
 println("\nALL80_SMOKE_DONE")

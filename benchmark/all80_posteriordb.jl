@@ -65,14 +65,43 @@ function _fetch_upstream()
     up
 end
 
+const RECEIPT_DIR = joinpath(@__DIR__, "receipts")
+
+# One isolated Julia subprocess per PHASE over the SAME pinned coexistence env. Native and
+# Reactant timings must never share a process (loading Reactant perturbs native compiler
+# state), so each phase re-execs this body with RK_ALL80_PHASE set and writes its own phase
+# receipt; the reactant phase additionally pins JULIA_NUM_PRECOMPILE_TASKS=1 (the primer's
+# ReactiveKernelsReactantExt precompile-wedge mitigation).
+function _phase_cmd(phase, up, receipt)
+    cmd = addenv(
+        `$(Base.julia_cmd()) --startup-file=no --project=$ENV_DIR $(_BODY) $(ARGS...)`,
+        _INNER => "1", "RK_ALL80_UPSTREAM" => up, "RK_ALL80_DPPL_SHA" => DPPL_SHA,
+        "RK_ALL80_PHASE" => phase, "RK_ALL80_RECEIPT" => receipt,
+    )
+    phase == "reactant" ? addenv(cmd, "JULIA_NUM_PRECOMPILE_TASKS" => "1") : cmd
+end
+
 function _run()
     _ensure_env()
     up = _fetch_upstream()
-    command = addenv(
-        `$(Base.julia_cmd()) --startup-file=no --project=$ENV_DIR $(_BODY) $(ARGS...)`,
-        _INNER => "1", "RK_ALL80_UPSTREAM" => up, "RK_ALL80_DPPL_SHA" => DPPL_SHA,
-    )
-    run(command)
+    mkpath(RECEIPT_DIR)
+    phases = String.(split(get(ENV, "RK_ALL80_PHASES", "native,reactant"), ','))
+    phase_receipts = String[]
+    for ph in phases
+        rec = joinpath(RECEIPT_DIR, "all80-$(ph).toml")
+        @info "RK_ALL80: phase=$ph in an isolated subprocess -> $rec"
+        run(_phase_cmd(ph, up, rec))
+        push!(phase_receipts, rec)
+    end
+    # Deterministic aggregation of the phase receipts into the final receipt.
+    include(joinpath(@__DIR__, "all80_receipt.jl"))
+    out = joinpath(RECEIPT_DIR, "all80-benchmark-v1.toml")
+    Base.invokelatest(All80Receipt.aggregate, phase_receipts, out;
+        meta = Dict("dppl_sha" => DPPL_SHA, "args" => collect(ARGS)))
+    @info "RK_ALL80: aggregated final receipt -> $out"
+    issues = Base.invokelatest(All80Receipt.validate, out)
+    isempty(issues) || (@warn "RK_ALL80: receipt has $(length(issues)) unpopulated mandatory cell(s)";
+                        foreach(i -> println("  ", i), first(issues, 20)))
 end
 
 get(ENV, _INNER, "") == "1" ? include(_BODY) : _run()
