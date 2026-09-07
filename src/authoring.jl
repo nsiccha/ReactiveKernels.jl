@@ -1017,6 +1017,7 @@ function _kernel_return_names(ex)
 end
 
 const _KERNEL_RETURN_PORT = Symbol("__return__")
+const _KERNEL_PLATE_VALUE_PORT = Symbol("__plate_value__")
 
 # `return expr` is graph authoring, not an eager Julia return.  Normalize the
 # expression to one ordinary recipe feeding a stable distinguished port, then
@@ -1065,7 +1066,22 @@ function _kernel_implicit_plate_result_body(body)
         nothing
     end
     if assigned_name === nothing
-        statements[result_index] = Expr(:return, result)
+        # A bare final VALUE expression (e.g. a nested object-endpoint call after
+        # a cell-local) is the cell result. Route it through the distinguished
+        # __plate_value__ port, exactly as the single-expression sugar in
+        # `_kernel_expression_result_body` does, so the inferred boundary type is
+        # applied to the result port below. Without this a multi-statement cell
+        # returns through the untyped `__return__` port and a typed nested
+        # endpoint output cannot be aliased onto it. A bare final Symbol is
+        # already a named boundary and needs no synthetic port.
+        if result isa Symbol
+            statements[result_index] = Expr(:return, result)
+        else
+            statements[result_index] =
+                Expr(:(=), _KERNEL_PLATE_VALUE_PORT, result)
+            insert!(statements, result_index + 1,
+                    Expr(:return, _KERNEL_PLATE_VALUE_PORT))
+        end
     else
         insert!(statements, result_index + 1, Expr(:return, assigned_name))
     end
@@ -1076,7 +1092,8 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                                       nested_specs::Dict{Symbol,Any},
                                       local_types::Dict{Symbol,Any};
                                       context = "inside @kernel",
-                                      materialized = Tuple{Symbol,Any,Any}[])
+                                      materialized = Tuple{Symbol,Any,Any}[],
+                                      cell_locals::Set{Symbol} = Set{Symbol}())
     ex isa Expr || return ex, nothing
     ex.head in (:quote, :inert) && return ex, nothing
 
@@ -1156,10 +1173,6 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                 length(endpoint_actuals) == length(explicit) || throw(ArgumentError(
                     "endpoint :$endpoint_name expects $(length(explicit)) argument(s), " *
                     "got $(length(endpoint_actuals))"))
-                all(arg -> arg isa Symbol && arg in locals, endpoint_actuals) ||
-                    throw(ArgumentError(
-                        "constructed endpoint arguments $context must be named caller ports"))
-
                 # Owner bindings are graph inputs, but their source spelling need not
                 # already be a named caller port. Materialize literals and computed
                 # expressions as hygienic caller recipes, typed by the selected child
@@ -1173,14 +1186,21 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                     if actual isa Symbol && actual in locals
                         push!(owner_ports, actual)
                         continue
-                    elseif actual isa Symbol
+                    elseif actual isa Symbol && !(actual in cell_locals)
                         throw(ArgumentError(
                             "kernel object binding :$formal $context refers to undeclared " *
                             "caller port :$actual"))
                     end
+                    # A computed expression, or a plate cell-local name, binds
+                    # through a hygienic caller recipe typed by the selected child
+                    # boundary. Materializing a cell-local (rather than aliasing it
+                    # directly) lets an untyped local still bind a typed owner port
+                    # with no boundary type mismatch, matching how a top-level
+                    # @kernel body already exposes its assigned names as ports.
                     rewritten_actual, _ = _kernel_constructed_endpoint(
                         actual, mod, locals, nested_specs, local_types;
-                        context = context, materialized = materialized)
+                        context = context, materialized = materialized,
+                        cell_locals = cell_locals)
                     generated_port = gensym(Symbol(formal, :_binding))
                     generated_type = valtype(endpoint_inputs[index])
                     push!(materialized,
@@ -1189,7 +1209,37 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                     push!(owner_ports, generated_port)
                 end
 
-                actuals = Symbol[owner_ports...; endpoint_actuals...]
+                # Endpoint method arguments (the observed value in `.logpdf(x)`) are
+                # graph inputs too, and — exactly like the owner bindings above —
+                # their source spelling need not already be a named caller port.
+                # Materialize a literal or computed method argument such as
+                # `normal(location, scale).logpdf(log(w))` as a hygienic caller
+                # recipe, typed by the endpoint's explicit boundary, so it lowers
+                # identically to the constructor-argument case rather than being
+                # rejected. A bare name still must resolve to a declared caller port.
+                endpoint_ports = Symbol[]
+                for (index, actual) in enumerate(endpoint_actuals)
+                    if actual isa Symbol && actual in locals
+                        push!(endpoint_ports, actual)
+                        continue
+                    elseif actual isa Symbol
+                        throw(ArgumentError(
+                            "endpoint :$endpoint_name argument $context refers to " *
+                            "undeclared caller port :$actual"))
+                    end
+                    rewritten_actual, _ = _kernel_constructed_endpoint(
+                        actual, mod, locals, nested_specs, local_types;
+                        context = context, materialized = materialized)
+                    generated_port = gensym(Symbol(explicit[index], :_argument))
+                    generated_type = valtype(
+                        endpoint_inputs[length(owner_formals) + index])
+                    push!(materialized,
+                          (generated_port, generated_type, rewritten_actual))
+                    push!(locals, generated_port)
+                    push!(endpoint_ports, generated_port)
+                end
+
+                actuals = Symbol[owner_ports...; endpoint_ports...]
                 for (actual, formal) in zip(actuals, inputs(endpoint))
                     T = valtype(formal)
                     if haskey(local_types, actual) && local_types[actual] != T
@@ -1206,7 +1256,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                 nested_specs[generated] = KernelSpec(
                     endpoint.graph, endpoint.ports, endpoint.port_order,
                     endpoint.have_names, endpoint.want_names, retargeted)
-                return Expr(:call, generated, endpoint_actuals...),
+                return Expr(:call, generated, endpoint_ports...),
                        valtype(only(outputs(endpoint)))
             end
         end
@@ -1217,7 +1267,8 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
     for arg in ex.args
         child, child_type = _kernel_constructed_endpoint(
             arg, mod, locals, nested_specs, local_types;
-            context = context, materialized = materialized)
+            context = context, materialized = materialized,
+            cell_locals = cell_locals)
         # A constructed object endpoint lowers to a call whose head is a generated
         # `nested_specs` key. `_kernel_operation` splices such a call ONLY when it is
         # the WHOLE recipe RHS. A splice used as a SUB-EXPRESSION of a value-combining
@@ -1245,6 +1296,22 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
         nothing
     end
     Expr(ex.head, rewritten...), inferred
+end
+
+# The names a plate do-block assigns as cell-locals. Unlike a top-level @kernel
+# body — where every assigned name is an exposed graph port — a plate cell's
+# caller ports are only its do-block formals, so a nested object-endpoint owner
+# binding that references a cell-local (`object(; log_rate = ll).logpdf(c)` with
+# a cell-local `ll`) must be recognized here and materialized as a typed caller
+# recipe rather than rejected as an undeclared port.
+function _kernel_plate_cell_locals(body)
+    names = Set{Symbol}()
+    body isa Expr && body.head === :block || return names
+    for statement in body.args
+        statement isa Expr && statement.head === :(=) || continue
+        _kernel_assignment_names!(names, statement.args[1])
+    end
+    names
 end
 
 function _kernel_authored_plate_expr(rhs, mod)
@@ -1295,13 +1362,15 @@ function _kernel_authored_plate_expr(rhs, mod)
     nested_specs = Dict{Symbol,Any}()
     local_types = Dict{Symbol,Any}()
     materialized = Tuple{Symbol,Any,Any}[]
+    cell_locals = _kernel_plate_cell_locals(scalar_body)
     rewritten, inferred = _kernel_constructed_endpoint(
         scalar_body, mod, Set(formals), nested_specs, local_types;
-        context = "inside plate", materialized = materialized)
+        context = "inside plate", materialized = materialized,
+        cell_locals = cell_locals)
     signature = Tuple{Symbol,Any}[
         (name, get(local_types, name, GlobalRef(Core, :Any))) for name in formals]
     scalar_graph_body = _kernel_expression_result_body(
-        :__plate_value__, signature, rewritten, true)
+        _KERNEL_PLATE_VALUE_PORT, signature, rewritten, true)
     scalar_graph_body = _kernel_implicit_plate_result_body(scalar_graph_body)
     if !isempty(materialized)
         lifted = Any[
@@ -1319,11 +1388,11 @@ function _kernel_authored_plate_expr(rhs, mod)
        scalar_graph_body.head === :block
         assignment_index = findfirst(scalar_graph_body.args) do statement
             statement isa Expr && statement.head === :(=) &&
-                statement.args[1] === :__plate_value__
+                statement.args[1] === _KERNEL_PLATE_VALUE_PORT
         end
         assignment_index === nothing ||
             (scalar_graph_body.args[assignment_index].args[1] =
-                Expr(:(::), :__plate_value__, inferred))
+                Expr(:(::), _KERNEL_PLATE_VALUE_PORT, inferred))
     end
     scalar_spec = _kernel_expand(
         scalar_graph_body, signature, nothing, mod; nested_specs = nested_specs)

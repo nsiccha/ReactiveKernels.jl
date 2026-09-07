@@ -111,6 +111,18 @@ end
     return sum(pointwise)
 end
 
+# The endpoint METHOD argument accepts a computed expression, exactly as the
+# constructor arguments (mean/scale) already do. `.logpdf(log(wi))` lowers to
+# the same graph as precomputing `log_w` in a transformed-data node and passing
+# the bare port, so a log-response likelihood need not be split off the plate.
+@kernel authored_transformed_response_loglik(
+        w::Vector{Float64}, location, scale) = begin
+    pointwise = plate(w, location, scale) do wi, li, si
+        authored_normal(li, si).logpdf(log(wi))
+    end
+    return sum(pointwise)
+end
+
 @kernel authored_cauchy_loglik(x::Vector{Float64}, location, scale) = begin
     pointwise = plate(x, location, scale) do xi, li, si
         authored_cauchy(li, si).logpdf(xi)
@@ -202,6 +214,28 @@ end
     total::Float64 = sum(terms)
 end
 
+# Identity/passthrough cell: the body is the bare loop variable, so the plate's
+# distinguished result names an input rather than a recipe output.
+@kernel authored_identity_plate(x::Vector{Float64}) = begin
+    terms = plate(x) do value
+        value
+    end
+    total::Float64 = sum(terms)
+end
+
+# The reporter's exact shape (snag identity-plate-o): an identity plate over
+# another plate's output, exposing a passthrough/generated-quantity node.
+@kernel authored_identity_over_plate(x::Vector{Float64}) = begin
+    mu = plate(x) do value
+        doubled::Float64 = 2.0 * value
+        doubled
+    end
+    expected = plate(mu) do m
+        m
+    end
+    total::Float64 = sum(expected)
+end
+
 _authored_plate_normal(x, location, scale) =
     -0.5 * log(2π) - log(scale) - 0.5 * ((x - location) / scale)^2
 _authored_plate_cauchy(x, location, scale) =
@@ -251,6 +285,37 @@ end
         @test total(values) == sum(expected)
         @test pointwise(values) == expected
     end
+end
+
+@testset "authored plate block: identity/passthrough cell" begin
+    values = [1.0, 2.0, 3.0]
+
+    # A cell whose body is the bare loop variable names an input as its
+    # distinguished result. That result id equals a HAVE id and is absent from
+    # the recipe-output `locals`, which previously threw
+    # `KeyError` in `_lower_authored_plate_native!` (snag identity-plate-o).
+    scalar_plan = plate_body(first(plan(authored_identity_plate).recipes))
+    @test [value.name for value in scalar_plan.have] == [:value]
+    @test isempty(scalar_plan.recipes)
+    # The root cause: the distinguished result canonicalizes to the same value as
+    # the sole input, so it never appears among the recipe-output locals.
+    @test ReactiveKernels.canon_id(scalar_plan.graph, only(scalar_plan.want).id) ==
+          ReactiveKernels.canon_id(scalar_plan.graph, only(scalar_plan.have).id)
+
+    total = prepare(authored_identity_plate; have = (:x,), want = :total)
+    pointwise = prepare(
+        extract(authored_identity_plate; have = (:x,), want = :terms))
+    @test pointwise(values) == values
+    @test total(values) == sum(values)
+
+    # The reporter's exact shape: an identity plate over another plate's output.
+    doubled = 2.0 .* values
+    over_pointwise = prepare(
+        extract(authored_identity_over_plate; have = (:x,), want = :expected))
+    over_total = prepare(
+        authored_identity_over_plate; have = (:x,), want = :total)
+    @test over_pointwise(values) == doubled
+    @test over_total(values) == sum(doubled)
 end
 
 @testset "authored plate block: transparent distribution log-likelihood" begin
@@ -446,6 +511,35 @@ end
     @test_throws DimensionMismatch total(xs, [locations; 0.6], scales)
 end
 
+@testset "authored plate block: computed endpoint method argument" begin
+    w = [0.5, 1.5, 2.0, 3.0]
+    location = 0.1
+    scale = 1.3
+
+    # A computed method argument `log(wi)` produces the SAME graph, and the same
+    # numbers, as precomputing the transformed response in a transformed-data
+    # node (`workaround_loglik`) and passing the bare port.
+    transformed = prepare(authored_transformed_response_loglik)
+    precomputed = prepare(untyped_authored_normal_loglik)
+    reference = sum(_authored_plate_normal(log(wi), location, scale) for wi in w)
+
+    @test transformed(w, location, scale) ≈ reference
+    @test transformed(w, location, scale) ≈ precomputed(log.(w), location, scale)
+    @test _authored_plate_allocated(
+        transformed, w, location, scale) == 0
+
+    # A bare name that is not a declared caller port is still rejected — the
+    # method argument path only gained expression materialization, not the
+    # ability to reference an undeclared local.
+    @test_throws ArgumentError @macroexpand @kernel _authored_undeclared_arg(
+            w::Vector{Float64}, location, scale) = begin
+        pointwise = plate(w, location, scale) do wi, li, si
+            authored_normal(li, si).logpdf(missing_port)
+        end
+        return sum(pointwise)
+    end
+end
+
 @testset "authored plate block: graph-derived broadcast scheduling" begin
     observations = collect(range(-1.0, 1.0; length = 7))
     locations = reshape([-0.4, 0.2, 0.7], 1, :)
@@ -615,4 +709,112 @@ end
     @test _authored_plate_head_count(code_expr(normal_total), :for) == 1
     @test !occursin("similar", string(code_expr(normal_total)))
     @test !occursin("for ", string(normal_total.f.tensorized_ast))
+end
+
+# A nested object-endpoint call after a cell-local in a plate cell. The inline
+# form was the only working spelling; a typed cell-local collapsed the cell
+# return type to Any (`:__return__` vs the endpoint output type), and a keyword
+# owner binding could not reference a cell-local. All three now author, agree
+# numerically, and stay buffer-free; the log-link keyword route additionally
+# drops the object's internal log(scale) round trip.
+@kernel authored_plate_endpoint_inline(x, location, scale) = begin
+    pointwise = plate(x, location, scale) do xi, li, si
+        authored_normal(li, exp(si)).logpdf(xi)
+    end
+    return sum(pointwise)
+end
+
+@kernel authored_plate_endpoint_typed_local(x, location, scale) = begin
+    pointwise = plate(x, location, scale) do xi, li, si
+        log_scale::Float64 = si
+        authored_normal(li, exp(log_scale)).logpdf(xi)
+    end
+    return sum(pointwise)
+end
+
+@kernel authored_plate_endpoint_keyword_typed(x, location, scale) = begin
+    pointwise = plate(x, location, scale) do xi, li, si
+        log_scale::Float64 = si
+        authored_normal(;
+            location = li, scale = exp(log_scale), log_scale = log_scale).logpdf(xi)
+    end
+    return sum(pointwise)
+end
+
+@kernel authored_plate_endpoint_keyword_untyped(x, location, scale) = begin
+    pointwise = plate(x, location, scale) do xi, li, si
+        log_scale = si
+        authored_normal(;
+            location = li, scale = exp(log_scale), log_scale = log_scale).logpdf(xi)
+    end
+    return sum(pointwise)
+end
+
+# A poisson-like log-link object whose only `log` is the rate round trip (no
+# `log(2π)` normalizer to confound the round-trip check below). The `rate`
+# HAVE-route lets a caller supply either `rate` or `log_rate`.
+@kernel authored_rate_kernel(rate::Float64) = begin
+    log_rate::Float64 = log(rate)
+    rate::Float64 = exp(log_rate)
+    logpdf(k::Float64)::Float64 = k * log_rate - rate
+end
+
+@kernel authored_rate_forced(k, lograte) = begin
+    pointwise = plate(k, lograte) do ki, lri
+        lr = lri
+        authored_rate_kernel(exp(lr)).logpdf(ki)
+    end
+    return sum(pointwise)
+end
+
+@kernel authored_rate_direct(k, lograte) = begin
+    pointwise = plate(k, lograte) do ki, lri
+        lr = lri
+        authored_rate_kernel(; log_rate = lr, rate = exp(lr)).logpdf(ki)
+    end
+    return sum(pointwise)
+end
+
+_authored_plate_log_recipe_count(cell) =
+    count(recipe -> occursin("log(", string(recipe.source)), cell.recipes)
+
+@testset "authored plate block: cell-local before a nested endpoint call" begin
+    x = [0.1, 0.2, -0.3]
+    location = [0.0, 0.5, -0.5]
+    scale = [0.0, 0.1, -0.1]
+    reference = sum(
+        _authored_plate_normal(x[i], location[i], exp(scale[i])) for i in eachindex(x))
+
+    for spec in (authored_plate_endpoint_inline,
+                 authored_plate_endpoint_typed_local,
+                 authored_plate_endpoint_keyword_typed,
+                 authored_plate_endpoint_keyword_untyped)
+        total = prepare(spec)
+        @test total(x, location, scale) ≈ reference
+        @test _authored_plate_head_count(code_expr(total), :for) == 1
+        @test !occursin("similar", string(code_expr(total)))
+    end
+
+    # The keyword log-link route supplies `log_rate` from a cell-local directly,
+    # so the cell plan carries no `log(rate)` round trip; the forced `rate = exp`
+    # route (also authored via a cell-local here) must still recompute it.
+    k = [3.0, 5.0, 2.0]
+    lograte = [-0.5, 0.25, 1.0]
+    @test authored_rate_direct(k, lograte) ≈ authored_rate_forced(k, lograte)
+    forced_cell = plate_body(first(plan(authored_rate_forced).recipes))
+    direct_cell = plate_body(first(plan(authored_rate_direct).recipes))
+    @test _authored_plate_log_recipe_count(forced_cell) == 1
+    @test _authored_plate_log_recipe_count(direct_cell) == 0
+    @test !occursin("similar", string(code_expr(prepare(authored_rate_direct))))
+
+    # A genuine undeclared owner port must still fail loudly, not be swept in as a
+    # cell-local materialization.
+    @test_throws ArgumentError @macroexpand @kernel authored_plate_endpoint_bad(
+            x, location, scale) = begin
+        pointwise = plate(x, location, scale) do xi, li, si
+            authored_normal(;
+                location = li, scale = exp(si), log_scale = missing_port).logpdf(xi)
+        end
+        return sum(pointwise)
+    end
 end
