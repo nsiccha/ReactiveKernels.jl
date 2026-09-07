@@ -214,6 +214,28 @@ end
     total::Float64 = sum(terms)
 end
 
+# Identity/passthrough cell: the body is the bare loop variable, so the plate's
+# distinguished result names an input rather than a recipe output.
+@kernel authored_identity_plate(x::Vector{Float64}) = begin
+    terms = plate(x) do value
+        value
+    end
+    total::Float64 = sum(terms)
+end
+
+# The reporter's exact shape (snag identity-plate-o): an identity plate over
+# another plate's output, exposing a passthrough/generated-quantity node.
+@kernel authored_identity_over_plate(x::Vector{Float64}) = begin
+    mu = plate(x) do value
+        doubled::Float64 = 2.0 * value
+        doubled
+    end
+    expected = plate(mu) do m
+        m
+    end
+    total::Float64 = sum(expected)
+end
+
 _authored_plate_normal(x, location, scale) =
     -0.5 * log(2π) - log(scale) - 0.5 * ((x - location) / scale)^2
 _authored_plate_cauchy(x, location, scale) =
@@ -263,6 +285,37 @@ end
         @test total(values) == sum(expected)
         @test pointwise(values) == expected
     end
+end
+
+@testset "authored plate block: identity/passthrough cell" begin
+    values = [1.0, 2.0, 3.0]
+
+    # A cell whose body is the bare loop variable names an input as its
+    # distinguished result. That result id equals a HAVE id and is absent from
+    # the recipe-output `locals`, which previously threw
+    # `KeyError` in `_lower_authored_plate_native!` (snag identity-plate-o).
+    scalar_plan = plate_body(first(plan(authored_identity_plate).recipes))
+    @test [value.name for value in scalar_plan.have] == [:value]
+    @test isempty(scalar_plan.recipes)
+    # The root cause: the distinguished result canonicalizes to the same value as
+    # the sole input, so it never appears among the recipe-output locals.
+    @test ReactiveKernels.canon_id(scalar_plan.graph, only(scalar_plan.want).id) ==
+          ReactiveKernels.canon_id(scalar_plan.graph, only(scalar_plan.have).id)
+
+    total = prepare(authored_identity_plate; have = (:x,), want = :total)
+    pointwise = prepare(
+        extract(authored_identity_plate; have = (:x,), want = :terms))
+    @test pointwise(values) == values
+    @test total(values) == sum(values)
+
+    # The reporter's exact shape: an identity plate over another plate's output.
+    doubled = 2.0 .* values
+    over_pointwise = prepare(
+        extract(authored_identity_over_plate; have = (:x,), want = :expected))
+    over_total = prepare(
+        authored_identity_over_plate; have = (:x,), want = :total)
+    @test over_pointwise(values) == doubled
+    @test over_total(values) == sum(doubled)
 end
 
 @testset "authored plate block: transparent distribution log-likelihood" begin

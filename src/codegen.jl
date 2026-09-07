@@ -522,7 +522,14 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
             push!(loopbody.args, Expr(:if, condition, assignments))
         end
     end
-    scalar_result = locals[canon_id(inner.graph, only(inner.want).id)]
+    # The distinguished result is usually a recipe output bound in `locals`, but
+    # an identity/passthrough cell (`plate(x) do v; v end`) names an input as its
+    # result. That input never appears in `locals`, so reuse the shared scalar
+    # projection, which resolves a HAVE input to its per-coordinate reference and
+    # otherwise falls back to `locals`.
+    scalar_result = _authored_plate_scalar_ref(
+        inner, locals, callargs, callvalues, prepared_arguments, atomic,
+        only(inner.want), index, true)
     pointwise_lhs === nothing ||
         push!(loopbody.args, :($pointwise_lhs[$index] = $scalar_result))
     accumulator === nothing ||
