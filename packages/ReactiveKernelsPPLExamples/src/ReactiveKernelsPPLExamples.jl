@@ -27,6 +27,7 @@ include("logearn_height.jl")
 include("log10earn_height.jl")
 include("logearn_interaction.jl")
 include("ark.jl")
+include("mh.jl")
 include("dugongs_growth.jl")
 include("arma11.jl")
 include("gaussian_mixture.jl")
@@ -74,6 +75,7 @@ export LogearnHeightExample
 export Log10earnHeightExample
 export LogearnInteractionExample
 export ARKExample
+export MhExample
 export DugongsGrowthExample
 export ARMA11Example
 export GaussianMixtureExample
