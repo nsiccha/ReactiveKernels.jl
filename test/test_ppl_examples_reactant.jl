@@ -56,6 +56,9 @@ using ReactiveKernelsPPLExamples.WellsDaeExample: evaluate_wells_dae_source
 using ReactiveKernelsPPLExamples.WellsDaeCExample: evaluate_wells_dae_c_source
 using ReactiveKernelsPPLExamples.WellsInteractionExample: evaluate_wells_interaction_source
 using ReactiveKernelsPPLExamples.WellsDaaeCExample: evaluate_wells_daae_c_source
+using ReactiveKernelsPPLExamples.WellsInteractionCExample: evaluate_wells_interaction_c_source
+using ReactiveKernelsPPLExamples.WellsDaeInterExample: evaluate_wells_dae_inter_source
+using ReactiveKernelsPPLExamples.WellsDist100arsExample: evaluate_wells_dist100ars_source
 using ReactiveKernelsPPLExamples.KidscoreMomhsExample: evaluate_kidscore_momhs_source
 using ReactiveKernelsPPLExamples.KidscoreMomiqExample: evaluate_kidscore_momiq_source
 using ReactiveKernelsPPLExamples.KidscoreMomhsiqExample: evaluate_kidscore_momhsiq_source
@@ -314,6 +317,18 @@ end
     end
     @testset "wells_daae_c_model (posteriordb)" begin
         a = evaluate_wells_daae_c_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "wells_interaction_c_model (posteriordb)" begin
+        a = evaluate_wells_interaction_c_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "wells_dae_inter_model (posteriordb)" begin
+        a = evaluate_wells_dae_inter_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "wells_dist100ars_model (posteriordb)" begin
+        a = evaluate_wells_dist100ars_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
     @testset "kidscore_momhs (posteriordb; Gaussian linear regression)" begin

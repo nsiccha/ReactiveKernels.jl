@@ -62,6 +62,9 @@ include("wells_dae_model.jl")
 include("wells_dae_c_model.jl")
 include("wells_interaction_model.jl")
 include("wells_daae_c_model.jl")
+include("wells_interaction_c_model.jl")
+include("wells_dae_inter_model.jl")
+include("wells_dist100ars_model.jl")
 include("dugongs_growth.jl")
 include("arma11.jl")
 include("gaussian_mixture.jl")
@@ -144,6 +147,9 @@ export WellsDaeExample
 export WellsDaeCExample
 export WellsInteractionExample
 export WellsDaaeCExample
+export WellsInteractionCExample
+export WellsDaeInterExample
+export WellsDist100arsExample
 export DugongsGrowthExample
 export ARMA11Example
 export GaussianMixtureExample
