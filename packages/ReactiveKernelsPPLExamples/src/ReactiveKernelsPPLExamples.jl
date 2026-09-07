@@ -53,6 +53,10 @@ include("radon_county_intercept.jl")
 include("radon_variable_intercept_noncentered.jl")
 include("radon_variable_slope_centered.jl")
 include("radon_variable_slope_noncentered.jl")
+include("radon_variable_intercept_slope_centered.jl")
+include("radon_variable_intercept_slope_noncentered.jl")
+include("radon_hierarchical_intercept_centered.jl")
+include("radon_hierarchical_intercept_noncentered.jl")
 include("rate_2.jl")
 include("rate_3.jl")
 include("rate_4.jl")
@@ -147,6 +151,10 @@ export RadonCountyInterceptExample
 export RadonVariableInterceptNoncenteredExample
 export RadonVariableSlopeCenteredExample
 export RadonVariableSlopeNoncenteredExample
+export RadonVariableInterceptSlopeCenteredExample
+export RadonVariableInterceptSlopeNoncenteredExample
+export RadonHierarchicalInterceptCenteredExample
+export RadonHierarchicalInterceptNoncenteredExample
 export Rate2Example
 export Rate3Example
 export Rate4Example

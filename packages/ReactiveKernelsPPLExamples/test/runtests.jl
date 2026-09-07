@@ -9,6 +9,7 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     NesLogitExample, WellsDistExample, WellsDist100Example, DogsLogExample, NESExample, KidscoreMomWorkExample, Rate1Example,
     RadonPooledExample, RadonPartiallyPooledCenteredExample, RadonPartiallyPooledNoncenteredExample, RadonVariableInterceptCenteredExample,
     RadonCountyExample, RadonCountyInterceptExample, RadonVariableInterceptNoncenteredExample, RadonVariableSlopeCenteredExample, RadonVariableSlopeNoncenteredExample,
+    RadonVariableInterceptSlopeCenteredExample, RadonVariableInterceptSlopeNoncenteredExample, RadonHierarchicalInterceptCenteredExample, RadonHierarchicalInterceptNoncenteredExample,
     Rate2Example, Rate3Example, Rate4Example, Rate5Example,
     DogsExample, DogsHierarchicalExample,
     SeedsExample, PilotsExample, LsatExample, SurgicalExample,
@@ -64,6 +65,10 @@ include("test_radon_county_intercept_example.jl")
 include("test_radon_variable_intercept_noncentered_example.jl")
 include("test_radon_variable_slope_centered_example.jl")
 include("test_radon_variable_slope_noncentered_example.jl")
+include("test_radon_variable_intercept_slope_centered_example.jl")
+include("test_radon_variable_intercept_slope_noncentered_example.jl")
+include("test_radon_hierarchical_intercept_centered_example.jl")
+include("test_radon_hierarchical_intercept_noncentered_example.jl")
 include("test_rate_2_example.jl")
 include("test_rate_3_example.jl")
 include("test_rate_4_example.jl")
