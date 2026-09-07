@@ -40,7 +40,10 @@ function _ensure_env()
             "DynamicPPL","Distributions","Bijectors","FillArrays","StatsFuns",
             "DifferentiationInterface","LogExpFunctions","SpecialFunctions","PosteriorDB",
             "OrdinaryDiffEqBDF","OrdinaryDiffEqLowOrderRK","OrdinaryDiffEqTsit5",
-            "SciMLBase","SciMLSensitivity")])
+            "SciMLBase","SciMLSensitivity",
+            # coexistence superset for the RK+Reactant single-eval + HMC transpiler
+            # (Reactant) and the AHMC-Turing HMC throughput axis (AdvancedHMC).
+            "Reactant","AdvancedHMC")])
         Pkg.develop([
             Pkg.PackageSpec(path = root),
             Pkg.PackageSpec(path = joinpath(root, "packages", "ReactiveKernelsDistributionKernels")),
@@ -99,9 +102,20 @@ function _run()
     Base.invokelatest(All80Receipt.aggregate, phase_receipts, out;
         meta = Dict("dppl_sha" => DPPL_SHA, "args" => collect(ARGS)))
     @info "RK_ALL80: aggregated final receipt -> $out"
-    issues = Base.invokelatest(All80Receipt.validate, out)
-    isempty(issues) || (@warn "RK_ALL80: receipt has $(length(issues)) unpopulated mandatory cell(s)";
-                        foreach(i -> println("  ", i), first(issues, 20)))
+    non_flag = [a for a in ARGS if !startswith(a, "-")]
+    complete = isempty(non_flag) && Set(phases) == Set(["native", "reactant"])
+    # A complete default run also gates the ROW COUNT (all 82 present), not just cell fill.
+    issues = Base.invokelatest(All80Receipt.validate, out; expected_models = complete ? 82 : nothing)
+    if !isempty(issues)
+        if complete
+            @error "RK_ALL80: publication gate FAILED — $(length(issues)) unpopulated mandatory cell(s)"
+            foreach(i -> println("  ", i), first(issues, 30))
+            exit(1)
+        else
+            @warn "RK_ALL80: PARTIAL run — $(length(issues)) mandatory cell(s) unpopulated (expected for a key-subset or single-phase run)"
+            foreach(i -> println("  ", i), first(issues, 20))
+        end
+    end
 end
 
 get(ENV, _INNER, "") == "1" ? include(_BODY) : _run()

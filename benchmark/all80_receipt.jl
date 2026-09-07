@@ -19,15 +19,21 @@ const SCHEMA = "all80-benchmark-v1"
 #       hmc_rk_native (RK-native multinomial-HMC loop), hmc_ahmc_turing (AdvancedHMC)
 #   reactant (Reactant + transpiler loaded): primal_rk_reactant, gradient_rk_reactant,
 #       hmc_rk_reactant (SAME multinomial HMC, Reactant-compiled)
+# MANDATORY (a finite number for ALL 82): the 8 NATIVE cells. RK+Reactant is NOT mandatory
+# for all 82 — the user (2026-09-07) explicitly does not expect every faithful graph to lower
+# through Reactant; the honest deliverable is a per-model transpile/no-transpile breakdown.
 const NATIVE_CELLS = ("primal_rk", "primal_turing", "primal_stan",
     "gradient_rk", "gradient_turing", "gradient_stan",
     "hmc_rk_native", "hmc_ahmc_turing")
+const MANDATORY_CELLS = NATIVE_CELLS
+# CONDITIONAL cells: a finite NUMBER where it applies, else a NONEMPTY string carrying the
+# exact reason. REACTANT cells = numeric where the model lowers through Reactant, else the
+# exact Reactant-lowering error. OPTIONAL optimized-Stan/further-Turing = number if a distinct
+# verified-faster impl exists, else the user-directive deferral provenance. Never merely absent.
 const REACTANT_CELLS = ("primal_rk_reactant", "gradient_rk_reactant", "hmc_rk_reactant")
-const MANDATORY_CELLS = (NATIVE_CELLS..., REACTANT_CELLS...)
-# OPTIONAL cells: a distinct VERIFIED-FASTER implementation, else an N/A-with-provenance
-# STRING (never merely-unwired). Provenance strings are allowed here; numbers when present.
 const OPTIONAL_CELLS = ("primal_opt_stan", "primal_further_turing",
     "gradient_opt_stan", "gradient_further_turing")
+const CONDITIONAL_CELLS = (REACTANT_CELLS..., OPTIONAL_CELLS...)
 # Descriptive per-model fields carried alongside the cells (native phase authors them).
 const DESCRIPTIVE = ("dim", "family", "note", "parity_pass", "rk_off", "tu_off",
     "off_reason", "rk_grad_relerr", "tu_grad_relerr")
@@ -88,10 +94,10 @@ function validate(path::AbstractString; expected_models = nothing)
             (v isa Real && isfinite(v)) ||
                 push!(issues, "$k: mandatory cell $c is not a finite number ($(repr(v)))")
         end
-        for c in OPTIONAL_CELLS
+        for c in CONDITIONAL_CELLS
             v = get(cells, c, nothing)
             ok = (v isa Real && isfinite(v)) || (v isa AbstractString && !isempty(v))
-            ok || push!(issues, "$k: optional cell $c must be a finite number or a nonempty provenance string ($(repr(v)))")
+            ok || push!(issues, "$k: conditional cell $c must be a finite number or a nonempty reason/provenance string ($(repr(v)))")
         end
     end
     issues
