@@ -52,7 +52,6 @@ site_pages = [
             "Poisson-Gamma" => "poisson-gamma.md",
             "Dugongs (nonlinear growth)" => "dugongs-growth.md",
             "ARMA(1,1) time series" => "arma11.md",
-            "Gaussian mixture" => "gaussian-mixture.md",
             "Correlated (MvNormal) regression" => "mvnormal-regression.md",
             "Partial evaluation (bound data)" => "bound-regression.md",
         ],

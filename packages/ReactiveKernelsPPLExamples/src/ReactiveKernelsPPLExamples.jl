@@ -17,18 +17,79 @@ include("kidscore_momhs.jl")
 include("kidscore_momiq.jl")
 include("kidscore_momhsiq.jl")
 include("kidscore_interaction.jl")
+include("kidscore_interaction_c.jl")
+include("kidscore_interaction_c2.jl")
+include("kidscore_interaction_z.jl")
 include("blr.jl")
 include("mesquite.jl")
 include("logmesquite.jl")
 include("logmesquite_logvolume.jl")
+include("logmesquite_logva.jl")
+include("logmesquite_logvas.jl")
+include("logmesquite_logvash.jl")
 include("kilpisjarvi.jl")
 include("earn_height.jl")
 include("logearn_height.jl")
 include("log10earn_height.jl")
 include("logearn_interaction.jl")
+include("logearn_height_male.jl")
+include("logearn_logheight_male.jl")
+include("logearn_interaction_z.jl")
+include("ark.jl")
+include("mh.jl")
+include("nes_logit.jl")
+include("wells_dist.jl")
+include("wells_dist100_model.jl")
+include("dogs_log.jl")
+include("nes.jl")
+include("kidscore_mom_work.jl")
+include("rate_1.jl")
+include("radon_pooled.jl")
+include("radon_partially_pooled_centered.jl")
+include("radon_partially_pooled_noncentered.jl")
+include("radon_variable_intercept_centered.jl")
+include("radon_county.jl")
+include("radon_county_intercept.jl")
+include("radon_variable_intercept_noncentered.jl")
+include("radon_variable_slope_centered.jl")
+include("radon_variable_slope_noncentered.jl")
+include("radon_variable_intercept_slope_centered.jl")
+include("radon_variable_intercept_slope_noncentered.jl")
+include("radon_hierarchical_intercept_centered.jl")
+include("radon_hierarchical_intercept_noncentered.jl")
+include("rate_2.jl")
+include("rate_3.jl")
+include("rate_4.jl")
+include("rate_5.jl")
+include("dogs.jl")
+include("dogs_hierarchical.jl")
+include("seeds.jl")
+include("seeds_centered_model.jl")
+include("seeds_stanified_model.jl")
+include("rats_model.jl")
+include("sesame_one_pred_a.jl")
+include("pilots.jl")
+include("lsat.jl")
+include("surgical.jl")
+include("m0.jl")
+include("mb.jl")
+include("mt.jl")
+include("mth_model.jl")
+include("mtbh_model.jl")
+include("wells_dae_model.jl")
+include("wells_dae_c_model.jl")
+include("wells_interaction_model.jl")
+include("wells_daae_c_model.jl")
+include("wells_interaction_c_model.jl")
+include("wells_dae_inter_model.jl")
+include("wells_dist100ars_model.jl")
+include("election88_full.jl")
 include("dugongs_growth.jl")
 include("arma11.jl")
-include("gaussian_mixture.jl")
+include("normal_mixture.jl")
+include("low_dim_gauss_mix_collapse.jl")
+include("low_dim_gauss_mix.jl")
+include("survey_model.jl")
 include("mnist_logistic.jl")
 include("mvnormal_regression.jl")
 include("bound_regression.jl")
@@ -70,18 +131,79 @@ export KidscoreMomhsExample
 export KidscoreMomiqExample
 export KidscoreMomhsiqExample
 export KidscoreInteractionExample
+export KidscoreInteractionCExample
+export KidscoreInteractionC2Example
+export KidscoreInteractionZExample
 export BLRExample
 export MesquiteExample
 export LogmesquiteExample
 export LogmesquiteLogvolumeExample
+export LogmesquiteLogvaExample
+export LogmesquiteLogvasExample
+export LogmesquiteLogvashExample
 export KilpisjarviExample
 export EarnHeightExample
 export LogearnHeightExample
 export Log10earnHeightExample
 export LogearnInteractionExample
+export LogearnHeightMaleExample
+export LogearnLogheightMaleExample
+export LogearnInteractionZExample
+export ARKExample
+export MhExample
+export NesLogitExample
+export WellsDistExample
+export WellsDist100Example
+export DogsLogExample
+export NESExample
+export KidscoreMomWorkExample
+export Rate1Example
+export RadonPooledExample
+export RadonPartiallyPooledCenteredExample
+export RadonPartiallyPooledNoncenteredExample
+export RadonVariableInterceptCenteredExample
+export RadonCountyExample
+export RadonCountyInterceptExample
+export RadonVariableInterceptNoncenteredExample
+export RadonVariableSlopeCenteredExample
+export RadonVariableSlopeNoncenteredExample
+export RadonVariableInterceptSlopeCenteredExample
+export RadonVariableInterceptSlopeNoncenteredExample
+export RadonHierarchicalInterceptCenteredExample
+export RadonHierarchicalInterceptNoncenteredExample
+export Rate2Example
+export Rate3Example
+export Rate4Example
+export Rate5Example
+export DogsExample
+export DogsHierarchicalExample
+export SeedsExample
+export SeedsCenteredExample
+export SeedsStanifiedExample
+export RatsModelExample
+export SesameOnePredAExample
+export PilotsExample
+export LsatExample
+export SurgicalExample
+export M0Example
+export MbExample
+export MtExample
+export MthModelExample
+export MtbhModelExample
+export WellsDaeExample
+export WellsDaeCExample
+export WellsInteractionExample
+export WellsDaaeCExample
+export WellsInteractionCExample
+export WellsDaeInterExample
+export WellsDist100arsExample
+export Election88FullExample
 export DugongsGrowthExample
 export ARMA11Example
-export GaussianMixtureExample
+export NormalMixtureExample
+export LowDimGaussMixCollapseExample
+export LowDimGaussMixExample
+export SurveyModelExample
 export MNISTLogisticExample
 export MVNormalRegressionExample
 export BoundRegressionExample
