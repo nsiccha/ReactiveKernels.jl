@@ -133,6 +133,20 @@ end
     return sum(pointwise)
 end
 
+# A `Bool`-typed cell local over host count data becomes its own plate recipe
+# (the binomial family's `valid::Bool = (observed >= 0) & (observed <= n)`), so
+# with the data bound it is a `Bool`-valued broadcast over two host vectors.
+@kernel reactant_bool_local_count_plate(
+        counts::Vector{Int}, totals::Vector{Int}, rates::Vector{Float64}) = begin
+    pointwise = plate(counts, totals, rates) do count, total, rate
+        valid::Bool = (count >= 0) & (count <= total)
+        value::Float64 = count * log(rate) - total * rate
+        result::Float64 = ifelse(valid, value, -Inf)
+        return result
+    end
+    return sum(pointwise)
+end
+
 # An `eachcol` regression plate whose density recipe lists the response vector
 # before the column batch, so a plain traced response vector is the first
 # marker-bearing operand of that recipe.
@@ -870,6 +884,19 @@ end
         rates = Reactant.to_rarray(rates_host)
         compiled_guarded = @compile guarded(rates)
         @test compiled_guarded(rates) ≈ guarded_reference
+
+        # The Bool validity local is its own recipe over two bound host count
+        # vectors: a marker-less host broadcast that must materialize an
+        # `Array{Bool}`, never the `BitArray` Reactant cannot `copyto!`.
+        totals_host = counts_host .+ 3
+        bool_local = prepare(reactant_bool_local_count_plate;
+            have = (:counts, :totals, :rates), want = :__return__,
+            bound = (; counts = counts_host, totals = totals_host))
+        bool_reference = sum(
+            c * log(r) - t * r for (c, t, r) in zip(counts_host, totals_host, rates_host))
+        @test bool_local(rates_host) ≈ bool_reference
+        compiled_bool_local = @compile bool_local(rates)
+        @test compiled_bool_local(rates) ≈ bool_reference
 
         scores_host = reshape(collect(1.0:(3n)) ./ 7, 3, n)
         weights_host = collect(range(0.5, 1.5; length = n))
