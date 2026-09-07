@@ -39,6 +39,10 @@ using ReactiveKernelsPPLExamples.Rate4Example: evaluate_rate_4_source
 using ReactiveKernelsPPLExamples.Rate5Example: evaluate_rate_5_source
 using ReactiveKernelsPPLExamples.DogsExample: evaluate_dogs_source
 using ReactiveKernelsPPLExamples.DogsHierarchicalExample: evaluate_dogs_hierarchical_source
+using ReactiveKernelsPPLExamples.SeedsExample: evaluate_seeds_source
+using ReactiveKernelsPPLExamples.PilotsExample: evaluate_pilots_source
+using ReactiveKernelsPPLExamples.LsatExample: evaluate_lsat_source
+using ReactiveKernelsPPLExamples.SurgicalExample: evaluate_surgical_source
 using ReactiveKernelsPPLExamples.KidscoreMomhsExample: evaluate_kidscore_momhs_source
 using ReactiveKernelsPPLExamples.KidscoreMomiqExample: evaluate_kidscore_momiq_source
 using ReactiveKernelsPPLExamples.KidscoreMomhsiqExample: evaluate_kidscore_momhsiq_source
@@ -229,6 +233,22 @@ end
     end
     @testset "dogs_hierarchical (posteriordb)" begin
         a = evaluate_dogs_hierarchical_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "seeds (posteriordb)" begin
+        a = evaluate_seeds_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "pilots (posteriordb)" begin
+        a = evaluate_pilots_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "lsat (posteriordb)" begin
+        a = evaluate_lsat_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "surgical (posteriordb)" begin
+        a = evaluate_surgical_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
     @testset "kidscore_momhs (posteriordb; Gaussian linear regression)" begin
