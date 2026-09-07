@@ -38,10 +38,15 @@ on it (verified against the `ReactiveKernels:sampling:gibbs` PoC on
   (unit).
 - **Automatic conjugacy** (`conjugate` kwarg, on by default): reading the
   `@ppl` structure descriptor (`PPLMacro.model_info`), a block whose full
-  conditional is a supported data-only conjugate pair is drawn in closed form
-  (exact, always accepted): **Beta-Bernoulli, Beta-Binomial, Gamma-Poisson**.
+  conditional is a supported conjugate pair is drawn in closed form (exact,
+  always accepted). Data-only pairs (fixed posterior): **Beta-Bernoulli,
+  Beta-Binomial, Gamma-Poisson**. Current-state pairs (posterior recomputed from
+  the current block values each sweep): a **Beta block whose successes are a
+  Bernoulli latent** — `omega ~ beta`, `z ~ bernoulli(omega)` — the
+  inclusion-probability block of a spike-and-slab / hierarchical Bernoulli model.
   Closed-form draws use `Random`-only samplers (Marsaglia–Tsang gamma, beta via
-  two gammas). Validated against the exact Beta and Gamma posteriors.
+  two gammas). Validated against the exact Beta/Gamma posteriors and the
+  analytic `omega | z` Beta.
 - **Discrete latents** (Gibbs-only): an `@ppl` parameter with a discrete family
   (`bernoulli`) is a latent carried OUTSIDE the continuous `unconstrained`
   vector — its own `Bool` HAVE port, no transform/gradient — and sampled by
@@ -90,54 +95,128 @@ function _rand_beta(rng, a::Real, b::Real)
     x / (x + y)
 end
 
-# A detected conjugate full conditional whose posterior parameters are data-only
-# (constant across sweeps): `:beta` → Beta(p1, p2), `:gamma` → Gamma(p1, p2).
+# InverseGamma(shape, scale) via 1 / Gamma(shape, rate = scale).
+_rand_inverse_gamma(rng, shape::Real, scale::Real) = 1 / _rand_gamma(rng, shape, scale)
+
+# A detected conjugate full conditional. `_Conjugate` is DATA-ONLY (its posterior
+# parameters are constant across sweeps): `:beta` → Beta(p1, p2), `:gamma` →
+# Gamma(p1, p2). `_ConjBetaLatentBernoulli` is CURRENT-STATE: a Beta block whose
+# "successes" are a Bernoulli LATENT `z` (its prior is `bernoulli(block)`), so its
+# posterior is recomputed from the current `z` each sweep — Beta(a0 + Σz,
+# b0 + Σ(1 - z)). This is the inclusion-probability block of a spike-and-slab /
+# hierarchical Bernoulli model (SSVS `omega`).
 struct _Conjugate
     family::Symbol
     p1::Float64
     p2::Float64
 end
-_draw_conjugate(rng, c::_Conjugate) = c.family === :beta ?
-    _rand_beta(rng, c.p1, c.p2) : _rand_gamma(rng, c.p1, c.p2)
+struct _ConjBetaLatentBernoulli
+    a0::Float64
+    b0::Float64
+    latent::Symbol
+end
+# CURRENT-STATE Inverse-Gamma-Normal (variance): an `inverse_gamma(a0, b0)` block
+# `sigma2` used as the VARIANCE of a single homoscedastic Normal observation
+# stream (its scale is `sqrt(sigma2)`). Its conditional is
+# InverseGamma(a0 + n/2, b0 + SSR/2), SSR = Σ(y_i - mu_i)². SSR is recovered each
+# sweep from the current likelihood `L` and variance `s2` (single-stream Normal):
+# `L = -n/2·log(2π) - n/2·log(s2) - SSR/(2 s2)` ⇒ SSR = -2 s2 (L + n/2·log(2π) +
+# n/2·log(s2)) — so no separate residual evaluation is needed.
+struct _ConjInvGammaNormal
+    a0::Float64
+    b0::Float64
+    n::Int
+end
 
-# Detect whether `block`'s full conditional is a supported data-only conjugate
-# pair, using the `@ppl` structure descriptor. Returns a `_Conjugate` with the
-# closed-form posterior parameters, or `nothing` (→ fall back to RW-MH). First
-# cut — the three feasible "direct" pairs (block is the sole latent appearing as
-# a bare likelihood argument, prior hyperparameters literal): Beta-Bernoulli,
-# Beta-Binomial, Gamma-Poisson. Inverse-Gamma-Normal / Dirichlet need
-# distributions absent from the distribution-kernels package; Normal-Normal needs
-# linear-predictor analysis. Both are deferred (see the module docstring).
-function _detect_conjugate(info::PPLMacro.PPLModelInfo, data, block::Symbol)
+# Draw from the detected conjugate posterior. `cur` supplies the current block
+# values for a current-state conjugate; a data-only `_Conjugate` ignores it.
+_draw_conjugate(rng, c::_Conjugate, cur) = c.family === :beta ?
+    _rand_beta(rng, c.p1, c.p2) : _rand_gamma(rng, c.p1, c.p2)
+function _draw_conjugate(rng, c::_ConjBetaLatentBernoulli, cur)
+    z = cur[c.latent]
+    s = sum(z)                 # scalar Bool → 0/1; Vector{Bool} → count of trues
+    n = length(z)
+    _rand_beta(rng, c.a0 + s, c.b0 + (n - s))
+end
+
+# Draw an Inverse-Gamma-Normal variance from the current likelihood `L` and the
+# current variance `s2` (recovers SSR via the single-stream back-out above).
+function _draw_invgamma_normal(rng, c::_ConjInvGammaNormal, s2, L)
+    ssr = -2 * s2 * (L + (c.n / 2) * log(2π) + (c.n / 2) * log(s2))
+    ssr = max(ssr, 0.0)        # guard against tiny negative from float roundoff
+    _rand_inverse_gamma(rng, c.a0 + c.n / 2, c.b0 + ssr / 2)
+end
+
+# Resolve a prior hyperparameter argument to a number: a literal `Real`, or a
+# `Symbol` naming a real-valued data input (`beta(a0, b0)` with `a0`/`b0` passed
+# as data). Anything else (an expression, a non-real, a missing data key) → the
+# hyperparameter is not statically known, so conjugacy detection bails.
+_hyperparam(arg::Real, data) = Float64(arg)
+_hyperparam(arg::Symbol, data) =
+    (haskey(data, arg) && data[arg] isa Real) ? Float64(data[arg]) : nothing
+_hyperparam(arg, data) = nothing
+
+# Does the argument AST reference `sym` anywhere?
+_ast_has_symbol(x::Symbol, sym) = x === sym
+_ast_has_symbol(x::Expr, sym) = any(a -> _ast_has_symbol(a, sym), x.args)
+_ast_has_symbol(x, sym) = false
+
+# Detect whether `block`'s full conditional is a supported conjugate pair, using
+# the `@ppl` structure descriptor. Returns a `_Conjugate` (data-only) or a
+# `_ConjBetaLatentBernoulli` (current-state), or `nothing` (→ RW-MH). Supported:
+# the data-only "direct" pairs (block the sole latent as a bare likelihood arg,
+# literal hyperparameters) — Beta-Bernoulli, Beta-Binomial, Gamma-Poisson — plus
+# the current-state Beta-(latent Bernoulli) inclusion-probability block.
+# Inverse-Gamma-Normal / Dirichlet-family and Normal-Normal (linear-predictor)
+# remain deferred (see the module docstring).
+function _detect_conjugate(info::PPLMacro.PPLModelInfo, data, block::Symbol, members)
     p = nothing
     for pi in info.params
         pi.name === block && (p = pi; break)
     end
     (p === nothing || p.is_vector) && return nothing
-    all(a -> a isa Real, p.prior_args) || return nothing
-    refs = [o for o in info.obs if any(a -> a === block, o.args)]
-    isempty(refs) && return nothing
+    length(p.prior_args) == 2 || return nothing
 
-    if p.prior_family === :beta && all(o -> o.family in (:binomial, :bernoulli), refs)
-        s = 0.0
-        f = 0.0
-        for o in refs
-            obsv = data[o.data]
-            if o.family === :bernoulli
-                o.args == Any[block] || return nothing
-                s += sum(obsv)
-                f += length(obsv) - sum(obsv)
-            else                                   # binomial(n, block)
-                (length(o.args) == 2 && o.args[2] === block &&
-                    o.args[1] isa Symbol && haskey(data, o.args[1])) || return nothing
-                n = data[o.args[1]]
-                s += sum(obsv)
-                f += sum(n) - sum(obsv)
+    if p.prior_family === :beta
+        a0 = _hyperparam(p.prior_args[1], data)
+        b0 = _hyperparam(p.prior_args[2], data)
+        (a0 === nothing || b0 === nothing) && return nothing
+        # (a) data-observation Beta-Bernoulli / Beta-Binomial (data-only).
+        obsrefs = [o for o in info.obs if any(a -> a === block, o.args)]
+        if !isempty(obsrefs) && all(o -> o.family in (:binomial, :bernoulli), obsrefs)
+            s = 0.0
+            f = 0.0
+            for o in obsrefs
+                obsv = data[o.data]
+                if o.family === :bernoulli
+                    o.args == Any[block] || return nothing
+                    s += sum(obsv)
+                    f += length(obsv) - sum(obsv)
+                else                               # binomial(n, block)
+                    (length(o.args) == 2 && o.args[2] === block &&
+                        o.args[1] isa Symbol && haskey(data, o.args[1])) || return nothing
+                    n = data[o.args[1]]
+                    s += sum(obsv)
+                    f += sum(n) - sum(obsv)
+                end
             end
+            return _Conjugate(:beta, a0 + s, b0 + f)
         end
-        return _Conjugate(:beta, Float64(p.prior_args[1]) + s,
-                          Float64(p.prior_args[2]) + f)
-    elseif p.prior_family === :gamma && all(o -> o.family === :poisson, refs)
+        # (b) a Bernoulli LATENT whose prior is `bernoulli(block)` (current-state).
+        # The latent must itself be a sampled block (so its current value exists).
+        for pj in info.params
+            pj.name === block && continue
+            (pj.prior_family === :bernoulli && pj.prior_args == Any[block] &&
+                pj.name in members) &&
+                return _ConjBetaLatentBernoulli(a0, b0, pj.name)
+        end
+        return nothing
+    elseif p.prior_family === :gamma
+        sh = _hyperparam(p.prior_args[1], data)
+        rt = _hyperparam(p.prior_args[2], data)
+        (sh === nothing || rt === nothing) && return nothing
+        refs = [o for o in info.obs if any(a -> a === block, o.args)]
+        (!isempty(refs) && all(o -> o.family === :poisson, refs)) || return nothing
         c = 0.0
         n = 0
         for o in refs
@@ -145,8 +224,22 @@ function _detect_conjugate(info::PPLMacro.PPLModelInfo, data, block::Symbol)
             c += sum(data[o.data])
             n += length(data[o.data])
         end
-        return _Conjugate(:gamma, Float64(p.prior_args[1]) + c,
-                          Float64(p.prior_args[2]) + n)
+        return _Conjugate(:gamma, sh + c, rt + n)
+    elseif p.prior_family === :inverse_gamma
+        a0 = _hyperparam(p.prior_args[1], data)
+        b0 = _hyperparam(p.prior_args[2], data)
+        (a0 === nothing || b0 === nothing) && return nothing
+        # A single homoscedastic Normal stream whose SCALE is `sqrt(block)`, with
+        # `block` NOT also in the mean — so the likelihood is exactly the
+        # sqrt(block)-Normal over the data and the SSR back-out is valid.
+        length(info.obs) == 1 || return nothing
+        o = info.obs[1]
+        (o.family === :normal && length(o.args) == 2) || return nothing
+        sc = o.args[2]
+        (sc isa Expr && sc.head === :call && length(sc.args) == 2 &&
+            sc.args[1] === :sqrt && sc.args[2] === block) || return nothing
+        _ast_has_symbol(o.args[1], block) && return nothing
+        return _ConjInvGammaNormal(a0, b0, length(data[o.data]))
     end
     return nothing
 end
@@ -280,11 +373,13 @@ each latent and `accept_rate[key]` is per block (`key` is the latent symbol for 
 single-site block, the tuple of members for a group).
 
 When `conjugate` is on (default) and the model carries an `@ppl` structure
-descriptor, each block whose full conditional is a supported data-only conjugate
-pair (Beta-Bernoulli, Beta-Binomial, Gamma-Poisson) is drawn in closed form
-(exact, always accepted — `accept_rate` 1.0); every other block uses the
-support-aware random-walk step below. Pass `conjugate = false` to force RW-MH for
-all blocks.
+descriptor, each single-latent `:auto` block whose full conditional is a
+supported conjugate pair is drawn in closed form (exact, always accepted —
+`accept_rate` 1.0): data-only pairs (Beta-Bernoulli, Beta-Binomial,
+Gamma-Poisson) and current-state pairs (Beta with a Bernoulli-latent's
+successes; Inverse-Gamma-Normal variance, whose SSR is recovered from the
+current likelihood). Every other block uses the support-aware random-walk step
+below. Pass `conjugate = false` to force RW-MH for all blocks.
 
 `support` gives each block's support as a NamedTuple / Dict of block-name =>
 `:real` (default) | `:positive` | `:unit`. A `:positive`/`:unit` block walks in
@@ -292,9 +387,7 @@ log/logit space with the matching Metropolis-Hastings correction, so every
 proposal respects the support while the chain still targets the CONSTRAINED
 density directly (the named-latent port takes the constrained value and
 `constrained_logdensity` carries no unconstraining Jacobian). Support is passed
-here rather than read from the model: `@ppl` exposes no structure descriptor yet
-(that is the follow-up conjugacy increment), so the engine stays decoupled from
-the macro internals.
+here rather than inferred, so a non-conjugate block's sampler stays explicit.
 
 The sweep is driven incrementally through a `ReactiveState`: each accepted or
 rejected `set!` invalidates only the block's Markov blanket, so the next
@@ -319,7 +412,7 @@ function gibbs(model; blocks, data, init, iters::Int, rng,
     # Conjugate detection is per SINGLE-latent `:auto` block (a group is not
     # jointly conjugate in general). Automatic when `conjugate` is on and the
     # model carries an `@ppl` structure descriptor.
-    conj = Dict{Symbol,Union{Nothing,_Conjugate}}(m => nothing for m in members)
+    conj = Dict{Symbol,Any}(m => nothing for m in members)
     disc = Dict{Symbol,Any}(m => nothing for m in members)
     if PPLMacro.has_model_info(model)
         info = PPLMacro.model_info(model)
@@ -331,7 +424,7 @@ function gibbs(model; blocks, data, init, iters::Int, rng,
             disc[m] = _detect_discrete(info, m)
             # Closed-form conjugate draw for a continuous `:auto` block.
             if disc[m] === nothing && conjugate && b.sampler === :auto
-                conj[m] = _detect_conjugate(info, data, m)
+                conj[m] = _detect_conjugate(info, data, m, members)
             end
         end
     end
@@ -340,6 +433,10 @@ function gibbs(model; blocks, data, init, iters::Int, rng,
         set!(st, ports[m], cur[m])
     end
     logtarget() = get!(st, tgt)
+    # The likelihood node, read on demand for a current-state Inverse-Gamma-Normal
+    # variance draw (SSR is recovered from it).
+    lik_port = getproperty(model, :likelihood)
+    loglik() = get!(st, lik_port)
 
     draws = Dict{Symbol,Vector{Any}}(m => Any[] for m in members)
     blockkeys = [_block_key(b) for b in spec.blocks]
@@ -381,8 +478,12 @@ function gibbs(model; blocks, data, init, iters::Int, rng,
                 counted && (accepts[k] += 1)
             elseif c !== nothing
                 # Exact conjugate draw (single-latent block) — always accepted.
+                # A current-state conjugate reads the other blocks' current values;
+                # Inverse-Gamma-Normal additionally reads the current likelihood.
                 m = m1
-                prop = _draw_conjugate(rng, c)
+                prop = c isa _ConjInvGammaNormal ?
+                    _draw_invgamma_normal(rng, c, cur[m], loglik()) :
+                    _draw_conjugate(rng, c, cur)
                 set!(st, ports[m], prop)
                 cur[m] = prop
                 counted && (accepts[k] += 1)

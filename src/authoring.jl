@@ -1357,10 +1357,13 @@ _tensorized_callee_replacement(callee::Symbol) =
     callee === :hcat ? :_tensorized_hcat :
     callee === :cat ? :_tensorized_cat :
     callee === :eachcol ? :_tensorized_eachcol :
-    callee === :getindex ? :_tensorized_getindex : nothing
+    callee === :getindex ? :_tensorized_getindex :
+    callee === :dot ? :_tensorized_dot : nothing
 _tensorized_callee_replacement(callee::GlobalRef) =
     callee.mod === Base && callee.name === :eachcol ? :_tensorized_eachcol :
     callee.mod === Base && callee.name === :getindex ? :_tensorized_getindex :
+    callee.name === :dot && nameof(callee.mod) === :LinearAlgebra ?
+        :_tensorized_dot :
     nothing
 _tensorized_callee_replacement(callee) = nothing
 
