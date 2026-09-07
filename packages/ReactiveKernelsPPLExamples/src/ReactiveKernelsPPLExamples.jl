@@ -74,6 +74,8 @@ include("surgical.jl")
 include("m0.jl")
 include("mb.jl")
 include("mt.jl")
+include("mth_model.jl")
+include("mtbh_model.jl")
 include("wells_dae_model.jl")
 include("wells_dae_c_model.jl")
 include("wells_interaction_model.jl")
@@ -180,6 +182,8 @@ export SurgicalExample
 export M0Example
 export MbExample
 export MtExample
+export MthModelExample
+export MtbhModelExample
 export WellsDaeExample
 export WellsDaeCExample
 export WellsInteractionExample

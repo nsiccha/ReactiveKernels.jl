@@ -65,6 +65,8 @@ using ReactiveKernelsPPLExamples.SurgicalExample: evaluate_surgical_source
 using ReactiveKernelsPPLExamples.M0Example: evaluate_m0_source
 using ReactiveKernelsPPLExamples.MbExample: evaluate_mb_source
 using ReactiveKernelsPPLExamples.MtExample: evaluate_mt_source
+using ReactiveKernelsPPLExamples.MthModelExample: evaluate_mth_model_source
+using ReactiveKernelsPPLExamples.MtbhModelExample: evaluate_mtbh_model_source
 using ReactiveKernelsPPLExamples.WellsDaeExample: evaluate_wells_dae_source
 using ReactiveKernelsPPLExamples.WellsDaeCExample: evaluate_wells_dae_c_source
 using ReactiveKernelsPPLExamples.WellsInteractionExample: evaluate_wells_interaction_source
@@ -374,6 +376,14 @@ end
     end
     @testset "mt (posteriordb)" begin
         a = evaluate_mt_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "mth_model (posteriordb; time + heterogeneity)" begin
+        a = evaluate_mth_model_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "mtbh_model (posteriordb; time + behaviour + heterogeneity)" begin
+        a = evaluate_mtbh_model_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
     @testset "wells_dae_model (posteriordb)" begin

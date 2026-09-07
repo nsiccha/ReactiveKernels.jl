@@ -14,7 +14,7 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     DogsExample, DogsHierarchicalExample,
     SeedsExample, PilotsExample, LsatExample, SurgicalExample,
     SeedsCenteredExample, SeedsStanifiedExample, RatsModelExample, SesameOnePredAExample,
-    M0Example, MbExample, MtExample, WellsDaeExample, WellsDaeCExample, WellsInteractionExample, WellsDaaeCExample,
+    M0Example, MbExample, MtExample, MthModelExample, MtbhModelExample, WellsDaeExample, WellsDaeCExample, WellsInteractionExample, WellsDaaeCExample,
     WellsInteractionCExample, WellsDaeInterExample, WellsDist100arsExample, Election88FullExample,
     KidscoreMomhsExample, KidscoreMomiqExample, KidscoreMomhsiqExample, KidscoreInteractionExample,
     KidscoreInteractionCExample, KidscoreInteractionC2Example, KidscoreInteractionZExample,
@@ -88,6 +88,8 @@ include("test_surgical_example.jl")
 include("test_m0_example.jl")
 include("test_mb_example.jl")
 include("test_mt_example.jl")
+include("test_mth_model_example.jl")
+include("test_mtbh_model_example.jl")
 include("test_wells_dae_example.jl")
 include("test_wells_dae_c_example.jl")
 include("test_wells_interaction_example.jl")
