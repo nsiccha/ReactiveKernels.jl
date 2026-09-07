@@ -808,6 +808,15 @@ end
 # scalar indexing while leaving XLA free to fuse the tensor operations.
 @inline ReactiveKernels._requires_tensorized_marker(::Reactant.RArray) = true
 
+# A traced SCALAR HAVE beside all-bound plate data is also a Reactant argument:
+# a scalar-parameter model (`logit_rate`/`log_rate`) with every array port
+# `bound=` traces only a `TracedRNumber`, so no `RArray` marker exists and the
+# native fused loop would run — writing each traced cell into a host
+# `Array{Float64}` buffer (`Float64(::TracedRNumber)` MethodError at
+# `setindex!`).  Selecting the tensorized body promotes the bound host arrays
+# into the traced program instead, exactly as the array-HAVE case already does.
+@inline ReactiveKernels._requires_tensorized_marker(::Reactant.TracedRNumber) = true
+
 # Cat-family calls in a tensorized fused body may mix untraced constant arrays
 # (e.g. a `zeros(1, n)` reference row built inside the body) with traced
 # operands; Base's generic `_typed_vcat` then copies elementwise into a host
@@ -1157,6 +1166,15 @@ end
 @inline function ReactiveKernels._batched_call(
         f::ReactiveKernels._ArrayFunctionPair, ops, args,
         marker::Reactant.RArray)
+    f.tensorized(ops, args...)
+end
+
+# A traced-scalar marker (a scalar HAVE with all plate data bound) selects the
+# same tensorized body as an `RArray` marker; `TracedRNumber` is not `<:RArray`,
+# so it needs its own dispatch to avoid the native host-buffer fallback.
+@inline function ReactiveKernels._batched_call(
+        f::ReactiveKernels._ArrayFunctionPair, ops, args,
+        marker::Reactant.TracedRNumber)
     f.tensorized(ops, args...)
 end
 

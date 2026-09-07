@@ -271,19 +271,27 @@ end
 @inline _tensorized_plate_sum(value) = sum(_tensorized_plate_materialize(value))
 
 # A recipe whose operands carry no plate marker — every operand a host array
-# (`bound=` data) or a shared scalar — broadcasts on the host.  Route it
-# through `_tensorized_materialize` so a `Bool`-valued recipe materializes a
-# dense `Array{Bool}` rather than a `BitArray`: a typed validity local such as
-# the binomial family's `valid::Bool = (observed >= 0) & (observed <= n)`
-# becomes its own plate recipe over two bound count vectors, and a tracing
-# backend cannot `copyto!` a `BitArray` (Reactant 0.2.284 recurses without
-# termination, a `StackOverflowError` with no actionable signal).  This is the
-# same container normalization the fused-body broadcasts already receive;
-# values and shapes are unchanged.
+# (`bound=` data) or a shared (possibly traced) scalar — broadcasts on the host.
+# Route it through `_tensorized_broadcast`, which handles the two ways Base's own
+# broadcast breaks a tracing backend here:
+#   * an all-host `Bool` recipe (a typed validity local such as the binomial
+#     family's `valid::Bool = (observed >= 0) & (observed <= n)`, which becomes
+#     its own plate recipe over two bound count vectors) would materialize a
+#     `BitArray` — Reactant 0.2.284 recurses without termination on
+#     `copyto!(::BitArray, ::Broadcasted)`, a `StackOverflowError` with no
+#     actionable signal — so `_tensorized_materialize` collects a dense
+#     `Array{Bool}` instead; and
+#   * a MIXED host-array/traced-scalar recipe (a scalar parameter with all plate
+#     data `bound=`, so only the shared scalar is traced) would infer an abstract
+#     `Number` eltype the backend's `similar` cannot allocate — so
+#     `_tensorized_cat_operands` promotes the host array operands against the
+#     discovered traced marker, giving a concrete traced eltype.
+# It reduces to plain `broadcast` for a non-`Bool` all-host recipe, so values and
+# shapes are unchanged.
 @inline function _tensorized_plate_call(operation, args...)
     marker = _tensorized_plate_marker(args)
     marker === nothing ?
-        _tensorized_materialize(Base.broadcasted(operation, args...)) :
+        _tensorized_broadcast(operation, args...) :
         _tensorized_plate_call(marker, operation, args)
 end
 

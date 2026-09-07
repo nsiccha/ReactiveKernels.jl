@@ -467,6 +467,27 @@ end
         a = evaluate_beta_binomial_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
+    # A scalar parameter (`logit_rate`) with every array port bound, so the only
+    # traced argument is a `TracedRNumber`: the plate's data lives entirely in
+    # bound host arrays. Compiles to the tensorized body (data-only support mask
+    # materialized as `Array{Bool}`, mixed host/traced ops promoted to a concrete
+    # traced eltype) rather than the native host-buffer loop.
+    @testset "beta_binomial (scalar param, all array data bound)" begin
+        a = evaluate_beta_binomial_source()
+        kb = prepare(a.model;
+            have = (:logit_rate, :trials, :successes), want = a.requested_nodes,
+            bound = (; trials = a.inputs.trials, successes = a.inputs.successes))
+        native = kb(a.inputs.logit_rate)
+        @test _rapprox(_compile_run(kb, (a.inputs.logit_rate,)), native)
+    end
+    @testset "poisson_gamma (scalar param, all array data bound)" begin
+        a = evaluate_poisson_gamma_source()
+        kb = prepare(a.model;
+            have = (:log_rate, :counts), want = a.requested_nodes,
+            bound = (; counts = a.inputs.counts))
+        native = kb(a.inputs.log_rate)
+        @test _rapprox(_compile_run(kb, (a.inputs.log_rate,)), native)
+    end
     @testset "dugongs" begin
         a = evaluate_dugongs_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
