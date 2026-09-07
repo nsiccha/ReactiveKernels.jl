@@ -23,6 +23,9 @@ using ReactiveKernelsPPLExamples.EarnHeightExample: evaluate_earn_height_source
 using ReactiveKernelsPPLExamples.LogearnHeightExample: evaluate_logearn_height_source
 using ReactiveKernelsPPLExamples.Log10earnHeightExample: evaluate_log10earn_height_source
 using ReactiveKernelsPPLExamples.LogearnInteractionExample: evaluate_logearn_interaction_source
+using ReactiveKernelsPPLExamples.LogearnHeightMaleExample: evaluate_logearn_height_male_source
+using ReactiveKernelsPPLExamples.LogearnLogheightMaleExample: evaluate_logearn_logheight_male_source
+using ReactiveKernelsPPLExamples.LogearnInteractionZExample: evaluate_logearn_interaction_z_source
 using ReactiveKernelsPPLExamples.ARKExample: evaluate_ark_source
 using ReactiveKernelsPPLExamples.MhExample: evaluate_mh_source
 using ReactiveKernelsPPLExamples.NesLogitExample: evaluate_nes_logit_source
@@ -179,6 +182,18 @@ end
     end
     @testset "logearn_interaction (posteriordb; Gaussian linear regression)" begin
         a = evaluate_logearn_interaction_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "logearn_height_male (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_logearn_height_male_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "logearn_logheight_male (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_logearn_logheight_male_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "logearn_interaction_z (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_logearn_interaction_z_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
     @testset "arK (posteriordb; AR(K) lag-matrix regression)" begin

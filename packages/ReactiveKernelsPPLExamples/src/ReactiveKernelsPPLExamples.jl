@@ -29,6 +29,9 @@ include("earn_height.jl")
 include("logearn_height.jl")
 include("log10earn_height.jl")
 include("logearn_interaction.jl")
+include("logearn_height_male.jl")
+include("logearn_logheight_male.jl")
+include("logearn_interaction_z.jl")
 include("ark.jl")
 include("mh.jl")
 include("nes_logit.jl")
@@ -108,6 +111,9 @@ export EarnHeightExample
 export LogearnHeightExample
 export Log10earnHeightExample
 export LogearnInteractionExample
+export LogearnHeightMaleExample
+export LogearnLogheightMaleExample
+export LogearnInteractionZExample
 export ARKExample
 export MhExample
 export NesLogitExample
