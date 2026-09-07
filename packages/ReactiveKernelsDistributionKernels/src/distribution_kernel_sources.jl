@@ -3,8 +3,9 @@ module DistributionKernelSources
 using ReactiveKernels
 
 export LOCATION_SCALE_SOURCE
-export standard_normal, standard_cauchy, standard_laplace, location_scale
-export normal, cauchy, laplace
+export standard_normal, standard_cauchy, standard_laplace, standard_student_t
+export location_scale
+export normal, cauchy, laplace, student_t
 export BERNOULLI_KERNEL_SOURCE, LOGNORMAL_KERNEL_SOURCE
 export EXPONENTIAL_KERNEL_SOURCE, GEOMETRIC_KERNEL_SOURCE, UNIFORM_KERNEL_SOURCE
 export MVNORMAL_KERNEL_SOURCE, AR1_KERNEL_SOURCE
@@ -25,7 +26,7 @@ export POISSON_SOURCE, GAMMA_SOURCE, BETA_SOURCE, BINOMIAL_SOURCE
 export INVERSE_GAMMA_SOURCE, DIRICHLET_SOURCE
 
 const LOCATION_SCALE_SOURCE = raw"""
-using SpecialFunctions: erfc, erfcinv
+using SpecialFunctions: erfc, erfcinv, loggamma, beta_inc, beta_inc_inv
 
 @kernel standard_normal() = begin
     logpdf(z::Float64)::Float64 = -0.5 * log(2π) - 0.5 * z^2
@@ -45,6 +46,27 @@ end
         ifelse(z < 0, 0.5 * exp(z), 1 - 0.5 * exp(-z))
     quantile(p::Float64)::Float64 =
         ifelse(p < 0.5, log(2p), -log(2 - 2p))
+end
+
+# Standardized Student-t with `nu` degrees of freedom (df=1 is standard Cauchy).
+# `cdf`/`quantile` use the regularized incomplete beta with x = nu/(nu+z^2):
+# for z<=0, F(z) = I_x(nu/2, 1/2)/2; symmetry gives the upper tail and the
+# inverse. Only positive df is a valid parameter, so there is no domain guard.
+@kernel standard_student_t(nu::Float64) = begin
+    logpdf(z::Float64)::Float64 =
+        loggamma((nu + 1) / 2) - loggamma(nu / 2) - 0.5 * log(nu * π) -
+        ((nu + 1) / 2) * log1p(z^2 / nu)
+    cdf(z::Float64)::Float64 = begin
+        half_tail::Float64 = 0.5 * first(beta_inc(nu / 2, 0.5, nu / (nu + z^2)))
+        ifelse(z <= 0, half_tail, 1 - half_tail)
+    end
+    quantile(p::Float64)::Float64 = begin
+        lower::Bool = p < 0.5
+        tail::Float64 = ifelse(lower, p, 1 - p)
+        beta_x::Float64 = first(beta_inc_inv(nu / 2, 0.5, 2 * tail, 1 - 2 * tail))
+        z_magnitude::Float64 = sqrt(nu * (1 - beta_x) / beta_x)
+        ifelse(lower, -z_magnitude, z_magnitude)
+    end
 end
 
 @kernel location_scale(standard, location::Float64, scale::Float64) = begin
@@ -71,6 +93,32 @@ end
 @kernel normal = location_scale(standard_normal)
 @kernel cauchy = location_scale(standard_cauchy)
 @kernel laplace = location_scale(standard_laplace)
+
+# `location_scale` binds a zero-parameter standard, so it cannot host the
+# df-carrying `standard_student_t`. `student_t` is therefore the explicit
+# location-scale wrapper: it reuses the shipped `standard_student_t` density via
+# `standard_student_t(nu).<endpoint>` (a df=1 special case is Cauchy). The
+# `scale`/`log_scale` dual HAVE route matches the `location_scale` families.
+@kernel student_t(nu::Float64, location::Float64, scale::Float64) = begin
+    log_scale::Float64 = log(scale)
+    scale::Float64 = exp(log_scale)
+
+    standardized(x::Float64)::Float64 = (x - location) / scale
+    inv(standardized, z::Float64)::Float64 = location + scale * z
+
+    logpdf(x::Float64)::Float64 = begin
+        z::Float64 = standardized(x)
+        standard_student_t(nu).logpdf(z) - log_scale
+    end
+    cdf(x::Float64)::Float64 = begin
+        z::Float64 = standardized(x)
+        standard_student_t(nu).cdf(z)
+    end
+    quantile(p::Float64)::Float64 = begin
+        z::Float64 = standard_student_t(nu).quantile(p)
+        inv(standardized, z)
+    end
+end
 """
 
 function _evaluate_source_bindings(source::AbstractString, names::Tuple)
@@ -88,16 +136,18 @@ end
 
 const _LOCATION_SCALE_BINDINGS = _evaluate_source_bindings(
     LOCATION_SCALE_SOURCE,
-    (:standard_normal, :standard_cauchy, :standard_laplace,
-     :location_scale, :normal, :cauchy, :laplace),
+    (:standard_normal, :standard_cauchy, :standard_laplace, :standard_student_t,
+     :location_scale, :normal, :cauchy, :laplace, :student_t),
 )
 const standard_normal = _LOCATION_SCALE_BINDINGS[1]
 const standard_cauchy = _LOCATION_SCALE_BINDINGS[2]
 const standard_laplace = _LOCATION_SCALE_BINDINGS[3]
-const location_scale = _LOCATION_SCALE_BINDINGS[4]
-const normal = _LOCATION_SCALE_BINDINGS[5]
-const cauchy = _LOCATION_SCALE_BINDINGS[6]
-const laplace = _LOCATION_SCALE_BINDINGS[7]
+const standard_student_t = _LOCATION_SCALE_BINDINGS[4]
+const location_scale = _LOCATION_SCALE_BINDINGS[5]
+const normal = _LOCATION_SCALE_BINDINGS[6]
+const cauchy = _LOCATION_SCALE_BINDINGS[7]
+const laplace = _LOCATION_SCALE_BINDINGS[8]
+const student_t = _LOCATION_SCALE_BINDINGS[9]
 
 # Compatibility names for existing consumers.  These are views of the shared
 # object graphs, not separately authored formulas.

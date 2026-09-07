@@ -6,6 +6,24 @@ using ReactiveKernelsPPLExamples.LinearRegressionExample:
     evaluate_linear_regression_source
 using ReactiveKernelsPPLExamples.ARMA11Example: evaluate_arma11_source
 using ReactiveKernelsPPLExamples.PoissonGammaExample: evaluate_poisson_gamma_source
+using ReactiveKernelsPPLExamples.GLMPoissonExample: evaluate_glm_poisson_source
+using ReactiveKernelsPPLExamples.GLMBinomialExample: evaluate_glm_binomial_source
+using ReactiveKernelsPPLExamples.EightSchoolsNoncenteredExample:
+    evaluate_eight_schools_noncentered_source
+using ReactiveKernelsPPLExamples.GLMMPoissonExample: evaluate_glmm_poisson_source
+using ReactiveKernelsPPLExamples.BLRExample: evaluate_blr_source
+using ReactiveKernelsPPLExamples.MesquiteExample: evaluate_mesquite_source
+using ReactiveKernelsPPLExamples.LogmesquiteExample: evaluate_logmesquite_source
+using ReactiveKernelsPPLExamples.LogmesquiteLogvolumeExample: evaluate_logmesquite_logvolume_source
+using ReactiveKernelsPPLExamples.KilpisjarviExample: evaluate_kilpisjarvi_source
+using ReactiveKernelsPPLExamples.EarnHeightExample: evaluate_earn_height_source
+using ReactiveKernelsPPLExamples.LogearnHeightExample: evaluate_logearn_height_source
+using ReactiveKernelsPPLExamples.Log10earnHeightExample: evaluate_log10earn_height_source
+using ReactiveKernelsPPLExamples.LogearnInteractionExample: evaluate_logearn_interaction_source
+using ReactiveKernelsPPLExamples.KidscoreMomhsExample: evaluate_kidscore_momhs_source
+using ReactiveKernelsPPLExamples.KidscoreMomiqExample: evaluate_kidscore_momiq_source
+using ReactiveKernelsPPLExamples.KidscoreMomhsiqExample: evaluate_kidscore_momhsiq_source
+using ReactiveKernelsPPLExamples.KidscoreInteractionExample: evaluate_kidscore_interaction_source
 using ReactiveKernelsPPLExamples.BetaBinomialExample: evaluate_beta_binomial_source
 using ReactiveKernelsPPLExamples.DugongsGrowthExample: evaluate_dugongs_source
 using ReactiveKernelsPPLExamples.GaussianMixtureExample: evaluate_gaussian_mixture_source
@@ -48,19 +66,107 @@ end
         a = evaluate_linear_regression_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
-    @testset "arma11 (native-only — sequential recursion is not XLA-lowerable)" begin
-        # The one-step error recursion reads err[t-1]/series[t-1] element by
-        # element; Reactant/XLA disallows scalar indexing of a traced array, so
-        # this authored model compiles and runs NATIVELY but its density does not
-        # lower through Reactant. This is an inherent property of the sequential
-        # scan (it would need an explicit scan/while-loop lowering), not a wrong
-        # authored shape — documented here as an explicit tested diagnostic rather
-        # than silently skipped. (Reported upstream: reactant-lane snag.)
+    @testset "arma11 (natural sequential recursion lowers via scan → stablehlo.while)" begin
+        # The likelihood/density reduce the NATURAL sequential `errors`, authored
+        # with the `scan` primitive, which lowers the one-step-ahead recurrence to
+        # a `stablehlo.while` carry loop (no per-step scalar indexing of a traced
+        # array) and reproduces native. `errors_closed` (a vectorized Toeplitz
+        # matvec) is kept as an independent numerical cross-check. This flips the
+        # former diagnostic (the raw `for`/`err[t-1]` recursion did NOT lower);
+        # see docs/src/arma11.md.
         a = evaluate_arma11_source()
-        @test_throws Exception _compile_run(a.kernel, Tuple(a.inputs))
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+
+        # The natural sequential `errors` now LOWERS through Reactant (was a
+        # tested `@test_throws` diagnostic before the scan primitive) and matches
+        # native.
+        seq_errors_kernel = prepare(a.model;
+            have = (:unconstrained, :series), want = :errors)
+        native_errors = seq_errors_kernel(a.inputs.q, a.inputs.series)
+        @test _rapprox(
+            _compile_run(seq_errors_kernel, Tuple(a.inputs)), native_errors)
+
+        # It lowers to a stablehlo.while carry loop rather than unrolling.
+        traced = map(_trace, Tuple(a.inputs))
+        hlo = repr(Reactant.@code_hlo optimize = false seq_errors_kernel(traced...))
+        @test occursin("stablehlo.while", hlo)
+
+        # Independent cross-check: the scan errors equal the vectorized closed form.
+        both_kernel = prepare(a.model;
+            have = (:unconstrained, :series), want = (:errors, :errors_closed))
+        e_scan, e_closed = both_kernel(a.inputs.q, a.inputs.series)
+        @test _rapprox(e_scan, e_closed)
     end
     @testset "poisson_gamma" begin
         a = evaluate_poisson_gamma_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "glm_poisson (posteriordb; bounded-uniform transforms + poisson-log)" begin
+        a = evaluate_glm_poisson_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "glm_binomial (posteriordb; binomial-logit GLM)" begin
+        a = evaluate_glm_binomial_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "eight_schools_noncentered (posteriordb; non-centered + half-cauchy)" begin
+        a = evaluate_eight_schools_noncentered_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "glmm_poisson (posteriordb; hierarchical Poisson-log + random effects)" begin
+        a = evaluate_glmm_poisson_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "blr (posteriordb; Bayesian linear regression, matvec)" begin
+        a = evaluate_blr_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "mesquite (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_mesquite_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "logmesquite (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_logmesquite_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "logmesquite_logvolume (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_logmesquite_logvolume_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "kilpisjarvi (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_kilpisjarvi_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "earn_height (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_earn_height_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "logearn_height (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_logearn_height_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "log10earn_height (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_log10earn_height_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "logearn_interaction (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_logearn_interaction_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "kidscore_momhs (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_kidscore_momhs_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "kidscore_momiq (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_kidscore_momiq_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "kidscore_momhsiq (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_kidscore_momhsiq_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "kidscore_interaction (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_kidscore_interaction_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
     @testset "beta_binomial" begin

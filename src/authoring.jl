@@ -1017,6 +1017,7 @@ function _kernel_return_names(ex)
 end
 
 const _KERNEL_RETURN_PORT = Symbol("__return__")
+const _KERNEL_PLATE_VALUE_PORT = Symbol("__plate_value__")
 
 # `return expr` is graph authoring, not an eager Julia return.  Normalize the
 # expression to one ordinary recipe feeding a stable distinguished port, then
@@ -1065,7 +1066,22 @@ function _kernel_implicit_plate_result_body(body)
         nothing
     end
     if assigned_name === nothing
-        statements[result_index] = Expr(:return, result)
+        # A bare final VALUE expression (e.g. a nested object-endpoint call after
+        # a cell-local) is the cell result. Route it through the distinguished
+        # __plate_value__ port, exactly as the single-expression sugar in
+        # `_kernel_expression_result_body` does, so the inferred boundary type is
+        # applied to the result port below. Without this a multi-statement cell
+        # returns through the untyped `__return__` port and a typed nested
+        # endpoint output cannot be aliased onto it. A bare final Symbol is
+        # already a named boundary and needs no synthetic port.
+        if result isa Symbol
+            statements[result_index] = Expr(:return, result)
+        else
+            statements[result_index] =
+                Expr(:(=), _KERNEL_PLATE_VALUE_PORT, result)
+            insert!(statements, result_index + 1,
+                    Expr(:return, _KERNEL_PLATE_VALUE_PORT))
+        end
     else
         insert!(statements, result_index + 1, Expr(:return, assigned_name))
     end
@@ -1076,7 +1092,8 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                                       nested_specs::Dict{Symbol,Any},
                                       local_types::Dict{Symbol,Any};
                                       context = "inside @kernel",
-                                      materialized = Tuple{Symbol,Any,Any}[])
+                                      materialized = Tuple{Symbol,Any,Any}[],
+                                      cell_locals::Set{Symbol} = Set{Symbol}())
     ex isa Expr || return ex, nothing
     ex.head in (:quote, :inert) && return ex, nothing
 
@@ -1156,10 +1173,6 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                 length(endpoint_actuals) == length(explicit) || throw(ArgumentError(
                     "endpoint :$endpoint_name expects $(length(explicit)) argument(s), " *
                     "got $(length(endpoint_actuals))"))
-                all(arg -> arg isa Symbol && arg in locals, endpoint_actuals) ||
-                    throw(ArgumentError(
-                        "constructed endpoint arguments $context must be named caller ports"))
-
                 # Owner bindings are graph inputs, but their source spelling need not
                 # already be a named caller port. Materialize literals and computed
                 # expressions as hygienic caller recipes, typed by the selected child
@@ -1173,14 +1186,21 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                     if actual isa Symbol && actual in locals
                         push!(owner_ports, actual)
                         continue
-                    elseif actual isa Symbol
+                    elseif actual isa Symbol && !(actual in cell_locals)
                         throw(ArgumentError(
                             "kernel object binding :$formal $context refers to undeclared " *
                             "caller port :$actual"))
                     end
+                    # A computed expression, or a plate cell-local name, binds
+                    # through a hygienic caller recipe typed by the selected child
+                    # boundary. Materializing a cell-local (rather than aliasing it
+                    # directly) lets an untyped local still bind a typed owner port
+                    # with no boundary type mismatch, matching how a top-level
+                    # @kernel body already exposes its assigned names as ports.
                     rewritten_actual, _ = _kernel_constructed_endpoint(
                         actual, mod, locals, nested_specs, local_types;
-                        context = context, materialized = materialized)
+                        context = context, materialized = materialized,
+                        cell_locals = cell_locals)
                     generated_port = gensym(Symbol(formal, :_binding))
                     generated_type = valtype(endpoint_inputs[index])
                     push!(materialized,
@@ -1189,7 +1209,37 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                     push!(owner_ports, generated_port)
                 end
 
-                actuals = Symbol[owner_ports...; endpoint_actuals...]
+                # Endpoint method arguments (the observed value in `.logpdf(x)`) are
+                # graph inputs too, and — exactly like the owner bindings above —
+                # their source spelling need not already be a named caller port.
+                # Materialize a literal or computed method argument such as
+                # `normal(location, scale).logpdf(log(w))` as a hygienic caller
+                # recipe, typed by the endpoint's explicit boundary, so it lowers
+                # identically to the constructor-argument case rather than being
+                # rejected. A bare name still must resolve to a declared caller port.
+                endpoint_ports = Symbol[]
+                for (index, actual) in enumerate(endpoint_actuals)
+                    if actual isa Symbol && actual in locals
+                        push!(endpoint_ports, actual)
+                        continue
+                    elseif actual isa Symbol
+                        throw(ArgumentError(
+                            "endpoint :$endpoint_name argument $context refers to " *
+                            "undeclared caller port :$actual"))
+                    end
+                    rewritten_actual, _ = _kernel_constructed_endpoint(
+                        actual, mod, locals, nested_specs, local_types;
+                        context = context, materialized = materialized)
+                    generated_port = gensym(Symbol(explicit[index], :_argument))
+                    generated_type = valtype(
+                        endpoint_inputs[length(owner_formals) + index])
+                    push!(materialized,
+                          (generated_port, generated_type, rewritten_actual))
+                    push!(locals, generated_port)
+                    push!(endpoint_ports, generated_port)
+                end
+
+                actuals = Symbol[owner_ports...; endpoint_ports...]
                 for (actual, formal) in zip(actuals, inputs(endpoint))
                     T = valtype(formal)
                     if haskey(local_types, actual) && local_types[actual] != T
@@ -1206,7 +1256,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                 nested_specs[generated] = KernelSpec(
                     endpoint.graph, endpoint.ports, endpoint.port_order,
                     endpoint.have_names, endpoint.want_names, retargeted)
-                return Expr(:call, generated, endpoint_actuals...),
+                return Expr(:call, generated, endpoint_ports...),
                        valtype(only(outputs(endpoint)))
             end
         end
@@ -1217,7 +1267,8 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
     for arg in ex.args
         child, child_type = _kernel_constructed_endpoint(
             arg, mod, locals, nested_specs, local_types;
-            context = context, materialized = materialized)
+            context = context, materialized = materialized,
+            cell_locals = cell_locals)
         # A constructed object endpoint lowers to a call whose head is a generated
         # `nested_specs` key. `_kernel_operation` splices such a call ONLY when it is
         # the WHOLE recipe RHS. A splice used as a SUB-EXPRESSION of a value-combining
@@ -1245,6 +1296,22 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
         nothing
     end
     Expr(ex.head, rewritten...), inferred
+end
+
+# The names a plate do-block assigns as cell-locals. Unlike a top-level @kernel
+# body — where every assigned name is an exposed graph port — a plate cell's
+# caller ports are only its do-block formals, so a nested object-endpoint owner
+# binding that references a cell-local (`object(; log_rate = ll).logpdf(c)` with
+# a cell-local `ll`) must be recognized here and materialized as a typed caller
+# recipe rather than rejected as an undeclared port.
+function _kernel_plate_cell_locals(body)
+    names = Set{Symbol}()
+    body isa Expr && body.head === :block || return names
+    for statement in body.args
+        statement isa Expr && statement.head === :(=) || continue
+        _kernel_assignment_names!(names, statement.args[1])
+    end
+    names
 end
 
 function _kernel_authored_plate_expr(rhs, mod)
@@ -1295,13 +1362,15 @@ function _kernel_authored_plate_expr(rhs, mod)
     nested_specs = Dict{Symbol,Any}()
     local_types = Dict{Symbol,Any}()
     materialized = Tuple{Symbol,Any,Any}[]
+    cell_locals = _kernel_plate_cell_locals(scalar_body)
     rewritten, inferred = _kernel_constructed_endpoint(
         scalar_body, mod, Set(formals), nested_specs, local_types;
-        context = "inside plate", materialized = materialized)
+        context = "inside plate", materialized = materialized,
+        cell_locals = cell_locals)
     signature = Tuple{Symbol,Any}[
         (name, get(local_types, name, GlobalRef(Core, :Any))) for name in formals]
     scalar_graph_body = _kernel_expression_result_body(
-        :__plate_value__, signature, rewritten, true)
+        _KERNEL_PLATE_VALUE_PORT, signature, rewritten, true)
     scalar_graph_body = _kernel_implicit_plate_result_body(scalar_graph_body)
     if !isempty(materialized)
         lifted = Any[
@@ -1319,11 +1388,11 @@ function _kernel_authored_plate_expr(rhs, mod)
        scalar_graph_body.head === :block
         assignment_index = findfirst(scalar_graph_body.args) do statement
             statement isa Expr && statement.head === :(=) &&
-                statement.args[1] === :__plate_value__
+                statement.args[1] === _KERNEL_PLATE_VALUE_PORT
         end
         assignment_index === nothing ||
             (scalar_graph_body.args[assignment_index].args[1] =
-                Expr(:(::), :__plate_value__, inferred))
+                Expr(:(::), _KERNEL_PLATE_VALUE_PORT, inferred))
     end
     scalar_spec = _kernel_expand(
         scalar_graph_body, signature, nothing, mod; nested_specs = nested_specs)
@@ -1337,6 +1406,134 @@ end
 function _kernel_authored_plate(spec::KernelSpec, ::Val{A}) where {A}
     kernel = prepare(spec)
     _AuthoredPlateOp{typeof(kernel),A}(kernel)
+end
+
+# `scan(xs, Ref(shared)...; init = c0) do carry, x, shared...  …; (new_carry, output)  end`
+# authors a bounded SEQUENTIAL recurrence.  Unlike `plate` (a pure per-element
+# broadcast map), `scan` threads a `carry` value: the do-block's FIRST formal is
+# the carry (seeded by `init`, never a positional argument), the SECOND is the
+# per-step element drawn from the single non-`Ref` positional `xs`, and any
+# further formals are `Ref`-wrapped shared/atomic operands (broadcast-invariant,
+# exactly like plate's atomic args).  The do-block returns the 2-tuple
+# `(new_carry, output)`; `scan` returns the vector `[output…]`.  The step is an
+# ordinary TWO-`want` KernelSpec (`want = (:new_carry, :output)`); the native
+# path runs the plain ordered loop (already Reactant-unsafe only via scalar
+# indexing, which the tensorized lowering avoids by emitting a `stablehlo.while`).
+function _kernel_authored_scan_expr(rhs, mod)
+    rhs isa Expr && rhs.head === :do && length(rhs.args) == 2 || return nothing
+    call, lambda = rhs.args
+    call isa Expr && call.head === :call && !isempty(call.args) || return nothing
+    _kernel_resolve_binding(mod, call.args[1]) === scan || return nothing
+    lambda isa Expr && lambda.head === :(->) && length(lambda.args) == 2 ||
+        throw(ArgumentError("scan do-block requires an ordinary argument list and body"))
+    formals_expr, scalar_body = lambda.args
+    formals = formals_expr isa Expr && formals_expr.head === :tuple &&
+              all(arg -> arg isa Symbol, formals_expr.args) ?
+              Symbol[formals_expr.args...] : throw(ArgumentError(
+                  "scan do-block arguments must be bare names: (carry, x, shared...)"))
+    length(formals) >= 2 || throw(ArgumentError(
+        "scan do-block needs at least (carry, x): the threaded carry and the per-step element"))
+    length(unique(formals)) == length(formals) || throw(ArgumentError(
+        "scan do-block argument names must be unique"))
+
+    # Split the call into positional operands and the required `init =` carry seed.
+    positional = Any[]
+    init_expr = nothing
+    for arg in call.args[2:end]
+        if arg isa Expr && arg.head === :parameters
+            for kw in arg.args
+                (kw isa Expr && kw.head === :kw && kw.args[1] === :init) ||
+                    throw(ArgumentError("scan accepts only an `init =` keyword"))
+                init_expr = kw.args[2]
+            end
+        elseif arg isa Expr && arg.head === :kw && arg.args[1] === :init
+            init_expr = arg.args[2]
+        else
+            push!(positional, arg)
+        end
+    end
+    init_expr === nothing && throw(ArgumentError("scan requires an `init =` carry seed"))
+    length(positional) == length(formals) - 1 || throw(ArgumentError(
+        "scan received $(length(positional)) positional argument(s), but its do-block has " *
+        "$(length(formals) - 1) non-carry parameter(s) (x, shared...)"))
+
+    # The scan op's outer arguments are (carry-seed, xs, shared...); the carry
+    # seed and every `Ref`-wrapped shared operand are atomic (broadcast-invariant),
+    # while the single bare positional is the iterated sequence.  Atomic indices
+    # are 1-based over the op's argument tuple, with the carry seed at index 1.
+    arguments = Symbol[]
+    atomic = Int[]
+    materialized_arguments = Tuple{Symbol,Any}[]
+    _push_operand!(value, is_atomic) = begin
+        name = if value isa Symbol
+            value
+        else
+            generated = gensym(:scan_argument)
+            push!(materialized_arguments, (generated, value))
+            generated
+        end
+        push!(arguments, name)
+        is_atomic && push!(atomic, length(arguments))
+        name
+    end
+    _is_ref(a) = a isa Expr && a.head === :call && length(a.args) == 2 &&
+                 _kernel_resolve_binding(mod, a.args[1]) === Ref
+    _push_operand!(init_expr, true)                     # index 1: the carry seed (atomic)
+    isempty(positional) && throw(ArgumentError(
+        "scan needs a sequence positional as its first argument"))
+    _is_ref(positional[1]) && throw(ArgumentError(
+        "scan's first positional must be the sequence to scan over, not Ref-wrapped"))
+    _push_operand!(positional[1], false)                # index 2: the iterated sequence xs
+    for shared in positional[2:end]                     # index 3+: shared (atomic)
+        _is_ref(shared) || throw(ArgumentError(
+            "scan operands after the sequence must be Ref(x) broadcast-invariant scalars"))
+        _push_operand!(shared.args[2], true)
+    end
+
+    # Build the step body's 2-want spec. Its HAVE boundary is the do-block formals
+    # (carry, x, shared...); an enclosing port used but not passed is out of scope
+    # (never auto-captured) — same rule as plate.
+    nested_specs = Dict{Symbol,Any}()
+    local_types = Dict{Symbol,Any}()
+    materialized = Tuple{Symbol,Any,Any}[]
+    rewritten, _ = _kernel_constructed_endpoint(
+        scalar_body, mod, Set(formals), nested_specs, local_types;
+        context = "inside scan", materialized = materialized)
+    signature = Tuple{Symbol,Any}[
+        (name, get(local_types, name, GlobalRef(Core, :Any))) for name in formals]
+    # The do-block ends with a 2-tuple `(new_carry, output)`.  `@kernel` return
+    # values must be PORT names, so bind the two components to synthetic result
+    # ports and return those, yielding a 2-`want` step spec.
+    stmts = rewritten isa Expr && rewritten.head === :block ?
+        filter(s -> !_kernel_is_line(s), rewritten.args) : Any[rewritten]
+    isempty(stmts) && throw(ArgumentError("scan do-block body is empty"))
+    result = last(stmts)
+    result isa Expr && result.head === :return && (result = result.args[1])
+    (result isa Expr && result.head === :tuple && length(result.args) == 2) ||
+        throw(ArgumentError(
+            "scan do-block must end with a 2-tuple `(new_carry, output)`"))
+    carry_expr, output_expr = result.args
+    step_stmts = Any[]
+    for (name, T, mrhs) in materialized
+        push!(step_stmts, Expr(:(=), Expr(:(::), name, T), mrhs))
+    end
+    append!(step_stmts, stmts[1:(end - 1)])
+    push!(step_stmts, Expr(:(=), :__scan_carry__, carry_expr))
+    push!(step_stmts, Expr(:(=), :__scan_output__, output_expr))
+    push!(step_stmts, Expr(:return, Expr(:tuple, :__scan_carry__, :__scan_output__)))
+    step_body = Expr(:block, step_stmts...)
+    step_spec = _kernel_expand(
+        step_body, signature, nothing, mod; nested_specs = nested_specs)
+    operation = Expr(:call, GlobalRef(@__MODULE__, :_kernel_authored_scan),
+                     step_spec,
+                     Expr(:call, GlobalRef(Base, :Val), QuoteNode(Tuple(atomic))))
+    (; arguments, operation, inferred = nothing, atomic = Tuple(atomic),
+       materialized_arguments)
+end
+
+function _kernel_authored_scan(spec::KernelSpec, ::Val{A}) where {A}
+    kernel = prepare(spec)
+    _AuthoredScanOp{typeof(kernel),A}(kernel)
 end
 
 # A dotted operator such as `.*` is broadcast *syntax*, not a bound function:
@@ -1357,10 +1554,13 @@ _tensorized_callee_replacement(callee::Symbol) =
     callee === :hcat ? :_tensorized_hcat :
     callee === :cat ? :_tensorized_cat :
     callee === :eachcol ? :_tensorized_eachcol :
-    callee === :getindex ? :_tensorized_getindex : nothing
+    callee === :getindex ? :_tensorized_getindex :
+    callee === :dot ? :_tensorized_dot : nothing
 _tensorized_callee_replacement(callee::GlobalRef) =
     callee.mod === Base && callee.name === :eachcol ? :_tensorized_eachcol :
     callee.mod === Base && callee.name === :getindex ? :_tensorized_getindex :
+    callee.name === :dot && nameof(callee.mod) === :LinearAlgebra ?
+        :_tensorized_dot :
     nothing
 _tensorized_callee_replacement(callee) = nothing
 
@@ -1725,9 +1925,11 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                 push!(outputs, (name, type_expr))
             end
             plate_expr = _kernel_authored_plate_expr(rhs, mod)
+            plate_expr === nothing &&
+                (plate_expr = _kernel_authored_scan_expr(rhs, mod))
             if plate_expr !== nothing
                 length(outputs) == 1 || throw(ArgumentError(
-                    "an authored plate produces exactly one named pointwise port"))
+                    "an authored plate/scan produces exactly one named output port"))
                 # A derived iterable is ordinary graph work outside the plate.
                 # Materialize it as a hygienic named recipe, then feed that port
                 # through the same broadcast/Ref boundary as explicit authoring.
@@ -2341,6 +2543,31 @@ execution and traceable by array compilers such as Reactant. See
 function plate(spec::KernelSpec; have, want, batched, reduce = :+)
     p = plan(spec; have = have, want = want)
     _prepare_batched(p; batched = batched, reduce = reduce)
+end
+
+"""
+    scan(xs, Ref(shared)...; init) do carry, x, shared...
+        …
+        (new_carry, output)
+    end
+
+Author a bounded SEQUENTIAL recurrence inside a `@kernel` / `@ppl` body. `xs` is
+the sequence to scan over (the sole non-`Ref` positional); `init` seeds the
+threaded `carry`; any `Ref(shared)` operands are broadcast-invariant scalars.
+The do-block receives `(carry, x, shared...)` and must end with the 2-tuple
+`(new_carry, output)`; `scan` returns the vector `[output…]`. A compound carry
+may be carried as a `NamedTuple` (`init = (; a, b)`, read `carry.a`).
+
+It lowers to an ordinary ordered loop natively, and to a `stablehlo.while` carry
+loop under Reactant — so a natural sequential recurrence lowers without unrolling
+into forbidden scalar indexing. This is `@kernel` authoring sugar recognized by
+the macro; it is not a callable runtime function outside a kernel body.
+"""
+function scan(args...; kwargs...)
+    throw(ArgumentError(
+        "`scan(...) do carry, x … end` is @kernel authoring sugar, recognized " *
+        "inside a @kernel/@ppl body; it is not a runtime function. Author it in a " *
+        "kernel body."))
 end
 
 inputs(spec::KernelSpec) = _kernel_selection(

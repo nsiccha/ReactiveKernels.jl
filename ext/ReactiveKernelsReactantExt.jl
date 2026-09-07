@@ -597,6 +597,36 @@ for RHS in (AbstractVector, AbstractMatrix)
     end
 end
 
+# Reactant's BatchedCholesky (unlike its BatchedSVD) defines no `getproperty`, so a
+# naturally authored `C.L` / `C.U` throws `type BatchedCholesky has no field L`
+# under `@compile`.  Fill that gap in RK's ext (RK-macro-only per decision
+# `17bnc6t` — normalize the factor accessor here, Reactant untouched), mirroring
+# Julia's `LinearAlgebra.Cholesky` `getproperty` semantics and respecting `uplo`.
+# The real fields (`:factors`/`:uplo`/`:info`) fall through to `getfield`, so RK's
+# own accesses and Reactant's internal use are unchanged.  A batched (ndims>2)
+# factor or an unexpected `uplo` is a LOUD error, never a silent mis-lower.
+function Base.getproperty(F::_RKBatchedCholesky, name::Symbol)
+    if name === :U || name === :L || name === :UL
+        factors = getfield(F, :factors)
+        uplo = getfield(F, :uplo)
+        (uplo === 'U' || uplo === 'L') || throw(ArgumentError(
+            "BatchedCholesky.$name: unexpected uplo=$(repr(uplo)); expected 'U' or 'L'."))
+        ndims(factors) == 2 || throw(ArgumentError(
+            "BatchedCholesky.$name: factor access is not lowerable for a batched " *
+            "factor (ndims(factors)=$(ndims(factors))); only a single 2-D " *
+            "factorization is supported — index a single batch element first."))
+        if name === :U
+            return LinearAlgebra.UpperTriangular(uplo === 'U' ? factors : copy(factors'))
+        elseif name === :L
+            return LinearAlgebra.LowerTriangular(uplo === 'L' ? factors : copy(factors'))
+        else # :UL
+            return uplo === 'U' ? LinearAlgebra.UpperTriangular(factors) :
+                                  LinearAlgebra.LowerTriangular(factors)
+        end
+    end
+    return getfield(F, name)
+end
+
 # A Cholesky supplied as compiled state carries source-static `info` metadata,
 # while a Cholesky computed inside a compiled call carries Reactant's traced
 # success flag.  Preserve the former, but let Reactant concretize the latter
@@ -799,6 +829,24 @@ end
     Reactant.@allowscalar array[index[]]
 end
 
+# A CONCRETE-integer scalar index `q[i]` on a traced vector cannot lower:
+# `getindex(::TracedRArray, ::Int)` hits Reactant's scalar-indexing ban (the
+# unrolled/authored scalar read the arma11 snag documented).  When it feeds
+# arithmetic/a reduction — the parameter-access case — normalize it in the
+# `@kernel` tensorized lowering to the value-identical 1-element reduction
+# `sum(view(v, i:i))`, which lowers cleanly (this is exactly the friendly form
+# the Reactant benchmark authored by hand).  RK-macro-only per decision
+# `17bnc6t`; Reactant untouched.  This is value-exact for a real vector, so it
+# never silently mis-lowers; a genuine scalar readback that must drive control
+# flow (or index another array) then surfaces as Reactant's own loud traced
+# error on the returned `TracedRNumber`, never a silent paper-over.  Scoped to a
+# 1-D traced vector with a single concrete integer index; every other shape
+# keeps the core fallback.
+@inline function ReactiveKernels._tensorized_getindex(
+        array::Reactant.TracedRArray{T,1}, index::Integer) where {T}
+    sum(view(array, index:index))
+end
+
 @inline function ReactiveKernels._tensorized_getindex(
         array::SubArray{T,N,P}, indices...) where
         {T,N,P<:Reactant.TracedRArray}
@@ -818,6 +866,63 @@ end
         array::Array, value::Reactant.TracedRNumber, indices...)
     traced = Reactant.promote_to(Reactant.TracedRArray, array)
     ReactiveKernels._tensorized_setindex(traced, value, indices...)
+end
+
+# A traced array/scalar's `eltype` is the traced number wrapper
+# (`TracedRArray{Float64}` -> `TracedRNumber{Float64}`), so the core
+# `eltype <: Real` default cannot see the underlying real/complex kind.  Read the
+# wrapped scalar type parameter directly so the dot normalization classifies
+# traced real operands correctly (and still LOUD-errors genuine complex ones).
+@inline ReactiveKernels._tensorized_real_operand(
+    ::Reactant.TracedRArray{T}) where {T} = T <: Real
+@inline ReactiveKernels._tensorized_real_operand(
+    ::Reactant.TracedRNumber{T}) where {T} = T <: Real
+
+# ONLY the mixed host-array × traced `dot` fails to lower (conj on the host
+# vector); normalize exactly that mix to `sum(a .* b)`.  A pure-traced
+# `dot(q, q)` keeps the core default (native `LinearAlgebra.dot`, replica-aware),
+# so existing Reactant kernels are unaffected.
+@inline ReactiveKernels._tensorized_dot(
+        a::Array, b::Reactant.TracedRArray) =
+    ReactiveKernels._tensorized_normalized_dot(a, b)
+@inline ReactiveKernels._tensorized_dot(
+        a::Reactant.TracedRArray, b::Array) =
+    ReactiveKernels._tensorized_normalized_dot(a, b)
+
+# A traced `scan` lowers its sequential recurrence to a `stablehlo.while` carry
+# loop instead of unrolling into per-step scalar indexing.  `step` is the
+# prepared two-`want` step kernel `(carry, x, shared...) -> (new_carry, output)`.
+# The threaded `carry` is an ordinary loop-carried variable — reassigned each
+# iteration, exactly like the transpiler's `state` (`transpiled_program.jl:17`) —
+# so a compound carry rides through as a loop-carried `NamedTuple`.  The per-step
+# outputs are written into a preallocated traced buffer with an in-place
+# `buffer[i] = …` dynamic-update-slice, the same idiom the range-draw probe uses
+# under `@trace for` (`range_draw_probe.jl:17`).  The first step runs eagerly to
+# seed the carry and fix the output element type; the `@trace for` then runs the
+# remaining steps as one `stablehlo.while`.  RK-macro-only per decision
+# `17bnc6t`; Reactant untouched.  A non-scalar per-step output is a loud,
+# reported limitation, never a silent mis-lowering.
+@inline _scan_output_buffer(::Reactant.TracedRNumber{T}, n::Integer) where {T} =
+    Reactant.promote_to(Reactant.TracedRArray, zeros(T, n))
+_scan_output_buffer(out, ::Integer) = throw(ArgumentError(
+    "the Reactant scan lowering supports a scalar per-step output; got a " *
+    "$(typeof(out)). Author the per-step output as a scalar, or report this " *
+    "shape as an unimplemented scan lowering."))
+
+function ReactiveKernels._tensorized_scan(
+        step, xs::Reactant.TracedRArray{<:Any,1}, init, shared...)
+    n = length(xs)
+    n == 0 && throw(ArgumentError("scan requires a non-empty sequence"))
+    x1 = Reactant.@allowscalar xs[1]
+    carry, out1 = step(init, x1, shared...)
+    buffer = _scan_output_buffer(out1, n)
+    Reactant.@allowscalar buffer[1] = out1
+    Reactant.@trace for i in 2:n
+        x = Reactant.@allowscalar xs[i]
+        carry, out = step(carry, x, shared...)
+        Reactant.@allowscalar buffer[i] = out
+    end
+    buffer
 end
 
 # Batched slice-collection plates preserve eachcol structurally in the core.
