@@ -28,6 +28,12 @@ include("log10earn_height.jl")
 include("logearn_interaction.jl")
 include("ark.jl")
 include("mh.jl")
+include("nes_logit.jl")
+include("wells_dist.jl")
+include("wells_dist100_model.jl")
+include("dogs_log.jl")
+include("nes.jl")
+include("kidscore_mom_work.jl")
 include("dugongs_growth.jl")
 include("arma11.jl")
 include("gaussian_mixture.jl")
@@ -76,6 +82,12 @@ export Log10earnHeightExample
 export LogearnInteractionExample
 export ARKExample
 export MhExample
+export NesLogitExample
+export WellsDistExample
+export WellsDist100Example
+export DogsLogExample
+export NESExample
+export KidscoreMomWorkExample
 export DugongsGrowthExample
 export ARMA11Example
 export GaussianMixtureExample

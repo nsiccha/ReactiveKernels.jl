@@ -6,6 +6,7 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     GLMPoissonExample, GLMBinomialExample, EightSchoolsNoncenteredExample,
     GLMMPoissonExample, BLRExample,
     MesquiteExample, LogmesquiteExample, LogmesquiteLogvolumeExample, KilpisjarviExample, EarnHeightExample, LogearnHeightExample, Log10earnHeightExample, LogearnInteractionExample, ARKExample, MhExample,
+    NesLogitExample, WellsDistExample, WellsDist100Example, DogsLogExample, NESExample, KidscoreMomWorkExample,
     KidscoreMomhsExample, KidscoreMomiqExample, KidscoreMomhsiqExample, KidscoreInteractionExample,
     DugongsGrowthExample, ARMA11Example, GaussianMixtureExample,
     MNISTLogisticExample, MVNormalRegressionExample, BoundRegressionExample
@@ -33,6 +34,12 @@ include("test_log10earn_height_example.jl")
 include("test_logearn_interaction_example.jl")
 include("test_ark_example.jl")
 include("test_mh_example.jl")
+include("test_nes_logit_example.jl")
+include("test_wells_dist_example.jl")
+include("test_wells_dist100_example.jl")
+include("test_dogs_log_example.jl")
+include("test_nes_example.jl")
+include("test_kidscore_mom_work_example.jl")
 include("test_kidscore_momhs_example.jl")
 include("test_kidscore_momiq_example.jl")
 include("test_kidscore_momhsiq_example.jl")

@@ -22,6 +22,12 @@ using ReactiveKernelsPPLExamples.Log10earnHeightExample: evaluate_log10earn_heig
 using ReactiveKernelsPPLExamples.LogearnInteractionExample: evaluate_logearn_interaction_source
 using ReactiveKernelsPPLExamples.ARKExample: evaluate_ark_source
 using ReactiveKernelsPPLExamples.MhExample: evaluate_mh_source
+using ReactiveKernelsPPLExamples.NesLogitExample: evaluate_nes_logit_source
+using ReactiveKernelsPPLExamples.WellsDistExample: evaluate_wells_dist_source
+using ReactiveKernelsPPLExamples.WellsDist100Example: evaluate_wells_dist100_source
+using ReactiveKernelsPPLExamples.DogsLogExample: evaluate_dogs_log_source
+using ReactiveKernelsPPLExamples.NESExample: evaluate_nes_source
+using ReactiveKernelsPPLExamples.KidscoreMomWorkExample: evaluate_kidscore_mom_work_source
 using ReactiveKernelsPPLExamples.KidscoreMomhsExample: evaluate_kidscore_momhs_source
 using ReactiveKernelsPPLExamples.KidscoreMomiqExample: evaluate_kidscore_momiq_source
 using ReactiveKernelsPPLExamples.KidscoreMomhsiqExample: evaluate_kidscore_momhsiq_source
@@ -144,6 +150,30 @@ end
     end
     @testset "Mh (posteriordb; capture-recapture log_sum_exp, data-mask)" begin
         a = evaluate_mh_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "nes_logit (posteriordb)" begin
+        a = evaluate_nes_logit_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "wells_dist (posteriordb)" begin
+        a = evaluate_wells_dist_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "wells_dist100_model (posteriordb)" begin
+        a = evaluate_wells_dist100_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "dogs_log (posteriordb)" begin
+        a = evaluate_dogs_log_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "nes (posteriordb)" begin
+        a = evaluate_nes_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "kidscore_mom_work (posteriordb)" begin
+        a = evaluate_kidscore_mom_work_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
     @testset "kidscore_momhs (posteriordb; Gaussian linear regression)" begin
