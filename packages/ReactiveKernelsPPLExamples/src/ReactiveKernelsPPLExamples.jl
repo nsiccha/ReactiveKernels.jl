@@ -9,6 +9,23 @@ include("sum_to_zero.jl")
 include("linear_regression.jl")
 include("beta_binomial.jl")
 include("poisson_gamma.jl")
+include("glm_poisson.jl")
+include("glm_binomial.jl")
+include("eight_schools_noncentered.jl")
+include("glmm_poisson.jl")
+include("kidscore_momhs.jl")
+include("kidscore_momiq.jl")
+include("kidscore_momhsiq.jl")
+include("kidscore_interaction.jl")
+include("blr.jl")
+include("mesquite.jl")
+include("logmesquite.jl")
+include("logmesquite_logvolume.jl")
+include("kilpisjarvi.jl")
+include("earn_height.jl")
+include("logearn_height.jl")
+include("log10earn_height.jl")
+include("logearn_interaction.jl")
 include("dugongs_growth.jl")
 include("arma11.jl")
 include("gaussian_mixture.jl")
@@ -33,11 +50,35 @@ include("ppl_macro.jl")
 # rk core. See the `PPLGibbs` module docstring.
 include("ppl_gibbs.jl")
 
+# EXPERIMENTAL, NOT REVIEWED / NOT APPROVED — do NOT build on this. An importable
+# builder for the `@ppl`-authored eight-schools model, so the posteriordb
+# benchmark 4th side can consume it without copying test-local code. Depends on
+# `PPLMacro` above, so it is included after it. Deliberately NOT exported; reach
+# it via `ReactiveKernelsPPLExamples.PPLEightSchoolsExample`.
+include("ppl_eight_schools.jl")
+
 export EightSchoolsExample
 export SumToZeroExample
 export LinearRegressionExample
 export BetaBinomialExample
 export PoissonGammaExample
+export GLMPoissonExample
+export GLMBinomialExample
+export EightSchoolsNoncenteredExample
+export GLMMPoissonExample
+export KidscoreMomhsExample
+export KidscoreMomiqExample
+export KidscoreMomhsiqExample
+export KidscoreInteractionExample
+export BLRExample
+export MesquiteExample
+export LogmesquiteExample
+export LogmesquiteLogvolumeExample
+export KilpisjarviExample
+export EarnHeightExample
+export LogearnHeightExample
+export Log10earnHeightExample
+export LogearnInteractionExample
 export DugongsGrowthExample
 export ARMA11Example
 export GaussianMixtureExample

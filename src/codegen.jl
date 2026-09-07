@@ -150,6 +150,31 @@ function (op::_AuthoredPlateOp{K,A})(args...) where {K,A}
     result
 end
 
+# A first-class authored SEQUENTIAL scan.  Unlike `plate` (a pure broadcast map),
+# it threads a carry through an ordered loop; its scalar step is a 2-`want` kernel
+# `(carry, x, shared...) -> (new_carry, output)`.  The op is opaque to the lowerer
+# (not inlined): the emitted `__ops__[k](args...)` call runs the loop via
+# `_tensorized_scan`, which a tracing backend specializes to a `stablehlo.while`.
+# The op's argument order is fixed by authoring: index 1 = carry seed, index 2 =
+# the sequence `xs`, index 3+ = Ref-shared operands; `A` records the atomic
+# (broadcast-invariant) indices {1, 3, 4, …}.
+struct _AuthoredScanOp{K,A}
+    kernel::K
+end
+
+"The transparent scalar step plan captured by an authored `scan(...) do` recipe."
+function scan_body(recipe::Recipe)
+    recipe.op isa _AuthoredScanOp || throw(ArgumentError(
+        "recipe $(recipe.id) is not an authored scan"))
+    recipe.op.kernel.plan
+end
+
+function (op::_AuthoredScanOp{K,A})(args...) where {K,A}
+    length(args) >= 2 || throw(ArgumentError(
+        "an authored scan expects (init, xs, shared...) arguments"))
+    _tensorized_scan(op.kernel, args[2], args[1], args[3:end]...)
+end
+
 function _lhs_symbols!(symbols::Set{Symbol}, lhs)
     lhs isa Symbol && return push!(symbols, lhs)
     lhs isa Expr || return symbols
@@ -1591,6 +1616,7 @@ catch
     string(op)
 end
 _opname(::_AuthoredPlateOp) = "plate"
+_opname(::_AuthoredScanOp) = "scan"
 
 function _readable_callee(op)
     name = try
