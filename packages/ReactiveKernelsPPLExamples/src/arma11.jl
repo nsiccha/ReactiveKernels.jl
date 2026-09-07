@@ -123,28 +123,28 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
 
     constrained_logdensity::Float64 = prior + likelihood
     unconstrained_prior::Float64 = prior + log_jacobian
-    density::Float64 = constrained_logdensity + log_jacobian
+    posterior::Float64 = constrained_logdensity + log_jacobian
 
     # Deterministic one-step-ahead point forecast ν_{T+1} = μ + φ·y_T + θ·err_T,
     # read off the constrained parameters and the last recursion error.
     forecast::Float64 =
         parameters.μ + parameters.φ * series[end] + parameters.θ * errors[end]
 
-    return density
+    return posterior
 end
 
 q = [0.0, 0.9, -0.2, log(0.15)]
 series = ARMA_SERIES
 
-requested_nodes = (:prior, :log_jacobian, :pointwise, :likelihood, :density)
+requested_nodes = (:prior, :log_jacobian, :pointwise, :likelihood, :posterior)
 density_kernel = prepare(model;
     have = (:unconstrained, :series),
     want = requested_nodes)
 
 output = density_kernel(q, series)
-prior, logjac, pointwise, likelihood, density = output
+prior, logjac, pointwise, likelihood, posterior = output
 @assert likelihood ≈ sum(pointwise)
-@assert density ≈ prior + logjac + likelihood
+@assert posterior ≈ prior + logjac + likelihood
 
 docs_example = (;
     name = :arma11_density,
@@ -212,14 +212,14 @@ function demo()
     println("\nFull unconstrained-space log density:")
     density_plan = plan(model;
                         have = (:unconstrained, :series),
-                        want = (:prior, :log_jacobian, :likelihood, :density,
+                        want = (:prior, :log_jacobian, :likelihood, :posterior,
                                 :forecast))
     println(explain(density_plan))
-    prior, log_jacobian, likelihood, density, forecast =
+    prior, log_jacobian, likelihood, posterior, forecast =
         prepare(density_plan)(q, ARMA_SERIES)
     println("log prior + log Jacobian + log likelihood")
     println("= ", prior, " + ", log_jacobian, " + ", likelihood)
-    println("= log density = ", density)
+    println("= log density = ", posterior)
     println("one-step-ahead forecast for y[T+1] = ", forecast)
 
     nothing

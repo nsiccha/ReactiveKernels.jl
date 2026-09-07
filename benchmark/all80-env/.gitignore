@@ -1,0 +1,5 @@
+# The upstream Turing benchmark files (posteriordb.jl / posteriordb_models.jl) are
+# FETCHED + digest-verified at run time from the pinned DynamicPPL SHA by
+# all80_posteriordb.jl — they are a consumed upstream input, never vendored here.
+# Project.toml + Manifest.toml ARE committed (they pin the reproducible env).
+upstream/
