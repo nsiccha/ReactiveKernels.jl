@@ -49,6 +49,10 @@ include("seeds.jl")
 include("pilots.jl")
 include("lsat.jl")
 include("surgical.jl")
+include("wells_dae_model.jl")
+include("wells_dae_c_model.jl")
+include("wells_interaction_model.jl")
+include("wells_daae_c_model.jl")
 include("dugongs_growth.jl")
 include("arma11.jl")
 include("gaussian_mixture.jl")
@@ -118,6 +122,10 @@ export SeedsExample
 export PilotsExample
 export LsatExample
 export SurgicalExample
+export WellsDaeExample
+export WellsDaeCExample
+export WellsInteractionExample
+export WellsDaaeCExample
 export DugongsGrowthExample
 export ARMA11Example
 export GaussianMixtureExample
