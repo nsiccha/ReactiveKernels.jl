@@ -30,8 +30,13 @@ end
     combined_axes = Base.Broadcast.combine_axes(wrapped...)
     isempty(combined_axes) && throw(ArgumentError(
         "an authored plate requires at least one non-Ref batched argument"))
-    output = only(ReactiveKernels.outputs(op.kernel))
-    output_type = ReactiveKernels.valtype(output)
+    # Materialize into the cache's own element type. The cache slot is typed by
+    # `_authored_plate_result_eltype` at preparation (a concrete element type for
+    # an inferable body, `Any` only when genuinely uninferrable), so this trusts
+    # that inferred type instead of the plan-level `valtype(output)`, which is
+    # `Any` for any unannotated plate body and would box a `Vector{Any}` and
+    # disagree bit-for-bit with the ordinary native lowering's typed buffer.
+    output_type = eltype(cache)
     result = if cache isa Array{output_type}
         _authored_plate_array_cache(cache, combined_axes)
     elseif Base.axes(cache) == combined_axes && eltype(cache) == output_type

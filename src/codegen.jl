@@ -123,6 +123,30 @@ function _narrow_plate_output(x::AbstractArray, ::Type{Any})
     result
 end
 
+# Concrete element type of an authored plate's pointwise result, inferred from
+# the scalar body kernel over the per-coordinate argument types. Each argument is
+# projected to what the scalar body actually receives per coordinate: an
+# atomic/`Ref` or `Number` argument whole, an axis argument by its `eltype`.
+# `Base.promote_op` over the whole (nested) plate body kernel narrows to that
+# concrete type at ordinary call sites; only inside a RuntimeGeneratedFunction
+# does it fail to const-fold, so the generated native lowering derives the same
+# type through the individual recipe ops instead. This types the pointwise buffer
+# and total accumulator UP FRONT — no boxed `Vector{Any}` is ever built and the
+# accumulator seed matches the summed cells (`_narrow_plate_output` above is a
+# post-hoc narrowing that still allocates the boxed container first and leaves the
+# accumulator untyped). A genuinely uninferrable body falls back to the
+# plan-level output valtype (`Any`), where `_narrow_plate_output` still recovers a
+# homogeneous element type at runtime.
+function _authored_plate_result_eltype(op::_AuthoredPlateOp{K,A},
+                                       argtypes) where {K,A}
+    element_types = ntuple(length(argtypes)) do position
+        argtype = argtypes[position]
+        (position in A || argtype <: Number) ? argtype : eltype(argtype)
+    end
+    T = Base.promote_op(op.kernel, element_types...)
+    T === Union{} ? valtype(only(outputs(op.kernel))) : T
+end
+
 # A plate is a pure graph map/reduction. Once Julia has instantiated the
 # broadcast axes, a recipe only needs to run again when a dimension kept by
 # one of its transitive HAVE roots changes in Cartesian iteration order. The
@@ -164,15 +188,19 @@ end
 function (op::_AuthoredPlateOp{K,A})(args...) where {K,A}
     batch = _authored_plate_broadcast(Val(A), args...)
     marker = _authored_plate_marker(Val(A), args...)
-    output = only(outputs(op.kernel))
-    result = similar(marker, valtype(output), axes(batch))
+    # Type the buffer up front from the inferred pointwise element type, so a
+    # homogeneous untyped cell fills a `Vector{Float64}` directly instead of a
+    # boxed `Vector{Any}`.
+    result = similar(marker, _authored_plate_result_eltype(op, map(typeof, args)),
+                     axes(batch))
     for index in eachindex(batch)
         scalar_args = batch[index]
         result[index] = op.kernel(scalar_args...)
     end
-    # An untyped cell (`valtype(output) === Any`) fills a boxed `Vector{Any}`;
-    # narrow it to the concrete element type so it stays promotable at the
-    # Reactant host-operand boundary. No-op for a typed cell.
+    # Fallback runtime narrowing when the element type was genuinely
+    # uninferrable (`valtype(output) === Any` and `promote_op` could not narrow):
+    # a no-op for the typed buffer above, recovering a homogeneous element type
+    # otherwise so the result stays promotable at the Reactant host boundary.
     _narrow_plate_output(result)
 end
 
@@ -413,8 +441,22 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
         "an authored plate body must lower to one operation per transparent scalar recipe"))
 
     atomic = typeof(op).parameters[2]
-    output_type = valtype(only(inner.want))
-    needs_marker = pointwise_lhs !== nothing || output_type === Any
+    # The distinguished result's element type governs both the materialized
+    # pointwise buffer and the total accumulator seed. The plan-level `valtype`
+    # is `Any` whenever the plate body's scalar result carries no explicit
+    # annotation (a bare arithmetic cell, an unannotated `plate(x) do e; f(e) end`);
+    # baking that literal `Any` into `similar`/`zero` allocates a boxed
+    # `Vector{Any}` and seeds the accumulator with a type that disagrees with the
+    # summed cells, both of which defeat scalar replacement and reverse-mode AD (a
+    # `Vector{Int}` axis then seeds `zero(eltype(marker)) = zero(Int)` against
+    # `Float64` cells, producing a `Union` accumulator Enzyme rejects). Recover the
+    # concrete element type by inferring the scalar body kernel over the actual
+    # per-coordinate argument types (`plate_eltype`, bound below), deferring to the
+    # runtime `eltype(marker)` seed only when the body is genuinely uninferrable.
+    # (`_narrow_plate_output` after the loop still recovers a homogeneous element
+    # type at runtime in that residual `Any` case.)
+    plate_eltype = gensym(:plate_eltype)
+    needs_marker = pointwise_lhs !== nothing || total_lhs !== nothing
     marker = gensym(:plate_axis)
     index = gensym(:plate_index)
     previous = gensym(:plate_previous)
@@ -473,6 +515,38 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
     op_offset = length(runtime_ops)
     append!(runtime_ops, inner_kernel.ops)
     append!(runtime_recipes, inner_kernel.lowered_recipes)
+    # Bind the concrete pointwise element type by propagating inferred types
+    # through the plate body's scalar recipe DAG. Each individual `__ops__`
+    # recipe op is an ordinary callable (a `_KernelSourceOp`, not the opaque
+    # nested `PreparedKernel`), so `Base.promote_op` over it const-folds inside
+    # the generated function from the actual per-coordinate argument types Julia
+    # infers here — the `Vector{Int}`-axis element / atomic scalar types — rather
+    # than the plan-level `Any`. Seeding `promote_op` over the whole plate body
+    # kernel instead does NOT fold (nested-RGF inference is opaque) and would
+    # inject a runtime inference call. This is a compile-time expression, so it
+    # also covers an empty axis with no representative element. A genuinely
+    # uninferrable recipe yields `Any`, reproducing the previous `Vector{Any}` /
+    # `_authored_plate_zero(Any, marker)` behavior (then narrowed at runtime by
+    # `_narrow_plate_output`) rather than regressing.
+    plate_type_exprs = Dict{Int,Any}()
+    for (position, input) in enumerate(inner.have)
+        cid = canon_id(inner.graph, input.id)
+        plate_type_exprs[cid] =
+            (position in atomic || valtype(callvalues[position]) <: Number) ?
+                Expr(:call, GlobalRef(Base, :typeof), callargs[position]) :
+                Expr(:call, GlobalRef(Base, :eltype), raw_arguments[position])
+    end
+    for (recipe_index, recipe) in enumerate(inner.recipes)
+        input_type_exprs = Any[
+            get(plate_type_exprs, canon_id(inner.graph, input.id),
+                GlobalRef(Core, :Any)) for input in recipe.inputs]
+        output_cid = canon_id(inner.graph, only(recipe.outputs).id)
+        plate_type_exprs[output_cid] = Expr(:call, GlobalRef(Base, :promote_op),
+            Expr(:ref, _OPS_ARG, op_offset + recipe_index), input_type_exprs...)
+    end
+    push!(body.args, Expr(:(=), plate_eltype,
+        get(plate_type_exprs, canon_id(inner.graph, only(inner.want).id),
+            GlobalRef(Core, :Any))))
     groups = _authored_plate_recipe_groups(
         inner, dependencies, root_positions, atomic, callvalues)
     has_scheduled_groups = any(groups) do (roots, _)
@@ -509,15 +583,17 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
 
     if pointwise_lhs !== nothing
         push!(body.args,
-            :($pointwise_lhs = similar($marker, $output_type, $output_axes)))
+            :($pointwise_lhs = similar($marker, $plate_eltype, $output_axes)))
     end
     accumulator = total_lhs === nothing ? nothing : gensym(:plate_total)
     if accumulator !== nothing
-        initial = output_type === Any ?
+        # `_authored_plate_zero(::Type{T}, marker) = zero(T)` for the inferred
+        # concrete `T`, and falls back to `zero(eltype(marker))` only when
+        # inference yielded `Any` — never a `zero(Int)` seed against `Float64`
+        # cells.
+        push!(body.args, Expr(:(=), accumulator,
             Expr(:call, GlobalRef(@__MODULE__, :_authored_plate_zero),
-                 output_type, marker) :
-            Expr(:call, GlobalRef(Base, :zero), output_type)
-        push!(body.args, Expr(:(=), accumulator, initial))
+                 plate_eltype, marker)))
     end
 
     loopbody = Expr(:block)
@@ -570,12 +646,15 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
         push!(body.args, :($first_coordinate = true))
     end
     push!(body.args, Expr(:for, Expr(:(=), index, iteration), loopbody))
-    # A materialized untyped cell fills a boxed `Vector{Any}` container
-    # (`output_type === Any`); narrow it to its concrete element type after the
-    # loop so a transformed-data plate over bound data stays promotable at the
-    # Reactant host-operand boundary. The total accumulator is already typed via
+    # Fallback runtime narrowing of the pointwise container. `plate_eltype`
+    # already types the buffer up front, so for an inferable body this is a
+    # compile-time no-op (`_narrow_plate_output` dispatches on `eltype`); it only
+    # does work in the residual case where inference yielded `Any` and the buffer
+    # is a boxed `Vector{Any}`, recovering a homogeneous element type so a
+    # transformed-data plate over bound data stays promotable at the Reactant
+    # host-operand boundary. The total accumulator is already typed via
     # `_authored_plate_zero`, so this touches only the pointwise materialization.
-    if pointwise_lhs !== nothing && output_type === Any
+    if pointwise_lhs !== nothing
         push!(body.args, :($pointwise_lhs =
             $(GlobalRef(@__MODULE__, :_narrow_plate_output))($pointwise_lhs)))
     end
@@ -1687,6 +1766,16 @@ end
 
 function _readable_expr(node, recipes)
     node isa Expr || return node
+
+    # A BARE operation slot — `__ops__[k]` passed as a value rather than invoked
+    # — renders as its readable operation name, not the raw index. The authored
+    # plate lowering does this when it seeds the pointwise element type with
+    # `Base.promote_op(__ops__[k], …)`; without this branch the reference would
+    # survive the readable rewrite as `__ops__[\d+]`.
+    let slot = _operation_slot(node)
+        slot !== nothing && 1 <= slot <= length(recipes) &&
+            return _readable_callee(recipes[slot].op)
+    end
 
     # Ordinary lowered kernels and pure reactive getters invoke an operation
     # slot directly. In-place variants wrap the same slot in cache plumbing;
