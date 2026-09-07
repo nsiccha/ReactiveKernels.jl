@@ -39,6 +39,10 @@ include("radon_pooled.jl")
 include("radon_partially_pooled_centered.jl")
 include("radon_partially_pooled_noncentered.jl")
 include("radon_variable_intercept_centered.jl")
+include("rate_2.jl")
+include("rate_3.jl")
+include("rate_4.jl")
+include("rate_5.jl")
 include("dugongs_growth.jl")
 include("arma11.jl")
 include("gaussian_mixture.jl")
@@ -98,6 +102,10 @@ export RadonPooledExample
 export RadonPartiallyPooledCenteredExample
 export RadonPartiallyPooledNoncenteredExample
 export RadonVariableInterceptCenteredExample
+export Rate2Example
+export Rate3Example
+export Rate4Example
+export Rate5Example
 export DugongsGrowthExample
 export ARMA11Example
 export GaussianMixtureExample

@@ -8,6 +8,7 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     MesquiteExample, LogmesquiteExample, LogmesquiteLogvolumeExample, KilpisjarviExample, EarnHeightExample, LogearnHeightExample, Log10earnHeightExample, LogearnInteractionExample, ARKExample, MhExample,
     NesLogitExample, WellsDistExample, WellsDist100Example, DogsLogExample, NESExample, KidscoreMomWorkExample, Rate1Example,
     RadonPooledExample, RadonPartiallyPooledCenteredExample, RadonPartiallyPooledNoncenteredExample, RadonVariableInterceptCenteredExample,
+    Rate2Example, Rate3Example, Rate4Example, Rate5Example,
     KidscoreMomhsExample, KidscoreMomiqExample, KidscoreMomhsiqExample, KidscoreInteractionExample,
     DugongsGrowthExample, ARMA11Example, GaussianMixtureExample,
     MNISTLogisticExample, MVNormalRegressionExample, BoundRegressionExample
@@ -46,6 +47,10 @@ include("test_radon_pooled_example.jl")
 include("test_radon_partially_pooled_centered_example.jl")
 include("test_radon_partially_pooled_noncentered_example.jl")
 include("test_radon_variable_intercept_centered_example.jl")
+include("test_rate_2_example.jl")
+include("test_rate_3_example.jl")
+include("test_rate_4_example.jl")
+include("test_rate_5_example.jl")
 include("test_kidscore_momhs_example.jl")
 include("test_kidscore_momiq_example.jl")
 include("test_kidscore_momhsiq_example.jl")

@@ -33,6 +33,10 @@ using ReactiveKernelsPPLExamples.RadonPooledExample: evaluate_radon_pooled_sourc
 using ReactiveKernelsPPLExamples.RadonPartiallyPooledCenteredExample: evaluate_radon_partially_pooled_centered_source
 using ReactiveKernelsPPLExamples.RadonPartiallyPooledNoncenteredExample: evaluate_radon_partially_pooled_noncentered_source
 using ReactiveKernelsPPLExamples.RadonVariableInterceptCenteredExample: evaluate_radon_variable_intercept_centered_source
+using ReactiveKernelsPPLExamples.Rate2Example: evaluate_rate_2_source
+using ReactiveKernelsPPLExamples.Rate3Example: evaluate_rate_3_source
+using ReactiveKernelsPPLExamples.Rate4Example: evaluate_rate_4_source
+using ReactiveKernelsPPLExamples.Rate5Example: evaluate_rate_5_source
 using ReactiveKernelsPPLExamples.KidscoreMomhsExample: evaluate_kidscore_momhs_source
 using ReactiveKernelsPPLExamples.KidscoreMomiqExample: evaluate_kidscore_momiq_source
 using ReactiveKernelsPPLExamples.KidscoreMomhsiqExample: evaluate_kidscore_momhsiq_source
@@ -199,6 +203,22 @@ end
     end
     @testset "radon_variable_intercept_centered (posteriordb; hierarchical normal)" begin
         a = evaluate_radon_variable_intercept_centered_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "rate_2 (posteriordb; binomial rate)" begin
+        a = evaluate_rate_2_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "rate_3 (posteriordb; binomial rate)" begin
+        a = evaluate_rate_3_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "rate_4 (posteriordb; binomial rate)" begin
+        a = evaluate_rate_4_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "rate_5 (posteriordb; binomial rate)" begin
+        a = evaluate_rate_5_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
     @testset "kidscore_momhs (posteriordb; Gaussian linear regression)" begin
