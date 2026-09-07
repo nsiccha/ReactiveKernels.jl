@@ -43,6 +43,8 @@ include("rate_2.jl")
 include("rate_3.jl")
 include("rate_4.jl")
 include("rate_5.jl")
+include("dogs.jl")
+include("dogs_hierarchical.jl")
 include("dugongs_growth.jl")
 include("arma11.jl")
 include("gaussian_mixture.jl")
@@ -106,6 +108,8 @@ export Rate2Example
 export Rate3Example
 export Rate4Example
 export Rate5Example
+export DogsExample
+export DogsHierarchicalExample
 export DugongsGrowthExample
 export ARMA11Example
 export GaussianMixtureExample

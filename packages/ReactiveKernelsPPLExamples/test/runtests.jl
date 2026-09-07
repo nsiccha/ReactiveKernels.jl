@@ -9,6 +9,7 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     NesLogitExample, WellsDistExample, WellsDist100Example, DogsLogExample, NESExample, KidscoreMomWorkExample, Rate1Example,
     RadonPooledExample, RadonPartiallyPooledCenteredExample, RadonPartiallyPooledNoncenteredExample, RadonVariableInterceptCenteredExample,
     Rate2Example, Rate3Example, Rate4Example, Rate5Example,
+    DogsExample, DogsHierarchicalExample,
     KidscoreMomhsExample, KidscoreMomiqExample, KidscoreMomhsiqExample, KidscoreInteractionExample,
     DugongsGrowthExample, ARMA11Example, GaussianMixtureExample,
     MNISTLogisticExample, MVNormalRegressionExample, BoundRegressionExample
@@ -51,6 +52,8 @@ include("test_rate_2_example.jl")
 include("test_rate_3_example.jl")
 include("test_rate_4_example.jl")
 include("test_rate_5_example.jl")
+include("test_dogs_example.jl")
+include("test_dogs_hierarchical_example.jl")
 include("test_kidscore_momhs_example.jl")
 include("test_kidscore_momiq_example.jl")
 include("test_kidscore_momhsiq_example.jl")

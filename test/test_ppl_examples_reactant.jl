@@ -37,6 +37,8 @@ using ReactiveKernelsPPLExamples.Rate2Example: evaluate_rate_2_source
 using ReactiveKernelsPPLExamples.Rate3Example: evaluate_rate_3_source
 using ReactiveKernelsPPLExamples.Rate4Example: evaluate_rate_4_source
 using ReactiveKernelsPPLExamples.Rate5Example: evaluate_rate_5_source
+using ReactiveKernelsPPLExamples.DogsExample: evaluate_dogs_source
+using ReactiveKernelsPPLExamples.DogsHierarchicalExample: evaluate_dogs_hierarchical_source
 using ReactiveKernelsPPLExamples.KidscoreMomhsExample: evaluate_kidscore_momhs_source
 using ReactiveKernelsPPLExamples.KidscoreMomiqExample: evaluate_kidscore_momiq_source
 using ReactiveKernelsPPLExamples.KidscoreMomhsiqExample: evaluate_kidscore_momhsiq_source
@@ -219,6 +221,14 @@ end
     end
     @testset "rate_5 (posteriordb; binomial rate)" begin
         a = evaluate_rate_5_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "dogs (posteriordb; bernoulli-logit)" begin
+        a = evaluate_dogs_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "dogs_hierarchical (posteriordb)" begin
+        a = evaluate_dogs_hierarchical_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
     @testset "kidscore_momhs (posteriordb; Gaussian linear regression)" begin
