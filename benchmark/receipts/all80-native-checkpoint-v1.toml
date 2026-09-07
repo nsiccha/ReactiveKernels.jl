@@ -1,0 +1,1964 @@
+generated_at = "2026-09-07T18:36:58.247"
+phase = "native"
+schema = "all80-benchmark-v1"
+
+[models.GLMM_Poisson_data-GLMM_Poisson_model]
+error = "RK STRUCTURAL parity FAIL GLMM_Poisson_data-GLMM_Poisson_model: stab 1.2343128522237143e-6 grad 6.419464303813019e-15 (not a constant offset)"
+parity_pass = false
+
+[models.GLM_Binomial_data-GLM_Binomial_model]
+dim = 3
+family = "GLM/Binomial"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 6491.250000000001
+gradient_stan = 3590.7142857142862
+gradient_turing = 14730.000000000002
+hmc_ahmc_turing = 332.90256350000004
+hmc_rk_native = 116.88431
+note = "Stan vectorized binomial_logit over a precomputed logit vector; RK per-obs plate with explicit logistic link recomputed inline."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 3327.1250000000005
+primal_stan = 2294.8333333333335
+primal_turing = 2200.769230769231
+rk_grad_relerr = 8.169548339802418e-16
+rk_off = -7.579122514774402e-14
+tu_grad_relerr = 3.267819335920967e-16
+tu_off = 1.1368683772161603e-13
+
+[models.GLM_Poisson_Data-GLM_Poisson_model]
+dim = 4
+family = "GLM/Poisson"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 1288.4761904761906
+gradient_stan = 2644.636363636364
+gradient_turing = 4392.4285714285725
+hmc_ahmc_turing = 146.8785575
+hmc_rk_native = 17.796031000000003
+note = "Stan vectorized poisson_log over a precomputed log-rate vector; RK per-obs plate recomputing exp-link cubic trend inline."
+off_reason = "upstream Turing writes explicit alpha~U(-20,20), beta1:3~U(-10,10); reference .stan uses IMPLICIT uniform on the same bounds (constant 0). Stan−Turing = log(40)+3·log(20) ≈ 12.676; HMC-invariant, gradient/support identical."
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 842.6470588235295
+primal_stan = 1276.086956521739
+primal_turing = 866.2500000000001
+rk_grad_relerr = 4.111362324463971e-15
+rk_off = 1.0913936421275139e-11
+tu_grad_relerr = 1.452992821486699e-14
+tu_off = 12.676076274794468
+
+[models.M0_data-M0_model]
+dim = 2
+family = "capture-recapture (data augmentation)"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 196260.50000000003
+gradient_stan = 22041.0
+gradient_turing = 55707.0
+hmc_ahmc_turing = 1326.7572795
+hmc_rk_native = 3995.4119969999997
+note = "Both augment + log_sum_exp; Stan branches per-i with binomial_lpmf, RK precomputes logC data + one s>0-masked plate."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 3457.714285714286
+primal_stan = 12482.0
+primal_turing = 15321.000000000002
+rk_grad_relerr = 7.231785103961519e-15
+rk_off = -3.789561257387201e-14
+tu_grad_relerr = 1.0568267776925583e-13
+tu_off = -5.684341886080802e-14
+
+[models.Mb_data-Mb_model]
+dim = 3
+family = "capture-recapture (data augmentation)"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 688590.0
+gradient_stan = 72525.0
+gradient_turing = 1620.3055555555557
+hmc_ahmc_turing = 54.76453
+hmc_rk_native = 13236.0948695
+note = "Stan builds an MxT p_eff matrix + per-occasion Bernoulli; RK collapses each history to four sufficient counts a,b,e,f."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 15862.000000000002
+primal_stan = 35029.0
+primal_turing = 204.49537037037038
+rk_grad_relerr = 4.3771741403776594e-14
+rk_off = -3.789561257387201e-14
+tu_grad_relerr = 4.3588596042254515e-14
+tu_off = 2.3495279795800647e-12
+
+[models.Mh_data-Mh_model]
+dim = 388
+family = "capture-recapture (data augmentation)"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 397870.00000000006
+gradient_stan = 48367.00000000001
+gradient_turing = 237302.5
+hmc_ahmc_turing = 7359.8727565
+hmc_rk_native = 7932.438794
+note = "Heterogeneity (non-centered eps); Stan per-i binomial_logit + branch, RK precomputes logC data + one s>0-masked plate."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = false
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 25245.000000000004
+primal_stan = 26547.0
+primal_turing = 35119.0
+rk_grad_relerr = 5.977699938672405e-15
+rk_off = 6.063298011819521e-13
+tu_grad_relerr = 1.822812645652046e-15
+tu_off = 1.609437912434449
+
+[models.Mt_data-Mt_model]
+dim = 4
+family = "capture-recapture (data augmentation)"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 485679.00000000006
+gradient_stan = 24133.0
+gradient_turing = 203681.00000000003
+hmc_ahmc_turing = 6135.726665
+hmc_rk_native = 11157.8190645
+note = "Time-varying p; Stan per-individual bernoulli_lpmf loop, RK writes detection as matrix-vector product Y*logit(p) + constant."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 11596.0
+primal_stan = 11010.5
+primal_turing = 22351.0
+rk_grad_relerr = 6.598491702383291e-15
+rk_off = 0.0
+tu_grad_relerr = 1.0319402133876954e-15
+tu_off = 0.0
+
+[models.Mtbh_data-Mtbh_model]
+error = "EnzymeNoDerivativeError: Current scope:  ; Function Attrs: mustprogress willreturn define internal fastcc nonnull \"enzyme_type\"=\"{[-1]:Pointer}\" {} addrspace(10)* @preprocess_julia_generated_callfunc_71544({ [1 x i64], ["
+parity_pass = false
+
+[models.Mth_data-Mth_model]
+error = "EnzymeNoDerivativeError: Current scope:  ; Function Attrs: mustprogress willreturn define internal fastcc nonnull \"enzyme_type\"=\"{[-1]:Pointer}\" {} addrspace(10)* @preprocess_julia_generated_callfunc_74417({ [1 x i64], ["
+parity_pass = false
+
+[models.Rate_1_data-Rate_1_model]
+dim = 1
+family = "Binomial-Beta rate"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 164.2848484848485
+gradient_stan = 285.5339805825243
+gradient_turing = 836.8157894736843
+hmc_ahmc_turing = 69.2869425
+hmc_rk_native = 10.616354
+note = "No structural difference: both author a scalar Binomial on sufficient stats k/n; RK adds explicit logistic+Jacobian for theta∈[0,1]."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 89.496875
+primal_stan = 191.68333333333337
+primal_turing = 92.86102236421726
+rk_grad_relerr = 7.215773222604226e-15
+rk_off = 8.881784197001252e-16
+tu_grad_relerr = 6.209526231235316e-15
+tu_off = 0.0
+
+[models.Rate_2_data-Rate_2_model]
+dim = 2
+family = "Binomial-Beta rate"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 313.6170212765958
+gradient_stan = 476.2352941176471
+gradient_turing = 1327.9130434782608
+hmc_ahmc_turing = 64.560103
+hmc_rk_native = 21.1513255
+note = "No structural difference: two independent scalar Binomials on sufficient stats; RK adds explicit logistic transforms/Jacobians."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 248.6121495327103
+primal_stan = 321.8372093023256
+primal_turing = 189.07894736842107
+rk_grad_relerr = 4.425117120098905e-16
+rk_off = -1.1842378929335002e-15
+tu_grad_relerr = 9.301329980546757e-15
+tu_off = -1.4802973661668755e-15
+
+[models.Rate_3_data-Rate_3_model]
+dim = 1
+family = "Binomial-Beta rate"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 176.3956043956044
+gradient_stan = 380.39473684210526
+gradient_turing = 965.6142857142856
+hmc_ahmc_turing = 38.182313
+hmc_rk_native = 12.1620715
+note = "No structural difference: one common theta, two scalar Binomial terms summed; RK adds explicit logistic+Jacobian."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 93.95709570957096
+primal_stan = 421.61764705882354
+primal_turing = 139.56692913385825
+rk_grad_relerr = 7.668972140418012e-16
+rk_off = -1.4802973661668755e-15
+tu_grad_relerr = 1.6504264250155263e-15
+tu_off = -2.6645352591003757e-15
+
+[models.Rate_4_data-Rate_4_model]
+dim = 2
+family = "Binomial-Beta rate"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 255.75675675675674
+gradient_stan = 335.5423728813559
+gradient_turing = 1141.5909090909092
+hmc_ahmc_turing = 49.377581
+hmc_rk_native = 17.208517
+note = "No structural difference: scalar Binomial + prior-only rate; predictive RNG draws omitted from the RK graph."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 132.73076923076923
+primal_stan = 197.09655172413792
+primal_turing = 147.12820512820514
+rk_grad_relerr = 1.5074817428510564e-16
+rk_off = 5.921189464667501e-16
+tu_grad_relerr = 6.029926971404226e-16
+tu_off = 5.921189464667501e-16
+
+[models.Rate_5_data-Rate_5_model]
+dim = 1
+family = "Binomial-Beta rate"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 178.74285714285716
+gradient_stan = 244.7899159663866
+gradient_turing = 949.9666666666667
+hmc_ahmc_turing = 45.288835
+hmc_rk_native = 10.163995000000002
+note = "No structural difference: common rate, two Binomial terms; posterior-predictive RNG draws omitted from the RK graph."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 91.2147435897436
+primal_stan = 155.07650273224044
+primal_turing = 132.9816513761468
+rk_grad_relerr = 2.4099068918918585e-14
+rk_off = 1.1842378929335002e-15
+tu_grad_relerr = 3.027321054277376e-14
+tu_off = 0.0
+
+[models.Survey_data-Survey_model]
+error = "EnzymeNoDerivativeError: Current scope:  ; Function Attrs: mustprogress willreturn define internal fastcc nonnull \"enzyme_type\"=\"{[-1]:Pointer}\" {} addrspace(10)* @preprocess_julia_generated_callfunc_82926({ [1 x {} addr"
+parity_pass = false
+
+[models.arK-arK]
+dim = 7
+family = "AR/time-series"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 2533.521739130435
+gradient_stan = 18966.0
+gradient_turing = 16212.0
+hmc_ahmc_turing = 403.18690349999997
+hmc_rk_native = 51.17722199999999
+note = "Stan scalar double-loops mu=alpha+Σβₖ·y[t−k] then per-obs normal; RK precomputes the ylag lag-matrix, matvec + one plate normal."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = false
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 449.8538461538462
+primal_stan = 1800.4333333333336
+primal_turing = 1511.1000000000001
+rk_grad_relerr = 5.495215797718226e-16
+rk_off = -1.8947806286936004e-14
+tu_grad_relerr = 4.011072977898361e-16
+tu_off = -0.6931471805599377
+
+[models.arma-arma11]
+dim = 4
+family = "AR/time-series"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 4442.833333333333
+gradient_stan = 8011.0
+gradient_turing = 24874.000000000004
+hmc_ahmc_turing = 364.9170935
+hmc_rk_native = 175.593853
+note = "Stan explicit sequential for-loop error recursion then vectorized normal; RK authors recursion as a scan carry primitive, likelihood plate."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = false
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 54345.5
+primal_stan = 1149.9600000000003
+primal_turing = 3395.0
+rk_grad_relerr = 4.871810259703797e-16
+rk_off = -0.6931471805599377
+tu_grad_relerr = 9.352123553674436e-16
+tu_off = -0.6931471805599662
+
+[models.dogs-dogs]
+dim = 3
+family = "Bernoulli-logit avoidance GLM"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 91165.00000000001
+gradient_stan = 88452.0
+gradient_turing = 69265.00000000001
+hmc_ahmc_turing = 1559.9126645000001
+hmc_rk_native = 1629.0055240000002
+note = "Stan recomputes data-only counts in transformed parameters + scalar double-loop bernoulli_logit; RK hoists counts to data, one flat plate."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 36410.00000000001
+primal_stan = 35629.0
+primal_turing = 9543.0
+rk_grad_relerr = 3.0085838064252915e-16
+rk_off = -7.579122514774402e-14
+tu_grad_relerr = 4.512875709637937e-16
+tu_off = -7.579122514774402e-14
+
+[models.dogs-dogs_hierarchical]
+error = "RK STRUCTURAL parity FAIL dogs-dogs_hierarchical: stab 0.0 grad NaN (not a constant offset)"
+parity_pass = false
+
+[models.dogs-dogs_log]
+dim = 2
+family = "Bernoulli-logit avoidance GLM"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 90945.5
+gradient_stan = 63236.5
+gradient_turing = 28769.000000000004
+hmc_ahmc_turing = 123.0374115
+hmc_rk_native = 1684.9042865000001
+note = "Stan recomputes counts each eval + scalar double-loop bernoulli(inv_logit); RK precomputes counts as data, single flat plate."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 37302.0
+primal_stan = 18595.0
+primal_turing = 7764.000000000001
+rk_grad_relerr = 1.8282107215305102e-16
+rk_off = -1.3263464400855204e-13
+tu_grad_relerr = 1.8282107215305102e-16
+tu_off = -1.3263464400855204e-13
+
+[models.dugongs_data-dugongs_model]
+dim = 4
+family = "Gaussian growth"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 1037.04
+gradient_stan = 1408.45
+gradient_turing = 4284.428571428572
+hmc_ahmc_turing = 161.66651799999997
+hmc_rk_native = 25.714288
+note = "Stan explicit for-loop nonlinear mean then vectorized normal; RK single per-observation plate computing α−β·λ^age inline."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 345.8823529411765
+primal_stan = 452.0634920634921
+primal_turing = 474.9365079365079
+rk_grad_relerr = 2.720773485198808e-16
+rk_off = 4.736951571734001e-15
+tu_grad_relerr = 3.675650932837134e-16
+tu_off = 1.4210854715202004e-14
+
+[models.earnings-earn_height]
+error = "RK STRUCTURAL parity FAIL earnings-earn_height: stab 0.0008544921875 grad 3.416259219811961e-16 (not a constant offset)"
+parity_pass = false
+
+[models.earnings-log10earn_height]
+dim = 3
+family = "Gaussian regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 5.167502500000001e6
+gradient_stan = 16613.0
+gradient_turing = 27970.750000000004
+hmc_ahmc_turing = 158.69520650000004
+hmc_rk_native = 84840.5141705
+note = "Stan log10-transforms response in transformed-data; RK computes log10-response via a data plate, per-obs likelihood plate recomputing linpred."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 108485.00000000001
+primal_stan = 1384.4000000000003
+primal_turing = 1041.0
+rk_grad_relerr = 1.6861278416755305e-15
+rk_off = 3.823667308703686e-10
+tu_grad_relerr = 1.6861278416755305e-15
+tu_off = -7.761021455128987e-11
+
+[models.earnings-logearn_height]
+dim = 3
+family = "Gaussian regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 4.123156e6
+gradient_stan = 16543.0
+gradient_turing = 13538.5
+hmc_ahmc_turing = 131.4291075
+hmc_rk_native = 94692.167428
+note = "Stan log-transforms response in transformed-data; RK computes log-response via a data plate, per-obs likelihood plate recomputing linpred."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 103471.00000000001
+primal_stan = 1509.568181818182
+primal_turing = 1907.3611111111115
+rk_grad_relerr = 1.9502197239802044e-15
+rk_off = 5.88897819397971e-11
+tu_grad_relerr = 1.7335286435379594e-15
+tu_off = 6.783314650723089e-11
+
+[models.earnings-logearn_height_male]
+dim = 4
+family = "Gaussian regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 4.6016865e6
+gradient_stan = 29470.0
+gradient_turing = 17064.0
+hmc_ahmc_turing = 124.58745350000001
+hmc_rk_native = 92024.1433245
+note = "Stan transformed-data log response, one vectorized normal; RK log-response data plate plus per-obs plate recomputing height+male linpred."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 57585.0
+primal_stan = 1472.0
+primal_turing = 1546.5000000000002
+rk_grad_relerr = 1.7428447142653432e-15
+rk_off = 5.002220859751105e-12
+tu_grad_relerr = 1.960700303548511e-15
+tu_off = 1.5158245029548803e-13
+
+[models.earnings-logearn_interaction]
+dim = 5
+family = "Gaussian regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 4.329197e6
+gradient_stan = 38023.00000000001
+gradient_turing = 18886.0
+hmc_ahmc_turing = 413.87176299999993
+hmc_rk_native = 91683.69084849999
+note = "Stan transformed-data log response and height*male interaction; RK log-response data plate, per-obs plate recomputing interaction+linpred inline."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 103483.00000000001
+primal_stan = 1652.8823529411766
+primal_turing = 1615.3750000000002
+rk_grad_relerr = 2.520583238395844e-15
+rk_off = -2.1221543041368326e-10
+tu_grad_relerr = 2.6781196907955842e-15
+tu_off = 3.698611787209908e-11
+
+[models.earnings-logearn_interaction_z]
+dim = 5
+family = "Gaussian regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 1.0217635000000002e7
+gradient_stan = 38032.5
+gradient_turing = 19197.000000000004
+hmc_ahmc_turing = 652.3989935
+hmc_rk_native = 114222.06895799999
+note = "Stan transformed-data standardizes height once; RK computes mean+sample-sd reductions, restandardizing z_height and interaction inline in likelihood plate."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 75815.0
+primal_stan = 1856.55
+primal_turing = 1448.8750000000002
+rk_grad_relerr = 1.5781213964510432e-15
+rk_off = -2.6678511252005894e-11
+tu_grad_relerr = 3.209393050610131e-16
+tu_off = 2.4253192047278085e-12
+
+[models.earnings-logearn_logheight_male]
+dim = 4
+family = "Gaussian regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 3.6502350000000005e6
+gradient_stan = 27107.000000000004
+gradient_turing = 16673.0
+hmc_ahmc_turing = 178.59985600000002
+hmc_rk_native = 49680.482969
+note = "Stan transformed-data logs response and height; RK log-response data plate but recomputes log(height) inline per plate cell."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 64359.0
+primal_stan = 1450.3333333333333
+primal_turing = 1364.0000000000002
+rk_grad_relerr = 1.9362262830746305e-15
+rk_off = -4.3655745685100555e-11
+tu_grad_relerr = 6.454087610248768e-16
+tu_off = 0.0
+
+[models.eight_schools-eight_schools_centered]
+dim = 10
+family = "hierarchical Gaussian"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 103.43840579710145
+gradient_stan = 540.3333333333334
+gradient_turing = 4689.0
+hmc_ahmc_turing = 99.01461
+hmc_rk_native = 6.6123164999999995
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Stan two vectorized normals (theta~normal, y~normal); RK two per-observation plate reductions with scalar hyperparameters broadcast into cells."
+off_reason = "artifact .stan declares (theta[8],mu,tau), RK packs (mu,logtau,theta[8]) — stan_perm reorders (verified by probe). The centered RK graph uses the PROPER HalfCauchy(0,5) (+log2 normalizer) while the reference .stan drops the truncation normalizer: Stan-RK = -log2, stable, grads 1e-16 (same class as arK/arma11; upstream Turing is also proper, Stan-Turing = -log2)."
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 58.55670103092784
+primal_stan = 225.18487394957984
+primal_turing = 250.33333333333331
+rk_grad_relerr = 1.764075632167154e-16
+rk_off = -0.6931471805599448
+tu_grad_relerr = 5.292226896501462e-16
+tu_off = -0.6931471805599401
+
+[models.eight_schools-eight_schools_noncentered]
+dim = 10
+family = "hierarchical Gaussian"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 98.25252525252526
+gradient_stan = 688.5714285714287
+gradient_turing = 4423.285714285715
+hmc_ahmc_turing = 105.116866
+hmc_rk_native = 6.055117500000001
+note = "Stan vectorized normals plus transformed-parameter theta; RK per-obs plates recomputing theta=theta_trans*tau+mu inline in the likelihood."
+off_reason = "faithful same density; upstream Turing's truncated Cauchy on tau includes the +log2 half-line normalizer the reference .stan drops: Stan-Turing = -log2 (measured -0.6931471805599401, grads 1e-16)."
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 63.83442265795207
+primal_stan = 245.1981981981982
+primal_turing = 251.27876106194688
+rk_grad_relerr = 5.940895753830588e-17
+rk_off = 0.0
+tu_grad_relerr = 4.781605429393179e-16
+tu_off = -0.6931471805599401
+
+[models.election88-election88_full]
+dim = 90
+family = "Multilevel logistic regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 1.714856e6
+gradient_stan = 1.6342140000000002e6
+gradient_turing = 1.6289070000000002e6
+hmc_ahmc_turing = 27661.120785714287
+hmc_rk_native = 28331.7935
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 14
+note = "Stan assembles y_hat via a scalar per-row loop indexing 5 intercepts + vectorized bernoulli_logit; RK array-gathers + per-row plate."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = false
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 911237.5
+primal_stan = 187488.0
+primal_turing = 434058.0
+rk_grad_relerr = 5.559456976191401e-16
+rk_off = 2.4253192047278085e-12
+tu_grad_relerr = 6.254389098215326e-16
+tu_off = 23.025850929959535
+
+[models.kidiq-kidscore_interaction]
+dim = 5
+family = "Gaussian regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 1576.611111111111
+gradient_stan = 13593.500000000002
+gradient_turing = 15211.0
+hmc_ahmc_turing = 60.1432105
+hmc_rk_native = 32.50846000000001
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Stan builds interaction in transformed-data, one vectorized normal; RK per-obs plate recomputing interaction+linpred inline every evaluation."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = false
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 523.2115384615385
+primal_stan = 1099.2962962962965
+primal_turing = 1852.0
+rk_grad_relerr = 6.157899301143815e-16
+rk_off = 4.656612873077393e-10
+tu_grad_relerr = 6.457947224196458e-16
+tu_off = -0.6931471807571749
+
+[models.kidiq-kidscore_momhs]
+dim = 3
+family = "Gaussian regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 782.75
+gradient_stan = 6308.75
+gradient_turing = 13619.000000000002
+hmc_ahmc_turing = 57.773452
+hmc_rk_native = 20.8328185
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Stan one vectorized normal with vector beta; RK per-observation plate recomputing beta1+beta2*mom_hs inline, scalar coefficients broadcast."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = false
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 465.25396825396825
+primal_stan = 621.0625000000001
+primal_turing = 1401.2000000000003
+rk_grad_relerr = 2.5781404153455944e-16
+rk_off = 2.8327728311220803e-9
+tu_grad_relerr = 3.867210623018392e-16
+tu_off = -0.6931471800198779
+
+[models.kidiq-kidscore_momhsiq]
+dim = 4
+family = "Gaussian regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 1094.857142857143
+gradient_stan = 10114.0
+gradient_turing = 14330.000000000002
+hmc_ahmc_turing = 64.296299
+hmc_rk_native = 28.1242315
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Stan one vectorized normal over two-predictor mean; RK per-observation plate recomputing beta1+beta2*hs+beta3*iq inline each evaluation."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = false
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 464.98333333333335
+primal_stan = 622.1276595744681
+primal_turing = 1705.5
+rk_grad_relerr = 4.369293892073251e-16
+rk_off = 6.59686823685964e-10
+tu_grad_relerr = 5.825725189431001e-16
+tu_off = -0.6931471805243442
+
+[models.kidiq-kidscore_momiq]
+dim = 3
+family = "Gaussian regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 775.5277777777778
+gradient_stan = 6226.0
+gradient_turing = 13874.000000000002
+hmc_ahmc_turing = 52.165650500000005
+hmc_rk_native = 15.955409499999998
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Stan one vectorized normal with vector beta; RK per-observation plate recomputing beta1+beta2*mom_iq inline, scalar coefficients broadcast."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = false
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 470.34375
+primal_stan = 612.1041666666667
+primal_turing = 1792.5000000000002
+rk_grad_relerr = 7.838623743263571e-16
+rk_off = 6.20881716410319e-10
+tu_grad_relerr = 6.532186452719642e-16
+tu_off = -0.6931471806019545
+
+[models.kidiq_with_mom_work-kidscore_interaction_c]
+dim = 5
+family = "Gaussian regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 1332.8095238095239
+gradient_stan = 14690.000000000002
+gradient_turing = 10339.0
+hmc_ahmc_turing = 45.323592
+hmc_rk_native = 32.366328499999995
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Stan centers via transformed-data mean() once; RK computes means as in-graph reductions, re-centering inline per cell each evaluation."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 668.9142857142857
+primal_stan = 646.3809523809524
+primal_turing = 1018.6111111111111
+rk_grad_relerr = 2.3921629122504137e-16
+rk_off = 1.1641532182693481e-9
+tu_grad_relerr = 5.980407280626035e-16
+tu_off = 1.5522042910257974e-10
+
+[models.kidiq_with_mom_work-kidscore_interaction_c2]
+dim = 5
+family = "Gaussian regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 1534.3333333333335
+gradient_stan = 13664.000000000002
+gradient_turing = 9878.5
+hmc_ahmc_turing = 44.75246500000001
+hmc_rk_native = 31.656689
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Stan reference-centers (−0.5,−100) in transformed-data; RK per-obs plate recomputing constant-offset centering and interaction inline each evaluation."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 612.5208333333334
+primal_stan = 681.3953488372093
+primal_turing = 953.2419354838711
+rk_grad_relerr = 3.084537363421966e-16
+rk_off = -1.1641532182693481e-10
+tu_grad_relerr = 4.62680604513295e-16
+tu_off = 3.8805107275644936e-11
+
+[models.kidiq_with_mom_work-kidscore_interaction_z]
+dim = 5
+family = "Gaussian regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 3184.3333333333335
+gradient_stan = 14000.000000000002
+gradient_turing = 9879.0
+hmc_ahmc_turing = 45.698034
+hmc_rk_native = 56.5311125
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Stan 2sd-standardizes via transformed-data mean/sd once; RK computes mean+sample-sd with extra reduction plates, restandardizing inline each evaluation."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 1410.45
+primal_stan = 676.5116279069767
+primal_turing = 1003.2708333333335
+rk_grad_relerr = 4.4200101228887814e-16
+rk_off = 3.880510727564494e-10
+tu_grad_relerr = 6.630015184333172e-16
+tu_off = 3.8805107275644936e-11
+
+[models.kidiq_with_mom_work-kidscore_mom_work]
+dim = 5
+family = "Gaussian regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 1718.294117647059
+gradient_stan = 13538.5
+gradient_turing = 9853.666666666666
+hmc_ahmc_turing = 46.9704445
+hmc_rk_native = 32.6359145
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Stan derives three factor indicators in transformed-data; RK takes them as precomputed data ports, per-observation plate over indicators."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 502.45614035087726
+primal_stan = 625.3111111111111
+primal_turing = 1157.982142857143
+rk_grad_relerr = 4.0504028581210057e-16
+rk_off = -7.761021455128988e-10
+tu_grad_relerr = 2.097935614454165e-16
+tu_off = -3.880510727564494e-10
+
+[models.kilpisjarvi_mod-kilpisjarvi]
+dim = 3
+family = "Gaussian regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 150.78125
+gradient_stan = 1107.7916666666667
+gradient_turing = 2570.8947368421054
+hmc_ahmc_turing = 11.59877
+hmc_rk_native = 5.967627
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Stan single vectorized normal over alpha+beta*x; RK per-observation plate recomputing the linear predictor inline per cell."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 76.82644628099173
+primal_stan = 204.36184210526318
+primal_turing = 256.45669291338584
+rk_grad_relerr = 4.3320236428266683e-16
+rk_off = 1.4590720335642496e-8
+tu_grad_relerr = 5.415029553533335e-16
+tu_off = 7.295360167821248e-9
+
+[models.low_dim_gauss_mix-low_dim_gauss_mix]
+dim = 5
+family = "Gaussian mixture (label marginalized)"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 27838.0
+gradient_stan = 163520.5
+gradient_turing = 89683.0
+hmc_ahmc_turing = 1240.7873291366907
+hmc_rk_native = 400.05304496402874
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 278
+note = "Ordered means (mu1<mu2); Stan uses ordered[2] + scalar log_mix loop, RK inlines the ordered transform + logaddexp plate."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = false
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 12692.5
+primal_stan = 43560.0
+primal_turing = 43800.0
+rk_grad_relerr = 4.276304347521773e-15
+rk_off = 3.0316490059097606e-13
+tu_grad_relerr = 3.59993522813123e-16
+tu_off = -1.3862943611199323
+
+[models.low_dim_gauss_mix_collapse-low_dim_gauss_mix_collapse]
+dim = 5
+family = "Gaussian mixture (label marginalized)"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 29351.0
+gradient_stan = 119915.0
+gradient_turing = 90104.0
+hmc_ahmc_turing = 1635.3722238267148
+hmc_rk_native = 512.5150613718412
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 277
+note = "Free unordered means; Stan scalar-loops log_mix, RK reduces the two-term log-sum-exp in one logaddexp plate."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 16914.0
+primal_stan = 57720.0
+primal_turing = 44801.0
+rk_grad_relerr = 2.052948266184462e-15
+rk_off = -1.5158245029548803e-13
+tu_grad_relerr = 6.845698391723554e-16
+tu_off = 7.579122514774402e-14
+
+[models.lsat_data-lsat_model]
+dim = 1006
+family = "Rasch/1-PL IRT"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 842432.5000000001
+gradient_stan = 156876.00000000003
+gradient_turing = 258296.00000000003
+hmc_ahmc_turing = 4409.002551724139
+hmc_rk_native = 14038.911913793103
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 29
+note = "Stan expands 1000 students from 32 patterns (culm) + per-question vectorized bernoulli_logit; RK per-row plate over the culm-expanded students."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 429777.50000000006
+primal_stan = 66923.00000000001
+primal_turing = 97054.00000000001
+rk_grad_relerr = 2.810036135134393e-15
+rk_off = 1.3642420526593924e-12
+tu_grad_relerr = 2.5424136460739745e-15
+tu_off = 0.0
+
+[models.mesquite-logmesquite]
+dim = 8
+family = "Gaussian regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 2400.0000000000005
+gradient_stan = 3066.7500000000005
+gradient_turing = 3906.0000000000005
+hmc_ahmc_turing = 102.528093
+hmc_rk_native = 45.479006500000004
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Stan transformed-data logs response+5 covariates once; RK log-response data plate, per-obs plate recomputing five predictor logs inline."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 972.0
+primal_stan = 178.26543209876544
+primal_turing = 351.03333333333336
+rk_grad_relerr = 3.8499185523279624e-16
+rk_off = -1.1368683772161603e-13
+tu_grad_relerr = 2.0748107240841993e-16
+tu_off = -7.579122514774402e-14
+
+[models.mesquite-logmesquite_logva]
+dim = 5
+family = "Gaussian regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 1154.1000000000001
+gradient_stan = 1734.2500000000002
+gradient_turing = 2477.5833333333335
+hmc_ahmc_turing = 99.0884075
+hmc_rk_native = 21.657611
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Stan transformed-data forms log volume+area once; RK log-response data plate, per-obs plate recomputing both log-features inline."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 458.0153846153847
+primal_stan = 152.9971264367816
+primal_turing = 701.1752577319588
+rk_grad_relerr = 3.684541474631847e-16
+rk_off = -1.8947806286936006e-13
+tu_grad_relerr = 2.626354301172786e-14
+tu_off = -1.1368683772161603e-13
+
+[models.mesquite-logmesquite_logvas]
+dim = 8
+family = "Gaussian regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 2451.5
+gradient_stan = 3139.3333333333335
+gradient_turing = 3393.666666666667
+hmc_ahmc_turing = 106.310986
+hmc_rk_native = 45.21433149999999
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Stan transformed-data forms six log-features once; RK log-response data plate, per-obs plate recomputing volume/area/shape/height/density logs inline."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 991.8947368421053
+primal_stan = 175.94303797468356
+primal_turing = 701.6728971962617
+rk_grad_relerr = 3.883815414593982e-16
+rk_off = 3.789561257387201e-14
+tu_grad_relerr = 9.062235967385957e-16
+tu_off = 1.1368683772161603e-13
+
+[models.mesquite-logmesquite_logvash]
+dim = 7
+family = "Gaussian regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 2122.923076923077
+gradient_stan = 2614.357142857143
+gradient_turing = 3050.8888888888887
+hmc_ahmc_turing = 94.337459
+hmc_rk_native = 37.468261
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Stan transformed-data forms five log-features once; RK log-response data plate, per-obs plate recomputing volume/area/shape/height logs inline."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 860.8823529411766
+primal_stan = 174.96604938271605
+primal_turing = 791.6602564102566
+rk_grad_relerr = 3.984708845878507e-16
+rk_off = 0.0
+tu_grad_relerr = 7.518620347069919e-16
+tu_off = -7.579122514774402e-14
+
+[models.mesquite-logmesquite_logvolume]
+dim = 3
+family = "Gaussian regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 673.4883720930233
+gradient_stan = 801.9714285714286
+gradient_turing = 2549.909090909091
+hmc_ahmc_turing = 98.9059565
+hmc_rk_native = 13.616283000000001
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Stan transformed-data forms log-volume once; RK log-response data plate, per-obs plate recomputing log(diam1*diam2*canopy) inline each evaluation."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 259.6952380952381
+primal_stan = 142.02475247524754
+primal_turing = 681.5510204081634
+rk_grad_relerr = 6.577114576910771e-16
+rk_off = 1.5158245029548803e-13
+tu_grad_relerr = 8.515745954716181e-16
+tu_off = 1.1368683772161603e-13
+
+[models.mesquite-mesquite]
+dim = 8
+family = "Gaussian regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 293.60824742268045
+gradient_stan = 4497.333333333334
+gradient_turing = 4488.75
+hmc_ahmc_turing = 18.177751
+hmc_rk_native = 11.461651
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Stan one vectorized normal with vector beta (7 predictors); RK per-observation plate recomputing the 7-term linpred inline."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 128.04347826086956
+primal_stan = 176.21893491124263
+primal_turing = 689.5769230769231
+rk_grad_relerr = 2.0987156521117477e-16
+rk_off = -3.725290298461914e-9
+tu_grad_relerr = 3.7851848530825446e-16
+tu_off = -2.483526865641276e-9
+
+[models.nes1972-nes]
+dim = 10
+family = "Gaussian regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 8371.0
+gradient_stan = 100259.0
+gradient_turing = 143288.0
+hmc_ahmc_turing = 2648.125761494253
+hmc_rk_native = 125.18127586206899
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 174
+note = "Stan expands nine scalar*vector terms in one vectorized normal; RK folds predictors into a single X*beta matmul plus plate."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 3385.0
+primal_stan = 3695.1111111111113
+primal_turing = 22211.0
+rk_grad_relerr = 1.3795208578999064e-15
+rk_off = 3.3348139065007367e-12
+tu_grad_relerr = 2.20723337263985e-15
+tu_off = 6.063298011819521e-13
+
+[models.nes_logit_data-nes_logit_model]
+dim = 2
+family = "Bernoulli-logit GLM"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 138351.00000000003
+gradient_stan = 13839.0
+gradient_turing = 45007.50000000001
+hmc_ahmc_turing = 818.842975
+hmc_rk_native = 2367.3726833333335
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 180
+note = "Stan fuses a 1-column bernoulli_logit_glm on a design matrix; RK per-row plate recomputes η=α+β·income inline."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 55787.00000000001
+primal_stan = 12176.500000000002
+primal_turing = 15922.000000000002
+rk_grad_relerr = 2.161526905715725e-14
+rk_off = 0.0
+tu_grad_relerr = 2.4723346960800776e-15
+tu_off = 1.0610771520684163e-12
+
+[models.normal_2-normal_mixture]
+dim = 3
+family = "Gaussian mixture (label marginalized)"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 22921.000000000004
+gradient_stan = 104834.0
+gradient_turing = 78648.00000000001
+hmc_ahmc_turing = 1265.244353312303
+hmc_rk_native = 306.74778233438485
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 317
+note = "Both marginalize the label; Stan scalar-loops log_mix per obs, RK one logaddexp plate; variance fixed=1."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 11596.0
+primal_stan = 33626.0
+primal_turing = 35719.0
+rk_grad_relerr = 6.054527383219057e-16
+rk_off = 0.0
+tu_grad_relerr = 8.072703177625409e-16
+tu_off = 0.0
+
+[models.pilots-pilots]
+dim = 18
+family = "Gaussian crossed random effects"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 142316.5
+gradient_stan = 1385.714285714286
+gradient_turing = 6941.599999999999
+hmc_ahmc_turing = 184.01421428571427
+hmc_rk_native = 2724.109045714286
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 175
+note = "Stan builds y_hat in a scalar gather loop + vectorized normal; RK array-gathers a/b then per-row plate normal."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = false
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 4476.181818181819
+primal_stan = 388.8904109589041
+primal_turing = 1277.54
+rk_grad_relerr = 1.8904795392583585e-16
+rk_off = -2.842170943040401e-14
+tu_grad_relerr = 4.322210301146023e-15
+tu_off = 13.815510557964265
+
+[models.radon_mn-radon_county_intercept]
+dim = 87
+family = "radon Gaussian: no-pool varying intercept"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 5572.5
+gradient_stan = 41392.50000000001
+gradient_turing = 15932.000000000002
+hmc_ahmc_turing = 353.2159305
+hmc_rk_native = 111.11515399999999
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Independent alpha_j~N(0,10), no hyperprior; Stan scalar per-obs loop, RK vectorized alpha[county] gather + plate likelihood."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 1953.0000000000002
+primal_stan = 6463.750000000001
+primal_turing = 4689.833333333334
+rk_grad_relerr = 9.034931143614004e-16
+rk_off = -1.5158245029548803e-13
+tu_grad_relerr = 3.6447065193382463e-16
+tu_off = 0.0
+
+[models.radon_mn-radon_hierarchical_intercept_centered]
+dim = 90
+family = "radon Gaussian: contextual varying intercept"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 5968.0
+gradient_stan = 56007.0
+gradient_turing = 26436.500000000004
+hmc_ahmc_turing = 505.78340423280423
+hmc_rk_native = 125.08013544973545
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 945
+note = "Adds county-level uranium term (beta1*log_uppm); Stan scalar per-obs loop, RK alpha[county] gather + inline-mean plate."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 2286.2000000000003
+primal_stan = 6857.000000000001
+primal_turing = 5273.200000000001
+rk_grad_relerr = 1.554617825483509e-15
+rk_off = 1.5158245029548803e-13
+tu_grad_relerr = 8.025176762923622e-16
+tu_off = 1.5158245029548803e-13
+
+[models.radon_mn-radon_hierarchical_intercept_noncentered]
+dim = 90
+family = "radon Gaussian: contextual varying intercept"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 4.813260000000001e6
+gradient_stan = 58180.0
+gradient_turing = 24773.0
+hmc_ahmc_turing = 468.8517
+hmc_rk_native = 76068.1777
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 5
+note = "Non-centered contextual varying intercept + uranium term; Stan per-obs likelihood loop vs RK gather + plate reduction."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 126348.99999999999
+primal_stan = 7059.750000000001
+primal_turing = 5739.8
+rk_grad_relerr = 3.1723538943368698e-15
+rk_off = 0.0
+tu_grad_relerr = 4.708395317395248e-16
+tu_off = 0.0
+
+[models.radon_mn-radon_partially_pooled_centered]
+dim = 88
+family = "radon Gaussian: hierarchical intercept"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 4813.333333333334
+gradient_stan = 24644.0
+gradient_turing = 14680.500000000002
+hmc_ahmc_turing = 330.351705
+hmc_rk_native = 108.21114800000001
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Centered alpha_j~N(mu,sigma); Stan vectorizes the alpha prior but scalar-loops the likelihood, RK uses gather + plate."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 1649.125
+primal_stan = 5756.000000000001
+primal_turing = 4194.428571428572
+rk_grad_relerr = 8.830698476759719e-16
+rk_off = -4.547473508864641e-13
+tu_grad_relerr = 7.1492689913783235e-16
+tu_off = 6.063298011819521e-13
+
+[models.radon_mn-radon_partially_pooled_noncentered]
+dim = 88
+family = "radon Gaussian: hierarchical intercept"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 2.2304770000000005e6
+gradient_stan = 26577.000000000004
+gradient_turing = 13979.000000000002
+hmc_ahmc_turing = 275.597
+hmc_rk_native = 38113.04113636363
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 11
+note = "Non-centered alpha=mu+sigma*raw; both reparametrize, but Stan scalar-loops the likelihood while RK uses gather + plate."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 83875.0
+primal_stan = 6040.750000000001
+primal_turing = 3778.1428571428573
+rk_grad_relerr = 2.6509671653016173e-15
+rk_off = -4.547473508864641e-13
+tu_grad_relerr = 8.469584484832006e-16
+tu_off = -3.0316490059097606e-13
+
+[models.radon_mn-radon_pooled]
+dim = 3
+family = "radon Gaussian: complete pooling"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 1560.5000000000002
+gradient_stan = 35269.00000000001
+gradient_turing = 10524.5
+hmc_ahmc_turing = 232.30090450000003
+hmc_rk_native = 29.536959500000002
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "No grouping; Stan vectorizes mu then scalar-loops normal_lpdf per obs, RK fuses mean+likelihood into one plate."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 1000.0666666666667
+primal_stan = 5242.250000000001
+primal_turing = 983.925925925926
+rk_grad_relerr = 1.6874048013202016e-15
+rk_off = 0.0
+tu_grad_relerr = 1.5186643211881814e-15
+tu_off = -1.2126596023639042e-12
+
+[models.radon_mn-radon_variable_intercept_centered]
+dim = 89
+family = "radon Gaussian: varying intercept + shared slope"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 5729.8
+gradient_stan = 43400.00000000001
+gradient_turing = 17754.0
+hmc_ahmc_turing = 378.54072299999996
+hmc_rk_native = 125.207546
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Centered varying intercept + shared slope; Stan scalar loop builds mu[n], RK gathers alpha[county] + inline-mean plate."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 1997.7857142857147
+primal_stan = 6301.25
+primal_turing = 4320.0
+rk_grad_relerr = 2.523284907388221e-15
+rk_off = 0.0
+tu_grad_relerr = 1.4399963491691455e-15
+tu_off = -7.579122514774402e-14
+
+[models.radon_mn-radon_variable_intercept_noncentered]
+dim = 89
+family = "radon Gaussian: varying intercept + shared slope"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 2.9636835e6
+gradient_stan = 48477.0
+gradient_turing = 16263.0
+hmc_ahmc_turing = 304.6301875
+hmc_rk_native = 51572.3489375
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 8
+note = "Non-centered varying intercept + shared slope; Stan per-obs loop vs RK gather + plate reduction."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 113387.0
+primal_stan = 6406.5
+primal_turing = 4640.583333333333
+rk_grad_relerr = 2.1630829910591068e-15
+rk_off = 5.305385760342082e-13
+tu_grad_relerr = 1.4175777273372837e-15
+tu_off = 7.579122514774402e-13
+
+[models.radon_mn-radon_variable_intercept_slope_centered]
+dim = 175
+family = "radon Gaussian: varying intercept + varying slope"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 9873.666666666668
+gradient_stan = 44401.00000000001
+gradient_turing = 23983.0
+hmc_ahmc_turing = 583.3603295
+hmc_rk_native = 191.7244665
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Independent centered varying intercept AND slope (two gathers); Stan scalar per-obs loop, RK two gathers + inline-mean plate."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 2554.666666666667
+primal_stan = 6656.500000000001
+primal_turing = 4918.8
+rk_grad_relerr = 1.7523010298975129e-15
+rk_off = 1.3642420526593924e-12
+tu_grad_relerr = 3.186001872540933e-16
+tu_off = 7.579122514774402e-14
+
+[models.radon_mn-radon_variable_intercept_slope_noncentered]
+dim = 175
+family = "radon Gaussian: varying intercept + varying slope"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 2.9371070000000005e6
+gradient_stan = 46855.00000000001
+gradient_turing = 19076.0
+hmc_ahmc_turing = 365.822125
+hmc_rk_native = 48705.3090625
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 8
+note = "Non-centered varying intercept AND slope (two reparams, two gathers); Stan per-obs loop vs RK gathers + plate."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 108660.0
+primal_stan = 6934.5
+primal_turing = 5922.200000000001
+rk_grad_relerr = 2.0862895719171926e-15
+rk_off = -8.337034766251842e-13
+tu_grad_relerr = 6.954298573057308e-16
+tu_off = -7.579122514774402e-13
+
+[models.radon_mn-radon_variable_slope_centered]
+dim = 89
+family = "radon Gaussian: shared intercept + varying slope"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 7424.200000000001
+gradient_stan = 41648.00000000001
+gradient_turing = 17544.0
+hmc_ahmc_turing = 368.59793299999995
+hmc_rk_native = 136.862288
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Shared intercept + centered per-county slope; Stan scalar per-obs loop, RK gathers beta[county] + inline-mean plate."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 1737.7333333333333
+primal_stan = 6196.25
+primal_turing = 4187.333333333334
+rk_grad_relerr = 1.593230432739741e-15
+rk_off = -3.789561257387201e-13
+tu_grad_relerr = 3.853916707404608e-16
+tu_off = 0.0
+
+[models.radon_mn-radon_variable_slope_noncentered]
+dim = 89
+family = "radon Gaussian: shared intercept + varying slope"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 2.992097e6
+gradient_stan = 42258.0
+gradient_turing = 15952.5
+hmc_ahmc_turing = 289.02431249999995
+hmc_rk_native = 51672.2748125
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 8
+note = "Non-centered per-county slope; Stan per-obs likelihood loop vs RK beta[county] gather + plate."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 114082.00000000001
+primal_stan = 6258.75
+primal_turing = 5021.833333333334
+rk_grad_relerr = 4.178478453636775e-15
+rk_off = 3.0316490059097606e-13
+tu_grad_relerr = 7.959006578355763e-16
+tu_off = 4.547473508864641e-13
+
+[models.radon_mod-radon_county]
+dim = 389
+family = "radon Gaussian: hierarchical intercept, no predictor"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 62947.00000000001
+gradient_stan = 66191.50000000001
+gradient_turing = 215207.0
+hmc_ahmc_turing = 4039.409103448276
+hmc_rk_native = 1828.1405129310344
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 116
+note = "The one Stan radon that vectorizes y~normal(y_hat,sigma); RK plate; scales are bounded uniform(0,100), not half-normal."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = false
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 20528.0
+primal_stan = 27167.000000000004
+primal_turing = 21659.5
+rk_grad_relerr = 1.323612641391263e-15
+rk_off = 9.701276818911234e-12
+tu_grad_relerr = 3.970837924173789e-15
+tu_off = 9.210340371981147
+
+[models.rats_data-rats_model]
+dim = 65
+family = "hierarchical Gaussian growth"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 3671.3125000000005
+gradient_stan = 6917.0
+gradient_turing = 14442.500000000002
+hmc_ahmc_turing = 73.28196600000001
+hmc_rk_native = 112.597487
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Stan vectorized population priors plus explicit per-point loop gathering alpha[rat]/beta[rat]; RK index-gathers outside plate, per-observation likelihood plate."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 1569.7317073170732
+primal_stan = 1059.2592592592594
+primal_turing = 1218.0333333333335
+rk_grad_relerr = 6.758140530278655e-16
+rk_off = 1.5522042910257974e-10
+tu_grad_relerr = 6.868225289161623e-16
+tu_off = -1.5522042910257974e-10
+
+[models.sblri-blr]
+dim = 6
+family = "Gaussian regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 1278.6444444444446
+gradient_stan = 1354.6666666666667
+gradient_turing = 5912.2
+hmc_ahmc_turing = 26.456972
+hmc_rk_native = 28.617392
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Both form X*beta matvec; Stan one vectorized normal_lpdf, RK a per-observation plate reduction over eta plus plate priors."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = false
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 531.7416666666667
+primal_stan = 298.62105263157895
+primal_turing = 1400.425
+rk_grad_relerr = 3.528979723386536e-16
+rk_off = -1.5522042910257974e-10
+tu_grad_relerr = 6.282428553694167e-16
+tu_off = -0.6931471810676157
+
+[models.seeds_data-seeds_centered_model]
+dim = 26
+family = "Binomial-logit GLMM"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 3785.285714285714
+gradient_stan = 3421.857142857143
+gradient_turing = 12297.000000000002
+hmc_ahmc_turing = 352.63447800000006
+hmc_rk_native = 72.9801695
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Vectorized binomial_logit with b=c−mean(c) as a vector op; RK per-row plate recomputes centering+η inline."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 1912.6000000000001
+primal_stan = 1433.5000000000002
+primal_turing = 1324.5500000000002
+rk_grad_relerr = 2.8932350453387234e-16
+rk_off = 6.631732200427602e-14
+tu_grad_relerr = 2.763687207487736e-16
+tu_off = 2.842170943040401e-14
+
+[models.seeds_data-seeds_model]
+dim = 26
+family = "Binomial-logit GLMM"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 3688.6428571428573
+gradient_stan = 2875.25
+gradient_turing = 11265.5
+hmc_ahmc_turing = 323.2574935
+hmc_rk_native = 70.3004935
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Stan precomputes interaction (.*) and vectorizes binomial_logit over the predictor vector; RK per-row plate, inline interaction+logistic."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 2002.7333333333333
+primal_stan = 1342.809523809524
+primal_turing = 1297.8000000000002
+rk_grad_relerr = 3.404376861394692e-16
+rk_off = 1.1368683772161603e-13
+tu_grad_relerr = 6.808753722789384e-16
+tu_off = 2.842170943040401e-14
+
+[models.seeds_data-seeds_stanified_model]
+dim = 26
+family = "Binomial-logit GLMM"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 3636.25
+gradient_stan = 2844.9
+gradient_turing = 10790.0
+hmc_ahmc_turing = 318.8925765
+hmc_rk_native = 74.45016249999999
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Vectorized binomial_logit with b used directly; RK per-row plate recomputes interaction+η inline, no vector predictor."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 1936.2857142857144
+primal_stan = 1331.35
+primal_turing = 1296.3000000000002
+rk_grad_relerr = 3.250728649622683e-16
+rk_off = 1.4210854715202004e-14
+tu_grad_relerr = 2.6347579686483485e-16
+tu_off = -6.631732200427602e-14
+
+[models.sesame_data-sesame_one_pred_a]
+dim = 3
+family = "Gaussian linear regression"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 406.5373134328359
+gradient_stan = 3357.125
+gradient_turing = 4815.555555555557
+hmc_ahmc_turing = 117.526856
+hmc_rk_native = 9.1181435
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Stan vectorizes normal over a precomputed mean vector; RK per-row plate normal, recomputing the mean inline."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 260.36607142857144
+primal_stan = 370.0869565217391
+primal_turing = 1858.8125000000002
+rk_grad_relerr = 2.5733174936833866e-15
+rk_off = 7.768600577643762e-13
+tu_grad_relerr = 3.4802920861048975e-15
+tu_off = 2.652692880171041e-13
+
+[models.surgical_data-surgical_model]
+dim = 14
+family = "Hierarchical binomial-logit"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 2032.071428571429
+gradient_stan = 1427.5
+gradient_turing = 6006.2
+hmc_ahmc_turing = 153.617488
+hmc_rk_native = 39.37176300000001
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 1000
+note = "Stan vectorizes binomial_logit over the per-hospital intercept vector; RK per-row plate applies the logistic link inline."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 1050.7037037037037
+primal_stan = 868.1818181818182
+primal_turing = 728.7179487179488
+rk_grad_relerr = 1.9001628777735823e-16
+rk_off = -4.547473508864641e-13
+tu_grad_relerr = 1.9001628777735823e-16
+tu_off = 1.5158245029548803e-13
+
+[models.wells_data-wells_daae_c_model]
+dim = 6
+family = "Bernoulli-logit GLM"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 325218.0
+gradient_stan = 37682.0
+gradient_turing = 149685.0
+hmc_ahmc_turing = 3186.6926249999997
+hmc_rk_native = 5815.189519736842
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 76
+note = "Stan fuses a 5-col centered bernoulli_logit_glm; RK per-row plate recomputes centering/interaction/η inline, no matmul."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 162714.5
+primal_stan = 32455.0
+primal_turing = 41026.0
+rk_grad_relerr = 3.600154022323507e-15
+rk_off = 1.5158245029548803e-13
+tu_grad_relerr = 3.191045610695836e-15
+tu_off = 2.1221543041368327e-12
+
+[models.wells_data-wells_dae_c_model]
+dim = 5
+family = "Bernoulli-logit GLM"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 360337.0
+gradient_stan = 46364.00000000001
+gradient_turing = 151970.0
+hmc_ahmc_turing = 3149.7452391304346
+hmc_rk_native = 5667.268478260869
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 69
+note = "Stan fuses a 4-col centered bernoulli_logit_glm; RK per-row plate recomputes means/centering/interaction/η inline, no matmul."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 180149.0
+primal_stan = 40466.0
+primal_turing = 41928.0
+rk_grad_relerr = 2.148074080509634e-15
+rk_off = -1.5158245029548803e-13
+tu_grad_relerr = 1.265093124153868e-15
+tu_off = 0.0
+
+[models.wells_data-wells_dae_inter_model]
+dim = 7
+family = "Bernoulli-logit GLM"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 344690.5
+gradient_stan = 45663.0
+gradient_turing = 163560.5
+hmc_ahmc_turing = 3076.8255416666666
+hmc_rk_native = 5778.258368055556
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 72
+note = "Stan fuses a 6-col centered bernoulli_logit_glm; RK per-row plate recomputes three pairwise interactions+η inline, no matrix."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 167231.0
+primal_stan = 36580.00000000001
+primal_turing = 41377.0
+rk_grad_relerr = 2.9154303582200798e-15
+rk_off = 0.0
+tu_grad_relerr = 2.788672516558337e-15
+tu_off = -1.5158245029548805e-12
+
+[models.wells_data-wells_dae_model]
+dim = 4
+family = "Bernoulli-logit GLM"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 401494.0
+gradient_stan = 43440.00000000001
+gradient_turing = 151984.0
+hmc_ahmc_turing = 3024.1202016129027
+hmc_rk_native = 6744.264258064516
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 62
+note = "Stan fuses a 3-col bernoulli_logit_glm (rescaled predictors); RK per-row plate recomputes /100,/4 rescales+η inline, no matrix."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 167951.0
+primal_stan = 37762.0
+primal_turing = 41768.00000000001
+rk_grad_relerr = 1.5459311800850004e-15
+rk_off = 0.0
+tu_grad_relerr = 5.005179814403328e-16
+tu_off = -1.3642420526593924e-12
+
+[models.wells_data-wells_dist]
+error = "RK STRUCTURAL parity FAIL wells_data-wells_dist: stab NaN grad 0.03919993144869112 (not a constant offset)"
+parity_pass = false
+
+[models.wells_data-wells_dist100_model]
+dim = 2
+family = "Bernoulli-logit GLM"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 385611.0
+gradient_stan = 43600.0
+gradient_turing = 148620.00000000003
+hmc_ahmc_turing = 2742.8324453125
+hmc_rk_native = 6359.3025703125
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 64
+note = "Stan fuses a 1-column bernoulli_logit_glm on a transformed-data matrix; RK per-row plate recomputes η inline, no matrix."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 151058.5
+primal_stan = 38413.0
+primal_turing = 54445.00000000001
+rk_grad_relerr = 1.0644222847702293e-15
+rk_off = -1.5158245029548803e-13
+tu_grad_relerr = 1.277306741724275e-15
+tu_off = -1.5158245029548803e-13
+
+[models.wells_data-wells_dist100ars_model]
+dim = 3
+family = "Bernoulli-logit GLM"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 388846.0
+gradient_stan = 49408.50000000001
+gradient_turing = 148846.0
+hmc_ahmc_turing = 3055.5553203125
+hmc_rk_native = 6593.899070312499
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 64
+note = "Stan fuses a 2-column bernoulli_logit_glm on a precomputed design matrix; RK per-row plate recomputes η inline, no matmul."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 155909.5
+primal_stan = 33270.50000000001
+primal_turing = 41908.0
+rk_grad_relerr = 1.4566882394381775e-15
+rk_off = 0.0
+tu_grad_relerr = 1.3360794742233135e-15
+tu_off = -2.3495279795800647e-12
+
+[models.wells_data-wells_interaction_c_model]
+dim = 4
+family = "Bernoulli-logit GLM"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 361358.50000000006
+gradient_stan = 45873.00000000001
+gradient_turing = 156986.00000000003
+hmc_ahmc_turing = 2879.274239130435
+hmc_rk_native = 5776.279079710145
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 69
+note = "Fused GLM on mean-centered columns; RK per-row plate recomputes centering+interaction+η inline, no design matrix."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 178871.00000000003
+primal_stan = 40786.00000000001
+primal_turing = 42849.0
+rk_grad_relerr = 3.1572964637038815e-15
+rk_off = 7.579122514774402e-14
+tu_grad_relerr = 3.3546274926853743e-15
+tu_off = 1.0610771520684163e-12
+
+[models.wells_data-wells_interaction_model]
+dim = 4
+family = "Bernoulli-logit GLM"
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 329666.0
+gradient_stan = 54265.0
+gradient_turing = 152554.0
+hmc_ahmc_turing = 2990.8640066666667
+hmc_rk_native = 5877.057366666666
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 75
+note = "Stan builds a 3-col design (interaction via .*) for fused bernoulli_logit_glm; RK per-row plate recomputes columns+η inline."
+off_reason = "faithful same density; propto=false jacobian=true; no dropped constants"
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 176583.50000000003
+primal_stan = 39214.0
+primal_turing = 42298.0
+rk_grad_relerr = 1.4257211259573738e-15
+rk_off = -1.5158245029548803e-13
+tu_grad_relerr = 1.2831490133616364e-15
+tu_off = 2.2737367544323206e-12

@@ -31,7 +31,7 @@ function _arma11_reference_logdensity(q, series)
     log_jacobian = log_σ
     likelihood = sum(_arma11_reference_normal(e, 0.0, σ) for e in errors)
     (; errors, prior, log_jacobian, likelihood,
-       density = prior + log_jacobian + likelihood)
+       posterior = prior + log_jacobian + likelihood)
 end
 
 @testset "PPL graph — ARMA(1,1)" begin
@@ -83,8 +83,8 @@ end
         p = plan(model.graph;
                  have = (model.unconstrained, model.series),
                  want = (model.prior, model.log_jacobian, model.errors,
-                         model.pointwise, model.likelihood, model.density))
-        prior, log_jacobian, errors, pointwise, likelihood, density =
+                         model.pointwise, model.likelihood, model.posterior))
+        prior, log_jacobian, errors, pointwise, likelihood, posterior =
             prepare(p)(q, ARMA_SERIES)
 
         reference = _arma11_reference_logdensity(q, ARMA_SERIES)
@@ -95,7 +95,7 @@ end
         @test likelihood ≈ reference.likelihood
         @test likelihood ≈ sum(pointwise)
         @test log_jacobian == reference.log_jacobian
-        @test density ≈ reference.density
+        @test posterior ≈ reference.posterior
     end
 
     @testset "vectorized closed form is a first-class port, parity-exact with the recursion" begin
@@ -127,7 +127,7 @@ end
         produced = Set(canon_id(model.graph, o.id)
                        for r in p.recipes for o in r.outputs)
         @test !(canon_id(model.graph, model.prior.id) in produced)
-        @test !(canon_id(model.graph, model.density.id) in produced)
+        @test !(canon_id(model.graph, model.posterior.id) in produced)
         # The recursion still runs — the forecast needs the last error.
         @test canon_id(model.graph, model.errors.id) in produced
 

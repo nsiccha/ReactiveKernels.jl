@@ -339,6 +339,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "mnist-reactant.md" => 14,
         "nuts.md" => 1,
         "nuts-reactant.md" => 2,
+        "posteriordb-comparison.md" => 3,
     )
     expected_aov_panels = Dict(
         "probprog-mcmc.md" => 1,

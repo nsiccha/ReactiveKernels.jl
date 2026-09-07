@@ -64,26 +64,26 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     end
     likelihood::Float64 = sum(pointwise)
 
-    density::Float64 = prior + log_jacobian + likelihood
+    posterior::Float64 = prior + log_jacobian + likelihood
 
     # Deterministic generated quantity: expected length at a new age.
     predicted::Float64 = parameters.α - parameters.β * parameters.λ^new_age
-    return density
+    return posterior
 end
 
 q = [2.7, 1.0, 1.7, log(300.0)]
 ages = DUGONGS_AGE
 lengths = DUGONGS_LENGTH
 
-requested_nodes = (:prior, :log_jacobian, :pointwise, :likelihood, :density)
+requested_nodes = (:prior, :log_jacobian, :pointwise, :likelihood, :posterior)
 density_kernel = prepare(model;
     have = (:unconstrained, :ages, :lengths),
     want = requested_nodes)
 
 output = density_kernel(q, ages, lengths)
-prior, logjac, pointwise, likelihood, density = output
+prior, logjac, pointwise, likelihood, posterior = output
 @assert likelihood ≈ sum(pointwise)
-@assert density ≈ prior + logjac + likelihood
+@assert posterior ≈ prior + logjac + likelihood
 
 docs_example = (;
     name = :dugongs_density,
@@ -142,14 +142,14 @@ function demo()
     println("\nFull unconstrained-space log density and pointwise terms:")
     density_plan = plan(model;
                         have = (:unconstrained, :ages, :lengths),
-                        want = (:prior, :log_jacobian, :likelihood, :density,
+                        want = (:prior, :log_jacobian, :likelihood, :posterior,
                                 :pointwise))
     println(explain(density_plan))
-    prior, log_jacobian, likelihood, density, pointwise =
+    prior, log_jacobian, likelihood, posterior, pointwise =
         prepare(density_plan)(q, DUGONGS_AGE, DUGONGS_LENGTH)
     println("log prior + log Jacobian + log likelihood")
     println("= ", prior, " + ", log_jacobian, " + ", likelihood)
-    println("= log density = ", density)
+    println("= log density = ", posterior)
 
     println("\nGenerated quantity from an already-constrained HAVE boundary:")
     generated_plan = plan(model; have = (:parameters, :new_age), want = :predicted)

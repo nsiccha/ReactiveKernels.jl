@@ -16,7 +16,7 @@ function _dugongs_reference(q, ages, lengths)
     prior = nld(α, 0.0, 1000.0) + nld(β, 0.0, 1000.0) + log(2.0) + gamma_ld
     likelihood = sum(nld(lengths[i], α - β * λ^ages[i], σ) for i in eachindex(ages))
     (; prior, log_jacobian, likelihood,
-       density = prior + log_jacobian + likelihood)
+       posterior = prior + log_jacobian + likelihood)
 end
 
 @testset "PPL graph — dugongs growth" begin
@@ -62,8 +62,8 @@ end
         p = plan(model.graph;
                  have = (model.unconstrained, model.ages, model.lengths),
                  want = (model.prior, model.log_jacobian, model.pointwise,
-                         model.likelihood, model.density))
-        prior, log_jacobian, pointwise, likelihood, density =
+                         model.likelihood, model.posterior))
+        prior, log_jacobian, pointwise, likelihood, posterior =
             prepare(p)(q, DUGONGS_AGE, DUGONGS_LENGTH)
         reference = _dugongs_reference(q, DUGONGS_AGE, DUGONGS_LENGTH)
         @test all(isfinite, pointwise)
@@ -71,7 +71,7 @@ end
         @test likelihood ≈ reference.likelihood
         @test likelihood ≈ sum(pointwise)
         @test log_jacobian ≈ reference.log_jacobian
-        @test density ≈ reference.density
+        @test posterior ≈ reference.posterior
     end
 
     @testset "generated quantity prunes density work" begin
@@ -80,7 +80,7 @@ end
                  have = (model.parameters, model.new_age), want = (model.predicted,))
         produced = Set(canon_id(model.graph, o.id)
                        for r in p.recipes for o in r.outputs)
-        @test !(canon_id(model.graph, model.density.id) in produced)
+        @test !(canon_id(model.graph, model.posterior.id) in produced)
         @test prepare(p)(parameters, 20.0) ≈ 2.7 - 1.0 * 0.92^20.0
     end
 

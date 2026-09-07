@@ -45,7 +45,7 @@ log prior + log Jacobian + log likelihood ──► unconstrained log density
 
 The latent errors are a **first-class named port**: the sequential `errors`,
 authored with [`scan`](scan.md), which the density reduces and which the forecast
-reruns. A query can ask for just the errors, the full `density`, or the
+reruns. A query can ask for just the errors, the full `posterior`, or the
 one-step-ahead `forecast`. The vectorized `errors_closed` is kept as an
 independent numerical cross-check; a test asserts `errors ≈ errors_closed`.
 
