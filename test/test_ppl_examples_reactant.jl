@@ -15,6 +15,9 @@ using ReactiveKernelsPPLExamples.BLRExample: evaluate_blr_source
 using ReactiveKernelsPPLExamples.MesquiteExample: evaluate_mesquite_source
 using ReactiveKernelsPPLExamples.LogmesquiteExample: evaluate_logmesquite_source
 using ReactiveKernelsPPLExamples.LogmesquiteLogvolumeExample: evaluate_logmesquite_logvolume_source
+using ReactiveKernelsPPLExamples.LogmesquiteLogvaExample: evaluate_logmesquite_logva_source
+using ReactiveKernelsPPLExamples.LogmesquiteLogvasExample: evaluate_logmesquite_logvas_source
+using ReactiveKernelsPPLExamples.LogmesquiteLogvashExample: evaluate_logmesquite_logvash_source
 using ReactiveKernelsPPLExamples.KilpisjarviExample: evaluate_kilpisjarvi_source
 using ReactiveKernelsPPLExamples.EarnHeightExample: evaluate_earn_height_source
 using ReactiveKernelsPPLExamples.LogearnHeightExample: evaluate_logearn_height_source
@@ -144,6 +147,18 @@ end
     end
     @testset "logmesquite_logvolume (posteriordb; Gaussian linear regression)" begin
         a = evaluate_logmesquite_logvolume_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "logmesquite_logva (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_logmesquite_logva_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "logmesquite_logvas (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_logmesquite_logvas_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "logmesquite_logvash (posteriordb; Gaussian linear regression)" begin
+        a = evaluate_logmesquite_logvash_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
     @testset "kilpisjarvi (posteriordb; Gaussian linear regression)" begin

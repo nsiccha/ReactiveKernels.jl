@@ -21,6 +21,9 @@ include("blr.jl")
 include("mesquite.jl")
 include("logmesquite.jl")
 include("logmesquite_logvolume.jl")
+include("logmesquite_logva.jl")
+include("logmesquite_logvas.jl")
+include("logmesquite_logvash.jl")
 include("kilpisjarvi.jl")
 include("earn_height.jl")
 include("logearn_height.jl")
@@ -97,6 +100,9 @@ export BLRExample
 export MesquiteExample
 export LogmesquiteExample
 export LogmesquiteLogvolumeExample
+export LogmesquiteLogvaExample
+export LogmesquiteLogvasExample
+export LogmesquiteLogvashExample
 export KilpisjarviExample
 export EarnHeightExample
 export LogearnHeightExample

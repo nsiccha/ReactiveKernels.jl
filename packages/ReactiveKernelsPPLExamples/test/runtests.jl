@@ -5,7 +5,7 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     LinearRegressionExample, BetaBinomialExample, PoissonGammaExample,
     GLMPoissonExample, GLMBinomialExample, EightSchoolsNoncenteredExample,
     GLMMPoissonExample, BLRExample,
-    MesquiteExample, LogmesquiteExample, LogmesquiteLogvolumeExample, KilpisjarviExample, EarnHeightExample, LogearnHeightExample, Log10earnHeightExample, LogearnInteractionExample, ARKExample, MhExample,
+    MesquiteExample, LogmesquiteExample, LogmesquiteLogvolumeExample, LogmesquiteLogvaExample, LogmesquiteLogvasExample, LogmesquiteLogvashExample, KilpisjarviExample, EarnHeightExample, LogearnHeightExample, Log10earnHeightExample, LogearnInteractionExample, ARKExample, MhExample,
     NesLogitExample, WellsDistExample, WellsDist100Example, DogsLogExample, NESExample, KidscoreMomWorkExample, Rate1Example,
     RadonPooledExample, RadonPartiallyPooledCenteredExample, RadonPartiallyPooledNoncenteredExample, RadonVariableInterceptCenteredExample,
     Rate2Example, Rate3Example, Rate4Example, Rate5Example,
@@ -32,6 +32,9 @@ include("test_blr_example.jl")
 include("test_mesquite_example.jl")
 include("test_logmesquite_example.jl")
 include("test_logmesquite_logvolume_example.jl")
+include("test_logmesquite_logva_example.jl")
+include("test_logmesquite_logvas_example.jl")
+include("test_logmesquite_logvash_example.jl")
 include("test_kilpisjarvi_example.jl")
 include("test_earn_height_example.jl")
 include("test_logearn_height_example.jl")
