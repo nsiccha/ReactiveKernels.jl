@@ -4,8 +4,9 @@ using ReactiveKernels
 
 export LOCATION_SCALE_SOURCE
 export standard_normal, standard_cauchy, standard_laplace, standard_student_t
+export standard_logistic
 export location_scale
-export normal, cauchy, laplace, student_t
+export normal, cauchy, laplace, student_t, logistic
 export BERNOULLI_KERNEL_SOURCE, LOGNORMAL_KERNEL_SOURCE
 export EXPONENTIAL_KERNEL_SOURCE, GEOMETRIC_KERNEL_SOURCE, UNIFORM_KERNEL_SOURCE
 export MVNORMAL_KERNEL_SOURCE, AR1_KERNEL_SOURCE
@@ -13,20 +14,22 @@ export CATEGORICAL_LOGIT_KERNEL_SOURCE, CATEGORICAL_LOGIT_REF_KERNEL_SOURCE
 export POISSON_KERNEL_SOURCE, GAMMA_KERNEL_SOURCE
 export BETA_KERNEL_SOURCE, BINOMIAL_KERNEL_SOURCE
 export INVERSE_GAMMA_KERNEL_SOURCE, DIRICHLET_KERNEL_SOURCE
+export LKJ_CORR_CHOLESKY_KERNEL_SOURCE
 export bernoulli, lognormal, exponential, geometric, uniform, mvnormal, ar1
 export categorical_logit, categorical_logit_ref
 export poisson, gamma, beta, binomial
-export inverse_gamma, dirichlet
+export inverse_gamma, dirichlet, lkj_corr_cholesky
 export NORMAL_LOGDENSITY_SOURCE, CAUCHY_LOGDENSITY_SOURCE
 export NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY
 export BERNOULLI_SOURCE, LOGNORMAL_SOURCE
 export EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE
 export MVNORMAL_SOURCE, AR1_SOURCE
 export POISSON_SOURCE, GAMMA_SOURCE, BETA_SOURCE, BINOMIAL_SOURCE
-export INVERSE_GAMMA_SOURCE, DIRICHLET_SOURCE
+export INVERSE_GAMMA_SOURCE, DIRICHLET_SOURCE, LKJ_CORR_CHOLESKY_SOURCE
 
 const LOCATION_SCALE_SOURCE = raw"""
 using SpecialFunctions: erfc, erfcinv, loggamma, beta_inc, beta_inc_inv
+using LogExpFunctions: log1pexp
 
 @kernel standard_normal() = begin
     logpdf(z::Float64)::Float64 = -0.5 * log(2π) - 0.5 * z^2
@@ -69,6 +72,16 @@ end
     end
 end
 
+# Standardized logistic (location 0, scale 1), a member of the standard_*
+# family. `logpdf(z) = -z - 2·log1pexp(-z)` is the stable symmetric form; `cdf`
+# is the logistic sigmoid and `quantile` the logit. It carries no parameters, so
+# unlike `standard_student_t` it binds directly through `location_scale`.
+@kernel standard_logistic() = begin
+    logpdf(z::Float64)::Float64 = -z - 2 * log1pexp(-z)
+    cdf(z::Float64)::Float64 = 1 / (1 + exp(-z))
+    quantile(p::Float64)::Float64 = log(p) - log1p(-p)
+end
+
 @kernel location_scale(standard, location::Float64, scale::Float64) = begin
     log_scale::Float64 = log(scale)
     scale::Float64 = exp(log_scale)
@@ -93,6 +106,7 @@ end
 @kernel normal = location_scale(standard_normal)
 @kernel cauchy = location_scale(standard_cauchy)
 @kernel laplace = location_scale(standard_laplace)
+@kernel logistic = location_scale(standard_logistic)
 
 # `location_scale` binds a zero-parameter standard, so it cannot host the
 # df-carrying `standard_student_t`. `student_t` is therefore the explicit
@@ -137,17 +151,20 @@ end
 const _LOCATION_SCALE_BINDINGS = _evaluate_source_bindings(
     LOCATION_SCALE_SOURCE,
     (:standard_normal, :standard_cauchy, :standard_laplace, :standard_student_t,
-     :location_scale, :normal, :cauchy, :laplace, :student_t),
+     :standard_logistic,
+     :location_scale, :normal, :cauchy, :laplace, :student_t, :logistic),
 )
 const standard_normal = _LOCATION_SCALE_BINDINGS[1]
 const standard_cauchy = _LOCATION_SCALE_BINDINGS[2]
 const standard_laplace = _LOCATION_SCALE_BINDINGS[3]
 const standard_student_t = _LOCATION_SCALE_BINDINGS[4]
-const location_scale = _LOCATION_SCALE_BINDINGS[5]
-const normal = _LOCATION_SCALE_BINDINGS[6]
-const cauchy = _LOCATION_SCALE_BINDINGS[7]
-const laplace = _LOCATION_SCALE_BINDINGS[8]
-const student_t = _LOCATION_SCALE_BINDINGS[9]
+const standard_logistic = _LOCATION_SCALE_BINDINGS[5]
+const location_scale = _LOCATION_SCALE_BINDINGS[6]
+const normal = _LOCATION_SCALE_BINDINGS[7]
+const cauchy = _LOCATION_SCALE_BINDINGS[8]
+const laplace = _LOCATION_SCALE_BINDINGS[9]
+const student_t = _LOCATION_SCALE_BINDINGS[10]
+const logistic = _LOCATION_SCALE_BINDINGS[11]
 
 # Compatibility names for existing consumers.  These are views of the shared
 # object graphs, not separately authored formulas.
@@ -161,11 +178,11 @@ const LAPLACE_LOGDENSITY = extract(laplace;
     have = (:x, :location, :scale), want = :logpdf)
 
 const BERNOULLI_KERNEL_SOURCE = raw"""
-using LogExpFunctions: logistic, log1pexp
+using LogExpFunctions: log1pexp
 
 @kernel bernoulli(p::Float64) = begin
     logit::Float64 = log(p) - log1p(-p)
-    p::Float64 = logistic(logit)
+    p::Float64 = 1 / (1 + exp(-logit))
     logp::Float64 = -log1pexp(-logit)
     log1mp::Float64 = -log1pexp(logit)
 
@@ -219,11 +236,11 @@ end
 """
 
 const GEOMETRIC_KERNEL_SOURCE = raw"""
-using LogExpFunctions: logistic, log1pexp
+using LogExpFunctions: log1pexp
 
 @kernel geometric(p::Float64) = begin
     logitp::Float64 = log(p) - log1p(-p)
-    p::Float64 = logistic(logitp)
+    p::Float64 = 1 / (1 + exp(-logitp))
     logp::Float64 = -log1pexp(-logitp)
     log1mp::Float64 = -log1pexp(logitp)
 
@@ -412,12 +429,12 @@ end
 # closed-form quantile (discrete inversion), so only `logpdf` and `cdf` are
 # exposed. `cdf` is the regularized incomplete beta I_{1-p}(n-k, k+1).
 const BINOMIAL_KERNEL_SOURCE = raw"""
-using LogExpFunctions: logistic, log1pexp
+using LogExpFunctions: log1pexp
 using SpecialFunctions: loggamma, beta_inc
 
 @kernel binomial(n::Int, p::Float64) = begin
     logit::Float64 = log(p) - log1p(-p)
-    p::Float64 = logistic(logit)
+    p::Float64 = 1 / (1 + exp(-logit))
     logp::Float64 = -log1pexp(-logit)
     log1mp::Float64 = -log1pexp(logit)
 
@@ -488,6 +505,40 @@ using SpecialFunctions: loggamma
 end
 """
 
+# Cholesky factor of a correlation matrix; the LKJ prior on that factor (the
+# conjugate-style shrinkage prior for a correlation structure). `eta` is the LKJ
+# shape (eta=1 uniform over correlation matrices; eta>1 concentrates toward the
+# identity). One whole-matrix graph (like `mvnormal`/`dirichlet`), not a scalar
+# plate: the observation is a single K×K lower-triangular Cholesky factor `L`.
+# The density is the LKJ 2009 (JMA) form, matching Stan's `lkj_corr_cholesky` and
+# `Distributions.LKJCholesky`:
+#   log p(L|eta) = Σ_{i=2}^{K} (K + 2(eta-1) - i)·log(L[i,i]) - loginvconst(eta,K)
+# with the onion normalizer (LKJ eq. 17). L[1,1]=1 ⇒ its i=1 term is 0, so the
+# kernel sums the weighted log-diagonal over all i. Straight-line authoring note:
+# the dimension is taken as `Kf::Float64 = size(L,1)` for the scalar arithmetic
+# and inline `size(L,1)` inside the ranges — a single reused integer node across
+# the many normalizer terms does not route through the planner.
+const LKJ_CORR_CHOLESKY_KERNEL_SOURCE = raw"""
+using SpecialFunctions: loggamma, logbeta
+using LinearAlgebra: diag
+
+@kernel lkj_corr_cholesky(eta::Float64) = begin
+    logpdf(L::Matrix{Float64})::Float64 = begin
+        Kf::Float64 = size(L, 1)
+        kernel_term::Float64 =
+            sum(((Kf + 2 * (eta - 1)) .- (1:size(L, 1))) .* log.(diag(L)))
+        alpha::Float64 = eta + 0.5 * Kf - 1
+        loginvconst::Float64 =
+            (2 * eta + Kf - 3) * log(2.0) +
+            (log(π) / 4) * (Kf * (Kf - 1) - 2) +
+            logbeta(alpha, alpha) -
+            (Kf - 2) * loggamma(eta + 0.5 * (Kf - 1)) +
+            sum(loggamma.(eta .+ 0.5 .* (0:(size(L, 1) - 3))); init = 0.0)
+        kernel_term - loginvconst
+    end
+end
+"""
+
 const _OTHER_DISTRIBUTION_BINDINGS = _evaluate_source_bindings(
     join((BERNOULLI_KERNEL_SOURCE, LOGNORMAL_KERNEL_SOURCE,
           EXPONENTIAL_KERNEL_SOURCE, GEOMETRIC_KERNEL_SOURCE,
@@ -496,11 +547,12 @@ const _OTHER_DISTRIBUTION_BINDINGS = _evaluate_source_bindings(
           CATEGORICAL_LOGIT_REF_KERNEL_SOURCE,
           POISSON_KERNEL_SOURCE, GAMMA_KERNEL_SOURCE,
           BETA_KERNEL_SOURCE, BINOMIAL_KERNEL_SOURCE,
-          INVERSE_GAMMA_KERNEL_SOURCE, DIRICHLET_KERNEL_SOURCE), "\n"),
+          INVERSE_GAMMA_KERNEL_SOURCE, DIRICHLET_KERNEL_SOURCE,
+          LKJ_CORR_CHOLESKY_KERNEL_SOURCE), "\n"),
     (:bernoulli, :lognormal, :exponential, :geometric, :uniform, :mvnormal, :ar1,
      :categorical_logit, :categorical_logit_ref,
      :poisson, :gamma, :beta, :binomial,
-     :inverse_gamma, :dirichlet),
+     :inverse_gamma, :dirichlet, :lkj_corr_cholesky),
 )
 const bernoulli = _OTHER_DISTRIBUTION_BINDINGS[1]
 const lognormal = _OTHER_DISTRIBUTION_BINDINGS[2]
@@ -517,6 +569,7 @@ const beta = _OTHER_DISTRIBUTION_BINDINGS[12]
 const binomial = _OTHER_DISTRIBUTION_BINDINGS[13]
 const inverse_gamma = _OTHER_DISTRIBUTION_BINDINGS[14]
 const dirichlet = _OTHER_DISTRIBUTION_BINDINGS[15]
+const lkj_corr_cholesky = _OTHER_DISTRIBUTION_BINDINGS[16]
 
 const BERNOULLI_SOURCE = BERNOULLI_KERNEL_SOURCE * raw"""
 
@@ -909,6 +962,27 @@ docs_example = (;
     inputs,
     spec = dirichlet.logpdf,
     kernel = dirichlet_kernel,
+    output,
+)
+"""
+
+const LKJ_CORR_CHOLESKY_SOURCE = LKJ_CORR_CHOLESKY_KERNEL_SOURCE * raw"""
+
+lkj_corr_cholesky_kernel = prepare(lkj_corr_cholesky.logpdf;
+    have = (:L, :eta), want = :logpdf)
+
+# A 2×2 correlation Cholesky factor (0.6² + 0.8² = 1) and LKJ shape η = 2.
+L = [1.0 0.0; 0.6 0.8]
+eta = 2.0
+inputs = (; L, eta)
+output = lkj_corr_cholesky_kernel(L, eta)
+
+docs_example = (;
+    name = :lkj_corr_cholesky_factor,
+    origin = "LKJ prior on a correlation-matrix Cholesky factor (build executed)",
+    inputs,
+    spec = lkj_corr_cholesky.logpdf,
+    kernel = lkj_corr_cholesky_kernel,
     output,
 )
 """
