@@ -18,6 +18,7 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     KidscoreMomhsExample, KidscoreMomiqExample, KidscoreMomhsiqExample, KidscoreInteractionExample,
     KidscoreInteractionCExample, KidscoreInteractionC2Example, KidscoreInteractionZExample,
     DugongsGrowthExample, ARMA11Example, GaussianMixtureExample,
+    NormalMixtureExample, LowDimGaussMixCollapseExample, LowDimGaussMixExample,
     MNISTLogisticExample, MVNormalRegressionExample, BoundRegressionExample
 using Test
 
@@ -100,6 +101,9 @@ include("test_kidscore_interaction_z_example.jl")
 include("test_dugongs_example.jl")
 include("test_arma11_example.jl")
 include("test_gaussian_mixture_example.jl")
+include("test_normal_mixture_example.jl")
+include("test_low_dim_gauss_mix_collapse_example.jl")
+include("test_low_dim_gauss_mix_example.jl")
 include("test_mvnormal_regression_example.jl")
 include("test_bound_regression_example.jl")
 include("test_ppl_macro.jl")

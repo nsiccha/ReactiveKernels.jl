@@ -79,6 +79,9 @@ using ReactiveKernelsPPLExamples.KidscoreInteractionZExample: evaluate_kidscore_
 using ReactiveKernelsPPLExamples.BetaBinomialExample: evaluate_beta_binomial_source
 using ReactiveKernelsPPLExamples.DugongsGrowthExample: evaluate_dugongs_source
 using ReactiveKernelsPPLExamples.GaussianMixtureExample: evaluate_gaussian_mixture_source
+using ReactiveKernelsPPLExamples.NormalMixtureExample: evaluate_normal_mixture_source
+using ReactiveKernelsPPLExamples.LowDimGaussMixCollapseExample: evaluate_low_dim_gauss_mix_collapse_source
+using ReactiveKernelsPPLExamples.LowDimGaussMixExample: evaluate_low_dim_gauss_mix_source
 using ReactiveKernelsPPLExamples.MVNormalRegressionExample:
     build_mvnormal_regression_graph, MVREG_X, MVREG_Y,
     MVREG_COVARIANCE, MVREG_CHOL, MVREG_PRECISION, MVREG_PRECISION_CHOL
@@ -418,6 +421,18 @@ end
     end
     @testset "dugongs" begin
         a = evaluate_dugongs_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "normal_mixture (posteriordb; 2-component mixture)" begin
+        a = evaluate_normal_mixture_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "low_dim_gauss_mix_collapse (posteriordb; 2-component mixture)" begin
+        a = evaluate_low_dim_gauss_mix_collapse_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "low_dim_gauss_mix (posteriordb; 2-component mixture, ordered)" begin
+        a = evaluate_low_dim_gauss_mix_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
     @testset "gaussian_mixture" begin

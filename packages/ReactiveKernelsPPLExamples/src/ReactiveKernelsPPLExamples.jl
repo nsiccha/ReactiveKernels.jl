@@ -81,6 +81,9 @@ include("election88_full.jl")
 include("dugongs_growth.jl")
 include("arma11.jl")
 include("gaussian_mixture.jl")
+include("normal_mixture.jl")
+include("low_dim_gauss_mix_collapse.jl")
+include("low_dim_gauss_mix.jl")
 include("mnist_logistic.jl")
 include("mvnormal_regression.jl")
 include("bound_regression.jl")
@@ -179,6 +182,9 @@ export Election88FullExample
 export DugongsGrowthExample
 export ARMA11Example
 export GaussianMixtureExample
+export NormalMixtureExample
+export LowDimGaussMixCollapseExample
+export LowDimGaussMixExample
 export MNISTLogisticExample
 export MVNormalRegressionExample
 export BoundRegressionExample
