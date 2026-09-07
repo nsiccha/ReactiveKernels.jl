@@ -284,6 +284,11 @@ end
         pointwise = prepare(extract(spec; have = (:x,), want = :terms))
         @test total(values) == sum(expected)
         @test pointwise(values) == expected
+        # A materialized cell must produce a concrete container, never a boxed
+        # `Vector{Any}` — an untyped cell (metadata result type `Any`) is
+        # narrowed to its element type so the node stays promotable at the
+        # Reactant host-operand boundary (snag untyped-plate-ce).
+        @test pointwise(values) isa Vector{Float64}
     end
 end
 

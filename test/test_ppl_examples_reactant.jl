@@ -6,7 +6,8 @@ using ReactiveKernelsPPLExamples.LinearRegressionExample:
     evaluate_linear_regression_source
 using ReactiveKernelsPPLExamples.ARMA11Example: evaluate_arma11_source
 using ReactiveKernelsPPLExamples.PoissonGammaExample: evaluate_poisson_gamma_source
-using ReactiveKernelsPPLExamples.GLMPoissonExample: evaluate_glm_poisson_source
+using ReactiveKernelsPPLExamples.GLMPoissonExample: evaluate_glm_poisson_source,
+    build_glm_poisson_graph, GLM_POISSON_YEAR, GLM_POISSON_C
 using ReactiveKernelsPPLExamples.GLMBinomialExample: evaluate_glm_binomial_source
 using ReactiveKernelsPPLExamples.EightSchoolsNoncenteredExample:
     evaluate_eight_schools_noncentered_source
@@ -466,6 +467,27 @@ end
         a = evaluate_beta_binomial_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
+    # A scalar parameter (`logit_rate`) with every array port bound, so the only
+    # traced argument is a `TracedRNumber`: the plate's data lives entirely in
+    # bound host arrays. Compiles to the tensorized body (data-only support mask
+    # materialized as `Array{Bool}`, mixed host/traced ops promoted to a concrete
+    # traced eltype) rather than the native host-buffer loop.
+    @testset "beta_binomial (scalar param, all array data bound)" begin
+        a = evaluate_beta_binomial_source()
+        kb = prepare(a.model;
+            have = (:logit_rate, :trials, :successes), want = a.requested_nodes,
+            bound = (; trials = a.inputs.trials, successes = a.inputs.successes))
+        native = kb(a.inputs.logit_rate)
+        @test _rapprox(_compile_run(kb, (a.inputs.logit_rate,)), native)
+    end
+    @testset "poisson_gamma (scalar param, all array data bound)" begin
+        a = evaluate_poisson_gamma_source()
+        kb = prepare(a.model;
+            have = (:log_rate, :counts), want = a.requested_nodes,
+            bound = (; counts = a.inputs.counts))
+        native = kb(a.inputs.log_rate)
+        @test _rapprox(_compile_run(kb, (a.inputs.log_rate,)), native)
+    end
     @testset "dugongs" begin
         a = evaluate_dugongs_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
@@ -512,5 +534,28 @@ end
             have = (:unconstrained, :raw_predictors, :responses), want = :density,
             bound = (; raw_predictors = BOUND_RAW_X))
         @test _rapprox(_compile_run(bound, (q, BOUND_Y)), bound(q, BOUND_Y))
+    end
+    @testset "glm_poisson with bound host data (>16-lane plate)" begin
+        # The benchmark shape: every data port BOUND as a host array, only the
+        # unconstrained vector traced.  `counts` is then a host `Vector{Int}`
+        # inside the 40-lane likelihood plate (above the 16-lane scalar-lanes
+        # threshold, so it lowers through Reactant's broadcast), and the Poisson
+        # `logpdf` cell guards validity with `ifelse(observed >= 0, …, -Inf)`.
+        # Reactant deduces the broadcast eltype from the RAW host element type
+        # before promoting operands, so that guard on a host `Bool` inferred
+        # `Union{Float64,TracedRNumber{Float64}}` — typejoin `Number`, for which
+        # Reactant has no traced `similar` — and the plate failed to trace.  The
+        # extension now promotes host array operands of a large vector plate
+        # before broadcasting, so the bound graph reproduces native.
+        model = build_glm_poisson_graph()
+        q = [0.2, 0.1, -0.05, 0.03]
+        have = (:unconstrained, :year, :counts)
+        all_bound = prepare(model; have, want = :posterior,
+            bound = (; year = GLM_POISSON_YEAR, counts = GLM_POISSON_C))
+        @test _rapprox(_compile_run(all_bound, (q,)), all_bound(q))
+        counts_bound = prepare(model; have, want = :posterior,
+            bound = (; counts = GLM_POISSON_C))
+        @test _rapprox(_compile_run(counts_bound, (q, GLM_POISSON_YEAR)),
+                       counts_bound(q, GLM_POISSON_YEAR))
     end
 end
