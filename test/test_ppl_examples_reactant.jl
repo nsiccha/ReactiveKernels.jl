@@ -86,6 +86,7 @@ using ReactiveKernelsPPLExamples.GaussianMixtureExample: evaluate_gaussian_mixtu
 using ReactiveKernelsPPLExamples.NormalMixtureExample: evaluate_normal_mixture_source
 using ReactiveKernelsPPLExamples.LowDimGaussMixCollapseExample: evaluate_low_dim_gauss_mix_collapse_source
 using ReactiveKernelsPPLExamples.LowDimGaussMixExample: evaluate_low_dim_gauss_mix_source
+using ReactiveKernelsPPLExamples.SurveyModelExample: evaluate_survey_model_source
 using ReactiveKernelsPPLExamples.MVNormalRegressionExample:
     build_mvnormal_regression_graph, MVREG_X, MVREG_Y,
     MVREG_COVARIANCE, MVREG_CHOL, MVREG_PRECISION, MVREG_PRECISION_CHOL
@@ -453,6 +454,10 @@ end
     end
     @testset "low_dim_gauss_mix (posteriordb; 2-component mixture, ordered)" begin
         a = evaluate_low_dim_gauss_mix_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "Survey_model (posteriordb; discrete-n marginalization)" begin
+        a = evaluate_survey_model_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
     @testset "gaussian_mixture" begin
