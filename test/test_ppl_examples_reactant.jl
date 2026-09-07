@@ -66,19 +66,36 @@ end
         a = evaluate_linear_regression_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
-    @testset "arma11 (vectorized closed form lowers; raw recursion stays native-only)" begin
-        # Side-by-side: the model's likelihood/density reduce the vectorized
-        # `errors_closed` (a Toeplitz matvec), which LOWERS and reproduces native.
-        # The natural sequential `errors` node reads err[t-1]/series[t-1] element
-        # by element, so it still does NOT lower (XLA disallows scalar indexing of
-        # a traced array) — kept as an explicit tested diagnostic. A sequential-scan
-        # (stablehlo.while) lowering would let the natural recursion lower directly;
+    @testset "arma11 (natural sequential recursion lowers via scan → stablehlo.while)" begin
+        # The likelihood/density reduce the NATURAL sequential `errors`, authored
+        # with the `scan` primitive, which lowers the one-step-ahead recurrence to
+        # a `stablehlo.while` carry loop (no per-step scalar indexing of a traced
+        # array) and reproduces native. `errors_closed` (a vectorized Toeplitz
+        # matvec) is kept as an independent numerical cross-check. This flips the
+        # former diagnostic (the raw `for`/`err[t-1]` recursion did NOT lower);
         # see docs/src/arma11.md.
         a = evaluate_arma11_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+
+        # The natural sequential `errors` now LOWERS through Reactant (was a
+        # tested `@test_throws` diagnostic before the scan primitive) and matches
+        # native.
         seq_errors_kernel = prepare(a.model;
             have = (:unconstrained, :series), want = :errors)
-        @test_throws Exception _compile_run(seq_errors_kernel, Tuple(a.inputs))
+        native_errors = seq_errors_kernel(a.inputs.q, a.inputs.series)
+        @test _rapprox(
+            _compile_run(seq_errors_kernel, Tuple(a.inputs)), native_errors)
+
+        # It lowers to a stablehlo.while carry loop rather than unrolling.
+        traced = map(_trace, Tuple(a.inputs))
+        hlo = repr(Reactant.@code_hlo optimize = false seq_errors_kernel(traced...))
+        @test occursin("stablehlo.while", hlo)
+
+        # Independent cross-check: the scan errors equal the vectorized closed form.
+        both_kernel = prepare(a.model;
+            have = (:unconstrained, :series), want = (:errors, :errors_closed))
+        e_scan, e_closed = both_kernel(a.inputs.q, a.inputs.series)
+        @test _rapprox(e_scan, e_closed)
     end
     @testset "poisson_gamma" begin
         a = evaluate_poisson_gamma_source()
