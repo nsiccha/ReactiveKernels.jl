@@ -1046,10 +1046,35 @@ end
 # broadcast.
 ReactiveKernels._tensorized_plate_is_marker(::Reactant.TracedRArray{<:Any,1}) =
     true
+# A host-resident array operand of a large vector plate — typically `bound=`
+# data such as an integer count vector — is a compile-time constant of the
+# traced program.  Reactant's broadcast promotes every operand to a traced
+# constant before applying the cell body, but it deduces the RESULT eltype
+# first, from the RAW host element type (`Int64`, not `TracedRNumber{Int64}`).
+# A fused cell body whose result type depends on how a host scalar combines
+# with a traced one — the discrete-family validity guard
+# `ifelse(observed >= 0, <traced>, -Inf)` infers
+# `Union{Float64,TracedRNumber{Float64}}` on a host `Bool` condition — then
+# deduces the abstract typejoin `Number`, for which Reactant defines no traced
+# `similar`, and the plate dies in
+# `similar(::Broadcasted{AbstractReactantArrayStyle}, ::Type{Number})`.
+# Promote host array operands here (the same `promote_to` the cat/broadcast
+# wrappers of a fused body use), so the cell body is typed on traced scalars
+# exactly as Reactant's element application evaluates it and the deduced
+# eltype is concrete.  Already-traced operands pass through untouched, so an
+# all-traced plate lowers exactly as before; `Ref`-wrapped shared scalars are
+# not arrays and are likewise untouched.
+@inline _reactant_plate_broadcast_operand(arg) = arg
+@inline _reactant_plate_broadcast_operand(arg::Reactant.TracedRArray) = arg
+@inline _reactant_plate_broadcast_operand(arg::AbstractArray) =
+    Reactant.promote_to(Reactant.TracedRArray, arg)
 function ReactiveKernels._tensorized_plate_call(
         marker::Reactant.TracedRArray{<:Any,1}, operation, args::Tuple)
     lanes = _reactant_plate_lanes(size(marker, 1), operation, args)
-    lanes === nothing ? Base.broadcast(operation, args...) : lanes
+    lanes === nothing ?
+        Base.broadcast(operation,
+                       map(_reactant_plate_broadcast_operand, args)...) :
+        lanes
 end
 
 @inline _authored_plate_batch_length(arg::_PlateLanes) = length(arg.lanes)
