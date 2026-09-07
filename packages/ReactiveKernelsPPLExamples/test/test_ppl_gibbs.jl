@@ -330,6 +330,63 @@ _nlp(x, mu, sig) = -0.5 * log(2π) - log(sig) - 0.5 * ((x - mu) / sig)^2
         end
     end
 
+    @testset "current-state conjugacy: Beta inclusion prob given a Bernoulli latent" begin
+        # omega ~ Beta(a0,b0); z_j ~ Bernoulli(omega); y informs z strongly. Then
+        # omega | z is Beta(a0 + Σz, b0 + Σ(1-z)), recomputed from the CURRENT z
+        # each sweep — an exact current-state conjugate draw (SSVS's omega block).
+        @ppl incl(y::Vector{Float64}, p::Int) = begin
+            omega ~ beta(2.0, 3.0)
+            z::vector[p] ~ bernoulli(omega)
+            y ~ normal(ifelse(z, 5.0, -5.0), 0.5)
+        end
+        p = 8
+        y = [5.2, 4.7, 5.1, 4.9, 5.3, -4.8, -5.1, -4.6]   # 5 "on", 3 "off"
+        res = gibbs(incl; blocks = [:omega, :z], data = (; y, p),
+                    init = (; omega = 0.5, z = fill(true, p)),
+                    support = (; omega = :unit), iters = 20000, warmup = 2000,
+                    rng = MersenneTwister(3))
+        om = Float64.(res.draws[:omega])
+        @test res.accept_rate[:omega] == 1.0              # exact conjugate draw
+        @test all(x -> 0.0 < x < 1.0, om)
+        # z is essentially determined by y (Σz ≈ 5), so omega | z ≈ Beta(7, 6).
+        @test isapprox(_mean(om), 7 / 13; atol = 0.03)    # Beta(7,6) mean
+    end
+
+    @testset "current-state conjugacy: Inverse-Gamma-Normal variance" begin
+        # sigma2 ~ InvGamma(a,b) as the VARIANCE of a Normal likelihood
+        # (`normal(mu, sqrt(sigma2))`). sigma2 | y ~ InvGamma(a + n/2, b + SSR/2),
+        # SSR = Σ(y-mu)². The engine recovers SSR from the current likelihood each
+        # sweep and draws exactly (a current-state conjugate).
+        @ppl varm(y::Vector{Float64}, mu::Float64, a::Float64, b::Float64) = begin
+            sigma2 ~ inverse_gamma(a, b)
+            y ~ normal(mu, sqrt(sigma2))
+        end
+        info = PPLMacro.model_info(varm)
+        @test info.params[1].name == :sigma2
+        @test info.params[1].prior_family == :inverse_gamma
+
+        rng = MersenneTwister(9)
+        n = 50
+        mu = 0.0
+        y = mu .+ 1.5 .* randn(rng, n)
+        a = 2.0
+        b = 1.0
+        ssr = sum((y .- mu) .^ 2)
+        apost = a + n / 2
+        bpost = b + ssr / 2
+        post_mean = bpost / (apost - 1)                         # InvGamma mean
+        post_sd = bpost / ((apost - 1) * sqrt(apost - 2))       # InvGamma sd
+
+        res = gibbs(varm; blocks = [:sigma2], data = (; y, mu, a, b),
+                    init = (; sigma2 = 1.0), support = (; sigma2 = :positive),
+                    iters = 20000, warmup = 2000, rng = MersenneTwister(4))
+        s2 = Float64.(res.draws[:sigma2])
+        @test res.accept_rate[:sigma2] == 1.0             # exact conjugate draw
+        @test all(>(0.0), s2)
+        @test isapprox(_mean(s2), post_mean; rtol = 0.03)
+        @test isapprox(_std(s2), post_sd; rtol = 0.10)
+    end
+
     @testset "SSVS spike-and-slab acceptance (George & McCulloch) on an @ppl model" begin
         # The full classic SSVS, authored end-to-end in @ppl: a Beta inclusion
         # probability, a vector of Bernoulli inclusion indicators, a conditional
@@ -367,6 +424,7 @@ _nlp(x, mu, sig) = -0.5 * log(2π) - log(sig) - 0.5 * ((x - mu) / sig)^2
         bhat = [_mean([bi[j] for bi in res.draws[:beta]]) for j in 1:p]
 
         @test res.accept_rate[:z] == 1.0                  # exact enumeration for z
+        @test res.accept_rate[:omega] == 1.0              # current-state Beta conjugate
         # variable selection: the true-nonzero coefficients are selected and
         # recovered; the true-zero coefficients are excluded and shrunk.
         for j in (1, 2, 6)

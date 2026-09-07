@@ -37,6 +37,7 @@ include("gibbs_page.jl")
 site_pages = [
     "Home" => "index.md",
     "Compiler capability and limits" => "compiler.md",
+    "Sequential recurrences (scan)" => "scan.md",
     "Distributions" => [
         "Distribution kernels" => "distributions.md",
         "Batched log densities" => "batched.md",
@@ -74,6 +75,7 @@ site_pages = [
         "Adaptive NUTS receipt (static)" => "nuts-reactant.md",
     ],
     "Non-allocating kernels" => "nonallocating.md",
+    "posteriordb benchmark (RK vs Stan vs Turing)" => "posteriordb-comparison.md",
     "Tools and reference" => [
         "DAG visualization" => "visualization.md",
         "API" => "api.md",

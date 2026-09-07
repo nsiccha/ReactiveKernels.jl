@@ -175,6 +175,63 @@ end
         collect(bc) : Base.materialize(bc)
 end
 
+# `LinearAlgebra.dot(a, b)` with a MIXED host-array × traced operand does not lower
+# under a tracing backend: it routes through `conj` on the host vector
+# (`MethodError: no method matching conj(::Vector)`).  ONLY that mix is a problem —
+# a pure-host dot is ordinary Base, and a pure-traced `dot(q, q)` has the backend's
+# own (replica-aware, see `replica`) lowering that existing Reactant kernels rely
+# on.  So `_tensorized_dot` DEFAULTS to the native `dot` for every case, and a
+# tracing extension specializes ONLY the host-array × traced mix onto
+# `_tensorized_normalized_dot` below.  Per user decision `17bnc6t` this normalizes
+# in the `@kernel` lowering, not in Reactant.
+@inline _tensorized_dot(a, b) = LinearAlgebra.dot(a, b)
+
+# Whether a tensorized-dot operand carries a REAL scalar type.  The default reads
+# the element type directly (host arrays/scalars); a tracing backend specializes
+# it to see through its traced scalar wrapper — a `TracedRArray{Float64}`'s
+# `eltype` is `TracedRNumber{Float64}`, not `Float64`, so a bare `eltype <: Real`
+# would misclassify a real traced operand as complex.
+@inline _tensorized_real_operand(x) = eltype(x) <: Real
+
+# Normalize the mixed host/traced dot to the value-identical `sum(a .* b)`
+# reduction over the promoted broadcast (the friendly form the Reactant benchmark
+# authored by hand), so authors can write `dot(data, q)` in the kernel body.
+# Value-exact for REAL operands, so it never silently mis-lowers.  COMPLEX
+# operands are a LOUD error, never rewritten: `dot` conjugates its FIRST argument,
+# so `sum(a .* b)` would silently corrupt a complex-valued result/gradient.
+@inline function _tensorized_normalized_dot(a, b)
+    (_tensorized_real_operand(a) && _tensorized_real_operand(b)) ||
+        throw(ArgumentError(
+            "dot(a, b) over complex operands is not lowerable to a tensorized " *
+            "reduction: `dot` conjugates its first argument, so `sum(a .* b)` " *
+            "would silently corrupt the result. Evaluate this dot on the native " *
+            "path, or supply real operands."))
+    sum(_tensorized_broadcast(*, a, b))
+end
+
+# The sequential-scan primitive `scan(xs, Ref(shared)...; init) do carry, x, s… end`
+# lowers to this.  `step` is the prepared 2-`want` step kernel
+# `(carry, x, shared...) -> (new_carry, output)`; the scan threads `carry`
+# (seeded by `init`) over `xs` in order and collects the per-step outputs.  The
+# default is the ordinary native loop — already correct, and the arma11 `errors`
+# recurrence proves the native form works.  A tracing backend SPECIALIZES this
+# (on a traced `xs`) to emit a `stablehlo.while` carry loop, so the natural
+# sequential form lowers under Reactant without unrolling (RK-macro-only per
+# decision `17bnc6t`; Reactant untouched).
+@inline function _tensorized_scan(step, xs, init, shared...)
+    idx = eachindex(xs)
+    isempty(idx) && throw(ArgumentError("scan requires a non-empty sequence"))
+    i1 = first(idx)
+    carry, out1 = step(init, xs[i1], shared...)
+    result = similar(xs, typeof(out1))
+    result[i1] = out1
+    for i in Iterators.drop(idx, 1)
+        carry, out = step(carry, xs[i], shared...)
+        result[i] = out
+    end
+    result
+end
+
 # Tensorized authored plates keep slice collections structural instead of
 # materializing Base.Slices.  A backend can consume the parent array as one
 # batched value, while the generic fallback preserves ordinary eachcol

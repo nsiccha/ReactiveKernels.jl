@@ -111,6 +111,13 @@ include("ppl_macro.jl")
 # rk core. See the `PPLGibbs` module docstring.
 include("ppl_gibbs.jl")
 
+# EXPERIMENTAL, NOT REVIEWED / NOT APPROVED — do NOT build on this. An importable
+# builder for the `@ppl`-authored eight-schools model, so the posteriordb
+# benchmark 4th side can consume it without copying test-local code. Depends on
+# `PPLMacro` above, so it is included after it. Deliberately NOT exported; reach
+# it via `ReactiveKernelsPPLExamples.PPLEightSchoolsExample`.
+include("ppl_eight_schools.jl")
+
 export EightSchoolsExample
 export SumToZeroExample
 export LinearRegressionExample
