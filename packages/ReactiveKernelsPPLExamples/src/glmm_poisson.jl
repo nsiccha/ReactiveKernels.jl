@@ -1,7 +1,7 @@
 module GLMMPoissonExample
 
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
 export GLMM_POISSON_YEAR, GLMM_POISSON_C
 export build_glmm_poisson_graph, demo
@@ -9,24 +9,11 @@ export GLMM_POISSON_SOURCE, evaluate_glmm_poisson_source
 
 # posteriordb `GLMM_Poisson_data-GLMM_Poisson_model` — a hierarchical Poisson-log
 # cubic-trend GLMM with a per-year random effect (BPA ch. 4). Real data (n = 40).
-const GLMM_POISSON_YEAR = [
-    -1.66802789939819, -1.58248800712136, -1.49694811484453, -1.4114082225677,
-    -1.32586833029087, -1.24032843801404, -1.15478854573721, -1.06924865346038,
-    -0.983708761183547, -0.898168868906717, -0.812628976629887,
-    -0.727089084353056, -0.641549192076226, -0.556009299799396,
-    -0.470469407522566, -0.384929515245736, -0.299389622968906,
-    -0.213849730692075, -0.128309838415245, -0.0427699461384151,
-    0.0427699461384151, 0.128309838415245, 0.213849730692075, 0.299389622968906,
-    0.384929515245736, 0.470469407522566, 0.556009299799396, 0.641549192076226,
-    0.727089084353056, 0.812628976629887, 0.898168868906717, 0.983708761183547,
-    1.06924865346038, 1.15478854573721, 1.24032843801404, 1.32586833029087,
-    1.4114082225677, 1.49694811484453, 1.58248800712136, 1.66802789939819,
-]
-const GLMM_POISSON_C = [
-    26, 33, 32, 34, 22, 30, 24, 24, 28, 28, 36, 43, 36, 36, 44, 57, 56, 49, 63,
-    84, 59, 87, 91, 100, 121, 132, 151, 149, 145, 221, 209, 198, 251, 258, 262,
-    265, 259, 261, 263, 244,
-]
+# Real data (full) from posteriordb `GLMM_Poisson_data-GLMM_Poisson_model`, loaded via PosteriorDB.jl.
+let d = _posteriordb_data("GLMM_Poisson_data-GLMM_Poisson_model")
+    global const GLMM_POISSON_YEAR = Float64.(d["year"])
+    global const GLMM_POISSON_C = Int.(d["C"])
+end
 
 const GLMM_POISSON_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, poisson
@@ -96,9 +83,10 @@ using LogExpFunctions: logistic, log1pexp
         a + b1 * y + b2 * (y * y) + b3 * (y * y * y) + e
     end
 
-    # Likelihood: Cⱼ ~ Poisson_log(log_lambdaⱼ), trend+eps fused inline (buffer-free).
-    pointwise = plate(counts, year, eps, alpha, beta1, beta2, beta3) do c, y, e, a, b1, b2, b3
-        poisson(exp(a + b1 * y + b2 * (y * y) + b3 * (y * y * y) + e)).logpdf(c)
+    # Likelihood: Cⱼ ~ Poisson_log(log_lambdaⱼ). Consumes the named `log_lambda`
+    # once via the natural log-rate HAVE route (single-consumer plate-chain, fused).
+    pointwise = plate(counts, log_lambda) do c, ll
+        poisson(; log_rate = ll).logpdf(c)
     end
     likelihood::Float64 = sum(pointwise)
 
@@ -120,16 +108,17 @@ counts = GLMM_POISSON_C
 requested_nodes = (:parameters, :log_jacobian, :prior, :likelihood, :posterior)
 density_kernel = prepare(model;
     have = (:unconstrained, :year, :counts),
-    want = requested_nodes)
+    want = requested_nodes,
+    bound = (; year, counts))
 
-output = density_kernel(q, year, counts)
+output = density_kernel(q)
 parameters, log_jacobian, prior, likelihood, posterior = output
 @assert posterior ≈ prior + likelihood + log_jacobian
 
 docs_example = (;
     name = :glmm_poisson_posterior,
     origin = "posteriordb GLMM_Poisson_model — hierarchical Poisson-log GLMM",
-    inputs = (; q, year, counts),
+    inputs = (; q),
     model,
     kernel = density_kernel,
     output,
