@@ -781,10 +781,48 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
         push!(prepared_arguments, prepared)
     end
     output_axes = gensym(:plate_axes)
+    # A fused plate chain absorbs one axis-check group per sub-plate
+    # (`_compose_authored_plates`). Emitting every one added extra pre-loop
+    # `_plate_require_axes(combine_axes(...))` calls that an equivalent single
+    # `plate` never has, measurably slowing the primal (~1.56× on the snag
+    # `composed-authore` bakeoff). Skip a group ONLY when the always-emitted
+    # `combined_axes` check below fully subsumes it — both conditions required:
+    #   (a) its operands ⊆ the combined operand set, so broadcast-compatibility
+    #       is already validated (the superset's `combine_axes` throws the same
+    #       `DimensionMismatch`); AND
+    #   (b) at least one operand is a STATICALLY provable ≥1-dim axis
+    #       (`_static_plate_axis_class === :axis`), so this sub-plate's own
+    #       "at least one batched broadcast axis" guard (`_plate_require_axes`
+    #       non-empty) cannot fire.
+    # Without (b) an all-scalar sub-plate (a fused producer over untyped ports
+    # bound to runtime scalars) would wrongly pass on an axis contributed by
+    # ANOTHER sub-plate — the `test_authored_plate` `multi`/`unused`
+    # ArgumentError guards. A chain over typed/bound array ports (the common
+    # case) meets both and drops the redundant checks, matching the single plate.
+    combined_positions = Set(position for position in eachindex(raw_arguments)
+                             if raw_arguments[position] !== nothing)
     for group in op.axis_checks
+        group_positions = Int[position for position in group
+                              if raw_arguments[position] !== nothing]
+        # Skip ONLY when the combined check subsumes this group — BOTH required:
+        # (a) operands ⊆ the combined operand set, and (b) at least one operand
+        # is a statically provable ≥1-dim axis. An EMPTY `group_positions` (every
+        # original operand filtered out because it is Ref-atomic or a static
+        # `Number`) is NOT skippable: it means this sub-plate has NO batched axis
+        # of its own, and the group must still lower to `combine_axes()` ⇒
+        # `_plate_require_axes(())` ⇒ `ArgumentError`, exactly as the pre-fusion
+        # single plate would. Both `issubset` (empty ⊆ anything) and `any`
+        # (`false` over empty) already give the right verdict, so no special-case
+        # skip — a `continue` here would let an axis-less producer silently borrow
+        # a sibling sub-plate's axis (regression caught in review of the first
+        # candidate; `snag composed-authore` negative-domain tests below).
+        if issubset(group_positions, combined_positions) &&
+           any(p -> _static_plate_axis_class(valtype(callvalues[p])) === :axis,
+               group_positions)
+            continue
+        end
         group_axes = Expr(:call, GlobalRef(Base.Broadcast, :combine_axes),
-            (raw_arguments[position] for position in group
-             if raw_arguments[position] !== nothing)...)
+            (raw_arguments[position] for position in group_positions)...)
         push!(body.args, Expr(:call, GlobalRef(@__MODULE__, :_plate_require_axes),
                               group_axes))
     end
