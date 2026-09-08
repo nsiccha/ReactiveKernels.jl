@@ -1,7 +1,7 @@
 module SurgicalExample
 
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
 export SURGICAL_SUCCESSES, SURGICAL_TOTALS
 export build_surgical_graph, demo
@@ -11,12 +11,11 @@ export SURGICAL_SOURCE, evaluate_surgical_source
 # binomial model: N = 12 hospitals, each with `successes` deaths of `totals`
 # operations, a per-hospital logit-scale random intercept b_i ~ Normal(mu, sigma)
 # with sigma^2 ~ Inverse-Gamma. The full real dataset (N = 12) is embedded.
-const SURGICAL_SUCCESSES = [
-    0, 18, 8, 46, 8, 13, 9, 31, 14, 8, 29, 24,
-]
-const SURGICAL_TOTALS = [
-    47, 148, 119, 810, 211, 196, 148, 215, 207, 97, 256, 360,
-]
+# Real data (full) from posteriordb `surgical_data-surgical_model`, loaded via PosteriorDB.jl.
+let d = _posteriordb_data("surgical_data-surgical_model")
+    global const SURGICAL_SUCCESSES = Int.(d["r"])
+    global const SURGICAL_TOTALS = Int.(d["n"])
+end
 
 const SURGICAL_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, inverse_gamma, binomial
@@ -62,11 +61,10 @@ using LogExpFunctions: logistic
     prior::Float64 = fixed_prior + b_prior
 
     # Likelihood: successes_i ~ Binomial_logit(totals_i, b_i). b_i is the
-    # logit-scale intercept per hospital; the Binomial endpoint takes the success
-    # probability, so the logit link is `logistic(.)` applied inline. All three
-    # inputs are per-cell slices, so the total fuses buffer-free.
+    # logit-scale per-hospital intercept, consumed via the natural logit HAVE
+    # route; all inputs are per-cell slices, so the total fuses buffer-free.
     pointwise = plate(successes, totals, b) do r, nt, bb
-        binomial(nt, logistic(bb)).logpdf(r)
+        binomial(; n = nt, logit = bb).logpdf(r)
     end
     likelihood::Float64 = sum(pointwise)
 
@@ -91,16 +89,17 @@ totals = SURGICAL_TOTALS
 requested_nodes = (:parameters, :log_jacobian, :prior, :likelihood, :posterior)
 density_kernel = prepare(model;
     have = (:unconstrained, :successes, :totals),
-    want = requested_nodes)
+    want = requested_nodes,
+    bound = (; successes, totals))
 
-output = density_kernel(q, successes, totals)
+output = density_kernel(q)
 parameters, log_jacobian, prior, likelihood, posterior = output
 @assert posterior ≈ prior + likelihood + log_jacobian
 
 docs_example = (;
     name = :surgical_posterior,
     origin = "posteriordb surgical_model — hierarchical binomial-logit model",
-    inputs = (; q, successes, totals),
+    inputs = (; q),
     model,
     kernel = density_kernel,
     output,

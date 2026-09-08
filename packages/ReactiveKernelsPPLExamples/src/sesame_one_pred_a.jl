@@ -1,7 +1,7 @@
 module SesameOnePredAExample
 
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
 export SESAME_ENCOURAGED, SESAME_WATCHED
 export build_sesame_one_pred_a_graph, demo
@@ -15,22 +15,11 @@ export SESAME_ONE_PRED_A_SOURCE, evaluate_sesame_one_pred_a_source
 # prior on the positive scale sigma. The full real dataset has N = 240; embedded
 # here verbatim is a faithfully-shaped systematic (every-fifth) subset, N = 48,
 # preserving the joint 0/1 pattern of (encouraged, watched).
-const SESAME_ENCOURAGED = Float64[
-    1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0,
-    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0,
-    0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
-    0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0,
-    1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0,
-    0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0,
-]
-const SESAME_WATCHED = Float64[
-    0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
-    1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0,
-    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
-    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
-    0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0,
-    0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0,
-]
+# Real data (full) from posteriordb `sesame_data-sesame_one_pred_a`, loaded via PosteriorDB.jl.
+let d = _posteriordb_data("sesame_data-sesame_one_pred_a")
+    global const SESAME_ENCOURAGED = Float64.(d["encouraged"])
+    global const SESAME_WATCHED = Float64.(d["watched"])
+end
 
 const SESAME_ONE_PRED_A_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
@@ -61,12 +50,10 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
         b1 + b2 * e
     end
 
-    # Likelihood: watched[n] ~ Normal(beta1 + beta2*encouraged[n], sigma). The
-    # mean is recomputed inline (not read from `mu`), so a total-only query fuses
-    # the traversal and materializes no intermediate vector (structural CSE merges
-    # it with `mu` only when both are requested).
-    pointwise = plate(watched, encouraged, beta1, beta2, sigma) do w, e, b1, b2, s
-        normal(b1 + b2 * e, s).logpdf(w)
+    # Likelihood: watched[n] ~ Normal(mu[n], sigma). Consumes the named `mu` once
+    # (single-consumer plate-chain, fused buffer-free).
+    pointwise = plate(watched, mu, sigma) do w, m, s
+        normal(m, s).logpdf(w)
     end
     likelihood::Float64 = sum(pointwise)
 
@@ -89,16 +76,17 @@ watched = SESAME_WATCHED
 requested_nodes = (:parameters, :log_jacobian, :likelihood, :posterior)
 density_kernel = prepare(model;
     have = (:unconstrained, :encouraged, :watched),
-    want = requested_nodes)
+    want = requested_nodes,
+    bound = (; encouraged, watched))
 
-output = density_kernel(q, encouraged, watched)
+output = density_kernel(q)
 parameters, log_jacobian, likelihood, posterior = output
 @assert posterior ≈ likelihood + log_jacobian
 
 docs_example = (;
     name = :sesame_one_pred_a_posterior,
     origin = "posteriordb sesame_one_pred_a — compliance regression of watched on encouraged",
-    inputs = (; q, encouraged, watched),
+    inputs = (; q),
     model,
     kernel = density_kernel,
     output,

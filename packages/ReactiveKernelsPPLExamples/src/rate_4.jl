@@ -1,13 +1,16 @@
 module Rate4Example
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 export RATE4_N, RATE4_K
 export build_rate_4_graph, demo, RATE_4_SOURCE, evaluate_rate_4_source
 # posteriordb Rate_4_model — "Prior and Posterior Prediction": theta (fit) + thetaprior
-# (prior-only param). Real data (k=1, n=15). RNG posterior/prior-predictive draws
-# are outside the pure graph (like other prediction examples), so the graph exposes
+# (prior-only param). Real data loaded via PosteriorDB.jl. RNG posterior/prior-predictive
+# draws are outside the pure graph (like other prediction examples), so the graph exposes
 # the density + both constrained rates.
-const RATE4_N = 15; const RATE4_K = 1
+let d = _posteriordb_data("Rate_4_data-Rate_4_model")
+    global const RATE4_N = Int(d["n"])
+    global const RATE4_K = Int(d["k"])
+end
 const RATE_4_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: beta, binomial
 using LogExpFunctions: logistic, log1pexp
@@ -31,12 +34,12 @@ end
 q = [0.1, 0.0]
 n = RATE4_N; k = RATE4_K
 requested_nodes = (:parameters, :prior, :likelihood, :posterior)
-density_kernel = prepare(model; have = (:unconstrained, :n, :k), want = requested_nodes)
-output = density_kernel(q, n, k)
+density_kernel = prepare(model; have = (:unconstrained, :n, :k), want = requested_nodes, bound = (; n, k))
+output = density_kernel(q)
 parameters, prior, likelihood, posterior = output
 @assert posterior ≈ prior + likelihood + (-log1pexp(-0.1)-log1pexp(0.1)) + (-log1pexp(0.0)-log1pexp(0.0))
 docs_example = (; name = :rate_4_posterior, origin = "posteriordb Rate_4_model — prior and posterior prediction",
-    inputs = (; q, n, k), model, kernel = density_kernel, output, requested_nodes,
+    inputs = (; q), model, kernel = density_kernel, output, requested_nodes,
     beta_object = beta, binomial_object = binomial)
 """
 evaluate_rate_4_source() = _evaluate_ppl_source(RATE_4_SOURCE, @__MODULE__; bindings = (:RATE4_N, :RATE4_K))

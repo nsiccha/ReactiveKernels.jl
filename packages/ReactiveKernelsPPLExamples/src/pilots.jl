@@ -1,7 +1,7 @@
 module PilotsExample
 
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
 export PILOTS_GROUP_ID, PILOTS_SCENARIO_ID, PILOTS_Y
 export build_pilots_graph, demo
@@ -12,21 +12,12 @@ export PILOTS_SOURCE, evaluate_pilots_source
 # and a scenario (n_scenarios = 8), and a continuous outcome y. The mean is
 # y_hat[i] = a[group_id[i]] + b[scenario_id[i]] (two integer-array gathers). The
 # full real dataset (N = 40) is embedded verbatim.
-const PILOTS_GROUP_ID = [
-    1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3,
-    3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5,
-]
-const PILOTS_SCENARIO_ID = [
-    1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4,
-    5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8,
-]
-const PILOTS_Y = [
-    0.375, 0.0, 0.375, 0.0, 0.333333333333333, 1.0, 0.125, 1.0,
-    0.25, 0.0, 0.5, 0.125, 0.5, 1.0, 0.125, 0.857142857142857,
-    0.5, 0.666666666666667, 0.333333333333333, 0.0, 0.142857142857143, 1.0, 0.0, 1.0,
-    0.142857142857143, 0.0, 0.714285714285714, 0.0, 0.285714285714286, 1.0, 0.142857142857143, 1.0,
-    0.428571428571429, 0.0, 0.285714285714286, 0.857142857142857, 0.857142857142857, 0.857142857142857, 0.142857142857143, 0.75,
-]
+# Real data (full) from posteriordb `pilots-pilots`, loaded via PosteriorDB.jl.
+let d = _posteriordb_data("pilots-pilots")
+    global const PILOTS_GROUP_ID = Int.(d["group_id"])
+    global const PILOTS_SCENARIO_ID = Int.(d["scenario_id"])
+    global const PILOTS_Y = Float64.(d["y"])
+end
 
 const PILOTS_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
@@ -130,16 +121,16 @@ requested_nodes = (:parameters, :log_jacobian, :prior, :likelihood, :posterior)
 density_kernel = prepare(model;
     have = (:unconstrained, :group_id, :scenario_id, :y),
     want = requested_nodes,
-    bound = (; group_id, scenario_id))
+    bound = (; group_id, scenario_id, y))
 
-output = density_kernel(q, y)
+output = density_kernel(q)
 parameters, log_jacobian, prior, likelihood, posterior = output
 @assert posterior ≈ prior + likelihood + log_jacobian
 
 docs_example = (;
     name = :pilots_posterior,
     origin = "posteriordb pilots — two-way crossed random-effects Gaussian model",
-    inputs = (; q, y),
+    inputs = (; q),
     model,
     kernel = density_kernel,
     output,

@@ -1,7 +1,7 @@
 module NesLogitExample
 
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
 export NES_LOGIT_INCOME, NES_LOGIT_VOTE
 export build_nes_logit_graph, demo
@@ -13,15 +13,11 @@ export NES_LOGIT_SOURCE, evaluate_nes_logit_source
 # income levels 1..5 and both vote outcomes) is embedded verbatim so the example
 # is self-contained. `income` is `vector[N]` in Stan, so it is stored as
 # Float64; `vote` is the 0/1 outcome, stored as Bool for the Bernoulli endpoint.
-const NES_LOGIT_INCOME = [
-    4.0, 2.0, 1.0, 2.0, 3.0, 4.0, 2.0, 4.0, 1.0, 4.0, 4.0, 1.0, 3.0, 2.0,
-    3.0, 3.0, 2.0, 3.0, 4.0, 3.0, 3.0, 2.0, 4.0, 3.0, 4.0, 4.0, 2.0, 3.0,
-    2.0, 3.0, 3.0, 3.0, 2.0, 5.0, 3.0, 3.0, 3.0, 4.0, 1.0, 4.0,
-]
-const NES_LOGIT_VOTE = Bool[
-    1, 1, 0, 1, 0, 0, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 1, 0,
-    1, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 1, 0, 1, 0,
-]
+# Real data (full) from posteriordb `nes_logit_data-nes_logit_model`, loaded via PosteriorDB.jl.
+let d = _posteriordb_data("nes_logit_data-nes_logit_model")
+    global const NES_LOGIT_INCOME = Float64.(d["income"])
+    global const NES_LOGIT_VOTE = Bool.(d["vote"])
+end
 
 const NES_LOGIT_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: bernoulli
@@ -54,14 +50,10 @@ using LogExpFunctions: logistic
         a + b1 * inc
     end
 
-    # Likelihood: voteᵢ ~ Bernoulli_logit(ηᵢ). The linear predictor is recomputed
-    # inline inside the likelihood plate (not read from `eta`), so a total-only
-    # query fuses the whole traversal and materializes no intermediate vector.
-    # The Bernoulli endpoint takes the success probability, so the logit link is
-    # `logistic(·)` applied inline (the N = 1 analogue of the binomial-logit GLM
-    # example).
-    pointwise = plate(vote, income, alpha, beta1) do v, inc, a, b1
-        bernoulli(logistic(a + b1 * inc)).logpdf(v)
+    # Likelihood: voteᵢ ~ Bernoulli_logit(ηᵢ). Consumes the named `eta` once via
+    # the natural logit HAVE route (single-consumer plate-chain, fused).
+    pointwise = plate(vote, eta) do v, e
+        bernoulli(; logit = e).logpdf(v)
     end
     likelihood::Float64 = sum(pointwise)
 
@@ -84,16 +76,17 @@ vote = NES_LOGIT_VOTE
 requested_nodes = (:parameters, :log_prior, :likelihood, :posterior)
 density_kernel = prepare(model;
     have = (:unconstrained, :income, :vote),
-    want = requested_nodes)
+    want = requested_nodes,
+    bound = (; income, vote))
 
-output = density_kernel(q, income, vote)
+output = density_kernel(q)
 parameters, log_prior, likelihood, posterior = output
 @assert posterior ≈ log_prior + likelihood
 
 docs_example = (;
     name = :nes_logit_posterior,
     origin = "posteriordb nes_logit_model — Bernoulli-logit GLM (vote ~ income)",
-    inputs = (; q, income, vote),
+    inputs = (; q),
     model,
     kernel = density_kernel,
     output,
