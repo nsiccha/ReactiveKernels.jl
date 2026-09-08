@@ -31,7 +31,7 @@ end
     @testset "authored on the current baseline surface" begin
         @test occursin("bernoulli(logistic(", WELLS_DAE_SOURCE)
         @test occursin(".logpdf(s)", WELLS_DAE_SOURCE)
-        @test occursin("sum(view(unconstrained, 1:1))", WELLS_DAE_SOURCE)
+        @test occursin("unconstrained[1]", WELLS_DAE_SOURCE)
         @test occursin("eta = plate(", WELLS_DAE_SOURCE)
         @test occursin("pointwise = plate(", WELLS_DAE_SOURCE)
         @test !occursin("struct ", WELLS_DAE_SOURCE)

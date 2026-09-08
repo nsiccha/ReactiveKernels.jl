@@ -32,9 +32,9 @@ using LogExpFunctions: logistic, log1pexp, logaddexp
               T::Int,
               M::Int) = begin
     # q = (u_omega, u_mean_p, u_sigma, eps_raw[1..M]); dim = M + 3.
-    u_omega::Float64 = sum(view(unconstrained, 1:1))
-    u_mean_p::Float64 = sum(view(unconstrained, 2:2))
-    u_sigma::Float64 = sum(view(unconstrained, 3:3))
+    u_omega::Float64 = unconstrained[1]
+    u_mean_p::Float64 = unconstrained[2]
+    u_sigma::Float64 = unconstrained[3]
     eps_raw::AbstractVector{Float64} = view(unconstrained, 4:M + 3)
 
     # Constrained: omega, mean_p ∈ [0,1]; sigma ∈ [0,5]. Interval transforms +

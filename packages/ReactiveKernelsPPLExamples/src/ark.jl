@@ -42,9 +42,9 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
               yt::Vector{Float64}) = begin
     # q = (alpha, beta[1..K], log_sigma). alpha/beta unconstrained; sigma = exp.
     n_lag::Int = length(unconstrained) - 2
-    alpha::Float64 = sum(view(unconstrained, 1:1))
+    alpha::Float64 = unconstrained[1]
     beta::AbstractVector{Float64} = view(unconstrained, 2:n_lag + 1)
-    log_sigma::Float64 = sum(view(unconstrained, n_lag + 2:n_lag + 2))
+    log_sigma::Float64 = unconstrained[n_lag + 2]
     log_sigma::Float64 = log(sigma)
     sigma::Float64 = exp(log_sigma)
     log_jacobian::Float64 = log_sigma

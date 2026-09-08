@@ -1,16 +1,22 @@
 module Rate3Example
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 export RATE3_N1, RATE3_N2, RATE3_K1, RATE3_K2
 export build_rate_3_graph, demo, RATE_3_SOURCE, evaluate_rate_3_source
 # posteriordb Rate_3_model — "Inferring a Common Rate". Real data embedded.
-const RATE3_N1 = 10; const RATE3_N2 = 10; const RATE3_K1 = 5; const RATE3_K2 = 7
+# Real data (full) from posteriordb `Rate_3_data-Rate_3_model`, loaded via PosteriorDB.jl.
+let d = _posteriordb_data("Rate_3_data-Rate_3_model")
+    global const RATE3_N1 = Int(d["n1"])
+    global const RATE3_N2 = Int(d["n2"])
+    global const RATE3_K1 = Int(d["k1"])
+    global const RATE3_K2 = Int(d["k2"])
+end
 const RATE_3_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: beta, binomial
 using LogExpFunctions: logistic, log1pexp
 
 @kernel model(unconstrained::Vector{Float64}, n1::Int, n2::Int, k1::Int, k2::Int) = begin
-    u::Float64 = sum(view(unconstrained, 1:1))
+    u::Float64 = unconstrained[1]
     theta::Float64 = logistic(u)
     log_jacobian::Float64 = -log1pexp(-u) - log1pexp(u)
     parameters = (; theta)
@@ -23,12 +29,12 @@ end
 q = [0.2]
 n1 = RATE3_N1; n2 = RATE3_N2; k1 = RATE3_K1; k2 = RATE3_K2
 requested_nodes = (:parameters, :prior, :likelihood, :posterior)
-density_kernel = prepare(model; have = (:unconstrained, :n1, :n2, :k1, :k2), want = requested_nodes)
-output = density_kernel(q, n1, n2, k1, k2)
+density_kernel = prepare(model; have = (:unconstrained, :n1, :n2, :k1, :k2), want = requested_nodes, bound = (; n1, n2, k1, k2))
+output = density_kernel(q)
 parameters, prior, likelihood, posterior = output
 @assert posterior ≈ prior + likelihood + (-log1pexp(-0.2)-log1pexp(0.2))
 docs_example = (; name = :rate_3_posterior, origin = "posteriordb Rate_3_model — inferring a common rate",
-    inputs = (; q, n1, n2, k1, k2), model, kernel = density_kernel, output, requested_nodes,
+    inputs = (; q), model, kernel = density_kernel, output, requested_nodes,
     beta_object = beta, binomial_object = binomial)
 """
 evaluate_rate_3_source() = _evaluate_ppl_source(RATE_3_SOURCE, @__MODULE__; bindings = (:RATE3_N1, :RATE3_N2, :RATE3_K1, :RATE3_K2))
