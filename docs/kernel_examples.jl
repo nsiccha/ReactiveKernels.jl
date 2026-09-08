@@ -573,6 +573,17 @@ function execute_example(mod::Module, code::AbstractString;
     rendered
 end
 
+"""
+    render_inert_source(source) -> Markdown.MD
+
+Render `source` as a static, non-executed Julia code block. Used for a
+reverse-mode AD example whose executable authority is the package test suite, so
+the docs build displays it as source and carries no Enzyme/LLVM autodiff
+toolchain (user decision `00jueci`).
+"""
+render_inert_source(source::AbstractString) =
+    Markdown.MD(Markdown.Code("julia", strip(source, '\n')))
+
 # Pathfinder is an external compiler-acceptance artifact, so the documentation
 # loads its reviewed benchmark fixture instead of maintaining a second copy of
 # the mathematics.  The raw pane is extracted from that same file through the
