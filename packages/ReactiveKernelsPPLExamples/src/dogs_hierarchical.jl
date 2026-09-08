@@ -77,12 +77,11 @@ using LogExpFunctions: logistic, log1pexp
               y::Vector{Bool}) = begin
     # q = (u_a, u_b). Stan declares `real<lower=0, upper=1> a, b`, so the
     # unit-interval constrain is the scaled-logit transform θ = 0 + 1·logistic(u)
-    # = logistic(u), with change-of-variables Jacobian
-    # log|dθ/du| = log(1) - log1pexp(-u) - log1pexp(u) = -log1pexp(-u) -
-    # log1pexp(u) (Stan's `lub_constrain` with width 1). One-element reductions
-    # keep the packed scalars traceable as a Reactant tensor program.
-    u_a::Float64 = sum(view(unconstrained, 1:1))
-    u_b::Float64 = sum(view(unconstrained, 2:2))
+    # = logistic(u), with change-of-variables Jacobian log|dθ/du| = log(1) -
+    # log1pexp(-u) - log1pexp(u) = -log1pexp(-u) - log1pexp(u) (Stan's
+    # `lub_constrain` with width 1).
+    u_a::Float64 = unconstrained[1]
+    u_b::Float64 = unconstrained[2]
     a::Float64 = logistic(u_a)
     b::Float64 = logistic(u_b)
     jac_a::Float64 = -log1pexp(-u_a) - log1pexp(u_a)

@@ -82,8 +82,7 @@ using LogExpFunctions: logistic, log1pexp
     #   beta[5], u_sigma_a, u_sigma_b, u_sigma_c, u_sigma_d, u_sigma_e.
     # dim = n_age + n_edu + n_age_edu + n_state + n_region_full + 5 + 5. The
     # group sizes ride as bound integer ports (like the gather indices), so the
-    # slice bounds below are concrete and the same prepared kernel stays
-    # traceable as a Reactant tensor program. The group vectors a..e and the
+    # slice bounds below are concrete. The group vectors a..e and the
     # fixed effects beta are unconstrained (identity transform, 0 Jacobian); only
     # the five scale hyperparameters transform.
     ob::Int = n_age
@@ -99,16 +98,16 @@ using LogExpFunctions: logistic, log1pexp
     d::AbstractVector{Float64} = view(unconstrained, od + 1:oe)
     e::AbstractVector{Float64} = view(unconstrained, oe + 1:obeta)
     beta_vec::AbstractVector{Float64} = view(unconstrained, obeta + 1:osig)
-    beta1::Float64 = sum(view(unconstrained, obeta + 1:obeta + 1))
-    beta2::Float64 = sum(view(unconstrained, obeta + 2:obeta + 2))
-    beta3::Float64 = sum(view(unconstrained, obeta + 3:obeta + 3))
-    beta4::Float64 = sum(view(unconstrained, obeta + 4:obeta + 4))
-    beta5::Float64 = sum(view(unconstrained, obeta + 5:obeta + 5))
-    u_sigma_a::Float64 = sum(view(unconstrained, osig + 1:osig + 1))
-    u_sigma_b::Float64 = sum(view(unconstrained, osig + 2:osig + 2))
-    u_sigma_c::Float64 = sum(view(unconstrained, osig + 3:osig + 3))
-    u_sigma_d::Float64 = sum(view(unconstrained, osig + 4:osig + 4))
-    u_sigma_e::Float64 = sum(view(unconstrained, osig + 5:osig + 5))
+    beta1::Float64 = unconstrained[obeta + 1]
+    beta2::Float64 = unconstrained[obeta + 2]
+    beta3::Float64 = unconstrained[obeta + 3]
+    beta4::Float64 = unconstrained[obeta + 4]
+    beta5::Float64 = unconstrained[obeta + 5]
+    u_sigma_a::Float64 = unconstrained[osig + 1]
+    u_sigma_b::Float64 = unconstrained[osig + 2]
+    u_sigma_c::Float64 = unconstrained[osig + 3]
+    u_sigma_d::Float64 = unconstrained[osig + 4]
+    u_sigma_e::Float64 = unconstrained[osig + 5]
 
     # `real<lower=0, upper=100> sigma_·` → scaled-logit interval transform
     # sigma = 100·logistic(u); the change-of-variables Jacobian

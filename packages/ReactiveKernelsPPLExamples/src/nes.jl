@@ -99,7 +99,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
     # scalar. `beta` is unconstrained (identity, no Jacobian); `sigma = exp(u)`.
     n_coef::Int = length(unconstrained) - 1
     beta::AbstractVector{Float64} = view(unconstrained, 1:n_coef)
-    log_sigma::Float64 = sum(view(unconstrained, n_coef + 1:n_coef + 1))
+    log_sigma::Float64 = unconstrained[n_coef + 1]
 
     # Only `sigma` carries a support transform σ = exp(log_σ); its change of
     # variables log|dσ/dlog_σ| = log_σ is Stan's `lb_constrain`. Either log_σ or

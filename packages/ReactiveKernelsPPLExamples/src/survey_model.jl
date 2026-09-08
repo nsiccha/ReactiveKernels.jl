@@ -54,7 +54,7 @@ using LogExpFunctions: logistic, log1pexp
               log_1_nmax::Float64) = begin
     # q = (u_theta); dim = 1. theta ∈ [0,1] via the logistic transform, with the
     # `lub_constrain` Jacobian log|dtheta/du| = -log1pexp(-u) - log1pexp(u).
-    u_theta::Float64 = sum(view(unconstrained, 1:1))
+    u_theta::Float64 = unconstrained[1]
     theta::Float64 = logistic(u_theta)
     log_jacobian::Float64 = -log1pexp(-u_theta) - log1pexp(u_theta)
     # log(theta) and log(1-theta) straight from the unconstrained value (no round trip).

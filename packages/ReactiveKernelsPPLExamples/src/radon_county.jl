@@ -47,13 +47,11 @@ using LogExpFunctions: logistic, log1pexp
     # Stan's declared unconstrained order: (a[1..J], mu_a, u_sigma_a, u_sigma_y);
     # dim = J + 3. `a` and `mu_a` are unconstrained; the two scales are
     # `real<lower=0, upper=100>`, so they use the scaled-logit interval transform.
-    # Slice without scalar indexing so the same kernel stays traceable as a
-    # Reactant program.
     n_counties::Int = length(unconstrained) - 3
     a::AbstractVector{Float64} = view(unconstrained, 1:n_counties)
-    mu_a::Float64 = sum(view(unconstrained, n_counties + 1:n_counties + 1))
-    u_sigma_a::Float64 = sum(view(unconstrained, n_counties + 2:n_counties + 2))
-    u_sigma_y::Float64 = sum(view(unconstrained, n_counties + 3:n_counties + 3))
+    mu_a::Float64 = unconstrained[n_counties + 1]
+    u_sigma_a::Float64 = unconstrained[n_counties + 2]
+    u_sigma_y::Float64 = unconstrained[n_counties + 3]
 
     # Interval [0, 100] transform sigma = 0 + 100 * logistic(u); the exact
     # `lub_constrain` Jacobian log|dsigma/du| = log(100) - log1pexp(-u) -

@@ -1,16 +1,18 @@
 module Rate1Example
 
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
 export RATE1_N, RATE1_K
 export build_rate_1_graph, demo
 export RATE_1_SOURCE, evaluate_rate_1_source
 
 # posteriordb `Rate_1_data-Rate_1_model` — "Inferring a Rate": k ~ Binomial(n, theta),
-# theta ~ Beta(1,1). Real data (k=5 of n=10) embedded.
-const RATE1_N = 10
-const RATE1_K = 5
+# theta ~ Beta(1,1). Real data loaded from the bundled artifact via PosteriorDB.jl.
+let d = _posteriordb_data("Rate_1_data-Rate_1_model")
+    global const RATE1_N = Int(d["n"])
+    global const RATE1_K = Int(d["k"])
+end
 
 const RATE_1_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: beta, binomial
@@ -20,7 +22,7 @@ using LogExpFunctions: logistic, log1pexp
               n::Int,
               k::Int) = begin
     # theta ∈ [0,1] via the logistic transform; log|dtheta/du| = -log1pexp(-u) - log1pexp(u).
-    u_theta::Float64 = sum(view(unconstrained, 1:1))
+    u_theta::Float64 = unconstrained[1]
     theta::Float64 = logistic(u_theta)
     log_jacobian::Float64 = -log1pexp(-u_theta) - log1pexp(u_theta)
 

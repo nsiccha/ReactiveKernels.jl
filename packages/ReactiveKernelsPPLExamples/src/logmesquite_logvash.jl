@@ -75,13 +75,13 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
               total_height::Vector{Float64},
               group::Vector{Float64}) = begin
     # q = (β₁, …, β₆, log_σ). Six unconstrained β (identity, zero Jacobian).
-    beta1::Float64 = sum(view(unconstrained, 1:1))
-    beta2::Float64 = sum(view(unconstrained, 2:2))
-    beta3::Float64 = sum(view(unconstrained, 3:3))
-    beta4::Float64 = sum(view(unconstrained, 4:4))
-    beta5::Float64 = sum(view(unconstrained, 5:5))
-    beta6::Float64 = sum(view(unconstrained, 6:6))
-    u_sigma::Float64 = sum(view(unconstrained, 7:7))
+    beta1::Float64 = unconstrained[1]
+    beta2::Float64 = unconstrained[2]
+    beta3::Float64 = unconstrained[3]
+    beta4::Float64 = unconstrained[4]
+    beta5::Float64 = unconstrained[5]
+    beta6::Float64 = unconstrained[6]
+    u_sigma::Float64 = unconstrained[7]
 
     # Only σ has a support transform: σ = exp(u), Jacobian log|dσ/du| = u.
     log_sigma::Float64 = u_sigma

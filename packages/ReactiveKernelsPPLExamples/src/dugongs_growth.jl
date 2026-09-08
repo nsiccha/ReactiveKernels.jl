@@ -1,7 +1,7 @@
 module DugongsGrowthExample
 
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
 export DUGONGS_AGE, DUGONGS_LENGTH
 export build_dugongs_graph, demo
@@ -12,12 +12,11 @@ export DUGONGS_SOURCE, evaluate_dugongs_source
 # relating the length of 27 dugongs to their age. Unlike the GLM-shaped examples,
 # the mean is a nonlinear function of the parameters.
 
-const DUGONGS_AGE = [1.0, 1.5, 1.5, 1.5, 2.5, 4.0, 5.0, 5.0, 7.0, 8.0, 8.5, 9.0,
-                     9.5, 9.5, 10.0, 12.0, 12.0, 13.0, 13.0, 14.5, 15.5, 15.5,
-                     16.5, 17.0, 22.5, 29.0, 31.5]
-const DUGONGS_LENGTH = [1.8, 1.85, 1.87, 1.77, 2.02, 2.27, 2.15, 2.26, 2.47,
-                        2.19, 2.26, 2.4, 2.39, 2.41, 2.5, 2.32, 2.32, 2.43, 2.47,
-                        2.56, 2.65, 2.47, 2.64, 2.56, 2.7, 2.72, 2.57]
+# Real data (full) from posteriordb `dugongs_data-dugongs_model`, loaded via PosteriorDB.jl.
+let d = _posteriordb_data("dugongs_data-dugongs_model")
+    global const DUGONGS_AGE = Float64.(d["x"])
+    global const DUGONGS_LENGTH = Float64.(d["Y"])
+end
 
 const DUGONGS_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
@@ -29,10 +28,10 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
               new_age::Float64) = begin
     # Unconstrained layout: (α, β, u_λ, log_τ). λ is bounded to (0.5, 1) and the
     # noise precision τ > 0, so both carry a support transform.
-    α::Float64 = sum(view(unconstrained, 1:1))
-    β::Float64 = sum(view(unconstrained, 2:2))
-    u_λ::Float64 = sum(view(unconstrained, 3:3))
-    log_τ::Float64 = sum(view(unconstrained, 4:4))
+    α::Float64 = unconstrained[1]
+    β::Float64 = unconstrained[2]
+    u_λ::Float64 = unconstrained[3]
+    log_τ::Float64 = unconstrained[4]
 
     # λ = 0.5 + 0.5·logistic(u_λ) ∈ (0.5, 1); τ = exp(log_τ); σ = 1/√τ.
     s::Float64 = 1 / (1 + exp(-u_λ))
@@ -78,9 +77,10 @@ lengths = DUGONGS_LENGTH
 requested_nodes = (:prior, :log_jacobian, :pointwise, :likelihood, :posterior)
 density_kernel = prepare(model;
     have = (:unconstrained, :ages, :lengths),
-    want = requested_nodes)
+    want = requested_nodes,
+    bound = (; ages, lengths))
 
-output = density_kernel(q, ages, lengths)
+output = density_kernel(q)
 prior, logjac, pointwise, likelihood, posterior = output
 @assert likelihood ≈ sum(pointwise)
 @assert posterior ≈ prior + logjac + likelihood
@@ -88,7 +88,7 @@ prior, logjac, pointwise, likelihood, posterior = output
 docs_example = (;
     name = :dugongs_density,
     origin = "Inline dugongs growth reusing normal/uniform/gamma — posteriordb dugongs",
-    inputs = (; q, ages, lengths),
+    inputs = (; q),
     model,
     kernel = density_kernel,
     output,

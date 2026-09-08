@@ -21,6 +21,7 @@ ppl_examples_testfile = joinpath(
 authored_scan_testfile = joinpath(@__DIR__, "test_authored_scan_reactant.jl")
 inner_partial_evaluation_testfile = joinpath(
     @__DIR__, "test_inner_plate_partial_evaluation_reactant.jl")
+ref_array_plate_testfile = joinpath(@__DIR__, "test_ref_array_plate_reactant.jl")
 example_packages = (
     joinpath(root, "packages", "ReactiveKernelsCompatibilityExamples"),
     joinpath(root, "packages", "ReactiveKernelsDistributionKernels"),
@@ -67,6 +68,8 @@ mktempdir() do env
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $inner_partial_evaluation_testfile`)
     elseif selector == "authored-scan"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $authored_scan_testfile`)
+    elseif selector == "ref-array-plate"
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $ref_array_plate_testfile`)
     elseif selector == "ppl-examples"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $ppl_examples_testfile`)
     elseif selector == "ad"

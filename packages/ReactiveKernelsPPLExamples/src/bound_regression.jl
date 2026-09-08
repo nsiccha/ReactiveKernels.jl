@@ -44,9 +44,9 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
     end
 
     # Unconstrained layout: (α, β₁, β₂, log_σ). Only σ has a support transform.
-    α::Float64 = sum(view(unconstrained, 1:1))
+    α::Float64 = unconstrained[1]
     β::AbstractVector{Float64} = view(unconstrained, 2:3)
-    log_σ::Float64 = sum(view(unconstrained, 4:4))
+    log_σ::Float64 = unconstrained[4]
     log_σ::Float64 = log(σ)
     σ::Float64 = exp(log_σ)
     log_jacobian::Float64 = log_σ
