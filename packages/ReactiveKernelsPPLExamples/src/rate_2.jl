@@ -1,10 +1,16 @@
 module Rate2Example
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 export RATE2_N1, RATE2_N2, RATE2_K1, RATE2_K2
 export build_rate_2_graph, demo, RATE_2_SOURCE, evaluate_rate_2_source
 # posteriordb Rate_2_model — "Difference Between Two Rates". Real data embedded.
-const RATE2_N1 = 10; const RATE2_N2 = 10; const RATE2_K1 = 5; const RATE2_K2 = 7
+# Real data (full) from posteriordb `Rate_2_data-Rate_2_model`, loaded via PosteriorDB.jl.
+let d = _posteriordb_data("Rate_2_data-Rate_2_model")
+    global const RATE2_N1 = Int(d["n1"])
+    global const RATE2_N2 = Int(d["n2"])
+    global const RATE2_K1 = Int(d["k1"])
+    global const RATE2_K2 = Int(d["k2"])
+end
 const RATE_2_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: beta, binomial
 using LogExpFunctions: logistic, log1pexp
@@ -28,12 +34,12 @@ end
 q = [0.1, -0.1]
 n1 = RATE2_N1; n2 = RATE2_N2; k1 = RATE2_K1; k2 = RATE2_K2
 requested_nodes = (:parameters, :prior, :likelihood, :posterior)
-density_kernel = prepare(model; have = (:unconstrained, :n1, :n2, :k1, :k2), want = requested_nodes)
-output = density_kernel(q, n1, n2, k1, k2)
+density_kernel = prepare(model; have = (:unconstrained, :n1, :n2, :k1, :k2), want = requested_nodes, bound = (; n1, n2, k1, k2))
+output = density_kernel(q)
 parameters, prior, likelihood, posterior = output
 @assert posterior ≈ prior + likelihood + (-log1pexp(-0.1)-log1pexp(0.1)) + (-log1pexp(0.1)-log1pexp(-0.1))
 docs_example = (; name = :rate_2_posterior, origin = "posteriordb Rate_2_model — difference between two rates",
-    inputs = (; q, n1, n2, k1, k2), model, kernel = density_kernel, output, requested_nodes,
+    inputs = (; q), model, kernel = density_kernel, output, requested_nodes,
     beta_object = beta, binomial_object = binomial)
 """
 evaluate_rate_2_source() = _evaluate_ppl_source(RATE_2_SOURCE, @__MODULE__; bindings = (:RATE2_N1, :RATE2_N2, :RATE2_K1, :RATE2_K2))
