@@ -48,6 +48,86 @@ function assert_resume_source!(prior, receipt_path)
     nothing
 end
 
+# ---- BATCH-1 process-start provenance (performance review 2026-09-09) ----------------------------
+# SCOPED to the incremental batch run: `write_phase`/`aggregate` take these as OPT-IN params, so the
+# frozen-82 flow is byte-for-byte unchanged. Freezes at PROCESS START the exact loaded harness +
+# developed-package SOURCE BYTES (sha256, not a post-import `git HEAD` read that could drift from what
+# was actually loaded), the package git identities, upstream hash, and env versions; `verify_provenance`
+# re-hashes the on-disk bytes and REFUSES if they changed mid-run (a receipt must not misattribute
+# mutated code — the mid-run-mutation guard the review mandated). Native and Reactant each freeze their
+# OWN block; `aggregate(...; preserve_provenance=true)` keeps BOTH (last phase never overwrites the first).
+const _PROV_START = Ref{Dict{String,Any}}()
+
+_git_at(root, args...) = try
+    strip(read(pipeline(setenv(Cmd(String["git", "-C", root, args...]); dir = root); stderr = devnull), String))
+catch; "?" end
+
+# sha256 over every `.jl` under `<pkgroot>/src` (sorted) — the developed-package source-byte identity.
+function _src_bytes_hash(pkgroot)
+    isdir(joinpath(pkgroot, "src")) || return "no-src"
+    srcs = String[]
+    for (r, _, fs) in walkdir(joinpath(pkgroot, "src"))
+        for f in fs
+            endswith(f, ".jl") && push!(srcs, joinpath(r, f))
+        end
+    end
+    ctx = IOBuffer()
+    for p in sort(srcs)
+        write(ctx, relpath(p, pkgroot), ":", bytes2hex(SHA.sha256(read(p))), "\n")
+    end
+    bytes2hex(SHA.sha256(take!(ctx)))
+end
+
+"""Freeze the process-start provenance snapshot ONCE. Call EARLY (right after imports), before any
+measurement. `packages` maps a name to its developed root; `upstream_hash` is the pinned
+posteriordb_models.jl sha256; `extra` carries run identity (env versions, query/data identity, q,
+transitions) the caller adds. Records harness + package source byte-hashes and git identities."""
+function freeze_provenance!(; packages = Dict{String,String}(), upstream_hash = "",
+                            extra = Dict{String,Any}())
+    root = normpath(joinpath(@__DIR__, ".."))
+    harness = Dict{String,String}()
+    for f in _HARNESS_FILES
+        p = joinpath(@__DIR__, f)
+        harness[f] = isfile(p) ? bytes2hex(SHA.sha256(read(p))) : "MISSING"
+    end
+    pkg = Dict{String,Any}()
+    for (name, pr) in packages
+        pkg[name] = Dict{String,Any}("root" => pr,
+            "git_head" => _git_at(pr, "rev-parse", "HEAD"),
+            "git_dirty" => _git_at(pr, "status", "--porcelain") != "",
+            "src_bytes_sha256" => _src_bytes_hash(pr))
+    end
+    _PROV_START[] = merge(Dict{String,Any}(
+        "captured_at" => string(Dates.now()),
+        "root" => root,
+        "root_git_head" => _git_at(root, "rev-parse", "HEAD"),
+        "root_git_dirty" => _git_at(root, "status", "--porcelain") != "",
+        "harness_file_sha256" => harness,
+        "packages" => pkg,
+        "upstream_posteriordb_models_sha256" => String(upstream_hash),
+        "julia" => string(VERSION)), extra)
+    _PROV_START[]
+end
+
+"""Re-hash the on-disk harness + package source bytes and REFUSE if any drifted from the
+process-start snapshot (a receipt must not misattribute code mutated mid-run). Returns the frozen
+snapshot to write into the phase receipt's `provenance`."""
+function verify_provenance()
+    isassigned(_PROV_START) || error("verify_provenance: freeze_provenance! was not called at process start")
+    s = _PROV_START[]
+    for (f, h0) in s["harness_file_sha256"]
+        p = joinpath(@__DIR__, f)
+        h = isfile(p) ? bytes2hex(SHA.sha256(read(p))) : "MISSING"
+        h == h0 || error("provenance DRIFT: harness `$f` changed since process start ($h0 → $h) — receipt refused")
+    end
+    for (name, info) in s["packages"]
+        h = _src_bytes_hash(String(info["root"]))
+        h == info["src_bytes_sha256"] ||
+            error("provenance DRIFT: package `$name` src changed since process start — receipt refused")
+    end
+    s
+end
+
 # The MANDATORY numeric cells — real numbers required for ALL 82 rows (publication gate).
 # primal_*/gradient_* are MEDIAN NANOSECONDS; hmc_* are MEDIAN MICROSECONDS/transition
 # (lower = faster). Which PHASE (isolated subprocess) produces which cell (LOCKED split —
@@ -94,11 +174,14 @@ const DESCRIPTIVE = ("dim", "family", "note", "parity_pass", "rk_off", "tu_off",
     "turing_support_ok", "turing_support_diag", # Fix E: false ⇒ non-equivalent Turing support (no RK/Turing ratio)
     "protocol")                                 # protocol stamp; absent ⇒ measured under the old (pre-scale-aware) protocol
 
-"""Write ONE phase's receipt. `rows` maps model-key => Dict{String,Any} of that phase's cells."""
-function write_phase(path::AbstractString, phase, rows::AbstractDict)
+"""Write ONE phase's receipt. `rows` maps model-key => Dict{String,Any} of that phase's cells.
+`provenance` (OPT-IN, batch-1 only) writes a process-start `provenance` block; `nothing` (the
+default, used by the frozen-82 flow) omits it, keeping that receipt byte-for-byte as before."""
+function write_phase(path::AbstractString, phase, rows::AbstractDict; provenance = nothing)
     doc = Dict("schema" => SCHEMA, "phase" => String(phase),
                "generated_at" => string(Dates.now()),
                "models" => Dict(String(k) => v for (k, v) in rows))
+    provenance === nothing || (doc["provenance"] = provenance)
     mkpath(dirname(path))
     open(path, "w") do io; TOML.print(io, doc; sorted = true); end
     path
@@ -109,12 +192,19 @@ Phases carry disjoint cell sets by construction; a cell that appears in two phas
 AGREE — a conflicting duplicate is a HARD ERROR, never a silent overwrite. Model ordering
 and cell content are deterministic (TOML-sorted); the only non-reproducible field is the
 `generated_at` timestamp, so the doc is content-stable, not byte-stable."""
-function aggregate(phase_paths, out_path::AbstractString; meta = Dict{String,Any}())
+function aggregate(phase_paths, out_path::AbstractString; meta = Dict{String,Any}(),
+                   preserve_provenance = false)
     merged = Dict{String,Dict{String,Any}}()
+    prov = Dict{String,Any}()   # per-phase process-start provenance (batch-1); native + reactant kept BOTH
     for p in phase_paths
         isfile(p) || error("All80Receipt.aggregate: missing phase receipt $p")
         d = TOML.parsefile(p)
         get(d, "schema", "") == SCHEMA || error("schema mismatch in $p: $(get(d,"schema",""))")
+        if preserve_provenance && haskey(d, "provenance")
+            ph = String(get(d, "phase", "?"))
+            haskey(prov, ph) && error("All80Receipt.aggregate: duplicate provenance for phase $ph (from $p)")
+            prov[ph] = d["provenance"]   # the LAST phase never overwrites the first — keyed by phase
+        end
         for (k, cells) in get(d, "models", Dict())
             dst = get!(merged, k, Dict{String,Any}())
             for (ck, cv) in cells
@@ -125,8 +215,10 @@ function aggregate(phase_paths, out_path::AbstractString; meta = Dict{String,Any
             end
         end
     end
+    meta_out = preserve_provenance && !isempty(prov) ?
+        merge(Dict{String,Any}(meta), Dict("provenance" => prov)) : meta
     doc = Dict("schema" => SCHEMA, "generated_at" => string(Dates.now()),
-               "meta" => meta, "models" => merged)
+               "meta" => meta_out, "models" => merged)
     mkpath(dirname(out_path))
     open(out_path, "w") do io; TOML.print(io, doc; sorted = true); end
     out_path
