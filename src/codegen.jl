@@ -332,6 +332,36 @@ function _authored_plate_sum_recipe(p::Plan, plate_recipe::Recipe)
     isempty(matches) ? nothing : only(matches)
 end
 
+# Inline the scalar step into the ordered native loop. Calling the nested
+# PreparedKernel from a loop with a changing carry defeats inference across the
+# RGF boundary; the same step AST and operation table specialize normally here.
+function _lower_authored_scan_native!(body, runtime_ops, runtime_recipes,
+                                      op::_AuthoredScanOp, callargs, lhs)
+    step = op.kernel
+    indices, index, carry, output = gensym.((:scan_indices, :scan_index,
+                                            :scan_carry, :scan_output))
+    xs = callargs[2]
+    offset = length(runtime_ops)
+    append!(runtime_ops, step.ops)
+    append!(runtime_recipes, step.lowered_recipes)
+    arguments = Any[carry, Expr(:ref, xs, index), callargs[3:end]...]
+    step_body = Expr(:block, _embedded_statements(
+        step.ast, arguments, Expr(:tuple, carry, output), offset)...)
+    push!(body.args, :($indices = $(GlobalRef(Base, :eachindex))($xs)))
+    push!(body.args, :($(GlobalRef(Base, :isempty))($indices) &&
+        throw(ArgumentError("scan requires a non-empty sequence"))))
+    push!(body.args, :($carry = $(callargs[1])))
+    push!(body.args, :($index = $(GlobalRef(Base, :first))($indices)))
+    append!(body.args, step_body.args)
+    push!(body.args, :($lhs = $(GlobalRef(Base, :similar))(
+        $xs, $(GlobalRef(Base, :typeof))($output))))
+    push!(body.args, :($lhs[$index] = $output))
+    push!(body.args, Expr(:for,
+        :($index = $(GlobalRef(Base.Iterators, :drop))($indices, 1)),
+        Expr(:block, step_body.args..., :($lhs[$index] = $output))))
+    body
+end
+
 function _plate_dependencies(plan::Plan, root_ids::Set{Int})
     graph = plan.graph
     dependencies = Dict{Int,Set{Int}}()
@@ -767,6 +797,23 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
             end
         end
         lhs = length(lhsnames) == 1 ? only(lhsnames) : Expr(:tuple, lhsnames...)
+        if inline_embedded && r.op isa _AuthoredScanOp
+            # Both products keep the same table: the traced path calls the scan
+            # op, while the native path calls its inlined scalar operations.
+            push!(runtime_ops, r.op)
+            push!(runtime_recipes, r)
+            if tensorized
+                call = Expr(:call, Expr(:ref, _OPS_ARG, length(runtime_ops)),
+                            callargs...)
+                push!(body.args, Expr(:(=), lhs, call))
+                append!(runtime_ops, r.op.kernel.ops)
+                append!(runtime_recipes, r.op.kernel.lowered_recipes)
+            else
+                _lower_authored_scan_native!(
+                    body, runtime_ops, runtime_recipes, r.op, callargs, lhs)
+            end
+            continue
+        end
         embedded = inline_embedded ? _embedded_kernel(r.op) : nothing
         if embedded === nothing
             push!(runtime_ops, r.op)
@@ -1287,6 +1334,7 @@ end
 function _needs_embedded_tensorization(p::Plan)
     any(p.recipes) do recipe
         recipe.op isa _AuthoredPlateOp && return true
+        recipe.op isa _AuthoredScanOp && !isempty(p.have) && return true
         kernel = _embedded_kernel(recipe.op)
         kernel !== nothing && kernel.f isa _ArrayFunctionPair
     end
@@ -1306,7 +1354,11 @@ function _embedded_marker_candidates(p::Plan)
         p, Set(keys(root_positions))).values
     candidates = Int[]
     for recipe in p.recipes
-        positions = if recipe.op isa _AuthoredPlateOp
+        positions = if recipe.op isa _AuthoredScanOp
+            # With the sequence bound, a traced carry/shared operand still
+            # selects the tensorized product through its runtime HAVE roots.
+            (2, 1, (3:length(recipe.inputs))...)
+        elseif recipe.op isa _AuthoredPlateOp
             atomic = typeof(recipe.op).parameters[2]
             Tuple(index for index in eachindex(recipe.inputs)
                   if !(index in atomic))
