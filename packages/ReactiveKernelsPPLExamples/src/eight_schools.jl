@@ -1,16 +1,19 @@
 module EightSchoolsExample
 
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
 export EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA
 export build_eight_schools_graph, demo
 export EIGHT_SCHOOLS_SOURCE, evaluate_eight_schools_source
 
-const NSCHOOLS = 8
-
-const EIGHT_SCHOOLS_Y = [28.0, 8.0, -3.0, 7.0, -1.0, 1.0, 18.0, 12.0]
-const EIGHT_SCHOOLS_SIGMA = [15.0, 10.0, 16.0, 11.0, 9.0, 11.0, 10.0, 18.0]
+# Real data from posteriordb `eight_schools-eight_schools_centered`, loaded from the
+# bundled artifact via PosteriorDB.jl (no hand-inlined arrays).
+let d = _posteriordb_data("eight_schools-eight_schools_centered")
+    global const NSCHOOLS = Int(d["J"])
+    global const EIGHT_SCHOOLS_Y = Float64.(d["y"])
+    global const EIGHT_SCHOOLS_SIGMA = Float64.(d["sigma"])
+end
 
 const EIGHT_SCHOOLS_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauchy
