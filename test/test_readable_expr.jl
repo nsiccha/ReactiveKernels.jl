@@ -86,4 +86,43 @@ using Test
         @test legacy(2) == 2
         @test fieldcount(typeof(legacy)) == 2
     end
+
+    @testset "partially-evaluated bound constants render as literals" begin
+        # `bound=` hoists every data-only recipe (an explicitly bound data port
+        # AND any binding reachable from only bound ports) into a `_BoundConstant`
+        # whose authored source was consumed by the prefix, so without special
+        # handling it would fall through to the unnamed `operation()` fallback the
+        # docs guard rejects. The readable view shows each such constant as the
+        # baked-in value it is.
+        @kernel bound_example(x::Float64, d::Vector{Float64}) = begin
+            a::Vector{Float64} = 2 .* d           # data-only prefix
+            s::Float64 = sum(a)                    # data-only scalar -> hoisted constant
+            scaled::Vector{Float64} = x .* d       # residual, references the bound port
+            result::Float64 = s + sum(scaled)      # residual
+            return result
+        end
+
+        dval = [1.0, 2.0, 3.0]
+        bound_kernel = prepare(bound_example;
+            have = (:x, :d), want = (:result,), bound = (; d = dval))
+        bound_raw = code_expr(bound_kernel)
+        bound_raw_before = deepcopy(bound_raw)
+        bound_source = sprint(
+            Base.show_unquoted,
+            ReactiveKernels._readable_expr(bound_raw, bound_kernel);
+            context = :limit => false,
+        )
+
+        # Display-only: the readable rewrite never mutates the compiled AST.
+        @test bound_raw == bound_raw_before == code_expr(bound_kernel)
+        # No unnamed/opaque leftovers — the two docs-guard rejections.
+        @test !occursin(r"__ops__\[\d+\]", bound_source)
+        @test !occursin(r"\boperation\(", bound_source)
+        # The hoisted scalar and the bound data port show their literal values.
+        @test occursin("s = 12.0", bound_source)
+        @test occursin("d = [1.0, 2.0, 3.0]", bound_source)
+        # The residual body still reads naturally and the value is unchanged.
+        @test occursin("result = s + sum(scaled)", bound_source)
+        @test bound_kernel(2.0) == 12.0 + sum(2.0 .* dval)
+    end
 end
