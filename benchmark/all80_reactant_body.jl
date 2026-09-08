@@ -29,14 +29,19 @@ const F = NUTSBMutationAuthoringFixture
 const AE = AutoEnzyme(mode = Enzyme.Reverse, function_annotation = Enzyme.Const)
 med(b) = median(b).time * 1e9
 
-# A Julia/Enzyme process abort is not catchable as an exception. This exact model was
-# attempted twice: both runs reached Survey and terminated with signal 6 in the generated
-# AD call (logs kb-run-compact.tsoAmU and kb-run-compact.6LkART). Preserve primal coverage,
-# but record that evidenced process-level diagnostic for the two AD-dependent cells.
-const PROCESS_ABORTING_AD = Dict(
-    "Survey_data-Survey_model" =>
-        "Survey Reactant AD process-abort: Julia signal 6 in Enzyme generated-call/GC marking; reproduced twice",
-)
+# A Julia/Enzyme process abort is NOT catchable as an exception (signal 6 kills the whole
+# subprocess), so a model whose AD genuinely aborts must be pre-declared here to preserve the
+# other rows' coverage. The mechanism is retained for that case.
+#
+# EMPTY as of the f1e8b83 re-test (HEAD c75242b, 2026-09-08): the sole prior entry,
+# `Survey_data-Survey_model`, was re-attempted IN ISOLATION (survey_ad_probe.jl — the exact
+# run_reactant_one setup, real `prepare_ad` + gradient `@compile` + gradient eval, no skip) and
+# it SURVIVES: prepare_ad OK, gradient @compile OK, finite gradient (first=-1.603). The
+# historical signal-6 abort in Enzyme generated-call/GC marking (Survey is a 1-D discrete-count
+# marginalization) no longer reproduces on this base; the referenced compact-run logs
+# (kb-run-compact.tsoAmU / .6LkART) are gone. So Survey now runs its real AD like every other
+# model. Re-populate this dict ONLY for a model whose abort is freshly reproduced.
+const PROCESS_ABORTING_AD = Dict{String,String}()
 
 function hmc_loop(kb, prep, q, backend, rng_factory;
                   T = 4, steps = All80Axes.HMC_STEPS, rounds = All80Axes.HMC_ROUNDS)
