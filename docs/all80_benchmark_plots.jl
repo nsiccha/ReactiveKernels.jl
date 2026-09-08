@@ -20,6 +20,13 @@ _all80_models(path = _ALL80_BENCHMARK_PATH) = get(TOML.parsefile(path), "models"
 # instead, so a benchmark where (say) nothing lowered through Reactant still builds cleanly.
 _all80_plot_note(text) = Markdown.parse("*" * text * "*")
 
+# `_plot_block` returns a bare `RawHTML`, which Documenter's `@eval` REJECTS (it accepts only
+# Nothing or Markdown.MD). Wrap it in a Markdown.MD carrying the RawHTML node — the same pattern
+# render_examples uses (kernel_examples.jl) — so the interactive plot embeds instead of falling
+# back to a textual code block and terminating the build. (Do NOT push this into shared
+# `_plot_block`: other pages already wrap its result in their own Markdown.MD.)
+_all80_fig(spec; kwargs...) = Markdown.MD(Any[_plot_block(spec; kwargs...)])
+
 # log2 speedup of `baseline` over `rk` (>0 ⇒ the RK/Reactant side is faster). Both
 # operands must be finite positive Reals; anything else (a diagnostic string, a missing
 # cell, a non-finite number) yields `missing` and is dropped from the ratio plots.
@@ -92,7 +99,7 @@ function render_all80_speedup_plot(path = _ALL80_BENCHMARK_PATH)
             color = :metric => "Evaluation", col = :comparator => "Comparator",
             marker = :workload => "Workload") *
         visual(Scatter)
-    _plot_block(spec * config(width = 360, height = 300,
+    _all80_fig(spec * config(width = 360, height = 300,
             title = "Faithful RK graphs (natural-source base f1e8b83) vs reference Stan and upstream Turing",
             scales = scales(X = (; scale = log10)));
         id = "all80-speedup",
@@ -141,7 +148,7 @@ function render_all80_reactant_hmc_plot(path = _ALL80_BENCHMARK_PATH)
             :speedup => "log₂(native µs/transition / Reactant µs/transition)";
             color = :native_T => "native batch T (Reactant fixed at 4)") *
         visual(Scatter)
-    _plot_block(spec * config(width = 480, height = 320,
+    _all80_fig(spec * config(width = 480, height = 320,
             title = "Reactant HMC-loop CAPABILITY PROBE (T=4) vs native throughput (calibrated T)",
             scales = scales(X = (; scale = log10)));
         id = "all80-reactant-hmc",
@@ -184,7 +191,7 @@ function render_all80_reactant_coverage_plot(path = _ALL80_BENCHMARK_PATH)
         mapping(:operation => "Reactant operation", :count => "Models (of 82)";
             color = :outcome => "Outcome") *
         visual(BarPlot)
-    _plot_block(spec * config(width = 420, height = 300,
+    _all80_fig(spec * config(width = 420, height = 300,
             title = "Reactant lowering coverage across the 82 faithful graphs",
             scales = scales(Y = (; zero = true)));
         id = "all80-reactant-coverage",
