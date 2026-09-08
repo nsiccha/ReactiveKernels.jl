@@ -164,19 +164,19 @@ docs_example = (;
 )
 """
 
-function evaluate_nes_source()
+function evaluate_nes_source(; model_only::Bool = false)
     # Bind only the data. The authored source imports the reusable Normal
     # endpoint itself and contains the complete PPL assembly with no helper
     # evaluator or separately prepared density/plate path.
     _evaluate_ppl_source(NES_SOURCE, @__MODULE__; bindings = (
         :NES_PARTYID7, :NES_X,
-    ))
+    ), model_only)
 end
 
 const _NES_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _NES_GRAPH_TEMPLATE[] = evaluate_nes_source().model
+    _NES_GRAPH_TEMPLATE[] = evaluate_nes_source(; model_only = true).model
     nothing
 end
 

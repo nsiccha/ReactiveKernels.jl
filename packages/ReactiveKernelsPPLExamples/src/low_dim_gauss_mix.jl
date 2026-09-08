@@ -121,17 +121,17 @@ docs_example = (;
 )
 """
 
-function evaluate_low_dim_gauss_mix_source()
+function evaluate_low_dim_gauss_mix_source(; model_only::Bool = false)
     _evaluate_ppl_source(LOW_DIM_GAUSS_MIX_SOURCE, @__MODULE__; bindings = (
         :LOW_DIM_GAUSS_MIX_Y,
-    ))
+    ), model_only)
 end
 
 const _LOW_DIM_GAUSS_MIX_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
     _LOW_DIM_GAUSS_MIX_GRAPH_TEMPLATE[] =
-        evaluate_low_dim_gauss_mix_source().model
+        evaluate_low_dim_gauss_mix_source(; model_only = true).model
     nothing
 end
 

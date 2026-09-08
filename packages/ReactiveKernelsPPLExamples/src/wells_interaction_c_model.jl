@@ -146,16 +146,16 @@ docs_example = (;
 )
 """
 
-function evaluate_wells_interaction_c_source()
+function evaluate_wells_interaction_c_source(; model_only::Bool = false)
     _evaluate_ppl_source(WELLS_INTERACTION_C_SOURCE, @__MODULE__; bindings = (
         :WELLS_INTERACTION_C_DIST, :WELLS_INTERACTION_C_ARSENIC, :WELLS_INTERACTION_C_SWITCHED,
-    ))
+    ), model_only)
 end
 
 const _WELLS_INTERACTION_C_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _WELLS_INTERACTION_C_GRAPH_TEMPLATE[] = evaluate_wells_interaction_c_source().model
+    _WELLS_INTERACTION_C_GRAPH_TEMPLATE[] = evaluate_wells_interaction_c_source(; model_only = true).model
     nothing
 end
 

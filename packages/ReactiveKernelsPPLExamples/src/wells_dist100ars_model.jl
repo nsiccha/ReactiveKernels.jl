@@ -127,16 +127,16 @@ docs_example = (;
 )
 """
 
-function evaluate_wells_dist100ars_source()
+function evaluate_wells_dist100ars_source(; model_only::Bool = false)
     _evaluate_ppl_source(WELLS_DIST100ARS_SOURCE, @__MODULE__; bindings = (
         :WELLS_DIST100ARS_DIST, :WELLS_DIST100ARS_ARSENIC, :WELLS_DIST100ARS_SWITCHED,
-    ))
+    ), model_only)
 end
 
 const _WELLS_DIST100ARS_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _WELLS_DIST100ARS_GRAPH_TEMPLATE[] = evaluate_wells_dist100ars_source().model
+    _WELLS_DIST100ARS_GRAPH_TEMPLATE[] = evaluate_wells_dist100ars_source(; model_only = true).model
     nothing
 end
 

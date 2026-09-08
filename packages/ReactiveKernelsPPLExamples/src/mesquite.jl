@@ -131,20 +131,20 @@ docs_example = (;
 )
 """
 
-function evaluate_mesquite_source()
+function evaluate_mesquite_source(; model_only::Bool = false)
     # Bind only the data. The authored source imports the reusable Normal
     # endpoint itself and contains the complete PPL assembly with no helper
     # evaluator or separately prepared density/plate path.
     _evaluate_ppl_source(MESQUITE_SOURCE, @__MODULE__; bindings = (
         :MESQ_WEIGHT, :MESQ_DIAM1, :MESQ_DIAM2, :MESQ_CANOPY_HEIGHT,
         :MESQ_TOTAL_HEIGHT, :MESQ_DENSITY, :MESQ_GROUP,
-    ))
+    ), model_only)
 end
 
 const _MESQUITE_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _MESQUITE_GRAPH_TEMPLATE[] = evaluate_mesquite_source().model
+    _MESQUITE_GRAPH_TEMPLATE[] = evaluate_mesquite_source(; model_only = true).model
     nothing
 end
 

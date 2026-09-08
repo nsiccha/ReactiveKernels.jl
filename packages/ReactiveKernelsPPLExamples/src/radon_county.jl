@@ -134,15 +134,15 @@ docs_example = (;
 )
 """
 
-function evaluate_radon_county_source()
+function evaluate_radon_county_source(; model_only::Bool = false)
     _evaluate_ppl_source(RADON_COUNTY_SOURCE, @__MODULE__;
-        bindings = (:RADON_COUNTY_IDX, :RADON_COUNTY_LOG))
+        bindings = (:RADON_COUNTY_IDX, :RADON_COUNTY_LOG), model_only)
 end
 
 const _RADON_COUNTY_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _RADON_COUNTY_GRAPH_TEMPLATE[] = evaluate_radon_county_source().model
+    _RADON_COUNTY_GRAPH_TEMPLATE[] = evaluate_radon_county_source(; model_only = true).model
     nothing
 end
 

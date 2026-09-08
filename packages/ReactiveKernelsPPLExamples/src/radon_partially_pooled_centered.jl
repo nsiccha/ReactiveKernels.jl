@@ -137,16 +137,16 @@ docs_example = (;
 )
 """
 
-function evaluate_radon_partially_pooled_centered_source()
+function evaluate_radon_partially_pooled_centered_source(; model_only::Bool = false)
     _evaluate_ppl_source(RADON_PARTIALLY_POOLED_CENTERED_SOURCE, @__MODULE__;
-        bindings = (:RADON_PP_COUNTY, :RADON_PP_LOG))
+        bindings = (:RADON_PP_COUNTY, :RADON_PP_LOG), model_only)
 end
 
 const _RADON_PP_CENTERED_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
     _RADON_PP_CENTERED_GRAPH_TEMPLATE[] =
-        evaluate_radon_partially_pooled_centered_source().model
+        evaluate_radon_partially_pooled_centered_source(; model_only = true).model
     nothing
 end
 

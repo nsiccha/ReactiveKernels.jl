@@ -141,16 +141,16 @@ docs_example = (;
 )
 """
 
-function evaluate_dogs_log_source()
+function evaluate_dogs_log_source(; model_only::Bool = false)
     _evaluate_ppl_source(DOGS_LOG_SOURCE, @__MODULE__; bindings = (
         :DOGS_LOG_N_AVOID, :DOGS_LOG_N_SHOCK, :DOGS_LOG_Y_FLAT,
-    ))
+    ), model_only)
 end
 
 const _DOGS_LOG_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _DOGS_LOG_GRAPH_TEMPLATE[] = evaluate_dogs_log_source().model
+    _DOGS_LOG_GRAPH_TEMPLATE[] = evaluate_dogs_log_source(; model_only = true).model
     nothing
 end
 

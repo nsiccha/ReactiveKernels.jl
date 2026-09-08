@@ -110,16 +110,16 @@ docs_example = (;
 )
 """
 
-function evaluate_surgical_source()
+function evaluate_surgical_source(; model_only::Bool = false)
     _evaluate_ppl_source(SURGICAL_SOURCE, @__MODULE__; bindings = (
         :SURGICAL_SUCCESSES, :SURGICAL_TOTALS,
-    ))
+    ), model_only)
 end
 
 const _SURGICAL_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _SURGICAL_GRAPH_TEMPLATE[] = evaluate_surgical_source().model
+    _SURGICAL_GRAPH_TEMPLATE[] = evaluate_surgical_source(; model_only = true).model
     nothing
 end
 

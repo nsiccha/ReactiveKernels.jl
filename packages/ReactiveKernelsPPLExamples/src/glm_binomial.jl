@@ -93,16 +93,16 @@ docs_example = (;
 )
 """
 
-function evaluate_glm_binomial_source()
+function evaluate_glm_binomial_source(; model_only::Bool = false)
     _evaluate_ppl_source(GLM_BINOMIAL_SOURCE, @__MODULE__; bindings = (
         :GLM_BINOMIAL_YEAR, :GLM_BINOMIAL_C, :GLM_BINOMIAL_N,
-    ))
+    ), model_only)
 end
 
 const _GLM_BINOMIAL_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _GLM_BINOMIAL_GRAPH_TEMPLATE[] = evaluate_glm_binomial_source().model
+    _GLM_BINOMIAL_GRAPH_TEMPLATE[] = evaluate_glm_binomial_source(; model_only = true).model
     nothing
 end
 
