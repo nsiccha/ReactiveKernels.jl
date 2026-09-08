@@ -1,3 +1,17 @@
+# Observable tail sentinel: counts how many times `_evaluate_ppl_source` has
+# executed the source's DEMO/SELF-CHECK TAIL — i.e. evaluated any source
+# expression AFTER `model` is defined (the `prepare(...)` + kernel execution +
+# `@assert`s that build `docs_example`). `model_only=true` stops at `model` and
+# therefore never bumps this; the full path (default) bumps it by exactly one.
+# It is the regression guard for the startup contract: every model module's
+# `__init__` builds its template with `model_only=true`, so this stays 0 across
+# package load. If an `__init__` regressed to the FULL evaluator, or a
+# `model_only` build failed to stop before the tail (even while returning only
+# `.model`), package load would bump it — caught by
+# test/test_startup_initialization.jl. Not thread-safe; the example inits and
+# tests are single-threaded.
+const _DEMO_TAIL_EXECUTIONS = Ref(0)
+
 """
     _evaluate_ppl_source(source, owner; bindings=(), model_only=false)
 
@@ -44,13 +58,22 @@ function _evaluate_ppl_source(source::AbstractString, owner::Module;
 
     parsed = Meta.parseall(displayed; filename = "$(nameof(owner))-docs-source.jl")
     expressions = parsed.head === :toplevel ? parsed.args : Any[parsed]
+    model_defined = false
+    tail_ran = false
     for expression in expressions
         expression isa LineNumberNode && continue
+        # An expression evaluated AFTER `model` is defined is part of the demo/
+        # self-check tail — the observable the sentinel below records.
+        model_defined && (tail_ran = true)
         Core.eval(sandbox, expression)
-        # Template build: the graph is complete once `model` is defined; stop
-        # before the source's prepare/execute/@assert demo tail runs.
-        model_only && isdefined(sandbox, :model) && break
+        if !model_defined && isdefined(sandbox, :model)
+            model_defined = true
+            # Template build: the graph is complete once `model` is defined; stop
+            # before the source's prepare/execute/@assert demo tail runs.
+            model_only && break
+        end
     end
+    tail_ran && (_DEMO_TAIL_EXECUTIONS[] += 1)
 
     if model_only
         isdefined(sandbox, :model) || error(

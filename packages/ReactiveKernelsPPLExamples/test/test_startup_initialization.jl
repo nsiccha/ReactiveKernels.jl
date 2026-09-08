@@ -19,6 +19,30 @@ const _M = ReactiveKernelsPPLExamples
 @testset "startup initialization contract (model-only templates)" begin
     E = _M.EightSchoolsExample
 
+    @testset "tail sentinel: package load ran NO demo/self-check tail" begin
+        # THE init-path regression guard. `_DEMO_TAIL_EXECUTIONS` counts every
+        # time a source's demo tail (any expression after `model` — the
+        # prepare/execute/@assert that build `docs_example`) actually executes.
+        # All ~89 `__init__` template builds are `model_only=true`, so package
+        # load must leave this at 0. This is STRICTLY stronger than checking the
+        # returned artifact's fields: the OLD full-demo `__init__` ALSO cached a
+        # KernelSpec and discarded the PreparedKernel/output, so a field check
+        # cannot tell it apart — but it ran the tail, which this counter records.
+        # If `__init__` regressed to the full evaluator, this would be ~89 (fail).
+        # (Runs first, before any full `evaluate_*_source()` below trips it.)
+        @test _M._DEMO_TAIL_EXECUTIONS[] == 0
+
+        # The sentinel is a REAL observable of tail execution: a FULL evaluate
+        # trips it by exactly one, a model_only evaluate does NOT — proving the
+        # discarded prepare/execute/@assert genuinely did not run in the template
+        # path (not merely that `.kernel`/`.output` fields are absent).
+        before = _M._DEMO_TAIL_EXECUTIONS[]
+        E.evaluate_eight_schools_source()                      # full: runs the tail
+        @test _M._DEMO_TAIL_EXECUTIONS[] == before + 1
+        E.evaluate_eight_schools_source(; model_only = true)   # model_only: no tail
+        @test _M._DEMO_TAIL_EXECUTIONS[] == before + 1         # unchanged
+    end
+
     @testset "import builds a graph template, not a prepared/executed demo" begin
         # The model-only artifact carries the graph but NOT a prepared kernel or
         # a demo output — i.e. no `prepare`/execute ran to build the template.
@@ -87,22 +111,24 @@ const _M = ReactiveKernelsPPLExamples
         pv(g) = prepare(g; have = (:unconstrained, :observations, :observation_scales),
                            want = :posterior)(
             [0.0, log(5.0), zeros(E.NSCHOOLS)...], E.EIGHT_SCHOOLS_Y, E.EIGHT_SCHOOLS_SIGMA)
-        @test pv(g1) ≈ v
-        @test pv(g2) ≈ v
+        @test pv(g1) == v
+        @test pv(g2) == v
     end
 
-    @testset "model-only graph is identical to the full-source graph" begin
+    @testset "model-only graph is bit-identical to the full-source graph" begin
+        # Same authored `@kernel model` -> same KernelSpec -> same prepared
+        # kernel -> exact (not merely approximate) equality. `==`, not `≈`.
         q = [0.0, log(5.0), zeros(E.NSCHOOLS)...]
         pv(g) = prepare(g; have = (:unconstrained, :observations, :observation_scales),
                            want = :posterior)(q, E.EIGHT_SCHOOLS_Y, E.EIGHT_SCHOOLS_SIGMA)
-        @test pv(E.build_eight_schools_graph()) ≈
+        @test pv(E.build_eight_schools_graph()) ==
               pv(compose(E.evaluate_eight_schools_source().model))
 
         R = _M.Rate2Example
         pr(g) = prepare(g; have = (:unconstrained, :n1, :n2, :k1, :k2), want = :posterior,
                            bound = (; n1 = R.RATE2_N1, n2 = R.RATE2_N2,
                                       k1 = R.RATE2_K1, k2 = R.RATE2_K2))([0.1, -0.1])
-        @test pr(R.build_rate_2_graph()) ≈
+        @test pr(R.build_rate_2_graph()) ==
               pr(compose(R.evaluate_rate_2_source().model))
     end
 end
