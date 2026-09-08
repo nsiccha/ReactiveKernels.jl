@@ -25,8 +25,11 @@ Priors (`nu_global = nu_local = 1` for `ovarian`, so the half-t's are
 half-Cauchy): `z ~ Normal(0,1)`, `λ ~ Student_t(nu_local, 0, 1)` truncated `> 0`,
 `τ ~ Student_t(nu_global, 0, scale_global·2)` truncated `> 0`,
 `caux ~ Inverse_Gamma(slab_df/2, slab_df/2)`, `β_0 ~ Normal(0, scale_icept)`.
-The half-t priors carry no explicit `student_t_lccdf` normalization here (Stan
-drops it), so the truncation is applied by the exp-transform Jacobian alone.
+The half-t priors carry no explicit `student_t_lccdf` normalization here: the
+positive support (`<lower=0>`) is enforced by the `exp` transform (which maps
+ℝ → ℝ₊), and its Jacobian supplies the change-of-measure. Stan drops the half-t
+truncation normalizing constant and we match that — the Jacobian is the measure
+term, it does not itself impose the truncation.
 
 The unconstrained vector is `(β_0, z[1..d], log_τ, log_λ[1..d], log_caux)`. The
 three positive scales use the `exp` support transform (Jacobians `log_τ`,

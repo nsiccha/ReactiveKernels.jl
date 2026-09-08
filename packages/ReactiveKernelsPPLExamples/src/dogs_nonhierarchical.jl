@@ -11,7 +11,9 @@ export DOGS_NH_SOURCE, evaluate_dogs_nonhierarchical_source
 # model in its CORRELATED per-dog form. Each dog j has its OWN multiplicative
 # learning rates a[j], b[j] ∈ (0,1), drawn from a bivariate logit-normal with a
 # shared mean, shared scales and a correlation:
-#   logit(a[j]), logit(b[j]) = mu_logit_ab + z[j,:] · diag(sigma_logit_ab)·L'
+#   logit(a[j]), logit(b[j]) = mu_logit_ab + z[j,:] · diag(sigma_logit_ab)·L
+#     (i.e. z[j,:] · diag_pre_multiply(sigma_logit_ab, L) = z[j,:] · diag(sigma)·L,
+#      NOT ·L' — the executable logit_a/logit_b below implement this exact form)
 #   p[j,t] = a[j]^prev_shock[j,t] · b[j]^prev_avoid[j,t]
 #   y[j,t] ~ Bernoulli(p[j,t])
 # where prev_shock / prev_avoid are the running counts of prior shocks / avoids

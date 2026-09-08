@@ -1,6 +1,14 @@
 using ReactiveKernelsPPLExamples.DiamondsExample
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, student_t
 using SpecialFunctions: loggamma
+using DifferentiationInterface
+import Enzyme
+
+const _DIAMONDS_AE = AutoEnzyme(mode = Enzyme.Reverse, function_annotation = Enzyme.Const)
+_diamonds_grad(kernel, q) =
+    ReactiveKernels.ad_value_and_gradient!(
+        prepare_ad(kernel, _DIAMONDS_AE, q; active = :unconstrained),
+        similar(q), q)[2]
 
 # Graph-independent reference oracle for the posteriordb diamonds model: the brms
 # centered design (drop the intercept column, subtract each remaining column's
@@ -84,5 +92,40 @@ end
                         bound = (; X = DIAMONDS_X, prior_only = DIAMONDS_PRIOR_ONLY))
         @test plain(q, DIAMONDS_X, DIAMONDS_Y, DIAMONDS_PRIOR_ONLY) ≈ bound(q, DIAMONDS_Y)
         @test bound(q, DIAMONDS_Y) ≈ reference.posterior
+    end
+
+    @testset "prior_only flips the likelihood contribution (value AND gradient)" begin
+        # A different finite Y, to prove prior_only == 1 is invariant to Y while
+        # prior_only == 0 is not. Y is bound here so each kernel takes only q.
+        Y2 = DIAMONDS_Y .+ 1.0
+        cfg(po, Y, want) = prepare(model; have = (:unconstrained, :X, :Y, :prior_only),
+            want = want, bound = (; X = DIAMONDS_X, Y = Y, prior_only = po))
+        p1_Y1 = cfg(1, DIAMONDS_Y, :posterior)   # prior + Jacobian only
+        p1_Y2 = cfg(1, Y2,         :posterior)
+        p0_Y1 = cfg(0, DIAMONDS_Y, :posterior)   # + likelihood
+        p0_Y2 = cfg(0, Y2,         :posterior)
+        pj    = cfg(1, DIAMONDS_Y, (:log_prior, :log_jacobian))
+        pup   = cfg(1, DIAMONDS_Y, :unconstrained_prior)   # the model's log_prior + log_jacobian node
+        like  = cfg(0, DIAMONDS_Y, :likelihood)(q)
+
+        # VALUE. prior_only == 1 equals prior + Jacobian and is Y-invariant;
+        # prior_only == 0 adds exactly the likelihood and depends on Y.
+        lp, lj = pj(q)
+        @test p1_Y1(q) ≈ lp + lj
+        @test p1_Y1(q) ≈ pup(q)
+        @test p1_Y1(q) == p1_Y2(q)                       # exact Y-invariance
+        @test p0_Y1(q) ≈ p1_Y1(q) + like
+        @test !isapprox(p0_Y1(q), p0_Y2(q))              # likelihood makes it Y-dependent
+
+        # GRADIENT (plain DI + Enzyme reverse). prior_only == 1 gradient equals the
+        # prior + Jacobian gradient and is Y-invariant; prior_only == 0 is not.
+        g1_Y1 = _diamonds_grad(p1_Y1, q)
+        g1_Y2 = _diamonds_grad(p1_Y2, q)
+        g0_Y1 = _diamonds_grad(p0_Y1, q)
+        g0_Y2 = _diamonds_grad(p0_Y2, q)
+        @test all(isfinite, g1_Y1)
+        @test g1_Y1 ≈ _diamonds_grad(pup, q)
+        @test g1_Y1 ≈ g1_Y2                              # gradient Y-invariant under prior_only == 1
+        @test !isapprox(g0_Y1, g0_Y2)                    # gradient Y-dependent under prior_only == 0
     end
 end

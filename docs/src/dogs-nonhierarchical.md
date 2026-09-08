@@ -13,7 +13,8 @@ from a bivariate logit-normal with a shared mean, shared scales and a correlatio
 
 ```math
 \begin{aligned}
-(\operatorname{logit} a_j,\ \operatorname{logit} b_j) &= \mu + z_j \cdot \operatorname{diag}(\sigma)\, L', \\
+(\operatorname{logit} a_j,\ \operatorname{logit} b_j) &= \mu + z_j \cdot \operatorname{diag}(\sigma)\, L
+  \quad (= z_j \cdot \operatorname{diag\_pre\_multiply}(\sigma, L),\ \text{not } L'), \\
 p_{j,t} &= a_j^{\,\text{prev\_shock}_{j,t}}\; b_j^{\,\text{prev\_avoid}_{j,t}}, \qquad
 y_{j,t} \sim \operatorname{Bernoulli}(p_{j,t}),
 \end{aligned}

@@ -88,9 +88,13 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, stud
 
     # Likelihood: Yᵢ ~ Normal(μᵢ, sigma). The Stan model adds it only when the
     # data flag `prior_only` is 0 (`if (!prior_only) target += normal_id_glm_lpdf`),
-    # so the data-directed choice is a bound port: `included_likelihood` is the
-    # likelihood when prior_only == 0 and 0 otherwise. Bound prior_only folds this
-    # to a constant branch at preparation (the posterior data has prior_only = 0).
+    # so the data-directed choice is a bound port: `included_likelihood` SELECTS the
+    # likelihood when prior_only == 0 and 0 otherwise, via `ifelse`. Binding
+    # prior_only makes only that SELECTION a compile-time constant (the posterior
+    # data has prior_only = 0, so the likelihood is always selected); `ifelse`
+    # evaluates BOTH arguments, so the likelihood itself is still computed — the
+    # bound flag chooses which contribution enters the density, it does not prune
+    # the likelihood computation.
     pointwise = plate(Y, mu, sigma) do y, m, s
         normal(m, s).logpdf(y)
     end

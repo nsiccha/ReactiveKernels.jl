@@ -26,8 +26,11 @@ all-ones intercept column and subtracts each remaining column's mean, giving
 hoisted by binding the raw design-matrix port (`bound = (; X, prior_only)`) — RK
 runs the column-drop and centering once at preparation and folds `Xc` into the
 residual kernel as a constant. The likelihood is added only when the data flag
-`prior_only` is 0 (`ifelse(prior_only == 0, likelihood, 0.0)`), a data-directed
-branch that the bound `prior_only` port folds to a constant.
+`prior_only` is 0 (`ifelse(prior_only == 0, likelihood, 0.0)`), so the bound
+`prior_only` port fixes which contribution is *selected* (the posterior data has
+`prior_only = 0`, so the likelihood is always selected). `ifelse` evaluates both
+arms, so binding the flag selects the contribution — it does not prune the
+likelihood computation.
 
 The unconstrained vector is `(b[1..24], Intercept, log_sigma)`. Only `sigma`
 needs a support transform (`sigma = exp(log_sigma)`, Jacobian `log_sigma`); the
@@ -57,8 +60,10 @@ Main.ReactiveKernelsDocs.execute_ppl_example(
 )
 ```
 
-The generated-quantity population intercept starts from an already-constrained
-boundary, so planning removes the transforms, Jacobian, prior, and likelihood:
+The generated-quantity population intercept is planned from the SAME unconstrained
+query, but a narrower WANT: asking only for `b_Intercept` prunes everything it does
+not depend on — the sigma transform, Jacobian, prior, likelihood, and fitted mean
+all drop out, leaving just `b`, `Intercept`, and the `means_X` assembly:
 
 ```julia
 gq_kernel = prepare(model;

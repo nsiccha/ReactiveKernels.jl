@@ -27,8 +27,10 @@ export LOGISTIC_RHS_SOURCE, evaluate_logistic_regression_rhs_source
 #   caux   ~ inv_gamma(0.5*slab_df, 0.5*slab_df)
 #   beta0  ~ normal(0, scale_icept)
 # The half-t priors carry NO explicit `student_t_lccdf` normalization in this
-# model (unlike brms), so the truncation is applied by the exp-transform Jacobian
-# alone (Stan drops the half-t normalizing constant), matched exactly here.
+# model (unlike brms): the positive support (`<lower=0>`) is ENFORCED by the exp
+# transform (which maps ℝ → ℝ₊), and its Jacobian supplies the change-of-measure.
+# Stan drops the half-t truncation normalizing constant and we match that — the
+# Jacobian is the measure term, it does not itself impose the truncation.
 #
 # Real, FULL data (n = 54, d = 1536) loaded from posteriordb via PosteriorDB.jl.
 # The design matrix `x` and the 0/1 outcomes `y` are bound data; the six prior
