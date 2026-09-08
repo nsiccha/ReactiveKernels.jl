@@ -7,8 +7,11 @@
 # provenance string and sort to the bottom.
 import TOML
 
-const _ALL80_NATIVE_CHECKPOINT_PATH = joinpath(
-    dirname(@__DIR__), "benchmark", "receipts", "all80-native-checkpoint-v1.toml")
+# The aggregated all80-benchmark-v1 receipt (native phase ∪ Reactant phase). The
+# native-only frozen checkpoint (all80-native-checkpoint-v1.toml) remains committed as
+# historical provenance; this page renders the aggregate so the Reactant cells appear.
+const _ALL80_BENCHMARK_PATH = joinpath(
+    dirname(@__DIR__), "benchmark", "receipts", "all80-benchmark-v1.toml")
 
 # ~2-sig-fig timing formatter (nanoseconds in the receipt). Non-Real = N/A provenance.
 function _all80_ns(value, _)
@@ -29,7 +32,7 @@ function _all80_rows(models, cellkeys)
         m = models[k]
         diagnostic = get(m, "error", "")
         fallback(c) = !isempty(diagnostic) ? "unavailable — " * first(diagnostic, 180) :
-            occursin("reactant", c) ? "not run in this native checkpoint" : "not measured"
+            occursin("reactant", c) ? "not attempted" : "not measured"
         base = (; model = k,
             note = isempty(diagnostic) ? get(m, "note", "") : "Benchmark gate failure: " * diagnostic)
         cells = NamedTuple{Tuple(Symbol.(cellkeys))}(
@@ -92,7 +95,7 @@ end
 
 """Render the published native checkpoint summary. This deliberately accepts gate-error
 rows: an exact diagnostic is a benchmark result, whereas an invented timing is not."""
-function render_all80_native_checkpoint_summary(path = _ALL80_NATIVE_CHECKPOINT_PATH)
+function render_all80_native_checkpoint_summary(path = _ALL80_BENCHMARK_PATH)
     receipt = TOML.parsefile(path)
     models = get(receipt, "models", Dict())
     failures = count(m -> haskey(m, "error"), values(models))
@@ -107,7 +110,7 @@ function render_all80_native_checkpoint_summary(path = _ALL80_NATIVE_CHECKPOINT_
 end
 
 """Render the three sortable tables from the committed native-checkpoint receipt."""
-function render_all80_native_checkpoint(path = _ALL80_NATIVE_CHECKPOINT_PATH)
+function render_all80_native_checkpoint(path = _ALL80_BENCHMARK_PATH)
     receipt = TOML.parsefile(path)
     models = get(receipt, "models", Dict())
     Markdown.MD(Any[

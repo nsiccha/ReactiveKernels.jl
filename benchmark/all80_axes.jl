@@ -38,11 +38,20 @@ authored-plate Int-axis/Any-materialization Enzyme failure) and we record THAT i
 re-attempting the slow failing compile. Every OTHER native cell (primal rk/turing/stan,
 gradient turing/stan) is unaffected and stays a hard number for all 82."""
 function native_single_eval!(row, c)
-    row["primal_rk"]       = med_ns(Chairmarks.@be c.rk_primal())
+    # Fix D per-cell preservation: an RK cell is a NUMBER only where that operation is verified;
+    # a failed RK operation carries its exact diagnostic STRING — never a timing a ratio plot would
+    # render as a passing verdict. Reference cells (turing/stan) are ALWAYS numeric.
+    # PROPAGATION: a defective RK PRIMAL makes the whole RK graph unreliable, so it BLOCKS gradient_rk
+    # (and hmc_rk_native, below) even if the reverse happened to be finite/accurate — no RK cell may
+    # report a number off a broken graph (performance contract 2026-09-08).
+    row["primal_rk"]       = c.rk_primal_diag === nothing ?
+        med_ns(Chairmarks.@be c.rk_primal()) : c.rk_primal_diag
     row["primal_turing"]   = med_ns(Chairmarks.@be c.tu_primal())
     row["primal_stan"]     = med_ns(Chairmarks.@be c.stan_primal())
-    row["gradient_rk"]     = c.rk_grad_diag === nothing ?
-        med_ns(Chairmarks.@be c.rk_grad()) : c.rk_grad_diag
+    row["gradient_rk"]     = c.rk_grad_diag !== nothing ? c.rk_grad_diag :
+        c.rk_primal_diag !== nothing ?
+            "gradient_rk: not reported — RK primal defective, graph unreliable: " * c.rk_primal_diag :
+        med_ns(Chairmarks.@be c.rk_grad())
     row["gradient_turing"] = med_ns(Chairmarks.@be c.tu_grad())
     row["gradient_stan"]   = med_ns(Chairmarks.@be c.stan_grad())
     row
@@ -58,8 +67,9 @@ HMC loop needs the RK reverse gradient, so a model whose gradient hits the known
 (`c.rk_grad_diag` set) records the SAME diagnostic here (HMC is blocked BY the gradient), never
 a fabricated number. hmc_ahmc_turing is unaffected (Turing side)."""
 hmc_rk_native!(row, c) = (row["hmc_rk_native"] =
-    c.rk_grad_diag === nothing ? c.hmc_time_loop(:native, row["hmc_transitions"]) :
-    "hmc_rk_native blocked by RK gradient: " * c.rk_grad_diag; row)
+    c.rk_grad_diag !== nothing ? "hmc_rk_native blocked by RK gradient: " * c.rk_grad_diag :
+    c.rk_primal_diag !== nothing ? "hmc_rk_native blocked by RK primal: " * c.rk_primal_diag :
+    c.hmc_time_loop(:native, row["hmc_transitions"]); row)
 """reactant HMC: SAME transpiled program lowered through Reactant."""
 hmc_rk_reactant!(row, c) = (row["hmc_rk_reactant"] = c.hmc_time_loop(:reactant); row)
 """AHMC+Turing HMC: AdvancedHMC over the Turing LDF (value+gradient); µs/transition.
@@ -116,7 +126,12 @@ function measure_native(c)
     row = Dict{String,Any}("dim" => c.dim, "family" => c.family, "note" => c.note,
         "parity_pass" => c.parity_pass, "rk_off" => c.rk_off, "tu_off" => c.tu_off,
         "off_reason" => c.off_reason, "rk_grad_relerr" => c.rk_grad_relerr,
-        "tu_grad_relerr" => c.tu_grad_relerr)
+        "tu_grad_relerr" => c.tu_grad_relerr, "rk_stab" => c.rk_stab, "tu_stab" => c.tu_stab,
+        "mag_rk" => c.mag_rk, "mag_tu" => c.mag_tu,
+        "rk_primal_ok" => c.rk_primal_ok, "rk_grad_ok" => c.rk_grad_ok,
+        "turing_support_ok" => c.turing_support_ok,
+        "turing_support_diag" => (c.turing_support_diag === nothing ? "" : c.turing_support_diag),
+        "protocol" => c.protocol)
     native_single_eval!(row, c)
     hmc_protocol!(row, c)
     row

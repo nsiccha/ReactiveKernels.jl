@@ -7,7 +7,7 @@
 # kb/prep. AHMC-Turing uses AdvancedHMC on the Turing LDF. All timings via Chairmarks/@elapsed;
 # every side parity-gated against reference Stan (propto=false, jacobian=true) before timing.
 using Random, LinearAlgebra, Statistics
-import TOML
+import TOML, SHA
 using Chairmarks: @be
 import BridgeStan, PosteriorDB, DynamicPPL
 using ReactiveKernels, ReactiveKernelsPPLExamples
@@ -66,6 +66,31 @@ fmt(ns) = ns < 1e3 ? "$(round(ns; digits=1)) ns" : ns < 1e6 ? "$(round(ns/1e3; d
 stan_val(sm, q) = BridgeStan.log_density(sm, q; propto = false, jacobian = true)
 stan_grad(sm, q) = BridgeStan.log_density_gradient(sm, q; propto = false, jacobian = true)[2]
 relerr(a, b) = maximum(abs, a .- b) / max(maximum(abs, b), eps())
+
+# Scale-aware native parity floor (scale_ok / parity_tol / STAB_ATOL / STAB_ULP_C / classify_boundary)
+# — SHARED with the pure fixtures so they exercise the PRODUCTION helpers.
+include(joinpath(@__DIR__, "all80_parity.jl"))
+# Protocol identity stamped on every row measured under the scale-aware / per-cell native gate
+# (Fix A rescale, C NaN-gradient resilience, D primal-defect preservation, E per-side boundary).
+const PARITY_PROTOCOL = "native-parity-scaleaware-peraxis-v1-2026-09-08"
+
+# Full-diagnostic artifact for a THROWN RK-cell failure. The cell string is a 200-char SUMMARY; the
+# COMPLETE exception + backtrace is written to a CONTENT-ADDRESSED raw log linked from the cell —
+# `diagnostics/<key>__<cell>__<sha16>.log`, where <sha16> is the first 16 hex of the sha256 of the
+# full text. Content-addressing makes the artifact IMMUTABLE: a later fix run with a DIFFERENT stack
+# writes a DIFFERENT file, so it cannot silently replace the exact diagnostic an older receipt links
+# to; the hash is persisted in the cell string alongside the path (performance review 2026-09-08).
+function _rk_full_diag(cell, name, err, bt)
+    full = sprint(showerror, err, bt)
+    ref = ""
+    if RECEIPT != ""
+        dir = joinpath(dirname(RECEIPT), "diagnostics"); mkpath(dir)
+        digest = bytes2hex(SHA.sha256(full)); h = digest[1:16]   # h = 16-hex PREFIX (filename only)
+        open(joinpath(dir, "$(name)__$(cell)__$(h).log"), "w") do io; write(io, full); end
+        ref = " [full stack sha256:$(digest) (filename uses the 16-hex prefix) -> diagnostics/$(name)__$(cell)__$(h).log]"
+    end
+    string(cell, ": ", first(replace(full, "\n" => " "), 200), ref)
+end
 
 # ---- HMC loop (µs/transition) via the shared transpiled program, either backend ----
 # rng_factory yields a fresh sampler RNG (Xoshiro for :native; ReactantRNG for :reactant —
@@ -154,11 +179,17 @@ function run_one(name; seed = 468, scale = 0.2, draws = 3)
 
     # ---- HARD GATE vs reference Stan (propto=false jacobian=true): declared offset + stability + gradient ----
     svj = [stan_val(sm, sq(q)) for q in points]
-    rk_c = svj .- [kb(q) for q in points]
-    tu_c = svj .- [DynamicPPL.LogDensityProblems.logdensity(tldf, cmap(sq(q))) for q in points]
+    rk_vals = [kb(q) for q in points]
+    tu_vals = [DynamicPPL.LogDensityProblems.logdensity(tldf, cmap(sq(q))) for q in points]
+    rk_c = svj .- rk_vals
+    tu_c = svj .- tu_vals
     rk_off = mean(rk_c); tu_off = mean(tu_c)
     rk_off_err = abs(rk_off - e.off_rk); tu_off_err = abs(tu_off - e.off_tu)
     rk_stab = maximum(abs, rk_c .- rk_off); tu_stab = maximum(abs, tu_c .- tu_off)
+    # DISTINCT roundoff magnitudes for the RK-side vs Turing-side floor (never one RK-derived mag
+    # for both — performance review): each is set by the values actually differenced on that side.
+    mag_rk = max(maximum(abs, svj), maximum(abs, rk_vals))
+    mag_tu = max(maximum(abs, svj), maximum(abs, tu_vals))
     # RK reverse gradient parity — resilient to the KNOWN authored-plate core defect
     # (snag authored-plate-i-4556ee01: Int-axis accumulator / Any-materialization Enzyme
     # failure). On THAT failure record the exact diagnostic; under DISCOVER the row keeps
@@ -168,49 +199,89 @@ function run_one(name; seed = 468, scale = 0.2, draws = 3)
     rk_grad_err = try
         maximum(relerr(ReactiveKernels.ad_value_and_gradient!(prep, similar(q), q)[2], bs(stan_grad(sm, sq(q)))) for q in points)
     catch err
-        rk_grad_diag = string("gradient_rk: ", first(replace(sprint(showerror, err), "\n" => " "), 200))
+        rk_grad_diag = _rk_full_diag("gradient_rk", name, err, catch_backtrace())
         NaN
+    end
+    # A NON-FINITE gradient RETURNED (not thrown — e.g. dogs_hier's genuine direct-p boundary
+    # defect, fixed on canonical 1349092/2ba4a639) routes to the SAME diagnostic REPORTING PATH as a
+    # thrown Enzyme error — NOT the same ROOT CAUSE (dogs_hier: boundary; arma11: authored-scan
+    # activity; GLMM: authored-plate marker-six). Same path so DISCOVER keeps every unaffected cell.
+    if rk_grad_diag === nothing && !isfinite(rk_grad_err)
+        rk_grad_diag = "gradient_rk: RK reverse returned a non-finite gradient at an in-support point (genuine RK-reverse defect)"
     end
     tu_grad_err = maximum(relerr(gradient_in_stan_coordinates(cmap, groups, q,
                    DynamicPPL.LogDensityProblems.logdensity_and_gradient(tldf, cmap(sq(q)))[2]), stan_grad(sm, sq(q))) for q in points)
-    # STRUCTURAL checks are HARD in BOTH modes (DISCOVER only softens the constant OFFSET):
-    # stability-across-draws + gradient parity. A non-constant residual or a gradient mismatch
-    # is a real structural failure, not an expected constant — it errors (the driver's DISCOVER
-    # catch records it per-model and continues; it is never silently logged as a soft offset).
-    if rk_grad_diag === nothing
-        rk_stab < 1e-6 && rk_grad_err < 2e-3 ||
-            error("RK STRUCTURAL parity FAIL $name: stab $rk_stab grad $rk_grad_err (not a constant offset)")
-    else
-        # RK reverse unavailable (known core defect). The PRIMAL structural check (offset
-        # stability across draws) is independent of AD and stays HARD; a non-DISCOVER run
-        # still fails closed because the gradient MUST work to PUBLISH numbers.
-        DISCOVER || error("RK gradient FAIL $name: $rk_grad_diag")
-        rk_stab < 1e-6 ||
-            error("RK PRIMAL STRUCTURAL parity FAIL $name: stab $rk_stab (not a constant offset)")
+    # INDEPENDENT PER-CELL failure preservation (Fix D, performance contract 2026-09-08): each RK
+    # cell is a number only if THAT operation is verified vs reference Stan; else an exact diagnostic.
+    #  · gradient_rk: unavailable (thrown/non-finite, above) OR finite-but-WRONG (relerr ≥ 2e-3).
+    #  · primal_rk:   primal not a constant offset (stab fails the scale-aware floor).
+    # Under DISCOVER the row is KEPT with the UNAFFECTED reference cells (Turing/Stan) intact and
+    # parity_pass=false; a failed RK cell never prints a passing verdict or a benchmark ratio
+    # (All80Axes emits the diagnostic string, never a number). NON-DISCOVER still fails CLOSED.
+    if rk_grad_diag === nothing && !(rk_grad_err < 2e-3)
+        rk_grad_diag = "gradient_rk: RK reverse gradient disagrees with reference Stan (relerr $rk_grad_err ≥ 2e-3) — genuine RK-reverse defect"
     end
-    tu_stab < 1e-6 && tu_grad_err < 2e-3 ||
-        error("Turing STRUCTURAL parity FAIL $name: stab $tu_stab grad $tu_grad_err (not a constant offset)")
-    # The value-offset-vs-declared is the ONLY soft check under DISCOVER.
-    rk_off_ok = rk_off_err < 1e-4; tu_off_ok = tu_off_err < 1e-4
-    parity_pass = rk_off_ok && tu_off_ok
+    rk_primal_diag = scale_ok(rk_stab, mag_rk) ? nothing :
+        (isfinite(rk_stab) && isfinite(mag_rk)) ?
+        "primal_rk: RK primal not a constant offset vs reference Stan across in-support draws " *
+        "(stab $rk_stab > tol $(parity_tol(mag_rk)) at mag $mag_rk) — genuine RK-primal defect" :
+        "primal_rk: RK primal scale check FAILED — non-finite residual/magnitude at an in-support draw " *
+        "(stab=$rk_stab, mag=$mag_rk; RK primal values=$(rk_vals); reference Stan values=$(svj)) — genuine RK-primal defect"
+    if !DISCOVER
+        rk_primal_diag === nothing || error("RK PRIMAL parity FAIL $name: $rk_primal_diag")
+        rk_grad_diag === nothing || error("RK gradient parity FAIL $name: $rk_grad_diag")
+    end
+    # Turing/Stan REFERENCE structural integrity stays HARD in both modes: a reference-side failure
+    # invalidates the row's comparison entirely (not an isolated RK-cell defect).
+    scale_ok(tu_stab, mag_tu) && tu_grad_err < 2e-3 ||
+        error("Turing STRUCTURAL parity FAIL $name: stab $tu_stab (tol $(parity_tol(mag_tu)) at mag $mag_tu) grad $tu_grad_err (not a constant offset)")
+    # The value-offset-vs-declared is a soft check under DISCOVER.
+    rk_off_ok = scale_ok(rk_off_err, mag_rk; atol = 1e-4); tu_off_ok = scale_ok(tu_off_err, mag_tu; atol = 1e-4)
+    # SUPPORT-boundary probe (per-side; Fix E / option 1). Stan is the REFERENCE and stays HARD; a
+    # per-side RK or Turing failure is owned by THAT side (kept under DISCOVER as a diagnostic +
+    # correctness=false; hard error under strict). A finite Turing where RK+Stan are -Inf is
+    # NON-EQUIVALENT support — not a valid reference success (no RK/Turing ratio, no HMC claim).
+    turing_support_ok = true; turing_support_diag = nothing
+    if e.boundary !== nothing
+        qb = e.boundary(points[1])
+        vb_r = kb(qb); vb_s = stan_val(sm, sq(qb)); vb_t = DynamicPPL.LogDensityProblems.logdensity(tldf, cmap(sq(qb)))
+        rk_boundary_diag, turing_support_ok, turing_support_diag = classify_boundary(vb_r, vb_s, vb_t; discover = DISCOVER)
+        rk_boundary_diag === nothing || (rk_primal_diag = rk_primal_diag === nothing ? rk_boundary_diag : rk_primal_diag)
+        (rk_boundary_diag === nothing && turing_support_ok) &&
+            println("  support-boundary probe: OK (RK, Stan, Turing all -Inf)")
+    end
+    # MODEL-CORRECTNESS flag (distinct from report-completeness): FALSE on ANY required RK
+    # primal/gradient diagnostic, a declared-offset mismatch, OR a non-equivalent Turing support.
+    # A failed axis never carries a passing verdict, though the row stays report-complete via its
+    # reference cells (Turing timings, if kept, are labeled non-equivalent — not passing cells).
+    rk_primal_ok = rk_primal_diag === nothing; rk_grad_ok = rk_grad_diag === nothing
+    parity_pass = rk_off_ok && tu_off_ok && rk_primal_ok && rk_grad_ok && turing_support_ok
     if !DISCOVER
         rk_off_ok || error("RK offset FAIL $name: measured $(rk_off) != declared $(e.off_rk)")
         tu_off_ok || error("Turing offset FAIL $name: measured $(tu_off) != declared $(e.off_tu)")
     end
-    println("  parity: RK off=$(round(rk_off;sigdigits=4))(want $(e.off_rk)) grad=$(round(rk_grad_err;sigdigits=2)) $(rk_off_ok ? "OK" : "OFFSET") | Turing off=$(round(tu_off;sigdigits=6))(want $(e.off_tu)) grad=$(round(tu_grad_err;sigdigits=2)) $(tu_off_ok ? "OK" : "OFFSET")")
-    if e.boundary !== nothing   # SUPPORT probe is HARD in both modes (structural)
-        qb = e.boundary(points[1])
-        vb_r = kb(qb); vb_s = stan_val(sm, sq(qb)); vb_t = DynamicPPL.LogDensityProblems.logdensity(tldf, cmap(sq(qb)))
-        (vb_r == -Inf && vb_s == -Inf && vb_t == -Inf) || error("boundary probe FAIL $name rk=$vb_r stan=$vb_s turing=$vb_t")
-        println("  support-boundary probe: OK (RK, Stan, Turing all -Inf)")
-    end
+    println("  parity: RK off=$(round(rk_off;sigdigits=4))(want $(e.off_rk)) grad=$(round(rk_grad_err;sigdigits=2)) $(rk_off_ok ? "OK" : "OFFSET") | Turing off=$(round(tu_off;sigdigits=6))(want $(e.off_tu)) grad=$(round(tu_grad_err;sigdigits=2)) $(tu_off_ok ? "OK" : "OFFSET")$(turing_support_ok ? "" : " | TURING-SUPPORT INVALID")")
 
     q = points[1]; qt = cmap(sq(q)); gbuf = similar(q)
     md = All80Metadata.meta(name)
     ctx = (; dim = dim, family = md.family, note = md.note,
         parity_pass = parity_pass, rk_off = rk_off, tu_off = tu_off, off_reason = e.off_reason,
         rk_grad_relerr = rk_grad_err, tu_grad_relerr = tu_grad_err,
-        rk_grad_diag = rk_grad_diag,   # nothing where RK reverse works; else the exact core-defect diagnostic
+        # scale-aware parity evidence: the offset-residual spread + the magnitude that sets its
+        # roundoff floor (tol = STAB_ATOL + STAB_ULP_C·mag·eps), so any row's gate call is auditable.
+        rk_stab = rk_stab, tu_stab = tu_stab, mag_rk = mag_rk, mag_tu = mag_tu,
+        # per-cell RK failure preservation (Fix D): each diagnostic is `nothing` where that RK
+        # operation is verified, else the exact diagnostic string. All80Axes emits a NUMBER only
+        # where the corresponding *_ok is true; a failed cell carries the diagnostic, never a ratio.
+        rk_grad_diag = rk_grad_diag, rk_primal_diag = rk_primal_diag,
+        rk_primal_ok = rk_primal_ok, rk_grad_ok = rk_grad_ok,
+        # Fix E: Turing-side support equivalence. false ⇒ upstream Turing has a NON-EQUIVALENT support
+        # vs reference Stan/RK; Turing timings (if kept) are observability only — NO RK/Turing ratio.
+        turing_support_ok = turing_support_ok, turing_support_diag = turing_support_diag,
+        # protocol stamp: rows measured under the scale-aware / per-cell (Fix A/C/D/E) native protocol.
+        # Rows WITHOUT this field predate it — their absent scale-aware fields are "not recorded under
+        # the old protocol", not a defect (performance directive: no full-82 rerun just to backfill).
+        protocol = PARITY_PROTOCOL,
         # native single-eval closures (timed by All80Axes); HMC returns µs/transition directly
         rk_primal = () -> kb(q),
         tu_primal = () -> DynamicPPL.LogDensityProblems.logdensity(tldf, qt),

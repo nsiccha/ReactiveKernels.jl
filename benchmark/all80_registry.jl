@@ -46,7 +46,7 @@ const REGISTRY = Dict{String,NamedTuple}()
 # GLM_Poisson: off_tu = log(40)+3·log(20). The driver GATES measured == declared.
 reg!(key; kw...) = (REGISTRY[key] = (; off_rk = 0.0, off_tu = 0.0,
     off_reason = "faithful same density; propto=false jacobian=true; no dropped constants",
-    boundary = nothing, stan_perm = nothing, kw...); nothing)
+    boundary = nothing, stan_perm = nothing, probe_q = nothing, kw...); nothing)
 
 # ---------------- Poisson / binomial GLM ----------------
 reg!("GLM_Poisson_Data-GLM_Poisson_model"; mod = :GLMPoissonExample, build = :build_glm_poisson_graph,
@@ -164,8 +164,9 @@ reg!("arK-arK"; mod = :ARKExample, build = :build_ark_graph, have = (:unconstrai
     off_reason = "upstream Turing's truncated/half-Cauchy on σ includes the +log2 half-line normalizer that reference .stan (implicit lower=0 + cauchy_lpdf) drops. Stan−Turing = −log2 ≈ −0.693 (source-derived, observed-confirmed).")
 reg!("arma-arma11"; mod = :ARMA11Example, build = :build_arma11_graph, have = (:unconstrained, :series),
     bind = d -> (series = F(d, "y"),),
+    off_rk = -log(2.0),
     off_tu = -log(2.0),
-    off_reason = "upstream Turing's truncated/half-Cauchy on σ includes the +log2 half-line normalizer that reference .stan (implicit lower=0 + cauchy_lpdf) drops. Stan−Turing = −log2 ≈ −0.693 (source-derived, observed-confirmed).")
+    off_reason = "the RK graph AND upstream Turing both use the PROPER truncated/half-Cauchy on σ (the +log2 half-line normalizer) that reference .stan (implicit lower=0 + cauchy_lpdf) drops: Stan−RK = Stan−Turing = −log2 ≈ −0.693 (source-derived; RK offset measured exactly −log(2) — ReactiveKernels:performance arma11 replay). Same class as eight_schools_centered / arK; the off_rk=0 default here was a metadata omission (off_tu was declared, off_rk was not), independent of the authored-scan Enzyme-activity performance snag.")
 
 # growth
 reg!("dugongs_data-dugongs_model"; mod = :DugongsGrowthExample, build = :build_dugongs_graph, have = (:unconstrained, :ages, :lengths),
@@ -205,7 +206,8 @@ reg!("wells_data-wells_daae_c_model"; mod = :WellsDaaeCExample, build = :build_w
 reg!("dogs-dogs"; mod = :DogsExample, build = :build_dogs_graph, have = (:unconstrained, :n_avoid, :n_shock, :y),
     bind = d -> (let (na, ns, yf) = _dogs_ports(d); (n_avoid = na, n_shock = ns, y = yf) end))
 reg!("dogs-dogs_log"; mod = :DogsLogExample, build = :build_dogs_log_graph, have = (:unconstrained, :n_avoid, :n_shock, :y),
-    bind = d -> (let (na, ns, yf) = _dogs_ports(d); (n_avoid = na, n_shock = ns, y = yf) end))
+    bind = d -> (let (na, ns, yf) = _dogs_ports(d); (n_avoid = na, n_shock = ns, y = yf) end),
+    probe_q = [-0.2, 0.1])  # zeros(2) sits on both Uniform box boundaries (beta1∈[-100,0], beta2∈[0,100])
 reg!("dogs-dogs_hierarchical"; mod = :DogsHierarchicalExample, build = :build_dogs_hierarchical_graph, have = (:unconstrained, :prev_avoid, :prev_shock, :y),
     bind = d -> (let (na, ns, yf) = _dogs_ports(d); (prev_avoid = na, prev_shock = ns, y = yf) end))
 reg!("nes_logit_data-nes_logit_model"; mod = :NesLogitExample, build = :build_nes_logit_graph, have = (:unconstrained, :income, :vote),
@@ -253,9 +255,11 @@ for (k, mod, bf, hv) in [
 end
 
 # ---------------- mixtures (marginalized) ----------------
-reg!("normal_2-normal_mixture"; mod = :NormalMixtureExample, build = :build_normal_mixture_graph, have = (:unconstrained, :y), bind = d -> (y = F(d, "y"),))
+reg!("normal_2-normal_mixture"; mod = :NormalMixtureExample, build = :build_normal_mixture_graph, have = (:unconstrained, :y), bind = d -> (y = F(d, "y"),),
+    probe_q = [0.0, -10.0, 10.0])  # separated components; zeros→mu1==mu2 logsumexp tie (AD subgradient ambiguous)
 reg!("low_dim_gauss_mix-low_dim_gauss_mix"; mod = :LowDimGaussMixExample, build = :build_low_dim_gauss_mix_graph, have = (:unconstrained, :y), bind = d -> (y = F(d, "y"),))
-reg!("low_dim_gauss_mix_collapse-low_dim_gauss_mix_collapse"; mod = :LowDimGaussMixCollapseExample, build = :build_low_dim_gauss_mix_collapse_graph, have = (:unconstrained, :y), bind = d -> (y = F(d, "y"),))
+reg!("low_dim_gauss_mix_collapse-low_dim_gauss_mix_collapse"; mod = :LowDimGaussMixCollapseExample, build = :build_low_dim_gauss_mix_collapse_graph, have = (:unconstrained, :y), bind = d -> (y = F(d, "y"),),
+    probe_q = [-1.0, 1.0, 0.0, 0.0, 0.0])  # separated components; zeros→equal scales/weights logsumexp tie
 
 # ---------------- capture-recapture (data augmentation; derived binds — run-validated) ----------------
 reg!("M0_data-M0_model"; mod = :M0Example, build = :build_m0_graph, have = (:unconstrained, :s, :lchoose, :T, :M), bind = d -> _cr_bind_m0(d))
@@ -363,6 +367,30 @@ function _survey_bind(d)
     (; ns = Float64.(1:nmax),
        lc = Float64[sum(_SURVEY_LCHOOSE(n, ki) for ki in k) for n in 1:nmax],
        sk = Float64(sum(k)), m = m, log_1_nmax = -log(Float64(nmax)))
+end
+
+# Source-derived off_tu (EXPECTED Stan−Turing normalizer offset) for models whose upstream Turing
+# writes an explicit prior normalizer the reference .stan omits (implicit uniform / ordinary lpdf).
+# Applied as a post-definition merge so it also covers loop-registered radon_county. Constants
+# VERIFIED against the pinned DPPL 6378673 posteriordb_models.jl (SHA256 a7ef985b…) + posteriordb-1.0.0
+# .stan by ReactiveKernels:performance (2026-09-08); recorded RK offsets ~0 / gradients agree — these
+# are Turing-side normalization metadata, NOT RK defects. The gate re-verifies measured==declared on
+# the next run (historical receipts keep their own provenance; old measurements are not relabeled).
+for (k, otu, why) in [
+    ("kidiq-kidscore_momhs",       -log(2),     "upstream Turing truncated Cauchy(0,2.5) (+log2 half-line normalizer); reference .stan ordinary cauchy at sigma>0. Stan−Turing=−log2 (posteriordb_models.jl:467-525)"),
+    ("kidiq-kidscore_momiq",       -log(2),     "upstream Turing truncated Cauchy(0,2.5) (+log2); reference .stan ordinary cauchy at sigma>0. Stan−Turing=−log2 (posteriordb_models.jl:467-525)"),
+    ("kidiq-kidscore_momhsiq",     -log(2),     "upstream Turing truncated Cauchy(0,2.5) (+log2); reference .stan ordinary cauchy at sigma>0. Stan−Turing=−log2 (posteriordb_models.jl:467-525)"),
+    ("kidiq-kidscore_interaction", -log(2),     "upstream Turing truncated Cauchy(0,2.5) (+log2); reference .stan ordinary cauchy at sigma>0. Stan−Turing=−log2 (posteriordb_models.jl:467-525)"),
+    ("sblri-blr",                  -log(2),     "upstream Turing half-Normal(0,10) (+log2); blr.stan ordinary normal at sigma>0. Stan−Turing=−log2 (posteriordb_models.jl:799-807, blr.stan:13-14)"),
+    ("Mtbh_data-Mtbh_model",        log(3),     "upstream Turing sigma~Uniform(0,3) (−log3); .stan bounds + uniform commented out. Stan−Turing=+log3 (posteriordb_models.jl:1432, Mtbh.stan:22,48)"),
+    ("Mth_data-Mth_model",          log(5),     "upstream Turing sigma~Uniform(0,5) (−log5); .stan bounds + uniform commented out. Stan−Turing=+log5 (posteriordb_models.jl:1463, Mth.stan:21,39)"),
+    ("election88-election88_full",  5*log(100), "five upstream Turing Uniform(0,100); .stan bounded sigmas, no density prior. Stan−Turing=+5log100 (posteriordb_models.jl:1900-1904, election88.stan:25-29)"),
+    ("pilots-pilots",               3*log(100), "three upstream Turing Uniform(0,100); .stan bounded, no prior. Stan−Turing=+3log100 (pilots.stan:14-16)"),
+    ("radon_mod-radon_county",      2*log(100), "two upstream Turing Uniform(0,100); .stan bounds, no prior. Stan−Turing=+2log100 (radon_county.stan:10-11)"),
+    ("low_dim_gauss_mix-low_dim_gauss_mix", -log(4), "upstream Turing two truncated Normal(0,2) scales (+2log2); .stan constrained scales + ordinary normal. Stan−Turing=−log4; ordered-mu convention retained (posteriordb_models.jl:846-855, low_dim_gauss_mix.stan:7,11)"),
+]
+    haskey(REGISTRY, k) || error("off_tu declaration for unknown registry key $k")
+    REGISTRY[k] = (; REGISTRY[k]..., off_tu = otu, off_reason = why)
 end
 
 end # module All80Registry
