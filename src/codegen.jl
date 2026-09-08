@@ -124,6 +124,24 @@ end
 @inline _authored_plate_zero(::Type{T}, marker) where {T} = zero(T)
 @inline _authored_plate_zero(::Type{Any}, marker) = zero(eltype(marker))
 
+# The pointwise buffer's container type and shape come from the axis marker. For
+# an array marker `similar(marker, T, output_axes)` is the single-allocation fast
+# path (unchanged). A `Tuple` axis marker — a tuple-valued batched argument, or a
+# plate whose sole axis is a tuple — has no `similar(::Tuple, T, axes)` method, so
+# the native/nonallocating pointwise allocation used to crash on it even though
+# the Reactant path materialized it. Julia's broadcast rule collapses a `Tuple`
+# against arrays (or a lone `Tuple`) to a plain `Array`, so allocate the `Array`
+# of the combined output shape directly, matching the container both `_plate_similar`
+# (style-combining) and the Reactant oracle already produce for a tuple axis.
+# (`_plate_similar` alone does not cover a plate whose SOLE axis is a tuple — a
+# lone `Style{Tuple}` would materialize a tuple, not an array — so this marker
+# dispatch is the general fix. The name retains `similar` so the lowering's
+# materialization proxy in `test_authored_plate.jl` still matches.)
+@inline _plate_similar_output(marker, ::Type{T}, output_axes) where {T} =
+    similar(marker, T, output_axes)
+@inline _plate_similar_output(marker::Tuple, ::Type{T}, output_axes) where {T} =
+    similar(Array{T}, output_axes)
+
 # An untyped plate cell exposes its result through a metadata-`Any` boundary
 # port (type annotations are optional metadata in an authored kernel), so the
 # native lowering allocates its pointwise container as a boxed `Vector{Any}` —
@@ -228,8 +246,9 @@ function (op::_AuthoredPlateOp{K,A})(args...) where {K,A}
     # Type the buffer up front from the inferred pointwise element type, so a
     # homogeneous untyped cell fills a `Vector{Float64}` directly instead of a
     # boxed `Vector{Any}`.
-    result = similar(marker, _authored_plate_result_eltype(op, map(typeof, args)),
-                     axes(batch))
+    result = _plate_similar_output(marker,
+                                   _authored_plate_result_eltype(op, map(typeof, args)),
+                                   axes(batch))
     for index in eachindex(batch)
         scalar_args = batch[index]
         result[index] = op.kernel(scalar_args...)
@@ -915,7 +934,8 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
 
     if pointwise_lhs !== nothing
         push!(body.args,
-            :($pointwise_lhs = similar($marker, $plate_eltype, $output_axes)))
+            :($pointwise_lhs = $(GlobalRef(@__MODULE__, :_plate_similar_output))(
+                $marker, $plate_eltype, $output_axes)))
     end
     accumulator = total_lhs === nothing ? nothing : gensym(:plate_total)
     if accumulator !== nothing
