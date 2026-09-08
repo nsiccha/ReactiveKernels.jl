@@ -116,6 +116,10 @@ include("irt_2pl.jl")
 include("2pl_latent_reg_irt.jl")
 include("hier_2pl.jl")
 include("gpcm_latent_reg_irt.jl")
+include("glmm1_model.jl")
+include("bym2_offset_only.jl")
+include("bones_model.jl")
+include("multi_occupancy.jl")
 
 export PPLWorkflow
 
@@ -251,5 +255,9 @@ export Irt2plExample
 export TwoplLatentRegIrtExample
 export Hier2plExample
 export GpcmLatentRegIrtExample
+export GLMM1ModelExample
+export Bym2OffsetOnlyExample
+export BonesModelExample
+export MultiOccupancyExample
 
 end # module ReactiveKernelsPPLExamples

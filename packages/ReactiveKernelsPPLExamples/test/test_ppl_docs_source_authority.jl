@@ -55,6 +55,14 @@ const PPL_SOURCE_CASES = (
      :HIER_2PL_SOURCE, :evaluate_hier_2pl_source),
     ("gpcm-latent-reg-irt.md", "gpcm_latent_reg_irt.jl", GpcmLatentRegIrtExample,
      :GPCM_LR_SOURCE, :evaluate_gpcm_latent_reg_irt_source),
+    ("glmm1.md", "glmm1_model.jl", GLMM1ModelExample,
+     :GLMM1_SOURCE, :evaluate_glmm1_model_source),
+    ("bym2-offset-only.md", "bym2_offset_only.jl", Bym2OffsetOnlyExample,
+     :BYM2_SOURCE, :evaluate_bym2_offset_only_source),
+    ("bones.md", "bones_model.jl", BonesModelExample,
+     :BONES_SOURCE, :evaluate_bones_model_source),
+    ("multi-occupancy.md", "multi_occupancy.jl", MultiOccupancyExample,
+     :MULTI_OCC_SOURCE, :evaluate_multi_occupancy_source),
 )
 
 # One displayed/executed authority kernel per registered case: a file carrying
