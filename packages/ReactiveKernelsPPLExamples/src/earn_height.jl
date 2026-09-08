@@ -1,7 +1,7 @@
 module EarnHeightExample
 
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
 export EARN_HEIGHT_EARN, EARN_HEIGHT_HEIGHT
 export build_earn_height_graph, demo
@@ -10,25 +10,14 @@ export EARN_HEIGHT_SOURCE, evaluate_earn_height_source
 # posteriordb `earnings-earn_height` (ARM ch. 4, Gelman & Hill): a Gaussian
 # linear regression of earnings on height,
 #     earn ~ Normal(β₁ + β₂·height, σ),  σ > 0,
-# with no explicit priors (Stan improper-flat over β and σ). The real dataset has
-# N = 1192; a faithfully-shaped 40-row systematic subset (spanning the full
-# earn/height range, both sexes) is embedded verbatim so the example is
-# self-contained and its gradient can be checked against the real `.stan` on the
-# same data. `earn`/`height` are integers in the posteriordb JSON but Stan reads
-# them as `vector[N]` (real), so they are embedded as `Float64`.
-const EARN_HEIGHT_EARN = [
-    50000.0, 75000.0, 4000.0, 16040.0, 23000.0, 25000.0, 12000.0, 50000.0,
-    35000.0, 28000.0, 35000.0, 6000.0, 8000.0, 8000.0, 40000.0, 22000.0, 8000.0,
-    15000.0, 18000.0, 2000.0, 8000.0, 15000.0, 14000.0, 1200.0, 9000.0, 600.0,
-    30000.0, 15000.0, 58000.0, 14000.0, 10000.0, 6000.0, 25000.0, 18000.0,
-    5000.0, 85000.0, 37000.0, 3000.0, 30000.0, 6000.0,
-]
-const EARN_HEIGHT_HEIGHT = [
-    74.0, 72.0, 64.0, 64.0, 70.0, 71.0, 64.0, 72.0, 69.0, 64.0, 67.0, 64.0,
-    71.0, 63.0, 58.0, 73.0, 68.0, 65.0, 70.0, 63.0, 68.0, 64.0, 66.0, 65.0,
-    72.0, 59.0, 71.0, 63.0, 64.0, 72.0, 63.0, 62.0, 69.0, 63.0, 72.0, 70.0,
-    74.0, 66.0, 68.0, 68.0,
-]
+# with no explicit priors (Stan improper-flat over β and σ). Real data (N = 1192)
+# loaded from the bundled artifact via PosteriorDB.jl. `earn`/`height` are
+# integers in the posteriordb JSON but Stan reads them as `vector[N]` (real), so
+# they are converted to `Float64`.
+let d = _posteriordb_data("earnings-earn_height")
+    global const EARN_HEIGHT_EARN = Float64.(d["earn"])
+    global const EARN_HEIGHT_HEIGHT = Float64.(d["height"])
+end
 
 const EARN_HEIGHT_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
@@ -65,12 +54,10 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
         b1 + b2 * h
     end
 
-    # Likelihood: earnⱼ ~ Normal(β₁ + β₂·heightⱼ, σ). The predictor is recomputed
-    # inline inside the likelihood plate (not read from `mu`), so a total-only
-    # query fuses the whole traversal and materializes no intermediate vector
-    # (structural CSE merges it with `mu` only when both are requested).
-    pointwise = plate(earn, height, beta1, beta2, sigma) do y, h, b1, b2, s
-        normal(b1 + b2 * h, s).logpdf(y)
+    # Likelihood: earnⱼ ~ Normal(μⱼ, σ). The likelihood consumes the named `mu`
+    # once (single-consumer plate-chain, fused buffer-free).
+    pointwise = plate(earn, mu, sigma) do y, m, s
+        normal(m, s).logpdf(y)
     end
     likelihood::Float64 = sum(pointwise)
 
@@ -99,18 +86,21 @@ height = EARN_HEIGHT_HEIGHT
 earn = EARN_HEIGHT_EARN
 
 requested_nodes = (:parameters, :log_jacobian, :likelihood, :posterior)
+# Raw data BOUND (benchmark-acceptance entry): height/earn stay in HAVE but are
+# fixed to their data values; only `unconstrained` stays active.
 density_kernel = prepare(model;
     have = (:unconstrained, :height, :earn),
-    want = requested_nodes)
+    want = requested_nodes,
+    bound = (; height, earn))
 
-output = density_kernel(q, height, earn)
+output = density_kernel(q)
 parameters, log_jacobian, likelihood, posterior = output
 @assert posterior ≈ likelihood + log_jacobian
 
 docs_example = (;
     name = :earn_height_posterior,
     origin = "posteriordb earnings-earn_height — Gaussian regression of earnings on height",
-    inputs = (; q, height, earn),
+    inputs = (; q),
     model,
     kernel = density_kernel,
     output,
