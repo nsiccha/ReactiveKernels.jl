@@ -47,7 +47,13 @@ _embedded_kernel(op) = nothing
 # the fused native/tensorized loop products directly.
 struct _AuthoredPlateOp{K,A}
     kernel::K
+    # Cold lowering metadata: each tuple names the non-atomic arguments of an
+    # absorbed plate. Its original broadcast domain must still be valid even
+    # when a later plate adds axes (or the scalar body ignores an argument).
+    axis_checks::Tuple
 end
+_AuthoredPlateOp{K,A}(kernel::K) where {K,A} =
+    _AuthoredPlateOp{K,A}(kernel, ())
 
 "The transparent scalar plan captured by an authored `plate(...) do` recipe."
 function plate_body(recipe::Recipe)
@@ -332,6 +338,113 @@ function _authored_plate_sum_recipe(p::Plan, plate_recipe::Recipe)
     isempty(matches) ? nothing : only(matches)
 end
 
+# Compose selected scalar DAGs only at code generation. The public graph and
+# Plan retain every named array node, so another WANT/HAVE query can still
+# materialize it or cut the graph there. A whole-array/Ref use is a boundary,
+# as is any additional selected consumer; no source expression is rewritten.
+function _compose_authored_plates(g::Graph, producer::Recipe, consumer::Recipe)
+    scalar_graph = Graph()
+    callvalues = Value[]
+    scalar_have = Value[]
+    atomic = Int[]
+    positions = Dict{Tuple{Int,Bool},Int}()
+    checks = Tuple[]
+    readable_recipes = Dict{Int,Recipe}()
+    producer_id = canon_id(g, only(producer.outputs).id)
+
+    function append_body(recipe, replacement = nothing)
+        op = recipe.op
+        inner = op.kernel.plan
+        old_atomic = typeof(op).parameters[2]
+        mapped = Dict{Int,Value}()
+        input_positions = Vector{Tuple}(undef, length(recipe.inputs))
+        for (index, (outer, input)) in enumerate(zip(recipe.inputs, inner.have))
+            cid = canon_id(g, outer.id)
+            if replacement !== nothing && cid == producer_id
+                mapped[canon_id(inner.graph, input.id)] = replacement.value
+                input_positions[index] = replacement.axes
+                continue
+            end
+            key = (cid, index in old_atomic)
+            position = get!(positions, key) do
+                push!(callvalues, outer)
+                push!(scalar_have, value!(scalar_graph, input.name, valtype(input)))
+                last(key) && push!(atomic, length(callvalues))
+                length(callvalues)
+            end
+            mapped[canon_id(inner.graph, input.id)] = scalar_have[position]
+            input_positions[index] = (position,)
+        end
+        # Preserve all absorbed domain checks, including singleton/empty axes
+        # and unused formals. Flattening only the scalar dependencies loses them.
+        remap(group) = Tuple(unique(Int[
+            position for index in group for position in input_positions[index]]))
+        append!(checks, (remap(group) for group in op.axis_checks))
+        axes = remap(Tuple(index for index in eachindex(recipe.inputs)
+                           if !(index in old_atomic)))
+        push!(checks, axes)
+        for (recipe_index, r) in enumerate(inner.recipes)
+            ins = Tuple(mapped[canon_id(inner.graph, v.id)] for v in r.inputs)
+            outs = Tuple(get!(mapped, canon_id(inner.graph, v.id)) do
+                value!(scalar_graph, v.name, valtype(v))
+            end for v in r.outputs)
+            copied = add!(scalar_graph, ins => outs, r.op; cost = r.cost,
+                          effectful = r.effectful, source = r.source)
+            readable_recipes[copied.id] = op.kernel.lowered_recipes[recipe_index]
+        end
+        (; value = mapped[canon_id(inner.graph, only(inner.want).id)], axes)
+    end
+
+    intermediate = append_body(producer)
+    result = append_body(consumer, intermediate)
+    # Keep the complete HAVE boundary, including unused axis arguments.
+    scalar_plan = plan(scalar_graph; have = scalar_have, want = (result.value,))
+    kernel = prepare(scalar_plan)
+    # Source RHSs use the original scalar formal names. Keep their original
+    # recipe metadata in operation-table order so readable code binds those
+    # names to the newly projected scalar arguments, including across chains.
+    kernel = PreparedKernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
+        kernel.plan, kernel.ast,
+        Tuple(readable_recipes[r.id] for r in scalar_plan.recipes))
+    op = _AuthoredPlateOp{typeof(kernel),Tuple(atomic)}(kernel, Tuple(unique(checks)))
+    Recipe(consumer.id, Tuple(callvalues), consumer.outputs, op,
+           producer.cost + consumer.cost, nothing, false, consumer.source)
+end
+
+function _fuse_authored_plate_chains(p::Plan)
+    recipes = Union{Nothing,Recipe}[p.recipes...]
+    boundary = Set(canon_id(p.graph, v.id) for v in (p.have..., p.want...))
+    changed = false
+    for index in eachindex(recipes)
+        producer = recipes[index]
+        producer === nothing && continue
+        producer.op isa _AuthoredPlateOp || continue
+        length(producer.outputs) == 1 || continue
+        cid = canon_id(p.graph, only(producer.outputs).id)
+        cid in boundary && continue
+        consumers = findall(recipes) do candidate
+            candidate === nothing && return false
+            any(input -> canon_id(p.graph, input.id) == cid, candidate.inputs)
+        end
+        length(consumers) == 1 || continue
+        consumer_index = only(consumers)
+        consumer_index > index || continue
+        consumer = recipes[consumer_index]
+        consumer.op isa _AuthoredPlateOp || continue
+        consumer_atomic = typeof(consumer.op).parameters[2]
+        any(position -> position in consumer_atomic &&
+            canon_id(p.graph, consumer.inputs[position].id) == cid,
+            eachindex(consumer.inputs)) && continue
+        recipes[consumer_index] = _compose_authored_plates(p.graph, producer, consumer)
+        recipes[index] = nothing
+        changed = true
+    end
+    changed || return p
+    selected = Recipe[r for r in recipes if r !== nothing]
+    producer = Dict(canon_id(p.graph, v.id) => r for r in selected for v in r.outputs)
+    Plan(p.graph, p.have, p.want, selected, producer, p.cost, p.candidates)
+end
+
 function _plate_dependencies(plan::Plan, root_ids::Set{Int})
     graph = plan.graph
     dependencies = Dict{Int,Set{Int}}()
@@ -494,6 +607,13 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
         push!(prepared_arguments, prepared)
     end
     output_axes = gensym(:plate_axes)
+    for group in op.axis_checks
+        group_axes = Expr(:call, GlobalRef(Base.Broadcast, :combine_axes),
+            (raw_arguments[position] for position in group
+             if raw_arguments[position] !== nothing)...)
+        push!(body.args, Expr(:call, GlobalRef(@__MODULE__, :_plate_require_axes),
+                              group_axes))
+    end
     combined_axes = Expr(:call, GlobalRef(Base.Broadcast, :combine_axes),
                          (arg for arg in raw_arguments if arg !== nothing)...)
     push!(body.args, Expr(:(=), output_axes,
@@ -1617,17 +1737,24 @@ only those ports runs once, here, and the returned kernel takes just the
 remaining HAVE ports positionally (in their original relative order); the
 hoisted values are baked in as constants. With `bound = ()` (the default)
 behavior is unchanged. `passes` apply to the residual (per-call) kernel.
+
+Selected authored plates with a single plate consumer are composed during
+lowering, eliminating the intermediate array. Named ports remain in `p`: asking
+for an intermediate, supplying it as HAVE, or selecting another consumer keeps
+that boundary. Whole-array (`Ref`) consumers and opaque intervening recipes
+also retain their materialization boundary.
 """
 function prepare(p::Plan; passes = (), bound = ())
     p = _partial_apply(p, bound)
-    native_ast, ops, recipes = _lower_with_ops(p)
+    lowered_plan = _fuse_authored_plate_chains(p)
+    native_ast, ops, recipes = _lower_with_ops(lowered_plan)
     isempty(passes) || (native_ast = transform(native_ast, passes...))
     if !_needs_embedded_tensorization(p)
         return _prepare(p, native_ast, ops, recipes)
     end
 
     tensorized_ast, tensorized_ops, tensorized_recipes =
-        _lower_with_ops(p; tensorized = true)
+        _lower_with_ops(lowered_plan; tensorized = true)
     tensorized_ops == ops || throw(ArgumentError(
         "embedded native and tensorized kernels produced different operation tables"))
     tensorized_recipes == recipes || throw(ArgumentError(
