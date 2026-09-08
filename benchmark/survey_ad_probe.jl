@@ -59,4 +59,8 @@ _, rgrad = gradc(prep, gb, rq)
 ghost = Array{Float64}(rgrad)
 println("gradient EVALUATED; finite=", all(isfinite, ghost),
         " first=", first(ghost, min(3, length(ghost)))); flush(stdout)
-println("SURVEY_AD_OK — the historical process-abort no longer reproduces on this base")
+# A non-abort is only "OK" if the gradient is actually finite — otherwise SURVEY_AD_OK would lie
+# about a NaN/Inf result (the production reactant_cells enforces finite + Stan parity; this keeps
+# the standalone probe from regressing to a false pass).
+all(isfinite, ghost) || error("Survey gradient is NON-FINITE: $(ghost) — probe is NOT ok")
+println("SURVEY_AD_OK — finite gradient, the historical process-abort no longer reproduces on this base")

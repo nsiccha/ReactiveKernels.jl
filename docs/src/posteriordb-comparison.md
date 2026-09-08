@@ -14,13 +14,16 @@ Each Reactant cell is a numeric timing where the faithful graph lowers, or the e
 lowering/AD diagnostic where it does not — never a hand-rewritten "Reactant-friendly"
 density. The failures are kept explicit precisely so they can be improved or fixed.
 
-On this base the load-independent result is strong: **all 82 native RK graphs produce finite
-primal, gradient, and native-HMC values**, and **81 of 82 pass full parity** with reference
-Stan and upstream Turing — the single non-pass, `GLMM_Poisson`, is a Turing prior-support
-non-equivalence, not an RK defect (see the reading guide). **All 82 graphs also lower fully
-through Reactant** (primal, gradient, and the compiled HMC loop) with no remaining lowering or
-AD diagnostic. The native defects that were open on the earlier frozen base are resolved by the
-inherited core compiler fixes, not by the data naturalization.
+On this base the load-independent result is strong, stated precisely: **no RK gate failure is
+observed at the tested points** across all 82 models. Concretely, every native RK graph produces
+finite primal, gradient, and native-HMC values, and **81 of 82 pass parity** with reference Stan
+and upstream Turing at the gate's probe points (native is a three-point check; the single
+non-pass, `GLMM_Poisson`, is a Turing prior-support non-equivalence, not an RK defect — see the
+reading guide). **All 82 graphs also lower through Reactant** (primal and gradient at the selected
+probe `q`; the compiled HMC loop executes finitely) with no remaining lowering or AD diagnostic.
+This is finite-point gate evidence, not a proof of correctness over all inputs. The native gate
+failures that were open on the earlier frozen base are resolved by the inherited core compiler
+fixes, not by the data naturalization.
 
 Every comparator receives the **same complete posteriordb dataset**, parameterization,
 priors, supports, and Jacobians. Reference Stan is compiled from the posteriordb model;
