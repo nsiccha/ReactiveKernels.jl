@@ -158,9 +158,19 @@ end
 # and total accumulator UP FRONT — no boxed `Vector{Any}` is ever built and the
 # accumulator seed matches the summed cells (`_narrow_plate_output` above is a
 # post-hoc narrowing that still allocates the boxed container first and leaves the
-# accumulator untyped). A genuinely uninferrable body falls back to the
-# plan-level output valtype (`Any`), where `_narrow_plate_output` still recovers a
-# homogeneous element type at runtime.
+# accumulator untyped).
+#
+# When `promote_op` cannot pin a CONCRETE type — a genuinely uninferrable body,
+# but also a STATIC call over an UNTYPED batched port, whose projected element
+# type is `Any` (`_plate_cache_slot`/`_plate_result_type` call this with the
+# plan-level HAVE types, where an unannotated port is `Any`) — fall back to the
+# scalar body kernel's DECLARED output valtype. For a typed body (`::Float64`)
+# that valtype is authoritative and concrete, so the nonallocating cache slot is
+# seeded `Array{Float64}` instead of a boxed `Array{Any}` that would re-box every
+# element through `broadcast!` on each call (the `want=:pointwise` regression:
+# 16 KB/call for a length-1000 untyped plate whose cells are Float64). A body
+# with no concrete declared type stays `Any`, where `_narrow_plate_output` still
+# recovers a homogeneous element type at runtime.
 function _authored_plate_result_eltype(op::_AuthoredPlateOp{K,A},
                                        argtypes) where {K,A}
     element_types = ntuple(length(argtypes)) do position
@@ -168,7 +178,10 @@ function _authored_plate_result_eltype(op::_AuthoredPlateOp{K,A},
         (position in A || argtype <: Number) ? argtype : eltype(argtype)
     end
     T = Base.promote_op(op.kernel, element_types...)
-    T === Union{} ? valtype(only(outputs(op.kernel))) : T
+    isconcretetype(T) && return T
+    declared = valtype(only(outputs(op.kernel)))
+    isconcretetype(declared) && return declared
+    T === Union{} ? declared : T
 end
 
 # A plate is a pure graph map/reduction. Once Julia has instantiated the
