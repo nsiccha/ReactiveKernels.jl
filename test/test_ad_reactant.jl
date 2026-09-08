@@ -5,6 +5,7 @@ import Enzyme
 using DifferentiationInterface: AutoEnzyme
 using ReactiveKernelsPPLExamples.EightSchoolsExample:
     build_eight_schools_graph, EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: bernoulli
 
 # Reactant-compiled AD is the AD analog of the primal Reactant path: it takes a
 # native `PreparedADKernel` (which owns the scalar-WANT / single-active-port
@@ -181,5 +182,43 @@ include("test_ad_fused_reactant.jl")
             @test Float64(compiled_value) ≈ value
             @test Array(compiled_gradient) ≈ reference
         end
+    end
+
+    # dogs_hierarchical shape: a bernoulli likelihood plate where `p = a^coef` (a
+    # in (0,1)); the first cell has coef = 0 so `p = 1` with an observed success —
+    # the exact boundary that made the direct-p HAVE NaN through the p -> logit
+    # round trip. The boundary-safe route keeps the compiled gradient finite and
+    # equal to the native reverse pass.
+    @testset "bernoulli direct-p boundary plate gradient (compiled)" begin
+        @kernel bern_plate(u::Vector{Float64}, coef::Vector{Float64},
+                           y::Vector{Bool}) = begin
+            param::Float64 = sum(view(u, 1:1))
+            a::Float64 = 1 / (1 + exp(-param))
+            log_a::Float64 = log(a)
+            pointwise = plate(y, coef, log_a) do yi, c, la
+                bernoulli(exp(c * la)).logpdf(yi)
+            end
+            total::Float64 = sum(pointwise)
+            return total
+        end
+        u = [0.3]
+        coef = [0.0, 1.0, 2.0, 3.0]   # coef[1] = 0 -> p = 1 (boundary), y[1] = true
+        y = Bool[1, 0, 1, 1]
+        kernel = prepare(bern_plate; have = (:u, :coef, :y), want = :total)
+        prepared = prepare_ad(kernel, AD_REACTANT_BACKEND, u, coef, y; active = :u)
+
+        reference = similar(u)
+        value, reference = ad_value_and_gradient!(prepared, reference, u, coef, y)
+        @test all(isfinite, reference)   # was NaN before the boundary-safe route
+
+        traced = map(_trace, (u, coef, y))
+        gradient = Array(compile_ad_gradient(prepared, traced...)(traced...))
+        @test all(isfinite, gradient)
+        @test gradient ≈ reference
+
+        compiled_value, compiled_gradient =
+            compile_ad_value_and_gradient(prepared, traced...)(traced...)
+        @test Float64(compiled_value) ≈ value
+        @test Array(compiled_gradient) ≈ reference
     end
 end

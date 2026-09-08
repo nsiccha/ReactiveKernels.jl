@@ -1,5 +1,6 @@
 using DifferentiationInterface
 import Enzyme
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: bernoulli
 
 include("test_authored_plate_chains_ad.jl")
 
@@ -471,5 +472,40 @@ end
         prepared = prepare_ad(kernel, TEST_AD_BACKEND, q; active = :q)
         @test kernel(q) == original(q)
         @test prepared.call(q, prepared.external_values...) == kernel(q)
+    end
+end
+
+# A direct-p `bernoulli` HAVE at an exact boundary (p = 1 & observed = true,
+# p = 0 & observed = false) previously yielded a NaN reverse gradient: the p HAVE
+# was routed through `logit = log(p) - log1p(-p)` whose derivative is ±Inf there,
+# so `0 · ±Inf = NaN` even though the primal is finite. The boundary-safe route
+# computes the log-probability directly from `p`; the logit HAVE keeps its stable
+# log-sum-exp gradient. (The Reactant analog lives in `test/test_ad_reactant.jl`.)
+@testset "bernoulli direct-p boundary gradients are finite" begin
+    p_kernel = prepare(bernoulli.logpdf; have = (:observed, :p), want = :logpdf)
+    logit_kernel = prepare(bernoulli.logpdf; have = (:observed, :logit), want = :logpdf)
+    grad_p(observed, p) = ad_gradient(p_kernel, TEST_AD_BACKEND, observed, p; active = :p)
+    grad_logit(observed, logit) =
+        ad_gradient(logit_kernel, TEST_AD_BACKEND, observed, logit; active = :logit)
+
+    # Exact boundary: finite (was NaN) and equal to d/dp of the selected log-prob.
+    @test grad_p(true, 1.0) == 1.0     # d/dp log(p)      at p = 1
+    @test grad_p(false, 0.0) == -1.0   # d/dp log1p(-p)   at p = 0
+
+    # Interior direct-p gradients.
+    for p in (0.1, 0.37, 0.6, 0.92)
+        @test grad_p(true, p) ≈ 1 / p
+        @test grad_p(false, p) ≈ -1 / (1 - p)
+        @test isfinite(grad_p(true, p))
+        @test isfinite(grad_p(false, p))
+    end
+
+    # logit HAVE keeps the stable log-sum-exp gradient (sigmoid), finite at
+    # saturating tails.
+    for logit in (-30.0, -20.0, 0.7, 20.0, 30.0)
+        @test grad_logit(true, logit) ≈ 1 / (1 + exp(logit))     # sigmoid(-logit)
+        @test grad_logit(false, logit) ≈ -1 / (1 + exp(-logit))  # -sigmoid(logit)
+        @test isfinite(grad_logit(true, logit))
+        @test isfinite(grad_logit(false, logit))
     end
 end
