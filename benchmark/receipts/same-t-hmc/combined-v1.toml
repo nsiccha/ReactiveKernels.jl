@@ -1,0 +1,141 @@
+schema = "same-t-hmc-combined-v1"
+generated_at = "2026-09-08T17:14:41.952"
+note = "Matched-T native-vs-Reactant HMC on 5 representative models (0yyv0u3, answers 0dur9gk). COMPLETED-RUN historical evidence preserved verbatim; NOT regenerated. us_per_transition is median of 6 rounds; compile_s is prepare+first-execution (warmup), NOT cold compile. Ratio = native/reactant per-transition (>1 => Reactant faster). LIMITATIONS: observed on these reps only (not proof all main-suite losses were artifacts); crossover for the 4 losing-at-4 models only bracketed in (4,100]; per-round timer includes wrapper _device_argument+deepcopy(outputs), XLA launch not isolated; RNG-boundary changed but old-vs-new NOT measured (boundary control OPEN); provenance partial (no data hashes/pkg SHAs/DI ver/load trace/raw start-end); observed-load preliminary, NOT load-invariant. See benchmark/all80_same_t_hmc.jl header."
+native_versions = { julia = "1.10.11", enzyme = "0.13.201" }
+reactant_versions = { julia = "1.10.11", enzyme = "0.13.201", reactant = "0.2.285" }
+
+[cells."GLM_Binomial_data-GLM_Binomial_model|T=100"]
+T = 100
+dim = 3
+native_us_per_transition = 60.63878999999999
+reactant_us_per_transition = 11.32143
+ratio_native_over_reactant = 5.3561
+native_prep_warmup_s = 0.011865198
+reactant_prep_warmup_s = 0.948901482
+
+[cells."GLM_Binomial_data-GLM_Binomial_model|T=1000"]
+T = 1000
+dim = 3
+native_us_per_transition = 59.298258
+reactant_us_per_transition = 10.574072000000001
+ratio_native_over_reactant = 5.6079
+native_prep_warmup_s = 0.066364735
+reactant_prep_warmup_s = 0.973197632
+
+[cells."GLM_Binomial_data-GLM_Binomial_model|T=4"]
+T = 4
+dim = 3
+native_us_per_transition = 64.98849999999999
+reactant_us_per_transition = 34.818125
+ratio_native_over_reactant = 1.8665
+native_prep_warmup_s = 3.671486283
+reactant_prep_warmup_s = 21.523840226
+
+[cells."eight_schools-eight_schools_centered|T=100"]
+T = 100
+dim = 10
+native_us_per_transition = 7.98262
+reactant_us_per_transition = 4.161545
+ratio_native_over_reactant = 1.9182
+native_prep_warmup_s = 0.009206497
+reactant_prep_warmup_s = 1.021043471
+
+[cells."eight_schools-eight_schools_centered|T=1000"]
+T = 1000
+dim = 10
+native_us_per_transition = 6.9268605
+reactant_us_per_transition = 2.7945965
+ratio_native_over_reactant = 2.4787
+native_prep_warmup_s = 0.015944848
+reactant_prep_warmup_s = 0.987721064
+
+[cells."eight_schools-eight_schools_centered|T=4"]
+T = 4
+dim = 10
+native_us_per_transition = 9.643375
+reactant_us_per_transition = 61.448499999999996
+ratio_native_over_reactant = 0.1569
+native_prep_warmup_s = 12.730559079
+reactant_prep_warmup_s = 65.084709371
+
+[cells."eight_schools-eight_schools_noncentered|T=100"]
+T = 100
+dim = 10
+native_us_per_transition = 6.422865
+reactant_us_per_transition = 4.034715000000001
+ratio_native_over_reactant = 1.5919
+native_prep_warmup_s = 0.006486362
+reactant_prep_warmup_s = 0.936022439
+
+[cells."eight_schools-eight_schools_noncentered|T=1000"]
+T = 1000
+dim = 10
+native_us_per_transition = 6.448475999999999
+reactant_us_per_transition = 2.7729019999999998
+ratio_native_over_reactant = 2.3255
+native_prep_warmup_s = 0.011366307
+reactant_prep_warmup_s = 0.995402826
+
+[cells."eight_schools-eight_schools_noncentered|T=4"]
+T = 4
+dim = 10
+native_us_per_transition = 10.438125
+reactant_us_per_transition = 40.776374999999994
+ratio_native_over_reactant = 0.256
+native_prep_warmup_s = 3.540139641
+reactant_prep_warmup_s = 17.519085252
+
+[cells."kilpisjarvi_mod-kilpisjarvi|T=100"]
+T = 100
+dim = 3
+native_us_per_transition = 5.749635
+reactant_us_per_transition = 4.394865
+ratio_native_over_reactant = 1.3083
+native_prep_warmup_s = 0.006151992
+reactant_prep_warmup_s = 0.856488659
+
+[cells."kilpisjarvi_mod-kilpisjarvi|T=1000"]
+T = 1000
+dim = 3
+native_us_per_transition = 5.7953335
+reactant_us_per_transition = 2.7058489999999997
+ratio_native_over_reactant = 2.1418
+native_prep_warmup_s = 0.009860739
+reactant_prep_warmup_s = 0.865717164
+
+[cells."kilpisjarvi_mod-kilpisjarvi|T=4"]
+T = 4
+dim = 3
+native_us_per_transition = 8.961125
+reactant_us_per_transition = 65.978375
+ratio_native_over_reactant = 0.1358
+native_prep_warmup_s = 3.205405223
+reactant_prep_warmup_s = 15.269704416
+
+[cells."radon_mn-radon_variable_intercept_slope_centered|T=100"]
+T = 100
+dim = 175
+native_us_per_transition = 221.911975
+reactant_us_per_transition = 134.88169
+ratio_native_over_reactant = 1.6452
+native_prep_warmup_s = 0.030475302
+reactant_prep_warmup_s = 1.15933587
+
+[cells."radon_mn-radon_variable_intercept_slope_centered|T=1000"]
+T = 1000
+dim = 175
+native_us_per_transition = 236.62730100000002
+reactant_us_per_transition = 124.40777299999999
+ratio_native_over_reactant = 1.902
+native_prep_warmup_s = 0.291037677
+reactant_prep_warmup_s = 1.243605895
+
+[cells."radon_mn-radon_variable_intercept_slope_centered|T=4"]
+T = 4
+dim = 175
+native_us_per_transition = 201.99874999999997
+reactant_us_per_transition = 262.453375
+ratio_native_over_reactant = 0.7697
+native_prep_warmup_s = 4.916432358
+reactant_prep_warmup_s = 17.809613493
+

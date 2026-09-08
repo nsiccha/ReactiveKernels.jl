@@ -17,6 +17,28 @@
 # ONLY for the reactant backend. NO cross-backend trajectory-agreement gate (same input + same work,
 # not identical draws). Timings are observed-load / provenance-labelled (shared host, run-freely).
 #
+# WHAT THIS DOES AND DOES NOT SHOW (performance review 2026-09-08):
+#   - It measures matched-T native-vs-Reactant per-transition wall-clock on FIVE representative
+#     models. At T=100/1000 all five are faster on Reactant; at T=4 four of five are faster on
+#     native (GLM_Binomial is faster on Reactant already at T=4). This is OBSERVED on these reps,
+#     NOT proof that every main-suite Reactant-HMC loss was a batch artifact, nor that no lowering
+#     deficiency remains anywhere.
+#   - The crossover for the four losing-at-4 models is only BRACKETED in (4, 100] — the grid does
+#     not resolve where in that interval it happens; do not state a specific crossover T.
+#   - The per-round timer is NOT a pure kernel execute: the transpiled wrapper still calls
+#     _device_argument + deepcopy(outputs) inside prog(...). XLA launch cost is NOT isolated from
+#     those wrapper costs. Preconstructing the RNG changes the construction boundary but the
+#     old-vs-new boundary is NOT measured here (see OPEN control below).
+#   - prep_warmup_s is preparation + FIRST execution (warmup), not a standalone cold compile.
+#   - Provenance recorded is partial (versions + medians + raw rounds + q). It omits data hashes,
+#     loaded RK/distribution roots+SHAs, DI version, effective compile options, per-round start/end,
+#     and a load trace. Preserve the completed receipts/logs WITH these limitations; capture the
+#     missing fields on any follow-on execution rather than rerunning solely for paperwork.
+#
+# OPEN (spec item not completed): a matched RNG-construction BOUNDARY control (same T, same q, only
+# the RNG-construction boundary changed: preconstructed vs constructed-in-timer) with honest
+# sample/load/source recording. Left explicitly open — the matched-T sub-result stands without it.
+#
 # Run:  SAME_T_BACKEND=native   SAME_T_RECEIPT=.../same_t_hmc_native.toml   julia --project=benchmark/all80-env benchmark/all80_same_t_hmc.jl
 #       SAME_T_BACKEND=reactant SAME_T_RECEIPT=.../same_t_hmc_reactant.toml julia --project=benchmark/all80-env benchmark/all80_same_t_hmc.jl
 using Random, LinearAlgebra, Statistics
@@ -94,16 +116,25 @@ function same_t_measure(kb, prep, q; T, steps = STEPS, rounds = ROUNDS)
         CallbackHandle(Potential(kb)), CallbackHandle(Gradient(prep)),
         Diagonal(ones(D)), copy(q), zeros(D))
     local prog, st, warm
-    compile_s = @elapsed begin
+    # prep_warmup_s = prepare_transpiled + FIRST execution (warmup). This is NOT a standalone cold
+    # compile cost: for :reactant it bundles compile + one run; and at T=100/1000 in a warm process
+    # (small numbers below) the executable is already compiled, so this is mostly the warmup run.
+    # Do not read it as a cold-vs-warm per-executable comparison.
+    prep_warmup_s = @elapsed begin
         prog = prepare_transpiled(PositionMultinomialHMCAuthoring.multinomial_hmc_state, point;
             backend = BACKEND, method = :step!, argument = mkrng(), iterations = T,
             kernel_kwargs = (n_steps = steps, step_f = F.leapfrog!, stepsize = STEPSIZE),
             outputs = (position = (:init, :pos),))
         st = initial_transpiled_state(prog)
-        warm = prog(st, mkrng())          # compile+run happens here for :reactant
+        warm = prog(st, mkrng())
     end
     all(isfinite, Array(warm.outputs.position)) || error("$BACKEND T=$T warmup non-finite")
-    rngs = [mkrng() for _ in 1:rounds]    # PRECONSTRUCTED outside the timer
+    # RNG preconstructed outside the execute timer. NOTE (performance review): this changes the
+    # RNG-construction boundary vs the production hmc_loop, but the harness does NOT measure the
+    # old-vs-new boundary, and the transpiled wrapper STILL calls _device_argument + deepcopy of
+    # the outputs inside `prog(...)` — so the timer is NOT a pure kernel-execute and the per-round
+    # figure is not an isolated marshalling gain. See the boundary control (OPEN) in the header.
+    rngs = [mkrng() for _ in 1:rounds]
     times = Float64[]
     for i in 1:rounds
         local r
@@ -111,14 +142,26 @@ function same_t_measure(kb, prep, q; T, steps = STEPS, rounds = ROUNDS)
         all(isfinite, Array(r.outputs.position)) || error("$BACKEND T=$T timed result non-finite")
         push!(times, t)
     end
-    (; compile_s, exec_round_s_median = median(times), us_per_transition = median(times) / T * 1e6)
+    (; prep_warmup_s, exec_round_s_median = median(times), us_per_transition = median(times) / T * 1e6,
+       raw_round_s = times)
 end
 
+_pkgroot(m) = try string(pkgdir(m)) catch; "?" end
+_pkgver(m) = try string(pkgversion(m)) catch; "?" end
 const VERSIONS = Dict{String,Any}(
     "julia" => string(VERSION), "backend" => String(BACKEND),
-    "enzyme" => string(pkgversion(Enzyme)),
-    "reactant" => BACKEND == :reactant ? string(pkgversion(@eval Reactant)) : "not-loaded",
-    "device" => "CPU", "steps" => STEPS, "stepsize" => STEPSIZE, "rounds" => ROUNDS)
+    "enzyme" => _pkgver(Enzyme),
+    "differentiationinterface" => _pkgver(DifferentiationInterface),
+    "reactant" => BACKEND == :reactant ? _pkgver(@eval Reactant) : "not-loaded",
+    "reactivekernels_version" => _pkgver(ReactiveKernels),
+    "reactivekernels_root" => _pkgroot(ReactiveKernels),
+    "pplexamples_root" => _pkgroot(ReactiveKernelsPPLExamples),
+    "device" => "CPU", "steps" => STEPS, "stepsize" => STEPSIZE, "rounds" => ROUNDS,
+    "started_at" => string(Dates.now()),
+    # HONEST GAPS (performance review): NOT recorded here — data hashes, exact loaded package SHAs,
+    # effective XLA/compile options, per-round start/end timestamps, host load trace. Capture on any
+    # follow-on execution; not reconstructable after the fact for the completed run.
+    "provenance_note" => "partial; see harness header LIMITATIONS")
 
 rows = Dict{String,Any}()
 for name in REP_SET
@@ -135,11 +178,12 @@ for name in REP_SET
     for T in TS
         cell = try
             m = same_t_measure(kb, prep, q; T = T)
-            println("  T=$(rpad(T,4)) compile=$(round(m.compile_s;sigdigits=3))s  " *
+            println("  T=$(rpad(T,4)) prep+warmup=$(round(m.prep_warmup_s;sigdigits=3))s  " *
                     "$(round(m.us_per_transition;sigdigits=4)) µs/transition")
-            Dict("T" => T, "compile_s" => m.compile_s,
+            Dict("T" => T, "prep_warmup_s" => m.prep_warmup_s,
                  "exec_round_s_median" => m.exec_round_s_median,
-                 "us_per_transition" => m.us_per_transition, "dim" => length(q))
+                 "us_per_transition" => m.us_per_transition, "dim" => length(q),
+                 "raw_round_s" => m.raw_round_s, "q" => collect(Float64, q))
         catch err
             msg = first(replace(sprint(showerror, err), "\n" => " "), 220)
             println("  T=$(rpad(T,4)) FAIL → $msg")

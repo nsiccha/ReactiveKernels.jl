@@ -1,0 +1,118 @@
+backend = "native"
+generated_at = "2026-09-08T17:14:41.952"
+schema = "same-t-hmc-v1"
+
+[cells."GLM_Binomial_data-GLM_Binomial_model|T=100"]
+T = 100
+compile_s = 0.011865198
+dim = 3
+exec_round_s_median = 0.0060638789999999995
+us_per_transition = 60.63878999999999
+
+[cells."GLM_Binomial_data-GLM_Binomial_model|T=1000"]
+T = 1000
+compile_s = 0.066364735
+dim = 3
+exec_round_s_median = 0.059298258
+us_per_transition = 59.298258
+
+[cells."GLM_Binomial_data-GLM_Binomial_model|T=4"]
+T = 4
+compile_s = 3.671486283
+dim = 3
+exec_round_s_median = 0.00025995399999999996
+us_per_transition = 64.98849999999999
+
+[cells."eight_schools-eight_schools_centered|T=100"]
+T = 100
+compile_s = 0.009206497
+dim = 10
+exec_round_s_median = 0.000798262
+us_per_transition = 7.98262
+
+[cells."eight_schools-eight_schools_centered|T=1000"]
+T = 1000
+compile_s = 0.015944848
+dim = 10
+exec_round_s_median = 0.0069268605
+us_per_transition = 6.9268605
+
+[cells."eight_schools-eight_schools_centered|T=4"]
+T = 4
+compile_s = 12.730559079
+dim = 10
+exec_round_s_median = 3.8573500000000006e-5
+us_per_transition = 9.643375
+
+[cells."eight_schools-eight_schools_noncentered|T=100"]
+T = 100
+compile_s = 0.006486362
+dim = 10
+exec_round_s_median = 0.0006422865
+us_per_transition = 6.422865
+
+[cells."eight_schools-eight_schools_noncentered|T=1000"]
+T = 1000
+compile_s = 0.011366307
+dim = 10
+exec_round_s_median = 0.006448476
+us_per_transition = 6.448475999999999
+
+[cells."eight_schools-eight_schools_noncentered|T=4"]
+T = 4
+compile_s = 3.540139641
+dim = 10
+exec_round_s_median = 4.17525e-5
+us_per_transition = 10.438125
+
+[cells."kilpisjarvi_mod-kilpisjarvi|T=100"]
+T = 100
+compile_s = 0.006151992
+dim = 3
+exec_round_s_median = 0.0005749635
+us_per_transition = 5.749635
+
+[cells."kilpisjarvi_mod-kilpisjarvi|T=1000"]
+T = 1000
+compile_s = 0.009860739
+dim = 3
+exec_round_s_median = 0.0057953335
+us_per_transition = 5.7953335
+
+[cells."kilpisjarvi_mod-kilpisjarvi|T=4"]
+T = 4
+compile_s = 3.205405223
+dim = 3
+exec_round_s_median = 3.58445e-5
+us_per_transition = 8.961125
+
+[cells."radon_mn-radon_variable_intercept_slope_centered|T=100"]
+T = 100
+compile_s = 0.030475302
+dim = 175
+exec_round_s_median = 0.022191197500000003
+us_per_transition = 221.911975
+
+[cells."radon_mn-radon_variable_intercept_slope_centered|T=1000"]
+T = 1000
+compile_s = 0.291037677
+dim = 175
+exec_round_s_median = 0.236627301
+us_per_transition = 236.62730100000002
+
+[cells."radon_mn-radon_variable_intercept_slope_centered|T=4"]
+T = 4
+compile_s = 4.916432358
+dim = 175
+exec_round_s_median = 0.0008079949999999999
+us_per_transition = 201.99874999999997
+
+[versions]
+backend = "native"
+device = "CPU"
+enzyme = "0.13.201"
+julia = "1.10.11"
+reactant = "not-loaded"
+rounds = 6
+steps = 16
+stepsize = 0.03
