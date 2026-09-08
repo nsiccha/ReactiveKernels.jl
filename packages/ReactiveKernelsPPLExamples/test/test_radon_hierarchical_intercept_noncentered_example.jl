@@ -46,7 +46,7 @@ end
                        RADON_HIERARCHICAL_INTERCEPT_NONCENTERED_SOURCE)
         @test occursin("mu = alpha_county .+ log_uppm .* beta1 .+ floor_measure .* beta2",
                        RADON_HIERARCHICAL_INTERCEPT_NONCENTERED_SOURCE)
-        @test occursin("beta1::Float64 = sum(view(beta, 1:1))",
+        @test occursin("beta1::Float64 = beta[1]",
                        RADON_HIERARCHICAL_INTERCEPT_NONCENTERED_SOURCE)
         @test occursin("normal(0.0, 1.0).logpdf(ar)",
                        RADON_HIERARCHICAL_INTERCEPT_NONCENTERED_SOURCE)

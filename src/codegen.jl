@@ -124,6 +124,24 @@ end
 @inline _authored_plate_zero(::Type{T}, marker) where {T} = zero(T)
 @inline _authored_plate_zero(::Type{Any}, marker) = zero(eltype(marker))
 
+# The pointwise buffer's container type and shape come from the axis marker. For
+# an array marker `similar(marker, T, output_axes)` is the single-allocation fast
+# path (unchanged). A `Tuple` axis marker — a tuple-valued batched argument, or a
+# plate whose sole axis is a tuple — has no `similar(::Tuple, T, axes)` method, so
+# the native/nonallocating pointwise allocation used to crash on it even though
+# the Reactant path materialized it. Julia's broadcast rule collapses a `Tuple`
+# against arrays (or a lone `Tuple`) to a plain `Array`, so allocate the `Array`
+# of the combined output shape directly, matching the container both `_plate_similar`
+# (style-combining) and the Reactant oracle already produce for a tuple axis.
+# (`_plate_similar` alone does not cover a plate whose SOLE axis is a tuple — a
+# lone `Style{Tuple}` would materialize a tuple, not an array — so this marker
+# dispatch is the general fix. The name retains `similar` so the lowering's
+# materialization proxy in `test_authored_plate.jl` still matches.)
+@inline _plate_similar_output(marker, ::Type{T}, output_axes) where {T} =
+    similar(marker, T, output_axes)
+@inline _plate_similar_output(marker::Tuple, ::Type{T}, output_axes) where {T} =
+    similar(Array{T}, output_axes)
+
 # An untyped plate cell exposes its result through a metadata-`Any` boundary
 # port (type annotations are optional metadata in an authored kernel), so the
 # native lowering allocates its pointwise container as a boxed `Vector{Any}` —
@@ -228,8 +246,9 @@ function (op::_AuthoredPlateOp{K,A})(args...) where {K,A}
     # Type the buffer up front from the inferred pointwise element type, so a
     # homogeneous untyped cell fills a `Vector{Float64}` directly instead of a
     # boxed `Vector{Any}`.
-    result = similar(marker, _authored_plate_result_eltype(op, map(typeof, args)),
-                     axes(batch))
+    result = _plate_similar_output(marker,
+                                   _authored_plate_result_eltype(op, map(typeof, args)),
+                                   axes(batch))
     for index in eachindex(batch)
         scalar_args = batch[index]
         result[index] = op.kernel(scalar_args...)
@@ -781,10 +800,58 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
         push!(prepared_arguments, prepared)
     end
     output_axes = gensym(:plate_axes)
+    # A fused plate chain absorbs one axis-check group per sub-plate
+    # (`_compose_authored_plates`), so it emits extra pre-loop
+    # `_plate_require_axes(combine_axes(...))` calls that an equivalent single
+    # `plate` never has — the ONLY codegen difference between the two forms
+    # (verified: `code_expr` is otherwise identical modulo gensyms). They
+    # validate nothing new (the always-emitted `combined_axes` check below
+    # subsumes broadcast-compatibility), so eliding them is a STRUCTURAL CLEANUP
+    # that makes a fused chain lower identically to a single plate. (snag
+    # `composed-authore` reported a ~1.56× composed-vs-single-plate primal gap
+    # under concurrent benchmark load; it is NOT reproducible under controlled
+    # conditions and its mechanism is UNLOCATED — this elision is a cleanup, not
+    # a proven speedup.) Skip a group ONLY when the `combined_axes` check fully
+    # subsumes it — both conditions required:
+    #   (a) its operands ⊆ the combined operand set, so broadcast-compatibility
+    #       is already validated (the superset's `combine_axes` throws the same
+    #       `DimensionMismatch`); AND
+    #   (b) at least one operand is a STATICALLY provable ≥1-dim axis
+    #       (`_static_plate_axis_class === :axis`), so this sub-plate's own
+    #       "at least one batched broadcast axis" guard cannot fire.
+    # Without (b) an all-scalar sub-plate (e.g. a fused producer over untyped
+    # ports bound to runtime scalars) would wrongly pass on an axis contributed
+    # by ANOTHER sub-plate — the `test_authored_plate` `multi`/`unused`
+    # rejection guards. A chain over typed/bound array ports (the common case)
+    # meets both and drops the redundant checks, matching the single plate.
+    combined_positions = Set(position for position in eachindex(raw_arguments)
+                             if raw_arguments[position] !== nothing)
     for group in op.axis_checks
+        group_positions = Int[position for position in group
+                              if raw_arguments[position] !== nothing]
+        # Skip ONLY when the combined check subsumes this group — BOTH required:
+        # (a) operands ⊆ the combined operand set, and (b) at least one operand
+        # is a statically provable ≥1-dim axis. An EMPTY `group_positions` (every
+        # original operand filtered out because it is Ref-atomic or a static
+        # `Number`) is NOT skippable: this sub-plate has NO batched axis of its
+        # own and must still be REJECTED, exactly as the pre-fusion single plate.
+        # Both `issubset` (empty ⊆ anything) and `any` (`false` over empty)
+        # already give that verdict, so no special-case skip: the group then
+        # lowers to a zero-operand `combine_axes()`, which throws (currently a
+        # `MethodError` — there is no zero-arg method), rejecting the axis-less
+        # sub-plate. (An UNTYPED all-scalar operand instead survives the filter
+        # as a 0-dim arg and is rejected one step later by `_plate_require_axes`
+        # over an empty axes tuple ⇒ `ArgumentError` — see the `multi`/`unused`
+        # tests; both paths reject.) A `continue` here would instead let an
+        # axis-less producer silently borrow a sibling's axis (regression caught
+        # in review of the first candidate; negative-domain tests below).
+        if issubset(group_positions, combined_positions) &&
+           any(p -> _static_plate_axis_class(valtype(callvalues[p])) === :axis,
+               group_positions)
+            continue
+        end
         group_axes = Expr(:call, GlobalRef(Base.Broadcast, :combine_axes),
-            (raw_arguments[position] for position in group
-             if raw_arguments[position] !== nothing)...)
+            (raw_arguments[position] for position in group_positions)...)
         push!(body.args, Expr(:call, GlobalRef(@__MODULE__, :_plate_require_axes),
                               group_axes))
     end
@@ -877,7 +944,8 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
 
     if pointwise_lhs !== nothing
         push!(body.args,
-            :($pointwise_lhs = similar($marker, $plate_eltype, $output_axes)))
+            :($pointwise_lhs = $(GlobalRef(@__MODULE__, :_plate_similar_output))(
+                $marker, $plate_eltype, $output_axes)))
     end
     accumulator = total_lhs === nothing ? nothing : gensym(:plate_total)
     if accumulator !== nothing

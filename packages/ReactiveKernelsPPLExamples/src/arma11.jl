@@ -48,12 +48,11 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
 
 @kernel model(unconstrained::Vector{Float64},
               series::Vector{Float64}) = begin
-    # q = (μ, φ, θ, log_σ). One-element reductions extract the packed scalars
-    # without scalar indexing, keeping the kernel Reactant-traceable.
-    μ::Float64 = sum(view(unconstrained, 1:1))
-    φ::Float64 = sum(view(unconstrained, 2:2))
-    θ::Float64 = sum(view(unconstrained, 3:3))
-    log_σ::Float64 = sum(view(unconstrained, 4:4))
+    # q = (μ, φ, θ, log_σ).
+    μ::Float64 = unconstrained[1]
+    φ::Float64 = unconstrained[2]
+    θ::Float64 = unconstrained[3]
+    log_σ::Float64 = unconstrained[4]
 
     # Only σ has a support transform. Either σ or log_σ may be the authoritative
     # HAVE value; supplying both cuts both edges.

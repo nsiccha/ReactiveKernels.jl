@@ -1,7 +1,7 @@
 module MesquiteExample
 
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
 export MESQ_WEIGHT, MESQ_DIAM1, MESQ_DIAM2, MESQ_CANOPY_HEIGHT
 export MESQ_TOTAL_HEIGHT, MESQ_DENSITY, MESQ_GROUP
@@ -14,49 +14,16 @@ export MESQUITE_SOURCE, evaluate_mesquite_source
 # improper-flat priors and `sigma > 0` has an implicit improper-flat prior; the
 # real data (N = 46) is embedded verbatim so the example is self-contained,
 # matching the other PPL examples.
-const MESQ_WEIGHT = [
-    401.3, 513.7, 1179.2, 308.0, 855.2, 268.7, 155.5, 1253.2, 328.0, 614.6,
-    60.2, 269.6, 448.4, 120.4, 378.7, 266.4, 138.9, 1020.8, 635.7, 621.8, 579.8,
-    326.8, 66.7, 68.0, 153.1, 256.4, 723.0, 4052.0, 345.0, 330.9, 163.5, 1160.0,
-    386.6, 693.5, 674.4, 217.5, 771.3, 341.7, 125.7, 462.5, 64.5, 850.6, 226.0,
-    1745.1, 908.0, 213.5,
-]
-const MESQ_DIAM1 = [
-    1.8, 1.7, 2.8, 1.3, 3.3, 1.4, 1.5, 3.9, 1.8, 2.1, 0.8, 1.3, 1.2, 1.5, 2.8,
-    1.4, 1.5, 2.4, 1.9, 2.3, 2.1, 2.4, 1.0, 1.3, 1.1, 1.3, 2.5, 5.2, 2.0, 1.6,
-    1.4, 3.2, 1.9, 2.4, 2.5, 2.1, 2.4, 2.4, 1.9, 2.7, 1.3, 2.9, 2.1, 4.1, 2.8,
-    1.27,
-]
-const MESQ_DIAM2 = [
-    1.15, 1.35, 2.55, 0.85, 1.9, 1.4, 0.5, 2.3, 1.35, 1.6, 0.63, 0.95, 0.9, 0.7,
-    1.7, 0.85, 0.6, 2.4, 1.55, 1.6, 1.7, 1.3, 0.4, 0.6, 0.7, 1.2, 2.3, 4.0, 1.6,
-    1.6, 1.0, 1.9, 1.8, 2.4, 1.8, 1.5, 2.2, 1.7, 1.2, 2.5, 1.1, 2.7, 1.0, 3.8,
-    2.5, 1.0,
-]
-const MESQ_CANOPY_HEIGHT = [
-    1.0, 1.33, 0.6, 1.2, 1.05, 1.0, 0.9, 1.3, 0.6, 0.8, 0.6, 0.95, 1.2, 0.7,
-    1.2, 1.1, 0.64, 1.2, 1.2, 1.3, 1.0, 0.9, 1.0, 0.5, 0.9, 0.6, 1.4, 2.5, 1.4,
-    1.3, 1.1, 1.5, 0.8, 1.1, 1.3, 0.85, 1.5, 1.2, 1.15, 1.5, 0.7, 1.9, 1.5, 1.5,
-    1.5, 0.62,
-]
-const MESQ_TOTAL_HEIGHT = [
-    1.3, 1.35, 2.16, 1.8, 1.55, 1.2, 1.0, 1.7, 0.8, 1.2, 0.9, 1.35, 1.4, 1.0,
-    1.7, 1.5, 0.65, 1.5, 1.7, 1.7, 1.5, 1.5, 1.2, 0.7, 1.2, 0.8, 1.7, 3.0, 1.7,
-    1.6, 1.5, 1.9, 1.1, 1.6, 2.0, 1.25, 2.0, 1.3, 1.45, 2.2, 0.7, 1.9, 1.8, 2.0,
-    2.2, 0.92,
-]
-const MESQ_DENSITY = [
-    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
-    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 1.0, 1.0, 1.0, 1.0, 5.0, 9.0, 1.0, 1.0,
-    1.0, 3.0, 1.0, 3.0, 7.0, 1.0, 2.0, 2.0, 2.0, 3.0, 1.0, 1.0, 2.0, 2.0, 1.0,
-    1.0,
-]
-const MESQ_GROUP = [
-    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0,
-    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
-    1.0,
-]
+# Real data (full) from posteriordb `mesquite-mesquite`, loaded via PosteriorDB.jl.
+let d = _posteriordb_data("mesquite-mesquite")
+    global const MESQ_WEIGHT = Float64.(d["weight"])
+    global const MESQ_DIAM1 = Float64.(d["diam1"])
+    global const MESQ_DIAM2 = Float64.(d["diam2"])
+    global const MESQ_CANOPY_HEIGHT = Float64.(d["canopy_height"])
+    global const MESQ_TOTAL_HEIGHT = Float64.(d["total_height"])
+    global const MESQ_DENSITY = Float64.(d["density"])
+    global const MESQ_GROUP = Float64.(d["group"])
+end
 
 const MESQUITE_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
@@ -69,19 +36,17 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
               total_height::Vector{Float64},
               density::Vector{Float64},
               group::Vector{Float64}) = begin
-    # q = (β₁, …, β₇, log_σ). One-element reductions extract the packed scalars
-    # without scalar indexing, so the same prepared kernel stays traceable as a
-    # Reactant tensor program (matching the Eight Schools / GLM boundary). The
-    # seven β coefficients are unconstrained (Stan `vector[7] beta`, no bounds),
-    # so their transform is the identity with zero Jacobian.
-    beta1::Float64 = sum(view(unconstrained, 1:1))
-    beta2::Float64 = sum(view(unconstrained, 2:2))
-    beta3::Float64 = sum(view(unconstrained, 3:3))
-    beta4::Float64 = sum(view(unconstrained, 4:4))
-    beta5::Float64 = sum(view(unconstrained, 5:5))
-    beta6::Float64 = sum(view(unconstrained, 6:6))
-    beta7::Float64 = sum(view(unconstrained, 7:7))
-    u_sigma::Float64 = sum(view(unconstrained, 8:8))
+    # q = (β₁, …, β₇, log_σ). The seven β coefficients are unconstrained (Stan
+    # `vector[7] beta`, no bounds), so their transform is the identity with zero
+    # Jacobian.
+    beta1::Float64 = unconstrained[1]
+    beta2::Float64 = unconstrained[2]
+    beta3::Float64 = unconstrained[3]
+    beta4::Float64 = unconstrained[4]
+    beta5::Float64 = unconstrained[5]
+    beta6::Float64 = unconstrained[6]
+    beta7::Float64 = unconstrained[7]
+    u_sigma::Float64 = unconstrained[8]
 
     # Only σ has a support transform. Stan's `real<lower=0> sigma` is the
     # exp/log constrain θ = exp(u) with change-of-variables Jacobian
@@ -115,14 +80,10 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
         b1 + b2 * d1 + b3 * d2 + b4 * ch + b5 * th + b6 * den + b7 * g
     end
 
-    # Likelihood: weightⱼ ~ Normal(μⱼ, σ). The linear predictor is recomputed
-    # inline inside the likelihood plate (not read from `mu`), so a total-only
-    # query fuses the whole traversal and materializes no intermediate vector
-    # (structural CSE merges it with `mu` only when both are requested). The
-    # scalar β and σ broadcast against the observation vectors.
-    pointwise = plate(weight, diam1, diam2, canopy_height, total_height, density, group,
-                      beta1, beta2, beta3, beta4, beta5, beta6, beta7, sigma) do w, d1, d2, ch, th, den, g, b1, b2, b3, b4, b5, b6, b7, s
-        normal(b1 + b2 * d1 + b3 * d2 + b4 * ch + b5 * th + b6 * den + b7 * g, s).logpdf(w)
+    # Likelihood: weightⱼ ~ Normal(μⱼ, σ). Consumes the named `mu` once
+    # (single-consumer plate-chain, fused buffer-free).
+    pointwise = plate(weight, mu, sigma) do w, m, s
+        normal(m, s).logpdf(w)
     end
     likelihood::Float64 = sum(pointwise)
 
@@ -151,17 +112,17 @@ requested_nodes = (:parameters, :log_jacobian, :likelihood, :posterior)
 density_kernel = prepare(model;
     have = (:unconstrained, :weight, :diam1, :diam2, :canopy_height,
             :total_height, :density, :group),
-    want = requested_nodes)
+    want = requested_nodes,
+    bound = (; weight, diam1, diam2, canopy_height, total_height, density, group))
 
-output = density_kernel(q, weight, diam1, diam2, canopy_height, total_height,
-                        density, group)
+output = density_kernel(q)
 parameters, log_jacobian, likelihood, posterior = output
 @assert posterior ≈ likelihood + log_jacobian
 
 docs_example = (;
     name = :mesquite_posterior,
     origin = "posteriordb mesquite — Gaussian linear regression of bush weight on size covariates",
-    inputs = (; q, weight, diam1, diam2, canopy_height, total_height, density, group),
+    inputs = (; q),
     model,
     kernel = density_kernel,
     output,

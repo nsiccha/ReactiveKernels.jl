@@ -1,7 +1,7 @@
 module GLMPoissonExample
 
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
 export GLM_POISSON_YEAR, GLM_POISSON_C
 export build_glm_poisson_graph, demo
@@ -10,24 +10,11 @@ export GLM_POISSON_SOURCE, evaluate_glm_poisson_source
 # posteriordb `GLM_Poisson_Data-GLM_Poisson_model` — a Poisson-log cubic-trend
 # GLM (BPA book, ch. 3). The real data (n = 40) is embedded verbatim so the
 # example is self-contained, matching the other PPL examples.
-const GLM_POISSON_YEAR = [
-    -1.66802789939819, -1.58248800712136, -1.49694811484453, -1.4114082225677,
-    -1.32586833029087, -1.24032843801404, -1.15478854573721, -1.06924865346038,
-    -0.983708761183547, -0.898168868906717, -0.812628976629887,
-    -0.727089084353056, -0.641549192076226, -0.556009299799396,
-    -0.470469407522566, -0.384929515245736, -0.299389622968906,
-    -0.213849730692075, -0.128309838415245, -0.0427699461384151,
-    0.0427699461384151, 0.128309838415245, 0.213849730692075, 0.299389622968906,
-    0.384929515245736, 0.470469407522566, 0.556009299799396, 0.641549192076226,
-    0.727089084353056, 0.812628976629887, 0.898168868906717, 0.983708761183547,
-    1.06924865346038, 1.15478854573721, 1.24032843801404, 1.32586833029087,
-    1.4114082225677, 1.49694811484453, 1.58248800712136, 1.66802789939819,
-]
-const GLM_POISSON_C = [
-    29, 36, 19, 28, 36, 29, 20, 19, 35, 32, 34, 34, 33, 47, 48, 46, 46, 49, 60,
-    64, 87, 85, 85, 95, 115, 127, 142, 168, 181, 194, 200, 210, 208, 235, 244,
-    272, 239, 263, 239, 245,
-]
+# Real data (full) from posteriordb `GLM_Poisson_Data-GLM_Poisson_model`, loaded via PosteriorDB.jl.
+let d = _posteriordb_data("GLM_Poisson_Data-GLM_Poisson_model")
+    global const GLM_POISSON_YEAR = Float64.(d["year"])
+    global const GLM_POISSON_C = Int.(d["C"])
+end
 
 const GLM_POISSON_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: poisson
@@ -36,14 +23,11 @@ using LogExpFunctions: logistic, log1pexp
 @kernel model(unconstrained::Vector{Float64},
               year::Vector{Float64},
               counts::Vector{Int}) = begin
-    # q = (α, β₁, β₂, β₃). One-element reductions extract the packed scalars
-    # without scalar indexing, so the same prepared kernel stays traceable as a
-    # Reactant tensor program (matching the Eight Schools / linear-regression
-    # boundary).
-    u_alpha::Float64 = sum(view(unconstrained, 1:1))
-    u_beta1::Float64 = sum(view(unconstrained, 2:2))
-    u_beta2::Float64 = sum(view(unconstrained, 3:3))
-    u_beta3::Float64 = sum(view(unconstrained, 4:4))
+    # q = (α, β₁, β₂, β₃).
+    u_alpha::Float64 = unconstrained[1]
+    u_beta1::Float64 = unconstrained[2]
+    u_beta2::Float64 = unconstrained[3]
+    u_beta3::Float64 = unconstrained[4]
 
     # Bounded-uniform priors in the Stan model (`alpha ∈ [-20, 20]`,
     # `betaⱼ ∈ [-10, 10]`) become scaled-logit interval transforms
@@ -78,17 +62,11 @@ using LogExpFunctions: logistic, log1pexp
         a + b1 * y + b2 * (y * y) + b3 * (y * y * y)
     end
 
-    # Likelihood: countⱼ ~ Poisson_log(α + β·yearⱼ). The trend is recomputed
-    # inline inside the likelihood plate (not read from `log_lambda`), so a
-    # total-only query fuses the whole traversal and materializes no intermediate
-    # vector (structural CSE merges it with `log_lambda` only when both are
-    # requested). The trend must be written as one inline expression: an
-    # intermediate plate-cell local before a nested endpoint call is rejected by
-    # `@kernel` (return-type inference collapses to Any — snag filed), and the
-    # keyword `log_rate =` route needs a declared port, so the log-link goes
-    # through `poisson(exp(·))` here.
-    pointwise = plate(counts, year, alpha, beta1, beta2, beta3) do c, y, a, b1, b2, b3
-        poisson(exp(a + b1 * y + b2 * (y * y) + b3 * (y * y * y))).logpdf(c)
+    # Likelihood: countⱼ ~ Poisson_log(log_lambdaⱼ). Consumes the named
+    # `log_lambda` once via the natural log-rate HAVE route (single-consumer
+    # plate-chain, fused); the `log_rate =` keyword takes the named plate port.
+    pointwise = plate(counts, log_lambda) do c, ll
+        poisson(; log_rate = ll).logpdf(c)
     end
     likelihood::Float64 = sum(pointwise)
 
@@ -116,16 +94,17 @@ counts = GLM_POISSON_C
 requested_nodes = (:parameters, :log_jacobian, :likelihood, :posterior)
 density_kernel = prepare(model;
     have = (:unconstrained, :year, :counts),
-    want = requested_nodes)
+    want = requested_nodes,
+    bound = (; year, counts))
 
-output = density_kernel(q, year, counts)
+output = density_kernel(q)
 parameters, log_jacobian, likelihood, posterior = output
 @assert posterior ≈ likelihood + log_jacobian
 
 docs_example = (;
     name = :glm_poisson_posterior,
     origin = "posteriordb GLM_Poisson_model — Poisson-log cubic-trend GLM",
-    inputs = (; q, year, counts),
+    inputs = (; q),
     model,
     kernel = density_kernel,
     output,
