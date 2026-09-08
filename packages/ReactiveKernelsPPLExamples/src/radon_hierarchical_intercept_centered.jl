@@ -81,14 +81,13 @@ using LogExpFunctions: logistic, log1pexp
     # intercept vector comes FIRST, then the length-2 coefficient vector `beta`
     # (beta[1] on log_uppm, beta[2] on floor), then the hyper-mean and the two
     # sigmas. `alpha`, `beta`, `mu_alpha` are unconstrained; the two sigmas use
-    # the exp support transform. Slice without scalar indexing so the same kernel
-    # stays traceable as a Reactant program.
+    # the exp support transform.
     n_counties::Int = length(unconstrained) - 5
     alpha::AbstractVector{Float64} = view(unconstrained, 1:n_counties)
     beta::AbstractVector{Float64} = view(unconstrained, n_counties + 1:n_counties + 2)
-    mu_alpha::Float64 = sum(view(unconstrained, n_counties + 3:n_counties + 3))
-    log_sigma_alpha::Float64 = sum(view(unconstrained, n_counties + 4:n_counties + 4))
-    log_sigma_y::Float64 = sum(view(unconstrained, n_counties + 5:n_counties + 5))
+    mu_alpha::Float64 = unconstrained[n_counties + 3]
+    log_sigma_alpha::Float64 = unconstrained[n_counties + 4]
+    log_sigma_y::Float64 = unconstrained[n_counties + 5]
 
     # sigma = exp(log_sigma); log|dsigma/dlog_sigma| = log_sigma. Bidirectional
     # edges so either sigma or log_sigma may be authoritative.
@@ -108,9 +107,9 @@ using LogExpFunctions: logistic, log1pexp
          parameters.sigma_alpha, parameters.sigma_y)
 
     # beta[1] (coefficient on log_uppm) and beta[2] (floor slope) as scalars —
-    # sliced from the reconstructed length-2 `beta` (view + sum, no scalar index).
-    beta1::Float64 = sum(view(beta, 1:1))
-    beta2::Float64 = sum(view(beta, 2:2))
+    # sliced from the reconstructed length-2 `beta`.
+    beta1::Float64 = beta[1]
+    beta2::Float64 = beta[2]
 
     # Priors (all proper): mu_alpha ~ Normal(0, 10); beta ~ Normal(0, 10) applied
     # to both beta[1] and beta[2]; sigma_alpha ~ Normal(0, 1), sigma_y ~ Normal(0,

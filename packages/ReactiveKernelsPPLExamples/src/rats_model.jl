@@ -47,16 +47,15 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
     # mu_beta, log_sigma_y, log_sigma_alpha, log_sigma_beta); D = 2N + 5. The
     # per-rat intercept vector comes FIRST, then the per-rat slope vector. alpha,
     # beta, mu_alpha, mu_beta are unconstrained; the three scales use the exp
-    # support transform. Slice without scalar indexing so the same kernel stays
-    # traceable as a Reactant program.
+    # support transform.
     n_rats::Int = div(length(unconstrained) - 5, 2)
     alpha::AbstractVector{Float64} = view(unconstrained, 1:n_rats)
     beta::AbstractVector{Float64} = view(unconstrained, n_rats + 1:2 * n_rats)
-    mu_alpha::Float64 = sum(view(unconstrained, 2 * n_rats + 1:2 * n_rats + 1))
-    mu_beta::Float64 = sum(view(unconstrained, 2 * n_rats + 2:2 * n_rats + 2))
-    log_sigma_y::Float64 = sum(view(unconstrained, 2 * n_rats + 3:2 * n_rats + 3))
-    log_sigma_alpha::Float64 = sum(view(unconstrained, 2 * n_rats + 4:2 * n_rats + 4))
-    log_sigma_beta::Float64 = sum(view(unconstrained, 2 * n_rats + 5:2 * n_rats + 5))
+    mu_alpha::Float64 = unconstrained[2 * n_rats + 1]
+    mu_beta::Float64 = unconstrained[2 * n_rats + 2]
+    log_sigma_y::Float64 = unconstrained[2 * n_rats + 3]
+    log_sigma_alpha::Float64 = unconstrained[2 * n_rats + 4]
+    log_sigma_beta::Float64 = unconstrained[2 * n_rats + 5]
 
     # sigma = exp(log_sigma); log|dsigma/dlog_sigma| = log_sigma for each of the
     # three FLAT-prior scales (Stan `real<lower=0>` with no `~` statement — only

@@ -20,7 +20,7 @@ using LogExpFunctions: logistic, log1pexp
               n::Int,
               k::Int) = begin
     # theta ∈ [0,1] via the logistic transform; log|dtheta/du| = -log1pexp(-u) - log1pexp(u).
-    u_theta::Float64 = sum(view(unconstrained, 1:1))
+    u_theta::Float64 = unconstrained[1]
     theta::Float64 = logistic(u_theta)
     log_jacobian::Float64 = -log1pexp(-u_theta) - log1pexp(u_theta)
 

@@ -22,11 +22,8 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
               prediction_innovations::Vector{Float64}) = begin
     # Split the unconstrained vector into (μ, log_τ, θ). The view keeps the
     # generated evaluator from allocating a second effects vector.
-    # One-element reductions retain the ordinary packed-vector boundary while
-    # avoiding scalar indexing when the same prepared kernel is traced as a
-    # Reactant tensor program. Native Julia specializes these constant slices.
-    μ::Float64 = sum(view(unconstrained, 1:1))
-    log_τ::Float64 = sum(view(unconstrained, 2:2))
+    μ::Float64 = unconstrained[1]
+    log_τ::Float64 = unconstrained[2]
     θ::AbstractVector{Float64} =
         view(unconstrained, 3:length(unconstrained))
 

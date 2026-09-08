@@ -36,14 +36,14 @@ using LogExpFunctions: logistic, log1pexp
               year::Vector{Float64},
               counts::Vector{Int}) = begin
     # Stan's declared unconstrained order: (α, β₁, β₂, β₃, eps[1..n], log_σ);
-    # dim = n + 5. Slice without scalar indexing (Reactant-traceable).
+    # dim = n + 5.
     n_obs::Int = length(unconstrained) - 5
-    u_alpha::Float64 = sum(view(unconstrained, 1:1))
-    u_beta1::Float64 = sum(view(unconstrained, 2:2))
-    u_beta2::Float64 = sum(view(unconstrained, 3:3))
-    u_beta3::Float64 = sum(view(unconstrained, 4:4))
+    u_alpha::Float64 = unconstrained[1]
+    u_beta1::Float64 = unconstrained[2]
+    u_beta2::Float64 = unconstrained[3]
+    u_beta3::Float64 = unconstrained[4]
     eps::AbstractVector{Float64} = view(unconstrained, 5:n_obs + 4)
-    u_sigma::Float64 = sum(view(unconstrained, n_obs + 5:n_obs + 5))
+    u_sigma::Float64 = unconstrained[n_obs + 5]
 
     # Bounded-uniform priors → scaled-logit interval transforms + `lub_constrain`
     # Jacobian (note β₂ ∈ [-10, 20], σ ∈ [0, 5]). eps is unconstrained.

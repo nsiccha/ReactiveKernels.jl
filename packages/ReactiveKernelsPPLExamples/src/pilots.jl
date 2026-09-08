@@ -38,18 +38,18 @@ using LogExpFunctions: logistic, log1pexp
               y::Vector{Float64}) = begin
     # Stan's declared unconstrained order: (a[1..n_groups], b[1..n_scenarios],
     # mu_a, mu_b, sigma_a, sigma_b, sigma_y); dim = n_groups + n_scenarios + 5.
-    # n_groups = 5 and n_scenarios = 8 are structural constants of this dataset.
-    # a, b, mu_a, mu_b are unconstrained; the three sigmas are
-    # real<lower=0, upper=100>. Slice without scalar indexing (Reactant-traceable).
+    # n_groups = 5 and n_scenarios = 8 are structural constants of this dataset. a,
+    # b, mu_a, mu_b are unconstrained; the three sigmas are real<lower=0,
+    # upper=100>.
     n_groups::Int = 5
     n_scenarios::Int = 8
     a::AbstractVector{Float64} = view(unconstrained, 1:n_groups)
     b::AbstractVector{Float64} = view(unconstrained, n_groups + 1:n_groups + n_scenarios)
-    u_mu_a::Float64 = sum(view(unconstrained, n_groups + n_scenarios + 1:n_groups + n_scenarios + 1))
-    u_mu_b::Float64 = sum(view(unconstrained, n_groups + n_scenarios + 2:n_groups + n_scenarios + 2))
-    u_sigma_a::Float64 = sum(view(unconstrained, n_groups + n_scenarios + 3:n_groups + n_scenarios + 3))
-    u_sigma_b::Float64 = sum(view(unconstrained, n_groups + n_scenarios + 4:n_groups + n_scenarios + 4))
-    u_sigma_y::Float64 = sum(view(unconstrained, n_groups + n_scenarios + 5:n_groups + n_scenarios + 5))
+    u_mu_a::Float64 = unconstrained[n_groups + n_scenarios + 1]
+    u_mu_b::Float64 = unconstrained[n_groups + n_scenarios + 2]
+    u_sigma_a::Float64 = unconstrained[n_groups + n_scenarios + 3]
+    u_sigma_b::Float64 = unconstrained[n_groups + n_scenarios + 4]
+    u_sigma_y::Float64 = unconstrained[n_groups + n_scenarios + 5]
 
     # sigma ∈ [0, 100]: scaled-logit interval transform sigma = 100*logistic(u);
     # log|dsigma/du| = log(100) - log1pexp(-u) - log1pexp(u). mu_a/mu_b identity.

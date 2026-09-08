@@ -39,11 +39,9 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
               encouraged::Vector{Float64},
               watched::Vector{Float64}) = begin
     # Stan's declared unconstrained order: (beta[1], beta[2], log_sigma); D = 3.
-    # One-element reductions extract the packed scalars without scalar indexing,
-    # so the same prepared kernel stays traceable as a Reactant tensor program.
-    beta1::Float64 = sum(view(unconstrained, 1:1))
-    beta2::Float64 = sum(view(unconstrained, 2:2))
-    log_sigma::Float64 = sum(view(unconstrained, 3:3))
+    beta1::Float64 = unconstrained[1]
+    beta2::Float64 = unconstrained[2]
+    log_sigma::Float64 = unconstrained[3]
 
     # Only sigma carries a support transform (Stan `real<lower=0> sigma`):
     # sigma = exp(log_sigma), log|dsigma/dlog_sigma| = log_sigma. beta is

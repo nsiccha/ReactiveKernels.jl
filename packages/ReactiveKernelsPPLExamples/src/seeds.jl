@@ -37,14 +37,12 @@ using LogExpFunctions: logistic
     # Stan's declared unconstrained order: (alpha0, alpha1, alpha12, alpha2,
     # log_tau, b[1..I]); dim = I + 5. Only `tau` is constrained (real<lower=0>),
     # so the first four fixed effects are the identity and b is unconstrained.
-    # Slice without scalar indexing so the same prepared kernel stays traceable
-    # as a Reactant tensor program.
     n_obs::Int = length(unconstrained) - 5
-    u_alpha0::Float64 = sum(view(unconstrained, 1:1))
-    u_alpha1::Float64 = sum(view(unconstrained, 2:2))
-    u_alpha12::Float64 = sum(view(unconstrained, 3:3))
-    u_alpha2::Float64 = sum(view(unconstrained, 4:4))
-    u_tau::Float64 = sum(view(unconstrained, 5:5))
+    u_alpha0::Float64 = unconstrained[1]
+    u_alpha1::Float64 = unconstrained[2]
+    u_alpha12::Float64 = unconstrained[3]
+    u_alpha2::Float64 = unconstrained[4]
+    u_tau::Float64 = unconstrained[5]
     b::AbstractVector{Float64} = view(unconstrained, 6:n_obs + 5)
 
     # tau = exp(log_tau); log|dtau/dlog_tau| = log_tau (Stan's `lb_constrain`).

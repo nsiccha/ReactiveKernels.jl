@@ -36,14 +36,11 @@ using LogExpFunctions: logistic, log1pexp
 @kernel model(unconstrained::Vector{Float64},
               year::Vector{Float64},
               counts::Vector{Int}) = begin
-    # q = (α, β₁, β₂, β₃). One-element reductions extract the packed scalars
-    # without scalar indexing, so the same prepared kernel stays traceable as a
-    # Reactant tensor program (matching the Eight Schools / linear-regression
-    # boundary).
-    u_alpha::Float64 = sum(view(unconstrained, 1:1))
-    u_beta1::Float64 = sum(view(unconstrained, 2:2))
-    u_beta2::Float64 = sum(view(unconstrained, 3:3))
-    u_beta3::Float64 = sum(view(unconstrained, 4:4))
+    # q = (α, β₁, β₂, β₃).
+    u_alpha::Float64 = unconstrained[1]
+    u_beta1::Float64 = unconstrained[2]
+    u_beta2::Float64 = unconstrained[3]
+    u_beta3::Float64 = unconstrained[4]
 
     # Bounded-uniform priors in the Stan model (`alpha ∈ [-20, 20]`,
     # `betaⱼ ∈ [-10, 10]`) become scaled-logit interval transforms

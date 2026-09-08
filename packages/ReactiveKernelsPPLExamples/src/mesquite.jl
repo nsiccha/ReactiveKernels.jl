@@ -69,19 +69,17 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
               total_height::Vector{Float64},
               density::Vector{Float64},
               group::Vector{Float64}) = begin
-    # q = (β₁, …, β₇, log_σ). One-element reductions extract the packed scalars
-    # without scalar indexing, so the same prepared kernel stays traceable as a
-    # Reactant tensor program (matching the Eight Schools / GLM boundary). The
-    # seven β coefficients are unconstrained (Stan `vector[7] beta`, no bounds),
-    # so their transform is the identity with zero Jacobian.
-    beta1::Float64 = sum(view(unconstrained, 1:1))
-    beta2::Float64 = sum(view(unconstrained, 2:2))
-    beta3::Float64 = sum(view(unconstrained, 3:3))
-    beta4::Float64 = sum(view(unconstrained, 4:4))
-    beta5::Float64 = sum(view(unconstrained, 5:5))
-    beta6::Float64 = sum(view(unconstrained, 6:6))
-    beta7::Float64 = sum(view(unconstrained, 7:7))
-    u_sigma::Float64 = sum(view(unconstrained, 8:8))
+    # q = (β₁, …, β₇, log_σ). The seven β coefficients are unconstrained (Stan
+    # `vector[7] beta`, no bounds), so their transform is the identity with zero
+    # Jacobian.
+    beta1::Float64 = unconstrained[1]
+    beta2::Float64 = unconstrained[2]
+    beta3::Float64 = unconstrained[3]
+    beta4::Float64 = unconstrained[4]
+    beta5::Float64 = unconstrained[5]
+    beta6::Float64 = unconstrained[6]
+    beta7::Float64 = unconstrained[7]
+    u_sigma::Float64 = unconstrained[8]
 
     # Only σ has a support transform. Stan's `real<lower=0> sigma` is the
     # exp/log constrain θ = exp(u) with change-of-variables Jacobian

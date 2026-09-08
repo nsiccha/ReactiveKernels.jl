@@ -41,13 +41,11 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
               kid_score::Vector{Float64},
               mom_iq::Vector{Float64},
               mom_iq_new::Float64) = begin
-    # Stan packs `vector[2] beta` before `real<lower=0> sigma`, so
-    # q = (β₁, β₂, log_σ). One-element reductions extract the packed scalars
-    # without scalar indexing, so the same prepared kernel stays traceable as a
-    # Reactant tensor program.
-    beta1::Float64 = sum(view(unconstrained, 1:1))
-    beta2::Float64 = sum(view(unconstrained, 2:2))
-    log_sigma::Float64 = sum(view(unconstrained, 3:3))
+    # Stan packs `vector[2] beta` before `real<lower=0> sigma`, so q = (β₁, β₂,
+    # log_σ).
+    beta1::Float64 = unconstrained[1]
+    beta2::Float64 = unconstrained[2]
+    log_sigma::Float64 = unconstrained[3]
 
     # `beta` is unconstrained in Stan (identity, no Jacobian); only `sigma`
     # carries a `<lower=0>` support transform σ = exp(log_σ), whose change of

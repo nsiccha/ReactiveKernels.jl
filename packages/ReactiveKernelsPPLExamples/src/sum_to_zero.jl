@@ -18,8 +18,8 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
     # q = (α_s2z, log(τ), K - 1 free effect coordinates). Match the packed
     # scalar extraction used by Eight Schools so this boundary is traceable as
     # a tensor program without changing its ordinary Julia meaning.
-    α_s2z::Float64 = sum(view(unconstrained, 1:1))
-    log_τ::Float64 = sum(view(unconstrained, 2:2))
+    α_s2z::Float64 = unconstrained[1]
+    log_τ::Float64 = unconstrained[2]
     effects_free::AbstractVector{Float64} =
         view(unconstrained, 3:length(unconstrained))
 

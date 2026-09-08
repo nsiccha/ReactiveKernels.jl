@@ -27,11 +27,9 @@ using LogExpFunctions: logistic
               totals::Vector{Int}) = begin
     # Stan's declared unconstrained order: (mu, log_sigmasq, b[1..N]); dim = N+2.
     # Only `sigmasq` is constrained (real<lower=0>); mu and b are unconstrained.
-    # Slice without scalar indexing so the same prepared kernel stays traceable
-    # as a Reactant tensor program.
     n_obs::Int = length(unconstrained) - 2
-    u_mu::Float64 = sum(view(unconstrained, 1:1))
-    u_sigmasq::Float64 = sum(view(unconstrained, 2:2))
+    u_mu::Float64 = unconstrained[1]
+    u_sigmasq::Float64 = unconstrained[2]
     b::AbstractVector{Float64} = view(unconstrained, 3:n_obs + 2)
 
     # sigmasq = exp(log_sigmasq); log|dsigmasq/dlog_sigmasq| = log_sigmasq

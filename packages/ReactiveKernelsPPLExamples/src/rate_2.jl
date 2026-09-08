@@ -10,8 +10,8 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: beta, binomi
 using LogExpFunctions: logistic, log1pexp
 
 @kernel model(unconstrained::Vector{Float64}, n1::Int, n2::Int, k1::Int, k2::Int) = begin
-    u1::Float64 = sum(view(unconstrained, 1:1))
-    u2::Float64 = sum(view(unconstrained, 2:2))
+    u1::Float64 = unconstrained[1]
+    u2::Float64 = unconstrained[2]
     theta1::Float64 = logistic(u1)
     theta2::Float64 = logistic(u2)
     jac1::Float64 = -log1pexp(-u1) - log1pexp(u1)

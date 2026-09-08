@@ -29,10 +29,10 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
               new_age::Float64) = begin
     # Unconstrained layout: (α, β, u_λ, log_τ). λ is bounded to (0.5, 1) and the
     # noise precision τ > 0, so both carry a support transform.
-    α::Float64 = sum(view(unconstrained, 1:1))
-    β::Float64 = sum(view(unconstrained, 2:2))
-    u_λ::Float64 = sum(view(unconstrained, 3:3))
-    log_τ::Float64 = sum(view(unconstrained, 4:4))
+    α::Float64 = unconstrained[1]
+    β::Float64 = unconstrained[2]
+    u_λ::Float64 = unconstrained[3]
+    log_τ::Float64 = unconstrained[4]
 
     # λ = 0.5 + 0.5·logistic(u_λ) ∈ (0.5, 1); τ = exp(log_τ); σ = 1/√τ.
     s::Float64 = 1 / (1 + exp(-u_λ))

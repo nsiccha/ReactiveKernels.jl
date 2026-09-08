@@ -42,11 +42,11 @@ using LogExpFunctions: logistic, log1pexp, logaddexp
               y::Vector{Float64}) = begin
     # q = (u_mu1, u_mu2, u_sigma1, u_sigma2, u_theta); Stan order ordered[2] mu,
     # array[2] real<lower=0> sigma, real<lower=0,upper=1> theta. dim = 5.
-    u_mu1::Float64 = sum(view(unconstrained, 1:1))
-    u_mu2::Float64 = sum(view(unconstrained, 2:2))
-    u_sigma1::Float64 = sum(view(unconstrained, 3:3))
-    u_sigma2::Float64 = sum(view(unconstrained, 4:4))
-    u_theta::Float64 = sum(view(unconstrained, 5:5))
+    u_mu1::Float64 = unconstrained[1]
+    u_mu2::Float64 = unconstrained[2]
+    u_sigma1::Float64 = unconstrained[3]
+    u_sigma2::Float64 = unconstrained[4]
+    u_theta::Float64 = unconstrained[5]
 
     # ordered[2] transform: mu1 = u_mu1, mu2 = u_mu1 + exp(u_mu2), so mu1 < mu2;
     # its K=2 Jacobian contributes u_mu2. sigma via exp (Jacobian u each); theta

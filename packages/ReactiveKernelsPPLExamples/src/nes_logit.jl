@@ -32,11 +32,9 @@ using LogExpFunctions: logistic
               vote::Vector{Bool}) = begin
     # q = (α, β₁). The Stan parameters (`real alpha`, `vector[1] beta`) are both
     # unconstrained, so the transform is the identity and the log Jacobian is
-    # zero. One-element reductions extract the packed scalars without scalar
-    # indexing, so the same prepared kernel stays traceable as a Reactant tensor
-    # program.
-    alpha::Float64 = sum(view(unconstrained, 1:1))
-    beta1::Float64 = sum(view(unconstrained, 2:2))
+    # zero.
+    alpha::Float64 = unconstrained[1]
+    beta1::Float64 = unconstrained[2]
     log_jacobian::Float64 = 0.0
 
     parameters = (; alpha, beta1)

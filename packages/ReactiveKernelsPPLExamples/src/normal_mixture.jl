@@ -38,9 +38,9 @@ using LogExpFunctions: logistic, log1pexp, logaddexp
 @kernel model(unconstrained::Vector{Float64},
               y::Vector{Float64}) = begin
     # q = (u_theta, mu1, mu2); Stan declares theta then array[2] real mu. dim = 3.
-    u_theta::Float64 = sum(view(unconstrained, 1:1))
-    mu1::Float64 = sum(view(unconstrained, 2:2))
-    mu2::Float64 = sum(view(unconstrained, 3:3))
+    u_theta::Float64 = unconstrained[1]
+    mu1::Float64 = unconstrained[2]
+    mu2::Float64 = unconstrained[3]
 
     # theta ∈ [0,1] via logistic; interval Jacobian log|dθ/du| = -log1pexp(-u)
     # - log1pexp(u). mu is free (identity, no Jacobian). log(θ) and log(1-θ)
