@@ -11,6 +11,21 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
     caches(p) = filter(r -> r.op isa RK._BoundConstant &&
         startswith(String(only(r.outputs).name), "bound_plate_"), p.recipes)
 
+    @testset "bound data outside a live-only plate" begin
+        data = [3.0, 4.0]
+        p = plan(C.unbound_plate)
+        original = only(plates(p))
+        @test any(r -> isempty(r.inputs), plate_body(original).recipes)
+        plain = prepare(p)
+        bound = prepare(C.unbound_plate; bound = (; data))
+        @test isempty(caches(bound.plan))
+        @test plate_body(only(plates(bound.plan))).recipes ==
+              plate_body(original).recipes
+        for q in (Float64[], [1.0], [1.0, 2.0, 3.0])
+            @test bound(q) == plain(q, data) == sum(q) + 2length(q) + sum(data)
+        end
+    end
+
     @testset "preparation-only prefix and original graph" begin
         p = plan(C.counted)
         graph_values, graph_recipes = copy(p.graph.values), copy(p.graph.recipes)
