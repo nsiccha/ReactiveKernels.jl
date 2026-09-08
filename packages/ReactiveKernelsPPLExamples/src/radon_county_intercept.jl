@@ -57,12 +57,11 @@ using LogExpFunctions: logistic, log1pexp
               log_radon::Vector{Float64}) = begin
     # Stan's declared unconstrained order: (alpha[1..J], beta, log_sigma_y);
     # dim = J + 2. `alpha` and `beta` are unconstrained; `sigma_y` is
-    # `real<lower=0>` (exp support transform). Slice without scalar indexing so
-    # the same kernel stays traceable as a Reactant program.
+    # `real<lower=0>` (exp support transform).
     n_counties::Int = length(unconstrained) - 2
     alpha::AbstractVector{Float64} = view(unconstrained, 1:n_counties)
-    beta::Float64 = sum(view(unconstrained, n_counties + 1:n_counties + 1))
-    log_sigma_y::Float64 = sum(view(unconstrained, n_counties + 2:n_counties + 2))
+    beta::Float64 = unconstrained[n_counties + 1]
+    log_sigma_y::Float64 = unconstrained[n_counties + 2]
 
     # sigma_y = exp(log_sigma_y); log|dsigma_y/dlog_sigma_y| = log_sigma_y.
     # Bidirectional edges so either sigma_y or log_sigma_y may be authoritative.

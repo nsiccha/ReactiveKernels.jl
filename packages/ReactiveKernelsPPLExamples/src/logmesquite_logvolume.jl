@@ -60,13 +60,11 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
               diam1::Vector{Float64},
               diam2::Vector{Float64},
               canopy_height::Vector{Float64}) = begin
-    # q = (β₁, β₂, log_σ). One-element reductions extract the packed scalars
-    # without scalar indexing, so the same prepared kernel stays traceable as a
-    # Reactant tensor program. The two β coefficients are unconstrained (identity
+    # q = (β₁, β₂, log_σ). The two β coefficients are unconstrained (identity
     # transform, zero Jacobian).
-    beta1::Float64 = sum(view(unconstrained, 1:1))
-    beta2::Float64 = sum(view(unconstrained, 2:2))
-    u_sigma::Float64 = sum(view(unconstrained, 3:3))
+    beta1::Float64 = unconstrained[1]
+    beta2::Float64 = unconstrained[2]
+    u_sigma::Float64 = unconstrained[3]
 
     # Only σ has a support transform: Stan's `real<lower=0> sigma` exp/log
     # constrain θ = exp(u), Jacobian log|dσ/du| = u.

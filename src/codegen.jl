@@ -158,9 +158,19 @@ end
 # and total accumulator UP FRONT — no boxed `Vector{Any}` is ever built and the
 # accumulator seed matches the summed cells (`_narrow_plate_output` above is a
 # post-hoc narrowing that still allocates the boxed container first and leaves the
-# accumulator untyped). A genuinely uninferrable body falls back to the
-# plan-level output valtype (`Any`), where `_narrow_plate_output` still recovers a
-# homogeneous element type at runtime.
+# accumulator untyped).
+#
+# When `promote_op` cannot pin a CONCRETE type — a genuinely uninferrable body,
+# but also a STATIC call over an UNTYPED batched port, whose projected element
+# type is `Any` (`_plate_cache_slot`/`_plate_result_type` call this with the
+# plan-level HAVE types, where an unannotated port is `Any`) — fall back to the
+# scalar body kernel's DECLARED output valtype. For a typed body (`::Float64`)
+# that valtype is authoritative and concrete, so the nonallocating cache slot is
+# seeded `Array{Float64}` instead of a boxed `Array{Any}` that would re-box every
+# element through `broadcast!` on each call (the `want=:pointwise` regression:
+# 16 KB/call for a length-1000 untyped plate whose cells are Float64). A body
+# with no concrete declared type stays `Any`, where `_narrow_plate_output` still
+# recovers a homogeneous element type at runtime.
 function _authored_plate_result_eltype(op::_AuthoredPlateOp{K,A},
                                        argtypes) where {K,A}
     element_types = ntuple(length(argtypes)) do position
@@ -168,7 +178,10 @@ function _authored_plate_result_eltype(op::_AuthoredPlateOp{K,A},
         (position in A || argtype <: Number) ? argtype : eltype(argtype)
     end
     T = Base.promote_op(op.kernel, element_types...)
-    T === Union{} ? valtype(only(outputs(op.kernel))) : T
+    isconcretetype(T) && return T
+    declared = valtype(only(outputs(op.kernel)))
+    isconcretetype(declared) && return declared
+    T === Union{} ? declared : T
 end
 
 # A plate is a pure graph map/reduction. Once Julia has instantiated the
@@ -1458,9 +1471,12 @@ end
 # prefer the first runtime broadcast axis when choosing native vs. tensorized
 # execution.  The native call ignores the marker and may derive its plate axis
 # only after projecting an atomic boundary, so exhausting the candidates falls
-# back to a non-axis sentinel.  Atomic `Ref(port)` inputs are excluded when the
-# candidates are derived, so an array-valued atom cannot accidentally become
-# the batch marker.
+# back to a non-axis sentinel.  Atomic `Ref(port)` inputs are excluded from the
+# axis candidates, so an array-valued atom cannot be mistaken for the plate
+# axis; but when every axis operand is bound and no axis candidate remains,
+# `_embedded_marker_candidates` admits array-valued HAVE ports (atomic ones
+# included) as backend markers, since only the marker TYPE — never its axis —
+# selects native vs. tensorized execution there.
 struct _DynamicEmbeddedFunctionPair{I,N,T,A} <: _ArrayFunctionPair
     native::N
     tensorized::T
@@ -1683,6 +1699,21 @@ function _embedded_marker_candidates(p::Plan)
                 position = root_positions[root]
                 position in candidates || push!(candidates, position)
             end
+        end
+    end
+    if isempty(candidates)
+        # No non-atomic (axis-defining) plate operand traces back to an active
+        # HAVE port: every axis operand is bound (`bound=`), so the plate axis is
+        # a compile-time constant baked into both bodies (the native body derives
+        # its own axis; the tensorized body takes the marker-less axis fallback).
+        # Backend selection still needs a runtime marker, so admit any
+        # array-valued active HAVE port as one — including a whole-vector
+        # `Ref`-captured parameter that is atomic for broadcasting yet remains a
+        # live array HAVE. Only the marker TYPE is consulted (`_batched_call`
+        # dispatches native vs. tensorized on it), never its axis, so an atomic
+        # array admitted here cannot be mistaken for the plate axis.
+        for (position, input) in enumerate(p.have)
+            valtype(input) <: AbstractArray && push!(candidates, position)
         end
     end
     Tuple(candidates)

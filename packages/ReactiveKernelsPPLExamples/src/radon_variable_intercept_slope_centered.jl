@@ -62,16 +62,14 @@ using LogExpFunctions: logistic, log1pexp
     # The THREE sigmas come FIRST (matching the parameters block), then the two
     # per-county effect vectors, then the two hyper-means. The three sigmas use
     # the exp support transform; alpha, beta, mu_alpha, mu_beta are unconstrained.
-    # Slice without scalar indexing so the same kernel stays traceable as a
-    # Reactant program.
     n_counties::Int = div(length(unconstrained) - 5, 2)
-    log_sigma_y::Float64 = sum(view(unconstrained, 1:1))
-    log_sigma_alpha::Float64 = sum(view(unconstrained, 2:2))
-    log_sigma_beta::Float64 = sum(view(unconstrained, 3:3))
+    log_sigma_y::Float64 = unconstrained[1]
+    log_sigma_alpha::Float64 = unconstrained[2]
+    log_sigma_beta::Float64 = unconstrained[3]
     alpha::AbstractVector{Float64} = view(unconstrained, 4:n_counties + 3)
     beta::AbstractVector{Float64} = view(unconstrained, n_counties + 4:2 * n_counties + 3)
-    mu_alpha::Float64 = sum(view(unconstrained, 2 * n_counties + 4:2 * n_counties + 4))
-    mu_beta::Float64 = sum(view(unconstrained, 2 * n_counties + 5:2 * n_counties + 5))
+    mu_alpha::Float64 = unconstrained[2 * n_counties + 4]
+    mu_beta::Float64 = unconstrained[2 * n_counties + 5]
 
     # sigma = exp(log_sigma); log|dsigma/dlog_sigma| = log_sigma. Bidirectional
     # edges so either sigma or log_sigma may be authoritative.

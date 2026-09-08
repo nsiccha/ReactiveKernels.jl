@@ -55,12 +55,11 @@ using LogExpFunctions: logistic
     # Stan's declared unconstrained order: (alpha[1..T], theta[1..N], log_beta);
     # dim = T + N + 1. LSAT has T = 5 questions (structural constant of the
     # test), so n_students = dim - 6. alpha and theta are unconstrained; only
-    # beta is constrained (real<lower=0>). Slice without scalar indexing so the
-    # same prepared kernel stays traceable as a Reactant tensor program.
+    # beta is constrained (real<lower=0>).
     n_students::Int = length(unconstrained) - 6
     alpha::AbstractVector{Float64} = view(unconstrained, 1:5)
     theta::AbstractVector{Float64} = view(unconstrained, 6:n_students + 5)
-    u_beta::Float64 = sum(view(unconstrained, n_students + 6:n_students + 6))
+    u_beta::Float64 = unconstrained[n_students + 6]
 
     # beta = exp(log_beta); log|dbeta/dlog_beta| = log_beta (Stan's `lb_constrain`).
     beta::Float64 = exp(u_beta)

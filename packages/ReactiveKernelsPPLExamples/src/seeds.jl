@@ -1,7 +1,7 @@
 module SeedsExample
 
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
 export SEEDS_COUNTS, SEEDS_TOTALS, SEEDS_X1, SEEDS_X2
 export build_seeds_graph, demo
@@ -12,18 +12,13 @@ export SEEDS_SOURCE, evaluate_seeds_source
 # a 2x2 design (seed type x1, root extract x2) with interaction, and a per-plate
 # random effect b ~ Normal(0, sigma). The full real dataset (I = 21) is embedded
 # verbatim so the example is self-contained.
-const SEEDS_COUNTS = [
-    10, 23, 23, 26, 17, 5, 53, 55, 32, 46, 10, 8, 10, 8, 23, 0, 3, 22, 15, 32, 3,
-]
-const SEEDS_TOTALS = [
-    39, 62, 81, 51, 39, 6, 74, 72, 51, 79, 13, 16, 30, 28, 45, 4, 12, 41, 30, 51, 7,
-]
-const SEEDS_X1 = Float64[
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-]
-const SEEDS_X2 = Float64[
-    0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1,
-]
+# Real data (full, N=21) from posteriordb `seeds_data-seeds_model`, via PosteriorDB.jl.
+let d = _posteriordb_data("seeds_data-seeds_model")
+    global const SEEDS_COUNTS = Int.(d["n"])
+    global const SEEDS_TOTALS = Int.(d["N"])
+    global const SEEDS_X1 = Float64.(d["x1"])
+    global const SEEDS_X2 = Float64.(d["x2"])
+end
 
 const SEEDS_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, gamma, binomial
@@ -37,14 +32,12 @@ using LogExpFunctions: logistic
     # Stan's declared unconstrained order: (alpha0, alpha1, alpha12, alpha2,
     # log_tau, b[1..I]); dim = I + 5. Only `tau` is constrained (real<lower=0>),
     # so the first four fixed effects are the identity and b is unconstrained.
-    # Slice without scalar indexing so the same prepared kernel stays traceable
-    # as a Reactant tensor program.
     n_obs::Int = length(unconstrained) - 5
-    u_alpha0::Float64 = sum(view(unconstrained, 1:1))
-    u_alpha1::Float64 = sum(view(unconstrained, 2:2))
-    u_alpha12::Float64 = sum(view(unconstrained, 3:3))
-    u_alpha2::Float64 = sum(view(unconstrained, 4:4))
-    u_tau::Float64 = sum(view(unconstrained, 5:5))
+    u_alpha0::Float64 = unconstrained[1]
+    u_alpha1::Float64 = unconstrained[2]
+    u_alpha12::Float64 = unconstrained[3]
+    u_alpha2::Float64 = unconstrained[4]
+    u_tau::Float64 = unconstrained[5]
     b::AbstractVector{Float64} = view(unconstrained, 6:n_obs + 5)
 
     # tau = exp(log_tau); log|dtau/dlog_tau| = log_tau (Stan's `lb_constrain`).
@@ -87,17 +80,22 @@ using LogExpFunctions: logistic
     b_prior::Float64 = sum(b_pointwise)
     prior::Float64 = fixed_prior + b_prior
 
-    # Transformed parameter: the logit-scale linear predictor with interaction
-    # (Stan's transformed data x1x2 = x1 .* x2 is recomputed inline as x1*x2).
-    logit_p = plate(x1, x2, b, alpha0, alpha1, alpha2, alpha12) do xx1, xx2, bb, a0, a1, a2, a12
-        a0 + a1 * xx1 + a2 * xx2 + a12 * (xx1 * xx2) + bb
+    # Transformed data: the x1×x2 interaction as a named node (Stan's
+    # `transformed data x1x2 = x1 .* x2`), hoisted when the data are bound.
+    inter = plate(x1, x2) do xx1, xx2
+        xx1 * xx2
+    end
+    # Transformed parameter: the logit-scale linear predictor with the random
+    # effect b, consuming the named `inter`; named once.
+    logit_p = plate(x1, x2, inter, b, alpha0, alpha1, alpha2, alpha12) do xx1, xx2, hi, bb, a0, a1, a2, a12
+        a0 + a1 * xx1 + a2 * xx2 + a12 * hi + bb
     end
 
-    # Likelihood: counts_j ~ Binomial_logit(totals_j, eta_j). The linear
-    # predictor is recomputed inline (buffer-free fused total); the Binomial
-    # endpoint takes the success probability, so the logit link is `logistic(.)`.
-    pointwise = plate(counts, totals, x1, x2, b, alpha0, alpha1, alpha2, alpha12) do c, nt, xx1, xx2, bb, a0, a1, a2, a12
-        binomial(nt, logistic(a0 + a1 * xx1 + a2 * xx2 + a12 * (xx1 * xx2) + bb)).logpdf(c)
+    # Likelihood: counts_j ~ Binomial_logit(totals_j, logit_p_j). Consumes the
+    # named `logit_p` once via the natural logit HAVE route (single-consumer
+    # plate-chain, fused).
+    pointwise = plate(counts, totals, logit_p) do c, nt, lp
+        binomial(; n = nt, logit = lp).logpdf(c)
     end
     likelihood::Float64 = sum(pointwise)
 
@@ -122,16 +120,17 @@ x2 = SEEDS_X2
 requested_nodes = (:parameters, :log_jacobian, :prior, :likelihood, :posterior)
 density_kernel = prepare(model;
     have = (:unconstrained, :counts, :totals, :x1, :x2),
-    want = requested_nodes)
+    want = requested_nodes,
+    bound = (; counts, totals, x1, x2))
 
-output = density_kernel(q, counts, totals, x1, x2)
+output = density_kernel(q)
 parameters, log_jacobian, prior, likelihood, posterior = output
 @assert posterior ≈ prior + likelihood + log_jacobian
 
 docs_example = (;
     name = :seeds_posterior,
     origin = "posteriordb seeds_model — binomial-logit GLMM with a per-plate random effect",
-    inputs = (; q, counts, totals, x1, x2),
+    inputs = (; q),
     model,
     kernel = density_kernel,
     output,

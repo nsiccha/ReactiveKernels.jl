@@ -61,9 +61,9 @@ using LogExpFunctions: logistic, log1pexp, logaddexp
               T::Int,
               M::Int) = begin
     # q = (u_omega, u_p, u_c); dim = 3.
-    u_omega::Float64 = sum(view(unconstrained, 1:1))
-    u_p::Float64 = sum(view(unconstrained, 2:2))
-    u_c::Float64 = sum(view(unconstrained, 3:3))
+    u_omega::Float64 = unconstrained[1]
+    u_p::Float64 = unconstrained[2]
+    u_c::Float64 = unconstrained[3]
 
     # Constrained: omega, p, c ∈ [0,1] via interval (logistic) transforms with
     # their `lub_constrain` Jacobians. Priors are implicit uniform(0,1) — the

@@ -65,6 +65,33 @@ isdefined(@__MODULE__, :AuthoredPlateChains) ||
     @test_throws DimensionMismatch unused(ones(2), y)
 end
 
+@testset "authored plate chain: bound data with only Ref-atomic array HAVE" begin
+    C = AuthoredPlateChains
+    q = [0.7, -0.3]
+    x = collect(range(-1.0, 1.0; length = 8))
+    y = fill(0.3, length(x))
+    middle = 2 .* x .+ q[1]
+    pointwise = y .+ middle .^ 2 .+ q[2] .* middle
+    ref = sum(pointwise)
+
+    unbound = prepare(C.ref_atomic_chain)
+    @test unbound(q, x, y) ≈ ref
+
+    # Binding the raw-data axis arrays must NOT remove the runtime backend
+    # marker: `q` is still an active array HAVE even though it is captured
+    # atomically, so `prepare(...; bound = (; x, y))` must succeed (it used to
+    # throw "an embedded plate requires an array-valued HAVE port").
+    bound = prepare(C.ref_atomic_chain; bound = (; x, y))
+    @test bound(q) ≈ ref
+    @test bound(q) == unbound(q, x, y)
+    @test bound.f isa ReactiveKernels._ArrayFunctionPair
+
+    # A demanded intermediate keeps its materialization boundary and stays
+    # bound/unbound consistent.
+    bound_mid = prepare(C.ref_atomic_chain; want = :middle, bound = (; x, y))
+    @test bound_mid(q) == middle
+end
+
 @kernel authored_standard_normal() = begin
     logpdf(z::Float64)::Float64 = -0.5 * log(2π) - 0.5 * z^2
 end

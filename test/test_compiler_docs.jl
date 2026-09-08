@@ -71,10 +71,15 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     @test occursin("Main.BatchedExamples.BATCHED_AD_SOURCE", distributions_ad_docs)
     @test occursin("test_batched_nonallocating.jl", distributions_ad_docs)
 
-    # No other public prose page carries backend/API guidance. Algorithmic
+    # No other public prose page carries backend/API GUIDANCE. Algorithmic
     # uses of the word "gradient" in sampler pages remain domain terminology,
     # while the evaluation-throughput page belongs to the top-level AD group
     # and the dedicated Eight Schools Reactant page owns its compiled-AD receipt.
+    # bound-regression.md and posteriordb-comparison.md carry only INCIDENTAL AD
+    # references, not guidance, so they are exempt: bound-regression names
+    # `prepare_ad` when describing the general `bound` partial-evaluation pre-pass,
+    # and posteriordb-comparison lists Enzyme once among the packages its pinned
+    # benchmark environment can load.
     ad_pages = Set((
         "automatic-differentiation.md",
         "distributions-ad.md",
@@ -85,6 +90,8 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
         "probprog-mcmc.md",
         "reactant-ad.md",
         "reactant.md",
+        "bound-regression.md",
+        "posteriordb-comparison.md",
     ))
     forbidden_ad_prose = (
         "DifferentiationInterface",

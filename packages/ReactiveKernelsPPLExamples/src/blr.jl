@@ -41,7 +41,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
     # q = (beta[1..D], log_sigma). beta is unconstrained; sigma = exp(log_sigma).
     n_coef::Int = length(unconstrained) - 1
     beta::AbstractVector{Float64} = view(unconstrained, 1:n_coef)
-    log_sigma::Float64 = sum(view(unconstrained, n_coef + 1:n_coef + 1))
+    log_sigma::Float64 = unconstrained[n_coef + 1]
     log_sigma::Float64 = log(sigma)
     sigma::Float64 = exp(log_sigma)
     log_jacobian::Float64 = log_sigma

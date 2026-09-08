@@ -44,6 +44,12 @@ zip; singleton dimensions expand; scalars repeat. `Ref(value)` marks an
 array-valued argument as one atomic value rather than a batch axis. Incompatible
 shapes raise `DimensionMismatch`.
 
+Whole parameter arrays can remain atomic when observation data is bound. A
+kernel prepared with `bound = (; x, y)` may keep `q` as its only input and use
+`Ref(q)` in each plate. The same prepared kernel accepts Reactant-traced `q`:
+every cell receives the complete parameter array, while the observation
+operands determine the broadcast axes and singleton expansion.
+
 Arguments may be transparent derived expressions, not only named ports. For
 example, `plate(eachcol(logits), y) do column, observed ... end` materializes
 the lazy column iterator as an ordinary outer graph recipe, then runs the

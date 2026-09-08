@@ -1,7 +1,7 @@
 module LogearnHeightExample
 
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
 export LOGEARN_HEIGHT_EARN, LOGEARN_HEIGHT_HEIGHT
 export build_logearn_height_graph, demo
@@ -16,19 +16,10 @@ export LOGEARN_HEIGHT_SOURCE, evaluate_logearn_height_source
 # 40-row systematic subset used by `earn_height` (spanning the full earn/height
 # range, both sexes; all earn > 0 so `log` is finite) is embedded verbatim as
 # `Float64` (Stan reads the integer JSON columns as `vector[N]`).
-const LOGEARN_HEIGHT_EARN = [
-    50000.0, 75000.0, 4000.0, 16040.0, 23000.0, 25000.0, 12000.0, 50000.0,
-    35000.0, 28000.0, 35000.0, 6000.0, 8000.0, 8000.0, 40000.0, 22000.0, 8000.0,
-    15000.0, 18000.0, 2000.0, 8000.0, 15000.0, 14000.0, 1200.0, 9000.0, 600.0,
-    30000.0, 15000.0, 58000.0, 14000.0, 10000.0, 6000.0, 25000.0, 18000.0,
-    5000.0, 85000.0, 37000.0, 3000.0, 30000.0, 6000.0,
-]
-const LOGEARN_HEIGHT_HEIGHT = [
-    74.0, 72.0, 64.0, 64.0, 70.0, 71.0, 64.0, 72.0, 69.0, 64.0, 67.0, 64.0,
-    71.0, 63.0, 58.0, 73.0, 68.0, 65.0, 70.0, 63.0, 68.0, 64.0, 66.0, 65.0,
-    72.0, 59.0, 71.0, 63.0, 64.0, 72.0, 63.0, 62.0, 69.0, 63.0, 72.0, 70.0,
-    74.0, 66.0, 68.0, 68.0,
-]
+let d = _posteriordb_data("earnings-logearn_height")
+    global const LOGEARN_HEIGHT_EARN = Float64.(d["earn"])
+    global const LOGEARN_HEIGHT_HEIGHT = Float64.(d["height"])
+end
 
 const LOGEARN_HEIGHT_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
@@ -36,12 +27,10 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 @kernel model(unconstrained::Vector{Float64},
               height::Vector{Float64},
               earn::Vector{Float64}) = begin
-    # q = (β₁, β₂, log_σ). One-element reductions extract the packed scalars
-    # without scalar indexing, so the same prepared kernel stays traceable as a
-    # Reactant tensor program.
-    beta1::Float64 = sum(view(unconstrained, 1:1))
-    beta2::Float64 = sum(view(unconstrained, 2:2))
-    log_sigma::Float64 = sum(view(unconstrained, 3:3))
+    # q = (β₁, β₂, log_σ).
+    beta1::Float64 = unconstrained[1]
+    beta2::Float64 = unconstrained[2]
+    log_sigma::Float64 = unconstrained[3]
 
     # Only σ carries a support transform (Stan `real<lower=0> sigma`):
     # σ = exp(log_σ), log|dσ/dlog_σ| = log_σ. β is unconstrained (identity).
@@ -64,19 +53,15 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
         log(e)
     end
 
-    # Transformed parameter: the linear predictor μ = β₁ + β₂·height. Captured
-    # scalars ride the plate as explicit shared arguments; the predictor is
-    # recomputed inline in the likelihood (constructor args may be constructed),
-    # so `mu` is pruned from a total-only query.
+    # Transformed parameter: the linear predictor μ = β₁ + β₂·height, named once.
     mu = plate(height, beta1, beta2) do h, b1, b2
         b1 + b2 * h
     end
 
-    # Likelihood: log(earnⱼ) ~ Normal(β₁ + β₂·heightⱼ, σ). The transformed
-    # response `log_earn` is sliced per cell as a bare caller port; the predictor
-    # is recomputed inline in the Normal constructor.
-    pointwise = plate(log_earn, height, beta1, beta2, sigma) do ly, h, b1, b2, s
-        normal(b1 + b2 * h, s).logpdf(ly)
+    # Likelihood: log(earnⱼ) ~ Normal(μⱼ, σ). Consumes the named `log_earn` and
+    # `mu` once (single-consumer plate-chain, fused buffer-free).
+    pointwise = plate(log_earn, mu, sigma) do ly, m, s
+        normal(m, s).logpdf(ly)
     end
     likelihood::Float64 = sum(pointwise)
 
@@ -102,18 +87,21 @@ height = LOGEARN_HEIGHT_HEIGHT
 earn = LOGEARN_HEIGHT_EARN
 
 requested_nodes = (:parameters, :log_jacobian, :likelihood, :posterior)
+# Raw data BOUND (benchmark-acceptance entry): log_earn is partial-eval-hoisted;
+# height/earn stay in HAVE, fixed to their data; only `unconstrained` stays active.
 density_kernel = prepare(model;
     have = (:unconstrained, :height, :earn),
-    want = requested_nodes)
+    want = requested_nodes,
+    bound = (; height, earn))
 
-output = density_kernel(q, height, earn)
+output = density_kernel(q)
 parameters, log_jacobian, likelihood, posterior = output
 @assert posterior ≈ likelihood + log_jacobian
 
 docs_example = (;
     name = :logearn_height_posterior,
     origin = "posteriordb earnings-logearn_height — Gaussian regression of log(earnings) on height",
-    inputs = (; q, height, earn),
+    inputs = (; q),
     model,
     kernel = density_kernel,
     output,

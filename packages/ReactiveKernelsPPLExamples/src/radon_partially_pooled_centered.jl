@@ -46,13 +46,12 @@ using LogExpFunctions: logistic, log1pexp
     # Stan's declared unconstrained order: (alpha[1..J], mu_alpha,
     # log_sigma_alpha, log_sigma_y); dim = J + 3. `sigma_alpha` and `sigma_y`
     # are `real<lower=0>` (exp support transform); `alpha` and `mu_alpha` are
-    # unconstrained. Slice without scalar indexing so the same prepared kernel
-    # stays traceable as a Reactant tensor program.
+    # unconstrained.
     n_counties::Int = length(unconstrained) - 3
     alpha::AbstractVector{Float64} = view(unconstrained, 1:n_counties)
-    mu_alpha::Float64 = sum(view(unconstrained, n_counties + 1:n_counties + 1))
-    log_sigma_alpha::Float64 = sum(view(unconstrained, n_counties + 2:n_counties + 2))
-    log_sigma_y::Float64 = sum(view(unconstrained, n_counties + 3:n_counties + 3))
+    mu_alpha::Float64 = unconstrained[n_counties + 1]
+    log_sigma_alpha::Float64 = unconstrained[n_counties + 2]
+    log_sigma_y::Float64 = unconstrained[n_counties + 3]
 
     # sigma = exp(log_sigma); log|dsigma/dlog_sigma| = log_sigma. Bidirectional
     # edges so either sigma or log_sigma may be authoritative.

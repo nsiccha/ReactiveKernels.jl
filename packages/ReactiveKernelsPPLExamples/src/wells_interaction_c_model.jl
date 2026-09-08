@@ -52,12 +52,11 @@ using LogExpFunctions: logistic
               switched::Vector{Bool}) = begin
     # q = (α, β₁, β₂, β₃). The Stan parameters (`real alpha`, `vector[3] beta`)
     # are all unconstrained, so the transform is the identity and the log
-    # Jacobian is zero. One-element reductions keep the packed scalars traceable
-    # as a Reactant tensor program.
-    alpha::Float64 = sum(view(unconstrained, 1:1))
-    beta1::Float64 = sum(view(unconstrained, 2:2))
-    beta2::Float64 = sum(view(unconstrained, 3:3))
-    beta3::Float64 = sum(view(unconstrained, 4:4))
+    # Jacobian is zero.
+    alpha::Float64 = unconstrained[1]
+    beta1::Float64 = unconstrained[2]
+    beta2::Float64 = unconstrained[3]
+    beta3::Float64 = unconstrained[4]
 
     parameters = (; alpha, beta1, beta2, beta3)
     (parameters, log_jacobian::Float64) =
