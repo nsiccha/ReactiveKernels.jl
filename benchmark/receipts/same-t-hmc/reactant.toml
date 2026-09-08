@@ -1,0 +1,118 @@
+backend = "reactant"
+generated_at = "2026-09-08T17:49:30.301"
+schema = "same-t-hmc-v1"
+
+[cells."GLM_Binomial_data-GLM_Binomial_model|T=100"]
+T = 100
+compile_s = 0.948901482
+dim = 3
+exec_round_s_median = 0.001132143
+us_per_transition = 11.32143
+
+[cells."GLM_Binomial_data-GLM_Binomial_model|T=1000"]
+T = 1000
+compile_s = 0.973197632
+dim = 3
+exec_round_s_median = 0.010574072
+us_per_transition = 10.574072000000001
+
+[cells."GLM_Binomial_data-GLM_Binomial_model|T=4"]
+T = 4
+compile_s = 21.523840226
+dim = 3
+exec_round_s_median = 0.0001392725
+us_per_transition = 34.818125
+
+[cells."eight_schools-eight_schools_centered|T=100"]
+T = 100
+compile_s = 1.021043471
+dim = 10
+exec_round_s_median = 0.0004161545
+us_per_transition = 4.161545
+
+[cells."eight_schools-eight_schools_centered|T=1000"]
+T = 1000
+compile_s = 0.987721064
+dim = 10
+exec_round_s_median = 0.0027945965
+us_per_transition = 2.7945965
+
+[cells."eight_schools-eight_schools_centered|T=4"]
+T = 4
+compile_s = 65.084709371
+dim = 10
+exec_round_s_median = 0.00024579399999999997
+us_per_transition = 61.448499999999996
+
+[cells."eight_schools-eight_schools_noncentered|T=100"]
+T = 100
+compile_s = 0.936022439
+dim = 10
+exec_round_s_median = 0.00040347150000000003
+us_per_transition = 4.034715000000001
+
+[cells."eight_schools-eight_schools_noncentered|T=1000"]
+T = 1000
+compile_s = 0.995402826
+dim = 10
+exec_round_s_median = 0.002772902
+us_per_transition = 2.7729019999999998
+
+[cells."eight_schools-eight_schools_noncentered|T=4"]
+T = 4
+compile_s = 17.519085252
+dim = 10
+exec_round_s_median = 0.00016310549999999999
+us_per_transition = 40.776374999999994
+
+[cells."kilpisjarvi_mod-kilpisjarvi|T=100"]
+T = 100
+compile_s = 0.856488659
+dim = 3
+exec_round_s_median = 0.0004394865
+us_per_transition = 4.394865
+
+[cells."kilpisjarvi_mod-kilpisjarvi|T=1000"]
+T = 1000
+compile_s = 0.865717164
+dim = 3
+exec_round_s_median = 0.0027058489999999998
+us_per_transition = 2.7058489999999997
+
+[cells."kilpisjarvi_mod-kilpisjarvi|T=4"]
+T = 4
+compile_s = 15.269704416
+dim = 3
+exec_round_s_median = 0.0002639135
+us_per_transition = 65.978375
+
+[cells."radon_mn-radon_variable_intercept_slope_centered|T=100"]
+T = 100
+compile_s = 1.15933587
+dim = 175
+exec_round_s_median = 0.013488169000000001
+us_per_transition = 134.88169
+
+[cells."radon_mn-radon_variable_intercept_slope_centered|T=1000"]
+T = 1000
+compile_s = 1.243605895
+dim = 175
+exec_round_s_median = 0.124407773
+us_per_transition = 124.40777299999999
+
+[cells."radon_mn-radon_variable_intercept_slope_centered|T=4"]
+T = 4
+compile_s = 17.809613493
+dim = 175
+exec_round_s_median = 0.0010498135
+us_per_transition = 262.453375
+
+[versions]
+backend = "reactant"
+device = "CPU"
+enzyme = "0.13.201"
+julia = "1.10.11"
+reactant = "0.2.285"
+rounds = 6
+steps = 16
+stepsize = 0.03

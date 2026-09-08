@@ -1,0 +1,10 @@
+
+===== [boundary eight_schools-eight_schools_centered] =====
+  T=4    A(pre)=40.65 B(in-timer)=43.91 µs/it  Δ=3.26 ratioB/A=1.08 equal=true
+  T=1000 A(pre)=2.689 B(in-timer)=2.686 µs/it  Δ=-0.00306 ratioB/A=0.9989 equal=true
+
+===== [boundary GLM_Binomial_data-GLM_Binomial_model] =====
+  T=4    A(pre)=42.03 B(in-timer)=44.3 µs/it  Δ=2.27 ratioB/A=1.054 equal=true
+  T=1000 A(pre)=8.92 B(in-timer)=8.85 µs/it  Δ=-0.0699 ratioB/A=0.9922 equal=true
+
+SAME_T_BOUNDARY_DONE cells=4

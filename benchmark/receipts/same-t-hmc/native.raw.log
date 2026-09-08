@@ -1,0 +1,27 @@
+
+===== [same-T native] eight_schools-eight_schools_centered =====
+  T=4    compile=12.7s  9.643 µs/transition
+  T=100  compile=0.00921s  7.983 µs/transition
+  T=1000 compile=0.0159s  6.927 µs/transition
+
+===== [same-T native] eight_schools-eight_schools_noncentered =====
+  T=4    compile=3.54s  10.44 µs/transition
+  T=100  compile=0.00649s  6.423 µs/transition
+  T=1000 compile=0.0114s  6.448 µs/transition
+
+===== [same-T native] kilpisjarvi_mod-kilpisjarvi =====
+  T=4    compile=3.21s  8.961 µs/transition
+  T=100  compile=0.00615s  5.75 µs/transition
+  T=1000 compile=0.00986s  5.795 µs/transition
+
+===== [same-T native] radon_mn-radon_variable_intercept_slope_centered =====
+  T=4    compile=4.92s  202.0 µs/transition
+  T=100  compile=0.0305s  221.9 µs/transition
+  T=1000 compile=0.291s  236.6 µs/transition
+
+===== [same-T native] GLM_Binomial_data-GLM_Binomial_model =====
+  T=4    compile=3.67s  64.99 µs/transition
+  T=100  compile=0.0119s  60.64 µs/transition
+  T=1000 compile=0.0664s  59.3 µs/transition
+
+SAME_T_HMC_DONE backend=native cells=15
