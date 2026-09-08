@@ -1776,7 +1776,7 @@ uuid = "4b169cd9-fc12-43fd-ba39-43e54ed8db7a"
 version = "0.1.0"
 
 [[deps.ReactiveKernelsPPLExamples]]
-deps = ["LinearAlgebra", "LogExpFunctions", "ReactiveKernels", "ReactiveKernelsDistributionKernels"]
+deps = ["LinearAlgebra", "LogExpFunctions", "PosteriorDB", "ReactiveKernels", "ReactiveKernelsDistributionKernels"]
 path = "../../packages/ReactiveKernelsPPLExamples"
 uuid = "a4d4be3d-45c5-49cc-80d7-34e606a16bce"
 version = "0.1.0"
