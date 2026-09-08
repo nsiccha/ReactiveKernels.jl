@@ -160,10 +160,10 @@ docs_example = (;
 )
 """
 
-function evaluate_lda_source()
+function evaluate_lda_source(; model_only::Bool = false)
     _evaluate_ppl_source(LDA_SOURCE, @__MODULE__; bindings = (
         :LDA_DOC, :LDA_W, :LDA_ALPHA, :LDA_BETA, :LDA_M,
-    ))
+    ), model_only)
 end
 
 """
@@ -179,7 +179,7 @@ lda_fixture() = (; doc = LDA_DOC, w = LDA_W, alpha = LDA_ALPHA, beta = LDA_BETA,
 const _LDA_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _LDA_GRAPH_TEMPLATE[] = evaluate_lda_source().model
+    _LDA_GRAPH_TEMPLATE[] = evaluate_lda_source(; model_only = true).model
     nothing
 end
 

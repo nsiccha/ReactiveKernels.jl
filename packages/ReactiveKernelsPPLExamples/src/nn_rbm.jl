@@ -158,10 +158,10 @@ docs_example = (;
 )
 """
 
-function evaluate_nn_rbm_source()
+function evaluate_nn_rbm_source(; model_only::Bool = false)
     _evaluate_ppl_source(NN_RBM_SOURCE, @__MODULE__; bindings = (
         :NN_RBM_X, :NN_RBM_Y, :NN_RBM_K, :NN_RBM_J,
-    ))
+    ), model_only)
 end
 
 """
@@ -176,7 +176,7 @@ nn_rbm_fixture() = (; x = NN_RBM_X, y = NN_RBM_Y, K = NN_RBM_K, J = NN_RBM_J)
 const _NN_RBM_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _NN_RBM_GRAPH_TEMPLATE[] = evaluate_nn_rbm_source().model
+    _NN_RBM_GRAPH_TEMPLATE[] = evaluate_nn_rbm_source(; model_only = true).model
     nothing
 end
 
