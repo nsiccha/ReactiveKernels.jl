@@ -887,3 +887,27 @@ _authored_plate_log_recipe_count(cell) =
         return sum(pointwise)
     end
 end
+
+@testset "authored plate marker: untyped scalar leading arg (want=:pointwise)" begin
+    # Regression guard (source-review catch by ReactiveKernels:performance): the
+    # static axis-marker fast path must NOT select an untyped (metadata-`Any`)
+    # leading argument that holds a runtime SCALAR. `want=:pointwise` materializes
+    # `similar(marker, ...)`, so a wrong marker builds the pointwise buffer from a
+    # scalar (or errors). Here `plate(x, location, scale)` is called with a scalar
+    # `x` and a vector `location`; `_authored_plate_is_axis` skips `x` and selects
+    # `location`, so the static classifier — for which an `Any` port is
+    # `:ambiguous` — must fall back to the runtime marker and reach the same axis.
+    # This is the correctness companion to the `test_ad.jl` Enzyme regression: the
+    # M0-shaped case proves the fast path lowers, this proves it never fires when
+    # it cannot prove the axis.
+    pointwise = prepare(extract(untyped_authored_normal_loglik; want = :pointwise))
+    x = 0.25
+    location = [0.1, 0.2, 0.4, 0.5]
+    scale = 0.8
+    result = pointwise(x, location, scale)
+    reference = [-0.5 * log(2π) - 0.5 * ((x - location[i]) / scale)^2 - log(scale)
+                 for i in eachindex(location)]
+    @test result isa AbstractVector
+    @test length(result) == length(location)
+    @test result ≈ reference
+end

@@ -13,8 +13,18 @@ import ReactiveKernelsNUTSExamples
     @test !haskey(project["deps"], "Enzyme")
     @test haskey(project["extras"], "Enzyme")
     @test "Enzyme" in project["targets"]["test"]
+    # Core must not DEPEND on Enzyme (a test/extension-only AD backend), but an
+    # explanatory comment may name it to document why core code sidesteps an AD
+    # failure mode (e.g. `codegen.jl` narrowing a plate accumulator's element
+    # type). Scan code with comments stripped so a comment mention is not
+    # mistaken for a dependency — a real `using`/`import`/qualified reference in
+    # code still trips this, as does the `deps` guard above.
+    strip_comments(code) = replace(
+        replace(code, r"#=.*?=#"s => " "),  # block comments
+        r"#[^\n]*" => "",                    # line comments
+    )
     @test all(readdir(srcdir; join = true)) do path
-        !isfile(path) || !occursin(r"\bEnzyme\b", read(path, String))
+        !isfile(path) || !occursin(r"\bEnzyme\b", strip_comments(read(path, String)))
     end
 
     for file in ("kernel_nuts.jl", "kernel_nuts_native.jl", "hmc.jl", "reactive_nuts.jl")

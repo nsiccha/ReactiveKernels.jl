@@ -348,6 +348,78 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
         # this remains the original exact zero-allocation sentinel.
         @test rk_allocated <= backend_allocated
     end
+
+    @testset "authored plate AD: Int data-axis in a capture-recapture plate" begin
+        # A likelihood plate whose axis is a data-only `Vector{Int}` sitting
+        # beside a `Vector{Float64}` data array and several parameter-derived
+        # scalars is the posteriordb capture-recapture / GLMM shape (M0, Mh,
+        # GLMM_Poisson, seeds*). The pointwise buffer's marker used to be selected
+        # by a runtime `findfirst` over the whole plate argument tuple; with the
+        # Int axis inactive and the Float array a differentiation `Constant`, that
+        # search stays CONDITIONALLY active for a plate wide enough that it does
+        # not fold to a constant index, so plain reverse-mode Enzyme (no
+        # `set_runtime_activity`, the standing config above) rejected the whole
+        # gradient with an `EnzymeRuntimeActivityError`. The lowering now binds the
+        # axis statically, so the derivative lowers. This width matters: a narrow
+        # two- or three-argument plate folds the search away and does NOT
+        # reproduce the bug, so the test mirrors the real M0 argument count.
+        @kernel capture_recapture_like(u::Vector{Float64}, s::Vector{Int},
+                                       lchoose::Vector{Float64}, T::Int) = begin
+            u_omega::Float64 = sum(view(u, 1:1))
+            u_p::Float64 = sum(view(u, 2:2))
+            log_omega::Float64 = -log1p(exp(-u_omega))
+            log1m_omega::Float64 = -log1p(exp(u_omega))
+            logp::Float64 = -log1p(exp(-u_p))
+            log1mp::Float64 = -log1p(exp(u_p))
+            pointwise = plate(s, lchoose, log_omega, log1m_omega, logp, log1mp,
+                              T) do si, lc, lo, l1o, lp, l1p, TT
+                observed = lo + lc + si * lp + (TT - si) * l1p
+                unobserved = l1o + lo
+                ifelse(si > 0, observed, unobserved)
+            end
+            objective::Float64 = sum(pointwise)
+        end
+
+        s = [1, 0, 2, 0, 1]
+        lchoose = [0.0, 0.0, 0.7, 0.0, 0.0]
+        T = 3
+        u = [0.1, -0.2]
+
+        # Plain-Julia reference of the same density, differentiated by the same
+        # backend on a closure that never routes through the authored-plate marker
+        # path — so it also confirms the recovered gradient is correct, not merely
+        # non-throwing.
+        reference = let s = s, lchoose = lchoose, T = T
+            function (u)
+                u_omega, u_p = u[1], u[2]
+                log_omega = -log1p(exp(-u_omega))
+                log1m_omega = -log1p(exp(u_omega))
+                logp = -log1p(exp(-u_p))
+                log1mp = -log1p(exp(u_p))
+                acc = zero(eltype(u))
+                for i in eachindex(s)
+                    observed = log_omega + lchoose[i] + s[i] * logp +
+                               (T - s[i]) * log1mp
+                    unobserved = log1m_omega + log_omega
+                    acc += ifelse(s[i] > 0, observed, unobserved)
+                end
+                acc
+            end
+        end
+        ref_value, ref_grad = DifferentiationInterface.value_and_gradient(
+            reference, TEST_AD_BACKEND, u)
+
+        kernel = prepare(capture_recapture_like;
+                         have = (:u, :s, :lchoose, :T), want = :objective,
+                         bound = (; s = s, lchoose = lchoose, T = T))
+        prepared = prepare_ad(kernel, TEST_AD_BACKEND, u; active = :u)
+
+        gradient = similar(u)
+        value, returned = ad_value_and_gradient!(prepared, gradient, u)
+        @test value ≈ ref_value
+        @test returned === gradient
+        @test gradient ≈ ref_grad
+    end
 end
 
 if !isdefined(@__MODULE__, :AuthoredScanFixtures)
