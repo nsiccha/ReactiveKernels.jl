@@ -22,6 +22,7 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     NormalMixtureExample, LowDimGaussMixCollapseExample, LowDimGaussMixExample,
     MNISTLogisticExample, MVNormalRegressionExample, BoundRegressionExample,
     NNRBMExample, LDAExample
+    LosscurveSislobExample, AccelSplinesExample, StateSpaceStochasticExample, ProphetExample
 using Test
 
 include("test_gp_first_use.jl")
@@ -126,6 +127,10 @@ include("test_gp_regr_example.jl")
 include("test_accel_gp_example.jl")
 include("test_gp_pois_regr_example.jl")
 include("test_hierarchical_gp_example.jl")
+include("test_losscurve_sislob_example.jl")
+include("test_accel_splines_example.jl")
+include("test_state_space_stochastic_example.jl")
+include("test_prophet_example.jl")
 include("test_ppl_macro.jl")
 include("test_ppl_posteriordb_parity.jl")
 include("test_ppl_gibbs.jl")

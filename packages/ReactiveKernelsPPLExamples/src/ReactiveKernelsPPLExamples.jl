@@ -105,6 +105,10 @@ include("gp_regr.jl")
 include("accel_gp.jl")
 include("gp_pois_regr.jl")
 include("hierarchical_gp.jl")
+include("losscurve_sislob.jl")
+include("accel_splines.jl")
+include("state_space_stochastic.jl")
+include("prophet.jl")
 
 export PPLWorkflow
 
@@ -229,5 +233,9 @@ export GPRegrExample
 export AccelGPExample
 export GPPoisRegrExample
 export HierarchicalGPExample
+export LosscurveSislobExample
+export AccelSplinesExample
+export StateSpaceStochasticExample
+export ProphetExample
 
 end # module ReactiveKernelsPPLExamples
