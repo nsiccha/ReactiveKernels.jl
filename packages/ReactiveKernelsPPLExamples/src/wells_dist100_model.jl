@@ -1,7 +1,7 @@
 module WellsDist100Example
 
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
 export WELLS_DIST100_DIST, WELLS_DIST100_SWITCHED
 export build_wells_dist100_graph, demo
@@ -14,22 +14,11 @@ export WELLS_DIST100_SOURCE, evaluate_wells_dist100_source
 # faithfully-shaped representative subset (first 40 households) is embedded. The
 # RAW distances (metres) are stored — the /100 rescale is applied in-graph as the
 # transformed-data step, matching the Stan model.
-const WELLS_DIST100_DIST = [
-    16.826000213623, 47.3219985961914, 20.9669990539551, 21.4860000610352,
-    40.8740005493164, 69.5179977416992, 80.7109985351563, 55.1459999084473,
-    52.6469993591309, 75.0719985961914, 29.7740001678467, 34.5040016174316,
-    63.8040008544922, 73.6039962768555, 67.6549987792969, 80.6600036621094,
-    52.181999206543, 52.181999206543, 50.5340003967285, 31.4220008850098,
-    33.0089988708496, 37.8709983825684, 48.3730010986328, 47.3089981079102,
-    67.7850036621094, 81.1380004882813, 95.4599990844727, 114.417999267578,
-    157.628997802734, 151.919998168945, 107.69100189209, 105.667999267578,
-    105.625999450684, 107.69100189209, 107.69100189209, 125.317001342773,
-    107.69100189209, 107.69100189209, 107.69100189209, 107.69100189209,
-]
-const WELLS_DIST100_SWITCHED = Bool[
-    1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 0, 1, 1, 0,
-]
+# Real data (full) from posteriordb `wells_data-wells_dist100_model`, loaded via PosteriorDB.jl.
+let d = _posteriordb_data("wells_data-wells_dist100_model")
+    global const WELLS_DIST100_DIST = Float64.(d["dist"])
+    global const WELLS_DIST100_SWITCHED = Bool.(d["switched"])
+end
 
 const WELLS_DIST100_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: bernoulli
@@ -58,19 +47,16 @@ using LogExpFunctions: logistic
         d / 100.0
     end
 
-    # Transformed parameter: the logit-scale linear predictor
-    # ηᵢ = α + β₁·dist100ᵢ. This is Stan's `bernoulli_logit_glm(x, alpha, beta)`
-    # with the single-column design x = dist100. The /100 rescale is recomputed
-    # inline here (not read from `dist100`), so the query stays fusable.
-    eta = plate(dist, alpha, beta1) do d, a, b1
-        a + b1 * (d / 100.0)
+    # Transformed parameter: the logit-scale linear predictor ηᵢ = α + β₁·dist100ᵢ,
+    # consuming the named transformed-data node `dist100`; named once.
+    eta = plate(dist100, alpha, beta1) do d100, a, b1
+        a + b1 * d100
     end
 
-    # Likelihood: switchedᵢ ~ Bernoulli_logit(ηᵢ). The linear predictor is
-    # recomputed inline (buffer-free fused total); the Bernoulli endpoint takes
-    # the success probability, so the logit link is `logistic(·)` applied inline.
-    pointwise = plate(switched, dist, alpha, beta1) do s, d, a, b1
-        bernoulli(logistic(a + b1 * (d / 100.0))).logpdf(s)
+    # Likelihood: switchedᵢ ~ Bernoulli_logit(ηᵢ). Consumes the named `eta` once
+    # via the natural logit HAVE route (single-consumer plate-chain, fused).
+    pointwise = plate(switched, eta) do s, e
+        bernoulli(; logit = e).logpdf(s)
     end
     likelihood::Float64 = sum(pointwise)
 
@@ -93,16 +79,17 @@ switched = WELLS_DIST100_SWITCHED
 requested_nodes = (:parameters, :log_prior, :likelihood, :posterior)
 density_kernel = prepare(model;
     have = (:unconstrained, :dist, :switched),
-    want = requested_nodes)
+    want = requested_nodes,
+    bound = (; dist, switched))
 
-output = density_kernel(q, dist, switched)
+output = density_kernel(q)
 parameters, log_prior, likelihood, posterior = output
 @assert posterior ≈ log_prior + likelihood
 
 docs_example = (;
     name = :wells_dist100_posterior,
     origin = "posteriordb wells_dist100_model — Bernoulli-logit GLM (switched ~ dist/100)",
-    inputs = (; q, dist, switched),
+    inputs = (; q),
     model,
     kernel = density_kernel,
     output,
