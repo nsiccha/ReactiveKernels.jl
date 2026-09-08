@@ -298,7 +298,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         error("rendered site has $(length(rendered)) content pages; navigation config has $(length(sources))")
     expected_panels = Dict(
         "automatic-differentiation.md" => 0,
-        "distributions-ad.md" => 1,
+        "distributions-ad.md" => 0,
         "distributions.md" => 19,
         "batched.md" => 1,
         "bijectors.md" => 1,

@@ -19,12 +19,11 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
               observations::Vector{Float64},
               observation_scales::Vector{Float64}) = begin
     # q = (theta_trans[1..J], mu, log_tau) — Stan's declared unconstrained order
-    # (tau is `real<lower=0>`). Slice without scalar indexing so the same kernel
-    # stays traceable as a Reactant tensor program.
+    # (tau is `real<lower=0>`).
     n_schools::Int = length(unconstrained) - 2
     theta_trans::AbstractVector{Float64} = view(unconstrained, 1:n_schools)
-    mu::Float64 = sum(view(unconstrained, n_schools + 1:n_schools + 1))
-    log_tau::Float64 = sum(view(unconstrained, n_schools + 2:n_schools + 2))
+    mu::Float64 = unconstrained[n_schools + 1]
+    log_tau::Float64 = unconstrained[n_schools + 2]
 
     # tau = exp(log_tau); log|dtau/dlog_tau| = log_tau. Bidirectional edges so
     # either tau or log_tau may be the authoritative HAVE value.

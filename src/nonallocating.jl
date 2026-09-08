@@ -297,15 +297,20 @@ function _plate_broadcast_rank(::Val{A}, argtypes) where {A}
     length(axes_type.parameters)
 end
 
+# The cache slot and recorded result type use the inferred concrete element
+# type (`_authored_plate_result_eltype`) rather than the plan-level `Any` of an
+# unannotated body, so an untyped plate materializes a typed buffer here exactly
+# as the ordinary native lowering now does — no boxed `Vector{Any}`, and both
+# execution paths agree bit-for-bit on the materialized pointwise vector.
 function _plate_cache_slot(op::_AuthoredPlateOp{K,A}, argtypes) where {K,A}
-    T = valtype(only(outputs(op.kernel)))
+    T = _authored_plate_result_eltype(op, argtypes)
     N = _plate_broadcast_rank(Val(A), argtypes)
     N === nothing && return Ref{Array{T}}(Vector{T}())
     Ref{Array{T,N}}(Array{T,N}(undef, ntuple(_ -> 0, N)...))
 end
 
 function _plate_result_type(op::_AuthoredPlateOp{K,A}, argtypes) where {K,A}
-    T = valtype(only(outputs(op.kernel)))
+    T = _authored_plate_result_eltype(op, argtypes)
     N = _plate_broadcast_rank(Val(A), argtypes)
     N === nothing ? Array{T} : Array{T,N}
 end

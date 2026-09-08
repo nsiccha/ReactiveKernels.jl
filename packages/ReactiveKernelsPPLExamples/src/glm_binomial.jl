@@ -1,7 +1,7 @@
 module GLMBinomialExample
 
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
 export GLM_BINOMIAL_YEAR, GLM_BINOMIAL_C, GLM_BINOMIAL_N
 export build_glm_binomial_graph, demo
@@ -9,17 +9,12 @@ export GLM_BINOMIAL_SOURCE, evaluate_glm_binomial_source
 
 # posteriordb `GLM_Binomial_data-GLM_Binomial_model` — a binomial-logit
 # quadratic-trend GLM (BPA book, ch. 3). Real data (nyears = 40) embedded.
-const GLM_BINOMIAL_YEAR = collect(-0.95:0.05:1.0)
-const GLM_BINOMIAL_C = [
-    27, 42, 35, 55, 61, 19, 41, 74, 43, 42, 73, 37, 48, 49, 19, 72, 30, 18, 31,
-    71, 63, 51, 48, 73, 49, 54, 43, 59, 30, 24, 62, 55, 51, 47, 14, 27, 45, 20,
-    26, 19,
-]
-const GLM_BINOMIAL_N = [
-    43, 83, 53, 91, 95, 24, 62, 91, 64, 57, 97, 56, 74, 66, 28, 92, 40, 23, 46,
-    96, 91, 75, 71, 100, 72, 77, 64, 68, 43, 32, 97, 92, 75, 84, 22, 58, 81, 37,
-    45, 39,
-]
+# Real data (full) from posteriordb `GLM_Binomial_data-GLM_Binomial_model`, loaded via PosteriorDB.jl.
+let d = _posteriordb_data("GLM_Binomial_data-GLM_Binomial_model")
+    global const GLM_BINOMIAL_YEAR = Float64.(d["year"])
+    global const GLM_BINOMIAL_C = Int.(d["C"])
+    global const GLM_BINOMIAL_N = Int.(d["N"])
+end
 
 const GLM_BINOMIAL_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, binomial
@@ -30,11 +25,10 @@ using LogExpFunctions: logistic
               counts::Vector{Int},
               totals::Vector{Int}) = begin
     # q = (α, β₁, β₂), all unconstrained (Stan `real`, no bounds), so the
-    # transform is the identity and the log Jacobian is zero. One-element
-    # reductions keep the packed scalars traceable as a Reactant tensor program.
-    alpha::Float64 = sum(view(unconstrained, 1:1))
-    beta1::Float64 = sum(view(unconstrained, 2:2))
-    beta2::Float64 = sum(view(unconstrained, 3:3))
+    # transform is the identity and the log Jacobian is zero.
+    alpha::Float64 = unconstrained[1]
+    beta1::Float64 = unconstrained[2]
+    beta2::Float64 = unconstrained[3]
     log_jacobian::Float64 = 0.0
 
     parameters = (; alpha, beta1, beta2)
@@ -52,11 +46,10 @@ using LogExpFunctions: logistic
         a + b1 * y + b2 * (y * y)
     end
 
-    # Likelihood: Cⱼ ~ Binomial_logit(Nⱼ, α + β·yearⱼ). The trend is recomputed
-    # inline (buffer-free fused total); the Binomial endpoint takes the success
-    # probability, so the logit link is `logistic(·)` applied inline.
-    pointwise = plate(counts, totals, year, alpha, beta1, beta2) do c, n, y, a, b1, b2
-        binomial(n, logistic(a + b1 * y + b2 * (y * y))).logpdf(c)
+    # Likelihood: Cⱼ ~ Binomial_logit(Nⱼ, logit_pⱼ). Consumes the named `logit_p`
+    # once via the natural logit HAVE route (single-consumer plate-chain, fused).
+    pointwise = plate(counts, totals, logit_p) do c, n, lp
+        binomial(; n = n, logit = lp).logpdf(c)
     end
     likelihood::Float64 = sum(pointwise)
 
@@ -80,16 +73,17 @@ totals = GLM_BINOMIAL_N
 requested_nodes = (:parameters, :prior, :likelihood, :posterior)
 density_kernel = prepare(model;
     have = (:unconstrained, :year, :counts, :totals),
-    want = requested_nodes)
+    want = requested_nodes,
+    bound = (; year, counts, totals))
 
-output = density_kernel(q, year, counts, totals)
+output = density_kernel(q)
 parameters, prior, likelihood, posterior = output
 @assert posterior ≈ prior + likelihood
 
 docs_example = (;
     name = :glm_binomial_posterior,
     origin = "posteriordb GLM_Binomial_model — binomial-logit quadratic-trend GLM",
-    inputs = (; q, year, counts, totals),
+    inputs = (; q),
     model,
     kernel = density_kernel,
     output,

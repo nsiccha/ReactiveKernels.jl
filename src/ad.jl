@@ -50,8 +50,8 @@ end
 # Plated PreparedKernels carry their already-generated native and tensorized
 # bodies behind a runtime function-pair selector. Native AD preparation has
 # concrete exemplars, so it can bypass only that selector and differentiate the
-# exact native callable/operation table used by primal execution. No AD-specific
-# kernel or AST is generated.
+# exact native callable and its live operations. No AD-specific kernel or AST
+# is generated.
 struct _ADNativeKernelCall{I,F,O}
     native::F
     ops::O
@@ -74,16 +74,50 @@ end
     :(call.native(call.ops, $(positional...)))
 end
 
+function _ad_operation_slots!(used, node)
+    node === _OPS_ARG && return false
+    node isa Expr || return true
+    slot = _operation_slot(node)
+    if slot !== nothing
+        push!(used, slot)
+        return true
+    end
+    all(child -> _ad_operation_slots!(used, child), node.args)
+end
+
+function _ad_native_ops(kernel::PreparedKernel)
+    ops = kernel.ops
+    any(op -> op isa _AuthoredScanOp, ops) || return ops
+    native = kernel.f.native
+    native isa RuntimeGeneratedFunctions.RuntimeGeneratedFunction || return ops
+    # Inspect the compiled callable's cached source, not the separately mutable
+    # display AST exposed by code_expr(kernel).
+    ast = RuntimeGeneratedFunctions.get_expression(native)
+    used = Set{Int}()
+    _ad_operation_slots!(used, ast.args[2]) || return ops
+    # Native scan steps are inlined, but the shared operation table also holds
+    # the tensorized scan's complete prepared kernel. Rebuilding a bound-array
+    # table with that unused graph metadata defeats readonly analysis on Julia
+    # 1.13. Keep every live slot and the original positional ABI; remove only
+    # unused scan metadata from this internal native call. A source transform
+    # that accesses the table dynamically conservatively retains the whole table.
+    ntuple(length(ops)) do index
+        op = ops[index]
+        op isa _AuthoredScanOp && !(index in used) ? nothing : op
+    end
+end
+
 function _ad_kernel_call(kernel::PreparedKernel, args::Tuple, ::Val{I}) where {I}
     native_exemplars = _dynamic_tensorized_marker(args) === nothing
     if kernel.f isa Union{
             _ArrayFunctionPair,_EmbeddedFunctionPair,
             _DynamicEmbeddedFunctionPair} && native_exemplars
+        ops = _ad_native_ops(kernel)
         externalized, values = _externalize_bound_array_call(
-            kernel.f.native, kernel.ops)
+            kernel.f.native, ops)
         isempty(values) && return (
-            _ADNativeKernelCall{I,typeof(kernel.f.native),typeof(kernel.ops)}(
-                kernel.f.native, kernel.ops),
+            _ADNativeKernelCall{I,typeof(kernel.f.native),typeof(ops)}(
+                kernel.f.native, ops),
             (),
         )
         return _ADKernelCall{I,typeof(externalized)}(externalized), values

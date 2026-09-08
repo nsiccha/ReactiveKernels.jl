@@ -1,7 +1,7 @@
 module LowDimGaussMixExample
 
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
 export LOW_DIM_GAUSS_MIX_Y
 export build_low_dim_gauss_mix_graph, demo
@@ -24,15 +24,10 @@ export LOW_DIM_GAUSS_MIX_SOURCE, evaluate_low_dim_gauss_mix_source
 #
 # Real data is N=1000; a representative stride-17 subsample (59 points) of the
 # real posteriordb dataset is embedded (the graph rebinds full data via `y`).
-const LOW_DIM_GAUSS_MIX_Y = [-3.58543, -2.47247, -4.42229, 2.1746, 3.9798,
-    -3.63695, -3.83286, 3.05141, -1.8756, -2.68874, -3.28516, -2.0849,
-    -3.77245, -2.56132, 4.65736, 1.93507, -2.73143, -3.76602, -2.88974,
-    2.19949, 3.96961, -2.26629, -3.90329, -4.42265, -2.96978, -3.87419,
-    1.77275, 3.36507, 3.05105, 3.68347, 2.11555, 1.72899, 3.50511, 2.33643,
-    -2.44237, -2.77268, 3.52847, -1.87345, 3.55273, -2.39433, -1.41915,
-    2.03854, 1.04083, 1.71943, -1.81664, -2.6926, 2.26088, -2.22045, 2.32455,
-    -4.17717, 3.08426, -2.18445, -2.84141, -1.80077, 3.88223, -3.3914, 2.60347,
-    -1.58232, -2.53733]
+# Real data (full) from posteriordb `low_dim_gauss_mix-low_dim_gauss_mix`, loaded via PosteriorDB.jl.
+let d = _posteriordb_data("low_dim_gauss_mix-low_dim_gauss_mix")
+    global const LOW_DIM_GAUSS_MIX_Y = Float64.(d["y"])
+end
 
 const LOW_DIM_GAUSS_MIX_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, beta
@@ -42,11 +37,11 @@ using LogExpFunctions: logistic, log1pexp, logaddexp
               y::Vector{Float64}) = begin
     # q = (u_mu1, u_mu2, u_sigma1, u_sigma2, u_theta); Stan order ordered[2] mu,
     # array[2] real<lower=0> sigma, real<lower=0,upper=1> theta. dim = 5.
-    u_mu1::Float64 = sum(view(unconstrained, 1:1))
-    u_mu2::Float64 = sum(view(unconstrained, 2:2))
-    u_sigma1::Float64 = sum(view(unconstrained, 3:3))
-    u_sigma2::Float64 = sum(view(unconstrained, 4:4))
-    u_theta::Float64 = sum(view(unconstrained, 5:5))
+    u_mu1::Float64 = unconstrained[1]
+    u_mu2::Float64 = unconstrained[2]
+    u_sigma1::Float64 = unconstrained[3]
+    u_sigma2::Float64 = unconstrained[4]
+    u_theta::Float64 = unconstrained[5]
 
     # ordered[2] transform: mu1 = u_mu1, mu2 = u_mu1 + exp(u_mu2), so mu1 < mu2;
     # its K=2 Jacobian contributes u_mu2. sigma via exp (Jacobian u each); theta
@@ -103,9 +98,10 @@ requested_nodes = (:parameters, :prior, :log_jacobian, :pointwise, :likelihood,
                    :posterior)
 density_kernel = prepare(model;
     have = (:unconstrained, :y),
-    want = requested_nodes)
+    want = requested_nodes,
+    bound = (; y))
 
-output = density_kernel(q, y)
+output = density_kernel(q)
 parameters, prior, log_jacobian, pointwise, likelihood, posterior = output
 @assert likelihood ≈ sum(pointwise)
 @assert posterior ≈ prior + likelihood + log_jacobian
@@ -115,7 +111,7 @@ parameters, prior, log_jacobian, pointwise, likelihood, posterior = output
 docs_example = (;
     name = :low_dim_gauss_mix_posterior,
     origin = "posteriordb low_dim_gauss_mix — 2-component normal mixture, ordered means (marginalized)",
-    inputs = (; q, y),
+    inputs = (; q),
     model,
     kernel = density_kernel,
     output,

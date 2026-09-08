@@ -808,6 +808,15 @@ end
 # scalar indexing while leaving XLA free to fuse the tensor operations.
 @inline ReactiveKernels._requires_tensorized_marker(::Reactant.RArray) = true
 
+# A traced SCALAR HAVE beside all-bound plate data is also a Reactant argument:
+# a scalar-parameter model (`logit_rate`/`log_rate`) with every array port
+# `bound=` traces only a `TracedRNumber`, so no `RArray` marker exists and the
+# native fused loop would run — writing each traced cell into a host
+# `Array{Float64}` buffer (`Float64(::TracedRNumber)` MethodError at
+# `setindex!`).  Selecting the tensorized body promotes the bound host arrays
+# into the traced program instead, exactly as the array-HAVE case already does.
+@inline ReactiveKernels._requires_tensorized_marker(::Reactant.TracedRNumber) = true
+
 # Cat-family calls in a tensorized fused body may mix untraced constant arrays
 # (e.g. a `zeros(1, n)` reference row built inside the body) with traced
 # operands; Base's generic `_typed_vcat` then copies elementwise into a host
@@ -975,10 +984,38 @@ end
     ndims(arg) == 1 && size(arg, 1) == count
 @inline _authored_plate_is_explicit_batch(arg, count) = false
 
+# A host-resident array operand of a plate that lowers through Reactant —
+# typically `bound=` data — is a compile-time constant of the traced program,
+# and both large-plate lowerings below need it promoted before they classify
+# or broadcast operands (see `_reactant_plate_operand` for the two failures).
+# Already-traced operands and `Ref`-wrapped shared scalars pass through
+# untouched, so an all-traced plate lowers exactly as before; the <= 16-lane
+# scalar-lanes path never reaches this promotion.
+@inline _reactant_plate_operand(arg) = arg
+@inline _reactant_plate_operand(arg::Reactant.TracedRArray) = arg
+@inline _reactant_plate_operand(arg::AbstractArray) =
+    Reactant.promote_to(Reactant.TracedRArray, arg)
+
+function _reactant_plate_batch(operation, args, batch_positions, scalar_positions,
+        batch_inputs, batch_shape)
+    shared = Tuple(_authored_plate_shared(getfield(args, index))
+        for index in eachindex(args) if !(index in batch_positions))
+    call = _AuthoredPlateBatchCall{
+        batch_positions,scalar_positions,length(args),
+        typeof(operation),typeof(shared)}(operation, shared)
+    only(Reactant.Ops.batch(call, batch_inputs, batch_shape))
+end
+
 function _reactant_authored_plate_call(marker, operation, args::Tuple)
     count = _authored_plate_batch_length(marker)
     lanes = _reactant_plate_lanes(count, operation, args)
     lanes === nothing || return lanes
+    # Only traced arrays and the structural markers count as explicit batch
+    # inputs below, so a host lane vector (a `bound=` data vector beside a
+    # traced `eachcol` matrix) would otherwise be captured as a SHARED closure
+    # value and the whole vector would reach every lane's scalar cell
+    # (`-(::Vector{Float64}, ::TracedRNumber{Float64})`).
+    args = map(_reactant_plate_operand, args)
     batch_positions = Tuple(index for index in eachindex(args)
         if _authored_plate_is_explicit_batch(getfield(args, index), count))
     isempty(batch_positions) && throw(ArgumentError(
@@ -990,12 +1027,8 @@ function _reactant_authored_plate_call(marker, operation, args::Tuple)
         _authored_plate_batch_input(getfield(args, index))
         for index in batch_positions
     ]
-    shared = Tuple(_authored_plate_shared(getfield(args, index))
-        for index in eachindex(args) if !(index in batch_positions))
-    call = _AuthoredPlateBatchCall{
-        batch_positions,scalar_positions,length(args),
-        typeof(operation),typeof(shared)}(operation, shared)
-    result = only(Reactant.Ops.batch(call, batch_inputs, Int64[count]))
+    result = _reactant_plate_batch(operation, args, batch_positions,
+        scalar_positions, batch_inputs, Int64[count])
     ReactiveKernels._TensorizedPlateBatch(result)
 end
 
@@ -1046,10 +1079,100 @@ end
 # broadcast.
 ReactiveKernels._tensorized_plate_is_marker(::Reactant.TracedRArray{<:Any,1}) =
     true
+# Reactant's broadcast promotes every operand to a traced constant before
+# applying the cell body, but it deduces the RESULT eltype first, from the RAW
+# host element type (`Int64`, not `TracedRNumber{Int64}`).  A fused cell body
+# whose result type depends on how a host scalar combines with a traced one —
+# the discrete-family validity guard `ifelse(observed >= 0, <traced>, -Inf)`
+# infers `Union{Float64,TracedRNumber{Float64}}` on a host `Bool` condition —
+# then deduces the abstract typejoin `Number`, for which Reactant defines no
+# traced `similar`, and the plate dies in
+# `similar(::Broadcasted{AbstractReactantArrayStyle}, ::Type{Number})`.
+# Promoting the host operands first (the same `promote_to` the cat/broadcast
+# wrappers of a fused body use) types the cell body on traced scalars exactly
+# as Reactant's element application evaluates it, so the deduced eltype is
+# concrete.
+# The core routes a recipe to the FIRST marker-bearing operand, and this
+# extension claims plain traced vectors (above) so a vector plate lowers here.
+# Inside an `eachcol`/batched plate a traced data vector can therefore precede
+# the structural marker in a cell's operand order, and the generic broadcast
+# below would then receive the structural operand itself
+# (`length(::_TensorizedPlateBatch)` has no method).  The batched lowering
+# handles both operand kinds, so a structural marker among the operands takes
+# precedence over the plain-vector one.
+@inline _reactant_is_structural_marker(arg) = false
+@inline _reactant_is_structural_marker(
+    ::ReactiveKernels._TensorizedEachcol{<:Reactant.TracedRArray}) = true
+@inline _reactant_is_structural_marker(
+    ::ReactiveKernels._TensorizedPlateBatch{<:Reactant.TracedRArray}) = true
+@inline _reactant_is_structural_marker(::_PlateLanes) = true
+@inline _reactant_structural_marker(::Tuple{}) = nothing
+@inline function _reactant_structural_marker(args::Tuple)
+    arg = first(args)
+    _reactant_is_structural_marker(arg) ? arg :
+        _reactant_structural_marker(Base.tail(args))
+end
+
+# A Ref contributes no broadcast axis, but its traced array still selects the
+# backend when every axis operand is bound host data. Generic Reactant broadcast
+# expands Ref payloads as scalars (broadcast_in_dim with no source dimensions),
+# which is invalid for an array payload. Ops.batch already preserves the full
+# shape of arrays captured by the callable, as in the eachcol lowering above.
+ReactiveKernels._tensorized_plate_is_marker(
+    ::Base.RefValue{<:Reactant.TracedRArray}) = true
+@inline _reactant_plate_ref_array(arg) = false
+@inline _reactant_plate_ref_array(::Base.RefValue{<:AbstractArray}) = true
+@inline _reactant_plate_broadcast_input(arg::AbstractArray) =
+    _reactant_plate_operand(arg)
+@inline _reactant_plate_broadcast_input(arg::Tuple) =
+    _reactant_plate_operand(collect(arg))
+@inline _reactant_plate_scalar_arg(arg) = _authored_plate_shared(arg)
+@inline _reactant_plate_scalar_arg(arg::AbstractArray) =
+    _authored_plate_batch_scalar(arg)
+
+function _reactant_ref_plate_call(operation, args::Tuple)
+    args = map(Base.broadcastable, args)
+    # Julia's broadcast axes, including singleton expansion, remain authoritative.
+    # In particular, the shape of an atomic parameter never becomes a lane axis.
+    shape = Int64[length(axis) for axis in Base.Broadcast.combine_axes(args...)]
+    isempty(shape) && return operation(map(_reactant_plate_scalar_arg, args)...)
+    if length(shape) == 1
+        lanes = _reactant_plate_lanes(only(shape), operation, args)
+        lanes === nothing || return lanes
+    end
+    positions = Tuple(index for index in eachindex(args)
+        if getfield(args, index) isa Union{AbstractArray,Tuple})
+    inputs = Reactant.TracedRArray[
+        let input = _reactant_plate_broadcast_input(getfield(args, index))
+            Reactant.Ops.broadcast_in_dim(
+                input, collect(Int64, 1:ndims(input)), shape)
+        end for index in positions
+    ]
+    result = _reactant_plate_batch(operation, args, positions, positions, inputs, shape)
+    # An empty batch can leave tensor.empty after Reactant's batch lowering,
+    # which XLA cannot export. Its shape and element type are already known,
+    # and it contains no parameter-dependent values: return the empty constant.
+    isempty(result) ? zeros(Reactant.unwrapped_eltype(result), size(result)) : result
+end
+
+function ReactiveKernels._tensorized_plate_call(
+        marker::Base.RefValue{<:Reactant.TracedRArray}, operation, args::Tuple)
+    structural = _reactant_structural_marker(args)
+    structural === nothing ? _reactant_ref_plate_call(operation, args) :
+        _reactant_authored_plate_call(structural, operation, args)
+end
+
 function ReactiveKernels._tensorized_plate_call(
         marker::Reactant.TracedRArray{<:Any,1}, operation, args::Tuple)
+    structural = _reactant_structural_marker(args)
+    structural === nothing ||
+        return _reactant_authored_plate_call(structural, operation, args)
+    any(_reactant_plate_ref_array, args) &&
+        return _reactant_ref_plate_call(operation, args)
     lanes = _reactant_plate_lanes(size(marker, 1), operation, args)
-    lanes === nothing ? Base.broadcast(operation, args...) : lanes
+    lanes === nothing ?
+        Base.broadcast(operation, map(_reactant_plate_operand, args)...) :
+        lanes
 end
 
 @inline _authored_plate_batch_length(arg::_PlateLanes) = length(arg.lanes)
@@ -1100,6 +1223,15 @@ end
 @inline function ReactiveKernels._batched_call(
         f::ReactiveKernels._ArrayFunctionPair, ops, args,
         marker::Reactant.RArray)
+    f.tensorized(ops, args...)
+end
+
+# A traced-scalar marker (a scalar HAVE with all plate data bound) selects the
+# same tensorized body as an `RArray` marker; `TracedRNumber` is not `<:RArray`,
+# so it needs its own dispatch to avoid the native host-buffer fallback.
+@inline function ReactiveKernels._batched_call(
+        f::ReactiveKernels._ArrayFunctionPair, ops, args,
+        marker::Reactant.TracedRNumber)
     f.tensorized(ops, args...)
 end
 

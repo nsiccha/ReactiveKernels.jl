@@ -44,12 +44,12 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
               height::Vector{Float64},
               male::Vector{Float64},
               earn::Vector{Float64}) = begin
-    # q = (β₁, β₂, β₃, β₄, log_σ). One-element reductions extract the packed scalars.
-    beta1::Float64 = sum(view(unconstrained, 1:1))
-    beta2::Float64 = sum(view(unconstrained, 2:2))
-    beta3::Float64 = sum(view(unconstrained, 3:3))
-    beta4::Float64 = sum(view(unconstrained, 4:4))
-    log_sigma::Float64 = sum(view(unconstrained, 5:5))
+    # q = (β₁, β₂, β₃, β₄, log_σ).
+    beta1::Float64 = unconstrained[1]
+    beta2::Float64 = unconstrained[2]
+    beta3::Float64 = unconstrained[3]
+    beta4::Float64 = unconstrained[4]
+    log_sigma::Float64 = unconstrained[5]
 
     # Only σ carries a support transform: σ = exp(log_σ), log|dσ/dlog_σ| = log_σ.
     log_sigma::Float64 = log(sigma)

@@ -13,19 +13,19 @@ pass.
 ## One reverse pass over a plated objective
 
 The same API used by a scalar kernel applies to an authored likelihood whose
-`plate` result is summed. The build-executed source below is the exact primal
+`plate` result is summed. The source below is the exact primal-plus-gradient
 source from [Batched log densities](batched.md): one authored graph supports its
 return, pointwise, combined, and prepared-gradient boundaries.
 
 ```@eval
-Main.ReactiveKernelsDocs.execute_example(
-    @__MODULE__, Main.BatchedExamples.BATCHED_AD_SOURCE,
-)
+Main.ReactiveKernelsDocs.render_inert_source(Main.BatchedExamples.BATCHED_AD_SOURCE)
 ```
 
-The result is checked against the analytic score
-`-(xᵢ - location)/scale²`. The generated-kernel pane comes from the exact plan
-executed during this docs build.
+The reverse pass is checked against the analytic score
+`-(xᵢ - location)/scale²` by the package test suite
+([`test_batched_nonallocating.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsBatchingExamples/test/test_batched_nonallocating.jl)).
+It is displayed here as source rather than executed, so the docs build carries no
+Enzyme/LLVM autodiff toolchain.
 
 ## Distribution gradient latency and allocation
 

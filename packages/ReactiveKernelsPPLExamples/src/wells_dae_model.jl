@@ -1,7 +1,7 @@
 module WellsDaeExample
 
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
 export WELLS_DAE_DIST, WELLS_DAE_ARSENIC, WELLS_DAE_EDUC, WELLS_DAE_SWITCHED
 export build_wells_dae_graph, demo
@@ -15,32 +15,13 @@ export WELLS_DAE_SOURCE, evaluate_wells_dae_source
 # verbatim, the SAME rows used for BridgeStan parity. RAW distances (metres) and
 # raw education (years) are stored — the /100 and /4 rescales are applied in-graph
 # as the Stan `transformed data` step. `switched` is the 0/1 outcome (Bool).
-const WELLS_DAE_DIST = [
-    16.826000213623, 47.3219985961914, 20.9669990539551, 21.4860000610352,
-    40.8740005493164, 69.5179977416992, 80.7109985351563, 55.1459999084473,
-    52.6469993591309, 75.0719985961914, 29.7740001678467, 34.5040016174316,
-    63.8040008544922, 73.6039962768555, 67.6549987792969, 80.6600036621094,
-    52.181999206543, 52.181999206543, 50.5340003967285, 31.4220008850098,
-    33.0089988708496, 37.8709983825684, 48.3730010986328, 47.3089981079102,
-    67.7850036621094, 81.1380004882813, 95.4599990844727, 114.417999267578,
-    157.628997802734, 151.919998168945, 107.69100189209, 105.667999267578,
-    105.625999450684, 107.69100189209, 107.69100189209, 125.317001342773,
-    107.69100189209, 107.69100189209, 107.69100189209, 107.69100189209,
-]
-const WELLS_DAE_ARSENIC = [
-    2.36, 0.71, 2.07, 1.15, 1.1, 3.9, 2.97, 3.24, 3.28, 2.52, 3.13, 3.04, 2.91,
-    3.21, 1.7, 1.8, 1.44, 1.43, 2.33, 2.83, 1.79, 2.54, 2.25, 2.42, 1.62, 2.34,
-    3.49, 2.13, 0.93, 3.36, 1.49, 0.83, 1.37, 2.8, 0.81, 1.48, 1.92, 2.74, 2.49,
-    3.95,
-]
-const WELLS_DAE_EDUC = Float64[
-    0, 0, 10, 12, 14, 9, 4, 10, 0, 0, 5, 0, 0, 0, 0, 7, 7, 7, 0, 10, 7, 0, 5, 0,
-    8, 8, 10, 16, 10, 10, 10, 10, 0, 0, 0, 3, 0, 10, 0, 0,
-]
-const WELLS_DAE_SWITCHED = Bool[
-    1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 0, 1, 1, 0,
-]
+# Real data (full) from posteriordb `wells_data-wells_dae_model`, loaded via PosteriorDB.jl.
+let d = _posteriordb_data("wells_data-wells_dae_model")
+    global const WELLS_DAE_DIST = Float64.(d["dist"])
+    global const WELLS_DAE_ARSENIC = Float64.(d["arsenic"])
+    global const WELLS_DAE_EDUC = Float64.(d["educ"])
+    global const WELLS_DAE_SWITCHED = Bool.(d["switched"])
+end
 
 const WELLS_DAE_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: bernoulli
@@ -53,13 +34,11 @@ using LogExpFunctions: logistic
               switched::Vector{Bool}) = begin
     # q = (α, β₁, β₂, β₃). The Stan parameters (`real alpha`, `vector[3] beta`)
     # are all unconstrained, so the transform is the identity and the log
-    # Jacobian is zero. One-element reductions extract the packed scalars without
-    # scalar indexing, so the same prepared kernel stays traceable as a Reactant
-    # tensor program.
-    alpha::Float64 = sum(view(unconstrained, 1:1))
-    beta1::Float64 = sum(view(unconstrained, 2:2))
-    beta2::Float64 = sum(view(unconstrained, 3:3))
-    beta3::Float64 = sum(view(unconstrained, 4:4))
+    # Jacobian is zero.
+    alpha::Float64 = unconstrained[1]
+    beta1::Float64 = unconstrained[2]
+    beta2::Float64 = unconstrained[3]
+    beta3::Float64 = unconstrained[4]
 
     # Two producers for the same `parameters` port and inverse edges exposing its
     # components — the HAVE-authority pattern. The identity transform makes the
@@ -85,19 +64,16 @@ using LogExpFunctions: logistic
     end
 
     # Transformed parameter: the logit-scale linear predictor
-    # ηᵢ = α + β₁·(distᵢ/100) + β₂·arsenicᵢ + β₃·(educᵢ/4). This is Stan's
-    # `bernoulli_logit_glm(x, alpha, beta)` with x = [dist100, arsenic, educ4].
-    # The rescales are recomputed inline (not read from dist100/educ4) so the
-    # query stays fusable.
-    eta = plate(dist, arsenic, educ, alpha, beta1, beta2, beta3) do d, ar, e, a, b1, b2, b3
-        a + b1 * (d / 100.0) + b2 * ar + b3 * (e / 4.0)
+    # ηᵢ = α + β₁·dist100ᵢ + β₂·arsenicᵢ + β₃·educ4ᵢ, consuming the named
+    # transformed-data nodes `dist100`/`educ4`; named once.
+    eta = plate(dist100, arsenic, educ4, alpha, beta1, beta2, beta3) do d100, ar, e4, a, b1, b2, b3
+        a + b1 * d100 + b2 * ar + b3 * e4
     end
 
-    # Likelihood: switchedᵢ ~ Bernoulli_logit(ηᵢ). The linear predictor is
-    # recomputed inline (buffer-free fused total); the Bernoulli endpoint takes
-    # the success probability, so the logit link is `logistic(·)` applied inline.
-    pointwise = plate(switched, dist, arsenic, educ, alpha, beta1, beta2, beta3) do s, d, ar, e, a, b1, b2, b3
-        bernoulli(logistic(a + b1 * (d / 100.0) + b2 * ar + b3 * (e / 4.0))).logpdf(s)
+    # Likelihood: switchedᵢ ~ Bernoulli_logit(ηᵢ). Consumes the named `eta` once
+    # via the natural logit HAVE route (single-consumer plate-chain, fused).
+    pointwise = plate(switched, eta) do s, e
+        bernoulli(; logit = e).logpdf(s)
     end
     likelihood::Float64 = sum(pointwise)
 
@@ -122,16 +98,17 @@ switched = WELLS_DAE_SWITCHED
 requested_nodes = (:parameters, :log_prior, :likelihood, :posterior)
 density_kernel = prepare(model;
     have = (:unconstrained, :dist, :arsenic, :educ, :switched),
-    want = requested_nodes)
+    want = requested_nodes,
+    bound = (; dist, arsenic, educ, switched))
 
-output = density_kernel(q, dist, arsenic, educ, switched)
+output = density_kernel(q)
 parameters, log_prior, likelihood, posterior = output
 @assert posterior ≈ log_prior + likelihood
 
 docs_example = (;
     name = :wells_dae_posterior,
     origin = "posteriordb wells_dae_model — Bernoulli-logit GLM (switched ~ dist100 + arsenic + educ4)",
-    inputs = (; q, dist, arsenic, educ, switched),
+    inputs = (; q),
     model,
     kernel = density_kernel,
     output,

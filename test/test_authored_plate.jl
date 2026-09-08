@@ -1,6 +1,97 @@
 using ReactiveKernels
 using Test
 
+isdefined(@__MODULE__, :AuthoredPlateChains) ||
+    include("fixtures/authored_plate_chains.jl")
+
+@testset "Demand-driven authored plate chains" begin
+    C = AuthoredPlateChains
+    q = [0.7]
+    x = collect(range(-1.0, 1.0; length = 4096))
+    y = fill(0.3, length(x))
+    p = plan(C.chain)
+    recipes = copy(p.recipes)
+    kernel = prepare(p)
+    reference = prepare(C.flat)
+    @test kernel(q, x, y) == reference(q, x, y)
+    @test kernel.plan === p
+    @test p.recipes == recipes
+    @test count(r -> r.op isa ReactiveKernels._AuthoredPlateOp, p.recipes) == 2
+    @test !occursin("similar", string(code_expr(kernel)))
+    shown_cell = ReactiveKernels._readable_recipe_call(
+        last(kernel.lowered_recipes), Any[0.2, 0.7])
+    @test Core.eval(@__MODULE__, shown_cell) == -0.5 * (0.2 - 0.7)^2
+    C.allocated(kernel, q, x, y)
+    @test C.allocated(kernel, q, x, y) == 0
+    @test kernel(q, Float64[], Float64[]) == 0.0
+    @test_throws DimensionMismatch kernel(q, x, y[1:2])
+
+    mu = x .* only(q)
+    pw = -0.5 .* (mu .- y).^2
+    @test prepare(C.chain; want = :mu)(q, x, y) == mu
+    @test prepare(C.chain; want = :pointwise)(q, x, y) == pw
+    both = prepare(C.chain; want = (:mu, :pointwise, :total))
+    @test both(q, x, y) == (mu, pw, kernel(q, x, y))
+    shared = prepare(C.chain; want = (:total, :extra))
+    @test first(shared(q, x, y)) == kernel(q, x, y)
+    @test last(shared(q, x, y)) ≈ sum(mu) atol = 1e-10
+    @test occursin("similar", string(code_expr(shared)))
+    cut = prepare(C.chain; have = (:mu, :y), want = :total)
+    @test cut(mu, y) == kernel(q, x, y)
+    bound = prepare(C.chain; bound = (; x, y))
+    @test bound(q) == kernel(q, x, y)
+    @test !occursin("similar", string(code_expr(bound)))
+
+    multi = prepare(C.multidimensional)
+    a = reshape([1.0, 2.0, 3.0], 3, 1)
+    b = reshape([0.5, 1.0], 1, 2)
+    observations = fill(0.2, 3, 2)
+    scales = reshape([2.0, 3.0], 1, 2)
+    @test multi(a, b, observations, scales) ≈
+        sum(((a .+ b) .- observations) .* log.(scales))
+    # A later vector must not make a scalar-only producer a valid plate.
+    @test_throws ArgumentError multi(1.0, 2.0, y, 2.0)
+    @test_throws DimensionMismatch multi(ones(2), ones(3), y, 2.0)
+    @test multi(zeros(0, 1), ones(1, 2), zeros(0, 2), 2.0) == 0.0
+    repeated = prepare(C.repeated)
+    @test repeated(x, 2.0) ≈ sum(4 .* x) atol = 1e-10
+    @test !occursin("similar", string(code_expr(repeated)))
+    atomic = prepare(C.atomic)
+    @test atomic(x, y) ≈ sum(y .+ sum(abs2, x))
+    @test occursin("similar", string(code_expr(atomic)))
+    unused = prepare(C.unused_axis)
+    @test unused(x, y) ≈ sum(1 .+ y)
+    @test_throws ArgumentError unused(1.0, y)
+    @test_throws DimensionMismatch unused(ones(2), y)
+end
+
+@testset "authored plate chain: bound data with only Ref-atomic array HAVE" begin
+    C = AuthoredPlateChains
+    q = [0.7, -0.3]
+    x = collect(range(-1.0, 1.0; length = 8))
+    y = fill(0.3, length(x))
+    middle = 2 .* x .+ q[1]
+    pointwise = y .+ middle .^ 2 .+ q[2] .* middle
+    ref = sum(pointwise)
+
+    unbound = prepare(C.ref_atomic_chain)
+    @test unbound(q, x, y) ≈ ref
+
+    # Binding the raw-data axis arrays must NOT remove the runtime backend
+    # marker: `q` is still an active array HAVE even though it is captured
+    # atomically, so `prepare(...; bound = (; x, y))` must succeed (it used to
+    # throw "an embedded plate requires an array-valued HAVE port").
+    bound = prepare(C.ref_atomic_chain; bound = (; x, y))
+    @test bound(q) ≈ ref
+    @test bound(q) == unbound(q, x, y)
+    @test bound.f isa ReactiveKernels._ArrayFunctionPair
+
+    # A demanded intermediate keeps its materialization boundary and stays
+    # bound/unbound consistent.
+    bound_mid = prepare(C.ref_atomic_chain; want = :middle, bound = (; x, y))
+    @test bound_mid(q) == middle
+end
+
 @kernel authored_standard_normal() = begin
     logpdf(z::Float64)::Float64 = -0.5 * log(2π) - 0.5 * z^2
 end
@@ -284,6 +375,11 @@ end
         pointwise = prepare(extract(spec; have = (:x,), want = :terms))
         @test total(values) == sum(expected)
         @test pointwise(values) == expected
+        # A materialized cell must produce a concrete container, never a boxed
+        # `Vector{Any}` — an untyped cell (metadata result type `Any`) is
+        # narrowed to its element type so the node stays promotable at the
+        # Reactant host-operand boundary (snag untyped-plate-ce).
+        @test pointwise(values) isa Vector{Float64}
     end
 end
 
@@ -817,4 +913,162 @@ _authored_plate_log_recipe_count(cell) =
         end
         return sum(pointwise)
     end
+end
+
+@testset "authored plate marker: untyped scalar leading arg (want=:pointwise)" begin
+    # Regression guard (source-review catch by ReactiveKernels:performance): the
+    # static axis-marker fast path must NOT select an untyped (metadata-`Any`)
+    # leading argument that holds a runtime SCALAR. `want=:pointwise` materializes
+    # `_plate_similar_output(marker, ...)`, so a wrong marker builds the pointwise buffer from a
+    # scalar (or errors). Here `plate(x, location, scale)` is called with a scalar
+    # `x` and a vector `location`; `_authored_plate_is_axis` skips `x` and selects
+    # `location`, so the static classifier — for which an `Any` port is
+    # `:ambiguous` — must fall back to the runtime marker and reach the same axis.
+    # This is the correctness companion to the `test_ad.jl` Enzyme regression: the
+    # M0-shaped case proves the fast path lowers, this proves it never fires when
+    # it cannot prove the axis.
+    pointwise = prepare(extract(untyped_authored_normal_loglik; want = :pointwise))
+    x = 0.25
+    location = [0.1, 0.2, 0.4, 0.5]
+    scale = 0.8
+    result = pointwise(x, location, scale)
+    reference = [-0.5 * log(2π) - 0.5 * ((x - location[i]) / scale)^2 - log(scale)
+                 for i in eachindex(location)]
+    @test result isa AbstractVector
+    @test length(result) == length(location)
+    @test result ≈ reference
+end
+
+module TupleAxisNative
+using ReactiveKernels
+
+@kernel broadcast_axes(q::Vector{Float64}, x, y) = begin
+    pointwise = plate(x, Ref(q), y) do xi, whole, yi
+        xi + sum(whole) * yi
+    end
+    total::Float64 = sum(pointwise)
+    return total
+end
+
+# A plate whose ONLY batched axis is a tuple (no array co-operand).
+@kernel tuple_only(q::Vector{Float64}, x) = begin
+    pointwise = plate(x, Ref(q)) do xi, whole
+        xi + sum(whole)
+    end
+    total::Float64 = sum(pointwise)
+    return total
+end
+end
+
+@testset "authored plate native: tuple / singleton axis pointwise output" begin
+    # Regression (todo `native-tuple-axi`, reporter ReactiveKernels:performance):
+    # a `Tuple` is admitted as a batched axis — `_static_plate_axis_class(
+    # ::Type{<:Tuple}) === :axis` and `_authored_plate_is_axis(::Tuple)` accept it —
+    # so the static marker binds to a tuple argument. The pointwise buffer was then
+    # allocated with a bare `similar(marker, T, axes)`, which has NO method for a
+    # `Tuple` marker: the Reactant path materialized the tuple case
+    # (test_ref_array_plate_reactant.jl "broadcast axes and shared rank …") but the
+    # NATIVE `k(q)` crashed with
+    # `similar(::Tuple{Float64}, ::Type{Float64}, ::Tuple{Base.OneTo{Int}})`.
+    # `_plate_similar_output` allocates a plain `Array` for a tuple marker, matching
+    # Julia's broadcast container rule (`x .+ sum(q) .* y` is a `Vector`).
+    q = [0.7, -0.3]
+
+    # A tuple axis beside a Vector axis, both `want`s.
+    for (x, y) in (((1.0,), collect(1.0:32)),        # singleton tuple, real broadcast
+                   ((1.0, 2.0, 3.0), fill(0.5, 3)))  # multi-element tuple
+        k = prepare(TupleAxisNative.broadcast_axes; want = :pointwise, bound = (; x, y))
+        result = k(q)
+        reference = x .+ sum(q) .* y
+        @test result isa Vector{Float64}
+        @test size(result) == size(reference)
+        @test result ≈ reference
+        # The total path (no pointwise buffer) already worked; keep it in parity.
+        ktot = prepare(TupleAxisNative.broadcast_axes; want = :total, bound = (; x, y))
+        @test ktot(q) ≈ sum(reference)
+    end
+
+    # A plate whose SOLE axis is a tuple. `_plate_similar`'s style-combine cannot
+    # cover this — a lone `Style{Tuple}` materializes a tuple, not an array — so it
+    # exercises the `_plate_similar_output(::Tuple, …)` marker dispatch directly.
+    x = (1.0, 2.0, 3.0, 4.0)
+    k = prepare(TupleAxisNative.tuple_only; want = :pointwise, bound = (; x))
+    result = k(q)
+    reference = collect(x) .+ sum(q)
+    @test result isa Vector{Float64}
+    @test result ≈ reference
+end
+
+@testset "authored plate chain: redundant axis-check elision + preserved domain guards" begin
+    # snag composed-authore: a fused authored plate chain absorbed one axis-check
+    # group per sub-plate, so it emitted redundant pre-loop
+    # `_plate_require_axes(combine_axes(...))` calls an equivalent single plate
+    # never has (the only codegen difference; reported to slow the primal under
+    # concurrent load, but NOT reproducible under controlled conditions —
+    # structural cleanup, not a proven speedup). These lock BOTH halves of it:
+    # the redundant checks are ELIDED over typed/bound array ports, and the
+    # axis-domain guards are PRESERVED (an axis-less producer sub-plate must still
+    # be rejected, never silently borrow a sibling's axis).
+
+    # POSITIVE — check elision + value: a typed fused chain lowers to the SAME
+    # number of axis checks as the equivalent single plate, and the same value.
+    @kernel _ce_chain(q::Vector{Float64}, x::Vector{Float64}, y::Vector{Float64}) = begin
+        location::Float64 = q[1]
+        slope::Float64 = q[2]
+        middle = plate(x, location) do xi, loc
+            2.0 * xi + loc
+        end
+        pointwise = plate(y, middle, slope) do yi, mi, sl
+            yi + mi^2 + sl * mi
+        end
+        total::Float64 = sum(pointwise)
+    end
+    @kernel _ce_oneplate(q::Vector{Float64}, x::Vector{Float64}, y::Vector{Float64}) = begin
+        location::Float64 = q[1]
+        slope::Float64 = q[2]
+        pointwise = plate(x, y, location, slope) do xi, yi, loc, sl
+            mi = 2.0 * xi + loc
+            yi + mi^2 + sl * mi
+        end
+        total::Float64 = sum(pointwise)
+    end
+    q = [0.3, -0.4]
+    x = collect(range(-1.0, 1.0; length = 16))
+    y = collect(range(0.25, -0.25; length = 16))
+    ch = prepare(_ce_chain; have = (:q, :x, :y), want = :total, bound = (; x, y))
+    op = prepare(_ce_oneplate; have = (:q, :x, :y), want = :total, bound = (; x, y))
+    @test ch(q) ≈ op(q)
+    axis_checks(k) = count("_plate_require_axes", string(code_expr(k)))
+    @test axis_checks(ch) == axis_checks(op)   # redundant per-sub-plate checks elided
+    @test axis_checks(ch) == 1
+
+    # NEGATIVE — an axis-less producer sub-plate in a fused chain must STILL be
+    # rejected (it has no batched axis of its own). The reviewed regression let an
+    # EMPTY-filtered axis-check group be skipped, so the producer silently borrowed
+    # the consumer's axis and returned a wrong value instead of throwing. These
+    # match the pre-fusion / single-plate rejection (a zero-operand
+    # `combine_axes()` — currently a `MethodError`).
+    @kernel _ce_scalar_producer(s::Float64, y::Vector{Float64}) = begin
+        producer = plate(s) do si
+            si * 2.0
+        end
+        pointwise = plate(y, producer) do yi, pj
+            yi + pj
+        end
+        total::Float64 = sum(pointwise)
+    end
+    ksp = prepare(_ce_scalar_producer)
+    @test_throws MethodError ksp(2.0, y)
+
+    @kernel _ce_ref_producer(a::Float64, y::Vector{Float64}) = begin
+        producer = plate(Ref(a)) do ra
+            ra * 2.0
+        end
+        pointwise = plate(y, producer) do yi, pj
+            yi + pj
+        end
+        total::Float64 = sum(pointwise)
+    end
+    krp = prepare(_ce_ref_producer)
+    @test_throws MethodError krp(2.0, y)
 end

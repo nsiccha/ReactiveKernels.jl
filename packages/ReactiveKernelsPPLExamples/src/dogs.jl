@@ -74,12 +74,10 @@ using LogExpFunctions: logistic
               y::Vector{Bool}) = begin
     # q = (β₁, β₂, β₃). The Stan parameter `vector[3] beta` is declared WITHOUT
     # bounds, so the unconstrained sampler space is the parameter itself
-    # (identity transform, log Jacobian zero). One-element reductions extract the
-    # packed scalars without scalar indexing, so the same prepared kernel stays
-    # traceable as a Reactant tensor program.
-    beta1::Float64 = sum(view(unconstrained, 1:1))
-    beta2::Float64 = sum(view(unconstrained, 2:2))
-    beta3::Float64 = sum(view(unconstrained, 3:3))
+    # (identity transform, log Jacobian zero).
+    beta1::Float64 = unconstrained[1]
+    beta2::Float64 = unconstrained[2]
+    beta3::Float64 = unconstrained[3]
     log_jacobian::Float64 = 0.0
 
     parameters = (; beta1, beta2, beta3)
