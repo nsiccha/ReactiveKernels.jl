@@ -70,5 +70,22 @@ end
     return total
 end
 
+# A chain whose parameter vector `q` reaches BOTH plates only through an atomic
+# `Ref(q)` whole-vector capture (indexed `q[1]`/`q[2]` inside the cell), mixed
+# with an ordinary elementwise use of the axis operand. When `x`/`y` are bound,
+# `q` is the only live HAVE yet is atomic-for-broadcast — the shape that used to
+# make `prepare(...; bound = (; x, y))` throw "an embedded plate requires an
+# array-valued HAVE port in the outer kernel".
+@kernel ref_atomic_chain(q::Vector{Float64}, x::Vector{Float64}, y::Vector{Float64}) = begin
+    middle = plate(x, Ref(q)) do xi, qq
+        2 * xi + qq[1]
+    end
+    pointwise = plate(y, middle, Ref(q)) do yi, mi, qq
+        yi + mi^2 + qq[2] * mi
+    end
+    total::Float64 = sum(pointwise)
+    return total
+end
+
 allocated(kernel::K, args::Vararg{Any,N}) where {K,N} = @allocated kernel(args...)
 end

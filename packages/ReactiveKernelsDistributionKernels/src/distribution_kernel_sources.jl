@@ -177,6 +177,30 @@ const CAUCHY_LOGDENSITY = extract(cauchy;
 const LAPLACE_LOGDENSITY = extract(laplace;
     have = (:x, :location, :scale), want = :logpdf)
 
+# `p` and `logit` are the two equivalent success-probability HAVE routes.
+# `logpdf` carries a route per HAVE: the planner picks whichever is directly
+# reachable (each is a self-contained fused recipe at cost 1.0, so the native
+# route always beats the cross route, which must first derive the other
+# parameter at cost 2.0 — verified with `explain(plan(...))`).
+#
+#   - logit HAVE (logistic models): `-log1pexp(ifelse(observed, -logit, logit))`
+#     is the stable log-sum-exp form, exact for saturating logits. Selecting the
+#     SIGN before the single `log1pexp` differentiates only the selected term.
+#     `logp = -log1pexp(-logit)` / `log1mp = -log1pexp(logit)` remain as their
+#     own extractable public object ports; the endpoint inlines the equivalent
+#     sign-selected form so they stay off the `logpdf` recipe (keeping the p HAVE
+#     route selectable) while a consumer can still WANT `logp`/`log1mp` directly.
+#   - p HAVE (direct-probability models, e.g. dogs_hierarchical's
+#     `a^prev_shock · b^prev_avoid`): compute the log-probability DIRECTLY from
+#     `p`, never forming `logit`. `logit = log(p) - log1p(-p)` has an unbounded
+#     derivative at `p ∈ {0, 1}`, so routing a p HAVE through it makes the
+#     reverse gradient `0 · ±Inf = NaN` at an exact boundary even though the
+#     primal is finite (e.g. p = 1, observed = true has logpdf log(1) = 0).
+#     The inner `ifelse` guards keep the UNSELECTED complement's log argument
+#     off the singularity (log(1)/log1p(0) = 0, finite derivative, killed by
+#     its 0 cotangent), so only the selected, genuinely-finite branch carries a
+#     gradient. Exact impossible events (p = 1 & observed = false, p = 0 &
+#     observed = true) still return -Inf.
 const BERNOULLI_KERNEL_SOURCE = raw"""
 using LogExpFunctions: log1pexp
 
@@ -186,7 +210,12 @@ using LogExpFunctions: log1pexp
     logp::Float64 = -log1pexp(-logit)
     log1mp::Float64 = -log1pexp(logit)
 
-    logpdf(observed::Bool)::Float64 = ifelse(observed, logp, log1mp)
+    logpdf(observed::Bool)::Float64 = begin
+        lp::Float64 = -log1pexp(ifelse(observed, -logit, logit))
+        lp::Float64 = ifelse(observed, log(ifelse(observed, p, 1.0)),
+                                        log1p(-ifelse(observed, 0.0, p)))
+        lp
+    end
     cdf(observed::Bool)::Float64 = ifelse(observed, 1.0, 1 - p)
     quantile(q::Float64)::Bool = q > 1 - p
 end

@@ -73,6 +73,24 @@ end
 @inline _authored_plate_is_axis(x::Base.Broadcast.Broadcasted) =
     !isempty(axes(x))
 
+# Compile-time counterpart of `_authored_plate_is_axis`, over a port's declared
+# value TYPE. The native plate lowering uses it to bind the axis marker to a
+# specific argument statically instead of via a runtime `findfirst` (which
+# defeats reverse-mode Enzyme's static-activity analysis — see
+# `_lower_authored_plate_native!`). It is deliberately CONSERVATIVE: it returns
+# `:axis` / `:not_axis` only when the type PROVES what `_authored_plate_is_axis`
+# would decide at runtime for every value of that type, and `:ambiguous`
+# otherwise. A metadata-`Any` port (which may hold a runtime scalar), an abstract
+# array type, a `Broadcasted`, or a non-axis struct is `:ambiguous`, so the caller
+# keeps the runtime marker for it. A rank-0 array has empty axes, so — like a
+# scalar — it is `:not_axis`.
+@inline _static_plate_axis_class(::Type) = :ambiguous
+@inline _static_plate_axis_class(::Type{<:Number}) = :not_axis
+@inline _static_plate_axis_class(::Type{<:AbstractArray{<:Any,0}}) = :not_axis
+@inline _static_plate_axis_class(::Type{<:AbstractArray{<:Any,N}}) where {N} =
+    :axis
+@inline _static_plate_axis_class(::Type{<:Tuple}) = :axis
+
 @inline _authored_plate_argument(::Val{A}, index, arg) where {A} =
     index in A ? Ref(arg) : arg
 
@@ -140,9 +158,19 @@ end
 # and total accumulator UP FRONT — no boxed `Vector{Any}` is ever built and the
 # accumulator seed matches the summed cells (`_narrow_plate_output` above is a
 # post-hoc narrowing that still allocates the boxed container first and leaves the
-# accumulator untyped). A genuinely uninferrable body falls back to the
-# plan-level output valtype (`Any`), where `_narrow_plate_output` still recovers a
-# homogeneous element type at runtime.
+# accumulator untyped).
+#
+# When `promote_op` cannot pin a CONCRETE type — a genuinely uninferrable body,
+# but also a STATIC call over an UNTYPED batched port, whose projected element
+# type is `Any` (`_plate_cache_slot`/`_plate_result_type` call this with the
+# plan-level HAVE types, where an unannotated port is `Any`) — fall back to the
+# scalar body kernel's DECLARED output valtype. For a typed body (`::Float64`)
+# that valtype is authoritative and concrete, so the nonallocating cache slot is
+# seeded `Array{Float64}` instead of a boxed `Array{Any}` that would re-box every
+# element through `broadcast!` on each call (the `want=:pointwise` regression:
+# 16 KB/call for a length-1000 untyped plate whose cells are Float64). A body
+# with no concrete declared type stays `Any`, where `_narrow_plate_output` still
+# recovers a homogeneous element type at runtime.
 function _authored_plate_result_eltype(op::_AuthoredPlateOp{K,A},
                                        argtypes) where {K,A}
     element_types = ntuple(length(argtypes)) do position
@@ -150,7 +178,10 @@ function _authored_plate_result_eltype(op::_AuthoredPlateOp{K,A},
         (position in A || argtype <: Number) ? argtype : eltype(argtype)
     end
     T = Base.promote_op(op.kernel, element_types...)
-    T === Union{} ? valtype(only(outputs(op.kernel))) : T
+    isconcretetype(T) && return T
+    declared = valtype(only(outputs(op.kernel)))
+    isconcretetype(declared) && return declared
+    T === Union{} ? declared : T
 end
 
 # A plate is a pure graph map/reduction. Once Julia has instantiated the
@@ -691,9 +722,37 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
     first_coordinate = gensym(:plate_first)
     atomic_val = Expr(:call, GlobalRef(Base, :Val), QuoteNode(atomic))
     if needs_marker
-        push!(body.args,
-            :($marker = $(GlobalRef(@__MODULE__, :_authored_plate_marker))(
-                $atomic_val, $(callargs...))))
+        # The marker supplies only the pointwise buffer's container type/shape and
+        # the `Any`-fallback element type — never a differentiated value. Emitting
+        # a runtime `_authored_plate_marker(Val(atomic), callargs...)` here (a
+        # `findfirst` over the whole argument tuple) makes the selected marker
+        # CONDITIONALLY active whenever a data-only `Vector{Int}` axis sits beside
+        # an active/`Constant` `Vector{Float64}` — the posteriordb M0/Mh/seeds
+        # shape — which reverse-mode Enzyme rejects with an
+        # `EnzymeRuntimeActivityError` under the standing static-activity config
+        # (no `set_runtime_activity`). So bind the marker to a SPECIFIC argument at
+        # lowering time — but only when the port value types PROVE it is the same
+        # axis the runtime `findfirst` would pick. Walk the non-atomic positions in
+        # authored order: skip provable non-axes (scalars, rank-0 arrays), take the
+        # first provable axis, and FALL BACK to the runtime marker the moment a
+        # preceding candidate is `:ambiguous` (a metadata-`Any` port that may hold a
+        # runtime scalar, an abstract array type, a non-axis struct) — because the
+        # runtime `_authored_plate_is_axis` could then skip it and select a later
+        # argument, and a static pick that is not provably the same axis would build
+        # the pointwise buffer from the wrong argument (e.g. a scalar `Any` port).
+        axis_position = nothing
+        for position in eachindex(callargs)
+            position in atomic && continue
+            class = _static_plate_axis_class(valtype(callvalues[position]))
+            class === :not_axis && continue
+            class === :axis && (axis_position = position)
+            break
+        end
+        marker_source = axis_position === nothing ?
+            :($(GlobalRef(@__MODULE__, :_authored_plate_marker))(
+                $atomic_val, $(callargs...))) :
+            callargs[axis_position]
+        push!(body.args, :($marker = $marker_source))
     end
 
     # Reuse Base's ordinary broadcast preparation one argument at a time. A
@@ -1374,9 +1433,12 @@ end
 # prefer the first runtime broadcast axis when choosing native vs. tensorized
 # execution.  The native call ignores the marker and may derive its plate axis
 # only after projecting an atomic boundary, so exhausting the candidates falls
-# back to a non-axis sentinel.  Atomic `Ref(port)` inputs are excluded when the
-# candidates are derived, so an array-valued atom cannot accidentally become
-# the batch marker.
+# back to a non-axis sentinel.  Atomic `Ref(port)` inputs are excluded from the
+# axis candidates, so an array-valued atom cannot be mistaken for the plate
+# axis; but when every axis operand is bound and no axis candidate remains,
+# `_embedded_marker_candidates` admits array-valued HAVE ports (atomic ones
+# included) as backend markers, since only the marker TYPE — never its axis —
+# selects native vs. tensorized execution there.
 struct _DynamicEmbeddedFunctionPair{I,N,T,A} <: _ArrayFunctionPair
     native::N
     tensorized::T
@@ -1599,6 +1661,21 @@ function _embedded_marker_candidates(p::Plan)
                 position = root_positions[root]
                 position in candidates || push!(candidates, position)
             end
+        end
+    end
+    if isempty(candidates)
+        # No non-atomic (axis-defining) plate operand traces back to an active
+        # HAVE port: every axis operand is bound (`bound=`), so the plate axis is
+        # a compile-time constant baked into both bodies (the native body derives
+        # its own axis; the tensorized body takes the marker-less axis fallback).
+        # Backend selection still needs a runtime marker, so admit any
+        # array-valued active HAVE port as one — including a whole-vector
+        # `Ref`-captured parameter that is atomic for broadcasting yet remains a
+        # live array HAVE. Only the marker TYPE is consulted (`_batched_call`
+        # dispatches native vs. tensorized on it), never its axis, so an atomic
+        # array admitted here cannot be mistaken for the plate axis.
+        for (position, input) in enumerate(p.have)
+            valtype(input) <: AbstractArray && push!(candidates, position)
         end
     end
     Tuple(candidates)
