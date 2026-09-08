@@ -1,6 +1,8 @@
 using DifferentiationInterface
 import Enzyme
 
+include("test_authored_plate_chains_ad.jl")
+
 const TEST_AD_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 
 _test_ad_value_gradient_allocated(prepared, gradient, q, data) =

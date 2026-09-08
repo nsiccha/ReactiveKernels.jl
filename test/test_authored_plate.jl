@@ -1,6 +1,70 @@
 using ReactiveKernels
 using Test
 
+isdefined(@__MODULE__, :AuthoredPlateChains) ||
+    include("fixtures/authored_plate_chains.jl")
+
+@testset "Demand-driven authored plate chains" begin
+    C = AuthoredPlateChains
+    q = [0.7]
+    x = collect(range(-1.0, 1.0; length = 4096))
+    y = fill(0.3, length(x))
+    p = plan(C.chain)
+    recipes = copy(p.recipes)
+    kernel = prepare(p)
+    reference = prepare(C.flat)
+    @test kernel(q, x, y) == reference(q, x, y)
+    @test kernel.plan === p
+    @test p.recipes == recipes
+    @test count(r -> r.op isa ReactiveKernels._AuthoredPlateOp, p.recipes) == 2
+    @test !occursin("similar", string(code_expr(kernel)))
+    shown_cell = ReactiveKernels._readable_recipe_call(
+        last(kernel.lowered_recipes), Any[0.2, 0.7])
+    @test Core.eval(@__MODULE__, shown_cell) == -0.5 * (0.2 - 0.7)^2
+    C.allocated(kernel, q, x, y)
+    @test C.allocated(kernel, q, x, y) == 0
+    @test kernel(q, Float64[], Float64[]) == 0.0
+    @test_throws DimensionMismatch kernel(q, x, y[1:2])
+
+    mu = x .* only(q)
+    pw = -0.5 .* (mu .- y).^2
+    @test prepare(C.chain; want = :mu)(q, x, y) == mu
+    @test prepare(C.chain; want = :pointwise)(q, x, y) == pw
+    both = prepare(C.chain; want = (:mu, :pointwise, :total))
+    @test both(q, x, y) == (mu, pw, kernel(q, x, y))
+    shared = prepare(C.chain; want = (:total, :extra))
+    @test first(shared(q, x, y)) == kernel(q, x, y)
+    @test last(shared(q, x, y)) ≈ sum(mu) atol = 1e-10
+    @test occursin("similar", string(code_expr(shared)))
+    cut = prepare(C.chain; have = (:mu, :y), want = :total)
+    @test cut(mu, y) == kernel(q, x, y)
+    bound = prepare(C.chain; bound = (; x, y))
+    @test bound(q) == kernel(q, x, y)
+    @test !occursin("similar", string(code_expr(bound)))
+
+    multi = prepare(C.multidimensional)
+    a = reshape([1.0, 2.0, 3.0], 3, 1)
+    b = reshape([0.5, 1.0], 1, 2)
+    observations = fill(0.2, 3, 2)
+    scales = reshape([2.0, 3.0], 1, 2)
+    @test multi(a, b, observations, scales) ≈
+        sum(((a .+ b) .- observations) .* log.(scales))
+    # A later vector must not make a scalar-only producer a valid plate.
+    @test_throws ArgumentError multi(1.0, 2.0, y, 2.0)
+    @test_throws DimensionMismatch multi(ones(2), ones(3), y, 2.0)
+    @test multi(zeros(0, 1), ones(1, 2), zeros(0, 2), 2.0) == 0.0
+    repeated = prepare(C.repeated)
+    @test repeated(x, 2.0) ≈ sum(4 .* x) atol = 1e-10
+    @test !occursin("similar", string(code_expr(repeated)))
+    atomic = prepare(C.atomic)
+    @test atomic(x, y) ≈ sum(y .+ sum(abs2, x))
+    @test occursin("similar", string(code_expr(atomic)))
+    unused = prepare(C.unused_axis)
+    @test unused(x, y) ≈ sum(1 .+ y)
+    @test_throws ArgumentError unused(1.0, y)
+    @test_throws DimensionMismatch unused(ones(2), y)
+end
+
 @kernel authored_standard_normal() = begin
     logpdf(z::Float64)::Float64 = -0.5 * log(2π) - 0.5 * z^2
 end
