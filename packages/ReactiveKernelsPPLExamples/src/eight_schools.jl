@@ -145,13 +145,13 @@ docs_example = (;
 )
 """
 
-function evaluate_eight_schools_source()
+function evaluate_eight_schools_source(; model_only::Bool = false)
     # Bind only the data. The authored source imports the reusable distribution
     # objects itself and contains the complete PPL assembly with no helper
     # evaluator or separately prepared density/plate path.
     _evaluate_ppl_source(EIGHT_SCHOOLS_SOURCE, @__MODULE__; bindings = (
         :EIGHT_SCHOOLS_Y, :EIGHT_SCHOOLS_SIGMA,
-    ))
+    ), model_only)
 end
 
 # Evaluate the authored source from `__init__`, after package precompilation has
@@ -161,7 +161,7 @@ end
 const _EIGHT_SCHOOLS_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _EIGHT_SCHOOLS_GRAPH_TEMPLATE[] = evaluate_eight_schools_source().model
+    _EIGHT_SCHOOLS_GRAPH_TEMPLATE[] = evaluate_eight_schools_source(; model_only = true).model
     nothing
 end
 

@@ -137,18 +137,18 @@ docs_example = (;
 )
 """
 
-function evaluate_seeds_stanified_model_source()
+function evaluate_seeds_stanified_model_source(; model_only::Bool = false)
     _evaluate_ppl_source(SEEDS_STANIFIED_MODEL_SOURCE, @__MODULE__; bindings = (
         :SEEDS_STANIFIED_COUNTS, :SEEDS_STANIFIED_TOTALS,
         :SEEDS_STANIFIED_X1, :SEEDS_STANIFIED_X2,
-    ))
+    ), model_only)
 end
 
 const _SEEDS_STANIFIED_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
     _SEEDS_STANIFIED_GRAPH_TEMPLATE[] =
-        evaluate_seeds_stanified_model_source().model
+        evaluate_seeds_stanified_model_source(; model_only = true).model
     nothing
 end
 

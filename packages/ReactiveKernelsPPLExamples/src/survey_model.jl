@@ -124,16 +124,16 @@ docs_example = (;
 )
 """
 
-function evaluate_survey_model_source()
+function evaluate_survey_model_source(; model_only::Bool = false)
     _evaluate_ppl_source(SURVEY_MODEL_SOURCE, @__MODULE__; bindings = (
         :SURVEY_NS, :SURVEY_LC, :SURVEY_SK, :SURVEY_M, :SURVEY_LOG1NMAX,
-    ))
+    ), model_only)
 end
 
 const _SURVEY_MODEL_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _SURVEY_MODEL_GRAPH_TEMPLATE[] = evaluate_survey_model_source().model
+    _SURVEY_MODEL_GRAPH_TEMPLATE[] = evaluate_survey_model_source(; model_only = true).model
     nothing
 end
 

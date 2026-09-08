@@ -179,16 +179,16 @@ docs_example = (;
 )
 """
 
-function evaluate_sum_to_zero_source()
+function evaluate_sum_to_zero_source(; model_only::Bool = false)
     _evaluate_ppl_source(SUM_TO_ZERO_SOURCE, @__MODULE__; bindings = (
         :EIGHT_SCHOOLS_Y, :EIGHT_SCHOOLS_SIGMA,
-    ))
+    ), model_only)
 end
 
 const _SUM_TO_ZERO_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _SUM_TO_ZERO_GRAPH_TEMPLATE[] = evaluate_sum_to_zero_source().model
+    _SUM_TO_ZERO_GRAPH_TEMPLATE[] = evaluate_sum_to_zero_source(; model_only = true).model
     nothing
 end
 

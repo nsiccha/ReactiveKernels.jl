@@ -115,17 +115,17 @@ docs_example = (;
 )
 """
 
-function evaluate_kidscore_momhsiq_source()
+function evaluate_kidscore_momhsiq_source(; model_only::Bool = false)
     _evaluate_ppl_source(KIDSCORE_MOMHSIQ_SOURCE, @__MODULE__; bindings = (
         :MOMHSIQ_KID_SCORE, :MOMHSIQ_MOM_HS, :MOMHSIQ_MOM_IQ,
         :MOMHSIQ_MOM_HS_NEW, :MOMHSIQ_MOM_IQ_NEW,
-    ))
+    ), model_only)
 end
 
 const _KIDSCORE_MOMHSIQ_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _KIDSCORE_MOMHSIQ_GRAPH_TEMPLATE[] = evaluate_kidscore_momhsiq_source().model
+    _KIDSCORE_MOMHSIQ_GRAPH_TEMPLATE[] = evaluate_kidscore_momhsiq_source(; model_only = true).model
     nothing
 end
 

@@ -101,14 +101,14 @@ docs_example = (;
 )
 """
 
-function evaluate_blr_source()
-    _evaluate_ppl_source(BLR_SOURCE, @__MODULE__; bindings = (:BLR_X, :BLR_Y))
+function evaluate_blr_source(; model_only::Bool = false)
+    _evaluate_ppl_source(BLR_SOURCE, @__MODULE__; bindings = (:BLR_X, :BLR_Y), model_only)
 end
 
 const _BLR_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _BLR_GRAPH_TEMPLATE[] = evaluate_blr_source().model
+    _BLR_GRAPH_TEMPLATE[] = evaluate_blr_source(; model_only = true).model
     nothing
 end
 

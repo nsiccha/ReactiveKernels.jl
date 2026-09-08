@@ -156,16 +156,16 @@ docs_example = (;
 )
 """
 
-function evaluate_radon_variable_slope_centered_source()
+function evaluate_radon_variable_slope_centered_source(; model_only::Bool = false)
     _evaluate_ppl_source(RADON_VARIABLE_SLOPE_CENTERED_SOURCE, @__MODULE__;
-        bindings = (:RADON_VSC_COUNTY, :RADON_VSC_FLOOR, :RADON_VSC_LOG))
+        bindings = (:RADON_VSC_COUNTY, :RADON_VSC_FLOOR, :RADON_VSC_LOG), model_only)
 end
 
 const _RADON_VSC_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
     _RADON_VSC_GRAPH_TEMPLATE[] =
-        evaluate_radon_variable_slope_centered_source().model
+        evaluate_radon_variable_slope_centered_source(; model_only = true).model
     nothing
 end
 

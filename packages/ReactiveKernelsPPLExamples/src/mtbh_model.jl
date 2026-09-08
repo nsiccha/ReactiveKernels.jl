@@ -169,16 +169,16 @@ docs_example = (;
 )
 """
 
-function evaluate_mtbh_model_source()
+function evaluate_mtbh_model_source(; model_only::Bool = false)
     _evaluate_ppl_source(MTBH_SOURCE, @__MODULE__; bindings = (
         :MTBH_Y, :MTBH_YPREV, :MTBH_S, :MTBH_T, :MTBH_M,
-    ))
+    ), model_only)
 end
 
 const _MTBH_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _MTBH_GRAPH_TEMPLATE[] = evaluate_mtbh_model_source().model
+    _MTBH_GRAPH_TEMPLATE[] = evaluate_mtbh_model_source(; model_only = true).model
     nothing
 end
 

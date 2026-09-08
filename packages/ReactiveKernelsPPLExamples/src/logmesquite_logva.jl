@@ -149,16 +149,16 @@ docs_example = (;
 )
 """
 
-function evaluate_logmesquite_logva_source()
+function evaluate_logmesquite_logva_source(; model_only::Bool = false)
     _evaluate_ppl_source(LOGMESQUITE_LOGVA_SOURCE, @__MODULE__; bindings = (
         :LOGVA_LOG_WEIGHT, :LOGVA_DIAM1, :LOGVA_DIAM2, :LOGVA_CANOPY_HEIGHT, :LOGVA_GROUP,
-    ))
+    ), model_only)
 end
 
 const _LOGMESQUITE_LOGVA_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _LOGMESQUITE_LOGVA_GRAPH_TEMPLATE[] = evaluate_logmesquite_logva_source().model
+    _LOGMESQUITE_LOGVA_GRAPH_TEMPLATE[] = evaluate_logmesquite_logva_source(; model_only = true).model
     nothing
 end
 

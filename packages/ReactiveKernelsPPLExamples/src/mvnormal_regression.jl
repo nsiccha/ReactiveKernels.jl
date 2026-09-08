@@ -99,21 +99,21 @@ docs_example = (;
 )
 """
 
-function evaluate_mvnormal_regression_source()
+function evaluate_mvnormal_regression_source(; model_only::Bool = false)
     # Bind only the data referenced by the displayed source (the covariance-path
     # query). The Cholesky/precision factorizations are exercised as alternate
     # HAVE parametrizations by the tests, not by the executed docs cut. The
     # authored source imports the reusable Normal and MvNormal objects itself.
     _evaluate_ppl_source(MVNORMAL_REGRESSION_SOURCE, @__MODULE__; bindings = (
         :MVREG_X, :MVREG_Y, :MVREG_COVARIANCE,
-    ))
+    ), model_only)
 end
 
 const _MVNORMAL_REGRESSION_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
     _MVNORMAL_REGRESSION_GRAPH_TEMPLATE[] =
-        evaluate_mvnormal_regression_source().model
+        evaluate_mvnormal_regression_source(; model_only = true).model
     nothing
 end
 

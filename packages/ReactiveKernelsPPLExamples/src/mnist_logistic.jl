@@ -122,13 +122,13 @@ docs_example = (;
 )
 """
 
-function evaluate_mnist_logistic_source()
+function evaluate_mnist_logistic_source(; model_only::Bool = false)
     # Bind only the data. The authored source imports the reusable `normal` and
     # `categorical_logit` distribution objects itself; the density is entirely
     # composed from those objects and RK plate/array primitives.
     _evaluate_ppl_source(MNIST_LOGISTIC_SOURCE, @__MODULE__; bindings = (
         :MNIST_LOGISTIC_X, :MNIST_LOGISTIC_Y, :NUM_CLASSES,
-    ))
+    ), model_only)
 end
 
 # Evaluate the authored source from `__init__`, after precompilation has closed
@@ -138,9 +138,9 @@ end
 const _MNIST_LOGISTIC_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _MNIST_LOGISTIC_GRAPH_TEMPLATE[] = evaluate_mnist_logistic_source().model
+    _MNIST_LOGISTIC_GRAPH_TEMPLATE[] = evaluate_mnist_logistic_source(; model_only = true).model
     _MNIST_LOGISTIC_OPTIMIZED_GRAPH_TEMPLATE[] =
-        evaluate_mnist_logistic_optimized_source().model
+        evaluate_mnist_logistic_optimized_source(; model_only = true).model
     nothing
 end
 
@@ -246,10 +246,10 @@ docs_example = (;
 )
 """
 
-function evaluate_mnist_logistic_optimized_source()
+function evaluate_mnist_logistic_optimized_source(; model_only::Bool = false)
     _evaluate_ppl_source(MNIST_LOGISTIC_OPTIMIZED_SOURCE, @__MODULE__; bindings = (
         :MNIST_LOGISTIC_X, :MNIST_LOGISTIC_Y, :NUM_CLASSES,
-    ))
+    ), model_only)
 end
 
 const _MNIST_LOGISTIC_OPTIMIZED_GRAPH_TEMPLATE = Ref{KernelSpec}()
