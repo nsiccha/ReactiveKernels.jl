@@ -86,9 +86,16 @@ end
 
 ## Lowering and semantics
 
-- **Native.** `scan` runs the ordinary ordered loop, seeding the carry from
-  `init` and collecting the per-step outputs — already correct, and the reference
-  the Reactant path is checked against.
+- **Native.** The generated ordered loop contains the scalar step directly,
+  seeding the carry from `init`. Requesting the scan port collects its per-step
+  outputs in a vector. When that port feeds only one authored `plate` with a
+  selected `sum`, native preparation can run the plate cell inside the same
+  carry loop and omit the intermediate scan vector. The plate's other inputs
+  must be declared numeric scalars or explicit `Ref` operands. Its shared
+  computations run once outside the loop. Requesting the pointwise plate port
+  still returns its vector; requesting the scan port, adding another consumer,
+  or supplying another broadcast array preserves ordinary materialization and
+  broadcast shape checks.
 - **Reactant.** When `xs` is a traced array, `scan` emits a `stablehlo.while`
   carry loop: the carry (scalar or `NamedTuple`) is threaded as a loop-carried
   value and the per-step outputs are written into a preallocated traced buffer

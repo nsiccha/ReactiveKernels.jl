@@ -206,9 +206,9 @@ end
 
 # A first-class authored SEQUENTIAL scan.  Unlike `plate` (a pure broadcast map),
 # it threads a carry through an ordered loop; its scalar step is a 2-`want` kernel
-# `(carry, x, shared...) -> (new_carry, output)`.  The op is opaque to the lowerer
-# (not inlined): the emitted `__ops__[k](args...)` call runs the loop via
-# `_tensorized_scan`, which a tracing backend specializes to a `stablehlo.while`.
+# `(carry, x, shared...) -> (new_carry, output)`. Native lowering inlines that
+# step and can stream its output into a reducing plate. The tensorized product
+# calls `_tensorized_scan`, specialized by a backend to a `stablehlo.while`.
 # The op's argument order is fixed by authoring: index 1 = carry seed, index 2 =
 # the sequence `xs`, index 3+ = Ref-shared operands; `A` records the atomic
 # (broadcast-invariant) indices {1, 3, 4, …}.
@@ -335,31 +335,113 @@ end
 # Inline the scalar step into the ordered native loop. Calling the nested
 # PreparedKernel from a loop with a changing carry defeats inference across the
 # RGF boundary; the same step AST and operation table specialize normally here.
-function _lower_authored_scan_native!(body, runtime_ops, runtime_recipes,
-                                      op::_AuthoredScanOp, callargs, lhs)
+function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
+                                      offset; consumer = nothing)
     step = op.kernel
     indices, index, carry, output = gensym.((:scan_indices, :scan_index,
                                             :scan_carry, :scan_output))
     xs = callargs[2]
-    offset = length(runtime_ops)
-    append!(runtime_ops, step.ops)
-    append!(runtime_recipes, step.lowered_recipes)
     arguments = Any[carry, Expr(:ref, xs, index), callargs[3:end]...]
     step_body = Expr(:block, _embedded_statements(
         step.ast, arguments, Expr(:tuple, carry, output), offset)...)
+    invariant = Any[]
+    initial_output, loop_output, final_output = Expr(:block), Expr(:block), Expr(:block)
+    if lhs !== nothing
+        push!(initial_output.args, :($lhs = $(GlobalRef(Base, :similar))(
+            $xs, $(GlobalRef(Base, :typeof))($output))))
+        push!(initial_output.args, :($lhs[$index] = $output))
+        push!(loop_output.args, :($lhs[$index] = $output))
+    end
+    if consumer !== nothing
+        cell, args, positions, cell_offset, pointwise_lhs, total_lhs = consumer
+        cell_output = gensym(:scan_cell)
+        cell_args = Any[i in positions ? output : arg for (i, arg) in enumerate(args)]
+        invariant, dynamic, cell_type = _authored_scan_cell_statements(
+            cell, cell_args, positions, cell_output, cell_offset)
+        append!(step_body.args, dynamic)
+        # Match ordinary plate lowering's inferred result type, including
+        # heterogeneous cells; the first value alone cannot type that buffer.
+        plate_eltype = gensym(:scan_plate_eltype)
+        push!(initial_output.args, :($plate_eltype = $cell_type))
+        if pointwise_lhs !== nothing
+            push!(initial_output.args, :($pointwise_lhs = $(GlobalRef(Base, :similar))(
+                $xs, $plate_eltype)))
+            push!(initial_output.args, :($pointwise_lhs[$index] = $cell_output))
+            push!(loop_output.args, :($pointwise_lhs[$index] = $cell_output))
+            push!(final_output.args, :($pointwise_lhs =
+                $(GlobalRef(@__MODULE__, :_narrow_plate_output))($pointwise_lhs)))
+        end
+        push!(initial_output.args,
+              :($total_lhs = $(GlobalRef(Base, :zero))(
+                  $plate_eltype === Any ? $(GlobalRef(Base, :typeof))($output) :
+                  $plate_eltype) + $cell_output))
+        push!(loop_output.args, :($total_lhs = $total_lhs + $cell_output))
+    end
     push!(body.args, :($indices = $(GlobalRef(Base, :eachindex))($xs)))
     push!(body.args, :($(GlobalRef(Base, :isempty))($indices) &&
         throw(ArgumentError("scan requires a non-empty sequence"))))
+    append!(body.args, invariant)
     push!(body.args, :($carry = $(callargs[1])))
     push!(body.args, :($index = $(GlobalRef(Base, :first))($indices)))
     append!(body.args, step_body.args)
-    push!(body.args, :($lhs = $(GlobalRef(Base, :similar))(
-        $xs, $(GlobalRef(Base, :typeof))($output))))
-    push!(body.args, :($lhs[$index] = $output))
+    append!(body.args, initial_output.args)
     push!(body.args, Expr(:for,
         :($index = $(GlobalRef(Base.Iterators, :drop))($indices, 1)),
-        Expr(:block, step_body.args..., :($lhs[$index] = $output))))
+        Expr(:block, step_body.args..., loop_output.args...)))
+    append!(body.args, final_output.args)
     body
+end
+
+function _authored_scan_cell_statements(cell, args, positions, output, offset)
+    inner = cell.plan
+    length(cell.ops) == length(inner.recipes) || throw(ArgumentError(
+        "an authored plate body must lower to one operation per transparent scalar recipe"))
+    roots = Set(canon_id(inner.graph, inner.have[i].id) for i in positions)
+    dependencies = _plate_dependencies(inner, roots).recipes
+    locals = Dict(canon_id(inner.graph, v.id) => arg
+                  for (v, arg) in zip(inner.have, args))
+    types = Dict{Int,Any}(canon_id(inner.graph, v.id) =>
+        Expr(:call, GlobalRef(Base, :typeof), arg) for (v, arg) in zip(inner.have, args))
+    invariant, dynamic = Any[], Any[]
+    for (i, recipe) in enumerate(inner.recipes)
+        length(recipe.outputs) == 1 || throw(ArgumentError(
+            "an authored plate currently requires single-output scalar recipes"))
+        value = only(recipe.outputs)
+        result = gensym(Symbol(:scan_cell_, value.name))
+        inputs = Any[locals[canon_id(inner.graph, v.id)] for v in recipe.inputs]
+        statement = :($result = $(_OPS_ARG)[$(offset + i)]($(inputs...)))
+        push!(isempty(dependencies[i]) ? invariant : dynamic, statement)
+        locals[canon_id(inner.graph, value.id)] = result
+        input_types = Any[types[canon_id(inner.graph, v.id)] for v in recipe.inputs]
+        types[canon_id(inner.graph, value.id)] = Expr(:call,
+            GlobalRef(Base, :promote_op), Expr(:ref, _OPS_ARG, offset + i), input_types...)
+    end
+    push!(dynamic, :($output = $(locals[canon_id(inner.graph, only(inner.want).id)])))
+    invariant, dynamic, types[canon_id(inner.graph, only(inner.want).id)]
+end
+
+# Fuse only a sole scalar plate consumer with a selected sum. Other array
+# operands need full broadcast-axis validation; other consumers or WANTs need
+# the materialized scan. In either case ordinary native scan lowering applies.
+function _authored_scan_sum_consumer(p::Plan, scan_recipe::Recipe)
+    output_id = canon_id(p.graph, only(scan_recipe.outputs).id)
+    any(w -> canon_id(p.graph, w.id) == output_id, p.want) && return nothing
+    consumers = filter(p.recipes) do recipe
+        any(v -> canon_id(p.graph, v.id) == output_id, recipe.inputs)
+    end
+    length(consumers) == 1 || return nothing
+    consumer = only(consumers)
+    consumer.op isa _AuthoredPlateOp || return nothing
+    _authored_plate_sum_recipe(p, consumer) === nothing && return nothing
+    atomic = typeof(consumer.op).parameters[2]
+    for (i, input) in enumerate(consumer.inputs)
+        if canon_id(p.graph, input.id) == output_id
+            i in atomic && return nothing # Ref(errors) consumes the whole vector.
+        elseif !(i in atomic || valtype(input) <: Number)
+            return nothing
+        end
+    end
+    consumer
 end
 
 function _plate_dependencies(plan::Plan, root_ids::Set{Int})
@@ -748,6 +830,7 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
     runtime_ops = Any[]
     runtime_recipes = Recipe[]
     skipped_recipes = Set{Int}()
+    pending_scans = Dict{Int,Any}()
     # HAVE is authoritative, and the first selected producer of any other
     # logical value owns its binding. Later recipes may emit that value as a
     # collateral multi-output; execute the recipe but discard the duplicate so
@@ -774,7 +857,19 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                 push!(assigned, canon_id(g, only(sum_recipe.outputs).id))
                 push!(skipped_recipes, sum_recipe.id)
             end
-            if tensorized
+            if !tensorized && haskey(pending_scans, r.id)
+                scan_recipe, scan_args, scan_offset = pending_scans[r.id]
+                output_id = canon_id(g, only(scan_recipe.outputs).id)
+                positions = findall(
+                    v -> canon_id(g, v.id) == output_id, r.inputs)
+                cell_offset = length(runtime_ops)
+                append!(runtime_ops, r.op.kernel.ops)
+                append!(runtime_recipes, r.op.kernel.lowered_recipes)
+                consumer = (r.op.kernel, callargs, positions, cell_offset,
+                            pointwise_lhs, total_lhs)
+                _lower_authored_scan_native!(
+                    body, scan_recipe.op, scan_args, nothing, scan_offset; consumer)
+            elseif tensorized
                 _lower_authored_plate_tensorized!(
                     body, runtime_ops, runtime_recipes, r.op, callargs,
                     pointwise_lhs, total_lhs)
@@ -802,15 +897,22 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
             # op, while the native path calls its inlined scalar operations.
             push!(runtime_ops, r.op)
             push!(runtime_recipes, r)
+            scan_index = length(runtime_ops)
+            append!(runtime_ops, r.op.kernel.ops)
+            append!(runtime_recipes, r.op.kernel.lowered_recipes)
             if tensorized
-                call = Expr(:call, Expr(:ref, _OPS_ARG, length(runtime_ops)),
+                call = Expr(:call, Expr(:ref, _OPS_ARG, scan_index),
                             callargs...)
                 push!(body.args, Expr(:(=), lhs, call))
-                append!(runtime_ops, r.op.kernel.ops)
-                append!(runtime_recipes, r.op.kernel.lowered_recipes)
             else
-                _lower_authored_scan_native!(
-                    body, runtime_ops, runtime_recipes, r.op, callargs, lhs)
+                consumer = _authored_scan_sum_consumer(p, r)
+                if consumer === nothing
+                    _lower_authored_scan_native!(body, r.op, callargs, lhs, scan_index)
+                else
+                    # Emit at the plate, where all its scalar inputs are ready.
+                    # The reserved table slots keep both backend products equal.
+                    pending_scans[consumer.id] = (r, callargs, scan_index)
+                end
             end
             continue
         end

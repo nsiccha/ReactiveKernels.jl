@@ -346,3 +346,33 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
         @test rk_allocated <= backend_allocated
     end
 end
+
+if !isdefined(@__MODULE__, :AuthoredScanFixtures)
+    include(joinpath(@__DIR__, "fixtures", "authored_scan.jl"))
+end
+
+@testset "authored scan plain reverse AD" begin
+    spec = AuthoredScanFixtures.authored_scan_arma
+    reference(q, series) = -0.5 * sum(abs2,
+        AuthoredScanFixtures._authored_scan_reference(q, series))
+    for series in ([0.5], sin.(1:20)), bound in ((;), (; series)),
+            want in (:total, :joint)
+        q = [0.2, 0.7, -0.3]
+        # :joint has a second scan consumer, exercising the materialized path.
+        sign = want === :total ? 1.0 : -1.0
+        k = prepare(spec; bound, want)
+        args = isempty(bound) ? (q, series) : (q,)
+        prepared = prepare_ad(k, TEST_AD_BACKEND, args...; active = :q)
+        gradient = zeros(3)
+        value, returned = ad_value_and_gradient!(prepared, gradient, args...)
+        @test value ≈ sign * reference(q, series)
+        @test returned === gradient
+        expected = map(eachindex(q)) do i
+            left, right = copy(q), copy(q)
+            left[i] -= 1e-5
+            right[i] += 1e-5
+            (reference(right, series) - reference(left, series)) / 2e-5
+        end
+        @test gradient ≈ sign .* expected rtol = 1e-8 atol = 1e-8
+    end
+end

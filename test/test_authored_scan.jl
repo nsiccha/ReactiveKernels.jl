@@ -1,34 +1,13 @@
 using ReactiveKernels
 using Test
 
-@kernel authored_scan_arma(q::Vector{Float64}, series::Vector{Float64}) = begin
-    mu::Float64 = q[1]
-    phi::Float64 = q[2]
-    theta::Float64 = q[3]
-    errors::Vector{Float64} = scan(series, Ref(mu), Ref(phi), Ref(theta);
-            init = (; previous = mu, error = 0.0)) do carry, y, m, f, t
-        e = y - (m + f * carry.previous + t * carry.error)
-        ((; previous = y, error = e), e)
-    end
-    pointwise = plate(errors) do e
-        -0.5 * e^2
-    end
-    total::Float64 = sum(pointwise)
-    return total
+if !isdefined(@__MODULE__, :AuthoredScanFixtures)
+    include(joinpath(@__DIR__, "fixtures", "authored_scan.jl"))
 end
+using .AuthoredScanFixtures: authored_scan_arma, _authored_scan_reference
 
-function _authored_scan_reference(q, series)
-    previous, error = q[1], 0.0
-    errors = similar(series)
-    for i in eachindex(series)
-        error = series[i] - (q[1] + q[2] * previous + q[3] * error)
-        previous = series[i]
-        errors[i] = error
-    end
-    errors
-end
-
-_authored_scan_allocated(k, args...) = @allocated k(args...)
+_authored_scan_allocated(k, args::Vararg{Any,N}) where {N} = @allocated k(args...)
+_authored_scan_mixed(x) = Base.inferencebarrier(x > 2 ? 1.5 : 1)
 
 @testset "authored scan native step lowering" begin
     q = [0.2, 0.7, -0.3]
@@ -38,6 +17,7 @@ _authored_scan_allocated(k, args...) = @allocated k(args...)
         args = isempty(bound) ? (q, series) : (q,)
         for (want, expected) in (
                 (:errors, errors), (:total, sum(pointwise)),
+                ((:pointwise, :total), (pointwise, sum(pointwise))),
                 ((:errors, :pointwise, :total), (errors, pointwise, sum(pointwise))))
             k = prepare(authored_scan_arma; want, bound)
             actual = k(args...)
@@ -66,4 +46,102 @@ _authored_scan_allocated(k, args...) = @allocated k(args...)
     k(q)
     _authored_scan_allocated(k, q)
     @test _authored_scan_allocated(k, q) <= sizeof(series) + 256
+end
+
+@testset "authored scan streams into a scalar plate reduction" begin
+    q, series = [0.2, 0.7, -0.3], sin.(1:200)
+    for bound in ((;), (; series))
+        k = prepare(authored_scan_arma; bound)
+        args = isempty(bound) ? (q, series) : (q,)
+        k(args...)
+        _authored_scan_allocated(k, args...)
+        @test _authored_scan_allocated(k, args...) == 0
+        @test_throws ArgumentError prepare(authored_scan_arma)(q, Float64[])
+    end
+
+    @kernel scan_broadcast_consumer(xs, weights, offset::Float64) = begin
+        cumulative = scan(xs; init = 0.0) do carry, x
+            next = carry + x
+            (next, next)
+        end
+        # This input becomes available after the scan in authored order.
+        scale::Float64 = exp(offset)
+        pointwise = plate(cumulative, weights, scale) do x, w, s
+            x * w / s
+        end
+        total = sum(pointwise)
+        extra = sum(abs2, cumulative)
+        return total
+    end
+    xs = [1.0, 2.0, 3.0]
+    for weights in (2.0, [2.0], [2.0, 3.0, 4.0])
+        expected = sum(cumsum(xs) .* weights ./ exp(0.5))
+        @test prepare(scan_broadcast_consumer)(xs, weights, 0.5) ≈ expected
+        # A separate scan consumer keeps its vector and its own result.
+        k = prepare(scan_broadcast_consumer; want = (:total, :extra))
+        total, extra = k(xs, weights, 0.5)
+        @test total ≈ expected
+        @test extra == sum(abs2, cumsum(xs))
+    end
+    @test_throws DimensionMismatch prepare(scan_broadcast_consumer)(xs, ones(2), 0.5)
+
+    @kernel scan_ref_consumer(xs) = begin
+        cumulative = scan(xs; init = 0.0) do carry, x
+            next = carry + x
+            (next, next)
+        end
+        pointwise = plate(xs, Ref(cumulative)) do x, all_values
+            x + sum(all_values)
+        end
+        return sum(pointwise)
+    end
+    @test prepare(scan_ref_consumer)(xs) == sum(xs .+ sum(cumsum(xs)))
+
+    @kernel scan_scalar_consumer(xs, offset::Float64) = begin
+        cumulative = scan(xs; init = 0.0) do carry, x
+            next = carry + x
+            (next, next)
+        end
+        scale::Float64 = exp(offset)
+        pointwise = plate(cumulative, scale) do x, s
+            log_scale = log(s)
+            x / s - log_scale
+        end
+        return sum(pointwise)
+    end
+    scalar = prepare(scan_scalar_consumer)
+    @test scalar(xs, 0.5) ≈ sum(cumsum(xs) ./ exp(0.5) .- 0.5)
+    scalar(xs, 0.5)
+    _authored_scan_allocated(scalar, xs, 0.5)
+    @test _authored_scan_allocated(scalar, xs, 0.5) == 0
+
+    @kernel scan_inside_plate(xs::Vector{Float64}, shifts::Vector{Float64}) = begin
+        totals = plate(Ref(xs), shifts) do data, m
+            values = scan(data, Ref(m); init = 0.0) do carry, x, shift
+                next = carry + x + shift
+                (next, next)
+            end
+            sum(values)
+        end
+        return totals
+    end
+    @test prepare(scan_inside_plate)(xs, [0.0, 1.0]) == [10.0, 16.0]
+
+    @kernel mixed_scan_consumer(xs) = begin
+        cumulative = scan(xs; init = 0.0) do carry, x
+            next = carry + x
+            (next, next)
+        end
+        pointwise = plate(cumulative) do x
+            _authored_scan_mixed(x)
+        end
+        total = sum(pointwise)
+        return total
+    end
+    fused = prepare(mixed_scan_consumer; want = (:pointwise, :total))(xs)
+    materialized = prepare(mixed_scan_consumer;
+        want = (:cumulative, :pointwise, :total))(xs)
+    @test fused == ([1, 1.5, 1.5], 4.0)
+    @test fused == materialized[2:3]
+    @test typeof(fused[1]) == typeof(materialized[2])
 end
