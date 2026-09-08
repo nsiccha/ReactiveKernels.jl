@@ -12,6 +12,10 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample, PPLEightSchoolsExample
 using ReactiveKernelsPPLExamples.EightSchoolsExample:
     EIGHT_SCHOOLS_Y, EIGHT_SCHOOLS_SIGMA, build_eight_schools_graph
 using ReactiveKernelsPPLExamples.PPLEightSchoolsExample: build_ppl_eight_schools
+using ReactiveKernelsPPLExamples.KilpisjarviExample:
+    KILPISJARVI_X, KILPISJARVI_Y, KILPISJARVI_XPRED,
+    KILPISJARVI_PMUALPHA, KILPISJARVI_PSALPHA,
+    KILPISJARVI_PMUBETA, KILPISJARVI_PSBETA, build_kilpisjarvi_graph
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauchy
 
 @testset "@ppl posteriordb-model parity (experimental)" begin
@@ -88,6 +92,59 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
                 have = (:unconstrained, :observations, :observation_scales),
                 want = :posterior)(q, y, sigma)
             @test ppl_post ≈ hand_post rtol = 1e-12
+        end
+    end
+
+    @testset "kilpisjarvi (flat sigma) — parity with the hand-authored kernel" begin
+        # posteriordb `kilpisjarvi`: α ~ Normal(pmualpha, psalpha), β ~
+        # Normal(pmubeta, psbeta) with data-supplied adjustable hyperparameters,
+        # and σ with NO prior — Stan's `real<lower=0> sigma` improper-flat, so
+        # only the log/exp transform Jacobian (log σ) contributes. `positive(flat())`
+        # supplies exactly that: positive support (Jacobian log σ) with a zero
+        # prior term. The unconstrained packing q = [α, β, log σ] is identical to
+        # the hand-authored kernel's — the dominant posteriordb coverage gap (todo
+        # 0gy1ejg) closed for a real model.
+        @ppl kilpisjarvi(y::Vector{Float64}, x::Vector{Float64},
+                         pmualpha::Float64, psalpha::Float64,
+                         pmubeta::Float64, psbeta::Float64) = begin
+            alpha ~ normal(pmualpha, psalpha)
+            beta ~ normal(pmubeta, psbeta)
+            sigma ~ positive(flat())
+            y ~ normal(alpha + beta * x, sigma)
+        end
+        @test kilpisjarvi isa KernelSpec
+
+        x = KILPISJARVI_X
+        y = KILPISJARVI_Y
+        pma, psa = KILPISJARVI_PMUALPHA, KILPISJARVI_PSALPHA
+        pmb, psb = KILPISJARVI_PMUBETA, KILPISJARVI_PSBETA
+        test_points = (
+            [9.3, 0.0, log(1.0)],
+            [9.0, 0.05, log(0.7)],
+            [10.1, -0.02, log(2.3)],
+        )
+        for q in test_points
+            hand = build_kilpisjarvi_graph()
+            hand_have = (:unconstrained, :x, :y, :xpred, :pmualpha, :psalpha,
+                         :pmubeta, :psbeta)
+            hand_post = prepare(hand; have = hand_have, want = :posterior)(
+                q, x, y, KILPISJARVI_XPRED, pma, psa, pmb, psb)
+            hand_prior, hand_lik = prepare(hand; have = hand_have,
+                want = (:log_prior, :likelihood))(
+                    q, x, y, KILPISJARVI_XPRED, pma, psa, pmb, psb)
+
+            ppl_have = (:unconstrained, :y, :x, :pmualpha, :psalpha, :pmubeta, :psbeta)
+            ppl_post = prepare(kilpisjarvi; have = ppl_have, want = :posterior)(
+                q, y, x, pma, psa, pmb, psb)
+            ppl_prior, ppl_lik = prepare(kilpisjarvi; have = ppl_have,
+                want = (:prior, :likelihood))(q, y, x, pma, psa, pmb, psb)
+
+            # Density-equivalent to machine precision — the flat σ contributes 0 to
+            # the prior in both, and both add log σ (the transform Jacobian) to the
+            # unconstrained posterior.
+            @test ppl_post ≈ hand_post rtol = 1e-12
+            @test ppl_prior ≈ hand_prior rtol = 1e-12
+            @test ppl_lik ≈ hand_lik rtol = 1e-12
         end
     end
 end

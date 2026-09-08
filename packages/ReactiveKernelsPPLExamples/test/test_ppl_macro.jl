@@ -213,6 +213,90 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
         @test got ≈ ref_density
     end
 
+    @testset "improper/flat prior (real support) — 0 prior contribution" begin
+        # earn_height shape: flat regression coefficients, known scales.
+        @ppl fr(y::Vector{Float64}, x::Vector{Float64},
+                sigma::Vector{Float64}) = begin
+            alpha ~ flat()
+            beta ~ flat()
+            y ~ normal(alpha + beta * x, sigma)
+        end
+        q = [1.0, 2.0]                    # alpha, beta (real, identity)
+        x = [-1.0, 0.0, 1.0]
+        y = [-0.9, 1.1, 3.2]
+        sig = [1.0, 1.0, 1.0]
+        mu = [1.0 + 2.0 * xi for xi in x]
+        ref_ll = sum(nlp(y[i], mu[i], sig[i]) for i in eachindex(y))
+
+        parameters, prior, likelihood = prepare(fr;
+            have = (:unconstrained, :y, :x, :sigma),
+            want = (:parameters, :prior, :likelihood))(q, y, x, sig)
+        @test prior == 0.0               # flat priors contribute EXACTLY zero
+        @test likelihood ≈ ref_ll
+        @test parameters.alpha == 1.0
+        @test parameters.beta == 2.0
+
+        post = prepare(fr; have = (:unconstrained, :y, :x, :sigma),
+                       want = :posterior)(q, y, x, sig)
+        @test post ≈ ref_ll              # prior 0 + jacobian 0 + likelihood
+        up = prepare(fr; have = (:unconstrained,),
+                     want = :unconstrained_prior)(q)
+        @test up == 0.0                  # real flat: prior 0, jacobian 0
+    end
+
+    @testset "improper/flat prior (positive support) — flat on constrained scale + Jacobian" begin
+        # kilpisjarvi shape: flat `sigma` on positive support (Stan `real<lower=0>`,
+        # no prior) — 0 prior, but the log-transform Jacobian still applies.
+        @ppl fp(y::Vector{Float64}) = begin
+            mu ~ flat()
+            sigma ~ positive(flat())
+            y ~ normal(mu, sigma)
+        end
+        lm, ls = 0.5, log(1.3)           # unconstrained: mu (real), log sigma
+        m, s = lm, exp(ls)
+        q = [lm, ls]
+        y = [1.0, -0.5, 2.0]
+        ref_ll = sum(nlp(yi, m, s) for yi in y)
+
+        parameters, prior, likelihood = prepare(fp;
+            have = (:unconstrained, :y),
+            want = (:parameters, :prior, :likelihood))(q, y)
+        @test prior == 0.0
+        @test parameters.mu == m
+        @test parameters.sigma ≈ s
+        @test likelihood ≈ ref_ll
+
+        # unconstrained_prior = prior(0) + log_jacobian(log sigma).
+        up = prepare(fp; have = (:unconstrained,),
+                     want = :unconstrained_prior)(q)
+        @test up ≈ ls
+        # the constrained density excludes the transform Jacobian.
+        cld = prepare(fp; have = (:unconstrained, :y),
+                      want = :constrained_logdensity)(q, y)
+        @test cld ≈ ref_ll
+        post = prepare(fp; have = (:unconstrained, :y), want = :posterior)(q, y)
+        @test post ≈ ref_ll + ls
+    end
+
+    @testset "improper/flat prior (real vector)" begin
+        @ppl fv(y::Vector{Float64}, sigma::Vector{Float64}, K::Int) = begin
+            beta::vector[K] ~ flat()
+            y ~ normal(beta, sigma)
+        end
+        q = [0.5, -1.0, 2.0]
+        K = 3
+        y = [0.6, -0.9, 2.1]
+        sig = [1.0, 1.0, 1.0]
+        ref_ll = sum(nlp(y[i], q[i], sig[i]) for i in 1:3)
+
+        parameters, prior, likelihood = prepare(fv;
+            have = (:unconstrained, :y, :sigma, :K),
+            want = (:parameters, :prior, :likelihood))(q, y, sig, K)
+        @test prior == 0.0
+        @test collect(parameters.beta) == q
+        @test likelihood ≈ ref_ll
+    end
+
     @testset "out-of-scope constructs fail loudly" begin
         # a discrete family is not a supported continuous parameter prior.
         @test_throws Exception macroexpand(@__MODULE__, :(@ppl bad(
@@ -224,6 +308,18 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
         @test_throws Exception macroexpand(@__MODULE__, :(@ppl prioronly(
                 y::Vector{Float64}) = begin
             mu ~ normal(0.0, 1.0)
+        end))
+        # `flat()` takes no arguments.
+        @test_throws Exception macroexpand(@__MODULE__, :(@ppl badflat(
+                y::Vector{Float64}) = begin
+            mu ~ flat(1.0)
+            y ~ normal(mu, 1.0)
+        end))
+        # a constrained-support flat vector is not supported yet.
+        @test_throws Exception macroexpand(@__MODULE__, :(@ppl badflatvec(
+                y::Vector{Float64}, K::Int) = begin
+            b::vector[K] ~ positive(flat())
+            y ~ normal(b, 1.0)
         end))
     end
 end
