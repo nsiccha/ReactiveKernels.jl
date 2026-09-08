@@ -1,7 +1,7 @@
 module LogearnInteractionExample
 
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
 export LOGEARN_INTERACTION_EARN, LOGEARN_INTERACTION_HEIGHT, LOGEARN_INTERACTION_MALE
 export build_logearn_interaction_graph, demo
@@ -16,24 +16,12 @@ export LOGEARN_INTERACTION_SOURCE, evaluate_logearn_interaction_source
 # has N = 1192; the same faithfully-shaped 40-row systematic subset used by the
 # other earnings examples (both sexes present, all earn > 0) is embedded verbatim
 # as `Float64` (`male` is 0/1).
-const LOGEARN_INTERACTION_EARN = [
-    50000.0, 75000.0, 4000.0, 16040.0, 23000.0, 25000.0, 12000.0, 50000.0,
-    35000.0, 28000.0, 35000.0, 6000.0, 8000.0, 8000.0, 40000.0, 22000.0, 8000.0,
-    15000.0, 18000.0, 2000.0, 8000.0, 15000.0, 14000.0, 1200.0, 9000.0, 600.0,
-    30000.0, 15000.0, 58000.0, 14000.0, 10000.0, 6000.0, 25000.0, 18000.0,
-    5000.0, 85000.0, 37000.0, 3000.0, 30000.0, 6000.0,
-]
-const LOGEARN_INTERACTION_HEIGHT = [
-    74.0, 72.0, 64.0, 64.0, 70.0, 71.0, 64.0, 72.0, 69.0, 64.0, 67.0, 64.0,
-    71.0, 63.0, 58.0, 73.0, 68.0, 65.0, 70.0, 63.0, 68.0, 64.0, 66.0, 65.0,
-    72.0, 59.0, 71.0, 63.0, 64.0, 72.0, 63.0, 62.0, 69.0, 63.0, 72.0, 70.0,
-    74.0, 66.0, 68.0, 68.0,
-]
-const LOGEARN_INTERACTION_MALE = [
-    1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
-    1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0,
-    0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0,
-]
+# Real data (full) from posteriordb `earnings-logearn_interaction`, loaded via PosteriorDB.jl.
+let d = _posteriordb_data("earnings-logearn_interaction")
+    global const LOGEARN_INTERACTION_EARN = Float64.(d["earn"])
+    global const LOGEARN_INTERACTION_HEIGHT = Float64.(d["height"])
+    global const LOGEARN_INTERACTION_MALE = Float64.(d["male"])
+end
 
 const LOGEARN_INTERACTION_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
@@ -76,17 +64,16 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
     end
 
     # Transformed parameter: the linear predictor
-    # μ = β₁ + β₂·height + β₃·male + β₄·(height·male). Captured scalars ride the
-    # plate as explicit shared arguments; the interaction is recomputed inline.
-    mu = plate(height, male, beta1, beta2, beta3, beta4) do h, ml, b1, b2, b3, b4
-        b1 + b2 * h + b3 * ml + b4 * (h * ml)
+    # μ = β₁ + β₂·height + β₃·male + β₄·(height·male), consuming the named `inter`
+    # (transformed-data interaction, hoisted when bound); named once.
+    mu = plate(height, male, inter, beta1, beta2, beta3, beta4) do h, ml, hm, b1, b2, b3, b4
+        b1 + b2 * h + b3 * ml + b4 * hm
     end
 
-    # Likelihood: log(earnⱼ) ~ Normal(μⱼ, σ). The transformed response `log_earn`
-    # is sliced per cell as a bare caller port; the interaction and predictor are
-    # recomputed inline in the Normal constructor.
-    pointwise = plate(log_earn, height, male, beta1, beta2, beta3, beta4, sigma) do ly, h, ml, b1, b2, b3, b4, s
-        normal(b1 + b2 * h + b3 * ml + b4 * (h * ml), s).logpdf(ly)
+    # Likelihood: log(earnⱼ) ~ Normal(μⱼ, σ). Consumes the named `log_earn` and
+    # `mu` once (single-consumer plate-chain, fused buffer-free).
+    pointwise = plate(log_earn, mu, sigma) do ly, m, s
+        normal(m, s).logpdf(ly)
     end
     likelihood::Float64 = sum(pointwise)
 
@@ -112,18 +99,20 @@ male = LOGEARN_INTERACTION_MALE
 earn = LOGEARN_INTERACTION_EARN
 
 requested_nodes = (:parameters, :log_jacobian, :likelihood, :posterior)
+# Raw data BOUND (benchmark-acceptance entry): log_earn and inter are partial-eval-hoisted.
 density_kernel = prepare(model;
     have = (:unconstrained, :height, :male, :earn),
-    want = requested_nodes)
+    want = requested_nodes,
+    bound = (; height, male, earn))
 
-output = density_kernel(q, height, male, earn)
+output = density_kernel(q)
 parameters, log_jacobian, likelihood, posterior = output
 @assert posterior ≈ likelihood + log_jacobian
 
 docs_example = (;
     name = :logearn_interaction_posterior,
     origin = "posteriordb earnings-logearn_interaction — log-earnings regression with a height×sex interaction",
-    inputs = (; q, height, male, earn),
+    inputs = (; q),
     model,
     kernel = density_kernel,
     output,
