@@ -79,7 +79,7 @@ const RECEIPT_DIR = joinpath(@__DIR__, "receipts")
 function _phase_cmd(phase, up, receipt)
     body = phase == "reactant" ? _REACTANT_BODY : _BODY
     cmd = addenv(
-        `$(Base.julia_cmd()) --startup-file=no --project=$ENV_DIR $(body) $(ARGS...)`,
+        `$(Base.julia_cmd()) --startup-file=no --project=$ENV_DIR $(body) $ARGS`,
         _INNER => "1", "RK_ALL80_UPSTREAM" => up, "RK_ALL80_DPPL_SHA" => DPPL_SHA,
         "RK_ALL80_PHASE" => phase, "RK_ALL80_RECEIPT" => receipt,
     )

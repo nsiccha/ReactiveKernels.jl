@@ -72,12 +72,20 @@ function cached_bridge_model(post)
     BridgeStan.StanModel(library, PosteriorDB.load(PosteriorDB.dataset(post), String), 468)
 end
 
-function valid_rk_point(kb, dim)
-    for q in (zeros(dim), fill(0.1, dim), fill(-0.1, dim), fill(0.25, dim))
-        value = try kb(q) catch; NaN end
-        isfinite(value) && return q
+function valid_rk_point(kb, dim, entry; rng = Xoshiro(0xC0FFEE))
+    # STRICT-INTERIOR probe. zeros(dim) is DEGENERATE for several models: a hard Uniform
+    # boundary (dogs_log's mixed-sign box), the a^0·b^0 = 1 endpoint singularity
+    # (dogs_hierarchical), or a symmetric logsumexp TIE where the AD subgradient is ambiguous
+    # (mixtures at mu1==mu2) — all poor gradient probes (performance audit 2026-09-08). A
+    # registry `probe_q` pins the model source's own separated probe; else search small random
+    # MIXED-SIGN points; zeros is only the last resort.
+    ok(q) = length(q) == dim && isfinite(try kb(q) catch; NaN end)
+    entry.probe_q !== nothing && ok(entry.probe_q) && return collect(Float64, entry.probe_q)
+    for q in Iterators.flatten(([fill(0.1, dim), fill(-0.1, dim)],
+                                (0.5 .* randn(rng, dim) for _ in 1:96), (zeros(dim),)))
+        ok(q) && return collect(Float64, q)
     end
-    error("no finite RK value at the bounded deterministic Reactant probe points")
+    error("no strict-interior finite RK probe point for a $dim-dim model")
 end
 
 function run_reactant_one(name)
@@ -88,7 +96,7 @@ function run_reactant_one(name)
     graph = getproperty(getproperty(ReactiveKernelsPPLExamples, entry.mod), entry.build)()
     kb = prepare(graph; have = entry.have, want = :posterior, bound = entry.bind(data))
     sm = cached_bridge_model(post)
-    q = valid_rk_point(kb, Int(BridgeStan.param_unc_num(sm)))
+    q = valid_rk_point(kb, Int(BridgeStan.param_unc_num(sm)), entry)
     abort_reason = get(PROCESS_ABORTING_AD, name, nothing)
     prep = abort_reason === nothing ? try
         prepare_ad(kb, AE, q; active = :unconstrained)
@@ -99,12 +107,24 @@ function run_reactant_one(name)
     # finite-check, and time the fixed 16-step program. Native HMC owns the adaptive
     # throughput protocol; running native Enzyme here would duplicate work and can abort on
     # exactly the full-data AD shapes this pass is meant to classify.
+    # Reference Stan gradient oracle (BridgeStan, propto=false jacobian=true) mapped to RK
+    # unconstrained order via the registry stan_perm — the SAME oracle the native phase uses
+    # (all80_posteriordb_body.jl). NO finite differences; the .so (sm) is already loaded.
+    sperm = entry.stan_perm
+    stan_order_q = sperm === nothing ? q : q[sperm]
+    grad_oracle = try
+        g = BridgeStan.log_density_gradient(sm, stan_order_q; propto = false, jacobian = true)[2]
+        sperm === nothing ? g : g[sortperm(sperm)]
+    catch err
+        err
+    end
     transitions = All80Axes.HMC_MIN_TRANSITIONS
-    row = reactant_cells(kb, prep, q; transitions)
+    row = reactant_cells(kb, prep, q; transitions, grad_oracle)
     row["hmc_steps"] = All80Axes.HMC_STEPS
     row["hmc_rounds"] = All80Axes.HMC_ROUNDS
     row["hmc_target_round_seconds"] = All80Axes.HMC_TARGET_ROUND_SECONDS
-    row["hmc_transitions"] = transitions
+    row["hmc_reactant_transitions"] = transitions   # DISTINCT from native's calibrated hmc_transitions
+    # (fixed at HMC_MIN_TRANSITIONS=4; surfaces the batch-size asymmetry + avoids an aggregate cell clash)
     for key in ("primal_rk_reactant", "gradient_rk_reactant", "hmc_rk_reactant")
         value = row[key]
         println("  $key = ", value isa Real ? string(round(value; sigdigits = 4)) : first(value, 180))
