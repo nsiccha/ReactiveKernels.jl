@@ -1,7 +1,7 @@
 module LogearnLogheightMaleExample
 
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
 export LELHM_EARN, LELHM_HEIGHT, LELHM_MALE
 export build_logearn_logheight_male_graph, demo
@@ -12,27 +12,15 @@ export LOGEARN_LOGHEIGHT_MALE_SOURCE, evaluate_logearn_logheight_male_source
 #     log(earn) ~ Normal(β₁ + β₂·log(height) + β₃·male, σ),  σ > 0,
 # with no explicit priors (Stan improper-flat over β and σ). Stan's
 # `transformed data` block computes `log_earn = log(earn)` and
-# `log_height = log(height)` on the DATA. The real dataset has N = 1192; the same
-# faithfully-shaped 40-row systematic subset used by the other earnings examples
-# (both sexes present, all earn > 0) is embedded verbatim (`male` is 0/1).
-const LELHM_EARN = [
-    50000.0, 75000.0, 4000.0, 16040.0, 23000.0, 25000.0, 12000.0, 50000.0,
-    35000.0, 28000.0, 35000.0, 6000.0, 8000.0, 8000.0, 40000.0, 22000.0, 8000.0,
-    15000.0, 18000.0, 2000.0, 8000.0, 15000.0, 14000.0, 1200.0, 9000.0, 600.0,
-    30000.0, 15000.0, 58000.0, 14000.0, 10000.0, 6000.0, 25000.0, 18000.0,
-    5000.0, 85000.0, 37000.0, 3000.0, 30000.0, 6000.0,
-]
-const LELHM_HEIGHT = [
-    74.0, 72.0, 64.0, 64.0, 70.0, 71.0, 64.0, 72.0, 69.0, 64.0, 67.0, 64.0,
-    71.0, 63.0, 58.0, 73.0, 68.0, 65.0, 70.0, 63.0, 68.0, 64.0, 66.0, 65.0,
-    72.0, 59.0, 71.0, 63.0, 64.0, 72.0, 63.0, 62.0, 69.0, 63.0, 72.0, 70.0,
-    74.0, 66.0, 68.0, 68.0,
-]
-const LELHM_MALE = [
-    1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
-    1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0,
-    0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0,
-]
+# `log_height = log(height)` on the DATA — reproduced here as an in-graph
+# preprocessing subgraph over the BOUND raw data, so partial evaluation hoists
+# both once. Real data (N = 1192) loaded from the bundled artifact via
+# PosteriorDB.jl.
+let d = _posteriordb_data("earnings-logearn_logheight_male")
+    global const LELHM_EARN = Float64.(d["earn"])
+    global const LELHM_HEIGHT = Float64.(d["height"])
+    global const LELHM_MALE = Float64.(d["male"])
+end
 
 const LOGEARN_LOGHEIGHT_MALE_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
@@ -41,11 +29,11 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
               height::Vector{Float64},
               male::Vector{Float64},
               earn::Vector{Float64}) = begin
-    # q = (β₁, β₂, β₃, log_σ). One-element reductions extract the packed scalars.
-    beta1::Float64 = sum(view(unconstrained, 1:1))
-    beta2::Float64 = sum(view(unconstrained, 2:2))
-    beta3::Float64 = sum(view(unconstrained, 3:3))
-    log_sigma::Float64 = sum(view(unconstrained, 4:4))
+    # q = (β₁, β₂, β₃, log_σ).
+    beta1::Float64 = unconstrained[1]
+    beta2::Float64 = unconstrained[2]
+    beta3::Float64 = unconstrained[3]
+    log_sigma::Float64 = unconstrained[4]
 
     # Only σ carries a support transform: σ = exp(log_σ), log|dσ/dlog_σ| = log_σ.
     log_sigma::Float64 = log(sigma)
@@ -57,20 +45,25 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
     (beta1::Float64, beta2::Float64, beta3::Float64, sigma::Float64) =
         (parameters.beta1, parameters.beta2, parameters.beta3, parameters.sigma)
 
-    # Transformed DATA: the log-response, read as a bare caller port. (log_height
-    # is formed inline per cell in the predictor below.)
+    # Transformed DATA: log-response and log-height as an in-graph preprocessing
+    # subgraph. Both are hoisted once by partial evaluation when `earn`/`height`
+    # are bound (the raw-data benchmark-acceptance entry).
     log_earn = plate(earn) do e
         log(e)
     end
-
-    # Transformed parameter: μ = β₁ + β₂·log(height) + β₃·male.
-    mu = plate(height, male, beta1, beta2, beta3) do h, ml, b1, b2, b3
-        b1 + b2 * log(h) + b3 * ml
+    log_height = plate(height) do h
+        log(h)
     end
 
-    # Likelihood: log(earnⱼ) ~ Normal(μⱼ, σ); log(height) recomputed inline.
-    pointwise = plate(log_earn, height, male, beta1, beta2, beta3, sigma) do ly, h, ml, b1, b2, b3, s
-        normal(b1 + b2 * log(h) + b3 * ml, s).logpdf(ly)
+    # Transformed parameter: μ = β₁ + β₂·log(height) + β₃·male (named once).
+    mu = plate(log_height, male, beta1, beta2, beta3) do lh, ml, b1, b2, b3
+        b1 + b2 * lh + b3 * ml
+    end
+
+    # Likelihood: log(earnⱼ) ~ Normal(μⱼ, σ); consumes the named μ and log_earn
+    # (single-consumer plate-chain, fused buffer-free).
+    pointwise = plate(log_earn, mu, sigma) do ly, m, s
+        normal(m, s).logpdf(ly)
     end
     likelihood::Float64 = sum(pointwise)
 
@@ -93,18 +86,22 @@ male = LELHM_MALE
 earn = LELHM_EARN
 
 requested_nodes = (:parameters, :log_jacobian, :likelihood, :posterior)
+# Raw data BOUND (the benchmark-acceptance entry): height/male/earn stay in HAVE
+# but are fixed to their data values, so the log_earn/log_height preprocessing
+# subgraph is partial-eval-hoisted; only `unconstrained` stays active.
 density_kernel = prepare(model;
     have = (:unconstrained, :height, :male, :earn),
-    want = requested_nodes)
+    want = requested_nodes,
+    bound = (; height, male, earn))
 
-output = density_kernel(q, height, male, earn)
+output = density_kernel(q)
 parameters, log_jacobian, likelihood, posterior = output
 @assert posterior ≈ likelihood + log_jacobian
 
 docs_example = (;
     name = :logearn_logheight_male_posterior,
     origin = "posteriordb earnings-logearn_logheight_male — log-earnings regression on log height and sex",
-    inputs = (; q, height, male, earn),
+    inputs = (; q),
     model,
     kernel = density_kernel,
     output,

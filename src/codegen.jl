@@ -124,6 +124,24 @@ end
 @inline _authored_plate_zero(::Type{T}, marker) where {T} = zero(T)
 @inline _authored_plate_zero(::Type{Any}, marker) = zero(eltype(marker))
 
+# The pointwise buffer's container type and shape come from the axis marker. For
+# an array marker `similar(marker, T, output_axes)` is the single-allocation fast
+# path (unchanged). A `Tuple` axis marker — a tuple-valued batched argument, or a
+# plate whose sole axis is a tuple — has no `similar(::Tuple, T, axes)` method, so
+# the native/nonallocating pointwise allocation used to crash on it even though
+# the Reactant path materialized it. Julia's broadcast rule collapses a `Tuple`
+# against arrays (or a lone `Tuple`) to a plain `Array`, so allocate the `Array`
+# of the combined output shape directly, matching the container both `_plate_similar`
+# (style-combining) and the Reactant oracle already produce for a tuple axis.
+# (`_plate_similar` alone does not cover a plate whose SOLE axis is a tuple — a
+# lone `Style{Tuple}` would materialize a tuple, not an array — so this marker
+# dispatch is the general fix. The name retains `similar` so the lowering's
+# materialization proxy in `test_authored_plate.jl` still matches.)
+@inline _plate_similar_output(marker, ::Type{T}, output_axes) where {T} =
+    similar(marker, T, output_axes)
+@inline _plate_similar_output(marker::Tuple, ::Type{T}, output_axes) where {T} =
+    similar(Array{T}, output_axes)
+
 # An untyped plate cell exposes its result through a metadata-`Any` boundary
 # port (type annotations are optional metadata in an authored kernel), so the
 # native lowering allocates its pointwise container as a boxed `Vector{Any}` —
@@ -158,9 +176,19 @@ end
 # and total accumulator UP FRONT — no boxed `Vector{Any}` is ever built and the
 # accumulator seed matches the summed cells (`_narrow_plate_output` above is a
 # post-hoc narrowing that still allocates the boxed container first and leaves the
-# accumulator untyped). A genuinely uninferrable body falls back to the
-# plan-level output valtype (`Any`), where `_narrow_plate_output` still recovers a
-# homogeneous element type at runtime.
+# accumulator untyped).
+#
+# When `promote_op` cannot pin a CONCRETE type — a genuinely uninferrable body,
+# but also a STATIC call over an UNTYPED batched port, whose projected element
+# type is `Any` (`_plate_cache_slot`/`_plate_result_type` call this with the
+# plan-level HAVE types, where an unannotated port is `Any`) — fall back to the
+# scalar body kernel's DECLARED output valtype. For a typed body (`::Float64`)
+# that valtype is authoritative and concrete, so the nonallocating cache slot is
+# seeded `Array{Float64}` instead of a boxed `Array{Any}` that would re-box every
+# element through `broadcast!` on each call (the `want=:pointwise` regression:
+# 16 KB/call for a length-1000 untyped plate whose cells are Float64). A body
+# with no concrete declared type stays `Any`, where `_narrow_plate_output` still
+# recovers a homogeneous element type at runtime.
 function _authored_plate_result_eltype(op::_AuthoredPlateOp{K,A},
                                        argtypes) where {K,A}
     element_types = ntuple(length(argtypes)) do position
@@ -168,7 +196,10 @@ function _authored_plate_result_eltype(op::_AuthoredPlateOp{K,A},
         (position in A || argtype <: Number) ? argtype : eltype(argtype)
     end
     T = Base.promote_op(op.kernel, element_types...)
-    T === Union{} ? valtype(only(outputs(op.kernel))) : T
+    isconcretetype(T) && return T
+    declared = valtype(only(outputs(op.kernel)))
+    isconcretetype(declared) && return declared
+    T === Union{} ? declared : T
 end
 
 # A plate is a pure graph map/reduction. Once Julia has instantiated the
@@ -215,8 +246,9 @@ function (op::_AuthoredPlateOp{K,A})(args...) where {K,A}
     # Type the buffer up front from the inferred pointwise element type, so a
     # homogeneous untyped cell fills a `Vector{Float64}` directly instead of a
     # boxed `Vector{Any}`.
-    result = similar(marker, _authored_plate_result_eltype(op, map(typeof, args)),
-                     axes(batch))
+    result = _plate_similar_output(marker,
+                                   _authored_plate_result_eltype(op, map(typeof, args)),
+                                   axes(batch))
     for index in eachindex(batch)
         scalar_args = batch[index]
         result[index] = op.kernel(scalar_args...)
@@ -912,7 +944,8 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
 
     if pointwise_lhs !== nothing
         push!(body.args,
-            :($pointwise_lhs = similar($marker, $plate_eltype, $output_axes)))
+            :($pointwise_lhs = $(GlobalRef(@__MODULE__, :_plate_similar_output))(
+                $marker, $plate_eltype, $output_axes)))
     end
     accumulator = total_lhs === nothing ? nothing : gensym(:plate_total)
     if accumulator !== nothing
@@ -1468,9 +1501,12 @@ end
 # prefer the first runtime broadcast axis when choosing native vs. tensorized
 # execution.  The native call ignores the marker and may derive its plate axis
 # only after projecting an atomic boundary, so exhausting the candidates falls
-# back to a non-axis sentinel.  Atomic `Ref(port)` inputs are excluded when the
-# candidates are derived, so an array-valued atom cannot accidentally become
-# the batch marker.
+# back to a non-axis sentinel.  Atomic `Ref(port)` inputs are excluded from the
+# axis candidates, so an array-valued atom cannot be mistaken for the plate
+# axis; but when every axis operand is bound and no axis candidate remains,
+# `_embedded_marker_candidates` admits array-valued HAVE ports (atomic ones
+# included) as backend markers, since only the marker TYPE — never its axis —
+# selects native vs. tensorized execution there.
 struct _DynamicEmbeddedFunctionPair{I,N,T,A} <: _ArrayFunctionPair
     native::N
     tensorized::T
@@ -1693,6 +1729,21 @@ function _embedded_marker_candidates(p::Plan)
                 position = root_positions[root]
                 position in candidates || push!(candidates, position)
             end
+        end
+    end
+    if isempty(candidates)
+        # No non-atomic (axis-defining) plate operand traces back to an active
+        # HAVE port: every axis operand is bound (`bound=`), so the plate axis is
+        # a compile-time constant baked into both bodies (the native body derives
+        # its own axis; the tensorized body takes the marker-less axis fallback).
+        # Backend selection still needs a runtime marker, so admit any
+        # array-valued active HAVE port as one — including a whole-vector
+        # `Ref`-captured parameter that is atomic for broadcasting yet remains a
+        # live array HAVE. Only the marker TYPE is consulted (`_batched_call`
+        # dispatches native vs. tensorized on it), never its axis, so an atomic
+        # array admitted here cannot be mistaken for the plate axis.
+        for (position, input) in enumerate(p.have)
+            valtype(input) <: AbstractArray && push!(candidates, position)
         end
     end
     Tuple(candidates)

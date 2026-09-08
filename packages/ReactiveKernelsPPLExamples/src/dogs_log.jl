@@ -64,13 +64,11 @@ using LogExpFunctions: logistic
               n_shock::Vector{Float64},
               y::Vector{Bool}) = begin
     # q = (β₁, β₂). The Stan parameter `vector[2] beta` is declared WITHOUT
-    # bounds, so the unconstrained sampler space is the parameter itself
-    # (identity transform, log Jacobian zero). The support is imposed entirely by
-    # the explicit uniform priors below. One-element reductions extract the packed
-    # scalars without scalar indexing, so the same prepared kernel stays traceable
-    # as a Reactant tensor program.
-    beta1::Float64 = sum(view(unconstrained, 1:1))
-    beta2::Float64 = sum(view(unconstrained, 2:2))
+    # bounds, so the unconstrained sampler space is the parameter itself (identity
+    # transform, log Jacobian zero). The support is imposed entirely by the
+    # explicit uniform priors below.
+    beta1::Float64 = unconstrained[1]
+    beta2::Float64 = unconstrained[2]
     log_jacobian::Float64 = 0.0
 
     parameters = (; beta1, beta2)

@@ -1,7 +1,7 @@
 module LogearnHeightMaleExample
 
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
 export LEHM_EARN, LEHM_HEIGHT, LEHM_MALE
 export build_logearn_height_male_graph, demo
@@ -15,24 +15,12 @@ export LOGEARN_HEIGHT_MALE_SOURCE, evaluate_logearn_height_male_source
 # dataset has N = 1192; the same faithfully-shaped 40-row systematic subset used
 # by the other earnings examples (both sexes present, all earn > 0) is embedded
 # verbatim as `Float64` (`male` is 0/1).
-const LEHM_EARN = [
-    50000.0, 75000.0, 4000.0, 16040.0, 23000.0, 25000.0, 12000.0, 50000.0,
-    35000.0, 28000.0, 35000.0, 6000.0, 8000.0, 8000.0, 40000.0, 22000.0, 8000.0,
-    15000.0, 18000.0, 2000.0, 8000.0, 15000.0, 14000.0, 1200.0, 9000.0, 600.0,
-    30000.0, 15000.0, 58000.0, 14000.0, 10000.0, 6000.0, 25000.0, 18000.0,
-    5000.0, 85000.0, 37000.0, 3000.0, 30000.0, 6000.0,
-]
-const LEHM_HEIGHT = [
-    74.0, 72.0, 64.0, 64.0, 70.0, 71.0, 64.0, 72.0, 69.0, 64.0, 67.0, 64.0,
-    71.0, 63.0, 58.0, 73.0, 68.0, 65.0, 70.0, 63.0, 68.0, 64.0, 66.0, 65.0,
-    72.0, 59.0, 71.0, 63.0, 64.0, 72.0, 63.0, 62.0, 69.0, 63.0, 72.0, 70.0,
-    74.0, 66.0, 68.0, 68.0,
-]
-const LEHM_MALE = [
-    1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
-    1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0,
-    0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0,
-]
+# Real data (full) from posteriordb `earnings-logearn_height_male`, loaded via PosteriorDB.jl.
+let d = _posteriordb_data("earnings-logearn_height_male")
+    global const LEHM_EARN = Float64.(d["earn"])
+    global const LEHM_HEIGHT = Float64.(d["height"])
+    global const LEHM_MALE = Float64.(d["male"])
+end
 
 const LOGEARN_HEIGHT_MALE_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
@@ -41,11 +29,11 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
               height::Vector{Float64},
               male::Vector{Float64},
               earn::Vector{Float64}) = begin
-    # q = (β₁, β₂, β₃, log_σ). One-element reductions extract the packed scalars.
-    beta1::Float64 = sum(view(unconstrained, 1:1))
-    beta2::Float64 = sum(view(unconstrained, 2:2))
-    beta3::Float64 = sum(view(unconstrained, 3:3))
-    log_sigma::Float64 = sum(view(unconstrained, 4:4))
+    # q = (β₁, β₂, β₃, log_σ).
+    beta1::Float64 = unconstrained[1]
+    beta2::Float64 = unconstrained[2]
+    beta3::Float64 = unconstrained[3]
+    log_sigma::Float64 = unconstrained[4]
 
     # Only σ carries a support transform (Stan `real<lower=0> sigma`):
     # σ = exp(log_σ), log|dσ/dlog_σ| = log_σ. β is unconstrained (identity).
@@ -69,9 +57,10 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
         b1 + b2 * h + b3 * ml
     end
 
-    # Likelihood: log(earnⱼ) ~ Normal(μⱼ, σ); predictor recomputed inline.
-    pointwise = plate(log_earn, height, male, beta1, beta2, beta3, sigma) do ly, h, ml, b1, b2, b3, s
-        normal(b1 + b2 * h + b3 * ml, s).logpdf(ly)
+    # Likelihood: log(earnⱼ) ~ Normal(μⱼ, σ). Consumes the named `log_earn` and
+    # `mu` once (single-consumer plate-chain, fused buffer-free).
+    pointwise = plate(log_earn, mu, sigma) do ly, m, s
+        normal(m, s).logpdf(ly)
     end
     likelihood::Float64 = sum(pointwise)
 
@@ -94,18 +83,20 @@ male = LEHM_MALE
 earn = LEHM_EARN
 
 requested_nodes = (:parameters, :log_jacobian, :likelihood, :posterior)
+# Raw data BOUND (benchmark-acceptance entry): log_earn is partial-eval-hoisted.
 density_kernel = prepare(model;
     have = (:unconstrained, :height, :male, :earn),
-    want = requested_nodes)
+    want = requested_nodes,
+    bound = (; height, male, earn))
 
-output = density_kernel(q, height, male, earn)
+output = density_kernel(q)
 parameters, log_jacobian, likelihood, posterior = output
 @assert posterior ≈ likelihood + log_jacobian
 
 docs_example = (;
     name = :logearn_height_male_posterior,
     origin = "posteriordb earnings-logearn_height_male — log-earnings regression on height and sex",
-    inputs = (; q, height, male, earn),
+    inputs = (; q),
     model,
     kernel = density_kernel,
     output,

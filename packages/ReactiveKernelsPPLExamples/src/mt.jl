@@ -44,7 +44,7 @@ using LogExpFunctions: logistic, log1pexp, logaddexp
               T::Int,
               M::Int) = begin
     # q = (u_omega, u_p[1..T]); dim = T + 1.
-    u_omega::Float64 = sum(view(unconstrained, 1:1))
+    u_omega::Float64 = unconstrained[1]
     u_p::AbstractVector{Float64} = view(unconstrained, 2:T + 1)
 
     # Constrained: omega, p[j] ∈ [0,1] via interval (logistic) transforms with

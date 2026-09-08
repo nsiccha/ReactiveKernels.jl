@@ -49,11 +49,10 @@ using LogExpFunctions: logistic, log1pexp
               log_radon::Vector{Float64}) = begin
     # Stan's declared unconstrained order: (alpha, beta, log_sigma_y); dim = 3.
     # `sigma_y` is `real<lower=0>`, so it uses the exp support transform; alpha
-    # and beta are unconstrained. Slice without scalar indexing so the same
-    # prepared kernel stays traceable as a Reactant tensor program.
-    alpha::Float64 = sum(view(unconstrained, 1:1))
-    beta::Float64 = sum(view(unconstrained, 2:2))
-    log_sigma_y::Float64 = sum(view(unconstrained, 3:3))
+    # and beta are unconstrained.
+    alpha::Float64 = unconstrained[1]
+    beta::Float64 = unconstrained[2]
+    log_sigma_y::Float64 = unconstrained[3]
 
     # sigma_y = exp(log_sigma_y); log|dsigma_y/dlog_sigma_y| = log_sigma_y.
     # Bidirectional edges so either sigma_y or log_sigma_y may be authoritative.

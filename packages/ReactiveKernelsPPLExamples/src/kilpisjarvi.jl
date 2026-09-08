@@ -48,13 +48,10 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
               psalpha::Float64,
               pmubeta::Float64,
               psbeta::Float64) = begin
-    # q = (α, β, log_σ). One-element reductions extract the packed scalars
-    # without scalar indexing, so the same prepared kernel stays traceable as a
-    # Reactant tensor program (matching the Eight Schools / linear-regression
-    # boundary).
-    alpha::Float64 = sum(view(unconstrained, 1:1))
-    beta::Float64 = sum(view(unconstrained, 2:2))
-    u_sigma::Float64 = sum(view(unconstrained, 3:3))
+    # q = (α, β, log_σ).
+    alpha::Float64 = unconstrained[1]
+    beta::Float64 = unconstrained[2]
+    u_sigma::Float64 = unconstrained[3]
 
     # Only σ has a support transform. Stan's `real<lower=0> sigma` is the
     # exp/log constrain θ = exp(u) with change-of-variables Jacobian

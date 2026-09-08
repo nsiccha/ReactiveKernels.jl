@@ -19,12 +19,10 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
               responses::Vector{Float64},
               new_predictor::Float64,
               prediction_innovation::Float64) = begin
-    # q = (α, β, log_σ). One-element reductions extract the packed scalars
-    # without scalar indexing, so the same prepared kernel stays traceable as a
-    # Reactant tensor program, matching the Eight Schools boundary.
-    α::Float64 = sum(view(unconstrained, 1:1))
-    β::Float64 = sum(view(unconstrained, 2:2))
-    log_σ::Float64 = sum(view(unconstrained, 3:3))
+    # q = (α, β, log_σ).
+    α::Float64 = unconstrained[1]
+    β::Float64 = unconstrained[2]
+    log_σ::Float64 = unconstrained[3]
 
     # Only σ has a support transform. Either σ or log_σ may be the authoritative
     # HAVE value; supplying both cuts both edges, matching the distribution

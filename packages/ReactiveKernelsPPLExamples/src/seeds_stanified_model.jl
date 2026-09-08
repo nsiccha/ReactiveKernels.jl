@@ -39,15 +39,14 @@ using LogExpFunctions: logistic
     # Stan's declared unconstrained order: (alpha0, alpha1, alpha12, alpha2,
     # b[1..I], log_sigma); D = I + 5. NOTE alpha12 precedes alpha2. Only sigma is
     # constrained (real<lower=0>); the four fixed effects and the random effect b
-    # are unconstrained. Slice without scalar indexing so the same prepared kernel
-    # stays traceable as a Reactant tensor program.
+    # are unconstrained.
     n_obs::Int = length(unconstrained) - 5
-    alpha0::Float64 = sum(view(unconstrained, 1:1))
-    alpha1::Float64 = sum(view(unconstrained, 2:2))
-    alpha12::Float64 = sum(view(unconstrained, 3:3))
-    alpha2::Float64 = sum(view(unconstrained, 4:4))
+    alpha0::Float64 = unconstrained[1]
+    alpha1::Float64 = unconstrained[2]
+    alpha12::Float64 = unconstrained[3]
+    alpha2::Float64 = unconstrained[4]
     b::AbstractVector{Float64} = view(unconstrained, 5:n_obs + 4)
-    u_sigma::Float64 = sum(view(unconstrained, n_obs + 5:n_obs + 5))
+    u_sigma::Float64 = unconstrained[n_obs + 5]
 
     # sigma = exp(u_sigma); log|dsigma/du_sigma| = u_sigma (Stan's `lb_constrain`).
     # The four fixed effects and b are unconstrained (identity, zero Jacobian).

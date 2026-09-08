@@ -1,7 +1,9 @@
 module ReactiveKernelsPPLExamples
 
 using ReactiveKernels: KernelSpec, PreparedKernel
+import PosteriorDB
 
+include("_posteriordb_data.jl")
 include("_ppl_source_authority.jl")
 include("ppl_workflow.jl")
 include("eight_schools.jl")

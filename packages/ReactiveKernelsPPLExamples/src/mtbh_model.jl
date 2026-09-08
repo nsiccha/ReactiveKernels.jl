@@ -59,10 +59,10 @@ using LogExpFunctions: logistic, log1pexp, logaddexp
               T::Int,
               M::Int) = begin
     # q = (u_omega, u_mean_p[1..T], gamma, u_sigma, eps_raw[1..M]); dim = 3 + T + M.
-    u_omega::Float64 = sum(view(unconstrained, 1:1))
+    u_omega::Float64 = unconstrained[1]
     u_mean_p::AbstractVector{Float64} = view(unconstrained, 2:T + 1)
-    gamma::Float64 = sum(view(unconstrained, T + 2:T + 2))
-    u_sigma::Float64 = sum(view(unconstrained, T + 3:T + 3))
+    gamma::Float64 = unconstrained[T + 2]
+    u_sigma::Float64 = unconstrained[T + 3]
     eps_raw::AbstractVector{Float64} = view(unconstrained, T + 4:T + 3 + M)
 
     # Constrained: omega, mean_p[j] ∈ [0,1] (logistic); sigma ∈ [0,3]

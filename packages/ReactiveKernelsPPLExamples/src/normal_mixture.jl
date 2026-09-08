@@ -1,7 +1,7 @@
 module NormalMixtureExample
 
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
 export NORMAL_MIXTURE_Y
 export build_normal_mixture_graph, demo
@@ -22,14 +22,10 @@ export NORMAL_MIXTURE_SOURCE, evaluate_normal_mixture_source
 # Real data is N=1000; a representative stride-17 subsample (59 points) of the
 # real posteriordb dataset is embedded (the graph rebinds full data via the
 # `y` port). The two clusters sit near mu ≈ ±10.
-const NORMAL_MIXTURE_Y = [10.0788, 9.90838, -10.9912, 8.16177, 9.46898,
-    10.9956, 11.5003, 10.0805, 7.33319, 12.0537, 9.28032, 8.50924, -11.6419,
-    -10.131, 9.48732, 10.658, -8.81471, -11.1097, 9.01034, 10.6101, 8.40314,
-    9.3452, -8.75164, -10.7425, 10.6007, 10.397, -10.3922, 11.1651, -11.0375,
-    -10.194, 9.17789, 7.92197, 9.34883, 10.6498, 11.1686, 7.81716, 11.2638,
-    9.80567, -9.92533, -11.6793, -11.416, 11.2871, 10.4752, 10.0594, 10.5924,
-    -8.56892, 9.7608, 10.0912, 9.74078, 9.29171, 10.9627, 10.3535, 10.1095,
-    9.67788, 11.1059, 9.30759, -10.1154, 8.28045, 9.62683]
+# Real data (full) from posteriordb `normal_2-normal_mixture`, loaded via PosteriorDB.jl.
+let d = _posteriordb_data("normal_2-normal_mixture")
+    global const NORMAL_MIXTURE_Y = Float64.(d["y"])
+end
 
 const NORMAL_MIXTURE_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
@@ -38,9 +34,9 @@ using LogExpFunctions: logistic, log1pexp, logaddexp
 @kernel model(unconstrained::Vector{Float64},
               y::Vector{Float64}) = begin
     # q = (u_theta, mu1, mu2); Stan declares theta then array[2] real mu. dim = 3.
-    u_theta::Float64 = sum(view(unconstrained, 1:1))
-    mu1::Float64 = sum(view(unconstrained, 2:2))
-    mu2::Float64 = sum(view(unconstrained, 3:3))
+    u_theta::Float64 = unconstrained[1]
+    mu1::Float64 = unconstrained[2]
+    mu2::Float64 = unconstrained[3]
 
     # theta ∈ [0,1] via logistic; interval Jacobian log|dθ/du| = -log1pexp(-u)
     # - log1pexp(u). mu is free (identity, no Jacobian). log(θ) and log(1-θ)
@@ -84,9 +80,10 @@ requested_nodes = (:parameters, :prior, :log_jacobian, :pointwise, :likelihood,
                    :posterior)
 density_kernel = prepare(model;
     have = (:unconstrained, :y),
-    want = requested_nodes)
+    want = requested_nodes,
+    bound = (; y))
 
-output = density_kernel(q, y)
+output = density_kernel(q)
 parameters, prior, log_jacobian, pointwise, likelihood, posterior = output
 @assert likelihood ≈ sum(pointwise)
 @assert posterior ≈ prior + likelihood + log_jacobian
@@ -95,7 +92,7 @@ parameters, prior, log_jacobian, pointwise, likelihood, posterior = output
 docs_example = (;
     name = :normal_mixture_posterior,
     origin = "posteriordb normal_2-normal_mixture — 2-component normal mixture, known unit variance (marginalized)",
-    inputs = (; q, y),
+    inputs = (; q),
     model,
     kernel = density_kernel,
     output,

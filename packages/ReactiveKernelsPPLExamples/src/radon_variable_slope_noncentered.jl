@@ -60,14 +60,12 @@ using LogExpFunctions: logistic, log1pexp
     # log_sigma_beta, log_sigma_y); dim = J + 4. The scalar intercept `alpha`
     # comes FIRST, then the per-county raw slope vector. `alpha`, `beta_raw`,
     # `mu_beta` are unconstrained; the two sigmas use the exp support transform.
-    # Slice without scalar indexing so the same kernel stays traceable as a
-    # Reactant program.
     n_counties::Int = length(unconstrained) - 4
-    alpha::Float64 = sum(view(unconstrained, 1:1))
+    alpha::Float64 = unconstrained[1]
     beta_raw::AbstractVector{Float64} = view(unconstrained, 2:n_counties + 1)
-    mu_beta::Float64 = sum(view(unconstrained, n_counties + 2:n_counties + 2))
-    log_sigma_beta::Float64 = sum(view(unconstrained, n_counties + 3:n_counties + 3))
-    log_sigma_y::Float64 = sum(view(unconstrained, n_counties + 4:n_counties + 4))
+    mu_beta::Float64 = unconstrained[n_counties + 2]
+    log_sigma_beta::Float64 = unconstrained[n_counties + 3]
+    log_sigma_y::Float64 = unconstrained[n_counties + 4]
 
     # sigma = exp(log_sigma); log|dsigma/dlog_sigma| = log_sigma. Bidirectional
     # edges so either sigma or log_sigma may be authoritative.
