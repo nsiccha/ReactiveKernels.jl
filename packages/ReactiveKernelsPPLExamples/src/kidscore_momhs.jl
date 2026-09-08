@@ -1,7 +1,7 @@
 module KidscoreMomhsExample
 
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
 export MOMHS_KID_SCORE, MOMHS_MOM_HS, MOMHS_MOM_HS_NEW
 export build_kidscore_momhs_graph, demo
@@ -9,22 +9,12 @@ export KIDSCORE_MOMHS_SOURCE, evaluate_kidscore_momhs_source
 
 # posteriordb `kidiq-kidscore_momhs` — the ARM (Gelman & Hill, ch. 3) linear
 # regression of a child's test score on whether the mother completed high
-# school. The real kidiq dataset has N = 434 rows; a faithfully-shaped,
-# real-valued representative subset of N = 40 (every 11th row, preserving both
-# mom_hs = 0 and mom_hs = 1) is embedded here so the example is self-contained
-# and cheap to trace, matching the other PPL examples. The Stan-gradient parity
-# check runs the real .stan against this same subset, so correctness is exact.
-const MOMHS_KID_SCORE = [
-    65.0, 58.0, 100.0, 106.0, 103.0, 56.0, 63.0, 73.0, 105.0, 95.0, 49.0, 99.0,
-    94.0, 100.0, 69.0, 98.0, 97.0, 58.0, 95.0, 98.0, 70.0, 81.0, 83.0,
-    110.0, 78.0, 58.0, 56.0, 43.0, 92.0, 92.0, 96.0, 83.0, 67.0, 94.0, 50.0,
-    56.0, 113.0, 95.0, 87.0, 94.0,
-]
-const MOMHS_MOM_HS = [
-    1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0,
-    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0,
-    1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0,
-]
+# school. Real data (full N = 434) loaded from the bundled artifact via
+# PosteriorDB.jl.
+let d = _posteriordb_data("kidiq-kidscore_momhs")
+    global const MOMHS_KID_SCORE = Float64.(d["kid_score"])
+    global const MOMHS_MOM_HS = Float64.(d["mom_hs"])
+end
 # ARM Ch.3 predicts a new child's score for a mother who finished high school.
 const MOMHS_MOM_HS_NEW = 1.0
 
@@ -66,13 +56,10 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
         b1 + b2 * hs
     end
 
-    # Likelihood: kid_scoreⱼ ~ Normal(β₁ + β₂·mom_hsⱼ, σ). The mean is recomputed
-    # inline inside the likelihood plate (not read from `linpred`), so a
-    # total-only query fuses the whole traversal and materializes no intermediate
-    # vector (structural CSE merges it with `linpred` only when both are
-    # requested).
-    pointwise = plate(kid_score, mom_hs, beta1, beta2, sigma) do score, hs, b1, b2, s
-        normal(b1 + b2 * hs, s).logpdf(score)
+    # Likelihood: kid_scoreⱼ ~ Normal(μⱼ, σ). Consumes the named `linpred` once
+    # (single-consumer plate-chain, fused buffer-free).
+    pointwise = plate(kid_score, linpred, sigma) do score, m, s
+        normal(m, s).logpdf(score)
     end
     likelihood::Float64 = sum(pointwise)
 
@@ -99,18 +86,21 @@ mom_hs = MOMHS_MOM_HS
 mom_hs_new = MOMHS_MOM_HS_NEW
 
 requested_nodes = (:parameters, :log_prior, :log_jacobian, :likelihood, :posterior)
+# Raw data BOUND (benchmark-acceptance entry): kid_score/mom_hs stay in HAVE but
+# are fixed to their data values; only `unconstrained` stays active.
 density_kernel = prepare(model;
     have = (:unconstrained, :kid_score, :mom_hs),
-    want = requested_nodes)
+    want = requested_nodes,
+    bound = (; kid_score, mom_hs))
 
-output = density_kernel(q, kid_score, mom_hs)
+output = density_kernel(q)
 parameters, log_prior, log_jacobian, likelihood, posterior = output
 @assert posterior ≈ log_prior + likelihood + log_jacobian
 
 docs_example = (;
     name = :kidscore_momhs_posterior,
     origin = "posteriordb kidiq-kidscore_momhs — ARM Ch.3 Gaussian regression",
-    inputs = (; q, kid_score, mom_hs),
+    inputs = (; q),
     model,
     kernel = density_kernel,
     output,

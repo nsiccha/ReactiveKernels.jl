@@ -1,7 +1,7 @@
 module KidscoreMomhsiqExample
 
 using ReactiveKernels
-using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source
+using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
 export MOMHSIQ_KID_SCORE, MOMHSIQ_MOM_HS, MOMHSIQ_MOM_IQ
 export MOMHSIQ_MOM_HS_NEW, MOMHSIQ_MOM_IQ_NEW
@@ -15,29 +15,12 @@ export KIDSCORE_MOMHSIQ_SOURCE, evaluate_kidscore_momhsiq_source
 # mom_hs = 0 and mom_hs = 1) is embedded here so the example is self-contained
 # and cheap to trace. The Stan-gradient parity check runs the real .stan against
 # this same subset, so correctness is exact.
-const MOMHSIQ_KID_SCORE = [
-    65.0, 58.0, 100.0, 106.0, 103.0, 56.0, 63.0, 73.0, 105.0, 95.0, 49.0, 99.0,
-    94.0, 100.0, 69.0, 98.0, 97.0, 58.0, 95.0, 98.0, 70.0, 81.0, 83.0,
-    110.0, 78.0, 58.0, 56.0, 43.0, 92.0, 92.0, 96.0, 83.0, 67.0, 94.0, 50.0,
-    56.0, 113.0, 95.0, 87.0, 94.0,
-]
-const MOMHSIQ_MOM_HS = [
-    1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0,
-    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0,
-    1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0,
-]
-const MOMHSIQ_MOM_IQ = [
-    121.117528602603, 94.8597081943671, 97.9115903092628, 108.633496913048,
-    85.8103765615827, 79.8335329627323, 93.4981963041352, 78.0131542683097,
-    136.493846917085, 78.8071449713118, 112.018920897562, 131.835771186485,
-    127.66705890683, 106.548478717828, 91.6067417305091, 93.1447908573186,
-    113.910375471188, 100.534071915245, 92.8677114462598, 109.537397162078,
-    90.3457720147583, 86.7688663993614, 99.1562556370934, 128.80901236506,
-    100.116947483653, 81.0945026784831, 91.9206443312728, 77.3826694104343,
-    103.791957561996, 87.0034481236916, 109.466321282875, 85.1798917037074,
-    96.6542846134164, 117.55716307788, 85.8348677328627, 80.8921631665322,
-    89.715287156883, 100.243630139074, 89.2908058308629, 84.8774118257353,
-]
+# Real data (full) from posteriordb `kidiq-kidscore_momhsiq`, loaded via PosteriorDB.jl.
+let d = _posteriordb_data("kidiq-kidscore_momhsiq")
+    global const MOMHSIQ_KID_SCORE = Float64.(d["kid_score"])
+    global const MOMHSIQ_MOM_HS = Float64.(d["mom_hs"])
+    global const MOMHSIQ_MOM_IQ = Float64.(d["mom_iq"])
+end
 # ARM Ch.3 predicts a new child's score for a high-school-completing mother of
 # average IQ (100).
 const MOMHSIQ_MOM_HS_NEW = 1.0
@@ -80,11 +63,10 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
         b1 + b2 * hs + b3 * iq
     end
 
-    # Likelihood: kid_scoreⱼ ~ Normal(β₁ + β₂·mom_hsⱼ + β₃·mom_iqⱼ, σ). The mean
-    # is recomputed inline inside the likelihood plate, so a total-only query
-    # fuses the whole traversal and materializes no intermediate vector.
-    pointwise = plate(kid_score, mom_hs, mom_iq, beta1, beta2, beta3, sigma) do score, hs, iq, b1, b2, b3, s
-        normal(b1 + b2 * hs + b3 * iq, s).logpdf(score)
+    # Likelihood: kid_scoreⱼ ~ Normal(μⱼ, σ). Consumes the named `linpred` once
+    # (single-consumer plate-chain, fused buffer-free).
+    pointwise = plate(kid_score, linpred, sigma) do score, m, s
+        normal(m, s).logpdf(score)
     end
     likelihood::Float64 = sum(pointwise)
 
@@ -113,16 +95,17 @@ mom_iq_new = MOMHSIQ_MOM_IQ_NEW
 requested_nodes = (:parameters, :log_prior, :log_jacobian, :likelihood, :posterior)
 density_kernel = prepare(model;
     have = (:unconstrained, :kid_score, :mom_hs, :mom_iq),
-    want = requested_nodes)
+    want = requested_nodes,
+    bound = (; kid_score, mom_hs, mom_iq))
 
-output = density_kernel(q, kid_score, mom_hs, mom_iq)
+output = density_kernel(q)
 parameters, log_prior, log_jacobian, likelihood, posterior = output
 @assert posterior ≈ log_prior + likelihood + log_jacobian
 
 docs_example = (;
     name = :kidscore_momhsiq_posterior,
     origin = "posteriordb kidiq-kidscore_momhsiq — ARM Ch.3 Gaussian regression",
-    inputs = (; q, kid_score, mom_hs, mom_iq),
+    inputs = (; q),
     model,
     kernel = density_kernel,
     output,
