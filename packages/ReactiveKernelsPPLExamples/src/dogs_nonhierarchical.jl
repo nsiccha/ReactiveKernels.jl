@@ -170,16 +170,16 @@ docs_example = (;
 )
 """
 
-function evaluate_dogs_nonhierarchical_source()
+function evaluate_dogs_nonhierarchical_source(; model_only::Bool = false)
     _evaluate_ppl_source(DOGS_NH_SOURCE, @__MODULE__; bindings = (
         :DOGS_NH_Y,
-    ))
+    ), model_only)
 end
 
 const _DOGS_NH_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _DOGS_NH_GRAPH_TEMPLATE[] = evaluate_dogs_nonhierarchical_source().model
+    _DOGS_NH_GRAPH_TEMPLATE[] = evaluate_dogs_nonhierarchical_source(; model_only = true).model
     nothing
 end
 

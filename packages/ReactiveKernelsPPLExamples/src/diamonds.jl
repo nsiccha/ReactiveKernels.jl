@@ -140,18 +140,18 @@ docs_example = (;
 )
 """
 
-function evaluate_diamonds_source()
+function evaluate_diamonds_source(; model_only::Bool = false)
     # Bind only the data. The authored source imports the reusable Normal and
     # Student-t endpoints itself and authors the centering prefix inline.
     _evaluate_ppl_source(DIAMONDS_SOURCE, @__MODULE__; bindings = (
         :DIAMONDS_X, :DIAMONDS_Y, :DIAMONDS_PRIOR_ONLY,
-    ))
+    ), model_only)
 end
 
 const _DIAMONDS_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _DIAMONDS_GRAPH_TEMPLATE[] = evaluate_diamonds_source().model
+    _DIAMONDS_GRAPH_TEMPLATE[] = evaluate_diamonds_source(; model_only = true).model
     nothing
 end
 

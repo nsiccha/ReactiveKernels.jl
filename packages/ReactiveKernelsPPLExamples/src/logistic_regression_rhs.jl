@@ -173,16 +173,16 @@ docs_example = (;
 )
 """
 
-function evaluate_logistic_regression_rhs_source()
+function evaluate_logistic_regression_rhs_source(; model_only::Bool = false)
     _evaluate_ppl_source(LOGISTIC_RHS_SOURCE, @__MODULE__; bindings = (
         :LOGISTIC_RHS_X, :LOGISTIC_RHS_Y, :LOGISTIC_RHS_HYPER,
-    ))
+    ), model_only)
 end
 
 const _LOGISTIC_RHS_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _LOGISTIC_RHS_GRAPH_TEMPLATE[] = evaluate_logistic_regression_rhs_source().model
+    _LOGISTIC_RHS_GRAPH_TEMPLATE[] = evaluate_logistic_regression_rhs_source(; model_only = true).model
     nothing
 end
 

@@ -149,16 +149,16 @@ docs_example = (;
 )
 """
 
-function evaluate_normal_mixture_k_source()
+function evaluate_normal_mixture_k_source(; model_only::Bool = false)
     _evaluate_ppl_source(NORMAL_MIXTURE_K_SOURCE, @__MODULE__; bindings = (
         :NORMAL_MIXTURE_K_Y, :NORMAL_MIXTURE_K_K,
-    ))
+    ), model_only)
 end
 
 const _NORMAL_MIXTURE_K_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _NORMAL_MIXTURE_K_GRAPH_TEMPLATE[] = evaluate_normal_mixture_k_source().model
+    _NORMAL_MIXTURE_K_GRAPH_TEMPLATE[] = evaluate_normal_mixture_k_source(; model_only = true).model
     nothing
 end
 
