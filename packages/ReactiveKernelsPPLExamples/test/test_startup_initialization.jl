@@ -115,9 +115,10 @@ const _M = ReactiveKernelsPPLExamples
         @test pv(g2) == v
     end
 
-    @testset "model-only graph is bit-identical to the full-source graph" begin
+    @testset "model-only graph matches the full-source graph exactly" begin
         # Same authored `@kernel model` -> same KernelSpec -> same prepared
-        # kernel -> exact (not merely approximate) equality. `==`, not `≈`.
+        # kernel -> EXACT NUMERIC equality (`==`, not `≈`). (`==` is exact
+        # numeric equality, e.g. +0.0 == -0.0 — not a byte comparison.)
         q = [0.0, log(5.0), zeros(E.NSCHOOLS)...]
         pv(g) = prepare(g; have = (:unconstrained, :observations, :observation_scales),
                            want = :posterior)(q, E.EIGHT_SCHOOLS_Y, E.EIGHT_SCHOOLS_SIGMA)

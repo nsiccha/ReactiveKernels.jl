@@ -14,9 +14,10 @@
 #       include("acceptance_startup_ad_reactant.jl")
 # Native asserts always run; Enzyme asserts run iff Enzyme is loaded; Reactant
 # asserts run iff Reactant is loaded. Same-backend model-only-vs-full comparisons
-# are EXACT (`==`, bit-identical); the only approximate assert is native-vs-Reactant
-# (different backends). The finite-difference check is manual central differences,
-# NOT ForwardDiff.
+# assert EXACT NUMERIC equality (`==`; note `==` is exact numeric equality, e.g.
+# +0.0 == -0.0, not bit identity); the only approximate assert is
+# native-vs-Reactant (different backends). The finite-difference check is manual
+# central differences, NOT ForwardDiff.
 
 using Test
 const _AMR = ReactiveKernelsPPLExamples
@@ -24,6 +25,12 @@ const _AMR = ReactiveKernelsPPLExamples
 # (model_only template graph, full-source graph) for a module.
 _mo_full(mod, buildfn, evalfn) =
     (getproperty(mod, buildfn)(), compose(getproperty(mod, evalfn)().model))
+
+# Package-identity check by loaded PkgId name — stronger than `isdefined(Main, …)`
+# because an INDIRECT import (a dependency loading Reactant) need not bind the
+# name in Main, yet WOULD change the numerical backend context. Used to assert
+# the native/Enzyme path runs with Reactant genuinely not loaded.
+_pkg_loaded(name) = any(id -> id.name == name, keys(Base.loaded_modules))
 
 @testset "startup model-only ≡ full-source graph: AD / Reactant acceptance" begin
     E = _AMR.EightSchoolsExample
@@ -35,7 +42,7 @@ _mo_full(mod, buildfn, evalfn) =
     gp_bnd  = (; year = G.GLM_POISSON_YEAR, counts = G.GLM_POISSON_C)
     gp_q    = [0.2, 0.1, -0.05, 0.03]
 
-    @testset "native primal — bit-identical (== )" begin
+    @testset "native primal — exact numeric equality (==)" begin
         for (mod, bf, ef, have, bnd, q) in (
             (E, :build_eight_schools_graph, :evaluate_eight_schools_source, es_have, es_bnd, es_q),
             (G, :build_glm_poisson_graph,   :evaluate_glm_poisson_source,   gp_have, gp_bnd, gp_q),
@@ -49,8 +56,12 @@ _mo_full(mod, buildfn, evalfn) =
     end
 
     if isdefined(Main, :Enzyme) && isdefined(Main, :DifferentiationInterface)
-        @testset "plain-Enzyme reverse gradient — bit-identical (Reactant-free context)" begin
-            @test !isdefined(Main, :Reactant)          # native-unloaded context preserved
+        @testset "plain-Enzyme reverse gradient — exact numeric equality (Reactant-free context)" begin
+            # Context assertion by loaded-package IDENTITY, before AND after the
+            # native/Enzyme path — an indirect import would not bind Main.Reactant
+            # yet would change the backend, so `isdefined(Main,:Reactant)` is too
+            # weak. Reactant must genuinely not be loaded around this path.
+            @test !_pkg_loaded("Reactant")             # BEFORE
             BE = Main.AutoEnzyme(; mode = Main.Enzyme.Reverse)
             gmo, gfu = _mo_full(E, :build_eight_schools_graph, :evaluate_eight_schools_source)
             grad(g) = begin
@@ -61,8 +72,8 @@ _mo_full(mod, buildfn, evalfn) =
             (vmo, gmo_grad) = grad(gmo)
             (vfu, gfu_grad) = grad(gfu)
             @test all(isfinite, gmo_grad)
-            @test vmo == vfu                            # same backend + graph -> exact
-            @test gmo_grad == gfu_grad                  # exact gradient equality
+            @test vmo == vfu                            # same backend + graph -> exact numeric
+            @test gmo_grad == gfu_grad                  # exact numeric gradient equality
             # finite-difference sanity (manual central differences, NOT ForwardDiff)
             h = 1e-6
             kk = prepare(gmo; have = es_have, want = :posterior, bound = es_bnd)
@@ -72,6 +83,7 @@ _mo_full(mod, buildfn, evalfn) =
                 fd = (kk(qp) - kk(qm)) / (2h)
                 @test isapprox(gmo_grad[i], fd; rtol = 1e-4, atol = 1e-6)
             end
+            @test !_pkg_loaded("Reactant")             # AFTER
         end
     end
 
