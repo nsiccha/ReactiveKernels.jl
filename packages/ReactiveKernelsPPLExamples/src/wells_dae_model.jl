@@ -117,16 +117,16 @@ docs_example = (;
 )
 """
 
-function evaluate_wells_dae_source()
+function evaluate_wells_dae_source(; model_only::Bool = false)
     _evaluate_ppl_source(WELLS_DAE_SOURCE, @__MODULE__; bindings = (
         :WELLS_DAE_DIST, :WELLS_DAE_ARSENIC, :WELLS_DAE_EDUC, :WELLS_DAE_SWITCHED,
-    ))
+    ), model_only)
 end
 
 const _WELLS_DAE_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _WELLS_DAE_GRAPH_TEMPLATE[] = evaluate_wells_dae_source().model
+    _WELLS_DAE_GRAPH_TEMPLATE[] = evaluate_wells_dae_source(; model_only = true).model
     nothing
 end
 

@@ -160,16 +160,16 @@ docs_example = (;
 )
 """
 
-function evaluate_mth_model_source()
+function evaluate_mth_model_source(; model_only::Bool = false)
     _evaluate_ppl_source(MTH_SOURCE, @__MODULE__; bindings = (
         :MTH_Y, :MTH_S, :MTH_T, :MTH_M,
-    ))
+    ), model_only)
 end
 
 const _MTH_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _MTH_GRAPH_TEMPLATE[] = evaluate_mth_model_source().model
+    _MTH_GRAPH_TEMPLATE[] = evaluate_mth_model_source(; model_only = true).model
     nothing
 end
 

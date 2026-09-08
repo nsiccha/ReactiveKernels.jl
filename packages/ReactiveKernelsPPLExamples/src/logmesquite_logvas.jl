@@ -168,17 +168,17 @@ docs_example = (;
 )
 """
 
-function evaluate_logmesquite_logvas_source()
+function evaluate_logmesquite_logvas_source(; model_only::Bool = false)
     _evaluate_ppl_source(LOGMESQUITE_LOGVAS_SOURCE, @__MODULE__; bindings = (
         :LOGVAS_LOG_WEIGHT, :LOGVAS_DIAM1, :LOGVAS_DIAM2, :LOGVAS_CANOPY_HEIGHT,
         :LOGVAS_TOTAL_HEIGHT, :LOGVAS_DENSITY, :LOGVAS_GROUP,
-    ))
+    ), model_only)
 end
 
 const _LOGMESQUITE_LOGVAS_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _LOGMESQUITE_LOGVAS_GRAPH_TEMPLATE[] = evaluate_logmesquite_logvas_source().model
+    _LOGMESQUITE_LOGVAS_GRAPH_TEMPLATE[] = evaluate_logmesquite_logvas_source(; model_only = true).model
     nothing
 end
 

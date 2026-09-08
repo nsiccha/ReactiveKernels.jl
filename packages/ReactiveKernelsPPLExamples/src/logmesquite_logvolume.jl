@@ -143,20 +143,20 @@ docs_example = (;
 )
 """
 
-function evaluate_logmesquite_logvolume_source()
+function evaluate_logmesquite_logvolume_source(; model_only::Bool = false)
     # Bind only the data. The authored source imports the reusable Normal
     # endpoint itself and computes the log/volume transforms inline on the raw
     # data.
     _evaluate_ppl_source(LOGMESQUITE_LOGVOLUME_SOURCE, @__MODULE__; bindings = (
         :LOGVOL_LOG_WEIGHT, :LOGVOL_DIAM1, :LOGVOL_DIAM2, :LOGVOL_CANOPY_HEIGHT,
-    ))
+    ), model_only)
 end
 
 const _LOGMESQUITE_LOGVOLUME_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
     _LOGMESQUITE_LOGVOLUME_GRAPH_TEMPLATE[] =
-        evaluate_logmesquite_logvolume_source().model
+        evaluate_logmesquite_logvolume_source(; model_only = true).model
     nothing
 end
 

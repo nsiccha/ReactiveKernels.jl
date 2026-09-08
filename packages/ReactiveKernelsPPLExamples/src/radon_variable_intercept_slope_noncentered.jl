@@ -184,16 +184,16 @@ docs_example = (;
 )
 """
 
-function evaluate_radon_variable_intercept_slope_noncentered_source()
+function evaluate_radon_variable_intercept_slope_noncentered_source(; model_only::Bool = false)
     _evaluate_ppl_source(RADON_VARIABLE_INTERCEPT_SLOPE_NONCENTERED_SOURCE, @__MODULE__;
-        bindings = (:RADON_VISN_COUNTY, :RADON_VISN_FLOOR, :RADON_VISN_LOG))
+        bindings = (:RADON_VISN_COUNTY, :RADON_VISN_FLOOR, :RADON_VISN_LOG), model_only)
 end
 
 const _RADON_VISN_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
     _RADON_VISN_GRAPH_TEMPLATE[] =
-        evaluate_radon_variable_intercept_slope_noncentered_source().model
+        evaluate_radon_variable_intercept_slope_noncentered_source(; model_only = true).model
     nothing
 end
 

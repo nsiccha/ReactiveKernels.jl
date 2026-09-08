@@ -110,16 +110,16 @@ docs_example = (;
 )
 """
 
-function evaluate_logearn_height_source()
+function evaluate_logearn_height_source(; model_only::Bool = false)
     _evaluate_ppl_source(LOGEARN_HEIGHT_SOURCE, @__MODULE__; bindings = (
         :LOGEARN_HEIGHT_EARN, :LOGEARN_HEIGHT_HEIGHT,
-    ))
+    ), model_only)
 end
 
 const _LOGEARN_HEIGHT_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _LOGEARN_HEIGHT_GRAPH_TEMPLATE[] = evaluate_logearn_height_source().model
+    _LOGEARN_HEIGHT_GRAPH_TEMPLATE[] = evaluate_logearn_height_source(; model_only = true).model
     nothing
 end
 

@@ -121,17 +121,17 @@ docs_example = (;
 )
 """
 
-function evaluate_logearn_interaction_source()
+function evaluate_logearn_interaction_source(; model_only::Bool = false)
     _evaluate_ppl_source(LOGEARN_INTERACTION_SOURCE, @__MODULE__; bindings = (
         :LOGEARN_INTERACTION_EARN, :LOGEARN_INTERACTION_HEIGHT,
         :LOGEARN_INTERACTION_MALE,
-    ))
+    ), model_only)
 end
 
 const _LOGEARN_INTERACTION_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _LOGEARN_INTERACTION_GRAPH_TEMPLATE[] = evaluate_logearn_interaction_source().model
+    _LOGEARN_INTERACTION_GRAPH_TEMPLATE[] = evaluate_logearn_interaction_source(; model_only = true).model
     nothing
 end
 

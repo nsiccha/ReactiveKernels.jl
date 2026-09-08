@@ -182,18 +182,18 @@ docs_example = (;
 )
 """
 
-function evaluate_kidscore_interaction_z_source()
+function evaluate_kidscore_interaction_z_source(; model_only::Bool = false)
     _evaluate_ppl_source(KIDSCORE_INTERACTION_Z_SOURCE, @__MODULE__; bindings = (
         :INTERACTION_Z_KID_SCORE, :INTERACTION_Z_MOM_HS, :INTERACTION_Z_MOM_IQ,
         :INTERACTION_Z_MOM_HS_NEW, :INTERACTION_Z_MOM_IQ_NEW,
-    ))
+    ), model_only)
 end
 
 const _KIDSCORE_INTERACTION_Z_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
     _KIDSCORE_INTERACTION_Z_GRAPH_TEMPLATE[] =
-        evaluate_kidscore_interaction_z_source().model
+        evaluate_kidscore_interaction_z_source(; model_only = true).model
     nothing
 end
 

@@ -156,17 +156,17 @@ docs_example = (;
 )
 """
 
-function evaluate_logmesquite_logvash_source()
+function evaluate_logmesquite_logvash_source(; model_only::Bool = false)
     _evaluate_ppl_source(LOGMESQUITE_LOGVASH_SOURCE, @__MODULE__; bindings = (
         :LOGVASH_LOG_WEIGHT, :LOGVASH_DIAM1, :LOGVASH_DIAM2, :LOGVASH_CANOPY_HEIGHT,
         :LOGVASH_TOTAL_HEIGHT, :LOGVASH_GROUP,
-    ))
+    ), model_only)
 end
 
 const _LOGMESQUITE_LOGVASH_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _LOGMESQUITE_LOGVASH_GRAPH_TEMPLATE[] = evaluate_logmesquite_logvash_source().model
+    _LOGMESQUITE_LOGVASH_GRAPH_TEMPLATE[] = evaluate_logmesquite_logvash_source(; model_only = true).model
     nothing
 end
 

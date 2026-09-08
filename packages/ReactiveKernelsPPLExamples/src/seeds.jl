@@ -141,16 +141,16 @@ docs_example = (;
 )
 """
 
-function evaluate_seeds_source()
+function evaluate_seeds_source(; model_only::Bool = false)
     _evaluate_ppl_source(SEEDS_SOURCE, @__MODULE__; bindings = (
         :SEEDS_COUNTS, :SEEDS_TOTALS, :SEEDS_X1, :SEEDS_X2,
-    ))
+    ), model_only)
 end
 
 const _SEEDS_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _SEEDS_GRAPH_TEMPLATE[] = evaluate_seeds_source().model
+    _SEEDS_GRAPH_TEMPLATE[] = evaluate_seeds_source(; model_only = true).model
     nothing
 end
 

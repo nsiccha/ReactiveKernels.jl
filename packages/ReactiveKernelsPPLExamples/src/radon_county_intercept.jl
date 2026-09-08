@@ -143,16 +143,16 @@ docs_example = (;
 )
 """
 
-function evaluate_radon_county_intercept_source()
+function evaluate_radon_county_intercept_source(; model_only::Bool = false)
     _evaluate_ppl_source(RADON_COUNTY_INTERCEPT_SOURCE, @__MODULE__;
-        bindings = (:RADON_CI_COUNTY, :RADON_CI_FLOOR, :RADON_CI_LOG))
+        bindings = (:RADON_CI_COUNTY, :RADON_CI_FLOOR, :RADON_CI_LOG), model_only)
 end
 
 const _RADON_CI_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
     _RADON_CI_GRAPH_TEMPLATE[] =
-        evaluate_radon_county_intercept_source().model
+        evaluate_radon_county_intercept_source(; model_only = true).model
     nothing
 end
 
