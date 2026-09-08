@@ -312,6 +312,51 @@ function setup_bound_regression!(mod::Module)
     nothing
 end
 
+function setup_diamonds!(mod::Module)
+    if !isdefined(mod, :DiamondsExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: DiamondsExample))
+    end
+    # Bind only the data. The displayed PPL assembly imports the shared `normal`
+    # and `student_t` endpoints itself and authors the brms centered-design
+    # prefix inline; binding the raw `X` port hoists it.
+    Core.eval(mod, :(using .DiamondsExample: DIAMONDS_X, DIAMONDS_Y, DIAMONDS_PRIOR_ONLY))
+    nothing
+end
+
+function setup_normal_mixture_k!(mod::Module)
+    if !isdefined(mod, :NormalMixtureKExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: NormalMixtureKExample))
+    end
+    # Bind only the data and the component count K. The displayed PPL assembly
+    # imports the shared `normal` endpoint itself and authors the inverse-ILR
+    # simplex transform and the marginalized K-way mixture likelihood inline.
+    Core.eval(mod, :(using .NormalMixtureKExample: NORMAL_MIXTURE_K_Y, NORMAL_MIXTURE_K_K))
+    nothing
+end
+
+function setup_dogs_nonhierarchical!(mod::Module)
+    if !isdefined(mod, :DogsNonhierarchicalExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: DogsNonhierarchicalExample))
+    end
+    # Bind only the raw y matrix. The displayed PPL assembly imports the shared
+    # `normal` and `bernoulli` endpoints itself and derives the running-count
+    # design (the strict-upper-triangular operator, prev_shock = y·C, …) in-graph.
+    Core.eval(mod, :(using .DogsNonhierarchicalExample: DOGS_NH_Y))
+    nothing
+end
+
+function setup_logistic_regression_rhs!(mod::Module)
+    if !isdefined(mod, :LogisticRegressionRHSExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: LogisticRegressionRHSExample))
+    end
+    # Bind the data and the fixed horseshoe hyper-scalars. The displayed PPL
+    # assembly imports the shared endpoints itself and authors the regularized
+    # horseshoe (lambda_tilde, the exp support transforms) inline.
+    Core.eval(mod, :(using .LogisticRegressionRHSExample:
+        LOGISTIC_RHS_X, LOGISTIC_RHS_Y, LOGISTIC_RHS_HYPER))
+    nothing
+end
+
 function setup_online_stats!(mod::Module)
     if !isdefined(mod, :OnlineStatsExample)
         Base.include(mod, joinpath(@__DIR__, "..", "examples", "online_stats.jl"))
@@ -732,6 +777,10 @@ const EXPECTED_PPL_EXAMPLES = (
     :mnist_logistic_optimized_density,
     :mvnormal_regression_density,
     :bound_regression_density,
+    :diamonds_posterior,
+    :normal_mixture_k_posterior,
+    :dogs_nonhierarchical_posterior,
+    :logistic_regression_rhs_posterior,
 )
 const _PPL_EXECUTION_COUNTS = Dict(name => 0 for name in EXPECTED_PPL_EXAMPLES)
 

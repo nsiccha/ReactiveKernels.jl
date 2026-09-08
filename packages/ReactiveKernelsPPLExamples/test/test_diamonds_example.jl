@@ -50,7 +50,8 @@ end
         @test occursin("student_t(3.0, 8.0, 10.0).logpdf", DIAMONDS_SOURCE)
         @test occursin("log(2.0) + student_t(3.0, 0.0, 10.0).logpdf", DIAMONDS_SOURCE)
         @test occursin("Xc::Matrix{Float64} = Xnoint .- col_means", DIAMONDS_SOURCE)
-        @test occursin("bound = (; X)", DIAMONDS_SOURCE)
+        @test occursin("bound = (; X, prior_only)", DIAMONDS_SOURCE)
+        @test occursin("ifelse(prior_only == 0, likelihood, 0.0)", DIAMONDS_SOURCE)
         @test occursin("pointwise = plate(", DIAMONDS_SOURCE)
         @test !occursin("struct ", DIAMONDS_SOURCE)
         @test artifact.normal_object === normal
@@ -59,28 +60,29 @@ end
 
     @testset "posterior decomposition vs the independent reference oracle" begin
         pk = prepare(model;
-            have = (:unconstrained, :X, :Y),
+            have = (:unconstrained, :X, :Y, :prior_only),
             want = (:log_prior, :log_jacobian, :likelihood, :posterior),
-            bound = (; X = DIAMONDS_X))
+            bound = (; X = DIAMONDS_X, prior_only = DIAMONDS_PRIOR_ONLY))
         log_prior, log_jacobian, likelihood, posterior = pk(q, DIAMONDS_Y)
         @test log_prior ≈ reference.log_prior
         @test log_jacobian ≈ reference.log_jacobian
-        @test likelihood ≈ reference.likelihood
-        @test posterior ≈ reference.posterior
+        @test likelihood ≈ reference.likelihood       # unconditional likelihood node
+        @test posterior ≈ reference.posterior          # prior_only == 0 -> likelihood included
         @test isfinite(posterior)
+        @test DIAMONDS_PRIOR_ONLY == 0                  # the diamonds-diamonds posterior
     end
 
-    @testset "generated quantity b_Intercept from a constrained HAVE" begin
+    @testset "generated quantity b_Intercept from an unconstrained HAVE" begin
         gq = prepare(model; have = (:unconstrained, :X), want = :b_Intercept,
                      bound = (; X = DIAMONDS_X))
         @test gq(q) ≈ reference.b_Intercept
     end
 
     @testset "the data-only centering prefix hoists under bound" begin
-        plain = prepare(model; have = (:unconstrained, :X, :Y), want = :posterior)
-        bound = prepare(model; have = (:unconstrained, :X, :Y), want = :posterior,
-                        bound = (; X = DIAMONDS_X))
-        @test plain(q, DIAMONDS_X, DIAMONDS_Y) ≈ bound(q, DIAMONDS_Y)
+        plain = prepare(model; have = (:unconstrained, :X, :Y, :prior_only), want = :posterior)
+        bound = prepare(model; have = (:unconstrained, :X, :Y, :prior_only), want = :posterior,
+                        bound = (; X = DIAMONDS_X, prior_only = DIAMONDS_PRIOR_ONLY))
+        @test plain(q, DIAMONDS_X, DIAMONDS_Y, DIAMONDS_PRIOR_ONLY) ≈ bound(q, DIAMONDS_Y)
         @test bound(q, DIAMONDS_Y) ≈ reference.posterior
     end
 end

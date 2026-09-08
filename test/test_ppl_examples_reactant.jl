@@ -543,7 +543,7 @@ end
         a = evaluate_diamonds_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
-    @testset "normal_mixture_k (posteriordb; K=5 simplex mixture, log_sum_exp)" begin
+    @testset "normal_mixture_k (posteriordb; natural K-dim simplex mixture, log_sum_exp)" begin
         a = evaluate_normal_mixture_k_source()
         @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end

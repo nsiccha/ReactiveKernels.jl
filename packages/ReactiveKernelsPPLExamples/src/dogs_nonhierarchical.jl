@@ -3,7 +3,7 @@ module DogsNonhierarchicalExample
 using ReactiveKernels
 using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
-export DOGS_NH_Y, DOGS_NH_C, DOGS_NH_DOG_IDX, DOGS_NH_J, DOGS_NH_T
+export DOGS_NH_Y, DOGS_NH_J, DOGS_NH_T
 export build_dogs_nonhierarchical_graph, demo
 export DOGS_NH_SOURCE, evaluate_dogs_nonhierarchical_source
 
@@ -25,23 +25,16 @@ export DOGS_NH_SOURCE, evaluate_dogs_nonhierarchical_source
 #   to_vector(z)      ~ Normal(0, 1)
 #
 # Real, FULL data (J = 30 dogs × T = 25 trials) loaded from posteriordb via
-# PosteriorDB.jl. The running-count design is derived IN-GRAPH from the bound
-# `y` matrix (prev_shock = y·C, prev_avoid = (1−y)·C where C is the fixed T×T
-# strict-upper-triangular "count prior trials" operator), so partial evaluation
-# hoists the whole data-only prefix; C and the per-cell dog index are fixed
-# STRUCTURAL constants (they depend only on the shape J, T — like an intercept
-# column of ones), bound alongside `y`.
+# PosteriorDB.jl. Raw `y` is the ONLY data HAVE: the running-count design is derived
+# entirely IN-GRAPH from the bound `y` matrix — the fixed T×T strict-upper-triangular
+# operator C[s,t] = (s < t) is built in-graph from the declared trial count, and
+# prev_shock = y·C, prev_avoid = (1−y)·C, log p, and the per-dog scaling all live in
+# named graph nodes, so binding `y` hoists the whole data-only prefix.
 let d = _posteriordb_data("dogs-dogs_nonhierarchical")
     global const DOGS_NH_Y = Bool.(d["y"])            # J×T
 end
 const DOGS_NH_J = size(DOGS_NH_Y, 1)                  # 30
 const DOGS_NH_T = size(DOGS_NH_Y, 2)                  # 25
-# Fixed structural operators (depend only on the shape, not on y's values):
-# C[s,t] = 1 iff s < t, so (y·C)[j,t] = Σ_{s<t} y[j,s] = prev_shock[j,t].
-const DOGS_NH_C = [Float64(s < t) for s in 1:DOGS_NH_T, t in 1:DOGS_NH_T]
-# Column-major (vec) cell -> dog index: cell p (1-based) is (dog ((p-1) mod J)+1,
-# trial ((p-1) div J)+1), so the dog index vector is [1..J, 1..J, ...] (T times).
-const DOGS_NH_DOG_IDX = repeat(collect(1:DOGS_NH_J), DOGS_NH_T)
 
 const DOGS_NH_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, bernoulli
@@ -49,10 +42,9 @@ import ReactiveKernelsDistributionKernels.DistributionKernelSources as DKS
 using LogExpFunctions: logistic, log1pexp
 
 @kernel model(unconstrained::Vector{Float64},
-              y::Matrix{Bool},
-              C::Matrix{Float64},
-              dog_idx::Vector{Int}) = begin
+              y::Matrix{Bool}) = begin
     n_dogs::Int = size(y, 1)
+    n_trials::Int = size(y, 2)
 
     # Unconstrained layout q = (mu_logit_ab[1:2], u_sigma[1:2], w_L,
     # z[:,1][1:J], z[:,2][1:J]), matching the Stan parameter declaration order
@@ -112,25 +104,32 @@ using LogExpFunctions: logistic, log1pexp
     log_a::Vector{Float64} = -log1pexp.(-logit_a)
     log_b::Vector{Float64} = -log1pexp.(-logit_b)
 
-    # Data-only running-count design, derived IN-GRAPH from the bound y matrix.
-    # prev_shock = y·C, prev_avoid = (1−y)·C, then flattened column-major so the
-    # flat cell vectors align with the bound per-cell dog index.
+    # Running-count design, derived entirely IN-GRAPH from the bound y matrix — raw
+    # y is the only data HAVE. The fixed structural operator C[s,t] = 1 iff s < t is
+    # built in-graph from the declared trial count (a strict-upper-triangular index
+    # mask), so prev_shock = y·C and prev_avoid = (1−y)·C are the running counts of
+    # prior shocks / avoids BEFORE each trial (Stan's transformed-data recurrence).
+    # C reads only the shape, so binding y hoists the whole prefix.
+    C::Matrix{Float64} = Float64.((1:n_trials) .< (1:n_trials)')
     yf::Matrix{Float64} = 1.0 .* y
-    prev_shock::Vector{Float64} = vec(yf * C)
-    prev_avoid::Vector{Float64} = vec((1.0 .- yf) * C)
+    prev_shock::Matrix{Float64} = yf * C
+    prev_avoid::Matrix{Float64} = (1.0 .- yf) * C
+
+    # Per-cell log shock-probability matrix log p[j,t] = prev_shock[j,t]·log a[j] +
+    # prev_avoid[j,t]·log b[j]; the per-dog log-rate vectors broadcast down each row
+    # (no external per-cell dog index needed). Flatten column-major for the scalar
+    # Bernoulli endpoint.
+    log_p::Matrix{Float64} = prev_shock .* log_a .+ prev_avoid .* log_b
+    log_p_flat::Vector{Float64} = vec(log_p)
     y_flat::Vector{Bool} = vec(y)
 
-    # Per-cell gather of the per-dog log-rates (idx bound -> hoisted structure).
-    log_a_cell::Vector{Float64} = log_a[dog_idx]
-    log_b_cell::Vector{Float64} = log_b[dog_idx]
-
     # Likelihood: y[j,t] ~ Bernoulli(a[j]^prev_shock · b[j]^prev_avoid). The
-    # probability p = exp(prev_shock·log a + prev_avoid·log b) is fed to the
-    # Bernoulli endpoint directly (the model's natural probability HAVE route;
-    # at t=1 both counts are 0 so p = 1 with a zero-gradient exponent, which the
-    # endpoint's branch-selecting logpdf handles without a spurious gradient).
-    pointwise = plate(y_flat, prev_shock, prev_avoid, log_a_cell, log_b_cell) do yi, ps, pa, la, lb
-        bernoulli(exp(ps * la + pa * lb)).logpdf(yi)
+    # probability p = exp(log p) is fed to the Bernoulli endpoint directly (the
+    # model's natural probability HAVE route; at t=1 both counts are 0 so p = 1 with
+    # a zero-gradient exponent, which the endpoint's branch-selecting logpdf handles
+    # without a spurious gradient).
+    pointwise = plate(y_flat, log_p_flat) do yi, lp
+        bernoulli(exp(lp)).logpdf(yi)
     end
     likelihood::Float64 = sum(pointwise)
 
@@ -144,14 +143,12 @@ end
 q = vcat(-1.0, 0.5, log(0.5), log(0.4), 0.2,
          0.1 .* range(-1.0, 1.0; length = 2 * size(DOGS_NH_Y, 1)))
 y = DOGS_NH_Y
-C = DOGS_NH_C
-dog_idx = DOGS_NH_DOG_IDX
 
 requested_nodes = (:parameters, :log_prior, :log_jacobian, :likelihood, :posterior)
 density_kernel = prepare(model;
-    have = (:unconstrained, :y, :C, :dog_idx),
+    have = (:unconstrained, :y),
     want = requested_nodes,
-    bound = (; y, C, dog_idx))
+    bound = (; y))
 
 output = density_kernel(q)
 parameters, log_prior, log_jacobian, likelihood, posterior = output
@@ -173,11 +170,16 @@ docs_example = (;
 
 function evaluate_dogs_nonhierarchical_source()
     _evaluate_ppl_source(DOGS_NH_SOURCE, @__MODULE__; bindings = (
-        :DOGS_NH_Y, :DOGS_NH_C, :DOGS_NH_DOG_IDX,
+        :DOGS_NH_Y,
     ))
 end
 
 const _DOGS_NH_GRAPH_TEMPLATE = Ref{KernelSpec}()
+
+function __init__()
+    _DOGS_NH_GRAPH_TEMPLATE[] = evaluate_dogs_nonhierarchical_source().model
+    nothing
+end
 
 
 """
@@ -188,14 +190,15 @@ multiplicative avoidance-learning model) as a declarative
 `ReactiveKernels.KernelSpec`. The per-dog logit learning rates use a non-centered
 parameterization with a `cholesky_factor_corr[2]` (constructed from one
 unconstrained value via `tanh`, with its exact Jacobian and the analytic K=2 LKJ
-log-density) and free scales (`exp` transform). The running-count design
-(`prev_shock`, `prev_avoid`) is derived IN-GRAPH from the bound `y` matrix via
-the fixed strict-upper-triangular operator `C`, so partial evaluation hoists it;
-the per-cell learning rates are gathered by a bound dog index, and the
-multiplicative Bernoulli likelihood reuses the shared Bernoulli endpoint.
+log-density) and free scales (`exp` transform). Raw `y` is the ONLY data HAVE:
+the running-count design (`prev_shock`, `prev_avoid`) is derived IN-GRAPH from the
+bound `y` matrix via the strict-upper-triangular operator `C = (1:T) .< (1:T)'`
+built in-graph from the declared trial count, so partial evaluation hoists it; the
+per-dog log-rates broadcast down the columns of the log-probability matrix (no
+external per-cell index), and the multiplicative Bernoulli likelihood reuses the
+shared Bernoulli endpoint.
 """
 function build_dogs_nonhierarchical_graph()
-    isassigned(_DOGS_NH_GRAPH_TEMPLATE) || (_DOGS_NH_GRAPH_TEMPLATE[] = evaluate_dogs_nonhierarchical_source().model)
     compose(_DOGS_NH_GRAPH_TEMPLATE[])
 end
 
@@ -203,9 +206,9 @@ function demo()
     model = build_dogs_nonhierarchical_graph()
     q = vcat(-1.0, 0.5, log(0.5), log(0.4), 0.2, zeros(2 * DOGS_NH_J))
     posterior_kernel = prepare(model;
-        have = (:unconstrained, :y, :C, :dog_idx), want = :posterior)
+        have = (:unconstrained, :y), want = :posterior)
     println("dogs_nonhierarchical unconstrained log posterior = ",
-            posterior_kernel(q, DOGS_NH_Y, DOGS_NH_C, DOGS_NH_DOG_IDX))
+            posterior_kernel(q, DOGS_NH_Y))
     nothing
 end
 

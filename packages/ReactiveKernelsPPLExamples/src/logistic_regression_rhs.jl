@@ -179,6 +179,11 @@ end
 
 const _LOGISTIC_RHS_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
+function __init__()
+    _LOGISTIC_RHS_GRAPH_TEMPLATE[] = evaluate_logistic_regression_rhs_source().model
+    nothing
+end
+
 
 """
     build_logistic_regression_rhs_graph()
@@ -194,7 +199,6 @@ from `ReactiveKernelsDistributionKernels`; the likelihood uses the natural
 `bernoulli(; logit = f)` HAVE route.
 """
 function build_logistic_regression_rhs_graph()
-    isassigned(_LOGISTIC_RHS_GRAPH_TEMPLATE) || (_LOGISTIC_RHS_GRAPH_TEMPLATE[] = evaluate_logistic_regression_rhs_source().model)
     compose(_LOGISTIC_RHS_GRAPH_TEMPLATE[])
 end
 

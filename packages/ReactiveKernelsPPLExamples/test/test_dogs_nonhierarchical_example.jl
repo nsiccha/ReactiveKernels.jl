@@ -59,26 +59,32 @@ end
 
     @testset "authored on the current baseline surface" begin
         @test occursin("L21::Float64 = tanh(w)", DOGS_NH_SOURCE)
-        @test occursin("bernoulli(exp(ps * la + pa * lb)).logpdf(yi)", DOGS_NH_SOURCE)
-        @test occursin("prev_shock::Vector{Float64} = vec(yf * C)", DOGS_NH_SOURCE)
-        @test occursin("log_a_cell::Vector{Float64} = log_a[dog_idx]", DOGS_NH_SOURCE)
-        @test occursin("bound = (; y, C, dog_idx)", DOGS_NH_SOURCE)
+        @test occursin("bernoulli(exp(lp)).logpdf(yi)", DOGS_NH_SOURCE)
+        # The running-count design operator C is derived IN-GRAPH from the bound y
+        # matrix (only the declared trial count), so prev_shock = y·C and the per-dog
+        # log-rates broadcast down the columns — no external C/dog_idx data HAVE.
+        @test occursin("C::Matrix{Float64} = Float64.((1:n_trials) .< (1:n_trials)')", DOGS_NH_SOURCE)
+        @test occursin("prev_shock::Matrix{Float64} = yf * C", DOGS_NH_SOURCE)
+        @test occursin("log_p::Matrix{Float64} = prev_shock .* log_a .+ prev_avoid .* log_b", DOGS_NH_SOURCE)
+        @test occursin("bound = (; y)", DOGS_NH_SOURCE)
+        @test !occursin("dog_idx", DOGS_NH_SOURCE)
         @test !occursin("struct ", DOGS_NH_SOURCE)
         @test artifact.bernoulli_object === bernoulli
     end
 
     @testset "posterior decomposition vs the independent reference oracle" begin
         pk = prepare(model;
-            have = (:unconstrained, :y, :C, :dog_idx),
+            have = (:unconstrained, :y),
             want = (:parameters, :log_prior, :log_jacobian, :likelihood, :posterior),
-            bound = (; y = DOGS_NH_Y, C = DOGS_NH_C, dog_idx = DOGS_NH_DOG_IDX))
+            bound = (; y = DOGS_NH_Y))
         parameters, log_prior, log_jacobian, likelihood, posterior = pk(q)
         @test log_prior ≈ reference.log_prior
         @test log_jacobian ≈ reference.log_jacobian
         @test likelihood ≈ reference.likelihood
         @test posterior ≈ reference.posterior
         @test isfinite(posterior)
-        # L is a valid 2x2 cholesky_factor_corr (unit columns).
+        # L is a valid 2x2 cholesky_factor_corr: its second row has unit norm
+        # (L21^2 + L22^2 == 1), which is what makes L*L' a correlation matrix.
         @test parameters.L21 ≈ reference.L21
         @test parameters.L22 ≈ reference.L22
         @test parameters.L21^2 + parameters.L22^2 ≈ 1.0

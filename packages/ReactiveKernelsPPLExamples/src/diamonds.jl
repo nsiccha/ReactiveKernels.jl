@@ -3,7 +3,7 @@ module DiamondsExample
 using ReactiveKernels
 using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
-export DIAMONDS_X, DIAMONDS_Y
+export DIAMONDS_X, DIAMONDS_Y, DIAMONDS_PRIOR_ONLY
 export build_diamonds_graph, demo
 export DIAMONDS_SOURCE, evaluate_diamonds_source
 
@@ -30,6 +30,7 @@ export DIAMONDS_SOURCE, evaluate_diamonds_source
 let d = _posteriordb_data("diamonds-diamonds")
     global const DIAMONDS_X = Float64.(d["X"])
     global const DIAMONDS_Y = Float64.(d["Y"])
+    global const DIAMONDS_PRIOR_ONLY = Int(d["prior_only"])   # 0 for this posterior
 end
 
 const DIAMONDS_SOURCE = raw"""
@@ -37,7 +38,8 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, stud
 
 @kernel model(unconstrained::Vector{Float64},
               X::Matrix{Float64},
-              Y::Vector{Float64}) = begin
+              Y::Vector{Float64},
+              prior_only::Int) = begin
     # Data-only centering prefix (Stan's `transformed data`). It reads only `X`,
     # so binding the raw design-matrix port runs the column-drop + centering once
     # at preparation and hoists the centered matrix `Xc` and column means into the
@@ -84,13 +86,18 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, stud
     # normal_id_glm linear predictor). Consumes the centered design once.
     mu::Vector{Float64} = Intercept .+ Xc * b
 
-    # Likelihood: Yᵢ ~ Normal(μᵢ, sigma).
+    # Likelihood: Yᵢ ~ Normal(μᵢ, sigma). The Stan model adds it only when the
+    # data flag `prior_only` is 0 (`if (!prior_only) target += normal_id_glm_lpdf`),
+    # so the data-directed choice is a bound port: `included_likelihood` is the
+    # likelihood when prior_only == 0 and 0 otherwise. Bound prior_only folds this
+    # to a constant branch at preparation (the posterior data has prior_only = 0).
     pointwise = plate(Y, mu, sigma) do y, m, s
         normal(m, s).logpdf(y)
     end
     likelihood::Float64 = sum(pointwise)
+    included_likelihood::Float64 = ifelse(prior_only == 0, likelihood, 0.0)
 
-    constrained_logdensity::Float64 = log_prior + likelihood
+    constrained_logdensity::Float64 = log_prior + included_likelihood
     unconstrained_prior::Float64 = log_prior + log_jacobian
     posterior::Float64 = constrained_logdensity + log_jacobian
 
@@ -104,12 +111,13 @@ end
 q = vcat(fill(0.05, 24), 8.0, log(0.6))
 X = DIAMONDS_X
 Y = DIAMONDS_Y
+prior_only = DIAMONDS_PRIOR_ONLY
 
 requested_nodes = (:parameters, :log_prior, :log_jacobian, :likelihood, :posterior)
 density_kernel = prepare(model;
-    have = (:unconstrained, :X, :Y),
+    have = (:unconstrained, :X, :Y, :prior_only),
     want = requested_nodes,
-    bound = (; X))
+    bound = (; X, prior_only))
 
 output = density_kernel(q, Y)
 parameters, log_prior, log_jacobian, likelihood, posterior = output
@@ -118,7 +126,7 @@ parameters, log_prior, log_jacobian, likelihood, posterior = output
 docs_example = (;
     name = :diamonds_posterior,
     origin = "posteriordb diamonds — brms Gaussian regression with a centered design matrix",
-    inputs = (; q),
+    inputs = (; q, Y),
     model,
     kernel = density_kernel,
     output,
@@ -132,11 +140,16 @@ function evaluate_diamonds_source()
     # Bind only the data. The authored source imports the reusable Normal and
     # Student-t endpoints itself and authors the centering prefix inline.
     _evaluate_ppl_source(DIAMONDS_SOURCE, @__MODULE__; bindings = (
-        :DIAMONDS_X, :DIAMONDS_Y,
+        :DIAMONDS_X, :DIAMONDS_Y, :DIAMONDS_PRIOR_ONLY,
     ))
 end
 
 const _DIAMONDS_GRAPH_TEMPLATE = Ref{KernelSpec}()
+
+function __init__()
+    _DIAMONDS_GRAPH_TEMPLATE[] = evaluate_diamonds_source().model
+    nothing
+end
 
 
 """
@@ -155,7 +168,6 @@ likelihood, densities, unconstrained posterior, and the generated-quantity
 population intercept `b_Intercept` are separate named nodes.
 """
 function build_diamonds_graph()
-    isassigned(_DIAMONDS_GRAPH_TEMPLATE) || (_DIAMONDS_GRAPH_TEMPLATE[] = evaluate_diamonds_source().model)
     compose(_DIAMONDS_GRAPH_TEMPLATE[])
 end
 
@@ -163,11 +175,11 @@ function demo()
     model = build_diamonds_graph()
     q = vcat(fill(0.05, 24), 8.0, log(0.6))
     posterior_plan = plan(model;
-                          have = (:unconstrained, :X, :Y),
+                          have = (:unconstrained, :X, :Y, :prior_only),
                           want = (:log_prior, :likelihood, :posterior))
     println(explain(posterior_plan))
     log_prior, likelihood, posterior =
-        prepare(posterior_plan)(q, DIAMONDS_X, DIAMONDS_Y)
+        prepare(posterior_plan)(q, DIAMONDS_X, DIAMONDS_Y, DIAMONDS_PRIOR_ONLY)
     println("log prior + log likelihood = ", log_prior, " + ", likelihood,
             " = ", posterior)
     nothing
