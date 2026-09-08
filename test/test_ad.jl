@@ -378,3 +378,26 @@ end
         @test gradient ≈ sign .* expected rtol = 1e-8 atol = 1e-8
     end
 end
+
+@testset "scan AD preserves operation-table source transforms" begin
+    spec = AuthoredScanFixtures.authored_scan_arma
+    q, series = [0.2, 0.7, -0.3], [0.5]
+    original = prepare(spec; bound = (; series), want = :total)
+    slot = findfirst(op -> op isa ReactiveKernels._AuthoredScanOp, original.ops)
+    # A literal slot and an arbitrary table use must both retain the scan
+    # metadata when a caller's source transform actually consumes it.
+    for table in (:__ops__, :(identity(__ops__)))
+        function require_scan_metadata(ast)
+            insert!(ast.args[2].args, 1,
+                :(@assert $table[$slot] isa ReactiveKernels._AuthoredScanOp))
+            ast
+        end
+        kernel = prepare(spec; bound = (; series), want = :total,
+                         passes = (require_scan_metadata,))
+        # Editing display metadata cannot change what the compiled body uses.
+        empty!(code_expr(kernel).args[2].args)
+        prepared = prepare_ad(kernel, TEST_AD_BACKEND, q; active = :q)
+        @test kernel(q) == original(q)
+        @test prepared.call(q, prepared.external_values...) == kernel(q)
+    end
+end
