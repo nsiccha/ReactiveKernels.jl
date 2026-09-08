@@ -1,5 +1,5 @@
 # Focused acceptance/measurement driver. Run in a consumer environment containing
-# RK, its distribution package, BenchmarkTools, SpecialFunctions, and Enzyme;
+# RK, its distribution package, PosteriorDB, BenchmarkTools, SpecialFunctions, and Enzyme;
 # add Reactant for RK_INNER_PE_BACKEND=reactant. Output belongs in task scratch.
 # Use this SAME detached driver checkout for both compiler revisions. Select
 # the loaded compiler with RK_INNER_PE_COMPILER_ROOT/SHA and ROLE=baseline or
@@ -59,6 +59,7 @@ const match_receipt = isempty(match_receipt_bytes) ? nothing : TOML.parse(String
 function source_receipts()
     paths = ("benchmark/inner_plate_partial_evaluation.jl",
         "packages/ReactiveKernelsPPLExamples/src/_ppl_source_authority.jl",
+        "packages/ReactiveKernelsPPLExamples/src/_posteriordb_data.jl",
         "packages/ReactiveKernelsPPLExamples/src/surgical.jl",
         "packages/ReactiveKernelsDistributionKernels/src/distribution_kernel_sources.jl")
     Dict(path => bytes2hex(sha256(read(joinpath(root, path)))) for path in paths)
@@ -153,7 +154,9 @@ end
 # loading every unrelated PPL example as part of this bounded acceptance driver.
 module ReactiveKernelsPPLExamples
 using ReactiveKernels: KernelSpec, PreparedKernel
+import PosteriorDB
 include("../packages/ReactiveKernelsPPLExamples/src/_ppl_source_authority.jl")
+include("../packages/ReactiveKernelsPPLExamples/src/_posteriordb_data.jl")
 include("../packages/ReactiveKernelsPPLExamples/src/surgical.jl")
 end
 
@@ -332,7 +335,9 @@ function main()
     surgical = ReactiveKernelsPPLExamples.SurgicalExample.evaluate_surgical_source()
     @test surgical.source == strip(ReactiveKernelsPPLExamples.SurgicalExample.SURGICAL_SOURCE, '\n')
     append!(rows, Base.invokelatest(run_case, "surgical/12", surgical.model,
-        surgical.inputs.q, (; successes=surgical.inputs.successes, totals=surgical.inputs.totals);
+        surgical.inputs.q, (;
+            successes=ReactiveKernelsPPLExamples.SurgicalExample.SURGICAL_SUCCESSES,
+            totals=ReactiveKernelsPPLExamples.SurgicalExample.SURGICAL_TOTALS);
         active=:unconstrained, want=:posterior))
     dependency_receipts() == dependencies || error(
         "dependency identities changed during the measurement process")

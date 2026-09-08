@@ -101,6 +101,15 @@ end
     total::Float64 = sum(pointwise)
 end
 
+@kernel ref_live(q::Vector{Float64}, data::Vector{Float64}) = begin
+    pointwise = plate(data, Ref(q)) do d, whole
+        transformed::Float64 = log(d)
+        result::Float64 = transformed * sum(whole)
+        result
+    end
+    total::Float64 = sum(pointwise)
+end
+
 @kernel boolean(q::Vector{Float64}, data::Vector{Int}) = begin
     parameter::Float64 = sum(q)
     pointwise = plate(data, parameter) do d, theta
