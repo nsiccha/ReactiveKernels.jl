@@ -46,8 +46,8 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
         plain = prepare(C.ref_live)
         for parameter in (q, [-0.2, 0.5])
             traced = Reactant.to_rarray(parameter)
-            expected = sum(log, data) * sum(parameter)
-            expected_gradient = fill(sum(log, data), length(parameter))
+            expected = sum(log, data; init=0.0) * sum(parameter)
+            expected_gradient = fill(sum(log, data; init=0.0), length(parameter))
             value, gradient = ad_value_and_gradient(prepared, parameter)
             @test kernel(parameter) ≈ plain(parameter, data) ≈ expected
             @test value ≈ expected
