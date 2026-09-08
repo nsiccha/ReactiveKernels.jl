@@ -95,6 +95,8 @@ include("survey_model.jl")
 include("mnist_logistic.jl")
 include("mvnormal_regression.jl")
 include("bound_regression.jl")
+include("nn_rbm.jl")
+include("lda.jl")
 
 export PPLWorkflow
 
@@ -209,5 +211,7 @@ export SurveyModelExample
 export MNISTLogisticExample
 export MVNormalRegressionExample
 export BoundRegressionExample
+export NNRBMExample
+export LDAExample
 
 end # module ReactiveKernelsPPLExamples
