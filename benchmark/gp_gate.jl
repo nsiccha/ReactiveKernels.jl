@@ -195,10 +195,10 @@ _want("gp_pois_regr") && gate("gp_pois_regr-gp_pois_regr";
 # hierarchical_gp — dim 933. All data bound; only q traced for Reactant. The
 # Reactant PRIMAL lowers (ILR simplex, dual Cholesky-factor matmul, reshape,
 # index gathers), the compiled gradient is the KNOWN Cholesky-factor-adjoint gap
-# (chol_grad_gap = true). No support-boundary probe: every parameter transform
-# (log for the positive scales, the ILR simplex) maps ℝ smoothly onto the
-# interior of the constrained space, so there is no hard boundary in
-# unconstrained q — the reference-validity probes already span the space.
+# (chol_grad_gap = true). No separate support-boundary probe: the finite
+# reference-validity probes span the sampled region and are checked against Stan;
+# a hard boundary in unconstrained q is not asserted here (finite-probe evidence
+# only, not a proof over all q).
 _want("hierarchical_gp") && gate("state_wide_presidential_votes-hierarchical_gp";
     graph = PE.HierarchicalGPExample.build_hierarchical_gp_graph(),
     have = (:unconstrained, :y, :year_ind, :state_ind, :region_ind, :state_region_ind,
