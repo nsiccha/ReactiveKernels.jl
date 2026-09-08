@@ -184,9 +184,12 @@ const LAPLACE_LOGDENSITY = extract(laplace;
 # parameter at cost 2.0 — verified with `explain(plan(...))`).
 #
 #   - logit HAVE (logistic models): `-log1pexp(ifelse(observed, -logit, logit))`
-#     is the stable log-sum-exp form (`logp = -log1pexp(-logit)`,
-#     `log1mp = -log1pexp(logit)`), exact for saturating logits. Selecting the
+#     is the stable log-sum-exp form, exact for saturating logits. Selecting the
 #     SIGN before the single `log1pexp` differentiates only the selected term.
+#     `logp = -log1pexp(-logit)` / `log1mp = -log1pexp(logit)` remain as their
+#     own extractable public object ports; the endpoint inlines the equivalent
+#     sign-selected form so they stay off the `logpdf` recipe (keeping the p HAVE
+#     route selectable) while a consumer can still WANT `logp`/`log1mp` directly.
 #   - p HAVE (direct-probability models, e.g. dogs_hierarchical's
 #     `a^prev_shock · b^prev_avoid`): compute the log-probability DIRECTLY from
 #     `p`, never forming `logit`. `logit = log(p) - log1p(-p)` has an unbounded
@@ -204,6 +207,8 @@ using LogExpFunctions: log1pexp
 @kernel bernoulli(p::Float64) = begin
     logit::Float64 = log(p) - log1p(-p)
     p::Float64 = 1 / (1 + exp(-logit))
+    logp::Float64 = -log1pexp(-logit)
+    log1mp::Float64 = -log1pexp(logit)
 
     logpdf(observed::Bool)::Float64 = begin
         lp::Float64 = -log1pexp(ifelse(observed, -logit, logit))

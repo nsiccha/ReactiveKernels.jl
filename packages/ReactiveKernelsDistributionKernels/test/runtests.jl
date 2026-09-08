@@ -2,8 +2,9 @@ using Distributions: Bernoulli, Cauchy, Dirichlet, Exponential, Geometric,
     InverseGamma, Laplace, LKJCholesky, Logistic, LogNormal, MvNormal, Normal,
     TDist, Uniform, cdf, logpdf, quantile
 using LinearAlgebra: Cholesky, LowerTriangular, Symmetric, cholesky
-using ReactiveKernels: @kernel, KernelObjectSpec, KernelSpec, code_expr, extract,
-    plan, plate, prepare
+using LogExpFunctions: log1pexp
+using ReactiveKernels: @kernel, KernelObjectSpec, KernelSpec, code_expr, explain,
+    extract, plan, plate, prepare
 using ReactiveKernelsDistributionKernels: DistributionKernelSources
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     LOCATION_SCALE_SOURCE,
@@ -348,4 +349,59 @@ end
     end
     @test occursin("@kernel lkj_corr_cholesky", LKJ_CORR_CHOLESKY_KERNEL_SOURCE)
     @test !occursin("Distributions", string(code_expr(kernel)))
+end
+
+# The bernoulli object carries a per-HAVE `logpdf` route (a direct-p HAVE is not
+# routed through the singular `logit = log(p) - log1p(-p)`); the stable logit-HAVE
+# log-sum-exp form and the `logp`/`log1mp` object ports are retained. Gradient
+# finiteness at the boundary is exercised under AD in `test/test_ad.jl` and
+# `test/test_ad_reactant.jl`; this covers the primal, ports, and route shape.
+@testset "bernoulli direct-p boundary and logit-route stability" begin
+    logp_at(have, args...) = prepare(bernoulli.logpdf; have, want = :logpdf)(args...)
+
+    @testset "boundary and impossible-event primal" begin
+        # The probability-1 event, when observed, has logpdf log(1) = 0.
+        @test logp_at((:observed, :p), true, 1.0) == 0.0
+        @test logp_at((:observed, :p), false, 0.0) == 0.0
+        # Impossible events stay -Inf.
+        @test logp_at((:observed, :p), false, 1.0) == -Inf
+        @test logp_at((:observed, :p), true, 0.0) == -Inf
+        # Interior direct-p values match the reference exactly-enough.
+        for p in (0.1, 0.37, 0.6, 0.92), observed in (true, false)
+            @test logp_at((:observed, :p), observed, p) ≈ logpdf(Bernoulli(p), observed)
+        end
+    end
+
+    @testset "logit HAVE stays the stable log-sum-exp form (saturating tails)" begin
+        for logit in (-30.0, -20.0, -1.3, 0.0, 0.7, 20.0, 30.0), observed in (true, false)
+            reference = observed ? -log1pexp(-logit) : -log1pexp(logit)
+            # Bit-identical: the logit route is unchanged by the direct-p fix.
+            @test logp_at((:observed, :logit), observed, logit) === reference
+        end
+    end
+
+    @testset "logp / log1mp remain extractable object ports" begin
+        @test prepare(extract(bernoulli; have = (:logit,), want = :logp))(0.8) ≈
+            -log1pexp(-0.8)
+        @test prepare(extract(bernoulli; have = (:logit,), want = :log1mp))(0.8) ≈
+            -log1pexp(0.8)
+        joint = prepare(extract(bernoulli; have = (:logit,), want = (:logp, :log1mp)))
+        @test collect(joint(0.8)) ≈ [-log1pexp(-0.8), -log1pexp(0.8)]
+        # A direct-p HAVE can still reach logp (routes p -> logit -> logp).
+        @test prepare(extract(bernoulli; have = (:p,), want = :logp))(0.6) ≈ log(0.6)
+    end
+
+    @testset "each HAVE selects its own fused logpdf recipe (no cross round-trip)" begin
+        selected(plan_str) = split(plan_str, "Alternatives not selected:")[1]
+        logit_plan = selected(
+            explain(plan(bernoulli.logpdf; have = (:observed, :logit), want = :logpdf)))
+        p_plan = selected(
+            explain(plan(bernoulli.logpdf; have = (:observed, :p), want = :logpdf)))
+        # logit HAVE selects the (observed, logit) recipe and never the direct-p one.
+        @test occursin("(observed, logit)", logit_plan)
+        @test !occursin("(observed, p)", logit_plan)
+        # p HAVE selects the (observed, p) recipe and never forms `logit`.
+        @test occursin("(observed, p)", p_plan)
+        @test !occursin("(observed, logit)", p_plan)
+    end
 end
