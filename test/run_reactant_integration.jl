@@ -19,6 +19,8 @@ sum_to_zero_testfile = joinpath(
 ppl_examples_testfile = joinpath(
     @__DIR__, "test_ppl_examples_reactant.jl")
 authored_scan_testfile = joinpath(@__DIR__, "test_authored_scan_reactant.jl")
+inner_partial_evaluation_testfile = joinpath(
+    @__DIR__, "test_inner_plate_partial_evaluation_reactant.jl")
 example_packages = (
     joinpath(root, "packages", "ReactiveKernelsCompatibilityExamples"),
     joinpath(root, "packages", "ReactiveKernelsDistributionKernels"),
@@ -52,6 +54,7 @@ mktempdir() do env
     julia = Base.julia_cmd()
     selector = get(ENV, "RK_REACTANT_TESTSET", "all")
     if selector == "all"
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $inner_partial_evaluation_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $authored_scan_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $effect_boundary_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $testfile`)
@@ -60,6 +63,8 @@ mktempdir() do env
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $mutation_profile_b_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $sum_to_zero_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $ppl_examples_testfile`)
+    elseif selector == "inner-partial-evaluation"
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $inner_partial_evaluation_testfile`)
     elseif selector == "authored-scan"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $authored_scan_testfile`)
     elseif selector == "ppl-examples"
