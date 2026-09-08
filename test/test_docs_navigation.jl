@@ -78,10 +78,11 @@ using Test
     @test !occursin("Kernel execution and tools", make)
 
     review_states = Dict(
-        :frozen_ppl => (
-            "linear-regression.md", "beta-binomial.md", "poisson-gamma.md",
-            "dugongs-growth.md", "arma11.md", "gaussian-mixture.md",
-        ),
+        # linear-regression, beta-binomial, poisson-gamma, dugongs-growth and
+        # arma11 were migrated into the authored-baseline review set (their
+        # `render_review_status(:frozen_ppl)` banners removed), and
+        # gaussian-mixture.md was deleted, so :frozen_ppl no longer applies to any
+        # page. Kept in lockstep with check_rendered.jl's expected_review_states.
         :frozen_sampling => (
             "pathfinder.md", "reactivehmc-corpus.md", "nuts.md",
             "nutpie-diagonal.md", "walnuts.md", "online-stats.md",
