@@ -13,6 +13,13 @@ import TOML
 const _ALL80_BENCHMARK_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts", "all80-benchmark-v1.toml")
 
+# Batch-1 incremental additions — a SEPARATE receipt rendered ALONGSIDE the immutable frozen-82,
+# never merged into it. Any "86" on the page is an explicit UNION of two separately-identified,
+# separately-measured batches (the frozen 82 and these 4), each carrying its own process-start
+# provenance; the batch-1 render reads THIS path, not `_ALL80_BENCHMARK_PATH`.
+const _ALL80_BATCH1_PATH = joinpath(
+    dirname(@__DIR__), "benchmark", "receipts", "all80-batch1-v1.toml")
+
 # ~2-sig-fig timing formatter (nanoseconds in the receipt). Non-Real = N/A provenance.
 function _all80_ns(value, _)
     value isa Real || return string(value)
