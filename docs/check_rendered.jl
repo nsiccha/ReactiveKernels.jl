@@ -355,6 +355,10 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "mnist-reactant.md" => 14,
         "nuts.md" => 1,
         "nuts-reactant.md" => 1,
+        # The three all-82 posteriordb comparison plots (coverage, speedup,
+        # reactant-HMC) rendered from all80_benchmark_plots.jl — one aov-panel
+        # each; the page's 3 sortable tables are registered above.
+        "posteriordb-comparison.md" => 3,
     )
     # The linear-regression, beta-binomial, poisson-gamma, dugongs-growth,
     # arma11, and gaussian-mixture PPL example pages were migrated into the
