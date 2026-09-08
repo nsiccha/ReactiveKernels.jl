@@ -31,18 +31,24 @@ jobs:
           # RuntimeGeneratedFunctions 0.5 currently fails under Julia 1.12's
           # stricter world-age semantics; match the package's tested baseline.
           version: '1.10'
+      # Restore the depot/compiled-artifact cache BEFORE any Julia runs so every
+      # step below reuses cached precompiles instead of recompiling on a cold depot.
+      - uses: julia-actions/cache@v2
       - name: Initialize rendered-docs advisory report
         run: julia --startup-file=no -e 'include("docs/check_rendered.jl"); initialize_rendered_docs_report()'
-      - uses: julia-actions/cache@v2
       - name: Install dependencies
         run: |
           DEPS="$RUNNER_TEMP/rk-docs-deps"
           mkdir -p "$DEPS"
-          git clone -b dev https://github.com/nsiccha/AlgebraOfVega.jl.git "$DEPS/AlgebraOfVega.jl"
-          git clone -b kb-impl/DynamicObjects-sbpmx-reflect https://github.com/nsiccha/DynamicObjects.jl.git "$DEPS/DynamicObjects.jl"
-          git clone -b dev https://github.com/nsiccha/HTMX.jl.git "$DEPS/HTMX.jl"
-          git clone -b devibe https://github.com/nsiccha/HTMXObjects.jl.git "$DEPS/HTMXObjects.jl"
-          git clone https://github.com/nsiccha/Treebars.jl.git "$DEPS/Treebars.jl"
+          # Pin the docs render-stack deps to fixed SHAs (branch noted) so an
+          # unrelated upstream commit no longer invalidates the Julia precompile
+          # cache on every run. Bump deliberately when a render feature is needed.
+          clone_pin() { git clone -q "$1" "$3" && git -C "$3" checkout -q "$2"; }
+          clone_pin https://github.com/nsiccha/AlgebraOfVega.jl.git   194b837ba6ec9f80850d737bb2e2e98e05d2780b "$DEPS/AlgebraOfVega.jl"    # dev
+          clone_pin https://github.com/nsiccha/DynamicObjects.jl.git  872311e13739b0dd6440fd63072718c9957e1ad3 "$DEPS/DynamicObjects.jl"  # kb-impl/DynamicObjects-sbpmx-reflect
+          clone_pin https://github.com/nsiccha/HTMX.jl.git            d52ce5be0f42e3c375370c85499ba5c395f781a8 "$DEPS/HTMX.jl"           # dev
+          clone_pin https://github.com/nsiccha/HTMXObjects.jl.git     aaffb38fa1e430becd8ba1e9199b55c659d2418c "$DEPS/HTMXObjects.jl"    # devibe
+          clone_pin https://github.com/nsiccha/Treebars.jl.git        e502929e702b5bf6bf92512bde678c152eac320f "$DEPS/Treebars.jl"        # default HEAD
           julia --project=docs -e '
             using Pkg
             deps = ENV["RUNNER_TEMP"] * "/rk-docs-deps"
