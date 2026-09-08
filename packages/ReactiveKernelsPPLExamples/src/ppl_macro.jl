@@ -52,6 +52,15 @@ Decisions: build GO `2026-09-06T14-20-02-559-1r5p4j1`; scope MINIMAL
   `-log(1 - cdf(0))` via the family's own `.cdf` — e.g.
   `sigma ~ positive(normal(0, 5))` (half-Normal),
   `tau ~ positive(cauchy(0, 5))` (half-Cauchy).
+- **Improper / flat priors** (Stan's "no prior statement"): `x ~ flat()` declares
+  a real-support latent with a ZERO prior contribution — it still takes an
+  unconstrained coordinate (identity transform). `positive(flat())` gives
+  positive support (log transform + Jacobian, flat on the CONSTRAINED scale, as
+  in Stan's `real<lower=0>` with no prior); a real-support `flat()` vector is
+  allowed too. PROVISIONAL spelling (decision `1uczi8y`), parallel to the
+  `positive(dist(…))` combinator. This is the dominant posteriordb coverage gap
+  (unblocks 12 of the 17-model expressibility set: earn_height / logmesquite /
+  kidscore_* flat coefficients, kilpisjarvi flat `sigma`, …).
 - `parameters` has two producers (constrain-only, and joint with `log_jacobian`
   so a params+Jacobian query shares the transform) plus named-latent inverse
   edges, so a packed, named-latent, or `parameters` HAVE boundary all route
@@ -123,6 +132,9 @@ struct _Param
                      # half distribution): add -log(1 - cdf(0)) to the prior
     discrete::Bool   # a discrete latent: no unconstrained coordinate/transform,
                      # carried as an Int-valued HAVE port, sampled by enumeration
+    improper::Bool   # a flat/improper prior (`flat()`): the latent is declared —
+                     # it takes an unconstrained coordinate, the support transform,
+                     # and the transform's log-Jacobian — but contributes 0 to :prior
 end
 
 # Running packed-offset arithmetic that stays a literal while every preceding
@@ -286,7 +298,31 @@ function _parse(def)
                         "@ppl: discrete latent `$(lname) ~ $(dist)(…)` cannot carry a " *
                         "support constraint.")
                     dsize = kind === :vector ? lsize : nothing
-                    push!(params, _Param(lname, dist_call, :discrete, dsize, false, true))
+                    push!(params, _Param(lname, dist_call, :discrete, dsize, false, true, false))
+                    continue
+                end
+                if dist === :flat
+                    # Improper / flat prior (Stan's "no prior statement"): the
+                    # latent is declared — it takes an unconstrained coordinate,
+                    # its support transform, and the transform's log-Jacobian —
+                    # but contributes 0 to `:prior`. `flat()` is real support;
+                    # `positive(flat())` gives positive support (log transform +
+                    # Jacobian, flat on the CONSTRAINED scale, matching Stan's
+                    # `real<lower=0>` with no prior statement). PROVISIONAL
+                    # spelling (decision `1uczi8y`, "do whatever for now, mark
+                    # provisional"), parallel to the `positive(dist(…))` combinator.
+                    isempty(_call_args(dist_call)) || error(
+                        "@ppl: `flat()` takes no arguments, got `$(dist_call)`.")
+                    effective = constraint === nothing ? :real : constraint
+                    effective in (:real, :positive) || error(
+                        "@ppl: a `$(constraint)` constraint on `flat()` is not " *
+                        "supported; use `flat()` (real support) or `positive(flat())` " *
+                        "(positive support).")
+                    fsize = kind === :vector ? lsize : nothing
+                    (fsize === nothing || effective === :real) || error(
+                        "@ppl (first cut): only real-support vector parameters are " *
+                        "supported yet (`$(lname)::vector[…]`).")
+                    push!(params, _Param(lname, dist_call, effective, fsize, false, false, true))
                     continue
                 end
                 haskey(_SUPPORT, dist) || error(
@@ -311,7 +347,7 @@ function _parse(def)
                 (size === nothing || effective === :real) || error(
                     "@ppl (first cut): only real-support vector parameters are " *
                     "supported yet (`$(lname)::vector[…]`).")
-                push!(params, _Param(lname, dist_call, effective, size, truncate, false))
+                push!(params, _Param(lname, dist_call, effective, size, truncate, false, false))
             end
         elseif stmt isa Expr && stmt.head === :(=)
             push!(passthrough, stmt)
@@ -479,6 +515,7 @@ function _lower(name, dataargs, params, obs, passthrough)
     end
     prior_terms = Any[]
     for p in params
+        p.improper && continue      # flat/improper prior: 0 contribution to :prior
         if p.size === nothing
             term = :( $(p.dist).logpdf($(p.name)) )
             if p.truncate
@@ -496,7 +533,8 @@ function _lower(name, dataargs, params, obs, passthrough)
             push!(prior_terms, :( sum($(pv)) ))
         end
     end
-    prior_expr = length(prior_terms) == 1 ? prior_terms[1] :
+    prior_expr = isempty(prior_terms) ? :(0.0) :
+                 length(prior_terms) == 1 ? prior_terms[1] :
                  foldl((a, b) -> :( $a + $b ), prior_terms)
     push!(stmts, :( prior::Float64 = $(prior_expr) ))
 
