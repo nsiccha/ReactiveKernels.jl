@@ -2176,8 +2176,19 @@ function _operation_slot(node)
     node.args[2]
 end
 
+# A `_BoundConstant` recipe carries a value that `partial_evaluation` computed
+# once at bind time and baked into the residual kernel (its authored `source` was
+# consumed by the hoisted prefix, so it renders with no source and no callable
+# `nameof`). The readable view shows that value as the literal constant it is, so
+# a `bound=` kernel reads like the unbound kernel with its data-only bindings
+# folded: a scalar binding shows the same literal it would unbound, and a hoisted
+# data port shows the bound data. Display-only, like the rest of this renderer;
+# `code_expr` still lowers the constant through the executable `__ops__` slot.
+_readable_bound_constant(value) = value
+
 function _readable_recipe_call(recipe::Recipe, args)
     op = recipe.op
+    op isa _BoundConstant && return _readable_bound_constant(op.value)
     source = recipe.source
     if !(source isa _NoKernelSource)
         rhs = deepcopy(source)
