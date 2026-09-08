@@ -94,8 +94,8 @@ end
   must be declared numeric scalars or explicit `Ref` operands. Its shared
   computations run once outside the loop. Requesting the pointwise plate port
   still returns its vector; requesting the scan port, adding another consumer,
-  or supplying another broadcast array preserves ordinary materialization and
-  broadcast shape checks.
+  supplying another broadcast array, or composing multiple plates preserves
+  ordinary scan materialization and broadcast shape checks.
 - **Reactant.** When `xs` is a traced array, `scan` emits a `stablehlo.while`
   carry loop: the carry (scalar or `NamedTuple`) is threaded as a loop-carried
   value and the per-step outputs are written into a preallocated traced buffer

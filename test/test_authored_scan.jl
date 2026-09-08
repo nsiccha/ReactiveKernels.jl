@@ -144,4 +144,22 @@ end
     @test fused == ([1, 1.5, 1.5], 4.0)
     @test fused == materialized[2:3]
     @test typeof(fused[1]) == typeof(materialized[2])
+
+    @kernel scan_plate_chain(xs, weights) = begin
+        cumulative = scan(xs; init = 0.0) do carry, x
+            next = carry + x
+            (next, next)
+        end
+        scaled = plate(cumulative, weights) do x, w
+            x * w
+        end
+        pointwise = plate(scaled) do x
+            x^2
+        end
+        return sum(pointwise)
+    end
+    chain = prepare(scan_plate_chain)
+    @test chain(xs, 2.0) == sum(abs2, 2 .* cumsum(xs))
+    @test chain(xs, [2.0]) == sum(abs2, 2 .* cumsum(xs))
+    @test_throws DimensionMismatch chain(xs, ones(2))
 end
