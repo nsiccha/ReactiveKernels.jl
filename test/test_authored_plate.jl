@@ -919,7 +919,7 @@ end
     # Regression guard (source-review catch by ReactiveKernels:performance): the
     # static axis-marker fast path must NOT select an untyped (metadata-`Any`)
     # leading argument that holds a runtime SCALAR. `want=:pointwise` materializes
-    # `similar(marker, ...)`, so a wrong marker builds the pointwise buffer from a
+    # `_plate_similar_output(marker, ...)`, so a wrong marker builds the pointwise buffer from a
     # scalar (or errors). Here `plate(x, location, scale)` is called with a scalar
     # `x` and a vector `location`; `_authored_plate_is_axis` skips `x` and selects
     # `location`, so the static classifier — for which an `Any` port is
@@ -936,6 +936,66 @@ end
                  for i in eachindex(location)]
     @test result isa AbstractVector
     @test length(result) == length(location)
+    @test result ≈ reference
+end
+
+module TupleAxisNative
+using ReactiveKernels
+
+@kernel broadcast_axes(q::Vector{Float64}, x, y) = begin
+    pointwise = plate(x, Ref(q), y) do xi, whole, yi
+        xi + sum(whole) * yi
+    end
+    total::Float64 = sum(pointwise)
+    return total
+end
+
+# A plate whose ONLY batched axis is a tuple (no array co-operand).
+@kernel tuple_only(q::Vector{Float64}, x) = begin
+    pointwise = plate(x, Ref(q)) do xi, whole
+        xi + sum(whole)
+    end
+    total::Float64 = sum(pointwise)
+    return total
+end
+end
+
+@testset "authored plate native: tuple / singleton axis pointwise output" begin
+    # Regression (todo `native-tuple-axi`, reporter ReactiveKernels:performance):
+    # a `Tuple` is admitted as a batched axis — `_static_plate_axis_class(
+    # ::Type{<:Tuple}) === :axis` and `_authored_plate_is_axis(::Tuple)` accept it —
+    # so the static marker binds to a tuple argument. The pointwise buffer was then
+    # allocated with a bare `similar(marker, T, axes)`, which has NO method for a
+    # `Tuple` marker: the Reactant path materialized the tuple case
+    # (test_ref_array_plate_reactant.jl "broadcast axes and shared rank …") but the
+    # NATIVE `k(q)` crashed with
+    # `similar(::Tuple{Float64}, ::Type{Float64}, ::Tuple{Base.OneTo{Int}})`.
+    # `_plate_similar_output` allocates a plain `Array` for a tuple marker, matching
+    # Julia's broadcast container rule (`x .+ sum(q) .* y` is a `Vector`).
+    q = [0.7, -0.3]
+
+    # A tuple axis beside a Vector axis, both `want`s.
+    for (x, y) in (((1.0,), collect(1.0:32)),        # singleton tuple, real broadcast
+                   ((1.0, 2.0, 3.0), fill(0.5, 3)))  # multi-element tuple
+        k = prepare(TupleAxisNative.broadcast_axes; want = :pointwise, bound = (; x, y))
+        result = k(q)
+        reference = x .+ sum(q) .* y
+        @test result isa Vector{Float64}
+        @test size(result) == size(reference)
+        @test result ≈ reference
+        # The total path (no pointwise buffer) already worked; keep it in parity.
+        ktot = prepare(TupleAxisNative.broadcast_axes; want = :total, bound = (; x, y))
+        @test ktot(q) ≈ sum(reference)
+    end
+
+    # A plate whose SOLE axis is a tuple. `_plate_similar`'s style-combine cannot
+    # cover this — a lone `Style{Tuple}` materializes a tuple, not an array — so it
+    # exercises the `_plate_similar_output(::Tuple, …)` marker dispatch directly.
+    x = (1.0, 2.0, 3.0, 4.0)
+    k = prepare(TupleAxisNative.tuple_only; want = :pointwise, bound = (; x))
+    result = k(q)
+    reference = collect(x) .+ sum(q)
+    @test result isa Vector{Float64}
     @test result ≈ reference
 end
 
