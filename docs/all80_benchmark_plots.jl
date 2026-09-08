@@ -29,10 +29,10 @@ function _log2_speedup(fast, baseline)
     log2(baseline / fast)
 end
 
-# ---- Plot 1: single-eval speedup (CURRENT COMMITTED faithful RK graphs vs reference Stan / Turing) ----
+# ---- Plot 1: single-eval speedup (faithful RK graphs vs reference Stan / Turing) ----
 # x = model dimension (log), y = log2(comparator / RK) so >0 ⇒ RK faster, faceted by comparator,
-# coloured by primal-vs-gradient, SHAPED by workload-match. These are the graphs COMMITTED at the
-# historical benchmark base (8f09780) — NOT the natural-source cleanup baseline (reserved separately).
+# coloured by primal-vs-gradient, SHAPED by workload-match. These are the faithful graphs on the
+# natural-source base (f1e8b83), whose modules source their complete real data through PosteriorDB.jl.
 # A numerically/parity-valid ratio is NOT a matched-workload claim: models where the RK graph
 # evaluates a fundamentally different amount of work than the comparator (e.g. Mb's rich O(M)
 # per-individual plate vs the comparator's O(1) sufficient statistics) are shown as a DISTINCT
@@ -93,17 +93,17 @@ function render_all80_speedup_plot(path = _ALL80_BENCHMARK_PATH)
             marker = :workload => "Workload") *
         visual(Scatter)
     _plot_block(spec * config(width = 360, height = 300,
-            title = "Current committed faithful RK graphs (base 8f09780) vs reference Stan and upstream Turing",
+            title = "Faithful RK graphs (natural-source base f1e8b83) vs reference Stan and upstream Turing",
             scales = scales(X = (; scale = log10)));
         id = "all80-speedup",
-        title = "Where the current committed faithful RK graphs win and lose",
-        description = "Each point is one posteriordb model at the CURRENT COMMITTED faithful graphs " *
-            "(base 8f09780; the natural-source cleanup baseline is reserved separately). " *
-            "y = log₂(comparator median / RK median). KNOWN-CONTENDED rows are OMITTED entirely (not " *
-            "disclaimed in-plot) — their raw values + load provenance are in the separate " *
-            "Measurements/evidence section. The plotted timings are UN-AUDITED for host isolation " *
-            "(not clean-certified, not a performance verdict); read directionally, treat near-parity " *
-            "cautiously. A distinct marker flags the one CONFIRMED gross-workload mismatch (Mb: rich " *
+        title = "Where the faithful RK graphs win and lose",
+        description = "Each point is one posteriordb model on the natural-source base (f1e8b83). " *
+            "y = log₂(comparator median / RK median). This whole run was measured under sustained " *
+            "OBSERVED HOST LOAD (≈377/383 telemetry samples competing), so every timing is " *
+            "directional-only, never a performance verdict — treat near-parity as a tie. Four " *
+            "historically-contended rows are conservatively omitted; their raw values + provenance " *
+            "are in the Measurements/evidence section. A distinct marker flags the one CONFIRMED " *
+            "gross-workload mismatch (Mb: rich " *
             "O(M) per-individual plate vs the comparator's O(1) sufficient statistics); no other model " *
             "is positively certified same-workload. GLMM's RK/Turing ratio is excluded (non-equivalent " *
             "Turing support). See the reading guide for the preprocessing/endpoint/HMC categories.")
@@ -190,6 +190,8 @@ function render_all80_reactant_coverage_plot(path = _ALL80_BENCHMARK_PATH)
         id = "all80-reactant-coverage",
         title = "Reactant coverage — what lowered, what still fails",
         description = "For each operation, how many of the 82 faithful graphs lowered through " *
-            "Reactant versus recorded an exact lowering diagnostic. The failing set is kept " *
-            "explicit (its errors are in the gradient/HMC tables) so it can be improved or fixed.")
+            "Reactant versus recorded an exact lowering diagnostic. On the natural-source base all " *
+            "82 lower for all three operations (primal, gradient, and the compiled HMC loop). The " *
+            "diagnostic-recording mechanism stays in place — never a workaround in the sources — so " *
+            "any future model or backend change that fails is surfaced here rather than hidden.")
 end
