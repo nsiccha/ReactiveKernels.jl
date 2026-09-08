@@ -916,7 +916,9 @@ end
     # snag composed-authore: a fused authored plate chain absorbed one axis-check
     # group per sub-plate, so it emitted redundant pre-loop
     # `_plate_require_axes(combine_axes(...))` calls an equivalent single plate
-    # never has, slowing the primal ~1.56x. These lock BOTH halves of the fix:
+    # never has (the only codegen difference; reported to slow the primal under
+    # concurrent load, but NOT reproducible under controlled conditions —
+    # structural cleanup, not a proven speedup). These lock BOTH halves of it:
     # the redundant checks are ELIDED over typed/bound array ports, and the
     # axis-domain guards are PRESERVED (an axis-less producer sub-plate must still
     # be rejected, never silently borrow a sibling's axis).
