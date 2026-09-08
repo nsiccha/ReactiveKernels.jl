@@ -113,6 +113,48 @@ ports. Authored signature defaults and keyword arguments do not apply to a
 bound preparation; the example therefore supplies the remaining `scale` and
 `offset` values positionally.
 
+The same preparation step can cache named data-only recipes inside an authored
+plate whose remaining work depends on the parameter:
+
+```julia
+@kernel plated_objective(q::Vector{Float64}, data::Vector{Float64}) = begin
+    parameter::Float64 = sum(q)
+    pointwise = plate(data, parameter) do d, theta
+        transformed::Float64 = log(d)
+        result::Float64 = transformed * theta
+        result
+    end
+    total::Float64 = sum(pointwise)
+end
+
+plate_data = [1.0, 2.0, 4.0]
+prepared_plate = prepare_ad(
+    plated_objective, backend, parameters;
+    active = :q, want = :total, bound = (; data = plate_data),
+)
+plate_gradient = ad_gradient(prepared_plate, parameters)
+```
+
+Here `log(d)` runs during preparation and its cached values feed the live plate.
+Each data-only recipe uses its own broadcast coordinates, including singleton
+axes. Rebinding rebuilds the cache. Native execution, prepared AD, and Reactant
+consume the same residual graph. The focused native and Reactant tests exercise
+this example without adding an AD toolchain to the documentation build.
+
+Caching adds preparation work and storage; cheap arithmetic may gain nothing or
+run slower. Original data arguments remain retained for shape validation even
+when their elements are no longer read by the residual. Empty bound domains
+and live inputs that could introduce an empty dimension keep their original
+execution. A live array needs a declared rank and bound axes longer than one
+in every dimension it can supply; scalar and explicit atomic inputs add no
+dimensions. Mutable or non-concrete intermediate results and nested plate/scan
+bodies also keep their original execution. Cached elements are limited to
+`Bool`, standard 8–64-bit integers, and `Float16`/`Float32`/`Float64`; tuple and
+struct frontiers keep their original execution. Recipes still follow the
+pure-operation contract.
+An inline expression such as `theta * log(d)` is one mixed-input recipe and is
+not split by this pass.
+
 ## Accepted boundary
 
 - Gradient preparation requires a scalar WANT. Pullback preparation accepts one
