@@ -47,7 +47,13 @@ _embedded_kernel(op) = nothing
 # the fused native/tensorized loop products directly.
 struct _AuthoredPlateOp{K,A}
     kernel::K
+    # Cold lowering metadata: each tuple names the non-atomic arguments of an
+    # absorbed plate. Its original broadcast domain must still be valid even
+    # when a later plate adds axes (or the scalar body ignores an argument).
+    axis_checks::Tuple
 end
+_AuthoredPlateOp{K,A}(kernel::K) where {K,A} =
+    _AuthoredPlateOp{K,A}(kernel, ())
 
 "The transparent scalar plan captured by an authored `plate(...) do` recipe."
 function plate_body(recipe::Recipe)
@@ -66,6 +72,24 @@ end
 @inline _authored_plate_is_axis(x::Tuple) = !isempty(axes(x))
 @inline _authored_plate_is_axis(x::Base.Broadcast.Broadcasted) =
     !isempty(axes(x))
+
+# Compile-time counterpart of `_authored_plate_is_axis`, over a port's declared
+# value TYPE. The native plate lowering uses it to bind the axis marker to a
+# specific argument statically instead of via a runtime `findfirst` (which
+# defeats reverse-mode Enzyme's static-activity analysis — see
+# `_lower_authored_plate_native!`). It is deliberately CONSERVATIVE: it returns
+# `:axis` / `:not_axis` only when the type PROVES what `_authored_plate_is_axis`
+# would decide at runtime for every value of that type, and `:ambiguous`
+# otherwise. A metadata-`Any` port (which may hold a runtime scalar), an abstract
+# array type, a `Broadcasted`, or a non-axis struct is `:ambiguous`, so the caller
+# keeps the runtime marker for it. A rank-0 array has empty axes, so — like a
+# scalar — it is `:not_axis`.
+@inline _static_plate_axis_class(::Type) = :ambiguous
+@inline _static_plate_axis_class(::Type{<:Number}) = :not_axis
+@inline _static_plate_axis_class(::Type{<:AbstractArray{<:Any,0}}) = :not_axis
+@inline _static_plate_axis_class(::Type{<:AbstractArray{<:Any,N}}) where {N} =
+    :axis
+@inline _static_plate_axis_class(::Type{<:Tuple}) = :axis
 
 @inline _authored_plate_argument(::Val{A}, index, arg) where {A} =
     index in A ? Ref(arg) : arg
@@ -134,9 +158,19 @@ end
 # and total accumulator UP FRONT — no boxed `Vector{Any}` is ever built and the
 # accumulator seed matches the summed cells (`_narrow_plate_output` above is a
 # post-hoc narrowing that still allocates the boxed container first and leaves the
-# accumulator untyped). A genuinely uninferrable body falls back to the
-# plan-level output valtype (`Any`), where `_narrow_plate_output` still recovers a
-# homogeneous element type at runtime.
+# accumulator untyped).
+#
+# When `promote_op` cannot pin a CONCRETE type — a genuinely uninferrable body,
+# but also a STATIC call over an UNTYPED batched port, whose projected element
+# type is `Any` (`_plate_cache_slot`/`_plate_result_type` call this with the
+# plan-level HAVE types, where an unannotated port is `Any`) — fall back to the
+# scalar body kernel's DECLARED output valtype. For a typed body (`::Float64`)
+# that valtype is authoritative and concrete, so the nonallocating cache slot is
+# seeded `Array{Float64}` instead of a boxed `Array{Any}` that would re-box every
+# element through `broadcast!` on each call (the `want=:pointwise` regression:
+# 16 KB/call for a length-1000 untyped plate whose cells are Float64). A body
+# with no concrete declared type stays `Any`, where `_narrow_plate_output` still
+# recovers a homogeneous element type at runtime.
 function _authored_plate_result_eltype(op::_AuthoredPlateOp{K,A},
                                        argtypes) where {K,A}
     element_types = ntuple(length(argtypes)) do position
@@ -144,7 +178,10 @@ function _authored_plate_result_eltype(op::_AuthoredPlateOp{K,A},
         (position in A || argtype <: Number) ? argtype : eltype(argtype)
     end
     T = Base.promote_op(op.kernel, element_types...)
-    T === Union{} ? valtype(only(outputs(op.kernel))) : T
+    isconcretetype(T) && return T
+    declared = valtype(only(outputs(op.kernel)))
+    isconcretetype(declared) && return declared
+    T === Union{} ? declared : T
 end
 
 # A plate is a pure graph map/reduction. Once Julia has instantiated the
@@ -206,9 +243,9 @@ end
 
 # A first-class authored SEQUENTIAL scan.  Unlike `plate` (a pure broadcast map),
 # it threads a carry through an ordered loop; its scalar step is a 2-`want` kernel
-# `(carry, x, shared...) -> (new_carry, output)`.  The op is opaque to the lowerer
-# (not inlined): the emitted `__ops__[k](args...)` call runs the loop via
-# `_tensorized_scan`, which a tracing backend specializes to a `stablehlo.while`.
+# `(carry, x, shared...) -> (new_carry, output)`. Native lowering inlines that
+# step and can stream its output into a reducing plate. The tensorized product
+# calls `_tensorized_scan`, specialized by a backend to a `stablehlo.while`.
 # The op's argument order is fixed by authoring: index 1 = carry seed, index 2 =
 # the sequence `xs`, index 3+ = Ref-shared operands; `A` records the atomic
 # (broadcast-invariant) indices {1, 3, 4, …}.
@@ -330,6 +367,228 @@ function _authored_plate_sum_recipe(p::Plan, plate_recipe::Recipe)
     length(matches) <= 1 || throw(ArgumentError(
         "an authored plate pointwise port has more than one selected sum consumer"))
     isempty(matches) ? nothing : only(matches)
+end
+
+# Inline the scalar step into the ordered native loop. Calling the nested
+# PreparedKernel from a loop with a changing carry defeats inference across the
+# RGF boundary; the same step AST and operation table specialize normally here.
+function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
+                                      offset; consumer = nothing)
+    step = op.kernel
+    indices, index, carry, output = gensym.((:scan_indices, :scan_index,
+                                            :scan_carry, :scan_output))
+    xs = callargs[2]
+    arguments = Any[carry, Expr(:ref, xs, index), callargs[3:end]...]
+    step_body = Expr(:block, _embedded_statements(
+        step.ast, arguments, Expr(:tuple, carry, output), offset)...)
+    invariant = Any[]
+    initial_output, loop_output, final_output = Expr(:block), Expr(:block), Expr(:block)
+    if lhs !== nothing
+        push!(initial_output.args, :($lhs = $(GlobalRef(Base, :similar))(
+            $xs, $(GlobalRef(Base, :typeof))($output))))
+        push!(initial_output.args, :($lhs[$index] = $output))
+        push!(loop_output.args, :($lhs[$index] = $output))
+    end
+    if consumer !== nothing
+        cell, args, positions, cell_offset, pointwise_lhs, total_lhs = consumer
+        cell_output = gensym(:scan_cell)
+        cell_args = Any[i in positions ? output : arg for (i, arg) in enumerate(args)]
+        invariant, dynamic, cell_type = _authored_scan_cell_statements(
+            cell, cell_args, positions, cell_output, cell_offset)
+        append!(step_body.args, dynamic)
+        # Match ordinary plate lowering's inferred result type, including
+        # heterogeneous cells; the first value alone cannot type that buffer.
+        plate_eltype = gensym(:scan_plate_eltype)
+        push!(initial_output.args, :($plate_eltype = $cell_type))
+        if pointwise_lhs !== nothing
+            push!(initial_output.args, :($pointwise_lhs = $(GlobalRef(Base, :similar))(
+                $xs, $plate_eltype)))
+            push!(initial_output.args, :($pointwise_lhs[$index] = $cell_output))
+            push!(loop_output.args, :($pointwise_lhs[$index] = $cell_output))
+            push!(final_output.args, :($pointwise_lhs =
+                $(GlobalRef(@__MODULE__, :_narrow_plate_output))($pointwise_lhs)))
+        end
+        push!(initial_output.args,
+              :($total_lhs = $(GlobalRef(Base, :zero))(
+                  $plate_eltype === Any ? $(GlobalRef(Base, :typeof))($output) :
+                  $plate_eltype) + $cell_output))
+        push!(loop_output.args, :($total_lhs = $total_lhs + $cell_output))
+    end
+    push!(body.args, :($indices = $(GlobalRef(Base, :eachindex))($xs)))
+    push!(body.args, :($(GlobalRef(Base, :isempty))($indices) &&
+        throw(ArgumentError("scan requires a non-empty sequence"))))
+    append!(body.args, invariant)
+    push!(body.args, :($carry = $(callargs[1])))
+    push!(body.args, :($index = $(GlobalRef(Base, :first))($indices)))
+    append!(body.args, step_body.args)
+    append!(body.args, initial_output.args)
+    push!(body.args, Expr(:for,
+        :($index = $(GlobalRef(Base.Iterators, :drop))($indices, 1)),
+        Expr(:block, step_body.args..., loop_output.args...)))
+    append!(body.args, final_output.args)
+    body
+end
+
+function _authored_scan_cell_statements(cell, args, positions, output, offset)
+    inner = cell.plan
+    length(cell.ops) == length(inner.recipes) || throw(ArgumentError(
+        "an authored plate body must lower to one operation per transparent scalar recipe"))
+    roots = Set(canon_id(inner.graph, inner.have[i].id) for i in positions)
+    dependencies = _plate_dependencies(inner, roots).recipes
+    locals = Dict(canon_id(inner.graph, v.id) => arg
+                  for (v, arg) in zip(inner.have, args))
+    types = Dict{Int,Any}(canon_id(inner.graph, v.id) =>
+        Expr(:call, GlobalRef(Base, :typeof), arg) for (v, arg) in zip(inner.have, args))
+    invariant, dynamic = Any[], Any[]
+    for (i, recipe) in enumerate(inner.recipes)
+        length(recipe.outputs) == 1 || throw(ArgumentError(
+            "an authored plate currently requires single-output scalar recipes"))
+        value = only(recipe.outputs)
+        result = gensym(Symbol(:scan_cell_, value.name))
+        inputs = Any[locals[canon_id(inner.graph, v.id)] for v in recipe.inputs]
+        statement = :($result = $(_OPS_ARG)[$(offset + i)]($(inputs...)))
+        push!(isempty(dependencies[i]) ? invariant : dynamic, statement)
+        locals[canon_id(inner.graph, value.id)] = result
+        input_types = Any[types[canon_id(inner.graph, v.id)] for v in recipe.inputs]
+        types[canon_id(inner.graph, value.id)] = Expr(:call,
+            GlobalRef(Base, :promote_op), Expr(:ref, _OPS_ARG, offset + i), input_types...)
+    end
+    push!(dynamic, :($output = $(locals[canon_id(inner.graph, only(inner.want).id)])))
+    invariant, dynamic, types[canon_id(inner.graph, only(inner.want).id)]
+end
+
+# Fuse only a sole scalar plate consumer with a selected sum. Other array
+# operands need full broadcast-axis validation; other consumers or WANTs need
+# the materialized scan. In either case ordinary native scan lowering applies.
+function _authored_scan_sum_consumer(p::Plan, scan_recipe::Recipe)
+    output_id = canon_id(p.graph, only(scan_recipe.outputs).id)
+    any(w -> canon_id(p.graph, w.id) == output_id, p.want) && return nothing
+    consumers = filter(p.recipes) do recipe
+        any(v -> canon_id(p.graph, v.id) == output_id, recipe.inputs)
+    end
+    length(consumers) == 1 || return nothing
+    consumer = only(consumers)
+    consumer.op isa _AuthoredPlateOp || return nothing
+    # Composed plate chains retain separate broadcast-domain checks. Let their
+    # ordinary lowering validate those domains against a materialized scan.
+    isempty(consumer.op.axis_checks) || return nothing
+    _authored_plate_sum_recipe(p, consumer) === nothing && return nothing
+    atomic = typeof(consumer.op).parameters[2]
+    for (i, input) in enumerate(consumer.inputs)
+        if canon_id(p.graph, input.id) == output_id
+            i in atomic && return nothing # Ref(errors) consumes the whole vector.
+        elseif !(i in atomic || valtype(input) <: Number)
+            return nothing
+        end
+    end
+    consumer
+end
+
+# Compose selected scalar DAGs only at code generation. The public graph and
+# Plan retain every named array node, so another WANT/HAVE query can still
+# materialize it or cut the graph there. A whole-array/Ref use is a boundary,
+# as is any additional selected consumer; no source expression is rewritten.
+function _compose_authored_plates(g::Graph, producer::Recipe, consumer::Recipe)
+    scalar_graph = Graph()
+    callvalues = Value[]
+    scalar_have = Value[]
+    atomic = Int[]
+    positions = Dict{Tuple{Int,Bool},Int}()
+    checks = Tuple[]
+    readable_recipes = Dict{Int,Recipe}()
+    producer_id = canon_id(g, only(producer.outputs).id)
+
+    function append_body(recipe, replacement = nothing)
+        op = recipe.op
+        inner = op.kernel.plan
+        old_atomic = typeof(op).parameters[2]
+        mapped = Dict{Int,Value}()
+        input_positions = Vector{Tuple}(undef, length(recipe.inputs))
+        for (index, (outer, input)) in enumerate(zip(recipe.inputs, inner.have))
+            cid = canon_id(g, outer.id)
+            if replacement !== nothing && cid == producer_id
+                mapped[canon_id(inner.graph, input.id)] = replacement.value
+                input_positions[index] = replacement.axes
+                continue
+            end
+            key = (cid, index in old_atomic)
+            position = get!(positions, key) do
+                push!(callvalues, outer)
+                push!(scalar_have, value!(scalar_graph, input.name, valtype(input)))
+                last(key) && push!(atomic, length(callvalues))
+                length(callvalues)
+            end
+            mapped[canon_id(inner.graph, input.id)] = scalar_have[position]
+            input_positions[index] = (position,)
+        end
+        # Preserve all absorbed domain checks, including singleton/empty axes
+        # and unused formals. Flattening only the scalar dependencies loses them.
+        remap(group) = Tuple(unique(Int[
+            position for index in group for position in input_positions[index]]))
+        append!(checks, (remap(group) for group in op.axis_checks))
+        axes = remap(Tuple(index for index in eachindex(recipe.inputs)
+                           if !(index in old_atomic)))
+        push!(checks, axes)
+        for (recipe_index, r) in enumerate(inner.recipes)
+            ins = Tuple(mapped[canon_id(inner.graph, v.id)] for v in r.inputs)
+            outs = Tuple(get!(mapped, canon_id(inner.graph, v.id)) do
+                value!(scalar_graph, v.name, valtype(v))
+            end for v in r.outputs)
+            copied = add!(scalar_graph, ins => outs, r.op; cost = r.cost,
+                          effectful = r.effectful, source = r.source)
+            readable_recipes[copied.id] = op.kernel.lowered_recipes[recipe_index]
+        end
+        (; value = mapped[canon_id(inner.graph, only(inner.want).id)], axes)
+    end
+
+    intermediate = append_body(producer)
+    result = append_body(consumer, intermediate)
+    # Keep the complete HAVE boundary, including unused axis arguments.
+    scalar_plan = plan(scalar_graph; have = scalar_have, want = (result.value,))
+    kernel = prepare(scalar_plan)
+    # Source RHSs use the original scalar formal names. Keep their original
+    # recipe metadata in operation-table order so readable code binds those
+    # names to the newly projected scalar arguments, including across chains.
+    kernel = PreparedKernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
+        kernel.plan, kernel.ast,
+        Tuple(readable_recipes[r.id] for r in scalar_plan.recipes))
+    op = _AuthoredPlateOp{typeof(kernel),Tuple(atomic)}(kernel, Tuple(unique(checks)))
+    Recipe(consumer.id, Tuple(callvalues), consumer.outputs, op,
+           producer.cost + consumer.cost, nothing, false, consumer.source)
+end
+
+function _fuse_authored_plate_chains(p::Plan)
+    recipes = Union{Nothing,Recipe}[p.recipes...]
+    boundary = Set(canon_id(p.graph, v.id) for v in (p.have..., p.want...))
+    changed = false
+    for index in eachindex(recipes)
+        producer = recipes[index]
+        producer === nothing && continue
+        producer.op isa _AuthoredPlateOp || continue
+        length(producer.outputs) == 1 || continue
+        cid = canon_id(p.graph, only(producer.outputs).id)
+        cid in boundary && continue
+        consumers = findall(recipes) do candidate
+            candidate === nothing && return false
+            any(input -> canon_id(p.graph, input.id) == cid, candidate.inputs)
+        end
+        length(consumers) == 1 || continue
+        consumer_index = only(consumers)
+        consumer_index > index || continue
+        consumer = recipes[consumer_index]
+        consumer.op isa _AuthoredPlateOp || continue
+        consumer_atomic = typeof(consumer.op).parameters[2]
+        any(position -> position in consumer_atomic &&
+            canon_id(p.graph, consumer.inputs[position].id) == cid,
+            eachindex(consumer.inputs)) && continue
+        recipes[consumer_index] = _compose_authored_plates(p.graph, producer, consumer)
+        recipes[index] = nothing
+        changed = true
+    end
+    changed || return p
+    selected = Recipe[r for r in recipes if r !== nothing]
+    producer = Dict(canon_id(p.graph, v.id) => r for r in selected for v in r.outputs)
+    Plan(p.graph, p.have, p.want, selected, producer, p.cost, p.candidates)
 end
 
 function _plate_dependencies(plan::Plan, root_ids::Set{Int})
@@ -463,9 +722,37 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
     first_coordinate = gensym(:plate_first)
     atomic_val = Expr(:call, GlobalRef(Base, :Val), QuoteNode(atomic))
     if needs_marker
-        push!(body.args,
-            :($marker = $(GlobalRef(@__MODULE__, :_authored_plate_marker))(
-                $atomic_val, $(callargs...))))
+        # The marker supplies only the pointwise buffer's container type/shape and
+        # the `Any`-fallback element type — never a differentiated value. Emitting
+        # a runtime `_authored_plate_marker(Val(atomic), callargs...)` here (a
+        # `findfirst` over the whole argument tuple) makes the selected marker
+        # CONDITIONALLY active whenever a data-only `Vector{Int}` axis sits beside
+        # an active/`Constant` `Vector{Float64}` — the posteriordb M0/Mh/seeds
+        # shape — which reverse-mode Enzyme rejects with an
+        # `EnzymeRuntimeActivityError` under the standing static-activity config
+        # (no `set_runtime_activity`). So bind the marker to a SPECIFIC argument at
+        # lowering time — but only when the port value types PROVE it is the same
+        # axis the runtime `findfirst` would pick. Walk the non-atomic positions in
+        # authored order: skip provable non-axes (scalars, rank-0 arrays), take the
+        # first provable axis, and FALL BACK to the runtime marker the moment a
+        # preceding candidate is `:ambiguous` (a metadata-`Any` port that may hold a
+        # runtime scalar, an abstract array type, a non-axis struct) — because the
+        # runtime `_authored_plate_is_axis` could then skip it and select a later
+        # argument, and a static pick that is not provably the same axis would build
+        # the pointwise buffer from the wrong argument (e.g. a scalar `Any` port).
+        axis_position = nothing
+        for position in eachindex(callargs)
+            position in atomic && continue
+            class = _static_plate_axis_class(valtype(callvalues[position]))
+            class === :not_axis && continue
+            class === :axis && (axis_position = position)
+            break
+        end
+        marker_source = axis_position === nothing ?
+            :($(GlobalRef(@__MODULE__, :_authored_plate_marker))(
+                $atomic_val, $(callargs...))) :
+            callargs[axis_position]
+        push!(body.args, :($marker = $marker_source))
     end
 
     # Reuse Base's ordinary broadcast preparation one argument at a time. A
@@ -494,6 +781,13 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
         push!(prepared_arguments, prepared)
     end
     output_axes = gensym(:plate_axes)
+    for group in op.axis_checks
+        group_axes = Expr(:call, GlobalRef(Base.Broadcast, :combine_axes),
+            (raw_arguments[position] for position in group
+             if raw_arguments[position] !== nothing)...)
+        push!(body.args, Expr(:call, GlobalRef(@__MODULE__, :_plate_require_axes),
+                              group_axes))
+    end
     combined_axes = Expr(:call, GlobalRef(Base.Broadcast, :combine_axes),
                          (arg for arg in raw_arguments if arg !== nothing)...)
     push!(body.args, Expr(:(=), output_axes,
@@ -718,6 +1012,7 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
     runtime_ops = Any[]
     runtime_recipes = Recipe[]
     skipped_recipes = Set{Int}()
+    pending_scans = Dict{Int,Any}()
     # HAVE is authoritative, and the first selected producer of any other
     # logical value owns its binding. Later recipes may emit that value as a
     # collateral multi-output; execute the recipe but discard the duplicate so
@@ -744,7 +1039,19 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                 push!(assigned, canon_id(g, only(sum_recipe.outputs).id))
                 push!(skipped_recipes, sum_recipe.id)
             end
-            if tensorized
+            if !tensorized && haskey(pending_scans, r.id)
+                scan_recipe, scan_args, scan_offset = pending_scans[r.id]
+                output_id = canon_id(g, only(scan_recipe.outputs).id)
+                positions = findall(
+                    v -> canon_id(g, v.id) == output_id, r.inputs)
+                cell_offset = length(runtime_ops)
+                append!(runtime_ops, r.op.kernel.ops)
+                append!(runtime_recipes, r.op.kernel.lowered_recipes)
+                consumer = (r.op.kernel, callargs, positions, cell_offset,
+                            pointwise_lhs, total_lhs)
+                _lower_authored_scan_native!(
+                    body, scan_recipe.op, scan_args, nothing, scan_offset; consumer)
+            elseif tensorized
                 _lower_authored_plate_tensorized!(
                     body, runtime_ops, runtime_recipes, r.op, callargs,
                     pointwise_lhs, total_lhs)
@@ -767,6 +1074,30 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
             end
         end
         lhs = length(lhsnames) == 1 ? only(lhsnames) : Expr(:tuple, lhsnames...)
+        if inline_embedded && r.op isa _AuthoredScanOp
+            # Both products keep the same table: the traced path calls the scan
+            # op, while the native path calls its inlined scalar operations.
+            push!(runtime_ops, r.op)
+            push!(runtime_recipes, r)
+            scan_index = length(runtime_ops)
+            append!(runtime_ops, r.op.kernel.ops)
+            append!(runtime_recipes, r.op.kernel.lowered_recipes)
+            if tensorized
+                call = Expr(:call, Expr(:ref, _OPS_ARG, scan_index),
+                            callargs...)
+                push!(body.args, Expr(:(=), lhs, call))
+            else
+                consumer = _authored_scan_sum_consumer(p, r)
+                if consumer === nothing
+                    _lower_authored_scan_native!(body, r.op, callargs, lhs, scan_index)
+                else
+                    # Emit at the plate, where all its scalar inputs are ready.
+                    # The reserved table slots keep both backend products equal.
+                    pending_scans[consumer.id] = (r, callargs, scan_index)
+                end
+            end
+            continue
+        end
         embedded = inline_embedded ? _embedded_kernel(r.op) : nothing
         if embedded === nothing
             push!(runtime_ops, r.op)
@@ -1287,6 +1618,7 @@ end
 function _needs_embedded_tensorization(p::Plan)
     any(p.recipes) do recipe
         recipe.op isa _AuthoredPlateOp && return true
+        recipe.op isa _AuthoredScanOp && !isempty(p.have) && return true
         kernel = _embedded_kernel(recipe.op)
         kernel !== nothing && kernel.f isa _ArrayFunctionPair
     end
@@ -1306,7 +1638,11 @@ function _embedded_marker_candidates(p::Plan)
         p, Set(keys(root_positions))).values
     candidates = Int[]
     for recipe in p.recipes
-        positions = if recipe.op isa _AuthoredPlateOp
+        positions = if recipe.op isa _AuthoredScanOp
+            # With the sequence bound, a traced carry/shared operand still
+            # selects the tensorized product through its runtime HAVE roots.
+            (2, 1, (3:length(recipe.inputs))...)
+        elseif recipe.op isa _AuthoredPlateOp
             atomic = typeof(recipe.op).parameters[2]
             Tuple(index for index in eachindex(recipe.inputs)
                   if !(index in atomic))
@@ -1617,17 +1953,24 @@ only those ports runs once, here, and the returned kernel takes just the
 remaining HAVE ports positionally (in their original relative order); the
 hoisted values are baked in as constants. With `bound = ()` (the default)
 behavior is unchanged. `passes` apply to the residual (per-call) kernel.
+
+Selected authored plates with a single plate consumer are composed during
+lowering, eliminating the intermediate array. Named ports remain in `p`: asking
+for an intermediate, supplying it as HAVE, or selecting another consumer keeps
+that boundary. Whole-array (`Ref`) consumers and opaque intervening recipes
+also retain their materialization boundary.
 """
 function prepare(p::Plan; passes = (), bound = ())
     p = _partial_apply(p, bound)
-    native_ast, ops, recipes = _lower_with_ops(p)
+    lowered_plan = _fuse_authored_plate_chains(p)
+    native_ast, ops, recipes = _lower_with_ops(lowered_plan)
     isempty(passes) || (native_ast = transform(native_ast, passes...))
     if !_needs_embedded_tensorization(p)
         return _prepare(p, native_ast, ops, recipes)
     end
 
     tensorized_ast, tensorized_ops, tensorized_recipes =
-        _lower_with_ops(p; tensorized = true)
+        _lower_with_ops(lowered_plan; tensorized = true)
     tensorized_ops == ops || throw(ArgumentError(
         "embedded native and tensorized kernels produced different operation tables"))
     tensorized_recipes == recipes || throw(ArgumentError(

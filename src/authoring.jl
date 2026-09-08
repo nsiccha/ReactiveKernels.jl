@@ -1405,6 +1405,13 @@ end
 
 function _kernel_authored_plate(spec::KernelSpec, ::Val{A}) where {A}
     kernel = prepare(spec)
+    # Plate lowering consumes one operation per scalar recipe. Standalone
+    # preparation may expand a nested scan into several native operations;
+    # retain the recipe boundary when storing that scalar body as metadata.
+    if length(kernel.ops) != length(kernel.plan.recipes)
+        kernel = _prepare(kernel.plan,
+            _lower_with_ops(kernel.plan; inline_embedded = false)...)
+    end
     _AuthoredPlateOp{typeof(kernel),A}(kernel)
 end
 
