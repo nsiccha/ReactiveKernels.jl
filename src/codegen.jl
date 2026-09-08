@@ -1420,9 +1420,12 @@ end
 # prefer the first runtime broadcast axis when choosing native vs. tensorized
 # execution.  The native call ignores the marker and may derive its plate axis
 # only after projecting an atomic boundary, so exhausting the candidates falls
-# back to a non-axis sentinel.  Atomic `Ref(port)` inputs are excluded when the
-# candidates are derived, so an array-valued atom cannot accidentally become
-# the batch marker.
+# back to a non-axis sentinel.  Atomic `Ref(port)` inputs are excluded from the
+# axis candidates, so an array-valued atom cannot be mistaken for the plate
+# axis; but when every axis operand is bound and no axis candidate remains,
+# `_embedded_marker_candidates` admits array-valued HAVE ports (atomic ones
+# included) as backend markers, since only the marker TYPE — never its axis —
+# selects native vs. tensorized execution there.
 struct _DynamicEmbeddedFunctionPair{I,N,T,A} <: _ArrayFunctionPair
     native::N
     tensorized::T
@@ -1645,6 +1648,21 @@ function _embedded_marker_candidates(p::Plan)
                 position = root_positions[root]
                 position in candidates || push!(candidates, position)
             end
+        end
+    end
+    if isempty(candidates)
+        # No non-atomic (axis-defining) plate operand traces back to an active
+        # HAVE port: every axis operand is bound (`bound=`), so the plate axis is
+        # a compile-time constant baked into both bodies (the native body derives
+        # its own axis; the tensorized body takes the marker-less axis fallback).
+        # Backend selection still needs a runtime marker, so admit any
+        # array-valued active HAVE port as one — including a whole-vector
+        # `Ref`-captured parameter that is atomic for broadcasting yet remains a
+        # live array HAVE. Only the marker TYPE is consulted (`_batched_call`
+        # dispatches native vs. tensorized on it), never its axis, so an atomic
+        # array admitted here cannot be mistaken for the plate axis.
+        for (position, input) in enumerate(p.have)
+            valtype(input) <: AbstractArray && push!(candidates, position)
         end
     end
     Tuple(candidates)
