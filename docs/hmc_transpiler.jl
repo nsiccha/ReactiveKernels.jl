@@ -15,20 +15,21 @@ function render_consumer(filename, marker)
 end
 
 function run_consumers()
-    include(joinpath(DIR, "prepared_examples.jl"))
-    include(joinpath(DIR, "prepared_hmc.jl"))
-    scalar = Base.invokelatest(PreparedTranspilerExamples.scalar_example)
-    vector = Base.invokelatest(PreparedTranspilerExamples.vector_example)
-    scalar.first.outputs.value == scalar.replayed.outputs.value == 9.0 || error("scalar example drift")
-    scalar.continued.outputs.value == 21.0 || error("scalar continuation drift")
-    vector.continued.outputs.position == [0.125, 0.25] || error("vector continuation drift")
-    vector.continued.outputs.squared == [0.015625, 0.0625] || error("derived output drift")
-    vector.input == [2.0, 4.0] || error("input preservation drift")
-    hmc = Base.invokelatest(PreparedHMCExample.hmc_example; transitions=10)
-    all(isfinite, hmc.continued.outputs.position) || error("HMC example failed")
-    Markdown.parse("The executable examples produce scalar outputs **9 → 21** (replay: **9**) " *
-        "and continued vector position **[0.125, 0.25]**. The HMC consumer also runs " *
-        "during this documentation build, including state and RNG continuation.")
+    # Frozen for the docs build (user decision `00jueci`): the scalar, vector and
+    # HMC transpiler consumers import Enzyme for reverse-mode gradients
+    # (benchmark/sampler_transpiler/eight_schools_density.jl). They are exercised
+    # by the executable benchmark suite under benchmark/sampler_transpiler and its
+    # tests, not during the docs build, so the build carries no Enzyme/LLVM
+    # autodiff toolchain. Their verified outputs are stated here as prose instead
+    # of re-executed at build time.
+    Markdown.parse(
+        "The executable examples produce scalar outputs **9 → 21** (state replay: " *
+        "**9**) and continued vector position **[0.125, 0.25]** (derived `squared` " *
+        "**[0.015625, 0.0625]**). The HMC consumer runs the same compiler with " *
+        "reverse-mode gradients. These consumers are exercised by the executable " *
+        "benchmark suite under " *
+        "[`benchmark/sampler_transpiler`](https://github.com/nsiccha/ReactiveKernels.jl/tree/main/benchmark/sampler_transpiler), " *
+        "not during the docs build.")
 end
 
 function render_results()

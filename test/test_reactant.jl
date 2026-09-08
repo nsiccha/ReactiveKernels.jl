@@ -9,6 +9,8 @@ import LambertW
 import TOML
 import Reactant: @compile, @jit
 
+include("test_authored_plate_chains_reactant.jl")
+
 module _ReactantStatefulFix
 include(joinpath(@__DIR__, "..", "benchmark", "nuts_kernel_authoring_fixture.jl"))
 end

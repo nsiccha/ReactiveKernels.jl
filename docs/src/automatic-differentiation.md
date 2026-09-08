@@ -15,10 +15,12 @@ RK does not generate an AD-specific kernel.
 
 ## Prepare once, then request gradients or value-and-gradient
 
-This build-executed example shows the kernel definition and the two native
-prepared interfaces:
+The example below shows the kernel definition and the two native prepared
+interfaces. Its assertions are exercised by the package test suite rather than
+the docs build, so the published documentation carries no Enzyme/LLVM autodiff
+toolchain:
 
-```@example automatic_differentiation
+```julia
 using ReactiveKernels
 using DifferentiationInterface
 import Enzyme
@@ -93,7 +95,7 @@ constants in the residual kernel, and the prepared derivative boundary accepts
 only the remaining HAVE ports. Rebind by preparing again from the original
 kernel specification.
 
-```@example automatic_differentiation
+```julia
 bound_prepared = prepare_ad(
     objective, backend, parameters, 1.25, 0.0;
     active = :q, want = :density,
