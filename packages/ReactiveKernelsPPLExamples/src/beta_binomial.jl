@@ -69,19 +69,19 @@ docs_example = (;
 )
 """
 
-function evaluate_beta_binomial_source()
+function evaluate_beta_binomial_source(; model_only::Bool = false)
     # Bind only the data. The authored source imports and reuses the shared Beta
     # and Binomial objects directly (Binomial is imported explicitly so the bare
     # name shadows Base.binomial inside the kernel body).
     _evaluate_ppl_source(BETA_BINOMIAL_SOURCE, @__MODULE__; bindings = (
         :BETA_BINOMIAL_TRIALS, :BETA_BINOMIAL_SUCCESSES,
-    ))
+    ), model_only)
 end
 
 const _BETA_BINOMIAL_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _BETA_BINOMIAL_GRAPH_TEMPLATE[] = evaluate_beta_binomial_source().model
+    _BETA_BINOMIAL_GRAPH_TEMPLATE[] = evaluate_beta_binomial_source(; model_only = true).model
     nothing
 end
 

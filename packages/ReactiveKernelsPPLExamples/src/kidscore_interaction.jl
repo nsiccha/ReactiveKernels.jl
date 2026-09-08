@@ -126,18 +126,18 @@ docs_example = (;
 )
 """
 
-function evaluate_kidscore_interaction_source()
+function evaluate_kidscore_interaction_source(; model_only::Bool = false)
     _evaluate_ppl_source(KIDSCORE_INTERACTION_SOURCE, @__MODULE__; bindings = (
         :INTERACTION_KID_SCORE, :INTERACTION_MOM_HS, :INTERACTION_MOM_IQ,
         :INTERACTION_MOM_HS_NEW, :INTERACTION_MOM_IQ_NEW,
-    ))
+    ), model_only)
 end
 
 const _KIDSCORE_INTERACTION_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
     _KIDSCORE_INTERACTION_GRAPH_TEMPLATE[] =
-        evaluate_kidscore_interaction_source().model
+        evaluate_kidscore_interaction_source(; model_only = true).model
     nothing
 end
 

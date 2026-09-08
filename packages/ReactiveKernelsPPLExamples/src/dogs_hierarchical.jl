@@ -150,16 +150,16 @@ docs_example = (;
 )
 """
 
-function evaluate_dogs_hierarchical_source()
+function evaluate_dogs_hierarchical_source(; model_only::Bool = false)
     _evaluate_ppl_source(DOGS_HIER_SOURCE, @__MODULE__; bindings = (
         :DOGS_HIER_PREV_AVOID, :DOGS_HIER_PREV_SHOCK, :DOGS_HIER_Y_FLAT,
-    ))
+    ), model_only)
 end
 
 const _DOGS_HIER_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _DOGS_HIER_GRAPH_TEMPLATE[] = evaluate_dogs_hierarchical_source().model
+    _DOGS_HIER_GRAPH_TEMPLATE[] = evaluate_dogs_hierarchical_source(; model_only = true).model
     nothing
 end
 

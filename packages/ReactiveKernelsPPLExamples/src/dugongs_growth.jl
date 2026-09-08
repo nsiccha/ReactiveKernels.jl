@@ -98,18 +98,18 @@ docs_example = (;
 )
 """
 
-function evaluate_dugongs_source()
+function evaluate_dugongs_source(; model_only::Bool = false)
     # Bind only the data. The authored source imports and reuses the shared
     # Normal, Uniform, and Gamma distribution objects directly.
     _evaluate_ppl_source(DUGONGS_SOURCE, @__MODULE__; bindings = (
         :DUGONGS_AGE, :DUGONGS_LENGTH,
-    ))
+    ), model_only)
 end
 
 const _DUGONGS_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _DUGONGS_GRAPH_TEMPLATE[] = evaluate_dugongs_source().model
+    _DUGONGS_GRAPH_TEMPLATE[] = evaluate_dugongs_source(; model_only = true).model
     nothing
 end
 

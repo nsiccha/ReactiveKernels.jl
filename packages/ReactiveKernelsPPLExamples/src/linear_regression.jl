@@ -100,13 +100,13 @@ docs_example = (;
 )
 """
 
-function evaluate_linear_regression_source()
+function evaluate_linear_regression_source(; model_only::Bool = false)
     # Bind only the data. The authored source imports the reusable Normal
     # distribution object itself and contains the complete PPL assembly with no
     # helper evaluator or separately prepared density/plate path.
     _evaluate_ppl_source(LINEAR_REGRESSION_SOURCE, @__MODULE__; bindings = (
         :LINREG_X, :LINREG_Y,
-    ))
+    ), model_only)
 end
 
 # Evaluate the authored source from `__init__`, after package precompilation has
@@ -116,7 +116,7 @@ end
 const _LINEAR_REGRESSION_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _LINEAR_REGRESSION_GRAPH_TEMPLATE[] = evaluate_linear_regression_source().model
+    _LINEAR_REGRESSION_GRAPH_TEMPLATE[] = evaluate_linear_regression_source(; model_only = true).model
     nothing
 end
 

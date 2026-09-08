@@ -265,18 +265,18 @@ docs_example = (;
 )
 """
 
-function evaluate_election88_full_source()
+function evaluate_election88_full_source(; model_only::Bool = false)
     _evaluate_ppl_source(ELECTION88_FULL_SOURCE, @__MODULE__; bindings = (
         :E88_AGE, :E88_EDU, :E88_AGE_EDU, :E88_STATE, :E88_REGION,
         :E88_BLACK, :E88_FEMALE, :E88_VPREV, :E88_Y,
         :E88_N_AGE, :E88_N_EDU, :E88_N_AGE_EDU, :E88_N_STATE, :E88_N_REGION,
-    ))
+    ), model_only)
 end
 
 const _ELECTION88_FULL_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _ELECTION88_FULL_GRAPH_TEMPLATE[] = evaluate_election88_full_source().model
+    _ELECTION88_FULL_GRAPH_TEMPLATE[] = evaluate_election88_full_source(; model_only = true).model
     nothing
 end
 

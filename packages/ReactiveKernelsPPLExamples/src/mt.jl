@@ -133,16 +133,16 @@ docs_example = (;
 )
 """
 
-function evaluate_mt_source()
+function evaluate_mt_source(; model_only::Bool = false)
     _evaluate_ppl_source(MT_SOURCE, @__MODULE__; bindings = (
         :MT_Y, :MT_S, :MT_T, :MT_M,
-    ))
+    ), model_only)
 end
 
 const _MT_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _MT_GRAPH_TEMPLATE[] = evaluate_mt_source().model
+    _MT_GRAPH_TEMPLATE[] = evaluate_mt_source(; model_only = true).model
     nothing
 end
 

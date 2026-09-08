@@ -125,16 +125,16 @@ docs_example = (;
 )
 """
 
-function evaluate_radon_pooled_source()
+function evaluate_radon_pooled_source(; model_only::Bool = false)
     _evaluate_ppl_source(RADON_POOLED_SOURCE, @__MODULE__; bindings = (
         :RADON_POOLED_FLOOR, :RADON_POOLED_LOG,
-    ))
+    ), model_only)
 end
 
 const _RADON_POOLED_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _RADON_POOLED_GRAPH_TEMPLATE[] = evaluate_radon_pooled_source().model
+    _RADON_POOLED_GRAPH_TEMPLATE[] = evaluate_radon_pooled_source(; model_only = true).model
     nothing
 end
 

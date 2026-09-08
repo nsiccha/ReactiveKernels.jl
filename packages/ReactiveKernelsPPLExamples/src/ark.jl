@@ -106,14 +106,14 @@ docs_example = (;
 )
 """
 
-function evaluate_ark_source()
-    _evaluate_ppl_source(ARK_SOURCE, @__MODULE__; bindings = (:ARK_YLAG, :ARK_YT))
+function evaluate_ark_source(; model_only::Bool = false)
+    _evaluate_ppl_source(ARK_SOURCE, @__MODULE__; bindings = (:ARK_YLAG, :ARK_YT), model_only)
 end
 
 const _ARK_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _ARK_GRAPH_TEMPLATE[] = evaluate_ark_source().model
+    _ARK_GRAPH_TEMPLATE[] = evaluate_ark_source(; model_only = true).model
     nothing
 end
 

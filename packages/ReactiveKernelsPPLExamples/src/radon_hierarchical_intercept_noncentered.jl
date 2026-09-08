@@ -196,16 +196,16 @@ docs_example = (;
 )
 """
 
-function evaluate_radon_hierarchical_intercept_noncentered_source()
+function evaluate_radon_hierarchical_intercept_noncentered_source(; model_only::Bool = false)
     _evaluate_ppl_source(RADON_HIERARCHICAL_INTERCEPT_NONCENTERED_SOURCE, @__MODULE__;
-        bindings = (:RADON_HIN_COUNTY, :RADON_HIN_UPPM, :RADON_HIN_FLOOR, :RADON_HIN_LOG))
+        bindings = (:RADON_HIN_COUNTY, :RADON_HIN_UPPM, :RADON_HIN_FLOOR, :RADON_HIN_LOG), model_only)
 end
 
 const _RADON_HIN_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
     _RADON_HIN_GRAPH_TEMPLATE[] =
-        evaluate_radon_hierarchical_intercept_noncentered_source().model
+        evaluate_radon_hierarchical_intercept_noncentered_source(; model_only = true).model
     nothing
 end
 

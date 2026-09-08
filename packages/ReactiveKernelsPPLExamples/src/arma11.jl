@@ -158,13 +158,13 @@ docs_example = (;
 )
 """
 
-function evaluate_arma11_source()
+function evaluate_arma11_source(; model_only::Bool = false)
     # Bind only the data. The authored source imports the reusable Normal and
     # Cauchy distribution objects itself and contains the complete PPL assembly,
     # including the inline error recursion, with no helper evaluator.
     _evaluate_ppl_source(ARMA11_SOURCE, @__MODULE__; bindings = (
         :ARMA_SERIES,
-    ))
+    ), model_only)
 end
 
 # Evaluate the authored source from `__init__`, after package precompilation has
@@ -174,7 +174,7 @@ end
 const _ARMA11_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _ARMA11_GRAPH_TEMPLATE[] = evaluate_arma11_source().model
+    _ARMA11_GRAPH_TEMPLATE[] = evaluate_arma11_source(; model_only = true).model
     nothing
 end
 

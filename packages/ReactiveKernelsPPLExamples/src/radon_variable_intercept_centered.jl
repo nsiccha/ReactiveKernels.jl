@@ -154,16 +154,16 @@ docs_example = (;
 )
 """
 
-function evaluate_radon_variable_intercept_centered_source()
+function evaluate_radon_variable_intercept_centered_source(; model_only::Bool = false)
     _evaluate_ppl_source(RADON_VARIABLE_INTERCEPT_CENTERED_SOURCE, @__MODULE__;
-        bindings = (:RADON_VI_COUNTY, :RADON_VI_FLOOR, :RADON_VI_LOG))
+        bindings = (:RADON_VI_COUNTY, :RADON_VI_FLOOR, :RADON_VI_LOG), model_only)
 end
 
 const _RADON_VI_CENTERED_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
     _RADON_VI_CENTERED_GRAPH_TEMPLATE[] =
-        evaluate_radon_variable_intercept_centered_source().model
+        evaluate_radon_variable_intercept_centered_source(; model_only = true).model
     nothing
 end
 

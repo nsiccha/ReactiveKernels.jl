@@ -139,7 +139,7 @@ docs_example = (;
 )
 """
 
-function evaluate_kilpisjarvi_source()
+function evaluate_kilpisjarvi_source(; model_only::Bool = false)
     # Bind only the data. The authored source imports the reusable Normal
     # endpoint itself and contains the complete PPL assembly with no helper
     # evaluator or separately prepared density/plate path.
@@ -147,13 +147,13 @@ function evaluate_kilpisjarvi_source()
         :KILPISJARVI_X, :KILPISJARVI_Y, :KILPISJARVI_XPRED,
         :KILPISJARVI_PMUALPHA, :KILPISJARVI_PSALPHA,
         :KILPISJARVI_PMUBETA, :KILPISJARVI_PSBETA,
-    ))
+    ), model_only)
 end
 
 const _KILPISJARVI_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _KILPISJARVI_GRAPH_TEMPLATE[] = evaluate_kilpisjarvi_source().model
+    _KILPISJARVI_GRAPH_TEMPLATE[] = evaluate_kilpisjarvi_source(; model_only = true).model
     nothing
 end
 
