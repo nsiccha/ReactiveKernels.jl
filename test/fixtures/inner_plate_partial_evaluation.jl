@@ -6,6 +6,16 @@ using ReactiveKernels
 const calls = Ref(0)
 counted_log(x) = (calls[] += 1; log(x))
 
+@kernel unbound_plate(q::Vector{Float64}, data::Vector{Float64}) = begin
+    data_sum::Float64 = sum(data)
+    pointwise = plate(q) do parameter
+        offset::Float64 = 2.0
+        result::Float64 = parameter + offset
+        result
+    end
+    total::Float64 = sum(pointwise) + data_sum
+end
+
 @kernel counted(q::Float64, data) = begin
     pointwise = plate(data, q) do d, parameter
         transformed::Float64 = counted_log(d)

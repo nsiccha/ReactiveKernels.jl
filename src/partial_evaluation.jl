@@ -187,6 +187,9 @@ function _partial_plate_recipe(g, recipe, known, op::_AuthoredPlateOp{K,A}) wher
         arguments[cid] = index in A ? Ref(data) : data
         types[cid] = index in A || data isa Number ? typeof(data) : eltype(data)
     end
+    # Nullary inner recipes can form a prefix even when this plate has no
+    # bound inputs. Without a bound domain, retain its per-cell execution.
+    isempty(arguments) && return nothing
     prefix, residual, owned = _partial_split(inner, bound)
     isempty(prefix) && return nothing
     have_ids = Set(canon_id(inner.graph, v.id) for v in inner.have)
