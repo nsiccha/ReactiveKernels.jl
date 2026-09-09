@@ -279,10 +279,18 @@ function scan_body(recipe::Recipe)
     recipe.op.kernel.plan
 end
 
-function (op::_AuthoredScanOp{K,A})(args...) where {K,A}
-    length(args) >= 2 || throw(ArgumentError(
-        "an authored scan expects (init, xs, shared...) arguments"))
-    _tensorized_scan(op.kernel, args[2], args[1], args[3:end]...)
+# `A` is the atomic (broadcast-invariant) index set over the op's argument tuple
+# `(init, operand...)`: index 1 (the carry seed) plus every `Ref`-shared operand.
+# The iterated sequences are the remaining operand indices (>= 2, not in `A`).
+# Split them at compile time so `_tensorized_scan` receives the sequence tuple and
+# the shared tuple explicitly.
+@generated function (op::_AuthoredScanOp{K,A})(args...) where {K,A}
+    n = length(args)
+    n >= 2 || return :(throw(ArgumentError(
+        "an authored scan expects (init, sequence, shared...) arguments")))
+    iterated = Expr(:tuple, (:(args[$i]) for i in 2:n if !(i in A))...)
+    shared = Expr(:tuple, (:(args[$i]) for i in 2:n if i in A)...)
+    :(_tensorized_scan(op.kernel, args[1], $iterated, $shared))
 end
 
 function _lhs_symbols!(symbols::Set{Symbol}, lhs)
@@ -396,8 +404,21 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
     step = op.kernel
     indices, index, carry, output = gensym.((:scan_indices, :scan_index,
                                             :scan_carry, :scan_output))
-    xs = callargs[2]
-    arguments = Any[carry, Expr(:ref, xs, index), callargs[3:end]...]
+    # `A` marks the atomic operands: index 1 (the carry seed) plus the `Ref`
+    # shareds.  The iterated sequences are the remaining operand indices; each is
+    # indexed by the loop counter per step, while shared operands pass whole.
+    atomic = typeof(op).parameters[2]
+    iterated_positions = [i for i in 2:length(callargs) if !(i in atomic)]
+    shared_positions = [i for i in 2:length(callargs) if i in atomic]
+    seqs = Any[callargs[i] for i in iterated_positions]
+    xs = first(seqs)                                    # the axis-defining sequence
+    arguments = Any[carry]
+    for i in iterated_positions
+        push!(arguments, Expr(:ref, callargs[i], index))
+    end
+    for i in shared_positions
+        push!(arguments, callargs[i])
+    end
     step_body = Expr(:block, _embedded_statements(
         step.ast, arguments, Expr(:tuple, carry, output), offset)...)
     invariant = Any[]
@@ -433,7 +454,9 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
                   $plate_eltype) + $cell_output))
         push!(loop_output.args, :($total_lhs = $total_lhs + $cell_output))
     end
-    push!(body.args, :($indices = $(GlobalRef(Base, :eachindex))($xs)))
+    # `eachindex(seqs...)` throws `DimensionMismatch` unless every iterated
+    # sequence shares axes, giving the lockstep length check for free.
+    push!(body.args, :($indices = $(GlobalRef(Base, :eachindex))($(seqs...))))
     push!(body.args, :($(GlobalRef(Base, :isempty))($indices) &&
         throw(ArgumentError("scan requires a non-empty sequence"))))
     append!(body.args, invariant)

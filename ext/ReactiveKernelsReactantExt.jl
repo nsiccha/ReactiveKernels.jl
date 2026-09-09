@@ -900,7 +900,7 @@ end
 
 # A traced `scan` lowers its sequential recurrence to a `stablehlo.while` carry
 # loop instead of unrolling into per-step scalar indexing.  `step` is the
-# prepared two-`want` step kernel `(carry, x, shared...) -> (new_carry, output)`.
+# prepared two-`want` step kernel `(carry, x..., shared...) -> (new_carry, output)`.
 # The threaded `carry` is an ordinary loop-carried variable — reassigned each
 # iteration, exactly like the transpiler's `state` (`transpiled_program.jl:17`) —
 # so a compound carry rides through as a loop-carried `NamedTuple`.  The per-step
@@ -911,6 +911,12 @@ end
 # remaining steps as one `stablehlo.while`.  RK-macro-only per decision
 # `17bnc6t`; Reactant untouched.  A non-scalar per-step output is a loud,
 # reported limitation, never a silent mis-lowering.
+#
+# `iterated` is the tuple of per-step sequences advanced in lockstep — one element
+# of each per step, spliced into the step call `step(carry, x..., shared...)`.
+# Under Reactant every iterated sequence must be a traced 1-D array so it can be
+# gathered inside the `while` by the loop counter; a host array (e.g. bound data)
+# has no exposed counter to index and is rejected with a clear message.
 @inline _scan_output_buffer(::Reactant.TracedRNumber{T}, n::Integer) where {T} =
     Reactant.promote_to(Reactant.TracedRArray, zeros(T, n))
 _scan_output_buffer(out, ::Integer) = throw(ArgumentError(
@@ -919,16 +925,25 @@ _scan_output_buffer(out, ::Integer) = throw(ArgumentError(
     "shape as an unimplemented scan lowering."))
 
 function ReactiveKernels._tensorized_scan(
-        step, xs::Reactant.TracedRArray{<:Any,1}, init, shared...)
-    n = length(xs)
+        step, init, iterated::Tuple{Reactant.TracedRArray{<:Any,1},Vararg{Any}},
+        shared::Tuple)
+    all(x -> x isa Reactant.TracedRArray{<:Any,1}, iterated) || throw(ArgumentError(
+        "the Reactant scan lowering requires every iterated sequence to be a " *
+        "traced 1-D array; pass each sequence traced (e.g. Reactant.to_rarray(data)) " *
+        "rather than as bound host data — a host array cannot be indexed by the " *
+        "stablehlo.while loop counter."))
+    n = length(first(iterated))
     n == 0 && throw(ArgumentError("scan requires a non-empty sequence"))
-    x1 = Reactant.@allowscalar xs[1]
-    carry, out1 = step(init, x1, shared...)
+    all(x -> length(x) == n, iterated) || throw(DimensionMismatch(
+        "scan's iterated sequences must have equal length; got lengths " *
+        "$(map(length, iterated))."))
+    x1 = Reactant.@allowscalar map(xs -> xs[1], iterated)
+    carry, out1 = step(init, x1..., shared...)
     buffer = _scan_output_buffer(out1, n)
     Reactant.@allowscalar buffer[1] = out1
     Reactant.@trace for i in 2:n
-        x = Reactant.@allowscalar xs[i]
-        carry, out = step(carry, x, shared...)
+        x = Reactant.@allowscalar map(xs -> xs[i], iterated)
+        carry, out = step(carry, x..., shared...)
         Reactant.@allowscalar buffer[i] = out
     end
     buffer
