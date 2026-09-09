@@ -315,6 +315,10 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "poisson-gamma.md" => 1,
         "dugongs-growth.md" => 1,
         "arma11.md" => 1,
+        "diamonds.md" => 1,
+        "normal-mixture-k.md" => 1,
+        "dogs-nonhierarchical.md" => 1,
+        "logistic-regression-rhs.md" => 1,
         "mnist-logistic.md" => 2,
         "online-stats.md" => 1,
     )

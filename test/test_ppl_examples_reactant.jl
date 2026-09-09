@@ -94,6 +94,10 @@ using ReactiveKernelsPPLExamples.MVNormalRegressionExample:
     MVREG_COVARIANCE, MVREG_CHOL, MVREG_PRECISION, MVREG_PRECISION_CHOL
 using ReactiveKernelsPPLExamples.BoundRegressionExample:
     build_bound_regression_graph, BOUND_RAW_X, BOUND_Y
+using ReactiveKernelsPPLExamples.DiamondsExample: evaluate_diamonds_source
+using ReactiveKernelsPPLExamples.NormalMixtureKExample: evaluate_normal_mixture_k_source
+using ReactiveKernelsPPLExamples.DogsNonhierarchicalExample: evaluate_dogs_nonhierarchical_source
+using ReactiveKernelsPPLExamples.LogisticRegressionRHSExample: evaluate_logistic_regression_rhs_source
 
 _host(v::Reactant.AbstractConcreteArray) = Array(v)
 _host(v::Reactant.AbstractConcreteNumber) = Reactant.to_number(v)
@@ -534,6 +538,22 @@ end
             have = (:unconstrained, :raw_predictors, :responses), want = :density,
             bound = (; raw_predictors = BOUND_RAW_X))
         @test _rapprox(_compile_run(bound, (q, BOUND_Y)), bound(q, BOUND_Y))
+    end
+    @testset "diamonds (posteriordb; brms centered regression, bound design)" begin
+        a = evaluate_diamonds_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "normal_mixture_k (posteriordb; natural K-dim simplex mixture, log_sum_exp)" begin
+        a = evaluate_normal_mixture_k_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "dogs_nonhierarchical (posteriordb; correlated per-dog, in-graph counts)" begin
+        a = evaluate_dogs_nonhierarchical_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "logistic_regression_rhs (posteriordb; regularized horseshoe)" begin
+        a = evaluate_logistic_regression_rhs_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
     @testset "glm_poisson with bound host data (>16-lane plate)" begin
         # The benchmark shape: every data port BOUND as a host array, only the
