@@ -68,6 +68,21 @@ function _lda_posterior_once(q, doc, w, alpha, beta, M)
 end
 
 @testset "PPL graph — LDA (posteriordb ldaK2/ldaK5, topic marginalized)" begin
+    @testset "first-use: build→prepare→execute in one function runs no demo tail" begin
+        # The model_only template makes build_lda_graph()+prepare()+execute safe
+        # INSIDE one ordinary function (no fresh Core.eval in the caller → no
+        # world-age hazard). This runs BEFORE any full evaluate_lda_source() below,
+        # so the demo-tail sentinel is UNCHANGED by the first-use path (it is 0 in
+        # a fresh import; the delta being 0 is the structural claim).
+        before = ReactiveKernelsPPLExamples._DEMO_TAIL_EXECUTIONS[]
+        fx = lda_fixture()
+        K = length(fx.alpha); V = length(fx.beta)
+        q = 0.1 .* sin.(collect(1.0:(fx.M * (K - 1) + K * (V - 1))))
+        v = _lda_posterior_once(q, fx.doc, fx.w, fx.alpha, fx.beta, fx.M)
+        @test isfinite(v)
+        @test ReactiveKernelsPPLExamples._DEMO_TAIL_EXECUTIONS[] == before
+    end
+
     @testset "source-authority artifact" begin
         artifact = evaluate_lda_source()
         @test artifact.source == strip(LDA_SOURCE, '\n')
@@ -113,7 +128,7 @@ end
         end
     end
 
-    @testset "pointwise plate exposes a buffer-free total" begin
+    @testset "pointwise/total parity (summed likelihood == sum of pointwise)" begin
         doc, w, alpha, beta, M = LDA_DOC, LDA_W, LDA_ALPHA, LDA_BETA, LDA_M
         K = length(alpha); V = length(beta)
         q = 0.2 .* randn(Xoshiro(3), M * (K - 1) + K * (V - 1))

@@ -357,6 +357,30 @@ function setup_logistic_regression_rhs!(mod::Module)
     nothing
 end
 
+function setup_lda!(mod::Module)
+    if !isdefined(mod, :LDAExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: LDAExample))
+    end
+    # Bind only the raw data (the rendered default is three_men1-ldaK2, whose
+    # transformed-data ones-vector priors are LDA_ALPHA/LDA_BETA). The displayed
+    # PPL assembly imports the shared `dirichlet` endpoint itself and authors the
+    # in-graph inverse-ILR simplex transform and the marginalized likelihood inline.
+    Core.eval(mod, :(using .LDAExample: LDA_DOC, LDA_W, LDA_ALPHA, LDA_BETA, LDA_M))
+    nothing
+end
+
+function setup_nn_rbm!(mod::Module)
+    if !isdefined(mod, :NNRBMExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: NNRBMExample))
+    end
+    # Bind only the data and the fixed hidden-unit count (the rendered default is
+    # mnist_100-nn_rbm1bJ10). The displayed PPL assembly imports the shared
+    # `normal`/`inverse_gamma`/`categorical_logit` endpoints itself and authors the
+    # tanh hidden layer and reference-coded softmax inline.
+    Core.eval(mod, :(using .NNRBMExample: NN_RBM_X, NN_RBM_Y, NN_RBM_K, NN_RBM_J))
+    nothing
+end
+
 function setup_online_stats!(mod::Module)
     if !isdefined(mod, :OnlineStatsExample)
         Base.include(mod, joinpath(@__DIR__, "..", "examples", "online_stats.jl"))
@@ -781,6 +805,8 @@ const EXPECTED_PPL_EXAMPLES = (
     :normal_mixture_k_posterior,
     :dogs_nonhierarchical_posterior,
     :logistic_regression_rhs_posterior,
+    :lda_density,
+    :nn_rbm_density,
 )
 const _PPL_EXECUTION_COUNTS = Dict(name => 0 for name in EXPECTED_PPL_EXAMPLES)
 

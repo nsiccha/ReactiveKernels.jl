@@ -54,6 +54,21 @@ function _rbm_posterior_once(q, x, y, K, J)
 end
 
 @testset "PPL graph — nn_rbm1b (posteriordb neural-network softmax classifier)" begin
+    @testset "first-use: build→prepare→execute in one function runs no demo tail" begin
+        # The model_only template makes build_nn_rbm_graph()+prepare()+execute safe
+        # INSIDE one ordinary function (no fresh Core.eval in the caller → no
+        # world-age hazard). This runs BEFORE any full evaluate_nn_rbm_source()
+        # below, so the demo-tail sentinel is UNCHANGED by the first-use path (it
+        # is 0 in a fresh import; the delta being 0 is the structural claim).
+        before = ReactiveKernelsPPLExamples._DEMO_TAIL_EXECUTIONS[]
+        fx = nn_rbm_fixture()
+        dim = _rbm_dim(size(fx.x, 2), fx.K, fx.J)
+        q = 0.05 .* collect(1.0:dim) .- 0.1
+        v = _rbm_posterior_once(q, fx.x, fx.y, fx.K, fx.J)
+        @test isfinite(v)
+        @test ReactiveKernelsPPLExamples._DEMO_TAIL_EXECUTIONS[] == before
+    end
+
     @testset "source-authority artifact" begin
         artifact = evaluate_nn_rbm_source()
         @test artifact.source == strip(NN_RBM_SOURCE, '\n')
@@ -98,7 +113,7 @@ end
         end
     end
 
-    @testset "pointwise plate exposes a buffer-free total" begin
+    @testset "pointwise/total parity (summed likelihood == sum of pointwise)" begin
         x, y, K, J = NN_RBM_X, NN_RBM_Y, NN_RBM_K, NN_RBM_J
         q = 0.1 .* randn(Xoshiro(5), _rbm_dim(size(x, 2), K, J))
         pw = prepare(build_nn_rbm_graph(); have = _RBM_HAVE, want = :pointwise,

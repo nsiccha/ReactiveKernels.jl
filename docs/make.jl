@@ -61,6 +61,8 @@ site_pages = [
             "Normal mixture (marginalized simplex)" => "normal-mixture-k.md",
             "Dogs (correlated avoidance learning)" => "dogs-nonhierarchical.md",
             "Logistic regression (regularized horseshoe)" => "logistic-regression-rhs.md",
+            "LDA (latent Dirichlet allocation, ldaK2/ldaK5)" => "lda.md",
+            "Neural RBM softmax (nn_rbm1b J10/J100)" => "nn-rbm.md",
         ],
         "Declarative @ppl front-end + Gibbs (experimental)" => "ppl-front-end.md",
     ],

@@ -319,6 +319,8 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "normal-mixture-k.md" => 1,
         "dogs-nonhierarchical.md" => 1,
         "logistic-regression-rhs.md" => 1,
+        "lda.md" => 1,
+        "nn-rbm.md" => 1,
         "mnist-logistic.md" => 2,
         "online-stats.md" => 1,
     )

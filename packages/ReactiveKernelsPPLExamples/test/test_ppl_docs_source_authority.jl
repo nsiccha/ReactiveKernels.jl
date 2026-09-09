@@ -25,6 +25,10 @@ const PPL_SOURCE_CASES = (
      :MVNORMAL_REGRESSION_SOURCE, :evaluate_mvnormal_regression_source),
     ("bound-regression.md", "bound_regression.jl", BoundRegressionExample,
      :BOUND_REGRESSION_SOURCE, :evaluate_bound_regression_source),
+    ("lda.md", "lda.jl", LDAExample,
+     :LDA_SOURCE, :evaluate_lda_source),
+    ("nn-rbm.md", "nn_rbm.jl", NNRBMExample,
+     :NN_RBM_SOURCE, :evaluate_nn_rbm_source),
 )
 
 # One displayed/executed authority kernel per registered case: a file carrying
@@ -98,6 +102,8 @@ end
         :mnist_logistic_optimized_density,
         :mvnormal_regression_density,
         :bound_regression_density,
+        :lda_density,
+        :nn_rbm_density,
     )
         @test occursin(":" * string(name), helper_source)
     end
