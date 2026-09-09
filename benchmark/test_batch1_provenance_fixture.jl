@@ -1,52 +1,139 @@
-# Provenance-freeze fixture for the batch-1 incremental run (performance review 2026-09-09).
-# Proves: (1) freeze at process start captures harness + package source byte-hashes + git identity;
-# (2) verify_provenance passes with no drift; (3) an ACTUAL mid-run source mutation makes verify
-# REFUSE (the receipt must not misattribute mutated code); (4) write_phase carries a provenance block
-# only when opted in — the frozen-82 default is unchanged; (5) aggregate(...; preserve_provenance=true)
-# keeps BOTH the native and the reactant process-start block (the last phase never overwrites the first).
-# Stdlib-only (TOML/SHA/git) — no RK env needed. Run: julia --startup-file=no benchmark/test_batch1_provenance_fixture.jl
+# Focused producer/receipt contract for incremental all80 batches.
+# Stdlib-only: no RK, Enzyme, Reactant, PosteriorDB, model execution, or measurement.
 include(joinpath(@__DIR__, "all80_receipt.jl"))
 using Test
 import TOML
-using .All80Receipt: freeze_provenance!, verify_provenance, write_phase, aggregate
+using .All80Receipt: freeze_provenance!, write_provenance_lock, load_provenance!,
+    certify_loaded_modules!, verify_provenance, write_phase, aggregate,
+    validate_batch, assert_batch_resume!, input_identity, ORDINARY_AD_BACKEND
 
-@testset "batch-1 process-start provenance: freeze / verify / mid-run-mutation refusal" begin
-    tmp = mktempdir(); mkpath(joinpath(tmp, "src"))
-    write(joinpath(tmp, "src", "x.jl"), "const A = 1\n")
-
+function _snapshot(tmp; phase, run_id = "run-1", keys = ["m1"],
+    backend = ORDINARY_AD_BACKEND, batch = "batch1")
     snap = freeze_provenance!(; packages = Dict("tmppkg" => tmp),
-        upstream_hash = "a7ef985b", extra = Dict("query" => "diamonds-diamonds", "q" => [0.1, -0.2]))
-    # captured the expected fields
-    @test haskey(snap, "harness_file_sha256") && haskey(snap["harness_file_sha256"], "all80_receipt.jl")
-    @test snap["packages"]["tmppkg"]["src_bytes_sha256"] isa AbstractString
-    @test snap["upstream_posteriordb_models_sha256"] == "a7ef985b"
-    @test snap["query"] == "diamonds-diamonds"             # caller `extra` merged at top level
-    @test verify_provenance()["captured_at"] == snap["captured_at"]   # no drift ⇒ returns the snapshot
+        upstream_hash = "a7ef985b", harness_files = [
+            "all80_posteriordb.jl", "all80_posteriordb_body.jl",
+            "all80_reactant_body.jl", "all80_reactant_evals.jl",
+            "all80_registry.jl", "all80_receipt.jl", "all80_axes.jl",
+            "all80_metadata.jl", "all80_parity.jl"],
+        extra = Dict{String,Any}("batch" => batch, "phase" => phase,
+            "requested_keys" => keys, "run_id" => run_id,
+            "ad_backend" => backend))
+    # A parent lock remains uncertified until the child certifies actual loaded roots.
+    snap
+end
 
-    # (3) ACTUAL mid-run mutation of a tracked source file ⇒ verify REFUSES.
-    write(joinpath(tmp, "src", "x.jl"), "const A = 2   # mutated mid-run\n")
+function _identity(phase)
+    query = Dict{String,Any}("points" => [[0.1, -0.2]],
+        "selected_point_index" => 1, "ad_backend" => ORDINARY_AD_BACKEND)
+    input_identity(; phase = phase, posterior = "m1", model = "model",
+        stan_path = "model.stan", stan_sha256 = "a"^64,
+        library = "model.so", library_sha256 = "b"^64,
+        dataset_path = "data.json", dataset_json_sha256 = "c"^64,
+        dataset_json_bytes = 2, query = query, stan_perm = nothing)
+end
+
+function _complete_row()
+    Dict{String,Any}(
+        "primal_turing" => 1.0, "primal_stan" => 1.0,
+        "gradient_turing" => 1.0, "gradient_stan" => 1.0,
+        "hmc_ahmc_turing" => 1.0, "primal_rk" => 1.0,
+        "gradient_rk" => 1.0, "hmc_rk_native" => 1.0,
+        "primal_rk_reactant" => 1.0, "gradient_rk_reactant" => 1.0,
+        "hmc_rk_reactant" => 1.0, "primal_opt_stan" => "deferred",
+        "primal_further_turing" => "deferred", "gradient_opt_stan" => "deferred",
+        "gradient_further_turing" => "deferred", "parity_pass" => true,
+        "input_identity_native" => _identity("native"),
+        "input_identity_reactant" => _identity("reactant"))
+end
+
+@testset "incremental source lock, loaded-root gate, and exact receipt publication" begin
+    tmp = mktempdir(); mkpath(joinpath(tmp, "src")); mkpath(joinpath(tmp, "ext"))
+    write(joinpath(tmp, "Project.toml"), "name = \"tmppkg\"\n")
+    write(joinpath(tmp, "src", "x.jl"), "const A = 1\n")
+    write(joinpath(tmp, "ext", "x_ext.jl"), "const B = 2\n")
+
+    parent = _snapshot(tmp; phase = "native")
+    @test parent["packages"]["tmppkg"]["src_ext_project_sha256"] isa AbstractString
+    @test parent["loaded_modules_certified"] == false
+    lock_path = joinpath(tmp, "source-lock.toml")
+    write_provenance_lock(lock_path, parent)
+    loaded = load_provenance!(lock_path)
+    @test loaded["source_id"] == parent["source_id"]
+    @test verify_provenance()["source_id"] == parent["source_id"]
+
+    # Loaded roots cannot be certified for a no-git package, even when its source path resolves.
+    toy = joinpath(tmp, "src", "ToyPkg.jl")
+    write(toy, "module ToyPkg\nend\n")
+    include(toy)
+    @test_throws ErrorException certify_loaded_modules!(
+        Dict{String,Any}("tmppkg" => ToyPkg))
+
+    # Mid-run byte drift is refused for src, ext, and Project through the frozen tree hash.
+    write(joinpath(tmp, "ext", "x_ext.jl"), "const B = 3   # mutated\n")
     @test_throws ErrorException verify_provenance()
+    write(joinpath(tmp, "ext", "x_ext.jl"), "const B = 2\n")
 
-    # (4) write_phase: provenance omitted by default (frozen-82 unchanged), written when opted in.
-    write(joinpath(tmp, "src", "x.jl"), "const A = 1\n")   # restore so the snapshot is valid again
-    snap2 = freeze_provenance!(; packages = Dict("tmppkg" => tmp), upstream_hash = "a7ef985b")
-    nat = joinpath(tmp, "native.toml"); rea = joinpath(tmp, "reactant.toml")
-    write_phase(nat, "native", Dict("m1" => Dict("primal_rk" => 1.0)))                       # default: no provenance
-    write_phase(rea, "reactant", Dict("m1" => Dict("primal_rk_reactant" => 2.0)); provenance = snap2)
-    @test !haskey(TOML.parsefile(nat), "provenance")
-    @test haskey(TOML.parsefile(rea), "provenance")
+    # Build a complete two-phase, exact-key receipt from producer-like snapshots.
+    native_snapshot = _snapshot(tmp; phase = "native")
+    reactant_snapshot = _snapshot(tmp; phase = "reactant")
+    # Simulate the child's post-import certification for aggregation/publication only.
+    native_snapshot["loaded_modules_certified"] = true
+    reactant_snapshot["loaded_modules_certified"] = true
+    native = joinpath(tmp, "native.toml"); reactant = joinpath(tmp, "reactant.toml")
+    write_phase(native, "native", Dict("m1" => _complete_row());
+        provenance = native_snapshot)
+    write_phase(reactant, "reactant", Dict("m1" => _complete_row());
+        provenance = reactant_snapshot)
+    parsed_native = TOML.parsefile(native)
+    @test parsed_native["source_id"] == native_snapshot["source_id"]
+    @test parsed_native["run_id"] == "run-1"
 
-    # (5) aggregate preserves per-phase provenance — but only for phases that HAVE it, keyed by phase.
-    #     Give both phases their OWN block and confirm both survive (last does not overwrite first).
-    write_phase(nat, "native", Dict("m1" => Dict("primal_rk" => 1.0)); provenance = snap2)
     out = joinpath(tmp, "batch1.toml")
-    aggregate([nat, rea], out; meta = Dict("batch" => "batch1"), preserve_provenance = true)
-    agg = TOML.parsefile(out)
-    @test haskey(agg["meta"], "provenance")
-    @test haskey(agg["meta"]["provenance"], "native") && haskey(agg["meta"]["provenance"], "reactant")
-    @test agg["meta"]["batch"] == "batch1"                 # existing meta preserved
-    # frozen-82 default path: no provenance in meta.
-    aggregate([nat, rea], out; meta = Dict("batch" => "x"))   # preserve_provenance=false default → but nat/rea carry blocks
-    @test !haskey(TOML.parsefile(out)["meta"], "provenance")  # not collected unless opted in
+    aggregate([native, reactant], out; meta = Dict{String,Any}(
+        "batch" => "batch1", "args" => ["m1"]), preserve_provenance = true,
+        require_phases = ["native", "reactant"], expected_keys = ["m1"],
+        batch = "batch1")
+    @test isempty(validate_batch(out; expected_keys = ["m1"],
+        phases = ("native", "reactant"), batch = "batch1"))
+
+    # The actual producer writes provenance on BOTH phase paths, including Reactant.
+    @test Set(keys(TOML.parsefile(out)["meta"]["provenance"])) ==
+        Set(["native", "reactant"])
+
+    # Exact-key resume accepts its own checkpoint and refuses foreign/incompatible rows.
+    assert_batch_resume!(parsed_native, native; phase = "native",
+        targets = ["m1"], provenance = native_snapshot)
+    foreign = _snapshot(tmp; phase = "native", run_id = "run-2")
+    @test_throws ErrorException assert_batch_resume!(parsed_native, native;
+        phase = "native", targets = ["m1"], provenance = foreign)
+    @test_throws ErrorException assert_batch_resume!(parsed_native, native;
+        phase = "native", targets = ["other"], provenance = native_snapshot)
+
+    # Strict aggregation fails missing/duplicate/mismatched phases and incomplete key sets.
+    @test_throws ErrorException aggregate([native], out;
+        require_phases = ["native", "reactant"], expected_keys = ["m1"], batch = "batch1")
+    @test_throws ErrorException aggregate([native, native], out;
+        require_phases = ["native", "reactant"], expected_keys = ["m1"], batch = "batch1")
+    @test_throws ErrorException aggregate([native, reactant], out;
+        require_phases = ["native", "reactant"], expected_keys = ["other"], batch = "batch1")
+    incomplete = joinpath(tmp, "incomplete.toml")
+    write_phase(incomplete, "reactant", Dict{String,Any}();
+        provenance = reactant_snapshot)
+    @test_throws ErrorException aggregate([native, incomplete], out;
+        require_phases = ["native", "reactant"], expected_keys = ["m1"], batch = "batch1")
+    no_provenance = joinpath(tmp, "no-provenance.toml")
+    write_phase(no_provenance, "reactant", Dict("m1" => _complete_row()))
+    @test_throws ErrorException aggregate([native, no_provenance], out;
+        require_phases = ["native", "reactant"], expected_keys = ["m1"], batch = "batch1")
+
+    # Frozen-82 default remains opt-out: no provenance is collected or emitted.
+    frozen_native = joinpath(tmp, "frozen-native.toml")
+    frozen_reactant = joinpath(tmp, "frozen-reactant.toml")
+    write_phase(frozen_native, "native", Dict("m1" => _complete_row()))
+    write_phase(frozen_reactant, "reactant", Dict("m1" => _complete_row()))
+    frozen_out = joinpath(tmp, "frozen.toml")
+    aggregate([frozen_native, frozen_reactant], frozen_out;
+        meta = Dict{String,Any}("args" => ["m1"]))
+    @test !haskey(TOML.parsefile(frozen_out)["meta"], "provenance")
 end
 println("BATCH1_PROVENANCE_FIXTURE_OK")

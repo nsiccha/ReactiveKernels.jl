@@ -10,122 +10,250 @@ import TOML, Dates, SHA
 
 const SCHEMA = "all80-benchmark-v1"
 
-# SOURCE/PROTOCOL IDENTITY — WIP, NOT YET WIRED (kept separate from the live incident per
-# performance review 2026-09-08). Purpose: a resume REJECTS a leftover receipt from a DIFFERENT
-# run/source (schema+phase alone cannot; an old checkpoint shares them) — what stops a stale
-# cross-run receipt silently seeding rows (incident 2026-09-08). Before wiring into
-# write_phase/resume, the reviewed design must: FREEZE the id ONCE at process start (recomputing
-# per write_phase from disk would falsely stamp already-loaded OLD code with NEW file hashes);
-# cover dirty MODEL/core source (git diff HEAD, not just harness files); fail-closed on missing
-# files; treat no-git as UNCERTIFIED (never certify production); + a fixture simulating a
-# mid-run file mutation. Current definition below is the pre-review sketch, intentionally unused.
-const _HARNESS_FILES = ("all80_posteriordb_body.jl", "all80_registry.jl", "all80_axes.jl",
-    "all80_reactant_body.jl", "all80_reactant_evals.jl", "all80_receipt.jl", "all80_parity.jl")
-function source_identity()
-    root = normpath(joinpath(@__DIR__, ".."))
-    head = try
-        strip(read(setenv(`git -C $root rev-parse HEAD`; dir = root), String))
-    catch
-        "no-git"
-    end
-    ctx = IOBuffer(); write(ctx, "head:", head, "\n")
-    for f in _HARNESS_FILES
-        p = joinpath(@__DIR__, f)
-        isfile(p) && write(ctx, f, ":", read(p), "\n")
-    end
-    bytes2hex(SHA.sha256(take!(ctx)))
-end
+const _HARNESS_FILES = (
+    "all80_posteriordb.jl", "all80_posteriordb_body.jl", "all80_reactant_body.jl",
+    "all80_reactant_evals.jl", "all80_registry.jl", "all80_receipt.jl",
+    "all80_axes.jl", "all80_metadata.jl", "all80_parity.jl")
+const _HMC_HARNESS_FILES = (
+    "sampler_transpiler/eight_schools_density.jl",
+    "nuts_kernel_authoring_fixture_b.jl",
+    "sampler_transpiler/position_multinomial_hmc_kernel.jl")
+const _ENV_FILES = ("Project.toml", "Manifest.toml")
+const ORDINARY_AD_BACKEND = "AutoEnzyme(mode=Enzyme.Reverse; no function_annotation)"
 
-"""Verify a resumed prior receipt was produced by the CURRENT harness/source; throw otherwise.
-Rejects a receipt with a missing/mismatched `source_id` (a leftover cross-run receipt)."""
-function assert_resume_source!(prior, receipt_path)
-    want = source_identity()
-    got = get(prior, "source_id", "")
-    got == want || error("all80 resume REFUSED: source_id " *
-        (isempty(got) ? "ABSENT (pre-identity or foreign receipt)" : "MISMATCH (prior=$got)") *
-        " ≠ current $want at $receipt_path — will not seed rows from a different run/source. " *
-        "Delete that receipt and re-run fresh, or RK_ALL80_RETRY the exact keys.")
-    nothing
-end
-
-# ---- BATCH-1 process-start provenance (performance review 2026-09-09) ----------------------------
-# SCOPED to the incremental batch run: `write_phase`/`aggregate` take these as OPT-IN params, so the
-# frozen-82 flow is byte-for-byte unchanged. Freezes at PROCESS START the exact loaded harness +
-# developed-package SOURCE BYTES (sha256, not a post-import `git HEAD` read that could drift from what
-# was actually loaded), the package git identities, upstream hash, and env versions; `verify_provenance`
-# re-hashes the on-disk bytes and REFUSES if they changed mid-run (a receipt must not misattribute
-# mutated code — the mid-run-mutation guard the review mandated). Native and Reactant each freeze their
-# OWN block; `aggregate(...; preserve_provenance=true)` keeps BOTH (last phase never overwrites the first).
+# ---- Incremental process-start provenance -------------------------------------------------
+# A batch publication must distinguish THREE facts: (1) the bytes selected by the parent before
+# spawning Julia; (2) the modules actually loaded by that subprocess; and (3) the on-disk bytes at
+# every incremental receipt write. The parent freezes (1) before the phase command, the child loads
+# and verifies it before heavy imports, certifies (2) through `pathof(module)` after imports, and
+# `verify_provenance()` rechecks (3) before every write. A post-import hash alone cannot make this
+# claim, and an uncertified/no-git snapshot is never publication-certified.
 const _PROV_START = Ref{Dict{String,Any}}()
 
-_git_at(root, args...) = try
-    strip(read(pipeline(setenv(Cmd(String["git", "-C", root, args...]); dir = root); stderr = devnull), String))
-catch; "?" end
+_git_bytes(root, args...) = try
+    read(pipeline(setenv(Cmd(String["git", "-C", root, args...]); dir = root); stderr = devnull))
+catch
+    UInt8[]
+end
+_git_at(root, args...) = strip(String(_git_bytes(root, args...)))
+_is_commit(s) = occursin(r"^[0-9a-f]{40}$", s)
+_file_sha256(path) = bytes2hex(SHA.sha256(read(path)))
 
-# sha256 over every `.jl` under `<pkgroot>/src` (sorted) — the developed-package source-byte identity.
-function _src_bytes_hash(pkgroot)
-    isdir(joinpath(pkgroot, "src")) || return "no-src"
-    srcs = String[]
-    for (r, _, fs) in walkdir(joinpath(pkgroot, "src"))
-        for f in fs
-            endswith(f, ".jl") && push!(srcs, joinpath(r, f))
+function _source_tree_hash(pkgroot)
+    isdir(joinpath(pkgroot, "src")) || error("provenance package has no src tree: $pkgroot")
+    files = String[]
+    for subdir in ("src", "ext")
+        rootdir = joinpath(pkgroot, subdir)
+        isdir(rootdir) || continue
+        for (root, _, names) in walkdir(rootdir)
+            for name in names
+                endswith(name, ".jl") && push!(files, joinpath(root, name))
+            end
         end
     end
+    isfile(joinpath(pkgroot, "Project.toml")) && push!(files, joinpath(pkgroot, "Project.toml"))
     ctx = IOBuffer()
-    for p in sort(srcs)
-        write(ctx, relpath(p, pkgroot), ":", bytes2hex(SHA.sha256(read(p))), "\n")
+    for path in sort(files)
+        write(ctx, relpath(path, pkgroot), ":", _file_sha256(path), "\n")
     end
     bytes2hex(SHA.sha256(take!(ctx)))
 end
 
-"""Freeze the process-start provenance snapshot ONCE. Call EARLY (right after imports), before any
-measurement. `packages` maps a name to its developed root; `upstream_hash` is the pinned
-posteriordb_models.jl sha256; `extra` carries run identity (env versions, query/data identity, q,
-transitions) the caller adds. Records harness + package source byte-hashes and git identities."""
+function _git_snapshot(root)
+    head = _git_at(root, "rev-parse", "HEAD")
+    status = _git_at(root, "status", "--porcelain")
+    diff = _git_bytes(root, "diff", "HEAD", "--")
+    (; head = head, status = status,
+       diff_sha256 = bytes2hex(SHA.sha256(diff)),
+       certified = _is_commit(head) && status != "?")
+end
+
+function _package_snapshot(root)
+    git = _git_snapshot(root)
+    Dict{String,Any}(
+        "root" => normpath(root), "git_head" => git.head,
+        "git_dirty" => !isempty(git.status), "git_status" => git.status,
+        "git_diff_head_sha256" => git.diff_sha256,
+        "git_certified" => git.certified,
+        "src_ext_project_sha256" => _source_tree_hash(root))
+end
+
+function _snapshot_source_id(s)
+    stable = Dict{String,Any}()
+    for (key, value) in s
+        key in ("captured_at", "run_id", "loaded_modules_certified",
+                "loaded_module_paths", "module_versions") && continue
+        stable[key] = value
+    end
+    ctx = IOBuffer(); TOML.print(ctx, stable; sorted = true)
+    bytes2hex(SHA.sha256(take!(ctx)))
+end
+
+"""Freeze the parent-side source/environment snapshot before spawning a phase subprocess.
+`harness_files` are absolute, or relative to this benchmark directory, and every path must exist.
+`packages` maps a package name to its developed root. `upstream_files` maps each fetched upstream
+file to its byte digest. `extra` carries phase/run/query configuration (including `run_id`)."""
 function freeze_provenance!(; packages = Dict{String,String}(), upstream_hash = "",
-                            extra = Dict{String,Any}())
-    root = normpath(joinpath(@__DIR__, ".."))
+        upstream_files = Dict{String,String}(), harness_files = _HARNESS_FILES,
+        extra = Dict{String,Any}())
+    isempty(harness_files) && error("provenance freeze requires the phase's harness files")
     harness = Dict{String,String}()
-    for f in _HARNESS_FILES
-        p = joinpath(@__DIR__, f)
-        harness[f] = isfile(p) ? bytes2hex(SHA.sha256(read(p))) : "MISSING"
+    for name in harness_files
+        path = isabspath(name) ? name : joinpath(@__DIR__, name)
+        isfile(path) || error("provenance harness file missing: $path")
+        harness[name] = _file_sha256(path)
     end
+    isempty(packages) && error("provenance freeze requires the developed-package roots")
+
     pkg = Dict{String,Any}()
-    for (name, pr) in packages
-        pkg[name] = Dict{String,Any}("root" => pr,
-            "git_head" => _git_at(pr, "rev-parse", "HEAD"),
-            "git_dirty" => _git_at(pr, "status", "--porcelain") != "",
-            "src_bytes_sha256" => _src_bytes_hash(pr))
+    for (name, root) in sort(collect(packages); by = first)
+        pkg[String(name)] = _package_snapshot(String(root))
     end
-    _PROV_START[] = merge(Dict{String,Any}(
+
+    upstream = Dict{String,Any}()
+    for (path, digest) in sort(collect(upstream_files); by = first)
+        upstream[String(path)] = Dict{String,Any}("sha256" => String(digest))
+    end
+    environment = Dict{String,Any}()
+    for name in _ENV_FILES
+        path = joinpath(@__DIR__, "all80-env", name)
+        environment[name] = _file_sha256(path)
+    end
+
+    snap = merge(Dict{String,Any}(
         "captured_at" => string(Dates.now()),
-        "root" => root,
-        "root_git_head" => _git_at(root, "rev-parse", "HEAD"),
-        "root_git_dirty" => _git_at(root, "status", "--porcelain") != "",
+        "root" => normpath(joinpath(@__DIR__, "..")),
         "harness_file_sha256" => harness,
         "packages" => pkg,
         "upstream_posteriordb_models_sha256" => String(upstream_hash),
-        "julia" => string(VERSION)), extra)
+        "upstream_file_sha256" => upstream,
+        "environment_file_sha256" => environment,
+        "julia_parent" => string(VERSION),
+        "loaded_modules_certified" => false), extra)
+    snap["source_id"] = _snapshot_source_id(snap)
+    _PROV_START[] = snap
     _PROV_START[]
 end
 
-"""Re-hash the on-disk harness + package source bytes and REFUSE if any drifted from the
-process-start snapshot (a receipt must not misattribute code mutated mid-run). Returns the frozen
-snapshot to write into the phase receipt's `provenance`."""
+"""Write a parent-side lock. The child loads this before importing the measured packages."""
+function write_provenance_lock(path::AbstractString,
+        snapshot = _PROV_START[])
+    open(path, "w") do io
+        TOML.print(io, snapshot; sorted = true)
+    end
+    path
+end
+
+"""Load and immediately verify a parent-side lock in the child process."""
+function load_provenance!(path::AbstractString)
+    isfile(path) || error("provenance lock missing: $path")
+    _PROV_START[] = TOML.parsefile(path)
+    verify_provenance()
+end
+
+"""Certify that the loaded Julia modules resolve inside the exact package roots frozen by the
+parent. This closes the “post-import filesystem hash” gap: source bytes and loaded roots are both
+recorded. No-git or unavailable module paths remain uncertified and throw for a batch publication."""
+function certify_loaded_modules!(modules::AbstractDict)
+    isassigned(_PROV_START) || error("certify_loaded_modules!: no frozen provenance")
+    snap = _PROV_START[]
+    paths = Dict{String,String}()
+    versions = Dict{String,String}()
+    for (name, module_or_name) in modules
+        key = String(name)
+        info = get(snap["packages"], key, nothing)
+        info === nothing && error("loaded module not represented in provenance: $key")
+        value = module_or_name
+        if value isa Symbol || value isa AbstractString
+            matches = [m for m in values(Base.loaded_modules)
+                       if String(nameof(m)) == String(value)]
+            length(matches) == 1 || error("loaded module name is absent or ambiguous: $value")
+            value = only(matches)
+        end
+        path = pathof(value)
+        path === nothing && error("loaded module has no source path: $key")
+        root = normpath(String(info["root"]))
+        startswith(normpath(path), root * Base.Filesystem.path_separator) ||
+            error("loaded module root mismatch for $key: $path is outside $root")
+        paths[key] = normpath(path)
+        versions[key] = try string(Base.pkgversion(value)) catch; "unavailable" end
+    end
+    all(info -> info["git_certified"], values(snap["packages"])) ||
+        error("provenance is not Git-certified (missing/no-git package root)")
+    snap["loaded_module_paths"] = paths
+    snap["module_versions"] = versions
+    snap["loaded_modules_certified"] = true
+    verify_provenance()
+end
+
+"""Re-hash every frozen byte source and return the immutable snapshot, or refuse the receipt."""
 function verify_provenance()
     isassigned(_PROV_START) || error("verify_provenance: freeze_provenance! was not called at process start")
     s = _PROV_START[]
-    for (f, h0) in s["harness_file_sha256"]
-        p = joinpath(@__DIR__, f)
-        h = isfile(p) ? bytes2hex(SHA.sha256(read(p))) : "MISSING"
-        h == h0 || error("provenance DRIFT: harness `$f` changed since process start ($h0 → $h) — receipt refused")
+    for (name, digest) in s["harness_file_sha256"]
+        path = joinpath(@__DIR__, name)
+        h = isfile(path) ? _file_sha256(path) : "MISSING"
+        h == digest || error("provenance DRIFT: harness `$name` changed since freeze ($digest → $h)")
+    end
+    for (name, digest) in s["environment_file_sha256"]
+        path = joinpath(@__DIR__, "all80-env", name)
+        h = isfile(path) ? _file_sha256(path) : "MISSING"
+        h == digest || error("provenance DRIFT: environment `$name` changed since freeze ($digest → $h)")
+    end
+    for (path, info) in s["upstream_file_sha256"]
+        h = isfile(path) ? _file_sha256(path) : "MISSING"
+        h == info["sha256"] ||
+            error("provenance DRIFT: upstream file `$path` changed since freeze")
     end
     for (name, info) in s["packages"]
-        h = _src_bytes_hash(String(info["root"]))
-        h == info["src_bytes_sha256"] ||
-            error("provenance DRIFT: package `$name` src changed since process start — receipt refused")
+        h = _source_tree_hash(String(info["root"]))
+        h == info["src_ext_project_sha256"] ||
+            error("provenance DRIFT: package `$name` src/ext/Project bytes changed since freeze")
     end
     s
+end
+
+"""Exact-key batch resume gate. Old/foreign checkpoints cannot seed a new batch run."""
+function assert_batch_resume!(prior, receipt_path; phase, targets, provenance)
+    want_keys = sort(String.(collect(targets)))
+    got_phase = String(get(prior, "phase", ""))
+    got_batch = String(get(get(prior, "provenance", Dict()), "batch", ""))
+    got_keys = sort(String.(get(get(prior, "provenance", Dict()), "requested_keys", String[])))
+    got_source = String(get(prior, "source_id", ""))
+    got_run = String(get(prior, "run_id", ""))
+    want_source = String(get(provenance, "source_id", ""))
+    want_run = String(get(provenance, "run_id", ""))
+    got_phase == String(phase) || error("batch resume REFUSED: phase $got_phase != $phase in $receipt_path")
+    got_batch == String(get(provenance, "batch", "")) ||
+        error("batch resume REFUSED: batch identity mismatch in $receipt_path")
+    got_keys == want_keys ||
+        error("batch resume REFUSED: requested keys $(repr(got_keys)) != $(repr(want_keys)) in $receipt_path")
+    got_source == want_source && !isempty(got_source) ||
+        error("batch resume REFUSED: source_id absent/foreign in $receipt_path")
+    got_run == want_run && !isempty(got_run) ||
+        error("batch resume REFUSED: run_id absent/foreign in $receipt_path")
+    prior_keys = sort(collect(String, keys(get(prior, "models", Dict()))))
+    isempty(setdiff(Set(prior_keys), Set(want_keys))) ||
+        error("batch resume REFUSED: prior rows are outside the exact requested key set in $receipt_path")
+    nothing
+end
+
+"""Normalize the per-model input/query identity recorded by each phase. The caller supplies
+already-measured paths/digests and query fields; this helper only gives both phases one schema."""
+function input_identity(; phase, posterior, model, stan_path, stan_sha256,
+        library, library_sha256, dataset_path, dataset_json_sha256,
+        dataset_json_bytes, query, stan_perm)
+    Dict{String,Any}(
+        "phase" => String(phase), "posterior" => String(posterior),
+        "model" => String(model), "stan_path" => String(stan_path),
+        "stan_sha256" => String(stan_sha256), "stan_compiled_library" => String(library),
+        "stan_compiled_library_sha256" => String(library_sha256),
+        "dataset_path" => String(dataset_path),
+        "dataset_json_sha256" => String(dataset_json_sha256),
+        "dataset_json_bytes" => Int(dataset_json_bytes),
+        "query" => query,
+        "stan_parameter_permutation" =>
+            stan_perm === nothing ? "identity" : collect(stan_perm))
 end
 
 # The MANDATORY numeric cells — real numbers required for ALL 82 rows (publication gate).
@@ -181,7 +309,11 @@ function write_phase(path::AbstractString, phase, rows::AbstractDict; provenance
     doc = Dict("schema" => SCHEMA, "phase" => String(phase),
                "generated_at" => string(Dates.now()),
                "models" => Dict(String(k) => v for (k, v) in rows))
-    provenance === nothing || (doc["provenance"] = provenance)
+    if provenance !== nothing
+        doc["provenance"] = provenance
+        haskey(provenance, "source_id") && (doc["source_id"] = provenance["source_id"])
+        haskey(provenance, "run_id") && (doc["run_id"] = provenance["run_id"])
+    end
     mkpath(dirname(path))
     open(path, "w") do io; TOML.print(io, doc; sorted = true); end
     path
@@ -193,15 +325,46 @@ AGREE — a conflicting duplicate is a HARD ERROR, never a silent overwrite. Mod
 and cell content are deterministic (TOML-sorted); the only non-reproducible field is the
 `generated_at` timestamp, so the doc is content-stable, not byte-stable."""
 function aggregate(phase_paths, out_path::AbstractString; meta = Dict{String,Any}(),
-                   preserve_provenance = false)
+                   preserve_provenance = false, require_phases = String[],
+                   expected_keys = String[], batch = "")
     merged = Dict{String,Dict{String,Any}}()
     prov = Dict{String,Any}()   # per-phase process-start provenance (batch-1); native + reactant kept BOTH
+    seen_phases = String[]
+    run_ids = String[]
+    strict = !isempty(require_phases)
+    strict && Set(String.(require_phases)) == Set(["native", "reactant"]) ||
+        isempty(require_phases) || error("All80Receipt.aggregate: required phases must be exactly native+reactant")
+    strict && length(phase_paths) == length(require_phases) ||
+        isempty(require_phases) ||
+        error("All80Receipt.aggregate: expected $(length(require_phases)) phase receipts, got $(length(phase_paths))")
+    expected = sort(String.(expected_keys))
     for p in phase_paths
         isfile(p) || error("All80Receipt.aggregate: missing phase receipt $p")
         d = TOML.parsefile(p)
         get(d, "schema", "") == SCHEMA || error("schema mismatch in $p: $(get(d,"schema",""))")
+        ph = String(get(d, "phase", "?"))
+        ph in seen_phases && error("All80Receipt.aggregate: duplicate phase $ph (from $p)")
+        push!(seen_phases, ph)
+        if strict
+            ph in require_phases || error("All80Receipt.aggregate: unexpected phase $ph in $p")
+            haskey(d, "provenance") || error("All80Receipt.aggregate: phase $ph lacks provenance ($p)")
+            snapshot = d["provenance"]
+            isempty(batch) || String(get(snapshot, "batch", "")) == batch ||
+                error("All80Receipt.aggregate: phase $ph batch mismatch in $p")
+            String(get(snapshot, "phase", "")) == ph ||
+                error("All80Receipt.aggregate: phase $ph provenance phase mismatch in $p")
+            sort(String.(get(snapshot, "requested_keys", String[]))) == expected ||
+                error("All80Receipt.aggregate: phase $ph requested-key mismatch in $p")
+            get(snapshot, "loaded_modules_certified", false) === true ||
+                error("All80Receipt.aggregate: phase $ph loaded modules are uncertified in $p")
+            String(get(snapshot, "ad_backend", "")) != ORDINARY_AD_BACKEND &&
+                error("All80Receipt.aggregate: phase $ph AD backend is not ordinary reverse in $p")
+            push!(run_ids, String(get(snapshot, "run_id", "")))
+            phase_keys = sort(collect(String, keys(get(d, "models", Dict()))))
+            phase_keys == expected ||
+                error("All80Receipt.aggregate: phase $ph model keys differ from the exact requested batch in $p")
+        end
         if preserve_provenance && haskey(d, "provenance")
-            ph = String(get(d, "phase", "?"))
             haskey(prov, ph) && error("All80Receipt.aggregate: duplicate provenance for phase $ph (from $p)")
             prov[ph] = d["provenance"]   # the LAST phase never overwrites the first — keyed by phase
         end
@@ -215,6 +378,8 @@ function aggregate(phase_paths, out_path::AbstractString; meta = Dict{String,Any
             end
         end
     end
+    strict && !(length(Set(run_ids)) == 1 && all(!isempty, run_ids)) &&
+        error("All80Receipt.aggregate: phase run identities differ")
     meta_out = preserve_provenance && !isempty(prov) ?
         merge(Dict{String,Any}(meta), Dict("provenance" => prov)) : meta
     doc = Dict("schema" => SCHEMA, "generated_at" => string(Dates.now()),
@@ -258,6 +423,57 @@ function validate(path::AbstractString; expected_models = nothing)
     issues
 end
 
+"""Strict incremental-batch publication contract: exact phases/keys/multiplicity, matching
+per-phase provenance and run id, certified loaded roots, recorded configuration, per-model input
+identities, plus the ordinary report-completeness gate. Missing Reactant provenance in the saved
+batch is therefore an explicit certification failure, not a silently accepted aggregate."""
+function validate_batch(path::AbstractString; expected_keys, phases = ("native", "reactant"),
+        batch = "")
+    d = TOML.parsefile(path)
+    issues = String[]
+    push!(issues, validate(path; expected_models = length(expected_keys))...)
+    get(d, "schema", "") == SCHEMA || push!(issues, "schema must be $SCHEMA")
+    meta = get(d, "meta", Dict())
+    isempty(batch) || String(get(meta, "batch", "")) == batch ||
+        push!(issues, "meta.batch must be $batch")
+    args = String.(get(meta, "args", String[]))
+    args == String.(collect(expected_keys)) ||
+        push!(issues, "meta.args must equal the exact requested key sequence")
+
+    expected = sort(String.(collect(expected_keys)))
+    models = get(d, "models", Dict())
+    sort(collect(String, keys(models))) == expected ||
+        push!(issues, "model key set differs from the exact requested batch")
+    provenance = get(meta, "provenance", Dict())
+    run_ids = String[]
+    for phase in phases
+        snapshot = get(provenance, String(phase), nothing)
+        snapshot === nothing && (push!(issues, "missing $phase process-start provenance"); continue)
+        String(get(snapshot, "phase", "")) == String(phase) ||
+            push!(issues, "$phase provenance phase mismatch")
+        isempty(batch) || String(get(snapshot, "batch", "")) == batch ||
+            push!(issues, "$phase provenance batch mismatch")
+        sort(String.(get(snapshot, "requested_keys", String[]))) == expected ||
+            push!(issues, "$phase provenance requested-key mismatch")
+        get(snapshot, "loaded_modules_certified", false) === true ||
+            push!(issues, "$phase loaded-module roots are uncertified")
+        ad = String(get(snapshot, "ad_backend", ""))
+        ad == ORDINARY_AD_BACKEND ||
+            push!(issues, "$phase AD backend is not the ordinary reverse configuration")
+        push!(run_ids, String(get(snapshot, "run_id", "")))
+    end
+    isempty(run_ids) || (length(Set(run_ids)) == 1 && all(!isempty, run_ids)) ||
+        push!(issues, "phase run identities are absent or differ")
+    for key in expected
+        haskey(models, key) || continue
+        _input_query_identity_ok(get(models[key], "input_identity_native", nothing)) ||
+            push!(issues, "$key lacks a complete native input/query identity")
+        _input_query_identity_ok(get(models[key], "input_identity_reactant", nothing)) ||
+            push!(issues, "$key lacks a complete Reactant input/query identity")
+    end
+    issues
+end
+
 """MODEL-CORRECTNESS gate (DISTINCT from report-completeness): the rows that are NOT a verified
 faithful comparison — a row is correct only when every RK cell is a finite number AND
 `parity_pass` is true. Returns `key => reason` for each failing row (empty == all verified).
@@ -276,6 +492,17 @@ function correctness_failures(path::AbstractString)
         isempty(reasons) || (fails[k] = join(reasons, "; "))
     end
     fails
+end
+
+function _input_query_identity_ok(identity)
+    identity isa AbstractDict || return false
+    query = get(identity, "query", nothing)
+    query isa AbstractDict || return false
+    has_point = haskey(query, "selected_point") || haskey(query, "points")
+    has_digest = haskey(identity, "dataset_json_sha256") &&
+        !isempty(String(get(identity, "dataset_json_sha256", "")))
+    has_backend = String(get(query, "ad_backend", "")) == ORDINARY_AD_BACKEND
+    has_point && has_digest && has_backend
 end
 
 end # module All80Receipt

@@ -8,11 +8,6 @@
 # every side parity-gated against reference Stan (propto=false, jacobian=true) before timing.
 using Random, LinearAlgebra, Statistics
 import TOML, SHA
-using Chairmarks: @be
-import BridgeStan, PosteriorDB, DynamicPPL
-using ReactiveKernels, ReactiveKernelsPPLExamples
-import Enzyme
-using DifferentiationInterface
 
 const UP = ENV["RK_ALL80_UPSTREAM"]
 const PHASE = get(ENV, "RK_ALL80_PHASE", "native")
@@ -26,9 +21,17 @@ const DISCOVER = get(ENV, "RK_ALL80_DISCOVER", "") == "1"
 # the phase receipt carries a frozen process-start provenance block (freeze/verify below); the
 # frozen-82 flow writes NO provenance, so its receipt bytes are unchanged.
 const BATCH = get(ENV, "RK_ALL80_BATCH", "")
+include(joinpath(@__DIR__, "all80_receipt.jl"))    # stdlib-only; load the parent lock before measured imports
+if BATCH != ""
+    All80Receipt.load_provenance!(ENV["RK_ALL80_SOURCE_LOCK"])
+end
+using Chairmarks: @be
+import BridgeStan, PosteriorDB, DynamicPPL
+using ReactiveKernels, ReactiveKernelsPPLExamples
+import Enzyme
+using DifferentiationInterface
 include(joinpath(UP, "posteriordb.jl"))            # main-guarded; helpers + make_model + models + PDB
 include(joinpath(@__DIR__, "all80_registry.jl"))   # All80Registry.REGISTRY (82 executable-gated entries)
-include(joinpath(@__DIR__, "all80_receipt.jl"))    # All80Receipt.write_phase
 include(joinpath(@__DIR__, "all80_axes.jl"))       # All80Axes.measure_native (native phase)
 include(joinpath(@__DIR__, "all80_metadata.jl"))   # All80Metadata.meta(key): family/note + optional provenance
 const RK = All80Registry.REGISTRY
@@ -59,19 +62,17 @@ _reactant_loaded() = any(m -> String(nameof(m)) == "Reactant", values(Base.loade
 PHASE == "native" && _reactant_loaded() &&
     error("native-phase isolation violated: Reactant is loaded before measurements")
 
-# BATCH provenance: freeze the process-start snapshot ONCE (loaded harness + developed-package
-# source bytes + git identities + pinned upstream hash), BEFORE any measurement. `verify_provenance`
-# re-hashes on-disk bytes at each write and REFUSES if code drifted mid-run. Frozen-82 flow (BATCH
-# empty) freezes nothing and writes no provenance block.
+# BATCH provenance: the parent froze source/environment bytes before spawn; this child loaded and
+# verified that lock BEFORE measured imports. Now certify the actual loaded module roots and all
+# included helper bytes, then reverify before every receipt write. Frozen-82 flow stays unchanged.
 if BATCH != ""
-    All80Receipt.freeze_provenance!(;
-        packages = Dict(
-            "ReactiveKernels" => normpath(joinpath(@__DIR__, "..")),
-            "ReactiveKernelsPPLExamples" => normpath(joinpath(@__DIR__, "..", "packages", "ReactiveKernelsPPLExamples")),
-            "ReactiveKernelsDistributionKernels" => normpath(joinpath(@__DIR__, "..", "packages", "ReactiveKernelsDistributionKernels"))),
-        upstream_hash = bytes2hex(SHA.sha256(read(joinpath(UP, "posteriordb_models.jl")))),
-        extra = Dict{String,Any}("batch" => BATCH, "phase" => PHASE, "discover" => DISCOVER,
-            "requested_keys" => [a for a in ARGS if !startswith(a, "-")]))
+    All80Receipt.certify_loaded_modules!(Dict(
+        "ReactiveKernels" => ReactiveKernels,
+        "ReactiveKernelsDistributionKernels" => "ReactiveKernelsDistributionKernels",
+        "ReactiveKernelsPPLExamples" => ReactiveKernelsPPLExamples))
+    snapshot = All80Receipt.verify_provenance()
+    snapshot["ad_backend"] == All80Receipt.ORDINARY_AD_BACKEND ||
+        error("all80 batch AD configuration mismatch: expected ordinary reverse without annotation")
 end
 # The provenance to stamp on each phase-receipt write (re-verified against on-disk bytes each call;
 # `nothing` in the frozen-82 flow ⇒ receipt bytes unchanged).
@@ -81,13 +82,34 @@ _phase_prov() = BATCH == "" ? nothing : All80Receipt.verify_provenance()
 # A correct RK graph has statically-resolvable activity (data ports are DI.Constant
 # contexts; the active port is the unconstrained vector), so plain reverse is right;
 # needing set_runtime_activity would itself signal an activity defect to fix, not mask.
-const AE = AutoEnzyme(mode = Enzyme.Reverse, function_annotation = Enzyme.Const)
+const AE = AutoEnzyme(mode = Enzyme.Reverse)
 med(b) = median(b).time * 1e9   # Chairmarks `.time` is SECONDS; receipt/fmt use NANOSECONDS
 fmt(ns) = ns < 1e3 ? "$(round(ns; digits=1)) ns" : ns < 1e6 ? "$(round(ns/1e3; digits=2)) µs" : "$(round(ns/1e6; digits=3)) ms"
 
 stan_val(sm, q) = BridgeStan.log_density(sm, q; propto = false, jacobian = true)
 stan_grad(sm, q) = BridgeStan.log_density_gradient(sm, q; propto = false, jacobian = true)[2]
 relerr(a, b) = maximum(abs, a .- b) / max(maximum(abs, b), eps())
+
+function _input_identity(post, points; phase, seed, scale, draws, stan_perm)
+    dataset = PosteriorDB.dataset(post)
+    stan_path = PosteriorDB.path(PosteriorDB.implementation(
+        PosteriorDB.model(post), "stan"))
+    data_json = PosteriorDB.load(dataset, String)
+    library = first(splitext(stan_path)) * "_model.so"
+    All80Receipt.input_identity(;
+        phase = phase, posterior = name, model = PosteriorDB.name(PosteriorDB.model(post)),
+        stan_path = stan_path, stan_sha256 = bytes2hex(SHA.sha256(read(stan_path))),
+        library = library,
+        library_sha256 = isfile(library) ? bytes2hex(SHA.sha256(read(library))) : "not-present",
+        dataset_path = try PosteriorDB.path(dataset) catch; "unavailable" end,
+        dataset_json_sha256 = bytes2hex(SHA.sha256(data_json)),
+        dataset_json_bytes = sizeof(data_json),
+        query = Dict{String,Any}("seed" => seed, "scale" => scale,
+            "draws" => draws, "points" => collect(points),
+            "selected_point_index" => 1,
+            "ad_backend" => All80Receipt.ORDINARY_AD_BACKEND),
+        stan_perm = stan_perm)
+end
 
 # Scale-aware native parity floor (scale_ok / parity_tol / STAB_ATOL / STAB_ULP_C / classify_boundary)
 # — SHARED with the pure fixtures so they exercise the PRODUCTION helpers.
@@ -286,6 +308,8 @@ function run_one(name; seed = 468, scale = 0.2, draws = 3)
 
     q = points[1]; qt = cmap(sq(q)); gbuf = similar(q)
     md = All80Metadata.meta(name)
+    input_identity = _input_identity(post, points; phase = PHASE, seed, scale,
+        draws, stan_perm = e.stan_perm)
     ctx = (; dim = dim, family = md.family, note = md.note,
         parity_pass = parity_pass, rk_off = rk_off, tu_off = tu_off, off_reason = e.off_reason,
         rk_grad_relerr = rk_grad_err, tu_grad_relerr = tu_grad_err,
@@ -325,6 +349,7 @@ function run_one(name; seed = 468, scale = 0.2, draws = 3)
         # (phase-independent metadata; attached in the native phase, carried by the aggregate).
         r["primal_opt_stan"] = md.primal_opt_stan; r["primal_further_turing"] = md.primal_further_turing
         r["gradient_opt_stan"] = md.gradient_opt_stan; r["gradient_further_turing"] = md.gradient_further_turing
+        r["input_identity_native"] = input_identity
         r
     else   # reactant: the 3 cells, each numeric-or-diagnostic, caught independently
         reactant_cells(kb, prep, q)
@@ -344,6 +369,9 @@ end
 # Empty ARGS => ALL 82 keys (sorted). Any requested key MUST exist (reject unknown, never
 # silently filter). Keep an explicit one-key smoke working.
 _req = [n for n in ARGS if !startswith(n, "-")]
+_req_duplicates = unique(filter(name -> count(==(name), _req) > 1, _req))
+isempty(_req_duplicates) ||
+    error("all80 native: duplicate model key(s) requested: $(join(_req_duplicates, ", "))")
 _unknown = [k for k in _req if !haskey(RK, k)]
 isempty(_unknown) || error("all80: unknown registry key(s) requested: $(join(_unknown, ", "))")
 # Default sweep = the frozen 82 ONLY (BATCH1_KEYS excluded); the batch-1 additions run solely when
@@ -360,6 +388,8 @@ if get(ENV, "RK_ALL80_RESUME", "") == "1" && RECEIPT != "" && isfile(RECEIPT)
         error("all80 resume: schema mismatch in $RECEIPT")
     get(prior, "phase", "") == PHASE ||
         error("all80 resume: phase mismatch in $RECEIPT")
+    BATCH == "" || All80Receipt.assert_batch_resume!(prior, RECEIPT;
+        phase = PHASE, targets = targets, provenance = All80Receipt.verify_provenance())
     for (name, cells) in get(prior, "models", Dict())
         rows[String(name)] = Dict{String,Any}(String(k) => v for (k, v) in cells)
     end
@@ -383,6 +413,10 @@ for (i, name) in enumerate(pending)
     RECEIPT != "" && All80Receipt.write_phase(RECEIPT, PHASE, rows; provenance = _phase_prov())
     println("  [$(length(rows))/$(length(targets)) complete; $i/$(length(pending)) this run] $(name) recorded" *
             (RECEIPT != "" ? " → $RECEIPT" : ""))
+end
+if BATCH != ""
+    sort(collect(keys(rows))) == sort(targets) ||
+        error("all80 native batch incomplete: got $(sort(collect(keys(rows)))) expected $(sort(targets))")
 end
 RECEIPT != "" && println("wrote phase receipt ($PHASE, $(length(rows)) rows): $RECEIPT")
 println("\nALL80_PHASE_DONE $PHASE")

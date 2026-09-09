@@ -1,0 +1,186 @@
+generated_at = "2026-09-09T02:12:37.684"
+phase = "native"
+schema = "all80-benchmark-v1"
+
+[models.diamonds-diamonds]
+dim = 26
+family = ""
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 62436.00000000001
+gradient_stan = 28579.000000000004
+gradient_turing = 4976.900000000001
+hmc_ahmc_turing = 157.14453625
+hmc_rk_native = 2637.5008449999996
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 400
+mag_rk = 182346.45482479697
+mag_tu = 182346.4548247971
+note = ""
+off_reason = "off_tu=0: brms-generated diamonds.stan writes `student_t_lpdf(sigma|3,0,10) − 1*student_t_lccdf(0|3,0,10)` (truncation correction), matching upstream Turing `sigma~truncated(LocationScale(0,10,TDist(3));lower=0)`; b~Normal, Intercept~student_t untruncated both sides (posteriordb_models.jl:815-830, diamonds.stan model block)."
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 19917.000000000004
+primal_stan = 23733.0
+primal_turing = 541.010752688172
+protocol = "native-parity-scaleaware-peraxis-v1-2026-09-08"
+rk_grad_ok = true
+rk_grad_relerr = 2.0964498589213794e-15
+rk_off = 9.701276818911235e-11
+rk_primal_ok = true
+rk_stab = 4.55960010488828e-10
+tu_grad_relerr = 2.2711540138314946e-15
+tu_off = 7.761021455128987e-11
+tu_stab = 6.790893773237865e-11
+turing_support_diag = ""
+turing_support_ok = true
+
+[models.dogs-dogs_nonhierarchical]
+dim = 65
+family = ""
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 36646.0
+gradient_stan = 51401.00000000001
+gradient_turing = 203715.50000000003
+hmc_ahmc_turing = 10510.712659836065
+hmc_rk_native = 884.7432786885245
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 122
+mag_rk = 1079.4259458503461
+mag_tu = 1079.4259458503461
+note = ""
+off_reason = "off_tu=0: dogs_nonhierarchical.stan `sigma_logit_ab~normal(0,1)` on <lower=0> (untruncated density, NO lccdf correction) matches upstream Turing `sigma_logit_ab~FlatPos(0)` (improper, contributes 0) PLUS a MANUAL `logpdf(Normal(0,1),·)` (untruncated); mu~logistic, L~lkj_corr_cholesky(2), z~normal all match (posteriordb_models.jl:1830-1847, dogs_nonhierarchical.stan model block)."
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 9438.0
+primal_stan = 19186.000000000004
+primal_turing = 13378.000000000002
+protocol = "native-parity-scaleaware-peraxis-v1-2026-09-08"
+rk_grad_ok = true
+rk_grad_relerr = 1.4796723353586536e-16
+rk_off = 0.0
+rk_primal_ok = true
+rk_stab = 6.821210263296962e-13
+tu_grad_relerr = 1.7585234804789379e-16
+tu_off = 0.0
+tu_stab = 6.821210263296962e-13
+turing_support_diag = ""
+turing_support_ok = true
+
+[models.normal_5-normal_mixture_k]
+dim = 14
+family = ""
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 545313.0000000001
+gradient_stan = 592327.0
+gradient_turing = 1.4678310000000002e6
+hmc_ahmc_turing = 42154.13276470588
+hmc_rk_native = 8834.782029411766
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 17
+mag_rk = 5536.735591198641
+mag_tu = 5545.875181789479
+note = ""
+off_reason = "off_tu=K·log10 − log((K−1)!) + log(K)/2, K=5 (normal_5): upstream Turing `sigma~Fill(Uniform(0,10),K)` (net Stan−Turing=+K·log10, same mechanism as GLM_Poisson/election88) and `theta~Dirichlet(ones(K))` vs Stan `simplex[K]` (no explicit prior). The two prior normalizers give +K·log10 − log Γ(K) = 8.3349; the residual +log(K)/2 = +0.8047 is a CONSTANT Turing-side (Bijectors) simplex/Dirichlet transform-normalization difference vs Stan's implicit-uniform simplex (the only structural difference in the theta block; matched measured 9.13959 to 6 sig figs). mu~normal(0,10) matches (posteriordb_models.jl:2600-2614, normal_mixture_k.stan). tu_off GATE-verified constant across draws (tu_stab); RK matches Stan exactly (rk_off≈0)."
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 148265.00000000003
+primal_stan = 161342.0
+primal_turing = 180449.0
+protocol = "native-parity-scaleaware-peraxis-v1-2026-09-08"
+rk_grad_ok = true
+rk_grad_relerr = 1.318077565419489e-14
+rk_off = -3.031649005909761e-12
+rk_primal_ok = true
+rk_stab = 4.850638409455618e-12
+tu_grad_relerr = 1.7189766402005383e-15
+tu_off = 9.139590590838148
+tu_stab = 2.424727085781342e-12
+turing_support_diag = ""
+turing_support_ok = true
+
+[models.ovarian-logistic_regression_rhs]
+dim = 3075
+family = ""
+gradient_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+gradient_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+gradient_rk = 121082.0
+gradient_stan = 144474.50000000003
+gradient_turing = 725235.5
+hmc_ahmc_turing = 12788.484897058825
+hmc_rk_native = 3213.1130588235296
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+hmc_transitions = 34
+mag_rk = 4445.977346523281
+mag_tu = 4445.977346523279
+note = ""
+off_reason = "off_tu=−(1+d)·log2, d=1536 (ovarian): upstream Turing `tau~truncated(LocationScale(0,2scale_global,TDist(nu_global));lower=0)` (+log2) and `lambda~Fill(truncated(LocationScale(0,1,TDist(nu_local));lower=0),d)` (d×+log2; all centered at 0 ⇒ half-line normalizer log2 each); logistic_regression_rhs.stan writes bare `tau~student_t(...)`, `lambda~student_t(...)` on <lower=0> with NO lccdf correction ⇒ Stan drops (1+d)·log2. caux~inv_gamma, beta0~normal, z~std_normal match (posteriordb_models.jl:2308-2325, logistic_regression_rhs.stan model block)."
+parity_pass = true
+primal_further_turing = "deferred (user directive 2026-09-07): further-optimized Turing variants out of scope for this table; upstream Turing is the Turing comparator"
+primal_opt_stan = "deferred (user directive 2026-09-07): optimized-Stan variants out of scope for this table; reference Stan is the Stan comparator"
+primal_rk = 75259.0
+primal_stan = 39695.00000000001
+primal_turing = 67383.0
+protocol = "native-parity-scaleaware-peraxis-v1-2026-09-08"
+rk_grad_ok = true
+rk_grad_relerr = 2.0080059866345273e-15
+rk_off = 3.3348139065007367e-12
+rk_primal_ok = true
+rk_stab = 8.48861721654733e-12
+tu_grad_relerr = 2.1335063607991852e-15
+tu_off = -1065.3672165206342
+tu_stab = 2.5011104298755527e-12
+turing_support_diag = ""
+turing_support_ok = true
+
+[provenance]
+batch = "batch1"
+captured_at = "2026-09-09T02:03:02.296"
+discover = false
+julia = "1.10.11"
+phase = "native"
+requested_keys = ["diamonds-diamonds", "dogs-dogs_nonhierarchical", "ovarian-logistic_regression_rhs", "normal_5-normal_mixture_k"]
+root = "/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-ppl-benchmark/"
+root_git_dirty = true
+root_git_head = "4a8d46b24f089970b26013c2fa396775b04beb7a"
+upstream_posteriordb_models_sha256 = "a7ef985b93df973dd0598f0c772f3f002afa25be80829fc38a9e8cb7232413ad"
+
+    [provenance.harness_file_sha256]
+    "all80_axes.jl" = "fa9dee8cb43391827ff028f609dbec329a18ad4f17bf401d3d576c168a9ebcf2"
+    "all80_parity.jl" = "e107e093e4c84e01428296508069ef280e92c5f7a48cae293a9a4212154b9684"
+    "all80_posteriordb_body.jl" = "54e3ffedbfe28d8c65c99b381c051dd9e7e9d371db5f9350af7caf44bb2cce5e"
+    "all80_reactant_body.jl" = "bea37e456c1dbc1bd9241b306a21dafcba58e381053406bd0e961a3f56d8dd6e"
+    "all80_reactant_evals.jl" = "aa26b5dad4ca99b6197d6c0b5d406a4f33289a75e61b913504363c63e9f22b8f"
+    "all80_receipt.jl" = "9ab4b76573b128a53a4f26cbd28777b046da61806a7f03e746c1b5aab75b5105"
+    "all80_registry.jl" = "a25a6c9acb9c57e0ddc101d4e79cb0e9a00d68aac0aa2315bae3fd65ecf215c1"
+
+    [provenance.packages.ReactiveKernels]
+    git_dirty = true
+    git_head = "4a8d46b24f089970b26013c2fa396775b04beb7a"
+    root = "/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-ppl-benchmark/"
+    src_bytes_sha256 = "1bb831ac0c48dcd576bc6cf2f4a8c19d75f5cede6c28176607c01c9c80b20145"
+
+    [provenance.packages.ReactiveKernelsDistributionKernels]
+    git_dirty = true
+    git_head = "4a8d46b24f089970b26013c2fa396775b04beb7a"
+    root = "/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-ppl-benchmark/packages/ReactiveKernelsDistributionKernels"
+    src_bytes_sha256 = "953a83fcedf442ab5ee7e5a45f3bbcc3e14640b13cc240de4de635409c3fa5ad"
+
+    [provenance.packages.ReactiveKernelsPPLExamples]
+    git_dirty = true
+    git_head = "4a8d46b24f089970b26013c2fa396775b04beb7a"
+    root = "/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-ppl-benchmark/packages/ReactiveKernelsPPLExamples"
+    src_bytes_sha256 = "9502c17cfa1217cc3231a89627a8bac6b3e5c01caa979583c0c7c8ac66182742"

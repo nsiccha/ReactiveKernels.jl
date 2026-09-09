@@ -1,6 +1,8 @@
 # Fail-closed rendered contract for the published native all-82 checkpoint.
 using Test
 import TOML, Markdown
+include(joinpath(@__DIR__, "..", "benchmark", "all80_receipt.jl"))
+using .All80Receipt
 # make.jl includes this file at Main top level while the table builders live in
 # ReactiveKernelsDocs (via Base.include); import them explicitly so the contract
 # holds under make.jl's own load order, not just inside the module.
@@ -129,4 +131,41 @@ end
     @test any(r -> r.operation == "gradient" && r.outcome == "failed (diagnostic recorded)", cov)
     # path isolation.
     @test RKD._ALL80_BATCH1_PATH != RKD._ALL80_BENCHMARK_PATH
+end
+
+@testset "batch-1 REAL receipt contract and honest certification status" begin
+    RKD = ReactiveKernelsDocs
+    path = RKD._ALL80_BATCH1_PATH
+    @test isfile(path)
+    receipt = TOML.parsefile(path)
+    expected = Set((
+        "diamonds-diamonds", "dogs-dogs_nonhierarchical",
+        "ovarian-logistic_regression_rhs", "normal_5-normal_mixture_k"))
+    @test Set(keys(get(receipt, "models", Dict()))) == expected
+    models = RKD._all80_models(path)
+    @test all(m -> !haskey(m, "error"), values(models))
+    @test all(m -> get(m, "parity_pass", false) === true, values(models))
+    for cell in ("primal_rk", "gradient_rk", "hmc_rk_native",
+                 "primal_rk_reactant", "gradient_rk_reactant",
+                 "hmc_rk_reactant")
+        @test all(m -> _number_or_reason(get(m, cell, nothing)), values(models))
+    end
+    # The saved historical run is deliberately NOT publication-certified under the new gate:
+    # Reactant producer provenance and per-model input identities are absent, and its native
+    # producer predated the ordinary-backend/configuration field. Do not rewrite those facts.
+    issues = All80Receipt.validate_batch(path;
+        expected_keys = collect(expected), phases = ("native", "reactant"),
+        batch = "batch1")
+    @test any(issue -> occursin("reactant process-start provenance", issue), issues)
+    @test any(issue -> occursin("native input/query identity", issue), issues)
+    @test any(issue -> occursin("ordinary reverse", issue), issues)
+    summary_text = sprint(show, RKD.render_all80_batch1_summary(path))
+    @test occursin("not certified as ordinary-AE publication evidence", summary_text)
+    @test occursin("Reactant phase provenance absent", summary_text)
+    # The real renderer still uses its own path and marks Diamonds a workload mismatch.
+    @test path != RKD._ALL80_BENCHMARK_PATH
+    dia = [r for r in RKD._all80_speedup_rows(models)
+           if r.model == "diamonds-diamonds"]
+    @test !isempty(dia) &&
+        all(r -> occursin("mismatch", r.workload) || occursin("Mb", r.workload), dia)
 end

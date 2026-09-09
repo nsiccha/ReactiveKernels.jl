@@ -126,3 +126,62 @@ function render_all80_native_checkpoint(path = _ALL80_BENCHMARK_PATH)
         all80_hmc_table(models),
     ])
 end
+
+# --- Batch-1 incremental additions (todo 1x4pytu/1q387t4): SEPARATE receipt, rendered ALONGSIDE ---
+# These read `_ALL80_BATCH1_PATH`, NEVER `_ALL80_BENCHMARK_PATH`. Distinct table ids (`batch1-*`) so
+# they never collide with the frozen-82 tables on the same page. Absent receipt ⇒ an honest note
+# (still a `Markdown.MD`, so the Documenter @eval contract holds), never a broken build.
+function _all80_batch1_configuration_note(path)
+    receipt = TOML.parsefile(path)
+    provenance = get(get(receipt, "meta", Dict()), "provenance", Dict())
+    native = get(provenance, "native", nothing)
+    reactant = get(provenance, "reactant", nothing)
+    native_label = if native === nothing
+        "native phase provenance absent"
+    elseif isempty(get(native, "ad_backend", ""))
+        "native recorded source/harness hashes but no backend-configuration field (the pinned historical producer source is Const-annotated; loaded-source certification is incomplete)"
+    else
+        "native backend recorded"
+    end
+    reactant_label = reactant === nothing ?
+        "Reactant phase provenance absent" :
+        isempty(get(reactant, "ad_backend", "")) ?
+            "Reactant recorded source/harness hashes but no backend-configuration field" :
+            "Reactant backend recorded"
+    "Historical measurement/configuration status: $native_label; $reactant_label. " *
+    "These saved numbers are not certified as ordinary-AE publication evidence; new batch " *
+    "producer/validation requires `AutoEnzyme(mode=Enzyme.Reverse)` with recorded per-phase identity."
+end
+
+"""One-line batch-1 gate summary (distinct from the immutable 82-row checkpoint summary)."""
+function render_all80_batch1_summary(path = _ALL80_BATCH1_PATH)
+    isfile(path) || return Markdown.parse(
+        "The batch-1 additions are registered and wired; the SEPARATE receipt " *
+        "(`all80-batch1-v1.toml`) populates on the focused 4-model run.")
+    models = get(TOML.parsefile(path), "models", Dict())
+    failures = count(m -> haskey(m, "error"), values(models))
+    passing = count(m -> get(m, "parity_pass", false) === true, values(models))
+    pending = length(models) - failures - passing
+    Markdown.parse("""
+    **Batch-1 receipt:** $(length(models)) incremental posteriordb model(s) measured into the
+    SEPARATE `all80-batch1-v1.toml` (a union alongside the immutable 82, never merged into it);
+    **$passing** pass the complete declared-offset/value/gradient/support gate, **$pending** await a
+    source-declared constant replay, **$failures** retain an exact structural/AD diagnostic.
+
+    $(_all80_batch1_configuration_note(path))
+    """)
+end
+
+"""Render the three batch-1 comparison tables from the SEPARATE batch-1 receipt (or an honest note)."""
+function render_all80_batch1_tables(path = _ALL80_BATCH1_PATH)
+    isfile(path) || return Markdown.parse(
+        "!!! note \"Batch-1 tables pending\"\n\n" *
+        "    No batch-1 receipt at `$(basename(path))` yet — run the focused batch-1 benchmark " *
+        "(`RK_ALL80_BATCH=batch1 … <keys>`) to populate these tables.")
+    models = get(TOML.parsefile(path), "models", Dict())
+    Markdown.MD(Any[
+        all80_primal_table(models; id = "batch1-primal"),
+        all80_gradient_table(models; id = "batch1-gradient"),
+        all80_hmc_table(models; id = "batch1-hmc"),
+    ])
+end

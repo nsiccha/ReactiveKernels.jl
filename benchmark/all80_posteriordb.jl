@@ -20,6 +20,7 @@
 # Manifest to be committed.
 
 import Pkg, SHA
+using Random: RandomDevice
 
 const _INNER = "RK_ALL80_INNER"
 const _BODY = joinpath(@__DIR__, "all80_posteriordb_body.jl")
@@ -30,6 +31,7 @@ const UPSTREAM_DIGESTS = Dict(
     "posteriordb.jl"        => "12a814438d69501b6f8a14e3dd3f8ae1e1cb278f7fbf14c43abe7485338fc1a5",
 )
 const ENV_DIR = joinpath(@__DIR__, "all80-env")
+include(joinpath(@__DIR__, "all80_receipt.jl"))
 
 function _ensure_env()
     root = normpath(joinpath(@__DIR__, ".."))
@@ -83,8 +85,46 @@ function _phase_cmd(phase, up, receipt)
         _INNER => "1", "RK_ALL80_UPSTREAM" => up, "RK_ALL80_DPPL_SHA" => DPPL_SHA,
         "RK_ALL80_PHASE" => phase, "RK_ALL80_RECEIPT" => receipt,
         "RK_ALL80_BATCH" => get(ENV, "RK_ALL80_BATCH", ""),
+        "RK_ALL80_RUN_ID" => get(ENV, "RK_ALL80_RUN_ID", ""),
+        "RK_ALL80_SOURCE_LOCK" => get(ENV, "RK_ALL80_SOURCE_LOCK", ""),
     )
     phase == "reactant" ? addenv(cmd, "JULIA_NUM_PRECOMPILE_TASKS" => "1") : cmd
+end
+
+function _phase_harness_files(phase)
+    common = ("all80_posteriordb.jl", "all80_registry.jl", "all80_receipt.jl",
+              "all80_axes.jl")
+    phase == "native" ? (common..., "all80_posteriordb_body.jl",
+        "all80_metadata.jl", "all80_parity.jl", _HMC_HARNESS_FILES...) :
+        (common..., "all80_reactant_body.jl", "all80_reactant_evals.jl",
+         _HMC_HARNESS_FILES...)
+end
+
+function _write_phase_source_lock(phase, up, requested_keys, run_id)
+    upstream_files = Dict(
+        joinpath(up, name) => bytes2hex(SHA.sha256(read(joinpath(up, name))))
+        for name in keys(UPSTREAM_DIGESTS))
+    root = normpath(joinpath(@__DIR__, ".."))
+    snapshot = All80Receipt.freeze_provenance!(;
+        packages = Dict(
+            "ReactiveKernels" => root,
+            "ReactiveKernelsDistributionKernels" =>
+                joinpath(root, "packages", "ReactiveKernelsDistributionKernels"),
+            "ReactiveKernelsPPLExamples" =>
+                joinpath(root, "packages", "ReactiveKernelsPPLExamples")),
+        upstream_hash = UPSTREAM_DIGESTS["posteriordb_models.jl"],
+        upstream_files = upstream_files,
+        harness_files = _phase_harness_files(phase),
+        extra = Dict{String,Any}(
+            "batch" => get(ENV, "RK_ALL80_BATCH", ""),
+            "phase" => phase,
+            "discover" => get(ENV, "RK_ALL80_DISCOVER", "") == "1",
+            "requested_keys" => collect(requested_keys),
+            "run_id" => run_id,
+            "ad_backend" => All80Receipt.ORDINARY_AD_BACKEND))
+    path = tempname() * ".toml"
+    All80Receipt.write_provenance_lock(path, snapshot)
+    path
 end
 
 function _run()
@@ -98,28 +138,45 @@ function _run()
     non_flag = [a for a in ARGS if !startswith(a, "-")]
     isempty(batch) || !isempty(non_flag) ||
         error("RK_ALL80_BATCH=$batch requires explicit model keys (refusing to run the default sweep into a batch receipt)")
+    duplicated = unique(filter(key -> count(==(key), non_flag) > 1, non_flag))
+    isempty(duplicated) ||
+        error("RK_ALL80 duplicate model key(s) requested: $(join(duplicated, ", "))")
     phases = String.(split(get(ENV, "RK_ALL80_PHASES", "native,reactant"), ','))
     phase_receipts = String[]
+    locks = String[]
+    run_id = bytes2hex(rand(RandomDevice, UInt8, 16))
     for ph in phases
         rec = joinpath(RECEIPT_DIR, "$(prefix)-$(ph).toml")
-        @info "RK_ALL80: phase=$ph in an isolated subprocess -> $rec"
-        run(_phase_cmd(ph, up, rec))
+        lock = isempty(batch) ? "" : _write_phase_source_lock(ph, up, non_flag, run_id)
+        isempty(lock) || push!(locks, lock)
+        withenv("RK_ALL80_RUN_ID" => run_id, "RK_ALL80_SOURCE_LOCK" => lock) do
+            @info "RK_ALL80: phase=$ph in an isolated subprocess -> $rec"
+            run(_phase_cmd(ph, up, rec))
+        end
         push!(phase_receipts, rec)
     end
     # Deterministic aggregation of the phase receipts into the final receipt.
-    include(joinpath(@__DIR__, "all80_receipt.jl"))
     out = joinpath(RECEIPT_DIR, "$(prefix)-v1.toml")
     meta = isempty(batch) ? Dict("dppl_sha" => DPPL_SHA, "args" => collect(ARGS)) :
                             Dict("dppl_sha" => DPPL_SHA, "args" => collect(ARGS), "batch" => batch)
     Base.invokelatest(All80Receipt.aggregate, phase_receipts, out;
-        meta = meta, preserve_provenance = !isempty(batch))
+        meta = meta, preserve_provenance = !isempty(batch),
+        require_phases = isempty(batch) ? String[] : phases,
+        expected_keys = isempty(batch) ? String[] : non_flag,
+        batch = batch)
     @info "RK_ALL80: aggregated final receipt -> $out"
     complete = isempty(batch) && isempty(non_flag) && Set(phases) == Set(["native", "reactant"])
-    # A complete default run also gates the ROW COUNT (all 82 present), not just cell fill.
-    issues = Base.invokelatest(All80Receipt.validate, out; expected_models = complete ? 82 : nothing)
+    issues = if isempty(batch)
+        # A complete default run also gates the ROW COUNT (all 82 present), not just cell fill.
+        Base.invokelatest(All80Receipt.validate, out;
+            expected_models = complete ? 82 : nothing)
+    else
+        Base.invokelatest(All80Receipt.validate_batch, out;
+            expected_keys = non_flag, phases = Tuple(phases), batch = batch)
+    end
     if !isempty(issues)
-        if complete
-            @error "RK_ALL80: publication gate FAILED — $(length(issues)) unpopulated mandatory cell(s)"
+        if complete || !isempty(batch)
+            @error "RK_ALL80: publication gate FAILED — $(length(issues)) certification/completeness issue(s)"
             foreach(i -> println("  ", i), first(issues, 30))
             exit(1)
         else
@@ -127,6 +184,7 @@ function _run()
             foreach(i -> println("  ", i), first(issues, 20))
         end
     end
+    foreach(lock -> rm(lock; force = true), locks)
 end
 
 get(ENV, _INNER, "") == "1" ? include(_BODY) : _run()
