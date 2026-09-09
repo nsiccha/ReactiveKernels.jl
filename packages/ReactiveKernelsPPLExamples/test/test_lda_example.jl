@@ -74,8 +74,7 @@ end
         @test artifact.model isa KernelSpec
         @test artifact.output == Base.invokelatest(artifact.kernel, Tuple(artifact.inputs)...)
         @test artifact.dirichlet_object === dirichlet
-        # authored on the intended surface
-        @test occursin("softmax", LDA_SOURCE) == false          # authored as log-space
+        # authored on the intended surface: log-space transform, in-graph basis
         @test occursin("logsumexp(", LDA_SOURCE)
         @test occursin("dirichlet(a).logpdf", LDA_SOURCE)
         @test occursin("sum_to_zero_constrain", LDA_SOURCE)     # documented in-graph

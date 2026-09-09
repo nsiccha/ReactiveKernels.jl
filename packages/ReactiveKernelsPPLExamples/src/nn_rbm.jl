@@ -145,7 +145,7 @@ pointwise = pointwise_extraction(q)
 docs_example = (;
     name = :nn_rbm_density,
     origin = "posteriordb nn_rbm1b — single-hidden-layer neural-network softmax classifier (RBM parametrization; build executed on mnist_100)",
-    inputs = (; q, x, y, K, J),
+    inputs = (; q),
     model,
     kernel = evaluation_kernel,
     output,

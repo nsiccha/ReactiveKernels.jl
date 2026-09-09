@@ -149,7 +149,7 @@ pointwise = pointwise_extraction(q)
 docs_example = (;
     name = :lda_density,
     origin = "posteriordb ldaK2/ldaK5 — latent Dirichlet allocation, topic marginalized (build executed on three_men1)",
-    inputs = (; q, doc, w, alpha, beta, M),
+    inputs = (; q),
     model,
     kernel = evaluation_kernel,
     output,
