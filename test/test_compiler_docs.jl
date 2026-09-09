@@ -80,11 +80,18 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     # `prepare_ad` when describing the general `bound` partial-evaluation pre-pass,
     # and posteriordb-comparison lists Enzyme once among the packages its pinned
     # benchmark environment can load.
+    # The per-model GP pages own their exact native-Enzyme and Reactant support
+    # boundaries; allow those disclosures there rather than duplicating or deleting
+    # the model-specific limitations.
     ad_pages = Set((
         "automatic-differentiation.md",
         "distributions-ad.md",
         "eight-schools-reactant.md",
         "eval-throughput.md",
+        "gp-regr.md",
+        "gp-pois-regr.md",
+        "accel-gp.md",
+        "hierarchical-gp.md",
         "mnist-reactant.md",
         "ppl-ad.md",
         "probprog-mcmc.md",
