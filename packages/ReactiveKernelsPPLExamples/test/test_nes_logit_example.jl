@@ -26,7 +26,7 @@ end
     reference = _nes_logit_reference(q, NES_LOGIT_INCOME, NES_LOGIT_VOTE)
 
     @testset "authored on the current baseline surface" begin
-        @test occursin("bernoulli(logistic(", NES_LOGIT_SOURCE)
+        @test occursin("bernoulli(; logit = e).logpdf(v)", NES_LOGIT_SOURCE)
         @test occursin(".logpdf(v)", NES_LOGIT_SOURCE)
         @test occursin("eta = plate(", NES_LOGIT_SOURCE)
         @test occursin("pointwise = plate(", NES_LOGIT_SOURCE)

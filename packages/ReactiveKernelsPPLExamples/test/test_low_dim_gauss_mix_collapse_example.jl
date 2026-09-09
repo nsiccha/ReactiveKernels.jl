@@ -1,3 +1,14 @@
+# Parse executable syntax only: comments may legitimately mention forbidden calls.
+function _has_executable_call(source, name)
+    parsed = Meta.parseall(source; filename = "source")
+    function contains_call(ex)
+        ex isa Expr || return false
+        ex.head === :call && !isempty(ex.args) && ex.args[1] === name && return true
+        any(contains_call, ex.args)
+    end
+    any(contains_call, parsed.args)
+end
+
 using ReactiveKernelsPPLExamples.LowDimGaussMixCollapseExample
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, beta
 using LogExpFunctions: log1pexp, logaddexp
@@ -38,7 +49,9 @@ end
         @test occursin("beta(5.0, 5.0).logpdf", LOW_DIM_GAUSS_MIX_COLLAPSE_SOURCE)
         @test occursin("logaddexp(", LOW_DIM_GAUSS_MIX_COLLAPSE_SOURCE)
         @test occursin("pointwise = plate(", LOW_DIM_GAUSS_MIX_COLLAPSE_SOURCE)
-        @test !occursin("log_mix", LOW_DIM_GAUSS_MIX_COLLAPSE_SOURCE)
+        @test occursin("log_mix", LOW_DIM_GAUSS_MIX_COLLAPSE_SOURCE)  # explanatory comment is not executable syntax
+        @test !_has_executable_call(LOW_DIM_GAUSS_MIX_COLLAPSE_SOURCE, :log_mix)
+        @test _has_executable_call(replace(LOW_DIM_GAUSS_MIX_COLLAPSE_SOURCE, "logaddexp(lt +" => "log_mix(lt +"; count = 1), :log_mix)
         @test !occursin("struct ", LOW_DIM_GAUSS_MIX_COLLAPSE_SOURCE)
         @test artifact.normal_object === normal
         @test artifact.beta_object === beta

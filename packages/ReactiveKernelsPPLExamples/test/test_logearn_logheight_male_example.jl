@@ -18,7 +18,9 @@ end
     q = [6.0, 0.5, 0.2, log(0.9)]
     reference = _logearn_logheight_male_reference(q, LELHM_EARN, LELHM_HEIGHT, LELHM_MALE)
     @test artifact.normal_object === normal
-    @test occursin("b2 * log(h)", LOGEARN_LOGHEIGHT_MALE_SOURCE)
+    @test occursin("log_height = plate(height)", LOGEARN_LOGHEIGHT_MALE_SOURCE)
+    @test occursin("b1 + b2 * lh + b3 * ml", LOGEARN_LOGHEIGHT_MALE_SOURCE)
+        @test occursin("normal(m, s).logpdf(ly)", LOGEARN_LOGHEIGHT_MALE_SOURCE)
 
     p = prepare(model; have = (:unconstrained, :height, :male, :earn),
                 want = (:log_jacobian, :likelihood, :posterior))

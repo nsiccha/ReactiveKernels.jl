@@ -27,7 +27,9 @@ end
 
     @test artifact.normal_object === normal
     @test !occursin("struct ", SESAME_ONE_PRED_A_SOURCE)
-    @test occursin("normal(b1 + b2 * e, s).logpdf(w)", SESAME_ONE_PRED_A_SOURCE)
+    @test occursin("mu = plate(encouraged, beta1, beta2)", SESAME_ONE_PRED_A_SOURCE)
+    @test occursin("b1 + b2 * e", SESAME_ONE_PRED_A_SOURCE)
+        @test occursin("normal(m, s).logpdf(w)", SESAME_ONE_PRED_A_SOURCE)
     @test occursin("mu = plate(", SESAME_ONE_PRED_A_SOURCE)
 
     @testset "constrain-only prunes the likelihood work" begin

@@ -29,7 +29,7 @@ end
                                      WELLS_DAE_EDUC, WELLS_DAE_SWITCHED)
 
     @testset "authored on the current baseline surface" begin
-        @test occursin("bernoulli(logistic(", WELLS_DAE_SOURCE)
+        @test occursin("bernoulli(; logit = e).logpdf(s)", WELLS_DAE_SOURCE)
         @test occursin(".logpdf(s)", WELLS_DAE_SOURCE)
         @test occursin("unconstrained[1]", WELLS_DAE_SOURCE)
         @test occursin("eta = plate(", WELLS_DAE_SOURCE)

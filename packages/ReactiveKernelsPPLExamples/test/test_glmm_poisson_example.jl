@@ -42,7 +42,7 @@ end
     reference = _glmm_poisson_reference(q, GLMM_POISSON_YEAR, GLMM_POISSON_C)
 
     @testset "authored on the current baseline surface" begin
-        @test occursin("poisson(exp(", GLMM_POISSON_SOURCE)
+        @test occursin("poisson(; log_rate = ll).logpdf(c)", GLMM_POISSON_SOURCE)
         @test occursin("normal(0.0, s).logpdf(e)", GLMM_POISSON_SOURCE)
         @test occursin("log_lambda = plate(", GLMM_POISSON_SOURCE)
         @test !occursin("struct ", GLMM_POISSON_SOURCE)

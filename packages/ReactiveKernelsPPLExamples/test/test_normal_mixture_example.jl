@@ -1,3 +1,14 @@
+# Parse executable syntax only: comments may legitimately mention forbidden calls.
+function _has_executable_call(source, name)
+    parsed = Meta.parseall(source; filename = "source")
+    function contains_call(ex)
+        ex isa Expr || return false
+        ex.head === :call && !isempty(ex.args) && ex.args[1] === name && return true
+        any(contains_call, ex.args)
+    end
+    any(contains_call, parsed.args)
+end
+
 using ReactiveKernelsPPLExamples.NormalMixtureExample
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 using LogExpFunctions: log1pexp, logaddexp
@@ -33,7 +44,9 @@ end
         @test occursin("logaddexp(", NORMAL_MIXTURE_SOURCE)
         @test occursin("pointwise = plate(", NORMAL_MIXTURE_SOURCE)
         @test occursin("normal(m1, 1.0).logpdf", NORMAL_MIXTURE_SOURCE)
-        @test !occursin("log_mix", NORMAL_MIXTURE_SOURCE)
+        @test occursin("log_mix", NORMAL_MIXTURE_SOURCE)  # explanatory comment is not executable syntax
+        @test !_has_executable_call(NORMAL_MIXTURE_SOURCE, :log_mix)
+        @test _has_executable_call(replace(NORMAL_MIXTURE_SOURCE, "logaddexp(lt +" => "log_mix(lt +"; count = 1), :log_mix)
         @test !occursin("struct ", NORMAL_MIXTURE_SOURCE)
         @test artifact.normal_object === normal
     end
