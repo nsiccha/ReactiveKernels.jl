@@ -99,6 +99,8 @@ include("diamonds.jl")
 include("logistic_regression_rhs.jl")
 include("normal_mixture_k.jl")
 include("dogs_nonhierarchical.jl")
+include("nn_rbm.jl")
+include("lda.jl")
 include("gp_regr.jl")
 include("accel_gp.jl")
 include("gp_pois_regr.jl")
@@ -221,6 +223,8 @@ export DiamondsExample
 export LogisticRegressionRHSExample
 export NormalMixtureKExample
 export DogsNonhierarchicalExample
+export NNRBMExample
+export LDAExample
 export GPRegrExample
 export AccelGPExample
 export GPPoisRegrExample

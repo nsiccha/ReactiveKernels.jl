@@ -20,7 +20,8 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     KidscoreInteractionCExample, KidscoreInteractionC2Example, KidscoreInteractionZExample,
     DugongsGrowthExample, ARMA11Example,
     NormalMixtureExample, LowDimGaussMixCollapseExample, LowDimGaussMixExample,
-    MNISTLogisticExample, MVNormalRegressionExample, BoundRegressionExample
+    MNISTLogisticExample, MVNormalRegressionExample, BoundRegressionExample,
+    NNRBMExample, LDAExample
 using Test
 
 include("test_gp_first_use.jl")
@@ -119,6 +120,8 @@ include("test_diamonds_example.jl")
 include("test_normal_mixture_k_example.jl")
 include("test_dogs_nonhierarchical_example.jl")
 include("test_logistic_regression_rhs_example.jl")
+include("test_nn_rbm_example.jl")
+include("test_lda_example.jl")
 include("test_gp_regr_example.jl")
 include("test_accel_gp_example.jl")
 include("test_gp_pois_regr_example.jl")
