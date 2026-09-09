@@ -116,25 +116,30 @@ function reference_points(sm, dim, seed, name, npts, scale)
     pts
 end
 
-function gate(name; build, have, bind, scale = 0.3, npts = 6, seed = 468,
+function gate(name; build, have, bind, want = :posterior, scale = 0.3, npts = 6, seed = 468,
               do_reactant = true, boundary_point = nothing, altflag = nothing)
     println("\n########## $name ##########"); flush(stdout)
     if altflag === nothing
         sm, post = bridge(name, seed)
     else
         sm, post = bridge_altflag(name, altflag.regex, altflag.replacement, seed)
-        println("  ALT-FLAG: $(altflag.regex) => $(altflag.replacement); RK bound $(altflag.bind)"); flush(stdout)
+        println("  ALT-FLAG: $(altflag.regex) => $(altflag.replacement); RK bind $(get(altflag, :bind, nothing))"); flush(stdout)
     end
     data = PosteriorDB.load(PosteriorDB.dataset(post))
     bound = bind(data)
-    altflag === nothing || (bound = merge(bound, altflag.bind))   # RK uses the flipped flag too
+    # An alt-flag `bind` merges the flipped flag into the RK bound ports; for a
+    # WANT-selected flag (accel prior_only) there is no bind — only the Stan
+    # oracle is instantiated with the flipped data.
+    if altflag !== nothing && get(altflag, :bind, nothing) !== nothing
+        bound = merge(bound, altflag.bind)
+    end
     # build -> prepare -> execute ALL inside this one ordinary function (the
     # benchmark run_one shape): `build` is a thunk `() -> build_*_graph()`, so
     # the graph is constructed here, not at top level. The templates were
     # evaluated MODEL-ONLY at package load (a world boundary), so this is
     # world-age-safe. The first `kb(q)` below is the execute.
     graph = build()
-    kb = prepare(graph; have, want = :posterior, bound = bound)
+    kb = prepare(graph; have, want, bound = bound)
     dim = Int(BridgeStan.param_unc_num(sm))
     println("  q identity: dim=$dim scale=$scale seed=$seed npts=$npts"); flush(stdout)
     pts = reference_points(sm, dim, seed, name, npts, scale)
@@ -203,9 +208,11 @@ end
 #   * losscurve (data growthmodel_id=1, Weibull selected): q₁=log(1000),
 #     q₂=log(max t_value) — at ω=1000 the unused log-logistic arm's
 #     t^ω/θ^ω overflows; the authored overflow-safe forms must stay finite.
-#   * accel_altflag (prior_only=1): all-zero q except the unconstrained
-#     Intercept_sigma at -800 — exp(-800) underflows the deselected
-#     likelihood's σ to 0; the guarded likelihood scale must stay finite.
+#   * accel_altflag (prior_only=1, WANT-pruned prior-only node mirroring Stan's
+#     `if (!prior_only)`): all-zero q except the unconstrained Intercept_sigma
+#     at -800 — exp(-800) would underflow the deselected likelihood's σ to 0;
+#     the planned prior-only program must stay finite and match the prior-only
+#     Stan oracle.
 # No FURTHER boundary_point is supplied: none of the four models carries a
 # SEPARATE hard prior-support restriction in the tested modes beyond the
 # ordinary constraining transforms (exp for positivity, the data-bounded logit
@@ -249,13 +256,12 @@ _want("losscurve") && gate("loss_curves-losscurve_sislob";
     scale = 0.3, do_reactant = DO_REACTANT)
 
 # accel_splines — brms penalized-spline regression; bind the response + the four
-# design/basis matrices (in-graph matrix-vector products) + the prior_only flag.
+# design/basis matrices (in-graph matrix-vector products).
 _want("accel") && gate("mcycle_splines-accel_splines";
     build = () -> PE.AccelSplinesExample.build_accel_splines_graph(),
-    have = (:unconstrained, :Y, :Xs, :Zs_1_1, :Xs_sigma, :Zs_sigma_1_1, :prior_only),
+    have = (:unconstrained, :Y, :Xs, :Zs_1_1, :Xs_sigma, :Zs_sigma_1_1),
     bind = d -> (Y = Float64.(d["Y"]), Xs = _mat(d["Xs"]), Zs_1_1 = _mat(d["Zs_1_1"]),
-                 Xs_sigma = _mat(d["Xs_sigma"]), Zs_sigma_1_1 = _mat(d["Zs_sigma_1_1"]),
-                 prior_only = Int(d["prior_only"])),
+                 Xs_sigma = _mat(d["Xs_sigma"]), Zs_sigma_1_1 = _mat(d["Zs_sigma_1_1"])),
     scale = 0.3, do_reactant = DO_REACTANT)
 
 # state_space — structural DLM; bind only the raw series y, x, w (the bounded
@@ -279,13 +285,14 @@ _want("prophet") && gate("rstan_downloads-prophet";
                  s_a = Float64.(d["s_a"]), s_m = Float64.(d["s_m"]), y = Float64.(d["y"])),
     scale = 0.2, do_reactant = DO_REACTANT)
 
-# ALTERNATE-FLAG Stan-oracle axes. The graph's eager `ifelse` evaluates BOTH
-# branches; the real posterior selects one (losscurve growthmodel_id=1 Weibull;
-# accel prior_only=0 likelihood-included). These entries flip the flag in BOTH
-# the BridgeStan data and the RK bound port, so the four-axis gate certifies the
-# gradient of the OTHER branch against an actual Stan oracle — the independent
-# check that the eagerly-evaluated-but-unselected branch does not poison the
-# reverse gradient.
+# ALTERNATE-FLAG Stan-oracle axes. The real posterior selects one mode
+# (losscurve growthmodel_id=1 Weibull; accel prior_only=0 likelihood-included).
+# These entries flip the flag in the BridgeStan data, so the four-axis gate
+# certifies the OTHER mode against an actual Stan oracle. Losscurve's eager
+# per-cell `ifelse` needs the flipped flag bound in RK too; accel's prior_only
+# is a WANT-selected node (`accel_splines_posterior_want(true)`), mirroring
+# Stan's `if (!prior_only)` — planning `:prior_only_posterior` does not compute
+# the likelihood at all.
 _want("losscurve_altflag") && gate("loss_curves-losscurve_sislob";
     build = () -> PE.LosscurveSislobExample.build_losscurve_sislob_graph(),
     have = (:unconstrained, :growthmodel_id, :cohort_id, :t_idx, :t_value, :premium, :loss),
@@ -298,16 +305,17 @@ _want("losscurve_altflag") && gate("loss_curves-losscurve_sislob";
 
 _want("accel_altflag") && gate("mcycle_splines-accel_splines";
     build = () -> PE.AccelSplinesExample.build_accel_splines_graph(),
-    have = (:unconstrained, :Y, :Xs, :Zs_1_1, :Xs_sigma, :Zs_sigma_1_1, :prior_only),
+    have = (:unconstrained, :Y, :Xs, :Zs_1_1, :Xs_sigma, :Zs_sigma_1_1),
+    want = PE.AccelSplinesExample.accel_splines_posterior_want(true),
     bind = d -> (Y = Float64.(d["Y"]), Xs = _mat(d["Xs"]), Zs_1_1 = _mat(d["Zs_1_1"]),
-                 Xs_sigma = _mat(d["Xs_sigma"]), Zs_sigma_1_1 = _mat(d["Zs_sigma_1_1"]),
-                 prior_only = Int(d["prior_only"])),
+                 Xs_sigma = _mat(d["Xs_sigma"]), Zs_sigma_1_1 = _mat(d["Zs_sigma_1_1"])),
     altflag = (regex = r"\"prior_only\"\s*:\s*\d+", replacement = "\"prior_only\": 1",
-               bind = (; prior_only = 1)),
+               bind = nothing),
     boundary_point = dim -> begin
-        # Inactive-branch stress: prior_only=1 deselects the likelihood, but the
-        # eager obs term still evaluates it — an all-zero q except the
-        # unconstrained Intercept_sigma at -800 underflows σ=exp(-800) to 0.
+        # Inactive-branch stress on the WANT-pruned prior-only program: an
+        # all-zero q except the unconstrained Intercept_sigma at -800 underflows
+        # the deselected likelihood's σ=exp(-800) to 0 — the planned node must
+        # stay finite and match the prior-only Stan oracle there.
         q = zeros(dim)
         q[3 + size(PE.AccelSplinesExample.ACCEL_XS, 2) +
               size(PE.AccelSplinesExample.ACCEL_ZS_1_1, 2)] = -800.0

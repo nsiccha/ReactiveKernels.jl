@@ -38,7 +38,8 @@ function _accel_reference(q, Y, Xs, Zs_1_1, Xs_sigma, Zs_sigma_1_1, prior_only)
             _as_student_t(sds_sigma_1_1, 3, 0, 36) + log(2)
     likelihood = prior_only == 0 ?
         sum(_as_normal(Y[i], mu[i], sigma[i]) for i in 1:length(Y)) : 0.0
-    (; prior, likelihood, log_jacobian, posterior = prior + likelihood + log_jacobian)
+    (; prior, likelihood, log_jacobian, posterior = prior + likelihood + log_jacobian,
+      prior_only_posterior = prior + log_jacobian)
 end
 
 @testset "PPL graph — accel_splines" begin
@@ -47,9 +48,8 @@ end
     @test artifact.output ==
           Base.invokelatest(artifact.kernel, Tuple(artifact.inputs)...)
     model = artifact.model
-    have = (:unconstrained, :Y, :Xs, :Zs_1_1, :Xs_sigma, :Zs_sigma_1_1, :prior_only)
-    data = (ACCEL_Y, ACCEL_XS, ACCEL_ZS_1_1, ACCEL_XS_SIGMA, ACCEL_ZS_SIGMA_1_1,
-            ACCEL_PRIOR_ONLY)
+    have = (:unconstrained, :Y, :Xs, :Zs_1_1, :Xs_sigma, :Zs_sigma_1_1)
+    data = (ACCEL_Y, ACCEL_XS, ACCEL_ZS_1_1, ACCEL_XS_SIGMA, ACCEL_ZS_SIGMA_1_1)
     dim = 1 + size(ACCEL_XS, 2) + size(ACCEL_ZS_1_1, 2) + 1 +
           1 + size(ACCEL_XS_SIGMA, 2) + size(ACCEL_ZS_SIGMA_1_1, 2) + 1
 
@@ -57,7 +57,9 @@ end
         @test occursin("student_t(3.0, -13.0, 36.0).logpdf", ACCEL_SPLINES_SOURCE)
         @test occursin("+ log(2.0)", ACCEL_SPLINES_SOURCE)
         @test occursin("sigma::Vector{Float64} = exp.(sigma_linpred)", ACCEL_SPLINES_SOURCE)
-        @test occursin("ifelse(prior_only == 0", ACCEL_SPLINES_SOURCE)
+        @test occursin(
+            "prior_only_posterior::Float64 = prior + log_jacobian",
+            ACCEL_SPLINES_SOURCE)
         @test !occursin("struct ", ACCEL_SPLINES_SOURCE)
         @test artifact.normal_object === normal
         @test artifact.student_t_object === student_t
@@ -79,7 +81,8 @@ end
                   [(-1) .^ (1:dim) .* 0.15])
             qi = q[1]
             prior, likelihood, log_jacobian, posterior = kernel(qi, data...)
-            ref = _accel_reference(qi, data...)
+            ref = _accel_reference(qi, ACCEL_Y, ACCEL_XS, ACCEL_ZS_1_1,
+                                   ACCEL_XS_SIGMA, ACCEL_ZS_SIGMA_1_1, ACCEL_PRIOR_ONLY)
             @test isfinite(posterior)
             @test prior ≈ ref.prior
             @test likelihood ≈ ref.likelihood
@@ -95,6 +98,13 @@ end
         @test kernel(q, data...) != kernel(q2, data...)
     end
 
+    @testset "raw-data boundary exposes Stan's data switch" begin
+        @test ACCEL_PRIOR_ONLY === false
+        @test accel_splines_posterior_want(false) === :posterior
+        @test accel_splines_posterior_want(true) === :prior_only_posterior
+        @test_throws MethodError accel_splines_posterior_want(2)
+    end
+
     @testset "data-generic: alternate spline widths and the prior_only flag" begin
         # A tiny synthetic problem (N = 4, one linear effect + two knots each).
         Y = [0.2, -0.4, 0.9, -0.1]
@@ -105,47 +115,67 @@ end
         small_dim = 1 + 1 + 2 + 1 + 1 + 1 + 2 + 1
         q = collect(range(-0.3, 0.3; length = small_dim))
         for prior_only in (0, 1)
-            small = (Y, Xs, Zs_1_1, Xs_sigma, Zs_sigma_1_1, prior_only)
-            post = prepare(model; have = have, want = :posterior)(q, small...)
-            @test post ≈ _accel_reference(q, small...).posterior
+            small = (Y, Xs, Zs_1_1, Xs_sigma, Zs_sigma_1_1)
+            post = prepare(model; have = have,
+                want = accel_splines_posterior_want(prior_only == 1))(q, small...)
+            @test post ≈ _accel_reference(q, small..., prior_only).posterior
         end
         # prior_only = 1 drops the likelihood, so the two densities differ.
-        p_full = prepare(model; have = have, want = :posterior)(q, Y, Xs, Zs_1_1, Xs_sigma, Zs_sigma_1_1, 0)
-        p_prior = prepare(model; have = have, want = :posterior)(q, Y, Xs, Zs_1_1, Xs_sigma, Zs_sigma_1_1, 1)
+        p_full = prepare(model; have = have,
+            want = accel_splines_posterior_want(false))(q, Y, Xs, Zs_1_1, Xs_sigma, Zs_sigma_1_1)
+        p_prior = prepare(model; have = have,
+            want = accel_splines_posterior_want(true))(q, Y, Xs, Zs_1_1, Xs_sigma, Zs_sigma_1_1)
         @test p_full != p_prior
     end
 
-    @testset "alternate-flag gradient (prior_only=1): eager ifelse does not poison" begin
-        # The graph's `likelihood = ifelse(prior_only == 0, obs_ll, 0.0)` EAGERLY
-        # evaluates the obs-likelihood branch even when prior_only=1 selects 0.0.
-        # A correct reverse gradient at prior_only=1 must therefore equal the
-        # prior+Jacobian gradient with NO contribution from the unselected
-        # (eagerly-evaluated) obs branch. Two independent checks:
-        prior_only = 1
-        alt = (ACCEL_Y, ACCEL_XS, ACCEL_ZS_1_1, ACCEL_XS_SIGMA, ACCEL_ZS_SIGMA_1_1, prior_only)
+    @testset "prior_only=true controls value and plain-reverse gradient" begin
+        # Stan's `if (!prior_only)` skips the likelihood block; the graph mirrors
+        # that control flow structurally — planning `:prior_only_posterior`
+        # (accel_splines_posterior_want(true)) does not compute the likelihood
+        # recipe at all. The reverse gradient of that node therefore cannot be
+        # poisoned by a saturated likelihood scale, checked at the reviewer's
+        # extreme probe (unconstrained Intercept_sigma = -800, where the
+        # deselected σ = exp(-800) underflows to 0).
         q = 0.05 .* collect(range(-1.0, 1.0; length = dim))
-        kernel = prepare(model; have = have, want = :posterior)
-        prepared = prepare_ad(kernel, _ACCEL_ENZYME_BACKEND, q, alt...; active = :unconstrained)
-        rk_grad = collect(ad_gradient(prepared, q, alt...))
-        @test all(isfinite, rk_grad)
+        alt = (ACCEL_Y, ACCEL_XS, ACCEL_ZS_1_1, ACCEL_XS_SIGMA, ACCEL_ZS_SIGMA_1_1)
+        kernel = prepare(model; have = have,
+            want = accel_splines_posterior_want(true),
+            bound = (; Y = ACCEL_Y, Xs = ACCEL_XS, Zs_1_1 = ACCEL_ZS_1_1,
+                     Xs_sigma = ACCEL_XS_SIGMA, Zs_sigma_1_1 = ACCEL_ZS_SIGMA_1_1))
+        prepared = prepare_ad(kernel, _ACCEL_ENZYME_BACKEND, q; active = :unconstrained)
+        v, rk_grad = ReactiveKernels.ad_value_and_gradient!(prepared, similar(q), q)
+        rk_grad = collect(rk_grad)
+        @test isfinite(v) && all(isfinite, rk_grad)
+        ref = _accel_reference(q, alt..., 1)
+        @test v ≈ ref.prior_only_posterior
 
         # SAME-GRAPH CONSISTENCY (labeled): the RK Enzyme reverse gradient must
         # agree with central finite differences of the RK VALUE. This is a
         # derivative-consistency check of the graph against itself — it directly
-        # catches ifelse gradient poisoning at this point (a poisoned reverse
-        # gradient would be NaN/Inf while the FD stays finite), but it is NOT an
+        # catches gradient poisoning at this point (a poisoned reverse gradient
+        # would be NaN/Inf while the FD stays finite), but it is NOT an
         # independent oracle and does not by itself prove general poisoning
-        # absence. The alternate-flag density VALUE is independently validated
-        # above (the from-first-principles reference oracle, both flag values),
-        # and the INDEPENDENT-oracle alternate-flag GRADIENT check (RK reverse vs
-        # BridgeStan on the same .stan instantiated with prior_only=1) lives in
-        # benchmark/forecast_batch_gate.jl (FORECAST_MODELS=accel_altflag).
-        valk = prepare(model; have = have, want = :posterior)
+        # absence. The prior-only density VALUE is independently validated above
+        # (the from-first-principles reference oracle, both flag values), and the
+        # INDEPENDENT-oracle prior-only GRADIENT check (RK reverse vs BridgeStan
+        # on the same .stan instantiated with prior_only=1, at the -800 stress
+        # probe) lives in benchmark/forecast_batch_gate.jl
+        # (FORECAST_MODELS=accel_altflag).
+        valk = kernel
         fd = similar(q); h = 1e-6
         for i in eachindex(q)
             qp = copy(q); qp[i] += h; qm = copy(q); qm[i] -= h
-            fd[i] = (valk(qp, alt...) - valk(qm, alt...)) / (2h)
+            fd[i] = (valk(qp) - valk(qm)) / (2h)
         end
         @test rk_grad ≈ fd rtol = 1e-4
+
+        q_stress = copy(q)
+        q_stress[3 + size(ACCEL_XS, 2) + size(ACCEL_ZS_1_1, 2)] = -800.0
+        vs, gs = ReactiveKernels.ad_value_and_gradient!(
+            prepare_ad(kernel, _ACCEL_ENZYME_BACKEND, q_stress; active = :unconstrained),
+            similar(q_stress), q_stress)
+        ref_stress = _accel_reference(q_stress, alt..., 1)
+        @test isfinite(vs) && all(isfinite, gs)
+        @test vs ≈ ref_stress.prior_only_posterior
     end
 end

@@ -7,6 +7,7 @@ export ACCEL_Y, ACCEL_XS, ACCEL_ZS_1_1, ACCEL_XS_SIGMA, ACCEL_ZS_SIGMA_1_1,
     ACCEL_PRIOR_ONLY
 export build_accel_splines_graph, demo
 export ACCEL_SPLINES_SOURCE, evaluate_accel_splines_source
+export accel_splines_posterior_want
 
 # posteriordb `mcycle_splines-accel_splines` — a brms-generated penalized-spline
 # regression of the motorcycle-acceleration data, with a spline for BOTH the mean
@@ -24,7 +25,11 @@ let d = _posteriordb_data("mcycle_splines-accel_splines")
     global const ACCEL_ZS_1_1 = _mat(d["Zs_1_1"])
     global const ACCEL_XS_SIGMA = _mat(d["Xs_sigma"])
     global const ACCEL_ZS_SIGMA_1_1 = _mat(d["Zs_sigma_1_1"])
-    global const ACCEL_PRIOR_ONLY = Int(d["prior_only"])
+    prior_only_int = Int(d["prior_only"])
+    prior_only_int in (0, 1) || error(
+        "accel_splines prior_only must be 0 or 1, got $prior_only_int",
+    )
+    global const ACCEL_PRIOR_ONLY = prior_only_int == 1
 end
 
 const ACCEL_SPLINES_SOURCE = raw"""
@@ -35,8 +40,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, stud
               Xs::Matrix{Float64},
               Zs_1_1::Matrix{Float64},
               Xs_sigma::Matrix{Float64},
-              Zs_sigma_1_1::Matrix{Float64},
-              prior_only::Int) = begin
+              Zs_sigma_1_1::Matrix{Float64}) = begin
     # Basis widths come from the design matrices, so the unconstrained layout is
     # data-generic. Stan declaration order:
     #   [Intercept, bs, zs_1_1, log sds_1_1,
@@ -99,21 +103,18 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, stud
     prior::Float64 = Intercept_prior + zs_1_1_prior + sds_1_1_prior +
                      Intercept_sigma_prior + zs_sigma_1_1_prior + sds_sigma_1_1_prior
 
-    # Likelihood: Yᵢ ~ Normal(muᵢ, sigmaᵢ), gated by the `prior_only` data flag.
-    # The `ifelse` below evaluates the obs branch EAGERLY, so guard the likelihood
-    # scale: when prior_only=1 selects the likelihood away, a saturating linear
-    # predictor can drive sigma → 0 (underflow), making `normal(·, 0).logpdf` NaN
-    # and poisoning the reverse gradient of the unselected branch. `sigma_ll` is
-    # exactly `sigma` when the likelihood is active (prior_only=0), and a harmless
-    # constant when it is not — keeping the eagerly-evaluated obs term finite.
-    sigma_ll::Vector{Float64} = ifelse.(prior_only == 0, sigma, 1.0)
-    obs_pointwise = plate(Y, mu, sigma_ll) do y, m, s
+    # Likelihood: Yᵢ ~ Normal(muᵢ, sigmaᵢ). Stan's `if (!prior_only)` controls
+    # whether its sum enters the target. Author the two outcomes as selectable
+    # nodes instead of a data-dependent `if` (unsupported in @kernel): planning
+    # `:prior_only_posterior` stops at the prior/Jacobian and does not compute
+    # this likelihood recipe, exactly matching Stan's skipped branch.
+    obs_pointwise = plate(Y, mu, sigma) do y, m, s
         normal(m, s).logpdf(y)
     end
-    obs_ll::Float64 = sum(obs_pointwise)
-    likelihood::Float64 = ifelse(prior_only == 0, obs_ll, 0.0)
+    likelihood::Float64 = sum(obs_pointwise)
 
     posterior::Float64 = prior + likelihood + log_jacobian
+    prior_only_posterior::Float64 = prior + log_jacobian
     return posterior
 end
 
@@ -123,17 +124,18 @@ Xs = ACCEL_XS
 Zs_1_1 = ACCEL_ZS_1_1
 Xs_sigma = ACCEL_XS_SIGMA
 Zs_sigma_1_1 = ACCEL_ZS_SIGMA_1_1
-prior_only = ACCEL_PRIOR_ONLY
 
-requested_nodes = (:parameters, :prior, :likelihood, :log_jacobian, :posterior)
+requested_nodes = (:parameters, :prior, :likelihood, :log_jacobian,
+                   :posterior, :prior_only_posterior)
 density_kernel = prepare(model;
-    have = (:unconstrained, :Y, :Xs, :Zs_1_1, :Xs_sigma, :Zs_sigma_1_1, :prior_only),
+    have = (:unconstrained, :Y, :Xs, :Zs_1_1, :Xs_sigma, :Zs_sigma_1_1),
     want = requested_nodes,
-    bound = (; Y, Xs, Zs_1_1, Xs_sigma, Zs_sigma_1_1, prior_only))
+    bound = (; Y, Xs, Zs_1_1, Xs_sigma, Zs_sigma_1_1))
 
 output = density_kernel(q)
-parameters, prior, likelihood, log_jacobian, posterior = output
+parameters, prior, likelihood, log_jacobian, posterior, prior_only_posterior = output
 @assert posterior ≈ prior + likelihood + log_jacobian
+@assert prior_only_posterior ≈ prior + log_jacobian
 
 docs_example = (;
     name = :accel_splines_posterior,
@@ -175,11 +177,27 @@ coefficients). The Normal and Student-t endpoints are reused from
 `ReactiveKernelsDistributionKernels`; the half-Student-t priors on the spline
 sds add the `+log(2)` truncation normalizer. The prior, transformed spline
 coefficients, linear predictors, pointwise log-likelihood, likelihood reduction
-(gated by the live `prior_only` flag), transform Jacobian, and total density are
-separate named nodes, and the constrained parameters are a plain NamedTuple.
+and a prior-only reduction, transform Jacobian, and total density are separate
+named nodes, and the constrained parameters are a plain NamedTuple. Stan's
+`prior_only` data flag selects the authoritative posterior node via
+`accel_splines_posterior_want` (planning `:prior_only_posterior` does not
+compute the likelihood, mirroring Stan's `if (!prior_only)`).
 """
 function build_accel_splines_graph()
     compose(_ACCEL_SPLINES_GRAPH_TEMPLATE[])
+end
+
+"""
+    accel_splines_posterior_want(prior_only::Bool = ACCEL_PRIOR_ONLY)
+
+Select the authoritative posterior node for Stan's `prior_only` data flag.
+Only a Boolean is accepted: the raw 0/1 Stan field is validated and converted
+once at data load, and malformed integers such as `2` are rejected here instead
+of being silently mapped onto prior-only mode. `true` selects
+`:prior_only_posterior`; planning that node does not compute the likelihood.
+"""
+function accel_splines_posterior_want(prior_only::Bool = ACCEL_PRIOR_ONLY)
+    prior_only ? :prior_only_posterior : :posterior
 end
 
 function demo()
@@ -187,12 +205,12 @@ function demo()
     q = zeros(82)
 
     density_plan = plan(model;
-        have = (:unconstrained, :Y, :Xs, :Zs_1_1, :Xs_sigma, :Zs_sigma_1_1, :prior_only),
-        want = (:prior, :likelihood, :log_jacobian, :posterior))
+        have = (:unconstrained, :Y, :Xs, :Zs_1_1, :Xs_sigma, :Zs_sigma_1_1),
+        want = (:prior, :likelihood, :log_jacobian,
+                accel_splines_posterior_want(ACCEL_PRIOR_ONLY)))
     println(explain(density_plan))
     prior, likelihood, log_jacobian, posterior = prepare(density_plan)(
-        q, ACCEL_Y, ACCEL_XS, ACCEL_ZS_1_1, ACCEL_XS_SIGMA, ACCEL_ZS_SIGMA_1_1,
-        ACCEL_PRIOR_ONLY)
+        q, ACCEL_Y, ACCEL_XS, ACCEL_ZS_1_1, ACCEL_XS_SIGMA, ACCEL_ZS_SIGMA_1_1)
     println("log prior + log likelihood + log Jacobian")
     println("= ", prior, " + ", likelihood, " + ", log_jacobian)
     println("= log posterior = ", posterior)

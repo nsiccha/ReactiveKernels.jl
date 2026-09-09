@@ -28,13 +28,14 @@ The unconstrained vector is `(Intercept, bs, zs_1_1[1..38], log sds_1_1,
 Intercept_sigma, bs_sigma, zs_sigma_1_1[1..38], log sds_sigma_1_1)`; only the two
 spline standard deviations carry an exp support transform (summed log-Jacobian).
 The mean and log-scale linear predictors are in-graph data→parameter
-transformations (design-matrix products). The `prior_only` flag stays a live
-bound port gating the likelihood (`ifelse(prior_only == 0, obs_ll, 0.0)`); the
-eagerly evaluated likelihood uses a guarded scale (`sigma_ll`, exactly `sigma`
-when the likelihood is active and a harmless constant otherwise), so the
-deselected-but-computed obs term stays finite even when the log-scale linear
-predictor saturates — the committed gate probes that with the unconstrained
-`Intercept_sigma` at `-800` under `prior_only = 1`.
+transformations (design-matrix products). The `prior_only` flag is Stan's data
+switch (`if (!prior_only)`): it is validated and
+converted once at the raw-data boundary (`ACCEL_PRIOR_ONLY`) and selects the
+authoritative posterior node through `accel_splines_posterior_want` — planning
+`:prior_only_posterior` does not compute the likelihood recipe at all, exactly
+mirroring Stan's skipped branch. The committed gate probes that mode with the
+unconstrained `Intercept_sigma` at `-800` (where the deselected likelihood's
+σ = exp(-800) would underflow to 0).
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_ppl_example(
