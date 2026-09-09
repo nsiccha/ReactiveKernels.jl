@@ -141,10 +141,13 @@ const _M = ReactiveKernelsPPLExamples
         # The exact public first-use path for the four batch-1 translations
         # (diamonds, normal_mixture_k, dogs_nonhierarchical, logistic_regression_rhs):
         # build_X_graph() -> prepare -> evaluate ALL INSIDE ONE ordinary function.
-        # Eager model-only `__init__` (a pure `compose`, no `Core.eval` in the
-        # caller) is what makes this safe; a lazy build_X_graph would throw
-        # `method too new`. Each also checks the model-only template graph is
-        # NUMERICALLY EXACT (`==`) against a graph composed from the full source.
+        # The eager model-only `__init__` evaluates the graph definitions at
+        # module load, so `build_X_graph()` is a pure `compose` with no
+        # `Core.eval` in the caller; the naive lazy variant that moves that
+        # `Core.eval` into `build_X_graph` would throw `method too new` on
+        # first use (the hazard we reproduced). Each also checks the
+        # model-only template graph is NUMERICALLY EXACT (`==`) against a
+        # graph composed from the full source.
         D = _M.DiamondsExample
         function diamonds_first_use()
             g = D.build_diamonds_graph()
