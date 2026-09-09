@@ -5,10 +5,12 @@ import Statistics
 import TOML
 
 include(joinpath(@__DIR__, "validate_mnist_logistic_ad_v1.jl"))
+include(joinpath(dirname(@__DIR__), "_comparison_source_attestation.jl"))
 
 isdefined(@__MODULE__, :MNISTLogisticMatrixSpec) ||
     include(joinpath(dirname(@__DIR__), "mnist_logistic_matrix_spec.jl"))
 using .MNISTLogisticMatrixSpec
+using .ComparisonSourceAttestation
 
 const EXPECTED_MNIST_AD_CONFIGURATIONS = Tuple(
     configuration for configuration in MNIST_RK_CONFIGURATIONS
@@ -19,6 +21,8 @@ const EXPECTED_MNIST_AD_CONFIGURATIONS = Tuple(
 _mnist_ad_median(values) = Statistics.median(Float64.(values))
 _mnist_ad_text_sha256(path) = bytes2hex(SHA.sha256(
     replace(read(path, String), "\r\n" => "\n", "\r" => "\n")))
+const _MNIST_COMPARATOR_DEFINITION_ONLY_GUARD =
+    "get(ENV, \"RK_MNIST_DEFINITIONS_ONLY\", \"\") == \"1\" || run_comparison()\n"
 
 function _validate_mnist_logistic_ad_v2_receipt(path::AbstractString;
         root::AbstractString = normpath(joinpath(dirname(path), "..", "..")))
@@ -76,11 +80,33 @@ function _validate_mnist_logistic_ad_v2_receipt(path::AbstractString;
         absolute_path = joinpath(root, expected_path)
         require(get(current, "path", "") == expected_path,
                 "$key current path mismatch")
+        append!(errors, historical_source_pin_errors(root, pin; label = key))
+        append!(errors, recorded_current_source_pin_errors(
+            root, current; label = "$key recorded current"))
         require(isfile(absolute_path), "$key current source is missing")
-        isfile(absolute_path) && require(
-            get(current, "text_sha256", "") ==
-            _mnist_ad_text_sha256(absolute_path),
-            "$key current text digest mismatch")
+        if isfile(absolute_path)
+            actual_current = read(absolute_path, String)
+            published = ComparisonSourceAttestation._git_blob_text(
+                root, String(get(pin, "git_blob", "")))
+            supported_delta = if key == "model_source"
+                recorded = ComparisonSourceAttestation._git_blob_text(
+                    root, String(get(current, "git_blob", "")))
+                mnist_model_source_preserves_published_authority(
+                    actual_current, published) &&
+                    mnist_model_source_matches_recorded_current(
+                        actual_current, recorded)
+            else
+                recorded = ComparisonSourceAttestation._git_blob_text(
+                    root, String(get(current, "git_blob", "")))
+                comparator_source_matches_current_delta(
+                    actual_current, published,
+                    _MNIST_COMPARATOR_DEFINITION_ONLY_GUARD) &&
+                    ComparisonSourceAttestation._normalized_text(actual_current) ==
+                    ComparisonSourceAttestation._normalized_text(recorded)
+            end
+            require(supported_delta,
+                    "$key current source exceeds its supported delta")
+        end
     end
 
     protocol = receipt["protocol"]
