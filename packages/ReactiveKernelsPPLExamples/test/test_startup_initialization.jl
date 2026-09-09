@@ -74,6 +74,10 @@ const _M = ReactiveKernelsPPLExamples
             (_M.Rate2Example, :evaluate_rate_2_source),
             (_M.ARMA11Example, :evaluate_arma11_source),
             (_M.MNISTLogisticExample, :evaluate_mnist_logistic_source),
+            (_M.DiamondsExample, :evaluate_diamonds_source),
+            (_M.NormalMixtureKExample, :evaluate_normal_mixture_k_source),
+            (_M.DogsNonhierarchicalExample, :evaluate_dogs_nonhierarchical_source),
+            (_M.LogisticRegressionRHSExample, :evaluate_logistic_regression_rhs_source),
         )
             mo = getproperty(mod, fn)(; model_only = true)
             @test mo.model isa _RK.KernelSpec
@@ -131,5 +135,75 @@ const _M = ReactiveKernelsPPLExamples
                                       k1 = R.RATE2_K1, k2 = R.RATE2_K2))([0.1, -0.1])
         @test pr(R.build_rate_2_graph()) ==
               pr(compose(R.evaluate_rate_2_source().model))
+    end
+
+    @testset "batch-1 posteriordb modules: first use world-age-safe in one function" begin
+        # The exact public first-use path for the four batch-1 translations
+        # (diamonds, normal_mixture_k, dogs_nonhierarchical, logistic_regression_rhs):
+        # build_X_graph() -> prepare -> evaluate ALL INSIDE ONE ordinary function.
+        # Eager model-only `__init__` (a pure `compose`, no `Core.eval` in the
+        # caller) is what makes this safe; a lazy build_X_graph would throw
+        # `method too new`. Each also checks the model-only template graph is
+        # NUMERICALLY EXACT (`==`) against a graph composed from the full source.
+        D = _M.DiamondsExample
+        function diamonds_first_use()
+            g = D.build_diamonds_graph()
+            k = prepare(g; have = (:unconstrained, :X, :Y, :prior_only), want = :posterior,
+                bound = (; X = D.DIAMONDS_X, Y = D.DIAMONDS_Y, prior_only = D.DIAMONDS_PRIOR_ONLY))
+            k(vcat(fill(0.05, size(D.DIAMONDS_X, 2) - 1), 8.0, log(0.6)))
+        end
+        @test isfinite(diamonds_first_use())
+        dpv(g) = prepare(g; have = (:unconstrained, :X, :Y, :prior_only), want = :posterior,
+            bound = (; X = D.DIAMONDS_X, Y = D.DIAMONDS_Y, prior_only = D.DIAMONDS_PRIOR_ONLY))(
+            vcat(fill(0.05, size(D.DIAMONDS_X, 2) - 1), 8.0, log(0.6)))
+        @test dpv(D.build_diamonds_graph()) == dpv(compose(D.evaluate_diamonds_source().model))
+
+        M = _M.NormalMixtureKExample
+        _mq() = [0.1, -0.1, 0.2, 0.0, -3.0, 3.0, 2.0, -9.0, 5.0,
+                 log(1.9 / 8.1), log(0.6 / 9.4), log(2.8 / 7.2), log(2.2 / 7.8), log(2.1 / 7.9)]
+        function mixture_first_use()
+            g = M.build_normal_mixture_k_graph()
+            k = prepare(g; have = (:unconstrained, :y, :K), want = :posterior,
+                bound = (; y = M.NORMAL_MIXTURE_K_Y, K = M.NORMAL_MIXTURE_K_K))
+            k(_mq())
+        end
+        @test isfinite(mixture_first_use())
+        mpv(g) = prepare(g; have = (:unconstrained, :y, :K), want = :posterior,
+            bound = (; y = M.NORMAL_MIXTURE_K_Y, K = M.NORMAL_MIXTURE_K_K))(_mq())
+        @test mpv(M.build_normal_mixture_k_graph()) ==
+              mpv(compose(M.evaluate_normal_mixture_k_source().model))
+
+        G = _M.DogsNonhierarchicalExample
+        _gq() = vcat(-1.0, 0.5, log(0.5), log(0.4), 0.2,
+                     0.1 .* range(-1.0, 1.0; length = 2 * G.DOGS_NH_J))
+        function dogs_first_use()
+            g = G.build_dogs_nonhierarchical_graph()
+            k = prepare(g; have = (:unconstrained, :y), want = :posterior,
+                bound = (; y = G.DOGS_NH_Y))
+            k(_gq())
+        end
+        @test isfinite(dogs_first_use())
+        gpv(g) = prepare(g; have = (:unconstrained, :y), want = :posterior,
+            bound = (; y = G.DOGS_NH_Y))(_gq())
+        @test gpv(G.build_dogs_nonhierarchical_graph()) ==
+              gpv(compose(G.evaluate_dogs_nonhierarchical_source().model))
+
+        L = _M.LogisticRegressionRHSExample
+        _lhave() = (:unconstrained, :x, :y, :scale_icept, :scale_global, :nu_global,
+                    :nu_local, :slab_scale, :slab_df)
+        _lbound() = (h = L.LOGISTIC_RHS_HYPER; (; x = L.LOGISTIC_RHS_X, y = L.LOGISTIC_RHS_Y,
+            scale_icept = h.scale_icept, scale_global = h.scale_global, nu_global = h.nu_global,
+            nu_local = h.nu_local, slab_scale = h.slab_scale, slab_df = h.slab_df))
+        _lq() = (d = size(L.LOGISTIC_RHS_X, 2);
+            vcat(0.0, fill(0.05, d), log(0.1), fill(log(0.5), d), log(2.0)))
+        function logistic_first_use()
+            g = L.build_logistic_regression_rhs_graph()
+            k = prepare(g; have = _lhave(), want = :posterior, bound = _lbound())
+            k(_lq())
+        end
+        @test isfinite(logistic_first_use())
+        lpv(g) = prepare(g; have = _lhave(), want = :posterior, bound = _lbound())(_lq())
+        @test lpv(L.build_logistic_regression_rhs_graph()) ==
+              lpv(compose(L.evaluate_logistic_regression_rhs_source().model))
     end
 end
