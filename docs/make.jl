@@ -61,6 +61,7 @@ site_pages = [
             "Normal mixture (marginalized simplex)" => "normal-mixture-k.md",
             "Dogs (correlated avoidance learning)" => "dogs-nonhierarchical.md",
             "Logistic regression (regularized horseshoe)" => "logistic-regression-rhs.md",
+            "Basketball-drive HMM (hmm_drive_1)" => "hmm-drive-1.md",
         ],
         "Declarative @ppl front-end + Gibbs (experimental)" => "ppl-front-end.md",
     ],

@@ -334,6 +334,19 @@ function setup_normal_mixture_k!(mod::Module)
     nothing
 end
 
+function setup_hmm_drive_1!(mod::Module)
+    if !isdefined(mod, :HmmDrive1Example)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: HmmDrive1Example))
+    end
+    # Bind only the raw data. The displayed PPL assembly imports and reuses the
+    # shared `normal` and `dirichlet` distribution objects directly and authors
+    # the forward-algorithm `scan` inline; no helper evaluator is injected.
+    Core.eval(mod, :(using .HmmDrive1Example:
+        HMM_DRIVE_1_U, HMM_DRIVE_1_V, HMM_DRIVE_1_ALPHA, HMM_DRIVE_1_TAU,
+        HMM_DRIVE_1_RHO))
+    nothing
+end
+
 function setup_dogs_nonhierarchical!(mod::Module)
     if !isdefined(mod, :DogsNonhierarchicalExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: DogsNonhierarchicalExample))
@@ -781,6 +794,7 @@ const EXPECTED_PPL_EXAMPLES = (
     :normal_mixture_k_posterior,
     :dogs_nonhierarchical_posterior,
     :logistic_regression_rhs_posterior,
+    :hmm_drive_1_density,
 )
 const _PPL_EXECUTION_COUNTS = Dict(name => 0 for name in EXPECTED_PPL_EXAMPLES)
 

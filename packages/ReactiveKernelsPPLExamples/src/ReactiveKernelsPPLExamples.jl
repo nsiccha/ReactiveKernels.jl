@@ -99,6 +99,7 @@ include("diamonds.jl")
 include("logistic_regression_rhs.jl")
 include("normal_mixture_k.jl")
 include("dogs_nonhierarchical.jl")
+include("hmm_drive_1.jl")
 
 export PPLWorkflow
 
@@ -217,5 +218,6 @@ export DiamondsExample
 export LogisticRegressionRHSExample
 export NormalMixtureKExample
 export DogsNonhierarchicalExample
+export HmmDrive1Example
 
 end # module ReactiveKernelsPPLExamples
