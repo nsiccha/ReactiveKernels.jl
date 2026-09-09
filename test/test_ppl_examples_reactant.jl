@@ -98,6 +98,11 @@ using ReactiveKernelsPPLExamples.DiamondsExample: evaluate_diamonds_source
 using ReactiveKernelsPPLExamples.NormalMixtureKExample: evaluate_normal_mixture_k_source
 using ReactiveKernelsPPLExamples.DogsNonhierarchicalExample: evaluate_dogs_nonhierarchical_source
 using ReactiveKernelsPPLExamples.LogisticRegressionRHSExample: evaluate_logistic_regression_rhs_source
+using ReactiveKernelsPPLExamples.GPRegrExample:
+    evaluate_gp_regr_source, GP_REGR_X, GP_REGR_Y
+using ReactiveKernelsPPLExamples.AccelGPExample: evaluate_accel_gp_source
+using ReactiveKernelsPPLExamples.GPPoisRegrExample: evaluate_gp_pois_regr_source
+using ReactiveKernelsPPLExamples.HierarchicalGPExample: evaluate_hierarchical_gp_source
 
 _host(v::Reactant.AbstractConcreteArray) = Array(v)
 _host(v::Reactant.AbstractConcreteNumber) = Reactant.to_number(v)
@@ -577,5 +582,53 @@ end
             bound = (; counts = GLM_POISSON_C))
         @test _rapprox(_compile_run(counts_bound, (q, GLM_POISSON_YEAR)),
                        counts_bound(q, GLM_POISSON_YEAR))
+    end
+    # gp_regr — marginal GP regression with a dense in-graph Cholesky of the
+    # exponential-quadratic covariance. The PRIMAL lowers through Reactant with
+    # the response `y` traced (the mvnormal-cholesky pattern; `x` is bound so the
+    # squared-distance design folds to a constant). The compiled REVERSE gradient
+    # of the Cholesky solve does NOT yet lower — the Reactant/EnzymeMLIR pass has
+    # no adjoint for `stablehlo.triangular_solve` — so only the primal is checked
+    # here (native primal + native Enzyme gradient vs Stan are the authoritative
+    # gate in `benchmark/gp_gate.jl`; the Reactant-gradient gap is snag
+    # `reactant-compile-f877fcfd` on ReactiveKernels).
+    @testset "gp_regr (posteriordb; marginal GP, in-graph cholesky; primal)" begin
+        a = evaluate_gp_regr_source()
+        q = a.inputs.q
+        kb = prepare(a.model; have = (:unconstrained, :x, :y), want = :posterior,
+                     bound = (; x = GP_REGR_X))
+        native = kb(q, GP_REGR_Y)
+        @test _rapprox(_compile_run(kb, (q, GP_REGR_Y)), native)
+    end
+    # accel_gp — brms Hilbert-space approximate GP (HSGP): a distributional model
+    # (latent GP on both the mean and log-sd of a Normal response) built entirely
+    # from dense matrix-vector products, no covariance matrix / Cholesky. All data
+    # is bound (raw-data bound entry); the whole graph — primal AND compiled
+    # reverse gradient — lowers through Reactant (see benchmark/gp_gate.jl axis 4).
+    @testset "accel_gp (posteriordb; HSGP distributional GP, all data bound)" begin
+        a = evaluate_accel_gp_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    # gp_pois_regr — non-centered latent GP + Poisson-log. The latent field is
+    # `f = cholesky(K).L * f_tilde`; the PRIMAL lowers through Reactant (`x`/`k`
+    # bound, only q traced). Its compiled REVERSE gradient does NOT lower — the
+    # Reactant/EnzymeMLIR pass has no adjoint for the Cholesky FACTOR
+    # (`stablehlo.cholesky`), the sibling of gp_regr's `triangular_solve` gap
+    # (both snag reactant-compile-f877fcfd). Native primal + native Enzyme
+    # gradient vs Stan are the authoritative gate in `benchmark/gp_gate.jl`.
+    @testset "gp_pois_regr (posteriordb; latent GP + Poisson-log; primal)" begin
+        a = evaluate_gp_pois_regr_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    # hierarchical_gp — hierarchical GP of state presidential votes (dim 933): the
+    # ILR simplex transform, dual per-year Cholesky GPs (non-centered factor
+    # matmul), index gathers and reshape all lower the Reactant PRIMAL (all data
+    # bound, only q traced). Its compiled REVERSE gradient does NOT lower — the
+    # dual Cholesky FACTOR reverse hits the `stablehlo.cholesky` adjoint gap
+    # (snag reactant-compile-f877fcfd). Native primal + native Enzyme gradient vs
+    # Stan are the authoritative gate in `benchmark/gp_gate.jl`.
+    @testset "hierarchical_gp (posteriordb; hierarchical GP, ILR simplex; primal)" begin
+        a = evaluate_hierarchical_gp_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
 end

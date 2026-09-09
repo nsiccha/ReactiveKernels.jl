@@ -62,6 +62,12 @@ site_pages = [
             "Dogs (correlated avoidance learning)" => "dogs-nonhierarchical.md",
             "Logistic regression (regularized horseshoe)" => "logistic-regression-rhs.md",
         ],
+        "Gaussian processes" => [
+            "GP regression (marginal)" => "gp-regr.md",
+            "GP Poisson regression (latent)" => "gp-pois-regr.md",
+            "Approximate GP (HSGP, distributional)" => "accel-gp.md",
+            "Hierarchical GP" => "hierarchical-gp.md",
+        ],
         "Declarative @ppl front-end + Gibbs (experimental)" => "ppl-front-end.md",
     ],
     "Automatic differentiation" => [

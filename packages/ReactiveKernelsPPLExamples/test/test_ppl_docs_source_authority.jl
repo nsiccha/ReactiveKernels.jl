@@ -25,6 +25,14 @@ const PPL_SOURCE_CASES = (
      :MVNORMAL_REGRESSION_SOURCE, :evaluate_mvnormal_regression_source),
     ("bound-regression.md", "bound_regression.jl", BoundRegressionExample,
      :BOUND_REGRESSION_SOURCE, :evaluate_bound_regression_source),
+    ("gp-regr.md", "gp_regr.jl", GPRegrExample,
+     :GP_REGR_SOURCE, :evaluate_gp_regr_source),
+    ("gp-pois-regr.md", "gp_pois_regr.jl", GPPoisRegrExample,
+     :GP_POIS_REGR_SOURCE, :evaluate_gp_pois_regr_source),
+    ("accel-gp.md", "accel_gp.jl", AccelGPExample,
+     :ACCEL_GP_SOURCE, :evaluate_accel_gp_source),
+    ("hierarchical-gp.md", "hierarchical_gp.jl", HierarchicalGPExample,
+     :HIERARCHICAL_GP_SOURCE, :evaluate_hierarchical_gp_source),
 )
 
 # One displayed/executed authority kernel per registered case: a file carrying
