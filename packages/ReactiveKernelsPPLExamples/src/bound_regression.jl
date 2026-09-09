@@ -113,19 +113,19 @@ docs_example = (;
 )
 """
 
-function evaluate_bound_regression_source()
+function evaluate_bound_regression_source(; model_only::Bool = false)
     # Bind only the data. The authored source imports the reusable Normal object
     # itself and authors the standardization prefix inline.
     _evaluate_ppl_source(BOUND_REGRESSION_SOURCE, @__MODULE__; bindings = (
         :BOUND_RAW_X, :BOUND_Y,
-    ))
+    ), model_only)
 end
 
 const _BOUND_REGRESSION_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
     _BOUND_REGRESSION_GRAPH_TEMPLATE[] =
-        evaluate_bound_regression_source().model
+        evaluate_bound_regression_source(; model_only = true).model
     nothing
 end
 

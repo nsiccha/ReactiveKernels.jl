@@ -118,16 +118,16 @@ docs_example = (;
 )
 """
 
-function evaluate_mh_source()
+function evaluate_mh_source(; model_only::Bool = false)
     _evaluate_ppl_source(MH_SOURCE, @__MODULE__; bindings = (
         :MH_Y, :MH_LCHOOSE, :MH_T, :MH_M,
-    ))
+    ), model_only)
 end
 
 const _MH_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _MH_GRAPH_TEMPLATE[] = evaluate_mh_source().model
+    _MH_GRAPH_TEMPLATE[] = evaluate_mh_source(; model_only = true).model
     nothing
 end
 

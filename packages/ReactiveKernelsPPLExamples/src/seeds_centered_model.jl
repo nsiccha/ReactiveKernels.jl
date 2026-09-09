@@ -143,18 +143,18 @@ docs_example = (;
 )
 """
 
-function evaluate_seeds_centered_model_source()
+function evaluate_seeds_centered_model_source(; model_only::Bool = false)
     _evaluate_ppl_source(SEEDS_CENTERED_MODEL_SOURCE, @__MODULE__; bindings = (
         :SEEDS_CENTERED_COUNTS, :SEEDS_CENTERED_TOTALS,
         :SEEDS_CENTERED_X1, :SEEDS_CENTERED_X2,
-    ))
+    ), model_only)
 end
 
 const _SEEDS_CENTERED_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
     _SEEDS_CENTERED_GRAPH_TEMPLATE[] =
-        evaluate_seeds_centered_model_source().model
+        evaluate_seeds_centered_model_source(; model_only = true).model
     nothing
 end
 

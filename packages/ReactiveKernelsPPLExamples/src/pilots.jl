@@ -139,16 +139,16 @@ docs_example = (;
 )
 """
 
-function evaluate_pilots_source()
+function evaluate_pilots_source(; model_only::Bool = false)
     _evaluate_ppl_source(PILOTS_SOURCE, @__MODULE__; bindings = (
         :PILOTS_GROUP_ID, :PILOTS_SCENARIO_ID, :PILOTS_Y,
-    ))
+    ), model_only)
 end
 
 const _PILOTS_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _PILOTS_GRAPH_TEMPLATE[] = evaluate_pilots_source().model
+    _PILOTS_GRAPH_TEMPLATE[] = evaluate_pilots_source(; model_only = true).model
     nothing
 end
 

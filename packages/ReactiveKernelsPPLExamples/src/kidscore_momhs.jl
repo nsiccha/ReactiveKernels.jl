@@ -110,19 +110,19 @@ docs_example = (;
 )
 """
 
-function evaluate_kidscore_momhs_source()
+function evaluate_kidscore_momhs_source(; model_only::Bool = false)
     # Bind only the data. The authored source imports the reusable Normal and
     # Cauchy endpoints itself and contains the complete PPL assembly with no
     # helper evaluator or separately prepared density/plate path.
     _evaluate_ppl_source(KIDSCORE_MOMHS_SOURCE, @__MODULE__; bindings = (
         :MOMHS_KID_SCORE, :MOMHS_MOM_HS, :MOMHS_MOM_HS_NEW,
-    ))
+    ), model_only)
 end
 
 const _KIDSCORE_MOMHS_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _KIDSCORE_MOMHS_GRAPH_TEMPLATE[] = evaluate_kidscore_momhs_source().model
+    _KIDSCORE_MOMHS_GRAPH_TEMPLATE[] = evaluate_kidscore_momhs_source(; model_only = true).model
     nothing
 end
 

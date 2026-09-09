@@ -180,19 +180,19 @@ docs_example = (;
 )
 """
 
-function evaluate_logmesquite_source()
+function evaluate_logmesquite_source(; model_only::Bool = false)
     # Bind only the data. The authored source imports the reusable Normal
     # endpoint itself and computes the log transforms inline on the raw data.
     _evaluate_ppl_source(LOGMESQUITE_SOURCE, @__MODULE__; bindings = (
         :LOGMESQ_LOG_WEIGHT, :LOGMESQ_DIAM1, :LOGMESQ_DIAM2, :LOGMESQ_CANOPY_HEIGHT,
         :LOGMESQ_TOTAL_HEIGHT, :LOGMESQ_DENSITY, :LOGMESQ_GROUP,
-    ))
+    ), model_only)
 end
 
 const _LOGMESQUITE_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _LOGMESQUITE_GRAPH_TEMPLATE[] = evaluate_logmesquite_source().model
+    _LOGMESQUITE_GRAPH_TEMPLATE[] = evaluate_logmesquite_source(; model_only = true).model
     nothing
 end
 

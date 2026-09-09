@@ -95,16 +95,16 @@ docs_example = (;
 )
 """
 
-function evaluate_nes_logit_source()
+function evaluate_nes_logit_source(; model_only::Bool = false)
     _evaluate_ppl_source(NES_LOGIT_SOURCE, @__MODULE__; bindings = (
         :NES_LOGIT_INCOME, :NES_LOGIT_VOTE,
-    ))
+    ), model_only)
 end
 
 const _NES_LOGIT_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _NES_LOGIT_GRAPH_TEMPLATE[] = evaluate_nes_logit_source().model
+    _NES_LOGIT_GRAPH_TEMPLATE[] = evaluate_nes_logit_source(; model_only = true).model
     nothing
 end
 

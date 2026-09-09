@@ -115,16 +115,16 @@ docs_example = (;
 )
 """
 
-function evaluate_m0_source()
+function evaluate_m0_source(; model_only::Bool = false)
     _evaluate_ppl_source(M0_SOURCE, @__MODULE__; bindings = (
         :M0_S, :M0_LCHOOSE, :M0_T, :M0_M,
-    ))
+    ), model_only)
 end
 
 const _M0_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _M0_GRAPH_TEMPLATE[] = evaluate_m0_source().model
+    _M0_GRAPH_TEMPLATE[] = evaluate_m0_source(; model_only = true).model
     nothing
 end
 

@@ -151,16 +151,16 @@ docs_example = (;
 )
 """
 
-function evaluate_mb_source()
+function evaluate_mb_source(; model_only::Bool = false)
     _evaluate_ppl_source(MB_SOURCE, @__MODULE__; bindings = (
         :MB_A, :MB_B, :MB_E, :MB_F, :MB_S, :MB_T, :MB_M,
-    ))
+    ), model_only)
 end
 
 const _MB_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _MB_GRAPH_TEMPLATE[] = evaluate_mb_source().model
+    _MB_GRAPH_TEMPLATE[] = evaluate_mb_source(; model_only = true).model
     nothing
 end
 

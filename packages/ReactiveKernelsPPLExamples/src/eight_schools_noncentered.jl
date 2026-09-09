@@ -91,17 +91,17 @@ docs_example = (;
 )
 """
 
-function evaluate_eight_schools_noncentered_source()
+function evaluate_eight_schools_noncentered_source(; model_only::Bool = false)
     _evaluate_ppl_source(EIGHT_SCHOOLS_NONCENTERED_SOURCE, @__MODULE__; bindings = (
         :ES_NC_Y, :ES_NC_SIGMA,
-    ))
+    ), model_only)
 end
 
 const _ES_NONCENTERED_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
     _ES_NONCENTERED_GRAPH_TEMPLATE[] =
-        evaluate_eight_schools_noncentered_source().model
+        evaluate_eight_schools_noncentered_source(; model_only = true).model
     nothing
 end
 

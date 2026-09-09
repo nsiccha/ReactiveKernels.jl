@@ -159,17 +159,17 @@ const _LSAT_THETA_Q = 0.05 .* Float64[
     -0.45, 0.2,
 ]
 
-function evaluate_lsat_source()
+function evaluate_lsat_source(; model_only::Bool = false)
     _evaluate_ppl_source(LSAT_SOURCE, @__MODULE__; bindings = (
         :LSAT_STUDENT_IDX, :LSAT_QUESTION_IDX, :LSAT_RESP_FLAT,
         :_LSAT_THETA_Q,
-    ))
+    ), model_only)
 end
 
 const _LSAT_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _LSAT_GRAPH_TEMPLATE[] = evaluate_lsat_source().model
+    _LSAT_GRAPH_TEMPLATE[] = evaluate_lsat_source(; model_only = true).model
     nothing
 end
 
