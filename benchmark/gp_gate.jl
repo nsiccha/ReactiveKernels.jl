@@ -145,12 +145,13 @@ function gate(name; posterior_name = name, key = name, want = :posterior,
               accel_prior_only = nothing, graph, have,
               native_bound, reactant_bound, reactant_runtime,
               scale = 0.5, npts = 8, seed = 468, boundary_point = nothing,
-              chol_grad_gap = false)
+              chol_grad_gap = false, reactant_boundary = false)
     println("\n########## $name (REACTANT=$DO_REACTANT) ##########"); flush(stdout)
     key in MODELS && push!(EXECUTED_MODELS, key)
     sm, _ = bridge(posterior_name, seed; accel_prior_only)
     dim = Int(BridgeStan.param_unc_num(sm))
     pts = reference_points(sm, dim, seed, name, npts, scale)
+    boundary_q = boundary_point === nothing ? nothing : boundary_point(dim)
 
     kb = prepare(graph; have, want, bound = native_bound)
     prep = prepare_ad(kb, AE, pts[1]; active = :unconstrained)
@@ -170,8 +171,8 @@ function gate(name; posterior_name = name, key = name, want = :posterior,
     println("  [1] native value max_rel=$(round(max_v; sigdigits = 4)) (< $VALUE_TOL) PASS")
     println("  [2] native grad  max_rel=$(round(max_g; sigdigits = 4)) (< $GRAD_TOL) PASS"); flush(stdout)
 
-    if boundary_point !== nothing
-        qb = boundary_point(dim)
+    if boundary_q !== nothing
+        qb = boundary_q
         vb = kb(qb); gbnd = ReactiveKernels.ad_value_and_gradient!(prep, similar(qb), qb)[2]
         sb = sval(sm, qb); gs_b = sgrad(sm, qb)
         @assert isfinite(sb) && all(isfinite, gs_b) "$name: boundary BridgeStan reference not finite"
@@ -185,7 +186,8 @@ function gate(name; posterior_name = name, key = name, want = :posterior,
         kb_r = prepare(graph; have, want, bound = reactant_bound)
         prep_r = prepare_ad(kb_r, AE, pts[1], reactant_runtime...; active = :unconstrained)
         @assert _relv(kb_r(pts[1], reactant_runtime...), kb(pts[1])) < 1e-10 "$name: reactant-kernel disagrees with native"
-        reactant_axes(name, kb_r, prep_r, sm, pts, reactant_runtime; chol_grad_gap)
+        reactant_axes(name, kb_r, prep_r, sm, pts, reactant_runtime;
+            chol_grad_gap, boundary_point = reactant_boundary ? boundary_q : nothing)
     end
     return
 end
@@ -251,7 +253,7 @@ _want("accel_gp") && gate("mcycle_gp-accel_gp (prior_only=1)";
         qb[4 + nb1] = -800.0
         qb
     end,
-    chol_grad_gap = false)
+    chol_grad_gap = false, reactant_boundary = true)
 
 # gp_pois_regr — non-centered latent GP + Poisson-log. bind raw x (folds the
 # squared-distance design) + counts k; f_tilde rides q (traced). Reactant

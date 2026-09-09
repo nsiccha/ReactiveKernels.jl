@@ -4,7 +4,8 @@
 # (it would abort the Reactant-unloaded phase). Uses the tolerances/helpers and
 # `Reactant` from the enclosing gp_gate.jl scope.
 
-function reactant_axes(name, kb_r, prep_r, sm, pts, reactant_runtime; chol_grad_gap = false)
+function reactant_axes(name, kb_r, prep_r, sm, pts, reactant_runtime;
+                       chol_grad_gap = false, boundary_point = nothing)
     q = pts[1]
     rq = Reactant.to_rarray(q)
     rrt = map(Reactant.to_rarray, reactant_runtime)
@@ -60,6 +61,23 @@ function reactant_axes(name, kb_r, prep_r, sm, pts, reactant_runtime; chol_grad_
         @assert all(isfinite, gh) "$name: Reactant gradient not finite"
         @assert rgr < RGRAD_TOL "$name: Reactant gradient vs Stan rel=$rgr ≥ $RGRAD_TOL"
         println("  [4] Reactant grad rel=$(round(rgr; sigdigits = 4)) (< $RGRAD_TOL) PASS"); flush(stdout)
+        if boundary_point !== nothing
+            qb = boundary_point
+            rqb = Reactant.to_rarray(qb)
+            vcb = Float64(kbc(rqb, rrt...)); vnb = kb_r(qb, reactant_runtime...)
+            rpb = _relv(vcb, vnb)
+            vsb = sval(sm, qb)
+            @assert isfinite(vsb) "$name: Reactant boundary BridgeStan value not finite"
+            @assert isfinite(vcb) && rpb < RPRIMAL_TOL "$name: Reactant boundary primal rel=$rpb ≥ $RPRIMAL_TOL"
+            @assert _relv(vnb, vsb) < VALUE_TOL "$name: Reactant boundary native value ≠ Stan"
+            _, rgb = gc(prep_r, gb, rqb, rrt...)
+            ghb = Array{Float64}(rgb); gsb = sgrad(sm, qb)
+            @assert all(isfinite, gsb) "$name: Reactant boundary BridgeStan gradient not finite"
+            @assert all(isfinite, ghb) "$name: Reactant boundary gradient not finite"
+            rgberr = relerr(ghb, gsb)
+            @assert rgberr < RGRAD_TOL "$name: Reactant boundary gradient vs Stan rel=$rgberr ≥ $RGRAD_TOL"
+            println("  [b] Reactant prior-only -800 stress primal+grad rel=$(round(max(rpb, rgberr); sigdigits = 4)) PASS"); flush(stdout)
+        end
     end
     return
 end
