@@ -323,6 +323,10 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "nn-rbm.md" => 1,
         "mnist-logistic.md" => 2,
         "online-stats.md" => 1,
+        "gp-regr.md" => 1,
+        "gp-pois-regr.md" => 1,
+        "accel-gp.md" => 1,
+        "hierarchical-gp.md" => 1,
     )
     expected_source_examples = Dict(
         "reactivehmc-corpus.md" => 5,

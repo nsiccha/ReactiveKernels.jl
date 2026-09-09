@@ -381,6 +381,44 @@ function setup_nn_rbm!(mod::Module)
     nothing
 end
 
+function setup_gp_regr!(mod::Module)
+    if !isdefined(mod, :GPRegrExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: GPRegrExample))
+    end
+    # Bind only the real data the displayed source references; the PPL assembly
+    # imports and reuses the shared `normal` and `gamma` endpoints directly.
+    Core.eval(mod, :(using .GPRegrExample: GP_REGR_X, GP_REGR_Y))
+    nothing
+end
+
+function setup_gp_pois_regr!(mod::Module)
+    if !isdefined(mod, :GPPoisRegrExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: GPPoisRegrExample))
+    end
+    Core.eval(mod, :(using .GPPoisRegrExample: GP_POIS_X, GP_POIS_K))
+    nothing
+end
+
+function setup_accel_gp!(mod::Module)
+    if !isdefined(mod, :AccelGPExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: AccelGPExample))
+    end
+    Core.eval(mod, :(using .AccelGPExample:
+        ACCEL_GP_Y, ACCEL_GP_XGP, ACCEL_GP_SLAMBDA,
+        ACCEL_GP_XGP_SIGMA, ACCEL_GP_SLAMBDA_SIGMA, ACCEL_GP_PRIOR_ONLY))
+    nothing
+end
+
+function setup_hierarchical_gp!(mod::Module)
+    if !isdefined(mod, :HierarchicalGPExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: HierarchicalGPExample))
+    end
+    Core.eval(mod, :(using .HierarchicalGPExample:
+        HGP_Y, HGP_YEAR_IND, HGP_STATE_IND, HGP_REGION_IND, HGP_STATE_REGION_IND,
+        HGP_N_YEARS, HGP_N_REGIONS, HGP_N_STATES, HGP_N_YEARS_OBS))
+    nothing
+end
+
 function setup_online_stats!(mod::Module)
     if !isdefined(mod, :OnlineStatsExample)
         Base.include(mod, joinpath(@__DIR__, "..", "examples", "online_stats.jl"))
@@ -807,6 +845,10 @@ const EXPECTED_PPL_EXAMPLES = (
     :logistic_regression_rhs_posterior,
     :lda_density,
     :nn_rbm_density,
+    :gp_regr_posterior,
+    :gp_pois_regr_posterior,
+    :accel_gp_posterior,
+    :hierarchical_gp_posterior,
 )
 const _PPL_EXECUTION_COUNTS = Dict(name => 0 for name in EXPECTED_PPL_EXAMPLES)
 

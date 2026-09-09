@@ -24,6 +24,7 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     NNRBMExample, LDAExample
 using Test
 
+include("test_gp_first_use.jl")
 include("test_startup_initialization.jl")
 include("test_ppl_workflow.jl")
 include("test_eight_schools_example.jl")
@@ -121,6 +122,10 @@ include("test_dogs_nonhierarchical_example.jl")
 include("test_logistic_regression_rhs_example.jl")
 include("test_nn_rbm_example.jl")
 include("test_lda_example.jl")
+include("test_gp_regr_example.jl")
+include("test_accel_gp_example.jl")
+include("test_gp_pois_regr_example.jl")
+include("test_hierarchical_gp_example.jl")
 include("test_ppl_macro.jl")
 include("test_ppl_posteriordb_parity.jl")
 include("test_ppl_gibbs.jl")

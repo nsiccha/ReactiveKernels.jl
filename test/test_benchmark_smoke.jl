@@ -10,6 +10,7 @@ using Test
 # gates + 0-B receipts + typed/LLVM hard gate must still hold on a tiny build.
 
 const _BENCH_DIR = joinpath(@__DIR__, "..", "benchmark")
+const _REPOSITORY_ROOT = normpath(joinpath(_BENCH_DIR, ".."))
 
 include(joinpath(_BENCH_DIR, "mnist_logistic_matrix_spec.jl"))
 import .MNISTLogisticMatrixSpec
@@ -22,6 +23,42 @@ function _load_benchmark_validator(path)
     Base.include(validator, path)
     validator
 end
+
+function _validator_fixture_root(relative_paths)
+    root = mktempdir()
+    for relative in relative_paths
+        source = joinpath(_REPOSITORY_ROOT, relative)
+        destination = joinpath(root, relative)
+        mkpath(dirname(destination))
+        cp(source, destination; force = true)
+    end
+    repository_git = joinpath(_REPOSITORY_ROOT, ".git")
+    fixture_git = joinpath(root, ".git")
+    if isdir(repository_git)
+        symlink(realpath(repository_git), fixture_git)
+    else
+        write(fixture_git, read(repository_git, String))
+    end
+    root
+end
+
+function _reject_current_source_mutation(path, mutation, check)
+    saved = read(path, String)
+    mutated = mutation(saved)
+    mutated === nothing && error("negative mutation anchor was not exact in $path")
+    try
+        write(path, mutated)
+        errors = check()
+        @test !isempty(errors)
+        @test any(error -> occursin("current source exceeds its supported delta", error), errors)
+    finally
+        write(path, saved)
+    end
+end
+
+_replace_one_anchor(text, replacement) =
+    length(findall(first(replacement), text)) == 1 ?
+        replace(text, replacement) : nothing
 
 function _parses(path)
     ex = Meta.parseall(read(path, String); filename = path)
@@ -167,60 +204,146 @@ end
 include(joinpath(_BENCH_DIR, "_comparison_source_attestation.jl"))
 using .ComparisonSourceAttestation
 
-@testset "AD comparator current-source delta stays narrow" begin
-    for (receipt_name, guard) in (
-            "mnist-logistic-ad-v2.toml" =>
+@testset "historical source pins and current-source deltas stay explicit" begin
+    root = normpath(joinpath(_BENCH_DIR, ".."))
+    receipts = (
+        "mnist-logistic-ad-v2.toml" => (
+            "model_source" => nothing,
+            "primal_comparator_source" =>
                 "get(ENV, \"RK_MNIST_DEFINITIONS_ONLY\", \"\") == \"1\" || run_comparison()\n",
-            "eight-schools-ad-v2.toml" =>
+        ),
+        "eight-schools-ad-v2.toml" => (
+            "model_source" => nothing,
+            "primal_comparator_source" =>
                 "get(ENV, \"RK_EIGHT_SCHOOLS_DEFINITIONS_ONLY\", \"\") == \"1\" || run_comparison()\n",
-        )
+        ),
+    )
+
+    for (receipt_name, pins) in receipts
         receipt = TOML.parsefile(joinpath(_BENCH_DIR, "receipts", receipt_name))
-        pin = receipt["pins"]["primal_comparator_source"]
-        published = read(
-            `git -C $_BENCH_DIR show $(pin["commit"]):$(pin["path"])`, String)
-        current = read(
-            `git -C $_BENCH_DIR cat-file blob $(pin["current"]["git_blob"])`,
-            String)
-        if get(pin, "current_delta", "") == "none"
-            @test current == published
-        else
-            @test comparator_source_matches_current_delta(current, published, guard)
+        for (key, guard) in pins
+            pin = receipt["pins"][key]
+            label = "$receipt_name/$key"
+            @test isempty(historical_source_pin_errors(root, pin; label = label))
+            current = pin["current"]
+            @test current["path"] == pin["path"]
+            @test isempty(recorded_current_source_pin_errors(
+                root, current; label = "$label recorded current"))
+            actual = read(joinpath(root, pin["path"]), String)
+            published = ComparisonSourceAttestation._git_blob_text(
+                root, pin["git_blob"])
+            recorded = ComparisonSourceAttestation._git_blob_text(
+                root, current["git_blob"])
+            if key == "model_source"
+                if startswith(receipt_name, "mnist")
+                    @test mnist_model_source_preserves_published_authority(
+                        actual, published)
+                    @test mnist_model_source_matches_recorded_current(
+                        actual, recorded)
+                else
+                    @test eight_schools_model_source_preserves_published_authority(
+                        actual, published)
+                    @test eight_schools_model_source_matches_recorded_current(
+                        actual, recorded)
+                end
+            else
+                @test comparator_source_matches_current_delta(
+                    actual, published, guard)
+            end
         end
     end
 
-    model_pin = TOML.parsefile(joinpath(
+    mnist_pin = TOML.parsefile(joinpath(
         _BENCH_DIR, "receipts", "mnist-logistic-ad-v2.toml"))["pins"]["model_source"]
-    published_model = read(
-        `git -C $_BENCH_DIR show $(model_pin["commit"]):$(model_pin["path"])`, String)
-    current_model = read(joinpath(dirname(_BENCH_DIR), model_pin["path"]), String)
-    @test mnist_model_source_preserves_published_authority(
-        current_model, published_model)
-    @test !mnist_model_source_preserves_published_authority(
-        replace(current_model, "@kernel model(" => "@kernel changed_model("),
-        published_model)
+    mnist_published = ComparisonSourceAttestation._git_blob_text(
+        root, mnist_pin["git_blob"])
+    mnist_recorded = ComparisonSourceAttestation._git_blob_text(
+        root, mnist_pin["current"]["git_blob"])
+    mnist_current = read(joinpath(root, mnist_pin["path"]), String)
+    @test !mnist_model_source_preserves_published_authority(replace(
+        mnist_current,
+        "normal(0.0, 1.0).logpdf(coefficient)" =>
+            "normal(0.0, 2.0).logpdf(coefficient)",
+    ), mnist_published)
+    @test !mnist_model_source_preserves_published_authority(replace(
+        mnist_current,
+        "function evaluate_mnist_logistic_source(; model_only::Bool = false)" =>
+            "function evaluate_mnist_logistic_source_changed()",
+    ), mnist_published)
+    @test !mnist_model_source_matches_recorded_current(replace(
+        mnist_current,
+        "function evaluate_mnist_logistic_source(; model_only::Bool = false)" =>
+            "function evaluate_mnist_logistic_source_changed()",
+    ), mnist_recorded)
+    @test !mnist_model_source_matches_recorded_current(replace(
+        mnist_current,
+        "compose(_MNIST_LOGISTIC_OPTIMIZED_GRAPH_TEMPLATE[])" =>
+            "compose(_MNIST_LOGISTIC_GRAPH_TEMPLATE[])",
+    ), mnist_recorded)
+    @test !mnist_model_source_matches_recorded_current(replace(
+        mnist_current,
+        "const NUM_CLASSES = 10" => "const NUM_CLASSES = 11",
+    ), mnist_recorded)
+    @test !mnist_model_source_preserves_published_authority(replace(
+        mnist_current,
+        "    nonreference_logits = W * transpose(X) .+ b\n" =>
+            "    nonreference_logits = W * transpose(X) .+ b .+ 1.0\n",
+    ), mnist_recorded)
 
     eight_pin = TOML.parsefile(joinpath(
         _BENCH_DIR, "receipts", "eight-schools-ad-v2.toml"))["pins"]["model_source"]
-    published_eight = read(
-        `git -C $_BENCH_DIR show $(eight_pin["commit"]):$(eight_pin["path"])`, String)
-    current_eight = read(joinpath(dirname(_BENCH_DIR), eight_pin["path"]), String)
-    @test eight_schools_model_source_preserves_published_authority(
-        current_eight, published_eight)
-    @test !eight_schools_model_source_preserves_published_authority(
-        replace(current_eight, "@kernel model(" => "@kernel changed_model("),
-        published_eight)
+    eight_published = ComparisonSourceAttestation._git_blob_text(
+        root, eight_pin["git_blob"])
+    eight_current = read(joinpath(root, eight_pin["path"]), String)
+    @test !eight_schools_model_source_preserves_published_authority(replace(
+        eight_current,
+        "eight_schools-eight_schools_centered" => "eight_schools-changed_model",
+    ), eight_published)
+    @test !eight_schools_model_source_preserves_published_authority(replace(
+        eight_current,
+        "    posterior::Float64 = constrained_logdensity + log_jacobian\n" =>
+            "    posterior::Float64 = constrained_logdensity + 2.0 * log_jacobian\n",
+    ), eight_published)
+
+    sum_receipt = TOML.parsefile(joinpath(
+        _BENCH_DIR, "receipts", "sum-to-zero-native-v1.toml"))
+    sum_pin = sum_receipt["pins"]["model_source"]
+    @test isempty(historical_source_pin_errors(
+        root, sum_pin; commit = sum_receipt["pins"]["reactivekernels_sha"],
+        label = "sum-to-zero/model_source"))
+    sum_published = ComparisonSourceAttestation._git_blob_text(
+        root, sum_pin["git_blob"])
+    sum_current = read(joinpath(root, sum_pin["path"]), String)
+    @test sum_to_zero_model_source_preserves_published_authority(
+        sum_current, sum_published)
+    @test !sum_to_zero_model_source_preserves_published_authority(replace(
+        sum_current,
+        "    log_τ::Float64 = unconstrained[2]\n" =>
+            "    log_τ::Float64 = unconstrained[3]\n",
+    ), sum_published)
+    @test !sum_to_zero_model_source_preserves_published_authority(replace(
+        sum_current,
+        "    sum_to_zero_log_jacobian::Float64 = 0.0\n" =>
+            "    sum_to_zero_log_jacobian::Float64 = 1.0\n",
+    ), sum_published)
+
+    bad_history = Dict(mnist_pin)
+    bad_history["git_blob"] = "0"^40
+    @test "mnist-logistic-ad-v2.toml/model_source published Git blob mismatch" in
+        historical_source_pin_errors(root, bad_history;
+            label = "mnist-logistic-ad-v2.toml/model_source")
 
     published = "model prefix\nturing definition\nmanual definition\nrun_comparison()\n"
     guard = "get(ENV, \"DEFINITIONS_ONLY\", \"\") == \"1\" || run_comparison()\n"
     current = """
-model prefix
-# DOCS-BASELINE-BEGIN: turing
-turing definition
-# DOCS-BASELINE-END: turing
-# DOCS-BASELINE-BEGIN: manual
-manual definition
-# DOCS-BASELINE-END: manual
-$(guard)"""
+    model prefix
+    # DOCS-BASELINE-BEGIN: turing
+    turing definition
+    # DOCS-BASELINE-END: turing
+    # DOCS-BASELINE-BEGIN: manual
+    manual definition
+    # DOCS-BASELINE-END: manual
+    $(guard)"""
     @test comparator_source_matches_current_delta(current, published, guard)
     @test !comparator_source_matches_current_delta(
         replace(current, "# DOCS-BASELINE-END: manual\n" => ""),
@@ -267,6 +390,59 @@ end
     @test isfile(wren_receipt)
     @test isempty(validation.validate_mnist_logistic_ad_receipt(wren_receipt))
 
+    comparator_relative = "benchmark/mnist_logistic_comparison_body.jl"
+    model_relative =
+        "packages/ReactiveKernelsPPLExamples/src/mnist_logistic.jl"
+    original_comparator = read(joinpath(_REPOSITORY_ROOT, comparator_relative), String)
+    original_model = read(joinpath(_REPOSITORY_ROOT, model_relative), String)
+    fixture = _validator_fixture_root((
+        comparator_relative, model_relative,
+        "benchmark/receipts/mnist-logistic-primal-v3.toml"))
+    try
+        comparator_path = joinpath(fixture, comparator_relative)
+        model_path = joinpath(fixture, model_relative)
+        check() = validation.validate_mnist_logistic_ad_receipt(receipt; root = fixture)
+        @test isempty(check())
+        _reject_current_source_mutation(comparator_path,
+            text -> _replace_one_anchor(text,
+                "outcome == \"joint\" ? :density : Symbol(outcome)" =>
+                    "outcome == \"joint\" ? :prior : Symbol(outcome)"),
+            check)
+        _reject_current_source_mutation(model_path,
+            text -> _replace_one_anchor(
+                text, "const NUM_CLASSES = 10" => "const NUM_CLASSES = 11"),
+            check)
+        _reject_current_source_mutation(model_path,
+            text -> _replace_one_anchor(text,
+                "compose(_MNIST_LOGISTIC_OPTIMIZED_GRAPH_TEMPLATE[])" =>
+                    "compose(_MNIST_LOGISTIC_GRAPH_TEMPLATE[])"),
+            check)
+
+        function optimized_only_mutation(text)
+            marker = "# DOCS-BASELINE-BEGIN: turing-optimized\n"
+            pieces = split(text, marker; limit = 2)
+            length(pieces) == 2 || return nothing
+            from = "W ~ filldist(Normal(), C - 1, D)"
+            length(findall(from, pieces[1])) == 1 &&
+                length(findall(from, pieces[2])) == 1 || return nothing
+            pieces[1] * marker * replace(
+                pieces[2], from => "W ~ filldist(Normal(0, 2), C - 1, D)"; count = 1)
+        end
+        pin = TOML.parsefile(receipt)["pins"]["primal_comparator_source"]
+        published = read(`git -C $fixture cat-file blob $(pin["git_blob"])`, String)
+        guard = "get(ENV, \"RK_MNIST_DEFINITIONS_ONLY\", \"\") == \"1\" || run_comparison()\n"
+        optimized_only = optimized_only_mutation(read(comparator_path, String))
+        @test comparator_source_matches_current_delta(
+            optimized_only, published, guard)
+        _reject_current_source_mutation(comparator_path, optimized_only_mutation, check)
+    finally
+        @test read(joinpath(_REPOSITORY_ROOT, comparator_relative), String) ==
+            original_comparator
+        @test read(joinpath(_REPOSITORY_ROOT, model_relative), String) ==
+            original_model
+        rm(fixture; recursive = true, force = true)
+    end
+
     impossible_receipt = TOML.parsefile(wren_receipt)
     impossible_receipt["pins"]["primal_comparator_source"]["commit"] = "0"^40
     mktemp() do impossible_path, io
@@ -296,6 +472,33 @@ end
     @test isfile(receipt)
     validation = _load_benchmark_validator(validator)
     @test isempty(validation.validate_eight_schools_ad_receipt(receipt))
+
+    comparator_relative = "benchmark/eight_schools_primal_comparison_body.jl"
+    original_comparator = read(joinpath(_REPOSITORY_ROOT, comparator_relative), String)
+    model_relative = "packages/ReactiveKernelsPPLExamples/src/eight_schools.jl"
+    original_model = read(joinpath(_REPOSITORY_ROOT, model_relative), String)
+    fixture = _validator_fixture_root((
+        comparator_relative,
+        model_relative))
+    try
+        comparator_path = joinpath(fixture, comparator_relative)
+        check() = validation.validate_eight_schools_ad_receipt(receipt; root = fixture)
+        @test isempty(check())
+        _reject_current_source_mutation(comparator_path,
+            text -> _replace_one_anchor(text, "μ ~ Normal(0, 5)" => "μ ~ Normal(0, 2)"),
+            check)
+        _reject_current_source_mutation(comparator_path,
+            text -> _replace_one_anchor(text,
+                "outcome == \"joint\" ? :posterior : Symbol(outcome == \"prior\" ?" =>
+                    "outcome == \"joint\" ? :constrained_logdensity : Symbol(outcome == \"prior\" ?"),
+            check)
+    finally
+        @test read(joinpath(_REPOSITORY_ROOT, comparator_relative), String) ==
+            original_comparator
+        @test read(joinpath(_REPOSITORY_ROOT, model_relative), String) ==
+            original_model
+        rm(fixture; recursive = true, force = true)
+    end
 end
 
 @testset "Eight Schools Reactant benchmark receipt validates" begin

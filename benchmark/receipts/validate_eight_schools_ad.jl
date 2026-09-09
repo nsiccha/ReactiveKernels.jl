@@ -4,9 +4,11 @@ import SHA
 import Statistics
 import TOML
 
+include(joinpath(dirname(@__DIR__), "_comparison_source_attestation.jl"))
 isdefined(@__MODULE__, :EightSchoolsMatrixSpec) ||
     include(joinpath(dirname(@__DIR__), "eight_schools_matrix_spec.jl"))
 using .EightSchoolsMatrixSpec
+using .ComparisonSourceAttestation
 
 const EXPECTED_EIGHT_SCHOOLS_AD_CONFIGURATIONS = Tuple(
     configuration for configuration in EIGHT_SCHOOLS_RK_CONFIGURATIONS
@@ -17,6 +19,8 @@ const EXPECTED_EIGHT_SCHOOLS_AD_CONFIGURATIONS = Tuple(
 _eight_schools_ad_median(values) = Statistics.median(Float64.(values))
 _eight_schools_ad_text_sha256(path) = bytes2hex(SHA.sha256(
     replace(read(path, String), "\r\n" => "\n", "\r" => "\n")))
+const _EIGHT_SCHOOLS_COMPARATOR_DEFINITION_ONLY_GUARD =
+    "get(ENV, \"RK_EIGHT_SCHOOLS_DEFINITIONS_ONLY\", \"\") == \"1\" || run_comparison()\n"
 
 function validate_eight_schools_ad_receipt(
     path::AbstractString;
@@ -59,11 +63,36 @@ function validate_eight_schools_ad_receipt(
         pin = get(pins, key, Dict{String,Any}())
         require(get(pin, "path", "") == expected_path, "$key path mismatch")
         current = get(pin, "current", Dict{String,Any}())
+        require(get(current, "path", "") == expected_path,
+                "$key current path mismatch")
         absolute = joinpath(root, expected_path)
+        append!(errors, historical_source_pin_errors(root, pin; label = key))
+        append!(errors, recorded_current_source_pin_errors(
+            root, current; label = "$key recorded current"))
         require(isfile(absolute), "$key current source is missing")
-        isfile(absolute) && require(get(current, "text_sha256", "") ==
-            _eight_schools_ad_text_sha256(absolute),
-            "$key current text digest mismatch")
+        if isfile(absolute)
+            actual_current = read(absolute, String)
+            published = ComparisonSourceAttestation._git_blob_text(
+                root, String(get(pin, "git_blob", "")))
+            supported_delta = if key == "model_source"
+                recorded = ComparisonSourceAttestation._git_blob_text(
+                    root, String(get(current, "git_blob", "")))
+                eight_schools_model_source_preserves_published_authority(
+                    actual_current, published) &&
+                    eight_schools_model_source_matches_recorded_current(
+                        actual_current, recorded)
+            else
+                recorded = ComparisonSourceAttestation._git_blob_text(
+                    root, String(get(current, "git_blob", "")))
+                comparator_source_matches_current_delta(
+                    actual_current, published,
+                    _EIGHT_SCHOOLS_COMPARATOR_DEFINITION_ONLY_GUARD) &&
+                    ComparisonSourceAttestation._normalized_text(actual_current) ==
+                    ComparisonSourceAttestation._normalized_text(recorded)
+            end
+            require(supported_delta,
+                    "$key current source exceeds its supported delta")
+        end
     end
 
     protocol = receipt["protocol"]

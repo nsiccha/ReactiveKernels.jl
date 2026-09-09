@@ -64,6 +64,12 @@ site_pages = [
             "LDA (latent Dirichlet allocation, ldaK2/ldaK5)" => "lda.md",
             "Neural RBM softmax (nn_rbm1b J10/J100)" => "nn-rbm.md",
         ],
+        "Gaussian processes" => [
+            "GP regression (marginal)" => "gp-regr.md",
+            "GP Poisson regression (latent)" => "gp-pois-regr.md",
+            "Approximate GP (HSGP, distributional)" => "accel-gp.md",
+            "Hierarchical GP" => "hierarchical-gp.md",
+        ],
         "Declarative @ppl front-end + Gibbs (experimental)" => "ppl-front-end.md",
     ],
     "Automatic differentiation" => [
