@@ -31,7 +31,9 @@ end
     reference = _log10earn_height_reference(q, LOG10EARN_HEIGHT_HEIGHT, LOG10EARN_HEIGHT_EARN)
 
     @testset "authored on the current baseline surface" begin
-        @test occursin("normal(b1 + b2 * h, s).logpdf(ly)", LOG10EARN_HEIGHT_SOURCE)
+        @test occursin("mu = plate(height, beta1, beta2)", LOG10EARN_HEIGHT_SOURCE)
+        @test occursin("b1 + b2 * h", LOG10EARN_HEIGHT_SOURCE)
+        @test occursin("normal(m, s).logpdf(ly)", LOG10EARN_HEIGHT_SOURCE)
         @test occursin("sigma::Float64 = exp(log_sigma)", LOG10EARN_HEIGHT_SOURCE)
         @test occursin("log10_earn = plate(", LOG10EARN_HEIGHT_SOURCE)
         @test occursin("log10(e)", LOG10EARN_HEIGHT_SOURCE)
