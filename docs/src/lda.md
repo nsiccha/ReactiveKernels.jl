@@ -4,10 +4,10 @@ This example ports the `ldaK2` / `ldaK5` latent Dirichlet allocation models from
 [posteriordb](https://github.com/stan-dev/posteriordb) into the
 declarative-`@kernel` style, with the discrete per-word topic assignment
 marginalized analytically (a stable `log_sum_exp` over topics), exactly as the
-`.stan` model block writes it. The graph is **data-generic** — the topic count
-`K` and the two Dirichlet concentration vectors `alpha` (length `K`), `beta`
-(length `V`) are HAVE ports — so ONE authored source certifies **both**
-posteriordb definitions:
+`.stan` model block writes it. The graph is **data-generic**. Its HAVE ports are
+exactly `unconstrained`, `doc`, `w`, `alpha`, `beta`, and `M`; the concentration
+vectors carry the dimensions (`K = length(alpha)`, `V = length(beta)`), so ONE
+authored source certifies **both** posteriordb definitions:
 
 | posterior | dataset | V (vocab) | M (docs) | N (word instances) | K | unconstrained dim |
 |---|---|---|---|---|---|---|

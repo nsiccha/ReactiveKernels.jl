@@ -11,9 +11,10 @@ export LDA_SOURCE, evaluate_lda_source
 # topic assignment marginalized analytically per word (`log_sum_exp` over topics),
 # exactly as the .stan model block writes it. The two posteriordb models
 # (`three_men1-ldaK2`, `prideprejudice_chapter-ldaK5`) share ONE data-generic
-# graph: the topic count K and the two Dirichlet concentration vectors alpha (K),
-# beta (V) are HAVE ports (for ldaK2 alpha,beta are the .stan transformed-data
-# ones-vectors; for ldaK5 they are data), and doc, w, M are data. This module
+# graph. Its HAVE ports are exactly `unconstrained`, `doc`, `w`, `alpha`, `beta`,
+# and `M`: the concentration vectors carry the dimensions (K = length(alpha),
+# V = length(beta)); for ldaK2 alpha/beta are the .stan transformed-data
+# ones-vectors, while for ldaK5 they are data. This module
 # executes the graph on `three_men1` (K=2); the benchmark also binds
 # `prideprejudice_chapter` (K=5).
 #

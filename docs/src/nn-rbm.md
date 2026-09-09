@@ -38,14 +38,15 @@ why the whole-vector `categorical_logit` is used rather than the zero-reference
 `categorical_logit_ref`.
 
 The unconstrained vector is Stan's declaration order (matrices column-major):
-`(σ²_α, σ²_β, vec(α), vec(β), α₁, β₁)`. Only the two variances need a support
-transform (`σ² = exp(u)`, Jacobian `u` each); the weights are unconstrained
+`(u_α, u_β, vec(α), vec(β), α₁, β₁)`. The packed variance coordinates are
+`u_α` and `u_β`; each passes through `exp` to `σ²` and then `sqrt` to `σ`, with
+Jacobian `u_α + u_β`. The weights are unconstrained
 Normal. `to_vector(α) ~ Normal(0, σ_α)` and `to_vector(β) ~ Normal(0, σ_β)` are
 authored as whole-vector reductions (one normalization each), while `α₁`, `β₁`
 reuse the shared `normal` endpoint and the two variances reuse `inverse_gamma`.
 
 ```text
-unconstrained ─► σ²_α, σ²_β ─► exp ─► σ_α, σ_β ──────┐ (Jacobian: log σ²_α + log σ²_β)
+unconstrained ─► u_α, u_β ─► exp ─► σ²_α, σ²_β ─► sqrt ─► σ_α, σ_β ───┐ (Jacobian: u_α + u_β)
     │                                                ├─► log prior
     ├─► α, β, α₁, β₁ ──────────────────────────────┐ │
 x ──┴─► tanh(x·α + α₁) = H ─► [1; H·β + β₁] = v ────┼─┴─► categorical_logit(vₙ).logpdf(yₙ)
