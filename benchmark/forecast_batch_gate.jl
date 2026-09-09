@@ -16,11 +16,13 @@
 #   4. REACTANT GRADIENT — the Reactant-compiled gradient vs BridgeStan
 #                          (relative error < 2e-3), finite.
 #
-# Every axis is a hard `@assert`, so a regression exits nonzero. Graphs are built
-# from the REAL installed package's `build_*_graph` (each model's template is
-# evaluated MODEL-ONLY at module-load, a world boundary), then `prepare`d here at
-# top level (build->prepare->execute in one ordinary function per model), so no
-# world-age hazard arises. In-graph data preprocessing is exercised by binding
+# Every axis is a hard `@assert`, so a regression exits nonzero. Each case builds
+# its graph from the REAL installed package's `build_*_graph`, prepares it, and
+# executes it (the first `kb(q)`) ALL INSIDE the one ordinary `gate` function —
+# the graph is passed as a thunk `() -> build_*_graph()` and called there, not at
+# top level. Each model's template was evaluated MODEL-ONLY at package load (a
+# world boundary), so this is world-age-safe. In-graph data preprocessing is
+# exercised by binding
 # ONLY the raw data ports each model declares. This is the PUBLIC-package AD gate;
 # it is distinct from the package's committed native-oracle regression tests
 # (`test/runtests.jl`) and from the model-only import sentinel
@@ -58,7 +60,9 @@ if !DO_REACTANT
 end
 
 const PE = ReactiveKernelsPPLExamples
-const AE = AutoEnzyme(mode = Enzyme.Reverse, function_annotation = Enzyme.Const)
+# Ordinary reverse-mode Enzyme (no function_annotation), matching the package's
+# committed AD checks. Non-active model data travel through DI as constants.
+const AE = AutoEnzyme(mode = Enzyme.Reverse)
 
 const VALUE_TOL   = 1e-6     # native value vs Stan
 const GRAD_TOL    = 1e-3     # native plain-Enzyme gradient vs Stan
@@ -112,7 +116,7 @@ function reference_points(sm, dim, seed, name, npts, scale)
     pts
 end
 
-function gate(name; graph, have, bind, scale = 0.3, npts = 6, seed = 468,
+function gate(name; build, have, bind, scale = 0.3, npts = 6, seed = 468,
               do_reactant = true, boundary_point = nothing, altflag = nothing)
     println("\n########## $name ##########"); flush(stdout)
     if altflag === nothing
@@ -124,6 +128,12 @@ function gate(name; graph, have, bind, scale = 0.3, npts = 6, seed = 468,
     data = PosteriorDB.load(PosteriorDB.dataset(post))
     bound = bind(data)
     altflag === nothing || (bound = merge(bound, altflag.bind))   # RK uses the flipped flag too
+    # build -> prepare -> execute ALL inside this one ordinary function (the
+    # benchmark run_one shape): `build` is a thunk `() -> build_*_graph()`, so
+    # the graph is constructed here, not at top level. The templates were
+    # evaluated MODEL-ONLY at package load (a world boundary), so this is
+    # world-age-safe. The first `kb(q)` below is the execute.
+    graph = build()
     kb = prepare(graph; have, want = :posterior, bound = bound)
     dim = Int(BridgeStan.param_unc_num(sm))
     println("  q identity: dim=$dim scale=$scale seed=$seed npts=$npts"); flush(stdout)
@@ -147,17 +157,24 @@ function gate(name; graph, have, bind, scale = 0.3, npts = 6, seed = 468,
     println("  [1] native value   max_rel=$(round(max_v; sigdigits = 4))  (< $VALUE_TOL) PASS")
     println("  [2] native grad    max_rel=$(round(max_g; sigdigits = 4))  (< $GRAD_TOL) PASS"); flush(stdout)
 
-    # ---- support-boundary probe (where applicable) ----
-    if boundary_point !== nothing
-        qb = boundary_point(dim)
-        vb = kb(qb); gbnd = ReactiveKernels.ad_value_and_gradient!(prep, similar(qb), qb)[2]
-        @assert isfinite(vb) && all(isfinite, gbnd) "$name: boundary value/grad not finite"
-        @assert _relv(vb, sval(sm, qb)) < VALUE_TOL "$name: boundary value ≠ Stan"
-        @assert relerr(gbnd, sgrad(sm, qb)) < GRAD_TOL "$name: boundary gradient ≠ Stan"
-        println("  [b] support boundary value+grad finite and match Stan PASS"); flush(stdout)
+    # ---- stress probe (where supplied): reference validity FIRST ----
+    # The BridgeStan oracle must be value- AND gradient-finite at the probe
+    # before anything is claimed about the RK graph there — the same
+    # reference-validity selection rule as the random probes, applied to the
+    # deliberately extreme point.
+    stress_q = boundary_point === nothing ? nothing : boundary_point(dim)
+    if stress_q !== nothing
+        vsb = sval(sm, stress_q); gsb = sgrad(sm, stress_q)
+        @assert isfinite(vsb) && all(isfinite, gsb) "$name: stress-point BridgeStan reference not finite"
+        vb = kb(stress_q)
+        gbnd = ReactiveKernels.ad_value_and_gradient!(prep, similar(stress_q), stress_q)[2]
+        @assert isfinite(vb) && all(isfinite, gbnd) "$name: stress-point RK value/grad not finite"
+        @assert _relv(vb, vsb) < VALUE_TOL "$name: stress-point value ≠ Stan"
+        @assert relerr(gbnd, gsb) < GRAD_TOL "$name: stress-point gradient ≠ Stan"
+        println("  [b] stress-point (reference-valid) value+grad finite and match Stan PASS"); flush(stdout)
     end
 
-    do_reactant && _reactant_axes(name, kb, prep, sm, pts)
+    do_reactant && _reactant_axes(name, kb, prep, sm, pts, stress_q)
     _RAN[] += 1
     return
 end
@@ -176,13 +193,28 @@ else
     _reactant_axes(args...) = nothing
 end
 
-# None of the four forecasting models has a reachable support boundary in the
-# unconstrained parameterization: every constraining transform (exp for
-# positivity, the data-bounded logit level, the positive_ordered cumulative-exp
-# scales) maps every finite unconstrained input to a strictly-interior
-# constrained point, so there is no reference-finite / RK-nonfinite point to
-# force through the boundary probe. Reference-validity probe selection still
-# guards the general case.
+# Two INACTIVE-BRANCH STRESS probes are supplied (deliberately extreme points,
+# not ordinary support boundaries). The graph's eager `ifelse` evaluates BOTH
+# arms, so a naive transcription's unselected arm can overflow/underflow and
+# poison the reverse gradient while Stan — whose ternary selects lazily — stays
+# finite. Each stress probe establishes the Stan oracle's value+gradient
+# finiteness FIRST, then asserts ordinary-native and (in the Reactant process)
+# compiled-Reactant value+gradient parity:
+#   * losscurve (data growthmodel_id=1, Weibull selected): q₁=log(1000),
+#     q₂=log(max t_value) — at ω=1000 the unused log-logistic arm's
+#     t^ω/θ^ω overflows; the authored overflow-safe forms must stay finite.
+#   * accel_altflag (prior_only=1): all-zero q except the unconstrained
+#     Intercept_sigma at -800 — exp(-800) underflows the deselected
+#     likelihood's σ to 0; the guarded likelihood scale must stay finite.
+# No FURTHER boundary_point is supplied: none of the four models carries a
+# SEPARATE hard prior-support restriction in the tested modes beyond the
+# ordinary constraining transforms (exp for positivity, the data-bounded logit
+# level, the positive_ordered cumulative-exp scales). This is NOT a claim that
+# every finite Float64 q maps strictly interior (exp overflow/underflow and
+# logistic saturation exist). Correctness at the sampled points is what the gate
+# asserts; reference-validity probe selection (never RK finiteness) still guards
+# the general case, so a Stan-finite / RK-nonfinite point would survive and
+# hard-fail.
 
 const KNOWN_MODELS = ("losscurve", "accel", "state_space", "prophet",
                       "losscurve_altflag", "accel_altflag")
@@ -200,17 +232,26 @@ const _RAN = Ref(0)
 # indices + the growthmodel_id flag (in-graph flag-selected growth factor) + the
 # premium/loss/t_value data; the unconstrained parameter vector stays free.
 _want("losscurve") && gate("loss_curves-losscurve_sislob";
-    graph = PE.LosscurveSislobExample.build_losscurve_sislob_graph(),
+    build = () -> PE.LosscurveSislobExample.build_losscurve_sislob_graph(),
     have = (:unconstrained, :growthmodel_id, :cohort_id, :t_idx, :t_value, :premium, :loss),
     bind = d -> (growthmodel_id = Int(d["growthmodel_id"]), cohort_id = Int.(d["cohort_id"]),
                  t_idx = Int.(d["t_idx"]), t_value = Float64.(d["t_value"]),
                  premium = Float64.(d["premium"]), loss = Float64.(d["loss"])),
+    boundary_point = dim -> begin
+        # Inactive-branch stress: ω=1000, θ=max(t_value) keeps the SELECTED
+        # Weibull arm bounded ((t/θ)^ω ≤ 1) while the unused log-logistic arm
+        # would overflow in the naive t^ω/θ^ω transcription.
+        q = zeros(dim)
+        q[1] = log(1000.0)
+        q[2] = log(maximum(PE.LosscurveSislobExample.LOSSCURVE_T_VALUE))
+        q
+    end,
     scale = 0.3, do_reactant = DO_REACTANT)
 
 # accel_splines — brms penalized-spline regression; bind the response + the four
 # design/basis matrices (in-graph matrix-vector products) + the prior_only flag.
 _want("accel") && gate("mcycle_splines-accel_splines";
-    graph = PE.AccelSplinesExample.build_accel_splines_graph(),
+    build = () -> PE.AccelSplinesExample.build_accel_splines_graph(),
     have = (:unconstrained, :Y, :Xs, :Zs_1_1, :Xs_sigma, :Zs_sigma_1_1, :prior_only),
     bind = d -> (Y = Float64.(d["Y"]), Xs = _mat(d["Xs"]), Zs_1_1 = _mat(d["Zs_1_1"]),
                  Xs_sigma = _mat(d["Xs_sigma"]), Zs_sigma_1_1 = _mat(d["Zs_sigma_1_1"]),
@@ -221,7 +262,7 @@ _want("accel") && gate("mcycle_splines-accel_splines";
 # level transform, positive_ordered scales, random-walk level and trailing-window
 # seasonal are all derived in-graph).
 _want("state_space") && gate("uk_drivers-state_space_stochastic_level_stochastic_seasonal";
-    graph = PE.StateSpaceStochasticExample.build_state_space_stochastic_graph(),
+    build = () -> PE.StateSpaceStochasticExample.build_state_space_stochastic_graph(),
     have = (:unconstrained, :y, :x, :w),
     bind = d -> (y = Float64.(d["y"]), x = Float64.(d["x"]), w = Float64.(d["w"])),
     scale = 0.2, do_reactant = DO_REACTANT)
@@ -231,7 +272,7 @@ _want("state_space") && gate("uk_drivers-state_space_stochastic_level_stochastic
 # are derived in-graph). LINEAR trend only (build_prophet_graph validates the
 # trend flag); the logistic mode is not part of the graph.
 _want("prophet") && gate("rstan_downloads-prophet";
-    graph = PE.ProphetExample.build_prophet_graph(),
+    build = () -> PE.ProphetExample.build_prophet_graph(),
     have = (:unconstrained, :t, :t_change, :X, :sigmas, :tau, :s_a, :s_m, :y),
     bind = d -> (t = Float64.(d["t"]), t_change = Float64.(d["t_change"]), X = _mat(d["X"]),
                  sigmas = Float64.(d["sigmas"]), tau = Float64(d["tau"]),
@@ -246,7 +287,7 @@ _want("prophet") && gate("rstan_downloads-prophet";
 # check that the eagerly-evaluated-but-unselected branch does not poison the
 # reverse gradient.
 _want("losscurve_altflag") && gate("loss_curves-losscurve_sislob";
-    graph = PE.LosscurveSislobExample.build_losscurve_sislob_graph(),
+    build = () -> PE.LosscurveSislobExample.build_losscurve_sislob_graph(),
     have = (:unconstrained, :growthmodel_id, :cohort_id, :t_idx, :t_value, :premium, :loss),
     bind = d -> (growthmodel_id = Int(d["growthmodel_id"]), cohort_id = Int.(d["cohort_id"]),
                  t_idx = Int.(d["t_idx"]), t_value = Float64.(d["t_value"]),
@@ -256,13 +297,22 @@ _want("losscurve_altflag") && gate("loss_curves-losscurve_sislob";
     scale = 0.3, do_reactant = DO_REACTANT)
 
 _want("accel_altflag") && gate("mcycle_splines-accel_splines";
-    graph = PE.AccelSplinesExample.build_accel_splines_graph(),
+    build = () -> PE.AccelSplinesExample.build_accel_splines_graph(),
     have = (:unconstrained, :Y, :Xs, :Zs_1_1, :Xs_sigma, :Zs_sigma_1_1, :prior_only),
     bind = d -> (Y = Float64.(d["Y"]), Xs = _mat(d["Xs"]), Zs_1_1 = _mat(d["Zs_1_1"]),
                  Xs_sigma = _mat(d["Xs_sigma"]), Zs_sigma_1_1 = _mat(d["Zs_sigma_1_1"]),
                  prior_only = Int(d["prior_only"])),
     altflag = (regex = r"\"prior_only\"\s*:\s*\d+", replacement = "\"prior_only\": 1",
                bind = (; prior_only = 1)),
+    boundary_point = dim -> begin
+        # Inactive-branch stress: prior_only=1 deselects the likelihood, but the
+        # eager obs term still evaluates it — an all-zero q except the
+        # unconstrained Intercept_sigma at -800 underflows σ=exp(-800) to 0.
+        q = zeros(dim)
+        q[3 + size(PE.AccelSplinesExample.ACCEL_XS, 2) +
+              size(PE.AccelSplinesExample.ACCEL_ZS_1_1, 2)] = -800.0
+        q
+    end,
     scale = 0.3, do_reactant = DO_REACTANT)
 
 @assert _RAN[] == length(SEL) "$(_RAN[]) gate(s) ran but $(length(SEL)) were selected"
@@ -279,4 +329,6 @@ end
 const _PHASE = DO_REACTANT ?
     "all FOUR parts (native value+grad, Reactant primal+grad)" :
     "the TWO native parts (Reactant UNLOADED; parts 3-4 deferred to a FORECAST_REACTANT=1 run)"
-println("\n== forecast_batch_gate: $(_RAN[]) model(s) [$(join(SEL, ", "))] PASSED $_PHASE =="); flush(stdout)
+println("\n== forecast_batch_gate: $(_RAN[]) case(s) [$(join(SEL, ", "))] PASSED $_PHASE ==")
+println("   (native = 6 reference-valid probes/case, plus the reference-valid stress probe where supplied;")
+println("    Reactant axes = first probe, plus the stress probe where supplied)"); flush(stdout)

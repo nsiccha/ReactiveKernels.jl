@@ -30,7 +30,7 @@ A_{ij} &= \mathbf{1}\{t_i \ge t\_change_j\} \quad (\text{data-only changepoint i
 \text{trend} &= (k + A\,\delta)\odot t + \big(m + A\,(-t\_change \odot \delta)\big), \\
 \mu &= \text{trend} \odot \big(1 + X(\beta\odot s_m)\big) + X(\beta\odot s_a), \qquad y_i \sim \operatorname{Normal}(\mu_i, \sigma\_obs), \\
 k, m &\sim \operatorname{Normal}(0, 5), \quad \delta \sim \operatorname{DoubleExponential}(0, \tau), \\
-\sigma\_obs &\sim \operatorname{Normal}(0, 0.5), \quad \beta_j \sim \operatorname{Normal}(0, \sigma s_j).
+\sigma\_obs &\sim \operatorname{Normal}(0, 0.5), \quad \beta_j \sim \operatorname{Normal}(0, sigmas[j]).
 \end{aligned}
 ```
 
@@ -55,7 +55,11 @@ boundary with value and gradient parity — `benchmark/forecast_batch_gate.jl`
 `@compile`s both the primal and the gradient and asserts they match the native
 evaluation and the reference `.stan` (via BridgeStan). The changepoint-incidence
 comparison-mask matvec, the trend/seasonality, and the reused `normal`/`laplace`
-endpoints all lower cleanly.
+endpoints all lower cleanly. Parity is asserted at the gate's tested
+reference-valid probe points — six native probes per case, Reactant axes at the
+first probe — on the gate's pinned `benchmark/all80-env` toolchain (BridgeStan
+2.9 / Stan 2.39, Reactant, Enzyme and DifferentiationInterface as resolved
+there); it is a tested-point result, not a claim over every finite input.
 
 Run the walkthrough from the repository root:
 

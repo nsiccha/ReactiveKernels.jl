@@ -29,6 +29,7 @@ end
 
 const LOSSCURVE_SISLOB_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, lognormal
+using LogExpFunctions: log1pexp
 
 @kernel model(unconstrained::Vector{Float64},
               growthmodel_id::Int,
@@ -66,10 +67,17 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, logn
     # In-graph growth-factor transform, per development time. The `growthmodel_id`
     # data flag stays a live bound port and selects Weibull (id == 1) or
     # log-logistic per cell; both closed forms are authored, so no branch is
-    # silently specialized away.
+    # silently specialized away. BOTH forms are written so the eagerly evaluated
+    # but UNSELECTED branch cannot poison the reverse gradient of the selected
+    # branch at extreme omega (measured at omega=1000, theta=max(t_value)):
+    # Weibull's `(t/theta)^omega` stays <= 1 through the data there, and
+    # log-logistic is the algebraically-equal `1/(1 + (theta/t)^omega)` written
+    # as `exp(-log1pexp(omega*log(theta/t)))` — the naive ratio form overflows
+    # `(theta/t)^omega` to Inf, whose forward reciprocal stays finite but whose
+    # REVERSE chain rule produces 0*Inf = NaN adjoints.
     gf_weibull::Vector{Float64} = 1.0 .- exp.(-(t_value ./ theta) .^ omega)
     gf_loglogistic::Vector{Float64} =
-        (t_value .^ omega) ./ ((t_value .^ omega) .+ theta ^ omega)
+        exp.(-log1pexp.(omega .* log.(theta ./ t_value)))
     gf::Vector{Float64} = ifelse.(growthmodel_id == 1, gf_weibull, gf_loglogistic)
 
     # Per-datum expected loss lmᵢ = LR[cohortᵢ] · premium[cohortᵢ] · gf[timeᵢ].

@@ -100,7 +100,14 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, stud
                      Intercept_sigma_prior + zs_sigma_1_1_prior + sds_sigma_1_1_prior
 
     # Likelihood: Yᵢ ~ Normal(muᵢ, sigmaᵢ), gated by the `prior_only` data flag.
-    obs_pointwise = plate(Y, mu, sigma) do y, m, s
+    # The `ifelse` below evaluates the obs branch EAGERLY, so guard the likelihood
+    # scale: when prior_only=1 selects the likelihood away, a saturating linear
+    # predictor can drive sigma → 0 (underflow), making `normal(·, 0).logpdf` NaN
+    # and poisoning the reverse gradient of the unselected branch. `sigma_ll` is
+    # exactly `sigma` when the likelihood is active (prior_only=0), and a harmless
+    # constant when it is not — keeping the eagerly-evaluated obs term finite.
+    sigma_ll::Vector{Float64} = ifelse.(prior_only == 0, sigma, 1.0)
+    obs_pointwise = plate(Y, mu, sigma_ll) do y, m, s
         normal(m, s).logpdf(y)
     end
     obs_ll::Float64 = sum(obs_pointwise)

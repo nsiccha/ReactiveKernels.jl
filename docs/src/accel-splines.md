@@ -29,7 +29,12 @@ Intercept_sigma, bs_sigma, zs_sigma_1_1[1..38], log sds_sigma_1_1)`; only the tw
 spline standard deviations carry an exp support transform (summed log-Jacobian).
 The mean and log-scale linear predictors are in-graph data→parameter
 transformations (design-matrix products). The `prior_only` flag stays a live
-bound port gating the likelihood (`ifelse(prior_only == 0, obs_ll, 0.0)`).
+bound port gating the likelihood (`ifelse(prior_only == 0, obs_ll, 0.0)`); the
+eagerly evaluated likelihood uses a guarded scale (`sigma_ll`, exactly `sigma`
+when the likelihood is active and a harmless constant otherwise), so the
+deselected-but-computed obs term stays finite even when the log-scale linear
+predictor saturates — the committed gate probes that with the unconstrained
+`Intercept_sigma` at `-800` under `prior_only = 1`.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_ppl_example(
@@ -44,7 +49,14 @@ The exact authored graph compiles and executes through the public Reactant
 boundary with value and gradient parity — `benchmark/forecast_batch_gate.jl`
 `@compile`s both the primal and the gradient and asserts they match the native
 evaluation and the reference `.stan` (via BridgeStan). The design-matrix
-products and reused `normal`/`student_t` endpoints all lower cleanly.
+products and reused `normal`/`student_t` endpoints all lower cleanly. Parity is
+asserted at the gate's tested reference-valid probe points — six native probes
+per case, plus the alternate-flag (`prior_only = 1`) case with its
+`Intercept_sigma = -800` stress probe, with the Reactant axes at the first probe
+and the stress probe — on the gate's pinned `benchmark/all80-env` toolchain
+(BridgeStan 2.9 / Stan 2.39, Reactant, Enzyme and DifferentiationInterface as
+resolved there); it is a tested-point result, not a claim over every finite
+input.
 
 Run the walkthrough from the repository root:
 
