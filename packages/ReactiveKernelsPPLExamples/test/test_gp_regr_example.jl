@@ -49,7 +49,7 @@ end
         @test posterior ≈ log_prior + likelihood + log_jacobian
     end
 
-    @testset "constrained parameters from a constrained HAVE prune the density" begin
+    @testset "an unconstrained HAVE exposes constrained parameters" begin
         params = prepare(model; have = :unconstrained, want = :parameters)([1.0, 0.5, -0.5])
         @test params isa NamedTuple
         @test params.rho ≈ exp(1.0)

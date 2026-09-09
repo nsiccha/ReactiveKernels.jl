@@ -26,18 +26,33 @@ function reactant_axes(name, kb_r, prep_r, sm, pts, reactant_runtime; chol_grad_
         # fails with EXACTLY one of those adjoint diagnostics — a regression to a
         # different failure, or a silent fix, trips this and the gate (and this
         # flag) must be updated.
-        ok = false; msg = ""
+        ok = false; msg = ""; artifact = ""
         try
             Reactant.@compile sync = true ReactiveKernels.ad_value_and_gradient!(prep_r, gb, rq, rrt...)
             ok = true
         catch e
             msg = sprint(showerror, e)
+            backtrace = catch_backtrace()
+            safe_name = replace(name, r"[^A-Za-z0-9_.-]" => "_")
+            artifact = joinpath(ADJOINT_ERROR_DIR,
+                "missing_adjoint_$(safe_name)_$(getpid()).log")
+            open(artifact, "w") do io
+                println(io, "model = ", name)
+                println(io, "operation = Reactant.@compile ReactiveKernels.ad_value_and_gradient!")
+                println(io, "julia = ", Base.VERSION)
+                println(io, "q = ", repr(q))
+                println(io, "reactant_runtime = ", repr(reactant_runtime))
+                println(io, "exception = ", typeof(e))
+                println(io, "complete exception and caught backtrace follow")
+                println(io, sprint(showerror, e, backtrace))
+            end
         end
         @assert !ok "$name: Reactant gradient of the Cholesky now COMPILES — the known gap (snag reactant-compile-f877fcfd) appears fixed; hard-assert it against Stan and clear chol_grad_gap."
         known = occursin("adjoint", msg) && (occursin("triangular_solve", msg) || occursin("cholesky", msg))
-        @assert known "$name: Reactant gradient failed with an UNEXPECTED error (not the known missing Cholesky-primitive adjoint, snag reactant-compile-f877fcfd): $(first(msg, 400))"
+        @assert known "$name: Reactant gradient failed with an UNEXPECTED error (not the known missing Cholesky-primitive adjoint, snag reactant-compile-f877fcfd); complete evidence: $artifact"
         prim = occursin("triangular_solve", msg) ? "stablehlo.triangular_solve" : "stablehlo.cholesky"
-        println("  [4] Reactant grad: KNOWN GAP confirmed — no adjoint for $prim (snag reactant-compile-f877fcfd)"); flush(stdout)
+        push!(REACTANT_GRADIENT_UNSUPPORTED, name)
+        println("  [4] Reactant grad: UNSUPPORTED (KNOWN GAP) — no adjoint for $prim; complete exception/backtrace artifact: $artifact"); flush(stdout)
     else
         gc = Reactant.@compile sync = true ReactiveKernels.ad_value_and_gradient!(prep_r, gb, rq, rrt...)
         _, rg = gc(prep_r, gb, rq, rrt...)

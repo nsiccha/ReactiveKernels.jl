@@ -19,13 +19,18 @@ Each GP is the basis expansion
 s_m = \operatorname{sdgp}^2 \sqrt{2\pi}\,\ell \, \exp\!\big(-\tfrac{1}{2}\ell^2 \lambda_m^2\big),
 ```
 
-where `X` are the Laplacian eigenfunctions and `√λ` the eigenvalues (the brms
-`spd_cov_exp_quad`, `D = 1`). The mean is `μ = Intercept + gp₁`, the standard
+where `X` are the Laplacian eigenfunctions and `√λ` are the square roots of the
+Laplacian eigenvalues (the brms `spd_cov_exp_quad`, `D = 1`). The mean is
+`μ = Intercept + gp₁`, the standard
 deviation `σ = exp(Intercept_σ + gp_σ)`, and `Y ~ Normal(μ, σ)`. The four
 positive scale parameters (`sdgp`, `lscale` on each GP) use Stan's `log`
 transform with its exact Jacobian; the priors reuse the shared `student_t`
 (intercepts, half-Student-t marginal SDs), `inverse_gamma` (length-scales), and
 `normal` (latent coefficients) endpoints.
+The Stan `prior_only` 0/1 data flag is validated at raw-data entry and exposed
+through `accel_gp_posterior_want`. Its strict Boolean argument selects
+`:prior_only_posterior` (the prior and Jacobian only; planning that node does
+not compute the likelihood) or the likelihood-including `:posterior`.
 
 ```text
 unconstrained ──► Intercept, sdgp, lscale, zgp (×2, mean + log-sd) ──► spectral density s

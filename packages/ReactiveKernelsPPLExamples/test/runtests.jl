@@ -23,6 +23,7 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     MNISTLogisticExample, MVNormalRegressionExample, BoundRegressionExample
 using Test
 
+include("test_gp_first_use.jl")
 include("test_startup_initialization.jl")
 include("test_ppl_workflow.jl")
 include("test_eight_schools_example.jl")

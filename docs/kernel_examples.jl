@@ -381,7 +381,7 @@ function setup_accel_gp!(mod::Module)
     end
     Core.eval(mod, :(using .AccelGPExample:
         ACCEL_GP_Y, ACCEL_GP_XGP, ACCEL_GP_SLAMBDA,
-        ACCEL_GP_XGP_SIGMA, ACCEL_GP_SLAMBDA_SIGMA))
+        ACCEL_GP_XGP_SIGMA, ACCEL_GP_SLAMBDA_SIGMA, ACCEL_GP_PRIOR_ONLY))
     nothing
 end
 

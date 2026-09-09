@@ -1,10 +1,15 @@
 using ReactiveKernelsPPLExamples.AccelGPExample
+using ReactiveKernels
+using DifferentiationInterface
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, student_t, inverse_gamma
+import Enzyme
 using SpecialFunctions: loggamma
+
+const ACCEL_PLAIN_REVERSE = AutoEnzyme(mode = Enzyme.Reverse)
 
 # Graph-independent reference oracle for posteriordb accel_gp (brms HSGP,
 # distributional: latent GP on the mean and on the log-sd of a Normal response).
-function _accel_gp_reference(q, Y, XGP, SLAM, XGPS, SLAMS)
+function _accel_gp_reference(q, Y, XGP, SLAM, XGPS, SLAMS; prior_only::Bool = false)
     _t(x, nu, loc, sc) = loggamma((nu + 1) / 2) - loggamma(nu / 2) - 0.5 * log(nu * π) -
                          ((nu + 1) / 2) * log1p(((x - loc) / sc)^2 / nu) - log(sc)
     _ig(x, sh, sc) = sh * log(sc) - loggamma(sh) - (sh + 1) * log(x) - sc / x
@@ -22,7 +27,10 @@ function _accel_gp_reference(q, Y, XGP, SLAM, XGPS, SLAMS)
                 _t(intercept_s, 3, 0, 10) + (_t(sdgp_s, 3, 0, 36) - log(0.5)) +
                 _ig(lscale_s, 1.124909, 0.0177) + sum(_n.(zgp_s, 0.0, 1.0))
     likelihood = sum(_n.(Y, mu, sigma))
-    (; log_prior, likelihood, log_jacobian, posterior = log_prior + likelihood + log_jacobian)
+    constrained = log_prior + ifelse(prior_only, 0.0, likelihood)
+    prior_only_posterior = log_prior + log_jacobian
+    (; log_prior, likelihood, log_jacobian,
+       posterior = constrained + log_jacobian, prior_only_posterior)
 end
 
 @testset "PPL graph — accel_gp (posteriordb HSGP)" begin
@@ -32,6 +40,17 @@ end
     @test artifact.normal_object === normal
     @test artifact.student_t_object === student_t
     @test artifact.inverse_gamma_object === inverse_gamma
+
+    @testset "raw-data boundary exposes Stan's data switch" begin
+        @test ACCEL_GP_PRIOR_ONLY === false
+        @test accel_gp_posterior_want(false) === :posterior
+        @test accel_gp_posterior_want(true) === :prior_only_posterior
+        @test_throws MethodError accel_gp_posterior_want(2)
+        @test AccelGPExample._accel_gp_slambda_vector(
+            :probe, reshape([1.0, 2.0, 3.0], 3, 1)) == [1.0, 2.0, 3.0]
+        @test_throws ErrorException AccelGPExample._accel_gp_slambda_vector(
+            :probe, [1.0 2.0; 3.0 4.0])
+    end
 
     @testset "authored on the reusable-endpoint surface" begin
         @test occursin("student_t(3.0, -13.0, 36.0).logpdf(intercept)", ACCEL_GP_SOURCE)
@@ -48,10 +67,12 @@ end
         q[1] = -13.0
         ref = _accel_gp_reference(q, AccelGPExample.ACCEL_GP_Y, AccelGPExample.ACCEL_GP_XGP,
                                   AccelGPExample.ACCEL_GP_SLAMBDA, AccelGPExample.ACCEL_GP_XGP_SIGMA,
-                                  AccelGPExample.ACCEL_GP_SLAMBDA_SIGMA)
+                                  AccelGPExample.ACCEL_GP_SLAMBDA_SIGMA;
+                                  prior_only = ACCEL_GP_PRIOR_ONLY)
         log_prior, likelihood, log_jacobian, posterior =
             prepare(model;
-                have = (:unconstrained, :Y, :Xgp_1, :slambda_1, :Xgp_sigma_1, :slambda_sigma_1),
+                have = (:unconstrained, :Y, :Xgp_1, :slambda_1, :Xgp_sigma_1,
+                        :slambda_sigma_1),
                 want = (:log_prior, :likelihood, :log_jacobian, :posterior),
                 bound = (; Y = AccelGPExample.ACCEL_GP_Y, Xgp_1 = AccelGPExample.ACCEL_GP_XGP,
                     slambda_1 = AccelGPExample.ACCEL_GP_SLAMBDA,
@@ -62,5 +83,53 @@ end
         @test log_jacobian ≈ ref.log_jacobian
         @test posterior ≈ ref.posterior
         @test posterior ≈ log_prior + likelihood + log_jacobian
+    end
+
+    @testset "prior_only=true controls value and plain-reverse gradient" begin
+        q = vcat([-13.0, 0.5, -1.9], zeros(size(AccelGPExample.ACCEL_GP_XGP, 2)),
+                 [0.0, 0.0, -1.9], zeros(size(AccelGPExample.ACCEL_GP_XGP_SIGMA, 2)))
+        Yalt = reverse(AccelGPExample.ACCEL_GP_Y) .+ 0.25
+
+        function value_gradient(Y, prior_only::Bool, probe = q)
+            kb = prepare(model;
+                have = (:unconstrained, :Y, :Xgp_1, :slambda_1, :Xgp_sigma_1,
+                        :slambda_sigma_1),
+                want = accel_gp_posterior_want(prior_only),
+                bound = (; Y, Xgp_1 = AccelGPExample.ACCEL_GP_XGP,
+                    slambda_1 = AccelGPExample.ACCEL_GP_SLAMBDA,
+                    Xgp_sigma_1 = AccelGPExample.ACCEL_GP_XGP_SIGMA,
+                    slambda_sigma_1 = AccelGPExample.ACCEL_GP_SLAMBDA_SIGMA))
+            ad = ReactiveKernels.prepare_ad(kb, ACCEL_PLAIN_REVERSE, probe;
+                                            active = :unconstrained)
+            ReactiveKernels.ad_value_and_gradient!(ad, similar(probe), probe)
+        end
+
+        ref0 = _accel_gp_reference(q, AccelGPExample.ACCEL_GP_Y,
+            AccelGPExample.ACCEL_GP_XGP, AccelGPExample.ACCEL_GP_SLAMBDA,
+            AccelGPExample.ACCEL_GP_XGP_SIGMA, AccelGPExample.ACCEL_GP_SLAMBDA_SIGMA;
+            prior_only = false)
+        ref1 = _accel_gp_reference(q, Yalt, AccelGPExample.ACCEL_GP_XGP,
+            AccelGPExample.ACCEL_GP_SLAMBDA, AccelGPExample.ACCEL_GP_XGP_SIGMA,
+            AccelGPExample.ACCEL_GP_SLAMBDA_SIGMA; prior_only = true)
+        v0, g0 = value_gradient(AccelGPExample.ACCEL_GP_Y, false)
+        v1, g1 = value_gradient(AccelGPExample.ACCEL_GP_Y, true)
+        _, g1_alt = value_gradient(Yalt, true)
+
+        @test isfinite(v0) && all(isfinite, g0)
+        @test v0 ≈ ref0.posterior
+        @test isfinite(v1) && all(isfinite, g1)
+        @test v1 ≈ ref1.prior_only_posterior
+        @test v1 != v0
+        @test g1 ≈ g1_alt
+
+        q_stress = copy(q)
+        q_stress[4 + size(AccelGPExample.ACCEL_GP_XGP, 2)] = -800.0
+        ref_stress = _accel_gp_reference(q_stress, AccelGPExample.ACCEL_GP_Y,
+            AccelGPExample.ACCEL_GP_XGP, AccelGPExample.ACCEL_GP_SLAMBDA,
+            AccelGPExample.ACCEL_GP_XGP_SIGMA, AccelGPExample.ACCEL_GP_SLAMBDA_SIGMA;
+            prior_only = true)
+        v_stress, g_stress = value_gradient(AccelGPExample.ACCEL_GP_Y, true, q_stress)
+        @test isfinite(v_stress) && all(isfinite, g_stress)
+        @test v_stress ≈ ref_stress.prior_only_posterior
     end
 end

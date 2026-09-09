@@ -5,8 +5,10 @@ using ..ReactiveKernelsPPLExamples: _evaluate_ppl_source, _posteriordb_data
 
 export ACCEL_GP_Y, ACCEL_GP_XGP, ACCEL_GP_SLAMBDA
 export ACCEL_GP_XGP_SIGMA, ACCEL_GP_SLAMBDA_SIGMA
+export ACCEL_GP_PRIOR_ONLY
 export build_accel_gp_graph, demo
 export ACCEL_GP_SOURCE, evaluate_accel_gp_source
+export accel_gp_posterior_want
 
 # posteriordb `mcycle_gp-accel_gp` — the `brms`-generated Hilbert-space
 # approximate GP (HSGP) for the motorcycle-acceleration data: a distributional
@@ -16,14 +18,33 @@ export ACCEL_GP_SOURCE, evaluate_accel_gp_source
 # Laplacian eigenvalues — so there is no covariance matrix and no Cholesky, only
 # dense matrix-vector products. Real full data via PosteriorDB.jl.
 # PosteriorDB.load already returns the Stan `matrix[N, NB]` design blocks as
-# N×NB `Matrix{Float64}` and the `array[NB] vector[1]` √-eigenvalues as an NB×1
-# matrix; take them as-is and flatten the single eigenvalue column to a vector.
+# N×NB `Matrix{Float64}` and the `array[NB] vector[Dgp]` √-eigenvalues as an
+# NB×Dgp matrix. The source below implements brms's scalar one-dimensional HSGP
+# spectral density, so reject a multi-dimensional eigenvalue table at the raw
+# data boundary instead of silently flattening away dimensions Dgp > 1.
+function _accel_gp_slambda_vector(name::Symbol, value)
+    value isa AbstractMatrix ||
+        error("$name must be an NB×Dgp eigenvalue matrix")
+    dgp = size(value, 2)
+    dgp == 1 || error(
+        "$name has Dgp=$dgp; this accel_gp source supports only Dgp=1 (the full real posterior)",
+    )
+    vec(Float64.(value))
+end
+
 let d = _posteriordb_data("mcycle_gp-accel_gp")
     global const ACCEL_GP_Y = Float64.(d["Y"])
     global const ACCEL_GP_XGP = Matrix{Float64}(d["Xgp_1"])                  # N × NBgp_1
-    global const ACCEL_GP_SLAMBDA = vec(Float64.(d["slambda_1"]))           # NBgp_1 √eigenvalues
+    global const ACCEL_GP_SLAMBDA =
+        _accel_gp_slambda_vector(:slambda_1, d["slambda_1"])                # NBgp_1 √eigenvalues
     global const ACCEL_GP_XGP_SIGMA = Matrix{Float64}(d["Xgp_sigma_1"])     # N × NBgp_sigma_1
-    global const ACCEL_GP_SLAMBDA_SIGMA = vec(Float64.(d["slambda_sigma_1"]))
+    global const ACCEL_GP_SLAMBDA_SIGMA =
+        _accel_gp_slambda_vector(:slambda_sigma_1, d["slambda_sigma_1"])
+    prior_only_int = Int(d["prior_only"])
+    prior_only_int in (0, 1) || error(
+        "accel_gp prior_only must be 0 or 1, got $prior_only_int",
+    )
+    global const ACCEL_GP_PRIOR_ONLY = prior_only_int == 1
 end
 
 const ACCEL_GP_SOURCE = raw"""
@@ -103,7 +124,11 @@ end
     log_prior::Float64 = prior_intercept + prior_sdgp_1 + prior_lscale_1 + prior_zgp_1 +
                          prior_intercept_s + prior_sdgp_s + prior_lscale_s + prior_zgp_s
 
-    # Likelihood: Yₙ ~ Normal(muₙ, sigmaₙ) (brms `!prior_only` branch).
+    # Likelihood: Yₙ ~ Normal(muₙ, sigmaₙ). Stan's `if (!prior_only)` controls
+    # whether its sum enters the target. Author the two outcomes as selectable
+    # nodes instead of a data-dependent `if` (unsupported in @kernel): planning
+    # `:prior_only_posterior` stops at the prior/Jacobian and does not compute
+    # this likelihood recipe, exactly matching Stan's skipped branch.
     pointwise = plate(Y, mu, sigma) do y, m, s
         normal(m, s).logpdf(y)
     end
@@ -111,6 +136,7 @@ end
 
     constrained_logdensity::Float64 = log_prior + likelihood
     posterior::Float64 = constrained_logdensity + log_jacobian
+    prior_only_posterior::Float64 = log_prior + log_jacobian
     return posterior
 end
 
@@ -122,15 +148,17 @@ slambda_1 = ACCEL_GP_SLAMBDA
 Xgp_sigma_1 = ACCEL_GP_XGP_SIGMA
 slambda_sigma_1 = ACCEL_GP_SLAMBDA_SIGMA
 
-requested_nodes = (:parameters, :log_prior, :likelihood, :log_jacobian, :posterior)
+requested_nodes = (:parameters, :log_prior, :likelihood, :log_jacobian,
+                   :posterior, :prior_only_posterior)
 density_kernel = prepare(model;
     have = (:unconstrained, :Y, :Xgp_1, :slambda_1, :Xgp_sigma_1, :slambda_sigma_1),
     want = requested_nodes,
     bound = (; Y, Xgp_1, slambda_1, Xgp_sigma_1, slambda_sigma_1))
 
 output = density_kernel(q)
-parameters, log_prior, likelihood, log_jacobian, posterior = output
+parameters, log_prior, likelihood, log_jacobian, posterior, prior_only_posterior = output
 @assert posterior ≈ log_prior + likelihood + log_jacobian
+@assert prior_only_posterior ≈ log_prior + log_jacobian
 
 docs_example = (;
     name = :accel_gp_posterior,
@@ -150,6 +178,7 @@ function evaluate_accel_gp_source(; model_only::Bool = false)
     _evaluate_ppl_source(ACCEL_GP_SOURCE, @__MODULE__; bindings = (
         :ACCEL_GP_Y, :ACCEL_GP_XGP, :ACCEL_GP_SLAMBDA,
         :ACCEL_GP_XGP_SIGMA, :ACCEL_GP_SLAMBDA_SIGMA,
+        :ACCEL_GP_PRIOR_ONLY,
     ), model_only)
 end
 
@@ -178,6 +207,19 @@ function build_accel_gp_graph()
     compose(_ACCEL_GP_GRAPH_TEMPLATE[])
 end
 
+"""
+    accel_gp_posterior_want(prior_only::Bool = ACCEL_GP_PRIOR_ONLY)
+
+Select the authoritative posterior node for Stan's `prior_only` data flag.
+Only a Boolean is accepted: the raw 0/1 Stan field is validated and converted
+once at data load, and malformed integers such as `2` are rejected here instead
+of being silently mapped onto prior-only mode. `true` selects
+`:prior_only_posterior`; planning that node does not compute the likelihood.
+"""
+function accel_gp_posterior_want(prior_only::Bool = ACCEL_GP_PRIOR_ONLY)
+    prior_only ? :prior_only_posterior : :posterior
+end
+
 function demo()
     model = build_accel_gp_graph()
     q = vcat([-13.0, log(3.0), log(0.15)], zeros(size(ACCEL_GP_XGP, 2)),
@@ -186,7 +228,8 @@ function demo()
     println("Unconstrained-space posterior and its pieces:")
     posterior_plan = plan(model;
         have = (:unconstrained, :Y, :Xgp_1, :slambda_1, :Xgp_sigma_1, :slambda_sigma_1),
-        want = (:log_prior, :likelihood, :log_jacobian, :posterior))
+        want = (:log_prior, :likelihood, :log_jacobian,
+                accel_gp_posterior_want(ACCEL_GP_PRIOR_ONLY)))
     log_prior, likelihood, log_jacobian, posterior =
         prepare(posterior_plan)(q, ACCEL_GP_Y, ACCEL_GP_XGP, ACCEL_GP_SLAMBDA,
                                 ACCEL_GP_XGP_SIGMA, ACCEL_GP_SLAMBDA_SIGMA)
