@@ -26,14 +26,30 @@ function _bym2_reference(q, node1, node2, y, E, scaling_factor)
 end
 
 @testset "PPL graph — bym2_offset_only (posteriordb)" begin
+    N = length(BYM2_Y)
+    q = vcat([0.1, -0.3, 0.2], 0.15 .* cos.(1:N), 0.1 .* sin.(1:N))
+    reference = _bym2_reference(q, BYM2_NODE1, BYM2_NODE2, BYM2_Y, BYM2_E,
+                                BYM2_SCALING_FACTOR)
+
+    # Keep the true first-use call ahead of the full-source evaluator; the latter
+    # prepares and executes its demo tail and would otherwise warm this path.
+    @testset "actual build+prepare+execute first use in one ordinary function" begin
+        function once(q)
+            k = prepare(build_bym2_offset_only_graph();
+                have = (:unconstrained, :node1, :node2, :y, :E, :scaling_factor),
+                want = :posterior,
+                bound = (; node1 = BYM2_NODE1, node2 = BYM2_NODE2, y = BYM2_Y,
+                           E = BYM2_E, scaling_factor = BYM2_SCALING_FACTOR))
+            k(q)
+        end
+        @test once(q) ≈ reference.posterior
+    end
+
     artifact = evaluate_bym2_offset_only_source()
     @test artifact.source == strip(BYM2_SOURCE, '\n')
     @test artifact.output ==
           Base.invokelatest(artifact.kernel, Tuple(artifact.inputs)...)
     model = artifact.model
-    N = length(BYM2_Y)
-    q = vcat([0.1, -0.3, 0.2], 0.15 .* cos.(1:N), 0.1 .* sin.(1:N))
-    reference = _bym2_reference(q, BYM2_NODE1, BYM2_NODE2, BYM2_Y, BYM2_E, BYM2_SCALING_FACTOR)
 
     @testset "authored on the current baseline surface" begin
         @test occursin("poisson(; log_rate = e)", BYM2_SOURCE)
@@ -58,16 +74,7 @@ end
         @test posterior ≈ reference.posterior
     end
 
-    @testset "build+prepare+execute in one ordinary function, repeat-use stable" begin
-        function once(q)
-            k = prepare(build_bym2_offset_only_graph();
-                have = (:unconstrained, :node1, :node2, :y, :E, :scaling_factor),
-                want = :posterior,
-                bound = (; node1 = BYM2_NODE1, node2 = BYM2_NODE2, y = BYM2_Y,
-                           E = BYM2_E, scaling_factor = BYM2_SCALING_FACTOR))
-            k(q)
-        end
-        @test once(q) ≈ reference.posterior
+    @testset "prepared graph repeat-use stable" begin
         k = prepare(build_bym2_offset_only_graph();
             have = (:unconstrained, :node1, :node2, :y, :E, :scaling_factor),
             want = :posterior,

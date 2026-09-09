@@ -118,6 +118,9 @@ end
     helper_source = read(
         joinpath(REPOSITORY_ROOT, "docs", "kernel_examples.jl"), String,
     )
+    rendered_contract_source = read(
+        joinpath(REPOSITORY_ROOT, "docs", "check_rendered.jl"), String,
+    )
     @test occursin("warnonly = false", make_source)
     @test !occursin("warnonly = Documenter.except(:eval_block)", make_source)
     @test occursin("assert_ppl_examples_executed!()", make_source)
@@ -142,7 +145,22 @@ end
         :two_pl_latent_reg_irt_posterior,
         :hier_2pl_posterior,
         :gpcm_latent_reg_irt_posterior,
+        :glmm1_model_posterior,
+        :bym2_offset_only_posterior,
+        :bones_model_posterior,
+        :multi_occupancy_posterior,
     )
-        @test occursin(":" * string(name), helper_source)
+        marker = ":" * string(name)
+        @test count(marker, helper_source) == 1
+    end
+
+    # The exact-once PPL execution gate must fail closed on an unknown name;
+    # otherwise a misspelled artifact name is silently unrecorded.
+    @test occursin("unknown PPL example execution name", helper_source)
+
+    # Each latent/spatial page contributes exactly one executable source panel.
+    for page in ("glmm1.md", "bym2-offset-only.md", "bones.md",
+                 "multi-occupancy.md")
+        @test occursin("\"$page\" => 1", rendered_contract_source)
     end
 end

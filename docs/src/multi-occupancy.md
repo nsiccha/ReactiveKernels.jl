@@ -15,9 +15,10 @@ The complete runnable source is
 \begin{aligned}
 uv_i &\sim \operatorname{MVN}(0, \Sigma), \quad \Sigma = \begin{bmatrix}\sigma_1^2 & \rho\sigma_1\sigma_2\\ \rho\sigma_1\sigma_2 & \sigma_2^2\end{bmatrix}, \\
 \text{logit\_psi}_i &= uv_{i,1} + \alpha, \qquad \text{logit\_theta}_i = uv_{i,2} + \beta, \\
-\text{detected } (X>0):\ & \log\operatorname{inv\_logit}(\psi) + \operatorname{Binomial\_logit}(X \mid K, \theta), \\
-\text{undetected}:\ & \operatorname{log\_sum\_exp}(\text{occupied·undetected},\ \text{unoccupied}), \\
-\text{never detected}:\ & \operatorname{log\_sum\_exp}(\text{unavailable},\ \text{available}\cdot J \cdot\text{undetected}).
+\ell_0:\ & \operatorname{logaddexp}(\log\operatorname{inv\_logit}(\text{logit}\_\psi)+K\log\operatorname{inv\_logit}(-\text{logit}\_\theta),\ \log\operatorname{inv\_logit}(-\text{logit}\_\psi)), \\
+\text{detected } (X>0):\ & \log\operatorname{inv\_logit}(\text{logit}\_\psi) + \operatorname{Binomial\_logit}(X \mid K, \text{logit}\_\theta), \\
+\text{undetected}:\ & \ell_0, \\
+\text{never detected}:\ & \operatorname{logaddexp}(\log(1-\Omega),\ \log(\Omega)+J\ell_0).
 \end{aligned}
 ```
 
@@ -25,8 +26,8 @@ The latent occupancy/availability indicators are MARGINALIZED with
 `log_sum_exp`. The graph binds ONLY the RAW `n × J` detection matrix `X` and the
 dimensions `n`, `J`, `K`: the column-major flat counts `vec(X)` and the species
 coordinate `repeat(1:n, J)` are built in-graph, the binomial detection normalizer
-`log C(K, X)` is computed by the shared `binomial` object (its bound-only
-normalizer folds — no `loggamma` in the compiled kernel), and the
+`log C(K, X)` is computed by the shared `binomial` object (the authored formula
+is in-graph; no backend cache is claimed here), and the
 detected/undetected split is the in-graph mask `X > 0`. `Omega ∈ [0,1]` (logit),
 `rho_uv ∈ [-1,1]` (scaled logit), and `sigma_uv > 0` (log) carry their transform
 Jacobians; the bivariate Normal is authored inline.
@@ -56,8 +57,11 @@ boundary with value and gradient parity — `benchmark/batch_latent_gate.jl`
 `@compile`s both the primal and the gradient and asserts they match the native
 evaluation and the reference `.stan` (via BridgeStan, `propto = false`,
 `jacobian = true`). The in-graph `vec`/`repeat` recipes, the shared `binomial`
-detection object (bound-only normalizer folded), and the `log_sum_exp`
+detection object, and the `log_sum_exp`
 marginalization all lower cleanly.
+Evidence is bounded to six reference-finite native points (Reactant uses their
+first point) under BridgeStan 2.9 / Stan 2.39; finite-point parity is not an
+all-input proof.
 
 Run the walkthrough from the repository root:
 

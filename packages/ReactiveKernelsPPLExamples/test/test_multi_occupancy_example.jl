@@ -23,12 +23,13 @@ function _occ_reference(q, X, n, J, K)
         prior += -log(2π) - log(s1) - log(s2) - 0.5 * log(om) -
                  0.5 * (z1^2 - 2 * rho * z1 * z2 + z2^2) / om
     end
-    lpsi = uv1 .+ alpha; lth = uv2 .+ beta_
+    logit_psi = uv1 .+ alpha; logit_theta = uv2 .+ beta_
     logO = log(Omega); log1mO = log1p(-Omega)
     ll = n * logO
     for i in 1:n
-        lp1 = -log1pexp(-lpsi[i]); lps = -log1pexp(-lth[i]); lpf = -log1pexp(lth[i])
-        lp_un = logaddexp(lp1 + K * lpf, -log1pexp(lpsi[i]))
+        lp1 = -log1pexp(-logit_psi[i])
+        lps = -log1pexp(-logit_theta[i]); lpf = -log1pexp(logit_theta[i])
+        lp_un = logaddexp(lp1 + K * lpf, -log1pexp(logit_psi[i]))
         for j in 1:J
             x = X[i, j]
             ll += x > 0 ?
@@ -36,31 +37,44 @@ function _occ_reference(q, X, n, J, K)
         end
     end
     for i in (n + 1):S
-        lp1 = -log1pexp(-lpsi[i]); lpf = -log1pexp(lth[i])
-        lp_un = logaddexp(lp1 + K * lpf, -log1pexp(lpsi[i]))
+        lp1 = -log1pexp(-logit_psi[i]); lpf = -log1pexp(logit_theta[i])
+        lp_un = logaddexp(lp1 + K * lpf, -log1pexp(logit_psi[i]))
         ll += logaddexp(log1mO, logO + J * lp_un)
     end
     (; prior, log_jacobian, likelihood = ll, posterior = prior + ll + log_jacobian)
 end
 
 @testset "PPL graph — multi_occupancy (posteriordb)" begin
+    S = MULTI_OCC_S
+    n, J, K = MULTI_OCC_N, MULTI_OCC_J, MULTI_OCC_K
+    X = MULTI_OCC_X
+    q = vcat([0.2, -0.1, 0.3, 0.15, -0.2, 0.1], 0.25 .* sin.(1:S),
+             0.25 .* cos.(1:S))
+    reference = _occ_reference(q, X, n, J, K)
+    _bound() = (; X = MULTI_OCC_X, n = MULTI_OCC_N, J = MULTI_OCC_J, K = MULTI_OCC_K)
+
+    # Evaluate the cold graph before the full-source demo tail warms prepare.
+    @testset "actual build+prepare+execute first use in one ordinary function" begin
+        function once(q)
+            k = prepare(build_multi_occupancy_graph();
+                have = (:unconstrained, :X, :n, :J, :K),
+                want = :posterior, bound = _bound())
+            k(q)
+        end
+        @test once(q) ≈ reference.posterior
+    end
+
     artifact = evaluate_multi_occupancy_source()
     @test artifact.source == strip(MULTI_OCC_SOURCE, '\n')
     @test artifact.output ==
           Base.invokelatest(artifact.kernel, Tuple(artifact.inputs)...)
     model = artifact.model
-    S = MULTI_OCC_S
-    n, J, K = MULTI_OCC_N, MULTI_OCC_J, MULTI_OCC_K
-    X = MULTI_OCC_X
-    q = vcat([0.2, -0.1, 0.3, 0.15, -0.2, 0.1], 0.25 .* sin.(1:S), 0.25 .* cos.(1:S))
-    reference = _occ_reference(q, X, n, J, K)
-
-    _bound() = (; X = MULTI_OCC_X, n = MULTI_OCC_N, J = MULTI_OCC_J, K = MULTI_OCC_K)
 
     @testset "authored in-graph over ONLY the raw counts (normalizer in-graph)" begin
         @test occursin("Xflat = vec(X)", MULTI_OCC_SOURCE)              # flat counts in-graph
         @test occursin("spec = repeat(1:n, J)", MULTI_OCC_SOURCE)       # species coord in-graph
-        @test occursin("binomial(; n = kk, logit = lt).logpdf(x)", MULTI_OCC_SOURCE)
+        @test occursin("binomial(; n = kk, logit = logit_theta).logpdf(x)",
+                       MULTI_OCC_SOURCE)
         @test occursin("logaddexp(", MULTI_OCC_SOURCE)
         @test occursin("cauchy(0.0, 2.5).logpdf(alpha)", MULTI_OCC_SOURCE)
         @test !occursin("lchoose", MULTI_OCC_SOURCE)                   # no precomputed normalizer
@@ -90,14 +104,7 @@ end
         @test posterior ≈ reference.posterior
     end
 
-    @testset "build+prepare+execute in one ordinary function, repeat-use stable" begin
-        function once(q)
-            k = prepare(build_multi_occupancy_graph();
-                have = (:unconstrained, :X, :n, :J, :K),
-                want = :posterior, bound = _bound())
-            k(q)
-        end
-        @test once(q) ≈ reference.posterior
+    @testset "prepared graph repeat-use stable" begin
         k = prepare(build_multi_occupancy_graph();
             have = (:unconstrained, :X, :n, :J, :K),
             want = :posterior, bound = _bound())

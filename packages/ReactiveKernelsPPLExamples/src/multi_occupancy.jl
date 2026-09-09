@@ -17,16 +17,20 @@ export MULTI_OCC_SOURCE, evaluate_multi_occupancy_source
 # `logit_psi[i] = uv1[i] + alpha` and detection log-odds
 # `logit_theta[i] = uv2[i] + beta`. `Omega` is the species-availability
 # probability. The latent occupancy/availability indicators are MARGINALIZED:
-#   detected at a site (X>0):  log_inv_logit(psi) + Binomial_logit(X | K, theta)
-#   undetected at a site:      log_sum_exp(occupied·undetected, unoccupied)
-#   never-detected species:    log_sum_exp(unavailable, available·J·undetected).
+#   detected at a site (X>0):  log_inv_logit(logit_psi) +
+#                              Binomial_logit(X | K, logit_theta)
+#   undetected at a site:      logaddexp(log_inv_logit(logit_psi) +
+#                              K*log_inv_logit(-logit_theta),
+#                              log_inv_logit(-logit_psi))
+#   never-detected species:    logaddexp(log1mOmega, logOmega + J*lp0),
+#                              where lp0 is the undetected-site term above.
 #
 # The acceptance entry binds ONLY the RAW n×J detection matrix `X` plus the
 # dimensions `n`, `J`, `K`. The column-major flat counts `vec(X)` and the species
 # coordinate `spec = repeat(1:n, J)` are built IN the graph from `X`/`n`; the
 # binomial detection normalizer `log C(K, X)` is computed in-graph by the shared
-# `binomial` distribution object (its bound-only normalizer folds — no `loggamma`
-# in the compiled kernel); the detected/undetected split is the in-graph mask
+# `binomial` distribution object (this file asserts its formula, not a backend
+# cache); the detected/undetected split is the in-graph mask
 # `X > 0`, and the per-cell occupancy log-odds are gathered from the parameters by
 # the species coordinate. Real data (full) from posteriordb `butterfly-multi_occupancy`.
 
@@ -126,28 +130,36 @@ using LogExpFunctions: logistic, log1pexp, logaddexp
     # normalizer is computed in-graph by the `binomial` object; X>0 is the mask.
     uv1_cell = unconstrained[6 .+ spec]
     uv2_cell = unconstrained[(6 + S) .+ spec]
-    lpsi_cell = plate(uv1_cell, alpha) do u, a
+    logit_psi_cell = plate(uv1_cell, alpha) do u, a
         u + a
     end
-    lth_cell = plate(uv2_cell, beta_) do v, b
+    logit_theta_cell = plate(uv2_cell, beta_) do v, b
         v + b
     end
-    site_terms = plate(lpsi_cell, lth_cell, Xflat, K) do lp, lt, x, kk
-        lp_obs = -log1pexp(-lp) + binomial(; n = kk, logit = lt).logpdf(x)
-        lp_unobs = logaddexp(-log1pexp(-lp) + kk * (-log1pexp(lt)), -log1pexp(lp))
+    site_terms = plate(
+        logit_psi_cell, logit_theta_cell, Xflat, K
+    ) do logit_psi, logit_theta, x, kk
+        lp_obs = -log1pexp(-logit_psi) +
+                 binomial(; n = kk, logit = logit_theta).logpdf(x)
+        lp_unobs = logaddexp(
+            -log1pexp(-logit_psi) + kk * -log1pexp(logit_theta),
+            -log1pexp(logit_psi))
         ifelse(x > 0, lp_obs, lp_unobs)
     end
     observed_ll::Float64 = n * log_Omega + sum(site_terms)
 
     # Augmented species (never detected): marginalize availability + occupancy.
-    lpsi_aug = plate(uv1_aug, alpha) do u, a
+    logit_psi_aug = plate(uv1_aug, alpha) do u, a
         u + a
     end
-    lth_aug = plate(uv2_aug, beta_) do v, b
+    logit_theta_aug = plate(uv2_aug, beta_) do v, b
         v + b
     end
-    lp_unobs_aug = plate(lpsi_aug, lth_aug, K) do lp, lt, kk
-        logaddexp(-log1pexp(-lp) + kk * (-log1pexp(lt)), -log1pexp(lp))
+    lp_unobs_aug = plate(
+        logit_psi_aug, logit_theta_aug, K
+    ) do logit_psi, logit_theta, kk
+        logaddexp(-log1pexp(-logit_psi) + kk * -log1pexp(logit_theta),
+                  -log1pexp(logit_psi))
     end
     lp_never = plate(lp_unobs_aug, log_Omega, log1m_Omega, J) do lu, lo, l1o, jj
         logaddexp(l1o, lo + jj * lu)

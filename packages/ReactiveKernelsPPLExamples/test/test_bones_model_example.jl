@@ -22,14 +22,27 @@ _bones_bound() = (; GRADE = BONES_GRADE, GAMMA = BONES_GAMMA,
                     DELTA = BONES_DELTA, NCAT = BONES_NCAT)
 
 @testset "PPL graph — bones (posteriordb)" begin
+    nChild = size(BONES_GRADE, 1)
+    theta = 0.4 .* sin.(1:nChild)
+    reference = _bones_reference(theta, BONES_GRADE, BONES_GAMMA, BONES_DELTA, BONES_NCAT)
+
+    # The full-source evaluator below prepares/executes its demo tail. Keep this
+    # first-use probe ahead of it so it observes an actually cold graph path.
+    @testset "actual build+prepare+execute first use in one ordinary function" begin
+        function once(theta)
+            k = prepare(build_bones_model_graph();
+                have = (:unconstrained, :GRADE, :GAMMA, :DELTA, :NCAT),
+                want = :posterior, bound = _bones_bound())
+            k(theta)
+        end
+        @test once(theta) ≈ reference.posterior
+    end
+
     artifact = evaluate_bones_model_source()
     @test artifact.source == strip(BONES_SOURCE, '\n')
     @test artifact.output ==
           Base.invokelatest(artifact.kernel, Tuple(artifact.inputs)...)
     model = artifact.model
-    nChild = size(BONES_GRADE, 1)
-    theta = 0.4 .* sin.(1:nChild)
-    reference = _bones_reference(theta, BONES_GRADE, BONES_GAMMA, BONES_DELTA, BONES_NCAT)
 
     @testset "authored in-graph over ONLY the raw data block" begin
         # Grid coordinates built in-graph from the raw dimensions, not passed in.
@@ -69,14 +82,7 @@ _bones_bound() = (; GRADE = BONES_GRADE, GAMMA = BONES_GAMMA,
         @test posterior ≈ reference.posterior
     end
 
-    @testset "build+prepare+execute in one ordinary function, repeat-use stable" begin
-        function once(theta)
-            k = prepare(build_bones_model_graph();
-                have = (:unconstrained, :GRADE, :GAMMA, :DELTA, :NCAT),
-                want = :posterior, bound = _bones_bound())
-            k(theta)
-        end
-        @test once(theta) ≈ reference.posterior
+    @testset "prepared graph repeat-use stable" begin
         k = prepare(build_bones_model_graph();
             have = (:unconstrained, :GRADE, :GAMMA, :DELTA, :NCAT),
             want = :posterior, bound = _bones_bound())

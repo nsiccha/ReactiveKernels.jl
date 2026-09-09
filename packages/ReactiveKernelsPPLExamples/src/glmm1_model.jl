@@ -12,11 +12,12 @@ export GLMM1_SOURCE, evaluate_glmm1_model_source
 # `alpha ~ Normal(mu_alpha, sd_alpha)`, and `nobs = 2072` observed counts
 # `obs[i] ~ poisson_log(log_lambda[obsyear[i], obssite[i]])`.
 #
-# `log_lambda = rep_matrix(alpha', nyear)` makes EVERY year-row equal to `alpha'`,
-# so `log_lambda[obsyear[i], obssite[i]] == alpha[obssite[i]]` for ANY year: the
-# year index provably drops out of the density (`obsyear`/`misyear`/`missite`/`mis`
-# feed only the generated-quantities block, never `target`). The faithful graph
-# therefore gathers the site effect `alpha[obssite]` directly — the natural,
+# `log_lambda = rep_matrix(alpha', nyear)` makes EVERY year-row equal to `alpha'`.
+# `obsyear[i]` occurs in the likelihood when it selects
+# `log_lambda[obsyear[i], obssite[i]]`, but that value equals
+# `alpha[obssite[i]]` for ANY year, so the year dependence cancels algebraically.
+# The other year/site missingness inputs feed generated quantities only. The
+# faithful graph therefore gathers the site effect `alpha[obssite]` directly — the natural,
 # concise translation, not a materialized `nyear × nsite` broadcast of `alpha`.
 # `sd_alpha ∈ [0,5]` carries only its interval Jacobian (its prior is implicitly
 # uniform — no `~` statement — so it adds NO density term, only the transform).
@@ -130,10 +131,11 @@ per-site random effect `alpha ~ Normal(mu_alpha, sd_alpha)`) as a declarative
 `ReactiveKernels.KernelSpec`. `sd_alpha ∈ [0,5]` uses the scaled-logit interval
 transform with its exact Jacobian and NO prior density term (implicit uniform);
 `mu_alpha ~ Normal(0,10)`. The likelihood `obsᵢ ~ Poisson_log(alpha[obssiteᵢ])`
-gathers the site effect by the bound `obssite` index (the year index provably
-drops out of `rep_matrix(alpha', nyear)`) and reuses the shared Normal/Poisson
-endpoints. The transform Jacobian, priors, gathered log-rate, pointwise/summed
-likelihood, densities, posterior, and the per-site `lambda_site = exp(alpha)`
+gathers the site effect by the bound `obssite` index (`obsyear` selects an
+equal row and its dependence cancels algebraically) and reuses the shared
+Normal/Poisson endpoints. The transform Jacobian, priors, gathered log-rate,
+pointwise/summed likelihood, densities, posterior, and the per-site
+`lambda_site = exp(alpha)`
 generated quantity are separate named nodes.
 """
 function build_glmm1_model_graph()

@@ -4,7 +4,7 @@ using LogExpFunctions: logistic, log1pexp
 using SpecialFunctions: loggamma
 
 # Graph-independent oracle for the per-site Poisson-log GLMM. obssite gathers the
-# site effect; the year index provably drops out of rep_matrix(alpha', nyear).
+# site effect; obsyear selects an equal rep_matrix row and cancels algebraically.
 function _glmm1_reference(q, obs, obssite)
     nsite = length(q) - 2
     tf(u, L, U) = L + (U - L) * logistic(u)
@@ -22,14 +22,29 @@ function _glmm1_reference(q, obs, obssite)
 end
 
 @testset "PPL graph — GLMM1 (posteriordb)" begin
+    nsite = GLMM1_NSITE
+    q = vcat(0.2 .* sin.(1:nsite), [0.3, 0.4])
+    reference = _glmm1_reference(q, GLMM1_OBS, GLMM1_OBSSITE)
+
+    # This must be the first prepare/execution after model-only package load.
+    # `evaluate_glmm1_model_source()` below intentionally warms that path, so it
+    # cannot be allowed to run first while claiming to test first use.
+    @testset "actual build+prepare+execute first use in one ordinary function" begin
+        function once(q)
+            graph = build_glmm1_model_graph()
+            k = prepare(graph; have = (:unconstrained, :obs, :obssite),
+                        want = :posterior,
+                        bound = (; obs = GLMM1_OBS, obssite = GLMM1_OBSSITE))
+            k(q)
+        end
+        @test once(q) ≈ reference.posterior
+    end
+
     artifact = evaluate_glmm1_model_source()
     @test artifact.source == strip(GLMM1_SOURCE, '\n')
     @test artifact.output ==
           Base.invokelatest(artifact.kernel, Tuple(artifact.inputs)...)
     model = artifact.model
-    nsite = GLMM1_NSITE
-    q = vcat(0.2 .* sin.(1:nsite), [0.3, 0.4])
-    reference = _glmm1_reference(q, GLMM1_OBS, GLMM1_OBSSITE)
 
     @testset "authored on the current baseline surface" begin
         @test occursin("poisson(; log_rate = lr)", GLMM1_SOURCE)
@@ -53,15 +68,7 @@ end
         @test posterior ≈ reference.posterior
     end
 
-    @testset "build+prepare+execute in one ordinary function, repeat-use stable" begin
-        function once(q)
-            graph = build_glmm1_model_graph()
-            k = prepare(graph; have = (:unconstrained, :obs, :obssite),
-                        want = :posterior, bound = (; obs = GLMM1_OBS, obssite = GLMM1_OBSSITE))
-            k(q)
-        end
-        v1 = once(q)
-        @test v1 ≈ reference.posterior
+    @testset "prepared graph repeat-use stable" begin
         k = prepare(build_glmm1_model_graph();
             have = (:unconstrained, :obs, :obssite), want = :posterior,
             bound = (; obs = GLMM1_OBS, obssite = GLMM1_OBSSITE))

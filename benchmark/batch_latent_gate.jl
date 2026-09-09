@@ -16,11 +16,14 @@
 #   4. REACTANT GRADIENT — the Reactant-compiled gradient vs BridgeStan
 #                          (relative error < 2e-3), finite.
 #
-# Every axis is a hard `@assert`, so a regression exits nonzero. Graphs are built
-# from the installed package's `build_*_graph` (its templates are evaluated at
-# module-load, a world boundary), then `prepare`d here at top level, so no
-# world-age hazard arises. Each model binds ONLY the RAW posteriordb data ports it
-# declares — every structural coordinate and derived quantity is authored in-graph.
+# Every axis is a hard `@assert`, so a regression exits nonzero. The native axes
+# evaluate exactly `NATIVE_PROBE_COUNT` (six) reference-finite unconstrained
+# points; the Reactant axes evaluate exactly the FIRST of those points. Those
+# finite-point checks are bounded evidence, not an all-input proof. Graphs are
+# built from the installed package's `build_*_graph` (its templates are evaluated
+# at module-load, a world boundary), then `prepare`d here at top level, so no
+# world-age hazard arises. Each model binds ONLY the RAW posteriordb data ports
+# it declares — every structural coordinate and derived quantity is in-graph.
 #
 # This is the AUTHORITATIVE real-package acceptance driver, distinct from any
 # exploratory stub loader and from the per-model regression testsets in
@@ -59,7 +62,9 @@ if !DO_REACTANT
 end
 
 const PE = ReactiveKernelsPPLExamples
-const AE = AutoEnzyme(mode = Enzyme.Reverse, function_annotation = Enzyme.Const)
+const AE = AutoEnzyme(mode = Enzyme.Reverse)
+const NATIVE_PROBE_COUNT = 6
+const REACTANT_PROBE_COUNT = 1
 
 # Package load must have built its graph templates MODEL-ONLY (no per-source
 # prepare/execute demo tail); assert the startup contract here so the gate also
@@ -104,8 +109,8 @@ function reference_points(sm, dim, seed, name, npts, scale)
     pts
 end
 
-function gate(name; graph, have, bind, scale = 0.3, npts = 6, seed = 468,
-              do_reactant = true)
+function gate(name; graph, have, bind, scale = 0.3, npts = NATIVE_PROBE_COUNT,
+              seed = 468, do_reactant = true)
     println("\n########## $name ##########"); flush(stdout)
     sm, post = bridge(name, seed)
     data = PosteriorDB.load(PosteriorDB.dataset(post))
@@ -113,7 +118,8 @@ function gate(name; graph, have, bind, scale = 0.3, npts = 6, seed = 468,
     kb = prepare(graph; have, want = :posterior, bound)
     dim = Int(BridgeStan.param_unc_num(sm))
     pts = reference_points(sm, dim, seed, name, npts, scale)
-    println("  raw bound ports: $(keys(bound))  dim=$dim  probes=$(length(pts))"); flush(stdout)
+    @assert length(pts) == NATIVE_PROBE_COUNT
+    println("  raw bound ports: $(keys(bound))  dim=$dim  native_probes=$(length(pts)) reactant_probes=$REACTANT_PROBE_COUNT(first point)"); flush(stdout)
 
     # ---- axes 1 & 2: native value + native plain-Enzyme gradient vs Stan ----
     prep = prepare_ad(kb, AE, pts[1]; active = :unconstrained)
@@ -197,6 +203,9 @@ _want("occ") && gate("butterfly-multi_occupancy";
 
 @assert _RAN[] == length(SEL) "$(_RAN[]) gate(s) ran but $(length(SEL)) were selected"
 @assert _RAN[] > 0 "no gates ran"
+if !DO_REACTANT
+    @assert !_reactant_loaded() "BATCH_LATENT_REACTANT=0 native phase finished with Reactant UNLOADED, but it was loaded after the gates"
+end
 const _PHASE = DO_REACTANT ?
     "all FOUR parts (native value+grad, Reactant primal+grad)" :
     "the TWO native parts (Reactant UNLOADED; parts 3-4 deferred to a BATCH_LATENT_REACTANT=1 run)"

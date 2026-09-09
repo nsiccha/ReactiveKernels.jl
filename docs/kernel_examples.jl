@@ -1092,11 +1092,16 @@ const EXPECTED_PPL_EXAMPLES = (
     :two_pl_latent_reg_irt_posterior,
     :hier_2pl_posterior,
     :gpcm_latent_reg_irt_posterior,
+    :glmm1_model_posterior,
+    :bym2_offset_only_posterior,
+    :bones_model_posterior,
+    :multi_occupancy_posterior,
 )
 const _PPL_EXECUTION_COUNTS = Dict(name => 0 for name in EXPECTED_PPL_EXAMPLES)
 
 function _record_ppl_execution!(name::Symbol)
-    haskey(_PPL_EXECUTION_COUNTS, name) || return nothing
+    haskey(_PPL_EXECUTION_COUNTS, name) ||
+        error("unknown PPL example execution name $name (expected one of $(join(EXPECTED_PPL_EXAMPLES, ", ")))")
     _PPL_EXECUTION_COUNTS[name] += 1
     nothing
 end

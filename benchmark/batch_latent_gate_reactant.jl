@@ -5,7 +5,9 @@
 # constants, ReactiveKernels) by being included into the same module.
 
 function _reactant_axes(name, kb, prep, sm, pts)
+    @assert length(pts) >= REACTANT_PROBE_COUNT
     q = pts[1]; rq = Reactant.to_rarray(q)
+    println("  [3-4] Reactant probe: exactly point 1 of $(length(pts)) (native axes used all $(length(pts)))"); flush(stdout)
 
     # ---- axis 3: Reactant primal vs native ----
     kbc = Reactant.@compile sync = true kb(rq)
