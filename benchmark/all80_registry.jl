@@ -393,4 +393,41 @@ for (k, otu, why) in [
     REGISTRY[k] = (; REGISTRY[k]..., off_tu = otu, off_reason = why)
 end
 
+# ---------------- Batch-1 incremental additions (todo 1x4pytu / 1q387t4) ----------------
+# Four newly-landed idiomatic-RK posteriordb translations (RK source landed on canonical 5ed649c,
+# USER go-decision 15fh0de), registered against their EXISTING upstream Turing make_model (pinned
+# DPPL 6378673 posteriordb_models.jl, SHA256 a7ef985b…) + reference posteriordb-1.0.0 .stan. They
+# are MEASURED INTO A SEPARATE receipt (all80-batch1-v1.toml) under RK_ALL80_BATCH mode and are
+# EXCLUDED from the frozen-82 default sweep (BATCH1_KEYS below), so the immutable 82-row checkpoint
+# is byte-for-byte unaffected. Registration params mirror the landed batch1_gate.jl (build fn /
+# have-ports / bind), which already certifies RK-vs-Stan value+gradient parity at IDENTITY order
+# (⇒ stan_perm = nothing). off_tu DERIVED FROM SOURCE (Turing truncation / uniform / Dirichlet
+# normalizers vs the reference .stan) and GATE-verified measured == declared on the batch run.
+reg!("diamonds-diamonds"; mod = :DiamondsExample, build = :build_diamonds_graph,
+    have = (:unconstrained, :X, :Y, :prior_only),
+    bind = d -> (X = _mat(d["X"]), Y = F(d, "Y"), prior_only = Is(d, "prior_only")),
+    off_reason = "off_tu=0: brms-generated diamonds.stan writes `student_t_lpdf(sigma|3,0,10) − 1*student_t_lccdf(0|3,0,10)` (truncation correction), matching upstream Turing `sigma~truncated(LocationScale(0,10,TDist(3));lower=0)`; b~Normal, Intercept~student_t untruncated both sides (posteriordb_models.jl:815-830, diamonds.stan model block).")
+reg!("dogs-dogs_nonhierarchical"; mod = :DogsNonhierarchicalExample, build = :build_dogs_nonhierarchical_graph,
+    have = (:unconstrained, :y), bind = d -> (y = Bv(d, "y"),),
+    off_reason = "off_tu=0: dogs_nonhierarchical.stan `sigma_logit_ab~normal(0,1)` on <lower=0> (untruncated density, NO lccdf correction) matches upstream Turing `sigma_logit_ab~FlatPos(0)` (improper, contributes 0) PLUS a MANUAL `logpdf(Normal(0,1),·)` (untruncated); mu~logistic, L~lkj_corr_cholesky(2), z~normal all match (posteriordb_models.jl:1830-1847, dogs_nonhierarchical.stan model block).")
+reg!("ovarian-logistic_regression_rhs"; mod = :LogisticRegressionRHSExample, build = :build_logistic_regression_rhs_graph,
+    have = (:unconstrained, :x, :y, :scale_icept, :scale_global, :nu_global, :nu_local, :slab_scale, :slab_df),
+    bind = d -> (x = _mat(d["x"]), y = Bv(d, "y"),
+                 scale_icept = Float64(d["scale_icept"]), scale_global = Float64(d["scale_global"]),
+                 nu_global = Float64(d["nu_global"]), nu_local = Float64(d["nu_local"]),
+                 slab_scale = Float64(d["slab_scale"]), slab_df = Float64(d["slab_df"])),
+    off_tu = -(1 + 1536) * log(2),
+    off_reason = "off_tu=−(1+d)·log2, d=1536 (ovarian): upstream Turing `tau~truncated(LocationScale(0,2scale_global,TDist(nu_global));lower=0)` (+log2) and `lambda~Fill(truncated(LocationScale(0,1,TDist(nu_local));lower=0),d)` (d×+log2; all centered at 0 ⇒ half-line normalizer log2 each); logistic_regression_rhs.stan writes bare `tau~student_t(...)`, `lambda~student_t(...)` on <lower=0> with NO lccdf correction ⇒ Stan drops (1+d)·log2. caux~inv_gamma, beta0~normal, z~std_normal match (posteriordb_models.jl:2308-2325, logistic_regression_rhs.stan model block).")
+reg!("normal_5-normal_mixture_k"; mod = :NormalMixtureKExample, build = :build_normal_mixture_k_graph,
+    have = (:unconstrained, :y, :K), bind = d -> (y = F(d, "y"), K = Is(d, "K")),
+    off_tu = 5 * log(10) - log(factorial(4)),
+    off_reason = "off_tu=K·log10 − log((K−1)!), K=5 (normal_5): upstream Turing `sigma~Fill(Uniform(0,10),K)` (each −log10 density; the [0,10] interval transform adds +log10 on BOTH sides ⇒ net Stan−Turing=+K·log10, same mechanism as GLM_Poisson/election88) and `theta~Dirichlet(ones(K))` (adds constant log Γ(K); Stan `simplex[K]` has no explicit prior ⇒ Stan−Turing=−log Γ(K)); mu~normal(0,10) matches (posteriordb_models.jl:2600-2614, normal_mixture_k.stan model block). Simplex + interval Jacobian equivalence is GATE-verified (tu_stab constant).")
+
+# Frozen-82 EXCLUSION set: these four run ONLY when explicitly requested (RK_ALL80_BATCH mode +
+# explicit ARGS), never in the default full sweep, so all80-benchmark-v1.toml stays the immutable
+# 82-row checkpoint. all80_validate.jl still checks all 86 structurally (inventory 86 == registry 86).
+const BATCH1_KEYS = Set([
+    "diamonds-diamonds", "dogs-dogs_nonhierarchical",
+    "ovarian-logistic_regression_rhs", "normal_5-normal_mixture_k"])
+
 end # module All80Registry

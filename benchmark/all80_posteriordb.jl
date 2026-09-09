@@ -82,6 +82,7 @@ function _phase_cmd(phase, up, receipt)
         `$(Base.julia_cmd()) --startup-file=no --project=$ENV_DIR $(body) $ARGS`,
         _INNER => "1", "RK_ALL80_UPSTREAM" => up, "RK_ALL80_DPPL_SHA" => DPPL_SHA,
         "RK_ALL80_PHASE" => phase, "RK_ALL80_RECEIPT" => receipt,
+        "RK_ALL80_BATCH" => get(ENV, "RK_ALL80_BATCH", ""),
     )
     phase == "reactant" ? addenv(cmd, "JULIA_NUM_PRECOMPILE_TASKS" => "1") : cmd
 end
@@ -90,22 +91,30 @@ function _run()
     _ensure_env()
     up = _fetch_upstream()
     mkpath(RECEIPT_DIR)
+    # OPT-IN incremental batch (todo 1x4pytu/1q387t4): a SEPARATE receipt namespace + PRESERVED
+    # process-start provenance, so the frozen-82 flow (batch unset) is byte-for-byte unchanged.
+    batch = get(ENV, "RK_ALL80_BATCH", "")
+    prefix = isempty(batch) ? "all80" : "all80-$(batch)"
+    non_flag = [a for a in ARGS if !startswith(a, "-")]
+    isempty(batch) || !isempty(non_flag) ||
+        error("RK_ALL80_BATCH=$batch requires explicit model keys (refusing to run the default sweep into a batch receipt)")
     phases = String.(split(get(ENV, "RK_ALL80_PHASES", "native,reactant"), ','))
     phase_receipts = String[]
     for ph in phases
-        rec = joinpath(RECEIPT_DIR, "all80-$(ph).toml")
+        rec = joinpath(RECEIPT_DIR, "$(prefix)-$(ph).toml")
         @info "RK_ALL80: phase=$ph in an isolated subprocess -> $rec"
         run(_phase_cmd(ph, up, rec))
         push!(phase_receipts, rec)
     end
     # Deterministic aggregation of the phase receipts into the final receipt.
     include(joinpath(@__DIR__, "all80_receipt.jl"))
-    out = joinpath(RECEIPT_DIR, "all80-benchmark-v1.toml")
+    out = joinpath(RECEIPT_DIR, "$(prefix)-v1.toml")
+    meta = isempty(batch) ? Dict("dppl_sha" => DPPL_SHA, "args" => collect(ARGS)) :
+                            Dict("dppl_sha" => DPPL_SHA, "args" => collect(ARGS), "batch" => batch)
     Base.invokelatest(All80Receipt.aggregate, phase_receipts, out;
-        meta = Dict("dppl_sha" => DPPL_SHA, "args" => collect(ARGS)))
+        meta = meta, preserve_provenance = !isempty(batch))
     @info "RK_ALL80: aggregated final receipt -> $out"
-    non_flag = [a for a in ARGS if !startswith(a, "-")]
-    complete = isempty(non_flag) && Set(phases) == Set(["native", "reactant"])
+    complete = isempty(batch) && isempty(non_flag) && Set(phases) == Set(["native", "reactant"])
     # A complete default run also gates the ROW COUNT (all 82 present), not just cell fill.
     issues = Base.invokelatest(All80Receipt.validate, out; expected_models = complete ? 82 : nothing)
     if !isempty(issues)

@@ -22,6 +22,10 @@ const RECEIPT = get(ENV, "RK_ALL80_RECEIPT", "")
 # is the HARD gate (the publication contract). The observed offsets guide SOURCE derivation of
 # each off_rk/off_tu; the final hard-gated run then verifies measured == source-derived.
 const DISCOVER = get(ENV, "RK_ALL80_DISCOVER", "") == "1"
+# BATCH mode (opt-in incremental additions; empty ⇒ the frozen-82 flow, unchanged). Under a batch
+# the phase receipt carries a frozen process-start provenance block (freeze/verify below); the
+# frozen-82 flow writes NO provenance, so its receipt bytes are unchanged.
+const BATCH = get(ENV, "RK_ALL80_BATCH", "")
 include(joinpath(UP, "posteriordb.jl"))            # main-guarded; helpers + make_model + models + PDB
 include(joinpath(@__DIR__, "all80_registry.jl"))   # All80Registry.REGISTRY (82 executable-gated entries)
 include(joinpath(@__DIR__, "all80_receipt.jl"))    # All80Receipt.write_phase
@@ -54,6 +58,24 @@ end
 _reactant_loaded() = any(m -> String(nameof(m)) == "Reactant", values(Base.loaded_modules))
 PHASE == "native" && _reactant_loaded() &&
     error("native-phase isolation violated: Reactant is loaded before measurements")
+
+# BATCH provenance: freeze the process-start snapshot ONCE (loaded harness + developed-package
+# source bytes + git identities + pinned upstream hash), BEFORE any measurement. `verify_provenance`
+# re-hashes on-disk bytes at each write and REFUSES if code drifted mid-run. Frozen-82 flow (BATCH
+# empty) freezes nothing and writes no provenance block.
+if BATCH != ""
+    All80Receipt.freeze_provenance!(;
+        packages = Dict(
+            "ReactiveKernels" => normpath(joinpath(@__DIR__, "..")),
+            "ReactiveKernelsPPLExamples" => normpath(joinpath(@__DIR__, "..", "packages", "ReactiveKernelsPPLExamples")),
+            "ReactiveKernelsDistributionKernels" => normpath(joinpath(@__DIR__, "..", "packages", "ReactiveKernelsDistributionKernels"))),
+        upstream_hash = bytes2hex(SHA.sha256(read(joinpath(UP, "posteriordb_models.jl")))),
+        extra = Dict{String,Any}("batch" => BATCH, "phase" => PHASE, "discover" => DISCOVER,
+            "requested_keys" => [a for a in ARGS if !startswith(a, "-")]))
+end
+# The provenance to stamp on each phase-receipt write (re-verified against on-disk bytes each call;
+# `nothing` in the frozen-82 flow ⇒ receipt bytes unchanged).
+_phase_prov() = BATCH == "" ? nothing : All80Receipt.verify_provenance()
 
 # Standing RK policy (user, 2026-09-07): RK does NOT use Enzyme runtime activity.
 # A correct RK graph has statically-resolvable activity (data ports are DI.Constant
@@ -324,7 +346,10 @@ end
 _req = [n for n in ARGS if !startswith(n, "-")]
 _unknown = [k for k in _req if !haskey(RK, k)]
 isempty(_unknown) || error("all80: unknown registry key(s) requested: $(join(_unknown, ", "))")
-targets = isempty(_req) ? sort(collect(keys(RK))) : _req
+# Default sweep = the frozen 82 ONLY (BATCH1_KEYS excluded); the batch-1 additions run solely when
+# requested by explicit key (RK_ALL80_BATCH mode), so an empty-ARGS full sweep reproduces the
+# immutable 82-row checkpoint rather than 86.
+targets = isempty(_req) ? sort(collect(setdiff(keys(RK), All80Registry.BATCH1_KEYS))) : _req
 retry_requested = get(ENV, "RK_ALL80_RETRY", "") == "1"
 retry_requested && isempty(_req) &&
     error("RK_ALL80_RETRY=1 requires explicit model keys; refusing to replay all 82 implicitly")
@@ -355,7 +380,7 @@ for (i, name) in enumerate(pending)
     end
     # INCREMENTAL: rewrite the phase receipt after EACH model so a late crash/OOM cannot erase
     # earlier completed rows or exact errors (parent-mandated failure isolation).
-    RECEIPT != "" && All80Receipt.write_phase(RECEIPT, PHASE, rows)
+    RECEIPT != "" && All80Receipt.write_phase(RECEIPT, PHASE, rows; provenance = _phase_prov())
     println("  [$(length(rows))/$(length(targets)) complete; $i/$(length(pending)) this run] $(name) recorded" *
             (RECEIPT != "" ? " → $RECEIPT" : ""))
 end
