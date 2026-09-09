@@ -95,6 +95,10 @@ include("survey_model.jl")
 include("mnist_logistic.jl")
 include("mvnormal_regression.jl")
 include("bound_regression.jl")
+include("diamonds.jl")
+include("logistic_regression_rhs.jl")
+include("normal_mixture_k.jl")
+include("dogs_nonhierarchical.jl")
 include("nn_rbm.jl")
 include("lda.jl")
 
@@ -211,6 +215,10 @@ export SurveyModelExample
 export MNISTLogisticExample
 export MVNormalRegressionExample
 export BoundRegressionExample
+export DiamondsExample
+export LogisticRegressionRHSExample
+export NormalMixtureKExample
+export DogsNonhierarchicalExample
 export NNRBMExample
 export LDAExample
 

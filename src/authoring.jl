@@ -1464,10 +1464,11 @@ function _kernel_authored_scan_expr(rhs, mod)
         "scan received $(length(positional)) positional argument(s), but its do-block has " *
         "$(length(formals) - 1) non-carry parameter(s) (x, shared...)"))
 
-    # The scan op's outer arguments are (carry-seed, xs, shared...); the carry
+    # The scan op's outer arguments are (carry-seed, xs..., shared...); the carry
     # seed and every `Ref`-wrapped shared operand are atomic (broadcast-invariant),
-    # while the single bare positional is the iterated sequence.  Atomic indices
-    # are 1-based over the op's argument tuple, with the carry seed at index 1.
+    # while each bare positional is an iterated sequence advanced in lockstep.
+    # Atomic indices are 1-based over the op's argument tuple, with the carry seed
+    # at index 1.
     arguments = Symbol[]
     atomic = Int[]
     materialized_arguments = Tuple{Symbol,Any}[]
@@ -1489,12 +1490,23 @@ function _kernel_authored_scan_expr(rhs, mod)
     isempty(positional) && throw(ArgumentError(
         "scan needs a sequence positional as its first argument"))
     _is_ref(positional[1]) && throw(ArgumentError(
-        "scan's first positional must be the sequence to scan over, not Ref-wrapped"))
-    _push_operand!(positional[1], false)                # index 2: the iterated sequence xs
-    for shared in positional[2:end]                     # index 3+: shared (atomic)
-        _is_ref(shared) || throw(ArgumentError(
-            "scan operands after the sequence must be Ref(x) broadcast-invariant scalars"))
-        _push_operand!(shared.args[2], true)
+        "scan's first positional must be a sequence to scan over, not Ref-wrapped"))
+    # Leading non-Ref positionals are iterated sequences, advanced together in
+    # lockstep (index 2+, non-atomic).  Once a `Ref(x)` shared operand appears the
+    # remaining positionals must all be `Ref` (broadcast-invariant, atomic).  This
+    # lets one step read several co-varying per-step sequences — e.g. a first-order
+    # recurrence carry_i = a[i] * carry_{i-1} + b[i] over two per-step sequences.
+    seen_shared = false
+    for operand in positional
+        if _is_ref(operand)
+            seen_shared = true
+            _push_operand!(operand.args[2], true)       # shared (atomic)
+        else
+            seen_shared && throw(ArgumentError(
+                "scan's iterated sequences must precede its Ref(...) shared operands; " *
+                "a non-Ref positional cannot follow a Ref(...) operand"))
+            _push_operand!(operand, false)              # iterated sequence (non-atomic)
+        end
     end
 
     # Build the step body's 2-want spec. Its HAVE boundary is the do-block formals

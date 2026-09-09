@@ -452,6 +452,33 @@ end
     end
 end
 
+@testset "authored scan lockstep reverse AD" begin
+    spec = AuthoredScanFixtures.authored_scan_lockstep
+    reference(a, b) = -0.5 * sum(abs2,
+        AuthoredScanFixtures._authored_scan_lockstep_reference(a, b))
+    a0, b0 = [0.9, 0.8, 0.5, -0.2], [1.0, -0.5, 0.2, 0.7]
+    fd(f, x0) = map(eachindex(x0)) do i
+        l, r = copy(x0), copy(x0)
+        l[i] -= 1e-5
+        r[i] += 1e-5
+        (f(r) - f(l)) / 2e-5
+    end
+    # Reverse AD runs through the native inlined lockstep loop; differentiate w.r.t.
+    # each of the two co-varying sequences, with the other bound.
+    for active in (:a, :b)
+        bound = active === :a ? (; b = b0) : (; a = a0)
+        x0 = active === :a ? a0 : b0
+        objective = active === :a ? (x -> reference(x, b0)) : (x -> reference(a0, x))
+        k = prepare(spec; bound, want = :total)
+        prepared = prepare_ad(k, TEST_AD_BACKEND, x0; active)
+        gradient = zeros(length(x0))
+        value, returned = ad_value_and_gradient!(prepared, gradient, x0)
+        @test value ≈ reference(a0, b0)
+        @test returned === gradient
+        @test gradient ≈ fd(objective, x0) rtol = 1e-6 atol = 1e-8
+    end
+end
+
 @testset "scan AD preserves operation-table source transforms" begin
     spec = AuthoredScanFixtures.authored_scan_arma
     q, series = [0.2, 0.7, -0.3], [0.5]
