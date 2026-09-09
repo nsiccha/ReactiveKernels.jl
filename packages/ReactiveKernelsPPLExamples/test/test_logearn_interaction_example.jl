@@ -33,8 +33,10 @@ end
                                        LOGEARN_INTERACTION_MALE, LOGEARN_INTERACTION_EARN)
 
     @testset "authored on the current baseline surface" begin
-        @test occursin("normal(b1 + b2 * h + b3 * ml + b4 * (h * ml), s).logpdf(ly)",
+        @test occursin("mu = plate(height, male, inter, beta1, beta2, beta3, beta4)",
                        LOGEARN_INTERACTION_SOURCE)
+        @test occursin("b1 + b2 * h + b3 * ml + b4 * hm", LOGEARN_INTERACTION_SOURCE)
+        @test occursin("normal(m, s).logpdf(ly)", LOGEARN_INTERACTION_SOURCE)
         @test occursin("sigma::Float64 = exp(log_sigma)", LOGEARN_INTERACTION_SOURCE)
         @test occursin("log_earn = plate(", LOGEARN_INTERACTION_SOURCE)
         @test occursin("inter = plate(", LOGEARN_INTERACTION_SOURCE)

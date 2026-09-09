@@ -41,7 +41,7 @@ end
     reference = _surgical_reference(q, SURGICAL_SUCCESSES, SURGICAL_TOTALS)
 
     @testset "authored on the current baseline surface" begin
-        @test occursin("binomial(nt, logistic(bb))", SURGICAL_SOURCE)
+        @test occursin("binomial(; n = nt, logit = bb).logpdf(r)", SURGICAL_SOURCE)
         @test occursin("inverse_gamma(0.001, 0.001).logpdf", SURGICAL_SOURCE)
         @test occursin("normal(0.0, 1000.0).logpdf", SURGICAL_SOURCE)
         @test occursin("normal(m, s).logpdf(bb)", SURGICAL_SOURCE)
