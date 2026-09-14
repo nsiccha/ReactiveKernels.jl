@@ -185,8 +185,9 @@ function check_plain_enzyme_gradient(
         Tuple(artifact.inputs)
     end
     active = first(values)
-    want = artifact.name === :eight_schools_extraction ? :posterior : :density
-    kernel = prepare(artifact.model; have, want)
+    # Use the authored return: migrated models call it `posterior`, while other
+    # examples retain `density`. The reference below checks the same full target.
+    kernel = prepare(artifact.model; have)
 
     @test kernel(values...) ≈ reference_density(active)
     prepared = prepare_ad(
