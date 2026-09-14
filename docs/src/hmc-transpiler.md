@@ -33,6 +33,14 @@ Main.HMCTranspilerDocs.run_consumers()
 
 ## The kernel being compiled
 
+The benchmark helper `benchmark/sampler_transpiler/hmc_benchmark.jl` accepts a
+prepared RK density, prepared AD, initial position, and RNG factory.
+`prepare_hmc` builds the authored sampler; `benchmark_hmc` separates preparation,
+first execution, and synchronized warmed batches, retaining raw rounds and
+checking finite positions and continued movement. Both the Eight Schools timing
+driver and the [motorcycle HSGP benchmark](brm-hsgp.md) use this helper. It is
+benchmark support outside the package API.
+
 This block is read directly from the executable benchmark source. `step_f` is
 the captured Euclidean leapfrog method, whose position, momentum, potential,
 gradient and Hamiltonian dependencies come from the reactive phasepoint.
