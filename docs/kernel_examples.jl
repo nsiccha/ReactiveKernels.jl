@@ -643,6 +643,87 @@ function render_examples(artifacts)
     Markdown.MD(blocks)
 end
 
+function _manual_derivative_rule_sources()
+    path = joinpath(
+        pkgdir(ReactiveKernels), "examples", "manual_derivative_rule.jl",
+    )
+    source = replace(read(path, String), "\r\n" => "\n", "\r" => "\n")
+    graph = _source_between(
+        source,
+        "@kernel matvec_rule(",
+        "# -- END DOCS: pure mathematical derivative rule --",
+    )
+    pullback = _source_between(
+        source,
+        "struct MatvecPullback",
+        "# -- END DOCS: generated-style pullback staging --",
+    )
+    (; path, graph, pullback)
+end
+
+"""
+    render_manual_derivative_rule_cuts() -> Markdown.MD
+
+Render and execute the primal, forward, and reverse HAVE→WANT cuts of the one
+source-owned manual derivative graph. Each cut uses the standard raw source,
+generated kernel, and compute-DAG documentation surface.
+"""
+function render_manual_derivative_rule_cuts()
+    example = Main.ManualDerivativeRuleExample
+    sources = _manual_derivative_rule_sources()
+    inputs = example.EXAMPLE_INPUTS
+    cuts = (
+        (;
+            name = :manual_rule_primal,
+            kernel = example.matvec_primal,
+            have = example.PRIMAL_HAVE,
+            want = example.PRIMAL_WANT,
+        ),
+        (;
+            name = :manual_rule_forward,
+            kernel = example.matvec_forward,
+            have = example.FORWARD_HAVE,
+            want = example.FORWARD_WANT,
+        ),
+        (;
+            name = :manual_rule_reverse,
+            kernel = example.matvec_reverse,
+            have = example.REVERSE_HAVE,
+            want = example.REVERSE_WANT,
+        ),
+    )
+    origin = relpath(sources.path, pkgdir(ReactiveKernels))
+    artifacts = map(cuts) do cut
+        selected_inputs = NamedTuple{cut.have}(
+            Tuple(getproperty(inputs, name) for name in cut.have),
+        )
+        output = Base.invokelatest(cut.kernel, Tuple(selected_inputs)...)
+        (;
+            name = cut.name,
+            origin,
+            source = string(
+                sources.graph, "\n\n",
+                _port_call_source(
+                    "selected", "matvec_rule", cut.have, cut.want,
+                ),
+            ),
+            inputs = selected_inputs,
+            kernel = cut.kernel,
+            output,
+            generated = code_expr(cut.kernel),
+            dag = cut.kernel.plan,
+        )
+    end
+    render_examples(artifacts)
+end
+
+"""Render the exact example-owned value-plus-pullback staging source."""
+function render_manual_derivative_pullback_source()
+    Markdown.MD(Any[Markdown.Code(
+        "julia", _manual_derivative_rule_sources().pullback,
+    )])
+end
+
 """
     execute_example(mod, code; result=:docs_example) -> Markdown.MD
 

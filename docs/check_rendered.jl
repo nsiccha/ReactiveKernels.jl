@@ -32,6 +32,7 @@ _occurrences(text, needle) = length(split(text, needle)) - 1
 
 const _RENDERED_DOCS_PAGE_OWNERS = Dict(
     "automatic-differentiation.md" => "ReactiveKernels:enzyme",
+    "manual-derivative-rules.md" => "ReactiveKernels:reactant",
     "batched.md" => "ReactiveKernels:batching",
     "distributions.md" => "ReactiveKernels:distributions",
     "nuts.md" => "ReactiveKernels:hmc",
@@ -298,6 +299,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         error("rendered site has $(length(rendered)) content pages; navigation config has $(length(sources))")
     expected_panels = Dict(
         "automatic-differentiation.md" => 0,
+        "manual-derivative-rules.md" => 3,
         "distributions-ad.md" => 0,
         "distributions.md" => 19,
         "batched.md" => 1,
@@ -390,6 +392,18 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "ppl-front-end.md" => "review-pending",
     )
     structural_markers = Dict(
+        "manual-derivative-rules.md" => (
+            "Manual derivative rule graphs (design example)",
+            "Executable design example, not a shipped adapter generator",
+            "Current capability and required RK features",
+            "Everything that turns",
+            "registered custom AD rule is new work",
+            "prepare_ad_pullback",
+            "examples/manual_derivative_rule.jl",
+            "One graph, three selected cuts",
+            "Value plus a generated-style pullback",
+            "Backend boundary",
+        ),
         "probprog-mcmc.md" => (
             "NUTS sampling performance and diagnostics",
             "Eight Schools posterior agreement",
@@ -589,6 +603,9 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
             ("class=\"rk-dag-legend\"", "class=\"rk-comparison-grid\""),
     )
     body_markers = Dict(
+        "manual-derivative-rules.md" => (
+            "Manual Rule Primal", "Manual Rule Forward", "Manual Rule Reverse",
+        ),
         "eight-schools.md" =>
             ("Eight Schools Extraction", "Raw input", "Generated kernel", "Compute DAG",
              "Eight Schools primal — Joint density"),
