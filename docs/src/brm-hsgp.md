@@ -81,12 +81,14 @@ multiply each working coefficient by `exp((c_new-c_old)*ℓ)`. Merely changing
 ## Measured performance
 
 On the CPU benchmark, native Julia is faster for the primal. Native Enzyme
-value-and-gradient evaluation is faster than the compiled Reactant path or
-similar to it, depending on the coordinate frame. Reactant does not meet the
-case study's `≤1.25× StanBlocks` value-and-gradient runtime target in this run.
+value-and-gradient evaluation is 1.02–1.20× StanBlocks in the longer measurement,
+meeting the case study's `≤1.25×` target. The resident Reactant path is
+1.50–1.98× StanBlocks and does not meet that target. The first, shorter receipt
+overstated the native Enzyme gap; both receipts are retained for comparison.
 
 The table reads the committed receipt. Times are warmed median microseconds
-at one posterior position per frame, with 1,000 single-evaluation samples,
+at one posterior position per frame, with up to 100,000 single-evaluation samples
+and a two-second budget per measurement,
 CPU affinity 6 on `strato2`, Julia 1.10.11, and one BLAS thread. The shared host
 was not reserved. Resident Reactant calls synchronize before returning; the
 host row also transfers the position and materializes both results. Julia
@@ -95,15 +97,16 @@ allocation counts exclude backend-managed memory. These are CPU measurements.
 ```@eval
 using Markdown, TOML
 receipt = TOML.parsefile(joinpath(@__DIR__, "..", "..", "benchmark", "receipts",
-    "brm-hsgp-reactant-v1.toml"))
+    "brm-hsgp-reactant-v2.toml"))
 frames = ("noncentered", "selected_partial", "mixed", "centered")
 paths = (("Julia primal", "rk_native_primal"),
     ("Reactant primal (resident)", "reactant_primal"),
     ("Enzyme value + gradient", "rk_native_value_gradient"),
     ("Enzyme + Reactant value + gradient (resident)", "reactant_resident"),
     ("Enzyme + Reactant value + gradient (host)", "reactant_host"),
-    ("StanBlocks value + gradient", "stanblocks"))
-rows = ["| Evaluation | NCP (μs) | Selected partial (μs) | Mixed (μs) | Centered (μs) | Julia bytes / allocations |",
+    ("StanBlocks value + gradient", "stanblocks"),
+    ("Native Turing + adaptive gradient wrapper", "native_turing"))
+rows = ["| Evaluation | NCP (μs) | Selected partial (μs) | Mixed (μs) | Centered (μs) | NCP Julia bytes / allocations |",
         "|---|---:|---:|---:|---:|---:|"]
 for (label, key) in paths
     measurements = [receipt[frame]["runtime"][key] for frame in frames]
@@ -114,26 +117,56 @@ end
 Markdown.parse(join(rows, "\n"))
 ```
 
-Preparation took 4.20 s for the bound kernel and 1.82 s for AD preparation.
-The first native Enzyme call took 29.80 s. Reactant primal compilation took
-24.93 s; subsequent value-and-gradient compilation took 12.42 s, followed by
-a 0.39 s first execution. These stages ran in that order in one process, so
+Preparation took 2.73 s for the bound kernel and 1.33 s for AD preparation.
+The first native Enzyme call took 26.69 s. Reactant primal compilation took
+22.53 s; subsequent value-and-gradient compilation took 10.03 s, followed by
+a 0.30 s first execution. These stages ran in that order in one process, so
 the second compiler measurement benefits from the first one's initialization.
 None of those costs is included in the warmed table.
 
 The compiled primal and value-and-gradient paths passed 40,072 comparisons
-against normalized StanBlocks: both supplied 10,000-draw posterior bundles,
+against both normalized StanBlocks and native Turing: both supplied 10,000-draw posterior bundles,
 10,000 NCP positions transported to each of mixed and centered coordinates,
 and 18 adversarial points in every frame. Maximum absolute density error was
 `9.10e-13`; maximum componentwise gradient error scaled by `1+abs(reference)`
 was `1.55e-11`. Absolute gradient errors are recorded too: centered coordinates
 can produce enormous gradients, making an absolute tolerance alone misleading.
 
-Native Turing parity remains unverified. At the recorded BRM revision, its
-generated target retains a length-scale floor near `0.20518` despite the explicit
-prior, while Stan uses the required zero lower bound. Initialization at `ρ=0.2`
-therefore fails. The receipt explicitly records `native_verified=false`; the
-runner's default native comparison fails rather than accepting this mismatch.
+Native Turing parity is verified at BRM
+`d137c326fa6a30cf173bf81fd6767e440bf025c0`, which corrected the explicit-prior
+length-scale support mismatch. The generated fixed-frame DynamicPPL density
+is checked directly. Its gradient control uses BRM's supported adaptive wrapper:
+construct the NCP target, set the source centeredness, and retain the target
+frame. This combines the generated density with an audited analytic HSGP
+gradient and Enzyme coordinate transport; it is not direct Enzyme AD of
+DynamicPPL. No sampling is involved.
+
+## Why the timings differ
+
+The targets compute the same normalized density and derivatives, but the
+executed operations differ. BRM specializes its generated NCP model to
+standardized weights, while the RK example keeps centeredness live. The RK
+lowering folds the basis once: its optimized StableHLO has a constant
+`133×20` basis and no sine operation. It still performs the parameter-dependent
+rescaling and projections on every call.
+
+The native Enzyme allocation profile records 40 arrays per call: eight slices,
+28 broadcast results, and four matrix-product results. AD preparation reuses
+differentiation setup, not all those intermediates. Binding NCP centeredness
+in a diagnostic reduces allocations from 40 to 32 and the native gradient
+median from 8.42 to 6.95 μs. The corresponding Reactant median changes from
+16.26 to 14.76 μs. These controls ran on CPU7 and should be compared within
+their own run.
+
+A cheap Reactant control returning the same scalar-plus-44-vector shape takes
+5.76 μs. A quadratic control containing just the two basis projections and their
+reverse projections already takes 15.98 μs through Reactant, versus 1.37 μs
+for its native analytic evaluation. Grouping the right-hand sides changes
+the Reactant control to 15.67 μs. Thus call overhead is material, and this
+small dense linear-algebra workload reproduces most of the compiled model's
+latency. This is a controlled comparison, not an additive timing breakdown or
+a general conclusion about Enzyme or Reactant. See the
+[diagnostic procedures and receipts](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/brm_hsgp/DIAGNOSTICS.md).
 
 The [benchmark runner](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/brm_hsgp/compare.jl)
 contains both the native Turing and StanBlocks comparisons. See its

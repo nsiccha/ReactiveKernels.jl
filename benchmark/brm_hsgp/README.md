@@ -37,8 +37,13 @@ written to the receipt. `propto=false, jacobian=true` is explicit for Stan.
 
 The native Turing value control is the generated `DynamicPPL.LogDensityFunction`.
 Its gradient control is BRM's existing `adaptive_centering_problem` wrapper,
-which combines that density with the supported analytic HSGP gradient and
-Enzyme coordinate transport. Direct Enzyme differentiation of this DynamicPPL
+constructed from the generated NCP target. The source centeredness is set
+through the wrapper's indexed reparametrization and its scoring-plan
+synchronization callback; its target remains NCP. Each basis control is matched
+to the DynamicPPL coordinate index. The separately generated fixed-partial
+target is an independent value control, with its own coordinate permutation.
+The wrapper combines the generated density with the supported analytic HSGP
+gradient and Enzyme coordinate transport. Direct Enzyme differentiation of this DynamicPPL
 model is a documented BRM limitation. Neither ForwardDiff nor ReverseDiff is
 used for differentiation here.
 
@@ -104,7 +109,43 @@ stated. Compilation cost is never mixed into the warmed ratio. A native Turing
 target whose support differs from Stan is an unsupported comparison, not an
 opportunity to modify the model or discard posterior points.
 
-## Recorded CPU run
+## Current verified CPU run
+
+[`../receipts/brm-hsgp-reactant-v2.toml`](../receipts/brm-hsgp-reactant-v2.toml)
+records RK `0dfe2165f978b1fdb1332a4d089cb31dd8851d25` with the corrected BRM
+`d137c326fa6a30cf173bf81fd6767e440bf025c0` and WarmupHMC
+`ad1feb6a228b8e9437fa745ae19ad490a3af34b1`. All other measured versions and
+source hashes are in the receipt.
+
+```sh
+KB_COMPACT_KEEP_LOG=1 kb-run-compact taskset -c 6 \
+  julia --startup-file=no --project=benchmark/brm_hsgp \
+  benchmark/brm_hsgp/compare.jl "$TMPDIR/brm-benchmark" "$TMPDIR/brm-comparison-native-v2"
+```
+
+Exit 0, elapsed 365 s, strato2 retained log `$TMPDIR/kb-run-compact.uNK6Mt`.
+All 40,072 positions passed against both native Turing and Stan, including
+the separately generated fixed-frame DynamicPPL values. No columns were dropped.
+Maximum normalized value error is `9.094947017729282e-13` against either
+reference. Maximum scaled gradient error is `1.2635231778851861e-11` against
+native Turing and `1.5455363706851556e-11` against Stan.
+
+Measurements now allow 100,000 samples and two seconds per evaluator,
+`evals=1`. Native Enzyme is 1.02–1.20× StanBlocks, meeting the 1.25× target in
+all four frames; resident Reactant is 1.50–1.98× and the host boundary is
+3.42–4.43×. The initial 1,000-sample run overstated the native Enzyme gap.
+This shared-host run is still a measurement, not a fixed cost guarantee.
+The [documentation page](../../docs/src/brm-hsgp.md) renders the current table
+directly from v2. [DIAGNOSTICS.md](DIAGNOSTICS.md) reports separate controls
+for constant centeredness, allocations, synchronous calls, and dense projections.
+
+The full run also corrected two consumer mistakes exposed after the BRM fix:
+`turing_model_source` returns an expression, which must be rendered before
+hashing; and the adaptive native wrapper starts from NCP, with partial
+centering on its source side. Feeding it a generated `beta_partial` target
+is outside that wrapper's supported contract.
+
+## Initial CPU run (superseded)
 
 [`../receipts/brm-hsgp-reactant-v1.toml`](../receipts/brm-hsgp-reactant-v1.toml)
 is the unmodified runner output from RK
@@ -117,8 +158,7 @@ RK_HSGP_NATIVE=0 KB_COMPACT_KEEP_LOG=1 kb-run-compact taskset -c 6 \
 ```
 
 Exit 0, elapsed 353 s, retained log `$TMPDIR/kb-run-compact.Gw0SWX`.
-The [documentation page](../../docs/src/brm-hsgp.md) renders its performance
-table directly from this receipt. All four frames have 1,000 warmed samples per
+All four frames in this initial receipt have 1,000 warmed samples per
 path, `evals=1`, at the midpoint posterior column; medians are not averages over
 10,000 different positions. Affinity is one CPU and BLAS one thread, on a shared
 host. Minimum timings and allocations are retained alongside medians. The
@@ -135,7 +175,7 @@ absolute errors as well: mixed/centered adversarial gradients can be around
 No columns were dropped. Both the separately compiled primal and compiled
 value-plus-gradient are checked at every point.
 
-Native Turing is explicitly unsupported in this receipt. At BRM
+Native Turing was explicitly unsupported in this initial receipt. At BRM
 `8dfe41253af3043482cb3270cf513b50a1de5437`, initialization with `rho=0.2` fails
 in `Bijectors.VectorBijectors.Untruncate` inside `_BRMConstrainedKernel` and
 `_brm_turing_hsgp_term` with `DomainError(-0.005181297595301976)`. The generated
@@ -144,5 +184,5 @@ emitted Stan declares both length scales with `lower=0.0`. This is tracked as
 BRM snag `turing-hsgp-expl-e60fccfe`. The failed default run exited 1 after
 135 s (`$TMPDIR/kb-run-compact.rrsktz`). The literal model-definition hash is
 identical at the bundle source, the requested source, and the measured BRM
-snapshot. The runner retains the native comparison for a corrected source
-snapshot; full native parity is still an open verification boundary.
+snapshot. The v2 receipt above closes this verification boundary using the
+corrected source and supported adaptive-wrapper construction.

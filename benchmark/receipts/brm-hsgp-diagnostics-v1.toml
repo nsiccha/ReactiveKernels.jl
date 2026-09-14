@@ -1,0 +1,88 @@
+blas_threads = 1
+cpu_affinity = "7"
+julia_version = "1.10.11"
+kernel_sha256 = "54a4173dda961ff90dac3afd9541fdf653126bb8cba5257f06532dc762987b25"
+posterior_column = 5000
+source_sha256 = "101954eefa25e3ed945889ed0f8abb70fb8497355c4abad74e41b14fd135f261"
+
+[bound_centeredness.native_primal]
+allocations = 14
+bytes = 5024
+median_ns = 1902.0
+minimum_ns = 1392.0
+samples = 100000
+
+[bound_centeredness.native_value_gradient]
+allocations = 32
+bytes = 10944
+median_ns = 6950.0
+minimum_ns = 5899.0
+samples = 100000
+
+[bound_centeredness.reactant_primal]
+allocations = 16
+bytes = 704
+median_ns = 14440.0
+minimum_ns = 9783.0
+samples = 100000
+
+[bound_centeredness.reactant_value_gradient]
+allocations = 20
+bytes = 816
+median_ns = 14761.0
+minimum_ns = 11696.0
+samples = 100000
+
+[cheap_control.reactant_primal]
+allocations = 16
+bytes = 704
+median_ns = 4546.0
+minimum_ns = 3244.0
+samples = 100000
+
+[cheap_control.reactant_value_gradient]
+allocations = 20
+bytes = 816
+median_ns = 5758.0
+minimum_ns = 4125.0
+samples = 100000
+
+[dynamic_centeredness.native_primal]
+allocations = 16
+bytes = 5472
+median_ns = 1792.0
+minimum_ns = 1352.0
+samples = 100000
+
+[dynamic_centeredness.native_value_gradient]
+allocations = 40
+bytes = 12736
+median_ns = 8422.0
+minimum_ns = 6489.0
+samples = 100000
+
+[dynamic_centeredness.reactant_primal]
+allocations = 16
+bytes = 704
+median_ns = 15752.0
+minimum_ns = 10675.0
+samples = 93033
+
+[dynamic_centeredness.reactant_value_gradient]
+allocations = 20
+bytes = 816
+median_ns = 16262.0
+minimum_ns = 11806.0
+samples = 90304
+
+[native_allocation_profile]
+calls = 20
+observed_allocations = 800
+observed_bytes = 238720
+
+[reusable_buffer_primal]
+allocations = 14
+bytes = 1536
+median_ns = 2523.0
+minimum_ns = 2323.0
+samples = 100000
