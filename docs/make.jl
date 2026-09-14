@@ -68,6 +68,7 @@ site_pages = [
             "GP regression (marginal)" => "gp-regr.md",
             "GP Poisson regression (latent)" => "gp-pois-regr.md",
             "Approximate GP (HSGP, distributional)" => "accel-gp.md",
+            "BRM motorcycle (partial HSGP coordinates)" => "brm-hsgp.md",
             "Hierarchical GP" => "hierarchical-gp.md",
         ],
         "Declarative @ppl front-end + Gibbs (experimental)" => "ppl-front-end.md",

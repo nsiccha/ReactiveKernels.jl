@@ -26,6 +26,7 @@ end
 # v = z * exp(c * log_spectral_sd), so w = v * exp((1-c)*log_spectral_sd).
 # Centeredness is a live, inactive HAVE: online-selected values reuse the
 # same prepared graph and compiled executable.
+# BEGIN MOTORCYCLE KERNEL
 @kernel model(q::Vector{Float64}, x::Vector{Float64}, y::Vector{Float64},
               c::Vector{Float64}, modes::Vector{Float64}, half_width::Float64) = begin
     frequency = modes .* (pi / (2 * half_width))
@@ -65,6 +66,7 @@ end
     posterior = hyperprior + weight_prior + coordinate_jacobian + likelihood
     return posterior
 end
+# END MOTORCYCLE KERNEL
 
 """Prepare the exact k=20 model, folding all data-only design work once."""
 function prepare_model(data; want=:posterior)

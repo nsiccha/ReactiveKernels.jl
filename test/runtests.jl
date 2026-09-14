@@ -25,6 +25,7 @@ import ReactiveKernelsNUTSExamples
 using Test
 
 const _MATRIX_CORE_TESTS = (
+    "test_brm_hsgp.jl",
     "test_runtests_selector.jl",
     "test_stateless.jl",
     "test_partial_evaluation.jl",
