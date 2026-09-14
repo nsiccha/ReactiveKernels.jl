@@ -181,6 +181,9 @@ function check_plain_enzyme_gradient(
         inputs = artifact.inputs
         ([inputs.μ, inputs.log_τ, inputs.θ...],
          inputs.observations, inputs.observation_scales)
+    elseif artifact.name === :dugongs_density
+        # The documentation binds these data; this test exercises live Constants.
+        (artifact.inputs.q, DUGONGS_AGE, DUGONGS_LENGTH)
     else
         Tuple(artifact.inputs)
     end
