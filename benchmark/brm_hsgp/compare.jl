@@ -62,6 +62,26 @@ function references(data, c, output, label; native_enabled=true)
     @assert sort(ps) == collect(1:44)
     native_enabled || return (; stan, ps, sb_seconds, native=nothing)
     native_seconds = @elapsed begin
+        # The adaptive wrapper starts from the generated NCP target. Its source
+        # frame, rather than the target declaration, carries online centering.
+        base_tb = TuringBRMI(BRMSource.MOTORCYCLE_NCP(data))
+        base_initial = (; rho=0.2, sigma=0.5, beta_raw=zeros(20))
+        base_vi = DP.VarInfo(base_tb.model, DP.InitFromParams(
+            (; term_mu_1=base_initial, term_sigma_1=base_initial)), DP.LinkAll())
+        base_density = DP.LogDensityFunction(base_tb.model, DP.getlogjoint_internal, base_vi)
+        native = adaptive_centering_problem(base_tb, base_density, TRANSPORT_BACKEND)
+        pn = native_permutation(base_density, zeros(40))
+        controls = Dict(zip(pn[vcat(3:22, 25:44)], c))
+        ir = WarmupHMC.reparametrizer(native)
+        @assert sort(first.(ir.pairs)) == sort(collect(keys(controls)))
+        ir.pairs .= map(ir.pairs) do (index, value)
+            index => WarmupHMC.Reparametrization(value.target,
+                WarmupHMC.PartiallyCentered(controls[index]), value.args...)
+        end
+        native.scoring_plan.synchronize!(ir)
+
+        # Independently retain the generated fixed-partial target as a value
+        # control. It has its own DynamicPPL coordinate metadata.
         tb = TuringBRMI(brmi)
         initial(cs) = any(!iszero, cs) ?
             (; rho=0.2, sigma=0.5, beta_partial=zeros(20)) :
@@ -69,11 +89,11 @@ function references(data, c, output, label; native_enabled=true)
         parameters = (; term_mu_1=initial(c[1:20]), term_sigma_1=initial(c[21:40]))
         vi = DP.VarInfo(tb.model, DP.InitFromParams(parameters), DP.LinkAll())
         density = DP.LogDensityFunction(tb.model, DP.getlogjoint_internal, vi)
-        native = adaptive_centering_problem(tb, density, TRANSPORT_BACKEND)
     end
-    pn = native_permutation(density, c)
-    @assert sort(pn) == collect(1:44)
-    (; stan, ps, native, density, pn, sb_seconds, native_seconds,
+    pd = native_permutation(density, c)
+    @assert sort(pn) == sort(pd) == collect(1:44)
+    (; stan, ps, native, density, pn, pd, sb_seconds, native_seconds,
+       base_turing_source_sha256=bytes2hex(sha256(string(turing_model_source(base_tb)))),
        turing_source_sha256=bytes2hex(sha256(string(turing_model_source(tb)))))
 end
 
@@ -108,8 +128,9 @@ end
 function check_points(compiled, primal, refs, points, c; label)
     rc = Reactant.to_rarray(c)
     max_value_sb = max_gradient_sb = max_value_native = max_gradient_native = 0.0
+    max_value_generated = 0.0
     max_scaled_gradient_sb = max_scaled_gradient_native = 0.0
-    qsb, qnative = zeros(44), zeros(44)
+    qsb, qnative, qdensity = zeros(44), zeros(44), zeros(44)
     for (i, q) in enumerate(eachcol(points))
         qsb[refs.ps] .= q
         sv, sg = BridgeStan.log_density_gradient(refs.stan.model, qsb;
@@ -132,7 +153,8 @@ function check_points(compiled, primal, refs, points, c; label)
             qnative[refs.pn] .= q
             nv, ng = LDP.logdensity_and_gradient(refs.native, qnative)
             # Keep the generated DynamicPPL target as a separate value control.
-            dv = LDP.logdensity(refs.density, qnative)
+            qdensity[refs.pd] .= q
+            dv = LDP.logdensity(refs.density, qdensity)
             @assert all(isfinite, (nv, dv)) && all(isfinite, ng)
             @assert isapprox(nv, dv; atol=2e-8, rtol=2e-10)
             @assert isapprox(v, nv; atol=2e-8, rtol=2e-10) "$label point $i native value: $v != $nv"
@@ -140,6 +162,7 @@ function check_points(compiled, primal, refs, points, c; label)
             rn = maximum(abs.(g .- ng[refs.pn]) ./ (1 .+ abs.(ng[refs.pn])))
             @assert rn < 2e-7 "$label point $i native gradient scaled error: $rn"
             max_value_native = max(max_value_native, abs(v-nv))
+            max_value_generated = max(max_value_generated, abs(v-dv))
             max_gradient_native = max(max_gradient_native, en)
             max_scaled_gradient_native = max(max_scaled_gradient_native, rn)
         end
@@ -149,6 +172,7 @@ function check_points(compiled, primal, refs, points, c; label)
         "native_verified"=>refs.native !== nothing)
     if refs.native !== nothing
         merge!(result, Dict("native_value_max_abs"=>max_value_native,
+            "native_generated_value_max_abs"=>max_value_generated,
             "native_gradient_max_abs"=>max_gradient_native,
             "native_gradient_max_scaled"=>max_scaled_gradient_native))
     end
@@ -157,7 +181,7 @@ end
 
 function measurement(f)
     f()
-    trial = @benchmark $f() seconds=1 samples=1000 evals=1
+    trial = @benchmark $f() seconds=2 samples=100000 evals=1
     Dict("median_ns"=>median(trial).time, "minimum_ns"=>minimum(trial).time,
         "bytes"=>trial.memory, "allocations"=>trial.allocs, "samples"=>length(trial))
 end
@@ -253,7 +277,9 @@ function main(bundle, output; limit=typemax(Int), native_enabled=true)
         if native_enabled
             row["native_preparation_seconds"] = refs.native_seconds
             row["native_turing_source_sha256"] = refs.turing_source_sha256
+            row["native_base_turing_source_sha256"] = refs.base_turing_source_sha256
             row["native_permutation"] = refs.pn
+            row["native_generated_permutation"] = refs.pd
         end
         row["centeredness"] = controls
         row["runtime"] = runtimes(compiled, primal, kernel, prepared, refs, points[:,cld(n,2)], controls)
