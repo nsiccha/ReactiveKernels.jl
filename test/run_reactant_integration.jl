@@ -40,6 +40,7 @@ mktempdir() do env
         PackageSpec(path = path) for path in (root, example_packages...)
     ])
     Pkg.add([
+        PackageSpec(name = "Distributions"),
         PackageSpec(name = "Enzyme"),
         PackageSpec(name = "LambertW"),
         PackageSpec(name = "LogExpFunctions"),

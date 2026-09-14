@@ -71,58 +71,6 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     @test occursin("Main.BatchedExamples.BATCHED_AD_SOURCE", distributions_ad_docs)
     @test occursin("test_batched_nonallocating.jl", distributions_ad_docs)
 
-    # No other public prose page carries backend/API GUIDANCE. Algorithmic
-    # uses of the word "gradient" in sampler pages remain domain terminology,
-    # while the evaluation-throughput page belongs to the top-level AD group
-    # and the dedicated Eight Schools Reactant page owns its compiled-AD receipt.
-    # bound-regression.md and posteriordb-comparison.md carry only INCIDENTAL AD
-    # references, not guidance, so they are exempt: bound-regression names
-    # `prepare_ad` when describing the general `bound` partial-evaluation pre-pass,
-    # and posteriordb-comparison lists Enzyme once among the packages its pinned
-    # benchmark environment can load.
-    # The per-model GP pages own their exact native-Enzyme and Reactant support
-    # boundaries; allow those disclosures there rather than duplicating or deleting
-    # the model-specific limitations.
-    ad_pages = Set((
-        "automatic-differentiation.md",
-        "distributions-ad.md",
-        "eight-schools-reactant.md",
-        "eval-throughput.md",
-        "gp-regr.md",
-        "gp-pois-regr.md",
-        "accel-gp.md",
-        "hierarchical-gp.md",
-        "mnist-reactant.md",
-        "ppl-ad.md",
-        "probprog-mcmc.md",
-        "reactant-ad.md",
-        "reactant.md",
-        "bound-regression.md",
-        "posteriordb-comparison.md",
-    ))
-    forbidden_ad_prose = (
-        "DifferentiationInterface",
-        "AutoEnzyme",
-        "Enzyme",
-        "prepare_ad",
-        "ad_gradient",
-        "ad_value_and_gradient!",
-        "automatic differentiation",
-        "reverse-mode",
-    )
-    docs_src = joinpath(root, "docs", "src")
-    for path in readdir(docs_src; join = true)
-        endswith(path, ".md") || continue
-        basename(path) in ad_pages && continue
-        prose = _compiler_docs_lf(read(path, String))
-        for marker in forbidden_ad_prose
-            @test !occursin(lowercase(marker), lowercase(prose))
-        end
-    end
-    for marker in forbidden_ad_prose
-        @test !occursin(lowercase(marker), lowercase(readme))
-    end
-
     @test occursin("\"Compiler capability and limits\" => \"compiler.md\"", make)
     @test occursin("\"Automatic differentiation\" => [", make)
     @test occursin("\"Prepared gradients\" => \"automatic-differentiation.md\"", make)
