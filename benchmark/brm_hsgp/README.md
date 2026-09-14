@@ -45,7 +45,9 @@ evaluation comparison exposes centeredness at every executable call.
 
 Receipts separate model/AD preparation, first native gradient, HMC preparation
 (including Reactant compilation), first batch execution, and raw warmed batch
-times, after three additional untimed warmup batches. RNG construction and
+times. Compilation garbage is collected once, then additional untimed warmup
+runs for at least one second and three batches; timed rounds include normal
+GC costs. RNG construction and
 finite-density checks are outside timing. The
 prepared interface's state copies and output snapshots remain inside timing;
 Julia allocation counts exclude C++/device runtime allocations. Timed rounds

@@ -41,11 +41,17 @@ function benchmark_hmc(density, ad, position, make_rng; backend=:native,
         q, value
     end
     inspect(first_result)
-    # Let runtime caches settle after first execution, especially for tiny
-    # batches. Keep this work separate from both cold and warmed measurements.
-    for _ in 1:3
+    # Compilation leaves substantial garbage, and three tiny batches do not
+    # establish steady throughput. Collect once, then warm for at least one
+    # second (and three batches). Timed rounds retain their normal GC costs.
+    warmup_gc_seconds = @elapsed GC.gc()
+    warmup_start = time_ns()
+    warmup_batches = 0
+    while warmup_batches < 3 || (time_ns() - warmup_start) / 1e9 < 1.0
         inspect(program(state, rng))
+        warmup_batches += 1
     end
+    warmup_seconds = (time_ns() - warmup_start) / 1e9
     # Distinct seeds are constructed before the timer. Every replicate starts
     # at the same position; continuation is checked separately below.
     rngs = [make_rng(i) for i in 1:rounds]
@@ -74,7 +80,8 @@ function benchmark_hmc(density, ad, position, make_rng; backend=:native,
     any(>(0), displacements) || error("timed batches never moved from their initial position")
     Dict("backend"=>string(backend), "transitions"=>transitions,
         "leapfrog_steps"=>steps, "leapfrog_steps_per_batch"=>transitions*steps,
-        "stepsize"=>stepsize, "rounds"=>rounds, "extra_warmup_batches"=>3,
+        "stepsize"=>stepsize, "rounds"=>rounds, "extra_warmup_batches"=>warmup_batches,
+        "warmup_seconds"=>warmup_seconds, "warmup_gc_seconds"=>warmup_gc_seconds,
         "started_utc"=>started,
         "finished_utc"=>string(now(UTC)), "prepare_seconds"=>prepare_seconds,
         "first_execution_seconds"=>first_seconds, "raw_batch_seconds"=>times,
