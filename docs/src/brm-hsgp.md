@@ -78,9 +78,65 @@ coordinates also requires transporting the position: for `c_old → c_new`,
 multiply each working coefficient by `exp((c_new-c_old)*ℓ)`. Merely changing
 `c` at a fixed `q` evaluates a different physical point.
 
+## Measured performance
+
+On the CPU benchmark, native Julia is faster for the primal. Native Enzyme
+value-and-gradient evaluation is faster than the compiled Reactant path or
+similar to it, depending on the coordinate frame. Reactant does not meet the
+case study's `≤1.25× StanBlocks` value-and-gradient runtime target in this run.
+
+The table reads the committed receipt. Times are warmed median microseconds
+at one posterior position per frame, with 1,000 single-evaluation samples,
+CPU affinity 6 on `strato2`, Julia 1.10.11, and one BLAS thread. The shared host
+was not reserved. Resident Reactant calls synchronize before returning; the
+host row also transfers the position and materializes both results. Julia
+allocation counts exclude backend-managed memory. These are CPU measurements.
+
+```@eval
+using Markdown, TOML
+receipt = TOML.parsefile(joinpath(@__DIR__, "..", "..", "benchmark", "receipts",
+    "brm-hsgp-reactant-v1.toml"))
+frames = ("noncentered", "selected_partial", "mixed", "centered")
+paths = (("Julia primal", "rk_native_primal"),
+    ("Reactant primal (resident)", "reactant_primal"),
+    ("Enzyme value + gradient", "rk_native_value_gradient"),
+    ("Enzyme + Reactant value + gradient (resident)", "reactant_resident"),
+    ("Enzyme + Reactant value + gradient (host)", "reactant_host"),
+    ("StanBlocks value + gradient", "stanblocks"))
+rows = ["| Evaluation | NCP (μs) | Selected partial (μs) | Mixed (μs) | Centered (μs) | Julia bytes / allocations |",
+        "|---|---:|---:|---:|---:|---:|"]
+for (label, key) in paths
+    measurements = [receipt[frame]["runtime"][key] for frame in frames]
+    times = [string(round(m["median_ns"] / 1000; digits=2)) for m in measurements]
+    m = first(measurements)
+    push!(rows, "| $label | " * join(times, " | ") * " | $(m["bytes"]) / $(m["allocations"]) |")
+end
+Markdown.parse(join(rows, "\n"))
+```
+
+Preparation took 4.20 s for the bound kernel and 1.82 s for AD preparation.
+The first native Enzyme call took 29.80 s. Reactant primal compilation took
+24.93 s; subsequent value-and-gradient compilation took 12.42 s, followed by
+a 0.39 s first execution. These stages ran in that order in one process, so
+the second compiler measurement benefits from the first one's initialization.
+None of those costs is included in the warmed table.
+
+The compiled primal and value-and-gradient paths passed 40,072 comparisons
+against normalized StanBlocks: both supplied 10,000-draw posterior bundles,
+10,000 NCP positions transported to each of mixed and centered coordinates,
+and 18 adversarial points in every frame. Maximum absolute density error was
+`9.10e-13`; maximum componentwise gradient error scaled by `1+abs(reference)`
+was `1.55e-11`. Absolute gradient errors are recorded too: centered coordinates
+can produce enormous gradients, making an absolute tolerance alone misleading.
+
+Native Turing parity remains unverified. At the recorded BRM revision, its
+generated target retains a length-scale floor near `0.20518` despite the explicit
+prior, while Stan uses the required zero lower bound. Initialization at `ρ=0.2`
+therefore fails. The receipt explicitly records `native_verified=false`; the
+runner's default native comparison fails rather than accepting this mismatch.
+
 The [benchmark runner](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/brm_hsgp/compare.jl)
-compares normalized values and all 44 gradients against the independently
-generated BRM native Turing and StanBlocks targets. See its
+contains both the native Turing and StanBlocks comparisons. See its
 [reproduction instructions](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/brm_hsgp/README.md)
 for coordinate maps, posterior provenance, numerical errors, setup costs, and
 warmed runtime measurements.

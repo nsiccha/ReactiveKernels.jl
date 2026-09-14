@@ -103,3 +103,46 @@ The `≤1.25× StanBlocks` target must be judged with the measurement boundary
 stated. Compilation cost is never mixed into the warmed ratio. A native Turing
 target whose support differs from Stan is an unsupported comparison, not an
 opportunity to modify the model or discard posterior points.
+
+## Recorded CPU run
+
+[`../receipts/brm-hsgp-reactant-v1.toml`](../receipts/brm-hsgp-reactant-v1.toml)
+is the unmodified runner output from RK
+`214cec420a7c4c1d0a354f7febea7d6ae83f34cb`, on `strato2`, 2026-09-14:
+
+```sh
+RK_HSGP_NATIVE=0 KB_COMPACT_KEEP_LOG=1 kb-run-compact taskset -c 6 \
+  julia --startup-file=no --project=benchmark/brm_hsgp \
+  benchmark/brm_hsgp/compare.jl "$TMPDIR/brm-benchmark" "$TMPDIR/brm-comparison-full"
+```
+
+Exit 0, elapsed 353 s, retained log `$TMPDIR/kb-run-compact.Gw0SWX`.
+The [documentation page](../../docs/src/brm-hsgp.md) renders its performance
+table directly from this receipt. All four frames have 1,000 warmed samples per
+path, `evals=1`, at the midpoint posterior column; medians are not averages over
+10,000 different positions. Affinity is one CPU and BLAS one thread, on a shared
+host. Minimum timings and allocations are retained alongside medians. The
+resident value-and-gradient median is 1.59–2.97× StanBlocks, and the host result
+boundary is 3.56–5.27×: neither meets the 1.25× target. This is an initial CPU
+measurement, not a GPU result or an optimized performance ceiling.
+
+Numerical checks cover all 20,000 original posterior draws, 20,000 additional
+transported positions, and 72 adversarial positions. Maximum density error is
+`9.094947017729282e-13`; maximum gradient error scaled componentwise by
+`1+abs(Stan gradient)` is `1.5455363706851556e-11`. The full receipt keeps the
+absolute errors as well: mixed/centered adversarial gradients can be around
+`1e74`, with absolute error around `1e61` but scaled error below `1.8e-13`.
+No columns were dropped. Both the separately compiled primal and compiled
+value-plus-gradient are checked at every point.
+
+Native Turing is explicitly unsupported in this receipt. At BRM
+`8dfe41253af3043482cb3270cf513b50a1de5437`, initialization with `rho=0.2` fails
+in `Bijectors.VectorBijectors.Untruncate` inside `_BRMConstrainedKernel` and
+`_brm_turing_hsgp_term` with `DomainError(-0.005181297595301976)`. The generated
+native target retains a length-scale floor near 0.2051813, while the independently
+emitted Stan declares both length scales with `lower=0.0`. This is tracked as
+BRM snag `turing-hsgp-expl-e60fccfe`. The failed default run exited 1 after
+135 s (`$TMPDIR/kb-run-compact.rrsktz`). The literal model-definition hash is
+identical at the bundle source, the requested source, and the measured BRM
+snapshot. The runner retains the native comparison for a corrected source
+snapshot; full native parity is still an open verification boundary.
