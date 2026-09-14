@@ -74,7 +74,7 @@ function references(data, c, output, label; native_enabled=true)
     pn = native_permutation(density, c)
     @assert sort(pn) == collect(1:44)
     (; stan, ps, native, density, pn, sb_seconds, native_seconds,
-       turing_source_sha256=bytes2hex(sha256(turing_model_source(tb))))
+       turing_source_sha256=bytes2hex(sha256(string(turing_model_source(tb)))))
 end
 
 function selected_centeredness(bundle)
