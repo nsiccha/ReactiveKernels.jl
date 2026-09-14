@@ -2,8 +2,8 @@
 # lowered to both backends by the merged transpiler (no hand-written Reactant
 # kernel) — multinomial HMC on the bound Eight Schools density via the sampling
 # lane's `sampler_transpiler` consumer. Compile + first-exec warmup excluded;
-# whole batch synchronized; inputs preserved so state/rng are reused across
-# replicates. Reports median µs per transition.
+# whole batch synchronized; each replicate starts from the same preserved state
+# with a distinct preconstructed RNG seed. Reports median µs per transition.
 #
 # Run (after the sampler_transpiler env is built):
 #   julia benchmark/sampler_transpiler/setup.jl        # JULIA_NUM_PRECOMPILE_TASKS=1

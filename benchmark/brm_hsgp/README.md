@@ -10,6 +10,9 @@ measures isolated evaluations; `hmc.jl` measures the authored HMC loop below.
 
 ## Native and Reactant HMC
 
+The [measured comparison](HMC.md) includes full timings, preparation costs,
+variation, validation, and raw receipts.
+
 `hmc.jl` uses the shared `sampler_transpiler/hmc_benchmark.jl` helper, also used
 by the Eight Schools HMC timing driver. It prepares the existing multinomial
 HMC `@kernel` through `prepare_transpiled`; the algorithm and model source are

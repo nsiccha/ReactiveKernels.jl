@@ -139,7 +139,7 @@ is checked directly. Its gradient control uses BRM's supported adaptive wrapper:
 construct the NCP target, set the source centeredness, and retain the target
 frame. This combines the generated density with an audited analytic HSGP
 gradient and Enzyme coordinate transport; it is not direct Enzyme AD of
-DynamicPPL. No sampling is involved.
+DynamicPPL. Those reference checks evaluate fixed posterior positions.
 
 ## Why the timings differ
 
@@ -173,3 +173,62 @@ contains both the native Turing and StanBlocks comparisons. See its
 [reproduction instructions](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/brm_hsgp/README.md)
 for coordinate maps, posterior provenance, numerical errors, setup costs, and
 warmed runtime measurements.
+
+## Compile the HMC loop
+
+The same motorcycle kernel also runs through the
+[authored HMC transpiler](hmc-transpiler.md). Native uses prepared Enzyme
+gradients; Reactant compiles differentiation together with momentum refreshes,
+leapfrog integration, and multinomial proposal selection. This removes the
+standalone gradient-call boundary from every leapfrog step.
+
+The shared benchmark helper is
+[`HMCBenchmark.prepare_hmc` / `benchmark_hmc`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/sampler_transpiler/hmc_benchmark.jl),
+also used by the Eight Schools timing driver. It remains outside the package
+API. This comparison uses the existing mathematical sampler source on both
+backends, with 16 leapfrog steps per transition and step size 0.03.
+
+Times below are warmed median **microseconds per transition**, from nine
+batches on CPU6 of the shared host. The bracketed values are observed minimum
+and maximum, not confidence intervals. Compilation garbage is collected once;
+at least one second and three batches of additional warmup precede timing.
+Each prepared-program call preserves its input state and returns final output
+snapshots. Those wrapper costs are timed; Reactant synchronizes once per batch.
+
+```@eval
+using Markdown, TOML
+receipts = Dict(backend => TOML.parsefile(joinpath(@__DIR__, "..", "..",
+    "benchmark", "receipts", "brm-hsgp-hmc-$backend-v1.toml"))
+    for backend in ("native", "reactant"))
+rows = ["| Frame | Transitions/batch | Native + Enzyme (μs) | Reactant + Enzyme (μs) | Native / Reactant |",
+        "|---|---:|---:|---:|---:|"]
+for (frame, label) in (("noncentered", "NCP"), ("partial", "Selected partial")), t in (4, 100, 1000)
+    measured = [receipts[b]["frames"][frame]["results"][string(t)] for b in ("native", "reactant")]
+    format(m) = string(round(m["median_us_per_transition"]; digits=2), " [",
+        round(minimum(m["raw_batch_seconds"]) * 1e6 / t; digits=2), "–",
+        round(maximum(m["raw_batch_seconds"]) * 1e6 / t; digits=2), "]")
+    ratio = round(measured[1]["median_us_per_transition"] / measured[2]["median_us_per_transition"]; digits=2)
+    push!(rows, "| $label | $t | $(format(measured[1])) | $(format(measured[2])) | $(ratio)× |")
+end
+Markdown.parse(join(rows, "\n"))
+```
+
+At 1,000 transitions, Reactant is about 2.3× faster in both frames. The shared
+host produced substantial variation, so these results support the throughput
+advantage more strongly than a precise scaling curve. First HMC preparation
+took 14.75 s native and 66.74 s Reactant, in addition to density/AD preparation
+and the first native gradient. Subsequent preparations benefited from compiler
+initialization. Raw timings and all preparation stages are in the
+[full HMC report](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/brm_hsgp/HMC.md).
+
+The density retains `(q,c)` inputs and folds data-only transformations once;
+the sampler holds centeredness fixed in its callback context. Both backends
+start at posterior column 5,000 and use the same frame-specific diagonal mass,
+the inverse coordinate variance of the supplied 10,000 draws. This fixed mass
+is posterior-informed benchmark setup. All 108 timed batches and 48 continued
+batches ended at finite, moved positions with finite densities. Different RNG
+engines are used; trajectories are not required to match.
+
+This measures fixed-work HMC throughput. Adaptation, history storage, and ESS
+are outside the measurement, so the timing ratio is not an effective-samples
+ratio.

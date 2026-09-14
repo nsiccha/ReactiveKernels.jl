@@ -2,7 +2,8 @@
 
 This experimental compiler lowers the same captured HMC source to native Julia
 and Reactant. The measured workloads chain endpoint or multinomial HMC transitions over the
-[centered Eight Schools model](eight-schools.md). The compiler owns state,
+[centered Eight Schools model](eight-schools.md), with a further multinomial
+comparison on the [motorcycle HSGP model](brm-hsgp.md). The compiler owns state,
 cache reuse, control flow and backend lowering; the sampler remains mathematical
 `@kernel` source.
 
