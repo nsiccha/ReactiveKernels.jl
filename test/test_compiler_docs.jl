@@ -9,12 +9,16 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     index_path = joinpath(root, "docs", "src", "index.md")
     readme_path = joinpath(root, "README.md")
     ad_path = joinpath(root, "docs", "src", "automatic-differentiation.md")
+    manual_rules_path = joinpath(
+        root, "docs", "src", "manual-derivative-rules.md",
+    )
     distributions_ad_path = joinpath(root, "docs", "src", "distributions-ad.md")
     batched_path = joinpath(root, "docs", "src", "batched.md")
     nuts_reactant_path = joinpath(root, "docs", "src", "nuts-reactant.md")
 
     @test isfile(page_path)
     @test isfile(ad_path)
+    @test isfile(manual_rules_path)
     @test isfile(distributions_ad_path)
     @test isfile(nuts_reactant_path)
     page = _compiler_docs_lf(read(page_path, String))
@@ -22,6 +26,7 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     index = _compiler_docs_lf(read(index_path, String))
     readme = _compiler_docs_lf(read(readme_path, String))
     ad_docs = _compiler_docs_lf(read(ad_path, String))
+    manual_rules_docs = _compiler_docs_lf(read(manual_rules_path, String))
     distributions_ad_docs = _compiler_docs_lf(read(distributions_ad_path, String))
     batched_docs = _compiler_docs_lf(read(batched_path, String))
     nuts_reactant = _compiler_docs_lf(read(nuts_reactant_path, String))
@@ -70,10 +75,29 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     end
     @test occursin("Main.BatchedExamples.BATCHED_AD_SOURCE", distributions_ad_docs)
     @test occursin("test_batched_nonallocating.jl", distributions_ad_docs)
+    for marker in (
+            "# Manual derivative rule graphs (design example)",
+            "Executable design example, not a shipped adapter generator",
+            "## Current capability and required RK features",
+            "Everything that turns\nthat graph into a registered custom AD rule is new work",
+            "RK has neither feature",
+            "prepare_ad_pullback",
+            "does not consume this manual rule\ngraph",
+            "render_manual_derivative_rule_cuts()",
+            "render_manual_derivative_pullback_source()",
+            "result.captured_fields",
+            "not yet generate ChainRules, Mooncake, Enzyme, or Reactant",
+        )
+        @test occursin(marker, manual_rules_docs)
+    end
 
     @test occursin("\"Compiler capability and limits\" => \"compiler.md\"", make)
     @test occursin("\"Automatic differentiation\" => [", make)
     @test occursin("\"Prepared gradients\" => \"automatic-differentiation.md\"", make)
+    @test occursin(
+        "\"Manual derivative rules (design)\" => \"manual-derivative-rules.md\"",
+        make,
+    )
     @test occursin("compiler.md", index)
     @test occursin("warnonly = false", make)
 
