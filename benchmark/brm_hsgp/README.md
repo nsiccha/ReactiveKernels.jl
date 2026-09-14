@@ -5,7 +5,62 @@ It uses ordinary `@kernel` recipes and an observation `plate`. `prepare(...;
 bound=...)` folds the data-only basis and squared frequencies; the 44-vector
 `q` and 40-vector of centeredness controls remain live. The benchmark separately
 prepares native Enzyme AD, compiles the primal through Reactant, and compiles
-value plus gradient through `compile_ad_value_and_gradient`. It does not sample.
+value plus gradient through `compile_ad_value_and_gradient`. `compare.jl`
+measures isolated evaluations; `hmc.jl` measures the authored HMC loop below.
+
+## Native and Reactant HMC
+
+The [measured comparison](HMC.md) includes full timings, preparation costs,
+variation, validation, and raw receipts.
+
+`hmc.jl` uses the shared `sampler_transpiler/hmc_benchmark.jl` helper, also used
+by the Eight Schools HMC timing driver. It prepares the existing multinomial
+HMC `@kernel` through `prepare_transpiled`; the algorithm and model source are
+identical for both backends. Native calls prepared Enzyme gradients. Reactant
+compiles the whole batch, including gradients, leapfrog steps, momentum draws,
+and multinomial proposal selection, and synchronizes once per batch.
+
+After preparing the environment and downloading the bundle as described below,
+run each backend in a fresh process on the same CPU:
+
+```sh
+BRM_BUNDLE=BUNDLE_DIR HMC_BACKEND=native HMC_OUTPUT=native-hmc.toml \
+  JULIA_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 taskset -c 6 \
+  julia --startup-file=no --project=benchmark/brm_hsgp benchmark/brm_hsgp/hmc.jl
+BRM_BUNDLE=BUNDLE_DIR HMC_BACKEND=reactant HMC_OUTPUT=reactant-hmc.toml \
+  JULIA_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 taskset -c 6 \
+  julia --startup-file=no --project=benchmark/brm_hsgp benchmark/brm_hsgp/hmc.jl
+```
+
+Defaults are matched batches of 4, 100, and 1,000 transitions, 16 leapfrog
+steps per transition, step size 0.03, and nine timed rounds. `HMC_BATCHES`,
+`HMC_STEPS`, `HMC_STEPSIZE`, `HMC_ROUNDS`, and `HMC_FRAMES` override these.
+Both noncentered and selected-partial frames start at column 5,000 of their
+supplied posterior bundle. Each frame uses the same fixed diagonal mass on both
+backends: inverse coordinate variance over its 10,000 supplied draws. This is
+posterior-informed benchmark setup, not timed adaptation.
+
+Data-only design work is partially evaluated once. The density retains `(q,c)`
+inputs and prepares AD with only `q` active; the sampler holds `c` fixed in its
+callback context for the entire run. Changing this context requires preparing
+a new sampler. Thus HMC measures fixed-frame sampling, whereas the isolated
+evaluation comparison exposes centeredness at every executable call.
+
+Receipts separate model/AD preparation, first native gradient, HMC preparation
+(including Reactant compilation), first batch execution, and raw warmed batch
+times. Compilation garbage is collected once, then additional untimed warmup
+runs for at least one second and three batches; timed rounds include normal
+GC costs. RNG construction and
+finite-density checks are outside timing. The
+prepared interface's state copies and output snapshots remain inside timing;
+Julia allocation counts exclude C++/device runtime allocations. Timed rounds
+start from the same initial position with distinct seeds. Four continued
+batches additionally check finite, moving execution. Different RNG engines are
+used, with no cross-backend trajectory equality requirement.
+
+These runs retain only final positions and do not measure adaptation, history
+storage, ESS, or effective samples per second. Equal transition/leapfrog work
+supports a throughput comparison; it does not establish equal mixing.
 
 ## Exact target and coordinates
 
