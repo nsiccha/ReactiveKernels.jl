@@ -1,0 +1,43 @@
+source_sha256 = "af45613e443de59dc44a1c41621bb2352822a4742186dbf5b074f4724136c6fd"
+
+[native_primal]
+allocations = 6
+bytes = 2976
+median_ns = 691.0
+minimum_ns = 480.0
+samples = 100000
+
+[native_value_gradient]
+allocations = 15
+bytes = 4640
+median_ns = 1372.0
+minimum_ns = 952.0
+samples = 100000
+
+[reactant_grouped_primal]
+allocations = 16
+bytes = 704
+median_ns = 15782.0
+minimum_ns = 11096.0
+samples = 100000
+
+[reactant_grouped_value_gradient]
+allocations = 20
+bytes = 816
+median_ns = 15671.0
+minimum_ns = 12958.0
+samples = 100000
+
+[reactant_primal]
+allocations = 16
+bytes = 704
+median_ns = 15441.0
+minimum_ns = 10484.0
+samples = 100000
+
+[reactant_value_gradient]
+allocations = 20
+bytes = 816
+median_ns = 15982.0
+minimum_ns = 10755.0
+samples = 100000
