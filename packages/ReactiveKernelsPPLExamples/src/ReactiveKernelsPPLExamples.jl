@@ -15,6 +15,7 @@ include("glm_poisson.jl")
 include("glm_binomial.jl")
 include("eight_schools_noncentered.jl")
 include("glmm_poisson.jl")
+include("covid19imperial.jl")
 include("kidscore_momhs.jl")
 include("kidscore_momiq.jl")
 include("kidscore_momhsiq.jl")
@@ -115,6 +116,10 @@ include("irt_2pl.jl")
 include("2pl_latent_reg_irt.jl")
 include("hier_2pl.jl")
 include("gpcm_latent_reg_irt.jl")
+include("glmm1_model.jl")
+include("bym2_offset_only.jl")
+include("bones_model.jl")
+include("multi_occupancy.jl")
 
 export PPLWorkflow
 
@@ -149,6 +154,7 @@ export GLMPoissonExample
 export GLMBinomialExample
 export EightSchoolsNoncenteredExample
 export GLMMPoissonExample
+export Covid19ImperialExample
 export KidscoreMomhsExample
 export KidscoreMomiqExample
 export KidscoreMomhsiqExample
@@ -249,5 +255,9 @@ export Irt2plExample
 export TwoplLatentRegIrtExample
 export Hier2plExample
 export GpcmLatentRegIrtExample
+export GLMM1ModelExample
+export Bym2OffsetOnlyExample
+export BonesModelExample
+export MultiOccupancyExample
 
 end # module ReactiveKernelsPPLExamples

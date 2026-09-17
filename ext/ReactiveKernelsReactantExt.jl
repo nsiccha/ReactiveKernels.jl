@@ -1349,6 +1349,77 @@ function ReactiveKernels._replica_call(
     length(results) == 1 ? only(results) : results
 end
 
+function _replica_ad_static_slice(arg, expected_rank, replica_index)
+    if expected_rank == 0
+        row = Reactant.Ops.reshape(
+            arg, Int64[1, length(arg)])
+        scalar = Base.getindex(row, 1:1, replica_index)
+        zero_cotangent = Reactant.promote_to(
+            Reactant.TracedRNumber{Reactant.unwrapped_eltype(arg)},
+            Base.zero(Reactant.unwrapped_eltype(arg)))
+        reduced = Reactant.Ops.reduce(
+            scalar, zero_cotangent, Int64[1],
+            ((left, right) -> left + right))
+        return Reactant.TracedRNumber{
+            Reactant.unwrapped_eltype(arg)}((), reduced.mlir_data)
+    end
+    indices = ntuple(dimension -> dimension == ndims(arg) ?
+        replica_index : Colon(), ndims(arg))
+    sliced = getindex(arg, indices...)
+    sliced
+end
+
+function ReactiveKernels._replica_ad_call(
+        k::ReactiveKernels._ReplicatedADKernel{B,BT,AT}, args,
+        marker::Reactant.RArray) where {B,BT,AT}
+    prepared = k.prepared
+    replica_count = size(marker, ndims(marker))
+    for index in B
+        arg = getfield(args, index)
+        expected_rank = ReactiveKernels._replica_rank(
+            ReactiveKernels.valtype(k.inputs[index])) + 1
+        ndims(arg) == expected_rank || throw(DimensionMismatch(
+            "replica port :$(k.inputs[index].name) has rank $(ndims(arg)); " *
+            "expected $expected_rank (scalar rank plus one trailing replica axis)"))
+        size(arg, ndims(arg)) == replica_count || throw(DimensionMismatch(
+            "replica port :$(k.inputs[index].name) has " *
+            "$(size(arg, ndims(arg))) replicas; expected $replica_count"))
+    end
+
+    active_index = Int(typeof(prepared).parameters[1])
+    results = ntuple(replica_count) do replica_index
+        scalar_args = ntuple(length(args)) do argument_index
+            arg = getfield(args, argument_index)
+            position = findfirst(==(argument_index), B)
+            position === nothing && return arg
+            expected_rank = ReactiveKernels._replica_rank(
+                ReactiveKernels.valtype(k.inputs[argument_index]))
+            _replica_ad_static_slice(arg, expected_rank, replica_index)
+        end
+        point, contexts = ReactiveKernels._ad_arguments(
+            Val(active_index), scalar_args)
+        ReactiveKernels._ad_prepared_value_and_gradient(
+            prepared, point, contexts)
+    end
+
+    values = ntuple(index -> Reactant.Ops.broadcast_in_dim(
+        first(results[index]), Int64[], Int64[1]), replica_count)
+    value = Reactant.Ops.concatenate(collect(values), 1)
+    gradient_rank = ReactiveKernels._replica_rank(AT)
+    if gradient_rank == 0
+        gradients = ntuple(index -> Reactant.Ops.broadcast_in_dim(
+            last(results[index]), Int64[], Int64[1]), replica_count)
+    else
+        gradients = ntuple(index -> Reactant.Ops.reshape(
+            last(results[index]),
+            vcat(collect(Int64, size(last(results[index]))), Int64[1])),
+            replica_count)
+    end
+    gradient = Reactant.Ops.concatenate(
+        collect(gradients), gradient_rank + 1)
+    value, gradient
+end
+
 # --- Reactant-compiled automatic differentiation -----------------------------
 # Selected by core's `compile_ad_gradient` / `compile_ad_value_and_gradient` when
 # the active argument is a Reactant-traced value. The differentiation engine is

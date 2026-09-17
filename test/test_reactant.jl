@@ -1,5 +1,6 @@
 using ReactiveKernels
 using Reactant
+using DifferentiationInterface: AutoEnzyme
 using LinearAlgebra
 using LogExpFunctions: log1pexp
 using Random
@@ -69,6 +70,14 @@ end
     accept::Bool = log(u) < -0.05 * kinetic
     q_next::Vector{Float64} = accept ? proposal : q
     return (q_next, accept, kinetic)
+end
+
+@kernel reactant_replica_normal(
+        x::Vector{Float64}, location::Float64, logscale::Float64) = begin
+    standardized = (x .- location) ./ exp(logscale)
+    total::Float64 = -0.5 * sum(abs2, standardized) - length(x) * logscale -
+                     0.5 * length(x) * log(2π)
+    return total
 end
 
 @kernel reactant_hmc_transition(
@@ -556,6 +565,44 @@ end
         @test Array(q_next) == reference[1]
         @test Array(accept) == reference[2]
         @test Array(kinetic) ≈ reference[3]
+    end
+
+    @testset "replicated scalar AD compiles under Reactant" begin
+        backend = AutoEnzyme(mode = Enzyme.Reverse)
+
+        scalar_prepared = prepare_ad(
+            reactant_normal_logscale, backend, 0.2, 0.1, log(1.2);
+            active = :x, want = :ld)
+        scalar_replicated = replica(scalar_prepared; batched = :x)
+        scalar_positions = [0.0, 0.4, 0.9]
+        scalar_reference = scalar_replicated(scalar_positions, 0.1, log(1.2))
+        scalar_compiled = @compile scalar_replicated(
+            Reactant.to_rarray(scalar_positions),
+            Reactant.to_rarray(0.1; track_numbers = true),
+            Reactant.to_rarray(log(1.2); track_numbers = true))
+        scalar_values, scalar_gradients = scalar_compiled(
+            Reactant.to_rarray(scalar_positions),
+            Reactant.to_rarray(0.1; track_numbers = true),
+            Reactant.to_rarray(log(1.2); track_numbers = true))
+        @test Array(scalar_values) ≈ scalar_reference[1]
+        @test Array(scalar_gradients) ≈ scalar_reference[2]
+
+        vector_prepared = prepare_ad(
+            reactant_replica_normal, backend, collect(0.2:0.1:0.7), 0.1,
+            log(1.2); active = :x, want = :total)
+        vector_replicated = replica(vector_prepared; batched = :x)
+        positions = reshape(collect(0.0:0.05:1.15), 6, 4)
+        vector_reference = vector_replicated(positions, 0.1, log(1.2))
+        vector_compiled = @compile vector_replicated(
+            Reactant.to_rarray(positions),
+            Reactant.to_rarray(0.1; track_numbers = true),
+            Reactant.to_rarray(log(1.2); track_numbers = true))
+        values, gradients = vector_compiled(
+            Reactant.to_rarray(positions),
+            Reactant.to_rarray(0.1; track_numbers = true),
+            Reactant.to_rarray(log(1.2); track_numbers = true))
+        @test Array(values) ≈ vector_reference[1]
+        @test Array(gradients) ≈ vector_reference[2]
     end
 
     @testset "scalar-source HMC compiles once and replicas without a rewrite" begin

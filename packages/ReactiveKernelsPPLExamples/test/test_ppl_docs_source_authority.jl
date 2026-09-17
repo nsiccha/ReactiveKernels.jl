@@ -17,6 +17,8 @@ const PPL_SOURCE_CASES = (
      :DUGONGS_SOURCE, :evaluate_dugongs_source),
     ("arma11.md", "arma11.jl", ARMA11Example,
      :ARMA11_SOURCE, :evaluate_arma11_source),
+    ("covid19imperial.md", "covid19imperial.jl", Covid19ImperialExample,
+     :COVID19IMPERIAL_SOURCE, :evaluate_covid19imperial_source),
     ("mnist-logistic.md", "mnist_logistic.jl", MNISTLogisticExample,
      :MNIST_LOGISTIC_SOURCE, :evaluate_mnist_logistic_source),
     ("mnist-logistic.md", "mnist_logistic.jl", MNISTLogisticExample,
@@ -53,6 +55,14 @@ const PPL_SOURCE_CASES = (
      :HIER_2PL_SOURCE, :evaluate_hier_2pl_source),
     ("gpcm-latent-reg-irt.md", "gpcm_latent_reg_irt.jl", GpcmLatentRegIrtExample,
      :GPCM_LR_SOURCE, :evaluate_gpcm_latent_reg_irt_source),
+    ("glmm1.md", "glmm1_model.jl", GLMM1ModelExample,
+     :GLMM1_SOURCE, :evaluate_glmm1_model_source),
+    ("bym2-offset-only.md", "bym2_offset_only.jl", Bym2OffsetOnlyExample,
+     :BYM2_SOURCE, :evaluate_bym2_offset_only_source),
+    ("bones.md", "bones_model.jl", BonesModelExample,
+     :BONES_SOURCE, :evaluate_bones_model_source),
+    ("multi-occupancy.md", "multi_occupancy.jl", MultiOccupancyExample,
+     :MULTI_OCC_SOURCE, :evaluate_multi_occupancy_source),
 )
 
 # One displayed/executed authority kernel per registered case: a file carrying
@@ -108,6 +118,9 @@ end
     helper_source = read(
         joinpath(REPOSITORY_ROOT, "docs", "kernel_examples.jl"), String,
     )
+    rendered_contract_source = read(
+        joinpath(REPOSITORY_ROOT, "docs", "check_rendered.jl"), String,
+    )
     @test occursin("warnonly = false", make_source)
     @test !occursin("warnonly = Documenter.except(:eval_block)", make_source)
     @test occursin("assert_ppl_examples_executed!()", make_source)
@@ -132,7 +145,22 @@ end
         :two_pl_latent_reg_irt_posterior,
         :hier_2pl_posterior,
         :gpcm_latent_reg_irt_posterior,
+        :glmm1_model_posterior,
+        :bym2_offset_only_posterior,
+        :bones_model_posterior,
+        :multi_occupancy_posterior,
     )
-        @test occursin(":" * string(name), helper_source)
+        marker = ":" * string(name)
+        @test count(marker, helper_source) == 1
+    end
+
+    # The exact-once PPL execution gate must fail closed on an unknown name;
+    # otherwise a misspelled artifact name is silently unrecorded.
+    @test occursin("unknown PPL example execution name", helper_source)
+
+    # Each latent/spatial page contributes exactly one executable source panel.
+    for page in ("glmm1.md", "bym2-offset-only.md", "bones.md",
+                 "multi-occupancy.md")
+        @test occursin("\"$page\" => 1", rendered_contract_source)
     end
 end

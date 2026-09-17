@@ -54,6 +54,37 @@ function _generated_source(expr::Expr)
     sprint(Base.show_unquoted, expr; context = :limit => false)
 end
 
+# Vitepress/Shiki amplifies a single long generated-code line into several MiB
+# of highlighted HTML/JS. Preserve the executed artifact and its exact output in
+# the build gate, but give readers a bounded generated preview rather than
+# highlighting megabytes of inlined constants.
+function _display_code(label::AbstractString, code::AbstractString;
+                       max_bytes::Int = 64 * 1024)
+    sizeof(code) <= max_bytes && return code
+    lines = split(code, '\n'; keepempty = true)
+    head_lines = first(lines, 24)
+    tail_lines = last(lines, 12)
+    while sizeof(join(vcat(head_lines, ["…"], tail_lines), '\n')) > max_bytes &&
+          length(head_lines) > 4 && length(tail_lines) > 2
+        if length(head_lines) > length(tail_lines)
+            head_lines = head_lines[1:(end - 1)]
+        else
+            tail_lines = tail_lines[2:end]
+        end
+    end
+    omitted_bytes = sizeof(code) -
+        sizeof(join(vcat(head_lines, tail_lines), '\n'))
+    return join(vcat(
+        head_lines,
+        [
+            "# … display bounded for docs build memory …",
+            "# $(length(lines)) lines total; about $(Base.format_bytes(sizeof(code))) total,",
+            "# about $(Base.format_bytes(max(omitted_bytes, 0))) omitted here.",
+        ],
+        tail_lines,
+    ), '\n')
+end
+
 function _readable_generated_source(expr::Expr, context, label)
     readable = ReactiveKernels._readable_expr(expr, context)
     occursin(r"__ops__\[\d+\]", string(readable)) && error(
@@ -289,6 +320,22 @@ function setup_arma11!(mod::Module)
     nothing
 end
 
+function setup_covid19imperial!(mod::Module)
+    if !isdefined(mod, :Covid19ImperialExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: Covid19ImperialExample))
+    end
+    # Bind only the RAW posteriordb arrays; the displayed PPL assembly derives
+    # every model-specific preprocessing step (covariate reshape, observed-grid
+    # mask, deaths grid, count log-factorial) as named in-graph nodes and reuses
+    # the shared `normal`, `gamma`, and `exponential` endpoints directly.
+    Core.eval(mod, :(using .Covid19ImperialExample: COVID19IMPERIAL_X,
+        COVID19IMPERIAL_EPIDEMICSTART, COVID19IMPERIAL_N, COVID19IMPERIAL_DEATHS,
+        COVID19IMPERIAL_SI, COVID19IMPERIAL_F, COVID19IMPERIAL_POP,
+        COVID19IMPERIAL_M, COVID19IMPERIAL_P, COVID19IMPERIAL_N0,
+        COVID19IMPERIAL_N2))
+    nothing
+end
+
 function setup_mvnormal_regression!(mod::Module)
     if !isdefined(mod, :MVNormalRegressionExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: MVNormalRegressionExample))
@@ -517,6 +564,48 @@ function setup_gpcm_latent_reg_irt!(mod::Module)
     nothing
 end
 
+function setup_glmm1!(mod::Module)
+    if !isdefined(mod, :GLMM1ModelExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: GLMM1ModelExample))
+    end
+    # Bind only the raw counts + site indices; the displayed PPL assembly imports
+    # the shared normal/poisson endpoints itself and gathers alpha[obssite] in-graph.
+    Core.eval(mod, :(using .GLMM1ModelExample: GLMM1_OBS, GLMM1_OBSSITE, GLMM1_NSITE))
+    nothing
+end
+
+function setup_bym2_offset_only!(mod::Module)
+    if !isdefined(mod, :Bym2OffsetOnlyExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: Bym2OffsetOnlyExample))
+    end
+    # Bind only the raw adjacency/counts/exposure/scaling; log_E, convolved_re and
+    # the ICAR phi[node1]/phi[node2] gathers are derived in-graph.
+    Core.eval(mod, :(using .Bym2OffsetOnlyExample:
+        BYM2_NODE1, BYM2_NODE2, BYM2_Y, BYM2_E, BYM2_SCALING_FACTOR))
+    nothing
+end
+
+function setup_bones!(mod::Module)
+    if !isdefined(mod, :BonesModelExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: BonesModelExample))
+    end
+    # Bind only the raw grade/gamma/delta/ncat block; grid coordinates and the
+    # ragged cut selection are all derived in-graph.
+    Core.eval(mod, :(using .BonesModelExample: BONES_GRADE, BONES_GAMMA, BONES_DELTA, BONES_NCAT))
+    nothing
+end
+
+function setup_multi_occupancy!(mod::Module)
+    if !isdefined(mod, :MultiOccupancyExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: MultiOccupancyExample))
+    end
+    # Bind only the raw n×J detection matrix + dims; the flat counts, species
+    # coordinate and binomial normalizer are all derived in-graph.
+    Core.eval(mod, :(using .MultiOccupancyExample:
+        MULTI_OCC_X, MULTI_OCC_N, MULTI_OCC_J, MULTI_OCC_K, MULTI_OCC_S))
+    nothing
+end
+
 function setup_online_stats!(mod::Module)
     if !isdefined(mod, :OnlineStatsExample)
         Base.include(mod, joinpath(@__DIR__, "..", "examples", "online_stats.jl"))
@@ -686,12 +775,12 @@ function _three_pane_blocks!(blocks, artifact_id, title, source, generated, dag:
      data-rk-artifact-kind="example-panel">
 <div data-rk-pane="source">
 """))
-    push!(blocks, Markdown.Code("julia", source))
+    push!(blocks, Markdown.Code("julia", _display_code("source", source)))
     push!(blocks, RawHTML("""
 </div>
 <div data-rk-pane="kernel">
 """))
-    push!(blocks, Markdown.Code("julia", generated))
+    push!(blocks, Markdown.Code("julia", _display_code("generated", generated)))
     push!(blocks, RawHTML("""
 </div>
 <div data-rk-pane="dag">
@@ -830,7 +919,8 @@ kernel through the standard three-view UI. The source must bind `result` to a
 named tuple with `name`, `origin`, `inputs`, `kernel`, and `output` fields.
 """
 function execute_example(mod::Module, code::AbstractString;
-                         result::Symbol = :docs_example, setup = nothing)
+                         result::Symbol = :docs_example, setup = nothing,
+                         gate::Bool = false)
     displayed = strip(code, '\n')
     Core.eval(mod, :(using ReactiveKernels))
     setup === nothing || setup(mod)
@@ -855,7 +945,7 @@ function execute_example(mod::Module, code::AbstractString;
         ),
     )
     rendered = render_examples((artifact,))
-    _record_ppl_execution!(executed.name)
+    gate && _record_ppl_execution!(executed.name)
     rendered
 end
 
@@ -1003,7 +1093,7 @@ function execute_ppl_example(mod::Module, owner::Symbol, source::Symbol;
     isdefined(owner_module, source) || error("$owner does not define source $source")
     code = getfield(owner_module, source)
     code isa AbstractString || error("$owner.$source is not source text")
-    execute_example(mod, code; result, setup = nothing)
+    execute_example(mod, code; result, setup = nothing, gate = true)
 end
 
 const EXPECTED_PPL_EXAMPLES = (
@@ -1022,6 +1112,7 @@ const EXPECTED_PPL_EXAMPLES = (
     :normal_mixture_k_posterior,
     :dogs_nonhierarchical_posterior,
     :logistic_regression_rhs_posterior,
+    :covid19imperial_density,
     :lda_density,
     :nn_rbm_density,
     :gp_regr_posterior,
@@ -1036,15 +1127,20 @@ const EXPECTED_PPL_EXAMPLES = (
     :two_pl_latent_reg_irt_posterior,
     :hier_2pl_posterior,
     :gpcm_latent_reg_irt_posterior,
+    :glmm1_model_posterior,
+    :bym2_offset_only_posterior,
+    :bones_model_posterior,
+    :multi_occupancy_posterior,
 )
 const _PPL_EXECUTION_COUNTS = Dict(name => 0 for name in EXPECTED_PPL_EXAMPLES)
 
 function _record_ppl_execution!(name::Symbol)
+    # execute_example is shared by PPL and non-PPL executable docs; only PPL
+    # names participate in the exact-once posterior-walkthrough gate.
     haskey(_PPL_EXECUTION_COUNTS, name) || return nothing
     _PPL_EXECUTION_COUNTS[name] += 1
     nothing
 end
-
 function assert_ppl_examples_executed!()
     failures = String[]
     for name in EXPECTED_PPL_EXAMPLES
