@@ -269,6 +269,7 @@ function _kernel_add!(graph::Graph, ins, outs, spec::KernelSpec, cost, cse_key,
         "boundary has $(length(child_outputs)) port(s); destructure that boundary exactly"))
 
     child_graph = spec.graph
+    child_have = Set{Int}(canon_id(child_graph, v.id) for v in child_inputs)
     cloned = Dict{Int,Value}()
     for id in sort!(collect(keys(child_graph.values)))
         value = child_graph.values[id]
@@ -294,6 +295,17 @@ function _kernel_add!(graph::Graph, ins, outs, spec::KernelSpec, cost, cse_key,
     end
 
     for recipe in child_graph.recipes
+        # A nested recipe that produces only HAVE values recomputes
+        # caller-supplied inputs: every nested HAVE is aliased to a caller
+        # actual just above, so the values are available with no recipe.
+        # Cloning it manufactures a spurious alternative producer for every
+        # call site, and the planner's exact search is exponential in the
+        # number of such producers. Recipes with any non-HAVE output are
+        # kept unchanged, and effectful recipes are never skipped.
+        if !recipe.effectful && all(
+                o -> canon_id(child_graph, o.id) in child_have, recipe.outputs)
+            continue
+        end
         add!(graph;
              inputs = Tuple(cloned[value.id] for value in recipe.inputs),
              outputs = Tuple(cloned[value.id] for value in recipe.outputs),
