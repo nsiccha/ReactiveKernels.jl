@@ -140,6 +140,7 @@ function gate(name; graph, have, bind, scale = 0.3, npts = 4, seed = 468,
             gs = sgrad(sm, q)
             @assert all(isfinite, gr) "$name pt$i: native gradient not finite"
             rg = relerr(gr, gs)
+            max_g = max(max_g, rg)
             println("  pt$i native=$vr stan=$vs val_rel=$rv grad_rel=$rg"); flush(stdout)
         else
             println("  pt$i native=$vr stan=$vs val_rel=$rv grad=SKIPPED-per-boundary"); flush(stdout)
