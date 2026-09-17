@@ -4,7 +4,7 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     SumToZeroExample,
     LinearRegressionExample, BetaBinomialExample, PoissonGammaExample,
     GLMPoissonExample, GLMBinomialExample, EightSchoolsNoncenteredExample,
-    GLMMPoissonExample, BLRExample,
+    GLMMPoissonExample, Covid19ImperialExample, BLRExample,
     MesquiteExample, LogmesquiteExample, LogmesquiteLogvolumeExample, LogmesquiteLogvaExample, LogmesquiteLogvasExample, LogmesquiteLogvashExample, KilpisjarviExample, EarnHeightExample, LogearnHeightExample, Log10earnHeightExample, LogearnInteractionExample, LogearnHeightMaleExample, LogearnLogheightMaleExample, LogearnInteractionZExample, ARKExample, MhExample,
     NesLogitExample, WellsDistExample, WellsDist100Example, DogsLogExample, NESExample, KidscoreMomWorkExample, Rate1Example,
     RadonPooledExample, RadonPartiallyPooledCenteredExample, RadonPartiallyPooledNoncenteredExample, RadonVariableInterceptCenteredExample,
@@ -39,6 +39,7 @@ include("test_glm_poisson_example.jl")
 include("test_glm_binomial_example.jl")
 include("test_eight_schools_noncentered_example.jl")
 include("test_glmm_poisson_example.jl")
+include("test_covid19imperial_example.jl")
 include("test_blr_example.jl")
 include("test_mesquite_example.jl")
 include("test_logmesquite_example.jl")

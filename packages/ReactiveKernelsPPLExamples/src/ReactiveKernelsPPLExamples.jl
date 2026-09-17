@@ -15,6 +15,7 @@ include("glm_poisson.jl")
 include("glm_binomial.jl")
 include("eight_schools_noncentered.jl")
 include("glmm_poisson.jl")
+include("covid19imperial.jl")
 include("kidscore_momhs.jl")
 include("kidscore_momiq.jl")
 include("kidscore_momhsiq.jl")
@@ -149,6 +150,7 @@ export GLMPoissonExample
 export GLMBinomialExample
 export EightSchoolsNoncenteredExample
 export GLMMPoissonExample
+export Covid19ImperialExample
 export KidscoreMomhsExample
 export KidscoreMomiqExample
 export KidscoreMomhsiqExample
