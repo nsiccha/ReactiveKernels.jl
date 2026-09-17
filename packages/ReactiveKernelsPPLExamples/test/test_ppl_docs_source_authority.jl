@@ -17,6 +17,8 @@ const PPL_SOURCE_CASES = (
      :DUGONGS_SOURCE, :evaluate_dugongs_source),
     ("arma11.md", "arma11.jl", ARMA11Example,
      :ARMA11_SOURCE, :evaluate_arma11_source),
+    ("covid19imperial.md", "covid19imperial.jl", Covid19ImperialExample,
+     :COVID19IMPERIAL_SOURCE, :evaluate_covid19imperial_source),
     ("mnist-logistic.md", "mnist_logistic.jl", MNISTLogisticExample,
      :MNIST_LOGISTIC_SOURCE, :evaluate_mnist_logistic_source),
     ("mnist-logistic.md", "mnist_logistic.jl", MNISTLogisticExample,

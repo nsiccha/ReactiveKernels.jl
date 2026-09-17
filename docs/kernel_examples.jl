@@ -289,6 +289,22 @@ function setup_arma11!(mod::Module)
     nothing
 end
 
+function setup_covid19imperial!(mod::Module)
+    if !isdefined(mod, :Covid19ImperialExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: Covid19ImperialExample))
+    end
+    # Bind only the RAW posteriordb arrays; the displayed PPL assembly derives
+    # every model-specific preprocessing step (covariate reshape, observed-grid
+    # mask, deaths grid, count log-factorial) as named in-graph nodes and reuses
+    # the shared `normal`, `gamma`, and `exponential` endpoints directly.
+    Core.eval(mod, :(using .Covid19ImperialExample: COVID19IMPERIAL_X,
+        COVID19IMPERIAL_EPIDEMICSTART, COVID19IMPERIAL_N, COVID19IMPERIAL_DEATHS,
+        COVID19IMPERIAL_SI, COVID19IMPERIAL_F, COVID19IMPERIAL_POP,
+        COVID19IMPERIAL_M, COVID19IMPERIAL_P, COVID19IMPERIAL_N0,
+        COVID19IMPERIAL_N2))
+    nothing
+end
+
 function setup_mvnormal_regression!(mod::Module)
     if !isdefined(mod, :MVNormalRegressionExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: MVNormalRegressionExample))
@@ -1022,6 +1038,7 @@ const EXPECTED_PPL_EXAMPLES = (
     :normal_mixture_k_posterior,
     :dogs_nonhierarchical_posterior,
     :logistic_regression_rhs_posterior,
+    :covid19imperial_density,
     :lda_density,
     :nn_rbm_density,
     :gp_regr_posterior,

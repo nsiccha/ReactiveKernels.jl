@@ -61,6 +61,7 @@ site_pages = [
             "Poisson-Gamma" => "poisson-gamma.md",
             "Dugongs (nonlinear growth)" => "dugongs-growth.md",
             "ARMA(1,1) time series" => "arma11.md",
+            "Imperial covid19 renewal model" => "covid19imperial.md",
             "Correlated (MvNormal) regression" => "mvnormal-regression.md",
             "Partial evaluation (bound data)" => "bound-regression.md",
             "Diamonds (brms centered regression)" => "diamonds.md",
