@@ -78,6 +78,10 @@ const _M = ReactiveKernelsPPLExamples
             (_M.NormalMixtureKExample, :evaluate_normal_mixture_k_source),
             (_M.DogsNonhierarchicalExample, :evaluate_dogs_nonhierarchical_source),
             (_M.LogisticRegressionRHSExample, :evaluate_logistic_regression_rhs_source),
+            (_M.Irt2plExample, :evaluate_irt_2pl_source),
+            (_M.TwoplLatentRegIrtExample, :evaluate_2pl_latent_reg_irt_source),
+            (_M.Hier2plExample, :evaluate_hier_2pl_source),
+            (_M.GpcmLatentRegIrtExample, :evaluate_gpcm_latent_reg_irt_source),
         )
             mo = getproperty(mod, fn)(; model_only = true)
             @test mo.model isa _RK.KernelSpec
@@ -208,5 +212,75 @@ const _M = ReactiveKernelsPPLExamples
         lpv(g) = prepare(g; have = _lhave(), want = :posterior, bound = _lbound())(_lq())
         @test lpv(L.build_logistic_regression_rhs_graph()) ==
               lpv(compose(L.evaluate_logistic_regression_rhs_source().model))
+    end
+
+    @testset "IRT posteriordb modules: first use world-age-safe in one function" begin
+        # All four cold-start calls run BEFORE any full IRT source evaluation.
+        # Each enters one ordinary function containing build, prepare, and
+        # execute, so a lazy build that Core.eval'd here would fail immediately.
+        function irt_first_use(build, have, bound, q)
+            graph = build()
+            kernel = prepare(graph; have, want = :posterior, bound = bound)
+            kernel(q)
+        end
+
+        I = _M.Irt2plExample
+        T = _M.TwoplLatentRegIrtExample
+        H = _M.Hier2plExample
+        G = _M.GpcmLatentRegIrtExample
+        iq = zeros(Float64, 2 * size(I.IRT_2PL_Y, 1) + size(I.IRT_2PL_Y, 2) + 4)
+        tq = zeros(Float64, 2 * T.TWOPL_LR_I + size(T.TWOPL_LR_W, 1) +
+                          size(T.TWOPL_LR_W, 2) - 1)
+        hq = zeros(Float64, H.HIER_2PL_J + 2 * H.HIER_2PL_I + 5)
+        g_m = [maximum(G.GPCM_LR_Y[G.GPCM_LR_II .== i]) for i in 1:G.GPCM_LR_I]
+        gq = zeros(Float64, G.GPCM_LR_I + sum(g_m) + size(G.GPCM_LR_W, 1) +
+                          size(G.GPCM_LR_W, 2) - 1)
+
+        iv = irt_first_use(I.build_irt_2pl_graph, (:unconstrained, :y),
+                           (; y = I.IRT_2PL_Y), iq)
+        tv = irt_first_use(T.build_2pl_latent_reg_irt_graph,
+                           (:unconstrained, :ii, :jj, :y, :W, :I),
+                           (; ii = T.TWOPL_LR_II, jj = T.TWOPL_LR_JJ,
+                              y = T.TWOPL_LR_Y, W = T.TWOPL_LR_W,
+                              I = T.TWOPL_LR_I), tq)
+        hv = irt_first_use(H.build_hier_2pl_graph,
+                           (:unconstrained, :ii, :jj, :y, :I, :J),
+                           (; ii = H.HIER_2PL_II, jj = H.HIER_2PL_JJ,
+                              y = H.HIER_2PL_Y, I = H.HIER_2PL_I,
+                              J = H.HIER_2PL_J), hq)
+        gv = irt_first_use(G.build_gpcm_latent_reg_irt_graph,
+                           (:unconstrained, :ii, :jj, :y, :W, :I),
+                           (; ii = G.GPCM_LR_II, jj = G.GPCM_LR_JJ,
+                              y = G.GPCM_LR_Y, W = G.GPCM_LR_W,
+                              I = G.GPCM_LR_I), gq)
+        @test all(isfinite, (iv, tv, hv, gv))
+
+        # Only after first use, prove each template is exactly the full authored
+        # source graph at the same point.
+        ipv(g) = prepare(g; have = (:unconstrained, :y), want = :posterior,
+                         bound = (; y = I.IRT_2PL_Y))(iq)
+        @test ipv(I.build_irt_2pl_graph()) ==
+              ipv(compose(I.evaluate_irt_2pl_source().model))
+        tpv(g) = prepare(g; have = (:unconstrained, :ii, :jj, :y, :W, :I),
+                         want = :posterior,
+                         bound = (; ii = T.TWOPL_LR_II, jj = T.TWOPL_LR_JJ,
+                                    y = T.TWOPL_LR_Y, W = T.TWOPL_LR_W,
+                                    I = T.TWOPL_LR_I))(tq)
+        @test tpv(T.build_2pl_latent_reg_irt_graph()) ==
+              tpv(compose(T.evaluate_2pl_latent_reg_irt_source().model))
+        hpv(g) = prepare(g; have = (:unconstrained, :ii, :jj, :y, :I, :J),
+                         want = :posterior,
+                         bound = (; ii = H.HIER_2PL_II, jj = H.HIER_2PL_JJ,
+                                    y = H.HIER_2PL_Y, I = H.HIER_2PL_I,
+                                    J = H.HIER_2PL_J))(hq)
+        @test hpv(H.build_hier_2pl_graph()) ==
+              hpv(compose(H.evaluate_hier_2pl_source().model))
+        gpv(g) = prepare(g; have = (:unconstrained, :ii, :jj, :y, :W, :I),
+                         want = :posterior,
+                         bound = (; ii = G.GPCM_LR_II, jj = G.GPCM_LR_JJ,
+                                    y = G.GPCM_LR_Y, W = G.GPCM_LR_W,
+                                    I = G.GPCM_LR_I))(gq)
+        @test gpv(G.build_gpcm_latent_reg_irt_graph()) ==
+              gpv(compose(G.evaluate_gpcm_latent_reg_irt_source().model))
     end
 end

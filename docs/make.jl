@@ -73,6 +73,10 @@ site_pages = [
             "Accel splines (brms penalized splines)" => "accel-splines.md",
             "State space (structural DLM)" => "state-space-stochastic.md",
             "Prophet (piecewise-trend forecasting)" => "prophet.md",
+            "IRT 2PL (item response)" => "irt-2pl.md",
+            "IRT 2PL + latent regression" => "2pl-latent-reg-irt.md",
+            "IRT hierarchical 2PL (correlated items)" => "hier-2pl.md",
+            "IRT GPCM (ordinal + latent regression)" => "gpcm-latent-reg-irt.md",
         ],
         "Gaussian processes" => [
             "GP regression (marginal)" => "gp-regr.md",
