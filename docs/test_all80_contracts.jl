@@ -1,6 +1,7 @@
 # Fail-closed rendered contract for the published native all-82 checkpoint.
 using Test
 import TOML, Markdown
+import Base64
 include(joinpath(@__DIR__, "..", "benchmark", "all80_receipt.jl"))
 using .All80Receipt
 # make.jl includes this file at Main top level while the table builders live in
@@ -162,6 +163,21 @@ end
     summary_text = sprint(show, RKD.render_all80_batch1_summary(path))
     @test occursin("not certified as ordinary-AE publication evidence", summary_text)
     @test occursin("Reactant phase provenance absent", summary_text)
+    tables_text = sprint(show, RKD.render_all80_batch1_tables(path))
+    @test occursin("Historical batch-1 primal", tables_text)
+    @test occursin("Historical batch-1 HMC", tables_text)
+    @test occursin("Recorded transitions", tables_text)
+    @test occursin("Reactant: 4", tables_text)
+    @test occursin("not a matched-T claim", tables_text)
+    function plot_text(node)
+        html = node.content isa AbstractString ? node.content : node.content[1].content
+        payload = only(match(
+            r"data-rk-exec-payload=\"([^\"]+)", html).captures)
+        String(Base64.base64decode(payload))
+    end
+    plots_text = plot_text(RKD.render_all80_batch1_coverage_plot(path)) *
+        plot_text(RKD.render_all80_batch1_speedup_plot(path))
+    @test occursin("uncertified", plots_text)
     # The real renderer still uses its own path and marks Diamonds a workload mismatch.
     @test path != RKD._ALL80_BENCHMARK_PATH
     dia = [r for r in RKD._all80_speedup_rows(models)

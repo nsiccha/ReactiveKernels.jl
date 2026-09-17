@@ -90,7 +90,7 @@ stan_val(sm, q) = BridgeStan.log_density(sm, q; propto = false, jacobian = true)
 stan_grad(sm, q) = BridgeStan.log_density_gradient(sm, q; propto = false, jacobian = true)[2]
 relerr(a, b) = maximum(abs, a .- b) / max(maximum(abs, b), eps())
 
-function _input_identity(post, points; phase, seed, scale, draws, stan_perm)
+function _input_identity(post, name, points; phase, seed, scale, draws, stan_perm)
     dataset = PosteriorDB.dataset(post)
     stan_path = PosteriorDB.path(PosteriorDB.implementation(
         PosteriorDB.model(post), "stan"))
@@ -308,7 +308,7 @@ function run_one(name; seed = 468, scale = 0.2, draws = 3)
 
     q = points[1]; qt = cmap(sq(q)); gbuf = similar(q)
     md = All80Metadata.meta(name)
-    input_identity = _input_identity(post, points; phase = PHASE, seed, scale,
+    input_identity = _input_identity(post, name, points; phase = PHASE, seed, scale,
         draws, stan_perm = e.stan_perm)
     ctx = (; dim = dim, family = md.family, note = md.note,
         parity_pass = parity_pass, rk_off = rk_off, tu_off = tu_off, off_reason = e.off_reason,

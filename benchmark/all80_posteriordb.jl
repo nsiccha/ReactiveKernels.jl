@@ -95,9 +95,10 @@ function _phase_harness_files(phase)
     common = ("all80_posteriordb.jl", "all80_registry.jl", "all80_receipt.jl",
               "all80_axes.jl")
     phase == "native" ? (common..., "all80_posteriordb_body.jl",
-        "all80_metadata.jl", "all80_parity.jl", _HMC_HARNESS_FILES...) :
+        "all80_metadata.jl", "all80_parity.jl",
+        All80Receipt._HMC_HARNESS_FILES...) :
         (common..., "all80_reactant_body.jl", "all80_reactant_evals.jl",
-         _HMC_HARNESS_FILES...)
+         All80Receipt._HMC_HARNESS_FILES...)
 end
 
 function _write_phase_source_lock(phase, up, requested_keys, run_id)
@@ -141,10 +142,12 @@ function _run()
     duplicated = unique(filter(key -> count(==(key), non_flag) > 1, non_flag))
     isempty(duplicated) ||
         error("RK_ALL80 duplicate model key(s) requested: $(join(duplicated, ", "))")
+    isempty(batch) || get(ENV, "RK_ALL80_RESUME", "") != "1" ||
+        error("RK_ALL80_BATCH resume is disabled: no durable same-run lock handle exists. Preserve the old phase receipt and start a fresh exact-key run")
     phases = String.(split(get(ENV, "RK_ALL80_PHASES", "native,reactant"), ','))
     phase_receipts = String[]
     locks = String[]
-    run_id = bytes2hex(rand(RandomDevice, UInt8, 16))
+    run_id = bytes2hex(rand(RandomDevice(), UInt8, 16))
     for ph in phases
         rec = joinpath(RECEIPT_DIR, "$(prefix)-$(ph).toml")
         lock = isempty(batch) ? "" : _write_phase_source_lock(ph, up, non_flag, run_id)
@@ -157,9 +160,10 @@ function _run()
     end
     # Deterministic aggregation of the phase receipts into the final receipt.
     out = joinpath(RECEIPT_DIR, "$(prefix)-v1.toml")
+    staged = out * ".stage.toml"
     meta = isempty(batch) ? Dict("dppl_sha" => DPPL_SHA, "args" => collect(ARGS)) :
                             Dict("dppl_sha" => DPPL_SHA, "args" => collect(ARGS), "batch" => batch)
-    Base.invokelatest(All80Receipt.aggregate, phase_receipts, out;
+    Base.invokelatest(All80Receipt.aggregate, phase_receipts, staged;
         meta = meta, preserve_provenance = !isempty(batch),
         require_phases = isempty(batch) ? String[] : phases,
         expected_keys = isempty(batch) ? String[] : non_flag,
@@ -168,10 +172,10 @@ function _run()
     complete = isempty(batch) && isempty(non_flag) && Set(phases) == Set(["native", "reactant"])
     issues = if isempty(batch)
         # A complete default run also gates the ROW COUNT (all 82 present), not just cell fill.
-        Base.invokelatest(All80Receipt.validate, out;
+        Base.invokelatest(All80Receipt.validate, staged;
             expected_models = complete ? 82 : nothing)
     else
-        Base.invokelatest(All80Receipt.validate_batch, out;
+        Base.invokelatest(All80Receipt.validate_batch, staged;
             expected_keys = non_flag, phases = Tuple(phases), batch = batch)
     end
     if !isempty(issues)
@@ -184,6 +188,7 @@ function _run()
             foreach(i -> println("  ", i), first(issues, 20))
         end
     end
+    isempty(issues) && mv(staged, out; force = true)
     foreach(lock -> rm(lock; force = true), locks)
 end
 

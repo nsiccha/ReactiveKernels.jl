@@ -95,6 +95,8 @@ end
 stan_val(sm, q) = BridgeStan.log_density(sm, q; propto = false, jacobian = true)
 stan_grad(sm, q) = BridgeStan.log_density_gradient(
     sm, q; propto = false, jacobian = true)[2]
+_numeric_vector_sha256(values) =
+    bytes2hex(SHA.sha256(sprint(show, Float64.(values))))
 
 function reference_valid_probe(sm, dim, entry; rng = Xoshiro(0xC0FFEE))
     # Select by REFERENCE validity, never by RK success. A registry probe is authoritative and
@@ -122,7 +124,7 @@ function reference_valid_probe(sm, dim, entry; rng = Xoshiro(0xC0FFEE))
             return (; q = q, candidates_tested = tested,
                 selected_source = entry.probe_q === nothing ? "generated" : "registry",
                 reference_value = value, reference_gradient = mapped_gradient,
-                reference_gradient_sha256 = bytes2hex(SHA.sha256(mapped_gradient)))
+                reference_gradient_sha256 = _numeric_vector_sha256(mapped_gradient))
         end
     end
     error("no reference-valid finite value/gradient probe for a $dim-dim model after $tested candidate(s)")
@@ -178,7 +180,8 @@ function run_reactant_one(name)
     # The reference-valid selector already produced the BridgeStan gradient mapped to RK order.
     grad_oracle = probe.reference_gradient
     transitions = All80Axes.HMC_MIN_TRANSITIONS
-    row = reactant_cells(kb, prep, q; transitions, grad_oracle)
+    row = reactant_cells(kb, prep, q; transitions, grad_oracle,
+        stan_value = probe.reference_value, rk_offset = entry.off_rk)
     row["hmc_steps"] = All80Axes.HMC_STEPS
     row["hmc_rounds"] = All80Axes.HMC_ROUNDS
     row["hmc_target_round_seconds"] = All80Axes.HMC_TARGET_ROUND_SECONDS

@@ -52,7 +52,9 @@ _all80_num(key, label) = _column(key, label; format = _all80_ns, sort = _all80_s
 _all80_hmc(key, label) = _column(key, label; format = _all80_us, sort = _all80_sort)
 
 # --- the three tables ------------------------------------------------------------
-function all80_primal_table(models; id = "all80-primal")
+function all80_primal_table(models; id = "all80-primal",
+        title = "Primal log-density evaluation — median, lower is faster",
+        note = "Select a column heading to sort.")
     cells = ["primal_rk", "primal_rk_reactant", "primal_turing", "primal_stan",
              "primal_opt_stan", "primal_further_turing"]
     cols = (_column(:model, "Model"),
@@ -63,11 +65,12 @@ function all80_primal_table(models; id = "all80-primal")
             _all80_num(:primal_opt_stan, "optimized Stan"),
             _all80_num(:primal_further_turing, "further Turing"),
             _column(:note, "Structural difference"))
-    _result_table(_all80_rows(models, cells), cols; id,
-        title = "Primal log-density evaluation — median, lower is faster")
+    _result_table(_all80_rows(models, cells), cols; id, title, note)
 end
 
-function all80_gradient_table(models; id = "all80-gradient")
+function all80_gradient_table(models; id = "all80-gradient",
+        title = "Value+gradient evaluation — median, lower is faster",
+        note = "Select a column heading to sort.")
     cells = ["gradient_rk", "gradient_rk_reactant", "gradient_turing", "gradient_stan",
              "gradient_opt_stan", "gradient_further_turing"]
     cols = (_column(:model, "Model"),
@@ -78,19 +81,19 @@ function all80_gradient_table(models; id = "all80-gradient")
             _all80_num(:gradient_opt_stan, "optimized Stan"),
             _all80_num(:gradient_further_turing, "further Turing"),
             _column(:note, "Structural difference"))
-    _result_table(_all80_rows(models, cells), cols; id,
-        title = "Value+gradient evaluation — median, lower is faster")
+    _result_table(_all80_rows(models, cells), cols; id, title, note)
 end
 
-function all80_hmc_table(models; id = "all80-hmc")
+function all80_hmc_table(models; id = "all80-hmc",
+        title = "HMC throughput — median µs per transition (multinomial HMC, fixed L), lower is faster",
+        note = "Select a column heading to sort.")
     cells = ["hmc_rk_native", "hmc_rk_reactant", "hmc_ahmc_turing"]
     cols = (_column(:model, "Model"),
             _all80_hmc(:hmc_rk_native, "RK native"),
             _all80_hmc(:hmc_rk_reactant, "RK + Reactant"),
             _all80_hmc(:hmc_ahmc_turing, "AHMC + Turing"),
             _column(:note, "Structural difference"))
-    _result_table(_all80_rows(models, cells), cols; id,
-        title = "HMC throughput — median µs per transition (multinomial HMC, fixed L), lower is faster")
+    _result_table(_all80_rows(models, cells), cols; id, title, note)
 end
 
 """Render all three all-82 comparison tables from a receipt file (or a parsed
@@ -179,9 +182,16 @@ function render_all80_batch1_tables(path = _ALL80_BATCH1_PATH)
         "    No batch-1 receipt at `$(basename(path))` yet — run the focused batch-1 benchmark " *
         "(`RK_ALL80_BATCH=batch1 … <keys>`) to populate these tables.")
     models = get(TOML.parsefile(path), "models", Dict())
+    historical = "Historical/uncertified batch-1 measurement; do not interpret as ordinary-AE publication evidence."
+    native_t = sort(unique(Int[m["hmc_transitions"] for m in values(models)]))
+    reactant_t = sort(unique(Int[m["hmc_reactant_transitions"] for m in values(models)]))
+    hmc_note = "Observed-load results. Recorded transitions — native: $(join(native_t, ", ")); Reactant: $(join(reactant_t, ", ")). Different T counts make this capability/end-to-end evidence, not a matched-T claim."
     Markdown.MD(Any[
-        all80_primal_table(models; id = "batch1-primal"),
-        all80_gradient_table(models; id = "batch1-gradient"),
-        all80_hmc_table(models; id = "batch1-hmc"),
+        all80_primal_table(models; id = "batch1-primal",
+            title = "Historical batch-1 primal — median, lower is faster", note = historical),
+        all80_gradient_table(models; id = "batch1-gradient",
+            title = "Historical batch-1 value+gradient — median, lower is faster", note = historical),
+        all80_hmc_table(models; id = "batch1-hmc",
+            title = "Historical batch-1 HMC — observed-load µs/transition", note = hmc_note),
     ])
 end

@@ -33,9 +33,12 @@ const _PROV_START = Ref{Dict{String,Any}}()
 _git_bytes(root, args...) = try
     read(pipeline(setenv(Cmd(String["git", "-C", root, args...]); dir = root); stderr = devnull))
 catch
-    UInt8[]
+    nothing
 end
-_git_at(root, args...) = strip(String(_git_bytes(root, args...)))
+_git_at(root, args...) = begin
+    bytes = _git_bytes(root, args...)
+    bytes === nothing ? "?" : strip(String(bytes))
+end
 _is_commit(s) = occursin(r"^[0-9a-f]{40}$", s)
 _file_sha256(path) = bytes2hex(SHA.sha256(read(path)))
 
@@ -63,9 +66,10 @@ function _git_snapshot(root)
     head = _git_at(root, "rev-parse", "HEAD")
     status = _git_at(root, "status", "--porcelain")
     diff = _git_bytes(root, "diff", "HEAD", "--")
+    diff_digest = diff === nothing ? "?" : bytes2hex(SHA.sha256(diff))
     (; head = head, status = status,
-       diff_sha256 = bytes2hex(SHA.sha256(diff)),
-       certified = _is_commit(head) && status != "?")
+       diff_sha256 = diff_digest,
+       certified = _is_commit(head) && status != "?" && diff_digest != "?")
 end
 
 function _package_snapshot(root)
@@ -157,6 +161,9 @@ recorded. No-git or unavailable module paths remain uncertified and throw for a 
 function certify_loaded_modules!(modules::AbstractDict)
     isassigned(_PROV_START) || error("certify_loaded_modules!: no frozen provenance")
     snap = _PROV_START[]
+    expected_modules = sort(String.(collect(keys(snap["packages"]))))
+    Set(String.(keys(modules))) == Set(expected_modules) ||
+        error("certify_loaded_modules!: module map must exactly cover $expected_modules")
     paths = Dict{String,String}()
     versions = Dict{String,String}()
     for (name, module_or_name) in modules
@@ -171,6 +178,11 @@ function certify_loaded_modules!(modules::AbstractDict)
             value = only(matches)
         end
         path = pathof(value)
+        if path === nothing
+            conventional = joinpath(String(info["root"]), "src",
+                String(nameof(value)) * ".jl")
+            isfile(conventional) && (path = conventional)
+        end
         path === nothing && error("loaded module has no source path: $key")
         root = normpath(String(info["root"]))
         startswith(normpath(path), root * Base.Filesystem.path_separator) ||
@@ -254,6 +266,35 @@ function input_identity(; phase, posterior, model, stan_path, stan_sha256,
         "query" => query,
         "stan_parameter_permutation" =>
             stan_perm === nothing ? "identity" : collect(stan_perm))
+end
+
+function _provenance_schema_issues(snapshot, phase)
+    issues = String[]
+    for field in ("source_id", "run_id", "batch", "requested_keys",
+                  "harness_file_sha256", "upstream_file_sha256",
+                  "environment_file_sha256", "packages", "loaded_module_paths",
+                  "module_versions")
+        haskey(snapshot, field) || push!(issues, "$phase provenance lacks $field")
+    end
+    String(get(snapshot, "phase", "")) == String(phase) ||
+        push!(issues, "$phase provenance phase mismatch")
+    get(snapshot, "loaded_modules_certified", false) === true ||
+        push!(issues, "$phase loaded modules are uncertified")
+    packages = get(snapshot, "packages", Dict())
+    packages isa AbstractDict && !isempty(packages) ||
+        push!(issues, "$phase package identity map is absent/empty")
+    loaded = get(snapshot, "loaded_module_paths", Dict())
+    loaded isa AbstractDict && !isempty(loaded) &&
+        Set(String.(keys(loaded))) == Set(String.(keys(packages))) ||
+        push!(issues, "$phase loaded-module map does not exactly cover package identities")
+    issues
+end
+
+function selected_point_stan_parity_ok(value, stan_value, declared_offset;
+        rtol = 1e-6, atol = 1e-6)
+    expected = stan_value - declared_offset
+    isfinite(value) && isfinite(expected) &&
+        abs(value - expected) <= max(atol, rtol * max(abs(expected), 1.0))
 end
 
 # The MANDATORY numeric cells — real numbers required for ALL 82 rows (publication gate).
@@ -349,6 +390,13 @@ function aggregate(phase_paths, out_path::AbstractString; meta = Dict{String,Any
             ph in require_phases || error("All80Receipt.aggregate: unexpected phase $ph in $p")
             haskey(d, "provenance") || error("All80Receipt.aggregate: phase $ph lacks provenance ($p)")
             snapshot = d["provenance"]
+            schema_issues = _provenance_schema_issues(snapshot, ph)
+            isempty(schema_issues) ||
+                error("All80Receipt.aggregate: $(join(schema_issues, "; ")) (from $p)")
+            String(get(d, "source_id", "")) == String(get(snapshot, "source_id", "")) ||
+                error("All80Receipt.aggregate: phase $ph top-level source_id mismatch in $p")
+            String(get(d, "run_id", "")) == String(get(snapshot, "run_id", "")) ||
+                error("All80Receipt.aggregate: phase $ph top-level run_id mismatch in $p")
             isempty(batch) || String(get(snapshot, "batch", "")) == batch ||
                 error("All80Receipt.aggregate: phase $ph batch mismatch in $p")
             String(get(snapshot, "phase", "")) == ph ||
@@ -445,10 +493,13 @@ function validate_batch(path::AbstractString; expected_keys, phases = ("native",
     sort(collect(String, keys(models))) == expected ||
         push!(issues, "model key set differs from the exact requested batch")
     provenance = get(meta, "provenance", Dict())
+    Set(String.(keys(provenance))) == Set(String.(collect(phases))) ||
+        push!(issues, "provenance phase set differs from the exact requested phases")
     run_ids = String[]
     for phase in phases
         snapshot = get(provenance, String(phase), nothing)
         snapshot === nothing && (push!(issues, "missing $phase process-start provenance"); continue)
+        append!(issues, _provenance_schema_issues(snapshot, phase))
         String(get(snapshot, "phase", "")) == String(phase) ||
             push!(issues, "$phase provenance phase mismatch")
         isempty(batch) || String(get(snapshot, "batch", "")) == batch ||
@@ -466,9 +517,11 @@ function validate_batch(path::AbstractString; expected_keys, phases = ("native",
         push!(issues, "phase run identities are absent or differ")
     for key in expected
         haskey(models, key) || continue
-        _input_query_identity_ok(get(models[key], "input_identity_native", nothing)) ||
+        _input_query_identity_ok(get(models[key], "input_identity_native", nothing),
+            models[key], "native", key) ||
             push!(issues, "$key lacks a complete native input/query identity")
-        _input_query_identity_ok(get(models[key], "input_identity_reactant", nothing)) ||
+        _input_query_identity_ok(get(models[key], "input_identity_reactant", nothing),
+            models[key], "reactant", key) ||
             push!(issues, "$key lacks a complete Reactant input/query identity")
     end
     issues
@@ -494,15 +547,32 @@ function correctness_failures(path::AbstractString)
     fails
 end
 
-function _input_query_identity_ok(identity)
+function _input_query_identity_ok(identity, row, phase, key)
     identity isa AbstractDict || return false
+    String(get(identity, "phase", "")) == String(phase) || return false
+    String(get(identity, "posterior", "")) == String(key) || return false
+    !isempty(String(get(identity, "model", ""))) || return false
+    for field in ("stan_path", "stan_compiled_library", "dataset_path")
+        !isempty(String(get(identity, field, ""))) || return false
+    end
+    for field in ("stan_sha256", "dataset_json_sha256")
+        occursin(r"^[0-9a-f]{64}$", String(get(identity, field, ""))) || return false
+    end
+    library_digest = String(get(identity, "stan_compiled_library_sha256", ""))
+    (library_digest == "not-present" ||
+        occursin(r"^[0-9a-f]{64}$", library_digest)) || return false
     query = get(identity, "query", nothing)
     query isa AbstractDict || return false
-    has_point = haskey(query, "selected_point") || haskey(query, "points")
-    has_digest = haskey(identity, "dataset_json_sha256") &&
-        !isempty(String(get(identity, "dataset_json_sha256", "")))
-    has_backend = String(get(query, "ad_backend", "")) == ORDINARY_AD_BACKEND
-    has_point && has_digest && has_backend
+    points = Vector{Vector{Float64}}(get(query, "points",
+        Vector{Vector{Float64}}(Any[get(query, "selected_point", Float64[])])))
+    dim = Int(get(row, "dim", -1))
+    !isempty(points) || return false
+    all(point -> point isa AbstractVector && length(point) == dim &&
+        all(isfinite, point), points) || return false
+    if haskey(query, "selected_point_index")
+        Int(get(query, "selected_point_index", 0)) in eachindex(points) || return false
+    end
+    String(get(query, "ad_backend", "")) == ORDINARY_AD_BACKEND
 end
 
 end # module All80Receipt

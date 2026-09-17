@@ -223,13 +223,12 @@ function render_all80_batch1_coverage_plot(path = _ALL80_BATCH1_PATH)
             color = :outcome => "Outcome") *
         visual(BarPlot)
     _all80_fig(spec * config(width = 420, height = 240,
-            title = "Batch-1 Reactant lowering coverage (incremental additions)",
+            title = "Historical batch-1 Reactant lowering coverage (uncertified)",
             scales = scales(Y = (; zero = true)));
         id = "all80-batch1-coverage",
         title = "Batch-1 coverage — what lowered",
-        description = "The batch-1 incremental posteriordb additions, rendered from the SEPARATE " *
-            "all80-batch1-v1.toml — a UNION alongside the frozen 82, never merged into it. Each batch " *
-            "is separately measured with its own process-start provenance. Registered against the " *
+        description = "The historical batch-1 additions, rendered from the SEPARATE " *
+            "all80-batch1-v1.toml — a UNION alongside the frozen 82, never merged into it. This saved run is uncertified: Reactant producer provenance and ordinary-AE certification are absent. Registered against the " *
             "existing upstream Turing + posteriordb Stan comparators (no new Turing translation).")
 end
 
@@ -244,12 +243,12 @@ function render_all80_batch1_speedup_plot(path = _ALL80_BATCH1_PATH)
             marker = :workload => "Workload") *
         visual(Scatter)
     _all80_fig(spec * config(width = 360, height = 300,
-            title = "Batch-1 incremental additions vs reference Stan and upstream Turing",
+            title = "Historical batch-1 additions vs reference Stan and upstream Turing (uncertified)",
             scales = scales(X = (; scale = log10)));
         id = "all80-batch1-speedup",
-        title = "Batch-1 incremental additions — single-eval speed (directional)",
-        description = "Each point is one batch-1 posteriordb addition, from the SEPARATE " *
-            "all80-batch1-v1.toml (a union with the frozen 82, not merged). `diamonds-diamonds` is " *
+        title = "Historical batch-1 additions — single-eval speed (uncertified, directional)",
+        description = "Each point is one historical batch-1 addition, from the SEPARATE " *
+            "all80-batch1-v1.toml (a union with the frozen 82, not merged; uncertified provenance/configuration). `diamonds-diamonds` is " *
             "marked a WORKLOAD MISMATCH — its upstream Turing model consumes precomputed sufficient " *
             "statistics (XtX/Xty/…) while RK/Stan do observation-level work, so its ratio is not a " *
             "matched-workload verdict. Same observed-load + per-side-support caveats as the 82; the " *
