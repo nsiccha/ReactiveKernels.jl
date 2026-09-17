@@ -416,6 +416,54 @@ function setup_hierarchical_gp!(mod::Module)
     Core.eval(mod, :(using .HierarchicalGPExample:
         HGP_Y, HGP_YEAR_IND, HGP_STATE_IND, HGP_REGION_IND, HGP_STATE_REGION_IND,
         HGP_N_YEARS, HGP_N_REGIONS, HGP_N_STATES, HGP_N_YEARS_OBS))
+function setup_losscurve_sislob!(mod::Module)
+    if !isdefined(mod, :LosscurveSislobExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: LosscurveSislobExample))
+    end
+    # Bind only the data. The displayed PPL assembly imports the shared `normal`
+    # and `lognormal` endpoints itself and authors the flag-selected growth
+    # factor and per-datum mean in-graph.
+    Core.eval(mod, :(using .LosscurveSislobExample:
+        LOSSCURVE_GROWTHMODEL_ID, LOSSCURVE_COHORT_ID, LOSSCURVE_T_IDX,
+        LOSSCURVE_T_VALUE, LOSSCURVE_PREMIUM, LOSSCURVE_LOSS))
+    nothing
+end
+
+function setup_accel_splines!(mod::Module)
+    if !isdefined(mod, :AccelSplinesExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: AccelSplinesExample))
+    end
+    # Bind only the response and the four design/basis matrices plus the
+    # prior_only flag; the displayed PPL assembly imports the shared `normal`
+    # and `student_t` endpoints itself and authors the linear predictors in-graph.
+    Core.eval(mod, :(using .AccelSplinesExample:
+        ACCEL_Y, ACCEL_XS, ACCEL_ZS_1_1, ACCEL_XS_SIGMA, ACCEL_ZS_SIGMA_1_1,
+        ACCEL_PRIOR_ONLY))
+    nothing
+end
+
+function setup_state_space_stochastic!(mod::Module)
+    if !isdefined(mod, :StateSpaceStochasticExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: StateSpaceStochasticExample))
+    end
+    # Bind only the raw series y, x, w; the displayed PPL assembly imports the
+    # shared `normal` and `student_t` endpoints itself and derives the bounded
+    # level transform, positive_ordered scales and seasonal window sum in-graph.
+    Core.eval(mod, :(using .StateSpaceStochasticExample:
+        STATE_SPACE_Y, STATE_SPACE_X, STATE_SPACE_W))
+    nothing
+end
+
+function setup_prophet!(mod::Module)
+    if !isdefined(mod, :ProphetExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: ProphetExample))
+    end
+    # Bind the raw time/changepoint/design data for the LINEAR trend; the
+    # displayed PPL assembly imports the shared `normal` and `laplace` endpoints
+    # itself and derives the changepoint incidence matrix and trend in-graph.
+    Core.eval(mod, :(using .ProphetExample:
+        PROPHET_T, PROPHET_T_CHANGE, PROPHET_X, PROPHET_SIGMAS, PROPHET_TAU,
+        PROPHET_S_A, PROPHET_S_M, PROPHET_Y))
     nothing
 end
 
@@ -930,6 +978,10 @@ const EXPECTED_PPL_EXAMPLES = (
     :gp_pois_regr_posterior,
     :accel_gp_posterior,
     :hierarchical_gp_posterior,
+    :losscurve_sislob_posterior,
+    :accel_splines_posterior,
+    :state_space_stochastic_posterior,
+    :prophet_posterior,
 )
 const _PPL_EXECUTION_COUNTS = Dict(name => 0 for name in EXPECTED_PPL_EXAMPLES)
 

@@ -37,6 +37,14 @@ const PPL_SOURCE_CASES = (
      :ACCEL_GP_SOURCE, :evaluate_accel_gp_source),
     ("hierarchical-gp.md", "hierarchical_gp.jl", HierarchicalGPExample,
      :HIERARCHICAL_GP_SOURCE, :evaluate_hierarchical_gp_source),
+    ("losscurve-sislob.md", "losscurve_sislob.jl", LosscurveSislobExample,
+     :LOSSCURVE_SISLOB_SOURCE, :evaluate_losscurve_sislob_source),
+    ("accel-splines.md", "accel_splines.jl", AccelSplinesExample,
+     :ACCEL_SPLINES_SOURCE, :evaluate_accel_splines_source),
+    ("state-space-stochastic.md", "state_space_stochastic.jl", StateSpaceStochasticExample,
+     :STATE_SPACE_STOCHASTIC_SOURCE, :evaluate_state_space_stochastic_source),
+    ("prophet.md", "prophet.jl", ProphetExample,
+     :PROPHET_SOURCE, :evaluate_prophet_source),
 )
 
 # One displayed/executed authority kernel per registered case: a file carrying

@@ -69,6 +69,10 @@ site_pages = [
             "Logistic regression (regularized horseshoe)" => "logistic-regression-rhs.md",
             "LDA (latent Dirichlet allocation, ldaK2/ldaK5)" => "lda.md",
             "Neural RBM softmax (nn_rbm1b J10/J100)" => "nn-rbm.md",
+            "Losscurve (insurance loss development)" => "losscurve-sislob.md",
+            "Accel splines (brms penalized splines)" => "accel-splines.md",
+            "State space (structural DLM)" => "state-space-stochastic.md",
+            "Prophet (piecewise-trend forecasting)" => "prophet.md",
         ],
         "Gaussian processes" => [
             "GP regression (marginal)" => "gp-regr.md",
