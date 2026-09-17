@@ -470,6 +470,53 @@ function setup_prophet!(mod::Module)
     nothing
 end
 
+function setup_irt_2pl!(mod::Module)
+    if !isdefined(mod, :Irt2plExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: Irt2plExample))
+    end
+    # Bind only the raw I×J response matrix. The displayed PPL assembly imports
+    # the shared endpoints itself and forms the per-cell linear predictor as an
+    # in-graph broadcast over the item/person axes (no external index).
+    Core.eval(mod, :(using .Irt2plExample: IRT_2PL_Y))
+    nothing
+end
+
+function setup_2pl_latent_reg_irt!(mod::Module)
+    if !isdefined(mod, :TwoplLatentRegIrtExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: TwoplLatentRegIrtExample))
+    end
+    # Bind the raw long-form ii/jj/y, the covariate matrix W, and the item count.
+    # The displayed PPL assembly derives the covariate design (obtain_adjustments)
+    # and the sum-to-zero difficulty map in-graph.
+    Core.eval(mod, :(using .TwoplLatentRegIrtExample:
+        TWOPL_LR_II, TWOPL_LR_JJ, TWOPL_LR_Y, TWOPL_LR_W, TWOPL_LR_I))
+    nothing
+end
+
+function setup_hier_2pl!(mod::Module)
+    if !isdefined(mod, :Hier2plExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: Hier2plExample))
+    end
+    # Bind the raw long-form ii/jj/y and the item/person counts. The displayed
+    # PPL assembly forms the cholesky_factor_corr transform, the analytic LKJ(4)
+    # density, and the fused multi_normal_cholesky item prior in-graph.
+    Core.eval(mod, :(using .Hier2plExample:
+        HIER_2PL_II, HIER_2PL_JJ, HIER_2PL_Y, HIER_2PL_I, HIER_2PL_J))
+    nothing
+end
+
+function setup_gpcm_latent_reg_irt!(mod::Module)
+    if !isdefined(mod, :GpcmLatentRegIrtExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: GpcmLatentRegIrtExample))
+    end
+    # Bind the raw long-form ii/jj/y (ordinal), the covariate matrix W, and the
+    # item count. The displayed PPL assembly derives the ragged per-item category
+    # structure, the covariate design, and the sum-to-zero map in-graph.
+    Core.eval(mod, :(using .GpcmLatentRegIrtExample:
+        GPCM_LR_II, GPCM_LR_JJ, GPCM_LR_Y, GPCM_LR_W, GPCM_LR_I))
+    nothing
+end
+
 function setup_online_stats!(mod::Module)
     if !isdefined(mod, :OnlineStatsExample)
         Base.include(mod, joinpath(@__DIR__, "..", "examples", "online_stats.jl"))
@@ -985,6 +1032,10 @@ const EXPECTED_PPL_EXAMPLES = (
     :accel_splines_posterior,
     :state_space_stochastic_posterior,
     :prophet_posterior,
+    :irt_2pl_posterior,
+    :two_pl_latent_reg_irt_posterior,
+    :hier_2pl_posterior,
+    :gpcm_latent_reg_irt_posterior,
 )
 const _PPL_EXECUTION_COUNTS = Dict(name => 0 for name in EXPECTED_PPL_EXAMPLES)
 

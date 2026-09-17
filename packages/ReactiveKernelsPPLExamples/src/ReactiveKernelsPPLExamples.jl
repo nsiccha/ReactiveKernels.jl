@@ -110,6 +110,12 @@ include("accel_splines.jl")
 include("state_space_stochastic.jl")
 include("prophet.jl")
 
+# posteriordb IRT batch (irt_2pl, hier_2pl, 2pl_latent_reg_irt, gpcm_latent_reg_irt)
+include("irt_2pl.jl")
+include("2pl_latent_reg_irt.jl")
+include("hier_2pl.jl")
+include("gpcm_latent_reg_irt.jl")
+
 export PPLWorkflow
 
 # EXPERIMENTAL, NOT REVIEWED / NOT APPROVED — do NOT build on this.
@@ -237,5 +243,11 @@ export LosscurveSislobExample
 export AccelSplinesExample
 export StateSpaceStochasticExample
 export ProphetExample
+
+# posteriordb IRT batch
+export Irt2plExample
+export TwoplLatentRegIrtExample
+export Hier2plExample
+export GpcmLatentRegIrtExample
 
 end # module ReactiveKernelsPPLExamples
