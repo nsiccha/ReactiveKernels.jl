@@ -1806,8 +1806,7 @@ _replica_rank(::Type{T}) where {T<:AbstractArray} = ndims(T)
 _replica_rank(::Type{T}) where {T} = throw(ArgumentError(
     "replica batched ports must be Numbers or AbstractArrays; got $T"))
 
-function _replica(target, batched)
-    boundary = inputs(target)
+function _replica_batch_indices(boundary, batched)
     names = Tuple(batched isa Symbol ? (batched,) : batched)
     isempty(names) && throw(ArgumentError("replica requires at least one batched port"))
     length(unique(names)) == length(names) || throw(ArgumentError(
@@ -1821,7 +1820,12 @@ function _replica(target, batched)
             "replica batched port :$name is not in the prepared HAVE boundary"))
         index
     end
-    indices = Tuple(sort(collect(indices)))
+    Tuple(sort!(collect(indices)))
+end
+
+function _replica(target, batched)
+    boundary = inputs(target)
+    indices = _replica_batch_indices(boundary, batched)
     input_types = Tuple{(valtype(boundary[i]) for i in indices)...}
     foreach(_replica_rank, input_types.parameters)
     output_types = Tuple{(valtype(value) for value in outputs(target))...}
