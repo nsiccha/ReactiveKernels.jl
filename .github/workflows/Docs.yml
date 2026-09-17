@@ -77,7 +77,7 @@ jobs:
       - name: Build and deploy
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NODE_OPTIONS: --max-old-space-size=4096
+          NODE_OPTIONS: --max-old-space-size=8192
         run: julia --project=docs docs/make.jl
       - name: Upload rendered-docs advisory report
         if: always()
