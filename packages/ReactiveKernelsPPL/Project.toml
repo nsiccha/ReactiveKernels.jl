@@ -1,0 +1,17 @@
+name = "ReactiveKernelsPPL"
+uuid = "e266ea2a-6817-46cd-8bec-6238f0035f44"
+authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+ReactiveKernels = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
+
+[compat]
+ReactiveKernels = "0.1"
+julia = "1.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
