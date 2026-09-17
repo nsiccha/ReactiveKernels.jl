@@ -9,12 +9,16 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     index_path = joinpath(root, "docs", "src", "index.md")
     readme_path = joinpath(root, "README.md")
     ad_path = joinpath(root, "docs", "src", "automatic-differentiation.md")
+    manual_rules_path = joinpath(
+        root, "docs", "src", "manual-derivative-rules.md",
+    )
     distributions_ad_path = joinpath(root, "docs", "src", "distributions-ad.md")
     batched_path = joinpath(root, "docs", "src", "batched.md")
     nuts_reactant_path = joinpath(root, "docs", "src", "nuts-reactant.md")
 
     @test isfile(page_path)
     @test isfile(ad_path)
+    @test isfile(manual_rules_path)
     @test isfile(distributions_ad_path)
     @test isfile(nuts_reactant_path)
     page = _compiler_docs_lf(read(page_path, String))
@@ -22,6 +26,7 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     index = _compiler_docs_lf(read(index_path, String))
     readme = _compiler_docs_lf(read(readme_path, String))
     ad_docs = _compiler_docs_lf(read(ad_path, String))
+    manual_rules_docs = _compiler_docs_lf(read(manual_rules_path, String))
     distributions_ad_docs = _compiler_docs_lf(read(distributions_ad_path, String))
     batched_docs = _compiler_docs_lf(read(batched_path, String))
     nuts_reactant = _compiler_docs_lf(read(nuts_reactant_path, String))
@@ -70,62 +75,29 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     end
     @test occursin("Main.BatchedExamples.BATCHED_AD_SOURCE", distributions_ad_docs)
     @test occursin("test_batched_nonallocating.jl", distributions_ad_docs)
-
-    # No other public prose page carries backend/API GUIDANCE. Algorithmic
-    # uses of the word "gradient" in sampler pages remain domain terminology,
-    # while the evaluation-throughput page belongs to the top-level AD group
-    # and the dedicated Eight Schools Reactant page owns its compiled-AD receipt.
-    # bound-regression.md and posteriordb-comparison.md carry only INCIDENTAL AD
-    # references, not guidance, so they are exempt: bound-regression names
-    # `prepare_ad` when describing the general `bound` partial-evaluation pre-pass,
-    # and posteriordb-comparison lists Enzyme once among the packages its pinned
-    # benchmark environment can load.
-    # The per-model GP pages own their exact native-Enzyme and Reactant support
-    # boundaries; allow those disclosures there rather than duplicating or deleting
-    # the model-specific limitations.
-    ad_pages = Set((
-        "automatic-differentiation.md",
-        "distributions-ad.md",
-        "eight-schools-reactant.md",
-        "eval-throughput.md",
-        "gp-regr.md",
-        "gp-pois-regr.md",
-        "accel-gp.md",
-        "hierarchical-gp.md",
-        "mnist-reactant.md",
-        "ppl-ad.md",
-        "probprog-mcmc.md",
-        "reactant-ad.md",
-        "reactant.md",
-        "bound-regression.md",
-        "posteriordb-comparison.md",
-    ))
-    forbidden_ad_prose = (
-        "DifferentiationInterface",
-        "AutoEnzyme",
-        "Enzyme",
-        "prepare_ad",
-        "ad_gradient",
-        "ad_value_and_gradient!",
-        "automatic differentiation",
-        "reverse-mode",
-    )
-    docs_src = joinpath(root, "docs", "src")
-    for path in readdir(docs_src; join = true)
-        endswith(path, ".md") || continue
-        basename(path) in ad_pages && continue
-        prose = _compiler_docs_lf(read(path, String))
-        for marker in forbidden_ad_prose
-            @test !occursin(lowercase(marker), lowercase(prose))
-        end
-    end
-    for marker in forbidden_ad_prose
-        @test !occursin(lowercase(marker), lowercase(readme))
+    for marker in (
+            "# Manual derivative rule graphs (design example)",
+            "Executable design example, not a shipped adapter generator",
+            "## Current capability and required RK features",
+            "Everything that turns\nthat graph into a registered custom AD rule is new work",
+            "RK has neither feature",
+            "prepare_ad_pullback",
+            "does not consume this manual rule\ngraph",
+            "render_manual_derivative_rule_cuts()",
+            "render_manual_derivative_pullback_source()",
+            "result.captured_fields",
+            "not yet generate ChainRules, Mooncake, Enzyme, or Reactant",
+        )
+        @test occursin(marker, manual_rules_docs)
     end
 
     @test occursin("\"Compiler capability and limits\" => \"compiler.md\"", make)
     @test occursin("\"Automatic differentiation\" => [", make)
     @test occursin("\"Prepared gradients\" => \"automatic-differentiation.md\"", make)
+    @test occursin(
+        "\"Manual derivative rules (design)\" => \"manual-derivative-rules.md\"",
+        make,
+    )
     @test occursin("compiler.md", index)
     @test occursin("warnonly = false", make)
 

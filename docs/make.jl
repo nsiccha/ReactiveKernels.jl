@@ -13,6 +13,12 @@ using ReactiveKernelsStreamingStats
 include(joinpath(@__DIR__, "..", "examples", "nutpie_diagonal_adaptation.jl"))
 import .NutpieDiagonalAdaptationExample
 
+# Load the executable manual-rule design example. It uses only today's public
+# HAVE→WANT preparation surface; the page labels backend adapter generation as
+# the proposed layer rather than presenting it as an existing package API.
+include(joinpath(@__DIR__, "..", "examples", "manual_derivative_rule.jl"))
+import .ManualDerivativeRuleExample
+
 # NUTS and WALNUTS authoring fixtures are deliberately not included here.
 # Their pages read the source files as inert text; docs builds must not parse,
 # lower, compile, or execute either moving compiler/runtime surface.
@@ -72,12 +78,14 @@ site_pages = [
             "GP regression (marginal)" => "gp-regr.md",
             "GP Poisson regression (latent)" => "gp-pois-regr.md",
             "Approximate GP (HSGP, distributional)" => "accel-gp.md",
+            "BRM motorcycle (partial HSGP coordinates)" => "brm-hsgp.md",
             "Hierarchical GP" => "hierarchical-gp.md",
         ],
         "Declarative @ppl front-end + Gibbs (experimental)" => "ppl-front-end.md",
     ],
     "Automatic differentiation" => [
         "Prepared gradients" => "automatic-differentiation.md",
+        "Manual derivative rules (design)" => "manual-derivative-rules.md",
         "Distributions: scalar and batched" => "distributions-ad.md",
         "PPL: Eight Schools and MNIST" => "ppl-ad.md",
     ],

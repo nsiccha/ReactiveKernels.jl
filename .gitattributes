@@ -3,3 +3,5 @@ benchmark/nutpie_diag_oracle.rs text eol=lf
 benchmark/nutpie_diag_oracle.toml text eol=lf
 benchmark/pathfinder_oracle/pathfinder_oracle.py text eol=lf
 benchmark/pathfinder_oracle/pathfinder_oracle.toml text eol=lf
+# The motorcycle CSV is checksum-verified on every platform.
+examples/data/mcycle.csv text eol=lf
