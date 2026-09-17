@@ -561,6 +561,9 @@ function setup_gpcm_latent_reg_irt!(mod::Module)
     # structure, the covariate design, and the sum-to-zero map in-graph.
     Core.eval(mod, :(using .GpcmLatentRegIrtExample:
         GPCM_LR_II, GPCM_LR_JJ, GPCM_LR_Y, GPCM_LR_W, GPCM_LR_I))
+    nothing
+end
+
 function setup_glmm1!(mod::Module)
     if !isdefined(mod, :GLMM1ModelExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: GLMM1ModelExample))
