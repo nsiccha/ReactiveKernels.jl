@@ -45,6 +45,14 @@ const PPL_SOURCE_CASES = (
      :STATE_SPACE_STOCHASTIC_SOURCE, :evaluate_state_space_stochastic_source),
     ("prophet.md", "prophet.jl", ProphetExample,
      :PROPHET_SOURCE, :evaluate_prophet_source),
+    ("irt-2pl.md", "irt_2pl.jl", Irt2plExample,
+     :IRT_2PL_SOURCE, :evaluate_irt_2pl_source),
+    ("2pl-latent-reg-irt.md", "2pl_latent_reg_irt.jl", TwoplLatentRegIrtExample,
+     :TWOPL_LR_SOURCE, :evaluate_2pl_latent_reg_irt_source),
+    ("hier-2pl.md", "hier_2pl.jl", Hier2plExample,
+     :HIER_2PL_SOURCE, :evaluate_hier_2pl_source),
+    ("gpcm-latent-reg-irt.md", "gpcm_latent_reg_irt.jl", GpcmLatentRegIrtExample,
+     :GPCM_LR_SOURCE, :evaluate_gpcm_latent_reg_irt_source),
 )
 
 # One displayed/executed authority kernel per registered case: a file carrying
@@ -120,6 +128,10 @@ end
         :bound_regression_density,
         :lda_density,
         :nn_rbm_density,
+        :irt_2pl_posterior,
+        :two_pl_latent_reg_irt_posterior,
+        :hier_2pl_posterior,
+        :gpcm_latent_reg_irt_posterior,
     )
         @test occursin(":" * string(name), helper_source)
     end

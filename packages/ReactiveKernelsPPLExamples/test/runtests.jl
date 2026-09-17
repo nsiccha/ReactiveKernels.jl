@@ -21,7 +21,8 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     DugongsGrowthExample, ARMA11Example,
     NormalMixtureExample, LowDimGaussMixCollapseExample, LowDimGaussMixExample,
     MNISTLogisticExample, MVNormalRegressionExample, BoundRegressionExample,
-    NNRBMExample, LDAExample
+    NNRBMExample, LDAExample, Irt2plExample, TwoplLatentRegIrtExample,
+    Hier2plExample, GpcmLatentRegIrtExample
     LosscurveSislobExample, AccelSplinesExample, StateSpaceStochasticExample, ProphetExample
 using Test
 
@@ -131,6 +132,11 @@ include("test_losscurve_sislob_example.jl")
 include("test_accel_splines_example.jl")
 include("test_state_space_stochastic_example.jl")
 include("test_prophet_example.jl")
+# posteriordb IRT batch
+include("test_irt_2pl_example.jl")
+include("test_2pl_latent_reg_irt_example.jl")
+include("test_hier_2pl_example.jl")
+include("test_gpcm_latent_reg_irt_example.jl")
 include("test_ppl_macro.jl")
 include("test_ppl_posteriordb_parity.jl")
 include("test_ppl_gibbs.jl")
