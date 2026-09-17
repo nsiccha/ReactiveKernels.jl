@@ -416,6 +416,9 @@ function setup_hierarchical_gp!(mod::Module)
     Core.eval(mod, :(using .HierarchicalGPExample:
         HGP_Y, HGP_YEAR_IND, HGP_STATE_IND, HGP_REGION_IND, HGP_STATE_REGION_IND,
         HGP_N_YEARS, HGP_N_REGIONS, HGP_N_STATES, HGP_N_YEARS_OBS))
+    nothing
+end
+
 function setup_losscurve_sislob!(mod::Module)
     if !isdefined(mod, :LosscurveSislobExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: LosscurveSislobExample))
