@@ -888,7 +888,8 @@ kernel through the standard three-view UI. The source must bind `result` to a
 named tuple with `name`, `origin`, `inputs`, `kernel`, and `output` fields.
 """
 function execute_example(mod::Module, code::AbstractString;
-                         result::Symbol = :docs_example, setup = nothing)
+                         result::Symbol = :docs_example, setup = nothing,
+                         gate::Bool = false)
     displayed = strip(code, '\n')
     Core.eval(mod, :(using ReactiveKernels))
     setup === nothing || setup(mod)
@@ -913,7 +914,7 @@ function execute_example(mod::Module, code::AbstractString;
         ),
     )
     rendered = render_examples((artifact,))
-    _record_ppl_execution!(executed.name)
+    gate && _record_ppl_execution!(executed.name)
     rendered
 end
 
@@ -1061,7 +1062,7 @@ function execute_ppl_example(mod::Module, owner::Symbol, source::Symbol;
     isdefined(owner_module, source) || error("$owner does not define source $source")
     code = getfield(owner_module, source)
     code isa AbstractString || error("$owner.$source is not source text")
-    execute_example(mod, code; result, setup = nothing)
+    execute_example(mod, code; result, setup = nothing, gate = true)
 end
 
 const EXPECTED_PPL_EXAMPLES = (
