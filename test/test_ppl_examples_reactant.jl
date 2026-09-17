@@ -5,6 +5,10 @@ using Test
 using ReactiveKernelsPPLExamples.LinearRegressionExample:
     evaluate_linear_regression_source
 using ReactiveKernelsPPLExamples.ARMA11Example: evaluate_arma11_source
+using ReactiveKernelsPPLExamples.GARCH11Example: evaluate_garch11_source
+using ReactiveKernelsPPLExamples.HmmExampleExample: evaluate_hmm_example_source
+using ReactiveKernelsPPLExamples.HmmGaussianExample: evaluate_hmm_gaussian_source
+using ReactiveKernelsPPLExamples.IohmmRegExample: evaluate_iohmm_reg_source
 using ReactiveKernelsPPLExamples.PoissonGammaExample: evaluate_poisson_gamma_source
 using ReactiveKernelsPPLExamples.GLMPoissonExample: evaluate_glm_poisson_source,
     build_glm_poisson_graph, GLM_POISSON_YEAR, GLM_POISSON_C
@@ -167,6 +171,39 @@ end
             have = (:unconstrained, :series), want = (:errors, :errors_closed))
         e_scan, e_closed = both_kernel(a.inputs.q, a.inputs.series)
         @test _rapprox(e_scan, e_closed)
+    end
+    @testset "garch11 (GARCH(1,1) sd recursion; traced raw series → stablehlo.while)" begin
+        a = evaluate_garch11_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+        traced = map(_trace, Tuple(a.inputs))
+        hlo = repr(Reactant.@code_hlo optimize = false a.kernel(traced...))
+        @test occursin("stablehlo.while", hlo)
+    end
+    @testset "hmm_example (forward algorithm; traced raw series → stablehlo.while)" begin
+        a = evaluate_hmm_example_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+        traced = map(_trace, Tuple(a.inputs))
+        hlo = repr(Reactant.@code_hlo optimize = false a.kernel(traced...))
+        @test occursin("stablehlo.while", hlo)
+    end
+    @testset "hmm_gaussian (K-state forward; traced raw series → stablehlo.while)" begin
+        a = evaluate_hmm_gaussian_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+        traced = map(_trace, Tuple(a.inputs))
+        hlo = repr(Reactant.@code_hlo optimize = false a.kernel(traced...))
+        @test occursin("stablehlo.while", hlo)
+    end
+    @testset "iohmm_reg (input-dependent forward; all-bound query compiles, scan unrolls)" begin
+        a = evaluate_iohmm_reg_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+        # KNOWN GAP (do not assert while here): this model's per-step scan
+        # inputs are K-vectors (rows of the input-dependent transition /
+        # emission design), and the scan while-lowering gathers only 1-D
+        # traced sequences. Each traced raw-series variant still unrolls
+        # (measured HLO without `stablehlo.while`, ~7 MB on the full data),
+        # and iterating a traced matrix directly fails Reactant scalar
+        # indexing. The all-bound query stays the natural authoring; parity is
+        # asserted above on the unrolled compiled program.
     end
     @testset "poisson_gamma" begin
         a = evaluate_poisson_gamma_source()

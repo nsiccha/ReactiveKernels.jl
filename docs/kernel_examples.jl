@@ -336,6 +336,38 @@ function setup_covid19imperial!(mod::Module)
     nothing
 end
 
+function setup_garch11!(mod::Module)
+    if !isdefined(mod, :GARCH11Example)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: GARCH11Example))
+    end
+    Core.eval(mod, :(using .GARCH11Example: GARCH11_Y, GARCH11_SIGMA1))
+    nothing
+end
+
+function setup_hmm_example!(mod::Module)
+    if !isdefined(mod, :HmmExampleExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: HmmExampleExample))
+    end
+    Core.eval(mod, :(using .HmmExampleExample: HMM_EXAMPLE_Y, HMM_EXAMPLE_K))
+    nothing
+end
+
+function setup_hmm_gaussian!(mod::Module)
+    if !isdefined(mod, :HmmGaussianExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: HmmGaussianExample))
+    end
+    Core.eval(mod, :(using .HmmGaussianExample: HMM_GAUSSIAN_Y, HMM_GAUSSIAN_K))
+    nothing
+end
+
+function setup_iohmm_reg!(mod::Module)
+    if !isdefined(mod, :IohmmRegExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: IohmmRegExample))
+    end
+    Core.eval(mod, :(using .IohmmRegExample: IOHMM_REG_Y, IOHMM_REG_U, IOHMM_REG_K))
+    nothing
+end
+
 function setup_mvnormal_regression!(mod::Module)
     if !isdefined(mod, :MVNormalRegressionExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: MVNormalRegressionExample))
@@ -1104,6 +1136,10 @@ const EXPECTED_PPL_EXAMPLES = (
     :poisson_gamma_density,
     :dugongs_density,
     :arma11_density,
+    :garch11_density,
+    :hmm_example_density,
+    :hmm_gaussian_density,
+    :iohmm_reg_density,
     :mnist_logistic_density,
     :mnist_logistic_optimized_density,
     :mvnormal_regression_density,
