@@ -1,3 +1,6 @@
+using ReactiveKernels
+using DifferentiationInterface
+using Enzyme
 using LinearAlgebra
 
 @kernel replica_transition(
@@ -8,6 +11,39 @@ using LinearAlgebra
     accept::Bool = log(u) < -0.05 * kinetic
     q_next::Vector{Float64} = accept ? proposal : q
     return (q_next, accept, kinetic)
+end
+
+@kernel replica_normal_logpdf(
+        x::Vector{Float64}, location::Float64, logscale::Float64) = begin
+    standardized = (x .- location) ./ exp(logscale)
+    total::Float64 = -0.5 * sum(abs2, standardized) - length(x) * logscale -
+                     0.5 * length(x) * log(2π)
+    return total
+end
+
+@testset "replicated scalar AD" begin
+    prepared = prepare_ad(
+        replica_normal_logpdf, AutoEnzyme(mode = Enzyme.Reverse),
+        collect(0.2:0.1:0.7), 0.3, log(1.2); active = :x, want = :total)
+    replicated = replica(prepared; batched = :x)
+    positions = reshape(collect(0.0:0.05:1.15), 6, 4)
+    values, gradients = replicated(positions, 0.3, log(1.2))
+
+    @test inputs(replicated) == inputs(prepared.kernel)
+    @test code_expr(replicated) == code_expr(prepared.kernel)
+    @test size(values) == (4,)
+    @test size(gradients) == (6, 4)
+    for replica_index in axes(positions, 2)
+        scalar_value, scalar_gradient = ad_value_and_gradient(
+            prepared, positions[:, replica_index], 0.3, log(1.2))
+        @test values[replica_index] ≈ scalar_value
+        @test gradients[:, replica_index] ≈ scalar_gradient
+        @test scalar_gradient ≈
+              -(positions[:, replica_index] .- 0.3) ./ 1.2^2
+    end
+
+    @test_throws DimensionMismatch replicated(
+        positions[:, 1], 0.3, log(1.2))
 end
 
 @kernel replica_defaulted(x::Float64, offset::Float64 = 1.0) = begin

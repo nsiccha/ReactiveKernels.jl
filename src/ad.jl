@@ -408,6 +408,100 @@ function prepare_ad(kernel::PreparedKernel,
     _prepare_ad(kernel, tuple, backend, args, NamedTuple(), active)
 end
 
+# A batched gradient callable owns the scalar AD preparation plus the same
+# trailing-axis metadata as `ReplicatedKernel`. The distinction matters: its
+# scalar target takes an already-reordered DI point and Constant contexts, not
+# the ordinary kernel ABI.
+struct _ReplicatedADKernel{B,BT,AT,K,IN}
+    prepared::K
+    inputs::IN
+end
+
+@inline function (k::_ReplicatedADKernel{B})(args...) where {B}
+    length(args) == length(k.inputs) || throw(MethodError(k, args))
+    _replica_ad_call(k, args, getfield(args, first(B)))
+end
+
+inputs(k::_ReplicatedADKernel) = k.inputs
+outputs(k::_ReplicatedADKernel) = outputs(k.prepared.kernel)
+code_expr(k::_ReplicatedADKernel) = code_expr(k.prepared.kernel)
+
+function Base.show(io::IO, k::_ReplicatedADKernel{B}) where {B}
+    names = Tuple(k.inputs[i].name for i in B)
+    print(io, "ReplicatedADKernel(batched=", names, ", target=")
+    show(io, k.prepared)
+    print(io, ")")
+end
+
+function replica(prepared::PreparedADKernel{I}; batched) where {I}
+    boundary = inputs(prepared.kernel)
+    indices = _replica_batch_indices(boundary, batched)
+    input_types = Tuple{(valtype(boundary[i]) for i in indices)...}
+    foreach(_replica_rank, input_types.parameters)
+    active_type = valtype(boundary[I])
+    _ReplicatedADKernel{indices,input_types,active_type,
+                        typeof(prepared),typeof(boundary)}(
+        prepared, boundary)
+end
+
+function _replica_ad_validation(k::_ReplicatedADKernel{B}, args, marker) where {B}
+    replica_count = size(marker, ndims(marker))
+    for index in B
+        arg = getfield(args, index)
+        input = k.inputs[index]
+        expected_rank = _replica_rank(valtype(input)) + 1
+        ndims(arg) == expected_rank || throw(DimensionMismatch(
+            "replica port :$(input.name) has rank $(ndims(arg)); " *
+            "expected $expected_rank (scalar rank plus one trailing replica axis)"))
+        size(arg, ndims(arg)) == replica_count || throw(DimensionMismatch(
+            "replica port :$(input.name) has $(size(arg, ndims(arg))) " *
+            "replicas; expected $replica_count"))
+    end
+    replica_count
+end
+
+@inline _replica_ad_native_arg(arg, ::Type{T}, replica_index) where {T<:Number} =
+    arg[replica_index]
+@inline _replica_ad_native_arg(arg, ::Type{T}, replica_index) where {T<:AbstractArray} =
+    copy(selectdim(arg, ndims(arg), replica_index))
+
+function _replica_ad_scalar_args(
+        ::_ReplicatedADKernel{B,BT}, args, replica_index) where {B,BT}
+    ntuple(length(args)) do argument_index
+        position = findfirst(==(argument_index), B)
+        position === nothing ? getfield(args, argument_index) :
+            _replica_ad_native_arg(
+                getfield(args, argument_index),
+                BT.parameters[position], replica_index)
+    end
+end
+
+function _replica_ad_call(
+        k::_ReplicatedADKernel{B,BT,AT}, args, marker) where {B,BT,AT}
+    count = _replica_ad_validation(k, args, getfield(args, first(B)))
+    results = map(1:count) do replica_index
+        scalar_args = _replica_ad_scalar_args(k, args, replica_index)
+        ad_value_and_gradient(k.prepared, scalar_args...)
+    end
+    _replica_ad_stack(first.(results), valtype(only(outputs(k)))),
+        _replica_ad_stack(last.(results), AT)
+end
+
+function ad_value_and_gradient(
+        k::_ReplicatedADKernel{B,BT,AT}, args...) where {B,BT,AT}
+    _replica_ad_call(k, args, getfield(args, first(B)))
+end
+
+function ad_gradient(
+        k::_ReplicatedADKernel, args...)
+    last(_replica_ad_call(k, args, getfield(args, first(B))))
+end
+
+_replica_ad_stack(values, ::Type{T}) where {T<:Number} = collect(values)
+_replica_ad_stack(values, ::Type{T}) where {T<:AbstractArray} = stack(values)
+_replica_ad_stack(values, ::Type{T}) where {T} = throw(ArgumentError(
+    "replica AD active ports must be Numbers or AbstractArrays; got $T"))
+
 """
     prepare_ad_pullback(spec, backend, seed, args...;
                         active, want, kwargs...) -> PreparedADPullback

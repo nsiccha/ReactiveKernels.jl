@@ -473,6 +473,23 @@ function Reactant.traced_type_inner(
     T
 end
 
+# The batched AD wrapper is immutable compiler metadata for the same reason:
+# its scalar `PreparedADKernel` stays a host constant while only the batched
+# HAVE boundary is traced. Its execution method lowers the replica map to one
+# StableHLO batch operation, with reverse AD staged inside each scalar batch
+# cell by the same DifferentiationInterface backend.
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels._ReplicatedADKernel,
+        path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where {T<:ReactiveKernels._ReplicatedADKernel}
+    T
+end
+
 # Functional stateful transitions are immutable compiled programs. Their
 # PreparedKernel ensure tuple and RGF/AST bodies are static metadata; only the
 # materialized state snapshot and method argument are traced. A trace block

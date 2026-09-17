@@ -306,6 +306,11 @@ copies array slices, and stacks results, so it is a semantic transform rather
 than a native zero-allocation promise. Optional array-compiler integration may
 lower the same mapping as a backend batch primitive.
 
+The same transform accepts a scalar `PreparedADKernel`. `replica(ad; batched =
+:position)` slices each selected HAVE, runs the scalar reverse pass, and stacks
+the objective and active-port gradient along the replica axis. The scalar AD
+preparation remains the derivative authority; it is not re-prepared per replica.
+
 ## Incremental and compiled reactive execution
 
 ### Open-ended `ReactiveState`
