@@ -69,10 +69,10 @@ _covid_bind() = (; X = COVID19IMPERIAL_X,
 const _COVID_AE_ORDINARY = AutoEnzyme(mode = Enzyme.Reverse)
 
 @testset "PPL graph — covid19imperial (posteriordb)" begin
-    # COLD FIRST USE: the model_only __init__ template is the first thing this
-    # file prepares and executes — before any full-source evaluation — and the
-    # demo-tail sentinel is still 0 after package load.
-    @test ReactiveKernelsPPLExamples._DEMO_TAIL_EXECUTIONS[] == 0
+    # The demo-tail sentinel is process-global. Snapshot it so this test is
+    # valid standalone and after earlier hosted example-package tests; only
+    # this test's full source evaluation should advance the delta by one.
+    demo_tail_before = ReactiveKernelsPPLExamples._DEMO_TAIL_EXECUTIONS[]
     template_kernel = prepare(build_covid19imperial_graph();
         have = _covid_have(), want = (:prior, :log_jacobian, :loglik, :posterior),
         bound = _covid_bind())
@@ -83,7 +83,7 @@ const _COVID_AE_ORDINARY = AutoEnzyme(mode = Enzyme.Reverse)
     @test isfinite(cold[4])
 
     artifact = evaluate_covid19imperial_source()
-    @test ReactiveKernelsPPLExamples._DEMO_TAIL_EXECUTIONS[] == 1
+    @test ReactiveKernelsPPLExamples._DEMO_TAIL_EXECUTIONS[] == demo_tail_before + 1
     @test artifact.source == strip(COVID19IMPERIAL_SOURCE, '\n')
     @test artifact.output == Base.invokelatest(artifact.kernel, artifact.inputs.q)
     model = artifact.model
