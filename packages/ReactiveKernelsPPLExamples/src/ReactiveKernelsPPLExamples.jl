@@ -125,6 +125,14 @@ include("bym2_offset_only.jl")
 include("bones_model.jl")
 include("multi_occupancy.jl")
 
+# posteriordb dynamics batch: lotka_volterra, sir, one_comp_mm_elim_abs,
+# soil_incubation (native + ordinary-Reverse path under 008vhy5; compiled
+# Reactant unsupported — see each module docstring).
+include("lotka_volterra.jl")
+include("sir.jl")
+include("one_comp_mm_elim_abs.jl")
+include("soil_incubation.jl")
+
 export PPLWorkflow
 
 # EXPERIMENTAL, NOT REVIEWED / NOT APPROVED — do NOT build on this.
@@ -267,5 +275,9 @@ export GLMM1ModelExample
 export Bym2OffsetOnlyExample
 export BonesModelExample
 export MultiOccupancyExample
+export LotkaVolterraExample
+export SIRExample
+export OneCompMMElimAbsExample
+export SoilIncubationExample
 
 end # module ReactiveKernelsPPLExamples

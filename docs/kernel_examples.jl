@@ -638,6 +638,43 @@ function setup_multi_occupancy!(mod::Module)
     nothing
 end
 
+function setup_lotka_volterra!(mod::Module)
+    if !isdefined(mod, :LotkaVolterraExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: LotkaVolterraExample))
+    end
+    Core.eval(mod, :(using .LotkaVolterraExample:
+        LOTKA_TS, LOTKA_Y_INIT, LOTKA_Y))
+    nothing
+end
+
+function setup_sir!(mod::Module)
+    if !isdefined(mod, :SIRExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: SIRExample))
+    end
+    Core.eval(mod, :(using .SIRExample:
+        SIR_T, SIR_Y0, SIR_STOI_HAT, SIR_B_HAT))
+    nothing
+end
+
+function setup_one_comp_mm_elim_abs!(mod::Module)
+    if !isdefined(mod, :OneCompMMElimAbsExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: OneCompMMElimAbsExample))
+    end
+    Core.eval(mod, :(using .OneCompMMElimAbsExample:
+        ONECOMP_T0, ONECOMP_D, ONECOMP_V, ONECOMP_TIMES, ONECOMP_C0,
+        ONECOMP_C_HAT))
+    nothing
+end
+
+function setup_soil_incubation!(mod::Module)
+    if !isdefined(mod, :SoilIncubationExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: SoilIncubationExample))
+    end
+    Core.eval(mod, :(using .SoilIncubationExample:
+        SOIL_T0, SOIL_TOTAL_C_T0, SOIL_TS, SOIL_ECO2MEAN))
+    nothing
+end
+
 function setup_online_stats!(mod::Module)
     if !isdefined(mod, :OnlineStatsExample)
         Base.include(mod, joinpath(@__DIR__, "..", "examples", "online_stats.jl"))
@@ -1167,6 +1204,10 @@ const EXPECTED_PPL_EXAMPLES = (
     :bym2_offset_only_posterior,
     :bones_model_posterior,
     :multi_occupancy_posterior,
+    :lotka_volterra_posterior,
+    :sir_posterior,
+    :one_comp_mm_elim_abs_posterior,
+    :soil_incubation_posterior,
 )
 const _PPL_EXECUTION_COUNTS = Dict(name => 0 for name in EXPECTED_PPL_EXAMPLES)
 
