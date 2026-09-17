@@ -71,6 +71,15 @@ const PPL_SOURCE_CASES = (
      :BONES_SOURCE, :evaluate_bones_model_source),
     ("multi-occupancy.md", "multi_occupancy.jl", MultiOccupancyExample,
      :MULTI_OCC_SOURCE, :evaluate_multi_occupancy_source),
+    ("lotka-volterra.md", "lotka_volterra.jl", LotkaVolterraExample,
+     :LOTKA_VOLTERRA_SOURCE, :evaluate_lotka_volterra_source),
+    ("sir.md", "sir.jl", SIRExample,
+     :SIR_SOURCE, :evaluate_sir_source),
+    ("one-comp-mm-elim-abs.md", "one_comp_mm_elim_abs.jl",
+     OneCompMMElimAbsExample,
+     :ONE_COMP_MM_ELIM_ABS_SOURCE, :evaluate_one_comp_mm_elim_abs_source),
+    ("soil-incubation.md", "soil_incubation.jl", SoilIncubationExample,
+     :SOIL_INCUBATION_SOURCE, :evaluate_soil_incubation_source),
 )
 
 # One displayed/executed authority kernel per registered case: a file carrying
