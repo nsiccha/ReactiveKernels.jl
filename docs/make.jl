@@ -78,6 +78,10 @@ site_pages = [
             "IRT 2PL + latent regression" => "2pl-latent-reg-irt.md",
             "IRT hierarchical 2PL (correlated items)" => "hier-2pl.md",
             "IRT GPCM (ordinal + latent regression)" => "gpcm-latent-reg-irt.md",
+            "GLMM1 (per-site Poisson-log GLMM)" => "glmm1.md",
+            "BYM2 (spatial-Poisson convolution)" => "bym2-offset-only.md",
+            "Bones (graded-response latent trait)" => "bones.md",
+            "Multi-occupancy (marginalized)" => "multi-occupancy.md",
         ],
         "Gaussian processes" => [
             "GP regression (marginal)" => "gp-regr.md",

@@ -22,8 +22,9 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     NormalMixtureExample, LowDimGaussMixCollapseExample, LowDimGaussMixExample,
     MNISTLogisticExample, MVNormalRegressionExample, BoundRegressionExample,
     NNRBMExample, LDAExample, Irt2plExample, TwoplLatentRegIrtExample,
-    Hier2plExample, GpcmLatentRegIrtExample
-    LosscurveSislobExample, AccelSplinesExample, StateSpaceStochasticExample, ProphetExample
+    Hier2plExample, GpcmLatentRegIrtExample,
+    LosscurveSislobExample, AccelSplinesExample, StateSpaceStochasticExample, ProphetExample,
+    GLMM1ModelExample, Bym2OffsetOnlyExample, BonesModelExample, MultiOccupancyExample
 using Test
 
 include("test_gp_first_use.jl")
@@ -138,6 +139,10 @@ include("test_irt_2pl_example.jl")
 include("test_2pl_latent_reg_irt_example.jl")
 include("test_hier_2pl_example.jl")
 include("test_gpcm_latent_reg_irt_example.jl")
+include("test_glmm1_model_example.jl")
+include("test_bym2_offset_only_example.jl")
+include("test_bones_model_example.jl")
+include("test_multi_occupancy_example.jl")
 include("test_ppl_macro.jl")
 include("test_ppl_posteriordb_parity.jl")
 include("test_ppl_gibbs.jl")

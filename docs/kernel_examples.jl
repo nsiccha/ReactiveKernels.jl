@@ -530,6 +530,45 @@ function setup_gpcm_latent_reg_irt!(mod::Module)
     # structure, the covariate design, and the sum-to-zero map in-graph.
     Core.eval(mod, :(using .GpcmLatentRegIrtExample:
         GPCM_LR_II, GPCM_LR_JJ, GPCM_LR_Y, GPCM_LR_W, GPCM_LR_I))
+function setup_glmm1!(mod::Module)
+    if !isdefined(mod, :GLMM1ModelExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: GLMM1ModelExample))
+    end
+    # Bind only the raw counts + site indices; the displayed PPL assembly imports
+    # the shared normal/poisson endpoints itself and gathers alpha[obssite] in-graph.
+    Core.eval(mod, :(using .GLMM1ModelExample: GLMM1_OBS, GLMM1_OBSSITE, GLMM1_NSITE))
+    nothing
+end
+
+function setup_bym2_offset_only!(mod::Module)
+    if !isdefined(mod, :Bym2OffsetOnlyExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: Bym2OffsetOnlyExample))
+    end
+    # Bind only the raw adjacency/counts/exposure/scaling; log_E, convolved_re and
+    # the ICAR phi[node1]/phi[node2] gathers are derived in-graph.
+    Core.eval(mod, :(using .Bym2OffsetOnlyExample:
+        BYM2_NODE1, BYM2_NODE2, BYM2_Y, BYM2_E, BYM2_SCALING_FACTOR))
+    nothing
+end
+
+function setup_bones!(mod::Module)
+    if !isdefined(mod, :BonesModelExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: BonesModelExample))
+    end
+    # Bind only the raw grade/gamma/delta/ncat block; grid coordinates and the
+    # ragged cut selection are all derived in-graph.
+    Core.eval(mod, :(using .BonesModelExample: BONES_GRADE, BONES_GAMMA, BONES_DELTA, BONES_NCAT))
+    nothing
+end
+
+function setup_multi_occupancy!(mod::Module)
+    if !isdefined(mod, :MultiOccupancyExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: MultiOccupancyExample))
+    end
+    # Bind only the raw n×J detection matrix + dims; the flat counts, species
+    # coordinate and binomial normalizer are all derived in-graph.
+    Core.eval(mod, :(using .MultiOccupancyExample:
+        MULTI_OCC_X, MULTI_OCC_N, MULTI_OCC_J, MULTI_OCC_K, MULTI_OCC_S))
     nothing
 end
 
@@ -1053,11 +1092,16 @@ const EXPECTED_PPL_EXAMPLES = (
     :two_pl_latent_reg_irt_posterior,
     :hier_2pl_posterior,
     :gpcm_latent_reg_irt_posterior,
+    :glmm1_model_posterior,
+    :bym2_offset_only_posterior,
+    :bones_model_posterior,
+    :multi_occupancy_posterior,
 )
 const _PPL_EXECUTION_COUNTS = Dict(name => 0 for name in EXPECTED_PPL_EXAMPLES)
 
 function _record_ppl_execution!(name::Symbol)
-    haskey(_PPL_EXECUTION_COUNTS, name) || return nothing
+    haskey(_PPL_EXECUTION_COUNTS, name) ||
+        error("unknown PPL example execution name $name (expected one of $(join(EXPECTED_PPL_EXAMPLES, ", ")))")
     _PPL_EXECUTION_COUNTS[name] += 1
     nothing
 end
