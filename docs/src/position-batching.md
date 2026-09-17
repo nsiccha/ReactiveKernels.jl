@@ -64,8 +64,12 @@ mutation or state carried between calls is not a batchable contract.
 Native execution validates ranks and equal batch lengths, evaluates independent
 positions, and stacks the requested outputs. This necessarily allocates output
 containers and copies array-valued slices; it is not the allocation-free
-reducing contract of a likelihood `plate`. Shared scalar work remains in the
-scalar prepared kernel rather than being copied per position.
+reducing contract of a likelihood `plate`. In the current typed replica
+lowering, a recipe depending only on shared ports is still evaluated once per
+position because it remains inside the scalar kernel. When such invariant work
+dominates, precompute it once outside the position batch and pass the result as
+a shared HAVE today; graph-level invariant hoisting is a separate optimization
+boundary, not part of the current contract.
 
 With Reactant, `@compile batched(positions, shared...)` lowers the same map to a
 backend batch primitive. A scalar kernel that compiles under Reactant therefore
