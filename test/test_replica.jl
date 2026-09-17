@@ -46,6 +46,42 @@ end
         positions[:, 1], 0.3, log(1.2))
 end
 
+@testset "public position-batching surface" begin
+    @kernel position_source(
+            x::Vector{Float64}, shared::Float64) = begin
+        total::Float64 = shared * sum(abs2, x)
+        pointwise::Vector{Float64} = shared .* x
+        return (total, pointwise)
+    end
+
+    lifted = prepare_batched(position_source; batched = :x, want = (:total, :pointwise))
+    concise = vectorize(position_source;
+                        batched = :x, want = (:total, :pointwise))
+    prepared = prepare(position_source;
+                       want = (:total, :pointwise))
+    low_level = vectorize(prepared; batched = :x)
+    positions = reshape(collect(1.0:6.0), 3, 2)
+
+    @test batched_ports(lifted) == (:x,)
+    @test scalar_kernel(lifted) === lifted.target
+    for kernel in (lifted, low_level)
+        totals, pointwise = kernel(positions, 2.0)
+        @test totals == [28.0, 154.0]
+        @test pointwise == cat((2 .* positions[:, i] for i in 1:2)...; dims = 2)
+        @test inputs(kernel) == inputs(prepared)
+        @test outputs(kernel) == outputs(prepared)
+    end
+
+    @test_throws ArgumentError prepare_batched(
+        position_source; batched = (), want = :total)
+    @test_throws ArgumentError prepare_batched(
+        position_source; batched = :missing, want = :total)
+    both = prepare_batched(
+        position_source; batched = (:x, :shared), want = :total)
+    @test batched_ports(both) == (:x, :shared) # metadata follows selected HAVE order
+    @test_throws DimensionMismatch both(positions, [2.0, 3.0, 4.0])
+end
+
 @kernel replica_defaulted(x::Float64, offset::Float64 = 1.0) = begin
     y::Float64 = x + offset
 end
