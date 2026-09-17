@@ -19,6 +19,14 @@ const PPL_SOURCE_CASES = (
      :ARMA11_SOURCE, :evaluate_arma11_source),
     ("covid19imperial.md", "covid19imperial.jl", Covid19ImperialExample,
      :COVID19IMPERIAL_SOURCE, :evaluate_covid19imperial_source),
+    ("garch11.md", "garch11.jl", GARCH11Example,
+     :GARCH11_SOURCE, :evaluate_garch11_source),
+    ("hmm-example.md", "hmm_example.jl", HmmExampleExample,
+     :HMM_EXAMPLE_SOURCE, :evaluate_hmm_example_source),
+    ("hmm-gaussian.md", "hmm_gaussian.jl", HmmGaussianExample,
+     :HMM_GAUSSIAN_SOURCE, :evaluate_hmm_gaussian_source),
+    ("iohmm-reg.md", "iohmm_reg.jl", IohmmRegExample,
+     :IOHMM_REG_SOURCE, :evaluate_iohmm_reg_source),
     ("mnist-logistic.md", "mnist_logistic.jl", MNISTLogisticExample,
      :MNIST_LOGISTIC_SOURCE, :evaluate_mnist_logistic_source),
     ("mnist-logistic.md", "mnist_logistic.jl", MNISTLogisticExample,
@@ -135,6 +143,10 @@ end
         :poisson_gamma_density,
         :dugongs_density,
         :arma11_density,
+        :garch11_density,
+        :hmm_example_density,
+        :hmm_gaussian_density,
+        :iohmm_reg_density,
         :mnist_logistic_density,
         :mnist_logistic_optimized_density,
         :mvnormal_regression_density,
@@ -154,9 +166,15 @@ end
         @test count(marker, helper_source) == 1
     end
 
-    # The exact-once PPL execution gate must fail closed on an unknown name;
-    # otherwise a misspelled artifact name is silently unrecorded.
-    @test occursin("unknown PPL example execution name", helper_source)
+    # The exact-once PPL execution gate is opt-in for shared executable docs.
+    # PPL walkthroughs must request the gate, while non-PPL executable pages
+    # are excluded from the posterior-walkthrough name registry.
+    @test occursin("haskey(_PPL_EXECUTION_COUNTS, name) || return nothing",
+                   helper_source)
+    @test occursin("gate && _record_ppl_execution!(executed.name)",
+                   helper_source)
+    @test occursin("execute_example(mod, code; result, setup = nothing, gate = true)",
+                   helper_source)
 
     # Each latent/spatial page contributes exactly one executable source panel.
     for page in ("glmm1.md", "bym2-offset-only.md", "bones.md",
