@@ -54,6 +54,37 @@ function _generated_source(expr::Expr)
     sprint(Base.show_unquoted, expr; context = :limit => false)
 end
 
+# Vitepress/Shiki amplifies a single long generated-code line into several MiB
+# of highlighted HTML/JS. Preserve the executed artifact and its exact output in
+# the build gate, but give readers a bounded generated preview rather than
+# highlighting megabytes of inlined constants.
+function _display_code(label::AbstractString, code::AbstractString;
+                       max_bytes::Int = 64 * 1024)
+    sizeof(code) <= max_bytes && return code
+    lines = split(code, '\n'; keepempty = true)
+    head_lines = first(lines, 24)
+    tail_lines = last(lines, 12)
+    while sizeof(join(vcat(head_lines, ["…"], tail_lines), '\n')) > max_bytes &&
+          length(head_lines) > 4 && length(tail_lines) > 2
+        if length(head_lines) > length(tail_lines)
+            head_lines = head_lines[1:(end - 1)]
+        else
+            tail_lines = tail_lines[2:end]
+        end
+    end
+    omitted_bytes = sizeof(code) -
+        sizeof(join(vcat(head_lines, tail_lines), '\n'))
+    return join(vcat(
+        head_lines,
+        [
+            "# … display bounded for docs build memory …",
+            "# $(length(lines)) lines total; about $(Base.format_bytes(sizeof(code))) total,",
+            "# about $(Base.format_bytes(max(omitted_bytes, 0))) omitted here.",
+        ],
+        tail_lines,
+    ), '\n')
+end
+
 function _readable_generated_source(expr::Expr, context, label)
     readable = ReactiveKernels._readable_expr(expr, context)
     occursin(r"__ops__\[\d+\]", string(readable)) && error(
@@ -744,12 +775,12 @@ function _three_pane_blocks!(blocks, artifact_id, title, source, generated, dag:
      data-rk-artifact-kind="example-panel">
 <div data-rk-pane="source">
 """))
-    push!(blocks, Markdown.Code("julia", source))
+    push!(blocks, Markdown.Code("julia", _display_code("source", source)))
     push!(blocks, RawHTML("""
 </div>
 <div data-rk-pane="kernel">
 """))
-    push!(blocks, Markdown.Code("julia", generated))
+    push!(blocks, Markdown.Code("julia", _display_code("generated", generated)))
     push!(blocks, RawHTML("""
 </div>
 <div data-rk-pane="dag">
@@ -1104,12 +1135,12 @@ const EXPECTED_PPL_EXAMPLES = (
 const _PPL_EXECUTION_COUNTS = Dict(name => 0 for name in EXPECTED_PPL_EXAMPLES)
 
 function _record_ppl_execution!(name::Symbol)
-    haskey(_PPL_EXECUTION_COUNTS, name) ||
-        error("unknown PPL example execution name $name (expected one of $(join(EXPECTED_PPL_EXAMPLES, ", ")))")
+    # execute_example is shared by PPL and non-PPL executable docs; only PPL
+    # names participate in the exact-once posterior-walkthrough gate.
+    haskey(_PPL_EXECUTION_COUNTS, name) || return nothing
     _PPL_EXECUTION_COUNTS[name] += 1
     nothing
 end
-
 function assert_ppl_examples_executed!()
     failures = String[]
     for name in EXPECTED_PPL_EXAMPLES
