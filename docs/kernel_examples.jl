@@ -1134,12 +1134,12 @@ const EXPECTED_PPL_EXAMPLES = (
 const _PPL_EXECUTION_COUNTS = Dict(name => 0 for name in EXPECTED_PPL_EXAMPLES)
 
 function _record_ppl_execution!(name::Symbol)
-    haskey(_PPL_EXECUTION_COUNTS, name) ||
-        error("unknown PPL example execution name $name (expected one of $(join(EXPECTED_PPL_EXAMPLES, ", ")))")
+    # execute_example is shared by PPL and non-PPL executable docs; only PPL
+    # names participate in the exact-once posterior-walkthrough gate.
+    haskey(_PPL_EXECUTION_COUNTS, name) || return nothing
     _PPL_EXECUTION_COUNTS[name] += 1
     nothing
 end
-
 function assert_ppl_examples_executed!()
     failures = String[]
     for name in EXPECTED_PPL_EXAMPLES
