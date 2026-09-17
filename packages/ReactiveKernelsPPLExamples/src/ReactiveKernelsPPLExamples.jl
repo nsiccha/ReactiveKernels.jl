@@ -89,6 +89,10 @@ include("wells_dist100ars_model.jl")
 include("election88_full.jl")
 include("dugongs_growth.jl")
 include("arma11.jl")
+include("garch11.jl")
+include("hmm_example.jl")
+include("hmm_gaussian.jl")
+include("iohmm_reg.jl")
 include("normal_mixture.jl")
 include("low_dim_gauss_mix_collapse.jl")
 include("low_dim_gauss_mix.jl")
@@ -228,6 +232,10 @@ export WellsDist100arsExample
 export Election88FullExample
 export DugongsGrowthExample
 export ARMA11Example
+export GARCH11Example
+export HmmExampleExample
+export HmmGaussianExample
+export IohmmRegExample
 export NormalMixtureExample
 export LowDimGaussMixCollapseExample
 export LowDimGaussMixExample
