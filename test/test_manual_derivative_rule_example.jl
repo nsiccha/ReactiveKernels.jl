@@ -2,7 +2,11 @@ using LinearAlgebra
 using Test
 
 include(joinpath(@__DIR__, "..", "examples", "manual_derivative_rule.jl"))
-using .ManualDerivativeRuleExample
+# `import` (not `using`): `DifferentiationInterface` (loaded earlier in
+# full-suite order by `test_ad.jl`) and `ManualDerivativeRuleExample` both
+# export `value_and_pullback`, so keeping the example module's exports out of
+# Main and fully qualifying below makes the fixture robust to suite order.
+import .ManualDerivativeRuleExample
 
 @testset "one pure graph supplies pruned primal, JVP, and VJP cuts" begin
     result = ManualDerivativeRuleExample.run()
@@ -24,9 +28,13 @@ using .ManualDerivativeRuleExample
         x_only = (:vjp, :A),
     )
 
-    A = copy(EXAMPLE_INPUTS.A)
-    x = copy(EXAMPLE_INPUTS.x)
-    y, pullback = value_and_pullback(A, x)
+    # Qualify these: `DifferentiationInterface` exports the same
+    # `value_and_pullback` name, so the bare call is ambiguous once both
+    # modules are in scope.
+    A = copy(ManualDerivativeRuleExample.EXAMPLE_INPUTS.A)
+    x = copy(ManualDerivativeRuleExample.EXAMPLE_INPUTS.x)
+    y, pullback =
+        ManualDerivativeRuleExample.value_and_pullback(A, x)
     @test pullback.A === A
     @test pullback.x === x
     @test y == [-1.5, -2.5]
