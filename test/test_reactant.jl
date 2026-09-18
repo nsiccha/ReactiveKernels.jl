@@ -605,6 +605,24 @@ end
         @test Array(gradients) ≈ vector_reference[2]
     end
 
+    @testset "graph-native position batching compiles under Reactant" begin
+        kernel = prepare_batched(
+            reactant_replica_normal;
+            batched = :x, want = :total)
+        @test kernel isa ReactiveKernels.GraphReplicatedKernel
+        positions = reshape(collect(0.0:0.05:1.15), 6, 4)
+        reference = kernel(positions, 0.3, log(1.2))
+        compiled = @compile kernel(
+            Reactant.to_rarray(positions),
+            Reactant.to_rarray(0.3; track_numbers = true),
+            Reactant.to_rarray(log(1.2); track_numbers = true))
+        observed = compiled(
+            Reactant.to_rarray(positions),
+            Reactant.to_rarray(0.3; track_numbers = true),
+            Reactant.to_rarray(log(1.2); track_numbers = true))
+        @test Array(observed) ≈ reference
+    end
+
     @testset "scalar-source HMC compiles once and replicas without a rewrite" begin
         inverse_mass = [2.0 0.2 0.1;
                         0.2 1.5 0.3;
