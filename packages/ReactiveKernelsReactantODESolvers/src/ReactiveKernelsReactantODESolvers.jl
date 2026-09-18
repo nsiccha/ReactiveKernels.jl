@@ -5,19 +5,29 @@ RK-native, explicitly adaptive ODE solvers that lower through Reactant.
 
 This is a self-contained example subpackage: it owns an explicit adaptive
 Tsit5 implementation whose adaptive control is written in Reactant-traceable
-form (fixed-shape buffers, traceable control flow, no host-side branching on
-tensor values), plus ordinary reverse-mode gradients through the solve.
+form (fixed-shape buffers, traceable control flow, no scalar indexing into
+traced arrays, no host-side branching on tensor values), plus ordinary
+reverse-mode gradients through the solve.
 
-Scope status: scaffold. The native solver, Reactant lowering, and RK-kernel
-refactor land as separate milestones; nothing here is PosteriorDB support
-until the solver itself is independently proven and separately reviewed.
-Stiff/BDF solvers, discontinuous events/callbacks, and rewiring the
-PosteriorDB adaptive-ODE models to this solver are explicitly out of scope
-until separately authorized.
+Nothing here is PosteriorDB support until the solver itself is independently
+proven and separately reviewed. Stiff/BDF solvers, discontinuous
+events/callbacks, and rewiring the PosteriorDB adaptive-ODE models to this
+solver are explicitly out of scope until separately authorized.
 """
 module ReactiveKernelsReactantODESolvers
 
 using LinearAlgebra
+# ReactiveKernels is load-bearing for the RK-kernel lowering milestone; the
+# native solver core below is deliberately dependency-light so the same
+# tableau/step code traces through Reactant unchanged.
 using ReactiveKernels
+
+export Tsit5, Tsit5Solution, solve_ode
+
+include("tableau.jl")
+include("controller.jl")
+include("step.jl")
+include("dense.jl")
+include("solve.jl")
 
 end # module ReactiveKernelsReactantODESolvers

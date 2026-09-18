@@ -7,3 +7,9 @@ using Test
     # lowering milestone; this fails if the local path wiring breaks.
     @test isdefined(ReactiveKernelsReactantODESolvers, :ReactiveKernels)
 end
+
+include("test_problems.jl")
+include("test_reference.jl")
+include("test_controller.jl")
+include("test_agreement.jl")
+include("test_guards.jl")
