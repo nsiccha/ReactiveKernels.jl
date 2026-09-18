@@ -71,7 +71,7 @@ module PPLGeneratedModels
 using ReactiveKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal, bernoulli, poisson, cauchy, exponential, gamma, lognormal,
-    beta, inverse_gamma
+    beta, inverse_gamma, binomial, negative_binomial2
 # Selective (explicit imports win over any re-export chain, so no `using`
 # ambiguity if ReactiveKernels ever exports these too): the only Statistics
 # names in the assignment allowlist.
@@ -148,7 +148,8 @@ end
 
 # One plate likelihood per response (pointwise plate + scalar sum node).
 # Triples 2 and 3 (Bernoulli-logit) lower identically; the triple only
-# selects the form.
+# selects the form. Branches are explicit per family; the else is a
+# fail-closed guard for enum members without an emitter (never silent).
 function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
     node = _lik_name(r.label)
     pw = _pw_name(r.label)
@@ -156,8 +157,17 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         return _gaussian_plate_stmts(r, plan, node, pw)
     elseif r.family === BernoulliLogitFam
         return _bernoulli_plate_stmts(r, plan, node, pw)
-    else
+    elseif r.family === PoissonLogFam
         return _poisson_plate_stmts(r, plan, node, pw)
+    elseif r.family === BinomialLogitFam
+        return _binomial_plate_stmts(r, plan, node, pw)
+    elseif r.family === NegativeBinomial2Fam
+        return _nb2_plate_stmts(r, plan, node, pw)
+    elseif r.family === GammaLogFam
+        return _gamma_plate_stmts(r, plan, node, pw)
+    else
+        throw(ContractValidationError(
+            "[generator] response family $(r.family) has no emitter"))
     end
 end
 
@@ -317,6 +327,63 @@ function _poisson_cell(kind::Symbol, base::Expr, yv::Symbol, lb, ub, etav::Symbo
     else # :interval_censored
         return :(log($(pcdf(ub)) - $(pcdf(_poisson_below(yv)))))
     end
+end
+
+function _binomial_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _lp_name(_predictor(plan, r.predictor))
+    inputs = Any[y, lp]
+    yv, etav = _dovar(1), _dovar(2)
+    nref = _thread_ref!(inputs, r.trials, true)
+    # All-keyword: the object constructor cannot mix positional and named
+    # owner bindings (matches the `:observed/:n/:logit` HAVE ports).
+    cell = :(binomial(; n = $nref, logit = $etav).logpdf($yv))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return _plate_sum_stmts(pw, node, inputs, cell)
+end
+
+# Mean/rate vectors are precomputed statements (like `_ppl_lp_*`): plate
+# cells take plain do-vars — a computed `exp` constructor arg miscompiles
+# the Enzyme pullback (NB2 eta-gradient, found by test).
+_mu_name(label::Symbol) = Symbol(:_ppl_mu_, label)
+_rate_name(label::Symbol) = Symbol(:_ppl_rate_, label)
+
+function _nb2_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _lp_name(_predictor(plan, r.predictor))
+    mu = _mu_name(r.label)
+    pre = :($mu = exp.($lp))
+    inputs = Any[y, mu]
+    yv, muv = _dovar(1), _dovar(2)
+    phiref = _thread_ref!(inputs, r.scale)
+    cell = :(negative_binomial2($muv, $phiref).logpdf($yv))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return Expr[pre, _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+function _gamma_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _lp_name(_predictor(plan, r.predictor))
+    # Surface is Distributions-SCALE `Gamma(alpha, mu/alpha)`; the kernel
+    # takes rate, so the boundary inverts (same as the sampled-gamma prior).
+    av = r.scale isa Symbol ? r.scale : Float64(r.scale)
+    rate = _rate_name(r.label)
+    pre = :($rate = $av ./ exp.($lp))
+    inputs = Any[y, rate]
+    yv, ratev = _dovar(1), _dovar(2)
+    aref = _thread_ref!(inputs, r.scale)
+    cell = :(gamma($aref, $ratev).logpdf($yv))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = :($wv * $cell)
+    end
+    return Expr[pre, _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 function _prior_statements(plan::StructuralPlan, layout::LayoutTable)

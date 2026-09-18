@@ -1438,12 +1438,12 @@ function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse)
     call = _dot2call_response(lhs, rhs)
     weights, call = _peel_weighted(lhs, call, ctx)
     evidence, call = _peel_evidence(lhs, call, ctx)
-    family, lik_link, pred_link, loc, scale =
+    family, lik_link, pred_link, loc, scale, trials =
         _lower_response_base(lhs, call, ctx)
     pname = _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         coefuse)
     return LikelihoodSpec(family, lik_link, lhs, pname, scale, weights,
-        evidence, Symbol(lhs, "_resp"), range)
+        evidence, Symbol(lhs, "_resp"), trials, range)
 end
 
 # `.~` takes a dotted distribution object (`Normal.(mu, sigma)`); convert
@@ -1472,7 +1472,8 @@ end
 function _dot2call_object_error(lhs, rhs)
     if rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
             rhs.args[1] isa Symbol && rhs.args[1] in
-            (:Normal, :Bernoulli, :Poisson, :weighted, :truncated, :censored,
+            (:Normal, :Bernoulli, :Poisson, :Binomial, :NegativeBinomial2,
+                :Gamma, :weighted, :truncated, :censored,
                 :interval_censored)
         _sfail("response $lhs: broadcast the object " *
                "(`$(rhs.args[1]).(...)` — `.~` is elementwise)")
@@ -1491,7 +1492,13 @@ function _dot2call_spine_arg(lhs, f, i, a)
         return _dot2call_nested_object(lhs, a)
     elseif (f === :Bernoulli || f === :Poisson) && i == 1
         return _dot2call_nested_link(lhs, a, f)
+    elseif f === :Binomial && i == 2
+        return _dot2call_nested_link(lhs, a, f)
+    elseif f === :NegativeBinomial2 && i == 1
+        return _dot2call_nested_link(lhs, a, f)
     end
+    # Gamma position 2 (`exp.(eta) ./ alpha`) passes through; the
+    # response branch matches the `./` structure (link + alpha identity).
     return a
 end
 
@@ -1510,7 +1517,7 @@ function _dot2call_nested_object(lhs, a)
 end
 
 function _dot2call_nested_link(lhs, a, base)
-    want = base === :Bernoulli ? :logistic : :exp
+    want = (base === :Bernoulli || base === :Binomial) ? :logistic : :exp
     a isa Expr && a.head === :. && length(a.args) == 2 &&
         a.args[1] isa Symbol && a.args[2] isa Expr &&
         a.args[2].head === :tuple ||
@@ -1604,7 +1611,9 @@ end
 
 const _RESPONSE_BASE_MSG =
     "response distribution must be `Normal.(mu, sigma)`, " *
-    "`Bernoulli.(logistic.(eta))` or `Poisson.(exp.(eta))`"
+    "`Bernoulli.(logistic.(eta))`, `Poisson.(exp.(eta))`, " *
+    "`Binomial.(n, logistic.(mu))`, `NegativeBinomial2.(exp.(eta), phi)` " *
+    "or `Gamma.(alpha, exp.(eta) ./ alpha)`"
 
 function _lower_response_base(lhs, rhs::Expr, ctx)
     rhs.head === :call || _sfail("response $lhs: $_RESPONSE_BASE_MSG; " *
@@ -1613,37 +1622,101 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
     fam === :weighted &&
         _sfail("`weighted.(...)` goes outermost: " *
                "`y .~ weighted.(Normal.(mu, sigma), w)`")
-    fam in (:Normal, :Bernoulli, :Poisson) ||
-        return _lower_response_base_error(lhs, rhs, fam)
+    fam in (:Normal, :Bernoulli, :Poisson, :Binomial, :NegativeBinomial2,
+        :Gamma) || return _lower_response_base_error(lhs, rhs, fam)
     args = _plain_args(rhs, "`$fam`")
     if fam === :Normal
         length(args) == 2 || _sfail("response $lhs: `Normal` takes " *
                                     "`Normal.(mu, sigma)`")
         return GaussianFam, IdentityLink, IdentityLink, args[1],
-        _lower_scale(lhs, args[2], ctx)
+        _lower_scale(lhs, args[2], ctx), nothing
     elseif fam === :Bernoulli
         length(args) == 1 || _sfail("response $lhs: `Bernoulli` takes " *
                                     "`Bernoulli.(logistic.(eta))`")
         return BernoulliLogitFam, LogitLink, IdentityLink,
-        _lower_link_arg(lhs, args[1], :logistic), nothing
+        _lower_link_arg(lhs, args[1], :logistic), nothing, nothing
+    elseif fam === :Binomial
+        length(args) == 2 || _sfail("response $lhs: `Binomial` takes " *
+                                    "`Binomial.(n, logistic.(mu))`")
+        return BinomialLogitFam, LogitLink, IdentityLink,
+        _lower_link_arg(lhs, args[2], :logistic), nothing,
+        _lower_trials(lhs, args[1], ctx)
+    elseif fam === :NegativeBinomial2
+        length(args) == 2 || _sfail("response $lhs: `NegativeBinomial2` takes " *
+                                    "`NegativeBinomial2.(exp.(eta), phi)`")
+        return NegativeBinomial2Fam, LogLink, LogLink,
+        _lower_link_arg(lhs, args[1], :exp),
+        _lower_scale(lhs, args[2], ctx), nothing
+    elseif fam === :Gamma
+        loc, scale = _lower_gamma_args(lhs, args, ctx)
+        return GammaLogFam, LogLink, LogLink, loc, scale, nothing
     else
         length(args) == 1 || _sfail("response $lhs: `Poisson` takes " *
                                     "`Poisson.(exp.(eta))`")
         return PoissonLogFam, LogLink, LogLink,
-        _lower_link_arg(lhs, args[1], :exp), nothing
+        _lower_link_arg(lhs, args[1], :exp), nothing, nothing
     end
 end
 
+function _lower_trials(lhs, t, ctx)
+    t isa Bool && _sfail("response $lhs trials must be an Int data " *
+                         "column or Int literal, got Bool")
+    t isa Integer && return Int(t)
+    t isa Real && _sfail("response $lhs trials must be an Int data " *
+                         "column or Int literal, got $(repr(t))")
+    if t isa Symbol
+        t in ctx.data && return t
+        t in ctx.vecdefs && _sfail(
+            "response $lhs trials column $t is derived — slice-1 binds " *
+            "trials raw (derived trials need shape metadata — planned)")
+        return _sfail("response $lhs trials $(repr(t)) must be an Int " *
+                      "data column or Int literal")
+    end
+    return _sfail("response $lhs trials must be an Int data column or " *
+                  "Int literal, got $(repr(t))")
+end
+
+function _lower_gamma_args(lhs, args, ctx)
+    length(args) == 2 || _sfail("response $lhs: `Gamma` takes " *
+                                "`Gamma.(alpha, exp.(eta) ./ alpha)`")
+    a1, div = args
+    div isa Expr && div.head === :call && length(div.args) == 3 &&
+        div.args[1] === Symbol("./") ||
+        _sfail("response $lhs: `Gamma` takes " *
+               "`Gamma.(alpha, exp.(eta) ./ alpha)`")
+    loc = _lower_link_arg(lhs,
+        _dot2call_nested_link(lhs, div.args[2], :Gamma), :exp)
+    a2 = div.args[3]
+    _same_gamma_alpha(a1, a2) || _sfail(
+        "response $lhs: both `Gamma` positions must name the same alpha " *
+        "(got $(repr(a1)) and $(repr(a2)))")
+    return loc, _lower_scale(lhs, a1, ctx)
+end
+
+_same_gamma_alpha(a, b) =
+    a isa Symbol && b isa Symbol ? a === b :
+    a isa Real && b isa Real ? a == b : false
+
 function _lower_response_base_error(lhs, rhs, fam)
-    fam in (:normal, :bernoulli, :poisson) && _sfail(
+    fam in (:normal, :bernoulli, :poisson, :binomial, :gamma) && _sfail(
         "response $lhs: use Distributions.jl constructors " *
         "(`Normal`, not `normal`)")
+    fam === :negative_binomial2 && _sfail("response $lhs: use " *
+                                          "`NegativeBinomial2` (the response " *
+                                          "spelling, not the kernel endpoint)")
     fam === :BernoulliLogit && _sfail("response $lhs: write " *
                                       "`Bernoulli.(logistic.(eta))`")
     fam === :PoissonLog && _sfail("response $lhs: write " *
                                   "`Poisson.(exp.(eta))`")
+    fam === :BinomialLogit && _sfail("response $lhs: write " *
+                                     "`Binomial.(n, logistic.(mu))`")
+    fam === :NegativeBinomial2Log && _sfail("response $lhs: write " *
+        "`NegativeBinomial2.(exp.(eta), phi)`")
+    fam === :GammaLog && _sfail("response $lhs: write " *
+                                "`Gamma.(alpha, exp.(eta) ./ alpha)`")
     return _sfail("response $lhs: unknown distribution `$(repr(fam))` " *
-                  "(admitted: Normal, Bernoulli, Poisson). When `$fam` is a " *
+                  "(admitted: Normal, Bernoulli, Poisson, Binomial, " *
+                  "NegativeBinomial2, Gamma). When `$fam` is a " *
                   "defined RKPPLSubmodel, a latent uses `latent ~ $fam(...)` " *
                   "and an observation stream uses plain `$lhs ~ $fam(...)` " *
                   "(the whole-column vectorized callee); an elementwise " *

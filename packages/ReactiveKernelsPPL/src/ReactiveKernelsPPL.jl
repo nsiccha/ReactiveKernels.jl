@@ -16,7 +16,8 @@ module ReactiveKernelsPPL
 using ReactiveKernels
 
 export ColumnRef, ParamName
-export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam
+export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
+    BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam
 export LinkFunction, IdentityLink, LogitLink, LogLink
 export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, LatentTerm
 export ResponseEvidence, LikelihoodSpec, TermSpec, PredictorSpec

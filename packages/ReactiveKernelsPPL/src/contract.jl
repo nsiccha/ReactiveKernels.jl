@@ -31,6 +31,9 @@ const ParamName = Symbol
     GaussianFam
     BernoulliLogitFam
     PoissonLogFam
+    BinomialLogitFam
+    NegativeBinomial2Fam
+    GammaLogFam
 end
 
 """Link functions. The enum crosses the boundary; the thin layer owns the
@@ -68,14 +71,18 @@ struct ResponseEvidence
 end
 
 """
-    LikelihoodSpec(family, link, response, predictor, scale, weights, evidence, label[, range])
+    LikelihoodSpec(family, link, response, predictor, scale, weights, evidence, label[, trials[, range]])
 
-One independent response. `scale` is the Gaussian sigma (parameter,
-assignment, or folded literal) and must be `nothing` otherwise. `weights`
-is a frequency/power-objective column (D1); analytic/precision weights fail
-closed emitter-side. `range` carries a literal `y[1:N]` response range
-(`nothing` = whole column: bare `.~`, `eachindex`, `axes`); it must cover
-`1:n_obs` exactly (checked at bind).
+One independent response. `scale` is the response's scalar auxiliary —
+Gaussian sigma, NB2 dispersion phi, Gamma shape alpha (parameter,
+assignment, or folded literal) — and must be `nothing` otherwise. (One
+slot covers every admitted family; a two-auxiliary family such as Beta
+needs a new field — noted, not built.) `weights` is a
+frequency/power-objective column (D1); analytic/precision weights fail
+closed emitter-side. `trials` is the Binomial trial count (Int column or
+Int literal), `nothing` otherwise. `range` carries a literal `y[1:N]`
+response range (`nothing` = whole column: bare `.~`, `eachindex`,
+`axes`); it must cover `1:n_obs` exactly (checked at bind).
 """
 struct LikelihoodSpec
     family::LikelihoodFamily
@@ -86,12 +93,17 @@ struct LikelihoodSpec
     weights::Union{Nothing,ColumnRef}
     evidence::ResponseEvidence
     label::Symbol
+    trials::Union{Nothing,ColumnRef,Int}
     range::Union{Nothing,UnitRange{Int}}
 end
 LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
     label) =
     LikelihoodSpec(family, link, response, predictor, scale, weights,
-        evidence, label, nothing)
+        evidence, label, nothing, nothing)
+LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
+    label, range) =
+    LikelihoodSpec(family, link, response, predictor, scale, weights,
+        evidence, label, nothing, range)
 
 """
     TermSpec(kind, columns, options, addressee, label)
@@ -323,8 +335,8 @@ struct StructuralPlan
     scans::Vector{ScanSpec}
 end
 
-# Pre-scan full-positional constructor (9-arg): every caller that built a plan
-# before `scans` existed keeps working with an empty scan set.
+# Pre-extension full-positional constructor (9-arg): callers that built a plan
+# before `levelmaps`/`scans` existed keep working with both empty.
 StructuralPlan(
     responses::Vector{LikelihoodSpec},
     predictors::Vector{PredictorSpec},
@@ -336,11 +348,11 @@ StructuralPlan(
     n_obs::Int,
     roles::Dict{Symbol,Symbol}) =
     StructuralPlan(responses, predictors, population_priors, parameters,
-        assignments, derived, columns, n_obs, roles, ScanSpec[])
+        assignments, derived, columns, n_obs, roles, LevelMap[], ScanSpec[])
 
 """Column roles: what a bound column IS (CV travel + program transforms read
 this). Inferred at bind; explicit roles override. Unbound plans carry none."""
-const COLUMN_ROLES = (:response, :predictor, :weight, :evidence, :data)
+const COLUMN_ROLES = (:response, :predictor, :weight, :evidence, :trials, :data)
 
 # Compatibility constructor: 7-arg positional construction (pre-roles,
 # pre-derived, pre-levelmaps) keeps working with empties; the
@@ -375,6 +387,9 @@ const ADMITTED_TRIPLES = (
     (BernoulliLogitFam, LogitLink, IdentityLink),
     (BernoulliLogitFam, LogitLink, LogitLink),
     (PoissonLogFam, LogLink, LogLink),
+    (BinomialLogitFam, LogitLink, IdentityLink),
+    (NegativeBinomial2Fam, LogLink, LogLink),
+    (GammaLogFam, LogLink, LogLink),
 )
 
 """Positional arity per sampled family (Distributions.jl order)."""
@@ -432,7 +447,8 @@ const ELEMENTWISE_COMPARISONS = (:.==, :.!=, :.<, :.>, :.<=, :.>=)
 const ELEMENTWISE_FNS = (:log, :log10, :log1p, :exp, :expm1, :sqrt, :abs)
 
 """Families the thin layer can lower (ext handshake predicate)."""
-admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam)
+admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
+    BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam)
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm)
@@ -1442,6 +1458,7 @@ function _validate_response_data(plan::StructuralPlan)
     for r in plan.responses
         _validate_response_column(r, plan)
         _validate_weights(r, plan)
+        _validate_trials(r, plan)
         _validate_evidence_data(r, plan)
     end
     return nothing
@@ -1466,30 +1483,87 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
     elseif r.family === PoissonLogFam
         eltype(col) <: Integer && all(>=(0), col) && return nothing
         return _fail(r.label, "Poisson response must be non-negative integers")
-    else
+    elseif r.family === BinomialLogitFam
+        _is_count_column(col) && return nothing
+        return _fail(r.label, "Binomial response must be non-negative integers")
+    elseif r.family === NegativeBinomial2Fam
+        _is_count_column(col) && return nothing
+        return _fail(r.label, "NB2 response must be non-negative integers")
+    elseif r.family === GaussianFam
         eltype(col) <: Real ||
             _fail(r.label, "Gaussian response must be numeric")
         return nothing
+    elseif r.family === GammaLogFam
+        # Strictly positive: the gamma kernel guards x > 0, and at exactly
+        # 0 it is wrong for shape ≤ 1 (says -Inf; truth is finite/+Inf) —
+        # fail closed instead of flowing a wrong value.
+        (eltype(col) <: Real && all(>(0), col)) ||
+            _fail(r.label, "Gamma response must be strictly positive numerics")
+        return nothing
+    else
+        return _fail(r.label, "response family $(r.family) has no column rule")
     end
 end
 
+# Non-Bool integer column, all non-negative (Binomial/NB2 responses;
+# Bool would pass `<: Integer` and die downstream — exclude it here).
+_is_count_column(col) =
+    eltype(col) <: Integer && eltype(col) !== Bool && all(>=(0), col)
+
 function _validate_scale(r::LikelihoodSpec, plan::StructuralPlan)
-    if r.family === GaussianFam
-        r.scale === nothing &&
-            _fail(r.label, "Gaussian response requires a scale (parameter or literal)")
-    else
+    need = r.family === GaussianFam ? "Gaussian response requires a scale" :
+        r.family === NegativeBinomial2Fam ?
+        "NB2 response requires a dispersion phi" :
+        r.family === GammaLogFam ? "Gamma response requires a shape alpha" : nothing
+    if need === nothing
         r.scale === nothing ||
-            _fail(r.label, "non-Gaussian response takes no scale")
+            _fail(r.label, "this response family takes no scale auxiliary")
+    else
+        r.scale === nothing &&
+            _fail(r.label, "$need (parameter or literal)")
     end
     s = r.scale
     s === nothing && return nothing
     if s isa Real
         (isfinite(s) && s > 0) ||
-            _fail(r.label, "Gaussian scale literal must be finite positive")
+            _fail(r.label, "scale literal must be finite positive")
         return nothing
     end
     s isa Symbol && s in _union_names(plan) && return nothing
     return _fail(r.label, "scale references unknown name $s")
+end
+
+function _validate_trials(r::LikelihoodSpec, plan::StructuralPlan)
+    if r.family !== BinomialLogitFam
+        r.trials === nothing ||
+            _fail(r.label, "only Binomial responses take trials")
+        return nothing
+    end
+    r.trials === nothing && _fail(r.label,
+        "Binomial response requires trials (Int column or literal)")
+    ycol = plan.columns[r.response]
+    t = r.trials
+    if t isa Int
+        t >= 0 || _fail(r.label, "Binomial trials literal must be non-negative")
+        all(ycol .<= t) ||
+            _fail(r.label, "Binomial response exceeds trials $t")
+        return nothing
+    end
+    _is_derived(plan, t) && _fail(r.label,
+        "trials column $t is derived — slice-1 binds trials " *
+        "raw (derived trials need shape metadata — planned)")
+    haskey(plan.columns, t) ||
+        _fail(r.label, "trials column $t missing")
+    col = plan.columns[t]
+    (eltype(col) <: Integer && eltype(col) !== Bool) ||
+        _fail(r.label, "trials column must hold integers")
+    all(>=(0), col) ||
+        _fail(r.label, "trials column must be non-negative")
+    length(col) == plan.n_obs ||
+        _fail(r.label, "trials column length $(length(col)) ≠ n_obs $(plan.n_obs)")
+    all(ycol .<= col) ||
+        _fail(r.label, "Binomial response exceeds trials in some row")
+    return nothing
 end
 
 function _validate_weights(r::LikelihoodSpec, plan::StructuralPlan)
@@ -1568,7 +1642,8 @@ function _bound_values(bound, side, r::LikelihoodSpec, plan::StructuralPlan)
 end
 
 const _ROLE_RANK = Dict{Symbol,Int}(
-    :data => 1, :predictor => 2, :weight => 3, :evidence => 4, :response => 5,
+    :data => 1, :predictor => 2, :weight => 3, :evidence => 4, :trials => 5,
+    :response => 6,
 )
 
 _upgrade_role!(roles, col, role) =
@@ -1580,8 +1655,8 @@ _upgrade_role!(roles, col, role) =
 Attach `columns` to a structure-only plan (or rebind an already-bound one,
 replacing columns + roles): infer column roles, merge explicit `roles` over
 them, and run data validation. Returns a NEW bound plan; the input is
-untouched. Inference precedence: response > evidence > weight > predictor
-> data; term columns are the only `:predictor` source, so
+untouched. Inference precedence: response > trials > evidence > weight >
+predictor > data; term columns are the only `:predictor` source, so
 assignment/extra columns stay `:data`.
 """
 function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
@@ -1603,6 +1678,8 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
     for r in plan.responses
         r.weights !== nothing && haskey(inferred, r.weights) &&
             _upgrade_role!(inferred, r.weights, :weight)
+        r.trials isa Symbol && haskey(inferred, r.trials) &&
+            _upgrade_role!(inferred, r.trials, :trials)
         for b in (r.evidence.lower, r.evidence.upper)
             b isa Symbol && haskey(inferred, b) &&
                 _upgrade_role!(inferred, b, :evidence)
