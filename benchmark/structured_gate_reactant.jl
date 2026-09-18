@@ -81,7 +81,7 @@ function _reactant_axes(name, build, kb, sm, pts, have, bind, data,
         println("  [3b] Reactant primal (traced streams) rel=$(round(rt; sigdigits=4))  (< $RPRIMAL_TOL; 1 probe) PASS; stablehlo.while=$traced_while, hlo_bytes=$traced_bytes (@code_hlo; single-while asserted)"); flush(stdout)
     end
     if int_ports || reactant_primal === :measure
-        int_ports ? _axis_3b() : _measured(3, _axis_3b)
+        int_ports ? _axis_3b() : _measured("3b", _axis_3b)
     else
         _axis_3b()
     end
