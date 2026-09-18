@@ -113,8 +113,11 @@ function _ad_kernel_call(kernel::PreparedKernel, args::Tuple, ::Val{I}) where {I
             _ArrayFunctionPair,_EmbeddedFunctionPair,
             _DynamicEmbeddedFunctionPair} && native_exemplars
         ops = _ad_native_ops(kernel)
+        # Bound views cross this Enzyme boundary as owning copies: a
+        # `SubArray`-typed `Constant` operand defeats static activity
+        # analysis, while identical owning contents differentiate cleanly.
         externalized, values = _externalize_bound_array_call(
-            kernel.f.native, ops)
+            kernel.f.native, ops; materialize_view_copies = true)
         isempty(values) && return (
             _ADNativeKernelCall{I,typeof(kernel.f.native),typeof(ops)}(
                 kernel.f.native, ops),
@@ -122,7 +125,8 @@ function _ad_kernel_call(kernel::PreparedKernel, args::Tuple, ::Val{I}) where {I
         )
         return _ADKernelCall{I,typeof(externalized)}(externalized), values
     end
-    externalized, values = _externalize_bound_arrays(kernel)
+    externalized, values = _externalize_bound_arrays(
+        kernel; materialize_view_copies = true)
     _ADKernelCall{I,typeof(externalized)}(externalized), values
 end
 
@@ -379,6 +383,8 @@ and its `Constant` contexts cover only the remaining ports. `args` and
 arguments do not apply to a bound preparation. Array-valued residual constants
 are passed to the backend as hidden `Constant` contexts rather than captured in
 the differentiated callable; this does not change the public HAVE boundary.
+Bound views cross as owning copies with identical contents, since a
+prebuilt view operand defeats reverse-mode static activity analysis.
 """
 function prepare_ad(spec::KernelSpec,
                     backend::DifferentiationInterface.AbstractADType,

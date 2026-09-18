@@ -1462,7 +1462,11 @@ function ReactiveKernels._ad_prepared_value_and_gradient(
         prepared::ReactiveKernels.PreparedADKernel{I},
         point::Union{Reactant.TracedRArray,Reactant.TracedRNumber},
         contexts) where {I}
-    kernel, _ = ReactiveKernels._externalize_bound_arrays(prepared.kernel)
+    # These contexts were built from `prepared.external_values`, which the
+    # native preparation externalizes as owning view copies (not prebuilt
+    # views); the re-externalized kernel must expect that same hidden shape.
+    kernel, _ = ReactiveKernels._externalize_bound_arrays(
+        prepared.kernel; materialize_view_copies = true)
     call = ReactiveKernels._ADKernelCall{I,typeof(kernel)}(kernel)
     DifferentiationInterface.value_and_gradient(
         call, prepared.backend, point, contexts...)
