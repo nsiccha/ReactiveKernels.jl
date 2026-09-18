@@ -343,7 +343,8 @@ function _peel_evidence(lhs, rhs::Expr, ctx)
         dist isa Expr && dist.head === :call || _sfail(
             "`interval_censored` wraps a distribution object, got " *
             "$(repr(dist))")
-        ev = ResponseEvidence(:interval_censored, nothing, _bound(lhs, hi, ctx))
+        ev = ResponseEvidence(:interval_censored, nothing,
+            _bound(lhs, hi, :upper, ctx))
         return ev, dist
     end
     args = _plain_args(rhs, "`$head`")
@@ -353,16 +354,38 @@ function _peel_evidence(lhs, rhs::Expr, ctx)
     obj isa Expr && obj.head === :call || _sfail(
         "`$head` wraps a distribution object " *
         "(`$head(Normal(...), lo, hi)`), got $(repr(obj))")
-    ev = ResponseEvidence(head, _bound(lhs, lo, ctx), _bound(lhs, hi, ctx))
+    ev = ResponseEvidence(head, _bound(lhs, lo, :lower, ctx),
+        _bound(lhs, hi, :upper, ctx))
     return ev, obj
 end
 
-function _bound(lhs, b, ctx)
-    b isa Real && return b
-    b === :Inf && return Inf
+# Bounds are literals or data columns; ±Inf normalizes to a missing side
+# (nothing): `truncated(d, -Inf, hi)` is the Distributions.jl upper-only
+# spelling and the IR carries one-sided bounds as nothing. Crossed
+# infinities are degenerate. Both the `-Inf` Symbol/call spellings and
+# actual ±Inf Reals (emitter-built ASTs) normalize.
+function _bound(lhs, b, side::Symbol, ctx)
+    if b isa Real
+        isinf(b) || return b
+        return _bound_infinite(lhs, b, side)
+    end
+    b === :Inf && return _bound_infinite(lhs, Inf, side)
+    if b isa Expr && b.head === :call && length(b.args) == 2 &&
+            b.args[1] === :- && b.args[2] === :Inf
+        return _bound_infinite(lhs, -Inf, side)
+    end
     b isa Symbol && b in ctx.data && return b
     return _sfail("response $lhs bound $(repr(b)) must be a literal or a " *
                   "data column")
+end
+
+function _bound_infinite(lhs, v::Real, side::Symbol)
+    if (side === :lower && v < 0) || (side === :upper && v > 0)
+        return nothing
+    end
+    return _sfail("response $lhs $side bound " *
+                  "$(v > 0 ? "+Inf" : "-Inf") is degenerate (one-sided " *
+                  "$side is $(side === :lower ? "-Inf" : "+Inf"))")
 end
 
 const _RESPONSE_BASE_MSG =
@@ -649,17 +672,45 @@ function _classify_ref(pname, core::Expr, sign::Int, ctx)
     base, idx = core.args
     base isa Symbol || _sfail("predictor $pname: factor base must be a " *
                               "bare coefficient vector, got $(repr(base))")
-    idx isa Symbol || _sfail("predictor $pname: factor index must be a " *
-                             "bare data column, got $(repr(idx))")
     base in ctx.data && _sfail("predictor $pname: $base is data — " *
                                "precompute data-indexed columns")
-    idx in ctx.data || _sfail("predictor $pname: factor index $idx must " *
-                              "be a data column")
     haskey(ctx.detmap, base) && _sfail("predictor $pname: $base is a " *
                                        "computed assignment, not a sampled " *
                                        "coefficient vector")
-    return TermSpec(FactorTerm, [idx], (contrasts = :treatment, ref = 1),
-        idx, Symbol(idx, "_term")), (base, idx, sign)
+    col, ref = _factor_index(pname, idx, ctx)
+    return TermSpec(FactorTerm, [col], (contrasts = :treatment, ref = ref),
+        col, Symbol(col, "_term")), (base, col, sign)
+end
+
+# Bare `c[g]` is treatment/ref-1 sugar; `c[treatment(g, ref)]` pins the
+# reference level (R `contr.treatment` tradition). The `treatment` head is
+# AST vocabulary only — it is never called.
+function _factor_index(pname, idx, ctx)
+    idx isa Symbol || return _treatment_index(pname, idx, ctx)
+    idx in ctx.data || _sfail("predictor $pname: factor index $idx must " *
+                              "be a data column")
+    return idx, 1
+end
+
+function _treatment_index(pname, idx, ctx)
+    idx isa Expr && idx.head === :call && !isempty(idx.args) &&
+        idx.args[1] === :treatment || _sfail(
+            "predictor $pname: factor index must be a bare data column or " *
+            "`treatment(group, ref)`, got $(repr(idx))")
+    args = _plain_args(idx, "`treatment`")
+    (length(args) == 1 || length(args) == 2) ||
+        _sfail("predictor $pname: `treatment` takes " *
+               "`treatment(group[, ref])`")
+    g = args[1]
+    g isa Symbol && g in ctx.data || _sfail(
+        "predictor $pname: `treatment` group must be a bare data column, " *
+        "got $(repr(g))")
+    length(args) == 1 && return g, 1
+    ref = args[2]
+    ref isa Integer && !(ref isa Bool) && ref >= 1 || _sfail(
+        "predictor $pname: `treatment` ref must be a literal 1-based level " *
+        "index, got $(repr(ref))")
+    return g, Int(ref)
 end
 
 # Coefficient priors: recovered by name from `coef ~ Normal(lit, lit)`
