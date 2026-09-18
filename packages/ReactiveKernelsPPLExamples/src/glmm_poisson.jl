@@ -51,10 +51,6 @@ using LogExpFunctions: logistic, log1pexp
     (parameters, log_jacobian::Float64) =
         ((; alpha, beta1, beta2, beta3, eps, sigma),
          jac_alpha + jac_beta1 + jac_beta2 + jac_beta3 + jac_sigma)
-    (alpha::Float64, beta1::Float64, beta2::Float64, beta3::Float64,
-     eps::AbstractVector{Float64}, sigma::Float64) =
-        (parameters.alpha, parameters.beta1, parameters.beta2, parameters.beta3,
-         parameters.eps, parameters.sigma)
 
     # Explicit uniform priors from the model block. `x ~ uniform(a,b)` adds
     # uniform_lpdf = -log(b-a) inside [a,b] and -Inf outside (kept with
@@ -128,16 +124,16 @@ docs_example = (;
 )
 """
 
-function evaluate_glmm_poisson_source()
+function evaluate_glmm_poisson_source(; model_only::Bool = false)
     _evaluate_ppl_source(GLMM_POISSON_SOURCE, @__MODULE__; bindings = (
         :GLMM_POISSON_YEAR, :GLMM_POISSON_C,
-    ))
+    ), model_only)
 end
 
 const _GLMM_POISSON_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _GLMM_POISSON_GRAPH_TEMPLATE[] = evaluate_glmm_poisson_source().model
+    _GLMM_POISSON_GRAPH_TEMPLATE[] = evaluate_glmm_poisson_source(; model_only = true).model
     nothing
 end
 

@@ -25,13 +25,21 @@ function _reactant_reason(op, err, bt = nothing)
     string(op, ": ", msg, top)
 end
 
-function reactant_cells(kb, prep, q; transitions = 4, grad_oracle = nothing)
+function reactant_cells(kb, prep, q; transitions = 4, grad_oracle = nothing,
+        stan_value = nothing, rk_offset = 0.0)
     row = Dict{String,Any}()
     rq = Reactant.to_rarray(q)
     # op1 — primal @compile + value-check vs native + time
     row["primal_rk_reactant"] = try
         kbc = Reactant.@compile sync = true kb(rq)
         vc = Float64(kbc(rq)); vn = kb(q)
+        expected_native = stan_value === nothing ? vn : stan_value - rk_offset
+        # No Stan reference on this path (unified-body default call): skip the Stan gate
+        # and keep the pre-existing relative native parity below, never a MethodError cell.
+        (stan_value === nothing ||
+            All80Receipt.selected_point_stan_parity_ok(vn, stan_value, rk_offset)) ||
+            error("selected-point Stan primal parity abserr $(abs(vn - expected_native)) " *
+                  "(RK $vn vs Stan $stan_value minus declared offset $rk_offset)")
         # RELATIVE parity: an absolute 1e-6 is unsatisfiable for a large-magnitude density
         # (the float ULP at |logdensity|~1e11 is ~1e-5), which false-rejected earn_height
         # (relerr ~1e-13). XLA sum reassociation only ever perturbs the low bits.

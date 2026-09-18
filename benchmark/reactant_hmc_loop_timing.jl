@@ -2,8 +2,8 @@
 # lowered to both backends by the merged transpiler (no hand-written Reactant
 # kernel) — multinomial HMC on the bound Eight Schools density via the sampling
 # lane's `sampler_transpiler` consumer. Compile + first-exec warmup excluded;
-# whole batch synchronized; inputs preserved so state/rng are reused across
-# replicates. Reports median µs per transition.
+# whole batch synchronized; each replicate starts from the same preserved state
+# with a distinct preconstructed RNG seed. Reports median µs per transition.
 #
 # Run (after the sampler_transpiler env is built):
 #   julia benchmark/sampler_transpiler/setup.jl        # JULIA_NUM_PRECOMPILE_TASKS=1
@@ -17,16 +17,13 @@ include(joinpath(@__DIR__, "sampler_transpiler", "prepared_hmc.jl"))
 const P = PreparedHMCExample
 
 function time_backend(backend, transitions, steps, rounds)
-    rng = backend === :reactant ? Reactant.ReactantRNG(Reactant.to_rarray(UInt64[91, 77])) : Xoshiro(91)
-    prog = P.prepare_hmc(rng; backend, transitions, steps)
-    st = initial_transpiled_state(prog)
-    prog(st, rng)                       # warmup (compile + first exec) — excluded
-    ts = Float64[]
-    for _ in 1:rounds
-        push!(ts, @elapsed prog(st, rng))   # inputs preserved; batch synchronizes
-    end
-    med = median(ts)
-    (per_transition_us = med / transitions * 1e6, batch_s = med)
+    density, ad, q = P.EightSchoolsDensity.build_density()
+    make_rng(i) = backend === :reactant ?
+        Reactant.ReactantRNG(Reactant.to_rarray(UInt64[91+i, 77])) : Xoshiro(91+i)
+    measured = P.HMCBenchmark.benchmark_hmc(density, ad, q, make_rng;
+        backend, transitions, steps, rounds)
+    (per_transition_us=measured["median_us_per_transition"],
+        batch_s=measured["median_batch_seconds"], details=measured)
 end
 
 const T = 1000
@@ -45,6 +42,7 @@ if outp != ""
     receipt = Dict("schema" => "reactant-hmc-loop-timing-v1", "generated_at" => string(now()),
         "methodology" => "same authored @kernel lowered to native + Reactant via the merged transpiler (no hand-written reactant kernel); multinomial HMC on the bound Eight Schools density; compile+first-exec warmup excluded; whole batch synchronized; median of $ROUNDS batches of $T transitions × L$STEPS",
         "environment" => Dict("julia" => string(VERSION), "arch" => string(Sys.ARCH), "cpu" => Sys.cpu_info()[1].model, "reactant_backend" => "default CPU"),
+        "batches" => Dict("native"=>n.details, "reactant"=>r.details),
         "result" => Dict("native_us_per_transition" => n.per_transition_us,
                          "reactant_us_per_transition" => r.per_transition_us,
                          "reactant_over_native" => ratio,

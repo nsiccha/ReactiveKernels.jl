@@ -1,0 +1,201 @@
+generated_at = "2026-09-18T17:35:06.414"
+phase = "reactant"
+run_id = "9a9e44dd796db4206676ea86a8b201fd"
+schema = "all80-benchmark-v1"
+source_id = "dc7ebdeb38ff7803455bff7ce68eeba60d1f5bff713910e18fef8ed02b90a2a6"
+
+[models.fims_Aus_Jpn_irt-2pl_latent_reg_irt]
+gradient_rk_reactant = 274267.0
+hmc_reactant_transitions = 4
+hmc_rk_reactant = 3836.90275
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+primal_rk_reactant = 85126.00000000001
+
+    [models.fims_Aus_Jpn_irt-2pl_latent_reg_irt.input_identity_reactant]
+    dataset_json_bytes = 87079
+    dataset_json_sha256 = "78f1e8b55da0e34b5c02a593acf1bcf76782bfdb696406706de74270bf29f978"
+    dataset_path = "/home/n/.julia/artifacts/f45397e9120c2d7e26bf6aff8c7aa810779a7e1b/posteriordb-1.0.0/posterior_database/data/data/fims_Aus_Jpn_irt.json.zip"
+    model = "2pl_latent_reg_irt"
+    phase = "reactant"
+    posterior = "fims_Aus_Jpn_irt-2pl_latent_reg_irt"
+    stan_compiled_library = "/home/n/.julia/artifacts/f45397e9120c2d7e26bf6aff8c7aa810779a7e1b/posteriordb-1.0.0/posterior_database/models/stan/2pl_latent_reg_irt_model.so"
+    stan_compiled_library_sha256 = "2c54f860a5a748719752dd6d0b7ad58f5e129992337a874855b8aea214d301d0"
+    stan_parameter_permutation = "identity"
+    stan_path = "/home/n/.julia/artifacts/f45397e9120c2d7e26bf6aff8c7aa810779a7e1b/posteriordb-1.0.0/posterior_database/models/stan/2pl_latent_reg_irt.stan"
+    stan_sha256 = "76823bddcd575781b598b419a2be9e587499b874d4e968ae339043ab82fbd9e9"
+
+        [models.fims_Aus_Jpn_irt-2pl_latent_reg_irt.input_identity_reactant.query]
+        ad_backend = "AutoEnzyme(mode=Enzyme.Reverse; no function_annotation)"
+        candidates_tested = 1
+        reference_gradient_sha256 = "deb3f9dcd5b798282f2d82d6d28bd19597e1519724fd1d9ed611cfe8dfe469e4"
+        reference_value = -5330.244837489344
+        selected_point = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+        selected_source = "generated"
+        selection_rule = "first reference-valid finite BridgeStan value and gradient; RK failures are not skipped"
+
+[models.irt_2pl-irt_2pl]
+gradient_rk_reactant = 75705.00000000001
+hmc_reactant_transitions = 4
+hmc_rk_reactant = 930.6301249999999
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+primal_rk_reactant = 47555.5
+
+    [models.irt_2pl-irt_2pl.input_identity_reactant]
+    dataset_json_bytes = 6159
+    dataset_json_sha256 = "2f19672a37352782fefc8936356ea30cd78bdd7a4732641bf1a8151eb9ade1a8"
+    dataset_path = "/home/n/.julia/artifacts/f45397e9120c2d7e26bf6aff8c7aa810779a7e1b/posteriordb-1.0.0/posterior_database/data/data/irt_2pl.json.zip"
+    model = "irt_2pl"
+    phase = "reactant"
+    posterior = "irt_2pl-irt_2pl"
+    stan_compiled_library = "/home/n/.julia/artifacts/f45397e9120c2d7e26bf6aff8c7aa810779a7e1b/posteriordb-1.0.0/posterior_database/models/stan/irt_2pl_model.so"
+    stan_compiled_library_sha256 = "8c1603dd03321c44f02d4667d0b9ed8c2598753bfaddfb6350405fcf2c9ea4cc"
+    stan_parameter_permutation = "identity"
+    stan_path = "/home/n/.julia/artifacts/f45397e9120c2d7e26bf6aff8c7aa810779a7e1b/posteriordb-1.0.0/posterior_database/models/stan/irt_2pl.stan"
+    stan_sha256 = "27947f5afa47a63c8587213c7d5598e701aa11209dff0b117d635578d028c922"
+
+        [models.irt_2pl-irt_2pl.input_identity_reactant.query]
+        ad_backend = "AutoEnzyme(mode=Enzyme.Reverse; no function_annotation)"
+        candidates_tested = 1
+        reference_gradient_sha256 = "997b80f54e4e2fde1dd38e4d56397a616e9f207671e9e0f358a2176e9371159a"
+        reference_value = -1537.9786170621312
+        selected_point = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+        selected_source = "generated"
+        selection_rule = "first reference-valid finite BridgeStan value and gradient; RK failures are not skipped"
+
+[models.sat-hier_2pl]
+gradient_rk_reactant = 327957.00000000006
+hmc_reactant_transitions = 4
+hmc_rk_reactant = 5559.7455
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+primal_rk_reactant = 175111.0
+
+    [models.sat-hier_2pl.input_identity_reactant]
+    dataset_json_bytes = 221613
+    dataset_json_sha256 = "1b06fd37b0cde2e167615beea91009faf11a395481d6d7c819d54335f1a14d1c"
+    dataset_path = "/home/n/.julia/artifacts/f45397e9120c2d7e26bf6aff8c7aa810779a7e1b/posteriordb-1.0.0/posterior_database/data/data/sat.json.zip"
+    model = "hier_2pl"
+    phase = "reactant"
+    posterior = "sat-hier_2pl"
+    stan_compiled_library = "/home/n/.julia/artifacts/f45397e9120c2d7e26bf6aff8c7aa810779a7e1b/posteriordb-1.0.0/posterior_database/models/stan/hier_2pl_model.so"
+    stan_compiled_library_sha256 = "660c473c4468472b6280a4f2a6d40e875ea0a0d430f07dc59bdf07f1f172613c"
+    stan_parameter_permutation = "identity"
+    stan_path = "/home/n/.julia/artifacts/f45397e9120c2d7e26bf6aff8c7aa810779a7e1b/posteriordb-1.0.0/posterior_database/models/stan/hier_2pl.stan"
+    stan_sha256 = "86e17a66416ff8ffefa0c2cee1ccf07af46090e2c6177577eb7e4bd0e7cdf636"
+
+        [models.sat-hier_2pl.input_identity_reactant.query]
+        ad_backend = "AutoEnzyme(mode=Enzyme.Reverse; no function_annotation)"
+        candidates_tested = 1
+        reference_gradient_sha256 = "14da591e2221e6ad56d9c9e818ae958379a5e08bebf9176b14bb0e8361fe0994"
+        reference_value = -13935.870359459568
+        selected_point = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+        selected_source = "generated"
+        selection_rule = "first reference-valid finite BridgeStan value and gradient; RK failures are not skipped"
+
+[models.timssAusTwn_irt-gpcm_latent_reg_irt]
+gradient_rk_reactant = 313092.0
+hmc_reactant_transitions = 4
+hmc_rk_reactant = 7446.83625
+hmc_rounds = 6
+hmc_steps = 16
+hmc_target_round_seconds = 0.5
+primal_rk_reactant = 170400.00000000003
+
+    [models.timssAusTwn_irt-gpcm_latent_reg_irt.input_identity_reactant]
+    dataset_json_bytes = 70903
+    dataset_json_sha256 = "588b3aad2093813ddff8dbb7d0e04cee9fbce93cf87092b26941924bd02f0ee3"
+    dataset_path = "/home/n/.julia/artifacts/f45397e9120c2d7e26bf6aff8c7aa810779a7e1b/posteriordb-1.0.0/posterior_database/data/data/timssAusTwn_irt.json.zip"
+    model = "gpcm_latent_reg_irt"
+    phase = "reactant"
+    posterior = "timssAusTwn_irt-gpcm_latent_reg_irt"
+    stan_compiled_library = "/home/n/.julia/artifacts/f45397e9120c2d7e26bf6aff8c7aa810779a7e1b/posteriordb-1.0.0/posterior_database/models/stan/gpcm_latent_reg_irt_model.so"
+    stan_compiled_library_sha256 = "ec99c967e7fc62bd0cc7e361e1e0a420736cec2d5b0d46c54c6ebf1ced1b8d37"
+    stan_parameter_permutation = "identity"
+    stan_path = "/home/n/.julia/artifacts/f45397e9120c2d7e26bf6aff8c7aa810779a7e1b/posteriordb-1.0.0/posterior_database/models/stan/gpcm_latent_reg_irt.stan"
+    stan_sha256 = "177c8db1898d34dbaf879ef799d3fcefe3c450d2e84255a38e4a9c4479a296e8"
+
+        [models.timssAusTwn_irt-gpcm_latent_reg_irt.input_identity_reactant.query]
+        ad_backend = "AutoEnzyme(mode=Enzyme.Reverse; no function_annotation)"
+        candidates_tested = 1
+        reference_gradient_sha256 = "fb695fae5d2d6c9d1ff99af39fb7e49f62a628a710e64e358ab192af00d94bb0"
+        reference_value = -5142.503484006888
+        selected_point = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+        selected_source = "generated"
+        selection_rule = "first reference-valid finite BridgeStan value and gradient; RK failures are not skipped"
+
+[provenance]
+ad_backend = "AutoEnzyme(mode=Enzyme.Reverse; no function_annotation)"
+batch = "irt"
+captured_at = "2026-09-18T17:25:51.083"
+discover = true
+julia_parent = "1.10.11"
+loaded_modules_certified = true
+phase = "reactant"
+requested_keys = ["irt_2pl-irt_2pl", "fims_Aus_Jpn_irt-2pl_latent_reg_irt", "sat-hier_2pl", "timssAusTwn_irt-gpcm_latent_reg_irt"]
+root = "/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-ppl-benchmark/"
+run_id = "9a9e44dd796db4206676ea86a8b201fd"
+source_id = "dc7ebdeb38ff7803455bff7ce68eeba60d1f5bff713910e18fef8ed02b90a2a6"
+upstream_posteriordb_models_sha256 = "a7ef985b93df973dd0598f0c772f3f002afa25be80829fc38a9e8cb7232413ad"
+
+    [provenance.environment_file_sha256]
+    "Manifest.toml" = "8acf9b02bfeb7a0dc663a0e6e220cd61efed23d0943a68a052627774495fdace"
+    "Project.toml" = "0b977f908f571030ff2173ebe66a1f0d0db357084fd45b9af18561d638347a63"
+
+    [provenance.harness_file_sha256]
+    "all80_axes.jl" = "fa9dee8cb43391827ff028f609dbec329a18ad4f17bf401d3d576c168a9ebcf2"
+    "all80_posteriordb.jl" = "ec8c8cd27fb4903b44bd228d3d838998b0e62ea376c474104d158a87b4c52a31"
+    "all80_reactant_body.jl" = "dfeac84589f06828359d4c8e326263ffc9cc6473ae0a23085f3312a125770bd0"
+    "all80_reactant_evals.jl" = "a99629db941df0ad29921c75f4944b5537a60a25ffd6042cbdd7c82e673c1a77"
+    "all80_receipt.jl" = "ae17d9c5c40acc38b94e76075d3141b6bbe2a046495347eff94b4cd0efeb85bb"
+    "all80_registry.jl" = "f81ed453e1b3022d6b615b7c5e83703f334964d08cb93f221eb9284bf035210f"
+    "nuts_kernel_authoring_fixture_b.jl" = "7a9a9d6e1fa122e3d846def760933b0ba14e62e567d92cffab9d9d638f9404f4"
+    "sampler_transpiler/eight_schools_density.jl" = "9aed458905f5f353e425a58529dfdf8b6ce79bacc6f79f4646ed3e7a25db9e77"
+    "sampler_transpiler/position_multinomial_hmc_kernel.jl" = "25c1328145e517c7b53dfc0b0e4d51aa5fc8f08e984e429da36412da5d06d0fe"
+
+    [provenance.loaded_module_paths]
+    ReactiveKernels = "/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-ppl-benchmark/src/ReactiveKernels.jl"
+    ReactiveKernelsDistributionKernels = "/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-ppl-benchmark/packages/ReactiveKernelsDistributionKernels/src/ReactiveKernelsDistributionKernels.jl"
+    ReactiveKernelsPPLExamples = "/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-ppl-benchmark/packages/ReactiveKernelsPPLExamples/src/ReactiveKernelsPPLExamples.jl"
+
+    [provenance.module_versions]
+    ReactiveKernels = "0.1.0"
+    ReactiveKernelsDistributionKernels = "0.1.0"
+    ReactiveKernelsPPLExamples = "0.1.0"
+
+    [provenance.packages.ReactiveKernels]
+    git_certified = true
+    git_diff_head_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    git_dirty = true
+    git_head = "15f4e3059c661b5af56ca79a05f7225b7dd934ee"
+    git_status = "?? benchmark/receipts/all80-irt-native.toml"
+    root = "/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-ppl-benchmark/"
+    src_ext_project_sha256 = "143118a28a07c5ae7e917906ea13aecf466ad1e02ed08114350355034f53478b"
+
+    [provenance.packages.ReactiveKernelsDistributionKernels]
+    git_certified = true
+    git_diff_head_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    git_dirty = true
+    git_head = "15f4e3059c661b5af56ca79a05f7225b7dd934ee"
+    git_status = "?? benchmark/receipts/all80-irt-native.toml"
+    root = "/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-ppl-benchmark/packages/ReactiveKernelsDistributionKernels"
+    src_ext_project_sha256 = "59190bfbf8c808fd1866eec5e064594efd8f382a482c1b6c390224ce75100cb0"
+
+    [provenance.packages.ReactiveKernelsPPLExamples]
+    git_certified = true
+    git_diff_head_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    git_dirty = true
+    git_head = "15f4e3059c661b5af56ca79a05f7225b7dd934ee"
+    git_status = "?? benchmark/receipts/all80-irt-native.toml"
+    root = "/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-ppl-benchmark/packages/ReactiveKernelsPPLExamples"
+    src_ext_project_sha256 = "b859147759f2afea4c1e990125938318ea7ebbb7e4b660bb150a2c3f939bc2d0"
+
+    [provenance.upstream_file_sha256."/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-ppl-benchmark/benchmark/all80-env/upstream/posteriordb.jl"]
+    sha256 = "12a814438d69501b6f8a14e3dd3f8ae1e1cb278f7fbf14c43abe7485338fc1a5"
+
+    [provenance.upstream_file_sha256."/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-ppl-benchmark/benchmark/all80-env/upstream/posteriordb_models.jl"]
+    sha256 = "a7ef985b93df973dd0598f0c772f3f002afa25be80829fc38a9e8cb7232413ad"

@@ -167,6 +167,53 @@ function _topo(g::Graph, selected::Vector{Int}, have::Set{Int})
     order
 end
 
+# --- greedy incumbent ------------------------------------------------------
+
+# Polynomial cheapest-producer fixpoint used ONLY to seed the exact
+# branch-and-bound incumbent. The traversal order and prune rules of `_search!`
+# are unchanged, so the final selection is identical to the unseeded search;
+# branches that cannot beat the incumbent are pruned from the start instead
+# of only after the first complete leaf is found (exponential in the number
+# of alternative producers when every recipe shares one cost).
+# Returns `nothing` when no complete acyclic selection is reachable this way,
+# in which case planning proceeds exactly as before.
+function _seed_greedy_incumbent!(s::_Search)
+    selected = Int[]
+    selected_set = Set{Int}()
+    produced = copy(s.have)
+    while true
+        frontier = _frontier(s, selected, produced)
+        isempty(frontier) && break
+        progressed = false
+        for v in frontier
+            v in produced && continue
+            best_rid = nothing
+            best_key = nothing
+            for rid in s.candidates
+                rid in selected_set && continue
+                any(o -> canon_id(s.g, o.id) == v, s.g.recipes[rid].outputs) || continue
+                key = (s.g.recipes[rid].cost, rid)
+                (best_key === nothing || key < best_key) || continue
+                best_key = key
+                best_rid = rid
+            end
+            best_rid === nothing && return nothing
+            push!(selected, best_rid)
+            push!(selected_set, best_rid)
+            for o in s.g.recipes[best_rid].outputs
+                push!(produced, canon_id(s.g, o.id))
+            end
+            progressed = true
+        end
+        progressed || return nothing
+    end
+    _is_acyclic(s.g, selected, s.have) || return nothing
+    s.best_sel = copy(selected)
+    s.best_cost = sum(r -> s.g.recipes[r].cost, selected; init = 0.0)
+    s.best_len = length(selected)
+    return nothing
+end
+
 # --- public entry point ----------------------------------------------------
 
 """
@@ -193,6 +240,7 @@ function plan(g::Graph; have = (), want = ())
 
     cand_ids = _candidate_recipes(g, have_ids, want_ids)
     s = _Search(g, have_ids, want_ids, cand_ids, nothing, Inf, typemax(Int), false)
+    _seed_greedy_incumbent!(s)
     _search!(s, Int[], 0.0)
 
     if s.best_sel === nothing

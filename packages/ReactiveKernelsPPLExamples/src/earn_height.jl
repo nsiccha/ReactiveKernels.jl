@@ -43,8 +43,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
     # constrain-only producer omits the Jacobian; the joint producer emits it.
     parameters = (; beta1, beta2, sigma)
     (parameters, log_jacobian::Float64) = ((; beta1, beta2, sigma), log_sigma)
-    (beta1::Float64, beta2::Float64, sigma::Float64) =
-        (parameters.beta1, parameters.beta2, parameters.sigma)
 
     # Transformed parameter: the linear predictor μ = β₁ + β₂·height. Captured
     # scalars ride the plate as explicit shared arguments (a scalar plate argument
@@ -109,19 +107,19 @@ docs_example = (;
 )
 """
 
-function evaluate_earn_height_source()
+function evaluate_earn_height_source(; model_only::Bool = false)
     # Bind only the data. The authored source imports the reusable Normal
     # endpoint itself and contains the complete PPL assembly with no helper
     # evaluator or separately prepared density/plate path.
     _evaluate_ppl_source(EARN_HEIGHT_SOURCE, @__MODULE__; bindings = (
         :EARN_HEIGHT_EARN, :EARN_HEIGHT_HEIGHT,
-    ))
+    ), model_only)
 end
 
 const _EARN_HEIGHT_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _EARN_HEIGHT_GRAPH_TEMPLATE[] = evaluate_earn_height_source().model
+    _EARN_HEIGHT_GRAPH_TEMPLATE[] = evaluate_earn_height_source(; model_only = true).model
     nothing
 end
 

@@ -85,12 +85,6 @@ using LogExpFunctions: logistic, log1pexp
     (parameters, log_jacobian::Float64) =
         ((; alpha, beta, mu_alpha, mu_beta, sigma_alpha, sigma_beta, sigma_y),
          log_sigma_y + log_sigma_alpha + log_sigma_beta)
-    (alpha::AbstractVector{Float64}, beta::AbstractVector{Float64},
-     mu_alpha::Float64, mu_beta::Float64, sigma_alpha::Float64,
-     sigma_beta::Float64, sigma_y::Float64) =
-        (parameters.alpha, parameters.beta, parameters.mu_alpha,
-         parameters.mu_beta, parameters.sigma_alpha, parameters.sigma_beta,
-         parameters.sigma_y)
 
     # Priors (all proper): mu_alpha ~ Normal(0, 10), mu_beta ~ Normal(0, 10),
     # sigma_y/sigma_alpha/sigma_beta ~ Normal(0, 1) (half-normal = plain
@@ -175,16 +169,16 @@ docs_example = (;
 )
 """
 
-function evaluate_radon_variable_intercept_slope_centered_source()
+function evaluate_radon_variable_intercept_slope_centered_source(; model_only::Bool = false)
     _evaluate_ppl_source(RADON_VARIABLE_INTERCEPT_SLOPE_CENTERED_SOURCE, @__MODULE__;
-        bindings = (:RADON_VISC_COUNTY, :RADON_VISC_FLOOR, :RADON_VISC_LOG))
+        bindings = (:RADON_VISC_COUNTY, :RADON_VISC_FLOOR, :RADON_VISC_LOG), model_only)
 end
 
 const _RADON_VISC_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
     _RADON_VISC_GRAPH_TEMPLATE[] =
-        evaluate_radon_variable_intercept_slope_centered_source().model
+        evaluate_radon_variable_intercept_slope_centered_source(; model_only = true).model
     nothing
 end
 

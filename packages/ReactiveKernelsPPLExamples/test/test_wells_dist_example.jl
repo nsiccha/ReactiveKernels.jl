@@ -26,7 +26,7 @@ end
     reference = _wells_dist_reference(q, WELLS_DIST_DIST, WELLS_DIST_SWITCHED)
 
     @testset "authored on the current baseline surface" begin
-        @test occursin("bernoulli(logistic(", WELLS_DIST_SOURCE)
+        @test occursin("bernoulli(; logit = e).logpdf(s)", WELLS_DIST_SOURCE)
         @test occursin(".logpdf(s)", WELLS_DIST_SOURCE)
         @test occursin("eta = plate(", WELLS_DIST_SOURCE)
         @test occursin("pointwise = plate(", WELLS_DIST_SOURCE)

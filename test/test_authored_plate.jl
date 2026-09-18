@@ -1,4 +1,5 @@
 using ReactiveKernels
+using LogExpFunctions: log1pexp
 using Test
 
 isdefined(@__MODULE__, :AuthoredPlateChains) ||
@@ -1071,4 +1072,36 @@ end
     end
     krp = prepare(_ce_ref_producer)
     @test_throws MethodError krp(2.0, y)
+end
+
+@testset "authored plate block: automatic caller-scalar threading" begin
+    @kernel _free_scalar_plate(
+            y::Vector{Float64}, mu::Vector{Float64}, s::Float64) = begin
+        pointwise = plate(y, mu) do yi, mui
+            (mui + s)^2 + yi
+        end
+        total::Float64 = sum(pointwise)
+    end
+
+    y = [0.2, -0.4, 1.1]
+    mu = [0.0, 0.3, -0.2]
+    kernel = prepare(_free_scalar_plate; want = :total)
+    @test kernel(y, mu, 0.7) ≈ sum(((m + 0.7)^2 + obs)
+                                   for (obs, m) in zip(y, mu))
+end
+
+@testset "authored plate block: keyword-call authoring without semicolon" begin
+    scale_logpdf(; logit) = -log1pexp(-logit)
+    @kernel _kw_call_plate(e::Vector{Float64}) = begin
+        pointwise = plate(e) do ei
+            scale_logpdf(logit = ei) * ei
+        end
+        total::Float64 = sum(pointwise)
+    end
+
+    e = [-1.0, 0.0, 0.25, 2.0]
+    expected = map(e) do x
+        -log1pexp(-x) * x
+    end
+    @test prepare(_kw_call_plate; want = :pointwise)(e) ≈ expected
 end

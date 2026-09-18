@@ -49,8 +49,6 @@ using LogExpFunctions: logistic, log1pexp, logaddexp
     parameters = (; theta, mu1, mu2)
     (parameters, log_jacobian::Float64) =
         ((; theta, mu1, mu2), (-log1pexp(-u_theta)) + (-log1pexp(u_theta)))
-    (theta::Float64, mu1::Float64, mu2::Float64) =
-        (parameters.theta, parameters.mu1, parameters.mu2)
 
     # Priors: mu[k] ~ Normal(0, 10); theta ~ uniform(0,1) is a flat constant
     # (-log(1) = 0) Stan drops, so it contributes no density term.
@@ -101,16 +99,16 @@ docs_example = (;
 )
 """
 
-function evaluate_normal_mixture_source()
+function evaluate_normal_mixture_source(; model_only::Bool = false)
     _evaluate_ppl_source(NORMAL_MIXTURE_SOURCE, @__MODULE__; bindings = (
         :NORMAL_MIXTURE_Y,
-    ))
+    ), model_only)
 end
 
 const _NORMAL_MIXTURE_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _NORMAL_MIXTURE_GRAPH_TEMPLATE[] = evaluate_normal_mixture_source().model
+    _NORMAL_MIXTURE_GRAPH_TEMPLATE[] = evaluate_normal_mixture_source(; model_only = true).model
     nothing
 end
 

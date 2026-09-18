@@ -71,10 +71,6 @@ using LogExpFunctions: logistic
     parameters = (; alpha, beta1, beta2, beta3, beta4, beta5, beta6)
     (parameters, log_jacobian::Float64) =
         ((; alpha, beta1, beta2, beta3, beta4, beta5, beta6), 0.0)
-    (alpha::Float64, beta1::Float64, beta2::Float64, beta3::Float64,
-     beta4::Float64, beta5::Float64, beta6::Float64) =
-        (parameters.alpha, parameters.beta1, parameters.beta2, parameters.beta3,
-         parameters.beta4, parameters.beta5, parameters.beta6)
 
     # The Stan model block has NO `~` prior statement, so the priors are flat
     # (improper); Stan adds nothing and the varying prior term is zero.
@@ -177,16 +173,16 @@ docs_example = (;
 )
 """
 
-function evaluate_wells_dae_inter_source()
+function evaluate_wells_dae_inter_source(; model_only::Bool = false)
     _evaluate_ppl_source(WELLS_DAE_INTER_SOURCE, @__MODULE__; bindings = (
         :WELLS_DAE_INTER_DIST, :WELLS_DAE_INTER_ARSENIC, :WELLS_DAE_INTER_EDUC, :WELLS_DAE_INTER_SWITCHED,
-    ))
+    ), model_only)
 end
 
 const _WELLS_DAE_INTER_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _WELLS_DAE_INTER_GRAPH_TEMPLATE[] = evaluate_wells_dae_inter_source().model
+    _WELLS_DAE_INTER_GRAPH_TEMPLATE[] = evaluate_wells_dae_inter_source(; model_only = true).model
     nothing
 end
 

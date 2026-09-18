@@ -291,10 +291,11 @@ body. This is the static-friendly density boundary used by the PPL examples:
 ordinary Julia consumers see one flat generated function, and Reactant still
 sees the array-native plate form.
 
-### Replica: lift the entire scalar callable
+### Position batching: lift the entire scalar callable
 
-`replica` keeps a complete scalar `PreparedKernel` as the mathematical source
-of truth and maps it over one trailing replica axis on selected HAVE ports.
+`vectorize` / `prepare_batched` (also available under the lower-level name
+`replica`) keep a complete scalar `PreparedKernel` as the mathematical source
+of truth and map it over one trailing replica axis on selected HAVE ports.
 Scalar batched ports become vectors, array ports gain one final dimension, and
 outputs are stacked along the same final dimension. Reductions inside the
 scalar kernel keep their original dimensions; they do not accidentally reduce
@@ -305,6 +306,12 @@ validates the extra rank and equal replica counts, evaluates scalar replicas,
 copies array slices, and stacks results, so it is a semantic transform rather
 than a native zero-allocation promise. Optional array-compiler integration may
 lower the same mapping as a backend batch primitive.
+
+The same transform accepts a scalar `PreparedADKernel`. `replica(ad; batched =
+:position)` slices each selected HAVE, runs the scalar reverse pass, and stacks
+the objective and active-port gradient along the replica axis. The scalar AD
+preparation remains the derivative authority; it is not re-prepared per replica.
+See [Position batching](position-batching.md) for the full public contract.
 
 ## Incremental and compiled reactive execution
 

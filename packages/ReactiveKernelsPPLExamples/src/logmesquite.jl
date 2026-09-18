@@ -102,10 +102,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
     parameters = (; beta1, beta2, beta3, beta4, beta5, beta6, beta7, sigma)
     (parameters, log_jacobian::Float64) =
         ((; beta1, beta2, beta3, beta4, beta5, beta6, beta7, sigma), u_sigma)
-    (beta1::Float64, beta2::Float64, beta3::Float64, beta4::Float64,
-     beta5::Float64, beta6::Float64, beta7::Float64, sigma::Float64) =
-        (parameters.beta1, parameters.beta2, parameters.beta3, parameters.beta4,
-         parameters.beta5, parameters.beta6, parameters.beta7, parameters.sigma)
 
     # Transformed parameter: the log-scale linear predictor
     # μ = β₁ + β₂·log(diam1) + β₃·log(diam2) + β₄·log(canopy_height)
@@ -180,19 +176,19 @@ docs_example = (;
 )
 """
 
-function evaluate_logmesquite_source()
+function evaluate_logmesquite_source(; model_only::Bool = false)
     # Bind only the data. The authored source imports the reusable Normal
     # endpoint itself and computes the log transforms inline on the raw data.
     _evaluate_ppl_source(LOGMESQUITE_SOURCE, @__MODULE__; bindings = (
         :LOGMESQ_LOG_WEIGHT, :LOGMESQ_DIAM1, :LOGMESQ_DIAM2, :LOGMESQ_CANOPY_HEIGHT,
         :LOGMESQ_TOTAL_HEIGHT, :LOGMESQ_DENSITY, :LOGMESQ_GROUP,
-    ))
+    ), model_only)
 end
 
 const _LOGMESQUITE_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _LOGMESQUITE_GRAPH_TEMPLATE[] = evaluate_logmesquite_source().model
+    _LOGMESQUITE_GRAPH_TEMPLATE[] = evaluate_logmesquite_source(; model_only = true).model
     nothing
 end
 

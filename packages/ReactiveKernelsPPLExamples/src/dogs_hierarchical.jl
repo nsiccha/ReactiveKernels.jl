@@ -92,7 +92,6 @@ using LogExpFunctions: logistic, log1pexp
     # constrain-only producer omits the Jacobian; the joint producer emits it.
     parameters = (; a, b)
     (parameters, log_jacobian::Float64) = ((; a, b), jac_a + jac_b)
-    (a::Float64, b::Float64) = (parameters.a, parameters.b)
 
     # Implicit uniform prior over the declared box [0, 1]² has density 1, so the
     # varying prior term is exactly zero (no dropped constant).
@@ -150,16 +149,16 @@ docs_example = (;
 )
 """
 
-function evaluate_dogs_hierarchical_source()
+function evaluate_dogs_hierarchical_source(; model_only::Bool = false)
     _evaluate_ppl_source(DOGS_HIER_SOURCE, @__MODULE__; bindings = (
         :DOGS_HIER_PREV_AVOID, :DOGS_HIER_PREV_SHOCK, :DOGS_HIER_Y_FLAT,
-    ))
+    ), model_only)
 end
 
 const _DOGS_HIER_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _DOGS_HIER_GRAPH_TEMPLATE[] = evaluate_dogs_hierarchical_source().model
+    _DOGS_HIER_GRAPH_TEMPLATE[] = evaluate_dogs_hierarchical_source(; model_only = true).model
     nothing
 end
 

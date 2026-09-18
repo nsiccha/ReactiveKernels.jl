@@ -86,10 +86,6 @@ using LogExpFunctions: logistic, log1pexp, logaddexp
     (parameters, log_jacobian::Float64) =
         ((; omega, mean_p, gamma, sigma, eps_raw),
          jac_omega + jac_mean_p + jac_sigma)
-    (omega::Float64, mean_p::AbstractVector{Float64}, gamma::Float64,
-     sigma::Float64, eps_raw::AbstractVector{Float64}) =
-        (parameters.omega, parameters.mean_p, parameters.gamma,
-         parameters.sigma, parameters.eps_raw)
 
     # Proper priors: gamma ~ Normal(0, 10) (behavioural recapture),
     # eps_rawᵢ ~ Normal(0, 1) (random effect).
@@ -169,16 +165,16 @@ docs_example = (;
 )
 """
 
-function evaluate_mtbh_model_source()
+function evaluate_mtbh_model_source(; model_only::Bool = false)
     _evaluate_ppl_source(MTBH_SOURCE, @__MODULE__; bindings = (
         :MTBH_Y, :MTBH_YPREV, :MTBH_S, :MTBH_T, :MTBH_M,
-    ))
+    ), model_only)
 end
 
 const _MTBH_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _MTBH_GRAPH_TEMPLATE[] = evaluate_mtbh_model_source().model
+    _MTBH_GRAPH_TEMPLATE[] = evaluate_mtbh_model_source(; model_only = true).model
     nothing
 end
 

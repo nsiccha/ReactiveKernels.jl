@@ -56,10 +56,6 @@ using LogExpFunctions: logistic
     parameters = (; alpha0, alpha1, alpha12, alpha2, b, sigma)
     (parameters, log_jacobian::Float64) =
         ((; alpha0, alpha1, alpha12, alpha2, b, sigma), u_sigma)
-    (alpha0::Float64, alpha1::Float64, alpha12::Float64, alpha2::Float64,
-     b::AbstractVector{Float64}, sigma::Float64) =
-        (parameters.alpha0, parameters.alpha1, parameters.alpha12,
-         parameters.alpha2, parameters.b, parameters.sigma)
 
     # Priors: alpha0, alpha1, alpha2, alpha12 ~ Normal(0, 1); sigma ~ Cauchy(0, 1)
     # (half-Cauchy — the plain cauchy_lpdf density term plus the exp transform
@@ -137,18 +133,18 @@ docs_example = (;
 )
 """
 
-function evaluate_seeds_stanified_model_source()
+function evaluate_seeds_stanified_model_source(; model_only::Bool = false)
     _evaluate_ppl_source(SEEDS_STANIFIED_MODEL_SOURCE, @__MODULE__; bindings = (
         :SEEDS_STANIFIED_COUNTS, :SEEDS_STANIFIED_TOTALS,
         :SEEDS_STANIFIED_X1, :SEEDS_STANIFIED_X2,
-    ))
+    ), model_only)
 end
 
 const _SEEDS_STANIFIED_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
     _SEEDS_STANIFIED_GRAPH_TEMPLATE[] =
-        evaluate_seeds_stanified_model_source().model
+        evaluate_seeds_stanified_model_source(; model_only = true).model
     nothing
 end
 

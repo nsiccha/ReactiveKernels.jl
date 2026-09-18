@@ -89,10 +89,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
     parameters = (; beta1, beta2, beta3, beta4, sigma)
     (parameters, log_jacobian::Float64) =
         ((; beta1, beta2, beta3, beta4, sigma), log_sigma)
-    (beta1::Float64, beta2::Float64, beta3::Float64, beta4::Float64,
-     sigma::Float64) =
-        (parameters.beta1, parameters.beta2, parameters.beta3, parameters.beta4,
-         parameters.sigma)
 
     # Transformed parameter: the fitted mean μ = β₁ + β₂·work2 + β₃·work3 +
     # β₄·work4. Captured scalars ride the plate as explicit shared arguments (a
@@ -160,20 +156,20 @@ docs_example = (;
 )
 """
 
-function evaluate_kidscore_mom_work_source()
+function evaluate_kidscore_mom_work_source(; model_only::Bool = false)
     # Bind only the data. The authored source imports the reusable Normal
     # endpoint itself and contains the complete PPL assembly with no helper
     # evaluator or separately prepared density/plate path.
     _evaluate_ppl_source(KIDSCORE_MOM_WORK_SOURCE, @__MODULE__; bindings = (
         :MOM_WORK_KID_SCORE, :MOM_WORK_WORK2, :MOM_WORK_WORK3, :MOM_WORK_WORK4,
         :MOM_WORK_WORK2_NEW, :MOM_WORK_WORK3_NEW, :MOM_WORK_WORK4_NEW,
-    ))
+    ), model_only)
 end
 
 const _KIDSCORE_MOM_WORK_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _KIDSCORE_MOM_WORK_GRAPH_TEMPLATE[] = evaluate_kidscore_mom_work_source().model
+    _KIDSCORE_MOM_WORK_GRAPH_TEMPLATE[] = evaluate_kidscore_mom_work_source(; model_only = true).model
     nothing
 end
 

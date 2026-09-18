@@ -30,7 +30,9 @@ end
     reference = _earn_height_reference(q, EARN_HEIGHT_HEIGHT, EARN_HEIGHT_EARN)
 
     @testset "authored on the current baseline surface" begin
-        @test occursin("normal(b1 + b2 * h, s).logpdf(y)", EARN_HEIGHT_SOURCE)
+        @test occursin("mu = plate(height, beta1, beta2)", EARN_HEIGHT_SOURCE)
+        @test occursin("b1 + b2 * h", EARN_HEIGHT_SOURCE)
+        @test occursin("normal(m, s).logpdf(y)", EARN_HEIGHT_SOURCE)
         @test occursin("sigma::Float64 = exp(log_sigma)", EARN_HEIGHT_SOURCE)
         @test occursin("mu = plate(", EARN_HEIGHT_SOURCE)
         @test occursin("pointwise = plate(", EARN_HEIGHT_SOURCE)

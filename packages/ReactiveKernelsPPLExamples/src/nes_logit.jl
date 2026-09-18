@@ -34,7 +34,6 @@ using LogExpFunctions: logistic
     log_jacobian::Float64 = 0.0
 
     parameters = (; alpha, beta1)
-    (alpha::Float64, beta1::Float64) = (parameters.alpha, parameters.beta1)
 
     # The Stan model block has NO `~` prior statement for either parameter, so
     # the priors are flat (improper); Stan adds nothing and the varying prior
@@ -95,16 +94,16 @@ docs_example = (;
 )
 """
 
-function evaluate_nes_logit_source()
+function evaluate_nes_logit_source(; model_only::Bool = false)
     _evaluate_ppl_source(NES_LOGIT_SOURCE, @__MODULE__; bindings = (
         :NES_LOGIT_INCOME, :NES_LOGIT_VOTE,
-    ))
+    ), model_only)
 end
 
 const _NES_LOGIT_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _NES_LOGIT_GRAPH_TEMPLATE[] = evaluate_nes_logit_source().model
+    _NES_LOGIT_GRAPH_TEMPLATE[] = evaluate_nes_logit_source(; model_only = true).model
     nothing
 end
 

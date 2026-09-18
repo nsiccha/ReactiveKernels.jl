@@ -78,10 +78,6 @@ using LogExpFunctions: logistic, log1pexp
     (parameters, log_jacobian::Float64) =
         ((; alpha_raw, beta, mu_alpha, sigma_alpha, sigma_y),
          log_sigma_alpha + log_sigma_y)
-    (alpha_raw::AbstractVector{Float64}, beta::Float64, mu_alpha::Float64,
-     sigma_alpha::Float64, sigma_y::Float64) =
-        (parameters.alpha_raw, parameters.beta, parameters.mu_alpha,
-         parameters.sigma_alpha, parameters.sigma_y)
 
     # Priors (all proper): mu_alpha ~ Normal(0, 10), beta ~ Normal(0, 10),
     # sigma_alpha ~ Normal(0, 1), sigma_y ~ Normal(0, 1) (half-normal = plain
@@ -158,16 +154,16 @@ docs_example = (;
 )
 """
 
-function evaluate_radon_variable_intercept_noncentered_source()
+function evaluate_radon_variable_intercept_noncentered_source(; model_only::Bool = false)
     _evaluate_ppl_source(RADON_VARIABLE_INTERCEPT_NONCENTERED_SOURCE, @__MODULE__;
-        bindings = (:RADON_VIN_COUNTY, :RADON_VIN_FLOOR, :RADON_VIN_LOG))
+        bindings = (:RADON_VIN_COUNTY, :RADON_VIN_FLOOR, :RADON_VIN_LOG), model_only)
 end
 
 const _RADON_VIN_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
     _RADON_VIN_GRAPH_TEMPLATE[] =
-        evaluate_radon_variable_intercept_noncentered_source().model
+        evaluate_radon_variable_intercept_noncentered_source(; model_only = true).model
     nothing
 end
 

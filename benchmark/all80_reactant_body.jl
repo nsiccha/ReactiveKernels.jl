@@ -7,15 +7,20 @@
 # independently. A cell is either a timing or its exact lowering/setup diagnostic.
 using Random, LinearAlgebra, Statistics
 import TOML
+import SHA
+
+const PHASE = "reactant"
+const RECEIPT = get(ENV, "RK_ALL80_RECEIPT", "")
+const BATCH = get(ENV, "RK_ALL80_BATCH", "")
+include(joinpath(@__DIR__, "all80_receipt.jl"))    # stdlib-only; load the parent lock before measured imports
+if BATCH != ""
+    All80Receipt.load_provenance!(ENV["RK_ALL80_SOURCE_LOCK"])
+end
 using Chairmarks: @be
 import BridgeStan, PosteriorDB, Reactant, Enzyme
 using ReactiveKernels, ReactiveKernelsPPLExamples
 using DifferentiationInterface
-
-const PHASE = "reactant"
-const RECEIPT = get(ENV, "RK_ALL80_RECEIPT", "")
 include(joinpath(@__DIR__, "all80_registry.jl"))
-include(joinpath(@__DIR__, "all80_receipt.jl"))
 include(joinpath(@__DIR__, "all80_axes.jl"))
 const RK = All80Registry.REGISTRY
 
@@ -26,7 +31,7 @@ include(joinpath(STD, "position_multinomial_hmc_kernel.jl"))
 using .EightSchoolsDensity: Potential, Gradient, CallbackHandle
 const F = NUTSBMutationAuthoringFixture
 
-const AE = AutoEnzyme(mode = Enzyme.Reverse, function_annotation = Enzyme.Const)
+const AE = AutoEnzyme(mode = Enzyme.Reverse)
 med(b) = median(b).time * 1e9
 
 # A Julia/Enzyme process abort is NOT catchable as an exception (signal 6 kills the whole
@@ -68,6 +73,16 @@ function hmc_loop(kb, prep, q, backend, rng_factory;
 end
 
 include(joinpath(@__DIR__, "all80_reactant_evals.jl"))
+if BATCH != ""
+    All80Receipt.certify_loaded_modules!(Dict(
+        "ReactiveKernels" => ReactiveKernels,
+        "ReactiveKernelsDistributionKernels" => "ReactiveKernelsDistributionKernels",
+        "ReactiveKernelsPPLExamples" => ReactiveKernelsPPLExamples))
+    snapshot = All80Receipt.verify_provenance()
+    snapshot["ad_backend"] == All80Receipt.ORDINARY_AD_BACKEND ||
+        error("all80 Reactant batch AD configuration mismatch: expected ordinary reverse without annotation")
+end
+_phase_prov() = BATCH == "" ? nothing : All80Receipt.verify_provenance()
 
 function cached_bridge_model(post)
     stan = PosteriorDB.implementation(PosteriorDB.model(post), "stan")
@@ -77,20 +92,68 @@ function cached_bridge_model(post)
     BridgeStan.StanModel(library, PosteriorDB.load(PosteriorDB.dataset(post), String), 468)
 end
 
-function valid_rk_point(kb, dim, entry; rng = Xoshiro(0xC0FFEE))
-    # STRICT-INTERIOR probe. zeros(dim) is DEGENERATE for several models: a hard Uniform
-    # boundary (dogs_log's mixed-sign box), the a^0·b^0 = 1 endpoint singularity
-    # (dogs_hierarchical), or a symmetric logsumexp TIE where the AD subgradient is ambiguous
-    # (mixtures at mu1==mu2) — all poor gradient probes (performance audit 2026-09-08). A
-    # registry `probe_q` pins the model source's own separated probe; else search small random
-    # MIXED-SIGN points; zeros is only the last resort.
-    ok(q) = length(q) == dim && isfinite(try kb(q) catch; NaN end)
-    entry.probe_q !== nothing && ok(entry.probe_q) && return collect(Float64, entry.probe_q)
-    for q in Iterators.flatten(([fill(0.1, dim), fill(-0.1, dim)],
-                                (0.5 .* randn(rng, dim) for _ in 1:96), (zeros(dim),)))
-        ok(q) && return collect(Float64, q)
+stan_val(sm, q) = BridgeStan.log_density(sm, q; propto = false, jacobian = true)
+stan_grad(sm, q) = BridgeStan.log_density_gradient(
+    sm, q; propto = false, jacobian = true)[2]
+_numeric_vector_sha256(values) =
+    bytes2hex(SHA.sha256(sprint(show, Float64.(values))))
+
+function reference_valid_probe(sm, dim, entry; rng = Xoshiro(0xC0FFEE))
+    # Select by REFERENCE validity, never by RK success. A registry probe is authoritative and
+    # must itself be reference-valid; generic candidates are tried in deterministic order. An RK
+    # failure at the selected point is preserved by `prepare_ad`/`reactant_cells`, not resampled.
+    sperm = entry.stan_perm
+    back = sperm === nothing ? nothing : sortperm(sperm)
+    candidates = entry.probe_q === nothing ?
+        Iterators.flatten((
+            (fill(0.1, dim), fill(-0.1, dim)),
+            (0.5 .* randn(rng, dim) for _ in 1:96),
+            (zeros(dim),))) :
+        (collect(Float64, entry.probe_q),)
+    tested = 0
+    for candidate in candidates
+        q = collect(Float64, candidate)
+        length(q) == dim || continue
+        tested += 1
+        stan_q = sperm === nothing ? q : q[sperm]
+        value = try stan_val(sm, stan_q) catch; NaN end
+        gradient = try stan_grad(sm, stan_q) catch; fill(NaN, dim) end
+        mapped_gradient = back === nothing ? gradient : gradient[back]
+        if isfinite(value) && length(mapped_gradient) == dim &&
+                all(isfinite, mapped_gradient)
+            return (; q = q, candidates_tested = tested,
+                selected_source = entry.probe_q === nothing ? "generated" : "registry",
+                reference_value = value, reference_gradient = mapped_gradient,
+                reference_gradient_sha256 = _numeric_vector_sha256(mapped_gradient))
+        end
     end
-    error("no strict-interior finite RK probe point for a $dim-dim model")
+    error("no reference-valid finite value/gradient probe for a $dim-dim model after $tested candidate(s)")
+end
+
+function _input_identity(post, probe, name, entry)
+    dataset = PosteriorDB.dataset(post)
+    stan_path = PosteriorDB.path(PosteriorDB.implementation(
+        PosteriorDB.model(post), "stan"))
+    data_json = PosteriorDB.load(dataset, String)
+    library = first(splitext(stan_path)) * "_model.so"
+    All80Receipt.input_identity(;
+        phase = PHASE, posterior = name,
+        model = PosteriorDB.name(PosteriorDB.model(post)),
+        stan_path = stan_path, stan_sha256 = bytes2hex(SHA.sha256(read(stan_path))),
+        library = library,
+        library_sha256 = isfile(library) ? bytes2hex(SHA.sha256(read(library))) : "not-present",
+        dataset_path = try PosteriorDB.path(dataset) catch; "unavailable" end,
+        dataset_json_sha256 = bytes2hex(SHA.sha256(data_json)),
+        dataset_json_bytes = sizeof(data_json),
+        query = Dict{String,Any}(
+            "selected_point" => probe.q,
+            "selected_source" => probe.selected_source,
+            "candidates_tested" => probe.candidates_tested,
+            "reference_value" => probe.reference_value,
+            "reference_gradient_sha256" => probe.reference_gradient_sha256,
+            "selection_rule" => "first reference-valid finite BridgeStan value and gradient; RK failures are not skipped",
+            "ad_backend" => All80Receipt.ORDINARY_AD_BACKEND),
+        stan_perm = entry.stan_perm)
 end
 
 function run_reactant_one(name)
@@ -101,7 +164,9 @@ function run_reactant_one(name)
     graph = getproperty(getproperty(ReactiveKernelsPPLExamples, entry.mod), entry.build)()
     kb = prepare(graph; have = entry.have, want = :posterior, bound = entry.bind(data))
     sm = cached_bridge_model(post)
-    q = valid_rk_point(kb, Int(BridgeStan.param_unc_num(sm)), entry)
+    probe = reference_valid_probe(sm, Int(BridgeStan.param_unc_num(sm)), entry)
+    q = probe.q
+    input_identity = _input_identity(post, probe, name, entry)
     abort_reason = get(PROCESS_ABORTING_AD, name, nothing)
     prep = abort_reason === nothing ? try
         prepare_ad(kb, AE, q; active = :unconstrained)
@@ -112,19 +177,11 @@ function run_reactant_one(name)
     # finite-check, and time the fixed 16-step program. Native HMC owns the adaptive
     # throughput protocol; running native Enzyme here would duplicate work and can abort on
     # exactly the full-data AD shapes this pass is meant to classify.
-    # Reference Stan gradient oracle (BridgeStan, propto=false jacobian=true) mapped to RK
-    # unconstrained order via the registry stan_perm — the SAME oracle the native phase uses
-    # (all80_posteriordb_body.jl). NO finite differences; the .so (sm) is already loaded.
-    sperm = entry.stan_perm
-    stan_order_q = sperm === nothing ? q : q[sperm]
-    grad_oracle = try
-        g = BridgeStan.log_density_gradient(sm, stan_order_q; propto = false, jacobian = true)[2]
-        sperm === nothing ? g : g[sortperm(sperm)]
-    catch err
-        err
-    end
+    # The reference-valid selector already produced the BridgeStan gradient mapped to RK order.
+    grad_oracle = probe.reference_gradient
     transitions = All80Axes.HMC_MIN_TRANSITIONS
-    row = reactant_cells(kb, prep, q; transitions, grad_oracle)
+    row = reactant_cells(kb, prep, q; transitions, grad_oracle,
+        stan_value = probe.reference_value, rk_offset = entry.off_rk)
     row["hmc_steps"] = All80Axes.HMC_STEPS
     row["hmc_rounds"] = All80Axes.HMC_ROUNDS
     row["hmc_target_round_seconds"] = All80Axes.HMC_TARGET_ROUND_SECONDS
@@ -134,13 +191,19 @@ function run_reactant_one(name)
         value = row[key]
         println("  $key = ", value isa Real ? string(round(value; sigdigits = 4)) : first(value, 180))
     end
+    row["input_identity_reactant"] = input_identity
     row
 end
 
 requested = [name for name in ARGS if !startswith(name, "-")]
+duplicates = unique(filter(name -> count(==(name), requested) > 1, requested))
+isempty(duplicates) ||
+    error("all80 reactant: duplicate key(s): $(join(duplicates, ", "))")
 unknown = [name for name in requested if !haskey(RK, name)]
 isempty(unknown) || error("all80 reactant: unknown key(s): $(join(unknown, ", "))")
-targets = isempty(requested) ? sort(collect(keys(RK))) : requested
+# Match the native default: the immutable frozen-82 sweep excludes incremental batch keys.
+targets = isempty(requested) ?
+    sort(collect(setdiff(keys(RK), All80Registry.BATCH_KEYS))) : requested
 retry_requested = get(ENV, "RK_ALL80_RETRY", "") == "1"
 retry_requested && isempty(requested) &&
     error("RK_ALL80_RETRY=1 requires explicit model keys; refusing to replay all 82 implicitly")
@@ -149,6 +212,8 @@ if get(ENV, "RK_ALL80_RESUME", "") == "1" && RECEIPT != "" && isfile(RECEIPT)
     prior = TOML.parsefile(RECEIPT)
     get(prior, "schema", "") == All80Receipt.SCHEMA || error("reactant resume schema mismatch")
     get(prior, "phase", "") == PHASE || error("reactant resume phase mismatch")
+    BATCH == "" || All80Receipt.assert_batch_resume!(prior, RECEIPT;
+        phase = PHASE, targets = targets, provenance = All80Receipt.verify_provenance())
     for (name, cells) in get(prior, "models", Dict())
         rows[String(name)] = Dict{String,Any}(String(k) => v for (k, v) in cells)
     end
@@ -163,8 +228,12 @@ for (index, name) in enumerate(pending)
         reason = string("reactant setup: ", first(replace(sprint(showerror, err), "\n" => " "), 220))
         Dict(cell => reason for cell in All80Receipt.REACTANT_CELLS)
     end
-    All80Receipt.write_phase(RECEIPT, PHASE, rows)
+    All80Receipt.write_phase(RECEIPT, PHASE, rows; provenance = _phase_prov())
     println("  [$(length(rows))/$(length(targets)) complete; $index/$(length(pending)) this run] $name recorded")
     flush(stdout)
+end
+if BATCH != ""
+    sort(collect(keys(rows))) == sort(targets) ||
+        error("all80 Reactant batch incomplete: got $(sort(collect(keys(rows)))) expected $(sort(targets))")
 end
 println("REACTANT_PHASE_DONE rows=$(length(rows))")

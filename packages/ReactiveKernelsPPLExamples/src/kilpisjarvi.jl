@@ -68,8 +68,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
     # constrain-only producer omits the Jacobian; the joint producer emits it.
     parameters = (; alpha, beta, sigma)
     (parameters, log_jacobian::Float64) = ((; alpha, beta, sigma), u_sigma)
-    (alpha::Float64, beta::Float64, sigma::Float64) =
-        (parameters.alpha, parameters.beta, parameters.sigma)
 
     # Priors: α ~ Normal(pmualpha, psalpha), β ~ Normal(pmubeta, psbeta) with the
     # data-supplied "adjustable-prior" hyperparameters, reusing the shared Normal
@@ -139,7 +137,7 @@ docs_example = (;
 )
 """
 
-function evaluate_kilpisjarvi_source()
+function evaluate_kilpisjarvi_source(; model_only::Bool = false)
     # Bind only the data. The authored source imports the reusable Normal
     # endpoint itself and contains the complete PPL assembly with no helper
     # evaluator or separately prepared density/plate path.
@@ -147,13 +145,13 @@ function evaluate_kilpisjarvi_source()
         :KILPISJARVI_X, :KILPISJARVI_Y, :KILPISJARVI_XPRED,
         :KILPISJARVI_PMUALPHA, :KILPISJARVI_PSALPHA,
         :KILPISJARVI_PMUBETA, :KILPISJARVI_PSBETA,
-    ))
+    ), model_only)
 end
 
 const _KILPISJARVI_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _KILPISJARVI_GRAPH_TEMPLATE[] = evaluate_kilpisjarvi_source().model
+    _KILPISJARVI_GRAPH_TEMPLATE[] = evaluate_kilpisjarvi_source(; model_only = true).model
     nothing
 end
 

@@ -10,32 +10,38 @@ what step `t−1` produced.
 Its purpose is Reactant lowering. A recurrence authored the obvious way — a
 `for` loop that reads `x[t-1]` and writes `out[t]` element by element — evaluates
 fine natively but does **not** lower through Reactant, because XLA forbids scalar
-indexing of a traced array. `scan` lowers the same recurrence to a single
-`stablehlo.while` carry loop: one traced loop, no unrolling, no per-step scalar
-indexing. So the natural sequential form compiles under Reactant with no manual
-reformulation into a vectorized closed form.
+indexing of a traced array. On its supported traced shapes — traced 1-D
+sequences, or `eachrow` over a traced matrix — `scan` lowers the same recurrence
+to a single `stablehlo.while` carry loop: one traced loop, no unrolling, no
+per-step scalar indexing. So the natural sequential form compiles under Reactant
+with no manual reformulation into a vectorized closed form.
 
 ## Syntax
 
 ```julia
-result = scan(xs, Ref(shared₁), Ref(shared₂), …; init = c₀) do carry, x, s₁, s₂, …
-    # … compute with carry, the per-step element x, and the shared operands …
+result = scan(xs₁, xs₂, …, Ref(shared₁), Ref(shared₂), …; init = c₀) do carry, x₁, x₂, …, s₁, s₂, …
+    # … compute with carry, the per-step elements x₁, x₂, …, and the shared operands …
     (new_carry, output)          # the do-block must END with this 2-tuple
 end
 ```
 
-- **`xs`** — the sequence to scan over. It is the sole non-`Ref` positional and
-  is consumed one element per step (never broadcast-invariant).
+- **`xs₁, xs₂, …`** — one or more **iterated sequences**, the leading non-`Ref`
+  positionals. They are advanced together in **lockstep**: step `t` receives
+  `xs₁[t], xs₂[t], …`. With a single sequence this is the ordinary
+  `scan(xs; …) do carry, x`. Every iterated sequence must share axes; a length
+  mismatch throws `DimensionMismatch`.
 - **`init`** — seeds the threaded `carry`. Required keyword.
 - **`Ref(shared)` operands** — broadcast-invariant scalars passed unchanged to
   every step, exactly like [`plate`](compiler.md)'s atomic `Ref`
-  arguments.
-- **The do-block** receives `(carry, x, shared...)` and must end with the 2-tuple
-  `(new_carry, output)`. `scan` returns the vector `[output₁, output₂, …]` (one
-  entry per element of `xs`); the final carry is internal.
+  arguments. Every `Ref(...)` operand must follow the iterated sequences; a bare
+  (non-`Ref`) positional after a `Ref(...)` is rejected.
+- **The do-block** receives `(carry, x₁, x₂, …, shared...)` and must end with the
+  2-tuple `(new_carry, output)`. `scan` returns the vector `[output₁, output₂, …]`
+  (one entry per step); the final carry is internal.
 
-The carry may be a scalar or a **`NamedTuple`** when several values must be
-threaded together:
+The carry may be a scalar, a **`NamedTuple`**, or a vector (an HMM forward
+pass threads its belief-state vector; see the `eachrow` shape below) when
+several values must be threaded together:
 
 ```julia
 init = (; y_prev = μ, err_prev = 0.0)     # a compound carry
@@ -84,6 +90,44 @@ running_max = scan(series; init = -Inf) do carry, x
 end
 ```
 
+## Several co-varying sequences (lockstep)
+
+When a step reads more than one per-step sequence — one bound-data, one
+parameter-derived, or two parameter-derived — list them all as leading
+positionals; they advance together. A first-order linear recurrence
+`carry_t = a_t · carry_{t-1} + b_t` over two per-step sequences `a` and `b`:
+
+```julia
+seq = scan(a, b; init = 0.0) do carry, aₜ, bₜ
+    next = aₜ * carry + bₜ
+    (next, next)
+end
+```
+
+The posteriordb `prophet` logistic-trend recurrence
+`m_t = m_{t-1} + (t_change_t − m_{t-1}) · r_t`, whose `t_change` is bound data
+and `r` is parameter-derived, is the same shape with two sequences:
+
+```julia
+m = scan(tchange, r; init = m0) do carry, tc, rr
+    next = carry + (tc - carry) * rr
+    (next, next)
+end
+```
+
+Shared broadcast-invariant scalars still ride along as trailing `Ref`s:
+`scan(a, b, Ref(gain); init = 0.0) do carry, aₜ, bₜ, g … end`.
+
+A scan over matrix rows iterates `eachrow` of the matrix — one row per step —
+with whatever carry the recurrence threads (here a 2-vector belief state):
+
+```julia
+forward = scan(eachrow(scan_rows), Ref(gain); init = seed) do carry, row, g
+    newg = g .* (row[1] .+ carry .* row[2]) .+ row[3]
+    (newg, sum(newg))
+end
+```
+
 ## Lowering and semantics
 
 - **Native.** The generated ordered loop contains the scalar step directly,
@@ -96,19 +140,33 @@ end
   still returns its vector; requesting the scan port, adding another consumer,
   supplying another broadcast array, or composing multiple plates preserves
   ordinary scan materialization and broadcast shape checks.
-- **Reactant.** When `xs` is a traced array, `scan` emits a `stablehlo.while`
-  carry loop: the carry (scalar or `NamedTuple`) is threaded as a loop-carried
-  value and the per-step outputs are written into a preallocated traced buffer
-  with a dynamic-update-slice. The first step runs eagerly to fix the output
-  element type; the `while` runs the rest. Native and Reactant results match to
-  floating-point tolerance (see `test/test_ppl_examples_reactant.jl`).
+- **Reactant.** `scan` emits a single `stablehlo.while` carry loop in two
+  shapes: every iterated sequence a traced 1-D array (each gathered inside the
+  loop by the loop counter), or a single `eachrow` over a traced matrix (each
+  row gathered by the counter from the traced parent; from RK `a4eaa27`). The
+  carry — scalar, `NamedTuple`, or vector — is threaded as a loop-carried
+  value, the per-step outputs are written into a preallocated traced buffer
+  with a dynamic-update-slice, and the first step runs eagerly to seed the
+  carry and fix the output element type (`N == 1` runs with an empty loop
+  body). Anything else — a host (`bound=`) iterated sequence, `eachrow` over
+  a host matrix, or a row-slices sequence beside other iterated sequences —
+  takes the generic loop instead, which traces unrolled with exact values: no
+  `while`, but also no error. One sharp edge stays loud: a traced 1-D first
+  sequence beside a host later sequence is rejected, so pass every sequence
+  traced via `Reactant.to_rarray(data)` on the 1-D path. Native and Reactant
+  results match to floating-point tolerance (see
+  `test/test_ppl_examples_reactant.jl`).
 
 ## Limitations
 
-- **`xs` must be non-empty** (an empty sequence throws — the output element type
-  is otherwise undetermined).
-- **Per-step output is a scalar** under the Reactant lowering. A non-scalar
-  per-step output is a loud, reported error, never a silent mis-lowering; author
-  the output as a scalar (or open an issue for the shape you need).
+- **The iterated sequences must be non-empty and share axes** (an empty sequence
+  throws — the output element type is otherwise undetermined — and a length
+  mismatch between sequences throws `DimensionMismatch`).
+- **Iterated sequences precede shared operands.** All bare (iterated) positionals
+  come first; every `Ref(...)` shared operand follows. A non-`Ref` positional
+  after a `Ref(...)` is rejected.
+- **Per-step output is a scalar** on either Reactant `while` path. A non-scalar
+  per-step output there is a loud, reported error, never a silent mis-lowering;
+  author the output as a scalar (or open an issue for the shape you need).
 - **RK-macro-only.** `scan` is recognised by the `@kernel` macro; it does not
   change Reactant itself.

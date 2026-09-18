@@ -132,16 +132,6 @@ using LogExpFunctions: logistic, log1pexp
         ((; a, b, c, d, e, beta1, beta2, beta3, beta4, beta5,
           sigma_a, sigma_b, sigma_c, sigma_d, sigma_e),
          jac_a + jac_b + jac_c + jac_d + jac_e)
-    (a::AbstractVector{Float64}, b::AbstractVector{Float64},
-     c::AbstractVector{Float64}, d::AbstractVector{Float64},
-     e::AbstractVector{Float64}, beta1::Float64, beta2::Float64,
-     beta3::Float64, beta4::Float64, beta5::Float64,
-     sigma_a::Float64, sigma_b::Float64, sigma_c::Float64,
-     sigma_d::Float64, sigma_e::Float64) =
-        (parameters.a, parameters.b, parameters.c, parameters.d, parameters.e,
-         parameters.beta1, parameters.beta2, parameters.beta3, parameters.beta4,
-         parameters.beta5, parameters.sigma_a, parameters.sigma_b,
-         parameters.sigma_c, parameters.sigma_d, parameters.sigma_e)
 
     # Varying-intercept priors (proper, so they appear in the density and its
     # gradient): a_k ~ Normal(0, sigma_a), ... The shared scale rides each plate
@@ -265,18 +255,18 @@ docs_example = (;
 )
 """
 
-function evaluate_election88_full_source()
+function evaluate_election88_full_source(; model_only::Bool = false)
     _evaluate_ppl_source(ELECTION88_FULL_SOURCE, @__MODULE__; bindings = (
         :E88_AGE, :E88_EDU, :E88_AGE_EDU, :E88_STATE, :E88_REGION,
         :E88_BLACK, :E88_FEMALE, :E88_VPREV, :E88_Y,
         :E88_N_AGE, :E88_N_EDU, :E88_N_AGE_EDU, :E88_N_STATE, :E88_N_REGION,
-    ))
+    ), model_only)
 end
 
 const _ELECTION88_FULL_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _ELECTION88_FULL_GRAPH_TEMPLATE[] = evaluate_election88_full_source().model
+    _ELECTION88_FULL_GRAPH_TEMPLATE[] = evaluate_election88_full_source(; model_only = true).model
     nothing
 end
 

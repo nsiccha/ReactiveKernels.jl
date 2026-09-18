@@ -48,8 +48,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 
     parameters = (; beta, sigma)
     (parameters, log_jacobian::Float64) = ((; beta, sigma), log_sigma)
-    (beta::AbstractVector{Float64}, sigma::Float64) =
-        (parameters.beta, parameters.sigma)
 
     # Priors: betaⱼ ~ Normal(0,10), sigma ~ HalfNormal(0,10) (the lower=0
     # constraint carries the half; Stan drops the log2 constant).
@@ -101,14 +99,14 @@ docs_example = (;
 )
 """
 
-function evaluate_blr_source()
-    _evaluate_ppl_source(BLR_SOURCE, @__MODULE__; bindings = (:BLR_X, :BLR_Y))
+function evaluate_blr_source(; model_only::Bool = false)
+    _evaluate_ppl_source(BLR_SOURCE, @__MODULE__; bindings = (:BLR_X, :BLR_Y), model_only)
 end
 
 const _BLR_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _BLR_GRAPH_TEMPLATE[] = evaluate_blr_source().model
+    _BLR_GRAPH_TEMPLATE[] = evaluate_blr_source(; model_only = true).model
     nothing
 end
 

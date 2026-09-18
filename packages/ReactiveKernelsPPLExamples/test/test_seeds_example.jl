@@ -45,7 +45,7 @@ end
     reference = _seeds_reference(q, SEEDS_COUNTS, SEEDS_TOTALS, SEEDS_X1, SEEDS_X2)
 
     @testset "authored on the current baseline surface" begin
-        @test occursin("binomial(nt, logistic(", SEEDS_SOURCE)
+        @test occursin("binomial(; n = nt, logit = lp).logpdf(c)", SEEDS_SOURCE)
         @test occursin("gamma(0.001, 0.001).logpdf", SEEDS_SOURCE)
         @test occursin("normal(0.0, 1000.0).logpdf", SEEDS_SOURCE)
         @test occursin("normal(0.0, s).logpdf(bb)", SEEDS_SOURCE)

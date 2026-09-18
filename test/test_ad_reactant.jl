@@ -222,3 +222,47 @@ include("test_ad_fused_reactant.jl")
         @test Array(compiled_gradient) ≈ reference
     end
 end
+
+@testset "staged prepared AD over bound views (§7a)" begin
+    @kernel staged_view_objective(x::Vector{Float64}, y::Matrix{Float64}) = begin
+        c1 = view(y, :, 1)
+        m::Vector{Float64} = exp.(x)
+        p1 = plate(c1, m) do o, mm
+            o * mm
+        end
+        s::Float64 = sum(p1)
+        return s
+    end
+
+    x = [0.3, -0.4, 0.2, 0.1, -0.2]
+    y = [1.0 6.0; 2.0 7.0; 3.0 8.0; 4.0 9.0; 5.0 10.0]
+    kernel = prepare(
+        staged_view_objective; have = (:x, :y), want = :s, bound = (; y))
+    prepared = prepare_ad(kernel, AD_REACTANT_BACKEND, x; active = :x)
+    expected = y[:, 1] .* exp.(x)
+
+    # The §7a contract: traced compile inputs stage the derivative inside the
+    # enclosing compiled function; bound data stays bound.
+    staged = let prepared = prepared
+        (tq) -> ad_value_and_gradient(prepared, tq)
+    end
+    compiled = Reactant.compile(staged, (_trace(x),))
+    value, gradient = compiled(_trace(x))
+    @test Float64(value) ≈ sum(expected)
+    @test Array(gradient) ≈ expected
+
+    # Native compile inputs pass through untraced, and Reactant's autodiff
+    # overlay then intercepts the native Enzyme call with all-native arguments
+    # — a correct value with a silent zero gradient. That shape must fail
+    # loudly at compile time instead of baking the corruption in.
+    native_staged = let prepared = prepared
+        (tq) -> ad_value_and_gradient(prepared, tq)
+    end
+    @test_throws ArgumentError Reactant.compile(native_staged, (x,))
+
+    native_staged_inplace = let prepared = prepared
+        (tq, tg) -> ad_value_and_gradient!(prepared, tg, tq)
+    end
+    @test_throws ArgumentError Reactant.compile(
+        native_staged_inplace, (x, similar(x)))
+end

@@ -255,6 +255,42 @@ end
         @test !(:standardized in [only(r.outputs).name for r in authoritative.recipes])
     end
 
+    @testset "endpoint call sites admit no cross-method producers" begin
+        # Regression test for the lotka_volterra prepare hang: every
+        # `.logpdf` call site used to splice the whole endpoint object,
+        # including the unused quantile/inv recipes, as alternative
+        # producers of the site's values. The exact planner is exponential
+        # in that count (12 sites hung prepare for 24+ minutes). Nested
+        # recipes that only recompute caller-supplied HAVE are no longer
+        # spliced, so every candidate value below has exactly one producer.
+        @kernel multi_site_logpdf(v::Vector{Float64}) = begin
+            a::Float64 = F.normal(0.0, 1.0).logpdf(v[1])
+            b::Float64 = F.normal(1.0, 2.0).logpdf(v[2])
+            c::Float64 = F.normal(-1.0, 0.5).logpdf(v[3])
+            total::Float64 = a + b + c
+            return total
+        end
+        g = multi_site_logpdf.graph
+        have_ids = Set(ReactiveKernels.canon_id(g, multi_site_logpdf.v.id))
+        want_ids = [ReactiveKernels.canon_id(g, multi_site_logpdf.total.id)]
+        counts = Dict{Int,Int}()
+        for rid in ReactiveKernels._candidate_recipes(g, have_ids, want_ids)
+            for o in g.recipes[rid].outputs
+                cid = ReactiveKernels.canon_id(g, o.id)
+                counts[cid] = get(counts, cid, 0) + 1
+            end
+        end
+        @test !isempty(counts)
+        @test all(==(1), values(counts))
+
+        # The wanted inverse direction still lowers through the declared
+        # inverse body: quantile(p) == location + scale * standard_quantile(p).
+        normal_quantile = extract(F.normal;
+            have = (:p, :location, :scale), want = :quantile)
+        @test prepare(normal_quantile)(0.75, 3.0, 2.0) ≈
+              3.0 + 2.0 * log(0.75 / 0.25) / 1.702
+    end
+
     @testset "ordinary graph execution surfaces" begin
         spec = extract(F.normal;
             have = (:x, :location, :scale), want = :logpdf)

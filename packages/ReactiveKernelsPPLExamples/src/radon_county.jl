@@ -69,9 +69,6 @@ using LogExpFunctions: logistic, log1pexp
     parameters = (; a, mu_a, sigma_a, sigma_y)
     (parameters, log_jacobian::Float64) =
         ((; a, mu_a, sigma_a, sigma_y), jac_sigma_a + jac_sigma_y)
-    (a::AbstractVector{Float64}, mu_a::Float64,
-     sigma_a::Float64, sigma_y::Float64) =
-        (parameters.a, parameters.mu_a, parameters.sigma_a, parameters.sigma_y)
 
     # Hyperprior: mu_a ~ Normal(0, 1) (proper, shows up in value AND gradient
     # parity).
@@ -134,15 +131,15 @@ docs_example = (;
 )
 """
 
-function evaluate_radon_county_source()
+function evaluate_radon_county_source(; model_only::Bool = false)
     _evaluate_ppl_source(RADON_COUNTY_SOURCE, @__MODULE__;
-        bindings = (:RADON_COUNTY_IDX, :RADON_COUNTY_LOG))
+        bindings = (:RADON_COUNTY_IDX, :RADON_COUNTY_LOG), model_only)
 end
 
 const _RADON_COUNTY_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _RADON_COUNTY_GRAPH_TEMPLATE[] = evaluate_radon_county_source().model
+    _RADON_COUNTY_GRAPH_TEMPLATE[] = evaluate_radon_county_source(; model_only = true).model
     nothing
 end
 

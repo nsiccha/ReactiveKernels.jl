@@ -5,6 +5,10 @@ using Test
 using ReactiveKernelsPPLExamples.LinearRegressionExample:
     evaluate_linear_regression_source
 using ReactiveKernelsPPLExamples.ARMA11Example: evaluate_arma11_source
+using ReactiveKernelsPPLExamples.GARCH11Example: evaluate_garch11_source
+using ReactiveKernelsPPLExamples.HmmExampleExample: evaluate_hmm_example_source
+using ReactiveKernelsPPLExamples.HmmGaussianExample: evaluate_hmm_gaussian_source
+using ReactiveKernelsPPLExamples.IohmmRegExample: evaluate_iohmm_reg_source
 using ReactiveKernelsPPLExamples.PoissonGammaExample: evaluate_poisson_gamma_source
 using ReactiveKernelsPPLExamples.GLMPoissonExample: evaluate_glm_poisson_source,
     build_glm_poisson_graph, GLM_POISSON_YEAR, GLM_POISSON_C
@@ -94,6 +98,15 @@ using ReactiveKernelsPPLExamples.MVNormalRegressionExample:
     MVREG_COVARIANCE, MVREG_CHOL, MVREG_PRECISION, MVREG_PRECISION_CHOL
 using ReactiveKernelsPPLExamples.BoundRegressionExample:
     build_bound_regression_graph, BOUND_RAW_X, BOUND_Y
+using ReactiveKernelsPPLExamples.DiamondsExample: evaluate_diamonds_source
+using ReactiveKernelsPPLExamples.NormalMixtureKExample: evaluate_normal_mixture_k_source
+using ReactiveKernelsPPLExamples.DogsNonhierarchicalExample: evaluate_dogs_nonhierarchical_source
+using ReactiveKernelsPPLExamples.LogisticRegressionRHSExample: evaluate_logistic_regression_rhs_source
+using ReactiveKernelsPPLExamples.GPRegrExample:
+    evaluate_gp_regr_source, GP_REGR_X, GP_REGR_Y
+using ReactiveKernelsPPLExamples.AccelGPExample: evaluate_accel_gp_source
+using ReactiveKernelsPPLExamples.GPPoisRegrExample: evaluate_gp_pois_regr_source
+using ReactiveKernelsPPLExamples.HierarchicalGPExample: evaluate_hierarchical_gp_source
 
 _host(v::Reactant.AbstractConcreteArray) = Array(v)
 _host(v::Reactant.AbstractConcreteNumber) = Reactant.to_number(v)
@@ -158,6 +171,39 @@ end
             have = (:unconstrained, :series), want = (:errors, :errors_closed))
         e_scan, e_closed = both_kernel(a.inputs.q, a.inputs.series)
         @test _rapprox(e_scan, e_closed)
+    end
+    @testset "garch11 (GARCH(1,1) sd recursion; traced raw series → stablehlo.while)" begin
+        a = evaluate_garch11_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+        traced = map(_trace, Tuple(a.inputs))
+        hlo = repr(Reactant.@code_hlo optimize = false a.kernel(traced...))
+        @test occursin("stablehlo.while", hlo)
+    end
+    @testset "hmm_example (forward algorithm; traced raw series → stablehlo.while)" begin
+        a = evaluate_hmm_example_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+        traced = map(_trace, Tuple(a.inputs))
+        hlo = repr(Reactant.@code_hlo optimize = false a.kernel(traced...))
+        @test occursin("stablehlo.while", hlo)
+    end
+    @testset "hmm_gaussian (K-state forward; traced raw series → stablehlo.while)" begin
+        a = evaluate_hmm_gaussian_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+        traced = map(_trace, Tuple(a.inputs))
+        hlo = repr(Reactant.@code_hlo optimize = false a.kernel(traced...))
+        @test occursin("stablehlo.while", hlo)
+    end
+    @testset "iohmm_reg (input-dependent forward; all-bound query compiles, scan unrolls)" begin
+        a = evaluate_iohmm_reg_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+        # KNOWN GAP (do not assert while here): this model's per-step scan
+        # inputs are K-vectors (rows of the input-dependent transition /
+        # emission design), and the scan while-lowering gathers only 1-D
+        # traced sequences. Each traced raw-series variant still unrolls
+        # (measured HLO without `stablehlo.while`, ~7 MB on the full data),
+        # and iterating a traced matrix directly fails Reactant scalar
+        # indexing. The all-bound query stays the natural authoring; parity is
+        # asserted above on the unrolled compiled program.
     end
     @testset "poisson_gamma" begin
         a = evaluate_poisson_gamma_source()
@@ -535,6 +581,22 @@ end
             bound = (; raw_predictors = BOUND_RAW_X))
         @test _rapprox(_compile_run(bound, (q, BOUND_Y)), bound(q, BOUND_Y))
     end
+    @testset "diamonds (posteriordb; brms centered regression, bound design)" begin
+        a = evaluate_diamonds_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "normal_mixture_k (posteriordb; natural K-dim simplex mixture, log_sum_exp)" begin
+        a = evaluate_normal_mixture_k_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "dogs_nonhierarchical (posteriordb; correlated per-dog, in-graph counts)" begin
+        a = evaluate_dogs_nonhierarchical_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    @testset "logistic_regression_rhs (posteriordb; regularized horseshoe)" begin
+        a = evaluate_logistic_regression_rhs_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
     @testset "glm_poisson with bound host data (>16-lane plate)" begin
         # The benchmark shape: every data port BOUND as a host array, only the
         # unconstrained vector traced.  `counts` is then a host `Vector{Int}`
@@ -557,5 +619,53 @@ end
             bound = (; counts = GLM_POISSON_C))
         @test _rapprox(_compile_run(counts_bound, (q, GLM_POISSON_YEAR)),
                        counts_bound(q, GLM_POISSON_YEAR))
+    end
+    # gp_regr — marginal GP regression with a dense in-graph Cholesky of the
+    # exponential-quadratic covariance. The PRIMAL lowers through Reactant with
+    # the response `y` traced (the mvnormal-cholesky pattern; `x` is bound so the
+    # squared-distance design folds to a constant). The compiled REVERSE gradient
+    # of the Cholesky solve does NOT yet lower — the Reactant/EnzymeMLIR pass has
+    # no adjoint for `stablehlo.triangular_solve` — so only the primal is checked
+    # here (native primal + native Enzyme gradient vs Stan are the authoritative
+    # gate in `benchmark/gp_gate.jl`; the Reactant-gradient gap is snag
+    # `reactant-compile-f877fcfd` on ReactiveKernels).
+    @testset "gp_regr (posteriordb; marginal GP, in-graph cholesky; primal)" begin
+        a = evaluate_gp_regr_source()
+        q = a.inputs.q
+        kb = prepare(a.model; have = (:unconstrained, :x, :y), want = :posterior,
+                     bound = (; x = GP_REGR_X))
+        native = kb(q, GP_REGR_Y)
+        @test _rapprox(_compile_run(kb, (q, GP_REGR_Y)), native)
+    end
+    # accel_gp — brms Hilbert-space approximate GP (HSGP): a distributional model
+    # (latent GP on both the mean and log-sd of a Normal response) built entirely
+    # from dense matrix-vector products, no covariance matrix / Cholesky. All data
+    # is bound (raw-data bound entry); the whole graph — primal AND compiled
+    # reverse gradient — lowers through Reactant (see benchmark/gp_gate.jl axis 4).
+    @testset "accel_gp (posteriordb; HSGP distributional GP, all data bound)" begin
+        a = evaluate_accel_gp_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    # gp_pois_regr — non-centered latent GP + Poisson-log. The latent field is
+    # `f = cholesky(K).L * f_tilde`; the PRIMAL lowers through Reactant (`x`/`k`
+    # bound, only q traced). Its compiled REVERSE gradient does NOT lower — the
+    # Reactant/EnzymeMLIR pass has no adjoint for the Cholesky FACTOR
+    # (`stablehlo.cholesky`), the sibling of gp_regr's `triangular_solve` gap
+    # (both snag reactant-compile-f877fcfd). Native primal + native Enzyme
+    # gradient vs Stan are the authoritative gate in `benchmark/gp_gate.jl`.
+    @testset "gp_pois_regr (posteriordb; latent GP + Poisson-log; primal)" begin
+        a = evaluate_gp_pois_regr_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
+    end
+    # hierarchical_gp — hierarchical GP of state presidential votes (dim 933): the
+    # ILR simplex transform, dual per-year Cholesky GPs (non-centered factor
+    # matmul), index gathers and reshape all lower the Reactant PRIMAL (all data
+    # bound, only q traced). Its compiled REVERSE gradient does NOT lower — the
+    # dual Cholesky FACTOR reverse hits the `stablehlo.cholesky` adjoint gap
+    # (snag reactant-compile-f877fcfd). Native primal + native Enzyme gradient vs
+    # Stan are the authoritative gate in `benchmark/gp_gate.jl`.
+    @testset "hierarchical_gp (posteriordb; hierarchical GP, ILR simplex; primal)" begin
+        a = evaluate_hierarchical_gp_source()
+        @test _rapprox(_compile_run(a.kernel, Tuple(a.inputs)), a.output)
     end
 end

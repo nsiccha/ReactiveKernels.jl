@@ -43,8 +43,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 
     parameters = (; beta1, beta2, beta3, sigma)
     (parameters, log_jacobian::Float64) = ((; beta1, beta2, beta3, sigma), log_sigma)
-    (beta1::Float64, beta2::Float64, beta3::Float64, sigma::Float64) =
-        (parameters.beta1, parameters.beta2, parameters.beta3, parameters.sigma)
 
     # Transformed DATA: the log-response, computed once from the data. Read as a
     # bare caller port by the likelihood.
@@ -105,16 +103,16 @@ docs_example = (;
 )
 """
 
-function evaluate_logearn_height_male_source()
+function evaluate_logearn_height_male_source(; model_only::Bool = false)
     _evaluate_ppl_source(LOGEARN_HEIGHT_MALE_SOURCE, @__MODULE__; bindings = (
         :LEHM_EARN, :LEHM_HEIGHT, :LEHM_MALE,
-    ))
+    ), model_only)
 end
 
 const _LOGEARN_HEIGHT_MALE_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _LOGEARN_HEIGHT_MALE_GRAPH_TEMPLATE[] = evaluate_logearn_height_male_source().model
+    _LOGEARN_HEIGHT_MALE_GRAPH_TEMPLATE[] = evaluate_logearn_height_male_source(; model_only = true).model
     nothing
 end
 

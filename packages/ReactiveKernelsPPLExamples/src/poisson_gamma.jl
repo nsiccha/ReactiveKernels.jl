@@ -19,7 +19,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: gamma, poiss
     # Either the rate λ or log_rate may be the authoritative HAVE value; the
     # support transform is λ = exp(log_rate) with log|dλ/dlog_rate| = log_rate.
     log_rate::Float64 = log(rate)
-    rate::Float64 = exp(log_rate)
     log_jacobian::Float64 = log_rate
 
     parameters = (; rate)
@@ -68,18 +67,18 @@ docs_example = (;
 )
 """
 
-function evaluate_poisson_gamma_source()
+function evaluate_poisson_gamma_source(; model_only::Bool = false)
     # Bind only the data. The authored source imports and reuses the shared
     # Gamma and Poisson distribution objects directly.
     _evaluate_ppl_source(POISSON_GAMMA_SOURCE, @__MODULE__; bindings = (
         :POISSON_COUNTS,
-    ))
+    ), model_only)
 end
 
 const _POISSON_GAMMA_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _POISSON_GAMMA_GRAPH_TEMPLATE[] = evaluate_poisson_gamma_source().model
+    _POISSON_GAMMA_GRAPH_TEMPLATE[] = evaluate_poisson_gamma_source(; model_only = true).model
     nothing
 end
 
