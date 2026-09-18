@@ -2586,7 +2586,18 @@ function prepare_batched(spec::KernelSpec;
                          have = _KERNEL_DEFAULT_BOUNDARY,
                          want = _KERNEL_DEFAULT_BOUNDARY,
                          passes = ())
-    replica(spec; batched, have, want, passes)
+    selected_have = have === _KERNEL_DEFAULT_BOUNDARY ? inputs(spec) : have
+    selected_want = want === _KERNEL_DEFAULT_BOUNDARY ? outputs(spec) : want
+    prepared = prepare(plan(spec; have = selected_have, want = selected_want);
+                       passes = passes)
+    replicated = try
+        replica_graph(prepared; batched)
+    catch err
+        err isa ArgumentError || rethrow()
+        replica(prepared; batched)
+    end
+    have === _KERNEL_DEFAULT_BOUNDARY || return replicated
+    _kernel_signature_callable(replicated, spec.call_signature)
 end
 
 """
@@ -2600,7 +2611,12 @@ name. See that docstring for the batch-axis, output-shape, purity, and
 allocation contract.
 """
 function vectorize(kernel::PreparedKernel; batched)
-    replica(kernel; batched)
+    try
+        replica_graph(kernel; batched)
+    catch err
+        err isa ArgumentError || rethrow()
+        replica(kernel; batched)
+    end
 end
 
 function vectorize(spec::KernelSpec;
@@ -2618,9 +2634,12 @@ end
 "Names of HAVE ports carrying the shared trailing batch axis."
 batched_ports(kernel::ReplicatedKernel{B}) where {B} =
     Tuple(kernel.inputs[index].name for index in B)
+batched_ports(kernel::GraphReplicatedKernel{B}) where {B} =
+    Tuple(kernel.inputs[index].name for index in B)
 
 "The scalar prepared kernel retained as the mathematical authority."
 scalar_kernel(kernel::ReplicatedKernel) = kernel.target
+scalar_kernel(kernel::GraphReplicatedKernel) = kernel.target
 
 """
     plate(spec::KernelSpec; have, want, batched, reduce = :+) -> PreparedKernel
