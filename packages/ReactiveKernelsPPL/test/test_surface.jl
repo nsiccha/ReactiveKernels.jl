@@ -5,7 +5,10 @@ using Test
 
 # Surface tests: `@rkppl` blocks lower to the same unbound plans a careful
 # hand-build produces (type-exact plan equality), bind through the call and
-# immediate forms, and fail loudly on every non-slice shape. Three
+# immediate forms, and fail loudly on every non-slice shape. Broadcasting
+# is explicit throughout (`mu = a .+ b .* x`, `y .~ Normal.(mu, sigma)`):
+# factored and un-factored programs lower to identical plans, and
+# Julia-invalid vector spellings fail naming the dotted fix. Three
 # end-to-end roundtrips (gaussian/bernoulli/poisson) pin the
 # surface→plan→kernel→value chain against Distributions.jl oracles.
 # Helpers from the earlier includes (_gen_columns, _ref_gaussian,
@@ -73,8 +76,8 @@ _unexp(responses, predictors, priors, params = SampledParameter[],
         a ~ Normal(0, 1)
         b ~ Normal(0, 2)
         sigma ~ Exponential(1)
-        mu = a + b * x
-        y ~ Normal(mu, sigma)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, sigma)
     end
     @test m isa RKPPLModel
     cols, _ = _gen_columns()
@@ -93,8 +96,8 @@ end
     m = @rkppl begin
         a ~ Normal(0, 1)
         b ~ Normal(0, 2)
-        eta = a + b * x
-        y ~ Bernoulli(logistic(eta))
+        eta = a .+ b .* x
+        y .~ Bernoulli.(logistic.(eta))
     end
     cols, _ = _gen_columns()
     y = repeat([false, true], 3)
@@ -109,8 +112,8 @@ end
 
 @testset "surface roundtrip poisson end to end" begin
     m = @rkppl begin
-        eta = a + b * x
-        y ~ Poisson(exp(eta))
+        eta = a .+ b .* x
+        y .~ Poisson.(exp.(eta))
     end
     cols, _ = _gen_columns()
     cols[:y] = [0, 1, 2, 1, 3, 2]
@@ -129,8 +132,8 @@ end
     # Bernoulli: stated intercept prior, defaulted slope prior.
     got = lower_rkppl(quote
         a ~ Normal(0, 5)
-        eta = a + b * x
-        y ~ Bernoulli(logistic(eta))
+        eta = a .+ b .* x
+        y .~ Bernoulli.(logistic.(eta))
     end, (:y, :x))
     want = _unexp(
         LikelihoodSpec[LikelihoodSpec(BernoulliLogitFam, LogitLink, :y, :eta,
@@ -147,8 +150,8 @@ end
     got = lower_rkppl(quote
         a ~ Normal(0, 1)
         c ~ Normal(0, 2)
-        mu = a + c[g] + o
-        y ~ Normal(mu, 1.5)
+        mu = a .+ c[g] .+ o
+        y .~ Normal.(mu, 1.5)
     end, (:y, :g, :o))
     want = _unexp(
         LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, 1.5,
@@ -166,8 +169,8 @@ end
     # Weighted response (object-first HOF, Distributions.jl argument order).
     got = lower_rkppl(quote
         s ~ Exponential(1)
-        mu = a + b * x
-        y ~ weighted(Normal(mu, s), w)
+        mu = a .+ b .* x
+        y .~ weighted.(Normal.(mu, s), w)
     end, (:y, :x, :w))
     want = _unexp(
         LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :s,
@@ -184,8 +187,8 @@ end
     @test _plans_equal(got, want)
     # Truncated (object form, literal bounds) and censored (column bounds).
     got = lower_rkppl(quote
-        mu = a + b * x
-        y ~ truncated(Normal(mu, s), 0, 10)
+        mu = a .+ b .* x
+        y .~ truncated.(Normal.(mu, s), 0, 10)
         s ~ Exponential(1)
     end, (:y, :x))
     want = _unexp(
@@ -202,16 +205,16 @@ end
             nothing, :s)])
     @test _plans_equal(got, want)
     got = lower_rkppl(quote
-        mu = a + b * x
-        y ~ censored(Normal(mu, s), lo, hi)
+        mu = a .+ b .* x
+        y .~ censored.(Normal.(mu, s), lo, hi)
         s ~ Exponential(1)
     end, (:y, :x, :lo, :hi))
     @test got.responses[1].evidence ==
         ResponseEvidence(:censored, :lo, :hi)
     # Interval (object + upper only; the response is the lower endpoint).
     got = lower_rkppl(quote
-        mu = a + b * x
-        y ~ interval_censored(Normal(mu, s), hi)
+        mu = a .+ b .* x
+        y .~ interval_censored.(Normal.(mu, s), hi)
         s ~ Exponential(1)
     end, (:y, :x, :hi))
     @test got.responses[1].evidence ==
@@ -229,8 +232,8 @@ end
         half_n = length(x) / 2
         s2 = s
         k = 2
-        mu = a + b * x
-        y ~ Normal(mu, s2)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, s2)
     end, (:y, :x))
     want = _unexp(
         LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :s2,
@@ -259,7 +262,7 @@ end
         a ~ Normal(1, 2)
         b ~ Normal(3, 4)
         s ~ Exponential(1)
-        y ~ Normal(a - b * x, s)
+        y .~ Normal.(a .- b .* x, s)
     end, (:y, :x))
     @test length(got.predictors) == 1
     @test got.predictors[1].name === :y_eta
@@ -269,9 +272,9 @@ end
             PopulationPrior(:y_eta, :x, -3.0, 4.0)]
     # Shared predictor across two responses lowers once.
     got = lower_rkppl(quote
-        mu = a + b * x
-        y1 ~ Normal(mu, s)
-        y2 ~ Normal(mu, s)
+        mu = a .+ b .* x
+        y1 .~ Normal.(mu, s)
+        y2 .~ Normal.(mu, s)
         s ~ Exponential(1)
     end, (:y1, :y2, :x))
     @test length(got.predictors) == 1
@@ -280,14 +283,14 @@ end
     # Leading docstring-to-be is ignored in slice 1.
     got = lower_rkppl(quote
         "my model"
-        mu = a + b * x
-        y ~ Normal(mu, 2.0)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, 2.0)
     end, (:y, :x))
     @test length(got.responses) == 1
     # Strip-list macros unwrap.
     got = lower_rkppl(quote
-        mu = a + b * x
-        @inbounds y ~ Normal(mu, 2.0)
+        mu = a .+ b .* x
+        @inbounds y .~ Normal.(mu, 2.0)
     end, (:y, :x))
     @test length(got.responses) == 1
 end
@@ -297,8 +300,8 @@ end
     yv, xv = cols[:y], cols[:x]
     m = @rkppl begin
         a ~ Normal(0, 1)
-        mu = a + b * x
-        y ~ Normal(mu, 2.0)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, 2.0)
     end
     b1 = m(; y = yv, x = xv)
     @test isbound(b1)
@@ -306,15 +309,15 @@ end
     # Immediate NamedTuple form lowers+binds the same plan.
     b2 = @rkppl (y = yv, x = xv) begin
         a ~ Normal(0, 1)
-        mu = a + b * x
-        y ~ Normal(mu, 2.0)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, 2.0)
     end
     @test _plans_equal(b1, b2)
     # Immediate dict form (String keys accepted).
     b3 = @rkppl Dict("y" => yv, "x" => xv) begin
         a ~ Normal(0, 1)
-        mu = a + b * x
-        y ~ Normal(mu, 2.0)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, 2.0)
     end
     @test _plans_equal(b1, b3)
     # The captured model is reusable across binds.
@@ -322,21 +325,21 @@ end
     @test _plans_equal(b1, b4)
     @test_throws SurfaceLoweringError m(; y = 1.0)
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        y ~ Normal(mu, 1.0)
+        y .~ Normal.(mu, 1.0)
     end, (:y, 42))
 end
 
 @testset "surface one-sided bounds and factor refs" begin
     # ±Inf normalizes to a missing side (Distributions.jl one-sided spelling).
     got = lower_rkppl(quote
-        mu = a + b * x
-        y ~ truncated(Normal(mu, s), -Inf, 4)
+        mu = a .+ b .* x
+        y .~ truncated.(Normal.(mu, s), -Inf, 4)
         s ~ Exponential(1)
     end, (:y, :x))
     @test got.responses[1].evidence == ResponseEvidence(:truncated, nothing, 4)
     got = lower_rkppl(quote
-        mu = a + b * x
-        y ~ truncated(Normal(mu, s), 0, Inf)
+        mu = a .+ b .* x
+        y .~ truncated.(Normal.(mu, s), 0, Inf)
         s ~ Exponential(1)
     end, (:y, :x))
     @test got.responses[1].evidence ==
@@ -346,15 +349,15 @@ end
         Expr(ex.head, (_swap999(a, v) for a in ex.args)...) :
         (ex == -999 ? v : ex)
     ast = _swap999(quote
-        mu = a + b * x
-        y ~ censored(Normal(mu, s), -999, 4)
+        mu = a .+ b .* x
+        y .~ censored.(Normal.(mu, s), -999, 4)
         s ~ Exponential(1)
     end, -Inf)
     got = lower_rkppl(ast, (:y, :x))
     @test got.responses[1].evidence == ResponseEvidence(:censored, nothing, 4)
     ast = _swap999(quote
-        mu = a + b * x
-        y ~ censored(Normal(mu, s), 0, -999)
+        mu = a .+ b .* x
+        y .~ censored.(Normal.(mu, s), 0, -999)
         s ~ Exponential(1)
     end, Inf)
     got = lower_rkppl(ast, (:y, :x))
@@ -362,13 +365,13 @@ end
         ResponseEvidence(:censored, 0, nothing)
     # Crossed infinities are degenerate, not missing.
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b * x
-        y ~ truncated(Normal(mu, s), Inf, 4)
+        mu = a .+ b .* x
+        y .~ truncated.(Normal.(mu, s), Inf, 4)
         s ~ Exponential(1)
     end, (:y, :x))
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b * x
-        y ~ truncated(Normal(mu, s), 0, -Inf)
+        mu = a .+ b .* x
+        y .~ truncated.(Normal.(mu, s), 0, -Inf)
         s ~ Exponential(1)
     end, (:y, :x))
     # One-sided surface evidence binds, builds, and values end to end.
@@ -376,8 +379,8 @@ end
         a ~ Normal(0, 1)
         b ~ Normal(0, 2)
         s ~ Exponential(1)
-        mu = a + b * x
-        y ~ truncated(Normal(mu, s), -Inf, 4.0)
+        mu = a .+ b .* x
+        y .~ truncated.(Normal.(mu, s), -Inf, 4.0)
     end
     cols, _ = _gen_columns()
     bound = m(; y = cols[:y], x = cols[:x])
@@ -396,8 +399,8 @@ end
     _check_gradient(built.spec, bound, u)
     # treatment(g, ref) pins the reference level; bare g stays ref 1.
     got = lower_rkppl(quote
-        mu = a + c[treatment(g, 3)]
-        y ~ Normal(mu, 1.0)
+        mu = a .+ c[treatment(g, 3)]
+        y .~ Normal.(mu, 1.0)
     end, (:y, :x, :g))
     @test _terms_equal(got.predictors[1].terms[2],
         TermSpec(FactorTerm, [:g], (contrasts = :treatment, ref = 3), :g,
@@ -406,25 +409,25 @@ end
         PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0),
             PopulationPrior(:mu, :g, 0.0, 1.0)]
     got = lower_rkppl(quote
-        mu = a + c[treatment(g)]
-        y ~ Normal(mu, 1.0)
+        mu = a .+ c[treatment(g)]
+        y .~ Normal.(mu, 1.0)
     end, (:y, :x, :g))
     @test got.predictors[1].terms[2].options == (contrasts = :treatment, ref = 1)
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + c[treatment(g, 0)]
-        y ~ Normal(mu, 1.0)
+        mu = a .+ c[treatment(g, 0)]
+        y .~ Normal.(mu, 1.0)
     end, (:y, :x, :g))
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + c[treatment(g, r)]
-        y ~ Normal(mu, 1.0)
+        mu = a .+ c[treatment(g, r)]
+        y .~ Normal.(mu, 1.0)
     end, (:y, :x, :g))
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + c[treatment(gg, 3)]
-        y ~ Normal(mu, 1.0)
+        mu = a .+ c[treatment(gg, 3)]
+        y .~ Normal.(mu, 1.0)
     end, (:y, :x, :g))
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + c[sumcode(g)]
-        y ~ Normal(mu, 1.0)
+        mu = a .+ c[sumcode(g)]
+        y .~ Normal.(mu, 1.0)
     end, (:y, :x, :g))
 end
 
@@ -436,8 +439,8 @@ end
         s ~ Exponential(1)
         lx = log.(e)
         z = (x .- mean(x)) ./ std(x)
-        mu = a + b * z + lx
-        y ~ Normal(mu, s)
+        mu = a .+ b .* z .+ lx
+        y .~ Normal.(mu, s)
     end, (:y, :x, :e))
     want = _unexp(
         LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :s,
@@ -466,92 +469,147 @@ end
         w = lx .+ 1
         v = lx
         b ~ Normal(0, 1)
-        mu = a + b * x
-        y ~ Normal(mu, 1.0)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, 1.0)
     end, (:y, :x))
     @test Set(a.name for a in got.assignments) == Set([:m, :t, :u])
     @test Set(d.name for d in got.derived) == Set([:lx, :w, :v])
-    # Nested reductions must stage; undotted math hints the dotted form.
+    # Nested reductions must stage (contract owns nesting).
     @test_throws ContractValidationError lower_rkppl(quote
         z = mean(log.(x))
-        mu = a + b * x
-        y ~ Normal(mu, 1.0)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, 1.0)
     end, (:y, :x))
+    # Undotted math over vectors fails at the surface, as in Julia.
     m = @rkppl begin
         lx = log(x)
-        mu = a + b * x
-        y ~ Normal(mu, 1.0)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, 1.0)
     end
-    @test_throws ContractValidationError m(; y = [1.0], x = [2.0])
+    @test_throws SurfaceLoweringError m(; y = [1.0], x = [2.0])
     # Factors, weights, and evidence take raw columns only.
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + c[z]
-        y ~ Normal(mu, 1.0)
+        mu = a .+ c[z]
+        y .~ Normal.(mu, 1.0)
         z = x .+ 1
     end, (:y, :x))
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b * x
-        y ~ weighted(Normal(mu, 1.0), w)
+        mu = a .+ b .* x
+        y .~ weighted.(Normal.(mu, 1.0), w)
         w = x .+ 1
     end, (:y, :x))
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b * x
-        y ~ truncated(Normal(mu, 1.0), lo, 5.0)
+        mu = a .+ b .* x
+        y .~ truncated.(Normal.(mu, 1.0), lo, 5.0)
         lo = x .+ 1
     end, (:y, :x))
     # Coefficients cannot leak into derived columns.
     @test_throws SurfaceLoweringError lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
-        mu = a + b * x
+        mu = a .+ b .* x
         z = x .* b
-        y ~ Normal(mu, 1.0)
+        y .~ Normal.(mu, 1.0)
     end, (:y, :x))
     # Dotted-unknown calls fail at the surface with vocabulary guidance.
     @test_throws SurfaceLoweringError lower_rkppl(quote
         m = myfun.(x)
-        mu = a + b * x
-        y ~ Normal(mu, 1.0)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, 1.0)
     end, (:y, :x))
-    # Chaining over derived is rejected: vector structure does not inline,
-    # so the combination belongs directly in the predictor (or dotted).
-    @test_throws SurfaceLoweringError lower_rkppl(quote
+    # Chaining inlines: the factored and un-factored forms lower to the
+    # SAME plan (naming a subexpression never changes legality).
+    chained = lower_rkppl(quote
         z = x .- mean(x)
-        mu = a + d * z
-        t = mu + c * x
-        y ~ Normal(t, 1.0)
+        mu = a .+ d .* z
+        t = mu .+ c .* x
+        y .~ Normal.(t, 1.0)
     end, (:y, :x))
-    # The un-chained form lowers: predictor over derived + raw.
-    got = lower_rkppl(quote
+    flat = lower_rkppl(quote
         z = x .- mean(x)
-        t = a + d * z + c * x
-        y ~ Normal(t, 1.0)
+        t = a .+ d .* z .+ c .* x
+        y .~ Normal.(t, 1.0)
     end, (:y, :x))
-    @test length(got.predictors) == 1
-    @test got.predictors[1].name === :t
-    @test Set(t.addressee for t in got.predictors[1].terms) ==
+    @test _plans_equal(chained, flat)
+    @test length(chained.predictors) == 1
+    @test chained.predictors[1].name === :t
+    @test Set(t.addressee for t in chained.predictors[1].terms) ==
         Set([:Intercept, :z, :x])
-    @test isempty(got.assignments)
-    @test length(got.derived) == 1 && got.derived[1].name === :z
+    @test isempty(chained.assignments)
+    @test length(chained.derived) == 1 && chained.derived[1].name === :z
+    # Julia-valid undotted scalar-array ops normalize to the dotted form.
+    dotted = lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ Normal.(mu, 1.0)
+    end, (:y, :x))
+    plain = lower_rkppl(quote
+        mu = a .+ b * x
+        y .~ Normal.(mu, 1.0)
+    end, (:y, :x))
+    @test _plans_equal(dotted, plain)
+    got = lower_rkppl(quote
+        z = x / 2
+        mu = a .+ b .* z
+        y .~ Normal.(mu, 1.0)
+    end, (:y, :x))
+    @test repr(got.derived[1].expr) == repr(:(x ./ 2))
+    # Anonymous interactions extract to synthetic locals; the named form
+    # addresses its own column.
+    got = lower_rkppl(quote
+        mu = a .+ b .* (x .* z)
+        y .~ Normal.(mu, 1.0)
+    end, (:y, :x, :z))
+    @test length(got.derived) == 1
+    @test got.derived[1].name === :_rkppl_synth_1
+    @test repr(got.derived[1].expr) == repr(:(x .* z))
+    @test _terms_equal(got.predictors[1].terms[2],
+        TermSpec(ContinuousTerm, [:_rkppl_synth_1], NamedTuple(),
+            :_rkppl_synth_1, :_rkppl_synth_1_term))
+    named = lower_rkppl(quote
+        w = x .* z
+        mu = a .+ b .* w
+        y .~ Normal.(mu, 1.0)
+    end, (:y, :x, :z))
+    @test named.predictors[1].terms[2].addressee === :w
+    # Anonymous offsets extract too (sign folds into the column).
+    got = lower_rkppl(quote
+        mu = a .- log.(x)
+        y .~ Normal.(mu, 1.0)
+    end, (:y, :x))
+    @test length(got.derived) == 1
+    @test repr(got.derived[1].expr) ==
+        repr(Expr(:call, :.-, :(log.(x))))
+    @test got.predictors[1].terms[2].kind === OffsetTerm
+    # Non-coefficient parameters stay addressable inside derived locals.
+    got = lower_rkppl(quote
+        s ~ Exponential(1)
+        w = s .+ x
+        mu = a .+ w
+        y .~ Normal.(mu, 1.0)
+    end, (:y, :x))
+    @test _terms_equal(got.predictors[1].terms[2],
+        TermSpec(OffsetTerm, [:w], NamedTuple(), :w, :w_off))
+    @test length(got.derived) == 1 && got.derived[1].name === :w
+    @test length(got.parameters) == 1 && got.parameters[1].name === :s
 end
 
 @testset "surface error paths" begin
     Dn = (:y, :x)
     # Control flow, target, reserved macros.
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b * x
+        mu = a .+ b .* x
         for i in 1:3
-            y ~ Normal(mu, 1.0)
+            y .~ Normal.(mu, 1.0)
         end
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b * x
-        y ~ Normal(mu, 1.0)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, 1.0)
         target += 1.0
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         @plate for i in 1:3
-            y[i] ~ Normal(mu, 1.0)
+            y[i] ~ Normal.(mu, 1.0)
         end
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -560,179 +618,256 @@ end
         end
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b * x
+        mu = a .+ b .* x
         if a > 0
-            y ~ Normal(mu, 1.0)
+            y .~ Normal.(mu, 1.0)
         end
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         theta::real ~ Normal(0, 1)
-        mu = a + b * x
-        y ~ Normal(mu, 1.0)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, 1.0)
     end, Dn)
     # Distributions must be Distributions.jl (julianic, never Stan).
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b * x
-        y ~ normal(mu, 1.0)
+        mu = a .+ b .* x
+        y .~ normal.(mu, 1.0)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b * x
-        y ~ Bernoulli(mu)
+        mu = a .+ b .* x
+        y .~ Bernoulli.(mu)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b * x
-        y ~ BernoulliLogit(mu)
+        mu = a .+ b .* x
+        y .~ BernoulliLogit.(mu)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b * x
-        y ~ Poisson(mu)
+        mu = a .+ b .* x
+        y .~ Poisson.(mu)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b * x
-        y ~ MvNormal(mu, 1.0)
+        mu = a .+ b .* x
+        y .~ MvNormal.(mu, 1.0)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         s ~ positive(Normal(0, 1))
-        mu = a + b * x
-        y ~ Normal(mu, s)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, s)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b * x
-        y ~ truncated(normal, 0, 10, mu, 1.0)
+        mu = a .+ b .* x
+        y .~ truncated.(normal, 0, 10, mu, 1.0)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         t ~ flat()
-        mu = a + b * x
-        y ~ Normal(mu, 1.0)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, 1.0)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b * x
-        y ~ weighted(Normal, w, mu, 1.0)
+        mu = a .+ b .* x
+        y .~ weighted.(Normal, w, mu, 1.0)
     end, (:y, :x, :w))
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b * x
-        y ~ interval_censored(Normal, y, hi, mu, 1.0)
+        mu = a .+ b .* x
+        y .~ interval_censored.(Normal, y, hi, mu, 1.0)
     end, (:y, :x, :hi))
     # Predictor shape violations.
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b
-        y ~ Normal(mu, 1.0)
+        mu = a .+ b
+        y .~ Normal.(mu, 1.0)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b * x + c * x
-        y ~ Normal(mu, 1.0)
+        mu = a .+ b .* x .+ c .* x
+        y .~ Normal.(mu, 1.0)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a + x * z
-        y ~ Normal(mu, 1.0)
+        y .~ Normal.(mu, 1.0)
     end, (:y, :x, :z))
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b * d
-        y ~ Normal(mu, 1.0)
+        mu = a .+ b .* d
+        y .~ Normal.(mu, 1.0)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = 1.5 + b * x
-        y ~ Normal(mu, 1.0)
+        mu = 1.5 .+ b .* x
+        y .~ Normal.(mu, 1.0)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = o
-        y ~ Normal(mu, 1.0)
+        y .~ Normal.(mu, 1.0)
     end, (:y, :x, :o))
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b[g, h]
-        y ~ Normal(mu, 1.0)
+        mu = a .+ b[g, h]
+        y .~ Normal.(mu, 1.0)
     end, (:y, :x, :g, :h))
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b * x
-        t = mu + c * x
-        y ~ Normal(t, 1.0)
+        mu = a .+ b .* x
+        t = mu .+ c .* x
+        y .~ Normal.(t, 1.0)
     end, Dn)
     # Name discipline.
     @test_throws SurfaceLoweringError lower_rkppl(quote
         x = 1.0
-        mu = a + b * x
-        y ~ Normal(mu, 1.0)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, 1.0)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         a ~ Normal(0, 1)
         a ~ Normal(0, 2)
-        mu = a + b * x
-        y ~ Normal(mu, 1.0)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, 1.0)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         theta ~ Normal(0, 1)
-        mu = a + b * x
-        y ~ Normal(theta, 1.0)
+        mu = a .+ b .* x
+        y .~ Normal.(theta, 1.0)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b * x
-        y1 ~ Normal(mu, 1.0)
-        y2 ~ Poisson(exp(mu))
+        mu = a .+ b .* x
+        y1 .~ Normal.(mu, 1.0)
+        y2 .~ Poisson.(exp.(mu))
     end, (:y1, :y2, :x))
     # Coefficient prior discipline.
     @test_throws SurfaceLoweringError lower_rkppl(quote
         b ~ Cauchy(0, 1)
-        mu = a + b * x
-        y ~ Normal(mu, 1.0)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, 1.0)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         m ~ Normal(0, 1)
         b ~ Normal(m, 1)
-        mu = a + b * x
-        y ~ Normal(mu, 1.0)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, 1.0)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu1 = a + b * x
-        mu2 = a + c * x
-        y1 ~ Normal(mu1, 1.0)
-        y2 ~ Normal(mu2, 1.0)
+        mu1 = a .+ b .* x
+        mu2 = a .+ c .* x
+        y1 .~ Normal.(mu1, 1.0)
+        y2 .~ Normal.(mu2, 1.0)
     end, (:y1, :y2, :x))
     @test_throws SurfaceLoweringError lower_rkppl(quote
         s ~ Exponential(b)
-        mu = a + b * x
-        y ~ Normal(mu, s)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, s)
+    end, Dn)
+    # Scalar structure that cannot identify: stray Normal names inline to
+    # a second intercept (degenerate), bare scalar parameters and staged
+    # reductions in predictors have no term slot.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        m ~ Normal(0, 1)
+        w = m .+ x
+        mu = a .+ w
+        y .~ Normal.(mu, 1.0)
+    end, Dn)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        s ~ Exponential(1)
+        mu = a .+ s .+ x
+        y .~ Normal.(mu, 1.0)
+    end, Dn)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        m = mean(x)
+        mu = a .+ m
+        y .~ Normal.(mu, 1.0)
     end, Dn)
     # Wrappers, bounds, broadcast, miscellany.
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b * x
-        y ~ truncated(Normal(mu, 1.0), s, 10)
+        mu = a .+ b .* x
+        y .~ truncated.(Normal.(mu, 1.0), s, 10)
         s ~ Exponential(1)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b * x
-        y ~ interval_censored(mu, hi)
+        mu = a .+ b .* x
+        y .~ interval_censored.(mu, hi)
     end, (:y, :x, :hi))
     @test_throws SurfaceLoweringError lower_rkppl(quote
         @. mu = a + b * x
-        y ~ Normal(mu, 1.0)
+        y .~ Normal.(mu, 1.0)
+    end, Dn)
+    # `~` over data is scalar-only: vector responses broadcast with `.~`
+    # (even a dotted object under `~` fails the kind check).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y ~ Normal.(mu, 1.0)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y ~ Normal(mu, 1.0)
     end, Dn)
+    # `.~` over a non-data name is not a response.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        theta .~ Normal.(0, 1)
+    end, Dn)
+    # Undotted objects and links under `.~` name the dotted fix.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ Normal(mu, 1.0)
+    end, Dn)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        eta = a .+ b .* x
+        y .~ Bernoulli.(logistic(eta))
+    end, Dn)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ truncated.(Normal(mu, 1.0), 0, 10)
+    end, Dn)
+    # Per-observation scales need plate plumbing (planned).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ Normal.(mu, x)
+    end, Dn)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        w = x .+ 1
+        mu = a .+ b .* x
+        y .~ Normal.(mu, w)
+    end, Dn)
+    # N-ary undotted products with a vector operand do not lower.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ 2 * 3 * x
+        y .~ Normal.(mu, 1.0)
+    end, Dn)
+    # Distributions and response-only wrappers are not values.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        m = Normal(0, 1)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, 1.0)
+    end, Dn)
+    # Synthetic names dodge user definitions (fresh-name generation).
+    got = lower_rkppl(quote
+        _rkppl_synth_1 = x .+ 1
+        mu = a .+ b .* (x .* _rkppl_synth_1)
+        y .~ Normal.(mu, 1.0)
+    end, Dn)
+    @test Set(d.name for d in got.derived) ==
+        Set([:_rkppl_synth_1, :_rkppl_synth_2])
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        w = treatment(g, 1)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, 1.0)
+    end, (:y, :x, :g))
     @test_throws SurfaceLoweringError lower_rkppl(quote
         m = myfun(x)
-        mu = a + b * x
-        y ~ Normal(mu, 1.0)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, 1.0)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b * x
-        y ~ Normal(mu, sigma; tol = 1)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, sigma; tol = 1)
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a + b * x
-        y ~ weighted(truncated(Normal, 0, 10, mu, 1.0), w)
+        mu = a .+ b .* x
+        y .~ weighted.(truncated(Normal, 0, 10, mu, 1.0), w)
     end, (:y, :x, :w))
     @test_throws SurfaceLoweringError lower_rkppl(quote
         s ~ Normal(0, 2 * m)
         m ~ Normal(0, 1)
-        mu = a + b * x
-        y ~ Normal(mu, 1.0)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, 1.0)
     end, Dn)
     # A response-less block fails structural validation, not lowering.
     @test_throws ContractValidationError lower_rkppl(quote
         a ~ Normal(0, 1)
-        mu = a + b * x
+        mu = a .+ b .* x
     end, (:y, :x))
     # Macro-shape errors fire at expansion (parsed+evaled at runtime so the
     # throw is catchable here instead of at file parse; eval wraps the
