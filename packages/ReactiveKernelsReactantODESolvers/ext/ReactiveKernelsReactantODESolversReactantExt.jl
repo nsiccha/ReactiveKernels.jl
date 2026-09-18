@@ -2,8 +2,8 @@
 #
 # The traced program is a single `@trace while` loop over fixed-shape buffers:
 # the adaptive accept/reject logic blends via `ifelse` (no traced branches),
-# all stage math is the shared vectorized core from the parent package, and
-# saveat emission accumulates into a tuple of per-point columns threaded by
+# each step calls the standard prepared `tsit5_stage` kernel, and saveat
+# emission accumulates into a tuple of per-point columns threaded by
 # structural recursion. Hyperparameters are concrete closure constants; only
 # `u0` and (optionally) `p` are traced.
 #
@@ -25,12 +25,21 @@
 #   Reactant's overlay and lowers the pullback into the program.
 # - Enzyme reverse through a `@trace while` needs `checkpointing =
 #   Binomial(b)` (revolve over a fixed budget), `track_numbers = false`,
-#   a single-comparison condition over a pure `+1` counter, and a
-#   constant bound: `Periodic(n)` fails even on a trivial loop, a
-#   compound `(a < b) & (c < d)` cond fails analysis even with `Binomial`
-#   ("no known iteration count"), and a select-on-IV saturating counter
-#   segfaults the Binomial reverse transform. Early exit is therefore a
+#   a single-comparison condition over a pure `+1` counter, and a constant
+#   bound. The three rejected shapes fail differently (each probed minimal
+#   on a trivial loop): `Periodic(n)` dies at XLA lowering
+#   (`stablehlo.dynamic_pad` untranslatable); a compound `(a < b) & (c < d)`
+#   cond fails analysis under either scheme ("no known iteration count");
+#   a select-on-IV saturating counter segfaults the Binomial reverse
+#   transform (`reverseBinomial`/`popCache`). Early exit is therefore a
 #   per-iteration freeze, not a second clause or a saturated counter.
+#   Measured freeze cost (strato2, 2026-09-18, Reactant 0.2.285; 2-state
+#   decay converging in 53 native attempts): maxiters=150 executes in
+#   0.20 ms, maxiters=2000 in 0.72 ms — ~0.28 µs per frozen iteration,
+#   bitwise-identical values at both bounds. Execution wall time scales
+#   with the bound, not the difficulty; status semantics are unchanged
+#   (exhaustion still reports from the unreached `t1`), and compile time
+#   is bound-independent (same program shape, new constants).
 # - never place complementary comparisons (`x <= c` and `x > c`) on one
 #   traced value that can be NaN: the optimizer derives one from the
 #   other, wrong for NaN. Test `isnan` explicitly instead.
@@ -79,6 +88,11 @@ function RKRO.traceable_ode_closure(f, cfg::RKRO.ReactantTsit5Config,
     two_T = one_T + one_T
     half_T = one_T / two_T
     qoldinit_T = T(RKRO.TSIT5_QOLDINIT)
+    # The step runs through the standard prepared kernel (concrete, once):
+    # prepared calls lower through Reactant via the core traced-slot
+    # machinery, primal and reverse. `inv_n` likewise concrete.
+    kstep = RKRO.prepare_tsit5_stage()
+    inv_n = T(inv(n))
 
     function body(u0, p)
         # Traced-zero origin: every loop-carried scalar derives from it so
@@ -121,7 +135,9 @@ function RKRO.traceable_ode_closure(f, cfg::RKRO.ReactantTsit5Config,
             # forms 0 * non-finite partials into live shadows (NaN
             # gradients). Every update from the dummy is discarded below.
             dt_step = ifelse(active, dt_use, one_tr)
-            taken = RKRO.tsit5_step(f, u, k1, p, t, dt_step, tab, atol, rtol)
+            taken_u, taken_k, taken_EEst = kstep(f, u, k1, p, t,
+                dt_step, tab, atol, rtol, inv_n)
+            taken = (u=taken_u, k=taken_k, EEst=taken_EEst)
             EEst = taken.EEst
             accept = EEst <= one_tr
             q, q11 = RKRO.pi_factors(EEst, qold)

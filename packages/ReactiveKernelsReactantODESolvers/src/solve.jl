@@ -98,9 +98,8 @@ function solve_ode(f, u0::AbstractVector, tspan, ::Tsit5=Tsit5(); p=nothing,
     u = Vector{T}(u0)
     tab = Tsit5Tableau{T}()
     dense = Tsit5DenseCoefficients{T}()
-    # The step runs on the plain functional implementation below (see the
-    # kernel-boundary note in kernels.jl for why the kernel mirror is not on
-    # this hot path).
+    # Each step below runs through `tsit5_step`, which executes the standard
+    # `tsit5_stage` kernel graph functionally (see kernels.jl).
 
     save_sorted = _prepare_saveat(saveat, t0, t1, tdir, T)
 

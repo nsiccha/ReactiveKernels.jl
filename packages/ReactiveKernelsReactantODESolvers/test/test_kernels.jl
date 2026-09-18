@@ -1,5 +1,6 @@
 # Standard-kernel expression of the Tsit5 stage block: the kernel graph
-# prepares, infers, and reproduces the plain functional step bit-for-bit.
+# prepares, infers, and its two executors — functional (native) and prepared
+# (traced) — agree bit-for-bit.
 using ReactiveKernels: KernelSpec, PreparedKernel
 
 const TSIT5_KERNEL = RKRO.prepare_tsit5_stage()
@@ -30,7 +31,7 @@ end
     @test Rt == Tuple{Vector{Float64},NTuple{7,Vector{Float64}},Float64}
 end
 
-@testset "stage kernel parity with plain step" begin
+@testset "functional and prepared executors agree bit-for-bit" begin
     cases = (
         (exponential_decay, [1.0, 2.0], [0.5, 1.5], 0.0, 0.1, 1e-10, 1e-8),
         (exponential_decay, Float32[1.0, 2.0], Float32[0.5, 1.5], 0.0f0,

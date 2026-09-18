@@ -15,17 +15,17 @@
 # - The stage tuple is bound to the named port `kk`: only named ports can be
 #   `want` targets.
 #
-# Kernel boundary, honestly: this mirror is proven but NOT on either hot
-# path, and both reasons are structural, not incidental.
-# - Native: routing `solve_ode` through the prepared kernel breaks
-#   plain-Enzyme reverse through the solve (`IllegalTypeAnalysisException`
-#   on the executor's `Union{Missing,Bool}` restart bookkeeping), which the
-#   native-gradient contract forbids working around. The leaner
-#   `prepare_nonallocating` executor needs the optional MutatingFunctions
-#   extension — a new dependency, out of scope.
-# - Traced: the prepared executor is in-place (0-alloc); Reactant traces
-#   only the functional out-of-place form, so the traced driver consumes
-#   the plain step.
+# Execution boundary, honestly: the graph above is the single source of truth
+# for the step, executed through two standard-derived executors.
+# - Native (`solve_ode` via `tsit5_step`): the `lower`ed plan body evaluated
+#   functionally (`stage_functional` below). Plain Enzyme reverse works
+#   through it; routing native execution through the prepared kernel instead
+#   breaks Enzyme (`IllegalTypeAnalysisException` on the executor's
+#   `Union{Missing,Bool}` restart bookkeeping, plus mutation discipline the
+#   contract forbids working around).
+# - Traced (the Reactant ext): the prepared kernel itself, called per step.
+#   Prepared calls lower through Reactant — primal and reverse — via the
+#   core traced-slot machinery.
 # The adaptive loop itself (accept/reject, PI control, guards) is
 # driver-level in both paths: kernels express straight-line dataflow, not
 # data-dependent control.
@@ -69,12 +69,73 @@ end
 """
     prepare_tsit5_stage() -> PreparedKernel
 
-Prepare [`tsit5_stage`](@ref) over its full have/want boundary. Used by the
-parity tests; see the kernel-boundary note above for why the hot paths stay
-on the plain step.
+Prepare [`tsit5_stage`](@ref) over its full have/want boundary. The
+Reactant-traced driver calls this kernel per step; prepared calls lower
+through Reactant (primal and reverse) via the core traced-slot machinery.
 """
 function prepare_tsit5_stage()
     prepare(tsit5_stage;
         have=(:f, :uprev, :k1, :p, :t, :dt, :tab, :atol, :rtol, :inv_n),
         want=(:u, :kk, :EEst))
+end
+
+# Functional evaluation of the same graph for the native path. The stateful
+# prepared executor is Enzyme-hostile (see the boundary note above), so the
+# native driver executes the `lower`ed plan body instead: `lower` turns the
+# plan into straight-line code over `(__ops__, ports...)`, and the generator
+# below bakes the ops in as constants and drops `__ops__`, yielding a plain
+# Julia function with static dispatch — which is why plain Enzyme reverse
+# works through it. Generated (not `eval`ed) so the product is always fresh:
+# no `__init__`, no precompilation staleness, no load order. The ops tuple
+# has no public accessor, so it comes from the private `_lower_with_ops` —
+# pinned by the ReactiveKernels compat entry, guarded by the parity tests and
+# the fail-fast signature check below, and filed as a core snag requesting a
+# public functional-lowering surface.
+const TSIT5_STAGE_PORTS = (:f, :uprev, :k1, :p, :t, :dt, :tab, :atol, :rtol,
+    :inv_n)
+
+function _bake_stage_ops!(ex::Expr, ops::Tuple)
+    # Replace every `__ops__[i]` (literal index) with the constant op value.
+    # Anything else shaped like an ops reference is a core-shape change that
+    # must fail loudly here, not miscompile silently downstream.
+    for (i, a) in enumerate(ex.args)
+        if a === :__ops__
+            error("bare __ops__ reference (not a literal ref): $ex")
+        elseif a isa Expr
+            if a.head === :ref && length(a.args) == 2 && a.args[1] === :__ops__
+                idx = a.args[2]
+                idx isa Integer || error("non-literal __ops__ index: $idx")
+                ex.args[i] = QuoteNode(ops[idx])
+            else
+                _bake_stage_ops!(a, ops)
+            end
+        end
+    end
+    ex
+end
+
+"""
+    stage_functional(f, uprev, k1, p, t, dt, tab, atol, rtol, inv_n)
+
+[`tsit5_stage`](@ref) evaluated functionally: the standard-planned,
+`lower`ed graph body with baked-in ops. Bitwise identical to the prepared
+kernel; Enzyme-clean. Valid inputs only (no validation branches).
+"""
+@generated function stage_functional(f, uprev, k1, p, t, dt, tab, atol,
+        rtol, inv_n)
+    spec_plan = plan(tsit5_stage; have=TSIT5_STAGE_PORTS,
+        want=(:u, :kk, :EEst))
+    lowered, ops, _ = ReactiveKernels._lower_with_ops(spec_plan;
+        inline_embedded=false)
+    sig = lowered.args[1]
+    sig.args[1] === :__ops__ ||
+        error("lower() signature changed shape: $sig")
+    names = map(sig.args[2:end]) do a
+        a isa Symbol ? a : (a isa Expr && a.head === :(::) ? a.args[1] :
+            error("lower() signature changed shape: $sig"))
+    end
+    Tuple(names) == TSIT5_STAGE_PORTS ||
+        error("lower() port order changed: $names")
+    body = _bake_stage_ops!(deepcopy(lowered.args[2]), ops)
+    body
 end
