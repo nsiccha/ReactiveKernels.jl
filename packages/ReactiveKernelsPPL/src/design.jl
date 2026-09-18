@@ -63,7 +63,7 @@ function _term_block(t::TermSpec, columns, label)
         return DesignBlock(OffsetTerm, only(t.columns), t.addressee, 0, Symbol[], [], 0)
     elseif t.kind === FactorTerm
         col = only(t.columns)
-        levels = sort(unique(columns[col]))
+        levels = _grouping_levels(columns[col])
         ref = t.options.ref
         labels = Symbol[]
         for (i, level) in enumerate(levels)

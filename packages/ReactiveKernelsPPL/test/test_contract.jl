@@ -89,6 +89,9 @@ end
         (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm)
     @test :log in admitted_functions()
     @test :sum in admitted_functions()
+    ops, fns = admitted_elementwise()
+    @test Symbol(".+") in ops && Symbol(".*") in ops && Symbol(".==") in ops
+    @test :log in fns && :exp in fns
     @test supports_term(:factor)
     @test !supports_term(:zscale)
     @test !supports_term(:hsgp)

@@ -1,13 +1,16 @@
 # Program generator: StructuralPlan → self-contained `@kernel` program.
 #
-# Emission order per program: preprocessing recipes (data-only, folded by
-# `bound=`) → layout transforms (unconstrained → constrained) → scalar
-# assignments in topo order → linear predictors → per-response plate
-# likelihoods over distribution-kernel endpoints → prior terms → canonical
-# `prior`/`likelihood`/`log_jacobian`/`posterior` nodes. Plates compile to
-# allocation-free loops with shared work hoisted; constraining stays
-# hand-rolled (no bijectors). The `@kernel` def is evaluated in the
-# dedicated `PPLGeneratedModels` scope (counter-suffixed binding per build).
+# Emission order per program: layout transforms (unconstrained →
+# constrained) → scalar + derived assignments in topo order → preprocessing
+# recipes (data-only, folded by `bound=`) → linear predictors →
+# per-response plate likelihoods over distribution-kernel endpoints → prior
+# terms → canonical `prior`/`likelihood`/`log_jacobian`/`posterior` nodes.
+# Recipes sit after assignments because design/offset blocks may reference
+# derived-column locals; folding is input-driven, so position changes
+# nothing for data-only recipes. Plates compile to allocation-free loops
+# with shared work hoisted; constraining stays hand-rolled (no bijectors).
+# The `@kernel` def is evaluated in the dedicated `PPLGeneratedModels` scope
+# (counter-suffixed binding per build).
 
 """
     build_kernel(plan) -> (; spec, layout)
@@ -38,11 +41,11 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     isbound(plan) || throw(ContractValidationError(
         "[generator] kernel_expr requires a bound plan (bind_data first)"))
     stmts = Expr[]
-    append!(stmts, preprocessing_recipes(plan))
     for e in layout.entries
         append!(stmts, transform_statements(e))
     end
     append!(stmts, _assignment_statements(plan))
+    append!(stmts, preprocessing_recipes(plan))
     append!(stmts, _predictor_statements(plan))
     append!(stmts, _likelihood_statements(plan))
     append!(stmts, _prior_statements(plan))
@@ -88,11 +91,15 @@ function _eval_kernel_def(def::Expr)
     return Core.eval(PPLGeneratedModels, name)
 end
 
-# Scalar assignments in topo order (params already constrained above, so
-# every scalar name resolves). Unannotated: Int temporaries (e.g. `length`)
+# Scalar + derived assignments in topo order (params already constrained
+# above, so every scalar name resolves; derived columns resolve as locals
+# for the recipes below). Unannotated: Int temporaries (e.g. `length`)
 # must not meet a Float64 assertion.
 function _assignment_statements(plan::StructuralPlan)
-    by_name = Dict{Symbol,AssignmentSpec}(a.name => a for a in plan.assignments)
+    by_name = Dict{Symbol,Any}(a.name => a for a in plan.assignments)
+    for d in plan.derived
+        by_name[d.name] = d
+    end
     return Expr[:($(name) = $(by_name[name].expr))
         for name in topological_order(plan) if haskey(by_name, name)]
 end

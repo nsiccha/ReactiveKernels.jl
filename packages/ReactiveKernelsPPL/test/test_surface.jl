@@ -24,6 +24,8 @@ _plans_equal(a::StructuralPlan, b::StructuralPlan) =
     all(_params_equal.(a.parameters, b.parameters)) &&
     length(a.assignments) == length(b.assignments) &&
     all(_assigns_equal.(a.assignments, b.assignments)) &&
+    length(a.derived) == length(b.derived) &&
+    all(_deriveds_equal.(a.derived, b.derived)) &&
     a.columns == b.columns && a.n_obs === b.n_obs && a.roles == b.roles
 
 _resps_equal(a::LikelihoodSpec, b::LikelihoodSpec) =
@@ -57,9 +59,14 @@ _params_equal(a::SampledParameter, b::SampledParameter) =
 _assigns_equal(a::AssignmentSpec, b::AssignmentSpec) =
     a.name === b.name && repr(a.expr) == repr(b.expr) && a.label === b.label
 
+_deriveds_equal(a::VectorAssignmentSpec, b::VectorAssignmentSpec) =
+    a.name === b.name && repr(a.expr) == repr(b.expr) && a.label === b.label
+
 _unexp(responses, predictors, priors, params = SampledParameter[],
-        assigns = AssignmentSpec[]) = StructuralPlan(responses, predictors,
-    priors, params, assigns, Dict{Symbol,AbstractVector}(), 0)
+        assigns = AssignmentSpec[],
+        derived = VectorAssignmentSpec[]) = StructuralPlan(responses,
+    predictors, priors, params, assigns, Dict{Symbol,AbstractVector}(), 0;
+    derived = derived)
 
 @testset "surface roundtrip gaussian end to end" begin
     m = @rkppl begin
@@ -419,6 +426,113 @@ end
         mu = a + c[sumcode(g)]
         y ~ Normal(mu, 1.0)
     end, (:y, :x, :g))
+end
+
+@testset "surface derived columns" begin
+    # z-scored continuous + log offset, all bound raw.
+    got = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 2)
+        s ~ Exponential(1)
+        lx = log.(e)
+        z = (x .- mean(x)) ./ std(x)
+        mu = a + b * z + lx
+        y ~ Normal(mu, s)
+    end, (:y, :x, :e))
+    want = _unexp(
+        LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :s,
+            nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink,
+            TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(),
+                    :Intercept, :intercept),
+                TermSpec(ContinuousTerm, [:z], NamedTuple(), :z, :z_term),
+                TermSpec(OffsetTerm, [:lx], NamedTuple(), :lx, :lx_off)],
+            :mu)],
+        PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0),
+            PopulationPrior(:mu, :z, 0.0, 2.0)],
+        SampledParameter[SampledParameter(:s, :exponential, (arg1 = 1,),
+            nothing, :s)],
+        AssignmentSpec[],
+        VectorAssignmentSpec[VectorAssignmentSpec(:lx, :(log.(e)), :lx),
+            VectorAssignmentSpec(:z, :((x .- mean(x)) ./ std(x)), :z)])
+    @test _plans_equal(got, want)
+    # Classification: reductions and scalar refs stay scalar, aliases and
+    # dotted forms go vector, staged chains resolve.
+    got = lower_rkppl(quote
+        m = mean(x)
+        t = m + 1
+        lx = log.(x)
+        u = mean(lx)
+        w = lx .+ 1
+        v = lx
+        b ~ Normal(0, 1)
+        mu = a + b * x
+        y ~ Normal(mu, 1.0)
+    end, (:y, :x))
+    @test Set(a.name for a in got.assignments) == Set([:m, :t, :u])
+    @test Set(d.name for d in got.derived) == Set([:lx, :w, :v])
+    # Nested reductions must stage; undotted math hints the dotted form.
+    @test_throws ContractValidationError lower_rkppl(quote
+        z = mean(log.(x))
+        mu = a + b * x
+        y ~ Normal(mu, 1.0)
+    end, (:y, :x))
+    m = @rkppl begin
+        lx = log(x)
+        mu = a + b * x
+        y ~ Normal(mu, 1.0)
+    end
+    @test_throws ContractValidationError m(; y = [1.0], x = [2.0])
+    # Factors, weights, and evidence take raw columns only.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a + c[z]
+        y ~ Normal(mu, 1.0)
+        z = x .+ 1
+    end, (:y, :x))
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a + b * x
+        y ~ weighted(Normal(mu, 1.0), w)
+        w = x .+ 1
+    end, (:y, :x))
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a + b * x
+        y ~ truncated(Normal(mu, 1.0), lo, 5.0)
+        lo = x .+ 1
+    end, (:y, :x))
+    # Coefficients cannot leak into derived columns.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        mu = a + b * x
+        z = x .* b
+        y ~ Normal(mu, 1.0)
+    end, (:y, :x))
+    # Dotted-unknown calls fail at the surface with vocabulary guidance.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        m = myfun.(x)
+        mu = a + b * x
+        y ~ Normal(mu, 1.0)
+    end, (:y, :x))
+    # Chaining over derived is rejected: vector structure does not inline,
+    # so the combination belongs directly in the predictor (or dotted).
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        z = x .- mean(x)
+        mu = a + d * z
+        t = mu + c * x
+        y ~ Normal(t, 1.0)
+    end, (:y, :x))
+    # The un-chained form lowers: predictor over derived + raw.
+    got = lower_rkppl(quote
+        z = x .- mean(x)
+        t = a + d * z + c * x
+        y ~ Normal(t, 1.0)
+    end, (:y, :x))
+    @test length(got.predictors) == 1
+    @test got.predictors[1].name === :t
+    @test Set(t.addressee for t in got.predictors[1].terms) ==
+        Set([:Intercept, :z, :x])
+    @test isempty(got.assignments)
+    @test length(got.derived) == 1 && got.derived[1].name === :z
 end
 
 @testset "surface error paths" begin
