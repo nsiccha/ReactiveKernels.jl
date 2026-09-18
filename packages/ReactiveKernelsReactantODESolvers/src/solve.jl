@@ -45,6 +45,7 @@ end
 Solve `du/dt = f(u, p, t)` from `u0` over `tspan = (t0, t1)` with the adaptive
 explicit Tsit5 method. `f` is out-of-place (`f(u, p, t)::AbstractVector`),
 `u0` a real vector, `tspan` two distinct finite times (forward or backward).
+`f` must return the state element type at the state length.
 
 Keyword arguments:
 
@@ -78,19 +79,7 @@ function solve_ode(f, u0::AbstractVector, tspan, ::Tsit5=Tsit5(); p=nothing,
         abstol::Real=1e-6, reltol::Real=1e-3, saveat=nothing,
         dt::Union{Real,Nothing}=nothing, dtmin::Real=0.0,
         dtmax::Union{Real,Nothing}=nothing, maxiters::Integer=1_000_000)
-    length(tspan) == 2 ||
-        throw(ArgumentError("tspan must hold exactly two times"))
-    t0_in, t1_in = tspan[1], tspan[2]
-    (t0_in isa Real && t1_in isa Real) ||
-        throw(ArgumentError("tspan times must be real"))
-    isfinite(t0_in) && isfinite(t1_in) ||
-        throw(ArgumentError("tspan times must be finite"))
-    t0_in != t1_in || throw(ArgumentError("tspan endpoints must differ"))
-    isempty(u0) && throw(ArgumentError("initial state must be non-empty"))
-    T = promote_type(typeof(float(t0_in)), typeof(float(t1_in)), eltype(u0))
-    T <: AbstractFloat ||
-        throw(ArgumentError("state and time must resolve to a floating-point type"))
-    t0, t1 = T(t0_in), T(t1_in)
+    T, t0, t1 = _solve_types(u0, tspan)
     atol = T(abstol)
     rtol = T(reltol)
     (isfinite(atol) && atol >= zero(T) && isfinite(rtol) && rtol >= zero(T)) ||
@@ -113,13 +102,16 @@ function solve_ode(f, u0::AbstractVector, tspan, ::Tsit5=Tsit5(); p=nothing,
     save_sorted = _prepare_saveat(saveat, t0, t1, tdir, T)
 
     saved_t = T[t0]
-    saved_u = Vector{T}[copy(u)]
+    # No copies on save: every stored state is a fresh vector (the functional
+    # core never mutates), so aliasing is safe by construction.
+    saved_u = Vector{T}[u]
 
     local dt_signed::T
     local nfevals::Int
     local k1::Vector{T}
     if dt === nothing
-        dt_signed, f0, spent = initial_dt(f, u, p, t0, tdir, dtmax_T, atol, rtol)
+        dt_signed, f0, spent = _initial_dt(f, u, p, t0, tdir, dtmax_T, atol,
+            rtol)
         nfevals = spent
         k1 = f0
     else
@@ -192,7 +184,7 @@ function solve_ode(f, u0::AbstractVector, tspan, ::Tsit5=Tsit5(); p=nothing,
             k1 = step.k[7]
             if saveat === nothing
                 push!(saved_t, t)
-                push!(saved_u, copy(u))
+                push!(saved_u, u)
             end
             naccepted += 1
             qold = max(EEst, T(TSIT5_QOLDINIT))
@@ -217,10 +209,29 @@ function solve_ode(f, u0::AbstractVector, tspan, ::Tsit5=Tsit5(); p=nothing,
 
     if saved_t[end] != t1
         push!(saved_t, t1)
-        push!(saved_u, copy(u))
+        push!(saved_u, u)
     end
     stats = (naccepted=naccepted, nrejected=nrejected, nfevals=nfevals)
     Tsit5Solution(saved_t, saved_u, :Success, stats)
+end
+
+# Shared input promotion for the native driver, `initial_dt`, and the
+# Reactant-traced configuration: validates the state/span pair and resolves
+# the compute float type. Returns `(T, t0::T, t1::T)`.
+function _solve_types(u0::AbstractVector, tspan)
+    length(tspan) == 2 ||
+        throw(ArgumentError("tspan must hold exactly two times"))
+    t0_in, t1_in = tspan[1], tspan[2]
+    (t0_in isa Real && t1_in isa Real) ||
+        throw(ArgumentError("tspan times must be real"))
+    isfinite(t0_in) && isfinite(t1_in) ||
+        throw(ArgumentError("tspan times must be finite"))
+    t0_in != t1_in || throw(ArgumentError("tspan endpoints must differ"))
+    isempty(u0) && throw(ArgumentError("initial state must be non-empty"))
+    T = promote_type(typeof(float(t0_in)), typeof(float(t1_in)), eltype(u0))
+    T <: AbstractFloat ||
+        throw(ArgumentError("state and time must resolve to a floating-point type"))
+    (T, T(t0_in), T(t1_in))
 end
 
 function _prepare_saveat(saveat, t0::T, t1::T, tdir::T,

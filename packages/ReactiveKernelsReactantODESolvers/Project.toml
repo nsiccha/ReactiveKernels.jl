@@ -7,6 +7,12 @@ version = "0.1.0"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 ReactiveKernels = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
 
+[weakdeps]
+Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+
+[extensions]
+ReactiveKernelsReactantODESolversReactantExt = "Reactant"
+
 [compat]
 DifferentiationInterface = "0.7"
 Enzyme = "0.13"
@@ -23,4 +29,5 @@ Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["DifferentiationInterface", "Enzyme", "OrdinaryDiffEqTsit5", "Reactant", "Test"]
+test = ["DifferentiationInterface", "Enzyme", "OrdinaryDiffEqTsit5", "Reactant",
+    "Test"]

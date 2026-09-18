@@ -12,15 +12,18 @@
 # step's `k1`. No separate `b` row is stored.
 
 """
-    Tsit5Tableau{T<:AbstractFloat}
+    Tsit5Tableau{T<:Number}
 
 Explicit Tsit5 tableau: stage nodes `c1..c6` (node of stage 1 is zero), the
 strictly-lower stage matrix rows `a21..a76`, and the embedded-error weights
 `btilde1..btilde7` (fifth- minus fourth-order weights).
 
-`Tsit5Tableau{T}()` fills every entry from the reference coefficients.
+`Tsit5Tableau{T}()` fills every entry from the reference coefficients. The
+bound is `Number` (not `AbstractFloat`) so Reactant can promote the
+container to traced coefficients when the struct is captured by a traced
+loop; native construction always uses concrete floats.
 """
-Base.@kwdef struct Tsit5Tableau{T<:AbstractFloat}
+Base.@kwdef struct Tsit5Tableau{T<:Number}
     c1::T = T(0.161)
     c2::T = T(0.327)
     c3::T = T(0.9)
@@ -58,13 +61,15 @@ Base.@kwdef struct Tsit5Tableau{T<:AbstractFloat}
 end
 
 """
-    Tsit5DenseCoefficients{T<:AbstractFloat}
+    Tsit5DenseCoefficients{T<:Number}
 
 Free fourth-order dense-output coefficients (Tsitouras): `b1(θ)` is
 `θ*evalpoly(θ, r11..r14)` and `bᵢ(θ)` for stages 2..7 is
 `θ²*evalpoly(θ, rᵢ2..rᵢ4)`, so `y(t+θ*dt) = uprev + dt*Σbᵢ(θ)kᵢ`.
+The bound is `Number` for the same traced-loop promotion reason as
+[`Tsit5Tableau`](@ref).
 """
-Base.@kwdef struct Tsit5DenseCoefficients{T<:AbstractFloat}
+Base.@kwdef struct Tsit5DenseCoefficients{T<:Number}
     r11::T = T(1.0)
     r12::T = T(-2.763706197274826)
     r13::T = T(2.9132554618219126)

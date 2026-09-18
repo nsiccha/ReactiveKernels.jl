@@ -23,11 +23,13 @@ using LinearAlgebra
 using ReactiveKernels
 
 export Tsit5, Tsit5Solution, solve_ode
+export initial_dt, ReactantTsit5Config, compile_ode_solve
 
 include("tableau.jl")
 include("controller.jl")
 include("step.jl")
 include("dense.jl")
 include("solve.jl")
+include("reactant.jl")
 
 end # module ReactiveKernelsReactantODESolvers

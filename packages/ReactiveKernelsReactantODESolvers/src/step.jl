@@ -15,11 +15,14 @@ Take one Tsit5 step from `(uprev, t)` with step `dt` and FSAL first stage
 `k1`. Returns `(u = u_proposed, k = (k1, …, k7), EEst = error_estimate)`.
 
 Performs exactly six RHS evaluations. All stage combinations allocate fresh
-vectors; nothing is mutated.
+vectors; nothing is mutated. The state arguments share one element type
+(concrete floats natively, traced numbers under Reactant); the tableau stays
+concrete. `f` must return the stage input's element type at the state
+length.
 """
-function tsit5_step(f, uprev::AbstractVector{T}, k1::AbstractVector{T}, p,
-        t::T, dt::T, tab::Tsit5Tableau{T}, abstol::T,
-        reltol::T) where {T<:AbstractFloat}
+function tsit5_step(f, uprev::AbstractVector, k1::AbstractVector, p, t::Number,
+        dt::Number, tab::Tsit5Tableau{<:Number}, abstol::Number,
+        reltol::Number)
     n = length(uprev)
     length(k1) == n ||
         throw(DimensionMismatch("first stage must match the state length $n"))
@@ -47,10 +50,15 @@ function tsit5_step(f, uprev::AbstractVector{T}, k1::AbstractVector{T}, p,
     (u=u, k=(k1, k2, k3, k4, k5, k6, k7), EEst=EEst)
 end
 
-function _stage(f, tmp::AbstractVector{T}, p, t::T, n::Integer,
-        stage::Integer) where {T<:AbstractFloat}
-    k = Vector{T}(f(tmp, p, t))
+function _stage(f, tmp::AbstractVector, p, t::Number, n::Integer,
+        stage::Integer)
+    k = f(tmp, p, t)
+    k isa AbstractVector ||
+        throw(ArgumentError("RHS must return a vector at stage $stage"))
     length(k) == n || throw(DimensionMismatch(
         "RHS must return a vector of length $n at stage $stage, got $(length(k))"))
+    eltype(k) == eltype(tmp) || throw(ArgumentError(
+        "RHS must return element type $(eltype(tmp)) at stage $stage, " *
+        "got $(eltype(k))"))
     k
 end

@@ -24,3 +24,15 @@ function max_abs_diff(as::AbstractVector{<:AbstractVector},
     @assert length(as) == length(bs)
     maximum(max_abs_diff(a, b) for (a, b) in zip(as, bs))
 end
+
+function central_gradient(f, x::AbstractVector; h=1e-8)
+    g = Vector{Float64}(undef, length(x))
+    for i in eachindex(x)
+        xp = Float64.(x)
+        xm = Float64.(x)
+        xp[i] += h
+        xm[i] -= h
+        g[i] = (f(xp) - f(xm)) / (2h)
+    end
+    g
+end

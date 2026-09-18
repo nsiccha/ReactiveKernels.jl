@@ -37,25 +37,26 @@ end
 
 @testset "automatic initial step" begin
     u0 = [1.0]
-    dt0, f0, spent = RKRO.initial_dt(exponential_decay, u0, [2.0], 0.0, 1.0,
-        5.0, 1e-6, 1e-3)
-    @test spent == 2
-    @test f0 == exponential_decay(u0, [2.0], 0.0)
+    dt0 = initial_dt(exponential_decay, u0, (0.0, 5.0); p=[2.0])
     @test 0.0 < dt0 <= 5.0
 
-    # Backward spans take a negative step.
-    dt0_back, _, _ = RKRO.initial_dt(exponential_decay, u0, [2.0], 5.0, -1.0,
-        5.0, 1e-6, 1e-3)
-    @test dt0_back < 0.0
+    # The public form returns a magnitude in both directions.
+    dt0_back = initial_dt(exponential_decay, u0, (5.0, 0.0); p=[2.0])
+    @test 0.0 < dt0_back <= 5.0
+
+    # The signed core takes a negative step on backward spans.
+    dt0_signed, f0, spent = RKRO._initial_dt(exponential_decay, u0, [2.0],
+        5.0, -1.0, 5.0, 1e-6, 1e-3)
+    @test spent == 2
+    @test f0 == exponential_decay(u0, [2.0], 5.0)
+    @test dt0_signed < 0.0
 
     # Constant RHS skips the curvature probe: 100x the Euler guess.
-    dt0_const, _, spent_const = RKRO.initial_dt((u, p, t) -> [2.0], [1.0],
-        nothing, 0.0, 1.0, 10.0, 1e-6, 1e-3)
-    @test spent_const == 2
+    dt0_const = initial_dt((u, p, t) -> [2.0], [1.0], (0.0, 10.0))
     @test dt0_const ≈ 0.5
 
     # Non-finite initial derivative is reported, not stepped from.
-    dt0_nan, f0_nan, spent_nan = RKRO.initial_dt((u, p, t) -> [NaN], [1.0],
+    dt0_nan, f0_nan, spent_nan = RKRO._initial_dt((u, p, t) -> [NaN], [1.0],
         nothing, 0.0, 1.0, 10.0, 1e-6, 1e-3)
     @test spent_nan == 1
     @test isnan(f0_nan[1])
@@ -78,4 +79,27 @@ end
 
     weights = RKRO.tsit5_dense_weights(0.0, dense)
     @test all(iszero, weights)
+end
+
+@testset "saveat column emission" begin
+    tab = RKRO.Tsit5Tableau{Float64}()
+    dense = RKRO.Tsit5DenseCoefficients{Float64}()
+    uprev = [1.0, 3.0]
+    k1 = lotka_volterra(uprev, LOTKA_PARAMS, 0.0)
+    step = RKRO.tsit5_step(lotka_volterra, uprev, k1, LOTKA_PARAMS, 0.0, 0.1,
+        tab, 1e-6, 1e-3)
+    blank = (zeros(2), zeros(2), zeros(2))
+    saveat = (0.03, 0.07, 0.5)
+
+    cols = RKRO._emit_saveat_cols(blank, saveat, uprev, step.k, 0.0, 0.1,
+        0.0, 0.1, true, dense)
+    @test cols[1] ≈ RKRO.tsit5_dense_eval(uprev, step.k, 0.1, 0.3, dense)
+    @test cols[2] ≈ RKRO.tsit5_dense_eval(uprev, step.k, 0.1, 0.7, dense)
+    # Out-of-window points keep their column.
+    @test cols[3] == zeros(2)
+
+    # Rejected steps emit nothing.
+    cols_rej = RKRO._emit_saveat_cols(blank, saveat, uprev, step.k, 0.0, 0.1,
+        0.0, 0.1, false, dense)
+    @test all(==(zeros(2)), cols_rej)
 end
