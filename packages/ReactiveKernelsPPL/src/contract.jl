@@ -64,12 +64,14 @@ struct ResponseEvidence
 end
 
 """
-    LikelihoodSpec(family, link, response, predictor, scale, weights, evidence, label)
+    LikelihoodSpec(family, link, response, predictor, scale, weights, evidence, label[, range])
 
 One independent response. `scale` is the Gaussian sigma (parameter,
 assignment, or folded literal) and must be `nothing` otherwise. `weights`
 is a frequency/power-objective column (D1); analytic/precision weights fail
-closed emitter-side.
+closed emitter-side. `range` carries a literal `y[1:N]` response range
+(`nothing` = whole column: bare `.~`, `eachindex`, `axes`); it must cover
+`1:n_obs` exactly (checked at bind).
 """
 struct LikelihoodSpec
     family::LikelihoodFamily
@@ -80,7 +82,12 @@ struct LikelihoodSpec
     weights::Union{Nothing,ColumnRef}
     evidence::ResponseEvidence
     label::Symbol
+    range::Union{Nothing,UnitRange{Int}}
 end
+LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
+    label) =
+    LikelihoodSpec(family, link, response, predictor, scale, weights,
+        evidence, label, nothing)
 
 """
     TermSpec(kind, columns, options, addressee, label)
@@ -1012,6 +1019,13 @@ function _validate_responses(plan::StructuralPlan)
         )
         _validate_scale(r, plan)
         _validate_evidence_structure(r, plan)
+        if r.range !== nothing
+            first(r.range) == 1 || _fail(r.label,
+                "response range must start at 1 (got $(r.range)) — " *
+                "ranges cover eachindex exactly, no partial windows")
+            length(r.range) >= 1 || _fail(r.label,
+                "response range $(r.range) is empty")
+        end
     end
     for pred in plan.predictors
         pred.name in used_predictors ||
@@ -1035,6 +1049,11 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         "responses raw (derived responses need shape metadata — planned)")
     haskey(plan.columns, r.response) ||
         _fail(r.label, "response column $(r.response) missing")
+    if r.range !== nothing
+        last(r.range) == plan.n_obs || _fail(r.label,
+            "response range $(r.range) covers $(length(r.range)) cells " *
+            "but n_obs is $(plan.n_obs) — ranges cover eachindex exactly")
+    end
     col = plan.columns[r.response]
     if r.family === BernoulliLogitFam
         eltype(col) === Bool && return nothing

@@ -35,7 +35,7 @@ _resps_equal(a::LikelihoodSpec, b::LikelihoodSpec) =
     a.family === b.family && a.link === b.link && a.response === b.response &&
     a.predictor === b.predictor && a.scale === b.scale &&
     a.weights === b.weights && _evs_equal(a.evidence, b.evidence) &&
-    a.label === b.label
+    a.label === b.label && a.range === b.range
 
 _evs_equal(a::ResponseEvidence, b::ResponseEvidence) =
     a.kind === b.kind && a.lower === b.lower && a.upper === b.upper
@@ -881,4 +881,80 @@ end
         end
         @test err isa LoadError && err.error isa SurfaceLoweringError
     end
+end
+
+# Slice A: range-explicit response LHS (`y[R] .~ ...`) + single-LHS
+# ownership. Self-covering forms lower identically to bare `.~`; literal
+# `1:N` rides the plan and is verified at bind.
+_ranged_ast(lhs) = Expr(:block,
+    LineNumberNode(1), :(a ~ Normal(0, 1)),
+    LineNumberNode(2), :(b ~ Normal(0, 2)),
+    LineNumberNode(3), :(s ~ Exponential(1)),
+    LineNumberNode(4), :(mu = a .+ b .* x),
+    LineNumberNode(5), Expr(:call, :.~, lhs, :(Normal.(mu, s))))
+
+@testset "surface ranged responses y[R]" begin
+    cols, n = _gen_columns()
+    @test n == 6
+    bare = lower_rkppl(_ranged_ast(:y), (:y, :x))
+    @test bare.responses[1].range === nothing
+    # Self-covering forms are plan-identical to bare.
+    for lhs in (:(y[eachindex(y)]), :(y[axes(y, 1)]))
+        got = lower_rkppl(_ranged_ast(lhs), (:y, :x))
+        @test _plans_equal(got, bare)
+        @test got.responses[1].range === nothing
+    end
+    # Literal range rides the plan and values identically end to end.
+    lit = lower_rkppl(_ranged_ast(:(y[1:6])), (:y, :x))
+    @test lit.responses[1].range == 1:6
+    u = [0.5, -0.25, 0.1]
+    @test _query(build_kernel(bind_data(lit, cols)).spec,
+        bind_data(lit, cols), :posterior, u) ==
+        _query(build_kernel(bind_data(bare, cols)).spec,
+            bind_data(bare, cols), :posterior, u)
+    # Mismatched literal range fails at bind, naming both lengths.
+    badn = lower_rkppl(_ranged_ast(:(y[1:5])), (:y, :x))
+    err = try
+        bind_data(badn, cols)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ContractValidationError && occursin("n_obs is 6", err.message)
+    # Structural range violations fail at lowering.
+    for lhs in (:(y[2:6]), :(y[0:6]), :(y[1:0]), :(y[1:n]), :(y[1:2:6]),
+            :(y[eachindex(x)]), :(y[axes(y, 2)]), :(y[axes(x, 1)]),
+            :(y[axes(y)]), :(y[i]), :(y[3]), :(y[:]))
+        @test_throws SurfaceLoweringError lower_rkppl(_ranged_ast(lhs), (:y, :x))
+    end
+    # Scalar tilde over a slice is crossed spelling; dotted LHS is out of scope.
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+        :(mu = a .+ b .* x),
+        Expr(:call, :~, :(y[1:6]), :(Normal.(mu, s)))), (:y, :x))
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+        :(mu = a .+ b .* x),
+        Expr(:call, :.~, :(a.b), :(Normal.(mu, s)))), (:y, :x))
+    # Ownership: a second LHS for y fails naming the first statement's line.
+    err = try
+        lower_rkppl(Expr(:block,
+            LineNumberNode(10), :(mu = a .+ b .* x),
+            LineNumberNode(11), :(y .~ Normal.(mu, s)),
+            LineNumberNode(12),
+            Expr(:call, :.~, :(y[eachindex(y)]), :(Normal.(mu, s)))), (:y, :x))
+        nothing
+    catch e
+        e
+    end
+    @test err isa SurfaceLoweringError &&
+        occursin("defined twice", err.message) &&
+        occursin("first at line 11", err.message)
+    # Hand-built off-start ranges fail structural validation, not lowering.
+    off = let p = bare
+        rs = [LikelihoodSpec(r.family, r.link, r.response, r.predictor,
+                r.scale, r.weights, r.evidence, r.label, 2:6)
+            for r in p.responses]
+        StructuralPlan(rs, p.predictors, p.population_priors, p.parameters,
+            p.assignments, p.columns, p.n_obs; derived = p.derived)
+    end
+    @test_throws ContractValidationError validate_structure(off)
 end

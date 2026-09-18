@@ -162,8 +162,8 @@ function lower_rkppl(ast, data_names)::StructuralPlan
                                     "— $(s.lhs) is not data (scalar " *
                                     "parameters use `~`)")
             push!(responses,
-                _lower_response(s.lhs, s.rhs, ctx, predictors, pred_idx,
-                    coefuse))
+                _lower_response(s.lhs, s.rhs, s.range, ctx, predictors,
+                    pred_idx, coefuse))
         elseif s.lhs in data
             _sfail("$(s.lhs) is data — vector responses broadcast with " *
                    "`.~` (`$(s.lhs) .~ Normal.(mu, sigma)`); `~` is " *
@@ -517,9 +517,14 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     sample = SampleStmt[]
     det = Pair{Symbol,Any}[]
     seen = Set{Symbol}()
+    seelines = Dict{Symbol,Int}()
     seen_doc = false
+    line = 0
     for arg in ast.args
-        arg isa LineNumberNode && continue
+        if arg isa LineNumberNode
+            line = arg.line
+            continue
+        end
         if arg isa String && !seen_doc && isempty(sample) && isempty(det)
             seen_doc = true
             continue
@@ -532,18 +537,16 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
         if _is_sample(st) || _is_broadcast_sample(st)
             bc = _is_broadcast_sample(st)
             tilde = bc ? "`.~`" : "`~`"
-            lhs = st.args[2]
-            lhs isa Symbol || _sfail("$tilde left-hand side must be a bare " *
-                                     "Symbol, got $(repr(lhs))")
-            _claim!(seen, lhs)
+            lhs, rng = _sample_lhs(st.args[2], bc, tilde)
+            _claim!(seen, seelines, lhs, line)
             _reject_target(st.args[3], lhs)
-            push!(sample, SampleStmt(lhs, st.args[3], bc))
+            push!(sample, SampleStmt(lhs, st.args[3], bc, rng))
         elseif st.head === :(=) && length(st.args) == 2 && st.args[1] isa Symbol
             lhs = st.args[1]
             lhs === :target && _sfail("no `target` in rkppl models " *
                                       "(density comes only from `~`)")
             lhs in data && _sfail("$lhs is bound data and cannot be redefined")
-            _claim!(seen, lhs)
+            _claim!(seen, seelines, lhs, line)
             _reject_target(st.args[2], lhs)
             push!(det, lhs => st.args[2])
         else
@@ -553,10 +556,17 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     return sample, det
 end
 
-_claim!(seen::Set{Symbol}, nm::Symbol) =
-    nm in seen ?
-    _sfail("single assignment: $nm is defined twice at model level") :
+function _claim!(seen::Set{Symbol}, seelines::Dict{Symbol,Int}, nm::Symbol,
+        line::Int)
+    if nm in seen
+        first = get(seelines, nm, 0)
+        at = first > 0 ? " (first at line $first)" : ""
+        _sfail("single assignment: $nm is defined twice at model level$at")
+    end
     push!(seen, nm)
+    seelines[nm] = line
+    return nothing
+end
 
 _is_sample(st::Expr) =
     st.head === :call && length(st.args) == 3 && st.args[1] === :~
@@ -564,12 +574,79 @@ _is_sample(st::Expr) =
 _is_broadcast_sample(st::Expr) =
     st.head === :call && length(st.args) == 3 && st.args[1] === :.~
 
-"""One `~` / `.~` statement: scalar (`~`) or elementwise (`.~`) density."""
+# Sampling-statement LHS: a bare Symbol, or (`.~` only) a one-dimensional
+# range ref `y[R]`. Returns `(column, range)` with `range === nothing`
+# for bare and self-covering (`eachindex`/`axes`) forms.
+_sample_lhs(lhs::Symbol, bc, tilde) = (lhs, nothing)
+function _sample_lhs(lhs, bc, tilde)
+    lhs isa Expr || _sfail("$tilde left-hand side must be a bare Symbol " *
+                           "or a range ref (`y[1:N]`, `y[eachindex(y)]`), " *
+                           "got $(repr(lhs))")
+    lhs.head === :. && _sfail("dotted left-hand side $(repr(lhs)) does " *
+                              "not lower (nested targets are out of scope)")
+    if lhs.head !== :ref || length(lhs.args) != 2 || !(lhs.args[1] isa Symbol)
+        _sfail("$tilde left-hand side must be a bare Symbol or a " *
+               "one-dimensional range ref (`y[1:N]`), got $(repr(lhs))")
+    end
+    bc || _sfail("sliced response `$(lhs.args[1])[...]` is a vector — " *
+                 "use `.~`, not `~`")
+    col = lhs.args[1]
+    return col, _lower_lhs_range(col, lhs.args[2])
+end
+
+function _lower_lhs_range(col::Symbol, r)
+    # Literal `1:N`: structural cover check now (start 1, non-empty);
+    # `N == n_obs` is verified at bind (the range rides the plan).
+    if r isa Expr && r.head === :call && length(r.args) == 3 && r.args[1] === :(:)
+        lo, hi = r.args[2], r.args[3]
+        lo === 1 || _sfail("response $col range must start at 1 " *
+                           "(got $(repr(r))) — ranges cover eachindex exactly")
+        hi isa Integer || _sfail("response $col range endpoint is " *
+                                 "unbound ($(repr(hi))) — no `n` is bound in " *
+                                 "the surface; write `eachindex($col)` or a " *
+                                 "literal `1:N`")
+        hi >= 1 || _sfail("response $col range $(repr(r)) is empty")
+        return UnitRange(1, Int(hi))
+    end
+    # Self-covering forms: the column's own full index set, by construction.
+    if r isa Expr && r.head === :call && !isempty(r.args) && r.args[1] === :eachindex
+        length(r.args) == 2 && r.args[2] isa Symbol || _sfail(
+            "response $col range takes `eachindex($col)` — " *
+            "got $(repr(r))")
+        r.args[2] === col || _sfail("response $col range covers " *
+                                    "$(r.args[2]), not $col — ranges cover " *
+                                    "their own column exactly " *
+                                    "(`eachindex($col)`)")
+        return nothing
+    end
+    if r isa Expr && r.head === :call && !isempty(r.args) && r.args[1] === :axes
+        length(r.args) == 3 && r.args[2] isa Symbol && r.args[3] == 1 || _sfail(
+            "response $col range takes `axes($col, 1)` — got $(repr(r))")
+        r.args[2] === col || _sfail("response $col range covers " *
+                                    "$(r.args[2]), not $col (`axes($col, 1)`)")
+        return nothing
+    end
+    r === :(:) && _sfail("whole-column `$col[:]` is not admitted — " *
+                            "write the range out (`$col[eachindex($col)]`)")
+    (r isa Symbol || r isa Integer) &&
+        _sfail("scalar cell index `$col[$(r)]` at top level does not " *
+               "lower — per-cell refs live in `@plate` (slice B); " *
+               "broadcast with `.~` or `eachindex`")
+    return _sfail("response $col range must be `1:N`, `eachindex($col)`, " *
+                  "or `axes($col, 1)` — got $(repr(r))")
+end
+
+"""One `~` / `.~` statement: scalar (`~`) or elementwise (`.~`) density.
+`range` carries a literal `y[1:N]` response range (`nothing` = whole
+column: bare LHS, `eachindex`, `axes`)."""
 struct SampleStmt
     lhs::Symbol
     rhs::Any
     broadcast::Bool
+    range::Union{Nothing,UnitRange{Int}}
 end
+SampleStmt(lhs::Symbol, rhs, broadcast::Bool) =
+    SampleStmt(lhs, rhs, broadcast, nothing)
 
 _is_doc_macro(m) =
     m === Symbol("@doc") || (m isa GlobalRef && m.name === Symbol("@doc"))
@@ -710,7 +787,7 @@ function _plain_args(rhs::Expr, what)
     return rhs.args[2:end]
 end
 
-function _lower_response(lhs, rhs, ctx, predictors, pred_idx, coefuse)
+function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse)
     call = _dot2call_response(lhs, rhs)
     weights, call = _peel_weighted(lhs, call, ctx)
     evidence, call = _peel_evidence(lhs, call, ctx)
@@ -719,7 +796,7 @@ function _lower_response(lhs, rhs, ctx, predictors, pred_idx, coefuse)
     pname = _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         coefuse)
     return LikelihoodSpec(family, lik_link, lhs, pname, scale, weights,
-        evidence, Symbol(lhs, "_resp"))
+        evidence, Symbol(lhs, "_resp"), range)
 end
 
 # `.~` takes a dotted distribution object (`Normal.(mu, sigma)`); convert

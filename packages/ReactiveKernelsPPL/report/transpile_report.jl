@@ -97,7 +97,8 @@ function _show_plan(plan::StructuralPlan)
           "predictor $(r.predictor), scale $(_show_scale(r.scale)), " *
           "weights $(r.weights === nothing ? "nothing" : string(r.weights)), " *
           "evidence ($(r.evidence.kind), $(_show_ev(r.evidence.lower)), " *
-          "$(_show_ev(r.evidence.upper))))" for r in plan.responses]
+          "$(_show_ev(r.evidence.upper))), " *
+          "range $(r.range === nothing ? "eachindex" : string(r.range)))" for r in plan.responses]
     ps = ["($(p.name), $(p.link), terms [$([string(t.kind) * " " *
           _show_cols(t.columns) for t in p.terms] |> x -> join(x, ", "))])"
         for p in plan.predictors]
