@@ -175,7 +175,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     ast isa Expr && ast.head === :block ||
         _sfail("lower_rkppl takes a `begin ... end` block AST")
     ast = _expand_submodels(ast, data, mod)
-    sample, det = _partition_statements(ast, data)
+    sample, det, scans = _partition_statements(ast, data)
     detmap = Dict{Symbol,Any}(nm => rhs for (nm, rhs) in det)
     prior_names = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
     normal_priors = Set{Symbol}(s.lhs for s in sample
@@ -203,7 +203,8 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     taken = union(data, Set{Symbol}(nm for (nm, _) in det), prior_names)
     ctx = (; data, detmap = canonmap, prior_names, normal_priors, detshape,
         vecdefs, structural, absorbed = Set{Symbol}(), synth = Ref(0),
-        synth_derived = VectorAssignmentSpec[], taken)
+        synth_derived = VectorAssignmentSpec[], taken,
+        scan_states = Set{Symbol}(s.state for s in scans))
     responses = LikelihoodSpec[]
     predictors = PredictorSpec[]
     pred_idx = Dict{Symbol,Int}()
@@ -247,7 +248,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
         end
     end
     plan = StructuralPlan(responses, predictors, priors, params, assigns,
-        Dict{Symbol,AbstractVector}(), 0; derived = derived)
+        Dict{Symbol,AbstractVector}(), 0; derived = derived, scans = scans)
     validate_structure(plan)
     return plan
 end
@@ -568,6 +569,7 @@ end
 function _partition_statements(ast::Expr, data::Set{Symbol})
     sample = SampleStmt[]
     det = Pair{Symbol,Any}[]
+    scans = ScanSpec[]
     seen = Set{Symbol}()
     seen_doc = false
     for arg in ast.args
@@ -578,6 +580,17 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
         end
         arg isa Expr || _sfail("stray literal $(repr(arg)) at model level " *
                                "(only `~`, `.~`, `=` and reserved macros lower)")
+        # `@scan begin <setup>; for … end end` — a sequential-recurrence block.
+        # Parsed into a `ScanSpec` here; its carried state is claimed as a
+        # model-level latent name.
+        if arg.head === :macrocall && arg.args[1] === Symbol("@scan")
+            (length(arg.args) >= 3 && arg.args[end] isa Expr) ||
+                _sfail("@scan takes a `begin … end` block")
+            sp = parse_scan_block(arg.args[end])
+            _claim!(seen, sp.state)
+            push!(scans, sp)
+            continue
+        end
         arg.head === :block &&
             _sfail("nested `begin` blocks do not lower — flatten the block")
         st = _unwrap_trivia(arg)
@@ -602,7 +615,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             _reject_statement(st)
         end
     end
-    return sample, det
+    return sample, det, scans
 end
 
 _claim!(seen::Set{Symbol}, nm::Symbol) =
@@ -639,10 +652,13 @@ function _unwrap_trivia(st::Expr)
             st = st.args[end]
             continue
         end
-        (m === Symbol("@plate") || m === Symbol("@scan")) && _sfail(
-            "$m needs per-cell/sequential IR support beyond slice 1 " *
+        m === Symbol("@plate") && _sfail(
+            "@plate needs per-cell IR support beyond slice 1 " *
             "(shapes copied from StanBlocks; vector responses broadcast " *
             "with `.~` — `y .~ Normal.(mu, sigma)` over data)")
+        m === Symbol("@scan") && _sfail(
+            "@scan must be a top-level model statement (a `@scan begin … end` " *
+            "block), not nested inside another macro or statement")
         m === Symbol("@.") && _sfail("explicit broadcast (`@.`) does not " *
                                      "lower — write the dots out " *
                                      "(`mu = a .+ b .* x`)")
@@ -1176,6 +1192,10 @@ end
 function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         coefuse)
     if loc isa Symbol
+        # A scan-state latent vector is a direct per-observation location: the
+        # response mean IS the carried state (no linear predictor). Admitted
+        # family/link is checked in `_validate_responses` (Gaussian-identity, v1).
+        loc in ctx.scan_states && return loc
         haskey(ctx.detmap, loc) ||
             return _lower_location_symbol_error(lhs, loc, ctx)
         pname = loc

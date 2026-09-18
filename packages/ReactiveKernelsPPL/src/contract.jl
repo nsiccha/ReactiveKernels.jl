@@ -179,15 +179,68 @@ end
 VectorAssignmentSpec(name::Symbol, expr::Union{Expr,Symbol}) =
     VectorAssignmentSpec(name, expr, name)
 
+"""One literal-index seed fill of a `@scan` carried array: `state[index] ~ Dist(args…)`.
+`family` is an internal family symbol (see the surface's `_PARAM_FAMILIES`); `args`
+are the positional distribution-argument expressions (literals in a seed fill)."""
+struct ScanSetup
+    index::Int
+    family::Symbol
+    args::Vector{Any}
+end
+
+"""
+    ScanStep(kind, target, indexed, family, args, expr)
+
+One `@scan` recurrence-body statement.
+
+- `kind === :sample` — a `~` statement: the carried array at the loop index
+  (`indexed = true`, `target === state`, centered form) or a fresh per-step local
+  innovation (`indexed = false`, non-centered form). `family`/`args` describe the
+  distribution; `expr` is `nothing`.
+- `kind === :assign` — a `=` statement: the carried array's deterministic write
+  (`indexed = true`) or a per-step deterministic local (`indexed = false`).
+  `expr` is the RHS AST; `family`/`args` are `nothing`.
+"""
+struct ScanStep
+    kind::Symbol
+    target::Symbol
+    indexed::Bool
+    family::Union{Symbol,Nothing}
+    args::Union{Vector{Any},Nothing}
+    expr::Any
+end
+
+"""
+    ScanSpec(state, loopvar, lo, hi, setup, step, maxlag, label)
+
+One sequential recurrence (`@scan begin <setup>; for loopvar in lo:hi … end end`):
+the carried array `state`, the loop variable and range `lo:hi` (`hi` a literal `Int`
+or a data length `Symbol`), the ordered `setup` seed fills, the ordered recurrence
+`step`s, and the maximum backward lag read. `state` is the plan-level latent the
+recurrence produces (the value visible after the block); the per-step locals and
+`loopvar` are scoped to the recurrence and never enter the plan name table.
+"""
+struct ScanSpec
+    state::Symbol
+    loopvar::Symbol
+    lo::Int
+    hi::Union{Symbol,Int}
+    setup::Vector{ScanSetup}
+    step::Vector{ScanStep}
+    maxlag::Int
+    label::Symbol
+end
+
 """
     StructuralPlan(responses, predictors, population_priors, parameters,
                    assignments, derived, columns, n_obs)
 
 Complete emitter→thin-layer input. `columns` maps RAW-column names to plain
 vectors (derived columns are never bound — they compute in-graph from
-`derived`); `parameters`, `assignments`, and `derived` share one name table
-(duplicates rejected). N≥1 independent responses; shared predictor Symbols
-allowed.
+`derived`); `parameters`, `assignments`, `derived`, and each `scans` state
+share one name table (duplicates rejected). N≥1 independent responses; shared
+predictor Symbols allowed. `scans` carries sequential-recurrence latents
+(vector-valued); it is empty for a population-GLM plan.
 """
 struct StructuralPlan
     responses::Vector{LikelihoodSpec}
@@ -199,7 +252,23 @@ struct StructuralPlan
     columns::Dict{Symbol,AbstractVector}
     n_obs::Int
     roles::Dict{Symbol,Symbol}
+    scans::Vector{ScanSpec}
 end
+
+# Pre-scan full-positional constructor (9-arg): every caller that built a plan
+# before `scans` existed keeps working with an empty scan set.
+StructuralPlan(
+    responses::Vector{LikelihoodSpec},
+    predictors::Vector{PredictorSpec},
+    population_priors::Vector{PopulationPrior},
+    parameters::Vector{SampledParameter},
+    assignments::Vector{AssignmentSpec},
+    derived::Vector{VectorAssignmentSpec},
+    columns::Dict{Symbol,AbstractVector},
+    n_obs::Int,
+    roles::Dict{Symbol,Symbol}) =
+    StructuralPlan(responses, predictors, population_priors, parameters,
+        assignments, derived, columns, n_obs, roles, ScanSpec[])
 
 """Column roles: what a bound column IS (CV travel + program transforms read
 this). Inferred at bind; explicit roles override. Unbound plans carry none."""
@@ -217,9 +286,10 @@ function StructuralPlan(
         columns::Dict{Symbol,AbstractVector},
         n_obs::Int;
         roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
-        derived::Vector{VectorAssignmentSpec} = VectorAssignmentSpec[])
+        derived::Vector{VectorAssignmentSpec} = VectorAssignmentSpec[],
+        scans::Vector{ScanSpec} = ScanSpec[])
     return StructuralPlan(responses, predictors, population_priors,
-        parameters, assignments, derived, columns, n_obs, roles)
+        parameters, assignments, derived, columns, n_obs, roles, scans)
 end
 
 """Bound ⟺ columns attached. Unbound plans (empty columns) carry structure
@@ -335,6 +405,7 @@ end
 unbound plans alike (the macro lowering + emitter-AST path call this)."""
 function validate_structure(plan::StructuralPlan)
     _validate_name_tables(plan)
+    _validate_scans(plan)
     _validate_assignments_structure(plan)
     _validate_vector_structure(plan)
     _validate_parameters(plan)
@@ -377,31 +448,63 @@ function _validate_name_tables(plan::StructuralPlan)
     params = [p.name for p in plan.parameters]
     assigns = [a.name for a in plan.assignments]
     deriveds = [d.name for d in plan.derived]
+    scanstates = [s.state for s in plan.scans]
     length(unique(params)) == length(params) || _fail(:plan, "duplicate parameter names")
     length(unique(assigns)) == length(assigns) ||
         _fail(:plan, "duplicate assignment names")
     length(unique(deriveds)) == length(deriveds) ||
         _fail(:plan, "duplicate derived-column names")
+    length(unique(scanstates)) == length(scanstates) ||
+        _fail(:plan, "duplicate scan-state names")
     for (l, r, what) in ((params, assigns, "parameters and assignments"),
         (params, deriveds, "parameters and derived columns"),
-        (assigns, deriveds, "assignments and derived columns"))
+        (assigns, deriveds, "assignments and derived columns"),
+        (params, scanstates, "parameters and scan states"),
+        (assigns, scanstates, "assignments and scan states"),
+        (deriveds, scanstates, "derived columns and scan states"))
         overlap = intersect(l, r)
         isempty(overlap) ||
             _fail(:plan, "names in both $what: $(join(overlap, ", "))")
     end
-    allnames = union(params, assigns, deriveds)
+    allnames = union(params, assigns, deriveds, scanstates)
     for pn in pnames
         pn in allnames && _fail(
             :plan,
-            "predictor $pn collides with a parameter/assignment/derived name",
+            "predictor $pn collides with a parameter/assignment/derived/scan name",
         )
         block_name(pn) in allnames && _fail(
             :plan,
-            "parameter/assignment/derived $(block_name(pn)) collides with predictor $pn block name",
+            "parameter/assignment/derived/scan $(block_name(pn)) collides with predictor $pn block name",
         )
     end
-    for n in Iterators.flatten((pnames, params, assigns, deriveds))
+    for n in Iterators.flatten((pnames, params, assigns, deriveds, scanstates))
         _check_name_hygiene(n)
+    end
+    return nothing
+end
+
+# Structural invariants of each sequential recurrence. The surface parser
+# (`parse_scan_block`) already enforces these; this is defense-in-depth for a
+# hand-built plan and the invariants the layout/emitter will rely on.
+function _validate_scans(plan::StructuralPlan)
+    for s in plan.scans
+        s.lo == length(s.setup) + 1 || _fail(s.label,
+            "scan loop start $(s.lo) must be one past the $(length(s.setup)) " *
+            "seed fill(s)")
+        for (k, f) in enumerate(s.setup)
+            f.index == k || _fail(s.label,
+                "scan seed fills must be contiguous 1..$(length(s.setup)); " *
+                "entry $k has index $(f.index)")
+        end
+        s.maxlag >= 1 || _fail(s.label,
+            "a scan must read a backward lag of its carried state (maxlag ≥ 1)")
+        length(s.setup) >= s.maxlag || _fail(s.label,
+            "scan maxlag $(s.maxlag) exceeds the $(length(s.setup)) seeded value(s)")
+        any(st -> st.indexed, s.step) || _fail(s.label,
+            "scan recurrence never writes its carried state $(s.state)")
+        (s.hi isa Int || s.hi isa Symbol) || _fail(s.label,
+            "scan loop bound must be a literal Int or a data length Symbol, " *
+            "got $(repr(s.hi))")
     end
     return nothing
 end
@@ -998,8 +1101,21 @@ function _validate_responses(plan::StructuralPlan)
             "response label collides with a canonical node",
         )
     end
+    scan_states = Set{Symbol}(s.state for s in plan.scans)
     used_predictors = Set{Symbol}()
     for r in plan.responses
+        # A scan-state latent vector location: the mean is the carried state
+        # directly (no linear predictor). Slice 1 admits Gaussian-identity only.
+        if r.predictor in scan_states
+            (r.family === GaussianFam && r.link === IdentityLink) || _fail(
+                r.label,
+                "a scan-state response location ($(r.predictor)) is " *
+                "Gaussian-identity only in slice 1 (got $(r.family)/$(r.link))",
+            )
+            _validate_scale(r, plan)
+            _validate_evidence_structure(r, plan)
+            continue
+        end
         idx = findfirst(p -> p.name === r.predictor, plan.predictors)
         idx === nothing &&
             _fail(r.label, "response addresses unknown predictor $(r.predictor)")
@@ -1192,7 +1308,7 @@ function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
     n = length(first(values(columns)))
     bound = StructuralPlan(plan.responses, plan.predictors,
         plan.population_priors, plan.parameters, plan.assignments,
-        columns, n; roles = merged, derived = plan.derived)
+        columns, n; roles = merged, derived = plan.derived, scans = plan.scans)
     validate_data(bound)
     return bound
 end
