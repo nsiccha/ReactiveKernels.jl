@@ -425,9 +425,44 @@ reg!("normal_5-normal_mixture_k"; mod = :NormalMixtureKExample, build = :build_n
 
 # Frozen-82 EXCLUSION set: these four run ONLY when explicitly requested (RK_ALL80_BATCH mode +
 # explicit ARGS), never in the default full sweep, so all80-benchmark-v1.toml stays the immutable
-# 82-row checkpoint. all80_validate.jl still checks all 86 structurally (inventory 86 == registry 86).
+# 82-row checkpoint.
 const BATCH1_KEYS = Set([
     "diamonds-diamonds", "dogs-dogs_nonhierarchical",
     "ovarian-logistic_regression_rhs", "normal_5-normal_mixture_k"])
+
+# ---------------- IRT incremental additions (todo 0wsjovm) ----------------
+# Four landed idiomatic-RK IRT translations (RK source landed canonical 9043993), registered
+# against their EXISTING upstream Turing make_model (pinned DPPL 6378673 posteriordb_models.jl,
+# SHA256 a7ef985b…) + reference posteriordb-1.0.0 .stan. MEASURED INTO A SEPARATE receipt
+# (all80-irt-v1.toml) under RK_ALL80_BATCH=irt and EXCLUDED from the frozen-82 default sweep
+# (IRT_KEYS below). Registration params mirror the landed acceptance_irt_four_axis.jl (build fn /
+# have-ports / bind), which certifies RK-vs-Stan value+gradient parity at IDENTITY order
+# (⇒ stan_perm = nothing). off_tu DERIVED FROM SOURCE for all four (all 0; see reasons) and
+# GATE-verified measured == declared on the batch run.
+reg!("irt_2pl-irt_2pl"; mod = :Irt2plExample, build = :build_irt_2pl_graph,
+    have = (:unconstrained, :y), bind = d -> (y = Bv(d, "y"),),
+    off_reason = "off_tu=0: bare cauchy/normal/lognormal/bernoulli_logit in irt_2pl.stan (no lccdf) match upstream Turing Flat/FlatPos + manual untruncated logpdf terms (posteriordb_models.jl pdb_irt_2pl:2214, make_model:2242).")
+reg!("fims_Aus_Jpn_irt-2pl_latent_reg_irt"; mod = :TwoplLatentRegIrtExample, build = :build_2pl_latent_reg_irt_graph,
+    have = (:unconstrained, :ii, :jj, :y, :W, :I),
+    bind = d -> (ii = Iv(d, "ii"), jj = Iv(d, "jj"), y = Bv(d, "y"), W = F(d, "W"), I = Is(d, "I")),
+    off_reason = "off_tu=0: lognormal/normal/student_t/bernoulli_logit match term-by-term; Turing replicates Stan obtain_adjustments two-sd branch and ±1 y-encoding (posteriordb_models.jl pdb_2pl_latent_reg_irt:1188, make_model:1205).")
+reg!("sat-hier_2pl"; mod = :Hier2plExample, build = :build_hier_2pl_graph,
+    have = (:unconstrained, :ii, :jj, :y, :I, :J),
+    bind = d -> (ii = Iv(d, "ii"), jj = Iv(d, "jj"), y = Bv(d, "y"), I = Is(d, "I"), J = Is(d, "J")),
+    off_reason = "off_tu=0: MVN-Cholesky/normal/LKJ/exponential/bernoulli match; Turing Exponential(inv(.1)) = Stan exponential(.1); ±1 signs (posteriordb_models.jl pdb_hier_2pl:2066, make_model:2083).")
+reg!("timssAusTwn_irt-gpcm_latent_reg_irt"; mod = :GpcmLatentRegIrtExample, build = :build_gpcm_latent_reg_irt_graph,
+    have = (:unconstrained, :ii, :jj, :y, :W, :I),
+    bind = d -> (ii = Iv(d, "ii"), jj = Iv(d, "jj"), y = Iv(d, "y"), W = F(d, "W"), I = Is(d, "I")),
+    off_reason = "off_tu=0: lognormal/normal/student_t + PCM categorical match; Turing replicates m/pos + two-sd W_adj + step-design (posteriordb_models.jl pdb_gpcm_latent_reg_irt:1947, make_model:1966). NOTE y is Int (levels), not Bool.")
+
+# IRT batch exclusion: same contract as BATCH1_KEYS (explicit RK_ALL80_BATCH=irt request only).
+const IRT_KEYS = Set([
+    "irt_2pl-irt_2pl", "fims_Aus_Jpn_irt-2pl_latent_reg_irt",
+    "sat-hier_2pl", "timssAusTwn_irt-gpcm_latent_reg_irt"])
+
+# Combined incremental-batch exclusion for the default sweep: every post-82 batch lands here,
+# so the selector stays one set. all80_validate.jl still checks all 90 structurally
+# (inventory 90 == registry 90).
+const BATCH_KEYS = union(BATCH1_KEYS, IRT_KEYS)
 
 end # module All80Registry
