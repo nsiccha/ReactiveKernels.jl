@@ -78,8 +78,6 @@ using LogExpFunctions: logistic, log1pexp, logaddexp
 
     parameters = (; omega, p, c)
     (parameters, log_jacobian::Float64) = ((; omega, p, c), jac_omega + jac_p + jac_c)
-    (omega::Float64, p::Float64, c::Float64) =
-        (parameters.omega, parameters.p, parameters.c)
 
     # Flat (implicit uniform) prior over the bounded box → 0.
     log_prior::Float64 = 0.0

@@ -444,14 +444,14 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
 
         x = [0.3, -0.4, 0.2, 0.1, -0.2]
         y = [1.0 6.0; 2.0 7.0; 3.0 8.0; 4.0 9.0; 5.0 10.0]
-        reference = let y = y
-            function (x)
-                m = exp.(x)
-                sum(view(y, :, 1) .* m) + sum(view(y, :, 2) .* m)
-            end
-        end
+        # Explicit `Constant` activity: a `let`-captured matrix defeats
+        # Enzyme's readonly analysis on Julia 1.12
+        # (`EnzymeMutabilityException`) while passing on 1.10; the annotated
+        # form differentiates the identical math on both.
+        reference(x, y) = (m = exp.(x);
+            sum(view(y, :, 1) .* m) + sum(view(y, :, 2) .* m))
         ref_value, ref_grad = DifferentiationInterface.value_and_gradient(
-            reference, TEST_AD_BACKEND, x)
+            reference, TEST_AD_BACKEND, x, DifferentiationInterface.Constant(y))
 
         kernel = prepare(twin_column_like;
                          have = (:x, :y), want = :objective,

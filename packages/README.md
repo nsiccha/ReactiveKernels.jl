@@ -9,6 +9,7 @@ ReactiveKernels
 ├── ReactiveKernelsDistributionKernels
 │   ├── ReactiveKernelsKernelExamples
 │   └── ReactiveKernelsPPLExamples
+├── ReactiveKernelsPPL
 ├── ReactiveKernelsBatchingExamples
 ├── ReactiveKernelsCompatibilityExamples
 ├── ReactiveKernelsNUTSExamples
@@ -22,8 +23,11 @@ docs → every package above
 ```
 
 `ReactiveKernelsDistributionKernels` owns the reusable mathematical
-`KernelSpec`s. The PPL package imports those specs and owns seven nested model
+`KernelSpec`s. The PPL *examples* package imports those specs and owns seven nested model
 modules; it does not copy their formulas or flatten their colliding exports.
+`ReactiveKernelsPPL` is the thin PPL compiler: it consumes a typed structural
+plan and generates fittable `@kernel` programs (layout, transforms,
+preprocessing, sampler queries).
 The general kernel-example package owns the distribution gallery, bijectors,
 fixed-step HMC, and runnable core walkthrough. Batching remains a separate
 package because its public boundary includes DifferentiationInterface cache

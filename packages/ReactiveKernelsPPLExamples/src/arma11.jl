@@ -64,8 +64,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
     # NamedTuple is also an authoritative input boundary.
     parameters = (; μ, φ, θ, σ)
     (parameters, log_jacobian::Float64) = ((; μ, φ, θ, σ), log_σ)
-    (μ::Float64, φ::Float64, θ::Float64, σ::Float64) =
-        (parameters.μ, parameters.φ, parameters.θ, parameters.σ)
 
     # The latent one-step-ahead errors are the sequential heart of the model:
     #   ν₁ = μ + φ·μ (err₀ ≡ 0), errₜ = yₜ − νₜ,

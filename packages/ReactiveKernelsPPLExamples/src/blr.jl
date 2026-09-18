@@ -48,8 +48,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 
     parameters = (; beta, sigma)
     (parameters, log_jacobian::Float64) = ((; beta, sigma), log_sigma)
-    (beta::AbstractVector{Float64}, sigma::Float64) =
-        (parameters.beta, parameters.sigma)
 
     # Priors: betaⱼ ~ Normal(0,10), sigma ~ HalfNormal(0,10) (the lower=0
     # constraint carries the half; Stan drops the log2 constant).

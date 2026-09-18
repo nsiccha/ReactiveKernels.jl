@@ -1842,7 +1842,8 @@ equivalent to `kernel(public_args...)`.
 
 With `materialize_view_copies`, a bound `SubArray` crosses as an owning copy
 (`collect`) of its elements instead of the prebuilt view. A `SubArray`-typed
-`Constant` operand defeats reverse-mode Enzyme static activity analysis (it
+`Constant` operand defeats static-activity analysis under reverse-mode
+automatic differentiation (it
 unboxes the parent pointer into an active slot), while an owning array with
 identical contents differentiates cleanly (snag plain-enzyme-rev-3dc5d563).
 """
@@ -2558,6 +2559,11 @@ function _recipe_line(r::Recipe)
     ins = join([string(v.name) for v in r.inputs], ", ")
     outs = length(r.outputs) == 1 ? string(r.outputs[1].name) :
            "(" * join([string(v.name) for v in r.outputs], ", ") * ")"
+    # Synthesized tuple unpacks read as field access, not as accessor calls.
+    if length(r.inputs) == 1
+        suffix = _unpack_access_suffix(r.op)
+        suffix !== nothing && return "$outs = $(only(r.inputs).name)$suffix"
+    end
     "$outs = $(_opname(r.op))($ins)"
 end
 

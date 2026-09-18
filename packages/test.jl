@@ -9,6 +9,7 @@ const EXAMPLE_PACKAGES = (
     "ReactiveKernelsNUTSExamples",
     "ReactiveKernelsStreamingStats",
     "ReactiveKernelsHMCDiagnostics",
+    "ReactiveKernelsPPL",
     "ReactiveKernelsReactantODESolvers",
 )
 

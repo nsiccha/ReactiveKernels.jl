@@ -17,6 +17,7 @@ See the design brief this package implements for the full rationale.
 module ReactiveKernels
 
 using RuntimeGeneratedFunctions
+using InverseFunctions: inverse, NoInverse
 using LinearAlgebra
 using LogExpFunctions
 using Random
@@ -26,6 +27,7 @@ RuntimeGeneratedFunctions.init(@__MODULE__)
 include("core.jl")
 include("planner.jl")
 include("codegen.jl")
+include("inverse_edges.jl")
 include("partial_evaluation.jl")
 include("nonallocating.jl")
 include("graphops.jl")
