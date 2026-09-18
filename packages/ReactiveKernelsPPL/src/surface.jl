@@ -44,31 +44,76 @@ lowered. Call it with data keywords to lower and bind:
 """
 struct RKPPLModel
     ast::Expr
+    mod::Module
 end
+
+"""
+    RKPPLSubmodel(name, argnames, body, mod)
+
+A captured reusable submodel definition (`@rkppl sm(a, b) = begin … end`),
+mirroring StanBlocks `@slic f(args…)=body`. `argnames` are the positional
+inputs bound by name at the use site; `body` is the block AST — density /
+deterministic `=` statements followed by a trailing RETURN expression whose
+value binds to the use-site LHS; `mod` is the defining module (for symbol
+resolution). Invoked as `latent ~ sm(a, b)` and expanded inline by
+[`lower_rkppl`](@ref) (see `_expand_submodels`): the submodel's own `~`/`=`
+names are namespaced under the LHS (`latent_…`) and spliced into the parent
+plan, so a submodel lowers exactly like a hand-inlined model — transparent and
+reusable, never an opaque node.
+"""
+struct RKPPLSubmodel
+    name::Symbol
+    argnames::Vector{Symbol}
+    body::Expr
+    mod::Module
+end
+
+"""True for the submodel-definition head `sm(args...) = begin ... end`."""
+_is_submodel_def(body) =
+    Meta.isexpr(body, :(=), 2) && Meta.isexpr(first(body.args), :call)
 
 function _check_body_shape(body)
     body isa Expr && body.head === :block && return nothing
-    if Meta.isexpr(body, :(=)) && Meta.isexpr(first(body.args), :call)
-        _sfail("named submodel definitions (`@rkppl sm(args...) = ...`) " *
-               "need composition semantics (planned); the use-site form " *
-               "`y ~ sm(...)` is locked for that slice")
-    end
-    return _sfail("@rkppl takes a `begin ... end` block " *
-                  "(or caller-scope data plus a block)")
+    return _sfail("@rkppl takes a `begin ... end` block, a submodel " *
+                  "definition (`sm(args...) = begin ... end`), or " *
+                  "caller-scope data plus a block")
 end
 
-"""Capture a model block (§ surface.jl for the admitted vocabulary)."""
+"""Build the `sm = RKPPLSubmodel(...)` binding from a submodel definition."""
+function _submodel_def_expr(def::Expr, mod::Module)
+    call, body = def.args[1], def.args[2]
+    name = call.args[1]
+    name isa Symbol || _sfail("submodel name must be a bare Symbol, got " *
+                              "$(repr(name))")
+    argnames = call.args[2:end]
+    for a in argnames
+        a isa Symbol || _sfail("submodel `$name` positional arguments must " *
+                               "be bare Symbols, got $(repr(a))")
+    end
+    body isa Expr && body.head === :block ||
+        _sfail("submodel `$name` body must be a `begin ... end` block")
+    argvec = Expr(:vect, [QuoteNode(a) for a in argnames]...)
+    return esc(:($name = $(RKPPLSubmodel)($(QuoteNode(name)), $argvec,
+                                          $(Meta.quot(body)), $mod)))
+end
+
+"""Capture a model block, or define a reusable submodel
+(`@rkppl sm(args...) = begin ... end`; see [`RKPPLSubmodel`](@ref))."""
 macro rkppl(body)
+    _is_submodel_def(body) && return _submodel_def_expr(body, __module__)
     _check_body_shape(body)
-    return Expr(:call, RKPPLModel, Meta.quot(body))
+    return Expr(:call, RKPPLModel, Meta.quot(body), __module__)
 end
 
 """Capture a model block and immediately lower+bind caller-scope data
 (a `NamedTuple` or dict of columns)."""
 macro rkppl(data, body)
+    _is_submodel_def(body) && _sfail("a submodel definition takes no data " *
+        "(write `@rkppl sm(args...) = begin ... end`); data binds at the " *
+        "use site")
     _check_body_shape(body)
     q = Meta.quot(body)
-    return esc(:($(_bind_immediate)($(RKPPLModel)($q), $data)))
+    return esc(:($(_bind_immediate)($(RKPPLModel)($q, $(__module__)), $data)))
 end
 
 function (m::RKPPLModel)(; kwargs...)
@@ -100,12 +145,12 @@ _check_col(k, v) = v isa AbstractVector ? v :
     _sfail("data column $k must be an AbstractVector, got $(typeof(v))")
 
 function _bind_model(m::RKPPLModel, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(m.ast, keys(cols))
+    plan = lower_rkppl(m.ast, keys(cols); mod = m.mod)
     return bind_data(plan, cols)
 end
 
 """
-    lower_rkppl(ast, data_names) -> StructuralPlan
+    lower_rkppl(ast, data_names; mod=Main) -> StructuralPlan
 
 Lower a captured `@rkppl` block AST to a data-free (unbound) plan.
 `data_names` classifies every `~` / `.~` LHS: data under `.~` is a
@@ -114,8 +159,14 @@ name sits in a predictor coefficient position, a population prior); the
 crossed spellings fail closed (`~` is scalar-only, `.~` broadcasts over
 data). Runs `validate_structure` before returning. The BRM emitter calls
 this entry point directly with ASTs.
+
+`mod` is the module against which `latent ~ sm(args...)` call heads are
+resolved to [`RKPPLSubmodel`](@ref)s; a resolving call is expanded inline
+before partitioning (see `_expand_submodels`). Non-submodel call heads
+(distributions, unknown names) are untouched and screened as before, so the
+default `mod=Main` keeps every non-submodel model unchanged.
 """
-function lower_rkppl(ast, data_names)::StructuralPlan
+function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     data = Set{Symbol}()
     for n in data_names
         n isa Symbol || _sfail("data names must be Symbols, got $(repr(n))")
@@ -123,6 +174,7 @@ function lower_rkppl(ast, data_names)::StructuralPlan
     end
     ast isa Expr && ast.head === :block ||
         _sfail("lower_rkppl takes a `begin ... end` block AST")
+    ast = _expand_submodels(ast, data, mod)
     sample, det = _partition_statements(ast, data)
     detmap = Dict{Symbol,Any}(nm => rhs for (nm, rhs) in det)
     prior_names = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
@@ -611,6 +663,129 @@ function _reject_target(rhs, lhs)
     return nothing
 end
 
+# ── Submodel expansion (StanBlocks-style reusable submodels) ─────────────
+# Runs before partitioning. Every `latent ~ sm(args...)` whose plain-`~` RHS
+# call head resolves in `mod` to an `RKPPLSubmodel` is rewritten into inline
+# statements: the submodel's positional args bind to the call arguments, its
+# own `~`/`=` names are namespaced under the LHS (`latent_…`), and its trailing
+# return expression becomes `latent = <return>`. The result lowers exactly like
+# a hand-inlined model (the submodel is transparent). A `~` whose head is a
+# distribution or unknown name passes through untouched — the ordinary
+# vocabulary screen still applies downstream.
+
+"""Return the [`RKPPLSubmodel`](@ref) a call RHS names in `mod`, or nothing."""
+function _resolve_submodel(rhs, mod::Module)
+    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) || return nothing
+    head = rhs.args[1]
+    head isa Symbol || return nothing
+    isdefined(mod, head) || return nothing
+    val = getfield(mod, head)
+    return val isa RKPPLSubmodel ? val : nothing
+end
+
+# A top-level statement that is a plain `~` whose RHS resolves to a submodel.
+function _stmt_is_submodel_call(arg, data::Set{Symbol}, mod::Module)
+    arg isa Expr || return false
+    st = try
+        _unwrap_trivia(arg)
+    catch
+        return false
+    end
+    st isa Expr && _is_sample(st) || return false
+    _resolve_submodel(st.args[3], mod) === nothing && return false
+    lhs = st.args[2]
+    lhs isa Symbol || return false
+    lhs in data && _sfail("observation-stream submodels (`$lhs ~ sm(...)` " *
+        "with `$lhs` a data column) are the next slice; this slice supports " *
+        "latent submodels (`latent ~ sm(...)`, `latent` not data)")
+    return true
+end
+
+function _expand_submodels(ast::Expr, data::Set{Symbol}, mod::Module)
+    any(_stmt_is_submodel_call(a, data, mod) for a in ast.args) || return ast
+    out = Any[]
+    for arg in ast.args
+        if _stmt_is_submodel_call(arg, data, mod)
+            st = _unwrap_trivia(arg)
+            append!(out, _expand_one_submodel(st.args[2], st.args[3], mod))
+        else
+            push!(out, arg)
+        end
+    end
+    return Expr(:block, out...)
+end
+
+_ns(lhs::Symbol, nm::Symbol) = Symbol(lhs, :_, nm)
+
+# Split a submodel body into (statements, return-expression).
+function _submodel_body_parts(sm::RKPPLSubmodel)
+    items = Any[a for a in sm.body.args if !(a isa LineNumberNode)]
+    isempty(items) && _sfail("submodel `$(sm.name)` has an empty body")
+    ret = last(items)
+    stmts = Any[_unwrap_trivia(st) for st in items[1:end-1]]
+    for st in stmts
+        (st isa Expr && (_is_sample(st) || _is_broadcast_sample(st) ||
+            (st.head === :(=) && length(st.args) == 2 &&
+             st.args[1] isa Symbol))) || _sfail(
+            "submodel `$(sm.name)`: statement `$(repr(st))` is not a `~`/`=` " *
+            "form (submodels are straight-line; the body must end in a return " *
+            "expression)")
+    end
+    (ret isa Expr && (_is_sample(ret) || _is_broadcast_sample(ret) ||
+        (ret.head === :(=) && length(ret.args) == 2))) && _sfail(
+        "submodel `$(sm.name)` must end in a RETURN expression bound to the " *
+        "use-site LHS (a bare value, not a `~`/`=` statement)")
+    return stmts, ret
+end
+
+_stmt_lhs(st::Expr) =
+    (_is_sample(st) || _is_broadcast_sample(st)) ? st.args[2] : st.args[1]
+
+# Reject a nested submodel call (single-level submodels this slice).
+function _reject_nested_submodel(sm::RKPPLSubmodel, st::Expr)
+    rhs = (_is_sample(st) || _is_broadcast_sample(st)) ? st.args[3] : st.args[2]
+    _resolve_submodel(rhs, sm.mod) === nothing || _sfail(
+        "submodel `$(sm.name)` calls another submodel — nested submodels are " *
+        "a follow-up slice; inline it for now")
+end
+
+# Substitute Symbols per `map` everywhere except inside QuoteNodes.
+_subst(ex::Symbol, map::AbstractDict) = get(map, ex, ex)
+_subst(ex::QuoteNode, ::AbstractDict) = ex
+_subst(ex, ::AbstractDict) = ex
+_subst(ex::Expr, map::AbstractDict) =
+    Expr(ex.head, Any[_subst(a, map) for a in ex.args]...)
+
+function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module)
+    sm = _resolve_submodel(callexpr, mod)::RKPPLSubmodel
+    callargs = callexpr.args[2:end]
+    length(callargs) == length(sm.argnames) || _sfail(
+        "submodel `$(sm.name)` expects $(length(sm.argnames)) argument(s) " *
+        "$(Tuple(sm.argnames)), got $(length(callargs)) at `$lhs ~ " *
+        "$(sm.name)(...)`")
+    stmts, ret = _submodel_body_parts(sm)
+    argset = Set{Symbol}(sm.argnames)
+    submap = Dict{Symbol,Any}()
+    for (a, v) in zip(sm.argnames, callargs)
+        submap[a] = v
+    end
+    for st in stmts
+        nm = _stmt_lhs(st)
+        nm in argset && _sfail("submodel `$(sm.name)`: `$nm` is both an " *
+            "argument and a local statement — rename the local")
+        haskey(submap, nm) && _sfail("submodel `$(sm.name)`: `$nm` is " *
+            "assigned twice")
+        submap[nm] = _ns(lhs, nm)
+    end
+    out = Any[]
+    for st in stmts
+        _reject_nested_submodel(sm, st)
+        push!(out, _subst(st, submap))
+    end
+    push!(out, Expr(:(=), lhs, _subst(ret, submap)))
+    return out
+end
+
 # Value-position symbols (call heads and dotted function names excluded):
 # coefficient-discipline scans must not mistake `log` in `log.(z)` for a
 # coefficient named `log`.
@@ -919,9 +1094,10 @@ function _lower_response_base_error(lhs, rhs, fam)
     fam === :PoissonLog && _sfail("response $lhs: write " *
                                   "`Poisson.(exp.(eta))`")
     return _sfail("response $lhs: unknown distribution `$(repr(fam))` " *
-                  "(admitted: Normal, Bernoulli, Poisson). " *
-                  "If `$fam` is a submodel, `y ~ sm(...)` calls need " *
-                  "composition semantics (planned).")
+                  "(admitted: Normal, Bernoulli, Poisson). Latent submodels " *
+                  "resolve as `latent ~ $fam(...)` when `$fam` is a defined " *
+                  "RKPPLSubmodel in scope; observation-stream submodels " *
+                  "(`$lhs .~ $fam(...)`) are a follow-up slice.")
 end
 
 function _lower_link_arg(lhs, arg, wrap)
@@ -1420,9 +1596,9 @@ function _lower_parameter(lhs, rhs, coefuse)
         _sfail("parameter $lhs: unknown distribution `$(repr(fam))` " *
                "(admitted: Normal, Cauchy, Exponential, Gamma, LogNormal, " *
                "Beta, InverseGamma, HalfNormal, HalfCauchy, Flat, " *
-               "truncated). " *
-               "If `$fam` is a submodel, `y ~ sm(...)` calls need " *
-               "composition semantics (planned).")
+               "truncated). If `$fam` is meant as a submodel, define it with " *
+               "`@rkppl $fam(args...) = begin ... end` and make it visible in " *
+               "the lowering module (`mod=`).")
     args = _plain_args(rhs, "`$fam`")
     vals = [_lower_param_arg(lhs, a, coefuse) for a in args]
     argkeys = ntuple(i -> Symbol(:arg, i), length(vals))
