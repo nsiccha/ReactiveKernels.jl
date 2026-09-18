@@ -185,3 +185,84 @@ end
     @test !isempty(dia) &&
         all(r -> occursin("mismatch", r.workload) || occursin("Mb", r.workload), dia)
 end
+
+# IRT incremental render (todo 0wsjovm): same @eval/data contract shape as batch-1 against a
+# SYNTHETIC IRT receipt — Markdown.MD, 4 present, no workload-mismatch series, failed cells
+# surfaced, absent receipt degrades, own path only.
+@testset "irt incremental render contract (synthetic receipt)" begin
+    RKD = ReactiveKernelsDocs
+    bm(dim; failed = false) = begin
+        m = Dict{String,Any}("dim" => dim, "family" => "irt",
+            "primal_rk" => 100.0, "gradient_rk" => 200.0, "hmc_rk_native" => 10.0,
+            "primal_stan" => 150.0, "gradient_stan" => 400.0,
+            "primal_turing" => 160.0, "gradient_turing" => 420.0,
+            "primal_rk_reactant" => 90.0, "gradient_rk_reactant" => 180.0, "hmc_rk_reactant" => 8.0,
+            "parity_pass" => true, "turing_support_ok" => true, "hmc_transitions" => 1000)
+        failed && (m["gradient_rk_reactant"] = "gradient @compile: MethodError …")
+        m
+    end
+    receipt = Dict("schema" => "all80-benchmark-v1", "generated_at" => "synthetic",
+        "models" => Dict("irt_2pl-irt_2pl" => bm(144), "fims_Aus_Jpn_irt-2pl_latent_reg_irt" => bm(200),
+            "sat-hier_2pl" => bm(150), "timssAusTwn_irt-gpcm_latent_reg_irt" => bm(180; failed = true)))
+    path = tempname() * ".toml"; open(path, "w") do io; TOML.print(io, receipt; sorted = true); end
+    @test RKD.render_all80_irt_coverage_plot(path) isa Markdown.MD
+    @test RKD.render_all80_irt_speedup_plot(path) isa Markdown.MD
+    @test RKD.render_all80_irt_coverage_plot(tempname() * ".toml") isa Markdown.MD
+    models = RKD._all80_models(path)
+    @test length(models) == 4
+    irstat = RKD._all80_speedup_rows(models)
+    @test !isempty(irstat) &&
+        all(r -> !occursin("mismatch", r.workload) && !occursin("Mb", r.workload), irstat)
+    cov = RKD._all80_reactant_coverage_rows(models)
+    @test any(r -> r.operation == "gradient" && r.outcome == "failed (diagnostic recorded)", cov)
+    @test RKD._ALL80_IRT_PATH != RKD._ALL80_BENCHMARK_PATH
+    @test RKD._ALL80_IRT_PATH != RKD._ALL80_BATCH1_PATH
+end
+
+@testset "irt REAL receipt contract and certified status" begin
+    RKD = ReactiveKernelsDocs
+    path = RKD._ALL80_IRT_PATH
+    @test isfile(path)
+    receipt = TOML.parsefile(path)
+    expected = Set((
+        "irt_2pl-irt_2pl", "fims_Aus_Jpn_irt-2pl_latent_reg_irt",
+        "sat-hier_2pl", "timssAusTwn_irt-gpcm_latent_reg_irt"))
+    @test Set(keys(get(receipt, "models", Dict()))) == expected
+    models = RKD._all80_models(path)
+    @test all(m -> !haskey(m, "error"), values(models))
+    @test all(m -> get(m, "parity_pass", false) === true, values(models))
+    for cell in ("primal_rk", "gradient_rk", "hmc_rk_native",
+                 "primal_rk_reactant", "gradient_rk_reactant",
+                 "hmc_rk_reactant")
+        @test all(m -> _number_or_reason(get(m, cell, nothing)), values(models))
+    end
+    # Unlike the historical batch-1 run, this receipt IS ordinary-AE certified: the strict
+    # validator must report zero issues.
+    issues = All80Receipt.validate_batch(path;
+        expected_keys = collect(expected), phases = ("native", "reactant"),
+        batch = "irt")
+    @test isempty(issues)
+    summary_text = sprint(show, RKD.render_all80_irt_summary(path))
+    @test occursin("Certified ordinary-AE run", summary_text)
+    @test !occursin("MISSING", summary_text)
+    tables_text = sprint(show, RKD.render_all80_irt_tables(path))
+    @test occursin("IRT batch primal", tables_text)
+    @test occursin("IRT batch HMC", tables_text)
+    @test occursin("Recorded transitions", tables_text)
+    @test occursin("Reactant: 4", tables_text)
+    @test occursin("not a matched-T claim", tables_text)
+    function plot_text(node)
+        html = node.content isa AbstractString ? node.content : node.content[1].content
+        payload = only(match(
+            r"data-rk-exec-payload=\"([^\"]+)\"", html).captures)
+        String(Base64.base64decode(payload))
+    end
+    plots_text = plot_text(RKD.render_all80_irt_coverage_plot(path)) *
+        plot_text(RKD.render_all80_irt_speedup_plot(path))
+    @test occursin("certified", plots_text)
+    @test !occursin("uncertified", plots_text)
+    @test path != RKD._ALL80_BENCHMARK_PATH
+    irspeed = [r for r in RKD._all80_speedup_rows(models)]
+    @test !isempty(irspeed) &&
+        all(r -> !occursin("mismatch", r.workload) && !occursin("Mb", r.workload), irspeed)
+end
