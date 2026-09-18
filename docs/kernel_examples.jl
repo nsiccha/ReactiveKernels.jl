@@ -609,6 +609,18 @@ function setup_gpcm_latent_reg_irt!(mod::Module)
     nothing
 end
 
+function setup_grsm_latent_reg_irt!(mod::Module)
+    if !isdefined(mod, :GrsmLatentRegIrtExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: GrsmLatentRegIrtExample))
+    end
+    # Bind the raw long-form ii/jj/y (ordinal), the covariate matrix W, and the
+    # item count. The displayed PPL assembly derives the category count, the
+    # covariate design, and both sum-to-zero maps in-graph.
+    Core.eval(mod, :(using .GrsmLatentRegIrtExample:
+        GRSM_LR_II, GRSM_LR_JJ, GRSM_LR_Y, GRSM_LR_W, GRSM_LR_I))
+    nothing
+end
+
 function setup_glmm1!(mod::Module)
     if !isdefined(mod, :GLMM1ModelExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: GLMM1ModelExample))
@@ -1213,6 +1225,7 @@ const EXPECTED_PPL_EXAMPLES = (
     :two_pl_latent_reg_irt_posterior,
     :hier_2pl_posterior,
     :gpcm_latent_reg_irt_posterior,
+    :grsm_latent_reg_irt_posterior,
     :glmm1_model_posterior,
     :bym2_offset_only_posterior,
     :bones_model_posterior,

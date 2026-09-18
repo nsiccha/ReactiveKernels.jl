@@ -156,6 +156,7 @@ include("test_soil_incubation_example.jl")
 # posteriordb structured batch
 include("test_hmm_drive_1_example.jl")
 include("test_hmm_drive_0_example.jl")
+include("test_grsm_latent_reg_irt_example.jl")
 include("test_ppl_macro.jl")
 include("test_ppl_posteriordb_parity.jl")
 include("test_ppl_gibbs.jl")

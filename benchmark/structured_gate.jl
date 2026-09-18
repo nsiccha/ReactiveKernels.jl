@@ -123,20 +123,25 @@ function reference_points(sm, dim, seed, name, scale)
 end
 
 _vec_json(v) = "[" * join(Float64.(v), ",") * "]"
+_intvec_json(v) = "[" * join(Int.(v), ",") * "]"
 _mat_json(m) = "[" * join(("[" * join(Float64.(r), ",") * "]" for r in eachrow(m)), ",") * "]"
 # The actual .stan re-instantiated with a modified N (data-only control).
-function bridge_modified_n(name, d, n)
+function bridge_with_json(name, json)
     post = PosteriorDB.posterior(PosteriorDB.database(), name)
     sp = PosteriorDB.path(PosteriorDB.implementation(PosteriorDB.model(post), "stan"))
+    BridgeStan.StanModel(sp, json, 468)
+end
+function bridge_modified_n(name, d, n)
     parts = ["\"K\":$(Int(d["K"]))", "\"N\":$n", "\"u\":$(_vec_json(d["u"][1:n]))",
              "\"v\":$(_vec_json(d["v"][1:n]))", "\"alpha\":$(_mat_json(_mat(d["alpha"])))"]
     haskey(d, "tau") && push!(parts, "\"tau\":$(Float64(d["tau"]))")
     haskey(d, "rho") && push!(parts, "\"rho\":$(Float64(d["rho"]))")
-    BridgeStan.StanModel(sp, "{" * join(parts, ",") * "}", 468)
+    bridge_with_json(name, "{" * join(parts, ",") * "}")
 end
 
 function gate(name; build, have, bind, n_bind, scale = 0.3, seed = 468,
-              do_reactant = true, boundary_point = nothing)
+              do_reactant = true, boundary_point = nothing, mod_data = nothing,
+              reactant_grad = :pin_boundary)
     println("\n########## $name ##########"); flush(stdout)
     push!(_AXES, name => String[])
     # First graph use happens HERE, inside an ordinary function, then again per
@@ -196,7 +201,8 @@ function gate(name; build, have, bind, n_bind, scale = 0.3, seed = 468,
 
     # ---- N controls against the actual .stan with modified data ----
     for n in (1, 3)
-        smn = bridge_modified_n(name, data, n)
+        smn = mod_data === nothing ? bridge_modified_n(name, data, n) :
+              bridge_with_json(name, mod_data(data, n))
         kbn = prepare(build(); have, want = :posterior, bound = n_bind(data, n))
         vn = kbn(pts[1]); vsn = sval(smn, pts[1])
         @assert isfinite(vn) && isfinite(vsn) "$name: N=$n control value not finite"
@@ -225,7 +231,9 @@ function gate(name; build, have, bind, n_bind, scale = 0.3, seed = 468,
         flush(stdout)
     end
 
-    do_reactant && _reactant_axes(name, build, kb, sm, pts, have, bind)
+    do_reactant &&
+        _reactant_axes(name, build, kb, sm, pts, have, bind, data, mod_data,
+                       reactant_grad)
     return
 end
 
@@ -235,7 +243,7 @@ else
     _reactant_axes(args...) = nothing
 end
 
-const KNOWN_MODELS = ("hmm_drive_1", "hmm_drive_0")
+const KNOWN_MODELS = ("hmm_drive_1", "hmm_drive_0", "grsm_latent_reg_irt")
 const SEL = strip.(split(get(ENV, "STRUCTURED_MODELS", join(KNOWN_MODELS, ',')), ','))
 isempty(SEL) && error("STRUCTURED_MODELS selected no models")
 length(unique(SEL)) == length(SEL) ||
@@ -272,6 +280,30 @@ _want("hmm_drive_0") && gate("bball_drive_event_0-hmm_drive_0";
                  alpha = _mat(d["alpha"])),
     scale = 0.5, do_reactant = DO_REACTANT)
 _want("hmm_drive_0") && push!(_RAN, "hmm_drive_0")
+
+# grsm_latent_reg_irt — rating-scale ordinal IRT with a latent ability
+# regression: shared sum-to-zero rating steps (m = max(y) + 1 categories),
+# per-item sum-to-zero difficulties, covariate-adjusted abilities. Bind ONLY
+# the raw index/response arrays and the covariate matrix W (all design
+# construction is in-graph).
+_want("grsm_latent_reg_irt") && gate("science_irt-grsm_latent_reg_irt";
+    build = () -> PE.GrsmLatentRegIrtExample.build_grsm_latent_reg_irt_graph(),
+    have = (:unconstrained, :ii, :jj, :y, :W, :I),
+    bind = d -> (ii = Int.(d["ii"]), jj = Int.(d["jj"]), y = Int.(d["y"]),
+                 W = _mat(d["W"]), I = Int(d["I"])),
+    n_bind = (d, n) -> (ii = Int.(d["ii"][1:n]), jj = Int.(d["jj"][1:n]),
+                 y = Int.(d["y"][1:n]), W = _mat(d["W"]), I = Int(d["I"])),
+    scale = 0.1, do_reactant = DO_REACTANT,
+    # Scan-free matrix-op graph: the compiled gradient is a hard-asserted axis
+    # on the bound-data query (IRT-lane recipe).
+    reactant_grad = :assert,
+    mod_data = (d, n) -> begin
+        "{" * join(["\"I\":$(Int(d["I"]))", "\"J\":$(Int(d["J"]))",
+            "\"K\":$(Int(d["K"]))", "\"N\":$n", "\"ii\":$(_intvec_json(d["ii"][1:n]))",
+            "\"jj\":$(_intvec_json(d["jj"][1:n]))", "\"y\":$(_intvec_json(d["y"][1:n]))",
+            "\"W\":$(_mat_json(_mat(d["W"])))"], ",") * "}"
+    end)
+_want("grsm_latent_reg_irt") && push!(_RAN, "grsm_latent_reg_irt")
 
 # Executed set must equal the selection, exactly once each.
 const _EXPECTED = filter(m -> m in SEL, KNOWN_MODELS)

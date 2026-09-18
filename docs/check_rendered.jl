@@ -336,6 +336,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "2pl-latent-reg-irt.md" => 1,
         "hier-2pl.md" => 1,
         "gpcm-latent-reg-irt.md" => 1,
+        "grsm-latent-reg-irt.md" => 1,
         "glmm1.md" => 1,
         "bym2-offset-only.md" => 1,
         "bones.md" => 1,

@@ -136,6 +136,7 @@ include("soil_incubation.jl")
 # posteriordb structured batch: bball-drive HMMs
 include("hmm_drive_1.jl")
 include("hmm_drive_0.jl")
+include("grsm_latent_reg_irt.jl")
 
 export PPLWorkflow
 
@@ -287,5 +288,6 @@ export SoilIncubationExample
 # posteriordb structured batch: bball-drive HMMs
 export HmmDrive1Example
 export HmmDrive0Example
+export GrsmLatentRegIrtExample
 
 end # module ReactiveKernelsPPLExamples

@@ -5,7 +5,8 @@
 # the same module. The Reactant axes use pts[1] (one probe) — recorded here and
 # in the per-axis accounting.
 
-function _reactant_axes(name, build, kb, sm, pts, have, bind)
+function _reactant_axes(name, build, kb, sm, pts, have, bind, data,
+                        mod_data = nothing, reactant_grad = :pin_boundary)
     q = pts[1]; rq = Reactant.to_rarray(q)
 
     # ---- [3a] Reactant primal of the public ALL-BOUND query vs native ----
@@ -33,19 +34,32 @@ function _reactant_axes(name, build, kb, sm, pts, have, bind)
     # traced eachrow while-lowering (main @ 90acd41c) after this pin; once
     # this tree carries it, the traced-stream count is expected to be 1 and
     # may then be asserted (snag scan-while-claim-5006b5b9 / todo 1wbtwl9).
-    data_bnd = bind(_GATE_DATA[])
-    kb_free = prepare(build(); have, want = :posterior)
-    traced = (Reactant.to_rarray(q),
-              (Reactant.to_rarray(getfield(data_bnd, f)) for f in Base.tail(have))...)
-    kbt = Reactant.compile(kb_free, traced; sync = true)
-    vt = Float64(kbt(traced...))
-    rt = _relv(vt, vn)
-    @assert isfinite(vt) && rt < RPRIMAL_TOL "$name: traced-stream Reactant primal rel=$rt ≥ $RPRIMAL_TOL"
-    traced_hlo = repr(Reactant.@code_hlo optimize = false kb_free(traced...))
-    traced_while = count("stablehlo.while", traced_hlo)
-    traced_bytes = length(codeunits(traced_hlo))
-    _axis!(name, "PASS Reactant primal (traced-stream query) rel=$(round(rt; sigdigits=4)) (1 probe); stablehlo.while=$traced_while, hlo_bytes=$traced_bytes (@code_hlo; measured, not asserted)")
-    println("  [3b] Reactant primal (traced streams) rel=$(round(rt; sigdigits=4))  (< $RPRIMAL_TOL; 1 probe) PASS; stablehlo.while=$traced_while, hlo_bytes=$traced_bytes (@code_hlo; measured, not asserted)"); flush(stdout)
+    #
+    # Integer data ports (ii/jj/y/I) CANNOT lower as traced streams at this
+    # pin (traced-boolean TypeError in the compiler, retained as [3b]
+    # diagnostic); models whose HAVEs include them use the IRT-lane boundary
+    # instead: data bound, only the unconstrained vector traced, plus the
+    # compiled-gradient axis [4] on that same query.
+    int_ports = any(f -> data[String(f)] isa AbstractVector{Int} ||
+                           data[String(f)] isa Int, Base.tail(have))
+    if !int_ports
+        data_bnd = bind(_GATE_DATA[])
+        kb_free = prepare(build(); have, want = :posterior)
+        traced = (Reactant.to_rarray(q),
+                  (Reactant.to_rarray(getfield(data_bnd, f)) for f in Base.tail(have))...)
+        kbt = Reactant.compile(kb_free, traced; sync = true)
+        vt = Float64(kbt(traced...))
+        rt = _relv(vt, vn)
+        @assert isfinite(vt) && rt < RPRIMAL_TOL "$name: traced-stream Reactant primal rel=$rt ≥ $RPRIMAL_TOL"
+        traced_hlo = repr(Reactant.@code_hlo optimize = false kb_free(traced...))
+        traced_while = count("stablehlo.while", traced_hlo)
+        traced_bytes = length(codeunits(traced_hlo))
+        _axis!(name, "PASS Reactant primal (traced-stream query) rel=$(round(rt; sigdigits=4)) (1 probe); stablehlo.while=$traced_while, hlo_bytes=$traced_bytes (@code_hlo; measured, not asserted)")
+        println("  [3b] Reactant primal (traced streams) rel=$(round(rt; sigdigits=4))  (< $RPRIMAL_TOL; 1 probe) PASS; stablehlo.while=$traced_while, hlo_bytes=$traced_bytes (@code_hlo; measured, not asserted)"); flush(stdout)
+    else
+        _axis!(name, "UNSUPPORTED Reactant traced-stream query at this pin: integer data ports (ii/jj/y/I) do not lower as traced streams (traced-boolean TypeError; retained diagnostic)")
+        println("  [3b] traced streams UNSUPPORTED (traced-integer ports at this pin; diagnostic retained)"); flush(stdout)
+    end
 
     # ---- [4] Reactant gradient vs Stan (fresh process; no priming here) ----
     # At THIS pin both queries compile with the scan UNROLLED (measured above:
@@ -58,7 +72,17 @@ function _reactant_axes(name, build, kb, sm, pts, have, bind)
     # host that can carry it; once this tree carries RK main @ 90acd41c (traced
     # eachrow while-lowering, single-while shape), the traced-stream gradient
     # becomes tractable and this axis returns to a hard-asserted attempt.
-    if get(ENV, "STRUCTURED_REACTANT_GRAD", "0") == "1"
+    # reactant_grad === :pin_boundary records the unrolled-scan boundary and
+    # attempts only opt-in; :assert hard-asserts the compiled gradient on the
+    # bound-data query (IRT-lane recipe, scan-free graphs).
+    if reactant_grad === :pin_boundary
+        if get(ENV, "STRUCTURED_REACTANT_GRAD", "0") != "1"
+            _axis!(name, "UNSUPPORTED Reactant gradient at this pin: unrolled scan module (see axes 3a/3b byte sizes) killed the EnzymeMLIR reverse compile with an external SIGTERM (retained gate log, kb-run-compact.X7biXF, 2026-09-18); opt-in attempt via STRUCTURED_REACTANT_GRAD=1, hard re-measure after RK 90acd41c lands in-tree")
+            println("  [4] Reactant grad  UNSUPPORTED (documented unrolled-scan pin boundary; diagnostic retained)"); flush(stdout)
+            return
+        end
+    end
+    begin
         grad_result = try
             prep = prepare_ad(kb, AE, q; active = :unconstrained)
             gb = Reactant.to_rarray(similar(q))
@@ -79,12 +103,10 @@ function _reactant_axes(name, build, kb, sm, pts, have, bind)
                 rethrow(err)
             end
         end
-    else
-        grad_result = "UNSUPPORTED Reactant gradient at this pin: unrolled scan module (see axes 3a/3b byte sizes) killed the EnzymeMLIR reverse compile with an external SIGTERM (retained gate log, kb-run-compact.X7biXF, 2026-09-18); opt-in attempt via STRUCTURED_REACTANT_GRAD=1, hard re-measure after RK 90acd41c lands in-tree"
+        _axis!(name, grad_result)
+        println("  [4] Reactant grad  ", startswith(grad_result, "PASS") ?
+                "$(split(grad_result)[4]) (< $RGRAD_TOL; 1 probe) PASS" :
+                "UNSUPPORTED (documented $_GAP_SNAG; diagnostic retained)"); flush(stdout)
     end
-    _axis!(name, grad_result)
-    println("  [4] Reactant grad  ", startswith(grad_result, "PASS") ?
-            "$(split(grad_result)[4]) (< $RGRAD_TOL; 1 probe) PASS" :
-            "UNSUPPORTED (documented $_GAP_SNAG; diagnostic retained)"); flush(stdout)
     return
 end
