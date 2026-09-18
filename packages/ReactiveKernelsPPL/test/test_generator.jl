@@ -100,6 +100,11 @@ end
     built = build_kernel(plan)
     @test built.spec isa ReactiveKernels.KernelSpec
     @test built.layout.total == 3
+    # Likelihoods lower to plate calls (Expr(:do)), never fused broadcasts.
+    _has_do(ex::Expr) = ex.head === :do ||
+        any(a -> a isa Expr && _has_do(a), ex.args)
+    _has_do(_) = false
+    @test _has_do(kernel_expr(plan, built.layout))
     # Second build interns a fresh binding; both work.
     built2 = build_kernel(plan)
     u = [0.5, -0.25, 0.1]
@@ -315,6 +320,92 @@ end
     _check_gradient(built.spec, plan, u)
 end
 
+@testset "poisson evidence lower bounds shift by one (inclusive cdf)" begin
+    # poisson.cdf(k) = P(Y ≤ k): lower-side masses cover Y < lb, i.e. F(lb-1),
+    # and interval cells cover [yv, ub], i.e. F(ub) - F(yv-1). Oracles are
+    # Distributions.jl cdf/logpdf arithmetic (F(-1) = 0 definitionally),
+    # never the emitted forms.
+    _F(lam, k) = k < 0 ? 0.0 : cdf(Poisson(lam), k)
+    cols, n = _gen_columns()
+    cols[:y] = [0, 1, 2, 1, 3, 2]
+    cols[:lo] = [0, 1, 0, 2, 1, 0]
+    u = [0.1, -0.2]
+    function _run(ev)
+        plan = StructuralPlan(
+            LikelihoodSpec[LikelihoodSpec(PoissonLogFam, LogLink, :y, :eta,
+                nothing, nothing, ev, :y_resp)],
+            PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+            _gen_priors(:eta),
+            SampledParameter[], AssignmentSpec[], cols, n)
+        built = build_kernel(plan)
+        nt = constrain(built.layout, u)
+        lam = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
+        pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+        return built, plan, lam, pr
+    end
+    y = cols[:y]
+    # Truncated two-sided T[1,4]: log(F(4) - F(0)).
+    built, plan, lam, pr = _run(ResponseEvidence(:truncated, 1, 4))
+    base = sum(logpdf.(Poisson.(lam), y))
+    corr = sum(log.(_F.(lam, 4) .- _F.(lam, 0)))
+    @test _query(built.spec, plan, :posterior, u) ≈ base - corr + pr
+    _check_gradient(built.spec, plan, u)
+    # Truncated lower-only [2,∞): log(1 - F(1)).
+    built, plan, lam, pr = _run(ResponseEvidence(:truncated, 2, nothing))
+    corr = sum(log.(1 .- _F.(lam, 1)))
+    @test _query(built.spec, plan, :posterior, u) ≈ base - corr + pr
+    _check_gradient(built.spec, plan, u)
+    # Truncated with a Symbol lower bound (do-var path), incl. lo = 0 rows
+    # where F(lo-1) = F(-1) = 0.
+    built, plan, lam, pr = _run(ResponseEvidence(:truncated, :lo, 4))
+    corr = sum(log.(_F.(lam, 4) .- _F.(lam, cols[:lo] .- 1)))
+    @test _query(built.spec, plan, :posterior, u) ≈ base - corr + pr
+    _check_gradient(built.spec, plan, u)
+    # Censored lower-only at 2: yv < 2 contributes log(F(1)).
+    built, plan, lam, pr = _run(ResponseEvidence(:censored, 2, nothing))
+    cell = ifelse.(y .< 2, log.(_F.(lam, 1)), logpdf.(Poisson.(lam), y))
+    @test _query(built.spec, plan, :posterior, u) ≈ sum(cell) + pr
+    _check_gradient(built.spec, plan, u)
+    # Censored two-sided [1,2].
+    built, plan, lam, pr = _run(ResponseEvidence(:censored, 1, 2))
+    cell = ifelse.(y .< 1, log.(_F.(lam, 0)),
+        ifelse.(y .> 2, log.(1 .- _F.(lam, 2)), logpdf.(Poisson.(lam), y)))
+    @test _query(built.spec, plan, :posterior, u) ≈ sum(cell) + pr
+    _check_gradient(built.spec, plan, u)
+    # Interval [yv,4]: log(F(4) - F(yv-1)); the y = 0 row pins F(-1) = 0.
+    built, plan, lam, pr =
+        _run(ResponseEvidence(:interval_censored, nothing, 4))
+    ival = sum(log.(_F.(lam, 4) .- _F.(lam, y .- 1)))
+    @test _query(built.spec, plan, :posterior, u) ≈ ival + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "reduction assignments resolve in generated scope" begin
+    # mean/std/var (Statistics) must resolve in PPLGeneratedModels like the
+    # Base reductions do; m = mean(x) feeds the Gaussian scale (valued via
+    # Base sum/length, never mean itself), s/v pin eval-scope resolution.
+    cols, n = _gen_columns()
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :m,
+            nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu)],
+        _gen_priors(:mu),
+        SampledParameter[],
+        AssignmentSpec[AssignmentSpec(:m, :(mean(x))),
+            AssignmentSpec(:s, :(std(x))),
+            AssignmentSpec(:v, :(var(x)))],
+        cols, n)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    mu = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    sig = sum(cols[:x]) / length(cols[:x])
+    ref = sum(logpdf.(Normal.(mu, sig), cols[:y])) +
+        logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ref
+    _check_gradient(built.spec, plan, u)
+end
+
 @testset "sampled prior sweep" begin
     cols, n = _gen_columns()
     specs = [
@@ -391,4 +482,22 @@ end
     pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2]) +
         logpdf(Normal(0, 1), nt.tau) + log(2)
     @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[3]
+end
+
+# _unbind comes from test_contract.jl (included first in runtests.jl).
+@testset "unbound refusal and bind equivalence" begin
+    plan = _gen_gaussian_plan()
+    built = build_kernel(plan)
+    u = _unbind(plan)
+    @test_throws ContractValidationError build_kernel(u)
+    @test_throws ContractValidationError kernel_expr(u, built.layout)
+    @test_throws ContractValidationError assign_layout(u)
+    @test_throws ContractValidationError prepare_query(built, u, :sampler)
+    # Rebinding the same columns reproduces the direct-build posterior.
+    b = bind_data(u, plan.columns)
+    bb = build_kernel(b)
+    @test bb.layout.total == built.layout.total
+    v = [0.5, -0.25, 0.1]
+    @test _query(bb.spec, b, :posterior, v) ≈
+        _query(built.spec, plan, :posterior, v)
 end
