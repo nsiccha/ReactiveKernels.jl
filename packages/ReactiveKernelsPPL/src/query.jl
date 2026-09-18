@@ -68,6 +68,8 @@ via `bound=`). Thin wrapper over `ReactiveKernels.prepare` with
 `Vector{Float64}` to the preset node's value.
 """
 function prepare_query(built, plan::StructuralPlan, preset::Symbol)
+    isbound(plan) || throw(ContractValidationError(
+        "[query] prepare_query requires a bound plan (bind_data first)"))
     return prepare(built.spec; have = _query_have(plan),
         want = workflow_wants(preset), bound = _query_bound(plan))
 end

@@ -21,7 +21,8 @@ export LinkFunction, IdentityLink, LogitLink, LogLink
 export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm
 export ResponseEvidence, LikelihoodSpec, TermSpec, PredictorSpec
 export PopulationPrior, SampledParameter, AssignmentSpec, StructuralPlan
-export ContractValidationError, validate_plan, topological_order
+export ContractValidationError, validate_plan, validate_structure, validate_data
+export topological_order, isbound, bind_data, COLUMN_ROLES
 export admitted_families, admitted_terms, admitted_functions, supports_term
 export block_name
 export build_kernel, kernel_expr

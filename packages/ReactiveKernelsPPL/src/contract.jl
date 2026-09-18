@@ -170,7 +170,31 @@ struct StructuralPlan
     assignments::Vector{AssignmentSpec}
     columns::Dict{Symbol,AbstractVector}
     n_obs::Int
+    roles::Dict{Symbol,Symbol}
 end
+
+"""Column roles: what a bound column IS (CV travel + program transforms read
+this). Inferred at bind; explicit roles override. Unbound plans carry none."""
+const COLUMN_ROLES = (:response, :predictor, :weight, :evidence, :data)
+
+# Compatibility constructor: 8-arg positional construction (pre-roles) keeps
+# working with empty roles; the emitter/serializer path is unaffected.
+function StructuralPlan(
+        responses::Vector{LikelihoodSpec},
+        predictors::Vector{PredictorSpec},
+        population_priors::Vector{PopulationPrior},
+        parameters::Vector{SampledParameter},
+        assignments::Vector{AssignmentSpec},
+        columns::Dict{Symbol,AbstractVector},
+        n_obs::Int;
+        roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}())
+    return StructuralPlan(responses, predictors, population_priors,
+        parameters, assignments, columns, n_obs, roles)
+end
+
+"""Bound ⟺ columns attached. Unbound plans (empty columns) carry structure
+only; [`bind_data`](@ref) attaches data (+ roles). Rebinding replaces."""
+isbound(plan::StructuralPlan) = !isempty(plan.columns)
 
 """Admitted (family, likelihood-link, predictor-link) triples (triple pin).
 Triples 2 and 3 lower identically; the triple is admission key + lowering
@@ -257,14 +281,34 @@ failure throws [`ContractValidationError`](@ref) — loud, never silent.
 Returns `nothing` on success.
 """
 function validate_plan(plan::StructuralPlan)
-    _validate_columns(plan)
+    validate_structure(plan)
+    isbound(plan) && validate_data(plan)
+    return nothing
+end
+
+"""Structure checks: everything provable without data. Runs on bound and
+unbound plans alike (the macro lowering + emitter-AST path call this)."""
+function validate_structure(plan::StructuralPlan)
     _validate_name_tables(plan)
-    _validate_assignments(plan)
+    _validate_assignments_structure(plan)
     _validate_parameters(plan)
     _validate_topo_order(plan)
     _validate_predictors(plan)
     _validate_priors(plan)
     _validate_responses(plan)
+    return nothing
+end
+
+"""Data checks: columns, eltypes, levels, bounds. Requires a bound plan;
+[`bind_data`](@ref) runs this after attaching columns."""
+function validate_data(plan::StructuralPlan)
+    isbound(plan) || throw(ContractValidationError(
+        "[bind] validate_data requires a bound plan (bind_data first)"))
+    _validate_columns(plan)
+    _validate_column_names(plan)
+    _validate_assignments_data(plan)
+    _validate_predictor_columns(plan)
+    _validate_response_data(plan)
     return nothing
 end
 
@@ -291,11 +335,6 @@ function _validate_name_tables(plan::StructuralPlan)
     overlap = intersect(params, assigns)
     isempty(overlap) ||
         _fail(:plan, "names in both parameters and assignments: $(join(overlap, ", "))")
-    col_overlap = filter(n -> haskey(plan.columns, n), union(params, assigns))
-    isempty(col_overlap) || _fail(
-        :plan,
-        "parameter/assignment names collide with raw columns: $(join(col_overlap, ", "))",
-    )
     for pn in pnames
         pn in union(params, assigns) && _fail(
             :plan,
@@ -306,23 +345,50 @@ function _validate_name_tables(plan::StructuralPlan)
             "parameter/assignment $(block_name(pn)) collides with predictor $pn block name",
         )
     end
-    for n in Iterators.flatten((pnames, params, assigns, keys(plan.columns)))
-        startswith(string(n), "_ppl_") && _fail(
-            :plan,
-            "name $n uses the reserved _ppl_ prefix (transform intermediates)",
-        )
-        n in RESERVED_NODES && _fail(
-            :plan,
-            "name $n collides with a canonical node (prior/likelihood/log_jacobian/posterior/unconstrained)",
-        )
+    for n in Iterators.flatten((pnames, params, assigns))
+        _check_name_hygiene(n)
     end
     return nothing
 end
 
-function _validate_assignments(plan::StructuralPlan)
+function _check_name_hygiene(n::Symbol)
+    startswith(string(n), "_ppl_") && _fail(
+        :plan,
+        "name $n uses the reserved _ppl_ prefix (transform intermediates)",
+    )
+    n in RESERVED_NODES && _fail(
+        :plan,
+        "name $n collides with a canonical node (prior/likelihood/log_jacobian/posterior/unconstrained)",
+    )
+    return nothing
+end
+
+function _validate_column_names(plan::StructuralPlan)
+    col_overlap = filter(
+        n -> haskey(plan.columns, n),
+        union([p.name for p in plan.parameters], [a.name for a in plan.assignments]),
+    )
+    isempty(col_overlap) || _fail(
+        :plan,
+        "parameter/assignment names collide with raw columns: $(join(col_overlap, ", "))",
+    )
+    for n in keys(plan.columns)
+        _check_name_hygiene(n)
+    end
+    return nothing
+end
+
+function _validate_assignments_structure(plan::StructuralPlan)
+    for a in plan.assignments
+        _collect_assignment_refs!(Symbol[], a.expr, plan, a.label, false)
+    end
+    return nothing
+end
+
+function _validate_assignments_data(plan::StructuralPlan)
     for a in plan.assignments
         refs = Symbol[]
-        _collect_assignment_refs!(refs, a.expr, plan, a.label)
+        _collect_assignment_refs!(refs, a.expr, plan, a.label, true)
         for r in refs
             r in _union_names(plan) ||
                 _fail(a.label, "assignment references unknown name $r")
@@ -334,11 +400,15 @@ end
 _union_names(plan::StructuralPlan) =
     union([p.name for p in plan.parameters], [a.name for a in plan.assignments])
 
-function _collect_assignment_refs!(refs, ex, plan, label)
+# With bound=false (structure), bare Symbols are opaque refs and column
+# checks are skipped — classification needs columns. With bound=true, bare
+# columns fail (row-varying outside a reduction) and reduction args must be
+# raw columns.
+function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
     ex isa Number && return nothing
     ex isa LineNumberNode && return nothing
     if ex isa Symbol
-        haskey(plan.columns, ex) && _fail(
+        bound && haskey(plan.columns, ex) && _fail(
             label,
             "row-varying column $ex outside a reduction (slice 1: precompute the column)",
         )
@@ -357,12 +427,18 @@ function _collect_assignment_refs!(refs, ex, plan, label)
                 "reduction $fn takes exactly one whole column",
             )
             arg = ex.args[2]
-            arg isa Symbol && haskey(plan.columns, arg) ||
-                _fail(label, "reduction $fn argument must be a bare raw column")
+            arg isa Symbol || _fail(
+                label,
+                "reduction $fn argument must be a bare raw column",
+            )
+            (!bound || haskey(plan.columns, arg)) || _fail(
+                label,
+                "reduction $fn argument must be a bare raw column",
+            )
             return nothing
         end
         for arg in ex.args[2:end]
-            _collect_assignment_refs!(refs, arg, plan, label)
+            _collect_assignment_refs!(refs, arg, plan, label, bound)
         end
         return nothing
     end
@@ -403,10 +479,16 @@ function _validate_parameters(plan::StructuralPlan)
                 p.label,
                 "support override must be :positive, got $ov",
             )
-            SAMPLED_SUPPORT[p.family] === :real || _fail(
+            (p.family === :normal || p.family === :cauchy) || _fail(
                 p.label,
-                ":positive override only applies to real-support families " *
-                "($(p.family) infers $(SAMPLED_SUPPORT[p.family]))",
+                ":positive override only applies to normal/cauchy " *
+                "(half-Normal/half-Cauchy); got $(p.family)",
+            )
+            loc = first(values(p.args))
+            loc isa Real && loc == 0 || _fail(
+                p.label,
+                ":positive override requires literal zero location " *
+                "(+log(2) is exact only by symmetry at 0); got $(repr(loc))",
             )
         end
     end
@@ -420,7 +502,8 @@ const RESERVED_NODES = (:prior, :likelihood, :log_jacobian, :posterior, :unconst
     topological_order(plan) -> Vector{Symbol}
 
 Evaluation order over parameters ∪ assignments (Kahn's algorithm). Loud on
-unknown references and cycles. Shared by validation and the generator.
+cycles (and, on bound plans, unknown references — unbound plans defer name
+resolution to bind). Shared by validation and the generator.
 """
 function topological_order(plan::StructuralPlan)
     names = _union_names(plan)
@@ -437,11 +520,13 @@ function topological_order(plan::StructuralPlan)
     end
     for a in plan.assignments
         refs = Symbol[]
-        _collect_assignment_refs!(refs, a.expr, plan, a.label)
-        for r in refs
-            r in names || _fail(a.label, "assignment references unknown name $r")
+        _collect_assignment_refs!(refs, a.expr, plan, a.label, isbound(plan))
+        if isbound(plan)
+            for r in refs
+                r in names || _fail(a.label, "assignment references unknown name $r")
+            end
         end
-        deps[a.name] = Set{Symbol}(refs)
+        deps[a.name] = Set{Symbol}(r for r in refs if r in names)
     end
     remaining = Dict{Symbol,Int}(name => length(d) for (name, d) in deps)
     dependents = Dict{Symbol,Vector{Symbol}}(name => Symbol[] for name in keys(deps))
@@ -481,10 +566,6 @@ function _validate_predictors(plan::StructuralPlan)
 end
 
 function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
-    for c in t.columns
-        haskey(plan.columns, c) ||
-            _fail(t.label, "term references missing column $c")
-    end
     if t.kind === FactorTerm
         o = t.options
         get(o, :contrasts, nothing) === :treatment ||
@@ -493,6 +574,36 @@ function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
         ref isa Int || _fail(t.label, "factor ref must be a 1-based level index")
         length(t.columns) == 1 ||
             _fail(t.label, "factor term takes exactly one grouping column")
+    else
+        t.options == NamedTuple() ||
+            _fail(t.label, "non-factor terms take no options (slice 1)")
+        if t.kind === ContinuousTerm || t.kind === OffsetTerm
+            length(t.columns) == 1 ||
+                _fail(t.label, "term takes exactly one column")
+        elseif t.kind === InterceptTerm
+            isempty(t.columns) ||
+                _fail(t.label, "intercept term takes no columns")
+        end
+    end
+    return nothing
+end
+
+function _validate_predictor_columns(plan::StructuralPlan)
+    for pred in plan.predictors
+        for t in pred.terms
+            _validate_term_columns(t, pred, plan)
+        end
+    end
+    return nothing
+end
+
+function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
+    for c in t.columns
+        haskey(plan.columns, c) ||
+            _fail(t.label, "term references missing column $c")
+    end
+    if t.kind === FactorTerm
+        ref = get(t.options, :ref, nothing)
         col = plan.columns[only(t.columns)]
         levels =
             try
@@ -504,19 +615,10 @@ function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
             t.label,
             "factor ref $ref out of range (1:$(length(levels)) observed levels)",
         )
-    else
-        t.options == NamedTuple() ||
-            _fail(t.label, "non-factor terms take no options (slice 1)")
-        if t.kind === ContinuousTerm || t.kind === OffsetTerm
-            length(t.columns) == 1 ||
-                _fail(t.label, "term takes exactly one column")
-            col = plan.columns[only(t.columns)]
-            eltype(col) <: Real ||
-                _fail(t.label, "column $(only(t.columns)) must be numeric")
-        elseif t.kind === InterceptTerm
-            isempty(t.columns) ||
-                _fail(t.label, "intercept term takes no columns")
-        end
+    elseif t.kind === ContinuousTerm || t.kind === OffsetTerm
+        col = plan.columns[only(t.columns)]
+        eltype(col) <: Real ||
+            _fail(t.label, "column $(only(t.columns)) must be numeric")
     end
     return nothing
 end
@@ -568,14 +670,21 @@ function _validate_responses(plan::StructuralPlan)
             "link triple ($(r.family), $(r.link), $(pred.link)) not admitted " *
             "(slice 1: Gaussian/identity, Bernoulli-logit, Poisson-log spellings)",
         )
-        _validate_response_column(r, plan)
         _validate_scale(r, plan)
-        _validate_weights(r, plan)
-        _validate_evidence(r, plan)
+        _validate_evidence_structure(r, plan)
     end
     for pred in plan.predictors
         pred.name in used_predictors ||
             _fail(pred.label, "predictor $(pred.name) unused by any response")
+    end
+    return nothing
+end
+
+function _validate_response_data(plan::StructuralPlan)
+    for r in plan.responses
+        _validate_response_column(r, plan)
+        _validate_weights(r, plan)
+        _validate_evidence_data(r, plan)
     end
     return nothing
 end
@@ -627,7 +736,7 @@ function _validate_weights(r::LikelihoodSpec, plan::StructuralPlan)
     return nothing
 end
 
-function _validate_evidence(r::LikelihoodSpec, plan::StructuralPlan)
+function _validate_evidence_structure(r::LikelihoodSpec, plan::StructuralPlan)
     ev = r.evidence
     ev.kind in (:none, :truncated, :censored, :interval_censored) ||
         _fail(r.label, "evidence kind $(ev.kind) unknown")
@@ -640,6 +749,12 @@ function _validate_evidence(r::LikelihoodSpec, plan::StructuralPlan)
         ev.upper === nothing &&
             _fail(r.label, "interval evidence requires an upper bound")
     end
+    return nothing
+end
+
+function _validate_evidence_data(r::LikelihoodSpec, plan::StructuralPlan)
+    ev = r.evidence
+    ev.kind === :none && return nothing
     lo = _bound_values(ev.lower, :lower, r, plan)
     hi = _bound_values(ev.upper, :upper, r, plan)
     if ev.kind === :interval_censored
@@ -660,14 +775,76 @@ function _bound_values(bound, side, r::LikelihoodSpec, plan::StructuralPlan)
     bound === nothing && return nothing
     if bound isa Real
         isfinite(bound) || _fail(r.label, "$side bound literal must be finite")
+        if r.family === PoissonLogFam
+            isinteger(bound) || _fail(r.label,
+                "$side bound literal must be integer-valued for Poisson evidence")
+        end
         return fill(Float64(bound), plan.n_obs)
     end
     bound isa Symbol || _fail(r.label, "$side bound must be a literal or column")
     haskey(plan.columns, bound) ||
         _fail(r.label, "$side bound column $bound missing")
     col = plan.columns[bound]
+    if r.family === PoissonLogFam
+        (eltype(col) <: Integer && eltype(col) !== Bool) || _fail(r.label,
+            "$side bound column must hold integers for Poisson evidence")
+        return col
+    end
     eltype(col) <: Real && all(isfinite, col) ||
         _fail(r.label, "$side bound column must be finite numerics")
     return col
+end
+
+const _ROLE_RANK = Dict{Symbol,Int}(
+    :data => 1, :predictor => 2, :weight => 3, :evidence => 4, :response => 5,
+)
+
+_upgrade_role!(roles, col, role) =
+    _ROLE_RANK[roles[col]] < _ROLE_RANK[role] && (roles[col] = role)
+
+"""
+    bind_data(plan, columns; roles=Dict()) -> StructuralPlan
+
+Attach `columns` to a structure-only plan (or rebind an already-bound one,
+replacing columns + roles): infer column roles, merge explicit `roles` over
+them, and run data validation. Returns a NEW bound plan; the input is
+untouched. Inference precedence: response > evidence > weight > predictor
+> data; term columns are the only `:predictor` source, so
+assignment/extra columns stay `:data`.
+"""
+function bind_data(plan::StructuralPlan, columns::Dict{Symbol,<:AbstractVector};
+        roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}())
+    validate_structure(plan)
+    isempty(columns) && throw(ContractValidationError(
+        "[bind] bind_data requires non-empty columns"))
+    columns = Dict{Symbol,AbstractVector}(columns)
+    for (k, v) in roles
+        haskey(columns, k) || throw(ContractValidationError(
+            "[bind] role for unknown column $k"))
+        v in COLUMN_ROLES || throw(ContractValidationError(
+            "[bind] unknown role $v for column $k (choose from $COLUMN_ROLES)"))
+    end
+    inferred = Dict{Symbol,Symbol}(k => :data for k in keys(columns))
+    for pred in plan.predictors, t in pred.terms, c in t.columns
+        haskey(inferred, c) && _upgrade_role!(inferred, c, :predictor)
+    end
+    for r in plan.responses
+        r.weights !== nothing && haskey(inferred, r.weights) &&
+            _upgrade_role!(inferred, r.weights, :weight)
+        for b in (r.evidence.lower, r.evidence.upper)
+            b isa Symbol && haskey(inferred, b) &&
+                _upgrade_role!(inferred, b, :evidence)
+        end
+    end
+    for r in plan.responses
+        haskey(inferred, r.response) && (inferred[r.response] = :response)
+    end
+    merged = merge(inferred, roles)
+    n = length(first(values(columns)))
+    bound = StructuralPlan(plan.responses, plan.predictors,
+        plan.population_priors, plan.parameters, plan.assignments,
+        columns, n; roles = merged)
+    validate_data(bound)
+    return bound
 end
 
