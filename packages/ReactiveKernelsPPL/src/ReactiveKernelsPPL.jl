@@ -21,19 +21,25 @@ export LinkFunction, IdentityLink, LogitLink, LogLink
 export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm
 export ResponseEvidence, LikelihoodSpec, TermSpec, PredictorSpec
 export PopulationPrior, SampledParameter, AssignmentSpec, StructuralPlan
-export ContractValidationError, validate_plan
+export ContractValidationError, validate_plan, topological_order
 export admitted_families, admitted_terms, admitted_functions, supports_term
 export block_name
+export build_kernel, kernel_expr
 export DesignShape, DesignBlock, design_shape, coefficient_priors
 export LayoutTable, LayoutEntry, assign_layout, coordinate_names
 export constrain, unconstrain, logjac, support_of
 export coordinate_read, block_read, transform_statements, jacobian_term
 export design_name, offset_name, design_recipe, offset_recipe
 export preprocessing_recipes
+export PPL_NODES, WORKFLOW_WANTS, workflow_wants
+export prepare_query, prepare_sampler, SamplerQuery, sampler_value_and_gradient!
+export restore_draws
 
 include("contract.jl")
 include("design.jl")
 include("layout.jl")
 include("preprocessing.jl")
+include("generator.jl")
+include("query.jl")
 
 end # module ReactiveKernelsPPL

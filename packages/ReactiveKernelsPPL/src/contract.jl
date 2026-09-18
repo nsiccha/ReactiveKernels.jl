@@ -311,6 +311,10 @@ function _validate_name_tables(plan::StructuralPlan)
             :plan,
             "name $n uses the reserved _ppl_ prefix (transform intermediates)",
         )
+        n in RESERVED_NODES && _fail(
+            :plan,
+            "name $n collides with a canonical node (prior/likelihood/log_jacobian/posterior/unconstrained)",
+        )
     end
     return nothing
 end
@@ -409,29 +413,46 @@ function _validate_parameters(plan::StructuralPlan)
     return nothing
 end
 
-function _validate_topo_order(plan::StructuralPlan)
+"""Canonical in-graph node names: reserved across every plan namespace."""
+const RESERVED_NODES = (:prior, :likelihood, :log_jacobian, :posterior, :unconstrained)
+
+"""
+    topological_order(plan) -> Vector{Symbol}
+
+Evaluation order over parameters ∪ assignments (Kahn's algorithm). Loud on
+unknown references and cycles. Shared by validation and the generator.
+"""
+function topological_order(plan::StructuralPlan)
+    names = _union_names(plan)
     deps = Dict{Symbol,Set{Symbol}}()
     for p in plan.parameters
         refs = Set{Symbol}()
         for v in values(p.args)
-            v isa Symbol && push!(refs, v)
+            v isa Symbol || continue
+            v in names ||
+                _fail(p.label, "arg references unknown name $v")
+            push!(refs, v)
         end
         deps[p.name] = refs
     end
     for a in plan.assignments
         refs = Symbol[]
         _collect_assignment_refs!(refs, a.expr, plan, a.label)
+        for r in refs
+            r in names || _fail(a.label, "assignment references unknown name $r")
+        end
         deps[a.name] = Set{Symbol}(refs)
     end
-    # Kahn's algorithm over parameters ∪ assignments; leftovers are a cycle.
     remaining = Dict{Symbol,Int}(name => length(d) for (name, d) in deps)
     dependents = Dict{Symbol,Vector{Symbol}}(name => Symbol[] for name in keys(deps))
     for (name, ds) in deps, d in ds
         push!(dependents[d], name)
     end
+    order = Symbol[]
     ready = [name for (name, n) in remaining if n == 0]
     while !isempty(ready)
         name = pop!(ready)
+        push!(order, name)
         for m in dependents[name]
             remaining[m] -= 1
             remaining[m] == 0 && push!(ready, m)
@@ -440,6 +461,11 @@ function _validate_topo_order(plan::StructuralPlan)
     cyclic = sort!([name for (name, n) in remaining if n > 0])
     isempty(cyclic) ||
         _fail(:plan, "cyclic parameter/assignment dependency: $(join(cyclic, ", "))")
+    return order
+end
+
+function _validate_topo_order(plan::StructuralPlan)
+    topological_order(plan)
     return nothing
 end
 
@@ -521,6 +547,15 @@ end
 
 function _validate_responses(plan::StructuralPlan)
     isempty(plan.responses) && _fail(:plan, "plan has no responses")
+    rlabels = [r.label for r in plan.responses]
+    length(unique(rlabels)) == length(rlabels) ||
+        _fail(:plan, "duplicate response labels")
+    for r in plan.responses
+        r.label in RESERVED_NODES && _fail(
+            r.label,
+            "response label collides with a canonical node",
+        )
+    end
     used_predictors = Set{Symbol}()
     for r in plan.responses
         idx = findfirst(p -> p.name === r.predictor, plan.predictors)

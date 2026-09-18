@@ -263,6 +263,21 @@ end
     @test_throws ContractValidationError validate_plan(bad)
 end
 
+@testset "labels and reserved names" begin
+    bad = _gaussian_plan()
+    push!(bad.responses, bad.responses[1])
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _gaussian_plan()
+    bad.parameters[1] =
+        SampledParameter(:posterior, :exponential, (arg1 = 1.0,), nothing, :m)
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _gaussian_plan()
+    bad.responses[1] =
+        LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :sigma, nothing,
+            _none_evidence(), :prior)
+    @test_throws ContractValidationError validate_plan(bad)
+end
+
 @testset "columns and evidence" begin
     bad = _gaussian_plan()
     bad.columns[:x] = [1.0, 2.0]
