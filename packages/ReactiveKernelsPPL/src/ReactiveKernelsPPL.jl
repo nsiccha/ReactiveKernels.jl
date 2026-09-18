@@ -15,4 +15,15 @@ module ReactiveKernelsPPL
 
 using ReactiveKernels
 
+export ColumnRef, ParamName
+export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam
+export LinkFunction, IdentityLink, LogitLink, LogLink
+export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm
+export ResponseEvidence, LikelihoodSpec, TermSpec, PredictorSpec
+export PopulationPrior, SampledParameter, AssignmentSpec, StructuralPlan
+export ContractValidationError, validate_plan
+export admitted_families, admitted_terms, admitted_functions, supports_term
+
+include("contract.jl")
+
 end # module ReactiveKernelsPPL
