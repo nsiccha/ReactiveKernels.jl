@@ -53,8 +53,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
     parameters = (; beta1, beta2, beta3, sigma)
     (parameters, log_jacobian::Float64) =
         ((; beta1, beta2, beta3, sigma), log_sigma)
-    (beta1::Float64, beta2::Float64, beta3::Float64, sigma::Float64) =
-        (parameters.beta1, parameters.beta2, parameters.beta3, parameters.sigma)
 
     # Transformed parameter: the fitted mean μ = β₁ + β₂·mom_hs + β₃·mom_iq.
     # Captured scalars ride the plate as explicit shared arguments (a scalar plate
@@ -115,17 +113,17 @@ docs_example = (;
 )
 """
 
-function evaluate_kidscore_momhsiq_source()
+function evaluate_kidscore_momhsiq_source(; model_only::Bool = false)
     _evaluate_ppl_source(KIDSCORE_MOMHSIQ_SOURCE, @__MODULE__; bindings = (
         :MOMHSIQ_KID_SCORE, :MOMHSIQ_MOM_HS, :MOMHSIQ_MOM_IQ,
         :MOMHSIQ_MOM_HS_NEW, :MOMHSIQ_MOM_IQ_NEW,
-    ))
+    ), model_only)
 end
 
 const _KIDSCORE_MOMHSIQ_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _KIDSCORE_MOMHSIQ_GRAPH_TEMPLATE[] = evaluate_kidscore_momhsiq_source().model
+    _KIDSCORE_MOMHSIQ_GRAPH_TEMPLATE[] = evaluate_kidscore_momhsiq_source(; model_only = true).model
     nothing
 end
 

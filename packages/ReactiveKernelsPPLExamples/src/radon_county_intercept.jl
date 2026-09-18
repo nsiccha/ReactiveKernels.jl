@@ -71,8 +71,6 @@ using LogExpFunctions: logistic, log1pexp
 
     parameters = (; alpha, beta, sigma_y)
     (parameters, log_jacobian::Float64) = ((; alpha, beta, sigma_y), log_sigma_y)
-    (alpha::AbstractVector{Float64}, beta::Float64, sigma_y::Float64) =
-        (parameters.alpha, parameters.beta, parameters.sigma_y)
 
     # Fixed priors (all proper): beta ~ Normal(0, 10) and sigma_y ~ Normal(0, 1)
     # (half-normal = plain normal_lpdf; the lower=0 constraint carries the half,
@@ -143,16 +141,16 @@ docs_example = (;
 )
 """
 
-function evaluate_radon_county_intercept_source()
+function evaluate_radon_county_intercept_source(; model_only::Bool = false)
     _evaluate_ppl_source(RADON_COUNTY_INTERCEPT_SOURCE, @__MODULE__;
-        bindings = (:RADON_CI_COUNTY, :RADON_CI_FLOOR, :RADON_CI_LOG))
+        bindings = (:RADON_CI_COUNTY, :RADON_CI_FLOOR, :RADON_CI_LOG), model_only)
 end
 
 const _RADON_CI_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
     _RADON_CI_GRAPH_TEMPLATE[] =
-        evaluate_radon_county_intercept_source().model
+        evaluate_radon_county_intercept_source(; model_only = true).model
     nothing
 end
 

@@ -17,6 +17,16 @@ const PPL_SOURCE_CASES = (
      :DUGONGS_SOURCE, :evaluate_dugongs_source),
     ("arma11.md", "arma11.jl", ARMA11Example,
      :ARMA11_SOURCE, :evaluate_arma11_source),
+    ("covid19imperial.md", "covid19imperial.jl", Covid19ImperialExample,
+     :COVID19IMPERIAL_SOURCE, :evaluate_covid19imperial_source),
+    ("garch11.md", "garch11.jl", GARCH11Example,
+     :GARCH11_SOURCE, :evaluate_garch11_source),
+    ("hmm-example.md", "hmm_example.jl", HmmExampleExample,
+     :HMM_EXAMPLE_SOURCE, :evaluate_hmm_example_source),
+    ("hmm-gaussian.md", "hmm_gaussian.jl", HmmGaussianExample,
+     :HMM_GAUSSIAN_SOURCE, :evaluate_hmm_gaussian_source),
+    ("iohmm-reg.md", "iohmm_reg.jl", IohmmRegExample,
+     :IOHMM_REG_SOURCE, :evaluate_iohmm_reg_source),
     ("mnist-logistic.md", "mnist_logistic.jl", MNISTLogisticExample,
      :MNIST_LOGISTIC_SOURCE, :evaluate_mnist_logistic_source),
     ("mnist-logistic.md", "mnist_logistic.jl", MNISTLogisticExample,
@@ -25,6 +35,57 @@ const PPL_SOURCE_CASES = (
      :MVNORMAL_REGRESSION_SOURCE, :evaluate_mvnormal_regression_source),
     ("bound-regression.md", "bound_regression.jl", BoundRegressionExample,
      :BOUND_REGRESSION_SOURCE, :evaluate_bound_regression_source),
+    ("lda.md", "lda.jl", LDAExample,
+     :LDA_SOURCE, :evaluate_lda_source),
+    ("nn-rbm.md", "nn_rbm.jl", NNRBMExample,
+     :NN_RBM_SOURCE, :evaluate_nn_rbm_source),
+    ("gp-regr.md", "gp_regr.jl", GPRegrExample,
+     :GP_REGR_SOURCE, :evaluate_gp_regr_source),
+    ("gp-pois-regr.md", "gp_pois_regr.jl", GPPoisRegrExample,
+     :GP_POIS_REGR_SOURCE, :evaluate_gp_pois_regr_source),
+    ("accel-gp.md", "accel_gp.jl", AccelGPExample,
+     :ACCEL_GP_SOURCE, :evaluate_accel_gp_source),
+    ("hierarchical-gp.md", "hierarchical_gp.jl", HierarchicalGPExample,
+     :HIERARCHICAL_GP_SOURCE, :evaluate_hierarchical_gp_source),
+    ("losscurve-sislob.md", "losscurve_sislob.jl", LosscurveSislobExample,
+     :LOSSCURVE_SISLOB_SOURCE, :evaluate_losscurve_sislob_source),
+    ("accel-splines.md", "accel_splines.jl", AccelSplinesExample,
+     :ACCEL_SPLINES_SOURCE, :evaluate_accel_splines_source),
+    ("state-space-stochastic.md", "state_space_stochastic.jl", StateSpaceStochasticExample,
+     :STATE_SPACE_STOCHASTIC_SOURCE, :evaluate_state_space_stochastic_source),
+    ("prophet.md", "prophet.jl", ProphetExample,
+     :PROPHET_SOURCE, :evaluate_prophet_source),
+    ("irt-2pl.md", "irt_2pl.jl", Irt2plExample,
+     :IRT_2PL_SOURCE, :evaluate_irt_2pl_source),
+    ("2pl-latent-reg-irt.md", "2pl_latent_reg_irt.jl", TwoplLatentRegIrtExample,
+     :TWOPL_LR_SOURCE, :evaluate_2pl_latent_reg_irt_source),
+    ("hier-2pl.md", "hier_2pl.jl", Hier2plExample,
+     :HIER_2PL_SOURCE, :evaluate_hier_2pl_source),
+    ("gpcm-latent-reg-irt.md", "gpcm_latent_reg_irt.jl", GpcmLatentRegIrtExample,
+     :GPCM_LR_SOURCE, :evaluate_gpcm_latent_reg_irt_source),
+    ("grsm-latent-reg-irt.md", "grsm_latent_reg_irt.jl", GrsmLatentRegIrtExample,
+     :GRSM_LR_SOURCE, :evaluate_grsm_latent_reg_irt_source),
+    ("kronecker-gp.md", "kronecker_gp.jl", KroneckerGpExample,
+     :KRON_SOURCE, :evaluate_kronecker_gp_source),
+    ("glmm1.md", "glmm1_model.jl", GLMM1ModelExample,
+     :GLMM1_SOURCE, :evaluate_glmm1_model_source),
+    ("bym2-offset-only.md", "bym2_offset_only.jl", Bym2OffsetOnlyExample,
+     :BYM2_SOURCE, :evaluate_bym2_offset_only_source),
+    ("bones.md", "bones_model.jl", BonesModelExample,
+     :BONES_SOURCE, :evaluate_bones_model_source),
+    ("multi-occupancy.md", "multi_occupancy.jl", MultiOccupancyExample,
+     :MULTI_OCC_SOURCE, :evaluate_multi_occupancy_source),
+    ("lotka-volterra.md", "lotka_volterra.jl", LotkaVolterraExample,
+     :LOTKA_VOLTERRA_SOURCE, :evaluate_lotka_volterra_source),
+    ("sir.md", "sir.jl", SIRExample,
+     :SIR_SOURCE, :evaluate_sir_source),
+    ("one-comp-mm-elim-abs.md", "one_comp_mm_elim_abs.jl",
+     OneCompMMElimAbsExample,
+     :ONE_COMP_MM_ELIM_ABS_SOURCE, :evaluate_one_comp_mm_elim_abs_source),
+    ("soil-incubation.md", "soil_incubation.jl", SoilIncubationExample,
+     :SOIL_INCUBATION_SOURCE, :evaluate_soil_incubation_source),
+    ("hmm-drive-1.md", "hmm_drive_1.jl", HmmDrive1Example,
+     :HMM_DRIVE_1_SOURCE, :evaluate_hmm_drive_1_source),
 )
 
 # One displayed/executed authority kernel per registered case: a file carrying
@@ -80,6 +141,9 @@ end
     helper_source = read(
         joinpath(REPOSITORY_ROOT, "docs", "kernel_examples.jl"), String,
     )
+    rendered_contract_source = read(
+        joinpath(REPOSITORY_ROOT, "docs", "check_rendered.jl"), String,
+    )
     @test occursin("warnonly = false", make_source)
     @test !occursin("warnonly = Documenter.except(:eval_block)", make_source)
     @test occursin("assert_ppl_examples_executed!()", make_source)
@@ -94,11 +158,44 @@ end
         :poisson_gamma_density,
         :dugongs_density,
         :arma11_density,
+        :garch11_density,
+        :hmm_example_density,
+        :hmm_gaussian_density,
+        :iohmm_reg_density,
         :mnist_logistic_density,
         :mnist_logistic_optimized_density,
         :mvnormal_regression_density,
         :bound_regression_density,
+        :lda_density,
+        :nn_rbm_density,
+        :irt_2pl_posterior,
+        :two_pl_latent_reg_irt_posterior,
+        :hier_2pl_posterior,
+        :gpcm_latent_reg_irt_posterior,
+        :grsm_latent_reg_irt_posterior,
+        :kronecker_gp_posterior,
+        :glmm1_model_posterior,
+        :bym2_offset_only_posterior,
+        :bones_model_posterior,
+        :multi_occupancy_posterior,
     )
-        @test occursin(":" * string(name), helper_source)
+        marker = ":" * string(name)
+        @test count(marker, helper_source) == 1
+    end
+
+    # The exact-once PPL execution gate is opt-in for shared executable docs.
+    # PPL walkthroughs must request the gate, while non-PPL executable pages
+    # are excluded from the posterior-walkthrough name registry.
+    @test occursin("haskey(_PPL_EXECUTION_COUNTS, name) || return nothing",
+                   helper_source)
+    @test occursin("gate && _record_ppl_execution!(executed.name)",
+                   helper_source)
+    @test occursin("execute_example(mod, code; result, setup = nothing, gate = true)",
+                   helper_source)
+
+    # Each latent/spatial page contributes exactly one executable source panel.
+    for page in ("glmm1.md", "bym2-offset-only.md", "bones.md",
+                 "multi-occupancy.md")
+        @test occursin("\"$page\" => 1", rendered_contract_source)
     end
 end

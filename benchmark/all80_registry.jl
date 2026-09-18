@@ -393,4 +393,76 @@ for (k, otu, why) in [
     REGISTRY[k] = (; REGISTRY[k]..., off_tu = otu, off_reason = why)
 end
 
+# ---------------- Batch-1 incremental additions (todo 1x4pytu / 1q387t4) ----------------
+# Four newly-landed idiomatic-RK posteriordb translations (RK source landed on canonical 5ed649c,
+# USER go-decision 15fh0de), registered against their EXISTING upstream Turing make_model (pinned
+# DPPL 6378673 posteriordb_models.jl, SHA256 a7ef985b…) + reference posteriordb-1.0.0 .stan. They
+# are MEASURED INTO A SEPARATE receipt (all80-batch1-v1.toml) under RK_ALL80_BATCH mode and are
+# EXCLUDED from the frozen-82 default sweep (BATCH1_KEYS below), so the immutable 82-row checkpoint
+# is byte-for-byte unaffected. Registration params mirror the landed batch1_gate.jl (build fn /
+# have-ports / bind), which already certifies RK-vs-Stan value+gradient parity at IDENTITY order
+# (⇒ stan_perm = nothing). off_tu DERIVED FROM SOURCE (Turing truncation / uniform / Dirichlet
+# normalizers vs the reference .stan) and GATE-verified measured == declared on the batch run.
+reg!("diamonds-diamonds"; mod = :DiamondsExample, build = :build_diamonds_graph,
+    have = (:unconstrained, :X, :Y, :prior_only),
+    bind = d -> (X = _mat(d["X"]), Y = F(d, "Y"), prior_only = Is(d, "prior_only")),
+    off_reason = "off_tu=0: brms-generated diamonds.stan writes `student_t_lpdf(sigma|3,0,10) − 1*student_t_lccdf(0|3,0,10)` (truncation correction), matching upstream Turing `sigma~truncated(LocationScale(0,10,TDist(3));lower=0)`; b~Normal, Intercept~student_t untruncated both sides (posteriordb_models.jl:815-830, diamonds.stan model block).")
+reg!("dogs-dogs_nonhierarchical"; mod = :DogsNonhierarchicalExample, build = :build_dogs_nonhierarchical_graph,
+    have = (:unconstrained, :y), bind = d -> (y = Bv(d, "y"),),
+    off_reason = "off_tu=0: dogs_nonhierarchical.stan `sigma_logit_ab~normal(0,1)` on <lower=0> (untruncated density, NO lccdf correction) matches upstream Turing `sigma_logit_ab~FlatPos(0)` (improper, contributes 0) PLUS a MANUAL `logpdf(Normal(0,1),·)` (untruncated); mu~logistic, L~lkj_corr_cholesky(2), z~normal all match (posteriordb_models.jl:1830-1847, dogs_nonhierarchical.stan model block).")
+reg!("ovarian-logistic_regression_rhs"; mod = :LogisticRegressionRHSExample, build = :build_logistic_regression_rhs_graph,
+    have = (:unconstrained, :x, :y, :scale_icept, :scale_global, :nu_global, :nu_local, :slab_scale, :slab_df),
+    bind = d -> (x = _mat(d["x"]), y = Bv(d, "y"),
+                 scale_icept = Float64(d["scale_icept"]), scale_global = Float64(d["scale_global"]),
+                 nu_global = Float64(d["nu_global"]), nu_local = Float64(d["nu_local"]),
+                 slab_scale = Float64(d["slab_scale"]), slab_df = Float64(d["slab_df"])),
+    off_tu = -(1 + 1536) * log(2),
+    off_reason = "off_tu=−(1+d)·log2, d=1536 (ovarian): upstream Turing `tau~truncated(LocationScale(0,2scale_global,TDist(nu_global));lower=0)` (+log2) and `lambda~Fill(truncated(LocationScale(0,1,TDist(nu_local));lower=0),d)` (d×+log2; all centered at 0 ⇒ half-line normalizer log2 each); logistic_regression_rhs.stan writes bare `tau~student_t(...)`, `lambda~student_t(...)` on <lower=0> with NO lccdf correction ⇒ Stan drops (1+d)·log2. caux~inv_gamma, beta0~normal, z~std_normal match (posteriordb_models.jl:2308-2325, logistic_regression_rhs.stan model block).")
+reg!("normal_5-normal_mixture_k"; mod = :NormalMixtureKExample, build = :build_normal_mixture_k_graph,
+    have = (:unconstrained, :y, :K), bind = d -> (y = F(d, "y"), K = Is(d, "K")),
+    off_tu = 5 * log(10) - log(factorial(4)) + log(5) / 2,
+    off_reason = "off_tu=K·log10 − log((K−1)!) + log(K)/2, K=5 (normal_5): upstream Turing `sigma~Fill(Uniform(0,10),K)` (net Stan−Turing=+K·log10, same mechanism as GLM_Poisson/election88) and `theta~Dirichlet(ones(K))` vs Stan `simplex[K]` (no explicit prior). The two prior normalizers give +K·log10 − log Γ(K) = 8.3349; the residual +log(K)/2 = +0.8047 is a CONSTANT Turing-side (Bijectors) simplex/Dirichlet transform-normalization difference vs Stan's implicit-uniform simplex (the only structural difference in the theta block; matched measured 9.13959 to 6 sig figs). mu~normal(0,10) matches (posteriordb_models.jl:2600-2614, normal_mixture_k.stan). tu_off GATE-verified constant across draws (tu_stab); RK matches Stan exactly (rk_off≈0).")
+
+# Frozen-82 EXCLUSION set: these four run ONLY when explicitly requested (RK_ALL80_BATCH mode +
+# explicit ARGS), never in the default full sweep, so all80-benchmark-v1.toml stays the immutable
+# 82-row checkpoint.
+const BATCH1_KEYS = Set([
+    "diamonds-diamonds", "dogs-dogs_nonhierarchical",
+    "ovarian-logistic_regression_rhs", "normal_5-normal_mixture_k"])
+
+# ---------------- IRT incremental additions (todo 0wsjovm) ----------------
+# Four landed idiomatic-RK IRT translations (RK source landed canonical 9043993), registered
+# against their EXISTING upstream Turing make_model (pinned DPPL 6378673 posteriordb_models.jl,
+# SHA256 a7ef985b…) + reference posteriordb-1.0.0 .stan. MEASURED INTO A SEPARATE receipt
+# (all80-irt-v1.toml) under RK_ALL80_BATCH=irt and EXCLUDED from the frozen-82 default sweep
+# (IRT_KEYS below). Registration params mirror the landed acceptance_irt_four_axis.jl (build fn /
+# have-ports / bind), which certifies RK-vs-Stan value+gradient parity at IDENTITY order
+# (⇒ stan_perm = nothing). off_tu DERIVED FROM SOURCE for all four (all 0; see reasons) and
+# GATE-verified measured == declared on the batch run.
+reg!("irt_2pl-irt_2pl"; mod = :Irt2plExample, build = :build_irt_2pl_graph,
+    have = (:unconstrained, :y), bind = d -> (y = Bv(d, "y"),),
+    off_reason = "off_tu=0: bare cauchy/normal/lognormal/bernoulli_logit in irt_2pl.stan (no lccdf) match upstream Turing Flat/FlatPos + manual untruncated logpdf terms (posteriordb_models.jl pdb_irt_2pl:2214, make_model:2242).")
+reg!("fims_Aus_Jpn_irt-2pl_latent_reg_irt"; mod = :TwoplLatentRegIrtExample, build = :build_2pl_latent_reg_irt_graph,
+    have = (:unconstrained, :ii, :jj, :y, :W, :I),
+    bind = d -> (ii = Iv(d, "ii"), jj = Iv(d, "jj"), y = Bv(d, "y"), W = F(d, "W"), I = Is(d, "I")),
+    off_reason = "off_tu=0: lognormal/normal/student_t/bernoulli_logit match term-by-term; Turing replicates Stan obtain_adjustments two-sd branch and ±1 y-encoding (posteriordb_models.jl pdb_2pl_latent_reg_irt:1188, make_model:1205).")
+reg!("sat-hier_2pl"; mod = :Hier2plExample, build = :build_hier_2pl_graph,
+    have = (:unconstrained, :ii, :jj, :y, :I, :J),
+    bind = d -> (ii = Iv(d, "ii"), jj = Iv(d, "jj"), y = Bv(d, "y"), I = Is(d, "I"), J = Is(d, "J")),
+    off_reason = "off_tu=0: MVN-Cholesky/normal/LKJ/exponential/bernoulli match; Turing Exponential(inv(.1)) = Stan exponential(.1); ±1 signs (posteriordb_models.jl pdb_hier_2pl:2066, make_model:2083).")
+reg!("timssAusTwn_irt-gpcm_latent_reg_irt"; mod = :GpcmLatentRegIrtExample, build = :build_gpcm_latent_reg_irt_graph,
+    have = (:unconstrained, :ii, :jj, :y, :W, :I),
+    bind = d -> (ii = Iv(d, "ii"), jj = Iv(d, "jj"), y = Iv(d, "y"), W = F(d, "W"), I = Is(d, "I")),
+    off_reason = "off_tu=0: lognormal/normal/student_t + PCM categorical match; Turing replicates m/pos + two-sd W_adj + step-design (posteriordb_models.jl pdb_gpcm_latent_reg_irt:1947, make_model:1966). NOTE y is Int (levels), not Bool.")
+
+# IRT batch exclusion: same contract as BATCH1_KEYS (explicit RK_ALL80_BATCH=irt request only).
+const IRT_KEYS = Set([
+    "irt_2pl-irt_2pl", "fims_Aus_Jpn_irt-2pl_latent_reg_irt",
+    "sat-hier_2pl", "timssAusTwn_irt-gpcm_latent_reg_irt"])
+
+# Combined incremental-batch exclusion for the default sweep: every post-82 batch lands here,
+# so the selector stays one set. all80_validate.jl still checks all 90 structurally
+# (inventory 90 == registry 90).
+const BATCH_KEYS = union(BATCH1_KEYS, IRT_KEYS)
+
 end # module All80Registry

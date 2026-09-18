@@ -60,6 +60,20 @@ There is no separate public axis or scheduling language. The one-axis example
 above is the simplest case of that contract; multidimensional inputs use the
 same broadcast rules.
 
+### Plate-cell scope
+
+Inside a `plate(... do` cell, the threaded arguments and names assigned in the
+cell are local. Other `@kernel` signature ports are intentionally not implicit
+globals: thread an explicit scalar through the plate when every cell needs it
+(that scalar is shared), or an array when its axis should zip. For example,
+`plate(y, mu, scale) do observed, mean, scale ... end` is the supported spelling
+for an unthreaded `scale` caller port. RK now detects an unthreaded signature
+scalar used by the cell and threads it automatically; local names assigned
+outside the plate remain outside its scope.
+
+Subkernel and endpoint calls accept ordinary `f(name = value)` and
+`f(; name = value)` spellings. They normalize to the same graph.
+
 ## A plate is a pure RK subgraph
 
 The `do` block is not an opaque batch callback. ReactiveKernels lowers it to an

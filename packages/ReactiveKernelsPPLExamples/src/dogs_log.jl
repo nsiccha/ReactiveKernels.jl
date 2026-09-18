@@ -72,7 +72,6 @@ using LogExpFunctions: logistic
     log_jacobian::Float64 = 0.0
 
     parameters = (; beta1, beta2)
-    (beta1::Float64, beta2::Float64) = (parameters.beta1, parameters.beta2)
 
     # Explicit uniform priors from the Stan model block:
     #   beta[1] ~ uniform(-100, 0);  beta[2] ~ uniform(0, 100);
@@ -141,16 +140,16 @@ docs_example = (;
 )
 """
 
-function evaluate_dogs_log_source()
+function evaluate_dogs_log_source(; model_only::Bool = false)
     _evaluate_ppl_source(DOGS_LOG_SOURCE, @__MODULE__; bindings = (
         :DOGS_LOG_N_AVOID, :DOGS_LOG_N_SHOCK, :DOGS_LOG_Y_FLAT,
-    ))
+    ), model_only)
 end
 
 const _DOGS_LOG_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _DOGS_LOG_GRAPH_TEMPLATE[] = evaluate_dogs_log_source().model
+    _DOGS_LOG_GRAPH_TEMPLATE[] = evaluate_dogs_log_source(; model_only = true).model
     nothing
 end
 

@@ -77,10 +77,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
     parameters = (; beta1, beta2, beta3, beta4, sigma)
     (parameters, log_jacobian::Float64) =
         ((; beta1, beta2, beta3, beta4, sigma), log_sigma)
-    (beta1::Float64, beta2::Float64, beta3::Float64, beta4::Float64,
-     sigma::Float64) =
-        (parameters.beta1, parameters.beta2, parameters.beta3, parameters.beta4,
-         parameters.sigma)
 
     # Transformed data: the reference-centered predictors and their interaction
     # c2_mom_hs = mom_hs - 0.5, c2_mom_iq = mom_iq - 100, inter = product.
@@ -159,18 +155,18 @@ docs_example = (;
 )
 """
 
-function evaluate_kidscore_interaction_c2_source()
+function evaluate_kidscore_interaction_c2_source(; model_only::Bool = false)
     _evaluate_ppl_source(KIDSCORE_INTERACTION_C2_SOURCE, @__MODULE__; bindings = (
         :INTERACTION_C2_KID_SCORE, :INTERACTION_C2_MOM_HS, :INTERACTION_C2_MOM_IQ,
         :INTERACTION_C2_MOM_HS_NEW, :INTERACTION_C2_MOM_IQ_NEW,
-    ))
+    ), model_only)
 end
 
 const _KIDSCORE_INTERACTION_C2_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
     _KIDSCORE_INTERACTION_C2_GRAPH_TEMPLATE[] =
-        evaluate_kidscore_interaction_c2_source().model
+        evaluate_kidscore_interaction_c2_source(; model_only = true).model
     nothing
 end
 

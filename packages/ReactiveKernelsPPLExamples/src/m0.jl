@@ -51,7 +51,6 @@ using LogExpFunctions: logistic, log1pexp, logaddexp
 
     parameters = (; omega, p)
     (parameters, log_jacobian::Float64) = ((; omega, p), jac_omega + jac_p)
-    (omega::Float64, p::Float64) = (parameters.omega, parameters.p)
 
     # Flat (implicit uniform) prior over the bounded box → 0.
     log_prior::Float64 = 0.0
@@ -115,16 +114,16 @@ docs_example = (;
 )
 """
 
-function evaluate_m0_source()
+function evaluate_m0_source(; model_only::Bool = false)
     _evaluate_ppl_source(M0_SOURCE, @__MODULE__; bindings = (
         :M0_S, :M0_LCHOOSE, :M0_T, :M0_M,
-    ))
+    ), model_only)
 end
 
 const _M0_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _M0_GRAPH_TEMPLATE[] = evaluate_m0_source().model
+    _M0_GRAPH_TEMPLATE[] = evaluate_m0_source(; model_only = true).model
     nothing
 end
 

@@ -1756,7 +1756,7 @@ uuid = "0192cb87-2b54-54ad-80e0-3be72ad8a3c0"
 version = "0.0.407+0"
 
 [[deps.ReactiveKernels]]
-deps = ["DifferentiationInterface", "LinearAlgebra", "LogExpFunctions", "Random", "RuntimeGeneratedFunctions"]
+deps = ["DifferentiationInterface", "InverseFunctions", "LinearAlgebra", "LogExpFunctions", "Random", "RuntimeGeneratedFunctions"]
 path = "../.."
 uuid = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
 version = "0.1.0"
@@ -1776,7 +1776,7 @@ uuid = "4b169cd9-fc12-43fd-ba39-43e54ed8db7a"
 version = "0.1.0"
 
 [[deps.ReactiveKernelsPPLExamples]]
-deps = ["LinearAlgebra", "LogExpFunctions", "PosteriorDB", "ReactiveKernels", "ReactiveKernelsDistributionKernels"]
+deps = ["LinearAlgebra", "LogExpFunctions", "OrdinaryDiffEqBDF", "OrdinaryDiffEqLowOrderRK", "PosteriorDB", "ReactiveKernels", "ReactiveKernelsDistributionKernels", "SciMLBase", "SciMLSensitivity", "SpecialFunctions"]
 path = "../../packages/ReactiveKernelsPPLExamples"
 uuid = "a4d4be3d-45c5-49cc-80d7-34e606a16bce"
 version = "0.1.0"

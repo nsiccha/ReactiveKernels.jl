@@ -37,8 +37,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
     # boundary; the inverse edges expose its components when it is supplied.
     parameters = (; α, β, σ)
     (parameters, log_jacobian::Float64) = ((; α, β, σ), log_σ)
-    (α::Float64, β::Float64, σ::Float64) =
-        (parameters.α, parameters.β, parameters.σ)
 
     # Log prior: α, β ~ Normal(0, 10) and σ ~ HalfNormal(5). The half-normal
     # folds the reusable Normal endpoint with the log(2) truncation constant, so
@@ -100,13 +98,13 @@ docs_example = (;
 )
 """
 
-function evaluate_linear_regression_source()
+function evaluate_linear_regression_source(; model_only::Bool = false)
     # Bind only the data. The authored source imports the reusable Normal
     # distribution object itself and contains the complete PPL assembly with no
     # helper evaluator or separately prepared density/plate path.
     _evaluate_ppl_source(LINEAR_REGRESSION_SOURCE, @__MODULE__; bindings = (
         :LINREG_X, :LINREG_Y,
-    ))
+    ), model_only)
 end
 
 # Evaluate the authored source from `__init__`, after package precompilation has
@@ -116,7 +114,7 @@ end
 const _LINEAR_REGRESSION_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _LINEAR_REGRESSION_GRAPH_TEMPLATE[] = evaluate_linear_regression_source().model
+    _LINEAR_REGRESSION_GRAPH_TEMPLATE[] = evaluate_linear_regression_source(; model_only = true).model
     nothing
 end
 

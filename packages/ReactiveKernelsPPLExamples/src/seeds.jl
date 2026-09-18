@@ -52,10 +52,6 @@ using LogExpFunctions: logistic
     parameters = (; alpha0, alpha1, alpha12, alpha2, tau, b)
     (parameters, log_jacobian::Float64) =
         ((; alpha0, alpha1, alpha12, alpha2, tau, b), u_tau)
-    (alpha0::Float64, alpha1::Float64, alpha12::Float64, alpha2::Float64,
-     tau::Float64, b::AbstractVector{Float64}) =
-        (parameters.alpha0, parameters.alpha1, parameters.alpha12,
-         parameters.alpha2, parameters.tau, parameters.b)
 
     # Transformed parameter: sigma = 1 / sqrt(tau) (a deterministic function of a
     # parameter, so no extra Jacobian — Stan puts it in transformed parameters).
@@ -141,16 +137,16 @@ docs_example = (;
 )
 """
 
-function evaluate_seeds_source()
+function evaluate_seeds_source(; model_only::Bool = false)
     _evaluate_ppl_source(SEEDS_SOURCE, @__MODULE__; bindings = (
         :SEEDS_COUNTS, :SEEDS_TOTALS, :SEEDS_X1, :SEEDS_X2,
-    ))
+    ), model_only)
 end
 
 const _SEEDS_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _SEEDS_GRAPH_TEMPLATE[] = evaluate_seeds_source().model
+    _SEEDS_GRAPH_TEMPLATE[] = evaluate_seeds_source(; model_only = true).model
     nothing
 end
 

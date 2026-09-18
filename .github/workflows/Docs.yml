@@ -62,6 +62,7 @@ jobs:
               PackageSpec(path=joinpath(pwd(), "packages", "ReactiveKernelsNUTSExamples")),
               PackageSpec(path=joinpath(pwd(), "packages", "ReactiveKernelsStreamingStats")),
               PackageSpec(path=joinpath(pwd(), "packages", "ReactiveKernelsHMCDiagnostics")),
+              PackageSpec(path=joinpath(pwd(), "packages", "ReactiveKernelsReactantODESolvers")),
               PackageSpec(path=joinpath(deps, "AlgebraOfVega.jl")),
               PackageSpec(path=joinpath(deps, "DynamicObjects.jl")),
               PackageSpec(path=joinpath(deps, "HTMX.jl")),
@@ -77,6 +78,7 @@ jobs:
       - name: Build and deploy
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_OPTIONS: --max-old-space-size=8192
         run: julia --project=docs docs/make.jl
       - name: Upload rendered-docs advisory report
         if: always()

@@ -56,10 +56,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
     (parameters, log_jacobian::Float64) =
         ((; α_s2z, τ, effects_s2z),
          log_τ + sum_to_zero_log_jacobian)
-    (α_s2z::Float64,
-     τ::Float64,
-     effects_s2z::AbstractVector{Float64}) =
-        (parameters.α_s2z, parameters.τ, parameters.effects_s2z)
 
     K::Int = length(effects_s2z)
 
@@ -179,16 +175,16 @@ docs_example = (;
 )
 """
 
-function evaluate_sum_to_zero_source()
+function evaluate_sum_to_zero_source(; model_only::Bool = false)
     _evaluate_ppl_source(SUM_TO_ZERO_SOURCE, @__MODULE__; bindings = (
         :EIGHT_SCHOOLS_Y, :EIGHT_SCHOOLS_SIGMA,
-    ))
+    ), model_only)
 end
 
 const _SUM_TO_ZERO_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _SUM_TO_ZERO_GRAPH_TEMPLATE[] = evaluate_sum_to_zero_source().model
+    _SUM_TO_ZERO_GRAPH_TEMPLATE[] = evaluate_sum_to_zero_source(; model_only = true).model
     nothing
 end
 

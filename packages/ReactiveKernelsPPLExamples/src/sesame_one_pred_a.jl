@@ -42,8 +42,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 
     parameters = (; beta1, beta2, sigma)
     (parameters, log_jacobian::Float64) = ((; beta1, beta2, sigma), log_sigma)
-    (beta1::Float64, beta2::Float64, sigma::Float64) =
-        (parameters.beta1, parameters.beta2, parameters.sigma)
 
     # Transformed parameter / fitted mean: mu = beta1 + beta2 * encouraged.
     mu = plate(encouraged, beta1, beta2) do e, b1, b2
@@ -95,17 +93,17 @@ docs_example = (;
 )
 """
 
-function evaluate_sesame_one_pred_a_source()
+function evaluate_sesame_one_pred_a_source(; model_only::Bool = false)
     _evaluate_ppl_source(SESAME_ONE_PRED_A_SOURCE, @__MODULE__; bindings = (
         :SESAME_ENCOURAGED, :SESAME_WATCHED,
-    ))
+    ), model_only)
 end
 
 const _SESAME_ONE_PRED_A_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
     _SESAME_ONE_PRED_A_GRAPH_TEMPLATE[] =
-        evaluate_sesame_one_pred_a_source().model
+        evaluate_sesame_one_pred_a_source(; model_only = true).model
     nothing
 end
 

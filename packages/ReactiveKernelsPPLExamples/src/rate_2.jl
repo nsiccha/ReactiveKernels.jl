@@ -24,7 +24,6 @@ using LogExpFunctions: logistic, log1pexp
     jac2::Float64 = -log1pexp(-u2) - log1pexp(u2)
     log_jacobian::Float64 = jac1 + jac2
     parameters = (; theta1, theta2)
-    (theta1::Float64, theta2::Float64) = (parameters.theta1, parameters.theta2)
     prior::Float64 = beta(1.0, 1.0).logpdf(theta1) + beta(1.0, 1.0).logpdf(theta2)
     likelihood::Float64 = binomial(n1, theta1).logpdf(k1) + binomial(n2, theta2).logpdf(k2)
     posterior::Float64 = prior + likelihood + log_jacobian
@@ -42,9 +41,9 @@ docs_example = (; name = :rate_2_posterior, origin = "posteriordb Rate_2_model â
     inputs = (; q), model, kernel = density_kernel, output, requested_nodes,
     beta_object = beta, binomial_object = binomial)
 """
-evaluate_rate_2_source() = _evaluate_ppl_source(RATE_2_SOURCE, @__MODULE__; bindings = (:RATE2_N1, :RATE2_N2, :RATE2_K1, :RATE2_K2))
+evaluate_rate_2_source(; model_only::Bool = false) = _evaluate_ppl_source(RATE_2_SOURCE, @__MODULE__; bindings = (:RATE2_N1, :RATE2_N2, :RATE2_K1, :RATE2_K2), model_only)
 const _RATE_2_GRAPH_TEMPLATE = Ref{KernelSpec}()
-__init__() = (_RATE_2_GRAPH_TEMPLATE[] = evaluate_rate_2_source().model; nothing)
+__init__() = (_RATE_2_GRAPH_TEMPLATE[] = evaluate_rate_2_source(; model_only = true).model; nothing)
 "Build posteriordb Rate_2_model (difference between two Binomial-Beta rates, delta = theta1-theta2)."
 build_rate_2_graph() = compose(_RATE_2_GRAPH_TEMPLATE[])
 function demo()

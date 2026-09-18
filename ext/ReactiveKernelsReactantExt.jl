@@ -473,6 +473,43 @@ function Reactant.traced_type_inner(
     T
 end
 
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels.GraphReplicatedKernel,
+        path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where {T<:ReactiveKernels.GraphReplicatedKernel}
+    T
+end
+
+function ReactiveKernels._replicated_backend_call(
+        k::ReactiveKernels.GraphReplicatedKernel{B}, args) where {B}
+    names = Tuple(k.inputs[index].name for index in B)
+    fallback = ReactiveKernels._replica(k.target, names)
+    ReactiveKernels._replica_call(
+        fallback, args, getfield(args, first(B)))
+end
+
+# The batched AD wrapper is immutable compiler metadata for the same reason:
+# its scalar `PreparedADKernel` stays a host constant while only the batched
+# HAVE boundary is traced. Its execution method lowers the replica map to one
+# StableHLO batch operation, with reverse AD staged inside each scalar batch
+# cell by the same DifferentiationInterface backend.
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels._ReplicatedADKernel,
+        path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where {T<:ReactiveKernels._ReplicatedADKernel}
+    T
+end
+
 # Functional stateful transitions are immutable compiled programs. Their
 # PreparedKernel ensure tuple and RGF/AST bodies are static metadata; only the
 # materialized state snapshot and method argument are traced. A trace block
@@ -900,7 +937,7 @@ end
 
 # A traced `scan` lowers its sequential recurrence to a `stablehlo.while` carry
 # loop instead of unrolling into per-step scalar indexing.  `step` is the
-# prepared two-`want` step kernel `(carry, x, shared...) -> (new_carry, output)`.
+# prepared two-`want` step kernel `(carry, x..., shared...) -> (new_carry, output)`.
 # The threaded `carry` is an ordinary loop-carried variable — reassigned each
 # iteration, exactly like the transpiler's `state` (`transpiled_program.jl:17`) —
 # so a compound carry rides through as a loop-carried `NamedTuple`.  The per-step
@@ -911,23 +948,88 @@ end
 # remaining steps as one `stablehlo.while`.  RK-macro-only per decision
 # `17bnc6t`; Reactant untouched.  A non-scalar per-step output is a loud,
 # reported limitation, never a silent mis-lowering.
+#
+# `iterated` is the tuple of per-step sequences advanced in lockstep — one element
+# of each per step, spliced into the step call `step(carry, x..., shared...)`.
+# Under Reactant every iterated sequence must be a traced 1-D array so it can be
+# gathered inside the `while` by the loop counter; a host array (e.g. bound data)
+# has no exposed counter to index and is rejected with a clear message.
 @inline _scan_output_buffer(::Reactant.TracedRNumber{T}, n::Integer) where {T} =
     Reactant.promote_to(Reactant.TracedRArray, zeros(T, n))
+
+# Gather one matrix row as a HOST vector of traced scalars. The column count
+# rides as `Val{K}`: the `@trace` body re-traces every captured operand as a
+# tracer, so a value-`K` would turn the `1:K` comprehension range into an
+# uncollectable `TracedUnitRange` — the type-domain `K` stays concrete.
+@inline _scan_gather_row(
+        parent::Reactant.TracedRArray{<:Any,2}, i, ::Val{K}) where {K} =
+    Reactant.@allowscalar [parent[i, k] for k in 1:K]
 _scan_output_buffer(out, ::Integer) = throw(ArgumentError(
     "the Reactant scan lowering supports a scalar per-step output; got a " *
     "$(typeof(out)). Author the per-step output as a scalar, or report this " *
     "shape as an unimplemented scan lowering."))
 
 function ReactiveKernels._tensorized_scan(
-        step, xs::Reactant.TracedRArray{<:Any,1}, init, shared...)
-    n = length(xs)
+        step, init, iterated::Tuple{Reactant.TracedRArray{<:Any,1},Vararg{Any}},
+        shared::Tuple)
+    all(x -> x isa Reactant.TracedRArray{<:Any,1}, iterated) || throw(ArgumentError(
+        "the Reactant scan lowering requires every iterated sequence to be a " *
+        "traced 1-D array; pass each sequence traced (e.g. Reactant.to_rarray(data)) " *
+        "rather than as bound host data — a host array cannot be indexed by the " *
+        "stablehlo.while loop counter."))
+    n = length(first(iterated))
     n == 0 && throw(ArgumentError("scan requires a non-empty sequence"))
-    x1 = Reactant.@allowscalar xs[1]
+    all(x -> length(x) == n, iterated) || throw(DimensionMismatch(
+        "scan's iterated sequences must have equal length; got lengths " *
+        "$(map(length, iterated))."))
+    x1 = Reactant.@allowscalar map(xs -> xs[1], iterated)
+    carry, out1 = step(init, x1..., shared...)
+    buffer = _scan_output_buffer(out1, n)
+    Reactant.@allowscalar buffer[1] = out1
+    Reactant.@trace for i in 2:n
+        x = Reactant.@allowscalar map(xs -> xs[i], iterated)
+        carry, out = step(carry, x..., shared...)
+        Reactant.@allowscalar buffer[i] = out
+    end
+    buffer
+end
+
+# A traced `scan` over matrix ROWS — `scan(eachrow(M); ...)` with `M` traced,
+# the HMM forward-algorithm shape — lowers to the same single `stablehlo.while`
+# carry loop as the 1-D method above. The loop closes over the traced parent
+# alone and gathers row `i` by the counter with the `allowscalar` idiom,
+# threads the carry (scalar, `NamedTuple`, or a vector such as an HMM belief
+# state), and writes scalar per-step outputs into the preallocated traced
+# buffer. The first step runs eagerly to seed the carry and fix the output
+# element type, so `N == 1` runs with an empty loop body. A non-scalar
+# per-step output is the same loud, reported limitation as on the 1-D path.
+# Two representation facts pin this shape: the step indexes its row (`row[1]`)
+# without `allowscalar`, which is legal only for a HOST container, so each
+# gathered row is a host vector of traced scalars; and the `RowSlices` wrapper
+# itself is not while-carryable (Reactant cannot trace its `OneTo` axes), so
+# it never crosses the `@trace` boundary — only the parent does. Shapes this
+# method does NOT claim — a host (untraced) parent, `eachrow` over a
+# non-matrix, or a row-slices sequence beside other iterated sequences — keep
+# falling through to the generic native loop, which traces unrolled with exact
+# values. `RowSlices` is `eachrow`'s return type across the supported Julia
+# line; a rename would fail loudly here at precompile, never silently.
+function ReactiveKernels._tensorized_scan(
+        step, init,
+        iterated::Tuple{<:Base.RowSlices{<:Reactant.TracedRArray{<:Any,2}}},
+        shared::Tuple)
+    parent = only(iterated).parent
+    n = size(parent, 1)
+    K = size(parent, 2)
+    n == 0 && throw(ArgumentError("scan requires a non-empty sequence"))
+    # Built OUTSIDE the `@trace` body: the body re-traces every captured value
+    # operand, so an in-body `Val(K)` would meet a traced `K` and die.
+    Kval = Val(K)
+    x1 = _scan_gather_row(parent, 1, Kval)
     carry, out1 = step(init, x1, shared...)
     buffer = _scan_output_buffer(out1, n)
     Reactant.@allowscalar buffer[1] = out1
     Reactant.@trace for i in 2:n
-        x = Reactant.@allowscalar xs[i]
+        x = _scan_gather_row(parent, i, Kval)
         carry, out = step(carry, x, shared...)
         Reactant.@allowscalar buffer[i] = out
     end
@@ -1317,6 +1419,77 @@ function ReactiveKernels._replica_call(
     length(results) == 1 ? only(results) : results
 end
 
+function _replica_ad_static_slice(arg, expected_rank, replica_index)
+    if expected_rank == 0
+        row = Reactant.Ops.reshape(
+            arg, Int64[1, length(arg)])
+        scalar = Base.getindex(row, 1:1, replica_index)
+        zero_cotangent = Reactant.promote_to(
+            Reactant.TracedRNumber{Reactant.unwrapped_eltype(arg)},
+            Base.zero(Reactant.unwrapped_eltype(arg)))
+        reduced = Reactant.Ops.reduce(
+            scalar, zero_cotangent, Int64[1],
+            ((left, right) -> left + right))
+        return Reactant.TracedRNumber{
+            Reactant.unwrapped_eltype(arg)}((), reduced.mlir_data)
+    end
+    indices = ntuple(dimension -> dimension == ndims(arg) ?
+        replica_index : Colon(), ndims(arg))
+    sliced = getindex(arg, indices...)
+    sliced
+end
+
+function ReactiveKernels._replica_ad_call(
+        k::ReactiveKernels._ReplicatedADKernel{B,BT,AT}, args,
+        marker::Reactant.RArray) where {B,BT,AT}
+    prepared = k.prepared
+    replica_count = size(marker, ndims(marker))
+    for index in B
+        arg = getfield(args, index)
+        expected_rank = ReactiveKernels._replica_rank(
+            ReactiveKernels.valtype(k.inputs[index])) + 1
+        ndims(arg) == expected_rank || throw(DimensionMismatch(
+            "replica port :$(k.inputs[index].name) has rank $(ndims(arg)); " *
+            "expected $expected_rank (scalar rank plus one trailing replica axis)"))
+        size(arg, ndims(arg)) == replica_count || throw(DimensionMismatch(
+            "replica port :$(k.inputs[index].name) has " *
+            "$(size(arg, ndims(arg))) replicas; expected $replica_count"))
+    end
+
+    active_index = Int(typeof(prepared).parameters[1])
+    results = ntuple(replica_count) do replica_index
+        scalar_args = ntuple(length(args)) do argument_index
+            arg = getfield(args, argument_index)
+            position = findfirst(==(argument_index), B)
+            position === nothing && return arg
+            expected_rank = ReactiveKernels._replica_rank(
+                ReactiveKernels.valtype(k.inputs[argument_index]))
+            _replica_ad_static_slice(arg, expected_rank, replica_index)
+        end
+        point, contexts = ReactiveKernels._ad_arguments(
+            Val(active_index), scalar_args)
+        ReactiveKernels._ad_prepared_value_and_gradient(
+            prepared, point, contexts)
+    end
+
+    values = ntuple(index -> Reactant.Ops.broadcast_in_dim(
+        first(results[index]), Int64[], Int64[1]), replica_count)
+    value = Reactant.Ops.concatenate(collect(values), 1)
+    gradient_rank = ReactiveKernels._replica_rank(AT)
+    if gradient_rank == 0
+        gradients = ntuple(index -> Reactant.Ops.broadcast_in_dim(
+            last(results[index]), Int64[], Int64[1]), replica_count)
+    else
+        gradients = ntuple(index -> Reactant.Ops.reshape(
+            last(results[index]),
+            vcat(collect(Int64, size(last(results[index]))), Int64[1])),
+            replica_count)
+    end
+    gradient = Reactant.Ops.concatenate(
+        collect(gradients), gradient_rank + 1)
+    value, gradient
+end
+
 # --- Reactant-compiled automatic differentiation -----------------------------
 # Selected by core's `compile_ad_gradient` / `compile_ad_value_and_gradient` when
 # the active argument is a Reactant-traced value. The differentiation engine is
@@ -1359,7 +1532,11 @@ function ReactiveKernels._ad_prepared_value_and_gradient(
         prepared::ReactiveKernels.PreparedADKernel{I},
         point::Union{Reactant.TracedRArray,Reactant.TracedRNumber},
         contexts) where {I}
-    kernel, _ = ReactiveKernels._externalize_bound_arrays(prepared.kernel)
+    # These contexts were built from `prepared.external_values`, which the
+    # native preparation externalizes as owning view copies (not prebuilt
+    # views); the re-externalized kernel must expect that same hidden shape.
+    kernel, _ = ReactiveKernels._externalize_bound_arrays(
+        prepared.kernel; materialize_view_copies = true)
     call = ReactiveKernels._ADKernelCall{I,typeof(kernel)}(kernel)
     DifferentiationInterface.value_and_gradient(
         call, prepared.backend, point, contexts...)
@@ -1372,6 +1549,37 @@ function ReactiveKernels._ad_prepared_value_and_gradient!(
         prepared, point, contexts)
     copyto!(gradient, derivative)
     value, gradient
+end
+
+# A prepared-AD call with a native active input inside a Reactant trace cannot
+# stage: Reactant passes native compile inputs through untraced, and its
+# autodiff overlay then intercepts the native Enzyme call with all-native
+# arguments, which returns a correct value with a silent zero gradient (seen
+# with and without any ReactiveKernels code in the closure). Refuse loudly and
+# name the staged shape instead of baking that corruption into the program.
+# Contexts are always a (possibly empty) Tuple at every call site; constraining
+# on that keeps this an overload of the core fallback rather than an overwrite.
+function ReactiveKernels._ad_trace_sanity(point, contexts::Tuple)
+    if Reactant.within_compile() &&
+            !(point isa Union{Reactant.TracedRArray,Reactant.TracedRNumber})
+        throw(ArgumentError(
+            "prepared AD with a native active input of type $(typeof(point)) " *
+            "inside a Reactant trace would silently return a zero gradient; " *
+            "compile the enclosing function with Reactant.to_rarray inputs " *
+            "so the staged derivative is selected (reactivekernels-use §7a)"))
+    end
+    nothing
+end
+
+# The positional `ad_value_and_gradient!` fast path builds its point inline and
+# never passes the `_ad_prepared_arguments` check above, so it needs its own
+# refusal. A traced point still selects the staged method; anything else
+# reaching the native call in a trace is the same silent-zero shape.
+function ReactiveKernels._ad_prepared_value_and_gradient!(
+        prepared::ReactiveKernels.PreparedADKernel, gradient, point, contexts)
+    ReactiveKernels._ad_trace_sanity(point, contexts)
+    invoke(ReactiveKernels._ad_prepared_value_and_gradient!,
+           Tuple{Any,Any,Any,Any}, prepared, gradient, point, contexts)
 end
 
 function _rk_reactant_compile_ad_call(

@@ -51,8 +51,6 @@ using LogExpFunctions: logistic, log1pexp
     (parameters, log_jacobian::Float64) =
         ((; alpha, beta1, beta2, beta3),
          jac_alpha + jac_beta1 + jac_beta2 + jac_beta3)
-    (alpha::Float64, beta1::Float64, beta2::Float64, beta3::Float64) =
-        (parameters.alpha, parameters.beta1, parameters.beta2, parameters.beta3)
 
     # Transformed parameters: the log-rate cubic trend. Captured scalars ride the
     # plate as explicit shared arguments (a scalar plate argument broadcasts
@@ -113,19 +111,19 @@ docs_example = (;
 )
 """
 
-function evaluate_glm_poisson_source()
+function evaluate_glm_poisson_source(; model_only::Bool = false)
     # Bind only the data. The authored source imports the reusable Poisson
     # endpoint itself and contains the complete PPL assembly with no helper
     # evaluator or separately prepared density/plate path.
     _evaluate_ppl_source(GLM_POISSON_SOURCE, @__MODULE__; bindings = (
         :GLM_POISSON_YEAR, :GLM_POISSON_C,
-    ))
+    ), model_only)
 end
 
 const _GLM_POISSON_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _GLM_POISSON_GRAPH_TEMPLATE[] = evaluate_glm_poisson_source().model
+    _GLM_POISSON_GRAPH_TEMPLATE[] = evaluate_glm_poisson_source(; model_only = true).model
     nothing
 end
 

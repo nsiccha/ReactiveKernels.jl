@@ -51,9 +51,6 @@ using LogExpFunctions: logistic, log1pexp, logaddexp
     (parameters, log_jacobian::Float64) =
         ((; omega, mean_p, sigma, eps_raw),
          jac_omega + jac_mean_p + jac_sigma)
-    (omega::Float64, mean_p::Float64, sigma::Float64,
-     eps_raw::AbstractVector{Float64}) =
-        (parameters.omega, parameters.mean_p, parameters.sigma, parameters.eps_raw)
 
     # Random-effect prior: eps_rawⱼ ~ Normal(0, 1).
     eps_pointwise = plate(eps_raw) do er
@@ -118,16 +115,16 @@ docs_example = (;
 )
 """
 
-function evaluate_mh_source()
+function evaluate_mh_source(; model_only::Bool = false)
     _evaluate_ppl_source(MH_SOURCE, @__MODULE__; bindings = (
         :MH_Y, :MH_LCHOOSE, :MH_T, :MH_M,
-    ))
+    ), model_only)
 end
 
 const _MH_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _MH_GRAPH_TEMPLATE[] = evaluate_mh_source().model
+    _MH_GRAPH_TEMPLATE[] = evaluate_mh_source(; model_only = true).model
     nothing
 end
 

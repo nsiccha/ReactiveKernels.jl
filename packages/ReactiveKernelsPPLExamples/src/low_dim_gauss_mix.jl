@@ -61,10 +61,6 @@ using LogExpFunctions: logistic, log1pexp, logaddexp
     (parameters, log_jacobian::Float64) =
         ((; mu1, mu2, sigma1, sigma2, theta),
          u_mu2 + u_sigma1 + u_sigma2 + (-log1pexp(-u_theta)) + (-log1pexp(u_theta)))
-    (mu1::Float64, mu2::Float64, sigma1::Float64, sigma2::Float64,
-     theta::Float64) =
-        (parameters.mu1, parameters.mu2, parameters.sigma1, parameters.sigma2,
-         parameters.theta)
 
     # Priors. mu ~ Normal(0,2) (over the constrained ordered means); sigma ~
     # Normal(0,2) (half-normal, plain normal_lpdf); theta ~ Beta(5,5).
@@ -121,17 +117,17 @@ docs_example = (;
 )
 """
 
-function evaluate_low_dim_gauss_mix_source()
+function evaluate_low_dim_gauss_mix_source(; model_only::Bool = false)
     _evaluate_ppl_source(LOW_DIM_GAUSS_MIX_SOURCE, @__MODULE__; bindings = (
         :LOW_DIM_GAUSS_MIX_Y,
-    ))
+    ), model_only)
 end
 
 const _LOW_DIM_GAUSS_MIX_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
     _LOW_DIM_GAUSS_MIX_GRAPH_TEMPLATE[] =
-        evaluate_low_dim_gauss_mix_source().model
+        evaluate_low_dim_gauss_mix_source(; model_only = true).model
     nothing
 end
 

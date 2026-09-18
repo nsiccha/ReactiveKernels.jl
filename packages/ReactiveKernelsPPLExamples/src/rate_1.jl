@@ -68,14 +68,14 @@ docs_example = (;
 )
 """
 
-function evaluate_rate_1_source()
-    _evaluate_ppl_source(RATE_1_SOURCE, @__MODULE__; bindings = (:RATE1_N, :RATE1_K))
+function evaluate_rate_1_source(; model_only::Bool = false)
+    _evaluate_ppl_source(RATE_1_SOURCE, @__MODULE__; bindings = (:RATE1_N, :RATE1_K), model_only)
 end
 
 const _RATE_1_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _RATE_1_GRAPH_TEMPLATE[] = evaluate_rate_1_source().model
+    _RATE_1_GRAPH_TEMPLATE[] = evaluate_rate_1_source(; model_only = true).model
     nothing
 end
 

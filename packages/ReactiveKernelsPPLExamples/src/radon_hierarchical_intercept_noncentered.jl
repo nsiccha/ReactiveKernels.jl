@@ -103,10 +103,6 @@ using LogExpFunctions: logistic, log1pexp
     (parameters, log_jacobian::Float64) =
         ((; alpha_raw, beta, mu_alpha, sigma_alpha, sigma_y),
          log_sigma_alpha + log_sigma_y)
-    (alpha_raw::AbstractVector{Float64}, beta::AbstractVector{Float64},
-     mu_alpha::Float64, sigma_alpha::Float64, sigma_y::Float64) =
-        (parameters.alpha_raw, parameters.beta, parameters.mu_alpha,
-         parameters.sigma_alpha, parameters.sigma_y)
 
     # beta[1] (coefficient on log_uppm) and beta[2] (floor slope) as scalars —
     # sliced from the reconstructed length-2 `beta`.
@@ -196,16 +192,16 @@ docs_example = (;
 )
 """
 
-function evaluate_radon_hierarchical_intercept_noncentered_source()
+function evaluate_radon_hierarchical_intercept_noncentered_source(; model_only::Bool = false)
     _evaluate_ppl_source(RADON_HIERARCHICAL_INTERCEPT_NONCENTERED_SOURCE, @__MODULE__;
-        bindings = (:RADON_HIN_COUNTY, :RADON_HIN_UPPM, :RADON_HIN_FLOOR, :RADON_HIN_LOG))
+        bindings = (:RADON_HIN_COUNTY, :RADON_HIN_UPPM, :RADON_HIN_FLOOR, :RADON_HIN_LOG), model_only)
 end
 
 const _RADON_HIN_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
     _RADON_HIN_GRAPH_TEMPLATE[] =
-        evaluate_radon_hierarchical_intercept_noncentered_source().model
+        evaluate_radon_hierarchical_intercept_noncentered_source(; model_only = true).model
     nothing
 end
 

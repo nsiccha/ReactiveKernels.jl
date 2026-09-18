@@ -209,24 +209,27 @@ end
     sum(_tensorized_broadcast(*, a, b))
 end
 
-# The sequential-scan primitive `scan(xs, Ref(shared)...; init) do carry, x, s… end`
+# The sequential-scan primitive `scan(xs..., Ref(shared)...; init) do carry, x…, s… end`
 # lowers to this.  `step` is the prepared 2-`want` step kernel
-# `(carry, x, shared...) -> (new_carry, output)`; the scan threads `carry`
-# (seeded by `init`) over `xs` in order and collects the per-step outputs.  The
-# default is the ordinary native loop — already correct, and the arma11 `errors`
-# recurrence proves the native form works.  A tracing backend SPECIALIZES this
-# (on a traced `xs`) to emit a `stablehlo.while` carry loop, so the natural
-# sequential form lowers under Reactant without unrolling (RK-macro-only per
-# decision `17bnc6t`; Reactant untouched).
-@inline function _tensorized_scan(step, xs, init, shared...)
-    idx = eachindex(xs)
+# `(carry, x..., shared...) -> (new_carry, output)`; the scan threads `carry`
+# (seeded by `init`) over the `iterated` sequences in lockstep, one element of
+# each per step, and collects the per-step outputs.  The default is the ordinary
+# native loop — already correct, and the arma11 `errors` recurrence proves the
+# native form works.  A tracing backend SPECIALIZES this (on traced `iterated`
+# sequences) to emit a `stablehlo.while` carry loop, so the natural sequential
+# form lowers under Reactant without unrolling (RK-macro-only per decision
+# `17bnc6t`; Reactant untouched).  `iterated` and `shared` are tuples; the common
+# case is a one-tuple `iterated`, and `eachindex(iterated...)` validates that
+# several sequences share axes (a `DimensionMismatch` otherwise).
+@inline function _tensorized_scan(step, init, iterated::Tuple, shared::Tuple)
+    idx = eachindex(iterated...)
     isempty(idx) && throw(ArgumentError("scan requires a non-empty sequence"))
     i1 = first(idx)
-    carry, out1 = step(init, xs[i1], shared...)
-    result = similar(xs, typeof(out1))
+    carry, out1 = step(init, map(xs -> xs[i1], iterated)..., shared...)
+    result = similar(first(iterated), typeof(out1))
     result[i1] = out1
     for i in Iterators.drop(idx, 1)
-        carry, out = step(carry, xs[i], shared...)
+        carry, out = step(carry, map(xs -> xs[i], iterated)..., shared...)
         result[i] = out
     end
     result

@@ -30,7 +30,7 @@ end
                                         GLM_BINOMIAL_N)
 
     @testset "authored on the current baseline surface" begin
-        @test occursin("binomial(n, logistic(", GLM_BINOMIAL_SOURCE)
+        @test occursin("binomial(; n = n, logit = lp).logpdf(c)", GLM_BINOMIAL_SOURCE)
         @test occursin("normal(0.0, 100.0).logpdf", GLM_BINOMIAL_SOURCE)
         @test occursin("logit_p = plate(", GLM_BINOMIAL_SOURCE)
         @test !occursin("struct ", GLM_BINOMIAL_SOURCE)

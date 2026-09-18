@@ -63,10 +63,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
     parameters = (; beta1, beta2, beta3, beta4, beta5, beta6, beta7, sigma)
     (parameters, log_jacobian::Float64) =
         ((; beta1, beta2, beta3, beta4, beta5, beta6, beta7, sigma), u_sigma)
-    (beta1::Float64, beta2::Float64, beta3::Float64, beta4::Float64,
-     beta5::Float64, beta6::Float64, beta7::Float64, sigma::Float64) =
-        (parameters.beta1, parameters.beta2, parameters.beta3, parameters.beta4,
-         parameters.beta5, parameters.beta6, parameters.beta7, parameters.sigma)
 
     # Transformed parameter: the fitted mean weight, the linear predictor
     # μ = β₁ + β₂·diam1 + β₃·diam2 + β₄·canopy_height + β₅·total_height
@@ -131,20 +127,20 @@ docs_example = (;
 )
 """
 
-function evaluate_mesquite_source()
+function evaluate_mesquite_source(; model_only::Bool = false)
     # Bind only the data. The authored source imports the reusable Normal
     # endpoint itself and contains the complete PPL assembly with no helper
     # evaluator or separately prepared density/plate path.
     _evaluate_ppl_source(MESQUITE_SOURCE, @__MODULE__; bindings = (
         :MESQ_WEIGHT, :MESQ_DIAM1, :MESQ_DIAM2, :MESQ_CANOPY_HEIGHT,
         :MESQ_TOTAL_HEIGHT, :MESQ_DENSITY, :MESQ_GROUP,
-    ))
+    ), model_only)
 end
 
 const _MESQUITE_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _MESQUITE_GRAPH_TEMPLATE[] = evaluate_mesquite_source().model
+    _MESQUITE_GRAPH_TEMPLATE[] = evaluate_mesquite_source(; model_only = true).model
     nothing
 end
 

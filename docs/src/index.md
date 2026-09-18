@@ -170,7 +170,6 @@ end
 
 @kernel location_scale(standard, location::Float64, scale::Float64) = begin
     log_scale::Float64 = log(scale)
-    scale::Float64 = exp(log_scale)
 
     standardized(x::Float64)::Float64 = (x - location) / scale
     inv(standardized, z::Float64)::Float64 = location + scale * z
@@ -225,18 +224,22 @@ constructed, and the endpoint is still transparently spliced with no runtime
 hygienic internal recipes, so natural calls such as
 `normal(0.0, 5.0).logpdf(x)` remain transparent too.
 
-Named relations stay available as alternate cuts. Here `scale = exp(log_scale)`
-and `log_scale = log(scale)` are ordinary bidirectional recipes: the natural
-constructor has `scale`, while this view starts from `log_scale` instead:
+Named relations stay available as alternate cuts. Authoring one direction is
+enough: a unary call such as `log_scale = log(scale)` gains the reverse edge
+(`scale = exp(log_scale)`, via InverseFunctions.jl) automatically, so the
+natural constructor has `scale` while this view starts from `log_scale`
+instead:
 
 ```julia
 from_log_scale = extract(normal;
     have = (:x, :location, :log_scale), want = :logpdf)
 ```
 
-If both sides are in `have`, the planner treats both as authoritative and runs
-neither conversion. `inv(standardized, z)` is an explicit authored inverse edge,
-not symbolic inversion. Joint extraction such as
+Tuple packs unpack the same way: `params = (; x, y)` lets a caller holding
+only `params` recover `x` and `y` individually, with no explicit unpacking
+recipes. If both sides are in `have`, the planner treats both as authoritative
+and runs neither conversion. `inv(standardized, z)` is an explicit authored
+inverse edge, not symbolic inversion. Joint extraction such as
 `want = (:logpdf, :standardized)` shares the same standardized value
 automatically; separately authored or effectful work is never merged merely
 because its expressions look alike.
@@ -278,11 +281,12 @@ planner reruns just the missing part — with all of that cache bookkeeping
 staying outside the generated kernel.
 
 Mathematical `PreparedKernel`s that Reactant can trace can also run through the
-optional compiler extension, and `replica` lifts a whole scalar kernel across an
-extra batch axis. The reviewed distribution, PPL, and compiled-AD evidence now
-lives under the top-level [Reactant integration](reactant.md) section. Sampling
-receipts are kept last and static; NUTS and WALNUTS compiler/runtime code is not
-executed during documentation builds.
+optional compiler extension, and `vectorize` / `prepare_batched` lift a whole
+scalar kernel across an extra position axis. The reviewed distribution, PPL, and
+compiled-AD evidence now lives under the top-level
+[Reactant integration](reactant.md) section. Sampling receipts are kept last and
+static; NUTS and WALNUTS compiler/runtime code is not executed during
+documentation builds.
 
 > **Status:** early development — the public API is still being shaped.
 

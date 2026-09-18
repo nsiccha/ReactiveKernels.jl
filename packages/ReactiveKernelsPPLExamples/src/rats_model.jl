@@ -70,12 +70,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
     (parameters, log_jacobian::Float64) =
         ((; alpha, beta, mu_alpha, mu_beta, sigma_y, sigma_alpha, sigma_beta),
          log_sigma_y + log_sigma_alpha + log_sigma_beta)
-    (alpha::AbstractVector{Float64}, beta::AbstractVector{Float64},
-     mu_alpha::Float64, mu_beta::Float64, sigma_y::Float64,
-     sigma_alpha::Float64, sigma_beta::Float64) =
-        (parameters.alpha, parameters.beta, parameters.mu_alpha,
-         parameters.mu_beta, parameters.sigma_y, parameters.sigma_alpha,
-         parameters.sigma_beta)
 
     # Population priors: mu_alpha ~ Normal(0, 100), mu_beta ~ Normal(0, 100). The
     # three scales are FLAT improper (only the exp Jacobian above, no density).
@@ -163,16 +157,16 @@ docs_example = (;
 )
 """
 
-function evaluate_rats_model_source()
+function evaluate_rats_model_source(; model_only::Bool = false)
     _evaluate_ppl_source(RATS_MODEL_SOURCE, @__MODULE__; bindings = (
         :RATS_RAT, :RATS_X, :RATS_Y, :RATS_XBAR,
-    ))
+    ), model_only)
 end
 
 const _RATS_MODEL_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _RATS_MODEL_GRAPH_TEMPLATE[] = evaluate_rats_model_source().model
+    _RATS_MODEL_GRAPH_TEMPLATE[] = evaluate_rats_model_source(; model_only = true).model
     nothing
 end
 

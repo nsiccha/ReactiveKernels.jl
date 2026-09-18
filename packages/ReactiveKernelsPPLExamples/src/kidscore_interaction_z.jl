@@ -81,10 +81,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
     parameters = (; beta1, beta2, beta3, beta4, sigma)
     (parameters, log_jacobian::Float64) =
         ((; beta1, beta2, beta3, beta4, sigma), log_sigma)
-    (beta1::Float64, beta2::Float64, beta3::Float64, beta4::Float64,
-     sigma::Float64) =
-        (parameters.beta1, parameters.beta2, parameters.beta3, parameters.beta4,
-         parameters.sigma)
 
     # Transformed data (Stan's `mean` / `sd`): scalar mean and SAMPLE standard
     # deviation (divisor N-1) over the observed rows, matching Stan's mean()/sd()
@@ -182,18 +178,18 @@ docs_example = (;
 )
 """
 
-function evaluate_kidscore_interaction_z_source()
+function evaluate_kidscore_interaction_z_source(; model_only::Bool = false)
     _evaluate_ppl_source(KIDSCORE_INTERACTION_Z_SOURCE, @__MODULE__; bindings = (
         :INTERACTION_Z_KID_SCORE, :INTERACTION_Z_MOM_HS, :INTERACTION_Z_MOM_IQ,
         :INTERACTION_Z_MOM_HS_NEW, :INTERACTION_Z_MOM_IQ_NEW,
-    ))
+    ), model_only)
 end
 
 const _KIDSCORE_INTERACTION_Z_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
     _KIDSCORE_INTERACTION_Z_GRAPH_TEMPLATE[] =
-        evaluate_kidscore_interaction_z_source().model
+        evaluate_kidscore_interaction_z_source(; model_only = true).model
     nothing
 end
 

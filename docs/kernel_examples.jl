@@ -54,6 +54,37 @@ function _generated_source(expr::Expr)
     sprint(Base.show_unquoted, expr; context = :limit => false)
 end
 
+# Vitepress/Shiki amplifies a single long generated-code line into several MiB
+# of highlighted HTML/JS. Preserve the executed artifact and its exact output in
+# the build gate, but give readers a bounded generated preview rather than
+# highlighting megabytes of inlined constants.
+function _display_code(label::AbstractString, code::AbstractString;
+                       max_bytes::Int = 64 * 1024)
+    sizeof(code) <= max_bytes && return code
+    lines = split(code, '\n'; keepempty = true)
+    head_lines = first(lines, 24)
+    tail_lines = last(lines, 12)
+    while sizeof(join(vcat(head_lines, ["…"], tail_lines), '\n')) > max_bytes &&
+          length(head_lines) > 4 && length(tail_lines) > 2
+        if length(head_lines) > length(tail_lines)
+            head_lines = head_lines[1:(end - 1)]
+        else
+            tail_lines = tail_lines[2:end]
+        end
+    end
+    omitted_bytes = sizeof(code) -
+        sizeof(join(vcat(head_lines, tail_lines), '\n'))
+    return join(vcat(
+        head_lines,
+        [
+            "# … display bounded for docs build memory …",
+            "# $(length(lines)) lines total; about $(Base.format_bytes(sizeof(code))) total,",
+            "# about $(Base.format_bytes(max(omitted_bytes, 0))) omitted here.",
+        ],
+        tail_lines,
+    ), '\n')
+end
+
 function _readable_generated_source(expr::Expr, context, label)
     readable = ReactiveKernels._readable_expr(expr, context)
     occursin(r"__ops__\[\d+\]", string(readable)) && error(
@@ -289,6 +320,54 @@ function setup_arma11!(mod::Module)
     nothing
 end
 
+function setup_covid19imperial!(mod::Module)
+    if !isdefined(mod, :Covid19ImperialExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: Covid19ImperialExample))
+    end
+    # Bind only the RAW posteriordb arrays; the displayed PPL assembly derives
+    # every model-specific preprocessing step (covariate reshape, observed-grid
+    # mask, deaths grid, count log-factorial) as named in-graph nodes and reuses
+    # the shared `normal`, `gamma`, and `exponential` endpoints directly.
+    Core.eval(mod, :(using .Covid19ImperialExample: COVID19IMPERIAL_X,
+        COVID19IMPERIAL_EPIDEMICSTART, COVID19IMPERIAL_N, COVID19IMPERIAL_DEATHS,
+        COVID19IMPERIAL_SI, COVID19IMPERIAL_F, COVID19IMPERIAL_POP,
+        COVID19IMPERIAL_M, COVID19IMPERIAL_P, COVID19IMPERIAL_N0,
+        COVID19IMPERIAL_N2))
+    nothing
+end
+
+function setup_garch11!(mod::Module)
+    if !isdefined(mod, :GARCH11Example)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: GARCH11Example))
+    end
+    Core.eval(mod, :(using .GARCH11Example: GARCH11_Y, GARCH11_SIGMA1))
+    nothing
+end
+
+function setup_hmm_example!(mod::Module)
+    if !isdefined(mod, :HmmExampleExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: HmmExampleExample))
+    end
+    Core.eval(mod, :(using .HmmExampleExample: HMM_EXAMPLE_Y, HMM_EXAMPLE_K))
+    nothing
+end
+
+function setup_hmm_gaussian!(mod::Module)
+    if !isdefined(mod, :HmmGaussianExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: HmmGaussianExample))
+    end
+    Core.eval(mod, :(using .HmmGaussianExample: HMM_GAUSSIAN_Y, HMM_GAUSSIAN_K))
+    nothing
+end
+
+function setup_iohmm_reg!(mod::Module)
+    if !isdefined(mod, :IohmmRegExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: IohmmRegExample))
+    end
+    Core.eval(mod, :(using .IohmmRegExample: IOHMM_REG_Y, IOHMM_REG_U, IOHMM_REG_K))
+    nothing
+end
+
 function setup_mvnormal_regression!(mod::Module)
     if !isdefined(mod, :MVNormalRegressionExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: MVNormalRegressionExample))
@@ -309,6 +388,326 @@ function setup_bound_regression!(mod::Module)
     # shared `normal` distribution object directly and authors the
     # standardization prefix inline.
     Core.eval(mod, :(using .BoundRegressionExample: BOUND_RAW_X, BOUND_Y))
+    nothing
+end
+
+function setup_diamonds!(mod::Module)
+    if !isdefined(mod, :DiamondsExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: DiamondsExample))
+    end
+    # Bind only the data. The displayed PPL assembly imports the shared `normal`
+    # and `student_t` endpoints itself and authors the brms centered-design
+    # prefix inline; binding the raw `X` port hoists it.
+    Core.eval(mod, :(using .DiamondsExample: DIAMONDS_X, DIAMONDS_Y, DIAMONDS_PRIOR_ONLY))
+    nothing
+end
+
+function setup_normal_mixture_k!(mod::Module)
+    if !isdefined(mod, :NormalMixtureKExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: NormalMixtureKExample))
+    end
+    # Bind only the data and the component count K. The displayed PPL assembly
+    # imports the shared `normal` endpoint itself and authors the inverse-ILR
+    # simplex transform and the marginalized K-way mixture likelihood inline.
+    Core.eval(mod, :(using .NormalMixtureKExample: NORMAL_MIXTURE_K_Y, NORMAL_MIXTURE_K_K))
+    nothing
+end
+
+function setup_hmm_drive_1!(mod::Module)
+    if !isdefined(mod, :HmmDrive1Example)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: HmmDrive1Example))
+    end
+    # Bind only the raw data. The displayed PPL assembly imports and reuses the
+    # shared `normal` and `dirichlet` distribution objects directly and authors
+    # the forward-algorithm `scan` inline; no helper evaluator is injected.
+    Core.eval(mod, :(using .HmmDrive1Example:
+        HMM_DRIVE_1_U, HMM_DRIVE_1_V, HMM_DRIVE_1_ALPHA, HMM_DRIVE_1_TAU,
+        HMM_DRIVE_1_RHO))
+    nothing
+end
+
+function setup_dogs_nonhierarchical!(mod::Module)
+    if !isdefined(mod, :DogsNonhierarchicalExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: DogsNonhierarchicalExample))
+    end
+    # Bind only the raw y matrix. The displayed PPL assembly imports the shared
+    # `normal` and `bernoulli` endpoints itself and derives the running-count
+    # design (the strict-upper-triangular operator, prev_shock = y·C, …) in-graph.
+    Core.eval(mod, :(using .DogsNonhierarchicalExample: DOGS_NH_Y))
+    nothing
+end
+
+function setup_logistic_regression_rhs!(mod::Module)
+    if !isdefined(mod, :LogisticRegressionRHSExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: LogisticRegressionRHSExample))
+    end
+    # Bind the data and the fixed horseshoe hyper-scalars. The displayed PPL
+    # assembly imports the shared endpoints itself and authors the regularized
+    # horseshoe (lambda_tilde, the exp support transforms) inline.
+    Core.eval(mod, :(using .LogisticRegressionRHSExample:
+        LOGISTIC_RHS_X, LOGISTIC_RHS_Y, LOGISTIC_RHS_HYPER))
+    nothing
+end
+
+function setup_lda!(mod::Module)
+    if !isdefined(mod, :LDAExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: LDAExample))
+    end
+    # Bind only the raw data (the rendered default is three_men1-ldaK2, whose
+    # transformed-data ones-vector priors are LDA_ALPHA/LDA_BETA). The displayed
+    # PPL assembly imports the shared `dirichlet` endpoint itself and authors the
+    # in-graph inverse-ILR simplex transform and the marginalized likelihood inline.
+    Core.eval(mod, :(using .LDAExample: LDA_DOC, LDA_W, LDA_ALPHA, LDA_BETA, LDA_M))
+    nothing
+end
+
+function setup_nn_rbm!(mod::Module)
+    if !isdefined(mod, :NNRBMExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: NNRBMExample))
+    end
+    # Bind only the data and the fixed hidden-unit count (the rendered default is
+    # mnist_100-nn_rbm1bJ10). The displayed PPL assembly imports the shared
+    # `normal`/`inverse_gamma`/`categorical_logit` endpoints itself and authors the
+    # tanh hidden layer and reference-coded softmax inline.
+    Core.eval(mod, :(using .NNRBMExample: NN_RBM_X, NN_RBM_Y, NN_RBM_K, NN_RBM_J))
+    nothing
+end
+
+function setup_gp_regr!(mod::Module)
+    if !isdefined(mod, :GPRegrExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: GPRegrExample))
+    end
+    # Bind only the real data the displayed source references; the PPL assembly
+    # imports and reuses the shared `normal` and `gamma` endpoints directly.
+    Core.eval(mod, :(using .GPRegrExample: GP_REGR_X, GP_REGR_Y))
+    nothing
+end
+
+function setup_gp_pois_regr!(mod::Module)
+    if !isdefined(mod, :GPPoisRegrExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: GPPoisRegrExample))
+    end
+    Core.eval(mod, :(using .GPPoisRegrExample: GP_POIS_X, GP_POIS_K))
+    nothing
+end
+
+function setup_accel_gp!(mod::Module)
+    if !isdefined(mod, :AccelGPExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: AccelGPExample))
+    end
+    Core.eval(mod, :(using .AccelGPExample:
+        ACCEL_GP_Y, ACCEL_GP_XGP, ACCEL_GP_SLAMBDA,
+        ACCEL_GP_XGP_SIGMA, ACCEL_GP_SLAMBDA_SIGMA, ACCEL_GP_PRIOR_ONLY))
+    nothing
+end
+
+function setup_hierarchical_gp!(mod::Module)
+    if !isdefined(mod, :HierarchicalGPExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: HierarchicalGPExample))
+    end
+    Core.eval(mod, :(using .HierarchicalGPExample:
+        HGP_Y, HGP_YEAR_IND, HGP_STATE_IND, HGP_REGION_IND, HGP_STATE_REGION_IND,
+        HGP_N_YEARS, HGP_N_REGIONS, HGP_N_STATES, HGP_N_YEARS_OBS))
+    nothing
+end
+
+function setup_losscurve_sislob!(mod::Module)
+    if !isdefined(mod, :LosscurveSislobExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: LosscurveSislobExample))
+    end
+    # Bind only the data. The displayed PPL assembly imports the shared `normal`
+    # and `lognormal` endpoints itself and authors the flag-selected growth
+    # factor and per-datum mean in-graph.
+    Core.eval(mod, :(using .LosscurveSislobExample:
+        LOSSCURVE_GROWTHMODEL_ID, LOSSCURVE_COHORT_ID, LOSSCURVE_T_IDX,
+        LOSSCURVE_T_VALUE, LOSSCURVE_PREMIUM, LOSSCURVE_LOSS))
+    nothing
+end
+
+function setup_accel_splines!(mod::Module)
+    if !isdefined(mod, :AccelSplinesExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: AccelSplinesExample))
+    end
+    # Bind only the response and the four design/basis matrices plus the
+    # prior_only flag; the displayed PPL assembly imports the shared `normal`
+    # and `student_t` endpoints itself and authors the linear predictors in-graph.
+    Core.eval(mod, :(using .AccelSplinesExample:
+        ACCEL_Y, ACCEL_XS, ACCEL_ZS_1_1, ACCEL_XS_SIGMA, ACCEL_ZS_SIGMA_1_1,
+        ACCEL_PRIOR_ONLY))
+    nothing
+end
+
+function setup_state_space_stochastic!(mod::Module)
+    if !isdefined(mod, :StateSpaceStochasticExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: StateSpaceStochasticExample))
+    end
+    # Bind only the raw series y, x, w; the displayed PPL assembly imports the
+    # shared `normal` and `student_t` endpoints itself and derives the bounded
+    # level transform, positive_ordered scales and seasonal window sum in-graph.
+    Core.eval(mod, :(using .StateSpaceStochasticExample:
+        STATE_SPACE_Y, STATE_SPACE_X, STATE_SPACE_W))
+    nothing
+end
+
+function setup_prophet!(mod::Module)
+    if !isdefined(mod, :ProphetExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: ProphetExample))
+    end
+    # Bind the raw time/changepoint/design data for the LINEAR trend; the
+    # displayed PPL assembly imports the shared `normal` and `laplace` endpoints
+    # itself and derives the changepoint incidence matrix and trend in-graph.
+    Core.eval(mod, :(using .ProphetExample:
+        PROPHET_T, PROPHET_T_CHANGE, PROPHET_X, PROPHET_SIGMAS, PROPHET_TAU,
+        PROPHET_S_A, PROPHET_S_M, PROPHET_Y))
+    nothing
+end
+
+function setup_irt_2pl!(mod::Module)
+    if !isdefined(mod, :Irt2plExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: Irt2plExample))
+    end
+    # Bind only the raw I×J response matrix. The displayed PPL assembly imports
+    # the shared endpoints itself and forms the per-cell linear predictor as an
+    # in-graph broadcast over the item/person axes (no external index).
+    Core.eval(mod, :(using .Irt2plExample: IRT_2PL_Y))
+    nothing
+end
+
+function setup_2pl_latent_reg_irt!(mod::Module)
+    if !isdefined(mod, :TwoplLatentRegIrtExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: TwoplLatentRegIrtExample))
+    end
+    # Bind the raw long-form ii/jj/y, the covariate matrix W, and the item count.
+    # The displayed PPL assembly derives the covariate design (obtain_adjustments)
+    # and the sum-to-zero difficulty map in-graph.
+    Core.eval(mod, :(using .TwoplLatentRegIrtExample:
+        TWOPL_LR_II, TWOPL_LR_JJ, TWOPL_LR_Y, TWOPL_LR_W, TWOPL_LR_I))
+    nothing
+end
+
+function setup_hier_2pl!(mod::Module)
+    if !isdefined(mod, :Hier2plExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: Hier2plExample))
+    end
+    # Bind the raw long-form ii/jj/y and the item/person counts. The displayed
+    # PPL assembly forms the cholesky_factor_corr transform, the analytic LKJ(4)
+    # density, and the fused multi_normal_cholesky item prior in-graph.
+    Core.eval(mod, :(using .Hier2plExample:
+        HIER_2PL_II, HIER_2PL_JJ, HIER_2PL_Y, HIER_2PL_I, HIER_2PL_J))
+    nothing
+end
+
+function setup_gpcm_latent_reg_irt!(mod::Module)
+    if !isdefined(mod, :GpcmLatentRegIrtExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: GpcmLatentRegIrtExample))
+    end
+    # Bind the raw long-form ii/jj/y (ordinal), the covariate matrix W, and the
+    # item count. The displayed PPL assembly derives the ragged per-item category
+    # structure, the covariate design, and the sum-to-zero map in-graph.
+    Core.eval(mod, :(using .GpcmLatentRegIrtExample:
+        GPCM_LR_II, GPCM_LR_JJ, GPCM_LR_Y, GPCM_LR_W, GPCM_LR_I))
+    nothing
+end
+
+function setup_grsm_latent_reg_irt!(mod::Module)
+    if !isdefined(mod, :GrsmLatentRegIrtExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: GrsmLatentRegIrtExample))
+    end
+    # Bind the raw long-form ii/jj/y (ordinal), the covariate matrix W, and the
+    # item count. The displayed PPL assembly derives the category count, the
+    # covariate design, and both sum-to-zero maps in-graph.
+    Core.eval(mod, :(using .GrsmLatentRegIrtExample:
+        GRSM_LR_II, GRSM_LR_JJ, GRSM_LR_Y, GRSM_LR_W, GRSM_LR_I))
+    nothing
+end
+
+function setup_kronecker_gp!(mod::Module)
+    if !isdefined(mod, :KroneckerGpExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: KroneckerGpExample))
+    end
+    # Bind the grid locations x1 and the observation matrix y; the squared-
+    # distance matrix, both margin eigendecompositions, and the LKJ-Cholesky
+    # transform are derived in-graph.
+    Core.eval(mod, :(using .KroneckerGpExample: KRON_X1, KRON_Y))
+    nothing
+end
+
+function setup_glmm1!(mod::Module)
+    if !isdefined(mod, :GLMM1ModelExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: GLMM1ModelExample))
+    end
+    # Bind only the raw counts + site indices; the displayed PPL assembly imports
+    # the shared normal/poisson endpoints itself and gathers alpha[obssite] in-graph.
+    Core.eval(mod, :(using .GLMM1ModelExample: GLMM1_OBS, GLMM1_OBSSITE, GLMM1_NSITE))
+    nothing
+end
+
+function setup_bym2_offset_only!(mod::Module)
+    if !isdefined(mod, :Bym2OffsetOnlyExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: Bym2OffsetOnlyExample))
+    end
+    # Bind only the raw adjacency/counts/exposure/scaling; log_E, convolved_re and
+    # the ICAR phi[node1]/phi[node2] gathers are derived in-graph.
+    Core.eval(mod, :(using .Bym2OffsetOnlyExample:
+        BYM2_NODE1, BYM2_NODE2, BYM2_Y, BYM2_E, BYM2_SCALING_FACTOR))
+    nothing
+end
+
+function setup_bones!(mod::Module)
+    if !isdefined(mod, :BonesModelExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: BonesModelExample))
+    end
+    # Bind only the raw grade/gamma/delta/ncat block; grid coordinates and the
+    # ragged cut selection are all derived in-graph.
+    Core.eval(mod, :(using .BonesModelExample: BONES_GRADE, BONES_GAMMA, BONES_DELTA, BONES_NCAT))
+    nothing
+end
+
+function setup_multi_occupancy!(mod::Module)
+    if !isdefined(mod, :MultiOccupancyExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: MultiOccupancyExample))
+    end
+    # Bind only the raw n×J detection matrix + dims; the flat counts, species
+    # coordinate and binomial normalizer are all derived in-graph.
+    Core.eval(mod, :(using .MultiOccupancyExample:
+        MULTI_OCC_X, MULTI_OCC_N, MULTI_OCC_J, MULTI_OCC_K, MULTI_OCC_S))
+    nothing
+end
+
+function setup_lotka_volterra!(mod::Module)
+    if !isdefined(mod, :LotkaVolterraExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: LotkaVolterraExample))
+    end
+    Core.eval(mod, :(using .LotkaVolterraExample:
+        LOTKA_TS, LOTKA_Y_INIT, LOTKA_Y))
+    nothing
+end
+
+function setup_sir!(mod::Module)
+    if !isdefined(mod, :SIRExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: SIRExample))
+    end
+    Core.eval(mod, :(using .SIRExample:
+        SIR_T, SIR_Y0, SIR_STOI_HAT, SIR_B_HAT))
+    nothing
+end
+
+function setup_one_comp_mm_elim_abs!(mod::Module)
+    if !isdefined(mod, :OneCompMMElimAbsExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: OneCompMMElimAbsExample))
+    end
+    Core.eval(mod, :(using .OneCompMMElimAbsExample:
+        ONECOMP_T0, ONECOMP_D, ONECOMP_V, ONECOMP_TIMES, ONECOMP_C0,
+        ONECOMP_C_HAT))
+    nothing
+end
+
+function setup_soil_incubation!(mod::Module)
+    if !isdefined(mod, :SoilIncubationExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: SoilIncubationExample))
+    end
+    Core.eval(mod, :(using .SoilIncubationExample:
+        SOIL_T0, SOIL_TOTAL_C_T0, SOIL_TS, SOIL_ECO2MEAN))
     nothing
 end
 
@@ -481,12 +880,12 @@ function _three_pane_blocks!(blocks, artifact_id, title, source, generated, dag:
      data-rk-artifact-kind="example-panel">
 <div data-rk-pane="source">
 """))
-    push!(blocks, Markdown.Code("julia", source))
+    push!(blocks, Markdown.Code("julia", _display_code("source", source)))
     push!(blocks, RawHTML("""
 </div>
 <div data-rk-pane="kernel">
 """))
-    push!(blocks, Markdown.Code("julia", generated))
+    push!(blocks, Markdown.Code("julia", _display_code("generated", generated)))
     push!(blocks, RawHTML("""
 </div>
 <div data-rk-pane="dag">
@@ -536,6 +935,87 @@ function render_examples(artifacts)
     Markdown.MD(blocks)
 end
 
+function _manual_derivative_rule_sources()
+    path = joinpath(
+        pkgdir(ReactiveKernels), "examples", "manual_derivative_rule.jl",
+    )
+    source = replace(read(path, String), "\r\n" => "\n", "\r" => "\n")
+    graph = _source_between(
+        source,
+        "@kernel matvec_rule(",
+        "# -- END DOCS: pure mathematical derivative rule --",
+    )
+    pullback = _source_between(
+        source,
+        "struct MatvecPullback",
+        "# -- END DOCS: generated-style pullback staging --",
+    )
+    (; path, graph, pullback)
+end
+
+"""
+    render_manual_derivative_rule_cuts() -> Markdown.MD
+
+Render and execute the primal, forward, and reverse HAVE→WANT cuts of the one
+source-owned manual derivative graph. Each cut uses the standard raw source,
+generated kernel, and compute-DAG documentation surface.
+"""
+function render_manual_derivative_rule_cuts()
+    example = Main.ManualDerivativeRuleExample
+    sources = _manual_derivative_rule_sources()
+    inputs = example.EXAMPLE_INPUTS
+    cuts = (
+        (;
+            name = :manual_rule_primal,
+            kernel = example.matvec_primal,
+            have = example.PRIMAL_HAVE,
+            want = example.PRIMAL_WANT,
+        ),
+        (;
+            name = :manual_rule_forward,
+            kernel = example.matvec_forward,
+            have = example.FORWARD_HAVE,
+            want = example.FORWARD_WANT,
+        ),
+        (;
+            name = :manual_rule_reverse,
+            kernel = example.matvec_reverse,
+            have = example.REVERSE_HAVE,
+            want = example.REVERSE_WANT,
+        ),
+    )
+    origin = relpath(sources.path, pkgdir(ReactiveKernels))
+    artifacts = map(cuts) do cut
+        selected_inputs = NamedTuple{cut.have}(
+            Tuple(getproperty(inputs, name) for name in cut.have),
+        )
+        output = Base.invokelatest(cut.kernel, Tuple(selected_inputs)...)
+        (;
+            name = cut.name,
+            origin,
+            source = string(
+                sources.graph, "\n\n",
+                _port_call_source(
+                    "selected", "matvec_rule", cut.have, cut.want,
+                ),
+            ),
+            inputs = selected_inputs,
+            kernel = cut.kernel,
+            output,
+            generated = code_expr(cut.kernel),
+            dag = cut.kernel.plan,
+        )
+    end
+    render_examples(artifacts)
+end
+
+"""Render the exact example-owned value-plus-pullback staging source."""
+function render_manual_derivative_pullback_source()
+    Markdown.MD(Any[Markdown.Code(
+        "julia", _manual_derivative_rule_sources().pullback,
+    )])
+end
+
 """
     execute_example(mod, code; result=:docs_example) -> Markdown.MD
 
@@ -544,7 +1024,8 @@ kernel through the standard three-view UI. The source must bind `result` to a
 named tuple with `name`, `origin`, `inputs`, `kernel`, and `output` fields.
 """
 function execute_example(mod::Module, code::AbstractString;
-                         result::Symbol = :docs_example, setup = nothing)
+                         result::Symbol = :docs_example, setup = nothing,
+                         gate::Bool = false)
     displayed = strip(code, '\n')
     Core.eval(mod, :(using ReactiveKernels))
     setup === nothing || setup(mod)
@@ -569,7 +1050,7 @@ function execute_example(mod::Module, code::AbstractString;
         ),
     )
     rendered = render_examples((artifact,))
-    _record_ppl_execution!(executed.name)
+    gate && _record_ppl_execution!(executed.name)
     rendered
 end
 
@@ -717,7 +1198,7 @@ function execute_ppl_example(mod::Module, owner::Symbol, source::Symbol;
     isdefined(owner_module, source) || error("$owner does not define source $source")
     code = getfield(owner_module, source)
     code isa AbstractString || error("$owner.$source is not source text")
-    execute_example(mod, code; result, setup = nothing)
+    execute_example(mod, code; result, setup = nothing, gate = true)
 end
 
 const EXPECTED_PPL_EXAMPLES = (
@@ -728,19 +1209,54 @@ const EXPECTED_PPL_EXAMPLES = (
     :poisson_gamma_density,
     :dugongs_density,
     :arma11_density,
+    :garch11_density,
+    :hmm_example_density,
+    :hmm_gaussian_density,
+    :iohmm_reg_density,
     :mnist_logistic_density,
     :mnist_logistic_optimized_density,
     :mvnormal_regression_density,
     :bound_regression_density,
+    :diamonds_posterior,
+    :normal_mixture_k_posterior,
+    :dogs_nonhierarchical_posterior,
+    :logistic_regression_rhs_posterior,
+    :covid19imperial_density,
+    :lda_density,
+    :nn_rbm_density,
+    :gp_regr_posterior,
+    :gp_pois_regr_posterior,
+    :accel_gp_posterior,
+    :hierarchical_gp_posterior,
+    :losscurve_sislob_posterior,
+    :accel_splines_posterior,
+    :state_space_stochastic_posterior,
+    :prophet_posterior,
+    :irt_2pl_posterior,
+    :two_pl_latent_reg_irt_posterior,
+    :hier_2pl_posterior,
+    :gpcm_latent_reg_irt_posterior,
+    :grsm_latent_reg_irt_posterior,
+    :kronecker_gp_posterior,
+    :glmm1_model_posterior,
+    :bym2_offset_only_posterior,
+    :bones_model_posterior,
+    :multi_occupancy_posterior,
+    :lotka_volterra_posterior,
+    :sir_posterior,
+    :one_comp_mm_elim_abs_posterior,
+    :soil_incubation_posterior,
+    :hmm_drive_1_density,
 )
 const _PPL_EXECUTION_COUNTS = Dict(name => 0 for name in EXPECTED_PPL_EXAMPLES)
 
 function _record_ppl_execution!(name::Symbol)
+    # execute_example is shared by PPL and non-PPL executable docs; only PPL
+    # names participate in the exact-once posterior-walkthrough gate.
     haskey(_PPL_EXECUTION_COUNTS, name) || return nothing
     _PPL_EXECUTION_COUNTS[name] += 1
     nothing
 end
-
 function assert_ppl_examples_executed!()
     failures = String[]
     for name in EXPECTED_PPL_EXAMPLES

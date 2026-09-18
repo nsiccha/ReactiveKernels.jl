@@ -1,0 +1,131 @@
+using ReactiveKernelsPPLExamples.DiamondsExample
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, student_t
+using SpecialFunctions: loggamma
+using DifferentiationInterface
+import Enzyme
+
+const _DIAMONDS_AE = AutoEnzyme(mode = Enzyme.Reverse, function_annotation = Enzyme.Const)
+_diamonds_grad(kernel, q) =
+    ReactiveKernels.ad_value_and_gradient!(
+        prepare_ad(kernel, _DIAMONDS_AE, q; active = :unconstrained),
+        similar(q), q)[2]
+
+# Graph-independent reference oracle for the posteriordb diamonds model: the brms
+# centered design (drop the intercept column, subtract each remaining column's
+# mean), Normal(0,1) coefficient priors, a Student_t(3,8,10) intercept prior, a
+# half-Student_t(3,0,10) scale prior (the `- student_t_lccdf(0|3,0,10)` = log(2)
+# normalization), the exp support transform for sigma, and the Normal-id-glm
+# likelihood Yᵢ ~ Normal(Intercept + Xcᵢ·b, sigma).
+_normal_ld(x, m, s) = -0.5 * log(2π) - log(s) - 0.5 * ((x - m) / s)^2
+_student_ld(x, nu, loc, sc) =
+    loggamma((nu + 1) / 2) - loggamma(nu / 2) - 0.5 * log(nu * π) - log(sc) -
+    ((nu + 1) / 2) * log1p(((x - loc) / sc)^2 / nu)
+
+function _diamonds_reference(q)
+    Kc = size(DIAMONDS_X, 2) - 1
+    b = q[1:Kc]
+    Intercept = q[Kc + 1]
+    log_sigma = q[Kc + 2]
+    sigma = exp(log_sigma)
+    X = DIAMONDS_X
+    n = size(X, 1)
+    Xnoint = X[:, 2:size(X, 2)]
+    means = vec(sum(Xnoint; dims = 1) ./ n)
+    Xc = Xnoint .- means'
+    mu = Intercept .+ Xc * b
+    b_prior = sum(_normal_ld(bj, 0.0, 1.0) for bj in b)
+    intercept_prior = _student_ld(Intercept, 3.0, 8.0, 10.0)
+    sigma_prior = log(2.0) + _student_ld(sigma, 3.0, 0.0, 10.0)
+    log_prior = b_prior + intercept_prior + sigma_prior
+    log_jacobian = log_sigma
+    likelihood = sum(_normal_ld(DIAMONDS_Y[i], mu[i], sigma) for i in eachindex(DIAMONDS_Y))
+    b_Intercept = Intercept - sum(means .* b)
+    (; log_prior, log_jacobian, likelihood, b_Intercept,
+       posterior = log_prior + likelihood + log_jacobian)
+end
+
+@testset "PPL graph — diamonds (posteriordb, brms centered regression)" begin
+    artifact = evaluate_diamonds_source()
+    @test artifact.source == strip(DIAMONDS_SOURCE, '\n')
+    @test artifact.output ==
+          Base.invokelatest(artifact.kernel, Tuple(artifact.inputs)...)
+    model = artifact.model
+    q = vcat(fill(0.05, size(DIAMONDS_X, 2) - 1), 8.0, log(0.6))
+    reference = _diamonds_reference(q)
+
+    @testset "authored on the current baseline surface" begin
+        @test occursin("normal(0.0, 1.0).logpdf", DIAMONDS_SOURCE)
+        @test occursin("student_t(3.0, 8.0, 10.0).logpdf", DIAMONDS_SOURCE)
+        @test occursin("log(2.0) + student_t(3.0, 0.0, 10.0).logpdf", DIAMONDS_SOURCE)
+        @test occursin("Xc::Matrix{Float64} = Xnoint .- col_means", DIAMONDS_SOURCE)
+        @test occursin("bound = (; X, prior_only)", DIAMONDS_SOURCE)
+        @test occursin("ifelse(prior_only == 0, likelihood, 0.0)", DIAMONDS_SOURCE)
+        @test occursin("pointwise = plate(", DIAMONDS_SOURCE)
+        @test !occursin("struct ", DIAMONDS_SOURCE)
+        @test artifact.normal_object === normal
+        @test artifact.student_t_object === student_t
+    end
+
+    @testset "posterior decomposition vs the independent reference oracle" begin
+        pk = prepare(model;
+            have = (:unconstrained, :X, :Y, :prior_only),
+            want = (:log_prior, :log_jacobian, :likelihood, :posterior),
+            bound = (; X = DIAMONDS_X, prior_only = DIAMONDS_PRIOR_ONLY))
+        log_prior, log_jacobian, likelihood, posterior = pk(q, DIAMONDS_Y)
+        @test log_prior ≈ reference.log_prior
+        @test log_jacobian ≈ reference.log_jacobian
+        @test likelihood ≈ reference.likelihood       # unconditional likelihood node
+        @test posterior ≈ reference.posterior          # prior_only == 0 -> likelihood included
+        @test isfinite(posterior)
+        @test DIAMONDS_PRIOR_ONLY == 0                  # the diamonds-diamonds posterior
+    end
+
+    @testset "generated quantity b_Intercept from an unconstrained HAVE" begin
+        gq = prepare(model; have = (:unconstrained, :X), want = :b_Intercept,
+                     bound = (; X = DIAMONDS_X))
+        @test gq(q) ≈ reference.b_Intercept
+    end
+
+    @testset "the data-only centering prefix hoists under bound" begin
+        plain = prepare(model; have = (:unconstrained, :X, :Y, :prior_only), want = :posterior)
+        bound = prepare(model; have = (:unconstrained, :X, :Y, :prior_only), want = :posterior,
+                        bound = (; X = DIAMONDS_X, prior_only = DIAMONDS_PRIOR_ONLY))
+        @test plain(q, DIAMONDS_X, DIAMONDS_Y, DIAMONDS_PRIOR_ONLY) ≈ bound(q, DIAMONDS_Y)
+        @test bound(q, DIAMONDS_Y) ≈ reference.posterior
+    end
+
+    @testset "prior_only flips the likelihood contribution (value AND gradient)" begin
+        # A different finite Y, to prove prior_only == 1 is invariant to Y while
+        # prior_only == 0 is not. Y is bound here so each kernel takes only q.
+        Y2 = DIAMONDS_Y .+ 1.0
+        cfg(po, Y, want) = prepare(model; have = (:unconstrained, :X, :Y, :prior_only),
+            want = want, bound = (; X = DIAMONDS_X, Y = Y, prior_only = po))
+        p1_Y1 = cfg(1, DIAMONDS_Y, :posterior)   # prior + Jacobian only
+        p1_Y2 = cfg(1, Y2,         :posterior)
+        p0_Y1 = cfg(0, DIAMONDS_Y, :posterior)   # + likelihood
+        p0_Y2 = cfg(0, Y2,         :posterior)
+        pj    = cfg(1, DIAMONDS_Y, (:log_prior, :log_jacobian))
+        pup   = cfg(1, DIAMONDS_Y, :unconstrained_prior)   # the model's log_prior + log_jacobian node
+        like  = cfg(0, DIAMONDS_Y, :likelihood)(q)
+
+        # VALUE. prior_only == 1 equals prior + Jacobian and is Y-invariant;
+        # prior_only == 0 adds exactly the likelihood and depends on Y.
+        lp, lj = pj(q)
+        @test p1_Y1(q) ≈ lp + lj
+        @test p1_Y1(q) ≈ pup(q)
+        @test p1_Y1(q) == p1_Y2(q)                       # exact Y-invariance
+        @test p0_Y1(q) ≈ p1_Y1(q) + like
+        @test !isapprox(p0_Y1(q), p0_Y2(q))              # likelihood makes it Y-dependent
+
+        # GRADIENT (plain DI + Enzyme reverse). prior_only == 1 gradient equals the
+        # prior + Jacobian gradient and is Y-invariant; prior_only == 0 is not.
+        g1_Y1 = _diamonds_grad(p1_Y1, q)
+        g1_Y2 = _diamonds_grad(p1_Y2, q)
+        g0_Y1 = _diamonds_grad(p0_Y1, q)
+        g0_Y2 = _diamonds_grad(p0_Y2, q)
+        @test all(isfinite, g1_Y1)
+        @test g1_Y1 ≈ _diamonds_grad(pup, q)
+        @test g1_Y1 ≈ g1_Y2                              # gradient Y-invariant under prior_only == 1
+        @test !isapprox(g0_Y1, g0_Y2)                    # gradient Y-dependent under prior_only == 0
+    end
+end

@@ -4,7 +4,7 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     SumToZeroExample,
     LinearRegressionExample, BetaBinomialExample, PoissonGammaExample,
     GLMPoissonExample, GLMBinomialExample, EightSchoolsNoncenteredExample,
-    GLMMPoissonExample, BLRExample,
+    GLMMPoissonExample, Covid19ImperialExample, BLRExample,
     MesquiteExample, LogmesquiteExample, LogmesquiteLogvolumeExample, LogmesquiteLogvaExample, LogmesquiteLogvasExample, LogmesquiteLogvashExample, KilpisjarviExample, EarnHeightExample, LogearnHeightExample, Log10earnHeightExample, LogearnInteractionExample, LogearnHeightMaleExample, LogearnLogheightMaleExample, LogearnInteractionZExample, ARKExample, MhExample,
     NesLogitExample, WellsDistExample, WellsDist100Example, DogsLogExample, NESExample, KidscoreMomWorkExample, Rate1Example,
     RadonPooledExample, RadonPartiallyPooledCenteredExample, RadonPartiallyPooledNoncenteredExample, RadonVariableInterceptCenteredExample,
@@ -19,10 +19,17 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     KidscoreMomhsExample, KidscoreMomiqExample, KidscoreMomhsiqExample, KidscoreInteractionExample,
     KidscoreInteractionCExample, KidscoreInteractionC2Example, KidscoreInteractionZExample,
     DugongsGrowthExample, ARMA11Example,
+    GARCH11Example, HmmExampleExample, HmmGaussianExample, IohmmRegExample,
     NormalMixtureExample, LowDimGaussMixCollapseExample, LowDimGaussMixExample,
-    MNISTLogisticExample, MVNormalRegressionExample, BoundRegressionExample
+    MNISTLogisticExample, MVNormalRegressionExample, BoundRegressionExample,
+    NNRBMExample, LDAExample, Irt2plExample, TwoplLatentRegIrtExample,
+    Hier2plExample, GpcmLatentRegIrtExample,
+    LosscurveSislobExample, AccelSplinesExample, StateSpaceStochasticExample, ProphetExample,
+    GLMM1ModelExample, Bym2OffsetOnlyExample, BonesModelExample, MultiOccupancyExample
 using Test
 
+include("test_gp_first_use.jl")
+include("test_startup_initialization.jl")
 include("test_ppl_workflow.jl")
 include("test_eight_schools_example.jl")
 include("test_sum_to_zero_example.jl")
@@ -34,6 +41,7 @@ include("test_glm_poisson_example.jl")
 include("test_glm_binomial_example.jl")
 include("test_eight_schools_noncentered_example.jl")
 include("test_glmm_poisson_example.jl")
+include("test_covid19imperial_example.jl")
 include("test_blr_example.jl")
 include("test_mesquite_example.jl")
 include("test_logmesquite_example.jl")
@@ -107,12 +115,49 @@ include("test_kidscore_interaction_c2_example.jl")
 include("test_kidscore_interaction_z_example.jl")
 include("test_dugongs_example.jl")
 include("test_arma11_example.jl")
+include("test_garch11_example.jl")
+include("test_hmm_example_example.jl")
+include("test_hmm_gaussian_example.jl")
+include("test_iohmm_reg_example.jl")
 include("test_normal_mixture_example.jl")
 include("test_low_dim_gauss_mix_collapse_example.jl")
 include("test_low_dim_gauss_mix_example.jl")
 include("test_survey_model_example.jl")
 include("test_mvnormal_regression_example.jl")
 include("test_bound_regression_example.jl")
+include("test_diamonds_example.jl")
+include("test_normal_mixture_k_example.jl")
+include("test_dogs_nonhierarchical_example.jl")
+include("test_logistic_regression_rhs_example.jl")
+include("test_nn_rbm_example.jl")
+include("test_lda_example.jl")
+include("test_gp_regr_example.jl")
+include("test_accel_gp_example.jl")
+include("test_gp_pois_regr_example.jl")
+include("test_hierarchical_gp_example.jl")
+include("test_losscurve_sislob_example.jl")
+include("test_accel_splines_example.jl")
+include("test_state_space_stochastic_example.jl")
+include("test_prophet_example.jl")
+# posteriordb IRT batch
+include("test_irt_2pl_example.jl")
+include("test_2pl_latent_reg_irt_example.jl")
+include("test_hier_2pl_example.jl")
+include("test_gpcm_latent_reg_irt_example.jl")
+include("test_glmm1_model_example.jl")
+include("test_bym2_offset_only_example.jl")
+include("test_bones_model_example.jl")
+include("test_multi_occupancy_example.jl")
+# posteriordb dynamics batch (four models; lotka unblocked by core fix 96eaf14d)
+include("test_lotka_volterra_example.jl")
+include("test_sir_example.jl")
+include("test_one_comp_mm_elim_abs_example.jl")
+include("test_soil_incubation_example.jl")
+# posteriordb structured batch
+include("test_hmm_drive_1_example.jl")
+include("test_hmm_drive_0_example.jl")
+include("test_grsm_latent_reg_irt_example.jl")
+include("test_kronecker_gp_example.jl")
 include("test_ppl_macro.jl")
 include("test_ppl_posteriordb_parity.jl")
 include("test_ppl_gibbs.jl")

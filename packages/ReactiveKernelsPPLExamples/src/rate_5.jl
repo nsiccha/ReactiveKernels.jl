@@ -38,9 +38,9 @@ docs_example = (; name = :rate_5_posterior, origin = "posteriordb Rate_5_model â
     inputs = (; q), model, kernel = density_kernel, output, requested_nodes,
     beta_object = beta, binomial_object = binomial)
 """
-evaluate_rate_5_source() = _evaluate_ppl_source(RATE_5_SOURCE, @__MODULE__; bindings = (:RATE5_N1, :RATE5_N2, :RATE5_K1, :RATE5_K2))
+evaluate_rate_5_source(; model_only::Bool = false) = _evaluate_ppl_source(RATE_5_SOURCE, @__MODULE__; bindings = (:RATE5_N1, :RATE5_N2, :RATE5_K1, :RATE5_K2), model_only)
 const _RATE_5_GRAPH_TEMPLATE = Ref{KernelSpec}()
-__init__() = (_RATE_5_GRAPH_TEMPLATE[] = evaluate_rate_5_source().model; nothing)
+__init__() = (_RATE_5_GRAPH_TEMPLATE[] = evaluate_rate_5_source(; model_only = true).model; nothing)
 "Build posteriordb Rate_5_model (a common Binomial rate; posterior-predictive draws are outside the pure graph)."
 build_rate_5_graph() = compose(_RATE_5_GRAPH_TEMPLATE[])
 function demo()

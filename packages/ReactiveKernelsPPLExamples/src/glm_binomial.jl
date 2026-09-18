@@ -32,8 +32,6 @@ using LogExpFunctions: logistic
     log_jacobian::Float64 = 0.0
 
     parameters = (; alpha, beta1, beta2)
-    (alpha::Float64, beta1::Float64, beta2::Float64) =
-        (parameters.alpha, parameters.beta1, parameters.beta2)
 
     # Priors: α, β₁, β₂ ~ Normal(0, 100), reusing the shared Normal endpoint.
     alpha_prior::Float64 = normal(0.0, 100.0).logpdf(alpha)
@@ -93,16 +91,16 @@ docs_example = (;
 )
 """
 
-function evaluate_glm_binomial_source()
+function evaluate_glm_binomial_source(; model_only::Bool = false)
     _evaluate_ppl_source(GLM_BINOMIAL_SOURCE, @__MODULE__; bindings = (
         :GLM_BINOMIAL_YEAR, :GLM_BINOMIAL_C, :GLM_BINOMIAL_N,
-    ))
+    ), model_only)
 end
 
 const _GLM_BINOMIAL_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _GLM_BINOMIAL_GRAPH_TEMPLATE[] = evaluate_glm_binomial_source().model
+    _GLM_BINOMIAL_GRAPH_TEMPLATE[] = evaluate_glm_binomial_source(; model_only = true).model
     nothing
 end
 

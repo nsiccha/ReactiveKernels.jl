@@ -198,3 +198,109 @@ The older hand-written flat-density and small-subset experiments answered useful
 questions, but they are not substitutes for this full-data, rich-kernel comparison. Their
 receipts remain in the repository as historical artifacts; this page's tables, plots, and the
 linked aggregated benchmark receipt are the current source of truth.
+
+## Batch-1 incremental additions
+
+Four newly-translated idiomatic-RK posteriordb models — `diamonds` (brms centered regression),
+`normal_mixture_k` (marginalized K-component mixture), `dogs_nonhierarchical` (correlated
+avoidance learning), and `logistic_regression_rhs` (regularized horseshoe on `ovarian`, 1536
+predictors) — are registered against their **existing** upstream Turing `make_model` (pinned DPPL
+`6378673`, `posteriordb_models.jl` SHA256 `a7ef985b…`) and reference posteriordb Stan. There is
+**no new Turing translation**: the comparators already existed, so this is a pure RK-side addition.
+
+They are measured into a **separate** receipt (`all80-batch1-v1.toml`) — a **union** rendered
+alongside the immutable 82-row checkpoint above, never merged into it. The saved batch-1
+measurement is historical/preliminary provenance, not a publication certificate: it records the
+native source/harness snapshot but has no Reactant phase provenance, per-model input/query
+identity, or backend-configuration field. Those numbers are preserved unchanged and explicitly
+labeled uncertified; the corrected producer now freezes both phases before subprocess launch,
+certifies actual loaded roots, records ordinary `AutoEnzyme(mode=Enzyme.Reverse)`, and gates the
+exact requested key set. The frozen-82 default sweep excludes these four, so its receipt is
+byte-for-byte unchanged.
+
+**Declared Turing offsets (`off_tu = Stan − Turing`), derived from source and gate-verified
+(measured == declared, constant across the probe draws):**
+
+- `diamonds` → **0**. The brms-generated `diamonds.stan` writes the truncation correction
+  `student_t_lpdf(sigma | 3,0,10) − student_t_lccdf(0 | 3,0,10)`, matching upstream Turing's
+  normalized `truncated(LocationScale(0,10,TDist(3)); lower=0)`.
+- `dogs_nonhierarchical` → **0**. Stan's `sigma_logit_ab ~ normal(0,1)` on `<lower=0>` (untruncated
+  density, no `lccdf` correction) matches Turing's `FlatPos(0)` (improper) plus a manual untruncated
+  `logpdf(Normal(0,1), ·)`.
+- `logistic_regression_rhs` → **−(1+d)·log 2 = −1537·log 2** (`d = 1536`). Turing normalizes the
+  half-t `tau` and `d` half-t `lambda` priors (`+log 2` each, all centered at 0); the hand-written
+  Stan uses bare `student_t(…)` on `<lower=0>` with no correction, dropping `(1+d)·log 2`.
+- `normal_mixture_k` → **K·log 10 − log((K−1)!) + log(K)/2 = 9.13959** (`K = 5`). Turing's explicit
+  `Uniform(0,10)` scales net `+K·log 10` vs Stan's implicit bounded uniform (same mechanism as
+  `GLM_Poisson` / `election88`), and its explicit `Dirichlet(1,…,1)` vs Stan's bare `simplex`
+  contributes `−log Γ(K)` plus a constant `+log(K)/2` simplex/Dirichlet transform-normalization
+  difference (Bijectors vs Stan) — the measured constant confirms this decomposition to six
+  significant figures, and RK matches Stan exactly (rk_off ≈ 0), so only the Turing column carries
+  the offset.
+
+The RK graphs' own value/gradient parity against reference Stan (BridgeStan, `propto=false`,
+`jacobian=true`) is separately certified at identity parameter order by `benchmark/batch1_gate.jl`.
+`diamonds` is a **workload mismatch** — its upstream Turing model consumes precomputed sufficient
+statistics (`XtX`/`Xty`/…) while RK and Stan do observation-level work — so its RK/Turing ratio is
+marked distinct, not a matched-workload verdict. Same observed-load timing provenance and
+per-side-support caveats as the 82 apply; no separate quiet-window timing pass was run.
+
+```@eval
+Main.ReactiveKernelsDocs.render_all80_batch1_summary()
+```
+
+```@eval
+Main.ReactiveKernelsDocs.render_all80_batch1_tables()
+```
+
+```@eval
+Main.ReactiveKernelsDocs.render_all80_batch1_coverage_plot()
+```
+
+```@eval
+Main.ReactiveKernelsDocs.render_all80_batch1_speedup_plot()
+```
+
+## IRT incremental additions
+
+Four item-response-theory posteriordb models — `irt_2pl` (2PL, 20 items × 100 persons),
+`2pl_latent_reg_irt` (2PL with latent regression), `hier_2pl` (hierarchical 2PL), and
+`gpcm_latent_reg_irt` (generalized partial-credit with latent regression) — are registered
+against their **existing** upstream Turing `make_model` (pinned DPPL `6378673`,
+`posteriordb_models.jl` SHA256 `a7ef985b…`) and reference posteriordb Stan. There is **no new
+Turing translation**: the comparators already existed, so this is a pure RK-side addition.
+
+They are measured into a **separate** receipt (`all80-irt-v1.toml`) — a **union** rendered
+alongside the immutable 82-row checkpoint above, never merged into it. Unlike the historical
+batch-1 run, this measurement is ordinary-AE certified: both phases recorded backend
+configuration and loaded-module certification under one run id. The frozen-82 default sweep
+excludes these four, so its receipt is byte-for-byte unchanged.
+
+**Declared Turing offsets (`off_tu = Stan − Turing`), derived from source and gate-verified
+(measured == declared):** all four are **0** — every Stan density is untruncated (no `lccdf`
+anywhere in the four `.stan` files) and the Turing side matches term-by-term (zero-contributing
+`Flat`/`FlatPos` plus manual untruncated densities, replicated covariate adjustments, identical
+Bernoulli/PCM likelihoods).
+
+The RK graphs' own value/gradient parity against reference Stan (BridgeStan, `propto=false`,
+`jacobian=true`) is separately certified at identity parameter order by
+`packages/ReactiveKernelsPPLExamples/test/acceptance_irt_four_axis.jl`. All sides do
+observation-level work — there is no workload-mismatch series in this batch. Same observed-load
+timing provenance and per-side-support caveats as the 82 apply; no separate quiet-window timing
+pass was run.
+
+```@eval
+Main.ReactiveKernelsDocs.render_all80_irt_summary()
+```
+
+```@eval
+Main.ReactiveKernelsDocs.render_all80_irt_tables()
+```
+
+```@eval
+Main.ReactiveKernelsDocs.render_all80_irt_coverage_plot()
+```
+
+```@eval
+Main.ReactiveKernelsDocs.render_all80_irt_speedup_plot()
+```

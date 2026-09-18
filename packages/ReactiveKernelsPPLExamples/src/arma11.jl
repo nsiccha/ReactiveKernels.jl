@@ -64,8 +64,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
     # NamedTuple is also an authoritative input boundary.
     parameters = (; μ, φ, θ, σ)
     (parameters, log_jacobian::Float64) = ((; μ, φ, θ, σ), log_σ)
-    (μ::Float64, φ::Float64, θ::Float64, σ::Float64) =
-        (parameters.μ, parameters.φ, parameters.θ, parameters.σ)
 
     # The latent one-step-ahead errors are the sequential heart of the model:
     #   ν₁ = μ + φ·μ (err₀ ≡ 0), errₜ = yₜ − νₜ,
@@ -158,13 +156,13 @@ docs_example = (;
 )
 """
 
-function evaluate_arma11_source()
+function evaluate_arma11_source(; model_only::Bool = false)
     # Bind only the data. The authored source imports the reusable Normal and
     # Cauchy distribution objects itself and contains the complete PPL assembly,
     # including the inline error recursion, with no helper evaluator.
     _evaluate_ppl_source(ARMA11_SOURCE, @__MODULE__; bindings = (
         :ARMA_SERIES,
-    ))
+    ), model_only)
 end
 
 # Evaluate the authored source from `__init__`, after package precompilation has
@@ -174,7 +172,7 @@ end
 const _ARMA11_GRAPH_TEMPLATE = Ref{KernelSpec}()
 
 function __init__()
-    _ARMA11_GRAPH_TEMPLATE[] = evaluate_arma11_source().model
+    _ARMA11_GRAPH_TEMPLATE[] = evaluate_arma11_source(; model_only = true).model
     nothing
 end
 

@@ -113,8 +113,11 @@ function _ad_kernel_call(kernel::PreparedKernel, args::Tuple, ::Val{I}) where {I
             _ArrayFunctionPair,_EmbeddedFunctionPair,
             _DynamicEmbeddedFunctionPair} && native_exemplars
         ops = _ad_native_ops(kernel)
+        # Bound views cross this Enzyme boundary as owning copies: a
+        # `SubArray`-typed `Constant` operand defeats static activity
+        # analysis, while identical owning contents differentiate cleanly.
         externalized, values = _externalize_bound_array_call(
-            kernel.f.native, ops)
+            kernel.f.native, ops; materialize_view_copies = true)
         isempty(values) && return (
             _ADNativeKernelCall{I,typeof(kernel.f.native),typeof(ops)}(
                 kernel.f.native, ops),
@@ -122,7 +125,8 @@ function _ad_kernel_call(kernel::PreparedKernel, args::Tuple, ::Val{I}) where {I
         )
         return _ADKernelCall{I,typeof(externalized)}(externalized), values
     end
-    externalized, values = _externalize_bound_arrays(kernel)
+    externalized, values = _externalize_bound_arrays(
+        kernel; materialize_view_copies = true)
     _ADKernelCall{I,typeof(externalized)}(externalized), values
 end
 
@@ -291,6 +295,14 @@ end
     :(getfield(args, $I), ($(contexts...),))
 end
 
+# A native (non-traced) prepared-AD call inside a Reactant trace never reaches
+# native Enzyme: Reactant's autodiff overlay intercepts the call with all-native
+# arguments and the staged derivative comes back a silent zero gradient, while
+# the value stays correct. Every native call boundary checks its already-split
+# point here; the Reactant extension implements the in-trace refusal, and this
+# fallback keeps the core independent of the weak dependency.
+_ad_trace_sanity(point, contexts) = nothing
+
 function _ad_resolve(resolver, args::Tuple, kwargs::NamedTuple)
     resolver(args...; kwargs...)
 end
@@ -379,6 +391,8 @@ and its `Constant` contexts cover only the remaining ports. `args` and
 arguments do not apply to a bound preparation. Array-valued residual constants
 are passed to the backend as hidden `Constant` contexts rather than captured in
 the differentiated callable; this does not change the public HAVE boundary.
+Bound views cross as owning copies with identical contents, since a
+prebuilt view operand defeats reverse-mode static activity analysis.
 """
 function prepare_ad(spec::KernelSpec,
                     backend::DifferentiationInterface.AbstractADType,
@@ -407,6 +421,100 @@ function prepare_ad(kernel::PreparedKernel,
         "not accept keywords; use a KernelSpec to preserve authored keywords"))
     _prepare_ad(kernel, tuple, backend, args, NamedTuple(), active)
 end
+
+# A batched gradient callable owns the scalar AD preparation plus the same
+# trailing-axis metadata as `ReplicatedKernel`. The distinction matters: its
+# scalar target takes an already-reordered DI point and Constant contexts, not
+# the ordinary kernel ABI.
+struct _ReplicatedADKernel{B,BT,AT,K,IN}
+    prepared::K
+    inputs::IN
+end
+
+@inline function (k::_ReplicatedADKernel{B})(args...) where {B}
+    length(args) == length(k.inputs) || throw(MethodError(k, args))
+    _replica_ad_call(k, args, getfield(args, first(B)))
+end
+
+inputs(k::_ReplicatedADKernel) = k.inputs
+outputs(k::_ReplicatedADKernel) = outputs(k.prepared.kernel)
+code_expr(k::_ReplicatedADKernel) = code_expr(k.prepared.kernel)
+
+function Base.show(io::IO, k::_ReplicatedADKernel{B}) where {B}
+    names = Tuple(k.inputs[i].name for i in B)
+    print(io, "ReplicatedADKernel(batched=", names, ", target=")
+    show(io, k.prepared)
+    print(io, ")")
+end
+
+function replica(prepared::PreparedADKernel{I}; batched) where {I}
+    boundary = inputs(prepared.kernel)
+    indices = _replica_batch_indices(boundary, batched)
+    input_types = Tuple{(valtype(boundary[i]) for i in indices)...}
+    foreach(_replica_rank, input_types.parameters)
+    active_type = valtype(boundary[I])
+    _ReplicatedADKernel{indices,input_types,active_type,
+                        typeof(prepared),typeof(boundary)}(
+        prepared, boundary)
+end
+
+function _replica_ad_validation(k::_ReplicatedADKernel{B}, args, marker) where {B}
+    replica_count = size(marker, ndims(marker))
+    for index in B
+        arg = getfield(args, index)
+        input = k.inputs[index]
+        expected_rank = _replica_rank(valtype(input)) + 1
+        ndims(arg) == expected_rank || throw(DimensionMismatch(
+            "replica port :$(input.name) has rank $(ndims(arg)); " *
+            "expected $expected_rank (scalar rank plus one trailing replica axis)"))
+        size(arg, ndims(arg)) == replica_count || throw(DimensionMismatch(
+            "replica port :$(input.name) has $(size(arg, ndims(arg))) " *
+            "replicas; expected $replica_count"))
+    end
+    replica_count
+end
+
+@inline _replica_ad_native_arg(arg, ::Type{T}, replica_index) where {T<:Number} =
+    arg[replica_index]
+@inline _replica_ad_native_arg(arg, ::Type{T}, replica_index) where {T<:AbstractArray} =
+    copy(selectdim(arg, ndims(arg), replica_index))
+
+function _replica_ad_scalar_args(
+        ::_ReplicatedADKernel{B,BT}, args, replica_index) where {B,BT}
+    ntuple(length(args)) do argument_index
+        position = findfirst(==(argument_index), B)
+        position === nothing ? getfield(args, argument_index) :
+            _replica_ad_native_arg(
+                getfield(args, argument_index),
+                BT.parameters[position], replica_index)
+    end
+end
+
+function _replica_ad_call(
+        k::_ReplicatedADKernel{B,BT,AT}, args, marker) where {B,BT,AT}
+    count = _replica_ad_validation(k, args, getfield(args, first(B)))
+    results = map(1:count) do replica_index
+        scalar_args = _replica_ad_scalar_args(k, args, replica_index)
+        ad_value_and_gradient(k.prepared, scalar_args...)
+    end
+    _replica_ad_stack(first.(results), valtype(only(outputs(k)))),
+        _replica_ad_stack(last.(results), AT)
+end
+
+function ad_value_and_gradient(
+        k::_ReplicatedADKernel{B,BT,AT}, args...) where {B,BT,AT}
+    _replica_ad_call(k, args, getfield(args, first(B)))
+end
+
+function ad_gradient(
+        k::_ReplicatedADKernel, args...)
+    last(_replica_ad_call(k, args, getfield(args, first(B))))
+end
+
+_replica_ad_stack(values, ::Type{T}) where {T<:Number} = collect(values)
+_replica_ad_stack(values, ::Type{T}) where {T<:AbstractArray} = stack(values)
+_replica_ad_stack(values, ::Type{T}) where {T} = throw(ArgumentError(
+    "replica AD active ports must be Numbers or AbstractArrays; got $T"))
 
 """
     prepare_ad_pullback(spec, backend, seed, args...;
@@ -457,11 +565,13 @@ function ad_gradient(spec::KernelSpec,
     if !isempty(bound)
         _ad_reject_bound_keywords(NamedTuple(kwargs))
         call, point, contexts, _, _ = _ad_call(kernel, args, active)
+        _ad_trace_sanity(point, contexts)
         return DifferentiationInterface.gradient(call, backend, point, contexts...)
     end
     resolver = _ad_resolver(spec)
     resolved = _ad_resolve(resolver, args, NamedTuple(kwargs))
     call, point, contexts, _, _ = _ad_call(kernel, resolved, active)
+    _ad_trace_sanity(point, contexts)
     DifferentiationInterface.gradient(call, backend, point, contexts...)
 end
 
@@ -472,6 +582,7 @@ function ad_gradient(kernel::PreparedKernel,
         "a low-level PreparedKernel has a positional HAVE boundary and does " *
         "not accept keywords; use a KernelSpec to preserve authored keywords"))
     call, point, contexts, _, _ = _ad_call(kernel, args, active)
+    _ad_trace_sanity(point, contexts)
     DifferentiationInterface.gradient(call, backend, point, contexts...)
 end
 
@@ -481,7 +592,10 @@ function _ad_prepared_arguments(
     length(resolved) == length(inputs(prepared.kernel)) || throw(ArgumentError(
         "selected HAVE boundary expects $(length(inputs(prepared.kernel))) " *
         "values; got $(length(resolved))"))
-    _ad_arguments(Val(I), (resolved..., prepared.external_values...))
+    point, contexts =
+        _ad_arguments(Val(I), (resolved..., prepared.external_values...))
+    _ad_trace_sanity(point, contexts)
+    point, contexts
 end
 
 function ad_gradient(prepared::PreparedADKernel, args...; kwargs...)
@@ -535,6 +649,7 @@ function ad_pullback(spec::KernelSpec,
     resolved = _ad_resolve(resolver, args, NamedTuple(kwargs))
     call, point, contexts, _, _ =
         _ad_call(kernel, resolved, active; scalar_output = false)
+    _ad_trace_sanity(point, contexts)
     only(DifferentiationInterface.pullback(
         call, backend, point, (seed,), contexts...))
 end
@@ -547,6 +662,7 @@ function ad_pullback(kernel::PreparedKernel,
         "not accept keywords; use a KernelSpec to preserve authored keywords"))
     call, point, contexts, _, _ =
         _ad_call(kernel, args, active; scalar_output = false)
+    _ad_trace_sanity(point, contexts)
     only(DifferentiationInterface.pullback(
         call, backend, point, (seed,), contexts...))
 end
@@ -557,7 +673,10 @@ function _ad_prepared_arguments(
     length(resolved) == length(inputs(prepared.kernel)) || throw(ArgumentError(
         "selected HAVE boundary expects $(length(inputs(prepared.kernel))) " *
         "values; got $(length(resolved))"))
-    _ad_arguments(Val(I), (resolved..., prepared.external_values...))
+    point, contexts =
+        _ad_arguments(Val(I), (resolved..., prepared.external_values...))
+    _ad_trace_sanity(point, contexts)
+    point, contexts
 end
 
 function ad_pullback(prepared::PreparedADPullback, seed, args...; kwargs...)
