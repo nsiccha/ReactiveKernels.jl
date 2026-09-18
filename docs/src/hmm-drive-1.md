@@ -89,11 +89,11 @@ work of any mode beforehand): the all-bound shape's unrolled module is
 intractable for the EnzymeMLIR reverse pass, and the single-while traced-stream
 shape currently fails the reverse pass itself (`operand #0 does not dominate
 this use`); complete diagnostics are retained by the gate.
-result and the same-process compile observations are kept as separate,
-explicitly labeled facts in `benchmark/structured_gate_diagnostics.jl` — no
-order-dependence or cache explanation is claimed. The gate pins the documented
-failure signatures on the standard axes so neither a regression nor a quiet fix
-can hide.
+The runtime-activity result and the same-process compile observations are kept
+as separate, explicitly labeled facts in
+`benchmark/structured_gate_diagnostics.jl` — no order-dependence or cache
+explanation is claimed. The gate pins the documented failure signatures on the
+standard axes so neither a regression nor a quiet fix can hide.
 
 Run the walkthrough from the repository root:
 
