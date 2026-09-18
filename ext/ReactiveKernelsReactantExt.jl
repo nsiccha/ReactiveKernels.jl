@@ -473,6 +473,26 @@ function Reactant.traced_type_inner(
     T
 end
 
+function Reactant.make_tracer(
+        seen, previous::ReactiveKernels.GraphReplicatedKernel,
+        path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where {T<:ReactiveKernels.GraphReplicatedKernel}
+    T
+end
+
+function ReactiveKernels._replicated_backend_call(
+        k::ReactiveKernels.GraphReplicatedKernel{B}, args) where {B}
+    names = Tuple(k.inputs[index].name for index in B)
+    fallback = ReactiveKernels._replica(k.target, names)
+    ReactiveKernels._replica_call(
+        fallback, args, getfield(args, first(B)))
+end
+
 # The batched AD wrapper is immutable compiler metadata for the same reason:
 # its scalar `PreparedADKernel` stays a host constant while only the batched
 # HAVE boundary is traced. Its execution method lowers the replica map to one
@@ -936,6 +956,14 @@ end
 # has no exposed counter to index and is rejected with a clear message.
 @inline _scan_output_buffer(::Reactant.TracedRNumber{T}, n::Integer) where {T} =
     Reactant.promote_to(Reactant.TracedRArray, zeros(T, n))
+
+# Gather one matrix row as a HOST vector of traced scalars. The column count
+# rides as `Val{K}`: the `@trace` body re-traces every captured operand as a
+# tracer, so a value-`K` would turn the `1:K` comprehension range into an
+# uncollectable `TracedUnitRange` — the type-domain `K` stays concrete.
+@inline _scan_gather_row(
+        parent::Reactant.TracedRArray{<:Any,2}, i, ::Val{K}) where {K} =
+    Reactant.@allowscalar [parent[i, k] for k in 1:K]
 _scan_output_buffer(out, ::Integer) = throw(ArgumentError(
     "the Reactant scan lowering supports a scalar per-step output; got a " *
     "$(typeof(out)). Author the per-step output as a scalar, or report this " *
@@ -961,6 +989,48 @@ function ReactiveKernels._tensorized_scan(
     Reactant.@trace for i in 2:n
         x = Reactant.@allowscalar map(xs -> xs[i], iterated)
         carry, out = step(carry, x..., shared...)
+        Reactant.@allowscalar buffer[i] = out
+    end
+    buffer
+end
+
+# A traced `scan` over matrix ROWS — `scan(eachrow(M); ...)` with `M` traced,
+# the HMM forward-algorithm shape — lowers to the same single `stablehlo.while`
+# carry loop as the 1-D method above. The loop closes over the traced parent
+# alone and gathers row `i` by the counter with the `allowscalar` idiom,
+# threads the carry (scalar, `NamedTuple`, or a vector such as an HMM belief
+# state), and writes scalar per-step outputs into the preallocated traced
+# buffer. The first step runs eagerly to seed the carry and fix the output
+# element type, so `N == 1` runs with an empty loop body. A non-scalar
+# per-step output is the same loud, reported limitation as on the 1-D path.
+# Two representation facts pin this shape: the step indexes its row (`row[1]`)
+# without `allowscalar`, which is legal only for a HOST container, so each
+# gathered row is a host vector of traced scalars; and the `RowSlices` wrapper
+# itself is not while-carryable (Reactant cannot trace its `OneTo` axes), so
+# it never crosses the `@trace` boundary — only the parent does. Shapes this
+# method does NOT claim — a host (untraced) parent, `eachrow` over a
+# non-matrix, or a row-slices sequence beside other iterated sequences — keep
+# falling through to the generic native loop, which traces unrolled with exact
+# values. `RowSlices` is `eachrow`'s return type across the supported Julia
+# line; a rename would fail loudly here at precompile, never silently.
+function ReactiveKernels._tensorized_scan(
+        step, init,
+        iterated::Tuple{<:Base.RowSlices{<:Reactant.TracedRArray{<:Any,2}}},
+        shared::Tuple)
+    parent = only(iterated).parent
+    n = size(parent, 1)
+    K = size(parent, 2)
+    n == 0 && throw(ArgumentError("scan requires a non-empty sequence"))
+    # Built OUTSIDE the `@trace` body: the body re-traces every captured value
+    # operand, so an in-body `Val(K)` would meet a traced `K` and die.
+    Kval = Val(K)
+    x1 = _scan_gather_row(parent, 1, Kval)
+    carry, out1 = step(init, x1, shared...)
+    buffer = _scan_output_buffer(out1, n)
+    Reactant.@allowscalar buffer[1] = out1
+    Reactant.@trace for i in 2:n
+        x = _scan_gather_row(parent, i, Kval)
+        carry, out = step(carry, x, shared...)
         Reactant.@allowscalar buffer[i] = out
     end
     buffer

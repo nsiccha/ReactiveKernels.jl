@@ -58,4 +58,32 @@ function _authored_scan_lockstep_reference(a, b)
     seq
 end
 
+# A forward-algorithm-shaped scan over matrix ROWS with a vector carry — the
+# posteriordb hmm_drive_1 shape: `scan(eachrow(mat), Ref(gain); init = seed)`
+# threads a 2-vector belief state and emits a scalar per step. The Reactant
+# lowering keeps a single `stablehlo.while` for this shape (regression:
+# scan-while-claim-5006b5b9); `N == 1` is a first-class case with an empty
+# loop body after the eager first step.
+@kernel authored_scan_eachrow(mat::Matrix{Float64}, gain::Float64) = begin
+    seed::Vector{Float64} = [-0.6931471805599453, -0.6931471805599453]
+    seq::Vector{Float64} = scan(eachrow(mat), Ref(gain); init = seed) do carry, row, g
+        emit = g .* (row[1] .+ carry .* row[2])
+        newg = emit .+ row[3]
+        (newg, sum(newg))
+    end
+    total::Float64 = sum(seq)
+    return total
+end
+
+function _authored_scan_eachrow_reference(mat, gain)
+    carry = [-0.6931471805599453, -0.6931471805599453]
+    seq = Vector{Float64}(undef, size(mat, 1))
+    for (i, row) in enumerate(eachrow(mat))
+        emit = gain .* (row[1] .+ carry .* row[2])
+        carry = emit .+ row[3]
+        seq[i] = sum(carry)
+    end
+    seq
+end
+
 end
