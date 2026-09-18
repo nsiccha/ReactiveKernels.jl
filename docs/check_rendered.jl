@@ -678,18 +678,9 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
     observed_panels = 0
     all_artifact_ids = String[]
     for source in sources
-        source_body = read(joinpath(source_dir, source), String)
-        raw_table_lines = [
-            line_number for (line_number, line) in enumerate(eachline(IOBuffer(source_body)))
-            if occursin(r"^\s*\|.*\|\s*$", line)
-        ]
-        isempty(raw_table_lines) || _record_advisory!(
-            advisories; page = source, contract_kind = "raw-markdown-table-count",
-            expected = 0, observed = length(raw_table_lines),
-            artifact_ids = ["source-line-$line" for line in raw_table_lines],
-            detail = "prefer source-authoritative AoV/HTMXO renderers",
-        )
-
+        # The raw-markdown-table lint was retired per user decision `17uqwf3`:
+        # authored pages may use markdown tables, and the recurring advisory was
+        # noise. Render integrity is still enforced by the fatal checks below.
         intermediate_path = joinpath(intermediate_dir, source)
         isfile(intermediate_path) ||
             error("DocumenterVitepress intermediate page is missing: $intermediate_path")
