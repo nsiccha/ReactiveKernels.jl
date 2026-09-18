@@ -2316,11 +2316,10 @@ function _recipe_line(r::Recipe)
     ins = join([string(v.name) for v in r.inputs], ", ")
     outs = length(r.outputs) == 1 ? string(r.outputs[1].name) :
            "(" * join([string(v.name) for v in r.outputs], ", ") * ")"
-    # Synthesized tuple unpacks read as field access, not as a Fix2 call.
-    if length(r.inputs) == 1 && r.op isa Base.Fix2{typeof(getproperty)}
-        return "$outs = $(only(r.inputs).name).$(r.op.x)"
-    elseif length(r.inputs) == 1 && r.op isa Base.Fix2{typeof(getindex)}
-        return "$outs = $(only(r.inputs).name)[$(r.op.x)]"
+    # Synthesized tuple unpacks read as field access, not as accessor calls.
+    if length(r.inputs) == 1
+        suffix = _unpack_access_suffix(r.op)
+        suffix !== nothing && return "$outs = $(only(r.inputs).name)$suffix"
     end
     "$outs = $(_opname(r.op))($ins)"
 end

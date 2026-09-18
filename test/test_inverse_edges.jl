@@ -184,4 +184,15 @@ end
             plan(F.named_pack; have = (:x, :y), want = (:x, :params))
         @test length(via_pack.recipes) == 1
     end
+
+    @testset "unpack edges infer like literal field access" begin
+        # A value-held selector (e.g. Fix2(getproperty, :x)) widens to the
+        # union of all field types; the parametric accessors must not.
+        get_x = prepare(F.named_pack; have = (:params,), want = :x)
+        @test @inferred(get_x((x = 1.0, y = 2))) === 1.0
+        get_y = prepare(F.named_pack; have = (:params,), want = :y)
+        @test @inferred(get_y((x = 1.0, y = 2))) === 2
+        get_first = prepare(F.positional_pack; have = (:t,), want = :x)
+        @test @inferred(get_first((1.0, 2))) === 1.0
+    end
 end

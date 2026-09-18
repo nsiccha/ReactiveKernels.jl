@@ -107,6 +107,32 @@ end
 # computed entries occupy their position but unpack to no port, and a splat
 # makes every later positional index unknowable so positional unpack stops
 # there. Named fields are unaffected by splats.
+#
+# The accessors carry their field/index as a TYPE parameter, not a value.
+# A value-held selector such as `Base.Fix2(getproperty, :x)` widens
+# `getproperty(::NamedTuple, ::Symbol)` to the union of all field types
+# under inference, which breaks `@inferred` callers of from-parameters
+# queries; the parametric form infers exactly like the `params.x` syntax.
+
+"""
+    _PackField{Field}
+
+Unpack accessor for one `NamedTuple` field: `_PackField{:x}()(params)`
+is `getproperty(params, :x)`, inferring exactly like the literal syntax.
+"""
+struct _PackField{Field} end
+
+(accessor::_PackField{Field})(packed) where {Field} = getproperty(packed, Field)
+
+"""
+    _PackIndex{Index}
+
+Unpack accessor for one positional tuple element: `_PackIndex{1}()(t)`
+is `getindex(t, 1)`, inferring exactly like the literal syntax.
+"""
+struct _PackIndex{Index} end
+
+(accessor::_PackIndex{Index})(packed) where {Index} = getindex(packed, Index)
 
 function _kernel_named_pack_entry(arg)
     arg isa Symbol && return (arg, arg)
@@ -161,8 +187,7 @@ function _kernel_synthesize_pack_edges!(graph::Graph, recipe::Recipe)
         target = get(by_name, port, nothing)
         target === nothing && continue
         canon_id(graph, target.id) == packed_id && continue
-        op = kind === :named ? Base.Fix2(getproperty, key) :
-             Base.Fix2(getindex, key)
+        op = kind === :named ? _PackField{key}() : _PackIndex{key}()
         _kernel_has_equivalent_recipe(
             graph, packed_id, canon_id(graph, target.id), op) && continue
         source = kind === :named ? Expr(:., packed.name, QuoteNode(key)) :
@@ -177,6 +202,12 @@ end
 
 _opname(f::Base.Fix1) = "Fix1($(_opname(f.f)), $(repr(f.x)))"
 _opname(f::Base.Fix2) = "Fix2($(_opname(f.f)), $(repr(f.x)))"
+_opname(::_PackField{Field}) where {Field} = "field(:$Field)"
+_opname(::_PackIndex{Index}) where {Index} = "index($Index)"
+
+_unpack_access_suffix(::_PackField{Field}) where {Field} = ".$Field"
+_unpack_access_suffix(::_PackIndex{Index}) where {Index} = "[$Index]"
+_unpack_access_suffix(::Any) = nothing
 
 function _readable_callee(f::Union{Base.Fix1,Base.Fix2})
     tag = f isa Base.Fix1 ? :Fix1 : :Fix2
