@@ -65,12 +65,19 @@ Prepare the `build_kernel` output `built` for a named workflow `preset`
 over the sampler boundary (`:unconstrained` + data columns, data hoisted
 via `bound=`). Thin wrapper over `ReactiveKernels.prepare` with
 `want = workflow_wants(preset)`; the returned kernel maps an unconstrained
-`Vector{Float64}` to the preset node's value.
+`Vector{Float64}` to the preset node's value. The preparation itself is
+world-age safe (callable from compiled functions), but the RAW returned
+kernel closes over build-time eval'd code: call it from top level, wrap
+the call in `Base.invokelatest`, or use [`SamplerQuery`](@ref), whose
+call paths carry the barrier.
 """
 function prepare_query(built, plan::StructuralPlan, preset::Symbol)
     isbound(plan) || throw(ContractValidationError(
         "[query] prepare_query requires a bound plan (bind_data first)"))
-    return prepare(built.spec; have = _query_have(plan),
+    # World-age barrier: `built.spec` holds closures eval'd at build time
+    # (newer than any already-compiled caller), so partial evaluation must
+    # run at the latest world. Same barrier guards every call below.
+    return Base.invokelatest(prepare, built.spec; have = _query_have(plan),
         want = workflow_wants(preset), bound = _query_bound(plan))
 end
 
@@ -102,7 +109,8 @@ function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real}
     length(u0) == layout.total || throw(ContractValidationError(
         "[query] exemplar length $(length(u0)) ≠ layout total $(layout.total)"))
     kern = prepare_query(built, plan, :sampler)
-    prep = prepare_ad(kern, backend, Vector{Float64}(u0); active = :unconstrained)
+    prep = Base.invokelatest(prepare_ad, kern, backend, Vector{Float64}(u0);
+        active = :unconstrained)
     return SamplerQuery(kern, prep, layout)
 end
 
@@ -113,8 +121,9 @@ Posterior value at unconstrained `u`. Zero-copy for `Vector{Float64}` (the
 HMC-loop case); any other real vector is converted. `u` must have
 `q.layout.total` entries.
 """
-(q::SamplerQuery)(u::Vector{Float64}) = q.kernel(u)
-(q::SamplerQuery)(u::AbstractVector{<:Real}) = q.kernel(Vector{Float64}(u))
+(q::SamplerQuery)(u::Vector{Float64}) = Base.invokelatest(q.kernel, u)
+(q::SamplerQuery)(u::AbstractVector{<:Real}) =
+    Base.invokelatest(q.kernel, Vector{Float64}(u))
 
 """
     sampler_value_and_gradient!(q::SamplerQuery, g::AbstractVector, u)
@@ -125,10 +134,10 @@ valid gradient destination for `u`; `u` is converted to `Vector{Float64}`
 unless it already is one.
 """
 function sampler_value_and_gradient!(q::SamplerQuery, g::AbstractVector, u::Vector{Float64})
-    return ad_value_and_gradient!(q.ad, g, u)
+    return Base.invokelatest(ad_value_and_gradient!, q.ad, g, u)
 end
 function sampler_value_and_gradient!(q::SamplerQuery, g::AbstractVector, u::AbstractVector)
-    return ad_value_and_gradient!(q.ad, g, Vector{Float64}(u))
+    return Base.invokelatest(ad_value_and_gradient!, q.ad, g, Vector{Float64}(u))
 end
 
 """
