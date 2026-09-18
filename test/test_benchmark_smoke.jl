@@ -363,6 +363,24 @@ using .ComparisonSourceAttestation
         published, guard)
 end
 
+@testset "incremental producer selection and resume isolation" begin
+    native = read(joinpath(_BENCH_DIR, "all80_posteriordb_body.jl"), String)
+    reactant = read(joinpath(_BENCH_DIR, "all80_reactant_body.jl"), String)
+    selector = "setdiff(keys(RK), All80Registry.BATCH1_KEYS)"
+    @test occursin(selector, native) && occursin(selector, reactant)
+    registry = read(joinpath(_BENCH_DIR, "all80_registry.jl"), String)
+    @test occursin("const BATCH1_KEYS = Set([", registry)
+    @test count(key -> occursin("\"$key\"", registry), (
+        "diamonds-diamonds", "dogs-dogs_nonhierarchical",
+        "ovarian-logistic_regression_rhs", "normal_5-normal_mixture_k")) == 4
+    @test occursin("count(==(name), _req) > 1", native)
+    @test occursin("count(==(name), requested) > 1", reactant)
+    @test occursin("All80Receipt.assert_batch_resume!", native)
+    @test occursin("All80Receipt.assert_batch_resume!", reactant)
+    @test occursin("reference_valid_probe", reactant)
+    @test !occursin("valid_rk_point(", reactant)
+end
+
 @testset "MNIST logistic primal benchmark receipt validates" begin
     validator = joinpath(
         _BENCH_DIR, "receipts", "validate_mnist_logistic.jl")

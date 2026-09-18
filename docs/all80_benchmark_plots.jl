@@ -45,7 +45,11 @@ end
 # per-individual plate vs the comparator's O(1) sufficient statistics) are shown as a DISTINCT
 # "workload-mismatch" series, never merged into a matched-workload win/loss. Set curated from the
 # performance workload audit (extend as it establishes more); Mb is the confirmed flagship.
-const _ALL80_WORKLOAD_MISMATCH = Set(["Mb_data-Mb_model"])
+# `Mb` (82): rich O(M) plate vs the comparator's O(1) sufficient statistics. `diamonds-diamonds`
+# (batch-1): the upstream Turing model consumes precomputed sufficient statistics (XtX/Xty/xsum/
+# ysum/yty/n, O(P²)) while RK/Stan do observation-level O(N·P) work — so its ratio is a
+# workload mismatch, NOT a matched-workload lowering verdict (verified in posteriordb_models.jl:815).
+const _ALL80_WORKLOAD_MISMATCH = Set(["Mb_data-Mb_model", "diamonds-diamonds"])
 
 # TIMING-QUARANTINED models (performance steer 2026-09-08, option c): their native timings were
 # measured under KNOWN competing host load (telemetry-evidenced), so their timing VALUES are
@@ -201,4 +205,52 @@ function render_all80_reactant_coverage_plot(path = _ALL80_BENCHMARK_PATH)
             "82 lower for all three operations (primal, gradient, and the compiled HMC loop). The " *
             "diagnostic-recording mechanism stays in place — never a workaround in the sources — so " *
             "any future model or backend change that fails is surfaced here rather than hidden.")
+end
+
+# ---- Batch-1 incremental additions (todo 1x4pytu) — SEPARATE receipt, rendered ALONGSIDE ----------
+# The batch-1 posteriordb translations registered against the EXISTING upstream Turing + Stan
+# comparators. These read `_ALL80_BATCH1_PATH`, NEVER `_ALL80_BENCHMARK_PATH`; the frozen-82 render
+# is untouched. They reuse the same data/gate/timing-quarantine helpers, so missing/failed cells are
+# not ranked and `diamonds-diamonds` renders as the distinct workload-mismatch series. Empty (no
+# receipt yet — awaiting the landed source) degrades to an honest note, never a broken build.
+function render_all80_batch1_coverage_plot(path = _ALL80_BATCH1_PATH)
+    isfile(path) || return _all80_plot_note(
+        "Batch-1 incremental additions: receipt not present yet — awaiting the landed RK source and the focused 4-model run.")
+    rows = _all80_reactant_coverage_rows(_all80_models(path))
+    isempty(rows) && return _all80_plot_note("Batch-1: no models recorded yet.")
+    spec = data(rows) *
+        mapping(:operation => "Reactant operation", :count => "Batch-1 models";
+            color = :outcome => "Outcome") *
+        visual(BarPlot)
+    _all80_fig(spec * config(width = 420, height = 240,
+            title = "Historical batch-1 Reactant lowering coverage (uncertified)",
+            scales = scales(Y = (; zero = true)));
+        id = "all80-batch1-coverage",
+        title = "Batch-1 coverage — what lowered",
+        description = "The historical batch-1 additions, rendered from the SEPARATE " *
+            "all80-batch1-v1.toml — a UNION alongside the frozen 82, never merged into it. This saved run is uncertified: Reactant producer provenance and ordinary-AE certification are absent. Registered against the " *
+            "existing upstream Turing + posteriordb Stan comparators (no new Turing translation).")
+end
+
+function render_all80_batch1_speedup_plot(path = _ALL80_BATCH1_PATH)
+    isfile(path) || return _all80_plot_note(
+        "Batch-1 single-eval speedup: receipt not present yet — awaiting the landed RK source and the focused 4-model run.")
+    rows = _all80_speedup_rows(_all80_models(path))
+    isempty(rows) && return _all80_plot_note("Batch-1: no numerically-gated single-evaluation rows yet.")
+    spec = data(rows) *
+        mapping(:dim => "Model dimension", :speedup => "log₂(comparator / RK)   ·   >0 ⇒ RK faster";
+            color = :metric => "Evaluation", col = :comparator => "Comparator",
+            marker = :workload => "Workload") *
+        visual(Scatter)
+    _all80_fig(spec * config(width = 360, height = 300,
+            title = "Historical batch-1 additions vs reference Stan and upstream Turing (uncertified)",
+            scales = scales(X = (; scale = log10)));
+        id = "all80-batch1-speedup",
+        title = "Historical batch-1 additions — single-eval speed (uncertified, directional)",
+        description = "Each point is one historical batch-1 addition, from the SEPARATE " *
+            "all80-batch1-v1.toml (a union with the frozen 82, not merged; uncertified provenance/configuration). `diamonds-diamonds` is " *
+            "marked a WORKLOAD MISMATCH — its upstream Turing model consumes precomputed sufficient " *
+            "statistics (XtX/Xty/…) while RK/Stan do observation-level work, so its ratio is not a " *
+            "matched-workload verdict. Same observed-load + per-side-support caveats as the 82; the " *
+            "same-T distinction (native-adaptive-T vs Reactant T=4 is capability, not matched-T) holds.")
 end
