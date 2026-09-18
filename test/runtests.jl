@@ -35,6 +35,7 @@ const _MATRIX_CORE_TESTS = (
     "test_authoring.jl",
     "test_docs_navigation.jl",
     "test_kernel_objects.jl",
+    "test_inverse_edges.jl",
     "test_readable_expr.jl",
     "test_plate.jl",
     "test_authored_plate.jl",
