@@ -1,5 +1,6 @@
 using Distributions: Bernoulli, Cauchy, Dirichlet, Exponential, Geometric,
-    InverseGamma, Laplace, LKJCholesky, Logistic, LogNormal, MvNormal, Normal,
+    InverseGamma, Laplace, LKJCholesky, Logistic, LogNormal, MvNormal,
+    NegativeBinomial, Normal,
     TDist, Uniform, cdf, logpdf, quantile
 using LinearAlgebra: Cholesky, LowerTriangular, Symmetric, cholesky
 using LogExpFunctions: log1pexp
@@ -19,6 +20,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal, cauchy, laplace, logistic, bernoulli, lognormal,
     exponential, geometric, uniform, mvnormal, ar1,
     categorical_logit, categorical_logit_ref,
+    negative_binomial2,
     inverse_gamma, dirichlet, lkj_corr_cholesky,
     NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY
 using Test
@@ -403,5 +405,29 @@ end
         # p HAVE selects the (observed, p) recipe and never forms `logit`.
         @test occursin("(observed, p)", p_plan)
         @test !occursin("(observed, logit)", p_plan)
+    end
+end
+
+@testset "negative_binomial2 Stan lpmf parity" begin
+    # NB2(mu, phi) is Stan's neg_binomial_2: var = mu + mu^2/phi, which is
+    # exactly NegativeBinomial(phi, phi/(phi+mu)) — the independent oracle.
+    nb2 = prepare(negative_binomial2.logpdf;
+        have = (:observed, :mu, :phi), want = :logpdf)
+    for (y, mu, phi) in ((0, 2.5, 1.5), (3, 2.5, 1.5), (7, 0.4, 3.0),
+            (1, 10.0, 0.5), (5, 3.0, 3.0))
+        ref = logpdf(NegativeBinomial(phi, phi / (phi + mu)), y)
+        @test nb2(y, mu, phi) ≈ ref
+    end
+    # Impossible events are -Inf, never NaN (branchless ifelse guards).
+    @test nb2(3, 0.0, 1.5) == -Inf
+    @test nb2(0, 0.0, 2.0) == 0.0
+    @test nb2(2, Inf, 1.5) == -Inf
+    @test nb2(-1, 2.5, 1.5) == -Inf
+    @test nb2(2, -1.0, 1.5) == -Inf
+    @test nb2(2, 2.5, 0.0) == -Inf
+    @test nb2(2, 2.5, -1.0) == -Inf
+    for v in (nb2(3, 0.0, 1.5), nb2(2, Inf, 1.5), nb2(-1, 2.5, 1.5),
+            nb2(2, -1.0, 1.5), nb2(2, 2.5, 0.0))
+        @test !isnan(v)
     end
 end

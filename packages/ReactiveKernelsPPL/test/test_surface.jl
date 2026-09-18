@@ -135,6 +135,123 @@ end
     _check_gradient(built.spec, bound, u)
 end
 
+@testset "surface roundtrip slice-1 families end to end" begin
+    # Binomial, column trials.
+    m = @rkppl begin
+        mu = a .+ b .* x
+        y .~ Binomial.(n, logistic.(mu))
+    end
+    cols, _ = _gen_columns()
+    cols[:y] = [1, 0, 2, 1, 3, 2]
+    cols[:n] = [3, 2, 4, 3, 5, 4]
+    bound = m(; y = cols[:y], x = cols[:x], n = cols[:n])
+    built = build_kernel(bound)
+    u = [0.25, 0.5]
+    nt = constrain(built.layout, u)
+    eta = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    ll = sum(logpdf.(Binomial.(cols[:n], 1 ./ (1 .+ exp.(-eta))), cols[:y]))
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2])
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, bound, u)
+    @test bound.roles[:n] === :trials
+
+    # Binomial, literal trials.
+    m = @rkppl begin
+        mu = a .+ b .* x
+        y .~ Binomial.(5, logistic.(mu))
+    end
+    bound = m(; y = cols[:y], x = cols[:x])
+    built = build_kernel(bound)
+    nt = constrain(built.layout, u)
+    eta = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    ll = sum(logpdf.(Binomial.(5, 1 ./ (1 .+ exp.(-eta))), cols[:y]))
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, bound, u)
+
+    # NB2.
+    m = @rkppl begin
+        phi ~ Exponential(1.0)
+        eta = a .+ b .* x
+        y .~ NegativeBinomial2.(exp.(eta), phi)
+    end
+    cols[:y] = [0, 1, 2, 1, 3, 2]
+    bound = m(; y = cols[:y], x = cols[:x])
+    built = build_kernel(bound)
+    u3 = [0.1, -0.2, 0.3]
+    nt = constrain(built.layout, u3)
+    mu = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
+    ll = sum(logpdf.(NegativeBinomial.(nt.phi, nt.phi ./ (nt.phi .+ mu)),
+        cols[:y]))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2]) +
+        logpdf(Exponential(1), nt.phi)
+    @test _query(built.spec, bound, :posterior, u3) ≈ ll + pr + u3[3]
+    _check_gradient(built.spec, bound, u3)
+
+    # Gamma.
+    m = @rkppl begin
+        alpha ~ Exponential(1.0)
+        eta = a .+ b .* x
+        y .~ Gamma.(alpha, exp.(eta) ./ alpha)
+    end
+    cols[:y] = [1.0, 2.0, 1.5, 2.5, 3.0, 2.0]
+    bound = m(; y = cols[:y], x = cols[:x])
+    built = build_kernel(bound)
+    nt = constrain(built.layout, u3)
+    mu = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
+    ll = sum(logpdf.(Gamma.(nt.alpha, mu ./ nt.alpha), cols[:y]))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2]) +
+        logpdf(Exponential(1), nt.alpha)
+    @test _query(built.spec, bound, :posterior, u3) ≈ ll + pr + u3[3]
+    _check_gradient(built.spec, bound, u3)
+end
+
+@testset "slice-1 response failures" begin
+    Dn2 = (:y, :x)
+    Dn3 = (:y, :x, :n)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ Binomial.(n, mu)
+    end, Dn3)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ Binomial.(2.5, logistic.(mu))
+    end, Dn3)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ Binomial.(zz, logistic.(mu))
+    end, Dn3)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        phi ~ Exponential(1.0)
+        eta = a .+ b .* x
+        y .~ NegativeBinomial2.(eta, phi)
+    end, Dn2)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        phi ~ Exponential(1.0)
+        eta = a .+ b .* x
+        y .~ negative_binomial2.(exp.(eta), phi)
+    end, Dn2)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        alpha ~ Exponential(1.0)
+        eta = a .+ b .* x
+        y .~ Gamma.(alpha, eta ./ alpha)
+    end, Dn2)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        alpha ~ Exponential(1.0)
+        alpha2 ~ Exponential(1.0)
+        eta = a .+ b .* x
+        y .~ Gamma.(alpha, exp.(eta) ./ alpha2)
+    end, Dn2)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        alpha ~ Exponential(1.0)
+        eta = a .+ b .* x
+        y .~ gamma.(alpha, exp.(eta) ./ alpha)
+    end, Dn2)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ BinomialLogit.(n, mu)
+    end, Dn3)
+end
+
 @testset "surface plan equality" begin
     # Bernoulli: stated intercept prior, defaulted slope prior.
     got = lower_rkppl(quote

@@ -83,8 +83,55 @@ function _poisson_plan(n = 9)
     )
 end
 
+function _binomial_plan(n = 9)
+    cols = _columns(n)
+    cols[:y] = repeat([1, 0, 2], outer = cld(n, 3))[1:n]
+    cols[:n] = fill(4, n)
+    StructuralPlan(
+        [LikelihoodSpec(BinomialLogitFam, LogitLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp, :n, nothing)],
+        [PredictorSpec(:eta, IdentityLink, _terms(), :eta)],
+        _priors(:eta),
+        SampledParameter[],
+        AssignmentSpec[],
+        cols,
+        n,
+    )
+end
+
+function _nb2_plan(n = 9)
+    cols = _columns(n)
+    cols[:y] = repeat([0, 1, 2], outer = cld(n, 3))[1:n]
+    StructuralPlan(
+        [LikelihoodSpec(NegativeBinomial2Fam, LogLink, :y, :eta, :phi, nothing,
+            _none_evidence(), :y_resp)],
+        [PredictorSpec(:eta, LogLink, _terms(), :eta)],
+        _priors(:eta),
+        [SampledParameter(:phi, :exponential, (arg1 = 1.0,), nothing, :phi)],
+        AssignmentSpec[],
+        cols,
+        n,
+    )
+end
+
+function _gamma_plan(n = 9)
+    cols = _columns(n)
+    cols[:y] = collect(1.0:n)
+    StructuralPlan(
+        [LikelihoodSpec(GammaLogFam, LogLink, :y, :eta, :alpha, nothing,
+            _none_evidence(), :y_resp)],
+        [PredictorSpec(:eta, LogLink, _terms(), :eta)],
+        _priors(:eta),
+        [SampledParameter(:alpha, :exponential, (arg1 = 1.0,), nothing, :alpha)],
+        AssignmentSpec[],
+        cols,
+        n,
+    )
+end
+
 @testset "contract admission predicates" begin
-    @test admitted_families() == (GaussianFam, BernoulliLogitFam, PoissonLogFam)
+    @test admitted_families() == (GaussianFam, BernoulliLogitFam, PoissonLogFam,
+        BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam)
     @test admitted_terms() ==
         (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm)
     @test :log in admitted_functions()
@@ -102,6 +149,9 @@ end
     @test validate_plan(_bernoulli_plan()) === nothing
     @test validate_plan(_bernoulli_logit_predictor_plan()) === nothing
     @test validate_plan(_poisson_plan()) === nothing
+    @test validate_plan(_binomial_plan()) === nothing
+    @test validate_plan(_nb2_plan()) === nothing
+    @test validate_plan(_gamma_plan()) === nothing
 end
 
 @testset "link triples" begin
@@ -112,6 +162,14 @@ end
     # Poisson + identity predictor link is not admitted either.
     bad = _poisson_plan()
     bad.predictors[1] = PredictorSpec(:eta, IdentityLink, _terms(), :eta)
+    @test_throws ContractValidationError validate_plan(bad)
+    # NB2 + identity predictor link is not admitted either.
+    bad = _nb2_plan()
+    bad.predictors[1] = PredictorSpec(:eta, IdentityLink, _terms(), :eta)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Binomial + log predictor link is not admitted either.
+    bad = _binomial_plan()
+    bad.predictors[1] = PredictorSpec(:eta, LogLink, _terms(), :eta)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
@@ -144,6 +202,58 @@ end
     bad.responses[1] =
         LikelihoodSpec(BernoulliLogitFam, LogitLink, :y, :eta, 1.0, nothing,
             _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+end
+
+@testset "slice-1 response validation" begin
+    # Binomial requires trials.
+    bad = _binomial_plan()
+    bad.responses[1] =
+        LikelihoodSpec(BinomialLogitFam, LogitLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Non-Binomial responses take no trials.
+    bad = _poisson_plan()
+    bad.responses[1] =
+        LikelihoodSpec(PoissonLogFam, LogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp, :n, nothing)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Non-integer trials column.
+    bad = _binomial_plan()
+    bad.columns[:n] = fill(2.5, 9)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Response exceeds trials.
+    bad = _binomial_plan()
+    bad.columns[:y] = fill(9, 9)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Bool is not a count column.
+    bad = _binomial_plan()
+    bad.columns[:y] = fill(true, 9)
+    @test_throws ContractValidationError validate_plan(bad)
+    # NB2/Gamma require their auxiliary.
+    bad = _nb2_plan()
+    bad.responses[1] =
+        LikelihoodSpec(NegativeBinomial2Fam, LogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    bad = _gamma_plan()
+    bad.responses[1] =
+        LikelihoodSpec(GammaLogFam, LogLink, :y, :eta, nothing, nothing,
+            _none_evidence(), :y_resp)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Gamma response must be strictly positive.
+    bad = _gamma_plan()
+    bad.columns[:y] = zeros(9)
+    @test_throws ContractValidationError validate_plan(bad)
+    # NB2 rejects non-count response.
+    bad = _nb2_plan()
+    bad.columns[:y] = fill(1.5, 9)
+    @test_throws ContractValidationError validate_plan(bad)
+    # Evidence wrappers stay Gaussian/Poisson-only.
+    bad = _nb2_plan()
+    bad.responses[1] =
+        LikelihoodSpec(NegativeBinomial2Fam, LogLink, :y, :eta, :phi, nothing,
+            ResponseEvidence(:truncated, 0.0, 9.0), :y_resp)
     @test_throws ContractValidationError validate_plan(bad)
 end
 
