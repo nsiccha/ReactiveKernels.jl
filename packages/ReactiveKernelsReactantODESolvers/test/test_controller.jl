@@ -65,22 +65,16 @@ end
 @testset "dense output identities" begin
     tab = RKRO.Tsit5Tableau{Float64}()
     dense = RKRO.Tsit5DenseCoefficients{Float64}()
-    buffers = RKRO.Tsit5Buffers{Float64}(2)
     uprev = [1.0, 3.0]
-    copyto!(buffers.k1, lotka_volterra(uprev, LOTKA_PARAMS, 0.0))
-    EEst = RKRO.tsit5_step!(buffers, lotka_volterra, uprev, LOTKA_PARAMS, 0.0,
-        0.1, tab, 1e-6, 1e-3)
-    @test isfinite(EEst)
-    stages = (buffers.k1, buffers.k2, buffers.k3, buffers.k4, buffers.k5,
-        buffers.k6, buffers.k7)
+    k1 = lotka_volterra(uprev, LOTKA_PARAMS, 0.0)
+    step = RKRO.tsit5_step(lotka_volterra, uprev, k1, LOTKA_PARAMS, 0.0, 0.1,
+        tab, 1e-6, 1e-3)
+    @test isfinite(step.EEst)
+    @test length(step.k) == 7
 
-    at_start = similar(uprev)
-    RKRO.tsit5_dense_eval!(at_start, uprev, stages, 0.1, 0.0, dense)
-    @test at_start == uprev
-
-    at_end = similar(uprev)
-    RKRO.tsit5_dense_eval!(at_end, uprev, stages, 0.1, 1.0, dense)
-    @test at_end ≈ buffers.u rtol = 1e-12
+    @test RKRO.tsit5_dense_eval(uprev, step.k, 0.1, 0.0, dense) == uprev
+    @test RKRO.tsit5_dense_eval(uprev, step.k, 0.1, 1.0, dense) ≈ step.u rtol =
+        1e-12
 
     weights = RKRO.tsit5_dense_weights(0.0, dense)
     @test all(iszero, weights)

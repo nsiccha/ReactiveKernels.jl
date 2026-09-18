@@ -23,21 +23,17 @@ function tsit5_dense_weights(θ::T,
 end
 
 """
-    tsit5_dense_eval!(out, uprev, stages, dt, θ, dense)
+    tsit5_dense_eval(uprev, stages, dt, θ, dense)
 
-Evaluate the dense output at fraction `θ` of the accepted step into `out`:
-`out = uprev + dt*Σbᵢ(θ)kᵢ`. `stages` is the 7-tuple of stage-derivative
-vectors `(k1, …, k7)` of that step.
+Evaluate the dense output at fraction `θ` of the accepted step:
+`uprev + dt*Σbᵢ(θ)kᵢ`. `stages` is the 7-tuple of stage-derivative vectors
+`(k1, …, k7)` of that step. Returns a fresh vector; nothing is mutated.
 """
-function tsit5_dense_eval!(out::AbstractVector{T}, uprev::AbstractVector{T},
+function tsit5_dense_eval(uprev::AbstractVector{T},
         stages::NTuple{7,AbstractVector{T}}, dt::T, θ::T,
         dense::Tsit5DenseCoefficients{T}) where {T<:AbstractFloat}
     b1, b2, b3, b4, b5, b6, b7 = tsit5_dense_weights(θ, dense)
     k1, k2, k3, k4, k5, k6, k7 = stages
-    @inbounds for i in eachindex(out, uprev, k1, k2, k3, k4, k5, k6, k7)
-        out[i] = uprev[i] +
-                 dt * (k1[i] * b1 + k2[i] * b2 + k3[i] * b3 + k4[i] * b4 +
-                       k5[i] * b5 + k6[i] * b6 + k7[i] * b7)
-    end
-    out
+    uprev .+ dt .* (k1 .* b1 .+ k2 .* b2 .+ k3 .* b3 .+ k4 .* b4 .+
+                    k5 .* b5 .+ k6 .* b6 .+ k7 .* b7)
 end

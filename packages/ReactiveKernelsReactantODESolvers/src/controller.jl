@@ -5,6 +5,12 @@
 # qmin = 1/5, qmax = 10, qoldinit = 1e-4, RMS error norm, and the Hairer-style
 # automatic initial step. The steady-state branch (`qsteady`) is a no-op for
 # explicit methods (qsteady_min == qsteady_max == 1) and is not implemented.
+#
+# The norm, error, and controller-factor functions are straight-line
+# vectorized code shared by the native driver and the Reactant-traced driver:
+# no scalar indexing, no mutation, no data-dependent branches. (`initial_dt`
+# keeps its host-side branches; the traced driver takes its initial step as
+# concrete configuration instead.)
 
 const TSIT5_ORDER = 5
 const TSIT5_PI_BETA1 = 7 / (10 * TSIT5_ORDER)   # 0.14
@@ -22,11 +28,7 @@ OrdinaryDiffEq's `ODE_DEFAULT_NORM` on array states.
 """
 function rms_norm(x::AbstractVector{T}) where {T<:AbstractFloat}
     isempty(x) && throw(ArgumentError("cannot take the norm of an empty state"))
-    acc = zero(T)
-    @inbounds for xi in x
-        acc += abs2(xi)
-    end
-    sqrt(acc / length(x))
+    sqrt(sum(abs2, x) / length(x))
 end
 
 """
@@ -37,25 +39,20 @@ Scaled error estimate: the RMS norm of
 """
 function error_estimate(utilde::AbstractVector{T}, uprev::AbstractVector{T},
         u::AbstractVector{T}, abstol::T, reltol::T) where {T<:AbstractFloat}
-    acc = zero(T)
-    @inbounds for i in eachindex(utilde, uprev, u)
-        scale = abstol + max(abs(uprev[i]), abs(u[i])) * reltol
-        r = utilde[i] / scale
-        acc += abs2(r)
-    end
-    sqrt(acc / length(utilde))
+    scales = abstol .+ max.(abs.(uprev), abs.(u)) .* reltol
+    rms_norm(utilde ./ scales)
 end
 
 """
     pi_factors(EEst, qold)
 
-PI-controller factors for an error estimate `EEst > 0`: returns `(q, q11)`
-with `q11 = EEst^beta1`, `q = clamp(q11 / qold^beta2 / gamma, 1/qmax, 1/qmin)`.
-A zero estimate takes the maximum growth factor `1/qmax`, matching
-OrdinaryDiffEq's `stepsize_controller!` for `PIController`.
+PI-controller factors for an error estimate `EEst`: returns `(q, q11)` with
+`q11 = EEst^beta1` and `q = clamp(q11 / qold^beta2 / gamma, 1/qmax, 1/qmin)`.
+A zero estimate takes the maximum growth factor `1/qmax` through the clamp
+(`0^beta1 == 0`), matching OrdinaryDiffEq's `stepsize_controller!` for
+`PIController` without a branch.
 """
 function pi_factors(EEst::T, qold::T) where {T<:AbstractFloat}
-    iszero(EEst) && return (one(T) / T(TSIT5_QMAX), zero(T))
     q11 = EEst^T(TSIT5_PI_BETA1)
     q = q11 / qold^T(TSIT5_PI_BETA2) / T(TSIT5_GAMMA)
     q = max(one(T) / T(TSIT5_QMAX), min(one(T) / T(TSIT5_QMIN), q))
@@ -95,10 +92,7 @@ rather than stepping from a poisoned state.
 function initial_dt(f, u0::AbstractVector{T}, p, t0::T, tdir::T, dtmax::T,
         abstol::T, reltol::T) where {T<:AbstractFloat}
     n = length(u0)
-    sk = Vector{T}(undef, n)
-    @inbounds for i in eachindex(u0)
-        sk[i] = abstol + abs(u0[i]) * reltol
-    end
+    sk = abstol .+ abs.(u0) .* reltol
     f0 = Vector{T}(f(u0, p, t0))
     length(f0) == n ||
         throw(ArgumentError("RHS must return a vector of length $(n), got $(length(f0))"))
@@ -110,7 +104,7 @@ function initial_dt(f, u0::AbstractVector{T}, p, t0::T, tdir::T, dtmax::T,
     end
     dt0 = (d0 < T(1e-5) || d1 < T(1e-5)) ? smalldt : (d0 / d1) / T(100)
     dt0 = min(dt0, dtmax)
-    u1 = @inbounds u0 .+ (tdir * dt0) .* f0
+    u1 = u0 .+ (tdir * dt0) .* f0
     f1 = Vector{T}(f(u1, p, t0 + tdir * dt0))
     if f0 == f1
         return (tdir * max(nextfloat(zero(T)), min(T(100) * dt0, dtmax)), f0, 2)

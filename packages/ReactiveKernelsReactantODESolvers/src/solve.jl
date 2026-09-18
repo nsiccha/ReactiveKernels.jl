@@ -109,7 +109,6 @@ function solve_ode(f, u0::AbstractVector, tspan, ::Tsit5=Tsit5(); p=nothing,
     u = Vector{T}(u0)
     tab = Tsit5Tableau{T}()
     dense = Tsit5DenseCoefficients{T}()
-    buffers = Tsit5Buffers{T}(n)
 
     save_sorted = _prepare_saveat(saveat, t0, t1, tdir, T)
 
@@ -118,18 +117,21 @@ function solve_ode(f, u0::AbstractVector, tspan, ::Tsit5=Tsit5(); p=nothing,
 
     local dt_signed::T
     local nfevals::Int
+    local k1::Vector{T}
     if dt === nothing
         dt_signed, f0, spent = initial_dt(f, u, p, t0, tdir, dtmax_T, atol, rtol)
         nfevals = spent
-        copyto!(buffers.k1, f0)
+        k1 = f0
     else
         iszero(dt) && throw(ArgumentError("initial dt must be nonzero"))
         isfinite(dt) || throw(ArgumentError("initial dt must be finite"))
         dt_signed = tdir * abs(T(dt))
         nfevals = 1
-        copyto!(buffers.k1, f(u, p, t0))
+        k1 = Vector{T}(f(u, p, t0))
+        length(k1) == n || throw(ArgumentError(
+            "RHS must return a vector of length $n, got $(length(k1))"))
     end
-    if any(!isfinite, buffers.k1)
+    if any(!isfinite, k1)
         stats = (naccepted=0, nrejected=0, nfevals=nfevals)
         return Tsit5Solution(saved_t, saved_u, :Unstable, stats)
     end
@@ -142,8 +144,6 @@ function solve_ode(f, u0::AbstractVector, tspan, ::Tsit5=Tsit5(); p=nothing,
     nrejected = 0
     attempts = 0
     cursor = 1
-    stages = (buffers.k1, buffers.k2, buffers.k3, buffers.k4, buffers.k5,
-        buffers.k6, buffers.k7)
 
     while tdir * (t1 - t) > zero(T)
         if attempts >= maxiters
@@ -165,7 +165,8 @@ function solve_ode(f, u0::AbstractVector, tspan, ::Tsit5=Tsit5(); p=nothing,
             stats = (naccepted=naccepted, nrejected=nrejected, nfevals=nfevals)
             return Tsit5Solution(saved_t, saved_u, :DtLessThanDtMin, stats)
         end
-        EEst = tsit5_step!(buffers, f, u, p, t, dt, tab, atol, rtol)
+        step = tsit5_step(f, u, k1, p, t, dt, tab, atol, rtol)
+        EEst = step.EEst
         attempts += 1
         nfevals += 6
         if isnan(EEst)
@@ -185,10 +186,10 @@ function solve_ode(f, u0::AbstractVector, tspan, ::Tsit5=Tsit5(); p=nothing,
         q, q11 = pi_factors(EEst, qold)
         if EEst <= one(T)
             cursor = _emit_saveat!(saved_t, saved_u, save_sorted, cursor, u,
-                stages, t, dt, tdir, dense)
+                step.k, t, dt, tdir, dense)
             t = endpoint_clamped ? t1 : t + dt
-            copyto!(u, buffers.u)
-            copyto!(buffers.k1, buffers.k7)
+            u = step.u
+            k1 = step.k[7]
             if saveat === nothing
                 push!(saved_t, t)
                 push!(saved_u, copy(u))
@@ -252,10 +253,8 @@ function _emit_saveat!(saved_t::Vector{T}, saved_u::Vector{Vector{T}},
             (t_new <= ts < t_prev)
         interior || break
         θ = ts == t_new ? one(T) : (ts - t_prev) / dt_used
-        out = Vector{T}(undef, length(uprev))
-        tsit5_dense_eval!(out, uprev, stages, dt_used, θ, dense)
         push!(saved_t, ts)
-        push!(saved_u, out)
+        push!(saved_u, tsit5_dense_eval(uprev, stages, dt_used, θ, dense))
         cursor += 1
     end
     cursor
