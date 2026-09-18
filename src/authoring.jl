@@ -1940,6 +1940,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     push_unique_ref = GlobalRef(@__MODULE__, :_kernel_push_unique!)
     add_ref = GlobalRef(@__MODULE__, :_kernel_add!)
     alias_ref = GlobalRef(@__MODULE__, :_kernel_alias!)
+    synthesize_ref = GlobalRef(@__MODULE__, :_kernel_synthesize_inverse_edges!)
     spec_ref = GlobalRef(@__MODULE__, :KernelSpec)
     graph_ref = GlobalRef(@__MODULE__, :Graph)
     value_ref = GlobalRef(@__MODULE__, :Value)
@@ -2174,6 +2175,9 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     for name in want_names
         push!(body, :($push_unique_ref($want_var, $(QuoteNode(name)))))
     end
+    # Provision automatic reverse edges (InverseFunctions inverses and tuple
+    # unpacks) once every authored recipe is in place; see inverse_edges.jl.
+    push!(body, :($synthesize_ref($graph_var)))
 
     quote
         let

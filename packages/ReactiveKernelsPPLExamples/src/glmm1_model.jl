@@ -50,8 +50,6 @@ using LogExpFunctions: logistic, log1pexp
     parameters = (; alpha, mu_alpha, sd_alpha)
     (parameters, log_jacobian::Float64) =
         ((; alpha, mu_alpha, sd_alpha), log(5.0) - log1pexp(-u_sd) - log1pexp(u_sd))
-    (alpha::AbstractVector{Float64}, mu_alpha::Float64, sd_alpha::Float64) =
-        (parameters.alpha, parameters.mu_alpha, parameters.sd_alpha)
 
     # Priors: alphaⱼ ~ Normal(mu_alpha, sd_alpha) (mu_alpha/sd_alpha ride the
     # plate as shared scalar args); mu_alpha ~ Normal(0, 10). sd_alpha has no `~`.

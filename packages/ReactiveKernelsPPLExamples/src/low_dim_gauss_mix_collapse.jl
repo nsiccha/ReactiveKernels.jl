@@ -62,10 +62,6 @@ using LogExpFunctions: logistic, log1pexp, logaddexp
     (parameters, log_jacobian::Float64) =
         ((; mu1, mu2, sigma1, sigma2, theta),
          u_sigma1 + u_sigma2 + (-log1pexp(-u_theta)) + (-log1pexp(u_theta)))
-    (mu1::Float64, mu2::Float64, sigma1::Float64, sigma2::Float64,
-     theta::Float64) =
-        (parameters.mu1, parameters.mu2, parameters.sigma1, parameters.sigma2,
-         parameters.theta)
 
     # Priors. mu ~ Normal(0,2); sigma ~ Normal(0,2) (half-normal over sigma>0,
     # plain normal_lpdf — Stan drops the truncation log2); theta ~ Beta(5,5).
