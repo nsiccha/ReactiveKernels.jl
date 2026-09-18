@@ -685,7 +685,10 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
     ex isa Number && return nothing
     ex isa LineNumberNode && return nothing
     if ex isa Symbol
-        if _is_derived(plan, ex) || ex in _union_names(plan)
+        # Per-cell latent (plate) parameters are vectors, so a derived column
+        # may transform one (`theta = mu .+ tau .* z`) — the non-centered shape.
+        if _is_derived(plan, ex) || _is_plate_param(plan, ex) ||
+                ex in _union_names(plan)
             push!(refs, ex)
             return nothing
         end
@@ -1044,10 +1047,11 @@ function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
         end
     elseif t.kind === LatentTerm
         length(t.columns) == 1 ||
-            _fail(t.label, "latent term takes exactly one plate-parameter name")
-        _is_plate_param(plan, only(t.columns)) || _fail(t.label,
-            "latent term over $(only(t.columns)) needs a matching per-cell " *
-            "latent parameter (a `PlateParameter`)")
+            _fail(t.label, "latent term takes exactly one latent-vector name")
+        c = only(t.columns)
+        (_is_plate_param(plan, c) || _is_derived(plan, c)) || _fail(t.label,
+            "latent term over $c needs a per-cell latent parameter " *
+            "(a `PlateParameter`) or a derived column that transforms one")
     else
         if t.kind === ContinuousTerm || t.kind === OffsetTerm
             length(t.columns) == 1 ||

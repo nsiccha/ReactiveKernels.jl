@@ -634,11 +634,18 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
     cells = Any[a for a in body.args if !(a isa LineNumberNode)]
     isempty(cells) && _sfail("`@plate` body is empty")
     # Names bound by `=` anywhere in this plate (cell locals, excluded
-    # from the bare-vector check even on forward reference).
+    # from the bare-vector check even on forward reference) — a bare LHS
+    # (`t = ...`) or an i-indexed LHS (`theta[i] = ...`).
     plate_defs = Set{Symbol}()
     for c in cells
-        c isa Expr && c.head === :(=) && length(c.args) == 2 &&
-            c.args[1] isa Symbol && push!(plate_defs, c.args[1])
+        c isa Expr && c.head === :(=) && length(c.args) == 2 || continue
+        lc = c.args[1]
+        if lc isa Symbol
+            push!(plate_defs, lc)
+        elseif lc isa Expr && lc.head === :ref && length(lc.args) == 2 &&
+                lc.args[1] isa Symbol && lc.args[2] === ivar
+            push!(plate_defs, lc.args[1])
+        end
     end
     out = Expr[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
@@ -683,14 +690,27 @@ function _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx, params)
         return _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs,
             ctx, params)
     end
-    if c.head === :(=) && length(c.args) == 2 && c.args[1] isa Symbol
-        lhs = c.args[1]
-        lhs in data && _sfail("cell assignment `$lhs = ...` redefines " *
+    if c.head === :(=) && length(c.args) == 2
+        # A deterministic cell binds a bare local (`t = expr`) or an i-indexed
+        # column (`theta[i] = f(...[i])`); both strip `[i]` refs to a
+        # whole-vector top-level assignment.
+        lc = c.args[1]
+        col = if lc isa Symbol
+            lc
+        elseif lc isa Expr && lc.head === :ref && length(lc.args) == 2 &&
+                lc.args[1] isa Symbol && lc.args[2] === ivar
+            lc.args[1]
+        else
+            _sfail("cell assignment LHS is a bare local (`t = ...`) or an " *
+                   "`$ivar`-indexed column (`theta[$ivar] = ...`), got " *
+                   "$(repr(lc))")
+        end
+        col in data && _sfail("cell assignment `$col = ...` redefines " *
                               "bound data")
         bares = _cell_bares(c.args[2], ivar)
         setdiff!(bares, plate_defs)
-        push!(ctx, (lhs, line, bares))
-        return [Expr(:(=), lhs, _strip_cell(c.args[2], ivar))]
+        push!(ctx, (col, line, bares))
+        return [Expr(:(=), col, _strip_cell(c.args[2], ivar))]
     end
     return _sfail("cells hold `~` observations and `=` assignments only")
 end
@@ -1415,19 +1435,19 @@ end
 
 function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         coefuse)
-    # A bare per-cell latent VECTOR is the whole location (`y .~ Normal.(theta,
-    # s)`): a LatentTerm predictor emitting `lp = theta` (identity design). The
-    # latent's own prior lives on its PlateParameter, so no coefficient use is
-    # recorded. Mixed latent+fixed-effect locations are a later increment.
+    # A per-cell latent VECTOR is the whole location via a LatentTerm predictor
+    # (`lp = theta`, identity design; the latent's prior lives on its
+    # PlateParameter, so no coefficient use is recorded). Two spellings: a bare
+    # latent (`y[i] ~ Normal.(theta[i], s)`) or a deterministic transform of one
+    # (`theta[i] = mu .+ tau .* z[i]` then `y[i] ~ Normal.(theta[i], s)` — the
+    # non-centered / latent-transform shape, emitted as a derived column and
+    # referenced directly). A derived location with NO latent stays a design
+    # predictor; mixed latent+fixed BARE-expression locations are a later slice.
     if loc isa Symbol && loc in ctx.plate_names
-        pname = Symbol(lhs, "_loc")
-        (haskey(ctx.detmap, pname) || pname in ctx.plate_names) && _sfail(
-            "latent-location predictor name $pname collides with your " *
-            "definition — rename it")
-        term = TermSpec(LatentTerm, [loc], NamedTuple(), loc, Symbol(loc, "_lat"))
-        push!(predictors, PredictorSpec(pname, pred_link, [term], pname))
-        pred_idx[pname] = length(predictors)
-        return pname
+        return _latent_predictor!(lhs, loc, pred_link, ctx, predictors, pred_idx)
+    end
+    if loc isa Symbol && haskey(ctx.detmap, loc) && _derived_reads_latent(loc, ctx)
+        return _latent_predictor!(lhs, loc, pred_link, ctx, predictors, pred_idx)
     end
     if loc isa Symbol
         haskey(ctx.detmap, loc) ||
@@ -1456,6 +1476,36 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
     push!(predictors, PredictorSpec(pname, pred_link, terms, pname))
     pred_idx[pname] = length(predictors)
     return pname
+end
+
+# Build the LatentTerm location predictor over `col` (a plate parameter or a
+# derived column that reads one); the generator emits `lp = col`.
+function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx)
+    pname = Symbol(lhs, "_loc")
+    (haskey(ctx.detmap, pname) || pname in ctx.plate_names) && _sfail(
+        "latent-location predictor name $pname collides with your " *
+        "definition — rename it")
+    term = TermSpec(LatentTerm, [col], NamedTuple(), col, Symbol(col, "_lat"))
+    push!(predictors, PredictorSpec(pname, pred_link, [term], pname))
+    pred_idx[pname] = length(predictors)
+    return pname
+end
+
+# Does a derived column transitively read a per-cell latent (plate parameter)?
+# If so, its value is a latent transform (e.g. non-centered `mu .+ tau .* z`),
+# not a design predictor — it stays a derived column used directly as the LP.
+function _derived_reads_latent(name::Symbol, ctx)
+    haskey(ctx.detmap, name) || return name in ctx.plate_names
+    seen = Set{Symbol}((name,))
+    stack = collect(_value_symbols(ctx.detmap[name]))
+    while !isempty(stack)
+        s = pop!(stack)
+        s in seen && continue
+        push!(seen, s)
+        s in ctx.plate_names && return true
+        haskey(ctx.detmap, s) && append!(stack, _value_symbols(ctx.detmap[s]))
+    end
+    return false
 end
 
 function _lower_location_symbol_error(lhs, loc, ctx)

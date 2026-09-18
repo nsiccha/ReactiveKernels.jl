@@ -1361,3 +1361,48 @@ end
                 Expr(:block, :(theta[i] ~ Normal(0, 1)),
                     :(y[i] ~ Normal.(theta[i] .+ b .* x[i], sigma)))))), Dn)
 end
+
+# Non-centered / latent-transform: a per-cell latent feeding a deterministic
+# cell (`theta[i] = mu .+ tau .* z[i]`) used as the response location — local
+# assignments and sampling statements composing inside a plate.
+@testset "surface plate non-centered latent transform" begin
+    cols, n = _gen_columns()
+    ast = Expr(:block,
+        :(mu ~ Normal(0, 5)), :(sigma ~ Exponential(1)), :(tau ~ Exponential(1)),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(5),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block, LineNumberNode(6),
+                    :(z[i] ~ Normal(0, 1)),
+                    :(theta[i] = mu .+ tau .* z[i]),
+                    :(y[i] ~ Normal.(theta[i], sigma))))))
+    plan = lower_rkppl(ast, (:y, :x))
+    @test [p.name for p in plan.plate_parameters] == [:z]
+    @test :theta in [d.name for d in plan.derived]      # emitted, not decomposed
+    loc = only(plan.predictors)
+    @test loc.terms[1].kind === LatentTerm && loc.terms[1].columns == [:theta]
+    # Value + gradient vs an independent oracle.
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    u = [0.3, -0.2, 0.1, 0.5, -0.25, 0.1, 0.4, -0.1, 0.2]
+    nt = constrain(built.layout, u)
+    mu, sigma, tau, z = nt.mu, nt.sigma, nt.tau, Vector(nt.z)
+    theta = mu .+ tau .* z
+    ll = sum(logpdf.(Normal.(theta, sigma), cols[:y]))
+    pr = logpdf(Normal(0, 5), mu) + logpdf(Exponential(1), sigma) +
+        logpdf(Exponential(1), tau) + sum(logpdf.(Normal(0, 1), z))
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[2] + u[3]
+    _check_gradient(built.spec, bound, u)
+    # An indexed deterministic cell with NO latent still lowers as a design
+    # predictor (identical to the bare-LHS spelling) — the discriminator works.
+    a = lower_rkppl(Expr(:block,
+        :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(4),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block, :(mu[i] = a .+ b .* x[i]),
+                    :(y[i] ~ Normal.(mu[i], s)))))), (:y, :x))
+    bare = lower_rkppl(Expr(:block,
+        :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
+        :(mu = a .+ b .* x), :(y .~ Normal.(mu, s))), (:y, :x))
+    @test _plans_equal(a, bare)
+    @test all(t.kind !== LatentTerm for p in a.predictors for t in p.terms)
+end
