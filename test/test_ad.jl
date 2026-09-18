@@ -420,6 +420,52 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
         @test returned === gradient
         @test gradient ≈ ref_grad
     end
+
+    @testset "bound matrix views externalize as owning copies" begin
+        # Likelihood plates over bind-time `view(y, :, j)` columns are the
+        # posteriordb lotka-volterra shape: observation columns beside an
+        # active trajectory. A prebuilt `SubArray` hidden operand defeats plain
+        # reverse-mode Enzyme static activity analysis (the derivative unboxes
+        # the parent pointer into an active slot), so preparation materializes
+        # each bound view as an owning copy with identical contents; the
+        # derivative then lowers exactly like the runtime-view form.
+        @kernel twin_column_like(x::Vector{Float64}, y::Matrix{Float64}) = begin
+            c1 = view(y, :, 1)
+            c2 = view(y, :, 2)
+            m::Vector{Float64} = exp.(x)
+            first_pointwise = plate(c1, m) do observation, mean
+                observation * mean
+            end
+            second_pointwise = plate(c2, m) do observation, mean
+                observation * mean
+            end
+            objective::Float64 = sum(first_pointwise) + sum(second_pointwise)
+        end
+
+        x = [0.3, -0.4, 0.2, 0.1, -0.2]
+        y = [1.0 6.0; 2.0 7.0; 3.0 8.0; 4.0 9.0; 5.0 10.0]
+        reference = let y = y
+            function (x)
+                m = exp.(x)
+                sum(view(y, :, 1) .* m) + sum(view(y, :, 2) .* m)
+            end
+        end
+        ref_value, ref_grad = DifferentiationInterface.value_and_gradient(
+            reference, TEST_AD_BACKEND, x)
+
+        kernel = prepare(twin_column_like;
+                         have = (:x, :y), want = :objective,
+                         bound = (; y = y))
+        prepared = prepare_ad(kernel, TEST_AD_BACKEND, x; active = :x)
+        @test all(value -> value isa Array, prepared.external_values)
+        @test prepared.external_values == (y[:, 1], y[:, 2])
+
+        gradient = similar(x)
+        value, returned = ad_value_and_gradient!(prepared, gradient, x)
+        @test value ≈ ref_value
+        @test returned === gradient
+        @test gradient ≈ ref_grad
+    end
 end
 
 if !isdefined(@__MODULE__, :AuthoredScanFixtures)

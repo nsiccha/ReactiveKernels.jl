@@ -181,14 +181,15 @@ isempty(SEL) && error("DYNAMICS_MODELS selected no models")
 _want(m) = m in SEL
 const _RAN = Ref(0)
 
-# lotka: reference-checked native value only; ordinary-Reverse gradient is
-# unsupported pending core snag plain-enzyme-rev-3dc5d563 (see boundary).
+# lotka: reference-checked native value + ordinary-Reverse gradient, enabled
+# by landed core fix 55da875/f8acaa1 (snag plain-enzyme-rev-3dc5d563: bound
+# views externalized as owning copies for prepared AD). Compiled Reactant
+# axes remain unsupported pending the separate survey.
 _want("lotka") && gate("hudson_lynx_hare-lotka_volterra";
     graph = PE.LotkaVolterraExample.build_lotka_volterra_graph(),
     have = (:unconstrained, :ts, :y_init, :y),
     bind = d -> (ts = Float64.(d["ts"]), y_init = Float64.(d["y_init"]),
-                 y = Float64.(d["y"])),
-    do_grad = false)
+                 y = Float64.(d["y"])))
 
 _want("onecomp") && gate("one_comp_mm_elim_abs-one_comp_mm_elim_abs";
     graph = PE.OneCompMMElimAbsExample.build_one_comp_mm_elim_abs_graph(),

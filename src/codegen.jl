@@ -1659,15 +1659,24 @@ operand it must read. By default every array is externalized.
 This is a backend ABI adapter, not a different model boundary: `kernel` keeps
 its original public inputs, and `call(public_args..., values...)` is exactly
 equivalent to `kernel(public_args...)`.
+
+With `materialize_view_copies`, a bound `SubArray` crosses as an owning copy
+(`collect`) of its elements instead of the prebuilt view. A `SubArray`-typed
+`Constant` operand defeats reverse-mode Enzyme static activity analysis (it
+unboxes the parent pointer into an active slot), while an owning array with
+identical contents differentiates cleanly (snag plain-enzyme-rev-3dc5d563).
 """
 function _externalize_bound_array_call(f, ops;
-                                       min_elements::Integer = 0)
+                                       min_elements::Integer = 0,
+                                       materialize_view_copies::Bool = false)
     positions = Tuple(
         index for (index, op) in pairs(ops)
         if op isa _BoundConstant && op.value isa AbstractArray &&
            length(op.value) >= min_elements)
     isempty(positions) && return nothing, ()
-    values = Tuple(ops[index].value for index in positions)
+    values = Tuple(
+        _externalize_bound_value(ops[index].value, materialize_view_copies)
+        for index in positions)
     stripped = ntuple(length(ops)) do index
         slot = findfirst(==(index), positions)
         slot === nothing ? ops[index] :
@@ -1679,10 +1688,26 @@ function _externalize_bound_array_call(f, ops;
 end
 
 function _externalize_bound_arrays(kernel::PreparedKernel;
-                                   min_elements::Integer = 0)
+                                   min_elements::Integer = 0,
+                                   materialize_view_copies::Bool = false)
     call, values = _externalize_bound_array_call(
-        kernel.f, kernel.ops; min_elements)
+        kernel.f, kernel.ops; min_elements, materialize_view_copies)
     call === nothing ? (kernel, ()) : (call, values)
+end
+
+# Decide how one bound array crosses the externalized boundary. Owning arrays
+# cross whole; with `materialize_view_copies`, a `SubArray` crosses as an
+# owning copy with identical contents, axes, and element type. The copy
+# snapshots the view at preparation time; bound data is documented as fixed at
+# preparation, so unlike the primal's aliasing view this cannot observe a later
+# mutation of the parent — the same freeze `prepare_ad` already applies to the
+# externalized operand objects themselves.
+function _externalize_bound_value(value::AbstractArray,
+                                  materialize_view_copies::Bool)
+    (value isa SubArray && materialize_view_copies) || return value
+    collected = collect(value)
+    axes(collected) == axes(value) || return value
+    collected
 end
 
 # Prepared RK kernels are compiler-owned program structure when used as recipe

@@ -1462,7 +1462,11 @@ function ReactiveKernels._ad_prepared_value_and_gradient(
         prepared::ReactiveKernels.PreparedADKernel{I},
         point::Union{Reactant.TracedRArray,Reactant.TracedRNumber},
         contexts) where {I}
-    kernel, _ = ReactiveKernels._externalize_bound_arrays(prepared.kernel)
+    # These contexts were built from `prepared.external_values`, which the
+    # native preparation externalizes as owning view copies (not prebuilt
+    # views); the re-externalized kernel must expect that same hidden shape.
+    kernel, _ = ReactiveKernels._externalize_bound_arrays(
+        prepared.kernel; materialize_view_copies = true)
     call = ReactiveKernels._ADKernelCall{I,typeof(kernel)}(kernel)
     DifferentiationInterface.value_and_gradient(
         call, prepared.backend, point, contexts...)
@@ -1475,6 +1479,37 @@ function ReactiveKernels._ad_prepared_value_and_gradient!(
         prepared, point, contexts)
     copyto!(gradient, derivative)
     value, gradient
+end
+
+# A prepared-AD call with a native active input inside a Reactant trace cannot
+# stage: Reactant passes native compile inputs through untraced, and its
+# autodiff overlay then intercepts the native Enzyme call with all-native
+# arguments, which returns a correct value with a silent zero gradient (seen
+# with and without any ReactiveKernels code in the closure). Refuse loudly and
+# name the staged shape instead of baking that corruption into the program.
+# Contexts are always a (possibly empty) Tuple at every call site; constraining
+# on that keeps this an overload of the core fallback rather than an overwrite.
+function ReactiveKernels._ad_trace_sanity(point, contexts::Tuple)
+    if Reactant.within_compile() &&
+            !(point isa Union{Reactant.TracedRArray,Reactant.TracedRNumber})
+        throw(ArgumentError(
+            "prepared AD with a native active input of type $(typeof(point)) " *
+            "inside a Reactant trace would silently return a zero gradient; " *
+            "compile the enclosing function with Reactant.to_rarray inputs " *
+            "so the staged derivative is selected (reactivekernels-use §7a)"))
+    end
+    nothing
+end
+
+# The positional `ad_value_and_gradient!` fast path builds its point inline and
+# never passes the `_ad_prepared_arguments` check above, so it needs its own
+# refusal. A traced point still selects the staged method; anything else
+# reaching the native call in a trace is the same silent-zero shape.
+function ReactiveKernels._ad_prepared_value_and_gradient!(
+        prepared::ReactiveKernels.PreparedADKernel, gradient, point, contexts)
+    ReactiveKernels._ad_trace_sanity(point, contexts)
+    invoke(ReactiveKernels._ad_prepared_value_and_gradient!,
+           Tuple{Any,Any,Any,Any}, prepared, gradient, point, contexts)
 end
 
 function _rk_reactant_compile_ad_call(

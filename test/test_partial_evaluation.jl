@@ -123,6 +123,38 @@ end
         @test isempty(no_values)
     end
 
+    @testset "bound views externalize as owning copies" begin
+        g = Graph()
+        x = value!(g, :x, Vector{Float64})
+        ym = value!(g, :ym, Matrix{Float64})
+        c = value!(g, :c, Vector{Float64})
+        r = value!(g, :r, Float64)
+        add!(g; inputs = (ym,), outputs = (c,), op = ym -> view(ym, :, 1))
+        add!(g; inputs = (x, c), outputs = (r,), op = (x, c) -> sum(x .* c))
+
+        yval = [1.0 4.0; 2.0 5.0; 3.0 6.0]
+        bound_kernel = prepare(g; have = (x, ym), want = (r,),
+                               bound = (ym => yval,))
+        @test bound_kernel([1.0, 1.0, 1.0]) == 6.0
+
+        default_call, default_values =
+            ReactiveKernels._externalize_bound_arrays(bound_kernel)
+        @test default_values == (view(yval, :, 1),)
+        @test only(default_values) isa SubArray
+        @test default_call([1.0, 1.0, 1.0], default_values...) == 6.0
+
+        copy_call, copy_values =
+            ReactiveKernels._externalize_bound_arrays(
+                bound_kernel; materialize_view_copies = true)
+        @test copy_values == (yval[:, 1],)
+        @test only(copy_values) isa Vector
+        @test copy_call([1.0, 1.0, 1.0], copy_values...) == 6.0
+        @test all(copy_call.ops) do op
+            !(op isa ReactiveKernels._BoundConstant &&
+              op.value isa AbstractArray)
+        end
+    end
+
     @testset "data-only WANTs become constants" begin
         g = Graph()
         x = value!(g, :x, Float64)

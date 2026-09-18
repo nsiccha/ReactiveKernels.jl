@@ -113,8 +113,11 @@ function _ad_kernel_call(kernel::PreparedKernel, args::Tuple, ::Val{I}) where {I
             _ArrayFunctionPair,_EmbeddedFunctionPair,
             _DynamicEmbeddedFunctionPair} && native_exemplars
         ops = _ad_native_ops(kernel)
+        # Bound views cross this Enzyme boundary as owning copies: a
+        # `SubArray`-typed `Constant` operand defeats static activity
+        # analysis, while identical owning contents differentiate cleanly.
         externalized, values = _externalize_bound_array_call(
-            kernel.f.native, ops)
+            kernel.f.native, ops; materialize_view_copies = true)
         isempty(values) && return (
             _ADNativeKernelCall{I,typeof(kernel.f.native),typeof(ops)}(
                 kernel.f.native, ops),
@@ -122,7 +125,8 @@ function _ad_kernel_call(kernel::PreparedKernel, args::Tuple, ::Val{I}) where {I
         )
         return _ADKernelCall{I,typeof(externalized)}(externalized), values
     end
-    externalized, values = _externalize_bound_arrays(kernel)
+    externalized, values = _externalize_bound_arrays(
+        kernel; materialize_view_copies = true)
     _ADKernelCall{I,typeof(externalized)}(externalized), values
 end
 
@@ -291,6 +295,14 @@ end
     :(getfield(args, $I), ($(contexts...),))
 end
 
+# A native (non-traced) prepared-AD call inside a Reactant trace never reaches
+# native Enzyme: Reactant's autodiff overlay intercepts the call with all-native
+# arguments and the staged derivative comes back a silent zero gradient, while
+# the value stays correct. Every native call boundary checks its already-split
+# point here; the Reactant extension implements the in-trace refusal, and this
+# fallback keeps the core independent of the weak dependency.
+_ad_trace_sanity(point, contexts) = nothing
+
 function _ad_resolve(resolver, args::Tuple, kwargs::NamedTuple)
     resolver(args...; kwargs...)
 end
@@ -379,6 +391,8 @@ and its `Constant` contexts cover only the remaining ports. `args` and
 arguments do not apply to a bound preparation. Array-valued residual constants
 are passed to the backend as hidden `Constant` contexts rather than captured in
 the differentiated callable; this does not change the public HAVE boundary.
+Bound views cross as owning copies with identical contents, since a
+prebuilt view operand defeats reverse-mode static activity analysis.
 """
 function prepare_ad(spec::KernelSpec,
                     backend::DifferentiationInterface.AbstractADType,
@@ -551,11 +565,13 @@ function ad_gradient(spec::KernelSpec,
     if !isempty(bound)
         _ad_reject_bound_keywords(NamedTuple(kwargs))
         call, point, contexts, _, _ = _ad_call(kernel, args, active)
+        _ad_trace_sanity(point, contexts)
         return DifferentiationInterface.gradient(call, backend, point, contexts...)
     end
     resolver = _ad_resolver(spec)
     resolved = _ad_resolve(resolver, args, NamedTuple(kwargs))
     call, point, contexts, _, _ = _ad_call(kernel, resolved, active)
+    _ad_trace_sanity(point, contexts)
     DifferentiationInterface.gradient(call, backend, point, contexts...)
 end
 
@@ -566,6 +582,7 @@ function ad_gradient(kernel::PreparedKernel,
         "a low-level PreparedKernel has a positional HAVE boundary and does " *
         "not accept keywords; use a KernelSpec to preserve authored keywords"))
     call, point, contexts, _, _ = _ad_call(kernel, args, active)
+    _ad_trace_sanity(point, contexts)
     DifferentiationInterface.gradient(call, backend, point, contexts...)
 end
 
@@ -575,7 +592,10 @@ function _ad_prepared_arguments(
     length(resolved) == length(inputs(prepared.kernel)) || throw(ArgumentError(
         "selected HAVE boundary expects $(length(inputs(prepared.kernel))) " *
         "values; got $(length(resolved))"))
-    _ad_arguments(Val(I), (resolved..., prepared.external_values...))
+    point, contexts =
+        _ad_arguments(Val(I), (resolved..., prepared.external_values...))
+    _ad_trace_sanity(point, contexts)
+    point, contexts
 end
 
 function ad_gradient(prepared::PreparedADKernel, args...; kwargs...)
@@ -629,6 +649,7 @@ function ad_pullback(spec::KernelSpec,
     resolved = _ad_resolve(resolver, args, NamedTuple(kwargs))
     call, point, contexts, _, _ =
         _ad_call(kernel, resolved, active; scalar_output = false)
+    _ad_trace_sanity(point, contexts)
     only(DifferentiationInterface.pullback(
         call, backend, point, (seed,), contexts...))
 end
@@ -641,6 +662,7 @@ function ad_pullback(kernel::PreparedKernel,
         "not accept keywords; use a KernelSpec to preserve authored keywords"))
     call, point, contexts, _, _ =
         _ad_call(kernel, args, active; scalar_output = false)
+    _ad_trace_sanity(point, contexts)
     only(DifferentiationInterface.pullback(
         call, backend, point, (seed,), contexts...))
 end
@@ -651,7 +673,10 @@ function _ad_prepared_arguments(
     length(resolved) == length(inputs(prepared.kernel)) || throw(ArgumentError(
         "selected HAVE boundary expects $(length(inputs(prepared.kernel))) " *
         "values; got $(length(resolved))"))
-    _ad_arguments(Val(I), (resolved..., prepared.external_values...))
+    point, contexts =
+        _ad_arguments(Val(I), (resolved..., prepared.external_values...))
+    _ad_trace_sanity(point, contexts)
+    point, contexts
 end
 
 function ad_pullback(prepared::PreparedADPullback, seed, args...; kwargs...)
