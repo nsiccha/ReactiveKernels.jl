@@ -26,6 +26,12 @@ SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 ReactiveKernelsStreamingStats = "fe060097-a659-4245-b1df-751eb37b739a"
 Treebars = "e1e568c4-3a56-40a4-95fa-9b9c6c16fccb"
 
+[compat]
+OrdinaryDiffEqBDF = "2.4"
+OrdinaryDiffEqLowOrderRK = "2.2"
+SciMLBase = "3.46"
+SciMLSensitivity = "7.119"
+
 [sources.ReactiveKernels]
 path = ".."
 

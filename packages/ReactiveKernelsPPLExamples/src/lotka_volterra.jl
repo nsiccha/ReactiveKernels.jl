@@ -152,12 +152,12 @@ Build the posteriordb Lotka--Volterra model as a declarative
 log transforms and Jacobian. The adaptive DP5 solve is a natural opaque graph
 node; its `ODEProblem` is constructed outside AD and active `u0`/`p` are passed
 to `solve` at call time.
-Accepted evidence path under decision `008vhy5`: native primal/value only.
-Ordinary-Reverse gradient is unsupported pending core snag
-`plain-enzyme-rev-3dc5d563` (prepared-kernel activity-analysis gap; the
-identical math as a plain function differentiates fine), and compiled
-Reactant primal/gradient is unsupported pending the separate survey
-(investigation todo `2026-09-17T14-41-05-845-1k4a6ep`).
+Accepted evidence path under decision `008vhy5`: native primal/value plus
+ordinary-Reverse gradient, supported via landed core fix `55da875`/`f8acaa1`
+for snag `plain-enzyme-rev-3dc5d563` (bound views externalized as owning
+copies for prepared AD). Compiled Reactant primal/gradient is unsupported
+pending the separate survey (investigation todo
+`2026-09-17T14-41-05-845-1k4a6ep`).
 """
 function build_lotka_volterra_graph()
     compose(_LOTKA_VOLTERRA_GRAPH_TEMPLATE[])

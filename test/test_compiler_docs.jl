@@ -132,6 +132,11 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
         "reactant.md",
         "bound-regression.md",
         "posteriordb-comparison.md",
+        # The adaptive-ODE dynamics pages own their exact native-Enzyme
+        # support boundaries the same way the per-model GP pages do.
+        "lotka-volterra.md",
+        "one-comp-mm-elim-abs.md",
+        "soil-incubation.md",
     ))
     forbidden_ad_prose = (
         "DifferentiationInterface",
