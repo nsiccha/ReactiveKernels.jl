@@ -103,6 +103,8 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     # The per-model GP pages own their exact native-Enzyme and Reactant support
     # boundaries; allow those disclosures there rather than duplicating or deleting
     # the model-specific limitations.
+    # The per-model HMM page owns its exact native-Enzyme and Reactant gradient
+    # support boundary the same way the per-model GP pages do.
     ad_pages = Set((
         "automatic-differentiation.md",
         "distributions-ad.md",
@@ -125,6 +127,10 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
         # exact AD terminology/support boundaries.
         "brm-hsgp.md",
         "manual-derivative-rules.md",
+        "hmm-drive-1.md",
+        # The Kronecker GP page owns its exact native-Enzyme/Reactant boundary
+        # disclosure (dense eigendecomposition gradient axes) the same way.
+        "kronecker-gp.md",
         "mnist-reactant.md",
         "ppl-ad.md",
         "probprog-mcmc.md",
