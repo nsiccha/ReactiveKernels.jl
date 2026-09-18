@@ -99,6 +99,31 @@ end
     @test identity["query"]["points"] == [[0.1, -0.2]]
 end
 
+@testset "dotdot package roots certify" begin
+    # Frozen roots ARE normpath(joinpath(@__DIR__, ".."))-shaped, and normpath keeps a
+    # trailing separator on ".."-resolved inputs (Julia 1.10) — the loaded-root check
+    # must strip it rather than double the separator into a false mismatch (this exact
+    # shape failed a live DISCOVER run while the path visibly sat inside the root).
+    dotroot = mktempdir(); mkpath(joinpath(dotroot, "src"))
+    write(joinpath(dotroot, "Project.toml"), "name = \"dotpkg\"\n")
+    write(joinpath(dotroot, "src", "DotPkg.jl"), "const DOT = 1\n")
+    run(`git -C $dotroot init -q`)
+    run(`git -C $dotroot config user.email fixture@example.com`)
+    run(`git -C $dotroot config user.name fixture`)
+    run(`git -C $dotroot add Project.toml src/DotPkg.jl`)
+    run(`git -C $dotroot commit -q -m fixture-package`)
+    DotPkg = Module(:DotPkg)
+    Base.include(DotPkg, joinpath(dotroot, "src", "DotPkg.jl"))
+    snap = freeze_provenance!(; packages = Dict("dotpkg" => joinpath(dotroot, "src", "..")),
+        upstream_hash = "a7ef985b", harness_files = ["all80_receipt.jl"],
+        extra = Dict{String,Any}("phase" => "native", "batch" => "batch1",
+            "requested_keys" => ["m1"], "run_id" => "run-dotdot",
+            "ad_backend" => ORDINARY_AD_BACKEND))
+    All80Receipt._PROV_START[] = snap
+    certified = certify_loaded_modules!(Dict{String,Any}("dotpkg" => DotPkg))
+    @test certified["loaded_modules_certified"] == true
+end
+
 @testset "Reactant numeric digest helper seam" begin
     source = read(joinpath(@__DIR__, "all80_reactant_body.jl"), String)
     start = findfirst("_numeric_vector_sha256(values) =", source)
