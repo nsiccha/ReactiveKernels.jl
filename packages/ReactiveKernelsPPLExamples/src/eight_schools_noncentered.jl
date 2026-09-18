@@ -33,8 +33,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
 
     parameters = (; theta_trans, mu, tau)
     (parameters, log_jacobian::Float64) = ((; theta_trans, mu, tau), log_tau)
-    (theta_trans::AbstractVector{Float64}, mu::Float64, tau::Float64) =
-        (parameters.theta_trans, parameters.mu, parameters.tau)
 
     # Priors: theta_trans ~ Normal(0,1), mu ~ Normal(0,5), tau ~ HalfCauchy(0,5)
     # (the lower=0 constraint carries the half; Stan drops the log2 constant).

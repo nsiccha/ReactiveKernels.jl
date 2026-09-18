@@ -35,7 +35,6 @@ using LogExpFunctions: logistic
     log_jacobian::Float64 = 0.0
 
     parameters = (; alpha, beta1)
-    (alpha::Float64, beta1::Float64) = (parameters.alpha, parameters.beta1)
 
     # The Stan model block has NO `~` prior statement, so the priors are flat
     # (improper); Stan adds nothing and the varying prior term is zero.

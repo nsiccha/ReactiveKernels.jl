@@ -1224,10 +1224,38 @@ Lower a plan to an ordinary anonymous-function `Expr` of the form
     end
 
 This `Expr` is a first-class artifact: it may be inspected (`code_expr`) and
-rewritten (`transform`) before compilation (gist §9).
+rewritten (`transform`) before compilation (gist §9). Pair it with its
+operation table via [`lower_with_ops`](@ref).
 """
 lower(p::Plan) = first(_lower_with_ops(p; inline_embedded = false))
 _lower_unembedded(p::Plan) = lower(p)
+
+"""
+    lower_with_ops(p::Plan; tensorized=false, inline_embedded=false) -> (ast, ops, recipes)
+
+Lower a plan to an executable straight-line function `Expr` plus the operation
+table it closes over. `ast` is `function (__ops__, ports...) ... end` over the
+plan HAVE ports in order; `ops` is the tuple of callables with `ops[i]`
+evaluating the `__ops__[i]` references in the body; `recipes` is the parallel
+human-readable recipe metadata.
+
+Evaluate functionally with [`compile`](@ref) (or `eval`) and call with the ops
+tuple first:
+
+    ast, ops, _ = lower_with_ops(p)
+    f = compile(ast)
+    f(ops, port_values...)
+
+`lower(p)` is `first(lower_with_ops(p))`. With `tensorized = true` the body
+takes the backend tensorized form over the same operation table; with
+`inline_embedded = true` embedded prepared kernels are spliced as statements
+(the form [`prepare`](@ref) compiles) instead of opaque `__ops__` calls.
+"""
+function lower_with_ops(p::Plan; tensorized::Bool = false,
+                        inline_embedded::Bool = false)
+    _lower_with_ops(
+        p; tensorized = tensorized, inline_embedded = inline_embedded)
+end
 
 function _batched_dependency_analysis(p::Plan, batched)
     graph = p.graph
@@ -1256,6 +1284,186 @@ function _batched_dependency_analysis(p::Plan, batched)
         "lower_batched: want :$(want.name) is loop-invariant (does not depend on a batched port); nothing to vectorize"))
     (; mapped = Tuple(mapped), mapped_ids,
        recipe_dependencies = dependencies.recipes, want)
+end
+
+
+function _replicated_graph_plan(p::Plan)
+    for recipe in p.recipes
+        recipe.op isa _AuthoredPlateOp && return false
+        recipe.op isa _AuthoredScanOp && return false
+        _embedded_kernel(recipe.op) === nothing || return false
+    end
+    true
+end
+
+function _replicated_dependency_analysis(p::Plan, batched)
+    graph = p.graph
+    names = Tuple(batched isa Symbol ? (batched,) : batched)
+    isempty(names) && throw(ArgumentError(
+        "position batching requires at least one batched HAVE port"))
+    all(name -> name isa Symbol, names) || throw(ArgumentError(
+        "position batching batched ports must be Symbols; got $(names)"))
+    length(unique(names)) == length(names) || throw(ArgumentError(
+        "position batching batched ports must be unique; got $(names)"))
+    have_by_name = Dict(value.name => value for value in p.have)
+    mapped = Value[]
+    for name in names
+        value = get(have_by_name, name, nothing)
+        value === nothing && throw(ArgumentError(
+            "position batching port :$name is not in the plan HAVE boundary"))
+        push!(mapped, value)
+    end
+    mapped_ids = Set(canon_id(graph, value.id) for value in mapped)
+    dependencies = _plate_dependencies(p, mapped_ids)
+    positions = Tuple(
+        findfirst(value -> value.name === name, p.have) for name in names)
+    expected_ranks = Tuple(_replica_rank(valtype(p.have[index])) + 1
+                           for index in positions)
+    (; mapped = Tuple(mapped), mapped_ids,
+       recipe_dependencies = dependencies.recipes, positions, expected_ranks)
+end
+
+@inline function _replicated_validate_axes(
+        args::Tuple, ::Val{B}, ::Val{R}) where {B,R}
+    marker = getfield(args, first(B))
+    replica_count = size(marker, ndims(marker))
+    for (index, expected_rank) in zip(B, R)
+        arg = getfield(args, index)
+        ndims(arg) == expected_rank || throw(DimensionMismatch(
+            "position-batched port at HAVE position $index has rank " *
+            "$(ndims(arg)); expected $expected_rank (scalar rank plus one)"))
+        size(arg, ndims(arg)) == replica_count || throw(DimensionMismatch(
+            "position-batched ports disagree on batch length; got " *
+            "$(size(arg, ndims(arg))) and $replica_count"))
+    end
+    replica_count
+end
+
+@inline _replicated_project(arg::AbstractVector, replica_index) = arg[replica_index]
+@inline function _replicated_project(
+        arg::AbstractArray{T,N}, replica_index) where {T,N}
+    copy(selectdim(arg, N, replica_index))
+end
+
+@inline function _replicated_output(::Type{T}, replica_count) where {T<:Number}
+    Vector{T}(undef, replica_count)
+end
+@inline function _replicated_output(
+        ::Type{A}, replica_count) where {T,N,A<:AbstractArray{T,N}}
+    Array{T,N + 1}(undef, ntuple(_ -> 0, N)..., replica_count)
+end
+@inline function _replicated_output(
+        ::Type{A}, replica_count) where {A<:AbstractArray}
+    size = ntuple(_ -> 0, ndims(A))
+    similar(A, (size..., replica_count))
+end
+
+@inline function _replicated_store!(destination, replica_index, value)
+    copyto!(selectdim(destination, ndims(destination), replica_index), value)
+    destination
+end
+@inline _replicated_output(value::Number, replica_count) =
+    Vector{typeof(value)}(undef, replica_count)
+@inline function _replicated_output(value::AbstractArray, replica_count)
+    similar(value, (size(value)..., replica_count))
+end
+
+"""
+    lower_replicated(p::Plan; batched) -> Expr
+
+Lower a scalar plan over a shared trailing **position axis**. Recipes that
+transitively depend on a batched HAVE port execute once per position; recipes
+independent of every batched port execute once above the loop. This is position
+batching, not broadcast data batching: each batched array port is projected to
+its scalar-kernel argument at one position.
+
+The restricted graph-native path accepts straight-line operation recipes.
+Authored plates/scans and embedded prepared kernels retain the complete scalar
+callable fallback.
+"""
+function lower_replicated(p::Plan; batched)
+    _replicated_graph_plan(p) || throw(ArgumentError(
+        "position batching graph lowering does not support authored plates, " *
+        "scans, or embedded prepared kernels"))
+    analysis = _replicated_dependency_analysis(p, batched)
+    g = p.graph
+    names = _varnames(p)
+    nm(v) = names[canon_id(g, v.id)]
+    mapped(cid) = cid in analysis.mapped_ids
+
+    projected = Dict(canon_id(g, v.id) => gensym(Symbol(v.name, :_position))
+                     for v in p.have if canon_id(g, v.id) in analysis.mapped_ids)
+
+    function recipe_assignments!(destination, replica_index)
+        for (cid, variable) in projected
+            push!(destination.args,
+                :($variable = _replicated_project(
+                    $(g.values[cid].name), $replica_index)))
+        end
+        for (recipe_index, recipe) in enumerate(p.recipes)
+            isempty(analysis.recipe_dependencies[recipe_index]) && continue
+            lhsnames = [nm(output) for output in recipe.outputs]
+            lhs = length(lhsnames) == 1 ? only(lhsnames) :
+                  Expr(:tuple, lhsnames...)
+            args = Any[haskey(projected, canon_id(g, input.id)) ?
+                       projected[canon_id(g, input.id)] : nm(input)
+                       for input in recipe.inputs]
+            call = Expr(:call, Expr(:ref, _OPS_ARG, recipe_index), args...)
+            push!(destination.args, Expr(:(=), lhs, call))
+        end
+    end
+
+    argexprs = Any[_OPS_ARG]
+    for v in p.have
+        push!(argexprs, nm(v))
+    end
+    body = Expr(:block)
+    runtime_args = Expr(:tuple, argexprs[2:end]...)
+    push!(body.args, :(replica_count = _replicated_validate_axes(
+        $runtime_args, Val($(analysis.positions)),
+        Val($(analysis.expected_ranks)))))
+    for (recipe_index, recipe) in enumerate(p.recipes)
+        isempty(analysis.recipe_dependencies[recipe_index]) || continue
+        lhsnames = [nm(output) for output in recipe.outputs]
+        lhs = length(lhsnames) == 1 ? only(lhsnames) :
+              Expr(:tuple, lhsnames...)
+        call = Expr(:call, Expr(:ref, _OPS_ARG, recipe_index),
+                    (nm(input) for input in recipe.inputs)...)
+        push!(body.args, Expr(:(=), lhs, call))
+    end
+
+    output_vars = Dict(canon_id(g, v.id) => gensym(Symbol(v.name, :_batched))
+                       for v in p.want)
+    first_index = gensym(:replica_index)
+    push!(body.args, :($first_index = 1))
+    recipe_assignments!(body, first_index)
+    for v in p.want
+        cid = canon_id(g, v.id)
+        push!(body.args, Expr(:(=), output_vars[cid],
+            Expr(:call, GlobalRef(@__MODULE__, :_replicated_output),
+                 nm(v), :replica_count)))
+        push!(body.args,
+              Expr(:call, GlobalRef(@__MODULE__, :_replicated_store!),
+                   output_vars[cid], first_index, nm(v)))
+    end
+
+    rest_body = Expr(:block)
+    recipe_assignments!(rest_body, :replica_index)
+    for v in p.want
+        cid = canon_id(g, v.id)
+        push!(rest_body.args,
+              Expr(:call, GlobalRef(@__MODULE__, :_replicated_store!),
+                   output_vars[cid], :replica_index, nm(v)))
+    end
+    push!(body.args, Expr(:for,
+        Expr(:(=), :replica_index,
+             Expr(:call, GlobalRef(Base, :OneTo), :replica_count)),
+        Expr(:if, Expr(:call, GlobalRef(Base, :(==)), :replica_index, 1),
+             Expr(:block, Expr(:continue)), rest_body)))
+    retval = length(p.want) == 1 ? only(values(output_vars)) :
+             Expr(:tuple, (output_vars[canon_id(g, v.id)] for v in p.want)...)
+    push!(body.args, Expr(:return, retval))
+    Expr(:function, Expr(:tuple, argexprs...), body)
 end
 
 """
@@ -1662,7 +1870,8 @@ equivalent to `kernel(public_args...)`.
 
 With `materialize_view_copies`, a bound `SubArray` crosses as an owning copy
 (`collect`) of its elements instead of the prebuilt view. A `SubArray`-typed
-`Constant` operand defeats reverse-mode Enzyme static activity analysis (it
+`Constant` operand defeats static-activity analysis under reverse-mode
+automatic differentiation (it
 unboxes the parent pointer into an active slot), while an owning array with
 identical contents differentiates cleanly (snag plain-enzyme-rev-3dc5d563).
 """
@@ -1879,6 +2088,68 @@ optional array-compiler extensions may lower the same map to a backend batch
 primitive.
 """
 replica(kernel::PreparedKernel; batched) = _replica(kernel, batched)
+
+"""
+    GraphReplicatedKernel
+
+Native position-batched lowering for a straight-line scalar plan. Shared-only
+recipes are evaluated once above the position loop; recipes depending on a
+batched HAVE port execute once per position. The scalar `PreparedKernel` is
+retained as the mathematical authority and as the fallback for array-compiler
+batching.
+"""
+struct GraphReplicatedKernel{B,BT,OT,F,O,P,K,IN,OUT}
+    target::K
+    native::F
+    ops::O
+    plan::P
+    ast::Expr
+    inputs::IN
+    outputs::OUT
+end
+
+function _replicated_backend_call end
+
+@inline function (k::GraphReplicatedKernel{B})(args...) where {B}
+    length(args) == length(k.inputs) || throw(MethodError(k, args))
+    if _dynamic_tensorized_marker(args) !== nothing
+        return _replicated_backend_call(k, args)
+    end
+    k.native(k.ops, args...)
+end
+
+inputs(k::GraphReplicatedKernel) = k.inputs
+outputs(k::GraphReplicatedKernel) = k.outputs
+code_expr(k::GraphReplicatedKernel) = k.ast
+plan(k::GraphReplicatedKernel) = k.plan
+
+function Base.show(io::IO, k::GraphReplicatedKernel{B}) where {B}
+    names = Tuple(k.inputs[i].name for i in B)
+    print(io, "GraphReplicatedKernel(batched=", names, ", target=")
+    show(io, k.target)
+    print(io, ")")
+end
+
+function _replica_graph(target::PreparedKernel, batched)
+    indices = _replica_batch_indices(inputs(target), batched)
+    _replicated_graph_plan(target.plan) || throw(ArgumentError(
+        "scalar kernel requires the complete-callable replica fallback"))
+    ast = lower_replicated(target.plan; batched)
+    native = compile(ast)
+    boundary = inputs(target)
+    input_types = Tuple{(valtype(boundary[i]) for i in indices)...}
+    output_types = Tuple{(valtype(value) for value in outputs(target))...}
+    GraphReplicatedKernel{indices,input_types,output_types,
+                          typeof(native),typeof(target.ops),typeof(target.plan),
+                          typeof(target),typeof(boundary),
+                          typeof(outputs(target))}(
+        target, native, target.ops, target.plan, ast,
+        boundary, outputs(target))
+end
+
+function replica_graph(kernel::PreparedKernel; batched)
+    _replica_graph(kernel, batched)
+end
 
 @inline _replica_native_arg(arg, ::Type{T}, replica_index) where {T<:Number} =
     arg[replica_index]
@@ -2316,6 +2587,11 @@ function _recipe_line(r::Recipe)
     ins = join([string(v.name) for v in r.inputs], ", ")
     outs = length(r.outputs) == 1 ? string(r.outputs[1].name) :
            "(" * join([string(v.name) for v in r.outputs], ", ") * ")"
+    # Synthesized tuple unpacks read as field access, not as accessor calls.
+    if length(r.inputs) == 1
+        suffix = _unpack_access_suffix(r.op)
+        suffix !== nothing && return "$outs = $(only(r.inputs).name)$suffix"
+    end
     "$outs = $(_opname(r.op))($ins)"
 end
 

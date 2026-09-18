@@ -51,8 +51,6 @@ using LogExpFunctions: logistic, log1pexp
     (parameters, log_jacobian::Float64) =
         ((; alpha, beta1, beta2, beta3),
          jac_alpha + jac_beta1 + jac_beta2 + jac_beta3)
-    (alpha::Float64, beta1::Float64, beta2::Float64, beta3::Float64) =
-        (parameters.alpha, parameters.beta1, parameters.beta2, parameters.beta3)
 
     # Transformed parameters: the log-rate cubic trend. Captured scalars ride the
     # plate as explicit shared arguments (a scalar plate argument broadcasts

@@ -9,6 +9,7 @@ ReactiveKernelsNUTSExamples = "1bd07bcb-ec6f-4af5-8d58-21805f68d06f"
 ReactiveKernelsPPL = "e266ea2a-6817-46cd-8bec-6238f0035f44"
 ReactiveKernelsPPLExamples = "a4d4be3d-45c5-49cc-80d7-34e606a16bce"
 ReactiveKernelsStreamingStats = "fe060097-a659-4245-b1df-751eb37b739a"
+ReactiveKernelsReactantODESolvers = "03eb76aa-2b23-4fab-a762-f0290f039ac9"
 
 [compat]
 ReactiveKernels = "0.1"
@@ -21,6 +22,7 @@ ReactiveKernelsNUTSExamples = "0.1"
 ReactiveKernelsPPL = "0.1"
 ReactiveKernelsPPLExamples = "0.1"
 ReactiveKernelsStreamingStats = "0.1"
+ReactiveKernelsReactantODESolvers = "0.1"
 julia = "1.10"
 
 [sources.ReactiveKernels]
@@ -52,3 +54,6 @@ path = "ReactiveKernelsPPLExamples"
 
 [sources.ReactiveKernelsStreamingStats]
 path = "ReactiveKernelsStreamingStats"
+
+[sources.ReactiveKernelsReactantODESolvers]
+path = "ReactiveKernelsReactantODESolvers"

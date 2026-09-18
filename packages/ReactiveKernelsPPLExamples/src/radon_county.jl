@@ -69,9 +69,6 @@ using LogExpFunctions: logistic, log1pexp
     parameters = (; a, mu_a, sigma_a, sigma_y)
     (parameters, log_jacobian::Float64) =
         ((; a, mu_a, sigma_a, sigma_y), jac_sigma_a + jac_sigma_y)
-    (a::AbstractVector{Float64}, mu_a::Float64,
-     sigma_a::Float64, sigma_y::Float64) =
-        (parameters.a, parameters.mu_a, parameters.sigma_a, parameters.sigma_y)
 
     # Hyperprior: mu_a ~ Normal(0, 1) (proper, shows up in value AND gradient
     # parity).

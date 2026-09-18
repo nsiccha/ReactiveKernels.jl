@@ -55,8 +55,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
     # supplied, these inverse edges expose its named components to the same
     # prior and likelihood graph; when the components are supplied instead,
     # HAVE authority cuts the inverse edges.
-    (μ::Float64, τ::Float64, θ::AbstractVector{Float64}) =
-        (parameters.μ, parameters.τ, parameters.θ)
 
     # Log prior: μ ~ Normal(0, 5), τ ~ HalfCauchy(0, 5),
     # and θⱼ ~ Normal(μ, τ). The half-Cauchy keeps its fixed scale 5. Supplying

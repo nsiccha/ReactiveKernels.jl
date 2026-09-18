@@ -12,6 +12,7 @@ const LOCAL_PACKAGE_PATHS = (
     joinpath(@__DIR__, "ReactiveKernelsStreamingStats"),
     joinpath(@__DIR__, "ReactiveKernelsHMCDiagnostics"),
     joinpath(@__DIR__, "ReactiveKernelsPPL"),
+    joinpath(@__DIR__, "ReactiveKernelsReactantODESolvers"),
 )
 
 Pkg.develop([PackageSpec(path = path) for path in LOCAL_PACKAGE_PATHS])
