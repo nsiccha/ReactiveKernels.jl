@@ -13,11 +13,12 @@ export MVNORMAL_KERNEL_SOURCE, AR1_KERNEL_SOURCE
 export CATEGORICAL_LOGIT_KERNEL_SOURCE, CATEGORICAL_LOGIT_REF_KERNEL_SOURCE
 export POISSON_KERNEL_SOURCE, GAMMA_KERNEL_SOURCE
 export BETA_KERNEL_SOURCE, BINOMIAL_KERNEL_SOURCE
+export NEGATIVE_BINOMIAL2_KERNEL_SOURCE
 export INVERSE_GAMMA_KERNEL_SOURCE, DIRICHLET_KERNEL_SOURCE
 export LKJ_CORR_CHOLESKY_KERNEL_SOURCE
 export bernoulli, lognormal, exponential, geometric, uniform, mvnormal, ar1
 export categorical_logit, categorical_logit_ref
-export poisson, gamma, beta, binomial
+export poisson, gamma, beta, binomial, negative_binomial2
 export inverse_gamma, dirichlet, lkj_corr_cholesky
 export NORMAL_LOGDENSITY_SOURCE, CAUCHY_LOGDENSITY_SOURCE
 export NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY
@@ -25,6 +26,7 @@ export BERNOULLI_SOURCE, LOGNORMAL_SOURCE
 export EXPONENTIAL_SOURCE, GEOMETRIC_SOURCE, UNIFORM_SOURCE
 export MVNORMAL_SOURCE, AR1_SOURCE
 export POISSON_SOURCE, GAMMA_SOURCE, BETA_SOURCE, BINOMIAL_SOURCE
+export NEGATIVE_BINOMIAL2_SOURCE
 export INVERSE_GAMMA_SOURCE, DIRICHLET_SOURCE, LKJ_CORR_CHOLESKY_SOURCE
 
 const LOCATION_SCALE_SOURCE = raw"""
@@ -479,6 +481,35 @@ using SpecialFunctions: loggamma, beta_inc
 end
 """
 
+# Quadratic-variance count family: Stan's `neg_binomial_2(mu, phi)` with
+# mean mu and var = mu + mu^2/phi (Bambi's alpha is the reciprocal,
+# alpha = 1/phi — an authoring-level translation, never this kernel).
+# `logpdf` is the FULL Stan lpmf including all loggamma constants (Stan
+# `propto=false` keeps them; cross-backend absolute-value comparison is
+# load-bearing on this). The log1p form is algebraically identical and
+# NaN-free at the mu = 0 / mu = Inf edges (safe_* inputs keep the
+# branchless `ifelse` off NaN on the invalid side). No cdf/quantile
+# (discrete inversion); only `logpdf` is exposed.
+const NEGATIVE_BINOMIAL2_KERNEL_SOURCE = raw"""
+using SpecialFunctions: loggamma
+using LogExpFunctions: log1p
+
+@kernel negative_binomial2(mu::Float64, phi::Float64) = begin
+    logpdf(observed::Int)::Float64 = begin
+        valid::Bool = (observed >= 0) & (mu >= 0) & (phi > 0)
+        safe_y::Float64 = ifelse(observed >= 0, Float64(observed), 0.0)
+        safe_mu::Float64 = ifelse(mu >= 0, mu, 0.0)
+        safe_phi::Float64 = ifelse(phi > 0, phi, 1.0)
+        base::Float64 =
+            loggamma(safe_y + safe_phi) - loggamma(safe_phi) -
+            loggamma(safe_y + 1.0) - safe_phi * log1p(safe_mu / safe_phi)
+        tail::Float64 = ifelse(observed == 0, 0.0,
+            -safe_y * log1p(safe_phi / safe_mu))
+        ifelse(valid, base + tail, -Inf)
+    end
+end
+"""
+
 # Continuous positive family; the conjugate prior for a Normal variance
 # (Inverse-Gamma-Normal). Shape α and scale θ; `log_scale` is the authoritative
 # log-scale HAVE route (θ = exp(log_scale)), so the normalization uses
@@ -570,11 +601,12 @@ const _OTHER_DISTRIBUTION_BINDINGS = _evaluate_source_bindings(
           CATEGORICAL_LOGIT_REF_KERNEL_SOURCE,
           POISSON_KERNEL_SOURCE, GAMMA_KERNEL_SOURCE,
           BETA_KERNEL_SOURCE, BINOMIAL_KERNEL_SOURCE,
+          NEGATIVE_BINOMIAL2_KERNEL_SOURCE,
           INVERSE_GAMMA_KERNEL_SOURCE, DIRICHLET_KERNEL_SOURCE,
           LKJ_CORR_CHOLESKY_KERNEL_SOURCE), "\n"),
     (:bernoulli, :lognormal, :exponential, :geometric, :uniform, :mvnormal, :ar1,
      :categorical_logit, :categorical_logit_ref,
-     :poisson, :gamma, :beta, :binomial,
+     :poisson, :gamma, :beta, :binomial, :negative_binomial2,
      :inverse_gamma, :dirichlet, :lkj_corr_cholesky),
 )
 const bernoulli = _OTHER_DISTRIBUTION_BINDINGS[1]
@@ -590,9 +622,10 @@ const poisson = _OTHER_DISTRIBUTION_BINDINGS[10]
 const gamma = _OTHER_DISTRIBUTION_BINDINGS[11]
 const beta = _OTHER_DISTRIBUTION_BINDINGS[12]
 const binomial = _OTHER_DISTRIBUTION_BINDINGS[13]
-const inverse_gamma = _OTHER_DISTRIBUTION_BINDINGS[14]
-const dirichlet = _OTHER_DISTRIBUTION_BINDINGS[15]
-const lkj_corr_cholesky = _OTHER_DISTRIBUTION_BINDINGS[16]
+const negative_binomial2 = _OTHER_DISTRIBUTION_BINDINGS[14]
+const inverse_gamma = _OTHER_DISTRIBUTION_BINDINGS[15]
+const dirichlet = _OTHER_DISTRIBUTION_BINDINGS[16]
+const lkj_corr_cholesky = _OTHER_DISTRIBUTION_BINDINGS[17]
 
 const BERNOULLI_SOURCE = BERNOULLI_KERNEL_SOURCE * raw"""
 
@@ -934,6 +967,36 @@ docs_example = (;
     kernel = binomial_kernel,
     output,
     plated = binomial_plated,
+    plate_inputs,
+    plate_output,
+)
+"""
+
+const NEGATIVE_BINOMIAL2_SOURCE = NEGATIVE_BINOMIAL2_KERNEL_SOURCE * raw"""
+
+negative_binomial2_kernel = prepare(negative_binomial2.logpdf;
+    have = (:observed, :mu, :phi), want = :logpdf)
+negative_binomial2_plated = plate(negative_binomial2.logpdf;
+    have = (:observed, :mu, :phi), want = :logpdf, batched = (:observed,))
+
+observed = 3
+mu = 2.5
+phi = 1.5
+inputs = (; observed, mu, phi)
+output = negative_binomial2_kernel(Tuple(inputs)...)
+
+plate_observed = [0, 1, 3, 7]
+plate_inputs = (; observed = plate_observed, mu, phi)
+plate_output = negative_binomial2_plated(Tuple(plate_inputs)...)
+
+docs_example = (;
+    name = :negative_binomial2_stan,
+    origin = "NB2 count object with Stan neg_binomial_2(mu, phi) semantics (build executed)",
+    inputs,
+    spec = negative_binomial2.logpdf,
+    kernel = negative_binomial2_kernel,
+    output,
+    plated = negative_binomial2_plated,
     plate_inputs,
     plate_output,
 )

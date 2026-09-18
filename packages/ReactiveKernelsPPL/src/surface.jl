@@ -5,7 +5,8 @@
 # statements, deterministic `=`, `model(; data...)` binding) under the
 # standing constraints: Distributions.jl constructors (never Stan lowercase),
 # immutable single-assignment top level, no control flow, no `target`,
-# `@plate`/`@scan` reserved. Broadcasting is EXPLICIT (no implied
+# `@plate` observations + deterministic cells (desugar; sampled cells
+# deferred), `@scan` reserved. Broadcasting is EXPLICIT (no implied
 # vectorization anywhere): vector math is dotted (`mu = a .+ b .* x` —
 # undotted scalar/vector `+` is a `MethodError` in Julia too), and vector
 # responses use the Turing dotted tilde (`y .~ Normal.(mu, sigma)`).
@@ -175,7 +176,7 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     ast isa Expr && ast.head === :block ||
         _sfail("lower_rkppl takes a `begin ... end` block AST")
     ast = _expand_submodels(ast, data, mod)
-    sample, det, scans = _partition_statements(ast, data)
+    sample, det, scans, plate_ctx = _partition_statements(ast, data)
     detmap = Dict{Symbol,Any}(nm => rhs for (nm, rhs) in det)
     prior_names = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
     normal_priors = Set{Symbol}(s.lhs for s in sample
@@ -211,19 +212,21 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
     coefuse = Dict{Symbol,Vector{Tuple{Symbol,Symbol,Int}}}()
     for s in sample
         if s.broadcast
+            # Broadcast coefficient priors lower with their factor term.
+            s.levels !== nothing && continue
             s.lhs in data || _sfail("`.~` broadcasts over a data column " *
                                     "— $(s.lhs) is not data (scalar " *
                                     "parameters use `~`)")
             push!(responses,
-                _lower_response(s.lhs, s.rhs, ctx, predictors, pred_idx,
-                    coefuse))
+                _lower_response(s.lhs, s.rhs, s.range, ctx, predictors,
+                    pred_idx, coefuse))
         elseif s.lhs in data
             _sfail("$(s.lhs) is data — vector responses broadcast with " *
                    "`.~` (`$(s.lhs) .~ Normal.(mu, sigma)`); `~` is " *
                    "scalar-only")
         end
     end
-    priors = _lower_coefficient_priors(sample, coefuse, predictors)
+    priors, levelmaps = _lower_coefficient_priors(sample, coefuse, predictors)
     params, paramsyms = _lower_parameters(sample, coefuse, ctx)
     used_locs = Set{Symbol}(r.predictor for r in responses)
     skip = _absorbed_skip(det, canonmap, responses, paramsyms, ctx.absorbed,
@@ -247,8 +250,11 @@ function lower_rkppl(ast, data_names; mod::Module = Main)::StructuralPlan
                                         "column (predictor $(d.label))")
         end
     end
+    _check_plate_bares(plate_ctx, data, Set{Symbol}(p.name for p in predictors),
+        Set{Symbol}(d.name for d in derived), _factor_coefs(coefuse, predictors))
     plan = StructuralPlan(responses, predictors, priors, params, assigns,
-        Dict{Symbol,AbstractVector}(), 0; derived = derived, scans = scans)
+        Dict{Symbol,AbstractVector}(), 0; derived = derived,
+        levelmaps = levelmaps, scans = scans)
     validate_structure(plan)
     return plan
 end
@@ -443,7 +449,7 @@ end
 # definition like `m = log` never reads as referencing data).
 const _KNOWN_VALUE_FNS = union(Set{Symbol}(ASSIGNMENT_FNS),
     Set{Symbol}(ELEMENTWISE_OPS), Set{Symbol}(ELEMENTWISE_FNS),
-    Set{Symbol}((:ifelse, :treatment)))
+    Set{Symbol}((:ifelse,)))
 
 # Structural definitions: anything transitively referencing a coefficient
 # candidate (a Normal-priored sampled name or a free name — data, det, and
@@ -504,8 +510,8 @@ function _reject_unknown_calls(where, rhs)
                 "$where uses dotted operator `$fn`, which is not in " *
                 "the slice-1 elementwise vocabulary")
             fn === :treatment && _sfail(
-                "$where calls `treatment`, which only lowers as a " *
-                "factor index (`c[treatment(g, ref)]`)")
+                "$where calls `treatment`, which was removed " *
+                "(BRM-specific contrasts)")
             fn === :ifelse && _sfail(
                 "$where calls undotted `ifelse` — use elementwise " *
                 "`ifelse.(condition, x, y)`")
@@ -571,9 +577,15 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     det = Pair{Symbol,Any}[]
     scans = ScanSpec[]
     seen = Set{Symbol}()
+    seelines = Dict{Symbol,Int}()
     seen_doc = false
-    for arg in ast.args
-        arg isa LineNumberNode && continue
+    line = 0
+    args, plate_ctx = _expand_plates(ast.args, data)
+    for arg in args
+        if arg isa LineNumberNode
+            line = arg.line
+            continue
+        end
         if arg isa String && !seen_doc && isempty(sample) && isempty(det)
             seen_doc = true
             continue
@@ -587,7 +599,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             (length(arg.args) >= 3 && arg.args[end] isa Expr) ||
                 _sfail("@scan takes a `begin … end` block")
             sp = parse_scan_block(arg.args[end])
-            _claim!(seen, sp.state)
+            _claim!(seen, seelines, sp.state, line)
             push!(scans, sp)
             continue
         end
@@ -597,31 +609,283 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
         if _is_sample(st) || _is_broadcast_sample(st)
             bc = _is_broadcast_sample(st)
             tilde = bc ? "`.~`" : "`~`"
-            lhs = st.args[2]
-            lhs isa Symbol || _sfail("$tilde left-hand side must be a bare " *
-                                     "Symbol, got $(repr(lhs))")
-            _claim!(seen, lhs)
+            lhs, rng, levs = _sample_lhs(st.args[2], bc, tilde, data)
+            _claim!(seen, seelines, lhs, line)
             _reject_target(st.args[3], lhs)
-            push!(sample, SampleStmt(lhs, st.args[3], bc))
+            push!(sample, SampleStmt(lhs, st.args[3], bc, rng, levs))
         elseif st.head === :(=) && length(st.args) == 2 && st.args[1] isa Symbol
             lhs = st.args[1]
             lhs === :target && _sfail("no `target` in rkppl models " *
                                       "(density comes only from `~`)")
             lhs in data && _sfail("$lhs is bound data and cannot be redefined")
-            _claim!(seen, lhs)
+            _claim!(seen, seelines, lhs, line)
             _reject_target(st.args[2], lhs)
             push!(det, lhs => st.args[2])
         else
             _reject_statement(st)
         end
     end
-    return sample, det, scans
+    return sample, det, scans, plate_ctx
 end
 
-_claim!(seen::Set{Symbol}, nm::Symbol) =
-    nm in seen ?
-    _sfail("single assignment: $nm is defined twice at model level") :
+# Pre-pass: expand top-level `@plate for i in R ... end` blocks into
+# spliced top-level statements (desugar slice: observations +
+# deterministic cells; per-cell sampled arrays deferred). Spliced
+# statements carry the plate's line for claim messages. Also returns the
+# plate context: `(lhs, line, bare-symbols)` per spliced statement for
+# the post-analysis whole-vector check.
+function _expand_plates(args, data::Set{Symbol})
+    expanded = Any[]
+    ctx = Tuple{Symbol,Int,Set{Symbol}}[]
+    line = 0
+    for arg in args
+        if arg isa LineNumberNode
+            line = arg.line
+            push!(expanded, arg)
+            continue
+        end
+        if arg isa Expr && arg.head === :macrocall && !isempty(arg.args) &&
+                arg.args[1] === Symbol("@plate")
+            pl = line
+            if length(arg.args) >= 2 && arg.args[2] isa LineNumberNode
+                pl = arg.args[2].line
+            end
+            stmts, stx = _desugar_plate(arg, pl, data)
+            for st in stmts
+                pl > 0 && push!(expanded, LineNumberNode(pl))
+                push!(expanded, st)
+            end
+            append!(ctx, stx)
+            continue
+        end
+        push!(expanded, arg)
+    end
+    return expanded, ctx
+end
+
+function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
+    (length(st.args) == 3 && st.args[3] isa Expr &&
+        st.args[3].head === :for) ||
+        _sfail("`@plate` takes `@plate for i in R ... end` exactly")
+    loop = st.args[3]
+    asg = loop.args[1]
+    asg isa Expr && asg.head === :block &&
+        _sfail("`@plate` takes one loop variable (multi-index plates " *
+               "are planned)")
+    (asg isa Expr && asg.head === :(=) && length(asg.args) == 2 &&
+        asg.args[1] isa Symbol) ||
+        _sfail("`@plate` loop must be `for i in R`")
+    ivar = asg.args[1]
+    R = asg.args[2]
+    rkind = _plate_range_kind(R)
+    body = loop.args[2]
+    cells = Any[a for a in body.args if !(a isa LineNumberNode)]
+    isempty(cells) && _sfail("`@plate` body is empty")
+    # Names bound by `=` anywhere in this plate (cell locals, excluded
+    # from the bare-vector check even on forward reference).
+    plate_defs = Set{Symbol}()
+    for c in cells
+        c isa Expr && c.head === :(=) && length(c.args) == 2 &&
+            c.args[1] isa Symbol && push!(plate_defs, c.args[1])
+    end
+    out = Expr[]
+    ctx = Tuple{Symbol,Int,Set{Symbol}}[]
+    for c in cells
+        push!(out, _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx)...)
+    end
+    return out, ctx
+end
+
+# Plate ranges mirror the response ranges: literal `a:b` (validated via
+# the desugared `y[a:b]` form), `eachindex(v)`, `axes(v, 1)`.
+function _plate_range_kind(R)
+    R isa Expr && R.head === :call && !isempty(R.args) || return _sfail(
+        "`@plate` range must be `1:N`, `eachindex(v)`, or `axes(v, 1)` — " *
+        "got $(repr(R)) (values-iteration is planned)")
+    R.args[1] === :(:) && return (:coloncall, R)
+    R.args[1] === :eachindex && length(R.args) == 2 &&
+        R.args[2] isa Symbol && return (:eachindex, R.args[2])
+    R.args[1] === :axes && length(R.args) == 3 && R.args[2] isa Symbol &&
+        R.args[3] == 1 && return (:axes, R.args[2])
+    return _sfail("`@plate` range must be `1:N`, `eachindex(v)`, or " *
+                  "`axes(v, 1)` — got $(repr(R))")
+end
+
+# One cell statement → spliced top-level statement(s). Observations
+# (`y[i] ~ OBJ`) become `y .~ OBJ.` (or `y[a:b] .~ OBJ.` under a literal
+# range); deterministic cells strip to top level (visible model-wide —
+# documented looseness: desugared locals leak like any top-level det).
+function _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx)
+    c isa Expr || _sfail("cells hold `~` observations and `=` " *
+                         "assignments only")
+    if c.head === :macrocall && !isempty(c.args) &&
+            c.args[1] === Symbol("@plate")
+        _sfail("nested `@plate` blocks do not lower")
+    end
+    if _is_broadcast_sample(c)
+        _sfail("cells are scalar (`~`); broadcast (`.~`) at top level")
+    end
+    if _is_sample(c)
+        return [_desugar_cell_sample(c, ivar, rkind, line, data, plate_defs,
+            ctx)]
+    end
+    if c.head === :(=) && length(c.args) == 2 && c.args[1] isa Symbol
+        lhs = c.args[1]
+        lhs in data && _sfail("cell assignment `$lhs = ...` redefines " *
+                              "bound data")
+        bares = _cell_bares(c.args[2], ivar)
+        setdiff!(bares, plate_defs)
+        push!(ctx, (lhs, line, bares))
+        return [Expr(:(=), lhs, _strip_cell(c.args[2], ivar))]
+    end
+    return _sfail("cells hold `~` observations and `=` assignments only")
+end
+
+function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx)
+    lhs = c.args[2]
+    lhs isa Symbol && _sfail("per-cell sampled `$lhs` is deferred " *
+                             "(per-cell sampled arrays land after " *
+                             "observations; write shared priors outside " *
+                             "the plate)")
+    (lhs isa Expr && lhs.head === :ref && length(lhs.args) == 2 &&
+        lhs.args[1] isa Symbol && lhs.args[2] === ivar) ||
+        _cell_lhs_error(lhs, ivar)
+    col = lhs.args[1]
+    col in data || _sfail("per-cell sampled `$col[$ivar]` is deferred " *
+                          "(per-cell sampled arrays land after " *
+                          "observations; write shared priors outside " *
+                          "the plate)")
+    bares = _cell_bares(c.args[3], ivar)
+    setdiff!(bares, plate_defs)
+    push!(ctx, (col, line, bares))
+    obj = c.args[3]
+    # Cells mirror top-level spelling exactly (dots as written — the
+    # desugar strips refs, never invents dots): the object must already
+    # be dotted, pairing scalar `~` (the cell) with a pre-dotted object.
+    obj isa Expr && obj.head === :. || _sfail(
+        "cell objects are dotted distribution calls " *
+        "(`y[$ivar] ~ Normal.(mu[$ivar], s)`), got $(repr(obj))")
+    obj = _strip_cell(obj, ivar)
+    if rkind[1] === :coloncall
+        # Literal ranges validate through the slice-A `y[a:b]` path
+        # (start-1, literal endpoints, bind-time cover check).
+        return Expr(:call, :.~, Expr(:ref, col, rkind[2]), obj)
+    end
+    rcol = rkind[2]
+    rcol === col || _sfail("plate over `$(rkind[1])($rcol)` cannot " *
+                           "sample `$col[$ivar]` (one response column " *
+                           "per range)")
+    return Expr(:call, :.~, col, obj)
+end
+
+function _cell_lhs_error(lhs, ivar)
+    lhs isa Expr && lhs.head === :ref || return _sfail(
+        "cell responses sample `name[$ivar]` exactly — got $(repr(lhs))")
+    length(lhs.args) == 2 || return _sfail(
+        "one-dimensional cell refs only (`v[$ivar]`)")
+    lhs.args[1] isa Symbol || return _sfail(
+        "cell refs index a bare column (`v[$ivar]`)")
+    idx = lhs.args[2]
+    idx isa Expr && idx.head === :ref && return _sfail(
+        "factor indexing inside plates is not in slice B")
+    return _sfail("cell reads index the loop variable exactly " *
+                  "(`v[$ivar]`) — got $(repr(lhs)) (cross-index reads " *
+                  "need `@scan`, reserved)")
+end
+
+# Value-position symbols of a cell expression, validating the loop-variable
+# discipline on the way: refs are exactly `v[i]`, and `i` appears only as
+# an index. Function heads and kw names are positions, not refs.
+function _cell_bares(ex, ivar)
+    bares = Set{Symbol}()
+    _cell_bares!(ex, ivar, bares)
+    return bares
+end
+
+function _cell_bares!(ex::Symbol, ivar, bares)
+    ex === ivar && _sfail("loop variable `$ivar` appears only as an " *
+                          "index (`v[$ivar]`)")
+    push!(bares, ex)
+    return nothing
+end
+_cell_bares!(ex, ivar, bares) = nothing
+function _cell_bares!(ex::Expr, ivar, bares)
+    if ex.head === :ref
+        (length(ex.args) == 2 && ex.args[1] isa Symbol &&
+            ex.args[2] === ivar) || _cell_lhs_error(ex, ivar)
+        return nothing
+    end
+    if ex.head === :call
+        for a in ex.args[2:end]
+            _cell_bares!(a, ivar, bares)
+        end
+        return nothing
+    end
+    if ex.head === :.
+        start = length(ex.args) >= 1 && ex.args[1] isa Symbol ? 2 : 1
+        for a in ex.args[start:end]
+            _cell_bares!(a, ivar, bares)
+        end
+        return nothing
+    end
+    if ex.head === :kw
+        for a in ex.args[2:end]
+            _cell_bares!(a, ivar, bares)
+        end
+        return nothing
+    end
+    for a in ex.args
+        _cell_bares!(a, ivar, bares)
+    end
+    return nothing
+end
+
+# Strip exact `v[i]` refs to whole columns (validation ran first).
+_strip_cell(ex, ivar) = ex
+_strip_cell(s::Symbol, ivar) = s
+function _strip_cell(ex::Expr, ivar)
+    ex.head === :ref && return ex.args[1]
+    return Expr(ex.head, (_strip_cell(a, ivar) for a in ex.args)...)
+end
+
+# Post-analysis whole-vector check: bare cell symbols denoting vectors
+# (data, predictors, derived, factor coefs) needed `[i]`. Runs after the
+# main loop, when predictors and derived are known.
+function _check_plate_bares(ctx, data, prednames, derivedkeys, factorcoefs)
+    isempty(ctx) && return nothing
+    vecs = union(data, prednames, derivedkeys, factorcoefs)
+    for (lhs, line, bares) in ctx
+        at = line > 0 ? " (line $line)" : ""
+        for b in sort!(collect(bares))
+            b in vecs && _sfail("`@plate`$at: bare `$b` reads a whole " *
+                                "vector in a cell — index it (`$b[i]`)")
+        end
+    end
+    return nothing
+end
+
+function _factor_coefs(coefuse, predictors)
+    out = Set{Symbol}()
+    for pred in predictors, t in pred.terms
+        t.kind === FactorTerm || continue
+        for (nm, uses) in coefuse, u in uses
+            u[1] === pred.name && u[2] in t.columns && push!(out, nm)
+        end
+    end
+    return out
+end
+
+function _claim!(seen::Set{Symbol}, seelines::Dict{Symbol,Int}, nm::Symbol,
+        line::Int)
+    if nm in seen
+        first = get(seelines, nm, 0)
+        at = first > 0 ? " (first at line $first)" : ""
+        _sfail("single assignment: $nm is defined twice at model level$at")
+    end
     push!(seen, nm)
+    seelines[nm] = line
+    return nothing
+end
 
 _is_sample(st::Expr) =
     st.head === :call && length(st.args) == 3 && st.args[1] === :~
@@ -629,12 +893,168 @@ _is_sample(st::Expr) =
 _is_broadcast_sample(st::Expr) =
     st.head === :call && length(st.args) == 3 && st.args[1] === :.~
 
-"""One `~` / `.~` statement: scalar (`~`) or elementwise (`.~`) density."""
+# Sampling-statement LHS: a bare Symbol, a one-dimensional range ref
+# `y[R]` (`.~` only), or a levels ref `c[levels(g)]` / `c[levels(g)][S]`
+# (`.~` only). Returns `(column, range, levels)` with at most one of
+# `range` / `levels` set.
+_sample_lhs(lhs::Symbol, bc, tilde, data) = (lhs, nothing, nothing)
+function _sample_lhs(lhs, bc, tilde, data)
+    lhs isa Expr || _sfail("$tilde left-hand side must be a bare Symbol, " *
+                           "a range ref (`y[1:N]`), or a levels ref " *
+                           "(`c[levels(g)]`), got $(repr(lhs))")
+    lhs.head === :. && _sfail("dotted left-hand side $(repr(lhs)) does " *
+                              "not lower (nested targets are out of scope)")
+    lhs.head === :ref && length(lhs.args) == 2 || _sfail(
+        "$tilde left-hand side must be a bare Symbol or a one-dimensional " *
+        "ref (`y[1:N]`, `c[levels(g)]`), got $(repr(lhs))")
+    target, index = lhs.args
+    # Chained outside subset (`c[levels(g)][2:end]`): one way to write it —
+    # the subset goes inside (`c[levels(g)[2:end]]`).
+    target isa Expr && _sfail("$tilde subset goes inside the levels " *
+                              "expression (`c[levels(g)[2:end]]`), got " *
+                              "$(repr(lhs))")
+    target isa Symbol || _sfail("$tilde left-hand side must be a bare " *
+                                "Symbol or a one-dimensional ref, got " *
+                                "$(repr(lhs))")
+    # `c[levels(g)[S]]`: subset selection over the levels.
+    if index isa Expr && index.head === :ref
+        bc || _sfail("sized prior `$(target)[levels(...)[...]]` is a " *
+                     "vector — use `.~`, not `~`")
+        target in data && _sfail("`levels` sizes coefficient priors, not " *
+                                 "responses ($target is data)")
+        gcol, sub = _levels_subset_index(target, index, data)
+        return target, nothing, (gcol, sub)
+    end
+    if _is_levels_call(index)
+        bc || _sfail("sized prior `$(target)[levels(...)]` is a vector — " *
+                     "use `.~`, not `~`")
+        target in data && _sfail("`levels` sizes coefficient priors, not " *
+                                 "responses ($target is data)")
+        gcol = _levels_column(target, index, data)
+        return target, nothing, (gcol, Colon())
+    end
+    bc || _sfail("sliced response `$target[...]` is a vector — " *
+                 "use `.~`, not `~`")
+    return target, _lower_lhs_range(target, index), nothing
+end
+
+# The `levels(g)[S]` index of a subset prior: returns `(g, subset)`.
+function _levels_subset_index(col::Symbol, index::Expr, data::Set{Symbol})
+    length(index.args) == 2 && _is_levels_call(index.args[1]) ||
+        _sfail("coefficient $col: subsets select over `levels` " *
+               "(`$col[levels(g)[2:end]]`), got $(repr(index))")
+    gcol = _levels_column(col, index.args[1], data)
+    return gcol, _lower_levels_subset(col, gcol, index.args[2])
+end
+
+_is_levels_call(x) =
+    x isa Expr && x.head === :call && !isempty(x.args) &&
+    x.args[1] isa Symbol && x.args[1] in (:levels, :unique, :sort)
+
+function _levels_column(col::Symbol, call::Expr, data::Set{Symbol})
+    fn = call.args[1]
+    fn === :levels || _sfail("coefficient $col: write `levels(...)`, not " *
+                             "`$fn(...)` (the levels function is `levels`)")
+    length(call.args) == 2 ||
+        _sfail("coefficient $col: `levels` takes exactly one grouping " *
+               "column, got $(repr(call))")
+    gcol = call.args[2]
+    gcol isa Symbol || _sfail("coefficient $col: `levels` takes a bare " *
+                              "grouping column, got $(repr(gcol))")
+    gcol in data || _sfail("coefficient $col: `levels($gcol)` needs a " *
+                           "data grouping column — $gcol is not data")
+    return gcol
+end
+
+# Subset selections over `levels(g)`: `2:end`, literal `a:b`, or literal
+# `[i, j]` (full cover is the bare `c[levels(g)]` — no `[:]` sugar).
+# Returns the LevelMap subset value.
+function _lower_levels_subset(col::Symbol, gcol::Symbol, s)
+    if s isa Expr && s.head === :call && !isempty(s.args) && s.args[1] === :(:)
+        length(s.args) == 3 || _sfail("coefficient $col: level subsets " *
+                                      "are `a:b` or `a:end`, got $(repr(s))")
+        lo, hi = s.args[2], s.args[3]
+        lo isa Integer && !(lo isa Bool) && lo >= 1 || _sfail(
+            "coefficient $col: subset must start at a literal 1-based " *
+            "position, got $(repr(lo))")
+        hi isa Integer && !(hi isa Bool) && return _subset_range(col, lo, hi)
+        hi === :end && return (Int(lo), :end)
+        return _sfail("coefficient $col: subset endpoint must be a " *
+                      "literal or `end`, got $(repr(hi))")
+    end
+    if s isa Expr && s.head === :vect
+        all(a -> a isa Integer && !(a isa Bool) && a >= 1, s.args) ||
+            _sfail("coefficient $col: level index lists take literal " *
+                   "1-based positions, got $(repr(s))")
+        !isempty(s.args) ||
+            _sfail("coefficient $col: level index list is empty")
+        return Int.(s.args)
+    end
+    return _sfail("coefficient $col: level subsets are `[2:end]`, " *
+                  "`[a:b]`, or `[[i, j]]`, got $(repr(s))")
+end
+
+function _subset_range(col::Symbol, lo::Integer, hi::Integer)
+    lo <= hi || _sfail("coefficient $col: level range $lo:$hi is empty")
+    return UnitRange(Int(lo), Int(hi))
+end
+
+function _lower_lhs_range(col::Symbol, r)
+    # Literal `1:N`: structural cover check now (start 1, non-empty);
+    # `N == n_obs` is verified at bind (the range rides the plan).
+    if r isa Expr && r.head === :call && length(r.args) == 3 && r.args[1] === :(:)
+        lo, hi = r.args[2], r.args[3]
+        lo === 1 || _sfail("response $col range must start at 1 " *
+                           "(got $(repr(r))) — ranges cover eachindex exactly")
+        hi isa Integer || _sfail("response $col range endpoint is " *
+                                 "unbound ($(repr(hi))) — no `n` is bound in " *
+                                 "the surface; write `eachindex($col)` or a " *
+                                 "literal `1:N`")
+        hi >= 1 || _sfail("response $col range $(repr(r)) is empty")
+        return UnitRange(1, Int(hi))
+    end
+    # Self-covering forms: the column's own full index set, by construction.
+    if r isa Expr && r.head === :call && !isempty(r.args) && r.args[1] === :eachindex
+        length(r.args) == 2 && r.args[2] isa Symbol || _sfail(
+            "response $col range takes `eachindex($col)` — " *
+            "got $(repr(r))")
+        r.args[2] === col || _sfail("response $col range covers " *
+                                    "$(r.args[2]), not $col — ranges cover " *
+                                    "their own column exactly " *
+                                    "(`eachindex($col)`)")
+        return nothing
+    end
+    if r isa Expr && r.head === :call && !isempty(r.args) && r.args[1] === :axes
+        length(r.args) == 3 && r.args[2] isa Symbol && r.args[3] == 1 || _sfail(
+            "response $col range takes `axes($col, 1)` — got $(repr(r))")
+        r.args[2] === col || _sfail("response $col range covers " *
+                                    "$(r.args[2]), not $col (`axes($col, 1)`)")
+        return nothing
+    end
+    r === :(:) && _sfail("whole-column `$col[:]` is not admitted — " *
+                            "write the range out (`$col[eachindex($col)]`)")
+    (r isa Symbol || r isa Integer) &&
+        _sfail("scalar cell index `$col[$(r)]` at top level does not " *
+               "lower — per-cell refs live in `@plate` (slice B); " *
+               "broadcast with `.~` or `eachindex`")
+    return _sfail("response $col range must be `1:N`, `eachindex($col)`, " *
+                  "or `axes($col, 1)` — got $(repr(r))")
+end
+
+"""One `~` / `.~` statement: scalar (`~`) or elementwise (`.~`) density.
+`range` carries a literal `y[1:N]` response range (`nothing` = whole
+column: bare LHS, `eachindex`, `axes`). `levels` carries a
+`(grouping column, subset)` pair for `c[levels(g)]` broadcast priors
+(`nothing` otherwise)."""
 struct SampleStmt
     lhs::Symbol
     rhs::Any
     broadcast::Bool
+    range::Union{Nothing,UnitRange{Int}}
+    levels::Any
 end
+SampleStmt(lhs::Symbol, rhs, broadcast::Bool) =
+    SampleStmt(lhs, rhs, broadcast, nothing, nothing)
 
 _is_doc_macro(m) =
     m === Symbol("@doc") || (m isa GlobalRef && m.name === Symbol("@doc"))
@@ -933,6 +1353,9 @@ function _reject_statement(st::Expr)
     elseif head in (:function, :macro, :return, :local, :global, :struct,
         :module, :import, :using, :export)
         return _sfail("`$head` does not lower at model level")
+    elseif head === :macrocall && !isempty(st.args) &&
+            st.args[1] === Symbol("@plate")
+        return _sfail("docstrings on `@plate` blocks do not lower")
     end
     return _sfail("unsupported model statement $(repr(st)) " *
                   "(only `~`, `.~`, `=` and reserved macros lower)")
@@ -947,16 +1370,16 @@ function _plain_args(rhs::Expr, what)
     return rhs.args[2:end]
 end
 
-function _lower_response(lhs, rhs, ctx, predictors, pred_idx, coefuse)
+function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse)
     call = _dot2call_response(lhs, rhs)
     weights, call = _peel_weighted(lhs, call, ctx)
     evidence, call = _peel_evidence(lhs, call, ctx)
-    family, lik_link, pred_link, loc, scale =
+    family, lik_link, pred_link, loc, scale, trials =
         _lower_response_base(lhs, call, ctx)
     pname = _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         coefuse)
     return LikelihoodSpec(family, lik_link, lhs, pname, scale, weights,
-        evidence, Symbol(lhs, "_resp"))
+        evidence, Symbol(lhs, "_resp"), trials, range)
 end
 
 # `.~` takes a dotted distribution object (`Normal.(mu, sigma)`); convert
@@ -985,7 +1408,8 @@ end
 function _dot2call_object_error(lhs, rhs)
     if rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
             rhs.args[1] isa Symbol && rhs.args[1] in
-            (:Normal, :Bernoulli, :Poisson, :weighted, :truncated, :censored,
+            (:Normal, :Bernoulli, :Poisson, :Binomial, :NegativeBinomial2,
+                :Gamma, :weighted, :truncated, :censored,
                 :interval_censored)
         _sfail("response $lhs: broadcast the object " *
                "(`$(rhs.args[1]).(...)` — `.~` is elementwise)")
@@ -1004,7 +1428,13 @@ function _dot2call_spine_arg(lhs, f, i, a)
         return _dot2call_nested_object(lhs, a)
     elseif (f === :Bernoulli || f === :Poisson) && i == 1
         return _dot2call_nested_link(lhs, a, f)
+    elseif f === :Binomial && i == 2
+        return _dot2call_nested_link(lhs, a, f)
+    elseif f === :NegativeBinomial2 && i == 1
+        return _dot2call_nested_link(lhs, a, f)
     end
+    # Gamma position 2 (`exp.(eta) ./ alpha`) passes through; the
+    # response branch matches the `./` structure (link + alpha identity).
     return a
 end
 
@@ -1023,7 +1453,7 @@ function _dot2call_nested_object(lhs, a)
 end
 
 function _dot2call_nested_link(lhs, a, base)
-    want = base === :Bernoulli ? :logistic : :exp
+    want = (base === :Bernoulli || base === :Binomial) ? :logistic : :exp
     a isa Expr && a.head === :. && length(a.args) == 2 &&
         a.args[1] isa Symbol && a.args[2] isa Expr &&
         a.args[2].head === :tuple ||
@@ -1117,7 +1547,9 @@ end
 
 const _RESPONSE_BASE_MSG =
     "response distribution must be `Normal.(mu, sigma)`, " *
-    "`Bernoulli.(logistic.(eta))` or `Poisson.(exp.(eta))`"
+    "`Bernoulli.(logistic.(eta))`, `Poisson.(exp.(eta))`, " *
+    "`Binomial.(n, logistic.(mu))`, `NegativeBinomial2.(exp.(eta), phi)` " *
+    "or `Gamma.(alpha, exp.(eta) ./ alpha)`"
 
 function _lower_response_base(lhs, rhs::Expr, ctx)
     rhs.head === :call || _sfail("response $lhs: $_RESPONSE_BASE_MSG; " *
@@ -1126,37 +1558,101 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
     fam === :weighted &&
         _sfail("`weighted.(...)` goes outermost: " *
                "`y .~ weighted.(Normal.(mu, sigma), w)`")
-    fam in (:Normal, :Bernoulli, :Poisson) ||
-        return _lower_response_base_error(lhs, rhs, fam)
+    fam in (:Normal, :Bernoulli, :Poisson, :Binomial, :NegativeBinomial2,
+        :Gamma) || return _lower_response_base_error(lhs, rhs, fam)
     args = _plain_args(rhs, "`$fam`")
     if fam === :Normal
         length(args) == 2 || _sfail("response $lhs: `Normal` takes " *
                                     "`Normal.(mu, sigma)`")
         return GaussianFam, IdentityLink, IdentityLink, args[1],
-        _lower_scale(lhs, args[2], ctx)
+        _lower_scale(lhs, args[2], ctx), nothing
     elseif fam === :Bernoulli
         length(args) == 1 || _sfail("response $lhs: `Bernoulli` takes " *
                                     "`Bernoulli.(logistic.(eta))`")
         return BernoulliLogitFam, LogitLink, IdentityLink,
-        _lower_link_arg(lhs, args[1], :logistic), nothing
+        _lower_link_arg(lhs, args[1], :logistic), nothing, nothing
+    elseif fam === :Binomial
+        length(args) == 2 || _sfail("response $lhs: `Binomial` takes " *
+                                    "`Binomial.(n, logistic.(mu))`")
+        return BinomialLogitFam, LogitLink, IdentityLink,
+        _lower_link_arg(lhs, args[2], :logistic), nothing,
+        _lower_trials(lhs, args[1], ctx)
+    elseif fam === :NegativeBinomial2
+        length(args) == 2 || _sfail("response $lhs: `NegativeBinomial2` takes " *
+                                    "`NegativeBinomial2.(exp.(eta), phi)`")
+        return NegativeBinomial2Fam, LogLink, LogLink,
+        _lower_link_arg(lhs, args[1], :exp),
+        _lower_scale(lhs, args[2], ctx), nothing
+    elseif fam === :Gamma
+        loc, scale = _lower_gamma_args(lhs, args, ctx)
+        return GammaLogFam, LogLink, LogLink, loc, scale, nothing
     else
         length(args) == 1 || _sfail("response $lhs: `Poisson` takes " *
                                     "`Poisson.(exp.(eta))`")
         return PoissonLogFam, LogLink, LogLink,
-        _lower_link_arg(lhs, args[1], :exp), nothing
+        _lower_link_arg(lhs, args[1], :exp), nothing, nothing
     end
 end
 
+function _lower_trials(lhs, t, ctx)
+    t isa Bool && _sfail("response $lhs trials must be an Int data " *
+                         "column or Int literal, got Bool")
+    t isa Integer && return Int(t)
+    t isa Real && _sfail("response $lhs trials must be an Int data " *
+                         "column or Int literal, got $(repr(t))")
+    if t isa Symbol
+        t in ctx.data && return t
+        t in ctx.vecdefs && _sfail(
+            "response $lhs trials column $t is derived — slice-1 binds " *
+            "trials raw (derived trials need shape metadata — planned)")
+        return _sfail("response $lhs trials $(repr(t)) must be an Int " *
+                      "data column or Int literal")
+    end
+    return _sfail("response $lhs trials must be an Int data column or " *
+                  "Int literal, got $(repr(t))")
+end
+
+function _lower_gamma_args(lhs, args, ctx)
+    length(args) == 2 || _sfail("response $lhs: `Gamma` takes " *
+                                "`Gamma.(alpha, exp.(eta) ./ alpha)`")
+    a1, div = args
+    div isa Expr && div.head === :call && length(div.args) == 3 &&
+        div.args[1] === Symbol("./") ||
+        _sfail("response $lhs: `Gamma` takes " *
+               "`Gamma.(alpha, exp.(eta) ./ alpha)`")
+    loc = _lower_link_arg(lhs,
+        _dot2call_nested_link(lhs, div.args[2], :Gamma), :exp)
+    a2 = div.args[3]
+    _same_gamma_alpha(a1, a2) || _sfail(
+        "response $lhs: both `Gamma` positions must name the same alpha " *
+        "(got $(repr(a1)) and $(repr(a2)))")
+    return loc, _lower_scale(lhs, a1, ctx)
+end
+
+_same_gamma_alpha(a, b) =
+    a isa Symbol && b isa Symbol ? a === b :
+    a isa Real && b isa Real ? a == b : false
+
 function _lower_response_base_error(lhs, rhs, fam)
-    fam in (:normal, :bernoulli, :poisson) && _sfail(
+    fam in (:normal, :bernoulli, :poisson, :binomial, :gamma) && _sfail(
         "response $lhs: use Distributions.jl constructors " *
         "(`Normal`, not `normal`)")
+    fam === :negative_binomial2 && _sfail("response $lhs: use " *
+                                          "`NegativeBinomial2` (the response " *
+                                          "spelling, not the kernel endpoint)")
     fam === :BernoulliLogit && _sfail("response $lhs: write " *
                                       "`Bernoulli.(logistic.(eta))`")
     fam === :PoissonLog && _sfail("response $lhs: write " *
                                   "`Poisson.(exp.(eta))`")
+    fam === :BinomialLogit && _sfail("response $lhs: write " *
+                                     "`Binomial.(n, logistic.(mu))`")
+    fam === :NegativeBinomial2Log && _sfail("response $lhs: write " *
+        "`NegativeBinomial2.(exp.(eta), phi)`")
+    fam === :GammaLog && _sfail("response $lhs: write " *
+                                "`Gamma.(alpha, exp.(eta) ./ alpha)`")
     return _sfail("response $lhs: unknown distribution `$(repr(fam))` " *
-                  "(admitted: Normal, Bernoulli, Poisson). When `$fam` is a " *
+                  "(admitted: Normal, Bernoulli, Poisson, Binomial, " *
+                  "NegativeBinomial2, Gamma). When `$fam` is a " *
                   "defined RKPPLSubmodel, a latent uses `latent ~ $fam(...)` " *
                   "and an observation stream uses plain `$lhs ~ $fam(...)` " *
                   "(the whole-column vectorized callee); an elementwise " *
@@ -1508,57 +2004,48 @@ function _classify_ref(pname, core::Expr, sign::Int, ctx)
     haskey(ctx.detmap, base) && _sfail("predictor $pname: $base is a " *
                                        "computed assignment, not a sampled " *
                                        "coefficient vector")
-    col, ref = _factor_index(pname, idx, ctx)
-    return TermSpec(FactorTerm, [col], (contrasts = :treatment, ref = ref),
-        col, Symbol(col, "_term")), (base, col, sign)
+    col = _factor_index(pname, idx, ctx)
+    return TermSpec(FactorTerm, [col], NamedTuple(), col,
+        Symbol(col, "_term")), (base, col, sign)
 end
 
-# Bare `c[g]` is treatment/ref-1 sugar; `c[treatment(g, ref)]` pins the
-# reference level (R `contr.treatment` tradition). The `treatment` head is
-# AST vocabulary only — it is never called.
+# Factor use is always bare `c[g]` over a raw data grouping column; the
+# coefficient's `c[levels(g)]` broadcast prior sizes the full-rank block.
+# The `treatment(g, ref)` vocabulary was BRM-specific contrasts machinery
+# and is removed (F2: full-rank, no reference dropping).
 function _factor_index(pname, idx, ctx)
-    idx isa Symbol || return _treatment_index(pname, idx, ctx)
+    idx isa Symbol || _sfail("predictor $pname: factor index must be a " *
+                             "bare data column (`c[g]`) — " *
+                             _treatment_removed(idx))
     idx in ctx.vecdefs && _sfail("predictor $pname: factor over the " *
                                  "derived column $idx needs pre-evaluation " *
                                  "level knowledge — factors take raw " *
                                  "grouping columns in slice 1")
     idx in ctx.data || _sfail("predictor $pname: factor index $idx must " *
                               "be a data column")
-    return idx, 1
+    return idx
 end
 
-function _treatment_index(pname, idx, ctx)
+function _treatment_removed(idx)
     idx isa Expr && idx.head === :call && !isempty(idx.args) &&
-        idx.args[1] === :treatment || _sfail(
-            "predictor $pname: factor index must be a bare data column or " *
-            "`treatment(group, ref)`, got $(repr(idx))")
-    args = _plain_args(idx, "`treatment`")
-    (length(args) == 1 || length(args) == 2) ||
-        _sfail("predictor $pname: `treatment` takes " *
-               "`treatment(group[, ref])`")
-    g = args[1]
-    g isa Symbol && g in ctx.vecdefs && _sfail(
-        "predictor $pname: factor over the derived column $g needs " *
-        "pre-evaluation level knowledge — factors take raw grouping " *
-        "columns in slice 1")
-    g isa Symbol && g in ctx.data || _sfail(
-        "predictor $pname: `treatment` group must be a bare data column, " *
-        "got $(repr(g))")
-    length(args) == 1 && return g, 1
-    ref = args[2]
-    ref isa Integer && !(ref isa Bool) && ref >= 1 || _sfail(
-        "predictor $pname: `treatment` ref must be a literal 1-based level " *
-        "index, got $(repr(ref))")
-    return g, Int(ref)
+        idx.args[1] === :treatment &&
+        return "`treatment` was removed (BRM-specific contrasts); size " *
+               "the vector with a broadcast prior " *
+               "(`c[levels(g)] .~ ...`) and index a subset for " *
+               "identified models"
+    return "got $(repr(idx))"
 end
 
 # Coefficient priors: recovered by name from `coef ~ Normal(lit, lit)`
-# statements; missing priors default to Normal(0, 1) (emitter convention).
+# statements; missing scalar priors default to Normal(0, 1) (emitter
+# convention). Factor coefficients instead take broadcast priors
+# (`c[levels(g)] .~ Normal.(lit, lit)`), which also size the block —
+# required, never defaulted — and each one emits its LevelMap.
 # Plan order follows predictors, addressees in term order.
 function _lower_coefficient_priors(sample, coefuse, predictors)
     stated = Dict{Symbol,Any}()
     for s in sample
-        haskey(coefuse, s.lhs) && (stated[s.lhs] = s.rhs)
+        haskey(coefuse, s.lhs) && (stated[s.lhs] = s)
     end
     for (name, uses) in coefuse
         preds = unique!(map(first, copy(uses)))
@@ -1572,6 +2059,7 @@ function _lower_coefficient_priors(sample, coefuse, predictors)
                                     "coefficient per column")
     end
     priors = PopulationPrior[]
+    levelmaps = LevelMap[]
     for pred in predictors
         for t in pred.terms
             t.kind === OffsetTerm && continue
@@ -1581,16 +2069,81 @@ function _lower_coefficient_priors(sample, coefuse, predictors)
                                       "($(pred.name), $addr)")
             name = use[1]
             sign = use[3]
+            if t.kind === FactorTerm
+                push!(priors, _lower_factor_prior(pred, t, name, sign,
+                    stated, levelmaps))
+                continue
+            end
             if !haskey(stated, name)
                 push!(priors, PopulationPrior(pred.name, addr, 0.0, 1.0))
                 continue
             end
-            rhs = stated[name]
-            loc, scale = _coefficient_normal(name, rhs, pred.name, addr)
+            s = stated[name]
+            s.levels !== nothing && _sfail("coefficient $name takes a " *
+                                           "scalar prior (`$name ~ Normal`), " *
+                                           "not a levels prior — it is used " *
+                                           "as $(t.kind), not a factor")
+            loc, scale = _coefficient_normal(name, s.rhs, pred.name, addr)
             push!(priors, PopulationPrior(pred.name, addr, sign * loc, scale))
         end
     end
-    return priors
+    _check_identified(predictors, levelmaps)
+    return priors, levelmaps
+end
+
+function _lower_factor_prior(pred, t, name, sign, stated, levelmaps)
+    col = only(t.columns)
+    haskey(stated, name) || _sfail("factor coefficient $name over $col " *
+                                   "needs an explicit broadcast prior " *
+                                   "(`$name[levels($col)] .~ Normal.(0, 1)`) " *
+                                   "— the prior sizes the coefficient vector")
+    s = stated[name]
+    s.levels === nothing && _sfail("coefficient $name is vector-valued " *
+                                   "(factor over $col) — scalar priors " *
+                                   "cannot size it; write " *
+                                   "`$name[levels($col)] .~ Normal.(0, 1)`")
+    gcol, subset = s.levels
+    gcol === col || _sfail("coefficient $name: levels column $gcol " *
+                           "differs from use column $col")
+    loc, scale = _coefficient_broadcast_normal(name, s.rhs, pred.name, col)
+    push!(levelmaps, LevelMap(pred.name, col, [], :levels, subset))
+    return PopulationPrior(pred.name, col, sign * loc, scale)
+end
+
+# Dotted coefficient priors peel to one shared (location, scale): broadcast
+# args must be literals (per-level priors are not in slice 1).
+function _coefficient_broadcast_normal(name, rhs, pname, col)
+    rhs isa Expr && rhs.head === :. && length(rhs.args) == 2 &&
+        rhs.args[1] === :Normal && rhs.args[2] isa Expr &&
+        rhs.args[2].head === :tuple || _sfail(
+            "coefficient $name of predictor $pname needs a broadcast " *
+            "`Normal.(literal, literal)` prior, got $(repr(rhs))")
+    args = rhs.args[2].args
+    length(args) == 2 || _sfail("coefficient $name of predictor $pname " *
+                                "needs `Normal.(location, scale)`")
+    loc, scale = args
+    loc isa Real || _sfail("coefficient $name prior location must be a " *
+                           "literal (per-level priors are not in slice 1)")
+    scale isa Real || _sfail("coefficient $name prior scale must be a " *
+                             "literal (per-level priors are not in slice 1)")
+    return Float64(loc), Float64(scale)
+end
+
+# Surface-side identifiability gate (the contract validator repeats it for
+# hand-built plans): intercept + full-cover factor is unidentified.
+function _check_identified(predictors, levelmaps)
+    for pred in predictors
+        any(t -> t.kind === InterceptTerm, pred.terms) || continue
+        for t in pred.terms
+            t.kind === FactorTerm || continue
+            m = _find_levelmap(levelmaps, pred.name, only(t.columns))
+            m !== nothing && m.subset === Colon() && _sfail(
+                "predictor $(pred.name) is unidentified: intercept + " *
+                "full-cover factor over $(only(t.columns)) (drop the " *
+                "intercept or index a strict subset of levels)")
+        end
+    end
+    return nothing
 end
 
 function _find_use(coefuse, pname, addr)
@@ -1633,6 +2186,9 @@ function _lower_parameters(sample, coefuse, ctx)
     for s in sample
         s.lhs in ctx.data && continue
         haskey(coefuse, s.lhs) && continue
+        s.levels !== nothing && _sfail("levels prior `$(s.lhs)[...]` is " *
+                                       "never used in a predictor — size " *
+                                       "only vectors the model indexes")
         p = _lower_parameter(s.lhs, s.rhs, coefuse)
         push!(params, p)
         for v in values(p.args)

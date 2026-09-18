@@ -18,7 +18,7 @@ offset_name(predictor::Symbol) = Symbol(:_ppl_offset_, predictor)
 
 `_ppl_design_<pred> = Float64.(hcat(<blocks…>))`, or `nothing` for a
 width-0 (offset-only) predictor. Blocks: intercept → `ones(n)`, continuous
-→ the bare column, factor → treatment contrasts over sort-ordered levels.
+→ the bare column, factor → full-rank dummies over mapped levels.
 """
 function design_recipe(shape::DesignShape, n_obs::Int)
     shape.width == 0 && return nothing
@@ -66,7 +66,7 @@ absent).
 function preprocessing_recipes(plan::StructuralPlan)
     stmts = Expr[]
     for pred in plan.predictors
-        shape = design_shape(pred, plan.columns)
+        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps)
         recipe = design_recipe(shape, plan.n_obs)
         recipe !== nothing && push!(stmts, recipe)
         off = offset_recipe(shape)
@@ -75,12 +75,11 @@ function preprocessing_recipes(plan::StructuralPlan)
     return stmts
 end
 
-# Treatment contrasts over sort-ordered non-ref levels:
+# Full-rank dummies over mapped levels:
 # `Float64.(g .== permutedims([l1, l2, …]))`.
 function _contrast_expr(b::DesignBlock)
     @assert b.kind === FactorTerm
-    nonref = [lvl for (i, lvl) in enumerate(b.levels) if i != b.ref]
-    lvlvec = Expr(:vect, (_level_literal(lvl) for lvl in nonref)...)
+    lvlvec = Expr(:vect, (_level_literal(lvl) for lvl in b.levels)...)
     # Build `g .== permutedims(lvlvec)` via quasiquote for stable lowering.
     g = b.column
     perms = :(permutedims($lvlvec))

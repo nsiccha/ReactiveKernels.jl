@@ -16,11 +16,13 @@ module ReactiveKernelsPPL
 using ReactiveKernels
 
 export ColumnRef, ParamName
-export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam
+export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
+    BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam
 export LinkFunction, IdentityLink, LogitLink, LogLink
 export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm
 export ResponseEvidence, LikelihoodSpec, TermSpec, PredictorSpec
 export PopulationPrior, SampledParameter, AssignmentSpec, VectorAssignmentSpec
+export LevelMap
 export StructuralPlan
 export ContractValidationError, validate_plan, validate_structure, validate_data
 export topological_order, isbound, bind_data, COLUMN_ROLES

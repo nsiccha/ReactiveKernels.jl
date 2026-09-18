@@ -29,13 +29,19 @@ _plans_equal(a::StructuralPlan, b::StructuralPlan) =
     all(_assigns_equal.(a.assignments, b.assignments)) &&
     length(a.derived) == length(b.derived) &&
     all(_deriveds_equal.(a.derived, b.derived)) &&
+    length(a.levelmaps) == length(b.levelmaps) &&
+    all(_maps_equal.(a.levelmaps, b.levelmaps)) &&
     a.columns == b.columns && a.n_obs === b.n_obs && a.roles == b.roles
+
+_maps_equal(a::LevelMap, b::LevelMap) =
+    a.predictor === b.predictor && a.column === b.column &&
+    a.values == b.values && a.source === b.source && a.subset == b.subset
 
 _resps_equal(a::LikelihoodSpec, b::LikelihoodSpec) =
     a.family === b.family && a.link === b.link && a.response === b.response &&
     a.predictor === b.predictor && a.scale === b.scale &&
     a.weights === b.weights && _evs_equal(a.evidence, b.evidence) &&
-    a.label === b.label
+    a.label === b.label && a.range === b.range
 
 _evs_equal(a::ResponseEvidence, b::ResponseEvidence) =
     a.kind === b.kind && a.lower === b.lower && a.upper === b.upper
@@ -67,9 +73,10 @@ _deriveds_equal(a::VectorAssignmentSpec, b::VectorAssignmentSpec) =
 
 _unexp(responses, predictors, priors, params = SampledParameter[],
         assigns = AssignmentSpec[],
-        derived = VectorAssignmentSpec[]) = StructuralPlan(responses,
+        derived = VectorAssignmentSpec[],
+        maps = LevelMap[]) = StructuralPlan(responses,
     predictors, priors, params, assigns, Dict{Symbol,AbstractVector}(), 0;
-    derived = derived)
+    derived = derived, levelmaps = maps)
 
 @testset "surface roundtrip gaussian end to end" begin
     m = @rkppl begin
@@ -128,6 +135,123 @@ end
     _check_gradient(built.spec, bound, u)
 end
 
+@testset "surface roundtrip slice-1 families end to end" begin
+    # Binomial, column trials.
+    m = @rkppl begin
+        mu = a .+ b .* x
+        y .~ Binomial.(n, logistic.(mu))
+    end
+    cols, _ = _gen_columns()
+    cols[:y] = [1, 0, 2, 1, 3, 2]
+    cols[:n] = [3, 2, 4, 3, 5, 4]
+    bound = m(; y = cols[:y], x = cols[:x], n = cols[:n])
+    built = build_kernel(bound)
+    u = [0.25, 0.5]
+    nt = constrain(built.layout, u)
+    eta = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    ll = sum(logpdf.(Binomial.(cols[:n], 1 ./ (1 .+ exp.(-eta))), cols[:y]))
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 1), nt.mu[2])
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, bound, u)
+    @test bound.roles[:n] === :trials
+
+    # Binomial, literal trials.
+    m = @rkppl begin
+        mu = a .+ b .* x
+        y .~ Binomial.(5, logistic.(mu))
+    end
+    bound = m(; y = cols[:y], x = cols[:x])
+    built = build_kernel(bound)
+    nt = constrain(built.layout, u)
+    eta = nt.mu[1] .+ nt.mu[2] .* cols[:x]
+    ll = sum(logpdf.(Binomial.(5, 1 ./ (1 .+ exp.(-eta))), cols[:y]))
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, bound, u)
+
+    # NB2.
+    m = @rkppl begin
+        phi ~ Exponential(1.0)
+        eta = a .+ b .* x
+        y .~ NegativeBinomial2.(exp.(eta), phi)
+    end
+    cols[:y] = [0, 1, 2, 1, 3, 2]
+    bound = m(; y = cols[:y], x = cols[:x])
+    built = build_kernel(bound)
+    u3 = [0.1, -0.2, 0.3]
+    nt = constrain(built.layout, u3)
+    mu = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
+    ll = sum(logpdf.(NegativeBinomial.(nt.phi, nt.phi ./ (nt.phi .+ mu)),
+        cols[:y]))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2]) +
+        logpdf(Exponential(1), nt.phi)
+    @test _query(built.spec, bound, :posterior, u3) ≈ ll + pr + u3[3]
+    _check_gradient(built.spec, bound, u3)
+
+    # Gamma.
+    m = @rkppl begin
+        alpha ~ Exponential(1.0)
+        eta = a .+ b .* x
+        y .~ Gamma.(alpha, exp.(eta) ./ alpha)
+    end
+    cols[:y] = [1.0, 2.0, 1.5, 2.5, 3.0, 2.0]
+    bound = m(; y = cols[:y], x = cols[:x])
+    built = build_kernel(bound)
+    nt = constrain(built.layout, u3)
+    mu = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
+    ll = sum(logpdf.(Gamma.(nt.alpha, mu ./ nt.alpha), cols[:y]))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 1), nt.eta[2]) +
+        logpdf(Exponential(1), nt.alpha)
+    @test _query(built.spec, bound, :posterior, u3) ≈ ll + pr + u3[3]
+    _check_gradient(built.spec, bound, u3)
+end
+
+@testset "slice-1 response failures" begin
+    Dn2 = (:y, :x)
+    Dn3 = (:y, :x, :n)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ Binomial.(n, mu)
+    end, Dn3)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ Binomial.(2.5, logistic.(mu))
+    end, Dn3)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ Binomial.(zz, logistic.(mu))
+    end, Dn3)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        phi ~ Exponential(1.0)
+        eta = a .+ b .* x
+        y .~ NegativeBinomial2.(eta, phi)
+    end, Dn2)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        phi ~ Exponential(1.0)
+        eta = a .+ b .* x
+        y .~ negative_binomial2.(exp.(eta), phi)
+    end, Dn2)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        alpha ~ Exponential(1.0)
+        eta = a .+ b .* x
+        y .~ Gamma.(alpha, eta ./ alpha)
+    end, Dn2)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        alpha ~ Exponential(1.0)
+        alpha2 ~ Exponential(1.0)
+        eta = a .+ b .* x
+        y .~ Gamma.(alpha, exp.(eta) ./ alpha2)
+    end, Dn2)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        alpha ~ Exponential(1.0)
+        eta = a .+ b .* x
+        y .~ gamma.(alpha, exp.(eta) ./ alpha)
+    end, Dn2)
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        mu = a .+ b .* x
+        y .~ BinomialLogit.(n, mu)
+    end, Dn3)
+end
+
 @testset "surface plan equality" begin
     # Bernoulli: stated intercept prior, defaulted slope prior.
     got = lower_rkppl(quote
@@ -146,25 +270,22 @@ end
         PopulationPrior[PopulationPrior(:eta, :Intercept, 0.0, 5.0),
             PopulationPrior(:eta, :x, 0.0, 1.0)])
     @test _plans_equal(got, want)
-    # Factor + offset + literal scale.
+    # Factor (full-rank, no intercept) + offset + literal scale.
     got = lower_rkppl(quote
-        a ~ Normal(0, 1)
-        c ~ Normal(0, 2)
-        mu = a .+ c[g] .+ o
+        c[levels(g)] .~ Normal.(0, 2)
+        mu = c[g] .+ o
         y .~ Normal.(mu, 1.5)
     end, (:y, :g, :o))
     want = _unexp(
         LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, 1.5,
             nothing, _none_evidence(), :y_resp)],
         PredictorSpec[PredictorSpec(:mu, IdentityLink,
-            TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(),
-                    :Intercept, :intercept),
-                TermSpec(FactorTerm, [:g], (contrasts = :treatment, ref = 1),
-                    :g, :g_term),
+            TermSpec[TermSpec(FactorTerm, [:g], NamedTuple(), :g, :g_term),
                 TermSpec(OffsetTerm, [:o], NamedTuple(), :o, :o_off)],
             :mu)],
-        PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0),
-            PopulationPrior(:mu, :g, 0.0, 2.0)])
+        PopulationPrior[PopulationPrior(:mu, :g, 0.0, 2.0)],
+        SampledParameter[], AssignmentSpec[], VectorAssignmentSpec[],
+        LevelMap[LevelMap(:mu, :g, [], :levels, Colon())])
     @test _plans_equal(got, want)
     # Weighted response (object-first HOF, Distributions.jl argument order).
     got = lower_rkppl(quote
@@ -397,38 +518,142 @@ end
         logpdf(Exponential(1), si)
     @test _query(built.spec, bound, :posterior, u) ≈ base - corr + pr + u[3]
     _check_gradient(built.spec, bound, u)
-    # treatment(g, ref) pins the reference level; bare g stays ref 1.
+    # treatment() vocabulary is removed (BRM-specific); factor use is bare.
+    for bad in (:(c[treatment(g, 3)]), :(c[treatment(g)]),
+            :(c[treatment(g, 0)]), :(c[sumcode(g)]), :(c[g, 1]))
+        @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            Expr(:(=), :mu, Expr(:call, :.+, :a, bad)),
+            Expr(:call, :.~, :y, :(Normal.(mu, 1.0)))), (:y, :x, :g))
+    end
+end
+
+@testset "surface levels priors" begin
+    # Subset + intercept: identified; the map carries the (2, :end) selector.
     got = lower_rkppl(quote
-        mu = a .+ c[treatment(g, 3)]
-        y .~ Normal.(mu, 1.0)
+        a ~ Normal(0, 1)
+        c[levels(g)[2:end]] .~ Normal.(0, 2)
+        mu = a .+ c[g]
+        y .~ Normal.(mu, 1.5)
     end, (:y, :x, :g))
-    @test _terms_equal(got.predictors[1].terms[2],
-        TermSpec(FactorTerm, [:g], (contrasts = :treatment, ref = 3), :g,
-            :g_term))
+    @test length(got.levelmaps) == 1 &&
+        _maps_equal(got.levelmaps[1], LevelMap(:mu, :g, [], :levels, (2, :end)))
     @test got.population_priors ==
         PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0),
-            PopulationPrior(:mu, :g, 0.0, 1.0)]
-    got = lower_rkppl(quote
-        mu = a .+ c[treatment(g)]
-        y .~ Normal.(mu, 1.0)
-    end, (:y, :x, :g))
-    @test got.predictors[1].terms[2].options == (contrasts = :treatment, ref = 1)
+            PopulationPrior(:mu, :g, 0.0, 2.0)]
+    # Intercept + full cover: the identifiability gate.
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a .+ c[treatment(g, 0)]
-        y .~ Normal.(mu, 1.0)
+        a ~ Normal(0, 1)
+        c[levels(g)] .~ Normal.(0, 2)
+        mu = a .+ c[g]
+        y .~ Normal.(mu, 1.5)
     end, (:y, :x, :g))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a .+ c[treatment(g, r)]
-        y .~ Normal.(mu, 1.0)
-    end, (:y, :x, :g))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a .+ c[treatment(gg, 3)]
-        y .~ Normal.(mu, 1.0)
-    end, (:y, :x, :g))
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-        mu = a .+ c[sumcode(g)]
-        y .~ Normal.(mu, 1.0)
-    end, (:y, :x, :g))
+    # Scalar prior for a vector coefficient: migration error. Missing prior:
+    # required error (no default sizes the block).
+    for stmts in ((:(c ~ Normal(0, 2)),), (:($(Expr(:call, :~,
+            :c, :(Normal.(0, 2))))),), ())
+        block = Expr(:block, stmts...,
+            :(mu = c[g]), :(y .~ Normal.(mu, 1.5)))
+        @test_throws SurfaceLoweringError lower_rkppl(block, (:y, :g))
+    end
+    # Levels column must match the use column; levels() takes one data column.
+    for lhs in (:(c[levels(h)]), :(c[unique(g)]), :(c[sort(g)]),
+            :(c[levels()]), :(c[levels(g, 1)]), :(c[levels(x)]),
+            :(c[f(g)]), :(y[levels(g)]))
+        block = Expr(:block, Expr(:call, :.~, lhs, :(Normal.(0, 2))),
+            :(mu = c[g]), :(y .~ Normal.(mu, 1.5)))
+        @test_throws SurfaceLoweringError lower_rkppl(block, (:y, :x, :g, :h))
+    end
+    # Scalar tilde over a levels ref is crossed spelling.
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+        Expr(:call, :~, :(c[levels(g)]), :(Normal(0, 2))),
+        :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g))
+    # Subset violations: unbound/start-0/empty/non-literal selections.
+    for sub in (:(1:n), :(0:2), :(3:2), :([]), :([1.5]), :([true]),
+            :([i]), :(1:2:6), :(eachindex(g)))
+        lhs = Expr(:ref, :c, Expr(:ref, :(levels(g)), sub))
+        block = Expr(:block, Expr(:call, :.~, lhs, :(Normal.(0, 2))),
+            :(mu = c[g]), :(y .~ Normal.(mu, 1.5)))
+        @test_throws SurfaceLoweringError lower_rkppl(block, (:y, :g))
+    end
+    # Valid subsets lower with their selectors.
+    for (sub, want) in ((:(2:3), 2:3), (:([1, 3]), [1, 3]))
+        lhs = Expr(:ref, :c, Expr(:ref, :(levels(g)), sub))
+        block = Expr(:block, Expr(:call, :.~, lhs, :(Normal.(0, 2))),
+            :(mu = c[g]), :(y .~ Normal.(mu, 1.5)))
+        got = lower_rkppl(block, (:y, :g))
+        @test got.levelmaps[1].subset == want
+    end
+    # Outside-chained subsets go inside instead (one way).
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+        Expr(:call, :.~,
+            Expr(:ref, Expr(:ref, :c, :(levels(g))),
+                Expr(:call, :(:), 2, :end)),
+            :(Normal.(0, 2))),
+        :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g))
+    # Non-dotted prior object over a levels ref: broadcast it.
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+        Expr(:call, :.~, :(c[levels(g)]), :(Normal(0, 2))),
+        :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g))
+    # Non-literal broadcast args are not per-level priors.
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+        Expr(:call, :.~, :(c[levels(g)]), :(Normal.(m, 2))),
+        :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g))
+    # Levels prior on a non-factor coefficient; unused levels prior.
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+        Expr(:call, :.~, :(a[levels(g)]), :(Normal.(0, 1))),
+        :(mu = a .+ c[g]),
+        Expr(:call, :.~, :(c[levels(g)]), :(Normal.(0, 2))),
+        :(y .~ Normal.(mu, 1.5))), (:y, :g))
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+        Expr(:call, :.~, :(z[levels(g)]), :(Normal.(0, 1))),
+        :(mu = c[g]),
+        Expr(:call, :.~, :(c[levels(g)]), :(Normal.(0, 2))),
+        :(y .~ Normal.(mu, 1.5))), (:y, :g))
+end
+
+@testset "surface full-rank factor end to end" begin
+    # No intercept + full cover: one coefficient per observed level.
+    m = @rkppl begin
+        c[levels(g)] .~ Normal.(0, 2)
+        s ~ Exponential(1)
+        mu = c[g]
+        y .~ Normal.(mu, s)
+    end
+    cols, _ = _gen_columns()
+    bound = m(; y = cols[:y], g = cols[:g])
+    @test bound.levelmaps[1].values == [1, 2, 3]
+    built = build_kernel(bound)
+    u = [0.2, -0.1, 0.3, 0.0]
+    nt = constrain(built.layout, u)
+    mu = Vector(nt.mu)[cols[:g]]
+    si = nt.s
+    ll = sum(logpdf.(Normal.(mu, si), cols[:y]))
+    pr = sum(logpdf.(Normal(0, 2), Vector(nt.mu))) +
+        logpdf(Exponential(1), si)
+    @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[4]
+    _check_gradient(built.spec, bound, u)
+    # Subset + intercept: reference rows ride the intercept.
+    m2 = @rkppl begin
+        a ~ Normal(0, 1)
+        c[levels(g)[2:end]] .~ Normal.(0, 2)
+        s ~ Exponential(1)
+        mu = a .+ c[g]
+        y .~ Normal.(mu, s)
+    end
+    bound2 = m2(; y = cols[:y], g = cols[:g])
+    @test bound2.levelmaps[1].values == [2, 3]
+    built2 = build_kernel(bound2)
+    u2 = [0.5, 0.2, -0.1, 0.0]
+    nt2 = constrain(built2.layout, u2)
+    coef = Dict(1 => 0.0, 2 => nt2.mu[2], 3 => nt2.mu[3])
+    mu2 = [nt2.mu[1] + coef[g] for g in cols[:g]]
+    si2 = nt2.s
+    ll2 = sum(logpdf.(Normal.(mu2, si2), cols[:y]))
+    pr2 = logpdf(Normal(0, 1), nt2.mu[1]) +
+        sum(logpdf.(Normal(0, 2), Vector(nt2.mu)[2:3])) +
+        logpdf(Exponential(1), si2)
+    @test _query(built2.spec, bound2, :posterior, u2) ≈ ll2 + pr2 + u2[4]
+    _check_gradient(built2.spec, bound2, u2)
 end
 
 @testset "surface derived columns" begin
@@ -595,7 +820,8 @@ end
 
 @testset "surface error paths" begin
     Dn = (:y, :x)
-    # Control flow, target, reserved macros.
+    # Control flow, target, reserved macros (@plate admitted since slice B;
+    # @scan still reserved).
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         for i in 1:3
@@ -608,8 +834,8 @@ end
         target += 1.0
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
-        @plate for i in 1:3
-            y[i] ~ Normal.(mu, 1.0)
+        @plate begin
+            y .~ Normal.(mu, 1.0)
         end
     end, Dn)
     @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -1104,4 +1330,266 @@ end
         z ~ obs_gstream(x)
         w .~ Normal.(z, 1.0)
     end, (:w, :x); mod = @__MODULE__)
+end
+
+# Slice A: range-explicit response LHS (`y[R] .~ ...`) + single-LHS
+# ownership. Self-covering forms lower identically to bare `.~`; literal
+# `1:N` rides the plan and is verified at bind.
+_ranged_ast(lhs) = Expr(:block,
+    LineNumberNode(1), :(a ~ Normal(0, 1)),
+    LineNumberNode(2), :(b ~ Normal(0, 2)),
+    LineNumberNode(3), :(s ~ Exponential(1)),
+    LineNumberNode(4), :(mu = a .+ b .* x),
+    LineNumberNode(5), Expr(:call, :.~, lhs, :(Normal.(mu, s))))
+
+@testset "surface ranged responses y[R]" begin
+    cols, n = _gen_columns()
+    @test n == 6
+    bare = lower_rkppl(_ranged_ast(:y), (:y, :x))
+    @test bare.responses[1].range === nothing
+    # Self-covering forms are plan-identical to bare.
+    for lhs in (:(y[eachindex(y)]), :(y[axes(y, 1)]))
+        got = lower_rkppl(_ranged_ast(lhs), (:y, :x))
+        @test _plans_equal(got, bare)
+        @test got.responses[1].range === nothing
+    end
+    # Literal range rides the plan and values identically end to end.
+    lit = lower_rkppl(_ranged_ast(:(y[1:6])), (:y, :x))
+    @test lit.responses[1].range == 1:6
+    u = [0.5, -0.25, 0.1]
+    @test _query(build_kernel(bind_data(lit, cols)).spec,
+        bind_data(lit, cols), :posterior, u) ==
+        _query(build_kernel(bind_data(bare, cols)).spec,
+            bind_data(bare, cols), :posterior, u)
+    # Mismatched literal range fails at bind, naming both lengths.
+    badn = lower_rkppl(_ranged_ast(:(y[1:5])), (:y, :x))
+    err = try
+        bind_data(badn, cols)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ContractValidationError && occursin("n_obs is 6", err.message)
+    # Structural range violations fail at lowering.
+    for lhs in (:(y[2:6]), :(y[0:6]), :(y[1:0]), :(y[1:n]), :(y[1:2:6]),
+            :(y[eachindex(x)]), :(y[axes(y, 2)]), :(y[axes(x, 1)]),
+            :(y[axes(y)]), :(y[i]), :(y[3]), :(y[:]))
+        @test_throws SurfaceLoweringError lower_rkppl(_ranged_ast(lhs), (:y, :x))
+    end
+    # Scalar tilde over a slice is crossed spelling; dotted LHS is out of scope.
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+        :(mu = a .+ b .* x),
+        Expr(:call, :~, :(y[1:6]), :(Normal.(mu, s)))), (:y, :x))
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+        :(mu = a .+ b .* x),
+        Expr(:call, :.~, :(a.b), :(Normal.(mu, s)))), (:y, :x))
+    # Ownership: a second LHS for y fails naming the first statement's line.
+    err = try
+        lower_rkppl(Expr(:block,
+            LineNumberNode(10), :(mu = a .+ b .* x),
+            LineNumberNode(11), :(y .~ Normal.(mu, s)),
+            LineNumberNode(12),
+            Expr(:call, :.~, :(y[eachindex(y)]), :(Normal.(mu, s)))), (:y, :x))
+        nothing
+    catch e
+        e
+    end
+    @test err isa SurfaceLoweringError &&
+        occursin("defined twice", err.message) &&
+        occursin("first at line 11", err.message)
+    # Hand-built off-start ranges fail structural validation, not lowering.
+    off = let p = bare
+        rs = [LikelihoodSpec(r.family, r.link, r.response, r.predictor,
+                r.scale, r.weights, r.evidence, r.label, 2:6)
+            for r in p.responses]
+        StructuralPlan(rs, p.predictors, p.population_priors, p.parameters,
+            p.assignments, p.columns, p.n_obs; derived = p.derived)
+    end
+    @test_throws ContractValidationError validate_structure(off)
+end
+
+# Slice B: `@plate for i in R` desugar — observations + deterministic
+# cells lower to the same plans as their top-level spellings.
+_plate_gauss(R) = Expr(:block,
+    :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
+    :(mu = a .+ b .* x),
+    Expr(:macrocall, Symbol("@plate"), LineNumberNode(5),
+        Expr(:for, Expr(:(=), :i, R),
+            Expr(:block, LineNumberNode(6),
+                :(y[i] ~ Normal.(mu[i], s))))))
+
+@testset "surface plate" begin
+    cols, n = _gen_columns()
+    bare = lower_rkppl(Expr(:block,
+            :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
+            :(mu = a .+ b .* x), :(y .~ Normal.(mu, s))), (:y, :x))
+    # eachindex/axes plates are plan-identical to bare `.~`.
+    for R in (:(eachindex(y)), :(axes(y, 1)))
+        @test _plans_equal(lower_rkppl(_plate_gauss(R), (:y, :x)), bare)
+    end
+    # Literal-range plates carry the range like `y[1:N]`.
+    lit = lower_rkppl(_plate_gauss(:(1:6)), (:y, :x))
+    @test lit.responses[1].range == 1:6
+    ranged = lower_rkppl(Expr(:block,
+            :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
+            :(mu = a .+ b .* x),
+            Expr(:call, :.~, :(y[1:6]), :(Normal.(mu, s)))), (:y, :x))
+    @test _plans_equal(lit, ranged)
+    # Deterministic cells: predictor-via-cell ≡ top-level predictor.
+    cell = lower_rkppl(Expr(:block,
+            :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
+            Expr(:macrocall, Symbol("@plate"), LineNumberNode(4),
+                Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                    Expr(:block, LineNumberNode(5),
+                        :(t = a .+ b .* x[i]),
+                        :(y[i] ~ Normal.(t, s)))))), (:y, :x))
+    top = lower_rkppl(Expr(:block,
+            :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
+            :(t = a .+ b .* x), :(y .~ Normal.(t, s))), (:y, :x))
+    @test _plans_equal(cell, top)
+    # Values agree end to end.
+    u = [0.5, -0.25, 0.1]
+    bb, pb = bind_data(bare, cols), bind_data(
+        lower_rkppl(_plate_gauss(:(eachindex(y))), (:y, :x)), cols)
+    @test _query(build_kernel(pb).spec, pb, :posterior, u) ==
+        _query(build_kernel(bb).spec, bb, :posterior, u)
+    # Scalar cell objects are rejected (dots as written, like top level).
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
+            :(mu = a .+ b .* x),
+            Expr(:macrocall, Symbol("@plate"), LineNumberNode(5),
+                Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                    Expr(:block, LineNumberNode(6),
+                        :(y[i] ~ Normal(mu[i], s)))))), (:y, :x))
+    # Dotted wrappers strip through the desugar.
+    wrap = lower_rkppl(Expr(:block,
+            :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
+            :(mu = a .+ b .* x),
+            Expr(:macrocall, Symbol("@plate"), LineNumberNode(5),
+                Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                    Expr(:block, LineNumberNode(6),
+                        :(y[i] ~ truncated.(Normal.(mu[i], s), 0, 10)))))),
+        (:y, :x))
+    wraptop = lower_rkppl(Expr(:block,
+            :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
+            :(mu = a .+ b .* x),
+            :(y .~ truncated.(Normal.(mu, s), 0, 10))), (:y, :x))
+    @test _plans_equal(wrap, wraptop)
+end
+
+@testset "surface plate failures" begin
+    Dn = (:y, :x, :g)
+    # Shape violations: non-for plate, multi-index, values-iteration,
+    # bad ranges, empty body, nested plates, non-statement cells.
+    badloops = Any[
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:block, :(y .~ Normal.(mu, s)))),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:for,
+                Expr(:block, Expr(:(=), :i, :(eachindex(y))),
+                    Expr(:(=), :j, :(eachindex(y)))),
+                Expr(:block, :(y[i] ~ Normal.(mu[i], s))))),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:for, Expr(:(=), :d, :doses),
+                Expr(:block, :(y[d] ~ Normal(mu[d], s))))),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:for, Expr(:(=), :i, :(1:n)),
+                Expr(:block, :(y[i] ~ Normal.(mu[i], s))))),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:for, Expr(:(=), :i, :(axes(y, 2))),
+                Expr(:block, :(y[i] ~ Normal.(mu[i], s))))),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))), Expr(:block))),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block,
+                    Expr(:macrocall, Symbol("@plate"), LineNumberNode(2),
+                        Expr(:for, Expr(:(=), :j, :(eachindex(y))),
+                            Expr(:block, :(y[j] ~ Normal.(mu[j], s)))))))),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block, :(for j in 1:3
+                    y[j] ~ Normal.(mu[j], s)
+                end)))),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block, :(if a > 0
+                    y[i] ~ Normal.(mu[i], s)
+                end)))),
+    ]
+    for bad in badloops
+        @test_throws SurfaceLoweringError lower_rkppl(
+            Expr(:block, :(mu = a .+ b .* x), bad), Dn)
+    end
+    # Cell violations: broadcast, cross/lag index, bare loop var,
+    # scalar cells, non-data sampled, bare priors, factor indexing.
+    badcells = Any[
+        :(y[i] .~ Normal.(mu[i], s)),
+        :(y[j] ~ Normal.(mu[j], s)),
+        :(y[i] ~ Normal.(x[i - 1], s)),
+        :(y[i] ~ Normal.(i, s)),
+        :(y[3] ~ Normal.(mu[3], s)),
+        :(z[i] ~ Normal.(0, 1)),
+        :(s ~ Exponential(1)),
+        :(y[i] ~ Normal.(c[g[i]], s)),
+        :(y[i, 1] ~ Normal.(mu[i], s)),
+    ]
+    for bad in badcells
+        @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+                :(mu = a .+ b .* x),
+                Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+                    Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                        Expr(:block, bad)))), Dn)
+    end
+    # Bare whole vectors in cells (data, predictor, derived).
+    for bad in (:(y[i] ~ Normal.(x, s)), :(y[i] ~ Normal.(mu, s)))
+        @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+                :(mu = a .+ b .* x),
+                Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+                    Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                        Expr(:block, bad)))), Dn)
+    end
+    # The predictor case names the fix (it would lower silently).
+    err = try
+        lower_rkppl(Expr(:block,
+                :(mu = a .+ b .* x),
+                Expr(:macrocall, Symbol("@plate"), LineNumberNode(9),
+                    Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                        Expr(:block, :(y[i] ~ Normal.(mu, s)))))), Dn)
+        nothing
+    catch e
+        e
+    end
+    @test err isa SurfaceLoweringError &&
+        occursin("reads a whole vector", err.message) &&
+        occursin("line 9", err.message)
+    # Cross-column ranges; write violations; ownership across forms.
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            :(mu = a .+ b .* x),
+            Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+                Expr(:for, Expr(:(=), :i, :(eachindex(x))),
+                    Expr(:block, :(y[i] ~ Normal.(mu[i], s)))))), Dn)
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            :(a ~ Normal(0, 1)),
+            Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+                Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                    Expr(:block, :(a = x[i]))))), Dn)
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+                Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                    Expr(:block, :(x = x[i]))))), Dn)
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+            :(y .~ Normal.(mu, s)),
+            Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+                Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                    Expr(:block, :(y[i] ~ Normal.(mu[i], s)))))), Dn)
+    # Docstrings on plates do not lower; @scan stays reserved.
+    plate = Expr(:macrocall, Symbol("@plate"), LineNumberNode(2),
+        Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+            Expr(:block, :(y[i] ~ Normal.(mu[i], s)))))
+    doc = Expr(:macrocall, Symbol("@doc"), LineNumberNode(1), "docs", plate)
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block, doc), Dn)
+    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+        Expr(:macrocall, Symbol("@scan"), LineNumberNode(1),
+            Expr(:block, :(y .~ Normal.(mu, s))))), Dn)
 end
