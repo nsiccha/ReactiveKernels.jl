@@ -43,7 +43,8 @@ end
         @test occursin("b[scenario_id]", PILOTS_SOURCE)
         @test occursin("normal(m, s).logpdf(aa)", PILOTS_SOURCE)
         @test occursin("y_hat = plate(", PILOTS_SOURCE)
-        @test occursin("bound = (; group_id, scenario_id)", PILOTS_SOURCE)
+        @test occursin("bound = (; group_id, scenario_id, y)", PILOTS_SOURCE)
+        @test occursin("output = density_kernel(q)", PILOTS_SOURCE)
         @test !occursin("struct ", PILOTS_SOURCE)
         @test artifact.normal_object === normal
     end

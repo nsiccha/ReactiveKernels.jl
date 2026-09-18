@@ -13,6 +13,12 @@ using ReactiveKernelsStreamingStats
 include(joinpath(@__DIR__, "..", "examples", "nutpie_diagonal_adaptation.jl"))
 import .NutpieDiagonalAdaptationExample
 
+# Load the executable manual-rule design example. It uses only today's public
+# HAVE→WANT preparation surface; the page labels backend adapter generation as
+# the proposed layer rather than presenting it as an existing package API.
+include(joinpath(@__DIR__, "..", "examples", "manual_derivative_rule.jl"))
+import .ManualDerivativeRuleExample
+
 # NUTS and WALNUTS authoring fixtures are deliberately not included here.
 # Their pages read the source files as inert text; docs builds must not parse,
 # lower, compile, or execute either moving compiler/runtime surface.
@@ -40,6 +46,7 @@ include("gibbs_page.jl")
 site_pages = [
     "Home" => "index.md",
     "Compiler capability and limits" => "compiler.md",
+    "Position batching (vectorize)" => "position-batching.md",
     "Sequential recurrences (scan)" => "scan.md",
     "Distributions" => [
         "Distribution kernels" => "distributions.md",
@@ -55,18 +62,49 @@ site_pages = [
             "Poisson-Gamma" => "poisson-gamma.md",
             "Dugongs (nonlinear growth)" => "dugongs-growth.md",
             "ARMA(1,1) time series" => "arma11.md",
+            "Imperial covid19 renewal model" => "covid19imperial.md",
+            "GARCH(1,1)" => "garch11.md",
+            "HMM (forward algorithm)" => "hmm-example.md",
+            "Gaussian HMM (K states)" => "hmm-gaussian.md",
+            "Input-output HMM" => "iohmm-reg.md",
             "Correlated (MvNormal) regression" => "mvnormal-regression.md",
             "Partial evaluation (bound data)" => "bound-regression.md",
             "Diamonds (brms centered regression)" => "diamonds.md",
             "Normal mixture (marginalized simplex)" => "normal-mixture-k.md",
             "Dogs (correlated avoidance learning)" => "dogs-nonhierarchical.md",
             "Logistic regression (regularized horseshoe)" => "logistic-regression-rhs.md",
+            "LDA (latent Dirichlet allocation, ldaK2/ldaK5)" => "lda.md",
+            "Neural RBM softmax (nn_rbm1b J10/J100)" => "nn-rbm.md",
+            "Losscurve (insurance loss development)" => "losscurve-sislob.md",
+            "Accel splines (brms penalized splines)" => "accel-splines.md",
+            "State space (structural DLM)" => "state-space-stochastic.md",
+            "Prophet (piecewise-trend forecasting)" => "prophet.md",
+            "IRT 2PL (item response)" => "irt-2pl.md",
+            "IRT 2PL + latent regression" => "2pl-latent-reg-irt.md",
+            "IRT hierarchical 2PL (correlated items)" => "hier-2pl.md",
+            "IRT GPCM (ordinal + latent regression)" => "gpcm-latent-reg-irt.md",
+            "GLMM1 (per-site Poisson-log GLMM)" => "glmm1.md",
+            "BYM2 (spatial-Poisson convolution)" => "bym2-offset-only.md",
+            "Bones (graded-response latent trait)" => "bones.md",
+            "Multi-occupancy (marginalized)" => "multi-occupancy.md",
+            "Lotka–Volterra adaptive ODE" => "lotka-volterra.md",
+            "SIR with environmental bacteria" => "sir.md",
+            "One-compartment Michaelis–Menten" => "one-comp-mm-elim-abs.md",
+            "Soil incubation two-pool carbon" => "soil-incubation.md",
+        ],
+        "Gaussian processes" => [
+            "GP regression (marginal)" => "gp-regr.md",
+            "GP Poisson regression (latent)" => "gp-pois-regr.md",
+            "Approximate GP (HSGP, distributional)" => "accel-gp.md",
+            "BRM motorcycle (partial HSGP coordinates)" => "brm-hsgp.md",
+            "Hierarchical GP" => "hierarchical-gp.md",
             "Basketball-drive HMM (hmm_drive_1)" => "hmm-drive-1.md",
         ],
         "Declarative @ppl front-end + Gibbs (experimental)" => "ppl-front-end.md",
     ],
     "Automatic differentiation" => [
         "Prepared gradients" => "automatic-differentiation.md",
+        "Manual derivative rules (design)" => "manual-derivative-rules.md",
         "Distributions: scalar and batched" => "distributions-ad.md",
         "PPL: Eight Schools and MNIST" => "ppl-ad.md",
     ],

@@ -26,6 +26,17 @@ using Test
     @test first(findfirst("\"Eight schools\" => \"eight-schools.md\"", make)) <
           first(findfirst("\"MNIST multinomial logistic\" => \"mnist-logistic.md\"", make)) <
           first(findfirst("\"Other model walkthroughs\" => [", make))
+    @test first(findfirst(
+              "\"Prepared gradients\" => \"automatic-differentiation.md\"", make,
+          )) <
+          first(findfirst(
+              "\"Manual derivative rules (design)\" => \"manual-derivative-rules.md\"",
+              make,
+          )) <
+          first(findfirst(
+              "\"Distributions: scalar and batched\" => \"distributions-ad.md\"",
+              make,
+          ))
     @test !occursin("practicalbayes.md", make)
     @test !isfile(joinpath(root, "docs", "src", "practicalbayes.md"))
 

@@ -35,8 +35,10 @@ end
                                     MESQ_DENSITY, MESQ_GROUP)
 
     @testset "authored on the current baseline surface" begin
-        @test occursin("normal(b1 + b2 * d1 + b3 * d2 + b4 * ch + b5 * th + b6 * den + b7 * g, s).logpdf(w)",
+        @test occursin("mu = plate(diam1, diam2, canopy_height, total_height, density, group,",
                        MESQUITE_SOURCE)
+        @test occursin("b1 + b2 * d1 + b3 * d2 + b4 * ch + b5 * th + b6 * den + b7 * g", MESQUITE_SOURCE)
+        @test occursin("normal(m, s).logpdf(w)", MESQUITE_SOURCE)
         @test occursin("mu = plate(", MESQUITE_SOURCE)
         @test occursin("log_prior::Float64 = 0.0", MESQUITE_SOURCE)
         @test !occursin("struct ", MESQUITE_SOURCE)

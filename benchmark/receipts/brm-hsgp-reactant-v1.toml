@@ -1,0 +1,399 @@
+ad_preparation_seconds = 1.821631142
+benchmark_source_sha256 = "2c4a5a5646ce2f212daa97cddf0debca9726025db5d585937125f3cf8c3c558a"
+blas_threads = 1
+brm_model_source_sha256 = "80eca4d161ccb7a99a7752434b21d0130025570f523c4b5baaa0d1c00b7372a6"
+coordinate_names = ["hsgp_x_rho_iso", "hsgp_x_sigma", "hsgp_x_beta_raw.1", "hsgp_x_beta_raw.2", "hsgp_x_beta_raw.3", "hsgp_x_beta_raw.4", "hsgp_x_beta_raw.5", "hsgp_x_beta_raw.6", "hsgp_x_beta_raw.7", "hsgp_x_beta_raw.8", "hsgp_x_beta_raw.9", "hsgp_x_beta_raw.10", "hsgp_x_beta_raw.11", "hsgp_x_beta_raw.12", "hsgp_x_beta_raw.13", "hsgp_x_beta_raw.14", "hsgp_x_beta_raw.15", "hsgp_x_beta_raw.16", "hsgp_x_beta_raw.17", "hsgp_x_beta_raw.18", "hsgp_x_beta_raw.19", "hsgp_x_beta_raw.20", "hsgp_log_sigma_x_rho_iso", "hsgp_log_sigma_x_sigma", "hsgp_log_sigma_x_beta_raw.1", "hsgp_log_sigma_x_beta_raw.2", "hsgp_log_sigma_x_beta_raw.3", "hsgp_log_sigma_x_beta_raw.4", "hsgp_log_sigma_x_beta_raw.5", "hsgp_log_sigma_x_beta_raw.6", "hsgp_log_sigma_x_beta_raw.7", "hsgp_log_sigma_x_beta_raw.8", "hsgp_log_sigma_x_beta_raw.9", "hsgp_log_sigma_x_beta_raw.10", "hsgp_log_sigma_x_beta_raw.11", "hsgp_log_sigma_x_beta_raw.12", "hsgp_log_sigma_x_beta_raw.13", "hsgp_log_sigma_x_beta_raw.14", "hsgp_log_sigma_x_beta_raw.15", "hsgp_log_sigma_x_beta_raw.16", "hsgp_log_sigma_x_beta_raw.17", "hsgp_log_sigma_x_beta_raw.18", "hsgp_log_sigma_x_beta_raw.19", "hsgp_log_sigma_x_beta_raw.20"]
+data_sha256 = "b89a1e4eb0391a982b32be3e378df00e8593ff9971e9425e9c5d7929b74f9801"
+julia_version = "1.10.11"
+kernel_preparation_seconds = 4.202528878
+kernel_source_sha256 = "54a4173dda961ff90dac3afd9541fdf653126bb8cba5257f06532dc762987b25"
+native_ad_first_execution_seconds = 29.799372904
+reactant_compilation_seconds = 12.420555804
+reactant_first_execution_seconds = 0.385513454
+reactant_primal_compilation_seconds = 24.930663877
+
+[bundle_hashes]
+"centeredness.tsv" = "e882c5b7a906275bbff370291c686ba8284272fdf7aa5102bccba3323468e289"
+"noncentered.jls" = "9f0b2513dd9762d54360c26548322e6349fa4e834691d0a92ae210d951435c50"
+"partial.jls" = "ad667cb50ddf28faff727cc73bdf22556ddaff54d5384dd4337556a22fca9247"
+
+[centered]
+centeredness = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+native_verified = false
+points = 10000
+source_coordinate_names = ["hsgp_x_rho_iso", "hsgp_x_sigma", "hsgp_x_beta_raw.1", "hsgp_x_beta_raw.2", "hsgp_x_beta_raw.3", "hsgp_x_beta_raw.4", "hsgp_x_beta_raw.5", "hsgp_x_beta_raw.6", "hsgp_x_beta_raw.7", "hsgp_x_beta_raw.8", "hsgp_x_beta_raw.9", "hsgp_x_beta_raw.10", "hsgp_x_beta_raw.11", "hsgp_x_beta_raw.12", "hsgp_x_beta_raw.13", "hsgp_x_beta_raw.14", "hsgp_x_beta_raw.15", "hsgp_x_beta_raw.16", "hsgp_x_beta_raw.17", "hsgp_x_beta_raw.18", "hsgp_x_beta_raw.19", "hsgp_x_beta_raw.20", "hsgp_log_sigma_x_rho_iso", "hsgp_log_sigma_x_sigma", "hsgp_log_sigma_x_beta_raw.1", "hsgp_log_sigma_x_beta_raw.2", "hsgp_log_sigma_x_beta_raw.3", "hsgp_log_sigma_x_beta_raw.4", "hsgp_log_sigma_x_beta_raw.5", "hsgp_log_sigma_x_beta_raw.6", "hsgp_log_sigma_x_beta_raw.7", "hsgp_log_sigma_x_beta_raw.8", "hsgp_log_sigma_x_beta_raw.9", "hsgp_log_sigma_x_beta_raw.10", "hsgp_log_sigma_x_beta_raw.11", "hsgp_log_sigma_x_beta_raw.12", "hsgp_log_sigma_x_beta_raw.13", "hsgp_log_sigma_x_beta_raw.14", "hsgp_log_sigma_x_beta_raw.15", "hsgp_log_sigma_x_beta_raw.16", "hsgp_log_sigma_x_beta_raw.17", "hsgp_log_sigma_x_beta_raw.18", "hsgp_log_sigma_x_beta_raw.19", "hsgp_log_sigma_x_beta_raw.20"]
+stan_coordinate_names = ["hsgp_x_rho_iso", "hsgp_x_sigma", "hsgp_x_beta_partial.1", "hsgp_x_beta_partial.2", "hsgp_x_beta_partial.3", "hsgp_x_beta_partial.4", "hsgp_x_beta_partial.5", "hsgp_x_beta_partial.6", "hsgp_x_beta_partial.7", "hsgp_x_beta_partial.8", "hsgp_x_beta_partial.9", "hsgp_x_beta_partial.10", "hsgp_x_beta_partial.11", "hsgp_x_beta_partial.12", "hsgp_x_beta_partial.13", "hsgp_x_beta_partial.14", "hsgp_x_beta_partial.15", "hsgp_x_beta_partial.16", "hsgp_x_beta_partial.17", "hsgp_x_beta_partial.18", "hsgp_x_beta_partial.19", "hsgp_x_beta_partial.20", "hsgp_log_sigma_x_rho_iso", "hsgp_log_sigma_x_sigma", "hsgp_log_sigma_x_beta_partial.1", "hsgp_log_sigma_x_beta_partial.2", "hsgp_log_sigma_x_beta_partial.3", "hsgp_log_sigma_x_beta_partial.4", "hsgp_log_sigma_x_beta_partial.5", "hsgp_log_sigma_x_beta_partial.6", "hsgp_log_sigma_x_beta_partial.7", "hsgp_log_sigma_x_beta_partial.8", "hsgp_log_sigma_x_beta_partial.9", "hsgp_log_sigma_x_beta_partial.10", "hsgp_log_sigma_x_beta_partial.11", "hsgp_log_sigma_x_beta_partial.12", "hsgp_log_sigma_x_beta_partial.13", "hsgp_log_sigma_x_beta_partial.14", "hsgp_log_sigma_x_beta_partial.15", "hsgp_log_sigma_x_beta_partial.16", "hsgp_log_sigma_x_beta_partial.17", "hsgp_log_sigma_x_beta_partial.18", "hsgp_log_sigma_x_beta_partial.19", "hsgp_log_sigma_x_beta_partial.20"]
+stan_gradient_max_abs = 101.5
+stan_gradient_max_scaled = 1.5455363706851556e-11
+stan_permutation = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44]
+stan_preparation_seconds = 20.161354125
+stan_value_max_abs = 4.192202140984591e-13
+
+    [centered.adversarial]
+    native_verified = false
+    points = 18
+    stan_gradient_max_abs = 3.5653937856996347e61
+    stan_gradient_max_scaled = 1.7045979716157393e-13
+    stan_value_max_abs = 9.094947017729282e-13
+
+    [centered.runtime]
+    host_over_stan = 3.5569783468943132
+    resident_over_stan = 1.7030812324929971
+
+        [centered.runtime.reactant_host]
+        allocations = 34
+        bytes = 1696
+        median_ns = 40000.0
+        minimum_ns = 28900.0
+        samples = 1000
+
+        [centered.runtime.reactant_primal]
+        allocations = 16
+        bytes = 704
+        median_ns = 16773.0
+        minimum_ns = 12347.0
+        samples = 1000
+
+        [centered.runtime.reactant_resident]
+        allocations = 20
+        bytes = 816
+        median_ns = 19152.0
+        minimum_ns = 14050.0
+        samples = 1000
+
+        [centered.runtime.rk_native_primal]
+        allocations = 16
+        bytes = 5472
+        median_ns = 3455.0
+        minimum_ns = 1511.0
+        samples = 1000
+
+        [centered.runtime.rk_native_value_gradient]
+        allocations = 40
+        bytes = 12736
+        median_ns = 18816.0
+        minimum_ns = 14359.0
+        samples = 1000
+
+        [centered.runtime.stanblocks]
+        allocations = 2
+        bytes = 464
+        median_ns = 11245.5
+        minimum_ns = 10905.0
+        samples = 1000
+
+[mixed]
+centeredness = [0.0, 0.25, 0.7, 1.0, 0.0, 0.25, 0.7, 1.0, 0.0, 0.25, 0.7, 1.0, 0.0, 0.25, 0.7, 1.0, 0.0, 0.25, 0.7, 1.0, 0.0, 0.25, 0.7, 1.0, 0.0, 0.25, 0.7, 1.0, 0.0, 0.25, 0.7, 1.0, 0.0, 0.25, 0.7, 1.0, 0.0, 0.25, 0.7, 1.0]
+native_verified = false
+points = 10000
+source_coordinate_names = ["hsgp_x_rho_iso", "hsgp_x_sigma", "hsgp_x_beta_raw.1", "hsgp_x_beta_raw.2", "hsgp_x_beta_raw.3", "hsgp_x_beta_raw.4", "hsgp_x_beta_raw.5", "hsgp_x_beta_raw.6", "hsgp_x_beta_raw.7", "hsgp_x_beta_raw.8", "hsgp_x_beta_raw.9", "hsgp_x_beta_raw.10", "hsgp_x_beta_raw.11", "hsgp_x_beta_raw.12", "hsgp_x_beta_raw.13", "hsgp_x_beta_raw.14", "hsgp_x_beta_raw.15", "hsgp_x_beta_raw.16", "hsgp_x_beta_raw.17", "hsgp_x_beta_raw.18", "hsgp_x_beta_raw.19", "hsgp_x_beta_raw.20", "hsgp_log_sigma_x_rho_iso", "hsgp_log_sigma_x_sigma", "hsgp_log_sigma_x_beta_raw.1", "hsgp_log_sigma_x_beta_raw.2", "hsgp_log_sigma_x_beta_raw.3", "hsgp_log_sigma_x_beta_raw.4", "hsgp_log_sigma_x_beta_raw.5", "hsgp_log_sigma_x_beta_raw.6", "hsgp_log_sigma_x_beta_raw.7", "hsgp_log_sigma_x_beta_raw.8", "hsgp_log_sigma_x_beta_raw.9", "hsgp_log_sigma_x_beta_raw.10", "hsgp_log_sigma_x_beta_raw.11", "hsgp_log_sigma_x_beta_raw.12", "hsgp_log_sigma_x_beta_raw.13", "hsgp_log_sigma_x_beta_raw.14", "hsgp_log_sigma_x_beta_raw.15", "hsgp_log_sigma_x_beta_raw.16", "hsgp_log_sigma_x_beta_raw.17", "hsgp_log_sigma_x_beta_raw.18", "hsgp_log_sigma_x_beta_raw.19", "hsgp_log_sigma_x_beta_raw.20"]
+stan_coordinate_names = ["hsgp_x_rho_iso", "hsgp_x_sigma", "hsgp_x_beta_partial.1", "hsgp_x_beta_partial.2", "hsgp_x_beta_partial.3", "hsgp_x_beta_partial.4", "hsgp_x_beta_partial.5", "hsgp_x_beta_partial.6", "hsgp_x_beta_partial.7", "hsgp_x_beta_partial.8", "hsgp_x_beta_partial.9", "hsgp_x_beta_partial.10", "hsgp_x_beta_partial.11", "hsgp_x_beta_partial.12", "hsgp_x_beta_partial.13", "hsgp_x_beta_partial.14", "hsgp_x_beta_partial.15", "hsgp_x_beta_partial.16", "hsgp_x_beta_partial.17", "hsgp_x_beta_partial.18", "hsgp_x_beta_partial.19", "hsgp_x_beta_partial.20", "hsgp_log_sigma_x_rho_iso", "hsgp_log_sigma_x_sigma", "hsgp_log_sigma_x_beta_partial.1", "hsgp_log_sigma_x_beta_partial.2", "hsgp_log_sigma_x_beta_partial.3", "hsgp_log_sigma_x_beta_partial.4", "hsgp_log_sigma_x_beta_partial.5", "hsgp_log_sigma_x_beta_partial.6", "hsgp_log_sigma_x_beta_partial.7", "hsgp_log_sigma_x_beta_partial.8", "hsgp_log_sigma_x_beta_partial.9", "hsgp_log_sigma_x_beta_partial.10", "hsgp_log_sigma_x_beta_partial.11", "hsgp_log_sigma_x_beta_partial.12", "hsgp_log_sigma_x_beta_partial.13", "hsgp_log_sigma_x_beta_partial.14", "hsgp_log_sigma_x_beta_partial.15", "hsgp_log_sigma_x_beta_partial.16", "hsgp_log_sigma_x_beta_partial.17", "hsgp_log_sigma_x_beta_partial.18", "hsgp_log_sigma_x_beta_partial.19", "hsgp_log_sigma_x_beta_partial.20"]
+stan_gradient_max_abs = 101.5
+stan_gradient_max_scaled = 9.28740041404553e-12
+stan_permutation = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44]
+stan_preparation_seconds = 24.176904888
+stan_value_max_abs = 4.121147867408581e-13
+
+    [mixed.adversarial]
+    native_verified = false
+    points = 18
+    stan_gradient_max_abs = 3.5653937856996347e61
+    stan_gradient_max_scaled = 1.7045979716157393e-13
+    stan_value_max_abs = 1.1368683772161603e-13
+
+    [mixed.runtime]
+    host_over_stan = 3.828952011291461
+    resident_over_stan = 1.5909491884262525
+
+        [mixed.runtime.reactant_host]
+        allocations = 34
+        bytes = 1696
+        median_ns = 43405.0
+        minimum_ns = 29060.0
+        samples = 1000
+
+        [mixed.runtime.reactant_primal]
+        allocations = 16
+        bytes = 704
+        median_ns = 16708.0
+        minimum_ns = 11987.0
+        samples = 1000
+
+        [mixed.runtime.reactant_resident]
+        allocations = 20
+        bytes = 816
+        median_ns = 18035.0
+        minimum_ns = 13799.0
+        samples = 1000
+
+        [mixed.runtime.rk_native_primal]
+        allocations = 16
+        bytes = 5472
+        median_ns = 3484.5
+        minimum_ns = 1572.0
+        samples = 1000
+
+        [mixed.runtime.rk_native_value_gradient]
+        allocations = 40
+        bytes = 12736
+        median_ns = 19046.0
+        minimum_ns = 14420.0
+        samples = 1000
+
+        [mixed.runtime.stanblocks]
+        allocations = 2
+        bytes = 464
+        median_ns = 11336.0
+        minimum_ns = 11025.0
+        samples = 1000
+
+[noncentered]
+centeredness = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+native_verified = false
+points = 10000
+source_coordinate_names = ["hsgp_x_rho_iso", "hsgp_x_sigma", "hsgp_x_beta_raw.1", "hsgp_x_beta_raw.2", "hsgp_x_beta_raw.3", "hsgp_x_beta_raw.4", "hsgp_x_beta_raw.5", "hsgp_x_beta_raw.6", "hsgp_x_beta_raw.7", "hsgp_x_beta_raw.8", "hsgp_x_beta_raw.9", "hsgp_x_beta_raw.10", "hsgp_x_beta_raw.11", "hsgp_x_beta_raw.12", "hsgp_x_beta_raw.13", "hsgp_x_beta_raw.14", "hsgp_x_beta_raw.15", "hsgp_x_beta_raw.16", "hsgp_x_beta_raw.17", "hsgp_x_beta_raw.18", "hsgp_x_beta_raw.19", "hsgp_x_beta_raw.20", "hsgp_log_sigma_x_rho_iso", "hsgp_log_sigma_x_sigma", "hsgp_log_sigma_x_beta_raw.1", "hsgp_log_sigma_x_beta_raw.2", "hsgp_log_sigma_x_beta_raw.3", "hsgp_log_sigma_x_beta_raw.4", "hsgp_log_sigma_x_beta_raw.5", "hsgp_log_sigma_x_beta_raw.6", "hsgp_log_sigma_x_beta_raw.7", "hsgp_log_sigma_x_beta_raw.8", "hsgp_log_sigma_x_beta_raw.9", "hsgp_log_sigma_x_beta_raw.10", "hsgp_log_sigma_x_beta_raw.11", "hsgp_log_sigma_x_beta_raw.12", "hsgp_log_sigma_x_beta_raw.13", "hsgp_log_sigma_x_beta_raw.14", "hsgp_log_sigma_x_beta_raw.15", "hsgp_log_sigma_x_beta_raw.16", "hsgp_log_sigma_x_beta_raw.17", "hsgp_log_sigma_x_beta_raw.18", "hsgp_log_sigma_x_beta_raw.19", "hsgp_log_sigma_x_beta_raw.20"]
+stan_coordinate_names = ["hsgp_x_rho_iso", "hsgp_x_sigma", "hsgp_x_beta_raw.1", "hsgp_x_beta_raw.2", "hsgp_x_beta_raw.3", "hsgp_x_beta_raw.4", "hsgp_x_beta_raw.5", "hsgp_x_beta_raw.6", "hsgp_x_beta_raw.7", "hsgp_x_beta_raw.8", "hsgp_x_beta_raw.9", "hsgp_x_beta_raw.10", "hsgp_x_beta_raw.11", "hsgp_x_beta_raw.12", "hsgp_x_beta_raw.13", "hsgp_x_beta_raw.14", "hsgp_x_beta_raw.15", "hsgp_x_beta_raw.16", "hsgp_x_beta_raw.17", "hsgp_x_beta_raw.18", "hsgp_x_beta_raw.19", "hsgp_x_beta_raw.20", "hsgp_log_sigma_x_rho_iso", "hsgp_log_sigma_x_sigma", "hsgp_log_sigma_x_beta_raw.1", "hsgp_log_sigma_x_beta_raw.2", "hsgp_log_sigma_x_beta_raw.3", "hsgp_log_sigma_x_beta_raw.4", "hsgp_log_sigma_x_beta_raw.5", "hsgp_log_sigma_x_beta_raw.6", "hsgp_log_sigma_x_beta_raw.7", "hsgp_log_sigma_x_beta_raw.8", "hsgp_log_sigma_x_beta_raw.9", "hsgp_log_sigma_x_beta_raw.10", "hsgp_log_sigma_x_beta_raw.11", "hsgp_log_sigma_x_beta_raw.12", "hsgp_log_sigma_x_beta_raw.13", "hsgp_log_sigma_x_beta_raw.14", "hsgp_log_sigma_x_beta_raw.15", "hsgp_log_sigma_x_beta_raw.16", "hsgp_log_sigma_x_beta_raw.17", "hsgp_log_sigma_x_beta_raw.18", "hsgp_log_sigma_x_beta_raw.19", "hsgp_log_sigma_x_beta_raw.20"]
+stan_gradient_max_abs = 3.495870259939693e-11
+stan_gradient_max_scaled = 9.567296145353515e-12
+stan_permutation = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44]
+stan_preparation_seconds = 82.866032542
+stan_value_max_abs = 4.689582056016661e-13
+
+    [noncentered.adversarial]
+    native_verified = false
+    points = 18
+    stan_gradient_max_abs = 1.1368683772161603e-13
+    stan_gradient_max_scaled = 6.676537771857189e-15
+    stan_value_max_abs = 8.526512829121202e-14
+
+    [noncentered.runtime]
+    host_over_stan = 5.272928714262552
+    resident_over_stan = 2.9706534075555315
+
+        [noncentered.runtime.reactant_host]
+        allocations = 34
+        bytes = 1696
+        median_ns = 48782.5
+        minimum_ns = 33306.0
+        samples = 1000
+
+        [noncentered.runtime.reactant_primal]
+        allocations = 16
+        bytes = 704
+        median_ns = 16748.0
+        minimum_ns = 11285.0
+        samples = 1000
+
+        [noncentered.runtime.reactant_resident]
+        allocations = 20
+        bytes = 816
+        median_ns = 27483.0
+        minimum_ns = 15431.0
+        samples = 1000
+
+        [noncentered.runtime.rk_native_primal]
+        allocations = 16
+        bytes = 5472
+        median_ns = 1973.0
+        minimum_ns = 1412.0
+        samples = 1000
+
+        [noncentered.runtime.rk_native_value_gradient]
+        allocations = 40
+        bytes = 12736
+        median_ns = 15091.0
+        minimum_ns = 12938.0
+        samples = 1000
+
+        [noncentered.runtime.stanblocks]
+        allocations = 2
+        bytes = 464
+        median_ns = 9251.5
+        minimum_ns = 9002.0
+        samples = 1000
+
+[[packages]]
+git_sha = "8dfe41253af3043482cb3270cf513b50a1de5437"
+name = "BayesianRegressionModels"
+source = "/home/n/scratch/kb-agent-tmp/ReactiveKernels-brm-hsgp-reactant/BayesianRegressionModels"
+tree_hash = "nothing"
+version = "0.2.1"
+[[packages]]
+git_sha = ""
+name = "BenchmarkTools"
+source = "/home/n/.julia/packages/BenchmarkTools/ZtsPk"
+tree_hash = "9670d3febc2b6da60a0ae57846ba74670290653f"
+version = "1.8.0"
+[[packages]]
+git_sha = ""
+name = "BridgeStan"
+source = "/home/n/.julia/packages/BridgeStan/lLxtM"
+tree_hash = "3037ad381e5595495008cf529c7adb7146b689ac"
+version = "2.9.0"
+[[packages]]
+git_sha = ""
+name = "DifferentiationInterface"
+source = "/home/n/.julia/packages/DifferentiationInterface/seMaz"
+tree_hash = "0693d8b0a4608ff289d228ab4c598df5894845cd"
+version = "0.7.21"
+[[packages]]
+git_sha = ""
+name = "Distributions"
+source = "/home/n/.julia/packages/Distributions/RTt4y"
+tree_hash = "a958ab3a40c755563f5e1405c0846cb0446bf19d"
+version = "0.25.131"
+[[packages]]
+git_sha = ""
+name = "DynamicPPL"
+source = "/home/n/.julia/packages/DynamicPPL/KUCnw"
+tree_hash = "8f9dc691ddef45d534e9ca1ddea33101a02283c7"
+version = "0.42.13"
+[[packages]]
+git_sha = ""
+name = "Enzyme"
+source = "/home/n/.julia/packages/Enzyme/378BD"
+tree_hash = "d242d84323f15c1b4788e9eaaca3f8d5ca08dca3"
+version = "0.13.204"
+[[packages]]
+git_sha = ""
+name = "Enzyme_jll"
+source = "/home/n/.julia/packages/Enzyme_jll/fk3Zf"
+tree_hash = "d405b496023e00071fcf874377e7d3e455badd66"
+version = "0.0.293+0"
+[[packages]]
+git_sha = ""
+name = "LogDensityProblems"
+source = "/home/n/.julia/packages/LogDensityProblems/Yy6GB"
+tree_hash = "d9625f27ded4ad726ceca7819394a4cc77ed25b3"
+version = "2.2.0"
+[[packages]]
+git_sha = "c59329c49663ae1b28f093e1111fd39ddca26d17"
+name = "MutatingFunctions"
+source = "/home/n/scratch/kb-agent-tmp/ReactiveKernels-brm-hsgp-reactant/MutatingFunctions"
+tree_hash = "nothing"
+version = "0.1.0"
+[[packages]]
+git_sha = "121de3194f02044e00bac0d11019a93458ddb63a"
+name = "OutputSignatures"
+source = "/home/n/github/nsiccha/OutputSignatures.jl"
+tree_hash = "nothing"
+version = "0.1.0"
+[[packages]]
+git_sha = ""
+name = "Reactant"
+source = "/home/n/.julia/packages/Reactant/Zq0Yj"
+tree_hash = "1d5420794d3683760faeb1a17c08d96d23a8e909"
+version = "0.2.284"
+[[packages]]
+git_sha = ""
+name = "Reactant_jll"
+source = "/home/n/.julia/packages/Reactant_jll/PcLyo"
+tree_hash = "463e8cfa46546e4e6d8209d307e932dc4d6fcb4c"
+version = "0.0.407+0"
+[[packages]]
+git_sha = "214cec420a7c4c1d0a354f7febea7d6ae83f34cb"
+name = "ReactiveKernels"
+source = "/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-brm-hsgp-reactant"
+tree_hash = "nothing"
+version = "0.1.0"
+[[packages]]
+git_sha = "c0b5b9197e2d06cf284f1990db024c37ed2b9d47"
+name = "StanBlocks"
+source = "/home/n/github/nsiccha/StanBlocks.jl"
+tree_hash = "nothing"
+version = "0.2.1"
+[[packages]]
+git_sha = ""
+name = "Turing"
+source = "/home/n/.julia/packages/Turing/4sXd9"
+tree_hash = "653ea28a8ffc069c46f2867fdf57b831ac25fe64"
+version = "0.46.1"
+[[packages]]
+git_sha = "131e7428083980de03edb7ed6aaae94daccc1a26"
+name = "WarmupHMC"
+source = "/home/n/github/nsiccha/WarmupHMC.jl"
+tree_hash = "nothing"
+version = "0.2.1"
+
+[posterior_provenance]
+basis_functions_per_gp = 20
+blas_threads = 1
+brm_commit = "09f3fed17e9ebeab1efc80c66a51afc6e0621349"
+chains_each_fit = 1
+data_revision = "1dcc2bf5f955cc1224a3e1307256e1fe86b68dae"
+data_sha256 = "b89a1e4eb0391a982b32be3e378df00e8593ff9971e9425e9c5d7929b74f9801"
+diagnostics = "rank-normalized split Rhat; bulk ESS; tail ESS; retained divergences"
+draws_requested_each_fit = 10000
+julia_version = "1.10.11"
+rhat_scope = "within one split chain, not independent-chain convergence"
+sampler = "WarmupHMC.adaptive_warmup_mcmc"
+sampler_config = "defaults; n_draws=10000; monitor_ess=true (source progress enables this)"
+script_sha256 = "117623801ca414fd8c25fc9ea15ff6689e6afd471729cd134aa4e3158ac9aade"
+seed_each_fit = 1
+source_revision = "0d00b8535e2c20c49017d03c7b060940eb8e7041"
+turing_sampling = "disabled pending measured value/runtime parity"
+
+[selected_partial]
+centeredness = [1.0, 0.91, 0.6, 0.84, 0.52, 0.79, 0.71, 0.53, 0.61, 0.17, 0.65, 0.42, 0.56, 0.48, 0.23, 0.33, 0.37, 0.24, 0.17, 0.15, 0.94, 1.0, 0.82, 0.74, 0.47, 0.23, 0.45, 0.48, 0.23, 0.23, 0.15, 0.11, 0.07, 0.01, 0.03, 0.0, 0.01, 0.0, 0.0, 0.0]
+native_verified = false
+points = 10000
+source_coordinate_names = ["hsgp_x_rho_iso", "hsgp_x_sigma", "hsgp_x_beta_partial.1", "hsgp_x_beta_partial.2", "hsgp_x_beta_partial.3", "hsgp_x_beta_partial.4", "hsgp_x_beta_partial.5", "hsgp_x_beta_partial.6", "hsgp_x_beta_partial.7", "hsgp_x_beta_partial.8", "hsgp_x_beta_partial.9", "hsgp_x_beta_partial.10", "hsgp_x_beta_partial.11", "hsgp_x_beta_partial.12", "hsgp_x_beta_partial.13", "hsgp_x_beta_partial.14", "hsgp_x_beta_partial.15", "hsgp_x_beta_partial.16", "hsgp_x_beta_partial.17", "hsgp_x_beta_partial.18", "hsgp_x_beta_partial.19", "hsgp_x_beta_partial.20", "hsgp_log_sigma_x_rho_iso", "hsgp_log_sigma_x_sigma", "hsgp_log_sigma_x_beta_partial.1", "hsgp_log_sigma_x_beta_partial.2", "hsgp_log_sigma_x_beta_partial.3", "hsgp_log_sigma_x_beta_partial.4", "hsgp_log_sigma_x_beta_partial.5", "hsgp_log_sigma_x_beta_partial.6", "hsgp_log_sigma_x_beta_partial.7", "hsgp_log_sigma_x_beta_partial.8", "hsgp_log_sigma_x_beta_partial.9", "hsgp_log_sigma_x_beta_partial.10", "hsgp_log_sigma_x_beta_partial.11", "hsgp_log_sigma_x_beta_partial.12", "hsgp_log_sigma_x_beta_partial.13", "hsgp_log_sigma_x_beta_partial.14", "hsgp_log_sigma_x_beta_partial.15", "hsgp_log_sigma_x_beta_partial.16", "hsgp_log_sigma_x_beta_partial.17", "hsgp_log_sigma_x_beta_partial.18", "hsgp_log_sigma_x_beta_partial.19", "hsgp_log_sigma_x_beta_partial.20"]
+stan_coordinate_names = ["hsgp_x_rho_iso", "hsgp_x_sigma", "hsgp_x_beta_partial.1", "hsgp_x_beta_partial.2", "hsgp_x_beta_partial.3", "hsgp_x_beta_partial.4", "hsgp_x_beta_partial.5", "hsgp_x_beta_partial.6", "hsgp_x_beta_partial.7", "hsgp_x_beta_partial.8", "hsgp_x_beta_partial.9", "hsgp_x_beta_partial.10", "hsgp_x_beta_partial.11", "hsgp_x_beta_partial.12", "hsgp_x_beta_partial.13", "hsgp_x_beta_partial.14", "hsgp_x_beta_partial.15", "hsgp_x_beta_partial.16", "hsgp_x_beta_partial.17", "hsgp_x_beta_partial.18", "hsgp_x_beta_partial.19", "hsgp_x_beta_partial.20", "hsgp_log_sigma_x_rho_iso", "hsgp_log_sigma_x_sigma", "hsgp_log_sigma_x_beta_partial.1", "hsgp_log_sigma_x_beta_partial.2", "hsgp_log_sigma_x_beta_partial.3", "hsgp_log_sigma_x_beta_partial.4", "hsgp_log_sigma_x_beta_partial.5", "hsgp_log_sigma_x_beta_partial.6", "hsgp_log_sigma_x_beta_partial.7", "hsgp_log_sigma_x_beta_partial.8", "hsgp_log_sigma_x_beta_partial.9", "hsgp_log_sigma_x_beta_partial.10", "hsgp_log_sigma_x_beta_partial.11", "hsgp_log_sigma_x_beta_partial.12", "hsgp_log_sigma_x_beta_partial.13", "hsgp_log_sigma_x_beta_partial.14", "hsgp_log_sigma_x_beta_partial.15", "hsgp_log_sigma_x_beta_partial.16", "hsgp_log_sigma_x_beta_partial.17", "hsgp_log_sigma_x_beta_partial.18", "hsgp_log_sigma_x_beta_partial.19", "hsgp_log_sigma_x_beta_partial.20"]
+stan_gradient_max_abs = 3.348077370901592e-11
+stan_gradient_max_scaled = 1.1571941242629176e-11
+stan_permutation = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44]
+stan_preparation_seconds = 39.224671916
+stan_value_max_abs = 4.689582056016661e-13
+
+    [selected_partial.adversarial]
+    native_verified = false
+    points = 18
+    stan_gradient_max_abs = 718848.0
+    stan_gradient_max_scaled = 4.293231321316573e-14
+    stan_value_max_abs = 1.1368683772161603e-13
+
+    [selected_partial.runtime]
+    host_over_stan = 3.7985107314936486
+    resident_over_stan = 1.604029785370127
+
+        [selected_partial.runtime.reactant_host]
+        allocations = 34
+        bytes = 1696
+        median_ns = 43360.0
+        minimum_ns = 30773.0
+        samples = 1000
+
+        [selected_partial.runtime.reactant_primal]
+        allocations = 16
+        bytes = 704
+        median_ns = 15466.0
+        minimum_ns = 11515.0
+        samples = 1000
+
+        [selected_partial.runtime.reactant_resident]
+        allocations = 20
+        bytes = 816
+        median_ns = 18310.0
+        minimum_ns = 13649.0
+        samples = 1000
+
+        [selected_partial.runtime.rk_native_primal]
+        allocations = 16
+        bytes = 5472
+        median_ns = 1923.0
+        minimum_ns = 1382.0
+        samples = 1000
+
+        [selected_partial.runtime.rk_native_value_gradient]
+        allocations = 40
+        bytes = 12736
+        median_ns = 15075.5
+        minimum_ns = 12978.0
+        samples = 1000
+
+        [selected_partial.runtime.stanblocks]
+        allocations = 2
+        bytes = 464
+        median_ns = 11415.0
+        minimum_ns = 10935.0
+        samples = 1000

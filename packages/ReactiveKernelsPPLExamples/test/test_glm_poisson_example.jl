@@ -34,8 +34,7 @@ end
     reference = _glm_poisson_reference(q, GLM_POISSON_YEAR, GLM_POISSON_C)
 
     @testset "authored on the current baseline surface" begin
-        @test occursin("poisson(exp(", GLM_POISSON_SOURCE)
-        @test occursin(".logpdf(c)", GLM_POISSON_SOURCE)
+        @test occursin("poisson(; log_rate = ll).logpdf(c)", GLM_POISSON_SOURCE)
         @test occursin("logistic(u_alpha)", GLM_POISSON_SOURCE)
         @test occursin("log_lambda = plate(", GLM_POISSON_SOURCE)
         @test occursin("pointwise = plate(", GLM_POISSON_SOURCE)

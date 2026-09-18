@@ -27,6 +27,27 @@ The reverse pass is checked against the analytic score
 It is displayed here as source rather than executed, so the docs build carries no
 Enzyme/LLVM autodiff toolchain.
 
+## Independent positions with `replica`
+
+Position batching is distinct from the data `plate` above: it evaluates the same
+scalar kernel at many parameter positions while shared data stays atomic. Prepare
+the scalar reverse pass once, then lift that prepared AD callable:
+
+```julia
+ad = prepare_ad(normal_posterior, backend, x, data; active = :x, want = :lp)
+batched_ad = replica(ad; batched = :x)
+values, gradients = batched_ad(positions, data)
+```
+
+A scalar active port becomes a length-`N` value vector. An active vector port
+whose scalar shape is `D` receives a trailing replica axis in the batched call
+and its gradient is stacked as `D × N`. The scalar preparation stays the source
+of truth. Native Enzyme reverse mode calls the same prepared AD kernel once per
+position (`test/test_replica.jl`). With Reactant, `@compile batched_ad(...)`
+lowers the replica map in one executable: static replica slices feed the same
+prepared DI/AutoEnzyme program, and the objective/gradient outputs are stacked
+(`test/test_reactant.jl`).
+
 ## Distribution gradient latency and allocation
 
 The receipt below reuses the same inventories as the distribution page: Normal

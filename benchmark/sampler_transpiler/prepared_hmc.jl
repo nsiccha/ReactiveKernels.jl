@@ -1,21 +1,13 @@
 module PreparedHMCExample
 using ReactiveKernels, LinearAlgebra, Random
 include("eight_schools_density.jl")
-using .EightSchoolsDensity: build_density, Potential, Gradient, CallbackHandle
-include("../nuts_kernel_authoring_fixture_b.jl")
-include("position_multinomial_hmc_kernel.jl")
-const F = NUTSBMutationAuthoringFixture
+using .EightSchoolsDensity: build_density
+include("hmc_benchmark.jl")
 
 # BEGIN HMC consumer
 function prepare_hmc(rng; backend=:native, transitions=1000, steps=4)
     density, ad, position = build_density()
-    point = transpiled_endpoint(F.euclidean_phasepoint, F.leapfrog!,
-        CallbackHandle(Potential(density)), CallbackHandle(Gradient(ad)),
-        Diagonal(ones(length(position))), position, zeros(length(position)))
-    prepare_transpiled(PositionMultinomialHMCAuthoring.multinomial_hmc_state, point;
-        backend, method=:step!, argument=rng, iterations=transitions,
-        kernel_kwargs=(n_steps=steps, step_f=F.leapfrog!, stepsize=0.03),
-        outputs=(position=(:init, :pos),))
+    HMCBenchmark.prepare_hmc(density, ad, position, rng; backend, transitions, steps)
 end
 
 function hmc_example(rng=Xoshiro(91); backend=:native, transitions=1000, steps=4)

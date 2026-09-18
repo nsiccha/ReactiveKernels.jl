@@ -278,11 +278,12 @@ planner reruns just the missing part — with all of that cache bookkeeping
 staying outside the generated kernel.
 
 Mathematical `PreparedKernel`s that Reactant can trace can also run through the
-optional compiler extension, and `replica` lifts a whole scalar kernel across an
-extra batch axis. The reviewed distribution, PPL, and compiled-AD evidence now
-lives under the top-level [Reactant integration](reactant.md) section. Sampling
-receipts are kept last and static; NUTS and WALNUTS compiler/runtime code is not
-executed during documentation builds.
+optional compiler extension, and `vectorize` / `prepare_batched` lift a whole
+scalar kernel across an extra position axis. The reviewed distribution, PPL, and
+compiled-AD evidence now lives under the top-level
+[Reactant integration](reactant.md) section. Sampling receipts are kept last and
+static; NUTS and WALNUTS compiler/runtime code is not executed during
+documentation builds.
 
 > **Status:** early development — the public API is still being shaped.
 

@@ -2,6 +2,9 @@ using SHA
 using Test
 using TOML
 
+include(joinpath(dirname(@__DIR__), "_comparison_source_attestation.jl"))
+using .ComparisonSourceAttestation
+
 const ROOT = normpath(joinpath(@__DIR__, "..", ".."))
 const RECEIPT_PATH = joinpath(@__DIR__, "sum-to-zero-native-v1.toml")
 
@@ -57,7 +60,21 @@ end
         source = receipt["pins"][pin]
         path = joinpath(ROOT, source["path"])
         @test isfile(path)
-        @test _normalized_sha256(path) == source["text_sha256"]
-        @test readchomp(`git -C $ROOT hash-object $path`) == source["git_blob"]
+        @test isempty(historical_source_pin_errors(
+            ROOT, source; commit = receipt["pins"]["reactivekernels_sha"],
+            label = pin))
+        if pin == "model_source"
+            published = try
+                read(`git -C $ROOT cat-file blob $(source["git_blob"])`, String)
+            catch
+                ""
+            end
+            @test sum_to_zero_model_source_preserves_published_authority(
+                read(path, String), published)
+        else
+            @test _normalized_sha256(path) == source["text_sha256"]
+            @test readchomp(`git -C $ROOT hash-object $path`) ==
+                source["git_blob"]
+        end
     end
 end

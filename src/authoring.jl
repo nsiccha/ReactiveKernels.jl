@@ -269,6 +269,7 @@ function _kernel_add!(graph::Graph, ins, outs, spec::KernelSpec, cost, cse_key,
         "boundary has $(length(child_outputs)) port(s); destructure that boundary exactly"))
 
     child_graph = spec.graph
+    child_have = Set{Int}(canon_id(child_graph, v.id) for v in child_inputs)
     cloned = Dict{Int,Value}()
     for id in sort!(collect(keys(child_graph.values)))
         value = child_graph.values[id]
@@ -294,6 +295,17 @@ function _kernel_add!(graph::Graph, ins, outs, spec::KernelSpec, cost, cse_key,
     end
 
     for recipe in child_graph.recipes
+        # A nested recipe that produces only HAVE values recomputes
+        # caller-supplied inputs: every nested HAVE is aliased to a caller
+        # actual just above, so the values are available with no recipe.
+        # Cloning it manufactures a spurious alternative producer for every
+        # call site, and the planner's exact search is exponential in the
+        # number of such producers. Recipes with any non-HAVE output are
+        # kept unchanged, and effectful recipes are never skipped.
+        if !recipe.effectful && all(
+                o -> canon_id(child_graph, o.id) in child_have, recipe.outputs)
+            continue
+        end
         add!(graph;
              inputs = Tuple(cloned[value.id] for value in recipe.inputs),
              outputs = Tuple(cloned[value.id] for value in recipe.outputs),
@@ -2545,6 +2557,70 @@ function replica(callable::_KernelSignatureCallable; batched)
     replicated = _replica(callable.target, batched)
     _kernel_signature_callable(replicated, callable.signature)
 end
+
+"""
+    prepare_batched(spec::KernelSpec; batched, have=inputs(spec),
+                    want=outputs(spec), passes=()) -> ReplicatedKernel
+
+First-class position batching for a scalar `@kernel`. The named HAVE ports
+carry one shared trailing batch axis; all other HAVE ports are shared by every
+position. A scalar batched port becomes a vector, a rank-`r` array batched port
+becomes rank-`r + 1`, and every selected output is stacked on the same trailing
+axis. `batched` may be one port name or a tuple of names; those names must be
+unique and agree on the batch length.
+
+This is position batching, not a likelihood `plate`: one scalar parameter
+position is evaluated at each slice while data remains shared. The scalar graph
+stays the mathematical authority, `plan` still owns HAVE/WANT selection and CSE,
+and native execution evaluates independent positions in a generated typed
+driver. Reactant lowers the same map to its backend batch primitive; a
+`PreparedADKernel` lifted with [`replica`](@ref) produces one gradient per
+position.
+
+The lifted kernel requires the same pure, straight-line semantics as ordinary
+prepared kernels. It allocates the requested output containers and copies
+array-valued slices, so it is not the allocation-free reducing `plate` contract.
+"""
+function prepare_batched(spec::KernelSpec;
+                         batched,
+                         have = _KERNEL_DEFAULT_BOUNDARY,
+                         want = _KERNEL_DEFAULT_BOUNDARY,
+                         passes = ())
+    replica(spec; batched, have, want, passes)
+end
+
+"""
+    vectorize(kernel::PreparedKernel; batched) -> ReplicatedKernel
+    vectorize(spec::KernelSpec; batched, have=inputs(spec),
+              want=outputs(spec), passes=()) -> ReplicatedKernel
+
+Lift a scalar kernel over position batching. This is the concise public spelling
+for [`prepare_batched`](@ref); `replica` remains the equivalent lower-level
+name. See that docstring for the batch-axis, output-shape, purity, and
+allocation contract.
+"""
+function vectorize(kernel::PreparedKernel; batched)
+    replica(kernel; batched)
+end
+
+function vectorize(spec::KernelSpec;
+                   batched,
+                   have = _KERNEL_DEFAULT_BOUNDARY,
+                   want = _KERNEL_DEFAULT_BOUNDARY,
+                   passes = ())
+    prepare_batched(spec; batched, have, want, passes)
+end
+
+function vectorize(callable::_KernelSignatureCallable; batched)
+    replica(callable; batched)
+end
+
+"Names of HAVE ports carrying the shared trailing batch axis."
+batched_ports(kernel::ReplicatedKernel{B}) where {B} =
+    Tuple(kernel.inputs[index].name for index in B)
+
+"The scalar prepared kernel retained as the mathematical authority."
+scalar_kernel(kernel::ReplicatedKernel) = kernel.target
 
 """
     plate(spec::KernelSpec; have, want, batched, reduce = :+) -> PreparedKernel

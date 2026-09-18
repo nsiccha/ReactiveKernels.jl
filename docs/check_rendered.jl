@@ -32,6 +32,7 @@ _occurrences(text, needle) = length(split(text, needle)) - 1
 
 const _RENDERED_DOCS_PAGE_OWNERS = Dict(
     "automatic-differentiation.md" => "ReactiveKernels:enzyme",
+    "manual-derivative-rules.md" => "ReactiveKernels:reactant",
     "batched.md" => "ReactiveKernels:batching",
     "distributions.md" => "ReactiveKernels:distributions",
     "nuts.md" => "ReactiveKernels:hmc",
@@ -298,6 +299,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         error("rendered site has $(length(rendered)) content pages; navigation config has $(length(sources))")
     expected_panels = Dict(
         "automatic-differentiation.md" => 0,
+        "manual-derivative-rules.md" => 3,
         "distributions-ad.md" => 0,
         "distributions.md" => 19,
         "batched.md" => 1,
@@ -315,13 +317,40 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "poisson-gamma.md" => 1,
         "dugongs-growth.md" => 1,
         "arma11.md" => 1,
+        "covid19imperial.md" => 1,
+        "garch11.md" => 1,
+        "hmm-example.md" => 1,
+        "hmm-gaussian.md" => 1,
+        "iohmm-reg.md" => 1,
         "diamonds.md" => 1,
         "normal-mixture-k.md" => 1,
         "dogs-nonhierarchical.md" => 1,
         "logistic-regression-rhs.md" => 1,
+        "lda.md" => 1,
+        "nn-rbm.md" => 1,
+        "losscurve-sislob.md" => 1,
+        "accel-splines.md" => 1,
+        "state-space-stochastic.md" => 1,
+        "prophet.md" => 1,
+        "irt-2pl.md" => 1,
+        "2pl-latent-reg-irt.md" => 1,
+        "hier-2pl.md" => 1,
+        "gpcm-latent-reg-irt.md" => 1,
+        "glmm1.md" => 1,
+        "bym2-offset-only.md" => 1,
+        "bones.md" => 1,
+        "multi-occupancy.md" => 1,
+        "lotka-volterra.md" => 1,
+        "sir.md" => 1,
+        "one-comp-mm-elim-abs.md" => 1,
+        "soil-incubation.md" => 1,
         "hmm-drive-1.md" => 1,
         "mnist-logistic.md" => 2,
         "online-stats.md" => 1,
+        "gp-regr.md" => 1,
+        "gp-pois-regr.md" => 1,
+        "accel-gp.md" => 1,
+        "hierarchical-gp.md" => 1,
     )
     expected_source_examples = Dict(
         "reactivehmc-corpus.md" => 5,
@@ -385,6 +414,18 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "ppl-front-end.md" => "review-pending",
     )
     structural_markers = Dict(
+        "manual-derivative-rules.md" => (
+            "Manual derivative rule graphs (design example)",
+            "Executable design example, not a shipped adapter generator",
+            "Current capability and required RK features",
+            "Everything that turns",
+            "registered custom AD rule is new work",
+            "prepare_ad_pullback",
+            "examples/manual_derivative_rule.jl",
+            "One graph, three selected cuts",
+            "Value plus a generated-style pullback",
+            "Backend boundary",
+        ),
         "probprog-mcmc.md" => (
             "NUTS sampling performance and diagnostics",
             "Eight Schools posterior agreement",
@@ -584,6 +625,9 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
             ("class=\"rk-dag-legend\"", "class=\"rk-comparison-grid\""),
     )
     body_markers = Dict(
+        "manual-derivative-rules.md" => (
+            "Manual Rule Primal", "Manual Rule Forward", "Manual Rule Reverse",
+        ),
         "eight-schools.md" =>
             ("Eight Schools Extraction", "Raw input", "Generated kernel", "Compute DAG",
              "Eight Schools primal — Joint density"),

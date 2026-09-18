@@ -15,6 +15,7 @@ include("glm_poisson.jl")
 include("glm_binomial.jl")
 include("eight_schools_noncentered.jl")
 include("glmm_poisson.jl")
+include("covid19imperial.jl")
 include("kidscore_momhs.jl")
 include("kidscore_momiq.jl")
 include("kidscore_momhsiq.jl")
@@ -88,6 +89,10 @@ include("wells_dist100ars_model.jl")
 include("election88_full.jl")
 include("dugongs_growth.jl")
 include("arma11.jl")
+include("garch11.jl")
+include("hmm_example.jl")
+include("hmm_gaussian.jl")
+include("iohmm_reg.jl")
 include("normal_mixture.jl")
 include("low_dim_gauss_mix_collapse.jl")
 include("low_dim_gauss_mix.jl")
@@ -99,6 +104,36 @@ include("diamonds.jl")
 include("logistic_regression_rhs.jl")
 include("normal_mixture_k.jl")
 include("dogs_nonhierarchical.jl")
+include("nn_rbm.jl")
+include("lda.jl")
+include("gp_regr.jl")
+include("accel_gp.jl")
+include("gp_pois_regr.jl")
+include("hierarchical_gp.jl")
+include("losscurve_sislob.jl")
+include("accel_splines.jl")
+include("state_space_stochastic.jl")
+include("prophet.jl")
+
+# posteriordb IRT batch (irt_2pl, hier_2pl, 2pl_latent_reg_irt, gpcm_latent_reg_irt)
+include("irt_2pl.jl")
+include("2pl_latent_reg_irt.jl")
+include("hier_2pl.jl")
+include("gpcm_latent_reg_irt.jl")
+include("glmm1_model.jl")
+include("bym2_offset_only.jl")
+include("bones_model.jl")
+include("multi_occupancy.jl")
+
+# posteriordb dynamics batch: lotka_volterra, sir, one_comp_mm_elim_abs,
+# soil_incubation (native + ordinary-Reverse path under 008vhy5; compiled
+# Reactant unsupported — see each module docstring).
+include("lotka_volterra.jl")
+include("sir.jl")
+include("one_comp_mm_elim_abs.jl")
+include("soil_incubation.jl")
+
+# posteriordb structured batch: bball-drive HMMs
 include("hmm_drive_1.jl")
 include("hmm_drive_0.jl")
 
@@ -135,6 +170,7 @@ export GLMPoissonExample
 export GLMBinomialExample
 export EightSchoolsNoncenteredExample
 export GLMMPoissonExample
+export Covid19ImperialExample
 export KidscoreMomhsExample
 export KidscoreMomiqExample
 export KidscoreMomhsiqExample
@@ -208,6 +244,10 @@ export WellsDist100arsExample
 export Election88FullExample
 export DugongsGrowthExample
 export ARMA11Example
+export GARCH11Example
+export HmmExampleExample
+export HmmGaussianExample
+export IohmmRegExample
 export NormalMixtureExample
 export LowDimGaussMixCollapseExample
 export LowDimGaussMixExample
@@ -219,6 +259,32 @@ export DiamondsExample
 export LogisticRegressionRHSExample
 export NormalMixtureKExample
 export DogsNonhierarchicalExample
+export NNRBMExample
+export LDAExample
+export GPRegrExample
+export AccelGPExample
+export GPPoisRegrExample
+export HierarchicalGPExample
+export LosscurveSislobExample
+export AccelSplinesExample
+export StateSpaceStochasticExample
+export ProphetExample
+
+# posteriordb IRT batch
+export Irt2plExample
+export TwoplLatentRegIrtExample
+export Hier2plExample
+export GpcmLatentRegIrtExample
+export GLMM1ModelExample
+export Bym2OffsetOnlyExample
+export BonesModelExample
+export MultiOccupancyExample
+export LotkaVolterraExample
+export SIRExample
+export OneCompMMElimAbsExample
+export SoilIncubationExample
+
+# posteriordb structured batch: bball-drive HMMs
 export HmmDrive1Example
 export HmmDrive0Example
 

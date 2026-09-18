@@ -40,6 +40,7 @@ mktempdir() do env
         PackageSpec(path = path) for path in (root, example_packages...)
     ])
     Pkg.add([
+        PackageSpec(name = "Distributions"),
         PackageSpec(name = "Enzyme"),
         PackageSpec(name = "LambertW"),
         PackageSpec(name = "LogExpFunctions"),
@@ -55,6 +56,7 @@ mktempdir() do env
     julia = Base.julia_cmd()
     selector = get(ENV, "RK_REACTANT_TESTSET", "all")
     if selector == "all"
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $(joinpath(root, "test", "test_brm_hsgp_reactant.jl"))`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $inner_partial_evaluation_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $authored_scan_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $effect_boundary_testfile`)
@@ -64,6 +66,8 @@ mktempdir() do env
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $mutation_profile_b_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $sum_to_zero_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $ppl_examples_testfile`)
+    elseif selector == "brm-hsgp"
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $(joinpath(root, "test", "test_brm_hsgp_reactant.jl"))`)
     elseif selector == "inner-partial-evaluation"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $inner_partial_evaluation_testfile`)
     elseif selector == "authored-scan"
